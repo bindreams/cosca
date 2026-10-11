@@ -1004,7 +1004,15 @@ impl ScratchAccount {
                      if an earlier run left it behind)"
                 ));
             }
-            Ok(_) => {}
+            // Exit code 2 is "the user name could not be found"; any other failure says nothing about the account.
+            Ok(out) if out.status.code() == Some(2) => {}
+            Ok(out) => {
+                return Err(format!(
+                    "`net user {user}` failed with {}: cannot tell whether the account exists: {}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr)
+                ))
+            }
             Err(e) => return Err(format!("could not run `net user {user}`: {e}")),
         }
 
@@ -1065,7 +1073,7 @@ impl ScratchAccount {
 pub(crate) fn profile_removal_script(user: &str) -> String {
     format!(
         "$ErrorActionPreference = 'Stop'; \
-         $sid = ([System.Security.Principal.NTAccount]'{user}').Translate([System.Security.Principal.SecurityIdentifier]).Value; \
+         $sid = ([System.Security.Principal.NTAccount]($env:COMPUTERNAME + '\\{user}')).Translate([System.Security.Principal.SecurityIdentifier]).Value; \
          Get-CimInstance Win32_UserProfile | Where-Object {{ $_.SID -eq $sid }} | Remove-CimInstance"
     )
 }

@@ -48,52 +48,73 @@ impl AppPathKey {
         key: &str,
         target: &Path,
     ) -> Result<Self, String> {
-        // Which parents are missing now: creating a volatile key creates every missing one, volatile too.
-        let mut created = Vec::new();
-        for (i, _) in key.match_indices('\\') {
-            let parent = &key[..i];
-            if !key_exists(hive, parent)? {
-                created.push(parent.to_owned());
-            }
-        }
-        created.reverse();
-        created.insert(0, key.to_owned());
+        Self::register_at_with(hive, options, key, target, &mut |_| {})
+    }
 
-        let name = wide(OsStr::new(key));
-        let mut hkey = HKEY::default();
-        let mut disposition = REG_CREATE_KEY_DISPOSITION::default();
-        // SAFETY: `name` is NUL-terminated and outlives the call; the out-pointers are live locals.
-        let rc = unsafe {
-            RegCreateKeyExW(
-                hive,
-                PCWSTR(name.as_ptr()),
-                None,
-                PCWSTR::null(),
-                options,
-                KEY_WRITE,
-                None,
-                &mut hkey,
-                Some(&mut disposition),
-            )
+    /// [`register_at`](Self::register_at), calling `before_create` with each level's path just before that level is
+    /// created: a seam for another process creating a parent in between.
+    ///
+    /// Each level is created on its own and only the levels `RegCreateKeyExW` reports as new are recorded, so a
+    /// parent that appears concurrently is never taken for this guard's own.
+    pub(crate) fn register_at_with(
+        hive: HKEY,
+        options: REG_OPEN_CREATE_OPTIONS,
+        key: &str,
+        target: &Path,
+        before_create: &mut dyn FnMut(&str),
+    ) -> Result<Self, String> {
+        // Dropped on every early return below, which deletes what was created so far.
+        let mut guard = AppPathKey {
+            hive,
+            created: Vec::new(),
         };
-        if rc != ERROR_SUCCESS {
-            return Err(format!("RegCreateKeyExW({key}) failed: {rc:?}"));
-        }
-        if disposition != REG_CREATED_NEW_KEY {
-            // SAFETY: `hkey` was opened above.
+        let levels: Vec<&str> = key.match_indices('\\').map(|(i, _)| &key[..i]).chain([key]).collect();
+        for level in levels {
+            before_create(level);
+            let name = wide(OsStr::new(level));
+            let mut hkey = HKEY::default();
+            let mut disposition = REG_CREATE_KEY_DISPOSITION::default();
+            // SAFETY: `name` is NUL-terminated and outlives the call; the out-pointers are live locals.
+            let rc = unsafe {
+                RegCreateKeyExW(
+                    hive,
+                    PCWSTR(name.as_ptr()),
+                    None,
+                    PCWSTR::null(),
+                    options,
+                    KEY_WRITE,
+                    None,
+                    &mut hkey,
+                    Some(&mut disposition),
+                )
+            };
+            if rc != ERROR_SUCCESS {
+                return Err(format!("RegCreateKeyExW({level}) failed: {rc:?}"));
+            }
+            let created = disposition == REG_CREATED_NEW_KEY;
+            if created {
+                guard.created.insert(0, level.to_owned());
+            }
+            let is_key = level.len() == key.len();
+            let set = if is_key && created {
+                let value: Vec<u8> = wide(target.as_os_str()).iter().flat_map(|u| u.to_le_bytes()).collect();
+                // SAFETY: `hkey` is open for writing; `value` is a NUL-terminated UTF-16 string as bytes.
+                Some(unsafe { RegSetValueExW(hkey, PCWSTR::null(), None, REG_SZ, Some(&value)) })
+            } else {
+                None
+            };
+            // SAFETY: `hkey` was opened above and is closed once.
             let _ = unsafe { RegCloseKey(hkey) };
-            return Err(format!(
-                "{key} already existed; refusing to overwrite a key this probe did not make"
-            ));
-        }
-        let guard = AppPathKey { hive, created };
-        let value: Vec<u8> = wide(target.as_os_str()).iter().flat_map(|u| u.to_le_bytes()).collect();
-        // SAFETY: `hkey` is open for writing; `value` is a NUL-terminated UTF-16 string as bytes.
-        let set = unsafe { RegSetValueExW(hkey, PCWSTR::null(), None, REG_SZ, Some(&value)) };
-        // SAFETY: `hkey` was opened above and is closed once.
-        let _ = unsafe { RegCloseKey(hkey) };
-        if set != ERROR_SUCCESS {
-            return Err(format!("RegSetValueExW failed: {set:?}"));
+            if is_key && !created {
+                return Err(format!(
+                    "{key} already existed; refusing to overwrite a key this probe did not make"
+                ));
+            }
+            if let Some(set) = set {
+                if set != ERROR_SUCCESS {
+                    return Err(format!("RegSetValueExW failed: {set:?}"));
+                }
+            }
         }
         Ok(guard)
     }

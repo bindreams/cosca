@@ -125,3 +125,34 @@ fn a_failed_delete_fails_the_test(#[fixture(shell_execute)] _group: &Group) {
         "the retry did not finish the job"
     );
 }
+
+/// A parent that appears between the guard's levels, made by someone else, is not the guard's to delete. Mutant: the
+/// guard decides which levels are its own before creating any.
+#[skuld::test]
+fn the_guard_keeps_a_parent_created_by_someone_else_meanwhile(#[fixture(shell_execute)] _group: &Group) {
+    let top = scratch("");
+    let middle = scratch(r"\App Paths");
+    let key = scratch(r"\App Paths\probe.exe");
+    let mut other: Option<AppPathKey> = None;
+    let guard = AppPathKey::register_at_with(
+        HKEY_CURRENT_USER,
+        REG_OPTION_VOLATILE,
+        &key,
+        Path::new(r"C:\x.exe"),
+        &mut |level| {
+            if level == middle {
+                other = Some(register(&middle));
+            }
+        },
+    );
+    let guard = guard.unwrap_or_else(|e| panic!("register {key}: {e}"));
+    drop(guard);
+    assert_eq!(key_exists(HKEY_CURRENT_USER, &key), Ok(false));
+    assert_eq!(
+        key_exists(HKEY_CURRENT_USER, &middle),
+        Ok(true),
+        "the guard deleted a parent that someone else made"
+    );
+    drop(other);
+    assert_eq!(key_exists(HKEY_CURRENT_USER, &top), Ok(false));
+}
