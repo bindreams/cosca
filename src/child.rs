@@ -622,6 +622,12 @@ impl Child {
         // Decided once: the gate is not asked again after the kill, when a killed front may read as
         // neither exited nor in its cgroup. It comes before the root's state: a front
         // that may not be signalled is refused whatever the root's number names.
+        #[cfg(target_os = "macos")]
+        if let Some(result) =
+            self.tree_signal_untrusted(crate::containment::dispatch::TreeSignal::Kill, "kill_tree", earlier)
+        {
+            return result;
+        }
         #[cfg(unix)]
         let front = match self.kill_gate() {
             crate::elevation::front::Gate::Closed(unkillable) => return Err(unkillable),
@@ -630,12 +636,6 @@ impl Child {
             crate::elevation::front::Gate::CgroupOnly => Some(true),
         };
         // A root launchd holds, or one the handle cannot vouch for, is signalled by identity alone.
-        #[cfg(target_os = "macos")]
-        if let Some(result) =
-            self.tree_signal_untrusted(crate::containment::dispatch::TreeSignal::Kill, "kill_tree", earlier)
-        {
-            return result;
-        }
         // Precondition (a separate, unfixed gap — asserted, not fixed, here): if a pgid-based
         // mechanism's leader pid has been reaped AND RECYCLED onto a DIFFERENT, LIVE process
         // group, `killpg` would signal that unrelated group instead. `carries_recyclable_pgid`
