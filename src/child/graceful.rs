@@ -274,16 +274,21 @@ impl Child {
             Some(Err(e)) if !self.attached.names_tree_by_identity() => return Err(e),
             other => other,
         };
-        #[cfg(not(target_os = "macos"))]
-        let by_identity: Option<Result<(), Error>> = None;
+        let term_signal = || {
+            #[cfg(target_os = "macos")]
+            if let Some(result) = by_identity {
+                return result;
+            }
+            self.terminate_tree_signalling()
+        };
 
         #[cfg(test)]
         let term_result = match fault::take_force_terminate() {
-            fault::Forced::None => by_identity.unwrap_or_else(|| self.terminate_tree_signalling()),
+            fault::Forced::None => term_signal(),
             kind => Err(fault::forced_terminate_error(kind)),
         };
         #[cfg(not(test))]
-        let term_result = by_identity.unwrap_or_else(|| self.terminate_tree_signalling());
+        let term_result = term_signal();
 
         // Hold-and-continue ONLY for the error shapes #61's fix can produce as ORDINARY
         // outcomes — a confirmed refusal (`Error::Containment`) or a per-member-unconfirmed

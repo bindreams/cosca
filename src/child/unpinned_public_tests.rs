@@ -352,16 +352,19 @@ fn kill_tree_of_an_untrusted_session_root_kills_its_holders_only() {
     }
 }
 
-/// Mutant: `kill_tree` signals a session root's group by the same call without recording.
-/// A real control: a trusted session root is killed for real, not through the recorder.
+/// A real control: a trusted session root is killed for real, not through the recorder. The stdin
+/// is released after the kill, so a kill that never came ends the root with status 0 instead of
+/// hanging the wait.
+///
+/// Mutant: `kill_tree` of a trusted root signals nothing.
 #[skuld::test]
 fn kill_tree_kills_a_trusted_session_root() {
     let (child, writer) = session_blocker();
 
     child.kill_tree().expect("a trusted root is killed with its group");
 
-    crate::test_child::assert_killed("the session root", child.wait().expect("wait"));
     drop(writer);
+    crate::test_child::assert_killed("the session root", child.wait().expect("wait"));
 }
 
 // terminate_tree =====

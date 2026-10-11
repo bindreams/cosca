@@ -258,9 +258,11 @@ async fn kill_tree_of_an_untrusted_session_root_kills_its_holders_only() {
     }
 }
 
-/// A real control: a trusted session root is killed for real, not through the recorder.
+/// A real control: a trusted session root is killed for real, not through the recorder. The stdin
+/// is released after the kill, so a kill that never came ends the root with status 0 instead of
+/// hanging the wait.
 ///
-/// Mutant: `kill_tree` kills nothing of a trusted session root.
+/// Mutant: `kill_tree` of a trusted root signals nothing.
 #[skuld::test]
 async fn kill_tree_kills_a_trusted_session_root() {
     crate::tokio::test_runtime::assert_current_thread();
@@ -268,8 +270,8 @@ async fn kill_tree_kills_a_trusted_session_root() {
 
     child.kill_tree().expect("a trusted root is killed with its group");
 
-    crate::test_child::assert_killed("the session root", child.wait().await.expect("wait"));
     drop(writer);
+    crate::test_child::assert_killed("the session root", child.wait().await.expect("wait"));
 }
 
 // terminate_tree =====
@@ -380,9 +382,10 @@ async fn terminate_tree_of_an_untrusted_session_root_signals_its_holders_only() 
     }
 }
 
-/// A real control: a trusted session root is terminated for real, not through the recorder.
+/// A real control: a trusted session root is terminated for real, not through the recorder. The
+/// stdin is released after the signal, as for `kill_tree_kills_a_trusted_session_root`.
 ///
-/// Mutant: `terminate_tree` signals nothing for a trusted session root.
+/// Mutant: `terminate_tree` of a trusted root signals nothing.
 #[skuld::test]
 async fn terminate_tree_terminates_a_trusted_session_root() {
     use std::os::unix::process::ExitStatusExt as _;
