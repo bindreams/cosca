@@ -1076,8 +1076,8 @@ impl ProcSource {
     pub(crate) fn reap_unreported(mut self, pid: u32) -> ChildFate {
         crate::bounded::assert_may_block("reap_unreported");
         let done = crate::child::spawn::kill_and_reap_unreported(pid);
-        let reaped = matches!(done.fate, ChildFate::Reaped | ChildFate::Gone);
-        let leak = self.forget_quietly(reaped).map(|(_, leak)| leak);
+        // The backend is dropped at once, so whether the child was shown reaped elsewhere is unread.
+        let leak = self.forget_quietly(false).map(|(_, leak)| leak);
         done.warn(pid, leak)
     }
 
