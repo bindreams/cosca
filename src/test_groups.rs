@@ -29,7 +29,10 @@ impl Group {
 
 /// Fails the test with `message`, or only prints it while the test is already failing: a second panic during unwinding
 /// aborts the test binary.
-#[allow(dead_code, reason = "the lib uses it on Linux only; every integration root includes it")]
+#[allow(
+    dead_code,
+    reason = "the lib uses it on Linux only; every integration root includes it"
+)]
 pub fn fail_unless_panicking(message: String) {
     if std::thread::panicking() {
         eprintln!("{message}");
