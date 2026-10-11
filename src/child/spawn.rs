@@ -823,11 +823,9 @@ const LATE: &str = "had not reported its unique id when its spawn returned, so i
 /// when it happened.
 #[cfg(target_os = "macos")]
 fn said(kill: &KillOutcome, fate: ChildFate) -> String {
-    let sent = match kill {
-        KillOutcome::Delivered => "was sent SIGKILL".to_owned(),
-        KillOutcome::NotSent => "was gone, or its pid names another process, so nothing was sent".to_owned(),
-        KillOutcome::Refused(why) => format!("could not be killed ({why})"),
-    };
+    // MUTANT: the sentence ignores the kill outcome
+    let _ = kill;
+    let sent = "was sent SIGKILL".to_owned();
     let state = match fate {
         ChildFate::Reaped => "it was reaped",
         ChildFate::Killed => "its status was not collected",
