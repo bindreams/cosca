@@ -641,13 +641,9 @@ impl Child {
     /// a termination that did not happen).
     pub(crate) fn kill_sent(&mut self) -> Result<Sent, Error> {
         #[cfg(unix)]
-        let gate = self.kill_gate();
-        // A front's refusal is permanent and says nothing of the pid, so it outranks a root launchd
-        // holds, which the caller can do nothing about either way.
+        self.refuse_unpinned("kill", None)?;
         #[cfg(unix)]
-        if !matches!(gate, crate::elevation::front::Gate::Closed(_)) {
-            self.refuse_unpinned("kill", None)?;
-        }
+        let gate = self.kill_gate();
         self.kill_sent_gated(
             #[cfg(unix)]
             gate,
