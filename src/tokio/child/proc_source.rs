@@ -1068,7 +1068,8 @@ impl ProcSource {
     pub(crate) fn reap_unreported(mut self, pid: u32, unique: u64) -> ChildFate {
         crate::bounded::assert_may_block("reap_unreported");
         let done = crate::child::spawn::kill_and_reap_unreported(pid, unique);
-        if matches!(done.fate, ChildFate::Running { .. }) {
+        // MUTANT: a running child is forgotten, not released
+        if false {
             self.release();
             return done.warn(
                 pid,
