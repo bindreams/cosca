@@ -1,6 +1,8 @@
 use std::os::fd::{AsRawFd, OwnedFd};
 
-use super::{adopted_id, failed_spawn_error, read_report, register, seams, set_nonblocking, Report, Unadoptable};
+use super::{
+    adopted_id, await_report, failed_spawn_error, read_report, register, seams, set_nonblocking, Report, Unadoptable,
+};
 use crate::error::Error;
 
 /// A non-blocking pipe, as the parent's read end is.
@@ -126,19 +128,20 @@ fn a_failed_read_is_unassessable_with_its_error_and_not_a_corpse() {
     assert!(matches!(not_adopted.error, Error::Unassessable { source: Some(_), .. }));
 }
 
-/// A report not yet written when the spawn returned does not show the child died: it may still
-/// report and run the program, so it is not taken for a corpse.
+/// A report that came after the spawn returned does not show the child died: it ran its hook, and
+/// may have run the program, so it is not taken for a corpse. Its id is kept, to tear it down by.
 ///
-/// Mutant: it is taken for a child that died before `exec`.
+/// Mutant: it is taken for a child that died before `exec`, or its id is dropped.
 #[skuld::test]
-fn an_unwritten_report_may_have_started() {
-    let not_adopted = adopted_id(Report::Unwritten, 31).expect_err("no id");
-    assert_eq!(not_adopted.why, Unadoptable::Unreported);
+fn a_late_report_may_have_started_and_keeps_its_id() {
+    let not_adopted = adopted_id(Report::Late(77), 31).expect_err("not adopted");
+    assert_eq!(not_adopted.why, Unadoptable::Late(77));
     let error = not_adopted.error;
     assert!(
         !error.to_string().contains("died before exec"),
-        "an unreported child is not a corpse: {error}"
+        "a late child is not a corpse: {error}"
     );
+    assert!(error.to_string().contains("exec cannot be confirmed"), "{error}");
     assert!(
         matches!(error, Error::Io(ref e) if e.raw_os_error().is_none()),
         "{error:?}"
@@ -154,6 +157,7 @@ fn only_a_refusal_or_a_missing_report_proves_no_exec() {
     assert!(proves_no_exec(&Report::ChildRefused(libc::EPERM)));
     assert!(proves_no_exec(&Report::Missing));
     assert!(!proves_no_exec(&Report::Id(1)));
+    assert!(!proves_no_exec(&Report::Late(1)));
     assert!(!proves_no_exec(&Report::Unwritten));
     assert!(!proves_no_exec(&Report::ReadFailed(std::io::Error::from_raw_os_error(
         libc::EIO
@@ -233,20 +237,59 @@ fn a_child_killed_before_its_report_is_missing_on_ok() {
     child.wait().expect("reap the corpse");
 }
 
-/// A report found unwritten, and a child killed by a signal after that: the spawn answers that the
-/// program may have started, with no identity. The child may be a corpse by the time anyone looks,
-/// and the spawn cannot know; it is this process's unreaped child, so the spawn kills it and
-/// collects its status: `Reaped`. The seam closes the report pipe's write end before the child dies,
-/// which would make the parent read `Missing`, so the parent's read is forced to find nothing.
+/// A report found unwritten, and a child killed by a signal after that: the spawn waits on the
+/// pipe, and the child's death closes it with no report, so the program did not start. The seam closes
+/// the report pipe's write end before the child dies, and the parent's first read is forced to find
+/// nothing.
 ///
-/// Mutant: the spawn answers that the program did not start, `Gone`, or leaves the child `Running`.
+/// Mutant: the spawn does not wait, and answers that the program may have started.
 #[skuld::test]
-fn an_unwritten_report_then_a_killed_child_is_answered_may_be_running() {
+fn an_unwritten_report_then_a_killed_child_is_answered_died_before_exec() {
     let _killed = seams::force_child_killed_before_report();
     let _unwritten = seams::find_the_report_unwritten();
     let mut cmd = crate::command::Command::new();
     cmd.args(["/usr/bin/true"]);
-    let error = cmd.spawn().expect_err("an unreported child is not adopted");
-    let (_error, fate) = crate::child::spawn::failure::expect_may_have_started_with(error);
-    assert_eq!(fate, crate::error::ChildFate::Reaped);
+    let error = cmd
+        .spawn()
+        .expect_err("a child killed before its report is not adopted");
+    assert!(
+        !matches!(error, Error::MayHaveStarted { .. }),
+        "the program did not start: {error:?}"
+    );
+}
+
+// The wait for a report =====
+
+/// An id that is already in the pipe is a late report.
+///
+/// Mutant: the wait answers `Id`, not `Late`.
+#[skuld::test]
+fn awaiting_a_written_report_answers_late() {
+    use std::io::Write;
+    let (r, mut w) = pipe();
+    w.write_all(&report_bytes(1, 0xabc)).unwrap();
+    assert!(matches!(await_report(&r), Report::Late(0xabc)));
+}
+
+/// A pipe whose every write end closed with nothing written is EOF: no report.
+///
+/// Mutant: the wait answers `Unwritten`, or never returns.
+#[skuld::test]
+fn awaiting_a_closed_empty_pipe_answers_missing() {
+    let (r, w) = pipe();
+    drop(w);
+    assert!(matches!(await_report(&r), Report::Missing));
+}
+
+/// The wait blocks until a report arrives from another thread, whichever of the two runs first.
+///
+/// Mutant: the wait returns at once with nothing.
+#[skuld::test]
+fn awaiting_waits_for_a_report_written_by_another_thread() {
+    use std::io::Write;
+    let (r, mut w) = pipe();
+    let writer = std::thread::spawn(move || w.write_all(&report_bytes(1, 0xdef)).unwrap());
+    let report = await_report(&r);
+    writer.join().expect("the writer thread");
+    assert!(matches!(report, Report::Late(0xdef)), "{report:?}");
 }
