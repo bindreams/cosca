@@ -277,6 +277,10 @@ fn fixture_a_cgroup_test_that_leaves_a_leaf(#[fixture(cgroup)] _group: &Group) {
     std::fs::create_dir(&leaf).expect("make the leaf");
     let child = leaf.join("child");
     std::fs::create_dir(&child).expect("make a child cgroup");
+    #[allow(
+        clippy::zombie_processes,
+        reason = "the leaf check kills the member, and init reaps it once this process exits"
+    )]
     let member = crate::test_spawn::spawn(
         std::process::Command::new("sleep")
             .arg("3600")
