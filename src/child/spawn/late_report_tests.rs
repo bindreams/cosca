@@ -27,7 +27,7 @@ pub(crate) const SAID_KILLED: &str = "was sent SIGKILL; its status was not colle
 pub(crate) const SAID_REFUSED_RUNNING: &str = "could not be killed (";
 pub(crate) const SAID_STILL_RUNNING: &str = "it is still running";
 /// ... for a kill that sent nothing.
-pub(crate) const SAID_NOT_SENT: &str = "so nothing was sent";
+pub(crate) const SAID_NOT_SENT: &str = "its pid names another process, so nothing was sent";
 pub(crate) const ZOMBIE: &str = "stays a zombie once it exits";
 
 /// The `warn`s since `mark` that name `pid` as `child {pid} `, on this thread, with their text.
@@ -136,6 +136,9 @@ fn macos_sync_spawn_with_fds_0_and_1_closed_leaves_no_child_behind() {
     };
     crate::log_capture::install();
     let (mut cmd, writer) = sync_blocker();
+    // Opened before the close, so it lands above stdio: a closed stdout cannot be inherited.
+    let null = std::fs::File::open("/dev/null").expect("open /dev/null");
+    cmd.stdout(crate::stdio::Stdio::from_file(null)).expect("set stdout");
     let restore = RestoreStdio::close(&done, &[0, 1]);
     let spawned = cmd.spawn();
     drop(restore);
