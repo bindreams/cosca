@@ -136,7 +136,8 @@ impl Channel {
         // Closed before the read, so a child that never wrote leaves the pipe at EOF.
         drop(write_end);
         let report = match read_report(&read_end) {
-            Report::Unwritten => await_report(&read_end),
+            // MUTANT: the spawn does not wait for the report
+            Report::Unwritten => Report::Missing,
             report => report,
         };
         debug_assert!(!matches!(report, Report::Unwritten), "the wait answers a report");
