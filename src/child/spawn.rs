@@ -788,9 +788,16 @@ pub(crate) fn kill_and_reap_unreported(pid: u32) -> Unreported {
 impl Unreported {
     /// The event's one `warn`: what happened to child `pid`, with what a caller forgot (`leak`).
     pub(crate) fn warn(self, pid: u32, leak: Option<&str>) -> ChildFate {
+        let what = match self.fate {
+            ChildFate::Reaped => "was killed and reaped as this process's own child",
+            ChildFate::Killed => "was killed, but its status was not collected",
+            ChildFate::Running { .. } => "is still running: its kill did not end it",
+            ChildFate::Gone => "was already gone when it was signalled",
+            ChildFate::Unknown => "could not be waited on, so what became of it is unknown",
+        };
         let mut said = format!(
             "child {pid} had not reported its unique id when its spawn returned, so it may have started the \
-             program; it was not adopted, and was killed and reaped as this process's own child: {:?}",
+             program; it was not adopted, and {what} ({:?})",
             self.fate
         );
         for note in &self.notes {

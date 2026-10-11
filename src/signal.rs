@@ -276,9 +276,11 @@ pub(crate) fn via_verified_pid(pid: u32, identity: Option<u64>, sig: Sig) -> io:
 }
 
 /// Send `sig` to `pid` by number with no identity check, for a child that is this process's own and
-/// unreaped: its pid is pinned by being a zombie at worst, so it cannot name a stranger. Only a
-/// teardown whose caller owns the child may use this (a child that reported no unique id). A pid
-/// already gone is `Sent::Gone`.
+/// unreaped. An unreaped child's pid is held by its zombie, so it cannot name a stranger, provided
+/// nothing else reaps the child before the spawn returns: the contract of `Command::contain`
+/// (`command.rs`, "the child must stay this process's to reap"), which forbids `SIGCHLD` set to
+/// `SIG_IGN` and a `waitpid(-1)` reaper. Only a teardown whose caller owns the child may use this (a
+/// child that reported no unique id). A pid already gone is `Sent::Gone`.
 #[cfg(target_os = "macos")]
 pub(crate) fn via_owned_pid(pid: u32, sig: Sig) -> io::Result<Sent> {
     // `kill(0, sig)` signals the caller's whole process group.
