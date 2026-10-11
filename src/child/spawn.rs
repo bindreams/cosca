@@ -1024,7 +1024,8 @@ fn abandon_unadopted(
             #[cfg(test)]
             fault::capture(ProcessId::of(pid));
             // A front is sent nothing: it is left running and unreaped, with its note.
-            if front.is_some() {
+            // MUTANT: a front is torn down like any child
+            if false {
                 warn_late_front(pid, None);
                 drop(child);
                 return SpawnFailure::started(
