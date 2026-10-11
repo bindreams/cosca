@@ -773,6 +773,10 @@ pub(crate) fn kill_and_reap_verified(pid: u32, unique: u64, id: Option<ProcessId
     fate
 }
 
+thread_local! {
+    static LATE_TEARDOWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// What a teardown that leaves its child running leaves behind, when nothing holds the child's handle.
 #[cfg(target_os = "macos")]
 const ZOMBIE_NOTE: &str = "is left unreaped: it stays a zombie once it exits";
@@ -805,7 +809,9 @@ pub(crate) struct Unreported {
 pub(crate) fn kill_and_reap_unreported(pid: u32, unique: u64) -> Unreported {
     let mut notes = Vec::new();
     let mut breach = None;
+    LATE_TEARDOWN.with(|f| f.set(true));
     let (fate, kill) = kill_and_reap_noting(pid, unique, None, &mut notes, &mut breach);
+    LATE_TEARDOWN.with(|f| f.set(false));
     Unreported {
         fate,
         kill,
@@ -889,7 +895,13 @@ fn kill_and_reap_noting(
     use crate::wait::exit_only::Foreign;
 
     let target = crate::wait::exit_only::Target::pid(pid, Some(unique));
-    match via_verified_pid(pid, Some(unique), Sig::Kill) {
+    // MUTANT: a late child's kill is not sent
+    let sent = if LATE_TEARDOWN.with(std::cell::Cell::get) {
+        Ok(Sent::Delivered)
+    } else {
+        via_verified_pid(pid, Some(unique), Sig::Kill)
+    };
+    match sent {
         Ok(Sent::Delivered) => {
             // A fixture that only the kill would end is released here when no kill was sent.
             #[cfg(test)]
