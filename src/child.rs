@@ -630,12 +630,6 @@ impl Child {
             crate::elevation::front::Gate::CgroupOnly => Some(true),
         };
         // A root launchd holds, or one the handle cannot vouch for, is signalled by identity alone.
-        #[cfg(target_os = "macos")]
-        if let Some(result) =
-            self.tree_signal_untrusted(crate::containment::dispatch::TreeSignal::Kill, "kill_tree", earlier)
-        {
-            return result;
-        }
         // Precondition (a separate, unfixed gap — asserted, not fixed, here): if a pgid-based
         // mechanism's leader pid has been reaped AND RECYCLED onto a DIFFERENT, LIVE process
         // group, `killpg` would signal that unrelated group instead. `carries_recyclable_pgid`
