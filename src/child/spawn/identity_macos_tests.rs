@@ -810,19 +810,23 @@ pub(crate) const SAID_RUNNING: &str = "is still running: its kill did not end it
 /// Asserts `pid` is no child of this process any more (`waitpid` answers `ECHILD`), that the
 /// teardown sent it a `SIGKILL` by pid, and that its one event produced exactly one `warn`.
 pub(crate) fn assert_reaped_and_warned_once(pid: u32, mark: usize, sent: &[crate::send_log::Entry]) {
-    use crate::send_log::Via;
-    assert_eq!(
-        sent.iter()
-            .filter(|e| **e == (pid, crate::signal::Sig::Kill, Via::Pid))
-            .count(),
-        1,
-        "the teardown must send the kill: {sent:?}"
-    );
+    assert_kill_sent(pid, sent);
     // SAFETY: `pid` was this test's own child; `WNOHANG` blocks on nothing.
     let rc = unsafe { libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), libc::WNOHANG) };
     assert_eq!(rc, -1, "the child must be reaped already, waitpid gave {rc}");
     assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
     assert_warned_once(pid, mark, SAID_REAPED, &[SAID_KILLED, SAID_RUNNING]);
+}
+
+/// Asserts the teardown sent `pid` one `SIGKILL`, by pid. Asserted before any blocking wait on the
+/// child, so a teardown that sends none fails here rather than hanging the test.
+pub(crate) fn assert_kill_sent(pid: u32, sent: &[crate::send_log::Entry]) {
+    let kill = (pid, crate::signal::Sig::Kill, crate::send_log::Via::Pid);
+    assert_eq!(
+        sent.iter().filter(|e| **e == kill).count(),
+        1,
+        "the teardown must send the kill: {sent:?}"
+    );
 }
 
 /// Asserts the teardown of `pid` produced exactly one `warn` that names it, that the warn says
@@ -887,6 +891,7 @@ fn macos_sync_spawn_of_an_unreported_child_whose_kill_is_refused_leaves_it_runni
 fn macos_sync_spawn_of_an_unreported_child_whose_wait_fails_is_killed() {
     crate::log_capture::install();
     let (mut cmd, writer) = sync_blocker();
+    let sent = crate::send_log::Capture::start();
     let mark = crate::log_capture::mark();
     let err = {
         let _unwritten = unique_report::seams::find_the_report_unwritten();
@@ -899,6 +904,7 @@ fn macos_sync_spawn_of_an_unreported_child_whose_wait_fails_is_killed() {
     };
     let pid = id.pid();
     assert_eq!(fate, crate::error::ChildFate::Killed);
+    assert_kill_sent(pid, &sent.entries());
     assert_warned_once(pid, mark, SAID_KILLED, &[SAID_REAPED, SAID_RUNNING]);
     // The wait failed, so the zombie is the test's to collect; its status shows the spawn's kill.
     let mut status = 0;
