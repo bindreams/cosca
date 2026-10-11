@@ -69,30 +69,36 @@ impl Drop for Scratch {
     }
 }
 
-/// A chain of cgroups `depth` deep, each named `name`, made level by level through held
-/// descriptors, as a path to its bottom may exceed `PATH_MAX`. Removes what is left of it, deepest
-/// first, when dropped.
+/// A chain of cgroups, one inside the next, made level by level through held descriptors, as a
+/// path to its bottom may exceed `PATH_MAX`. Removes what is left of it, deepest first, when
+/// dropped.
 pub(crate) struct DeepTree {
     root: OwnedFd,
-    name: String,
+    names: Vec<String>,
     /// `levels[0]` is the chain's first cgroup.
     levels: Vec<OwnedFd>,
 }
 
 impl DeepTree {
+    /// `depth` levels, each named `name`.
     pub(crate) fn new(root: &OwnedFd, name: &str, depth: usize) -> DeepTree {
+        DeepTree::with_names(root, vec![name.to_owned(); depth])
+    }
+
+    /// One level for each of `names`, outermost first.
+    pub(crate) fn with_names(root: &OwnedFd, names: Vec<String>) -> DeepTree {
         use rustix::fs::{Mode, OFlags};
         let mut tree = DeepTree {
             root: rustix::io::fcntl_dupfd_cloexec(root, 3).expect("dup the root"),
-            name: name.to_owned(),
+            names,
             levels: Vec::new(),
         };
-        for _ in 0..depth {
+        for name in &tree.names.clone() {
             let parent = tree.levels.last().unwrap_or(&tree.root);
-            rustix::fs::mkdirat(parent, name, Mode::from_raw_mode(0o777)).expect("make a level");
+            rustix::fs::mkdirat(parent, name.as_str(), Mode::from_raw_mode(0o777)).expect("make a level");
             let level = rustix::fs::openat(
                 parent,
-                name,
+                name.as_str(),
                 OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::empty(),
             )
@@ -112,7 +118,7 @@ impl Drop for DeepTree {
     fn drop(&mut self) {
         for i in (0..self.levels.len()).rev() {
             let parent = if i == 0 { &self.root } else { &self.levels[i - 1] };
-            match rustix::fs::unlinkat(parent, &self.name, rustix::fs::AtFlags::REMOVEDIR) {
+            match rustix::fs::unlinkat(parent, self.names[i].as_str(), rustix::fs::AtFlags::REMOVEDIR) {
                 Ok(()) | Err(rustix::io::Errno::NOENT) => {}
                 Err(e) if std::thread::panicking() => eprintln!("remove a level of the chain: {e}"),
                 Err(e) => panic!("remove a level of the chain: {e}"),
