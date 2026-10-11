@@ -792,12 +792,6 @@ impl Child {
     pub fn terminate_tree(&self) -> Result<(), Error> {
         self.require_contained()?;
         // A root launchd holds, or one the handle cannot vouch for, is signalled by identity alone.
-        #[cfg(target_os = "macos")]
-        if let Some(result) =
-            self.tree_signal_untrusted(crate::containment::dispatch::TreeSignal::Term, "terminate_tree", None)
-        {
-            return result;
-        }
         self.terminate_tree_signalling()
     }
 
