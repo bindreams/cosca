@@ -401,6 +401,60 @@ async fn macos_tokio_spawn_of_an_unreported_child_kills_and_reaps_it() {
     drop(writer);
 }
 
+/// Async twin of `macos_sync_spawn_of_an_unreported_child_whose_kill_is_refused_leaves_it_running`.
+#[skuld::test]
+async fn macos_tokio_spawn_of_an_unreported_child_whose_kill_is_refused_leaves_it_running() {
+    use crate::child::spawn::identity_macos_tests::assert_warned_once;
+    crate::log_capture::install();
+    let (mut cmd, writer) = tokio_blocker();
+    let mark = crate::log_capture::mark();
+    let err = {
+        let _unwritten = crate::child::spawn::unique_report::seams::find_the_report_unwritten();
+        let _refused = crate::signal::seams::refuse_kills();
+        cmd.spawn().expect_err("an unreported child is not adopted")
+    };
+    let (_err, fate) = crate::child::spawn::failure::expect_may_have_started_with(err);
+    let Some(crate::identity::Resolved::Found(id)) = crate::child::spawn::fault::take_captured() else {
+        panic!("the spawn captured the child");
+    };
+    let pid = id.pid();
+    assert_eq!(fate, crate::error::ChildFate::Running { id: None });
+    assert!(has_not_exited(pid), "nothing ended the child");
+    assert_warned_once(pid, mark);
+    end_unsignalled_and_reap(pid);
+    drop(writer);
+}
+
+/// Async twin of `macos_sync_spawn_of_an_unreported_child_whose_wait_fails_is_killed`.
+#[skuld::test]
+async fn macos_tokio_spawn_of_an_unreported_child_whose_wait_fails_is_killed() {
+    use crate::child::spawn::identity_macos_tests::assert_warned_once;
+    crate::log_capture::install();
+    let (mut cmd, writer) = tokio_blocker();
+    let mark = crate::log_capture::mark();
+    let err = {
+        let _unwritten = crate::child::spawn::unique_report::seams::find_the_report_unwritten();
+        let _failed = force_peek_once(Err(std::io::Error::other("forced wait failure")));
+        cmd.spawn().expect_err("an unreported child is not adopted")
+    };
+    let (_err, fate) = crate::child::spawn::failure::expect_may_have_started_with(err);
+    let Some(crate::identity::Resolved::Found(id)) = crate::child::spawn::fault::take_captured() else {
+        panic!("the spawn captured the child");
+    };
+    let pid = id.pid();
+    assert_eq!(fate, crate::error::ChildFate::Killed);
+    assert_warned_once(pid, mark);
+    let mut status = 0;
+    // SAFETY: `pid` is this test's own unreaped child, killed by the spawn.
+    let reaped = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
+    assert_eq!(reaped, pid as libc::pid_t);
+    assert!(
+        libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL,
+        "{status:#x}"
+    );
+    drop(writer);
+}
+
 /// Async twin of `macos_sync_spawn_of_an_unreported_front_leaves_it_running_and_says_so`.
 #[skuld::test]
 async fn macos_tokio_spawn_of_an_unreported_front_leaves_it_running_and_says_so() {
