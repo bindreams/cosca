@@ -298,7 +298,7 @@ impl Child {
             "graceful_shutdown_tree",
             None,
         ) {
-            Some(Err(e)) if !self.os.attached.names_tree_by_identity() => return Err(e),
+            Some(Err(e)) if false && !self.os.attached.names_tree_by_identity() => return Err(e),
             other => other,
         };
         let term_signal = || {
