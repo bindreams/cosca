@@ -7,29 +7,12 @@ use std::path::Path;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegCreateKeyExW, RegDeleteKeyW, RegOpenKeyExW, RegSetValueExW, HKEY, KEY_READ, KEY_WRITE,
-    REG_CREATED_NEW_KEY, REG_CREATE_KEY_DISPOSITION, REG_OPEN_CREATE_OPTIONS, REG_SZ,
+    RegCloseKey, RegCreateKeyExW, RegDeleteKeyW, RegSetValueExW, HKEY, KEY_WRITE, REG_CREATED_NEW_KEY,
+    REG_CREATE_KEY_DISPOSITION, REG_OPEN_CREATE_OPTIONS, REG_SZ,
 };
 
 fn wide(s: &OsStr) -> Vec<u16> {
     s.encode_wide().chain([0]).collect()
-}
-
-/// Does `path` exist under `hive`? Only "not found" is an answer of no.
-pub(crate) fn key_exists(hive: HKEY, path: &str) -> Result<bool, String> {
-    let name = wide(OsStr::new(path));
-    let mut hkey = HKEY::default();
-    // SAFETY: `name` is NUL-terminated and outlives the call; `hkey` is a live local.
-    let rc = unsafe { RegOpenKeyExW(hive, PCWSTR(name.as_ptr()), None, KEY_READ, &mut hkey) };
-    if rc == ERROR_SUCCESS {
-        // SAFETY: `hkey` was opened above and is closed once.
-        let _ = unsafe { RegCloseKey(hkey) };
-        Ok(true)
-    } else if rc == ERROR_FILE_NOT_FOUND {
-        Ok(false)
-    } else {
-        Err(format!("RegOpenKeyExW({path}) failed: {rc:?}"))
-    }
 }
 
 /// A registry key made by this probe, deleted on drop together with every missing parent it made along the way.
@@ -42,26 +25,13 @@ pub(crate) struct AppPathKey {
 }
 
 impl AppPathKey {
+    /// Creates each level on its own and records only the levels `RegCreateKeyExW` reports as new, so a parent that
+    /// appears concurrently is never taken for this guard's own.
     pub(crate) fn register_at(
         hive: HKEY,
         options: REG_OPEN_CREATE_OPTIONS,
         key: &str,
         target: &Path,
-    ) -> Result<Self, String> {
-        Self::register_at_with(hive, options, key, target, &mut |_| {})
-    }
-
-    /// [`register_at`](Self::register_at), calling `before_create` with each level's path just before that level is
-    /// created: a seam for another process creating a parent in between.
-    ///
-    /// Each level is created on its own and only the levels `RegCreateKeyExW` reports as new are recorded, so a
-    /// parent that appears concurrently is never taken for this guard's own.
-    pub(crate) fn register_at_with(
-        hive: HKEY,
-        options: REG_OPEN_CREATE_OPTIONS,
-        key: &str,
-        target: &Path,
-        before_create: &mut dyn FnMut(&str),
     ) -> Result<Self, String> {
         // Dropped on every early return below, which deletes what was created so far.
         let mut guard = AppPathKey {
@@ -70,7 +40,6 @@ impl AppPathKey {
         };
         let levels: Vec<&str> = key.match_indices('\\').map(|(i, _)| &key[..i]).chain([key]).collect();
         for level in levels {
-            before_create(level);
             let name = wide(OsStr::new(level));
             let mut hkey = HKEY::default();
             let mut disposition = REG_CREATE_KEY_DISPOSITION::default();

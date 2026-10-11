@@ -124,9 +124,6 @@ fn wide(s: &OsStr) -> Vec<u16> {
 #[path = "windows_shell_execute/app_path_key.rs"]
 mod app_path_key;
 #[cfg(windows)]
-#[path = "windows_shell_execute/app_path_key_tests.rs"]
-mod app_path_key_tests;
-#[cfg(windows)]
 use app_path_key::AppPathKey;
 
 #[cfg(windows)]

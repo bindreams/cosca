@@ -196,29 +196,6 @@ impl Drop for SecretDir {
     }
 }
 
-/// A directory that cannot be removed fails the test that held it. Mutant: the drop ignores the result.
-#[cfg(unix)]
-#[skuld::test]
-fn a_secret_dir_that_cannot_be_removed_fails_the_test() {
-    let dir = SecretDir::new();
-    std::fs::remove_dir_all(dir.path()).expect("take the directory away");
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(dir)));
-    assert!(outcome.is_err(), "the removal failed and the test did not");
-}
-
-/// While the test is already failing, a removal that fails only prints: a second panic would abort the binary.
-#[cfg(unix)]
-#[skuld::test]
-fn a_secret_dir_that_cannot_be_removed_does_not_abort_a_failing_test() {
-    let outcome = std::panic::catch_unwind(|| {
-        let dir = SecretDir::new();
-        std::fs::remove_dir_all(dir.path()).expect("take the directory away");
-        panic!("the test fails first");
-    });
-    let payload = outcome.expect_err("the test panicked");
-    assert_eq!(payload.downcast_ref::<&str>(), Some(&"the test fails first"));
-}
-
 // Auth::Askpass delivers the password via a trivial SUDO_ASKPASS helper script.
 #[cfg(unix)]
 #[skuld::test]

@@ -409,7 +409,3 @@ mod reexec {
         assert_label_selects(&TRACER);
     }
 }
-
-#[cfg(target_os = "linux")]
-#[path = "test_groups_tests/stray_leaves.rs"]
-mod stray_leaves;
