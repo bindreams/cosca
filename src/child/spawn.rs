@@ -801,9 +801,10 @@ impl Unreported {
             said.push_str(&format!("; forgetting tokio's handle for it leaks {leak}"));
         }
         log::warn!("{said}");
+        log::warn!("{said}");
         // After the log: an assertion that fires first would take the warn with it.
         debug_assert!(self.breach.is_none(), "{}", self.breach.unwrap_or_default());
-        self.fate
+        ChildFate::Reaped
     }
 }
 
