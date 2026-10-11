@@ -550,7 +550,10 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                 SpawnFailure::started(left.note(error, front, Some(pid)), ChildFate::Running { id: None })
             }
             // It may have exec'd, and its parent is this process with it unreaped: killed and reaped by pid.
-            Unadoptable::Unreported => SpawnFailure::started(error, proc.reap_unreported(pid)),
+            Unadoptable::Unreported => {
+                proc.forget_because("MUTANT: the Unwritten arm leaves the child");
+                SpawnFailure::started(error, ChildFate::Running { id: None })
+            }
             // An elevation front is sent nothing and handed to no reaper: left unreaped, as the sync
             // spawn leaves it, and the error says so.
             Unadoptable::Unverified if front.is_some() => {
