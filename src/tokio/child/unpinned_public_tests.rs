@@ -25,9 +25,27 @@ pub(super) fn blocker(mode: ContainMode) -> (crate::tokio::Child, std::io::PipeW
     (cmd.spawn().expect("spawn"), writer)
 }
 
-/// A tree-walk child: its root is signalled by identity.
+/// A blocker spawned with the marker's install made to fail, so the spawn degrades to the
+/// mechanism the marker takes priority over.
+fn degraded_blocker(mode: ContainMode) -> (crate::tokio::Child, std::io::PipeWriter) {
+    use crate::containment::fdmarker::fault::{lock_for_log_assertion, set_fault, Fault};
+    // A failed install logs, and a sibling test scans the shared log for its own text.
+    let _serialize = lock_for_log_assertion();
+    set_fault(Some(Fault::Pipe));
+    let spawned = blocker(mode);
+    set_fault(None);
+    spawned
+}
+
+/// A tree-walk child: its root is signalled by identity. (On macOS `TreeWalk` is only the
+/// mechanism when the marker cannot be installed, which is made to happen here.)
 pub(super) fn walked_blocker() -> (crate::tokio::Child, std::io::PipeWriter) {
-    blocker(ContainMode::TreeWalk)
+    let (child, writer) = degraded_blocker(ContainMode::TreeWalk);
+    assert!(
+        matches!(child.os.attached, crate::containment::Attached::TreeWalk(_)),
+        "the test needs a tree walk"
+    );
+    (child, writer)
 }
 
 /// A session (fd-marker) child: its group is signalled with `killpg`.
@@ -40,14 +58,9 @@ pub(super) fn session_blocker() -> (crate::tokio::Child, std::io::PipeWriter) {
     (child, writer)
 }
 
-/// A process-group child: the marker's install is made to fail, so the spawn degrades to the group.
+/// A process-group child.
 pub(super) fn group_blocker() -> (crate::tokio::Child, std::io::PipeWriter) {
-    use crate::containment::fdmarker::fault::{lock_for_log_assertion, set_fault, Fault};
-    // A failed install logs, and a sibling test scans the shared log for its own text.
-    let _serialize = lock_for_log_assertion();
-    set_fault(Some(Fault::Pipe));
-    let (child, writer) = blocker(ContainMode::Session);
-    set_fault(None);
+    let (child, writer) = degraded_blocker(ContainMode::Session);
     assert!(
         matches!(child.os.attached, crate::containment::Attached::ProcessGroup(_)),
         "the test needs a process group"
