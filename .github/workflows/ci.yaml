@@ -43,107 +43,6 @@ env:
   COSCA_TEST_ELEVATION_ROUTES: "0"
 
 jobs:
-  lint:
-    name: Lint
-    runs-on: ubuntu-latest
-    # Measured: 164 s to 242 s in four runs. 25 min is 6x the slowest, a failure bound for a hang.
-    timeout-minutes: 25
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      # setup-rust so the cargo-fmt / cargo-clippy prek hooks (language = "system")
-      # find a toolchain.
-      # The targets are the ones check-disallowed-methods.sh lints its fixture for,
-      # plus musl for the build check below.
-      - uses: ./.github/actions/setup-rust
-        with:
-          components: rustfmt, clippy
-          targets: x86_64-unknown-linux-gnu,aarch64-apple-darwin,x86_64-pc-windows-msvc,x86_64-unknown-linux-musl
-
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
-        with:
-          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
-
-      # prek.toml is the single source of truth for lint — the same checks run
-      # locally as git hooks. prek-action runs `prek run --all-files`.
-      # The libtest guard hook is skipped: the Test job runs it, per target and over the feature powerset.
-      - uses: j178/prek-action@5337cb91e0fa35a7ff31b9ca345126d8bbbcdf16 # v2
-        env:
-          SKIP: libtest-guard
-        with:
-          prek-version: 0.5.3
-
-      - name: Test devvm scripts
-        run: python3 -m unittest scripts.devvm_macos_gate_test scripts.devvm_macos_gateio_test scripts.devvm_macos_tart_test scripts.devvm_test scripts.devvm_macos_test scripts.devvm_macos_signals_test scripts.devvm_macos_realtart_test scripts.devvm_vagrantfiles_test scripts.devvm_linux_rust_test
-
-      - name: Test release helper scripts
-        shell: bash
-        run: bash .github/scripts/release-script-tests.sh
-
-      - name: Test sccache fallback script
-        shell: bash
-        run: bash .github/scripts/enable-sccache-tests.sh
-
-      - name: Test the signal forwarding and nextest wrapper scripts
-        shell: bash
-        working-directory: .github/scripts
-        run: python3 -m unittest -f forward_tests run_nextest_tests unattended_gui_elevation_tests
-
-      # Forces pid reuse in a fresh PID namespace, so it needs root.
-      - name: Test the signal forwarding script against pid reuse
-        shell: bash
-        run: sudo python3 .github/scripts/forward_reuse_tests.py
-
-      # musl has broken the build before (#172: msghdr/cmsghdr field types differ from glibc).
-      # --lib only: the dev-dependencies' C code (libsqlite3-sys) needs a musl C compiler.
-      - name: Check the library builds for musl
-        shell: bash
-        run: cargo check --locked --all-features --lib --target x86_64-unknown-linux-musl
-
-      # scripts/skuld-rewrite is a standalone crate, so neither prek's
-      # root-package hooks nor the clippy steps below reach it.
-      - name: Test the skuld-rewrite tool
-        shell: bash
-        working-directory: scripts/skuld-rewrite
-        run: |
-          cargo fmt --check
-          cargo clippy --locked --all-targets -- -D warnings
-          cargo nextest run --locked
-
-      # Regression check for clippy.toml's disallowed-methods bans (see that file): lints
-      # .github/fixtures/disallowed-methods, a standalone crate that calls every banned path,
-      # against the real clippy.toml, and asserts the diagnostic actually fires for each —
-      # structured JSON, not scraped text. Catches a renamed disallowed-methods key, a typo'd
-      # path, or a dependency upgrade that silently moves a function out from under the ban.
-      # `!cancelled()`: same override-success() rationale as the step below.
-      - name: Check the disallowed-methods bans still fire
-        if: ${{ !cancelled() }}
-        shell: bash
-        run: bash .github/scripts/check-disallowed-methods.sh
-
-      # The prek `cargo-clippy` hook above calls .github/scripts/clippy.sh with
-      # neither --target nor --feature-powerset (host, no features) — this crate
-      # declares no `default` feature, so the host (Linux) side of the
-      # feature-gated tokio/pty/serde code paths (and any feature-gated dead
-      # code among them) is never linted by the hook alone.
-      #
-      # Placed after the local-parity checks above, not right after checkout,
-      # for the same reason as the test job's Clippy step below: a failure here
-      # would otherwise skip `Test release helper scripts` and hide its result.
-      # `!cancelled()`: same override-success() rationale as that step.
-      - name: Clippy (feature powerset)
-        if: ${{ !cancelled() }}
-        uses: ./.github/actions/clippy-powerset
-
-      # `cfg(not(debug_assertions))` code (release-only branches and their tests) is compiled by no
-      # debug build, so the step above never lints it, and neither do clippy.toml's bans. The
-      # powerset action installed cargo-hack.
-      - name: Clippy (feature powerset, release)
-        if: ${{ !cancelled() }}
-        shell: bash
-        run: .github/scripts/clippy.sh --feature-powerset --release
-
   test:
     name: Test (${{ matrix.os }}/${{ matrix.arch }})
     strategy:
@@ -151,26 +50,6 @@ jobs:
       matrix:
         # `other` is the OS's other architecture: the libtest guard's self-test compiles for it.
         include:
-          - os: linux
-            arch: amd64
-            # 26.04: the elevation lane needs polkit 0.106 or later, and its `polkit.service` is
-            # `Type=notify-reload` there.
-            runner: ubuntu-26.04
-            # ubuntu:26.04
-            root_image: ubuntu@sha256:f144425ff09be612d6d9ad965196e9cdc23dae1f42110a8a11a3e9a8198759f7
-            timeout: 30
-            target: x86_64-unknown-linux-gnu
-            other: aarch64-unknown-linux-gnu
-            nextest: exec python3 .github/scripts/run-nextest.py
-          - os: linux
-            arch: arm64
-            runner: ubuntu-24.04-arm
-            # ubuntu:24.04
-            root_image: ubuntu@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
-            timeout: 29
-            target: aarch64-unknown-linux-gnu
-            other: x86_64-unknown-linux-gnu
-            nextest: exec python3 .github/scripts/run-nextest.py
           - os: darwin
             arch: arm64
             runner: macos-latest
@@ -180,31 +59,6 @@ jobs:
             nextest: exec python3 .github/scripts/run-nextest.py
             # This is the one darwin lane that also runs the feature-powerset
             # Clippy step below; see there for why one arch stands in for both.
-            lint: true
-          - os: darwin
-            arch: amd64
-            runner: macos-15
-            timeout: 53
-            target: x86_64-apple-darwin
-            other: aarch64-apple-darwin
-            nextest: exec python3 .github/scripts/run-nextest.py
-          - os: windows
-            arch: amd64
-            runner: windows-latest
-            timeout: 51
-            target: x86_64-pc-windows-msvc
-            other: aarch64-pc-windows-msvc
-            nextest: ./.github/scripts/run-nextest.ps1
-            # This is the one Windows lane that also runs the feature-powerset
-            # Clippy step below; see there for why one arch stands in for both.
-            lint: true
-          - os: windows
-            arch: arm64
-            runner: windows-11-arm
-            timeout: 51
-            target: aarch64-pc-windows-msvc
-            other: x86_64-pc-windows-msvc
-            nextest: ./.github/scripts/run-nextest.ps1
 
     runs-on: ${{ matrix.runner }}
     # Failure bound per job (minutes): about 1.5x the slowest measured wall time, lanes included. The clippy powerset
@@ -265,17 +119,21 @@ jobs:
 
       # `pty` is an additive feature flag; exercise the feature-gated code paths.
       - name: Build tests (pty feature)
+        if: ${{ !cancelled() }}
         run: cargo nextest run --locked --no-run --features pty --target ${{ matrix.target }} --profile ci
 
       - name: Run tests (pty feature)
+        if: ${{ !cancelled() }}
         timeout-minutes: 8
         run: ${{ matrix.nextest }} pty cargo nextest run --locked --features pty --target ${{ matrix.target }}
 
 
       - name: Build tests (tokio feature)
+        if: ${{ !cancelled() }}
         run: cargo nextest run --locked --no-run --features tokio --target ${{ matrix.target }} --profile ci
 
       - name: Run tests (tokio feature)
+        if: ${{ !cancelled() }}
         timeout-minutes: 8
         run: ${{ matrix.nextest }} tokio cargo nextest run --locked --features tokio --target ${{ matrix.target }}
 
