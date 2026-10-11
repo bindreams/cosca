@@ -142,7 +142,7 @@ impl Child {
         fault::run_hook(fault::HookPoint::BeforeEscalation);
         // A root orphaned during the grace is no longer ours to kill.
         #[cfg(unix)]
-        self.refuse_unpinned("kill", Some("the SIGTERM"))?;
+        self.refuse_unpinned("kill", None)?;
         // Escalate; an Err returns HERE, subsuming any watch Err (deliberate — mirrors kill_tree's
         // both-fail disposition). A live front outside a cgroup is not signalled; any other child's
         // refused kill stays the raw `Io`.

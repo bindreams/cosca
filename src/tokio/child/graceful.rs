@@ -163,7 +163,7 @@ impl Child {
             // does not read the state again.
             #[cfg(unix)]
             {
-                self.refuse_unpinned("kill", Some("the SIGTERM"))?;
+                self.refuse_unpinned("kill", None)?;
                 let gate = self.kill_gate();
                 self.kill_sent_gated(gate)?;
             }
