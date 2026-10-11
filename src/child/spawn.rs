@@ -781,6 +781,7 @@ pub(crate) fn kill_and_reap_unreported(pid: u32) -> Unreported {
     let mut notes = Vec::new();
     let mut breach = None;
     let fate = kill_and_reap_noting(pid, None, None, &mut notes, &mut breach);
+    log::warn!("spawn teardown: pid {pid} MUTANT second warn");
     Unreported { fate, notes, breach }
 }
 
