@@ -82,7 +82,7 @@ runs:
     - name: Windows canaries - check the elevating-probe result
       if: ${{ !cancelled() && steps.execute.outcome == 'success' && inputs.filter == '' }}
       shell: bash
-      run: python3 .github/scripts/check-junit.py "$RUNNER_TEMP/junit/canary-shell-execute.xml" --tests 3
+      run: python3 .github/scripts/check-junit.py "$RUNNER_TEMP/junit/canary-shell-execute.xml" --tests 7
 
     # A filter matching only surveys would otherwise pass having asserted nothing.
     - name: Windows canaries - require that a filtered canary ran
