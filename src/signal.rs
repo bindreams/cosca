@@ -86,35 +86,79 @@ pub(crate) const UNPINNED_WHY: &str = "launchd holds its zombie (its tracer died
 
 /// The refusal of a signal to a root that is [`RootState::Unpinned`]. `Unassessable` with no
 /// `source`: nothing was asked of the OS, and the crate refuses to act on a pid it does not pin.
-/// `op` names the call that sent nothing.
+/// `op` names the call that sent nothing; `earlier` names what the same operation had already
+/// sent before it got here, if anything, so the message never claims more than `op` did.
 #[cfg(target_os = "macos")]
-pub(crate) fn unpinned_refusal(pid: u32, op: &str) -> crate::error::Error {
+pub(crate) fn unpinned_refusal(pid: u32, op: &str, earlier: Option<&str>) -> crate::error::Error {
+    let earlier = earlier.map_or_else(String::new, |sent| format!(", though {sent} was sent before it"));
     crate::error::Error::Unassessable {
-        detail: format!("pid {pid}: the child cannot be shown to be ours: {UNPINNED_WHY}; {op} sent nothing"),
+        detail: format!("pid {pid}: the child cannot be shown to be ours: {UNPINNED_WHY}; {op} sent nothing{earlier}"),
         source: None,
     }
 }
 
-/// Refuse `op` if the root's own handle says this process does not pin it. Called first by every
-/// public path that signals the root or its tree, so none sends a signal by number to a pid launchd
-/// may reap and reuse. macOS only: no other platform reports an unpinned root, and `state` is not
+/// Whether the root's own handle says this process does not pin it: launchd holds its zombie, so
+/// its pid is not ours. macOS only: no other platform reports an unpinned root, and `state` is not
 /// read there.
-///
-/// The check can pass, the tracer can then die, and the signal can still land on a launchd-held
-/// zombie. Only the audit-token signal of #55 closes that window.
+#[cfg(unix)]
+pub(crate) fn is_unpinned(state: impl FnOnce() -> RootState) -> bool {
+    #[cfg(target_os = "macos")]
+    return matches!(state(), RootState::Unpinned);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = state;
+        false
+    }
+}
+
+/// The root of `op` is [`RootState::Unpinned`] at the end of it: the tree was signalled, but the
+/// exit status of a zombie launchd holds cannot be collected.
+#[cfg(target_os = "macos")]
+pub(crate) fn unpinned_status(pid: u32, op: &str) -> crate::error::Error {
+    crate::error::Error::Unassessable {
+        detail: format!("pid {pid}: {op} signalled the tree, but its exit status cannot be collected: {UNPINNED_WHY}"),
+        source: None,
+    }
+}
+
+/// Refuse `op` if [`is_unpinned`], so the lone `kill` and `terminate` send no signal by number to a
+/// pid launchd may reap and reuse. The tree paths do not refuse outright: see [`untrusted_root`].
 #[cfg(unix)]
 pub(crate) fn refuse_unpinned(
     pid: u32,
     op: &str,
+    earlier: Option<&str>,
     state: impl FnOnce() -> RootState,
 ) -> Result<(), crate::error::Error> {
     #[cfg(target_os = "macos")]
-    if matches!(state(), RootState::Unpinned) {
-        return Err(unpinned_refusal(pid, op));
+    if is_unpinned(state) {
+        return Err(unpinned_refusal(pid, op, earlier));
     }
     #[cfg(not(target_os = "macos"))]
-    let _ = (pid, op, state);
+    let _ = (pid, op, earlier, state);
     Ok(())
+}
+
+/// The root's state, if it is one the tree paths cannot name targets by number for: `Unpinned`
+/// (launchd holds its zombie) or `Unknown` (the handle cannot vouch for it). They then send only
+/// by identity, as the drop does. Read once per call.
+#[cfg(target_os = "macos")]
+pub(crate) fn untrusted_root(state: impl FnOnce() -> RootState) -> Option<RootState> {
+    let state = state();
+    matches!(state, RootState::Unpinned | RootState::Unknown(_)).then_some(state)
+}
+
+/// Why `state` leaves the root's number untrusted, for a message.
+#[cfg(target_os = "macos")]
+pub(crate) fn why_untrusted(state: &RootState) -> String {
+    match state {
+        RootState::Unpinned => format!("the root is not pinned by this process (RootState::Unpinned: {UNPINNED_WHY})"),
+        RootState::Unknown(e) => format!("the root could not be shown to be unreaped (RootState::Unknown: {e})"),
+        RootState::Unreaped | RootState::Reaped => {
+            debug_assert!(false, "{state:?} leaves the root's number trusted");
+            "the root's number is trusted".to_owned()
+        }
+    }
 }
 
 #[cfg(unix)]

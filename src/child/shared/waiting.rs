@@ -10,9 +10,31 @@ use super::unlocked::Unlocked;
 use super::{echild, status_of, Guard, SharedChild, State};
 use crate::wait::exit_only::{self, Reap};
 
+/// Whether a wait that finds the child's zombie held by launchd (macOS) says so at `warn`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Orphaned {
+    /// The wait reports it: the caller has nobody else to.
+    Warn,
+    /// The caller reports it itself, with the refusal it goes on to make.
+    #[cfg_attr(
+        not(unix),
+        allow(dead_code, reason = "only the Unix graceful shutdown waits quietly")
+    )]
+    Quiet,
+}
+
 impl SharedChild {
     /// `wait` (no deadline) and `wait_deadline`. `Ok(None)` only at a deadline.
     pub(super) fn wait_inner(&self, deadline: Option<Instant>) -> io::Result<Option<ExitStatus>> {
+        self.wait_inner_reporting(deadline, Orphaned::Warn)
+    }
+
+    /// [`wait_inner`](Self::wait_inner), with `orphaned` saying how a launchd-held zombie is reported.
+    pub(super) fn wait_inner_reporting(
+        &self,
+        deadline: Option<Instant>,
+        orphaned: Orphaned,
+    ) -> io::Result<Option<ExitStatus>> {
         let mut lock = self.lock();
         #[cfg(test)]
         let mut check = crate::wait::test_clock::RoundCheck::new("SharedChild::wait_inner");
@@ -23,7 +45,7 @@ impl SharedChild {
                     if self.target().is_none() {
                         return Err(echild());
                     }
-                    return self.hold(lock, deadline);
+                    return self.hold(lock, deadline, orphaned);
                 }
                 // Another thread is the holder: block on the `Condvar`, re-dispatch on every wake.
                 State::W { .. } => {
@@ -68,7 +90,12 @@ impl SharedChild {
     }
 
     /// Become the holder: write `W`, wait unlocked, then settle the result under the lock.
-    fn hold<'a>(&'a self, lock: Guard<'a>, deadline: Option<Instant>) -> io::Result<Option<ExitStatus>> {
+    fn hold<'a>(
+        &'a self,
+        lock: Guard<'a>,
+        deadline: Option<Instant>,
+        orphaned: Orphaned,
+    ) -> io::Result<Option<ExitStatus>> {
         let mut holder = HolderGuard::arm(self, lock);
         holder.unlock();
         let mut waited = self.unlocked_wait(deadline);
@@ -89,6 +116,17 @@ impl SharedChild {
                 }
                 // The child was reaped by someone else (S13).
                 Ok(Unlocked::Gone) => {
+                    drop(holder.finish(State::N));
+                    return Err(echild());
+                }
+                // Launchd holds the zombie: not ours to reap, and not shown reaped.
+                Ok(Unlocked::Orphaned) => {
+                    if orphaned == Orphaned::Warn {
+                        log::warn!(
+                            "pid {}: not ours to reap (launchd holds its zombie, because its tracer died)",
+                            self.id()
+                        );
+                    }
                     drop(holder.finish(State::N));
                     return Err(echild());
                 }

@@ -76,14 +76,16 @@ impl Child {
     /// **A macOS graphically-elevated child** is refused, as for the sync
     /// [`Child::terminate`](crate::Child::terminate).
     ///
-    /// **macOS, a root launchd holds** is refused with nothing sent, as for the sync
-    /// [`Child::kill`](crate::Child::kill).
+    /// **macOS, a root launchd holds** is refused with nothing sent, and an `Unknown` root is signalled
+    /// through the handle, as for the sync [`Child::kill`](crate::Child::kill).
     pub fn terminate(&self) -> Result<(), Error> {
         #[cfg(unix)]
-        self.refuse_unpinned("terminate")?;
-        #[cfg(unix)]
-        if let crate::elevation::front::Gate::Closed(unkillable) = self.terminate_gate() {
-            return Err(unkillable);
+        {
+            // A front's refusal outranks a root launchd holds, as for `kill`.
+            if let crate::elevation::front::Gate::Closed(unkillable) = self.terminate_gate() {
+                return Err(unkillable);
+            }
+            self.refuse_unpinned("terminate", None)?;
         }
         let mechanism = self.graceful_mechanism();
         #[cfg(windows)]
@@ -137,8 +139,10 @@ impl Child {
     /// `#[tokio::test]` defaults) — on a hand-built runtime missing either, tokio panics
     /// rather than returning a typed error.
     ///
-    /// **macOS, a root launchd holds** is refused with nothing sent, as for the sync
-    /// [`Child::kill`](crate::Child::kill).
+    /// **macOS, a root launchd holds** is refused by the cooperative half, as for the sync
+    /// [`Child::kill`](crate::Child::kill). A root orphaned during the grace is not killed: the
+    /// escalation returns [`Error::Unassessable`](crate::error::Error::Unassessable) saying the kill
+    /// sent nothing though the `SIGTERM` was sent.
     pub async fn graceful_shutdown(&mut self, grace: Duration) -> Result<ExitStatus, Error> {
         self.terminate()?;
         // A watch failure must not strand the child between the soft signal and the escalation —
@@ -155,6 +159,15 @@ impl Child {
             }
             #[cfg(test)]
             fault::run_hook(fault::HookPoint::BeforeEscalation);
+            // A root orphaned during the grace is no longer ours to kill. Read once: the gated send
+            // does not read the state again.
+            #[cfg(unix)]
+            {
+                self.refuse_unpinned("kill", Some("the SIGTERM"))?;
+                let gate = self.kill_gate();
+                self.kill_sent_gated(gate)?;
+            }
+            #[cfg(not(unix))]
             self.kill()?; // escalate; an Err returns HERE, subsuming any watch Err
         }
         #[cfg(test)]
@@ -267,22 +280,37 @@ impl Child {
     /// each in-flight call occupies one blocking-pool thread for up to `grace` — size the
     /// pool accordingly for many long concurrent shutdowns.
     ///
-    /// **macOS, a root launchd holds** is refused with nothing sent, as for the sync
-    /// [`Child::kill`](crate::Child::kill).
+    /// **macOS, a root the handle cannot vouch for** is signalled as for
+    /// [`terminate_tree`](Child::terminate_tree) and swept as for [`kill_tree`](Child::kill_tree). A
+    /// mechanism with no channel by identity ends the call up front, with nothing sent and no grace
+    /// waited. A root launchd holds has no exit status to collect: once the tree is down this returns
+    /// [`Error::Unassessable`](crate::error::Error::Unassessable) instead of waiting on a zombie that
+    /// is not this process's to reap.
     pub async fn graceful_shutdown_tree(&mut self, grace: Duration) -> Result<ExitStatus, Error> {
-        // Before the grace is waited: a root this process does not pin is neither signalled nor
-        // watched.
         self.require_contained()?;
-        #[cfg(unix)]
-        self.refuse_unpinned("graceful_shutdown_tree")?;
-        // `require_contained` above errors an uncontained child before any signal.
+
+        // The cooperative signal, by identity alone while the root is `Unpinned` or `Unknown`
+        // (see `terminate_tree`). With no channel by identity there is nothing to signal, wait for
+        // or sweep, so the call ends here with nothing sent.
+        #[cfg(target_os = "macos")]
+        let by_identity = match self.tree_signal_untrusted(
+            crate::containment::dispatch::TreeSignal::Term,
+            "graceful_shutdown_tree",
+            None,
+        ) {
+            Some(Err(e)) if !self.os.attached.names_tree_by_identity() => return Err(e),
+            other => other,
+        };
+        #[cfg(not(target_os = "macos"))]
+        let by_identity: Option<Result<(), Error>> = None;
+
         #[cfg(test)]
         let term_result = match fault::take_force_terminate() {
-            fault::Forced::None => self.terminate_tree_signalling(),
+            fault::Forced::None => by_identity.unwrap_or_else(|| self.terminate_tree_signalling()),
             kind => Err(fault::forced_terminate_error(kind)),
         };
         #[cfg(not(test))]
-        let term_result = self.terminate_tree_signalling();
+        let term_result = by_identity.unwrap_or_else(|| self.terminate_tree_signalling());
 
         // Hold-and-continue ONLY for the error shapes that are ORDINARY outcomes rather than a
         // dead mechanism — see the sync `src/child/graceful.rs` twin's identical match for the
@@ -367,12 +395,13 @@ impl Child {
             let sweep_result = if fault::take_force_kill_tree_error() {
                 Err(fault::forced_kill_tree_error())
             } else {
-                self.kill_tree()
+                self.kill_tree_after(Some("the SIGTERM"))
             };
             #[cfg(not(test))]
-            let sweep_result = self.kill_tree();
+            let sweep_result = self.kill_tree_after(Some("the SIGTERM"));
             if let Err(sweep) = sweep_result {
-                if root_exited {
+                // A zombie launchd holds is not ours to reap: waiting on it only warns.
+                if root_exited && !self.root_is_unpinned() {
                     // Best-effort reap so an observed-exited root isn't left a zombie; `sweep`
                     // (below) is already the error this call reports, so a failure here is
                     // secondary — but every other discarded error in this module is still logged,
@@ -389,6 +418,13 @@ impl Child {
         }
         #[cfg(test)]
         fault::run_hook(fault::HookPoint::BeforeReap);
+        #[cfg(target_os = "macos")]
+        if self.root_is_unpinned() {
+            return Err(crate::signal::unpinned_status(
+                self.id().pid(),
+                "graceful_shutdown_tree",
+            ));
+        }
         let status = self.wait().await?;
         if let Some(e) = watch_err {
             return Err(e);

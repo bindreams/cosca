@@ -294,7 +294,7 @@ impl DropView {
     /// name the tree by it.
     pub(crate) fn skipped_action(&self, attached: &Attached) -> Option<String> {
         attached
-            .named_by_root_number(self.root_pid)
+            .named_by_root_number(self.root_pid, "kill")
             .filter(|_| self.number_untrusted())
     }
 }
@@ -316,6 +316,14 @@ impl TreeKilled {
     pub(crate) fn is_set(&self) -> bool {
         self.0.load(std::sync::atomic::Ordering::Acquire)
     }
+}
+
+/// Which signal a tree path sends.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum TreeSignal {
+    Kill,
+    Term,
 }
 
 /// What [`Attached::hard_kill_for_drop`] did to the tree.
@@ -557,15 +565,15 @@ impl Attached {
     /// that names no descendant of the reaped root: reparenting cleared those edges, so the only
     /// processes with that ppid belong to whoever reused the number. A macOS fd marker does both.
     #[cfg(unix)]
-    fn named_by_root_number(&self, root_pid: u32) -> Option<String> {
+    fn named_by_root_number(&self, root_pid: u32, verb: &str) -> Option<String> {
         match self {
-            Attached::ProcessGroup(pgid) => Some(format!("kill its process group (pgid {pgid})")),
+            Attached::ProcessGroup(pgid) => Some(format!("{verb} its process group (pgid {pgid})")),
             #[cfg(target_os = "macos")]
             Attached::FdMarker(m) => {
                 // A group only if the mode made one; the walk always runs.
                 let walk = format!("walk the process table from the root's pid (root pid {root_pid})");
                 Some(match m.pgid() {
-                    Some(pgid) => format!("kill its process group (pgid {pgid}) or {walk}"),
+                    Some(pgid) => format!("{verb} its process group (pgid {pgid}) or {walk}"),
                     None => walk,
                 })
             }
@@ -617,6 +625,58 @@ impl Attached {
             result,
             skipped: left_behind,
         }
+    }
+
+    /// A tree path's signal while the root's number cannot be trusted (`root` is `Unpinned` or
+    /// `Unknown`): what a drop does. Nothing that names the tree by the root's number runs (the
+    /// `killpg`, the walk from the root's pid, the root's kill by pid). A macOS fd marker still
+    /// signals its holders, which are named by identity; `Ok` there says every holder was reached,
+    /// and for `Kill` the tree is marked killed. Any other number-named mechanism has no channel
+    /// left: `Unassessable`, with what was skipped. `None` for a mechanism that names the tree
+    /// some other way, which signals as usual.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn signal_tree_untrusted(
+        &self,
+        signal: TreeSignal,
+        root: &crate::signal::RootState,
+        root_pid: u32,
+        op: &str,
+        earlier: Option<&str>,
+        killed: &TreeKilled,
+    ) -> Option<Result<(), Error>> {
+        let verb = match signal {
+            TreeSignal::Kill => "kill",
+            TreeSignal::Term => "signal",
+        };
+        let skipped = self.named_by_root_number(root_pid, verb)?;
+        let why = crate::signal::why_untrusted(root);
+        let Attached::FdMarker(m) = self else {
+            let earlier = earlier.map_or_else(String::new, |sent| format!(", though {sent} was sent before it"));
+            return Some(Err(Error::Unassessable {
+                detail: format!(
+                    "pid {root_pid}: {why}; {op} sent nothing{earlier}: its signals are all named by the root's \
+                     number, so it did not {skipped}"
+                ),
+                source: None,
+            }));
+        };
+        let except = matches!(root, crate::signal::RootState::Unpinned).then(|| m.root());
+        log::debug!("{op}: {why}, so it does not {skipped}; it signals the marker holders");
+        let result = match signal {
+            TreeSignal::Kill => m.hard_kill_holders_only(except),
+            TreeSignal::Term => m.terminate_holders_only(except),
+        };
+        if result.is_ok() && matches!(signal, TreeSignal::Kill) {
+            killed.mark();
+        }
+        Some(result)
+    }
+
+    /// Whether [`signal_tree_untrusted`](Self::signal_tree_untrusted) has a channel left to signal
+    /// the tree through: one named by identity rather than by the root's number.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn names_tree_by_identity(&self) -> bool {
+        matches!(self, Attached::FdMarker(_))
     }
 
     /// [`hard_kill_marking`](Self::hard_kill_marking) for a handle that kills its tree while the

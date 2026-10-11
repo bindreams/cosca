@@ -1078,6 +1078,16 @@ impl Marker {
     /// `term_group`'s own cooperative, best-effort contract; `hard_kill` (`kill_tree`) is the
     /// guaranteed sweep.
     pub(crate) fn terminate(&self) -> Result<(), Error> {
+        self.terminate_impl(Scope::Full)
+    }
+
+    /// [`terminate`](Self::terminate) through the marker-holder channel alone, as
+    /// [`hard_kill_holders_only`](Self::hard_kill_holders_only) does for the kill.
+    pub(crate) fn terminate_holders_only(&self, except: Option<ProcessId>) -> Result<(), Error> {
+        self.terminate_impl(Scope::HoldersOnly { except })
+    }
+
+    fn terminate_impl(&self, scope: Scope) -> Result<(), Error> {
         self.check_read_end_still_valid()?;
         let mut seen: std::collections::HashSet<ProcessId> = std::collections::HashSet::new();
         let mut group_result: Result<(), Error> = Ok(());
@@ -1088,7 +1098,7 @@ impl Marker {
             &mut group_result,
             &mut incomplete,
             true,
-            Scope::Full,
+            scope,
         );
         Self::finish_sweep(self.handle, group_result, incomplete)
     }

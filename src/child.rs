@@ -66,7 +66,11 @@ mod drop_report_tests;
 
 #[cfg(all(test, target_os = "macos"))]
 #[path = "child/unpinned_public_tests.rs"]
-mod unpinned_public_tests;
+pub(crate) mod unpinned_public_tests;
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "child/unpinned_graceful_tests.rs"]
+mod unpinned_graceful_tests;
 
 #[cfg(all(test, unix))]
 #[path = "child/front_kill_tests.rs"]
@@ -273,9 +277,9 @@ impl Child {
         )
     }
 
-    /// Hard-kill the process. Returns `Ok(())` if already dead, except a root launchd holds on macOS (see
-    /// below), which is refused. Unlike [`Process::kill`](crate::Process::kill), this
-    /// signals through the child's own handle, so a refused Linux `pidfd_open` cannot fail it.
+    /// Hard-kill the process. Returns `Ok(())` if already dead. Unlike
+    /// [`Process::kill`](crate::Process::kill), this signals through the child's own handle, so a
+    /// refused Linux `pidfd_open` cannot fail it.
     ///
     /// **An elevated child behind a front** ([`Backend::Sudo`](crate::elevation::Backend::Sudo),
     /// [`Backend::Doas`](crate::elevation::Backend::Doas),
@@ -299,13 +303,15 @@ impl Child {
     /// truthful.
     ///
     /// **macOS, a root launchd holds.** If a tracer reparented the root and died, launchd holds its
-    /// zombie and reaps it on its own schedule, so this process no longer pins its pid. Nothing is
-    /// sent to it, by pid or to its group, and nothing is waited on: the call returns
-    /// [`Error::Unassessable`](crate::error::Error::Unassessable) naming launchd, and the root is
-    /// left as it was. The state is read before anything is sent, so a tracer that dies after the
-    /// read passes still leaves a window in which the signal lands on a pid launchd has since
-    /// reused; only the audit-token signal of [#55](https://github.com/bindreams/cosca/issues/55)
-    /// closes it.
+    /// zombie and reaps it on its own schedule, so this process no longer pins its pid. Nothing is sent
+    /// to it, by pid or to its group, and nothing is waited on: the call returns
+    /// [`Error::Unassessable`](crate::error::Error::Unassessable) naming launchd, and the root is left
+    /// as it was. The state is read before anything is sent, so a tracer that dies after the read
+    /// passes still leaves a window in which the signal lands on a pid launchd has since reused.
+    ///
+    /// A root the handle cannot vouch for (`Unknown`: a failed peek or an unreadable unique id) is
+    /// still killed through the handle. It is this process's own unreaped child, and the send checks
+    /// its pid against the unique id read at spawn.
     pub fn kill(&self) -> Result<(), Error> {
         #[cfg(unix)]
         {
@@ -325,15 +331,44 @@ impl Child {
     /// [`kill`](Child::kill), reporting whether a signal was sent (see [`Sent`](crate::signal::Sent)).
     #[cfg(unix)]
     pub(crate) fn kill_sent(&self) -> Result<crate::signal::Sent, Error> {
-        self.refuse_unpinned("kill")?;
-        self.kill_sent_gated(self.kill_gate())
+        let gate = self.kill_gate();
+        // A front's refusal is permanent and says nothing of the pid, so it outranks a root launchd
+        // holds, which the caller can do nothing about either way.
+        if !matches!(gate, crate::elevation::front::Gate::Closed(_)) {
+            self.refuse_unpinned("kill", None)?;
+        }
+        self.kill_sent_gated(gate)
     }
 
     /// Refuse `op` while the root is not pinned by this process (macOS: launchd holds its zombie).
-    /// See [`crate::signal::refuse_unpinned`].
+    /// `earlier` names what the same operation sent before. See [`crate::signal::refuse_unpinned`].
     #[cfg(unix)]
-    pub(crate) fn refuse_unpinned(&self, op: &str) -> Result<(), Error> {
-        crate::signal::refuse_unpinned(self.id.pid(), op, || self.proc.state())
+    pub(crate) fn refuse_unpinned(&self, op: &str, earlier: Option<&str>) -> Result<(), Error> {
+        crate::signal::refuse_unpinned(self.id.pid(), op, earlier, || self.proc.state())
+    }
+
+    /// Whether launchd holds the root's zombie now (macOS; `false` elsewhere, where the state is
+    /// not read).
+    pub(crate) fn root_is_unpinned(&self) -> bool {
+        #[cfg(unix)]
+        return crate::signal::is_unpinned(|| self.proc.state());
+        #[cfg(not(unix))]
+        false
+    }
+
+    /// A tree path's signal while the root cannot be vouched for (`Unpinned` or `Unknown`): it
+    /// signals by identity alone. `Some` ends the call; see
+    /// [`Attached::signal_tree_untrusted`](crate::containment::Attached::signal_tree_untrusted).
+    #[cfg(target_os = "macos")]
+    pub(crate) fn tree_signal_untrusted(
+        &self,
+        signal: crate::containment::dispatch::TreeSignal,
+        op: &str,
+        earlier: Option<&str>,
+    ) -> Option<Result<(), Error>> {
+        let root = crate::signal::untrusted_root(|| self.proc.state())?;
+        self.attached
+            .signal_tree_untrusted(signal, &root, self.id.pid(), op, earlier, &self.tree_killed)
     }
 
     /// [`kill_sent`](Child::kill_sent) under `gate`, this child's [`kill_gate`](Child::kill_gate)
@@ -565,11 +600,42 @@ impl Child {
     /// once it has left the cgroup, this sends nothing and returns
     /// [`ElevationErrorKind::Unkillable`](crate::error::ElevationErrorKind::Unkillable).
     ///
-    /// **macOS, a root launchd holds** is refused with nothing sent, as for [`kill`](Child::kill).
+    /// **macOS, a root the handle cannot vouch for.** If the root is `Unpinned` (launchd holds its
+    /// zombie, see [`kill`](Child::kill)) or `Unknown`, nothing that names the tree by the root's
+    /// number runs: no `killpg`, no walk from its pid, no kill of the root by pid, and no handle
+    /// backstop. An fd marker still kills its marker holders, which are named by identity (an
+    /// `Unpinned` root is an exited zombie and is left alone), and the call is `Ok` only if every
+    /// holder was reached. Any other mechanism has nothing left to send, and the call returns
+    /// [`Error::Unassessable`](crate::error::Error::Unassessable) saying that nothing was sent and what
+    /// was skipped. The handle backstop reads the root's state again: a root orphaned during the sweep
+    /// is an exited zombie, so the backstop is skipped and the sweep's answer stands.
     pub fn kill_tree(&self) -> Result<(), Error> {
+        self.kill_tree_after(None)
+    }
+
+    /// [`kill_tree`](Self::kill_tree), as a step of an operation that already sent `earlier`, so an
+    /// error never claims the whole operation sent nothing.
+    pub(crate) fn kill_tree_after(&self, earlier: Option<&str>) -> Result<(), Error> {
+        #[cfg(not(target_os = "macos"))]
+        let _ = earlier;
         self.require_contained()?;
+        // Decided once: the gate is not asked again after the kill, when a killed front may read as
+        // neither exited nor in its cgroup. It comes before the root's state: a front
+        // that may not be signalled is refused whatever the root's number names.
         #[cfg(unix)]
-        self.refuse_unpinned("kill_tree")?;
+        let front = match self.kill_gate() {
+            crate::elevation::front::Gate::Closed(unkillable) => return Err(unkillable),
+            crate::elevation::front::Gate::Open => None,
+            crate::elevation::front::Gate::Exited => Some(false),
+            crate::elevation::front::Gate::CgroupOnly => Some(true),
+        };
+        // A root launchd holds, or one the handle cannot vouch for, is signalled by identity alone.
+        #[cfg(target_os = "macos")]
+        if let Some(result) =
+            self.tree_signal_untrusted(crate::containment::dispatch::TreeSignal::Kill, "kill_tree", earlier)
+        {
+            return result;
+        }
         // Precondition (a separate, unfixed gap — asserted, not fixed, here): if a pgid-based
         // mechanism's leader pid has been reaped AND RECYCLED onto a DIFFERENT, LIVE process
         // group, `killpg` would signal that unrelated group instead. `carries_recyclable_pgid`
@@ -618,15 +684,6 @@ impl Child {
              unrelated process group",
             self.id.pid()
         );
-        // Decided once: the gate is not asked again after the kill, when a killed front may read as
-        // neither exited nor in its cgroup.
-        #[cfg(unix)]
-        let front = match self.kill_gate() {
-            crate::elevation::front::Gate::Closed(unkillable) => return Err(unkillable),
-            crate::elevation::front::Gate::Open => None,
-            crate::elevation::front::Gate::Exited => Some(false),
-            crate::elevation::front::Gate::CgroupOnly => Some(true),
-        };
         let group_result = self.attached.hard_kill_marking(&self.tree_killed);
         // A TreeWalk that could not walk killed nothing, and the root's death would strand the
         // descendants beyond a retry: return the error with the tree intact.
@@ -651,16 +708,19 @@ impl Child {
         // Backstop for the TreeWalk mechanism: its hard_kill kills the root by identity,
         // which no-ops if `ProcessId::of` transiently fails to resolve the root — this
         // handle-based kill covers that, so its failure is contract-relevant.
-        // Read again: the sweep above can be long, and a root orphaned meanwhile is no longer ours.
-        #[cfg(unix)]
-        let backstop = self.refuse_unpinned("kill_tree");
-        #[cfg(not(unix))]
-        let backstop = Ok(());
-        let backstop = backstop.and_then(|()| {
+        // Read again: the sweep above can be long, and a root orphaned meanwhile is an exited zombie
+        // launchd holds, so there is nothing left for the backstop to kill.
+        let backstop = if self.root_is_unpinned() {
+            log::debug!(
+                "kill_tree({}): launchd holds the root's zombie, so the handle backstop is skipped",
+                self.id.pid()
+            );
+            Ok(())
+        } else {
             self.proc
                 .kill()
                 .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper()))
-        });
+        };
         if let (Err(group), Err(bs)) = (&group_result, &backstop) {
             log::debug!("kill_tree handle backstop also failed ({bs}); surfacing the group error: {group}");
         }
@@ -722,17 +782,26 @@ impl Child {
     /// `ProcessGroup`/`Session`-only scope of this guarantee (a separate, unfixed gap for
     /// `TreeWalk`), and the residual `hidepid` gap on Linux.
     ///
-    /// **macOS, a root launchd holds** is refused with nothing sent, as for [`kill`](Child::kill).
+    /// **macOS, a root the handle cannot vouch for.** If the root is `Unpinned` (launchd holds its
+    /// zombie, see [`kill`](Child::kill)) or `Unknown`, nothing that names the tree by the root's
+    /// number runs: no `killpg`, no walk from its pid. An fd marker still signals its marker holders,
+    /// which are named by identity (an `Unpinned` root is left alone), and the call is `Ok` only if
+    /// every holder was reached. Any other mechanism has nothing left to send, and the call returns
+    /// [`Error::Unassessable`](crate::error::Error::Unassessable) saying that nothing was sent and what
+    /// was skipped.
     pub fn terminate_tree(&self) -> Result<(), Error> {
         self.require_contained()?;
-        #[cfg(unix)]
-        self.refuse_unpinned("terminate_tree")?;
+        // A root launchd holds, or one the handle cannot vouch for, is signalled by identity alone.
+        #[cfg(target_os = "macos")]
+        if let Some(result) =
+            self.tree_signal_untrusted(crate::containment::dispatch::TreeSignal::Term, "terminate_tree", None)
+        {
+            return result;
+        }
         self.terminate_tree_signalling()
     }
 
-    /// [`terminate_tree`](Self::terminate_tree) after its guards: the signal itself. The graceful
-    /// shutdown calls it after reading the root's state once, so the refusal of an unpinned root
-    /// is never mistaken for an ordinary refusal that the shutdown holds and goes on from.
+    /// The signal itself, for a root whose number is trusted.
     fn terminate_tree_signalling(&self) -> Result<(), Error> {
         // See kill_tree's identical precondition assert for the full rationale, including the
         // `#[cfg(unix)]` gate (`carries_recyclable_pgid` does not exist on Windows).

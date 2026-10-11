@@ -484,6 +484,13 @@ impl SharedChild {
         self.wait_inner(Some(deadline))
     }
 
+    /// [`wait`](Self::wait) up to `deadline` (`None`: unbounded) that leaves a zombie launchd holds
+    /// (macOS) unreported: the caller reports it with the refusal it goes on to make.
+    #[cfg(unix)]
+    pub(crate) fn wait_until_quiet(&self, deadline: Option<Instant>) -> io::Result<Option<ExitStatus>> {
+        self.wait_inner_reporting(deadline, waiting::Orphaned::Quiet)
+    }
+
     /// The pidfd naming the child, if it holds one (Linux).
     #[cfg(target_os = "linux")]
     pub(crate) fn pidfd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {

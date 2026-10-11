@@ -100,6 +100,14 @@ impl ProcHandle {
         }
     }
 
+    /// [`wait`](Self::wait) up to `deadline` (`None`: unbounded), leaving a zombie launchd holds
+    /// (macOS) unreported: the caller reports it with the refusal it goes on to make.
+    #[cfg(unix)]
+    pub(crate) fn wait_until_quiet(&self, deadline: Option<Instant>) -> io::Result<Option<ExitStatus>> {
+        let ProcHandle::Std(s) = self;
+        s.wait_until_quiet(deadline)
+    }
+
     /// Hard-kill the process (already-exited is success).
     pub(crate) fn kill(&self) -> io::Result<()> {
         match self {
