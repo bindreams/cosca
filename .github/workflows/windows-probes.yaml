@@ -63,7 +63,7 @@ env:
   COSCA_TEST_ELEVATION_ROUTES: "0"
   # `.config/nextest.toml`, ci.yaml and the devvm provision scripts carry the same nextest
   # version; Renovate moves them together (.github/renovate.json).
-  NEXTEST_VERSION: "0.9.146"
+  NEXTEST_VERSION: "0.9.148"
 
 jobs:
   path-resolution:

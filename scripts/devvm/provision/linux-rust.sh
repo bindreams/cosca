@@ -98,8 +98,8 @@ fi
 # SHA-256 of each release asset. Checked before extracting (below) so a corrupted or tampered
 # download is a hard failure, never silently `tar -x`'d. Each tag shares a line with its
 # checksum so Renovate moves both together.
-NEXTEST_TAG_X86_64="cargo-nextest-0.9.146" NEXTEST_SHA256_X86_64="682c21b777c333e96fd532e114d3a5a894e0729ab88d94c0a9f20f8419695428"
-NEXTEST_TAG_AARCH64="cargo-nextest-0.9.146" NEXTEST_SHA256_AARCH64="b2e33d7c72de7ade0ff7b3a948ac37516b24f8a836b7a8870c1f634a94be9de9"
+NEXTEST_TAG_X86_64="cargo-nextest-0.9.148" NEXTEST_SHA256_X86_64="223ba936714cc861a9cdedad5a8eb664dfdd69d6fbdf6cea6aa8184f523290dc"
+NEXTEST_TAG_AARCH64="cargo-nextest-0.9.148" NEXTEST_SHA256_AARCH64="81469eb963ef883fd590e60189e77d6aba3d91b418591d3391f50fe3e9480d2b"
 if [ "$NEXTEST_TAG_X86_64" != "$NEXTEST_TAG_AARCH64" ]; then
     echo "devvm: cargo-nextest tags disagree: $NEXTEST_TAG_X86_64 vs $NEXTEST_TAG_AARCH64" >&2
     exit 1
