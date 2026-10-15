@@ -1,4 +1,4 @@
-nextest-version = { required = "0.9.146" }
+nextest-version = { required = "0.9.148" }
 
 # Death-watch tests that a regression would turn into a hang rather than a failure. Every one is
 # named `death_watch_*`, so a new one is bounded without touching this file.

@@ -107,7 +107,7 @@ if ($vcRuntimeInstalled) {
 # SHA-256 of the exact release asset. Checked before extracting (below) so a corrupted or
 # tampered download is a hard failure, never silently `Expand-Archive`'d. The release tag and
 # checksum share one line so Renovate moves both together.
-$nextestTag = "cargo-nextest-0.9.146"; $nextestSha256 = "0fa689815c8157e4633225b6b173184b3d546eb6ffb754c3d0e6ea5973284a20"
+$nextestTag = "cargo-nextest-0.9.148"; $nextestSha256 = "7a931b4a9123fe5e641dd0f2b73d897f64bcf77bb06f080db17cb434b7eac782"
 $nextestVersion = $nextestTag -replace '^cargo-nextest-', ''
 $installedVersion = if (Get-Command cargo-nextest -ErrorAction SilentlyContinue) {
     ((cargo nextest --version 2>$null) -split " ")[1]
