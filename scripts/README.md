@@ -73,6 +73,10 @@ needed. Install yourself:
 - **`ssh` is refused for Windows guests**, on every host. `vagrant powershell` can write the guest's
   address into the host's WSMan `TrustedHosts` and restores it only if Vagrant exits normally. Use
   `devvm.py run windows-x64 -- <cmd>`, or the console for an interactive session.
+- **Guest fixes for this box.** Its WinRM per-shell memory quota (800 MB) is too small for
+  `rustup-init`, so `windows-winrm-memory.ps1` raises it (Hyper-V only). It ships with "only allow
+  Windows Hello sign-in" on, which makes Windows 11 drop the autologon `--unelevated` needs, so
+  `windows-account-and-uac.ps1` turns that off (`DevicePasswordLessBuildVersion`).
 - **Cleanup.** `destroy` removes the VM and its disk. The downloaded box stays in
   `~/.vagrant.d/boxes` (`vagrant box list`, `vagrant box remove`).
 
@@ -219,8 +223,8 @@ investigation.
 
 **No Vagrant shell provisioner — a real restart fuse, removed.** `windows-x64`'s Vagrantfile
 declares exactly one provisioner (the WinRM `file` upload). Every other Windows provisioning
-step (`windows-clean-stage.ps1`, `windows-mirror-tree.ps1`, `windows-lock-tree.ps1`,
-`windows-account-and-uac.ps1`, `windows-rust.ps1`) is driven directly by `devvm.py` over
+step (`windows-winrm-memory.ps1`, `windows-clean-stage.ps1`, `windows-mirror-tree.ps1`,
+`windows-lock-tree.ps1`, `windows-account-and-uac.ps1`, `windows-rust.ps1`) is driven directly by `devvm.py` over
 `vagrant winrm` (`provision_windows_guest`/`run_windows_script` in `scripts/devvm_windows.py`), not
 through Vagrant's `config.vm.provision "shell", ...`. This was a deliberate fix, not a style
 choice: vagrant 2.4.9's shell-provisioner WinRM path (`provision_winrm`) calls the guest's

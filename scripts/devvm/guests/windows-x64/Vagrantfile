@@ -42,8 +42,8 @@
 # is the other option if a window on this Mac specifically isn't what's needed.
 #
 # Provisioning: this Vagrantfile deliberately declares only ONE provisioner below (the "file"
-# upload). Every other Windows provisioning step (clean-stage, mirror-tree, lock-tree,
-# account-and-uac, rust) is driven directly by scripts/devvm_windows.py over `vagrant winrm`
+# upload). Every other Windows provisioning step (winrm-memory, clean-stage, mirror-tree,
+# lock-tree, account-and-uac, rust) is driven directly by scripts/devvm_windows.py over `vagrant winrm`
 # (provision_windows_guest / run_windows_script there), not through Vagrant's `config.vm.
 # provision "shell", ...`. Reason: vagrant 2.4.9's own shell-provisioner WinRM path
 # (provision_winrm) calls the `wait_for_reboot` guest capability UNCONDITIONALLY at the start

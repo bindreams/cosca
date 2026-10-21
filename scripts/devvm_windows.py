@@ -554,6 +554,10 @@ def provision_windows_guest(guest: Guest, *, auto_consent: bool, display: bool =
     each other but both come last, with rust installed before the reboot-required check below
     is acted on.
 
+    windows-winrm-memory.ps1 (Hyper-V only: the gusztavvargadr/windows-11 box's WinRM quota is too
+    small for rustup) comes first of the scripts, because its quota applies only to shells opened
+    after it.
+
     The license-rearm check (create only) runs before every other provisioning step,
     including windows-clean-stage.ps1: an expired-eval shutdown can land mid-step regardless
     of which step it is (it has hit during windows-lock-tree.ps1), so there's
@@ -582,6 +586,8 @@ def provision_windows_guest(guest: Guest, *, auto_consent: bool, display: bool =
             if display:
                 open_vm_console(guest)
         rebooted = ensure_windows_license_current(guest, display=display)
+    if host_provider() == "hyperv":
+        run_windows_script(guest, WINDOWS_PROVISION_DIR / "windows-winrm-memory.ps1", elevated=True, display=display)
     run_windows_script(guest, WINDOWS_PROVISION_DIR / "windows-clean-stage.ps1", elevated=True, display=display)
     # The lone remaining Vagrantfile-declared provisioner: uploads the staged tree into
     # C:/cosca-stage. `run: "always"` on it means a plain `vagrant provision` re-runs it every
