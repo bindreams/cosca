@@ -13,6 +13,7 @@ scripts/README.md for what's actually covered and why.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import os
 import shlex
 import shutil
@@ -44,6 +45,33 @@ class Guest:
     available: bool = True
     unavailable_reason: str | None = None
     tree_path_posix: str | None = None  # where the read-only tree copy lands in-guest
+    arch: str = "amd64"
+    # Display text of this guest's Hyper-V box, `name (hyperv/amd64)`. `box` stays the QEMU box.
+    # None: no Hyper-V box, so the guest does not run on a Windows host.
+    hyperv_box: str | None = None
+
+
+def host_provider(platform: str = sys.platform) -> str:
+    """The Vagrant provider devvm drives on this host: Hyper-V on Windows, QEMU elsewhere."""
+    return "hyperv" if platform == "win32" else "qemu"
+
+
+def host_unsupported_reason(guest: Guest, platform: str = sys.platform) -> str | None:
+    """Why `guest` cannot run on this host's provider, or None if it can.
+
+    Separate from Guest.available, which says the guest exists at all: that check runs first in every
+    command, ahead of the flag validation devvm_test.py exercises on any host.
+    """
+    if host_provider(platform) == "hyperv" and guest.hyperv_box is None:
+        return "it has no Hyper-V box (its box is QEMU-only), and a Windows host runs guests only on Hyper-V"
+    return None
+
+
+def require_host_support(guest: Guest) -> None:
+    reason = host_unsupported_reason(guest)
+    if reason is not None:
+        print(f"error: guest '{guest.name}' is not available on this host: {reason}", file=sys.stderr)
+        sys.exit(1)
 
 
 def guest_dir(guest: Guest) -> Path:
@@ -99,6 +127,16 @@ def stage_lock(stage: Path) -> Iterator[None]:
         os.close(fd)
 
 
+def vm_name(guest: Guest) -> str:
+    """The Hyper-V VM name of this worktree's `guest`, the only place it is computed.
+
+    The hash of the staging path keeps two worktrees' VMs apart. Never select a VM by this name for
+    anything that changes it: use the id Vagrant stores (devvm_hyperv.vm_id).
+    """
+    digest = hashlib.sha256(str(stage_dir(guest)).encode()).hexdigest()
+    return f"cosca-devvm-{guest.name}-{digest[:8]}"
+
+
 def require_tool(name: str) -> None:
     if shutil.which(name) is None:
         print(
@@ -113,6 +151,8 @@ def vagrant_env(guest: Guest, *, display: bool = False) -> dict[str, str]:
     env["VAGRANT_DOTFILE_PATH"] = str(dotfile_dir(guest))
     env["DEVVM_STAGE_DIR"] = str(stage_dir(guest))
     env["DEVVM_WINDOWS_DISPLAY"] = "1" if display else "0"
+    env["DEVVM_PROVIDER"] = host_provider()
+    env["DEVVM_VMNAME"] = vm_name(guest)
     return env
 
 
@@ -260,10 +300,11 @@ def get_vagrant_machine_state(guest: Guest) -> str:
     the guest is no longer running, instead of retrying `vagrant winrm` in a tight loop against
     a guest that is never coming back on its own.
 
-    `vagrant status` reads local state via the qemu provider's own read_state action: a
-    liveness check (`Process.kill(0, pid)`, see vagrant-qemu's driver.rb) against the PID in
-    the guest's own pidfile, not a QMP query — no WinRM round-trip, so this stays fast and
-    answers even when WinRM itself is unresponsive.
+    `vagrant status` reads local state through the provider's own read_state action, with no
+    WinRM round-trip, so this stays fast and answers even when WinRM itself is unresponsive. The
+    qemu provider checks liveness (`Process.kill(0, pid)`, see vagrant-qemu's driver.rb) of the
+    PID in the guest's pidfile; the Hyper-V provider asks Hyper-V for the state of the VM id
+    Vagrant stored.
     """
     require_tool("vagrant")
     result = subprocess.run(

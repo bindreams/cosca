@@ -35,6 +35,47 @@ Install on the host yourself — this tool does not install anything for you:
 Verify with `vagrant plugin list` (expect `vagrant-qemu`) and
 `qemu-system-x86_64 --version` / `qemu-system-aarch64 --version`.
 
+A Windows host needs different tools: see [Windows host](#windows-host).
+
+## Windows host
+
+On Windows `devvm.py` drives Vagrant's built-in Hyper-V provider. No QEMU, plugin or `rsync` is
+needed. Install yourself:
+
+- A Hyper-V capable Windows (Pro, Enterprise or Education) with Hyper-V enabled
+  (`Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All`, elevated, then reboot).
+- Membership in the `Hyper-V Administrators` group (sign out and in afterwards), or an elevated shell.
+- [Vagrant](https://www.vagrantup.com/) 2.4.9, [`uv`](https://docs.astral.sh/uv/), Git and Python on `PATH`.
+- A SYSTEM `FullControl` entry that this worktree's `.tmp` inherits, which Vagrant's Hyper-V provider
+  checks on its data directory. A normal profile directory has it; if `up` reports it missing, grant
+  it as the message says.
+- The Hyper-V `Default Switch`, which must stay an Internal or Private switch.
+- The Windows OpenSSH client (`ssh.exe`, an optional Windows feature), which `vagrant ssh -c` needs for Linux guests.
+
+| Guest           | Hyper-V box                                 | Notes                                      |
+| --------------- | ------------------------------------------- | ------------------------------------------ |
+| `windows-x64`   | `gusztavvargadr/windows-11` (hyperv, amd64) | pinned in `box.hyperv.json`                |
+| `linux-x64`     | _(none yet)_                                | refused on a Windows host, with the reason |
+| `linux-arm64`   | _(none)_                                    | arm64: QEMU only                           |
+| `windows-arm64` | _(none)_                                    | see [`windows-arm64`](#windows-arm64)      |
+| `macos-arm64`   | _(none)_                                    | needs an Apple Silicon Mac (Tart)          |
+
+- **Network.** A Hyper-V guest has no forwarded port and no host listener. It sits on the Internal
+  `Default Switch` and is reached at its address there. `up` refuses to start unless that switch
+  exists and is Internal or Private, and right after `vagrant up` returns, before any provisioning,
+  it turns the VM off and exits if an adapter is on an External switch. The first boot happens before
+  that second check, so a switch that changes between the two checks is a window the check narrows
+  but cannot close.
+- **VM names.** `cosca-devvm-<guest>-<8 hex digits of a hash of the worktree's staging path>`, so two
+  worktrees never share a VM. Devvm changes a VM only by the id Vagrant stored in
+  `.tmp/devvm/<guest>/.vagrant`, never by name, and touches no other VM.
+- **`--display`** opens Hyper-V's console (`vmconnect.exe localhost <VM name>`) on the VM.
+- **`ssh` is refused for Windows guests**, on every host. `vagrant powershell` can write the guest's
+  address into the host's WSMan `TrustedHosts` and restores it only if Vagrant exits normally. Use
+  `devvm.py run windows-x64 -- <cmd>`, or the console for an interactive session.
+- **Cleanup.** `destroy` removes the VM and its disk. The downloaded box stays in
+  `~/.vagrant.d/boxes` (`vagrant box list`, `vagrant box remove`).
+
 ## Usage
 
 ```sh
@@ -292,10 +333,12 @@ prompt itself — rather than just observing its outcome — give the guest a di
 uv run scripts/devvm.py up windows-x64 --display
 ```
 
-This opens a real, local QEMU window on this Mac (`-display cocoa -vga std`) — not VNC or any
-other network-exposed display, so it doesn't touch the loopback-only port-forwarding guarantee
-above. Off by default; pass it again on every `up` that needs it (not persisted). RDP into the
-guest is the other option if a window on this Mac specifically isn't what's needed.
+With QEMU this opens a real, local QEMU window on this Mac (`-display cocoa -vga std`) — not VNC
+or any other network-exposed display, so it doesn't touch the loopback-only port-forwarding
+guarantee above. On a Windows host it opens Hyper-V's console instead (see
+[Windows host](#windows-host)). Off by default; pass it again on every `up` that needs it (not
+persisted). RDP into the guest is the other option if a window on this Mac specifically isn't
+what's needed (QEMU only: a Hyper-V guest has no forwarded port).
 
 RDP-ing into `vagrant` takes over its console (session 1) logon rather than opening a second,
 independent one — the account stays genuinely logged in, and both the session-wait `sync`/`up`
@@ -420,6 +463,9 @@ time (`vagrant box list`, then `vagrant box remove` the one you're done with) if
 tight.
 
 ## Forwarded ports are loopback-only, always
+
+This section is about the QEMU provider. A Hyper-V guest has no forwarded port; see
+[Windows host](#windows-host) for what replaces the guarantee.
 
 Every guest's forwarded ports (WinRM, RDP, SSH) are bound to `127.0.0.1` on the host, never
 `0.0.0.0`/every interface — nothing here is meant to be reachable from your LAN. This is

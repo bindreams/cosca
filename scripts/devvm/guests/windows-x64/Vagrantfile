@@ -12,7 +12,14 @@
 # into windows-account-and-uac.ps1's own remote WinRM invocation (see
 # provision_windows_guest's run_windows_script call), never through Vagrantfile ENV at all.
 #
-# Box: stromweld/windows-10, provider qemu, version pinned below. A "vanilla Windows 10"
+# Providers: QEMU on macOS and Linux hosts, Hyper-V on a Windows host; scripts/devvm.py picks
+# one per host and exports it as DEVVM_PROVIDER (with the VM name as DEVVM_VMNAME). The QEMU
+# settings are the top-level ones; the Hyper-V ones sit in the `provider "hyperv"` block at the
+# end, which overrides the box and drops what only QEMU needs (forwarded ports,
+# fix_qemu_loopback_only.rb): a Hyper-V guest has no host listener at all and is reached at its
+# address on the Internal "Default Switch", which devvm.py checks before and right after `up`.
+#
+# Box (QEMU): stromweld/windows-10, provider qemu, version pinned below. A "vanilla Windows 10"
 # box built with Bento (chef-io/bento) from Microsoft's free evaluation media — evaluation
 # Windows installs activate on a timer and expire (commonly 90 days for Windows 10
 # Enterprise eval); when this box's Windows install expires, `vagrant box update` /
@@ -58,7 +65,10 @@
 # provisioner capability, which carries the exact same fuse plus its own `sleep 10` poll loop.
 
 require_relative "../_shared/fix_macos_port_check"
-require_relative "../_shared/fix_qemu_loopback_only"
+
+HYPERV = ENV.fetch("DEVVM_PROVIDER", "qemu") == "hyperv"
+# The loopback patch rewrites QEMU's hostfwd arguments; there is nothing for it to do on Hyper-V.
+require_relative "../_shared/fix_qemu_loopback_only" unless HYPERV
 
 STAGE_DIR = ENV.fetch("DEVVM_STAGE_DIR")
 
@@ -92,9 +102,11 @@ Vagrant.configure("2") do |config|
   # already running another guest, rather than failing `up`. fix_qemu_loopback_only.rb above
   # is defense-in-depth for all three regardless of how the host/guest/host_ip values here
   # were arrived at.
-  config.vm.network "forwarded_port", id: "winrm", guest: 5985, host: 5985, host_ip: "127.0.0.1", auto_correct: true
-  config.vm.network "forwarded_port", id: "winrm-ssl", guest: 5986, host: 5986, host_ip: "127.0.0.1", auto_correct: true
-  config.vm.network "forwarded_port", id: "rdp", guest: 3389, host: 3389, host_ip: "127.0.0.1", auto_correct: true
+  unless HYPERV
+    config.vm.network "forwarded_port", id: "winrm", guest: 5985, host: 5985, host_ip: "127.0.0.1", auto_correct: true
+    config.vm.network "forwarded_port", id: "winrm-ssl", guest: 5986, host: 5986, host_ip: "127.0.0.1", auto_correct: true
+    config.vm.network "forwarded_port", id: "rdp", guest: 3389, host: 3389, host_ip: "127.0.0.1", auto_correct: true
+  end
 
   # A fresh install booting under TCG (cross-arch emulation) can be extremely slow — give it
   # a lot of room rather than fail a merely-slow-not-stuck boot.
@@ -156,4 +168,22 @@ Vagrant.configure("2") do |config|
   # provision` re-uploads every time devvm.py calls it (on every `up`/`sync`), not just once.
   config.vm.synced_folder ".", "/vagrant", disabled: true
   config.vm.provision "file", source: STAGE_DIR, destination: "C:/cosca-stage", run: "always"
+
+  # Hyper-V (Windows host). gusztavvargadr/windows-11: a maintained client-edition box (the
+  # windows-10 one is deprecated) with UAC, like the QEMU box; the box and its sha512 are pinned in
+  # box.hyperv.json the same way box.json pins the QEMU one. The VM name is computed once, in
+  # devvm_common.vm_name, and every devvm action that changes a VM selects it by the id Vagrant
+  # stores, not by this name.
+  config.vm.provider "hyperv" do |h, override|
+    override.vm.box = "gusztavvargadr/windows-11-2607.1.0"
+    override.vm.box_url = "file://#{File.expand_path("box.hyperv.json", __dir__)}"
+    # Only "Default Switch" is ever named, and devvm.py refuses to `up` unless it is Internal or
+    # Private. Without a `bridge:` Vagrant would take the only switch, or ask on stdin.
+    override.vm.network "public_network", bridge: "Default Switch"
+    h.vmname = ENV.fetch("DEVVM_VMNAME")
+    h.linked_clone = true
+    h.enable_checkpoints = false
+    h.memory = 4096
+    h.cpus = 2
+  end
 end

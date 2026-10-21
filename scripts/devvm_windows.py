@@ -34,11 +34,13 @@ from devvm_common import (  # noqa: E402
     Guest,
     WINDOWS_PROVISION_DIR,
     get_vagrant_machine_state,
+    host_provider,
     powershell_quote,
     run_vagrant,
     run_vagrant_streaming,
     run_vagrant_winrm_bounded,
 )
+from devvm_hyperv import check_hyperv_guest_network, open_vm_console  # noqa: E402
 
 # Last output line windows-account-and-uac.ps1 prints, telling devvm.py whether an
 # EnableLUA/autologon change it just made needs a reboot to take effect (see
@@ -573,7 +575,12 @@ def provision_windows_guest(guest: Guest, *, auto_consent: bool, display: bool =
         # the explicit `vagrant provision` call two lines down would run it a second,
         # redundant time. Skipping it here makes exactly one invocation happen either way
         # (create or not), driven explicitly below.
-        run_vagrant(guest, ["up", "--provider", "qemu", "--no-provision"], display=display)
+        run_vagrant(guest, ["up", "--provider", host_provider(), "--no-provision"], display=display)
+        if host_provider() == "hyperv":
+            # Before the first provisioning script, and before the console opens.
+            check_hyperv_guest_network(guest)
+            if display:
+                open_vm_console(guest)
         rebooted = ensure_windows_license_current(guest, display=display)
     run_windows_script(guest, WINDOWS_PROVISION_DIR / "windows-clean-stage.ps1", elevated=True, display=display)
     # The lone remaining Vagrantfile-declared provisioner: uploads the staged tree into
