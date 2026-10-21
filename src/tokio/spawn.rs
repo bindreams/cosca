@@ -340,10 +340,11 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                 // after std returned `Ok`: a std `Err` has already collected the child.
                 use crate::child::spawn::unique_report::Report;
                 use crate::containment::AbandonedChild;
-                // A child that had not reported may yet `exec`, with nothing holding it.
                 let front = cmd.elevation_front();
                 let abandoned = match unique {
                     Report::ChildRefused(_) | Report::Missing => AbandonedChild::MaybeUnreaped,
+                    // Not waited for: tokio's error took the pid. If tokio failed after std's `Ok`, the
+                    // child may yet report and `exec`, with nothing holding it.
                     Report::Unwritten => AbandonedChild::MaybeUnreachable,
                     _ => prepared.abandon_before_verdict(front.is_some()),
                 };

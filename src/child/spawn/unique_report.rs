@@ -22,10 +22,11 @@
 //! close-on-exec pipe takes one of the child's stdio numbers, so std returns before the child's
 //! hooks run (see `crate::containment::cgroup::channel::ReportChannel`). The pipe is then empty but
 //! open. The report hook is registered first, so the child either writes its report or dies without
-//! one: [`Channel::run`] blocks on the pipe until one of the two happens, and answers
-//! [`Report::Late`] for a report that came after the spawn returned. The program may then have started
-//! and std's own spawn is not trusted (its error pipe was clobbered, so a failed `exec` is invisible
-//! to it): the spawn tears the child down through its unique id.
+//! one: after an `Ok` spawn, [`Channel::run`] blocks on the pipe until one of the two happens, and
+//! answers [`Report::Late`] for a report that came after the spawn returned. The program may then
+//! have started and std's own spawn is not trusted (its error pipe was clobbered, so a failed `exec`
+//! is invisible to it): the spawn tears the child down through its unique id. A failed spawn leaves
+//! no child to wait on, so its pipe is read once.
 
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -55,8 +56,8 @@ pub(crate) enum Report {
     Missing,
     /// The child's own unique id, which arrived only after the spawn returned (see the module doc).
     Late(u64),
-    /// No report yet, and the pipe still open. Only [`read_report`] answers it; [`Channel::run`]
-    /// waits it out, so no caller sees it.
+    /// No report yet, and the pipe still open. [`Channel::run`] waits it out for a spawn that
+    /// returned `Ok`, so only a failed spawn's caller sees it.
     Unwritten,
     /// This process's own read of the pipe failed.
     ReadFailed(io::Error),
@@ -136,10 +137,15 @@ impl Channel {
         // Closed before the read, so a child that never wrote leaves the pipe at EOF.
         drop(write_end);
         let report = match read_report(&read_end) {
-            Report::Unwritten => await_report(&read_end),
+            // A failed spawn leaves no child to wait on: std collected it, or tokio dropped it and
+            // its pid with it. Its report came already or never comes, so the read stands.
+            Report::Unwritten if spawned.is_ok() => await_report(&read_end),
             report => report,
         };
-        debug_assert!(!matches!(report, Report::Unwritten), "the wait answers a report");
+        debug_assert!(
+            spawned.is_err() || !matches!(report, Report::Unwritten),
+            "the wait answers a report"
+        );
         (spawned, report)
     }
 }
@@ -157,6 +163,10 @@ const SAY_WAITING_AFTER_MS: libc::c_int = 1000;
 /// external event, so the wait has no bound. Past one second it warns, once, naming that: a message
 /// only, never a decision.
 fn await_report(read_end: &OwnedFd) -> Report {
+    #[cfg(test)]
+    if seams::wait_is_refused() {
+        return Report::ReadFailed(io::Error::other("test seam: the wait for a report was entered"));
+    }
     let mut warned = false;
     loop {
         let mut poll = libc::pollfd {
@@ -237,9 +247,9 @@ pub(crate) struct NotAdopted {
 }
 
 /// Why a child cannot be adopted, which decides what the spawn does with it and what it answers.
-/// The caller signals and waits on none of them by pid: without a unique id nothing in cosca acts on
-/// a macOS pid, because nothing pins the number against a foreign reap (`SIGCHLD` ignored, or a
-/// `waitpid(-1)` reaper) and its reuse.
+/// Only a [`Late`](Self::Late) child is signalled and waited on by pid, each act checked against its
+/// id. Without a unique id nothing in cosca acts on a macOS pid, because nothing pins the number
+/// against a foreign reap (`SIGCHLD` ignored, or a `waitpid(-1)` reaper) and its reuse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Unadoptable {
     /// It died before `exec`, so only a corpse is left, and the program did not start.
@@ -253,7 +263,7 @@ pub(crate) enum Unadoptable {
 }
 
 /// The spawn's unique id, or why the child cannot be adopted, for a spawn that returned `Ok`.
-/// Either way the caller does not signal or wait on the child by pid.
+/// Every act on the child by pid is checked against the id; without one, nothing acts on it.
 pub(crate) fn adopted_id(report: Report, pid: u32) -> Result<u64, NotAdopted> {
     let not = |why, error| Err(NotAdopted { error, why });
     match report {
@@ -402,6 +412,7 @@ pub(crate) mod seams {
         static FORCE: Cell<Force> = const { Cell::new(Force::None) };
         static PARENT_READ_ERRNO: Cell<Option<i32>> = const { Cell::new(None) };
         static PARENT_READ_UNWRITTEN: Cell<bool> = const { Cell::new(false) };
+        static WAIT_REFUSED: Cell<bool> = const { Cell::new(false) };
     }
 
     /// What a hook registered on this thread was armed with.
@@ -505,6 +516,26 @@ pub(crate) mod seams {
     /// Whether the next read finds nothing; take-once, so the wait that follows reads the real pipe.
     pub(super) fn parent_read_finds_nothing() -> bool {
         PARENT_READ_UNWRITTEN.with(|f| f.replace(false))
+    }
+
+    /// While the guard lives, the wait for a report on this thread answers `ReadFailed` at once, so a
+    /// test sees by assertion that the wait was entered.
+    pub(crate) fn refuse_the_wait() -> RefusedWait {
+        WAIT_REFUSED.with(|f| f.set(true));
+        RefusedWait(())
+    }
+
+    #[must_use = "the wait runs again as soon as the guard is dropped"]
+    pub(crate) struct RefusedWait(());
+
+    impl Drop for RefusedWait {
+        fn drop(&mut self) {
+            WAIT_REFUSED.with(|f| f.set(false));
+        }
+    }
+
+    pub(super) fn wait_is_refused() -> bool {
+        WAIT_REFUSED.with(Cell::get)
     }
 
     /// The next spawns on this thread have their child killed by `SIGKILL` before it reports, as
