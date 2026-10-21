@@ -89,14 +89,16 @@ def _fs_path(path: Path) -> str:
 
 
 def _clear_readonly_and_retry(func, path, _exc) -> None:
-    """`shutil.rmtree` error handler: Windows refuses to delete a read-only file."""
+    """`shutil.rmtree` error handler for Windows, which refuses to delete a read-only file."""
     os.chmod(path, stat.S_IWRITE)
     func(path)
 
 
 def _rmtree(path: str) -> None:
+    if sys.platform != "win32":
+        shutil.rmtree(path)
     # `onexc` replaced `onerror` in Python 3.12; the script supports 3.11.
-    if sys.version_info >= (3, 12):
+    elif sys.version_info >= (3, 12):
         shutil.rmtree(path, onexc=_clear_readonly_and_retry)
     else:
         shutil.rmtree(path, onerror=lambda func, p, _info: _clear_readonly_and_retry(func, p, None))
