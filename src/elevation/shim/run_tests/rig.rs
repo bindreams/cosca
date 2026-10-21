@@ -41,6 +41,7 @@ pub(super) struct Spec {
     without_proc: bool,
     shipped: bool,
     raw_seams: Vec<(String, OsString)>,
+    exe: Option<PathBuf>,
 }
 
 impl Spec {
@@ -65,6 +66,7 @@ impl Spec {
             without_proc: false,
             shipped: false,
             raw_seams: vec![],
+            exe: None,
         }
     }
 
@@ -146,6 +148,12 @@ impl Spec {
         self
     }
 
+    /// The executable that is the shim, in place of this test binary.
+    pub(super) fn exe(mut self, exe: &Path) -> Spec {
+        self.exe = Some(exe.to_owned());
+        self
+    }
+
     /// `argv[1]` in place of the shim's flag.
     pub(super) fn flag(mut self, flag: &str) -> Spec {
         self.flag = Some(flag.into());
@@ -210,7 +218,10 @@ impl ShimRig {
             program: spec.program.clone(),
             args: spec.args.clone(),
         };
-        let exe = std::env::current_exe().expect("the test binary's path");
+        let exe = spec
+            .exe
+            .clone()
+            .unwrap_or_else(|| std::env::current_exe().expect("the test binary's path"));
         let mut argv = args.to_argv(exe.as_os_str(), false);
         if let Some(flag) = &spec.flag {
             argv[1] = flag.clone();
@@ -754,10 +765,22 @@ pub(super) struct Owner {
 impl Owner {
     /// Starts the helper in `mode` and waits until it is ready.
     pub(super) fn start(mode: &str) -> Owner {
+        Owner::start_with(mode, &[])
+    }
+
+    /// [`start`](Self::start) behind `wrapper`, a command that runs what follows it (`setpriv …`).
+    pub(super) fn start_with(mode: &str, wrapper: &[&str]) -> Owner {
         use std::io::BufRead;
         let work = tempfile::tempdir().expect("a work directory");
         let exe = std::env::current_exe().expect("the test binary's path");
-        let mut command = Command::new(exe);
+        let mut command = match wrapper.split_first() {
+            Some((first, rest)) => {
+                let mut c = Command::new(first);
+                c.args(rest).arg(exe);
+                c
+            }
+            None => Command::new(exe),
+        };
         command
             .args(crate::elevation::shim::owner_helper::argv(mode, work.path()))
             .env_clear()
