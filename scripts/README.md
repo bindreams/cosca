@@ -46,24 +46,25 @@ needed. Install yourself:
   (`Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All`, elevated, then reboot).
 - Membership in the `Hyper-V Administrators` group (sign out and in afterwards), or an elevated shell.
 - [Vagrant](https://www.vagrantup.com/) 2.4.9, [`uv`](https://docs.astral.sh/uv/), Git and Python on `PATH`.
-- A SYSTEM `FullControl` entry that this worktree's `.tmp` inherits, which Vagrant's Hyper-V provider
-  checks on its data directory. A normal profile directory has it; if `up` reports it missing, grant
-  it as the message says.
+- An inheritable SYSTEM `FullControl` entry on this worktree's `.tmp`, which Vagrant's Hyper-V
+  provider checks on its data directory. A normal profile directory has it; if `up` reports it
+  missing, grant it as the message says.
 - The Hyper-V `Default Switch`, which must stay an Internal or Private switch.
 - The Windows OpenSSH client (`ssh.exe`, an optional Windows feature), which `vagrant ssh -c` needs for Linux guests.
 
 | Guest           | Hyper-V box                                 | Notes                                      |
 | --------------- | ------------------------------------------- | ------------------------------------------ |
 | `windows-x64`   | `gusztavvargadr/windows-11` (hyperv, amd64) | pinned in `box.hyperv.json`                |
-| `linux-x64`     | _(none yet)_                                | refused on a Windows host, with the reason |
+| `linux-x64`     | _(none; planned in #706)_                   | refused on a Windows host, with the reason |
 | `linux-arm64`   | _(none)_                                    | arm64: QEMU only                           |
 | `windows-arm64` | _(none)_                                    | see [`windows-arm64`](#windows-arm64)      |
 | `macos-arm64`   | _(none)_                                    | needs an Apple Silicon Mac (Tart)          |
 
 - **Network.** A Hyper-V guest has no forwarded port and no host listener. It sits on the Internal
   `Default Switch` and is reached at its address there. `up` refuses to start unless that switch
-  exists and is Internal or Private, and right after `vagrant up` returns, before any provisioning,
-  it turns the VM off and exits if an adapter is on an External switch. The first boot happens before
+  exists and is Internal or Private, and right after `vagrant up` returns or fails, before any provisioning,
+  it turns the VM off and exits if an adapter is on an External switch. If the VM cannot be turned
+  off, the error says so and gives the `Stop-VM` command to run. The first boot happens before
   that second check, so a switch that changes between the two checks is a window the check narrows
   but cannot close. The guest is unreachable from the LAN. Other VMs on `Default Switch` and
   processes on the host can reach it, as local processes on a macOS host can reach the QEMU guest's
@@ -227,12 +228,12 @@ investigation.
 
 On a Windows host, `gusztavvargadr/windows-11` reads status 5 and grace 0 (an expired
 evaluation's reading) for about three minutes after a fresh VM boots, until Windows runs its
-first activation. A reading other than Licensed is therefore read again after `slmgr /ato`,
-which runs that activation and returns when it is done (`get_settled_windows_license_state`),
-unless its `LicenseStatusReason` is 0xC004FC07 ("validity period expired"): that is an evaluation
-that really ran out, which `/ato` cannot help, so it goes straight to the rearm. A guest that has
-not activated yet reads 0xC004F009 ("grace period expired"). The box ships one rearm, and this
-keeps `up` from spending it on a VM that is not expired.
+first activation. A reading that is neither Licensed nor reason 0xC004FC07 ("validity period
+expired", an evaluation that really ran out) is therefore read again after `slmgr /ato`, which
+runs that activation and returns when it is done (`get_settled_windows_license_state`). If `/ato`
+fails or the second reading is still neither, `up` exits rather than rearm: the box ships one
+rearm, and it must not go to a VM that is not expired. A guest that has not activated yet reads
+0xC004F009 ("grace period expired").
 
 **No Vagrant shell provisioner — a real restart fuse, removed.** `windows-x64`'s Vagrantfile
 declares exactly one provisioner (the WinRM `file` upload). Every other Windows provisioning

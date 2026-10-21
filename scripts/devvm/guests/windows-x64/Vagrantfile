@@ -169,11 +169,9 @@ Vagrant.configure("2") do |config|
   config.vm.synced_folder ".", "/vagrant", disabled: true
   config.vm.provision "file", source: STAGE_DIR, destination: "C:/cosca-stage", run: "always"
 
-  # Hyper-V (Windows host). gusztavvargadr/windows-11: a maintained client-edition box (the
-  # windows-10 one is deprecated) with UAC, like the QEMU box; the box and its sha512 are pinned in
-  # box.hyperv.json the same way box.json pins the QEMU one. The VM name is computed once, in
-  # devvm_common.vm_name, and every devvm action that changes a VM selects it by the id Vagrant
-  # stores, not by this name.
+  # Hyper-V (Windows host). gusztavvargadr/windows-11, with UAC like the QEMU box; box and sha512
+  # are pinned in box.hyperv.json the way box.json pins the QEMU one. devvm actions that change a
+  # VM select it by the id Vagrant stores, not by this name.
   config.vm.provider "hyperv" do |h, override|
     override.vm.box = "gusztavvargadr/windows-11-2607.1.0"
     override.vm.box_url = "file://#{File.expand_path("box.hyperv.json", __dir__)}"
@@ -181,6 +179,8 @@ Vagrant.configure("2") do |config|
     # Private. Without a `bridge:` Vagrant would take the only switch, or ask on stdin.
     override.vm.network "public_network", bridge: "Default Switch"
     h.vmname = ENV.fetch("DEVVM_VMNAME")
+    # Defaults to 120 s, which a first boot can exceed: `up` would fail with the VM still booting.
+    h.ip_address_timeout = config.vm.boot_timeout
     h.linked_clone = true
     h.enable_checkpoints = false
     h.memory = 4096

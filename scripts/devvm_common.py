@@ -56,14 +56,47 @@ def host_provider(platform: str = sys.platform) -> str:
     return "hyperv" if platform == "win32" else "qemu"
 
 
+IMAGE_FILE_MACHINE = {"amd64": 0x8664, "arm64": 0xAA64}
+
+
+def native_machine() -> int:
+    """The host's native IMAGE_FILE_MACHINE value, correct even for an emulated Python (Windows
+    only). platform.machine() reports the emulated architecture instead."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.IsWow64Process2.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.USHORT), ctypes.POINTER(wintypes.USHORT)]
+    process_machine = wintypes.USHORT()
+    native = wintypes.USHORT()
+    if not kernel32.IsWow64Process2(kernel32.GetCurrentProcess(), ctypes.byref(process_machine), ctypes.byref(native)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return native.value
+
+
+def _machine_name(machine: int) -> str:
+    for name, value in IMAGE_FILE_MACHINE.items():
+        if value == machine:
+            return name
+    return f"machine type {machine:#06x}"
+
+
 def host_unsupported_reason(guest: Guest, platform: str = sys.platform) -> str | None:
     """Why `guest` cannot run on this host's provider, or None if it can.
 
     Separate from Guest.available (the guest exists at all, checked first in every command): commands
     call this only after their flag validation, so devvm_test.py's validation tests pass on any host.
+    On a Windows host the guest's architecture must also match the host's native one, because
+    Hyper-V runs only guests of the host's own architecture.
     """
-    if host_provider(platform) == "hyperv" and guest.hyperv_box is None:
+    if host_provider(platform) != "hyperv":
+        return None
+    if guest.hyperv_box is None:
         return "it has no Hyper-V box (its box is QEMU-only), and a Windows host runs guests only on Hyper-V"
+    native = native_machine()
+    if native != IMAGE_FILE_MACHINE[guest.arch]:
+        return f"it is {guest.arch}, but this host's native architecture is {_machine_name(native)}"
     return None
 
 

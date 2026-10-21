@@ -40,7 +40,7 @@ from devvm_common import (  # noqa: E402
     run_vagrant_streaming,
     run_vagrant_winrm_bounded,
 )
-from devvm_hyperv import check_hyperv_guest_network, open_vm_console  # noqa: E402
+from devvm_hyperv import check_hyperv_guest_network, open_vm_console, recorded_vm_id  # noqa: E402
 
 # Last output line windows-account-and-uac.ps1 prints, telling devvm.py whether an
 # EnableLUA/autologon change it just made needs a reboot to take effect (see
@@ -53,9 +53,9 @@ REBOOT_MARKER_FALSE = "DEVVM_REBOOT_REQUIRED=0"
 # stromweld/windows-10 202503.09.0) means the guest is not currently licensed and needs a
 # rearm before it's safe to leave unattended - see ensure_windows_license_current.
 WINDOWS_LICENSE_STATUS_LICENSED = 1
-# SoftwareLicensingProduct.LicenseStatusReason when a started evaluation has run out: sppc.dll's
-# text for it is "the validity period expired". A guest that has not yet run its first
-# activation reads 0xC004F009 instead ("the grace period expired"). Both read status 5, grace 0.
+# SoftwareLicensingProduct.LicenseStatusReason of a started evaluation that has run out ("the
+# validity period expired"). A guest that has not run its first activation yet reads 0xC004F009
+# instead; see get_settled_windows_license_state.
 WINDOWS_LICENSE_REASON_VALIDITY_EXPIRED = 0xC004FC07
 # Rearm proactively within this many minutes of the eval period actually running out, not
 # just once it's already hit zero - a guest that dies mid-provisioning run (see
@@ -453,35 +453,36 @@ def get_settled_windows_license_state(guest: Guest, *, display: bool = False) ->
     activation about three minutes after boot and starts the 90-day validity (measured on 2607.1.0
     in five fresh VMs). A rearm spent on that reading is wasted, and the box ships only one. The
     two differ in LicenseStatusReason: 0xC004F009 (grace period expired) before the first
-    activation, 0xC004FC07 (validity period expired) once a started evaluation has run out. So on
-    Hyper-V:
-    - Licensed, or reason 0xC004FC07: returned as read. `/ato` is not needed, and on an expired
-      guest it cannot help (measured with the guest clock set past the end, where it fails
-      0xC004B011), so it is not run.
-    - Anything else: read again after `slmgr /ato`, which runs the first activation now and returns
-      once it is done. `/ato` can fail (measured: 0x80072EE7, the guest's DNS dropping out); then
-      the state is unknown, so this exits instead of reporting it.
-    The QEMU boxes never showed the misread and keep the single read.
+    activation, 0xC004FC07 (validity period expired) once a started evaluation has run out.
+
+    On Hyper-V a reading that is neither Licensed nor reason 0xC004FC07 is read again after
+    `slmgr /ato`, which runs the first activation now and returns once it is done. If `/ato` fails
+    (measured: 0x80072EE7, the guest's DNS dropping out) or the second reading is still neither,
+    the state is unknown and this exits, so the caller never rearms on it. The QEMU boxes never
+    showed the misread and keep the single read.
     """
     state = get_windows_license_state(guest)
-    if (
-        state[0] == WINDOWS_LICENSE_STATUS_LICENSED
-        or state[3] == WINDOWS_LICENSE_REASON_VALIDITY_EXPIRED
-        or host_provider() != "hyperv"
-    ):
+    if host_provider() != "hyperv" or _license_state_is_settled(state):
         return state
     returncode = run_vagrant(
         guest, ["winrm", "-c", "cscript.exe //nologo C:\\Windows\\System32\\slmgr.vbs /ato"], display=display, check=False
     )
-    if returncode != 0:
-        print(
-            f"error: guest '{guest.name}' reads Windows license status {state[0]}, and `slmgr /ato` "
-            "failed, so devvm cannot tell an expired evaluation from one that has not finished "
-            "activating. Run `devvm.py up` again; check the guest's network if it keeps failing.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    return get_windows_license_state(guest)
+    if returncode == 0:
+        state = get_windows_license_state(guest)
+        if _license_state_is_settled(state):
+            return state
+    print(
+        f"error: guest '{guest.name}' reads Windows license status {state[0]} (reason {state[3]:#010x}), "
+        "and devvm cannot tell an expired evaluation from one that has not finished activating. "
+        "Run `devvm.py up` again; check the guest's network if it keeps failing.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
+def _license_state_is_settled(state: tuple[int, float, int, int]) -> bool:
+    """Whether a reading is Licensed or an evaluation that really ran out (reason 0xC004FC07)."""
+    return state[0] == WINDOWS_LICENSE_STATUS_LICENSED or state[3] == WINDOWS_LICENSE_REASON_VALIDITY_EXPIRED
 
 
 def ensure_windows_license_current(guest: Guest, *, display: bool = False) -> bool:
@@ -586,6 +587,24 @@ def should_wait_for_session(*, started_guest: bool, rebooted: bool) -> bool:
     return started_guest or rebooted
 
 
+def _hyperv_up(guest: Guest, *, display: bool) -> None:
+    """`vagrant up --no-provision` on Hyper-V, then the guest network check, then the console.
+
+    The check runs whenever a VM id is recorded, whatever `up` did (it fails, or is interrupted
+    after the VM exists), because a VM Vagrant started may already be on a bad switch. A bad switch
+    exits first; otherwise a failed `up` exits with Vagrant's code.
+    """
+    try:
+        returncode = run_vagrant(guest, ["up", "--provider", "hyperv", "--no-provision"], display=display, check=False)
+    finally:
+        if recorded_vm_id(guest) is not None:
+            check_hyperv_guest_network(guest)
+    if returncode != 0:
+        sys.exit(returncode)
+    if display:
+        open_vm_console(guest)
+
+
 def provision_windows_guest(guest: Guest, *, auto_consent: bool, display: bool = False, create: bool) -> None:
     """Create (if `create`) and/or provision a Windows guest, driving each provisioning
     script directly over `vagrant winrm` (see run_windows_script) instead of Vagrant's WinRM
@@ -625,12 +644,10 @@ def provision_windows_guest(guest: Guest, *, auto_consent: bool, display: bool =
         # the explicit `vagrant provision` call two lines down would run it a second,
         # redundant time. Skipping it here makes exactly one invocation happen either way
         # (create or not), driven explicitly below.
-        run_vagrant(guest, ["up", "--provider", host_provider(), "--no-provision"], display=display)
         if host_provider() == "hyperv":
-            # Before the first provisioning script, and before the console opens.
-            check_hyperv_guest_network(guest)
-            if display:
-                open_vm_console(guest)
+            _hyperv_up(guest, display=display)
+        else:
+            run_vagrant(guest, ["up", "--provider", host_provider(), "--no-provision"], display=display)
         rebooted = ensure_windows_license_current(guest, display=display)
     if host_provider() == "hyperv":
         run_windows_script(guest, WINDOWS_PROVISION_DIR / "windows-winrm-memory.ps1", elevated=True, display=display)

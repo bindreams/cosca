@@ -21,14 +21,16 @@ import uuid
 from pathlib import Path
 from typing import NoReturn
 
-from devvm_common import Guest, dotfile_dir, host_unsupported_reason, vm_name
+from devvm_common import Guest, dotfile_dir, host_unsupported_reason, powershell_quote, vm_name
 
 # Vagrant 2.4.9's `data_dir` for the default machine: <VAGRANT_DOTFILE_PATH>/machines/default/hyperv.
 MACHINE_NAME = "default"
 SWITCH_NAME = "Default Switch"
 SID_ADMINISTRATORS = "S-1-5-32-544"
 SID_HYPERV_ADMINISTRATORS = "S-1-5-32-578"
-IMAGE_FILE_MACHINE = {"amd64": 0x8664, "arm64": 0xAA64}
+# FILE_ALL_ACCESS, which is what FullControl is, and GENERIC_ALL, which maps to it when a child inherits it.
+FILE_ALL_ACCESS = 0x1F01FF
+GENERIC_ALL = 0x10000000
 
 
 def _die(message: str) -> NoReturn:
@@ -80,22 +82,6 @@ def can_manage_hyperv() -> bool:
     return _token_is_member(SID_ADMINISTRATORS) or _token_is_member(SID_HYPERV_ADMINISTRATORS)
 
 
-def native_machine() -> int:
-    """The host's native IMAGE_FILE_MACHINE value, correct even for an emulated Python (Windows
-    only). platform.machine() reports the emulated architecture instead."""
-    import ctypes
-    from ctypes import wintypes
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
-    kernel32.IsWow64Process2.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.USHORT), ctypes.POINTER(wintypes.USHORT)]
-    process_machine = wintypes.USHORT()
-    native = wintypes.USHORT()
-    if not kernel32.IsWow64Process2(kernel32.GetCurrentProcess(), ctypes.byref(process_machine), ctypes.byref(native)):
-        raise ctypes.WinError(ctypes.get_last_error())
-    return native.value
-
-
 def _nearest_existing(path: Path) -> Path:
     while not path.exists():
         path = path.parent
@@ -103,20 +89,22 @@ def _nearest_existing(path: Path) -> Path:
 
 
 def system_full_control_propagates(directory: Path) -> bool:
-    """Whether `directory` carries an Allow FullControl ACE for SYSTEM that its children inherit.
+    """Whether `directory` carries an Allow ACE for SYSTEM that its children inherit as FullControl.
 
     Vagrant's Hyper-V provider refuses to start unless the machine's data directory has that ACE
     as an inherited one (VagrantVM.psm1, Check-VagrantHyperVAccess), so it has to flow down from
-    the nearest directory that exists now. NoPropagateInherit would stop it one level down.
+    the nearest directory that exists now. A mask of FullControl, or one with GENERIC_ALL (which a
+    child inherits as FullControl), qualifies; NoPropagateInherit would stop it one level down.
     """
     script = (
         "$ErrorActionPreference = 'Stop'; "
-        f"$acl = [System.IO.Directory]::GetAccessControl({_ps_quote(str(directory))}); "
+        f"$acl = [System.IO.Directory]::GetAccessControl({powershell_quote(str(directory))}); "
         "$sid = [System.Security.Principal.SecurityIdentifier]; "
         "$ok = @($acl.GetAccessRules($true, $true, $sid) | Where-Object { "
         "$_.IdentityReference.Value -eq 'S-1-5-18' -and "
         "$_.AccessControlType -eq 'Allow' -and "
-        "$_.FileSystemRights -eq 'FullControl' -and "
+        f"(([int]$_.FileSystemRights -band {GENERIC_ALL}) -ne 0 -or "
+        f"([int]$_.FileSystemRights -band {FILE_ALL_ACCESS}) -eq {FILE_ALL_ACCESS}) -and "
         "($_.InheritanceFlags -band [System.Security.AccessControl.InheritanceFlags]::ContainerInherit) -and "
         "-not ($_.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::NoPropagateInherit) "
         "}).Count -gt 0; "
@@ -128,29 +116,17 @@ def system_full_control_propagates(directory: Path) -> bool:
     return bool(json.loads(result.stdout)["ok"])
 
 
-def _ps_quote(value: str) -> str:
-    return "'" + value.replace("'", "''") + "'"
-
-
 def check_hyperv_host(guest: Guest) -> None:
     """Exit with a message unless this host can run `guest` on Hyper-V.
 
-    Runs before devvm creates or stages anything. Checks, in order: the guest has a Hyper-V box;
-    the host's native architecture matches the guest's; the user may manage Hyper-V; Vagrant's
-    data directory will carry the SYSTEM ACE its own access check needs; `Default Switch` exists
-    and is Internal or Private, so the guest cannot be bridged onto the LAN.
+    Runs before devvm creates or stages anything. Checks, in order: the host supports the guest
+    (host_unsupported_reason); the user may manage Hyper-V; Vagrant's data directory will carry
+    the SYSTEM ACE its own access check needs; `Default Switch` exists and is Internal or Private,
+    so the guest cannot be bridged onto the LAN.
     """
     reason = host_unsupported_reason(guest)
     if reason is not None:
         _die(f"guest '{guest.name}' is not available on this host: {reason}")
-
-    machine = IMAGE_FILE_MACHINE[guest.arch]
-    native = native_machine()
-    if native != machine:
-        _die(
-            f"guest '{guest.name}' is {guest.arch}, but this host's native architecture is "
-            f"{_machine_name(native)}; Hyper-V runs only guests of the host's own architecture."
-        )
 
     if not can_manage_hyperv():
         _die(
@@ -170,7 +146,7 @@ def check_hyperv_host(guest: Guest) -> None:
 
     result = run_host_powershell(
         "$ErrorActionPreference = 'Stop'; "
-        f"$s = @(Hyper-V\\Get-VMSwitch | Where-Object {{ $_.Name -eq {_ps_quote(SWITCH_NAME)} }}); "
+        f"$s = @(Hyper-V\\Get-VMSwitch | Where-Object {{ $_.Name -eq {powershell_quote(SWITCH_NAME)} }}); "
         "ConvertTo-Json @{ types = @($s | ForEach-Object { $_.SwitchType.ToString() }) }"
     )
     if result.returncode != 0:
@@ -188,14 +164,7 @@ def check_hyperv_host(guest: Guest) -> None:
         )
 
 
-def _machine_name(machine: int) -> str:
-    for name, value in IMAGE_FILE_MACHINE.items():
-        if value == machine:
-            return name
-    return f"machine type {machine:#06x}"
-
-
-def _recorded_vm_id(guest: Guest) -> str | None:
+def recorded_vm_id(guest: Guest) -> str | None:
     """The VM id Vagrant stored for `guest`, or None if no VM has been created yet."""
     id_file = dotfile_dir(guest) / "machines" / MACHINE_NAME / "hyperv" / "id"
     try:
@@ -215,7 +184,7 @@ def vm_id(guest: Guest) -> str:
 
     Every operation that changes or opens a VM selects it by this id, never by name.
     """
-    recorded = _recorded_vm_id(guest)
+    recorded = recorded_vm_id(guest)
     if recorded is None:
         _die(f"no Hyper-V VM id recorded for guest '{guest.name}': it has not been created here")
     return recorded
@@ -225,13 +194,13 @@ def check_hyperv_guest_network(guest: Guest) -> None:
     """Exit non-zero if any network adapter of `guest`'s VM is not on an Internal or Private
     switch, after turning that VM off (by id, only it).
 
-    Runs right after `vagrant up` returns, before the first provisioning script. It narrows the
-    window the pre-`up` check in check_hyperv_host leaves (the switch changing in between); it
-    cannot prevent the VM's first boot.
+    Runs right after `vagrant up` returns or fails, before the first provisioning script. If the
+    VM cannot be turned off, the error says so and gives the command that does.
     """
+    vid = vm_id(guest)
     script = (
         "$ErrorActionPreference = 'Stop'; "
-        f"$vm = Hyper-V\\Get-VM -Id {_ps_quote(vm_id(guest))}; "
+        f"$vm = Hyper-V\\Get-VM -Id {powershell_quote(vid)}; "
         "$switches = @(Hyper-V\\Get-VMSwitch); "
         "$bad = @(); "
         "foreach ($a in @(Hyper-V\\Get-VMNetworkAdapter -VM $vm)) { "
@@ -239,20 +208,36 @@ def check_hyperv_guest_network(guest: Guest) -> None:
         "$m = @($switches | Where-Object { $_.Name -eq $a.SwitchName }); "
         "if ($m.Count -eq 0 -or @($m | Where-Object { $_.SwitchType.ToString() -notin 'Internal', 'Private' }).Count -gt 0) "
         "{ $bad += $a.SwitchName } }; "
-        "if ($bad.Count -gt 0) { Hyper-V\\Stop-VM -VM $vm -TurnOff -Force }; "
-        "ConvertTo-Json @{ bad = @($bad) }"
+        "$stopError = ''; "
+        "if ($bad.Count -gt 0 -and $vm.State.ToString() -ne 'Off') { "
+        "try { Hyper-V\\Stop-VM -VM $vm -TurnOff -Force; "
+        f"$after = (Hyper-V\\Get-VM -Id {powershell_quote(vid)}).State.ToString(); "
+        'if ($after -ne \'Off\') { $stopError = "the VM is $after after Stop-VM" } } '
+        "catch { $stopError = $_.Exception.Message } }; "
+        "ConvertTo-Json @{ bad = @($bad); stop_error = $stopError }"
     )
     result = run_host_powershell(script)
     if result.returncode != 0:
         _die(f"could not inspect the network adapters of VM '{vm_name(guest)}':\n{result.stderr}")
-    bad = json.loads(result.stdout)["bad"]
-    if bad:
+    report = json.loads(result.stdout)
+    bad = report["bad"]
+    if not bad:
+        return
+    switches = ", ".join(repr(b) for b in bad)
+    problem = (
+        f"VM '{vm_name(guest)}' (id {vid}) has an adapter on {switches}, which is not an Internal or "
+        "Private Hyper-V switch, so it could be reachable from the LAN."
+    )
+    if report["stop_error"]:
         _die(
-            f"VM '{vm_name(guest)}' has an adapter on {', '.join(repr(b) for b in bad)}, which is not "
-            "an Internal or Private Hyper-V switch, so it could be reachable from the LAN. devvm "
-            "turned the VM off before provisioning anything. Check the switch named in "
-            f"scripts/devvm/guests/{guest.name}/Vagrantfile, then `devvm.py destroy {guest.name}`."
+            f"{problem} devvm could NOT turn it off ({report['stop_error'].strip()}). Turn it off now, "
+            f"from an elevated shell: `Get-VM -Id {vid} | Stop-VM -TurnOff -Force`, then "
+            f"`devvm.py destroy {guest.name}`."
         )
+    _die(
+        f"{problem} The VM is off and devvm provisioned nothing on it. Check the switch named in "
+        f"scripts/devvm/guests/{guest.name}/Vagrantfile, then `devvm.py destroy {guest.name}`."
+    )
 
 
 def vmconnect_argv(guest: Guest) -> list[str]:
@@ -262,12 +247,20 @@ def vmconnect_argv(guest: Guest) -> list[str]:
 
 def vmconnect_hint(guest: Guest) -> str:
     """`vmconnect_argv` as text for a message; before the VM exists, says how to get one."""
-    recorded = _recorded_vm_id(guest)
+    recorded = recorded_vm_id(guest)
     if recorded is None:
         return "Hyper-V's console (`vmconnect.exe`, once `devvm.py up` has created the VM)"
     return f"Hyper-V's console (`vmconnect.exe localhost -G {recorded}`)"
 
 
 def open_vm_console(guest: Guest) -> None:
-    """Open Hyper-V's own console window (`vmconnect`) on `guest`'s VM; does not wait for it."""
-    subprocess.Popen(vmconnect_argv(guest))
+    """Open Hyper-V's own console window (`vmconnect`) on `guest`'s VM; does not wait for it.
+
+    The console is a convenience, so a `vmconnect.exe` that cannot start (it comes with Hyper-V's
+    management tools) is a warning, not a failure.
+    """
+    argv = vmconnect_argv(guest)
+    try:
+        subprocess.Popen(argv)
+    except OSError as e:
+        print(f"warning: could not start {argv[0]} to open the console of VM '{vm_name(guest)}': {e}", file=sys.stderr)
