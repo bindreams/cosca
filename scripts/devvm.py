@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import base64
 import math
+import os
 import shlex
 import shutil
 import subprocess
@@ -53,12 +54,16 @@ from devvm_common import (  # noqa: E402
     run_vagrant,
     stage_dir,
 )
-import devvm_macos  # noqa: E402
 from devvm_windows import (  # noqa: E402
     InteractiveLookupFailure,
     get_windows_interactive_username,
     provision_windows_guest,
 )
+
+# devvm_macos needs POSIX modules (fcntl, signal.SIGHUP) that do not exist on Windows. The
+# macOS guest needs Tart on an Apple Silicon Mac anyway, so a Windows host never loads it.
+if sys.platform != "win32":
+    import devvm_macos
 
 # windows-run-unelevated.ps1 (the guest side of `devvm.py run --unelevated --timeout`) feeds
 # -TimeoutSeconds, converted to milliseconds via its own Get-RemainingMs, into .NET
@@ -67,6 +72,8 @@ from devvm_windows import (  # noqa: E402
 # on the guest, after a slow round-trip there and back - reject it here instead, where the
 # mistake is immediate and the error message is in front of the person who typed it.
 WINDOWS_RUN_UNELEVATED_MAX_TIMEOUT_SECONDS = (2**31 - 1) // 1000
+
+WINDOWS_VERBATIM_PREFIX = "\\\\?\\"
 
 
 GUESTS: dict[str, Guest] = {
@@ -82,11 +89,22 @@ GUESTS: dict[str, Guest] = {
         box="perk/ubuntu-24.04-arm64 (qemu/arm64)",
         tree_path_posix="/home/vagrant/cosca",
     ),
-    "macos-arm64": Guest(
-        name="macos-arm64",
-        communicator="tart",
-        box=f"{devvm_macos.BASE_IMAGE} (Tart, Cirrus base image - not GitHub's runner image)",
-        tree_path_posix="~/cosca",
+    "macos-arm64": (
+        Guest(
+            name="macos-arm64",
+            communicator="tart",
+            box="Tart Cirrus base image - not GitHub's runner image",
+            available=False,
+            unavailable_reason="needs an Apple Silicon Mac (Tart)",
+            tree_path_posix="~/cosca",
+        )
+        if sys.platform == "win32"
+        else Guest(
+            name="macos-arm64",
+            communicator="tart",
+            box=f"{devvm_macos.BASE_IMAGE} (Tart, Cirrus base image - not GitHub's runner image)",
+            tree_path_posix="~/cosca",
+        )
     ),
     "windows-x64": Guest(
         name="windows-x64",
@@ -244,9 +262,14 @@ def stage_tree(guest: Guest, *, repo_root: Path = REPO_ROOT, dest: Path | None =
 
     `git ls-files -z` / `rsync --from0` avoid whitespace/newline-in-filename hazards that a
     plain newline-joined list would have.
+
+    Off Windows the copy is `rsync --archive`. Windows has no rsync, so there the same file list
+    is copied with `shutil.copy2` (content, mtime and the read-only bit; the repo has no symlinks
+    or submodules, so every entry is a regular file).
     """
-    require_tool("rsync")
     require_tool("git")
+    if sys.platform != "win32":
+        require_tool("rsync")
     if dest is None:
         dest = stage_dir(guest)
 
@@ -265,6 +288,17 @@ def stage_tree(guest: Guest, *, repo_root: Path = REPO_ROOT, dest: Path | None =
     if dest.exists():
         shutil.rmtree(dest)
     dest.mkdir(parents=True)
+
+    if sys.platform == "win32":
+        # The verbatim prefix lifts the 260-character MAX_PATH limit for deep checkouts.
+        src_root = WINDOWS_VERBATIM_PREFIX + os.path.abspath(repo_root)
+        dst_root = WINDOWS_VERBATIM_PREFIX + os.path.abspath(dest)
+        for rel in existing:
+            rel_native = rel.decode().replace("/", "\\")  # verbatim paths allow only backslashes
+            target = os.path.join(dst_root, rel_native)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            shutil.copy2(os.path.join(src_root, rel_native), target)
+        return
 
     cmd = [
         "rsync",
@@ -678,6 +712,7 @@ class VagrantBackend:
 
 def backend_for(guest: Guest):
     if guest.communicator == "tart":
+        assert sys.platform != "win32", "the macOS guest is unavailable on a Windows host"
         return devvm_macos.MacosBackend(None, REPO_ROOT, STATE_DIR)
     return VagrantBackend(guest)
 
