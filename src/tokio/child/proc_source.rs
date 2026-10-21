@@ -1058,16 +1058,22 @@ impl ProcSource {
         fate
     }
 
-    /// macOS: tears down a child whose unique id `unique` arrived only after its spawn returned
-    /// (see `kill_and_reap_unreported`). Tokio's `Child` is forgotten, never dropped, because its drop
-    /// would `waitpid` a number already collected; the event's one warn says what that leaks. A child
-    /// its kill did not end (a setuid child refuses the kill) is released instead, to tokio's orphan
-    /// reaper, which reaps it once it exits: forgetting it would leave a zombie nothing collects.
+    /// macOS: tears down a child whose unique id `unique` arrived only after its spawn returned, and
+    /// its tree through `prepared` (see `kill_and_reap_unreported`). Tokio's `Child` is forgotten,
+    /// never dropped, because its drop would `waitpid` a number already collected; the event's one
+    /// warn says what that leaks. A child its kill did not end (a setuid child refuses the kill) is
+    /// released instead, to tokio's orphan reaper, which reaps it once it exits: forgetting it would
+    /// leave a zombie nothing collects.
     /// Consumes the backend. **Invariant:** no `wait()` future for this child is in flight.
     #[cfg(target_os = "macos")]
-    pub(crate) fn reap_unreported(mut self, pid: u32, unique: u64) -> ChildFate {
+    pub(crate) fn reap_unreported(
+        mut self,
+        pid: u32,
+        unique: u64,
+        prepared: crate::containment::Prepared,
+    ) -> ChildFate {
         crate::bounded::assert_may_block("reap_unreported");
-        let done = crate::child::spawn::kill_and_reap_unreported(pid, unique);
+        let done = crate::child::spawn::kill_and_reap_unreported(pid, unique, prepared);
         if matches!(done.fate, ChildFate::Running { .. }) {
             self.release();
             return done.warn(

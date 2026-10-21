@@ -555,7 +555,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                 SpawnFailure::started(left.note(error, front, Some(pid)), ChildFate::Running { id: None })
             }
             // Its id came late: torn down through it, as the sync spawn does.
-            Unadoptable::Late(unique) => SpawnFailure::started(error, proc.reap_unreported(pid, unique)),
+            Unadoptable::Late(unique) => SpawnFailure::started(error, proc.reap_unreported(pid, unique, prepared)),
             // An elevation front is sent nothing and handed to no reaper: left unreaped, as the sync
             // spawn leaves it, and the error says so.
             Unadoptable::Unverified if front.is_some() => {

@@ -575,7 +575,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     #[cfg(target_os = "macos")]
     let unique = match unique_report::adopted_id(unique, child.id()) {
         Ok(unique) => unique,
-        Err(not_adopted) => return Err(abandon_unadopted(child, not_adopted, front)),
+        Err(not_adopted) => return Err(abandon_unadopted(child, not_adopted, front, prepared)),
     };
     // A front's leaf subtree, captured while it exists: a failure arm drops the leaf, killing it.
     #[cfg(target_os = "linux")]
@@ -800,11 +800,14 @@ pub(crate) struct Unreported {
 }
 
 /// Kills and reaps `pid`, a child whose unique id `unique` arrived only after its spawn returned. Its
-/// exec cannot be confirmed, so it is torn down through the id, as the other post-spawn failures are.
-/// Warns nothing: [`Unreported::warn`] does, once.
+/// exec cannot be confirmed, so it is torn down through the id, as the other post-spawn failures are:
+/// its tree first, through `prepared`, its containment, then the child. Warns nothing:
+/// [`Unreported::warn`] does, once.
 #[cfg(target_os = "macos")]
-pub(crate) fn kill_and_reap_unreported(pid: u32, unique: u64) -> Unreported {
-    let mut notes = Vec::new();
+pub(crate) fn kill_and_reap_unreported(pid: u32, unique: u64, prepared: crate::containment::Prepared) -> Unreported {
+    #[cfg(test)]
+    fault::run_at(fault::SpawnPoint::BeforeLateTeardown, pid);
+    let mut notes: Vec<String> = kill_late_tree(pid, unique, prepared).into_iter().collect();
     let mut breach = None;
     let (fate, kill) = kill_and_reap_noting(pid, unique, None, &mut notes, &mut breach);
     Unreported {
@@ -812,6 +815,40 @@ pub(crate) fn kill_and_reap_unreported(pid: u32, unique: u64) -> Unreported {
         kill,
         notes,
         breach,
+    }
+}
+
+/// Kills the tree of `pid`, a late child with the unique id `unique`, through `prepared`, its
+/// containment. It runs before the child's own kill and reap, so the child is unreaped and its group
+/// and marker still name its tree. Only a contained root has a tree; the child's identity is read
+/// and checked against `unique` first, and one that is gone or not shown ours names none. A foreign
+/// reap after that check is the gap `Child::drop`'s tree kill accepts too. Answers a note for the
+/// warn when the tree was not killed.
+#[cfg(target_os = "macos")]
+fn kill_late_tree(pid: u32, unique: u64, prepared: crate::containment::Prepared) -> Option<String> {
+    if prepared.mode.is_none() || !prepared.is_root {
+        return None;
+    }
+    let (resolved, mut why) = resolve_identity(pid, &crate::wait::exit_only::Target::pid(pid, Some(unique)));
+    let id = match resolved {
+        crate::identity::Resolved::Found(id) => id,
+        crate::identity::Resolved::Gone => {
+            return Some(why.fold("its tree was not killed: the child is gone, or is not ours"))
+        }
+        crate::identity::Resolved::Unknown => {
+            return Some(why.fold("its tree was not killed: the child's identity could not be read"))
+        }
+    };
+    match crate::containment::attach(id, prepared) {
+        Ok(attachment) => attachment
+            .attached
+            .hard_kill()
+            .err()
+            .map(|e| format!("its tree was not fully killed: {e}")),
+        Err(e) => {
+            assert_attach_cannot_fail(&e);
+            Some(format!("its tree was not killed: {e}"))
+        }
     }
 }
 
@@ -998,16 +1035,18 @@ fn reap_verified(
     }
 }
 
-/// macOS: `child` could not be adopted, so it is abandoned with nothing signalled or waited on by
-/// pid, and the spawn fails with `not_adopted.error`. A child that died before `exec` is only a
-/// corpse nothing collects, and the program did not start. A child whose id came late may have
-/// started the program, and is torn down through that id; a `front` is left running and unreaped
-/// instead, and the error notes it. Any other is left as `leave_unverified_child` leaves it.
+/// macOS: `child` could not be adopted, and the spawn fails with `not_adopted.error`. A child that
+/// died before `exec` is only a corpse nothing collects, and the program did not start. A child
+/// whose id came late may have started the program: its tree is killed through `prepared`, then the
+/// child is killed and reaped by pid, each checked against that id. A `front` is sent nothing and
+/// left running and unreaped instead, and the error notes it. Any other is never signalled or
+/// waited on by pid, and is left as `leave_unverified_child` leaves it.
 #[cfg(target_os = "macos")]
 fn abandon_unadopted(
     child: std::process::Child,
     not_adopted: unique_report::NotAdopted,
     front: Option<crate::elevation::front::Front>,
+    prepared: crate::containment::Prepared,
 ) -> SpawnFailure {
     use unique_report::Unadoptable;
 
@@ -1036,7 +1075,7 @@ fn abandon_unadopted(
             }
             // Torn down through its unique id, exactly as every other post-spawn failure is. The `std`
             // `Child` is dropped after: it reaps nothing, so a child still running stays a zombie.
-            let done = kill_and_reap_unreported(pid, unique);
+            let done = kill_and_reap_unreported(pid, unique, prepared);
             let tail = done.zombie_tail();
             let fate = done.warn(pid, tail);
             drop(child);
@@ -2533,6 +2572,8 @@ pub(crate) mod fault {
         static BEFORE_IDENTITY: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
         static BEFORE_ATTACH: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
         static AFTER_IDENTITY_READ: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
+        #[cfg(target_os = "macos")]
+        static BEFORE_LATE_TEARDOWN: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
         static TEARDOWN_REAPS: std::cell::RefCell<Option<Vec<TeardownReap>>> = const { std::cell::RefCell::new(None) };
         #[cfg(target_os = "linux")]
         static ATTACHMENT_OVERRIDE: std::cell::RefCell<Option<crate::containment::Attachment>> =
@@ -2803,6 +2844,9 @@ pub(crate) mod fault {
         /// Right after the spawn read the child's identity, before it checks the read against the
         /// child's handle.
         AfterIdentityRead,
+        /// macOS: right before the teardown of a child whose unique id came late.
+        #[cfg(target_os = "macos")]
+        BeforeLateTeardown,
     }
 
     fn hook_at(point: SpawnPoint) -> &'static std::thread::LocalKey<crate::oneshot_hook::OneShotHook> {
@@ -2810,6 +2854,8 @@ pub(crate) mod fault {
             SpawnPoint::BeforeIdentity => &BEFORE_IDENTITY,
             SpawnPoint::BeforeAttach => &BEFORE_ATTACH,
             SpawnPoint::AfterIdentityRead => &AFTER_IDENTITY_READ,
+            #[cfg(target_os = "macos")]
+            SpawnPoint::BeforeLateTeardown => &BEFORE_LATE_TEARDOWN,
         }
     }
 
