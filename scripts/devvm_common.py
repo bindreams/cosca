@@ -155,11 +155,12 @@ def run_vagrant_winrm_bounded(guest: Guest, powershell_cmd: str, deadline: float
     `deadline` (a time.monotonic() value) instead of running unbounded.
 
     Why not a plain `timeout=`: `vagrant` execs a Ruby child to do the actual work, so killing
-    only the Go launcher process on timeout would leave that Ruby child running, reparented to
-    PID 1, orphaned on the HOST — the leaked-process hazard CLAUDE.local.md's sandbox rule
-    exists to prevent. `start_new_session=True` makes the launcher (and everything it forks) its
-    own process group, so a timeout kills the whole group via `os.killpg`, not just the
-    launcher.
+    only the launcher process on timeout would leave that Ruby child running, orphaned on the
+    HOST — the leaked-process hazard CLAUDE.local.md's sandbox rule exists to prevent. Off
+    Windows, `start_new_session=True` makes the launcher (and everything it forks) its own
+    process group, so a timeout kills the whole group via `os.killpg`, not just the launcher. On
+    Windows, which has no process groups, the launcher runs in a Job Object
+    (devvm_winjob.KillOnCloseJob) and a timeout terminates the whole job.
 
     On a real timeout, returns `timed_out=True` with a nonzero returncode and empty
     stdout/stderr — see BoundedWinrmResult's own docstring for why that's reported explicitly,
@@ -167,15 +168,27 @@ def run_vagrant_winrm_bounded(guest: Guest, powershell_cmd: str, deadline: float
     produces.
     """
     remaining = max(deadline - time.monotonic(), 0.001)
-    proc = subprocess.Popen(
-        ["vagrant", "winrm", "-c", powershell_cmd],
+    argv = ["vagrant", "winrm", "-c", powershell_cmd]
+    popen_kwargs = dict(
         cwd=guest_dir(guest),
         env=vagrant_env(guest),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        start_new_session=True,
     )
+    if sys.platform == "win32":
+        from devvm_winjob import KillOnCloseJob
+
+        with KillOnCloseJob() as job:
+            proc = job.popen(argv, **popen_kwargs)
+            try:
+                stdout, stderr = proc.communicate(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                job.terminate()
+                stdout, stderr = proc.communicate()
+                return BoundedWinrmResult(1, stdout, stderr, timed_out=True)
+            return BoundedWinrmResult(proc.returncode, stdout, stderr, timed_out=False)
+    proc = subprocess.Popen(argv, start_new_session=True, **popen_kwargs)
     try:
         stdout, stderr = proc.communicate(timeout=remaining)
     except subprocess.TimeoutExpired:
