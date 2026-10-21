@@ -257,3 +257,42 @@ async fn macos_tokio_spawn_of_a_late_front_leaves_it_running_and_says_so() {
     crate::child::spawn::identity_macos_tests::end_unsignalled_and_reap(pid);
     drop(writer);
 }
+
+/// A contained child whose report came late is torn down with its tree, as the sync spawn does: the
+/// grandchild it forked is killed too. The hook before the teardown waits until the grandchild runs;
+/// the grandchild is released afterwards and writes if it is still alive, so a survivor fails by
+/// assertion, not by hang.
+///
+/// Mutant: the late teardown kills the root alone.
+#[skuld::test]
+async fn macos_tokio_spawn_of_a_late_contained_child_kills_its_tree() {
+    use crate::child::spawn::late_report_tests::{tree_pipes, TREE_ARGV};
+    crate::log_capture::install();
+    let (tree, ends) = tree_pipes();
+    let mut cmd = crate::tokio::Command::new();
+    cmd.args(TREE_ARGV).contain();
+    for (fd, end) in ends {
+        cmd.fd(fd, end).expect("set the fd");
+    }
+    let tree = Rc::new(std::cell::RefCell::new(Some(tree)));
+    let _hook = crate::child::spawn::fault::set_at(crate::child::spawn::fault::SpawnPoint::BeforeLateTeardown, {
+        let tree = Rc::clone(&tree);
+        move || tree.borrow_mut().as_mut().expect("the tree").await_grandchild()
+    });
+    let mark = crate::log_capture::mark();
+    let err = {
+        let _late = unique_report::seams::find_the_report_unwritten();
+        cmd.spawn().expect_err("a late child is not adopted")
+    };
+    let (_err, fate) = crate::child::spawn::failure::expect_may_have_started_with(err);
+    let Some(crate::identity::Resolved::Found(id)) = crate::child::spawn::fault::take_captured() else {
+        panic!("the spawn captured the child");
+    };
+    let tree = tree.borrow_mut().take().expect("the tree");
+    assert!(
+        !tree.grandchild_survived(),
+        "the late child's grandchild must be killed"
+    );
+    assert_eq!(fate, ChildFate::Reaped, "the root is killed and reaped");
+    assert_one_warn(id.pid(), mark, &[SAID_REAPED, LEAKS], &["tree was not"]);
+}
