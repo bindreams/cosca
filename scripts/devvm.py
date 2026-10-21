@@ -23,7 +23,9 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import math
+import ntpath
 import os
 import shlex
 import shutil
@@ -31,6 +33,7 @@ import stat
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 # Sibling-module import, working whether this script runs directly as `__main__`
@@ -54,6 +57,7 @@ from devvm_common import (  # noqa: E402
     require_tool,
     run_vagrant,
     stage_dir,
+    stage_lock,
 )
 from devvm_windows import (  # noqa: E402
     InteractiveLookupFailure,
@@ -61,8 +65,7 @@ from devvm_windows import (  # noqa: E402
     provision_windows_guest,
 )
 
-# devvm_macos needs POSIX modules (fcntl, signal.SIGHUP) that do not exist on Windows. The
-# macOS guest needs Tart on an Apple Silicon Mac anyway, so a Windows host never loads it.
+# devvm_macos needs POSIX modules (fcntl, signal.SIGHUP) that do not exist on Windows.
 if sys.platform != "win32":
     import devvm_macos
 
@@ -76,14 +79,27 @@ WINDOWS_RUN_UNELEVATED_MAX_TIMEOUT_SECONDS = (2**31 - 1) // 1000
 
 WINDOWS_VERBATIM_PREFIX = "\\\\?\\"
 WINDOWS_VERBATIM_UNC_PREFIX = "\\\\?\\UNC\\"
+WINDOWS_DEVICE_PREFIX = "\\\\.\\"
 
 
 def _fs_path(path: Path) -> str:
-    """`path` as an absolute string for file operations, in verbatim form on Windows."""
+    r"""`path` as an absolute string for file operations, in verbatim form on Windows.
+
+    Verbatim (`\\?\`) form lifts MAX_PATH and turns off Win32 path normalisation. A device
+    path (`\\.\X`) becomes `\\?\X`; a UNC path (`\\server\share`) becomes `\\?\UNC\server\share`.
+    """
     absolute = os.path.abspath(path)
-    if sys.platform != "win32" or absolute.startswith(WINDOWS_VERBATIM_PREFIX):
+    if sys.platform != "win32":
         return absolute
-    if absolute.startswith("\\\\"):  # UNC: \\server\share -> \\?\UNC\server\share
+    return _windows_verbatim(absolute)
+
+
+def _windows_verbatim(absolute: str) -> str:
+    if absolute.startswith(WINDOWS_VERBATIM_PREFIX):
+        return absolute
+    if absolute.startswith(WINDOWS_DEVICE_PREFIX):
+        return WINDOWS_VERBATIM_PREFIX + absolute[len(WINDOWS_DEVICE_PREFIX) :]
+    if ntpath.splitdrive(absolute)[0].startswith("\\\\"):
         return WINDOWS_VERBATIM_UNC_PREFIX + absolute[2:]
     return WINDOWS_VERBATIM_PREFIX + absolute
 
@@ -104,6 +120,8 @@ def _rmtree(path: str) -> None:
         shutil.rmtree(path, onerror=lambda func, p, _info: _clear_readonly_and_retry(func, p, None))
 
 
+MACOS_BOX_NOTE = "Tart, Cirrus base image - not GitHub's runner image"
+
 GUESTS: dict[str, Guest] = {
     "linux-x64": Guest(
         name="linux-x64",
@@ -117,22 +135,13 @@ GUESTS: dict[str, Guest] = {
         box="perk/ubuntu-24.04-arm64 (qemu/arm64)",
         tree_path_posix="/home/vagrant/cosca",
     ),
-    "macos-arm64": (
-        Guest(
-            name="macos-arm64",
-            communicator="tart",
-            box="Tart Cirrus base image - not GitHub's runner image",
-            available=False,
-            unavailable_reason="needs an Apple Silicon Mac (Tart)",
-            tree_path_posix="~/cosca",
-        )
-        if sys.platform == "win32"
-        else Guest(
-            name="macos-arm64",
-            communicator="tart",
-            box=f"{devvm_macos.BASE_IMAGE} (Tart, Cirrus base image - not GitHub's runner image)",
-            tree_path_posix="~/cosca",
-        )
+    "macos-arm64": Guest(
+        name="macos-arm64",
+        communicator="tart",
+        box=MACOS_BOX_NOTE if sys.platform == "win32" else f"{devvm_macos.BASE_IMAGE} ({MACOS_BOX_NOTE})",
+        available=sys.platform != "win32",
+        unavailable_reason="needs an Apple Silicon Mac (Tart)" if sys.platform == "win32" else None,
+        tree_path_posix="~/cosca",
     ),
     "windows-x64": Guest(
         name="windows-x64",
@@ -266,7 +275,25 @@ def build_run_inner(guest: Guest, cmd_args: list[str], *, direct: bool) -> str:
     )
 
 
+@contextlib.contextmanager
+def staged_tree(guest: Guest, *, repo_root: Path = REPO_ROOT, dest: Path | None = None) -> Iterator[None]:
+    """Rebuild a fresh copy of the tracked files under `dest` and hold its `stage_lock` for the
+    `with` body, which is where whatever reads the stage (the upload to the guest) belongs.
+    """
+    if dest is None:
+        dest = stage_dir(guest)
+    with stage_lock(dest):
+        _copy_tracked(repo_root, dest)
+        yield
+
+
 def stage_tree(guest: Guest, *, repo_root: Path = REPO_ROOT, dest: Path | None = None) -> None:
+    """`staged_tree` with nothing done under the lock."""
+    with staged_tree(guest, repo_root=repo_root, dest=dest):
+        pass
+
+
+def _copy_tracked(repo_root: Path, dest: Path) -> None:
     """Rebuild a fresh copy of the working tree's git-TRACKED files under dest (default:
     .tmp/devvm/<guest>/tree).
 
@@ -291,16 +318,15 @@ def stage_tree(guest: Guest, *, repo_root: Path = REPO_ROOT, dest: Path | None =
     `git ls-files -z` / `rsync --from0` avoid whitespace/newline-in-filename hazards that a
     plain newline-joined list would have.
 
-    Off Windows the copy is `rsync --archive`. Windows has no rsync, so there the same file list
-    is copied with `shutil.copy2` (content, mtime and the read-only bit; the repo has no symlinks
-    or submodules, so every entry is a regular file). `copy2` keeps the read-only bit, so the wipe
-    clears it to delete a previous stage's read-only files (rsync's wipe needs no such step).
+    Windows has no rsync, so it copies the same file list with `shutil.copy2`; the repo has no
+    symlinks or submodules, so every entry is a regular file. `copy2` keeps the read-only bit,
+    which the wipe must clear.
+
+    The caller holds `stage_lock(dest)`.
     """
     require_tool("git")
     if sys.platform != "win32":
         require_tool("rsync")
-    if dest is None:
-        dest = stage_dir(guest)
 
     ls_files = subprocess.run(
         ["git", "-C", str(repo_root), "ls-files", "-z"],
@@ -319,10 +345,20 @@ def stage_tree(guest: Guest, *, repo_root: Path = REPO_ROOT, dest: Path | None =
         return name.replace("/", "\\") if sys.platform == "win32" else name  # verbatim allows only backslashes
 
     existing = [p for p in tracked if os.path.isfile(os.path.join(src_root, native(p)))]
+    existing_set = set(existing)
+    skipped = [p for p in tracked if p not in existing_set]
+    assert not any(os.path.lexists(os.path.join(src_root, native(p))) for p in skipped), (
+        "a tracked entry that is not a regular file exists on disk (a directory, a submodule, a dangling symlink)"
+    )
+    assert not any(os.path.islink(os.path.join(src_root, native(p))) for p in existing), (
+        "a tracked symlink: the stage copies regular files only"
+    )
 
     os.makedirs(os.path.dirname(dst_root), exist_ok=True)
-    if os.path.exists(dst_root):
+    try:
         _rmtree(dst_root)
+    except FileNotFoundError:
+        pass
     os.makedirs(dst_root)
 
     if sys.platform == "win32":
@@ -489,11 +525,11 @@ def _vagrant_up(args: argparse.Namespace) -> None:
         )
     # Every guest's synced folder (Linux: rsync synced_folder; Windows: "file" provisioner)
     # sources from this staged, git-tracked-only copy — it must exist before `vagrant up`.
-    stage_tree(guest)
-    if guest.communicator == "winrm":
-        provision_windows_guest(guest, auto_consent=auto_consent, display=display, create=True)
-    else:
-        run_vagrant(guest, ["up", "--provider", "qemu", "--provision"])
+    with staged_tree(guest):
+        if guest.communicator == "winrm":
+            provision_windows_guest(guest, auto_consent=auto_consent, display=display, create=True)
+        else:
+            run_vagrant(guest, ["up", "--provider", "qemu", "--provision"])
     if guest.communicator == "ssh":
         print(f"note: the read-only working tree is synced to {guest.tree_path_posix} — run `devvm.py sync {guest.name}` after local changes.")
     else:
@@ -509,14 +545,14 @@ def _vagrant_sync(args: argparse.Namespace) -> None:
     if not dotfile_dir(guest).exists():
         print(f"error: guest '{guest.name}' has not been brought up yet; run `devvm.py up {guest.name}` first", file=sys.stderr)
         sys.exit(1)
-    stage_tree(guest)
-    if guest.communicator == "ssh":
-        run_vagrant(guest, ["rsync"])
-    else:
-        # Reuse the persisted auto-consent choice (set by `up --allow-elevation`) rather than
-        # implicitly defaulting to off and silently resetting a guest that had it on.
-        auto_consent = read_persisted_auto_consent(guest)
-        provision_windows_guest(guest, auto_consent=auto_consent, create=False)
+    with staged_tree(guest):
+        if guest.communicator == "ssh":
+            run_vagrant(guest, ["rsync"])
+        else:
+            # Reuse the persisted auto-consent choice (set by `up --allow-elevation`) rather than
+            # implicitly defaulting to off and silently resetting a guest that had it on.
+            auto_consent = read_persisted_auto_consent(guest)
+            provision_windows_guest(guest, auto_consent=auto_consent, create=False)
 
 
 def _vagrant_ssh(args: argparse.Namespace) -> None:

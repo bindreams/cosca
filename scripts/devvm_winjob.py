@@ -189,9 +189,26 @@ def _inheritable_copy(handle: int) -> int:
     return copy.value
 
 
+def _close(handle: int) -> None:
+    """CloseHandle a handle this module owns; failure means it was not valid, a contract violation."""
+    closed = _kernel32.CloseHandle(handle)
+    assert closed, f"CloseHandle({handle}) failed: {ctypes.WinError(ctypes.get_last_error())}"
+
+
 def _close_all(handles: list[int]) -> None:
     for handle in handles:
-        _kernel32.CloseHandle(handle)
+        _close(handle)
+
+
+def _terminate_process(process: int) -> None:
+    """Terminate the process behind `process`, alone (not its descendants)."""
+    if not _kernel32.TerminateProcess(process, KILLED_EXIT_CODE):
+        # TerminateProcess fails on an already-exited process; that is not an error.
+        error = ctypes.get_last_error()
+        code = wintypes.DWORD()
+        _check(_kernel32.GetExitCodeProcess(process, ctypes.byref(code)))
+        if code.value == STILL_ACTIVE:
+            raise ctypes.WinError(error)
 
 
 def _make_attribute_list(job: int, inherited: list[int]) -> tuple[ctypes.Array, list[object]]:
@@ -225,27 +242,41 @@ def _make_attribute_list(job: int, inherited: list[int]) -> tuple[ctypes.Array, 
 class JobProcess:
     """A process created inside a `KillOnCloseJob`: the part of `subprocess.Popen` devvm uses.
 
-    `communicate` and `wait` behave as `Popen`'s do, including raising `subprocess.TimeoutExpired`
-    and resuming on a later call. `returncode` is the exit code once the process has been waited
-    for, `None` before.
+    `communicate` behaves as `Popen`'s does, including raising `subprocess.TimeoutExpired` and
+    resuming on a later call. `returncode` is the exit code once `communicate` has returned,
+    `None` before. The process handle is released when `communicate` finishes or fails (other
+    than by timeout), and by `close()`; use as a context manager to release it on every path.
     """
 
-    def __init__(
-        self,
-        args: list[str],
-        process: int,
-        pid: int,
-        stdout: IO[Any] | None,
-        stderr: IO[Any] | None,
-    ) -> None:
+    def __init__(self, args: list[str], process: int, stdout: IO[Any] | None, stderr: IO[Any] | None) -> None:
         self.args = args
-        self.pid = pid
         self.returncode: int | None = None
         self._process: int | None = process
         self._streams = {"stdout": stdout, "stderr": stderr}
         self._output: dict[str, Any] = {}
         self._errors: list[BaseException] = []
-        self._readers: list[threading.Thread] | None = None
+        self._readers: dict[str, threading.Thread] | None = None
+
+    def __enter__(self) -> JobProcess:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        self.close()
+
+    def close(self) -> None:
+        """Release the process handle and the output streams no reader owns; the process keeps running."""
+        process, self._process = self._process, None
+        if process is not None:
+            _close(process)
+        for name, stream in self._streams.items():
+            # A started reader closes its own stream at EOF.
+            if stream is not None and (self._readers is None or self._readers[name].ident is None):
+                stream.close()
 
     def _read(self, name: str, stream: IO[Any]) -> None:
         try:
@@ -256,53 +287,50 @@ class JobProcess:
             stream.close()
 
     def communicate(self, timeout: float | None = None) -> tuple[Any, Any]:
-        """Read stdout and stderr to EOF and wait for exit; `(None, None)` for unpiped streams."""
+        """Read stdout and stderr to EOF and wait for exit; `(None, None)` for unpiped streams.
+
+        Raises `subprocess.TimeoutExpired` (resumable) when `timeout` passes first, and an
+        `ExceptionGroup` of every reader error if reading a stream failed.
+        """
         deadline = None if timeout is None else time.monotonic() + timeout
-        if self._readers is None:
-            self._readers = [
-                threading.Thread(target=self._read, args=(name, stream), daemon=True)
-                for name, stream in self._streams.items()
-                if stream is not None
-            ]
-            for reader in self._readers:
-                reader.start()
-        for reader in self._readers:
-            reader.join(None if deadline is None else max(deadline - time.monotonic(), 0))
-            if reader.is_alive():
-                raise subprocess.TimeoutExpired(self.args, timeout)
-        self.wait(None if deadline is None else max(deadline - time.monotonic(), 0))
+        try:
+            if self._readers is None:
+                self._readers = {
+                    name: threading.Thread(target=self._read, args=(name, stream), daemon=True)
+                    for name, stream in self._streams.items()
+                    if stream is not None
+                }
+                for reader in self._readers.values():
+                    reader.start()
+            for reader in self._readers.values():
+                reader.join(None if deadline is None else max(deadline - time.monotonic(), 0))
+                if reader.is_alive():
+                    raise subprocess.TimeoutExpired(self.args, timeout)
+            self._wait(None if deadline is None else max(deadline - time.monotonic(), 0))
+        except subprocess.TimeoutExpired:
+            raise
+        except BaseException:
+            self.close()
+            raise
         if self._errors:
-            raise self._errors[0]
+            raise BaseExceptionGroup("reading the child's output failed", self._errors)
         return self._output.get("stdout"), self._output.get("stderr")
 
-    def wait(self, timeout: float | None = None) -> int:
-        if self._process is not None:
-            milliseconds = INFINITE if timeout is None else math.ceil(timeout * 1000)
-            assert timeout is None or milliseconds < INFINITE, "timeout too large for WaitForSingleObject"
-            result = _kernel32.WaitForSingleObject(self._process, milliseconds)
-            if result == WAIT_TIMEOUT:
-                raise subprocess.TimeoutExpired(self.args, timeout)
-            if result != WAIT_OBJECT_0:
-                raise ctypes.WinError(ctypes.get_last_error())
-            code = wintypes.DWORD()
-            _check(_kernel32.GetExitCodeProcess(self._process, ctypes.byref(code)))
-            self.returncode = code.value
-            _kernel32.CloseHandle(self._process)
-            self._process = None
-        assert self.returncode is not None
-        return self.returncode
-
-    def kill(self) -> None:
-        """Terminate this process alone (not its descendants; use `KillOnCloseJob.terminate`)."""
+    def _wait(self, timeout: float | None) -> None:
         if self._process is None:
             return
-        if not _kernel32.TerminateProcess(self._process, KILLED_EXIT_CODE):
-            # An exited process refuses termination; anything still running must not hide the error.
-            error = ctypes.get_last_error()
-            code = wintypes.DWORD()
-            _check(_kernel32.GetExitCodeProcess(self._process, ctypes.byref(code)))
-            if code.value == STILL_ACTIVE:
-                raise ctypes.WinError(error)
+        milliseconds = INFINITE if timeout is None else math.ceil(timeout * 1000)
+        assert timeout is None or milliseconds < INFINITE, "timeout too large for WaitForSingleObject"
+        result = _kernel32.WaitForSingleObject(self._process, milliseconds)
+        if result == WAIT_TIMEOUT:
+            raise subprocess.TimeoutExpired(self.args, timeout)
+        if result != WAIT_OBJECT_0:
+            raise ctypes.WinError(ctypes.get_last_error())
+        code = wintypes.DWORD()
+        _check(_kernel32.GetExitCodeProcess(self._process, ctypes.byref(code)))
+        self.returncode = code.value
+        process, self._process = self._process, None
+        _close(process)
 
 
 class KillOnCloseJob:
@@ -333,7 +361,7 @@ class KillOnCloseJob:
                 )
             )
         except BaseException:
-            _kernel32.CloseHandle(handle)
+            _close(handle)
             raise
         self._handle = handle
         return self
@@ -346,7 +374,7 @@ class KillOnCloseJob:
     ) -> None:
         handle, self._handle = self._handle, None
         if handle is not None:
-            _kernel32.CloseHandle(handle)
+            _close(handle)
 
     def popen(
         self,
@@ -359,8 +387,7 @@ class KillOnCloseJob:
         text: bool = False,
         creationflags: int = 0,
     ) -> JobProcess:
-        """Start `argv` inside the job, like `subprocess.Popen(argv, ...)` with the same meaning
-        for the arguments it has.
+        """Start `argv` inside the job; arguments mean what they do for `subprocess.Popen`.
 
         `stdout` and `stderr` are `subprocess.PIPE` or `None` (inherit); stdin is always
         inherited. Only the standard handles and the job reach the child. Raises `OSError` if the
@@ -420,7 +447,7 @@ class KillOnCloseJob:
                 )
             finally:
                 _kernel32.DeleteProcThreadAttributeList(attributes)
-            _kernel32.CloseHandle(created.hThread)
+            _close(created.hThread)
 
             streams: dict[str, IO[Any] | None] = {"stdout": None, "stderr": None}
             try:
@@ -433,13 +460,15 @@ class KillOnCloseJob:
                         os.close(fd)
                         raise
             except BaseException:
-                _kernel32.TerminateProcess(created.hProcess, KILLED_EXIT_CODE)
-                _kernel32.CloseHandle(created.hProcess)
-                for stream in streams.values():
-                    if stream is not None:
-                        stream.close()
+                try:
+                    _terminate_process(created.hProcess)
+                finally:
+                    _close(created.hProcess)
+                    for stream in streams.values():
+                        if stream is not None:
+                            stream.close()
                 raise
-            return JobProcess(argv, created.hProcess, created.dwProcessId, streams["stdout"], streams["stderr"])
+            return JobProcess(argv, created.hProcess, streams["stdout"], streams["stderr"])
         except BaseException:
             _close_all(list(parent_ends.values()))
             raise
