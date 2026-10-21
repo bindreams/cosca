@@ -196,6 +196,97 @@ fn macos_sync_spawn_of_a_late_front_leaves_it_running_and_says_so() {
     drop(writer);
 }
 
+/// The ends of a [`TREE_ARGV`] spawn the test keeps.
+pub(crate) struct Tree {
+    /// Gives one byte once the grandchild runs.
+    ready: std::io::PipeReader,
+    /// The grandchild blocks reading this pipe until the writer is dropped.
+    hold: std::io::PipeWriter,
+    /// What the grandchild writes if it outlives the teardown, then EOF.
+    out: std::io::PipeReader,
+}
+
+/// A root `sh` with a grandchild that says it runs on fd 3, blocks reading fd 4, and once that
+/// returns writes `survived` to fd 5.
+pub(crate) const TREE_ARGV: [&str; 3] = [
+    "/bin/sh",
+    "-c",
+    "(printf r >&3; read x <&4; printf survived >&5) & wait",
+];
+
+/// The pipes of a [`TREE_ARGV`] spawn: the child's ends for fds 3, 4 and 5, and the test's.
+pub(crate) fn tree_pipes() -> (Tree, [(i32, crate::stdio::Stdio); 3]) {
+    use std::os::fd::OwnedFd;
+    let child_end = |end: OwnedFd| crate::stdio::Stdio::from_file(std::fs::File::from(end));
+    let (ready, ready_w) = std::io::pipe().expect("pipe");
+    let (hold_r, hold) = std::io::pipe().expect("pipe");
+    let (out, out_w) = std::io::pipe().expect("pipe");
+    let ends = [
+        (3, child_end(ready_w.into())),
+        (4, child_end(hold_r.into())),
+        (5, child_end(out_w.into())),
+    ];
+    (Tree { ready, hold, out }, ends)
+}
+
+impl Tree {
+    /// Blocks until the grandchild runs. A root that died first closes the pipe, which fails here.
+    pub(crate) fn await_grandchild(&mut self) {
+        use std::io::Read;
+        let mut byte = [0u8; 1];
+        let n = self.ready.read(&mut byte).expect("read the ready pipe");
+        assert_eq!(n, 1, "the grandchild must run before the teardown");
+    }
+
+    /// Releases the grandchild, and answers whether it was still alive to say so.
+    pub(crate) fn grandchild_survived(self) -> bool {
+        use std::io::Read;
+        let Tree { ready, hold, mut out } = self;
+        drop((ready, hold));
+        let mut said = String::new();
+        out.read_to_string(&mut said).expect("read the grandchild's word");
+        !said.is_empty()
+    }
+}
+
+/// A contained child whose report came late is torn down with its tree: the grandchild it forked is
+/// killed too. The hook before the teardown waits until the grandchild runs, so it is in the tree
+/// before the kill. The grandchild is released afterwards and writes if it is still alive, so a
+/// survivor fails by assertion, not by hang.
+///
+/// Mutant: the late teardown kills the root alone.
+#[skuld::test]
+fn macos_sync_spawn_of_a_late_contained_child_kills_its_tree() {
+    crate::log_capture::install();
+    let (tree, ends) = tree_pipes();
+    let mut cmd = crate::Command::new();
+    cmd.args(TREE_ARGV).contain();
+    for (fd, end) in ends {
+        cmd.fd(fd, end).expect("set the fd");
+    }
+    let tree = Rc::new(std::cell::RefCell::new(Some(tree)));
+    let _hook = crate::child::spawn::fault::set_at(crate::child::spawn::fault::SpawnPoint::BeforeLateTeardown, {
+        let tree = Rc::clone(&tree);
+        move || tree.borrow_mut().as_mut().expect("the tree").await_grandchild()
+    });
+    let mark = crate::log_capture::mark();
+    let err = {
+        let _late = unique_report::seams::find_the_report_unwritten();
+        cmd.spawn().expect_err("a late child is not adopted")
+    };
+    let (_err, fate) = crate::child::spawn::failure::expect_may_have_started_with(err);
+    let Some(crate::identity::Resolved::Found(id)) = crate::child::spawn::fault::take_captured() else {
+        panic!("the spawn captured the child");
+    };
+    let tree = tree.borrow_mut().take().expect("the tree");
+    assert!(
+        !tree.grandchild_survived(),
+        "the late child's grandchild must be killed"
+    );
+    assert_eq!(fate, ChildFate::Reaped, "the root is killed and reaped");
+    assert_one_warn(id.pid(), mark, &[SAID_REAPED], &["tree was not"]);
+}
+
 // The teardown's sentence =====
 
 /// Runs the teardown of a late child `child` (a real blocker with the id `unique`, its stdin held by
@@ -217,7 +308,12 @@ fn tear_down(
     });
     let mark = crate::log_capture::mark();
     let _armed = arm(pid);
-    let done = crate::child::spawn::kill_and_reap_unreported(pid, unique);
+    let uncontained = crate::containment::Prepared {
+        mode: None,
+        is_root: true,
+        marker: None,
+    };
+    let done = crate::child::spawn::kill_and_reap_unreported(pid, unique, uncontained);
     let tail = done.zombie_tail();
     let fate = done.warn(pid, tail);
     drop(child);
