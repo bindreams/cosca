@@ -27,6 +27,7 @@ import math
 import os
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -74,6 +75,31 @@ if sys.platform != "win32":
 WINDOWS_RUN_UNELEVATED_MAX_TIMEOUT_SECONDS = (2**31 - 1) // 1000
 
 WINDOWS_VERBATIM_PREFIX = "\\\\?\\"
+WINDOWS_VERBATIM_UNC_PREFIX = "\\\\?\\UNC\\"
+
+
+def _fs_path(path: Path) -> str:
+    """`path` as an absolute string for file operations, in verbatim form on Windows."""
+    absolute = os.path.abspath(path)
+    if sys.platform != "win32" or absolute.startswith(WINDOWS_VERBATIM_PREFIX):
+        return absolute
+    if absolute.startswith("\\\\"):  # UNC: \\server\share -> \\?\UNC\server\share
+        return WINDOWS_VERBATIM_UNC_PREFIX + absolute[2:]
+    return WINDOWS_VERBATIM_PREFIX + absolute
+
+
+def _clear_readonly_and_retry(func, path, _exc) -> None:
+    """`shutil.rmtree` error handler: Windows refuses to delete a read-only file."""
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
+
+
+def _rmtree(path: str) -> None:
+    # `onexc` replaced `onerror` in Python 3.12; the script supports 3.11.
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=_clear_readonly_and_retry)
+    else:
+        shutil.rmtree(path, onerror=lambda func, p, _info: _clear_readonly_and_retry(func, p, None))
 
 
 GUESTS: dict[str, Guest] = {
@@ -265,7 +291,8 @@ def stage_tree(guest: Guest, *, repo_root: Path = REPO_ROOT, dest: Path | None =
 
     Off Windows the copy is `rsync --archive`. Windows has no rsync, so there the same file list
     is copied with `shutil.copy2` (content, mtime and the read-only bit; the repo has no symlinks
-    or submodules, so every entry is a regular file).
+    or submodules, so every entry is a regular file). `copy2` keeps the read-only bit, so the wipe
+    clears it to delete a previous stage's read-only files (rsync's wipe needs no such step).
     """
     require_tool("git")
     if sys.platform != "win32":
@@ -279,26 +306,32 @@ def stage_tree(guest: Guest, *, repo_root: Path = REPO_ROOT, dest: Path | None =
         capture_output=True,
     )
     tracked = [p for p in ls_files.stdout.split(b"\0") if p]
-    existing = [p for p in tracked if (repo_root / p.decode()).is_file()]
 
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    files_list = dest.parent / "tracked-files.list"
-    files_list.write_bytes(b"\0".join(existing) + (b"\0" if existing else b""))
+    # On Windows every file operation below uses the verbatim form, which lifts the
+    # 260-character MAX_PATH limit that a deep checkout can exceed without LongPathsEnabled.
+    src_root = _fs_path(repo_root)
+    dst_root = _fs_path(dest)
 
-    if dest.exists():
-        shutil.rmtree(dest)
-    dest.mkdir(parents=True)
+    def native(rel: bytes) -> str:
+        name = rel.decode()
+        return name.replace("/", "\\") if sys.platform == "win32" else name  # verbatim allows only backslashes
+
+    existing = [p for p in tracked if os.path.isfile(os.path.join(src_root, native(p)))]
+
+    os.makedirs(os.path.dirname(dst_root), exist_ok=True)
+    if os.path.exists(dst_root):
+        _rmtree(dst_root)
+    os.makedirs(dst_root)
 
     if sys.platform == "win32":
-        # The verbatim prefix lifts the 260-character MAX_PATH limit for deep checkouts.
-        src_root = WINDOWS_VERBATIM_PREFIX + os.path.abspath(repo_root)
-        dst_root = WINDOWS_VERBATIM_PREFIX + os.path.abspath(dest)
         for rel in existing:
-            rel_native = rel.decode().replace("/", "\\")  # verbatim paths allow only backslashes
-            target = os.path.join(dst_root, rel_native)
+            target = os.path.join(dst_root, native(rel))
             os.makedirs(os.path.dirname(target), exist_ok=True)
-            shutil.copy2(os.path.join(src_root, rel_native), target)
+            shutil.copy2(os.path.join(src_root, native(rel)), target)
         return
+
+    files_list = dest.parent / "tracked-files.list"
+    files_list.write_bytes(b"\0".join(existing) + (b"\0" if existing else b""))
 
     cmd = [
         "rsync",
