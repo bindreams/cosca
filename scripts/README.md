@@ -228,8 +228,11 @@ investigation.
 On a Windows host, `gusztavvargadr/windows-11` reads status 5 and grace 0 (an expired
 evaluation's reading) for about three minutes after a fresh VM boots, until Windows runs its
 first activation. A reading other than Licensed is therefore read again after `slmgr /ato`,
-which runs that activation and returns when it is done (`get_settled_windows_license_state`). The
-box ships one rearm, and this keeps `up` from spending it on a VM that is not expired.
+which runs that activation and returns when it is done (`get_settled_windows_license_state`),
+unless its `LicenseStatusReason` is 0xC004FC07 ("validity period expired"): that is an evaluation
+that really ran out, which `/ato` cannot help, so it goes straight to the rearm. A guest that has
+not activated yet reads 0xC004F009 ("grace period expired"). The box ships one rearm, and this
+keeps `up` from spending it on a VM that is not expired.
 
 **No Vagrant shell provisioner — a real restart fuse, removed.** `windows-x64`'s Vagrantfile
 declares exactly one provisioner (the WinRM `file` upload). Every other Windows provisioning

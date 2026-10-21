@@ -53,6 +53,10 @@ REBOOT_MARKER_FALSE = "DEVVM_REBOOT_REQUIRED=0"
 # stromweld/windows-10 202503.09.0) means the guest is not currently licensed and needs a
 # rearm before it's safe to leave unattended - see ensure_windows_license_current.
 WINDOWS_LICENSE_STATUS_LICENSED = 1
+# SoftwareLicensingProduct.LicenseStatusReason when a started evaluation has run out: sppc.dll's
+# text for it is "the validity period expired". A guest that has not yet run its first
+# activation reads 0xC004F009 instead ("the grace period expired"). Both read status 5, grace 0.
+WINDOWS_LICENSE_REASON_VALIDITY_EXPIRED = 0xC004FC07
 # Rearm proactively within this many minutes of the eval period actually running out, not
 # just once it's already hit zero - a guest that dies mid-provisioning run (see
 # ensure_windows_license_current's docstring for the incident this is fixing) is worse than
@@ -398,9 +402,9 @@ def reboot_windows_guest_and_wait(guest: Guest) -> None:
             return
 
 
-def get_windows_license_state(guest: Guest) -> tuple[int, float, int]:
+def get_windows_license_state(guest: Guest) -> tuple[int, float, int, int]:
     """Read the guest's Windows license status via WMI/CIM: (LicenseStatus,
-    GracePeriodRemaining in minutes, RemainingWindowsReArmCount).
+    GracePeriodRemaining in minutes, RemainingWindowsReArmCount, LicenseStatusReason).
 
     Reads the same underlying data `slmgr.vbs /dlv` prints, but structured: no parsing of
     slmgr's free-text human-readable output, just the WMI properties behind it
@@ -413,6 +417,7 @@ def get_windows_license_state(guest: Guest) -> tuple[int, float, int]:
         "$s = Get-CimInstance SoftwareLicensingService; "
         'Write-Host ("DEVVM_LICENSE_STATUS=" + $p.LicenseStatus); '
         'Write-Host ("DEVVM_LICENSE_GRACE_MINUTES=" + $p.GracePeriodRemaining); '
+        'Write-Host ("DEVVM_LICENSE_REASON=" + $p.LicenseStatusReason); '
         'Write-Host ("DEVVM_LICENSE_REARM_REMAINING=" + $s.RemainingWindowsReArmCount)'
     )
     _, output = run_vagrant_streaming(guest, ["winrm", "-c", cmd])
@@ -421,6 +426,7 @@ def get_windows_license_state(guest: Guest) -> tuple[int, float, int]:
         if "=" in line and line.split("=", 1)[0] in (
             "DEVVM_LICENSE_STATUS",
             "DEVVM_LICENSE_GRACE_MINUTES",
+            "DEVVM_LICENSE_REASON",
             "DEVVM_LICENSE_REARM_REMAINING",
         ):
             key, value = line.split("=", 1)
@@ -430,6 +436,7 @@ def get_windows_license_state(guest: Guest) -> tuple[int, float, int]:
             int(values["DEVVM_LICENSE_STATUS"]),
             float(values["DEVVM_LICENSE_GRACE_MINUTES"]),
             int(values["DEVVM_LICENSE_REARM_REMAINING"]),
+            int(values["DEVVM_LICENSE_REASON"]),
         )
     except (KeyError, ValueError) as e:
         raise RuntimeError(
@@ -438,21 +445,30 @@ def get_windows_license_state(guest: Guest) -> tuple[int, float, int]:
         ) from e
 
 
-def get_settled_windows_license_state(guest: Guest, *, display: bool = False) -> tuple[int, float, int]:
+def get_settled_windows_license_state(guest: Guest, *, display: bool = False) -> tuple[int, float, int, int]:
     """get_windows_license_state, but never a reading the guest has not finished settling.
 
     A fresh gusztavvargadr/windows-11 VM (Hyper-V) reads LicenseStatus 5 and GracePeriodRemaining 0,
     exactly what an expired evaluation reads, until the Software Protection service runs its first
     activation about three minutes after boot and starts the 90-day validity (measured on 2607.1.0
-    in five fresh VMs). A rearm spent on that reading is wasted, and the box ships only one. So on
-    Hyper-V a reading other than Licensed is read again after `slmgr /ato`, which runs the activation
-    now and returns once it is done. An expired evaluation still reads 5 afterwards and reaches the
-    rearm. `/ato` can fail (measured: 0x80072EE7, the guest's DNS dropping out); then the state is
-    unknown, so this exits instead of reporting it. Not called on a Licensed reading, where `/ato`
-    is not needed. The QEMU boxes never showed the misread and keep the single read.
+    in five fresh VMs). A rearm spent on that reading is wasted, and the box ships only one. The
+    two differ in LicenseStatusReason: 0xC004F009 (grace period expired) before the first
+    activation, 0xC004FC07 (validity period expired) once a started evaluation has run out. So on
+    Hyper-V:
+    - Licensed, or reason 0xC004FC07: returned as read. `/ato` is not needed, and on an expired
+      guest it cannot help (measured with the guest clock set past the end, where it fails
+      0xC004B011), so it is not run.
+    - Anything else: read again after `slmgr /ato`, which runs the first activation now and returns
+      once it is done. `/ato` can fail (measured: 0x80072EE7, the guest's DNS dropping out); then
+      the state is unknown, so this exits instead of reporting it.
+    The QEMU boxes never showed the misread and keep the single read.
     """
     state = get_windows_license_state(guest)
-    if state[0] == WINDOWS_LICENSE_STATUS_LICENSED or host_provider() != "hyperv":
+    if (
+        state[0] == WINDOWS_LICENSE_STATUS_LICENSED
+        or state[3] == WINDOWS_LICENSE_REASON_VALIDITY_EXPIRED
+        or host_provider() != "hyperv"
+    ):
         return state
     returncode = run_vagrant(
         guest, ["winrm", "-c", "cscript.exe //nologo C:\\Windows\\System32\\slmgr.vbs /ato"], display=display, check=False
@@ -496,7 +512,7 @@ def ensure_windows_license_current(guest: Guest, *, display: bool = False) -> bo
     cmd_run comment on the same fact), so no separate elevation request is needed for a
     privileged operation issued over WinRM.
     """
-    status, grace_minutes, rearm_remaining = get_settled_windows_license_state(guest, display=display)
+    status, grace_minutes, rearm_remaining, _ = get_settled_windows_license_state(guest, display=display)
     needs_rearm = status != WINDOWS_LICENSE_STATUS_LICENSED or grace_minutes < WINDOWS_LICENSE_NEAR_EXPIRY_MINUTES
     if not needs_rearm:
         print(
@@ -526,7 +542,7 @@ def ensure_windows_license_current(guest: Guest, *, display: bool = False) -> bo
     # waiting for a session here unconditionally could hang the full
     # WINDOWS_REBOOT_DEADLINE_SECONDS for no reason.
     reboot_windows_guest_and_wait(guest)
-    new_status, new_grace_minutes, _ = get_settled_windows_license_state(guest, display=display)
+    new_status, new_grace_minutes, _, _ = get_settled_windows_license_state(guest, display=display)
     if new_status != WINDOWS_LICENSE_STATUS_LICENSED:
         print(
             f"error: guest '{guest.name}' Windows evaluation license still not current after "
