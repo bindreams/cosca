@@ -293,3 +293,22 @@ fn awaiting_waits_for_a_report_written_by_another_thread() {
     writer.join().expect("the writer thread");
     assert!(matches!(report, Report::Late(0xdef)), "{report:?}");
 }
+
+/// A failed spawn's child was collected by std, or tokio dropped it with its pid, so there is no
+/// child to wait on: the report is read once. A copy of the write end held elsewhere (as a foreign
+/// fork holds one) keeps the empty pipe open, so it reads `Unwritten`.
+///
+/// Mutant: the spawn waits for the report after a failed spawn (the refused wait answers
+/// `ReadFailed`).
+#[skuld::test]
+fn a_failed_spawn_reads_the_report_once_and_does_not_wait() {
+    let mut cmd = std::process::Command::new("/usr/bin/true");
+    let pending = register(&mut cmd);
+    let guard = crate::child::spawn::spawn_lock();
+    let channel = pending.open(&guard).expect("open");
+    let _foreign_copy = channel.write_end.try_clone().expect("dup the write end");
+    let _refused = seams::refuse_the_wait();
+    let (spawned, report) = channel.run(|| Err::<(), ()>(()));
+    assert!(spawned.is_err());
+    assert!(matches!(report, Report::Unwritten), "{report:?}");
+}
