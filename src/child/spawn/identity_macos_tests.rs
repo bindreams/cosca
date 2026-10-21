@@ -599,6 +599,49 @@ fn macos_attach_failure_teardown_with_a_refused_id_read_warns_it_cannot_be_shown
     end_unsignalled_and_reap(pid);
 }
 
+/// A child the teardown leaves running is left as its caller says: the warn ends with the caller's
+/// words, not the sync spawn's.
+///
+/// Mutant: the warn says the child stays a zombie whatever the caller passes.
+#[skuld::test]
+fn macos_kill_and_reap_verified_says_the_callers_words_of_a_child_left_running() {
+    const TAIL: &str = "it is handed to the caller's reaper";
+    crate::log_capture::install();
+    let (child, _stdin, unique) = std_blocker_with_unique();
+    let pid = child.id();
+    let mark = crate::log_capture::mark();
+    let _refused = refuse_the_kill();
+    let fate = super::kill_and_reap_verified(pid, unique, None, TAIL);
+    assert!(matches!(fate, crate::error::ChildFate::Running { .. }), "{fate:?}");
+    let records = teardown_records(mark);
+    assert_eq!(records.len(), 1, "one warn for the one event: {records:?}");
+    assert!(
+        records[0].1.contains(TAIL) && !records[0].1.contains("zombie"),
+        "{records:?}"
+    );
+    drop(child);
+    end_unsignalled_and_reap(pid);
+}
+
+/// The sync spawn drops its `std` `Child`, which reaps nothing: a child its teardown leaves running
+/// stays a zombie once it exits, and the warn says so.
+///
+/// Mutant: the sync caller says nothing of what it leaves.
+#[skuld::test]
+fn macos_attach_failure_teardown_says_a_child_left_running_stays_a_zombie() {
+    crate::log_capture::install();
+    let (child, _stdin, unique) = std_blocker_with_unique();
+    let pid = child.id();
+    let mark = crate::log_capture::mark();
+    let _refused = refuse_the_kill();
+    let fate = teardown(child, unique);
+    assert!(matches!(fate, crate::error::ChildFate::Running { .. }), "{fate:?}");
+    let records = teardown_records(mark);
+    assert_eq!(records.len(), 1, "one warn for the one event: {records:?}");
+    assert!(records[0].1.contains("stays a zombie once it exits"), "{records:?}");
+    end_unsignalled_and_reap(pid);
+}
+
 /// A delivered kill, then a foreign reap and a reuse of the pid between the wait and the reap: the
 /// verified reap sees another unique id and takes nothing. The test then reaps the zombie itself,
 /// proving it was left.

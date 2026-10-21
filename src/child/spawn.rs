@@ -744,16 +744,18 @@ fn leave_front_after_attach_failure(child: std::process::Child) -> FrontFate {
 /// Dropping the `std` `Child` closes our pipe ends only.
 #[cfg(target_os = "macos")]
 fn teardown_after_attach_failure(child: std::process::Child, unique: u64, id: ProcessId) -> ChildFate {
-    let fate = kill_and_reap_verified(child.id(), unique, Some(id));
+    // The `std` `Child` reaps nothing when dropped: a child still running stays a zombie.
+    let fate = kill_and_reap_verified(child.id(), unique, Some(id), ZOMBIE_NOTE);
     drop(child);
     fate
 }
 
 /// The kill and reap of [`teardown_after_attach_failure`], for a child by its pid, whoever holds its
 /// handle. `id` is its identity, if one was read. What it cannot do is one event, so one `warn`
-/// carries every note (a verified foreign reap is a `debug`).
+/// carries every note (a verified foreign reap is a `debug`). `left_running` is the caller's note of
+/// what becomes of a child this leaves running.
 #[cfg(target_os = "macos")]
-pub(crate) fn kill_and_reap_verified(pid: u32, unique: u64, id: Option<ProcessId>) -> ChildFate {
+pub(crate) fn kill_and_reap_verified(pid: u32, unique: u64, id: Option<ProcessId>, left_running: &str) -> ChildFate {
     let mut notes = Vec::new();
     let mut breach = None;
     let (fate, kill) = kill_and_reap_noting(pid, unique, id, &mut notes, &mut breach);
@@ -761,9 +763,8 @@ pub(crate) fn kill_and_reap_verified(pid: u32, unique: u64, id: Option<ProcessId
         // First, as the order of events: the kill, then the reap's notes.
         notes.insert(0, format!("could not be killed: {why}"));
     }
-    // The caller drops the `std` `Child`, which reaps nothing: a child still running stays a zombie.
     if matches!(fate, ChildFate::Running { .. }) {
-        notes.push(ZOMBIE_NOTE.to_owned());
+        notes.push(left_running.to_owned());
     }
     if !notes.is_empty() {
         log::warn!("spawn teardown: pid {pid} {}", notes.join("; "));
