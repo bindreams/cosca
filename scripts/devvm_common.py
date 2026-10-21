@@ -12,6 +12,7 @@ scripts/README.md for what's actually covered and why.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shlex
 import shutil
@@ -19,8 +20,10 @@ import signal
 import subprocess
 import sys
 import time
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
@@ -57,6 +60,43 @@ def stage_dir(guest: Guest) -> Path:
 
 def auto_consent_state_path(guest: Guest) -> Path:
     return STATE_DIR / guest.name / "auto_consent"
+
+
+@contextlib.contextmanager
+def stage_lock(stage: Path) -> Iterator[None]:
+    """Hold an exclusive lock on the staged tree `stage` (the wipe, the copy and whatever reads it).
+
+    An OS file lock, so it is released when the process dies. If another devvm command holds it,
+    exits with a message rather than waiting: such a command can run for minutes (`vagrant up`),
+    and the developer is better told than left hanging.
+    """
+    lock_path = stage.parent / f"{stage.name}.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT)
+    try:
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (BlockingIOError, PermissionError):  # a held lock: flock's EWOULDBLOCK, LockFile's EACCES
+            print(
+                f"error: another devvm command is using {stage}; wait for it to finish and run this again",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        try:
+            yield
+        finally:
+            if sys.platform == "win32":
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    finally:
+        os.close(fd)
 
 
 def require_tool(name: str) -> None:
@@ -155,11 +195,12 @@ def run_vagrant_winrm_bounded(guest: Guest, powershell_cmd: str, deadline: float
     `deadline` (a time.monotonic() value) instead of running unbounded.
 
     Why not a plain `timeout=`: `vagrant` execs a Ruby child to do the actual work, so killing
-    only the Go launcher process on timeout would leave that Ruby child running, reparented to
-    PID 1, orphaned on the HOST — the leaked-process hazard CLAUDE.local.md's sandbox rule
-    exists to prevent. `start_new_session=True` makes the launcher (and everything it forks) its
-    own process group, so a timeout kills the whole group via `os.killpg`, not just the
-    launcher.
+    only the launcher process on timeout would leave that Ruby child running, orphaned on the
+    HOST — the leaked-process hazard CLAUDE.local.md's sandbox rule exists to prevent. Off
+    Windows, `start_new_session=True` makes the launcher (and everything it forks) its own
+    process group, so a timeout kills the whole group via `os.killpg`, not just the launcher. On
+    Windows, which has no process groups, the launcher runs in a Job Object
+    (devvm_winjob.KillOnCloseJob) and a timeout terminates the whole job.
 
     On a real timeout, returns `timed_out=True` with a nonzero returncode and empty
     stdout/stderr — see BoundedWinrmResult's own docstring for why that's reported explicitly,
@@ -167,22 +208,39 @@ def run_vagrant_winrm_bounded(guest: Guest, powershell_cmd: str, deadline: float
     produces.
     """
     remaining = max(deadline - time.monotonic(), 0.001)
-    proc = subprocess.Popen(
+    with _started_in_kill_tree_scope(
         ["vagrant", "winrm", "-c", powershell_cmd],
         cwd=guest_dir(guest),
         env=vagrant_env(guest),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        start_new_session=True,
-    )
-    try:
-        stdout, stderr = proc.communicate(timeout=remaining)
-    except subprocess.TimeoutExpired:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        stdout, stderr = proc.communicate()
-        return BoundedWinrmResult(1, stdout, stderr, timed_out=True)
-    return BoundedWinrmResult(proc.returncode, stdout, stderr, timed_out=False)
+    ) as (proc, kill_tree):
+        try:
+            stdout, stderr = proc.communicate(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            kill_tree()
+            stdout, stderr = proc.communicate()
+            return BoundedWinrmResult(1, stdout, stderr, timed_out=True)
+        return BoundedWinrmResult(proc.returncode, stdout, stderr, timed_out=False)
+
+
+@contextlib.contextmanager
+def _started_in_kill_tree_scope(argv: list[str], **popen_kwargs: Any) -> Iterator[tuple[Any, Callable[[], None]]]:
+    """Start `argv` so that its whole process tree can be killed; yield the process and a callable that kills the tree.
+
+    Windows has no process groups, so the process runs in a Job Object that outlives the `with`
+    body, which kills whatever is left on exit (devvm_winjob.KillOnCloseJob). Elsewhere it leads
+    its own session, and the tree is its process group.
+    """
+    if sys.platform == "win32":
+        from devvm_winjob import KillOnCloseJob
+
+        with KillOnCloseJob() as job, job.popen(argv, **popen_kwargs) as proc:
+            yield proc, job.terminate
+    else:
+        proc = subprocess.Popen(argv, start_new_session=True, **popen_kwargs)
+        yield proc, lambda: os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
 
 
 def powershell_quote(value: str) -> str:
