@@ -131,7 +131,7 @@ def vm_name(guest: Guest) -> str:
     """The Hyper-V VM name of this worktree's `guest`, the only place it is computed.
 
     The hash of the staging path keeps two worktrees' VMs apart. Never select a VM by this name for
-    anything that changes it: use the id Vagrant stores (devvm_hyperv.vm_id).
+    anything that changes or opens it: use the id Vagrant stores (devvm_hyperv.vm_id).
     """
     digest = hashlib.sha256(str(stage_dir(guest)).encode()).hexdigest()
     return f"cosca-devvm-{guest.name}-{digest[:8]}"

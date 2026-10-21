@@ -61,9 +61,8 @@ from devvm_common import (  # noqa: E402
     run_vagrant,
     stage_dir,
     stage_lock,
-    vm_name,
 )
-from devvm_hyperv import check_hyperv_host  # noqa: E402
+from devvm_hyperv import check_hyperv_host, vmconnect_hint  # noqa: E402
 from devvm_windows import (  # noqa: E402
     InteractiveLookupFailure,
     get_windows_interactive_username,
@@ -594,7 +593,7 @@ def _vagrant_ssh(args: argparse.Namespace) -> None:
     # setting changed, and devvm reverts what it changes on a developer's machine. On any other
     # host Vagrant raises HostUnsupported (command.rb:74) before touching the guest.
     console = (
-        f"Hyper-V's console (`vmconnect.exe localhost {vm_name(guest)}`, or `devvm.py up --display`)"
+        f"{vmconnect_hint(guest)} or `devvm.py up --display`"
         if host_provider() == "hyperv"
         else "RDP (127.0.0.1:3389 by default, the 'rdp' forwarded_port in "
         f"scripts/devvm/guests/{guest.name}/Vagrantfile)"

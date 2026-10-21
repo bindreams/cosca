@@ -65,11 +65,15 @@ needed. Install yourself:
   exists and is Internal or Private, and right after `vagrant up` returns, before any provisioning,
   it turns the VM off and exits if an adapter is on an External switch. The first boot happens before
   that second check, so a switch that changes between the two checks is a window the check narrows
-  but cannot close.
+  but cannot close. The guest is unreachable from the LAN. Other VMs on `Default Switch` and
+  processes on the host can reach it, as local processes on a macOS host can reach the QEMU guest's
+  loopback-forwarded ports: both are "on the host". The guest's `vagrant`/`vagrant` administrator
+  account is open to them.
 - **VM names.** `cosca-devvm-<guest>-<8 hex digits of a hash of the worktree's staging path>`, so two
   worktrees never share a VM. Devvm changes a VM only by the id Vagrant stored in
   `.tmp/devvm/<guest>/.vagrant`, never by name, and touches no other VM.
-- **`--display`** opens Hyper-V's console (`vmconnect.exe localhost <VM name>`) on the VM.
+- **`--display`** opens Hyper-V's console (`vmconnect.exe localhost -G <VM id>`) on the VM, selected
+  by id like every other operation.
 - **`ssh` is refused for Windows guests**, on every host. `vagrant powershell` can write the guest's
   address into the host's WSMan `TrustedHosts` and restores it only if Vagrant exits normally. Use
   `devvm.py run windows-x64 -- <cmd>`, or the console for an interactive session.
@@ -220,6 +224,12 @@ can die mid-run — at that point the fix is bumping the box in
 `scripts/devvm/guests/windows-x64/` (the `config.vm.box` name and `box.json`) to a newer
 build, not disabling activation checks. This is throwaway dev tooling; don't rely on this VM outliving a single
 investigation.
+
+On a Windows host, `gusztavvargadr/windows-11` reads status 5 and grace 0 (an expired
+evaluation's reading) for about three minutes after a fresh VM boots, until Windows runs its
+first activation. A reading other than Licensed is therefore read again after `slmgr /ato`,
+which runs that activation and returns when it is done (`get_settled_windows_license_state`). The
+box ships one rearm, and this keeps `up` from spending it on a VM that is not expired.
 
 **No Vagrant shell provisioner — a real restart fuse, removed.** `windows-x64`'s Vagrantfile
 declares exactly one provisioner (the WinRM `file` upload). Every other Windows provisioning

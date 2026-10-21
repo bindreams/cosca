@@ -195,20 +195,30 @@ def _machine_name(machine: int) -> str:
     return f"machine type {machine:#06x}"
 
 
-def vm_id(guest: Guest) -> str:
-    """The Hyper-V VM id Vagrant stored for `guest`, validated as a GUID.
-
-    Every operation that changes a VM selects it by this id, never by name.
-    """
+def _recorded_vm_id(guest: Guest) -> str | None:
+    """The VM id Vagrant stored for `guest`, or None if no VM has been created yet."""
     id_file = dotfile_dir(guest) / "machines" / MACHINE_NAME / "hyperv" / "id"
     try:
         raw = id_file.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
     except OSError as e:
-        _die(f"no Hyper-V VM id recorded for guest '{guest.name}' ({id_file}): {e}")
+        _die(f"cannot read the Hyper-V VM id of guest '{guest.name}' ({id_file}): {e}")
     try:
         return str(uuid.UUID(raw))
     except ValueError:
         _die(f"{id_file} does not hold a VM id: {raw!r}")
+
+
+def vm_id(guest: Guest) -> str:
+    """The Hyper-V VM id Vagrant stored for `guest`, validated as a GUID.
+
+    Every operation that changes or opens a VM selects it by this id, never by name.
+    """
+    recorded = _recorded_vm_id(guest)
+    if recorded is None:
+        _die(f"no Hyper-V VM id recorded for guest '{guest.name}': it has not been created here")
+    return recorded
 
 
 def check_hyperv_guest_network(guest: Guest) -> None:
@@ -245,6 +255,19 @@ def check_hyperv_guest_network(guest: Guest) -> None:
         )
 
 
+def vmconnect_argv(guest: Guest) -> list[str]:
+    """The command that opens Hyper-V's console (`vmconnect`) on `guest`'s VM, selected by id."""
+    return ["vmconnect.exe", "localhost", "-G", vm_id(guest)]
+
+
+def vmconnect_hint(guest: Guest) -> str:
+    """`vmconnect_argv` as text for a message; before the VM exists, says how to get one."""
+    recorded = _recorded_vm_id(guest)
+    if recorded is None:
+        return "Hyper-V's console (`vmconnect.exe`, once `devvm.py up` has created the VM)"
+    return f"Hyper-V's console (`vmconnect.exe localhost -G {recorded}`)"
+
+
 def open_vm_console(guest: Guest) -> None:
     """Open Hyper-V's own console window (`vmconnect`) on `guest`'s VM; does not wait for it."""
-    subprocess.Popen(["vmconnect.exe", "localhost", vm_name(guest)])
+    subprocess.Popen(vmconnect_argv(guest))
