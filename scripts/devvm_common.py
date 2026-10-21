@@ -59,8 +59,8 @@ def host_provider(platform: str = sys.platform) -> str:
 def host_unsupported_reason(guest: Guest, platform: str = sys.platform) -> str | None:
     """Why `guest` cannot run on this host's provider, or None if it can.
 
-    Separate from Guest.available, which says the guest exists at all: that check runs first in every
-    command, ahead of the flag validation devvm_test.py exercises on any host.
+    Separate from Guest.available (the guest exists at all, checked first in every command): commands
+    call this only after their flag validation, so devvm_test.py's validation tests pass on any host.
     """
     if host_provider(platform) == "hyperv" and guest.hyperv_box is None:
         return "it has no Hyper-V box (its box is QEMU-only), and a Windows host runs guests only on Hyper-V"
