@@ -1,0 +1,113 @@
+# Throwaway: #629 measurements. Not for merging.
+name: measure-629
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  COSCA_TEST_PATH_PROBES: "0"
+  COSCA_TEST_SHELL_EXECUTE: "0"
+  COSCA_TEST_SHELL_PROBES: "0"
+  COSCA_TEST_ELEVATION_ROUTES: "0"
+  NEXTEST_VERSION: "0.9.148"
+
+jobs:
+  leads:
+    name: Lead ${{ matrix.scenario }} (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-latest, windows-11-arm]
+        scenario:
+          - logonuser-interactive
+          - logonuser-network
+          - cpwl-profile
+          - cpwl-noprofile
+          - cpwl-profile-l2
+          - cpwl-profile-elevate-l2
+          - own-load-l2
+          - own-load-elevate-l2
+          - startprocess
+          - startprocess-loadprofile
+          - startprocess-elevate
+          - startprocess-elevate-l2
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Allow unattended GUI elevation
+        shell: pwsh
+        run: python .github/scripts/unattended-gui-elevation.py --this-machine-is-disposable
+      - name: Measure
+        shell: pwsh
+        run: ./.github/measure/profile-hive-629.ps1 ${{ matrix.scenario }}
+      - name: Revert unattended GUI elevation
+        if: always()
+        shell: pwsh
+        run: python .github/scripts/unattended-gui-elevation.py --this-machine-is-disposable --revert
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: lead-${{ matrix.scenario }}-${{ matrix.runner }}
+          path: ${{ runner.temp }}/629
+
+  harness:
+    name: Harness baseline (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: windows-latest, target: x86_64-pc-windows-msvc }
+          - { runner: windows-11-arm, target: aarch64-pc-windows-msvc }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      COSCA_TEST_SHELL_PROBES: "1"
+      COSCA_TEST_SHELL_PROBES_CONSENT: "1"
+      COSCA_TEST_ELEVATION_ROUTES: "1"
+      COSCA_TEST_ELEVATION_ROUTES_CONSENT: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
+        with:
+          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
+      - name: Run the account probes
+        shell: bash
+        env:
+          SKULD_LABELS: "(shell_probes | elevation_routes) & !isolated_trailing_dot & !isolated_pathext_precedence & !isolated_existing_extensionless"
+          COSCA_PROBE_ALLOW_ACCOUNTS: "1"
+          COSCA_PROBE_ALLOW_STATE: "1"
+          COSCA_PROBE_MARKERS: ${{ runner.temp }}/probe-markers
+        run: |
+          mkdir -p "$COSCA_PROBE_MARKERS"
+          cargo nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_elevation_routes --no-capture \
+            -E 'test(does_create_process_with_logon_elevate) | test(which_logon_types_return_a_filtered_token)'
+      - name: Leftovers of coscaprobe*
+        if: always()
+        shell: pwsh
+        run: |
+          $key = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
+          foreach ($p in Get-ChildItem $key) {
+            $v = Get-ItemProperty $p.PSPath
+            if ($v.ProfileImagePath -like '*coscaprobe*') {
+              $sid = $p.PSChildName
+              Write-Host "PROFILELIST $sid path=$($v.ProfileImagePath) state=$($v.State) refcount=$($v.RefCount) dirExists=$(Test-Path $v.ProfileImagePath) hku=$(Test-Path "Registry::HKEY_USERS\$sid") hkuClasses=$(Test-Path "Registry::HKEY_USERS\${sid}_Classes")"
+              Get-CimInstance Win32_UserProfile -Filter "SID = '$($sid -replace '\.bak$')'" | ForEach-Object { Write-Host "WIN32USERPROFILE loaded=$($_.Loaded) refcount=$($_.RefCount) path=$($_.LocalPath)" }
+            }
+          }
+          Get-ChildItem C:\Users -Directory -Force | Where-Object Name -like 'coscaprobe*' | ForEach-Object { Write-Host "DIR $($_.FullName)" }
+          Get-LocalUser | Where-Object Name -like 'coscaprobe*' | ForEach-Object { Write-Host "ACCOUNT $($_.Name)" }
+          foreach ($e in Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'Microsoft-Windows-User Profile Service' } -ErrorAction SilentlyContinue) {
+            Write-Host "EVENT id=$($e.Id) $($e.TimeCreated.ToString('o')) props=[$(($e.Properties | ForEach-Object { "$($_.Value)" }) -join ' | ')]"
+          }
