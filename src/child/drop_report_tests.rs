@@ -215,6 +215,7 @@ fn a_transient_tree_kill_failure_is_retried_by_the_drop() {
             leaf_path.clone(),
         )),
         graceful: crate::graceful::GracefulMechanism::Process,
+        frozen: None,
     });
     let (stdin, _writer) = crate::test_child::held_writer_stdin();
     let mut cmd = Command::new();

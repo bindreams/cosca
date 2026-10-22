@@ -145,6 +145,13 @@ pub struct Child {
     front: Option<crate::elevation::front::Front>,
     /// The token of a frozen spawn, until [`SuspendedChild`] takes it; `None` for every other child.
     /// Boxed so an ordinary child stays one pointer larger, not a job handle larger.
+    #[cfg_attr(
+        not(windows),
+        allow(
+            dead_code,
+            reason = "only a Windows frozen spawn takes it, and off Windows it is never `Some`"
+        )
+    )]
     frozen: Option<Box<crate::containment::frozen::Frozen>>,
     /// What a failed-spawn cleanup that left this handle armed already warned of, so the drop that
     /// retries reports a repeat of it at `debug` and anything new at `warn`
@@ -184,6 +191,7 @@ impl Child {
     }
 
     /// Take a frozen spawn's token. `None` once taken, and for a child that was not spawned frozen.
+    #[cfg_attr(not(windows), allow(dead_code, reason = "only the Windows frozen spawn takes it"))]
     pub(crate) fn take_frozen(&mut self) -> Option<crate::containment::frozen::Frozen> {
         self.frozen.take().map(|frozen| *frozen)
     }

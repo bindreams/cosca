@@ -606,6 +606,7 @@ fn attach_entered_leaf(leaf_path: &std::path::Path) {
             leaf_path.to_path_buf(),
         )),
         graceful: crate::graceful::GracefulMechanism::Process,
+        frozen: None,
     });
 }
 
@@ -730,6 +731,7 @@ async fn a_failed_password_write_removes_the_leaf_once_the_tree_drains() {
         containment: crate::containment::Containment::CgroupV2,
         attached: crate::containment::Attached::Cgroup(entered_leaf_at(fake.leaf.clone())),
         graceful: crate::graceful::GracefulMechanism::Process,
+        frozen: None,
     });
     let (mut cmd, teardown) = opted_out_teardown_blocker();
     let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
@@ -835,6 +837,7 @@ async fn a_failed_password_write_kills_and_reaps_a_delegated_root() {
         containment: crate::containment::Containment::Delegated,
         attached: crate::containment::Attached::Delegated,
         graceful: crate::graceful::GracefulMechanism::Process,
+        frozen: None,
     });
     let (mut cmd, teardown) = opted_out_teardown_blocker();
     let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
@@ -871,6 +874,7 @@ async fn a_failed_password_write_reaps_the_root_when_the_tree_kill_fails() {
             leaf_path.clone(),
         )),
         graceful: crate::graceful::GracefulMechanism::Process,
+        frozen: None,
     });
     let (mut cmd, teardown) = opted_out_teardown_blocker();
     let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
@@ -910,6 +914,7 @@ async fn a_failed_tree_kill_and_an_unknown_root_share_one_warn() {
             leaf_path.clone(),
         )),
         graceful: crate::graceful::GracefulMechanism::Process,
+        frozen: None,
     });
     let (mut cmd, teardown) = opted_out_teardown_blocker();
     let child = super::spawn_uncommitted(&mut cmd).expect("spawn");

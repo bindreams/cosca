@@ -692,6 +692,7 @@ fn cgroup_attachment_for_test(leaf_path: &std::path::Path) -> super::Attachment 
             leaf_path.to_path_buf(),
         )),
         graceful: crate::graceful::GracefulMechanism::Process,
+        frozen: None,
     }
 }
 
