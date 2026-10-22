@@ -324,6 +324,11 @@ path = "tests/windows_shell_resolution.rs"
 harness = false
 
 [[test]]
+name = "windows_suspended"
+path = "tests/windows_suspended.rs"
+harness = false
+
+[[test]]
 name = "windows_testbin_ack"
 path = "tests/windows_testbin_ack.rs"
 harness = false

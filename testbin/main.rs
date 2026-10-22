@@ -1,7 +1,7 @@
 //! Test-only helper spawned by the crate's integration tests. std-only, with
-//! two exceptions that use the `cosca` crate: the `report-nested-kill-tree` mode, to exercise
-//! the real nested-member `kill_tree` path, and `spawn-dump-env-block`, to spawn through each
-//! Windows backend. Behavior is selected by argv[1].
+//! exceptions that use the `cosca` crate: the `report-nested-kill-tree` mode, to exercise
+//! the real nested-member `kill_tree` path, `spawn-dump-env-block`, to spawn through each
+//! Windows backend, and the frozen-spawn modes of `frozen.rs`. Behavior is selected by argv[1].
 
 #[cfg(target_os = "macos")]
 use std::io::BufRead;
@@ -44,6 +44,11 @@ mod setuid_stdin_block;
 #[cfg(windows)]
 #[path = "breakaway.rs"]
 mod breakaway;
+
+/// The frozen-spawn helper modes (`spawn-frozen-report`, `spawn-breakaway-report`).
+#[cfg(windows)]
+#[path = "frozen.rs"]
+mod frozen;
 
 #[cfg(windows)]
 #[path = "env_block.rs"]
@@ -1205,6 +1210,10 @@ fn main() {
         "spawn-with-env-block" => env_block::spawn_with_block(&args[2], &args[3..]),
         #[cfg(windows)]
         "try-env-block" => env_block::try_block(&args[2..]),
+        #[cfg(windows)]
+        "spawn-frozen-report" => frozen::spawn_frozen_report(&args[2], &args[3], &args[4]),
+        #[cfg(windows)]
+        "spawn-breakaway-report" => frozen::spawn_breakaway_report(&args[2]),
         #[cfg(windows)]
         "report-breakaway" => {
             breakaway::run(&args[2], &args[3], &args[4]);
