@@ -66,9 +66,9 @@ fn blank() -> KEvent {
     KEvent::new(0, EventFilter::EVFILT_PROC, EvFlags::empty(), FilterFlag::empty(), 0, 0)
 }
 
-// `NOTE_REAP` is `#[deprecated]` in libc, but it is the only spelling of the flag.
-#[allow(deprecated, reason = "libc marks NOTE_REAP deprecated; there is no other spelling")]
-const NOTE_REAP: u32 = libc::NOTE_REAP;
+// xnu `sys/event.h`. Spelled here because libc 0.2.190 removed it (0.2.189 had it deprecated), and a
+// downstream lockfile can resolve any 0.2.x.
+const NOTE_REAP: u32 = 0x1000_0000;
 
 /// Register `EVFILT_SIGNAL` for `SIGCHLD` and `EVFILT_PROC` for `pid`. `Ok(true)` when the
 /// `EVFILT_PROC` receipt says `ESRCH` (the child is already past `P_REF_DEAD`).
