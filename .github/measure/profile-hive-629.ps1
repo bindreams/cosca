@@ -148,7 +148,14 @@ function Holders([string]$label, [string]$sid) {
         if ($line -like "*$sid*" -or $line -like "*\$account*") { "$current :: $($line.Trim())" }
     }
     Write-Host "HOLDERS[$label] $($hits.Count) handles (handle.exe exit $LASTEXITCODE, $($all.Count) lines)"
-    foreach ($h in $hits) { Write-Host "HOLDER[$label] $h" }
+    foreach ($h in $hits) {
+        Write-Host "HOLDER[$label] $h"
+        if ($h -match 'pid: (\d+)') {
+            $services = @(Get-CimInstance Win32_Service -Filter "ProcessId = $($Matches[1])" | ForEach-Object Name)
+            $cmdline = (Get-CimInstance Win32_Process -Filter "ProcessId = $($Matches[1])").CommandLine
+            Write-Host "HOLDERSERVICES[$label] pid=$($Matches[1]) services=[$($services -join ',')] cmdline=$cmdline"
+        }
+    }
     $log["holders-$label"] = @($hits)
     foreach ($ls in Get-CimInstance Win32_LogonSession) {
         $users = @(Get-CimAssociatedInstance -InputObject $ls -Association Win32_LoggedOnUser -ErrorAction SilentlyContinue | ForEach-Object Name)
