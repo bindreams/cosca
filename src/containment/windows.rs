@@ -23,7 +23,7 @@ use windows::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation,
     QueryInformationJobObject, SetInformationJobObject, TerminateJobObject, JOBOBJECT_BASIC_PROCESS_ID_LIST,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows::Win32::System::Threading::{
     GetProcessId, GetProcessIdOfThread, OpenProcess, OpenThread, ResumeThread, WaitForMultipleObjects,
@@ -131,28 +131,40 @@ impl JobHandle {
     /// Called by `Child::detach()` before the handle is released: otherwise
     /// dropping the job handle terminates the tree the caller intended to keep alive.
     pub(crate) fn disarm(&self) {
+        if let Err(e) = self.try_set_limit_flags(JOB_OBJECT_LIMIT(0)) {
+            log::warn!(
+                "SetInformationJobObject(disarm) failed ({e}); KILL_ON_JOB_CLOSE is still set, so \
+                 closing this handle will still kill the tree"
+            );
+        }
+    }
+
+    /// Replace the job's limit flags with exactly `flags`, reporting a failure. A zero word clears
+    /// `KILL_ON_JOB_CLOSE`, so closing the handle does not kill the tree; a guard job keeps its
+    /// breakaway flags instead.
+    ///
+    /// A handle already consumed by `hard_kill` is `Ok`: there is no job left to disarm.
+    pub(crate) fn try_set_limit_flags(&self, flags: JOB_OBJECT_LIMIT) -> io::Result<()> {
         // Held across the call: this WRITES to the handle, so landing on a recycled value
-        // would clear KILL_ON_JOB_CLOSE on an unrelated job and quietly let its tree
-        // outlive its owner.
+        // would change the limits of an unrelated job (clearing KILL_ON_JOB_CLOSE would quietly
+        // let its tree outlive its owner).
         self.with_handle(|job| {
-            // A zeroed JOBOBJECT_EXTENDED_LIMIT_INFORMATION has LimitFlags == 0, which
-            // clears KILL_ON_JOB_CLOSE.
-            let info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            #[cfg(test)]
+            forced(fault::Step::SetLimits).map_err(io::Error::from)?;
+            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            info.BasicLimitInformation.LimitFlags = flags;
             // SAFETY: job is a valid handle; info is fully initialised (zeroed by default()).
             unsafe {
-                if let Err(e) = SetInformationJobObject(
+                SetInformationJobObject(
                     job,
                     JobObjectExtendedLimitInformation,
                     std::ptr::addr_of!(info).cast(),
                     size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-                ) {
-                    log::warn!(
-                        "SetInformationJobObject(disarm) failed ({e}); KILL_ON_JOB_CLOSE is still set, so \
-                         closing this handle will still kill the tree"
-                    );
-                }
+                )
             }
-        });
+            .map_err(io::Error::from)
+        })
+        .unwrap_or(Ok(()))
     }
 }
 
@@ -554,6 +566,10 @@ pub(crate) mod fault {
         Owner,
         ResumeOpen,
         Resume,
+        /// `JobHandle::try_set_limit_flags`' `SetInformationJobObject`.
+        SetLimits,
+        /// The assignment of a Strongest root's job, in [`assign_held`](super::assign_held).
+        Assign,
     }
 
     thread_local! {
@@ -626,6 +642,19 @@ pub(crate) mod fault {
 /// primitive — reused verbatim rather than duplicated, so `Command::contain()` and `Job::assign`
 /// share exactly one implementation.
 pub(crate) fn assign_to_kill_on_close_job(proc_handle: std::os::windows::io::RawHandle) -> io::Result<JobHandle> {
+    assign_with_limits(proc_handle, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
+}
+
+/// [`assign_to_kill_on_close_job`] as `attach` takes it: the job is assigned and the child is NOT
+/// resumed. The ordinary Strongest-root attach and a frozen spawn's hold branch both assign here.
+pub(crate) fn assign_held(proc_handle: std::os::windows::io::RawHandle) -> io::Result<JobHandle> {
+    #[cfg(test)]
+    forced(fault::Step::Assign).map_err(io::Error::from)?;
+    assign_to_kill_on_close_job(proc_handle)
+}
+
+/// Create a job with exactly `flags` and assign the process at `proc_handle` to it.
+fn assign_with_limits(proc_handle: std::os::windows::io::RawHandle, flags: JOB_OBJECT_LIMIT) -> io::Result<JobHandle> {
     // A Windows `RawHandle` is a `*mut c_void`.
     let raw_handle = HANDLE(proc_handle.cast());
     // SAFETY: all calls are standard Win32; owned handles are closed on every error path.
@@ -633,7 +662,7 @@ pub(crate) fn assign_to_kill_on_close_job(proc_handle: std::os::windows::io::Raw
         let job = CreateJobObjectW(None, windows::core::PCWSTR::null()).map_err(io::Error::from)?;
 
         let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        info.BasicLimitInformation.LimitFlags = flags;
         if let Err(e) = SetInformationJobObject(
             job,
             JobObjectExtendedLimitInformation,
@@ -1123,14 +1152,16 @@ fn owner_of(thread: &ThreadHandle) -> windows::core::Result<u32> {
     }
 }
 
-fn resume_thread(thread: &ThreadHandle) -> windows::core::Result<()> {
+/// `ResumeThread`, answering the suspend count the thread had before: a frozen child's initial
+/// thread has exactly 1.
+fn resume_thread(thread: &ThreadHandle) -> windows::core::Result<u32> {
     #[cfg(test)]
     forced(fault::Step::Resume)?;
     // ResumeThread returns the previous suspend count, or u32::MAX on failure.
     // SAFETY: `thread` is a live handle with THREAD_SUSPEND_RESUME.
     match unsafe { ResumeThread(thread.0) } {
         u32::MAX => Err(windows::core::Error::from_thread()),
-        _ => Ok(()),
+        previous => Ok(previous),
     }
 }
 
@@ -1204,10 +1235,27 @@ fn resume_if_owned(tid: u32, process_pid: u32, walk: &mut Walk) -> Visit {
     }
 
     match resume_thread(&resume) {
-        Ok(()) => {
+        Ok(1) => {
             walk.resumed += 1;
             Visit::Resumed
         }
+        // Anything else leaves a process that is not running the way its creator left it. A count
+        // above 1 is a thread still suspended after this resume (a debugger, an EDR agent or the
+        // caller's own tooling suspended it in the window); 0 is a thread that was already
+        // running, so the child ran before it was released.
+        Ok(previous) => walk.fail(
+            "ResumeThread",
+            tid,
+            process_pid,
+            format_args!(
+                "the previous suspend count was {previous}, not 1: {}",
+                if previous > 1 {
+                    "the thread is still suspended"
+                } else {
+                    "the thread was not suspended, so the child had already run"
+                }
+            ),
+        ),
         Err(e) => walk.fail("ResumeThread", tid, process_pid, e),
     }
 }
@@ -1272,7 +1320,7 @@ fn walk_verdict(process_pid: u32, walk: Walk) -> io::Result<()> {
 ///
 /// PID-reuse safety: the caller holds the child's process handle (via the owning
 /// `Child`), keeping its PID alive for the duration of the Toolhelp snapshot walk.
-fn resume_initial_threads(proc_handle: std::os::windows::io::RawHandle) -> io::Result<()> {
+pub(crate) fn resume_initial_threads(proc_handle: std::os::windows::io::RawHandle) -> io::Result<()> {
     use windows::Win32::Foundation::ERROR_NO_MORE_FILES;
     use windows::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
@@ -1343,7 +1391,7 @@ fn resume_initial_threads(proc_handle: std::os::windows::io::RawHandle) -> io::R
 /// Returns `Err` when resume fails — a frozen child is unacceptable; the
 /// child+job are killed and the error propagates to fail the spawn.
 pub(crate) fn attach_job(proc_handle: std::os::windows::io::RawHandle) -> io::Result<Option<JobHandle>> {
-    let job_result = assign_to_kill_on_close_job(proc_handle);
+    let job_result = assign_held(proc_handle);
 
     // Resume REGARDLESS of job assignment result. A frozen child cannot be left running.
     if let Err(resume_err) = resume_initial_threads(proc_handle) {

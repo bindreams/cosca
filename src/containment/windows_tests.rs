@@ -773,3 +773,111 @@ fn resume_initial_threads_reports_a_broken_handle_contract_in_release() {
     let err = super::resume_initial_threads(std::ptr::null_mut()).expect_err("a null handle names no process");
     assert!(err.to_string().contains("GetProcessId"), "{err}");
 }
+
+// ===== hold mode =====
+
+/// Kill and reap a std child these tests left suspended or running.
+fn dispose(mut child: std::process::Child) {
+    child.kill().expect("kill the test child");
+    child.wait().expect("reap the test child");
+}
+
+/// `resume_initial_threads` brings a frozen child's initial thread from suspend count 1 to 0: it runs.
+#[skuld::test]
+fn resume_initial_threads_leaves_no_thread_suspended() {
+    let mut child = crate::test_frozen::spawn_suspended_blocker();
+    let thread = crate::test_frozen::InitialThread::of(child.id());
+    assert_eq!(thread.suspend_count(), 1, "the child is created suspended");
+
+    super::resume_initial_threads(crate::test_frozen::raw(&child)).expect("resume a frozen child");
+
+    assert_eq!(thread.suspend_count(), 0, "the resumed child's initial thread must run");
+    drop(child.stdin.take());
+    child.wait().expect("the resumed blocker exits on stdin EOF");
+}
+
+/// Something suspended the initial thread a second time during the window (a debugger, an
+/// EDR agent): one resume leaves it suspended, and `Ok` there would hand out a frozen process.
+#[skuld::test]
+fn resume_initial_threads_fails_when_the_initial_thread_was_suspended_twice() {
+    let child = crate::test_frozen::spawn_suspended_blocker();
+    let thread = crate::test_frozen::InitialThread::of(child.id());
+    thread.suspend_once();
+
+    let err =
+        super::resume_initial_threads(crate::test_frozen::raw(&child)).expect_err("the thread is still suspended");
+
+    let text = err.to_string();
+    assert!(
+        text.contains("previous suspend count was 2"),
+        "the error must name the count it found: {text}"
+    );
+    assert_eq!(
+        thread.suspend_count(),
+        1,
+        "the walk resumed once; the foreign suspend is still held, and the failure says so"
+    );
+    dispose(child);
+}
+
+/// Something already ran the child (its count was 0): "ran no instruction" no longer holds, so
+/// resume must not report a clean success.
+#[skuld::test]
+fn resume_initial_threads_fails_when_the_initial_thread_was_already_running() {
+    let child = crate::test_frozen::spawn_suspended_blocker();
+    let thread = crate::test_frozen::InitialThread::of(child.id());
+    assert_eq!(thread.release_one(), 1);
+
+    let err = super::resume_initial_threads(crate::test_frozen::raw(&child)).expect_err("the child already ran");
+
+    let text = err.to_string();
+    assert!(
+        text.contains("previous suspend count was 0"),
+        "the error must name the count it found: {text}"
+    );
+    dispose(child);
+}
+
+/// `assign_held` assigns the job and does not resume: the thread stays frozen.
+#[skuld::test]
+fn assign_held_assigns_the_job_without_resuming() {
+    let child = crate::test_frozen::spawn_suspended_blocker();
+    let thread = crate::test_frozen::InitialThread::of(child.id());
+
+    let job = super::assign_held(crate::test_frozen::raw(&child)).expect("assign the held child");
+
+    assert_eq!(thread.suspend_count(), 1, "assign_held must not resume");
+    assert_ne!(
+        crate::test_frozen::limit_flags(&job).0
+            & windows::Win32::System::JobObjects::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.0,
+        0
+    );
+    drop(job); // KILL_ON_JOB_CLOSE ends the child
+    let mut child = child;
+    child.wait().expect("the job's close killed the frozen child");
+}
+
+/// `try_set_limit_flags` writes exactly the flags given, and reports a failed write instead of
+/// logging it away.
+#[skuld::test]
+fn try_set_limit_flags_writes_exactly_the_given_flags_and_reports_a_failure() {
+    use crate::containment::windows::fault::{force_next, Step};
+    use windows::Win32::System::JobObjects::{JOB_OBJECT_LIMIT, JOB_OBJECT_LIMIT_BREAKAWAY_OK};
+    const ERROR_ACCESS_DENIED: u32 = 5;
+    let job = super::JobHandle::create_empty_for_test();
+
+    job.try_set_limit_flags(JOB_OBJECT_LIMIT_BREAKAWAY_OK)
+        .expect("set a limit");
+    assert_eq!(crate::test_frozen::limit_flags(&job), JOB_OBJECT_LIMIT_BREAKAWAY_OK);
+    job.try_set_limit_flags(JOB_OBJECT_LIMIT(0)).expect("clear the limits");
+    assert_eq!(crate::test_frozen::limit_flags(&job), JOB_OBJECT_LIMIT(0));
+
+    let _forced = force_next(Step::SetLimits, ERROR_ACCESS_DENIED);
+    job.try_set_limit_flags(JOB_OBJECT_LIMIT_BREAKAWAY_OK)
+        .expect_err("a failed write must be reported");
+    assert_eq!(
+        crate::test_frozen::limit_flags(&job),
+        JOB_OBJECT_LIMIT(0),
+        "the failed write changed nothing"
+    );
+}

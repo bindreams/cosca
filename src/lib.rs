@@ -183,6 +183,9 @@ mod test_support;
 #[cfg(test)]
 mod test_spawn;
 
+#[cfg(all(test, windows))]
+mod test_frozen;
+
 pub mod process;
 pub use process::{Process, Recursive};
 
