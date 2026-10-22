@@ -194,7 +194,7 @@ fn run_through_channel(cmd: &mut std::process::Command) -> (std::io::Result<std:
     let guard = crate::child::spawn::spawn_lock();
     let channel = pending.open(&guard).expect("open");
     #[allow(clippy::disallowed_methods, reason = "spawn_lock is held by `guard`")]
-    channel.run(|| cmd.spawn())
+    channel.run(|| cmd.spawn(), |c| Some(c.id()))
 }
 
 /// A program that cannot be exec'd fails the spawn after the hook reported an id: std's own error
@@ -260,38 +260,166 @@ fn an_unwritten_report_then_a_killed_child_is_answered_died_before_exec() {
 
 // The wait for a report =====
 
+/// A live child of this test (`cat` on a held stdin), so the wait has a real pid to watch. Dropping
+/// the stdin ends it.
+fn live_child() -> (std::process::Child, std::process::ChildStdin) {
+    let mut cmd = std::process::Command::new("/bin/cat");
+    cmd.stdin(std::process::Stdio::piped());
+    let guard = crate::child::spawn::spawn_lock();
+    #[allow(clippy::disallowed_methods, reason = "spawn_lock is held by `guard`")]
+    let mut child = cmd.spawn().expect("spawn cat");
+    drop(guard);
+    let stdin = child.stdin.take().expect("piped stdin");
+    (child, stdin)
+}
+
+/// Ends and reaps a [`live_child`].
+fn end(mut child: std::process::Child, stdin: std::process::ChildStdin) {
+    drop(stdin);
+    child.wait().expect("reap cat");
+}
+
+/// Arms a hook on the wait's first block that drops `copy`, a copy of the write end, so a wait that
+/// blocks where it should not ends at EOF and fails its test's assertion instead of hanging.
+fn release_on_block(copy: std::io::PipeWriter) -> crate::oneshot_hook::Armed {
+    seams::on_first_block(move || drop(copy))
+}
+
 /// An id that is already in the pipe is a late report.
 ///
 /// Mutant: the wait answers `Id`, not `Late`.
 #[skuld::test]
 fn awaiting_a_written_report_answers_late() {
     use std::io::Write;
+    let (child, stdin) = live_child();
     let (r, mut w) = pipe();
     w.write_all(&report_bytes(1, 0xabc)).unwrap();
-    assert!(matches!(await_report(&r), Report::Late(0xabc)));
+    assert!(matches!(await_report(&r, child.id()), Report::Late(0xabc)));
+    end(child, stdin);
 }
 
 /// A pipe whose every write end closed with nothing written is EOF: no report.
 ///
-/// Mutant: the wait answers `Unwritten`, or never returns.
+/// Mutant: the wait answers `Unwritten`.
 #[skuld::test]
 fn awaiting_a_closed_empty_pipe_answers_missing() {
+    let (child, stdin) = live_child();
     let (r, w) = pipe();
     drop(w);
-    assert!(matches!(await_report(&r), Report::Missing));
+    let report = await_report(&r, child.id());
+    assert!(matches!(report, Report::Missing), "{report:?}");
+    end(child, stdin);
 }
 
-/// The wait blocks until a report arrives from another thread, whichever of the two runs first.
+/// The wait blocks until a report arrives from another thread. The writer writes only once the
+/// wait has blocked, released by the wait's own hook; a wait that never blocks drops the release
+/// unsent, and the writer writes nothing.
 ///
 /// Mutant: the wait returns at once with nothing.
 #[skuld::test]
 fn awaiting_waits_for_a_report_written_by_another_thread() {
     use std::io::Write;
+    let (child, stdin) = live_child();
     let (r, mut w) = pipe();
-    let writer = std::thread::spawn(move || w.write_all(&report_bytes(1, 0xdef)).unwrap());
-    let report = await_report(&r);
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let writer = std::thread::spawn(move || {
+        if released.recv().is_ok() {
+            w.write_all(&report_bytes(1, 0xdef)).unwrap();
+        }
+    });
+    let blocked = std::rc::Rc::new(std::cell::Cell::new(false));
+    let hook = seams::on_first_block({
+        let blocked = std::rc::Rc::clone(&blocked);
+        move || {
+            blocked.set(true);
+            release.send(()).expect("the writer waits");
+        }
+    });
+    let report = await_report(&r, child.id());
+    drop(hook);
     writer.join().expect("the writer thread");
+    assert!(blocked.get(), "the wait must block until the report comes");
     assert!(matches!(report, Report::Late(0xdef)), "{report:?}");
+    end(child, stdin);
+}
+
+/// A child that exited without reporting, while another copy of the write end stays open (as a fork
+/// that inherited it holds one): the pipe never hits EOF, but the child is gone, so the report never
+/// comes. The wait answers `Missing` without blocking.
+///
+/// Mutant: the wait watches the pipe alone, so it blocks until every copy of the write end closes.
+#[skuld::test]
+fn awaiting_a_child_that_exited_unreported_answers_missing_without_blocking() {
+    let (mut child, stdin) = live_child();
+    let (r, copy) = pipe();
+    drop(stdin);
+    crate::test_child::wait_until_zombie(child.id());
+    let before = seams::block_count();
+    let _release = release_on_block(copy);
+    let report = await_report(&r, child.id());
+    assert_eq!(seams::block_count(), before, "a child already gone is not waited for");
+    assert!(matches!(report, Report::Missing), "{report:?}");
+    child.wait().expect("reap cat");
+}
+
+/// A child that exits during the wait ends it, through the watch on the child, even while another
+/// copy of the write end stays open. The hook on the wait's first block ends the child, waits until
+/// it is a zombie, then drops that copy, so the next wake has both events pending and says which
+/// one ended the wait.
+///
+/// Mutant: the wait watches the pipe alone.
+#[skuld::test]
+fn awaiting_a_child_that_exits_during_the_wait_is_ended_by_its_exit() {
+    let (mut child, stdin) = live_child();
+    let pid = child.id();
+    let (r, copy) = pipe();
+    let _hook = seams::on_first_block(move || {
+        drop(stdin);
+        crate::test_child::wait_until_zombie(pid);
+        drop(copy);
+    });
+    let report = await_report(&r, pid);
+    assert_eq!(
+        seams::take_wake(),
+        Some(seams::Wake::ChildGone),
+        "the child's exit ends the wait"
+    );
+    assert!(matches!(report, Report::Missing), "{report:?}");
+    child.wait().expect("reap cat");
+}
+
+/// A pid that names no child of this process (as after a foreign reap and a reuse of the number by
+/// another process) shows the child gone: `waitid` answers `ECHILD`, and the wait does not block.
+/// The test's own parent stands in for the stranger.
+///
+/// Mutant: `ECHILD` is not taken as the child gone, so the wait watches the stranger.
+#[skuld::test]
+fn awaiting_a_pid_that_is_not_our_child_answers_missing_without_blocking() {
+    let (r, copy) = pipe();
+    // SAFETY: `getppid` has no preconditions.
+    let stranger = unsafe { libc::getppid() } as u32;
+    let before = seams::block_count();
+    let _release = release_on_block(copy);
+    let report = await_report(&r, stranger);
+    assert_eq!(seams::block_count(), before, "a stranger is not waited for");
+    assert!(matches!(report, Report::Missing), "{report:?}");
+}
+
+/// A pid no process holds (a child this test reaped) cannot be watched: the registration's
+/// `ESRCH` shows the child gone, and the wait does not block.
+///
+/// Mutant: the registration's `ESRCH` is an error (`ReadFailed`).
+#[skuld::test]
+fn awaiting_a_reaped_pid_answers_missing_without_blocking() {
+    let (child, stdin) = live_child();
+    let pid = child.id();
+    end(child, stdin);
+    let (r, copy) = pipe();
+    let before = seams::block_count();
+    let _release = release_on_block(copy);
+    let report = await_report(&r, pid);
+    assert_eq!(seams::block_count(), before, "a reaped child is not waited for");
+    assert!(matches!(report, Report::Missing), "{report:?}");
 }
 
 /// A failed spawn's child was collected by std, or tokio dropped it with its pid, so there is no
@@ -308,7 +436,7 @@ fn a_failed_spawn_reads_the_report_once_and_does_not_wait() {
     let channel = pending.open(&guard).expect("open");
     let _foreign_copy = channel.write_end.try_clone().expect("dup the write end");
     let _refused = seams::refuse_the_wait();
-    let (spawned, report) = channel.run(|| Err::<(), ()>(()));
+    let (spawned, report) = channel.run(|| Err::<(), ()>(()), |_| unreachable!("a failed spawn has no child"));
     assert!(spawned.is_err());
     assert!(matches!(report, Report::Unwritten), "{report:?}");
 }

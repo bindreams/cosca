@@ -117,9 +117,9 @@ fn macos_sync_spawn_of_a_late_reporting_child_kills_and_reaps_it_through_its_id(
 }
 
 /// With two of fds 0 to 2 closed in the parent, std's close-on-exec pipe takes a child's stdio number
-/// and std returns before the child's hooks run. Whether the report is late is the child's race to
-/// win: either the spawn adopts the child, or it tears the late one down. Neither leaves a child
-/// behind. Runs in a process of its own, since closing fds is process-wide.
+/// and std returns before the child's hooks run. The child's report hook waits until the parent's
+/// first read of the report has returned, so the report is late, and the spawn tears the child down.
+/// Runs in a process of its own, since closing fds is process-wide.
 ///
 /// Mutant: a late child is left running and unreaped.
 #[skuld::test]
@@ -139,23 +139,19 @@ fn macos_sync_spawn_with_fds_0_and_1_closed_leaves_no_child_behind() {
     // Opened before the close, so it lands above stdio: a closed stdout cannot be inherited.
     let null = std::fs::File::open("/dev/null").expect("open /dev/null");
     cmd.stdout(crate::stdio::Stdio::from_file(null)).expect("set stdout");
+    // Opened before the close too, so the gate's ends are above stdio.
+    let held = unique_report::seams::hold_the_report_until_the_first_read();
     let restore = RestoreStdio::close(&done, &[0, 1]);
     let spawned = cmd.spawn();
     drop(restore);
-    match spawned {
-        Ok(child) => {
-            child.kill().expect("kill the adopted child");
-            child.wait().expect("reap it");
-        }
-        Err(err) => {
-            let (_err, fate) = crate::child::spawn::failure::expect_may_have_started_with(err);
-            assert_eq!(fate, ChildFate::Reaped, "the late child is reaped");
-            let Some(crate::identity::Resolved::Found(id)) = crate::child::spawn::fault::take_captured() else {
-                panic!("the spawn captured the child");
-            };
-            assert!(is_reaped(id.pid()), "nothing is left to wait for");
-        }
-    }
+    drop(held);
+    let err = spawned.expect_err("a late child is not adopted");
+    let (_err, fate) = crate::child::spawn::failure::expect_may_have_started_with(err);
+    assert_eq!(fate, ChildFate::Reaped, "the late child is reaped");
+    let Some(crate::identity::Resolved::Found(id)) = crate::child::spawn::fault::take_captured() else {
+        panic!("the spawn captured the child");
+    };
+    assert!(is_reaped(id.pid()), "nothing is left to wait for");
     drop(writer);
 }
 
