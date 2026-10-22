@@ -22,7 +22,8 @@
 //! close-on-exec pipe takes one of the child's stdio numbers, so std returns before the child's
 //! hooks run (see `crate::containment::cgroup::channel::ReportChannel`). The pipe is then empty but
 //! open. The report hook is registered first, so the child either writes its report or dies without
-//! one: after an `Ok` spawn, [`Channel::run`] blocks on the pipe until one of the two happens, and
+//! one: after an `Ok` spawn, [`Channel::run`] watches the pipe and the child until one of the two
+//! happens (see [`await_report`] for why the pipe's EOF is not enough), and
 //! answers [`Report::Late`] for a report that came after the spawn returned. The program may then
 //! have started and std's own spawn is not trusted (its error pipe was clobbered, so a failed `exec`
 //! is invisible to it): the spawn tears the child down through its unique id. A failed spawn leaves
@@ -125,8 +126,13 @@ fn set_nonblocking(fd: &OwnedFd) -> Result<(), Error> {
 
 impl Channel {
     /// Runs `spawn` with the pipe published, then reads what the child reported. The report comes
-    /// with the spawn's result either way.
-    pub(crate) fn run<T, E>(self, spawn: impl FnOnce() -> Result<T, E>) -> (Result<T, E>, Report) {
+    /// with the spawn's result either way. `pid_of` names the child of a spawn that returned `Ok`; a
+    /// child it cannot name is not waited for.
+    pub(crate) fn run<T, E>(
+        self,
+        spawn: impl FnOnce() -> Result<T, E>,
+        pid_of: impl FnOnce(&T) -> Option<u32>,
+    ) -> (Result<T, E>, Report) {
         let Channel {
             read_end,
             write_end,
@@ -136,69 +142,156 @@ impl Channel {
         shared.withdraw();
         // Closed before the read, so a child that never wrote leaves the pipe at EOF.
         drop(write_end);
-        let report = match read_report(&read_end) {
+        let first = read_report(&read_end);
+        #[cfg(test)]
+        seams::first_read_done();
+        let report = match (first, spawned.as_ref().ok().map(pid_of)) {
+            (Report::Unwritten, Some(Some(pid))) => await_report(&read_end, pid),
+            (Report::Unwritten, Some(None)) => {
+                debug_assert!(false, "a freshly spawned child has a pid");
+                Report::Unwritten
+            }
             // A failed spawn leaves no child to wait on: std collected it, or tokio dropped it and
             // its pid with it. Its report came already or never comes, so the read stands.
-            Report::Unwritten if spawned.is_ok() => await_report(&read_end),
-            report => report,
+            (report, _) => report,
         };
-        debug_assert!(
-            spawned.is_err() || !matches!(report, Report::Unwritten),
-            "the wait answers a report"
-        );
         (spawned, report)
     }
 }
 
 /// How long the wait runs before it says what it is waiting on.
-const SAY_WAITING_AFTER_MS: libc::c_int = 1000;
+const SAY_WAITING_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Blocks on `read_end` until the child's report arrives or every copy of the write end closes, then
-/// answers what it holds: [`Report::Late`] for an id (it arrived after the spawn returned).
+/// Blocks until the report of child `pid` is in `read_end`, or the child is gone, then answers what
+/// the pipe holds: [`Report::Late`] for an id (it arrived after the spawn returned), and
+/// [`Report::Missing`] for nothing from a child that is gone, which never reached its report.
 ///
-/// It waits on an event, the pipe becoming readable or hanging up, and never on a timer. The parent's
-/// own write end is closed by [`Channel::run`] before this, so EOF comes when the child's hooks
-/// finish, or the child dies. A copy of the write end inherited by another fork in this process
-/// delays the EOF of a child that dies without reporting until that fork `exec`s or exits: an
-/// external event, so the wait has no bound. Past one second it warns, once, naming that: a message
-/// only, never a decision.
-fn await_report(read_end: &OwnedFd) -> Report {
+/// The pipe's EOF alone cannot end the wait. `std::io::pipe` on macOS is `pipe()`, then a separate
+/// `FD_CLOEXEC`, so any process another thread starts in between (not only a fork that never execs)
+/// inherits the write end and holds the EOF off for as long as it lives. So one kqueue watches the
+/// pipe (`EVFILT_READ`) and the child (`EVFILT_PROC`, `NOTE_EXIT`). The child is gone when that
+/// registration answers `ESRCH`, when `NOTE_EXIT` comes, or when `waitid(WNOHANG | WNOWAIT)`, asked
+/// after the registration, finds it exited or answers `ECHILD`; the pipe is then read once more.
+///
+/// The residual: something else reaps the child (`SIGCHLD` ignored, or a `waitpid(-1)` reaper) and
+/// another child of this process takes its pid before the registration. The watch and `waitid` then
+/// name that process, and the wait lasts as long as it does, unless the pipe hits EOF first.
+///
+/// It waits on events, never on a timer. Past one second it warns, once, naming what it waits for:
+/// a message only, never a decision.
+fn await_report(read_end: &OwnedFd, pid: u32) -> Report {
     #[cfg(test)]
     if seams::wait_is_refused() {
         return Report::ReadFailed(io::Error::other("test seam: the wait for a report was entered"));
     }
+    match watch(read_end, pid) {
+        Ok(Watch::Pipe(report)) => {
+            #[cfg(test)]
+            seams::woke(seams::Wake::Pipe);
+            report
+        }
+        Ok(Watch::ChildGone) => {
+            #[cfg(test)]
+            seams::woke(seams::Wake::ChildGone);
+            // Whatever the child wrote is in the pipe by now.
+            match read_report(read_end) {
+                Report::Id(id) => Report::Late(id),
+                Report::Unwritten => Report::Missing,
+                report => report,
+            }
+        }
+        Err(e) => Report::ReadFailed(e),
+    }
+}
+
+/// What ended a [`watch`].
+enum Watch {
+    /// The pipe had something to read, or hit EOF: the report as read, an id as [`Report::Late`].
+    Pipe(Report),
+    /// The child is gone.
+    ChildGone,
+}
+
+/// The kqueue wait of [`await_report`].
+fn watch(read_end: &OwnedFd, pid: u32) -> io::Result<Watch> {
+    use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
+
+    let kq = Kqueue::new()?;
+    let pipe = KEvent::new(
+        read_end.as_raw_fd() as usize,
+        EventFilter::EVFILT_READ,
+        EvFlags::EV_ADD | EvFlags::EV_RECEIPT,
+        FilterFlag::empty(),
+        0,
+        0,
+    );
+    match crate::wait::backend::add_with_receipt(&kq, pipe).map_err(into_io)? {
+        0 => {}
+        errno => return Err(io::Error::from_raw_os_error(errno as i32)),
+    }
+    // Registered before the `waitid`, so a child that exits after it fires `NOTE_EXIT`.
+    if crate::wait::backend::arm_note_exit_on(&kq, pid)
+        .map_err(into_io)?
+        .is_none()
+    {
+        return Ok(Watch::ChildGone);
+    }
+    // Read again before asking about the child: the report may have come since the first read.
+    match read_report(read_end) {
+        Report::Unwritten => {}
+        Report::Id(id) => return Ok(Watch::Pipe(Report::Late(id))),
+        report => return Ok(Watch::Pipe(report)),
+    }
+    if !child_is_running(pid)? {
+        return Ok(Watch::ChildGone);
+    }
+    let blank = KEvent::new(0, EventFilter::EVFILT_READ, EvFlags::empty(), FilterFlag::empty(), 0, 0);
+    let mut events = [blank; 2];
     let mut warned = false;
     loop {
-        let mut poll = libc::pollfd {
-            fd: read_end.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
+        #[cfg(test)]
+        seams::blocking();
+        let timeout = (!warned).then(|| crate::wait::backend::kevent_timeout(SAY_WAITING_AFTER));
+        let n = match kq.kevent(&[], &mut events, timeout) {
+            Ok(n) => n,
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(e) => return Err(e.into()),
         };
-        let timeout = if warned { -1 } else { SAY_WAITING_AFTER_MS };
-        // SAFETY: one valid `pollfd` for the whole call.
-        let n = unsafe { libc::poll(&mut poll, 1, timeout) };
-        if n < 0 {
-            let e = io::Error::last_os_error();
-            if e.raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            return Report::ReadFailed(e);
-        }
         if n == 0 {
             warned = true;
             log::warn!(
-                "the spawned child has not reported its unique id after 1 s; waiting for its report, or for \
-                 every copy of the pipe's write end to close (a copy held by another fork of this process \
-                 delays that until it execs or exits)"
+                "the spawned child {pid} has not reported its unique id after 1 s; waiting for its report, or \
+                 for it to exit"
             );
             continue;
         }
-        return match read_report(read_end) {
-            Report::Id(id) => Report::Late(id),
+        if events[..n].iter().any(|e| e.filter() == Ok(EventFilter::EVFILT_PROC)) {
+            return Ok(Watch::ChildGone);
+        }
+        match read_report(read_end) {
+            Report::Id(id) => return Ok(Watch::Pipe(Report::Late(id))),
             // Readable, yet nothing to read: a spurious wake. Wait again.
             Report::Unwritten => continue,
-            report => report,
-        };
+            report => return Ok(Watch::Pipe(report)),
+        }
+    }
+}
+
+/// Whether `pid` is a child of this process that has not exited, by a `waitid` that consumes
+/// nothing. An exit record, or `ECHILD` (something else reaped it, so the pid is not our child), is
+/// `false`.
+fn child_is_running(pid: u32) -> io::Result<bool> {
+    use crate::wait::exit_only::{peek, Peek, Target};
+    Ok(match peek(&Target::pid(pid, None))? {
+        Peek::Running => true,
+        Peek::Exit(_) | Peek::Foreign(_) => false,
+    })
+}
+
+fn into_io(e: Error) -> io::Error {
+    match e {
+        Error::Io(e) => e,
+        other => io::Error::other(other),
     }
 }
 
@@ -357,6 +450,8 @@ pub(crate) fn refused_error(errno: i32) -> Error {
 /// The hook: the child reads its own unique id and writes the report. Async-signal-safe.
 fn report(shared: &Shared, #[cfg(test)] seam: seams::Armed) -> io::Result<()> {
     #[cfg(test)]
+    seam.await_gate();
+    #[cfg(test)]
     if let Some(errno) = seam.fail_before_report() {
         return Err(io::Error::from_raw_os_error(errno));
     }
@@ -406,6 +501,8 @@ pub(crate) mod seams {
         KillSelf,
         /// The hook fails with this errno before it reports.
         FailBeforeReport(i32),
+        /// The hook reads one byte from this fd before it reports.
+        Gate(std::os::fd::RawFd),
     }
 
     thread_local! {
@@ -413,6 +510,11 @@ pub(crate) mod seams {
         static PARENT_READ_ERRNO: Cell<Option<i32>> = const { Cell::new(None) };
         static PARENT_READ_UNWRITTEN: Cell<bool> = const { Cell::new(false) };
         static WAIT_REFUSED: Cell<bool> = const { Cell::new(false) };
+        static GATE: std::cell::RefCell<Option<(std::io::PipeReader, std::io::PipeWriter)>> =
+            const { std::cell::RefCell::new(None) };
+        static ON_FIRST_BLOCK: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
+        static BLOCKS: Cell<u32> = const { Cell::new(0) };
+        static WAKE: Cell<Option<Wake>> = const { Cell::new(None) };
     }
 
     /// What a hook registered on this thread was armed with.
@@ -428,10 +530,26 @@ pub(crate) mod seams {
             }
         }
 
+        /// Blocks until the parent's first read of the report has returned, if the seam says so.
+        /// Async-signal-safe: `read` into a stack byte.
+        pub(super) fn await_gate(self) {
+            let Force::Gate(fd) = self.0 else { return };
+            let mut byte = 0u8;
+            loop {
+                // SAFETY: one byte into a stack variable.
+                let n = unsafe { libc::read(fd, (&raw mut byte).cast(), 1) };
+                // SAFETY: `__error` is this thread's errno location.
+                if n < 0 && unsafe { *libc::__error() } == libc::EINTR {
+                    continue;
+                }
+                return;
+            }
+        }
+
         /// `child_end` is the report pipe's write end.
         pub(super) fn read(self, child_end: std::os::fd::RawFd) -> Result<u64, i32> {
             match self.0 {
-                Force::None | Force::FailBeforeReport(_) => crate::identity::own_unique_id(),
+                Force::None | Force::FailBeforeReport(_) | Force::Gate(_) => crate::identity::own_unique_id(),
                 Force::Errno(errno) => Err(errno),
                 Force::KillSelf => {
                     // The write end is closed first: the kernel closes a dying process's descriptors
@@ -536,6 +654,68 @@ pub(crate) mod seams {
 
     pub(super) fn wait_is_refused() -> bool {
         WAIT_REFUSED.with(Cell::get)
+    }
+
+    /// While the guard lives, the next spawn's child on this thread writes its report only after the
+    /// parent's first read of it has returned, so the report is late whenever std returned before
+    /// the child's hooks ran.
+    pub(crate) fn hold_the_report_until_the_first_read() -> HeldReport {
+        use std::os::fd::AsRawFd;
+        let (read, write) = std::io::pipe().expect("the gate pipe");
+        FORCE.with(|f| f.set(Force::Gate(read.as_raw_fd())));
+        GATE.with(|g| *g.borrow_mut() = Some((read, write)));
+        HeldReport(())
+    }
+
+    #[must_use = "the report is held only while the guard lives"]
+    pub(crate) struct HeldReport(());
+
+    impl Drop for HeldReport {
+        fn drop(&mut self) {
+            FORCE.with(|f| f.set(Force::None));
+            GATE.with(|g| g.borrow_mut().take());
+        }
+    }
+
+    /// The parent's first read of a report has returned: lets a held child write it.
+    pub(super) fn first_read_done() {
+        use std::io::Write;
+        if let Some((_, mut write)) = GATE.with(|g| g.borrow_mut().take()) {
+            write.write_all(b"r").expect("release the held report");
+        }
+    }
+
+    /// Runs `hook` once, the first time a wait for a report on this thread is about to block.
+    pub(crate) fn on_first_block(hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
+        crate::oneshot_hook::arm(&ON_FIRST_BLOCK, hook)
+    }
+
+    /// How many times a wait for a report on this thread has been about to block.
+    pub(crate) fn block_count() -> u32 {
+        BLOCKS.with(Cell::get)
+    }
+
+    pub(super) fn blocking() {
+        BLOCKS.with(|b| b.set(b.get() + 1));
+        crate::oneshot_hook::fire(&ON_FIRST_BLOCK);
+    }
+
+    /// What ended the last wait for a report on this thread.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Wake {
+        /// The pipe had something to read, or hit EOF.
+        Pipe,
+        /// The child was gone.
+        ChildGone,
+    }
+
+    pub(super) fn woke(wake: Wake) {
+        WAKE.with(|w| w.set(Some(wake)));
+    }
+
+    /// What ended the last wait for a report on this thread, taken.
+    pub(crate) fn take_wake() -> Option<Wake> {
+        WAKE.with(Cell::take)
     }
 
     /// The next spawns on this thread have their child killed by `SIGKILL` before it reports, as
