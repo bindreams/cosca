@@ -341,6 +341,7 @@ pub(crate) fn spawn_raw(
         // decision: a derivation reading only the containment half would report an in-process
         // route for a child this spawn deliberately put in another console.
         graceful: crate::containment::windows::mechanism_from_flags(flags),
+        frozen: cmd.flags_request().suspended,
     };
     let raw_handle = proc.as_raw_handle();
     let id = match resolve_identity(

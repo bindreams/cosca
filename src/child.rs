@@ -29,6 +29,10 @@ use proc_handle::ProcHandle;
 #[path = "child/lifecycle.rs"]
 mod lifecycle;
 
+#[path = "child/suspended.rs"]
+mod suspended;
+pub use suspended::SuspendedChild;
+
 #[path = "child/graceful.rs"]
 mod graceful;
 
@@ -139,6 +143,9 @@ pub struct Child {
     /// The elevation front this child is, if any, as its spawn found it (see
     /// [`crate::elevation::front`]). The one source the kill and `SIGTERM` gates read.
     front: Option<crate::elevation::front::Front>,
+    /// The token of a frozen spawn, until [`SuspendedChild`] takes it; `None` for every other child.
+    /// Boxed so an ordinary child stays one pointer larger, not a job handle larger.
+    frozen: Option<Box<crate::containment::frozen::Frozen>>,
     /// What a failed-spawn cleanup that left this handle armed already warned of, so the drop that
     /// retries reports a repeat of it at `debug` and anything new at `warn`
     /// ([`DropReport::emit`](crate::child::drop_report::DropReport::emit)).
@@ -165,6 +172,7 @@ impl Child {
             graceful: attachment.graceful,
             elevation: None,
             front: None,
+            frozen: attachment.frozen.map(Box::new),
             #[cfg(unix)]
             reported: Vec::new(),
         }
@@ -173,6 +181,17 @@ impl Child {
     /// Set by the spawn, from its command (see [`Child::front`](Self#structfield.front)).
     pub(crate) fn set_front(&mut self, front: Option<crate::elevation::front::Front>) {
         self.front = front;
+    }
+
+    /// Take a frozen spawn's token. `None` once taken, and for a child that was not spawned frozen.
+    pub(crate) fn take_frozen(&mut self) -> Option<crate::containment::frozen::Frozen> {
+        self.frozen.take().map(|frozen| *frozen)
+    }
+
+    /// The process handle this child holds, valid while the child is.
+    #[cfg(windows)]
+    pub(crate) fn process_handle(&self) -> std::os::windows::io::RawHandle {
+        self.proc.raw_handle()
     }
 
     /// Commit the spawn: apply `kill_on_drop` to the containment resource (see

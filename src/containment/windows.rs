@@ -23,7 +23,8 @@ use windows::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation,
     QueryInformationJobObject, SetInformationJobObject, TerminateJobObject, JOBOBJECT_BASIC_PROCESS_ID_LIST,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
 };
 use windows::Win32::System::Threading::{
     GetProcessId, GetProcessIdOfThread, OpenProcess, OpenThread, ResumeThread, WaitForMultipleObjects,
@@ -570,6 +571,8 @@ pub(crate) mod fault {
         SetLimits,
         /// The assignment of a Strongest root's job, in [`assign_held`](super::assign_held).
         Assign,
+        /// The assignment of a frozen child's guard job, in [`assign_guard_job`](super::assign_guard_job).
+        GuardAssign,
     }
 
     thread_local! {
@@ -651,6 +654,31 @@ pub(crate) fn assign_held(proc_handle: std::os::windows::io::RawHandle) -> io::R
     #[cfg(test)]
     forced(fault::Step::Assign).map_err(io::Error::from)?;
     assign_to_kill_on_close_job(proc_handle)
+}
+
+/// The guard job of a frozen child that no cosca job holds: it kills the child if its owner dies
+/// while the child is frozen, and it never narrows what the child may do afterwards.
+///
+/// Armed, it carries `KILL_ON_JOB_CLOSE`; armed and released it permits breakaway
+/// (`BREAKAWAY_OK`) and keeps the member's descendants out of the job (`SILENT_BREAKAWAY_OK`).
+/// Membership outlives the handle, so a job without them would stay around the resumed child and
+/// refuse its `CREATE_BREAKAWAY_FROM_JOB`, which an uncontained child may use freely.
+pub(crate) fn assign_guard_job(proc_handle: std::os::windows::io::RawHandle) -> io::Result<JobHandle> {
+    #[cfg(test)]
+    forced(fault::Step::GuardAssign).map_err(io::Error::from)?;
+    assign_with_limits(proc_handle, guard_armed_flags())
+}
+
+/// The guard's limits while it is armed.
+pub(crate) fn guard_armed_flags() -> JOB_OBJECT_LIMIT {
+    JOB_OBJECT_LIMIT(
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.0 | JOB_OBJECT_LIMIT_BREAKAWAY_OK.0 | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK.0,
+    )
+}
+
+/// The guard's limits once it is released: the kill is gone and breakaway is still permitted.
+pub(crate) fn guard_released_flags() -> JOB_OBJECT_LIMIT {
+    JOB_OBJECT_LIMIT(JOB_OBJECT_LIMIT_BREAKAWAY_OK.0 | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK.0)
 }
 
 /// Create a job with exactly `flags` and assign the process at `proc_handle` to it.
@@ -1423,12 +1451,17 @@ pub(crate) fn attach_job(proc_handle: std::os::windows::io::RawHandle) -> io::Re
 /// async `Child::test_job_handle_contains_self` accessors (both compiled outside `cfg(test)` so
 /// integration crates can call them).
 pub(crate) fn job_contains_pid(attached: &crate::containment::Attached, pid: u32) -> bool {
-    use windows::Win32::System::JobObjects::IsProcessInJob;
-    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION};
-
     let crate::containment::Attached::JobObject(job) = attached else {
         return false;
     };
+    job_handle_contains_pid(job, pid)
+}
+
+/// [`job_contains_pid`] for a job handle: whether `pid` is inside it, by `IsProcessInJob` against
+/// that handle.
+pub(crate) fn job_handle_contains_pid(job: &JobHandle, pid: u32) -> bool {
+    use windows::Win32::System::JobObjects::IsProcessInJob;
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION};
 
     // Open the child process by PID; the backend doesn't expose its handle.
     // SAFETY: standard Win32 call; the handle is closed below.

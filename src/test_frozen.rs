@@ -15,12 +15,14 @@ use windows::Win32::System::JobObjects::{
     JobObjectBasicLimitInformation, QueryInformationJobObject, JOBOBJECT_BASIC_LIMIT_INFORMATION, JOB_OBJECT_LIMIT,
 };
 use windows::Win32::System::Threading::{
-    OpenThread, ResumeThread, SuspendThread, CREATE_SUSPENDED, THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME,
+    OpenThread, ResumeThread, SuspendThread, CREATE_NO_WINDOW, CREATE_SUSPENDED, THREAD_QUERY_LIMITED_INFORMATION,
+    THREAD_SUSPEND_RESUME,
 };
 
 use crate::containment::windows::JobHandle;
 
-/// A `findstr x` blocker created `CREATE_SUSPENDED` through std, with piped stdin the caller holds.
+/// A `findstr x` blocker created `CREATE_SUSPENDED` through std, windowless (`CREATE_NO_WINDOW`: a
+/// test must never open a console window on a developer's desktop), with piped stdin the caller holds.
 /// Closing that stdin is what lets the child exit by itself once it runs.
 pub(crate) fn spawn_suspended_blocker() -> std::process::Child {
     let mut cmd = std::process::Command::new(crate::test_child::BLOCKER_ARGV[0]);
@@ -28,7 +30,7 @@ pub(crate) fn spawn_suspended_blocker() -> std::process::Child {
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .creation_flags(CREATE_SUSPENDED.0);
+        .creation_flags(CREATE_SUSPENDED.0 | CREATE_NO_WINDOW.0);
     crate::test_spawn::spawn(&mut cmd).expect("spawn a suspended blocker")
 }
 
@@ -129,4 +131,41 @@ pub(crate) fn limit_flags(job: &JobHandle) -> JOB_OBJECT_LIMIT {
 /// The raw process handle of a std child, as `attach` takes it.
 pub(crate) fn raw(child: &std::process::Child) -> std::os::windows::io::RawHandle {
     child.as_raw_handle()
+}
+
+// Counting the root teardowns a drop starts =====
+
+thread_local! {
+    static ROOT_TEARDOWNS: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Called by `ProcHandle::teardown_on_drop`; counts while a recorder lives on this thread.
+pub(crate) fn note_root_teardown() {
+    ROOT_TEARDOWNS.with(|c| {
+        if let Some(n) = c.get() {
+            c.set(Some(n + 1));
+        }
+    });
+}
+
+/// Count every root teardown a drop or `tear_down_now` starts on THIS thread until the recorder
+/// drops. The teardown still runs.
+pub(crate) fn record_root_teardowns() -> RootTeardownRecorder {
+    ROOT_TEARDOWNS.with(|c| c.set(Some(0)));
+    RootTeardownRecorder(())
+}
+
+#[must_use = "recording stops as soon as the recorder is dropped"]
+pub(crate) struct RootTeardownRecorder(());
+
+impl RootTeardownRecorder {
+    pub(crate) fn count(&self) -> u32 {
+        ROOT_TEARDOWNS.with(|c| c.get().expect("the recorder is live"))
+    }
+}
+
+impl Drop for RootTeardownRecorder {
+    fn drop(&mut self) {
+        ROOT_TEARDOWNS.with(|c| c.set(None));
+    }
 }

@@ -857,6 +857,25 @@ fn assign_held_assigns_the_job_without_resuming() {
     child.wait().expect("the job's close killed the frozen child");
 }
 
+/// The guard arms the kill and permits breakaway, so it never narrows what its member may do.
+#[skuld::test]
+fn assign_guard_job_arms_kill_on_close_and_permits_breakaway() {
+    use windows::Win32::System::JobObjects::{
+        JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
+    };
+    let child = crate::test_frozen::spawn_suspended_blocker();
+
+    let guard = super::assign_guard_job(crate::test_frozen::raw(&child)).expect("assign the guard");
+
+    assert_eq!(
+        crate::test_frozen::limit_flags(&guard).0,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.0 | JOB_OBJECT_LIMIT_BREAKAWAY_OK.0 | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK.0
+    );
+    drop(guard);
+    let mut child = child;
+    child.wait().expect("the guard's close killed the frozen child");
+}
+
 /// `try_set_limit_flags` writes exactly the flags given, and reports a failed write instead of
 /// logging it away.
 #[skuld::test]

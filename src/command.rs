@@ -879,6 +879,13 @@ impl Command {
         &self.flags
     }
 
+    /// Set the suspended request, which only `spawn_suspended` makes, for the duration of one
+    /// spawn. Returns the previous value.
+    #[cfg(windows)]
+    pub(crate) fn set_suspended(&mut self, yes: bool) -> bool {
+        std::mem::replace(&mut self.flags.suspended, yes)
+    }
+
     /// Run this child elevated (admin/root). Sugar for `Backend::Auto` +
     /// `Auth::Interactive` + the default `EnvSanitizer`. Elevation wraps the
     /// CHILD, never this process.

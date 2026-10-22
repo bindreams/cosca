@@ -160,6 +160,8 @@ fn nested_attach_is_delegated() {
             marker: None,
             #[cfg(windows)]
             graceful: crate::containment::windows::mechanism_from_flags(crate::containment::windows::group_flags()),
+            #[cfg(windows)]
+            frozen: false,
         };
         #[cfg(windows)]
         let proc_handle = {
@@ -729,4 +731,155 @@ fn kill_on_drop_true_leaves_a_cgroup_leaf_armed() {
         b"1",
         "the default is still a kill-on-drop teardown"
     );
+}
+
+// ===== hold mode (Windows) =====
+
+#[cfg(windows)]
+mod hold_mode {
+    use crate::containment::dispatch::{attach, Attached, Attachment, Prepared};
+    use crate::containment::windows::fault::{force_next, Step};
+    use crate::containment::windows::guard_armed_flags;
+    use crate::containment::{ContainMode, Containment};
+    use crate::error::Error;
+    use crate::test_frozen::{limit_flags, raw, spawn_suspended_blocker, InitialThread};
+
+    const ERROR_ACCESS_DENIED: u32 = 5;
+
+    fn prepared(mode: Option<ContainMode>, is_root: bool, frozen: bool) -> Prepared {
+        Prepared {
+            mode,
+            is_root,
+            graceful: crate::graceful::GracefulMechanism::None,
+            frozen,
+        }
+    }
+
+    fn attach_suspended(child: &std::process::Child, prepared: Prepared) -> Result<Attachment, Error> {
+        let crate::identity::Resolved::Found(id) = crate::identity::ProcessId::of(child.id()) else {
+            panic!("the suspended child must be readable");
+        };
+        attach(id, raw(child), prepared)
+    }
+
+    fn dispose(mut child: std::process::Child) {
+        child.kill().expect("kill the test child");
+        child.wait().expect("reap the test child");
+    }
+
+    /// A frozen Strongest root is assigned its containment job and stays suspended; the job is its
+    /// guard, so there is no second one.
+    #[skuld::test]
+    fn attach_in_hold_mode_assigns_a_strongest_roots_job_and_leaves_the_thread_suspended() {
+        let child = spawn_suspended_blocker();
+        let thread = InitialThread::of(child.id());
+
+        let attachment = attach_suspended(&child, prepared(Some(ContainMode::Strongest), true, true)).expect("attach");
+
+        assert_eq!(attachment.containment, Containment::JobObject);
+        assert!(matches!(attachment.attached, Attached::JobObject(_)));
+        let frozen = attachment
+            .frozen
+            .as_ref()
+            .expect("a frozen attach hands back its token");
+        assert!(!frozen.has_guard(), "the containment job is the guard");
+        assert_eq!(thread.suspend_count(), 1, "hold mode must not resume");
+        drop(attachment);
+        child
+            .wait_with_output()
+            .expect("the job's close killed the frozen child");
+    }
+
+    /// A frozen child needs a job to be guarded, so a failed assignment fails the attach instead of
+    /// falling back to `TreeWalk`, which would leave nothing to kill it.
+    #[skuld::test]
+    fn attach_in_hold_mode_fails_when_the_strongest_assignment_fails_instead_of_falling_back_to_treewalk() {
+        let child = spawn_suspended_blocker();
+        let _forced = force_next(Step::Assign, ERROR_ACCESS_DENIED);
+
+        let err = attach_suspended(&child, prepared(Some(ContainMode::Strongest), true, true))
+            .err()
+            .expect("a frozen attach with no job must fail");
+
+        assert!(matches!(err, Error::Containment { .. }), "got {err:?}");
+        dispose(child);
+    }
+
+    /// The ordinary attach is unchanged: it resumes, and a failed assignment still degrades to
+    /// `TreeWalk`.
+    #[skuld::test]
+    fn attach_without_hold_still_resumes_and_still_falls_back_to_treewalk() {
+        let child = spawn_suspended_blocker();
+        let thread = InitialThread::of(child.id());
+        let _forced = force_next(Step::Assign, ERROR_ACCESS_DENIED);
+
+        let attachment = attach_suspended(&child, prepared(Some(ContainMode::Strongest), true, false)).expect("attach");
+
+        assert_eq!(attachment.containment, Containment::TreeWalk);
+        assert!(attachment.frozen.is_none());
+        assert_eq!(thread.suspend_count(), 0, "the ordinary attach resumes the child");
+        dispose(child);
+    }
+
+    /// Every shape without a cosca job of its own gets a guard, assigned while frozen, and keeps
+    /// the containment it would report if it were not frozen.
+    #[skuld::test]
+    fn attach_in_hold_mode_gives_treewalk_nested_and_uncontained_shapes_a_guard_and_keeps_their_containment() {
+        let shapes = [
+            (
+                "treewalk root",
+                Some(ContainMode::TreeWalk),
+                true,
+                Containment::TreeWalk,
+            ),
+            (
+                "nested strongest member",
+                Some(ContainMode::Strongest),
+                false,
+                Containment::Delegated,
+            ),
+            (
+                "nested treewalk member",
+                Some(ContainMode::TreeWalk),
+                false,
+                Containment::Delegated,
+            ),
+            ("uncontained", None, false, Containment::None),
+        ];
+        for (name, mode, is_root, expected) in shapes {
+            let child = spawn_suspended_blocker();
+            let thread = InitialThread::of(child.id());
+
+            let attachment = attach_suspended(&child, prepared(mode, is_root, true)).expect(name);
+
+            assert_eq!(attachment.containment, expected, "{name}");
+            let frozen = attachment.frozen.as_ref().expect(name);
+            assert!(frozen.has_guard(), "{name} has no job of its own, so it needs a guard");
+            assert_eq!(
+                limit_flags(frozen.guard_for_test().expect(name)).0,
+                guard_armed_flags().0,
+                "{name}: the guard must be armed with breakaway permitted"
+            );
+            assert_eq!(thread.suspend_count(), 1, "{name}: hold mode must not resume");
+            drop(attachment);
+            child
+                .wait_with_output()
+                .unwrap_or_else(|e| panic!("{name}: the guard's close killed the child: {e}"));
+        }
+    }
+
+    /// A guard that cannot be assigned fails the attach: a frozen child nothing can kill must not
+    /// be handed to the caller.
+    #[skuld::test]
+    fn a_failed_guard_assignment_fails_the_attach() {
+        let child = spawn_suspended_blocker();
+        let _forced = force_next(Step::GuardAssign, ERROR_ACCESS_DENIED);
+
+        let err = attach_suspended(&child, prepared(None, false, true))
+            .err()
+            .expect("an unguardable frozen child must fail the attach");
+
+        assert!(matches!(err, Error::Containment { .. }), "got {err:?}");
+        dispose(child);
+    }
 }
