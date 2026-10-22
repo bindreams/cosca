@@ -22,18 +22,8 @@ jobs:
       matrix:
         runner: [windows-latest, windows-11-arm]
         scenario:
-          - logonuser-interactive
-          - logonuser-network
-          - cpwl-profile
-          - cpwl-noprofile
-          - cpwl-profile-l2
-          - cpwl-profile-elevate-l2
-          - own-load-l2
-          - own-load-elevate-l2
-          - startprocess
-          - startprocess-loadprofile
-          - startprocess-elevate
-          - startprocess-elevate-l2
+          - startprocess-elevate-m1
+          - cpwl-profile-elevate-m1
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     steps:
@@ -108,6 +98,6 @@ jobs:
           }
           Get-ChildItem C:\Users -Directory -Force | Where-Object Name -like 'coscaprobe*' | ForEach-Object { Write-Host "DIR $($_.FullName)" }
           Get-LocalUser | Where-Object Name -like 'coscaprobe*' | ForEach-Object { Write-Host "ACCOUNT $($_.Name)" }
-          foreach ($e in Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'Microsoft-Windows-User Profile Service' } -ErrorAction SilentlyContinue) {
+          foreach ($e in Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'Microsoft-Windows-User Profiles Service' } -ErrorAction SilentlyContinue) {
             Write-Host "EVENT id=$($e.Id) $($e.TimeCreated.ToString('o')) props=[$(($e.Properties | ForEach-Object { "$($_.Value)" }) -join ' | ')]"
           }

@@ -88,7 +88,7 @@ public static class P629 {
 
 $scenarios = 'logonuser-interactive', 'logonuser-network', 'cpwl-profile', 'cpwl-noprofile', 'cpwl-profile-l2',
     'cpwl-profile-elevate-l2', 'own-load-l2', 'own-load-elevate-l2', 'startprocess', 'startprocess-loadprofile',
-    'startprocess-elevate', 'startprocess-elevate-l2'
+    'startprocess-elevate', 'startprocess-elevate-l2', 'startprocess-elevate-m1', 'cpwl-profile-elevate-m1'
 $index = [array]::IndexOf($scenarios, $scenario)
 if ($index -lt 0) { throw "unknown scenario $scenario" }
 $account = 'c629s{0:d2}' -f $index
@@ -130,12 +130,40 @@ function State([string]$label, [string]$sid) {
     $s
 }
 
+# M1: every handle that names the account's SID or the account (Token handles read `<computer>\<account>:<luid>`).
+function Holders([string]$label, [string]$sid) {
+    $exe = @{ AMD64 = 'handle64.exe'; ARM64 = 'handle64a.exe' }[$env:PROCESSOR_ARCHITECTURE]
+    $path = Join-Path C:\c629-tools $exe
+    if (-not (Test-Path $path)) {
+        New-Item -ItemType Directory -Force C:\c629-tools | Out-Null
+        Invoke-WebRequest -Method Get -Uri https://download.sysinternals.com/files/Handle.zip -OutFile C:\c629-tools\Handle.zip
+        Expand-Archive C:\c629-tools\Handle.zip C:\c629-tools -Force
+        $sig = Get-AuthenticodeSignature $path
+        if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notlike '*Microsoft Corporation*') { throw "handle signature: $($sig.Status) $($sig.SignerCertificate.Subject)" }
+    }
+    $all = & $path -accepteula -nobanner -a -u 2>&1
+    $current = ''
+    $hits = foreach ($line in $all) {
+        if ($line -match '^\S.*pid: \d+') { $current = $line.Trim(); continue }
+        if ($line -like "*$sid*" -or $line -like "*\$account*") { "$current :: $($line.Trim())" }
+    }
+    Write-Host "HOLDERS[$label] $($hits.Count) handles (handle.exe exit $LASTEXITCODE, $($all.Count) lines)"
+    foreach ($h in $hits) { Write-Host "HOLDER[$label] $h" }
+    $log["holders-$label"] = @($hits)
+    foreach ($ls in Get-CimInstance Win32_LogonSession) {
+        $users = @(Get-CimAssociatedInstance -InputObject $ls -Association Win32_LoggedOnUser -ErrorAction SilentlyContinue | ForEach-Object Name)
+        if ($users -contains $account) { Write-Host "LOGONSESSION[$label] id=$($ls.LogonId) type=$($ls.LogonType) pkg=$($ls.AuthenticationPackage) start=$($ls.StartTime)" }
+    }
+}
+
 function Events {
     $out = @()
     foreach ($f in @(
-            @{ LogName = 'Application'; ProviderName = 'Microsoft-Windows-User Profile Service'; StartTime = $start },
+            @{ LogName = 'Application'; ProviderName = 'Microsoft-Windows-User Profiles Service'; StartTime = $start },
+            @{ LogName = 'Application'; ProviderName = 'Microsoft-Windows-User Profiles General'; StartTime = $start },
             @{ LogName = 'Microsoft-Windows-User Profile Service/Operational'; StartTime = $start })) {
-        foreach ($e in Get-WinEvent -FilterHashtable $f -ErrorAction SilentlyContinue | Sort-Object TimeCreated) {
+        $found = try { @(Get-WinEvent -FilterHashtable $f -ErrorAction Stop) } catch { Write-Host "EVENTQUERY $($f.LogName)/$($f.ProviderName): $_"; @() }
+        foreach ($e in $found | Sort-Object TimeCreated) {
             $props = ($e.Properties | ForEach-Object { "$($_.Value)" }) -join ' | '
             $line = "$($e.LogName) id=$($e.Id) $($e.TimeCreated.ToString('o')) props=[$props]"
             Write-Host "EVENT $line"
@@ -252,6 +280,20 @@ switch ($scenario) {
         Step 'Start-Process -Credential, elevating child' (StartProcessShape $elevCmd $false)
         State 'after-logon' $sid | Out-Null; BaselineCleanup
     }
+    'startprocess-elevate-m1' {
+        Holders 'before' $sid
+        Step 'Start-Process -Credential, elevating child' (StartProcessShape $elevCmd $false)
+        State 'after-logon' $sid | Out-Null
+        Holders 'after-logon' $sid
+        BaselineCleanup
+        Holders 'after-cleanup' $sid
+    }
+    'cpwl-profile-elevate-m1' {
+        Step 'CreateProcessWithLogonW(LOGON_WITH_PROFILE), elevating child' ([P629]::Cpwl($account, $password, 1, $elevCmd))
+        State 'after-logon' $sid | Out-Null
+        Holders 'after-logon' $sid
+        BaselineCleanup
+    }
     'startprocess-elevate-l2' {
         Step 'Start-Process -Credential, elevating child' (StartProcessShape $elevCmd $false)
         State 'after-logon' $sid | Out-Null
@@ -266,6 +308,7 @@ switch ($scenario) {
 
 try { Remove-LocalUser $account; Step 'Remove-LocalUser' 'ok' } catch { Step 'Remove-LocalUser' "failed: $_" }
 $after = State 'after-delete' $sid
+if ($scenario -like '*-m1') { Holders 'after-delete' $sid }
 Events
 
 $imagePath = $log['after-logon'].profileImagePath, $log['after-child'].profileImagePath | Where-Object { $_ } | Select-Object -First 1
