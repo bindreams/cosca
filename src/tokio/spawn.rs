@@ -323,12 +323,15 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
             clippy::disallowed_methods,
             reason = "spawn_lock is held by `_guard` at the top of this function"
         )]
-        let (spawned, unique) = report.run(|| {
-            let spawned = tcmd.spawn();
-            #[cfg(test)]
-            let spawned = crate::child::spawn::fault::fail_tokio_spawn_after_fork(spawned);
-            spawned.map_err(Error::Io)
-        });
+        let (spawned, unique) = report.run(
+            || {
+                let spawned = tcmd.spawn();
+                #[cfg(test)]
+                let spawned = crate::child::spawn::fault::fail_tokio_spawn_after_fork(spawned);
+                spawned.map_err(Error::Io)
+            },
+            ::tokio::process::Child::id,
+        );
         let c = match spawned {
             Ok(c) => c,
             Err(e) => {
