@@ -479,7 +479,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             clippy::disallowed_methods,
             reason = "spawn_lock is held by `_guard`, taken at the top of this block"
         )]
-        let (spawned, unique) = report.run(|| std_cmd.spawn().map_err(Error::Io));
+        let (spawned, unique) = report.run(|| std_cmd.spawn().map_err(Error::Io), |c| Some(c.id()));
         // std collected the child of a spawn it failed, which never ran the program.
         let c = spawned
             .map_err(|e| unique_report::failed_spawn_error(e, &unique))
