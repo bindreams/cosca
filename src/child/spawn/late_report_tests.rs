@@ -215,7 +215,7 @@ pub(crate) struct Tree {
     /// Gives one byte once the grandchild runs.
     ready: std::io::PipeReader,
     /// The grandchild blocks reading this pipe until the writer is dropped.
-    hold: std::io::PipeWriter,
+    hold: Option<std::io::PipeWriter>,
     /// What the grandchild writes if it outlives the teardown, then EOF.
     out: std::io::PipeReader,
 }
@@ -240,7 +240,14 @@ pub(crate) fn tree_pipes() -> (Tree, [(i32, crate::stdio::Stdio); 3]) {
         (4, child_end(hold_r.into())),
         (5, child_end(out_w.into())),
     ];
-    (Tree { ready, hold, out }, ends)
+    (
+        Tree {
+            ready,
+            hold: Some(hold),
+            out,
+        },
+        ends,
+    )
 }
 
 impl Tree {
@@ -289,6 +296,11 @@ impl Tree {
         assert_eq!(n, 1, "the grandchild must run before the teardown");
     }
 
+    /// Lets the grandchild run on, so it and its root exit by themselves.
+    pub(crate) fn release(&mut self) {
+        self.hold = None;
+    }
+
     /// Releases the grandchild, and answers whether it was still alive to say so.
     pub(crate) fn grandchild_survived(self) -> bool {
         use std::io::Read;
@@ -335,7 +347,80 @@ fn macos_sync_spawn_of_a_late_contained_child_kills_its_tree() {
         "the late child's grandchild must be killed"
     );
     assert_eq!(fate, ChildFate::Reaped, "the root is killed and reaped");
-    assert_one_warn(id.pid(), mark, &[SAID_REAPED], &["tree was not"]);
+    assert_one_warn(id.pid(), mark, &[SAID_REAPED], &["tree was not", "fully killed"]);
+}
+
+/// A late [`TREE_ARGV`] child under `TreeWalk` without a marker, whose first tree sweep is spoiled by
+/// `spoil`, armed once the grandchild runs. Answers the root's pid, its fate, whether the grandchild
+/// survived the teardown, and the log mark taken before the spawn.
+fn late_tree_walk(spoil: impl FnOnce() + 'static) -> (u32, ChildFate, bool, usize) {
+    use crate::containment::ContainMode;
+    crate::log_capture::install();
+    let (tree, ends) = tree_pipes();
+    let mut cmd = crate::Command::new();
+    cmd.args(TREE_ARGV).contain_with(ContainMode::TreeWalk);
+    cmd.suppress_fd_marker();
+    for (fd, end) in ends {
+        cmd.fd(fd, end).expect("set the fd");
+    }
+    let tree = Rc::new(std::cell::RefCell::new(Some(tree)));
+    let _hook = crate::child::spawn::fault::set_at(crate::child::spawn::fault::SpawnPoint::BeforeLateTeardown, {
+        let tree = Rc::clone(&tree);
+        move || {
+            tree.borrow_mut().as_mut().expect("the tree").await_grandchild();
+            spoil();
+        }
+    });
+    let mark = crate::log_capture::mark();
+    let err = {
+        let _late = unique_report::seams::find_the_report_unwritten();
+        cmd.spawn().expect_err("a late child is not adopted")
+    };
+    let (_err, fate) = crate::child::spawn::failure::expect_may_have_started_with(err);
+    let Some(crate::identity::Resolved::Found(id)) = crate::child::spawn::fault::take_captured() else {
+        panic!("the spawn captured the child");
+    };
+    let survived = tree.borrow_mut().take().expect("the tree").grandchild_survived();
+    (id.pid(), fate, survived, mark)
+}
+
+/// A walk that cannot take its snapshot kills nothing; the root's kill then reparents the grandchild
+/// to launchd, so the walk from the zombie finds nothing and succeeds. That success does not erase
+/// the first failure: the warn says the tree may not be fully killed.
+///
+/// Mutant: each sweep's result overwrites the last one's.
+#[skuld::test]
+fn macos_late_tree_walk_that_fails_before_the_root_kill_says_its_tree_may_be_left() {
+    let (pid, fate, survived, mark) =
+        late_tree_walk(|| crate::containment::enumerate::force_blind_snapshot_for_next_call(true));
+    assert!(survived, "a walk that could not take its snapshot kills nothing");
+    assert_eq!(fate, ChildFate::Reaped, "the root is killed and reaped");
+    assert_one_warn(
+        pid,
+        mark,
+        &[SAID_REAPED, "its tree may not be fully killed", "test fault injected"],
+        &[],
+    );
+}
+
+/// A walk that left a member it could not kill is not a complete kill, though it returns `Ok`: the
+/// warn says so, even when a later walk is complete.
+///
+/// Mutant: the sweep reads only the walk's `Ok`, not whether it was complete.
+#[skuld::test]
+fn macos_late_tree_walk_that_leaves_a_member_says_its_tree_may_be_left() {
+    let (pid, fate, _, mark) = late_tree_walk(crate::containment::treewalk::fault::force_incomplete_once);
+    assert_eq!(fate, ChildFate::Reaped, "the root is killed and reaped");
+    assert_one_warn(
+        pid,
+        mark,
+        &[
+            SAID_REAPED,
+            "its tree may not be fully killed",
+            "a member could not be killed",
+        ],
+        &[],
+    );
 }
 
 /// A Session child without a marker, held between its report and its `setsid`, is torn down with
@@ -343,9 +428,11 @@ fn macos_sync_spawn_of_a_late_contained_child_kills_its_tree() {
 /// kill and the root's lets the child run on, `setsid`, `exec` and fork its grandchild, and waits
 /// until the grandchild runs. Only a kill of the group once the root is dead reaches the grandchild.
 /// Runs in a process of its own with fds 0 and 1 closed, so the report is late for real and the
-/// child can be held before its `setsid` while the spawn goes on.
+/// child can be held before its `setsid` while the spawn goes on. The hook between the root's kill
+/// and its wait releases the grandchild when no kill was sent, so the root exits and the missing kill
+/// fails an assertion instead of hanging the wait.
 ///
-/// Mutant: the late teardown kills the tree only before the root's kill.
+/// Mutants: the late teardown kills the tree only before the root's kill; the root's kill is not sent.
 #[skuld::test]
 fn macos_late_session_child_without_a_marker_is_torn_down_with_what_it_starts_after_its_report() {
     use crate::containment::ContainMode;
@@ -369,11 +456,33 @@ fn macos_late_session_child_without_a_marker_is_torn_down_with_what_it_starts_af
         cmd.fd(fd, end).expect("set the fd");
     }
     let tree = Rc::new(std::cell::RefCell::new(Some(tree)));
+    let root = Rc::new(Cell::new(None));
     let _hook = crate::child::spawn::fault::set_at(crate::child::spawn::fault::SpawnPoint::BeforeLateRootKill, {
-        let tree = Rc::clone(&tree);
+        let (tree, root) = (Rc::clone(&tree), Rc::clone(&root));
         move || {
+            root.set(Some(crate::child::spawn::fault::spawn_pid()));
             unique_report::seams::release_the_child_after_its_report();
             tree.borrow_mut().as_mut().expect("the tree").await_grandchild();
+        }
+    });
+    let sent = Rc::new(crate::send_log::Capture::start());
+    let kill_missing = Rc::new(Cell::new(false));
+    let _release = crate::child::spawn::fault::set_between_kill_and_wait({
+        let (tree, root, sent, missing) = (
+            Rc::clone(&tree),
+            Rc::clone(&root),
+            Rc::clone(&sent),
+            Rc::clone(&kill_missing),
+        );
+        move || {
+            let root = root
+                .get()
+                .expect("the root's kill comes after the first kill of its tree");
+            let kill = (root, crate::signal::Sig::Kill, crate::send_log::Via::Pid);
+            if !sent.entries().contains(&kill) {
+                missing.set(true);
+                tree.borrow_mut().as_mut().expect("the tree").release();
+            }
         }
     });
     let mark = crate::log_capture::mark();
@@ -383,6 +492,7 @@ fn macos_late_session_child_without_a_marker_is_torn_down_with_what_it_starts_af
     let spawned = cmd.spawn();
     drop(restore);
     drop((held, after));
+    assert!(!kill_missing.get(), "the root's kill must be sent before its wait");
     let err = spawned.expect_err("a late child is not adopted");
     let (_err, fate) = crate::child::spawn::failure::expect_may_have_started_with(err);
     let Some(crate::identity::Resolved::Found(id)) = crate::child::spawn::fault::take_captured() else {
@@ -398,7 +508,7 @@ fn macos_late_session_child_without_a_marker_is_torn_down_with_what_it_starts_af
         id.pid(),
         mark,
         &[SAID_REAPED],
-        &["tree was not", "not shown an unreaped zombie"],
+        &["tree was not", "fully killed", "not shown an unreaped zombie"],
     );
 }
 
@@ -446,8 +556,8 @@ fn macos_sync_spawn_of_a_late_child_reaped_before_its_teardown_kills_its_marked_
     assert_one_warn(
         id.pid(),
         mark,
-        &[SAID_NOT_SENT, "only its marker's holders were killed"],
-        &["was sent SIGKILL", "not fully killed", "tree was not killed"],
+        &[SAID_NOT_SENT, "reached only through its marker's holders"],
+        &["was sent SIGKILL", "fully killed", "tree was not killed"],
     );
 }
 
