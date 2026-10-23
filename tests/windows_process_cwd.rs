@@ -113,6 +113,28 @@ fn a_drive_relative_current_dir_takes_the_drives_own_directory_as_win32_does(#[f
 }
 
 #[cfg(windows)]
+/// M12 (#156): a process cwd on a `subst` drive that is then removed, or re-pointed at another
+/// directory. A child spawned with `NULL` (std's route), and with the cwd string explicitly (std's
+/// and the raw backend's), reports its cwd string and what it finds there. Records `M12` lines;
+/// asserts only that the probe entered the drive.
+///
+/// System-affecting: the probe maps a drive letter for the logon session, so it is the
+/// `DRIVE_MAPPING` group.
+#[skuld::test]
+fn m12_a_cwd_on_a_removed_or_repointed_subst(#[fixture(drive_mapping)] _group: &Group) {
+    let report = probe("subst-cwd", env!("CARGO_BIN_EXE_cosca_testbin_cwd"));
+    for line in report.lines() {
+        println!("M12 {line}");
+    }
+    for key in ["removed_set", "repointed_set"] {
+        assert!(
+            report.lines().any(|line| line == format!("{key}=ok")),
+            "precondition: {key}=ok, the probe entered the mapped drive; full report:\n{report}"
+        );
+    }
+}
+
+#[cfg(windows)]
 /// A UNC `current_dir` runs the child there, plainly and verbatim; and against a verbatim UNC
 /// process cwd, `GetFullPathNameW` completes a rooted name and a `..` run as measured here.
 ///
