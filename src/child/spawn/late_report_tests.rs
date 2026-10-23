@@ -14,6 +14,7 @@ use super::identity_macos_tests::{
 use super::unique_report;
 use crate::error::ChildFate;
 use crate::identity::{uniq_fault, ReadPurpose, UniqRead};
+use crate::test_groups::{tracer_group, Group};
 use crate::wait::exit_only::seams::{force_peek_once, force_peeks};
 use crate::wait::exit_only::Peek;
 
@@ -116,6 +117,26 @@ fn macos_sync_spawn_of_a_late_reporting_child_kills_and_reaps_it_through_its_id(
     assert_one_warn(pid, mark, &[SAID_REAPED], &[SAID_REFUSED_RUNNING, SAID_NOT_SENT]);
 }
 
+/// Closes this process's fds 0 and 1, and asserts they are the lowest free numbers, so that std's
+/// close-on-exec pipe takes them: the child's stdio then closes that pipe before its hooks run, and
+/// std returns before them. A spawn that waited for `exec` instead would deadlock against a child
+/// held before its report, so this fails first.
+fn close_fds_0_and_1(done: &crate::test_own_process::Completion) -> crate::test_stdio::RestoreStdio {
+    use std::os::fd::AsRawFd;
+    let restore = crate::test_stdio::RestoreStdio::close(done, &[0, 1]);
+    let (read, write) = std::io::pipe().expect("pipe");
+    let fds = [read.as_raw_fd(), write.as_raw_fd()];
+    drop((read, write));
+    assert_eq!(fds, [0, 1], "precondition: a new pipe must take fds 0 and 1");
+    restore
+}
+
+/// The `stdout` for a spawn while fds 0 and 1 are closed: `/dev/null`, opened before the close so it
+/// lands above stdio, since a closed stdout cannot be inherited.
+fn null_stdout() -> crate::stdio::Stdio {
+    crate::stdio::Stdio::from_file(std::fs::File::open("/dev/null").expect("open /dev/null"))
+}
+
 /// With two of fds 0 to 2 closed in the parent, std's close-on-exec pipe takes a child's stdio number
 /// and std returns before the child's hooks run. The child's report hook waits until the parent's
 /// first read of the report has returned, so the report is late, and the spawn tears the child down.
@@ -126,7 +147,6 @@ fn macos_sync_spawn_of_a_late_reporting_child_kills_and_reaps_it_through_its_id(
 fn macos_sync_spawn_with_fds_0_and_1_closed_leaves_no_child_behind() {
     use crate::test_own_process::{own_process, test_path};
     use crate::test_spawn::spawn;
-    use crate::test_stdio::RestoreStdio;
 
     let Some(done) = own_process(
         test_path!(macos_sync_spawn_with_fds_0_and_1_closed_leaves_no_child_behind),
@@ -136,12 +156,10 @@ fn macos_sync_spawn_with_fds_0_and_1_closed_leaves_no_child_behind() {
     };
     crate::log_capture::install();
     let (mut cmd, writer) = sync_blocker();
-    // Opened before the close, so it lands above stdio: a closed stdout cannot be inherited.
-    let null = std::fs::File::open("/dev/null").expect("open /dev/null");
-    cmd.stdout(crate::stdio::Stdio::from_file(null)).expect("set stdout");
+    cmd.stdout(null_stdout()).expect("set stdout");
     // Opened before the close too, so the gate's ends are above stdio.
     let held = unique_report::seams::hold_the_report_until_the_first_read();
-    let restore = RestoreStdio::close(&done, &[0, 1]);
+    let restore = close_fds_0_and_1(&done);
     let spawned = cmd.spawn();
     drop(restore);
     drop(held);
@@ -226,9 +244,46 @@ pub(crate) fn tree_pipes() -> (Tree, [(i32, crate::stdio::Stdio); 3]) {
 }
 
 impl Tree {
-    /// Blocks until the grandchild runs. A root that died first closes the pipe, which fails here.
+    /// Blocks until the grandchild runs. Called from a spawn hook ([`fault::spawn_pid`] names the
+    /// root). The spawn holds a copy of the ready pipe's write end until it returns, so a root that
+    /// died first would not close the pipe: one kqueue watches the root's exit too, which fails here.
+    ///
+    /// [`fault::spawn_pid`]: crate::child::spawn::fault::spawn_pid
     pub(crate) fn await_grandchild(&mut self) {
         use std::io::Read;
+        use std::os::fd::AsRawFd;
+
+        use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
+
+        let root = crate::child::spawn::fault::spawn_pid();
+        let kq = Kqueue::new().expect("kqueue");
+        let add = |ident: usize, filter, fflags| {
+            let change = KEvent::new(ident, filter, EvFlags::EV_ADD | EvFlags::EV_RECEIPT, fflags, 0, 0);
+            crate::wait::backend::add_with_receipt(&kq, change).expect("register with the kqueue")
+        };
+        let read = add(
+            self.ready.as_raw_fd() as usize,
+            EventFilter::EVFILT_READ,
+            FilterFlag::empty(),
+        );
+        assert_eq!(read, 0, "watch the ready pipe: errno {read}");
+        let exit = add(root as usize, EventFilter::EVFILT_PROC, FilterFlag::NOTE_EXIT);
+        assert_eq!(
+            exit, 0,
+            "the root {root} must be alive until its grandchild runs: errno {exit}"
+        );
+        let blank = KEvent::new(0, EventFilter::EVFILT_READ, EvFlags::empty(), FilterFlag::empty(), 0, 0);
+        let mut events = [blank; 2];
+        let n = loop {
+            match kq.kevent(&[], &mut events, None) {
+                Err(nix::errno::Errno::EINTR) => continue,
+                other => break other.expect("wait for the grandchild or the root's exit"),
+            }
+        };
+        assert!(
+            events[..n].iter().any(|e| e.filter() == Ok(EventFilter::EVFILT_READ)),
+            "the root {root} exited before its grandchild ran"
+        );
         let mut byte = [0u8; 1];
         let n = self.ready.read(&mut byte).expect("read the ready pipe");
         assert_eq!(n, 1, "the grandchild must run before the teardown");
@@ -281,6 +336,177 @@ fn macos_sync_spawn_of_a_late_contained_child_kills_its_tree() {
     );
     assert_eq!(fate, ChildFate::Reaped, "the root is killed and reaped");
     assert_one_warn(id.pid(), mark, &[SAID_REAPED], &["tree was not"]);
+}
+
+/// A Session child without a marker, held between its report and its `setsid`, is torn down with
+/// what it starts after that. The first kill of its tree finds no group yet; the hook between that
+/// kill and the root's lets the child run on, `setsid`, `exec` and fork its grandchild, and waits
+/// until the grandchild runs. Only a kill of the group once the root is dead reaches the grandchild.
+/// Runs in a process of its own with fds 0 and 1 closed, so the report is late for real and the
+/// child can be held before its `setsid` while the spawn goes on.
+///
+/// Mutant: the late teardown kills the tree only before the root's kill.
+#[skuld::test]
+fn macos_late_session_child_without_a_marker_is_torn_down_with_what_it_starts_after_its_report() {
+    use crate::containment::ContainMode;
+    use crate::test_own_process::{own_process, test_path};
+    use crate::test_spawn::spawn;
+
+    let Some(done) = own_process(
+        test_path!(macos_late_session_child_without_a_marker_is_torn_down_with_what_it_starts_after_its_report),
+        spawn,
+    ) else {
+        return;
+    };
+    crate::log_capture::install();
+    let (tree, ends) = tree_pipes();
+    let mut cmd = crate::Command::new();
+    cmd.args(TREE_ARGV).contain_with(ContainMode::Session);
+    cmd.suppress_fd_marker();
+    cmd.stdout(null_stdout()).expect("set stdout");
+    for (fd, end) in ends {
+        cmd.fd(fd, end).expect("set the fd");
+    }
+    let tree = Rc::new(std::cell::RefCell::new(Some(tree)));
+    let _hook = crate::child::spawn::fault::set_at(crate::child::spawn::fault::SpawnPoint::BeforeLateRootKill, {
+        let tree = Rc::clone(&tree);
+        move || {
+            unique_report::seams::release_the_child_after_its_report();
+            tree.borrow_mut().as_mut().expect("the tree").await_grandchild();
+        }
+    });
+    let mark = crate::log_capture::mark();
+    let held = unique_report::seams::hold_the_report_until_the_first_read();
+    let after = unique_report::seams::hold_the_child_after_its_report();
+    let restore = close_fds_0_and_1(&done);
+    let spawned = cmd.spawn();
+    drop(restore);
+    drop((held, after));
+    let err = spawned.expect_err("a late child is not adopted");
+    let (_err, fate) = crate::child::spawn::failure::expect_may_have_started_with(err);
+    let Some(crate::identity::Resolved::Found(id)) = crate::child::spawn::fault::take_captured() else {
+        panic!("the spawn captured the child");
+    };
+    let tree = tree.borrow_mut().take().expect("the tree");
+    assert!(
+        !tree.grandchild_survived(),
+        "the grandchild the child started after its first tree kill must be killed"
+    );
+    assert_eq!(fate, ChildFate::Reaped, "the root is killed and reaped");
+    assert_one_warn(
+        id.pid(),
+        mark,
+        &[SAID_REAPED],
+        &["tree was not", "not shown an unreaped zombie"],
+    );
+}
+
+/// A contained child whose report came late, and that is reaped before its teardown: its pid names
+/// nothing of its own any more, but its fd marker still names its tree, so the grandchild that holds
+/// the marker is killed. The hook before the teardown waits until the grandchild runs, then kills
+/// and reaps the root, as a host that ignores `SIGCHLD` would reap it.
+///
+/// Mutant: a late root that is gone leaves its tree running.
+#[skuld::test]
+fn macos_sync_spawn_of_a_late_child_reaped_before_its_teardown_kills_its_marked_tree() {
+    crate::log_capture::install();
+    let (tree, ends) = tree_pipes();
+    let mut cmd = crate::Command::new();
+    cmd.args(TREE_ARGV).contain();
+    for (fd, end) in ends {
+        cmd.fd(fd, end).expect("set the fd");
+    }
+    let tree = Rc::new(std::cell::RefCell::new(Some(tree)));
+    let _hook = crate::child::spawn::fault::set_at(crate::child::spawn::fault::SpawnPoint::BeforeLateTeardown, {
+        let tree = Rc::clone(&tree);
+        move || {
+            tree.borrow_mut().as_mut().expect("the tree").await_grandchild();
+            let root = crate::child::spawn::fault::spawn_pid();
+            // SAFETY: the root is this test's own unreaped child.
+            assert_eq!(unsafe { libc::kill(root as libc::pid_t, libc::SIGKILL) }, 0);
+            reap_by_pid(root);
+        }
+    });
+    let mark = crate::log_capture::mark();
+    let err = {
+        let _late = unique_report::seams::find_the_report_unwritten();
+        cmd.spawn().expect_err("a late child is not adopted")
+    };
+    let (_err, fate) = crate::child::spawn::failure::expect_may_have_started_with(err);
+    let Some(crate::identity::Resolved::Found(id)) = crate::child::spawn::fault::take_captured() else {
+        panic!("the spawn captured the child");
+    };
+    let tree = tree.borrow_mut().take().expect("the tree");
+    assert!(
+        !tree.grandchild_survived(),
+        "the grandchild that holds the marker must be killed"
+    );
+    assert_eq!(fate, ChildFate::Gone, "the root was reaped before the teardown");
+    assert_one_warn(
+        id.pid(),
+        mark,
+        &[SAID_NOT_SENT, "only its marker's holders were killed"],
+        &["was sent SIGKILL", "not fully killed", "tree was not killed"],
+    );
+}
+
+/// A child a tracer holds while its report is still unwritten is not taken for dead: the parent's
+/// `waitid` answers `ECHILD` for it, yet this process forked it, so the spawn waits on, and the
+/// report it writes once released is late, not missing. The helper attaches after the spawn's first
+/// read of the report, and the report is released when the wait first blocks. The child is torn down
+/// through its id, and the helper hands its zombie back.
+/// Runs in a process of its own with fds 0 and 1 closed, so the child can be held before its report
+/// while the spawn goes on.
+///
+/// Mutant: `ECHILD` in the wait is taken for the child gone, so the spawn answers it died before
+/// `exec` (`NotStarted`).
+#[skuld::test]
+fn macos_late_child_held_by_a_tracer_is_not_answered_dead(#[fixture(tracer_group)] _group: &Group) {
+    use crate::test_own_process::{own_process, test_path};
+    use crate::test_spawn::spawn;
+    use crate::test_support::tracer::{self, Mode, Report, TracerHelper};
+
+    let Some(done) = own_process(
+        test_path!(macos_late_child_held_by_a_tracer_is_not_answered_dead),
+        spawn,
+    ) else {
+        return;
+    };
+    crate::log_capture::install();
+    let pending = Rc::new(std::cell::RefCell::new(Some(tracer::start(Mode::Auto))));
+    let helper: Rc<std::cell::RefCell<Option<TracerHelper<'static>>>> = Rc::default();
+    let (mut cmd, writer) = sync_blocker();
+    cmd.stdout(null_stdout()).expect("set stdout");
+    let _attach = unique_report::seams::on_first_read({
+        let helper = Rc::clone(&helper);
+        move |pid| {
+            let pending = pending.borrow_mut().take().expect("the helper");
+            let mut attached = pending.attach_unheld(pid);
+            assert_eq!(attached.recv(), Report::Attached);
+            *helper.borrow_mut() = Some(attached);
+        }
+    });
+    let _release = unique_report::seams::on_each_block(|n, _| {
+        if n == 1 {
+            unique_report::seams::release_the_report();
+        }
+    });
+    let held = unique_report::seams::hold_the_report();
+    let restore = close_fds_0_and_1(&done);
+    let spawned = cmd.spawn();
+    drop(restore);
+    drop(held);
+    let err = spawned.expect_err("a late child is not adopted");
+    let (_err, fate) = crate::child::spawn::failure::expect_may_have_started_with(err);
+    assert_eq!(
+        fate,
+        ChildFate::Reaped,
+        "the late child is killed, handed back and reaped"
+    );
+    let mut helper = helper.borrow_mut().take().expect("the helper attached");
+    assert_eq!(helper.recv(), Report::Reaped);
+    drop(helper);
+    drop(writer);
 }
 
 // The teardown's sentence =====

@@ -30,7 +30,11 @@ must wait is an `async fn`. Sync code may block, as sync Rust normally does.
 One exception: spawning blocks until `exec`, as tokio's own `Command::spawn` does. That includes
 cosca's placement report ([`ReportChannel::wait`](../src/containment/cgroup/channel.rs)), which
 completes before `exec`. The wait is bounded by the child's own progress to `exec`; a child stopped
-or stuck in D state between `fork` and `exec` holds the thread.
+or stuck in D state between `fork` and `exec` holds the thread. The wait for macOS's unique-id
+report ([`unique_report::await_report`](../src/child/spawn/unique_report.rs)) is bounded the same
+way, with an accepted residual: if something else reaps the child and another child of this process
+takes its pid, the wait lasts as long as that process. It holds `spawn_lock`, so it stalls every
+other cosca spawn meanwhile.
 
 [`SuspendedChild::resume`](../src/tokio/child/suspended.rs) is the deferred second half of a spawn,
 so the exception covers it, and it is a sync `fn`. On Windows it walks the system's thread snapshot
