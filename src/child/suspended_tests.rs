@@ -408,6 +408,11 @@ mod on_windows {
         let mut cmd = blocker(false);
         drop(cmd.spawn_suspended().expect("spawn suspended"));
 
+        // A spawn takes the stdio configuration out of the command. Without its own piped stdin the
+        // second blocker would read the harness's stdin and, where that is at EOF, exit at once.
+        cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
+        cmd.stdout(crate::Stdio::null()).expect("stdout null");
+        cmd.stderr(crate::Stdio::null()).expect("stderr null");
         let child = crate::child::spawn::spawn_uncommitted(&mut cmd).expect("an ordinary spawn");
 
         assert_eq!(

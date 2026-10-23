@@ -18,9 +18,9 @@ use windows::Win32::System::JobObjects::{
 use windows::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
 use windows::Win32::System::Memory::{VirtualAllocEx, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
 use windows::Win32::System::Threading::{
-    CreateRemoteThread, GetThreadId, OpenProcess, OpenThread, ResumeThread, SuspendThread, TerminateProcess,
-    WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED, INFINITE, LPTHREAD_START_ROUTINE, PROCESS_SYNCHRONIZE,
-    PROCESS_TERMINATE, THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME,
+    CreateRemoteThread, GetThreadId, GetThreadTimes, OpenProcess, OpenThread, ResumeThread, SuspendThread,
+    TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED, INFINITE, LPTHREAD_START_ROUTINE,
+    PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME,
 };
 
 use crate::containment::windows::JobHandle;
@@ -37,14 +37,16 @@ pub(crate) fn spawn_suspended_blocker() -> std::process::Child {
     crate::test_spawn::spawn(&mut cmd).expect("spawn a suspended blocker")
 }
 
-/// The initial thread of a process that is still alive, held by handle. Opened while the caller's
-/// own handle on the process pins the pid. The handle is live, owned and closed once, with suspend
-/// rights, for as long as the value exists.
+/// The initial thread of a process that is still alive, held by handle: its earliest-created
+/// thread, the product's rule. Opened while the caller's own handle on the process pins the pid.
+/// The handle is live, owned and closed once, with suspend rights, for as long as the value exists.
 pub(crate) struct InitialThread(HANDLE);
 
 impl InitialThread {
     pub(crate) fn of(pid: u32) -> InitialThread {
-        // SAFETY: standard Win32 snapshot walk; the snapshot handle is closed before return.
+        let mut earliest: Option<(u64, HANDLE)> = None;
+        // SAFETY: standard Win32 snapshot walk; the snapshot handle is closed before return, and
+        // every thread handle is either kept in `earliest` or closed.
         unsafe {
             let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0).expect("thread snapshot");
             let mut entry = THREADENTRY32 {
@@ -54,20 +56,32 @@ impl InitialThread {
             let mut step = Thread32First(snap, &mut entry);
             while step.is_ok() {
                 if entry.th32OwnerProcessID == pid {
-                    let thread = OpenThread(
+                    // A thread that has exited since the snapshot cannot be the initial one of a live child.
+                    if let Ok(thread) = OpenThread(
                         THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION,
                         false,
                         entry.th32ThreadID,
-                    )
-                    .expect("open the initial thread");
-                    _ = CloseHandle(snap);
-                    return InitialThread(thread);
+                    ) {
+                        let (mut created, mut exited, mut kernel, mut user) = Default::default();
+                        GetThreadTimes(thread, &mut created, &mut exited, &mut kernel, &mut user)
+                            .expect("read the thread's creation time");
+                        let created = (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
+                        match earliest {
+                            Some((best, _)) if best <= created => _ = CloseHandle(thread),
+                            _ => {
+                                if let Some((_, older)) = earliest.replace((created, thread)) {
+                                    _ = CloseHandle(older);
+                                }
+                            }
+                        }
+                    }
                 }
                 step = Thread32Next(snap, &mut entry);
             }
             _ = CloseHandle(snap);
         }
-        panic!("pid {pid} has no thread in the snapshot");
+        let (_, thread) = earliest.unwrap_or_else(|| panic!("pid {pid} has no openable thread in the snapshot"));
+        InitialThread(thread)
     }
 
     /// The thread id.
