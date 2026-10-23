@@ -2,7 +2,7 @@
 
 use super::observe;
 use crate::containment::dispatch::{attach, Attachment, Prepared};
-use crate::containment::windows::{guard_armed_flags, guard_released_flags};
+use crate::containment::windows::guard_armed_flags;
 use crate::containment::ContainMode;
 use crate::test_frozen::{raw, spawn_suspended_blocker, InitialThread};
 
@@ -60,8 +60,15 @@ fn release_leaves_breakaway_permitted_and_kill_on_close_cleared() {
 
     frozen.release_process(raw(&child)).expect("release");
 
+    use windows::Win32::System::JobObjects::{JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK};
     let released = observe::take_guard_flags_after_release().expect("the seam saw the released guard");
-    assert_eq!(released.0, guard_released_flags().0);
+    // Literals, not `guard_released_flags()`: the production function cannot vouch for itself.
+    // Without `SILENT_BREAKAWAY_OK` every descendant of the resumed child would stay in the guard.
+    assert_eq!(
+        released.0,
+        JOB_OBJECT_LIMIT_BREAKAWAY_OK.0 | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK.0,
+        "released: no KILL_ON_JOB_CLOSE, breakaway and silent breakaway permitted"
+    );
     drop(attachment);
     child.kill().expect("kill");
     child.wait().expect("reap");
