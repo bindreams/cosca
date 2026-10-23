@@ -1,0 +1,12 @@
+diff --git a/src/child/spawn/unique_report.rs b/src/child/spawn/unique_report.rs
+index e9f8e9d5..e4275c5f 100644
+--- a/src/child/spawn/unique_report.rs
++++ b/src/child/spawn/unique_report.rs
+@@ -147,6 +147,7 @@ impl Channel {
+         seams::first_read_done();
+         let report = match (first, spawned.as_ref().ok().map(pid_of)) {
+             (Report::Unwritten, Some(Some(pid))) => await_report(&read_end, pid),
++            (Report::Unwritten, None) => await_report(&read_end, 1),
+             (Report::Unwritten, Some(None)) => {
+                 debug_assert!(false, "a freshly spawned child has a pid");
+                 Report::Unwritten

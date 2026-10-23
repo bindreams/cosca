@@ -1,0 +1,52 @@
+# Throwaway: runs each named mutant's target tests on macOS, expecting them to fail, and the
+# unmutated tree's, expecting them to pass. Never merged.
+name: Mutants
+
+on:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  COSCA_TEST_ROOT: "0"
+  COSCA_TEST_UID_SWITCH: "0"
+  COSCA_TEST_NAMESPACES: "0"
+  COSCA_TEST_TRACER: "0"
+  COSCA_TEST_SETUID: "0"
+  COSCA_TEST_CGROUP: "0"
+  COSCA_TEST_ELEVATION: "0"
+
+jobs:
+  mutant:
+    name: ${{ matrix.name }}
+    runs-on: macos-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: baseline
+            filter: "test(/a_failed_spawn_reads_the_report_once|says_the_callers_words|attach_failure_teardown_says_a_child_left_running_stays_a_zombie|late_contained_child_kills_its_tree|unique_report_tests::awaiting_|fds_0_and_1_closed_leaves_no_child_behind/)"
+          - name: m1-wait-after-failed-spawn
+            filter: "test(/a_failed_spawn_reads_the_report_once/)"
+          - name: m3-sync-caller-says-nothing
+            filter: "test(/attach_failure_teardown_says_a_child_left_running_stays_a_zombie/)"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: ./.github/actions/setup-rust
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
+        with:
+          tool: cargo-nextest@0.9.148
+      - name: Apply the mutant
+        if: matrix.name != 'baseline'
+        run: git apply ".github/mutants/${{ matrix.name }}.patch"
+      - name: Run the target tests
+        shell: bash
+        run: |
+          set +e
+          cargo nextest run --locked --features tokio --no-fail-fast --no-tests=fail -E '${{ matrix.filter }}'
+          code=$?
+          echo "nextest exit: $code"
+          if [ "${{ matrix.name }}" = baseline ]; then exit "$code"; fi
+          # A mutant must fail its tests (exit 100), not pass or fail to build.
+          [ "$code" -eq 100 ]

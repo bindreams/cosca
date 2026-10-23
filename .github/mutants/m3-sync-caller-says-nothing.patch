@@ -1,0 +1,13 @@
+diff --git a/src/child/spawn.rs b/src/child/spawn.rs
+index d2fa4dd9..332cc594 100644
+--- a/src/child/spawn.rs
++++ b/src/child/spawn.rs
+@@ -745,7 +745,7 @@ fn leave_front_after_attach_failure(child: std::process::Child) -> FrontFate {
+ #[cfg(target_os = "macos")]
+ fn teardown_after_attach_failure(child: std::process::Child, unique: u64, id: ProcessId) -> ChildFate {
+     // The `std` `Child` reaps nothing when dropped: a child still running stays a zombie.
+-    let fate = kill_and_reap_verified(child.id(), unique, Some(id), ZOMBIE_NOTE);
++    let fate = kill_and_reap_verified(child.id(), unique, Some(id), "");
+     drop(child);
+     fate
+ }
