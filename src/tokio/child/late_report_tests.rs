@@ -294,5 +294,5 @@ async fn macos_tokio_spawn_of_a_late_contained_child_kills_its_tree() {
         "the late child's grandchild must be killed"
     );
     assert_eq!(fate, ChildFate::Reaped, "the root is killed and reaped");
-    assert_one_warn(id.pid(), mark, &[SAID_REAPED, LEAKS], &["tree was not"]);
+    assert_one_warn(id.pid(), mark, &[SAID_REAPED, LEAKS], &["tree was not", "fully killed"]);
 }
