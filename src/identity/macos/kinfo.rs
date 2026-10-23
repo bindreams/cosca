@@ -1,7 +1,7 @@
 //! `sysctl(KERN_PROC_PID)` / `kinfo_proc` — the BSD interface that resolves ZOMBIES and
 //! EPERM-hidden cross-user processes (libproc's `proc_pidinfo` does not). libc has no apple
 //! definition for these structs, so this is a minimal faithful local one. Only
-//! `p_un.p_starttime`, `p_stat`, and `eproc.e_ppid` are read, and in tests `eproc.e_jobc`;
+//! `p_un.p_starttime`, `p_stat`, `p_oppid` and `eproc.e_ppid` are read, and in tests `eproc.e_jobc`;
 //! everything else is layout.
 //! Layout is triple-checked: the compile-time size tripwires below, the kernel-size oracle,
 //! and the token-vs-libproc / ppid-vs-libproc oracles (kinfo_tests.rs).
@@ -68,7 +68,8 @@ pub(crate) struct extern_proc {
     pub(crate) p_flag: libc::c_int,
     pub(crate) p_stat: libc::c_char,
     pub(crate) p_pid: libc::pid_t,
-    p_oppid: libc::pid_t,
+    /// The parent at a tracer's attach, which the tracer's detach restores (xnu `mach_process.c`).
+    pub(crate) p_oppid: libc::pid_t,
     p_dupfd: libc::c_int,
     user_stack: u64,
     exit_thread: u64,
