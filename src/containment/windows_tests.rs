@@ -912,9 +912,8 @@ fn resume_initial_threads_leaves_a_thread_someone_else_suspended_suspended() {
     child.wait().expect("the resumed blocker exits on stdin EOF");
 }
 
-/// The release resumes only the initial thread: another thread of the child is opened query-only,
-/// for its creation time, but never for suspend/resume or a suspend-count check, so a failure of
-/// that kind on it cannot fail a release of a child whose initial thread is frozen exactly once.
+/// The release's resume walk visits only the initial thread: another thread of the child is read
+/// for its creation time, but the walk's own `open_query` (`Step::QueryOpen`) is never made for it.
 /// The failure is armed for that thread alone, and the walk must leave it unconsumed.
 #[skuld::test]
 fn resume_initial_threads_visits_only_the_initial_thread() {
@@ -927,7 +926,7 @@ fn resume_initial_threads_visits_only_the_initial_thread() {
     let _forced = force_next_for_thread(Step::QueryOpen, ERROR_NOT_ENOUGH_MEMORY, other.tid());
 
     super::resume_initial_threads(crate::test_frozen::raw(&child), super::SuspendCount::ExactlyOne)
-        .expect("a thread that cannot be queried is not the initial one and must not fail the release");
+        .expect("the resume walk's open_query must not be made for a thread that is not the initial one");
 
     assert!(forced_is_armed(), "the walk opened the other thread");
     assert_eq!(initial.suspend_count(), 0, "the initial thread must run");

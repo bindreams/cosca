@@ -1355,8 +1355,9 @@ fn creation_time_if_owned(tid: u32, process_pid: u32) -> Result<Option<u64>, (&'
 /// created later has a later creation time. Thread ids say nothing about order, and the snapshot
 /// lists threads in no promised order.
 ///
-/// `None`, with the cause in `walk`, when the initial thread cannot be told: the creation time of a
-/// thread of the child cannot be read (it might be the earlier), or the earliest two are equal. The
+/// `None`, with the cause in `walk`, when the initial thread cannot be told: the snapshot lists no
+/// thread of the child, every listed thread is stale, the creation time of a thread of the child
+/// cannot be read (it might be the earlier), or the earliest two are equal. The
 /// clock was measured only on Windows 11 10.0.26100, where 300 threads started back to back in one
 /// process were 56 us or more apart; whether an older build's clock can tie is unmeasured, so a tie
 /// is a failure, never a guess by thread id.
