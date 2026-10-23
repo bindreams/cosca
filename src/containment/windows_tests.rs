@@ -763,14 +763,15 @@ fn process_pid_of_rejects_a_handle_that_names_no_process() {
 #[skuld::test]
 #[should_panic(expected = "live process handle")]
 fn resume_initial_threads_asserts_its_handle_contract_in_debug() {
-    _ = super::resume_initial_threads(std::ptr::null_mut());
+    _ = super::resume_initial_threads(std::ptr::null_mut(), super::SuspendCount::Any);
 }
 
 /// Release builds return the error instead. Runs in the release lane.
 #[cfg(not(debug_assertions))]
 #[skuld::test]
 fn resume_initial_threads_reports_a_broken_handle_contract_in_release() {
-    let err = super::resume_initial_threads(std::ptr::null_mut()).expect_err("a null handle names no process");
+    let err = super::resume_initial_threads(std::ptr::null_mut(), super::SuspendCount::Any)
+        .expect_err("a null handle names no process");
     assert!(err.to_string().contains("GetProcessId"), "{err}");
 }
 
@@ -789,7 +790,8 @@ fn resume_initial_threads_leaves_no_thread_suspended() {
     let thread = crate::test_frozen::InitialThread::of(child.id());
     assert_eq!(thread.suspend_count(), 1, "the child is created suspended");
 
-    super::resume_initial_threads(crate::test_frozen::raw(&child)).expect("resume a frozen child");
+    super::resume_initial_threads(crate::test_frozen::raw(&child), super::SuspendCount::ExactlyOne)
+        .expect("resume a frozen child");
 
     assert_eq!(thread.suspend_count(), 0, "the resumed child's initial thread must run");
     drop(child.stdin.take());
@@ -804,8 +806,8 @@ fn resume_initial_threads_fails_when_the_initial_thread_was_suspended_twice() {
     let thread = crate::test_frozen::InitialThread::of(child.id());
     thread.suspend_once();
 
-    let err =
-        super::resume_initial_threads(crate::test_frozen::raw(&child)).expect_err("the thread is still suspended");
+    let err = super::resume_initial_threads(crate::test_frozen::raw(&child), super::SuspendCount::ExactlyOne)
+        .expect_err("the thread is still suspended");
 
     let text = err.to_string();
     assert!(
@@ -820,15 +822,16 @@ fn resume_initial_threads_fails_when_the_initial_thread_was_suspended_twice() {
     dispose(child);
 }
 
-/// Something already ran the child (its count was 0): "ran no instruction" no longer holds, so
-/// resume must not report a clean success.
+/// Something already ran the child (its count was 0): "ran no instruction" no longer holds, so a
+/// frozen child's resume must not report a clean success.
 #[skuld::test]
 fn resume_initial_threads_fails_when_the_initial_thread_was_already_running() {
     let child = crate::test_frozen::spawn_suspended_blocker();
     let thread = crate::test_frozen::InitialThread::of(child.id());
     assert_eq!(thread.release_one(), 1);
 
-    let err = super::resume_initial_threads(crate::test_frozen::raw(&child)).expect_err("the child already ran");
+    let err = super::resume_initial_threads(crate::test_frozen::raw(&child), super::SuspendCount::ExactlyOne)
+        .expect_err("the child already ran");
 
     let text = err.to_string();
     assert!(
@@ -836,6 +839,36 @@ fn resume_initial_threads_fails_when_the_initial_thread_was_already_running() {
         "the error must name the count it found: {text}"
     );
     dispose(child);
+}
+
+/// The ordinary spawn's resume does not ask that the child was suspended exactly once: a thread
+/// something else already ran (a debugger's break-in thread, an EDR agent's) must not fail a
+/// `contain()` spawn that has always accepted it.
+#[skuld::test]
+fn resume_initial_threads_with_any_count_accepts_a_thread_that_was_already_running() {
+    let child = crate::test_frozen::spawn_suspended_blocker();
+    let thread = crate::test_frozen::InitialThread::of(child.id());
+    assert_eq!(thread.release_one(), 1);
+
+    super::resume_initial_threads(crate::test_frozen::raw(&child), super::SuspendCount::Any)
+        .expect("the ordinary resume accepts a running thread");
+
+    dispose(child);
+}
+
+/// The ordinary `contain()` attach, end to end: the same tolerance as above, through `attach_job`.
+#[skuld::test]
+fn death_watch_attach_job_succeeds_when_the_initial_thread_was_already_running() {
+    let mut child = crate::test_frozen::spawn_suspended_blocker();
+    let thread = crate::test_frozen::InitialThread::of(child.id());
+    assert_eq!(thread.release_one(), 1);
+
+    let job = super::attach_job(crate::test_frozen::raw(&child))
+        .expect("an ordinary attach must not fail on a running thread")
+        .expect("the job was assigned");
+
+    drop(job); // KILL_ON_JOB_CLOSE ends the child
+    child.wait().expect("the job's close killed the child");
 }
 
 /// `assign_held` assigns the job and does not resume: the thread stays frozen.

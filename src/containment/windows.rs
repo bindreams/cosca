@@ -1111,9 +1111,22 @@ pub(crate) enum Visit {
     Failed,
 }
 
+/// What a resume asks of the suspend count it answers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum SuspendCount {
+    /// Any count: the ordinary `contain()` spawn resumes whatever the snapshot lists and accepts a
+    /// thread something else already ran.
+    #[default]
+    Any,
+    /// Exactly 1 on every thread: a frozen child's release, where a thread that ran, or that
+    /// something else suspended again, means the child is not as its creator left it.
+    ExactlyOne,
+}
+
 /// The state of one walk over the snapshot.
 #[derive(Default)]
 struct Walk {
+    expected: SuspendCount,
     resumed: u32,
     /// The FIRST failure: it is the root cause, and later ones are logged as they happen.
     last_err: Option<io::Error>,
@@ -1267,6 +1280,10 @@ fn resume_if_owned(tid: u32, process_pid: u32, walk: &mut Walk) -> Visit {
             walk.resumed += 1;
             Visit::Resumed
         }
+        Ok(_) if walk.expected == SuspendCount::Any => {
+            walk.resumed += 1;
+            Visit::Resumed
+        }
         // Anything else leaves a process that is not running the way its creator left it. A count
         // above 1 is a thread still suspended after this resume (a debugger, an EDR agent or the
         // caller's own tooling suspended it in the window); 0 is a thread that was already
@@ -1324,6 +1341,7 @@ fn walk_verdict(process_pid: u32, walk: Walk) -> io::Result<()> {
         resumed,
         last_err,
         last_skip,
+        ..
     } = walk;
     if let Some(e) = last_err {
         log::warn!(
@@ -1346,9 +1364,14 @@ fn walk_verdict(process_pid: u32, walk: Walk) -> io::Result<()> {
 /// MUST be resumed — a frozen process is unacceptable. If `ResumeThread` fails
 /// the child is killed immediately and an error returned.
 ///
+/// `expected` is what each resume's previous suspend count must be; see [`SuspendCount`].
+///
 /// PID-reuse safety: the caller holds the child's process handle (via the owning
 /// `Child`), keeping its PID alive for the duration of the Toolhelp snapshot walk.
-pub(crate) fn resume_initial_threads(proc_handle: std::os::windows::io::RawHandle) -> io::Result<()> {
+pub(crate) fn resume_initial_threads(
+    proc_handle: std::os::windows::io::RawHandle,
+    expected: SuspendCount,
+) -> io::Result<()> {
     use windows::Win32::Foundation::ERROR_NO_MORE_FILES;
     use windows::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
@@ -1358,7 +1381,10 @@ pub(crate) fn resume_initial_threads(proc_handle: std::os::windows::io::RawHandl
 
     // Thread32First/Next signal end-of-enumeration with ERROR_NO_MORE_FILES.
     let end_of_walk = windows::core::HRESULT::from_win32(ERROR_NO_MORE_FILES.0);
-    let mut walk = Walk::default();
+    let mut walk = Walk {
+        expected,
+        ..Walk::default()
+    };
 
     let process_pid = process_pid_of(raw_handle);
     debug_assert!(
@@ -1422,7 +1448,7 @@ pub(crate) fn attach_job(proc_handle: std::os::windows::io::RawHandle) -> io::Re
     let job_result = assign_held(proc_handle);
 
     // Resume REGARDLESS of job assignment result. A frozen child cannot be left running.
-    if let Err(resume_err) = resume_initial_threads(proc_handle) {
+    if let Err(resume_err) = resume_initial_threads(proc_handle, SuspendCount::Any) {
         if let Ok(job) = job_result {
             // Kill via the job first (catches any threads the walk may have missed). The
             // resume failure is what gets reported; a kill failure on top of it cannot change

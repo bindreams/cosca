@@ -49,7 +49,7 @@ impl Frozen {
     /// only kill a running child. A guard whose release fails is dropped armed, so the OS ends the
     /// child; the caller tears it down all the same.
     pub(crate) fn release_process(self, proc_handle: RawHandle) -> io::Result<()> {
-        windows::resume_initial_threads(proc_handle)?;
+        windows::resume_initial_threads(proc_handle, windows::SuspendCount::ExactlyOne)?;
         let Some(guard) = self.guard else { return Ok(()) };
         #[cfg(test)]
         observe::record_guard_flags_after_resume(&guard);
