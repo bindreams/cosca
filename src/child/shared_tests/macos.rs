@@ -451,6 +451,47 @@ fn an_echild_for_a_pid_held_by_a_tracer_is_running() {
     );
 }
 
+/// A child whose tracer dies while the child is exiting: XNU sends the child's `NOTE_EXIT` and
+/// `SIGCHLD` to the tracer alone, then gives the child to launchd. The wait watches the tracer as
+/// well, and its `NOTE_EXIT` makes the wait peek again, which finds launchd holding the child:
+/// `Orphaned`. This process's own pid stands in for the child (`waitid` answers `ECHILD`, and its id
+/// resolves), and a blocker for the tracer; the parent read is forced: the stand-in while it runs,
+/// launchd once it has exited. The stand-in is this test's child, so its `SIGCHLD` wakes the wait
+/// too, and the assertion is on the tracer's `NOTE_EXIT` among the wait's events.
+///
+/// Mutant: the wait does not watch the tracer.
+#[skuld::test]
+fn a_wait_on_a_child_whose_tracer_dies_during_its_exit_is_woken_by_the_tracers_exit() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use crate::wait::backend::{await_reapable, Waited};
+    let (pid, unique) = echild_yet_resolvable();
+    let (mut tracer, tracer_stdin) = spawn_std_blocker();
+    let tracer_pid = tracer.id();
+    let exited = Rc::new(Cell::new(false));
+    let _parent = ppid_fault::force_ppid_with({
+        let exited = Rc::clone(&exited);
+        move || Ok(if exited.get() { LAUNCHD } else { tracer_pid })
+    });
+    let _end = test_hooks::on_kevent_round(0, move || {
+        drop(tracer_stdin);
+        crate::test_child::wait_until_zombie(tracer_pid);
+        exited.set(true);
+    });
+    let _ = test_hooks::take_events();
+    let waited = await_reapable(pid, Some(unique), None).expect("wait");
+    let events = test_hooks::take_events();
+    assert!(
+        events
+            .iter()
+            .any(|&(filter, fflags)| filter == libc::EVFILT_PROC && fflags & libc::NOTE_EXIT != 0),
+        "the tracer's exit must wake the wait: {events:?}"
+    );
+    assert_eq!(waited, Waited::Orphaned);
+    tracer.wait().expect("reap the stand-in tracer");
+}
+
 /// launchd answers `ECHILD` to our `waitid` and refuses `PROC_PIDTBSDINFO` to a caller that is not
 /// root, yet its unique id and parent read unprivileged: it is held, not reaped. Its parent is the
 /// kernel, pid 0, not launchd.

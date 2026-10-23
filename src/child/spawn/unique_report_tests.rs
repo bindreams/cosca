@@ -447,6 +447,114 @@ fn awaiting_a_reaped_pid_answers_missing_without_blocking() {
     assert!(matches!(report, Report::Missing), "{report:?}");
 }
 
+/// Whether `kq` has an event pending, by a `poll` of its descriptor, which takes nothing from it.
+fn event_pending(kq: &nix::sys::event::Kqueue) -> bool {
+    use std::os::fd::AsFd;
+    let mut fd = libc::pollfd {
+        fd: kq.as_fd().as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid `pollfd`, and a zero timeout.
+    let n = unsafe { libc::poll(&mut fd, 1, 0) };
+    assert!(n >= 0, "poll the wait's kqueue: {}", std::io::Error::last_os_error());
+    n == 1
+}
+
+/// The parents a `kinfo_proc` read reports for a child this process forked, held by `parent`:
+/// `(p_oppid, e_ppid)`.
+fn forked_by_us_held_by(parent: u32) -> (libc::pid_t, libc::pid_t) {
+    (std::process::id() as libc::pid_t, parent as libc::pid_t)
+}
+
+/// A child that launchd holds, whose parent at a tracer's attach is this process: its tracer died
+/// while it was exiting, and XNU gave it to launchd. It is gone, and the wait answers `Missing`
+/// without blocking. The child really runs; its `waitid` and its parents are forced.
+///
+/// Mutant: the check takes a child this process forked for running, whoever holds it.
+#[skuld::test]
+fn awaiting_a_child_launchd_holds_after_its_tracer_died_answers_missing_without_blocking() {
+    use crate::wait::exit_only::{seams::force_peek_once, Foreign, Peek};
+    let (child, stdin) = live_child();
+    let pid = child.id();
+    let (r, copy) = pipe();
+    let _echild = force_peek_once(Ok(Peek::Foreign(Foreign::Gone)));
+    let _parents = crate::identity::kinfo::fault::force_parents(pid as libc::pid_t, || {
+        forked_by_us_held_by(crate::identity::LAUNCHD)
+    });
+    let before = seams::block_count();
+    let _release = release_on_block(copy);
+    let report = await_report(&r, pid);
+    assert_eq!(seams::block_count(), before, "a child launchd holds is not waited for");
+    assert!(matches!(report, Report::Missing), "{report:?}");
+    end(child, stdin);
+}
+
+/// A child whose tracer dies while the child is exiting: XNU sends the child's `NOTE_EXIT` to the
+/// tracer alone, then gives the child to launchd, so no event of the child's reaches this process.
+/// The wait watches the tracer as well, and the tracer's exit makes it check the child again, which
+/// finds launchd holding it: `Missing`. A live `cat` stands in for the tracer. The child really runs;
+/// its `waitid` and its parents are forced: held by the stand-in while that runs, by launchd once it
+/// has exited. The hook on the wait's first block ends the stand-in and looks for an event pending on
+/// the wait's kqueue; if there is none, it drops a copy of the write end, so a wait that missed the
+/// tracer's exit ends at EOF instead of hanging.
+///
+/// Mutant: the wait does not watch the tracer.
+#[skuld::test]
+fn awaiting_a_child_whose_tracer_dies_during_its_exit_is_woken_by_the_tracers_exit() {
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    use crate::wait::exit_only::{seams::force_peeks, Foreign, Peek};
+    let (child, stdin) = live_child();
+    let pid = child.id();
+    let (mut tracer, tracer_stdin) = live_child();
+    let tracer_pid = tracer.id();
+    let (r, copy) = pipe();
+    // More than the wait takes: the child stays `ECHILD` to this process throughout.
+    let _echild = force_peeks((0..8).map(|_| Ok(Peek::Foreign(Foreign::Gone))));
+    let tracer_exited = Rc::new(Cell::new(false));
+    let _parents = crate::identity::kinfo::fault::force_parents(pid as libc::pid_t, {
+        let exited = Rc::clone(&tracer_exited);
+        move || {
+            forked_by_us_held_by(if exited.get() {
+                crate::identity::LAUNCHD
+            } else {
+                tracer_pid
+            })
+        }
+    });
+    let pending = Rc::new(Cell::new(None));
+    let tracer_stdin = RefCell::new(Some(tracer_stdin));
+    let copy = RefCell::new(Some(copy));
+    let _hook = seams::on_each_block({
+        let pending = Rc::clone(&pending);
+        move |n, kq| {
+            if n == 1 {
+                drop(tracer_stdin.borrow_mut().take());
+                crate::test_child::wait_until_zombie(tracer_pid);
+                tracer_exited.set(true);
+                pending.set(Some(event_pending(kq)));
+                if pending.get() == Some(true) {
+                    return;
+                }
+            }
+            drop(copy.borrow_mut().take());
+        }
+    });
+    let _ = seams::take_wake();
+    let report = await_report(&r, pid);
+    assert_eq!(pending.get(), Some(true), "the tracer's exit must wake the wait");
+    assert_eq!(
+        seams::take_wake(),
+        Some(seams::Wake::ChildGone),
+        "the check after the tracer's exit ends the wait"
+    );
+    assert!(matches!(report, Report::Missing), "{report:?}");
+    end(child, stdin);
+    tracer.wait().expect("reap the stand-in tracer");
+}
+
 /// A failed spawn's child was collected by std, or tokio dropped it with its pid, so there is no
 /// child to wait on: the report is read once. A copy of the write end held elsewhere (as a foreign
 /// fork holds one) keeps the empty pipe open, so it reads `Unwritten`.

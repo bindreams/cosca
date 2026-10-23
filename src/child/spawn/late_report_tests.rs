@@ -632,6 +632,22 @@ fn tear_down(
     unique: u64,
     arm: impl FnOnce(u32) -> Vec<Box<dyn std::any::Any>>,
 ) -> (ChildFate, Vec<String>, Vec<crate::send_log::Entry>) {
+    let uncontained = crate::containment::Prepared {
+        mode: None,
+        is_root: true,
+        marker: None,
+    };
+    tear_down_with(uncontained, child, stdin, unique, arm)
+}
+
+/// [`tear_down`] of a child contained by `prepared`.
+fn tear_down_with(
+    prepared: crate::containment::Prepared,
+    child: std::process::Child,
+    stdin: &Rc<Cell<Option<std::process::ChildStdin>>>,
+    unique: u64,
+    arm: impl FnOnce(u32) -> Vec<Box<dyn std::any::Any>>,
+) -> (ChildFate, Vec<String>, Vec<crate::send_log::Entry>) {
     crate::log_capture::install();
     let pid = child.id();
     let sent = crate::send_log::Capture::start();
@@ -641,12 +657,7 @@ fn tear_down(
     });
     let mark = crate::log_capture::mark();
     let _armed = arm(pid);
-    let uncontained = crate::containment::Prepared {
-        mode: None,
-        is_root: true,
-        marker: None,
-    };
-    let done = crate::child::spawn::kill_and_reap_unreported(pid, unique, uncontained);
+    let done = crate::child::spawn::kill_and_reap_unreported(pid, unique, prepared);
     let tail = done.zombie_tail();
     let fate = done.warn(pid, tail);
     drop(child);
@@ -694,6 +705,32 @@ fn macos_late_teardown_with_a_refused_kill_leaves_it_running_and_says_so() {
         !warn.contains("was sent SIGKILL") && !warn.contains("did not end it"),
         "{warn}"
     );
+    end_unsignalled_and_reap(pid);
+}
+
+/// A refused kill of a child whose tree attach read its identity: the child is left running, and its
+/// fate names it by that identity. The tree walk is forced blind, so it kills nothing.
+///
+/// Mutant: the teardown drops the attach's identity (`Running { id: None }`).
+#[skuld::test]
+fn macos_late_teardown_of_a_contained_child_with_a_refused_kill_names_it_running() {
+    let (child, stdin, unique) = std_blocker_with_unique();
+    let stdin = Rc::new(Cell::new(Some(stdin)));
+    let pid = child.id();
+    let walked = crate::containment::Prepared {
+        mode: Some(crate::containment::ContainMode::TreeWalk),
+        is_root: true,
+        marker: None,
+    };
+    let (fate, _warns, sent) = tear_down_with(walked, child, &stdin, unique, |_| {
+        crate::containment::enumerate::force_blind_snapshot_for_next_call(true);
+        vec![Box::new(refuse_the_kill())]
+    });
+    assert!(
+        matches!(fate, ChildFate::Running { id: Some(id) } if id.pid() == pid),
+        "{fate:?}"
+    );
+    assert_eq!(sent, [], "a refused kill and a blind walk send nothing");
     end_unsignalled_and_reap(pid);
 }
 
