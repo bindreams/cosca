@@ -878,6 +878,95 @@ fn resume_initial_threads_leaves_a_thread_someone_else_suspended_suspended() {
     child.wait().expect("the resumed blocker exits on stdin EOF");
 }
 
+/// The release visits only the initial thread: another thread of the child is not opened, so a
+/// call on it that fails (an EDR agent's thread that denies a query, say) cannot fail a release of
+/// a child whose initial thread is frozen exactly once. The failure is armed for that thread alone,
+/// and the walk must leave it unconsumed.
+#[skuld::test]
+fn resume_initial_threads_does_not_open_a_thread_that_is_not_the_initial_one() {
+    use crate::containment::windows::fault::{force_next_for_thread, forced_is_armed, Step};
+    const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
+
+    let mut child = crate::test_frozen::spawn_suspended_blocker();
+    let initial = crate::test_frozen::InitialThread::of(child.id());
+    let other = crate::test_frozen::inject_running_thread_into_std_child(&child);
+    let _forced = force_next_for_thread(Step::QueryOpen, ERROR_NOT_ENOUGH_MEMORY, other.tid());
+
+    super::resume_initial_threads(crate::test_frozen::raw(&child), super::SuspendCount::ExactlyOne)
+        .expect("a thread that cannot be queried is not the initial one and must not fail the release");
+
+    assert!(forced_is_armed(), "the walk opened the other thread");
+    assert_eq!(initial.suspend_count(), 0, "the initial thread must run");
+    drop(child.stdin.take());
+    child.wait().expect("the resumed blocker exits on stdin EOF");
+}
+
+/// A child thread whose creation time cannot be read might be the earlier one, so the initial thread
+/// is not identifiable: the release fails, and resumes nothing.
+#[skuld::test]
+fn resume_initial_threads_resumes_nothing_when_a_childs_creation_time_cannot_be_read() {
+    use crate::containment::windows::fault::{force_next_for_thread, Step};
+    const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
+
+    let child = crate::test_frozen::spawn_suspended_blocker();
+    let initial = crate::test_frozen::InitialThread::of(child.id());
+    let other = crate::test_frozen::inject_running_thread_into_std_child(&child);
+    let _forced = force_next_for_thread(Step::CreationTime, ERROR_NOT_ENOUGH_MEMORY, other.tid());
+
+    let err = super::resume_initial_threads(crate::test_frozen::raw(&child), super::SuspendCount::ExactlyOne)
+        .expect_err("the initial thread cannot be identified");
+
+    let text = err.to_string();
+    assert!(
+        text.contains("GetThreadTimes failed") && text.contains(&format!("thread {} of pid", other.tid())),
+        "the error must name the call and the unreadable thread: {text}"
+    );
+    assert_eq!(
+        initial.suspend_count(),
+        1,
+        "nothing may be resumed when the initial thread is unknown"
+    );
+    dispose(child);
+}
+
+/// Two threads created at the same clock reading: which came first is unknowable (thread ids carry
+/// no order), so the release fails and resumes nothing rather than guessing.
+#[skuld::test]
+fn resume_initial_threads_resumes_nothing_when_the_earliest_creation_times_are_equal() {
+    let child = crate::test_frozen::spawn_suspended_blocker();
+    let initial = crate::test_frozen::InitialThread::of(child.id());
+    let _other = crate::test_frozen::inject_running_thread_into_std_child(&child);
+    let _equal = crate::containment::windows::fault::equal_creation_times();
+
+    let err = super::resume_initial_threads(crate::test_frozen::raw(&child), super::SuspendCount::ExactlyOne)
+        .expect_err("the initial thread cannot be identified");
+
+    let text = err.to_string();
+    assert!(
+        text.contains("same creation time") && text.contains(&format!("pid {}", child.id())),
+        "the error must say why the initial thread is unknown: {text}"
+    );
+    assert_eq!(
+        initial.suspend_count(),
+        1,
+        "nothing may be resumed when the initial thread is unknown"
+    );
+    dispose(child);
+}
+
+/// `earliest_created`: the earliest time wins wherever it is listed; a tie for the earliest is a
+/// tie, whichever ids hold it; a tie among later times is irrelevant.
+#[skuld::test]
+fn earliest_created_answers_the_unique_earliest_and_reports_a_tie_for_it() {
+    use super::Earliest;
+
+    assert_eq!(super::earliest_created([]), Earliest::NoThread);
+    assert_eq!(super::earliest_created([(7, 1)]), Earliest::Unique(1));
+    assert_eq!(super::earliest_created([(9, 1), (7, 2), (8, 3)]), Earliest::Unique(2));
+    assert_eq!(super::earliest_created([(7, 5), (7, 2), (8, 3)]), Earliest::Tie(5, 2));
+    assert_eq!(super::earliest_created([(8, 5), (8, 2), (7, 3)]), Earliest::Unique(3));
+}
+
 /// The ordinary spawn's walk is unchanged: `Any` resumes every thread of the child, as `contain()`
 /// always has.
 #[skuld::test]

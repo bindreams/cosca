@@ -554,6 +554,8 @@ pub(crate) mod fault {
         Owner,
         ResumeOpen,
         Resume,
+        /// The read of a thread's creation time, in the search for a frozen child's initial thread.
+        CreationTime,
         /// The assignment of a Strongest root's job.
         Assign,
     }
@@ -561,7 +563,8 @@ pub(crate) mod fault {
     thread_local! {
         static INJECTED: Cell<Option<(u32, Option<u32>)>> = const { Cell::new(None) };
         static INJECTED_VISIT: Cell<Option<Option<super::Visit>>> = const { Cell::new(None) };
-        static FORCED: Cell<Option<(Step, u32)>> = const { Cell::new(None) };
+        static FORCED: Cell<Option<(Step, u32, Option<u32>)>> = const { Cell::new(None) };
+        static EQUAL_CREATION_TIMES: Cell<bool> = const { Cell::new(false) };
     }
     /// Make `resume_initial_threads` on THIS thread walk one extra snapshot entry for thread
     /// `tid`, owned by `owner` (`None`: the CHILD's pid, which is what a stale id looks like).
@@ -589,21 +592,50 @@ pub(crate) mod fault {
     /// Make the NEXT `step` call on THIS thread fail with Win32 error `code`. Reset on drop of the
     /// guard. Neither an owner of 0 nor a failed `ResumeThread` can be produced on a live system.
     pub(crate) fn force_next(step: Step, code: u32) -> Forced {
+        arm(step, code, None)
+    }
+    /// [`force_next`], but only for the call that handles thread `tid`; a call for another thread
+    /// does not consume it.
+    pub(crate) fn force_next_for_thread(step: Step, code: u32, tid: u32) -> Forced {
+        arm(step, code, Some(tid))
+    }
+    fn arm(step: Step, code: u32, tid: Option<u32>) -> Forced {
         FORCED.with(|f| {
             debug_assert!(f.get().is_none(), "a failure is already forced");
-            f.set(Some((step, code)));
+            f.set(Some((step, code, tid)));
         });
         Forced(())
     }
-    /// Consume a forced failure for `step`, if one is armed for it.
-    pub(crate) fn take_forced(step: Step) -> Option<u32> {
+    /// Whether a forced failure is still armed: the call it was armed for never happened.
+    pub(crate) fn forced_is_armed() -> bool {
+        FORCED.with(|f| f.get().is_some())
+    }
+    /// Consume a forced failure for `step` (on thread `tid`, where the call has one), if one is
+    /// armed for it.
+    pub(crate) fn take_forced(step: Step, tid: Option<u32>) -> Option<u32> {
         FORCED.with(|f| match f.get() {
-            Some((armed, code)) if armed == step => {
+            Some((armed, code, only)) if armed == step && (only.is_none() || only == tid) => {
                 f.set(None);
                 Some(code)
             }
             _ => None,
         })
+    }
+    /// Make every creation time read on THIS thread answer the same value, as a coarse clock would,
+    /// until the guard drops. No live system can be made to tie.
+    pub(crate) fn equal_creation_times() -> EqualTimes {
+        EQUAL_CREATION_TIMES.with(|f| f.set(true));
+        EqualTimes(())
+    }
+    pub(crate) fn creation_times_are_equal() -> bool {
+        EQUAL_CREATION_TIMES.with(|f| f.get())
+    }
+    #[must_use = "dropping this immediately restores the real clock"]
+    pub(crate) struct EqualTimes(());
+    impl Drop for EqualTimes {
+        fn drop(&mut self) {
+            EQUAL_CREATION_TIMES.with(|f| f.set(false));
+        }
     }
     #[must_use = "dropping this immediately removes the injected entry"]
     pub(crate) struct Injected(());
@@ -659,7 +691,7 @@ pub(crate) fn assign_to_kill_on_close_job(proc_handle: std::os::windows::io::Raw
 /// resumed.
 pub(crate) fn assign_held(proc_handle: std::os::windows::io::RawHandle) -> io::Result<JobHandle> {
     #[cfg(test)]
-    forced(fault::Step::Assign).map_err(io::Error::from)?;
+    forced(fault::Step::Assign, None).map_err(io::Error::from)?;
     assign_to_kill_on_close_job(proc_handle)
 }
 
@@ -1060,9 +1092,6 @@ pub(crate) enum Visit {
     /// The query-only open was denied. The child's own threads are openable by its creator, so
     /// the id belongs to someone else.
     Denied,
-    /// The child's own thread, but not the one a frozen release resumes (see
-    /// [`SuspendCount::ExactlyOne`]); untouched.
-    LeftAlone,
     /// A call failed on a thread that is the child's; recorded in `last_err`.
     Failed,
 }
@@ -1077,8 +1106,11 @@ pub(crate) enum SuspendCount {
     /// A frozen child's release: resumes the child's INITIAL thread only, and only if its previous
     /// count was exactly 1. An initial thread that ran, or that something else suspended again,
     /// means the child is not as its creator left it. Every other thread (one an EDR agent or a
-    /// debugger started) is left alone at the count it had: the creator suspended only the initial
-    /// thread, so a resume of any other would take away a suspension that is someone else's.
+    /// debugger started) is not opened at all: the creator suspended only the initial thread, so a
+    /// resume of any other would take away a suspension that is someone else's, and a call that
+    /// fails on it says nothing about the child's. If the initial thread cannot be identified (a
+    /// thread's creation time unreadable, or the earliest two equal) nothing is resumed and the
+    /// release fails.
     ExactlyOne,
 }
 
@@ -1086,10 +1118,6 @@ pub(crate) enum SuspendCount {
 #[derive(Default)]
 struct Walk {
     expected: SuspendCount,
-    /// For [`SuspendCount::ExactlyOne`]: the id of the child's initial thread, the only thread the
-    /// count is asked of. `None` when no listed thread could be identified; then the walk resumed
-    /// nothing, or `last_err` says why.
-    initial: Option<u32>,
     resumed: u32,
     /// The FIRST failure: it is the root cause, and later ones are logged as they happen.
     last_err: Option<io::Error>,
@@ -1098,14 +1126,19 @@ struct Walk {
 }
 
 impl Walk {
-    /// Whether thread `tid` is left alone: a frozen child's release resumes its initial thread only.
-    fn leaves_alone(&self, tid: u32) -> bool {
-        self.expected == SuspendCount::ExactlyOne && self.initial != Some(tid)
-    }
-
     fn skip(&mut self, reason: String) {
         log::debug!("resume_initial_threads: {reason}; skipped");
         self.last_skip = Some(reason);
+    }
+
+    /// Record that the initial thread of `process_pid` cannot be told from the threads `first` and
+    /// `second`.
+    fn fail_unidentified(&mut self, process_pid: u32, first: u32, second: u32) {
+        let msg = format!(
+            "the initial thread of pid {process_pid} cannot be identified: threads {first} and {second}              have the same creation time"
+        );
+        log::warn!("resume_initial_threads: {msg}");
+        self.last_err.get_or_insert_with(|| io::Error::other(msg));
     }
 
     fn fail(&mut self, call: &str, tid: u32, process_pid: u32, cause: impl std::fmt::Display) -> Visit {
@@ -1128,8 +1161,8 @@ impl Drop for ThreadHandle {
 
 /// Fail with the Win32 error a test armed for `step`, if any.
 #[cfg(test)]
-fn forced(step: fault::Step) -> windows::core::Result<()> {
-    match fault::take_forced(step) {
+fn forced(step: fault::Step, tid: Option<u32>) -> windows::core::Result<()> {
+    match fault::take_forced(step, tid) {
         Some(code) => Err(windows::core::Error::from_hresult(windows::core::HRESULT::from_win32(
             code,
         ))),
@@ -1139,21 +1172,21 @@ fn forced(step: fault::Step) -> windows::core::Result<()> {
 
 fn open_query(tid: u32) -> windows::core::Result<ThreadHandle> {
     #[cfg(test)]
-    forced(fault::Step::QueryOpen)?;
+    forced(fault::Step::QueryOpen, Some(tid))?;
     // SAFETY: plain Win32 call; the handle is owned by the returned guard.
     unsafe { OpenThread(THREAD_QUERY_LIMITED_INFORMATION, false, tid) }.map(ThreadHandle)
 }
 
 fn open_for_resume(tid: u32) -> windows::core::Result<ThreadHandle> {
     #[cfg(test)]
-    forced(fault::Step::ResumeOpen)?;
+    forced(fault::Step::ResumeOpen, Some(tid))?;
     // SAFETY: plain Win32 call; the handle is owned by the returned guard.
     unsafe { OpenThread(THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION, false, tid) }.map(ThreadHandle)
 }
 
 fn owner_of(thread: &ThreadHandle) -> windows::core::Result<u32> {
     #[cfg(test)]
-    forced(fault::Step::Owner)?;
+    forced(fault::Step::Owner, None)?;
     // SAFETY: `thread` is a live handle with THREAD_QUERY_LIMITED_INFORMATION.
     match unsafe { GetProcessIdOfThread(thread.0) } {
         0 => Err(windows::core::Error::from_thread()),
@@ -1165,7 +1198,7 @@ fn owner_of(thread: &ThreadHandle) -> windows::core::Result<u32> {
 /// thread has exactly 1.
 fn resume_thread(thread: &ThreadHandle) -> windows::core::Result<u32> {
     #[cfg(test)]
-    forced(fault::Step::Resume)?;
+    forced(fault::Step::Resume, None)?;
     // ResumeThread returns the previous suspend count, or u32::MAX on failure.
     // SAFETY: `thread` is a live handle with THREAD_SUSPEND_RESUME.
     match unsafe { ResumeThread(thread.0) } {
@@ -1224,11 +1257,6 @@ fn resume_if_owned(tid: u32, process_pid: u32, walk: &mut Walk) -> Visit {
             return Visit::Foreign { owner };
         }
         Err(e) => return walk.fail("GetProcessIdOfThread", tid, process_pid, e),
-    }
-
-    if walk.leaves_alone(tid) {
-        log::debug!("resume_initial_threads: thread {tid} of pid {process_pid} is not its initial thread; left alone");
-        return Visit::LeftAlone;
     }
 
     let resume = match open_for_resume(tid) {
@@ -1305,10 +1333,16 @@ fn creation_time_if_owned(tid: u32, process_pid: u32) -> Result<Option<u64>, (&'
         FILETIME::default(),
         FILETIME::default(),
     );
+    #[cfg(test)]
+    forced(fault::Step::CreationTime, Some(tid)).map_err(|e| ("GetThreadTimes", e))?;
     // SAFETY: `thread` is a live handle with THREAD_QUERY_LIMITED_INFORMATION; the out-parameters
     // are valid.
     unsafe { GetThreadTimes(thread.0, &mut created, &mut exited, &mut kernel, &mut user) }
         .map_err(|e| ("GetThreadTimes", e))?;
+    #[cfg(test)]
+    if fault::creation_times_are_equal() {
+        return Ok(Some(1));
+    }
     Ok(Some(
         (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime),
     ))
@@ -1317,28 +1351,66 @@ fn creation_time_if_owned(tid: u32, process_pid: u32) -> Result<Option<u64>, (&'
 /// The id of the child's initial thread among `tids`: the thread of `process_pid` created first.
 ///
 /// A frozen child has one thread, its initial one, until someone else starts another; a thread
-/// created later has a later creation time, and the clock is the system's precise one (measured on
-/// Windows 11 10.0.26100: 300 threads started back to back in one process all had distinct creation
-/// times, 56 us or more apart). Thread ids say nothing about order, and the snapshot lists threads
-/// in no promised order. Equal times, if the clock ever gave them, go to the lower id so the answer
-/// is the same on every run.
+/// created later has a later creation time. Thread ids say nothing about order, and the snapshot
+/// lists threads in no promised order.
 ///
-/// A failure to read a thread of the child is recorded in `walk` like any failed call on the child's
-/// thread, and the thread is passed over.
+/// `None`, with the cause in `walk`, when the initial thread cannot be told: the creation time of a
+/// thread of the child cannot be read (it might be the earlier), or the earliest two are equal. The
+/// clock was measured only on Windows 11 10.0.26100, where 300 threads started back to back in one
+/// process were 56 us or more apart; whether an older build's clock can tie is unmeasured, so a tie
+/// is a failure, never a guess by thread id.
 fn initial_thread_id(process_pid: u32, tids: &[u32], walk: &mut Walk) -> Option<u32> {
-    let mut earliest: Option<(u64, u32)> = None;
+    let mut times = Vec::with_capacity(tids.len());
     for &tid in tids {
         match creation_time_if_owned(tid, process_pid) {
-            Ok(Some(created)) => {
-                earliest = Some(earliest.map_or((created, tid), |current| current.min((created, tid))));
-            }
+            Ok(Some(created)) => times.push((created, tid)),
             Ok(None) => {}
             Err((call, e)) => {
                 walk.fail(call, tid, process_pid, e);
+                return None;
             }
         }
     }
-    earliest.map(|(_, tid)| tid)
+    match earliest_created(times) {
+        Earliest::NoThread => None,
+        Earliest::Unique(tid) => Some(tid),
+        Earliest::Tie(first, second) => {
+            walk.fail_unidentified(process_pid, first, second);
+            None
+        }
+    }
+}
+
+/// Which of some `(creation time, thread id)` pairs is the earliest.
+#[derive(Debug, PartialEq, Eq)]
+enum Earliest {
+    NoThread,
+    Unique(u32),
+    /// Two threads share the earliest time, in the order they were listed: which came first is
+    /// unknowable.
+    Tie(u32, u32),
+}
+
+fn earliest_created(times: impl IntoIterator<Item = (u64, u32)>) -> Earliest {
+    let mut best: Option<(u64, u32)> = None;
+    let mut tied: Option<u32> = None;
+    for (created, tid) in times {
+        match best {
+            Some((time, _)) if created > time => {}
+            Some((time, _)) if created == time => {
+                tied.get_or_insert(tid);
+            }
+            _ => {
+                best = Some((created, tid));
+                tied = None;
+            }
+        }
+    }
+    match (best, tied) {
+        (None, _) => Earliest::NoThread,
+        (Some((_, tid)), None) => Earliest::Unique(tid),
+        (Some((_, first)), Some(second)) => Earliest::Tie(first, second),
+    }
 }
 
 /// The pid of the process at `raw_handle`, or an error naming `GetProcessId`.
@@ -1455,15 +1527,19 @@ pub(crate) fn resume_initial_threads(
         _ = CloseHandle(snap);
 
         if walk.expected == SuspendCount::ExactlyOne {
+            // Only the initial thread is visited: no other thread of the child is opened.
             let own: Vec<u32> = entries
                 .iter()
                 .filter(|e| e.th32OwnerProcessID == process_pid)
                 .map(|e| e.th32ThreadID)
                 .collect();
-            walk.initial = initial_thread_id(process_pid, &own, &mut walk);
-        }
-        for entry in &entries {
-            visit_thread_entry(entry, process_pid, &mut walk);
+            if let Some(initial) = initial_thread_id(process_pid, &own, &mut walk) {
+                resume_if_owned(initial, process_pid, &mut walk);
+            }
+        } else {
+            for entry in &entries {
+                visit_thread_entry(entry, process_pid, &mut walk);
+            }
         }
     }
 
