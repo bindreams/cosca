@@ -30,9 +30,9 @@ pub struct SuspendedChild {
 }
 
 impl Command {
-    /// Spawn the configured command frozen: created, contained as [`spawn`](Self::spawn) would
-    /// contain it, and not yet run. Record the child's [`id`](SuspendedChild::id), then
-    /// [`resume`](SuspendedChild::resume) it.
+    /// Spawn the configured command frozen: created, contained as the command asks, and not yet
+    /// run. Record the child's [`id`](SuspendedChild::id), then [`resume`](SuspendedChild::resume)
+    /// it.
     ///
     /// # Windows
     ///
@@ -54,11 +54,15 @@ impl Command {
     ///
     /// # Errors
     ///
-    /// As [`spawn`](Self::spawn). A frozen spawn that fails after the process exists reports
-    /// [`Error::MayHaveStarted`], conservatively: a child that was never resumed ran nothing.
+    /// As [`spawn`](Self::spawn), and two more that `spawn` would not give, each an
+    /// [`Error::Containment`] cause: a [`Strongest`] root whose job assignment fails (`spawn` falls
+    /// back to [`TreeWalk`] there; a frozen root without a job would have nothing to kill it), and a
+    /// failed assignment to the guard job. A frozen spawn that fails after the process exists
+    /// reports [`Error::MayHaveStarted`], conservatively: a child that was never resumed ran nothing.
     /// `spawn_suspended` with [`elevate`](Self::elevate) is [`Error::Unsupported`] on every platform,
     /// even for an already-elevated caller.
     ///
+    /// [`Strongest`]: crate::ContainMode::Strongest
     /// [`TreeWalk`]: crate::ContainMode::TreeWalk
     pub fn spawn_suspended(&mut self) -> Result<SuspendedChild, Error> {
         platform::spawn(self)
