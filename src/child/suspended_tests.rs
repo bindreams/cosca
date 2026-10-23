@@ -187,6 +187,109 @@ mod on_windows {
         }
     }
 
+    /// An owned handle on a process that can wait for it and end it, opened while the caller still
+    /// holds the process, so the pid names nothing else.
+    struct Remote(HANDLE);
+
+    impl Remote {
+        fn open(pid: u32) -> Remote {
+            // SAFETY: plain Win32 call; the handle is closed on drop.
+            let handle = unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, false, pid) }
+                .expect("open the resumed child");
+            Remote(handle)
+        }
+
+        /// Block until the process is gone; the process object signals, nothing here is a timer.
+        fn wait_for_death(&self) {
+            // SAFETY: `self.0` is live.
+            unsafe { WaitForSingleObject(self.0, INFINITE) };
+        }
+
+        /// Whether the process is gone now. A single non-blocking look, used only after a drop that
+        /// kills synchronously, so it is not a bet that enough time has passed.
+        fn is_dead_now(&self) -> bool {
+            // SAFETY: `self.0` is live.
+            unsafe { WaitForSingleObject(self.0, 0) }.0 == 0
+        }
+
+        fn end(&self) {
+            // SAFETY: `self.0` is live with `PROCESS_TERMINATE`.
+            unsafe { TerminateProcess(self.0, 1) }.expect("end the resumed child");
+            self.wait_for_death();
+        }
+    }
+
+    impl Drop for Remote {
+        fn drop(&mut self) {
+            // SAFETY: owned, closed once.
+            unsafe { _ = CloseHandle(self.0) };
+        }
+    }
+
+    /// The command's `kill_on_drop` decides what dropping the resumed `Child` does, for every
+    /// containment: a resumed child that kept the frozen spawn's forced `true` would be killed by a
+    /// command that opted out.
+    #[skuld::test]
+    fn death_watch_dropping_a_resumed_child_follows_the_commands_kill_on_drop_for_every_containment() {
+        for (shape, contain) in [
+            ("uncontained", None),
+            ("treewalk", Some(crate::ContainMode::TreeWalk)),
+            ("strongest", Some(crate::ContainMode::Strongest)),
+        ] {
+            for kill_on_drop in [true, false] {
+                let mut cmd = blocker(false);
+                if let Some(mode) = contain {
+                    cmd.contain_with(mode);
+                }
+                cmd.kill_on_drop(kill_on_drop);
+                let child = cmd
+                    .spawn_suspended()
+                    .expect("spawn suspended")
+                    .resume()
+                    .expect("resume");
+                assert_eq!(child.kill_on_drop, kill_on_drop, "{shape}");
+                let remote = Remote::open(child.id().pid());
+
+                drop(child);
+
+                if kill_on_drop {
+                    remote.wait_for_death();
+                } else {
+                    assert!(
+                        !remote.is_dead_now(),
+                        "{shape}: kill_on_drop(false) must leave the resumed child running"
+                    );
+                    remote.end();
+                }
+            }
+        }
+    }
+
+    // Refusals before anything exists =====
+
+    /// A program that does not exist is the plain spawn error, not `MayHaveStarted`, and the command
+    /// is as it was: the borrowed `kill_on_drop` and suspended request are put back.
+    #[skuld::test]
+    fn spawn_suspended_of_a_nonexistent_program_returns_the_plain_error_and_leaves_the_command_as_it_was() {
+        for raw in BACKENDS {
+            for kill_on_drop in [true, false] {
+                let mut cmd = crate::Command::new();
+                cmd.args(["cosca-49-no-such-program.exe"]);
+                if raw {
+                    cmd.executable("cosca-49-no-such-program.exe");
+                }
+                cmd.no_window().kill_on_drop(kill_on_drop);
+
+                let err = cmd.spawn_suspended().expect_err("there is no such program");
+
+                assert!(err.fate().is_none(), "raw={raw}: nothing started, got {err:?}");
+                assert!(matches!(err, Error::Io(_)), "raw={raw}: got {err:?}");
+                assert_eq!(cmd.kill_on_drop_flag(), kill_on_drop, "raw={raw}");
+                assert!(!cmd.flags_request().suspended, "raw={raw}");
+            }
+        }
+    }
+
     // Drop =====
 
     /// A dropped frozen child is torn down by the `Child` teardown (a kill and a reap inside the
