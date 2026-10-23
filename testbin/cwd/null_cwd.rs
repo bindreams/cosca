@@ -1,5 +1,6 @@
-//! M12 and M13: a child spawned with no `current_dir` (`NULL`, std's route) from a process cwd
-//! whose string no longer names it, against one given that string explicitly. Each spawn reports
+//! M12 and M13: a child spawned with no `current_dir` from a process cwd whose string no longer
+//! names it, against one given that string explicitly. std then passes `NULL`; the raw backend
+//! never does, and passes the cwd string whether or not `current_dir` was set. Each spawn reports
 //! `ok,cwd=<string>,markers=<names>`: the child's cwd string and the `marker-*` files it finds
 //! there, which tell two directories behind one string apart.
 
@@ -33,7 +34,8 @@ pub fn report_cwd_final() {
 
 const KEYS: &[&str] = &["cwd", "markers"];
 
-/// Spawns `child report-cwd-final` four ways from this process's cwd, printing `<prefix>_<route>=`.
+/// Spawns `child report-cwd-final` from this process's cwd, printing `<prefix>_<route>=`. `null_std`
+/// sends `NULL`; `unset_raw` sets no `current_dir`, and the raw backend sends the cwd string.
 fn spawn_rows(prefix: &str, child: &str, render: &Render) {
     let gcd = std::env::current_dir();
     println!(
@@ -43,9 +45,9 @@ fn spawn_rows(prefix: &str, child: &str, render: &Render) {
     );
     let null_std = std_run(std::process::Command::new(child).arg("report-cwd-final"), KEYS, render);
     println!("{prefix}_null_std={null_std}");
-    let mut null_raw = cosca::Command::new();
-    null_raw.executable(child).commandline("x report-cwd-final");
-    println!("{prefix}_null_raw={}", cosca_run(&mut null_raw, KEYS, render));
+    let mut unset_raw = cosca::Command::new();
+    unset_raw.executable(child).commandline("x report-cwd-final");
+    println!("{prefix}_unset_raw={}", cosca_run(&mut unset_raw, KEYS, render));
     let Ok(gcd) = gcd else { return };
     let string_std = std_run(
         std::process::Command::new(child)
@@ -86,6 +88,7 @@ pub fn subst_cwd(base: &str, child: &str) {
     let set = set_cwd(OsStr::new(&sub));
     println!("removed_set={}", outcome(&set));
     drop(first);
+    assert_eq!(free_drive(), drive, "the mapping of {drive} was removed");
     if set.is_ok() {
         spawn_rows("removed", child, &render);
     }
@@ -95,6 +98,10 @@ pub fn subst_cwd(base: &str, child: &str) {
     let set = set_cwd(OsStr::new(&sub));
     println!("repointed_set={}", outcome(&set));
     let second = Subst::new(&drive, &d2).expect("map X: to <d2> over <d1>");
+    assert!(
+        Path::new(&format!(r"{drive}\sub\marker-d2")).exists(),
+        "{drive} was re-pointed at <d2>"
+    );
     if set.is_ok() {
         spawn_rows("repointed", child, &render);
     }
@@ -129,9 +136,9 @@ pub fn verbatim_null(base: &str, image: &str) {
     let mut null_cosca = cosca::Command::new();
     null_cosca.arg(image);
     println!("null_cosca={}", cosca_run(&mut null_cosca, keys, &render));
-    let mut null_raw = cosca::Command::new();
-    null_raw.executable(image).commandline("x");
-    println!("null_raw={}", cosca_run(&mut null_raw, keys, &render));
+    let mut unset_raw = cosca::Command::new();
+    unset_raw.executable(image).commandline("x");
+    println!("unset_raw={}", cosca_run(&mut unset_raw, keys, &render));
     let string_std = std_run(std::process::Command::new(image).current_dir(&gcd), keys, &render);
     println!("string_std={string_std}");
     let mut string_raw = cosca::Command::new();
