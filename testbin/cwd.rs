@@ -16,6 +16,8 @@
 //!   past its root.
 //! - `drive-dir` and `verbatim-unc`: see [`completion`].
 //! - `report-cwd`: prints `cwd=` and this process's cwd; the long-path-aware child.
+//! - `subst-cwd`, `verbatim-null` and `report-cwd-final`: see [`null_cwd`].
+//! - `long-image`: see [`long_image`]; this binary is its long-path-aware half.
 //!
 //! A `[[bin]]` cannot be `cfg`-ed out, so off Windows it exits 1.
 
@@ -28,6 +30,10 @@ fn main() {
         Some("drive-dir") => completion::drive_dir(&args[2], &args[3]),
         Some("verbatim-unc") => completion::verbatim_unc(&args[2], &args[3]),
         Some("report-cwd") => println!("cwd={}", std::env::current_dir().unwrap().display()),
+        Some("report-cwd-final") => null_cwd::report_cwd_final(),
+        Some("subst-cwd") => null_cwd::subst_cwd(&args[2], &args[3]),
+        Some("verbatim-null") => null_cwd::verbatim_null(&args[2], &args[3]),
+        Some("long-image") => long_image::run(&args[2], &args[3]),
         other => panic!("unknown mode {other:?}"),
     }
 }
@@ -41,6 +47,19 @@ fn main() {
 #[cfg(windows)]
 #[path = "cwd/completion.rs"]
 mod completion;
+
+#[cfg(windows)]
+#[path = "cwd/null_cwd.rs"]
+mod null_cwd;
+
+#[cfg(windows)]
+#[path = "long_image.rs"]
+mod long_image;
+
+#[cfg(windows)]
+#[allow(dead_code, reason = "shared with cosca_testbin, which uses other parts")]
+#[path = "measure.rs"]
+mod measure;
 
 #[cfg(windows)]
 mod probe {

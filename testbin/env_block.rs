@@ -1,5 +1,7 @@
 //! The `dump-env-block` and `spawn-dump-env-block` modes: the environment block a child receives
-//! from each Windows backend, byte for byte.
+//! from each Windows backend, byte for byte. Also `with-env-block`, which runs any mode in a block
+//! given entry by entry, and `env-set-probe`, which records what `SetEnvironmentVariableW` does to
+//! such a block.
 
 use std::io::Write;
 
@@ -72,6 +74,68 @@ pub fn spawn(backend: &str, ops: &[String]) {
 pub fn spawn_with_block(dump_args: &str, entries: &[String]) {
     let code = create_with_block(entries, &format!("spawn-dump-env-block {dump_args}")).expect("CreateProcessW");
     std::process::exit(code as i32);
+}
+
+/// `with-env-block <entries>... -- <args>...`: run `cosca_testbin <args>` in a child given exactly
+/// `entries`, in order, as its environment block, and exit with its exit code. Windows on Arm adds
+/// `PROCESSOR_ARCHITECTURE` to that block on its own.
+pub fn with_block(args: &[String]) {
+    let split = args
+        .iter()
+        .position(|a| a == "--")
+        .expect("with-env-block needs `--` before the mode");
+    let line: Vec<String> = args[split + 1..].iter().map(|a| quote(a)).collect();
+    let code = create_with_block(&args[..split], &line.join(" ")).expect("CreateProcessW");
+    std::process::exit(code as i32);
+}
+
+/// `arg` quoted for the command line, as the CRT and `CommandLineToArgvW` parse it back.
+fn quote(arg: &str) -> String {
+    if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
+        return arg.to_owned();
+    }
+    let mut out = String::from('"');
+    let mut backslashes = 0;
+    for c in arg.chars() {
+        if c == '\\' {
+            backslashes += 1;
+            continue;
+        }
+        let escaped = if c == '"' { backslashes * 2 + 1 } else { backslashes };
+        out.push_str(&"\\".repeat(escaped));
+        out.push(c);
+        backslashes = 0;
+    }
+    out.push_str(&"\\".repeat(backslashes * 2));
+    out.push('"');
+    out
+}
+
+/// `env-set-probe <op>...`: dump this process's block under `# before`, then apply each op to this
+/// process's own environment with `SetEnvironmentVariableW` and dump it again under
+/// `# after <op>`. An op is `set:NAME=VALUE` or `remove:NAME`.
+pub fn set_probe(ops: &[String]) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::System::Environment::SetEnvironmentVariableW;
+
+    let wide = |s: &str| std::ffi::OsStr::new(s).encode_wide().chain([0]).collect::<Vec<u16>>();
+    println!("# before");
+    dump();
+    for op in ops {
+        let (name, value) = if let Some(kv) = op.strip_prefix("set:") {
+            let (name, value) = kv.split_once('=').expect("set:NAME=VALUE");
+            (wide(name), Some(wide(value)))
+        } else if let Some(name) = op.strip_prefix("remove:") {
+            (wide(name), None)
+        } else {
+            panic!("unknown op {op:?}");
+        };
+        let value = value.as_ref().map_or(PCWSTR::null(), |v| PCWSTR(v.as_ptr()));
+        // SAFETY: `name` and `value` are NUL-terminated and outlive the call.
+        unsafe { SetEnvironmentVariableW(PCWSTR(name.as_ptr()), value) }.expect("SetEnvironmentVariableW");
+        println!("# after {op}");
+        dump();
+    }
 }
 
 /// Report whether `CreateProcessW` accepts `entries` as a child's block: `ok`, or `err=<code>`
