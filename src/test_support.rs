@@ -4,6 +4,6 @@
 #[cfg(target_os = "macos")]
 pub(crate) mod tracer;
 
-// The foreign tracer is a separate process that seizes a test child with `ptrace`, on Linux.
+// The foreign tracer: see the module doc.
 #[cfg(target_os = "linux")]
 pub(crate) mod foreign_tracer;

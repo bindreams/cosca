@@ -6,7 +6,7 @@
 //! only after the tracer hands the zombie back: by reaping it with `waitpid`, or by exiting
 //! (`exit_ptrace` detaches it; a debugger that quits). Both are tested, for the unbounded `wait`
 //! and, for the reap, for a bounded `wait_deadline`. A tracee the tracer merely stops is no exit
-//! either. The tracer is [`crate::test_support::foreign_tracer`]'s re-exec of this test binary.
+//! either. The tracer is [`crate::test_support::foreign_tracer`].
 
 use std::cell::Cell;
 use std::os::fd::AsRawFd as _;

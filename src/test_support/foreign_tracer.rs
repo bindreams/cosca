@@ -5,15 +5,11 @@
 //! A tracee that dies while a foreign tracer holds it is a zombie the tracer alone can see: its
 //! pidfd is readable, the parent's `waitid` finds no record, and the parent's own record appears
 //! only after the tracer hands the zombie back: by reaping it with `waitpid`, or by exiting
-//! (`exit_ptrace` detaches it; a debugger that quits). The tracer is [`foreign_tracer_helper`];
-//! the tracee allows it with `PR_SET_PTRACER` ([`allow_any_tracer`]), which Yama's scope 1
-//! requires of a tracer that is no ancestor.
+//! (`exit_ptrace` detaches it; a debugger that quits). The tracer is [`foreign_tracer_helper`].
 //!
-//! A test takes `tracer_group`, spawns the tracee with [`allow_any_tracer`] applied to its command
-//! (or has the tracee call [`allow_any_tracer_now`]), calls [`spawn_helper`] with the tracee's pid,
-//! and drives the tracer with one go byte ([`STOP`], [`REAP`], [`EXIT`]) per [`Tracer::send`],
-//! waiting for its report with [`Tracer::expect`]. These calls block; a test whose own thread
-//! blocks until the tracer hands the zombie back drives the [`Tracer`] from another thread.
+//! A test takes `tracer_group`. A tracee that calls [`allow_any_tracer_now`] itself reports that it
+//! returned, and the test reads that report before [`spawn_helper`]. [`Tracer`] calls block; a test
+//! whose own thread blocks until the tracer hands the zombie back drives it from another thread.
 
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::os::unix::process::CommandExt as _;
@@ -109,9 +105,10 @@ pub(crate) fn allow_any_tracer(cmd: &mut std::process::Command) {
     }
 }
 
-/// Lets any process trace this one (`PR_SET_PTRACER`), which [`spawn_helper`] needs under Yama's
-/// scope 1. A tracee that is a fixture re-exec calls it itself; a `cosca::tokio::Command` tracee
-/// must, since that command has no `pre_exec`.
+/// Lets any process trace this one (`PR_SET_PTRACER`), which Yama's scope 1 requires of a tracer
+/// that is no ancestor. For a tracee that cannot take [`allow_any_tracer`], such as one spawned by
+/// `cosca::tokio::Command`, which has no `pre_exec`. Until it returns, [`spawn_helper`]'s seize
+/// fails: the tracee reports after it, and the driver reads that report first.
 pub(crate) fn allow_any_tracer_now() -> std::io::Result<()> {
     match rustix::process::set_ptracer(rustix::process::PTracer::Any) {
         // `INVAL`: no Yama, so nothing restricts a tracer and nothing needs allowing.
@@ -130,15 +127,15 @@ impl Drop for Helper {
     }
 }
 
-/// A running foreign tracer, driven by go bytes. Dropping it kills the helper.
+/// A running foreign tracer.
 pub(crate) struct Tracer {
     helper: Helper,
     go: Option<ChildStdin>,
     lines: std::io::Lines<BufReader<ChildStdout>>,
 }
 
-/// Starts the helper on `pid`, which must have been spawned with [`allow_any_tracer`], and returns
-/// once it has seized the tracee.
+/// Starts the helper on `pid`, which was spawned with [`allow_any_tracer`] or has reported that its
+/// [`allow_any_tracer_now`] returned, and returns once it has seized the tracee.
 pub(crate) fn spawn_helper(pid: u32) -> Tracer {
     let mut cmd = fixture_command(fixture_path!(foreign_tracer_helper));
     cmd.env(MARKER, std::process::id().to_string())
@@ -168,9 +165,8 @@ impl Tracer {
             .expect("send the helper a go byte");
     }
 
-    /// Waits for the helper's `@@<expected>@@` report. The next line of its stdout that ends in
-    /// it: libtest-mimic's `test <name> ... ` prefix (skuld's harness), which the helper shares,
-    /// may precede it on the same line.
+    /// Waits for the helper's `@@<expected>@@` line. Matches by suffix: the harness's
+    /// `test <name> ... ` prefix may precede it.
     pub(crate) fn expect(&mut self, expected: &str) {
         let want = format!("@@{expected}@@");
         for line in &mut self.lines {
