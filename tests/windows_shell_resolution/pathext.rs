@@ -14,12 +14,12 @@ use crate::harness::{
 };
 use crate::windows_probe::{mark_test_passed, same_file};
 
-/// **THE question.** `raw_executable("tool")` under `.elevate()` produces an `lpFile` that is
-/// absolute, extensionless and quite possibly nonexistent — `raw_executable`'s contract forbids an
-/// existence check. If `ShellExecuteEx` applies `PATHEXT` to a fully-qualified name, then a
-/// `tool.bat` beside it runs through `cmd.exe`, past a batch gate that only ever saw the token
-/// `tool`. The "an absolute `lpFile` is taken verbatim" fact this crate relies on was measured on
-/// an existing `.exe`, which cannot distinguish the two behaviours.
+/// **THE question.** An elevated argv[0] such as `C:\dir\tool` reaches `ShellExecuteEx` as an
+/// `lpFile` that is absolute, extensionless and quite possibly nonexistent. If `ShellExecuteEx`
+/// applies `PATHEXT` to a fully-qualified name, then a `tool.bat` beside it runs through `cmd.exe`,
+/// past a batch gate that only ever saw the token `tool`, and only cosca's `.exe`/`.com` allowlist
+/// stops it. The "an absolute `lpFile` is taken verbatim" fact this crate relies on was measured
+/// on an existing `.exe`, which cannot distinguish the two behaviours.
 #[skuld::test]
 fn does_shellexecute_apply_pathext_to_an_absolute_extensionless_lpfile(#[fixture(shell_probes)] _group: &Group) {
     let (dir, marker) = probe_dir("pathext");
@@ -52,9 +52,9 @@ fn does_shellexecute_apply_pathext_to_an_absolute_extensionless_lpfile(#[fixture
             match report {
                 Some(reported) if same_file(&reported, &bat) => println!(
                     "  => ShellExecuteEx DOES apply PATHEXT to an absolute lpFile. \
-                     `raw_executable(\"tool\")` under .elevate() can reach a planted tool.bat; \
-                     absolutising alone does NOT close the batch vector, and the gate must also run \
-                     on the completed path."
+                     An extensionless elevated argv[0] can reach a planted tool.bat; an absolute \
+                     path alone does NOT close the batch vector, and the .exe/.com allowlist must \
+                     stay."
                 ),
                 Some(reported) => panic!(
                     "PROBE absolute-extensionless-lpFile: INCONCLUSIVE — a marker was written, but \

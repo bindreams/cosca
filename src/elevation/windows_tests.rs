@@ -153,30 +153,30 @@ fn commandline_elevated_is_unsupported_on_windows_regardless_of_privilege() {
 
 /// An argv-less command is not a `commandline()` one. Both of these are reachable from the public
 /// builder and neither calls `.commandline()`, so naming it sends the caller to audit a line of
-/// their code that does not exist — and says nothing about the program they actually failed to set.
+/// their code that does not exist — and says nothing about the program they actually failed to
+/// set. `executable()` alone is refused for the setter, the gate's first rule.
 #[skuld::test]
 fn an_argv_less_command_is_not_reported_as_a_commandline_command() {
     let mut by_executable = Command::new();
     by_executable.executable("x.exe").elevate();
+    assert_eq!(
+        unsupported_detail(super::plan_runas(&by_executable, &win_host(false)).map(|_| ())),
+        super::ARGV_REFUSALS.setter,
+        "executable() only"
+    );
 
     let mut bare = Command::new();
     bare.elevate();
-
-    for (via, c) in [("executable() only", &by_executable), ("nothing at all", &bare)] {
-        match super::plan_runas(c, &win_host(false)) {
-            Err(e @ Error::Unsupported { .. }) => {
-                let msg = e.to_string();
-                assert!(!msg.contains("commandline"), "{via}: none was set, got {msg}");
-                assert!(
-                    msg.contains("empty command"),
-                    "{via}: the refusal must name the missing program, got {msg}"
-                );
-            }
-            other => panic!(
-                "{via}: an argv-less elevate() must be refused, got {:?}",
-                other.map(|_| "Ok")
-            ),
+    match super::plan_runas(&bare, &win_host(false)) {
+        Err(e @ Error::Unsupported { .. }) => {
+            let msg = e.to_string();
+            assert!(!msg.contains("commandline"), "none was set, got {msg}");
+            assert!(
+                msg.contains("empty command"),
+                "the refusal must name the missing program, got {msg}"
+            );
         }
+        other => panic!("an argv-less elevate() must be refused, got {:?}", other.map(|_| "Ok")),
     }
 }
 
@@ -337,38 +337,14 @@ fn an_elevated_raw_executable_is_refused() {
     );
 }
 
-/// Kills replacing `elevated_program`'s `Exact` arm with `let program = token;`, which hands
-/// `ShellExecuteEx` a path-less `lpFile` to search (see `absolutise_exact`'s doc): the result must
-/// be absolute, and for a relative input must DIFFER from the token as written.
-#[skuld::test]
-fn elevated_exact_program_is_completed_to_an_absolute_path() {
-    let mut c = Command::new();
-    c.raw_executable("tool.exe").args(["tool.exe"]).elevate();
-    let argv = super::elevated_argv(&c).expect("an argv command");
-    let program = super::elevated_program(&c, argv).expect("a relative Exact program completes");
-    let p = std::path::Path::new(&program);
-    assert!(
-        p.is_absolute(),
-        "an Exact program must reach lpFile absolute, got {program:?}"
-    );
-    assert_ne!(
-        p.as_os_str(),
-        std::ffi::OsStr::new("tool.exe"),
-        "a relative Exact token must have been completed, not passed through"
-    );
-    // Completed, NOT searched: no extension invented and the file name is untouched.
-    assert_eq!(p.file_name().unwrap(), std::ffi::OsStr::new("tool.exe"), "{program:?}");
-}
-
-/// The consent path's `Exact` arm applies [`crate::resolve::reject_unloadable_image`]: an absolute
+/// The consent path applies [`crate::resolve::reject_unloadable_image`] to argv[0]: an absolute
 /// extensionless `lpFile` may still be PATHEXT-completed by `ShellExecuteEx` (measured without a
-/// class, unmeasured for the `exefile` consent launch). Relative too, since completion does not add
-/// an extension.
+/// class, unmeasured for the `exefile` consent launch).
 #[skuld::test]
-fn an_extensionless_exact_program_is_refused_on_the_consent_path() {
-    for n in [r"C:\tools\setup", "setup", r"C:\tools\setup.bat.exe.lnk"] {
+fn an_extensionless_absolute_argv0_program_is_refused_on_the_consent_path() {
+    for n in [r"C:\tools\setup", r"C:\tools\setup.bat.exe.lnk"] {
         let mut c = Command::new();
-        c.raw_executable(n).args([n]).elevate();
+        c.args([n]).elevate();
         match super::plan_runas(&c, &win_host(false)) {
             Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput => {
                 assert!(
@@ -385,18 +361,18 @@ fn an_extensionless_exact_program_is_refused_on_the_consent_path() {
 /// short-circuit, so an already-elevated caller gets the same refusal though it re-spawns through
 /// `CreateProcessW`, which assumes no default extension.
 #[skuld::test]
-fn an_extensionless_exact_program_is_refused_when_already_elevated_too() {
+fn an_extensionless_absolute_argv0_program_is_refused_when_already_elevated_too() {
     let mut c = Command::new();
-    c.raw_executable(r"C:\tools\setup").args([r"C:\tools\setup"]).elevate();
+    c.args([r"C:\tools\setup"]).elevate();
     assert!(is_pathext_refusal(super::plan_runas(&c, &win_host(true)).map(|_| ())));
 }
 
 /// Negative control: a loadable image name still plans a launch.
 #[skuld::test]
-fn an_exact_exe_or_com_program_plans_a_launch() {
-    for n in [r"C:\tools\setup.exe", r"C:\tools\SETUP.COM", "setup.exe"] {
+fn an_absolute_argv0_exe_or_com_program_plans_a_launch() {
+    for n in [r"C:\tools\setup.exe", r"C:\tools\SETUP.COM"] {
         let mut c = Command::new();
-        c.raw_executable(n).args([n]).elevate();
+        c.args([n]).elevate();
         assert!(
             matches!(super::plan_runas(&c, &win_host(false)), Ok(super::RunasStep::Launch(_))),
             "{n:?} must plan a launch"
@@ -404,8 +380,7 @@ fn an_exact_exe_or_com_program_plans_a_launch() {
     }
 }
 
-/// The allowlist is the consent path's, not `raw_executable()`'s: an `executable()` or argv[0]
-/// token is passed to `ShellExecuteEx` as written, so an extensionless one could be
+/// argv[0] is passed to `ShellExecuteEx` as written, so an extensionless one could be
 /// PATHEXT-completed. The bare `whoami` is not fully qualified either; the allowlist refuses it
 /// first.
 #[skuld::test]
@@ -423,7 +398,7 @@ fn an_extensionless_search_program_is_refused_on_the_consent_path() {
     }
 }
 
-/// Negative control for the `Search` and argv[0] arms. Fully qualified: a bare `whoami.exe` is
+/// Negative control for argv[0]. Fully qualified: a bare `whoami.exe` is
 /// refused (see `launch_runas_refuses_a_program_that_is_not_fully_qualified`).
 #[skuld::test]
 fn a_search_exe_or_com_program_plans_a_launch() {
@@ -456,14 +431,10 @@ fn a_search_batch_reached_through_normalisation_is_refused_regardless_of_privile
     }
 }
 
-/// Each name as an `executable()` and as a bare argv[0], the two ways a token reaches `lpFile`
-/// unresolved.
+/// Each name as a bare argv[0], the one way a token reaches `lpFile`.
 fn search_commands(names: &[&str]) -> Vec<(String, Command)> {
     let mut out = Vec::new();
     for &n in names {
-        let mut exe = Command::new();
-        exe.executable(n).args([n]).elevate();
-        out.push((format!("executable({n:?})"), exe));
         let mut argv = Command::new();
         argv.args([n]).elevate();
         out.push((format!("args([{n:?}])"), argv));
@@ -724,15 +695,15 @@ fn launch_runas_refuses_a_batch_program_regardless_of_privilege() {
     }
 }
 
-/// An `Exact` batch file reached only through Win32 normalisation is refused as the batch file it
-/// is, before the planner, so the verdict does not depend on privilege.
+/// An absolute argv[0] batch file reached only through Win32 normalisation is refused as the batch
+/// file it is, before the planner, so the verdict does not depend on privilege.
 #[skuld::test]
-fn launch_runas_refuses_an_exact_batch_reached_through_normalisation_regardless_of_privilege() {
+fn launch_runas_refuses_an_absolute_argv0_batch_reached_through_normalisation_regardless_of_privilege() {
     for elevated in [false, true] {
         // Trailing dot; one trailing space; a file named `.bat`.
         for probe in [r"C:\t\setup.bat.", r"C:\t\setup.bat ", r"C:\t\.bat"] {
             let mut c = Command::new();
-            c.raw_executable(probe).args([probe, "a&calc"]).elevate();
+            c.args([probe, "a&calc"]).elevate();
             let detail = unsupported_detail(super::plan_runas(&c, &win_host(elevated)).map(|_| ()));
             assert!(
                 detail.contains("CVE-2024-24576"),

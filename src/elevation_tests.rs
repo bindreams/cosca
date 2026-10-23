@@ -225,7 +225,6 @@ fn the_shared_argv_gate_refuses_each_rule_with_the_backends_words() {
         op_prefix: "test elevation",
         commandline: "no command lines here",
         setter: "argv[0] only here",
-        argv0: "no separate argv[0] here",
     };
     let refusal = |c: &Command| match super::elevation_argv(c, &WORDS) {
         Err(Error::Unsupported { op, platform, detail }) => {

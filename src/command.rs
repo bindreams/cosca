@@ -36,44 +36,6 @@ pub struct Command {
     held: Vec<std::sync::Arc<std::fs::File>>,
 }
 
-/// [`explain_cwd_read`]'s error when this process's cwd cannot be read: says why a path was
-/// needed, and keeps the read's own error — errno included — as its source.
-#[derive(Debug)]
-struct CwdUnreadable(std::io::Error);
-
-impl std::fmt::Display for CwdUnreadable {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "elevating raw_executable() needs this process's working directory as a path, and it \
-             cannot be read: {}",
-            self.0
-        )
-    }
-}
-
-impl std::error::Error for CwdUnreadable {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.0)
-    }
-}
-
-/// `process_cwd`, with a failure explained as [`CwdUnreadable`] and its own error kept as the
-/// source — for the macOS graphical elevation, the one sink that needs this process's cwd as a
-/// path.
-#[cfg_attr(
-    not(unix),
-    allow(
-        dead_code,
-        reason = "its only caller is elevation::macos, itself dead off-unix (see elevation.rs's `mod macos`)"
-    )
-)]
-pub(crate) fn explain_cwd_read(
-    process_cwd: impl FnOnce() -> std::io::Result<PathBuf>,
-) -> impl FnOnce() -> std::io::Result<PathBuf> {
-    move || process_cwd().map_err(|e| std::io::Error::new(e.kind(), CwdUnreadable(e)))
-}
-
 /// Which setter recorded the executable path, and therefore whether cosca resolves it before
 /// the OS sees it.
 ///
@@ -85,8 +47,8 @@ pub(crate) fn explain_cwd_read(
 pub(crate) enum ExecutableSpec {
     /// From [`Command::executable`]: cosca resolves it (`PATH`, `.exe`) before the OS sees it.
     Search(PathBuf),
-    /// From [`Command::raw_executable`]: never searched — at most completed to an absolute path,
-    /// where a sink would otherwise search a relative one.
+    /// From [`Command::raw_executable`]: never searched — at most anchored (`./tool`) or
+    /// completed to an absolute path, where a sink would otherwise search a relative one.
     Exact(PathBuf),
 }
 
@@ -198,7 +160,7 @@ impl Command {
     /// `executable("/bin/busybox").args(["sh", "-c", "..."])` correctly loads
     /// busybox while the child sees `"sh"` as its `argv[0]`.
     ///
-    /// On Windows, for an UNELEVATED spawn, a set `executable` routes through the raw
+    /// On Windows, a set `executable` routes through the raw
     /// `CreateProcessW` backend, which sets `lpApplicationName` independently of
     /// `lpCommandLine` — so `argv[0]` is preserved (it no longer degrades to the
     /// executable path), and combining `executable` with
@@ -233,17 +195,9 @@ impl Command {
     /// against the CHILD's working directory ([`current_dir`](Self::current_dir) when set) — even with no
     /// `executable` set at all. (`raw_executable` itself does not add a second bare-name search: its image is
     /// completed rather than searched — see its own doc — so this rule has nothing to resolve for it; it
-    /// matters here only as a second way to land on the raw backend.) This is specific
-    /// to the raw backend: on Windows, [`elevate`](Self::elevate) ordinarily takes a different route
-    /// (`ShellExecuteEx`, not `CreateProcessW`) — except when the calling process is already elevated, where it
-    /// falls back to the same unelevated backends this doc otherwise describes: the raw `CreateProcessW`
-    /// backend when `executable` or `raw_executable` is set (an elevated spawn cannot map fd >= 3, so that
-    /// trigger is unavailable here), `std::process::Command` otherwise. Either way — `ShellExecuteEx`, or either
-    /// already-elevated fallback — `elevate()` refuses anything but a fully qualified `.exe`/`.com` before that
-    /// matters, so a bare or relative `executable` never reaches a search on the `elevate()` path at all. (On
-    /// POSIX, `elevate` goes through one of the POSIX elevation backends — `sudo`, `doas`, `pkexec`,
-    /// `osascript` — none of which is `CreateProcessW`, so this rule, specific to Windows's raw backend, has
-    /// nothing to resolve there either.)
+    /// matters here only as a second way to land on the raw backend.) [`elevate`](Self::elevate)
+    /// refuses `executable` and `raw_executable` (see "Elevation" below) and cannot map fd >= 3, so
+    /// an elevated spawn never reaches this rule.
     ///
     /// **An UNELEVATED spawn that reaches neither trigger — no `executable`/`raw_executable`, no `fd` mapping a
     /// descriptor >= 3 — stays on the DEFAULT Windows backend, `std::process::Command`, and none
@@ -316,25 +270,20 @@ impl Command {
     /// The dividing line is whether a different filesystem could make the name succeed: if
     /// no disk ever could, the refusal is a property of the string, and it is `InvalidInput`.
     ///
-    /// This resolution rule does NOT apply to an ELEVATED spawn: that path goes through
-    /// `ShellExecuteEx` instead of `CreateProcessW`, entirely bypassing the raw
-    /// backend (and this resolver) described above, and nothing resolves the name there. So
-    /// [`elevate`](Self::elevate) on Windows takes only a fully qualified path to an image.
-    /// `ShellExecuteEx` can apply `PATHEXT` and file associations even to an absolute name
-    /// (measured without a class; for cosca's `exefile` launch on the consent route it is
-    /// unmeasured), so a name not ending in `.exe` or `.com` is refused with
-    /// [`std::io::ErrorKind::InvalidInput`] — both `executable(r"C:\tools\setup")` and
-    /// `executable("whoami")` — and a bare or relative one such as `whoami.exe` is refused with
-    /// [`Error::Unsupported`]. A `%` in the name or in [`current_dir`](Self::current_dir) is refused
-    /// with [`std::io::ErrorKind::InvalidInput`], since whether the launch expands it is unmeasured.
-    /// All of these hold whether or not the caller is already elevated.
-    ///
-    /// Every Windows spawn, elevated or not, refuses a `.bat`/`.cmd` that only Win32's
-    /// normalisation exposes, such as `C:\t\setup.bat.` (trailing dot), `C:\t\setup.bat ` (one
-    /// trailing space) and `C:\t\.bat`, with [`Error::Unsupported`] (CVE-2024-24576).
+    /// Every Windows spawn refuses a `.bat`/`.cmd` that only Win32's normalisation exposes, such as
+    /// `C:\t\setup.bat.` (trailing dot), `C:\t\setup.bat ` (one trailing space) and `C:\t\.bat`,
+    /// with [`Error::Unsupported`] (CVE-2024-24576).
     ///
     /// [`raw_executable`](Self::raw_executable) is the unresolved alternative; calling either
     /// replaces the other.
+    ///
+    /// # Elevation
+    ///
+    /// [`elevate`](Self::elevate) refuses a command that sets this, with [`Error::Unsupported`],
+    /// on every platform and whether or not the caller is already elevated. An elevated program
+    /// is named by `argv[0]` alone: every backend runs `argv[0]` as written, and cosca never
+    /// rewrites argv, so it has no program to search for. Pass the program as `argv[0]` instead;
+    /// see [`elevate`](Self::elevate) for what each backend accepts there.
     pub fn executable<P: Into<PathBuf>>(&mut self, path: P) -> &mut Command {
         self.executable = Some(ExecutableSpec::Search(path.into()));
         self
@@ -364,9 +313,6 @@ impl Command {
     ///   the name there, both from the cwd it inherits, so no path to this process's cwd is ever
     ///   needed and the file loaded and the directory run in are always the same.
     ///
-    ///   Under [`elevate`](Self::elevate), see that method's doc for which directory each
-    ///   backend runs in; the file loaded here is always the one the directory it names holds.
-    ///
     /// [`executable`](Self::executable) resolves against the child's working directory on both.
     /// The divergence is inherited from the platform primitives, not chosen here.
     ///
@@ -386,22 +332,11 @@ impl Command {
     ///
     /// # Elevation
     ///
-    /// On Windows the elevated path goes through `ShellExecuteEx`, which can search a path-less
-    /// `lpFile` and apply `PATHEXT` even to an absolute one (measured without a class; for cosca's
-    /// `exefile` launch on the consent route it is unmeasured). cosca completes the name to an
-    /// absolute path first, by the same rules as above, and refuses it with
-    /// [`std::io::ErrorKind::InvalidInput`] unless it ends in `.exe` or `.com` — so
-    /// `raw_executable(r"C:\tools\setup").elevate()` is refused where the unelevated spawn loads
-    /// `C:\tools\setup`.
-    ///
-    /// Every elevation backend derives the child's `argv[0]` from the program it is handed
-    /// (`ShellExecuteEx`'s `lpFile`, the POSIX backends' and `osascript`'s exec): `./tool` under
-    /// `sudo`, `doas` and `osascript`, and the completed absolute path under `ShellExecuteEx`. `pkexec`
-    /// refuses a relative `raw_executable()` (see [`elevate`](Self::elevate)), and an absolute one is
-    /// its `argv[0]` as given. So `raw_executable("tool").args(["tool"])` yields `argv[0] == "tool"`
-    /// only unelevated, or from an already-elevated caller, which runs no backend and spawns
-    /// with argv verbatim. Handing a backend the bare name instead would let it search for the
-    /// image.
+    /// [`elevate`](Self::elevate) refuses a command that sets this, with [`Error::Unsupported`],
+    /// on every platform and whether or not the caller is already elevated. Every backend loads
+    /// the program `argv[0]` names and gives the child that `argv[0]`, and cosca never rewrites
+    /// argv, so no backend can load a file named apart from it. Pass the program as `argv[0]`
+    /// instead, absolute: `args(["/opt/tool", "-x"]).elevate()`.
     pub fn raw_executable<P: Into<PathBuf>>(&mut self, path: P) -> &mut Command {
         self.executable = Some(ExecutableSpec::Exact(path.into()));
         self
@@ -898,24 +833,27 @@ impl Command {
     /// - `pkexec` is passed `--keep-cwd`, and so requires Linux and polkit 121 or later; see
     ///   [`Backend::Pkexec`](crate::elevation::Backend::Pkexec).
     ///
-    /// A relative [`raw_executable`](Self::raw_executable) reaches each backend but pkexec in a form
-    /// it does not search:
+    /// The program is `argv[0]`, as written. A command that sets
+    /// [`executable`](Self::executable) or [`raw_executable`](Self::raw_executable) is refused with
+    /// [`Error::Unsupported`], on every platform and whether or not the caller is already elevated.
+    /// What `argv[0]` may be depends on the backend:
     ///
-    /// - `sudo` and `doas` are handed `./tool`, and read it against the directory they inherited,
-    ///   after authenticating, so a rename of an ancestor during authentication cannot swap the
-    ///   file; under a sudoers `runcwd`, `./tool` is not found.
-    /// - `osascript`'s trampoline carries no cwd, so its shell `cd -P`s to the directory as an
-    ///   absolute path completed against this process's cwd (read once), and runs `./tool` there.
-    ///   A cwd with no usable path fails the spawn: an unlinked directory with `NotFound`, an
-    ///   unsearchable ancestor with `PermissionDenied`, each with an error saying why a path was
-    ///   needed.
+    /// - `sudo`, `doas` and `pkexec` are handed it as written, and resolve a bare name by their own
+    ///   lookup (`sudo`'s `secure_path`, for one). `pkexec` has no `--`, so one starting with `-`
+    ///   is refused with [`Error::Unsupported`].
+    /// - `osascript` (macOS, [`Auth::Gui`](crate::elevation::Auth::Gui)) requires an absolute path,
+    ///   since root's shell would search its own `PATH` for anything else.
+    /// - On Windows, `ShellExecuteEx` loads it, not cosca's resolver, and can apply `PATHEXT` and
+    ///   file associations even to an absolute name (measured without a class; for cosca's
+    ///   `exefile` launch on the consent route it is unmeasured). So it must be a fully qualified
+    ///   path to an image: a name not ending in `.exe` or `.com` is refused with
+    ///   [`std::io::ErrorKind::InvalidInput`], and a bare or relative one such as `whoami.exe` with
+    ///   [`Error::Unsupported`]. A `%` in it or in [`current_dir`](Self::current_dir) is refused
+    ///   with [`std::io::ErrorKind::InvalidInput`], since whether the launch expands it is
+    ///   unmeasured.
+    ///   These hold whether or not the caller is already elevated.
     ///
-    /// `pkexec` runs a relative program only if the caller itself can execute it, so under
-    /// `Backend::Pkexec` a relative `raw_executable()` is refused with [`Error::Unsupported`],
-    /// root or not: pass an absolute path. A program named by [`executable`](Self::executable) or
-    /// `argv[0]` reaches pkexec as written, and pkexec's own lookup resolves it.
-    ///
-    /// An already-root caller runs no backend and spawns as it would unelevated.
+    /// An already-root caller runs no backend and spawns argv as it would unelevated.
     pub fn elevate(&mut self) -> &mut Command {
         self.elevation.enabled = true;
         self

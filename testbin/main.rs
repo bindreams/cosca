@@ -1485,10 +1485,18 @@ fn main() {
         #[cfg(unix)]
         "elevate-pkexec-report" => {
             drop_root();
-            // `elevate-pkexec-report <raw_executable> [<current_dir>]`.
+            // `elevate-pkexec-report <argv0|raw> <program> [<current_dir>]`: the program as argv[0]
+            // only, or also as `raw_executable()`.
             let mut c = cosca::Command::new();
-            c.raw_executable(&args[2]).args([&args[2]]);
-            if let Some(dir) = args.get(3) {
+            c.args([&args[3]]);
+            match args[2].as_str() {
+                "argv0" => {}
+                "raw" => {
+                    c.raw_executable(&args[3]);
+                }
+                other => panic!("elevate-pkexec-report: expected argv0 or raw, got {other:?}"),
+            }
+            if let Some(dir) = args.get(4) {
                 c.current_dir(dir);
             }
             c.elevation_backend(cosca::elevation::Backend::Pkexec)

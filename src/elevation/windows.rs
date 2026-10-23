@@ -228,7 +228,6 @@ use crate::child::proc_handle::ProcHandle;
 use crate::child::spawn::windows_raw::resolve::ensure_no_nul_wide;
 use crate::child::spawn::windows_raw::RawChild;
 use crate::child::spawn::{Classify, SpawnFailure};
-use crate::command::ExecutableSpec;
 use crate::containment::Attachment;
 use crate::elevation::plan::Transition;
 use crate::elevation::shell_file;
@@ -336,8 +335,8 @@ impl Drop for ComInit {
     }
 }
 
-/// The argv runas can work from at all. Split from [`elevated_program`] and [`elevated_params`] so
-/// the program's NUL check can sit between them — see [`plan_runas`].
+/// The argv runas can work from at all. Split from [`elevated_params`] so the program's NUL check
+/// can sit between them — see [`plan_runas`].
 fn elevated_argv(cmd: &Command) -> Result<&[OsString], Error> {
     super::elevation_argv(cmd, &ARGV_REFUSALS)
 }
@@ -350,40 +349,7 @@ pub(crate) const ARGV_REFUSALS: super::ArgvRefusals = super::ArgvRefusals {
     setter: "name the elevated program as argv[0] (set .args([program, ...])): ShellExecuteEx(runas) \
              loads argv[0] as written, so neither executable()'s search nor raw_executable()'s exact \
              file can be honoured",
-    argv0: "ShellExecuteEx(runas) cannot set an argv[0] independent of the loaded image",
 };
-
-/// The loaded image. Honors `executable()`. A `raw_executable()` program is additionally COMPLETED to an absolute
-/// path — see the `Exact` arm below for why that is the opposite of searching for it.
-fn elevated_program(cmd: &Command, argv: &[OsString]) -> Result<OsString, Error> {
-    // The token AS WRITTEN, before any completion: argv[0], or the explicit executable.
-    // `elevated_argv` refused an argv[0] distinct from a set executable, so the two agree.
-    let token = cmd
-        .executable_path()
-        .map_or_else(|| argv[0].clone(), |exe| exe.as_os_str().to_os_string());
-
-    // An `Exact` token is completed, never passed through: `ShellExecuteEx` would search a
-    // relative `lpFile`. See `absolutise_exact`'s doc for why this sink needs that and
-    // `CreateProcessW` does not, and for the `PATHEXT` residue [`plan_runas`]'s allowlist covers.
-    //
-    // A `Search` token is passed as written, not resolved: [`plan_runas`] refuses it unless it is a
-    // fully qualified `.exe`/`.com` path (`shell_file::reject_elevated_program`), so
-    // `ShellExecuteEx` has no search to make.
-    //
-    // Completion runs BEFORE [`plan_runas`]'s `wide_nul("program path", ..)`, so it must not blunt
-    // that field's NUL attribution: `absolutise_exact` refuses an interior NUL itself, under the
-    // same "program path" name, ahead of every other field and of its own shape checks.
-    //
-    // Spelled out rather than `_ =>`: the discriminant IS the feature here, and this is the
-    // security sink. A future `ExecutableSpec` variant must not compile silently into the
-    // SEARCHING branch, which is the unsafe default.
-    match cmd.executable_spec() {
-        Some(ExecutableSpec::Exact(p)) => {
-            Ok(crate::child::spawn::windows_raw::resolve::absolutise_exact(p)?.into_os_string())
-        }
-        Some(ExecutableSpec::Search(_)) | None => Ok(token),
-    }
-}
 
 /// The joined `lpParameters` line, NUL-checked per element BEFORE the join: `lpParameters` is one
 /// string, so a refusal built from it could only say that SOME element carried a NUL.
@@ -436,8 +402,10 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
     // Structural config gate FIRST — privilege-independent (before the short-circuit), so
     // an already-elevated caller gets the same verdict for piped/env/contain/commandline.
     reject_unsupported_config(cmd)?;
-    let argv = elevated_argv(cmd)?; // validates commandline()/empty argv too
-    let program = elevated_program(cmd, argv)?;
+    // The program is argv[0] as written: `ShellExecuteEx` gets it unresolved, and the gates below
+    // refuse anything but a fully qualified `.exe`/`.com`, so it has no search to make.
+    let argv = elevated_argv(cmd)?; // refuses executable()/raw_executable()/commandline()/empty too
+    let program = &argv[0];
 
     // Input validation stays with `reject_unsupported_config`, ABOVE the short-circuit, so every
     // verdict here is a property of the REQUEST rather than of the caller's ambient privilege.
@@ -465,10 +433,9 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
     let params_w = wide_nul("argument line", params.as_os_str())?;
     let verb_w = wide_nul("verb", OsStr::new("runas"))?;
 
-    // Refuse a `.bat`/`.cmd` spelled in the program `elevated_program` returned — the caller's
-    // TOKEN, except on the `Exact` arm, where it is that token completed to an absolute path.
-    // `ShellExecuteEx`'s `runas` resolves the `batfile` association, which routes through `cmd.exe`
-    // and substitutes `lpParameters` into `%*` UNESCAPED — and `join_wide` quotes only for
+    // Refuse a `.bat`/`.cmd` spelled in the program, argv[0]. `ShellExecuteEx`'s `runas` resolves
+    // the `batfile` association, which routes through `cmd.exe` and substitutes `lpParameters`
+    // into `%*` UNESCAPED — and `join_wide` quotes only for
     // whitespace, never for cmd metacharacters, so `args(["setup.bat", "a&calc"])` is command
     // injection into an ELEVATED cmd.exe. That is CVE-2024-24576, which the raw and std backends
     // both refuse outright.
@@ -483,7 +450,7 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
     // name already ending in `.exe` is unmeasured on every route), with no `"` or `%`, and a
     // `current_dir()` with no `%`. A relative or bare token is refused until the image is resolved
     // before the launch.
-    let program_path = std::path::Path::new(&program);
+    let program_path = std::path::Path::new(program);
     crate::child::spawn::reject_batch_path(program_path)?;
     shell_file::reject_elevated_program(program_path)?;
     if let Some(dir) = cmd.cwd() {

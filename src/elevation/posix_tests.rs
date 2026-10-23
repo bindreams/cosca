@@ -521,19 +521,6 @@ mod rewrite_tests {
         ));
     }
 
-    #[skuld::test]
-    fn distinct_argv0_with_executable_is_unsupported() {
-        let mut c = Command::new();
-        c.executable("/bin/busybox")
-            .args(["sh", "-c", "true"])
-            .elevation_backend(Backend::Sudo)
-            .elevation_auth(Auth::NonInteractive);
-        assert!(matches!(
-            rewrite_with_host(&mut c, &sudo_host()),
-            Err(Error::Unsupported { .. })
-        ));
-    }
-
     pub(super) fn elevated_sudo_host() -> Host {
         Host {
             elevated: true,

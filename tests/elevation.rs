@@ -66,9 +66,8 @@ fn posix_child_self_detects_elevation(#[fixture(elevation)] _group: &Group) {
     let exe = testbin();
     let exe_str = exe.clone().into_os_string();
     let mut c = cosca::Command::new();
-    // executable() set AND argv[0] == the exe path, so no distinct-argv0 rejection.
-    c.executable(&exe)
-        .args([exe_str, "is-elevated-report".into()])
+    // The program is argv[0] alone: an elevated spawn refuses executable().
+    c.args([exe_str, "is-elevated-report".into()])
         .elevation_auth(cosca::elevation::Auth::NonInteractive);
     let s = c.read().expect("read");
     assert_eq!(s.trim(), "1", "elevated testbin did not self-detect elevation");
@@ -239,14 +238,13 @@ fn posix_uncontained_elevated_child_is_unkillable_and_drop_does_not_hang(#[fixtu
     let nonce = common::payload::fresh_nonce();
     let exe = testbin();
     let mut c = cosca::Command::new();
-    c.executable(&exe)
-        .args([
-            exe.clone().into_os_string(),
-            "block-on-socket".into(),
-            addr.into(),
-            nonce.clone().into(),
-        ])
-        .elevation_auth(cosca::elevation::Auth::NonInteractive);
+    c.args([
+        exe.clone().into_os_string(),
+        "block-on-socket".into(),
+        addr.into(),
+        nonce.clone().into(),
+    ])
+    .elevation_auth(cosca::elevation::Auth::NonInteractive);
     let child = c.spawn().expect("elevated block-on-socket");
     // Watched by pid, not through `child`: this test owns the only `Child`, so the `drop` below
     // is the `Drop` under test and not a reference count going down.
@@ -283,8 +281,7 @@ fn already_elevated_inherit_spawn_reports_already_elevated(#[fixture(elevation)]
     require_unelevated();
     let exe = testbin();
     let mut c = cosca::Command::new();
-    c.executable(&exe)
-        .args([exe.clone().into_os_string(), "elevated-spawn-report".into()])
+    c.args([exe.clone().into_os_string(), "elevated-spawn-report".into()])
         .elevation_auth(cosca::elevation::Auth::NonInteractive);
     let reported = c.read().expect("read the elevated testbin's report");
     assert_eq!(reported.trim(), "AlreadyElevated");
@@ -300,7 +297,7 @@ fn windows_elevated_child_writes_admin_marker(#[fixture(elevation)] _group: &Gro
     let marker = dir.join(format!("elev-{}.marker", std::process::id()));
     let exe = testbin();
     let mut c = cosca::Command::new();
-    c.executable(&exe).args([
+    c.args([
         exe.clone().into_os_string(),
         "write-marker".into(),
         marker.clone().into_os_string(),
@@ -416,14 +413,13 @@ fn windows_kill_of_an_elevated_child_reports_what_happened(#[fixture(elevation)]
     let nonce = common::payload::fresh_nonce();
     let exe = testbin();
     let mut c = cosca::Command::new();
-    c.executable(&exe)
-        .args([
-            exe.clone().into_os_string(),
-            "block-on-socket".into(),
-            addr.into(),
-            nonce.clone().into(),
-        ])
-        .elevate();
+    c.args([
+        exe.clone().into_os_string(),
+        "block-on-socket".into(),
+        addr.into(),
+        nonce.clone().into(),
+    ])
+    .elevate();
     let child = c.spawn().expect("runas spawn");
     // A medium-integrity parent cannot open the UAC-elevated child by pid, and `Child` exposes no
     // handle to wait on, so its early exit cannot be watched; the `drop` below is the only owner.
@@ -447,7 +443,7 @@ async fn async_windows_elevated_child_writes_admin_marker(#[fixture(elevation)] 
     let marker = dir.join(format!("elev-async-{}.marker", std::process::id()));
     let exe = testbin();
     let mut c = cosca::tokio::Command::new();
-    c.executable(&exe).args([
+    c.args([
         exe.clone().into_os_string(),
         "write-marker".into(),
         marker.clone().into_os_string(),
@@ -477,14 +473,13 @@ async fn async_windows_kill_of_an_elevated_child_reports_what_happened(#[fixture
     let nonce = common::payload::fresh_nonce();
     let exe = testbin();
     let mut c = cosca::tokio::Command::new();
-    c.executable(&exe)
-        .args([
-            exe.clone().into_os_string(),
-            "block-on-socket".into(),
-            addr.into(),
-            nonce.clone().into(),
-        ])
-        .elevate();
+    c.args([
+        exe.clone().into_os_string(),
+        "block-on-socket".into(),
+        addr.into(),
+        nonce.clone().into(),
+    ])
+    .elevate();
     let mut child = c.spawn().expect("async runas spawn");
 
     // `Child::wait` is async and `&mut`, so the race is `select!` here and the helper's exit

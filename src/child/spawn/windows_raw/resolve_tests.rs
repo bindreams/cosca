@@ -1043,33 +1043,43 @@ fn resolution_searches_the_given_snapshot() {
     );
 }
 
-// `absolutise_exact`: the `raw_executable()` contract, on the one path that needs it ──────
+// `absolutise_exact_on`: the `raw_executable()` contract ──────
 //
-// These exist because the elevated `Exact` arm had NO coverage: replacing this function's whole
-// body with `Ok(program.to_path_buf())`, or deleting the arm in `elevation::windows::elevated_program`
-// that calls it, passed the entire suite on every platform. Each test below kills one of those
-// mutations. They need only a Windows runner, not elevation.
+// The cwd is stated: `absolutise_exact_on` reads this process's cwd only through its reader, so
+// these need no real directory and run on any Windows runner.
+
+/// `absolutise_exact_on` with `cwd` as this process's cwd and no drive's own directory set.
+fn exact_on(program: &Path, cwd: &str) -> Result<PathBuf, Error> {
+    let cwd = PathBuf::from(cwd);
+    absolutise_exact_on(program, || Ok(cwd), |_| Ok(None)).map(|c| c.path)
+}
+
+/// `absolutise_exact_on` that fails the test if it reads any cwd.
+fn exact_reading_nothing(program: &Path) -> Result<PathBuf, Error> {
+    absolutise_exact_on(
+        program,
+        || panic!("must not read the process cwd"),
+        |_| panic!("must not read a drive's directory"),
+    )
+    .map(|c| c.path)
+}
 
 /// The core promise: ABSOLUTE, but completed rather than searched.
 ///
 /// A bare name must come back as the calling process's current directory joined with that name —
-/// which is what `CreateProcessW` would do with the same partial `lpApplicationName`, and is NOT
-/// what `ShellExecuteEx` would do with the same path-less `lpFile` (it would search `PATHEXT` and
-/// `lpDirectory`). Kills "replace the body with a passthrough".
+/// which is what `CreateProcessW` would do with the same partial `lpApplicationName`. Kills
+/// "replace the body with a passthrough".
 #[skuld::test]
 fn absolutise_exact_completes_a_bare_name_against_the_processes_cwd() {
-    // Two readings of the process cwd — one inside `GetFullPathNameW`, one in the assertion —
-    // agree because no test in this binary moves it (clippy's `disallowed-methods`, configured
-    // in `clippy.toml`, forbids it).
-    let got = absolutise_exact(Path::new("tool")).unwrap();
-    assert_eq!(got, std::env::current_dir().unwrap().join("tool"), "{got:?}");
+    let got = exact_on(Path::new("tool"), r"C:\base").unwrap();
+    assert_eq!(got, PathBuf::from(r"C:\base\tool"), "{got:?}");
     assert!(got.is_absolute());
 }
 
 /// No extension is invented. `executable("tool")` would look for `tool.exe`; this must not.
 #[skuld::test]
 fn absolutise_exact_never_appends_an_extension() {
-    let got = absolutise_exact(Path::new("tool")).unwrap();
+    let got = exact_on(Path::new("tool"), r"C:\base").unwrap();
     assert_eq!(got.file_name().unwrap(), std::ffi::OsStr::new("tool"), "{got:?}");
 }
 
@@ -1077,29 +1087,30 @@ fn absolutise_exact_never_appends_an_extension() {
 /// `NotFound` here would mean the resolver was used instead.
 #[skuld::test]
 fn absolutise_exact_succeeds_for_a_file_that_does_not_exist() {
-    let got = absolutise_exact(Path::new("no-such-file-983471.tmp")).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let got = exact_on(Path::new("no-such-file-983471.tmp"), dir.path().to_str().unwrap()).unwrap();
     assert!(got.is_absolute(), "{got:?}");
     assert!(!got.exists(), "the probe name must genuinely not exist: {got:?}");
 }
 
-/// An already-absolute path is returned as itself, not re-rooted.
+/// An already-absolute path is returned as itself, not re-rooted, and reads no cwd.
 #[skuld::test]
 fn absolutise_exact_leaves_an_absolute_path_absolute() {
     let me = std::env::current_exe().unwrap();
-    assert_eq!(absolutise_exact(&me).unwrap(), me);
+    assert_eq!(exact_reading_nothing(&me).unwrap(), me);
 }
 
 /// Empty fails closed: an empty `lpApplicationName` is a pointer to a lone NUL rather than the
 /// NULL pointer, and whether `CreateProcessW` treats those alike is undocumented.
 #[skuld::test]
 fn absolutise_exact_refuses_an_empty_program() {
-    match absolutise_exact(Path::new("")) {
+    match exact_reading_nothing(Path::new("")) {
         Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput => {}
         other => panic!("an empty program must be Io(InvalidInput), got {other:?}"),
     }
 }
 
-/// Kills dropping EITHER of `absolutise_exact`'s two shape checks (see its comments):
+/// Kills dropping EITHER of the two shape checks (see `check_exact` and `complete_exact`):
 /// `C:\t\.` needs the pre-check, while `C:\t\...` and `C:\t\. ` (one trailing space) name no file
 /// only after normalisation and need the post-check.
 #[skuld::test]
@@ -1115,7 +1126,7 @@ fn absolutise_exact_refuses_a_program_that_names_no_file() {
         r"C:\t\...",
         r"C:\t\. ",
     ] {
-        match absolutise_exact(Path::new(n)) {
+        match exact_on(Path::new(n), r"C:\base") {
             Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput => {}
             other => panic!("{n:?} names no file and must be Io(InvalidInput), got {other:?}"),
         }
@@ -1123,9 +1134,8 @@ fn absolutise_exact_refuses_a_program_that_names_no_file() {
 }
 
 /// An INTERIOR NUL fails closed. `PCWSTR` stops at the first NUL, so without this check
-/// `raw_executable("C:\\a\\b.exe\0junk")` would silently become `lpFile = C:\a\b.exe` — a
-/// different file than the caller named, loaded elevated. The raw backend already refuses such a
-/// path, so accepting it here would make the contract depend on which path you spawned through.
+/// `raw_executable("C:\\a\\b.exe\0junk")` would silently become `C:\a\b.exe` — a different file
+/// than the caller named.
 ///
 /// Note the empty-path guard alone does NOT catch this: the `OsStr` is non-empty.
 #[skuld::test]
@@ -1133,20 +1143,20 @@ fn absolutise_exact_refuses_an_interior_nul() {
     use std::os::windows::ffi::OsStringExt;
     for units in [vec![0u16], "a.exe\0b".encode_utf16().collect::<Vec<u16>>()] {
         let p = std::ffi::OsString::from_wide(&units);
-        match absolutise_exact(Path::new(&p)) {
+        match exact_reading_nothing(Path::new(&p)) {
             Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput => {}
             other => panic!("an interior NUL must be Io(InvalidInput), not truncated: {p:?}, got {other:?}"),
         }
     }
 }
 
-/// Kills moving `absolutise_exact`'s NUL check below its shape check (see its comment):
-/// `x` + NUL + `\` must be blamed on the NUL.
+/// Kills moving `check_exact`'s NUL check below its shape check (see its comment): `x` + NUL + `\`
+/// must be blamed on the NUL.
 #[skuld::test]
 fn absolutise_exact_reports_an_interior_nul_ahead_of_the_shape() {
     use std::os::windows::ffi::OsStringExt;
     let p = std::ffi::OsString::from_wide(&"x\0\\".encode_utf16().collect::<Vec<u16>>());
-    match absolutise_exact(Path::new(&p)) {
+    match exact_reading_nothing(Path::new(&p)) {
         Err(Error::Io(e)) => {
             assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{e:?}");
             assert!(e.to_string().contains("embedded NUL"), "the NUL must be named: {e}");

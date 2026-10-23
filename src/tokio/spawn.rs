@@ -121,13 +121,13 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
     // the std/tokio path, whose `prepare` applies containment for argv/commandline spawns.
     #[cfg(windows)]
     if to_raw_backend {
-        // Attach the report on the AlreadyElevated fall-through too — an already-elevated
-        // `executable()` command routes here (fd >= 3 on an elevated child is already rejected by
-        // the Windows gate), and dropping the raw child without the report would lose its elevation
-        // state (mirrors the sync `spawn_elevated` post-spawn set).
-        let mut child = windows_raw::spawn_raw(cmd, fds, kill_on_drop)?;
-        child.set_elevation(elevation_report);
-        return Ok(child);
+        // An elevated request never routes here: the Windows gate refuses `executable()`,
+        // `raw_executable()` and fd >= 3 on it, already elevated or not.
+        debug_assert!(
+            elevation_report.is_none(),
+            "an elevated request reached the raw backend past the gate"
+        );
+        return windows_raw::spawn_raw(cmd, fds, kill_on_drop);
     }
 
     #[cfg(target_os = "linux")]
