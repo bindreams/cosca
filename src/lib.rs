@@ -24,6 +24,9 @@
 //!   [`Error::MayHaveStarted`](error::Error::MayHaveStarted): a spawn reads the identity once the
 //!   child runs. [`ProcessId::current`](identity::ProcessId::current)
 //!   needs only a readable `/proc/self/stat`.
+//! - The elevation shim (`cosca::init`) runs on Linux. Other platforms have no shim; `init` reports
+//!   that and does not start the program. It needs `/proc` mounted: it reaches cosca's socket through
+//!   `/proc/thread-self/fd`. Without it the shim refuses, saying so, and the program is not started.
 //!
 //! [`Containment::CgroupV2`] additionally needs `cgroup.kill` (Linux 5.14); without it `CgroupV2`
 //! is not used and containment falls back as documented on [`Containment`]. It also assumes kernel
@@ -65,6 +68,11 @@ pub mod stdio;
 #[cfg(windows)]
 pub use containment::Job;
 pub use containment::{ContainMode, Containment};
+#[cfg(unix)]
+pub use elevation::shim::{init, installed};
+#[doc(hidden)]
+#[cfg(unix)]
+pub use elevation::shim::{init_with_test_hooks, Gate, Inject, ShimTestHooks};
 pub use elevation::{Auth, Backend, ElevatedStdio, ElevatedVia, ElevationReport, EnvSanitizer, Privilege, Secret};
 pub use graceful::GracefulMechanism;
 pub use stdio::{Fd, Stdio};
@@ -205,8 +213,18 @@ pub fn run_line(line: impl Into<std::ffi::OsString>) -> Command {
     c
 }
 
+#[cfg(all(test, unix))]
+#[path = "../testbin/shim_hooks.rs"]
+mod shim_env_hooks;
+
 #[cfg(test)]
 fn main() {
+    // This binary is also the elevation shim in the shim's end-to-end tests: a process started with
+    // the shim's arguments runs it here and exits.
+    #[cfg(unix)]
+    shim_env_hooks::init();
+    #[cfg(target_os = "linux")]
+    elevation::shim::owner_helper::run_if_requested();
     let mut runner = skuld::TestRunner::new();
     runner.libtest_names();
     runner.require_known_labels();

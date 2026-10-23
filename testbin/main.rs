@@ -33,6 +33,10 @@ mod console_identity;
 mod accept;
 
 #[cfg(unix)]
+#[path = "shim_hooks.rs"]
+mod shim_hooks;
+
+#[cfg(unix)]
 #[path = "setuid_stdin_block.rs"]
 mod setuid_stdin_block;
 
@@ -252,6 +256,9 @@ fn spawn_reported_grandchild(exe: &std::path::Path, args: &[&str]) -> KeptGrandc
 struct KeptGrandchild(std::process::Child);
 
 fn main() {
+    // The elevation shim, when this process was started as one; its test seams come from the environment.
+    #[cfg(unix)]
+    shim_hooks::init();
     let args: Vec<String> = std::env::args().collect();
     #[cfg(target_os = "linux")]
     if std::fs::read_link("/proc/self/exe").is_ok_and(|exe| exe.file_name() == Some("pkexec-impl".as_ref())) {
