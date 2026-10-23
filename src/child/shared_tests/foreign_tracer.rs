@@ -6,111 +6,20 @@
 //! only after the tracer hands the zombie back: by reaping it with `waitpid`, or by exiting
 //! (`exit_ptrace` detaches it; a debugger that quits). Both are tested, for the unbounded `wait`
 //! and, for the reap, for a bounded `wait_deadline`. A tracee the tracer merely stops is no exit
-//! either. The tracer here is a re-exec of this test binary ([`foreign_tracer_helper`]); the
-//! tracee allows it with `PR_SET_PTRACER`, which Yama's scope 1 requires of a tracer that is no
-//! ancestor.
+//! either. The tracer is [`crate::test_support::foreign_tracer`]'s re-exec of this test binary.
 
 use std::cell::Cell;
-use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::os::fd::AsRawFd as _;
-use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+use std::os::unix::process::ExitStatusExt as _;
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::sync::Arc;
 
 use super::fixtures::Blocker;
 use crate::test_groups::{tracer_group, Group};
+use crate::test_support::foreign_tracer::{self, EXIT, REAP, STOP};
 use crate::wait::exit_only::seams::{self as exit_seams, HolderStep};
 use crate::wait::exit_only::Target;
-
-/// Marks the helper re-exec; the value is the driver's pid.
-const MARKER: &str = "COSCA_TEST_SHARED_FOREIGN_TRACER";
-
-const PID_ENV: &str = "COSCA_TEST_SHARED_FOREIGN_TRACER_PID";
-
-/// The go bytes. `STOP` makes the helper stop the tracee and report it; `REAP` and `EXIT` hand the
-/// zombie back.
-const STOP: u8 = b's';
-const REAP: u8 = b'r';
-const EXIT: u8 = b'x';
-
-fn say(line: &str) {
-    // Not `println!`: it panics on a write error.
-    writeln!(std::io::stdout(), "@@{line}@@").expect("write to the driver");
-}
-
-/// `waitpid(pid, __WALL)`, past `EINTR`.
-fn waitpid_status(pid: libc::pid_t) -> libc::c_int {
-    loop {
-        let mut status = 0;
-        // SAFETY: `status` is a valid out-pointer.
-        let r = unsafe { libc::waitpid(pid, &mut status, libc::__WALL) };
-        if r != -1 {
-            return status;
-        }
-        let e = std::io::Error::last_os_error();
-        assert_eq!(e.raw_os_error(), Some(libc::EINTR), "waitpid: {e}");
-    }
-}
-
-/// The foreign tracer: seize the pid in [`PID_ENV`], report, and act on each go byte from stdin:
-/// `STOP` interrupts the tracee and reports the stop, `REAP` reaps the zombie with `waitpid` and
-/// reports, `EXIT` exits without reaping. A no-op unless it is the re-exec the driver started.
-///
-/// It seizes with no options, so no `PTRACE_O_TRACEEXIT`: the kill is not delayed by an exit stop,
-/// and the pidfd turns readable at the zombie.
-#[skuld::test]
-fn foreign_tracer_helper() {
-    if !crate::test_child::is_marked_fixture_reexec(MARKER) {
-        return;
-    }
-    let pid: libc::pid_t = std::env::var(PID_ENV)
-        .expect("the tracee's pid")
-        .parse()
-        .expect("a pid");
-    // SAFETY: a ptrace request on a pid; variadic `addr`/`data` are read as pointers: typed nulls.
-    let null = std::ptr::null_mut::<libc::c_void>;
-    let rc = unsafe { libc::ptrace(libc::PTRACE_SEIZE, pid, null(), null()) };
-    assert_eq!(rc, 0, "PTRACE_SEIZE: {}", std::io::Error::last_os_error());
-    say("seized");
-    loop {
-        let mut go = [0u8; 1];
-        std::io::stdin().read_exact(&mut go).expect("the driver's go byte");
-        match go[0] {
-            EXIT => return,
-            STOP => {
-                // SAFETY: as above.
-                let rc = unsafe { libc::ptrace(libc::PTRACE_INTERRUPT, pid, null(), null()) };
-                assert_eq!(rc, 0, "PTRACE_INTERRUPT: {}", std::io::Error::last_os_error());
-                let status = waitpid_status(pid);
-                assert!(libc::WIFSTOPPED(status), "waitpid: not a stop: {status:#x}");
-                say("stopped");
-            }
-            REAP => {
-                // The driver saw the pidfd readable, so the tracee is a zombie, which `waitpid`
-                // reports before any stop.
-                let status = waitpid_status(pid);
-                assert!(
-                    libc::WIFEXITED(status) || libc::WIFSIGNALED(status),
-                    "waitpid: not an exit: {status:#x}"
-                );
-                say("reaped");
-                return;
-            }
-            other => panic!("an unknown go byte {other:#x}"),
-        }
-    }
-}
-
-/// Ends the helper when the driver leaves, whatever the way.
-struct Helper(std::process::Child);
-
-impl Drop for Helper {
-    fn drop(&mut self) {
-        _ = self.0.kill();
-        _ = self.0.wait();
-    }
-}
 
 /// What the waiting thread reports.
 enum Msg {
@@ -122,19 +31,6 @@ enum Msg {
     Spun(String),
     /// `wait` returned, with the holder's steps.
     Done(std::io::Result<Option<std::process::ExitStatus>>, Vec<HolderStep>),
-}
-
-/// The next line of the helper's stdout that ends in `@@<expected>@@`: libtest-mimic's
-/// `test <name> ... ` prefix (skuld's harness), which the helper shares, may precede it on the
-/// same line.
-fn expect_line(lines: &mut impl Iterator<Item = std::io::Result<String>>, expected: &str) {
-    let want = format!("@@{expected}@@");
-    for line in lines {
-        if line.expect("read the helper's stdout").ends_with(&want) {
-            return;
-        }
-    }
-    panic!("the helper ended without reporting {expected:?}");
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -225,32 +121,12 @@ fn a_deadline_wait_on_a_zombie_held_by_a_foreign_tracer_is_handed_back(#[fixture
 }
 
 fn hand_back(go_byte: u8, wait: Wait, stop_first: bool) {
-    let b = Blocker::spawn_with(|cmd| {
-        // SAFETY: `set_ptracer` is a raw `prctl` syscall, async-signal-safe, and touches only the
-        // forked child.
-        unsafe {
-            cmd.pre_exec(|| match rustix::process::set_ptracer(rustix::process::PTracer::Any) {
-                // `INVAL`: no Yama, so nothing restricts a tracer and nothing needs allowing.
-                Ok(()) | Err(rustix::io::Errno::INVAL) => Ok(()),
-                Err(e) => Err(e.into()),
-            });
-        }
-    });
-    let pid = b.shared.id();
-    let mut cmd = crate::test_child::fixture_command(crate::test_child::fixture_path!(foreign_tracer_helper));
-    cmd.env(MARKER, std::process::id().to_string())
-        .env(PID_ENV, pid.to_string())
-        .env_remove("RUST_TEST_NOCAPTURE")
-        .stdin(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit());
-    let mut helper = Helper(crate::test_spawn::spawn(&mut cmd).expect("spawn the foreign tracer"));
-    let mut go = helper.0.stdin.take().expect("piped stdin");
-    let mut lines = BufReader::new(helper.0.stdout.take().expect("piped stdout")).lines();
-    expect_line(&mut lines, "seized");
+    let b = Blocker::spawn_with(foreign_tracer::allow_any_tracer);
+    let mut tracer = foreign_tracer::spawn_helper(b.shared.id());
 
     if stop_first {
-        go.write_all(&[STOP]).expect("tell the helper to stop the tracee");
-        expect_line(&mut lines, "stopped");
+        tracer.send(STOP);
+        tracer.expect("stopped");
         assert_eq!(b.shared.try_wait().expect("try_wait"), None, "a stop is no exit");
         // The wait ends at its deadline with one final peek; a peek that read the stop as an exit
         // would go on to reap.
@@ -379,10 +255,9 @@ fn hand_back(go_byte: u8, wait: Wait, stop_first: bool) {
             panic!("wait returned {result:?} ({steps:?}) while the tracer still held the zombie")
         }
     }
-    go.write_all(&[go_byte])
-        .expect("tell the helper to hand the zombie back");
+    tracer.send(go_byte);
     if go_byte == REAP {
-        expect_line(&mut lines, "reaped");
+        tracer.expect("reaped");
     }
     let Msg::Done(result, steps) = rx.recv().expect("the waiter reports") else {
         panic!("the waiter reported a step twice");
@@ -416,7 +291,5 @@ fn hand_back(go_byte: u8, wait: Wait, stop_first: bool) {
         b.shared.try_wait().expect("try_wait").and_then(|s| s.signal()),
         Some(libc::SIGKILL)
     );
-    drop(go);
-    let status = helper.0.wait().expect("the helper exits");
-    assert!(status.success(), "{status:?}");
+    tracer.finish();
 }
