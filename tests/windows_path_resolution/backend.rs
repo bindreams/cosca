@@ -14,7 +14,8 @@ use crate::provenance::survey_platform;
 use crate::test_groups::{path_probes, Group};
 
 /// M2: a child spawned while all three of the parent's std handles are null. std sets no
-/// `STARTF_USESTDHANDLES` then; the raw backend duplicates them.
+/// `STARTF_USESTDHANDLES` then. Rev 19 §3 predicts the raw backend duplicates them after P7; on
+/// `main` it fails the spawn with `ERROR_INVALID_HANDLE` (6), which is #726.
 #[skuld::test]
 fn m2_null_std_handles(#[fixture(path_probes)] _group: &Group) {
     survey_platform();
@@ -84,7 +85,8 @@ fn argv_of(stdout: &str, bin: &str) -> String {
 }
 
 /// M13: a verbatim process cwd and no `current_dir`: a child given `NULL` (std's route), the cwd
-/// string explicitly (std's and the raw backend's), and the raw backend with no `current_dir`.
+/// string explicitly (std's and the raw backend's), and the raw backend with no `current_dir`
+/// (`unset_raw`), which passes the cwd string, not `NULL`.
 #[skuld::test]
 fn m13_a_verbatim_process_cwd_without_current_dir(#[fixture(path_probes)] _group: &Group) {
     survey_platform();

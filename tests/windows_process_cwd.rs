@@ -114,9 +114,11 @@ fn a_drive_relative_current_dir_takes_the_drives_own_directory_as_win32_does(#[f
 
 #[cfg(windows)]
 /// M12 (#156): a process cwd on a `subst` drive that is then removed, or re-pointed at another
-/// directory. A child spawned with `NULL` (std's route), and with the cwd string explicitly (std's
-/// and the raw backend's), reports its cwd string and what it finds there. Records `M12` lines;
-/// asserts only that the probe entered the drive.
+/// directory. A child spawned with `NULL` (std's route), with the cwd string explicitly (std's and
+/// the raw backend's), and by the raw backend with no `current_dir` (which passes the cwd string,
+/// not `NULL`), reports its cwd string and what it finds there. Records `M12` lines;
+/// asserts only that the probe entered the drive and that the mapping was removed or re-pointed
+/// before each recording.
 ///
 /// System-affecting: the probe maps a drive letter for the logon session, so it is the
 /// `DRIVE_MAPPING` group.
@@ -169,7 +171,7 @@ fn a_unc_current_dir_runs_there_and_a_verbatim_unc_cwd_completes_as_win32_does()
 
 #[cfg(windows)]
 mod drive_mapping_group {
-    //! Re-execs this binary on the one `DRIVE_MAPPING` test. Its body never runs here: each case is
+    //! Re-execs this binary on a `DRIVE_MAPPING` test. Its body never runs here: each case is
     //! either opted out or refused at setup, so these are safe on any host.
 
     use crate::common::test_reexec::{command, suite_outcome, with_json_events, SuiteOutcome, NOCAPTURE};
