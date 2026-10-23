@@ -94,7 +94,7 @@ fn release_clears_kill_on_close_and_keeps_the_breakaway_bits() {
 /// A release that fails after the threads resumed says so, and the guard is still armed when it
 /// is dropped, so the OS ends the running child instead of leaving it unguarded.
 #[skuld::test]
-fn a_failed_guard_release_is_reported_after_the_threads_resumed() {
+fn death_watch_a_failed_guard_release_is_reported_after_the_threads_resumed() {
     use crate::containment::windows::fault::{force_next, Step};
     const ERROR_ACCESS_DENIED: u32 = 5;
     let (mut child, mut attachment) = frozen_uncontained();

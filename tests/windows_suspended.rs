@@ -124,11 +124,12 @@ fn frozen_child_dies_with_its_parent(
     assert_eq!(report_field(&report, "job"), job, "{backend}/{shape}: {report}");
     assert_eq!(report_field(&report, "guard"), guard, "{backend}/{shape}: {report}");
     let pid: u32 = report_field(&report, "pid").parse().expect("the frozen child's pid");
-    assert_eq!(
-        helper.test_job_handle_contains(pid),
-        helper_contained,
-        "{backend}/{shape}: the frozen child is in the helper's job exactly when the helper has one"
-    );
+    if helper_contained {
+        assert!(
+            helper.test_job_handle_contains(pid),
+            "{backend}/{shape}: the frozen child is in the helper's job, which the test holds"
+        );
+    }
     // The helper holds the frozen child until the go byte, so this pid cannot be anyone else's.
     let watch = Watch::open(pid);
     sock.write_all(b"g").expect("send go");

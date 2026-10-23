@@ -776,7 +776,7 @@ mod hold_mode {
     /// A frozen Strongest root is assigned its containment job and stays suspended; the job is its
     /// guard, so there is no second one.
     #[skuld::test]
-    fn attach_in_hold_mode_assigns_a_strongest_roots_job_and_leaves_the_thread_suspended() {
+    fn death_watch_attach_in_hold_mode_assigns_a_strongest_roots_job_and_leaves_the_thread_suspended() {
         let child = spawn_suspended_blocker();
         let thread = InitialThread::of(child.id());
 
@@ -830,7 +830,8 @@ mod hold_mode {
     /// Every shape without a cosca job of its own gets a guard, assigned while frozen, and keeps
     /// the containment it would report if it were not frozen.
     #[skuld::test]
-    fn attach_in_hold_mode_gives_treewalk_nested_and_uncontained_shapes_a_guard_and_keeps_their_containment() {
+    fn death_watch_attach_in_hold_mode_gives_treewalk_nested_and_uncontained_shapes_a_guard_and_keeps_their_containment(
+    ) {
         let shapes = [
             (
                 "treewalk root",

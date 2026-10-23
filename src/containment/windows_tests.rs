@@ -873,7 +873,7 @@ fn death_watch_attach_job_succeeds_when_the_initial_thread_was_already_running()
 
 /// `assign_held` assigns the job and does not resume: the thread stays frozen.
 #[skuld::test]
-fn assign_held_assigns_the_job_without_resuming() {
+fn death_watch_assign_held_assigns_the_job_without_resuming() {
     let child = crate::test_frozen::spawn_suspended_blocker();
     let thread = crate::test_frozen::InitialThread::of(child.id());
 

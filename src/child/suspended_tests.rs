@@ -313,7 +313,7 @@ mod on_windows {
     }
 
     #[skuld::test]
-    fn dropping_a_frozen_child_with_piped_stdio_does_not_hang() {
+    fn death_watch_dropping_a_frozen_child_with_piped_stdio_does_not_hang() {
         for raw in BACKENDS {
             let mut cmd = blocker(raw);
             cmd.stdout(crate::Stdio::pipe()).expect("stdout pipe");
