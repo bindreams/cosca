@@ -1,0 +1,14 @@
+diff --git a/src/child/spawn/unique_report.rs b/src/child/spawn/unique_report.rs
+index 70cba258..7d25d9e6 100644
+--- a/src/child/spawn/unique_report.rs
++++ b/src/child/spawn/unique_report.rs
+@@ -230,7 +230,8 @@ fn watch(read_end: &OwnedFd, pid: u32) -> io::Result<Watch> {
+         0,
+         0,
+     );
+-    match crate::wait::backend::add_with_receipt(&kq, pipe).map_err(into_io)? {
++    let _ = pipe;
++    match 0 {
+         0 => {}
+         errno => return Err(io::Error::from_raw_os_error(errno as i32)),
+     }

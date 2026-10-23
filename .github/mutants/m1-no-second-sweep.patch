@@ -1,0 +1,14 @@
+diff --git a/src/child/spawn.rs b/src/child/spawn.rs
+index 219ec185..37f304ee 100644
+--- a/src/child/spawn.rs
++++ b/src/child/spawn.rs
+@@ -920,7 +920,8 @@ impl LateTree {
+         use crate::containment::Attached;
+         match (&self.reach, sweep) {
+             (Reach::None, _) => {}
+-            (Reach::Attached(attached), Sweep::RootAlive | Sweep::RootKilled { zombie: true }) => {
++            (Reach::Attached(_), Sweep::RootKilled { zombie: true }) => {}
++            (Reach::Attached(attached), Sweep::RootAlive) => {
+                 self.failed = attached.hard_kill().err().map(|e| e.to_string());
+             }
+             // The root is not shown ours any more: only the holders, and never the root.

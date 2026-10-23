@@ -1,0 +1,66 @@
+# Throwaway: runs each named mutant's target tests on macOS, expecting them to fail, and the
+# unmutated tree's, expecting them to pass. Never merged.
+name: Mutants
+
+on:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  COSCA_TEST_ROOT: "0"
+  COSCA_TEST_UID_SWITCH: "0"
+  COSCA_TEST_NAMESPACES: "0"
+  COSCA_TEST_SETUID: "0"
+  COSCA_TEST_CGROUP: "0"
+  COSCA_TEST_ELEVATION: "0"
+
+jobs:
+  mutant:
+    name: ${{ matrix.name }}
+    runs-on: macos-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: baseline
+            tracer: "1"
+            filter: "test(/late_report_tests::|unique_report_tests::|origin_tests::|late_child_held_by_a_tracer/)"
+          - name: m1-no-second-sweep
+            filter: "test(/macos_late_session_child_without_a_marker/)"
+          - name: m2-gone-root-leaves-tree
+            filter: "test(/late_child_reaped_before_its_teardown_kills_its_marked_tree/)"
+          - name: m3-echild-is-gone
+            tracer: "1"
+            filter: "test(/late_child_held_by_a_tracer_is_not_answered_dead/)"
+          - name: s1-no-read-registration
+            filter: "test(/awaiting_is_woken_by_the_report_through_the_pipe/)"
+          - name: s1-readable-is-spurious
+            filter: "test(/awaiting_is_woken_by_the_report_through_the_pipe/)"
+          - name: origin-no-parent
+            filter: "test(/origin_tests::a_child_of_this_process_is_ours/)"
+          - name: origin-always-ours
+            filter: "test(/origin_tests::the_parent_of_this_process_is_not_ours/)"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: ./.github/actions/setup-rust
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
+        with:
+          tool: cargo-nextest@0.9.148
+      - name: Apply the mutant
+        if: matrix.name != 'baseline'
+        run: git apply ".github/mutants/${{ matrix.name }}.patch"
+      - name: Run the target tests
+        shell: bash
+        env:
+          COSCA_TEST_TRACER: ${{ matrix.tracer || '0' }}
+          COSCA_TEST_TRACER_CONSENT: "1"
+        run: |
+          set +e
+          cargo nextest run --locked --features tokio --no-fail-fast --no-tests=fail -E '${{ matrix.filter }}'
+          code=$?
+          echo "nextest exit: $code"
+          if [ "${{ matrix.name }}" = baseline ]; then exit "$code"; fi
+          # A mutant must fail its tests (exit 100), not pass or fail to build.
+          [ "$code" -eq 100 ]

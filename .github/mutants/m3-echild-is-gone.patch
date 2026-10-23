@@ -1,0 +1,13 @@
+diff --git a/src/child/spawn/unique_report.rs b/src/child/spawn/unique_report.rs
+index 70cba258..834dda96 100644
+--- a/src/child/spawn/unique_report.rs
++++ b/src/child/spawn/unique_report.rs
+@@ -296,7 +296,7 @@ fn child_is_running(pid: u32) -> io::Result<bool> {
+         Peek::Running => true,
+         Peek::Exit(_) => false,
+         Peek::Foreign(_) => match origin(pid) {
+-            Origin::Ours => true,
++            Origin::Ours => false,
+             Origin::NotOurs | Origin::Gone => false,
+             Origin::Refused(errno) => {
+                 return Err(io::Error::new(

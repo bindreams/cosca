@@ -1,0 +1,13 @@
+diff --git a/src/child/spawn.rs b/src/child/spawn.rs
+index 219ec185..6c3a46ca 100644
+--- a/src/child/spawn.rs
++++ b/src/child/spawn.rs
+@@ -932,7 +932,7 @@ impl LateTree {
+                 self.notes.push(NOT_SWEPT_AGAIN.to_owned());
+             }
+             (Reach::Attached(_), Sweep::RootKilled { zombie: false }) => self.notes.push(NOT_SWEPT_AGAIN.to_owned()),
+-            (Reach::Holders(m), _) => self.failed = m.hard_kill_holders_only(None).err().map(|e| e.to_string()),
++            (Reach::Holders(m), _) => drop(m),
+         }
+     }
+ }
