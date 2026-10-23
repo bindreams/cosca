@@ -1106,11 +1106,12 @@ pub(crate) enum SuspendCount {
     /// A frozen child's release: resumes the child's INITIAL thread only, and only if its previous
     /// count was exactly 1. An initial thread that ran, or that something else suspended again,
     /// means the child is not as its creator left it. Every other thread (one an EDR agent or a
-    /// debugger started) is not opened at all: the creator suspended only the initial thread, so a
-    /// resume of any other would take away a suspension that is someone else's, and a call that
-    /// fails on it says nothing about the child's. If the initial thread cannot be identified (a
-    /// thread's creation time unreadable, or the earliest two equal) nothing is resumed and the
-    /// release fails.
+    /// debugger started) is opened query-only, to read its creation time, and never for
+    /// suspend/resume: the creator suspended only the initial thread, so a resume of any other would
+    /// take away a suspension that is someone else's. Other threads are never resumed and keep
+    /// their count. The initial thread is the one created first, so the release fails, resuming
+    /// nothing, if the creation time of any thread of the child cannot be read or the earliest two
+    /// are equal. A thread that is gone, or that the creator cannot open, is skipped.
     ExactlyOne,
 }
 
@@ -1135,7 +1136,7 @@ impl Walk {
     /// `second`.
     fn fail_unidentified(&mut self, process_pid: u32, first: u32, second: u32) {
         let msg = format!(
-            "the initial thread of pid {process_pid} cannot be identified: threads {first} and {second}              have the same creation time"
+            "the initial thread of pid {process_pid} cannot be identified: threads {first} and {second} have the same creation time"
         );
         log::warn!("resume_initial_threads: {msg}");
         self.last_err.get_or_insert_with(|| io::Error::other(msg));
@@ -1364,7 +1365,9 @@ fn initial_thread_id(process_pid: u32, tids: &[u32], walk: &mut Walk) -> Option<
     for &tid in tids {
         match creation_time_if_owned(tid, process_pid) {
             Ok(Some(created)) => times.push((created, tid)),
-            Ok(None) => {}
+            Ok(None) => walk.skip(format!(
+                "thread {tid} is gone, is not pid {process_pid}'s, or cannot be opened by the child's creator"
+            )),
             Err((call, e)) => {
                 walk.fail(call, tid, process_pid, e);
                 return None;
@@ -1527,7 +1530,8 @@ pub(crate) fn resume_initial_threads(
         _ = CloseHandle(snap);
 
         if walk.expected == SuspendCount::ExactlyOne {
-            // Only the initial thread is visited: no other thread of the child is opened.
+            // Only the initial thread is resumed. The others are opened query-only, to read their
+            // creation time, and that read failing fails the release.
             let own: Vec<u32> = entries
                 .iter()
                 .filter(|e| e.th32OwnerProcessID == process_pid)

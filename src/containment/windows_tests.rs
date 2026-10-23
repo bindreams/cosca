@@ -735,6 +735,40 @@ fn walk_verdict_with_only_skips_names_the_last_skip() {
     assert!(text.contains("listed no threads"), "{text}");
 }
 
+/// The tie error is one single-spaced sentence naming the pid and both threads.
+#[skuld::test]
+fn fail_unidentified_reports_the_whole_sentence() {
+    use super::{walk_verdict, Walk};
+    let mut walk = Walk::default();
+    walk.fail_unidentified(7, 12, 34);
+    let text = walk_verdict(7, walk).expect_err("a failure").to_string();
+    assert_eq!(
+        text,
+        "the initial thread of pid 7 cannot be identified: threads 12 and 34 have the same creation time"
+    );
+}
+
+/// Every thread the snapshot listed for the child reads back as gone: the identification finds no
+/// initial thread, and the walk's error says the listed threads were stale, not that none were listed.
+/// An odd id is never a thread id (they are multiples of 4), so each of these is gone.
+#[skuld::test]
+fn initial_thread_id_records_a_skip_for_each_stale_thread() {
+    use super::{initial_thread_id, walk_verdict, Walk};
+    let mut walk = Walk::default();
+    let found = initial_thread_id(7, &[0xFFFF_FFFF, 0xFFFF_FFFD], &mut walk);
+    assert_eq!(
+        found, None,
+        "no listed thread is readable, so none is the initial thread"
+    );
+    let text = walk_verdict(7, walk).expect_err("nothing was resumed").to_string();
+    assert!(
+        text.contains("every thread the snapshot listed for pid 7 was stale")
+            && text.contains("thread 4294967293")
+            && !text.contains("listed no threads"),
+        "the error must say the listed threads were stale: {text}"
+    );
+}
+
 #[skuld::test]
 fn walk_verdict_accepts_a_walk_that_resumed_a_thread() {
     use super::{walk_verdict, Walk};
@@ -878,12 +912,12 @@ fn resume_initial_threads_leaves_a_thread_someone_else_suspended_suspended() {
     child.wait().expect("the resumed blocker exits on stdin EOF");
 }
 
-/// The release visits only the initial thread: another thread of the child is not opened, so a
-/// call on it that fails (an EDR agent's thread that denies a query, say) cannot fail a release of
-/// a child whose initial thread is frozen exactly once. The failure is armed for that thread alone,
-/// and the walk must leave it unconsumed.
+/// The release resumes only the initial thread: another thread of the child is opened query-only,
+/// for its creation time, but never for suspend/resume or a suspend-count check, so a failure of
+/// that kind on it cannot fail a release of a child whose initial thread is frozen exactly once.
+/// The failure is armed for that thread alone, and the walk must leave it unconsumed.
 #[skuld::test]
-fn resume_initial_threads_does_not_open_a_thread_that_is_not_the_initial_one() {
+fn resume_initial_threads_visits_only_the_initial_thread() {
     use crate::containment::windows::fault::{force_next_for_thread, forced_is_armed, Step};
     const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
 
@@ -935,16 +969,24 @@ fn resume_initial_threads_resumes_nothing_when_a_childs_creation_time_cannot_be_
 fn resume_initial_threads_resumes_nothing_when_the_earliest_creation_times_are_equal() {
     let child = crate::test_frozen::spawn_suspended_blocker();
     let initial = crate::test_frozen::InitialThread::of(child.id());
-    let _other = crate::test_frozen::inject_running_thread_into_std_child(&child);
+    let other = crate::test_frozen::inject_running_thread_into_std_child(&child);
     let _equal = crate::containment::windows::fault::equal_creation_times();
 
     let err = super::resume_initial_threads(crate::test_frozen::raw(&child), super::SuspendCount::ExactlyOne)
         .expect_err("the initial thread cannot be identified");
 
+    // The listing order of the two threads is the snapshot's, so either order is the sentence.
+    let (a, b) = (initial.tid(), other.tid());
+    let sentence = |first: u32, second: u32| {
+        format!(
+            "the initial thread of pid {} cannot be identified: threads {first} and {second} have the same creation time",
+            child.id()
+        )
+    };
     let text = err.to_string();
     assert!(
-        text.contains("same creation time") && text.contains(&format!("pid {}", child.id())),
-        "the error must say why the initial thread is unknown: {text}"
+        text == sentence(a, b) || text == sentence(b, a),
+        "the error must say why the initial thread is unknown, in single-spaced words: {text}"
     );
     assert_eq!(
         initial.suspend_count(),
