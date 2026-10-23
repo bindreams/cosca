@@ -27,3 +27,15 @@ fn the_parent_of_this_process_is_not_ours() {
     let parent = unsafe { libc::getppid() } as u32;
     assert_eq!(origin(parent), Origin::NotOurs);
 }
+
+/// A process created before this one is not ours, though its `p_oppid` names this process's pid: an
+/// earlier holder of the pid left it. This process's parent is forced to show it.
+///
+/// Mutant: `origin` does not compare unique ids.
+#[skuld::test]
+fn a_stale_parent_at_attach_does_not_make_an_older_process_ours() {
+    // SAFETY: `getppid` has no preconditions.
+    let parent = unsafe { libc::getppid() } as u32;
+    super::kinfo::fault::force_oppid_once(std::process::id() as libc::pid_t);
+    assert_eq!(origin(parent), Origin::NotOurs);
+}
