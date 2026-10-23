@@ -212,7 +212,10 @@ fn non_permission_kill_error_stays_io_even_when_elevated() {
     assert!(matches!(super::map_elevated_kill_error(other, true), Error::Io(_)));
 }
 
-/// Every backend's argv gate is this one function; only the words differ.
+/// Every backend's argv gate is this one function; only the words differ. A program set by
+/// `executable()` or `raw_executable()` is its first rule, so it is refused whatever else is wrong.
+///
+/// Mutant: the setter rule moved below the empty-command or `commandline()` rule.
 #[skuld::test]
 fn the_shared_argv_gate_refuses_each_rule_with_the_backends_words() {
     use crate::command::Command;
@@ -221,6 +224,7 @@ fn the_shared_argv_gate_refuses_each_rule_with_the_backends_words() {
         platform: "test",
         op_prefix: "test elevation",
         commandline: "no command lines here",
+        setter: "argv[0] only here",
         argv0: "no separate argv[0] here",
     };
     let refusal = |c: &Command| match super::elevation_argv(c, &WORDS) {
@@ -230,6 +234,39 @@ fn the_shared_argv_gate_refuses_each_rule_with_the_backends_words() {
         }
         other => panic!("expected Unsupported, got {other:?}"),
     };
+    type Set = fn(&mut Command, &str);
+    let setters: [(&str, Set); 2] = [
+        ("executable", |c, p| {
+            c.executable(p);
+        }),
+        ("raw_executable", |c, p| {
+            c.raw_executable(p);
+        }),
+    ];
+    for (name, set) in setters {
+        let mut matching = Command::new();
+        matching.args(["/usr/bin/id", "-u"]);
+        let mut distinct = Command::new();
+        distinct.args(["not-id"]);
+        let mut line = Command::new();
+        line.commandline("id -u");
+        let mut empty_argv = Command::new();
+        empty_argv.args::<[&str; 0], &str>([]);
+        for (what, mut c) in [
+            ("argv[0] == program", matching),
+            ("argv[0] != program", distinct),
+            ("commandline()", line),
+            ("an empty argv", empty_argv),
+            ("no input", Command::new()),
+        ] {
+            set(&mut c, "/usr/bin/id");
+            assert_eq!(
+                refusal(&c),
+                format!("test elevation of a program set by {name}() / argv[0] only here"),
+                "{name}() with {what}"
+            );
+        }
+    }
     let mut empty_argv = Command::new();
     empty_argv.args::<[&str; 0], &str>([]);
     for no_program in [Command::new(), empty_argv] {
@@ -244,13 +281,7 @@ fn the_shared_argv_gate_refuses_each_rule_with_the_backends_words() {
         refusal(&line),
         "test elevation of a commandline() command / no command lines here"
     );
-    let mut argv0 = Command::new();
-    argv0.executable("/usr/bin/id").args(["not-id"]);
-    assert_eq!(
-        refusal(&argv0),
-        "test elevation with an argv[0] distinct from executable() / no separate argv[0] here"
-    );
     let mut ok = Command::new();
-    ok.executable("/usr/bin/id").args(["/usr/bin/id", "-u"]);
+    ok.args(["/usr/bin/id", "-u"]);
     assert_eq!(super::elevation_argv(&ok, &WORDS).expect("accepted").len(), 2);
 }

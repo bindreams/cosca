@@ -80,6 +80,10 @@ pub(crate) struct ArgvRefusals {
     pub(crate) op_prefix: &'static str,
     /// Why a `commandline()` command cannot be elevated here.
     pub(crate) commandline: &'static str,
+    /// Why an elevated program is named by argv[0] alone, never by `executable()` or
+    /// `raw_executable()`.
+    #[allow(dead_code, reason = "RED: no rule reads it yet")]
+    pub(crate) setter: &'static str,
     /// Why an argv[0] distinct from a set `executable()` cannot survive this backend.
     pub(crate) argv0: &'static str,
 }

@@ -600,19 +600,22 @@ fn explicit_set_env(ops: &[EnvOp]) -> Vec<(OsString, OsString)> {
     map.into_iter().collect()
 }
 
+/// The POSIX backends' words for [`super::elevation_argv`]'s refusals.
+pub(crate) const ARGV_REFUSALS: super::ArgvRefusals = super::ArgvRefusals {
+    platform: "unix",
+    op_prefix: "elevation",
+    commandline: "elevation requires an argv command (set .args([...])); a raw command line cannot be \
+                  safely wrapped",
+    setter: "name the elevated program as argv[0] (set .args([program, ...])): sudo, doas and pkexec \
+             run argv[0] as written, so neither executable()'s search nor raw_executable()'s exact \
+             file can be honoured",
+    argv0: "the backend runs the loaded file with argv[0] = its path; a separate argv[0] cannot \
+            survive elevation",
+};
+
 /// The argv, refused unless a backend can wrap it ([`super::elevation_argv`]).
 fn checked_argv(cmd: &Command) -> Result<&[OsString], Error> {
-    super::elevation_argv(
-        cmd,
-        &super::ArgvRefusals {
-            platform: "unix",
-            op_prefix: "elevation",
-            commandline: "elevation requires an argv command (set .args([...])); a raw command line cannot be \
-                          safely wrapped",
-            argv0: "the backend runs the loaded file with argv[0] = its path; a separate argv[0] cannot \
-                    survive elevation",
-        },
-    )
+    super::elevation_argv(cmd, &ARGV_REFUSALS)
 }
 
 /// Program + args + directory for a POSIX backend: a `raw_executable()` program in the unelevated
