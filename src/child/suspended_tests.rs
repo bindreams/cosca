@@ -318,33 +318,52 @@ mod on_windows {
 
     // Drop =====
 
-    /// A dropped frozen child is torn down by the `Child` teardown (a kill and a reap inside the
-    /// drop), whatever `kill_on_drop` says. The job's own close is a second, asynchronous kill, so
-    /// the teardown itself is what is counted.
+    /// A dropped frozen child is killed by the `Child` teardown whatever `kill_on_drop` says, for every
+    /// containment: the uncontained and `TreeWalk` shapes have no job to end it, so the teardown's
+    /// own kill is all that does. The stdin write end is leaked, so nothing but a kill can end the
+    /// process; a drop that does not kill leaves the wait below blocked (bounded by nextest's
+    /// terminate-after). The teardown count shows the drop ran the `Child` teardown, not the job's
+    /// asynchronous close.
     #[skuld::test]
-    fn dropping_a_frozen_child_with_kill_on_drop_false_runs_the_child_teardown() {
-        for contain in [false, true] {
-            let mut cmd = blocker(false);
-            cmd.kill_on_drop(false);
-            if contain {
-                cmd.contain();
+    fn death_watch_dropping_a_frozen_child_kills_it_whatever_kill_on_drop_says() {
+        for (shape, contain) in [
+            ("uncontained", None),
+            ("treewalk", Some(crate::ContainMode::TreeWalk)),
+            ("strongest", Some(crate::ContainMode::Strongest)),
+        ] {
+            for kill_on_drop in [false, true] {
+                let mut cmd = blocker(false);
+                if let Some(mode) = contain {
+                    cmd.contain_with(mode);
+                }
+                cmd.kill_on_drop(kill_on_drop);
+                cmd.stdin(crate::test_child::leaked_writer_stdin()).expect("stdin");
+                let frozen = cmd.spawn_suspended().expect("spawn suspended");
+                let remote = Remote::open(frozen.id().pid());
+                let teardowns = crate::test_frozen::record_root_teardowns();
+
+                drop(frozen);
+
+                remote.wait_for_death();
+                assert_eq!(teardowns.count(), 1, "{shape}, kill_on_drop({kill_on_drop})");
             }
-            let frozen = cmd.spawn_suspended().expect("spawn suspended");
-            let teardowns = crate::test_frozen::record_root_teardowns();
-
-            drop(frozen);
-
-            assert_eq!(teardowns.count(), 1, "contain={contain}");
         }
     }
 
+    /// Piped stdout and stderr on a dropped frozen child neither hang the drop nor keep the child
+    /// alive.
     #[skuld::test]
-    fn death_watch_dropping_a_frozen_child_with_piped_stdio_does_not_hang() {
+    fn death_watch_dropping_a_frozen_child_with_piped_stdio_kills_it_without_hanging() {
         for raw in BACKENDS {
             let mut cmd = blocker(raw);
             cmd.stdout(crate::Stdio::pipe()).expect("stdout pipe");
+            cmd.stdin(crate::test_child::leaked_writer_stdin()).expect("stdin");
             let frozen = cmd.spawn_suspended().expect("spawn suspended");
+            let remote = Remote::open(frozen.id().pid());
+
             drop(frozen);
+
+            remote.wait_for_death();
         }
     }
 

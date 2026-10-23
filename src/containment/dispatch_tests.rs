@@ -733,10 +733,10 @@ fn kill_on_drop_true_leaves_a_cgroup_leaf_armed() {
     );
 }
 
-// ===== hold mode (Windows) =====
+// ===== frozen attach (Windows) =====
 
 #[cfg(windows)]
-mod hold_mode {
+mod frozen_attach {
     use crate::containment::dispatch::{attach, Attached, Attachment, Prepared};
     use crate::containment::windows::fault::{force_next, Step};
     use crate::containment::{ContainMode, Containment};
@@ -768,7 +768,7 @@ mod hold_mode {
 
     /// A frozen Strongest root is assigned its containment job and stays suspended.
     #[skuld::test]
-    fn death_watch_attach_in_hold_mode_assigns_a_strongest_roots_job_and_leaves_the_thread_suspended() {
+    fn death_watch_attach_frozen_assigns_a_strongest_roots_job_and_leaves_the_thread_suspended() {
         let child = spawn_suspended_blocker();
         let thread = InitialThread::of(child.id());
 
@@ -776,7 +776,7 @@ mod hold_mode {
 
         assert_eq!(attachment.containment, Containment::JobObject);
         assert!(matches!(attachment.attached, Attached::JobObject(_)));
-        assert_eq!(thread.suspend_count(), 1, "hold mode must not resume");
+        assert_eq!(thread.suspend_count(), 1, "a frozen attach must not resume");
         drop(attachment);
         child
             .wait_with_output()
@@ -786,7 +786,7 @@ mod hold_mode {
     /// A frozen root needs its job to be held, so a failed assignment fails the attach instead of
     /// falling back to `TreeWalk`, which would leave nothing to kill it.
     #[skuld::test]
-    fn attach_in_hold_mode_fails_when_the_strongest_assignment_fails_instead_of_falling_back_to_treewalk() {
+    fn attach_frozen_fails_when_the_strongest_assignment_fails_instead_of_falling_back_to_treewalk() {
         let child = spawn_suspended_blocker();
         let _forced = force_next(Step::Assign, ERROR_ACCESS_DENIED);
 
@@ -817,7 +817,7 @@ mod hold_mode {
     /// left frozen and unjobbed: `attach` adds no job and keeps the containment it would report if
     /// the child were not frozen.
     #[skuld::test]
-    fn attach_in_hold_mode_gives_treewalk_nested_and_uncontained_shapes_no_job_and_leaves_them_suspended() {
+    fn attach_frozen_gives_treewalk_nested_and_uncontained_shapes_no_job_and_leaves_them_suspended() {
         let shapes = [
             (
                 "treewalk root",
@@ -850,7 +850,7 @@ mod hold_mode {
                 !matches!(attachment.attached, Attached::JobObject(_)),
                 "{name}: no job of its own"
             );
-            assert_eq!(thread.suspend_count(), 1, "{name}: hold mode must not resume");
+            assert_eq!(thread.suspend_count(), 1, "{name}: a frozen attach must not resume");
             drop(attachment);
             dispose(child);
         }

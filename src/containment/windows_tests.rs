@@ -775,7 +775,7 @@ fn resume_initial_threads_reports_a_broken_handle_contract_in_release() {
     assert!(err.to_string().contains("GetProcessId"), "{err}");
 }
 
-// ===== hold mode =====
+// ===== frozen release =====
 
 /// Kill and reap a std child these tests left suspended or running.
 fn dispose(mut child: std::process::Child) {

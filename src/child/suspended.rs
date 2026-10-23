@@ -44,7 +44,8 @@ impl Command {
     /// - Any other child (no containment, a [`TreeWalk`] root, a member of an enclosing cosca tree)
     ///   gets no job of its own. **If this process dies while it is frozen, such a child stays
     ///   frozen until someone kills it**; its recorded [`id`](SuspendedChild::id) names it. A job
-    ///   this process is itself in holds it as it holds any child, and ends it when that job closes.
+    ///   this process is itself in holds it as it holds any child, and ends it when that job closes,
+    ///   if that job kills its members on close.
     /// - A crash between `CreateProcessW` returning and the job assignment can leave even a
     ///   [`Strongest`] root frozen with nothing to kill it.
     ///

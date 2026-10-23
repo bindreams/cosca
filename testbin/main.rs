@@ -45,7 +45,8 @@ mod setuid_stdin_block;
 #[path = "breakaway.rs"]
 mod breakaway;
 
-/// The frozen-spawn helper modes (`spawn-frozen-report`, `spawn-breakaway-report`, `spawn-breakaway-child`).
+/// The frozen-spawn helper modes (`spawn-frozen-report`, `spawn-breakaway-report`, `spawn-breakaway-child`,
+/// `spawn-measured-child`, `spawn-report-pid` and `report-pid`).
 #[cfg(windows)]
 #[path = "frozen.rs"]
 mod frozen;
