@@ -4,15 +4,12 @@
 //! - `spawn-frozen-report`: hold a frozen child and block, for the test to kill.
 //! - `spawn-breakaway-report` and `spawn-breakaway-child`: whether a child's
 //!   `CREATE_BREAKAWAY_FROM_JOB` grandchild is allowed.
-//! - `spawn-measured-child`, `spawn-report-job-flags` and `report-job-flags`: the job a grandchild
-//!   sits in.
+//! - `spawn-measured-child`, `spawn-report-pid` and `report-pid`: a plain grandchild whose job
+//!   membership the test checks.
 
 use std::io::{Read, Write};
 
-use windows::Win32::System::JobObjects::{
-    JobObjectBasicLimitInformation, QueryInformationJobObject, JOBOBJECT_BASIC_LIMIT_INFORMATION,
-    JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
-};
+use windows::Win32::System::JobObjects::{JOB_OBJECT_LIMIT, JOB_OBJECT_LIMIT_BREAKAWAY_OK};
 
 /// A windowless command running `mode extra...` of this binary, through the backend `backend` names.
 fn mode_command(backend: &str, mode: &str, extra: &[&str]) -> cosca::Command {
@@ -107,26 +104,33 @@ fn apply_shape(cmd: &mut cosca::Command, shape: &str) {
 }
 
 /// Put this process into the ambient job `ambient` names: `j0`, a job of its own that forbids
-/// breakaway and carries a flag no other job in the test has; `jbreak`, one that permits breakaway;
-/// or `inherited`, the job the test spawned it into, if any.
-fn enter_ambient(ambient: &str) {
+/// breakaway; `jbreak`, one that permits breakaway; or `inherited`, the job the test spawned it
+/// into, if any.
+///
+/// Returns the name the job can be opened by (the process keeps its handle, so the name lives as
+/// long as the process), or `none` for `inherited`.
+fn enter_ambient(ambient: &str) -> String {
     let limit = match ambient {
-        "j0" => JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
+        "j0" => JOB_OBJECT_LIMIT(0),
         "jbreak" => JOB_OBJECT_LIMIT_BREAKAWAY_OK,
-        "inherited" => return,
+        "inherited" => return "none".to_owned(),
         other => panic!("unknown ambient {other}"),
     };
-    crate::breakaway::job_with_self(limit).expect("put this process into the ambient job");
+    let name = format!("cosca-test-ambient-{}-{}", std::process::id(), ambient);
+    let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    crate::breakaway::job_with_self_named(limit, windows::core::PCWSTR(wide.as_ptr()))
+        .expect("put this process into the ambient job");
+    name
 }
 
-/// Spawn the `spawn-report-job-flags` child as the test names, report its containment, tell it to
+/// Spawn the `spawn-report-pid` child as the test names, report its containment, tell it to
 /// go, and hold until the test closes the socket.
 ///
 /// `ambient` is as in [`enter_ambient`].
 pub fn spawn_measured_child(addr: &str, backend: &str, shape: &str, how: &str, ambient: &str) -> ! {
-    enter_ambient(ambient);
+    let ambient_job = enter_ambient(ambient);
     let mut sock = crate::ack::connect_control(addr).expect("connect to the test");
-    let mut cmd = mode_command(backend, "spawn-report-job-flags", &[addr]);
+    let mut cmd = mode_command(backend, "spawn-report-pid", &[addr]);
     cmd.stdin(cosca::Stdio::pipe()).expect("stdin pipe");
     apply_shape(&mut cmd, shape);
     let mut child = match how {
@@ -138,7 +142,12 @@ pub fn spawn_measured_child(addr: &str, backend: &str, shape: &str, how: &str, a
         "ordinary" => cmd.spawn().expect("spawn the child"),
         other => panic!("unknown how {other}"),
     };
-    writeln!(sock, "helper containment={:?}", child.containment()).expect("report");
+    writeln!(
+        sock,
+        "helper containment={:?} ambient_job={ambient_job}",
+        child.containment()
+    )
+    .expect("report");
     sock.flush().expect("flush");
     // Only now, with the frozen child resumed and its guard released, may the child spawn.
     let mut stdin = child.stdin().expect("the child's stdin pipe");
@@ -157,7 +166,7 @@ pub fn spawn_measured_child(addr: &str, backend: &str, shape: &str, how: &str, a
 /// socket, whether its `CREATE_BREAKAWAY_FROM_JOB` grandchild was allowed), then hold until it exits,
 /// which it does once the test closes that socket.
 pub fn spawn_breakaway_child(addr: &str, backend: &str, shape: &str, how: &str, ambient: &str) -> ! {
-    enter_ambient(ambient);
+    let _ = enter_ambient(ambient);
     let mut cmd = mode_command(backend, "spawn-breakaway-report", &[addr]);
     apply_shape(&mut cmd, shape);
     let child = match how {
@@ -175,12 +184,12 @@ pub fn spawn_breakaway_child(addr: &str, backend: &str, shape: &str, how: &str, 
 
 /// Wait for go on stdin, spawn a plain grandchild (no containment, no breakaway flag) and keep its
 /// handle, which keeps its pid naming it. Exits when stdin closes and the grandchild has gone.
-pub fn spawn_report_job_flags(addr: &str) -> ! {
+pub fn spawn_report_pid(addr: &str) -> ! {
     let mut go = [0u8; 1];
     std::io::stdin().read_exact(&mut go).expect("wait for go");
     let exe = std::env::current_exe().expect("own path");
     let mut cmd = cosca::Command::new();
-    cmd.args([exe.to_str().expect("UTF-8 path"), "report-job-flags", addr]);
+    cmd.args([exe.to_str().expect("UTF-8 path"), "report-pid", addr]);
     cmd.env(crate::ack::ACK_ENV, "1");
     cmd.stdout(cosca::Stdio::null()).expect("null stdout");
     cmd.stderr(cosca::Stdio::null()).expect("null stderr");
@@ -192,27 +201,10 @@ pub fn spawn_report_job_flags(addr: &str) -> ! {
     std::process::exit(0);
 }
 
-/// Report this process's pid and the limit flags of its innermost job, then hold until the test
-/// closes the socket.
-pub fn report_job_flags(addr: &str) -> ! {
+/// Report this process's pid, then hold until the test closes the socket.
+pub fn report_pid(addr: &str) -> ! {
     let mut sock = crate::ack::connect_control(addr).expect("connect to the test");
-    let mut info = JOBOBJECT_BASIC_LIMIT_INFORMATION::default();
-    // SAFETY: standard Win32; `info` is a valid, correctly sized out-parameter. `None` asks about
-    // the calling process's own job.
-    let queried = unsafe {
-        QueryInformationJobObject(
-            None,
-            JobObjectBasicLimitInformation,
-            std::ptr::addr_of_mut!(info).cast(),
-            size_of::<JOBOBJECT_BASIC_LIMIT_INFORMATION>() as u32,
-            None,
-        )
-    };
-    let flags = match queried {
-        Ok(()) => format!("{:#x}", info.LimitFlags.0),
-        Err(_) => "not-in-a-job".to_owned(),
-    };
-    writeln!(sock, "grandchild pid={} job_flags={flags}", std::process::id()).expect("report");
+    writeln!(sock, "grandchild pid={}", std::process::id()).expect("report");
     sock.flush().expect("flush");
     let mut b = [0u8; 1];
     let _ = sock.read(&mut b);

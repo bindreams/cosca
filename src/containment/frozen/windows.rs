@@ -20,7 +20,7 @@ pub(crate) struct Frozen {
     guard: Option<Guard>,
 }
 
-/// A guard job and whether it carries `BREAKAWAY_OK`, which its release keeps.
+/// A guard job and whether it carries the breakaway bits, which its release keeps.
 #[derive(Debug)]
 struct Guard {
     job: JobHandle,

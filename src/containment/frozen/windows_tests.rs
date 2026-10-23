@@ -27,16 +27,16 @@ fn frozen_with(mode: Option<ContainMode>, is_root: bool) -> (std::process::Child
     (child, attachment)
 }
 
-/// The armed guard of a child of this process, as literal bits: the kill and silent breakaway, plus
-/// breakaway when the job the child is in permits it. Not the production flag functions, which
-/// cannot vouch for themselves.
+/// The armed guard of a child of this process, as literal bits: the kill, plus both breakaway bits
+/// when the job the child is in permits breakaway. Not the production flag functions, which cannot
+/// vouch for themselves.
 fn armed_literal(child: &std::process::Child) -> u32 {
     use windows::Win32::System::JobObjects::{
         JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
     };
-    let mut bits = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.0 | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK.0;
+    let mut bits = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.0;
     if child_may_break_away(child) {
-        bits |= JOB_OBJECT_LIMIT_BREAKAWAY_OK.0;
+        bits |= JOB_OBJECT_LIMIT_BREAKAWAY_OK.0 | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK.0;
     }
     bits
 }
@@ -77,14 +77,15 @@ fn release_clears_kill_on_close_and_keeps_the_breakaway_bits() {
     use windows::Win32::System::JobObjects::{JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK};
     let released = observe::take_guard_flags_after_release().expect("the seam saw the released guard");
     // Literals, not `guard_released_flags()`: the production function cannot vouch for itself.
-    // Without `SILENT_BREAKAWAY_OK` every descendant of the resumed child would stay in the guard.
-    let mut expected = JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK.0;
+    // Either breakaway bit lets `CREATE_BREAKAWAY_FROM_JOB` through, so a child whose enclosing job
+    // forbids it must be left with neither.
+    let mut expected = 0;
     if child_may_break_away(&child) {
-        expected |= JOB_OBJECT_LIMIT_BREAKAWAY_OK.0;
+        expected = JOB_OBJECT_LIMIT_BREAKAWAY_OK.0 | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK.0;
     }
     assert_eq!(
         released.0, expected,
-        "released: no KILL_ON_JOB_CLOSE, silent breakaway, and breakaway where the enclosing job permits it"
+        "released: no KILL_ON_JOB_CLOSE, and both breakaway bits only where the enclosing job permits breakaway"
     );
     drop(attachment);
     child.kill().expect("kill");

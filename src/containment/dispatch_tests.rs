@@ -862,10 +862,11 @@ mod hold_mode {
             assert_eq!(attachment.containment, expected, "{name}");
             let frozen = attachment.frozen.as_ref().expect(name);
             assert!(frozen.has_guard(), "{name} has no job of its own, so it needs a guard");
-            // Literal bits: the kill and silent breakaway always, breakaway where the enclosing job allows.
-            let mut armed = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.0 | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK.0;
+            // Literal bits: the kill always, both breakaway bits only where the enclosing job allows
+            // breakaway.
+            let mut armed = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.0;
             if child_may_break_away(&child) {
-                armed |= JOB_OBJECT_LIMIT_BREAKAWAY_OK.0;
+                armed |= JOB_OBJECT_LIMIT_BREAKAWAY_OK.0 | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK.0;
             }
             assert_eq!(
                 limit_flags(frozen.guard_for_test().expect(name)).0,

@@ -986,11 +986,11 @@ fn death_watch_assign_held_assigns_the_job_without_resuming() {
     child.wait().expect("the job's close killed the frozen child");
 }
 
-/// The guard arms the kill and silent breakaway, and carries `BREAKAWAY_OK` only when asked: a
-/// guard that always carried it would let its member break away from an enclosing job that refuses.
+/// The guard arms the kill, and carries both breakaway bits only when asked: a guard that always
+/// carried either would let its member break away from an enclosing job that refuses.
 /// Literals, not the production flag functions, which cannot vouch for themselves.
 #[skuld::test]
-fn death_watch_assign_guard_job_arms_kill_on_close_and_carries_breakaway_only_when_asked() {
+fn death_watch_assign_guard_job_arms_kill_on_close_and_carries_both_breakaway_bits_only_when_asked() {
     use windows::Win32::System::JobObjects::{
         JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
     };
@@ -999,9 +999,9 @@ fn death_watch_assign_guard_job_arms_kill_on_close_and_carries_breakaway_only_wh
 
         let guard = super::assign_guard_job(crate::test_frozen::raw(&child), breakaway_ok).expect("assign the guard");
 
-        let mut expected = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.0 | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK.0;
+        let mut expected = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.0;
         if breakaway_ok {
-            expected |= JOB_OBJECT_LIMIT_BREAKAWAY_OK.0;
+            expected |= JOB_OBJECT_LIMIT_BREAKAWAY_OK.0 | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK.0;
         }
         assert_eq!(
             crate::test_frozen::limit_flags(&guard).0,
@@ -1022,10 +1022,7 @@ fn guard_released_flags_drop_the_kill_and_keep_the_breakaway_bits() {
         super::guard_released_flags(true).0,
         JOB_OBJECT_LIMIT_BREAKAWAY_OK.0 | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK.0
     );
-    assert_eq!(
-        super::guard_released_flags(false).0,
-        JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK.0
-    );
+    assert_eq!(super::guard_released_flags(false).0, 0);
 }
 
 /// A child may be given breakaway exactly where an ordinary child in its place could use it: in no

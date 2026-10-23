@@ -24,11 +24,20 @@ mod common;
 use common::{accept_or_die, bind_report, read_report_line, report_field, silence, testbin, ACK_ENV};
 
 #[cfg(windows)]
+use windows::core::{BOOL, PCWSTR};
+#[cfg(windows)]
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 #[cfg(windows)]
+use windows::Win32::System::JobObjects::{IsProcessInJob, OpenJobObjectW};
+#[cfg(windows)]
 use windows::Win32::System::Threading::{
-    OpenProcess, TerminateProcess, WaitForSingleObject, INFINITE, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    OpenProcess, TerminateProcess, WaitForSingleObject, INFINITE, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
 };
+
+/// `JOB_OBJECT_QUERY`, which the `windows` crate does not export as a constant.
+#[cfg(windows)]
+const JOB_OBJECT_QUERY: u32 = 0x0004;
 
 #[cfg(windows)]
 const BACKENDS: [&str; 2] = ["argv", "executable"];
@@ -377,9 +386,29 @@ impl Measured {
             .expect("the grandchild pid")
     }
 
-    /// The limit flags of the grandchild's innermost job.
-    fn job_flags(&self) -> &str {
-        report_field(&self.grandchild_line, "job_flags")
+    /// The name the helper's own ambient job can be opened by, or `none` when it made none.
+    fn ambient_job(&self) -> &str {
+        report_field(&self.helper_line, "ambient_job")
+    }
+
+    /// Whether the grandchild is in the job named `job_name` (a member of a nested job is a member
+    /// of every job around it). The grandchild is pinned: it is blocked on its socket.
+    fn grandchild_is_in_named_job(&self, job_name: &str) -> bool {
+        let wide: Vec<u16> = job_name.encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY: standard Win32; `wide` is NUL-terminated for the call, both handles are closed
+        // before returning, and `in_job` is a valid out-parameter.
+        unsafe {
+            let job = OpenJobObjectW(JOB_OBJECT_QUERY, false, PCWSTR(wide.as_ptr()))
+                .unwrap_or_else(|e| panic!("open the helper's ambient job {job_name}: {e}"));
+            let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, self.grandchild_pid())
+                .expect("open the grandchild");
+            let mut in_job = BOOL(0);
+            let queried = IsProcessInJob(process, Some(job), &mut in_job);
+            _ = CloseHandle(process);
+            _ = CloseHandle(job);
+            queried.expect("IsProcessInJob");
+            in_job.as_bool()
+        }
     }
 
     /// Close both sockets, which lets everything exit, and reap the helper.
@@ -415,77 +444,62 @@ fn measure(backend: &str, shape: &str, how: &str, helper_contained: bool, ambien
 }
 
 #[cfg(windows)]
-/// The flags of the job a helper makes for itself (`DIE_ON_UNHANDLED_EXCEPTION`, which no other job
-/// in these tests carries) and of the test-held containment job (`KILL_ON_JOB_CLOSE`).
-const AMBIENT_JOB_FLAGS: &str = "0x400";
-#[cfg(windows)]
-const CONTAINMENT_JOB_FLAGS: &str = "0x2000";
-
-#[cfg(windows)]
-/// A plain grandchild of a resumed frozen child sits in the job a grandchild of an ordinary
-/// spawn's child sits in. The guard is gone from its ancestry, and it has not left a job it would
-/// have stayed in. `expected_flags` pins what the ordinary spawn shows, so the comparison cannot be
-/// between two measurements of the wrong job.
-fn assert_grandchild_job_matches_an_ordinary_spawn(
-    shape: &str,
-    helper_contained: bool,
-    ambient: &str,
-    containment: &str,
-    expected_flags: &str,
-) {
+/// A plain grandchild of a resumed frozen child is in the job that holds the child: the helper's
+/// ambient job `ambient` names, or, when `helper_contained`, the containment job the test holds. The
+/// ordinary spawn is the control, so the membership check is shown to see that job at all. The
+/// innermost job is not compared: a resumed child's grandchild may sit in the released guard, which
+/// limits nothing and lies inside the enclosing job.
+fn assert_grandchild_stays_in_the_enclosing_job(shape: &str, helper_contained: bool, ambient: &str, containment: &str) {
     for backend in BACKENDS {
-        let ordinary = measure(backend, shape, "ordinary", helper_contained, ambient);
-        let frozen = measure(backend, shape, "frozen", helper_contained, ambient);
+        for how in ["ordinary", "frozen"] {
+            let measured = measure(backend, shape, how, helper_contained, ambient);
 
-        let case = format!("{backend}/{shape}");
-        assert_eq!(
-            ordinary.containment(),
-            containment,
-            "{case}: the ordinary spawn's shape"
-        );
-        assert_eq!(frozen.containment(), containment, "{case}: the frozen spawn's shape");
-        assert_eq!(
-            ordinary.job_flags(),
-            expected_flags,
-            "{case}: precondition: the ordinary spawn's grandchild must sit in the job this test built"
-        );
-        assert_eq!(
-            frozen.job_flags(),
-            ordinary.job_flags(),
-            "{case}: the grandchild of a resumed child must be in the same job as after an ordinary spawn"
-        );
-        if helper_contained {
-            assert!(
-                frozen.helper.test_job_handle_contains(frozen.grandchild_pid()),
-                "{case}: the grandchild must still be in the helper's job, which the test holds"
-            );
+            let case = format!("{backend}/{shape}/{how}");
+            assert_eq!(measured.containment(), containment, "{case}: the child's shape");
+            if helper_contained {
+                assert!(
+                    measured.helper.test_job_handle_contains(measured.grandchild_pid()),
+                    "{case}: the grandchild must be in the helper's containment job, which the test holds"
+                );
+            } else {
+                assert!(
+                    measured.grandchild_is_in_named_job(measured.ambient_job()),
+                    "{case}: the grandchild must be in the helper's ambient job"
+                );
+            }
+            measured.finish();
         }
-        ordinary.finish();
-        frozen.finish();
     }
 }
 
 #[cfg(windows)]
 #[skuld::test]
-fn death_watch_grandchild_of_a_resumed_uncontained_child_is_in_the_same_job_as_after_an_ordinary_spawn() {
-    assert_grandchild_job_matches_an_ordinary_spawn("uncontained", false, "j0", "None", AMBIENT_JOB_FLAGS);
+fn death_watch_grandchild_of_a_resumed_uncontained_child_stays_in_the_enclosing_job() {
+    assert_grandchild_stays_in_the_enclosing_job("uncontained", false, "j0", "None");
 }
 
 #[cfg(windows)]
 #[skuld::test]
-fn death_watch_grandchild_of_a_resumed_treewalk_child_is_in_the_same_job_as_after_an_ordinary_spawn() {
-    assert_grandchild_job_matches_an_ordinary_spawn("treewalk", false, "j0", "TreeWalk", AMBIENT_JOB_FLAGS);
+fn death_watch_grandchild_of_a_resumed_treewalk_child_stays_in_the_enclosing_job() {
+    assert_grandchild_stays_in_the_enclosing_job("treewalk", false, "j0", "TreeWalk");
 }
 
 #[cfg(windows)]
 #[skuld::test]
-fn death_watch_grandchild_of_a_resumed_nested_child_is_in_the_same_job_as_after_an_ordinary_spawn() {
-    assert_grandchild_job_matches_an_ordinary_spawn("contained", true, "inherited", "Delegated", CONTAINMENT_JOB_FLAGS);
+fn death_watch_grandchild_of_a_resumed_nested_child_stays_in_the_enclosing_job() {
+    assert_grandchild_stays_in_the_enclosing_job("contained", true, "inherited", "Delegated");
+}
+
+#[cfg(windows)]
+#[skuld::test]
+fn death_watch_grandchild_of_a_resumed_child_stays_in_an_enclosing_job_that_permits_breakaway() {
+    assert_grandchild_stays_in_the_enclosing_job("uncontained", false, "jbreak", "None");
+    assert_grandchild_stays_in_the_enclosing_job("treewalk", false, "jbreak", "TreeWalk");
 }
 
 #[cfg(windows)]
 /// A plain grandchild of a resumed nested child must not escape the ancestor's job through the
-/// guard's silent breakaway: `kill_tree` on the helper (the ancestor's root) has to end it. The wait
+/// guard: `kill_tree` on the helper (the ancestor's root) has to end it. The wait
 /// is on a handle opened while the child holds the grandchild, with no timer; if the grandchild
 /// escaped, it never returns and nextest's `death_watch_` bound fails the test.
 #[skuld::test]

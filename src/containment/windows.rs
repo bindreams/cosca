@@ -659,11 +659,13 @@ pub(crate) fn assign_held(proc_handle: std::os::windows::io::RawHandle) -> io::R
 /// The guard job of a frozen child that no cosca job holds: it kills the child if its owner dies
 /// while the child is frozen, and it never widens what the child may do afterwards.
 ///
-/// Membership outlives the handle, so the guard's limits outlive its kill. `SILENT_BREAKAWAY_OK`
-/// keeps the member's descendants out of the guard: they stay in the job around it, as they would
-/// with no guard. `BREAKAWAY_OK` is carried only when `breakaway_ok`: breakaway from a nested job
-/// checks the innermost one, so a guard that carried it against an enclosing job that refuses would
-/// let the child's `CREATE_BREAKAWAY_FROM_JOB` succeed where an ordinary child's is denied.
+/// The guard carries breakaway only when `breakaway_ok`, that is, only where the job around it
+/// permits it (or there is none). `CREATE_BREAKAWAY_FROM_JOB` is checked against the innermost job
+/// and either breakaway bit lets it through, so a guard that carried one against an enclosing job
+/// that refuses would let the child's request succeed where an ordinary child's is denied. With
+/// `breakaway_ok` the guard carries both bits, which keeps the child's descendants out of the guard,
+/// in the job around it, as with no guard. Without it the descendants stay in the guard, which
+/// limits nothing once released and sits inside the enclosing job, so that job still governs them.
 pub(crate) fn assign_guard_job(
     proc_handle: std::os::windows::io::RawHandle,
     breakaway_ok: bool,
@@ -680,12 +682,11 @@ pub(crate) fn guard_armed_flags(breakaway_ok: bool) -> JOB_OBJECT_LIMIT {
 
 /// The guard's limits once it is released: the kill is gone and the breakaway bits are as armed.
 pub(crate) fn guard_released_flags(breakaway_ok: bool) -> JOB_OBJECT_LIMIT {
-    let breakaway = if breakaway_ok {
-        JOB_OBJECT_LIMIT_BREAKAWAY_OK.0
+    if breakaway_ok {
+        JOB_OBJECT_LIMIT(JOB_OBJECT_LIMIT_BREAKAWAY_OK.0 | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK.0)
     } else {
-        0
-    };
-    JOB_OBJECT_LIMIT(breakaway | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK.0)
+        JOB_OBJECT_LIMIT(0)
+    }
 }
 
 /// The job a frozen child is in when its guard is assigned, as far as breakaway goes.
