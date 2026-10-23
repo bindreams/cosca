@@ -606,9 +606,7 @@ pub(crate) const ARGV_REFUSALS: super::ArgvRefusals = super::ArgvRefusals {
     op_prefix: "elevation",
     commandline: "elevation requires an argv command (set .args([...])); a raw command line cannot be \
                   safely wrapped",
-    setter: "name the elevated program as argv[0] (set .args([program, ...])): sudo, doas and pkexec \
-             run argv[0] as written, so neither executable()'s search nor raw_executable()'s exact \
-             file can be honoured",
+    setter: super::SETTER_REFUSAL,
 };
 
 /// The argv, refused unless a backend can wrap it ([`super::elevation_argv`]).

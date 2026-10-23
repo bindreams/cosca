@@ -697,6 +697,6 @@ fn the_script_enters_a_symlink_dotdot_directory_as_the_kernel_does() {
     exit_tool(&root.path().join("real").join("tool"), 11);
     exit_tool(&root.path().join("a").join("tool"), 22);
     let dir = root.path().join("a").join("link").join("..");
-    let script = build_shell_command(OsStr::new("./tool"), &[], Some(&dir)).unwrap();
+    let script = build_shell_command(OsStr::new("/bin/sh"), &args(&["-c", "exec ./tool"]), Some(&dir)).unwrap();
     assert_eq!(sh_exit_code(&script), Some(11), "{}", String::from_utf8_lossy(&script));
 }

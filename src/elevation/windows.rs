@@ -346,9 +346,7 @@ pub(crate) const ARGV_REFUSALS: super::ArgvRefusals = super::ArgvRefusals {
     platform: "windows",
     op_prefix: "elevation",
     commandline: "runas elevation requires an argv command (set .args([...]))",
-    setter: "name the elevated program as argv[0] (set .args([program, ...])): ShellExecuteEx(runas) \
-             loads argv[0] as written, so neither executable()'s search nor raw_executable()'s exact \
-             file can be honoured",
+    setter: super::SETTER_REFUSAL,
 };
 
 /// The joined `lpParameters` line, NUL-checked per element BEFORE the join: `lpParameters` is one

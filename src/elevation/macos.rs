@@ -85,19 +85,19 @@ fn is_posix_absolute(s: &OsStr) -> Result<bool, Error> {
 /// Requiring the cwd to be absolute makes osascript's directory and the script's
 /// `cd -P --` resolve the same PATH. `-P` makes the `cd` read it as the kernel's `chdir` does —
 /// osascript's own cwd, and the unelevated spawn's: a shell's default logical `cd` takes
-/// `link/..` to the directory holding `link`, not to the parent of its target, and would run a
-/// different `./tool`. It does not make them resolve the same OUTCOME:
+/// `link/..` to the directory holding `link`, not to the parent of its target, and would run
+/// the payload in a different directory. It does not make them resolve the same OUTCOME:
 /// the `cd` runs as root on the far side of the trampoline, so a directory the
 /// caller can traverse but root cannot (NFS `root_squash`) fails there, `&&`
 /// short-circuits, and the payload never runs. That surfaces as a bare non-zero
 /// exit, since [`ElevatedStdio::OsascriptRelay`] never relays the payload's stderr.
 ///
-/// Precondition: `cwd` is POSIX-absolute, and so is `program` unless `cwd` is set — enforced by
+/// Precondition: `program` and `cwd` are POSIX-absolute — enforced by
 /// [`reject_structural_gui_config`].
 pub(crate) fn build_shell_command(program: &OsStr, args: &[OsString], cwd: Option<&Path>) -> Result<Vec<u8>, Error> {
     debug_assert!(
-        cwd.is_some() || matches!(is_posix_absolute(program), Ok(true)),
-        "a relative program needs the directory it is read against"
+        matches!(is_posix_absolute(program), Ok(true)),
+        "the structural gate must reject a non-absolute program before composition"
     );
     debug_assert!(
         cwd.is_none_or(|d| matches!(is_posix_absolute(d.as_os_str()), Ok(true))),
@@ -190,9 +190,7 @@ pub(crate) const ARGV_REFUSALS: super::ArgvRefusals = super::ArgvRefusals {
     op_prefix: "macOS graphical elevation",
     commandline: "the command must be an argv (set .args([...])); a raw command line cannot be \
                   re-quoted for /bin/sh without guessing its word boundaries",
-    setter: "name the elevated program as argv[0] (set .args([program, ...])): `do shell script` \
-             execs argv[0] as written, so neither executable()'s search nor raw_executable()'s exact \
-             file can be honoured",
+    setter: super::SETTER_REFUSAL,
 };
 
 /// The argv, refused unless it is one `do shell script` can exec.

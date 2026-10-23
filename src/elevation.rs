@@ -85,6 +85,12 @@ pub(crate) struct ArgvRefusals {
     pub(crate) setter: &'static str,
 }
 
+/// Why an elevated program is named by argv[0] alone. Names no backend: the refusal also reaches
+/// a caller that is already elevated, where none runs.
+pub(crate) const SETTER_REFUSAL: &str = "name the elevated program as argv[0] (set .args([program, ...])): the \
+     elevated program is the one argv[0] names, so neither executable()'s search nor \
+     raw_executable()'s exact file can be honoured";
+
 /// The argv an elevation backend can work from. Refused, as [`crate::error::Error::Unsupported`]
 /// in `words`' terms: a program set by `executable()` or `raw_executable()`, which is checked
 /// first, then no program (`Empty`, or an empty argv) and a `commandline()` command.
