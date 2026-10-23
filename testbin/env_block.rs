@@ -76,8 +76,9 @@ pub fn spawn_with_block(dump_args: &str, entries: &[String]) {
     std::process::exit(code as i32);
 }
 
-/// `with-env-block <entries>... -- <args>...`: run `cosca_testbin <args>` in a child whose
-/// environment block is exactly `entries`, in order, and exit with its exit code.
+/// `with-env-block <entries>... -- <args>...`: run `cosca_testbin <args>` in a child given exactly
+/// `entries`, in order, as its environment block, and exit with its exit code. Windows on Arm adds
+/// `PROCESSOR_ARCHITECTURE` to that block on its own.
 pub fn with_block(args: &[String]) {
     let split = args
         .iter()
