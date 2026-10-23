@@ -70,11 +70,17 @@ fn m17_set_environment_variable_semantics(#[fixture(path_probes)] _group: &Group
                 .args(&ops),
         );
         let sections = sections(&out);
+        let (label, before) = sections.first().expect("a before section");
+        assert_eq!(label, "before");
+        // Windows may add entries of its own (`PROCESSOR_ARCHITECTURE` on Arm); recorded, and the
+        // case's entries must all be there, in order.
+        let kept: Vec<String> = before.iter().filter(|e| entries.contains(e)).cloned().collect();
         assert_eq!(
-            sections.first().map(|(label, block)| (label.as_str(), block.clone())),
-            Some(("before", entries.clone())),
-            "precondition: the child started with exactly the case's block"
+            kept, entries,
+            "precondition: the child started with the case's block, in order"
         );
+        let added: Vec<&String> = before.iter().filter(|e| !entries.contains(e)).collect();
+        println!("M17 {case} added_by_windows={added:?}");
         for (label, block) in sections {
             let block = block
                 .iter()
