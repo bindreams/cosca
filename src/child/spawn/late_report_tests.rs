@@ -131,9 +131,9 @@ fn close_fds_0_and_1(done: &crate::test_own_process::Completion) -> crate::test_
     restore
 }
 
-/// The `stdout` for a spawn while fds 0 and 1 are closed: `/dev/null`, opened before the close so it
-/// lands above stdio, since a closed stdout cannot be inherited.
-fn null_stdout() -> crate::stdio::Stdio {
+/// A stdio for a spawn while fds 0 and 1 are closed: `/dev/null`, opened before the close so it
+/// lands above stdio, since a closed descriptor cannot be inherited.
+fn null_stdio() -> crate::stdio::Stdio {
     crate::stdio::Stdio::from_file(std::fs::File::open("/dev/null").expect("open /dev/null"))
 }
 
@@ -156,7 +156,7 @@ fn macos_sync_spawn_with_fds_0_and_1_closed_leaves_no_child_behind() {
     };
     crate::log_capture::install();
     let (mut cmd, writer) = sync_blocker();
-    cmd.stdout(null_stdout()).expect("set stdout");
+    cmd.stdout(null_stdio()).expect("set stdout");
     // Opened before the close too, so the gate's ends are above stdio.
     let held = unique_report::seams::hold_the_report_until_the_first_read();
     let restore = close_fds_0_and_1(&done);
@@ -363,7 +363,8 @@ fn macos_late_session_child_without_a_marker_is_torn_down_with_what_it_starts_af
     let mut cmd = crate::Command::new();
     cmd.args(TREE_ARGV).contain_with(ContainMode::Session);
     cmd.suppress_fd_marker();
-    cmd.stdout(null_stdout()).expect("set stdout");
+    cmd.stdin(null_stdio()).expect("set stdin");
+    cmd.stdout(null_stdio()).expect("set stdout");
     for (fd, end) in ends {
         cmd.fd(fd, end).expect("set the fd");
     }
@@ -476,7 +477,7 @@ fn macos_late_child_held_by_a_tracer_is_not_answered_dead(#[fixture(tracer_group
     let pending = Rc::new(std::cell::RefCell::new(Some(tracer::start(Mode::Auto))));
     let helper: Rc<std::cell::RefCell<Option<TracerHelper<'static>>>> = Rc::default();
     let (mut cmd, writer) = sync_blocker();
-    cmd.stdout(null_stdout()).expect("set stdout");
+    cmd.stdout(null_stdio()).expect("set stdout");
     let _attach = unique_report::seams::on_first_read({
         let helper = Rc::clone(&helper);
         move |pid| {
