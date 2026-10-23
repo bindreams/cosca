@@ -600,27 +600,29 @@ pub(crate) fn launch_runas_with_host(cmd: &Command, host: &Host) -> Result<Runas
     Ok(RunasOutcome::Launched { proc, pid, id, report })
 }
 
-pub(crate) fn spawn_elevated(cmd: &mut Command, kill_on_drop: bool) -> Result<crate::child::Child, SpawnFailure> {
+pub(crate) fn spawn_elevated(cmd: &mut Command, kill_on_drop: bool) -> Result<crate::child::Spawned, SpawnFailure> {
     match launch_runas(&*cmd)? {
         RunasOutcome::AlreadyElevated => {
-            let mut child = crate::child::spawn::spawn_unelevated(cmd, kill_on_drop)?;
-            child.set_elevation(Some(crate::elevation::already_elevated_report(
-                ElevatedStdio::Passthrough,
-            )));
-            Ok(child)
+            let mut spawned = crate::child::spawn::spawn_unelevated(cmd, kill_on_drop)?;
+            spawned
+                .child
+                .set_elevation(Some(crate::elevation::already_elevated_report(
+                    ElevatedStdio::Passthrough,
+                )));
+            Ok(spawned)
         }
         RunasOutcome::Launched { proc, pid, id, report } => {
             // A dedicated non-blocking-kill handle (RawChild::new_runas): a higher-integrity
             // child a medium parent cannot terminate never hangs Drop.
-            let mut child = crate::child::Child::from_parts(
+            let mut spawned = crate::child::Child::from_parts(
                 ProcHandle::Raw(RawChild::new_runas(proc, pid)),
                 id,
                 BTreeMap::new(),
                 kill_on_drop,
                 Attachment::uac_elevated(),
             );
-            child.set_elevation(Some(report));
-            Ok(child)
+            spawned.child.set_elevation(Some(report));
+            Ok(spawned)
         }
     }
 }

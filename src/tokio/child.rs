@@ -111,6 +111,7 @@ impl Child {
         pipes: FdPipes,
         owned_std: BTreeMap<Fd, super::stdio::OwnedStd>,
     ) -> Child {
+        debug_assert!(attachment.frozen.is_none(), "a tokio spawn is never frozen");
         Child {
             os: OsResources {
                 proc: Some(proc),

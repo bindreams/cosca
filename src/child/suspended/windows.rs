@@ -1,7 +1,7 @@
 //! The Windows frozen spawn: the ordinary spawn with a suspended request, and the token it leaves.
 
 use crate::child::spawn::spawn_uncommitted;
-use crate::child::SuspendedChild;
+use crate::child::{Spawned, SuspendedChild};
 use crate::command::Command;
 use crate::error::Error;
 
@@ -71,23 +71,10 @@ pub(super) fn spawn(cmd: &mut Command) -> Result<SuspendedChild, Error> {
     let borrowed = Borrowed::new(cmd);
     let spawned = spawn_uncommitted(&mut *borrowed.cmd);
     drop(borrowed);
-    let mut child = spawned?;
-    match child.take_frozen() {
-        Some(frozen) => Ok(SuspendedChild {
-            child,
-            frozen,
-            wanted_kill_on_drop,
-        }),
-        None => {
-            debug_assert!(false, "a frozen request always yields a frozen token");
-            let fate = child.tear_down_now();
-            Err(crate::child::spawn::after_the_spawn(
-                Error::Containment {
-                    detail: "internal: the spawn did not hold the child".into(),
-                },
-                fate,
-                child.behind_wrapper(),
-            ))
-        }
-    }
+    let Spawned { child, frozen } = spawned?;
+    Ok(SuspendedChild {
+        child,
+        frozen: frozen.expect("a frozen request always yields its token"),
+        wanted_kill_on_drop,
+    })
 }

@@ -221,7 +221,9 @@ fn a_transient_tree_kill_failure_is_retried_by_the_drop() {
     let mut cmd = Command::new();
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
-    let child = crate::child::spawn::spawn_uncommitted(&mut cmd).expect("spawn");
+    let child = crate::child::spawn::spawn_uncommitted(&mut cmd)
+        .expect("spawn")
+        .into_child();
     // Rule out the leaf's own `Drop`: only the handle's drop may retry.
     child.attached.disarm();
     // The failure ends once the root is killed: the retry finds a file it can write.

@@ -7,7 +7,7 @@ use std::process::Stdio as StdStdio;
 use crate::child::proc_handle::ProcHandle;
 use crate::child::shared::SharedChild;
 pub(crate) use crate::child::spawn::failure::{after_the_spawn, Classify, SpawnFailure};
-use crate::child::{Child, ParentEnd};
+use crate::child::{Child, ParentEnd, Spawned};
 use crate::command::{Command, CommandInput, EnvOp};
 use crate::error::{ChildFate, Error};
 use crate::identity::ProcessId;
@@ -20,14 +20,14 @@ pub(crate) type ChildEnd = std::os::unix::io::OwnedFd;
 pub(crate) type ChildEnd = std::os::windows::io::OwnedHandle;
 
 pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, SpawnFailure> {
-    let child = spawn_uncommitted(cmd)?;
+    let child = spawn_uncommitted(cmd)?.into_child();
     child.commit_kill_on_drop();
     Ok(child)
 }
 
 /// [`spawn`] up to the handle it returns, whose containment resource still tears the tree down
 /// on drop whatever `kill_on_drop` says.
-pub(crate) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure> {
+pub(crate) fn spawn_uncommitted(cmd: &mut Command) -> Result<Spawned, SpawnFailure> {
     let kill_on_drop = cmd.kill_on_drop_flag();
     // Elevation runs BEFORE spawn_unelevated's std::mem::take(cmd.fds_mut()), so the
     // effect layers see/modify cmd.fds() while it is still populated (the honest Windows
@@ -63,7 +63,8 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                     // No derived command: the current POSIX `rewrite` always returns `Some` (it
                     // sanitizes even the already-elevated case into a derived), so this is defensive.
                     None => spawn_unelevated(cmd, kill_on_drop)?,
-                };
+                }
+                .into_child();
                 // Set the elevation report BEFORE handling the deferred password: a cleanup
                 // kill() in the write-failure path must see the elevated state so an EPERM maps
                 // to the typed Unkillable rather than leaking a raw Io.
@@ -71,7 +72,13 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                 let written = password_write.map_or(Ok(()), |pw| pw.write_after_spawn());
                 finish_elevated(child, written)
             })();
-            return spawned.map_err(|failure| if wrapper { failure.behind_wrapper() } else { failure });
+            return spawned.map(|child| Spawned { child, frozen: None }).map_err(|failure| {
+                if wrapper {
+                    failure.behind_wrapper()
+                } else {
+                    failure
+                }
+            });
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -352,7 +359,7 @@ pub(crate) fn routes_to_raw_backend(cmd: &Command) -> bool {
 /// re-entering the elevation branch).
 ///
 /// Every failure says whether the program could have started; see [`SpawnFailure`].
-pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<Child, SpawnFailure> {
+pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<Spawned, SpawnFailure> {
     // Before anything is made or forked: a pidfd that is refused means no child, and no leaf.
     #[cfg(target_os = "linux")]
     crate::wait::backend::probe_pidfd_support().not_started()?;
@@ -701,9 +708,9 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         }
     };
 
-    let mut child = Child::from_parts(ProcHandle::std(shared), id, parent_ends, kill_on_drop, attachment);
-    child.set_front(cmd.elevation_front());
-    Ok(child)
+    let mut spawned = Child::from_parts(ProcHandle::std(shared), id, parent_ends, kill_on_drop, attachment);
+    spawned.child.set_front(cmd.elevation_front());
+    Ok(spawned)
 }
 
 /// macOS: the identity is verified and the attach reads nothing, so an attach cannot fail. Only a

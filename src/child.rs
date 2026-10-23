@@ -126,6 +126,21 @@ pub(crate) fn root_pid_was_recycled(
     }
 }
 
+/// A freshly spawned child and, for a frozen spawn, the token that releases it.
+pub(crate) struct Spawned {
+    pub(crate) child: Child,
+    /// `None` unless the spawn was a frozen request.
+    pub(crate) frozen: Option<crate::containment::frozen::Frozen>,
+}
+
+impl Spawned {
+    /// The child of a spawn that was not frozen.
+    pub(crate) fn into_child(self) -> Child {
+        debug_assert!(self.frozen.is_none(), "a frozen spawn's token must not be dropped");
+        self.child
+    }
+}
+
 /// A spawned child process the crate owns.
 #[derive(Debug)]
 pub struct Child {
@@ -143,16 +158,6 @@ pub struct Child {
     /// The elevation front this child is, if any, as its spawn found it (see
     /// [`crate::elevation::front`]). The one source the kill and `SIGTERM` gates read.
     front: Option<crate::elevation::front::Front>,
-    /// The token of a frozen spawn, until [`SuspendedChild`] takes it; `None` for every other child.
-    /// Boxed so an ordinary child stays one pointer larger, not a job handle larger.
-    #[cfg_attr(
-        not(windows),
-        allow(
-            dead_code,
-            reason = "only a Windows frozen spawn takes it, and off Windows it is never `Some`"
-        )
-    )]
-    frozen: Option<Box<crate::containment::frozen::Frozen>>,
     /// What a failed-spawn cleanup that left this handle armed already warned of, so the drop that
     /// retries reports a repeat of it at `debug` and anything new at `warn`
     /// ([`DropReport::emit`](crate::child::drop_report::DropReport::emit)).
@@ -167,8 +172,8 @@ impl Child {
         pipes: BTreeMap<Fd, ParentEnd>,
         kill_on_drop: bool,
         attachment: crate::containment::Attachment,
-    ) -> Child {
-        Child {
+    ) -> Spawned {
+        let child = Child {
             proc,
             id,
             pipes,
@@ -179,21 +184,18 @@ impl Child {
             graceful: attachment.graceful,
             elevation: None,
             front: None,
-            frozen: attachment.frozen.map(Box::new),
             #[cfg(unix)]
             reported: Vec::new(),
+        };
+        Spawned {
+            child,
+            frozen: attachment.frozen,
         }
     }
 
     /// Set by the spawn, from its command (see [`Child::front`](Self#structfield.front)).
     pub(crate) fn set_front(&mut self, front: Option<crate::elevation::front::Front>) {
         self.front = front;
-    }
-
-    /// Take a frozen spawn's token. `None` once taken, and for a child that was not spawned frozen.
-    #[cfg_attr(not(windows), allow(dead_code, reason = "only the Windows frozen spawn takes it"))]
-    pub(crate) fn take_frozen(&mut self) -> Option<crate::containment::frozen::Frozen> {
-        self.frozen.take().map(|frozen| *frozen)
     }
 
     /// The process handle this child holds, valid while the child is.

@@ -52,7 +52,7 @@ use crate::child::spawn::{
     attach_or_fault, reject_batch_path, resolve_identity, resolve_stdio, spawn_lock, ChildEnd, Classify, PipeOwnership,
     SpawnFailure,
 };
-use crate::child::Child;
+use crate::child::{Child, Spawned};
 use crate::command::{Command, CommandInput, EnvOp, ExecutableSpec};
 use crate::error::{ChildFate, Error};
 use crate::stdio::{Fd, ResolvedStdio};
@@ -66,7 +66,7 @@ pub(crate) fn spawn_raw(
     cmd: &Command,
     fds: BTreeMap<Fd, ResolvedStdio>,
     kill_on_drop: bool,
-) -> Result<Child, SpawnFailure> {
+) -> Result<Spawned, SpawnFailure> {
     // .bat/.cmd rejected on the raw program token BEFORE resolution, so a bad/nonexistent batch
     // path still errors loudly (CVE-2024-24576) rather than surfacing as a spawn failure.
     reject_batch_program(cmd).not_started()?;

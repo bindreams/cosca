@@ -321,10 +321,13 @@ mod on_windows {
     /// A command used for `spawn_suspended` and then for `spawn` yields a running child.
     #[skuld::test]
     fn the_command_spawns_an_ordinary_child_after_a_frozen_one() {
-        drop(blocker(false).spawn_suspended().expect("spawn suspended"));
-        let mut child = blocker(false).spawn().expect("an ordinary spawn");
-        assert!(child.take_frozen().is_none());
-        end(child);
+        let mut cmd = blocker(false);
+        drop(cmd.spawn_suspended().expect("spawn suspended"));
+
+        let spawned = crate::child::spawn::spawn_uncommitted(&mut cmd).expect("an ordinary spawn");
+
+        assert!(spawned.frozen.is_none(), "only a frozen request yields a frozen token");
+        end(spawned.into_child());
     }
 
     #[skuld::test]
