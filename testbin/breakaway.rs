@@ -33,7 +33,7 @@ use windows::Win32::System::Threading::{
 /// `JobObjectBasicLimitInformation` returns `ERROR_INVALID_PARAMETER`, at runtime and not at
 /// compile time. The read side is asymmetric on purpose — the query class returns the basic
 /// structure, the setter needs the extended one.
-fn job_with_self(limits: JOB_OBJECT_LIMIT) -> Option<HANDLE> {
+pub(crate) fn job_with_self(limits: JOB_OBJECT_LIMIT) -> Option<HANDLE> {
     // SAFETY: standard Win32; `info` is fully initialised (zeroed by default()), and the handle
     // stays owned by this short-lived process.
     unsafe {

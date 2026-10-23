@@ -1215,6 +1215,14 @@ fn main() {
         #[cfg(windows)]
         "spawn-breakaway-report" => frozen::spawn_breakaway_report(&args[2]),
         #[cfg(windows)]
+        "spawn-measured-child" => {
+            frozen::spawn_measured_child(&args[2], &args[3], &args[4], &args[5], &args[6]);
+        }
+        #[cfg(windows)]
+        "spawn-report-job-flags" => frozen::spawn_report_job_flags(&args[2]),
+        #[cfg(windows)]
+        "report-job-flags" => frozen::report_job_flags(&args[2]),
+        #[cfg(windows)]
         "report-breakaway" => {
             breakaway::run(&args[2], &args[3], &args[4]);
         }
