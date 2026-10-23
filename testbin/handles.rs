@@ -16,9 +16,23 @@ use windows::Win32::Storage::FileSystem::{
     GetFileType, GetFinalPathNameByHandleW, FILE_NAME_NORMALIZED, FILE_TYPE_CHAR, FILE_TYPE_DISK, FILE_TYPE_PIPE,
 };
 use windows::Win32::System::Console::{
-    GetStdHandle, SetStdHandle, STD_ERROR_HANDLE, STD_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    SetStdHandle, STD_ERROR_HANDLE, STD_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
 use windows::Win32::System::Threading::{GetStartupInfoW, STARTF_USESTDHANDLES, STARTUPINFOW};
+
+#[link(name = "kernel32", kind = "raw-dylib")]
+extern "system" {
+    /// `GetStdHandle` unwrapped: the `windows` crate turns a null handle into an error carrying a
+    /// stale last-error code, and a null std handle is what M2 measures.
+    #[link_name = "GetStdHandle"]
+    fn raw_std_handle(id: STD_HANDLE) -> HANDLE;
+}
+
+/// This process's std handle `id`, null included.
+fn std_handle(id: STD_HANDLE) -> HANDLE {
+    // SAFETY: no preconditions.
+    unsafe { raw_std_handle(id) }
+}
 
 const STD: [(&str, STD_HANDLE); 3] = [
     ("stdin", STD_INPUT_HANDLE),
@@ -36,12 +50,13 @@ pub fn report(path: &str, probed: Option<&str>) {
     unsafe { GetStartupInfoW(&mut si) };
     let mut lines = vec![format!("usestdhandles={}", si.dwFlags.0 & STARTF_USESTDHANDLES.0 != 0)];
     for (name, id) in STD {
-        // SAFETY: no preconditions.
-        let kind = match unsafe { GetStdHandle(id) } {
-            Ok(h) if h.is_invalid() => "invalid".to_owned(),
-            Ok(h) if h.0.is_null() => "null".to_owned(),
-            Ok(h) => file_type(h),
-            Err(e) => format!("err={}", e.code().0 & 0xFFFF),
+        let h = std_handle(id);
+        let kind = if h.0.is_null() {
+            "null".to_owned()
+        } else if h.0 as isize == -1 {
+            "invalid".to_owned()
+        } else {
+            file_type(h)
         };
         lines.push(format!("{name}={kind}"));
     }
@@ -85,19 +100,12 @@ pub fn probe(case: &str, dir: &str) {
     let dir = Path::new(dir);
     match case {
         "null" => {
-            // SAFETY: no preconditions.
-            let saved: Vec<HANDLE> = STD
-                .iter()
-                .map(|&(_, id)| unsafe { GetStdHandle(id) }.expect("GetStdHandle"))
-                .collect();
+            let saved: Vec<HANDLE> = STD.iter().map(|&(_, id)| std_handle(id)).collect();
             for (_, id) in STD {
                 // SAFETY: sets this process's own std handle; this mode starts no other thread.
                 unsafe { SetStdHandle(id, HANDLE::default()) }.expect("SetStdHandle(NULL)");
             }
-            // SAFETY: no preconditions.
-            let null = STD
-                .iter()
-                .all(|&(_, id)| unsafe { GetStdHandle(id) }.is_ok_and(|h| h.0.is_null()));
+            let null = STD.iter().all(|&(_, id)| std_handle(id).0.is_null());
             let lines = routes(dir, None, |_| String::new());
             for ((_, id), h) in STD.iter().zip(saved) {
                 // SAFETY: restores the handle saved above.

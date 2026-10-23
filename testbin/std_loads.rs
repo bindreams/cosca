@@ -371,6 +371,7 @@ pub fn run_dup(t: &str, image: &str) {
         .filter(|(k, _)| k.eq_ignore_ascii_case("path"))
         .map(|(k, v)| [k, v].join(OsStr::new("=")))
         .collect();
+    let paths: Vec<String> = paths.iter().map(|p| render.apply(&p.to_string_lossy())).collect();
     println!("c8_parent_view={paths:?}");
     for (name, row) in [
         ("c8_both_op", Row::new(&["tool8"]).set("K", "1")),
@@ -386,22 +387,17 @@ pub fn run_dup(t: &str, image: &str) {
         ("c8_child_env_op", Row::new(&[me, "dump-env-block"]).set("K", "1")),
         ("c8_child_env_contained", Row::new(&[me, "dump-env-block"]).contained()),
     ] {
-        let std_col = path_entries(crate::measure::std_stdout(&mut row.std_command()));
-        let cosca_col = path_entries(crate::measure::cosca_stdout(&mut row.cosca_command()));
+        let std_col = path_entries(crate::measure::std_stdout(&mut row.std_command()), &render);
+        let cosca_col = path_entries(crate::measure::cosca_stdout(&mut row.cosca_command()), &render);
         let mut raw = row.cosca_command();
         raw.fd(3, cosca::Stdio::null()).expect("map fd 3");
-        let raw_col = path_entries(crate::measure::cosca_stdout(&mut raw));
-        println!(
-            "{name}: std={} cosca={} raw_fd3={}",
-            render.apply(&std_col),
-            render.apply(&cosca_col),
-            render.apply(&raw_col)
-        );
+        let raw_col = path_entries(crate::measure::cosca_stdout(&mut raw), &render);
+        println!("{name}: std={std_col} cosca={cosca_col} raw_fd3={raw_col}");
     }
 }
 
 /// The `Path`-named entries of a `dump-env-block` dump, or the error that stopped it.
-fn path_entries(dump: Result<Vec<u8>, String>) -> String {
+fn path_entries(dump: Result<Vec<u8>, String>, render: &Render) -> String {
     use std::os::windows::ffi::OsStringExt;
     let dump = match dump {
         Ok(dump) => dump,
@@ -414,7 +410,7 @@ fn path_entries(dump: Result<Vec<u8>, String>) -> String {
                 .step_by(4)
                 .map(|i| u16::from_str_radix(&hex[i..i + 4], 16).expect("hex"))
                 .collect();
-            OsString::from_wide(&units).to_string_lossy().into_owned()
+            render.apply(&OsString::from_wide(&units).to_string_lossy())
         })
         .filter(|e| e.get(..5).is_some_and(|name| name.eq_ignore_ascii_case("path=")))
         .collect();
