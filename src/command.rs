@@ -850,8 +850,7 @@ impl Command {
     ///   [`std::io::ErrorKind::InvalidInput`], and a bare or relative one such as `whoami.exe` with
     ///   [`Error::Unsupported`]. A `%` in it or in [`current_dir`](Self::current_dir) is refused
     ///   with [`std::io::ErrorKind::InvalidInput`], since whether the launch expands it is
-    ///   unmeasured.
-    ///   These hold whether or not the caller is already elevated.
+    ///   unmeasured. These hold whether or not the caller is already elevated.
     ///
     /// An already-root caller runs no backend and spawns argv as it would unelevated.
     pub fn elevate(&mut self) -> &mut Command {

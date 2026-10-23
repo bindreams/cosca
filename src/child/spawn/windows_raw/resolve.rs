@@ -468,7 +468,8 @@ pub(crate) fn drive_cwd_var(drive: &OsStr) -> OsString {
 /// ([`effective_cwd`]) instead, so the file loaded and the directory the child runs in come from
 /// the same value.
 ///
-/// The completion is Win32's own, on three counts documented by Win32 itself:
+/// It completes as `GetFullPathNameW` does, which matches the loader on three counts documented
+/// by Win32 itself:
 ///
 /// - It uses the same base the loader does: `GetFullPathNameW` "merges the name of the current
 ///   drive and directory with a specified file name", matching `lpApplicationName`'s own wording.
