@@ -52,8 +52,8 @@ pub(crate) enum Report {
     Id(u64),
     /// The child's own read was refused with this errno; its hook then failed before `exec`.
     ChildRefused(i32),
-    /// No report, or a short one, and every copy of the write end closed: the child died before it
-    /// could write it (before `exec`).
+    /// No report, or a short one, and either every copy of the write end closed or the child is gone:
+    /// the child died before it could write it (before `exec`).
     Missing,
     /// The child's own unique id, which arrived only after the spawn returned (see the module doc).
     Late(u64),
@@ -398,8 +398,8 @@ pub(crate) fn adopted_id(report: Report, pid: u32) -> Result<u64, NotAdopted> {
         Report::Late(id) => not(
             Unadoptable::Late(id),
             Error::Io(io::Error::other(format!(
-                "the spawned child {pid} had not reported its unique id when its spawn returned (a descriptor of \
-                 0 to 2 was closed), so its exec cannot be confirmed; the child was not adopted"
+                "the spawned child {pid} had not reported its unique id when its spawn returned (two of this \
+                 process's descriptors 0 to 2 were closed), so its exec cannot be confirmed; the child was not adopted"
             ))),
         ),
         Report::Unwritten => {

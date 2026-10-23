@@ -825,11 +825,7 @@ pub(crate) fn kill_and_reap_unreported(pid: u32, unique: u64, prepared: crate::c
         tree.kill(Sweep::RootKilled { zombie })
     });
     let mut owed = std::mem::take(&mut tree.notes);
-    owed.extend(
-        tree.failed
-            .take()
-            .map(|e| format!("its tree was not fully killed: {e}")),
-    );
+    owed.extend(tree.failure_note());
     notes.splice(0..0, owed);
     Unreported {
         fate,
@@ -866,8 +862,12 @@ enum Reach {
 #[cfg(target_os = "macos")]
 struct LateTree {
     reach: Reach,
-    /// The latest failure of a sweep that reached the whole tree, which a later complete one clears.
+    /// The first sweep's failure. No later sweep is shown to reach what it missed, so none clears it:
+    /// the root's kill reparents its descendants out of a walk from its pid, a member that refused the
+    /// kill can leave the group, and a holder can close its marker.
     failed: Option<String>,
+    /// Whether a sweep succeeded after `failed`, and none failed since.
+    succeeded_after: bool,
     /// What the sweeps could not do.
     notes: Vec<String>,
 }
@@ -882,6 +882,7 @@ impl LateTree {
         let mut tree = LateTree {
             reach: Reach::None,
             failed: None,
+            succeeded_after: false,
             notes: Vec::new(),
         };
         if prepared.mode.is_none() || !prepared.is_root {
@@ -905,8 +906,8 @@ impl LateTree {
         match prepared.marker {
             Some(marker) => {
                 tree.notes.push(why.fold(format!(
-                    "{unshown}, so only its marker's holders were killed, not its process group or the processes \
-                     its pid parents"
+                    "{unshown}, so its tree is reached only through its marker's holders, not its process group \
+                     or the processes its pid parents"
                 )));
                 tree.reach = Reach::Holders(crate::containment::fdmarker::Marker::without_root(marker));
             }
@@ -921,7 +922,12 @@ impl LateTree {
         match (&self.reach, sweep) {
             (Reach::None, _) => {}
             (Reach::Attached(attached), Sweep::RootAlive | Sweep::RootKilled { zombie: true }) => {
-                self.failed = attached.hard_kill().err().map(|e| e.to_string());
+                let result = match attached.hard_kill_report() {
+                    (Err(e), _) => Err(e.to_string()),
+                    (Ok(()), false) => Err("a member could not be killed".to_owned()),
+                    (Ok(()), true) => Ok(()),
+                };
+                self.fold(result);
             }
             // The root is not shown ours any more: only the holders, and never the root.
             (Reach::Attached(Attached::FdMarker(m)), Sweep::RootKilled { zombie: false }) => {
@@ -932,15 +938,40 @@ impl LateTree {
                 self.notes.push(NOT_SWEPT_AGAIN.to_owned());
             }
             (Reach::Attached(_), Sweep::RootKilled { zombie: false }) => self.notes.push(NOT_SWEPT_AGAIN.to_owned()),
-            (Reach::Holders(m), _) => self.failed = m.hard_kill_holders_only(None).err().map(|e| e.to_string()),
+            (Reach::Holders(m), _) => {
+                let result = m.hard_kill_holders_only(None).map_err(|e| e.to_string());
+                self.fold(result);
+            }
         }
+    }
+
+    /// Folds a sweep's result into [`failed`](Self::failed).
+    fn fold(&mut self, result: Result<(), String>) {
+        match (result, &self.failed) {
+            (Err(e), None) => self.failed = Some(e),
+            (Err(_), Some(_)) => self.succeeded_after = false,
+            (Ok(()), failed) => self.succeeded_after = failed.is_some(),
+        }
+    }
+
+    /// The `warn`'s note for a sweep that failed.
+    fn failure_note(&mut self) -> Option<String> {
+        let failed = self.failed.take()?;
+        Some(if self.succeeded_after {
+            format!(
+                "its tree may not be fully killed: a kill of it failed ({failed}), and the later one that succeeded \
+                 cannot be shown to reach what that one missed"
+            )
+        } else {
+            format!("its tree was not fully killed: {failed}")
+        })
     }
 }
 
-/// The note of a tree whose root was not shown an unreaped zombie after its kill.
+/// The note of a tree whose root was not shown an unreaped zombie once its kill was tried.
 #[cfg(target_os = "macos")]
-const NOT_SWEPT_AGAIN: &str =
-    "it was not shown an unreaped zombie after its kill, so what it started as it died was not killed by its pid";
+const NOT_SWEPT_AGAIN: &str = "it was not shown an unreaped zombie, so its tree was not killed again by its pid: what \
+                               it started after the first kill of its tree may be left running";
 
 /// The one `warn` of a spawn whose child's report came late (see [`Report::Late`]).
 #[cfg(target_os = "macos")]
@@ -1135,9 +1166,8 @@ fn reap_verified(
 /// died before `exec` is only a corpse nothing collects, and the program did not start. A child
 /// whose id came late may have started the program: it is killed and reaped by pid, each act checked
 /// against that id, and its tree is killed through `prepared` (see [`kill_and_reap_unreported`]). A
-/// `front` is sent nothing and
-/// left running and unreaped instead, and the error notes it. Any other is never signalled or
-/// waited on by pid, and is left as `leave_unverified_child` leaves it.
+/// `front` is sent nothing and left running and unreaped instead, and the error notes it. Any other
+/// is never signalled or waited on by pid, and is left as `leave_unverified_child` leaves it.
 #[cfg(target_os = "macos")]
 fn abandon_unadopted(
     child: std::process::Child,
