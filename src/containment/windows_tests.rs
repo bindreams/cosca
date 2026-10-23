@@ -841,6 +841,102 @@ fn resume_initial_threads_fails_when_the_initial_thread_was_already_running() {
     dispose(child);
 }
 
+/// Another party (an EDR agent, a debugger) started a thread in the frozen child, and it runs: the
+/// child is still as its creator left it, because the INITIAL thread is suspended exactly once.
+#[skuld::test]
+fn resume_initial_threads_accepts_a_running_thread_someone_else_started() {
+    let mut child = crate::test_frozen::spawn_suspended_blocker();
+    let initial = crate::test_frozen::InitialThread::of(child.id());
+    let _injected = crate::test_frozen::inject_running_thread_into_std_child(&child);
+
+    super::resume_initial_threads(crate::test_frozen::raw(&child), super::SuspendCount::ExactlyOne)
+        .expect("a running second thread must not fail the release of a child whose initial thread is frozen");
+
+    assert_eq!(initial.suspend_count(), 0, "the initial thread must run");
+    drop(child.stdin.take());
+    child.wait().expect("the resumed blocker exits on stdin EOF");
+}
+
+/// The initial thread ran while a second thread exists: still a failure, and it names the initial
+/// thread, not the other one.
+#[skuld::test]
+fn resume_initial_threads_names_the_initial_thread_when_it_was_already_running() {
+    let child = crate::test_frozen::spawn_suspended_blocker();
+    let initial = crate::test_frozen::InitialThread::of(child.id());
+    assert_eq!(initial.release_one(), 1);
+    let _injected = crate::test_frozen::inject_running_thread_into_std_child(&child);
+
+    let err = super::resume_initial_threads(crate::test_frozen::raw(&child), super::SuspendCount::ExactlyOne)
+        .expect_err("the initial thread already ran");
+
+    let text = err.to_string();
+    assert!(
+        text.contains(&format!("thread {} of pid", initial.tid())) && text.contains("previous suspend count was 0"),
+        "the error must name the initial thread and its count: {text}"
+    );
+    dispose(child);
+}
+
+/// The initial thread was suspended twice while a second thread exists: still a failure naming the
+/// initial thread.
+#[skuld::test]
+fn resume_initial_threads_names_the_initial_thread_when_it_was_suspended_twice() {
+    let child = crate::test_frozen::spawn_suspended_blocker();
+    let initial = crate::test_frozen::InitialThread::of(child.id());
+    initial.suspend_once();
+    let _injected = crate::test_frozen::inject_running_thread_into_std_child(&child);
+
+    let err = super::resume_initial_threads(crate::test_frozen::raw(&child), super::SuspendCount::ExactlyOne)
+        .expect_err("the initial thread is still suspended");
+
+    let text = err.to_string();
+    assert!(
+        text.contains(&format!("thread {} of pid", initial.tid())) && text.contains("previous suspend count was 2"),
+        "the error must name the initial thread and its count: {text}"
+    );
+    dispose(child);
+}
+
+/// The initial thread is the earliest created, wherever the snapshot lists it: a list that puts the
+/// later thread first must not make that one the initial.
+#[skuld::test]
+fn initial_thread_id_picks_the_earliest_created_thread_whatever_the_list_order() {
+    let child = crate::test_frozen::spawn_suspended_blocker();
+    let initial = crate::test_frozen::InitialThread::of(child.id());
+    let injected = crate::test_frozen::inject_running_thread_into_std_child(&child);
+
+    for tids in [[initial.tid(), injected.tid()], [injected.tid(), initial.tid()]] {
+        let mut walk = super::Walk::default();
+        let picked = super::initial_thread_id(child.id(), &tids, &mut walk);
+        assert_eq!(picked, Some(initial.tid()), "list {tids:?}");
+        assert!(walk.last_err.is_none(), "{:?}", walk.last_err);
+    }
+    dispose(child);
+}
+
+/// A listed thread that is another process's, or gone, is nobody's initial thread, even when it is
+/// older than the child's own.
+#[skuld::test]
+fn initial_thread_id_ignores_a_thread_that_is_not_the_childs() {
+    let older = crate::test_frozen::spawn_suspended_blocker();
+    let older_thread = crate::test_frozen::InitialThread::of(older.id());
+    let child = crate::test_frozen::spawn_suspended_blocker();
+    let initial = crate::test_frozen::InitialThread::of(child.id());
+
+    // Thread id 1 resolves to CID 0, never allocated: the lookup always fails.
+    let mut walk = super::Walk::default();
+    let picked = super::initial_thread_id(child.id(), &[older_thread.tid(), 1, initial.tid()], &mut walk);
+
+    assert_eq!(picked, Some(initial.tid()));
+    assert!(
+        walk.last_err.is_none(),
+        "a foreign or vanished thread is a skip: {:?}",
+        walk.last_err
+    );
+    dispose(older);
+    dispose(child);
+}
+
 /// The ordinary spawn's resume does not ask that the child was suspended exactly once: a thread
 /// something else already ran (a debugger's break-in thread, an EDR agent's) must not fail a
 /// `contain()` spawn that has always accepted it.

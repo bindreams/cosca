@@ -8,6 +8,7 @@ use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::System::Diagnostics::Debug::WriteProcessMemory;
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
 };
@@ -15,9 +16,11 @@ use windows::Win32::System::JobObjects::{
     IsProcessInJob, JobObjectBasicLimitInformation, QueryInformationJobObject, JOBOBJECT_BASIC_LIMIT_INFORMATION,
     JOB_OBJECT_LIMIT, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
 };
+use windows::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+use windows::Win32::System::Memory::{VirtualAllocEx, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, OpenThread, ResumeThread, SuspendThread, CREATE_NO_WINDOW, CREATE_SUSPENDED,
-    THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME,
+    CreateRemoteThread, GetCurrentProcess, GetThreadId, OpenThread, ResumeThread, SuspendThread, CREATE_NO_WINDOW,
+    CREATE_SUSPENDED, LPTHREAD_START_ROUTINE, THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME,
 };
 
 use crate::containment::windows::JobHandle;
@@ -67,6 +70,12 @@ impl InitialThread {
         panic!("pid {pid} has no thread in the snapshot");
     }
 
+    /// The thread id.
+    pub(crate) fn tid(&self) -> u32 {
+        // SAFETY: `self.0` is a live thread handle.
+        unsafe { GetThreadId(self.0) }
+    }
+
     /// The suspend count, read by suspending and resuming once. Only meaningful while the thread
     /// is not running anything that matters (a frozen child), or when the count is the question.
     pub(crate) fn suspend_count(&self) -> u32 {
@@ -104,6 +113,97 @@ impl Drop for InitialThread {
     fn drop(&mut self) {
         unsafe { _ = CloseHandle(self.0) };
     }
+}
+
+/// A thread another party started in a child, as an EDR agent or a debugger does: held by handle,
+/// closed on drop. It is not the child's initial thread.
+pub(crate) struct InjectedThread(HANDLE);
+
+impl InjectedThread {
+    /// The thread id.
+    pub(crate) fn tid(&self) -> u32 {
+        // SAFETY: `self.0` is a live thread handle.
+        unsafe { GetThreadId(self.0) }
+    }
+}
+
+impl Drop for InjectedThread {
+    fn drop(&mut self) {
+        // SAFETY: the handle is owned and closed once.
+        unsafe { _ = CloseHandle(self.0) };
+    }
+}
+
+/// Start a second thread in the process behind `process` (a handle with thread-creation, memory
+/// and query rights), released at once: its suspend count is 0 from
+/// the moment this returns, and it stays alive, blocked for good on an SRW lock this function
+/// writes into the child as already held. It starts in ntdll's `RtlAcquireSRWLockExclusive`,
+/// whose address is the same in every process of this boot.
+pub(crate) fn inject_running_thread(process: HANDLE) -> InjectedThread {
+    // SAFETY: `process` is a live process handle with the rights above. The lock word is data in
+    // memory this function allocates in the child; ntdll is mapped in every process, and
+    // `RtlAcquireSRWLockExclusive` takes one pointer, which the thread gets as its argument. The
+    // thread handle is owned by the returned value.
+    unsafe {
+        let lock = VirtualAllocEx(process, None, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        assert!(
+            !lock.is_null(),
+            "allocate the lock in the child: {}",
+            std::io::Error::last_os_error()
+        );
+        // An SRW lock is held exclusively, with no waiters, when its word is 1.
+        let held: usize = 1;
+        WriteProcessMemory(process, lock, std::ptr::addr_of!(held).cast(), size_of::<usize>(), None)
+            .expect("write the held lock into the child");
+        let ntdll = GetModuleHandleA(windows::core::s!("ntdll.dll")).expect("ntdll is loaded");
+        let start =
+            GetProcAddress(ntdll, windows::core::s!("RtlAcquireSRWLockExclusive")).expect("RtlAcquireSRWLockExclusive");
+        let thread = CreateRemoteThread(
+            process,
+            None,
+            0,
+            LPTHREAD_START_ROUTINE::Some(std::mem::transmute::<
+                unsafe extern "system" fn() -> isize,
+                unsafe extern "system" fn(*mut std::ffi::c_void) -> u32,
+            >(start)),
+            Some(lock),
+            CREATE_SUSPENDED.0,
+            None,
+        )
+        .expect("start a thread in the child");
+        assert_eq!(ResumeThread(thread), 1, "the new thread was created suspended once");
+        InjectedThread(thread)
+    }
+}
+
+/// [`inject_running_thread`] into a std child, whose handle has full access.
+pub(crate) fn inject_running_thread_into_std_child(child: &std::process::Child) -> InjectedThread {
+    inject_running_thread(HANDLE(raw(child)))
+}
+
+/// [`inject_running_thread`] into the live process `pid`, which the caller keeps from being reaped.
+pub(crate) fn inject_running_thread_into_pid(pid: u32) -> InjectedThread {
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ,
+        PROCESS_VM_WRITE,
+    };
+    // SAFETY: plain Win32 call; the handle is closed below, after the thread exists.
+    let process = unsafe {
+        OpenProcess(
+            PROCESS_CREATE_THREAD
+                | PROCESS_QUERY_INFORMATION
+                | PROCESS_VM_OPERATION
+                | PROCESS_VM_READ
+                | PROCESS_VM_WRITE,
+            false,
+            pid,
+        )
+    }
+    .expect("open the frozen process");
+    let thread = inject_running_thread(process);
+    // SAFETY: owned and closed once; the thread does not depend on this handle.
+    unsafe { _ = CloseHandle(process) };
+    thread
 }
 
 /// The limit flags `job` holds now.

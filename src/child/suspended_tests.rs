@@ -115,6 +115,28 @@ mod on_windows {
         }
     }
 
+    /// Something else started a running thread in the frozen child (an EDR agent, a debugger): the
+    /// initial thread is still frozen exactly once, so the resume goes through, contained or not.
+    #[skuld::test]
+    fn resume_succeeds_when_another_party_started_a_running_thread_in_the_frozen_child() {
+        for raw in BACKENDS {
+            for contain in [false, true] {
+                let mut cmd = blocker(raw);
+                if contain {
+                    cmd.contain();
+                }
+                let frozen = cmd.spawn_suspended().expect("spawn suspended");
+                let _injected = crate::test_frozen::inject_running_thread_into_pid(frozen.id().pid());
+
+                let child = frozen.resume().unwrap_or_else(|e| {
+                    panic!("raw={raw} contain={contain}: a running second thread failed the resume: {e:?}")
+                });
+
+                end(child);
+            }
+        }
+    }
+
     #[skuld::test]
     fn id_recorded_while_frozen_equals_the_resumed_childs_id() {
         for raw in BACKENDS {

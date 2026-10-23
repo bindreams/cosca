@@ -1188,8 +1188,11 @@ pub(crate) enum SuspendCount {
     /// thread something else already ran.
     #[default]
     Any,
-    /// Exactly 1 on every thread: a frozen child's release, where a thread that ran, or that
-    /// something else suspended again, means the child is not as its creator left it.
+    /// Exactly 1 on the child's INITIAL thread: a frozen child's release, where an initial thread
+    /// that ran, or that something else suspended again, means the child is not as its creator
+    /// left it. Every other thread (one an EDR agent or a debugger started) is resumed once, at
+    /// whatever count it had: the creator suspended only the initial thread, and a thread that is
+    /// already running says nothing about the child.
     ExactlyOne,
 }
 
@@ -1197,6 +1200,10 @@ pub(crate) enum SuspendCount {
 #[derive(Default)]
 struct Walk {
     expected: SuspendCount,
+    /// For [`SuspendCount::ExactlyOne`]: the id of the child's initial thread, the only thread the
+    /// count is asked of. `None` when no listed thread could be identified; then the walk resumed
+    /// nothing, or `last_err` says why.
+    initial: Option<u32>,
     resumed: u32,
     /// The FIRST failure: it is the root cause, and later ones are logged as they happen.
     last_err: Option<io::Error>,
@@ -1205,6 +1212,11 @@ struct Walk {
 }
 
 impl Walk {
+    /// Whether the previous suspend count of thread `tid` must be exactly 1.
+    fn asks_exactly_one_of(&self, tid: u32) -> bool {
+        self.expected == SuspendCount::ExactlyOne && self.initial == Some(tid)
+    }
+
     fn skip(&mut self, reason: String) {
         log::debug!("resume_initial_threads: {reason}; skipped");
         self.last_skip = Some(reason);
@@ -1350,14 +1362,14 @@ fn resume_if_owned(tid: u32, process_pid: u32, walk: &mut Walk) -> Visit {
             walk.resumed += 1;
             Visit::Resumed
         }
-        Ok(_) if walk.expected == SuspendCount::Any => {
+        Ok(_) if !walk.asks_exactly_one_of(tid) => {
             walk.resumed += 1;
             Visit::Resumed
         }
         // Anything else leaves a process that is not running the way its creator left it. A count
-        // above 1 is a thread still suspended after this resume (a debugger, an EDR agent or the
-        // caller's own tooling suspended it in the window); 0 is a thread that was already
-        // running, so the child ran before it was released.
+        // above 1 is an initial thread still suspended after this resume (a debugger, an EDR agent
+        // or the caller's own tooling suspended it in the window); 0 is an initial thread that was
+        // already running, so the child ran before it was released.
         Ok(previous) => walk.fail(
             "ResumeThread",
             tid,
@@ -1373,6 +1385,69 @@ fn resume_if_owned(tid: u32, process_pid: u32, walk: &mut Walk) -> Visit {
         ),
         Err(e) => walk.fail("ResumeThread", tid, process_pid, e),
     }
+}
+
+/// The creation time of thread `tid` (100 ns ticks) if it is a thread of `process_pid`; `None` if
+/// the id is stale (gone, another process's, not openable by the child's creator). The error names
+/// the failed call.
+fn creation_time_if_owned(tid: u32, process_pid: u32) -> Result<Option<u64>, (&'static str, windows::core::Error)> {
+    use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, FILETIME};
+    use windows::Win32::System::Threading::GetThreadTimes;
+
+    let gone = windows::core::HRESULT::from_win32(ERROR_INVALID_PARAMETER.0);
+    let denied = windows::core::HRESULT::from_win32(ERROR_ACCESS_DENIED.0);
+
+    // SAFETY: plain Win32 call; the handle is owned by the returned guard, which pins the thread.
+    let thread = match unsafe { OpenThread(THREAD_QUERY_LIMITED_INFORMATION, false, tid) } {
+        Ok(h) => ThreadHandle(h),
+        Err(e) if e.code() == gone || e.code() == denied => return Ok(None),
+        Err(e) => return Err(("OpenThread(query)", e)),
+    };
+    match owner_of(&thread) {
+        Ok(owner) if owner == process_pid => {}
+        Ok(_) => return Ok(None),
+        Err(e) => return Err(("GetProcessIdOfThread", e)),
+    }
+    let (mut created, mut exited, mut kernel, mut user) = (
+        FILETIME::default(),
+        FILETIME::default(),
+        FILETIME::default(),
+        FILETIME::default(),
+    );
+    // SAFETY: `thread` is a live handle with THREAD_QUERY_LIMITED_INFORMATION; the out-parameters
+    // are valid.
+    unsafe { GetThreadTimes(thread.0, &mut created, &mut exited, &mut kernel, &mut user) }
+        .map_err(|e| ("GetThreadTimes", e))?;
+    Ok(Some(
+        (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime),
+    ))
+}
+
+/// The id of the child's initial thread among `tids`: the thread of `process_pid` created first.
+///
+/// A frozen child has one thread, its initial one, until someone else starts another; a thread
+/// created later has a later creation time, and the clock is the system's precise one (measured on
+/// Windows 11 10.0.26100: 300 threads started back to back in one process all had distinct creation
+/// times, 56 us or more apart). Thread ids say nothing about order, and the snapshot lists threads
+/// in no promised order. Equal times, if the clock ever gave them, go to the lower id so the answer
+/// is the same on every run.
+///
+/// A failure to read a thread of the child is recorded in `walk` like any failed call on the child's
+/// thread, and the thread is passed over.
+fn initial_thread_id(process_pid: u32, tids: &[u32], walk: &mut Walk) -> Option<u32> {
+    let mut earliest: Option<(u64, u32)> = None;
+    for &tid in tids {
+        match creation_time_if_owned(tid, process_pid) {
+            Ok(Some(created)) => {
+                earliest = Some(earliest.map_or((created, tid), |current| current.min((created, tid))));
+            }
+            Ok(None) => {}
+            Err((call, e)) => {
+                walk.fail(call, tid, process_pid, e);
+            }
+        }
+    }
+    earliest.map(|(_, tid)| tid)
 }
 
 /// The pid of the process at `raw_handle`, or an error naming `GetProcessId`.
@@ -1471,6 +1546,7 @@ pub(crate) fn resume_initial_threads(
             ..Default::default()
         };
 
+        let mut entries = Vec::new();
         let mut step = Thread32First(snap, &mut entry);
         loop {
             match step {
@@ -1482,10 +1558,22 @@ pub(crate) fn resume_initial_threads(
                     return Err(io::Error::from(e));
                 }
             }
-            visit_thread_entry(&entry, process_pid, &mut walk);
+            entries.push(entry);
             step = Thread32Next(snap, &mut entry);
         }
         _ = CloseHandle(snap);
+
+        if walk.expected == SuspendCount::ExactlyOne {
+            let own: Vec<u32> = entries
+                .iter()
+                .filter(|e| e.th32OwnerProcessID == process_pid)
+                .map(|e| e.th32ThreadID)
+                .collect();
+            walk.initial = initial_thread_id(process_pid, &own, &mut walk);
+        }
+        for entry in &entries {
+            visit_thread_entry(entry, process_pid, &mut walk);
+        }
     }
 
     // Test-only: the injected entry goes through the same owner filter as a real one.
