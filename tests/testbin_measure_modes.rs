@@ -42,7 +42,9 @@ mod windows {
     use std::os::windows::ffi::OsStringExt;
     use std::process::Command;
 
-    /// `dump-env-block`'s lines (each UTF-16 unit as four hex digits), decoded.
+    /// `dump-env-block`'s lines (each UTF-16 unit as four hex digits), decoded, without the
+    /// `PROCESSOR_ARCHITECTURE` entry Windows on Arm adds to a child's block on its own (measured on
+    /// `windows-11-arm`).
     fn decode(hex_lines: &str) -> Vec<String> {
         hex_lines
             .lines()
@@ -53,6 +55,7 @@ mod windows {
                     .collect();
                 OsString::from_wide(&units).to_string_lossy().into_owned()
             })
+            .filter(|e| !e.starts_with("PROCESSOR_ARCHITECTURE="))
             .collect()
     }
 
