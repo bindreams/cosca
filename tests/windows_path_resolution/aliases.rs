@@ -12,31 +12,28 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use windows::core::{PCWSTR, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, GENERIC_WRITE, HANDLE, LUID};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, LUID};
 use windows::Win32::Security::{
     AdjustTokenPrivileges, DuplicateTokenEx, GetTokenInformation, SecurityImpersonation, TokenElevation,
     TokenImpersonation, TokenPrivileges, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_DUPLICATE,
     TOKEN_ELEVATION, TOKEN_IMPERSONATE, TOKEN_QUERY,
 };
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FindClose, FindFirstFileW, GetFileAttributesW, FILE_ATTRIBUTE_REPARSE_POINT,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_MODE, INVALID_FILE_ATTRIBUTES, OPEN_EXISTING,
+    FindClose, FindFirstFileW, GetFileAttributesW, FILE_ATTRIBUTE_REPARSE_POINT, INVALID_FILE_ATTRIBUTES,
     WIN32_FIND_DATAW,
 };
 use windows::Win32::System::Threading::{
     CreateProcessW, GetCurrentProcess, GetExitCodeProcess, OpenProcessToken, SetThreadToken, WaitForSingleObject,
     CREATE_NO_WINDOW, INFINITE, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
 };
-use windows::Win32::System::IO::DeviceIoControl;
 
+use crate::common::windows_reparse::{app_exec_link_data, set_reparse, IO_REPARSE_TAG_APPEXECLINK};
 use crate::measure::canonical;
 use crate::provenance::survey_platform;
 use crate::test_groups::{path_probes, Group};
 
 const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
-const IO_REPARSE_TAG_APPEXECLINK: u32 = 0x8000_001B;
 const IO_REPARSE_TAG_LX_SYMLINK: u32 = 0xA000_001D;
-const FSCTL_SET_REPARSE_POINT: u32 = 0x0009_00A4;
 
 #[skuld::test]
 fn m19_app_execution_aliases(#[fixture(path_probes)] _group: &Group) {
@@ -93,17 +90,7 @@ fn self_made_alias(t: &Path) {
     std::fs::copy(env!("CARGO_BIN_EXE_cosca_testbin_image"), &target).expect("copy the image");
     let alias = t.join("own-alias.exe");
     std::fs::write(&alias, b"").expect("create the alias file");
-    let mut data = 3u32.to_le_bytes().to_vec();
-    for s in [
-        OsStr::new("cosca.m19_0000000000000"),
-        OsStr::new("cosca.m19_0000000000000!App"),
-        target.as_os_str(),
-        OsStr::new("0"),
-    ] {
-        for unit in s.encode_wide().chain([0]) {
-            data.extend_from_slice(&unit.to_le_bytes());
-        }
-    }
+    let data = app_exec_link_data(target.as_os_str());
     let mut created = without_privileges(|| set_reparse(&alias, IO_REPARSE_TAG_APPEXECLINK, &data));
     println!("M19 own_alias_unprivileged_create={}", outcome(&created));
     if created.is_err() {
@@ -357,44 +344,6 @@ fn junction(link: &Path, target: &Path) -> Result<(), String> {
         data.extend_from_slice(&unit.to_le_bytes());
     }
     set_reparse(link, IO_REPARSE_TAG_MOUNT_POINT, &data)
-}
-
-/// Sets a reparse point with `tag` and `data` on the existing `path`.
-fn set_reparse(path: &Path, tag: u32, data: &[u8]) -> Result<(), String> {
-    let mut buffer = tag.to_le_bytes().to_vec();
-    buffer.extend_from_slice(&(data.len() as u16).to_le_bytes());
-    buffer.extend_from_slice(&0u16.to_le_bytes());
-    buffer.extend_from_slice(data);
-    let wide = wide_of(path.as_os_str());
-    // SAFETY: `wide` is NUL-terminated and outlives the call.
-    let handle = unsafe {
-        CreateFileW(
-            PCWSTR(wide.as_ptr()),
-            GENERIC_WRITE.0,
-            FILE_SHARE_MODE(0),
-            None,
-            OPEN_EXISTING,
-            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
-            None,
-        )
-    }
-    .map_err(|e| format!("CreateFileW: err={}", e.code().0 & 0xFFFF))?;
-    // SAFETY: `handle` is live; `buffer` is a whole reparse buffer of the length passed.
-    let set = unsafe {
-        DeviceIoControl(
-            handle,
-            FSCTL_SET_REPARSE_POINT,
-            Some(buffer.as_ptr().cast()),
-            buffer.len() as u32,
-            None,
-            0,
-            None,
-            None,
-        )
-    };
-    // SAFETY: `handle` is owned here and closed once.
-    let _ = unsafe { CloseHandle(handle) };
-    set.map_err(|e| format!("FSCTL_SET_REPARSE_POINT: err={}", e.code().0 & 0xFFFF))
 }
 
 /// Runs `f` on a thread of its own, impersonating this process's token with every privilege
