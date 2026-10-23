@@ -3,3 +3,7 @@
 // The debugger stand-in is `ptrace` on macOS.
 #[cfg(target_os = "macos")]
 pub(crate) mod tracer;
+
+// The foreign tracer: see the module doc.
+#[cfg(target_os = "linux")]
+pub(crate) mod foreign_tracer;
