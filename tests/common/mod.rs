@@ -31,6 +31,9 @@ pub mod kevent_eintr;
 #[cfg(windows)]
 pub mod windows_env;
 
+#[cfg(windows)]
+pub mod windows_reparse;
+
 mod locked;
 pub use locked::*;
 

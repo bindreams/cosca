@@ -340,6 +340,11 @@ path = "tests/windows_testbin_ack.rs"
 harness = false
 
 [[test]]
+name = "windows_app_alias"
+path = "tests/windows_app_alias.rs"
+harness = false
+
+[[test]]
 name = "testbin_measure_modes"
 path = "tests/testbin_measure_modes.rs"
 harness = false
