@@ -48,7 +48,7 @@ impl Frozen {
         }))
     }
 
-    /// Resume the child's threads, then release the guard.
+    /// Resume the child's initial thread, then release the guard.
     pub(crate) fn release(self, child: &crate::child::Child) -> io::Result<()> {
         self.release_process(child.process_handle())
     }
@@ -56,7 +56,7 @@ impl Frozen {
     /// [`release`](Self::release) for the process at `proc_handle`, which must stay open for the
     /// call.
     ///
-    /// The guard is released only after the threads run: the other order would strand a frozen
+    /// The guard is released only after the initial thread runs: the other order would strand a frozen
     /// process if the owner died between the calls. A guard whose release fails is dropped armed, so
     /// the OS ends the child.
     pub(crate) fn release_process(self, proc_handle: RawHandle) -> io::Result<()> {

@@ -857,6 +857,44 @@ fn resume_initial_threads_accepts_a_running_thread_someone_else_started() {
     child.wait().expect("the resumed blocker exits on stdin EOF");
 }
 
+/// A thread another party holds suspended is theirs: the frozen release resumes the initial thread,
+/// the only one its creator suspended, and leaves the other at the count it had.
+#[skuld::test]
+fn resume_initial_threads_leaves_a_thread_someone_else_suspended_suspended() {
+    let mut child = crate::test_frozen::spawn_suspended_blocker();
+    let initial = crate::test_frozen::InitialThread::of(child.id());
+    let held = crate::test_frozen::inject_suspended_thread_into_std_child(&child);
+
+    super::resume_initial_threads(crate::test_frozen::raw(&child), super::SuspendCount::ExactlyOne)
+        .expect("the initial thread is frozen exactly once");
+
+    assert_eq!(initial.suspend_count(), 0, "the initial thread must run");
+    assert_eq!(
+        held.suspend_count(),
+        1,
+        "the other party's suspension must still be held after the release"
+    );
+    drop(child.stdin.take());
+    child.wait().expect("the resumed blocker exits on stdin EOF");
+}
+
+/// The ordinary spawn's walk is unchanged: `Any` resumes every thread of the child, as `contain()`
+/// always has.
+#[skuld::test]
+fn resume_initial_threads_with_any_count_resumes_every_thread() {
+    let mut child = crate::test_frozen::spawn_suspended_blocker();
+    let initial = crate::test_frozen::InitialThread::of(child.id());
+    let second = crate::test_frozen::inject_suspended_thread_into_std_child(&child);
+
+    super::resume_initial_threads(crate::test_frozen::raw(&child), super::SuspendCount::Any)
+        .expect("resume every thread");
+
+    assert_eq!(initial.suspend_count(), 0, "the initial thread must run");
+    assert_eq!(second.suspend_count(), 0, "`Any` resumes the second thread too");
+    drop(child.stdin.take());
+    child.wait().expect("the resumed blocker exits on stdin EOF");
+}
+
 /// The initial thread ran while a second thread exists: still a failure, and it names the initial
 /// thread, not the other one.
 #[skuld::test]

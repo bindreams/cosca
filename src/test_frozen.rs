@@ -125,6 +125,23 @@ impl InjectedThread {
         // SAFETY: `self.0` is a live thread handle.
         unsafe { GetThreadId(self.0) }
     }
+
+    /// The suspend count, read by suspending and resuming once; meaningful because the thread is
+    /// blocked for good (see [`inject_running_thread`]) and so never changes the count itself.
+    pub(crate) fn suspend_count(&self) -> u32 {
+        // SAFETY: `self.0` is a live thread handle with suspend/resume rights (the creator's).
+        let previous = unsafe { SuspendThread(self.0) };
+        assert_ne!(
+            previous,
+            u32::MAX,
+            "SuspendThread failed: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: as above.
+        let resumed = unsafe { ResumeThread(self.0) };
+        assert_eq!(resumed, previous + 1, "the thread must be back at the count it had");
+        previous
+    }
 }
 
 impl Drop for InjectedThread {
@@ -140,6 +157,19 @@ impl Drop for InjectedThread {
 /// writes into the child as already held. It starts in ntdll's `RtlAcquireSRWLockExclusive`,
 /// whose address is the same in every process of this boot.
 pub(crate) fn inject_running_thread(process: HANDLE) -> InjectedThread {
+    let thread = inject_suspended_thread(process);
+    // SAFETY: `thread` is a live handle; the new thread was created suspended once.
+    assert_eq!(
+        unsafe { ResumeThread(thread.0) },
+        1,
+        "the new thread was created suspended once"
+    );
+    thread
+}
+
+/// Like [`inject_running_thread`], but the thread is left at suspend count 1, as a debugger or an
+/// EDR agent that holds a thread of the child suspended leaves it.
+pub(crate) fn inject_suspended_thread(process: HANDLE) -> InjectedThread {
     // SAFETY: `process` is a live process handle with the rights above. The lock word is data in
     // memory this function allocates in the child; ntdll is mapped in every process, and
     // `RtlAcquireSRWLockExclusive` takes one pointer, which the thread gets as its argument. The
@@ -171,9 +201,13 @@ pub(crate) fn inject_running_thread(process: HANDLE) -> InjectedThread {
             None,
         )
         .expect("start a thread in the child");
-        assert_eq!(ResumeThread(thread), 1, "the new thread was created suspended once");
         InjectedThread(thread)
     }
+}
+
+/// [`inject_suspended_thread`] into a std child, whose handle has full access.
+pub(crate) fn inject_suspended_thread_into_std_child(child: &std::process::Child) -> InjectedThread {
+    inject_suspended_thread(HANDLE(raw(child)))
 }
 
 /// [`inject_running_thread`] into a std child, whose handle has full access.

@@ -251,6 +251,10 @@ mod on_windows {
     /// The command's `kill_on_drop` decides what dropping the resumed `Child` does, for every
     /// containment: a resumed child that kept the frozen spawn's forced `true` would be killed by a
     /// command that opted out.
+    ///
+    /// The child's stdin write end is leaked, so no EOF can end it: it dies only if the drop kills
+    /// it. Without the drop's kill the `true` leg never sees the child die (the run is bounded by
+    /// nextest's terminate-after); a drop that kills regardless fails the `false` leg's check.
     #[skuld::test]
     fn death_watch_dropping_a_resumed_child_follows_the_commands_kill_on_drop_for_every_containment() {
         for (shape, contain) in [
@@ -264,6 +268,7 @@ mod on_windows {
                     cmd.contain_with(mode);
                 }
                 cmd.kill_on_drop(kill_on_drop);
+                cmd.stdin(crate::test_child::leaked_writer_stdin()).expect("stdin");
                 let child = cmd
                     .spawn_suspended()
                     .expect("spawn suspended")

@@ -1178,6 +1178,9 @@ pub(crate) enum Visit {
     /// The query-only open was denied. The child's own threads are openable by its creator, so
     /// the id belongs to someone else.
     Denied,
+    /// The child's own thread, but not the one a frozen release resumes (see
+    /// [`SuspendCount::ExactlyOne`]); untouched.
+    LeftAlone,
     /// A call failed on a thread that is the child's; recorded in `last_err`.
     Failed,
 }
@@ -1189,11 +1192,11 @@ pub(crate) enum SuspendCount {
     /// thread something else already ran.
     #[default]
     Any,
-    /// Exactly 1 on the child's INITIAL thread: a frozen child's release, where an initial thread
-    /// that ran, or that something else suspended again, means the child is not as its creator
-    /// left it. Every other thread (one an EDR agent or a debugger started) is resumed once, at
-    /// whatever count it had: the creator suspended only the initial thread, and a thread that is
-    /// already running says nothing about the child.
+    /// A frozen child's release: resumes the child's INITIAL thread only, and only if its previous
+    /// count was exactly 1. An initial thread that ran, or that something else suspended again,
+    /// means the child is not as its creator left it. Every other thread (one an EDR agent or a
+    /// debugger started) is left alone at the count it had: the creator suspended only the initial
+    /// thread, so a resume of any other would take away a suspension that is someone else's.
     ExactlyOne,
 }
 
@@ -1213,9 +1216,9 @@ struct Walk {
 }
 
 impl Walk {
-    /// Whether the previous suspend count of thread `tid` must be exactly 1.
-    fn asks_exactly_one_of(&self, tid: u32) -> bool {
-        self.expected == SuspendCount::ExactlyOne && self.initial == Some(tid)
+    /// Whether thread `tid` is left alone: a frozen child's release resumes its initial thread only.
+    fn leaves_alone(&self, tid: u32) -> bool {
+        self.expected == SuspendCount::ExactlyOne && self.initial != Some(tid)
     }
 
     fn skip(&mut self, reason: String) {
@@ -1341,6 +1344,11 @@ fn resume_if_owned(tid: u32, process_pid: u32, walk: &mut Walk) -> Visit {
         Err(e) => return walk.fail("GetProcessIdOfThread", tid, process_pid, e),
     }
 
+    if walk.leaves_alone(tid) {
+        log::debug!("resume_initial_threads: thread {tid} of pid {process_pid} is not its initial thread; left alone");
+        return Visit::LeftAlone;
+    }
+
     let resume = match open_for_resume(tid) {
         Ok(h) => h,
         Err(e) => return walk.fail("OpenThread(suspend/resume)", tid, process_pid, e),
@@ -1363,7 +1371,7 @@ fn resume_if_owned(tid: u32, process_pid: u32, walk: &mut Walk) -> Visit {
             walk.resumed += 1;
             Visit::Resumed
         }
-        Ok(_) if !walk.asks_exactly_one_of(tid) => {
+        Ok(_) if walk.expected == SuspendCount::Any => {
             walk.resumed += 1;
             Visit::Resumed
         }
