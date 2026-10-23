@@ -35,8 +35,9 @@ report ([`unique_report::await_report`](../src/child/spawn/unique_report.rs)) is
 way, with accepted residuals: if something else reaps the child and another child of this process
 takes its pid, the wait lasts as long as that process; and a tracer holding the child's zombie keeps
 it waiting until the tracer hands the zombie back. One more is open: a tracer that attaches after the
-wait's last check and exits while the child is exiting leaves it waiting until launchd waits on the
-child. The wait holds `spawn_lock`, so it stalls every other cosca spawn meanwhile.
+wait's last check, or that is itself traced, and exits while the child is exiting leaves it waiting
+until launchd waits on the child (or, for a traced tracer, until its own tracer reaps it). The wait
+holds `spawn_lock`, so it stalls every other cosca spawn meanwhile.
 
 **Why:** a blocked worker stops every task scheduled on it, and on a `current_thread` runtime it
 stops the runtime. tokio itself panics rather than block when a `Runtime` is dropped in async
