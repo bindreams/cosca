@@ -442,7 +442,7 @@ impl Attached {
     }
 
     /// The kill's result, and whether it was complete. Only a `TreeWalk`'s `Ok` can be incomplete.
-    fn hard_kill_report(&self) -> (Result<(), crate::error::Error>, bool) {
+    pub(crate) fn hard_kill_report(&self) -> (Result<(), crate::error::Error>, bool) {
         let result = match self {
             Attached::None | Attached::Delegated => Ok(()),
             #[cfg(unix)]
