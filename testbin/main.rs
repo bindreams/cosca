@@ -303,6 +303,22 @@ fn main() {
                 println!("arg{i}={arg}");
             }
         }
+        // `std-spawn-bare <name> <plain|pre_exec>`: runs `<name>` as a bare name through std with this
+        // process's `PATH`, which std keeps to its `posix_spawnp` route where it has one, and prints
+        // `ok,<status>` or `err=<errno>,<kind>`. `pre_exec` forces the fork route.
+        #[cfg(unix)]
+        "std-spawn-bare" => {
+            use std::os::unix::process::CommandExt;
+            let mut cmd = std::process::Command::new(&args[2]);
+            if args[3] == "pre_exec" {
+                // SAFETY: the closure does nothing, so it is async-signal-safe.
+                unsafe { cmd.pre_exec(|| Ok(())) };
+            }
+            match cmd.status() {
+                Ok(status) => println!("ok,{status}"),
+                Err(e) => println!("err={},{:?}", e.raw_os_error().unwrap_or(-1), e.kind()),
+            }
+        }
         "argv0" => {
             // Print this process's argv[0] so callers can verify it.
             let argv0 = std::env::args().next().unwrap_or_default();
