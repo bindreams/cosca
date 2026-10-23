@@ -758,7 +758,7 @@ fn teardown_after_attach_failure(child: std::process::Child, unique: u64, id: Pr
 pub(crate) fn kill_and_reap_verified(pid: u32, unique: u64, id: Option<ProcessId>, left_running: &str) -> ChildFate {
     let mut notes = Vec::new();
     let mut breach = None;
-    let (fate, kill) = kill_and_reap_noting(pid, unique, id, &mut notes, &mut breach);
+    let (fate, kill) = kill_and_reap_noting(pid, unique, id, &mut notes, &mut breach, |_| {});
     if let KillOutcome::Refused(why) = kill {
         // First, as the order of events: the kill, then the reap's notes.
         notes.insert(0, format!("could not be killed: {why}"));
@@ -800,16 +800,37 @@ pub(crate) struct Unreported {
 }
 
 /// Kills and reaps `pid`, a child whose unique id `unique` arrived only after its spawn returned. Its
-/// exec cannot be confirmed, so it is torn down through the id, as the other post-spawn failures are:
-/// its tree first, through `prepared`, its containment, then the child. Warns nothing:
-/// [`Unreported::warn`] does, once.
+/// exec cannot be confirmed, so it is torn down through the id, as the other post-spawn failures are,
+/// with its tree through `prepared`, its containment:
+/// 1. the tree, while the root is alive, so a walk from it still finds its descendants (the walk's
+///    own kill reaches the root first);
+/// 2. the root, so it can add no member after its kill lands (a `setsid`, an `exec`, a fork);
+/// 3. once the root is an unreaped zombie, whose pid still names its group, the tree again, for what
+///    it added before it died: a child held between its report and a `setsid` escapes the first
+///    `killpg`;
+/// 4. the root's reap.
+///
+/// Warns nothing: [`Unreported::warn`] does, once.
 #[cfg(target_os = "macos")]
 pub(crate) fn kill_and_reap_unreported(pid: u32, unique: u64, prepared: crate::containment::Prepared) -> Unreported {
     #[cfg(test)]
     fault::run_at(fault::SpawnPoint::BeforeLateTeardown, pid);
-    let mut notes: Vec<String> = kill_late_tree(pid, unique, prepared).into_iter().collect();
+    let mut tree = LateTree::attach(pid, unique, prepared);
+    tree.kill(Sweep::RootAlive);
+    #[cfg(test)]
+    fault::run_at(fault::SpawnPoint::BeforeLateRootKill, pid);
+    let mut notes = Vec::new();
     let mut breach = None;
-    let (fate, kill) = kill_and_reap_noting(pid, unique, None, &mut notes, &mut breach);
+    let (fate, kill) = kill_and_reap_noting(pid, unique, None, &mut notes, &mut breach, |zombie| {
+        tree.kill(Sweep::RootKilled { zombie })
+    });
+    let mut owed = std::mem::take(&mut tree.notes);
+    owed.extend(
+        tree.failed
+            .take()
+            .map(|e| format!("its tree was not fully killed: {e}")),
+    );
+    notes.splice(0..0, owed);
     Unreported {
         fate,
         kill,
@@ -818,39 +839,108 @@ pub(crate) fn kill_and_reap_unreported(pid: u32, unique: u64, prepared: crate::c
     }
 }
 
-/// Kills the tree of `pid`, a late child with the unique id `unique`, through `prepared`, its
-/// containment. It runs before the child's own kill and reap, so the child is unreaped and its group
-/// and marker still name its tree. Only a contained root has a tree; the child's identity is read
-/// and checked against `unique` first, and one that is gone or not shown ours names none. A foreign
-/// reap after that check is the gap `Child::drop`'s tree kill accepts too. Answers a note for the
-/// warn when the tree was not killed.
+/// Which sweep of a late child's tree [`LateTree::kill`] runs.
 #[cfg(target_os = "macos")]
-fn kill_late_tree(pid: u32, unique: u64, prepared: crate::containment::Prepared) -> Option<String> {
-    if prepared.mode.is_none() || !prepared.is_root {
-        return None;
+#[derive(Debug, Clone, Copy)]
+enum Sweep {
+    /// Before the root's kill, while its identity is fresh from [`LateTree::attach`].
+    RootAlive,
+    /// After the root's kill. `zombie`: the root is shown an unreaped zombie of ours, so its pid
+    /// still names it and its group.
+    RootKilled { zombie: bool },
+}
+
+/// What can reach the tree of a child whose report came late.
+#[cfg(target_os = "macos")]
+enum Reach {
+    /// No tree of its own: uncontained, or a nested member of another root's.
+    None,
+    /// The containment, attached to the root, whose identity was read and shown ours.
+    Attached(crate::containment::Attached),
+    /// The root is not shown ours, so nothing may name the tree by its pid: only the fd marker's
+    /// holders, which the kernel names by the marker pipe, can be reached.
+    Holders(crate::containment::fdmarker::Marker),
+}
+
+/// The tree of a child whose report came late, and the notes its sweeps owe the teardown's `warn`.
+#[cfg(target_os = "macos")]
+struct LateTree {
+    reach: Reach,
+    /// The latest failure of a sweep that reached the whole tree, which a later complete one clears.
+    failed: Option<String>,
+    /// What the sweeps could not do.
+    notes: Vec<String>,
+}
+
+#[cfg(target_os = "macos")]
+impl LateTree {
+    /// Reads the identity of `pid` and checks it against `unique`, then attaches `prepared` to it.
+    /// A root that is gone or not shown ours keeps only its marker's holders, when it has a marker.
+    /// A foreign reap after the check is the gap `Child::drop`'s tree kill accepts too.
+    fn attach(pid: u32, unique: u64, prepared: crate::containment::Prepared) -> LateTree {
+        use crate::identity::Resolved;
+        let mut tree = LateTree {
+            reach: Reach::None,
+            failed: None,
+            notes: Vec::new(),
+        };
+        if prepared.mode.is_none() || !prepared.is_root {
+            return tree;
+        }
+        let (resolved, mut why) = resolve_identity(pid, &crate::wait::exit_only::Target::pid(pid, Some(unique)));
+        let unshown = match resolved {
+            Resolved::Found(id) => {
+                match crate::containment::attach(id, prepared) {
+                    Ok(attachment) => tree.reach = Reach::Attached(attachment.attached),
+                    Err(e) => {
+                        assert_attach_cannot_fail(&e);
+                        tree.notes.push(format!("its tree was not killed: {e}"));
+                    }
+                }
+                return tree;
+            }
+            Resolved::Gone => "the child is gone, or is not ours",
+            Resolved::Unknown => "the child's identity could not be read",
+        };
+        match prepared.marker {
+            Some(marker) => {
+                tree.notes.push(why.fold(format!(
+                    "{unshown}, so only its marker's holders were killed, not its process group or the processes \
+                     its pid parents"
+                )));
+                tree.reach = Reach::Holders(crate::containment::fdmarker::Marker::without_root(marker));
+            }
+            None => tree.notes.push(why.fold(format!("its tree was not killed: {unshown}"))),
+        }
+        tree
     }
-    let (resolved, mut why) = resolve_identity(pid, &crate::wait::exit_only::Target::pid(pid, Some(unique)));
-    let id = match resolved {
-        crate::identity::Resolved::Found(id) => id,
-        crate::identity::Resolved::Gone => {
-            return Some(why.fold("its tree was not killed: the child is gone, or is not ours"))
-        }
-        crate::identity::Resolved::Unknown => {
-            return Some(why.fold("its tree was not killed: the child's identity could not be read"))
-        }
-    };
-    match crate::containment::attach(id, prepared) {
-        Ok(attachment) => attachment
-            .attached
-            .hard_kill()
-            .err()
-            .map(|e| format!("its tree was not fully killed: {e}")),
-        Err(e) => {
-            assert_attach_cannot_fail(&e);
-            Some(format!("its tree was not killed: {e}"))
+
+    /// Runs `sweep`.
+    fn kill(&mut self, sweep: Sweep) {
+        use crate::containment::Attached;
+        match (&self.reach, sweep) {
+            (Reach::None, _) => {}
+            (Reach::Attached(attached), Sweep::RootAlive | Sweep::RootKilled { zombie: true }) => {
+                self.failed = attached.hard_kill().err().map(|e| e.to_string());
+            }
+            // The root is not shown ours any more: only the holders, and never the root.
+            (Reach::Attached(Attached::FdMarker(m)), Sweep::RootKilled { zombie: false }) => {
+                if let Err(e) = m.hard_kill_holders_only(m.root()) {
+                    self.notes
+                        .push(format!("its marker's holders were not all killed after its kill: {e}"));
+                }
+                self.notes.push(NOT_SWEPT_AGAIN.to_owned());
+            }
+            (Reach::Attached(_), Sweep::RootKilled { zombie: false }) => self.notes.push(NOT_SWEPT_AGAIN.to_owned()),
+            (Reach::Holders(m), _) => self.failed = m.hard_kill_holders_only(None).err().map(|e| e.to_string()),
         }
     }
 }
+
+/// The note of a tree whose root was not shown an unreaped zombie after its kill.
+#[cfg(target_os = "macos")]
+const NOT_SWEPT_AGAIN: &str =
+    "it was not shown an unreaped zombie after its kill, so what it started as it died was not killed by its pid";
 
 /// The one `warn` of a spawn whose child's report came late (see [`Report::Late`]).
 #[cfg(target_os = "macos")]
@@ -921,6 +1011,7 @@ fn kill_and_reap_noting(
     id: Option<ProcessId>,
     notes: &mut Vec<String>,
     breach: &mut Option<String>,
+    after_kill: impl FnOnce(bool),
 ) -> (ChildFate, KillOutcome) {
     use crate::signal::{via_verified_pid, Sent, Sig};
     use crate::wait::backend::{await_reapable, Waited};
@@ -932,7 +1023,9 @@ fn kill_and_reap_noting(
             // A fixture that only the kill would end is released here when no kill was sent.
             #[cfg(test)]
             fault::run_between_kill_and_wait();
-            let fate = match await_reapable(pid, Some(unique), None) {
+            let waited = await_reapable(pid, Some(unique), None);
+            after_kill(matches!(waited, Ok(Waited::Reapable)));
+            let fate = match waited {
                 Ok(Waited::Reapable) => reap_verified(pid, &target, id, true, notes, breach),
                 Ok(Waited::Gone) => {
                     log::debug!("spawn teardown: pid {pid} was reaped by someone else");
@@ -957,14 +1050,17 @@ fn kill_and_reap_noting(
         }
         Ok(Sent::Gone) => {
             log::debug!("spawn teardown: pid {pid} is already gone");
+            after_kill(false);
             (Foreign::Gone.fate(false), KillOutcome::NotSent)
         }
         Ok(Sent::Unverified) => {
             debug_assert!(false, "`via_verified_pid` was given `Some(unique)`, so it verifies");
+            after_kill(false);
             notes.push("could not be verified, so it was not signalled".to_owned());
             (ChildFate::Running { id }, KillOutcome::NotSent)
         }
         Err(kill) => {
+            after_kill(false);
             let fate = reap_verified(pid, &target, id, false, notes, breach);
             (fate, KillOutcome::Refused(kill.to_string()))
         }
@@ -1037,8 +1133,9 @@ fn reap_verified(
 
 /// macOS: `child` could not be adopted, and the spawn fails with `not_adopted.error`. A child that
 /// died before `exec` is only a corpse nothing collects, and the program did not start. A child
-/// whose id came late may have started the program: its tree is killed through `prepared`, then the
-/// child is killed and reaped by pid, each checked against that id. A `front` is sent nothing and
+/// whose id came late may have started the program: it is killed and reaped by pid, each act checked
+/// against that id, and its tree is killed through `prepared` (see [`kill_and_reap_unreported`]). A
+/// `front` is sent nothing and
 /// left running and unreaped instead, and the error notes it. Any other is never signalled or
 /// waited on by pid, and is left as `leave_unverified_child` leaves it.
 #[cfg(target_os = "macos")]
@@ -2574,6 +2671,8 @@ pub(crate) mod fault {
         static AFTER_IDENTITY_READ: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
         #[cfg(target_os = "macos")]
         static BEFORE_LATE_TEARDOWN: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
+        #[cfg(target_os = "macos")]
+        static BEFORE_LATE_ROOT_KILL: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
         static TEARDOWN_REAPS: std::cell::RefCell<Option<Vec<TeardownReap>>> = const { std::cell::RefCell::new(None) };
         #[cfg(target_os = "linux")]
         static ATTACHMENT_OVERRIDE: std::cell::RefCell<Option<crate::containment::Attachment>> =
@@ -2847,6 +2946,9 @@ pub(crate) mod fault {
         /// macOS: right before the teardown of a child whose unique id came late.
         #[cfg(target_os = "macos")]
         BeforeLateTeardown,
+        /// macOS: in that teardown, after the first kill of the tree and before the root's kill.
+        #[cfg(target_os = "macos")]
+        BeforeLateRootKill,
     }
 
     fn hook_at(point: SpawnPoint) -> &'static std::thread::LocalKey<crate::oneshot_hook::OneShotHook> {
@@ -2856,6 +2958,8 @@ pub(crate) mod fault {
             SpawnPoint::AfterIdentityRead => &AFTER_IDENTITY_READ,
             #[cfg(target_os = "macos")]
             SpawnPoint::BeforeLateTeardown => &BEFORE_LATE_TEARDOWN,
+            #[cfg(target_os = "macos")]
+            SpawnPoint::BeforeLateRootKill => &BEFORE_LATE_ROOT_KILL,
         }
     }
 
