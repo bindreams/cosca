@@ -66,8 +66,7 @@ fn blank() -> KEvent {
     KEvent::new(0, EventFilter::EVFILT_PROC, EvFlags::empty(), FilterFlag::empty(), 0, 0)
 }
 
-// xnu `sys/event.h`. Spelled here because libc 0.2.190 removed it (0.2.189 had it deprecated), and a
-// downstream lockfile can resolve any 0.2.x.
+// xnu `sys/event.h`. Spelled locally: libc dropped `NOTE_REAP` in 0.2.190.
 const NOTE_REAP: u32 = 0x1000_0000;
 
 /// Register `EVFILT_SIGNAL` for `SIGCHLD` and `EVFILT_PROC` for `pid`. `Ok(true)` when the
