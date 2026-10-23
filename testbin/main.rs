@@ -314,7 +314,12 @@ fn main() {
                 // SAFETY: the closure does nothing, so it is async-signal-safe.
                 unsafe { cmd.pre_exec(|| Ok(())) };
             }
-            match cmd.status() {
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "no other thread of this process forks: this mode starts none"
+            )]
+            let status = cmd.status();
+            match status {
                 Ok(status) => println!("ok,{status}"),
                 Err(e) => println!("err={},{:?}", e.raw_os_error().unwrap_or(-1), e.kind()),
             }
