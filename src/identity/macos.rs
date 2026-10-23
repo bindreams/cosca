@@ -258,7 +258,9 @@ pub(crate) fn held_by(pid: RawPid, expected: u64, purpose: ReadPurpose) -> Held 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Origin {
     /// This process forked it: its parent is this process, or was when a tracer attached.
-    Ours,
+    /// `parent` holds it now: this process, a tracer, or launchd (a child whose tracer exited while
+    /// the child was exiting).
+    Ours { parent: RawPid },
     /// Another process's, or not the same process from one read to the next.
     NotOurs,
     /// No process has the pid.
@@ -299,7 +301,9 @@ pub(crate) fn origin(pid: RawPid) -> Origin {
     }
     let me = std::process::id() as libc::pid_t;
     if unique > own && (info.kp_proc.p_oppid == me || info.e_ppid() == me) {
-        Origin::Ours
+        Origin::Ours {
+            parent: info.e_ppid() as RawPid,
+        }
     } else {
         Origin::NotOurs
     }

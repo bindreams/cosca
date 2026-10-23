@@ -170,15 +170,22 @@ const SAY_WAITING_AFTER: std::time::Duration = std::time::Duration::from_secs(1)
 /// The pipe's EOF alone cannot end the wait. `std::io::pipe` on macOS is `pipe()`, then a separate
 /// `FD_CLOEXEC`, so any process another thread starts in between (not only a fork that never execs)
 /// inherits the write end and holds the EOF off for as long as it lives. So one kqueue watches the
-/// pipe (`EVFILT_READ`) and the child (`EVFILT_PROC`, `NOTE_EXIT`). The child is gone when that
-/// registration answers `ESRCH`, when `NOTE_EXIT` comes, or when `waitid(WNOHANG | WNOWAIT)`, asked
-/// after the registration, finds it exited, or answers `ECHILD` for a pid this process did not fork
-/// (a tracer holding the child also makes `waitid` answer `ECHILD`); the pipe is then read once more.
+/// pipe (`EVFILT_READ`) and the child (`EVFILT_PROC`, `NOTE_EXIT`), and [`check`] asks after the
+/// child once the watch is registered and again on every wake. The child is gone when that
+/// registration answers `ESRCH`, when `NOTE_EXIT` comes, or when the check finds it gone; the pipe
+/// is then read once more.
 ///
-/// The residual: something else reaps the child (`SIGCHLD` ignored, or a `waitpid(-1)` reaper) and
-/// another child of this process, traced or not, takes its pid before the registration. The watch
-/// and `waitid` then name that process, and the wait lasts as long as it does, unless the pipe hits
-/// EOF first.
+/// A traced child's `NOTE_EXIT` reaches this process only at its tracer's hand-back. So a live
+/// tracer that holds the child's zombie keeps the wait going until it hands the zombie back: the
+/// tracer owns its tracee's stops and hand-back. The wait also watches the tracer's exit
+/// ([`TracerWatch`](crate::wait::backend::TracerWatch)), which ends it when the tracer exits while
+/// the child is exiting and XNU gives the child to launchd.
+///
+/// The residuals. Something else reaps the child (`SIGCHLD` ignored, or a `waitpid(-1)` reaper) and
+/// another child of this process, traced or not, takes its pid before the registration: the watch
+/// and the check then name that process, and the wait lasts as long as it does, unless the pipe hits
+/// EOF first. A tracer that attaches after the wait's last check is not watched: if it exits while
+/// the child is exiting, nothing wakes the wait until launchd waits on the child.
 ///
 /// It waits on events, never on a timer. Past one second it warns, once, naming what it waits for:
 /// a message only, never a decision.
@@ -217,6 +224,7 @@ enum Watch {
 
 /// The kqueue wait of [`await_report`].
 fn watch(read_end: &OwnedFd, pid: u32) -> io::Result<Watch> {
+    use crate::wait::backend::{OnTracer, TracerWatch};
     use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 
     let kq = Kqueue::new()?;
@@ -234,70 +242,99 @@ fn watch(read_end: &OwnedFd, pid: u32) -> io::Result<Watch> {
         0 => {}
         errno => return Err(io::Error::from_raw_os_error(errno as i32)),
     }
-    // Registered before the `waitid`, so a child that exits after it fires `NOTE_EXIT`.
+    // Registered before the first check, so a child that exits after it fires `NOTE_EXIT`.
     if crate::wait::backend::arm_note_exit_on(&kq, pid)
         .map_err(into_io)?
         .is_none()
     {
         return Ok(Watch::ChildGone);
     }
-    // Read again before asking about the child: the report may have come since the first read.
-    match read_report(read_end) {
-        Report::Unwritten => {}
-        Report::Id(id) => return Ok(Watch::Pipe(Report::Late(id))),
-        report => return Ok(Watch::Pipe(report)),
-    }
-    if !child_is_running(pid)? {
-        return Ok(Watch::ChildGone);
-    }
+    let mut tracer = TracerWatch::default();
     let blank = KEvent::new(0, EventFilter::EVFILT_READ, EvFlags::empty(), FilterFlag::empty(), 0, 0);
-    let mut events = [blank; 2];
+    // Room for every knote at once: the pipe, the child, and the tracers watched.
+    let mut events = [blank; 8];
+    let started = std::time::Instant::now();
     let mut warned = false;
     loop {
+        // Read before asking about the child: the report may have come since the last read.
+        match read_report(read_end) {
+            Report::Unwritten => {}
+            Report::Id(id) => return Ok(Watch::Pipe(Report::Late(id))),
+            report => return Ok(Watch::Pipe(report)),
+        }
+        let recheck = match check(pid)? {
+            Check::Gone => return Ok(Watch::ChildGone),
+            Check::Running => None,
+            Check::Traced(by) => match tracer.held_by(&kq, by)? {
+                OnTracer::Block => None,
+                OnTracer::Recheck(after) if after.is_zero() => continue,
+                OnTracer::Recheck(after) => Some(after),
+            },
+        };
         #[cfg(test)]
         seams::blocking(&kq);
-        let timeout = (!warned).then(|| crate::wait::backend::kevent_timeout(SAY_WAITING_AFTER));
-        let n = match kq.kevent(&[], &mut events, timeout) {
+        let warn_in = (!warned).then(|| SAY_WAITING_AFTER.saturating_sub(started.elapsed()));
+        let timeout = match (recheck, warn_in) {
+            (Some(recheck), Some(warn_in)) => Some(recheck.min(warn_in)),
+            (recheck, warn_in) => recheck.or(warn_in),
+        };
+        let n = match kq.kevent(&[], &mut events, timeout.map(crate::wait::backend::kevent_timeout)) {
             Ok(n) => n,
             Err(nix::errno::Errno::EINTR) => continue,
             Err(e) => return Err(e.into()),
         };
-        if n == 0 {
+        if !warned && started.elapsed() >= SAY_WAITING_AFTER {
             warned = true;
             log::warn!(
                 "the spawned child {pid} has not reported its unique id after 1 s; waiting for its report, or \
                  for it to exit"
             );
-            continue;
         }
-        if events[..n].iter().any(|e| e.filter() == Ok(EventFilter::EVFILT_PROC)) {
+        let woke = &events[..n];
+        if woke
+            .iter()
+            .any(|e| e.filter() == Ok(EventFilter::EVFILT_PROC) && e.ident() == pid as usize)
+        {
             return Ok(Watch::ChildGone);
         }
-        match read_report(read_end) {
-            Report::Id(id) => return Ok(Watch::Pipe(Report::Late(id))),
-            // Readable, yet nothing to read: a spurious wake. Wait again.
-            Report::Unwritten => continue,
-            report => return Ok(Watch::Pipe(report)),
+        // Any other wake (a tracer's exit, the pipe, a timer) reads the pipe and checks the child
+        // again.
+        for event in woke {
+            tracer.fired(event, pid);
         }
     }
 }
 
-/// Whether `pid` is a child of this process that has not exited, by a `waitid` that consumes
-/// nothing. An exit record is `false`.
+/// What [`check`] found.
+enum Check {
+    /// A child of this process that has not exited.
+    Running,
+    /// This process's child, held by this tracer.
+    Traced(u32),
+    /// Exited, reaped, or not this process's child: no report is coming.
+    Gone,
+}
+
+/// Where `pid` is, by a `waitid` that consumes nothing. An exit record is [`Check::Gone`].
 ///
 /// `ECHILD` alone is not: while a tracer holds our child, its parent's `waitid` answers `ECHILD`
-/// too. So the pid is asked who forked it ([`origin`](crate::identity::origin)): a process this one
-/// forked is still waited on, since the watch registered before this check fires `NOTE_EXIT` when it
-/// exits. Any other answer means the child is gone. A read that is refused is an error.
-fn child_is_running(pid: u32) -> io::Result<bool> {
-    use crate::identity::{origin, Origin};
+/// too. So the pid is asked who forked it and who holds it ([`origin`](crate::identity::origin)). A
+/// process this one forked is [`Check::Traced`] by the process that holds it, unless that is
+/// launchd: XNU gives launchd a child whose tracer exited while the child was exiting, so it is
+/// gone. Any other answer means the child is gone. A read that is refused is an error.
+fn check(pid: u32) -> io::Result<Check> {
+    use crate::identity::{origin, Origin, LAUNCHD};
     use crate::wait::exit_only::{peek, Peek, Target};
     Ok(match peek(&Target::pid(pid, None))? {
-        Peek::Running => true,
-        Peek::Exit(_) => false,
+        Peek::Running => Check::Running,
+        Peek::Exit(_) => Check::Gone,
         Peek::Foreign(_) => match origin(pid) {
-            Origin::Ours => true,
-            Origin::NotOurs | Origin::Gone => false,
+            Origin::Ours { parent } if parent == LAUNCHD => Check::Gone,
+            // A tracer detached between the two reads: the child is ours again, and its own
+            // `NOTE_EXIT` reaches this process.
+            Origin::Ours { parent } if parent == std::process::id() => Check::Running,
+            Origin::Ours { parent } => Check::Traced(parent),
+            Origin::NotOurs | Origin::Gone => Check::Gone,
             Origin::Refused(errno) => {
                 return Err(io::Error::new(
                     io::Error::from_raw_os_error(errno).kind(),

@@ -32,9 +32,11 @@ cosca's placement report ([`ReportChannel::wait`](../src/containment/cgroup/chan
 completes before `exec`. The wait is bounded by the child's own progress to `exec`; a child stopped
 or stuck in D state between `fork` and `exec` holds the thread. The wait for macOS's unique-id
 report ([`unique_report::await_report`](../src/child/spawn/unique_report.rs)) is bounded the same
-way, with an accepted residual: if something else reaps the child and another child of this process
-takes its pid, the wait lasts as long as that process. It holds `spawn_lock`, so it stalls every
-other cosca spawn meanwhile.
+way, with accepted residuals: if something else reaps the child and another child of this process
+takes its pid, the wait lasts as long as that process; and a tracer holding the child's zombie keeps
+it waiting until the tracer hands the zombie back. One more is open: a tracer that attaches after the
+wait's last check and exits while the child is exiting leaves it waiting until launchd waits on the
+child. The wait holds `spawn_lock`, so it stalls every other cosca spawn meanwhile.
 
 **Why:** a blocked worker stops every task scheduled on it, and on a `current_thread` runtime it
 stops the runtime. tokio itself panics rather than block when a `Runtime` is dropped in async
@@ -99,7 +101,12 @@ doesn't do this yet either ([#341]).
 Where a group ID must be used (process-group or fd-marker containment), keep the root an unreaped
 zombie until the group kill is done.
 
-One by-number reap is outside this rule: tokio's reap of a dropped async root (principle 3).
+The by-number reaps outside this rule are all tokio's: its reap of a dropped async root (principle 3),
+and, on macOS, its orphan queue's reap of a child whose async spawn failed and whose kill did not
+end it. There cosca releases tokio's `Child` rather than forget it, which would leave a zombie
+nothing collects: `ProcSource::reap_now_noting` and `ProcSource::reap_unreported`
+([`proc_source.rs`](../src/tokio/child/proc_source.rs)), and the attach-failure arm of
+`spawn_uncommitted` ([`tokio/spawn.rs`](../src/tokio/spawn.rs)).
 
 **Why:** once the process is reaped its number can belong to anyone, and a signal sent to it hits an
 unrelated process.
