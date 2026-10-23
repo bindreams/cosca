@@ -140,12 +140,12 @@ mod windows {
         );
         let text = std::fs::read_to_string(&report).expect("the report");
         let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 5, "{text}");
         assert_eq!(lines[0], "usestdhandles=true", "{text}");
         assert!(lines[1].starts_with("stdin="), "{text}");
         assert_eq!(lines[2], "stdout=pipe", "{text}");
         assert_eq!(lines[3], "stderr=pipe", "{text}");
         assert!(lines[4].starts_with("probed="), "{text}");
-        assert_eq!(lines.len(), 5, "{text}");
     }
 
     /// Mutant: the child reports only its cwd string, which cannot tell two directories reached
@@ -160,9 +160,9 @@ mod windows {
                 .current_dir(dir.path()),
         );
         let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2, "{out}");
         assert!(lines[0].starts_with("cwd="), "{out}");
         assert_eq!(lines[1], "markers=marker-x", "{out}");
-        assert_eq!(lines.len(), 2, "{out}");
     }
 }
 
