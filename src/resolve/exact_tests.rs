@@ -76,7 +76,7 @@ fn an_absolute_program_is_not_anchored() {
 }
 
 #[skuld::test]
-fn anchoring_refuses_a_program_that_names_no_file() {
+fn anchoring_refuses_what_it_cannot_anchor() {
     for n in ["", ".", "dir/", "a\0b"] {
         invalid_input_message(anchor_posix(OsStr::new(n), None));
     }
