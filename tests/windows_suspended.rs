@@ -167,6 +167,7 @@ fn death_watch_frozen_spawn_inside_a_contained_tree_dies_with_the_nested_parent(
 
 /// As above for a child that asked for no containment but sits in the helper's tree: it has no
 /// containment of its own (`None`), the ancestor's job holds it, and only the guard can end it.
+#[cfg(windows)]
 #[skuld::test]
 fn death_watch_uncontained_frozen_spawn_inside_a_contained_tree_dies_with_its_parent() {
     for backend in BACKENDS {
