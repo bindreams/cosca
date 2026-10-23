@@ -143,9 +143,10 @@ impl Channel {
         // Closed before the read, so a child that never wrote leaves the pipe at EOF.
         drop(write_end);
         let first = read_report(&read_end);
+        let pid = spawned.as_ref().ok().map(pid_of);
         #[cfg(test)]
-        seams::first_read_done();
-        let report = match (first, spawned.as_ref().ok().map(pid_of)) {
+        seams::first_read_done(pid.flatten());
+        let report = match (first, pid) {
             (Report::Unwritten, Some(Some(pid))) => await_report(&read_end, pid),
             (Report::Unwritten, Some(None)) => {
                 debug_assert!(false, "a freshly spawned child has a pid");
@@ -171,11 +172,13 @@ const SAY_WAITING_AFTER: std::time::Duration = std::time::Duration::from_secs(1)
 /// inherits the write end and holds the EOF off for as long as it lives. So one kqueue watches the
 /// pipe (`EVFILT_READ`) and the child (`EVFILT_PROC`, `NOTE_EXIT`). The child is gone when that
 /// registration answers `ESRCH`, when `NOTE_EXIT` comes, or when `waitid(WNOHANG | WNOWAIT)`, asked
-/// after the registration, finds it exited or answers `ECHILD`; the pipe is then read once more.
+/// after the registration, finds it exited, or answers `ECHILD` for a pid this process did not fork
+/// (a tracer holding the child also makes `waitid` answer `ECHILD`); the pipe is then read once more.
 ///
 /// The residual: something else reaps the child (`SIGCHLD` ignored, or a `waitpid(-1)` reaper) and
-/// another child of this process takes its pid before the registration. The watch and `waitid` then
-/// name that process, and the wait lasts as long as it does, unless the pipe hits EOF first.
+/// another child of this process, traced or not, takes its pid before the registration. The watch
+/// and `waitid` then name that process, and the wait lasts as long as it does, unless the pipe hits
+/// EOF first.
 ///
 /// It waits on events, never on a timer. Past one second it warns, once, naming what it waits for:
 /// a message only, never a decision.
@@ -217,6 +220,8 @@ fn watch(read_end: &OwnedFd, pid: u32) -> io::Result<Watch> {
     use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 
     let kq = Kqueue::new()?;
+    #[cfg(test)]
+    seams::wait_begins();
     let pipe = KEvent::new(
         read_end.as_raw_fd() as usize,
         EventFilter::EVFILT_READ,
@@ -250,7 +255,7 @@ fn watch(read_end: &OwnedFd, pid: u32) -> io::Result<Watch> {
     let mut warned = false;
     loop {
         #[cfg(test)]
-        seams::blocking();
+        seams::blocking(&kq);
         let timeout = (!warned).then(|| crate::wait::backend::kevent_timeout(SAY_WAITING_AFTER));
         let n = match kq.kevent(&[], &mut events, timeout) {
             Ok(n) => n,
@@ -278,13 +283,33 @@ fn watch(read_end: &OwnedFd, pid: u32) -> io::Result<Watch> {
 }
 
 /// Whether `pid` is a child of this process that has not exited, by a `waitid` that consumes
-/// nothing. An exit record, or `ECHILD` (something else reaped it, so the pid is not our child), is
-/// `false`.
+/// nothing. An exit record is `false`.
+///
+/// `ECHILD` alone is not: while a tracer holds our child, its parent's `waitid` answers `ECHILD`
+/// too. So the pid is asked who forked it ([`origin`](crate::identity::origin)): a process this one
+/// forked is still waited on, since the watch registered before this check fires `NOTE_EXIT` when it
+/// exits. Any other answer means the child is gone. A read that is refused is an error.
 fn child_is_running(pid: u32) -> io::Result<bool> {
+    use crate::identity::{origin, Origin};
     use crate::wait::exit_only::{peek, Peek, Target};
     Ok(match peek(&Target::pid(pid, None))? {
         Peek::Running => true,
-        Peek::Exit(_) | Peek::Foreign(_) => false,
+        Peek::Exit(_) => false,
+        Peek::Foreign(_) => match origin(pid) {
+            Origin::Ours => true,
+            Origin::NotOurs | Origin::Gone => false,
+            Origin::Refused(errno) => {
+                return Err(io::Error::new(
+                    io::Error::from_raw_os_error(errno).kind(),
+                    format!("pid {pid}: whether it is this process's child could not be read (errno {errno})"),
+                ))
+            }
+            Origin::Unreadable => {
+                return Err(io::Error::other(format!(
+                    "pid {pid}: whether it is this process's child could not be read (kinfo_proc refused)"
+                )))
+            }
+        },
     })
 }
 
@@ -470,6 +495,8 @@ fn report(shared: &Shared, #[cfg(test)] seam: seams::Armed) -> io::Result<()> {
         // SAFETY: `buf` is valid for `REPORT_LEN` bytes.
         let n = unsafe { libc::write(shared.child_end(), buf.as_ptr().cast(), REPORT_LEN) };
         if n == REPORT_LEN as isize {
+            #[cfg(test)]
+            seam.await_after_gate();
             return match tag {
                 REPORT_ERRNO => Err(io::Error::from_raw_os_error(value as i32)),
                 _ => Ok(()),
@@ -505,21 +532,71 @@ pub(crate) mod seams {
         Gate(std::os::fd::RawFd),
     }
 
+    /// A gate the hook blocks on: the test holds both ends, and a byte written releases the child.
+    struct Gate {
+        read: std::io::PipeReader,
+        write: std::io::PipeWriter,
+        /// Released by the parent's first read of the report, rather than by the test.
+        at_first_read: bool,
+    }
+
+    impl Gate {
+        fn new(at_first_read: bool) -> Gate {
+            let (read, write) = std::io::pipe().expect("the gate pipe");
+            Gate {
+                read,
+                write,
+                at_first_read,
+            }
+        }
+
+        fn release(mut self) {
+            use std::io::Write;
+            self.write.write_all(b"r").expect("release the held child");
+        }
+    }
+
+    /// What [`on_each_block`] runs: the block's number in its wait (1 for the first) and the
+    /// wait's kqueue.
+    type BlockHook = Box<dyn FnMut(u32, &nix::sys::event::Kqueue)>;
+
+    /// What [`on_first_read`] runs: the child's pid.
+    type FirstReadHook = Box<dyn FnOnce(u32)>;
+
     thread_local! {
         static FORCE: Cell<Force> = const { Cell::new(Force::None) };
         static PARENT_READ_ERRNO: Cell<Option<i32>> = const { Cell::new(None) };
         static PARENT_READ_UNWRITTEN: Cell<bool> = const { Cell::new(false) };
         static WAIT_REFUSED: Cell<bool> = const { Cell::new(false) };
-        static GATE: std::cell::RefCell<Option<(std::io::PipeReader, std::io::PipeWriter)>> =
-            const { std::cell::RefCell::new(None) };
+        static GATE: std::cell::RefCell<Option<Gate>> = const { std::cell::RefCell::new(None) };
+        static AFTER_GATE: std::cell::RefCell<Option<Gate>> = const { std::cell::RefCell::new(None) };
+        static ON_FIRST_READ: std::cell::RefCell<Option<FirstReadHook>> = const { std::cell::RefCell::new(None) };
         static ON_FIRST_BLOCK: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
+        static ON_EACH_BLOCK: std::cell::RefCell<Option<BlockHook>> = const { std::cell::RefCell::new(None) };
+        static BLOCKS_IN_WAIT: Cell<u32> = const { Cell::new(0) };
         static BLOCKS: Cell<u32> = const { Cell::new(0) };
         static WAKE: Cell<Option<Wake>> = const { Cell::new(None) };
     }
 
-    /// What a hook registered on this thread was armed with.
+    /// What a hook registered on this thread was armed with: the force, and the read end of the
+    /// gate it blocks on after its report.
     #[derive(Debug, Clone, Copy)]
-    pub(super) struct Armed(Force);
+    pub(super) struct Armed(Force, Option<std::os::fd::RawFd>);
+
+    /// Blocks until a byte can be read from `fd`, or it is at end of file. Async-signal-safe: `read`
+    /// into a stack byte.
+    fn await_byte(fd: std::os::fd::RawFd) {
+        let mut byte = 0u8;
+        loop {
+            // SAFETY: one byte into a stack variable.
+            let n = unsafe { libc::read(fd, (&raw mut byte).cast(), 1) };
+            // SAFETY: `__error` is this thread's errno location.
+            if n < 0 && unsafe { *libc::__error() } == libc::EINTR {
+                continue;
+            }
+            return;
+        }
+    }
 
     impl Armed {
         /// The child's read, as the seam shapes it. Async-signal-safe.
@@ -530,19 +607,19 @@ pub(crate) mod seams {
             }
         }
 
-        /// Blocks until the parent's first read of the report has returned, if the seam says so.
-        /// Async-signal-safe: `read` into a stack byte.
+        /// Blocks before the report until its gate is released, if the seam says so.
+        /// Async-signal-safe.
         pub(super) fn await_gate(self) {
-            let Force::Gate(fd) = self.0 else { return };
-            let mut byte = 0u8;
-            loop {
-                // SAFETY: one byte into a stack variable.
-                let n = unsafe { libc::read(fd, (&raw mut byte).cast(), 1) };
-                // SAFETY: `__error` is this thread's errno location.
-                if n < 0 && unsafe { *libc::__error() } == libc::EINTR {
-                    continue;
-                }
-                return;
+            if let Force::Gate(fd) = self.0 {
+                await_byte(fd);
+            }
+        }
+
+        /// Blocks after the report until its gate is released, if the seam says so.
+        /// Async-signal-safe.
+        pub(super) fn await_after_gate(self) {
+            if let Some(fd) = self.1 {
+                await_byte(fd);
             }
         }
 
@@ -568,7 +645,9 @@ pub(crate) mod seams {
     }
 
     pub(super) fn armed() -> Armed {
-        Armed(FORCE.with(Cell::get))
+        use std::os::fd::AsRawFd;
+        let after = AFTER_GATE.with(|g| g.borrow().as_ref().map(|gate| gate.read.as_raw_fd()));
+        Armed(FORCE.with(Cell::get), after)
     }
 
     /// Disarms the force when dropped.
@@ -660,11 +739,51 @@ pub(crate) mod seams {
     /// parent's first read of it has returned, so the report is late whenever std returned before
     /// the child's hooks ran.
     pub(crate) fn hold_the_report_until_the_first_read() -> HeldReport {
+        hold(Gate::new(true))
+    }
+
+    /// While the guard lives, the next spawn's child on this thread writes its report only once
+    /// [`release_the_report`] is called.
+    pub(crate) fn hold_the_report() -> HeldReport {
+        hold(Gate::new(false))
+    }
+
+    fn hold(gate: Gate) -> HeldReport {
         use std::os::fd::AsRawFd;
-        let (read, write) = std::io::pipe().expect("the gate pipe");
-        FORCE.with(|f| f.set(Force::Gate(read.as_raw_fd())));
-        GATE.with(|g| *g.borrow_mut() = Some((read, write)));
+        FORCE.with(|f| f.set(Force::Gate(gate.read.as_raw_fd())));
+        GATE.with(|g| *g.borrow_mut() = Some(gate));
         HeldReport(())
+    }
+
+    /// Lets the child [`hold_the_report`] holds write its report.
+    pub(crate) fn release_the_report() {
+        GATE.with(|g| g.borrow_mut().take())
+            .expect("a held report to release")
+            .release();
+    }
+
+    /// While the guard lives, the next spawn's child on this thread stops right after its report,
+    /// before any later hook, until [`release_the_child_after_its_report`] is called.
+    pub(crate) fn hold_the_child_after_its_report() -> HeldAfterReport {
+        AFTER_GATE.with(|g| *g.borrow_mut() = Some(Gate::new(false)));
+        HeldAfterReport(())
+    }
+
+    #[must_use = "the child is held only while the guard lives"]
+    pub(crate) struct HeldAfterReport(());
+
+    impl Drop for HeldAfterReport {
+        fn drop(&mut self) {
+            AFTER_GATE.with(|g| g.borrow_mut().take());
+        }
+    }
+
+    /// Lets the child [`hold_the_child_after_its_report`] holds run on.
+    pub(crate) fn release_the_child_after_its_report() {
+        AFTER_GATE
+            .with(|g| g.borrow_mut().take())
+            .expect("a child held after its report")
+            .release();
     }
 
     #[must_use = "the report is held only while the guard lives"]
@@ -677,11 +796,42 @@ pub(crate) mod seams {
         }
     }
 
-    /// The parent's first read of a report has returned: lets a held child write it.
-    pub(super) fn first_read_done() {
-        use std::io::Write;
-        if let Some((_, mut write)) = GATE.with(|g| g.borrow_mut().take()) {
-            write.write_all(b"r").expect("release the held report");
+    /// The parent's first read of a report has returned: lets a child held until then write it,
+    /// and runs the hook [`on_first_read`] armed.
+    pub(super) fn first_read_done(pid: Option<u32>) {
+        let gate = GATE.with(|g| {
+            let mut g = g.borrow_mut();
+            if g.as_ref().is_some_and(|gate| gate.at_first_read) {
+                g.take()
+            } else {
+                None
+            }
+        });
+        if let Some(gate) = gate {
+            gate.release();
+        }
+        let hook = ON_FIRST_READ.with(|h| h.borrow_mut().take());
+        if let (Some(hook), Some(pid)) = (hook, pid) {
+            hook(pid);
+        }
+    }
+
+    /// Runs `hook` once with the child's pid, when the parent's first read of the report of a spawn
+    /// that returned `Ok` on this thread has returned, before any wait for it.
+    pub(crate) fn on_first_read(hook: impl FnOnce(u32) + 'static) -> FirstRead {
+        ON_FIRST_READ.with(|h| {
+            let previous = h.borrow_mut().replace(Box::new(hook));
+            debug_assert!(previous.is_none(), "a first-read hook is already armed");
+        });
+        FirstRead(())
+    }
+
+    #[must_use = "the hook is cleared as soon as the guard is dropped"]
+    pub(crate) struct FirstRead(());
+
+    impl Drop for FirstRead {
+        fn drop(&mut self) {
+            ON_FIRST_READ.with(|h| h.borrow_mut().take());
         }
     }
 
@@ -695,9 +845,45 @@ pub(crate) mod seams {
         BLOCKS.with(Cell::get)
     }
 
-    pub(super) fn blocking() {
+    /// Runs `hook` each time a wait for a report on this thread is about to block, with the
+    /// block's number in that wait (1 for the first) and the wait's kqueue, until the guard drops.
+    pub(crate) fn on_each_block(hook: impl FnMut(u32, &nix::sys::event::Kqueue) + 'static) -> EachBlock {
+        ON_EACH_BLOCK.with(|h| {
+            let previous = h.borrow_mut().replace(Box::new(hook));
+            debug_assert!(previous.is_none(), "a block hook is already armed");
+        });
+        EachBlock(())
+    }
+
+    #[must_use = "the hook is cleared as soon as the guard is dropped"]
+    pub(crate) struct EachBlock(());
+
+    impl Drop for EachBlock {
+        fn drop(&mut self) {
+            ON_EACH_BLOCK.with(|h| h.borrow_mut().take());
+        }
+    }
+
+    /// A wait for a report has begun on this thread.
+    pub(super) fn wait_begins() {
+        BLOCKS_IN_WAIT.with(|b| b.set(0));
+    }
+
+    pub(super) fn blocking(kq: &nix::sys::event::Kqueue) {
         BLOCKS.with(|b| b.set(b.get() + 1));
+        let n = BLOCKS_IN_WAIT.with(|b| {
+            b.set(b.get() + 1);
+            b.get()
+        });
         crate::oneshot_hook::fire(&ON_FIRST_BLOCK);
+        // Taken out for the call, so the hook may use the other seams.
+        let hook = ON_EACH_BLOCK.with(|h| h.borrow_mut().take());
+        if let Some(mut hook) = hook {
+            hook(n, kq);
+            ON_EACH_BLOCK.with(|h| {
+                h.borrow_mut().get_or_insert(hook);
+            });
+        }
     }
 
     /// What ended the last wait for a report on this thread.

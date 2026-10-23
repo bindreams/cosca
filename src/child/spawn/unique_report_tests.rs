@@ -311,36 +311,61 @@ fn awaiting_a_closed_empty_pipe_answers_missing() {
     end(child, stdin);
 }
 
-/// The wait blocks until a report arrives from another thread. The writer writes only once the
-/// wait has blocked, released by the wait's own hook; a wait that never blocks drops the release
-/// unsent, and the writer writes nothing.
+/// Whether `kq` has an `EVFILT_READ` event pending, by a `kevent` that does not block. A level
+/// event stays queued while the pipe is readable, so the look takes nothing from the wait.
+fn read_pending(kq: &nix::sys::event::Kqueue) -> bool {
+    use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent};
+    let blank = KEvent::new(0, EventFilter::EVFILT_PROC, EvFlags::empty(), FilterFlag::empty(), 0, 0);
+    let mut events = [blank; 2];
+    let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    let n = kq.kevent(&[], &mut events, Some(zero)).expect("poll the wait's kqueue");
+    events[..n].iter().any(|e| e.filter() == Ok(EventFilter::EVFILT_READ))
+}
+
+/// The wait blocks until a report arrives, and the pipe's readability is what ends it. The hook on
+/// the wait's first block writes the report and looks at the wait's kqueue for the pipe's event.
+/// The child stays alive, so only the pipe can end a correct wait. A wait that missed it is ended by
+/// the child's exit instead, never left hanging: the first block ends the child when no pipe event
+/// is pending, and any later block ends it too.
 ///
-/// Mutant: the wait returns at once with nothing.
+/// Mutants: the wait returns at once with nothing; it does not register `EVFILT_READ` (no pipe
+/// event); it takes a readable pipe for a spurious wake (a second block, and the child's exit ends
+/// the wait).
 #[skuld::test]
-fn awaiting_waits_for_a_report_written_by_another_thread() {
+fn awaiting_is_woken_by_the_report_through_the_pipe() {
+    use std::cell::{Cell, RefCell};
     use std::io::Write;
+    use std::rc::Rc;
     let (child, stdin) = live_child();
-    let (r, mut w) = pipe();
-    let (release, released) = std::sync::mpsc::channel::<()>();
-    let writer = std::thread::spawn(move || {
-        if released.recv().is_ok() {
-            w.write_all(&report_bytes(1, 0xdef)).unwrap();
+    let (r, w) = pipe();
+    let stdin = Rc::new(RefCell::new(Some(stdin)));
+    let writer = RefCell::new(Some(w));
+    let pending = Rc::new(Cell::new(None));
+    let blocks = Rc::new(Cell::new(0));
+    let _hook = seams::on_each_block({
+        let (stdin, pending, blocks) = (Rc::clone(&stdin), Rc::clone(&pending), Rc::clone(&blocks));
+        move |n, kq| {
+            blocks.set(n);
+            if n == 1 {
+                let mut w = writer.borrow_mut().take().expect("the report's writer");
+                w.write_all(&report_bytes(1, 0xdef)).unwrap();
+                pending.set(Some(read_pending(kq)));
+                if pending.get() == Some(true) {
+                    return;
+                }
+            }
+            drop(stdin.borrow_mut().take());
         }
     });
-    let blocked = std::rc::Rc::new(std::cell::Cell::new(false));
-    let hook = seams::on_first_block({
-        let blocked = std::rc::Rc::clone(&blocked);
-        move || {
-            blocked.set(true);
-            release.send(()).expect("the writer waits");
-        }
-    });
+    let _ = seams::take_wake();
     let report = await_report(&r, child.id());
-    drop(hook);
-    writer.join().expect("the writer thread");
-    assert!(blocked.get(), "the wait must block until the report comes");
+    assert_eq!(pending.get(), Some(true), "the wait must watch the pipe");
+    assert_eq!(blocks.get(), 1, "a readable pipe ends the wait");
+    assert_eq!(seams::take_wake(), Some(seams::Wake::Pipe));
     assert!(matches!(report, Report::Late(0xdef)), "{report:?}");
-    end(child, stdin);
+    let mut child = child;
+    drop(stdin.borrow_mut().take());
+    child.wait().expect("reap cat");
 }
 
 /// A child that exited without reporting, while another copy of the write end stays open (as a fork
