@@ -20,6 +20,9 @@
 //! printed as the measurement, not raised, so a change in behaviour nothing asserts on never turns
 //! the run red. They fail only if their own scaffolding (a temp directory) cannot be set up.
 //!
+//! The `m<n>_` surveys are the single-backend measurements (#156): what `main`'s two Windows routes
+//! do today, printed as `M<n> <key>=<value>` lines for the change that unifies them to assert.
+//!
 //! Every test stamps its output with the OS build it ran on.
 //!
 //! # How to run it
@@ -32,21 +35,40 @@
 //! never mistakes a platform measurement for coverage of cosca. The canary's own string logic and
 //! verdict are tested by `windows_path_logic`, which runs by default on every host. `GetFullPathNameW` works on the string alone and touches no disk
 //! or network, so UNC and device inputs here reach no server or device. The file and spawn tests
-//! write only inside a `tempfile` directory of their own and launch only `cosca_testbin_image`,
-//! except that one canary has std create `cmd.exe` SUSPENDED and terminates it before it runs.
-//! Nothing here runs a batch file or needs elevation. Temp directories are removed on drop and
-//! planted files explicitly, but a removal failure is only printed; whatever it leaves goes with
-//! the ephemeral runner.
+//! write inside a `tempfile` directory of their own and launch `cosca_testbin` and its image
+//! copies, with these exceptions: one canary has std create `cmd.exe` SUSPENDED and terminates it
+//! before it runs; `m5_what_std_loads` runs `whoami` and `find` from System32 and reaches its
+//! temp directory through `\\localhost\<drive>$`; `m19_app_execution_aliases` launches `winget
+//! --version` and makes a directory of its own beside `%LOCALAPPDATA%\Microsoft\WindowsApps`. The
+//! symlink rows of `m19_` need the symlink privilege or Developer Mode, and record a refusal.
+//! Nothing here runs a batch file. Temp directories are removed on drop and planted files
+//! explicitly, but a removal failure is only printed; whatever it leaves goes with the ephemeral
+//! runner.
 
+#[cfg(windows)]
+#[path = "windows_path_resolution/aliases.rs"]
+mod aliases;
+#[cfg(windows)]
+#[path = "windows_path_resolution/backend.rs"]
+mod backend;
 #[cfg(windows)]
 #[path = "common/mod.rs"]
 mod common;
 #[cfg(windows)]
+#[path = "windows_path_resolution/devices.rs"]
+mod devices;
+#[cfg(windows)]
 #[path = "windows_path_resolution/dots_and_spaces.rs"]
 mod dots_and_spaces;
 #[cfg(windows)]
+#[path = "windows_path_resolution/env_set.rs"]
+mod env_set;
+#[cfg(windows)]
 #[path = "windows_path_resolution/harness.rs"]
 mod harness;
+#[cfg(windows)]
+#[path = "windows_path_resolution/measure.rs"]
+mod measure;
 #[cfg(windows)]
 #[path = "windows_path_resolution/provenance.rs"]
 mod provenance;
@@ -56,6 +78,9 @@ mod pure;
 #[cfg(windows)]
 #[path = "windows_path_resolution/spawn.rs"]
 mod spawn;
+#[cfg(windows)]
+#[path = "windows_path_resolution/std_loads.rs"]
+mod std_loads;
 #[cfg(windows)]
 #[path = "windows_path_resolution/streams.rs"]
 mod streams;

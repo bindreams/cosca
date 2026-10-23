@@ -45,6 +45,12 @@ fail-fast = false
 # the noise of a loaded runner.
 leak-timeout = { period = "5s", result = "fail" }
 
+# The single-backend measurements (`m<n>_…`) only record, as printed `M<n> …` lines, so CI shows
+# their output when they pass too.
+[[profile.ci.overrides]]
+filter = 'test(/(^|::)m[0-9]+_/)'
+success-output = "immediate"
+
 # Every nextest step in ci.yaml uploads this file as an artifact (the `upload-junit` action).
 [profile.ci.junit]
 path = "junit.xml"
