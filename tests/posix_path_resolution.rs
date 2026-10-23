@@ -6,10 +6,18 @@
 #[path = "common/mod.rs"]
 mod common;
 
-/// Spawns `script` by each std route and records whether a shell ran it: its body creates the
-/// marker. `(i)` is a plain `std::process::Command` (`posix_spawnp` where std takes it), `(ii)`
-/// the same with a no-op `pre_exec`, which forces fork and `execvp`. Each runs as an absolute path
-/// and as a bare name found on `PATH`.
+/// Runs `script` through std and records whether a shell ran it: its body creates the marker.
+/// Three cases, each plain (no `pre_exec`) and with a no-op `pre_exec`:
+///
+/// - `absolute`: the path.
+/// - `bare_set_path`: the name, with `Command::env("PATH", dir)`, which std cannot give
+///   `posix_spawnp`.
+/// - `bare_inherited`: the name, run by a `cosca_testbin` child whose own `PATH` is `dir`, so std
+///   keeps `posix_spawnp`'s `PATH` search.
+///
+/// Each row starts with `route=`. `spawn` is the route std gives to `posix_spawn(p)` where it has
+/// one (glibc, macOS); `fork` is fork and `execvp`, which `pre_exec` and a set `PATH` force. The
+/// `os` and `target_env` line says whether std has `posix_spawn(p)` at all.
 #[cfg(unix)]
 #[skuld::test]
 fn m18_std_routes_and_the_shell_fallback() {
@@ -34,20 +42,43 @@ fn m18_std_routes_and_the_shell_fallback() {
     );
 
     println!("M18 os={} target_env={}", std::env::consts::OS, target_env());
-    for (name, program) in [("absolute", script.as_os_str()), ("bare", "m18-script".as_ref())] {
-        for (route, pre_exec) in [("plain", false), ("pre_exec", true)] {
+    for case in ["absolute", "bare_set_path", "bare_inherited"] {
+        for variant in ["plain", "pre_exec"] {
             let _ = std::fs::remove_file(&marker);
-            let mut cmd = std::process::Command::new(program);
-            cmd.env("PATH", dir.path());
-            if pre_exec {
-                // SAFETY: the closure does nothing, so it is async-signal-safe.
-                unsafe { cmd.pre_exec(|| Ok(())) };
-            }
-            let outcome = match common::status_locked(&mut cmd) {
-                Ok(status) => format!("ok,{status}"),
-                Err(e) => format!("err={},{:?}", e.raw_os_error().unwrap_or(-1), e.kind()),
+            let pre_exec = variant == "pre_exec";
+            let route = if pre_exec || case == "bare_set_path" {
+                "fork"
+            } else {
+                "spawn"
             };
-            println!("M18 {name}_{route}={outcome},marker={}", marker.exists());
+            let outcome = if case == "bare_inherited" {
+                let mut cmd = std::process::Command::new(common::testbin());
+                cmd.args(["std-spawn-bare", "m18-script", variant])
+                    .env("PATH", dir.path());
+                let out = common::output_locked(&mut cmd).expect("run the testbin");
+                assert!(out.status.success(), "precondition: the testbin ran: {:?}", out.status);
+                String::from_utf8_lossy(&out.stdout).trim_end().to_owned()
+            } else {
+                let mut cmd = if case == "absolute" {
+                    std::process::Command::new(&script)
+                } else {
+                    let mut cmd = std::process::Command::new("m18-script");
+                    cmd.env("PATH", dir.path());
+                    cmd
+                };
+                if pre_exec {
+                    // SAFETY: the closure does nothing, so it is async-signal-safe.
+                    unsafe { cmd.pre_exec(|| Ok(())) };
+                }
+                match common::status_locked(&mut cmd) {
+                    Ok(status) => format!("ok,{status}"),
+                    Err(e) => format!("err={},{:?}", e.raw_os_error().unwrap_or(-1), e.kind()),
+                }
+            };
+            println!(
+                "M18 {case}_{variant}=route={route},{outcome},marker={}",
+                marker.exists()
+            );
         }
     }
 }
