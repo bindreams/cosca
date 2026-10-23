@@ -41,8 +41,9 @@ pub struct Command {
 ///
 /// The variants are alternatives on ONE field: [`Command::executable`] and
 /// [`Command::raw_executable`] overwrite each other, last call wins. Downstream, only the sites
-/// that would otherwise resolve need the discriminant — everything that merely wants the path
-/// uses [`Command::executable_path`], which is variant-agnostic.
+/// that would otherwise resolve, and the elevation refusal that names the setter, need the
+/// discriminant — everything that merely wants the path uses [`Command::executable_path`], which
+/// is variant-agnostic.
 #[derive(Debug, Clone)]
 pub(crate) enum ExecutableSpec {
     /// From [`Command::executable`]: cosca resolves it (`PATH`, `.exe`) before the OS sees it.
@@ -281,7 +282,7 @@ impl Command {
     ///
     /// [`elevate`](Self::elevate) refuses a command that sets this, with [`Error::Unsupported`],
     /// on every platform and whether or not the caller is already elevated. An elevated program
-    /// is named by `argv[0]` alone: every backend runs `argv[0]` as written, and cosca never
+    /// is named by `argv[0]` alone: every backend is handed `argv[0]` as written, and cosca never
     /// rewrites argv, so it has no program to search for. Pass the program as `argv[0]` instead;
     /// see [`elevate`](Self::elevate) for what each backend accepts there.
     pub fn executable<P: Into<PathBuf>>(&mut self, path: P) -> &mut Command {
@@ -334,9 +335,11 @@ impl Command {
     ///
     /// [`elevate`](Self::elevate) refuses a command that sets this, with [`Error::Unsupported`],
     /// on every platform and whether or not the caller is already elevated. Every backend loads
-    /// the program `argv[0]` names and gives the child that `argv[0]`, and cosca never rewrites
-    /// argv, so no backend can load a file named apart from it. Pass the program as `argv[0]`
-    /// instead, absolute: `args(["/opt/tool", "-x"]).elevate()`.
+    /// the program `argv[0]` names, and cosca never rewrites argv, so no backend can load a file
+    /// named apart from it. What the child then sees as its own `argv[0]` is the backend's:
+    /// `pkexec` replaces a bare or relative one with the path it resolved (polkit's `pkexec.c`
+    /// assigns it back into `argv`). Pass the program as `argv[0]` instead, absolute:
+    /// `args(["/opt/tool", "-x"]).elevate()`.
     pub fn raw_executable<P: Into<PathBuf>>(&mut self, path: P) -> &mut Command {
         self.executable = Some(ExecutableSpec::Exact(path.into()));
         self
@@ -348,9 +351,9 @@ impl Command {
 
     /// The executable path as written, whichever setter recorded it.
     ///
-    /// Deliberately variant-agnostic: most readers — the elevation `argv[0]` guards, backend
-    /// routing, the argv and command-line builders — want the path and nothing else. Only a
-    /// caller that must not resolve an `Exact` path should reach for
+    /// Deliberately variant-agnostic: most readers — backend routing, the argv and command-line
+    /// builders — want the path and nothing else. Only a caller that must not resolve an `Exact`
+    /// path, or that must name the setter (the elevation refusal), should reach for
     /// [`executable_spec`](Self::executable_spec).
     pub(crate) fn executable_path(&self) -> Option<&Path> {
         self.executable.as_ref().map(ExecutableSpec::path)
@@ -361,7 +364,8 @@ impl Command {
         self.executable.as_ref()
     }
 
-    /// Carry another command's executable over whole, setter included.
+    /// Set the executable spec directly: the POSIX elevation rewrite points its derived command
+    /// at the pinned backend binary.
     #[cfg_attr(
         not(unix),
         allow(
