@@ -9,9 +9,11 @@
 //! the tracee allows it with `PR_SET_PTRACER` ([`allow_any_tracer`]), which Yama's scope 1
 //! requires of a tracer that is no ancestor.
 //!
-//! A test spawns the tracee with [`allow_any_tracer`] applied to its command, calls
-//! [`spawn_helper`] with the tracee's pid, and drives the tracer with one go byte ([`STOP`],
-//! [`REAP`], [`EXIT`]) per [`Tracer::send`], waiting for its report with [`Tracer::expect`].
+//! A test takes `tracer_group`, spawns the tracee with [`allow_any_tracer`] applied to its command
+//! (or has the tracee call [`allow_any_tracer_now`]), calls [`spawn_helper`] with the tracee's pid,
+//! and drives the tracer with one go byte ([`STOP`], [`REAP`], [`EXIT`]) per [`Tracer::send`],
+//! waiting for its report with [`Tracer::expect`]. These calls block; a test whose own thread
+//! blocks until the tracer hands the zombie back drives the [`Tracer`] from another thread.
 
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::os::unix::process::CommandExt as _;
@@ -98,17 +100,23 @@ fn foreign_tracer_helper() {
     }
 }
 
-/// Lets any process trace the child `cmd` spawns: it calls `PR_SET_PTRACER` before exec. The
-/// tracee's command must go through this for [`spawn_helper`] to seize it under Yama's scope 1.
+/// Lets any process trace the child `cmd` spawns: it calls [`allow_any_tracer_now`] before exec.
 pub(crate) fn allow_any_tracer(cmd: &mut std::process::Command) {
-    // SAFETY: `set_ptracer` is a raw `prctl` syscall, async-signal-safe, and touches only the
-    // forked child.
+    // SAFETY: `allow_any_tracer_now` is a raw `prctl` syscall, async-signal-safe, and touches only
+    // the forked child.
     unsafe {
-        cmd.pre_exec(|| match rustix::process::set_ptracer(rustix::process::PTracer::Any) {
-            // `INVAL`: no Yama, so nothing restricts a tracer and nothing needs allowing.
-            Ok(()) | Err(rustix::io::Errno::INVAL) => Ok(()),
-            Err(e) => Err(e.into()),
-        });
+        cmd.pre_exec(allow_any_tracer_now);
+    }
+}
+
+/// Lets any process trace this one (`PR_SET_PTRACER`), which [`spawn_helper`] needs under Yama's
+/// scope 1. A tracee that is a fixture re-exec calls it itself; a `cosca::tokio::Command` tracee
+/// must, since that command has no `pre_exec`.
+pub(crate) fn allow_any_tracer_now() -> std::io::Result<()> {
+    match rustix::process::set_ptracer(rustix::process::PTracer::Any) {
+        // `INVAL`: no Yama, so nothing restricts a tracer and nothing needs allowing.
+        Ok(()) | Err(rustix::io::Errno::INVAL) => Ok(()),
+        Err(e) => Err(e.into()),
     }
 }
 
