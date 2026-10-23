@@ -23,8 +23,7 @@ use windows::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation,
     QueryInformationJobObject, SetInformationJobObject, TerminateJobObject, JOBOBJECT_BASIC_PROCESS_ID_LIST,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows::Win32::System::Threading::{
     GetProcessId, GetProcessIdOfThread, OpenProcess, OpenThread, ResumeThread, WaitForMultipleObjects,
@@ -132,40 +131,28 @@ impl JobHandle {
     /// Called by `Child::detach()` before the handle is released: otherwise
     /// dropping the job handle terminates the tree the caller intended to keep alive.
     pub(crate) fn disarm(&self) {
-        if let Err(e) = self.try_set_limit_flags(JOB_OBJECT_LIMIT(0)) {
-            log::warn!(
-                "SetInformationJobObject(disarm) failed ({e}); KILL_ON_JOB_CLOSE is still set, so \
-                 closing this handle will still kill the tree"
-            );
-        }
-    }
-
-    /// Replace the job's limit flags with exactly `flags`, reporting a failure. A zero word clears
-    /// `KILL_ON_JOB_CLOSE`, so closing the handle does not kill the tree; a guard job keeps its
-    /// breakaway flags instead.
-    ///
-    /// A handle already consumed by `hard_kill` is `Ok`: there is no job left to disarm.
-    pub(crate) fn try_set_limit_flags(&self, flags: JOB_OBJECT_LIMIT) -> io::Result<()> {
         // Held across the call: this WRITES to the handle, so landing on a recycled value
-        // would change the limits of an unrelated job (clearing KILL_ON_JOB_CLOSE would quietly
-        // let its tree outlive its owner).
+        // would clear KILL_ON_JOB_CLOSE on an unrelated job and quietly let its tree
+        // outlive its owner.
         self.with_handle(|job| {
-            #[cfg(test)]
-            forced(fault::Step::SetLimits).map_err(io::Error::from)?;
-            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-            info.BasicLimitInformation.LimitFlags = flags;
+            // A zeroed JOBOBJECT_EXTENDED_LIMIT_INFORMATION has LimitFlags == 0, which
+            // clears KILL_ON_JOB_CLOSE.
+            let info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
             // SAFETY: job is a valid handle; info is fully initialised (zeroed by default()).
             unsafe {
-                SetInformationJobObject(
+                if let Err(e) = SetInformationJobObject(
                     job,
                     JobObjectExtendedLimitInformation,
                     std::ptr::addr_of!(info).cast(),
                     size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-                )
+                ) {
+                    log::warn!(
+                        "SetInformationJobObject(disarm) failed ({e}); KILL_ON_JOB_CLOSE is still set, so \
+                         closing this handle will still kill the tree"
+                    );
+                }
             }
-            .map_err(io::Error::from)
-        })
-        .unwrap_or(Ok(()))
+        });
     }
 }
 
@@ -567,12 +554,8 @@ pub(crate) mod fault {
         Owner,
         ResumeOpen,
         Resume,
-        /// `JobHandle::try_set_limit_flags`' `SetInformationJobObject`.
-        SetLimits,
         /// The assignment of a Strongest root's job.
         Assign,
-        /// The assignment of a frozen child's guard job.
-        GuardAssign,
     }
 
     thread_local! {
@@ -645,115 +628,6 @@ pub(crate) mod fault {
 /// primitive — reused verbatim rather than duplicated, so `Command::contain()` and `Job::assign`
 /// share exactly one implementation.
 pub(crate) fn assign_to_kill_on_close_job(proc_handle: std::os::windows::io::RawHandle) -> io::Result<JobHandle> {
-    assign_with_limits(proc_handle, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
-}
-
-/// [`assign_to_kill_on_close_job`] as `attach` takes it: the job is assigned and the child is NOT
-/// resumed.
-pub(crate) fn assign_held(proc_handle: std::os::windows::io::RawHandle) -> io::Result<JobHandle> {
-    #[cfg(test)]
-    forced(fault::Step::Assign).map_err(io::Error::from)?;
-    assign_to_kill_on_close_job(proc_handle)
-}
-
-/// The guard job of a frozen child that no cosca job holds: it kills the child if its owner dies
-/// while the child is frozen, and it never widens what the child may do afterwards.
-///
-/// The guard carries breakaway only when `breakaway_ok`, that is, only where the job around it
-/// permits it (or there is none). `CREATE_BREAKAWAY_FROM_JOB` is checked against the innermost job
-/// and either breakaway bit lets it through, so a guard that carried one against an enclosing job
-/// that refuses would let the child's request succeed where an ordinary child's is denied. With
-/// `breakaway_ok` the guard carries both bits, which keeps the child's descendants out of the guard,
-/// in the job around it, as with no guard. Without it the descendants stay in the guard, which
-/// limits nothing once released and sits inside the enclosing job, so that job still governs them.
-pub(crate) fn assign_guard_job(
-    proc_handle: std::os::windows::io::RawHandle,
-    breakaway_ok: bool,
-) -> io::Result<JobHandle> {
-    #[cfg(test)]
-    forced(fault::Step::GuardAssign).map_err(io::Error::from)?;
-    assign_with_limits(proc_handle, guard_armed_flags(breakaway_ok))
-}
-
-/// The guard's limits while it is armed.
-pub(crate) fn guard_armed_flags(breakaway_ok: bool) -> JOB_OBJECT_LIMIT {
-    JOB_OBJECT_LIMIT(JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.0 | guard_released_flags(breakaway_ok).0)
-}
-
-/// The guard's limits once it is released: the kill is gone and the breakaway bits are as armed.
-pub(crate) fn guard_released_flags(breakaway_ok: bool) -> JOB_OBJECT_LIMIT {
-    if breakaway_ok {
-        JOB_OBJECT_LIMIT(JOB_OBJECT_LIMIT_BREAKAWAY_OK.0 | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK.0)
-    } else {
-        JOB_OBJECT_LIMIT(0)
-    }
-}
-
-/// The job a frozen child is in when its guard is assigned, as far as breakaway goes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Surroundings {
-    /// In no job: `CREATE_BREAKAWAY_FROM_JOB` is a no-op for its children.
-    NoJob,
-    /// In the job with these limits.
-    Job(JOB_OBJECT_LIMIT),
-    /// In a job whose limits this process cannot read.
-    Unreadable,
-}
-
-impl Surroundings {
-    /// Whether an ordinary child in these surroundings can use `CREATE_BREAKAWAY_FROM_JOB`: it is in
-    /// no job, or in one that carries `BREAKAWAY_OK`.
-    pub(crate) fn permits_breakaway(self) -> bool {
-        match self {
-            Surroundings::NoJob => true,
-            Surroundings::Job(limits) => limits.0 & JOB_OBJECT_LIMIT_BREAKAWAY_OK.0 != 0,
-            Surroundings::Unreadable => false,
-        }
-    }
-}
-
-/// The surroundings of the just-created child at `proc_handle`, whose creator is this process.
-///
-/// A job's limits can be read only through a handle to it, and the only job a process holds a way to
-/// is its own, so the child's job is read as this process's innermost one. That is the child's job
-/// when it inherited it. It did not when this process's job sends children out of it
-/// (`SILENT_BREAKAWAY_OK`) or the child was made with `CREATE_BREAKAWAY_FROM_JOB`
-/// (`breakaway_requested`): it then sits in an ancestor job if there is one, which cannot be read.
-pub(crate) fn surroundings_of(proc_handle: std::os::windows::io::RawHandle, breakaway_requested: bool) -> Surroundings {
-    use windows::Win32::System::JobObjects::{
-        IsProcessInJob, JobObjectBasicLimitInformation, JOBOBJECT_BASIC_LIMIT_INFORMATION,
-    };
-
-    let mut in_job = windows::core::BOOL(0);
-    // SAFETY: `proc_handle` is a live process handle the caller holds, `in_job` is a valid
-    // out-parameter, and a null job handle asks whether the process is in any job.
-    if unsafe { IsProcessInJob(HANDLE(proc_handle.cast()), None, &mut in_job) }.is_err() {
-        return Surroundings::Unreadable;
-    }
-    if !in_job.as_bool() {
-        return Surroundings::NoJob;
-    }
-    let mut info = JOBOBJECT_BASIC_LIMIT_INFORMATION::default();
-    // SAFETY: `info` is a correctly sized out-parameter; a null job handle asks about the calling
-    // process's own job.
-    let own = unsafe {
-        QueryInformationJobObject(
-            None,
-            JobObjectBasicLimitInformation,
-            std::ptr::addr_of_mut!(info).cast(),
-            size_of::<JOBOBJECT_BASIC_LIMIT_INFORMATION>() as u32,
-            None,
-        )
-    };
-    let leaves_own_job = breakaway_requested || info.LimitFlags.0 & JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK.0 != 0;
-    match own {
-        Ok(()) if !leaves_own_job => Surroundings::Job(info.LimitFlags),
-        _ => Surroundings::Unreadable,
-    }
-}
-
-/// Create a job with exactly `flags` and assign the process at `proc_handle` to it.
-fn assign_with_limits(proc_handle: std::os::windows::io::RawHandle, flags: JOB_OBJECT_LIMIT) -> io::Result<JobHandle> {
     // A Windows `RawHandle` is a `*mut c_void`.
     let raw_handle = HANDLE(proc_handle.cast());
     // SAFETY: all calls are standard Win32; owned handles are closed on every error path.
@@ -761,7 +635,7 @@ fn assign_with_limits(proc_handle: std::os::windows::io::RawHandle, flags: JOB_O
         let job = CreateJobObjectW(None, windows::core::PCWSTR::null()).map_err(io::Error::from)?;
 
         let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        info.BasicLimitInformation.LimitFlags = flags;
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         if let Err(e) = SetInformationJobObject(
             job,
             JobObjectExtendedLimitInformation,
@@ -779,6 +653,14 @@ fn assign_with_limits(proc_handle: std::os::windows::io::RawHandle, flags: JOB_O
 
         Ok(JobHandle::new(job))
     }
+}
+
+/// [`assign_to_kill_on_close_job`] as `attach` takes it: the job is assigned and the child is NOT
+/// resumed.
+pub(crate) fn assign_held(proc_handle: std::os::windows::io::RawHandle) -> io::Result<JobHandle> {
+    #[cfg(test)]
+    forced(fault::Step::Assign).map_err(io::Error::from)?;
+    assign_to_kill_on_close_job(proc_handle)
 }
 
 /// Read the job's LIVE member pids via `QueryInformationJobObject(JobObjectBasicProcessIdList)`
@@ -1644,16 +1526,12 @@ pub(crate) fn attach_job(proc_handle: std::os::windows::io::RawHandle) -> io::Re
 /// async `Child::test_job_handle_contains_self` accessors (both compiled outside `cfg(test)` so
 /// integration crates can call them).
 pub(crate) fn job_contains_pid(attached: &crate::containment::Attached, pid: u32) -> bool {
+    use windows::Win32::System::JobObjects::IsProcessInJob;
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION};
+
     let crate::containment::Attached::JobObject(job) = attached else {
         return false;
     };
-    job_handle_contains_pid(job, pid)
-}
-
-/// [`job_contains_pid`] against a job handle.
-pub(crate) fn job_handle_contains_pid(job: &JobHandle, pid: u32) -> bool {
-    use windows::Win32::System::JobObjects::IsProcessInJob;
-    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION};
 
     // Open the child process by PID; the backend doesn't expose its handle.
     // SAFETY: standard Win32 call; the handle is closed below.

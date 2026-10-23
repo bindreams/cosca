@@ -1,8 +1,9 @@
 //! The Windows frozen spawn: the ordinary spawn with a suspended request, and the token it leaves.
 
 use crate::child::spawn::spawn_uncommitted;
-use crate::child::{Spawned, SuspendedChild};
+use crate::child::{Child, SuspendedChild};
 use crate::command::Command;
+use crate::containment::windows::{resume_initial_threads, SuspendCount};
 use crate::error::Error;
 
 /// Test-only accessors, `pub` so integration tests can call them.
@@ -17,13 +18,6 @@ impl SuspendedChild {
     #[doc(hidden)]
     pub fn test_containment(&self) -> crate::Containment {
         self.child.containment()
-    }
-
-    /// Test-only: whether the child is inside its guard job (an uncontained, `TreeWalk` or nested
-    /// frozen child; `false` for a Strongest root, whose containment job guards it).
-    #[doc(hidden)]
-    pub fn test_guard_job_contains_self(&self) -> bool {
-        self.frozen.guard_contains(self.id().pid())
     }
 }
 
@@ -69,10 +63,13 @@ pub(super) fn spawn(cmd: &mut Command) -> Result<SuspendedChild, Error> {
     let borrowed = Borrowed::new(cmd);
     let spawned = spawn_uncommitted(&mut *borrowed.cmd);
     drop(borrowed);
-    let Spawned { child, frozen } = spawned?;
     Ok(SuspendedChild {
-        child,
-        frozen: frozen.expect("a frozen request always yields its token"),
+        child: spawned?,
         wanted_kill_on_drop,
     })
+}
+
+/// Resume the child's initial thread, which must have been suspended exactly once.
+pub(super) fn release(child: &Child) -> std::io::Result<()> {
+    resume_initial_threads(child.process_handle(), SuspendCount::ExactlyOne)
 }

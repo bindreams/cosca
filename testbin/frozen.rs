@@ -1,7 +1,7 @@
 //! The frozen-spawn helper modes. All use the `cosca` crate: they are the callers whose behaviour
 //! `tests/windows_suspended.rs` measures from outside.
 //!
-//! - `spawn-frozen-report`: hold a frozen child and block, for the test to kill.
+//! - `spawn-frozen-report`: hold a contained frozen child and block, for the test to kill.
 //! - `spawn-breakaway-report` and `spawn-breakaway-child`: whether a child's
 //!   `CREATE_BREAKAWAY_FROM_JOB` grandchild is allowed.
 //! - `spawn-measured-child`, `spawn-report-pid` and `report-pid`: a plain grandchild whose job
@@ -38,28 +38,25 @@ fn blocker_command(backend: &str, addr: &str) -> cosca::Command {
     mode_command(backend, "control-block", &[addr, "G"])
 }
 
-pub fn spawn_frozen_report(addr: &str, shape: &str, backend: &str) -> ! {
+pub fn spawn_frozen_report(addr: &str, backend: &str) -> ! {
     let mut sock = crate::ack::connect_control(addr).expect("connect to the test");
     // Never connected to: this child is never resumed, so its own address is a dead end.
     let mut cmd = blocker_command(backend, "127.0.0.1:9");
-    if shape == "contained" {
-        cmd.contain();
-    }
+    cmd.contain();
     let frozen = cmd.spawn_suspended().expect("spawn the frozen grandchild");
     let child_pid = frozen.id().pid();
     writeln!(
         sock,
-        "frozen pid={child_pid} containment={:?} job={} guard={}",
+        "frozen pid={child_pid} containment={:?} job={}",
         frozen.test_containment(),
         u8::from(frozen.test_job_handle_contains_self()),
-        u8::from(frozen.test_guard_job_contains_self()),
     )
     .expect("report");
     sock.flush().expect("flush");
     // The test opens its handle on the frozen child now, while this process still holds it.
     let mut go = [0u8; 1];
     sock.read_exact(&mut go).expect("wait for the test's go");
-    // Block forever; never dropped, so the guard alone must kill the child.
+    // Block forever; never dropped, so the child's containment job alone must kill it.
     let mut b = [0u8; 1];
     loop {
         if matches!(sock.read(&mut b), Ok(0) | Err(_)) {
@@ -149,7 +146,7 @@ pub fn spawn_measured_child(addr: &str, backend: &str, shape: &str, how: &str, a
     )
     .expect("report");
     sock.flush().expect("flush");
-    // Only now, with the frozen child resumed and its guard released, may the child spawn.
+    // Only now, with the frozen child resumed, may the child spawn.
     let mut stdin = child.stdin().expect("the child's stdin pipe");
     stdin.write_all(b"g").expect("send go");
     stdin.flush().expect("flush go");

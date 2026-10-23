@@ -35,7 +35,6 @@ mod on_windows {
         OpenProcess, TerminateProcess, WaitForSingleObject, INFINITE, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
     };
 
-    use crate::containment::frozen::observe;
     use crate::containment::windows::fault::{force_next, Step};
     use crate::error::{ChildFate, Error};
     use crate::test_frozen::{limit_flags, InitialThread};
@@ -170,11 +169,11 @@ mod on_windows {
     }
 
     #[skuld::test]
-    fn uncontained_frozen_child_is_inside_the_guard_and_reports_containment_none() {
+    fn uncontained_frozen_child_has_no_cosca_job_and_reports_containment_none() {
         for raw in BACKENDS {
             let frozen = blocker(raw).spawn_suspended().expect("spawn suspended");
-            assert!(frozen.test_guard_job_contains_self(), "raw={raw}: guarded while frozen");
             assert!(!frozen.test_job_handle_contains_self(), "raw={raw}: no containment job");
+            assert_eq!(frozen.test_containment(), Containment::None, "raw={raw}");
 
             let child = frozen.resume().expect("resume");
 
@@ -364,31 +363,6 @@ mod on_windows {
         assert_eq!(id.is_alive(), crate::identity::Liveness::Dead);
     }
 
-    #[skuld::test]
-    fn a_failed_guard_assignment_fails_the_spawn_and_kills_the_child() {
-        let _forced = force_next(Step::GuardAssign, ERROR_ACCESS_DENIED);
-
-        let err = blocker(false)
-            .spawn_suspended()
-            .expect_err("an unguardable spawn fails");
-
-        assert!(matches!(err.fate(), Some(ChildFate::Reaped)), "got {err:?}");
-    }
-
-    #[skuld::test]
-    fn a_failed_guard_release_kills_the_child_and_reports_it() {
-        let frozen = blocker(false).spawn_suspended().expect("spawn suspended");
-        let id = frozen.id();
-        let forced = force_next(Step::SetLimits, ERROR_ACCESS_DENIED);
-
-        let err = frozen.resume().expect_err("the guard release was forced to fail");
-        drop(forced);
-
-        assert!(matches!(err.fate(), Some(ChildFate::Reaped)), "got {err:?}");
-        assert_eq!(id.is_alive(), crate::identity::Liveness::Dead);
-        assert!(observe::take_guard_flags_after_resume().is_some());
-    }
-
     /// Something else killed the frozen process. The process is observed dead (its handle is
     /// signalled) before `resume`, so the answer is not a race with the kill: an error with a fate,
     /// and no hang.
@@ -454,10 +428,14 @@ mod on_windows {
         let mut cmd = blocker(false);
         drop(cmd.spawn_suspended().expect("spawn suspended"));
 
-        let spawned = crate::child::spawn::spawn_uncommitted(&mut cmd).expect("an ordinary spawn");
+        let child = crate::child::spawn::spawn_uncommitted(&mut cmd).expect("an ordinary spawn");
 
-        assert!(spawned.frozen.is_none(), "only a frozen request yields a frozen token");
-        end(spawned.into_child());
+        assert_eq!(
+            InitialThread::of(child.id().pid()).suspend_count(),
+            0,
+            "the spawn after a frozen one must run"
+        );
+        end(child);
     }
 
     #[skuld::test]

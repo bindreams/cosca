@@ -24,13 +24,9 @@ pub(crate) struct Prepared {
     #[cfg(windows)]
     pub graceful: crate::graceful::GracefulMechanism,
     /// Whether the child is created suspended and `attach` must leave it so (see
-    /// [`Frozen`](crate::containment::frozen::Frozen)).
+    /// [`Command::spawn_suspended`](crate::Command::spawn_suspended)).
     #[cfg(windows)]
     pub frozen: bool,
-    /// Whether the child was created with `CREATE_BREAKAWAY_FROM_JOB`, which puts it in none of its
-    /// creator's innermost job. Read for a frozen child's guard.
-    #[cfg(windows)]
-    pub breakaway: bool,
 }
 
 /// A child the spawn has just forked, as the spawn holds it: its pid, and the pidfd the handshake
@@ -41,15 +37,6 @@ pub(crate) struct Prepared {
 pub(crate) struct ChildHandle<'a> {
     pub(crate) pid: u32,
     pub(crate) pidfd: std::os::fd::BorrowedFd<'a>,
-}
-
-#[cfg(windows)]
-impl Prepared {
-    /// Whether `attach` assigns this spawn a containment job of its own: a Strongest root. Every
-    /// other shape (`TreeWalk` root, nested member, uncontained) has none.
-    pub(crate) fn assigns_job(&self) -> bool {
-        self.is_root && matches!(self.mode, Some(mode) if !matches!(mode, ContainMode::TreeWalk))
-    }
 }
 
 impl Prepared {
@@ -161,8 +148,6 @@ pub(crate) struct Attachment {
     pub containment: Containment,
     pub attached: Attached,
     pub graceful: crate::graceful::GracefulMechanism,
-    /// The token of a frozen spawn (`Prepared.frozen`); `None` for every other.
-    pub frozen: Option<crate::containment::frozen::Frozen>,
 }
 
 #[cfg(windows)]
@@ -179,7 +164,6 @@ impl Attachment {
             containment: Containment::None,
             attached: Attached::None,
             graceful: crate::graceful::GracefulMechanism::Unknown,
-            frozen: None,
         }
     }
 }
@@ -964,8 +948,6 @@ pub(crate) fn prepare(
             graceful,
             #[cfg(windows)]
             frozen: flags.suspended,
-            #[cfg(windows)]
-            breakaway: flags.breakaway_from_job,
         });
     }
     let marker_env = is_root && req.nesting == Nesting::Mark;
@@ -1105,8 +1087,6 @@ pub(crate) fn prepare(
         graceful,
         #[cfg(windows)]
         frozen: flags.suspended,
-        #[cfg(windows)]
-        breakaway: flags.breakaway_from_job,
     })
 }
 
@@ -1121,13 +1101,6 @@ pub(crate) fn attach(
     prepared: Prepared,
 ) -> Result<Attachment, Error> {
     let graceful = prepared.graceful_mechanism();
-    // A frozen child's guard is assigned before anything else is done for it: the shorter the
-    // time between `CreateProcessW` and the assignment, the less of the gap a parent's death can
-    // fall in.
-    #[cfg(windows)]
-    let frozen = crate::containment::frozen::Frozen::establish(&prepared, proc_handle)?;
-    #[cfg(not(windows))]
-    let frozen = None;
     let (containment, attached) = attach_tree(
         id,
         #[cfg(target_os = "linux")]
@@ -1140,7 +1113,6 @@ pub(crate) fn attach(
         containment,
         attached,
         graceful,
-        frozen,
     })
 }
 
@@ -1283,7 +1255,7 @@ fn attach_tree(
                 return Ok((Containment::TreeWalk, Attached::TreeWalk(id)));
             }
             // A frozen root is assigned its job and left suspended. It gets no `TreeWalk` fallback:
-            // without a job nothing would kill it if its owner died.
+            // a frozen root without a job would have nothing to kill it if its owner died.
             if prepared.frozen {
                 return match crate::containment::windows::assign_held(proc_handle) {
                     Ok(job) => Ok((Containment::JobObject, Attached::JobObject(job))),

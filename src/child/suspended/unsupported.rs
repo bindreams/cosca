@@ -1,6 +1,6 @@
 //! Off Windows there is no frozen spawn.
 
-use crate::child::SuspendedChild;
+use crate::child::{Child, SuspendedChild};
 use crate::command::Command;
 use crate::error::Error;
 
@@ -13,4 +13,9 @@ pub(super) fn spawn(_cmd: &mut Command) -> Result<SuspendedChild, Error> {
                  does not allow"
             .into(),
     })
+}
+
+/// There is no `SuspendedChild` to resume here: `spawn` never returns one.
+pub(super) fn release(_child: &Child) -> std::io::Result<()> {
+    unreachable!("spawn_suspended never returns a SuspendedChild off Windows")
 }

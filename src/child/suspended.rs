@@ -3,7 +3,6 @@
 
 use crate::child::Child;
 use crate::command::Command;
-use crate::containment::frozen::Frozen;
 use crate::error::Error;
 use crate::identity::ProcessId;
 
@@ -20,11 +19,12 @@ mod platform;
 /// Dropping it before `resume` kills the child, whatever
 /// [`kill_on_drop`](Command::kill_on_drop) says: a frozen child nobody can resume is a leak. That
 /// opt-out applies to the [`Child`] `resume` returns.
+///
+/// If this process dies while the child is frozen, what happens to the child is what the child's
+/// containment gives (see [`Command::spawn_suspended`]).
 #[derive(Debug)]
 pub struct SuspendedChild {
-    // Field order is drop order: the child is torn down first, then its guard job closes.
     child: Child,
-    frozen: Frozen,
     /// The command's `kill_on_drop`, applied by `resume`. The child itself was made with `true`.
     wanted_kill_on_drop: bool,
 }
@@ -36,17 +36,20 @@ impl Command {
     ///
     /// # Windows
     ///
-    /// The child is created suspended and is inside its containment before it executes one
-    /// instruction. A child that no cosca job holds (uncontained, a [`TreeWalk`] root, a nested
-    /// member) is held by a private guard job while it is frozen, so it dies with this process if
-    /// this process dies. After `resume`, that job has no kill; the child stays a member of it,
-    /// which [`Child::containment`] does not show (it stays `None`, `TreeWalk` or `Delegated`).
-    /// The guard permits `CREATE_BREAKAWAY_FROM_JOB` only where the job the child was already in
-    /// does (or the child was in none), so the child's breakaway is allowed or denied as an
-    /// ordinary spawn's would be.
+    /// The child is created suspended and executes no instruction until `resume`. A frozen child
+    /// has exactly the lifetime guarantees of the containment the command asked for, and no more:
     ///
-    /// **A parent crash between `CreateProcessW` returning and the job assignment can leave a frozen
-    /// process nothing kills.**
+    /// - A [`Strongest`] root (`contain()`) is in its kill-on-close job before `spawn_suspended`
+    ///   returns, so the job ends it if this process dies while it is frozen.
+    /// - Any other child (no containment, a [`TreeWalk`] root, a member of an enclosing cosca tree)
+    ///   gets no job of its own. **If this process dies while it is frozen, such a child stays
+    ///   frozen until someone kills it**; its recorded [`id`](SuspendedChild::id) names it. A job
+    ///   this process is itself in holds it as it holds any child, and ends it when that job closes.
+    /// - A crash between `CreateProcessW` returning and the job assignment can leave even a
+    ///   [`Strongest`] root frozen with nothing to kill it.
+    ///
+    /// After `resume`, the child is the one an ordinary [`spawn`](Self::spawn) makes: the same jobs
+    /// and the same `CREATE_BREAKAWAY_FROM_JOB` verdict.
     ///
     /// # Other platforms
     ///
@@ -54,11 +57,10 @@ impl Command {
     ///
     /// # Errors
     ///
-    /// As [`spawn`](Self::spawn), and two more that `spawn` would not give, each an
-    /// [`Error::Containment`] cause: a [`Strongest`] root whose job assignment fails (`spawn` falls
-    /// back to [`TreeWalk`] there; a frozen root without a job would have nothing to kill it), and a
-    /// failed assignment to the guard job. A frozen spawn that fails after the process exists
-    /// reports [`Error::MayHaveStarted`].
+    /// As [`spawn`](Self::spawn), and one more that `spawn` would not give: a [`Strongest`] root
+    /// whose job assignment fails is an [`Error::Containment`] (`spawn` falls back to [`TreeWalk`]
+    /// there; a frozen root without a job is not worth having). A frozen spawn that fails after the
+    /// process exists reports [`Error::MayHaveStarted`].
     /// `spawn_suspended` with [`elevate`](Self::elevate) is [`Error::Unsupported`] on every platform,
     /// even for an already-elevated caller.
     ///
@@ -85,10 +87,9 @@ impl SuspendedChild {
     pub fn resume(self) -> Result<Child, Error> {
         let SuspendedChild {
             mut child,
-            frozen,
             wanted_kill_on_drop,
         } = self;
-        match frozen.release(&child) {
+        match platform::release(&child) {
             Ok(()) => {
                 child.kill_on_drop = wanted_kill_on_drop;
                 child.commit_kill_on_drop();

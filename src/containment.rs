@@ -325,9 +325,6 @@ pub(crate) mod fdmarker;
 #[path = "containment/treewalk.rs"]
 pub(crate) mod treewalk;
 
-#[path = "containment/frozen.rs"]
-pub(crate) mod frozen;
-
 #[path = "containment/dispatch.rs"]
 pub(crate) mod dispatch;
 #[cfg(target_os = "linux")]

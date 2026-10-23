@@ -393,9 +393,7 @@ fn spawn_unelevated_runs_a_plain_child() {
     #[cfg(windows)]
     c.args(["cmd", "/C", "exit 0"]);
     let kill_on_drop = c.kill_on_drop_flag();
-    let child = super::spawn_unelevated(&mut c, kill_on_drop)
-        .expect("spawn")
-        .into_child();
+    let child = super::spawn_unelevated(&mut c, kill_on_drop).expect("spawn");
     assert!(child.wait().expect("wait").success());
 }
 
@@ -653,7 +651,6 @@ fn attach_entered_leaf(leaf_path: &std::path::Path) {
             leaf_path.to_path_buf(),
         )),
         graceful: crate::graceful::GracefulMechanism::Process,
-        frozen: None,
     });
 }
 
@@ -668,7 +665,7 @@ fn kill_on_drop_false_disarms_the_leaf_only_when_the_spawn_commits() {
         attach_entered_leaf(&leaf_path);
         let (mut cmd, stdin) = blocker_with_held_stdin();
         cmd.kill_on_drop(false);
-        let child = super::spawn_uncommitted(&mut cmd).expect("spawn").into_child();
+        let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
         if commit {
             child.commit_kill_on_drop();
         }
@@ -703,7 +700,7 @@ fn a_failed_password_write_kills_the_contained_tree() {
     attach_entered_leaf(&leaf_path);
     let (mut cmd, teardown) = teardown_blocker();
     cmd.kill_on_drop(false);
-    let child = super::spawn_uncommitted(&mut cmd).expect("spawn").into_child();
+    let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
     // Rule out the leaf's `Drop`: only the failure path itself may kill.
     child.attached.disarm();
 
@@ -771,11 +768,10 @@ fn a_failed_password_write_removes_the_leaf_once_the_tree_drains() {
         containment: crate::containment::Containment::CgroupV2,
         attached: crate::containment::Attached::Cgroup(entered_leaf_at(fake.leaf.clone())),
         graceful: crate::graceful::GracefulMechanism::Process,
-        frozen: None,
     });
     let (mut cmd, teardown) = teardown_blocker();
     cmd.kill_on_drop(false);
-    let child = super::spawn_uncommitted(&mut cmd).expect("spawn").into_child();
+    let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
 
     let mark = crate::log_capture::mark();
     let (err, fate) = super::finish_elevated(child, failed_write())
@@ -810,7 +806,7 @@ fn a_failed_password_write_warns_when_the_tree_kill_fails() {
     attach_entered_leaf(&leaf_path);
     let (mut cmd, teardown) = teardown_blocker();
     cmd.kill_on_drop(false);
-    let child = super::spawn_uncommitted(&mut cmd).expect("spawn").into_child();
+    let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
     // Rule out the leaf's `Drop`: only the failure path itself may kill.
     child.attached.disarm();
 
@@ -952,11 +948,10 @@ fn a_failed_password_write_kills_and_reaps_a_delegated_root() {
         containment: crate::containment::Containment::Delegated,
         attached: crate::containment::Attached::Delegated,
         graceful: crate::graceful::GracefulMechanism::Process,
-        frozen: None,
     });
     let (mut cmd, teardown) = teardown_blocker();
     cmd.kill_on_drop(false);
-    let child = super::spawn_uncommitted(&mut cmd).expect("spawn").into_child();
+    let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
     let pid = child.id().pid();
 
     let (err, fate) = super::finish_elevated(child, failed_write())
@@ -989,11 +984,10 @@ fn a_failed_password_write_reaps_the_root_when_the_tree_kill_fails() {
             leaf_path.clone(),
         )),
         graceful: crate::graceful::GracefulMechanism::Process,
-        frozen: None,
     });
     let (mut cmd, teardown) = teardown_blocker();
     cmd.kill_on_drop(false);
-    let child = super::spawn_uncommitted(&mut cmd).expect("spawn").into_child();
+    let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
     let pid = child.id().pid();
 
     let (err, fate) = super::finish_elevated(child, failed_write())
@@ -1030,11 +1024,10 @@ fn a_failed_tree_kill_and_an_unknown_root_share_one_warn() {
             leaf_path.clone(),
         )),
         graceful: crate::graceful::GracefulMechanism::Process,
-        frozen: None,
     });
     let (mut cmd, teardown) = teardown_blocker();
     cmd.kill_on_drop(false);
-    let child = super::spawn_uncommitted(&mut cmd).expect("spawn").into_child();
+    let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
     let pid = child.id().pid();
     let mark = crate::log_capture::mark();
     let _unsure =

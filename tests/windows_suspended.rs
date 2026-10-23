@@ -1,14 +1,14 @@
 //! Windows: `Command::spawn_suspended`, measured from outside the crate.
 //!
 //! The lib's own tests (`src/child/suspended_tests.rs`) hold everything that needs a fault seam.
-//! What lives here needs real helper processes: a parent that dies while its child is frozen, and
-//! a resumed child that must behave like an ordinary one.
+//! What lives here needs real helper processes: a parent that dies while its contained child is
+//! frozen, and a resumed child that must behave like an ordinary one.
 //!
 //! Every child is windowless (`no_window`), so no test opens a console on a developer's desktop.
 //! Each spawn runs on both sync backends: argv (std) and `executable()` (raw `CreateProcessW`).
 //!
 //! The death tests are named `death_watch_*`: their waits are on a process handle with no timeout
-//! of their own, and `.config/nextest.toml` bounds that name pattern, so a guard that stops
+//! of their own, and `.config/nextest.toml` bounds that name pattern, so a containment that stops
 //! working fails the test instead of hanging the job.
 
 #[cfg(windows)]
@@ -104,41 +104,19 @@ impl Drop for Watch {
 }
 
 #[cfg(windows)]
-/// A helper parent holds a frozen child, then is killed (the root only, through its `Child`, which
-/// the test keeps alive until the frozen child is observed dead). The helper's own containment
-/// cannot be what kills the frozen child: when it is contained at all, the test never tears the
-/// tree down. What is left is the frozen child's own guard.
-fn frozen_child_dies_with_its_parent(
-    backend: &str,
-    shape: &str,
-    helper_contained: bool,
-    containment: &str,
-    job: &str,
-    guard: &str,
-) {
+/// A helper parent holds a contained frozen child, then is killed (the helper alone, through its
+/// `Child`). The helper is not contained, so nothing but the frozen child's own containment job,
+/// closed with the helper's handle table, can end the child.
+fn contained_frozen_child_dies_with_its_parent(backend: &str) {
     let (listener, addr) = bind_report();
-    let mut cmd = testbin_command(backend, "spawn-frozen-report", &addr, &[shape, backend]);
-    if helper_contained {
-        cmd.contain();
-    }
+    let mut cmd = testbin_command(backend, "spawn-frozen-report", &addr, &[backend]);
     let mut helper = cmd.spawn().expect("spawn the helper parent");
     let mut sock: TcpStream = accept_or_die(&listener, &mut helper);
     let report = read_report_line(&sock);
 
-    assert_eq!(
-        report_field(&report, "containment"),
-        containment,
-        "{backend}/{shape}: {report}"
-    );
-    assert_eq!(report_field(&report, "job"), job, "{backend}/{shape}: {report}");
-    assert_eq!(report_field(&report, "guard"), guard, "{backend}/{shape}: {report}");
+    assert_eq!(report_field(&report, "containment"), "JobObject", "{backend}: {report}");
+    assert_eq!(report_field(&report, "job"), "1", "{backend}: {report}");
     let pid: u32 = report_field(&report, "pid").parse().expect("the frozen child's pid");
-    if helper_contained {
-        assert!(
-            helper.test_job_handle_contains(pid),
-            "{backend}/{shape}: the frozen child is in the helper's job, which the test holds"
-        );
-    }
     // The helper holds the frozen child until the go byte, so this pid cannot be anyone else's.
     let watch = Watch::open(pid);
     sock.write_all(b"g").expect("send go");
@@ -150,45 +128,16 @@ fn frozen_child_dies_with_its_parent(
 
 #[cfg(windows)]
 #[skuld::test]
-fn death_watch_uncontained_frozen_child_dies_with_its_parent() {
-    for backend in BACKENDS {
-        frozen_child_dies_with_its_parent(backend, "uncontained", false, "None", "0", "1");
-    }
-}
-
-#[cfg(windows)]
-#[skuld::test]
 fn death_watch_contained_frozen_child_dies_with_its_parent() {
     for backend in BACKENDS {
-        frozen_child_dies_with_its_parent(backend, "contained", false, "JobObject", "1", "0");
+        contained_frozen_child_dies_with_its_parent(backend);
     }
 }
 
 #[cfg(windows)]
-/// The frozen child is a nested member (`Delegated`) of the helper's tree, so the ancestor's job
-/// holds it and the test holds that job: only the guard can end it. The helper's report names the
-/// containment, so a nested spawn that lost its marker (and would be `None`) fails here.
+/// A resumed child runs.
 #[skuld::test]
-fn death_watch_frozen_spawn_inside_a_contained_tree_dies_with_the_nested_parent() {
-    for backend in BACKENDS {
-        frozen_child_dies_with_its_parent(backend, "contained", true, "Delegated", "0", "1");
-    }
-}
-
-/// As above for a child that asked for no containment but sits in the helper's tree: it has no
-/// containment of its own (`None`), the ancestor's job holds it, and only the guard can end it.
-#[cfg(windows)]
-#[skuld::test]
-fn death_watch_uncontained_frozen_spawn_inside_a_contained_tree_dies_with_its_parent() {
-    for backend in BACKENDS {
-        frozen_child_dies_with_its_parent(backend, "uncontained", true, "None", "0", "1");
-    }
-}
-
-#[cfg(windows)]
-/// A resumed uncontained child outlives the guard handle's close: the guard has no kill left.
-#[skuld::test]
-fn resumed_child_is_alive_after_the_guard_closes() {
+fn a_resumed_child_runs() {
     for backend in BACKENDS {
         let (listener, addr) = bind_report();
         let mut cmd = testbin_command(backend, "control-echo-pid", &addr, &["C"]);
@@ -202,46 +151,6 @@ fn resumed_child_is_alive_after_the_guard_closes() {
         common::assert_echoes(&mut sock, "the resumed child");
         child.kill().expect("kill");
         child.wait().expect("reap");
-    }
-}
-
-#[cfg(windows)]
-/// The guard permits breakaway. A descendant's `CREATE_BREAKAWAY_FROM_JOB` is a no-op outside a job
-/// and `ACCESS_DENIED` inside one that forbids it, so an ordinary spawn is the control: if it is
-/// refused too, the environment forbids breakaway and this test says so instead of blaming the guard.
-#[skuld::test]
-fn a_resumed_uncontained_child_can_still_break_away() {
-    for backend in BACKENDS {
-        let verdict = |frozen: bool| -> String {
-            let (listener, addr) = bind_report();
-            let mut cmd = testbin_command(backend, "spawn-breakaway-report", &addr, &[]);
-            let mut child = if frozen {
-                cmd.spawn_suspended()
-                    .expect("spawn suspended")
-                    .resume()
-                    .expect("resume")
-            } else {
-                cmd.spawn().expect("spawn")
-            };
-            let sock = accept_or_die(&listener, &mut child);
-            let line = read_report_line(&sock);
-            drop(sock);
-            child.kill().expect("kill");
-            child.wait().expect("reap");
-            line.trim().to_owned()
-        };
-
-        let control = verdict(false);
-        assert_eq!(
-            control, "breakaway:ok",
-            "{backend}: precondition: an ordinary uncontained child must be able to break away from this \
-             environment's job, or this test measures the environment and not the guard"
-        );
-        assert_eq!(
-            verdict(true),
-            "breakaway:ok",
-            "{backend}: the guard must not forbid breakaway"
-        );
     }
 }
 
@@ -264,9 +173,9 @@ fn breakaway_verdict(backend: &str, shape: &str, how: &str, helper_contained: bo
 }
 
 #[cfg(windows)]
-/// A resumed child may break away exactly when an ordinary child in its place may: the guard
-/// permits breakaway only if the job the child is in does (or it is in none). `expected` pins the
-/// ordinary verdict, so the comparison is not between two measurements of the wrong environment.
+/// A resumed child may break away exactly when an ordinary child in its place may. `expected` pins
+/// the ordinary verdict, so the comparison is not between two measurements of the wrong
+/// environment.
 fn assert_breakaway_matches_an_ordinary_spawn(shape: &str, helper_contained: bool, ambient: &str, expected: &str) {
     for backend in BACKENDS {
         let ordinary = breakaway_verdict(backend, shape, "ordinary", helper_contained, ambient);
@@ -285,30 +194,19 @@ fn assert_breakaway_matches_an_ordinary_spawn(shape: &str, helper_contained: boo
 
 #[cfg(windows)]
 /// An ambient job without `BREAKAWAY_OK`: breakaway is refused, so a resumed child must be refused
-/// too. A guard that permitted it would hand the child an escape no ordinary child has.
+/// too.
 #[skuld::test]
-fn a_resumed_uncontained_child_cannot_break_away_from_an_ambient_job_that_forbids_it() {
+fn a_resumed_child_cannot_break_away_from_an_ambient_job_that_forbids_it() {
     assert_breakaway_matches_an_ordinary_spawn("uncontained", false, "j0", "breakaway:err");
+    assert_breakaway_matches_an_ordinary_spawn("treewalk", false, "j0", "breakaway:err");
 }
 
 #[cfg(windows)]
-/// The ancestor's containment job forbids breakaway (`KILL_ON_JOB_CLOSE` alone), and the nested
-/// member's guard must not lift that.
+/// The ancestor's containment job forbids breakaway (`KILL_ON_JOB_CLOSE` alone), and a resumed
+/// nested member must not lift that.
 #[skuld::test]
 fn a_resumed_nested_child_cannot_break_away_from_its_ancestors_containment() {
     assert_breakaway_matches_an_ordinary_spawn("contained", true, "inherited", "breakaway:err");
-}
-
-#[cfg(windows)]
-#[skuld::test]
-fn a_resumed_uncontained_child_in_a_contained_tree_cannot_break_away_from_it() {
-    assert_breakaway_matches_an_ordinary_spawn("uncontained", true, "inherited", "breakaway:err");
-}
-
-#[cfg(windows)]
-#[skuld::test]
-fn a_resumed_treewalk_child_cannot_break_away_from_an_ambient_job_that_forbids_it() {
-    assert_breakaway_matches_an_ordinary_spawn("treewalk", false, "j0", "breakaway:err");
 }
 
 #[cfg(windows)]
@@ -316,13 +214,12 @@ fn a_resumed_treewalk_child_cannot_break_away_from_an_ambient_job_that_forbids_i
 #[skuld::test]
 fn a_resumed_child_can_break_away_from_an_ambient_job_that_permits_it() {
     assert_breakaway_matches_an_ordinary_spawn("uncontained", false, "jbreak", "breakaway:ok");
-    assert_breakaway_matches_an_ordinary_spawn("treewalk", false, "jbreak", "breakaway:ok");
 }
 
 #[cfg(windows)]
 /// The detach flow a supervisor uses: resume, then `detach()`, then every handle on the child is
-/// gone. The child must still be alive, which its echo proves. A guard that stayed armed, or a job
-/// that kept its kill, would end it here.
+/// gone. The child must still be alive, which its echo proves. A job that kept its kill would end
+/// it here.
 fn resumed_then_detached_child_is_alive(backend: &str, shape: &str) {
     let (listener, addr) = bind_report();
     let mut cmd = testbin_command(backend, "control-echo-pid", &addr, &["C"]);
@@ -446,9 +343,7 @@ fn measure(backend: &str, shape: &str, how: &str, helper_contained: bool, ambien
 #[cfg(windows)]
 /// A plain grandchild of a resumed frozen child is in the job that holds the child: the helper's
 /// ambient job `ambient` names, or, when `helper_contained`, the containment job the test holds. The
-/// ordinary spawn is the control, so the membership check is shown to see that job at all. The
-/// innermost job is not compared: a resumed child's grandchild may sit in the released guard, which
-/// limits nothing and lies inside the enclosing job.
+/// ordinary spawn is the control, so the membership check is shown to see that job at all.
 fn assert_grandchild_stays_in_the_enclosing_job(shape: &str, helper_contained: bool, ambient: &str, containment: &str) {
     for backend in BACKENDS {
         for how in ["ordinary", "frozen"] {
@@ -488,33 +383,6 @@ fn death_watch_grandchild_of_a_resumed_treewalk_child_stays_in_the_enclosing_job
 #[skuld::test]
 fn death_watch_grandchild_of_a_resumed_nested_child_stays_in_the_enclosing_job() {
     assert_grandchild_stays_in_the_enclosing_job("contained", true, "inherited", "Delegated");
-}
-
-#[cfg(windows)]
-#[skuld::test]
-fn death_watch_grandchild_of_a_resumed_child_stays_in_an_enclosing_job_that_permits_breakaway() {
-    assert_grandchild_stays_in_the_enclosing_job("uncontained", false, "jbreak", "None");
-    assert_grandchild_stays_in_the_enclosing_job("treewalk", false, "jbreak", "TreeWalk");
-}
-
-#[cfg(windows)]
-/// A plain grandchild of a resumed nested child must not escape the ancestor's job through the
-/// guard: `kill_tree` on the helper (the ancestor's root) has to end it. The wait
-/// is on a handle opened while the child holds the grandchild, with no timer; if the grandchild
-/// escaped, it never returns and nextest's `death_watch_` bound fails the test.
-#[skuld::test]
-fn death_watch_kill_tree_of_the_ancestor_ends_the_grandchild_of_a_resumed_nested_child() {
-    for backend in BACKENDS {
-        for shape in ["contained", "uncontained"] {
-            let measured = measure(backend, shape, "frozen", true, "inherited");
-            let watch = Watch::open(measured.grandchild_pid());
-
-            measured.helper.kill_tree().expect("kill the helper's tree");
-
-            watch.wait_for_death();
-            measured.finish();
-        }
-    }
 }
 
 #[path = "../src/test_harness.rs"]

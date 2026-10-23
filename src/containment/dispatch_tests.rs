@@ -162,8 +162,6 @@ fn nested_attach_is_delegated() {
             graceful: crate::containment::windows::mechanism_from_flags(crate::containment::windows::group_flags()),
             #[cfg(windows)]
             frozen: false,
-            #[cfg(windows)]
-            breakaway: false,
         };
         #[cfg(windows)]
         let proc_handle = {
@@ -694,7 +692,6 @@ fn cgroup_attachment_for_test(leaf_path: &std::path::Path) -> super::Attachment 
             leaf_path.to_path_buf(),
         )),
         graceful: crate::graceful::GracefulMechanism::Process,
-        frozen: None,
     }
 }
 
@@ -744,10 +741,7 @@ mod hold_mode {
     use crate::containment::windows::fault::{force_next, Step};
     use crate::containment::{ContainMode, Containment};
     use crate::error::Error;
-    use crate::test_frozen::{child_may_break_away, limit_flags, raw, spawn_suspended_blocker, InitialThread};
-    use windows::Win32::System::JobObjects::{
-        JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
-    };
+    use crate::test_frozen::{raw, spawn_suspended_blocker, InitialThread};
 
     const ERROR_ACCESS_DENIED: u32 = 5;
 
@@ -757,7 +751,6 @@ mod hold_mode {
             is_root,
             graceful: crate::graceful::GracefulMechanism::None,
             frozen,
-            breakaway: false,
         }
     }
 
@@ -773,8 +766,7 @@ mod hold_mode {
         child.wait().expect("reap the test child");
     }
 
-    /// A frozen Strongest root is assigned its containment job and stays suspended; the job is its
-    /// guard, so there is no second one.
+    /// A frozen Strongest root is assigned its containment job and stays suspended.
     #[skuld::test]
     fn death_watch_attach_in_hold_mode_assigns_a_strongest_roots_job_and_leaves_the_thread_suspended() {
         let child = spawn_suspended_blocker();
@@ -784,11 +776,6 @@ mod hold_mode {
 
         assert_eq!(attachment.containment, Containment::JobObject);
         assert!(matches!(attachment.attached, Attached::JobObject(_)));
-        let frozen = attachment
-            .frozen
-            .as_ref()
-            .expect("a frozen attach hands back its token");
-        assert!(!frozen.has_guard(), "the containment job is the guard");
         assert_eq!(thread.suspend_count(), 1, "hold mode must not resume");
         drop(attachment);
         child
@@ -796,7 +783,7 @@ mod hold_mode {
             .expect("the job's close killed the frozen child");
     }
 
-    /// A frozen child needs a job to be guarded, so a failed assignment fails the attach instead of
+    /// A frozen root needs its job to be held, so a failed assignment fails the attach instead of
     /// falling back to `TreeWalk`, which would leave nothing to kill it.
     #[skuld::test]
     fn attach_in_hold_mode_fails_when_the_strongest_assignment_fails_instead_of_falling_back_to_treewalk() {
@@ -822,16 +809,15 @@ mod hold_mode {
         let attachment = attach_suspended(&child, prepared(Some(ContainMode::Strongest), true, false)).expect("attach");
 
         assert_eq!(attachment.containment, Containment::TreeWalk);
-        assert!(attachment.frozen.is_none());
         assert_eq!(thread.suspend_count(), 0, "the ordinary attach resumes the child");
         dispose(child);
     }
 
-    /// Every shape without a cosca job of its own gets a guard, assigned while frozen, and keeps
-    /// the containment it would report if it were not frozen.
+    /// Every shape without a cosca job of its own (`TreeWalk` root, nested member, uncontained) is
+    /// left frozen and unjobbed: `attach` adds no job and keeps the containment it would report if
+    /// the child were not frozen.
     #[skuld::test]
-    fn death_watch_attach_in_hold_mode_gives_treewalk_nested_and_uncontained_shapes_a_guard_and_keeps_their_containment(
-    ) {
+    fn attach_in_hold_mode_gives_treewalk_nested_and_uncontained_shapes_no_job_and_leaves_them_suspended() {
         let shapes = [
             (
                 "treewalk root",
@@ -860,39 +846,13 @@ mod hold_mode {
             let attachment = attach_suspended(&child, prepared(mode, is_root, true)).expect(name);
 
             assert_eq!(attachment.containment, expected, "{name}");
-            let frozen = attachment.frozen.as_ref().expect(name);
-            assert!(frozen.has_guard(), "{name} has no job of its own, so it needs a guard");
-            // Literal bits: the kill always, both breakaway bits only where the enclosing job allows
-            // breakaway.
-            let mut armed = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.0;
-            if child_may_break_away(&child) {
-                armed |= JOB_OBJECT_LIMIT_BREAKAWAY_OK.0 | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK.0;
-            }
-            assert_eq!(
-                limit_flags(frozen.guard_for_test().expect(name)).0,
-                armed,
-                "{name}: the guard must be armed, with breakaway only where the enclosing job allows it"
+            assert!(
+                !matches!(attachment.attached, Attached::JobObject(_)),
+                "{name}: no job of its own"
             );
             assert_eq!(thread.suspend_count(), 1, "{name}: hold mode must not resume");
             drop(attachment);
-            child
-                .wait_with_output()
-                .unwrap_or_else(|e| panic!("{name}: the guard's close killed the child: {e}"));
+            dispose(child);
         }
-    }
-
-    /// A guard that cannot be assigned fails the attach: a frozen child nothing can kill must not
-    /// be handed to the caller.
-    #[skuld::test]
-    fn a_failed_guard_assignment_fails_the_attach() {
-        let child = spawn_suspended_blocker();
-        let _forced = force_next(Step::GuardAssign, ERROR_ACCESS_DENIED);
-
-        let err = attach_suspended(&child, prepared(None, false, true))
-            .err()
-            .expect("an unguardable frozen child must fail the attach");
-
-        assert!(matches!(err, Error::Containment { .. }), "got {err:?}");
-        dispose(child);
     }
 }

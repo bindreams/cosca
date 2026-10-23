@@ -1211,7 +1211,7 @@ fn main() {
         #[cfg(windows)]
         "try-env-block" => env_block::try_block(&args[2..]),
         #[cfg(windows)]
-        "spawn-frozen-report" => frozen::spawn_frozen_report(&args[2], &args[3], &args[4]),
+        "spawn-frozen-report" => frozen::spawn_frozen_report(&args[2], &args[3]),
         #[cfg(windows)]
         "spawn-breakaway-report" => frozen::spawn_breakaway_report(&args[2]),
         #[cfg(windows)]

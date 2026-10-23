@@ -52,7 +52,7 @@ use crate::child::spawn::{
     attach_or_fault, reject_batch_path, resolve_identity, resolve_stdio, spawn_lock, ChildEnd, Classify, PipeOwnership,
     SpawnFailure,
 };
-use crate::child::{Child, Spawned};
+use crate::child::Child;
 use crate::command::{Command, CommandInput, EnvOp, ExecutableSpec};
 use crate::error::{ChildFate, Error};
 use crate::stdio::{Fd, ResolvedStdio};
@@ -66,7 +66,7 @@ pub(crate) fn spawn_raw(
     cmd: &Command,
     fds: BTreeMap<Fd, ResolvedStdio>,
     kill_on_drop: bool,
-) -> Result<Spawned, SpawnFailure> {
+) -> Result<Child, SpawnFailure> {
     // .bat/.cmd rejected on the raw program token BEFORE resolution, so a bad/nonexistent batch
     // path still errors loudly (CVE-2024-24576) rather than surfacing as a spawn failure.
     reject_batch_program(cmd).not_started()?;
@@ -179,7 +179,6 @@ pub(crate) fn spawn_raw(
         // route for a child this spawn deliberately put in another console.
         graceful: crate::containment::windows::mechanism_from_flags(flags),
         frozen: cmd.flags_request().suspended,
-        breakaway: cmd.flags_request().breakaway_from_job,
     };
     let raw_handle = proc.as_raw_handle();
     let id = match resolve_identity(

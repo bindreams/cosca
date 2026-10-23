@@ -126,21 +126,6 @@ pub(crate) fn root_pid_was_recycled(
     }
 }
 
-/// A freshly spawned child and, for a frozen spawn, the token that releases it.
-pub(crate) struct Spawned {
-    pub(crate) child: Child,
-    /// `None` unless the spawn was a frozen request.
-    pub(crate) frozen: Option<crate::containment::frozen::Frozen>,
-}
-
-impl Spawned {
-    /// The child of a spawn that was not frozen.
-    pub(crate) fn into_child(self) -> Child {
-        debug_assert!(self.frozen.is_none(), "a frozen spawn's token must not be dropped");
-        self.child
-    }
-}
-
 /// A spawned child process the crate owns.
 #[derive(Debug)]
 pub struct Child {
@@ -172,8 +157,8 @@ impl Child {
         pipes: BTreeMap<Fd, ParentEnd>,
         kill_on_drop: bool,
         attachment: crate::containment::Attachment,
-    ) -> Spawned {
-        let child = Child {
+    ) -> Child {
+        Child {
             proc,
             id,
             pipes,
@@ -186,10 +171,6 @@ impl Child {
             front: None,
             #[cfg(unix)]
             reported: Vec::new(),
-        };
-        Spawned {
-            child,
-            frozen: attachment.frozen,
         }
     }
 

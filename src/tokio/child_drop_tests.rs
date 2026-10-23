@@ -543,7 +543,6 @@ async fn drop_warns_instead_of_asserting_on_a_real_teardown_mechanism_failure() 
             leaf_path.clone(),
         )),
         graceful: crate::graceful::GracefulMechanism::Process,
-        frozen: None,
     });
 
     let mut cmd = crate::tokio::Command::new();
