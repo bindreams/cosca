@@ -151,7 +151,37 @@ pub(crate) const P_WEXIT: libc::c_int = 0x0000_2000;
 /// wrong-sized record is a contract violation and leaves a trace before the same `None`.
 /// EINTR retries, per the codebase convention (see `wait/linux.rs`, `wait/macos.rs`).
 pub(crate) fn kinfo(pid: RawPid) -> Resolved<kinfo_proc> {
+    #[cfg(test)]
+    if let Some(oppid) = fault::take_oppid() {
+        return match read_record(pid, libc::KERN_PROC_PID) {
+            Resolved::Found(mut info) => {
+                info.kp_proc.p_oppid = oppid;
+                Resolved::Found(info)
+            }
+            other => other,
+        };
+    }
     read_record(pid, libc::KERN_PROC_PID)
+}
+
+/// Forces a field of the next [`kinfo`] read.
+#[cfg(test)]
+pub(crate) mod fault {
+    use std::cell::Cell;
+
+    thread_local! {
+        static OPPID: Cell<Option<libc::pid_t>> = const { Cell::new(None) };
+    }
+
+    /// The next [`kinfo`](super::kinfo) on this thread that finds its process reports `oppid` as its
+    /// `p_oppid`, the parent it had when a tracer attached.
+    pub(crate) fn force_oppid_once(oppid: libc::pid_t) {
+        OPPID.with(|o| o.set(Some(oppid)));
+    }
+
+    pub(super) fn take_oppid() -> Option<libc::pid_t> {
+        OPPID.with(Cell::take)
+    }
 }
 
 /// The selector-parameterized core. The `selector` parameter is a TEST SEAM (production
