@@ -184,8 +184,10 @@ const SAY_WAITING_AFTER: std::time::Duration = std::time::Duration::from_secs(1)
 /// The residuals. Something else reaps the child (`SIGCHLD` ignored, or a `waitpid(-1)` reaper) and
 /// another child of this process, traced or not, takes its pid before the registration: the watch
 /// and the check then name that process, and the wait lasts as long as it does, unless the pipe hits
-/// EOF first. A tracer that attaches after the wait's last check is not watched: if it exits while
-/// the child is exiting, nothing wakes the wait until launchd waits on the child.
+/// EOF first. A tracer that attaches after the wait's last check is not watched, and a tracer that
+/// is itself traced has its own `NOTE_EXIT` held back until its tracer reaps it. If either exits
+/// while the child is exiting, nothing wakes the wait until launchd waits on the child (or, for a
+/// traced tracer, until its own tracer reaps it).
 ///
 /// It waits on events, never on a timer. Past one second it warns, once, naming what it waits for:
 /// a message only, never a decision.
