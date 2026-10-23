@@ -311,9 +311,12 @@ pub(crate) mod test_hooks;
 
 #[path = "macos/await_reapable.rs"]
 mod await_reapable;
+#[path = "macos/tracer_watch.rs"]
+mod tracer_watch;
 #[cfg(test)]
 pub(crate) use await_reapable::await_reapable_on;
 pub(crate) use await_reapable::{await_reapable, Waited};
+pub(crate) use tracer_watch::{OnTracer, TracerWatch};
 
 pub(crate) fn kill(id: ProcessId) -> Result<(), Error> {
     use nix::sys::signal::{kill as nix_kill, Signal};

@@ -821,7 +821,7 @@ pub(crate) fn kill_and_reap_unreported(pid: u32, unique: u64, prepared: crate::c
     fault::run_at(fault::SpawnPoint::BeforeLateRootKill, pid);
     let mut notes = Vec::new();
     let mut breach = None;
-    let (fate, kill) = kill_and_reap_noting(pid, unique, None, &mut notes, &mut breach, |zombie| {
+    let (fate, kill) = kill_and_reap_noting(pid, unique, tree.id, &mut notes, &mut breach, |zombie| {
         tree.kill(Sweep::RootKilled { zombie })
     });
     let mut owed = std::mem::take(&mut tree.notes);
@@ -862,6 +862,8 @@ enum Reach {
 #[cfg(target_os = "macos")]
 struct LateTree {
     reach: Reach,
+    /// The root's identity, when the attach read it.
+    id: Option<ProcessId>,
     /// The first sweep's failure. No later sweep is shown to reach what it missed, so none clears it:
     /// the root's kill reparents its descendants out of a walk from its pid, a member that refused the
     /// kill can leave the group, and a holder can close its marker.
@@ -881,6 +883,7 @@ impl LateTree {
         use crate::identity::Resolved;
         let mut tree = LateTree {
             reach: Reach::None,
+            id: None,
             failed: None,
             succeeded_after: false,
             notes: Vec::new(),
@@ -891,6 +894,7 @@ impl LateTree {
         let (resolved, mut why) = resolve_identity(pid, &crate::wait::exit_only::Target::pid(pid, Some(unique)));
         let unshown = match resolved {
             Resolved::Found(id) => {
+                tree.id = Some(id);
                 match crate::containment::attach(id, prepared) {
                     Ok(attachment) => tree.reach = Reach::Attached(attachment.attached),
                     Err(e) => {

@@ -13,7 +13,12 @@ fn a_child_of_this_process_is_ours() {
     #[allow(clippy::disallowed_methods, reason = "spawn_lock is held by `guard`")]
     let mut child = cmd.spawn().expect("spawn cat");
     drop(guard);
-    assert_eq!(origin(child.id()), Origin::Ours);
+    assert_eq!(
+        origin(child.id()),
+        Origin::Ours {
+            parent: std::process::id()
+        }
+    );
     drop(child.stdin.take());
     child.wait().expect("reap cat");
 }

@@ -184,6 +184,17 @@ pub(crate) fn peek_verified(target: &Target<'_>) -> io::Result<Peek> {
     backend::peek_with(target, true)
 }
 
+/// [`peek`], and the tracer that holds the child when the verdict is `Running` because a process
+/// other than this one and launchd holds it (`waitid` answered `ECHILD`). **macOS only.**
+#[cfg(target_os = "macos")]
+pub(crate) fn peek_traced(target: &Target<'_>) -> io::Result<(Peek, Option<u32>)> {
+    #[cfg(test)]
+    if let Some(forced) = seams::take_forced_peek() {
+        return forced.map(|peeked| (peeked, None));
+    }
+    backend::peek_holder(target, false)
+}
+
 /// [`peek`], then consume `target`'s exit record if it has one.
 pub(crate) fn try_reap(target: &Target<'_>) -> io::Result<Reap> {
     backend::try_reap(target)

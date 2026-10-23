@@ -14,7 +14,9 @@
 //!   its reap), or the read was refused. If launchd holds it (a zombie whose tracer died), the
 //!   verdict is [`Waited::Orphaned`], which is not a reap. While the
 //!   pid names the child and a live process other than launchd holds it, a tracer holds the
-//!   child, and the wait goes on.
+//!   child, and the wait goes on: until the tracer's hand-back, which re-sends `NOTE_EXIT`, or the
+//!   tracer's exit, which the wait also watches ([`TracerWatch`]) and which leaves the child ours
+//!   or launchd's. A tracer that attaches after the wait's last peek is not watched.
 //! - Once `NOTE_EXIT` has come, or the registration's receipt says `ESRCH` (the child is past
 //!   `P_REF_DEAD`, where `proc_find` fails, but `waitid` may not see the zombie yet), it re-peeks
 //!   with a backoff until the peek finds the zombie or the child is gone. That is XNU finishing
@@ -39,7 +41,7 @@ use std::time::{Duration, Instant};
 
 use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 
-use super::add_with_receipt;
+use super::{add_with_receipt, OnTracer, TracerWatch};
 use crate::wait::exit_only::{self, Foreign, Peek, Target};
 
 /// The wait's verdict.
@@ -110,9 +112,10 @@ fn into_io(e: crate::error::Error) -> io::Error {
     }
 }
 
-/// One non-consuming look, by number and checked against `unique` when there is one.
-fn peek(pid: u32, unique: Option<u64>) -> io::Result<Peek> {
-    exit_only::peek(&Target::pid(pid, unique))
+/// One non-consuming look, by number and checked against `unique` when there is one, and the tracer
+/// that holds a running child, if one does.
+fn peek(pid: u32, unique: Option<u64>) -> io::Result<(Peek, Option<u32>)> {
+    exit_only::peek_traced(&Target::pid(pid, unique))
 }
 
 /// The peek's verdict as a wait verdict, or `None` when the child is still running.
@@ -126,11 +129,11 @@ fn settle(peeked: Peek) -> Option<Waited> {
 }
 
 /// Read every event already pending without blocking, until a round returns fewer events than
-/// the buffer holds; `true` if any is `NOTE_REAP`.
-fn drain_for_reap(kq: &Kqueue, events: &mut [KEvent; BATCH]) -> io::Result<bool> {
+/// the buffer holds; `true` if any is the child's `NOTE_REAP`.
+fn drain_for_reap(kq: &Kqueue, events: &mut [KEvent; BATCH], pid: u32, tracer: &mut TracerWatch) -> io::Result<bool> {
     loop {
         let n = kevent_round(kq, events, Block::Poll)?;
-        if scan(&events[..n]).0 {
+        if scan(&events[..n], pid, tracer).0 {
             return Ok(true);
         }
         if n < BATCH {
@@ -139,12 +142,16 @@ fn drain_for_reap(kq: &Kqueue, events: &mut [KEvent; BATCH]) -> io::Result<bool>
     }
 }
 
-/// `(saw NOTE_REAP, saw NOTE_EXIT)` in `events`.
-fn scan(events: &[KEvent]) -> (bool, bool) {
+/// `(saw NOTE_REAP, saw NOTE_EXIT)` of the child `pid` in `events`. A tracer's exit is neither:
+/// it only wakes the wait to peek again.
+fn scan(events: &[KEvent], pid: u32, tracer: &mut TracerWatch) -> (bool, bool) {
     let (mut reap, mut exit) = (false, false);
     for event in events {
         #[cfg(test)]
         super::test_hooks::record_event(event.filter().map_or(0, |f| f as i16), event.fflags().bits());
+        if tracer.fired(event, pid) {
+            continue;
+        }
         if event.filter() == Ok(EventFilter::EVFILT_PROC) {
             reap |= event.fflags().bits() & NOTE_REAP != 0;
             exit |= event.fflags().contains(FilterFlag::NOTE_EXIT);
@@ -230,6 +237,7 @@ pub(crate) fn await_reapable_on(
     let mut backoff = register(kq, pid)?;
     let mut interval = BACKOFF_START;
     let mut events = [blank(); BATCH];
+    let mut tracer = TracerWatch::default();
     #[cfg(test)]
     let mut round: u32 = 0;
     #[cfg(test)]
@@ -248,13 +256,27 @@ pub(crate) fn await_reapable_on(
             }
         }
         repeek = true;
-        // A `NOTE_REAP` anywhere before a peek means something else reaped the child: never
-        // peek again by a pid that may since name another child.
-        if drain_for_reap(kq, &mut events)? {
-            return Ok(Waited::Gone);
-        }
-        if let Some(verdict) = settle(peek(pid, unique)?) {
-            return Ok(verdict);
+        // Peeks until the wait may block: once more at once after a tracer's watch is registered.
+        let mut tracer_wait = None;
+        loop {
+            // A `NOTE_REAP` anywhere before a peek means something else reaped the child: never
+            // peek again by a pid that may since name another child.
+            if drain_for_reap(kq, &mut events, pid, &mut tracer)? {
+                return Ok(Waited::Gone);
+            }
+            let (peeked, holder) = peek(pid, unique)?;
+            if let Some(verdict) = settle(peeked) {
+                return Ok(verdict);
+            }
+            let Some(holder) = holder else { break };
+            match tracer.held_by(kq, holder)? {
+                OnTracer::Block => break,
+                OnTracer::Recheck(after) if after.is_zero() && !expired(deadline) => {}
+                OnTracer::Recheck(after) => {
+                    tracer_wait = Some(after);
+                    break;
+                }
+            }
         }
         if expired(deadline) {
             return final_peek(pid, unique);
@@ -267,11 +289,14 @@ pub(crate) fn await_reapable_on(
             round += 1;
         }
         let block = Block::Until {
-            interval: backoff.then_some(interval),
+            interval: match (backoff.then_some(interval), tracer_wait) {
+                (Some(backoff), Some(tracer)) => Some(backoff.min(tracer)),
+                (backoff, tracer) => backoff.or(tracer),
+            },
             deadline,
         };
         let n = kevent_round(kq, &mut events, block)?;
-        let (reaped, exited) = scan(&events[..n]);
+        let (reaped, exited) = scan(&events[..n], pid, &mut tracer);
         if reaped {
             return Ok(Waited::Gone);
         }
@@ -282,7 +307,7 @@ pub(crate) fn await_reapable_on(
         }
         if expired(deadline) {
             // No new round: the drain, then the one final peek.
-            if drain_for_reap(kq, &mut events)? {
+            if drain_for_reap(kq, &mut events, pid, &mut tracer)? {
                 return Ok(Waited::Gone);
             }
             return final_peek(pid, unique);
@@ -298,7 +323,7 @@ fn expired(deadline: Option<Option<Instant>>) -> bool {
 fn final_peek(pid: u32, unique: Option<u64>) -> io::Result<Waited> {
     #[cfg(test)]
     exit_only::seams::step(exit_only::seams::HolderStep::FinalPeek);
-    Ok(settle(peek(pid, unique)?).unwrap_or(Waited::DeadlinePassed))
+    Ok(settle(peek(pid, unique)?.0).unwrap_or(Waited::DeadlinePassed))
 }
 
 /// [`await_reapable_on`] on a kqueue of its own.
