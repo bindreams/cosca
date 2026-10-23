@@ -1,0 +1,18 @@
+diff --git a/src/child/spawn.rs b/src/child/spawn.rs
+index 6a22940d..21037751 100644
+--- a/src/child/spawn.rs
++++ b/src/child/spawn.rs
+@@ -947,11 +947,8 @@ impl LateTree {
+ 
+     /// Folds a sweep's result into [`failed`](Self::failed).
+     fn fold(&mut self, result: Result<(), String>) {
+-        match (result, &self.failed) {
+-            (Err(e), None) => self.failed = Some(e),
+-            (Err(_), Some(_)) => self.succeeded_after = false,
+-            (Ok(()), failed) => self.succeeded_after = failed.is_some(),
+-        }
++        self.failed = result.err();
++        self.succeeded_after = false;
+     }
+ 
+     /// The `warn`'s note for a sweep that failed.

@@ -1,0 +1,13 @@
+diff --git a/src/child/spawn.rs b/src/child/spawn.rs
+index 6a22940d..d74b5f00 100644
+--- a/src/child/spawn.rs
++++ b/src/child/spawn.rs
+@@ -924,7 +924,7 @@ impl LateTree {
+             (Reach::Attached(attached), Sweep::RootAlive | Sweep::RootKilled { zombie: true }) => {
+                 let result = match attached.hard_kill_report() {
+                     (Err(e), _) => Err(e.to_string()),
+-                    (Ok(()), false) => Err("a member could not be killed".to_owned()),
++                    (Ok(()), false) => Ok(()),
+                     (Ok(()), true) => Ok(()),
+                 };
+                 self.fold(result);

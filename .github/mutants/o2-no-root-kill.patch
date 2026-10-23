@@ -1,0 +1,13 @@
+diff --git a/src/child/spawn.rs b/src/child/spawn.rs
+index 6a22940d..f97c704d 100644
+--- a/src/child/spawn.rs
++++ b/src/child/spawn.rs
+@@ -1049,7 +1049,7 @@ fn kill_and_reap_noting(
+     use crate::wait::exit_only::Foreign;
+ 
+     let target = crate::wait::exit_only::Target::pid(pid, Some(unique));
+-    match via_verified_pid(pid, Some(unique), Sig::Kill) {
++    match Ok::<_, std::io::Error>(Sent::Delivered) {
+         Ok(Sent::Delivered) => {
+             // A fixture that only the kill would end is released here when no kill was sent.
+             #[cfg(test)]

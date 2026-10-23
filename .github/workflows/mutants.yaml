@@ -1,0 +1,59 @@
+# Throwaway: runs each named mutant's target tests on macOS, expecting them to fail, and the
+# unmutated tree's, expecting them to pass. Never merged.
+name: Mutants
+
+on:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  COSCA_TEST_ROOT: "0"
+  COSCA_TEST_UID_SWITCH: "0"
+  COSCA_TEST_NAMESPACES: "0"
+  COSCA_TEST_SETUID: "0"
+  COSCA_TEST_CGROUP: "0"
+  COSCA_TEST_ELEVATION: "0"
+
+jobs:
+  mutant:
+    name: ${{ matrix.name }}
+    runs-on: macos-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: baseline
+            tracer: "1"
+            filter: "test(/late_report_tests::|unique_report_tests::|origin_tests::/)"
+          - name: m1-sweep-overwrites
+            filter: "test(/macos_late_tree_walk_that_fails_before_the_root_kill/)"
+          - name: m1-incomplete-ignored
+            filter: "test(/macos_late_tree_walk_that_leaves_a_member/)"
+          - name: o1-no-unique-guard
+            filter: "test(/origin_tests::a_stale_parent_at_attach/)"
+          - name: o2-no-root-kill
+            filter: "test(/macos_late_session_child_without_a_marker/)"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: ./.github/actions/setup-rust
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
+        with:
+          tool: cargo-nextest@0.9.148
+      - name: Apply the mutant
+        if: matrix.name != 'baseline'
+        run: git apply ".github/mutants/${{ matrix.name }}.patch"
+      - name: Run the target tests
+        shell: bash
+        env:
+          COSCA_TEST_TRACER: ${{ matrix.tracer || '0' }}
+          COSCA_TEST_TRACER_CONSENT: "1"
+        run: |
+          set +e
+          cargo nextest run --locked --features tokio --no-fail-fast --no-tests=fail -E '${{ matrix.filter }}'
+          code=$?
+          echo "nextest exit: $code"
+          if [ "${{ matrix.name }}" = baseline ]; then exit "$code"; fi
+          # A mutant must fail its tests (exit 100), not pass or fail to build.
+          [ "$code" -eq 100 ]
