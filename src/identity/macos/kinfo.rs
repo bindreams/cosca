@@ -52,6 +52,11 @@ impl kinfo_proc {
         let at = kinfo_proc::E_JOBC_OFFSET;
         i16::from_ne_bytes(self.kp_eproc[at..at + 2].try_into().expect("2 bytes"))
     }
+
+    fn set_e_ppid(&mut self, ppid: libc::pid_t) {
+        let at = kinfo_proc::E_PPID_OFFSET;
+        self.kp_eproc[at..at + std::mem::size_of::<libc::pid_t>()].copy_from_slice(&ppid.to_ne_bytes());
+    }
 }
 
 // E_PPID_OFFSET must stay inside the opaque tail it reads from - a compile-time companion to
@@ -161,6 +166,17 @@ pub(crate) fn kinfo(pid: RawPid) -> Resolved<kinfo_proc> {
             other => other,
         };
     }
+    #[cfg(test)]
+    if let Some((oppid, ppid)) = fault::forced_parents(pid) {
+        return match read_record(pid, libc::KERN_PROC_PID) {
+            Resolved::Found(mut info) => {
+                info.kp_proc.p_oppid = oppid;
+                info.set_e_ppid(ppid);
+                Resolved::Found(info)
+            }
+            other => other,
+        };
+    }
     read_record(pid, libc::KERN_PROC_PID)
 }
 
@@ -181,6 +197,40 @@ pub(crate) mod fault {
 
     pub(super) fn take_oppid() -> Option<libc::pid_t> {
         OPPID.with(Cell::take)
+    }
+
+    /// What [`force_parents`] answers: `(p_oppid, e_ppid)`.
+    type Parents = Box<dyn FnMut() -> (libc::pid_t, libc::pid_t)>;
+
+    thread_local! {
+        static PARENTS: std::cell::RefCell<Option<(libc::pid_t, Parents)>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// While the guard lives, every [`kinfo`](super::kinfo) of `pid` on this thread that finds its
+    /// process reports the `(p_oppid, e_ppid)` that `parents` answers at that read: the parent at a
+    /// tracer's attach, and the parent now.
+    pub(crate) fn force_parents(
+        pid: libc::pid_t,
+        parents: impl FnMut() -> (libc::pid_t, libc::pid_t) + 'static,
+    ) -> ForcedParents {
+        PARENTS.with(|p| *p.borrow_mut() = Some((pid, Box::new(parents))));
+        ForcedParents(())
+    }
+
+    #[must_use = "the reads are real again as soon as the guard is dropped"]
+    pub(crate) struct ForcedParents(());
+
+    impl Drop for ForcedParents {
+        fn drop(&mut self) {
+            PARENTS.with(|p| p.borrow_mut().take());
+        }
+    }
+
+    pub(super) fn forced_parents(pid: libc::pid_t) -> Option<(libc::pid_t, libc::pid_t)> {
+        PARENTS.with(|p| match p.borrow_mut().as_mut() {
+            Some((forced, parents)) if *forced == pid => Some(parents()),
+            _ => None,
+        })
     }
 }
 
