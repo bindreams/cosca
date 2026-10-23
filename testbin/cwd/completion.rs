@@ -21,14 +21,15 @@ fn gfpn(path: &OsStr) -> String {
     String::from_utf16_lossy(&buf[..n as usize])
 }
 
-/// A drive letter mapped to a directory with `DefineDosDeviceW` for as long as it lives.
-struct Subst {
+/// A drive letter mapped to a directory with `DefineDosDeviceW` for as long as it lives. A second
+/// one for the same letter shadows the first until it is dropped.
+pub(crate) struct Subst {
     drive: String,
     target: Vec<u16>,
 }
 
 impl Subst {
-    fn new(drive: &str, target: &Path) -> Result<Self, String> {
+    pub(crate) fn new(drive: &str, target: &Path) -> Result<Self, String> {
         use std::os::windows::ffi::OsStrExt;
         use windows::core::PCWSTR;
         use windows::Win32::Storage::FileSystem::{DefineDosDeviceW, DEFINE_DOS_DEVICE_FLAGS};
@@ -98,19 +99,12 @@ fn drive_dir_value(drive: &str) -> String {
 /// `current_dir("X:sub")`, what `GetFullPathNameW` makes of `X:sub` and the value it leaves in
 /// `=X:`, and where std runs the child.
 pub fn drive_dir(base: &str, image: &str) {
-    use windows::Win32::Storage::FileSystem::GetLogicalDrives;
     let d = canonical(base);
     for sub in ["sub", r"exists\sub"] {
         std::fs::create_dir_all(d.join(sub)).expect("create the drive's directories");
     }
     std::fs::write(d.join("afile"), b"x").expect("create <d>\\afile");
-    // SAFETY: no arguments; reads the mounted drives.
-    let mask = unsafe { GetLogicalDrives() };
-    let letter = (b'M'..=b'Z')
-        .rev()
-        .find(|l| mask & (1 << (l - b'A')) == 0)
-        .expect("a free drive letter");
-    let drive = format!("{}:", letter as char);
+    let drive = free_drive();
     let _subst = match Subst::new(&drive, &d) {
         Ok(s) => s,
         Err(e) => return println!("subst=err {e}"),
@@ -141,6 +135,18 @@ pub fn drive_dir(base: &str, image: &str) {
         let std_run = std_output(std::process::Command::new(image).current_dir(&name));
         println!("std_{label}={}", spawned(std_run, "cwd=", &render));
     }
+}
+
+/// A drive letter no volume or mapping uses, as `X:`.
+pub(crate) fn free_drive() -> String {
+    use windows::Win32::Storage::FileSystem::GetLogicalDrives;
+    // SAFETY: no arguments; reads the mounted drives.
+    let mask = unsafe { GetLogicalDrives() };
+    let letter = (b'M'..=b'Z')
+        .rev()
+        .find(|l| mask & (1 << (l - b'A')) == 0)
+        .expect("a free drive letter");
+    format!("{}:", letter as char)
 }
 
 /// Where cosca and std run a child given the rooted `current_dir(r"\x")` from this process's cwd.

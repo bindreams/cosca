@@ -104,8 +104,12 @@ fn self_made_alias(t: &Path) {
             data.extend_from_slice(&unit.to_le_bytes());
         }
     }
-    let created = without_privileges(|| set_reparse(&alias, IO_REPARSE_TAG_APPEXECLINK, &data));
+    let mut created = without_privileges(|| set_reparse(&alias, IO_REPARSE_TAG_APPEXECLINK, &data));
     println!("M19 own_alias_unprivileged_create={}", outcome(&created));
+    if created.is_err() {
+        created = set_reparse(&alias, IO_REPARSE_TAG_APPEXECLINK, &data);
+        println!("M19 own_alias_privileged_create={}", outcome(&created));
+    }
     if created.is_ok() {
         println!("M19 own_alias {}", facts(&alias, Some("")));
     }

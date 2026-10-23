@@ -1,7 +1,9 @@
 //! Test-only helper spawned by the crate's integration tests. std-only, with
 //! exceptions that use the `cosca` crate: the `report-nested-kill-tree` mode, to exercise
 //! the real nested-member `kill_tree` path, `spawn-dump-env-block`, to spawn through each
-//! Windows backend, and the frozen-spawn modes of `frozen.rs`. Behavior is selected by argv[1].
+//! Windows backend, the frozen-spawn modes of `frozen.rs`, and the measurement modes
+//! (`handles-probe`, `std-loads`, `std-loads-dup`). Behavior is selected by `COSCA_TESTBIN_MODE`
+//! when set, else by argv[1]; the variable keeps the mode when a test shifts argv (`dump-argv`).
 
 #[cfg(target_os = "macos")]
 use std::io::BufRead;
@@ -54,6 +56,23 @@ mod frozen;
 #[cfg(windows)]
 #[path = "env_block.rs"]
 mod env_block;
+
+#[cfg(windows)]
+#[path = "handles.rs"]
+mod handles;
+
+#[cfg(windows)]
+#[path = "long_image.rs"]
+mod long_image;
+
+#[cfg(windows)]
+#[allow(dead_code, reason = "shared with cosca_testbin_cwd, which uses other parts")]
+#[path = "measure.rs"]
+mod measure;
+
+#[cfg(windows)]
+#[path = "std_loads.rs"]
+mod std_loads;
 
 /// `tests/elevation_pkexec_version.rs`'s fake pkexec: this binary, copied to `real/pkexec-impl`.
 /// Appends one line to `../pkexec.log` (next to `real/`): `argv[0]`, the file running (so the
@@ -271,8 +290,19 @@ fn main() {
         fake_pkexec(&args);
         return;
     }
-    let mode = args.get(1).map(String::as_str).unwrap_or("");
+    let mode_var = std::env::var("COSCA_TESTBIN_MODE").ok();
+    let mode = mode_var
+        .as_deref()
+        .unwrap_or_else(|| args.get(1).map(String::as_str).unwrap_or(""));
     match mode {
+        // Every argument, argv[0] included: `argc=`, then `arg<i>=` lines.
+        "dump-argv" => {
+            let argv: Vec<String> = std::env::args_os().map(|a| a.to_string_lossy().into_owned()).collect();
+            println!("argc={}", argv.len());
+            for (i, arg) in argv.iter().enumerate() {
+                println!("arg{i}={arg}");
+            }
+        }
         "argv0" => {
             // Print this process's argv[0] so callers can verify it.
             let argv0 = std::env::args().next().unwrap_or_default();
@@ -1229,6 +1259,20 @@ fn main() {
         "spawn-report-pid" => frozen::spawn_report_pid(&args[2]),
         #[cfg(windows)]
         "report-pid" => frozen::report_pid(&args[2]),
+        #[cfg(windows)]
+        "with-env-block" => env_block::with_block(&args[2..]),
+        #[cfg(windows)]
+        "env-set-probe" => env_block::set_probe(&args[2..]),
+        #[cfg(windows)]
+        "handles-probe" => handles::probe(&args[2], &args[3]),
+        #[cfg(windows)]
+        "report-handles" => handles::report(&args[2], args.get(3).map(String::as_str)),
+        #[cfg(windows)]
+        "std-loads" => std_loads::run(&args[2], &args[3]),
+        #[cfg(windows)]
+        "std-loads-dup" => std_loads::run_dup(&args[2], &args[3]),
+        #[cfg(windows)]
+        "long-image" => long_image::run(&args[2], &args[3]),
         #[cfg(windows)]
         "report-breakaway" => {
             breakaway::run(&args[2], &args[3], &args[4]);
