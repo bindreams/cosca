@@ -162,6 +162,8 @@ fn nested_attach_is_delegated() {
             graceful: crate::containment::windows::mechanism_from_flags(crate::containment::windows::group_flags()),
             #[cfg(windows)]
             frozen: false,
+            #[cfg(windows)]
+            breakaway: false,
         };
         #[cfg(windows)]
         let proc_handle = {
@@ -740,10 +742,12 @@ fn kill_on_drop_true_leaves_a_cgroup_leaf_armed() {
 mod hold_mode {
     use crate::containment::dispatch::{attach, Attached, Attachment, Prepared};
     use crate::containment::windows::fault::{force_next, Step};
-    use crate::containment::windows::guard_armed_flags;
     use crate::containment::{ContainMode, Containment};
     use crate::error::Error;
-    use crate::test_frozen::{limit_flags, raw, spawn_suspended_blocker, InitialThread};
+    use crate::test_frozen::{child_may_break_away, limit_flags, raw, spawn_suspended_blocker, InitialThread};
+    use windows::Win32::System::JobObjects::{
+        JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
+    };
 
     const ERROR_ACCESS_DENIED: u32 = 5;
 
@@ -753,6 +757,7 @@ mod hold_mode {
             is_root,
             graceful: crate::graceful::GracefulMechanism::None,
             frozen,
+            breakaway: false,
         }
     }
 
@@ -856,10 +861,15 @@ mod hold_mode {
             assert_eq!(attachment.containment, expected, "{name}");
             let frozen = attachment.frozen.as_ref().expect(name);
             assert!(frozen.has_guard(), "{name} has no job of its own, so it needs a guard");
+            // Literal bits: the kill and silent breakaway always, breakaway where the enclosing job allows.
+            let mut armed = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.0 | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK.0;
+            if child_may_break_away(&child) {
+                armed |= JOB_OBJECT_LIMIT_BREAKAWAY_OK.0;
+            }
             assert_eq!(
                 limit_flags(frozen.guard_for_test().expect(name)).0,
-                guard_armed_flags().0,
-                "{name}: the guard must be armed with breakaway permitted"
+                armed,
+                "{name}: the guard must be armed, with breakaway only where the enclosing job allows it"
             );
             assert_eq!(thread.suspend_count(), 1, "{name}: hold mode must not resume");
             drop(attachment);

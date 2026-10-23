@@ -236,6 +236,80 @@ fn a_resumed_uncontained_child_can_still_break_away() {
 }
 
 #[cfg(windows)]
+/// What `CREATE_BREAKAWAY_FROM_JOB` gets from a child (frozen and resumed, or `ordinary`) of `shape`
+/// that sits in the ambient job `ambient` names, inside a helper that `helper_contained` puts in a
+/// job the test holds.
+fn breakaway_verdict(backend: &str, shape: &str, how: &str, helper_contained: bool, ambient: &str) -> String {
+    let (listener, addr) = bind_report();
+    let mut cmd = testbin_command(backend, "spawn-breakaway-child", &addr, &[backend, shape, how, ambient]);
+    if helper_contained {
+        cmd.contain();
+    }
+    let mut helper = cmd.spawn().expect("spawn the helper");
+    let sock = accept_or_die(&listener, &mut helper);
+    let line = read_report_line(&sock);
+    drop(sock);
+    helper.wait().expect("reap the helper");
+    line.trim().to_owned()
+}
+
+#[cfg(windows)]
+/// A resumed child may break away exactly when an ordinary child in its place may: the guard
+/// permits breakaway only if the job the child is in does (or it is in none). `expected` pins the
+/// ordinary verdict, so the comparison is not between two measurements of the wrong environment.
+fn assert_breakaway_matches_an_ordinary_spawn(shape: &str, helper_contained: bool, ambient: &str, expected: &str) {
+    for backend in BACKENDS {
+        let ordinary = breakaway_verdict(backend, shape, "ordinary", helper_contained, ambient);
+        let frozen = breakaway_verdict(backend, shape, "frozen", helper_contained, ambient);
+
+        assert!(
+            ordinary.starts_with(expected),
+            "{backend}/{shape}/{ambient}: precondition: the ordinary spawn's verdict is {ordinary:?}, not {expected:?}"
+        );
+        assert_eq!(
+            frozen, ordinary,
+            "{backend}/{shape}/{ambient}: the resumed child must get the verdict an ordinary child gets"
+        );
+    }
+}
+
+#[cfg(windows)]
+/// An ambient job without `BREAKAWAY_OK`: breakaway is refused, so a resumed child must be refused
+/// too. A guard that permitted it would hand the child an escape no ordinary child has.
+#[skuld::test]
+fn a_resumed_uncontained_child_cannot_break_away_from_an_ambient_job_that_forbids_it() {
+    assert_breakaway_matches_an_ordinary_spawn("uncontained", false, "j0", "breakaway:err");
+}
+
+#[cfg(windows)]
+/// The ancestor's containment job forbids breakaway (`KILL_ON_JOB_CLOSE` alone), and the nested
+/// member's guard must not lift that.
+#[skuld::test]
+fn a_resumed_nested_child_cannot_break_away_from_its_ancestors_containment() {
+    assert_breakaway_matches_an_ordinary_spawn("contained", true, "inherited", "breakaway:err");
+}
+
+#[cfg(windows)]
+#[skuld::test]
+fn a_resumed_uncontained_child_in_a_contained_tree_cannot_break_away_from_it() {
+    assert_breakaway_matches_an_ordinary_spawn("uncontained", true, "inherited", "breakaway:err");
+}
+
+#[cfg(windows)]
+#[skuld::test]
+fn a_resumed_treewalk_child_cannot_break_away_from_an_ambient_job_that_forbids_it() {
+    assert_breakaway_matches_an_ordinary_spawn("treewalk", false, "j0", "breakaway:err");
+}
+
+#[cfg(windows)]
+/// An ambient job that permits breakaway: the resumed child may break away, as an ordinary one may.
+#[skuld::test]
+fn a_resumed_child_can_break_away_from_an_ambient_job_that_permits_it() {
+    assert_breakaway_matches_an_ordinary_spawn("uncontained", false, "jbreak", "breakaway:ok");
+    assert_breakaway_matches_an_ordinary_spawn("treewalk", false, "jbreak", "breakaway:ok");
+}
+
+#[cfg(windows)]
 /// The detach flow a supervisor uses: resume, then `detach()`, then every handle on the child is
 /// gone. The child must still be alive, which its echo proves. A guard that stayed armed, or a job
 /// that kept its kill, would end it here.

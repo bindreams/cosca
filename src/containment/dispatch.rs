@@ -27,6 +27,10 @@ pub(crate) struct Prepared {
     /// [`Frozen`](crate::containment::frozen::Frozen)).
     #[cfg(windows)]
     pub frozen: bool,
+    /// Whether the child was created with `CREATE_BREAKAWAY_FROM_JOB`, which puts it in none of its
+    /// creator's innermost job. Read for a frozen child's guard.
+    #[cfg(windows)]
+    pub breakaway: bool,
 }
 
 /// A child the spawn has just forked, as the spawn holds it: its pid, and the pidfd the handshake
@@ -960,6 +964,8 @@ pub(crate) fn prepare(
             graceful,
             #[cfg(windows)]
             frozen: flags.suspended,
+            #[cfg(windows)]
+            breakaway: flags.breakaway_from_job,
         });
     }
     let marker_env = is_root && req.nesting == Nesting::Mark;
@@ -1099,6 +1105,8 @@ pub(crate) fn prepare(
         graceful,
         #[cfg(windows)]
         frozen: flags.suspended,
+        #[cfg(windows)]
+        breakaway: flags.breakaway_from_job,
     })
 }
 

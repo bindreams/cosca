@@ -45,7 +45,7 @@ mod setuid_stdin_block;
 #[path = "breakaway.rs"]
 mod breakaway;
 
-/// The frozen-spawn helper modes (`spawn-frozen-report`, `spawn-breakaway-report`).
+/// The frozen-spawn helper modes (`spawn-frozen-report`, `spawn-breakaway-report`, `spawn-breakaway-child`).
 #[cfg(windows)]
 #[path = "frozen.rs"]
 mod frozen;
@@ -1214,6 +1214,10 @@ fn main() {
         "spawn-frozen-report" => frozen::spawn_frozen_report(&args[2], &args[3], &args[4]),
         #[cfg(windows)]
         "spawn-breakaway-report" => frozen::spawn_breakaway_report(&args[2]),
+        #[cfg(windows)]
+        "spawn-breakaway-child" => {
+            frozen::spawn_breakaway_child(&args[2], &args[3], &args[4], &args[5], &args[6]);
+        }
         #[cfg(windows)]
         "spawn-measured-child" => {
             frozen::spawn_measured_child(&args[2], &args[3], &args[4], &args[5], &args[6]);

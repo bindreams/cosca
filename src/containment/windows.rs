@@ -657,28 +657,98 @@ pub(crate) fn assign_held(proc_handle: std::os::windows::io::RawHandle) -> io::R
 }
 
 /// The guard job of a frozen child that no cosca job holds: it kills the child if its owner dies
-/// while the child is frozen, and it never narrows what the child may do afterwards.
+/// while the child is frozen, and it never widens what the child may do afterwards.
 ///
-/// Armed, it carries `KILL_ON_JOB_CLOSE`; armed and released it permits breakaway
-/// (`BREAKAWAY_OK`) and keeps the member's descendants out of the job (`SILENT_BREAKAWAY_OK`).
-/// Membership outlives the handle, so a job without them would stay around the resumed child and
-/// refuse its `CREATE_BREAKAWAY_FROM_JOB`, which an uncontained child may use freely.
-pub(crate) fn assign_guard_job(proc_handle: std::os::windows::io::RawHandle) -> io::Result<JobHandle> {
+/// Membership outlives the handle, so the guard's limits outlive its kill. `SILENT_BREAKAWAY_OK`
+/// keeps the member's descendants out of the guard: they stay in the job around it, as they would
+/// with no guard. `BREAKAWAY_OK` is carried only when `breakaway_ok`: breakaway from a nested job
+/// checks the innermost one, so a guard that carried it against an enclosing job that refuses would
+/// let the child's `CREATE_BREAKAWAY_FROM_JOB` succeed where an ordinary child's is denied.
+pub(crate) fn assign_guard_job(
+    proc_handle: std::os::windows::io::RawHandle,
+    breakaway_ok: bool,
+) -> io::Result<JobHandle> {
     #[cfg(test)]
     forced(fault::Step::GuardAssign).map_err(io::Error::from)?;
-    assign_with_limits(proc_handle, guard_armed_flags())
+    assign_with_limits(proc_handle, guard_armed_flags(breakaway_ok))
 }
 
 /// The guard's limits while it is armed.
-pub(crate) fn guard_armed_flags() -> JOB_OBJECT_LIMIT {
-    JOB_OBJECT_LIMIT(
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.0 | JOB_OBJECT_LIMIT_BREAKAWAY_OK.0 | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK.0,
-    )
+pub(crate) fn guard_armed_flags(breakaway_ok: bool) -> JOB_OBJECT_LIMIT {
+    JOB_OBJECT_LIMIT(JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.0 | guard_released_flags(breakaway_ok).0)
 }
 
-/// The guard's limits once it is released: the kill is gone and breakaway is still permitted.
-pub(crate) fn guard_released_flags() -> JOB_OBJECT_LIMIT {
-    JOB_OBJECT_LIMIT(JOB_OBJECT_LIMIT_BREAKAWAY_OK.0 | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK.0)
+/// The guard's limits once it is released: the kill is gone and the breakaway bits are as armed.
+pub(crate) fn guard_released_flags(breakaway_ok: bool) -> JOB_OBJECT_LIMIT {
+    let breakaway = if breakaway_ok {
+        JOB_OBJECT_LIMIT_BREAKAWAY_OK.0
+    } else {
+        0
+    };
+    JOB_OBJECT_LIMIT(breakaway | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK.0)
+}
+
+/// The job a frozen child is in when its guard is assigned, as far as breakaway goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Surroundings {
+    /// In no job: `CREATE_BREAKAWAY_FROM_JOB` is a no-op for its children.
+    NoJob,
+    /// In the job with these limits.
+    Job(JOB_OBJECT_LIMIT),
+    /// In a job whose limits this process cannot read.
+    Unreadable,
+}
+
+impl Surroundings {
+    /// Whether an ordinary child in these surroundings can use `CREATE_BREAKAWAY_FROM_JOB`: it is in
+    /// no job, or in one that carries `BREAKAWAY_OK`.
+    pub(crate) fn permits_breakaway(self) -> bool {
+        match self {
+            Surroundings::NoJob => true,
+            Surroundings::Job(limits) => limits.0 & JOB_OBJECT_LIMIT_BREAKAWAY_OK.0 != 0,
+            Surroundings::Unreadable => false,
+        }
+    }
+}
+
+/// The surroundings of the just-created child at `proc_handle`, whose creator is this process.
+///
+/// A job's limits can be read only through a handle to it, and the only job a process holds a way to
+/// is its own, so the child's job is read as this process's innermost one. That is the child's job
+/// when it inherited it. It did not when this process's job sends children out of it
+/// (`SILENT_BREAKAWAY_OK`) or the child was made with `CREATE_BREAKAWAY_FROM_JOB`
+/// (`breakaway_requested`): it then sits in an ancestor job if there is one, which cannot be read.
+pub(crate) fn surroundings_of(proc_handle: std::os::windows::io::RawHandle, breakaway_requested: bool) -> Surroundings {
+    use windows::Win32::System::JobObjects::{
+        IsProcessInJob, JobObjectBasicLimitInformation, JOBOBJECT_BASIC_LIMIT_INFORMATION,
+    };
+
+    let mut in_job = windows::core::BOOL(0);
+    // SAFETY: `proc_handle` is a live process handle the caller holds, `in_job` is a valid
+    // out-parameter, and a null job handle asks whether the process is in any job.
+    if unsafe { IsProcessInJob(HANDLE(proc_handle.cast()), None, &mut in_job) }.is_err() {
+        return Surroundings::Unreadable;
+    }
+    if !in_job.as_bool() {
+        return Surroundings::NoJob;
+    }
+    let mut info = JOBOBJECT_BASIC_LIMIT_INFORMATION::default();
+    // SAFETY: `info` is a correctly sized out-parameter; a null job handle asks about the calling
+    // process's own job.
+    let own = unsafe {
+        QueryInformationJobObject(
+            None,
+            JobObjectBasicLimitInformation,
+            std::ptr::addr_of_mut!(info).cast(),
+            size_of::<JOBOBJECT_BASIC_LIMIT_INFORMATION>() as u32,
+            None,
+        )
+    };
+    let leaves_own_job = breakaway_requested || info.LimitFlags.0 & JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK.0 != 0;
+    match own {
+        Ok(()) if !leaves_own_job => Surroundings::Job(info.LimitFlags),
+        _ => Surroundings::Unreadable,
+    }
 }
 
 /// Create a job with exactly `flags` and assign the process at `proc_handle` to it.

@@ -2,9 +2,8 @@
 
 use super::observe;
 use crate::containment::dispatch::{attach, Attachment, Prepared};
-use crate::containment::windows::guard_armed_flags;
 use crate::containment::ContainMode;
-use crate::test_frozen::{raw, spawn_suspended_blocker, InitialThread};
+use crate::test_frozen::{child_may_break_away, raw, spawn_suspended_blocker, InitialThread};
 
 /// A suspended `findstr x` blocker, attached the way a frozen
 /// spawn attaches it.
@@ -22,9 +21,24 @@ fn frozen_with(mode: Option<ContainMode>, is_root: bool) -> (std::process::Child
         is_root,
         graceful: crate::graceful::GracefulMechanism::None,
         frozen: true,
+        breakaway: false,
     };
     let attachment = attach(id, raw(&child), prepared).expect("attach a frozen child");
     (child, attachment)
+}
+
+/// The armed guard of a child of this process, as literal bits: the kill and silent breakaway, plus
+/// breakaway when the job the child is in permits it. Not the production flag functions, which
+/// cannot vouch for themselves.
+fn armed_literal(child: &std::process::Child) -> u32 {
+    use windows::Win32::System::JobObjects::{
+        JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
+    };
+    let mut bits = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.0 | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK.0;
+    if child_may_break_away(child) {
+        bits |= JOB_OBJECT_LIMIT_BREAKAWAY_OK.0;
+    }
+    bits
 }
 
 /// The order is the safety argument: releasing the guard first would strand a frozen process if
@@ -41,7 +55,7 @@ fn release_resumes_before_it_disarms_the_guard() {
     let at_resume = observe::take_guard_flags_after_resume().expect("the seam saw the guard after the resume");
     assert_eq!(
         at_resume.0,
-        guard_armed_flags().0,
+        armed_literal(&child),
         "the guard must still be armed when the threads have been resumed"
     );
     assert_eq!(thread.suspend_count(), 0, "the child runs after release");
@@ -50,11 +64,11 @@ fn release_resumes_before_it_disarms_the_guard() {
     child.wait().expect("reap");
 }
 
-/// After release the guard's kill is gone and breakaway stays permitted. (That the child then lives
-/// on is `windows_suspended.rs`' `resumed_child_is_alive_after_the_guard_closes`: a blocker that
-/// does not echo cannot prove it here.)
+/// After release the guard's kill is gone and its breakaway bits stay as armed. (That the child then
+/// lives on is `windows_suspended.rs`' `resumed_child_is_alive_after_the_guard_closes`: a blocker
+/// that does not echo cannot prove it here.)
 #[skuld::test]
-fn release_leaves_breakaway_permitted_and_kill_on_close_cleared() {
+fn release_clears_kill_on_close_and_keeps_the_breakaway_bits() {
     let (mut child, mut attachment) = frozen_uncontained();
     let frozen = attachment.frozen.take().expect("token");
 
@@ -64,10 +78,13 @@ fn release_leaves_breakaway_permitted_and_kill_on_close_cleared() {
     let released = observe::take_guard_flags_after_release().expect("the seam saw the released guard");
     // Literals, not `guard_released_flags()`: the production function cannot vouch for itself.
     // Without `SILENT_BREAKAWAY_OK` every descendant of the resumed child would stay in the guard.
+    let mut expected = JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK.0;
+    if child_may_break_away(&child) {
+        expected |= JOB_OBJECT_LIMIT_BREAKAWAY_OK.0;
+    }
     assert_eq!(
-        released.0,
-        JOB_OBJECT_LIMIT_BREAKAWAY_OK.0 | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK.0,
-        "released: no KILL_ON_JOB_CLOSE, breakaway and silent breakaway permitted"
+        released.0, expected,
+        "released: no KILL_ON_JOB_CLOSE, silent breakaway, and breakaway where the enclosing job permits it"
     );
     drop(attachment);
     child.kill().expect("kill");

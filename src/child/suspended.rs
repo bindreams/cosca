@@ -39,10 +39,11 @@ impl Command {
     /// The child is created suspended and is inside its containment before it executes one
     /// instruction. A child that no cosca job holds (uncontained, a [`TreeWalk`] root, a nested
     /// member) is held by a private guard job while it is frozen, so it dies with this process if
-    /// this process dies. After `resume`, that job has no kill and permits breakaway; the child
-    /// stays a member of it, which [`Child::containment`] does not show (it stays `None`,
-    /// `TreeWalk` or `Delegated`), and `CREATE_BREAKAWAY_FROM_JOB` still works for the child and
-    /// its descendants.
+    /// this process dies. After `resume`, that job has no kill; the child stays a member of it,
+    /// which [`Child::containment`] does not show (it stays `None`, `TreeWalk` or `Delegated`).
+    /// The guard permits `CREATE_BREAKAWAY_FROM_JOB` only where the job the child was already in
+    /// does (or the child was in none), so the child's breakaway is allowed or denied as an
+    /// ordinary spawn's would be.
     ///
     /// **A crash between `CreateProcessW` returning and the child's assignment to its job or guard
     /// can leave a frozen process that nothing kills.** That window exists for every contained

@@ -16,7 +16,14 @@ use crate::error::Error;
 /// drop before that (the owner gave up) kills the child.
 #[derive(Debug)]
 pub(crate) struct Frozen {
-    guard: Option<JobHandle>,
+    guard: Option<Guard>,
+}
+
+/// A guard job and whether it carries `BREAKAWAY_OK`, which its release keeps.
+#[derive(Debug)]
+struct Guard {
+    job: JobHandle,
+    breakaway_ok: bool,
 }
 
 impl Frozen {
@@ -30,10 +37,14 @@ impl Frozen {
         if prepared.assigns_job() {
             return Ok(Some(Frozen { guard: None }));
         }
-        let guard = windows::assign_guard_job(proc_handle).map_err(|e| Error::Containment {
+        // Read before the assignment, which makes the guard the child's innermost job.
+        let breakaway_ok = windows::surroundings_of(proc_handle, prepared.breakaway).permits_breakaway();
+        let job = windows::assign_guard_job(proc_handle, breakaway_ok).map_err(|e| Error::Containment {
             detail: format!("could not assign the frozen child to its guard job: {e}"),
         })?;
-        Ok(Some(Frozen { guard: Some(guard) }))
+        Ok(Some(Frozen {
+            guard: Some(Guard { job, breakaway_ok }),
+        }))
     }
 
     /// Resume the child's threads, then release the guard.
@@ -52,10 +63,12 @@ impl Frozen {
         windows::resume_initial_threads(proc_handle, windows::SuspendCount::ExactlyOne)?;
         let Some(guard) = self.guard else { return Ok(()) };
         #[cfg(test)]
-        observe::record_guard_flags_after_resume(&guard);
-        guard.try_set_limit_flags(windows::guard_released_flags())?;
+        observe::record_guard_flags_after_resume(&guard.job);
+        guard
+            .job
+            .try_set_limit_flags(windows::guard_released_flags(guard.breakaway_ok))?;
         #[cfg(test)]
-        observe::record_guard_flags_after_release(&guard);
+        observe::record_guard_flags_after_release(&guard.job);
         Ok(())
     }
 
@@ -63,7 +76,7 @@ impl Frozen {
     pub(crate) fn guard_contains(&self, pid: u32) -> bool {
         self.guard
             .as_ref()
-            .is_some_and(|guard| windows::job_handle_contains_pid(guard, pid))
+            .is_some_and(|guard| windows::job_handle_contains_pid(&guard.job, pid))
     }
 
     /// Test-only: whether this token owns a guard job.
@@ -75,7 +88,7 @@ impl Frozen {
     /// Test-only: the guard job.
     #[cfg(test)]
     pub(crate) fn guard_for_test(&self) -> Option<&JobHandle> {
-        self.guard.as_ref()
+        self.guard.as_ref().map(|guard| &guard.job)
     }
 }
 

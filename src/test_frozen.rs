@@ -12,11 +12,12 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
 };
 use windows::Win32::System::JobObjects::{
-    JobObjectBasicLimitInformation, QueryInformationJobObject, JOBOBJECT_BASIC_LIMIT_INFORMATION, JOB_OBJECT_LIMIT,
+    IsProcessInJob, JobObjectBasicLimitInformation, QueryInformationJobObject, JOBOBJECT_BASIC_LIMIT_INFORMATION,
+    JOB_OBJECT_LIMIT, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
 };
 use windows::Win32::System::Threading::{
-    OpenThread, ResumeThread, SuspendThread, CREATE_NO_WINDOW, CREATE_SUSPENDED, THREAD_QUERY_LIMITED_INFORMATION,
-    THREAD_SUSPEND_RESUME,
+    GetCurrentProcess, OpenThread, ResumeThread, SuspendThread, CREATE_NO_WINDOW, CREATE_SUSPENDED,
+    THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME,
 };
 
 use crate::containment::windows::JobHandle;
@@ -126,6 +127,48 @@ pub(crate) fn limit_flags(job: &JobHandle) -> JOB_OBJECT_LIMIT {
     })
     .expect("the job handle is live");
     info.LimitFlags
+}
+
+/// The limit flags of this process's innermost job; `None` when it is in none.
+pub(crate) fn own_job_limits() -> Option<JOB_OBJECT_LIMIT> {
+    let mut in_job = windows::core::BOOL(0);
+    // SAFETY: `GetCurrentProcess` is a pseudo-handle, and `in_job` is a valid out-parameter. A null
+    // job handle asks about any job.
+    unsafe { IsProcessInJob(GetCurrentProcess(), None, &mut in_job) }.expect("IsProcessInJob on this process");
+    if !in_job.as_bool() {
+        return None;
+    }
+    let mut info = JOBOBJECT_BASIC_LIMIT_INFORMATION::default();
+    // SAFETY: `info` is a correctly sized out-parameter; `None` asks about the calling process's job.
+    unsafe {
+        QueryInformationJobObject(
+            None,
+            JobObjectBasicLimitInformation,
+            std::ptr::addr_of_mut!(info).cast(),
+            std::mem::size_of::<JOBOBJECT_BASIC_LIMIT_INFORMATION>() as u32,
+            None,
+        )
+    }
+    .expect("query this process's job");
+    Some(info.LimitFlags)
+}
+
+/// Whether a child of this process, made without `CREATE_BREAKAWAY_FROM_JOB`, may use that flag
+/// for its own children: it is in no job, or in one that carries `BREAKAWAY_OK`. A creator job with
+/// silent breakaway puts the child in an ancestor this process cannot read, which counts as no.
+pub(crate) fn child_may_break_away(child: &std::process::Child) -> bool {
+    let mut in_job = windows::core::BOOL(0);
+    // SAFETY: the std child owns a live process handle; a null job handle asks about any job.
+    unsafe { IsProcessInJob(HANDLE(raw(child)), None, &mut in_job) }.expect("IsProcessInJob on the child");
+    if !in_job.as_bool() {
+        return true;
+    }
+    match own_job_limits() {
+        Some(limits) => {
+            limits.0 & JOB_OBJECT_LIMIT_BREAKAWAY_OK.0 != 0 && limits.0 & JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK.0 == 0
+        }
+        None => false,
+    }
 }
 
 /// The raw process handle of a std child, as `attach` takes it.

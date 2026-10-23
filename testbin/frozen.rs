@@ -6,6 +6,9 @@
 //!   test kills this process; whatever then happens to the frozen child is the guard's doing.
 //! - `spawn-breakaway-report <addr> <how>`: be the child of a frozen spawn (or an ordinary one),
 //!   spawn a grandchild with `CREATE_BREAKAWAY_FROM_JOB`, and report whether the OS allowed it.
+//! - `spawn-breakaway-child <addr> <backend> <shape> <how> <ambient>`: spawn `spawn-breakaway-report`
+//!   as a child of the given shape, frozen and resumed or by an ordinary `spawn()`, inside the ambient
+//!   job `ambient` names. The test compares the two `how`s.
 //! - `spawn-measured-child <addr> <backend> <shape> <how> <ambient>`: spawn a child of the given
 //!   shape, frozen and resumed or by an ordinary `spawn()`, and report its containment. The child
 //!   (`spawn-report-job-flags`) spawns a plain grandchild (`report-job-flags`) once told to go, and
@@ -15,7 +18,7 @@ use std::io::{Read, Write};
 
 use windows::Win32::System::JobObjects::{
     JobObjectBasicLimitInformation, QueryInformationJobObject, JOBOBJECT_BASIC_LIMIT_INFORMATION,
-    JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
+    JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
 };
 
 /// A windowless command running `mode extra...` of this binary, through the backend `backend` names.
@@ -110,21 +113,25 @@ fn apply_shape(cmd: &mut cosca::Command, shape: &str) {
     }
 }
 
+/// Put this process into the ambient job `ambient` names: `j0`, a job of its own that forbids
+/// breakaway and carries a flag no other job in the test has; `jbreak`, one that permits breakaway;
+/// or `inherited`, the job the test spawned it into, if any.
+fn enter_ambient(ambient: &str) {
+    let limit = match ambient {
+        "j0" => JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
+        "jbreak" => JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+        "inherited" => return,
+        other => panic!("unknown ambient {other}"),
+    };
+    crate::breakaway::job_with_self(limit).expect("put this process into the ambient job");
+}
+
 /// Spawn the `spawn-report-job-flags` child as the test names, report its containment, tell it to
 /// go, and hold until the test closes the socket.
 ///
-/// `ambient` is `j0` to first put this process into a job of its own, which forbids breakaway and
-/// carries a flag no other job in the test has, or `inherited` to stay in the job the test spawned
-/// it into.
+/// `ambient` is as in [`enter_ambient`].
 pub fn spawn_measured_child(addr: &str, backend: &str, shape: &str, how: &str, ambient: &str) -> ! {
-    match ambient {
-        "j0" => {
-            let limit = JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
-            crate::breakaway::job_with_self(limit).expect("put this process into the ambient job");
-        }
-        "inherited" => {}
-        other => panic!("unknown ambient {other}"),
-    }
+    enter_ambient(ambient);
     let mut sock = crate::ack::connect_control(addr).expect("connect to the test");
     let mut cmd = mode_command(backend, "spawn-report-job-flags", &[addr]);
     cmd.stdin(cosca::Stdio::pipe()).expect("stdin pipe");
@@ -149,6 +156,26 @@ pub fn spawn_measured_child(addr: &str, backend: &str, shape: &str, how: &str, a
     let mut b = [0u8; 1];
     while !matches!(sock.read(&mut b), Ok(0) | Err(_)) {}
     drop(stdin);
+    child.wait().expect("reap the child");
+    std::process::exit(0);
+}
+
+/// Spawn the `spawn-breakaway-report` child as the test names (the child reports, on its own
+/// socket, whether its `CREATE_BREAKAWAY_FROM_JOB` grandchild was allowed), then hold until it exits,
+/// which it does once the test closes that socket.
+pub fn spawn_breakaway_child(addr: &str, backend: &str, shape: &str, how: &str, ambient: &str) -> ! {
+    enter_ambient(ambient);
+    let mut cmd = mode_command(backend, "spawn-breakaway-report", &[addr]);
+    apply_shape(&mut cmd, shape);
+    let child = match how {
+        "frozen" => cmd
+            .spawn_suspended()
+            .expect("spawn the child frozen")
+            .resume()
+            .expect("resume the child"),
+        "ordinary" => cmd.spawn().expect("spawn the child"),
+        other => panic!("unknown how {other}"),
+    };
     child.wait().expect("reap the child");
     std::process::exit(0);
 }

@@ -342,6 +342,7 @@ pub(crate) fn spawn_raw(
         // route for a child this spawn deliberately put in another console.
         graceful: crate::containment::windows::mechanism_from_flags(flags),
         frozen: cmd.flags_request().suspended,
+        breakaway: cmd.flags_request().breakaway_from_job,
     };
     let raw_handle = proc.as_raw_handle();
     let id = match resolve_identity(
