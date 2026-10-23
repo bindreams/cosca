@@ -13,7 +13,9 @@ pub(crate) fn spawn_frozen<T>(
     Err(Error::Unsupported {
         op: "spawn_suspended".into(),
         platform: std::env::consts::OS,
-        detail: "a suspended spawn is implemented on Windows only: a POSIX child cannot be held                  before it runs without a gate in the child before exec, which std's blocking spawn                  does not allow"
+        detail: "a suspended spawn is implemented on Windows only: a POSIX child cannot be held \
+                 before it runs without a gate in the child before exec, which std's blocking spawn \
+                 does not allow"
             .into(),
     })
 }

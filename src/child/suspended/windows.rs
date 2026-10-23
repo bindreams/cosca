@@ -60,7 +60,8 @@ pub(crate) fn spawn_frozen<T>(
         return Err(Error::Unsupported {
             op: "spawn_suspended() with elevate()".into(),
             platform: "windows",
-            detail: "an elevated spawn goes through ShellExecuteEx, which cannot create a process                      suspended; drop one of the two"
+            detail: "an elevated spawn goes through ShellExecuteEx, which cannot create a process \
+                     suspended; drop one of the two"
                 .into(),
         });
     }
