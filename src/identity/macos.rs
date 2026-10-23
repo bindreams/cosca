@@ -398,8 +398,12 @@ pub(crate) mod ppid_fault {
 
     use super::ReadErr;
 
+    /// What [`force_ppid_with`] answers.
+    type Reads = Box<dyn FnMut() -> Result<u32, ReadErr>>;
+
     thread_local! {
         static FORCED: RefCell<Vec<Result<u32, ReadErr>>> = const { RefCell::new(Vec::new()) };
+        static READS: RefCell<Option<Reads>> = const { RefCell::new(None) };
     }
 
     #[must_use = "dropping this immediately disarms the force; bind it for the probe's duration"]
@@ -411,17 +415,34 @@ pub(crate) mod ppid_fault {
         Forced(())
     }
 
+    /// While the guard lives, every parent read on this thread that no queued force answers
+    /// answers what `reads` does at that read.
+    pub(crate) fn force_ppid_with(reads: impl FnMut() -> Result<u32, ReadErr> + 'static) -> ForcedReads {
+        READS.with(|r| *r.borrow_mut() = Some(Box::new(reads)));
+        ForcedReads(())
+    }
+
     impl Drop for Forced {
         fn drop(&mut self) {
             FORCED.with(|f| f.borrow_mut().clear());
         }
     }
 
+    #[must_use = "the reads are real again as soon as the guard is dropped"]
+    pub(crate) struct ForcedReads(());
+
+    impl Drop for ForcedReads {
+        fn drop(&mut self) {
+            READS.with(|r| r.borrow_mut().take());
+        }
+    }
+
     pub(super) fn take() -> Option<Result<u32, ReadErr>> {
-        FORCED.with(|f| {
+        let queued = FORCED.with(|f| {
             let mut forced = f.borrow_mut();
             (!forced.is_empty()).then(|| forced.remove(0))
-        })
+        });
+        queued.or_else(|| READS.with(|r| r.borrow_mut().as_mut().map(|reads| reads())))
     }
 }
 
