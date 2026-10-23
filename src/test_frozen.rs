@@ -18,8 +18,9 @@ use windows::Win32::System::JobObjects::{
 use windows::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
 use windows::Win32::System::Memory::{VirtualAllocEx, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
 use windows::Win32::System::Threading::{
-    CreateRemoteThread, GetThreadId, OpenThread, ResumeThread, SuspendThread, CREATE_NO_WINDOW, CREATE_SUSPENDED,
-    LPTHREAD_START_ROUTINE, THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME,
+    CreateRemoteThread, GetThreadId, OpenProcess, OpenThread, ResumeThread, SuspendThread, TerminateProcess,
+    WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED, INFINITE, LPTHREAD_START_ROUTINE, PROCESS_SYNCHRONIZE,
+    PROCESS_TERMINATE, THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME,
 };
 
 use crate::containment::windows::JobHandle;
@@ -296,5 +297,44 @@ impl RootTeardownRecorder {
 impl Drop for RootTeardownRecorder {
     fn drop(&mut self) {
         ROOT_TEARDOWNS.with(|c| c.set(None));
+    }
+}
+
+/// An owned handle on a process that can wait for it and end it, opened while the caller still
+/// holds the process, so the pid names nothing else.
+pub(crate) struct Remote(HANDLE);
+
+impl Remote {
+    pub(crate) fn open(pid: u32) -> Remote {
+        // SAFETY: plain Win32 call; the handle is closed on drop.
+        let handle =
+            unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, false, pid) }.expect("open the child");
+        Remote(handle)
+    }
+
+    /// Block until the process is gone; the process object signals, nothing here is a timer.
+    pub(crate) fn wait_for_death(&self) {
+        // SAFETY: `self.0` is live.
+        unsafe { WaitForSingleObject(self.0, INFINITE) };
+    }
+
+    /// Whether the process is gone now. A single non-blocking look, used only after a drop that
+    /// kills synchronously, so it is not a bet that enough time has passed.
+    pub(crate) fn is_dead_now(&self) -> bool {
+        // SAFETY: `self.0` is live.
+        unsafe { WaitForSingleObject(self.0, 0) }.0 == 0
+    }
+
+    pub(crate) fn end(&self) {
+        // SAFETY: `self.0` is live with `PROCESS_TERMINATE`.
+        unsafe { TerminateProcess(self.0, 1) }.expect("end the child");
+        self.wait_for_death();
+    }
+}
+
+impl Drop for Remote {
+    fn drop(&mut self) {
+        // SAFETY: owned, closed once.
+        unsafe { _ = CloseHandle(self.0) };
     }
 }

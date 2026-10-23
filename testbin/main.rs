@@ -45,7 +45,7 @@ mod setuid_stdin_block;
 #[path = "breakaway.rs"]
 mod breakaway;
 
-/// The frozen-spawn helper modes (`spawn-frozen-report`, `spawn-breakaway-report`, `spawn-breakaway-child`,
+/// The frozen-spawn helper modes (`spawn-frozen-report`, `spawn-frozen-report-async`, `spawn-breakaway-report`, `spawn-breakaway-child`,
 /// `spawn-measured-child`, `spawn-report-pid` and `report-pid`).
 #[cfg(windows)]
 #[path = "frozen.rs"]
@@ -1213,6 +1213,8 @@ fn main() {
         "try-env-block" => env_block::try_block(&args[2..]),
         #[cfg(windows)]
         "spawn-frozen-report" => frozen::spawn_frozen_report(&args[2], &args[3]),
+        #[cfg(all(windows, feature = "tokio"))]
+        "spawn-frozen-report-async" => frozen::spawn_frozen_report_async(&args[2], &args[3]),
         #[cfg(windows)]
         "spawn-breakaway-report" => frozen::spawn_breakaway_report(&args[2]),
         #[cfg(windows)]

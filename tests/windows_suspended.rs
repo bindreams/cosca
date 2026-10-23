@@ -5,7 +5,8 @@
 //! frozen, and a resumed child that must behave like an ordinary one.
 //!
 //! Every child is windowless (`no_window`), so no test opens a console on a developer's desktop.
-//! Each spawn runs on both sync backends: argv (std) and `executable()` (raw `CreateProcessW`).
+//! Each spawn runs on both backends: argv (std) and `executable()` (raw `CreateProcessW`). With the
+//! `tokio` feature, the async API gets the same two legs where a helper process matters.
 //!
 //! The death tests are named `death_watch_*`: their waits are on a process handle with no timeout
 //! of their own, and `.config/nextest.toml` bounds that name pattern, so a containment that stops
@@ -22,6 +23,8 @@ mod common;
 
 #[cfg(windows)]
 use common::{accept_or_die, bind_report, read_report_line, report_field, silence, testbin, ACK_ENV};
+#[cfg(all(windows, feature = "tokio"))]
+use common::{accept_or_die_async, bind_async_listener, silence_async};
 
 #[cfg(windows)]
 use windows::core::{BOOL, PCWSTR};
@@ -58,6 +61,26 @@ fn testbin_command(backend: &str, mode: &str, addr: &str, extra: &[&str]) -> cos
     cmd.args(extra);
     cmd.env(ACK_ENV, "1");
     silence(&mut cmd);
+    cmd.no_window();
+    cmd
+}
+
+#[cfg(all(windows, feature = "tokio"))]
+/// [`testbin_command`] for the async builder.
+fn testbin_command_async(backend: &str, mode: &str, addr: &str, extra: &[&str]) -> cosca::tokio::Command {
+    let mut cmd = cosca::tokio::Command::new();
+    match backend {
+        "argv" => {
+            cmd.args([testbin(), mode, addr]);
+        }
+        "executable" => {
+            cmd.executable(testbin()).args(["cosca_testbin", mode, addr]);
+        }
+        other => panic!("unknown backend {other}"),
+    }
+    cmd.args(extra);
+    cmd.env(ACK_ENV, "1");
+    silence_async(&mut cmd);
     cmd.no_window();
     cmd
 }
@@ -104,12 +127,12 @@ impl Drop for Watch {
 }
 
 #[cfg(windows)]
-/// A helper parent holds a contained frozen child, then is killed (the helper alone, through its
-/// `Child`). The helper is not contained, so nothing but the frozen child's own containment job,
-/// closed with the helper's handle table, can end the child.
-fn contained_frozen_child_dies_with_its_parent(backend: &str) {
+/// A helper parent (`mode`: the sync or the async API) holds a contained frozen child, then is
+/// killed (the helper alone, through its `Child`). The helper is not contained, so nothing but the
+/// frozen child's own containment job, closed with the helper's handle table, can end the child.
+fn contained_frozen_child_dies_with_its_parent(mode: &str, backend: &str) {
     let (listener, addr) = bind_report();
-    let mut cmd = testbin_command(backend, "spawn-frozen-report", &addr, &[backend]);
+    let mut cmd = testbin_command(backend, mode, &addr, &[backend]);
     let mut helper = cmd.spawn().expect("spawn the helper parent");
     let mut sock: TcpStream = accept_or_die(&listener, &mut helper);
     let report = read_report_line(&sock);
@@ -130,7 +153,15 @@ fn contained_frozen_child_dies_with_its_parent(backend: &str) {
 #[skuld::test]
 fn death_watch_contained_frozen_child_dies_with_its_parent() {
     for backend in BACKENDS {
-        contained_frozen_child_dies_with_its_parent(backend);
+        contained_frozen_child_dies_with_its_parent("spawn-frozen-report", backend);
+    }
+}
+
+#[cfg(all(windows, feature = "tokio"))]
+#[skuld::test]
+fn death_watch_async_contained_frozen_child_dies_with_its_parent() {
+    for backend in BACKENDS {
+        contained_frozen_child_dies_with_its_parent("spawn-frozen-report-async", backend);
     }
 }
 
@@ -151,6 +182,26 @@ fn a_resumed_child_runs() {
         common::assert_echoes(&mut sock, "the resumed child");
         child.kill().expect("kill");
         child.wait().expect("reap");
+    }
+}
+
+#[cfg(all(windows, feature = "tokio"))]
+/// An async resumed child runs.
+#[skuld::test]
+async fn an_async_resumed_child_runs() {
+    for backend in BACKENDS {
+        let (listener, addr) = bind_async_listener();
+        let mut cmd = testbin_command_async(backend, "control-echo-pid", &addr, &["C"]);
+
+        let frozen = cmd.spawn_suspended().expect("spawn suspended");
+        let mut child = frozen.resume().expect("resume");
+
+        let mut sock = accept_or_die_async(&listener, &mut child).await;
+        let (tag, pid) = common::read_tag_and_pid(&mut sock);
+        assert_eq!((tag, pid), (b'C', child.id().pid()), "{backend}");
+        common::assert_echoes(&mut sock, "the resumed child");
+        child.kill().expect("kill");
+        child.wait().await.expect("reap");
     }
 }
 

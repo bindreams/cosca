@@ -338,6 +338,15 @@ impl ProcSource {
         }
     }
 
+    /// The process handle, borrowed from `self`. `None` once tokio has reaped the child and closed it.
+    #[cfg(windows)]
+    pub(crate) fn raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+        match self {
+            ProcSource::Tokio { child, .. } => child.raw_handle(),
+            ProcSource::Raw(raw) => Some(raw.raw_handle()),
+        }
+    }
+
     /// The child as its spawn holds it, with the handshake pidfd. `None` for a forgotten backend.
     #[cfg(target_os = "linux")]
     pub(crate) fn child_handle(&self, pid: u32) -> Option<crate::containment::ChildHandle<'_>> {

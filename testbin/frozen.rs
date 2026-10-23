@@ -2,6 +2,7 @@
 //! `tests/windows_suspended.rs` measures from outside.
 //!
 //! - `spawn-frozen-report`: hold a contained frozen child and block, for the test to kill.
+//!   `spawn-frozen-report-async` does the same through the async API (with the `tokio` feature).
 //! - `spawn-breakaway-report` and `spawn-breakaway-child`: whether a child's
 //!   `CREATE_BREAKAWAY_FROM_JOB` grandchild is allowed.
 //! - `spawn-measured-child`, `spawn-report-pid` and `report-pid`: a plain grandchild whose job
@@ -16,6 +17,29 @@ fn mode_command(backend: &str, mode: &str, extra: &[&str]) -> cosca::Command {
     let exe = std::env::current_exe().expect("own path");
     let exe = exe.to_str().expect("UTF-8 path").to_owned();
     let mut cmd = cosca::Command::new();
+    match backend {
+        "argv" => {
+            cmd.args([exe.as_str(), mode]);
+        }
+        "executable" => {
+            cmd.executable(exe.as_str()).args(["cosca_testbin", mode]);
+        }
+        other => panic!("unknown backend {other}"),
+    }
+    cmd.args(extra);
+    cmd.env(crate::ack::ACK_ENV, "1");
+    cmd.stdout(cosca::Stdio::null()).expect("null stdout");
+    cmd.stderr(cosca::Stdio::null()).expect("null stderr");
+    cmd.no_window();
+    cmd
+}
+
+/// [`mode_command`] for the async builder.
+#[cfg(feature = "tokio")]
+fn mode_command_async(backend: &str, mode: &str, extra: &[&str]) -> cosca::tokio::Command {
+    let exe = std::env::current_exe().expect("own path");
+    let exe = exe.to_str().expect("UTF-8 path").to_owned();
+    let mut cmd = cosca::tokio::Command::new();
     match backend {
         "argv" => {
             cmd.args([exe.as_str(), mode]);
@@ -53,10 +77,43 @@ pub fn spawn_frozen_report(addr: &str, backend: &str) -> ! {
     )
     .expect("report");
     sock.flush().expect("flush");
+    hold_until_killed(sock, frozen)
+}
+
+/// [`spawn_frozen_report`] through the async API, on a runtime of its own.
+#[cfg(feature = "tokio")]
+pub fn spawn_frozen_report_async(addr: &str, backend: &str) -> ! {
+    let mut sock = crate::ack::connect_control(addr).expect("connect to the test");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build the helper's runtime");
+    let frozen = rt.block_on(async {
+        let mut cmd = mode_command_async(backend, "control-block", &["127.0.0.1:9", "G"]);
+        cmd.contain();
+        cmd.spawn_suspended().expect("spawn the async frozen grandchild")
+    });
+    let child_pid = frozen.id().pid();
+    writeln!(
+        sock,
+        "frozen pid={child_pid} containment={:?} job={}",
+        frozen.test_containment(),
+        u8::from(frozen.test_job_handle_contains_self()),
+    )
+    .expect("report");
+    sock.flush().expect("flush");
+    // `rt` stays alive: `hold_until_killed` never returns.
+    hold_until_killed(sock, frozen)
+}
+
+/// Wait for the test's go byte, which it sends once it has opened its handle on the frozen child,
+/// then block until the test kills this process. `held` is never dropped, so the child's
+/// containment job alone must kill it.
+fn hold_until_killed<T>(mut sock: std::net::TcpStream, held: T) -> ! {
+    let _held = held;
     // The test opens its handle on the frozen child now, while this process still holds it.
     let mut go = [0u8; 1];
     sock.read_exact(&mut go).expect("wait for the test's go");
-    // Block forever; never dropped, so the child's containment job alone must kill it.
     let mut b = [0u8; 1];
     loop {
         if matches!(sock.read(&mut b), Ok(0) | Err(_)) {

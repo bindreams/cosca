@@ -18,7 +18,7 @@ pub(crate) mod test_runtime;
 #[path = "tokio/wait.rs"]
 pub(crate) mod wait;
 
-pub use child::Child;
+pub use child::{Child, SuspendedChild};
 pub use command::Command;
 pub use process::Process;
 pub use stdio::{ChildStderr, ChildStdin, ChildStdout};
