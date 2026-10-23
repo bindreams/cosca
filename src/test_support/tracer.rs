@@ -448,6 +448,14 @@ impl Pending {
         self.attach_pid_number(pid)
     }
 
+    /// [`attach`](Pending::attach) for a tracee no handle holds yet, such as the child of a spawn
+    /// still running: the test must not reap it through anything but that spawn while the helper
+    /// holds it.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn attach_unheld(self, pid: u32) -> TracerHelper<'static> {
+        self.attach_pid_number(pid)
+    }
+
     fn attach_pid(self, tracee: &crate::Child) -> TracerHelper<'_> {
         self.attach_pid_number(tracee.id().pid())
     }

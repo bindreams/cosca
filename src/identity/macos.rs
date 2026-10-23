@@ -90,6 +90,8 @@ pub(crate) enum ReadPurpose {
     SecondPeek,
     /// The re-read after an exit watch is armed on a pid: is it still the child?
     Arm,
+    /// Whether a pid whose unique id is not known yet was forked by this process.
+    Origin,
 }
 
 /// The pid launchd runs as, the parent of every orphan.
@@ -249,6 +251,57 @@ pub(crate) fn held_by(pid: RawPid, expected: u64, purpose: ReadPurpose) -> Held 
             Held::Gone
         }
         Err(ReadErr::Refused(errno)) => Held::Refused(errno),
+    }
+}
+
+/// What [`origin`] saw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Origin {
+    /// This process forked it: its parent is this process, or was when a tracer attached.
+    Ours,
+    /// Another process's, or not the same process from one read to the next.
+    NotOurs,
+    /// No process has the pid.
+    Gone,
+    /// A unique-id read failed with this errno.
+    Refused(i32),
+    /// The `kinfo_proc` read was refused.
+    Unreadable,
+}
+
+/// Whether the process `pid` names was forked by this process, for a pid whose unique id is not
+/// known yet. A tracer takes a child from its parent: the child's `p_ppid` names the tracer, and
+/// `p_oppid` keeps the parent it had at the attach (xnu `mach_process.c`, `PT_ATTACH`). So the child
+/// is ours when either names this process and its unique id is above this process's own, which
+/// excludes a stale `p_oppid` left by an earlier holder of this process's pid: ids are allocated in
+/// increasing order and never reused, so only a process created after this one has a higher one.
+/// The `kinfo_proc` read is between two unique-id reads, as in [`held_by`].
+pub(crate) fn origin(pid: RawPid) -> Origin {
+    let own = match own_unique_id() {
+        Ok(own) => own,
+        Err(errno) => return Origin::Refused(errno),
+    };
+    let unique = match uniq_info(pid, ReadPurpose::Origin) {
+        UniqRead::Found(info) => info.unique_id,
+        UniqRead::Gone => return Origin::Gone,
+        UniqRead::Refused(errno) => return Origin::Refused(errno),
+    };
+    let info = match kinfo::kinfo(pid) {
+        Resolved::Found(info) => info,
+        Resolved::Gone => return Origin::Gone,
+        Resolved::Unknown => return Origin::Unreadable,
+    };
+    match uniq_info(pid, ReadPurpose::Origin) {
+        UniqRead::Found(again) if again.unique_id == unique => {}
+        UniqRead::Found(_) => return Origin::NotOurs,
+        UniqRead::Gone => return Origin::Gone,
+        UniqRead::Refused(errno) => return Origin::Refused(errno),
+    }
+    let me = std::process::id() as libc::pid_t;
+    if unique > own && (info.kp_proc.p_oppid == me || info.e_ppid() == me) {
+        Origin::Ours
+    } else {
+        Origin::NotOurs
     }
 }
 
@@ -611,3 +664,7 @@ pub(crate) mod fault {
 #[cfg(test)]
 #[path = "macos/ppid_tests.rs"]
 mod ppid_tests;
+
+#[cfg(test)]
+#[path = "macos/origin_tests.rs"]
+mod origin_tests;
