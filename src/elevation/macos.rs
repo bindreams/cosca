@@ -186,20 +186,22 @@ pub(crate) fn build_shim_script(
     wrap_do_shell_script(&shell_command, arg_max)
 }
 
-/// The argv, refused unless it is one `do shell script` can exec. `exec`ing the program sets
-/// argv[0] to its own path, so an argv[0] distinct from a set `executable()` cannot survive.
+/// macOS graphical elevation's words for [`super::elevation_argv`]'s refusals.
+pub(crate) const ARGV_REFUSALS: super::ArgvRefusals = super::ArgvRefusals {
+    platform: "macos",
+    op_prefix: "macOS graphical elevation",
+    commandline: "the command must be an argv (set .args([...])); a raw command line cannot be \
+                  re-quoted for /bin/sh without guessing its word boundaries",
+    setter: "name the elevated program as argv[0] (set .args([program, ...])): `do shell script` \
+             execs argv[0] as written, so neither executable()'s search nor raw_executable()'s exact \
+             file can be honoured",
+    argv0: "`do shell script` execs the program, which sets argv[0] to its own path; a separate \
+            argv[0] cannot survive elevation",
+};
+
+/// The argv, refused unless it is one `do shell script` can exec.
 fn checked_argv(cmd: &Command) -> Result<&[OsString], Error> {
-    super::elevation_argv(
-        cmd,
-        &super::ArgvRefusals {
-            platform: "macos",
-            op_prefix: "macOS graphical elevation",
-            commandline: "the command must be an argv (set .args([...])); a raw command line cannot be \
-                          re-quoted for /bin/sh without guessing its word boundaries",
-            argv0: "`do shell script` execs the program, which sets argv[0] to its own path; a separate \
-                    argv[0] cannot survive elevation",
-        },
-    )
+    super::elevation_argv(cmd, &ARGV_REFUSALS)
 }
 
 /// Program + args + the directory to run them in, honoring `executable()`. A `raw_executable()`

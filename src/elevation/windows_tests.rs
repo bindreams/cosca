@@ -265,6 +265,78 @@ fn already_elevated_inherit_only_is_run_as_is() {
     ));
 }
 
+/// `set` names each program on a command whose argv[0] is that program too, root or not, and with
+/// whatever else the argv gate, the NUL checks and the batch gate would refuse; each must be
+/// refused in the runas words. Only `reject_unsupported_config` comes first.
+fn assert_setter_refused(setter: &str, set: fn(&mut Command, &str), programs: &[&str]) {
+    let words = &super::ARGV_REFUSALS;
+    for elevated in [false, true] {
+        for &program in programs {
+            let mut plain = Command::new();
+            plain.args([program, "/all"]);
+            let mut line = Command::new();
+            line.commandline("whoami /all");
+            let mut nul_arg = Command::new();
+            nul_arg.args([std::ffi::OsString::from(program), nul_between("a", "b")]);
+            let mut nul_cwd = Command::new();
+            nul_cwd.args([program]).current_dir(nul_between(r"C:\w", "x"));
+            for (what, mut c) in [
+                ("a plain argv", plain),
+                ("commandline()", line),
+                ("no input", Command::new()),
+                ("a NUL in an argument", nul_arg),
+                ("a NUL in current_dir()", nul_cwd),
+            ] {
+                set(&mut c, program);
+                c.elevate();
+                let at = format!("elevated={elevated}, {setter}({program:?}), {what}");
+                match super::plan_runas(&c, &win_host(elevated)) {
+                    Err(Error::Unsupported { op, platform, detail }) => {
+                        assert_eq!(platform, "windows", "{at}");
+                        assert_eq!(op, format!("elevation of a program set by {setter}()"), "{at}");
+                        assert_eq!(detail, words.setter, "{at}");
+                    }
+                    other => panic!("{at}: expected the setter refusal, got {:?}", other.map(|_| "Ok")),
+                }
+            }
+            // `reject_unsupported_config` is the one gate ahead of it.
+            let mut env = Command::new();
+            env.args([program]).env("A", "1");
+            set(&mut env, program);
+            env.elevate();
+            let detail = unsupported_detail(super::plan_runas(&env, &win_host(elevated)).map(|_| ()));
+            assert!(
+                detail.contains("environment"),
+                "elevated={elevated}, {setter}({program:?}): {detail}"
+            );
+        }
+    }
+}
+
+/// Mutant: the gate's setter rule matches `raw_executable()` alone.
+#[skuld::test]
+fn an_elevated_executable_is_refused() {
+    assert_setter_refused(
+        "executable",
+        |c, p| {
+            c.executable(p);
+        },
+        &[r"C:\Windows\System32\whoami.exe", "whoami", r"C:\t\setup.bat"],
+    );
+}
+
+/// Mutant: the gate's setter rule matches `executable()` alone.
+#[skuld::test]
+fn an_elevated_raw_executable_is_refused() {
+    assert_setter_refused(
+        "raw_executable",
+        |c, p| {
+            c.raw_executable(p);
+        },
+        &[r"C:\Windows\System32\whoami.exe", "tool.exe", r"C:\t\setup.bat"],
+    );
+}
+
 /// Kills replacing `elevated_program`'s `Exact` arm with `let program = token;`, which hands
 /// `ShellExecuteEx` a path-less `lpFile` to search (see `absolutise_exact`'s doc): the result must
 /// be absolute, and for a relative input must DIFFER from the token as written.

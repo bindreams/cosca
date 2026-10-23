@@ -339,16 +339,19 @@ impl Drop for ComInit {
 /// The argv runas can work from at all. Split from [`elevated_program`] and [`elevated_params`] so
 /// the program's NUL check can sit between them — see [`plan_runas`].
 fn elevated_argv(cmd: &Command) -> Result<&[OsString], Error> {
-    super::elevation_argv(
-        cmd,
-        &super::ArgvRefusals {
-            platform: "windows",
-            op_prefix: "elevation",
-            commandline: "runas elevation requires an argv command (set .args([...]))",
-            argv0: "ShellExecuteEx(runas) cannot set an argv[0] independent of the loaded image",
-        },
-    )
+    super::elevation_argv(cmd, &ARGV_REFUSALS)
 }
+
+/// The runas launch's words for [`super::elevation_argv`]'s refusals.
+pub(crate) const ARGV_REFUSALS: super::ArgvRefusals = super::ArgvRefusals {
+    platform: "windows",
+    op_prefix: "elevation",
+    commandline: "runas elevation requires an argv command (set .args([...]))",
+    setter: "name the elevated program as argv[0] (set .args([program, ...])): ShellExecuteEx(runas) \
+             loads argv[0] as written, so neither executable()'s search nor raw_executable()'s exact \
+             file can be honoured",
+    argv0: "ShellExecuteEx(runas) cannot set an argv[0] independent of the loaded image",
+};
 
 /// The loaded image. Honors `executable()`. A `raw_executable()` program is additionally COMPLETED to an absolute
 /// path — see the `Exact` arm below for why that is the opposite of searching for it.

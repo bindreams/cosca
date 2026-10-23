@@ -867,3 +867,7 @@ mod cwd;
 #[cfg(unix)]
 #[path = "posix_tests/front.rs"]
 mod front;
+
+#[cfg(unix)]
+#[path = "posix_tests/setter.rs"]
+mod setter;

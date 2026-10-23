@@ -35,7 +35,7 @@ fn under(mut c: Command, backend: Backend) -> Command {
 
 /// A Linux host offering every CLI backend, for a request that names one; its `pkexec` is polkit
 /// 121, pinned by a descriptor detection would have opened (here, on `/dev/null`).
-fn every_backend_host() -> Host {
+pub(super) fn every_backend_host() -> Host {
     Host {
         available: BackendSet {
             sudo: Some(PathBuf::from("/usr/bin/sudo")),
