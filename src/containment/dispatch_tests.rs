@@ -160,6 +160,8 @@ fn nested_attach_is_delegated() {
             marker: None,
             #[cfg(windows)]
             graceful: crate::containment::windows::mechanism_from_flags(crate::containment::windows::group_flags()),
+            #[cfg(windows)]
+            frozen: false,
         };
         #[cfg(windows)]
         let proc_handle = {
@@ -729,4 +731,128 @@ fn kill_on_drop_true_leaves_a_cgroup_leaf_armed() {
         b"1",
         "the default is still a kill-on-drop teardown"
     );
+}
+
+// ===== frozen attach (Windows) =====
+
+#[cfg(windows)]
+mod frozen_attach {
+    use crate::containment::dispatch::{attach, Attached, Attachment, Prepared};
+    use crate::containment::windows::fault::{force_next, Step};
+    use crate::containment::{ContainMode, Containment};
+    use crate::error::Error;
+    use crate::test_frozen::{raw, spawn_suspended_blocker, InitialThread};
+
+    const ERROR_ACCESS_DENIED: u32 = 5;
+
+    fn prepared(mode: Option<ContainMode>, is_root: bool, frozen: bool) -> Prepared {
+        Prepared {
+            mode,
+            is_root,
+            graceful: crate::graceful::GracefulMechanism::None,
+            frozen,
+        }
+    }
+
+    fn attach_suspended(child: &std::process::Child, prepared: Prepared) -> Result<Attachment, Error> {
+        let crate::identity::Resolved::Found(id) = crate::identity::ProcessId::of(child.id()) else {
+            panic!("the suspended child must be readable");
+        };
+        attach(id, raw(child), prepared)
+    }
+
+    fn dispose(mut child: std::process::Child) {
+        child.kill().expect("kill the test child");
+        child.wait().expect("reap the test child");
+    }
+
+    /// A frozen Strongest root is assigned its containment job and stays suspended.
+    #[skuld::test]
+    fn death_watch_attach_frozen_assigns_a_strongest_roots_job_and_leaves_the_thread_suspended() {
+        let child = spawn_suspended_blocker();
+        let thread = InitialThread::of(child.id());
+
+        let attachment = attach_suspended(&child, prepared(Some(ContainMode::Strongest), true, true)).expect("attach");
+
+        assert_eq!(attachment.containment, Containment::JobObject);
+        assert!(matches!(attachment.attached, Attached::JobObject(_)));
+        assert_eq!(thread.suspend_count(), 1, "a frozen attach must not resume");
+        drop(attachment);
+        child
+            .wait_with_output()
+            .expect("the job's close killed the frozen child");
+    }
+
+    /// A frozen root needs its job to be held, so a failed assignment fails the attach instead of
+    /// falling back to `TreeWalk`, which would leave nothing to kill it.
+    #[skuld::test]
+    fn attach_frozen_fails_when_the_strongest_assignment_fails_instead_of_falling_back_to_treewalk() {
+        let child = spawn_suspended_blocker();
+        let _forced = force_next(Step::Assign, ERROR_ACCESS_DENIED);
+
+        let err = attach_suspended(&child, prepared(Some(ContainMode::Strongest), true, true))
+            .err()
+            .expect("a frozen attach with no job must fail");
+
+        assert!(matches!(err, Error::Containment { .. }), "got {err:?}");
+        dispose(child);
+    }
+
+    /// The ordinary attach is unchanged: it resumes, and a failed assignment still degrades to
+    /// `TreeWalk`.
+    #[skuld::test]
+    fn attach_without_hold_still_resumes_and_still_falls_back_to_treewalk() {
+        let child = spawn_suspended_blocker();
+        let thread = InitialThread::of(child.id());
+        let _forced = force_next(Step::Assign, ERROR_ACCESS_DENIED);
+
+        let attachment = attach_suspended(&child, prepared(Some(ContainMode::Strongest), true, false)).expect("attach");
+
+        assert_eq!(attachment.containment, Containment::TreeWalk);
+        assert_eq!(thread.suspend_count(), 0, "the ordinary attach resumes the child");
+        dispose(child);
+    }
+
+    /// Every shape without a cosca job of its own (`TreeWalk` root, nested member, uncontained) is
+    /// left frozen and unjobbed: `attach` adds no job and keeps the containment it would report if
+    /// the child were not frozen.
+    #[skuld::test]
+    fn attach_frozen_gives_treewalk_nested_and_uncontained_shapes_no_job_and_leaves_them_suspended() {
+        let shapes = [
+            (
+                "treewalk root",
+                Some(ContainMode::TreeWalk),
+                true,
+                Containment::TreeWalk,
+            ),
+            (
+                "nested strongest member",
+                Some(ContainMode::Strongest),
+                false,
+                Containment::Delegated,
+            ),
+            (
+                "nested treewalk member",
+                Some(ContainMode::TreeWalk),
+                false,
+                Containment::Delegated,
+            ),
+            ("uncontained", None, false, Containment::None),
+        ];
+        for (name, mode, is_root, expected) in shapes {
+            let child = spawn_suspended_blocker();
+            let thread = InitialThread::of(child.id());
+
+            let attachment = attach_suspended(&child, prepared(mode, is_root, true)).expect(name);
+
+            assert_eq!(attachment.containment, expected, "{name}");
+            assert!(
+                !matches!(attachment.attached, Attached::JobObject(_)),
+                "{name}: no job of its own"
+            );
+            assert_eq!(thread.suspend_count(), 1, "{name}: a frozen attach must not resume");
+            drop(attachment);
+            dispose(child);
+        }
+    }
 }

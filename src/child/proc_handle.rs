@@ -51,6 +51,15 @@ impl ProcHandle {
         shared.adopted_unique()
     }
 
+    /// The process handle, borrowed from `self`.
+    #[cfg(windows)]
+    pub(crate) fn raw_handle(&self) -> std::os::windows::io::RawHandle {
+        match self {
+            ProcHandle::Std(s) => s.raw_handle(),
+            ProcHandle::Raw(r) => r.raw_handle(),
+        }
+    }
+
     /// Whether this handle itself has reaped the root: [`wait`](Self::wait),
     /// [`try_wait`](Self::try_wait) or [`wait_deadline`](Self::wait_deadline) recorded the exit.
     /// True from the moment the reap is recorded, even before the recording waiter returns. A reap by someone else is not seen here.
@@ -195,6 +204,8 @@ impl ProcHandle {
         use crate::error::ChildFate;
         #[cfg(all(test, unix))]
         crate::child::fault::note_root_teardown();
+        #[cfg(all(test, windows))]
+        crate::test_frozen::note_root_teardown();
         match self {
             ProcHandle::Std(s) => {
                 #[cfg(unix)]

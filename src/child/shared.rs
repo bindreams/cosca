@@ -273,6 +273,13 @@ impl SharedChild {
         child.as_handle().try_clone_to_owned()
     }
 
+    /// The process handle, borrowed from `self`.
+    #[cfg(windows)]
+    pub(crate) fn raw_handle(&self) -> std::os::windows::io::RawHandle {
+        use std::os::windows::io::AsRawHandle;
+        self.handle.as_raw_handle()
+    }
+
     /// Whether this handle's own wait has recorded the reap, read under the lock. A reap by
     /// someone else is not seen here.
     pub(crate) fn is_reaped(&self) -> bool {

@@ -383,3 +383,90 @@ fn a_spawn_denial_without_a_breakaway_request_is_never_reclassified() {
         }
     }
 }
+
+/// A suspended request adds `CREATE_SUSPENDED` to every containment shape on both backends, so the
+/// child exists frozen however it is contained. A shape that drops it would run before the caller
+/// could record its identity.
+#[skuld::test]
+fn suspended_request_adds_create_suspended_for_every_containment_shape() {
+    let treewalk = ContainRequest {
+        mode: Some(ContainMode::TreeWalk),
+        nesting: Nesting::Mark,
+    };
+    let suspended = FlagsRequest {
+        suspended: true,
+        ..Default::default()
+    };
+    for backend in [SpawnBackend::Std, SpawnBackend::Raw] {
+        let shapes = [
+            ("uncontained", uncontained(), false),
+            ("strongest root", contained(), true),
+            ("strongest nested member", contained(), false),
+            ("treewalk root", treewalk, true),
+            ("treewalk nested member", treewalk, false),
+        ];
+        for (name, contain, is_root) in shapes {
+            let w = word(&contain, suspended, is_root, backend);
+            assert_ne!(
+                w & CREATE_SUSPENDED.0,
+                0,
+                "{name} on {backend:?} must be created suspended"
+            );
+        }
+    }
+}
+
+/// Without the request the word is exactly as before: an uncontained spawn is not suspended, and
+/// a `TreeWalk` root is not either.
+#[skuld::test]
+fn no_suspended_request_leaves_the_word_without_create_suspended_unchanged() {
+    let treewalk = ContainRequest {
+        mode: Some(ContainMode::TreeWalk),
+        nesting: Nesting::Mark,
+    };
+    for backend in [SpawnBackend::Std, SpawnBackend::Raw] {
+        assert_eq!(
+            word(&uncontained(), FlagsRequest::default(), false, backend) & CREATE_SUSPENDED.0,
+            0
+        );
+        assert_eq!(
+            word(&treewalk, FlagsRequest::default(), true, backend) & CREATE_SUSPENDED.0,
+            0
+        );
+    }
+}
+
+/// `CREATE_SUSPENDED` is the only bit a suspended request adds. In particular it adds no process
+/// group, which would change the cooperative signal an uncontained child can be sent.
+#[skuld::test]
+fn suspended_request_adds_no_other_bit_so_the_graceful_mechanism_is_unchanged() {
+    for (contain, is_root) in [(uncontained(), false), (contained(), true), (contained(), false)] {
+        let plain = word(&contain, FlagsRequest::default(), is_root, SpawnBackend::Std);
+        let frozen = word(
+            &contain,
+            FlagsRequest {
+                suspended: true,
+                ..Default::default()
+            },
+            is_root,
+            SpawnBackend::Std,
+        );
+        assert_eq!(frozen & !CREATE_SUSPENDED.0, plain & !CREATE_SUSPENDED.0);
+        assert_eq!(
+            crate::containment::windows::mechanism_from_flags(frozen),
+            crate::containment::windows::mechanism_from_flags(plain),
+        );
+    }
+}
+
+/// The raw hatch still refuses `CREATE_SUSPENDED`, and the refusal now points at the API that
+/// does the job.
+#[skuld::test]
+fn create_suspended_is_still_refused_in_the_raw_hatch_and_the_remedy_names_spawn_suspended() {
+    let detail = refusal(FlagsRequest {
+        raw: CREATE_SUSPENDED.0,
+        ..Default::default()
+    });
+    assert!(detail.contains("CREATE_SUSPENDED"), "{detail}");
+    assert!(detail.contains("spawn_suspended"), "{detail}");
+}

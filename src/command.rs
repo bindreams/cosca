@@ -859,7 +859,7 @@ impl Command {
     ///
     /// | Flag | Why reserved | Instead |
     /// | --- | --- | --- |
-    /// | `CREATE_SUSPENDED` | cosca suspends and resumes a contained root itself | none |
+    /// | `CREATE_SUSPENDED` | cosca suspends and resumes a contained root itself | [`spawn_suspended`](Self::spawn_suspended) |
     /// | `CREATE_NEW_PROCESS_GROUP` | load-bearing for `CTRL_BREAK` delivery to the contained root | [`contain`](Self::contain) |
     /// | `CREATE_NEW_CONSOLE` | measured: the child gets its own *visible* console window, overriding a requested window suppression | none |
     /// | `CREATE_UNICODE_ENVIRONMENT` | both backends supply it structurally, so a caller can neither set nor clear it meaningfully | none |
@@ -877,6 +877,13 @@ impl Command {
 
     pub(crate) fn flags_request(&self) -> &FlagsRequest {
         &self.flags
+    }
+
+    /// Set the suspended request, which only `spawn_suspended` makes, for the duration of one
+    /// spawn. Returns the previous value.
+    #[cfg(windows)]
+    pub(crate) fn set_suspended(&mut self, yes: bool) -> bool {
+        std::mem::replace(&mut self.flags.suspended, yes)
     }
 
     /// Run this child elevated (admin/root). Sugar for `Backend::Auto` +

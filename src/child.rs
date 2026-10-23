@@ -29,6 +29,10 @@ use proc_handle::ProcHandle;
 #[path = "child/lifecycle.rs"]
 mod lifecycle;
 
+#[path = "child/suspended.rs"]
+mod suspended;
+pub use suspended::SuspendedChild;
+
 #[path = "child/graceful.rs"]
 mod graceful;
 
@@ -173,6 +177,12 @@ impl Child {
     /// Set by the spawn, from its command (see [`Child::front`](Self#structfield.front)).
     pub(crate) fn set_front(&mut self, front: Option<crate::elevation::front::Front>) {
         self.front = front;
+    }
+
+    /// The process handle, borrowed from `self`.
+    #[cfg(windows)]
+    pub(crate) fn process_handle(&self) -> std::os::windows::io::RawHandle {
+        self.proc.raw_handle()
     }
 
     /// Commit the spawn: apply `kill_on_drop` to the containment resource (see

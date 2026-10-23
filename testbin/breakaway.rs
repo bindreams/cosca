@@ -34,10 +34,16 @@ use windows::Win32::System::Threading::{
 /// compile time. The read side is asymmetric on purpose — the query class returns the basic
 /// structure, the setter needs the extended one.
 fn job_with_self(limits: JOB_OBJECT_LIMIT) -> Option<HANDLE> {
-    // SAFETY: standard Win32; `info` is fully initialised (zeroed by default()), and the handle
-    // stays owned by this short-lived process.
+    job_with_self_named(limits, windows::core::PCWSTR::null())
+}
+
+/// [`job_with_self`] for a job another process can open by `name`, or an anonymous one for a null
+/// name.
+pub(crate) fn job_with_self_named(limits: JOB_OBJECT_LIMIT, name: windows::core::PCWSTR) -> Option<HANDLE> {
+    // SAFETY: standard Win32; `info` is fully initialised (zeroed by default()), `name` is null or
+    // NUL-terminated for the call, and the handle stays owned by this short-lived process.
     unsafe {
-        let job = CreateJobObjectW(None, windows::core::PCWSTR::null()).ok()?;
+        let job = CreateJobObjectW(None, name).ok()?;
         if limits.0 != 0 {
             let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
             info.BasicLimitInformation.LimitFlags = limits;

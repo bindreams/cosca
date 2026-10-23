@@ -65,6 +65,11 @@ impl RawChild {
         HANDLE(self.proc.as_raw_handle())
     }
 
+    /// The process handle, borrowed from `self`.
+    pub(crate) fn raw_handle(&self) -> std::os::windows::io::RawHandle {
+        self.proc.as_raw_handle()
+    }
+
     /// Does the CALLER hold `PROCESS_TERMINATE` on this child? A STATIC permission answer,
     /// not a racing `try_wait`: because we still hold `self.proc`, the process object — and
     /// thus `self.pid` — cannot be reused while we probe. `OpenProcess(PROCESS_TERMINATE)`

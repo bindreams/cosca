@@ -47,6 +47,11 @@ pub(crate) struct FlagsRequest {
     pub detached: bool,
     #[cfg(windows)]
     pub breakaway_from_job: bool,
+    /// Create the child suspended and leave it so: set by `spawn_suspended` for the duration of
+    /// the call, never by a caller. The word then carries `CREATE_SUSPENDED` for every
+    /// containment shape, and `attach` does not resume.
+    #[cfg(windows)]
+    pub suspended: bool,
     /// The raw hatch. `0` is indistinguishable from never calling `creation_flags`, which is
     /// correct: a zero word requests no bits, so there is nothing to refuse and nothing to emit.
     #[cfg(windows)]
@@ -101,10 +106,9 @@ fn reserved_table() -> [Reserved; 10] {
         Reserved {
             bit: CREATE_SUSPENDED.0,
             name: "CREATE_SUSPENDED",
-            remedy: "no replacement today, a suspended-spawn window is being designed in cosca#49: \
-                     cosca suspends and resumes a contained root itself, so a caller's suspend \
-                     would be resumed silently on a contained spawn and never resumed at all on \
-                     an uncontained one",
+            remedy: "use spawn_suspended(): cosca suspends and resumes a contained root itself, so a \
+                     caller's suspend would be resumed silently on a contained spawn and never \
+                     resumed at all on an uncontained one",
         },
         Reserved {
             bit: DETACHED_PROCESS.0,
@@ -213,6 +217,9 @@ pub(crate) fn windows_spawn(
     // if the reading goes stale before the spawn.
     if flags.breakaway_from_job {
         creation_flags |= CREATE_BREAKAWAY_FROM_JOB.0;
+    }
+    if flags.suspended {
+        creation_flags |= CREATE_SUSPENDED.0;
     }
     if backend == SpawnBackend::Raw {
         creation_flags |= CREATE_UNICODE_ENVIRONMENT.0 | EXTENDED_STARTUPINFO_PRESENT.0;
