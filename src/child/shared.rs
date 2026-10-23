@@ -273,7 +273,7 @@ impl SharedChild {
         child.as_handle().try_clone_to_owned()
     }
 
-    /// The duplicate of the child's process handle, valid for as long as `self` is.
+    /// The process handle, borrowed from `self`.
     #[cfg(windows)]
     pub(crate) fn raw_handle(&self) -> std::os::windows::io::RawHandle {
         use std::os::windows::io::AsRawHandle;

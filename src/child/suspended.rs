@@ -45,9 +45,8 @@ impl Command {
     /// does (or the child was in none), so the child's breakaway is allowed or denied as an
     /// ordinary spawn's would be.
     ///
-    /// **A crash between `CreateProcessW` returning and the child's assignment to its job or guard
-    /// can leave a frozen process that nothing kills.** That window exists for every contained
-    /// spawn; a frozen child makes it matter more because the child stays frozen.
+    /// **A parent crash between `CreateProcessW` returning and the job assignment can leave a frozen
+    /// process nothing kills.**
     ///
     /// # Other platforms
     ///
@@ -59,7 +58,7 @@ impl Command {
     /// [`Error::Containment`] cause: a [`Strongest`] root whose job assignment fails (`spawn` falls
     /// back to [`TreeWalk`] there; a frozen root without a job would have nothing to kill it), and a
     /// failed assignment to the guard job. A frozen spawn that fails after the process exists
-    /// reports [`Error::MayHaveStarted`], conservatively: a child that was never resumed ran nothing.
+    /// reports [`Error::MayHaveStarted`].
     /// `spawn_suspended` with [`elevate`](Self::elevate) is [`Error::Unsupported`] on every platform,
     /// even for an already-elevated caller.
     ///
@@ -82,8 +81,7 @@ impl SuspendedChild {
     ///
     /// [`Error::MayHaveStarted`] when the resume failed or only partly happened (a thread that
     /// something else also suspended stays suspended). The child is then torn down and the error's
-    /// `fate` says how. A child killed by something else *before* the call is this error too; one
-    /// killed *during* the call may come back `Ok` while it is exiting.
+    /// `fate` says how. A child killed by something else *before* the call is this error too.
     pub fn resume(self) -> Result<Child, Error> {
         let SuspendedChild {
             mut child,

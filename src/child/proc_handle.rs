@@ -51,7 +51,7 @@ impl ProcHandle {
         shared.adopted_unique()
     }
 
-    /// The process handle behind this child, valid for as long as `self` is.
+    /// The process handle, borrowed from `self`.
     #[cfg(windows)]
     pub(crate) fn raw_handle(&self) -> std::os::windows::io::RawHandle {
         match self {

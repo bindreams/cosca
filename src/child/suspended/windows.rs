@@ -5,24 +5,22 @@ use crate::child::{Spawned, SuspendedChild};
 use crate::command::Command;
 use crate::error::Error;
 
+/// Test-only accessors, `pub` so integration tests can call them.
 impl SuspendedChild {
-    /// Test-only: whether the child is inside its containment job. `pub` so integration tests can
-    /// call it.
+    /// Test-only: whether the child is inside its containment job.
     #[doc(hidden)]
     pub fn test_job_handle_contains_self(&self) -> bool {
         self.child.test_job_handle_contains_self()
     }
 
-    /// Test-only: the containment the child has (and keeps after `resume`). `pub` so integration
-    /// tests can call it.
+    /// Test-only: the containment the child has (and keeps after `resume`).
     #[doc(hidden)]
     pub fn test_containment(&self) -> crate::Containment {
         self.child.containment()
     }
 
     /// Test-only: whether the child is inside its guard job (an uncontained, `TreeWalk` or nested
-    /// frozen child; `false` for a Strongest root, whose containment job guards it). `pub` so
-    /// integration tests can call it.
+    /// frozen child; `false` for a Strongest root, whose containment job guards it).
     #[doc(hidden)]
     pub fn test_guard_job_contains_self(&self) -> bool {
         self.frozen.guard_contains(self.id().pid())

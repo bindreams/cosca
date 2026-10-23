@@ -1,7 +1,5 @@
 //! A frozen child's containment state: what keeps it from being stranded while the caller holds
 //! it before it ran, and what releases it.
-//!
-//! Windows only. `Frozen` is uninhabited elsewhere, so the types that carry one need no `cfg`.
 
 #[cfg(windows)]
 #[path = "frozen/windows.rs"]
@@ -19,7 +17,6 @@ pub(crate) enum Frozen {}
 
 #[cfg(not(windows))]
 impl Frozen {
-    /// Unreachable: no value of this type exists.
     pub(crate) fn release(self, _child: &crate::child::Child) -> std::io::Result<()> {
         match self {}
     }

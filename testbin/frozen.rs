@@ -1,18 +1,11 @@
 //! The frozen-spawn helper modes. All use the `cosca` crate: they are the callers whose behaviour
 //! `tests/windows_suspended.rs` measures from outside.
 //!
-//! - `spawn-frozen-report <addr> <shape> <backend>`: spawn a frozen `control-block` child, report
-//!   it, hold it frozen until the test says go, then block forever without ever dropping it. The
-//!   test kills this process; whatever then happens to the frozen child is the guard's doing.
-//! - `spawn-breakaway-report <addr> <how>`: be the child of a frozen spawn (or an ordinary one),
-//!   spawn a grandchild with `CREATE_BREAKAWAY_FROM_JOB`, and report whether the OS allowed it.
-//! - `spawn-breakaway-child <addr> <backend> <shape> <how> <ambient>`: spawn `spawn-breakaway-report`
-//!   as a child of the given shape, frozen and resumed or by an ordinary `spawn()`, inside the ambient
-//!   job `ambient` names. The test compares the two `how`s.
-//! - `spawn-measured-child <addr> <backend> <shape> <how> <ambient>`: spawn a child of the given
-//!   shape, frozen and resumed or by an ordinary `spawn()`, and report its containment. The child
-//!   (`spawn-report-job-flags`) spawns a plain grandchild (`report-job-flags`) once told to go, and
-//!   the grandchild reports the limit flags of the job it sits in. The test compares the two `how`s.
+//! - `spawn-frozen-report`: hold a frozen child and block, for the test to kill.
+//! - `spawn-breakaway-report` and `spawn-breakaway-child`: whether a child's
+//!   `CREATE_BREAKAWAY_FROM_JOB` grandchild is allowed.
+//! - `spawn-measured-child`, `spawn-report-job-flags` and `report-job-flags`: the job a grandchild
+//!   sits in.
 
 use std::io::{Read, Write};
 
@@ -69,7 +62,7 @@ pub fn spawn_frozen_report(addr: &str, shape: &str, backend: &str) -> ! {
     // The test opens its handle on the frozen child now, while this process still holds it.
     let mut go = [0u8; 1];
     sock.read_exact(&mut go).expect("wait for the test's go");
-    // Block until killed. `exit` runs no destructors, so the frozen child is never dropped here.
+    // Block forever; never dropped, so the guard alone must kill the child.
     let mut b = [0u8; 1];
     loop {
         if matches!(sock.read(&mut b), Ok(0) | Err(_)) {

@@ -569,9 +569,9 @@ pub(crate) mod fault {
         Resume,
         /// `JobHandle::try_set_limit_flags`' `SetInformationJobObject`.
         SetLimits,
-        /// The assignment of a Strongest root's job, in [`assign_held`](super::assign_held).
+        /// The assignment of a Strongest root's job.
         Assign,
-        /// The assignment of a frozen child's guard job, in [`assign_guard_job`](super::assign_guard_job).
+        /// The assignment of a frozen child's guard job.
         GuardAssign,
     }
 
@@ -649,7 +649,7 @@ pub(crate) fn assign_to_kill_on_close_job(proc_handle: std::os::windows::io::Raw
 }
 
 /// [`assign_to_kill_on_close_job`] as `attach` takes it: the job is assigned and the child is NOT
-/// resumed. The ordinary Strongest-root attach and a frozen spawn's hold branch both assign here.
+/// resumed.
 pub(crate) fn assign_held(proc_handle: std::os::windows::io::RawHandle) -> io::Result<JobHandle> {
     #[cfg(test)]
     forced(fault::Step::Assign).map_err(io::Error::from)?;
@@ -1553,8 +1553,7 @@ pub(crate) fn job_contains_pid(attached: &crate::containment::Attached, pid: u32
     job_handle_contains_pid(job, pid)
 }
 
-/// [`job_contains_pid`] for a job handle: whether `pid` is inside it, by `IsProcessInJob` against
-/// that handle.
+/// [`job_contains_pid`] against a job handle.
 pub(crate) fn job_handle_contains_pid(job: &JobHandle, pid: u32) -> bool {
     use windows::Win32::System::JobObjects::IsProcessInJob;
     use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION};

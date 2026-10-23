@@ -22,9 +22,8 @@ use windows::Win32::System::Threading::{
 
 use crate::containment::windows::JobHandle;
 
-/// A `findstr x` blocker created `CREATE_SUSPENDED` through std, windowless (`CREATE_NO_WINDOW`: a
-/// test must never open a console window on a developer's desktop), with piped stdin the caller holds.
-/// Closing that stdin is what lets the child exit by itself once it runs.
+/// A `findstr x` blocker created `CREATE_SUSPENDED` through std, with piped stdin; closing it lets the
+/// child exit once it runs.
 pub(crate) fn spawn_suspended_blocker() -> std::process::Child {
     let mut cmd = std::process::Command::new(crate::test_child::BLOCKER_ARGV[0]);
     cmd.args(&crate::test_child::BLOCKER_ARGV[1..])
@@ -36,7 +35,8 @@ pub(crate) fn spawn_suspended_blocker() -> std::process::Child {
 }
 
 /// The initial thread of a process that is still alive, held by handle. Opened while the caller's
-/// own handle on the process pins the pid.
+/// own handle on the process pins the pid. The handle is live, owned and closed once, with suspend
+/// rights, for as long as the value exists.
 pub(crate) struct InitialThread(HANDLE);
 
 impl InitialThread {
@@ -77,7 +77,6 @@ impl InitialThread {
 
     /// `SuspendThread`: returns the previous count.
     pub(crate) fn suspend_once(&self) -> u32 {
-        // SAFETY: `self.0` is a live thread handle with suspend rights.
         let previous = unsafe { SuspendThread(self.0) };
         assert_ne!(
             previous,
@@ -90,7 +89,6 @@ impl InitialThread {
 
     /// `ResumeThread`: returns the previous count.
     pub(crate) fn release_one(&self) -> u32 {
-        // SAFETY: as above.
         let previous = unsafe { ResumeThread(self.0) };
         assert_ne!(
             previous,
@@ -104,7 +102,6 @@ impl InitialThread {
 
 impl Drop for InitialThread {
     fn drop(&mut self) {
-        // SAFETY: the handle is owned and closed once.
         unsafe { _ = CloseHandle(self.0) };
     }
 }
@@ -175,8 +172,6 @@ pub(crate) fn child_may_break_away(child: &std::process::Child) -> bool {
 pub(crate) fn raw(child: &std::process::Child) -> std::os::windows::io::RawHandle {
     child.as_raw_handle()
 }
-
-// Counting the root teardowns a drop starts =====
 
 thread_local! {
     static ROOT_TEARDOWNS: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };

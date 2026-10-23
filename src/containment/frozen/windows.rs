@@ -3,7 +3,8 @@
 //! A child no cosca job holds (uncontained, `TreeWalk` root, nested member) gets a guard job as
 //! `attach`'s first act, so a parent that dies while the child is frozen has the child killed by
 //! the OS closing the guard handle. A Strongest root needs none: its containment job is armed the
-//! same way. **The window between `CreateProcessW` returning and that assignment stays open.**
+//! same way. **A parent crash between `CreateProcessW` returning and that assignment can leave a frozen
+//! process nothing kills.**
 
 use std::io;
 use std::os::windows::io::RawHandle;
@@ -55,10 +56,9 @@ impl Frozen {
     /// [`release`](Self::release) for the process at `proc_handle`, which must stay open for the
     /// call.
     ///
-    /// Order is the safety argument: the guard is released only after the threads run. The other
-    /// order would strand a frozen process if the owner died between the two calls; this one can
-    /// only kill a running child. A guard whose release fails is dropped armed, so the OS ends the
-    /// child; the caller tears it down all the same.
+    /// The guard is released only after the threads run: the other order would strand a frozen
+    /// process if the owner died between the calls. A guard whose release fails is dropped armed, so
+    /// the OS ends the child.
     pub(crate) fn release_process(self, proc_handle: RawHandle) -> io::Result<()> {
         windows::resume_initial_threads(proc_handle, windows::SuspendCount::ExactlyOne)?;
         let Some(guard) = self.guard else { return Ok(()) };

@@ -65,7 +65,7 @@ impl RawChild {
         HANDLE(self.proc.as_raw_handle())
     }
 
-    /// The process handle, valid for as long as `self` is.
+    /// The process handle, borrowed from `self`.
     pub(crate) fn raw_handle(&self) -> std::os::windows::io::RawHandle {
         self.proc.as_raw_handle()
     }

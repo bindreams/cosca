@@ -198,7 +198,7 @@ impl Child {
         self.front = front;
     }
 
-    /// The process handle this child holds, valid while the child is.
+    /// The process handle, borrowed from `self`.
     #[cfg(windows)]
     pub(crate) fn process_handle(&self) -> std::os::windows::io::RawHandle {
         self.proc.raw_handle()
