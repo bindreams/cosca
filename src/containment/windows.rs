@@ -668,6 +668,7 @@ pub(crate) fn assign_to_kill_on_close_job(proc_handle: std::os::windows::io::Raw
 
         let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        info.BasicLimitInformation.LimitFlags = Default::default(); // MUTANT: no KILL_ON_JOB_CLOSE
         if let Err(e) = SetInformationJobObject(
             job,
             JobObjectExtendedLimitInformation,
