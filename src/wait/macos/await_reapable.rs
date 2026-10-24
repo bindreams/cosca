@@ -12,13 +12,11 @@
 //!   cases, all decided in `exit_only::macos::peek`: the unique id says the pid names another
 //!   process, `arg = 1` says it is reaped (`ESRCH`: a process resolves from `P_REF_DEAD` until
 //!   its reap), or the read was refused. If launchd holds it (a zombie whose tracer died), the
-//!   verdict is [`Waited::Orphaned`], which is not a reap. While the
-//!   pid names the child and a live process other than launchd holds it, a tracer holds the
-//!   child, and the wait goes on: until the tracer's hand-back, which re-sends `NOTE_EXIT`, or the
-//!   tracer's exit, which the wait also watches, up a chain of traced tracers ([`TracerWatch`]),
-//!   and which leaves the child ours or launchd's. A tracer that attaches after a peek sends the
-//!   child `SIGSTOP`, and `NOTE_SIGNAL` makes the wait peek again; any other signal to the child
-//!   does too, and only peeks.
+//!   verdict is [`Waited::Orphaned`], which is not a reap. While the pid names the child and a
+//!   live process other than launchd holds it, a tracer holds the child, and the wait goes on. A
+//!   traced child's `NOTE_EXIT` reaches this process only at its tracer's hand-back; see
+//!   [`TracerWatch`] for how the wait watches the tracer chain. Any signal to the child only makes
+//!   the wait peek again.
 //! - Once `NOTE_EXIT` has come, or the registration's receipt says `ESRCH` (the child is past
 //!   `P_REF_DEAD`, where `proc_find` fails, but `waitid` may not see the zombie yet), it re-peeks
 //!   with a backoff until the peek finds the zombie or the child is gone. That is XNU finishing

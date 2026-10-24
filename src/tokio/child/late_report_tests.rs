@@ -32,6 +32,7 @@ fn tokio_blocker() -> (crate::tokio::Command, std::io::PipeWriter) {
 struct Late {
     fate: ChildFate,
     pid: u32,
+    id: crate::identity::ProcessId,
     mark: usize,
     forgets: u32,
 }
@@ -56,6 +57,7 @@ fn late_spawn(arm: impl FnOnce() -> Vec<Box<dyn std::any::Any>>) -> (Late, std::
     let late = Late {
         fate,
         pid: id.pid(),
+        id,
         mark,
         forgets: forgets.forgets(),
     };
@@ -104,6 +106,7 @@ async fn macos_tokio_spawn_of_a_late_reporting_child_kills_and_reaps_it_through_
             Late {
                 fate,
                 pid: id.pid(),
+                id,
                 mark,
                 forgets: forgets.forgets(),
             },
@@ -125,7 +128,8 @@ async fn macos_tokio_spawn_of_a_late_reporting_child_kills_and_reaps_it_through_
 
 /// A refused kill leaves the child running: tokio's `Child` is released to its orphan reaper, not
 /// forgotten (which would leave a zombie nothing collects), and the one warn says so. The test then
-/// kills the child; the orphan reaper collects it.
+/// kills the child and turns the runtime, whose every turn reaps tokio's exited orphans, until the
+/// zombie is gone: no interval, no bound.
 ///
 /// Mutants: the child is forgotten; the warn says the child was killed; the hand-off is not said.
 #[skuld::test]
@@ -142,6 +146,14 @@ async fn macos_tokio_spawn_of_a_late_child_whose_kill_is_refused_hands_it_to_the
     );
     // SAFETY: `pid` is this test's own child; the orphan reaper collects it.
     assert_eq!(unsafe { libc::kill(late.pid as libc::pid_t, libc::SIGKILL) }, 0);
+    while late.id.exists() == crate::identity::Existence::Present {
+        ::tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        late.id.exists(),
+        crate::identity::Existence::Gone,
+        "tokio's orphan reaper collects the zombie"
+    );
     drop(writer);
 }
 

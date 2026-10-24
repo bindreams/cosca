@@ -497,6 +497,12 @@ impl TracerHelper<'_> {
         }
     }
 
+    /// The helper's pid, which is this process's child: a second helper can trace it.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn helper_pid(&self) -> u32 {
+        self.session.helper.id()
+    }
+
     /// Writes one signal byte.
     pub(crate) fn signal(&mut self) {
         let tx = self.session.signal_tx();

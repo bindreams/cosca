@@ -496,7 +496,7 @@ fn a_wait_on_a_child_whose_tracer_dies_during_its_exit_is_woken_by_the_tracers_e
 /// round's index and the kqueue. A round whose hook answers `false` (it found nothing pending that
 /// should be) gets a `SIGCHLD` to this process, which the wait also watches, so a wait that missed
 /// its event fails its test's assertion instead of hanging.
-fn on_rounds(
+pub(super) fn on_rounds(
     kq: &std::rc::Rc<nix::sys::event::Kqueue>,
     mut hook: impl FnMut(u32, &nix::sys::event::Kqueue) -> bool + 'static,
 ) -> ForcedOnce {
@@ -509,7 +509,7 @@ fn on_rounds(
 }
 
 /// A tracer that attaches after the wait's check: XNU reparents the child to it and sends the child
-/// `SIGSTOP` (xnu-12377.121.6 `mach_process.c:295`, `:304`). The wait watches the child's signals,
+/// `SIGSTOP` (see `wait::backend::TracerWatch`). The wait watches the child's signals,
 /// so it peeks again, finds the tracer and watches it too; the tracer's exit, with launchd then
 /// holding the child, ends the wait: `Orphaned`. This process's own pid stands in for the child, and
 /// a blocker for the tracer; the parent read is forced: this process until the attach, then the
@@ -564,9 +564,8 @@ fn started_by_us_traced_by(tracer: u32) -> (libc::pid_t, libc::pid_t) {
     (std::process::id() as libc::pid_t, tracer as libc::pid_t)
 }
 
-/// A tracer that is itself traced: XNU sends its `NOTE_EXIT` only to its own tracer
-/// (xnu-12377.121.6 `kern_event.c:1200`), and its exit sends that tracer `SIGCHLD`
-/// (`kern_exit.c:2779`). The wait follows the chain of tracers and watches the signals of each, so
+/// A tracer that is itself traced: XNU sends its `NOTE_EXIT` only to its own tracer, and its exit
+/// sends that tracer `SIGCHLD` (see `wait::backend::TracerWatch`). The wait follows the chain of tracers and watches the signals of each, so
 /// that `SIGCHLD` wakes it, and the peek after it finds launchd holding the child: `Orphaned`. This
 /// process's own pid stands in for the child, held by one blocker; a second blocker stands in for
 /// that one's tracer, by its forced parents. A `SIGCHLD` to the second stands in for the first one's
@@ -617,10 +616,9 @@ fn a_wait_on_a_child_whose_tracer_is_traced_is_woken_by_that_tracers_exit() {
 }
 
 /// A tracer that began its exit, then lost its own tracer: XNU gives it to launchd and keeps its
-/// `p_oppid` (xnu-12377.121.6 `kern_exit.c:2612-2613`), so its `NOTE_EXIT` reaches only launchd
-/// (`kern_event.c:1200`), and its `SIGCHLD` goes to launchd too (`kern_exit.c:2779`). It hands the
-/// child over once its exit reaches its children (`:2528`), so the wait peeks again on a backoff instead of
-/// blocking for an event that never comes. This process's own pid stands in for the child, held by
+/// `p_oppid`, so its `NOTE_EXIT` and its `SIGCHLD` reach only launchd (see
+/// `wait::backend::TracerWatch`). It hands the child over once its exit reaches its children, so the
+/// wait peeks again on a backoff instead of blocking for an event that never comes. This process's own pid stands in for the child, held by
 /// a blocker whose forced parents say launchd holds it and a tracer attached to it; the child's
 /// parent read answers launchd from the first block on.
 ///
