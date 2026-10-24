@@ -9,7 +9,8 @@ thread_local! {
     static BETWEEN_CHECK_AND_KILL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     static ON_TAKE_PLACEMENT: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static BEFORE_EXIT_WAIT: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
-    static SIGNALLED_BY_PID: Cell<usize> = const { Cell::new(0) };
+    static CHILD_SENDS: std::cell::RefCell<Vec<ChildSend>> = const { std::cell::RefCell::new(Vec::new()) };
+    static FORCE_GROUP_KILL_GONE: Cell<bool> = const { Cell::new(false) };
     static TERMINATED_BY_PID: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
     static HOOK_GATE: Cell<Option<std::os::fd::RawFd>> = const { Cell::new(None) };
     static FORCE_CHILD_KILL_DENIED: Cell<bool> = const { Cell::new(false) };
@@ -490,8 +491,9 @@ pub(crate) fn run_after_shut_read() {
     }
 }
 
-/// Deny the NEXT abandoned child's kill with `EPERM`, as a child that exec'd a setuid program
-/// denies an unprivileged supervisor — which a root test lane cannot reproduce for real.
+/// Deny the NEXT abandoned child's kills, through its handle and as its group, with `EPERM`, as a
+/// child that exec'd a setuid program denies an unprivileged supervisor — which a root test lane
+/// cannot reproduce for real.
 pub(crate) fn set_force_child_kill_denied(on: bool) {
     FORCE_CHILD_KILL_DENIED.with(|f| f.set(on));
 }
@@ -639,13 +641,29 @@ pub(crate) fn take_fork_running_lock_held_report_fd() -> Option<std::os::fd::Raw
     FORK_RUNNING_LOCK_HELD_REPORT_FD.with(|f| f.take())
 }
 
-/// Count an abandoned child signalled by its bare pid on this thread.
-pub(crate) fn record_signalled_by_pid() {
-    SIGNALLED_BY_PID.with(|c| c.set(c.get() + 1));
+/// A signal `end_child` sent an abandoned spawn's child.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChildSend {
+    /// Through its pidfd or `/proc` directory.
+    Handle,
+    /// To the process group it leads, by number.
+    Group,
 }
-/// How many abandoned children this thread signalled by bare pid since the last call.
-pub(crate) fn take_signalled_by_pid() -> usize {
-    SIGNALLED_BY_PID.with(|c| c.replace(0))
+/// Note a signal `end_child` sent on this thread.
+pub(crate) fn record_child_send(send: ChildSend) {
+    CHILD_SENDS.with(|s| s.borrow_mut().push(send));
+}
+/// The signals `end_child` sent on this thread since the last call, in order.
+pub(crate) fn take_child_sends() -> Vec<ChildSend> {
+    CHILD_SENDS.with(|s| std::mem::take(&mut *s.borrow_mut()))
+}
+
+/// Answer the NEXT abandoned child's group kill with `ESRCH`, as for a group with no member left.
+pub(crate) fn set_force_group_kill_gone(on: bool) {
+    FORCE_GROUP_KILL_GONE.with(|f| f.set(on));
+}
+pub(crate) fn take_force_group_kill_gone() -> bool {
+    FORCE_GROUP_KILL_GONE.with(|f| f.replace(false))
 }
 
 /// Note a member `CgroupLeaf::terminate` signalled by its bare pid on this thread.

@@ -903,7 +903,7 @@ enum ChildFate {
     /// Already exited and reaped by whoever failed the spawn (std reaps the child of a spawn it
     /// failed).
     Gone,
-    /// Killed through its pidfd, with its process group, and reaped.
+    /// Killed through its handle, and reaped.
     Killed,
     /// Could not be killed: no pidfd, or the signal was refused.
     Unkillable,
@@ -912,8 +912,8 @@ enum ChildFate {
 #[cfg(target_os = "linux")]
 impl CgroupLeaf {
     /// End the exchange of a spawn that failed before its verdict (see the module's contract),
-    /// and answer for its child: kill it and its group, kill through the leaf if it entered, reap
-    /// it if no handle owns it, and remove the leaf.
+    /// and answer for its child: kill it (see [`end_child`]), kill through the leaf if it
+    /// entered, reap it if no handle owns it, and remove the leaf.
     ///
     /// Idempotent: the channel is taken once, and `Drop` does nothing after it.
     ///
@@ -954,8 +954,8 @@ impl CgroupLeaf {
             }
             return self.abandon_front(&received);
         }
-        // The child first, by its pidfd and as its group, whatever the leaf's own kill does: it
-        // may have left the leaf, or never entered it.
+        // The child first, through its handle, whatever the leaf's own kill does: it may have left
+        // the leaf, or never entered it.
         let fate = end_child(&received);
         let through_leaf = self.entered.then(|| self.hard_kill());
         if self.entered {
@@ -1097,9 +1097,8 @@ impl CgroupLeaf {
     }
 }
 
-/// Answer for an abandoned spawn's child: kill it and the group it leads, then reap it — it is
-/// killed directly, so the wait ends with its exit, and no handle owns it (see
-/// [`CgroupLeaf::abandon_before_verdict`]).
+/// Answer for an abandoned spawn's child: kill it, then reap it — it is killed directly, so the
+/// wait ends with its exit, and no handle owns it (see [`CgroupLeaf::abandon_before_verdict`]).
 ///
 /// The child is named by the handle its intent carried — a pidfd, or its `/proc/<pid>` directory —
 /// never by its number alone. Which path failed the spawn does not need knowing: `std` reaps the
@@ -1107,8 +1106,14 @@ impl CgroupLeaf {
 /// one error. The handle answers instead: a process `std` reaped opens nothing through it, however
 /// its number has been reused since. An intent with no handle names nothing cosca may signal.
 ///
-/// A child it may not signal (`EPERM`) is handed to a background reaper, so it is reaped once it
-/// exits, however that comes.
+/// A child that reported a failed placement exec'd outside the leaf, so what it forked is reached
+/// only as the process group it leads, killed by number after one look at the child through its
+/// handle and before the handle's kill. A reap by another reaper after that look is not seen, and
+/// the number may then name another group. A child in the leaf is killed with the leaf, and one
+/// that never reported never exec'd, so neither is sent anything by number.
+///
+/// A child its handle may not signal (`EPERM`) is handed to a background reaper, so it is reaped
+/// once it exits, however that comes.
 #[cfg(target_os = "linux")]
 fn end_child(received: &Received) -> ChildFate {
     use rustix::process::{pidfd_send_signal, waitid, WaitIdOptions};
@@ -1137,30 +1142,20 @@ fn end_child(received: &Received) -> ChildFate {
     let denied = fault::take_force_child_kill_denied();
     #[cfg(not(test))]
     let denied = false;
+    if matches!(received.report, Some(PlacementReport::WriteFailed(_))) {
+        kill_group_outside_leaf(pid, denied);
+    }
     // Through the handle: the kernel takes a `/proc/<pid>` directory as a pidfd here.
+    #[cfg(test)]
+    fault::record_child_send(fault::ChildSend::Handle);
     let killed = if denied {
         Err(rustix::io::Errno::PERM)
     } else {
         pidfd_send_signal(handle, rustix::process::Signal::KILL)
     };
-    let killed = match killed {
-        // Reaped since the check, by another reaper in the process: gone, and its number is not
-        // signalled.
-        Err(rustix::io::Errno::SRCH) => return ChildFate::Gone,
-        // `pidfd_send_signal` itself refused, as a seccomp filter can: the kill falls back to the
-        // pid, proven the child's a moment ago. Another reaper in the process may reap the child
-        // since that proof, and the kill then reaches whatever holds the number.
-        Err(rustix::io::Errno::NOSYS) | Err(rustix::io::Errno::PERM) if !denied => {
-            #[cfg(test)]
-            fault::record_signalled_by_pid();
-            rustix::process::kill_process(pid, rustix::process::Signal::KILL)
-        }
-        other => other,
-    };
-    // The group it leads: an unreaped leader pins the group's id, so this names its group alone,
-    // unless another reaper in the process reaped it since the check.
-    if !denied {
-        _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+    if killed == Err(rustix::io::Errno::SRCH) {
+        // Reaped since the look, by another reaper in the process.
+        return ChildFate::Gone;
     }
     if let Err(e) = killed {
         log::warn!("cgroup v2: could not kill an abandoned spawn's child ({e}); it is reaped once it exits");
@@ -1198,6 +1193,35 @@ fn end_child(received: &Received) -> ChildFate {
         }
     }
     ChildFate::Killed
+}
+
+/// Kill the process group an abandoned spawn's child leads, by its number `pid` (see
+/// [`end_child`]). `denied` is the test seam's refusal.
+#[cfg(target_os = "linux")]
+fn kill_group_outside_leaf(pid: rustix::process::Pid, denied: bool) {
+    #[cfg(test)]
+    fault::record_child_send(fault::ChildSend::Group);
+    #[cfg(test)]
+    let gone = fault::take_force_group_kill_gone();
+    #[cfg(not(test))]
+    let gone = false;
+    let killed = if denied {
+        Err(rustix::io::Errno::PERM)
+    } else if gone {
+        Err(rustix::io::Errno::SRCH)
+    } else {
+        rustix::process::kill_process_group(pid, rustix::process::Signal::KILL)
+    };
+    let pid = rustix::process::Pid::as_raw(Some(pid));
+    match killed {
+        Ok(()) => {}
+        // No member left: the child was reaped elsewhere since the look, with nothing it forked
+        // still running.
+        Err(rustix::io::Errno::SRCH) => {
+            log::debug!("cgroup v2: an abandoned spawn's child's process group {pid} has no member left");
+        }
+        Err(e) => log::warn!("cgroup v2: could not kill an abandoned spawn's child's process group {pid} ({e})"),
+    }
 }
 
 /// What names the child `received` names, `pid`, to its reaper: its pidfd, or — with its `/proc`

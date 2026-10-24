@@ -2605,7 +2605,7 @@ fn an_abandoned_intent_without_a_handle_is_never_signalled() {
         leaf.abandon_before_verdict(false, None),
         crate::containment::cgroup::Abandoned::OutOfReach
     );
-    assert_eq!(crate::containment::cgroup::fault::take_signalled_by_pid(), 0);
+    assert_eq!(crate::containment::cgroup::fault::take_child_sends(), []);
 
     let mut echo = [0u8; 1];
     other
@@ -2651,7 +2651,7 @@ fn an_abandoned_child_with_no_handle_on_itself_is_out_of_reach() {
         leaf.abandon_before_verdict(false, None),
         crate::containment::cgroup::Abandoned::OutOfReach
     );
-    assert_eq!(crate::containment::cgroup::fault::take_signalled_by_pid(), 0);
+    assert_eq!(crate::containment::cgroup::fault::take_child_sends(), []);
     crate::test_child::assert_echoes(
         child.stdin.as_mut().expect("stdin"),
         child.stdout.as_mut().expect("stdout"),
@@ -2691,7 +2691,7 @@ fn an_abandoned_child_std_already_reaped_is_never_signalled() {
         leaf.abandon_before_verdict(false, None),
         crate::containment::cgroup::Abandoned::Ended
     );
-    assert_eq!(crate::containment::cgroup::fault::take_signalled_by_pid(), 0);
+    assert_eq!(crate::containment::cgroup::fault::take_child_sends(), []);
     assert_eq!(crate::containment::cgroup::fault::take_reaped_orphans(), Vec::new());
 }
 
@@ -2710,7 +2710,7 @@ fn an_abandoned_spawn_whose_child_sent_nothing_may_leave_it_unreaped() {
         crate::containment::cgroup::Abandoned::MaybeUnreaped
     );
     assert!(!leaf_path.exists(), "the empty leaf is removed");
-    assert_eq!(crate::containment::cgroup::fault::take_signalled_by_pid(), 0);
+    assert_eq!(crate::containment::cgroup::fault::take_child_sends(), []);
 }
 
 /// A child reaped between the check that it lives and the kill, by another reaper in the process,
@@ -2738,7 +2738,10 @@ fn a_child_reaped_between_the_check_and_the_kill_is_not_signalled_by_number() {
         leaf.abandon_before_verdict(false, None),
         crate::containment::cgroup::Abandoned::Ended
     );
-    assert_eq!(crate::containment::cgroup::fault::take_signalled_by_pid(), 0);
+    assert_eq!(
+        crate::containment::cgroup::fault::take_child_sends(),
+        [crate::containment::cgroup::fault::ChildSend::Handle]
+    );
     assert_eq!(crate::containment::cgroup::fault::take_reaped_orphans(), Vec::new());
 }
 
@@ -2770,9 +2773,29 @@ fn an_abandoned_child_that_refuses_the_kill_is_reaped_once_it_exits() {
     crate::containment::cgroup::fault::set_force_child_kill_denied(true);
     crate::containment::cgroup::fault::set_background_reap_notifier(reaped_tx);
 
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+
     assert_eq!(
         leaf.abandon_before_verdict(false, None),
         crate::containment::cgroup::Abandoned::OutOfReach
+    );
+    assert_eq!(
+        crate::containment::cgroup::fault::take_child_sends(),
+        [
+            crate::containment::cgroup::fault::ChildSend::Group,
+            crate::containment::cgroup::fault::ChildSend::Handle
+        ],
+        "no retry by its bare pid"
+    );
+    let group_warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "process group")
+        .into_iter()
+        .filter(|(level, _)| *level == log::Level::Warn)
+        .collect();
+    assert_eq!(
+        group_warns.len(),
+        1,
+        "the refused group kill is warned about: {group_warns:?}"
     );
     crate::test_child::assert_echoes(&mut stdin, &mut stdout);
     assert!(!reaped(&pidfd), "the child refused the kill and is still running");
@@ -2783,11 +2806,10 @@ fn an_abandoned_child_that_refuses_the_kill_is_reaped_once_it_exits() {
     assert!(reaped(&pidfd), "the child must be reaped once it exits");
 }
 
-/// An abandoned child is killed as the process group it leads: what it forked after `exec` is in
-/// that group, whether or not it is in the leaf. Here the leaf's own kill kills nothing (a
-/// directory, not a cgroup), so only the group kill can end the descendant, which holds the
-/// child's stdout: reading it to EOF proves both dead. The descendant is a `cat` blocked on a
-/// stdin this test holds (see `test_child::BLOCKER_ARGV` for the idiom), so it dies only from a
+/// An abandoned child whose placement failed is killed as the process group it leads: what it
+/// forked after `exec` is in that group, outside the leaf, so only the group kill can end the
+/// descendant, which holds the child's stdout: reading it to EOF proves both dead. The descendant
+/// is a `cat` blocked on a stdin this test holds (see `test_child::BLOCKER_ARGV` for the idiom), so it dies only from a
 /// real signal. The stdin is released by `fault::set_before_exit_wait`, which fires after
 /// `end_child`'s own kill and before its blocking `waitid` on the shell: the shell is parked in
 /// its own `wait`, so with that kill skipped `drop(leaf)` would never return. A real kill has
@@ -2806,7 +2828,7 @@ fn an_abandoned_child_is_killed_with_the_group_it_leads() {
     let mut child = spawn_placing(
         &leaf,
         &["/bin/sh", "-c", "exec 3<&0; cat <&3 3<&- & echo forked; wait"],
-        false,
+        true,
         std::process::Stdio::piped(),
         std::process::Stdio::piped(),
     );
