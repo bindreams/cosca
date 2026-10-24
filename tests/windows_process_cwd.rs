@@ -113,10 +113,11 @@ fn a_drive_relative_current_dir_takes_the_drives_own_directory_as_win32_does(#[f
 }
 
 #[cfg(windows)]
-/// M7 (#156, untangling P1a), the rows whose `=X:` value names a directory on drive X itself: what
-/// a child's `GetFullPathNameW` makes of `X:tool` given a block with that value and a cwd on another
-/// drive, against D1's prediction. `tests/common/drive_rule.rs` has the runner, and
-/// `windows_path_resolution`'s `m7_` survey the rows that need no mapping.
+/// M7 (#156, untangling P1a), the rows whose `=X:` value names a directory on drive X itself, and
+/// the partially qualified values whose target must exist: what a child's `GetFullPathNameW` makes
+/// of `X:tool` given a block with that value and a cwd on another drive (for those values, of
+/// `T:tool` with the child's cwd on X), against D1's prediction. `tests/common/drive_rule.rs` has
+/// the runner, and `windows_path_resolution`'s `m7_` survey the rows that need no mapping.
 ///
 /// Records only. Preconditions, asserted: the mapping serves its directories, the child runs in
 /// the row's cwd and sees the row's `=X:` value.
@@ -126,24 +127,30 @@ fn a_drive_relative_current_dir_takes_the_drives_own_directory_as_win32_does(#[f
 #[skuld::test]
 fn m7_a_drive_relative_name_against_a_drive_directory_on_its_own_drive(#[fixture(drive_mapping)] _group: &Group) {
     use common::drive_rule::{canonical, free_drive, run, Cwd, Render, Row, Var};
+    use common::subst::Subst;
 
     let tmp = tempfile::tempdir().unwrap();
     let d = canonical(tmp.path());
     let m = format!(r"{d}\m");
     let long_rel = format!(r"long\{}\{}\{}", "a".repeat(100), "a".repeat(100), "a".repeat(60));
-    for sub in [r"e", r"m\exists", r"m\vx", &format!(r"m\{long_rel}")] {
+    for sub in [r"e", r"m\exists", r"m\vx", r"m\e\exists", &format!(r"m\{long_rel}")] {
         std::fs::create_dir_all(format!(r"{d}\{sub}")).expect("create the row directories");
     }
     std::fs::write(format!(r"{m}\afile"), b"x").expect("create the file");
     let letter = free_drive((b'M'..=b'Z').rev());
     let x = format!("{letter}:");
-    let _mapping = DriveMapping::new(&x, &m);
+    let mut mapping = Subst::new(&x, std::path::Path::new(&m)).unwrap_or_else(|e| panic!("map {x} to {m}: {e}"));
     let long = format!(r"{x}\{long_rel}");
     assert!(
         long.encode_utf16().count() > 260,
         "precondition: {long} is longer than MAX_PATH"
     );
-    for dir in [format!(r"{x}\exists"), format!(r"\\?\{x}\vx"), long.clone()] {
+    for dir in [
+        format!(r"{x}\exists"),
+        format!(r"{x}\e\exists"),
+        format!(r"\\?\{x}\vx"),
+        long.clone(),
+    ] {
         assert!(
             std::path::Path::new(&dir).is_dir(),
             "precondition: the mapping serves {dir}"
@@ -180,9 +187,12 @@ fn m7_a_drive_relative_name_against_a_drive_directory_on_its_own_drive(#[fixture
             "Value",
             format!(r"{x}\exists\tool"),
         ),
+        // The child (`cosca_testbin`) has no `longPathAware` manifest: this records its behaviour,
+        // not ntdll's threshold, which M7b measures.
         row("longer_than_max_path", &long, &tool, "Value", format!(r"{long}\tool")),
-        // A verbatim value: the plan expects the name it makes verbatim normalised. These rows
-        // block P4 and P5 if Win32 takes the value literally or ignores it.
+        // A verbatim value: the plan expects the name it makes verbatim normalised. ntdll ignores
+        // the value (observed_arm=Root), so these three rows block P4 and P5 under the plan's rule
+        // (blocking if Win32 takes the value literally or ignores it).
         row(
             "verbatim_dotted_name",
             &verbatim,
@@ -197,8 +207,8 @@ fn m7_a_drive_relative_name_against_a_drive_directory_on_its_own_drive(#[fixture
             "Value",
             format!(r"{verbatim}\sub"),
         ),
-        // `main`'s `append` stops `..` at the drive, giving the prediction; Win32's floor would give
-        // `\\?\t.exe`. Neither blocks.
+        // `main`'s `append` stops `..` at the drive, giving the prediction. Win32's floor question
+        // is unanswered, since ntdll ignores the value: the row blocks, like the two above.
         row(
             "verbatim_up_past_root",
             &verbatim,
@@ -210,58 +220,32 @@ fn m7_a_drive_relative_name_against_a_drive_directory_on_its_own_drive(#[fixture
     for row in &rows {
         run(row, &render, Some((letter, 'D')));
     }
-}
 
-#[cfg(windows)]
-/// A drive letter mapped to a directory with `DefineDosDeviceW` for as long as it lives.
-struct DriveMapping {
-    drive: Vec<u16>,
-    target: Vec<u16>,
-}
-
-#[cfg(windows)]
-impl DriveMapping {
-    fn new(drive: &str, target: &str) -> Self {
-        use windows::core::PCWSTR;
-        use windows::Win32::Storage::FileSystem::{DefineDosDeviceW, DEFINE_DOS_DEVICE_FLAGS};
-        let wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
-        let mapping = Self {
-            drive: wide(drive),
-            target: wide(target),
-        };
-        // SAFETY: both strings are NUL-terminated and outlive the call.
-        unsafe {
-            DefineDosDeviceW(
-                DEFINE_DOS_DEVICE_FLAGS(0),
-                PCWSTR(mapping.drive.as_ptr()),
-                PCWSTR(mapping.target.as_ptr()),
-            )
-        }
-        .unwrap_or_else(|e| panic!("map {drive} to {target}: {e}"));
-        mapping
+    // A value that is not fully qualified must be refused even when it names an existing directory.
+    // `exists` and `\exists` resolve against the child's own cwd, so it runs on X, and the name's
+    // drive is T. The parent has asserted above that each target exists.
+    let t = &d[..2];
+    let cwd_x = format!(r"{x}\e");
+    let partial = |key, value: String| Row {
+        key,
+        cwd: Cwd::Given(cwd_x.clone()),
+        block: vec![sr.clone(), format!("={t}={value}")],
+        name: format!("{t}tool"),
+        arm: "Root",
+        predicted: format!(r"{t}\tool"),
+        var: Var::Is(Some(value)),
+    };
+    for row in [
+        partial("drive_relative", format!("{x}exists")),
+        partial("relative", "exists".to_owned()),
+        partial("rooted", r"\exists".to_owned()),
+    ] {
+        run(&row, &render, Some((letter, 'D')));
     }
-}
 
-#[cfg(windows)]
-impl Drop for DriveMapping {
-    fn drop(&mut self) {
-        use windows::core::PCWSTR;
-        use windows::Win32::Storage::FileSystem::{DefineDosDeviceW, DDD_EXACT_MATCH_ON_REMOVE, DDD_REMOVE_DEFINITION};
-        // SAFETY: both strings are NUL-terminated and outlive the call.
-        let removed = unsafe {
-            DefineDosDeviceW(
-                DDD_REMOVE_DEFINITION | DDD_EXACT_MATCH_ON_REMOVE,
-                PCWSTR(self.drive.as_ptr()),
-                PCWSTR(self.target.as_ptr()),
-            )
-        };
-        if let Err(e) = removed {
-            common::test_groups::fail_unless_panicking(format!(
-                "could not remove the {} mapping: {e}",
-                String::from_utf16_lossy(&self.drive[..self.drive.len() - 1])
-            ));
-        }
-    }
+    mapping
+        .remove()
+        .unwrap_or_else(common::test_groups::fail_unless_panicking);
 }
 
 #[cfg(windows)]

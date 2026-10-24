@@ -32,7 +32,7 @@ impl Cwd {
 pub enum Var {
     /// This value, or unset for `None`: the row's block reached the child as built.
     Is(Option<String>),
-    /// Which entry ntdll reads is itself the measurement.
+    /// Which entry ntdll reads is itself the measurement, so only: one of the block's `=X:` values.
     Recorded,
 }
 
@@ -43,7 +43,7 @@ pub struct Row {
     pub block: Vec<String>,
     /// The drive-relative name given to `GetFullPathNameW`.
     pub name: String,
-    /// `Base`, `Value` or `Root`.
+    /// The arm D1 predicts: `Base`, `Value` or `Root`.
     pub arm: &'static str,
     pub predicted: String,
     pub var: Var,
@@ -108,15 +108,25 @@ pub fn run(row: &Row, render: &Render, drive: Option<(char, char)>) {
         row.key
     );
     let var = value(&report, "var");
-    if let Var::Is(expected) = &row.var {
-        let expected = expected.as_deref().unwrap_or("<unset>");
-        assert_eq!(
-            var, expected,
+    match &row.var {
+        Var::Is(expected) => assert_eq!(
+            var,
+            expected.as_deref().unwrap_or("<unset>"),
             "M7 {}: precondition: the child sees the block's =X: value",
             row.key
-        );
+        ),
+        Var::Recorded => assert!(
+            row.block
+                .iter()
+                .filter_map(|e| e.strip_prefix('=')?.split_once('='))
+                .any(|(_, v)| v == var),
+            "M7 {}: precondition: the child sees one of the block's =X: values, not {var:?}",
+            row.key
+        ),
     }
     let full = value(&report, "full");
+    let var_after = value(&report, "var_after");
+    let observed = observed_arm(row.cwd.path(), var, var_after, full);
     let show = |s: &str| {
         let s = render.apply(s);
         match drive {
@@ -135,11 +145,31 @@ pub fn run(row: &Row, render: &Render, drive: Option<(char, char)>) {
     );
     println!("M7 {k} name={}", show(&row.name));
     println!("M7 {k} var={}", show(var));
-    println!("M7 {k} arm={}", row.arm);
+    println!("M7 {k} predicted_arm={}", row.arm);
+    println!("M7 {k} observed_arm={observed}");
     println!("M7 {k} predicted={}", show(&row.predicted));
     println!("M7 {k} full={}", show(full));
-    println!("M7 {k} var_after={}", show(value(&report, "var_after")));
+    println!("M7 {k} var_after={}", show(var_after));
     println!("M7 {k} agrees={}", full == row.predicted);
+}
+
+/// The arm ntdll took, from the child's report: `Base` when `full` is under the cwd; `Root` when the
+/// child's `=X:` ends as the drive's root `X:\` (ntdll rewrites it there when it rejects the value);
+/// `Value` when `full` is under the value; else `Other`. Case-insensitive for ASCII only.
+fn observed_arm(cwd: &str, var: &str, var_after: &str, full: &str) -> &'static str {
+    let under = |path: &str, dir: &str| {
+        let (path, dir) = (path.to_ascii_lowercase(), dir.to_ascii_lowercase());
+        path.starts_with(&format!("{}\\", dir.trim_end_matches('\\')))
+    };
+    if under(full, cwd) {
+        "Base"
+    } else if var_after.chars().count() == 3 && var_after.ends_with(":\\") {
+        "Root"
+    } else if under(full, var) {
+        "Value"
+    } else {
+        "Other"
+    }
 }
 
 /// The value of the first `key=` line of `report`; a missing key fails the test.

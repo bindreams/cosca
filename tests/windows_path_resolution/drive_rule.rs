@@ -1,18 +1,23 @@
 //! M7 (#156, untangling P1a): the `=X:` rows that need no mapped drive. `tests/common/drive_rule.rs`
-//! has the runner and D1's arms; `windows_process_cwd.rs` has the rows whose `=X:` value names a
-//! directory on drive X itself, which needs X mapped.
+//! has the runner and D1's arms; `windows_process_cwd.rs` has the rows that need a mapped drive: an
+//! `=X:` value naming a directory on drive X itself, and a partially qualified value whose target
+//! must exist.
 
 use crate::common::drive_rule::{canonical, free_drive, run, Cwd, Render, Row, Var};
 use crate::provenance::survey_platform;
 use crate::test_groups::{path_probes, Group};
 
-/// Survey: M7's rows on an unmapped drive letter (rendered `D:`), with every `=D:` value naming a
-/// directory on the temp directory's drive T. Then the rows where E is on T, verbatim or UNC.
+/// M7's rows that need no mapped drive: an unmapped drive letter (rendered `D:`) whose `=D:` value,
+/// where it names a directory, names one on the temp directory's drive T. Then the rows where E is
+/// on T, verbatim or UNC. The rows whose value must exist relative to the child's cwd are in
+/// `windows_process_cwd`'s mapped test. The letter is searched in `G..=L`, disjoint from the mapped
+/// tests' `M..=Z`.
 ///
-/// Preconditions, asserted: the child runs in the row's cwd and sees the row's `=X:` value. The UNC
-/// rows, last, need `\\localhost\<T>$` served and openable, as CI runners serve it.
+/// Preconditions, asserted: the child runs in the row's cwd and sees the row's `=X:` value (a
+/// `Recorded` row, one the block holds). The UNC rows, last, need `\\localhost\<T>$` served and
+/// openable, as CI runners serve it.
 #[skuld::test]
-fn m7_a_drive_relative_name_against_the_childs_own_drive_directory(#[fixture(path_probes)] _group: &Group) {
+fn m7_a_drive_relative_name_against_a_childs_block_without_a_mapped_drive(#[fixture(path_probes)] _group: &Group) {
     survey_platform();
     let tmp = tempfile::tempdir().expect("tempdir");
     let d = canonical(tmp.path());
@@ -23,7 +28,7 @@ fn m7_a_drive_relative_name_against_the_childs_own_drive_directory(#[fixture(pat
     let exists = format!(r"{d}\exists");
     let exists2 = format!(r"{d}\exists2");
     let t = &d[..2];
-    let letter = free_drive(b'G'..=b'Z');
+    let letter = free_drive(b'G'..=b'L');
     let q = format!("{letter}:");
     let lq = q.to_ascii_lowercase();
     let lt = t.to_ascii_lowercase();
@@ -36,8 +41,8 @@ fn m7_a_drive_relative_name_against_the_childs_own_drive_directory(#[fixture(pat
     let block = |entries: &[String]| [vec![sr.clone()], entries.to_vec()].concat();
     let set = |v: &str| Var::Is(Some(v.to_owned()));
     let rows = vec![
-        // #173's B3 values, replayed through a child's block. `=D:` names no existing directory
-        // here except where it names one on T.
+        // #173's B3 values, replayed through a child's block. The partially qualified ones are in
+        // `windows_process_cwd`: they need a target that exists.
         Row {
             key: "unset",
             cwd: given(),
@@ -46,33 +51,6 @@ fn m7_a_drive_relative_name_against_the_childs_own_drive_directory(#[fixture(pat
             arm: "Root",
             predicted: format!(r"{q}\tool"),
             var: Var::Is(None),
-        },
-        Row {
-            key: "drive_relative",
-            cwd: given(),
-            block: block(&[format!("={q}={q}exists")]),
-            name: format!("{q}tool"),
-            arm: "Root",
-            predicted: format!(r"{q}\tool"),
-            var: set(&format!("{q}exists")),
-        },
-        Row {
-            key: "relative",
-            cwd: given(),
-            block: block(&[format!("={q}=exists")]),
-            name: format!("{q}tool"),
-            arm: "Root",
-            predicted: format!(r"{q}\tool"),
-            var: set("exists"),
-        },
-        Row {
-            key: "rooted",
-            cwd: given(),
-            block: block(&[format!(r"={q}=\exists")]),
-            name: format!("{q}tool"),
-            arm: "Root",
-            predicted: format!(r"{q}\tool"),
-            var: set(r"\exists"),
         },
         Row {
             key: "other_drive",
