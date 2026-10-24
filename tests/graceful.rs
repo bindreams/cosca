@@ -268,20 +268,20 @@ fn process_lone_graceful_unsupported_on_windows() {
 
 #[skuld::test]
 fn process_kill_tree_tears_down_tree() {
-    use std::io::Read;
     // An UNcontained 2-level tree (root R + grandchild G). Take the root foreign and kill_tree
-    // it: the identity-walk (snapshot-then-kill) reaches both. Both sockets EOF. All OSes.
-    let (child, mut socks) = common::spawn_grandchild(false);
+    // it: the identity-walk (snapshot-then-kill) reaches both. All OSes.
+    let (child, socks) = common::spawn_tree_with("spawn-grandchild", false, |cmd| {
+        cmd.env(common::ECHO_HELD_ENV, "1");
+    });
+    let [root, grand]: [_; 2] = socks.try_into().expect("a root and a grandchild socket");
+    let (root, grand) = (
+        common::Member::new(root, child.id().pid()),
+        common::Member::new(grand, common::last_reported_grandchild().expect("the grandchild's pid")),
+    );
     let p = cosca::Process::from_pid(child.id().pid()).found().expect("resolves");
     p.kill_tree().expect("kill_tree");
-    for (i, s) in socks.iter_mut().enumerate() {
-        let mut buf = [0u8; 1];
-        match s.read(&mut buf) {
-            Ok(0) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
-            other => panic!("tree member {i} not torn down: {other:?}"),
-        }
-    }
+    // A kill that sent nothing fails here by assertion instead of hanging a read for an EOF.
+    common::assert_members_killed(vec![(root, "the root"), (grand, "the grandchild")]);
     let _ = child.wait(); // reap the owned root (grandchild is reaped by init)
 }
 
@@ -385,8 +385,13 @@ fn child_terminate_delivers_ctrl_break_to_a_contained_root() {
     let mut ack = [0u8; 1];
     sock.read_exact(&mut ack).expect("the child must acknowledge the break");
     assert_eq!(&ack, b"B", "wrong ack byte");
-    child.kill_tree().expect("cleanup");
-    let _ = child.wait();
+    // The kill is the subject now: the root survives the break by design, so release it, which
+    // ends the wait whether or not the kill came, then tell the kill (exit code 1) from a clean
+    // exit on the released socket (exit code 0).
+    child.kill_tree().expect("kill_tree");
+    drop(sock);
+    let status = child.wait().expect("reap");
+    assert_eq!(status.code(), Some(1), "kill_tree must kill the root, got {status:?}");
 }
 
 /// The graceful path end to end: no handler, so the default disposition applies and the child
@@ -493,7 +498,12 @@ fn child_graceful_shutdown_signals_the_group_but_only_kills_the_child() {
 
     use cosca::containment::TreeDrain;
 
-    let (child, mut socks) = common::spawn_tree("spawn-grandchild-ack-break", true);
+    let (child, socks) = common::spawn_tree("spawn-grandchild-ack-break", true);
+    let [_root_sock, grand_sock]: [_; 2] = socks.try_into().expect("a root and a grandchild socket");
+    let mut grand = common::Member::new(
+        grand_sock,
+        common::last_reported_grandchild().expect("the grandchild's pid"),
+    );
     let status = child
         .graceful_shutdown(Duration::ZERO)
         .expect("graceful_shutdown on a console-group root");
@@ -505,7 +515,8 @@ fn child_graceful_shutdown_signals_the_group_but_only_kills_the_child() {
     // Positive proof the cooperative half reached a descendant the forced half will not touch.
     // The grandchild's handler reports "handled", so this read cannot race its death.
     let mut ack = [0u8; 1];
-    socks[1]
+    grand
+        .sock
         .read_exact(&mut ack)
         .expect("the grandchild must acknowledge the break");
     assert_eq!(&ack, b"B", "wrong ack byte");
@@ -516,15 +527,10 @@ fn child_graceful_shutdown_signals_the_group_but_only_kills_the_child() {
         TreeDrain::MembersRemain,
         "the escalation must not have reached the group"
     );
-    child.kill_tree().expect("cleanup");
-    for (i, s) in socks.iter_mut().enumerate() {
-        let mut buf = [0u8; 1];
-        match s.read(&mut buf) {
-            Ok(0) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
-            other => panic!("tree member {i} not torn down: {other:?}"),
-        }
-    }
+    // The grandchild survived the break and holds its socket, so it ends only by the kill. The
+    // root is already dead.
+    child.kill_tree().expect("kill_tree");
+    common::assert_members_killed(vec![(grand, "the grandchild")]);
     let _ = child.wait();
 }
 

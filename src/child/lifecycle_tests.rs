@@ -29,10 +29,19 @@ fn quick_contained_child() -> crate::Child {
     cmd.spawn().expect("spawn")
 }
 
-/// A contained [`crate::test_child::BLOCKER_ARGV`] child and its stdin writer, which the caller
-/// must keep for exactly as long as the child must stay running.
+/// A contained blocker and its stdin writer, which the caller must keep for exactly as long as the
+/// child must stay running. On Windows it is `more.com`, not the `findstr` of
+/// [`crate::test_child::BLOCKER_ARGV`]: released stdin must not look like a kill to
+/// [`crate::test_child::assert_killed`].
 fn long_lived_contained_child() -> (crate::Child, std::io::PipeWriter) {
-    crate::test_child::held_contained_blocker(crate::Stdio::null())
+    #[cfg(unix)]
+    {
+        crate::test_child::held_contained_blocker(crate::Stdio::null())
+    }
+    #[cfg(windows)]
+    {
+        crate::test_child::windows_blocker()
+    }
 }
 
 /// End a [`long_lived_contained_child`] with `kill_tree`, then release its stdin and reap it. The

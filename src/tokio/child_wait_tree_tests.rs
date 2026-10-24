@@ -27,7 +27,16 @@ fn quick_contained_cmd() -> crate::tokio::Command {
 
 /// Async twin of `child::lifecycle_tests::long_lived_contained_child`.
 fn long_lived_contained_child() -> (crate::tokio::Child, crate::tokio::ChildStdin) {
-    crate::test_child::held_contained_blocker_async(crate::Stdio::null())
+    #[cfg(unix)]
+    {
+        crate::test_child::held_contained_blocker_async(crate::Stdio::null())
+    }
+    #[cfg(windows)]
+    {
+        crate::test_child::windows_blocker_async(|cmd| {
+            cmd.contain();
+        })
+    }
 }
 
 /// Async twin of `child::lifecycle_tests::kill_then_release`.

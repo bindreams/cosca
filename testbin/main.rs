@@ -212,7 +212,8 @@ fn run_control_echo_pid(addr: &str, tag: &str) -> ! {
     }
 }
 
-/// The env var that makes [`hold`] answer the test's bytes instead of leaving on the first one.
+/// The env var that makes [`hold`] answer the test's bytes instead of leaving on the first one. Keep in
+/// sync with `ECHO_HELD_ENV` in `tests/common/member.rs`.
 const ECHO_HELD_ENV: &str = "COSCA_TEST_ECHO_HELD";
 
 /// Block on `sock` until the test closes it, or writes a byte. With [`ECHO_HELD_ENV`] set the member

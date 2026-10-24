@@ -966,17 +966,18 @@ fn unix_terminate_tree_reaps_the_grandchild() {
 #[cfg(windows)]
 #[skuld::test]
 fn windows_kill_tree_reaps_the_grandchild() {
-    let (child, mut gc_stream) = spawn_contained_tree();
+    let (child, gc_stream) = spawn_contained_tree();
     assert_eq!(child.containment(), cosca::Containment::JobObject);
+    let grand = common::Member::new(
+        gc_stream,
+        common::last_reported_grandchild().expect("the grandchild's pid"),
+    );
 
     child.kill_tree().expect("kill_tree");
+    // `TerminateJobObject` only starts the termination: the proof is the grandchild's exit event
+    // and its kill exit code, with its socket released so a missing kill ends the wait too.
+    common::assert_members_killed(vec![(grand, "the grandchild")]);
     let _ = child.wait(); // reap the root
-
-    // Deterministic proof: the grandchild's control socket closes on its death.
-    // On Windows, TerminateJobObject causes the TCP socket to close with a
-    // ConnectionReset (WSAECONNRESET/10054) rather than a graceful EOF — both
-    // prove the grandchild is dead, and `assert_dead` accepts either.
-    common::assert_dead(&mut gc_stream, "the grandchild after kill_tree");
 }
 
 /// `terminate_tree` under JobObject containment reaps the whole tree. The
@@ -1212,7 +1213,12 @@ fn spawn_treewalk_tree() -> (cosca::Child, std::net::TcpStream, std::net::TcpStr
 fn treewalk_kill_tree_reaps_the_grandchild() {
     // Hold `root_stream` until the kill: it keeps the root alive so TreeWalk
     // enumerates the grandchild as a live descendant (not a reparented orphan).
-    let (child, mut gc_stream, mut root_stream) = spawn_treewalk_tree();
+    let (child, gc_stream, root_stream) = spawn_treewalk_tree();
+    let grand = common::Member::new(
+        gc_stream,
+        common::last_reported_grandchild().expect("the grandchild's pid"),
+    );
+    let root = common::Member::new(root_stream, child.id().pid());
     let expected = if cfg!(target_os = "macos") {
         cosca::Containment::FdMarker
     } else {
@@ -1223,8 +1229,7 @@ fn treewalk_kill_tree_reaps_the_grandchild() {
     child.kill_tree().expect("kill_tree");
     // The root still holds its socket, so a kill that did not come would leave it alive: prove
     // both members dead before the wait that only their death ends.
-    common::assert_dead(&mut root_stream, "the root after kill_tree");
-    common::assert_dead(&mut gc_stream, "the grandchild after kill_tree");
+    common::assert_members_killed(vec![(root, "the root"), (grand, "the grandchild")]);
     let _ = child.wait(); // reap the root
 }
 

@@ -39,6 +39,9 @@ mod uid_switch;
 #[cfg(unix)]
 pub use uid_switch::*;
 
+mod member;
+pub use member::*;
+
 mod report;
 pub use report::*;
 
@@ -427,6 +430,16 @@ pub fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 /// when the whole tree is torn down, so callers prove teardown by reading EOF on both, never by
 /// a timer.
 pub fn spawn_tree(mode: &str, contain: bool) -> (cosca::Child, Vec<TcpStream>) {
+    spawn_tree_with(mode, contain, |_| {})
+}
+
+/// [`spawn_tree`] with the command further configured by `configure` (an env var, say) before the
+/// spawn. The returned sockets are `[root, grandchild]`.
+pub fn spawn_tree_with(
+    mode: &str,
+    contain: bool,
+    configure: impl FnOnce(&mut cosca::Command),
+) -> (cosca::Child, Vec<TcpStream>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap().to_string();
     let mut cmd = cosca::Command::new();
@@ -439,6 +452,7 @@ pub fn spawn_tree(mode: &str, contain: bool) -> (cosca::Child, Vec<TcpStream>) {
     }
     let report = TcpListener::bind("127.0.0.1:0").expect("bind the grandchild pid report listener");
     cmd.env(GC_PID_ADDR_ENV, report.local_addr().unwrap().to_string());
+    configure(&mut cmd);
     let mut child = cmd.spawn().expect("spawn tree");
     let grand = report_grandchild(&report, &mut child);
     // Demux by tag exactly like spawn_tree_async (accept order is not guaranteed, and a
@@ -685,31 +699,6 @@ pub fn assert_echoes(sock: &mut std::net::TcpStream, who: &str) {
     sock.read_exact(&mut b)
         .unwrap_or_else(|e| panic!("{who} must echo the byte back while alive: {e}"));
     assert_eq!(&b, b"p", "{who} echoed {b:?} instead of the byte it was sent");
-}
-
-/// The env var that makes the testbin's `control-block` family echo each byte the test writes
-/// instead of leaving on it, so [`assert_dead`] can tell a killed member from one that is alive.
-/// The `control-echo-pid` members echo regardless.
-pub const ECHO_HELD_ENV: &str = "COSCA_TEST_ECHO_HELD";
-
-/// Prove a member that echoes (see [`ECHO_HELD_ENV`]) is DEAD without waiting for its death: send
-/// a byte and read. A killed member refuses the write or gives EOF or a reset on the read; one a
-/// missing kill left alive echoes the byte. That makes a `kill_tree` that sends nothing fail here
-/// by assertion instead of hanging a blocking read for an EOF, so call it right after the kill,
-/// before any wait on the tree.
-pub fn assert_dead(sock: &mut std::net::TcpStream, who: &str) {
-    use std::io::ErrorKind::{BrokenPipe, ConnectionAborted, ConnectionReset};
-    match sock.write_all(b"p") {
-        Ok(()) => {}
-        Err(e) if matches!(e.kind(), BrokenPipe | ConnectionReset | ConnectionAborted) => return,
-        Err(e) => panic!("writing to {who} failed unexpectedly: {e}"),
-    }
-    let mut b = [0u8; 1];
-    match sock.read(&mut b) {
-        Ok(0) => {}
-        Err(e) if matches!(e.kind(), ConnectionReset | ConnectionAborted) => {}
-        other => panic!("{who} must be dead after the kill, but answered: {other:?}"),
-    }
 }
 
 /// Lower this process' own `RLIMIT_NOFILE` soft limit to `to`, for the life of the guard,

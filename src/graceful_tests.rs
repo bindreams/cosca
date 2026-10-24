@@ -60,11 +60,12 @@ fn signal_attempts_a_child_whose_group_may_be_in_another_console() {
         group.is_ok(),
         "the two console mechanisms must take one path: {other:?} vs {group:?}"
     );
-    child.kill_tree().expect("kill_tree");
-    // Released after the kill and before the wait: a `kill_tree` that sends nothing lets the
-    // blocker exit by itself and fails the assertion, instead of leaving the wait unbounded.
+    // Cleanup, not the subject: the two breaks may already have ended the blocker (a delivered break
+    // ends a handler-less child), so the kill's outcome and the exit status prove nothing here.
+    // Releasing stdin keeps the wait from blocking if the blocker is still alive.
+    _ = child.kill_tree();
     drop(stdin);
-    crate::test_child::assert_killed("the blocker", child.wait().expect("reap the blocker"));
+    _ = child.wait();
 }
 
 // The dispatcher's half of `uac_elevated_attachment_has_no_in_process_route`, which pins only
