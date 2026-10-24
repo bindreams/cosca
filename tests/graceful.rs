@@ -342,10 +342,11 @@ fn graceful_mechanism_is_process_on_unix() {
     let (contained, _s2) = common::spawn_control("control-block", &["R"], true);
     assert_eq!(uncontained.graceful_mechanism(), GracefulMechanism::Process);
     assert_eq!(contained.graceful_mechanism(), GracefulMechanism::Process);
-    for child in [uncontained, contained] {
-        child.kill().expect("cleanup");
-        let _ = child.wait();
-    }
+    uncontained.kill().expect("cleanup");
+    let _ = uncontained.wait();
+    // The group, before the reap: a contained child reaped first and then dropped warns (#382).
+    contained.kill_tree().expect("cleanup the group");
+    let _ = contained.wait();
 }
 
 /// On Windows the two must DISAGREE: containment is what sets `CREATE_NEW_PROCESS_GROUP`, so an
@@ -443,7 +444,8 @@ fn child_graceful_shutdown_escalates_when_the_break_is_ignored() {
 fn child_terminate_reports_ok_for_an_already_exited_child() {
     let _warns = common::warn_watch();
     let (child, _sock) = common::spawn_control("control-block", &["R"], true);
-    child.kill().expect("kill");
+    // `kill_tree`, not `kill`: reaping a contained root first and then dropping it warns (#382).
+    child.kill_tree().expect("kill");
     let _status = child.wait().expect("reap");
     child.terminate().expect("already-dead must be Ok");
 }

@@ -42,7 +42,10 @@ fn containment_smoke() {
     let _warns = common::warn_watch();
     let tb = env!("CARGO_BIN_EXE_cosca_testbin");
     let mut cmd = cosca::Command::new();
-    cmd.executable(tb).args(["cosca_testbin", "exit", "0"]).contain();
+    cmd.executable(tb).args(["cosca_testbin", "exit", "0"]);
+    // On Linux this asks for a session, not `.contain()`'s cgroup leaf, which warns where none is
+    // delegated; the live cgroup mechanism is covered in the `cgroup` group (`spawn_io`).
+    common::contain_without_cgroup(&mut cmd);
     let child = cmd.spawn().expect("spawn contained child");
 
     // On every supported host (Unix + Windows) the strongest mechanism must
@@ -57,11 +60,7 @@ fn containment_smoke() {
     #[cfg(windows)]
     assert_eq!(child.containment(), Containment::JobObject);
     #[cfg(target_os = "linux")]
-    assert!(
-        matches!(child.containment(), Containment::CgroupV2 | Containment::ProcessGroup),
-        "Linux must use CgroupV2 or ProcessGroup, got {:?}",
-        child.containment()
-    );
+    assert_eq!(child.containment(), Containment::Session);
     #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
     assert!(
         matches!(

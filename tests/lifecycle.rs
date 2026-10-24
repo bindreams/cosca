@@ -137,8 +137,8 @@ fn nested_member_kill_tree_is_unsupported_end_to_end() {
     let mut cmd = Command::new();
     cmd.executable(testbin())
         .args(["cosca_testbin", "report-nested-kill-tree", &addr])
-        .env(common::ACK_ENV, "1")
-        .contain();
+        .env(common::ACK_ENV, "1");
+    common::contain_without_cgroup(&mut cmd);
     let mut child = cmd.spawn().expect("spawn reporter");
     let mut sock = common::accept_or_die(&listener, &mut child);
     let mut tag = [0u8; 1];
@@ -147,6 +147,8 @@ fn nested_member_kill_tree_is_unsupported_end_to_end() {
         &tag, b"D",
         "a nested member must report Containment::Delegated AND kill_tree() Unsupported"
     );
+    // The group, before the reap: a contained root reaped first and then dropped warns (#382).
+    child.kill_tree().expect("cleanup the group");
     let _ = child.wait();
 }
 

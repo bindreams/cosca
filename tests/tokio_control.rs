@@ -67,7 +67,10 @@ async fn async_tree_ops_unsupported_when_uncontained() {
 #[skuld::test]
 async fn async_kill_tree_tears_down_tree() {
     let _warns = common::warn_watch();
-    let (mut child, mut root, mut grand) = common::spawn_grandchild_async(true).await;
+    let (mut child, mut root, mut grand) = common::spawn_tree_async("spawn-grandchild", |cmd| {
+        common::contain_without_cgroup_async(cmd);
+    })
+    .await;
     child.kill_tree().expect("kill_tree");
     expect_eof("root", &mut root);
     expect_eof("grandchild", &mut grand);
@@ -82,7 +85,9 @@ async fn async_kill_tree_tears_down_tree() {
 #[cfg(unix)]
 #[skuld::test]
 async fn async_terminate_tree_soft_kills_the_group() {
-    let _warns = common::warn_watch();
+    // The soft signal alone is the subject, so the root is reaped before the drop and the drop
+    // says so (#382): a `kill_tree()` first would race the SIGTERM for the exit status.
+    let _warns = common::warn_watch().expecting("call kill_tree() before wait()");
     use std::os::unix::process::ExitStatusExt;
     // control-block honors SIGTERM: the group signal alone (signal-only op) tears it down.
     let (mut child, mut sock) = common::spawn_control_async("control-block", &["R"], true).await;
@@ -255,7 +260,7 @@ async fn async_graceful_tree_cancel_does_not_escalate_on_windows() {
     // BOTH members ignore CTRL_BREAK, so after poll-once + drop the root can only be dead if
     // something escalated — being alive proves the cancelled graceful sent nothing further.
     let (mut child, mut root, mut grand) = common::spawn_tree_async("spawn-grandchild-ignore-break", |cmd| {
-        cmd.contain();
+        common::contain_without_cgroup_async(cmd);
     })
     .await;
     {
@@ -296,7 +301,7 @@ async fn async_graceful_tree_cancel_does_not_escalate() {
     // poll-once + drop the root can only be dead if something escalated — being alive proves
     // the cancelled graceful sent nothing further.
     let (mut child, mut root, mut grand) = common::spawn_tree_async("spawn-grandchild-ignore-term", |cmd| {
-        cmd.contain();
+        common::contain_without_cgroup_async(cmd);
     })
     .await;
     {
@@ -329,7 +334,7 @@ async fn async_graceful_shutdown_tree_sweep_is_load_bearing_on_windows() {
     // BOTH members ignore CTRL_BREAK, so whether or not the soft signal reaches this console
     // group, only the ZERO-grace hard sweep can tear the tree down.
     let (mut child, mut root, mut grand) = common::spawn_tree_async("spawn-grandchild-ignore-break", |cmd| {
-        cmd.contain();
+        common::contain_without_cgroup_async(cmd);
     })
     .await;
     let status = child
@@ -369,7 +374,10 @@ async fn async_graceful_shutdown_tree_tears_down_tree() {
     use std::time::Duration;
     // A contained 2-level tree: the group's graceful signal (SIGTERM / CTRL_BREAK) plus the
     // hard sweep tear down BOTH members; both sockets EOF. All OSes.
-    let (mut child, mut root, mut grand) = common::spawn_grandchild_async(true).await;
+    let (mut child, mut root, mut grand) = common::spawn_tree_async("spawn-grandchild", |cmd| {
+        common::contain_without_cgroup_async(cmd);
+    })
+    .await;
     child
         .graceful_shutdown_tree(Duration::from_secs(30))
         .await
@@ -411,7 +419,7 @@ async fn async_graceful_shutdown_tree_escalates_with_surviving_grandchild() {
     // are provably alive when the grace elapses — the hard sweep, not the soft signal, must
     // tear down the root AND the surviving grandchild.
     let (mut child, mut root, mut grand) = common::spawn_tree_async("spawn-grandchild-ignore-term", |cmd| {
-        cmd.contain();
+        common::contain_without_cgroup_async(cmd);
     })
     .await;
     let status = child
@@ -450,7 +458,7 @@ async fn async_graceful_shutdown_tree_sweeps_survivor_after_graceful_root_exit()
     // completes as soon as the root exits, so the sweep never runs concurrently with a
     // still-alive root at all.
     let (mut child, mut root, mut grand) = common::spawn_tree_async("spawn-grandchild-stubborn-child", |cmd| {
-        cmd.contain();
+        common::contain_without_cgroup_async(cmd);
     })
     .await;
     child
@@ -554,7 +562,8 @@ async fn async_child_graceful_shutdown_escalates_when_the_break_is_ignored() {
 async fn async_child_terminate_reports_ok_for_an_already_exited_child() {
     let _warns = common::warn_watch();
     let (mut child, _sock) = common::spawn_control_async("control-block", &["R"], true).await;
-    child.kill().expect("kill");
+    // `kill_tree`, not `kill`: reaping a contained root first and then dropping it warns (#382).
+    child.kill_tree().expect("kill");
     let _status = child.wait().await.expect("reap");
     child.terminate().expect("already-dead must be Ok");
 }
@@ -662,14 +671,16 @@ async fn async_graceful_mechanism_matches_the_sync_surface() {
         "uncontained, after a reap: the two mirrors answer with different error shapes"
     );
 
+    // The group, before the reap, for the contained ones: a contained root reaped first and then
+    // dropped warns (#382).
     uncontained.kill().expect("cleanup");
     let _ = uncontained.wait().await;
-    contained.kill().expect("cleanup");
+    contained.kill_tree().expect("cleanup the group");
     let _ = contained.wait().await;
-    for child in [sync_uncontained, sync_contained] {
-        child.kill().expect("cleanup");
-        let _ = child.wait();
-    }
+    sync_uncontained.kill().expect("cleanup");
+    let _ = sync_uncontained.wait();
+    sync_contained.kill_tree().expect("cleanup the group");
+    let _ = sync_contained.wait();
 }
 
 #[cfg(feature = "tokio")]
