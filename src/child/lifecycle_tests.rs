@@ -44,9 +44,8 @@ fn long_lived_contained_child() -> (crate::Child, std::io::PipeWriter) {
     }
 }
 
-/// End a [`long_lived_contained_child`] with `kill_tree`, then release its stdin and reap it. The
-/// release comes after the kill and before the wait, so a `kill_tree` that sends nothing lets the
-/// child exit by itself and fails the status assertion instead of hanging the wait.
+/// Kill, release stdin, reap. Releasing after the kill makes a no-op `kill_tree` fail the status
+/// assertion instead of hanging the wait.
 fn kill_then_release(child: crate::Child, stdin: std::io::PipeWriter) {
     child.kill_tree().expect("kill_tree");
     drop(stdin);

@@ -385,9 +385,8 @@ fn child_terminate_delivers_ctrl_break_to_a_contained_root() {
     let mut ack = [0u8; 1];
     sock.read_exact(&mut ack).expect("the child must acknowledge the break");
     assert_eq!(&ack, b"B", "wrong ack byte");
-    // The kill is the subject now: the root survives the break by design, so release it, which
-    // ends the wait whether or not the kill came, then tell the kill (exit code 1) from a clean
-    // exit on the released socket (exit code 0).
+    // The root survives the break by design; releasing it ends the wait either way, and exit code 1
+    // (kill) tells it from a clean exit on release (0).
     child.kill_tree().expect("kill_tree");
     drop(sock);
     let status = child.wait().expect("reap");

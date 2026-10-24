@@ -504,9 +504,7 @@ async fn async_child_terminate_delivers_ctrl_break_to_a_contained_root() {
     let mut ack = [0u8; 1];
     sock.read_exact(&mut ack).expect("the child must acknowledge the break");
     assert_eq!(&ack, b"B", "wrong ack byte");
-    // The kill is the subject now: release the root, which survives the break by design and would
-    // otherwise block the wait if the kill sent nothing, then tell the kill (code 1) from a clean
-    // exit on the released socket (code 0).
+    // As the sync twin: release the root, then exit code 1 (kill) vs 0 (released).
     child.kill_tree().expect("kill_tree");
     drop(sock);
     let status = child.wait().await.expect("reap");

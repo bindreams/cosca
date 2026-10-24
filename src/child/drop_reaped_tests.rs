@@ -168,7 +168,7 @@ fn root_that_leaves_an_eof_reporter() -> Command {
 
 /// Real `killpg`: `kill_tree()` before `wait()` ends a descendant that outlives the root. Stdin is
 /// closed after the kill, so a `kill_tree` that sends nothing lets the descendant report `eof`
-/// instead of leaving the read below unbounded. Mutant: `kill_tree` sends nothing.
+/// instead of leaving the read below unbounded.
 #[skuld::test]
 fn kill_tree_before_wait_ends_a_descendant_of_an_exited_root() {
     let mut child = root_that_leaves_an_eof_reporter().spawn().expect("spawn");
@@ -457,8 +457,7 @@ fn drop_after_an_incomplete_tree_walk_kill_and_wait_still_warns() {
     let stdin = child.stdin().expect("stdin pipe");
     crate::containment::treewalk::fault::force_incomplete_once();
     child.kill_tree().expect("a tree walk reports Ok");
-    // Released after the kill and before the wait: a `kill_tree` that sends nothing lets the root
-    // exit by itself and fails here, instead of leaving the wait unbounded.
+    // Released after the kill so a no-op kill fails the assertion, not the wait.
     drop(stdin);
     crate::test_child::assert_killed("the root", child.wait().expect("reap the root"));
 

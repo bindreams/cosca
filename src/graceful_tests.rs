@@ -89,8 +89,7 @@ fn signal_refuses_a_child_cosca_did_not_create() {
     );
     assert!(detail.contains("kill()"), "the refusal must name the remedy: {detail}");
     child.kill_tree().expect("kill_tree");
-    // Released after the kill and before the wait: a `kill_tree` that sends nothing lets the
-    // blocker exit by itself and fails the assertion, instead of leaving the wait unbounded.
+    // Released after the kill so a no-op kill fails the assertion, not the wait.
     drop(stdin);
     crate::test_child::assert_killed("the blocker", child.wait().expect("reap the blocker"));
 }

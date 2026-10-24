@@ -404,8 +404,7 @@ async fn drop_after_an_incomplete_tree_walk_kill_and_wait_still_warns() {
     let stdin = child.stdin().expect("stdin pipe");
     crate::containment::treewalk::fault::force_incomplete_once();
     child.kill_tree().expect("a tree walk reports Ok");
-    // Released after the kill and before the wait: a `kill_tree` that sends nothing lets the root
-    // exit by itself and fails here, instead of leaving the wait unbounded.
+    // Released after the kill so a no-op kill fails the assertion, not the wait.
     drop(stdin);
     crate::test_child::assert_killed("the root", child.wait().await.expect("reap the root"));
 

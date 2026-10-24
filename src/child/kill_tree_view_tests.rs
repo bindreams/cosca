@@ -36,8 +36,7 @@ fn kill_tree_over_an_untrusted_view_errors_and_leaves_the_root_alive() {
 }
 
 /// A retry once the view recovers finds the tree and kills it. Mutant: "`kill_tree` sends nothing
-/// from its second call on". The blocker's stdin is released before the wait, so the root then
-/// leaves with status 0 and the assertion fails, instead of the wait hanging.
+/// from its second call on".
 #[skuld::test]
 fn kill_tree_succeeds_on_a_retry_after_the_view_recovers() {
     let (child, stdin) = treewalk_blocker();

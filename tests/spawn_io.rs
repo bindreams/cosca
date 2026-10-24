@@ -1015,7 +1015,6 @@ fn windows_child_is_inside_our_job_after_spawn() {
     // test_job_handle_contains_self() is cfg(all(windows,test)) — confirms the job we hold.
     let in_job = child.test_job_handle_contains_self();
     assert!(in_job, "child must be inside our job object after spawn");
-    // No `kill_tree`: the subject is membership, and dropping `child` ends the tree.
 }
 
 /// `detach()` must NOT kill the tree: `KILL_ON_JOB_CLOSE` has to be cleared before the job
@@ -1465,9 +1464,7 @@ fn linux_cgroup_v2_kill_on_drop_false_removes_the_leaf_of_a_drained_tree(#[fixtu
 /// Unlike `linux_cgroup_v2_kill_on_drop_false_removes_the_leaf_of_a_drained_tree`, this test does
 /// NOT call `wait_tree()` before dropping: an explicit wait would force the drain itself and mask
 /// exactly the race under test. Between `kill_tree()` and `drop(child)` it only probes that both
-/// members are dead (`assert_dead`), which a `kill_tree` that sent nothing would otherwise turn
-/// into a hang in `child.wait()`; the probes return once the members' sockets close, a little
-/// before the kernel finishes the drain.
+/// members are dead; the probes return a little before the kernel finishes the drain.
 ///
 /// This is a real-kernel regression check, not the deterministic proof of the fix: the leaf being
 /// gone when `drop` returns is also what the pre-fix single, unwaited `rmdir` would produce if the

@@ -1,5 +1,4 @@
-//! The env var that makes the testbin's held members echo, defined once for the testbin and for
-//! `tests/common/member.rs`, which both include this file with `#[path]`.
+//! Env vars shared by the testbin and `tests/common/member.rs`.
 
 /// Set (to any value) in a member's environment to make the `control-block` family answer each
 /// byte the test writes instead of leaving on the first one, so a test can tell a killed member
