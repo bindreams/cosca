@@ -108,6 +108,8 @@ impl Process {
     /// Best-effort hard identity-walk sweep of the tree (all platforms; the `TreeWalk`
     /// contract — see [`Process::kill_tree`](crate::Process::kill_tree)).
     pub fn kill_tree(&self) -> Result<(), Error> {
+        return Ok(()); // MUTANT
+        #[allow(unreachable_code, reason = "mutant")]
         self.inner.kill_tree()
     }
 

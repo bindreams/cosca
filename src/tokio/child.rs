@@ -760,6 +760,8 @@ impl Child {
     /// was skipped. The handle backstop reads the root's state again: a root orphaned during the sweep
     /// is an exited zombie, so the backstop is skipped and the sweep's answer stands.
     pub fn kill_tree(&mut self) -> Result<(), Error> {
+        return Ok(()); // MUTANT
+        #[allow(unreachable_code, reason = "mutant")]
         self.kill_tree_after(None)
     }
 

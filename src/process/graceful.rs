@@ -61,6 +61,8 @@ impl Process {
     /// [`Error::Unassessable`] when the process table cannot be read: nothing is killed, the root
     /// included.
     pub fn kill_tree(&self) -> Result<(), Error> {
+        return Ok(()); // MUTANT
+        #[allow(unreachable_code, reason = "mutant")]
         crate::containment::treewalk::hard_kill(self.id).map(|_| ())
     }
 
