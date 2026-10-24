@@ -1,7 +1,8 @@
 //! Test-only helper spawned by the crate's integration tests. std-only, with
 //! exceptions that use the `cosca` crate: the `report-nested-kill-tree` mode, to exercise
 //! the real nested-member `kill_tree` path, `spawn-dump-env-block` and `spawn-with-null-std`, to
-//! spawn through each Windows backend, and the frozen-spawn modes of `frozen.rs`. Behavior is selected by argv[1].
+//! spawn through each Windows backend, and the frozen-spawn modes of `frozen.rs`. Behavior is
+//! selected by argv[1].
 
 #[cfg(target_os = "macos")]
 use std::io::BufRead;

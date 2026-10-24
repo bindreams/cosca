@@ -288,8 +288,7 @@ pub(crate) fn spawn_raw(
     // SAME layout + single HANDLE_LIST source as the sync backend.
     let table = sync_raw::build_fd_table(&child_ends).not_started()?;
 
-    // THE SAME composition as the sync backend. `table` (`bytes`) and the attribute list stay alive
-    // until after CreateProcessW.
+    // `table` (`bytes`) and the attribute list stay alive until after CreateProcessW.
     let (mut si, attr) = sync_raw::startup_info(&child_ends, &table).not_started()?;
     // SINGLE handle source: `table.handles` is 0/1/2 + fd >= 3, each a distinct fresh dup (its
     // 0/1/2 entries ARE the hStd* handles), so no duplicate reaches the list.

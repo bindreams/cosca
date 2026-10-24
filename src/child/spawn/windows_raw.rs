@@ -229,7 +229,10 @@ pub(crate) fn build_fd_table(child_ends: &BTreeMap<Fd, ChildEnd>) -> Result<crt_
     let mut entries: BTreeMap<Fd, (HANDLE, crt_fds::FdKind)> = BTreeMap::new();
     for (&slot, end) in child_ends {
         let h = HANDLE(end.as_raw_handle());
-        // A null end (an inherited null std handle) is a gap: not open in the child, not inherited.
+        // A null end is a gap: not open in the child, not inherited. It comes from an inherited
+        // null std handle (this process's, e.g. a GUI process's), or from a dup of one: `fd(3,
+        // Stdio::merge(Fd::STDOUT))` with a null stdout leaves fd 3 closed in the child, as a null
+        // std slot is.
         if h.0.is_null() {
             continue;
         }
@@ -312,6 +315,11 @@ pub(crate) fn spawn_step(
     flags: u32,
     request: crate::command::flags::FlagsRequest,
 ) -> Result<(OwnedHandle, u32), Error> {
+    debug_assert_eq!(
+        handles.is_empty(),
+        si.lpAttributeList.0.is_null(),
+        "a HANDLE_LIST is attached exactly when there are handles to list"
+    );
     for &h in handles {
         set_inherit(h)?;
     }
@@ -473,12 +481,11 @@ pub(crate) fn can_terminate(pid: u32) -> bool {
 /// The `STARTUPINFOEXW` for `child_ends` (0/1/2 + fd >= 3) and their encoded `table`: the std
 /// handles, `table` as `lpReserved2` (so the child CRT recovers fd >= 3), and the HANDLE_LIST that
 /// scopes inheritance to `table.handles`. Keep `table` and the list alive until after
-/// `CreateProcessW`. `pub(crate)`: shared with the async raw backend.
+/// `CreateProcessW`.
 ///
 /// A null end, inherited from a null std handle of this process, reaches the child as null.
-/// `STARTF_USESTDHANDLES` is set only when one of 0/1/2 is non-null, as std does: that flag requires
-/// `bInheritHandles`, and with all three null the child gets the OS default, as from std's route.
-/// With no handle to inherit there is no list, and `create_process` passes `bInheritHandles` FALSE.
+/// `STARTF_USESTDHANDLES` is set only when one of 0/1/2 is non-null, as std does: the flag requires
+/// `bInheritHandles`, and with all three null the child gets the OS default.
 pub(crate) fn startup_info(
     child_ends: &BTreeMap<Fd, ChildEnd>,
     table: &crt_fds::FdTable,
