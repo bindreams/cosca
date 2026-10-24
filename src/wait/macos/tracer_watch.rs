@@ -30,7 +30,7 @@ use nix::sys::event::{EventFilter, FilterFlag, KEvent, Kqueue};
 use super::arm_exit_and_signals_on;
 use crate::identity::{link, uniq_info, Link, ReadPurpose, UniqRead, LAUNCHD};
 
-/// The first re-check after a tracer is found gone, and the cap on the backoff between later ones.
+/// The backoff's first interval after a walk finds a tracer gone, and its cap.
 const GONE_START: Duration = Duration::from_millis(1);
 const GONE_CAP: Duration = Duration::from_millis(50);
 
@@ -49,8 +49,9 @@ pub(crate) struct TracerWatch {
     /// The processes, by pid and unique id, whose `NOTE_EXIT` and `NOTE_SIGNAL` are registered,
     /// each by a registration made while the pid named that process.
     armed: Vec<(u32, u64)>,
-    /// The tracer last found gone, and the backoff before the next check.
-    gone: Option<(u32, Duration)>,
+    /// The backoff before the next check, while each walk since it was set found a tracer gone or
+    /// exiting at launchd.
+    gone: Option<Duration>,
 }
 
 impl TracerWatch {
@@ -63,8 +64,8 @@ impl TracerWatch {
     /// The wait may block only on a check whose walk registered nothing new: before a
     /// registration, the process may have changed unseen. A tracer that is gone, or exiting at
     /// launchd, has not necessarily released the child yet, so the wait checks again: at once the
-    /// first time, then after 1 ms, doubling to 50 ms, with no cap on rounds, while the walk still
-    /// finds it. Each wake re-checks the child and walks again; the elapsed time decides nothing.
+    /// first time, then after 1 ms, doubling to 50 ms, with no cap on rounds, while walks keep
+    /// finding one. Each wake re-checks the child and walks again; the elapsed time decides nothing.
     pub(crate) fn held_by(&mut self, kq: &Kqueue, tracer: u32) -> std::io::Result<OnTracer> {
         let me = std::process::id();
         let mut walked = Vec::new();
@@ -78,7 +79,7 @@ impl TracerWatch {
                     parent,
                     at_attach,
                 } => (unique, parent, at_attach),
-                Link::Gone => return Ok(self.gone(at)),
+                Link::Gone => return Ok(self.gone()),
                 Link::Refused(errno) => return Err(refused(at, errno)),
                 Link::Unreadable => {
                     return Err(std::io::Error::other(format!(
@@ -92,11 +93,11 @@ impl TracerWatch {
                     other => std::io::Error::other(other),
                 })?;
                 if armed.is_none() {
-                    return Ok(self.gone(at));
+                    return Ok(self.gone());
                 }
                 match uniq_info(at, ReadPurpose::Link) {
                     UniqRead::Found(info) if info.unique_id == unique => {}
-                    UniqRead::Found(_) | UniqRead::Gone => return Ok(self.gone(at)),
+                    UniqRead::Found(_) | UniqRead::Gone => return Ok(self.gone()),
                     UniqRead::Refused(errno) => return Err(refused(at, errno)),
                 }
                 self.armed.push((at, unique));
@@ -108,7 +109,7 @@ impl TracerWatch {
             }
             // Traced, yet held by launchd: exiting, its tracer died after `P_LTRACED` was cleared.
             if parent == LAUNCHD {
-                return Ok(self.gone(at));
+                return Ok(self.gone());
             }
             at = parent;
         }
@@ -120,13 +121,12 @@ impl TracerWatch {
         })
     }
 
-    /// The re-check for a chain whose process `at` is gone or exiting at launchd.
-    fn gone(&mut self, at: u32) -> OnTracer {
-        let wait = match self.gone {
-            Some((gone, wait)) if gone == at => (wait * 2).clamp(GONE_START, GONE_CAP),
-            _ => Duration::ZERO,
-        };
-        self.gone = Some((at, wait));
+    /// The re-check after a walk that found a tracer gone or exiting at launchd.
+    fn gone(&mut self) -> OnTracer {
+        let wait = self
+            .gone
+            .map_or(Duration::ZERO, |wait| (wait * 2).clamp(GONE_START, GONE_CAP));
+        self.gone = Some(wait);
         OnTracer::Recheck(wait)
     }
 
