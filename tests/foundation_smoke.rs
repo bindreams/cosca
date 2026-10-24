@@ -39,6 +39,7 @@ fn public_surface_is_usable() {
 #[cfg(any(unix, windows))]
 #[skuld::test]
 fn containment_smoke() {
+    let _warns = common::warn_watch();
     let tb = env!("CARGO_BIN_EXE_cosca_testbin");
     let mut cmd = cosca::Command::new();
     cmd.executable(tb).args(["cosca_testbin", "exit", "0"]).contain();

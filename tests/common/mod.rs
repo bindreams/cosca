@@ -235,8 +235,69 @@ mod log_capture {
             .map(|(level, _)| *level)
             .collect()
     }
+
+    /// The text of every record at `Warn` or worse emitted at or after `mark`.
+    pub fn warnings_since(mark: usize) -> Vec<String> {
+        RECORDS.lock().unwrap()[mark..]
+            .iter()
+            .filter(|(level, _)| *level <= log::Level::Warn)
+            .map(|(_, m)| m.clone())
+            .collect()
+    }
 }
-pub use log_capture::{contains_since, install as install_log_capture, levels_since, mark as log_mark};
+pub use log_capture::{contains_since, install as install_log_capture, levels_since, mark as log_mark, warnings_since};
+
+/// Pins a test's log output: every record at `Warn` or worse emitted while it lives must contain
+/// one of the [`expecting`](Self::expecting) needles, and every needle must match at least one
+/// such record. Declare it FIRST in a test, so it drops last, after the test's children have been
+/// torn down and their teardown has logged. Skipped while the test is already panicking, so it
+/// never masks the real failure.
+///
+/// Reads the process-wide capture from its creation on, so it assumes one test per process (what
+/// nextest runs); the binary's `main` must call [`install_log_capture`].
+#[must_use = "the watch asserts when dropped; bind it to a named `_watch`, not `_`"]
+pub struct WarnWatch {
+    mark: usize,
+    expected: Vec<&'static str>,
+}
+
+pub fn warn_watch() -> WarnWatch {
+    WarnWatch {
+        mark: log_mark(),
+        expected: Vec::new(),
+    }
+}
+
+impl WarnWatch {
+    /// This test legitimately produces a warning containing `needle`.
+    pub fn expecting(mut self, needle: &'static str) -> Self {
+        self.expected.push(needle);
+        self
+    }
+}
+
+impl Drop for WarnWatch {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            return;
+        }
+        let warnings = warnings_since(self.mark);
+        let unexpected: Vec<&String> = warnings
+            .iter()
+            .filter(|w| !self.expected.iter().any(|n| w.contains(n)))
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "unexpected warning(s) at Warn or above: {unexpected:#?}"
+        );
+        for needle in &self.expected {
+            assert!(
+                warnings.iter().any(|w| w.contains(needle)),
+                "expected a warning containing {needle:?}, got {warnings:#?}"
+            );
+        }
+    }
+}
 
 /// The lib's group declarations, included once for every root that uses `common` (an integration
 /// test cannot name a `#[cfg(test)]` item of the library). See `docs/principles.md`, principles 9

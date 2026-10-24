@@ -126,6 +126,7 @@ fn tree_ops_on_uncontained_child_are_unsupported() {
 
 #[skuld::test]
 fn nested_member_kill_tree_is_unsupported_end_to_end() {
+    let _warns = common::warn_watch();
     // Spawn the reporter CONTAINED so its crate-spawned grandchild is a real nested member,
     // exercising the full prepare->attach->require_contained chain rather than a hand-built
     // Prepared. The grandchild reports b"D" only when it is specifically Containment::Delegated

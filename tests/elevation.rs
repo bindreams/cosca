@@ -656,6 +656,7 @@ mod group {
 mod test_harness;
 
 fn main() {
+    common::install_log_capture();
     let mut runner = skuld::TestRunner::new();
     runner.libtest_names();
     runner.require_known_labels();

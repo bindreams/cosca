@@ -66,6 +66,7 @@ async fn async_tree_ops_unsupported_when_uncontained() {
 #[cfg(feature = "tokio")]
 #[skuld::test]
 async fn async_kill_tree_tears_down_tree() {
+    let _warns = common::warn_watch();
     let (mut child, mut root, mut grand) = common::spawn_grandchild_async(true).await;
     child.kill_tree().expect("kill_tree");
     expect_eof("root", &mut root);
@@ -81,6 +82,7 @@ async fn async_kill_tree_tears_down_tree() {
 #[cfg(unix)]
 #[skuld::test]
 async fn async_terminate_tree_soft_kills_the_group() {
+    let _warns = common::warn_watch();
     use std::os::unix::process::ExitStatusExt;
     // control-block honors SIGTERM: the group signal alone (signal-only op) tears it down.
     let (mut child, mut sock) = common::spawn_control_async("control-block", &["R"], true).await;
@@ -97,6 +99,7 @@ async fn async_terminate_tree_soft_kills_the_group() {
 #[cfg(feature = "tokio")]
 #[skuld::test]
 async fn async_contain_with_treewalk_tears_down_tree() {
+    let _warns = common::warn_watch();
     // kill_tree on a TreeWalk-contained tree tears down BOTH members via the identity walk
     // (no kernel group needed). The builder mirror's value-sensitivity is the unit test's job
     // (src/tokio/command_tests.rs).
@@ -245,6 +248,7 @@ async fn async_graceful_cancel_mid_grace_leaves_child_owned() {
 #[cfg(windows)]
 #[skuld::test]
 async fn async_graceful_tree_cancel_does_not_escalate_on_windows() {
+    let _warns = common::warn_watch();
     use std::future::Future;
     use std::time::Duration;
     // The Windows non-escalation discriminator (this is the only Windows grace_wait entry):
@@ -285,6 +289,7 @@ async fn async_graceful_tree_cancel_does_not_escalate_on_windows() {
 #[cfg(unix)]
 #[skuld::test]
 async fn async_graceful_tree_cancel_does_not_escalate() {
+    let _warns = common::warn_watch();
     use std::future::Future;
     use std::time::Duration;
     // The tree-path non-escalation discriminator: BOTH members ignore SIGTERM, so after
@@ -319,6 +324,7 @@ async fn async_graceful_tree_cancel_does_not_escalate() {
 #[cfg(windows)]
 #[skuld::test]
 async fn async_graceful_shutdown_tree_sweep_is_load_bearing_on_windows() {
+    let _warns = common::warn_watch();
     use std::time::Duration;
     // BOTH members ignore CTRL_BREAK, so whether or not the soft signal reaches this console
     // group, only the ZERO-grace hard sweep can tear the tree down.
@@ -359,6 +365,7 @@ async fn async_graceful_shutdown_unsupported_for_an_uncontained_child_on_windows
 #[cfg(feature = "tokio")]
 #[skuld::test]
 async fn async_graceful_shutdown_tree_tears_down_tree() {
+    let _warns = common::warn_watch();
     use std::time::Duration;
     // A contained 2-level tree: the group's graceful signal (SIGTERM / CTRL_BREAK) plus the
     // hard sweep tear down BOTH members; both sockets EOF. All OSes.
@@ -375,6 +382,7 @@ async fn async_graceful_shutdown_tree_tears_down_tree() {
 #[cfg(unix)]
 #[skuld::test]
 async fn async_graceful_shutdown_tree_graceful_root_sigterm() {
+    let _warns = common::warn_watch();
     use std::os::unix::process::ExitStatusExt;
     use std::time::Duration;
     // A contained root that honors SIGTERM: the group signal makes it exit; the reaped status
@@ -396,6 +404,7 @@ async fn async_graceful_shutdown_tree_graceful_root_sigterm() {
 #[cfg(unix)]
 #[skuld::test]
 async fn async_graceful_shutdown_tree_escalates_with_surviving_grandchild() {
+    let _warns = common::warn_watch();
     use std::os::unix::process::ExitStatusExt;
     use std::time::Duration;
     // BOTH tree members ignore SIGTERM (spawn-grandchild-ignore-term), so with ZERO grace both
@@ -422,6 +431,7 @@ async fn async_graceful_shutdown_tree_escalates_with_surviving_grandchild() {
 #[cfg(unix)]
 #[skuld::test]
 async fn async_graceful_shutdown_tree_sweeps_survivor_after_graceful_root_exit() {
+    let _warns = common::warn_watch();
     use std::time::Duration;
     // The exact case the sweep-before-reap invariant protects: the root honors the group
     // SIGTERM and exits within the grace, but the grandchild ignores it and survives — only
@@ -473,6 +483,7 @@ async fn async_graceful_tree_unsupported_when_uncontained() {
 #[cfg(windows)]
 #[skuld::test]
 async fn async_child_terminate_delivers_ctrl_break_to_a_contained_root() {
+    let _warns = common::warn_watch();
     use cosca::GracefulMechanism;
 
     let (mut child, mut sock) = common::spawn_control_async("control-block-ack-break", &["R"], true).await;
@@ -495,6 +506,7 @@ async fn async_child_terminate_delivers_ctrl_break_to_a_contained_root() {
 #[cfg(windows)]
 #[skuld::test]
 async fn async_child_graceful_shutdown_exits_via_ctrl_break_on_windows() {
+    let _warns = common::warn_watch();
     use std::time::Duration;
 
     let (mut child, _sock) = common::spawn_control_async("control-block", &["R"], true).await;
@@ -514,6 +526,7 @@ async fn async_child_graceful_shutdown_exits_via_ctrl_break_on_windows() {
 #[cfg(windows)]
 #[skuld::test]
 async fn async_child_graceful_shutdown_escalates_when_the_break_is_ignored() {
+    let _warns = common::warn_watch();
     use std::time::Duration;
 
     let (mut child, _sock) = common::spawn_control_async("control-block-ignore-break", &["R"], true).await;
@@ -539,6 +552,7 @@ async fn async_child_graceful_shutdown_escalates_when_the_break_is_ignored() {
 #[cfg(unix)]
 #[skuld::test]
 async fn async_child_terminate_reports_ok_for_an_already_exited_child() {
+    let _warns = common::warn_watch();
     let (mut child, _sock) = common::spawn_control_async("control-block", &["R"], true).await;
     child.kill().expect("kill");
     let _status = child.wait().await.expect("reap");
@@ -551,6 +565,7 @@ async fn async_child_terminate_reports_ok_for_an_already_exited_child() {
 #[cfg(windows)]
 #[skuld::test]
 async fn async_child_graceful_ops_report_success_for_a_child_that_shares_no_console() {
+    let _warns = common::warn_watch();
     use std::time::Duration;
 
     use cosca::GracefulMechanism;
@@ -588,6 +603,7 @@ async fn async_child_graceful_ops_report_success_for_a_child_that_shares_no_cons
 /// contained child.
 #[skuld::test]
 async fn async_graceful_mechanism_matches_the_sync_surface() {
+    let _warns = common::warn_watch();
     let (mut uncontained, _s1) = common::spawn_blocker_async().await;
     let (mut contained, _s2) = common::spawn_control_async("control-block", &["R"], true).await;
     let (sync_uncontained, _s3) = common::spawn_blocker();

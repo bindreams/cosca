@@ -110,6 +110,7 @@ fn child_graceful_shutdown_unsupported_for_an_uncontained_child_on_windows() {
 
 #[skuld::test]
 fn child_graceful_shutdown_tree_tears_down_tree() {
+    let _warns = common::warn_watch();
     use std::io::Read;
     use std::time::Duration;
     // A contained 2-level tree (root R + grandchild G). The group's graceful signal
@@ -131,6 +132,7 @@ fn child_graceful_shutdown_tree_tears_down_tree() {
 #[cfg(unix)]
 #[skuld::test]
 fn child_graceful_shutdown_tree_graceful_root_sigterm() {
+    let _warns = common::warn_watch();
     use std::io::Read;
     use std::os::unix::process::ExitStatusExt;
     use std::time::Duration;
@@ -152,6 +154,7 @@ fn child_graceful_shutdown_tree_graceful_root_sigterm() {
 #[cfg(unix)]
 #[skuld::test]
 fn child_graceful_shutdown_tree_escalates() {
+    let _warns = common::warn_watch();
     use std::io::Read;
     use std::os::unix::process::ExitStatusExt;
     use std::time::Duration;
@@ -173,6 +176,7 @@ fn child_graceful_shutdown_tree_escalates() {
 #[cfg(unix)]
 #[skuld::test]
 fn child_graceful_shutdown_tree_sweeps_survivor_after_graceful_root_exit() {
+    let _warns = common::warn_watch();
     use std::io::Read;
     use std::time::Duration;
     // The exact case the sweep-before-reap invariant protects: the root honors the group
@@ -331,6 +335,7 @@ fn process_soft_tree_unsupported_on_windows() {
 #[cfg(unix)]
 #[skuld::test]
 fn graceful_mechanism_is_process_on_unix() {
+    let _warns = common::warn_watch();
     use cosca::GracefulMechanism;
 
     let (uncontained, _s1) = common::spawn_blocker();
@@ -349,6 +354,7 @@ fn graceful_mechanism_is_process_on_unix() {
 #[cfg(windows)]
 #[skuld::test]
 fn graceful_mechanism_distinguishes_contained_from_uncontained_on_windows() {
+    let _warns = common::warn_watch();
     use cosca::GracefulMechanism;
 
     let (uncontained, _s1) = common::spawn_blocker();
@@ -369,6 +375,7 @@ fn graceful_mechanism_distinguishes_contained_from_uncontained_on_windows() {
 #[cfg(windows)]
 #[skuld::test]
 fn child_terminate_delivers_ctrl_break_to_a_contained_root() {
+    let _warns = common::warn_watch();
     use std::io::Read;
 
     use cosca::GracefulMechanism;
@@ -395,6 +402,7 @@ fn child_terminate_delivers_ctrl_break_to_a_contained_root() {
 #[cfg(windows)]
 #[skuld::test]
 fn child_graceful_shutdown_exits_via_ctrl_break_on_windows() {
+    let _warns = common::warn_watch();
     use std::time::Duration;
 
     // The long grace is a failure bound on the child's own exit, never the synchronization.
@@ -414,6 +422,7 @@ fn child_graceful_shutdown_exits_via_ctrl_break_on_windows() {
 #[cfg(windows)]
 #[skuld::test]
 fn child_graceful_shutdown_escalates_when_the_break_is_ignored() {
+    let _warns = common::warn_watch();
     use std::time::Duration;
 
     let (child, _sock) = common::spawn_control("control-block-ignore-break", &["R"], true);
@@ -432,6 +441,7 @@ fn child_graceful_shutdown_escalates_when_the_break_is_ignored() {
 /// platform.
 #[skuld::test]
 fn child_terminate_reports_ok_for_an_already_exited_child() {
+    let _warns = common::warn_watch();
     let (child, _sock) = common::spawn_control("control-block", &["R"], true);
     child.kill().expect("kill");
     let _status = child.wait().expect("reap");
@@ -446,6 +456,7 @@ fn child_terminate_reports_ok_for_an_already_exited_child() {
 #[cfg(windows)]
 #[skuld::test]
 fn child_graceful_ops_report_success_for_a_child_that_shares_no_console() {
+    let _warns = common::warn_watch();
     use std::io::Read;
     use std::time::Duration;
 
@@ -488,6 +499,7 @@ fn child_graceful_ops_report_success_for_a_child_that_shares_no_console() {
 #[cfg(windows)]
 #[skuld::test]
 fn child_graceful_shutdown_signals_the_group_but_only_kills_the_child() {
+    let _warns = common::warn_watch();
     use std::io::Read;
     use std::time::Duration;
 
@@ -536,6 +548,7 @@ fn child_graceful_shutdown_signals_the_group_but_only_kills_the_child() {
 #[cfg(windows)]
 #[skuld::test]
 fn nested_delegated_child_can_be_gracefully_terminated() {
+    let _warns = common::warn_watch();
     use std::io::Read;
     use std::net::TcpListener;
 

@@ -201,6 +201,8 @@ async fn async_fd3_only_routing_does_not_load_a_binary_planted_in_the_process_cw
 mod test_harness;
 
 fn main() {
+    #[cfg(all(windows, feature = "tokio"))]
+    common::install_log_capture();
     let mut runner = skuld::TestRunner::new();
     runner.libtest_names();
     runner.require_known_labels();
