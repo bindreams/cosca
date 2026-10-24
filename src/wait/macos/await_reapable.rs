@@ -1,5 +1,5 @@
 //! The macOS wait for a child's exit, by number: a kqueue holding `EVFILT_PROC` (`NOTE_EXIT |
-//! NOTE_REAP`) and `EVFILT_SIGNAL` (`SIGCHLD`), plus a peek. It never reaps: the caller reaps
+//! NOTE_REAP | NOTE_SIGNAL`) and `EVFILT_SIGNAL` (`SIGCHLD`), plus a peek. It never reaps: the caller reaps
 //! afterwards through the handle it holds, and for a zombie that returns at once.
 //!
 //! - A peek that finds an exit record is [`Waited::Reapable`]. A still-running child blocks on
@@ -15,8 +15,10 @@
 //!   verdict is [`Waited::Orphaned`], which is not a reap. While the
 //!   pid names the child and a live process other than launchd holds it, a tracer holds the
 //!   child, and the wait goes on: until the tracer's hand-back, which re-sends `NOTE_EXIT`, or the
-//!   tracer's exit, which the wait also watches ([`TracerWatch`]) and which leaves the child ours
-//!   or launchd's. A tracer that attaches after the wait's last peek is not watched.
+//!   tracer's exit, which the wait also watches, up a chain of traced tracers ([`TracerWatch`]),
+//!   and which leaves the child ours or launchd's. A tracer that attaches after a peek sends the
+//!   child `SIGSTOP`, and `NOTE_SIGNAL` makes the wait peek again; any other signal to the child
+//!   does too, and only peeks.
 //! - Once `NOTE_EXIT` has come, or the registration's receipt says `ESRCH` (the child is past
 //!   `P_REF_DEAD`, where `proc_find` fails, but `waitid` may not see the zombie yet), it re-peeks
 //!   with a backoff until the peek finds the zombie or the child is gone. That is XNU finishing
@@ -94,7 +96,7 @@ fn register(kq: &Kqueue, pid: u32) -> io::Result<bool> {
         pid as usize,
         EventFilter::EVFILT_PROC,
         EvFlags::EV_ADD | EvFlags::EV_RECEIPT | EvFlags::EV_CLEAR,
-        FilterFlag::NOTE_EXIT | FilterFlag::from_bits_retain(NOTE_REAP),
+        FilterFlag::NOTE_EXIT | FilterFlag::from_bits_retain(NOTE_REAP) | FilterFlag::NOTE_SIGNAL,
         0,
         0,
     );
@@ -142,8 +144,8 @@ fn drain_for_reap(kq: &Kqueue, events: &mut [KEvent; BATCH], pid: u32, tracer: &
     }
 }
 
-/// `(saw NOTE_REAP, saw NOTE_EXIT)` of the child `pid` in `events`. A tracer's exit is neither:
-/// it only wakes the wait to peek again.
+/// `(saw NOTE_REAP, saw NOTE_EXIT)` of the child `pid` in `events`. A signal, to the child or to a
+/// tracer, and a tracer's exit are neither: they only wake the wait to peek again.
 fn scan(events: &[KEvent], pid: u32, tracer: &mut TracerWatch) -> (bool, bool) {
     let (mut reap, mut exit) = (false, false);
     for event in events {
