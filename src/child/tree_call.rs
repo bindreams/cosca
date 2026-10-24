@@ -41,7 +41,7 @@ pub(crate) fn root_number(attached: &Attached, pid: RawPid, state: impl FnOnce()
     #[cfg(target_os = "macos")]
     let state = {
         let looked = state();
-        if matches!(looked.0, RootState::Unpinned | RootState::Unknown(_)) {
+        if matches!(looked.0, RootState::Unknown(_)) {
             return RootNumber::Untrusted(looked.0);
         }
         move || looked
