@@ -1247,3 +1247,90 @@ in_fresh_pid_ns!(
     fixture_tokio_graceful_own_wait_init,
     graceful_shutdown_tree_after_own_wait_and_reuse_body
 );
+
+/// The sync `terminate_tree_after_own_wait_and_reuse_body`'s twin. Same mutant.
+fn terminate_tree_after_own_wait_and_reuse_body() {
+    runtime().block_on(async {
+        crate::log_capture::install();
+        let termed = crate::containment::unix::fault::record_term_group();
+        let (mut child, writer) = spawn_group_blocker();
+        let pid = child.id().pid();
+        let token = reuser_token(&child, false);
+        drop(writer);
+        child.wait().await.expect("this handle reaps the root");
+        let reuser = crate::test_child::pid_reuse::reuse(pid);
+        let _alias = alias_token(reuser.id(), token);
+
+        let mark = crate::log_capture::mark();
+        child
+            .terminate_tree()
+            .expect("a tree whose root this handle reaped answers Ok");
+
+        assert_eq!(
+            termed.termed(),
+            Vec::<i32>::new(),
+            "no SIGTERM by a reaped root's number"
+        );
+        assert_eq!(
+            crate::test_child::reaped_elsewhere::warns_since(mark),
+            Vec::<String>::new(),
+            "the group is empty: nothing to warn about"
+        );
+        assert_eq!(
+            sigusr1_and_wait(reuser),
+            Some(libc::SIGUSR1),
+            "the reuser must have been signalled by the test alone"
+        );
+    });
+}
+in_fresh_pid_ns!(
+    namespaces_tokio_terminate_tree_after_own_wait_and_reuse_sends_nothing,
+    fixture_tokio_terminate_own_wait_driver,
+    fixture_tokio_terminate_own_wait_init,
+    terminate_tree_after_own_wait_and_reuse_body
+);
+
+/// The sync `graceful_shutdown_tree_after_a_foreign_reap_and_reuse_body`'s twin. Same mutant.
+fn graceful_shutdown_tree_after_a_foreign_reap_and_reuse_body() {
+    runtime().block_on(async {
+        crate::log_capture::install();
+        let killed = crate::containment::unix::fault::record_kill_group();
+        let termed = crate::containment::unix::fault::record_term_group();
+        let (mut child, writer) = spawn_group_blocker();
+        let pid = child.id().pid();
+        let token = reuser_token(&child, false);
+        drop(writer);
+        let reuser = reap_behind_and_reuse(pid);
+        let _alias = alias_token(reuser.id(), token);
+
+        let mark = crate::log_capture::mark();
+        let err = child
+            .graceful_shutdown_tree(std::time::Duration::ZERO)
+            .await
+            .expect_err("a group whose root was reaped elsewhere is not assessable");
+
+        assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
+        assert_eq!(
+            termed.termed(),
+            Vec::<i32>::new(),
+            "no SIGTERM by a reaped root's number"
+        );
+        assert_eq!(
+            killed.killed(),
+            Vec::<i32>::new(),
+            "no killpg by a reaped root's number"
+        );
+        assert_one_reaped_elsewhere_warn(mark, pid);
+        assert_eq!(
+            sigusr1_and_wait(reuser),
+            Some(libc::SIGUSR1),
+            "the reuser must have been signalled by the test alone"
+        );
+    });
+}
+in_fresh_pid_ns!(
+    namespaces_tokio_graceful_shutdown_tree_after_a_foreign_reap_and_reuse_sends_nothing,
+    fixture_tokio_graceful_foreign_reuse_driver,
+    fixture_tokio_graceful_foreign_reuse_init,
+    graceful_shutdown_tree_after_a_foreign_reap_and_reuse_body
+);
