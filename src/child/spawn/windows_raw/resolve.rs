@@ -121,10 +121,9 @@ pub(crate) fn reject_not_fully_qualified(what: &str, path: &Path) -> Result<(), 
 /// at the one caller that has ambient OS access, rather than inside `crate::resolve` itself, which
 /// is deliberately parameterised so its rules stay exercisable from a POSIX host.
 ///
-/// Both directories come from the API, never from `%SystemRoot%` or `%windir%`, which any process
-/// can set. The Windows directory comes from `GetSystemWindowsDirectoryW`, not
-/// `GetWindowsDirectoryW`: under Terminal Services compatibility the latter can return a per-user
-/// directory.
+/// Both directories come from the API, never from `%SystemRoot%`/`%windir%`, which any process can
+/// set. `GetSystemWindowsDirectoryW`, not `GetWindowsDirectoryW`: under Terminal Services
+/// compatibility the latter can return a per-user directory.
 ///
 /// This function is [`crate::resolve::ResolveInput::system_dirs`] itself — `resolve_executable`
 /// passes it, unevaluated, as that field's closure, so `crate::resolve::resolve` only calls it from
@@ -149,7 +148,7 @@ pub(crate) fn reject_not_fully_qualified(what: &str, path: &Path) -> Result<(), 
 /// error instead of a silent search-order change. That propagation is proven through the real
 /// `windows_system_dirs_via` wiring, for each of the two queries independently (one leg real, one
 /// forced to fail), by `a_bare_name_names_get_system_directory_w_when_the_system_query_fails` and
-/// its `_system_windows_directory_w_` mirror below. `windows_system_dirs`'s own zero-argument body — which
+/// `a_bare_name_names_get_system_windows_directory_w_when_the_system_windows_query_fails`. `windows_system_dirs`'s own zero-argument body — which
 /// real closures it hands to `windows_system_dirs_via`, and that it does not discard the `Result` —
 /// is, like `resolve_executable`'s binding above, covered by review rather than by a test: nothing
 /// portable can make the real Win32 calls it hardcodes fail.

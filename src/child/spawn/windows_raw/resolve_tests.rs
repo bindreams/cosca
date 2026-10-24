@@ -438,11 +438,9 @@ fn windows_system_dirs_are_real_existing_directories() {
     );
 }
 
-/// The system directories come from the API, not from `SystemRoot` or `windir`: a child whose
-/// `SystemRoot` and `windir` name a bogus directory still reads the real ones. A fresh re-exec,
-/// never this runner, so the environment change reaches no other test.
+/// Re-execs a child, never this runner, so the bogus environment reaches no other test.
 ///
-/// Mutant: read `%SystemRoot%` for the Windows directory.
+/// Mutants: read `%SystemRoot%` or `%windir%` for the Windows directory.
 #[skuld::test]
 fn the_system_dirs_ignore_systemroot_and_windir() {
     let real = windows_system_dirs().unwrap();
@@ -467,7 +465,7 @@ const FIXTURE_SYSTEM_DIRS_EXPECTED: &str = "COSCA_FIXTURE_SYSTEM_DIRS_EXPECTED";
 #[skuld::test]
 fn fixture_the_system_dirs_ignore_systemroot_and_windir() {
     if !crate::test_child::is_marked_fixture_reexec(FIXTURE_SYSTEM_DIRS_MARKER) {
-        return; // picked up by an ordinary suite run: deliberately inert
+        return; // picked up by an ordinary suite run
     }
     let expected: Vec<PathBuf> = std::env::split_paths(
         &std::env::var_os(FIXTURE_SYSTEM_DIRS_EXPECTED).expect("the driver sets the expectation"),
@@ -478,11 +476,13 @@ fn fixture_the_system_dirs_ignore_systemroot_and_windir() {
         2,
         "the driver passes System32 and the Windows directory"
     );
-    let systemroot = PathBuf::from(std::env::var_os("SystemRoot").expect("the driver sets SystemRoot"));
-    assert!(
-        !expected.contains(&systemroot),
-        "the bogus SystemRoot {systemroot:?} must differ from the real directories {expected:?}"
-    );
+    for name in ["SystemRoot", "windir"] {
+        let value = PathBuf::from(std::env::var_os(name).unwrap_or_else(|| panic!("the driver sets {name}")));
+        assert!(
+            !expected.contains(&value),
+            "the bogus {name} {value:?} must differ from the real directories {expected:?}"
+        );
+    }
     assert_eq!(windows_system_dirs().unwrap(), expected);
 }
 
@@ -612,7 +612,7 @@ fn a_bare_name_names_get_system_directory_w_when_the_system_query_fails() {
 /// The [`a_bare_name_names_get_system_directory_w_when_the_system_query_fails`] mirror, with `win`
 /// forced to fail and `sys` left real — see its doc.
 #[skuld::test]
-fn a_bare_name_names_get_system_windows_directory_w_when_the_windows_query_fails() {
+fn a_bare_name_names_get_system_windows_directory_w_when_the_system_windows_query_fails() {
     let pathdir = tempfile::tempdir().unwrap();
     std::fs::write(pathdir.path().join("sp_winfail.exe"), b"x").unwrap();
     let cwd = tempfile::tempdir().unwrap();
