@@ -1052,7 +1052,10 @@ fn abandoned_after_handshake(
         AbandonedChild::Front(fate) => (fate.note(error, front, None), front_child_fate(fate)),
         // Out of the leaf's reach, and not known to be dead.
         AbandonedChild::MaybeUnreachable => (error, ChildFate::Running { id: None }),
-        AbandonedChild::Ended | AbandonedChild::Described | AbandonedChild::MaybeUnreaped => {
+        AbandonedChild::Ended | AbandonedChild::MaybeUnreaped => (error, ChildFate::Unknown),
+        // Only the handshake's front arm, which a leaf's front never reaches, answers `Described`.
+        AbandonedChild::Described => {
+            debug_assert!(false, "a front left to its leaf is never `Described`");
             (error, ChildFate::Unknown)
         }
     })

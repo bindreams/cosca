@@ -1285,6 +1285,38 @@ fn an_abandoned_child_only_a_linux_leaf_can_report_asserts() {
     }
 }
 
+/// A leaf answers a front spawned for it, and never as `Described`, which only the handshake's
+/// front arm (no leaf) produces: that is a contract breach, asserted in debug. In release the leaf's
+/// answer stands as `Unknown`, as for the other answers a front never gets, and the error is kept.
+///
+/// Mutant: the `Described` arm answers silently in debug, or drops the error in release.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_front_left_to_a_leaf_is_never_described() {
+    use crate::containment::AbandonedChild;
+
+    let answered = std::panic::catch_unwind(|| {
+        super::abandoned_after_handshake(
+            AbandonedChild::Described,
+            crate::child::spawn::SpawnFailure::started(
+                Error::Io(std::io::Error::other("tokio failed")),
+                ChildFate::Unknown,
+            ),
+            None,
+            true,
+        )
+    });
+    if cfg!(debug_assertions) {
+        assert!(answered.is_err(), "Described must assert");
+    } else {
+        let (error, fate) = answered
+            .expect("no assertion in release")
+            .expect_may_have_started_with();
+        assert_eq!(fate, ChildFate::Unknown);
+        assert!(error.to_string().contains("tokio failed"), "{error}");
+    }
+}
+
 /// macOS and Windows: tokio can fail a spawn after its fork, dropping the child neither killed nor
 /// reaped. Nothing holds it, so the spawn answers that the program may have started, and that the
 /// child may be running with no identity read.

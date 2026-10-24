@@ -1371,6 +1371,52 @@ fn a_child_that_ended_is_covered_not_described() {
     assert_eq!(reaping, Reaping::Covered, "a collected front");
 }
 
+/// A front the teardown reaped (it exited before the teardown looked) ended: it is `Covered`, not
+/// `Described`, though the failure still notes what became of it.
+///
+/// Mutant: the front arm sets `Described` whatever the teardown found.
+#[skuld::test]
+fn a_front_the_teardown_reaped_is_covered() {
+    let (mut cat, pidfd) = cat_with_pidfd();
+    drop(cat.stdin.take());
+    crate::test_child::wait_until_zombie(cat.id());
+    let (failure, reaping) = super::conclude_noting(
+        Err::<NoChild, _>(std::io::Error::other("tokio failed")),
+        Outcome::Opened(pidfd),
+        sudo_front(),
+    );
+    let (err, _) = failure.err().expect("the spawn fails").expect_may_have_started_with();
+    assert_eq!(reaping, super::Reaping::Covered);
+    assert!(err.to_string().contains("and it was reaped"), "{err}");
+    assert_eq!(
+        crate::child::front_kill_tests::reap(cat.id()),
+        None,
+        "the teardown reaped it"
+    );
+}
+
+/// A front a foreign reaper collected after the first look saw it uncollected ended too: `Covered`,
+/// and the failure's note says it could not be waited on.
+///
+/// Mutant: the front arm sets `Described` whatever the teardown found.
+#[skuld::test]
+fn a_front_found_reaped_by_someone_else_is_covered() {
+    let (mut cat, pidfd) = cat_with_pidfd();
+    drop(cat.stdin.take());
+    cat.wait().expect("the foreign reaper collects the child");
+    let forced = force_peeks([Ok(Peek::Running)]);
+    let (failure, reaping) = super::conclude_noting(
+        Err::<NoChild, _>(std::io::Error::other("tokio failed")),
+        Outcome::Opened(pidfd),
+        sudo_front(),
+    );
+    assert_peeks_exhausted();
+    drop(forced);
+    let (err, _) = failure.err().expect("the spawn fails").expect_may_have_started_with();
+    assert_eq!(reaping, super::Reaping::Covered);
+    assert!(err.to_string().contains("could not be waited on"), "{err}");
+}
+
 /// `conclude` on a failed tokio-style spawn whose child is a live `cat` (`front` says whether it is
 /// a front), with the peeks `looks` answering in order (conclude's own first, then the teardown's),
 /// as a foreign reaper between them would. The `cat` is returned, for the caller to clean up.
@@ -1666,12 +1712,6 @@ fn conclude_answers_whether_the_program_could_have_started() {
         super::LeftFront::NotAFront,
     ))
     .expect_not_started();
-    answered(super::conclude(
-        Err::<NoChild, _>(io("x")),
-        Outcome::Unwatched("cause".into()),
-        super::LeftFront::NotAFront,
-    ))
-    .expect_not_started();
     let (cat, pidfd) = cat_with_pidfd();
     super::conclude(Ok(cat), Outcome::Gone(pidfd), super::LeftFront::NotAFront)
         .err()
@@ -1693,7 +1733,7 @@ fn conclude_answers_whether_the_program_could_have_started() {
 /// returned a child with no go (`Failed`, `NoReport`, `Unwatched`) fails it as not started, the helper's
 /// own error standing; a spawn that returned a child told to go carries on; and a spawn that failed
 /// while the helper had failed too, with a pidfd, reaps the child it names. Together they drive all
-/// twelve `(spawned, outcome)` pairs.
+/// eleven reachable `(spawned, outcome)` pairs; the twelfth is `a_failed_spawn_whose_child_was_watched_asserts`.
 ///
 /// Mutant: any of these arms answers that the program may have started, or the carry-on arm fails.
 #[skuld::test]
@@ -1761,11 +1801,11 @@ fn conclude_answers_every_remaining_pair() {
     assert!(matches!(&error, Error::Io(e) if e.to_string() == "helper"), "{error:?}");
 }
 
-/// Every `(spawned, outcome)` pair says whether its child is reaped, or will be. Only a pair whose
+/// Every reachable `(spawned, outcome)` pair says whether its child is reaped, or will be. Only a pair whose
 /// failed `spawn` is tokio's, with no pidfd to tear the child down through, leaves one tokio
 /// dropped unreaped: the std child it wraps reaps nothing.
 ///
-/// Mutant: any of the three `Uncovered` pairs answers `Covered`, or any `Covered` pair `Uncovered`.
+/// Mutant: either `Uncovered` pair answers `Covered`, or any `Covered` pair `Uncovered`.
 #[skuld::test]
 fn reaping_of_answers_every_pair() {
     use super::Reaping::{Covered, Uncovered};
@@ -1834,11 +1874,6 @@ fn reaping_of_answers_every_pair() {
             super::reaping_of(&dropped(), &Outcome::NoReport),
             Uncovered,
         ),
-        (
-            "Err, Unwatched",
-            super::reaping_of(&dropped(), &Outcome::Unwatched("cause".into())),
-            Uncovered,
-        ),
     ];
     let wrong: Vec<_> = rows
         .iter()
@@ -1846,4 +1881,28 @@ fn reaping_of_answers_every_pair() {
         .map(|(pair, got, want)| format!("{pair}: {got:?}, expected {want:?}"))
         .collect();
     assert!(wrong.is_empty(), "pairs answered wrongly: {wrong:#?}");
+}
+
+/// Only a spawn that returned a child is watched, so a failed spawn whose outcome is `Unwatched` is a
+/// contract breach: asserted in debug, and in release answered as a child that may be unreaped, not
+/// started.
+///
+/// Mutant: `reaping_of` answers the pair silently (or `Covered`) in debug, or in release.
+#[skuld::test]
+fn a_failed_spawn_whose_child_was_watched_asserts() {
+    let dropped = || Err::<NoChild, _>(std::io::Error::other("spawn"));
+
+    let reaping = std::panic::catch_unwind(|| super::reaping_of(&dropped(), &Outcome::Unwatched("cause".into())));
+    if cfg!(debug_assertions) {
+        assert!(reaping.is_err(), "the pair must assert");
+    } else {
+        assert_eq!(reaping.expect("no assertion in release"), super::Reaping::Uncovered);
+        let (failure, reaping) = super::conclude_noting(
+            dropped(),
+            Outcome::Unwatched("cause".into()),
+            super::LeftFront::NotAFront,
+        );
+        failure.err().expect("the spawn fails").expect_not_started();
+        assert_eq!(reaping, super::Reaping::Uncovered);
+    }
 }
