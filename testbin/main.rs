@@ -59,6 +59,10 @@ mod env_block;
 #[path = "consent_spawn.rs"]
 mod consent_spawn;
 
+#[cfg(windows)]
+#[path = "full_path.rs"]
+mod full_path;
+
 /// `tests/elevation_pkexec_version.rs`'s fake pkexec: this binary, copied to `real/pkexec-impl`.
 /// Appends one line to `../pkexec.log` (next to `real/`): `argv[0]`, the file running (so the
 /// test sees which inode was exec'd), the arguments, and, for a launch, whether its program
@@ -1219,6 +1223,10 @@ fn main() {
         "spawn-consent-with-block" => env_block::spawn_consent_with_block(&args[2..]),
         #[cfg(windows)]
         "consent-spawn" => consent_spawn::run(&args[2], &args[3], &args[4], &args[5]),
+        #[cfg(windows)]
+        "with-env-block" => env_block::with_block(&args[2..]),
+        #[cfg(windows)]
+        "full-path" => full_path::run(&args[2]),
         #[cfg(windows)]
         "spawn-frozen-report" => frozen::spawn_frozen_report(&args[2], &args[3]),
         #[cfg(all(windows, feature = "tokio"))]

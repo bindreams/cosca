@@ -45,6 +45,12 @@ fail-fast = false
 # the noise of a loaded runner.
 leak-timeout = { period = "5s", result = "fail" }
 
+# The single-backend measurements (`m<n>_…`) only record, as printed `M<n> …` lines, so CI shows
+# their output when they pass too.
+[[profile.ci.overrides]]
+filter = 'test(/(^|::)m[0-9]+_/)'
+success-output = "immediate"
+
 # Every nextest step in ci.yaml uploads this file as an artifact (the `upload-junit` action).
 [profile.ci.junit]
 path = "junit.xml"
@@ -171,6 +177,11 @@ windows-shell-execute = { max-threads = 1 }
 # that binary at one test at a time instead.
 windows-elevation-routes = { max-threads = 1 }
 
+# The `DRIVE_MAPPING` tests in `tests/windows_process_cwd.rs` each map the highest free drive letter
+# for the whole logon session, so two at once could pick the same letter and read each other's
+# mapping.
+windows-drive-mapping = { max-threads = 1 }
+
 [[profile.default.overrides]]
 filter = 'binary(windows_shell_execute)'
 test-group = 'windows-shell-execute'
@@ -178,6 +189,10 @@ test-group = 'windows-shell-execute'
 [[profile.default.overrides]]
 filter = 'binary(windows_elevation_routes)'
 test-group = 'windows-elevation-routes'
+
+[[profile.default.overrides]]
+filter = 'binary(windows_process_cwd) & (test(=a_drive_relative_current_dir_takes_the_drives_own_directory_as_win32_does) | test(=m7_a_drive_relative_name_against_a_drive_directory_on_its_own_drive))'
+test-group = 'windows-drive-mapping'
 
 [[profile.default.overrides]]
 # `windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reaped`

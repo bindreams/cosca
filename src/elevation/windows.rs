@@ -96,12 +96,12 @@ pub(super) fn integrity_level() -> Option<u32> {
     }
 }
 
-pub(super) fn detect() -> Host {
+pub(super) fn detect(elevated: bool) -> Host {
     if let Some(rid) = integrity_level() {
         log::debug!("current process integrity RID = 0x{rid:04x}");
     }
     Host {
-        elevated: is_elevated(),
+        elevated,
         has_tty: false, // Windows never prompts on a TTY — UAC is a GUI gate.
         available: BackendSet::default(),
         os: Os::Windows,
@@ -364,7 +364,7 @@ fn elevated_params(argv: &[OsString]) -> Result<OsString, Error> {
 // Both the sync (`spawn_elevated`) and async spawn arms route an elevated `Command` here.
 pub(crate) fn launch_runas(cmd: &Command) -> Result<RunasOutcome, SpawnFailure> {
     let request = cmd.elevation_request();
-    launch_runas_with_host(cmd, &Host::detect(request.backend, &request.auth))
+    launch_runas_with_host(cmd, &Host::detect(request.backend, &request.auth, None, is_elevated()))
 }
 
 /// The validated `SHELLEXECUTEINFOW` payload: every string field, NUL-terminated, plus the show
