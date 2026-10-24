@@ -251,6 +251,54 @@ async fn a_post_fork_tokio_failure_without_a_leaf_warns_of_no_abandoned_child() 
     assert!(reaped_through(&pidfd), "the child {pid} must be reaped");
 }
 
+/// A tokio spawn that fails after its fork, with no cgroup leaf, of a child that died before it
+/// reported: std read that as success, tokio dropped the child unreaped, and no pidfd names it. The
+/// spawn warns that the child may be left unreaped.
+///
+/// Mutant: a spawn with no leaf answers that its child ended, and warns of nothing.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn a_post_fork_tokio_failure_of_an_unreported_child_without_a_leaf_warns_it_may_be_unreaped() {
+    use crate::child::spawn::pidfd_handshake::fault::{arm_child_fault, ChildFault};
+    use std::os::fd::AsFd;
+
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let mut cmd = blocker();
+    cmd.contain_with(crate::ContainMode::TreeWalk);
+    let mark = crate::log_capture::mark();
+    let killed = arm_child_fault(ChildFault::Sigkill);
+    {
+        let _failing = fault::fail_tokio_spawns_after_fork();
+        cmd.spawn().expect_err("the forced failure must fail the spawn");
+    }
+    drop(killed);
+    let pid = fault::take_forgotten_pid().expect("the seam dropped a child");
+    let pidfd = fault::take_forgotten_pidfd().expect("the seam took a pidfd for the child");
+    // The child is a zombie nothing reaps: this test's own reap, after the assertions.
+    let warned = crate::log_capture::records_since(mark, "left unreaped");
+    let levels = crate::log_capture::levels_since(mark, "left unreaped");
+    let status = loop {
+        match rustix::process::waitid(
+            rustix::process::WaitId::PidFd(pidfd.as_fd()),
+            rustix::process::WaitIdOptions::EXITED,
+        ) {
+            Err(rustix::io::Errno::INTR) => continue,
+            other => break other.expect("reap the child").expect("it exited"),
+        }
+    };
+    assert_eq!(
+        status.terminating_signal(),
+        Some(libc::SIGKILL),
+        "child {pid} killed itself"
+    );
+    assert_eq!(
+        levels,
+        [log::Level::Warn],
+        "child {pid}: the spawn must warn once that its child may be left unreaped: {warned:?}"
+    );
+}
+
 /// The abandoned-child warning is at `warn` on every call, including a repeat, through the real
 /// entry point.
 #[skuld::test]

@@ -1636,3 +1636,90 @@ fn conclude_answers_every_remaining_pair() {
     .expect_not_started();
     assert!(matches!(&error, Error::Io(e) if e.to_string() == "helper"), "{error:?}");
 }
+
+/// Every `(spawned, outcome)` pair says whether its child is reaped, or will be. Only a pair whose
+/// failed `spawn` is tokio's, with no pidfd to tear the child down through, leaves one tokio dropped
+/// unreaped: the std child it wraps reaps nothing.
+///
+/// Mutant: any of the three `Uncovered` pairs answers `Covered`, or any `Covered` pair `Uncovered`.
+#[skuld::test]
+fn reaping_of_answers_every_pair() {
+    use super::Reaping::{Covered, Uncovered};
+
+    let pidfd = || OwnedFd::from(std::fs::File::open("/dev/null").expect("open /dev/null"));
+    let io = || std::io::Error::other("spawn");
+    let failed = || Error::Io(std::io::Error::other("helper"));
+    // A spawn that returned a child: its handle reaps it, whatever the helper found.
+    let returned = || Ok::<(), std::io::Error>(());
+    // A spawn that failed: std collected its child, or tokio dropped it.
+    let dropped = || Err::<(), _>(io());
+
+    let rows = [
+        (
+            "Ok, Opened",
+            super::reaping_of(&returned(), &Outcome::Opened(pidfd())),
+            Covered,
+        ),
+        (
+            "Ok, Gone",
+            super::reaping_of(&returned(), &Outcome::Gone(pidfd())),
+            Covered,
+        ),
+        (
+            "Ok, Failed with a pidfd",
+            super::reaping_of(&returned(), &Outcome::Failed(failed(), Some(pidfd()))),
+            Covered,
+        ),
+        (
+            "Ok, Failed without",
+            super::reaping_of(&returned(), &Outcome::Failed(failed(), None)),
+            Covered,
+        ),
+        (
+            "Ok, NoReport",
+            super::reaping_of(&returned(), &Outcome::NoReport),
+            Covered,
+        ),
+        (
+            "Ok, Unwatched",
+            super::reaping_of(&returned(), &Outcome::Unwatched("cause".into())),
+            Covered,
+        ),
+        (
+            "Err, Opened",
+            super::reaping_of(&dropped(), &Outcome::Opened(pidfd())),
+            Covered,
+        ),
+        (
+            "Err, Gone",
+            super::reaping_of(&dropped(), &Outcome::Gone(pidfd())),
+            Covered,
+        ),
+        (
+            "Err, Failed with a pidfd",
+            super::reaping_of(&dropped(), &Outcome::Failed(failed(), Some(pidfd()))),
+            Covered,
+        ),
+        (
+            "Err, Failed without",
+            super::reaping_of(&dropped(), &Outcome::Failed(failed(), None)),
+            Uncovered,
+        ),
+        (
+            "Err, NoReport",
+            super::reaping_of(&dropped(), &Outcome::NoReport),
+            Uncovered,
+        ),
+        (
+            "Err, Unwatched",
+            super::reaping_of(&dropped(), &Outcome::Unwatched("cause".into())),
+            Uncovered,
+        ),
+    ];
+    let wrong: Vec<_> = rows
+        .iter()
+        .filter(|(_, got, want)| got != want)
+        .map(|(pair, got, want)| format!("{pair}: {got:?}, expected {want:?}"))
+        .collect();
+    assert!(wrong.is_empty(), "pairs answered wrongly: {wrong:#?}");
+}

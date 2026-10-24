@@ -72,10 +72,11 @@ impl Prepared {
 
     /// End the placement exchange of a spawn that failed with no handle left on its child — tokio
     /// can drop one it forked — and say what became of that child. Without a leaf, on Linux the
-    /// handshake already held the child's pidfd and answered for it, so [`AbandonedChild::Ended`];
-    /// elsewhere nothing can tell, so [`AbandonedChild::MaybeUnreachable`]. A child that is an
-    /// elevation `front` is sent no signal of its own (see [`CgroupLeaf::abandon_before_verdict`]);
-    /// `handshake` is the pidfd its handshake left for a child the leaf cannot name.
+    /// handshake answered for the child, so it is [`AbandonedChild::Ended`] if `reaping` says it is
+    /// reaped or will be, and [`AbandonedChild::MaybeUnreaped`] if not; elsewhere nothing can tell,
+    /// so [`AbandonedChild::MaybeUnreachable`]. A child that is an elevation `front` is sent no
+    /// signal of its own (see [`CgroupLeaf::abandon_before_verdict`]); `handshake` is the pidfd its
+    /// handshake left for a child the leaf cannot name.
     ///
     /// [`CgroupLeaf::abandon_before_verdict`]: crate::containment::cgroup::CgroupLeaf::abandon_before_verdict
     #[cfg_attr(
@@ -89,6 +90,7 @@ impl Prepared {
         &mut self,
         front: bool,
         #[cfg(target_os = "linux")] handshake: Option<std::os::fd::OwnedFd>,
+        #[cfg(target_os = "linux")] reaping: crate::child::spawn::pidfd_handshake::Reaping,
     ) -> AbandonedChild {
         #[cfg(target_os = "linux")]
         if let Some(leaf) = self.cgroup_leaf.as_mut() {
@@ -102,9 +104,16 @@ impl Prepared {
         }
         #[cfg(not(target_os = "linux"))]
         let _ = front;
-        if cfg!(target_os = "linux") {
-            AbandonedChild::Ended
-        } else {
+        #[cfg(target_os = "linux")]
+        {
+            use crate::child::spawn::pidfd_handshake::Reaping;
+            match reaping {
+                Reaping::Covered => AbandonedChild::Ended,
+                Reaping::Uncovered => AbandonedChild::MaybeUnreaped,
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
             AbandonedChild::MaybeUnreachable
         }
     }
@@ -133,7 +142,9 @@ impl Prepared {
 )]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AbandonedChild {
-    /// Nothing of it runs, and it is reaped or will be.
+    /// Answered for, with nothing to warn of: it was ended and is reaped or will be, or the failure
+    /// the spawn returns already says what became of it (an elevation front is left running, and
+    /// its error notes so).
     Ended,
     /// If it was forked, it exits before `exec`, but nothing holds its pid to reap it.
     MaybeUnreaped,

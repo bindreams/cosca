@@ -281,6 +281,9 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
     // The pidfd the handshake opens; the child keeps it (Linux).
     #[cfg(target_os = "linux")]
     let mut held_pidfd: Option<std::os::fd::OwnedFd> = None;
+    // Whether the handshake left a failed spawn's child reaped, or to be (Linux).
+    #[cfg(target_os = "linux")]
+    let reaped: crate::child::spawn::pidfd_handshake::Reaping;
 
     // Phase 1 (before spawn): root detection + pre-spawn containment setup, registered before
     // fd_map's dup2 pre_exec so the latter runs LAST in the child (see the ordering
@@ -438,7 +441,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
             #[cfg(target_os = "linux")]
             let spawned = {
                 #[allow(clippy::disallowed_methods, reason = "spawn_lock is held by `_guard` above")]
-                let held = handshake.run(|| {
+                let (held, reaping) = handshake.run_noting(|| {
                     let spawned = tcmd.spawn();
                     #[cfg(test)]
                     let spawned = crate::child::spawn::fault::fail_tokio_spawn_after_fork(
@@ -447,6 +450,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                     );
                     spawned
                 });
+                reaped = reaping;
                 held.map(|held| {
                     held_pidfd = Some(held.pidfd);
                     held.child
@@ -474,16 +478,15 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
             match spawned {
                 Ok(c) => c,
                 Err(e) => {
-                    // Whatever tokio did with the child, the leaf's exchange says what became of
-                    // it; without a leaf, nothing can tell.
                     let front = cmd.elevation_front();
                     #[cfg(target_os = "linux")]
                     {
                         // Whatever tokio did with the child, the leaf's exchange says what became of
-                        // it; the handshake already answered for a child it held, except a front
-                        // spawned for a leaf, which the leaf answers for.
+                        // it; without a leaf, the handshake's `reaped` does. The handshake already
+                        // tore down a child it held, except a front spawned for a leaf, which the
+                        // leaf answers for.
                         let left_to_leaf = front.is_some() && prepared.cgroup_leaf.is_some();
-                        let abandoned = prepared.abandon_before_verdict(front.is_some(), left_pidfd.take());
+                        let abandoned = prepared.abandon_before_verdict(front.is_some(), left_pidfd.take(), reaped);
                         return Err(abandoned_after_handshake(abandoned, e, front, left_to_leaf));
                     }
                     // Windows: only the leaf's exchange could say what became of a child tokio
@@ -984,8 +987,8 @@ fn warn_for_abandoned(child: crate::containment::AbandonedChild, error: &Error) 
     let consequence = match child {
         AbandonedChild::Front(_) | AbandonedChild::Ended => return,
         AbandonedChild::MaybeUnreaped => {
-            "the child exits before `exec`; if its spawn did not collect it, it is left unreaped, since it \
-             never reached the point where it names itself and nothing holds its pid"
+            "the child exits before `exec`; if its spawn did not collect it, it is left unreaped, since \
+             nothing names it and nothing holds its pid"
         }
         AbandonedChild::MaybeUnreachable => {
             "unless its spawn collected it, the child was left running and nothing \

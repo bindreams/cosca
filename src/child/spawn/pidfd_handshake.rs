@@ -338,6 +338,14 @@ impl Handshake {
     /// did not start: a failed `spawn` after the child was told to go, from a spawn whose error does
     /// not prove it (see [`Spawned::ERR_PROVES_NO_EXEC`]).
     pub(crate) fn run<T: Spawned>(self, spawn: impl FnOnce() -> io::Result<T>) -> Result<Held<T>, SpawnFailure> {
+        self.run_noting(spawn).0
+    }
+
+    /// [`run`](Self::run), also saying whether a failed spawn's child is reaped, or will be.
+    pub(crate) fn run_noting<T: Spawned>(
+        self,
+        spawn: impl FnOnce() -> io::Result<T>,
+    ) -> (Result<Held<T>, SpawnFailure>, Reaping) {
         let Handshake {
             parent_end,
             child_end,
@@ -384,7 +392,7 @@ impl Handshake {
                 Ok(helper) => helper,
                 Err(e) => {
                     shared.withdraw();
-                    return Err(SpawnFailure::NotStarted(helper_start_error(e)));
+                    return (Err(SpawnFailure::NotStarted(helper_start_error(e))), Reaping::Covered);
                 }
             };
 
@@ -445,7 +453,8 @@ impl Handshake {
                 (Outcome::NoReport, Some(cause)) => Outcome::Unwatched(cause),
                 (outcome, _) => outcome,
             };
-            conclude(spawned, outcome, front)
+            let reaping = reaping_of(&spawned, &outcome);
+            (conclude(spawned, outcome, front), reaping)
         })
     }
 }
@@ -806,6 +815,30 @@ fn join_helper(helper: std::thread::ScopedJoinHandle<'_, Outcome>, #[cfg(test)] 
     outcome
 }
 
+/// Whether the child of a spawn that failed is reaped, or will be, once the handshake has concluded
+/// (see [`Handshake::run_noting`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reaping {
+    /// There is no child, or the handshake tore it down through its pidfd (an elevation front it
+    /// sent nothing is described by the failure), or the spawn returned its handle and the handle
+    /// reaps it.
+    Covered,
+    /// No pidfd names the child and no handle reaps it: tokio failed after `std`'s `spawn` returned
+    /// `Ok`, dropped the `std` child, which reaps nothing, and the child may be a zombie nothing
+    /// collects. A `std` failure collected its child, so this is a possibility, not a fact.
+    Uncovered,
+}
+
+/// The [`Reaping`] of `conclude(spawned, outcome, ..)`. Spelled out for every pair, so a new
+/// outcome must decide.
+fn reaping_of<T>(spawned: &io::Result<T>, outcome: &Outcome) -> Reaping {
+    match (spawned, outcome) {
+        (Ok(_), _) => Reaping::Covered,
+        (Err(_), Outcome::Opened(_) | Outcome::Gone(_) | Outcome::Failed(_, Some(_))) => Reaping::Covered,
+        (Err(_), Outcome::Failed(_, None) | Outcome::NoReport | Outcome::Unwatched(_)) => Reaping::Uncovered,
+    }
+}
+
 /// What `conclude`'s first look at the pidfd of a spawn that failed after its fork showed.
 #[derive(Clone, Copy)]
 enum FirstLook {
@@ -845,8 +878,10 @@ fn conclude<T: Spawned>(spawned: io::Result<T>, outcome: Outcome, front: LeftFro
     let opened_teardown = |pidfd: OwnedFd, error: Error| {
         use crate::wait::exit_only::{peek, Peek, Target};
         use std::os::fd::AsFd as _;
-        // A child std collected never ran the program. A peek that fails tells nothing, so the
-        // child is taken for a front still there, which is sent nothing.
+        // A child std collected never ran the program, and one collected at this look is taken for
+        // it: a foreign reaper's collection looks the same, so a front so collected is noted
+        // nothing. A peek that fails tells nothing, so the child is taken for a front still there,
+        // which is sent nothing.
         let look = match peek(&Target::PidFd(pidfd.as_fd())) {
             Ok(Peek::Foreign(_)) => FirstLook::Collected,
             Ok(_) => FirstLook::Uncollected,

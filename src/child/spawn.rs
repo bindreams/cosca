@@ -2155,7 +2155,7 @@ pub(crate) fn teardown_through_pidfd_noting(
     let child = PidfdChild::new(pid, pidfd);
     match peek(&child.target()) {
         Ok(Peek::Foreign(why)) => {
-            log::debug!("{}: already collected when its spawn failed", named(pid));
+            log::debug!("{}: already collected when its teardown looked", named(pid));
             return why.fate(false);
         }
         Ok(Peek::Exit(_) | Peek::Running) => {}
