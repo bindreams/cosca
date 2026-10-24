@@ -113,6 +113,158 @@ fn a_drive_relative_current_dir_takes_the_drives_own_directory_as_win32_does(#[f
 }
 
 #[cfg(windows)]
+/// M7 (#156, untangling P1a), the rows whose `=X:` value names a directory on drive X itself: what
+/// a child's `GetFullPathNameW` makes of `X:tool` given a block with that value and a cwd on another
+/// drive, against D1's prediction. `tests/common/drive_rule.rs` has the runner, and
+/// `windows_path_resolution`'s `m7_` survey the rows that need no mapping.
+///
+/// Records only. Preconditions, asserted: the mapping serves its directories, the child runs in
+/// the row's cwd and sees the row's `=X:` value.
+///
+/// System-affecting: it maps a drive letter (`DefineDosDeviceW`) for the whole logon session, and
+/// removes it when done, so it is the `DRIVE_MAPPING` group.
+#[skuld::test]
+fn m7_a_drive_relative_name_against_a_drive_directory_on_its_own_drive(#[fixture(drive_mapping)] _group: &Group) {
+    use common::drive_rule::{canonical, free_drive, run, Cwd, Render, Row, Var};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let d = canonical(tmp.path());
+    let m = format!(r"{d}\m");
+    let long_rel = format!(r"long\{}\{}\{}", "a".repeat(100), "a".repeat(100), "a".repeat(60));
+    for sub in [r"e", r"m\exists", r"m\vx", &format!(r"m\{long_rel}")] {
+        std::fs::create_dir_all(format!(r"{d}\{sub}")).expect("create the row directories");
+    }
+    std::fs::write(format!(r"{m}\afile"), b"x").expect("create the file");
+    let letter = free_drive((b'M'..=b'Z').rev());
+    let x = format!("{letter}:");
+    let _mapping = DriveMapping::new(&x, &m);
+    let long = format!(r"{x}\{long_rel}");
+    assert!(
+        long.encode_utf16().count() > 260,
+        "precondition: {long} is longer than MAX_PATH"
+    );
+    for dir in [format!(r"{x}\exists"), format!(r"\\?\{x}\vx"), long.clone()] {
+        assert!(
+            std::path::Path::new(&dir).is_dir(),
+            "precondition: the mapping serves {dir}"
+        );
+    }
+    let e = format!(r"{d}\e");
+    let sr = format!("SystemRoot={}", std::env::var("SystemRoot").expect("SystemRoot"));
+    let render = Render(vec![(d.clone(), "<d>".into()), (long_rel.clone(), "<long>".into())]);
+    let row = |key, value: &str, name: &str, arm, predicted: String| Row {
+        key,
+        cwd: Cwd::Given(e.clone()),
+        block: vec![sr.clone(), format!("={x}={value}")],
+        name: name.to_owned(),
+        arm,
+        predicted,
+        var: Var::Is(Some(value.to_owned())),
+    };
+    let tool = format!("{x}tool");
+    let verbatim = format!(r"\\?\{x}\vx");
+    let rows = [
+        row(
+            "existing",
+            &format!(r"{x}\exists"),
+            &tool,
+            "Value",
+            format!(r"{x}\exists\tool"),
+        ),
+        row("missing", &format!(r"{x}\gone"), &tool, "Root", format!(r"{x}\tool")),
+        row("a_file", &format!(r"{x}\afile"), &tool, "Root", format!(r"{x}\tool")),
+        row(
+            "trailing_separator",
+            &format!(r"{x}\exists\"),
+            &tool,
+            "Value",
+            format!(r"{x}\exists\tool"),
+        ),
+        row("longer_than_max_path", &long, &tool, "Value", format!(r"{long}\tool")),
+        // A verbatim value: the plan expects the name it makes verbatim normalised. These rows
+        // block P4 and P5 if Win32 takes the value literally or ignores it.
+        row(
+            "verbatim_dotted_name",
+            &verbatim,
+            &format!(r"{x}sub.\tool.exe"),
+            "Value",
+            format!(r"{verbatim}\sub\tool.exe"),
+        ),
+        row(
+            "verbatim_dotted_dir",
+            &verbatim,
+            &format!("{x}sub."),
+            "Value",
+            format!(r"{verbatim}\sub"),
+        ),
+        // `main`'s `append` stops `..` at the drive, giving the prediction; Win32's floor would give
+        // `\\?\t.exe`. Neither blocks.
+        row(
+            "verbatim_up_past_root",
+            &verbatim,
+            &format!(r"{x}..\..\t.exe"),
+            "Value",
+            format!(r"\\?\{x}\t.exe"),
+        ),
+    ];
+    for row in &rows {
+        run(row, &render, Some((letter, 'D')));
+    }
+}
+
+#[cfg(windows)]
+/// A drive letter mapped to a directory with `DefineDosDeviceW` for as long as it lives.
+struct DriveMapping {
+    drive: Vec<u16>,
+    target: Vec<u16>,
+}
+
+#[cfg(windows)]
+impl DriveMapping {
+    fn new(drive: &str, target: &str) -> Self {
+        use windows::core::PCWSTR;
+        use windows::Win32::Storage::FileSystem::{DefineDosDeviceW, DEFINE_DOS_DEVICE_FLAGS};
+        let wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
+        let mapping = Self {
+            drive: wide(drive),
+            target: wide(target),
+        };
+        // SAFETY: both strings are NUL-terminated and outlive the call.
+        unsafe {
+            DefineDosDeviceW(
+                DEFINE_DOS_DEVICE_FLAGS(0),
+                PCWSTR(mapping.drive.as_ptr()),
+                PCWSTR(mapping.target.as_ptr()),
+            )
+        }
+        .unwrap_or_else(|e| panic!("map {drive} to {target}: {e}"));
+        mapping
+    }
+}
+
+#[cfg(windows)]
+impl Drop for DriveMapping {
+    fn drop(&mut self) {
+        use windows::core::PCWSTR;
+        use windows::Win32::Storage::FileSystem::{DefineDosDeviceW, DDD_EXACT_MATCH_ON_REMOVE, DDD_REMOVE_DEFINITION};
+        // SAFETY: both strings are NUL-terminated and outlive the call.
+        let removed = unsafe {
+            DefineDosDeviceW(
+                DDD_REMOVE_DEFINITION | DDD_EXACT_MATCH_ON_REMOVE,
+                PCWSTR(self.drive.as_ptr()),
+                PCWSTR(self.target.as_ptr()),
+            )
+        };
+        if let Err(e) = removed {
+            common::test_groups::fail_unless_panicking(format!(
+                "could not remove the {} mapping: {e}",
+                String::from_utf16_lossy(&self.drive[..self.drive.len() - 1])
+            ));
+        }
+    }
+}
+
+#[cfg(windows)]
 /// A UNC `current_dir` runs the child there, plainly and verbatim; and against a verbatim UNC
 /// process cwd, `GetFullPathNameW` completes a rooted name and a `..` run as measured here.
 ///
@@ -147,7 +299,7 @@ fn a_unc_current_dir_runs_there_and_a_verbatim_unc_cwd_completes_as_win32_does()
 
 #[cfg(windows)]
 mod drive_mapping_group {
-    //! Re-execs this binary on the one `DRIVE_MAPPING` test. Its body never runs here: each case is
+    //! Re-execs this binary on one `DRIVE_MAPPING` test. Its body never runs here: each case is
     //! either opted out or refused at setup, so these are safe on any host.
 
     use crate::common::test_reexec::{command, suite_outcome, with_json_events, SuiteOutcome, NOCAPTURE};
