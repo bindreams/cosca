@@ -447,20 +447,6 @@ fn awaiting_a_reaped_pid_answers_missing_without_blocking() {
     assert!(matches!(report, Report::Missing), "{report:?}");
 }
 
-/// Whether `kq` has an event pending, by a `poll` of its descriptor, which takes nothing from it.
-fn event_pending(kq: &nix::sys::event::Kqueue) -> bool {
-    use std::os::fd::AsFd;
-    let mut fd = libc::pollfd {
-        fd: kq.as_fd().as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // SAFETY: one valid `pollfd`, and a zero timeout.
-    let n = unsafe { libc::poll(&mut fd, 1, 0) };
-    assert!(n >= 0, "poll the wait's kqueue: {}", std::io::Error::last_os_error());
-    n == 1
-}
-
 /// The parents a `kinfo_proc` read reports for a child this process forked, held by `parent`:
 /// `(p_oppid, e_ppid)`.
 fn forked_by_us_held_by(parent: u32) -> (libc::pid_t, libc::pid_t) {
@@ -532,7 +518,7 @@ fn awaiting_a_child_whose_tracer_dies_during_its_exit_is_woken_by_the_tracers_ex
                 drop(tracer_stdin.borrow_mut().take());
                 crate::test_child::wait_until_zombie(tracer_pid);
                 tracer_exited.set(true);
-                pending.set(Some(event_pending(kq)));
+                pending.set(Some(crate::wait::backend::test_hooks::event_pending(kq)));
                 if pending.get() == Some(true) {
                     return;
                 }
@@ -548,6 +534,78 @@ fn awaiting_a_child_whose_tracer_dies_during_its_exit_is_woken_by_the_tracers_ex
         Some(seams::Wake::ChildGone),
         "the check after the tracer's exit ends the wait"
     );
+    assert!(matches!(report, Report::Missing), "{report:?}");
+    end(child, stdin);
+    tracer.wait().expect("reap the stand-in tracer");
+}
+
+/// A tracer that attaches after the wait's check: XNU reparents the child to it and sends the child
+/// `SIGSTOP` (xnu-12377.121.6 `mach_process.c:295`, `:304`). The wait watches the child's signals,
+/// so it checks again, finds the tracer and watches it too; the tracer's exit, with launchd then
+/// holding the child, ends the wait: `Missing`. A live `cat` stands in for the tracer. The child
+/// really runs; its `waitid` and its parents are forced: running until the attach, then held by the
+/// stand-in, then by launchd once that has exited. A `SIGCONT` to the child stands in for the
+/// attach's `SIGSTOP`. Each of the two hooks looks for an event pending on the wait's kqueue; if
+/// there is none, it drops a copy of the write end, so a wait that missed it ends at EOF instead of
+/// hanging.
+///
+/// Mutant: the wait registers no `NOTE_SIGNAL` on the child.
+#[skuld::test]
+fn awaiting_a_child_a_tracer_attaches_to_late_is_woken_by_the_attach() {
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    use crate::wait::backend::test_hooks::{event_pending, send_signal};
+    use crate::wait::exit_only::{seams::force_peeks, Foreign, Peek};
+    let (child, stdin) = live_child();
+    let pid = child.id();
+    let (mut tracer, tracer_stdin) = live_child();
+    let tracer_pid = tracer.id();
+    let (r, copy) = pipe();
+    // Running for the first check, then `ECHILD` throughout: more than the wait takes.
+    let _peeks =
+        force_peeks(std::iter::once(Ok(Peek::Running)).chain((0..8).map(|_| Ok(Peek::Foreign(Foreign::Gone)))));
+    let holder = Rc::new(Cell::new(std::process::id()));
+    let _parents = crate::identity::kinfo::fault::force_parents(pid, {
+        let holder = Rc::clone(&holder);
+        move || forked_by_us_held_by(holder.get())
+    });
+    let (attach_woke, exit_woke) = (Rc::new(Cell::new(None)), Rc::new(Cell::new(None)));
+    let tracer_stdin = RefCell::new(Some(tracer_stdin));
+    let copy = RefCell::new(Some(copy));
+    let _hook = seams::on_each_block({
+        let (attach_woke, exit_woke) = (Rc::clone(&attach_woke), Rc::clone(&exit_woke));
+        move |n, kq| {
+            let woke = match n {
+                1 => {
+                    holder.set(tracer_pid);
+                    send_signal(pid, libc::SIGCONT);
+                    attach_woke.set(Some(event_pending(kq)));
+                    attach_woke.get()
+                }
+                2 => {
+                    drop(tracer_stdin.borrow_mut().take());
+                    crate::test_child::wait_until_zombie(tracer_pid);
+                    holder.set(crate::identity::LAUNCHD);
+                    exit_woke.set(Some(event_pending(kq)));
+                    exit_woke.get()
+                }
+                _ => None,
+            };
+            if woke != Some(true) {
+                drop(copy.borrow_mut().take());
+            }
+        }
+    });
+    let _ = seams::take_wake();
+    let report = await_report(&r, pid);
+    assert_eq!(attach_woke.get(), Some(true), "the attach's signal must wake the wait");
+    assert_eq!(
+        exit_woke.get(),
+        Some(true),
+        "the wait must block again, watching the tracer, and its exit must wake it"
+    );
+    assert_eq!(seams::take_wake(), Some(seams::Wake::ChildGone));
     assert!(matches!(report, Report::Missing), "{report:?}");
     end(child, stdin);
     tracer.wait().expect("reap the stand-in tracer");
