@@ -276,11 +276,26 @@ fn the_elevated_program_note_is_for_a_wrapper_elevated_spawn_only() {
         }
         .to_string()
     };
-    for fate in [ChildFate::Reaped, ChildFate::Killed, ChildFate::Gone] {
+    for fate in [
+        ChildFate::Reaped,
+        ChildFate::Killed,
+        ChildFate::Gone,
+        ChildFate::Collected,
+    ] {
         assert!(!message(fate, false).contains(note), "{fate:?}, not wrapper-elevated");
         assert!(message(fate, true).contains(note), "{fate:?}, wrapper-elevated");
     }
     for fate in [ChildFate::Running { id: None }, ChildFate::Unknown] {
         assert!(!message(fate, true).contains(note), "{fate:?}");
     }
+}
+
+/// Only `Gone` blames someone else for the reap: a child that a failed spawn found collected was
+/// collected by that spawn's own wait or by tokio's reaper.
+///
+/// Mutant: `Collected` displays as `Gone`.
+#[skuld::test]
+fn only_a_gone_child_is_blamed_on_someone_else() {
+    assert!(ChildFate::Gone.to_string().contains("reaped by someone else"));
+    assert!(!ChildFate::Collected.to_string().contains("someone else"));
 }

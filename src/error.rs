@@ -289,6 +289,11 @@ pub enum ChildFate {
     /// no kill: a child that was gone already, or not ours, when cosca came to it. (One cosca killed
     /// and found collected is [`Killed`](ChildFate::Killed).) The child is not running; on a wrapper-elevated spawn, the elevated program may be (see the type's doc).
     Gone,
+    /// A spawn that failed found its child already collected, and cosca delivered no kill: `std`
+    /// collects the child of a spawn it fails, and tokio's reaper may have collected it after that.
+    /// Unlike [`Gone`](ChildFate::Gone), this does not say that someone else did. The child is not
+    /// running; on a wrapper-elevated spawn, the elevated program may be (see the type's doc).
+    Collected,
     /// cosca cannot say what became of the child.
     Unknown,
 }
@@ -301,6 +306,7 @@ impl std::fmt::Display for ChildFate {
             ChildFate::Running { id: Some(id) } => write!(f, "its child, pid {}, may still be running", id.pid()),
             ChildFate::Running { id: None } => f.write_str("its child may still be running"),
             ChildFate::Gone => f.write_str("its child had been reaped by someone else"),
+            ChildFate::Collected => f.write_str("its child had already been collected when the spawn failed"),
             ChildFate::Unknown => f.write_str("what became of its child is unknown"),
         }
     }
@@ -310,7 +316,7 @@ impl std::fmt::Display for ChildFate {
 /// behind it may still run, whenever the fate says the backend is not running.
 fn elevated_note(fate: &ChildFate, wrapper_elevated: bool) -> &'static str {
     match fate {
-        ChildFate::Reaped | ChildFate::Killed | ChildFate::Gone if wrapper_elevated => {
+        ChildFate::Reaped | ChildFate::Killed | ChildFate::Gone | ChildFate::Collected if wrapper_elevated => {
             " (an elevated program behind it may still run)"
         }
         _ => "",

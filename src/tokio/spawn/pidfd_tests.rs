@@ -145,7 +145,7 @@ async fn a_tokio_exec_failure_may_have_started() {
     let (err, fate) = expect_may_have_started_with(cmd.spawn().expect_err("a missing program fails the spawn"));
     assert_eq!(
         fate,
-        crate::error::ChildFate::Gone,
+        crate::error::ChildFate::Collected,
         "std had collected the child whose exec failed"
     );
     assert!(

@@ -200,6 +200,11 @@ path = "tests/spawn_lock_reentry.rs"
 harness = false
 
 [[test]]
+name = "exec_failure"
+path = "tests/exec_failure.rs"
+harness = false
+
+[[test]]
 name = "tokio_foreign"
 path = "tests/tokio_foreign.rs"
 harness = false

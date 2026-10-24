@@ -806,6 +806,15 @@ fn join_helper(helper: std::thread::ScopedJoinHandle<'_, Outcome>, #[cfg(test)] 
     outcome
 }
 
+/// `fate`, for the child of a spawn that failed after its fork: one found already collected was
+/// collected by `std`'s failed spawn or by tokio's reaper, which is not "someone else".
+fn collected_by_the_spawn(fate: ChildFate) -> ChildFate {
+    match fate {
+        ChildFate::Gone => ChildFate::Collected,
+        other => other,
+    }
+}
+
 /// Combines the fork's answer with the helper's. A child that sent its pidfd and then failed its
 /// `spawn()` is torn down through that pidfd. The exception is the elevation `front` still there:
 /// tokio dropped it after it ran the program, so it is sent nothing. A child std already
@@ -836,11 +845,11 @@ fn conclude<T: Spawned>(spawned: io::Result<T>, outcome: Outcome, front: LeftFro
             }
             LeftFront::Here(front) if !collected => {
                 let (fate, child_fate) = super::leave_front_through_pidfd(None, pidfd, front, None, None);
-                (fate.note(error, Some(front), None), child_fate)
+                (fate.note(error, Some(front), None), collected_by_the_spawn(child_fate))
             }
             LeftFront::Here(_) | LeftFront::NotAFront => {
                 let child_fate = super::teardown_through_pidfd(None, pidfd, None);
-                (error, child_fate)
+                (error, collected_by_the_spawn(child_fate))
             }
         }
     };

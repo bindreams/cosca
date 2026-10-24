@@ -1311,7 +1311,7 @@ fn a_collected_front_is_no_front() {
     .err()
     .expect("the spawn fails")
     .expect_may_have_started_with();
-    assert_eq!(fate, ChildFate::Gone, "std had collected it");
+    assert_eq!(fate, ChildFate::Collected, "std had collected it");
     assert!(!err.to_string().contains("what sudo left"), "{err}");
 }
 

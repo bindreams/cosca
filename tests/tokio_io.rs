@@ -7,11 +7,12 @@ mod common;
 use common::test_groups::{cgroup, Group};
 
 /// What a tokio spawn whose child failed before `exec` did with the child. On Linux the pidfd
-/// handshake found std had collected it; elsewhere nothing holds it, so it may be running.
+/// handshake found it already collected, by std's failed spawn; elsewhere nothing holds it, so it
+/// may be running.
 #[cfg(all(feature = "tokio", unix))]
 fn failed_exec_fate() -> cosca::error::ChildFate {
     if cfg!(target_os = "linux") {
-        cosca::error::ChildFate::Gone
+        cosca::error::ChildFate::Collected
     } else {
         cosca::error::ChildFate::Running { id: None }
     }
