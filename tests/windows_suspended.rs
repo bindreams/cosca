@@ -186,7 +186,6 @@ fn a_resumed_child_runs() {
 }
 
 #[cfg(all(windows, feature = "tokio"))]
-/// An async resumed child runs.
 #[skuld::test]
 async fn an_async_resumed_child_runs() {
     for backend in BACKENDS {
@@ -224,21 +223,35 @@ fn breakaway_verdict(backend: &str, shape: &str, how: &str, helper_contained: bo
 }
 
 #[cfg(windows)]
+/// The helper's `how` for an ordinary child and for a frozen-then-resumed one, through the sync API.
+const SYNC_API: (&str, &str) = ("ordinary", "frozen");
+
+#[cfg(all(windows, feature = "tokio"))]
+/// [`SYNC_API`] through the async API, whose spawn is a separate path.
+const ASYNC_API: (&str, &str) = ("ordinary-async", "frozen-async");
+
+#[cfg(windows)]
 /// A resumed child may break away exactly when an ordinary child in its place may. `expected` pins
 /// the ordinary verdict, so the comparison is not between two measurements of the wrong
 /// environment.
-fn assert_breakaway_matches_an_ordinary_spawn(shape: &str, helper_contained: bool, ambient: &str, expected: &str) {
+fn assert_breakaway_matches_an_ordinary_spawn(
+    (ordinary_how, frozen_how): (&str, &str),
+    shape: &str,
+    helper_contained: bool,
+    ambient: &str,
+    expected: &str,
+) {
     for backend in BACKENDS {
-        let ordinary = breakaway_verdict(backend, shape, "ordinary", helper_contained, ambient);
-        let frozen = breakaway_verdict(backend, shape, "frozen", helper_contained, ambient);
+        let ordinary = breakaway_verdict(backend, shape, ordinary_how, helper_contained, ambient);
+        let frozen = breakaway_verdict(backend, shape, frozen_how, helper_contained, ambient);
 
         assert!(
             ordinary.starts_with(expected),
-            "{backend}/{shape}/{ambient}: precondition: the ordinary spawn's verdict is {ordinary:?}, not {expected:?}"
+            "{backend}/{shape}/{ambient}: precondition: the {ordinary_how} spawn's verdict is {ordinary:?}, not {expected:?}"
         );
         assert_eq!(
             frozen, ordinary,
-            "{backend}/{shape}/{ambient}: the resumed child must get the verdict an ordinary child gets"
+            "{backend}/{shape}/{ambient}: the {frozen_how} child must get the verdict an {ordinary_how} child gets"
         );
     }
 }
@@ -248,8 +261,15 @@ fn assert_breakaway_matches_an_ordinary_spawn(shape: &str, helper_contained: boo
 /// too.
 #[skuld::test]
 fn a_resumed_child_cannot_break_away_from_an_ambient_job_that_forbids_it() {
-    assert_breakaway_matches_an_ordinary_spawn("uncontained", false, "j0", "breakaway:err");
-    assert_breakaway_matches_an_ordinary_spawn("treewalk", false, "j0", "breakaway:err");
+    assert_breakaway_matches_an_ordinary_spawn(SYNC_API, "uncontained", false, "j0", "breakaway:err");
+    assert_breakaway_matches_an_ordinary_spawn(SYNC_API, "treewalk", false, "j0", "breakaway:err");
+}
+
+#[cfg(all(windows, feature = "tokio"))]
+#[skuld::test]
+fn an_async_resumed_child_cannot_break_away_from_an_ambient_job_that_forbids_it() {
+    assert_breakaway_matches_an_ordinary_spawn(ASYNC_API, "uncontained", false, "j0", "breakaway:err");
+    assert_breakaway_matches_an_ordinary_spawn(ASYNC_API, "treewalk", false, "j0", "breakaway:err");
 }
 
 #[cfg(windows)]
@@ -257,14 +277,26 @@ fn a_resumed_child_cannot_break_away_from_an_ambient_job_that_forbids_it() {
 /// nested member must not lift that.
 #[skuld::test]
 fn a_resumed_nested_child_cannot_break_away_from_its_ancestors_containment() {
-    assert_breakaway_matches_an_ordinary_spawn("contained", true, "inherited", "breakaway:err");
+    assert_breakaway_matches_an_ordinary_spawn(SYNC_API, "contained", true, "inherited", "breakaway:err");
+}
+
+#[cfg(all(windows, feature = "tokio"))]
+#[skuld::test]
+fn an_async_resumed_nested_child_cannot_break_away_from_its_ancestors_containment() {
+    assert_breakaway_matches_an_ordinary_spawn(ASYNC_API, "contained", true, "inherited", "breakaway:err");
 }
 
 #[cfg(windows)]
 /// An ambient job that permits breakaway: the resumed child may break away, as an ordinary one may.
 #[skuld::test]
 fn a_resumed_child_can_break_away_from_an_ambient_job_that_permits_it() {
-    assert_breakaway_matches_an_ordinary_spawn("uncontained", false, "jbreak", "breakaway:ok");
+    assert_breakaway_matches_an_ordinary_spawn(SYNC_API, "uncontained", false, "jbreak", "breakaway:ok");
+}
+
+#[cfg(all(windows, feature = "tokio"))]
+#[skuld::test]
+fn an_async_resumed_child_can_break_away_from_an_ambient_job_that_permits_it() {
+    assert_breakaway_matches_an_ordinary_spawn(ASYNC_API, "uncontained", false, "jbreak", "breakaway:ok");
 }
 
 #[cfg(windows)]
@@ -307,6 +339,49 @@ fn resumed_then_detached_child_outlives_its_handles() {
     for backend in BACKENDS {
         for shape in ["uncontained", "contained", "treewalk"] {
             resumed_then_detached_child_is_alive(backend, shape);
+        }
+    }
+}
+
+#[cfg(all(windows, feature = "tokio"))]
+/// [`resumed_then_detached_child_is_alive`] through the async API.
+async fn async_resumed_then_detached_child_is_alive(backend: &str, shape: &str) {
+    let (listener, addr) = bind_async_listener();
+    let mut cmd = testbin_command_async(backend, "control-echo-pid", &addr, &["C"]);
+    match shape {
+        "uncontained" => {}
+        "contained" => {
+            cmd.contain();
+        }
+        "treewalk" => {
+            cmd.contain_with(cosca::ContainMode::TreeWalk);
+        }
+        other => panic!("unknown shape {other}"),
+    }
+    let mut child = cmd
+        .spawn_suspended()
+        .expect("spawn suspended")
+        .resume()
+        .expect("resume");
+    let mut sock = accept_or_die_async(&listener, &mut child).await;
+    let (tag, pid) = common::read_tag_and_pid(&mut sock);
+    assert_eq!((tag, pid), (b'C', child.id().pid()), "{backend}/{shape}");
+    // While the `Child` pins the pid: the handle that ends the child once the test is done.
+    let cleanup = Watch::open_terminable(pid);
+
+    child.detach();
+    drop(child);
+
+    common::assert_echoes(&mut sock, &format!("the detached async {backend}/{shape} child"));
+    cleanup.terminate_and_wait();
+}
+
+#[cfg(all(windows, feature = "tokio"))]
+#[skuld::test]
+async fn an_async_resumed_then_detached_child_outlives_its_handles() {
+    for backend in BACKENDS {
+        for shape in ["uncontained", "contained", "treewalk"] {
+            async_resumed_then_detached_child_is_alive(backend, shape).await;
         }
     }
 }
@@ -395,9 +470,15 @@ fn measure(backend: &str, shape: &str, how: &str, helper_contained: bool, ambien
 /// A plain grandchild of a resumed frozen child is in the job that holds the child: the helper's
 /// ambient job `ambient` names, or, when `helper_contained`, the containment job the test holds. The
 /// ordinary spawn is the control, so the membership check is shown to see that job at all.
-fn assert_grandchild_stays_in_the_enclosing_job(shape: &str, helper_contained: bool, ambient: &str, containment: &str) {
+fn assert_grandchild_stays_in_the_enclosing_job(
+    hows: (&str, &str),
+    shape: &str,
+    helper_contained: bool,
+    ambient: &str,
+    containment: &str,
+) {
     for backend in BACKENDS {
-        for how in ["ordinary", "frozen"] {
+        for how in [hows.0, hows.1] {
             let measured = measure(backend, shape, how, helper_contained, ambient);
 
             let case = format!("{backend}/{shape}/{how}");
@@ -421,19 +502,37 @@ fn assert_grandchild_stays_in_the_enclosing_job(shape: &str, helper_contained: b
 #[cfg(windows)]
 #[skuld::test]
 fn death_watch_grandchild_of_a_resumed_uncontained_child_stays_in_the_enclosing_job() {
-    assert_grandchild_stays_in_the_enclosing_job("uncontained", false, "j0", "None");
+    assert_grandchild_stays_in_the_enclosing_job(SYNC_API, "uncontained", false, "j0", "None");
+}
+
+#[cfg(all(windows, feature = "tokio"))]
+#[skuld::test]
+fn death_watch_grandchild_of_an_async_resumed_uncontained_child_stays_in_the_enclosing_job() {
+    assert_grandchild_stays_in_the_enclosing_job(ASYNC_API, "uncontained", false, "j0", "None");
 }
 
 #[cfg(windows)]
 #[skuld::test]
 fn death_watch_grandchild_of_a_resumed_treewalk_child_stays_in_the_enclosing_job() {
-    assert_grandchild_stays_in_the_enclosing_job("treewalk", false, "j0", "TreeWalk");
+    assert_grandchild_stays_in_the_enclosing_job(SYNC_API, "treewalk", false, "j0", "TreeWalk");
+}
+
+#[cfg(all(windows, feature = "tokio"))]
+#[skuld::test]
+fn death_watch_grandchild_of_an_async_resumed_treewalk_child_stays_in_the_enclosing_job() {
+    assert_grandchild_stays_in_the_enclosing_job(ASYNC_API, "treewalk", false, "j0", "TreeWalk");
 }
 
 #[cfg(windows)]
 #[skuld::test]
 fn death_watch_grandchild_of_a_resumed_nested_child_stays_in_the_enclosing_job() {
-    assert_grandchild_stays_in_the_enclosing_job("contained", true, "inherited", "Delegated");
+    assert_grandchild_stays_in_the_enclosing_job(SYNC_API, "contained", true, "inherited", "Delegated");
+}
+
+#[cfg(all(windows, feature = "tokio"))]
+#[skuld::test]
+fn death_watch_grandchild_of_an_async_resumed_nested_child_stays_in_the_enclosing_job() {
+    assert_grandchild_stays_in_the_enclosing_job(ASYNC_API, "contained", true, "inherited", "Delegated");
 }
 
 #[path = "../src/test_harness.rs"]
