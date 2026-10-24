@@ -143,7 +143,7 @@ fn macos_tokio_late_teardown_inside_a_local_set_on_a_multi_thread_runtime_reaps_
     let local = ::tokio::task::LocalSet::new();
     let (flavor, fate) = runtime.block_on(local.run_until(async {
         let flavor = ::tokio::runtime::Handle::current().runtime_flavor();
-        let (late, writer) = late_spawn(|| vec![]);
+        let (late, writer) = late_spawn(Vec::new);
         drop(writer);
         (flavor, late.fate)
     }));

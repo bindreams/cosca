@@ -1141,7 +1141,7 @@ fn await_exit_warning(
     match await_reapable(pid, Some(unique), Some(std::time::Instant::now() + after))? {
         Waited::DeadlinePassed => {
             log::warn!(
-                "child {pid} is not reapable {after:?} after its kill (it is still running, or a tracer holds its                  exit); still waiting for it to exit"
+                "child {pid} is not reapable {after:?} after its kill (it is still running, or a tracer holds its exit); still waiting for it to exit"
             );
             await_reapable(pid, Some(unique), None)
         }
