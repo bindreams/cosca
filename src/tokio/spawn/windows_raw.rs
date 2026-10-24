@@ -289,10 +289,10 @@ pub(crate) fn spawn_raw(
     let table = sync_raw::build_fd_table(&child_ends).not_started()?;
 
     // `table` (`bytes`) and the attribute list stay alive until after CreateProcessW.
-    let (mut si, attr) = sync_raw::startup_info(&child_ends, &table).not_started()?;
+    let mut startup = sync_raw::startup_info(&child_ends, &table).not_started()?;
     // SINGLE handle source: `table.handles` is 0/1/2 + fd >= 3, each a distinct fresh dup (its
     // 0/1/2 entries ARE the hStd* handles), so no duplicate reaches the list.
-    let all_handles: &[HANDLE] = &table.handles;
+    let all_handles: Vec<HANDLE> = startup.handles(&table).to_vec();
     // The complete word, composed above by the ONE function all three backends share — the two
     // structural bits this backend cannot spawn without included. Nothing ORs into it here.
     let flags = plan.creation_flags;
@@ -304,17 +304,17 @@ pub(crate) fn spawn_raw(
     let spawned = {
         let _guard = spawn_lock();
         let r = sync_raw::spawn_step(
-            all_handles,
+            &all_handles,
             &app_name,
             &mut cmdline,
-            &mut si,
+            &mut startup.si,
             &spawn_env.block,
             &cwd_w,
             flags,
             *cmd.flags_request(),
         );
         drop(child_ends); // close the child ends inside the lock, on success AND error
-        drop(attr); // DeleteProcThreadAttributeList before the guard releases
+        drop(startup); // DeleteProcThreadAttributeList and the filler before the guard releases
         r
     };
     let (proc, pid) = spawned.not_started()?;
