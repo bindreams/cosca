@@ -101,8 +101,8 @@ pub struct Child {
     elevation: Option<crate::elevation::ElevationReport>,
     /// The elevation front this child is, if any, as its spawn found it (see the sync `Child`).
     front: Option<crate::elevation::front::Front>,
-    /// What a failed-spawn cleanup that left this handle armed already warned of, so the drop that
-    /// retries reports a repeat of it at `debug` and anything new at `warn`.
+    /// What a failed-spawn cleanup already warned of, so the drop reports a repeat of it at `debug`
+    /// and anything new at `warn`.
     #[cfg(unix)]
     reported: Vec<crate::child::drop_report::PartKey>,
 }
@@ -159,15 +159,14 @@ impl Child {
 
     /// End a failed spawn's cleanup: `settled` (the tree and the root were each killed, are gone, or
     /// were deliberately left alone) disarms the drop, whose error reports what the cleanup did and
-    /// left. Otherwise the handle stays armed so its drop tries again; `warned` is what the cleanup
-    /// already warned of, so the drop does not warn of the same twice.
+    /// left. Otherwise the handle stays armed so its drop tries again. `warned` is what the cleanup
+    /// already warned of, so the drop, armed or not, does not warn of the same twice.
     #[cfg(unix)]
     pub(super) fn end_cleanup(&mut self, settled: bool, warned: Vec<crate::child::drop_report::PartKey>) {
         if settled {
             self.kill_on_drop = false;
-        } else {
-            self.reported = warned;
         }
+        self.reported = warned;
     }
 
     /// Set by the spawn, from its command.

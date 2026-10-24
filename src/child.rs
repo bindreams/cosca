@@ -443,8 +443,8 @@ pub struct Child {
     /// The elevation front this child is, if any, as its spawn found it (see
     /// [`crate::elevation::front`]). The one source the kill and `SIGTERM` gates read.
     front: Option<crate::elevation::front::Front>,
-    /// What a failed-spawn cleanup that left this handle armed already warned of, so the drop that
-    /// retries reports a repeat of it at `debug` and anything new at `warn`
+    /// What a failed-spawn cleanup already warned of, so the drop reports a repeat of it at `debug`
+    /// and anything new at `warn`
     /// ([`DropReport::emit`](crate::child::drop_report::DropReport::emit)).
     #[cfg(unix)]
     reported: Vec<crate::child::drop_report::PartKey>,

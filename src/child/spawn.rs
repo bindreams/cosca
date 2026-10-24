@@ -256,10 +256,9 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     let warned = report.emit(&[]);
     if tree_settled && root_settled {
         child.kill_on_drop = false;
-    } else {
-        // The drop tries again; it need not warn of what the cleanup warned of again.
-        child.reported = warned;
     }
+    // The drop, armed to try again or not, need not warn of what the cleanup warned of again.
+    child.reported = warned;
     Err(SpawnFailure::started(
         Error::Elevation {
             kind: crate::error::ElevationErrorKind::AuthFailed,
