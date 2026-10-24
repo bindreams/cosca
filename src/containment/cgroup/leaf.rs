@@ -1698,6 +1698,10 @@ mod release;
 #[path = "leaf/end_front_tests.rs"]
 mod end_front_tests;
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "leaf/end_child_tests.rs"]
+mod end_child_tests;
+
 #[cfg(test)]
 #[path = "leaf_tests.rs"]
 mod leaf_tests;

@@ -123,17 +123,14 @@ pub(crate) mod fault {
     }
 
     /// From now on `term_group` on THIS thread records its group and sends nothing.
-    #[cfg(target_os = "macos")]
     pub(crate) fn record_term_group() -> TermGroupRecorder {
         TERMED.with(|t| *t.borrow_mut() = Some(Vec::new()));
         TermGroupRecorder(())
     }
 
-    #[cfg(target_os = "macos")]
     #[must_use = "recording stops as soon as the recorder is dropped"]
     pub(crate) struct TermGroupRecorder(());
 
-    #[cfg(target_os = "macos")]
     impl TermGroupRecorder {
         /// The groups `term_group` was asked to signal since the recorder was made.
         pub(crate) fn termed(&self) -> Vec<i32> {
@@ -141,7 +138,6 @@ pub(crate) mod fault {
         }
     }
 
-    #[cfg(target_os = "macos")]
     impl Drop for TermGroupRecorder {
         fn drop(&mut self) {
             TERMED.with(|t| *t.borrow_mut() = None);

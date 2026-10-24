@@ -1127,6 +1127,10 @@ mod child_drop_reaped_tests;
 mod pid_reuse_tests;
 
 #[cfg(all(test, unix))]
+#[path = "child/foreign_reap_tree_tests.rs"]
+mod foreign_reap_tree_tests;
+
+#[cfg(all(test, unix))]
 #[path = "child/root_state_tests.rs"]
 mod root_state_tests;
 
