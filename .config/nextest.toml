@@ -225,14 +225,6 @@ filter = 'test(/^test_support::tracer::/)'
 slow-timeout = { period = "10s", terminate-after = 3, grace-period = "1s" }
 
 [[profile.default.overrides]]
-# A backstop, not the proof: `linux_cgroup_v2_async_drop_alone_kills_the_members_and_logs_the_leftover`
-# asserts the member's `SIGKILL`. What it cannot assert past is `drop(child)` itself: the async
-# `Drop` blocks until the root is reaped, and the test holds the root's socket, so a drop that
-# loses its kill never returns. This bound turns that into a failure on the cgroup lane.
-filter = 'binary(tokio_io) & test(=linux_cgroup_v2_async_drop_alone_kills_the_members_and_logs_the_leftover)'
-slow-timeout = { period = "30s", terminate-after = 2, grace-period = "1s" }
-
-[[profile.default.overrides]]
 # The macOS tracer tests re-exec a freshly signed copy of the test binary (up to ~2s on amd64).
 # This bound must outlast the fixture's watchdog (8s) and the driver's wait bound (12s), so that
 # their messages surface.

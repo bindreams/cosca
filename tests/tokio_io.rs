@@ -605,10 +605,11 @@ async fn linux_cgroup_v2_async_kill_tree_then_wait_tree_then_drop_leaves_no_leaf
 ///
 /// Whether the drain has finished by the drop's single read is a race this test does not depend
 /// on: either the leaf is gone and nothing warned, or it is left and a warning names it.
+///
+/// Mutant: the drop's `cgroup.kill` write is a no-op.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn linux_cgroup_v2_async_drop_alone_kills_the_members_and_logs_the_leftover(#[fixture(cgroup)] _group: &Group) {
-    use std::io::Read as _;
     use std::os::unix::process::ExitStatusExt as _;
 
     common::install_log_capture();
@@ -653,14 +654,8 @@ async fn linux_cgroup_v2_async_drop_alone_kills_the_members_and_logs_the_leftove
         Some(libc::SIGKILL),
         "the drop must kill the leaf's members"
     );
-    for (who, s) in [("root", &mut root), ("grandchild", &mut grand)] {
-        let mut buf = [0u8; 1];
-        match s.read(&mut buf) {
-            Ok(0) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
-            other => panic!("{who} not torn down on drop: {other:?}"),
-        }
-    }
+    common::assert_dead(&mut root, "the root not torn down on drop");
+    common::assert_dead(&mut grand, "the grandchild not torn down on drop");
     assert_leaf_gone_or_warned_about(&leaf, mark);
     common::cgroup::drain_and_remove_leaf(&leaf);
 }
