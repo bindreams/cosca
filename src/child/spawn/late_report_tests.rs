@@ -1065,8 +1065,9 @@ fn late_tree_not_zombie(
 const NOT_SWEPT_AGAIN: &str = "not shown an unreaped zombie, so its tree was not killed again by its pid";
 
 /// A marked tree whose root is not shown a zombie after its kill: its marker's holders are still
-/// swept, and the root's pid is not walked again. The first sweep is spoiled (a blind snapshot), so
-/// only that holders' sweep can reach the grandchild.
+/// swept, and the root's pid is not walked again. The first sweep is spoiled (a blind snapshot, and
+/// no kill of the root by its identity, so no second pass), so only that holders' sweep can reach
+/// the grandchild.
 ///
 /// Mutant: a root not shown a zombie gets no sweep of its marker's holders.
 #[skuld::test]
@@ -1077,7 +1078,10 @@ fn macos_late_marked_tree_whose_root_is_not_shown_a_zombie_still_sweeps_its_hold
             cmd.contain_with(ContainMode::TreeWalk);
         },
         crate::wait::exit_only::Foreign::Gone,
-        || crate::containment::enumerate::force_blind_snapshot_for_next_call(true),
+        || {
+            crate::containment::enumerate::force_blind_snapshot_for_next_call(true);
+            crate::containment::fdmarker::fault::set_force_root_kill_noop(true);
+        },
     );
     assert!(!seen.survived, "the grandchild holds the marker, so its sweep kills it");
     assert!(
