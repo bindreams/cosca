@@ -951,11 +951,9 @@ impl Marker {
     }
 
     /// Whether this marker carries a pgid to `killpg`/`term_group` on sweep — `true` for
-    /// every mode except `TreeWalk` (`pgid: None`, no process group). Exposed so
-    /// `Child::kill_tree`/`terminate_tree`'s pgid-recycle precondition assert
-    /// (`src/child.rs`, `src/tokio/child.rs`) can extend to `Attached::FdMarker` exactly as
-    /// it already covers `Attached::ProcessGroup`: this mechanism fires `killpg` on `self.pgid`
-    /// unconditionally on pass 1, so the same recycled-pgid hazard applies to it.
+    /// every mode except `TreeWalk` (`pgid: None`, no process group). `kill_tree`/`terminate_tree`
+    /// check a reaped root before such a sweep (`child::reaped_root_tree_signal`), as for
+    /// `Attached::ProcessGroup`: this mechanism fires `killpg` on `self.pgid` on pass 1.
     pub(crate) fn has_pgid(&self) -> bool {
         self.pgid.is_some()
     }

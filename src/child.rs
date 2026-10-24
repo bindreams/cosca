@@ -52,6 +52,10 @@ mod child_tests;
 #[path = "child/pid_reuse_tests.rs"]
 mod pid_reuse_tests;
 
+#[cfg(all(test, unix))]
+#[path = "child/foreign_reap_tree_tests.rs"]
+mod foreign_reap_tree_tests;
+
 #[cfg(all(test, target_os = "linux"))]
 #[path = "child/kill_tree_view_tests.rs"]
 mod kill_tree_view_tests;
@@ -91,39 +95,61 @@ pub(crate) enum ParentEnd {
     Writer(PipeWriter),
 }
 
-/// True only when there is POSITIVE evidence that a contained root's pid was reaped **and**
-/// recycled: it now resolves to a DIFFERENT identity than `original`, and that different
-/// identity is confirmed [`Liveness::Alive`](crate::identity::Liveness::Alive) — not merely
-/// resolvable, since a not-yet-reaped zombie also resolves. Reaping alone, without a
-/// subsequent recycle, is harmless to a pgid-based mechanism: `killpg` on an absent pgid
-/// returns `ESRCH`, which `signal_group`/`verify` in `containment::unix` already treat as
-/// `Cleared`. [`Existence`](crate::identity::Existence) cannot distinguish these two cases — it
-/// collapses "reaped, nothing there yet" and "reaped, a different live process now holds the
-/// pid" into the same `Gone` — which is why `kill_tree`/`terminate_tree`'s precondition assert
-/// needs this finer, two-value read (a fresh [`Resolved`](crate::identity::Resolved) plus a
-/// [`Liveness`](crate::identity::Liveness) reading of whatever it found) instead.
+/// What `kill_tree` and `terminate_tree` (sync and async) do instead of signalling a tree named
+/// by the root's pid (a process group, or a macOS fd marker with one) when that pid may name
+/// another process. `None`: signal it as usual. `state` is the root's own handle's answer, and
+/// whether a `Reaped` is that handle's own reap; it is read only for such a mechanism.
 ///
-/// A pure function of already-resolved values, deliberately: it is unit-tested (`child_tests.rs`)
-/// with synthetic `ProcessId`s rather than by racing the kernel's own pid allocator to construct
-/// a genuine recycle — that would be synchronizing on luck, not a real test.
-#[cfg_attr(
-    not(unix),
-    allow(
-        dead_code,
-        reason = "only called from the `#[cfg(unix)]` debug_assert!s below and in `tokio/child.rs`; still unit-tested everywhere"
-    )
-)]
-pub(crate) fn root_pid_was_recycled(
-    original: ProcessId,
-    current: crate::identity::Resolved<ProcessId>,
-    current_liveness: crate::identity::Liveness,
-) -> bool {
-    match current {
-        crate::identity::Resolved::Found(now) => {
-            now != original && current_liveness == crate::identity::Liveness::Alive
-        }
-        crate::identity::Resolved::Gone | crate::identity::Resolved::Unknown => false,
+/// - Reaped by this handle, and a process holds the pid: that process is not the root, and the
+///   group is empty, since the kernel does not reissue a pid while it is some group's id. Nothing
+///   is sent: `Ok`. A pid that names nothing (`Gone`) may still be the id of the root's surviving
+///   group, which is signalled.
+/// - Reaped elsewhere, or a handle or pid that cannot be read: the pid may name another process.
+///   Nothing is sent, one `warn` names what was left unsignalled, and the call is `Unassessable`.
+///
+/// `op` names the call, `verb` its signal; `earlier` names what the same operation sent before.
+#[cfg(unix)]
+pub(crate) fn reaped_root_tree_signal(
+    attached: &crate::containment::Attached,
+    id: ProcessId,
+    op: &str,
+    verb: &str,
+    earlier: Option<&str>,
+    state: impl FnOnce() -> (crate::signal::RootState, bool),
+) -> Option<Result<(), Error>> {
+    use crate::identity::Resolved;
+    use crate::signal::RootState;
+    if !attached.carries_recyclable_pgid() {
+        return None;
     }
+    let pid = id.pid();
+    let why = match state() {
+        (RootState::Reaped, true) => match root_identity_now(pid) {
+            Resolved::Gone => return None,
+            Resolved::Found(_) => {
+                log::debug!(
+                    "{op}({pid}): this handle reaped the root and another process holds its pid now, so \
+                     its group is empty and nothing is sent"
+                );
+                return Some(Ok(()));
+            }
+            Resolved::Unknown => format!("this handle reaped the root, and its pid ({pid}) could not be read"),
+        },
+        (RootState::Reaped, false) => format!("the root (pid {pid}) was reaped elsewhere"),
+        (RootState::Unknown(e), _) => {
+            format!("the root's own handle could not say whether it (pid {pid}) was reaped ({e})")
+        }
+        (RootState::Unreaped | RootState::Unpinned, _) => return None,
+    };
+    let skipped = attached
+        .named_by_root_number(pid, verb)
+        .unwrap_or_else(|| format!("{verb} its tree"));
+    let earlier = earlier.map_or_else(String::new, |sent| format!(", though {sent} was sent before it"));
+    let detail = format!(
+        "{op}(): {why}, so its number may name another process; it did not {skipped}, and sent nothing{earlier}"
+    );
+    log::warn!("{detail}");
+    Some(Err(Error::Unassessable { detail, source: None }))
 }
 
 /// A spawned child process the crate owns.
@@ -619,6 +645,14 @@ impl Child {
     /// [`Error::Unassessable`](crate::error::Error::Unassessable) saying that nothing was sent and what
     /// was skipped. The handle backstop reads the root's state again: a root orphaned during the sweep
     /// is an exited zombie, so the backstop is skipped and the sweep's answer stands.
+    ///
+    /// **A root reaped by something else.** A process group, and a macOS fd marker's group, are
+    /// named by the root's pid. If the root's own handle shows it was reaped by another reaper in the
+    /// process, or cannot say, that pid may name another process: this sends nothing and returns
+    /// [`Error::Unassessable`](crate::error::Error::Unassessable), with a `warn` naming the group it
+    /// skipped. Once this handle reaped the root itself, another process at that pid means the group
+    /// is empty: nothing is sent, and the call is `Ok`; a pid that cannot be read is `Unassessable`
+    /// as above. A foreign reap after that look is not seen.
     pub fn kill_tree(&self) -> Result<(), Error> {
         self.kill_tree_after(None)
     }
@@ -646,54 +680,13 @@ impl Child {
         {
             return result;
         }
-        // Precondition (a separate, unfixed gap — asserted, not fixed, here): if a pgid-based
-        // mechanism's leader pid has been reaped AND RECYCLED onto a DIFFERENT, LIVE process
-        // group, `killpg` would signal that unrelated group instead. `carries_recyclable_pgid`
-        // (`containment/dispatch.rs`) names exactly the mechanisms this applies to:
-        // `Attached::ProcessGroup` (covers both `Containment::ProcessGroup` and
-        // `Containment::Session`) and macOS `Attached::FdMarker` when its mode created a pgid
-        // (it fires `killpg` on pass 1 of every sweep unconditionally, so the hazard is
-        // identical there, not merely similar). Reaping alone is harmless — `killpg` on an
-        // absent pgid returns `ESRCH`, which `containment::unix::signal_group`/`verify` already
-        // treat as `Cleared` — so this only asserts on POSITIVE evidence of an actual recycle
-        // (see `root_pid_was_recycled`), never on a mere reap. That positive-evidence case is
-        // reachable without an explicit `wait()` before `kill_tree()`/`terminate_tree()`:
-        // `SharedChild::adopt` (inside `Command::spawn`) reaps nothing, but something else in
-        // the process can (`SIGCHLD` set to `SIG_IGN`, a `waitpid(-1)` reaper) — and then the
-        // kernel may recycle the leader's pid before the caller ever gets a `Child` handle back,
-        // so this assert can fire on the very first call the caller makes, whatever ordering
-        // they use. Gated to mechanisms that carry a recyclable pgid: a
-        // recycled pgid is meaningless for Cgroup (keyed by an fd), JobObject (no pgid),
-        // Delegated (no mechanism), TreeWalk (checks after its snapshot that the root still
-        // holds its pid, and re-resolves identity per member, so a recycled root pid walks
-        // nothing), or a macOS FdMarker whose mode created no pgid — asserting it there
-        // would be a false alarm unrelated to what this precondition is about. An OS refusal to
-        // answer either resolve (`Resolved::Unknown` / `Liveness::Unknown`) is permitted
-        // through: this asserts against POSITIVE evidence of a violation, not against every
-        // case we merely couldn't rule out.
-        //
-        // `#[cfg(unix)]`: `Attached::carries_recyclable_pgid` is itself Unix-only (see
-        // `containment/dispatch.rs`) — referencing it unconditionally does not compile on
-        // Windows (`cargo check --target x86_64-pc-windows-msvc` confirmed E0599 without this
-        // gate). Windows has no pgid to recycle, so there is nothing for this precondition to
-        // assert there.
+        // A group named by the root's pid, once that pid may name another process.
         #[cfg(unix)]
-        debug_assert!(
-            !self.attached.carries_recyclable_pgid() || {
-                let now = ProcessId::of(self.id.pid());
-                let now_liveness = match now {
-                    crate::identity::Resolved::Found(id) => id.is_alive(),
-                    crate::identity::Resolved::Gone | crate::identity::Resolved::Unknown => {
-                        crate::identity::Liveness::Unknown
-                    }
-                };
-                !root_pid_was_recycled(self.id, now, now_liveness)
-            },
-            "kill_tree/terminate_tree called after the contained root's pid ({}) was reaped and \
-             recycled onto a different, live process; a pgid-based mechanism would now signal an \
-             unrelated process group",
-            self.id.pid()
-        );
+        if let Some(result) = reaped_root_tree_signal(&self.attached, self.id, "kill_tree", "kill", earlier, || {
+            self.proc.state_and_own_reap()
+        }) {
+            return result;
+        }
         let group_result = self.attached.hard_kill_marking(&self.tree_killed);
         // A TreeWalk that could not walk killed nothing, and the root's death would strand the
         // descendants beyond a retry: return the error with the tree intact.
@@ -788,9 +781,9 @@ impl Child {
     /// group refused the signal — a setuid binary in the tree is the ordinary cause. The
     /// tree is still running and this process cannot bring it down.
     ///
-    /// See [`kill_tree`](Child::kill_tree)'s doc for two things that also apply here: the
+    /// See [`kill_tree`](Child::kill_tree)'s doc for three things that also apply here: the
     /// `ProcessGroup`/`Session`-only scope of this guarantee (a separate, unfixed gap for
-    /// `TreeWalk`), and the residual `hidepid` gap on Linux.
+    /// `TreeWalk`), the residual `hidepid` gap on Linux, and a root reaped by something else.
     ///
     /// **macOS, a root the handle cannot vouch for.** If the root is `Unpinned` (launchd holds its
     /// zombie, see [`kill`](Child::kill)) or `Unknown`, nothing that names the tree by the root's
@@ -813,25 +806,12 @@ impl Child {
 
     /// The signal itself, for a root whose number is trusted.
     fn terminate_tree_signalling(&self) -> Result<(), Error> {
-        // See kill_tree's identical precondition assert for the full rationale, including the
-        // `#[cfg(unix)]` gate (`carries_recyclable_pgid` does not exist on Windows).
         #[cfg(unix)]
-        debug_assert!(
-            !self.attached.carries_recyclable_pgid() || {
-                let now = ProcessId::of(self.id.pid());
-                let now_liveness = match now {
-                    crate::identity::Resolved::Found(id) => id.is_alive(),
-                    crate::identity::Resolved::Gone | crate::identity::Resolved::Unknown => {
-                        crate::identity::Liveness::Unknown
-                    }
-                };
-                !root_pid_was_recycled(self.id, now, now_liveness)
-            },
-            "kill_tree/terminate_tree called after the contained root's pid ({}) was reaped and \
-             recycled onto a different, live process; a pgid-based mechanism would now signal an \
-             unrelated process group",
-            self.id.pid()
-        );
+        if let Some(result) = reaped_root_tree_signal(&self.attached, self.id, "terminate_tree", "signal", None, || {
+            self.proc.state_and_own_reap()
+        }) {
+            return result;
+        }
         self.attached.terminate(self.proc.id())
     }
 

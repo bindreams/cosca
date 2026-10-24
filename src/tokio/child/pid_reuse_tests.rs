@@ -13,6 +13,7 @@ use crate::signal::Sig;
 use crate::test_child::pid_reuse::{
     in_fresh_pid_ns, reap_behind_and_reuse, sigusr1_and_peek, sigusr1_and_wait, wait_pollin,
 };
+use crate::test_child::reaped_elsewhere::{assert_one_reaped_elsewhere_warn, REAPED_ELSEWHERE};
 use crate::test_groups::namespaces;
 use crate::tokio::Command;
 
@@ -1015,4 +1016,176 @@ in_fresh_pid_ns!(
     fixture_panicking_logger_drop_driver,
     fixture_panicking_logger_drop_init,
     a_panicking_logger_in_drops_via_pidfd_log_body
+);
+
+// Tree signals after a reap and a reuse =====
+
+/// A blocker in its own session (`Attached::ProcessGroup`), which exits once `writer` is dropped.
+fn spawn_group_blocker() -> (crate::tokio::Child, std::io::PipeWriter) {
+    let (stdin, writer) = crate::test_child::held_writer_stdin();
+    let mut cmd = Command::new();
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(stdin).expect("set stdin");
+    cmd.contain_with(crate::ContainMode::Session);
+    let child = cmd.spawn().expect("spawn");
+    assert!(
+        child.carries_recyclable_pgid(),
+        "the test needs a number-named group kill"
+    );
+    (child, writer)
+}
+
+/// The token a reuser of `child`'s pid is made to read with: `child`'s own (a reuse in the same
+/// clock tick, which only the handle can tell apart) or the next one (a later tick, which the
+/// number shows).
+fn reuser_token(child: &crate::tokio::Child, same_tick: bool) -> StartToken {
+    let raw = child.id().start_token_raw();
+    StartToken::from_raw(if same_tick { raw } else { raw + 1 })
+}
+
+/// The sync `kill_tree_after_a_foreign_reap_and_reuse`'s twin. Mutants: the precondition assert
+/// kept (a debug panic on the later-tick reuse); `killpg` sent; the decision taken on the number
+/// alone (the same-tick reuse reads as the root).
+fn kill_tree_after_a_foreign_reap_and_reuse(same_tick: bool) {
+    runtime().block_on(async {
+        crate::log_capture::install();
+        let recorder = crate::containment::unix::fault::record_kill_group();
+        let (mut child, writer) = spawn_group_blocker();
+        let pid = child.id().pid();
+        let token = reuser_token(&child, same_tick);
+        drop(writer);
+        let reuser = reap_behind_and_reuse(pid);
+        let _alias = alias_token(reuser.id(), token);
+
+        let mark = crate::log_capture::mark();
+        let err = child
+            .kill_tree()
+            .expect_err("a group whose root was reaped elsewhere is not assessable");
+
+        assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
+        assert_eq!(
+            recorder.killed(),
+            Vec::<i32>::new(),
+            "no killpg by a reaped root's number"
+        );
+        assert_one_reaped_elsewhere_warn(mark, pid);
+        assert_eq!(
+            sigusr1_and_wait(reuser),
+            Some(libc::SIGUSR1),
+            "the reuser must have been signalled by the test alone"
+        );
+    });
+}
+fn kill_tree_after_a_foreign_reap_and_reuse_body() {
+    kill_tree_after_a_foreign_reap_and_reuse(false);
+}
+fn kill_tree_after_a_foreign_reap_and_same_tick_reuse_body() {
+    kill_tree_after_a_foreign_reap_and_reuse(true);
+}
+in_fresh_pid_ns!(
+    namespaces_tokio_kill_tree_after_a_foreign_reap_and_reuse_sends_no_killpg,
+    fixture_tokio_kill_tree_reuse_driver,
+    fixture_tokio_kill_tree_reuse_init,
+    kill_tree_after_a_foreign_reap_and_reuse_body
+);
+in_fresh_pid_ns!(
+    namespaces_tokio_kill_tree_after_a_foreign_reap_and_same_tick_reuse_sends_no_killpg,
+    fixture_tokio_kill_tree_same_tick_driver,
+    fixture_tokio_kill_tree_same_tick_init,
+    kill_tree_after_a_foreign_reap_and_same_tick_reuse_body
+);
+
+/// `terminate_tree`'s twin. Same mutants.
+fn terminate_tree_after_a_foreign_reap_and_reuse_body() {
+    runtime().block_on(async {
+        crate::log_capture::install();
+        let recorder = crate::containment::unix::fault::record_term_group();
+        let (child, writer) = spawn_group_blocker();
+        let pid = child.id().pid();
+        let token = reuser_token(&child, false);
+        drop(writer);
+        let reuser = reap_behind_and_reuse(pid);
+        let _alias = alias_token(reuser.id(), token);
+
+        let mark = crate::log_capture::mark();
+        let err = child
+            .terminate_tree()
+            .expect_err("a group whose root was reaped elsewhere is not assessable");
+
+        assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
+        assert_eq!(
+            recorder.termed(),
+            Vec::<i32>::new(),
+            "no SIGTERM by a reaped root's number"
+        );
+        assert_one_reaped_elsewhere_warn(mark, pid);
+        assert_eq!(
+            sigusr1_and_wait(reuser),
+            Some(libc::SIGUSR1),
+            "the reuser must have been signalled by the test alone"
+        );
+    });
+}
+in_fresh_pid_ns!(
+    namespaces_tokio_terminate_tree_after_a_foreign_reap_and_reuse_sends_no_signal,
+    fixture_tokio_terminate_tree_reuse_driver,
+    fixture_tokio_terminate_tree_reuse_init,
+    terminate_tree_after_a_foreign_reap_and_reuse_body
+);
+
+/// A root this handle reaped itself, whose pid now names another process: `kill_tree` sends
+/// nothing and is `Ok`, whether the reuser reads as another process or as the root. Mutants: the
+/// precondition assert kept (a debug panic); our own reap answered as foreign (`Unassessable`);
+/// `killpg` sent; the number trusted when it reads as the root (same tick).
+fn kill_tree_after_own_wait_and_reuse(same_tick: bool) {
+    runtime().block_on(async {
+        crate::log_capture::install();
+        let recorder = crate::containment::unix::fault::record_kill_group();
+        let (mut child, writer) = spawn_group_blocker();
+        let pid = child.id().pid();
+        let token = reuser_token(&child, same_tick);
+        drop(writer);
+        child.wait().await.expect("this handle reaps the root");
+        let reuser = crate::test_child::pid_reuse::reuse(pid);
+        let _alias = alias_token(reuser.id(), token);
+
+        let mark = crate::log_capture::mark();
+        child
+            .kill_tree()
+            .expect("a tree whose root this handle reaped answers Ok");
+
+        assert_eq!(
+            recorder.killed(),
+            Vec::<i32>::new(),
+            "no killpg by a reaped root's number"
+        );
+        assert_eq!(
+            crate::log_capture::records_since_on_current_thread(mark, REAPED_ELSEWHERE),
+            [],
+            "our own reap is not a foreign one"
+        );
+        assert_eq!(
+            sigusr1_and_wait(reuser),
+            Some(libc::SIGUSR1),
+            "the reuser must have been signalled by the test alone"
+        );
+    });
+}
+fn kill_tree_after_own_wait_and_reuse_body() {
+    kill_tree_after_own_wait_and_reuse(false);
+}
+fn kill_tree_after_own_wait_and_same_tick_reuse_body() {
+    kill_tree_after_own_wait_and_reuse(true);
+}
+in_fresh_pid_ns!(
+    namespaces_tokio_kill_tree_after_own_wait_and_reuse_is_ok_and_sends_nothing,
+    fixture_tokio_kill_tree_own_wait_driver,
+    fixture_tokio_kill_tree_own_wait_init,
+    kill_tree_after_own_wait_and_reuse_body
+);
+in_fresh_pid_ns!(
+    namespaces_tokio_kill_tree_after_own_wait_and_same_tick_reuse_is_ok_and_sends_nothing,
+    fixture_tokio_kill_tree_own_wait_same_tick_driver,
+    fixture_tokio_kill_tree_own_wait_same_tick_init,
+    kill_tree_after_own_wait_and_same_tick_reuse_body
 );

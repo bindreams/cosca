@@ -293,10 +293,17 @@ impl SharedChild {
     /// unique id, with an unreadable id on a running child an error).
     #[cfg(unix)]
     pub(crate) fn state(&self) -> crate::signal::RootState {
+        self.state_and_own_reap().0
+    }
+
+    /// [`state`](Self::state), and whether a `Reaped` is this handle's own reap, from one read under
+    /// the lock: a reap of ours on another thread cannot land between the two answers.
+    #[cfg(unix)]
+    pub(crate) fn state_and_own_reap(&self) -> (crate::signal::RootState, bool) {
         use crate::signal::RootState;
         let lock = self.lock();
         if matches!(lock.state, State::E(_)) {
-            return RootState::Reaped;
+            return (RootState::Reaped, true);
         }
         let Some(target) = self.target() else {
             #[cfg(not(test))]
@@ -305,13 +312,13 @@ impl SharedChild {
                 "child {} has no handle (it was gone when adopted); treating it as reaped",
                 self.id()
             );
-            return RootState::Reaped;
+            return (RootState::Reaped, false);
         };
         #[cfg(target_os = "macos")]
         let peeked = exit_only::peek_verified(&target);
         #[cfg(not(target_os = "macos"))]
         let peeked = exit_only::peek(&target);
-        RootState::of_peek(peeked)
+        (RootState::of_peek(peeked), false)
     }
 
     /// The unique id this handle checks its by-pid actions against. Tests only.
