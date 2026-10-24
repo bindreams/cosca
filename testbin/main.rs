@@ -1,7 +1,7 @@
 //! Test-only helper spawned by the crate's integration tests. std-only, with
 //! exceptions that use the `cosca` crate: the `report-nested-kill-tree` mode, to exercise
-//! the real nested-member `kill_tree` path, `spawn-dump-env-block`, to spawn through each
-//! Windows backend, and the frozen-spawn modes of `frozen.rs`. Behavior is selected by argv[1].
+//! the real nested-member `kill_tree` path, `spawn-dump-env-block` and `spawn-with-null-std`, to
+//! spawn through each Windows backend, and the frozen-spawn modes of `frozen.rs`. Behavior is selected by argv[1].
 
 #[cfg(target_os = "macos")]
 use std::io::BufRead;
@@ -54,6 +54,10 @@ mod frozen;
 #[cfg(windows)]
 #[path = "env_block.rs"]
 mod env_block;
+
+#[cfg(windows)]
+#[path = "null_std.rs"]
+mod null_std;
 
 /// `tests/elevation_pkexec_version.rs`'s fake pkexec: this binary, copied to `real/pkexec-impl`.
 /// Appends one line to `../pkexec.log` (next to `real/`): `argv[0]`, the file running (so the
@@ -1203,6 +1207,10 @@ fn main() {
             report_sock.write_all(line.as_bytes()).unwrap();
             report_sock.flush().unwrap();
         }
+        #[cfg(windows)]
+        "spawn-with-null-std" => null_std::spawn(&args[2], &args[3], &args[4]),
+        #[cfg(windows)]
+        "report-std-handles" => null_std::report(&args[2], &args[3]),
         #[cfg(windows)]
         "dump-env-block" => env_block::dump(),
         #[cfg(windows)]

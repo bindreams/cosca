@@ -532,6 +532,25 @@ fn fd3_only_routing_does_not_load_a_binary_planted_in_the_process_cwd() {
     assert_eq!(s.trim(), "notfound", "helper report: {s}");
 }
 
+#[cfg(windows)]
+/// With the spawning process's std handles all null, as a GUI or service process's are,
+/// a raw-backend spawn succeeds and its child gets null std handles and no `STARTF_USESTDHANDLES`, as
+/// from std's route, and no handle the spawn did not list. Mutants: a null parent handle passed to
+/// `GetFileType` (fails with 6); `STARTF_USESTDHANDLES` always set; `bInheritHandles` TRUE without a
+/// HANDLE_LIST.
+#[skuld::test]
+fn raw_spawn_with_null_parent_std_handles_gives_the_child_null() {
+    common::null_std::assert_every_route("sync", "all", "usestdhandles=false,stdin=null,stdout=null,stderr=null");
+}
+
+#[cfg(windows)]
+/// With only the spawning process's stdin null, the child gets null stdin and the other two inherited.
+/// Mutant: a null parent handle passed to `GetFileType` (fails with 6).
+#[skuld::test]
+fn raw_spawn_with_null_parent_stdin_gives_the_child_null_stdin() {
+    common::null_std::assert_every_route("sync", "stdin", "usestdhandles=true,stdin=null,stdout=pipe,stderr=pipe");
+}
+
 #[path = "../src/test_harness.rs"]
 mod test_harness;
 

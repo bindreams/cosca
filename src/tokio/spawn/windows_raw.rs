@@ -16,7 +16,7 @@ use std::process::ExitStatus;
 use std::sync::Arc;
 
 use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
-use windows::Win32::System::Threading::{TerminateProcess, WaitForSingleObject, STARTF_USESTDHANDLES, STARTUPINFOEXW};
+use windows::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
 
 use crate::child::spawn::windows_raw as sync_raw;
 use crate::child::spawn::{
@@ -29,7 +29,7 @@ use crate::tokio::child::{Child, ProcSource};
 use crate::tokio::stdio::OwnedStd;
 use crate::wait::backend::{new_cancel_event, signal_cancel};
 
-use sync_raw::{exit_status, wait_handle_or_cancel, AttributeList, WaitOutcome};
+use sync_raw::{exit_status, wait_handle_or_cancel, WaitOutcome};
 
 /// A raw `CreateProcessW` child driven from tokio. The process handle lives behind an `Arc` so a
 /// dropped `wait()` future — or a dropped child — never closes a handle a blocking watcher is still
@@ -292,21 +292,12 @@ pub(crate) fn spawn_raw(
     // SAME layout + single HANDLE_LIST source as the sync backend.
     let table = sync_raw::build_fd_table(&child_ends).not_started()?;
 
-    // STARTUPINFOEXW: STARTF_USESTDHANDLES + hStd* for 0/1/2; `lpReserved2` carries the fd-table so
-    // the child CRT recovers fd >= 3; the HANDLE_LIST (`table.handles`) scopes inheritance AND backs
-    // EXTENDED_STARTUPINFO_PRESENT. `table` (`bytes`) is kept alive until after CreateProcessW.
-    let mut si = STARTUPINFOEXW::default();
-    si.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
-    si.StartupInfo.hStdInput = HANDLE(child_ends[&Fd::STDIN].as_raw_handle());
-    si.StartupInfo.hStdOutput = HANDLE(child_ends[&Fd::STDOUT].as_raw_handle());
-    si.StartupInfo.hStdError = HANDLE(child_ends[&Fd::STDERR].as_raw_handle());
-    si.StartupInfo.cbReserved2 = table.bytes.len() as u16; // fits: capped above
-    si.StartupInfo.lpReserved2 = table.bytes.as_ptr() as *mut u8;
+    // THE SAME composition as the sync backend. `table` (`bytes`) and the attribute list stay alive
+    // until after CreateProcessW.
+    let (mut si, attr) = sync_raw::startup_info(&child_ends, &table).not_started()?;
     // SINGLE handle source: `table.handles` is 0/1/2 + fd >= 3, each a distinct fresh dup (its
     // 0/1/2 entries ARE the hStd* handles), so no duplicate reaches the list.
     let all_handles: &[HANDLE] = &table.handles;
-    let attr = AttributeList::build(all_handles).not_started()?;
-    si.lpAttributeList = attr.as_ptr();
     // The complete word, composed above by the ONE function all three backends share — the two
     // structural bits this backend cannot spawn without included. Nothing ORs into it here.
     let flags = plan.creation_flags;
