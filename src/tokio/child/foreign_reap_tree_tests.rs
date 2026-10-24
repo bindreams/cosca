@@ -161,6 +161,61 @@ async fn tokio_graceful_shutdown_tree_after_a_foreign_reap_warns_once_and_ends()
     );
 }
 
+/// The sync `graceful_shutdown_tree_after_own_wait_claims_no_sigterm_it_did_not_send`'s twin. Same
+/// mutant.
+#[skuld::test]
+async fn tokio_graceful_shutdown_tree_after_own_wait_claims_no_sigterm_it_did_not_send() {
+    use crate::child::fault::force_next_root_read;
+    use crate::identity::{ProcessId, Resolved};
+    use crate::test_child::reaped_elsewhere::UNTRUSTED_NUMBER;
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let killed = record_kill_group();
+    let termed = record_term_group();
+    let mut child = session_sleep().spawn().expect("spawn");
+    let pid = child.id().pid();
+    child.kill().expect("kill the root");
+    child.wait().await.expect("this handle reaps the root");
+    let other = ProcessId::from_parts_for_test(pid, child.id().start_token_raw() + 1);
+    // The shutdown's look finds another process; the sweep's, after the terminate, cannot read the
+    // pid. This guard clears the second force too, should it go unconsumed.
+    let _reads = force_next_root_read(Resolved::Found(other));
+    let _unreadable = crate::graceful_hooks::at(crate::graceful_hooks::HookPoint::AfterTerminate, || {
+        std::mem::forget(force_next_root_read(Resolved::Unknown))
+    });
+
+    let mark = crate::log_capture::mark();
+    let err = child
+        .graceful_shutdown_tree(std::time::Duration::ZERO)
+        .await
+        .expect_err("a sweep whose root's pid cannot be read is not assessable");
+
+    assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
+    assert_eq!(
+        termed.termed(),
+        Vec::<i32>::new(),
+        "no SIGTERM by a reaped root's number"
+    );
+    assert_eq!(
+        killed.killed(),
+        Vec::<i32>::new(),
+        "no killpg by a reaped root's number"
+    );
+    let warns = warns_since(mark);
+    assert_eq!(warns.len(), 1, "exactly one warn: {warns:?}");
+    assert!(warns[0].contains(UNTRUSTED_NUMBER), "{warns:?}");
+    #[cfg(target_os = "linux")]
+    assert!(
+        !warns[0].contains("was sent before it"),
+        "no SIGTERM was sent: {warns:?}"
+    );
+    #[cfg(target_os = "macos")]
+    assert!(
+        warns[0].contains("though the SIGTERM to any marker holders was sent before it"),
+        "the SIGTERM went to the marker holders alone: {warns:?}"
+    );
+}
+
 /// A backend forgotten because it could not be shown to be ours may still be running: `kill_tree`
 /// treats its root as `Unknown`, never as reaped elsewhere. On macOS that is the identity path: the
 /// marker holders, the root among them, are killed by the pipe they hold.
@@ -225,10 +280,12 @@ async fn tokio_kill_tree_of_a_backend_forgotten_unproven_treats_the_root_as_unkn
 }
 
 /// A root that leaves a marker holder outside its process group: see
-/// [`ESCAPED_HOLDER_SCRIPT`](crate::test_child::reaped_elsewhere::ESCAPED_HOLDER_SCRIPT). Returns the
+/// [`escaped_holder_script`](crate::test_child::reaped_elsewhere::escaped_holder_script). Returns the
 /// child, the holder's pid, the held stdin and the stderr the holder's death closes.
 #[cfg(target_os = "macos")]
-async fn escaped_holder_tree() -> (
+async fn escaped_holder_tree(
+    ignore_term: bool,
+) -> (
     crate::tokio::Child,
     u32,
     crate::tokio::ChildStdin,
@@ -236,7 +293,11 @@ async fn escaped_holder_tree() -> (
 ) {
     use ::tokio::io::AsyncBufReadExt as _;
     let mut cmd = crate::tokio::Command::new();
-    cmd.args(["sh", "-c", crate::test_child::reaped_elsewhere::ESCAPED_HOLDER_SCRIPT]);
+    cmd.args([
+        "sh",
+        "-c",
+        &crate::test_child::reaped_elsewhere::escaped_holder_script(ignore_term),
+    ]);
     cmd.contain_with(crate::ContainMode::Session);
     cmd.stdin(crate::Stdio::pipe_in()).expect("stdin pipe");
     cmd.stdout(crate::Stdio::pipe_out()).expect("stdout pipe");
@@ -279,7 +340,7 @@ async fn tokio_kill_tree_after_own_wait_and_reuse_kills_a_holder_that_left_the_g
     let groups = record_kill_group();
     let walks = crate::containment::treewalk::fault::record_walks();
     let holders = crate::containment::fdmarker::fault::record_holder_kills();
-    let (mut child, holder, _stdin, stderr) = escaped_holder_tree().await;
+    let (mut child, holder, _stdin, stderr) = escaped_holder_tree(false).await;
     let pid = child.id().pid();
     child.kill().expect("kill the root");
     child.wait().await.expect("this handle reaps the root");
@@ -318,7 +379,7 @@ async fn tokio_kill_tree_after_a_foreign_reap_kills_a_holder_that_left_the_group
     let groups = record_kill_group();
     let walks = crate::containment::treewalk::fault::record_walks();
     let holders = crate::containment::fdmarker::fault::record_holder_kills();
-    let (mut child, holder, _stdin, stderr) = escaped_holder_tree().await;
+    let (mut child, holder, _stdin, stderr) = escaped_holder_tree(false).await;
     let pid = child.id().pid();
     child.kill().expect("kill the root");
     reap_behind(pid);
@@ -341,5 +402,51 @@ async fn tokio_kill_tree_after_a_foreign_reap_kills_a_holder_that_left_the_group
         holders.killed()
     );
     assert_one_reaped_elsewhere_warn(mark, pid);
+    assert_holder_dies(stderr).await;
+}
+
+/// The sync `graceful_shutdown_tree_after_a_foreign_reap_kills_a_holder_that_ignores_sigterm`'s
+/// twin. Same mutant.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+async fn tokio_graceful_shutdown_tree_after_a_foreign_reap_kills_a_holder_that_ignores_sigterm() {
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let killed = record_kill_group();
+    let termed = record_term_group();
+    let walks = crate::containment::treewalk::fault::record_walks();
+    let holders = crate::containment::fdmarker::fault::record_holder_kills();
+    let (mut child, holder, _stdin, stderr) = escaped_holder_tree(true).await;
+    let pid = child.id().pid();
+    child.kill().expect("kill the root");
+    reap_behind(pid);
+
+    let mark = crate::log_capture::mark();
+    let err = child
+        .graceful_shutdown_tree(std::time::Duration::ZERO)
+        .await
+        .expect_err("a group whose root was reaped elsewhere is not assessable");
+
+    assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
+    assert_eq!(
+        killed.killed(),
+        Vec::<i32>::new(),
+        "no killpg by a reaped root's number"
+    );
+    assert_eq!(
+        termed.termed(),
+        Vec::<i32>::new(),
+        "no SIGTERM by a reaped root's number"
+    );
+    assert_eq!(walks.walked(), Vec::<u32>::new(), "no walk from a reaped root's number");
+    let signalled = holders
+        .killed()
+        .iter()
+        .filter(|signalled| **signalled == holder)
+        .count();
+    assert_eq!(signalled, 2, "the SIGTERM, then the kill: {:?}", holders.killed());
+    assert_one_reaped_elsewhere_warn(mark, pid);
+    let warns = warns_since(mark);
+    assert_eq!(warns.len(), 1, "exactly one warn: {warns:?}");
     assert_holder_dies(stderr).await;
 }

@@ -359,3 +359,55 @@ in_fresh_pid_ns!(
     fixture_sync_kill_tree_own_wait_same_tick_init,
     kill_tree_after_own_wait_and_same_tick_reuse_body
 );
+
+/// `graceful_shutdown_tree` of a root this handle reaped itself, whose pid now names another
+/// process: the group is empty, so neither the `SIGTERM` nor the sweep goes out by the number, and
+/// the call answers the root's own status, with no warn.
+///
+/// Mutant: the shutdown's look at the reaped root is ignored, so its `SIGTERM` goes to the group by
+/// the number, the reuser's.
+fn graceful_shutdown_tree_after_own_wait_and_reuse_body() {
+    crate::log_capture::install();
+    let killed = crate::containment::unix::fault::record_kill_group();
+    let termed = crate::containment::unix::fault::record_term_group();
+    let (child, writer) = spawn_group_blocker();
+    let pid = child.id().pid();
+    let token = reuser_token(&child, false);
+    drop(writer);
+    let status = child.wait().expect("this handle reaps the root");
+    let reuser = crate::test_child::pid_reuse::reuse(pid);
+    let _alias = crate::identity::fault::alias_token(reuser.id(), token);
+
+    let mark = crate::log_capture::mark();
+    let shut_down = child
+        .graceful_shutdown_tree(std::time::Duration::ZERO)
+        .expect("a tree whose root this handle reaped answers its status");
+
+    assert_eq!(shut_down, status, "the root's own status");
+    assert_eq!(
+        termed.termed(),
+        Vec::<i32>::new(),
+        "no SIGTERM by a reaped root's number"
+    );
+    assert_eq!(
+        killed.killed(),
+        Vec::<i32>::new(),
+        "no killpg by a reaped root's number"
+    );
+    assert_eq!(
+        crate::test_child::reaped_elsewhere::warns_since(mark),
+        Vec::<String>::new(),
+        "the group is empty: nothing to warn about"
+    );
+    assert_eq!(
+        sigusr1_and_wait(reuser),
+        Some(libc::SIGUSR1),
+        "the reuser must have been signalled by the test alone"
+    );
+}
+in_fresh_pid_ns!(
+    namespaces_graceful_shutdown_tree_after_own_wait_and_reuse_sends_nothing,
+    fixture_sync_graceful_own_wait_driver,
+    fixture_sync_graceful_own_wait_init,
+    graceful_shutdown_tree_after_own_wait_and_reuse_body
+);
