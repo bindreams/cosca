@@ -542,15 +542,12 @@ impl Attached {
         }
     }
 
-    /// Whether this mechanism fires `killpg` against a pgid subject to the reap-then-recycle
-    /// hazard `Child::kill_tree`/`terminate_tree`'s precondition assert guards against: the OS
-    /// reaping the leader and recycling its pid/pgid onto a different, live process group
-    /// before the signal is sent. `ProcessGroup` always carries one; a macOS `FdMarker` does
-    /// too, when its mode created one (`Marker::has_pgid` — `None` for `TreeWalk`, which needs
-    /// no pgid and stays exempt, matching `Attached::TreeWalk` below). `FdMarker` fires
-    /// `killpg` on `self.pgid` unconditionally on pass 1 of every sweep, so the hazard is
-    /// identical, not merely analogous — routing every contained macOS root through
-    /// `FdMarker` instead of `ProcessGroup` must not silently drop this precondition's coverage.
+    /// Whether this mechanism fires `killpg` against a pgid that the leader's reap frees for reuse,
+    /// so `kill_tree`/`terminate_tree` check the root first ([`crate::child::reaped_root_tree_signal`]).
+    /// `ProcessGroup` always carries one; a macOS `FdMarker` does too, when its mode created one
+    /// (`Marker::has_pgid`: `None` for `TreeWalk`, which needs no pgid, matching `Attached::TreeWalk`
+    /// below). `FdMarker` fires `killpg` on `self.pgid` on pass 1 of every sweep, so the hazard is
+    /// the same as `ProcessGroup`'s.
     #[cfg(unix)]
     pub(crate) fn carries_recyclable_pgid(&self) -> bool {
         match self {
@@ -569,7 +566,7 @@ impl Attached {
     /// that names no descendant of the reaped root: reparenting cleared those edges, so the only
     /// processes with that ppid belong to whoever reused the number. A macOS fd marker does both.
     #[cfg(unix)]
-    fn named_by_root_number(&self, root_pid: u32, verb: &str) -> Option<String> {
+    pub(crate) fn named_by_root_number(&self, root_pid: u32, verb: &str) -> Option<String> {
         match self {
             Attached::ProcessGroup(pgid) => Some(format!("{verb} its process group (pgid {pgid})")),
             #[cfg(target_os = "macos")]

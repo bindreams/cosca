@@ -759,6 +759,14 @@ impl Child {
     /// [`Error::Unassessable`](crate::error::Error::Unassessable) saying that nothing was sent and what
     /// was skipped. The handle backstop reads the root's state again: a root orphaned during the sweep
     /// is an exited zombie, so the backstop is skipped and the sweep's answer stands.
+    ///
+    /// **A root reaped by something else.** A process group, and a macOS fd marker's group, are
+    /// named by the root's pid. If the root's own handle shows it was reaped by another reaper in the
+    /// process, or cannot say, that pid may name another process: this sends nothing and returns
+    /// [`Error::Unassessable`](crate::error::Error::Unassessable), with a `warn` naming the group it
+    /// skipped. Once this handle reaped the root itself, another process at that pid means the group
+    /// is empty: nothing is sent, and the call is `Ok`; a pid that cannot be read is `Unassessable`
+    /// as above. A foreign reap after that look is not seen.
     pub fn kill_tree(&mut self) -> Result<(), Error> {
         self.kill_tree_after(None)
     }
@@ -788,26 +796,15 @@ impl Child {
         {
             return result;
         }
-        // Precondition (a separate, unfixed gap — asserted, not fixed, here): see the sync
-        // twin, `Child::kill_tree` in `src/child.rs`, for the full rationale (including which
-        // mechanisms `carries_recyclable_pgid` covers, and why this is `#[cfg(unix)]`).
+        // A group named by the root's pid, once that pid may name another process.
         #[cfg(unix)]
-        debug_assert!(
-            !self.os.attached.carries_recyclable_pgid() || {
-                let now = ProcessId::of(self.id.pid());
-                let now_liveness = match now {
-                    crate::identity::Resolved::Found(id) => id.is_alive(),
-                    crate::identity::Resolved::Gone | crate::identity::Resolved::Unknown => {
-                        crate::identity::Liveness::Unknown
-                    }
-                };
-                !crate::child::root_pid_was_recycled(self.id, now, now_liveness)
-            },
-            "kill_tree/terminate_tree called after the contained root's pid ({}) was reaped and \
-             recycled onto a different, live process; a pgid-based mechanism would now signal an \
-             unrelated process group",
-            self.id.pid()
-        );
+        if let Some(result) =
+            crate::child::reaped_root_tree_signal(&self.os.attached, self.id, "kill_tree", "kill", earlier, || {
+                self.root_state_and_own_reap()
+            })
+        {
+            return result;
+        }
         let group_result = self.os.attached.hard_kill_marking(&self.tree_killed);
         // A TreeWalk that could not walk killed nothing, and the root's death would strand the
         // descendants beyond a retry: return the error with the tree intact.
@@ -897,9 +894,9 @@ impl Child {
     /// group refused the signal — a setuid binary in the tree is the ordinary cause. The
     /// tree is still running and this process cannot bring it down.
     ///
-    /// See [`kill_tree`](Child::kill_tree)'s doc for two things that also apply here: the
+    /// See [`kill_tree`](Child::kill_tree)'s doc for three things that also apply here: the
     /// `ProcessGroup`/`Session`-only scope of this guarantee (a separate, unfixed gap for
-    /// `TreeWalk`), and the residual `hidepid` gap on Linux.
+    /// `TreeWalk`), the residual `hidepid` gap on Linux, and a root reaped by something else.
     ///
     /// **Windows, after the root's exit has been observed.** The event is addressed by the
     /// ROOT's pid — on the job-object mechanism and the tree walk alike — and this handle stops
@@ -937,25 +934,14 @@ impl Child {
         if !self.proc().pins_pid() {
             return Err(self.unpinned_pid_refusal("terminate_tree"));
         }
-        // See kill_tree's identical precondition assert for the full rationale, including the
-        // `#[cfg(unix)]` gate (`carries_recyclable_pgid` does not exist on Windows).
         #[cfg(unix)]
-        debug_assert!(
-            !self.os.attached.carries_recyclable_pgid() || {
-                let now = ProcessId::of(self.id.pid());
-                let now_liveness = match now {
-                    crate::identity::Resolved::Found(id) => id.is_alive(),
-                    crate::identity::Resolved::Gone | crate::identity::Resolved::Unknown => {
-                        crate::identity::Liveness::Unknown
-                    }
-                };
-                !crate::child::root_pid_was_recycled(self.id, now, now_liveness)
-            },
-            "kill_tree/terminate_tree called after the contained root's pid ({}) was reaped and \
-             recycled onto a different, live process; a pgid-based mechanism would now signal an \
-             unrelated process group",
-            self.id.pid()
-        );
+        if let Some(result) =
+            crate::child::reaped_root_tree_signal(&self.os.attached, self.id, "terminate_tree", "signal", None, || {
+                self.root_state_and_own_reap()
+            })
+        {
+            return result;
+        }
         self.os.attached.terminate(self.id.pid())
     }
 
@@ -985,6 +971,16 @@ impl Child {
             .proc
             .as_ref()
             .map_or(crate::signal::RootState::Reaped, ProcSource::state)
+    }
+
+    /// [`root_state`](Self::root_state), and whether a `Reaped` is this handle's own reap (a
+    /// forgotten child's is not).
+    #[cfg(unix)]
+    fn root_state_and_own_reap(&self) -> (crate::signal::RootState, bool) {
+        self.os.proc.as_ref().map_or(
+            (crate::signal::RootState::Reaped, false),
+            ProcSource::state_and_own_reap,
+        )
     }
 
     /// Refuse `op` while the root is not pinned by this process (macOS: launchd holds its zombie).
@@ -1135,6 +1131,10 @@ mod child_drop_reaped_tests;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "child/pid_reuse_tests.rs"]
 mod pid_reuse_tests;
+
+#[cfg(all(test, unix))]
+#[path = "child/foreign_reap_tree_tests.rs"]
+mod foreign_reap_tree_tests;
 
 #[cfg(all(test, unix))]
 #[path = "child/root_state_tests.rs"]

@@ -2713,8 +2713,8 @@ fn an_abandoned_spawn_whose_child_sent_nothing_may_leave_it_unreaped() {
     assert_eq!(crate::containment::cgroup::fault::take_signalled_by_pid(), 0);
 }
 
-/// A child reaped between the check that it lives and the kill — only by a reaper the crate's
-/// contract forbids — is signalled through its handle, which now names nothing: no other process
+/// A child reaped between the check that it lives and the kill, by another reaper in the process,
+/// is signalled through its handle, which now names nothing: no other process
 /// can be hit. The kill finds it gone, and nothing is reaped twice.
 #[cfg(target_os = "linux")]
 #[skuld::test]

@@ -629,10 +629,14 @@ impl Command {
     /// available, so dropping or `kill_tree`-ing the child tears down every
     /// descendant. See [`crate::Containment`] for the per-OS mechanisms.
     ///
-    /// # Linux: the child must stay this process's to reap
-    /// Until `spawn` returns, nothing else in the process may reap the child: do not set `SIGCHLD`
-    /// to `SIG_IGN` or run a reaper that calls `waitpid(-1, …)`/`wait()`, since that frees the pid
-    /// for reuse by an unrelated process.
+    /// # A child reaped by something else
+    /// Another reaper in the process (`SIGCHLD` set to `SIG_IGN`, or `waitpid(-1, …)`) may reap the
+    /// child. On Linux a cgroup's kill stays exact, since it names no pid, and only the exit status
+    /// is lost. A process group, and a macOS fd marker's group, are named by the root's pid, which
+    /// may then name another process: on evidence of a foreign reap their kills are skipped, and
+    /// [`kill_tree`](crate::Child::kill_tree) and [`terminate_tree`](crate::Child::terminate_tree)
+    /// return [`Error::Unassessable`](crate::error::Error::Unassessable). A foreign reap between
+    /// that look and the signal is not seen. macOS has no pidfd, so cosca has no exact kill there.
     ///
     /// # Linux: an elevated child behind a front
     /// A `sudo` or `doas` front in a cgroup is killed through the cgroup alone, and whether that kill
