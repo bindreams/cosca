@@ -836,6 +836,9 @@ impl Command {
     ///   measured, sudo 1.9.5–1.9.17 with `runcwd=~` ran it in `/root`.
     /// - `pkexec` is passed `--keep-cwd`, and so requires Linux and polkit 121 or later; see
     ///   [`Backend::Pkexec`](crate::elevation::Backend::Pkexec).
+    /// - `osascript` (macOS, [`Auth::Gui`](crate::elevation::Auth::Gui)) does not carry the cwd
+    ///   across its trampoline: with no `current_dir()`, the payload runs in the trampoline's
+    ///   directory. Pass an absolute `current_dir()` to fix that.
     ///
     /// The program is `argv[0]`, as written. A command that sets
     /// [`executable`](Self::executable) or [`raw_executable`](Self::raw_executable) is refused with

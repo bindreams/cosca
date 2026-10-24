@@ -10,7 +10,7 @@ fn invalid_input_message(r: Result<Anchored, Error>) -> String {
 }
 
 #[skuld::test]
-fn an_absolute_program_is_returned_unchanged_without_reading_any_cwd() {
+fn an_absolute_program_is_returned_unchanged() {
     let got = anchor_posix(OsStr::new("/usr/bin/id"), Some(Path::new("rel"))).unwrap();
     assert_eq!(got.program, Path::new("/usr/bin/id"));
 }
@@ -31,7 +31,7 @@ fn backslashes_and_drive_letters_are_ordinary_bytes() {
 }
 
 #[skuld::test]
-fn a_name_that_names_no_file_is_refused_before_any_cwd_is_read() {
+fn a_name_that_names_no_file_is_refused() {
     for n in ["", ".", "..", "dir/", "a/.", "a/..", "/"] {
         let msg = invalid_input_message(anchor_posix(OsStr::new(n), None));
         assert!(msg.contains("names no file"), "{n:?}: {msg}");
@@ -41,7 +41,7 @@ fn a_name_that_names_no_file_is_refused_before_any_cwd_is_read() {
 /// Blamed on the NUL even where the untruncated spelling is also shapeless (`x` + NUL + `/`).
 #[skuld::test]
 fn an_interior_nul_is_refused_and_named() {
-    for n in ["to\0ol", "x\0/"] {
+    for n in ["to\0ol", "a\0b", "x\0/"] {
         let msg = invalid_input_message(anchor_posix(OsStr::new(n), None));
         assert!(msg.contains("NUL"), "{n:?}: {msg}");
         assert!(!msg.contains('\0'), "the refusal must not carry a raw NUL: {msg:?}");
@@ -50,7 +50,7 @@ fn an_interior_nul_is_refused_and_named() {
 
 /// A name with no `/` gets one, so `execvp` cannot search it; one with a `/` is already unsearched.
 #[skuld::test]
-fn a_relative_program_is_anchored_to_the_childs_cwd_without_reading_it() {
+fn a_relative_program_is_anchored_to_the_childs_cwd() {
     for (program, want) in [("tool", "./tool"), ("bin/tool", "bin/tool"), ("./tool", "./tool")] {
         let got = anchor_posix(OsStr::new(program), Some(Path::new("sub"))).unwrap();
         // `OsStr`, not `Path`: `Path`'s equality skips `.` components, so it could not see a
@@ -73,11 +73,4 @@ fn an_absolute_program_is_not_anchored() {
     let got = anchor_posix(OsStr::new("/usr/bin/id"), Some(Path::new("sub"))).unwrap();
     assert!(!got.enter);
     assert_eq!(got.program, Path::new("/usr/bin/id"));
-}
-
-#[skuld::test]
-fn anchoring_refuses_what_it_cannot_anchor() {
-    for n in ["", ".", "dir/", "a\0b"] {
-        invalid_input_message(anchor_posix(OsStr::new(n), None));
-    }
 }

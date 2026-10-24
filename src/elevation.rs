@@ -98,9 +98,7 @@ pub(crate) const SETTER_REFUSAL: &str = "name the elevated program as argv[0] (s
 /// An elevated program is argv[0] as written: cosca neither searches for it nor completes it, and
 /// argv is never rewritten, so neither setter has anything to act on.
 ///
-/// `Empty` is matched on its own rather than folded into the command-line refusal: a fresh
-/// `Command` is `Empty`, and telling `Command::new().elevate()` it elevated a command line would
-/// send its author to audit a builder call their code never makes.
+/// A `Command::new().elevate()` is `Empty`; the message must not claim a command line was elevated.
 pub(crate) fn elevation_argv<'a>(
     cmd: &'a crate::command::Command,
     words: &ArgvRefusals,

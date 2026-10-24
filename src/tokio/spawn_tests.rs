@@ -1201,3 +1201,30 @@ fn a_front_the_leaf_found_is_answered_by_what_became_of_it() {
     assert_eq!(super::front_child_fate(FrontFate::Unplaced), ChildFate::Unknown);
     assert_eq!(super::front_child_fate(FrontFate::Unaccounted), ChildFate::Unknown);
 }
+
+/// The async `spawn()` refuses an elevated `executable()` or `raw_executable()` before any launch,
+/// on the gate in `elevation_argv`; `spawn_uncommitted`'s raw-backend branch asserts that no
+/// elevated request reaches it. The argv[0] is extensionless, so with the gate gone a later check
+/// refuses it as `InvalidInput`: still no launch, and the test fails on the error kind.
+///
+/// Mutant: `elevation_argv` stops refusing a program set by either setter.
+#[cfg(windows)]
+#[skuld::test]
+async fn an_elevated_executable_or_raw_executable_is_refused_by_the_async_spawn() {
+    let program = r"C:\no-such-dir\tool";
+    for setter in ["executable", "raw_executable"] {
+        let mut c = crate::tokio::Command::new();
+        match setter {
+            "executable" => c.executable(program),
+            _ => c.raw_executable(program),
+        };
+        c.args([program]).elevate();
+        match c.spawn() {
+            Err(Error::Unsupported { op, detail, .. }) => {
+                assert!(op.contains(&format!("{setter}()")), "{setter}: {op}");
+                assert_eq!(detail, crate::elevation::SETTER_REFUSAL, "{setter}");
+            }
+            other => panic!("{setter}: expected Unsupported, got {:?}", other.map(|_| "a child")),
+        }
+    }
+}

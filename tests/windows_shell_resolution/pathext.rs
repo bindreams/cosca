@@ -14,7 +14,7 @@ use crate::harness::{
 };
 use crate::windows_probe::{mark_test_passed, same_file};
 
-/// **THE question.** An elevated argv[0] such as `C:\dir\tool` reaches `ShellExecuteEx` as an
+/// An elevated argv[0] such as `C:\dir\tool` reaches `ShellExecuteEx` as an
 /// `lpFile` that is absolute, extensionless and quite possibly nonexistent. If `ShellExecuteEx`
 /// applies `PATHEXT` to a fully-qualified name, then a `tool.bat` beside it runs through `cmd.exe`,
 /// past a batch gate that only ever saw the token `tool`, and only cosca's `.exe`/`.com` allowlist
@@ -34,8 +34,8 @@ fn does_shellexecute_apply_pathext_to_an_absolute_extensionless_lpfile(#[fixture
             // is exactly what "PATHEXT is not applied" would look like.
             println!("PROBE absolute-extensionless-lpFile: launched=false ({e})");
             println!(
-                "  => ShellExecuteEx does NOT extend an absolute lpFile. Completing the name is \
-                 sufficient to close the search half, as cosca currently assumes."
+                "  => ShellExecuteEx does NOT extend an absolute lpFile, so a fully qualified \
+                 argv[0] closes the search half, as cosca currently assumes."
             );
         }
         LaunchOutcome::NotLaunched(e) => panic!(
