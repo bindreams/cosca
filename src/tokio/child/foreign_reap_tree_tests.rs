@@ -96,11 +96,14 @@ async fn tokio_kill_tree_after_own_wait_whose_pid_reads_unknown_sends_no_killpg(
     assert_one_untrusted_number_warn(mark, pid);
 }
 
-/// The sync `kill_tree_of_a_root_its_handle_cannot_read_sends_no_killpg`'s twin. Same mutant.
+/// The sync `kill_tree_of_a_root_its_handle_cannot_read_kills_it_through_its_pidfd_alone`'s twin.
+/// Same mutants.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-async fn tokio_kill_tree_of_a_root_its_handle_cannot_read_sends_no_killpg() {
+async fn tokio_kill_tree_of_a_root_its_handle_cannot_read_kills_it_through_its_pidfd_alone() {
+    use crate::test_child::reaped_elsewhere::ROOT_KILLED_BY_PIDFD;
     use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peek_once};
+    use std::os::unix::process::ExitStatusExt as _;
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let recorder = record_kill_group();
@@ -108,6 +111,7 @@ async fn tokio_kill_tree_of_a_root_its_handle_cannot_read_sends_no_killpg() {
     let pid = child.id().pid();
 
     let mark = crate::log_capture::mark();
+    let sends = crate::send_log::Capture::start();
     let forced = force_peek_once(Err(std::io::Error::other("forced peek failure")));
     let err = child
         .kill_tree()
@@ -121,9 +125,16 @@ async fn tokio_kill_tree_of_a_root_its_handle_cannot_read_sends_no_killpg() {
         Vec::<i32>::new(),
         "no killpg by a number that may name another process"
     );
+    assert_eq!(
+        sends.entries(),
+        [(pid, crate::signal::Sig::Kill, crate::send_log::Via::Pidfd)],
+        "the root is killed through its pidfd, and nothing else is sent"
+    );
     assert_one_untrusted_number_warn(mark, pid);
-    child.kill().expect("kill the root");
-    child.wait().await.expect("reap the root");
+    let warns = warns_since(mark);
+    assert!(warns[0].contains(ROOT_KILLED_BY_PIDFD), "{warns:?}");
+    let status = child.wait().await.expect("reap the root");
+    assert_eq!(status.signal(), Some(libc::SIGKILL), "the pidfd kill ended the root");
 }
 
 /// The sync `graceful_shutdown_tree_after_a_foreign_reap_warns_once_and_ends`'s twin. Same mutant.
@@ -407,7 +418,7 @@ async fn tokio_kill_tree_after_a_foreign_reap_kills_a_holder_that_left_the_group
 }
 
 /// The sync `graceful_shutdown_tree_after_a_foreign_reap_kills_a_holder_that_ignores_sigterm`'s
-/// twin. Same mutant.
+/// twin. Same mutants.
 #[cfg(target_os = "macos")]
 #[skuld::test]
 async fn tokio_graceful_shutdown_tree_after_a_foreign_reap_kills_a_holder_that_ignores_sigterm() {
@@ -440,12 +451,11 @@ async fn tokio_graceful_shutdown_tree_after_a_foreign_reap_kills_a_holder_that_i
         "no SIGTERM by a reaped root's number"
     );
     assert_eq!(walks.walked(), Vec::<u32>::new(), "no walk from a reaped root's number");
-    let signalled = holders
-        .killed()
-        .iter()
-        .filter(|signalled| **signalled == holder)
-        .count();
-    assert_eq!(signalled, 2, "the SIGTERM, then the kill: {:?}", holders.killed());
+    assert_eq!(
+        holders.signals_to(holder),
+        [nix::sys::signal::Signal::SIGTERM, nix::sys::signal::Signal::SIGKILL],
+        "the SIGTERM, then the kill"
+    );
     assert_one_reaped_elsewhere_warn(mark, pid);
     let warns = warns_since(mark);
     assert_eq!(warns.len(), 1, "exactly one warn: {warns:?}");

@@ -22,7 +22,7 @@ pub struct Command {
 
 impl Command {
     /// The sync builder this one wraps, for the frozen spawn, which shares its core.
-    pub(super) fn as_sync_mut(&mut self) -> &mut SyncCommand {
+    pub(crate) fn as_sync_mut(&mut self) -> &mut SyncCommand {
         &mut self.inner
     }
 

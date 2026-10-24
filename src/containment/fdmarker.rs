@@ -745,12 +745,14 @@ pub(crate) mod fault {
         FORCE_ROOT_KILL_NOOP.with(|f| f.get())
     }
 
+    type HolderSignal = (u32, nix::sys::signal::Signal);
+
     thread_local! {
-        static HOLDER_KILLS: std::cell::RefCell<Option<Vec<u32>>> = const { std::cell::RefCell::new(None) };
+        static HOLDER_KILLS: std::cell::RefCell<Option<Vec<HolderSignal>>> = const { std::cell::RefCell::new(None) };
     }
 
-    /// From now on `kill_holder` on THIS thread records each marker holder it signals, so a test
-    /// can tell that the sweep ran without waiting for a process to die.
+    /// From now on `kill_holder` on THIS thread records each marker holder it signals, and the
+    /// signal, so a test can tell that the sweep ran without waiting for a process to die.
     pub(crate) fn record_holder_kills() -> HolderKillRecorder {
         HOLDER_KILLS.with(|k| *k.borrow_mut() = Some(Vec::new()));
         HolderKillRecorder(())
@@ -760,7 +762,20 @@ pub(crate) mod fault {
     pub(crate) struct HolderKillRecorder(());
 
     impl HolderKillRecorder {
+        /// The holders signalled, with any signal.
         pub(crate) fn killed(&self) -> Vec<u32> {
+            self.sent().into_iter().map(|(pid, _)| pid).collect()
+        }
+
+        /// The signals sent to `pid`, in order.
+        pub(crate) fn signals_to(&self, pid: u32) -> Vec<nix::sys::signal::Signal> {
+            self.sent()
+                .into_iter()
+                .filter_map(|(to, signal)| (to == pid).then_some(signal))
+                .collect()
+        }
+
+        fn sent(&self) -> Vec<HolderSignal> {
             HOLDER_KILLS.with(|k| k.borrow().clone().expect("the recorder is live"))
         }
     }
@@ -774,13 +789,17 @@ pub(crate) mod fault {
     /// The holders signalled so far under a live [`record_holder_kills`], for a hook that cannot
     /// borrow the recorder.
     pub(crate) fn holder_kills_so_far() -> Vec<u32> {
-        HOLDER_KILLS.with(|k| k.borrow().clone().expect("a recorder is live"))
+        HOLDER_KILLS
+            .with(|k| k.borrow().clone().expect("a recorder is live"))
+            .into_iter()
+            .map(|(pid, _)| pid)
+            .collect()
     }
 
-    pub(super) fn note_holder_kill(pid: u32) {
+    pub(super) fn note_holder_kill(pid: u32, signal: nix::sys::signal::Signal) {
         HOLDER_KILLS.with(|k| {
             if let Some(killed) = k.borrow_mut().as_mut() {
-                killed.push(pid);
+                killed.push((pid, signal));
             }
         });
     }
@@ -1550,7 +1569,7 @@ impl Marker {
             }
             MarkerQuery::Held => {
                 #[cfg(test)]
-                fault::note_holder_kill(id.pid());
+                fault::note_holder_kill(id.pid(), signal);
                 crate::containment::treewalk::kill_by_identity(id, signal)
                     == crate::containment::treewalk::KillOutcome::NotAttempted
             }

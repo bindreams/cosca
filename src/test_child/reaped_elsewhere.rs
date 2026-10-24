@@ -36,6 +36,10 @@ pub(crate) fn assert_one_reaped_elsewhere_walk_warn(mark: usize, pid: u32) {
 /// Every record of the tree ops' skip for a root's number they cannot trust contains this.
 pub(crate) const UNTRUSTED_NUMBER: &str = "may name another process";
 
+/// Every record of a skip that killed the root through its pidfd instead contains this.
+#[cfg(target_os = "linux")]
+pub(crate) const ROOT_KILLED_BY_PIDFD: &str = "killed the root through its pidfd";
+
 /// Asserts the one record since `mark` on this thread says the root's number may name another
 /// process, is a `warn`, and names the group it left unsignalled.
 #[track_caller]

@@ -56,6 +56,10 @@ mod pid_reuse_tests;
 #[path = "child/foreign_reap_tree_tests.rs"]
 mod foreign_reap_tree_tests;
 
+#[cfg(all(test, unix))]
+#[path = "child/root_number_matrix_tests.rs"]
+mod root_number_matrix_tests;
+
 #[cfg(all(test, target_os = "linux"))]
 #[path = "child/kill_tree_view_tests.rs"]
 mod kill_tree_view_tests;
@@ -1201,8 +1205,28 @@ pub(crate) mod fault {
         }
     }
 
+    /// Every read of a root's number on THIS thread answers `read` until the guard drops, after any
+    /// [`force_next_root_read`].
+    pub(crate) fn force_root_reads(read: Resolved<ProcessId>) -> ForcedRootReads {
+        FORCED_ALWAYS.with(|f| f.set(Some(read)));
+        ForcedRootReads(())
+    }
+
+    #[must_use = "the seam is cleared as soon as the guard is dropped"]
+    pub(crate) struct ForcedRootReads(());
+
+    impl Drop for ForcedRootReads {
+        fn drop(&mut self) {
+            FORCED_ALWAYS.with(|f| f.set(None));
+        }
+    }
+
+    thread_local! {
+        static FORCED_ALWAYS: Cell<Option<Resolved<ProcessId>>> = const { Cell::new(None) };
+    }
+
     pub(super) fn take_forced_root_read() -> Option<Resolved<ProcessId>> {
-        FORCED.with(|f| f.take())
+        FORCED.with(|f| f.take()).or_else(|| FORCED_ALWAYS.with(|f| f.get()))
     }
 
     #[cfg(target_os = "linux")]

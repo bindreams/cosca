@@ -4,6 +4,8 @@
 //! reaches no process.
 
 use crate::containment::unix::fault::{record_kill_group, record_term_group};
+#[cfg(target_os = "linux")]
+use crate::test_child::reaped_elsewhere::ROOT_KILLED_BY_PIDFD;
 use crate::test_child::reaped_elsewhere::{
     assert_one_reaped_elsewhere_warn, assert_one_untrusted_number_warn, foreign_reaped_group_root, session_sleep,
     warns_since,
@@ -80,20 +82,23 @@ fn kill_tree_after_own_wait_whose_pid_reads_unknown_sends_no_killpg() {
 }
 
 /// A root whose own handle cannot say whether it was reaped: its pid may name another process, so
-/// `kill_tree` sends no `killpg` and answers `Unassessable`. (macOS answers this earlier, through
-/// its untrusted-root path.)
+/// `kill_tree` sends no `killpg`, kills the root through its pidfd, which names it exactly, and
+/// answers `Unassessable`. (macOS answers this earlier, through its untrusted-root path.)
 ///
-/// Mutant: a `RootState::Unknown` root's group is signalled.
+/// Mutants: a `RootState::Unknown` root's group is signalled; the root is not killed through its
+/// pidfd; the warn does not say it was.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn kill_tree_of_a_root_its_handle_cannot_read_sends_no_killpg() {
+fn kill_tree_of_a_root_its_handle_cannot_read_kills_it_through_its_pidfd_alone() {
     use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peek_once};
+    use std::os::unix::process::ExitStatusExt as _;
     crate::log_capture::install();
     let recorder = record_kill_group();
     let child = session_sleep().spawn().expect("spawn");
     let pid = child.id().pid();
 
     let mark = crate::log_capture::mark();
+    let sends = crate::send_log::Capture::start();
     let forced = force_peek_once(Err(std::io::Error::other("forced peek failure")));
     let err = child
         .kill_tree()
@@ -107,9 +112,16 @@ fn kill_tree_of_a_root_its_handle_cannot_read_sends_no_killpg() {
         Vec::<i32>::new(),
         "no killpg by a number that may name another process"
     );
+    assert_eq!(
+        sends.entries(),
+        [(pid, crate::signal::Sig::Kill, crate::send_log::Via::Pidfd)],
+        "the root is killed through its pidfd, and nothing else is sent"
+    );
     assert_one_untrusted_number_warn(mark, pid);
-    child.kill().expect("kill the root");
-    child.wait().expect("reap the root");
+    let warns = warns_since(mark);
+    assert!(warns[0].contains(ROOT_KILLED_BY_PIDFD), "{warns:?}");
+    let status = child.wait().expect("reap the root");
+    assert_eq!(status.signal(), Some(libc::SIGKILL), "the pidfd kill ended the root");
 }
 
 /// After a foreign reap, `graceful_shutdown_tree` ends `Unassessable` with one warn and no sweep by
@@ -294,7 +306,8 @@ fn kill_tree_after_a_foreign_reap_kills_a_holder_that_left_the_group() {
 /// `SIGTERM`, so only that kill ends it. Nothing goes out by the root's number, and the call is
 /// `Unassessable`, with one warn.
 ///
-/// Mutant: no kill after the grace.
+/// Mutants: no kill after the grace; a second `SIGTERM` in place of the kill. Either fails by
+/// assertion before the wait for the holder's death.
 #[cfg(target_os = "macos")]
 #[skuld::test]
 fn graceful_shutdown_tree_after_a_foreign_reap_kills_a_holder_that_ignores_sigterm() {
@@ -326,12 +339,11 @@ fn graceful_shutdown_tree_after_a_foreign_reap_kills_a_holder_that_ignores_sigte
         "no SIGTERM by a reaped root's number"
     );
     assert_eq!(walks.walked(), Vec::<u32>::new(), "no walk from a reaped root's number");
-    let signalled = holders
-        .killed()
-        .iter()
-        .filter(|signalled| **signalled == holder.pid)
-        .count();
-    assert_eq!(signalled, 2, "the SIGTERM, then the kill: {:?}", holders.killed());
+    assert_eq!(
+        holders.signals_to(holder.pid),
+        [nix::sys::signal::Signal::SIGTERM, nix::sys::signal::Signal::SIGKILL],
+        "the SIGTERM, then the kill"
+    );
     assert_one_reaped_elsewhere_warn(mark, pid);
     let warns = warns_since(mark);
     assert_eq!(warns.len(), 1, "exactly one warn: {warns:?}");

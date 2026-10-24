@@ -705,6 +705,8 @@ impl CgroupLeaf {
         };
         for line in content.lines() {
             if let Ok(pid) = line.trim().parse::<i32>() {
+                #[cfg(test)]
+                fault::record_terminated_by_pid(pid as u32);
                 _ = kill(Pid::from_raw(pid), Signal::SIGTERM);
             }
         }

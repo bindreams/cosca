@@ -10,6 +10,7 @@ thread_local! {
     static ON_TAKE_PLACEMENT: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static BEFORE_EXIT_WAIT: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static SIGNALLED_BY_PID: Cell<usize> = const { Cell::new(0) };
+    static TERMINATED_BY_PID: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
     static HOOK_GATE: Cell<Option<std::os::fd::RawFd>> = const { Cell::new(None) };
     static FORCE_CHILD_KILL_DENIED: Cell<bool> = const { Cell::new(false) };
     static BACKGROUND_REAP_NOTIFY: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
@@ -645,6 +646,15 @@ pub(crate) fn record_signalled_by_pid() {
 /// How many abandoned children this thread signalled by bare pid since the last call.
 pub(crate) fn take_signalled_by_pid() -> usize {
     SIGNALLED_BY_PID.with(|c| c.replace(0))
+}
+
+/// Note a member `CgroupLeaf::terminate` signalled by its bare pid on this thread.
+pub(crate) fn record_terminated_by_pid(pid: u32) {
+    TERMINATED_BY_PID.with(|t| t.borrow_mut().push(pid));
+}
+/// The members this thread's `CgroupLeaf::terminate` signalled by bare pid since the last call.
+pub(crate) fn take_terminated_by_pid() -> Vec<u32> {
+    TERMINATED_BY_PID.with(|t| std::mem::take(&mut *t.borrow_mut()))
 }
 
 /// Pumps started and ended, per leaf name, process-wide.
