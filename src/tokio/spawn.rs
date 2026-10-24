@@ -751,7 +751,7 @@ fn leave_unverified_front(
                 "is an elevation front whose identity could not be read, sent nothing, and left unreaped"
             }
         },
-        false,
+        super::child::Forgotten::Unproven,
         why,
     );
     let fate = match identity {

@@ -118,8 +118,10 @@ pub(crate) enum RootNumber {
     /// pid-less fd marker's root names nothing. Only the marker holders, if any, are signalled.
     Empty,
     /// The pid may name another process, for the reason `why`: the root was reaped elsewhere, or
-    /// its handle or its pid cannot be read. `exact_root`: the handle cannot say whether the root
-    /// was reaped, but still names it exactly (Linux: its pidfd), so a signal can still reach it.
+    /// its handle or its pid cannot be read. `exact_root` (Linux): the handle cannot say whether the
+    /// root was reaped, and a signal through it reaches the root exactly if it reaches it at all. A
+    /// handle that still holds the root's pidfd delivers it; a tokio backend forgotten because the
+    /// root could not be shown to be ours holds none, and answers `Sent::Unverified`.
     MayNameAnother { why: String, exact_root: bool },
 }
 
@@ -907,7 +909,8 @@ impl Child {
     /// walk, are named by the root's pid. If the root's own handle shows it was reaped by another
     /// reaper in the process, that pid may name another process: nothing is sent by it, and the call
     /// returns [`Error::Unassessable`](crate::error::Error::Unassessable), with a `warn` naming what
-    /// it skipped. A root whose handle cannot say is answered the same way, except that on Linux the
+    /// it skipped, or the error of a failed marker holders' sweep (below), such as
+    /// [`Error::Containment`](crate::error::Error::Containment). A root whose handle cannot say is answered the same way, except that on Linux the
     /// root itself is still signalled through its pidfd, which names it exactly, and the `warn` says
     /// so: `kill_tree` kills it, [`terminate_tree`](Child::terminate_tree) sends it the `SIGTERM`, and
     /// [`graceful_shutdown_tree`](Child::graceful_shutdown_tree) sends the `SIGTERM`, then the kill if
@@ -928,7 +931,7 @@ impl Child {
     /// then goes out, for the whole sweep, to a number another process may hold. For a process group
     /// and an fd marker with a group, the `wait` case closes once `wait` leaves such a root unreaped
     /// until drop (bindreams/cosca#54); for an fd marker without a group, once its sweep checks the
-    /// root again after its process-table snapshot, as `TreeWalk` does.
+    /// root again after its process-table snapshot, as `TreeWalk` does (plan A P7, unit A2b1).
     pub fn kill_tree(&self) -> Result<(), Error> {
         self.kill_tree_after(None)
     }

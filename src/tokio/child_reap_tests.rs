@@ -754,13 +754,14 @@ async fn macos_wait_and_reap_on_a_failed_peek_is_unverified() {
     reap_behind_the_owner(pid);
 }
 
-/// A zombie launchd holds (its tracer died) has exited and is not ours to reap: `Foreign`, with a
+/// A zombie launchd holds (its tracer died) has exited and is not ours to reap: `Orphaned`, with a
 /// `warn` saying so.
 ///
-/// Mutants: `Awaited::Orphaned` is folded into `Gone` without a log; or it is `Unverified`.
+/// Mutants: `Awaited::Orphaned` is folded into `Gone` without a log; or it is `Unverified` or
+/// `Foreign`.
 #[cfg(target_os = "macos")]
 #[skuld::test]
-async fn macos_wait_and_reap_of_a_zombie_launchd_holds_is_foreign_and_warns() {
+async fn macos_wait_and_reap_of_a_zombie_launchd_holds_is_orphaned_and_warns() {
     use crate::wait::exit_only::seams::force_peek_once;
     use crate::wait::exit_only::{Foreign, Peek};
     crate::log_capture::install();
@@ -768,7 +769,7 @@ async fn macos_wait_and_reap_of_a_zombie_launchd_holds_is_foreign_and_warns() {
     let mark = crate::log_capture::mark();
     let _orphaned = force_peek_once(Ok(Peek::Foreign(Foreign::Orphaned)));
 
-    assert_eq!(proc.wait_and_reap(pid), Waited::Foreign);
+    assert_eq!(proc.wait_and_reap(pid), Waited::Orphaned);
 
     let records = crate::log_capture::records_since_on_current_thread(mark, &format!("child {pid}"));
     assert!(

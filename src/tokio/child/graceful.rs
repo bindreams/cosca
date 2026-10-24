@@ -529,6 +529,8 @@ impl Child {
             return unkillable;
         }
         let term = self.term_root_through_handle();
+        #[cfg(test)]
+        fault::run_hook(fault::HookPoint::AfterTerminate);
         let kill = if matches!(term, Ok(Sent::Delivered)) {
             let exited = match self.os.proc.as_ref() {
                 Some(proc) => proc.exited_within(grace).await,

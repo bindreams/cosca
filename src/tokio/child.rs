@@ -10,6 +10,8 @@ pub use suspended::SuspendedChild;
 
 #[path = "child/proc_source.rs"]
 mod proc_source;
+#[cfg(target_os = "macos")]
+pub(crate) use proc_source::Forgotten;
 pub(crate) use proc_source::ProcSource;
 #[cfg(any(unix, test))]
 pub(crate) use proc_source::Waited;
@@ -333,7 +335,7 @@ impl Child {
                 let id = Some(self.id);
                 (self.proc_mut().collect_exit(id), None)
             }
-            Waited::Foreign | Waited::Unverified => (
+            _ => (
                 crate::error::ChildFate::Killed,
                 self.proc_mut().forget_for_wait(waited, cause),
             ),
@@ -764,7 +766,8 @@ impl Child {
     /// walk, are named by the root's pid. If the root's own handle shows it was reaped by another
     /// reaper in the process, that pid may name another process: nothing is sent by it, and the call
     /// returns [`Error::Unassessable`](crate::error::Error::Unassessable), with a `warn` naming what
-    /// it skipped. A root whose handle cannot say is answered the same way, except that on Linux the
+    /// it skipped, or the error of a failed marker holders' sweep (below), such as
+    /// [`Error::Containment`](crate::error::Error::Containment). A root whose handle cannot say is answered the same way, except that on Linux the
     /// root itself is still signalled through its pidfd, which names it exactly, and the `warn` says
     /// so: `kill_tree` kills it, [`terminate_tree`](Child::terminate_tree) sends it the `SIGTERM`, and
     /// [`graceful_shutdown_tree`](Child::graceful_shutdown_tree) sends the `SIGTERM`, then the kill if

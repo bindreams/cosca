@@ -408,7 +408,9 @@ async fn tokio_kill_tree_of_a_backend_forgotten_unproven_treats_the_root_as_unkn
     cmd.contain_with(crate::ContainMode::Session);
     let mut child = cmd.spawn().expect("spawn");
     let pid = child.id().pid();
-    child.proc_mut().forget_as("was forgotten by a test", false);
+    child
+        .proc_mut()
+        .forget_as("was forgotten by a test", super::proc_source::Forgotten::Unproven);
 
     let mark = crate::log_capture::mark();
     let result = child.kill_tree();

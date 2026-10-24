@@ -253,10 +253,16 @@ pub(crate) async fn watch_pidfd(pidfd: std::os::fd::OwnedFd) -> Result<(), Error
 /// pidfd: non-reaping, and no pid is looked up. A `grace` that overflows, or sits inside tokio's
 /// timer margin, is unbounded.
 #[cfg(target_os = "linux")]
-pub(crate) async fn pidfd_exited_within(pidfd: std::os::fd::OwnedFd, grace: Duration) -> Result<bool, Error> {
+pub(crate) async fn pidfd_exited_within(pidfd: std::os::fd::BorrowedFd<'_>, grace: Duration) -> Result<bool, Error> {
+    let watched = pidfd.try_clone_to_owned().map_err(Error::Io)?;
     match deadline_from(grace) {
-        Some(Some(at)) => Ok(arm_at(at, watch_pidfd(pidfd)).await.transpose()?.is_some()),
-        _ => watch_pidfd(pidfd).await.map(|()| true),
+        Some(Some(at)) => match arm_at(at, watch_pidfd(watched)).await {
+            Some(watch) => watch.map(|()| true),
+            // The timer can win the first poll before the reactor reports an exit that was already
+            // pending: answer from one final non-blocking look, as `grace_wait` does.
+            None => crate::wait::poll_pidfd_exit(pidfd, crate::wait::deadline_from(Duration::ZERO)).map_err(Error::Io),
+        },
+        _ => watch_pidfd(watched).await.map(|()| true),
     }
 }
 

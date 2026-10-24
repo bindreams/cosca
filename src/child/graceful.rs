@@ -503,6 +503,8 @@ impl Child {
             return unkillable;
         }
         let term = self.proc.signal_sent(Sig::Term).map_err(Error::Io);
+        #[cfg(test)]
+        fault::run_hook(fault::HookPoint::AfterTerminate);
         let kill = if matches!(term, Ok(Sent::Delivered)) {
             match self.proc.exited_within(grace) {
                 Ok(true) => None,

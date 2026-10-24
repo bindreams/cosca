@@ -637,7 +637,8 @@ impl Command {
     /// [`kill_tree`](crate::Child::kill_tree), [`terminate_tree`](crate::Child::terminate_tree) and
     /// [`graceful_shutdown_tree`](crate::Child::graceful_shutdown_tree) return
     /// [`Error::Unassessable`](crate::error::Error::Unassessable). An fd marker's holders are named by
-    /// the pipe they hold, and are still killed. After the handle's own reap no walk runs from the
+    /// the pipe they hold, and are still killed; if that sweep fails, the call returns its error
+    /// instead, such as [`Error::Containment`](crate::error::Error::Containment). After the handle's own reap no walk runs from the
     /// root's pid, since the root's children were reparented at its exit, but a pid that names no
     /// process is still signalled as the group's id, which another process may take once no member
     /// of the group survives (bindreams/cosca#382). A reap after the handle's look, by another reaper
