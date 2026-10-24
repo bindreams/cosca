@@ -634,10 +634,11 @@ fn program_and_args(cmd: &Command) -> Result<Launch, Error> {
 ///
 /// Reads nothing: an already-root caller runs no backend, and needs no path to its cwd.
 fn reject_structural_posix_config(cmd: &Command, backend: Backend, auth: &Auth) -> Result<(), Error> {
-    // executable() / raw_executable() / commandline() / empty.
-    let argv = checked_argv(cmd)?;
-    // pkexec has no `--` terminator, so a program starting with `-` would be taken for an option.
-    if backend == Backend::Pkexec && program_starts_with_dash(&argv[0]) {
+    let first = match cmd.input() {
+        crate::command::CommandInput::Argv(a) if !a.is_empty() => Some(a[0].clone()),
+        _ => None,
+    };
+    if backend == Backend::Pkexec && first.as_deref().is_some_and(program_starts_with_dash) {
         return Err(Error::Unsupported {
             op: "elevating a leading-dash program under pkexec".into(),
             platform: "unix",
@@ -677,6 +678,7 @@ fn reject_structural_posix_config(cmd: &Command, backend: Backend, auth: &Auth) 
             detail: "Auth::Stdin consumes fd0 to feed sudo -S the password; do not also configure stdin".into(),
         });
     }
+    checked_argv(cmd)?;
     Ok(())
 }
 
@@ -724,6 +726,11 @@ fn reject_structural(cmd: &Command, os: Os) -> Result<(), Error> {
 pub(crate) fn rewrite_with_host(cmd: &mut Command, host: &Host) -> Result<PosixRewrite, Error> {
     let requested_backend = cmd.elevation_request().backend;
     let requested_auth = cmd.elevation_request().auth.clone();
+    if requested_backend == Backend::Pkexec && !host.elevated {
+        if let Some(refusal) = host.pkexec_version.refusal() {
+            return Err(refusal);
+        }
+    }
     reject_structural(cmd, host.os)?;
 
     match host.plan(Privilege::Elevated, requested_backend, requested_auth) {
