@@ -289,7 +289,9 @@ impl Child {
     /// through its pidfd, which names it exactly, then the grace, and a kill through the pidfd if it
     /// is still running; nothing goes out by its number, and the call ends the same way.
     /// After this handle's own reap, with another process at the pid, the group is empty: only the
-    /// holders get the `SIGTERM`, and the call goes on as usual.
+    /// holders get the `SIGTERM`, and the call goes on as usual. The `SIGTERM` and the sweep each
+    /// decide on a look of their own at the root, and each has `kill_tree`'s window between its look
+    /// and its sends: a reap after the look by another reaper is not seen.
     ///
     /// **macOS, a root the handle cannot vouch for** is signalled as for
     /// [`terminate_tree`](Child::terminate_tree) and swept as for [`kill_tree`](Child::kill_tree). A

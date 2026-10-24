@@ -750,9 +750,10 @@ impl Child {
     /// group refused the signal — a setuid binary in the tree is the ordinary cause. The
     /// tree is still running and this process cannot bring it down.
     ///
-    /// See [`kill_tree`](Child::kill_tree)'s doc for three things that also apply here: the
+    /// See [`kill_tree`](Child::kill_tree)'s doc for four things that also apply here: the
     /// `ProcessGroup`/`Session`-only scope of this guarantee (a separate, unfixed gap for
-    /// `TreeWalk`), the residual `hidepid` gap on Linux, and a root reaped by something else.
+    /// `TreeWalk`), the residual `hidepid` gap on Linux, a root reaped by something else, and a reap
+    /// after the look, which may send the `SIGTERM` to a number another process holds.
     ///
     /// **macOS, a root the handle cannot vouch for.** If the root is `Unpinned` (launchd holds its
     /// zombie, see [`kill`](Child::kill)) or `Unknown`, nothing that names the tree by the root's
