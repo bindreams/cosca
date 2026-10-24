@@ -135,7 +135,7 @@ impl ProcHandle {
     }
 
     /// [`kill_sent`](Self::kill_sent) for any `sig`.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     pub(crate) fn signal_sent(&self, sig: crate::signal::Sig) -> io::Result<crate::signal::Sent> {
         match self {
             ProcHandle::Std(s) => s.signal_sent(sig),
