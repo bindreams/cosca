@@ -482,10 +482,9 @@ impl Run {
 
     /// Whether the shim still holds the write end of the pipe the program's process waits on to be
     /// released: a pipe the process holds the read end of and the shim does not, and the shim holds the
-    /// write end of.
+    /// write end of. An fd or process that vanishes mid-scan holds nothing; any other error panics.
     pub(super) fn holds_the_release_pipe(&mut self) -> bool {
         let (shim, child) = (self.pid(), self.program_pid() as u32);
-        // An fd or process that vanishes mid-scan (`ENOENT`, `ESRCH`) is a definite answer: it holds nothing.
         let gone = |e: &std::io::Error| matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ESRCH));
         let ends = |pid: u32| -> Vec<(String, bool)> {
             let mut ends = vec![];
@@ -497,13 +496,14 @@ impl Run {
             for entry in table {
                 let path = match entry {
                     Ok(entry) => entry.path(),
-                    Err(e) if gone(&e) => return ends,
+                    Err(e) if gone(&e) => return vec![],
                     Err(e) => panic!("an entry: {e}"),
                 };
-                let Ok(target) = std::fs::read_link(&path) else {
-                    continue;
+                let target = match std::fs::read_link(&path) {
+                    Ok(target) => target.to_string_lossy().into_owned(),
+                    Err(e) if gone(&e) => continue,
+                    Err(e) => panic!("an fd's target: {e}"),
                 };
-                let target = target.to_string_lossy().into_owned();
                 if !target.starts_with("pipe:[") {
                     continue;
                 }
@@ -521,6 +521,13 @@ impl Run {
                     .expect("flags")
                     .trim();
                 let flags = u32::from_str_radix(flags, 8).expect("octal flags");
+                // The fd number may have been closed and reused between the two reads.
+                match std::fs::read_link(&path) {
+                    Ok(again) if again.to_string_lossy() == target => {}
+                    Ok(_) => continue,
+                    Err(e) if gone(&e) => continue,
+                    Err(e) => panic!("an fd's target: {e}"),
+                }
                 ends.push((target, flags & libc::O_ACCMODE as u32 == libc::O_WRONLY as u32));
             }
             ends
