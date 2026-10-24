@@ -66,8 +66,10 @@ const FAULTS: &[(&str, Fault)] = &[
 ];
 
 /// `set` names `program` on a command whose argv[0] is that program too, under every backend,
-/// root or not and with every [`Fault`]; each must be refused in that backend's words.
+/// root or not and with every [`Fault`]; each must be refused in that backend's words. Every
+/// case runs, so a misplaced rule is reported with each fault it lets ahead.
 fn assert_refused(setter: &str, set: fn(&mut Command, &str), programs: &[&str]) {
+    let mut wrong = Vec::new();
     for elevated in [false, true] {
         for (name, backend, auth, host, words) in backends(elevated) {
             for &program in programs {
@@ -82,21 +84,28 @@ fn assert_refused(setter: &str, set: fn(&mut Command, &str), programs: &[&str]) 
                     let at = format!("{name}, elevated={elevated}, {setter}({program:?}), {fault}");
                     match rewrite_with_host(&mut c, &host) {
                         Err(Error::Unsupported { op, platform, detail }) => {
-                            assert_eq!(platform, words.platform, "{at}");
-                            assert_eq!(
-                                op,
-                                format!("{} of a program set by {setter}()", words.op_prefix),
-                                "{at}"
-                            );
-                            assert_eq!(detail, words.setter, "{at}");
+                            let want_op = format!("{} of a program set by {setter}()", words.op_prefix);
+                            if (platform, &op, &detail) != (words.platform, &want_op, &words.setter.to_owned()) {
+                                wrong.push(format!("{at}: refused as {op:?}: {detail}"));
+                            }
                         }
-                        Err(other) => panic!("{at}: expected Unsupported, got {other}"),
-                        Ok(rw) => panic!("{at}: accepted as {:?}", derived_argv(&rw)),
+                        Err(other) => wrong.push(format!("{at}: expected Unsupported, got {other}")),
+                        Ok(rw) => wrong.push(format!("{at}: accepted as {:?}", derived_argv(&rw))),
                     }
                 }
             }
         }
     }
+    assert!(
+        wrong.is_empty(),
+        "{} cases:
+{}",
+        wrong.len(),
+        wrong.join(
+            "
+"
+        )
+    );
 }
 
 /// Mutant: the gate's setter rule matches `raw_executable()` alone.
