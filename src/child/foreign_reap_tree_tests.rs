@@ -220,7 +220,7 @@ fn kill_tree_after_own_wait_and_reuse_kills_a_holder_that_left_the_group() {
     let groups = record_kill_group();
     let walks = crate::containment::treewalk::fault::record_walks();
     let holders = crate::containment::fdmarker::fault::record_holder_kills();
-    let (child, holder) = escaped_holder_tree(false);
+    let (child, holder) = escaped_holder_tree(crate::ContainMode::Session, false);
     let pid = child.id().pid();
     child.kill().expect("kill the root");
     child.wait().expect("this handle reaps the root");
@@ -263,7 +263,7 @@ fn kill_tree_after_a_foreign_reap_kills_a_holder_that_left_the_group() {
     let groups = record_kill_group();
     let walks = crate::containment::treewalk::fault::record_walks();
     let holders = crate::containment::fdmarker::fault::record_holder_kills();
-    let (child, holder) = escaped_holder_tree(false);
+    let (child, holder) = escaped_holder_tree(crate::ContainMode::Session, false);
     let pid = child.id().pid();
     child.kill().expect("kill the root");
     reap_behind(pid);
@@ -304,7 +304,7 @@ fn graceful_shutdown_tree_after_a_foreign_reap_kills_a_holder_that_ignores_sigte
     let termed = record_term_group();
     let walks = crate::containment::treewalk::fault::record_walks();
     let holders = crate::containment::fdmarker::fault::record_holder_kills();
-    let (child, holder) = escaped_holder_tree(true);
+    let (child, holder) = escaped_holder_tree(crate::ContainMode::Session, true);
     let pid = child.id().pid();
     child.kill().expect("kill the root");
     reap_behind(pid);
@@ -335,5 +335,73 @@ fn graceful_shutdown_tree_after_a_foreign_reap_kills_a_holder_that_ignores_sigte
     assert_one_reaped_elsewhere_warn(mark, pid);
     let warns = warns_since(mark);
     assert_eq!(warns.len(), 1, "exactly one warn: {warns:?}");
+    holder.assert_dies();
+}
+
+/// A `TreeWalk` fd marker has no group, but its sweep walks from the root's pid. After a foreign
+/// reap that pid may name another process, so the walk is skipped; the holders are still killed by
+/// the pipe they hold. The call is `Unassessable`, with one warn naming the walk.
+///
+/// Mutant: the root is checked only for a mechanism with a pgid.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn kill_tree_of_a_walk_marker_after_a_foreign_reap_walks_nothing_and_kills_the_holder() {
+    use crate::test_child::reaped_elsewhere::{
+        assert_one_reaped_elsewhere_walk_warn, escaped_holder_tree, reap_behind,
+    };
+    crate::log_capture::install();
+    let walks = crate::containment::treewalk::fault::record_walks();
+    let holders = crate::containment::fdmarker::fault::record_holder_kills();
+    let (child, holder) = escaped_holder_tree(crate::ContainMode::TreeWalk, false);
+    let pid = child.id().pid();
+    child.kill().expect("kill the root");
+    reap_behind(pid);
+
+    let mark = crate::log_capture::mark();
+    let result = child.kill_tree();
+
+    assert_eq!(walks.walked(), Vec::<u32>::new(), "no walk from a reaped root's number");
+    assert!(
+        matches!(result, Err(crate::error::Error::Unassessable { .. })),
+        "a walk whose root was reaped elsewhere is not assessable: {result:?}"
+    );
+    assert!(
+        holders.killed().contains(&holder.pid),
+        "the holder is killed: {:?}",
+        holders.killed()
+    );
+    assert_one_reaped_elsewhere_walk_warn(mark, pid);
+    holder.assert_dies();
+}
+
+/// After this handle's own reap, with the pid reused, a `TreeWalk` fd marker's walk from that pid
+/// would name only the reuser's children: it is skipped, and the holders are killed by the pipe
+/// they hold. `Ok` follows their sweep.
+///
+/// Mutant: the root is checked only for a mechanism with a pgid.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn kill_tree_of_a_walk_marker_after_own_wait_and_reuse_walks_nothing_and_kills_the_holder() {
+    use crate::identity::{ProcessId, Resolved};
+    use crate::test_child::reaped_elsewhere::escaped_holder_tree;
+    crate::log_capture::install();
+    let walks = crate::containment::treewalk::fault::record_walks();
+    let holders = crate::containment::fdmarker::fault::record_holder_kills();
+    let (child, holder) = escaped_holder_tree(crate::ContainMode::TreeWalk, false);
+    let pid = child.id().pid();
+    child.kill().expect("kill the root");
+    child.wait().expect("this handle reaps the root");
+    let other = ProcessId::from_parts_for_test(pid, child.id().start_token_raw() + 1);
+    let _reused = crate::child::fault::force_next_root_read(Resolved::Found(other));
+
+    let result = child.kill_tree();
+
+    assert_eq!(walks.walked(), Vec::<u32>::new(), "no walk from a reaped root's number");
+    result.expect("every holder was reached");
+    assert!(
+        holders.killed().contains(&holder.pid),
+        "the holder is killed: {:?}",
+        holders.killed()
+    );
     holder.assert_dies();
 }

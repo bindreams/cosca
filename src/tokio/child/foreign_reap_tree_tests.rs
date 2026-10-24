@@ -284,6 +284,7 @@ async fn tokio_kill_tree_of_a_backend_forgotten_unproven_treats_the_root_as_unkn
 /// child, the holder's pid, the held stdin and the stderr the holder's death closes.
 #[cfg(target_os = "macos")]
 async fn escaped_holder_tree(
+    mode: crate::ContainMode,
     ignore_term: bool,
 ) -> (
     crate::tokio::Child,
@@ -298,7 +299,7 @@ async fn escaped_holder_tree(
         "-c",
         &crate::test_child::reaped_elsewhere::escaped_holder_script(ignore_term),
     ]);
-    cmd.contain_with(crate::ContainMode::Session);
+    cmd.contain_with(mode);
     cmd.stdin(crate::Stdio::pipe_in()).expect("stdin pipe");
     cmd.stdout(crate::Stdio::pipe_out()).expect("stdout pipe");
     cmd.stderr(crate::Stdio::pipe_out()).expect("stderr pipe");
@@ -340,7 +341,7 @@ async fn tokio_kill_tree_after_own_wait_and_reuse_kills_a_holder_that_left_the_g
     let groups = record_kill_group();
     let walks = crate::containment::treewalk::fault::record_walks();
     let holders = crate::containment::fdmarker::fault::record_holder_kills();
-    let (mut child, holder, _stdin, stderr) = escaped_holder_tree(false).await;
+    let (mut child, holder, _stdin, stderr) = escaped_holder_tree(crate::ContainMode::Session, false).await;
     let pid = child.id().pid();
     child.kill().expect("kill the root");
     child.wait().await.expect("this handle reaps the root");
@@ -379,7 +380,7 @@ async fn tokio_kill_tree_after_a_foreign_reap_kills_a_holder_that_left_the_group
     let groups = record_kill_group();
     let walks = crate::containment::treewalk::fault::record_walks();
     let holders = crate::containment::fdmarker::fault::record_holder_kills();
-    let (mut child, holder, _stdin, stderr) = escaped_holder_tree(false).await;
+    let (mut child, holder, _stdin, stderr) = escaped_holder_tree(crate::ContainMode::Session, false).await;
     let pid = child.id().pid();
     child.kill().expect("kill the root");
     reap_behind(pid);
@@ -416,7 +417,7 @@ async fn tokio_graceful_shutdown_tree_after_a_foreign_reap_kills_a_holder_that_i
     let termed = record_term_group();
     let walks = crate::containment::treewalk::fault::record_walks();
     let holders = crate::containment::fdmarker::fault::record_holder_kills();
-    let (mut child, holder, _stdin, stderr) = escaped_holder_tree(true).await;
+    let (mut child, holder, _stdin, stderr) = escaped_holder_tree(crate::ContainMode::Session, true).await;
     let pid = child.id().pid();
     child.kill().expect("kill the root");
     reap_behind(pid);
@@ -448,5 +449,66 @@ async fn tokio_graceful_shutdown_tree_after_a_foreign_reap_kills_a_holder_that_i
     assert_one_reaped_elsewhere_warn(mark, pid);
     let warns = warns_since(mark);
     assert_eq!(warns.len(), 1, "exactly one warn: {warns:?}");
+    assert_holder_dies(stderr).await;
+}
+
+/// The sync `kill_tree_of_a_walk_marker_after_a_foreign_reap_walks_nothing_and_kills_the_holder`'s
+/// twin. Same mutant.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+async fn tokio_kill_tree_of_a_walk_marker_after_a_foreign_reap_walks_nothing_and_kills_the_holder() {
+    use crate::test_child::reaped_elsewhere::assert_one_reaped_elsewhere_walk_warn;
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let walks = crate::containment::treewalk::fault::record_walks();
+    let holders = crate::containment::fdmarker::fault::record_holder_kills();
+    let (mut child, holder, _stdin, stderr) = escaped_holder_tree(crate::ContainMode::TreeWalk, false).await;
+    let pid = child.id().pid();
+    child.kill().expect("kill the root");
+    reap_behind(pid);
+
+    let mark = crate::log_capture::mark();
+    let result = child.kill_tree();
+
+    assert_eq!(walks.walked(), Vec::<u32>::new(), "no walk from a reaped root's number");
+    assert!(
+        matches!(result, Err(crate::error::Error::Unassessable { .. })),
+        "a walk whose root was reaped elsewhere is not assessable: {result:?}"
+    );
+    assert!(
+        holders.killed().contains(&holder),
+        "the holder is killed: {:?}",
+        holders.killed()
+    );
+    assert_one_reaped_elsewhere_walk_warn(mark, pid);
+    assert_holder_dies(stderr).await;
+}
+
+/// The sync `kill_tree_of_a_walk_marker_after_own_wait_and_reuse_walks_nothing_and_kills_the_holder`'s
+/// twin. Same mutant.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+async fn tokio_kill_tree_of_a_walk_marker_after_own_wait_and_reuse_walks_nothing_and_kills_the_holder() {
+    use crate::identity::{ProcessId, Resolved};
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let walks = crate::containment::treewalk::fault::record_walks();
+    let holders = crate::containment::fdmarker::fault::record_holder_kills();
+    let (mut child, holder, _stdin, stderr) = escaped_holder_tree(crate::ContainMode::TreeWalk, false).await;
+    let pid = child.id().pid();
+    child.kill().expect("kill the root");
+    child.wait().await.expect("this handle reaps the root");
+    let other = ProcessId::from_parts_for_test(pid, child.id().start_token_raw() + 1);
+    let _reused = crate::child::fault::force_next_root_read(Resolved::Found(other));
+
+    let result = child.kill_tree();
+
+    assert_eq!(walks.walked(), Vec::<u32>::new(), "no walk from a reaped root's number");
+    result.expect("every holder was reached");
+    assert!(
+        holders.killed().contains(&holder),
+        "the holder is killed: {:?}",
+        holders.killed()
+    );
     assert_holder_dies(stderr).await;
 }
