@@ -6,7 +6,6 @@ use crate::error::Error;
 use crate::identity::ProcessId;
 use crate::tokio::Command;
 
-// The one platform boundary; the sync `SuspendedChild` has the same.
 #[cfg(windows)]
 #[path = "suspended/windows.rs"]
 mod platform;
@@ -61,9 +60,8 @@ impl SuspendedChild {
 
     /// Let the child run, returning the ordinary async [`Child`].
     ///
-    /// A plain `fn`, not an `async fn`: it is the deferred second half of a spawn, which blocks the
-    /// calling thread only as long as `spawn` does (the walk over the system's threads that a
-    /// contained spawn already runs), and waits for no process exit.
+    /// A plain `fn`, not `async`: the deferred half of a spawn. It blocks the calling thread only as
+    /// long as `spawn` does (a walk over the system's threads) and waits for no process exit.
     ///
     /// # Errors
     ///

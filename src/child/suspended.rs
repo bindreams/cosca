@@ -6,7 +6,7 @@ use crate::command::Command;
 use crate::error::Error;
 use crate::identity::ProcessId;
 
-// The one platform boundary. `platform::spawn_frozen` is also the async frozen spawn's core.
+// `platform::spawn_frozen` is also the async frozen spawn's core.
 #[cfg(windows)]
 #[path = "suspended/windows.rs"]
 pub(crate) mod platform;
