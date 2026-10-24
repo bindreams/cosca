@@ -333,7 +333,7 @@ pub(crate) fn pkexec_on(
 }
 
 /// The [`Os`] this build runs on.
-fn host_os() -> Os {
+pub(super) fn host_os() -> Os {
     if cfg!(target_os = "macos") {
         Os::MacOs
     } else if cfg!(target_os = "linux") {
@@ -343,20 +343,8 @@ fn host_os() -> Os {
     }
 }
 
-pub(super) fn detect(backend: Backend, auth: &Auth) -> Host {
-    detect_with(
-        std::env::var_os("PATH").as_deref(),
-        host_os(),
-        is_elevated(),
-        backend,
-        auth,
-        |p| std::fs::canonicalize(p),
-        run_version_probe,
-    )
-}
-
-/// [`detect`] over an explicit `PATH`, OS and privilege, resolving pkexec's real file with
-/// `canonicalize` and `run`ning the pkexec probe. The pkexec it stores is the one it probed.
+/// [`Host::detect`]'s unix arm over an explicit `PATH`, OS and privilege. The pkexec it stores is
+/// the one it probed.
 pub(crate) fn detect_with(
     path_var: Option<&OsStr>,
     os: Os,
@@ -700,7 +688,12 @@ pub(crate) fn rewrite(cmd: &mut Command) -> Result<PosixRewrite, Error> {
     // Before detection, so a request refused for its shape never runs pkexec's version probe.
     reject_structural(cmd, host_os())?;
     let request = cmd.elevation_request();
-    let host = Host::detect(request.backend, &request.auth);
+    let host = Host::detect(
+        request.backend,
+        &request.auth,
+        std::env::var_os("PATH").as_deref(),
+        is_elevated(),
+    );
     rewrite_with_host(cmd, &host)
 }
 
