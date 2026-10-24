@@ -32,7 +32,9 @@ serde = { version = "1", optional = true, features = ["derive"] }
 # which is gated behind tokio's `macros` feature. `net` is solely for `AsyncFd` (the
 # reactor-native death-watch); `time` solely for the grace bound on it. `sync` backs the
 # per-instance wait observer (a `#[cfg(test)]` oneshot seam) the raw async backend is tested with.
-tokio = { version = "1", optional = true, features = ["process", "rt", "io-util", "macros", "net", "sync", "time"] }
+# `rt-multi-thread` is solely for `task::block_in_place`, which a spawn's wait for a killed child's
+# exit runs inside on a multi-thread runtime (`src/tokio/blocking.rs`).
+tokio = { version = "1", optional = true, features = ["process", "rt", "rt-multi-thread", "io-util", "macros", "net", "sync", "time"] }
 
 [dev-dependencies]
 tempfile = "3"

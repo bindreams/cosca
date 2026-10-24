@@ -1,5 +1,8 @@
 //! Async (tokio) mirror of the owned-`Child` I/O surface.
 
+#[cfg(any(target_os = "macos", test))]
+#[path = "tokio/blocking.rs"]
+mod blocking;
 #[path = "tokio/child.rs"]
 mod child;
 #[path = "tokio/command.rs"]

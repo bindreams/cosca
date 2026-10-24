@@ -126,6 +126,36 @@ async fn macos_tokio_spawn_of_a_late_reporting_child_kills_and_reaps_it_through_
     );
 }
 
+/// On a multi-thread runtime the late teardown's wait runs inside `block_in_place`, so the worker's
+/// other tasks keep running behind it; the hook before the teardown runs inside that wait and probes
+/// it. (Every other test here runs on a `current_thread` runtime, where the wait runs in place and
+/// must not panic.) The spawn runs with no `await` in it, so its thread-local seams stay on one thread.
+///
+/// Mutants: the wait is not wrapped in `block_in_place`; it is wrapped on every flavour.
+#[skuld::test]
+fn macos_tokio_late_teardown_on_a_multi_thread_runtime_waits_inside_block_in_place() {
+    let runtime = ::tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (inside, fate) = runtime
+        .block_on(runtime.spawn(async {
+            let probed = Rc::new(Cell::new(None));
+            let _hook =
+                crate::child::spawn::fault::set_at(crate::child::spawn::fault::SpawnPoint::BeforeLateTeardown, {
+                    let probed = Rc::clone(&probed);
+                    move || probed.set(Some(crate::tokio::test_runtime::inside_block_in_place()))
+                });
+            let (late, writer) = late_spawn(|| vec![]);
+            drop(writer);
+            (probed.get(), late.fate)
+        }))
+        .unwrap();
+    assert_eq!(inside, Some(true), "the wait must run inside `block_in_place`");
+    assert_eq!(fate, ChildFate::Reaped);
+}
+
 /// A refused kill leaves the child running: tokio's `Child` is released to its orphan reaper, not
 /// forgotten (which would leave a zombie nothing collects), and the one warn says so. The test then
 /// kills the child and turns the runtime, whose every turn reaps tokio's exited orphans, until the

@@ -20,6 +20,12 @@ pub(crate) fn assert_current_thread() {
     );
 }
 
+/// Whether the caller runs inside `block_in_place`: tokio allows `Handle::block_on` only on a thread
+/// that has left the runtime, which `block_in_place` does and nothing else on a worker does.
+pub(crate) fn inside_block_in_place() -> bool {
+    std::panic::catch_unwind(|| ::tokio::runtime::Handle::current().block_on(async {})).is_ok()
+}
+
 #[cfg(test)]
 #[path = "test_runtime_tests.rs"]
 mod test_runtime_tests;

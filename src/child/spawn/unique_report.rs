@@ -11,8 +11,10 @@
 //! before every other so `fd_map`'s `dup2` onto its number cannot come first.
 //!
 //! A refused read is reported, then the hook fails: `exec` never runs, the spawn is an `Err`, and
-//! std collects the child. A signal that kills the child between the report and std's own errno
-//! write makes the spawn `Ok` with the same report, and the same refusal.
+//! std collects the child. Two things make the spawn `Ok` with the same report, and the same refusal:
+//! a signal that kills the child between the report and std's own errno write, and an exposed std
+//! error pipe (below), whose errno write goes nowhere the parent sees. [`Report::ChildRefused`] on an
+//! `Ok` spawn is then a corpse, which `adopted_id` maps to `DiedBeforeExec` and nothing collects.
 //!
 //! `spawn()` returning `Ok` does not mean the child execed: std reads EOF on its own close-on-exec
 //! pipe both after a successful `exec` and after a child killed by a signal before it. So the
@@ -221,8 +223,19 @@ impl FirstRead {
 /// returns before the report and cannot see whether the `exec` ran. std makes the pipes of the
 /// `std_pipes` piped stdio slots first, then its own, each `pipe()` on the two lowest free fds
 /// (std 1.96 `sys/process/unix`: `setup_io`, then `pipe`). Read under `spawn_lock`, just before
-/// the spawn. A stdio fd another thread closes between this read and the spawn exposes the pipe
-/// unseen; an id the first read then misses is still late, but one it finds is adopted.
+/// the spawn.
+///
+/// Another thread can change fds 0 to 2 between this read and the spawn, and the check then answers
+/// for a state that is gone, in both directions:
+/// - A close exposes std's pipe unseen. An id the first read misses is still late, but one it finds
+///   is adopted, though std could not see the `exec`.
+/// - An open hides an exposure the check saw. std's pipe lands above stdio and std does see the
+///   `exec`, but `true` was already answered: [`FirstRead::finish`] makes the id late, and the spawn
+///   tears down a child that did `exec` and fails with an error that says its `exec` cannot be
+///   confirmed.
+///
+/// Both are routed to #192, and closed for good when cosca makes its own error channel in place of
+/// std's (the untangling's PXc), which never lands on a stdio number.
 fn std_pipe_exposed(std_pipes: usize) -> bool {
     // SAFETY: `F_GETFD` only reads a descriptor's flags, and fails only with `EBADF`.
     let free = (0..=2)
@@ -496,7 +509,8 @@ pub(crate) fn adopted_id(report: Report, pid: u32) -> Result<u64, NotAdopted> {
     match report {
         Report::Id(id) => Ok(id),
         // The hook fails its spawn after reporting a refusal, so `Ok` is a child killed between its
-        // report and std's own errno write: the same refusal, with the program not started.
+        // report and std's own errno write, or one whose std error pipe was exposed: the same refusal,
+        // with the program not started.
         Report::ChildRefused(errno) => not(Unadoptable::DiedBeforeExec, refused_error(errno)),
         Report::Missing => not(
             Unadoptable::DiedBeforeExec,
@@ -507,8 +521,8 @@ pub(crate) fn adopted_id(report: Report, pid: u32) -> Result<u64, NotAdopted> {
         Report::Late(id) => not(
             Unadoptable::Late(id),
             Error::Io(io::Error::other(format!(
-                "the spawned child {pid} had not reported its unique id when its spawn returned (two of this \
-                 process's descriptors 0 to 2 were closed), so its exec cannot be confirmed; the child was not adopted"
+                "the spawned child {pid}'s exec cannot be confirmed: two of this process's descriptors 0 to 2 were \
+                 closed at its spawn, so std's own error pipe could not show it; the child was not adopted"
             ))),
         ),
         Report::Unwritten => {

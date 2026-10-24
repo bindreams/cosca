@@ -33,9 +33,17 @@ completes before `exec`. The wait is bounded by the child's own progress to `exe
 or stuck in D state between `fork` and `exec` holds the thread. The wait for macOS's unique-id
 report ([`unique_report::await_report`](../src/child/spawn/unique_report.rs)) is bounded the same
 way, with accepted residuals: if something else reaps the child and another child of this process
-takes its pid, the wait lasts as long as that process; and a tracer holding the child's zombie keeps
-it waiting until the tracer hands the zombie back. It runs after `spawn_lock` is released, so it
-holds up only its own spawn.
+takes its pid before the wait registers its watch, the wait lasts as long as that process; and a
+tracer holding the child's zombie keeps it waiting until the tracer hands the zombie back. It runs
+after `spawn_lock` is released, so it holds up only its own spawn.
+
+One more wait is named here until #220 replaces it: on macOS, a tokio spawn whose child's unique-id
+report came after the spawn returned kills the child and waits for its exit
+([`reap_unreported`](../src/tokio/child/proc_source.rs)). A kill does not bound that wait (principle
+3). It follows the owner's ruling Q-A for an armed async drop: inside `block_in_place` on a
+multi-thread runtime, in place on a `current_thread` one (where `block_in_place` would panic), and
+one `warn` naming the child once the wait passes 1 s, which is a message only. The hand-back (plan A
+P17-P19) replaces the wait.
 
 [`SuspendedChild::resume`](../src/tokio/child/suspended.rs) is the deferred second half of a spawn,
 so the exception covers it, and it is a sync `fn`. On Windows it walks the system's thread snapshot

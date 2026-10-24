@@ -125,6 +125,11 @@ impl std::os::fd::AsFd for PinnedPidfd {
     }
 }
 
+/// How long [`ProcSource::reap_unreported`] waits before it says it is still waiting. A message only:
+/// the wait never gives up.
+#[cfg(target_os = "macos")]
+const SLOW_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Why a child is forgotten by [`ProcSource::forget_foreign`], completing "child N ...".
 #[cfg(unix)]
 const FORGET_FOREIGN: &str = "was reaped by someone else, or cannot be shown to be ours";
@@ -1073,6 +1078,10 @@ impl ProcSource {
     /// warn says what that leaks. A child its kill did not end (a setuid child refuses the kill) is
     /// released instead, to tokio's orphan reaper, which reaps it once it exits: forgetting it would
     /// leave a zombie nothing collects.
+    ///
+    /// The wait for the killed child's exit blocks this thread, as the spawn's other waits do
+    /// (principle 2): inside `block_in_place` on a multi-thread runtime, in place on a `current_thread`
+    /// one. It logs one `warn` naming the child once it passes [`SLOW_WAIT`], and goes on waiting.
     /// Consumes the backend. **Invariant:** no `wait()` future for this child is in flight.
     #[cfg(target_os = "macos")]
     pub(crate) fn reap_unreported(
@@ -1082,7 +1091,9 @@ impl ProcSource {
         prepared: crate::containment::Prepared,
     ) -> ChildFate {
         crate::bounded::assert_may_block("reap_unreported");
-        let done = crate::child::spawn::kill_and_reap_unreported(pid, unique, prepared);
+        let done = crate::tokio::blocking::wait_in_place(|| {
+            crate::child::spawn::kill_and_reap_unreported(pid, unique, prepared, Some(SLOW_WAIT))
+        });
         if matches!(done.fate, ChildFate::Running { .. }) {
             self.release();
             return done.warn(

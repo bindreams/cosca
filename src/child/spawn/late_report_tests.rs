@@ -47,7 +47,7 @@ pub(crate) fn assert_one_warn(pid: u32, mark: usize, says: &[&str], not_says: &[
     let warns = warns_of(pid, mark);
     assert_eq!(warns.len(), 1, "one event, one warn: {warns:?}");
     assert!(
-        warns[0].contains("had not reported its unique id when its spawn returned"),
+        warns[0].contains("two of this process's descriptors 0 to 2 were closed"),
         "{warns:?}"
     );
     for said in says {
@@ -760,6 +760,18 @@ fn tear_down_with(
     unique: u64,
     arm: impl FnOnce(u32) -> Vec<Box<dyn std::any::Any>>,
 ) -> (ChildFate, Vec<String>, Vec<crate::send_log::Entry>) {
+    tear_down_warning_after(prepared, None, child, stdin, unique, arm)
+}
+
+/// [`tear_down_with`] whose wait for the killed child warns once it passes `warn_after`.
+fn tear_down_warning_after(
+    prepared: crate::containment::Prepared,
+    warn_after: Option<std::time::Duration>,
+    child: std::process::Child,
+    stdin: &Rc<Cell<Option<std::process::ChildStdin>>>,
+    unique: u64,
+    arm: impl FnOnce(u32) -> Vec<Box<dyn std::any::Any>>,
+) -> (ChildFate, Vec<String>, Vec<crate::send_log::Entry>) {
     crate::log_capture::install();
     let pid = child.id();
     let sent = crate::send_log::Capture::start();
@@ -769,7 +781,7 @@ fn tear_down_with(
     });
     let mark = crate::log_capture::mark();
     let _armed = arm(pid);
-    let done = crate::child::spawn::kill_and_reap_unreported(pid, unique, prepared);
+    let done = crate::child::spawn::kill_and_reap_unreported(pid, unique, prepared, warn_after);
     let tail = done.zombie_tail();
     let fate = done.warn(pid, tail);
     drop(child);
@@ -794,6 +806,40 @@ fn macos_late_teardown_of_a_live_child_is_reaped() {
     let warn = only(&warns);
     assert_kill_sent(pid, &sent);
     assert!(warn.contains(SAID_REAPED) && !warn.contains(ZOMBIE), "{warn}");
+}
+
+/// A wait for the killed child that passes its threshold says so once, naming the child, and keeps
+/// waiting: the child is still reaped, and the event's own `warn` follows. The first two looks at the
+/// child are forced to find it running, so the threshold (zero here) expires before it is seen dead.
+///
+/// Mutants: no slow-wait `warn`; the `warn` repeats; the wait gives up at the threshold.
+#[skuld::test]
+fn macos_late_teardown_whose_wait_passes_its_threshold_warns_once_and_still_reaps() {
+    let (child, stdin, unique) = std_blocker_with_unique();
+    let stdin = Rc::new(Cell::new(Some(stdin)));
+    let pid = child.id();
+    let uncontained = crate::containment::Prepared {
+        mode: None,
+        is_root: true,
+        marker: None,
+    };
+    let (fate, warns, sent) = tear_down_warning_after(
+        uncontained,
+        Some(std::time::Duration::ZERO),
+        child,
+        &stdin,
+        unique,
+        |_| vec![Box::new(force_peeks([Ok(Peek::Running), Ok(Peek::Running)]))],
+    );
+    crate::wait::exit_only::seams::assert_peeks_exhausted();
+    assert_eq!(fate, ChildFate::Reaped, "the wait goes on past the threshold");
+    assert_kill_sent(pid, &sent);
+    assert_eq!(warns.len(), 2, "the slow wait, then the event: {warns:?}");
+    assert!(
+        warns[0].contains("still waiting for it to exit") && warns[0].contains("after its kill"),
+        "{warns:?}"
+    );
+    assert!(warns[1].contains(SAID_REAPED), "{warns:?}");
 }
 
 /// A refused kill leaves the child running: the sentence says the kill failed and the child runs,

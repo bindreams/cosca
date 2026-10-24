@@ -763,7 +763,7 @@ fn teardown_after_attach_failure(child: std::process::Child, unique: u64, id: Pr
 pub(crate) fn kill_and_reap_verified(pid: u32, unique: u64, id: Option<ProcessId>, left_running: &str) -> ChildFate {
     let mut notes = Vec::new();
     let mut breach = None;
-    let (fate, kill) = kill_and_reap_noting(pid, unique, id, &mut notes, &mut breach, |_| {});
+    let (fate, kill) = kill_and_reap_noting(pid, unique, id, None, &mut notes, &mut breach, |_| {});
     match kill {
         KillOutcome::Refused(why) => notes.insert(0, format!("could not be killed: {why}")),
         KillOutcome::Unverified => notes.insert(0, UNVERIFIED.to_owned()),
@@ -818,9 +818,16 @@ pub(crate) struct Unreported {
 ///    `killpg`;
 /// 4. the root's reap.
 ///
-/// Warns nothing: [`Unreported::warn`] does, once.
+/// The root's wait is unbounded. With `warn_after`, it logs one `warn` naming `pid` once the wait
+/// passes that long, and goes on waiting: the threshold is a message, never a decision. Otherwise it
+/// warns nothing: [`Unreported::warn`] does, once.
 #[cfg(target_os = "macos")]
-pub(crate) fn kill_and_reap_unreported(pid: u32, unique: u64, prepared: crate::containment::Prepared) -> Unreported {
+pub(crate) fn kill_and_reap_unreported(
+    pid: u32,
+    unique: u64,
+    prepared: crate::containment::Prepared,
+    warn_after: Option<std::time::Duration>,
+) -> Unreported {
     #[cfg(test)]
     fault::run_at(fault::SpawnPoint::BeforeLateTeardown, pid);
     let mut tree = LateTree::attach(pid, unique, prepared);
@@ -829,7 +836,7 @@ pub(crate) fn kill_and_reap_unreported(pid: u32, unique: u64, prepared: crate::c
     fault::run_at(fault::SpawnPoint::BeforeLateRootKill, pid);
     let mut notes = Vec::new();
     let mut breach = None;
-    let (fate, kill) = kill_and_reap_noting(pid, unique, tree.id, &mut notes, &mut breach, |zombie| {
+    let (fate, kill) = kill_and_reap_noting(pid, unique, tree.id, warn_after, &mut notes, &mut breach, |zombie| {
         tree.kill(Sweep::RootKilled { zombie })
     });
     let mut owed = std::mem::take(&mut tree.notes);
@@ -991,8 +998,8 @@ const UNVERIFIED: &str = "could not be verified, so it was not signalled";
 
 /// The one `warn` of a spawn whose child's report came late (see [`Report::Late`]).
 #[cfg(target_os = "macos")]
-const LATE: &str = "had not reported its unique id when its spawn returned, so its exec cannot be confirmed and the \
-                    program may have started; it was not adopted";
+const LATE: &str = "was spawned while two of this process's descriptors 0 to 2 were closed, so its exec cannot be \
+                    confirmed and the program may have started; it was not adopted";
 
 /// The sentence for what a teardown did, built from the kill and the fate, so that each is said only
 /// when it happened.
@@ -1052,17 +1059,19 @@ pub(crate) fn warn_late_front(pid: u32, tail: Option<&str>) {
     );
 }
 
+/// `warn_after`: see [`kill_and_reap_unreported`].
 #[cfg(target_os = "macos")]
 fn kill_and_reap_noting(
     pid: u32,
     unique: u64,
     id: Option<ProcessId>,
+    warn_after: Option<std::time::Duration>,
     notes: &mut Vec<String>,
     breach: &mut Option<String>,
     after_kill: impl FnOnce(bool),
 ) -> (ChildFate, KillOutcome) {
     use crate::signal::{via_verified_pid, Sent, Sig};
-    use crate::wait::backend::{await_reapable, Waited};
+    use crate::wait::backend::Waited;
     use crate::wait::exit_only::Foreign;
 
     let target = crate::wait::exit_only::Target::pid(pid, Some(unique));
@@ -1071,7 +1080,7 @@ fn kill_and_reap_noting(
             // A fixture that only the kill would end is released here when no kill was sent.
             #[cfg(test)]
             fault::run_between_kill_and_wait();
-            let waited = await_reapable(pid, Some(unique), None);
+            let waited = await_exit_warning(pid, unique, warn_after);
             after_kill(matches!(waited, Ok(Waited::Reapable)));
             let fate = match waited {
                 Ok(Waited::Reapable) => reap_verified(pid, &target, id, true, notes, breach),
@@ -1113,6 +1122,28 @@ fn kill_and_reap_noting(
             let fate = reap_verified(pid, &target, id, false, notes, breach);
             (fate, KillOutcome::Refused(kill.to_string()))
         }
+    }
+}
+
+/// Waits for the killed `pid` to become reapable. With `warn_after`, the wait that passes it logs one
+/// `warn` and then goes on, unbounded.
+#[cfg(target_os = "macos")]
+fn await_exit_warning(
+    pid: u32,
+    unique: u64,
+    warn_after: Option<std::time::Duration>,
+) -> std::io::Result<crate::wait::backend::Waited> {
+    use crate::wait::backend::{await_reapable, Waited};
+
+    let Some(after) = warn_after else {
+        return await_reapable(pid, Some(unique), None);
+    };
+    match await_reapable(pid, Some(unique), Some(std::time::Instant::now() + after))? {
+        Waited::DeadlinePassed => {
+            log::warn!("child {pid} is still running more than {after:?} after its kill; still waiting for it to exit");
+            await_reapable(pid, Some(unique), None)
+        }
+        done => Ok(done),
     }
 }
 
@@ -1220,7 +1251,7 @@ fn abandon_unadopted(
             }
             // Torn down through its unique id, exactly as every other post-spawn failure is. The `std`
             // `Child` is dropped after: it reaps nothing, so a child still running stays a zombie.
-            let done = kill_and_reap_unreported(pid, unique, prepared);
+            let done = kill_and_reap_unreported(pid, unique, prepared, None);
             let tail = done.zombie_tail();
             let fate = done.warn(pid, tail);
             drop(child);
