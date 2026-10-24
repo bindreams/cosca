@@ -492,41 +492,39 @@ impl Run {
             let zero = rustix::event::Timespec { tv_sec: 0, tv_nsec: 0 };
             matches!(poll(&mut fds, Some(&zero)), Ok(n) if n > 0)
         };
-        let gone = |e: &std::io::Error| matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ESRCH));
-        // pipefs's mount id, from a pipe of this process: an fd's `fdinfo` names its file's mount and inode.
+        // pipefs's device, from a pipe of this process: a pipe of any process is a FIFO on that device.
         let pipefs = {
             let (r, _w) = std::io::pipe().expect("a pipe");
-            let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", std::os::fd::AsRawFd::as_raw_fd(&r)))
-                .expect("this process's fdinfo");
-            field(&info, "mnt_id").expect("mnt_id").to_owned()
+            rustix::fs::fstat(&r).expect("fstat").st_dev
         };
-        // Each end comes from one `fdinfo` read, which names the file's mount, inode and flags together, so
-        // an fd number reused between reads cannot pair one pipe with another file's access mode.
-        let ends = |pid: u32| -> Vec<(String, bool)> {
+        // Each end is a copy of the fd, taken with `pidfd_getfd`: it names the open file description that
+        // was at that fd number when it was taken, so its inode and its access mode cannot come from two
+        // different files, as two reads of a reused number could. `EBADF` means the fd closed: it holds
+        // nothing. The copy makes this process a holder of that end until the iteration drops it.
+        // That never releases anything early; at most it delays an EOF by the `fstat` and `fcntl`.
+        let ends = |pid: u32, pidfd: &OwnedFd| -> Vec<(u64, bool)> {
             let table = std::fs::read_dir(format!("/proc/{pid}/fd"))
                 .unwrap_or_else(|e| panic!("process {pid} exited during the scan: {e}"));
             let mut ends = vec![];
             for entry in table {
                 let entry = entry.unwrap_or_else(|e| panic!("process {pid} exited during the scan: {e}"));
-                let fd = entry.file_name().to_string_lossy().into_owned();
-                let info = match std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{fd}")) {
-                    Ok(info) => info,
-                    Err(e) if gone(&e) => continue,
-                    Err(e) => panic!("fdinfo: {e}"),
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let fd: i32 = name.parse().expect("an fd number");
+                let copy = match rustix::process::pidfd_getfd(pidfd, fd, rustix::process::PidfdGetfdFlags::empty()) {
+                    Ok(copy) => copy,
+                    Err(rustix::io::Errno::BADF) => continue,
+                    Err(e) => panic!("pidfd_getfd of fd {fd} of process {pid}: {e}"),
                 };
-                if field(&info, "mnt_id") != Some(pipefs.as_str()) {
+                let stat = rustix::fs::fstat(&copy).expect("fstat of a copy");
+                if FileType::from_raw_mode(stat.st_mode) != FileType::Fifo || stat.st_dev != pipefs {
                     continue;
                 }
-                let ino = field(&info, "ino").expect("ino");
-                let flags = u32::from_str_radix(field(&info, "flags").expect("flags"), 8).expect("octal flags");
-                ends.push((
-                    format!("pipe:[{ino}]"),
-                    flags & libc::O_ACCMODE as u32 == libc::O_WRONLY as u32,
-                ));
+                let flags = rustix::fs::fcntl_getfl(&copy).expect("fcntl F_GETFL of a copy");
+                ends.push((stat.st_ino, flags & OFlags::ACCMODE == OFlags::WRONLY));
             }
             ends
         };
-        let (shim_ends, child_ends) = (ends(shim), ends(child));
+        let (shim_ends, child_ends) = (ends(shim, &self.pidfd), ends(child, &program_pidfd));
         // An exited process lists an empty fd table, with no error, until it is reaped.
         assert!(
             !exited(&self.pidfd),
@@ -928,11 +926,4 @@ impl Drop for Owner {
         _ = self.child.kill();
         _ = self.child.wait();
     }
-}
-
-/// The value of `name:` in a `/proc/<pid>/fdinfo/<fd>` file.
-fn field<'a>(info: &'a str, name: &str) -> Option<&'a str> {
-    info.lines()
-        .find_map(|l| l.strip_prefix(name).and_then(|r| r.strip_prefix(':')))
-        .map(str::trim)
 }
