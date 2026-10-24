@@ -3,7 +3,7 @@
 
 /// Run the elevated image and exit with its exit code. The image is the one built beside this
 /// testbin.
-pub fn run(report: &str, env_dump: &str, dir: &str) {
+pub fn run(report: &str, env_dump: &str, _dir: &str) {
     // An elevated caller takes the already-elevated route, which never reaches `ShellExecuteExW`.
     assert!(
         !cosca::elevation::is_elevated(),
@@ -20,7 +20,8 @@ pub fn run(report: &str, env_dump: &str, dir: &str) {
         "--dump-env-to".as_ref(),
         env_dump.as_ref(),
     ])
-    .current_dir(dir)
+    // RED mutant: lpDirectory dropped.
+    .current_dir(std::env::current_dir().unwrap())
     .elevate();
     let status = cmd.status().expect("the elevated image");
     std::process::exit(status.code().expect("a Windows exit code"));
