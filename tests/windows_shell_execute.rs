@@ -21,11 +21,8 @@
 //! parent volatile (seen on arm64, whose HKCU has no `App Paths` key); the guard records which
 //! parents were missing and deletes those too.
 //!
-//! The tests share machine-wide state — the registry keys — so each holds [`serial`] for its
-//! whole body. Under plain `cargo test` that keeps the tests' isolated re-executions (below) from
-//! overlapping; under nextest each test is a process of its own and `serial`'s mutex cannot reach
-//! across processes, so `.config/nextest.toml`'s test group, capped at one concurrent test, is what
-//! keeps them from racing each other.
+//! The tests share machine-wide state — the registry keys — so `.config/nextest.toml`'s test group
+//! runs them one at a time.
 //!
 //! The two tests that set `PATH` or another environment variable run in a re-executed process of
 //! their own (`test_own_process`), so the change never reaches a sibling test's thread, and
@@ -39,16 +36,13 @@ mod common;
 mod windows_probe;
 
 #[cfg(windows)]
+use common::test_own_process::{own_process, test_path, Completion};
+#[cfg(windows)]
 use std::ffi::{OsStr, OsString};
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 #[cfg(windows)]
 use std::path::{Path, PathBuf};
-#[cfg(windows)]
-use std::sync::{Mutex, MutexGuard};
-
-#[cfg(windows)]
-use common::test_own_process::{own_process, test_path, Completion};
 
 #[cfg(windows)]
 use crate::test_groups::{shell_execute, Group};
@@ -81,13 +75,6 @@ const FILE_NOT_FOUND: i32 = 0x8007_0002_u32 as i32;
 #[cfg(windows)]
 /// `ERROR_NO_ASSOCIATION` as an HRESULT: the class has no command for the verb (measured).
 const NO_ASSOCIATION: i32 = 0x8007_0483_u32 as i32;
-
-#[cfg(windows)]
-/// Serialize the tests in this file: see the module doc.
-fn serial() -> MutexGuard<'static, ()> {
-    static SERIAL: Mutex<()> = Mutex::new(());
-    SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-}
 
 #[cfg(windows)]
 /// An environment variable set for a test's duration and restored on drop to exactly what it was,
@@ -368,7 +355,6 @@ fn last_component(path: &str) -> String {
 /// where the same launch without the class finds both. `comfile` has no `runas` verb.
 #[skuld::test]
 fn classname_runas_needs_a_full_path(#[fixture(shell_execute)] _group: &Group) {
-    let _serial = serial();
     let Some(done) = own_process(test_path!(classname_runas_needs_a_full_path), common::spawn_locked) else {
         return;
     };
@@ -463,7 +449,6 @@ fn classname_runas_needs_a_full_path(#[fixture(shell_execute)] _group: &Group) {
 /// registration is not consulted at all; that is printed, not asserted.
 #[skuld::test]
 fn exefile_skips_the_app_paths_lookup(#[fixture(shell_execute)] _group: &Group) {
-    let _serial = serial();
     let l = layout();
     let app = OsStr::new(APP);
     let mut failures: Vec<String> = Vec::new();
@@ -499,7 +484,6 @@ fn exefile_skips_the_app_paths_lookup(#[fixture(shell_execute)] _group: &Group) 
 /// directory literally named that, not `…\exp\…`.
 #[skuld::test]
 fn exefile_takes_percent_literally(#[fixture(shell_execute)] _group: &Group) {
-    let _serial = serial();
     let Some(done) = own_process(test_path!(exefile_takes_percent_literally), common::spawn_locked) else {
         return;
     };
