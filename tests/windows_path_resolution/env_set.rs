@@ -1,4 +1,4 @@
-//! M17: where `SetEnvironmentVariableW` puts a name, against N1's rule for `Env::set` (removes every
+//! M17: where `SetEnvironmentVariableW` puts a name, against the rule for `Env::set` (removes every
 //! match, inserts in sorted place). Each case runs in a child whose block is exactly the case's
 //! entries; the child changes only its own environment and dumps `GetEnvironmentStringsW` after
 //! each call, so no test process's environment changes.

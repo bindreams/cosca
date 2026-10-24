@@ -113,7 +113,7 @@ fn a_drive_relative_current_dir_takes_the_drives_own_directory_as_win32_does(#[f
 }
 
 #[cfg(windows)]
-/// M12 (#156): a process cwd on a `subst` drive that is then removed, or re-pointed at another
+/// M12: a process cwd on a `subst` drive that is then removed, or re-pointed at another
 /// directory. A child spawned with `NULL` (std's route), with the cwd string explicitly (std's and
 /// the raw backend's), and by the raw backend with no `current_dir` (which passes the cwd string,
 /// not `NULL`), reports its cwd string and what it finds there. Records `M12` lines;

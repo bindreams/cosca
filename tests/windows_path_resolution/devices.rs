@@ -1,4 +1,4 @@
-//! M14 (DOS device names, input to #186) and M20 (std's parse of a doubled-separator UNC path).
+//! M14 (DOS device names) and M20 (std's parse of a doubled-separator UNC path).
 //! String-level only: no device is opened and no share contacted.
 
 use crate::provenance::survey_platform;
@@ -17,7 +17,7 @@ extern "system" {
 #[skuld::test]
 fn m14_device_name_mapping(#[fixture(path_probes)] _group: &Group) {
     survey_platform();
-    for name in [
+    let names = [
         "NUL",
         "nul",
         "NUL.exe",
@@ -48,7 +48,9 @@ fn m14_device_name_mapping(#[fixture(path_probes)] _group: &Group) {
         "LPT1.exe",
         "LPT³",
         "CLOCK$",
-    ] {
+    ];
+    let mut devices = Vec::new();
+    for name in names {
         let units = wide(name);
         // SAFETY: `units` is NUL-terminated and outlives the call, which only reads it.
         let found = unsafe { RtlIsDosDeviceName_U(units.as_ptr()) };
@@ -60,7 +62,10 @@ fn m14_device_name_mapping(#[fixture(path_probes)] _group: &Group) {
         };
         let full = full_path_name(name).unwrap_or_else(|why| format!("err({why})"));
         println!("M14 {name:?} device={device} gfpn={full:?}");
+        devices.push(device);
     }
+    assert_eq!(devices.len(), names.len(), "precondition: every row was printed");
+    assert_eq!(devices[0], "NUL", "precondition: `NUL` maps to the device");
 }
 
 /// M20: `Path::is_absolute` and the first component of a UNC path with a doubled separator before
@@ -69,7 +74,9 @@ fn m14_device_name_mapping(#[fixture(path_probes)] _group: &Group) {
 #[skuld::test]
 fn m20_a_doubled_separator_unc_path_as_std_parses_it(#[fixture(path_probes)] _group: &Group) {
     survey_platform();
-    for path in [r"\\srv\\shr", r"\\srv\\shr\tool.exe", r"\\srv\shr\tool.exe"] {
+    let paths = [r"\\srv\\shr", r"\\srv\\shr\tool.exe", r"\\srv\shr\tool.exe"];
+    let mut printed = 0;
+    for path in paths {
         let p = std::path::Path::new(path);
         let first = p.components().next().map(|c| format!("{c:?}"));
         println!(
@@ -77,5 +84,7 @@ fn m20_a_doubled_separator_unc_path_as_std_parses_it(#[fixture(path_probes)] _gr
             p.is_absolute(),
             first.as_deref().unwrap_or("-")
         );
+        printed += 1;
     }
+    assert_eq!(printed, paths.len(), "precondition: every row was printed");
 }

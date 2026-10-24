@@ -290,7 +290,10 @@ fn main() {
         fake_pkexec(&args);
         return;
     }
-    let mode_var = std::env::var("COSCA_TESTBIN_MODE").ok();
+    let mode_var = std::env::var_os("COSCA_TESTBIN_MODE").map(|v| {
+        v.into_string()
+            .unwrap_or_else(|v| panic!("COSCA_TESTBIN_MODE is not Unicode: {v:?}"))
+    });
     let mode = mode_var
         .as_deref()
         .unwrap_or_else(|| args.get(1).map(String::as_str).unwrap_or(""));

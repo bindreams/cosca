@@ -86,13 +86,24 @@ fn file_type(h: HANDLE) -> String {
 
 /// The file `h` names, or the error asking gives.
 fn final_path(h: HANDLE) -> String {
-    let mut buf = vec![0u16; 1024];
     // SAFETY: `buf` is a live buffer of its length; an invalid `h` is an error, not UB.
-    let n = unsafe { GetFinalPathNameByHandleW(h, &mut buf, FILE_NAME_NORMALIZED) } as usize;
-    if n == 0 || n > buf.len() {
-        return format!("err={}", std::io::Error::last_os_error().raw_os_error().unwrap_or(-1));
+    crate::measure::wide_string(|buf| unsafe { GetFinalPathNameByHandleW(h, buf, FILE_NAME_NORMALIZED) })
+        .unwrap_or_else(|code| format!("err={code}"))
+}
+
+/// The std handles saved before `handles-probe null` nulls them, put back on drop, so a panic
+/// while they are null still prints.
+struct RestoreStdHandles(Vec<HANDLE>);
+
+impl Drop for RestoreStdHandles {
+    fn drop(&mut self) {
+        for ((_, id), h) in STD.iter().zip(&self.0) {
+            // SAFETY: restores the handle saved at construction. No panic: this runs while unwinding too.
+            if let Err(e) = unsafe { SetStdHandle(*id, *h) } {
+                eprintln!("could not restore a std handle: {e}");
+            }
+        }
     }
-    String::from_utf16_lossy(&buf[..n])
 }
 
 /// `handles-probe <case> <dir>`.
@@ -100,17 +111,14 @@ pub fn probe(case: &str, dir: &str) {
     let dir = Path::new(dir);
     match case {
         "null" => {
-            let saved: Vec<HANDLE> = STD.iter().map(|&(_, id)| std_handle(id)).collect();
+            let restore = RestoreStdHandles(STD.iter().map(|&(_, id)| std_handle(id)).collect());
             for (_, id) in STD {
                 // SAFETY: sets this process's own std handle; this mode starts no other thread.
                 unsafe { SetStdHandle(id, HANDLE::default()) }.expect("SetStdHandle(NULL)");
             }
             let null = STD.iter().all(|&(_, id)| std_handle(id).0.is_null());
             let lines = routes(dir, None, |_| String::new());
-            for ((_, id), h) in STD.iter().zip(saved) {
-                // SAFETY: restores the handle saved above.
-                unsafe { SetStdHandle(*id, h) }.expect("restore the std handle");
-            }
+            drop(restore);
             println!("parent_std_handles={}", if null { "null" } else { "not-null" });
             for line in lines {
                 println!("{line}");

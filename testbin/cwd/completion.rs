@@ -12,13 +12,9 @@ fn gfpn(path: &OsStr) -> String {
     use windows::core::PCWSTR;
     use windows::Win32::Storage::FileSystem::GetFullPathNameW;
     let wide: Vec<u16> = path.encode_wide().chain([0]).collect();
-    let mut buf = vec![0u16; 32 * 1024];
     // SAFETY: `wide` is NUL-terminated; `buf` is a live buffer the call writes at most its length of.
-    let n = unsafe { GetFullPathNameW(PCWSTR(wide.as_ptr()), Some(&mut buf), None) };
-    if n == 0 || n as usize > buf.len() {
-        return format!("err={}", std::io::Error::last_os_error().raw_os_error().unwrap_or(-1));
-    }
-    String::from_utf16_lossy(&buf[..n as usize])
+    crate::measure::wide_string(|buf| unsafe { GetFullPathNameW(PCWSTR(wide.as_ptr()), Some(buf), None) })
+        .unwrap_or_else(|code| format!("err={code}"))
 }
 
 /// A drive letter mapped to a directory with `DefineDosDeviceW` for as long as it lives. A second
@@ -29,8 +25,75 @@ pub(crate) struct Subst {
     removed: bool,
 }
 
+/// Why a letter could not be mapped.
+pub(crate) enum MapError {
+    /// The letter already had other definitions, which the new one shadowed. It is removed again.
+    Shadowed(Vec<String>),
+    Failed(String),
+}
+
+impl std::fmt::Display for MapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Shadowed(all) => write!(f, "the letter had other definitions: {all:?}"),
+            Self::Failed(why) => f.write_str(why),
+        }
+    }
+}
+
+const ERROR_FILE_NOT_FOUND: i32 = 2;
+const ERROR_INSUFFICIENT_BUFFER: i32 = 122;
+
+/// Every definition of `drive` (`X:`), newest first, or the OS error code: `ERROR_FILE_NOT_FOUND`
+/// when it has none.
+fn definitions(drive: &str) -> Result<Vec<String>, i32> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::QueryDosDeviceW;
+    let name: Vec<u16> = OsStr::new(drive).encode_wide().chain([0]).collect();
+    let mut buf = vec![0u16; 1024];
+    loop {
+        // SAFETY: `name` is NUL-terminated; `buf` is a live buffer the call writes at most its length of.
+        let n = unsafe { QueryDosDeviceW(PCWSTR(name.as_ptr()), Some(&mut buf)) } as usize;
+        if n != 0 {
+            return Ok(buf[..n]
+                .split(|&u| u == 0)
+                .filter(|s| !s.is_empty())
+                .map(String::from_utf16_lossy)
+                .collect());
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(ERROR_INSUFFICIENT_BUFFER) => buf.resize(buf.len() * 2, 0),
+            other => return Err(other.unwrap_or(-1)),
+        }
+    }
+}
+
+/// Panics unless `drive` has no definition at all.
+pub(crate) fn assert_undefined(drive: &str) {
+    match definitions(drive) {
+        Err(ERROR_FILE_NOT_FOUND) => {}
+        other => panic!("{drive} should have no definition left: {other:?}"),
+    }
+}
+
 impl Subst {
-    pub(crate) fn new(drive: &str, target: &Path) -> Result<Self, String> {
+    /// Maps the highest letter from `Z:` down to `M:` that nothing else defines to `target`: it
+    /// defines first, then looks, and gives up a letter whose definitions are not just ours.
+    pub(crate) fn map_free(target: &Path) -> Result<Self, String> {
+        for letter in (b'M'..=b'Z').rev() {
+            match Self::new(&format!("{}:", letter as char), target, 0) {
+                Ok(subst) => return Ok(subst),
+                Err(MapError::Shadowed(_)) => continue,
+                Err(MapError::Failed(why)) => return Err(why),
+            }
+        }
+        Err("every letter from M: to Z: is already defined".to_owned())
+    }
+
+    /// Maps `drive` to `target` over the `below` definitions it must already have. Any other
+    /// count shows someone else's mapping, so the new one is removed again by exact match.
+    pub(crate) fn new(drive: &str, target: &Path, below: usize) -> Result<Self, MapError> {
         use std::os::windows::ffi::OsStrExt;
         use windows::core::PCWSTR;
         use windows::Win32::Storage::FileSystem::{DefineDosDeviceW, DEFINE_DOS_DEVICE_FLAGS};
@@ -44,12 +107,25 @@ impl Subst {
                 PCWSTR(target.as_ptr()),
             )
         }
-        .map_err(|e| format!("{e}"))?;
-        Ok(Self {
+        .map_err(|e| MapError::Failed(format!("{e}")))?;
+        let subst = Self {
             drive: drive.to_owned(),
             target,
             removed: false,
-        })
+        };
+        // On an error `subst` drops here and removes the mapping.
+        let all = definitions(drive).map_err(|code| MapError::Failed(format!("QueryDosDeviceW err={code}")))?;
+        if all.len() == below + 1 {
+            return Ok(subst);
+        }
+        subst
+            .remove()
+            .map_err(|e| MapError::Failed(format!("could not remove the shadowing mapping of {drive}: {e}")))?;
+        Err(MapError::Shadowed(all))
+    }
+
+    pub(crate) fn drive(&self) -> &str {
+        &self.drive
     }
 
     /// Removes the mapping and reports a failure. The drop guard covers an early exit; a test that
@@ -120,11 +196,11 @@ pub fn drive_dir(base: &str, image: &str) {
         std::fs::create_dir_all(d.join(sub)).expect("create the drive's directories");
     }
     std::fs::write(d.join("afile"), b"x").expect("create <d>\\afile");
-    let drive = free_drive();
-    let _subst = match Subst::new(&drive, &d) {
+    let _subst = match Subst::map_free(&d) {
         Ok(s) => s,
         Err(e) => return println!("subst=err {e}"),
     };
+    let drive = _subst.drive().to_owned();
     println!("cwd_set={}", outcome(&set_cwd(d.as_os_str())));
     let render = Render(vec![(drive.clone(), "X:"), (d.to_str().unwrap().to_owned(), "<d>")]);
     let other = format!(r"{}\exists", d.display());
@@ -151,18 +227,6 @@ pub fn drive_dir(base: &str, image: &str) {
         let std_run = std_output(std::process::Command::new(image).current_dir(&name));
         println!("std_{label}={}", spawned(std_run, "cwd=", &render));
     }
-}
-
-/// A drive letter no volume or mapping uses, as `X:`.
-pub(crate) fn free_drive() -> String {
-    use windows::Win32::Storage::FileSystem::GetLogicalDrives;
-    // SAFETY: no arguments; reads the mounted drives.
-    let mask = unsafe { GetLogicalDrives() };
-    let letter = (b'M'..=b'Z')
-        .rev()
-        .find(|l| mask & (1 << (l - b'A')) == 0)
-        .expect("a free drive letter");
-    format!("{}:", letter as char)
 }
 
 /// Where cosca and std run a child given the rooted `current_dir(r"\x")` from this process's cwd.

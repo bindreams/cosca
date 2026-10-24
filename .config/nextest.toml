@@ -171,9 +171,9 @@ windows-shell-execute = { max-threads = 1 }
 # that binary at one test at a time instead.
 windows-elevation-routes = { max-threads = 1 }
 
-# The `DRIVE_MAPPING` tests in `tests/windows_process_cwd.rs` each map the highest free drive letter
-# for the whole logon session, so two at once would pick the same letter and each read the other's
-# mapping (measured: M12's child found the other test's directory behind its letter).
+# The `DRIVE_MAPPING` tests in `tests/windows_process_cwd.rs` each map a drive letter for the whole
+# logon session, so two at once would each read the other's mapping. This group runs that whole
+# binary one test at a time, so a new drive-mapping test is covered without a filter naming it.
 windows-drive-mapping = { max-threads = 1 }
 
 [[profile.default.overrides]]
@@ -185,7 +185,7 @@ filter = 'binary(windows_elevation_routes)'
 test-group = 'windows-elevation-routes'
 
 [[profile.default.overrides]]
-filter = 'binary(windows_process_cwd) & (test(=a_drive_relative_current_dir_takes_the_drives_own_directory_as_win32_does) | test(=m12_a_cwd_on_a_removed_or_repointed_subst))'
+filter = 'binary(windows_process_cwd)'
 test-group = 'windows-drive-mapping'
 
 [[profile.default.overrides]]

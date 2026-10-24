@@ -15,7 +15,7 @@ mod common;
 /// - `bare_inherited`: the name, run by a `cosca_testbin` child whose own `PATH` is `dir`, so std
 ///   keeps `posix_spawnp`'s `PATH` search.
 ///
-/// Each row starts with `route=`, a label taken from std's source and not observed: `spawn` is the
+/// Each row starts with `route~`, a label inferred from std's source and not observed: `spawn` is the
 /// route std gives to `posix_spawn(p)` where it has one (glibc, macOS); `fork` is fork and
 /// `execvp`, which `pre_exec` and a set `PATH` force. A change in std would leave the label wrong
 /// while the outcome and marker stay measured. The `os` and `target_env` line says whether std has
@@ -46,7 +46,9 @@ fn m18_std_routes_and_the_shell_fallback() {
     println!("M18 os={} target_env={}", std::env::consts::OS, target_env());
     for case in ["absolute", "bare_set_path", "bare_inherited"] {
         for variant in ["plain", "pre_exec"] {
-            let _ = std::fs::remove_file(&marker);
+            if let Err(e) = std::fs::remove_file(&marker) {
+                assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "remove {marker:?}: {e}");
+            }
             let pre_exec = variant == "pre_exec";
             let route = if pre_exec || case == "bare_set_path" {
                 "fork"
@@ -78,7 +80,7 @@ fn m18_std_routes_and_the_shell_fallback() {
                 }
             };
             println!(
-                "M18 {case}_{variant}=route={route},{outcome},marker={}",
+                "M18 {case}_{variant}=route~{route},{outcome},marker={}",
                 marker.exists()
             );
         }

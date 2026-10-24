@@ -3,8 +3,9 @@
 //! Each row spawns an argv-only command three ways and prints `<row>: std=… cosca=… raw_fd3=…`:
 //! `std::process::Command`; an argv-only `cosca::Command`, which `main` sends through std's
 //! route; and the same with fd 3 mapped, which `main` sends to the raw backend. A `.contain()` row
-//! gives std `main`'s `prepare` stand-in (`env_clear()`, then this process's variables), and fails
-//! the probe if std and cosca load different files: the stand-in would then not be `main`'s route.
+//! gives std `main`'s `prepare` stand-in (`env_clear()`, then this process's variables) and records
+//! `stand_in_matches=`, whether std and cosca loaded the same file: when not, the stand-in is not
+//! `main`'s route.
 //!
 //! The planted programs are copies of `cosca_testbin_image`, which prints `image=` and `cwd=`.
 //! `<t>` is the probe's cwd, and `<t>\p` is first on its `PATH` (set by the test). Directories
@@ -110,12 +111,13 @@ fn measure(name: &str, row: &Row, render: &Render) {
     let mut raw = row.cosca_command();
     raw.fd(3, cosca::Stdio::null()).expect("map fd 3");
     let raw_col = cosca_run(&mut raw, KEYS, render);
-    println!("{name}: std={std_col} cosca={cosca_col} raw_fd3={raw_col}");
     if row.contain {
-        assert_eq!(
-            std_col, cosca_col,
-            "{name}: std under prepare's stand-in loaded another file than cosca's contained route"
+        println!(
+            "{name}: std={std_col} cosca={cosca_col} raw_fd3={raw_col} stand_in_matches={}",
+            std_col == cosca_col
         );
+    } else {
+        println!("{name}: std={std_col} cosca={cosca_col} raw_fd3={raw_col}");
     }
 }
 
@@ -138,10 +140,8 @@ fn plant(image: &str, to: &Path) {
 fn renderer(t: &Path) -> Render {
     let unc = unc_of(t);
     let dir = |f: unsafe fn(Option<&mut [u16]>) -> u32| {
-        let mut buf = vec![0u16; 1024];
         // SAFETY: `buf` is a live buffer of its length.
-        let n = unsafe { f(Some(&mut buf)) } as usize;
-        String::from_utf16_lossy(&buf[..n])
+        crate::measure::wide_string(|buf| unsafe { f(Some(buf)) }).expect("a system directory")
     };
     let sys = dir(windows::Win32::System::SystemInformation::GetSystemDirectoryW);
     let win = dir(windows::Win32::System::SystemInformation::GetWindowsDirectoryW);
@@ -219,7 +219,7 @@ pub fn run(t: &str, image: &str) {
     let doubled = format!(r"\\localhost\\{}", &unc[r"\\localhost\".len()..]);
 
     let rows: Vec<(&str, Row)> = vec![
-        // §3: the bare-name search, and D5 class 4.
+        // Class 4: the bare-name search.
         ("c4_env_clear", Row::new(&["probe"]).clear()),
         ("c4_path_empty_dir", Row::new(&["probe"]).set("PATH", &s)),
         ("c4_path_removed", Row::new(&["probe"]).remove("PATH")),
@@ -290,7 +290,7 @@ pub fn run(t: &str, image: &str) {
             "c11_long_candidate_first",
             Row::new(&["l11"]).set("PATH", format!("{};{ts}\\short", long.display())),
         ),
-        // Classes 12 and 13, and the other `current_dir` rows of §3.
+        // Classes 12 and 13, and the other `current_dir` rows.
         ("c12_verbatim_cwd", Row::new(&["probe"]).cwd(format!(r"\\?\{ts}\sub12"))),
         (
             "c13_verbatim_cwd_dotdot",
@@ -308,18 +308,18 @@ pub fn run(t: &str, image: &str) {
         ("cwd_trailing_space", Row::new(&["probe"]).cwd(format!(r"{ts}\sub12 "))),
         ("cwd_server_only", Row::new(&["probe"]).cwd(r"\\localhost")),
         ("e1_empty_cwd", Row::new(&["probe"]).cwd("")),
-        // §3: a verbatim image.
+        // A verbatim image.
         ("verbatim_image", Row::new(&[&format!(r"\\?\{ts}\bin\tool.exe")])),
-        // §3: an app execution alias, found on the parent's `PATH`.
+        // An app execution alias, found on the parent's `PATH`.
         ("app_alias_winget", Row::new(&["winget", "--version"])),
-        // N7: a NUL in an env value, and no such program.
+        // A NUL in an env value, and no such program.
         ("n7_nul_in_env", Row::new(&["nosuch-q"]).set("K", "a\0b")),
     ];
     for (name, row) in &rows {
         measure(name, row, &render);
     }
 
-    // §3's error precedence, which only cosca's routes have.
+    // Error precedence, which only cosca's routes have.
     measure_cosca(
         "order_nul_cwd_no_program",
         || {

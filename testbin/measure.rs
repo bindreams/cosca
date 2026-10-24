@@ -29,6 +29,23 @@ fn replace_ignore_case(s: &str, from: &str, to: &str) -> String {
     out
 }
 
+/// The string a Win32 call that fills a UTF-16 buffer returns. When `f` reports a size past the
+/// buffer, it retries with a buffer of that size, until the result fits. `Err` is the OS error
+/// code of a call that returned 0.
+pub(crate) fn wide_string(mut f: impl FnMut(&mut [u16]) -> u32) -> Result<String, i32> {
+    let mut buf = vec![0u16; 1024];
+    loop {
+        let n = f(&mut buf) as usize;
+        if n == 0 {
+            return Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(-1));
+        }
+        if n < buf.len() {
+            return Ok(String::from_utf16_lossy(&buf[..n]));
+        }
+        buf.resize(n, 0);
+    }
+}
+
 /// An I/O error as `err=<code>`, or `err(<kind>)` when it carries no OS code.
 pub(crate) fn io_error(e: &std::io::Error) -> String {
     match e.raw_os_error() {

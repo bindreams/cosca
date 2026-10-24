@@ -340,11 +340,6 @@ path = "tests/windows_testbin_ack.rs"
 harness = false
 
 [[test]]
-name = "windows_app_alias"
-path = "tests/windows_app_alias.rs"
-harness = false
-
-[[test]]
 name = "posix_path_resolution"
 path = "tests/posix_path_resolution.rs"
 harness = false

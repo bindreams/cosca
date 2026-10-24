@@ -1,10 +1,11 @@
 //! M19: app execution aliases (`AppExecLink` reparse points in `%LOCALAPPDATA%\Microsoft\WindowsApps`)
 //! and links to them: what `metadata`, `symlink_metadata`, the reparse tag and `GetFileAttributesW`
-//! say, and whether `CreateProcessW` launches each by full path. The ground truth for N11, and for
-//! where the guard `an_app_execution_alias_is_a_file` goes.
+//! say, and whether `CreateProcessW` launches each by full path.
 //!
 //! It writes in its temp directory, and in one directory of its own under
-//! `%LOCALAPPDATA%\Microsoft` (the junction row needs a sibling of `WindowsApps`), removed on drop.
+//! `%LOCALAPPDATA%\Microsoft` (the junction row needs a sibling of `WindowsApps`). A `tempfile`
+//! directory with a unique name, it is removed explicitly once its row is recorded, and the removal
+//! must succeed; a panic before then leaves it to `Drop`.
 //! Only `winget` is launched (with `--version`): another alias may open a store page or a REPL.
 
 use std::ffi::OsStr;
@@ -45,17 +46,23 @@ fn m19_app_execution_aliases(#[fixture(path_probes)] _group: &Group) {
     let apps = PathBuf::from(std::env::var_os("LOCALAPPDATA").expect("LOCALAPPDATA"))
         .join("Microsoft")
         .join("WindowsApps");
-    let mut names: Vec<String> = match std::fs::read_dir(&apps) {
-        Ok(entries) => entries
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.to_ascii_lowercase().ends_with(".exe"))
-            .collect(),
-        Err(e) => {
-            println!("M19 windows_apps=err({e})");
-            Vec::new()
+    let mut names: Vec<String> = Vec::new();
+    match std::fs::read_dir(&apps) {
+        Ok(entries) => {
+            for entry in entries {
+                match entry {
+                    Ok(e) => {
+                        let name = e.file_name().to_string_lossy().into_owned();
+                        if name.to_ascii_lowercase().ends_with(".exe") {
+                            names.push(name);
+                        }
+                    }
+                    Err(e) => println!("M19 windows_apps_entry=err({e})"),
+                }
+            }
         }
-    };
+        Err(e) => println!("M19 windows_apps=err({e})"),
+    }
     names.sort();
     println!(
         "M19 aliases={}",
@@ -102,7 +109,7 @@ fn self_made_alias(t: &Path) {
     }
 }
 
-/// N11's link rows, each `M19 <row> create=<outcome> <facts>`.
+/// The link rows, each `M19 <row> create=<outcome> <facts>`.
 fn link_rows(t: &Path, apps: &Path, name: &str, alias: &Path, launch: Option<&str>) {
     let row = |label: &str, created: Result<(), String>, path: &Path| {
         let facts = if created.is_ok() {
@@ -156,26 +163,32 @@ fn link_rows(t: &Path, apps: &Path, name: &str, alias: &Path, launch: Option<&st
     let a = t.join("a");
     std::fs::create_dir(&a).expect("create <t>\\a");
     let l = a.join(name);
-    // Below the prefix and the root.
-    let depth = a.components().count() - 2;
-    let rest = alias.to_string_lossy();
-    let rest = rest.get(3..).expect("a drive-absolute alias path");
-    let created = io(std::os::windows::fs::symlink_file(
-        format!(r"{}{rest}", r"..\".repeat(depth + 2)),
-        &l,
-    ));
+    let created = same_drive(&a, alias).and_then(|()| {
+        // Below the prefix and the root.
+        let depth = a.components().count() - 2;
+        let rest = alias.to_string_lossy();
+        let rest = rest.get(3..).expect("a drive-absolute alias path");
+        io(std::os::windows::fs::symlink_file(
+            format!(r"{}{rest}", r"..\".repeat(depth + 2)),
+            &l,
+        ))
+    });
     row("rel_past_root", created, &l);
 
     // A relative link, `..\WindowsApps\<name>`, read through a junction to its directory.
-    let sibling = SiblingOfApps::new(apps);
-    let l = sibling.0.join(name);
+    let sibling = tempfile::Builder::new()
+        .prefix("cosca-m19-")
+        .tempdir_in(apps.parent().expect("WindowsApps has a parent"))
+        .expect("create the sibling of WindowsApps");
+    let l = sibling.path().join(name);
     let created = io(std::os::windows::fs::symlink_file(
         format!(r"..\WindowsApps\{name}"),
         &l,
     ));
     let j = t.join("j");
-    let created = created.and_then(|()| junction(&j, &sibling.0));
+    let created = created.and_then(|()| junction(&j, sibling.path()));
     row("rel_in_junction", created, &j.join(name));
+    sibling.close().expect("remove the sibling of WindowsApps");
 
     // The link found by std's search through a verbatim `PATH` entry.
     let v = t.join("vlinks");
@@ -200,28 +213,6 @@ fn link_rows(t: &Path, apps: &Path, name: &str, alias: &Path, launch: Option<&st
             None => "not-attempted".to_owned(),
         };
         println!("M19 verbatim_path_entry_std_search={found}");
-    }
-}
-
-/// A directory of this test's own beside `WindowsApps`, removed on drop.
-struct SiblingOfApps(PathBuf);
-
-impl SiblingOfApps {
-    fn new(apps: &Path) -> Self {
-        let dir = apps
-            .parent()
-            .expect("WindowsApps has a parent")
-            .join(format!("cosca-m19-{}", std::process::id()));
-        std::fs::create_dir(&dir).expect("create the sibling of WindowsApps");
-        Self(dir)
-    }
-}
-
-impl Drop for SiblingOfApps {
-    fn drop(&mut self) {
-        if let Err(e) = std::fs::remove_dir_all(&self.0) {
-            println!("M19 CLEANUP: {:?} could not be removed: {e}", self.0);
-        }
     }
 }
 
@@ -438,13 +429,21 @@ fn elevated() -> bool {
 
 /// `target` relative to the directory `from`: `..` up to the volume root, then `target` below it.
 fn relative_to(from: &Path, target: &Path) -> Result<PathBuf, String> {
-    let (f, t) = (from.to_string_lossy(), target.to_string_lossy());
-    if !f[..2].eq_ignore_ascii_case(&t[..2]) {
-        return Err(format!("impossible: {from:?} and {target:?} are on different drives"));
-    }
+    same_drive(from, target)?;
+    let t = target.to_string_lossy();
     // Below the prefix and the root.
     let depth = from.components().count() - 2;
     Ok(PathBuf::from(format!(r"{}{}", r"..\".repeat(depth), &t[3..])))
+}
+
+/// `Ok` when both drive-absolute paths are on one drive; no `..` run reaches across drives.
+fn same_drive(from: &Path, target: &Path) -> Result<(), String> {
+    let (f, t) = (from.to_string_lossy(), target.to_string_lossy());
+    if f[..2].eq_ignore_ascii_case(&t[..2]) {
+        Ok(())
+    } else {
+        Err(format!("impossible: {from:?} and {target:?} are on different drives"))
+    }
 }
 
 fn wide_of(s: &OsStr) -> Vec<u16> {

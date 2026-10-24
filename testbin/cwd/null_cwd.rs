@@ -7,7 +7,7 @@
 use std::ffi::OsStr;
 use std::path::Path;
 
-use crate::completion::{free_drive, Subst};
+use crate::completion::{assert_undefined, Subst};
 use crate::measure::{cosca_run, std_run, Render};
 use crate::probe::{canonical, outcome, set_cwd, verbatim_of};
 
@@ -20,9 +20,10 @@ pub fn report_cwd_final() {
     let markers = match std::fs::read_dir(".") {
         Ok(entries) => {
             let mut names: Vec<String> = entries
-                .filter_map(|e| e.ok())
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .filter(|n| n.starts_with("marker"))
+                .filter_map(|entry| match entry {
+                    Ok(e) => Some(e.file_name().to_string_lossy().into_owned()).filter(|n| n.starts_with("marker")),
+                    Err(e) => Some(format!("err({e})")),
+                })
                 .collect();
             names.sort();
             names.join(",")
@@ -75,7 +76,8 @@ pub fn subst_cwd(base: &str, child: &str) {
         std::fs::create_dir_all(dir.join("sub")).expect("create the drive's directories");
         std::fs::write(dir.join("sub").join(marker), b"").expect("plant the marker");
     }
-    let drive = free_drive();
+    let first = Subst::map_free(&d1).expect("map a free letter to <d1>");
+    let drive = first.drive().to_owned();
     let render = Render(vec![
         (d1.display().to_string(), "<d1>".to_owned()),
         (d2.display().to_string(), "<d2>".to_owned()),
@@ -84,20 +86,19 @@ pub fn subst_cwd(base: &str, child: &str) {
     ]);
     let sub = format!(r"{drive}\sub");
 
-    let first = Subst::new(&drive, &d1).expect("map X: to <d1>");
     let set = set_cwd(OsStr::new(&sub));
     println!("removed_set={}", outcome(&set));
     first.remove().expect("remove the mapping of X:");
-    assert_eq!(free_drive(), drive, "the mapping of {drive} was removed");
+    assert_undefined(&drive);
     if set.is_ok() {
         spawn_rows("removed", child, &render);
     }
     set_cwd(d.as_os_str()).expect("leave the removed drive");
 
-    let first = Subst::new(&drive, &d1).expect("map X: to <d1>");
+    let first = Subst::new(&drive, &d1, 0).unwrap_or_else(|e| panic!("map {drive} to <d1> again: {e}"));
     let set = set_cwd(OsStr::new(&sub));
     println!("repointed_set={}", outcome(&set));
-    let second = Subst::new(&drive, &d2).expect("map X: to <d2> over <d1>");
+    let second = Subst::new(&drive, &d2, 1).unwrap_or_else(|e| panic!("map {drive} to <d2> over <d1>: {e}"));
     assert!(
         Path::new(&format!(r"{drive}\sub\marker-d2")).exists(),
         "{drive} was re-pointed at <d2>"
@@ -112,7 +113,7 @@ pub fn subst_cwd(base: &str, child: &str) {
     let first = first.remove();
     second.expect("remove the second mapping of X:");
     first.expect("remove the first mapping of X:");
-    assert_eq!(free_drive(), drive, "the mappings of {drive} were removed");
+    assert_undefined(&drive);
 }
 
 /// `verbatim-null <base> <image>`: enters `\\?\<d>` and spawns `<image>` from there.

@@ -1,6 +1,5 @@
-//! M5, std's column: what `main` loads for an argv-only command, one row per §3 case of the
-//! untangling plan and at least one member of each class it lists. P7 asserts its own column
-//! against these.
+//! M5, std's column: what `main` loads for an argv-only command, at least one row per class of
+//! case. The unified backend is to assert its own column against these.
 
 use std::process::Command;
 
@@ -51,7 +50,8 @@ fn m5_what_std_loads(#[fixture(path_probes)] _group: &Group) {
             .args(&block)
             .args(["--", "std-loads-dup"])
             .arg(&t)
-            .arg(image),
+            .arg(image)
+            .current_dir(&t),
     );
     record("M5", &report);
 }

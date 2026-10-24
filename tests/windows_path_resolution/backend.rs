@@ -1,6 +1,5 @@
-//! Surveys of what `main`'s two Windows routes do today, for P7 (#156) to assert once every
-//! Windows spawn takes the raw backend. Each records its rows as `M<n> <key>=<value>` and asserts
-//! only its preconditions.
+//! Surveys of what `main`'s two Windows routes do today, for a change that unifies them to assert.
+//! Each records its rows as `M<n> <key>=<value>` and asserts only its preconditions.
 //!
 //! A route is named by how `main` sends the command: `std` is `std::process::Command`, `cosca`
 //! an argv-only `cosca::Command` (std's route on `main`), `raw_fd3` the same with fd 3 mapped and
@@ -14,8 +13,7 @@ use crate::provenance::survey_platform;
 use crate::test_groups::{path_probes, Group};
 
 /// M2: a child spawned while all three of the parent's std handles are null. std sets no
-/// `STARTF_USESTDHANDLES` then. Rev 19 §3 predicts the raw backend duplicates them after P7; on
-/// `main` it fails the spawn with `ERROR_INVALID_HANDLE` (6), which is #726.
+/// `STARTF_USESTDHANDLES` then. The raw backend fails the spawn with `ERROR_INVALID_HANDLE` (6).
 #[skuld::test]
 fn m2_null_std_handles(#[fixture(path_probes)] _group: &Group) {
     survey_platform();
@@ -44,7 +42,8 @@ fn m3_stray_inheritable_handles(#[fixture(path_probes)] _group: &Group) {
     );
 }
 
-/// M4: the argv a child parses from `commandline()`, per route. The child's mode comes from
+/// M4: the argv a child parses from `commandline()`, and from argument shapes given through
+/// `arg()`/`args()` on `std`, `cosca` and `raw_fd3`. The child's mode comes from
 /// `COSCA_TESTBIN_MODE`, so a shifted argv cannot change what it does.
 #[skuld::test]
 fn m4_commandline_argv(#[fixture(path_probes)] _group: &Group) {
@@ -70,6 +69,37 @@ fn m4_commandline_argv(#[fixture(path_probes)] _group: &Group) {
                 Err(e) => format!("err({e})"),
             };
             println!("M4 {row}_{route}={outcome}");
+        }
+    }
+    for (row, args) in [
+        ("empty_arg", &[""][..]),
+        ("embedded_quotes", &[r#"a"b"#, r#""quoted""#]),
+        ("trailing_backslashes", &[r"C:\dir\", r"C:\two\\"]),
+        ("space", &["a b"]),
+        ("space_and_trailing_backslash", &[r"C:\a b\"]),
+    ] {
+        for route in ["std", "cosca", "raw_fd3"] {
+            let outcome = if route == "std" {
+                let mut cmd = Command::new(bin);
+                cmd.args(args).env("COSCA_TESTBIN_MODE", "dump-argv");
+                match crate::common::output_locked(&mut cmd) {
+                    Ok(out) if out.status.success() => argv_of(&String::from_utf8_lossy(&out.stdout), bin),
+                    Ok(out) => format!("exit={:?}", out.status.code()),
+                    Err(e) => format!("err({e})"),
+                }
+            } else {
+                let mut cmd = cosca::Command::new();
+                cmd.arg(bin).args(args).env("COSCA_TESTBIN_MODE", "dump-argv");
+                if route == "raw_fd3" {
+                    cmd.fd(3, cosca::Stdio::null()).expect("map fd 3");
+                }
+                match cmd.output() {
+                    Ok(out) if out.status.success() => argv_of(&String::from_utf8_lossy(&out.stdout), bin),
+                    Ok(out) => format!("exit={:?}", out.status.code()),
+                    Err(e) => format!("err({e})"),
+                }
+            };
+            println!("M4 argv_{row}_{route}={outcome}");
         }
     }
 }

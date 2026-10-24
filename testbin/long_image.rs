@@ -47,7 +47,9 @@ fn launch(name: &OsStr, file: &Path, report: &Path) -> String {
         CreateProcessW, WaitForSingleObject, INFINITE, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION,
         STARTF_USESTDHANDLES, STARTUPINFOW,
     };
-    let _ = std::fs::remove_file(report);
+    if let Err(e) = std::fs::remove_file(report) {
+        assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "remove {report:?}: {e}");
+    }
     let app: Vec<u16> = name.encode_wide().chain([0]).collect();
     let mut line = OsString::from("t --report-to \"");
     line.push(report);
