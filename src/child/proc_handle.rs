@@ -81,6 +81,13 @@ impl ProcHandle {
         s.state()
     }
 
+    /// [`state`](Self::state), and whether a `Reaped` is this handle's own reap, read together.
+    #[cfg(unix)]
+    pub(crate) fn state_and_own_reap(&self) -> (crate::signal::RootState, bool) {
+        let ProcHandle::Std(s) = self;
+        s.state_and_own_reap()
+    }
+
     /// Block until the child exits.
     pub(crate) fn wait(&self) -> io::Result<ExitStatus> {
         match self {

@@ -581,6 +581,14 @@ impl ProcSource {
         }
     }
 
+    /// [`state`](ProcSource::state), and whether a `Reaped` is this backend's own reap: tokio's wait
+    /// collected the status. A forgotten backend's is not.
+    #[cfg(unix)]
+    pub(crate) fn state_and_own_reap(&self) -> (RootState, bool) {
+        let own = matches!(self, ProcSource::Tokio { child, .. } if child.id().is_none());
+        (self.state(), own)
+    }
+
     /// [`state`](ProcSource::state) of a `Tokio` backend whose `child` may already be taken out of
     /// it (the drop does that), for a child tokio has not reaped.
     #[cfg(unix)]

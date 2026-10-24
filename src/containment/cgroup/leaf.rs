@@ -1142,8 +1142,8 @@ fn end_child(received: &Received) -> ChildFate {
         pidfd_send_signal(handle, rustix::process::Signal::KILL)
     };
     let killed = match killed {
-        // Reaped since the check — only a reaper the crate's contract forbids can have — so it is
-        // gone, and its number is not signalled.
+        // Reaped since the check, by another reaper in the process: gone, and its number is not
+        // signalled.
         Err(rustix::io::Errno::SRCH) => return ChildFate::Gone,
         // `pidfd_send_signal` itself refused, as a seccomp filter can: the identity was proven a
         // moment ago, and only this process may reap the child, so its pid still names it.
@@ -1180,7 +1180,14 @@ fn end_child(received: &Received) -> ChildFate {
                 status.and_then(|status| status.terminating_signal()),
             );
         }
-        // Nothing else may reap it: the child was unreaped a moment ago, and no handle owns it.
+        // Killed above, then reaped by another reaper in the process: only its status is lost.
+        Err(rustix::io::Errno::CHILD) => {
+            log::debug!(
+                "cgroup v2: an abandoned spawn's child (pid {}) was reaped elsewhere after its kill",
+                rustix::process::Pid::as_raw(Some(pid))
+            );
+        }
+        // The child was ours and unreaped a moment ago: no other errno is reachable.
         Err(e) => {
             log::warn!("cgroup v2: could not reap an abandoned spawn's child: {e}");
             debug_assert!(false, "an abandoned spawn's child could not be reaped: {e}");
@@ -1697,6 +1704,10 @@ mod release;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "leaf/end_front_tests.rs"]
 mod end_front_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "leaf/end_child_tests.rs"]
+mod end_child_tests;
 
 #[cfg(test)]
 #[path = "leaf_tests.rs"]
