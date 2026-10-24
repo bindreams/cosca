@@ -843,3 +843,32 @@ async fn reap_now_of_a_child_reaped_behind_the_owner_after_the_kill_is_killed() 
 
     assert_eq!(fate, crate::error::ChildFate::Killed);
 }
+
+/// A backend forgotten before it was shown to be ours holds no pidfd, and its child may still be
+/// running: its grace never says it exited.
+///
+/// Mutant: a backend with no pidfd answers that its child exited.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn exited_within_of_a_child_never_shown_ours_is_false() {
+    crate::tokio::test_runtime::assert_current_thread();
+    // `cat` runs until the backend, which keeps its stdin, drops.
+    let child = crate::test_spawn::spawn_tokio(
+        ::tokio::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null()),
+    )
+    .expect("spawn");
+    let pid = child.id().expect("tokio owns an un-reaped child");
+    let mut proc = proc_source(child);
+    proc.forget_foreign();
+
+    let exited = proc.exited_within(std::time::Duration::ZERO).await;
+
+    assert!(
+        !exited.expect("a forgotten backend's grace"),
+        "its child may still be running"
+    );
+    drop(proc);
+    reap_behind_the_owner(pid);
+}

@@ -515,13 +515,17 @@ impl ProcSource {
     }
 
     /// Whether the child has exited by the time `grace` is over, read only through its pidfd: nothing
-    /// is reaped and no state is read. A backend with no pidfd holds nothing that is still running.
+    /// is reaped and no state is read. A forgotten backend has no pidfd and is not waited on: its
+    /// child has exited if it was reaped elsewhere, and may still run if it was never shown to be
+    /// ours.
     #[cfg(target_os = "linux")]
     pub(crate) async fn exited_within(&self, grace: std::time::Duration) -> Result<bool, Error> {
-        let ProcSource::Tokio { pidfd, .. } = self else {
-            return Ok(true);
-        };
-        crate::tokio::wait::pidfd_exited_within(std::os::fd::AsFd::as_fd(pidfd), grace).await
+        match self {
+            ProcSource::Tokio { pidfd, .. } => {
+                crate::tokio::wait::pidfd_exited_within(std::os::fd::AsFd::as_fd(pidfd), grace).await
+            }
+            ProcSource::Foreign { fate, .. } => Ok(fate.gone()),
+        }
     }
 
     /// Waits, without reaping, until the child's exit is visible through its handle (Linux: the
