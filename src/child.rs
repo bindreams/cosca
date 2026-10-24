@@ -223,7 +223,7 @@ pub(crate) fn root_checked_tree_signal(
         #[cfg(target_os = "macos")]
         RootNumber::Untrusted(root) => attached.signal_tree_untrusted(signal, &root, pid, op, earlier, killed),
         #[cfg(target_os = "macos")]
-        RootNumber::NoWalk => Some(no_walk_signal(attached, pid, signal, op, Some(killed))),
+        RootNumber::NoWalk => Some(no_walk_signal(attached, pid, signal, op, None)),
         RootNumber::Empty => Some(
             empty_group_signal(attached, pid, signal, op, Some(killed)).unwrap_or_else(|| {
                 if let TreeSignal::Kill = signal {
