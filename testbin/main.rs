@@ -194,6 +194,16 @@ fn chdir_this_process(dir: impl AsRef<std::path::Path>) {
     std::env::set_current_dir(dir).expect("chdir to the decoy directory");
 }
 
+/// Run `body`; a broken pipe (the parent closed its read end early) is a normal end, so exit 0
+/// quietly. Any other error panics.
+fn end_on_broken_pipe(body: impl FnOnce() -> std::io::Result<()>) {
+    match body() {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => exit(0),
+        Err(e) => panic!("{e}"),
+    }
+}
+
 /// Shared body of `control-echo-pid` and the grandchild arm of `spawn-orphan-escapee`'s
 /// relay: publish `<tag><pid>\n`, then echo each byte received. `Ok(0)`/`Interrupted` are the
 /// only expected outcomes besides a live echo; anything else is a genuine test-harness bug.
@@ -329,32 +339,36 @@ fn main() {
         "emit" => {
             let n_out: usize = args[2].parse().unwrap();
             let n_err: usize = args[3].parse().unwrap();
-            // Flush explicitly: these bytes have no trailing newline, so the
-            // line-buffered Stdout would otherwise hold them until process exit.
-            let mut out = std::io::stdout().lock();
-            out.write_all(&vec![b'o'; n_out]).unwrap();
-            out.flush().unwrap();
-            let mut err = std::io::stderr().lock();
-            err.write_all(&vec![b'e'; n_err]).unwrap();
-            err.flush().unwrap();
+            end_on_broken_pipe(|| {
+                // Flush explicitly: these bytes have no trailing newline, so the
+                // line-buffered Stdout would otherwise hold them until process exit.
+                let mut out = std::io::stdout().lock();
+                out.write_all(&vec![b'o'; n_out])?;
+                out.flush()?;
+                let mut err = std::io::stderr().lock();
+                err.write_all(&vec![b'e'; n_err])?;
+                err.flush()
+            });
         }
         "tee-both" => {
             // Copy stdin to BOTH stdout and stderr in a loop, so a parent that
             // does not pump concurrently will deadlock once a pipe buffer fills.
-            let mut stdin = std::io::stdin().lock();
-            let mut stdout = std::io::stdout().lock();
-            let mut stderr = std::io::stderr().lock();
-            let mut buf = [0u8; 8192];
-            loop {
-                let n = stdin.read(&mut buf).unwrap();
-                if n == 0 {
-                    break;
+            end_on_broken_pipe(|| {
+                let mut stdin = std::io::stdin().lock();
+                let mut stdout = std::io::stdout().lock();
+                let mut stderr = std::io::stderr().lock();
+                let mut buf = [0u8; 8192];
+                loop {
+                    let n = stdin.read(&mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    stdout.write_all(&buf[..n])?;
+                    stderr.write_all(&buf[..n])?;
                 }
-                stdout.write_all(&buf[..n]).unwrap();
-                stderr.write_all(&buf[..n]).unwrap();
-            }
-            stdout.flush().unwrap();
-            stderr.flush().unwrap();
+                stdout.flush()?;
+                stderr.flush()
+            });
         }
         "stdin-split-echo" => {
             // Prove the In-direction merge dup: fd 0 and fd 2 are dups of ONE pipe, so
