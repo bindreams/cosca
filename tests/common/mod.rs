@@ -687,6 +687,31 @@ pub fn assert_echoes(sock: &mut std::net::TcpStream, who: &str) {
     assert_eq!(&b, b"p", "{who} echoed {b:?} instead of the byte it was sent");
 }
 
+/// The env var that makes the testbin's `control-block` family echo each byte the test writes
+/// instead of leaving on it, so [`assert_dead`] can tell a killed member from one that is alive.
+/// The `control-echo-pid` members echo regardless.
+pub const ECHO_HELD_ENV: &str = "COSCA_TEST_ECHO_HELD";
+
+/// Prove a member that echoes (see [`ECHO_HELD_ENV`]) is DEAD without waiting for its death: send
+/// a byte and read. A killed member refuses the write or gives EOF or a reset on the read; one a
+/// missing kill left alive echoes the byte. That makes a `kill_tree` that sends nothing fail here
+/// by assertion instead of hanging a blocking read for an EOF, so call it right after the kill,
+/// before any wait on the tree.
+pub fn assert_dead(sock: &mut std::net::TcpStream, who: &str) {
+    use std::io::ErrorKind::{BrokenPipe, ConnectionAborted, ConnectionReset};
+    match sock.write_all(b"p") {
+        Ok(()) => {}
+        Err(e) if matches!(e.kind(), BrokenPipe | ConnectionReset | ConnectionAborted) => return,
+        Err(e) => panic!("writing to {who} failed unexpectedly: {e}"),
+    }
+    let mut b = [0u8; 1];
+    match sock.read(&mut b) {
+        Ok(0) => {}
+        Err(e) if matches!(e.kind(), ConnectionReset | ConnectionAborted) => {}
+        other => panic!("{who} must be dead after the kill, but answered: {other:?}"),
+    }
+}
+
 /// Lower this process' own `RLIMIT_NOFILE` soft limit to `to`, for the life of the guard,
 /// restoring the original soft limit on drop (even if the test panics).
 ///

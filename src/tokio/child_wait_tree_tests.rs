@@ -30,6 +30,13 @@ fn long_lived_contained_child() -> (crate::tokio::Child, crate::tokio::ChildStdi
     crate::test_child::held_contained_blocker_async(crate::Stdio::null())
 }
 
+/// Async twin of `child::lifecycle_tests::kill_then_release`.
+async fn kill_then_release(mut child: crate::tokio::Child, stdin: crate::tokio::ChildStdin) {
+    child.kill_tree().expect("kill_tree");
+    drop(stdin);
+    crate::test_child::assert_killed("the blocker", child.wait().await.expect("reap the blocker"));
+}
+
 #[skuld::test]
 async fn async_wait_tree_reports_the_drained_verdict_when_the_tree_drains() {
     let mut cmd = quick_contained_cmd();
@@ -51,7 +58,7 @@ async fn async_wait_tree_reports_the_drained_verdict_when_the_tree_drains() {
 
 #[skuld::test]
 async fn async_wait_tree_timeout_reports_members_remain_before_the_deadline() {
-    let (mut child, _stdin) = long_lived_contained_child();
+    let (child, stdin) = long_lived_contained_child();
     let drainable = child.containment().can_observe_drain();
     let result = child.wait_tree_timeout(Duration::from_millis(200)).await;
     if drainable {
@@ -63,15 +70,14 @@ async fn async_wait_tree_timeout_reports_members_remain_before_the_deadline() {
         let err = result.expect_err("a non-drainable mechanism must refuse wait_tree_timeout");
         assert!(matches!(err, crate::error::Error::Unsupported { .. }), "got {err:?}");
     }
-    _ = child.kill_tree();
-    _ = child.wait().await;
+    kill_then_release(child, stdin).await;
 }
 
 /// Async twin of `wait_tree_timeout_zero_reports_members_remain_on_a_live_tree` — see there for
 /// the full rationale.
 #[skuld::test]
 async fn async_wait_tree_timeout_zero_reports_members_remain_on_a_live_tree() {
-    let (mut child, _stdin) = long_lived_contained_child();
+    let (child, stdin) = long_lived_contained_child();
     let drainable = child.containment().can_observe_drain();
     let result = child.wait_tree_timeout(Duration::ZERO).await;
     if drainable {
@@ -83,8 +89,7 @@ async fn async_wait_tree_timeout_zero_reports_members_remain_on_a_live_tree() {
         let err = result.expect_err("a non-drainable mechanism must refuse wait_tree_timeout");
         assert!(matches!(err, crate::error::Error::Unsupported { .. }), "got {err:?}");
     }
-    _ = child.kill_tree();
-    _ = child.wait().await;
+    kill_then_release(child, stdin).await;
 }
 
 /// Async twin of `wait_tree_timeout_zero_reports_the_drained_verdict_after_the_tree_has_already_drained`

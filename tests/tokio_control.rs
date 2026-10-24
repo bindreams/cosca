@@ -66,10 +66,17 @@ async fn async_tree_ops_unsupported_when_uncontained() {
 #[cfg(feature = "tokio")]
 #[skuld::test]
 async fn async_kill_tree_tears_down_tree() {
-    let (mut child, mut root, mut grand) = common::spawn_grandchild_async(true).await;
+    let (mut child, mut root, mut grand) = common::spawn_tree_async("spawn-grandchild", |cmd| {
+        cmd.contain();
+        cmd.kill_on_drop(true);
+        cmd.env(common::ECHO_HELD_ENV, "1");
+    })
+    .await;
     child.kill_tree().expect("kill_tree");
-    expect_eof("root", &mut root);
-    expect_eof("grandchild", &mut grand);
+    // The root and grandchild echo, so a kill that did not come fails here instead of hanging the
+    // read for an EOF.
+    common::assert_dead(&mut root, "the root after kill_tree");
+    common::assert_dead(&mut grand, "the grandchild after kill_tree");
     let status = child.wait().await.expect("reap root");
     assert!(
         !status.success(),
@@ -103,6 +110,7 @@ async fn async_contain_with_treewalk_tears_down_tree() {
     let (mut child, mut root, mut grand) = common::spawn_tree_async("spawn-grandchild", |cmd| {
         cmd.contain_with(cosca::ContainMode::TreeWalk)
             .nesting(cosca::containment::Nesting::Opaque);
+        cmd.env(common::ECHO_HELD_ENV, "1");
     })
     .await;
     // On macOS, ContainMode::TreeWalk still attaches Containment::FdMarker (decision 2: the
@@ -114,8 +122,8 @@ async fn async_contain_with_treewalk_tears_down_tree() {
     };
     assert_eq!(child.containment(), expected);
     child.kill_tree().expect("treewalk kill_tree");
-    expect_eof("root", &mut root);
-    expect_eof("grandchild", &mut grand);
+    common::assert_dead(&mut root, "the root after kill_tree");
+    common::assert_dead(&mut grand, "the grandchild after kill_tree");
     let _ = child.wait().await.expect("reap");
 }
 
@@ -252,6 +260,7 @@ async fn async_graceful_tree_cancel_does_not_escalate_on_windows() {
     // something escalated — being alive proves the cancelled graceful sent nothing further.
     let (mut child, mut root, mut grand) = common::spawn_tree_async("spawn-grandchild-ignore-break", |cmd| {
         cmd.contain();
+        cmd.env(common::ECHO_HELD_ENV, "1");
     })
     .await;
     {
@@ -273,8 +282,8 @@ async fn async_graceful_tree_cancel_does_not_escalate_on_windows() {
         "cancelled tree graceful must not have escalated"
     );
     child.kill_tree().expect("explicit sweep after cancel");
-    expect_eof("root", &mut root);
-    expect_eof("grandchild", &mut grand);
+    common::assert_dead(&mut root, "the root after the sweep");
+    common::assert_dead(&mut grand, "the grandchild after the sweep");
     let _ = child.wait().await.expect("reap after cancelled graceful");
     // Release proof rides on teardown: the test runtime's drop JOINS blocking tasks, so a
     // cancel event that failed to release the Duration::MAX watcher hangs shutdown (bounded by
@@ -292,6 +301,7 @@ async fn async_graceful_tree_cancel_does_not_escalate() {
     // the cancelled graceful sent nothing further.
     let (mut child, mut root, mut grand) = common::spawn_tree_async("spawn-grandchild-ignore-term", |cmd| {
         cmd.contain();
+        cmd.env(common::ECHO_HELD_ENV, "1");
     })
     .await;
     {
@@ -310,8 +320,8 @@ async fn async_graceful_tree_cancel_does_not_escalate() {
         "cancelled tree graceful must not have escalated"
     );
     child.kill_tree().expect("explicit sweep after cancel");
-    expect_eof("root", &mut root);
-    expect_eof("grandchild", &mut grand);
+    common::assert_dead(&mut root, "the root after the sweep");
+    common::assert_dead(&mut grand, "the grandchild after the sweep");
     let _ = child.wait().await.expect("reap");
 }
 

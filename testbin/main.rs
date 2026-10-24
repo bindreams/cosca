@@ -212,6 +212,24 @@ fn run_control_echo_pid(addr: &str, tag: &str) -> ! {
     }
 }
 
+/// The env var that makes [`hold`] answer the test's bytes instead of leaving on the first one.
+const ECHO_HELD_ENV: &str = "COSCA_TEST_ECHO_HELD";
+
+/// Block on `sock` until the test closes it, or writes a byte. With [`ECHO_HELD_ENV`] set the member
+/// echoes every byte and leaves only when the test closes the socket, so a test that releases the
+/// tree can tell a member that was killed (no echo) from one that is merely alive.
+fn hold(sock: &mut std::net::TcpStream) {
+    let echo = std::env::var_os(ECHO_HELD_ENV).is_some();
+    let mut b = [0u8; 1];
+    loop {
+        match sock.read(&mut b) {
+            Ok(n) if n > 0 && echo => sock.write_all(&b).unwrap(),
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            _ => break,
+        }
+    }
+}
+
 /// Spawn `exe args` as a grandchild and, when the harness asked for it via `COSCA_TEST_GC_PID_ADDR`,
 /// report its pid there as one `<pid>\n` line on a throwaway connection, then wait for the
 /// harness's release (the second ack) before returning. The harness resolves the grandchild's
@@ -406,8 +424,7 @@ fn main() {
             let mut sock = crate::ack::connect_control(addr).unwrap();
             sock.write_all(tag.as_bytes()).unwrap();
             sock.flush().unwrap();
-            let mut buf = [0u8; 1];
-            let _ = sock.read(&mut buf); // blocks until the socket closes (our death) / test writes
+            hold(&mut sock);
         }
         #[cfg(target_os = "linux")]
         "report-tid-block-stdin" => {
@@ -529,8 +546,7 @@ fn main() {
             let mut sock = crate::ack::connect_control(&addr).unwrap();
             sock.write_all(b"R").unwrap();
             sock.flush().unwrap();
-            let mut buf = [0u8; 1];
-            let _ = sock.read(&mut buf);
+            hold(&mut sock);
         }
         "spawn-grandchild-dies" => {
             // spawn-grandchild whose grandchild dies at once (an unknown mode exits immediately)
@@ -657,8 +673,7 @@ fn main() {
             let mut sock = crate::ack::connect_control(&addr).unwrap();
             sock.write_all(b"R").unwrap();
             sock.flush().unwrap();
-            let mut buf = [0u8; 1];
-            let _ = sock.read(&mut buf);
+            hold(&mut sock);
         }
         // The shape both current macOS mechanisms lose: a grandchild that leaves the session,
         // is reparented to launchd when its parent exits, and execs. The relay does the setsid
@@ -713,8 +728,7 @@ fn main() {
             let mut sock = crate::ack::connect_control(&addr).unwrap();
             sock.write_all(b"R").unwrap();
             sock.flush().unwrap();
-            let mut buf = [0u8; 1];
-            let _ = sock.read(&mut buf);
+            hold(&mut sock);
         }
         #[cfg(unix)]
         "control-block-ack-term" => {
@@ -772,8 +786,7 @@ fn main() {
             let mut sock = crate::ack::connect_control(addr).unwrap();
             sock.write_all(tag.as_bytes()).unwrap();
             sock.flush().unwrap();
-            let mut buf = [0u8; 1];
-            let _ = sock.read(&mut buf);
+            hold(&mut sock);
         }
         #[cfg(windows)]
         "spawn-grandchild-ignore-break" => {
@@ -786,8 +799,7 @@ fn main() {
             let mut sock = crate::ack::connect_control(&addr).unwrap();
             sock.write_all(b"R").unwrap();
             sock.flush().unwrap();
-            let mut buf = [0u8; 1];
-            let _ = sock.read(&mut buf);
+            hold(&mut sock);
         }
         #[cfg(windows)]
         "control-block-ack-break" => {
@@ -1464,8 +1476,7 @@ fn main() {
             let mut sock = crate::ack::connect_control(addr).unwrap();
             sock.write_all(tag.as_bytes()).unwrap();
             sock.flush().unwrap();
-            let mut buf = [0u8; 1];
-            let _ = sock.read(&mut buf);
+            hold(&mut sock);
         }
         "is-elevated-report" => {
             println!("{}", if cosca::elevation::is_elevated() { "1" } else { "0" });

@@ -397,12 +397,17 @@ async fn drop_after_an_incomplete_tree_walk_kill_and_wait_still_warns() {
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let mut cmd = Command::new();
-    cmd.args(["sleep", "300"]);
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
     cmd.contain_with(ContainMode::TreeWalk);
     let mut child = cmd.spawn().expect("spawn");
+    let stdin = child.stdin().expect("stdin pipe");
     crate::containment::treewalk::fault::force_incomplete_once();
     child.kill_tree().expect("a tree walk reports Ok");
-    child.wait().await.expect("reap the root");
+    // Released after the kill and before the wait: a `kill_tree` that sends nothing lets the root
+    // exit by itself and fails here, instead of leaving the wait unbounded.
+    drop(stdin);
+    crate::test_child::assert_killed("the root", child.wait().await.expect("reap the root"));
 
     let mark = crate::log_capture::mark();
     drop(child);

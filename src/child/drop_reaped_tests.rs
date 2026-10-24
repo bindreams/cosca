@@ -151,17 +151,45 @@ fn dropping_an_exited_but_unreaped_process_group_child_still_kills_the_group() {
     assert_eq!(drop_warns_since(mark), []);
 }
 
-/// Real `killpg`: `kill_tree()` before `wait()` ends a descendant that outlives the root.
+/// Root `sh` prints `started` and exits, leaving a reader in its group that holds the stdin pipe
+/// the test keeps open. The reader is the one background process (`{ ...; } &` forks no second
+/// one), so it prints `eof` on stdout exactly when it was not killed first and the test later
+/// closes stdin.
+fn root_that_leaves_an_eof_reporter() -> Command {
+    let mut cmd = session(&[
+        "sh",
+        "-c",
+        "exec 3<&0; { read -r _; echo eof; } <&3 3<&- & echo started; exit 0",
+    ]);
+    cmd.stdin(Stdio::pipe_in()).expect("stdin pipe");
+    cmd.stdout(Stdio::pipe_out()).expect("stdout pipe");
+    cmd
+}
+
+/// Real `killpg`: `kill_tree()` before `wait()` ends a descendant that outlives the root. Stdin is
+/// closed after the kill, so a `kill_tree` that sends nothing lets the descendant report `eof`
+/// instead of leaving the read below unbounded. Mutant: `kill_tree` sends nothing.
 #[skuld::test]
 fn kill_tree_before_wait_ends_a_descendant_of_an_exited_root() {
-    let (child, mut pipes) = spawn_cat_tree();
+    let mut child = root_that_leaves_an_eof_reporter().spawn().expect("spawn");
+    assert_eq!(child.containment(), SESSION_CONTAINMENT);
+    let mut stdout = child.stdout().expect("stdout pipe");
+    let stdin = child.stdin().expect("stdin pipe");
+    let mut started = [0u8; 8];
+    stdout.read_exact(&mut started).expect("read `started`");
+    assert_eq!(&started, b"started\n");
 
     child.kill_tree().expect("kill_tree");
+    drop(stdin);
     let mut rest = Vec::new();
-    pipes
-        .stderr
+    stdout
         .read_to_end(&mut rest)
-        .expect("stderr reaches EOF once the cat is dead");
+        .expect("stdout reaches EOF once the descendant is gone");
+    assert_eq!(
+        String::from_utf8_lossy(&rest),
+        "",
+        "the descendant must be killed, not see stdin close"
+    );
     child.wait().expect("reap the root");
 }
 
@@ -422,12 +450,17 @@ fn drop_after_a_failed_kill_tree_and_wait_still_warns() {
 fn drop_after_an_incomplete_tree_walk_kill_and_wait_still_warns() {
     crate::log_capture::install();
     let mut cmd = Command::new();
-    cmd.args(["sleep", "300"]);
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(Stdio::pipe_in()).expect("stdin pipe");
     cmd.contain_with(ContainMode::TreeWalk);
-    let child = cmd.spawn().expect("spawn");
+    let mut child = cmd.spawn().expect("spawn");
+    let stdin = child.stdin().expect("stdin pipe");
     crate::containment::treewalk::fault::force_incomplete_once();
     child.kill_tree().expect("a tree walk reports Ok");
-    child.wait().expect("reap the root");
+    // Released after the kill and before the wait: a `kill_tree` that sends nothing lets the root
+    // exit by itself and fails here, instead of leaving the wait unbounded.
+    drop(stdin);
+    crate::test_child::assert_killed("the root", child.wait().expect("reap the root"));
 
     let mark = crate::log_capture::mark();
     drop(child);
