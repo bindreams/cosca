@@ -39,8 +39,12 @@
 //! would then signal that process's group. Another reaper in the process (`SIGCHLD` set to
 //! `SIG_IGN`, a `waitpid(-1)` reaper) can reap it before the caller gets a `Child` back.
 //! `kill_tree`/`terminate_tree` therefore look at the root through its handle first
-//! (`child::reaped_root_tree_signal`): a root reaped elsewhere gets no `killpg`. cgroup v2 names
-//! no pid and does not have this hole — prefer it when the guarantee matters.
+//! (`child::reaped_root_tree_signal`): a root shown reaped elsewhere gets no `killpg`. That look
+//! is not atomic with the sweep: a foreign reap after it is not seen, and every signal of the sweep
+//! (the `killpg`, `signal_direct`'s `kill`, and `verify`'s resends to the members it lists by that
+//! pgid) then goes out by a number another process may hold. After this handle's own reap, a pid that names no process is still
+//! signalled as the group's id. cgroup v2 names no pid and does not have this hole — prefer it
+//! when the guarantee matters.
 
 use std::io;
 
@@ -212,15 +216,10 @@ pub(crate) fn term_group(pgid: i32) -> Result<(), Error> {
 /// the broadcast/double-negation hazard this file's Background measures. A check placed after
 /// the dangerous syscall it claims to guard is not a guard.
 fn signal_group(pgid: i32, signal: Signal) -> Result<(), Error> {
-    // NOT a debug_assert!: unlike the reaped-root precondition in `Child::kill_tree`/
-    // `terminate_tree`, an invalid `pgid` reaching this function is a directly
-    // and deliberately TESTED, ordinary input-validation outcome, not a "should never happen"
-    // internal contract — `kill_group_and_term_group_reject_non_positive_pgid` (this file)
-    // calls this path with `0`/`-1`/`i32::MIN` on purpose and asserts a plain `Err`, not a
-    // panic. A `debug_assert!` here would turn that legitimate, always-possible defensive
-    // check into a test-build panic and break that test outright — the two are not the same
-    // kind of precondition, even though both guard "this input should not reach the syscall
-    // below."
+    // NOT a debug_assert!: an invalid `pgid` reaching this function is a directly and deliberately
+    // TESTED, ordinary input-validation outcome, not a "should never happen" internal contract —
+    // `kill_group_and_term_group_reject_non_positive_pgid` (this file) calls this path with
+    // `0`/`-1`/`i32::MIN` on purpose and asserts a plain `Err`, not a panic.
     if pgid <= 0 {
         return Err(Error::Unassessable {
             detail: format!(

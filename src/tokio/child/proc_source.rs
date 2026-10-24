@@ -580,11 +580,21 @@ impl ProcSource {
     ///   (a spawn whose unique id was not adopted, see `adopted_id`) is `Unknown`: its unique-id
     ///   read was refused, and nothing shows the pid still names it.
     ///
-    /// A child tokio reaped (`id()` is `None`) and a forgotten backend are `Reaped`.
+    /// A child tokio reaped (`id()` is `None`), and a backend forgotten as reaped elsewhere, are
+    /// `Reaped`. A backend forgotten because the child could not be shown to be ours is `Unknown`:
+    /// the child may still be running.
     #[cfg(unix)]
     pub(crate) fn state(&self) -> RootState {
         match self {
-            ProcSource::Foreign { .. } => RootState::Reaped,
+            ProcSource::Foreign {
+                reaped_elsewhere: true, ..
+            } => RootState::Reaped,
+            ProcSource::Foreign {
+                reaped_elsewhere: false,
+                ..
+            } => RootState::Unknown(std::io::Error::other(
+                "its handle was forgotten because it could not be shown to be ours, so it may still be running",
+            )),
             ProcSource::Tokio { child, .. } if child.id().is_none() => RootState::Reaped,
             ProcSource::Tokio { child, .. } => self.state_of(child),
         }
