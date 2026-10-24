@@ -76,7 +76,7 @@ pub fn subst_cwd(base: &str, child: &str) {
         std::fs::create_dir_all(dir.join("sub")).expect("create the drive's directories");
         std::fs::write(dir.join("sub").join(marker), b"").expect("plant the marker");
     }
-    let first = Subst::map_free(&d1).expect("map a free letter to <d1>");
+    let mut first = Subst::map_free(&d1).expect("map a free letter to <d1>");
     let drive = first.drive().to_owned();
     let render = Render(vec![
         (d1.display().to_string(), "<d1>".to_owned()),
@@ -95,10 +95,10 @@ pub fn subst_cwd(base: &str, child: &str) {
     }
     set_cwd(d.as_os_str()).expect("leave the removed drive");
 
-    let first = Subst::new(&drive, &d1, 0).unwrap_or_else(|e| panic!("map {drive} to <d1> again: {e}"));
+    let mut first = Subst::new(&drive, &d1).unwrap_or_else(|e| panic!("map {drive} to <d1> again: {e}"));
     let set = set_cwd(OsStr::new(&sub));
     println!("repointed_set={}", outcome(&set));
-    let second = Subst::new(&drive, &d2, 1).unwrap_or_else(|e| panic!("map {drive} to <d2> over <d1>: {e}"));
+    let mut second = Subst::over(&first, &d2).unwrap_or_else(|e| panic!("map {drive} to <d2> over <d1>: {e}"));
     assert!(
         Path::new(&format!(r"{drive}\sub\marker-d2")).exists(),
         "{drive} was re-pointed at <d2>"

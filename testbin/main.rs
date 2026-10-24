@@ -62,6 +62,10 @@ mod env_block;
 mod handles;
 
 #[cfg(windows)]
+#[path = "full_path.rs"]
+mod full_path;
+
+#[cfg(windows)]
 #[path = "long_image.rs"]
 mod long_image;
 
@@ -1266,6 +1270,10 @@ fn main() {
         #[cfg(windows)]
         "try-env-block" => env_block::try_block(&args[2..]),
         #[cfg(windows)]
+        "with-env-block" => env_block::with_block(&args[2..]),
+        #[cfg(windows)]
+        "full-path" => full_path::run(&args[2]),
+        #[cfg(windows)]
         "spawn-frozen-report" => frozen::spawn_frozen_report(&args[2], &args[3]),
         #[cfg(all(windows, feature = "tokio"))]
         "spawn-frozen-report-async" => frozen::spawn_frozen_report_async(&args[2], &args[3]),
@@ -1283,8 +1291,6 @@ fn main() {
         "spawn-report-pid" => frozen::spawn_report_pid(&args[2]),
         #[cfg(windows)]
         "report-pid" => frozen::report_pid(&args[2]),
-        #[cfg(windows)]
-        "with-env-block" => env_block::with_block(&args[2..]),
         #[cfg(windows)]
         "env-set-probe" => env_block::set_probe(&args[2..]),
         #[cfg(windows)]

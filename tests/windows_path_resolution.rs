@@ -38,7 +38,7 @@
 //! write inside a `tempfile` directory of their own and launch `cosca_testbin` and its image
 //! copies, with these exceptions: one canary has std create `cmd.exe` SUSPENDED and terminates it
 //! before it runs; `m5_what_std_loads` runs `whoami` and `find` from System32, launches `winget
-//! --version` and reaches its temp directory through `\\localhost\<drive>$`;
+//! --version` and reaches its temp directory through `\\localhost\<drive>$`, as `m7_` does;
 //! `m19_app_execution_aliases` also launches `winget --version` and makes a directory of its own
 //! beside `%LOCALAPPDATA%\Microsoft\WindowsApps`, which it removes explicitly: a failed removal
 //! fails the test. The symlink rows of `m19_` need the symlink privilege or Developer Mode, and
@@ -61,6 +61,9 @@ mod devices;
 #[cfg(windows)]
 #[path = "windows_path_resolution/dots_and_spaces.rs"]
 mod dots_and_spaces;
+#[cfg(windows)]
+#[path = "windows_path_resolution/drive_rule.rs"]
+mod drive_rule;
 #[cfg(windows)]
 #[path = "windows_path_resolution/env_set.rs"]
 mod env_set;

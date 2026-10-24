@@ -172,8 +172,9 @@ windows-shell-execute = { max-threads = 1 }
 windows-elevation-routes = { max-threads = 1 }
 
 # The `DRIVE_MAPPING` tests in `tests/windows_process_cwd.rs` each map a drive letter for the whole
-# logon session, so two at once would each read the other's mapping. This group runs that whole
-# binary one test at a time, so a new drive-mapping test is covered without a filter naming it.
+# logon session, so two at once would contend for the same letters and see each other's mappings.
+# This group runs that whole binary one test at a time, so a new drive-mapping test is covered
+# without a filter naming it.
 windows-drive-mapping = { max-threads = 1 }
 
 [[profile.default.overrides]]
