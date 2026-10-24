@@ -162,7 +162,10 @@ jobs:
             runner: ubuntu-26.04
             # ubuntu:26.04
             root_image: ubuntu@sha256:f144425ff09be612d6d9ad965196e9cdc23dae1f42110a8a11a3e9a8198759f7
-            timeout: 35
+            # Slowest of 4 main runs: 34.1 min, with a 7.3 min virtme-ng install (the others: 22 to 25 min, 10 to 15 s).
+            # 51 is 1.5x that, as for the Windows lanes. The shim steps stay in this job: a separate job would
+            # be a new required check in the repository ruleset.
+            timeout: 51
             target: x86_64-unknown-linux-gnu
             other: aarch64-unknown-linux-gnu
             nextest: exec python3 .github/scripts/run-nextest.py
@@ -1033,6 +1036,8 @@ jobs:
       - name: "Shim on Linux: install virtme-ng and allow KVM"
         id: shim_vng
         if: ${{ !cancelled() && matrix.os == 'linux' && matrix.arch == 'amd64' }}
+        # Measured 0.2 to 9.5 min; this keeps a hung apt or pipx from consuming the whole job bound.
+        timeout-minutes: 15
         shell: bash
         env:
           VIRTME_NG_VERSION: "1.30"
