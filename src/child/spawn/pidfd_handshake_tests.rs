@@ -1371,22 +1371,31 @@ fn a_child_that_ended_is_covered_not_described() {
     assert_eq!(reaping, Reaping::Covered, "a collected front");
 }
 
-/// `conclude` on a failed tokio-style spawn whose child is a live `cat`, with the peeks `looks`
-/// answering in order (conclude's own first, then the teardown's), as a foreign reaper between
-/// them would. The `cat` is cleaned up here.
-fn conclude_a_live_cat_with_looks(looks: impl IntoIterator<Item = std::io::Result<Peek>>) -> ChildFate {
-    let (mut cat, pidfd) = cat_with_pidfd();
+/// `conclude` on a failed tokio-style spawn whose child is a live `cat` (`front` says whether it is
+/// a front), with the peeks `looks` answering in order (conclude's own first, then the teardown's),
+/// as a foreign reaper between them would. The `cat` is returned, for the caller to clean up.
+fn conclude_a_live_cat(
+    front: super::LeftFront,
+    looks: impl IntoIterator<Item = std::io::Result<Peek>>,
+) -> (std::process::Child, ChildFate) {
+    let (cat, pidfd) = cat_with_pidfd();
     let forced = force_peeks(looks);
     let (_, fate) = super::conclude(
         Err::<NoChild, _>(std::io::Error::other("tokio failed")),
         Outcome::Opened(pidfd),
-        super::LeftFront::NotAFront,
+        front,
     )
     .err()
     .expect("the spawn fails")
     .expect_may_have_started_with();
     assert_peeks_exhausted();
     drop(forced);
+    (cat, fate)
+}
+
+/// [`conclude_a_live_cat`] for a child that is no front, whose teardown the looks leave alive.
+fn conclude_a_live_cat_with_looks(looks: impl IntoIterator<Item = std::io::Result<Peek>>) -> ChildFate {
+    let (mut cat, fate) = conclude_a_live_cat(super::LeftFront::NotAFront, looks);
     cat.kill().expect("kill the cat");
     cat.wait().expect("collect the cat");
     fate
@@ -1438,6 +1447,66 @@ fn a_failed_first_look_leaves_a_later_gone_unknown() {
         Err(std::io::Error::other("forced peek failure")),
         Ok(Peek::Foreign(Foreign::Gone)),
     ]);
+    assert_eq!(fate, ChildFate::Unknown);
+}
+
+/// A teardown that finds the child live, after a first look that failed, kills and reaps it: its
+/// answer is `Reaped`, not the `Unknown` a failed look gives a `Gone`.
+///
+/// Mutant: a failed first look makes every later fate `Unknown`.
+#[skuld::test]
+fn a_failed_first_look_followed_by_a_real_teardown_is_reaped() {
+    let (cat, fate) = conclude_a_live_cat(
+        super::LeftFront::NotAFront,
+        [Err(std::io::Error::other("forced peek failure"))],
+    );
+    assert_eq!(fate, ChildFate::Reaped);
+    // Reaped through its pidfd.
+    drop(cat);
+}
+
+/// The same for a first look that saw the child uncollected: a later `Reaped` is the teardown's own.
+///
+/// Mutant: the pass-through arm of `FirstLook::fate` maps a fate other than `Gone` to `Unknown` or
+/// `Collected`.
+#[skuld::test]
+fn an_uncollected_first_look_leaves_a_real_teardown_reaped() {
+    let (cat, fate) = conclude_a_live_cat(super::LeftFront::NotAFront, [Ok(Peek::Running)]);
+    assert_eq!(fate, ChildFate::Reaped);
+    drop(cat);
+}
+
+/// A first look that found the child collected makes only a `Gone` `Collected`: a teardown that then
+/// finds the child live and reaps it answers `Reaped`.
+///
+/// Mutant: a collected first look makes every later fate `Collected`.
+#[skuld::test]
+fn a_collected_first_look_followed_by_a_live_child_is_not_collected() {
+    let (cat, fate) = conclude_a_live_cat(super::LeftFront::NotAFront, [Ok(Peek::Foreign(Foreign::Gone))]);
+    assert_eq!(fate, ChildFate::Reaped);
+    drop(cat);
+}
+
+/// An elevation front whose first look failed is taken to be there, and sent nothing; a foreign reap
+/// the front arm then finds blames nobody and names no time: `Unknown`.
+///
+/// Mutant: the front arm leaves such a `Gone` as `Gone` (or maps it to `Collected`).
+#[skuld::test]
+fn a_failed_first_look_of_a_front_leaves_a_later_gone_unknown() {
+    let (mut cat, pidfd) = cat_with_pidfd();
+    drop(cat.stdin.take());
+    cat.wait().expect("the foreign reaper collects the child");
+    let forced = force_peeks([Err(std::io::Error::other("forced peek failure"))]);
+    let (_, fate) = super::conclude(
+        Err::<NoChild, _>(std::io::Error::other("tokio failed")),
+        Outcome::Opened(pidfd),
+        sudo_front(),
+    )
+    .err()
+    .expect("the spawn fails")
+    .expect_may_have_started_with();
+    assert_peeks_exhausted();
+    drop(forced);
     assert_eq!(fate, ChildFate::Unknown);
 }
 

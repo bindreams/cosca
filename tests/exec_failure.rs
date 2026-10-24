@@ -80,6 +80,19 @@ fn dishonest(error: &cosca::error::Error, kind: std::io::ErrorKind, errno: Optio
         cause = source;
     }
     let message = error.to_string();
+    // On Linux the handshake holds the child's pidfd, finds it already collected (the failed spawn
+    // collected it), and says only that.
+    #[cfg(target_os = "linux")]
+    match error {
+        Error::MayHaveStarted { fate, .. } if *fate != cosca::error::ChildFate::Collected => {
+            return Some(format!("its fate is {fate:?}, not Collected: {error:?}"));
+        }
+        Error::MayHaveStarted { .. } if !message.contains("already been collected") => {
+            return Some(format!("does not say the child was already collected: {message}"));
+        }
+        Error::MayHaveStarted { .. } => {}
+        _ => return Some(format!("is not MayHaveStarted: {error:?}")),
+    }
     if message.contains("reaped by someone else") {
         Some(format!("blames a reaper: {message}"))
     } else if !matches!(cause, Error::Io(e) if e.kind() == kind && e.raw_os_error() == errno) {
@@ -128,6 +141,10 @@ async fn a_failed_tokio_exec_blames_no_foreign_reaper() {
 /// A failed exec without a cgroup leaf warns of no abandoned child: the handshake holds the child's
 /// pidfd, and has torn it down or found it collected.
 ///
+/// A warning is found by the exec's own OS error, which the warning quotes, so rewording the rest
+/// cannot hide one. A warning this test logs itself for each error is the control: it must be the
+/// only one seen, or the capture saw nothing.
+///
 /// Mutant: a spawn with no leaf warns that its child "was left running and nothing can reach it".
 #[cfg(all(feature = "tokio", target_os = "linux"))]
 #[skuld::test]
@@ -149,11 +166,19 @@ async fn a_failed_tokio_exec_without_a_leaf_warns_of_no_abandoned_child() {
             cmd.spawn().expect_err("the exec fails");
         }
     }
-    assert_eq!(
-        common::levels_since(mark, "tokio spawn failed"),
-        Vec::<log::Level>::new(),
-        "a failed exec abandoned no child, so nothing is warned"
-    );
+    for (_, _, errno) in &programs {
+        let os_error = std::io::Error::from_raw_os_error(errno.expect("Linux reports an OS code")).to_string();
+        log::warn!("capture control: {os_error}");
+        let warned: Vec<_> = common::levels_since(mark, &os_error)
+            .into_iter()
+            .filter(|level| *level <= log::Level::Warn)
+            .collect();
+        assert_eq!(
+            warned,
+            [log::Level::Warn],
+            "a failed exec abandoned no child, so only the control warns of {os_error:?}"
+        );
+    }
 }
 
 /// [`a_failed_tokio_exec_blames_no_foreign_reaper`] in a cgroup leaf, which the failed spawn removes.

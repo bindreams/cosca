@@ -299,6 +299,88 @@ async fn a_post_fork_tokio_failure_of_an_unreported_child_without_a_leaf_warns_i
     );
 }
 
+/// A tokio spawn with no cgroup leaf whose child could not open its own pidfd: the child aborts, so
+/// `std`'s spawn fails and collects it, but no pidfd names it and the handshake cannot say so. The
+/// spawn warns, once, that the child may be left unreaped, and the child is in fact collected.
+///
+/// Mutant: a failed spawn whose helper reported `Failed(_, None)` answers `Covered`, and warns of
+/// nothing.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn a_post_fork_tokio_failure_of_a_child_that_could_not_open_its_pidfd_warns_it_may_be_unreaped() {
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let mut cmd = blocker();
+    cmd.contain_with(crate::ContainMode::TreeWalk);
+    let mark = crate::log_capture::mark();
+    let forced = crate::wait::backend::fault::force_pidfd_open_script([None, Some(rustix::io::Errno::NFILE)]);
+    let error = cmd
+        .spawn()
+        .expect_err("a child that cannot open its pidfd fails the spawn");
+    drop(forced);
+    crate::child::spawn::failure::expect_not_started(error);
+    let warned = crate::log_capture::records_since_on_current_thread(mark, "tokio spawn failed");
+    assert_eq!(
+        warned.iter().map(|(level, _)| *level).collect::<Vec<_>>(),
+        [log::Level::Warn],
+        "one warning that the child may be left unreaped: {warned:?}"
+    );
+    assert!(warned[0].1.contains("left unreaped"), "{warned:?}");
+    crate::child::spawn::pidfd_handshake::pidfd_handshake_tests::assert_no_child_of_this_thread(
+        "`std` collected the child whose spawn failed",
+    );
+}
+
+/// A tokio spawn with no cgroup leaf that `std` answered with a child, and whose exit the handshake
+/// could not watch: the handle tokio returned reaps the child, so nothing is warned, and the child
+/// is reaped.
+///
+/// Mutant: a returned handle with an unwatched child answers `Uncovered`, and warns the child may be
+/// left unreaped.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn a_post_fork_tokio_failure_of_an_unwatched_child_is_left_to_tokios_handle() {
+    use crate::child::spawn::pidfd_handshake::fault::{
+        after_spawn_returns_do, arm_child_fault, fail_watch, ChildFault, WatchFault,
+    };
+
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let mut cmd = blocker();
+    cmd.contain_with(crate::ContainMode::TreeWalk);
+    let mark = crate::log_capture::mark();
+    let named = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let name = after_spawn_returns_do({
+        let named = std::rc::Rc::clone(&named);
+        move |pid| {
+            let pid = rustix::process::Pid::from_raw(pid.expect("std returned a child") as i32).expect("a pid");
+            // A zombie is still this process's child, so the pidfd names it.
+            *named.borrow_mut() =
+                Some(rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()).expect("pidfd_open"));
+        }
+    });
+    let killed = arm_child_fault(ChildFault::Sigkill);
+    let watch = fail_watch(WatchFault::Open(rustix::io::Errno::MFILE));
+    let error = cmd
+        .spawn()
+        .expect_err("a child whose exit cannot be watched fails the spawn");
+    drop(watch);
+    drop(killed);
+    drop(name);
+    let error = crate::child::spawn::failure::expect_not_started(error);
+    assert!(error.to_string().contains("its exit could not be watched"), "{error}");
+    let pidfd = named.borrow_mut().take().expect("the hook opened a pidfd on the child");
+    // tokio's driver reaps the dropped handle's child; turn it until it has, and never before.
+    while !reaped_through(&pidfd) {
+        ::tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        crate::log_capture::records_since_on_current_thread(mark, "tokio spawn failed"),
+        Vec::<(log::Level, String)>::new(),
+        "tokio's handle reaps the child, so nothing is warned"
+    );
+}
+
 /// The abandoned-child warning is at `warn` on every call, including a repeat, through the real
 /// entry point.
 #[skuld::test]
