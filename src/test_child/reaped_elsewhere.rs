@@ -61,6 +61,7 @@ pub(crate) fn foreign_reaped_group_root() -> (crate::Child, u32) {
 }
 
 /// Every record of the tree ops' skip for a root whose handle was forgotten unproven contains this.
+#[cfg(feature = "tokio")]
 pub(crate) const MAY_STILL_RUN: &str = "may still be running";
 
 /// The text of every `warn` since `mark` on this thread.
