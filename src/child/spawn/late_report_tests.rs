@@ -1,7 +1,7 @@
 //! The macOS sync spawn of a child whose unique-id report came after the spawn returned.
 //!
 //! The report hook is registered first, so the child writes its report or dies without one, and the
-//! spawn waits on the pipe for whichever comes (see `unique_report::Channel::run`). A report that
+//! spawn waits on the pipe for whichever comes (see `unique_report::FirstRead::finish`). A report that
 //! came late means std's own spawn is not trusted, so the child is torn down through its unique id.
 
 use std::cell::Cell;

@@ -512,7 +512,7 @@ pub(crate) fn adopted_id(report: Report, pid: u32) -> Result<u64, NotAdopted> {
             ))),
         ),
         Report::Unwritten => {
-            debug_assert!(false, "`Channel::run` waits out an unwritten report");
+            debug_assert!(false, "`FirstRead::finish` waits out an unwritten report");
             not(
                 Unadoptable::Unverified,
                 Error::Unassessable {
@@ -836,7 +836,7 @@ pub(crate) mod seams {
         PARENT_READ_UNWRITTEN.with(|f| f.replace(false))
     }
 
-    /// While the guard lives, the wait for a report on this thread answers `ReadFailed` at once, so a
+    /// While the guard lives, the wait for a report on this thread answers `WaitFailed` at once, so a
     /// test sees by assertion that the wait was entered.
     pub(crate) fn refuse_the_wait() -> RefusedWait {
         WAIT_REFUSED.with(|f| f.set(true));
