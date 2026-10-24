@@ -1340,6 +1340,7 @@ fn main() {
                 Ok(()) => "Ok".to_string(),
                 Err(e) => describe(&e),
             };
+            let exit_code = |s: cosca::ExitStatus| s.code().map_or_else(|| "none".to_string(), |c| c.to_string());
 
             // (1) terminate_tree — signal-only, so delivery is observable without escalation.
             let (c1, mut ack1) = spawn_acker("R");
@@ -1366,22 +1367,37 @@ fn main() {
             // and fails as an assertion rather than as a suite hang. The post-kill read/reap
             // only runs when the kill itself succeeded — on a failed kill the child is still
             // alive and blocked, so both would block forever and discard the kill error.
+            //
+            // A `kill_tree` that sent nothing leaves the acker alive and blocked on the socket
+            // this helper holds, so each blocking step after the kill first lets go of the
+            // socket: the acker then leaves on EOF (exit code 0) where a killed one has exit
+            // code 1, and the report carries the code for the test to assert on.
             let (terminate_break, kill_tree) = if c1_in_console && terminate == "Ok" {
                 let seen = saw_break(&mut ack1);
                 (seen, classify(c1.kill_tree()))
             } else {
                 let killed = classify(c1.kill_tree());
-                let seen = if killed == "Ok" { saw_break(&mut ack1) } else { "K" };
+                let seen = if killed == "Ok" {
+                    // Half-close: the read below still collects the acker's last word, and a
+                    // live acker (no kill sent) gets EOF and leaves instead of blocking it.
+                    let _ = ack1.shutdown(std::net::Shutdown::Write);
+                    saw_break(&mut ack1)
+                } else {
+                    "K"
+                };
                 (seen, killed)
             };
-            if kill_tree == "Ok" {
-                c1.wait().expect("reap probe root 1");
-            }
+            let acker1_exit = if kill_tree == "Ok" {
+                drop(ack1);
+                exit_code(c1.wait().expect("reap probe root 1"))
+            } else {
+                "none".to_string()
+            };
 
             // (2) graceful_shutdown_tree — the escalation trio, ZERO grace. Delivery is proved
             // by (1); this leg proves the trio's own classification and that a failure leaves
             // the tree untouched.
-            let (c2, _ack2) = spawn_acker("S");
+            let (c2, ack2) = spawn_acker("S");
             let graceful = match c2.graceful_shutdown_tree(Duration::ZERO) {
                 Ok(_) => "Ok".to_string(),
                 Err(e) => describe(&e),
@@ -1390,14 +1406,17 @@ fn main() {
             // "Skipped" — NOT "Ok": nothing was called on this path, so reporting a success
             // would be a tautology. Whether the tree really went away is carried by the
             // measured `alive_after_graceful`.
-            let graceful_cleanup = if graceful == "Ok" {
-                "Skipped".to_string()
+            let (graceful_cleanup, graceful_cleanup_exit) = if graceful == "Ok" {
+                ("Skipped".to_string(), "none".to_string())
             } else {
                 let killed = classify(c2.kill_tree());
-                if killed == "Ok" {
-                    c2.wait().expect("reap probe root 2"); // a failed sweep leaves it alive
-                }
-                killed
+                let exit = if killed == "Ok" {
+                    drop(ack2); // a failed sweep leaves it alive, so keep the socket then
+                    exit_code(c2.wait().expect("reap probe root 2"))
+                } else {
+                    "none".to_string()
+                };
+                (killed, exit)
             };
 
             let mut line = String::new();
@@ -1405,8 +1424,9 @@ fn main() {
                 line,
                 "console={console} c1_in_console={} containment={containment_tag} \
                  terminate_tree={terminate} alive_after_terminate={alive_after_terminate} \
-                 terminate_break={terminate_break} kill_tree={kill_tree} graceful={graceful} \
-                 alive_after_graceful={alive_after_graceful} graceful_cleanup={graceful_cleanup}",
+                 terminate_break={terminate_break} kill_tree={kill_tree} acker1_exit={acker1_exit} \
+                 graceful={graceful} alive_after_graceful={alive_after_graceful} \
+                 graceful_cleanup={graceful_cleanup} graceful_cleanup_exit={graceful_cleanup_exit}",
                 u8::from(c1_in_console),
             )
             .unwrap();

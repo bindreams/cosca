@@ -25,15 +25,17 @@ pub const ECHO_HELD_ENV: &str = "COSCA_TEST_ECHO_HELD";
 /// member may still echo for a moment after the kill returned.
 pub fn assert_dead(sock: &mut TcpStream, who: &str) {
     use std::io::ErrorKind::{BrokenPipe, ConnectionAborted, ConnectionReset};
-    match sock.write_all(b"p") {
-        Ok(()) => {}
-        Err(e) if matches!(e.kind(), BrokenPipe | ConnectionReset | ConnectionAborted) => return,
-        Err(e) => panic!("writing to {who} failed unexpectedly: {e}"),
+    // A dead peer can surface on the write (the FIN or RST already arrived) or, if the write went
+    // through, on the read: macOS (BSD `soreceive`) checks `so_error` before end-of-file, so the
+    // read can return `ECONNRESET` or `EPIPE` instead of `Ok(0)`. Every write error means the
+    // peer is gone; only an echoed byte means it is alive.
+    if sock.write_all(b"p").is_err() {
+        return;
     }
     let mut b = [0u8; 1];
     match sock.read(&mut b) {
         Ok(0) => {}
-        Err(e) if matches!(e.kind(), ConnectionReset | ConnectionAborted) => {}
+        Err(e) if matches!(e.kind(), ConnectionReset | ConnectionAborted | BrokenPipe) => {}
         other => panic!("{who} must be dead after the kill, but answered: {other:?}"),
     }
 }

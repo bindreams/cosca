@@ -1466,7 +1466,10 @@ fn linux_cgroup_v2_kill_on_drop_false_removes_the_leaf_of_a_drained_tree(#[fixtu
 ///
 /// Unlike `linux_cgroup_v2_kill_on_drop_false_removes_the_leaf_of_a_drained_tree`, this test does
 /// NOT call `wait_tree()` before dropping: an explicit wait would force the drain itself and mask
-/// exactly the race under test. `drop(child)` follows `kill_tree()` directly.
+/// exactly the race under test. Between `kill_tree()` and `drop(child)` it only probes that both
+/// members are dead (`assert_dead`), which a `kill_tree` that sent nothing would otherwise turn
+/// into a hang in `child.wait()`; the probes return once the members' sockets close, a little
+/// before the kernel finishes the drain.
 ///
 /// This is a real-kernel regression check, not the deterministic proof of the fix: the leaf being
 /// gone when `drop` returns is also what the pre-fix single, unwaited `rmdir` would produce if the

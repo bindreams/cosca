@@ -7,8 +7,9 @@
 //! Both required behaviors need a real, provably-alive descendant tree, not merely "hasn't been
 //! reaped yet": `control-block`'s EOF-on-death is proof of death, never proof of life. Both
 //! members here run the testbin's `control-echo-pid` round-trip (via `spawn-grandchild-echo`),
-//! mirroring `tests/macos_fdmarker.rs`'s `Member` (alive = a real write/read round trip; dead =
-//! EOF/reset on a socket the test itself still holds).
+//! mirroring `tests/macos_fdmarker.rs`'s `Member` (alive = a real write/read round trip). Death is
+//! proven by the exit event in `kill_tree_reaps_every_descendant`, because a job kill only starts
+//! termination.
 
 #[cfg(windows)]
 use std::io::{BufRead, BufReader, Read, Write};
@@ -70,26 +71,30 @@ impl Member {
         assert_eq!(&b, b"x", "{who} echoed {b:?} instead of the byte sent");
     }
 
-    /// Dead, proven by a write failure OR a read failure/EOF on a socket the test still holds.
+    /// Dead, proven by [`common::assert_dead`]: a write failure, or EOF or a reset on the read.
     fn assert_dead(&mut self, who: &str) {
-        if self.sock.write_all(b"x").is_err() {
-            return; // the peer already closed its end: dead, as expected
-        }
-        let mut b = [0u8; 1];
-        match self.sock.read(&mut b) {
-            Ok(0) => {} // EOF: dead, as expected
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
-                ) =>
-            {
-                // the kernel resolved the race the other way (RST before FIN): also dead
-            }
-            Ok(n) => panic!("{who} (pid {}) must be dead; it echoed {n} byte(s) instead", self.pid),
-            Err(e) => panic!("{who} (pid {}): unexpected control-socket error: {e}", self.pid),
-        }
+        common::assert_dead(&mut self.sock, &format!("{who} (pid {})", self.pid));
     }
+}
+
+#[cfg(windows)]
+/// An exit watch on `member` for [`assert_killed`], opened while the member is alive. It shares
+/// `member`'s socket, which stays open until [`assert_killed`] releases it.
+fn watch(member: &Member) -> common::Member {
+    common::Member::new(member.sock.try_clone().expect("clone the control socket"), member.pid)
+}
+
+#[cfg(windows)]
+/// Assert that the kill that just ran killed every watched member. `TerminateJobObject` and the
+/// close of the last job handle only START termination, so a write/read probe could still be
+/// answered by a member about to die. Releasing `held` (the test's own sockets, which keep the
+/// members' peers open) and waiting for each exit code ends either way: a member the kill missed
+/// leaves on the release with code `0`, and the assertion on code `1` fails.
+fn assert_killed(watched: Vec<(common::Member, &str)>, held: [&Member; 2]) {
+    for member in held {
+        let _ = member.sock.shutdown(std::net::Shutdown::Both);
+    }
+    common::assert_members_killed(watched);
 }
 
 #[cfg(windows)]
@@ -274,10 +279,13 @@ fn kill_tree_reaps_every_descendant() {
     root_member.assert_alive("the root, before teardown");
     grand_member.assert_alive("the grandchild, before teardown");
 
+    let watched = vec![
+        (watch(&root_member), "the root, after kill_tree"),
+        (watch(&grand_member), "the grandchild, after kill_tree"),
+    ];
     job.kill_tree().expect("kill_tree");
 
-    root_member.assert_dead("the root, after kill_tree");
-    grand_member.assert_dead("the grandchild, after kill_tree");
+    assert_killed(watched, [&root_member, &grand_member]);
 }
 
 #[cfg(windows)]

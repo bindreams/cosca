@@ -35,34 +35,10 @@ impl Member {
         assert_eq!(&b, b"x", "{who} echoed {b:?} instead of the byte sent");
     }
 
-    /// Dead, proven by a write failure OR a read failure/EOF on a socket the test still holds.
-    /// Write first, exactly like `assert_alive` (`control-echo-pid` only speaks when spoken to,
-    /// so a bare read would block forever against a still-alive peer). A dead peer can surface
-    /// EITHER way depending on which side of the TCP teardown the kernel processes first: the
-    /// probe write can fail immediately (EPIPE/ECONNRESET, if the FIN was already queued), OR
-    /// it can succeed and the FOLLOWING read then sees the connection reset (BSD `soreceive`
-    /// checks `so_error` before end-of-file, so a dead peer's `read` can return `ECONNRESET`
-    /// rather than `Ok(0)`) or plain EOF (`Ok(0)`, if the FIN direction won the race instead).
-    /// All three are proof of death; only "the read returns an actual echoed byte" is proof of
-    /// life, and that alone panics.
+    /// Dead, proven by [`common::assert_dead`] (a write failure, or EOF or a reset on the read,
+    /// on a socket the test still holds); only an echoed byte is proof of life.
     fn assert_dead(&mut self, who: &str) {
-        if self.sock.write_all(b"x").is_err() {
-            return; // the peer already closed its end: dead, as expected
-        }
-        let mut b = [0u8; 1];
-        match self.sock.read(&mut b) {
-            Ok(0) => {} // EOF: dead, as expected
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
-                ) =>
-            {
-                // The kernel resolved the race the other way (RST before FIN): also dead.
-            }
-            Ok(n) => panic!("{who} (pid {}) must be dead; it echoed {n} byte(s) instead", self.pid),
-            Err(e) => panic!("{who} (pid {}): unexpected control-socket error: {e}", self.pid),
-        }
+        common::assert_dead(&mut self.sock, &format!("{who} (pid {})", self.pid));
     }
 }
 
