@@ -128,20 +128,29 @@ pub enum Transition {
 
 impl Host {
     /// The facts for a request naming `backend` and `auth`, which decide whether `pkexec` is asked
-    /// its version.
-    pub fn detect(backend: Backend, auth: &Auth) -> Host {
+    /// its version. The backends are looked for on `path_var` (`None`: none is found), and
+    /// `elevated` is the caller's privilege. Windows reads both itself.
+    pub fn detect(backend: Backend, auth: &Auth, path_var: Option<&std::ffi::OsStr>, elevated: bool) -> Host {
         #[cfg(unix)]
         {
-            super::posix::detect(backend, auth)
+            super::posix::detect_with(
+                path_var,
+                super::posix::host_os(),
+                elevated,
+                backend,
+                auth,
+                |p| std::fs::canonicalize(p),
+                super::posix::run_version_probe,
+            )
         }
         #[cfg(windows)]
         {
-            let _ = (backend, auth);
+            let _ = (backend, auth, path_var, elevated);
             super::windows::detect()
         }
         #[cfg(not(any(unix, windows)))]
         {
-            let _ = (backend, auth);
+            let _ = (backend, auth, path_var, elevated);
             Host {
                 elevated: false,
                 has_tty: false,

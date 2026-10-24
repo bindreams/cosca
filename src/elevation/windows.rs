@@ -364,7 +364,7 @@ fn elevated_params(argv: &[OsString]) -> Result<OsString, Error> {
 // Both the sync (`spawn_elevated`) and async spawn arms route an elevated `Command` here.
 pub(crate) fn launch_runas(cmd: &Command) -> Result<RunasOutcome, SpawnFailure> {
     let request = cmd.elevation_request();
-    launch_runas_with_host(cmd, &Host::detect(request.backend, &request.auth))
+    launch_runas_with_host(cmd, &Host::detect(request.backend, &request.auth, None, is_elevated()))
 }
 
 /// The validated `SHELLEXECUTEINFOW` payload: every string field, NUL-terminated, plus the show

@@ -153,17 +153,50 @@ fn is_elevated_matches_effective_uid_ground_truth() {
     assert_eq!(super::is_elevated(), euid0, "is_elevated disagreed with geteuid()==0");
 }
 
+/// Detection looks for the backends on the `PATH` it is handed, not on this process's.
+#[cfg(unix)]
+#[skuld::test]
+fn detect_finds_backends_on_the_path_it_is_given() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sudo = dir.path().join("sudo");
+    std::fs::write(
+        &sudo,
+        "#!/bin/sh
+",
+    )
+    .expect("write the fake sudo");
+    std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let h = super::plan::Host::detect(
+        super::Backend::Auto,
+        &super::Auth::Interactive,
+        Some(dir.path().as_os_str()),
+        false,
+    );
+    assert_eq!(h.available.sudo.as_deref(), Some(sudo.as_path()));
+}
+
+/// Detection reports the privilege it is handed, not this process's.
+#[cfg(unix)]
+#[skuld::test]
+fn detect_reports_the_elevation_it_is_given() {
+    for elevated in [true, false] {
+        let h = super::plan::Host::detect(super::Backend::Auto, &super::Auth::Interactive, None, elevated);
+        assert_eq!(h.elevated, elevated);
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn detect_reports_linux() {
-    let h = super::plan::Host::detect(super::Backend::Auto, &super::Auth::Interactive);
+    let h = super::plan::Host::detect(super::Backend::Auto, &super::Auth::Interactive, None, false);
     assert_eq!(h.os, super::plan::Os::Linux);
 }
 
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
 #[skuld::test]
 fn detect_reports_unix_os() {
-    let h = super::plan::Host::detect(super::Backend::Auto, &super::Auth::Interactive);
+    let h = super::plan::Host::detect(super::Backend::Auto, &super::Auth::Interactive, None, false);
     assert_eq!(h.os, super::plan::Os::Unix);
 }
 
@@ -172,7 +205,7 @@ fn detect_reports_unix_os() {
 #[cfg(target_os = "macos")]
 #[skuld::test]
 fn detect_reports_macos() {
-    let h = super::plan::Host::detect(super::Backend::Auto, &super::Auth::Interactive);
+    let h = super::plan::Host::detect(super::Backend::Auto, &super::Auth::Interactive, None, false);
     assert_eq!(h.os, super::plan::Os::MacOs);
     assert!(
         h.available.osascript.is_some(),

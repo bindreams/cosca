@@ -1,6 +1,11 @@
 #[skuld::test]
 fn detect_reports_windows_os() {
-    let h = crate::elevation::plan::Host::detect(crate::elevation::Backend::Auto, &crate::elevation::Auth::Interactive);
+    let h = crate::elevation::plan::Host::detect(
+        crate::elevation::Backend::Auto,
+        &crate::elevation::Auth::Interactive,
+        None,
+        false,
+    );
     assert_eq!(h.os, crate::elevation::plan::Os::Windows);
 }
 
