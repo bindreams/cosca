@@ -119,7 +119,7 @@ pub(crate) enum RootNumber {
     Empty,
     /// The pid may name another process, for the reason `why`: the root was reaped elsewhere, or
     /// its handle or its pid cannot be read. `exact_root`: the handle cannot say whether the root
-    /// was reaped, but still names it exactly (Linux: its pidfd), so a kill can still reach it.
+    /// was reaped, but still names it exactly (Linux: its pidfd), so a signal can still reach it.
     MayNameAnother { why: String, exact_root: bool },
 }
 
@@ -196,11 +196,11 @@ fn own_reaped_free(attached: &crate::containment::Attached) -> RootNumber {
 /// - `NoWalk` (macOS): the group and the holders. A `Kill` that is `Ok` marks the tree killed.
 /// - `Empty`: the holders are signalled, and the call is their sweep's answer (`Ok` with no holders
 ///   channel). A `Kill` that is `Ok` marks the tree killed.
-/// - `MayNameAnother`: [`number_skipped`], after `kill_root` for a `Kill` when the handle still
-///   names the root exactly.
+/// - `MayNameAnother`: [`number_skipped`], after `signal_root` when the handle still names the root
+///   exactly.
 ///
-/// `op` names the call; `earlier` names what the same operation sent before. `kill_root` kills the
-/// root through its handle; only `kill_tree` passes it.
+/// `op` names the call; `earlier` names what the same operation sent before. `signal_root` sends
+/// the call's own signal to the root through its handle.
 #[cfg(unix)]
 #[expect(
     clippy::too_many_arguments,
@@ -214,7 +214,7 @@ pub(crate) fn root_checked_tree_signal(
     earlier: Option<&str>,
     killed: &crate::containment::TreeKilled,
     state: impl FnOnce() -> (crate::signal::RootState, bool),
-    kill_root: Option<&dyn Fn() -> Result<crate::signal::Sent, Error>>,
+    signal_root: &dyn Fn() -> Result<crate::signal::Sent, Error>,
 ) -> Option<Result<(), Error>> {
     use crate::containment::dispatch::TreeSignal;
     let pid = id.pid();
@@ -233,10 +233,7 @@ pub(crate) fn root_checked_tree_signal(
             }),
         ),
         RootNumber::MayNameAnother { why, exact_root } => {
-            let root = match (exact_root, signal, kill_root) {
-                (true, TreeSignal::Kill, Some(kill_root)) => Some(kill_root()),
-                _ => None,
-            };
+            let root = exact_root.then(signal_root);
             Some(Err(number_skipped(attached, pid, signal, op, earlier, &why, root)))
         }
     }
@@ -282,8 +279,8 @@ pub(crate) fn empty_group_signal(
 
 /// The answer for [`RootNumber::MayNameAnother`], `why` its reason: nothing is sent by the root's
 /// number, a macOS fd marker's holders are signalled, and one `warn` names what was skipped and
-/// what was sent, `root` included: the kill of the root through its handle, if one was sent. The
-/// holders' sweep's error, the root kill's error, or `Unassessable`.
+/// what was sent, `root` included: the signal to the root through its handle, if one was sent. The
+/// holders' sweep's error, the root signal's error, or `Unassessable`.
 #[cfg(unix)]
 pub(crate) fn number_skipped(
     attached: &crate::containment::Attached,
@@ -296,21 +293,74 @@ pub(crate) fn number_skipped(
 ) -> Error {
     use crate::signal::Sent;
     let holders = attached.signal_holders_only(signal, None);
+    let (sent_root, failed_root) = match signal {
+        crate::containment::dispatch::TreeSignal::Kill => (
+            "killed the root through its pidfd, which names it exactly, and sent nothing else",
+            "the kill of the root",
+        ),
+        crate::containment::dispatch::TreeSignal::Term => (
+            "sent the SIGTERM to the root through its pidfd, which names it exactly, and sent nothing else",
+            "the SIGTERM to the root",
+        ),
+    };
     let sent = match (&holders, &root) {
         (Some(Ok(())), _) => "signalled only the marker holders".to_owned(),
         (Some(Err(e)), _) => format!("signalled only the marker holders, which failed ({e})"),
         (None, None) => "sent nothing".to_owned(),
-        (None, Some(Ok(Sent::Delivered))) => {
-            "killed the root through its pidfd, which names it exactly, and sent nothing else".to_owned()
-        }
+        (None, Some(Ok(Sent::Delivered))) => sent_root.to_owned(),
         (None, Some(Ok(Sent::Gone))) => "sent nothing: the root's pidfd shows it is gone".to_owned(),
         (None, Some(Ok(_))) => "sent nothing: the root's handle no longer reaches it".to_owned(),
-        (None, Some(Err(e))) => format!("sent nothing: the kill of the root through its pidfd failed ({e})"),
+        (None, Some(Err(e))) => format!("sent nothing: {failed_root} through its pidfd failed ({e})"),
     };
     let detail = skipped_detail(attached, pid, signal.verb(), op, why, &sent, earlier);
     log::warn!("{detail}");
     match (holders, root) {
         (Some(Err(e)), _) | (None, Some(Err(e))) => e,
+        _ => Error::Unassessable { detail, source: None },
+    }
+}
+
+/// `graceful_shutdown_tree`'s answer (sync and async) for [`RootNumber::MayNameAnother`] when the root's
+/// handle still names it exactly (`exact_root`, Linux): the root got the `SIGTERM` (`term`) through its
+/// pidfd and, if it outlived the grace, a kill (`kill`), and nothing went out by its number. One `warn`
+/// names what was skipped and what was sent. The failed signal's error, or `Unassessable`.
+#[cfg(target_os = "linux")]
+pub(crate) fn root_shutdown_error(
+    attached: &crate::containment::Attached,
+    pid: crate::identity::RawPid,
+    why: &str,
+    term: Result<crate::signal::Sent, Error>,
+    kill: Option<Result<crate::signal::Sent, Error>>,
+) -> Error {
+    use crate::signal::Sent;
+    let termed = "sent the SIGTERM to the root through its pidfd, which names it exactly";
+    let sent = match (&term, &kill) {
+        (Err(e), _) => format!("sent nothing: the SIGTERM to the root through its pidfd failed ({e})"),
+        (Ok(Sent::Delivered), None) => format!("{termed}, and it exited within the grace; sent nothing else"),
+        (Ok(Sent::Delivered), Some(Ok(Sent::Delivered))) => {
+            format!("{termed}, then killed the root through its pidfd after the grace, and sent nothing else")
+        }
+        (Ok(Sent::Delivered), Some(Err(e))) => {
+            format!("{termed}, then the kill of the root through its pidfd failed ({e})")
+        }
+        (Ok(Sent::Delivered), Some(Ok(_))) => {
+            format!("{termed}, and its pidfd showed it gone after the grace; sent nothing else")
+        }
+        (Ok(Sent::Gone), _) => "sent nothing: the root's pidfd shows it is gone".to_owned(),
+        (Ok(_), _) => "sent nothing: the root's handle no longer reaches it".to_owned(),
+    };
+    let detail = skipped_detail(
+        attached,
+        pid,
+        crate::containment::dispatch::TreeSignal::Term.verb(),
+        "graceful_shutdown_tree",
+        why,
+        &sent,
+        None,
+    );
+    log::warn!("{detail}");
+    match (term, kill) {
+        (Err(e), _) | (_, Some(Err(e))) => e,
         _ => Error::Unassessable { detail, source: None },
     }
 }
@@ -858,9 +908,12 @@ impl Child {
     /// reaper in the process, that pid may name another process: nothing is sent by it, and the call
     /// returns [`Error::Unassessable`](crate::error::Error::Unassessable), with a `warn` naming what
     /// it skipped. A root whose handle cannot say is answered the same way, except that on Linux the
-    /// root itself is still killed through its pidfd, which names it exactly, and the `warn` says so;
-    /// on macOS it is answered as in the paragraph above. An fd marker still kills its marker
-    /// holders, which are named by the pipe they hold, so no pid reuse redirects the kill.
+    /// root itself is still signalled through its pidfd, which names it exactly, and the `warn` says
+    /// so: `kill_tree` kills it, [`terminate_tree`](Child::terminate_tree) sends it the `SIGTERM`, and
+    /// [`graceful_shutdown_tree`](Child::graceful_shutdown_tree) sends the `SIGTERM`, then the kill if
+    /// it is still running after the grace; on macOS it is answered as in the paragraph above. An fd
+    /// marker still kills its marker holders, which are named by the pipe they hold, so no pid reuse
+    /// redirects the kill.
     ///
     /// **After this handle's own reap.** The root's children were reparented at its exit, so no walk
     /// runs from its pid. Another process at that pid means the group is empty: nothing is sent by
@@ -908,11 +961,11 @@ impl Child {
             earlier,
             &self.tree_killed,
             || self.proc.state_and_own_reap(),
-            Some(&|| {
+            &|| {
                 self.proc
                     .kill_sent()
                     .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper()))
-            }),
+            },
         ) {
             return result;
         }
@@ -1021,6 +1074,10 @@ impl Child {
     /// every holder was reached. Any other mechanism has nothing left to send, and the call returns
     /// [`Error::Unassessable`](crate::error::Error::Unassessable) saying that nothing was sent and what
     /// was skipped.
+    ///
+    /// **Linux, a root whose handle cannot say whether it was reaped** is sent the `SIGTERM` through
+    /// its pidfd, which names it exactly. Nothing goes out by its number, and the call returns
+    /// [`Error::Unassessable`](crate::error::Error::Unassessable), with one `warn` saying so.
     pub fn terminate_tree(&self) -> Result<(), Error> {
         self.require_contained()?;
         // One look at the root decides, as for `kill_tree`.
@@ -1033,7 +1090,7 @@ impl Child {
             None,
             &self.tree_killed,
             || self.proc.state_and_own_reap(),
-            None,
+            &|| self.proc.signal_sent(crate::signal::Sig::Term).map_err(Error::Io),
         ) {
             return result;
         }

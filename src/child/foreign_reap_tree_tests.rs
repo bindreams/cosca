@@ -124,6 +124,139 @@ fn kill_tree_of_a_root_its_handle_cannot_read_kills_it_through_its_pidfd_alone()
     assert_eq!(status.signal(), Some(libc::SIGKILL), "the pidfd kill ended the root");
 }
 
+/// A root whose own handle cannot say whether it was reaped: `terminate_tree` sends no `SIGTERM` by
+/// its number, sends it one through its pidfd, which names it exactly, and answers `Unassessable`.
+///
+/// Mutants: nothing is sent to the root; a `SIGTERM` goes to its group; the warn does not say it was
+/// sent.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn terminate_tree_of_a_root_its_handle_cannot_read_terms_it_through_its_pidfd_alone() {
+    use crate::test_child::reaped_elsewhere::ROOT_TERMED_BY_PIDFD;
+    use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peek_once};
+    use std::os::unix::process::ExitStatusExt as _;
+    crate::log_capture::install();
+    let termed = record_term_group();
+    let child = session_sleep().spawn().expect("spawn");
+    let pid = child.id().pid();
+
+    let mark = crate::log_capture::mark();
+    let sends = crate::send_log::Capture::start();
+    let forced = force_peek_once(Err(std::io::Error::other("forced peek failure")));
+    let err = child
+        .terminate_tree()
+        .expect_err("a group whose root nothing can answer for is not assessable");
+    assert_peeks_exhausted();
+    drop(forced);
+
+    assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
+    assert_eq!(
+        termed.termed(),
+        Vec::<i32>::new(),
+        "no SIGTERM by a number that may name another process"
+    );
+    assert_eq!(
+        sends.entries(),
+        [(pid, crate::signal::Sig::Term, crate::send_log::Via::Pidfd)],
+        "the root is signalled through its pidfd, and nothing else is sent"
+    );
+    assert_one_untrusted_number_warn(mark, pid);
+    let warns = warns_since(mark);
+    assert!(warns[0].contains(ROOT_TERMED_BY_PIDFD), "{warns:?}");
+    let status = child.wait().expect("reap the root");
+    assert_eq!(status.signal(), Some(libc::SIGTERM), "the pidfd SIGTERM ended the root");
+}
+
+/// A root whose own handle cannot say whether it was reaped and ignores `SIGTERM`:
+/// `graceful_shutdown_tree` sends it the `SIGTERM` through its pidfd, and after the grace the kill
+/// through its pidfd, and nothing by its number. It ends `Unassessable` with one warn that says so.
+///
+/// Mutants: nothing is sent to the root; the kill after the grace is not sent; a second `SIGTERM`
+/// in its place; a `killpg` or a `SIGTERM` to the group.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn graceful_shutdown_tree_of_a_root_its_handle_cannot_read_escalates_through_its_pidfd_alone() {
+    use crate::signal::Sig::{Kill, Term};
+    use crate::test_child::reaped_elsewhere::{term_ignoring_session_sleep, ROOT_TERMED_BY_PIDFD};
+    use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peek_once};
+    use std::os::unix::process::ExitStatusExt as _;
+    crate::log_capture::install();
+    let killed = record_kill_group();
+    let termed = record_term_group();
+    let mut child = term_ignoring_session_sleep().spawn().expect("spawn");
+    let pid = child.id().pid();
+    let mut ready = String::new();
+    std::io::BufRead::read_line(
+        &mut std::io::BufReader::new(child.stdout().expect("stdout pipe")),
+        &mut ready,
+    )
+    .expect("the root ignores SIGTERM");
+
+    let mark = crate::log_capture::mark();
+    let sends = crate::send_log::Capture::start();
+    let forced = force_peek_once(Err(std::io::Error::other("forced peek failure")));
+    // A root that ignores the SIGTERM is alive after any grace, so the kill follows.
+    let err = child
+        .graceful_shutdown_tree(std::time::Duration::ZERO)
+        .expect_err("a group whose root nothing can answer for is not assessable");
+    assert_peeks_exhausted();
+    drop(forced);
+
+    assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
+    assert_eq!(killed.killed(), Vec::<i32>::new(), "no killpg by the root's number");
+    assert_eq!(termed.termed(), Vec::<i32>::new(), "no SIGTERM by the root's number");
+    let via_pidfd = crate::send_log::Via::Pidfd;
+    assert_eq!(
+        sends.entries(),
+        [(pid, Term, via_pidfd), (pid, Kill, via_pidfd)],
+        "the SIGTERM, then the kill, both through the pidfd"
+    );
+    assert_one_untrusted_number_warn(mark, pid);
+    let warns = warns_since(mark);
+    assert!(warns[0].contains(ROOT_TERMED_BY_PIDFD), "{warns:?}");
+    assert!(warns[0].contains(ROOT_KILLED_BY_PIDFD), "{warns:?}");
+    let status = child.wait().expect("reap the root");
+    assert_eq!(status.signal(), Some(libc::SIGKILL), "the kill ended the root");
+}
+
+/// The same root, but it exits on the `SIGTERM`: `graceful_shutdown_tree` sends no kill, and the one
+/// warn does not say it did. The grace is only an upper bound: the pidfd turns readable at the exit.
+///
+/// Mutants: the kill is sent whatever the root did; the warn says it was.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn graceful_shutdown_tree_of_a_root_its_handle_cannot_read_sends_no_kill_to_one_that_exited() {
+    use crate::signal::Sig::Term;
+    use crate::test_child::reaped_elsewhere::ROOT_TERMED_BY_PIDFD;
+    use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peek_once};
+    use std::os::unix::process::ExitStatusExt as _;
+    crate::log_capture::install();
+    let child = session_sleep().spawn().expect("spawn");
+    let pid = child.id().pid();
+
+    let mark = crate::log_capture::mark();
+    let sends = crate::send_log::Capture::start();
+    let forced = force_peek_once(Err(std::io::Error::other("forced peek failure")));
+    let err = child
+        .graceful_shutdown_tree(std::time::Duration::from_secs(3600))
+        .expect_err("a group whose root nothing can answer for is not assessable");
+    assert_peeks_exhausted();
+    drop(forced);
+
+    assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
+    assert_eq!(
+        sends.entries(),
+        [(pid, Term, crate::send_log::Via::Pidfd)],
+        "only the SIGTERM, through the pidfd"
+    );
+    assert_one_untrusted_number_warn(mark, pid);
+    let warns = warns_since(mark);
+    assert!(warns[0].contains(ROOT_TERMED_BY_PIDFD), "{warns:?}");
+    assert!(!warns[0].contains(ROOT_KILLED_BY_PIDFD), "{warns:?}");
+    let status = child.wait().expect("reap the root");
+    assert_eq!(status.signal(), Some(libc::SIGTERM), "the SIGTERM ended the root");
+}
+
 /// After a foreign reap, `graceful_shutdown_tree` ends `Unassessable` with one warn and no sweep by
 /// the root's number, which would warn again and claim a `SIGTERM` was sent. (A macOS fd marker's
 /// holders still get their shutdown; here there are none left.)

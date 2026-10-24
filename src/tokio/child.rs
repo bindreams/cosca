@@ -765,9 +765,12 @@ impl Child {
     /// reaper in the process, that pid may name another process: nothing is sent by it, and the call
     /// returns [`Error::Unassessable`](crate::error::Error::Unassessable), with a `warn` naming what
     /// it skipped. A root whose handle cannot say is answered the same way, except that on Linux the
-    /// root itself is still killed through its pidfd, which names it exactly, and the `warn` says so;
-    /// on macOS it is answered as in the paragraph above. An fd marker still kills its marker
-    /// holders, which are named by the pipe they hold, so no pid reuse redirects the kill.
+    /// root itself is still signalled through its pidfd, which names it exactly, and the `warn` says
+    /// so: `kill_tree` kills it, [`terminate_tree`](Child::terminate_tree) sends it the `SIGTERM`, and
+    /// [`graceful_shutdown_tree`](Child::graceful_shutdown_tree) sends the `SIGTERM`, then the kill if
+    /// it is still running after the grace; on macOS it is answered as in the paragraph above. An fd
+    /// marker still kills its marker holders, which are named by the pipe they hold, so no pid reuse
+    /// redirects the kill.
     ///
     /// **After this handle's own reap.** As for the sync
     /// [`Child::kill_tree`](crate::Child::kill_tree): no walk runs from the root's pid, another
@@ -812,7 +815,7 @@ impl Child {
             earlier,
             &self.tree_killed,
             || self.root_state_and_own_reap(),
-            Some(&|| self.kill_root_through_handle()),
+            &|| self.kill_root_through_handle(),
         ) {
             return result;
         }
@@ -925,6 +928,10 @@ impl Child {
     /// is `Ok` only if every holder was reached. Any other mechanism has nothing left to send, and the
     /// call returns [`Error::Unassessable`](crate::error::Error::Unassessable) saying that nothing was
     /// sent and what was skipped.
+    ///
+    /// **Linux, a root whose handle cannot say whether it was reaped** is sent the `SIGTERM` through
+    /// its pidfd, which names it exactly. Nothing goes out by its number, and the call returns
+    /// [`Error::Unassessable`](crate::error::Error::Unassessable), with one `warn` saying so.
     pub fn terminate_tree(&self) -> Result<(), Error> {
         self.require_contained()?;
         // One look at the root decides, as for `kill_tree`.
@@ -937,7 +944,7 @@ impl Child {
             None,
             &self.tree_killed,
             || self.root_state_and_own_reap(),
-            None,
+            &|| self.term_root_through_handle(),
         ) {
             return result;
         }
@@ -954,6 +961,15 @@ impl Child {
             Err(Error::Io(e)) => Err(crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper())),
             other => other,
         }
+    }
+
+    /// A `SIGTERM` to the root through its own handle (Linux: its pidfd), with no look at its state.
+    #[cfg(unix)]
+    fn term_root_through_handle(&self) -> Result<Sent, Error> {
+        self.os
+            .proc
+            .as_ref()
+            .map_or(Ok(Sent::Gone), |proc| proc.signal(Sig::Term))
     }
 
     /// The tree paths' one look at the root ([`root_number`](crate::child::root_number)).

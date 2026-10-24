@@ -11,6 +11,9 @@ use crate::error::io_context;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Sig {
     Kill,
+    /// `SIGTERM`: a request to exit, not an order.
+    #[cfg(unix)]
+    Term,
 }
 
 #[cfg(target_os = "linux")]
@@ -18,6 +21,7 @@ impl Sig {
     fn as_rustix(self) -> rustix::process::Signal {
         match self {
             Sig::Kill => rustix::process::Signal::KILL,
+            Sig::Term => rustix::process::Signal::TERM,
         }
     }
 }
@@ -27,6 +31,7 @@ impl Sig {
     fn as_libc(self) -> libc::c_int {
         match self {
             Sig::Kill => libc::SIGKILL,
+            Sig::Term => libc::SIGTERM,
         }
     }
 }

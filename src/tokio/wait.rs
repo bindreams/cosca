@@ -249,6 +249,17 @@ pub(crate) async fn watch_pidfd(pidfd: std::os::fd::OwnedFd) -> Result<(), Error
     }
 }
 
+/// Whether the process `pidfd` names has exited by the time `grace` is over, read only through the
+/// pidfd: non-reaping, and no pid is looked up. A `grace` that overflows, or sits inside tokio's
+/// timer margin, is unbounded.
+#[cfg(target_os = "linux")]
+pub(crate) async fn pidfd_exited_within(pidfd: std::os::fd::OwnedFd, grace: Duration) -> Result<bool, Error> {
+    match deadline_from(grace) {
+        Some(Some(at)) => Ok(arm_at(at, watch_pidfd(pidfd)).await.transpose()?.is_some()),
+        _ => watch_pidfd(pidfd).await.map(|()| true),
+    }
+}
+
 /// Map a pidfd readiness to the watch verdict; `None` = unclassified readiness (tokio's
 /// documented `ready()` false positive) — re-await: never a false "exited" (which would skip
 /// escalation on a live child) and never a false watch failure (which would force-kill a

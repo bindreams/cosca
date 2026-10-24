@@ -141,6 +141,26 @@ impl ProcHandle {
         }
     }
 
+    /// [`kill_sent`](Self::kill_sent) for any `sig`.
+    #[cfg(unix)]
+    pub(crate) fn signal_sent(&self, sig: crate::signal::Sig) -> io::Result<crate::signal::Sent> {
+        match self {
+            ProcHandle::Std(s) => s.signal_sent(sig),
+        }
+    }
+
+    /// Whether the process has exited by the time `grace` is over, read only through its pidfd: no
+    /// state is read and nothing is reaped. A process with no pidfd was gone when adopted.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn exited_within(&self, grace: std::time::Duration) -> io::Result<bool> {
+        #[cfg(feature = "tokio")]
+        crate::bounded::assert_may_block("waiting for a process to exit");
+        let Some(pidfd) = self.pidfd() else {
+            return Ok(true);
+        };
+        crate::wait::poll_pidfd_exit(pidfd, crate::wait::deadline_from(grace))
+    }
+
     /// The pidfd naming the process, if it holds one (Linux).
     #[cfg(unix)]
     pub(crate) fn pidfd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {

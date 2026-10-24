@@ -547,6 +547,12 @@ impl SharedChild {
     ///   no reap of ours can run between the state read and the call.
     #[cfg(unix)]
     pub(crate) fn kill_sent(&self) -> io::Result<crate::signal::Sent> {
+        self.signal_sent(crate::signal::Sig::Kill)
+    }
+
+    /// [`kill_sent`](SharedChild::kill_sent) for any `sig`.
+    #[cfg(unix)]
+    pub(crate) fn signal_sent(&self, sig: crate::signal::Sig) -> io::Result<crate::signal::Sent> {
         let lock = self.lock();
         if matches!(lock.state, State::E(_)) {
             return Ok(crate::signal::Sent::Gone);
@@ -556,15 +562,11 @@ impl SharedChild {
         #[cfg(target_os = "linux")]
         {
             use std::os::fd::AsFd;
-            crate::signal::via_pidfd(
-                self.pidfd.as_ref().map(AsFd::as_fd),
-                self.id(),
-                crate::signal::Sig::Kill,
-            )
+            crate::signal::via_pidfd(self.pidfd.as_ref().map(AsFd::as_fd), self.id(), sig)
         }
         #[cfg(target_os = "macos")]
         {
-            crate::signal::via_verified_pid(self.id(), self.identity, crate::signal::Sig::Kill)
+            crate::signal::via_verified_pid(self.id(), self.identity, sig)
         }
     }
 

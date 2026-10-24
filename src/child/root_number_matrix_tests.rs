@@ -1,5 +1,5 @@
-//! What the tree paths send, for every mechanism that has a root, every way the root can be reaped,
-//! and every tree entry point, sync and tokio. After a reap the root's number may name another
+//! What the tree paths send, for every mechanism that has a root, every way the root can be reaped
+//! (and, on Linux, a root whose handle cannot answer), and every tree entry point, sync and tokio. After a reap the root's number may name another
 //! process, so nothing may go out by it: no `killpg`, no walk from the root's pid, no signal by a
 //! bare pid. What names the tree exactly still runs: an fd marker's holders, a cgroup's kill.
 //!
@@ -110,6 +110,10 @@ exec sleep 300"#;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Reap {
     None,
+    /// Linux: not reaped, but the root's own handle cannot answer (`RootState::Unknown`), so its pid
+    /// may name another process while its pidfd still names it exactly.
+    #[cfg(target_os = "linux")]
+    Unanswered,
     OwnFree,
     OwnReused,
     ForeignFree,
@@ -117,8 +121,10 @@ enum Reap {
 }
 
 impl Reap {
-    const ALL: [Reap; 5] = [
+    const ALL: &[Reap] = &[
         Reap::None,
+        #[cfg(target_os = "linux")]
+        Reap::Unanswered,
         Reap::OwnFree,
         Reap::OwnReused,
         Reap::ForeignFree,
@@ -129,15 +135,59 @@ impl Reap {
         matches!(self, Reap::OwnFree | Reap::OwnReused)
     }
 
+    /// Whether the root is reaped when the entry point runs.
+    fn reaped(self) -> bool {
+        match self {
+            Reap::None => false,
+            #[cfg(target_os = "linux")]
+            Reap::Unanswered => false,
+            _ => true,
+        }
+    }
+
+    /// Whether the cell exists for `mechanism`: the handle's answer is read only by a mechanism
+    /// that reaches its tree through the root's number.
+    fn applies_to(self, mechanism: Mechanism) -> bool {
+        #[cfg(target_os = "linux")]
+        if self == Reap::Unanswered {
+            return !mechanism.is_cgroup();
+        }
+        let _ = mechanism;
+        true
+    }
+
     /// What every read of the root's pid answers after the reap: nothing, or another process.
     fn read(self, root: ProcessId) -> Option<Resolved<ProcessId>> {
         match self {
             Reap::None => None,
+            #[cfg(target_os = "linux")]
+            Reap::Unanswered => None,
             Reap::OwnFree | Reap::ForeignFree => Some(Resolved::Gone),
             Reap::OwnReused | Reap::ForeignReused => Some(Resolved::Found(ProcessId::from_parts_for_test(
                 root.pid(),
                 root.start_token_raw() + 1,
             ))),
+        }
+    }
+}
+
+impl Reap {
+    /// Arms what makes the root read as this reap, until the guard drops.
+    fn force(self, id: ProcessId) -> Option<Box<dyn std::any::Any>> {
+        #[cfg(target_os = "linux")]
+        if self == Reap::Unanswered {
+            let failed = Err(std::io::Error::other("forced peek failure"));
+            return Some(Box::new(crate::wait::exit_only::seams::force_peek_once(failed)));
+        }
+        self.read(id)
+            .map(|read| Box::new(crate::child::fault::force_root_reads(read)) as Box<dyn std::any::Any>)
+    }
+
+    /// Checks that the failed peek was the one look at the root the entry point took.
+    fn assert_forced_used(self) {
+        #[cfg(target_os = "linux")]
+        if self == Reap::Unanswered {
+            crate::wait::exit_only::seams::assert_peeks_exhausted();
         }
     }
 }
@@ -225,7 +275,7 @@ const CGROUP_TERM_BY_PID: Want = Want::Routed("bindreams/cosca#106");
 
 fn expected(mechanism: Mechanism, reap: Reap, op: Op) -> Expected {
     use nix::sys::signal::Signal::{SIGKILL, SIGTERM};
-    let reaped = reap != Reap::None;
+    let reaped = reap.reaped();
     let killpg = match (mechanism.has_group(), reap) {
         (false, _) => Want::No,
         (true, Reap::None) => Want::Yes,
@@ -239,7 +289,7 @@ fn expected(mechanism: Mechanism, reap: Reap, op: Op) -> Expected {
     };
     let by_pid = if mechanism.is_cgroup() && op != Op::Kill {
         CGROUP_TERM_BY_PID
-    } else if reaped {
+    } else if reaped || reap != Reap::None {
         Want::No
     } else {
         Want::Any
@@ -254,10 +304,12 @@ fn expected(mechanism: Mechanism, reap: Reap, op: Op) -> Expected {
         (true, false) => None,
         (false, _) => Some(&[]),
     };
-    // The handle backstop, through the pidfd; after a reap it has nothing to reach.
+    // The handle backstop, through the pidfd; after a reap it has nothing to reach. A root whose
+    // handle cannot answer is signalled through it by every entry point: it names the root exactly.
     let pidfd = match (cfg!(target_os = "linux"), reaped, op) {
         (false, _, _) => Want::No,
         (true, true, _) => Want::Any,
+        (true, false, _) if reap != Reap::None => Want::Yes,
         (true, false, Op::Terminate) => Want::No,
         (true, false, _) => Want::Yes,
     };
@@ -375,7 +427,7 @@ fn run_sync(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
     let stdin = child.stdin().expect("stdin pipe");
     let mut stderr = child.stderr().expect("stderr pipe");
     let root = child.id().pid();
-    if reap != Reap::None {
+    if reap.reaped() {
         child.kill().expect("kill the root");
         if reap.own() {
             child.wait().expect("this handle reaps the root");
@@ -383,7 +435,7 @@ fn run_sync(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
             crate::test_child::reaped_elsewhere::reap_behind(root);
         }
     }
-    let forced = reap.read(child.id()).map(crate::child::fault::force_root_reads);
+    let forced = reap.force(child.id());
 
     let recorders = Recorders::start();
     // The cell checks what was sent, not what the call answered.
@@ -392,10 +444,11 @@ fn run_sync(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
         Op::Terminate => child.terminate_tree(),
         Op::GracefulShutdown => child.graceful_shutdown_tree(Duration::ZERO).map(drop),
     };
+    reap.assert_forced_used();
     let sent = recorders.sent(root, cat);
 
     // The tree is gone before the drop, which runs under the recorders: it sends no killpg.
-    if reap == Reap::None {
+    if !reap.reaped() {
         child.kill().expect("kill the root");
         child.wait().expect("reap the root");
     }
@@ -430,7 +483,7 @@ async fn run_tokio(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
     let stdin = child.stdin().expect("stdin pipe");
     let mut stderr = child.stderr().expect("stderr pipe");
     let root = child.id().pid();
-    if reap != Reap::None {
+    if reap.reaped() {
         child.kill().expect("kill the root");
         if reap.own() {
             child.wait().await.expect("this handle reaps the root");
@@ -438,7 +491,7 @@ async fn run_tokio(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
             crate::test_child::reaped_elsewhere::reap_behind(root);
         }
     }
-    let forced = reap.read(child.id()).map(crate::child::fault::force_root_reads);
+    let forced = reap.force(child.id());
 
     let recorders = Recorders::start();
     // The cell checks what was sent, not what the call answered.
@@ -447,9 +500,10 @@ async fn run_tokio(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
         Op::Terminate => child.terminate_tree(),
         Op::GracefulShutdown => child.graceful_shutdown_tree(Duration::ZERO).await.map(drop),
     };
+    reap.assert_forced_used();
     let sent = recorders.sent(root, cat);
 
-    if reap == Reap::None {
+    if !reap.reaped() {
         child.kill().expect("kill the root");
         child.wait().await.expect("reap the root");
     }
@@ -479,7 +533,7 @@ fn check_matrix(mechanisms: &[Mechanism]) {
     let mut rows = Vec::new();
     let mut failed = 0;
     for &mechanism in mechanisms {
-        for reap in Reap::ALL {
+        for &reap in Reap::ALL.iter().filter(|reap| reap.applies_to(mechanism)) {
             for op in Op::ALL {
                 for &api in Api::ALL {
                     let sent = match api {

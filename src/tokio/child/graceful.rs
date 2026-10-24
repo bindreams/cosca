@@ -285,6 +285,9 @@ impl Child {
     /// [`Error::Unassessable`](crate::error::Error::Unassessable), with no sweep. A macOS fd marker's
     /// holders, named by the pipe they hold, still get the `SIGTERM`, the grace, and a kill of any
     /// left, whose error is returned if it fails; any other mechanism ends at once, with no grace.
+    /// On Linux, a root whose handle cannot say whether it was reaped still gets the `SIGTERM`
+    /// through its pidfd, which names it exactly, then the grace, and a kill through the pidfd if it
+    /// is still running; nothing goes out by its number, and the call ends the same way.
     /// After this handle's own reap, with another process at the pid, the group is empty: only the
     /// holders get the `SIGTERM`, and the call goes on as usual.
     ///
@@ -342,9 +345,16 @@ impl Child {
                 Some(holders.unwrap_or(Ok(())))
             }
             // The pid may name another process. A macOS fd marker shuts its holders down by the pipe
-            // they hold; any other mechanism has nothing to send. Either way the call ends with one
-            // warn: a sweep would warn again.
-            crate::child::RootNumber::MayNameAnother { why, .. } => {
+            // they hold, and a Linux root its handle cannot answer for is shut down through its pidfd;
+            // any other mechanism has nothing to send. Either way the call ends with one warn: a
+            // sweep would warn again.
+            crate::child::RootNumber::MayNameAnother { why, exact_root } => {
+                #[cfg(target_os = "linux")]
+                if exact_root {
+                    return Err(self.shut_down_root_through_pidfd(grace, &why).await);
+                }
+                #[cfg(not(target_os = "linux"))]
+                let _ = exact_root;
                 #[cfg(target_os = "macos")]
                 if self.os.attached.names_tree_by_identity() {
                     return Err(self.shut_down_holders_only(grace, &why).await);
@@ -505,6 +515,44 @@ impl Child {
             );
         }
         Ok(status)
+    }
+
+    /// `graceful_shutdown_tree` of a root whose handle cannot say whether it was reaped, so its
+    /// number may name another process (`why`), but whose pidfd still names it exactly: the `SIGTERM`
+    /// through the pidfd, the grace, then a kill through the pidfd if the root outlived it. Nothing
+    /// goes out by the number. A front that may not be signalled is refused, as for the tree paths.
+    #[cfg(target_os = "linux")]
+    async fn shut_down_root_through_pidfd(&self, grace: Duration, why: &str) -> Error {
+        use crate::elevation::front::Gate;
+        use crate::signal::Sent;
+        if let Gate::Closed(unkillable) = self.terminate_gate() {
+            return unkillable;
+        }
+        let term = self.term_root_through_handle();
+        let kill = if matches!(term, Ok(Sent::Delivered)) {
+            let exited = match self.os.proc.as_ref() {
+                Some(proc) => proc.exited_within(grace).await,
+                None => Ok(true),
+            };
+            match exited {
+                Ok(true) => None,
+                outcome => {
+                    if let Err(e) = outcome {
+                        log::debug!(
+                            "graceful_shutdown_tree({}): the root's grace wait failed, so it is killed now: {e}",
+                            self.id().pid()
+                        );
+                    }
+                    Some(match self.kill_gate() {
+                        Gate::Closed(unkillable) => Err(unkillable),
+                        _ => self.kill_root_through_handle(),
+                    })
+                }
+            }
+        } else {
+            None
+        };
+        crate::child::root_shutdown_error(&self.os.attached, self.id().pid(), why, term, kill)
     }
 
     /// `graceful_shutdown_tree` of an fd marker whose root's number may name another process (`why`):

@@ -40,6 +40,10 @@ pub(crate) const UNTRUSTED_NUMBER: &str = "may name another process";
 #[cfg(target_os = "linux")]
 pub(crate) const ROOT_KILLED_BY_PIDFD: &str = "killed the root through its pidfd";
 
+/// Every record of a skip that sent the root a `SIGTERM` through its pidfd instead contains this.
+#[cfg(target_os = "linux")]
+pub(crate) const ROOT_TERMED_BY_PIDFD: &str = "SIGTERM to the root through its pidfd";
+
 /// Asserts the one record since `mark` on this thread says the root's number may name another
 /// process, is a `warn`, and names the group it left unsignalled.
 #[track_caller]
@@ -58,6 +62,17 @@ pub(crate) fn session_sleep() -> crate::Command {
     let mut cmd = crate::Command::new();
     cmd.args(["sleep", "300"]);
     cmd.contain_with(crate::ContainMode::Session);
+    cmd
+}
+
+/// [`session_sleep`] that ignores `SIGTERM` (an ignored signal stays ignored across `exec`), so
+/// only a kill ends it. It prints a line to its piped stdout once it ignores the signal.
+#[cfg(target_os = "linux")]
+pub(crate) fn term_ignoring_session_sleep() -> crate::Command {
+    let mut cmd = crate::Command::new();
+    cmd.args(["sh", "-c", r#"trap "" TERM; echo ready; exec sleep 300"#]);
+    cmd.contain_with(crate::ContainMode::Session);
+    cmd.stdout(crate::Stdio::pipe_out()).expect("stdout pipe");
     cmd
 }
 
