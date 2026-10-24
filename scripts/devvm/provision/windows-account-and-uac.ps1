@@ -29,6 +29,7 @@
 $ErrorActionPreference = "Stop"
 $policyKey = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
 $winlogonKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
+$passwordLessKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\PasswordLess\Device"
 
 # Must match config.winrm.username / config.winrm.password in windows-x64/Vagrantfile — this
 # box's credentials are already fixed, non-secret values ("vagrant"/"vagrant"), not something
@@ -101,6 +102,18 @@ if ($autoConsent) {
 #    filtered token from, and a headless VM has no console session unless something logs in.
 #    AutoAdminLogon establishes that at every boot.
 #    Also only takes effect at the next boot; only reboot if actually changing something.
+#
+#    Windows 11 only: with "only allow Windows Hello sign-in for Microsoft accounts on this device"
+#    on (DevicePasswordLessBuildVersion = 2, which gusztavvargadr/windows-11 ships), Winlogon
+#    resets AutoAdminLogon to 0 at the next boot and never logs in, so no interactive session
+#    exists. Measured on that box: AutoAdminLogon=0 after the first reboot, and no logon type 2
+#    event. The key is absent on Windows 10, where nothing needs doing.
+$currentPasswordLess = (Get-ItemProperty -Path $passwordLessKey -Name "DevicePasswordLessBuildVersion" -ErrorAction SilentlyContinue).DevicePasswordLessBuildVersion
+if ($null -ne $currentPasswordLess -and $currentPasswordLess -ne 0) {
+    Set-ItemProperty -Path $passwordLessKey -Name "DevicePasswordLessBuildVersion" -Value 0 -Type DWord
+    $rebootNeeded = $true
+    Write-Host "devvm: DevicePasswordLessBuildVersion was $currentPasswordLess, set to 0 - Windows would otherwise reset autologon; this needs a reboot."
+}
 $currentAutoAdminLogon = (Get-ItemProperty -Path $winlogonKey -Name "AutoAdminLogon" -ErrorAction SilentlyContinue).AutoAdminLogon
 $currentDefaultUserName = (Get-ItemProperty -Path $winlogonKey -Name "DefaultUserName" -ErrorAction SilentlyContinue).DefaultUserName
 $currentDefaultPassword = (Get-ItemProperty -Path $winlogonKey -Name "DefaultPassword" -ErrorAction SilentlyContinue).DefaultPassword

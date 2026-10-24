@@ -35,6 +35,56 @@ Install on the host yourself — this tool does not install anything for you:
 Verify with `vagrant plugin list` (expect `vagrant-qemu`) and
 `qemu-system-x86_64 --version` / `qemu-system-aarch64 --version`.
 
+A Windows host needs different tools: see [Windows host](#windows-host).
+
+## Windows host
+
+On Windows `devvm.py` drives Vagrant's built-in Hyper-V provider. No QEMU, plugin or `rsync` is
+needed. Install yourself:
+
+- A Hyper-V capable Windows (Pro, Enterprise or Education) with Hyper-V enabled
+  (`Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All`, elevated, then reboot).
+- Membership in the `Hyper-V Administrators` group (sign out and in afterwards), or an elevated shell.
+- [Vagrant](https://www.vagrantup.com/) 2.4.9, [`uv`](https://docs.astral.sh/uv/), Git and Python on `PATH`.
+- An inheritable SYSTEM `FullControl` entry on this worktree's `.tmp`, which Vagrant's Hyper-V
+  provider checks on its data directory. A normal profile directory has it; if `up` reports it
+  missing, grant it as the message says.
+- The Hyper-V `Default Switch`, which must stay an Internal or Private switch.
+- The Windows OpenSSH client (`ssh.exe`, an optional Windows feature), which `vagrant ssh -c` needs for Linux guests.
+
+| Guest           | Hyper-V box                                 | Notes                                      |
+| --------------- | ------------------------------------------- | ------------------------------------------ |
+| `windows-x64`   | `gusztavvargadr/windows-11` (hyperv, amd64) | pinned in `box.hyperv.json`                |
+| `linux-x64`     | _(none; planned in #706)_                   | refused on a Windows host, with the reason |
+| `linux-arm64`   | _(none)_                                    | arm64: QEMU only                           |
+| `windows-arm64` | _(none)_                                    | see [`windows-arm64`](#windows-arm64)      |
+| `macos-arm64`   | _(none)_                                    | needs an Apple Silicon Mac (Tart)          |
+
+- **Network.** A Hyper-V guest has no forwarded port and no host listener. It sits on the Internal
+  `Default Switch` and is reached at its address there. `up` refuses to start unless that switch
+  exists and is Internal or Private, and right after `vagrant up` returns or fails, before any provisioning,
+  it turns the VM off and exits if an adapter is on an External switch. If the VM cannot be turned
+  off, the error says so and gives the `Stop-VM` command to run. The first boot happens before
+  that second check, so a switch that changes between the two checks is a window the check narrows
+  but cannot close. The guest is unreachable from the LAN. Other VMs on `Default Switch` and
+  processes on the host can reach it, as local processes on a macOS host can reach the QEMU guest's
+  loopback-forwarded ports: both are "on the host". The guest's `vagrant`/`vagrant` administrator
+  account is open to them.
+- **VM names.** `cosca-devvm-<guest>-<8 hex digits of a hash of the worktree's staging path>`, so two
+  worktrees never share a VM. Devvm changes a VM only by the id Vagrant stored in
+  `.tmp/devvm/<guest>/.vagrant`, never by name, and touches no other VM.
+- **`--display`** opens Hyper-V's console (`vmconnect.exe localhost -G <VM id>`) on the VM, selected
+  by id like every other operation.
+- **`ssh` is refused for Windows guests**, on every host. `vagrant powershell` can write the guest's
+  address into the host's WSMan `TrustedHosts` and restores it only if Vagrant exits normally. Use
+  `devvm.py run windows-x64 -- <cmd>`, or the console for an interactive session.
+- **Guest fixes for this box.** Its WinRM per-shell memory quota (800 MB) is too small for
+  `rustup-init`, so `windows-winrm-memory.ps1` raises it (Hyper-V only). It ships with "only allow
+  Windows Hello sign-in" on, which makes Windows 11 drop the autologon `--unelevated` needs, so
+  `windows-account-and-uac.ps1` turns that off (`DevicePasswordLessBuildVersion`).
+- **Cleanup.** `destroy` removes the VM and its disk. The downloaded box stays in
+  `~/.vagrant.d/boxes` (`vagrant box list`, `vagrant box remove`).
+
 ## Usage
 
 ```sh
@@ -176,10 +226,19 @@ can die mid-run — at that point the fix is bumping the box in
 build, not disabling activation checks. This is throwaway dev tooling; don't rely on this VM outliving a single
 investigation.
 
+On a Windows host, `gusztavvargadr/windows-11` reads status 5 and grace 0 (an expired
+evaluation's reading) for about three minutes after a fresh VM boots, until Windows runs its
+first activation. A reading that is neither Licensed nor reason 0xC004FC07 ("validity period
+expired", an evaluation that really ran out) is therefore read again after `slmgr /ato`, which
+runs that activation and returns when it is done (`get_settled_windows_license_state`). If `/ato`
+fails or the second reading is still neither, `up` exits rather than rearm: the box ships one
+rearm, and it must not go to a VM that is not expired. A guest that has not activated yet reads
+0xC004F009 ("grace period expired").
+
 **No Vagrant shell provisioner — a real restart fuse, removed.** `windows-x64`'s Vagrantfile
 declares exactly one provisioner (the WinRM `file` upload). Every other Windows provisioning
-step (`windows-clean-stage.ps1`, `windows-mirror-tree.ps1`, `windows-lock-tree.ps1`,
-`windows-account-and-uac.ps1`, `windows-rust.ps1`) is driven directly by `devvm.py` over
+step (`windows-winrm-memory.ps1`, `windows-clean-stage.ps1`, `windows-mirror-tree.ps1`,
+`windows-lock-tree.ps1`, `windows-account-and-uac.ps1`, `windows-rust.ps1`) is driven directly by `devvm.py` over
 `vagrant winrm` (`provision_windows_guest`/`run_windows_script` in `scripts/devvm_windows.py`), not
 through Vagrant's `config.vm.provision "shell", ...`. This was a deliberate fix, not a style
 choice: vagrant 2.4.9's shell-provisioner WinRM path (`provision_winrm`) calls the guest's
@@ -292,10 +351,12 @@ prompt itself — rather than just observing its outcome — give the guest a di
 uv run scripts/devvm.py up windows-x64 --display
 ```
 
-This opens a real, local QEMU window on this Mac (`-display cocoa -vga std`) — not VNC or any
-other network-exposed display, so it doesn't touch the loopback-only port-forwarding guarantee
-above. Off by default; pass it again on every `up` that needs it (not persisted). RDP into the
-guest is the other option if a window on this Mac specifically isn't what's needed.
+With QEMU this opens a real, local QEMU window on this Mac (`-display cocoa -vga std`) — not VNC
+or any other network-exposed display, so it doesn't touch the loopback-only port-forwarding
+guarantee above. On a Windows host it opens Hyper-V's console instead (see
+[Windows host](#windows-host)). Off by default; pass it again on every `up` that needs it (not
+persisted). RDP into the guest is the other option if a window on this Mac specifically isn't
+what's needed (QEMU only: a Hyper-V guest has no forwarded port).
 
 RDP-ing into `vagrant` takes over its console (session 1) logon rather than opening a second,
 independent one — the account stays genuinely logged in, and both the session-wait `sync`/`up`
@@ -420,6 +481,9 @@ time (`vagrant box list`, then `vagrant box remove` the one you're done with) if
 tight.
 
 ## Forwarded ports are loopback-only, always
+
+This section is about the QEMU provider. A Hyper-V guest has no forwarded port; see
+[Windows host](#windows-host) for what replaces the guarantee.
 
 Every guest's forwarded ports (WinRM, RDP, SSH) are bound to `127.0.0.1` on the host, never
 `0.0.0.0`/every interface — nothing here is meant to be reachable from your LAN. This is
