@@ -521,8 +521,8 @@ pub(crate) fn adopted_id(report: Report, pid: u32) -> Result<u64, NotAdopted> {
         Report::Late(id) => not(
             Unadoptable::Late(id),
             Error::Io(io::Error::other(format!(
-                "the spawned child {pid}'s exec cannot be confirmed: two of this process's descriptors 0 to 2 were \
-                 closed at its spawn, so std's own error pipe could not show it; the child was not adopted"
+                "the spawned child {pid}'s exec cannot be confirmed: at least two of this process's descriptors 0 to 2 \
+                 were closed at its spawn, so std's own error pipe could not show it; the child was not adopted"
             ))),
         ),
         Report::Unwritten => {

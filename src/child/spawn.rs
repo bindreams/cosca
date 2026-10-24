@@ -998,8 +998,8 @@ const UNVERIFIED: &str = "could not be verified, so it was not signalled";
 
 /// The one `warn` of a spawn whose child's report came late (see [`Report::Late`]).
 #[cfg(target_os = "macos")]
-const LATE: &str = "was spawned while two of this process's descriptors 0 to 2 were closed, so its exec cannot be \
-                    confirmed and the program may have started; it was not adopted";
+const LATE: &str = "was spawned while at least two of this process's descriptors 0 to 2 were closed, so its exec \
+                    cannot be confirmed and the program may have started; it was not adopted";
 
 /// The sentence for what a teardown did, built from the kill and the fate, so that each is said only
 /// when it happened.
@@ -1140,7 +1140,9 @@ fn await_exit_warning(
     };
     match await_reapable(pid, Some(unique), Some(std::time::Instant::now() + after))? {
         Waited::DeadlinePassed => {
-            log::warn!("child {pid} is still running more than {after:?} after its kill; still waiting for it to exit");
+            log::warn!(
+                "child {pid} is not reapable {after:?} after its kill (it is still running, or a tracer holds its                  exit); still waiting for it to exit"
+            );
             await_reapable(pid, Some(unique), None)
         }
         done => Ok(done),

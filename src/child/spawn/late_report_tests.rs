@@ -47,7 +47,7 @@ pub(crate) fn assert_one_warn(pid: u32, mark: usize, says: &[&str], not_says: &[
     let warns = warns_of(pid, mark);
     assert_eq!(warns.len(), 1, "one event, one warn: {warns:?}");
     assert!(
-        warns[0].contains("two of this process's descriptors 0 to 2 were closed"),
+        warns[0].contains("at least two of this process's descriptors 0 to 2 were closed"),
         "{warns:?}"
     );
     for said in says {
@@ -836,7 +836,9 @@ fn macos_late_teardown_whose_wait_passes_its_threshold_warns_once_and_still_reap
     assert_kill_sent(pid, &sent);
     assert_eq!(warns.len(), 2, "the slow wait, then the event: {warns:?}");
     assert!(
-        warns[0].contains("still waiting for it to exit") && warns[0].contains("after its kill"),
+        warns[0].contains("not reapable")
+            && warns[0].contains("a tracer holds its exit")
+            && warns[0].contains("still waiting for it to exit"),
         "{warns:?}"
     );
     assert!(warns[1].contains(SAID_REAPED), "{warns:?}");

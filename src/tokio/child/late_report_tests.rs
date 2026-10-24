@@ -126,33 +126,28 @@ async fn macos_tokio_spawn_of_a_late_reporting_child_kills_and_reaps_it_through_
     );
 }
 
-/// On a multi-thread runtime the late teardown's wait runs inside `block_in_place`, so the worker's
-/// other tasks keep running behind it; the hook before the teardown runs inside that wait and probes
-/// it. (Every other test here runs on a `current_thread` runtime, where the wait runs in place and
-/// must not panic.) The spawn runs with no `await` in it, so its thread-local seams stay on one thread.
+/// A late spawn inside `LocalSet::run_until` on a multi-thread runtime tears its child down without
+/// panicking. tokio refuses `block_in_place` there, even though the runtime is multi-thread and
+/// offers no way to ask beforehand, so the wait always runs in place. The spawn runs with no `await`
+/// in it, so its thread-local seams stay on one thread.
 ///
-/// Mutants: the wait is not wrapped in `block_in_place`; it is wrapped on every flavour.
+/// Mutant: the wait runs in `block_in_place` on a multi-thread runtime, which panics here and leaves
+/// the child running.
 #[skuld::test]
-fn macos_tokio_late_teardown_on_a_multi_thread_runtime_waits_inside_block_in_place() {
+fn macos_tokio_late_teardown_inside_a_local_set_on_a_multi_thread_runtime_reaps_the_child() {
     let runtime = ::tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
         .enable_all()
         .build()
         .unwrap();
-    let (inside, fate) = runtime
-        .block_on(runtime.spawn(async {
-            let probed = Rc::new(Cell::new(None));
-            let _hook =
-                crate::child::spawn::fault::set_at(crate::child::spawn::fault::SpawnPoint::BeforeLateTeardown, {
-                    let probed = Rc::clone(&probed);
-                    move || probed.set(Some(crate::tokio::test_runtime::inside_block_in_place()))
-                });
-            let (late, writer) = late_spawn(|| vec![]);
-            drop(writer);
-            (probed.get(), late.fate)
-        }))
-        .unwrap();
-    assert_eq!(inside, Some(true), "the wait must run inside `block_in_place`");
+    let local = ::tokio::task::LocalSet::new();
+    let (flavor, fate) = runtime.block_on(local.run_until(async {
+        let flavor = ::tokio::runtime::Handle::current().runtime_flavor();
+        let (late, writer) = late_spawn(|| vec![]);
+        drop(writer);
+        (flavor, late.fate)
+    }));
+    assert_eq!(flavor, ::tokio::runtime::RuntimeFlavor::MultiThread);
     assert_eq!(fate, ChildFate::Reaped);
 }
 

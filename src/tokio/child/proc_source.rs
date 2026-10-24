@@ -127,8 +127,13 @@ impl std::os::fd::AsFd for PinnedPidfd {
 
 /// How long [`ProcSource::reap_unreported`] waits before it says it is still waiting. A message only:
 /// the wait never gives up.
-#[cfg(target_os = "macos")]
-const SLOW_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+#[cfg(all(target_os = "macos", not(test)))]
+const SLOW_WAIT: Option<std::time::Duration> = Some(std::time::Duration::from_secs(1));
+
+/// No slow-wait message in a test: a loaded runner could pass the threshold, and a test's verdict
+/// must not depend on elapsed time. The threshold's own test is `child::spawn`'s.
+#[cfg(all(target_os = "macos", test))]
+const SLOW_WAIT: Option<std::time::Duration> = None;
 
 /// Why a child is forgotten by [`ProcSource::forget_foreign`], completing "child N ...".
 #[cfg(unix)]
@@ -1079,9 +1084,10 @@ impl ProcSource {
     /// released instead, to tokio's orphan reaper, which reaps it once it exits: forgetting it would
     /// leave a zombie nothing collects.
     ///
-    /// The wait for the killed child's exit blocks this thread, as the spawn's other waits do
-    /// (principle 2): inside `block_in_place` on a multi-thread runtime, in place on a `current_thread`
-    /// one. It logs one `warn` naming the child once it passes [`SLOW_WAIT`], and goes on waiting.
+    /// The wait for the killed child's exit blocks this thread in place, as the spawn's other waits do
+    /// (principle 2), on every runtime: tokio's `block_in_place` panics inside a `LocalSet`, even on a
+    /// multi-thread runtime, and cannot be asked beforehand. It logs one `warn` naming the child once it
+    /// passes [`SLOW_WAIT`], and goes on waiting.
     /// Consumes the backend. **Invariant:** no `wait()` future for this child is in flight.
     #[cfg(target_os = "macos")]
     pub(crate) fn reap_unreported(
@@ -1091,9 +1097,7 @@ impl ProcSource {
         prepared: crate::containment::Prepared,
     ) -> ChildFate {
         crate::bounded::assert_may_block("reap_unreported");
-        let done = crate::tokio::blocking::wait_in_place(|| {
-            crate::child::spawn::kill_and_reap_unreported(pid, unique, prepared, Some(SLOW_WAIT))
-        });
+        let done = crate::child::spawn::kill_and_reap_unreported(pid, unique, prepared, SLOW_WAIT);
         if matches!(done.fate, ChildFate::Running { .. }) {
             self.release();
             return done.warn(

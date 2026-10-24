@@ -142,6 +142,7 @@ fn a_late_report_may_have_started_and_keeps_its_id() {
         "a late child is not a corpse: {error}"
     );
     assert!(error.to_string().contains("exec cannot be confirmed"), "{error}");
+    assert!(error.to_string().contains("at least two of"), "{error}");
     assert!(
         matches!(error, Error::Io(ref e) if e.raw_os_error().is_none()),
         "{error:?}"
