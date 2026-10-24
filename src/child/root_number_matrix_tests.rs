@@ -1,7 +1,9 @@
 //! What the tree paths send, for every mechanism that has a root, every way the root can be reaped
-//! (and, on Linux, a root whose handle cannot answer), and every tree entry point, sync and tokio. After a reap the root's number may name another
-//! process, so nothing may go out by it: no `killpg`, no walk from the root's pid, no signal by a
-//! bare pid. What names the tree exactly still runs: an fd marker's holders, a cgroup's kill.
+//! or its handle fail to vouch for it, and every tree entry point, sync and tokio. After a reap the
+//! root's number may name another process, so nothing may go out by it: no `killpg`, no walk from
+//! the root's pid, no signal by a bare pid. What names the tree exactly still runs: an fd marker's
+//! holders, a cgroup's kill. A `TreeWalk` checks the root after its snapshot instead, and walks
+//! nothing once the root is gone.
 //!
 //! The recorders replace `killpg` with a record and record every walk, holder signal, pidfd signal,
 //! `cgroup.kill` write and bare-pid `SIGTERM`, so a mutant that sends by number reaches no process.
@@ -28,6 +30,8 @@ enum Mechanism {
     MarkerWithGroup,
     #[cfg(target_os = "macos")]
     MarkerWalk,
+    /// `Attached::TreeWalk`: `ContainMode::TreeWalk`, with the fd marker suppressed on macOS.
+    TreeWalk,
     #[cfg(target_os = "linux")]
     Cgroup,
 }
@@ -40,9 +44,15 @@ impl Mechanism {
             Mechanism::MarkerWithGroup => true,
             #[cfg(target_os = "macos")]
             Mechanism::MarkerWalk => false,
+            Mechanism::TreeWalk => false,
             #[cfg(target_os = "linux")]
             Mechanism::Cgroup => false,
         }
+    }
+
+    /// Whether the tree is reached by a walk from the root's pid.
+    fn walks(self) -> bool {
+        self.is_marker() || self == Mechanism::TreeWalk
     }
 
     fn is_marker(self) -> bool {
@@ -68,6 +78,7 @@ impl Mechanism {
             Mechanism::MarkerWithGroup => crate::ContainMode::Session,
             #[cfg(target_os = "macos")]
             Mechanism::MarkerWalk => crate::ContainMode::TreeWalk,
+            Mechanism::TreeWalk => crate::ContainMode::TreeWalk,
             #[cfg(target_os = "linux")]
             Mechanism::Cgroup => crate::ContainMode::Strongest,
         }
@@ -78,6 +89,7 @@ impl Mechanism {
             Mechanism::Group => crate::Containment::Session,
             #[cfg(target_os = "macos")]
             Mechanism::MarkerWithGroup | Mechanism::MarkerWalk => crate::Containment::FdMarker,
+            Mechanism::TreeWalk => crate::Containment::TreeWalk,
             #[cfg(target_os = "linux")]
             Mechanism::Cgroup => crate::Containment::CgroupV2,
         }
@@ -88,7 +100,7 @@ impl Mechanism {
         cmd.args(["sh", "-c", TREE]);
         cmd.contain_with(self.mode());
         #[cfg(target_os = "macos")]
-        if self == Mechanism::Group {
+        if matches!(self, Mechanism::Group | Mechanism::TreeWalk) {
             cmd.suppress_fd_marker();
         }
         cmd.stdin(crate::Stdio::pipe_in()).expect("stdin pipe");
@@ -110,10 +122,13 @@ exec sleep 300"#;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Reap {
     None,
-    /// Linux: not reaped, but the root's own handle cannot answer (`RootState::Unknown`), so its pid
-    /// may name another process while its pidfd still names it exactly.
-    #[cfg(target_os = "linux")]
+    /// Not reaped, but the root's own handle cannot answer (`RootState::Unknown`), so its pid may
+    /// name another process. On Linux its pidfd still names it exactly.
     Unanswered,
+    /// macOS: not reaped, but launchd holds the root (`RootState::Unpinned`) and may reap it at any
+    /// time.
+    #[cfg(target_os = "macos")]
+    Unpinned,
     OwnFree,
     OwnReused,
     ForeignFree,
@@ -123,8 +138,9 @@ enum Reap {
 impl Reap {
     const ALL: &[Reap] = &[
         Reap::None,
-        #[cfg(target_os = "linux")]
         Reap::Unanswered,
+        #[cfg(target_os = "macos")]
+        Reap::Unpinned,
         Reap::OwnFree,
         Reap::OwnReused,
         Reap::ForeignFree,
@@ -138,19 +154,20 @@ impl Reap {
     /// Whether the root is reaped when the entry point runs.
     fn reaped(self) -> bool {
         match self {
-            Reap::None => false,
-            #[cfg(target_os = "linux")]
-            Reap::Unanswered => false,
+            Reap::None | Reap::Unanswered => false,
+            #[cfg(target_os = "macos")]
+            Reap::Unpinned => false,
             _ => true,
         }
     }
 
-    /// Whether the cell exists for `mechanism`: the handle's answer is read only by a mechanism
-    /// that reaches its tree through the root's number.
+    /// Whether the cell exists for `mechanism`. On Linux the handle's answer is read only by a
+    /// mechanism that reaches its tree through the root's number and does not check the root itself;
+    /// macOS reads it for every mechanism.
     fn applies_to(self, mechanism: Mechanism) -> bool {
         #[cfg(target_os = "linux")]
         if self == Reap::Unanswered {
-            return !mechanism.is_cgroup();
+            return !mechanism.is_cgroup() && mechanism != Mechanism::TreeWalk;
         }
         let _ = mechanism;
         true
@@ -159,9 +176,9 @@ impl Reap {
     /// What every read of the root's pid answers after the reap: nothing, or another process.
     fn read(self, root: ProcessId) -> Option<Resolved<ProcessId>> {
         match self {
-            Reap::None => None,
-            #[cfg(target_os = "linux")]
-            Reap::Unanswered => None,
+            Reap::None | Reap::Unanswered => None,
+            #[cfg(target_os = "macos")]
+            Reap::Unpinned => None,
             Reap::OwnFree | Reap::ForeignFree => Some(Resolved::Gone),
             Reap::OwnReused | Reap::ForeignReused => Some(Resolved::Found(ProcessId::from_parts_for_test(
                 root.pid(),
@@ -172,23 +189,59 @@ impl Reap {
 }
 
 impl Reap {
-    /// Arms what makes the root read as this reap, until the guard drops.
+    /// Arms what makes the root read as this reap, until the guard drops. On macOS every look at the
+    /// root answers the same, so a graceful shutdown's sweep reads what its signal read.
     fn force(self, id: ProcessId) -> Option<Box<dyn std::any::Any>> {
         #[cfg(target_os = "linux")]
         if self == Reap::Unanswered {
             let failed = Err(std::io::Error::other("forced peek failure"));
             return Some(Box::new(crate::wait::exit_only::seams::force_peek_once(failed)));
         }
+        #[cfg(target_os = "macos")]
+        {
+            use crate::wait::exit_only::seams::force_every_peek;
+            use crate::wait::exit_only::{Foreign, Peek};
+            match self {
+                Reap::Unanswered => {
+                    return Some(Box::new(force_every_peek(|| {
+                        Err(std::io::Error::other("forced peek failure"))
+                    })));
+                }
+                Reap::Unpinned => {
+                    return Some(Box::new(force_every_peek(|| Ok(Peek::Foreign(Foreign::Orphaned)))));
+                }
+                _ => {}
+            }
+        }
         self.read(id)
             .map(|read| Box::new(crate::child::fault::force_root_reads(read)) as Box<dyn std::any::Any>)
     }
 
-    /// Checks that the failed peek was the one look at the root the entry point took.
+    /// Checks that the failed peek was the one look at the root the entry point took (Linux).
     fn assert_forced_used(self) {
         #[cfg(target_os = "linux")]
         if self == Reap::Unanswered {
             crate::wait::exit_only::seams::assert_peeks_exhausted();
         }
+    }
+
+    /// Whether the root is unreaped, but its handle cannot vouch for it.
+    fn untrusted(self) -> bool {
+        !self.reaped() && self != Reap::None
+    }
+
+    fn unpinned(self) -> bool {
+        #[cfg(target_os = "macos")]
+        if self == Reap::Unpinned {
+            return true;
+        }
+        false
+    }
+
+    /// Whether the force must be lifted before the cell's cleanup kills and reaps the root: a macOS
+    /// root forced untrusted would refuse both.
+    fn lift_before_cleanup(self) -> bool {
+        cfg!(target_os = "macos") && self.untrusted()
     }
 }
 
@@ -233,6 +286,8 @@ struct Sent {
     // Exact.
     /// The signals the `cat`, a marker holder, got through the holders channel.
     holder: Vec<nix::sys::signal::Signal>,
+    /// The signals the root, also a marker holder, got through the holders channel.
+    root_holder: Vec<nix::sys::signal::Signal>,
     pidfd: bool,
     cgroup_kill: bool,
 }
@@ -263,6 +318,8 @@ struct Expected {
     by_pid: Want,
     /// `None`: not checked.
     holder: Option<&'static [nix::sys::signal::Signal]>,
+    /// `None`: not checked.
+    root_holder: Option<&'static [nix::sys::signal::Signal]>,
     pidfd: Want,
     cgroup_kill: Want,
 }
@@ -282,7 +339,7 @@ fn expected(mechanism: Mechanism, reap: Reap, op: Op) -> Expected {
         (true, Reap::OwnFree) => KILLPG_AFTER_OWN_REAP,
         (true, _) => Want::No,
     };
-    let walk = if mechanism.is_marker() && !reaped {
+    let walk = if mechanism.walks() && reap == Reap::None {
         Want::Yes
     } else {
         Want::No
@@ -294,15 +351,29 @@ fn expected(mechanism: Mechanism, reap: Reap, op: Op) -> Expected {
     } else {
         Want::Any
     };
-    let holder: Option<&'static [nix::sys::signal::Signal]> = match (mechanism.is_marker(), reaped) {
-        (true, true) => Some(match op {
+    let holder: Option<&'static [nix::sys::signal::Signal]> = match (mechanism.is_marker(), reap == Reap::None) {
+        (true, false) => Some(match op {
             Op::Kill => &[SIGKILL],
             Op::Terminate => &[SIGTERM],
             Op::GracefulShutdown => &[SIGTERM, SIGKILL],
         }),
         // The walk reaches the `cat` first.
-        (true, false) => None,
+        (true, true) => None,
         (false, _) => Some(&[]),
+    };
+    // A macOS root the handle cannot vouch for: launchd's zombie is left alone, and an unanswered
+    // root is signalled with the other holders. A graceful shutdown's `SIGTERM` may end it before
+    // the sweep looks for holders.
+    let root_holder: Option<&'static [nix::sys::signal::Signal]> = if !(cfg!(target_os = "macos") && reap.untrusted()) {
+        None
+    } else if !mechanism.is_marker() || reap.unpinned() {
+        Some(&[])
+    } else {
+        match op {
+            Op::Kill => Some(&[SIGKILL]),
+            Op::Terminate => Some(&[SIGTERM]),
+            Op::GracefulShutdown => None,
+        }
     };
     // The handle backstop, through the pidfd; after a reap it has nothing to reach. A root whose
     // handle cannot answer is signalled through it by every entry point: it names the root exactly.
@@ -323,6 +394,7 @@ fn expected(mechanism: Mechanism, reap: Reap, op: Op) -> Expected {
         walk,
         by_pid,
         holder,
+        root_holder,
         pidfd,
         cgroup_kill,
     }
@@ -344,6 +416,11 @@ fn mismatches(want: &Expected, sent: &Sent) -> Vec<String> {
     if let Some(holder) = want.holder {
         if sent.holder != holder {
             wrong.push(format!("holder: want {holder:?}, sent {:?}", sent.holder));
+        }
+    }
+    if let Some(root) = want.root_holder {
+        if sent.root_holder != root {
+            wrong.push(format!("root holder: want {root:?}, sent {:?}", sent.root_holder));
         }
     }
     wrong
@@ -401,6 +478,10 @@ impl Recorders {
             holder: self.holders.signals_to(cat),
             #[cfg(not(target_os = "macos"))]
             holder: Vec::new(),
+            #[cfg(target_os = "macos")]
+            root_holder: self.holders.signals_to(root),
+            #[cfg(not(target_os = "macos"))]
+            root_holder: Vec::new(),
             pidfd: entries.iter().any(|(pid, _, via)| *pid == root && *via == Via::Pidfd),
             cgroup_kill,
         }
@@ -435,7 +516,7 @@ fn run_sync(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
             crate::test_child::reaped_elsewhere::reap_behind(root);
         }
     }
-    let forced = reap.force(child.id());
+    let mut forced = reap.force(child.id());
 
     let recorders = Recorders::start();
     // The cell checks what was sent, not what the call answered.
@@ -446,6 +527,9 @@ fn run_sync(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
     };
     reap.assert_forced_used();
     let sent = recorders.sent(root, cat);
+    if reap.lift_before_cleanup() {
+        drop(forced.take());
+    }
 
     // The tree is gone before the drop, which runs under the recorders: it sends no killpg.
     if !reap.reaped() {
@@ -491,7 +575,7 @@ async fn run_tokio(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
             crate::test_child::reaped_elsewhere::reap_behind(root);
         }
     }
-    let forced = reap.force(child.id());
+    let mut forced = reap.force(child.id());
 
     let recorders = Recorders::start();
     // The cell checks what was sent, not what the call answered.
@@ -502,6 +586,9 @@ async fn run_tokio(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
     };
     reap.assert_forced_used();
     let sent = recorders.sent(root, cat);
+    if reap.lift_before_cleanup() {
+        drop(forced.take());
+    }
 
     if !reap.reaped() {
         child.kill().expect("kill the root");
@@ -577,15 +664,18 @@ fn check_matrix(mechanisms: &[Mechanism]) {
     );
 }
 
-/// The process group, and on macOS both fd markers.
+/// The process group, the tree walk, and on macOS both fd markers.
 ///
 /// Mutants: `root_number` answers `Trusted` for any of a foreign reap, an own reap whose pid is
-/// reused, or (macOS, an fd marker) an own reap whose pid names nothing; the holders sweep skipped
-/// after a reap.
+/// reused, (macOS, an fd marker) an own reap whose pid names nothing, or (macOS) a root that is
+/// `Unpinned` or `Unknown`; the holders sweep skipped after a reap or for an untrusted root; an
+/// `Unpinned` root signalled as a holder; `treewalk::hard_kill` or `treewalk::terminate` walks
+/// without `anchor_present`.
 #[skuld::test]
 fn tree_paths_send_nothing_by_the_root_number_after_a_reap() {
     check_matrix(&[
         Mechanism::Group,
+        Mechanism::TreeWalk,
         #[cfg(target_os = "macos")]
         Mechanism::MarkerWithGroup,
         #[cfg(target_os = "macos")]

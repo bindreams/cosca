@@ -220,12 +220,15 @@ fn graceful_shutdown_tree_of_a_root_its_handle_cannot_read_escalates_through_its
 }
 
 /// The same root, but it exits on the `SIGTERM`: `graceful_shutdown_tree` sends no kill, and the one
-/// warn does not say it did. The grace is only an upper bound: the pidfd turns readable at the exit.
+/// warn does not say it did. A hook after the `SIGTERM` checks it went out, then waits for the root
+/// to exit, so the grace's one look at the pidfd at expiry finds it readable.
 ///
-/// Mutants: the kill is sent whatever the root did; the warn says it was.
+/// Mutants: the kill is sent whatever the root did; the warn says it was; the grace wait misses the
+/// pidfd's exit.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn graceful_shutdown_tree_of_a_root_its_handle_cannot_read_sends_no_kill_to_one_that_exited() {
+    use crate::graceful_hooks::{at, HookPoint};
     use crate::signal::Sig::Term;
     use crate::test_child::reaped_elsewhere::ROOT_TERMED_BY_PIDFD;
     use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peek_once};
@@ -235,11 +238,23 @@ fn graceful_shutdown_tree_of_a_root_its_handle_cannot_read_sends_no_kill_to_one_
     let pid = child.id().pid();
 
     let mark = crate::log_capture::mark();
-    let sends = crate::send_log::Capture::start();
+    let sends = std::rc::Rc::new(crate::send_log::Capture::start());
     let forced = force_peek_once(Err(std::io::Error::other("forced peek failure")));
+    let exited_first = at(HookPoint::AfterTerminate, {
+        let sends = std::rc::Rc::clone(&sends);
+        move || {
+            assert_eq!(
+                sends.entries(),
+                [(pid, Term, crate::send_log::Via::Pidfd)],
+                "the SIGTERM went out before the grace"
+            );
+            crate::test_child::wait_until_zombie(pid);
+        }
+    });
     let err = child
-        .graceful_shutdown_tree(std::time::Duration::from_secs(3600))
+        .graceful_shutdown_tree(std::time::Duration::ZERO)
         .expect_err("a group whose root nothing can answer for is not assessable");
+    drop(exited_first);
     assert_peeks_exhausted();
     drop(forced);
 
@@ -384,6 +399,101 @@ fn kill_tree_after_own_wait_and_reuse_kills_a_holder_that_left_the_group() {
         holders.killed().contains(&holder.pid),
         "the holder that left the group is killed: {:?}",
         holders.killed()
+    );
+    let mark = crate::log_capture::mark();
+    drop(child);
+    assert_eq!(
+        warns_since(mark),
+        Vec::<String>::new(),
+        "the tree was killed: the drop does not warn"
+    );
+    holder.assert_dies();
+}
+
+/// After this handle's own reap, with the pid naming nothing, an fd marker with a group (the default
+/// containment) kills its group and its holders, and walks nothing from the pid. `Ok` follows, and
+/// the tree counts as killed, so the drop neither sweeps again nor warns.
+///
+/// Mutants: the tree not marked killed; `no_walk_signal` returns an error.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn kill_tree_after_own_wait_of_a_marker_with_a_group_is_ok_and_marks_the_tree_killed() {
+    use crate::identity::Resolved;
+    use crate::test_child::reaped_elsewhere::escaped_holder_tree;
+    crate::log_capture::install();
+    let groups = record_kill_group();
+    let walks = crate::containment::treewalk::fault::record_walks();
+    let holders = crate::containment::fdmarker::fault::record_holder_kills();
+    let (child, holder) = escaped_holder_tree(crate::ContainMode::Session, false);
+    let pid = child.id().pid();
+    child.kill().expect("kill the root");
+    child.wait().expect("this handle reaps the root");
+    let _gone = crate::child::fault::force_root_reads(Resolved::Gone);
+
+    child.kill_tree().expect("the group and every holder were reached");
+
+    // Routed: the killpg by a pid that names nothing (bindreams/cosca#382).
+    let by_id = groups.killed();
+    assert!(
+        !by_id.is_empty() && by_id.iter().all(|g| *g == pid as i32),
+        "the group is killed by its id: {by_id:?}"
+    );
+    assert_eq!(walks.walked(), Vec::<u32>::new(), "no walk from a reaped root's number");
+    assert_eq!(
+        holders.signals_to(holder.pid),
+        [nix::sys::signal::Signal::SIGKILL],
+        "the holder that left the group is killed"
+    );
+    let mark = crate::log_capture::mark();
+    drop(child);
+    assert_eq!(
+        warns_since(mark),
+        Vec::<String>::new(),
+        "the tree was killed: the drop does not warn"
+    );
+    holder.assert_dies();
+}
+
+/// `graceful_shutdown_tree` after this handle's own reap, with the pid naming nothing: the group and
+/// the holders get the `SIGTERM`, then the kill, and no walk runs from the pid. The holder ignores
+/// the `SIGTERM`, so only the kill ends it. The call answers the status the wait collected, and the
+/// tree counts as killed, so the drop does not warn.
+///
+/// Mutants: the `SIGTERM` skipped or answered with an error; the tree not marked killed;
+/// `no_walk_signal` returns an error.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn graceful_shutdown_tree_after_own_wait_of_a_marker_with_a_group_answers_the_collected_status() {
+    use crate::identity::Resolved;
+    use crate::test_child::reaped_elsewhere::escaped_holder_tree;
+    crate::log_capture::install();
+    let killed = record_kill_group();
+    let termed = record_term_group();
+    let walks = crate::containment::treewalk::fault::record_walks();
+    let holders = crate::containment::fdmarker::fault::record_holder_kills();
+    let (child, holder) = escaped_holder_tree(crate::ContainMode::Session, true);
+    let pid = child.id().pid();
+    child.kill().expect("kill the root");
+    let collected = child.wait().expect("this handle reaps the root");
+    let _gone = crate::child::fault::force_root_reads(Resolved::Gone);
+
+    let status = child
+        .graceful_shutdown_tree(std::time::Duration::ZERO)
+        .expect("the group and every holder were reached");
+
+    assert_eq!(status, collected, "the status the wait collected");
+    // Routed: the group's signals by a pid that names nothing (bindreams/cosca#382).
+    for (what, by_id) in [("SIGTERM", termed.termed()), ("kill", killed.killed())] {
+        assert!(
+            !by_id.is_empty() && by_id.iter().all(|g| *g == pid as i32),
+            "the group's {what} by its id: {by_id:?}"
+        );
+    }
+    assert_eq!(walks.walked(), Vec::<u32>::new(), "no walk from a reaped root's number");
+    assert_eq!(
+        holders.signals_to(holder.pid),
+        [nix::sys::signal::Signal::SIGTERM, nix::sys::signal::Signal::SIGKILL],
+        "the SIGTERM, then the kill"
     );
     let mark = crate::log_capture::mark();
     drop(child);

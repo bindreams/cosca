@@ -43,6 +43,9 @@ pub(crate) enum ForcedReap {
 
 type StepHook = Box<dyn FnOnce()>;
 
+/// What every peek answers under [`force_every_peek`].
+type PeekAnswer = fn() -> io::Result<Peek>;
+
 /// Told the `options` of each `waitid` this thread makes.
 #[cfg(target_os = "linux")]
 type WaitidObserver = Box<dyn FnMut(u32)>;
@@ -56,6 +59,7 @@ struct RegisteredHook {
 
 thread_local! {
     static FORCED_PEEK: RefCell<std::collections::VecDeque<io::Result<Peek>>> = const { RefCell::new(std::collections::VecDeque::new()) };
+    static FORCED_EVERY_PEEK: Cell<Option<PeekAnswer>> = const { Cell::new(None) };
     static FORCED_REAP: Cell<Option<ForcedReap>> = const { Cell::new(None) };
     static FORCED_SI_CODE: Cell<Option<i32>> = const { Cell::new(None) };
     #[cfg(target_os = "linux")]
@@ -105,8 +109,18 @@ pub(crate) fn assert_peeks_exhausted() {
     assert_eq!(left, 0, "{left} forced peek(s) were never consumed");
 }
 
+/// Every peek on this thread answers `answer()`, after any of [`force_peeks`], until the guard drops:
+/// for a test that cannot count the looks a call takes.
+#[cfg(target_os = "macos")]
+pub(crate) fn force_every_peek(answer: PeekAnswer) -> Forced {
+    FORCED_EVERY_PEEK.with(|f| f.set(Some(answer)));
+    Forced(|| FORCED_EVERY_PEEK.with(|f| f.set(None)))
+}
+
 pub(crate) fn take_forced_peek() -> Option<io::Result<Peek>> {
-    FORCED_PEEK.with(|f| f.borrow_mut().pop_front())
+    FORCED_PEEK
+        .with(|f| f.borrow_mut().pop_front())
+        .or_else(|| FORCED_EVERY_PEEK.with(Cell::get).map(|answer| answer()))
 }
 
 /// The next consuming reap on this thread finds `what` instead of calling the OS.

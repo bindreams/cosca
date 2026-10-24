@@ -241,7 +241,11 @@ async fn tokio_graceful_shutdown_tree_of_a_root_its_handle_cannot_read_escalates
 }
 
 /// The sync `graceful_shutdown_tree_of_a_root_its_handle_cannot_read_sends_no_kill_to_one_that_exited`'s
-/// twin. Same mutants.
+/// twin. The grace's deadline has passed when its wait arms (the clock it is computed on lags an
+/// hour), so the timer wins the first poll, before the reactor reports the exit: only the one look at
+/// the pidfd at expiry can see it.
+///
+/// Mutants: the sync twin's; no look at the pidfd at expiry.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn tokio_graceful_shutdown_tree_of_a_root_its_handle_cannot_read_sends_no_kill_to_one_that_exited() {
@@ -255,12 +259,29 @@ async fn tokio_graceful_shutdown_tree_of_a_root_its_handle_cannot_read_sends_no_
     let pid = child.id().pid();
 
     let mark = crate::log_capture::mark();
-    let sends = crate::send_log::Capture::start();
+    let sends = std::rc::Rc::new(crate::send_log::Capture::start());
     let forced = force_peek_once(Err(std::io::Error::other("forced peek failure")));
+    let exited_first = crate::graceful_hooks::at(crate::graceful_hooks::HookPoint::AfterTerminate, {
+        let sends = std::rc::Rc::clone(&sends);
+        move || {
+            assert_eq!(
+                sends.entries(),
+                [(pid, Term, crate::send_log::Via::Pidfd)],
+                "the SIGTERM went out before the grace"
+            );
+            crate::test_child::wait_until_zombie(pid);
+        }
+    });
+    let past = crate::tokio::wait::tokio_now()
+        .checked_sub(std::time::Duration::from_secs(3600))
+        .expect("an hour before now");
+    let lagging = crate::tokio::wait::now_override::install(past);
     let err = child
-        .graceful_shutdown_tree(std::time::Duration::from_secs(3600))
+        .graceful_shutdown_tree(std::time::Duration::from_secs(60))
         .await
         .expect_err("a group whose root nothing can answer for is not assessable");
+    drop(lagging);
+    drop(exited_first);
     assert_peeks_exhausted();
     drop(forced);
 
@@ -512,6 +533,94 @@ async fn tokio_kill_tree_after_own_wait_and_reuse_kills_a_holder_that_left_the_g
         holders.killed().contains(&holder),
         "the holder that left the group is killed: {:?}",
         holders.killed()
+    );
+    let mark = crate::log_capture::mark();
+    drop(child);
+    assert_eq!(
+        warns_since(mark),
+        Vec::<String>::new(),
+        "the tree was killed: the drop does not warn"
+    );
+    assert_holder_dies(stderr).await;
+}
+
+/// The sync `kill_tree_after_own_wait_of_a_marker_with_a_group_is_ok_and_marks_the_tree_killed`'s
+/// twin. Same mutants.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+async fn tokio_kill_tree_after_own_wait_of_a_marker_with_a_group_is_ok_and_marks_the_tree_killed() {
+    use crate::identity::Resolved;
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let groups = record_kill_group();
+    let walks = crate::containment::treewalk::fault::record_walks();
+    let holders = crate::containment::fdmarker::fault::record_holder_kills();
+    let (mut child, holder, _stdin, stderr) = escaped_holder_tree(crate::ContainMode::Session, false).await;
+    let pid = child.id().pid();
+    child.kill().expect("kill the root");
+    child.wait().await.expect("this handle reaps the root");
+    let _gone = crate::child::fault::force_root_reads(Resolved::Gone);
+
+    child.kill_tree().expect("the group and every holder were reached");
+
+    // Routed: the killpg by a pid that names nothing (bindreams/cosca#382).
+    let by_id = groups.killed();
+    assert!(
+        !by_id.is_empty() && by_id.iter().all(|g| *g == pid as i32),
+        "the group is killed by its id: {by_id:?}"
+    );
+    assert_eq!(walks.walked(), Vec::<u32>::new(), "no walk from a reaped root's number");
+    assert_eq!(
+        holders.signals_to(holder),
+        [nix::sys::signal::Signal::SIGKILL],
+        "the holder that left the group is killed"
+    );
+    let mark = crate::log_capture::mark();
+    drop(child);
+    assert_eq!(
+        warns_since(mark),
+        Vec::<String>::new(),
+        "the tree was killed: the drop does not warn"
+    );
+    assert_holder_dies(stderr).await;
+}
+
+/// The sync `graceful_shutdown_tree_after_own_wait_of_a_marker_with_a_group_answers_the_collected_status`'s
+/// twin. Same mutants.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+async fn tokio_graceful_shutdown_tree_after_own_wait_of_a_marker_with_a_group_answers_the_collected_status() {
+    use crate::identity::Resolved;
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let killed = record_kill_group();
+    let termed = record_term_group();
+    let walks = crate::containment::treewalk::fault::record_walks();
+    let holders = crate::containment::fdmarker::fault::record_holder_kills();
+    let (mut child, holder, _stdin, stderr) = escaped_holder_tree(crate::ContainMode::Session, true).await;
+    let pid = child.id().pid();
+    child.kill().expect("kill the root");
+    let collected = child.wait().await.expect("this handle reaps the root");
+    let _gone = crate::child::fault::force_root_reads(Resolved::Gone);
+
+    let status = child
+        .graceful_shutdown_tree(std::time::Duration::ZERO)
+        .await
+        .expect("the group and every holder were reached");
+
+    assert_eq!(status, collected, "the status the wait collected");
+    // Routed: the group's signals by a pid that names nothing (bindreams/cosca#382).
+    for (what, by_id) in [("SIGTERM", termed.termed()), ("kill", killed.killed())] {
+        assert!(
+            !by_id.is_empty() && by_id.iter().all(|g| *g == pid as i32),
+            "the group's {what} by its id: {by_id:?}"
+        );
+    }
+    assert_eq!(walks.walked(), Vec::<u32>::new(), "no walk from a reaped root's number");
+    assert_eq!(
+        holders.signals_to(holder),
+        [nix::sys::signal::Signal::SIGTERM, nix::sys::signal::Signal::SIGKILL],
+        "the SIGTERM, then the kill"
     );
     let mark = crate::log_capture::mark();
     drop(child);
