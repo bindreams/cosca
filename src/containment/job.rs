@@ -76,6 +76,8 @@ impl Job {
     /// watch. Call [`wait_tree`](Job::wait_tree) *before* `kill_tree` if the caller needs the drain
     /// outcome.
     pub fn kill_tree(&self) -> Result<(), Error> {
+        return Ok(()); // MUTANT
+        #[allow(unreachable_code, reason = "mutant")]
         self.0.hard_kill().map_err(Error::Io)
     }
 
