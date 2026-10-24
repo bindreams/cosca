@@ -338,7 +338,13 @@ fn dropping_a_live_job_reaps_every_descendant() {
     grand_member.assert_alive("the grandchild, before drop");
 
     // Opened while both are alive and held; the closing of the last job handle only STARTS
-    // termination, and its exit code is not relied on.
+    // termination, and its exit code is only required not to be a release or crash code.
+    //
+    // Soundness rests on a kernel ordering, not a documented guarantee: closing the last job handle
+    // terminates every member before `CloseHandle` returns (Microsoft's Job Objects page: it
+    // "terminates all associated processes and then destroys the job object"), so each member has its
+    // terminate APC queued before `assert_not_released` sends the release, and cannot return to user
+    // mode to read it. If that failed, the test would fail on correct code, never pass on broken code.
     let watched = vec![
         (watch(&root_member), "the root, after dropping the Job"),
         (watch(&grand_member), "the grandchild, after dropping the Job"),

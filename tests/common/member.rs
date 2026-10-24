@@ -88,16 +88,30 @@ pub fn assert_members_killed(members: Vec<(Member, &str)>) {
     }
 }
 
-/// Windows: assert that no member left because it was released. For a kill whose own exit code is
-/// not known (`KILL_ON_JOB_CLOSE`): the tree was started with [`RELEASED_EXIT_ENV`] set to
-/// [`RELEASED_EXIT_CODE`], so a member the kill missed leaves on the release with that code, and
-/// a killed one with any other. Call it right after the kill, before any wait on the tree.
+/// The exit codes a testbin member can leave with for a reason other than the kill, besides
+/// [`RELEASED_EXIT_CODE`]: `101` (a Rust panic) and the NTSTATUS codes of an access violation, an
+/// illegal instruction and a fast-fail abort.
+#[cfg(windows)]
+const CRASH_EXIT_CODES: [u32; 4] = [101, 0xC000_0005, 0xC000_001D, 0xC000_0409];
+
+/// Windows: assert that every member died to the kill and none left for another reason. For a kill
+/// whose own exit code is not known (`KILL_ON_JOB_CLOSE`): the tree was started with
+/// [`RELEASED_EXIT_ENV`] set to [`RELEASED_EXIT_CODE`], so a member the kill missed leaves on the
+/// release with that code. A member that crashed on the release (a panic on a reset socket, say)
+/// leaves with one of [`CRASH_EXIT_CODES`] and must not pass as killed either. Each member's code is
+/// printed (`--no-capture`) and named in the failure. Call it right after the kill, before any wait
+/// on the tree.
 #[cfg(windows)]
 pub fn assert_members_not_released(members: Vec<(Member, &str)>) {
     for (code, who) in release_and_wait(members) {
+        println!("{who}: exit code {code:#x}");
         assert_ne!(
             code, RELEASED_EXIT_CODE,
-            "{who} must be killed, not leave on its own when released"
+            "{who} must be killed, not leave on its own when released (exit code {code:#x})"
+        );
+        assert!(
+            !CRASH_EXIT_CODES.contains(&code),
+            "{who} must be killed, not crash when released (exit code {code:#x})"
         );
     }
 }
