@@ -203,14 +203,14 @@ pub(crate) mod fault {
     type Parents = Box<dyn FnMut() -> (libc::pid_t, libc::pid_t)>;
 
     thread_local! {
-        static PARENTS: std::cell::RefCell<Option<(libc::pid_t, Parents)>> = const { std::cell::RefCell::new(None) };
+        static PARENTS: std::cell::RefCell<Option<(crate::identity::RawPid, Parents)>> = const { std::cell::RefCell::new(None) };
     }
 
     /// While the guard lives, every [`kinfo`](super::kinfo) of `pid` on this thread that finds its
     /// process reports the `(p_oppid, e_ppid)` that `parents` answers at that read: the parent at a
     /// tracer's attach, and the parent now.
     pub(crate) fn force_parents(
-        pid: libc::pid_t,
+        pid: crate::identity::RawPid,
         parents: impl FnMut() -> (libc::pid_t, libc::pid_t) + 'static,
     ) -> ForcedParents {
         PARENTS.with(|p| *p.borrow_mut() = Some((pid, Box::new(parents))));
@@ -226,7 +226,7 @@ pub(crate) mod fault {
         }
     }
 
-    pub(super) fn forced_parents(pid: libc::pid_t) -> Option<(libc::pid_t, libc::pid_t)> {
+    pub(super) fn forced_parents(pid: crate::identity::RawPid) -> Option<(libc::pid_t, libc::pid_t)> {
         PARENTS.with(|p| match p.borrow_mut().as_mut() {
             Some((forced, parents)) if *forced == pid => Some(parents()),
             _ => None,
