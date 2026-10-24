@@ -672,6 +672,8 @@ fn refusal_shape(result: &Result<(), cosca::error::Error>) -> &'static str {
 mod test_harness;
 
 fn main() {
+    #[cfg(feature = "tokio")]
+    common::install_log_capture();
     let mut runner = skuld::TestRunner::new();
     runner.libtest_names();
     runner.require_known_labels();

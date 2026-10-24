@@ -153,6 +153,7 @@ fn nested_member_kill_tree_is_unsupported_end_to_end() {
 mod test_harness;
 
 fn main() {
+    common::install_log_capture();
     let mut runner = skuld::TestRunner::new();
     runner.libtest_names();
     runner.require_known_labels();

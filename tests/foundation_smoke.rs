@@ -89,10 +89,14 @@ fn spawn_public_surface_is_usable() {
     let _ = Stdio::null();
 }
 
+#[path = "common/mod.rs"]
+mod common;
+
 #[path = "../src/test_harness.rs"]
 mod test_harness;
 
 fn main() {
+    common::install_log_capture();
     let mut runner = skuld::TestRunner::new();
     runner.libtest_names();
     runner.require_known_labels();
