@@ -1,6 +1,6 @@
 //! The macOS wait for a child's exit, by number: a kqueue holding `EVFILT_PROC` (`NOTE_EXIT |
-//! NOTE_REAP | NOTE_SIGNAL`) and `EVFILT_SIGNAL` (`SIGCHLD`), plus a peek. It never reaps: the caller reaps
-//! afterwards through the handle it holds, and for a zombie that returns at once.
+//! NOTE_REAP | NOTE_SIGNAL`) and `EVFILT_SIGNAL` (`SIGCHLD`), plus a peek. It never reaps: the
+//! caller reaps afterwards through the handle it holds, and for a zombie that returns at once.
 //!
 //! - A peek that finds an exit record is [`Waited::Reapable`]. A still-running child blocks on
 //!   the kqueue; a spurious wake, such as a sibling's `SIGCHLD`, only re-peeks.
