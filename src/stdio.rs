@@ -108,8 +108,8 @@ impl Stdio {
     ///
     /// On Windows, if the target is a std stream and this process's own handle for it is null (a GUI
     /// program or a service), the child gets null for this descriptor too; for a descriptor >= 3,
-    /// that means it is closed in the child. When all three of the child's std descriptors are null,
-    /// the OS default applies to them instead.
+    /// that means it is closed in the child. The child gets null there even while another of this
+    /// process's std handles is live.
     pub fn merge(other: Fd) -> Stdio {
         Stdio(StdioKind::Merge(other))
     }

@@ -41,23 +41,35 @@ pub fn assert_every_route(backend: &str, nulled: &str) {
         } else {
             kind("stderr", "pipe")
         };
+        // `merge_live` merges every live slot from a nulled one: all three ends are null.
+        let (stdin, stdout, stderr) = if route == "merge_live" {
+            ("null", "null", "null")
+        } else {
+            (stdin, stdout, stderr)
+        };
         let fd3 = match route {
             "fd3" | "listed" => "open",
             "merge3" if stdout != "null" => "open",
             _ => "closed",
         };
-        let used = [stdin, stdout, stderr].iter().any(|k| *k != "null");
+        // The flag is set whenever this process holds a live handle for a slot: a child end that
+        // is null there (a merge from a null slot) takes its null only through the flag.
+        let used = nulled != "all";
         format!("{route}=usestdhandles={used},stdin={stdin},stdout={stdout},stderr={stderr},fd3={fd3}")
     };
     let got = reports(backend, nulled);
-    let routes = ["std", "argv", "exe", "fd3", "exe_merge", "listed", "merge3"];
+    let routes = [
+        "std",
+        "argv",
+        "exe",
+        "fd3",
+        "exe_merge",
+        "listed",
+        "merge3",
+        "merge_live",
+    ];
     assert_eq!(got.len(), routes.len(), "{got:?}");
     for (route, line) in routes.iter().zip(&got) {
-        // Every child end is null but this process's stderr is live: no `STARTF_USESTDHANDLES`, so
-        // the child gets the OS default, which is not null.
-        if *route == "exe_merge" && nulled == "stdin+stdout" {
-            continue;
-        }
         let (head, stray) = line.rsplit_once(",stray=").unwrap_or((line, "<missing>"));
         assert_eq!(head, want(route), "route {route} with {nulled} nulled: {line}");
         match *route {

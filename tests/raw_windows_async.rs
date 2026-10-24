@@ -207,9 +207,9 @@ fn async_raw_spawn_with_null_parent_std_handles_gives_the_child_null() {
 }
 
 #[cfg(all(windows, feature = "tokio"))]
-/// Async: Only one parent std handle null: the child gets that one null and the others inherited.
-/// Mutants: `STARTF_USESTDHANDLES` set only when stdin / only when stdout / only when stderr is
-/// non-null (each is killed by the case that nulls the other two); `GetFileType(NULL)`.
+/// Async: Only one parent std handle null: the child gets that one null and the others inherited,
+/// and a live slot merged from the null one is null too. Mutants: `STARTF_USESTDHANDLES` set only
+/// when some child end is non-null (`merge_live`); `GetFileType(NULL)`.
 #[skuld::test]
 fn async_raw_spawn_with_one_null_parent_std_handle_gives_the_child_that_one_null() {
     for nulled in ["stdin", "stdout", "stderr"] {
@@ -219,9 +219,9 @@ fn async_raw_spawn_with_one_null_parent_std_handle_gives_the_child_that_one_null
 
 #[cfg(all(windows, feature = "tokio"))]
 /// Async: Two parent std handles null, one live: `STARTF_USESTDHANDLES` is still set, the null slots
-/// are gaps, and a merge from a null stdout is null too. Mutants: `STARTF_USESTDHANDLES` set only
-/// when stdin / only when stdout / only when stderr is non-null; the flag derived from the
-/// std slots before the merge resolves (`exe_merge` with `stdin+stdout` nulled).
+/// are gaps, and a live slot merged from a null one is null too, with a NUL device as the whole
+/// HANDLE_LIST. Mutants: the flag set only when some child end is non-null (`merge_live` and
+/// `exe_merge` with `stdin+stdout` nulled); the flag keyed on one parent slot only (each set).
 #[skuld::test]
 fn async_raw_spawn_with_two_null_parent_std_handles_gives_the_child_two_null() {
     for nulled in ["stdin+stdout", "stdin+stderr", "stdout+stderr"] {

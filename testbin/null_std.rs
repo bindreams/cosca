@@ -41,8 +41,19 @@ const STD: [(&str, STD_HANDLE); 3] = [
 /// `std`: `std::process::Command`. `argv`: cosca's std route. The rest are cosca's raw backend:
 /// `exe` (`executable()`), `fd3` (fd 3 is the null device), `exe_merge` (stderr merged into
 /// stdout), `listed` (fd 3 is the stray file: a handle that is listed, so it must be inherited) and
-/// `merge3` (fd 3 is merged from stdout, so it is null when stdout is).
-const ROUTES: [&str; 7] = ["std", "argv", "exe", "fd3", "exe_merge", "listed", "merge3"];
+/// `merge3` (fd 3 is merged from stdout, so it is null when stdout is) and `merge_live` (every std
+/// slot whose handle in this process is live is merged from the first nulled slot, so all three of
+/// the child's std ends are null while this process still holds a live handle).
+const ROUTES: [&str; 8] = [
+    "std",
+    "argv",
+    "exe",
+    "fd3",
+    "exe_merge",
+    "listed",
+    "merge3",
+    "merge_live",
+];
 
 const STRAY: &str = "stray.txt";
 
@@ -159,11 +170,12 @@ pub fn spawn(backend: &str, nulled: &str, dir: &str) {
         // SAFETY: sets this process's own std handle; restored below.
         unsafe { SetStdHandle(id, HANDLE::default()) }.expect("SetStdHandle(NULL)");
     }
+    let merges = live_merges(&ids);
     let lines: Vec<String> = ROUTES
         .iter()
         .map(|route| {
             let report = Path::new(dir).join(format!("{route}.txt"));
-            match run(backend, route, &report, &stray_hex, &stray) {
+            match run(backend, route, &report, &stray_hex, &stray, &merges) {
                 Ok(()) => format!(
                     "{route}={}",
                     std::fs::read_to_string(&report).expect("the grandchild's report")
@@ -179,6 +191,21 @@ pub fn spawn(backend: &str, nulled: &str, dir: &str) {
     }
 }
 
+/// `(live slot, first nulled slot)` for every std slot not in `ids`: the merges that null the
+/// child's end of a slot this process holds a live handle for. Empty when `ids` is all three.
+fn live_merges(ids: &[(&str, STD_HANDLE)]) -> Vec<(cosca::Fd, cosca::Fd)> {
+    let fd = |id: STD_HANDLE| match id {
+        STD_INPUT_HANDLE => cosca::Fd::STDIN,
+        STD_OUTPUT_HANDLE => cosca::Fd::STDOUT,
+        _ => cosca::Fd::STDERR,
+    };
+    let first_nulled = fd(ids[0].1);
+    STD.iter()
+        .filter(|(_, id)| !ids.iter().any(|(_, n)| n == id))
+        .map(|&(_, id)| (fd(id), first_nulled))
+        .collect()
+}
+
 /// Sets each of `ids` to the matching handle value in `saved`.
 fn restore_std(ids: &[(&str, STD_HANDLE)], saved: &[usize]) {
     for (&(_, id), &h) in ids.iter().zip(saved) {
@@ -188,7 +215,14 @@ fn restore_std(ids: &[(&str, STD_HANDLE)], saved: &[usize]) {
 }
 
 /// Run `report-std-handles <report> <stray>` through `route` and wait for it.
-fn run(backend: &str, route: &str, report: &Path, stray_hex: &str, stray: &std::fs::File) -> Result<(), String> {
+fn run(
+    backend: &str,
+    route: &str,
+    report: &Path,
+    stray_hex: &str,
+    stray: &std::fs::File,
+    merges: &[(cosca::Fd, cosca::Fd)],
+) -> Result<(), String> {
     let exe = std::env::current_exe().expect("current_exe");
     if route == "std" {
         #[allow(
@@ -216,7 +250,7 @@ fn run(backend: &str, route: &str, report: &Path, stray_hex: &str, stray: &std::
     match backend {
         "sync" => {
             let mut cmd = cosca::Command::new();
-            configure_sync(&mut cmd, route, &exe, &argv, stray)?;
+            configure_sync(&mut cmd, route, &exe, &argv, stray, merges)?;
             // Not `status()`, which resets stdout and stderr to inherit and would undo a merge.
             let child = cmd.spawn().map_err(|e| e.to_string())?;
             match child.wait() {
@@ -228,7 +262,7 @@ fn run(backend: &str, route: &str, report: &Path, stray_hex: &str, stray: &std::
         #[cfg(feature = "tokio")]
         "tokio" => {
             let mut cmd = cosca::tokio::Command::new();
-            configure_tokio(&mut cmd, route, &exe, &argv, stray)?;
+            configure_tokio(&mut cmd, route, &exe, &argv, stray, merges)?;
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -252,9 +286,10 @@ fn configure_sync(
     exe: &Path,
     argv: &[OsString],
     stray: &std::fs::File,
+    merges: &[(cosca::Fd, cosca::Fd)],
 ) -> Result<(), String> {
     match route {
-        "exe" | "exe_merge" | "listed" | "merge3" => {
+        "exe" | "exe_merge" | "listed" | "merge3" | "merge_live" => {
             cmd.executable(exe).args(argv);
         }
         "argv" => {
@@ -280,6 +315,11 @@ fn configure_sync(
     if route == "exe_merge" {
         cmd.stderr(cosca::Stdio::merge(cosca::Fd::STDOUT))
             .map_err(|e| e.to_string())?;
+    }
+    if route == "merge_live" {
+        for &(slot, from) in merges {
+            cmd.fd(slot, cosca::Stdio::merge(from)).map_err(|e| e.to_string())?;
+        }
     }
     Ok(())
 }
@@ -292,9 +332,10 @@ fn configure_tokio(
     exe: &Path,
     argv: &[OsString],
     stray: &std::fs::File,
+    merges: &[(cosca::Fd, cosca::Fd)],
 ) -> Result<(), String> {
     match route {
-        "exe" | "exe_merge" | "listed" | "merge3" => {
+        "exe" | "exe_merge" | "listed" | "merge3" | "merge_live" => {
             cmd.executable(exe).args(argv);
         }
         "argv" => {
@@ -320,6 +361,11 @@ fn configure_tokio(
     if route == "exe_merge" {
         cmd.stderr(cosca::Stdio::merge(cosca::Fd::STDOUT))
             .map_err(|e| e.to_string())?;
+    }
+    if route == "merge_live" {
+        for &(slot, from) in merges {
+            cmd.fd(slot, cosca::Stdio::merge(from)).map_err(|e| e.to_string())?;
+        }
     }
     Ok(())
 }
