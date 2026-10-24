@@ -1,5 +1,6 @@
 //! The `dump-env-block` and `spawn-dump-env-block` modes: the environment block a child receives
-//! from each Windows backend, byte for byte.
+//! from each Windows backend, byte for byte. Also `spawn-consent-with-block`, which starts
+//! `consent-spawn` in a given block.
 
 use std::io::Write;
 
@@ -72,6 +73,46 @@ pub fn spawn(backend: &str, ops: &[String]) {
 pub fn spawn_with_block(dump_args: &str, entries: &[String]) {
     let code = create_with_block(entries, &format!("spawn-dump-env-block {dump_args}")).expect("CreateProcessW");
     std::process::exit(code as i32);
+}
+
+/// `spawn-consent-with-block <report> <envdump> <dir> <block-file>`: run `consent-spawn <report>
+/// <envdump> <dir>` in a child whose environment block is exactly the entries of `<block-file>`, in
+/// order, and relay its exit code. Each entry in the file ends in a NUL. The block goes through a
+/// file because a whole inherited environment can exceed the command line's 32767 units.
+pub fn spawn_consent_with_block(args: &[String]) {
+    let [report, env_dump, dir, block_file] = args else {
+        panic!("spawn-consent-with-block <report> <envdump> <dir> <block-file>, got {args:?}");
+    };
+    let block = std::fs::read_to_string(block_file).expect("read the block file");
+    let entries: Vec<String> = block.split_terminator('\0').map(str::to_owned).collect();
+    let line: Vec<String> = ["consent-spawn", report, env_dump, dir]
+        .iter()
+        .map(|a| quote(a))
+        .collect();
+    let code = create_with_block(&entries, &line.join(" ")).expect("CreateProcessW");
+    std::process::exit(code as i32);
+}
+
+/// `arg` quoted for the command line, as the CRT and `CommandLineToArgvW` parse it back.
+fn quote(arg: &str) -> String {
+    if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
+        return arg.to_owned();
+    }
+    let mut out = String::from('"');
+    let mut backslashes = 0;
+    for c in arg.chars() {
+        if c == '\\' {
+            backslashes += 1;
+            continue;
+        }
+        let escaped = if c == '"' { backslashes * 2 + 1 } else { backslashes };
+        out.push_str(&"\\".repeat(escaped));
+        out.push(c);
+        backslashes = 0;
+    }
+    out.push_str(&"\\".repeat(backslashes * 2));
+    out.push('"');
+    out
 }
 
 /// Report whether `CreateProcessW` accepts `entries` as a child's block: `ok`, or `err=<code>`
