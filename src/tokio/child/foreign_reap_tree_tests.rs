@@ -454,6 +454,52 @@ async fn tokio_kill_tree_of_a_backend_forgotten_unproven_treats_the_root_as_unkn
     reap_behind(pid);
 }
 
+/// `graceful_shutdown_tree` of a backend forgotten because it could not be shown to be ours: the
+/// root is `Unknown`, so the `SIGTERM` would go through its pidfd, but the forgotten backend holds
+/// none. Its handle answers `Sent::Unverified`: nothing is sent, no grace is waited, and the one
+/// warn says the handle no longer reaches the root.
+///
+/// Mutant: a backend forgotten unproven answers a signal as `Sent::Gone`.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn tokio_graceful_shutdown_tree_of_a_backend_forgotten_unproven_sends_nothing() {
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let killed = record_kill_group();
+    let termed = record_term_group();
+    let (stdin, writer) = crate::test_child::held_writer_stdin();
+    let mut cmd = crate::tokio::Command::new();
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(stdin).expect("set stdin");
+    cmd.contain_with(crate::ContainMode::Session);
+    let mut child = cmd.spawn().expect("spawn");
+    let pid = child.id().pid();
+    child
+        .proc_mut()
+        .forget_as("was forgotten by a test", super::proc_source::Forgotten::Unproven);
+
+    let mark = crate::log_capture::mark();
+    let sends = crate::send_log::Capture::start();
+    let err = child
+        .graceful_shutdown_tree(std::time::Duration::from_secs(3600))
+        .await
+        .expect_err("a group whose root nothing can answer for is not assessable");
+
+    assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
+    assert_eq!(sends.entries(), [], "nothing is sent, through the handle or otherwise");
+    assert_eq!(killed.killed(), Vec::<i32>::new(), "no killpg by the root's number");
+    assert_eq!(termed.termed(), Vec::<i32>::new(), "no SIGTERM by the root's number");
+    let warns = warns_since(mark);
+    assert_eq!(warns.len(), 1, "exactly one warn: {warns:?}");
+    assert!(warns[0].contains(MAY_STILL_RUN), "{warns:?}");
+    assert!(
+        warns[0].contains("sent nothing: the root's handle no longer reaches it"),
+        "{warns:?}"
+    );
+    drop(writer);
+    reap_behind(pid);
+}
+
 /// A root that leaves a marker holder outside its process group: see
 /// [`escaped_holder_script`](crate::test_child::reaped_elsewhere::escaped_holder_script). Returns the
 /// child, the holder's pid, the held stdin and the stderr the holder's death closes.
