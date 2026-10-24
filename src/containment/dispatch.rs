@@ -553,18 +553,18 @@ impl Attached {
         }
     }
 
-    /// Whether this mechanism fires `killpg` against a pgid that the leader's reap frees for reuse,
-    /// so `kill_tree`/`terminate_tree` check the root first ([`crate::child::root_number`]).
-    /// `ProcessGroup` always carries one; a macOS `FdMarker` does too, when its mode created one
-    /// (`Marker::has_pgid`: `None` for `TreeWalk`, which needs no pgid, matching `Attached::TreeWalk`
-    /// below). `FdMarker` fires `killpg` on `self.pgid` on pass 1 of every sweep, so the hazard is
-    /// the same as `ProcessGroup`'s.
+    /// Whether `kill_tree`/`terminate_tree` must check the root before signalling
+    /// ([`crate::child::root_number`]): this mechanism reaches the tree through the root's number,
+    /// which the root's reap frees for reuse, and nothing in it checks the root first.
+    /// `ProcessGroup` `killpg`s that number. A macOS `FdMarker` walks the process table from it on
+    /// every sweep, and `killpg`s it too when its mode made a group. `TreeWalk` also walks from it,
+    /// but checks after its snapshot that the root still holds it (`treewalk::anchor_present`).
     #[cfg(unix)]
-    pub(crate) fn carries_recyclable_pgid(&self) -> bool {
+    pub(crate) fn needs_root_check(&self) -> bool {
         match self {
             Attached::ProcessGroup(_) => true,
             #[cfg(target_os = "macos")]
-            Attached::FdMarker(m) => m.has_pgid(),
+            Attached::FdMarker(_) => true,
             _ => false,
         }
     }

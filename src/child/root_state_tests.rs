@@ -66,7 +66,7 @@ mod linux {
         let recorder = record_kill_group();
         let (child, writer) = session_blocker();
         assert!(
-            child.attached.carries_recyclable_pgid(),
+            child.attached.needs_root_check(),
             "the test needs a number-named group kill"
         );
         let token = StartToken::from_raw(child.id().start_token_raw());

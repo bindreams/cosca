@@ -955,10 +955,7 @@ async fn finish_elevated_after_a_foreign_reap_sends_no_killpg_to_a_process_group
     cmd.stdin(stdin).expect("set stdin pipe");
     cmd.contain_with(crate::ContainMode::Session);
     let child = cmd.spawn().expect("spawn");
-    assert!(
-        child.carries_recyclable_pgid(),
-        "the test needs a number-named group kill"
-    );
+    assert!(child.needs_root_check(), "the test needs a number-named group kill");
     let pid = child.id().pid();
     drop(writer);
     crate::test_child::wait_until_zombie(pid);

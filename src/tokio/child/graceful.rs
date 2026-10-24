@@ -499,26 +499,21 @@ impl Child {
 
     /// `graceful_shutdown_tree` of an fd marker whose root's number may name another process (`why`):
     /// the `SIGTERM` to its holders, the grace, then a kill of any left, each by the pipe they hold.
+    /// The kill always runs: a marker's drain wait never shows every member exited.
     #[cfg(target_os = "macos")]
     async fn shut_down_holders_only(&self, grace: Duration, why: &str) -> Error {
         use crate::containment::dispatch::TreeSignal;
         let term = crate::child::holders_only(&self.os.attached, TreeSignal::Term);
-        let drained = match crate::tokio::wait::wait_tree_drained_dispatch(
-            &self.os.attached,
-            crate::tokio::wait::deadline_from(grace),
-        )
-        .await
+        if let Err(e) =
+            crate::tokio::wait::wait_tree_drained_dispatch(&self.os.attached, crate::tokio::wait::deadline_from(grace))
+                .await
         {
-            Ok(verdict) => verdict.permits_skipping_sweep(),
-            Err(e) => {
-                log::debug!(
-                    "graceful_shutdown_tree({}): the marker holders' grace wait failed, so they are killed: {e}",
-                    self.id().pid()
-                );
-                false
-            }
-        };
-        let kill = (!drained).then(|| crate::child::holders_only(&self.os.attached, TreeSignal::Kill));
+            log::debug!(
+                "graceful_shutdown_tree({}): the marker holders' grace wait failed, so they are killed now: {e}",
+                self.id().pid()
+            );
+        }
+        let kill = crate::child::holders_only(&self.os.attached, TreeSignal::Kill);
         crate::child::holders_shutdown_error(&self.os.attached, self.id().pid(), why, term, kill)
     }
 }

@@ -78,31 +78,28 @@ fn attached_is_actionable() {
     assert!(Attached::JobObject(crate::containment::windows::JobHandle::create_empty_for_test()).is_actionable());
 }
 
-/// `kill_tree`/`terminate_tree`'s check of a reaped root (`child::root_number`) gates
-/// on this predicate, not on `Attached::ProcessGroup` alone: a macOS `FdMarker` that carries a
-/// pgid fires `killpg` on pass 1 of every sweep, the same hazard.
+/// `kill_tree`/`terminate_tree`'s check of a reaped root (`child::root_number`) gates on this
+/// predicate: a mechanism that reaches its tree through the root's number, with nothing of its own
+/// that checks the root first.
 #[cfg(unix)]
 #[skuld::test]
-fn attached_carries_recyclable_pgid() {
+fn attached_needs_root_check() {
     use super::Attached;
-    assert!(!Attached::None.carries_recyclable_pgid());
-    assert!(!Attached::Delegated.carries_recyclable_pgid());
-    assert!(!Attached::TreeWalk(crate::identity::ProcessId::current()).carries_recyclable_pgid());
-    assert!(Attached::ProcessGroup(0).carries_recyclable_pgid());
+    assert!(!Attached::None.needs_root_check());
+    assert!(!Attached::Delegated.needs_root_check());
+    assert!(!Attached::TreeWalk(crate::identity::ProcessId::current()).needs_root_check());
+    assert!(Attached::ProcessGroup(0).needs_root_check());
     #[cfg(target_os = "linux")]
-    assert!(
-        !Attached::Cgroup(crate::containment::cgroup::CgroupLeaf::placeholder_for_test()).carries_recyclable_pgid()
-    );
+    assert!(!Attached::Cgroup(crate::containment::cgroup::CgroupLeaf::placeholder_for_test()).needs_root_check());
 }
 
-/// The macOS-specific half of `attached_carries_recyclable_pgid`: an `FdMarker` must track
-/// its OWN `pgid`, not the mechanism's mere presence — `TreeWalk` mode creates no pgid at
-/// all (`Marker::pgid: None`), so a marker built for it must read `false` here exactly like
-/// `Attached::TreeWalk` itself, while a marker built for any grouped mode (`pgid: Some(_)`)
-/// must read `true`, matching `Attached::ProcessGroup`.
+/// The macOS half of `attached_needs_root_check`: an `FdMarker` needs the check with or without a
+/// pgid, since every sweep walks from the root's pid.
+///
+/// Mutant: the check gated on the marker's pgid.
 #[cfg(target_os = "macos")]
 #[skuld::test]
-fn attached_fd_marker_carries_recyclable_pgid_tracks_its_own_pgid() {
+fn attached_fd_marker_needs_root_check_with_or_without_a_pgid() {
     use std::os::fd::{AsFd, AsRawFd};
 
     use super::Attached;
@@ -124,8 +121,8 @@ fn attached_fd_marker_carries_recyclable_pgid_tracks_its_own_pgid() {
         )
     }
 
-    assert!(Attached::FdMarker(marker_with_pgid(Some(1234))).carries_recyclable_pgid());
-    assert!(!Attached::FdMarker(marker_with_pgid(None)).carries_recyclable_pgid());
+    assert!(Attached::FdMarker(marker_with_pgid(Some(1234))).needs_root_check());
+    assert!(Attached::FdMarker(marker_with_pgid(None)).needs_root_check());
 }
 
 /// Drives the real `attach()` nested arms (not a hand-built variant): a nested

@@ -235,11 +235,11 @@ impl Child {
         Ok(())
     }
 
-    /// Whether this child's tree is named by a number that outlives the root's reap (a process
-    /// group), for a test that needs a number-named group kill.
+    /// Whether this child's tree is reached through the root's number, for a test that needs a
+    /// number-named group kill.
     #[cfg(all(test, unix))]
-    pub(super) fn carries_recyclable_pgid(&self) -> bool {
-        self.os.attached.carries_recyclable_pgid()
+    pub(super) fn needs_root_check(&self) -> bool {
+        self.os.attached.needs_root_check()
     }
 
     /// What names this child's tree in a message about a failed teardown of it.
@@ -760,20 +760,22 @@ impl Child {
     /// was skipped. The handle backstop reads the root's state again: a root orphaned during the sweep
     /// is an exited zombie, so the backstop is skipped and the sweep's answer stands.
     ///
-    /// **A root reaped by something else.** A process group, and a macOS fd marker's group and walk,
-    /// are named by the root's pid. If the root's own handle shows it was reaped by another reaper in
-    /// the process, or cannot say, that pid may name another process: nothing is sent by it, and the
-    /// call returns [`Error::Unassessable`](crate::error::Error::Unassessable), with a `warn` naming
-    /// what it skipped. Once this handle reaped the root itself, another process at that pid means the
-    /// group is empty: nothing is sent by the pid, and the call is `Ok`; a pid that cannot be read is
-    /// `Unassessable` as above. Either way an fd marker still kills its marker holders, which are
-    /// named by the pipe they hold, so no pid reuse redirects the kill. After this handle's own reap
-    /// the call is `Ok` only if every holder was reached, and a pid that names no process is still
-    /// signalled as the group's id: the root's group while a member survives, but once none does,
-    /// another process may take the number, and lead a group by it, first (bindreams/cosca#382). A
-    /// foreign reap after that look is not seen, and the signals by that number (the group's, and an
-    /// fd marker's walk from the root's pid) then go out, for the whole sweep, to a number another
-    /// process may hold.
+    /// **A root reaped by something else.** A process group, and a macOS fd marker's group and
+    /// walk, are named by the root's pid. If the root's own handle shows it was reaped by another
+    /// reaper in the process, or, on Linux, cannot say, that pid may name another process: nothing
+    /// is sent by it, and the call returns
+    /// [`Error::Unassessable`](crate::error::Error::Unassessable), with a `warn` naming what it
+    /// skipped. On macOS a root the handle cannot say about is answered as in the paragraph above.
+    /// Once this handle reaped the root itself, another process at that pid means the group is
+    /// empty, and a walk from the pid would find only that process's children: nothing is sent by
+    /// the pid, and the call is `Ok`; a pid that cannot be read is `Unassessable` as above. Either
+    /// way an fd marker still kills its marker holders, which are named by the pipe they hold, so
+    /// no pid reuse redirects the kill. After this handle's own reap the call is `Ok` only if every
+    /// holder was reached, and a pid that names no process is still signalled as the group's id:
+    /// the root's group while a member survives, but once none does, another process may take the
+    /// number, and lead a group by it, first (bindreams/cosca#382). A foreign reap after that look
+    /// is not seen, and the signals by that number (the group's, and an fd marker's walk from the
+    /// root's pid) then go out, for the whole sweep, to a number another process may hold.
     pub fn kill_tree(&mut self) -> Result<(), Error> {
         self.kill_tree_after(None)
     }
