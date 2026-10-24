@@ -6,6 +6,7 @@
 use crate::containment::unix::fault::{record_kill_group, record_term_group};
 use crate::test_child::reaped_elsewhere::{
     assert_one_reaped_elsewhere_warn, assert_one_untrusted_number_warn, foreign_reaped_group_root, session_sleep,
+    warns_since,
 };
 
 /// Mutants: `killpg` sent; the decision taken on the number alone (it shows no recycle).
@@ -109,4 +110,123 @@ fn kill_tree_of_a_root_its_handle_cannot_read_sends_no_killpg() {
     assert_one_untrusted_number_warn(mark, pid);
     child.kill().expect("kill the root");
     child.wait().expect("reap the root");
+}
+
+/// After a foreign reap, `graceful_shutdown_tree` ends with `terminate_tree`'s answer: one warn, no
+/// grace and no sweep, which would warn again and claim a `SIGTERM` was sent.
+///
+/// Mutant: the `Unassessable` falls through to the grace and the sweep.
+#[skuld::test]
+fn graceful_shutdown_tree_after_a_foreign_reap_warns_once_and_ends() {
+    crate::log_capture::install();
+    let killed = record_kill_group();
+    let termed = record_term_group();
+    let (child, pgid) = foreign_reaped_group_root();
+
+    let mark = crate::log_capture::mark();
+    let err = child
+        .graceful_shutdown_tree(std::time::Duration::from_secs(1))
+        .expect_err("a group whose root was reaped elsewhere is not assessable");
+
+    assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
+    assert_eq!(
+        killed.killed(),
+        Vec::<i32>::new(),
+        "no killpg by a reaped root's number"
+    );
+    assert_eq!(
+        termed.termed(),
+        Vec::<i32>::new(),
+        "no SIGTERM by a reaped root's number"
+    );
+    assert_one_reaped_elsewhere_warn(mark, pgid);
+    let warns = warns_since(mark);
+    assert_eq!(warns.len(), 1, "exactly one warn: {warns:?}");
+    assert!(
+        !warns[0].contains("was sent before it"),
+        "no SIGTERM was sent: {warns:?}"
+    );
+}
+
+/// After this handle's own reap, with the pid reused, an fd marker still kills its holders by the
+/// pipe they hold, which no pid reuse redirects, including one that left the group. `Ok` follows
+/// the sweep, and the tree counts as killed, so the drop has nothing to warn about.
+///
+/// Mutants: `Ok` without the holders sweep; the tree not marked killed.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn kill_tree_after_own_wait_and_reuse_kills_a_holder_that_left_the_group() {
+    use crate::identity::{ProcessId, Resolved};
+    use crate::test_child::reaped_elsewhere::escaped_holder_tree;
+    crate::log_capture::install();
+    let groups = record_kill_group();
+    let walks = crate::containment::treewalk::fault::record_walks();
+    let holders = crate::containment::fdmarker::fault::record_holder_kills();
+    let (child, holder) = escaped_holder_tree();
+    let pid = child.id().pid();
+    child.kill().expect("kill the root");
+    child.wait().expect("this handle reaps the root");
+    let other = ProcessId::from_parts_for_test(pid, child.id().start_token_raw() + 1);
+    let _reused = crate::child::fault::force_next_root_read(Resolved::Found(other));
+
+    child.kill_tree().expect("every holder was reached");
+
+    assert_eq!(
+        groups.killed(),
+        Vec::<i32>::new(),
+        "no killpg by a reaped root's number"
+    );
+    assert_eq!(walks.walked(), Vec::<u32>::new(), "no walk from a reaped root's number");
+    assert!(
+        holders.killed().contains(&holder.pid),
+        "the holder that left the group is killed: {:?}",
+        holders.killed()
+    );
+    let mark = crate::log_capture::mark();
+    drop(child);
+    assert_eq!(
+        warns_since(mark),
+        Vec::<String>::new(),
+        "the tree was killed: the drop does not warn"
+    );
+    holder.assert_dies();
+}
+
+/// After a foreign reap, an fd marker still kills its holders, by the pipe they hold, including one
+/// that left the group. Only what names the tree by the root's number is skipped, so the call is
+/// `Unassessable`, with one warn naming the group.
+///
+/// Mutant: no holders sweep after a foreign reap.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn kill_tree_after_a_foreign_reap_kills_a_holder_that_left_the_group() {
+    use crate::test_child::reaped_elsewhere::{escaped_holder_tree, reap_behind};
+    crate::log_capture::install();
+    let groups = record_kill_group();
+    let walks = crate::containment::treewalk::fault::record_walks();
+    let holders = crate::containment::fdmarker::fault::record_holder_kills();
+    let (child, holder) = escaped_holder_tree();
+    let pid = child.id().pid();
+    child.kill().expect("kill the root");
+    reap_behind(pid);
+
+    let mark = crate::log_capture::mark();
+    let err = child
+        .kill_tree()
+        .expect_err("a group whose root was reaped elsewhere is not assessable");
+
+    assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
+    assert_eq!(
+        groups.killed(),
+        Vec::<i32>::new(),
+        "no killpg by a reaped root's number"
+    );
+    assert_eq!(walks.walked(), Vec::<u32>::new(), "no walk from a reaped root's number");
+    assert!(
+        holders.killed().contains(&holder.pid),
+        "the holder that left the group is killed: {:?}",
+        holders.killed()
+    );
+    assert_one_reaped_elsewhere_warn(mark, pid);
+    holder.assert_dies();
 }
