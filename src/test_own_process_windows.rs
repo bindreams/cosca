@@ -2,73 +2,29 @@
 //! (the environment, here) in a process of its own. Mounted by `#[path]` into `tests/common` as
 //! `test_own_process`, so a caller names the same items on both platforms.
 //!
-//! The parent re-executes the test binary as
-//! `<exe> --exact <test> --test-threads=1 --nocapture --format json` with [`ENV`] set to the test's
-//! filter. A process takes the child role only if [`ENV`] names this test and its argv is exactly
-//! that shape, so libtest was told to run this one test on one thread and the process is the
-//! test's own. An [`ENV`] naming the test under any other argv (a shell export, an outer harness)
-//! panics rather than run the body in a shared process, and never re-executes, so it cannot
-//! recurse.
-//!
-//! The parent requires a successful exit and the child's suite events to show exactly one test,
-//! which passed: a filter that matches no test, or a body that exits the process, fails the run.
-//!
-//! [`own_process`] returns the [`Completion`] only in the child. A guard that changes
-//! process-global state takes `&Completion`, so a test that forgot `own_process` does not compile.
+//! The role marker, argv and gate are shared with the unix module: see
+//! [`super::test_own_process_gate`]. The transport differs. The parent reads the child's suite
+//! events (`--format json`, part of the shared argv) and requires a successful exit and exactly one
+//! test, which passed: a filter that matches no test, or a body that exits the process, fails the
+//! run.
 
-use std::ffi::OsString;
-use std::process::{Child, Command, Stdio};
+use std::process::Stdio;
 
-/// Forks `command` with `spawn_lock` held for the fork alone: `common::spawn_locked`.
-pub(crate) type Spawn = fn(&mut Command) -> std::io::Result<Child>;
+use super::test_own_process_gate::{child_args, child_role, env_value, gate, test_filter};
+pub(crate) use super::test_own_process_gate::{test_path, Completion, Spawn};
 
-/// The role marker: the filter of the test the child was re-executed for.
-pub(crate) const ENV: &str = "COSCA_TEST_OWN_PROCESS";
+/// The marker's transport field: the parent reads the child's suite events.
+const TRANSPORT: &str = "json";
 
-/// The path of the test fn `$name`, for [`own_process`]. `let _ = $name;` makes a stale name a
-/// compile error rather than a filter that matches nothing.
-#[allow(
-    unused_macros,
-    reason = "unused in the integration binaries that mount this file only for `tests/common`"
-)]
-macro_rules! test_path {
-    ($name:ident) => {{
-        let _ = $name;
-        concat!(module_path!(), "::", stringify!($name))
-    }};
+/// The pid of this process's real parent, `0` (never a parent's pid) if it has exited.
+fn parent_pid() -> u32 {
+    cosca::Process::current()
+        .parent()
+        .expect("find the parent process")
+        .map_or(0, |parent| parent.id().pid())
 }
 
-/// libtest's filter for a [`test_path!`]: `module_path!()` always leads with a crate segment, which
-/// the filter has none of.
-pub(crate) fn test_filter(path: &str) -> &str {
-    path.split_once("::")
-        .unwrap_or_else(|| panic!("{path:?} has no crate segment"))
-        .1
-}
-
-/// The argv (after the program name) of a re-executed test.
-///
-/// `--nocapture` keeps skuld's fd-level capture from swallowing the child's output, which the
-/// parent reports; `--format json` gives the parent the suite events it checks.
-pub(crate) fn child_args(test: &str) -> [&str; 6] {
-    let [format, json] = super::test_reexec::JSON_FORMAT;
-    [
-        "--exact",
-        test,
-        "--test-threads=1",
-        super::test_reexec::NOCAPTURE,
-        format,
-        json,
-    ]
-}
-
-/// Proof that this process is an `own_process` child. A guard that changes process-global state
-/// takes `&Completion`.
-#[must_use = "bind it for the whole body; a guard that changes process-global state takes it"]
-pub(crate) struct Completion(());
-
-/// Call first in a test that changes process-global state:
-/// `let Some(done) = own_process(test_path!(this_fn), spawn) else { return };`.
+/// Call first in a test that changes process-global state.
 ///
 /// In the parent this re-executes the test binary to run only this test, waits for it, and
 /// panics with its output unless it passed; it returns `None`. In the child it returns the
@@ -82,7 +38,7 @@ pub(crate) fn own_process(path: &str, spawn: Spawn) -> Option<Completion> {
     let mut command = super::test_reexec::command(std::env::current_exe().expect("current_exe"));
     command
         .args(child_args(test))
-        .env(ENV, test)
+        .env(super::test_own_process_gate::ENV, env_value(TRANSPORT, test))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -98,21 +54,11 @@ pub(crate) fn own_process(path: &str, spawn: Spawn) -> Option<Completion> {
     None
 }
 
-/// The [`Completion`] if this process was re-executed for `test`, else `None`.
+/// The [`Completion`] if this process was re-executed for `test` by its real parent, else `None`.
 fn child_completion(test: &str) -> Option<Completion> {
-    let inherited = std::env::var(ENV).ok()?;
-    if inherited != test {
-        return None;
-    }
-    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
-    assert!(
-        args.iter()
-            .map(OsString::as_os_str)
-            .eq(child_args(test).iter().map(std::ffi::OsStr::new)),
-        "{ENV}={inherited:?} names this test, but argv is not the re-executed shape: got {args:?}, expected {:?}",
-        child_args(test)
-    );
-    Some(Completion(()))
+    child_role(test, parent_pid(), |inherited, parent_pid, args, test| {
+        gate(inherited, parent_pid, args, test)
+            .filter(|&transport| transport == TRANSPORT)
+            .map(|_| Completion(()))
+    })
 }
-
-pub(crate) use test_path;

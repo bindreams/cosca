@@ -24,9 +24,8 @@
 //! The tests share machine-wide state — the registry keys — so `.config/nextest.toml`'s test group
 //! runs them one at a time.
 //!
-//! The two tests that set `PATH` or another environment variable run in a re-executed process of
-//! their own (`test_own_process`), so the change never reaches a sibling test's thread, and
-//! [`EnvVar::set`] takes the `Completion` that proves it.
+//! Tests that set an environment variable (`PATH` included) run in a re-executed process of their
+//! own (`test_own_process`), so the change never reaches a sibling test's thread.
 
 #[cfg(windows)]
 #[path = "common/mod.rs"]
