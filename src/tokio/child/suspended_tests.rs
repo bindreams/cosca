@@ -15,8 +15,7 @@ assert_impl_all!(SuspendedChild: Send);
 /// What `spawn_suspended` is refused with off Windows, before the runtime check: the same verdict
 /// inside and outside a runtime.
 #[cfg(not(windows))]
-#[skuld::test]
-fn spawn_suspended_is_unsupported_off_windows() {
+fn assert_spawn_suspended_is_refused() {
     let mut cmd = crate::tokio::Command::new();
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.kill_on_drop(false);
@@ -31,6 +30,18 @@ fn spawn_suspended_is_unsupported_off_windows() {
         !cmd.sync().kill_on_drop_flag(),
         "the refusal must leave the command as it was"
     );
+}
+
+#[cfg(not(windows))]
+#[skuld::test]
+fn spawn_suspended_is_unsupported_off_windows() {
+    assert_spawn_suspended_is_refused();
+}
+
+#[cfg(not(windows))]
+#[skuld::test]
+async fn spawn_suspended_is_unsupported_off_windows_inside_a_runtime() {
+    assert_spawn_suspended_is_refused();
 }
 
 #[cfg(windows)]
@@ -69,6 +80,45 @@ mod on_windows {
     async fn end(mut child: Child) {
         child.kill().expect("kill the resumed child");
         child.wait().await.expect("reap the resumed child");
+    }
+
+    /// The blocker for one `kill_on_drop` leg of a drop test. Stdin decides the child's fate: the
+    /// `true` leg leaks its write end, so only the drop's kill can end the child. The `false` leg
+    /// pipes stdin and stdout, which [`drop_and_expect_it_runs`] keeps past the drop.
+    fn drop_leg_blocker(kill_on_drop: bool) -> Command {
+        let mut cmd = blocker(false);
+        cmd.kill_on_drop(kill_on_drop);
+        if kill_on_drop {
+            cmd.stdin(crate::test_child::leaked_writer_stdin()).expect("stdin");
+        } else {
+            cmd.stdout(crate::Stdio::pipe()).expect("stdout pipe");
+        }
+        cmd
+    }
+
+    /// Drop `child` (built by [`drop_leg_blocker`]`(false)`) and prove the drop did not kill it, by
+    /// a round trip only a live child answers: a line in through its stdin, the match out of its
+    /// stdout (`findstr x` prints it once its input ends). The drop issues its kill before the
+    /// first byte is written, so a child the drop killed answers nothing, whenever it dies.
+    async fn drop_and_expect_it_runs(mut child: Child, what: &str) {
+        use ::tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let mut stdin = child.stdin().expect("piped stdin");
+        let mut stdout = child.stdout().expect("piped stdout");
+
+        drop(child);
+
+        stdin
+            .write_all(b"x\n")
+            .await
+            .unwrap_or_else(|e| panic!("{what}: kill_on_drop(false) must leave the child running: {e}"));
+        drop(stdin);
+        let mut answer = String::new();
+        stdout.read_to_string(&mut answer).await.expect("read the answer");
+        assert_eq!(
+            answer.trim_end(),
+            "x",
+            "{what}: kill_on_drop(false) must leave the child running"
+        );
     }
 
     // Refusals =====
@@ -226,51 +276,94 @@ mod on_windows {
 
     // The resumed child is a tokio child =====
 
-    /// The pipes the frozen spawn made serve the resumed child: closing its stdin ends it, and the
-    /// exit is awaited. `findstr x` on empty input finds nothing and exits 1.
+    /// The pipes the frozen spawn made serve the resumed child: a line written to its stdin comes
+    /// back on its stdout, and the exit is awaited. The echoed match and exit 0 show it ran:
+    /// `findstr x` on input with no match exits 1.
     #[skuld::test]
-    async fn a_resumed_child_serves_its_piped_stdin_and_is_awaited() {
+    async fn a_resumed_child_serves_its_piped_stdin_and_stdout_and_is_awaited() {
+        use ::tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         for raw in BACKENDS {
-            let frozen = blocker(raw).spawn_suspended().expect("spawn suspended");
-            let mut child = frozen.resume().expect("resume");
-            drop(child.stdin().expect("piped stdin"));
+            let mut cmd = blocker(raw);
+            cmd.stdout(crate::Stdio::pipe()).expect("stdout pipe");
+            let mut child = cmd
+                .spawn_suspended()
+                .expect("spawn suspended")
+                .resume()
+                .expect("resume");
+            let mut stdin = child.stdin().expect("piped stdin");
+            let mut stdout = child.stdout().expect("piped stdout");
 
+            stdin.write_all(b"xyz\nabc\n").await.expect("write the child's stdin");
+            drop(stdin);
+            let mut answer = String::new();
+            stdout
+                .read_to_string(&mut answer)
+                .await
+                .expect("read the child's stdout");
             let status = child.wait().await.expect("await the exit");
 
-            assert_eq!(status.code(), Some(1), "raw={raw}: findstr found nothing");
+            assert_eq!(answer.trim_end(), "xyz", "raw={raw}: only the matching line comes back");
+            assert_eq!(status.code(), Some(0), "raw={raw}: findstr found a match");
+        }
+    }
+
+    /// The resumed child's piped stderr carries what it writes: `findstr` names the file it cannot
+    /// open there, and nothing reaches stdout.
+    #[skuld::test]
+    async fn a_resumed_child_serves_its_piped_stderr() {
+        use ::tokio::io::AsyncReadExt as _;
+        const MISSING: &str = "cosca-49-no-such-file.txt";
+        for raw in BACKENDS {
+            let mut cmd = Command::new();
+            cmd.args(["findstr", "x", MISSING]);
+            if raw {
+                cmd.executable("findstr");
+            }
+            cmd.stdin(crate::Stdio::null()).expect("stdin null");
+            cmd.stdout(crate::Stdio::pipe()).expect("stdout pipe");
+            cmd.stderr(crate::Stdio::pipe()).expect("stderr pipe");
+            cmd.no_window();
+            let mut child = cmd
+                .spawn_suspended()
+                .expect("spawn suspended")
+                .resume()
+                .expect("resume");
+            let mut stdout = child.stdout().expect("piped stdout");
+            let mut stderr = child.stderr().expect("piped stderr");
+
+            let (mut out, mut err) = (String::new(), String::new());
+            stderr.read_to_string(&mut err).await.expect("read the child's stderr");
+            stdout.read_to_string(&mut out).await.expect("read the child's stdout");
+            let status = child.wait().await.expect("await the exit");
+
+            assert!(err.contains(MISSING), "raw={raw}: stderr was {err:?}");
+            assert_eq!(out, "", "raw={raw}");
+            assert_ne!(status.code(), Some(0), "raw={raw}: the file does not exist");
         }
     }
 
     /// The command's `kill_on_drop` decides what dropping the resumed `Child` does: a resumed child
     /// that kept the frozen spawn's forced `true` would be killed by a command that opted out.
     ///
-    /// The child's stdin write end is leaked, so no EOF can end it: it dies only if the drop kills
-    /// it. Without the drop's kill the `true` leg never sees the child die (the run is bounded by
-    /// nextest's terminate-after); a drop that kills regardless fails the `false` leg's check.
+    /// The `true` leg's child can only end by the drop's kill (without it the run is bounded by
+    /// nextest's terminate-after). The `false` leg proves the child alive after the drop with a
+    /// round trip, not a look at the process.
     #[skuld::test]
     async fn death_watch_dropping_an_uncontained_resumed_child_follows_the_commands_kill_on_drop() {
         for kill_on_drop in [true, false] {
-            let mut cmd = blocker(false);
-            cmd.kill_on_drop(kill_on_drop);
-            cmd.stdin(crate::test_child::leaked_writer_stdin()).expect("stdin");
-            let child = cmd
+            let child = drop_leg_blocker(kill_on_drop)
                 .spawn_suspended()
                 .expect("spawn suspended")
                 .resume()
                 .expect("resume");
             assert_eq!(child.kill_on_drop, kill_on_drop);
-            let remote = Remote::open(child.id().pid());
-
-            drop(child);
 
             if kill_on_drop {
+                let remote = Remote::open(child.id().pid());
+                drop(child);
                 remote.wait_for_death();
             } else {
-                assert!(
-                    !remote.is_dead_now(),
-                    "kill_on_drop(false) must leave the resumed child running"
-                );
-                remote.end();
+                drop_and_expect_it_runs(child, "uncontained").await;
             }
         }
     }
@@ -280,27 +373,21 @@ mod on_windows {
     async fn death_watch_dropping_a_contained_resumed_child_follows_the_commands_kill_on_drop() {
         for mode in [crate::ContainMode::TreeWalk, crate::ContainMode::Strongest] {
             for kill_on_drop in [true, false] {
-                let mut cmd = blocker(false);
-                cmd.contain_with(mode).kill_on_drop(kill_on_drop);
-                cmd.stdin(crate::test_child::leaked_writer_stdin()).expect("stdin");
+                let mut cmd = drop_leg_blocker(kill_on_drop);
+                cmd.contain_with(mode);
                 let child = cmd
                     .spawn_suspended()
                     .expect("spawn suspended")
                     .resume()
                     .expect("resume");
                 assert_eq!(child.kill_on_drop, kill_on_drop, "{mode:?}");
-                let remote = Remote::open(child.id().pid());
-
-                drop(child);
 
                 if kill_on_drop {
+                    let remote = Remote::open(child.id().pid());
+                    drop(child);
                     remote.wait_for_death();
                 } else {
-                    assert!(
-                        !remote.is_dead_now(),
-                        "{mode:?}: kill_on_drop(false) must leave the resumed child running"
-                    );
-                    remote.end();
+                    drop_and_expect_it_runs(child, &format!("{mode:?}")).await;
                 }
             }
         }
