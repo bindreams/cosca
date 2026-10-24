@@ -112,8 +112,9 @@ fn kill_tree_of_a_root_its_handle_cannot_read_sends_no_killpg() {
     child.wait().expect("reap the root");
 }
 
-/// After a foreign reap, `graceful_shutdown_tree` ends with `terminate_tree`'s answer: one warn, no
-/// grace and no sweep, which would warn again and claim a `SIGTERM` was sent.
+/// After a foreign reap, `graceful_shutdown_tree` ends `Unassessable` with one warn and no sweep by
+/// the root's number, which would warn again and claim a `SIGTERM` was sent. (A macOS fd marker's
+/// holders still get their shutdown; here there are none left.)
 ///
 /// Mutant: the `Unassessable` falls through to the grace and the sweep.
 #[skuld::test]

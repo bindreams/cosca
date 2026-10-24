@@ -1145,8 +1145,9 @@ fn end_child(received: &Received) -> ChildFate {
         // Reaped since the check, by another reaper in the process: gone, and its number is not
         // signalled.
         Err(rustix::io::Errno::SRCH) => return ChildFate::Gone,
-        // `pidfd_send_signal` itself refused, as a seccomp filter can: the identity was proven a
-        // moment ago, and only this process may reap the child, so its pid still names it.
+        // `pidfd_send_signal` itself refused, as a seccomp filter can: the kill falls back to the
+        // pid, proven the child's a moment ago. Another reaper in the process may reap the child
+        // since that proof, and the kill then reaches whatever holds the number.
         Err(rustix::io::Errno::NOSYS) | Err(rustix::io::Errno::PERM) if !denied => {
             #[cfg(test)]
             fault::record_signalled_by_pid();
@@ -1154,7 +1155,8 @@ fn end_child(received: &Received) -> ChildFate {
         }
         other => other,
     };
-    // The group it leads: an unreaped leader pins the group's id, so this names its group alone.
+    // The group it leads: an unreaped leader pins the group's id, so this names its group alone,
+    // unless another reaper in the process reaped it since the check.
     if !denied {
         _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
     }

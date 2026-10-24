@@ -637,8 +637,11 @@ impl Command {
     /// [`kill_tree`](crate::Child::kill_tree) and [`terminate_tree`](crate::Child::terminate_tree)
     /// return [`Error::Unassessable`](crate::error::Error::Unassessable). An fd marker's holders are
     /// named by the pipe they hold, and are still killed. A foreign reap after that look is not
-    /// seen, and the group's signals then go out, for the whole sweep, by a number another process
-    /// may hold. macOS has no pidfd, so cosca has no exact kill of the root there.
+    /// seen, and the signals by that number (the group's, and an fd marker's walk from the root's
+    /// pid) then go out, for the whole sweep, to a number another process may hold. After the
+    /// handle's own reap, a pid that names no process is still signalled as the group's id, which
+    /// another process may take once no member of the group survives (bindreams/cosca#382). macOS
+    /// has no pidfd, so cosca has no exact kill of the root there.
     ///
     /// # Linux: an elevated child behind a front
     /// A `sudo` or `doas` front in a cgroup is killed through the cgroup alone, and whether that kill

@@ -768,8 +768,12 @@ impl Child {
     /// group is empty: nothing is sent by the pid, and the call is `Ok`; a pid that cannot be read is
     /// `Unassessable` as above. Either way an fd marker still kills its marker holders, which are
     /// named by the pipe they hold, so no pid reuse redirects the kill. After this handle's own reap
-    /// the call is `Ok` only if every holder was reached. A foreign reap after that look is not seen,
-    /// and the group's signals then go out, for the whole sweep, by a number another process may hold.
+    /// the call is `Ok` only if every holder was reached, and a pid that names no process is still
+    /// signalled as the group's id: the root's group while a member survives, but once none does,
+    /// another process may take the number, and lead a group by it, first (bindreams/cosca#382). A
+    /// foreign reap after that look is not seen, and the signals by that number (the group's, and an
+    /// fd marker's walk from the root's pid) then go out, for the whole sweep, to a number another
+    /// process may hold.
     pub fn kill_tree(&mut self) -> Result<(), Error> {
         self.kill_tree_after(None)
     }
@@ -792,16 +796,11 @@ impl Child {
             crate::elevation::front::Gate::Exited => Some(false),
             crate::elevation::front::Gate::CgroupOnly => Some(true),
         };
-        // A root launchd holds, or one the handle cannot vouch for, is signalled by identity alone.
-        #[cfg(target_os = "macos")]
-        if let Some(result) =
-            self.tree_signal_untrusted(crate::containment::dispatch::TreeSignal::Kill, "kill_tree", earlier)
-        {
-            return result;
-        }
-        // A group named by the root's pid, once that pid may name another process.
+        // One look at the root decides: one launchd holds, or one the handle cannot vouch for, is
+        // signalled by identity alone, and so is a group named by the root's pid once that pid may
+        // name another process.
         #[cfg(unix)]
-        if let Some(result) = crate::child::reaped_root_tree_signal(
+        if let Some(result) = crate::child::root_checked_tree_signal(
             &self.os.attached,
             self.id,
             crate::containment::dispatch::TreeSignal::Kill,
@@ -923,31 +922,9 @@ impl Child {
     /// sent and what was skipped.
     pub fn terminate_tree(&self) -> Result<(), Error> {
         self.require_contained()?;
-        // A root launchd holds, or one the handle cannot vouch for, is signalled by identity alone.
-        #[cfg(target_os = "macos")]
-        if let Some(result) =
-            self.tree_signal_untrusted(crate::containment::dispatch::TreeSignal::Term, "terminate_tree", None)
-        {
-            return result;
-        }
-        self.terminate_tree_signalling()
-    }
-
-    /// The signal itself, for a root whose number is trusted.
-    fn terminate_tree_signalling(&self) -> Result<(), Error> {
+        // One look at the root decides, as for `kill_tree`.
         #[cfg(unix)]
-        if let Some(result) = self.reaped_root_term() {
-            return result;
-        }
-        self.terminate_tree_unchecked()
-    }
-
-    /// `terminate_tree`'s answer for a root whose pid may name another process; see
-    /// [`reaped_root_tree_signal`](crate::child::reaped_root_tree_signal). `None`: signal the tree
-    /// as usual.
-    #[cfg(unix)]
-    fn reaped_root_term(&self) -> Option<Result<(), Error>> {
-        crate::child::reaped_root_tree_signal(
+        if let Some(result) = crate::child::root_checked_tree_signal(
             &self.os.attached,
             self.id,
             crate::containment::dispatch::TreeSignal::Term,
@@ -955,7 +932,16 @@ impl Child {
             None,
             &self.tree_killed,
             || self.root_state_and_own_reap(),
-        )
+        ) {
+            return result;
+        }
+        self.terminate_tree_unchecked()
+    }
+
+    /// The tree paths' one look at the root ([`root_number`](crate::child::root_number)).
+    #[cfg(unix)]
+    fn root_number(&self) -> crate::child::RootNumber {
+        crate::child::root_number(&self.os.attached, self.id.pid(), || self.root_state_and_own_reap())
     }
 
     /// The group's termination signal, with no look at the root's state.
@@ -1021,22 +1007,6 @@ impl Child {
         return crate::signal::is_unpinned(|| self.root_state());
         #[cfg(not(unix))]
         false
-    }
-
-    /// A tree path's signal while the root cannot be vouched for (`Unpinned` or `Unknown`): it
-    /// signals by identity alone. `Some` ends the call; see the sync
-    /// [`Child`](crate::Child)'s twin.
-    #[cfg(target_os = "macos")]
-    pub(super) fn tree_signal_untrusted(
-        &self,
-        signal: crate::containment::dispatch::TreeSignal,
-        op: &str,
-        earlier: Option<&str>,
-    ) -> Option<Result<(), Error>> {
-        let root = crate::signal::untrusted_root(|| self.root_state())?;
-        self.os
-            .attached
-            .signal_tree_untrusted(signal, &root, self.id.pid(), op, earlier, &self.tree_killed)
     }
 
     /// Guard for the `_tree` operations (single-sourced with the sync `Child`).
