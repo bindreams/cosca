@@ -80,6 +80,8 @@ pub(crate) struct Channel {
     read_end: OwnedFd,
     write_end: OwnedFd,
     shared: Arc<Shared>,
+    /// How many pipes std's spawn makes for the child's stdio, before its own error pipe.
+    std_pipes: usize,
 }
 
 /// Registers the reporting hook on `cmd`, before any other hook.
@@ -113,6 +115,7 @@ impl Pending {
             read_end,
             write_end,
             shared: self.shared,
+            std_pipes: 0,
         })
     }
 }
@@ -129,6 +132,14 @@ fn set_nonblocking(fd: &OwnedFd) -> Result<(), Error> {
 }
 
 impl Channel {
+    /// The spawn passes `Stdio::piped()` for `n` of the child's stdio slots: std makes those pipes
+    /// first, on the lowest free fds (see [`std_pipe_exposed`]).
+    #[cfg(feature = "tokio")]
+    pub(crate) fn std_makes_pipes(mut self, n: usize) -> Channel {
+        self.std_pipes = n;
+        self
+    }
+
     /// Runs `spawn` with the pipe published, then reads what the child reported, once. The read
     /// comes with the spawn's result either way. `pid_of` names the child of a spawn that returned
     /// `Ok`. Runs under `spawn_lock`; the caller drops the guard before [`FirstRead::finish`], whose
@@ -142,8 +153,9 @@ impl Channel {
             read_end,
             write_end,
             shared,
+            std_pipes,
         } = self;
-        let exposed = std_pipe_exposed();
+        let exposed = std_pipe_exposed(std_pipes);
         let spawned = spawn();
         shared.withdraw();
         // Closed before the read, so a child that never wrote leaves the pipe at EOF.
@@ -204,17 +216,19 @@ impl FirstRead {
     }
 }
 
-/// Whether two of this process's fds 0 to 2 are closed. The pipe std's spawn opens to learn of a
-/// failed `exec` then takes a stdio number, which the child replaces before any hook runs: std
-/// returns before the report, and cannot see whether the `exec` ran. Read under `spawn_lock`, just
-/// before the spawn. A stdio fd another thread closes between this read and the spawn exposes the
-/// pipe unseen; an id the first read then misses is still late, but one it finds is adopted.
-fn std_pipe_exposed() -> bool {
+/// Whether the pipe std's spawn opens to learn of a failed `exec` takes one of fds 0 to 2 for its
+/// write end. The child replaces each of those with its own stdio before any hook runs, so std
+/// returns before the report and cannot see whether the `exec` ran. std makes the pipes of the
+/// `std_pipes` piped stdio slots first, then its own, each `pipe()` on the two lowest free fds
+/// (std 1.96 `sys/process/unix`: `setup_io`, then `pipe`). Read under `spawn_lock`, just before
+/// the spawn. A stdio fd another thread closes between this read and the spawn exposes the pipe
+/// unseen; an id the first read then misses is still late, but one it finds is adopted.
+fn std_pipe_exposed(std_pipes: usize) -> bool {
     // SAFETY: `F_GETFD` only reads a descriptor's flags, and fails only with `EBADF`.
-    (0..=2)
+    let free = (0..=2)
         .filter(|&fd| unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1)
-        .count()
-        >= 2
+        .count();
+    free >= 2 * std_pipes + 2
 }
 
 /// How long the wait runs before it says what it is waiting on.

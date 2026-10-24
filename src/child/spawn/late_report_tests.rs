@@ -121,7 +121,7 @@ fn macos_sync_spawn_of_a_late_reporting_child_kills_and_reaps_it_through_its_id(
 /// close-on-exec pipe takes them: the child's stdio then closes that pipe before its hooks run, and
 /// std returns before them. A spawn that waited for `exec` instead would deadlock against a child
 /// held before its report, so this fails first.
-fn close_fds_0_and_1(done: &crate::test_own_process::Completion) -> crate::test_stdio::RestoreStdio {
+pub(crate) fn close_fds_0_and_1(done: &crate::test_own_process::Completion) -> crate::test_stdio::RestoreStdio {
     use std::os::fd::AsRawFd;
     let restore = crate::test_stdio::RestoreStdio::close(done, &[0, 1]);
     let (read, write) = std::io::pipe().expect("pipe");
@@ -133,7 +133,7 @@ fn close_fds_0_and_1(done: &crate::test_own_process::Completion) -> crate::test_
 
 /// A stdio for a spawn while fds 0 and 1 are closed: `/dev/null`, opened before the close so it
 /// lands above stdio, since a closed descriptor cannot be inherited.
-fn null_stdio() -> crate::stdio::Stdio {
+pub(crate) fn null_stdio() -> crate::stdio::Stdio {
     crate::stdio::Stdio::from_file(std::fs::File::open("/dev/null").expect("open /dev/null"))
 }
 

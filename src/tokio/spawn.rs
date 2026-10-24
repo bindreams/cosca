@@ -244,13 +244,22 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
         "Deferred pipe ownership must only produce fd >= 3 parent ends"
     );
 
+    // macOS: std makes these pipes itself, ahead of its error pipe (`unique_report::Channel`).
+    #[cfg(target_os = "macos")]
+    let mut std_pipes = 0;
     for slot in std_slots {
         let stdio: StdStdio = match preassigned.remove(&slot) {
             // The merge pre-pass already assigned this slot (our owned pipe's child end,
             // or a dup of it for a merging slot).
             Some(pre) => pre,
             None => match fds.get(&slot) {
-                Some(ResolvedStdio::Pipe(_)) => StdStdio::piped(),
+                Some(ResolvedStdio::Pipe(_)) => {
+                    #[cfg(target_os = "macos")]
+                    {
+                        std_pipes += 1;
+                    }
+                    StdStdio::piped()
+                }
                 _ => StdStdio::from(
                     child_ends
                         .remove(&slot)
@@ -301,7 +310,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                 cmd.env_ops(),
             )
             .not_started()?;
-            let report = report.open(&_guard).not_started()?;
+            let report = report.open(&_guard).not_started()?.std_makes_pipes(std_pipes);
 
             // fd >= 3 merge SOURCES: their dup'd ends join the resolved fd >= 3 collection below
             // (the pre-pass removed those slots from `fds`, so the numbers cannot collide).
