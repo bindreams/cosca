@@ -425,6 +425,34 @@ fn elevated_pipe_is_rejected_deterministically_regardless_of_privilege() {
     ));
 }
 
+/// `spawn()` refuses an elevated `executable()` or `raw_executable()` itself, on the gate in
+/// `elevation_argv`, before any launch. The raw backend's routing (`routes_to_raw_backend`) relies
+/// on that: it asserts no elevated request reaches it. The argv[0] is extensionless, so with the
+/// gate gone a later check refuses it as `InvalidInput`: still no launch, and the test fails on the
+/// error kind instead of raising a consent prompt.
+///
+/// Mutant: `elevation_argv` stops refusing a program set by either setter.
+#[cfg(windows)]
+#[skuld::test]
+fn an_elevated_executable_or_raw_executable_is_refused_by_spawn() {
+    let program = r"C:\no-such-dir\tool";
+    for setter in ["executable", "raw_executable"] {
+        let mut c = crate::command::Command::new();
+        match setter {
+            "executable" => c.executable(program),
+            _ => c.raw_executable(program),
+        };
+        c.args([program]).elevate();
+        match c.spawn() {
+            Err(Error::Unsupported { op, detail, .. }) => {
+                assert!(op.contains(&format!("{setter}()")), "{setter}: {op}");
+                assert_eq!(detail, crate::elevation::SETTER_REFUSAL, "{setter}");
+            }
+            other => panic!("{setter}: expected Unsupported, got {:?}", other.map(|_| "a child")),
+        }
+    }
+}
+
 // ===== Windows backend routing =====
 
 /// The rule both Windows routers read, in both directions and for all four shapes.

@@ -8,10 +8,9 @@
 //! An `Exact` program, from `Command::raw_executable()`, deliberately does NOT come through
 //! [`resolve`]: "load exactly this file" is the absence of this module's SEARCH policy, not an
 //! application of it. Where a sink would search a relative name, it is put in a form no sink
-//! searches: on the unelevated POSIX spawn and the CLI elevation backends a `./`-anchored name
-//! ([`exact::anchor_posix`]), under `osascript` an absolute path ([`exact::complete_posix`]), and on the Windows
-//! elevated path an absolute path from `windows_raw::resolve::absolutise_exact` — see its doc for
-//! why `ShellExecuteEx` forces that step where `CreateProcessW` does not.
+//! searches: on the POSIX spawn a `./`-anchored name ([`exact::anchor_posix`]), and on the Windows
+//! raw backend an absolute path (`windows_raw::resolve::absolutise_exact_on`). An elevated spawn
+//! refuses both setters, so neither reaches an elevation backend.
 //!
 //! It does, however, share this module's naming CLASSIFIERS: every `Exact` arm refuses a program
 //! that names no file via [`names_no_file`], so the two axes cannot drift apart on what counts as
@@ -19,7 +18,8 @@
 //!
 //! Every other spawn path resolves a `Search` program itself, ignorant of this module: POSIX
 //! spawning calls `execvp`/`posix_spawn`'s own PATH search, and the Windows elevated
-//! (`ShellExecuteEx`) path passes a `Search` `lpFile` through unresolved. `src/lib.rs`'s
+//! (`ShellExecuteEx`) path passes argv[0] to `ShellExecuteEx` unresolved, and `executable()` is
+//! refused under elevation. `src/lib.rs`'s
 //! `#[cfg_attr(not(windows), allow(dead_code, reason = "..."))]` on this module tracks exactly
 //! that: the `allow` goes away once those paths route through [`resolve`] too.
 //! Producing an ABSOLUTE path is what would let a backend skip its own search once it is wired
@@ -679,7 +679,7 @@ fn has_loadable_extension(name: &OsStr) -> bool {
 /// it loads an extensionless PE by absolute path quite safely; `ShellExecuteEx` does extend, so
 /// the same name is plantable there. The asymmetry is the platform's, and this rule follows it
 /// rather than papering over it: `.elevate()` refuses names an ordinary spawn accepts.
-/// `raw_executable("tool").elevate()` wants `tool.exe`.
+/// `args([r"C:\t\tool"]).elevate()` wants `C:\t\tool.exe`.
 ///
 /// Over-rejection is the safe direction and is taken where the two disagree: `tool.exe.` (trailing
 /// dot) resolves to `tool.exe` on Windows but is refused here, because a trailing dot does NOT

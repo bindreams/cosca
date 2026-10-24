@@ -6,7 +6,7 @@ use std::cell::Cell;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use super::{absolutise_exact, absolutise_exact_on, complete_on, Completed, DriveDirs};
+use super::{absolutise_exact_on, complete_on, Completed, DriveDirs};
 use crate::child::spawn::windows_raw::env_snapshot::EnvSnapshot;
 use crate::error::Error;
 
@@ -29,10 +29,35 @@ fn letter_of(p: &Path) -> char {
     p.to_string_lossy().chars().next().unwrap().to_ascii_uppercase()
 }
 
-/// With the real cwd and environment as readers, the result is `absolutise_exact`'s for every
-/// shape, UNC-shaped ones included.
+/// `GetFullPathNameW` on `token`, called directly: Win32's own completion against this process's
+/// real cwd and `=X:` values.
+fn win32_full_path(token: &str) -> std::io::Result<PathBuf> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::GetFullPathNameW;
+    let wide: Vec<u16> = std::ffi::OsStr::new(token).encode_wide().chain([0]).collect();
+    let mut buf = vec![0u16; 1];
+    loop {
+        // SAFETY: `wide` is NUL-terminated and outlives the call; `buf` is a writable slice whose
+        // length the call is told.
+        let n = unsafe { GetFullPathNameW(PCWSTR(wide.as_ptr()), Some(&mut buf), None) } as usize;
+        if n == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // Fits: `n` excludes the NUL. Too small: `n` is the size needed, NUL included.
+        if n < buf.len() {
+            buf.truncate(n);
+            return Ok(PathBuf::from(OsString::from_wide(&buf)));
+        }
+        buf.resize(n, 0);
+    }
+}
+
+/// With the real cwd and environment as readers, the result is Win32's for every shape, UNC-shaped
+/// ones included: `GetFullPathNameW` on the token, with the name-no-file check on the token and on
+/// the result, as `absolutise_exact_on` applies them.
 #[skuld::test]
-fn matches_absolutise_exact_given_the_real_cwd() {
+fn matches_get_full_path_name_given_the_real_cwd() {
     let cwd = std::env::current_dir().unwrap();
     let letter = letter_of(&cwd);
     let other = if letter == 'Q' { 'R' } else { 'Q' };
@@ -68,7 +93,18 @@ fn matches_absolutise_exact_given_the_real_cwd() {
             Err(Error::Io(e)) => Err(e.kind()),
             Err(other) => panic!("{token:?}: unexpected error {other:?}"),
         };
-        let want = outcome(absolutise_exact(Path::new(&token)));
+        let names_no_file = |p: &std::ffi::OsStr| crate::resolve::names_no_file(p, true);
+        let oracle = || {
+            if names_no_file(token.as_ref()) {
+                return Err(std::io::ErrorKind::InvalidInput);
+            }
+            let full = win32_full_path(&token).map_err(|e| e.kind())?;
+            if names_no_file(full.as_os_str()) {
+                return Err(std::io::ErrorKind::InvalidInput);
+            }
+            Ok(full)
+        };
+        let want = oracle();
         let got = outcome(absolutise_exact_on(Path::new(&token), || Ok(cwd.clone()), real_drive).map(|c| c.path));
         assert_eq!(got, want, "{token:?}");
     }
@@ -436,26 +472,6 @@ fn a_verbatim_exact_token_is_taken_as_written() {
     for token in [r"\\?\C:\t\tool.exe.", r"\\?\C:\t\x\..\tool.exe", r"\\?\C:\t\..."] {
         let got = absolutise_exact_on(Path::new(token), || panic!("must not read the cwd"), no_drive).unwrap();
         assert_eq!(got.path, PathBuf::from(token), "{token:?}");
-    }
-}
-
-/// The elevated path completes a verbatim token as main does: `GetFullPathNameW` on it, then the
-/// shape check on the result, which refuses a name normalised down to a directory.
-#[skuld::test]
-fn the_elevated_completion_normalises_a_verbatim_token() {
-    for (token, want) in [
-        (r"\\?\C:\t\tool.exe.", r"\\?\C:\t\tool.exe"),
-        (r"\\?\C:\t\x\..\tool.exe", r"\\?\C:\t\tool.exe"),
-    ] {
-        assert_eq!(
-            absolutise_exact(Path::new(token)).unwrap(),
-            PathBuf::from(want),
-            "{token:?}"
-        );
-    }
-    match absolutise_exact(Path::new(r"\\?\C:\t\...")) {
-        Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{e}"),
-        other => panic!("expected Io(InvalidInput), got {other:?}"),
     }
 }
 

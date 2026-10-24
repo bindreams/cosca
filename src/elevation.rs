@@ -80,27 +80,42 @@ pub(crate) struct ArgvRefusals {
     pub(crate) op_prefix: &'static str,
     /// Why a `commandline()` command cannot be elevated here.
     pub(crate) commandline: &'static str,
-    /// Why an argv[0] distinct from a set `executable()` cannot survive this backend.
-    pub(crate) argv0: &'static str,
+    /// Why an elevated program is named by argv[0] alone, never by `executable()` or
+    /// `raw_executable()`.
+    pub(crate) setter: &'static str,
 }
 
+/// Why an elevated program is named by argv[0] alone. Names no backend: the refusal also reaches
+/// a caller that is already elevated, where none runs.
+pub(crate) const SETTER_REFUSAL: &str = "name the elevated program as argv[0] (set .args([program, ...])): the \
+     elevated program is the one argv[0] names, so neither executable()'s search nor \
+     raw_executable()'s exact file can be honoured";
+
 /// The argv an elevation backend can work from. Refused, as [`crate::error::Error::Unsupported`]
-/// in `words`' terms: no program (`Empty`, or an empty argv), a `commandline()` command, and an
-/// argv[0] distinct from a set `executable()`.
+/// in `words`' terms: a program set by `executable()` or `raw_executable()`, which is checked
+/// first, then no program (`Empty`, or an empty argv) and a `commandline()` command.
 ///
-/// `Empty` is matched on its own rather than folded into the command-line refusal: a fresh
-/// `Command` is `Empty`, and telling `Command::new().executable("x").elevate()` it elevated a
-/// command line would send its author to audit a builder call their code never makes.
+/// An elevated program is argv[0] as written: cosca neither searches for it nor completes it, and
+/// argv is never rewritten, so neither setter has anything to act on.
+///
+/// A `Command::new().elevate()` is `Empty`; the message must not claim a command line was elevated.
 pub(crate) fn elevation_argv<'a>(
     cmd: &'a crate::command::Command,
     words: &ArgvRefusals,
 ) -> Result<&'a [OsString], crate::error::Error> {
-    use crate::command::CommandInput;
+    use crate::command::{CommandInput, ExecutableSpec};
     let refuse = |what: &str, detail: &str| crate::error::Error::Unsupported {
         op: format!("{} {what}", words.op_prefix),
         platform: words.platform,
         detail: detail.into(),
     };
+    if let Some(spec) = cmd.executable_spec() {
+        let setter = match spec {
+            ExecutableSpec::Search(_) => "executable",
+            ExecutableSpec::Exact(_) => "raw_executable",
+        };
+        return Err(refuse(&format!("of a program set by {setter}()"), words.setter));
+    }
     let no_program = || {
         refuse(
             "of an empty command",
@@ -112,21 +127,14 @@ pub(crate) fn elevation_argv<'a>(
         CommandInput::Empty => return Err(no_program()),
         CommandInput::CommandLine(_) => return Err(refuse("of a commandline() command", words.commandline)),
     };
-    let Some(first) = argv.first() else {
+    if argv.is_empty() {
         return Err(no_program());
-    };
-    if cmd
-        .executable_path()
-        .is_some_and(|exe| first.as_os_str() != exe.as_os_str())
-    {
-        return Err(refuse("with an argv[0] distinct from executable()", words.argv0));
     }
     Ok(argv)
 }
 
-/// What an elevation gate validated and the build then wraps: the program, its arguments, and the
-/// directory to run them in. Computed once per rewrite, so a `raw_executable()` program and its
-/// directory come from one reading of this process's cwd.
+/// What an elevation gate validated and the build then wraps: the program (argv[0]), its
+/// arguments, and `current_dir()` as given.
 #[cfg_attr(
     not(unix),
     allow(
@@ -173,8 +181,7 @@ pub enum Backend {
     /// first runs `pkexec --version` and refuses one it cannot show to be 121 or later with
     /// [`crate::error::Error::Unsupported`]. The pkexec on `PATH` is opened once, and both that
     /// check and the launch exec the opened file (`/proc/self/fd/N`), so a pkexec replaced in
-    /// between is never run. A relative `raw_executable()` is refused: pkexec runs a relative
-    /// program only if the caller itself can execute it, so pass an absolute path.
+    /// between is never run.
     Pkexec,
 }
 

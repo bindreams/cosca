@@ -29,12 +29,11 @@ struct Outcome {
 }
 
 #[cfg(target_os = "linux")]
-/// What the elevated spawn names: an absolute program, or a relative `raw_executable("tool")` in
-/// a `target/` directory holding `tool`.
+/// What the elevated spawn names: `/bin/true` as argv[0], or as `raw_executable()` too.
 #[derive(Clone, Copy)]
 enum Launch {
     BinTrue,
-    RelativeRaw,
+    RawBinTrue,
 }
 
 #[cfg(target_os = "linux")]
@@ -69,8 +68,8 @@ fn elevate_with_fake_pkexec(version_line: &str, launch: Launch) -> Outcome {
     if as_root {
         assert_traversable_by_everyone(&root);
     }
-    let (bin, real_dir, target) = (root.join("bin"), root.join("real"), root.join("target"));
-    for dir in [&bin, &real_dir, &target] {
+    let (bin, real_dir) = (root.join("bin"), root.join("real"));
+    for dir in [&bin, &real_dir] {
         std::fs::create_dir(dir).expect("mkdir");
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         assert_eq!(
@@ -108,10 +107,6 @@ fn elevate_with_fake_pkexec(version_line: &str, launch: Launch) -> Outcome {
         version
             .set_permissions(std::fs::Permissions::from_mode(0o644))
             .expect("chmod version");
-        let mut tool = create_in(&target, c"tool", 0o644);
-        writeln!(tool, "#!/bin/sh").expect("write tool");
-        tool.set_permissions(std::fs::Permissions::from_mode(0o644))
-            .expect("chmod tool");
     }
     std::os::unix::fs::symlink("../real/pkexec-impl", bin.join("pkexec")).expect("link bin/pkexec");
     assert_eq!(
@@ -122,8 +117,8 @@ fn elevate_with_fake_pkexec(version_line: &str, launch: Launch) -> Outcome {
     let mut testbin = std::process::Command::new(common::testbin());
     testbin.arg("elevate-pkexec-report").env("PATH", &bin);
     match launch {
-        Launch::BinTrue => testbin.arg("/bin/true"),
-        Launch::RelativeRaw => testbin.args(["tool".as_ref(), target.as_os_str()]),
+        Launch::BinTrue => testbin.args(["argv0", "/bin/true"]),
+        Launch::RawBinTrue => testbin.args(["raw", "/bin/true"]),
     };
     if let Some((uid, gid)) = drop_to {
         testbin.env("COSCA_TEST_DROP_TO", format!("{uid}:{gid}"));
@@ -299,13 +294,17 @@ fn a_new_pkexec_is_launched_with_keep_cwd() {
 }
 
 #[cfg(target_os = "linux")]
-/// A relative `raw_executable()` is refused before detection, so pkexec is never run, not even to
-/// ask its version.
+/// A `raw_executable()` is refused before detection, so pkexec is never run, not even to ask its
+/// version. `/bin/true` is the very program the launch test runs as argv[0].
 #[skuld::test]
-fn a_relative_raw_executable_is_refused_before_pkexec_runs() {
-    let o = elevate_with_fake_pkexec("pkexec version 121", Launch::RelativeRaw);
+fn an_elevated_raw_executable_is_refused_before_pkexec_runs() {
+    let o = elevate_with_fake_pkexec("pkexec version 121", Launch::RawBinTrue);
     assert!(o.report.starts_with("UNSUPPORTED "), "{}", o.report);
-    assert!(o.report.contains("absolute program path"), "{}", o.report);
+    assert!(
+        o.report.contains("name the elevated program as argv[0]"),
+        "{}",
+        o.report
+    );
     assert!(o.pkexec_argvs.is_empty(), "{:?}", o.pkexec_argvs);
 }
 

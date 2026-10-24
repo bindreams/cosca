@@ -269,49 +269,6 @@ pub(crate) fn reject_unnameable_program(program: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-/// Complete a possibly-relative program name into an absolute path the way the Win32 loader
-/// itself would — **without searching or appending an extension**. The filesystem is touched only
-/// to ask whether a drive-relative name's `=Q:` directory exists, as `GetFullPathNameW` does
-/// ([`DriveDirs`]).
-///
-/// This is the `Exact` (`raw_executable()`) counterpart to [`resolve_executable`], and both Win32
-/// sinks get a completed name:
-///
-/// - `CreateProcessW` would complete a partial `lpApplicationName` itself ("the function uses the
-///   current drive and current directory to complete the specification. The function will not
-///   use the search path"), but from its own, second read of the cwd. The raw backend completes it
-///   through [`absolutise_exact_on`] instead, from the one read its working directory comes from.
-/// - `ShellExecuteEx` SEARCHES a path-less `lpFile`, which is how the elevated path reached the
-///   `.bat`/`.cmd` vector; completing the name here stops that search. The consent path also gates
-///   the completed name against `.exe`/`.com` — see [`crate::resolve::reject_unloadable_image`]
-///   for why existence-checking is not enough.
-///
-/// `GetFullPathNameW` is the right primitive rather than a hand-rolled join, on three counts
-/// documented by Win32 itself:
-///
-/// - It uses the same base the loader does — it "merges the name of the current drive and
-///   directory with a specified file name", matching `lpApplicationName`'s own wording.
-/// - It "does not verify that the resulting path and file name are valid, or that they see an
-///   existing file", so `raw_executable()`'s "no existence check" clause survives intact.
-/// - It resolves a DRIVE-RELATIVE name (`C:tool`) through that drive's own current directory —
-///   state Win32 tracks and cosca does not, which is why `executable()`'s search path fails such
-///   names closed instead. Here the platform answers it correctly.
-///
-/// The current directory is process-global and can change between calls, so the elevated path
-/// consumes the relative name exactly once and everything downstream uses the absolute result —
-/// which is precisely what `GetFullPathNameW`'s own doc advises for shared library code.
-pub(crate) fn absolutise_exact(program: &Path) -> Result<PathBuf, Error> {
-    check_exact(program)?;
-    let full = full_path_name(program)?;
-    // AFTER: normalisation STRIPS trailing dots and spaces from the final component, so it can
-    // CREATE the shape the pre-check refuses. `C:\t\...` passes as written — `...` is neither
-    // empty nor `.`/`..` — and normalises to `C:\t\`, a directory, which would then be handed to
-    // `ShellExecuteEx` as `lpFile` under `runas`. Checking only the spelling refuses the spelling
-    // and not the shape.
-    reject_unnameable_program(&full)?;
-    Ok(full)
-}
-
 /// A path Win32 has completed, and whether this process's cwd went into it.
 pub(crate) struct Completed {
     pub(crate) path: PathBuf,
@@ -499,9 +456,21 @@ pub(crate) fn drive_cwd_var(drive: &OsStr) -> OsString {
     name
 }
 
-/// [`absolutise_exact`], completed by [`complete_on`] against the spawn's effective cwd
-/// ([`effective_cwd`]) instead of by `GetFullPathNameW` reading this process's cwd itself, so the
-/// file loaded and the directory the child runs in come from the same value.
+/// Complete a possibly-relative `raw_executable()` program into an absolute path the way the Win32
+/// loader itself would — **without searching or appending an extension**. The filesystem is
+/// touched only to ask whether a drive-relative name's `=Q:` directory exists, as
+/// `GetFullPathNameW` does ([`DriveDirs`]).
+///
+/// This is the `Exact` counterpart to [`resolve_executable`]. `CreateProcessW` would complete a
+/// partial `lpApplicationName` itself ("the function uses the current drive and current directory
+/// to complete the specification. The function will not use the search path"), but from its own,
+/// second read of the cwd. This completes it by [`complete_on`] against the spawn's effective cwd
+/// ([`effective_cwd`]) instead, so the file loaded and the directory the child runs in come from
+/// the same value.
+///
+/// Completes as `GetFullPathNameW` does: against the same base the loader uses, with no existence
+/// check, and a drive-relative name through that drive's own current directory (state cosca does
+/// not track, which is why `executable()` fails such names closed).
 pub(crate) fn absolutise_exact_on(
     program: &Path,
     process_cwd: impl FnOnce() -> Result<PathBuf, Error>,
@@ -545,10 +514,8 @@ fn check_exact(program: &Path) -> Result<(), Error> {
     // FIRST, ahead of the shape check, so the refusal names the NUL, not a trailing separator Win32
     // would never see (`x` + NUL + `\`). `to_wide_nul` appends a terminator, and `PCWSTR` stops at
     // the FIRST NUL — so an interior NUL silently truncates the path Win32 sees.
-    // `raw_executable("C:\\a\\b.exe\0x")` would become `lpFile = C:\a\b.exe`, loading a file the
-    // caller did not name, elevated. The raw backend already fails such a path closed (`spawn_raw`
-    // NUL-checks the image); without this the same `Command` would error unelevated and silently
-    // load a different file elevated.
+    // `raw_executable("C:\\a\\b.exe\0x")` would become `C:\a\b.exe`, a file the caller did
+    // not name, and the completed path would carry no NUL for `spawn_raw`'s own check to see.
     ensure_no_nul_wide("program path", program.as_os_str())?;
     // The shape is checked TWICE, on purpose, because the two checks catch different things.
     //
@@ -558,8 +525,8 @@ fn check_exact(program: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-/// [`absolutise_exact`]'s checks around `GetFullPathNameW`, applied to whatever `anchored` makes
-/// of `program` once the first checks pass. A token written verbatim is taken as written, as
+/// The checks around `GetFullPathNameW`, applied to whatever `anchored` makes of `program` once
+/// the first checks pass. A token written verbatim is taken as written, as
 /// `CreateProcessW` loads it; one made verbatim by its base is normalised.
 fn complete_exact(program: &Path, anchored: impl FnOnce() -> Result<PathBuf, Error>) -> Result<PathBuf, Error> {
     check_exact(program)?;
@@ -572,7 +539,10 @@ fn complete_exact(program: &Path, anchored: impl FnOnce() -> Result<PathBuf, Err
         return Ok(anchored);
     }
     let full = full_path_name(&anchored)?;
-    // AFTER: as in `absolutise_exact`.
+    // AFTER: normalisation STRIPS trailing dots and spaces from the final component, so it can
+    // CREATE the shape the pre-check refuses. `C:\t\...` passes as written — `...` is neither
+    // empty nor `.`/`..` — and normalises to `C:\t\`, a directory. Checking only the spelling
+    // refuses the spelling and not the shape.
     reject_unnameable_program(&full)?;
     Ok(full)
 }

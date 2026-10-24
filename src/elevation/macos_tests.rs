@@ -25,7 +25,7 @@ fn gate(c: &Command) -> Result<(), Error> {
 
 /// [`build_rewrite`] alone, bypassing the gate.
 fn build(c: &mut Command, arg_max: Option<usize>) -> Result<(Command, crate::elevation::ElevationReport), Error> {
-    let launch = super::program_and_args(c, std::env::current_dir)?;
+    let launch = super::program_and_args(c)?;
     build_rewrite(c, launch, Path::new("/usr/bin/osascript"), arg_max)
 }
 
@@ -219,20 +219,6 @@ fn a_relative_program_is_rejected_so_roots_path_never_chooses_the_binary() {
 }
 
 #[skuld::test]
-fn an_elevated_exact_program_that_names_no_file_is_refused() {
-    for n in ["", ".", "dir/"] {
-        let mut c = Command::new();
-        c.raw_executable(n)
-            .args([n])
-            .elevation_auth(crate::elevation::Auth::Gui);
-        match gate(&c) {
-            Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput => {}
-            other => panic!("{n:?} names no file and must be Io(InvalidInput), got {other:?}"),
-        }
-    }
-}
-
-#[skuld::test]
 fn absoluteness_is_judged_by_posix_rules_not_the_build_hosts() {
     // `/usr/bin/id` must be accepted and `C:\tool.exe` rejected on EVERY host —
     // `Path::is_absolute` gets both backwards on Windows.
@@ -340,15 +326,6 @@ fn an_empty_command_is_rejected() {
     assert_rejected(&empty_argv, "program");
 }
 
-#[skuld::test]
-fn an_argv0_distinct_from_executable_is_rejected() {
-    let mut c = Command::new();
-    c.executable("/usr/bin/id")
-        .args(["not-id", "-u"])
-        .elevation_auth(crate::elevation::Auth::Gui);
-    assert_rejected(&c, "argv[0]");
-}
-
 #[cfg(windows)]
 #[skuld::test]
 fn the_gate_reports_a_byte_formless_program_as_a_quote_error() {
@@ -366,14 +343,12 @@ fn the_gate_reports_a_byte_formless_program_as_a_quote_error() {
 }
 
 #[skuld::test]
-fn a_matching_executable_yields_that_program_and_the_remaining_args() {
-    // The `Some(exe)` success arm substitutes `exe` for argv[0] and slices the
-    // tail; pin the returned pair, not merely the absence of a rejection.
+fn argv0_yields_that_program_and_the_remaining_args() {
+    // Pin the returned pair, not merely the absence of a rejection.
     let mut c = Command::new();
-    c.executable("/usr/bin/id")
-        .args(["/usr/bin/id", "-u", "-r"])
+    c.args(["/usr/bin/id", "-u", "-r"])
         .elevation_auth(crate::elevation::Auth::Gui);
-    let launch = super::program_and_args(&c, std::env::current_dir).expect("matching executable");
+    let launch = super::program_and_args(&c).expect("an argv program");
     assert_eq!(launch.program, OsString::from("/usr/bin/id"));
     assert_eq!(launch.args, args(&["-u", "-r"]));
 }
@@ -453,52 +428,6 @@ fn kill_on_drop_warns_that_it_cannot_reach_the_payload() {
     quiet.kill_on_drop(false);
     let _ = build(&mut quiet, None).unwrap();
     assert!(!crate::log_capture::contains_since(mark, QUIET));
-}
-
-/// A bare `raw_executable()` is accepted, and root's shell enters its directory and runs it as
-/// `./tool`, which no shell searches.
-#[skuld::test]
-fn a_bare_exact_program_is_completed_rather_than_refused() {
-    let mut c = Command::new();
-    c.raw_executable("tool")
-        .args(["tool", "-u"])
-        .current_dir("/work")
-        .elevation_auth(crate::elevation::Auth::Gui);
-    assert!(gate(&c).is_ok());
-    let (derived, _) = build(&mut c, None).unwrap();
-    let CommandInput::Argv(argv) = derived.input() else {
-        unreachable!()
-    };
-    assert!(
-        argv[2].to_str().unwrap().contains("cd -P -- /work && exec ./tool -u"),
-        "{:?}",
-        argv[2]
-    );
-}
-
-/// With no `current_dir`, the payload must still run in the directory the program was completed
-/// against: root's shell starts wherever the trampoline puts it.
-#[skuld::test]
-fn a_bare_exact_program_without_a_cwd_runs_in_the_directory_it_was_completed_against() {
-    let mut c = Command::new();
-    c.raw_executable("tool")
-        .args(["tool"])
-        .elevation_auth(crate::elevation::Auth::Gui);
-    reject_structural_gui_config(&c).unwrap();
-    let launch = super::program_and_args(&c, || Ok("/proc-cwd".into())).unwrap();
-    let (derived, _) = build_rewrite(&mut c, launch, Path::new("/usr/bin/osascript"), None).unwrap();
-    let CommandInput::Argv(argv) = derived.input() else {
-        unreachable!()
-    };
-    assert!(
-        argv[2]
-            .to_str()
-            .unwrap()
-            .contains("\"cd -P -- /proc-cwd && exec ./tool\""),
-        "{:?}",
-        argv[2]
-    );
-    assert_eq!(derived.cwd(), Some(Path::new("/proc-cwd")));
 }
 
 #[skuld::test]
@@ -729,20 +658,6 @@ end timeout"
     );
 }
 
-/// Every relative `raw_executable()` reaches the script `./`-prefixed, so none is read as an
-/// option to `exec` — bash's `exec` takes `-x/tool` for its own `-x` flag.
-#[skuld::test]
-fn a_relative_exact_program_reaches_the_script_dot_slash_prefixed() {
-    for (program, want) in [("-x/tool", "./-x/tool"), ("bin/tool", "./bin/tool"), ("tool", "./tool")] {
-        let mut c = Command::new();
-        c.raw_executable(program)
-            .args([program])
-            .elevation_auth(crate::elevation::Auth::Gui);
-        let launch = super::program_and_args(&c, || Ok("/proc-cwd".into())).unwrap();
-        assert_eq!(launch.program, OsString::from(want), "{program}");
-    }
-}
-
 /// Runs `script` through the real `/bin/sh`, as `do shell script` does, and returns its exit code.
 #[cfg(unix)]
 fn sh_exit_code(script: &[u8]) -> Option<i32> {
@@ -769,22 +684,6 @@ fn exit_tool(path: &Path, code: i32) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod tool");
 }
 
-/// The composed script runs a leading-dash program through the real `/bin/sh`.
-#[cfg(unix)]
-#[skuld::test]
-fn a_leading_dash_program_survives_the_real_shell() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    exit_tool(&dir.path().join("-x").join("tool"), 11);
-    let mut c = Command::new();
-    c.raw_executable("-x/tool")
-        .args(["-x/tool"])
-        .elevation_auth(crate::elevation::Auth::Gui);
-    let dir_path = dir.path().to_path_buf();
-    let launch = super::program_and_args(&c, || Ok(dir_path)).unwrap();
-    let script = build_shell_command(&launch.program, &launch.args, launch.cwd.as_deref()).unwrap();
-    assert_eq!(sh_exit_code(&script), Some(11), "{}", String::from_utf8_lossy(&script));
-}
-
 /// The script enters the directory the kernel's `chdir` would: `cd -P`, not the shell's logical
 /// `cd`, which reads `link/..` as the directory holding `link` rather than the target's parent.
 /// osascript itself, and the unelevated spawn, `chdir` by the kernel's rule.
@@ -798,6 +697,6 @@ fn the_script_enters_a_symlink_dotdot_directory_as_the_kernel_does() {
     exit_tool(&root.path().join("real").join("tool"), 11);
     exit_tool(&root.path().join("a").join("tool"), 22);
     let dir = root.path().join("a").join("link").join("..");
-    let script = build_shell_command(OsStr::new("./tool"), &[], Some(&dir)).unwrap();
+    let script = build_shell_command(OsStr::new("/bin/sh"), &args(&["-c", "exec ./tool"]), Some(&dir)).unwrap();
     assert_eq!(sh_exit_code(&script), Some(11), "{}", String::from_utf8_lossy(&script));
 }

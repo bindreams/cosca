@@ -1,7 +1,5 @@
 //! `raw_executable()` on POSIX: making an `Exact` program unsearchable, which is the opposite of
-//! searching for it. The unelevated spawn and the CLI elevation backends anchor it to the cwd
-//! they inherit ([`anchor_posix`]); `osascript`, whose trampoline carries no cwd, needs it
-//! completed to an absolute path ([`complete_posix`]).
+//! searching for it. The spawn anchors it to the cwd the child inherits ([`anchor_posix`]).
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -22,7 +20,9 @@ use crate::error::Error;
 /// usable path (an unsearchable ancestor, an unlinked directory, one outside a chroot) works,
 /// as it does for `./tool` under std.
 ///
-/// Refused with `InvalidInput` as [`complete_posix`] refuses.
+/// Refused with `InvalidInput` before anything else: an interior NUL, which no exec argument can
+/// carry, and a name that [names no file](super::names_no_file) — empty, `/`-terminated, or a
+/// final `.`/`..`. POSIX grammar, byte-level, on every host.
 // Off unix the std spawn never has an `Exact` program: it routes to the raw backend.
 #[cfg_attr(
     not(unix),
@@ -42,12 +42,15 @@ pub(crate) fn anchor_posix(program: &OsStr, child_cwd: Option<&Path>) -> Result<
         });
     }
     let program = if program.as_encoded_bytes().contains(&b'/') {
-        program.to_os_string()
+        PathBuf::from(program)
     } else {
-        join(OsStr::new("."), program)
+        // Bytes, not `Path::join`: off unix that would insert the host's separator.
+        let mut anchored = OsString::from("./");
+        anchored.push(program);
+        PathBuf::from(anchored)
     };
     Ok(Anchored {
-        program: PathBuf::from(program),
+        program,
         cwd,
         enter: true,
     })
@@ -70,117 +73,8 @@ pub(crate) struct Anchored {
     pub(crate) enter: bool,
 }
 
-/// Complete an `Exact` program to an absolute path against the CHILD's working directory —
-/// **without searching, appending anything, or touching the filesystem**. For `osascript`, whose
-/// trampoline runs the program in another process and carries no cwd, so needs a path.
-///
-/// Needs this process's cwd as a PATH when the program is relative and `child_cwd` is not
-/// absolute, so a cwd with no usable path fails where the unelevated [`anchor_posix`] would
-/// succeed. An unlinked directory fails `process_cwd` on every OS (`ENOENT`), so this does. An
-/// unsearchable ancestor fails it on macOS (`EACCES`); Linux's `getcwd` succeeds regardless of
-/// ancestors' permissions, so the path is returned and entering it fails later, at spawn.
-///
-/// The base is `child_cwd` (what `Command::current_dir` set; joined onto `process_cwd()` when
-/// itself relative), or `process_cwd()` when unset. That is the directory the child's own exec
-/// would read a relative path against.
-///
-/// Returns the base alongside the program as [`Completed::child_cwd`], for the sink to run the
-/// child in. A base built from `process_cwd()` replaces `child_cwd`: left relative or unset, the
-/// child would read this process's cwd again at `fork`, and a `set_current_dir` in between would
-/// load one directory's file while running in another.
-///
-/// Absolute is the point: root's `/bin/sh` looks up a name it is handed bare, and does not search
-/// an absolute path. A `./` prefix alone would not do — the trampoline starts the shell in a
-/// directory of its own choosing.
-///
-/// POSIX grammar, byte-level, on every host: `/` is the only separator and a leading `/` the only
-/// absolute form, so the macOS elevation path — compiled and tested everywhere — gets one answer.
-/// The join does not normalise: `..` is left for the kernel, which reads it against the same base.
-///
-/// Refused with `InvalidInput` before any cwd is read: an interior NUL, which no exec argument can
-/// carry, and a name that [names no file](super::names_no_file) — empty, `/`-terminated, or a
-/// final `.`/`..`. An empty `child_cwd` under a relative program is `NotFound`, as the `chdir("")`
-/// it would otherwise reach reports. `process_cwd` is called at most once, and only when the base
-/// needs it, so an absolute program or child cwd cannot fail on an unreadable process cwd.
-pub(crate) fn complete_posix(
-    program: &OsStr,
-    child_cwd: Option<&Path>,
-    process_cwd: impl FnOnce() -> std::io::Result<PathBuf>,
-) -> Result<Completed, Error> {
-    refuse_unnameable(program)?;
-    let as_given = || child_cwd.map(Path::to_path_buf);
-    if is_absolute(program) {
-        return Ok(Completed {
-            program: PathBuf::from(program),
-            child_cwd: as_given(),
-        });
-    }
-    let base = match child_cwd {
-        // Joined, it would name the process cwd, where the `chdir` it stands for fails.
-        Some(dir) if dir.as_os_str().is_empty() => {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "current_dir(\"\") names no directory",
-            )))
-        }
-        Some(dir) if is_absolute(dir.as_os_str()) => {
-            return Ok(Completed {
-                program: PathBuf::from(join(dir.as_os_str(), program)),
-                child_cwd: as_given(),
-            })
-        }
-        Some(dir) => join(process_cwd()?.as_os_str(), dir.as_os_str()),
-        None => process_cwd()?.into_os_string(),
-    };
-    Ok(Completed {
-        program: PathBuf::from(join(&base, program)),
-        child_cwd: Some(PathBuf::from(base)),
-    })
-}
-
-/// An `Exact` program for a shell that enters a directory by path and then execs — root's shell
-/// under `osascript`: the absolute directory to `cd` to, and the name to exec there.
-///
-/// The directory is [`complete_posix`]'s — `child_cwd` if absolute, else completed against one
-/// reading of `process_cwd` — and the name is the program as written, `./`-prefixed when
-/// relative: exec reads it against the directory the `cd` entered, and a `./` keeps any shell
-/// from searching `PATH` for it or reading `-x/tool` as an option. An absolute program is left
-/// as is, with `child_cwd` as given.
-pub(crate) fn enter_posix(
-    program: &OsStr,
-    child_cwd: Option<&Path>,
-    process_cwd: impl FnOnce() -> std::io::Result<PathBuf>,
-) -> Result<Entered, Error> {
-    let completed = complete_posix(program, child_cwd, process_cwd)?;
-    if is_absolute(program) {
-        return Ok(Entered {
-            program: completed.program,
-            dir: completed.child_cwd,
-        });
-    }
-    let bytes = program.as_encoded_bytes();
-    let program = if bytes.starts_with(b"./") {
-        program.to_os_string()
-    } else {
-        join(OsStr::new("."), program)
-    };
-    Ok(Entered {
-        program: PathBuf::from(program),
-        dir: completed.child_cwd,
-    })
-}
-
-/// [`enter_posix`]'s answer.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct Entered {
-    /// Absolute, or `./`-prefixed and read against `dir`.
-    pub(crate) program: PathBuf,
-    /// Absolute whenever `program` is relative.
-    pub(crate) dir: Option<PathBuf>,
-}
-
-/// The refusals both forms share: an interior NUL, which no exec argument can carry, and a name
-/// that [names no file](super::names_no_file).
+/// [`anchor_posix`]'s refusals: an interior NUL, which no exec argument can carry, and a name that
+/// [names no file](super::names_no_file).
 pub(crate) fn refuse_unnameable(program: &OsStr) -> Result<(), Error> {
     if program.as_encoded_bytes().contains(&0) {
         // A literal: interpolating the token would put a raw U+0000 into logs and terminals.
@@ -196,26 +90,8 @@ pub(crate) fn refuse_unnameable(program: &OsStr) -> Result<(), Error> {
     Ok(())
 }
 
-/// [`complete_posix`]'s answer: the program to exec and the directory to run it in.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct Completed {
-    pub(crate) program: PathBuf,
-    /// The base `program` was joined onto when that base came from `process_cwd()`; otherwise
-    /// `child_cwd` as given.
-    pub(crate) child_cwd: Option<PathBuf>,
-}
-
 fn is_absolute(p: &OsStr) -> bool {
     p.as_encoded_bytes().first() == Some(&b'/')
-}
-
-fn join(base: &OsStr, rel: &OsStr) -> OsString {
-    let mut out = base.to_os_string();
-    if !base.as_encoded_bytes().ends_with(b"/") {
-        out.push("/");
-    }
-    out.push(rel);
-    out
 }
 
 fn invalid_input(msg: String) -> Error {
