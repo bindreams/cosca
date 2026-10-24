@@ -534,7 +534,7 @@ mod rewrite_tests {
             .elevation_backend(Backend::Sudo)
             .elevation_auth(Auth::NonInteractive);
         let rw = rewrite_with_host(&mut c, &elevated_sudo_host()).expect("rewrite");
-        // A derived command IS built (non-destructive), but there is no backend wrapper.
+        // No backend wrapper: the derived command is the sanitized original.
         let derived = rw.derived;
         assert!(rw.backend_path.is_none());
         assert!(rw.password_write.is_none());

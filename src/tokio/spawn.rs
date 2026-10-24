@@ -46,13 +46,11 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
 
     let kill_on_drop = cmd.kill_on_drop_flag();
 
-    // Elevation runs before fds are taken (mirrors sync). POSIX rewrites into a DERIVED command and
-    // recurses (the derived command has elevation disabled → no re-entry); Windows builds the async
-    // Child here (tokio::child::Child::from_parts is pub(super)).
+    // Elevation runs before fds are taken (mirrors sync). POSIX rewrites into a derived command and
+    // returns from the block below. On Windows an already-elevated caller falls through here with the
+    // report the child carries.
     #[cfg(windows)]
     let mut elevation_report: Option<crate::elevation::ElevationReport> = None;
-    #[cfg(not(windows))]
-    let elevation_report: Option<crate::elevation::ElevationReport> = None;
     if cmd.elevation_request().enabled {
         #[cfg(windows)]
         {
@@ -83,9 +81,8 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
         {
             let mut rw = crate::elevation::posix::rewrite(cmd).not_started()?;
             let backend_path = rw.backend_path;
-            // Same shared honest remap as the sync path (parity-by-construction): remap a
-            // derived-backend exec failure to BackendUnavailable ONLY when the backend path is
-            // the culprit. An already-elevated derived (sanitized original) has no backend path.
+            // Remap an exec failure to BackendUnavailable only when the backend path is the culprit
+            // (see the sync path).
             // From here the child is the backend: its elevated program may outlive what happens to it.
             let wrapper = rw.report.as_ref().is_some_and(|r| r.via.program_outlives_child());
             let spawned = (|| {
@@ -728,6 +725,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
     };
 
     let mut child = Child::from_parts(proc, id, kill_on_drop, attachment, pipes, owned_std);
+    #[cfg(windows)]
     child.set_elevation(elevation_report);
     child.set_front(cmd.elevation_front());
     Ok(child)
