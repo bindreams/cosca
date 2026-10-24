@@ -1218,7 +1218,7 @@ fn main() {
         #[cfg(windows)]
         "spawn-consent-with-block" => env_block::spawn_consent_with_block(&args[2..]),
         #[cfg(windows)]
-        "consent-spawn" => consent_spawn::run(&args[2], &args[3], &args[4]),
+        "consent-spawn" => consent_spawn::run(&args[2], &args[3], &args[4], &args[5]),
         #[cfg(windows)]
         "spawn-frozen-report" => frozen::spawn_frozen_report(&args[2], &args[3]),
         #[cfg(all(windows, feature = "tokio"))]

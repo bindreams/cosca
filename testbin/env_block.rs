@@ -35,6 +35,24 @@ pub fn dump() {
     unsafe { FreeEnvironmentStringsW(PCWSTR(block.0)) }.expect("FreeEnvironmentStringsW");
 }
 
+/// This process's environment block, UTF-16LE, through the empty entry that closes it.
+pub fn block_bytes() -> Vec<u8> {
+    // SAFETY: no preconditions; the block is freed below.
+    let block = unsafe { GetEnvironmentStringsW() };
+    assert!(!block.is_null(), "GetEnvironmentStringsW failed");
+    // SAFETY: the block is a run of NUL-terminated entries closed by an empty one, so every read up
+    // to the first two NULs in a row is in bounds.
+    let end = (1..)
+        .find(|&i| unsafe { *block.0.add(i - 1) == 0 && *block.0.add(i) == 0 })
+        .unwrap();
+    // SAFETY: the `end + 1` units starting at `block` were just read.
+    let units = unsafe { std::slice::from_raw_parts(block.0, end + 1) };
+    let bytes = units.iter().flat_map(|u| u.to_le_bytes()).collect();
+    // SAFETY: `block` came from `GetEnvironmentStringsW` and is freed once.
+    unsafe { FreeEnvironmentStringsW(PCWSTR(block.0)) }.expect("FreeEnvironmentStringsW");
+    bytes
+}
+
 /// Spawn `dump-env-block` through cosca's `backend` (`raw` or `std`) after replaying `ops`, and
 /// relay its output. An op is `set:KEY=VAL`, `remove:KEY`, `clear`, or `contain`.
 pub fn spawn(backend: &str, ops: &[String]) {
@@ -75,17 +93,17 @@ pub fn spawn_with_block(dump_args: &str, entries: &[String]) {
     std::process::exit(code as i32);
 }
 
-/// `spawn-consent-with-block <report> <envdump> <dir> <block-file>`: run `consent-spawn <report>
-/// <envdump> <dir>` in a child whose environment block is exactly the entries of `<block-file>`, in
+/// `spawn-consent-with-block <report> <envdump> <own-envdump> <dir> <block-file>`: run
+/// `consent-spawn <report> <envdump> <own-envdump> <dir>` in a child whose environment block is exactly the entries of `<block-file>`, in
 /// order, and relay its exit code. Each entry in the file ends in a NUL. The block goes through a
 /// file because a whole inherited environment can exceed the command line's 32767 units.
 pub fn spawn_consent_with_block(args: &[String]) {
-    let [report, env_dump, dir, block_file] = args else {
-        panic!("spawn-consent-with-block <report> <envdump> <dir> <block-file>, got {args:?}");
+    let [report, env_dump, own_dump, dir, block_file] = args else {
+        panic!("spawn-consent-with-block <report> <envdump> <own-envdump> <dir> <block-file>, got {args:?}");
     };
     let block = std::fs::read_to_string(block_file).expect("read the block file");
     let entries: Vec<String> = block.split_terminator('\0').map(str::to_owned).collect();
-    let line: Vec<String> = ["consent-spawn", report, env_dump, dir]
+    let line: Vec<String> = ["consent-spawn", report, env_dump, own_dump, dir]
         .iter()
         .map(|a| quote(a))
         .collect();

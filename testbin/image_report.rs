@@ -54,11 +54,15 @@ fn main() {
     let report = format!("{module}\n{image}\n{cwd}\n{elevated}\n");
     print!("{report}");
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-    for pair in args.chunks(2) {
-        match pair {
-            [flag, path] if flag == "--report-to" => std::fs::write(path, &report).expect("write the report file"),
-            [flag, path] if flag == "--dump-env-to" => std::fs::write(path, env_block()).expect("write the env dump"),
-            _ => {}
+    let mut flags = args.iter();
+    while let Some(flag) = flags.next() {
+        let path = flags.next().unwrap_or_else(|| panic!("{flag:?} needs a path argument"));
+        if flag == "--report-to" {
+            std::fs::write(path, &report).expect("write the report file");
+        } else if flag == "--dump-env-to" {
+            std::fs::write(path, env_block()).expect("write the env dump");
+        } else {
+            panic!("unknown argument {flag:?}");
         }
     }
     std::process::exit(code);

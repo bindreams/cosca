@@ -432,15 +432,63 @@ fn windows_kill_of_an_elevated_child_reports_what_happened(#[fixture(elevation)]
     payload.release();
 }
 
+/// How an environment block holds one of the two M10 markers.
+#[cfg(windows)]
+#[derive(Debug, PartialEq, Eq)]
+enum Marker {
+    /// The entry, key and value.
+    Exact,
+    /// An entry with the marker's key (case-insensitive) and another value.
+    OtherValue,
+    Absent,
+}
+
+/// The entries of a raw `GetEnvironmentStringsW` dump (UTF-16LE, through the closing empty entry).
+#[cfg(windows)]
+fn decode_block(dump: &[u8]) -> Vec<String> {
+    dump.as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| u16::from_le_bytes(*b))
+        .collect::<Vec<u16>>()
+        .split(|&u| u == 0)
+        .take_while(|e| !e.is_empty())
+        .map(String::from_utf16_lossy)
+        .collect()
+}
+
+/// The name of an environment entry. A leading `=` belongs to the name (`=Q:`).
+#[cfg(windows)]
+fn entry_name(entry: &str) -> &str {
+    let from = usize::from(entry.starts_with('='));
+    entry[from..].find('=').map_or(entry, |i| &entry[..from + i])
+}
+
+#[cfg(windows)]
+fn marker_in(block: &[String], marker: &str) -> Marker {
+    if block.iter().any(|e| e == marker) {
+        return Marker::Exact;
+    }
+    let name = entry_name(marker);
+    if block.iter().any(|e| entry_name(e).eq_ignore_ascii_case(name)) {
+        Marker::OtherValue
+    } else {
+        Marker::Absent
+    }
+}
+
 /// M10, a measurement: the consent route's child runs in the `current_dir` given, which reaches it as
 /// `lpDirectory`, and its environment block is recorded next to the one its launcher had.
 ///
-/// `cosca_testbin spawn-consent-with-block` starts `consent-spawn` with the test's block plus `=Q:=<dir>` and a nonce,
-/// and that mode elevates `cosca_testbin_image` through `ShellExecuteExW(runas)`. The child has its own console, so it
-/// reports to files. Both markers in the child's block mean it inherited its launcher's; neither, a fresh one.
+/// `cosca_testbin spawn-consent-with-block` starts `consent-spawn` with the test's block plus `=Q:=<dir>` and a nonce.
+/// That mode dumps its own block (the positive control: both markers reached it), then elevates `cosca_testbin_image`
+/// through `ShellExecuteExW(runas)`. The child has its own console, so it reports to files. Measured on windows/amd64
+/// and windows/arm64 (run 40104203592): neither marker reaches the child, which gets a fresh environment. The test
+/// records only variable names, the markers and entry counts, because values go to a public job log.
 ///
 /// Mutants: the elevated spawn drops `current_dir` (the cwd assertion fails, as the directory is fresh and neither the
-/// test's cwd nor `System32`); the spawn does not elevate (`elevated=1` fails).
+/// test's cwd nor `System32`); the spawn does not elevate (`elevated=1` fails); the block never reaches `consent-spawn`
+/// (the control fails); the consent route starts carrying the launcher's environment (the verdict fails).
 #[cfg(windows)]
 #[skuld::test]
 fn m10_the_consent_route_child_runs_in_lp_directory(#[fixture(elevation)] _group: &Group) {
@@ -460,6 +508,7 @@ fn m10_the_consent_route_child_runs_in_lp_directory(#[fixture(elevation)] _group
     let records = tempfile::tempdir().expect("a directory for the child's reports");
     let report = records.path().join("report.txt");
     let env_dump = records.path().join("env.bin");
+    let own_dump = records.path().join("own-env.bin");
     let q_dir = tempfile::tempdir().expect("the `=Q:` marker's directory");
     let nonce = format!("COSCA_M10_NONCE={}", common::payload::fresh_nonce());
     let q_entry = format!("=Q:={}", q_dir.path().display());
@@ -485,6 +534,7 @@ fn m10_the_consent_route_child_runs_in_lp_directory(#[fixture(elevation)] _group
     cmd.arg("spawn-consent-with-block").args([
         report.as_os_str(),
         env_dump.as_os_str(),
+        own_dump.as_os_str(),
         dir.path().as_os_str(),
         block_file.as_os_str(),
     ]);
@@ -492,30 +542,24 @@ fn m10_the_consent_route_child_runs_in_lp_directory(#[fixture(elevation)] _group
     assert!(out.status.success(), "spawn-consent-with-block failed: {out:?}");
 
     let report = std::fs::read_to_string(&report).expect("the child's report");
-    let dump = std::fs::read(&env_dump).expect("the child's environment dump");
-    let child_entries: Vec<String> = dump
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|b| u16::from_le_bytes(*b))
-        .collect::<Vec<u16>>()
-        .split(|&u| u == 0)
-        .take_while(|e| !e.is_empty())
-        .map(String::from_utf16_lossy)
-        .collect();
-    let has_q = child_entries.contains(&q_entry);
-    let has_nonce = child_entries.contains(&nonce);
+    let own_entries = decode_block(&std::fs::read(&own_dump).expect("consent-spawn's environment dump"));
+    let child_entries = decode_block(&std::fs::read(&env_dump).expect("the child's environment dump"));
+    let own = (marker_in(&own_entries, &q_entry), marker_in(&own_entries, &nonce));
+    let child = (marker_in(&child_entries, &q_entry), marker_in(&child_entries, &nonce));
     println!("M10 report:\n{report}");
-    println!("M10 launcher block ({} entries):", entries.len());
-    entries.iter().for_each(|e| println!("  {e}"));
-    println!("M10 child block ({} entries):", child_entries.len());
-    child_entries.iter().for_each(|e| println!("  {e}"));
-    println!(
-        "M10 verdict: =Q: {}, nonce {}",
-        if has_q { "inherited" } else { "absent" },
-        if has_nonce { "inherited" } else { "absent" }
-    );
+    for (what, block) in [("consent-spawn", &own_entries), ("child", &child_entries)] {
+        println!("M10 {what} block: {} entries; names:", block.len());
+        block.iter().for_each(|e| println!("  {}", entry_name(e)));
+    }
+    println!("M10 launcher block: {} entries", entries.len());
+    println!("M10 markers (=Q:, nonce): consent-spawn {own:?}, child {child:?}");
 
+    // The positive control: without it, "absent" below could mean the block never reached `consent-spawn`.
+    assert_eq!(
+        own,
+        (Marker::Exact, Marker::Exact),
+        "consent-spawn did not receive both markers, so the child's block says nothing about the consent route"
+    );
     assert!(
         report.lines().any(|l| l == "elevated=1"),
         "the child did not run elevated:\n{report}"
@@ -523,6 +567,11 @@ fn m10_the_consent_route_child_runs_in_lp_directory(#[fixture(elevation)] _group
     assert!(
         report.lines().any(|l| l == format!("cwd={lp_directory}")),
         "the child's cwd is not the lpDirectory given ({lp_directory}):\n{report}"
+    );
+    assert_eq!(
+        child,
+        (Marker::Absent, Marker::Absent),
+        "the consent route's child no longer gets a fresh environment (Exact: inherited as given; OtherValue: the name is there with another value)"
     );
 }
 
