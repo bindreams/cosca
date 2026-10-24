@@ -21,6 +21,17 @@ pub struct Command {
 }
 
 impl Command {
+    /// The sync builder this one wraps, for the frozen spawn, which shares its core.
+    pub(super) fn as_sync_mut(&mut self) -> &mut SyncCommand {
+        &mut self.inner
+    }
+
+    /// The sync builder this one wraps, to read what a spawn did to it.
+    #[cfg(test)]
+    pub(crate) fn sync(&self) -> &SyncCommand {
+        &self.inner
+    }
+
     pub fn new() -> Command {
         Command {
             inner: SyncCommand::new(),

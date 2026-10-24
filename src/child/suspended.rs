@@ -6,12 +6,13 @@ use crate::command::Command;
 use crate::error::Error;
 use crate::identity::ProcessId;
 
+// `platform::spawn_frozen` is also the async frozen spawn's core.
 #[cfg(windows)]
 #[path = "suspended/windows.rs"]
-mod platform;
+pub(crate) mod platform;
 #[cfg(not(windows))]
 #[path = "suspended/unsupported.rs"]
-mod platform;
+pub(crate) mod platform;
 
 /// A child that exists but has not run: [`id`](Self::id) names it, and [`resume`](Self::resume)
 /// lets it run.

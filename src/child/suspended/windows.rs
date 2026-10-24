@@ -1,6 +1,6 @@
 //! The Windows frozen spawn: the ordinary spawn with a suspended request, and the token it leaves.
 
-use crate::child::spawn::spawn_uncommitted;
+use crate::child::spawn::{spawn_uncommitted, SpawnFailure};
 use crate::child::{Child, SuspendedChild};
 use crate::command::Command;
 use crate::containment::windows::{resume_initial_threads, SuspendCount};
@@ -49,7 +49,13 @@ impl Drop for Borrowed<'_> {
     }
 }
 
-pub(super) fn spawn(cmd: &mut Command) -> Result<SuspendedChild, Error> {
+/// Spawn `cmd` frozen through `spawn`, which is the sync or the async uncommitted spawn. Returns
+/// what it made and the command's own `kill_on_drop`, which the caller applies on resume: the child
+/// itself is made with `true`.
+pub(crate) fn spawn_frozen<T>(
+    cmd: &mut Command,
+    spawn: impl FnOnce(&mut Command) -> Result<T, SpawnFailure>,
+) -> Result<(T, bool), Error> {
     if cmd.elevation_request().enabled {
         return Err(Error::Unsupported {
             op: "spawn_suspended() with elevate()".into(),
@@ -61,10 +67,15 @@ pub(super) fn spawn(cmd: &mut Command) -> Result<SuspendedChild, Error> {
     }
     let wanted_kill_on_drop = cmd.kill_on_drop_flag();
     let borrowed = Borrowed::new(cmd);
-    let spawned = spawn_uncommitted(&mut *borrowed.cmd);
+    let spawned = spawn(&mut *borrowed.cmd);
     drop(borrowed);
+    Ok((spawned?, wanted_kill_on_drop))
+}
+
+pub(super) fn spawn(cmd: &mut Command) -> Result<SuspendedChild, Error> {
+    let (child, wanted_kill_on_drop) = spawn_frozen(cmd, spawn_uncommitted)?;
     Ok(SuspendedChild {
-        child: spawned?,
+        child,
         wanted_kill_on_drop,
     })
 }

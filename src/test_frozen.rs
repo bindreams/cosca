@@ -18,8 +18,9 @@ use windows::Win32::System::JobObjects::{
 use windows::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
 use windows::Win32::System::Memory::{VirtualAllocEx, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
 use windows::Win32::System::Threading::{
-    CreateRemoteThread, GetThreadId, OpenThread, ResumeThread, SuspendThread, CREATE_NO_WINDOW, CREATE_SUSPENDED,
-    LPTHREAD_START_ROUTINE, THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME,
+    CreateRemoteThread, GetThreadId, GetThreadTimes, OpenProcess, OpenThread, ResumeThread, SuspendThread,
+    TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED, INFINITE, LPTHREAD_START_ROUTINE,
+    PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME,
 };
 
 use crate::containment::windows::JobHandle;
@@ -36,14 +37,16 @@ pub(crate) fn spawn_suspended_blocker() -> std::process::Child {
     crate::test_spawn::spawn(&mut cmd).expect("spawn a suspended blocker")
 }
 
-/// The initial thread of a process that is still alive, held by handle. Opened while the caller's
-/// own handle on the process pins the pid. The handle is live, owned and closed once, with suspend
-/// rights, for as long as the value exists.
+/// The initial thread of a process that is still alive, held by handle: its earliest-created
+/// thread, the product's rule. Opened while the caller's own handle on the process pins the pid.
+/// The handle is live, owned and closed once, with suspend rights, for as long as the value exists.
 pub(crate) struct InitialThread(HANDLE);
 
 impl InitialThread {
     pub(crate) fn of(pid: u32) -> InitialThread {
-        // SAFETY: standard Win32 snapshot walk; the snapshot handle is closed before return.
+        let mut earliest: Option<(u64, HANDLE)> = None;
+        // SAFETY: standard Win32 snapshot walk; the snapshot handle is closed before return, and
+        // every thread handle is either kept in `earliest` or closed.
         unsafe {
             let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0).expect("thread snapshot");
             let mut entry = THREADENTRY32 {
@@ -53,20 +56,32 @@ impl InitialThread {
             let mut step = Thread32First(snap, &mut entry);
             while step.is_ok() {
                 if entry.th32OwnerProcessID == pid {
-                    let thread = OpenThread(
+                    // A thread that has exited since the snapshot cannot be the initial one of a live child.
+                    if let Ok(thread) = OpenThread(
                         THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION,
                         false,
                         entry.th32ThreadID,
-                    )
-                    .expect("open the initial thread");
-                    _ = CloseHandle(snap);
-                    return InitialThread(thread);
+                    ) {
+                        let (mut created, mut exited, mut kernel, mut user) = Default::default();
+                        GetThreadTimes(thread, &mut created, &mut exited, &mut kernel, &mut user)
+                            .expect("read the thread's creation time");
+                        let created = (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
+                        match earliest {
+                            Some((best, _)) if best <= created => _ = CloseHandle(thread),
+                            _ => {
+                                if let Some((_, older)) = earliest.replace((created, thread)) {
+                                    _ = CloseHandle(older);
+                                }
+                            }
+                        }
+                    }
                 }
                 step = Thread32Next(snap, &mut entry);
             }
             _ = CloseHandle(snap);
         }
-        panic!("pid {pid} has no thread in the snapshot");
+        let (_, thread) = earliest.unwrap_or_else(|| panic!("pid {pid} has no openable thread in the snapshot"));
+        InitialThread(thread)
     }
 
     /// The thread id.
@@ -296,5 +311,44 @@ impl RootTeardownRecorder {
 impl Drop for RootTeardownRecorder {
     fn drop(&mut self) {
         ROOT_TEARDOWNS.with(|c| c.set(None));
+    }
+}
+
+/// An owned handle on a process that can wait for it and end it, opened while the caller still
+/// holds the process, so the pid names nothing else.
+pub(crate) struct Remote(HANDLE);
+
+impl Remote {
+    pub(crate) fn open(pid: u32) -> Remote {
+        // SAFETY: plain Win32 call; the handle is closed on drop.
+        let handle =
+            unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, false, pid) }.expect("open the child");
+        Remote(handle)
+    }
+
+    /// Block until the process is gone; the process object signals, nothing here is a timer.
+    pub(crate) fn wait_for_death(&self) {
+        // SAFETY: `self.0` is live.
+        unsafe { WaitForSingleObject(self.0, INFINITE) };
+    }
+
+    /// Whether the process is gone now. A single non-blocking look, used only after a drop that
+    /// kills synchronously, so it is not a bet that enough time has passed.
+    pub(crate) fn is_dead_now(&self) -> bool {
+        // SAFETY: `self.0` is live.
+        unsafe { WaitForSingleObject(self.0, 0) }.0 == 0
+    }
+
+    pub(crate) fn end(&self) {
+        // SAFETY: `self.0` is live with `PROCESS_TERMINATE`.
+        unsafe { TerminateProcess(self.0, 1) }.expect("end the child");
+        self.wait_for_death();
+    }
+}
+
+impl Drop for Remote {
+    fn drop(&mut self) {
+        // SAFETY: owned, closed once.
+        unsafe { _ = CloseHandle(self.0) };
     }
 }

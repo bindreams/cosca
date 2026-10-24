@@ -81,6 +81,10 @@ impl RawAsyncChild {
         HANDLE(self.proc.as_raw_handle())
     }
 
+    pub(crate) fn raw_handle(&self) -> std::os::windows::io::RawHandle {
+        self.proc.as_raw_handle()
+    }
+
     /// Block until the child exits, returning its status. Runs the blocking handle wait on the
     /// blocking pool; a `CancelGuard` in this future signals a cancel event on drop so an aborted
     /// or timed-out wait releases the parked watcher at once.

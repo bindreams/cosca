@@ -30,7 +30,7 @@ use proc_handle::ProcHandle;
 mod lifecycle;
 
 #[path = "child/suspended.rs"]
-mod suspended;
+pub(crate) mod suspended;
 pub use suspended::SuspendedChild;
 
 #[path = "child/graceful.rs"]

@@ -4,6 +4,10 @@
 #[path = "child/graceful.rs"]
 mod graceful;
 
+#[path = "child/suspended.rs"]
+mod suspended;
+pub use suspended::SuspendedChild;
+
 #[path = "child/proc_source.rs"]
 mod proc_source;
 pub(crate) use proc_source::ProcSource;
@@ -128,6 +132,12 @@ impl Child {
             #[cfg(unix)]
             reported: Vec::new(),
         }
+    }
+
+    /// The process handle, borrowed from `self`, while the backend still holds one.
+    #[cfg(windows)]
+    pub(super) fn process_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+        self.os.proc.as_ref()?.raw_handle()
     }
 
     /// See [`ProcSource::forget_for`].

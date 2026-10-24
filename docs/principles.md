@@ -32,6 +32,11 @@ cosca's placement report ([`ReportChannel::wait`](../src/containment/cgroup/chan
 completes before `exec`. The wait is bounded by the child's own progress to `exec`; a child stopped
 or stuck in D state between `fork` and `exec` holds the thread.
 
+[`SuspendedChild::resume`](../src/tokio/child/suspended.rs) is the deferred second half of a spawn,
+so the exception covers it, and it is a sync `fn`. On Windows it walks the system's thread snapshot
+to resume the child's initial thread, as a contained `spawn` already does, and waits for no process
+exit.
+
 **Why:** a blocked worker stops every task scheduled on it, and on a `current_thread` runtime it
 stops the runtime. tokio itself panics rather than block when a `Runtime` is dropped in async
 context ([tokio shutdown.rs]).
@@ -71,8 +76,10 @@ that own the whole process, such as tini and the containerd shim. Embeddable lib
 role: sd-event avoids `waitid(P_ALL)` ([sd-event.c]), and runc's Go `libcontainer` requires its
 embedder to supply the reaper for containers without their own PID namespace ([runc CHANGELOG]).
 
-**Applies to:** `Drop` of [`cosca::tokio::Child`](../src/tokio/child.rs) and everything it owns. The
-sync [`Child`](../src/child.rs) kills and reaps in its `Drop`, which is allowed.
+**Applies to:** `Drop` of [`cosca::tokio::Child`](../src/tokio/child.rs) and everything it owns,
+which includes an unresumed [`cosca::tokio::SuspendedChild`](../src/tokio/child/suspended.rs): its
+drop is its `Child`'s. The sync [`Child`](../src/child.rs) kills and reaps in its `Drop`, which is
+allowed.
 
 ## 4. Don't act on a bare PID after it may be reused
 

@@ -37,7 +37,7 @@ mod on_windows {
 
     use crate::containment::windows::fault::{force_next, Step};
     use crate::error::{ChildFate, Error};
-    use crate::test_frozen::{limit_flags, InitialThread};
+    use crate::test_frozen::{limit_flags, InitialThread, Remote};
     use crate::Containment;
 
     const ERROR_ACCESS_DENIED: u32 = 5;
@@ -205,45 +205,6 @@ mod on_windows {
             assert_eq!(kills_on_close, kill_on_drop, "kill_on_drop({kill_on_drop})");
             child.kill().expect("kill");
             child.wait().expect("reap");
-        }
-    }
-
-    /// An owned handle on a process that can wait for it and end it, opened while the caller still
-    /// holds the process, so the pid names nothing else.
-    struct Remote(HANDLE);
-
-    impl Remote {
-        fn open(pid: u32) -> Remote {
-            // SAFETY: plain Win32 call; the handle is closed on drop.
-            let handle = unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, false, pid) }
-                .expect("open the resumed child");
-            Remote(handle)
-        }
-
-        /// Block until the process is gone; the process object signals, nothing here is a timer.
-        fn wait_for_death(&self) {
-            // SAFETY: `self.0` is live.
-            unsafe { WaitForSingleObject(self.0, INFINITE) };
-        }
-
-        /// Whether the process is gone now. A single non-blocking look, used only after a drop that
-        /// kills synchronously, so it is not a bet that enough time has passed.
-        fn is_dead_now(&self) -> bool {
-            // SAFETY: `self.0` is live.
-            unsafe { WaitForSingleObject(self.0, 0) }.0 == 0
-        }
-
-        fn end(&self) {
-            // SAFETY: `self.0` is live with `PROCESS_TERMINATE`.
-            unsafe { TerminateProcess(self.0, 1) }.expect("end the resumed child");
-            self.wait_for_death();
-        }
-    }
-
-    impl Drop for Remote {
-        fn drop(&mut self) {
-            // SAFETY: owned, closed once.
-            unsafe { _ = CloseHandle(self.0) };
         }
     }
 
@@ -447,6 +408,11 @@ mod on_windows {
         let mut cmd = blocker(false);
         drop(cmd.spawn_suspended().expect("spawn suspended"));
 
+        // A spawn takes the stdio configuration out of the command. Without its own piped stdin the
+        // second blocker would read the harness's stdin and, where that is at EOF, exit at once.
+        cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
+        cmd.stdout(crate::Stdio::null()).expect("stdout null");
+        cmd.stderr(crate::Stdio::null()).expect("stderr null");
         let child = crate::child::spawn::spawn_uncommitted(&mut cmd).expect("an ordinary spawn");
 
         assert_eq!(
