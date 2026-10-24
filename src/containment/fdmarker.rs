@@ -952,7 +952,7 @@ impl Marker {
 
     /// Whether this marker carries a pgid to `killpg`/`term_group` on sweep — `true` for
     /// every mode except `TreeWalk` (`pgid: None`, no process group). `kill_tree`/`terminate_tree`
-    /// check a reaped root before such a sweep (`child::reaped_root_tree_signal`), as for
+    /// check a reaped root before such a sweep (`child::root_number`), as for
     /// `Attached::ProcessGroup`: this mechanism fires `killpg` on `self.pgid` on pass 1.
     pub(crate) fn has_pgid(&self) -> bool {
         self.pgid.is_some()

@@ -39,12 +39,14 @@
 //! would then signal that process's group. Another reaper in the process (`SIGCHLD` set to
 //! `SIG_IGN`, a `waitpid(-1)` reaper) can reap it before the caller gets a `Child` back.
 //! `kill_tree`/`terminate_tree` therefore look at the root through its handle first
-//! (`child::reaped_root_tree_signal`): a root shown reaped elsewhere gets no `killpg`. That look
-//! is not atomic with the sweep: a foreign reap after it is not seen, and every signal of the sweep
-//! (the `killpg`, `signal_direct`'s `kill`, and `verify`'s resends to the members it lists by that
-//! pgid) then goes out by a number another process may hold. After this handle's own reap, a pid that names no process is still
-//! signalled as the group's id. cgroup v2 names no pid and does not have this hole — prefer it
-//! when the guarantee matters.
+//! (`child::root_number`): a root shown reaped elsewhere gets no `killpg`. That look is not atomic
+//! with the sweep: a foreign reap after it is not seen, and every signal the sweep sends by that
+//! number then goes out to a number another process may hold: the `killpg`, `signal_direct`'s
+//! `kill`, `verify`'s resends to the members it lists by that pgid, and a macOS fd marker's walk
+//! from the root's pid. After this handle's own reap, a pid that names no process is still
+//! signalled as the group's id: the root's group while a member survives, but once none does,
+//! another process may take the number, and lead a group by it, first. cgroup v2 names no pid and
+//! does not have this hole — prefer it when the guarantee matters.
 
 use std::io;
 

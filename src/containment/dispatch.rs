@@ -554,7 +554,7 @@ impl Attached {
     }
 
     /// Whether this mechanism fires `killpg` against a pgid that the leader's reap frees for reuse,
-    /// so `kill_tree`/`terminate_tree` check the root first ([`crate::child::reaped_root_tree_signal`]).
+    /// so `kill_tree`/`terminate_tree` check the root first ([`crate::child::root_number`]).
     /// `ProcessGroup` always carries one; a macOS `FdMarker` does too, when its mode created one
     /// (`Marker::has_pgid`: `None` for `TreeWalk`, which needs no pgid, matching `Attached::TreeWalk`
     /// below). `FdMarker` fires `killpg` on `self.pgid` on pass 1 of every sweep, so the hazard is

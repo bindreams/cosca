@@ -78,7 +78,7 @@ fn attached_is_actionable() {
     assert!(Attached::JobObject(crate::containment::windows::JobHandle::create_empty_for_test()).is_actionable());
 }
 
-/// `kill_tree`/`terminate_tree`'s check of a reaped root (`child::reaped_root_tree_signal`) gates
+/// `kill_tree`/`terminate_tree`'s check of a reaped root (`child::root_number`) gates
 /// on this predicate, not on `Attached::ProcessGroup` alone: a macOS `FdMarker` that carries a
 /// pgid fires `killpg` on pass 1 of every sweep, the same hazard.
 #[cfg(unix)]
