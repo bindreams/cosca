@@ -128,7 +128,7 @@ pub(crate) fn unpinned_status(pid: u32, op: &str) -> crate::error::Error {
 
 /// Refuse `op` if [`is_unpinned`], so the lone `kill` and `terminate` send no signal by number to a
 /// pid launchd may reap and reuse. The tree paths do not refuse outright: see
-/// [`root_number`](crate::child::root_number).
+/// [`root_number`](crate::child::tree_call::root_number).
 #[cfg(unix)]
 pub(crate) fn refuse_unpinned(
     pid: u32,

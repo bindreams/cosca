@@ -566,7 +566,7 @@ impl Attached {
     }
 
     /// Whether `kill_tree`/`terminate_tree` must check the root before signalling
-    /// ([`crate::child::root_number`]): this mechanism reaches the tree through the root's number,
+    /// ([`crate::child::tree_call::root_number`]): this mechanism reaches the tree through the root's number,
     /// which the root's reap frees for reuse, and nothing in it checks the root first.
     /// `ProcessGroup` `killpg`s that number. A macOS `FdMarker` walks the process table from it on
     /// every sweep, and `killpg`s it too when its mode made a group. `TreeWalk` also walks from it,

@@ -36,6 +36,14 @@ pub use suspended::SuspendedChild;
 #[path = "child/graceful.rs"]
 mod graceful;
 
+#[cfg(unix)]
+#[path = "child/tree_call.rs"]
+pub(crate) mod tree_call;
+#[cfg(target_os = "linux")]
+pub(crate) use tree_call::PidfdShutdown;
+#[cfg(unix)]
+pub(crate) use tree_call::{Graceful, TreeCall};
+
 #[cfg(all(target_os = "macos", test))]
 impl Child {
     /// The unique id the handle checks its by-pid actions against.
@@ -97,333 +105,6 @@ pub(crate) mod front_cgroup_tests;
 pub(crate) enum ParentEnd {
     Reader(PipeReader),
     Writer(PipeWriter),
-}
-
-/// What a tree path may send by the root's number, from one look at the root's state.
-#[cfg(unix)]
-pub(crate) enum RootNumber {
-    /// Everything: as far as the look shows, the number names the root.
-    Trusted,
-    /// macOS: the root is `Unpinned` or `Unknown`, so only what names the tree by identity is sent;
-    /// see [`Attached::signal_tree_untrusted`](crate::containment::Attached::signal_tree_untrusted).
-    #[cfg(target_os = "macos")]
-    Untrusted(crate::signal::RootState),
-    /// macOS: this handle reaped the root, its pid names no process, and an fd marker made a group.
-    /// The group and the marker holders are signalled, but no walk runs from the pid: the root's
-    /// children were reparented at its exit, so a walk would find only a later process's children.
-    #[cfg(target_os = "macos")]
-    NoWalk,
-    /// This handle reaped the root, and its group is empty or it had none: another process holds
-    /// the pid, and the kernel does not reissue a pid while it is some group's id, or the pid of a
-    /// pid-less fd marker's root names nothing. Only the marker holders, if any, are signalled.
-    Empty,
-    /// The pid may name another process, for the reason `why`: the root was reaped elsewhere, or
-    /// its handle or its pid cannot be read. `exact_root` (Linux): the handle cannot say whether the
-    /// root was reaped, and a signal through it reaches the root exactly if it reaches it at all. A
-    /// handle that still holds the root's pidfd delivers it; a tokio backend forgotten because the
-    /// root could not be shown to be ours holds none, and answers `Sent::Unverified`.
-    MayNameAnother { why: String, exact_root: bool },
-}
-
-/// [`RootNumber`] for `attached`'s tree, from one call of `state`: the root's own handle's answer,
-/// and whether a `Reaped` is that handle's own reap. On macOS it is always called; elsewhere only
-/// for a mechanism that reaches its tree through the root's number
-/// ([`Attached::needs_root_check`](crate::containment::Attached::needs_root_check)). After this
-/// handle's own reap, a pid that names nothing (`Gone`) is still the id of the root's group while a
-/// member survives, so a group is signalled by it, though once none survives a later process may
-/// take the number, and lead a group by it, first (bindreams/cosca#382). No walk runs from it.
-#[cfg(unix)]
-pub(crate) fn root_number(
-    attached: &crate::containment::Attached,
-    pid: crate::identity::RawPid,
-    state: impl FnOnce() -> (crate::signal::RootState, bool),
-) -> RootNumber {
-    use crate::identity::Resolved;
-    use crate::signal::RootState;
-    #[cfg(target_os = "macos")]
-    let state = {
-        let looked = state();
-        if matches!(looked.0, RootState::Unpinned | RootState::Unknown(_)) {
-            return RootNumber::Untrusted(looked.0);
-        }
-        move || looked
-    };
-    if !attached.needs_root_check() {
-        return RootNumber::Trusted;
-    }
-    let mut exact_root = false;
-    let why = match state() {
-        (RootState::Unreaped, _) => return RootNumber::Trusted,
-        (RootState::Reaped, true) => match root_identity_now(pid) {
-            Resolved::Gone => return own_reaped_free(attached),
-            Resolved::Found(_) => return RootNumber::Empty,
-            Resolved::Unknown => format!("this handle reaped the root, and its pid ({pid}) could not be read"),
-        },
-        (RootState::Reaped, false) => format!("the root (pid {pid}) was reaped elsewhere"),
-        (RootState::Unknown(e), _) => {
-            exact_root = cfg!(target_os = "linux");
-            format!("the root's own handle could not say whether it (pid {pid}) was reaped ({e})")
-        }
-        (RootState::Unpinned, _) => {
-            debug_assert!(false, "only macOS reports an unpinned root, and it is answered above");
-            format!("the root (pid {pid}) is not pinned by this process")
-        }
-    };
-    RootNumber::MayNameAnother { why, exact_root }
-}
-
-/// [`RootNumber`] after this handle's own reap, with the root's pid naming no process.
-#[cfg(unix)]
-fn own_reaped_free(attached: &crate::containment::Attached) -> RootNumber {
-    #[cfg(target_os = "macos")]
-    match attached.fd_marker_has_group() {
-        Some(true) => return RootNumber::NoWalk,
-        Some(false) => return RootNumber::Empty,
-        None => {}
-    }
-    #[cfg(not(target_os = "macos"))]
-    let _ = attached;
-    RootNumber::Trusted
-}
-
-/// What `kill_tree` and `terminate_tree` (sync and async) do instead of signalling a tree reached
-/// through the root's pid (a process group, or a macOS fd marker's group and walk) when that pid may
-/// name another process, decided on one look ([`root_number`]). `None`: signal it as usual.
-///
-/// No walk from the root's pid runs here, and no `killpg` except a marker's group's after this
-/// handle's own reap ([`RootNumber::NoWalk`]). What names the tree by identity still runs: a macOS
-/// fd marker's holders, named by the pipe they hold.
-///
-/// - `Untrusted` (macOS): `Attached::signal_tree_untrusted`.
-/// - `NoWalk` (macOS): the group and the holders. A `Kill` that is `Ok` marks the tree killed.
-/// - `Empty`: the holders are signalled, and the call is their sweep's answer (`Ok` with no holders
-///   channel). A `Kill` that is `Ok` marks the tree killed.
-/// - `MayNameAnother`: [`number_skipped`], after `signal_root` when the handle still names the root
-///   exactly.
-///
-/// `op` names the call; `earlier` names what the same operation sent before. `signal_root` sends
-/// the call's own signal to the root through its handle.
-#[cfg(unix)]
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each is one fact of the call the decision needs"
-)]
-pub(crate) fn root_checked_tree_signal(
-    attached: &crate::containment::Attached,
-    id: ProcessId,
-    signal: crate::containment::dispatch::TreeSignal,
-    op: &str,
-    earlier: Option<&str>,
-    killed: &crate::containment::TreeKilled,
-    state: impl FnOnce() -> (crate::signal::RootState, bool),
-    signal_root: &dyn Fn() -> Result<crate::signal::Sent, Error>,
-) -> Option<Result<(), Error>> {
-    use crate::containment::dispatch::TreeSignal;
-    let pid = id.pid();
-    match root_number(attached, pid, state) {
-        RootNumber::Trusted => None,
-        #[cfg(target_os = "macos")]
-        RootNumber::Untrusted(root) => attached.signal_tree_untrusted(signal, &root, pid, op, earlier, killed),
-        #[cfg(target_os = "macos")]
-        RootNumber::NoWalk => Some(no_walk_signal(attached, pid, signal, op, Some(killed))),
-        RootNumber::Empty => Some(
-            empty_group_signal(attached, pid, signal, op, Some(killed)).unwrap_or_else(|| {
-                if let TreeSignal::Kill = signal {
-                    killed.mark();
-                }
-                Ok(())
-            }),
-        ),
-        RootNumber::MayNameAnother { why, exact_root } => {
-            let root = exact_root.then(signal_root);
-            Some(Err(number_skipped(attached, pid, signal, op, earlier, &why, root)))
-        }
-    }
-}
-
-/// The signal for [`RootNumber::NoWalk`]: the group and a macOS fd marker's holders, and no walk
-/// from the root's pid. For `Kill`, an `Ok` marks the tree killed only if `mark` is set.
-#[cfg(target_os = "macos")]
-pub(crate) fn no_walk_signal(
-    attached: &crate::containment::Attached,
-    pid: crate::identity::RawPid,
-    signal: crate::containment::dispatch::TreeSignal,
-    op: &str,
-    mark: Option<&crate::containment::TreeKilled>,
-) -> Result<(), Error> {
-    log::debug!(
-        "{op}({pid}): this handle reaped the root, and its pid names no process: its group and the marker holders \
-         are signalled, and no walk runs from the pid, which would find none of the tree"
-    );
-    attached.signal_group_and_holders(signal, mark).unwrap_or_else(|| {
-        debug_assert!(false, "only an fd marker with a group gets here");
-        Ok(())
-    })
-}
-
-/// The signal for [`RootNumber::Empty`]: nothing by the root's number, and a macOS fd marker's
-/// holders by the pipe they hold. `None` for a mechanism with no such channel. For `Kill`, an `Ok`
-/// marks the tree killed only if `mark` is set.
-#[cfg(unix)]
-pub(crate) fn empty_group_signal(
-    attached: &crate::containment::Attached,
-    pid: crate::identity::RawPid,
-    signal: crate::containment::dispatch::TreeSignal,
-    op: &str,
-    mark: Option<&crate::containment::TreeKilled>,
-) -> Option<Result<(), Error>> {
-    log::debug!(
-        "{op}({pid}): this handle reaped the root, so its group is empty or it had none, a walk from its pid \
-         would find none of the tree, and nothing is sent by it"
-    );
-    attached.signal_holders_only(signal, mark)
-}
-
-/// The answer for [`RootNumber::MayNameAnother`], `why` its reason: nothing is sent by the root's
-/// number, a macOS fd marker's holders are signalled, and one `warn` names what was skipped and
-/// what was sent, `root` included: the signal to the root through its handle, if one was sent. The
-/// holders' sweep's error, the root signal's error, or `Unassessable`.
-#[cfg(unix)]
-pub(crate) fn number_skipped(
-    attached: &crate::containment::Attached,
-    pid: crate::identity::RawPid,
-    signal: crate::containment::dispatch::TreeSignal,
-    op: &str,
-    earlier: Option<&str>,
-    why: &str,
-    root: Option<Result<crate::signal::Sent, Error>>,
-) -> Error {
-    use crate::signal::Sent;
-    let holders = attached.signal_holders_only(signal, None);
-    let (sent_root, failed_root) = match signal {
-        crate::containment::dispatch::TreeSignal::Kill => (
-            "killed the root through its pidfd, which names it exactly, and sent nothing else",
-            "the kill of the root",
-        ),
-        crate::containment::dispatch::TreeSignal::Term => (
-            "sent the SIGTERM to the root through its pidfd, which names it exactly, and sent nothing else",
-            "the SIGTERM to the root",
-        ),
-    };
-    let sent = match (&holders, &root) {
-        (Some(Ok(())), _) => "signalled only the marker holders".to_owned(),
-        (Some(Err(e)), _) => format!("signalled only the marker holders, which failed ({e})"),
-        (None, None) => "sent nothing".to_owned(),
-        (None, Some(Ok(Sent::Delivered))) => sent_root.to_owned(),
-        (None, Some(Ok(Sent::Gone))) => "sent nothing: the root's pidfd shows it is gone".to_owned(),
-        (None, Some(Ok(_))) => "sent nothing: the root's handle no longer reaches it".to_owned(),
-        (None, Some(Err(e))) => format!("sent nothing: {failed_root} through its pidfd failed ({e})"),
-    };
-    let detail = skipped_detail(attached, pid, signal.verb(), op, why, &sent, earlier);
-    log::warn!("{detail}");
-    match (holders, root) {
-        (Some(Err(e)), _) | (None, Some(Err(e))) => e,
-        _ => Error::Unassessable { detail, source: None },
-    }
-}
-
-/// `graceful_shutdown_tree`'s answer (sync and async) for [`RootNumber::MayNameAnother`] when the root's
-/// handle still names it exactly (`exact_root`, Linux): the root got the `SIGTERM` (`term`) through its
-/// pidfd and, if it outlived the grace, a kill (`kill`), and nothing went out by its number. One `warn`
-/// names what was skipped and what was sent. The failed signal's error, or `Unassessable`.
-#[cfg(target_os = "linux")]
-pub(crate) fn root_shutdown_error(
-    attached: &crate::containment::Attached,
-    pid: crate::identity::RawPid,
-    why: &str,
-    term: Result<crate::signal::Sent, Error>,
-    kill: Option<Result<crate::signal::Sent, Error>>,
-) -> Error {
-    use crate::signal::Sent;
-    let termed = "sent the SIGTERM to the root through its pidfd, which names it exactly";
-    let sent = match (&term, &kill) {
-        (Err(e), _) => format!("sent nothing: the SIGTERM to the root through its pidfd failed ({e})"),
-        (Ok(Sent::Delivered), None) => format!("{termed}, and it exited within the grace; sent nothing else"),
-        (Ok(Sent::Delivered), Some(Ok(Sent::Delivered))) => {
-            format!("{termed}, then killed the root through its pidfd after the grace, and sent nothing else")
-        }
-        (Ok(Sent::Delivered), Some(Err(e))) => {
-            format!("{termed}, then the kill of the root through its pidfd failed ({e})")
-        }
-        (Ok(Sent::Delivered), Some(Ok(_))) => {
-            format!("{termed}, and its pidfd showed it gone after the grace; sent nothing else")
-        }
-        (Ok(Sent::Gone), _) => "sent nothing: the root's pidfd shows it is gone".to_owned(),
-        (Ok(_), _) => "sent nothing: the root's handle no longer reaches it".to_owned(),
-    };
-    let detail = skipped_detail(
-        attached,
-        pid,
-        crate::containment::dispatch::TreeSignal::Term.verb(),
-        "graceful_shutdown_tree",
-        why,
-        &sent,
-        None,
-    );
-    log::warn!("{detail}");
-    match (term, kill) {
-        (Err(e), _) | (_, Some(Err(e))) => e,
-        _ => Error::Unassessable { detail, source: None },
-    }
-}
-
-/// `graceful_shutdown_tree`'s answer (sync and async) for [`RootNumber::MayNameAnother`] on a macOS
-/// fd marker, whose holders got the `SIGTERM` (`term`) and, after the grace, a kill (`kill`). One
-/// `warn` names what was skipped. The kill's error, or `Unassessable`.
-#[cfg(target_os = "macos")]
-pub(crate) fn holders_shutdown_error(
-    attached: &crate::containment::Attached,
-    pid: crate::identity::RawPid,
-    why: &str,
-    term: Result<(), Error>,
-    kill: Result<(), Error>,
-) -> Error {
-    let term = match &term {
-        Ok(()) => String::new(),
-        Err(e) => format!(", which failed ({e})"),
-    };
-    let kill_failed = match &kill {
-        Ok(()) => String::new(),
-        Err(e) => format!(", which failed ({e})"),
-    };
-    let sent =
-        format!("sent the SIGTERM only to the marker holders{term}, then killed any left after the grace{kill_failed}");
-    let detail = skipped_detail(attached, pid, "signal", "graceful_shutdown_tree", why, &sent, None);
-    log::warn!("{detail}");
-    match kill {
-        Err(e) => e,
-        Ok(()) => Error::Unassessable { detail, source: None },
-    }
-}
-
-/// `signal` to the marker holders of `attached`, a macOS fd marker, which names its tree by identity.
-#[cfg(target_os = "macos")]
-pub(crate) fn holders_only(
-    attached: &crate::containment::Attached,
-    signal: crate::containment::dispatch::TreeSignal,
-) -> Result<(), Error> {
-    attached.signal_holders_only(signal, None).unwrap_or_else(|| {
-        debug_assert!(false, "only a mechanism that names its tree by identity gets here");
-        Ok(())
-    })
-}
-
-/// The one line that says a tree path skipped what names the tree by the root's number.
-#[cfg(unix)]
-fn skipped_detail(
-    attached: &crate::containment::Attached,
-    pid: crate::identity::RawPid,
-    verb: &str,
-    op: &str,
-    why: &str,
-    sent: &str,
-    earlier: Option<&str>,
-) -> String {
-    let skipped = attached
-        .named_by_root_number(pid, verb)
-        .unwrap_or_else(|| format!("{verb} its tree"));
-    let earlier = earlier.map_or_else(String::new, |sent| format!(", though {sent} was sent before it"));
-    format!("{op}(): {why}, so its number may name another process; it did not {skipped}, and {sent}{earlier}")
 }
 
 /// A spawned child process the crate owns.
@@ -956,20 +637,17 @@ impl Child {
         // signalled by identity alone, and so is a group named by the root's pid once that pid may
         // name another process.
         #[cfg(unix)]
-        if let Some(result) = root_checked_tree_signal(
-            &self.attached,
-            self.id,
-            crate::containment::dispatch::TreeSignal::Kill,
-            "kill_tree",
-            earlier,
-            &self.tree_killed,
-            || self.proc.state_and_own_reap(),
-            &|| {
-                self.proc
-                    .kill_sent()
-                    .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper()))
-            },
-        ) {
+        if let Some(result) = self
+            .tree_call(crate::containment::dispatch::TreeSignal::Kill, "kill_tree", earlier)
+            .root_checked(
+                || self.proc.state_and_own_reap(),
+                || {
+                    self.proc
+                        .kill_sent()
+                        .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper()))
+                },
+            )
+        {
             return result;
         }
         let group_result = self.attached.hard_kill_marking(&self.tree_killed);
@@ -1085,16 +763,13 @@ impl Child {
         self.require_contained()?;
         // One look at the root decides, as for `kill_tree`.
         #[cfg(unix)]
-        if let Some(result) = root_checked_tree_signal(
-            &self.attached,
-            self.id,
-            crate::containment::dispatch::TreeSignal::Term,
-            "terminate_tree",
-            None,
-            &self.tree_killed,
-            || self.proc.state_and_own_reap(),
-            &|| self.proc.signal_sent(crate::signal::Sig::Term).map_err(Error::Io),
-        ) {
+        if let Some(result) = self
+            .tree_call(crate::containment::dispatch::TreeSignal::Term, "terminate_tree", None)
+            .root_checked(
+                || self.proc.state_and_own_reap(),
+                || self.proc.signal_sent(crate::signal::Sig::Term).map_err(Error::Io),
+            )
+        {
             return result;
         }
         self.terminate_tree_unchecked()
@@ -1105,10 +780,22 @@ impl Child {
         self.attached.terminate(self.proc.id())
     }
 
-    /// The tree paths' one look at the root ([`root_number`]).
+    /// A tree call on this child's tree ([`TreeCall`]).
     #[cfg(unix)]
-    fn root_number(&self) -> RootNumber {
-        root_number(&self.attached, self.id.pid(), || self.proc.state_and_own_reap())
+    fn tree_call<'a>(
+        &'a self,
+        signal: crate::containment::dispatch::TreeSignal,
+        op: &'static str,
+        earlier: Option<&'a str>,
+    ) -> TreeCall<'a> {
+        TreeCall {
+            attached: &self.attached,
+            pid: self.id.pid(),
+            signal,
+            op,
+            earlier,
+            killed: &self.tree_killed,
+        }
     }
 
     /// Take the parent's write end of the child's stdin pipe, if configured.

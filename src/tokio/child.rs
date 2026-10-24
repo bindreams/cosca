@@ -809,16 +809,10 @@ impl Child {
         // signalled by identity alone, and so is a group named by the root's pid once that pid may
         // name another process.
         #[cfg(unix)]
-        if let Some(result) = crate::child::root_checked_tree_signal(
-            &self.os.attached,
-            self.id,
-            crate::containment::dispatch::TreeSignal::Kill,
-            "kill_tree",
-            earlier,
-            &self.tree_killed,
-            || self.root_state_and_own_reap(),
-            &|| self.kill_root_through_handle(),
-        ) {
+        if let Some(result) = self
+            .tree_call(crate::containment::dispatch::TreeSignal::Kill, "kill_tree", earlier)
+            .root_checked(|| self.root_state_and_own_reap(), || self.kill_root_through_handle())
+        {
             return result;
         }
         let group_result = self.os.attached.hard_kill_marking(&self.tree_killed);
@@ -938,16 +932,10 @@ impl Child {
         self.require_contained()?;
         // One look at the root decides, as for `kill_tree`.
         #[cfg(unix)]
-        if let Some(result) = crate::child::root_checked_tree_signal(
-            &self.os.attached,
-            self.id,
-            crate::containment::dispatch::TreeSignal::Term,
-            "terminate_tree",
-            None,
-            &self.tree_killed,
-            || self.root_state_and_own_reap(),
-            &|| self.term_root_through_handle(),
-        ) {
+        if let Some(result) = self
+            .tree_call(crate::containment::dispatch::TreeSignal::Term, "terminate_tree", None)
+            .root_checked(|| self.root_state_and_own_reap(), || self.term_root_through_handle())
+        {
             return result;
         }
         self.terminate_tree_unchecked()
@@ -974,10 +962,22 @@ impl Child {
             .map_or(Ok(Sent::Gone), |proc| proc.signal(Sig::Term))
     }
 
-    /// The tree paths' one look at the root ([`root_number`](crate::child::root_number)).
+    /// A tree call on this child's tree ([`TreeCall`](crate::child::TreeCall)).
     #[cfg(unix)]
-    fn root_number(&self) -> crate::child::RootNumber {
-        crate::child::root_number(&self.os.attached, self.id.pid(), || self.root_state_and_own_reap())
+    fn tree_call<'a>(
+        &'a self,
+        signal: crate::containment::dispatch::TreeSignal,
+        op: &'static str,
+        earlier: Option<&'a str>,
+    ) -> crate::child::TreeCall<'a> {
+        crate::child::TreeCall {
+            attached: &self.os.attached,
+            pid: self.id.pid(),
+            signal,
+            op,
+            earlier,
+            killed: &self.tree_killed,
+        }
     }
 
     /// The group's termination signal, with no look at the root's state.

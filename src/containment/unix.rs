@@ -39,7 +39,7 @@
 //! would then signal that process's group. Another reaper in the process (`SIGCHLD` set to
 //! `SIG_IGN`, a `waitpid(-1)` reaper) can reap it before the caller gets a `Child` back.
 //! `kill_tree`/`terminate_tree` therefore look at the root through its handle first
-//! (`child::root_number`): a root shown reaped elsewhere gets no `killpg`. That look is not atomic
+//! (`child::tree_call::root_number`): a root shown reaped elsewhere gets no `killpg`. That look is not atomic
 //! with the sweep: a reap after it, by another reaper or by a sync `wait` on another thread, is not
 //! seen, and every signal the sweep sends by that number then goes out to a number another process
 //! may hold: the `killpg`, `signal_direct`'s `kill`, `verify`'s resends to the members it lists by

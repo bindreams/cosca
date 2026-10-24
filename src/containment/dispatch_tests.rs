@@ -78,7 +78,7 @@ fn attached_is_actionable() {
     assert!(Attached::JobObject(crate::containment::windows::JobHandle::create_empty_for_test()).is_actionable());
 }
 
-/// `kill_tree`/`terminate_tree`'s check of a reaped root (`child::root_number`) gates on this
+/// `kill_tree`/`terminate_tree`'s check of a reaped root (`child::tree_call::root_number`) gates on this
 /// predicate: a mechanism that reaches its tree through the root's number, with nothing of its own
 /// that checks the root first.
 #[cfg(unix)]

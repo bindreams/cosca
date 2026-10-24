@@ -275,73 +275,25 @@ impl Child {
 
         // One look at the root decides the cooperative signal (see `terminate_tree`), and what the
         // sweep may say was sent before it.
-        #[cfg(unix)]
-        let mut earlier = Some("the SIGTERM");
         #[cfg(not(unix))]
         let earlier = Some("the SIGTERM");
         #[cfg(unix)]
-        let decided = match self.root_number() {
-            crate::child::RootNumber::Trusted => None,
-            // By identity alone. With no channel by identity there is nothing to signal, wait for or
-            // sweep, so the call ends here with nothing sent.
-            #[cfg(target_os = "macos")]
-            crate::child::RootNumber::Untrusted(root) => match self.attached.signal_tree_untrusted(
-                crate::containment::dispatch::TreeSignal::Term,
-                &root,
-                self.id.pid(),
-                "graceful_shutdown_tree",
-                None,
-                &self.tree_killed,
-            ) {
-                Some(Err(e)) if !self.attached.names_tree_by_identity() => return Err(e),
-                other => other,
-            },
-            // This handle reaped the root: its marker's group and holders, and no walk from its pid.
-            #[cfg(target_os = "macos")]
-            crate::child::RootNumber::NoWalk => Some(crate::child::no_walk_signal(
-                &self.attached,
-                self.id.pid(),
-                crate::containment::dispatch::TreeSignal::Term,
-                "graceful_shutdown_tree",
-                None,
-            )),
-            // The group is empty: nothing goes out by its number, only to the marker holders, if any.
-            crate::child::RootNumber::Empty => {
-                let holders = crate::child::empty_group_signal(
-                    &self.attached,
-                    self.id.pid(),
-                    crate::containment::dispatch::TreeSignal::Term,
-                    "graceful_shutdown_tree",
-                    None,
-                );
-                earlier = holders.is_some().then_some("the SIGTERM to any marker holders");
-                Some(holders.unwrap_or(Ok(())))
+        let call = self.tree_call(
+            crate::containment::dispatch::TreeSignal::Term,
+            "graceful_shutdown_tree",
+            None,
+        );
+        #[cfg(unix)]
+        let (decided, earlier) = match call.graceful(|| self.proc.state_and_own_reap()) {
+            crate::child::Graceful::Signal => (None, Some("the SIGTERM")),
+            crate::child::Graceful::Sent { result, earlier } => (Some(result), earlier),
+            crate::child::Graceful::End(e) => return Err(e),
+            #[cfg(target_os = "linux")]
+            crate::child::Graceful::RootThroughPidfd(why) => {
+                return Err(self.shut_down_root_through_pidfd(&call, grace, &why))
             }
-            // The pid may name another process. A macOS fd marker shuts its holders down by the pipe
-            // they hold, and a Linux root its handle cannot answer for is shut down through its pidfd;
-            // any other mechanism has nothing to send. Either way the call ends with one warn: a
-            // sweep would warn again.
-            crate::child::RootNumber::MayNameAnother { why, exact_root } => {
-                #[cfg(target_os = "linux")]
-                if exact_root {
-                    return Err(self.shut_down_root_through_pidfd(grace, &why));
-                }
-                #[cfg(not(target_os = "linux"))]
-                let _ = exact_root;
-                #[cfg(target_os = "macos")]
-                if self.attached.names_tree_by_identity() {
-                    return Err(self.shut_down_holders_only(grace, &why));
-                }
-                return Err(crate::child::number_skipped(
-                    &self.attached,
-                    self.id.pid(),
-                    crate::containment::dispatch::TreeSignal::Term,
-                    "graceful_shutdown_tree",
-                    None,
-                    &why,
-                    None,
-                ));
-            }
+            #[cfg(target_os = "macos")]
+            crate::child::Graceful::HoldersOnly(why) => return Err(self.shut_down_holders_only(&call, grace, &why)),
         };
         let term_signal = || {
             #[cfg(unix)]
@@ -491,60 +443,39 @@ impl Child {
         Ok(status)
     }
 
-    /// `graceful_shutdown_tree` of a root whose handle cannot say whether it was reaped, so its
-    /// number may name another process (`why`), but whose pidfd still names it exactly: the `SIGTERM`
-    /// through the pidfd, the grace, then a kill through the pidfd if the root outlived it. Nothing
-    /// goes out by the number. A front that may not be signalled is refused, as for the tree paths.
+    /// [`Graceful::RootThroughPidfd`](crate::child::Graceful::RootThroughPidfd), `why` its reason.
     #[cfg(target_os = "linux")]
-    fn shut_down_root_through_pidfd(&self, grace: Duration, why: &str) -> Error {
-        use crate::elevation::front::Gate;
-        use crate::signal::{Sent, Sig};
-        if let Gate::Closed(unkillable) = self.terminate_gate() {
-            return unkillable;
-        }
-        let term = self.proc.signal_sent(Sig::Term).map_err(Error::Io);
+    fn shut_down_root_through_pidfd(&self, call: &crate::child::TreeCall<'_>, grace: Duration, why: &str) -> Error {
+        let shutdown = match crate::child::PidfdShutdown::start(self.terminate_gate(), || {
+            self.proc.signal_sent(crate::signal::Sig::Term).map_err(Error::Io)
+        }) {
+            Ok(shutdown) => shutdown,
+            Err(unkillable) => return unkillable,
+        };
         #[cfg(test)]
         fault::run_hook(fault::HookPoint::AfterTerminate);
-        let kill = if matches!(term, Ok(Sent::Delivered)) {
-            match self.proc.exited_within(grace) {
-                Ok(true) => None,
-                outcome => {
-                    if let Err(e) = outcome {
-                        log::debug!(
-                            "graceful_shutdown_tree({}): the root's grace wait failed, so it is killed now: {e}",
-                            self.id.pid()
-                        );
-                    }
-                    Some(match self.kill_gate() {
-                        Gate::Closed(unkillable) => Err(unkillable),
-                        _ => self
-                            .proc
-                            .kill_sent()
-                            .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper())),
-                    })
-                }
-            }
-        } else {
-            None
-        };
-        crate::child::root_shutdown_error(&self.attached, self.id.pid(), why, term, kill)
+        let exited = shutdown.needs_grace().then(|| self.proc.exited_within(grace));
+        shutdown.finish(
+            call,
+            why,
+            exited,
+            || self.kill_gate(),
+            || {
+                self.proc
+                    .kill_sent()
+                    .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper()))
+            },
+        )
     }
 
-    /// `graceful_shutdown_tree` of an fd marker whose root's number may name another process (`why`):
-    /// the `SIGTERM` to its holders, the grace, then a kill of any left, each by the pipe they hold.
-    /// The kill always runs: a marker's drain wait never shows every member exited.
+    /// [`Graceful::HoldersOnly`](crate::child::Graceful::HoldersOnly), `why` its reason.
     #[cfg(target_os = "macos")]
-    fn shut_down_holders_only(&self, grace: Duration, why: &str) -> Error {
-        use crate::containment::dispatch::TreeSignal;
-        let term = crate::child::holders_only(&self.attached, TreeSignal::Term);
+    fn shut_down_holders_only(&self, call: &crate::child::TreeCall<'_>, grace: Duration, why: &str) -> Error {
+        let term = call.holders_term();
         if let Err(e) = self.attached.wait_drained(crate::wait::deadline_from(grace)) {
-            log::debug!(
-                "graceful_shutdown_tree({}): the marker holders' grace wait failed, so they are killed now: {e}",
-                self.id.pid()
-            );
+            call.holders_grace_failed(&e);
         }
-        let kill = crate::child::holders_only(&self.attached, TreeSignal::Kill);
-        crate::child::holders_shutdown_error(&self.attached, self.id.pid(), why, term, kill)
+        call.holders_shutdown_error(why, term)
     }
 }
 
