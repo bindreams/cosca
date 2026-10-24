@@ -479,9 +479,7 @@ fn awaiting_a_child_launchd_holds_after_its_tracer_died_answers_missing_without_
     let pid = child.id();
     let (r, copy) = pipe();
     let _echild = force_peek_once(Ok(Peek::Foreign(Foreign::Gone)));
-    let _parents = crate::identity::kinfo::fault::force_parents(pid as libc::pid_t, || {
-        forked_by_us_held_by(crate::identity::LAUNCHD)
-    });
+    let _parents = crate::identity::kinfo::fault::force_parents(pid, || forked_by_us_held_by(crate::identity::LAUNCHD));
     let before = seams::block_count();
     let _release = release_on_block(copy);
     let report = await_report(&r, pid);
@@ -514,7 +512,7 @@ fn awaiting_a_child_whose_tracer_dies_during_its_exit_is_woken_by_the_tracers_ex
     // More than the wait takes: the child stays `ECHILD` to this process throughout.
     let _echild = force_peeks((0..8).map(|_| Ok(Peek::Foreign(Foreign::Gone))));
     let tracer_exited = Rc::new(Cell::new(false));
-    let _parents = crate::identity::kinfo::fault::force_parents(pid as libc::pid_t, {
+    let _parents = crate::identity::kinfo::fault::force_parents(pid, {
         let exited = Rc::clone(&tracer_exited);
         move || {
             forked_by_us_held_by(if exited.get() {
