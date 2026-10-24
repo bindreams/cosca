@@ -953,8 +953,8 @@ mod pidfd_tests;
 /// The fate of a child a failed tokio spawn abandoned with no handle on it (see
 /// [`warn_for_abandoned`]). Linux's handshake holds a pidfd on it, and answers itself.
 ///
-/// Off Linux nothing is known of such a child, because only a Linux cgroup leaf says more than
-/// `MaybeUnreachable`, and the spawn answers the other two itself, so they are a contract breach
+/// Off Linux nothing is known of such a child, because only Linux (a cgroup leaf, or the
+/// handshake's pidfd) says more than `MaybeUnreachable`, and the spawn answers the other two itself, so they are a contract breach
 /// that claims nothing.
 #[cfg(not(target_os = "linux"))]
 fn abandoned_fate(child: crate::containment::AbandonedChild) -> ChildFate {
@@ -962,7 +962,7 @@ fn abandoned_fate(child: crate::containment::AbandonedChild) -> ChildFate {
 
     match child {
         AbandonedChild::Ended | AbandonedChild::MaybeUnreaped => {
-            debug_assert!(false, "only a Linux cgroup leaf abandons a child as `{child:?}`");
+            debug_assert!(false, "only Linux abandons a child as `{child:?}`");
             ChildFate::Unknown
         }
         AbandonedChild::Front(fate) => {
@@ -977,8 +977,8 @@ fn abandoned_fate(child: crate::containment::AbandonedChild) -> ChildFate {
 /// reaps, or a process nothing can reach.
 ///
 /// tokio can fail a spawn after its fork, dropping the child neither killed nor reaped and
-/// returning no pid. Only a cgroup leaf still reaches such a child, and only once the child has
-/// told it who it is. The error cannot tell a failure before the fork from one after it, hence
+/// returning no pid. Only a cgroup leaf, once the child has told it who it is, or on Linux the
+/// handshake's pidfd still reaches such a child. The error cannot tell a failure before the fork from one after it, hence
 /// "may". Reported at `warn` every time. The fate of an elevation `front` the leaf found is noted
 /// on the error instead, as the spawn's other failures note it.
 fn warn_for_abandoned(child: crate::containment::AbandonedChild, error: &Error) {

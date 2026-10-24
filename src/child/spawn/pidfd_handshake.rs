@@ -816,12 +816,12 @@ fn join_helper(helper: std::thread::ScopedJoinHandle<'_, Outcome>, #[cfg(test)] 
 }
 
 /// Whether the child of a spawn that failed is reaped, or will be, once the handshake has concluded
-/// (see [`Handshake::run_noting`]).
+/// (see [`Handshake::run_noting`]). A teardown that could not look at the child says so itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Reaping {
     /// There is no child, or the handshake tore it down through its pidfd (an elevation front it
-    /// sent nothing is described by the failure), or the spawn returned its handle and the handle
-    /// reaps it.
+    /// sent nothing is described by the failure), or tokio's spawn returned its handle and the
+    /// handle reaps it. Only tokio's spawn reads this.
     Covered,
     /// No pidfd names the child and no handle reaps it: tokio failed after `std`'s `spawn` returned
     /// `Ok`, dropped the `std` child, which reaps nothing, and the child may be a zombie nothing

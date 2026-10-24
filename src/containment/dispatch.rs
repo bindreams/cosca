@@ -135,10 +135,7 @@ impl Prepared {
 /// elsewhere nothing does, and it is `MaybeUnreachable`.
 #[cfg_attr(
     not(all(target_os = "linux", feature = "tokio")),
-    allow(
-        dead_code,
-        reason = "only a Linux leaf under tokio produces more than MaybeUnreachable"
-    )
+    allow(dead_code, reason = "only Linux under tokio produces more than MaybeUnreachable")
 )]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AbandonedChild {

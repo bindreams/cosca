@@ -321,8 +321,8 @@ fn the_unreachable_child_warning_is_every_time() {
     }
 }
 
-/// `AbandonedChild::Ended` means nothing of the child runs and it is reaped or will be — not a
-/// degraded guarantee, so it logs nothing at all.
+/// `AbandonedChild::Ended` means the child is answered for (ended and reaped, or will be, or
+/// described by the spawn's error) — not a degraded guarantee, so it logs nothing at all.
 #[skuld::test]
 fn ended_abandoned_child_logs_nothing() {
     use crate::containment::AbandonedChild;
@@ -1172,8 +1172,7 @@ fn an_abandoned_child_nothing_reaches_may_be_running() {
     );
 }
 
-/// Only a Linux cgroup leaf abandons a child as ended or unreaped; elsewhere either is a contract
-/// breach, asserted in debug. It claims nothing (`Unknown`), and in particular never `Killed`.
+/// Only Linux abandons a child as ended or unreaped; elsewhere either is a contract breach, asserted in debug. It claims nothing (`Unknown`), and in particular never `Killed`.
 ///
 /// Mutants: `Ended` is `Killed`, which says a kill was delivered; either arm is silent.
 #[cfg(not(target_os = "linux"))]
