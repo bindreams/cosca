@@ -70,7 +70,7 @@ impl Member {
 pub fn assert_members_killed(members: Vec<(Member, &str)>) {
     #[cfg(unix)]
     for (mut member, who) in members {
-        assert_dead(&mut member.sock, &format!("{who} after the kill"));
+        assert_dead(&mut member.sock, who);
     }
     #[cfg(windows)]
     {
