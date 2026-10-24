@@ -332,7 +332,7 @@ mod rewrite_tests {
     }
 
     pub(super) fn derived_argv(rw: &PosixRewrite) -> Vec<OsString> {
-        match rw.derived.as_ref().expect("derived").input() {
+        match rw.derived.input() {
             CommandInput::Argv(v) => v.clone(),
             other => panic!("expected Argv, got {other:?}"),
         }
@@ -357,7 +357,7 @@ mod rewrite_tests {
         // Value is set in sudo's own env, never in argv; LD_PRELOAD is stripped everywhere.
         assert!(!a.iter().any(|x| x.to_string_lossy().contains("bar")));
         assert!(!a.iter().any(|x| x.to_string_lossy().contains("LD_PRELOAD")));
-        let derived = rw.derived.as_ref().unwrap();
+        let derived = &rw.derived;
         assert!(derived
             .env_ops()
             .iter()
@@ -456,8 +456,6 @@ mod rewrite_tests {
         let rw = rewrite_with_host(&mut c, &sudo_host()).expect("rewrite");
         assert!(rw
             .derived
-            .as_ref()
-            .unwrap()
             .env_ops()
             .iter()
             .any(|o| matches!(o, EnvOp::Set(k, v) if k == "SUDO_ASKPASS" && v == "/usr/bin/ssh-askpass")));
@@ -471,10 +469,7 @@ mod rewrite_tests {
             .elevation_auth(Auth::Stdin(crate::elevation::Secret::new("pw")));
         let rw = rewrite_with_host(&mut c, &sudo_host()).expect("rewrite");
         // Stdio::from_file(reader) resolves to ResolvedStdio::File(_).
-        assert!(matches!(
-            rw.derived.as_ref().unwrap().fds().get(&Fd::STDIN),
-            Some(ResolvedStdio::File(_))
-        ));
+        assert!(matches!(rw.derived.fds().get(&Fd::STDIN), Some(ResolvedStdio::File(_))));
         assert!(
             rw.password_write.is_some(),
             "the password write is deferred to after spawn"
@@ -540,10 +535,7 @@ mod rewrite_tests {
             .elevation_auth(Auth::NonInteractive);
         let rw = rewrite_with_host(&mut c, &elevated_sudo_host()).expect("rewrite");
         // A derived command IS built (non-destructive), but there is no backend wrapper.
-        let derived = rw
-            .derived
-            .as_ref()
-            .expect("already-elevated still derives a sanitized command");
+        let derived = rw.derived;
         assert!(rw.backend_path.is_none());
         assert!(rw.password_write.is_none());
         let report = rw.report.as_ref().unwrap();
@@ -699,7 +691,7 @@ mod rewrite_tests {
         let mut c = Command::new();
         c.args(["/usr/bin/id", "-u"]).elevation_auth(Auth::Gui);
         let rw = rewrite_with_host(&mut c, &macos_gui_host(false)).expect("macos gui rewrite");
-        let derived = rw.derived.expect("a derived command");
+        let derived = rw.derived;
         let CommandInput::Argv(argv) = derived.input() else {
             panic!("argv expected")
         };
@@ -812,7 +804,7 @@ mod rewrite_tests {
             .elevation_backend(Backend::Sudo)
             .elevation_auth(Auth::NonInteractive);
         let rw = rewrite_with_host(&mut c, &sudo_host()).expect("rewrite");
-        let derived = rw.derived.as_ref().expect("derived");
+        let derived = &rw.derived;
         assert!(
             derived.fd_marker_suppressed(),
             "transfer_process_attrs must suppress the fd marker on the derived sudo command, or \
@@ -838,7 +830,7 @@ mod rewrite_tests {
             .elevation_backend(Backend::Sudo)
             .elevation_auth(Auth::NonInteractive);
         let rw = rewrite_with_host(&mut c, &elevated_sudo_host()).expect("rewrite");
-        let derived = rw.derived.as_ref().expect("derived");
+        let derived = &rw.derived;
         assert!(
             !derived.fd_marker_suppressed(),
             "RunAsIs spawns the original program with no wrapper; suppressing the marker here \
