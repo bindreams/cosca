@@ -9,13 +9,13 @@ use crate::tokio::Command;
 
 /// Test-only accessors, `pub` so integration tests can call them.
 impl SuspendedChild {
-    /// Test-only: whether the child is inside its containment job.
+    /// Whether the child is inside its containment job.
     #[doc(hidden)]
     pub fn test_job_handle_contains_self(&self) -> bool {
         self.child.test_job_handle_contains_self()
     }
 
-    /// Test-only: the containment the child has (and keeps after `resume`).
+    /// The containment the child has (and keeps after `resume`).
     #[doc(hidden)]
     pub fn test_containment(&self) -> crate::Containment {
         self.child.containment()
@@ -31,9 +31,12 @@ pub(super) fn spawn(cmd: &mut Command) -> Result<SuspendedChild, Error> {
 }
 
 /// Resume the child's initial thread, which must have been suspended exactly once.
+///
+/// The backend holds the process handle until `resume`: nothing can poll or reap an unresumed
+/// child, so a missing handle is a broken invariant, not a runtime failure.
 pub(super) fn release(child: &Child) -> std::io::Result<()> {
     let handle = child
         .process_handle()
-        .ok_or_else(|| std::io::Error::other("the frozen child's process handle is gone"))?;
+        .expect("a frozen child's process handle is held until it is resumed");
     resume_initial_threads(handle, SuspendCount::ExactlyOne)
 }
