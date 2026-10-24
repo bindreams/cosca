@@ -231,8 +231,8 @@ async fn tokio_kill_tree_of_a_backend_forgotten_unproven_treats_the_root_as_unkn
 async fn escaped_holder_tree() -> (
     crate::tokio::Child,
     u32,
-    ::tokio::process::ChildStdin,
-    ::tokio::process::ChildStderr,
+    crate::tokio::ChildStdin,
+    crate::tokio::ChildStderr,
 ) {
     use ::tokio::io::AsyncBufReadExt as _;
     let mut cmd = crate::tokio::Command::new();
@@ -258,7 +258,7 @@ async fn escaped_holder_tree() -> (
 /// Blocks until the holder is gone: its stderr reaches EOF. Call only once the test has shown the
 /// holder was signalled, so a missed kill fails an assertion rather than hanging here.
 #[cfg(target_os = "macos")]
-async fn assert_holder_dies(mut stderr: ::tokio::process::ChildStderr) {
+async fn assert_holder_dies(mut stderr: crate::tokio::ChildStderr) {
     use ::tokio::io::AsyncReadExt as _;
     let mut rest = Vec::new();
     stderr
