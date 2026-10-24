@@ -32,17 +32,27 @@ fn public_surface_is_usable() {
 }
 
 /// Containment public-surface smoke: `.contain()` on a supported host must
-/// report a mechanism other than `None`. The test spawns the simplest possible
-/// child (`exit 0`), asserts the achieved containment, and waits for the child to
-/// exit — all via the public API. The full tree-death proof lives in
+/// report a mechanism other than `None`. The test spawns a child that blocks on a piped stdin
+/// it holds, asserts the achieved containment, kills the tree and waits — all via the public API.
+/// The child leaves with status 0 once stdin is released, so a `kill_tree` that sends nothing
+/// fails the final assertion instead of hanging the wait. The full tree-death proof lives in
 /// `spawn_io.rs`; this is just the surface reachability check.
+///
+/// Mutant: `kill_tree` is a no-op.
 #[cfg(any(unix, windows))]
 #[skuld::test]
 fn containment_smoke() {
     let tb = env!("CARGO_BIN_EXE_cosca_testbin");
     let mut cmd = cosca::Command::new();
-    cmd.executable(tb).args(["cosca_testbin", "exit", "0"]).contain();
-    let child = cmd.spawn().expect("spawn contained child");
+    cmd.executable(tb)
+        .args(["cosca_testbin", "read-fd", "0"])
+        .stdin(cosca::Stdio::pipe())
+        .unwrap()
+        .stdout(cosca::Stdio::null())
+        .unwrap()
+        .contain();
+    let mut child = cmd.spawn().expect("spawn contained child");
+    let stdin = child.stdin().expect("piped stdin");
 
     // On every supported host (Unix + Windows) the strongest mechanism must
     // not be None.
@@ -71,7 +81,24 @@ fn containment_smoke() {
         child.containment()
     );
 
-    child.wait().expect("reap the child that exited by itself");
+    child.kill_tree().expect("kill_tree");
+    drop(stdin);
+    let status = child.wait().expect("reap");
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt as _;
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGKILL),
+            "kill_tree must SIGKILL the child: {status:?}"
+        );
+    }
+    #[cfg(windows)]
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "kill_tree must kill the child (exit code 1): {status:?}"
+    );
 }
 
 #[skuld::test]
