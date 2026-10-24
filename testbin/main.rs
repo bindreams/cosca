@@ -55,6 +55,10 @@ mod frozen;
 #[path = "env_block.rs"]
 mod env_block;
 
+#[cfg(windows)]
+#[path = "full_path.rs"]
+mod full_path;
+
 /// `tests/elevation_pkexec_version.rs`'s fake pkexec: this binary, copied to `real/pkexec-impl`.
 /// Appends one line to `../pkexec.log` (next to `real/`): `argv[0]`, the file running (so the
 /// test sees which inode was exec'd), the arguments, and, for a launch, whether its program
@@ -1211,6 +1215,10 @@ fn main() {
         "spawn-with-env-block" => env_block::spawn_with_block(&args[2], &args[3..]),
         #[cfg(windows)]
         "try-env-block" => env_block::try_block(&args[2..]),
+        #[cfg(windows)]
+        "with-env-block" => env_block::with_block(&args[2..]),
+        #[cfg(windows)]
+        "full-path" => full_path::run(&args[2]),
         #[cfg(windows)]
         "spawn-frozen-report" => frozen::spawn_frozen_report(&args[2], &args[3]),
         #[cfg(all(windows, feature = "tokio"))]
