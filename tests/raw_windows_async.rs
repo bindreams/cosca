@@ -198,26 +198,35 @@ async fn async_fd3_only_routing_does_not_load_a_binary_planted_in_the_process_cw
 }
 
 #[cfg(all(windows, feature = "tokio"))]
-/// With the spawning process's std handles all null, as a GUI or service process's are,
-/// an async raw-backend spawn succeeds and its child gets null std handles and no `STARTF_USESTDHANDLES`, as
-/// from std's route, and no handle the spawn did not list. Mutants: a null parent handle passed to
-/// `GetFileType` (fails with 6); `STARTF_USESTDHANDLES` always set; `bInheritHandles` TRUE without a
-/// HANDLE_LIST.
+/// Async: All three parent std handles null (a GUI or service): the child gets null handles, no
+/// `STARTF_USESTDHANDLES`, and no unlisted handle. Mutants: `GetFileType(NULL)` (fails with 6);
+/// `STARTF_USESTDHANDLES` always set; `bInheritHandles` TRUE without a HANDLE_LIST.
 #[skuld::test]
 fn async_raw_spawn_with_null_parent_std_handles_gives_the_child_null() {
-    common::null_std::assert_every_route("tokio", "all", "usestdhandles=false,stdin=null,stdout=null,stderr=null");
+    common::null_std::assert_every_route("tokio", "all");
 }
 
 #[cfg(all(windows, feature = "tokio"))]
-/// With only the spawning process's stdin null, the child gets null stdin and the other two inherited.
-/// Mutant: a null parent handle passed to `GetFileType` (fails with 6).
+/// Async: Only one parent std handle null: the child gets that one null and the others inherited.
+/// Mutants: `STARTF_USESTDHANDLES` set only when stdin / only when stdout / only when stderr is
+/// non-null (each is killed by the case that nulls the other two); `GetFileType(NULL)`.
 #[skuld::test]
-fn async_raw_spawn_with_null_parent_stdin_gives_the_child_null_stdin() {
-    common::null_std::assert_every_route(
-        "tokio",
-        "stdin",
-        "usestdhandles=true,stdin=null,stdout=pipe,stderr=pipe",
-    );
+fn async_raw_spawn_with_one_null_parent_std_handle_gives_the_child_that_one_null() {
+    for nulled in ["stdin", "stdout", "stderr"] {
+        common::null_std::assert_every_route("tokio", nulled);
+    }
+}
+
+#[cfg(all(windows, feature = "tokio"))]
+/// Async: Two parent std handles null, one live: `STARTF_USESTDHANDLES` is still set, the null slots
+/// are gaps, and a merge from a null stdout is null too. Mutants: `STARTF_USESTDHANDLES` set only
+/// when stdin / only when stdout / only when stderr is non-null; the flag derived from the
+/// std slots before the merge resolves (`exe_merge` with `stdin+stdout` nulled).
+#[skuld::test]
+fn async_raw_spawn_with_two_null_parent_std_handles_gives_the_child_two_null() {
+    for nulled in ["stdin+stdout", "stdin+stderr", "stdout+stderr"] {
+        common::null_std::assert_every_route("tokio", nulled);
+    }
 }
 
 #[path = "../src/test_harness.rs"]

@@ -26,18 +26,44 @@ pub fn reports(backend: &str, nulled: &str) -> Vec<String> {
         .collect()
 }
 
-/// Every route spawned and its grandchild got the std handles `expected`, as from std's route.
-/// The grandchildren of std and of cosca's std route inherit the stray handle; none of the raw
-/// backend's does.
-pub fn assert_every_route(backend: &str, nulled: &str, expected: &str) {
-    let mut want = vec![
-        format!("std={expected},stray=true"),
-        format!("argv={expected},stray=true"),
-    ];
-    want.extend(
-        ["exe", "fd3", "exe_merge"]
-            .iter()
-            .map(|route| format!("{route}={expected},stray=false")),
-    );
-    assert_eq!(reports(backend, nulled), want);
+/// Every route spawned, and its grandchild got the std handles that `nulled` implies (`all`, or
+/// std handle names joined by `+`), saw fd 3 as expected, and inherited the stray handle only where
+/// the route listed it. The std and argv routes inherit every inheritable handle (std's behavior),
+/// so their stray state is not checked.
+pub fn assert_every_route(backend: &str, nulled: &str) {
+    let is_null = |name: &str| nulled == "all" || nulled.split('+').any(|n| n == name);
+    let kind = |name: &str, live: &'static str| if is_null(name) { "null" } else { live };
+    let want = |route: &str| {
+        let (stdin, stdout) = (kind("stdin", "char"), kind("stdout", "pipe"));
+        // `exe_merge` merges stderr into stdout.
+        let stderr = if route == "exe_merge" {
+            stdout
+        } else {
+            kind("stderr", "pipe")
+        };
+        let fd3 = match route {
+            "fd3" | "listed" => "open",
+            "merge3" if stdout != "null" => "open",
+            _ => "closed",
+        };
+        let used = [stdin, stdout, stderr].iter().any(|k| *k != "null");
+        format!("{route}=usestdhandles={used},stdin={stdin},stdout={stdout},stderr={stderr},fd3={fd3}")
+    };
+    let got = reports(backend, nulled);
+    let routes = ["std", "argv", "exe", "fd3", "exe_merge", "listed", "merge3"];
+    assert_eq!(got.len(), routes.len(), "{got:?}");
+    for (route, line) in routes.iter().zip(&got) {
+        // Every child end is null but this process's stderr is live: no `STARTF_USESTDHANDLES`, so
+        // the child gets the OS default, which is not null.
+        if *route == "exe_merge" && nulled == "stdin+stdout" {
+            continue;
+        }
+        let (head, stray) = line.rsplit_once(",stray=").unwrap_or((line, "<missing>"));
+        assert_eq!(head, want(route), "route {route} with {nulled} nulled: {line}");
+        match *route {
+            "std" | "argv" => {}
+            "listed" => assert_eq!(stray, "true", "route {route} with {nulled} nulled: {line}"),
+            _ => assert_eq!(stray, "false", "route {route} with {nulled} nulled: {line}"),
+        }
+    }
 }
