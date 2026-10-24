@@ -492,7 +492,11 @@ async fn a_front_whose_exec_fails_is_not_noted() {
         .map(drop)
         .expect_err("an argument over MAX_ARG_STRLEN fails the exec")
         .expect_may_have_started_with();
-    assert_eq!(fate, ChildFate::Gone, "the handshake found the child already collected");
+    assert_eq!(
+        fate,
+        ChildFate::Collected,
+        "the handshake found the child already collected"
+    );
     let crate::error::Error::Io(io) = &err else {
         panic!("an exec failure is an Io error: {err:?}");
     };

@@ -256,9 +256,10 @@ pub enum Error {
 ///
 /// It is about the child cosca spawned. On a wrapper-elevated spawn that child is the backend
 /// (`sudo`, `doas`, `pkexec`, `osascript`), and the elevated program is its own child, which cosca
-/// never signals: `Reaped`, `Killed` and `Gone` say the backend is not running, not that the program
-/// is not. A front that had exited by itself is `Reaped` while the program it launched may still
-/// run. Descendants of a contained child are not covered either; the containment's own teardown is.
+/// never signals: `Reaped`, `Killed`, `Gone` and `Collected` say the backend is not running, not
+/// that the program is not. A front that had exited by itself is `Reaped` while the program it
+/// launched may still run. Descendants of a contained child are not covered either; the
+/// containment's own teardown is.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChildFate {
@@ -287,8 +288,14 @@ pub enum ChildFate {
     /// Someone else reaped the child, or its zombie is held by another process (on macOS, launchd
     /// holds a tracer-orphaned child's zombie), so cosca could not collect it, and cosca delivered
     /// no kill: a child that was gone already, or not ours, when cosca came to it. (One cosca killed
-    /// and found collected is [`Killed`](ChildFate::Killed).) The child is not running; on a wrapper-elevated spawn, the elevated program may be (see the type's doc).
+    /// and found collected is [`Killed`](ChildFate::Killed).) The child is not running; on a
+    /// wrapper-elevated spawn, the elevated program may be (see the type's doc).
     Gone,
+    /// A spawn that failed found its child already collected at the first look after the failure,
+    /// and cosca delivered no kill. `std` collects the child of a spawn it fails, and cosca cannot
+    /// tell that from a collection by someone else, so this names no collector (unlike
+    /// [`Gone`](ChildFate::Gone)).
+    Collected,
     /// cosca cannot say what became of the child.
     Unknown,
 }
@@ -301,6 +308,7 @@ impl std::fmt::Display for ChildFate {
             ChildFate::Running { id: Some(id) } => write!(f, "its child, pid {}, may still be running", id.pid()),
             ChildFate::Running { id: None } => f.write_str("its child may still be running"),
             ChildFate::Gone => f.write_str("its child had been reaped by someone else"),
+            ChildFate::Collected => f.write_str("its child had already been collected by the time cosca first looked"),
             ChildFate::Unknown => f.write_str("what became of its child is unknown"),
         }
     }
@@ -310,7 +318,7 @@ impl std::fmt::Display for ChildFate {
 /// behind it may still run, whenever the fate says the backend is not running.
 fn elevated_note(fate: &ChildFate, wrapper_elevated: bool) -> &'static str {
     match fate {
-        ChildFate::Reaped | ChildFate::Killed | ChildFate::Gone if wrapper_elevated => {
+        ChildFate::Reaped | ChildFate::Killed | ChildFate::Gone | ChildFate::Collected if wrapper_elevated => {
             " (an elevated program behind it may still run)"
         }
         _ => "",

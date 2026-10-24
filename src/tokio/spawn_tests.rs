@@ -223,15 +223,14 @@ fn drive_until_reaped(
     }
 }
 
-/// A tokio spawn that fails with no cgroup leaf to kill through warns that a forked child may have
-/// been left running out of reach, unless its spawn collected it: tokio can drop a child it forked
-/// and return no pid. Here the failure comes under a tree walk, which holds no leaf, and the
-/// handshake's pidfd reaps the child: the answer says so.
+/// A tokio spawn that fails after its fork, with no cgroup leaf, warns of nothing: tokio dropped
+/// the child, but the handshake holds its pidfd and has killed and reaped it, so nothing was left
+/// running out of reach. Here the failure comes under a tree walk, which holds no leaf.
 ///
-/// Mutant: the handshake leaves the dropped child, or the warning is dropped.
+/// Mutant: a spawn with no leaf warns that its child "was left running and nothing can reach it".
 #[cfg(target_os = "linux")]
 #[skuld::test]
-async fn a_post_fork_tokio_failure_without_a_leaf_says_the_child_may_be_unreachable() {
+async fn a_post_fork_tokio_failure_without_a_leaf_warns_of_no_abandoned_child() {
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let mut cmd = blocker();
@@ -243,15 +242,143 @@ async fn a_post_fork_tokio_failure_without_a_leaf_says_the_child_may_be_unreacha
     };
     assert_eq!(fate, ChildFate::Reaped, "killed and reaped through its pidfd");
     let pid = fault::take_forgotten_pid().expect("the seam dropped a child");
-    assert!(
-        crate::log_capture::records_since(mark, "nothing can reach it")
-            .iter()
-            .zip(crate::log_capture::levels_since(mark, "nothing can reach it"))
-            .any(|(_, level)| level == log::Level::Warn),
-        "the failure must say the child may be left running"
+    assert_eq!(
+        crate::log_capture::levels_since(mark, "tokio spawn failed"),
+        Vec::<log::Level>::new(),
+        "the child {pid} was reaped, so nothing is warned"
     );
     let pidfd = fault::take_forgotten_pidfd().expect("the seam took a pidfd for the child");
     assert!(reaped_through(&pidfd), "the child {pid} must be reaped");
+}
+
+/// A tokio spawn that fails after its fork, with no cgroup leaf, of a child that died before it
+/// reported: std read that as success, tokio dropped the child unreaped, and no pidfd names it. The
+/// spawn warns that the child may be left unreaped.
+///
+/// Mutant: a spawn with no leaf answers that its child ended, and warns of nothing.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn a_post_fork_tokio_failure_of_an_unreported_child_without_a_leaf_warns_it_may_be_unreaped() {
+    use crate::child::spawn::pidfd_handshake::fault::{arm_child_fault, ChildFault};
+    use std::os::fd::AsFd;
+
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let mut cmd = blocker();
+    cmd.contain_with(crate::ContainMode::TreeWalk);
+    let mark = crate::log_capture::mark();
+    let killed = arm_child_fault(ChildFault::Sigkill);
+    {
+        let _failing = fault::fail_tokio_spawns_after_fork();
+        cmd.spawn().expect_err("the forced failure must fail the spawn");
+    }
+    drop(killed);
+    let pid = fault::take_forgotten_pid().expect("the seam dropped a child");
+    let pidfd = fault::take_forgotten_pidfd().expect("the seam took a pidfd for the child");
+    // The child is a zombie nothing reaps: this test's own reap, after the assertions.
+    let warned = crate::log_capture::records_since(mark, "left unreaped");
+    let levels = crate::log_capture::levels_since(mark, "left unreaped");
+    let status = loop {
+        match rustix::process::waitid(
+            rustix::process::WaitId::PidFd(pidfd.as_fd()),
+            rustix::process::WaitIdOptions::EXITED,
+        ) {
+            Err(rustix::io::Errno::INTR) => continue,
+            other => break other.expect("reap the child").expect("it exited"),
+        }
+    };
+    assert_eq!(
+        status.terminating_signal(),
+        Some(libc::SIGKILL),
+        "child {pid} killed itself"
+    );
+    assert_eq!(
+        levels,
+        [log::Level::Warn],
+        "child {pid}: the spawn must warn once that its child may be left unreaped: {warned:?}"
+    );
+}
+
+/// A tokio spawn with no cgroup leaf whose child could not open its own pidfd: the child aborts, so
+/// `std`'s spawn fails and collects it, but no pidfd names it and the handshake cannot say so. The
+/// spawn warns, once, that the child may be left unreaped, and the child is in fact collected.
+///
+/// Mutant: a failed spawn whose helper reported `Failed(_, None)` answers `Covered`, and warns of
+/// nothing.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn a_post_fork_tokio_failure_of_a_child_that_could_not_open_its_pidfd_warns_it_may_be_unreaped() {
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let mut cmd = blocker();
+    cmd.contain_with(crate::ContainMode::TreeWalk);
+    let mark = crate::log_capture::mark();
+    let forced = crate::wait::backend::fault::force_pidfd_open_script([None, Some(rustix::io::Errno::NFILE)]);
+    let error = cmd
+        .spawn()
+        .expect_err("a child that cannot open its pidfd fails the spawn");
+    drop(forced);
+    crate::child::spawn::failure::expect_not_started(error);
+    let warned = crate::log_capture::records_since_on_current_thread(mark, "tokio spawn failed");
+    assert_eq!(
+        warned.iter().map(|(level, _)| *level).collect::<Vec<_>>(),
+        [log::Level::Warn],
+        "one warning that the child may be left unreaped: {warned:?}"
+    );
+    assert!(warned[0].1.contains("left unreaped"), "{warned:?}");
+    crate::child::spawn::pidfd_handshake::pidfd_handshake_tests::assert_no_child_of_this_thread(
+        "`std` collected the child whose spawn failed",
+    );
+}
+
+/// A tokio spawn with no cgroup leaf that `std` answered with a child, and whose exit the handshake
+/// could not watch: the handle tokio returned reaps the child, so nothing is warned, and the child
+/// is reaped.
+///
+/// Mutant: a returned handle with an unwatched child answers `Uncovered`, and warns the child may
+/// be left unreaped.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn a_post_fork_tokio_failure_of_an_unwatched_child_is_left_to_tokios_handle() {
+    use crate::child::spawn::pidfd_handshake::fault::{
+        after_spawn_returns_do, arm_child_fault, fail_watch, ChildFault, WatchFault,
+    };
+
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let mut cmd = blocker();
+    cmd.contain_with(crate::ContainMode::TreeWalk);
+    let mark = crate::log_capture::mark();
+    let named = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let name = after_spawn_returns_do({
+        let named = std::rc::Rc::clone(&named);
+        move |pid| {
+            let pid = rustix::process::Pid::from_raw(pid.expect("std returned a child") as i32).expect("a pid");
+            // A zombie is still this process's child, so the pidfd names it.
+            *named.borrow_mut() =
+                Some(rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()).expect("pidfd_open"));
+        }
+    });
+    let killed = arm_child_fault(ChildFault::Sigkill);
+    let watch = fail_watch(WatchFault::Open(rustix::io::Errno::MFILE));
+    let error = cmd
+        .spawn()
+        .expect_err("a child whose exit cannot be watched fails the spawn");
+    drop(watch);
+    drop(killed);
+    drop(name);
+    let error = crate::child::spawn::failure::expect_not_started(error);
+    assert!(error.to_string().contains("its exit could not be watched"), "{error}");
+    let pidfd = named.borrow_mut().take().expect("the hook opened a pidfd on the child");
+    // tokio's driver reaps the dropped handle's child; turn it until it has, and never before.
+    while !reaped_through(&pidfd) {
+        ::tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        crate::log_capture::records_since_on_current_thread(mark, "tokio spawn failed"),
+        Vec::<(log::Level, String)>::new(),
+        "tokio's handle reaps the child, so nothing is warned"
+    );
 }
 
 /// The abandoned-child warning is at `warn` on every call, including a repeat, through the real
@@ -276,20 +403,29 @@ fn the_unreachable_child_warning_is_every_time() {
     }
 }
 
-/// `AbandonedChild::Ended` means nothing of the child runs and it is reaped or will be — not a
-/// degraded guarantee, so it logs nothing at all.
+/// `AbandonedChild::Ended` (nothing of the child runs, and it is reaped or will be) and
+/// `AbandonedChild::Described` (a front left running, which the spawn's error notes) are not a
+/// degraded guarantee, so each logs nothing at all.
+///
+/// Mutant: either arm of `warn_for_abandoned` warns.
 #[skuld::test]
-fn ended_abandoned_child_logs_nothing() {
+fn answered_for_abandoned_children_log_nothing() {
     use crate::containment::AbandonedChild;
 
     crate::log_capture::install();
     let error = Error::Io(std::io::Error::other("cosca-abandoned-ended-probe-3a17"));
     let marker = "cosca-abandoned-ended-probe-3a17";
 
-    let mark = crate::log_capture::mark();
-    super::warn_for_abandoned(AbandonedChild::Ended, &error);
+    for child in [AbandonedChild::Ended, AbandonedChild::Described] {
+        let mark = crate::log_capture::mark();
+        super::warn_for_abandoned(child, &error);
 
-    assert_eq!(crate::log_capture::levels_since(mark, marker), Vec::<log::Level>::new());
+        assert_eq!(
+            crate::log_capture::levels_since(mark, marker),
+            Vec::<log::Level>::new(),
+            "{child:?}"
+        );
+    }
 }
 
 /// Whether a record since `mark` says `marker` of the seam's failed spawn of `pid` at `warn` —
@@ -1017,10 +1153,10 @@ async fn a_failed_exec_may_have_started_the_program() {
     let mut cmd = Command::new();
     cmd.args(["cosca-no-such-program-142"]);
     let (err, fate) = expect_may_have_started_with(cmd.spawn().expect_err("a missing program fails the spawn"));
-    // Linux's handshake finds std had collected the child whose exec failed. Elsewhere nothing holds
-    // it, so it may be running.
+    // Linux's handshake finds the child already collected. Elsewhere nothing holds it, so it may be
+    // running.
     let expected = if cfg!(target_os = "linux") {
-        ChildFate::Gone
+        ChildFate::Collected
     } else {
         ChildFate::Running { id: None }
     };
@@ -1127,21 +1263,57 @@ fn an_abandoned_child_nothing_reaches_may_be_running() {
     );
 }
 
-/// Only a Linux cgroup leaf abandons a child as ended or unreaped; elsewhere either is a contract
+/// Only Linux abandons a child as ended, described or unreaped; elsewhere each is a contract
 /// breach, asserted in debug. It claims nothing (`Unknown`), and in particular never `Killed`.
 ///
-/// Mutants: `Ended` is `Killed`, which says a kill was delivered; either arm is silent.
+/// Mutants: `Ended` is `Killed`, which says a kill was delivered; any arm is silent.
 #[cfg(not(target_os = "linux"))]
 #[skuld::test]
 fn an_abandoned_child_only_a_linux_leaf_can_report_asserts() {
     use crate::containment::AbandonedChild;
-    for abandoned in [AbandonedChild::Ended, AbandonedChild::MaybeUnreaped] {
+    for abandoned in [
+        AbandonedChild::Ended,
+        AbandonedChild::Described,
+        AbandonedChild::MaybeUnreaped,
+    ] {
         let outcome = std::panic::catch_unwind(|| super::abandoned_fate(abandoned));
         if cfg!(debug_assertions) {
             assert!(outcome.is_err(), "{abandoned:?} must assert");
         } else {
             assert_eq!(outcome.expect("no assertion in release"), ChildFate::Unknown);
         }
+    }
+}
+
+/// A leaf answers a front spawned for it, and never as `Described`, which only the handshake's
+/// front arm (no leaf) produces: that is a contract breach, asserted in debug. In release the leaf's
+/// answer stands as `Unknown`, as for the other answers a front never gets, and the error is kept.
+///
+/// Mutant: the `Described` arm answers silently in debug, or drops the error in release.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_front_left_to_a_leaf_is_never_described() {
+    use crate::containment::AbandonedChild;
+
+    let answered = std::panic::catch_unwind(|| {
+        super::abandoned_after_handshake(
+            AbandonedChild::Described,
+            crate::child::spawn::SpawnFailure::started(
+                Error::Io(std::io::Error::other("tokio failed")),
+                ChildFate::Unknown,
+            ),
+            None,
+            true,
+        )
+    });
+    if cfg!(debug_assertions) {
+        assert!(answered.is_err(), "Described must assert");
+    } else {
+        let (error, fate) = answered
+            .expect("no assertion in release")
+            .expect_may_have_started_with();
+        assert_eq!(fate, ChildFate::Unknown);
+        assert!(error.to_string().contains("tokio failed"), "{error}");
     }
 }
 

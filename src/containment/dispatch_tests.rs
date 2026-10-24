@@ -856,3 +856,35 @@ mod frozen_attach {
         }
     }
 }
+
+// ===== an abandoned child with no leaf (Linux) =====
+
+/// With no leaf, the handshake's `Reaping` decides what became of an abandoned child; each answer
+/// is its own, and a front it left running is not one that ended.
+///
+/// Mutant: `Described` maps to `Ended` (or `Uncovered` to `Ended`, or `Covered` to
+/// `MaybeUnreaped`).
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn the_handshakes_reaping_decides_an_abandoned_child_with_no_leaf() {
+    use crate::child::spawn::pidfd_handshake::Reaping;
+    use crate::containment::AbandonedChild;
+
+    let answers = [
+        (Reaping::Covered, AbandonedChild::Ended),
+        (Reaping::Described, AbandonedChild::Described),
+        (Reaping::Uncovered, AbandonedChild::MaybeUnreaped),
+    ];
+    for (reaping, want) in answers {
+        let mut prepared = super::Prepared {
+            mode: None,
+            is_root: false,
+            cgroup_leaf: None,
+        };
+        assert_eq!(
+            prepared.abandon_before_verdict(true, None, reaping),
+            want,
+            "{reaping:?}"
+        );
+    }
+}

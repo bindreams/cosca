@@ -71,10 +71,12 @@ impl Prepared {
     }
 
     /// End the placement exchange of a spawn that failed with no handle left on its child — tokio
-    /// can drop one it forked — and say what became of that child. Without a leaf nothing can
-    /// tell, so [`AbandonedChild::MaybeUnreachable`]. A child that is an elevation `front` is sent
-    /// no signal of its own (see [`CgroupLeaf::abandon_before_verdict`]); `handshake` is the
-    /// pidfd its handshake left for a child the leaf cannot name.
+    /// can drop one it forked — and say what became of that child. Without a leaf, Linux's
+    /// `reaping` decides ([`AbandonedChild::Ended`], [`AbandonedChild::Described`] or
+    /// [`AbandonedChild::MaybeUnreaped`]); elsewhere nothing can tell, so
+    /// [`AbandonedChild::MaybeUnreachable`]. A child that is an elevation `front` is sent no signal
+    /// of its own (see [`CgroupLeaf::abandon_before_verdict`]); `handshake` is the pidfd its
+    /// handshake left for a child the leaf cannot name.
     ///
     /// [`CgroupLeaf::abandon_before_verdict`]: crate::containment::cgroup::CgroupLeaf::abandon_before_verdict
     #[cfg_attr(
@@ -88,6 +90,7 @@ impl Prepared {
         &mut self,
         front: bool,
         #[cfg(target_os = "linux")] handshake: Option<std::os::fd::OwnedFd>,
+        #[cfg(target_os = "linux")] reaping: crate::child::spawn::pidfd_handshake::Reaping,
     ) -> AbandonedChild {
         #[cfg(target_os = "linux")]
         if let Some(leaf) = self.cgroup_leaf.as_mut() {
@@ -101,7 +104,19 @@ impl Prepared {
         }
         #[cfg(not(target_os = "linux"))]
         let _ = front;
-        AbandonedChild::MaybeUnreachable
+        #[cfg(target_os = "linux")]
+        {
+            use crate::child::spawn::pidfd_handshake::Reaping;
+            match reaping {
+                Reaping::Covered => AbandonedChild::Ended,
+                Reaping::Described => AbandonedChild::Described,
+                Reaping::Uncovered => AbandonedChild::MaybeUnreaped,
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            AbandonedChild::MaybeUnreachable
+        }
     }
 
     /// Watch the elevation front `pid` this spawn forked: its cgroup leaf, if it has one, records
@@ -117,13 +132,11 @@ impl Prepared {
 }
 
 /// What became of the child of a spawn that failed with no handle left on it (see
-/// [`Prepared::abandon_before_verdict`]). Only a Linux leaf tells more than `MaybeUnreachable`.
+/// [`Prepared::abandon_before_verdict`]). On Linux a leaf or the handshake answers for the child;
+/// elsewhere nothing does, and it is `MaybeUnreachable`.
 #[cfg_attr(
     not(all(target_os = "linux", feature = "tokio")),
-    allow(
-        dead_code,
-        reason = "only a Linux leaf under tokio produces more than MaybeUnreachable"
-    )
+    allow(dead_code, reason = "only Linux under tokio produces more than MaybeUnreachable")
 )]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AbandonedChild {
@@ -133,6 +146,9 @@ pub(crate) enum AbandonedChild {
     MaybeUnreaped,
     /// If it was forked, it may be running where nothing can reach it.
     MaybeUnreachable,
+    /// It is an elevation front that may be running (left alive, or its wait failed for a reason
+    /// other than `ECHILD`), and the failure the spawn returns says so.
+    Described,
     /// It is an elevation front, which was sent no signal of its own, and this is what became of
     /// it.
     Front(crate::child::spawn::FrontFate),

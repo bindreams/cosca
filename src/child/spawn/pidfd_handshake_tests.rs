@@ -23,6 +23,10 @@ use crate::stdio::Stdio;
 use crate::test_child::fixture_path;
 use crate::test_child::namespaces as ns;
 use crate::test_groups::{namespaces, Group};
+use crate::wait::exit_only::seams::{
+    assert_peeks_exhausted, force_peeks, force_reap_once, take_forced_reap, ForcedReap,
+};
+use crate::wait::exit_only::{Foreign, Peek, Reaped};
 
 /// A command that writes `ran` to a pipe and exits, and the read end of that pipe.
 fn marker_command() -> (Command, std::io::PipeReader) {
@@ -1311,8 +1315,298 @@ fn a_collected_front_is_no_front() {
     .err()
     .expect("the spawn fails")
     .expect_may_have_started_with();
-    assert_eq!(fate, ChildFate::Gone, "std had collected it");
+    assert_eq!(fate, ChildFate::Collected, "std had collected it");
     assert!(!err.to_string().contains("what sudo left"), "{err}");
+}
+
+/// A front tokio dropped after it ran the program is left running, and the failure it returns says
+/// so: it is `Described`, not a child that ended.
+///
+/// Mutant: the front arm leaves the reaping `Covered`, which `Prepared::abandon_before_verdict`
+/// answers `Ended`.
+#[skuld::test]
+fn a_dropped_front_is_described_not_covered() {
+    use super::Reaping;
+
+    let (mut cat, pidfd) = cat_with_pidfd();
+    let (failure, reaping) = super::conclude_noting(
+        Err::<NoChild, _>(std::io::Error::other("tokio failed")),
+        Outcome::Opened(pidfd),
+        sudo_front(),
+    );
+    failure.err().expect("the spawn fails");
+    assert_eq!(reaping, Reaping::Described);
+    drop(cat.stdin.take());
+    cat.wait().expect("collect the front");
+}
+
+/// A child that ended, whether torn down through its pidfd or already collected, is `Covered`,
+/// front or not: only a front left running is `Described`.
+///
+/// Mutant: the arm for a front that std collected, or the arm for a child that is not a front,
+/// answers `Described`.
+#[skuld::test]
+fn a_child_that_ended_is_covered_not_described() {
+    use super::Reaping;
+
+    // Torn down through its pidfd.
+    let (cat, pidfd) = cat_with_pidfd();
+    let (failure, reaping) = super::conclude_noting(
+        Err::<NoChild, _>(std::io::Error::other("tokio failed")),
+        Outcome::Opened(pidfd),
+        super::LeftFront::NotAFront,
+    );
+    failure.err().expect("the spawn fails");
+    assert_eq!(reaping, Reaping::Covered, "not a front");
+    drop(cat);
+
+    // A front that std had collected is no front.
+    let (mut cat, pidfd) = cat_with_pidfd();
+    drop(cat.stdin.take());
+    cat.wait().expect("collect the child");
+    let (failure, reaping) = super::conclude_noting(
+        Err::<NoChild, _>(std::io::Error::other("exec failed")),
+        Outcome::Opened(pidfd),
+        sudo_front(),
+    );
+    failure.err().expect("the spawn fails");
+    assert_eq!(reaping, Reaping::Covered, "a collected front");
+}
+
+/// A front the teardown reaped (it exited before the teardown looked) ended: it is `Covered`, not
+/// `Described`, though the failure still notes what became of it.
+///
+/// Mutant: the front arm sets `Described` whatever the teardown found.
+#[skuld::test]
+fn a_front_the_teardown_reaped_is_covered() {
+    let (mut cat, pidfd) = cat_with_pidfd();
+    drop(cat.stdin.take());
+    crate::test_child::wait_until_zombie(cat.id());
+    let (failure, reaping) = super::conclude_noting(
+        Err::<NoChild, _>(std::io::Error::other("tokio failed")),
+        Outcome::Opened(pidfd),
+        sudo_front(),
+    );
+    let (err, _) = failure.err().expect("the spawn fails").expect_may_have_started_with();
+    assert_eq!(reaping, super::Reaping::Covered);
+    assert!(err.to_string().contains("and it was reaped"), "{err}");
+    assert_eq!(
+        crate::child::front_kill_tests::reap(cat.id()),
+        None,
+        "the teardown reaped it"
+    );
+}
+
+/// A front a foreign reaper collected after the first look saw it uncollected ended too: `Covered`,
+/// and the failure's note says it could not be waited on.
+///
+/// Mutant: the front arm sets `Described` whatever the teardown found.
+#[skuld::test]
+fn a_front_found_reaped_by_someone_else_is_covered() {
+    let (mut cat, pidfd) = cat_with_pidfd();
+    drop(cat.stdin.take());
+    cat.wait().expect("the foreign reaper collects the child");
+    let forced = force_peeks([Ok(Peek::Running)]);
+    let (failure, reaping) = super::conclude_noting(
+        Err::<NoChild, _>(std::io::Error::other("tokio failed")),
+        Outcome::Opened(pidfd),
+        sudo_front(),
+    );
+    assert_peeks_exhausted();
+    drop(forced);
+    let (err, _) = failure.err().expect("the spawn fails").expect_may_have_started_with();
+    assert_eq!(reaping, super::Reaping::Covered);
+    assert!(err.to_string().contains("could not be waited on"), "{err}");
+}
+
+/// A front whose wait failed for a reason other than `ECHILD` is not shown gone: it may be running,
+/// so it is `Described`, and the failure's note says it could not be waited on.
+///
+/// Mutant: the front arm answers `Covered` for every `Unaccounted` front, not only for one whose
+/// wait answered `ECHILD`.
+#[skuld::test]
+fn a_front_whose_wait_failed_otherwise_is_described() {
+    let (mut cat, pidfd) = cat_with_pidfd();
+    drop(cat.stdin.take());
+    crate::test_child::wait_until_zombie(cat.id());
+    let forced = force_reap_once(ForcedReap::Errno(libc::EIO));
+    let (failure, reaping) = super::conclude_noting(
+        Err::<NoChild, _>(std::io::Error::other("tokio failed")),
+        Outcome::Opened(pidfd),
+        sudo_front(),
+    );
+    assert!(
+        take_forced_reap().is_none(),
+        "the teardown's wait consumed the forced failure"
+    );
+    drop(forced);
+    let (err, fate) = failure.err().expect("the spawn fails").expect_may_have_started_with();
+    assert_eq!(reaping, super::Reaping::Described);
+    assert_eq!(fate, ChildFate::Unknown, "the failed wait showed nothing");
+    assert!(err.to_string().contains("could not be waited on"), "{err}");
+    cat.wait().expect("collect the front");
+}
+
+/// `conclude` on a failed tokio-style spawn whose child is a live `cat` (`front` says whether it is
+/// a front), with the peeks `looks` answering in order (conclude's own first, then the teardown's),
+/// as a foreign reaper between them would. The `cat` is returned, for the caller to clean up.
+fn conclude_a_live_cat(
+    front: super::LeftFront,
+    looks: impl IntoIterator<Item = std::io::Result<Peek>>,
+) -> (std::process::Child, ChildFate) {
+    let (cat, pidfd) = cat_with_pidfd();
+    let forced = force_peeks(looks);
+    let (_, fate) = super::conclude(
+        Err::<NoChild, _>(std::io::Error::other("tokio failed")),
+        Outcome::Opened(pidfd),
+        front,
+    )
+    .err()
+    .expect("the spawn fails")
+    .expect_may_have_started_with();
+    assert_peeks_exhausted();
+    drop(forced);
+    (cat, fate)
+}
+
+/// [`conclude_a_live_cat`] for a child that is no front, whose teardown the looks leave alive.
+fn conclude_a_live_cat_with_looks(looks: impl IntoIterator<Item = std::io::Result<Peek>>) -> ChildFate {
+    let (mut cat, fate) = conclude_a_live_cat(super::LeftFront::NotAFront, looks);
+    cat.kill().expect("kill the cat");
+    cat.wait().expect("collect the cat");
+    fate
+}
+
+/// A foreign reap shown after a look saw the child uncollected is "reaped by someone else", not
+/// "already collected": nobody in cosca, std or tokio reaps it after that look.
+///
+/// Mutant: every `Gone` of the teardown becomes `Collected`.
+#[skuld::test]
+fn a_foreign_reap_after_an_uncollected_look_is_still_gone() {
+    for first in [Peek::Running, Peek::Exit(Reaped::Unreadable { si_code: 0 })] {
+        let fate = conclude_a_live_cat_with_looks([Ok(first), Ok(Peek::Foreign(Foreign::Gone))]);
+        assert_eq!(fate, ChildFate::Gone, "first look {first:?}");
+        assert!(fate.to_string().contains("reaped by someone else"), "{fate}");
+    }
+}
+
+/// The same for an elevation front: one seen uncollected is sent nothing, and a foreign reap of it
+/// that the front arm then finds is still "reaped by someone else".
+///
+/// Mutant: the front arm maps `Gone` to `Collected`.
+#[skuld::test]
+fn a_foreign_reap_of_a_front_after_an_uncollected_look_is_still_gone() {
+    let (mut cat, pidfd) = cat_with_pidfd();
+    drop(cat.stdin.take());
+    cat.wait().expect("the foreign reaper collects the child");
+    let forced = force_peeks([Ok(Peek::Running)]);
+    let (_, fate) = super::conclude(
+        Err::<NoChild, _>(std::io::Error::other("tokio failed")),
+        Outcome::Opened(pidfd),
+        sudo_front(),
+    )
+    .err()
+    .expect("the spawn fails")
+    .expect_may_have_started_with();
+    assert_peeks_exhausted();
+    drop(forced);
+    assert_eq!(fate, ChildFate::Gone);
+}
+
+/// A first look that fails proves nothing about when the child was collected, so a `Gone` that
+/// follows it blames nobody and claims no time: it is `Unknown`.
+///
+/// Mutant: a `Gone` after a failed first look is left `Gone` (or mapped to `Collected`).
+#[skuld::test]
+fn a_failed_first_look_leaves_a_later_gone_unknown() {
+    let fate = conclude_a_live_cat_with_looks([
+        Err(std::io::Error::other("forced peek failure")),
+        Ok(Peek::Foreign(Foreign::Gone)),
+    ]);
+    assert_eq!(fate, ChildFate::Unknown);
+}
+
+/// A teardown that finds the child live, after a first look that failed, kills and reaps it: its
+/// answer is `Reaped`, not the `Unknown` a failed look gives a `Gone`.
+///
+/// Mutant: a failed first look makes every later fate `Unknown`.
+#[skuld::test]
+fn a_failed_first_look_followed_by_a_real_teardown_is_reaped() {
+    let (cat, fate) = conclude_a_live_cat(
+        super::LeftFront::NotAFront,
+        [Err(std::io::Error::other("forced peek failure"))],
+    );
+    assert_eq!(fate, ChildFate::Reaped);
+    // Reaped through its pidfd.
+    drop(cat);
+}
+
+/// The same for a first look that saw the child uncollected: a later `Reaped` is the teardown's
+/// own.
+///
+/// Mutant: the pass-through arm of `FirstLook::fate` maps a fate other than `Gone` to `Unknown` or
+/// `Collected`.
+#[skuld::test]
+fn an_uncollected_first_look_leaves_a_real_teardown_reaped() {
+    let (cat, fate) = conclude_a_live_cat(super::LeftFront::NotAFront, [Ok(Peek::Running)]);
+    assert_eq!(fate, ChildFate::Reaped);
+    drop(cat);
+}
+
+/// A first look that found the child collected makes only a `Gone` `Collected`: a teardown that
+/// then finds the child live and reaps it answers `Reaped`.
+///
+/// Mutant: a collected first look makes every later fate `Collected`.
+#[skuld::test]
+fn a_collected_first_look_followed_by_a_live_child_is_not_collected() {
+    let (cat, fate) = conclude_a_live_cat(super::LeftFront::NotAFront, [Ok(Peek::Foreign(Foreign::Gone))]);
+    assert_eq!(fate, ChildFate::Reaped);
+    drop(cat);
+}
+
+/// An elevation front whose first look failed is taken to be there, and sent nothing; a foreign
+/// reap the front arm then finds blames nobody and names no time: `Unknown`.
+///
+/// Mutant: the front arm leaves such a `Gone` as `Gone` (or maps it to `Collected`).
+#[skuld::test]
+fn a_failed_first_look_of_a_front_leaves_a_later_gone_unknown() {
+    let (mut cat, pidfd) = cat_with_pidfd();
+    drop(cat.stdin.take());
+    cat.wait().expect("the foreign reaper collects the child");
+    let forced = force_peeks([Err(std::io::Error::other("forced peek failure"))]);
+    let (_, fate) = super::conclude(
+        Err::<NoChild, _>(std::io::Error::other("tokio failed")),
+        Outcome::Opened(pidfd),
+        sudo_front(),
+    )
+    .err()
+    .expect("the spawn fails")
+    .expect_may_have_started_with();
+    assert_peeks_exhausted();
+    drop(forced);
+    assert_eq!(fate, ChildFate::Unknown);
+}
+
+/// A child the first look finds collected is `Collected`, as a front or not.
+///
+/// Mutant: `Collected` is never answered (the pre-change `Gone`).
+#[skuld::test]
+fn a_child_collected_at_the_first_look_is_collected() {
+    for front in [super::LeftFront::NotAFront, sudo_front()] {
+        let (mut cat, pidfd) = cat_with_pidfd();
+        drop(cat.stdin.take());
+        cat.wait().expect("collect the child");
+        let (_, fate) = super::conclude(
+            Err::<NoChild, _>(std::io::Error::other("exec failed")),
+            Outcome::Opened(pidfd),
+            front,
+        )
+        .err()
+        .expect("the spawn fails")
+        .expect_may_have_started_with();
+        assert_eq!(fate, ChildFate::Collected);
+        assert!(fate.to_string().contains("already been collected"), "{fate}");
+    }
 }
 
 /// A child that died before it was told to go never ran the program: it is reaped, with no note.
@@ -1448,12 +1742,6 @@ fn conclude_answers_whether_the_program_could_have_started() {
         super::LeftFront::NotAFront,
     ))
     .expect_not_started();
-    answered(super::conclude(
-        Err::<NoChild, _>(io("x")),
-        Outcome::Unwatched("cause".into()),
-        super::LeftFront::NotAFront,
-    ))
-    .expect_not_started();
     let (cat, pidfd) = cat_with_pidfd();
     super::conclude(Ok(cat), Outcome::Gone(pidfd), super::LeftFront::NotAFront)
         .err()
@@ -1475,7 +1763,7 @@ fn conclude_answers_whether_the_program_could_have_started() {
 /// returned a child with no go (`Failed`, `NoReport`, `Unwatched`) fails it as not started, the helper's
 /// own error standing; a spawn that returned a child told to go carries on; and a spawn that failed
 /// while the helper had failed too, with a pidfd, reaps the child it names. Together they drive all
-/// twelve `(spawned, outcome)` pairs.
+/// eleven reachable `(spawned, outcome)` pairs; the twelfth is `a_failed_spawn_whose_child_was_watched_asserts`.
 ///
 /// Mutant: any of these arms answers that the program may have started, or the carry-on arm fails.
 #[skuld::test]
@@ -1541,4 +1829,110 @@ fn conclude_answers_every_remaining_pair() {
     .expect("the spawn fails")
     .expect_not_started();
     assert!(matches!(&error, Error::Io(e) if e.to_string() == "helper"), "{error:?}");
+}
+
+/// Every reachable `(spawned, outcome)` pair says whether its child is reaped, or will be. Only a pair whose
+/// failed `spawn` is tokio's, with no pidfd to tear the child down through, leaves one tokio
+/// dropped unreaped: the std child it wraps reaps nothing.
+///
+/// Mutant: either `Uncovered` pair answers `Covered`, or any `Covered` pair `Uncovered`.
+#[skuld::test]
+fn reaping_of_answers_every_pair() {
+    use super::Reaping::{Covered, Uncovered};
+
+    let pidfd = || OwnedFd::from(std::fs::File::open("/dev/null").expect("open /dev/null"));
+    let io = || std::io::Error::other("spawn");
+    let failed = || Error::Io(std::io::Error::other("helper"));
+    // A spawn that returned a child: its handle reaps it, whatever the helper found.
+    let returned = || Ok::<(), std::io::Error>(());
+    // A spawn that failed: std collected its child, or tokio dropped it.
+    let dropped = || Err::<(), _>(io());
+
+    let rows = [
+        (
+            "Ok, Opened",
+            super::reaping_of(&returned(), &Outcome::Opened(pidfd())),
+            Covered,
+        ),
+        (
+            "Ok, Gone",
+            super::reaping_of(&returned(), &Outcome::Gone(pidfd())),
+            Covered,
+        ),
+        (
+            "Ok, Failed with a pidfd",
+            super::reaping_of(&returned(), &Outcome::Failed(failed(), Some(pidfd()))),
+            Covered,
+        ),
+        (
+            "Ok, Failed without",
+            super::reaping_of(&returned(), &Outcome::Failed(failed(), None)),
+            Covered,
+        ),
+        (
+            "Ok, NoReport",
+            super::reaping_of(&returned(), &Outcome::NoReport),
+            Covered,
+        ),
+        (
+            "Ok, Unwatched",
+            super::reaping_of(&returned(), &Outcome::Unwatched("cause".into())),
+            Covered,
+        ),
+        (
+            "Err, Opened",
+            super::reaping_of(&dropped(), &Outcome::Opened(pidfd())),
+            Covered,
+        ),
+        (
+            "Err, Gone",
+            super::reaping_of(&dropped(), &Outcome::Gone(pidfd())),
+            Covered,
+        ),
+        (
+            "Err, Failed with a pidfd",
+            super::reaping_of(&dropped(), &Outcome::Failed(failed(), Some(pidfd()))),
+            Covered,
+        ),
+        (
+            "Err, Failed without",
+            super::reaping_of(&dropped(), &Outcome::Failed(failed(), None)),
+            Uncovered,
+        ),
+        (
+            "Err, NoReport",
+            super::reaping_of(&dropped(), &Outcome::NoReport),
+            Uncovered,
+        ),
+    ];
+    let wrong: Vec<_> = rows
+        .iter()
+        .filter(|(_, got, want)| got != want)
+        .map(|(pair, got, want)| format!("{pair}: {got:?}, expected {want:?}"))
+        .collect();
+    assert!(wrong.is_empty(), "pairs answered wrongly: {wrong:#?}");
+}
+
+/// Only a spawn that returned a child is watched, so a failed spawn whose outcome is `Unwatched` is a
+/// contract breach: asserted in debug, and in release answered as a child that may be unreaped, not
+/// started.
+///
+/// Mutant: `reaping_of` answers the pair silently (or `Covered`) in debug, or in release.
+#[skuld::test]
+fn a_failed_spawn_whose_child_was_watched_asserts() {
+    let dropped = || Err::<NoChild, _>(std::io::Error::other("spawn"));
+
+    let reaping = std::panic::catch_unwind(|| super::reaping_of(&dropped(), &Outcome::Unwatched("cause".into())));
+    if cfg!(debug_assertions) {
+        assert!(reaping.is_err(), "the pair must assert");
+    } else {
+        assert_eq!(reaping.expect("no assertion in release"), super::Reaping::Uncovered);
+        let (failure, reaping) = super::conclude_noting(
+            dropped(),
+            Outcome::Unwatched("cause".into()),
+            super::LeftFront::NotAFront,
+        );
+        failure.err().expect("the spawn fails").expect_not_started();
+        assert_eq!(reaping, super::Reaping::Uncovered);
+    }
 }
