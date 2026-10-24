@@ -11,7 +11,6 @@ use crate::error::io_context;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Sig {
     Kill,
-    /// `SIGTERM`: a request to exit, not an order.
     #[cfg(unix)]
     Term,
 }

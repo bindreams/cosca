@@ -43,7 +43,6 @@ pub(crate) enum ForcedReap {
 
 type StepHook = Box<dyn FnOnce()>;
 
-/// What every peek answers under [`force_every_peek`].
 type PeekAnswer = fn() -> io::Result<Peek>;
 
 /// Told the `options` of each `waitid` this thread makes.

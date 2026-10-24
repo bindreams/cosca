@@ -630,22 +630,14 @@ impl Command {
     /// descendant. See [`crate::Containment`] for the per-OS mechanisms.
     ///
     /// # A child reaped by something else
-    /// Another reaper in the process (`SIGCHLD` set to `SIG_IGN`, or `waitpid(-1, …)`) may reap the
-    /// child. On Linux a cgroup's kill stays exact, since it names no pid, and only the exit status
-    /// is lost. A process group, and a macOS fd marker's group and walk, are named by the root's pid,
-    /// which may then name another process: on evidence of a foreign reap those kills are skipped, and
-    /// [`kill_tree`](crate::Child::kill_tree), [`terminate_tree`](crate::Child::terminate_tree) and
+    /// Another reaper in the process (`SIGCHLD` set to `SIG_IGN`, `waitpid(-1, …)`) may reap the
+    /// child. A cgroup kill stays exact (only the exit status is lost). Kills named by the root's pid
+    /// (a process group; a macOS fd marker's group and walk) are skipped on evidence of a foreign
+    /// reap, and [`kill_tree`](crate::Child::kill_tree),
+    /// [`terminate_tree`](crate::Child::terminate_tree) and
     /// [`graceful_shutdown_tree`](crate::Child::graceful_shutdown_tree) return
-    /// [`Error::Unassessable`](crate::error::Error::Unassessable). An fd marker's holders are named by
-    /// the pipe they hold, and are still killed; if that sweep fails, the call returns its error
-    /// instead, such as [`Error::Containment`](crate::error::Error::Containment). After the handle's own reap no walk runs from the
-    /// root's pid, since the root's children were reparented at its exit, but a pid that names no
-    /// process is still signalled as the group's id, which another process may take once no member
-    /// of the group survives (bindreams/cosca#382). A reap after the handle's look, by another reaper
-    /// or by a sync `wait` on another thread, is not seen, and the signals by that number (the
-    /// group's, and an fd marker's walk from the root's pid) then go out, for the whole sweep, to a
-    /// number another process may hold. macOS has no pidfd, so cosca has no exact kill of the root
-    /// there.
+    /// [`Error::Unassessable`](crate::error::Error::Unassessable); see `kill_tree` for the rest.
+    /// macOS has no pidfd, so cosca has no exact kill of the root there.
     ///
     /// # Linux: an elevated child behind a front
     /// A `sudo` or `doas` front in a cgroup is killed through the cgroup alone, and whether that kill

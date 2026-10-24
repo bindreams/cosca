@@ -331,7 +331,7 @@ struct Expected {
 
 /// The killpg after this handle's own reap, while the pid names nothing: the group may still have
 /// members, but once none survives another process may take the number first.
-const KILLPG_AFTER_OWN_REAP: Want = Want::Routed("bindreams/cosca#382, plan A P14");
+const KILLPG_AFTER_OWN_REAP: Want = Want::Routed("bindreams/cosca#382");
 /// A cgroup's `SIGTERM` goes to each member by the pid `cgroup.procs` lists.
 const CGROUP_TERM_BY_PID: Want = Want::Routed("bindreams/cosca#106");
 

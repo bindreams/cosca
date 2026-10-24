@@ -761,28 +761,8 @@ impl Child {
     /// was skipped. The handle backstop reads the root's state again: a root orphaned during the sweep
     /// is an exited zombie, so the backstop is skipped and the sweep's answer stands.
     ///
-    /// **A root reaped by something else.** A process group, and a macOS fd marker's group and
-    /// walk, are named by the root's pid. If the root's own handle shows it was reaped by another
-    /// reaper in the process, that pid may name another process: nothing is sent by it, and the call
-    /// returns [`Error::Unassessable`](crate::error::Error::Unassessable), with a `warn` naming what
-    /// it skipped, or the error of a failed marker holders' sweep (below), such as
-    /// [`Error::Containment`](crate::error::Error::Containment). A root whose handle cannot say is answered the same way, except that on Linux the
-    /// root itself is still signalled through its pidfd, which names it exactly, and the `warn` says
-    /// so: `kill_tree` kills it, [`terminate_tree`](Child::terminate_tree) sends it the `SIGTERM`, and
-    /// [`graceful_shutdown_tree`](Child::graceful_shutdown_tree) sends the `SIGTERM`, then the kill if
-    /// it is still running after the grace; on macOS it is answered as in the paragraph above. An fd
-    /// marker still kills its marker holders, which are named by the pipe they hold, so no pid reuse
-    /// redirects the kill.
-    ///
-    /// **After this handle's own reap.** As for the sync
-    /// [`Child::kill_tree`](crate::Child::kill_tree): no walk runs from the root's pid, another
-    /// process at that pid means the group is empty, and a pid that names no process is still
-    /// signalled as the group's id (bindreams/cosca#382).
-    ///
-    /// **A reap after the look.** All of this is decided on one look at the root. A foreign reap
-    /// after it is not seen, and what the sweep sends by that number (the group's signal, and an fd
-    /// marker's walk from the root's pid) then goes out, for the whole sweep, to a number another
-    /// process may hold.
+    /// **A root reaped by something else, after this handle's own reap, and a reap after the
+    /// look.** As for the sync [`Child::kill_tree`](crate::Child::kill_tree).
     pub fn kill_tree(&mut self) -> Result<(), Error> {
         self.kill_tree_after(None)
     }

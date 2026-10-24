@@ -762,7 +762,6 @@ pub(crate) mod fault {
     pub(crate) struct HolderKillRecorder(());
 
     impl HolderKillRecorder {
-        /// The holders signalled, with any signal.
         pub(crate) fn killed(&self) -> Vec<u32> {
             self.sent().into_iter().map(|(pid, _)| pid).collect()
         }

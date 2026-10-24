@@ -24,11 +24,8 @@ pub(crate) enum RootNumber {
     /// the pid, and the kernel does not reissue a pid while it is some group's id, or the pid of a
     /// pid-less fd marker's root names nothing. Only the marker holders, if any, are signalled.
     Empty,
-    /// The pid may name another process, for the reason `why`: the root was reaped elsewhere, or
-    /// its handle or its pid cannot be read. `exact_root` (Linux): the handle cannot say whether the
-    /// root was reaped, and a signal through it reaches the root exactly if it reaches it at all. A
-    /// handle that still holds the root's pidfd delivers it; a tokio backend forgotten because the
-    /// root could not be shown to be ours holds none, and answers `Sent::Unverified`.
+    /// The pid may name another process, for the reason `why`. `exact_root` (Linux): the root's
+    /// handle still reaches the root exactly, if it reaches it at all.
     MayNameAnother { why: String, exact_root: bool },
 }
 
@@ -38,7 +35,7 @@ pub(crate) enum RootNumber {
 /// ([`Attached::needs_root_check`](crate::containment::Attached::needs_root_check)). After this
 /// handle's own reap, a pid that names nothing (`Gone`) is still the id of the root's group while a
 /// member survives, so a group is signalled by it, though once none survives a later process may
-/// take the number, and lead a group by it, first (bindreams/cosca#382). No walk runs from it.
+/// take the number, and lead a group by it, first. No walk runs from it.
 pub(crate) fn root_number(attached: &Attached, pid: RawPid, state: impl FnOnce() -> (RootState, bool)) -> RootNumber {
     use crate::identity::Resolved;
     #[cfg(target_os = "macos")]

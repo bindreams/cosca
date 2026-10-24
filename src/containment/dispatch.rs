@@ -332,7 +332,6 @@ pub(crate) enum TreeSignal {
 
 #[cfg(unix)]
 impl TreeSignal {
-    /// The verb for a log line: "kill" or "signal".
     pub(crate) fn verb(self) -> &'static str {
         match self {
             TreeSignal::Kill => "kill",
@@ -565,12 +564,11 @@ impl Attached {
         }
     }
 
-    /// Whether `kill_tree`/`terminate_tree` must check the root before signalling
-    /// ([`crate::child::tree_call::root_number`]): this mechanism reaches the tree through the root's number,
-    /// which the root's reap frees for reuse, and nothing in it checks the root first.
-    /// `ProcessGroup` `killpg`s that number. A macOS `FdMarker` walks the process table from it on
-    /// every sweep, and `killpg`s it too when its mode made a group. `TreeWalk` also walks from it,
-    /// but checks after its snapshot that the root still holds it (`treewalk::anchor_present`).
+    /// Whether this mechanism reaches the tree through the root's number (`ProcessGroup`'s `killpg`;
+    /// a macOS `FdMarker`'s walk and group), which the root's reap frees for reuse, so
+    /// `kill_tree`/`terminate_tree` check the root first
+    /// ([`crate::child::tree_call::root_number`]). `TreeWalk` checks for itself
+    /// (`treewalk::anchor_present`).
     #[cfg(unix)]
     pub(crate) fn needs_root_check(&self) -> bool {
         match self {

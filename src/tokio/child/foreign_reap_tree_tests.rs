@@ -611,7 +611,7 @@ async fn tokio_kill_tree_after_own_wait_of_a_marker_with_a_group_is_ok_and_marks
 
     child.kill_tree().expect("the group and every holder were reached");
 
-    // Routed: the killpg by a pid that names nothing (bindreams/cosca#382).
+    // A pid that names nothing is still killed as the group's id.
     let by_id = groups.killed();
     assert!(
         !by_id.is_empty() && by_id.iter().all(|g| *g == pid as i32),
@@ -657,7 +657,7 @@ async fn tokio_graceful_shutdown_tree_after_own_wait_of_a_marker_with_a_group_an
         .expect("the group and every holder were reached");
 
     assert_eq!(status, collected, "the status the wait collected");
-    // Routed: the group's signals by a pid that names nothing (bindreams/cosca#382).
+    // A pid that names nothing is still signalled as the group's id.
     for (what, by_id) in [("SIGTERM", termed.termed()), ("kill", killed.killed())] {
         assert!(
             !by_id.is_empty() && by_id.iter().all(|g| *g == pid as i32),
