@@ -484,7 +484,7 @@ impl Child {
                 self.id.pid()
             );
         }
-        let kill = crate::child::holders_only(&self.attached, TreeSignal::Kill);
+        let kill = crate::child::holders_only(&self.attached, TreeSignal::Term); // MUTANT (I3): SIGTERM twice
         crate::child::holders_shutdown_error(&self.attached, self.id.pid(), why, term, kill)
     }
 }
