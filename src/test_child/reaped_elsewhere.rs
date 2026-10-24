@@ -59,3 +59,87 @@ pub(crate) fn foreign_reaped_group_root() -> (crate::Child, u32) {
     reap_behind(pid);
     (child, pid)
 }
+
+/// Every record of the tree ops' skip for a root whose handle was forgotten unproven contains this.
+pub(crate) const MAY_STILL_RUN: &str = "may still be running";
+
+/// The text of every `warn` since `mark` on this thread.
+pub(crate) fn warns_since(mark: usize) -> Vec<String> {
+    crate::log_capture::records_since_on_current_thread(mark, "")
+        .into_iter()
+        .filter(|(level, _)| *level == log::Level::Warn)
+        .map(|(_, text)| text)
+        .collect()
+}
+
+/// A root `sh` that leaves a marker holder outside its process group, then sleeps. The holder is a
+/// `cat` that called `setsid` (through `perl`, as macOS has no `setsid` command) and reads the
+/// root's stdin through fd 3, as `sh` points a background job's stdin at `/dev/null` otherwise. It
+/// prints its pid once it has left the group. It holds the stderr pipe's write end: once the root is
+/// gone, stderr reaches EOF exactly when the holder is.
+#[cfg(target_os = "macos")]
+pub(crate) const ESCAPED_HOLDER_SCRIPT: &str = r#"exec 3<&0
+perl -MPOSIX -e 'POSIX::setsid() > 0 or die "setsid: $!"; $| = 1; print "$$\n"; open(STDOUT, ">", "/dev/null") or die; exec("cat") or die' <&3 3<&- &
+exec 3<&-
+exec sleep 300"#;
+
+/// Asserts that `holder` leads its own process group, so a `killpg` of the root's group misses it.
+#[cfg(target_os = "macos")]
+#[track_caller]
+pub(crate) fn assert_left_the_group(holder: u32, root: u32) {
+    // SAFETY: `getpgid` reads a process's group and has no memory-safety preconditions.
+    let pgid = unsafe { libc::getpgid(holder as libc::pid_t) };
+    assert_eq!(
+        pgid,
+        holder as libc::pid_t,
+        "the holder must lead its own group, not the root's ({root}): {}",
+        std::io::Error::last_os_error()
+    );
+}
+
+/// A spawned [`ESCAPED_HOLDER_SCRIPT`] tree.
+#[cfg(target_os = "macos")]
+pub(crate) struct EscapedHolder {
+    pub(crate) pid: u32,
+    /// Held so the holder's `cat` ends only when killed.
+    _stdin: std::io::PipeWriter,
+    stderr: std::io::PipeReader,
+}
+
+#[cfg(target_os = "macos")]
+impl EscapedHolder {
+    /// Blocks until the holder is gone: its stderr reaches EOF. Call only once the test has shown
+    /// the holder was signalled, so a missed kill fails an assertion rather than hanging here.
+    pub(crate) fn assert_dies(mut self) {
+        let mut rest = Vec::new();
+        std::io::Read::read_to_end(&mut self.stderr, &mut rest).expect("the holder's stderr reaches EOF");
+        assert!(rest.is_empty(), "unexpected stderr from the holder: {rest:?}");
+    }
+}
+
+/// Spawns [`ESCAPED_HOLDER_SCRIPT`] behind an fd marker with a group, and waits for its holder to
+/// leave the group.
+#[cfg(target_os = "macos")]
+pub(crate) fn escaped_holder_tree() -> (crate::Child, EscapedHolder) {
+    use std::io::BufRead as _;
+    let mut cmd = crate::Command::new();
+    cmd.args(["sh", "-c", ESCAPED_HOLDER_SCRIPT]);
+    cmd.contain_with(crate::ContainMode::Session);
+    cmd.stdin(crate::Stdio::pipe_in()).expect("stdin pipe");
+    cmd.stdout(crate::Stdio::pipe_out()).expect("stdout pipe");
+    cmd.stderr(crate::Stdio::pipe_out()).expect("stderr pipe");
+    let mut child = cmd.spawn().expect("spawn");
+    assert_eq!(child.containment(), crate::Containment::FdMarker);
+    let mut line = String::new();
+    std::io::BufReader::new(child.stdout().expect("stdout pipe"))
+        .read_line(&mut line)
+        .expect("read the holder's pid");
+    let pid: u32 = line.trim().parse().expect("the holder's pid");
+    assert_left_the_group(pid, child.id().pid());
+    let holder = EscapedHolder {
+        pid,
+        _stdin: child.stdin().expect("stdin pipe"),
+        stderr: child.stderr().expect("stderr pipe"),
+    };
+    (child, holder)
+}

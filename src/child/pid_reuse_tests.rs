@@ -300,7 +300,8 @@ in_fresh_pid_ns!(
 /// the root is gone, so the pid names someone else.
 ///
 /// Mutants: the precondition assert kept (a debug panic); our own reap answered as foreign
-/// (`Unassessable`); `killpg` sent; the number trusted when it reads as the root (same tick).
+/// (`Unassessable`); `killpg` sent; the number trusted when it reads as the root (same tick); the
+/// tree not marked killed, so the drop warns.
 fn kill_tree_after_own_wait_and_reuse(same_tick: bool) {
     crate::log_capture::install();
     let recorder = crate::containment::unix::fault::record_kill_group();
@@ -326,6 +327,13 @@ fn kill_tree_after_own_wait_and_reuse(same_tick: bool) {
         crate::log_capture::records_since_on_current_thread(mark, REAPED_ELSEWHERE),
         [],
         "our own reap is not a foreign one"
+    );
+    let dropped = crate::log_capture::mark();
+    drop(child);
+    assert_eq!(
+        crate::test_child::reaped_elsewhere::warns_since(dropped),
+        Vec::<String>::new(),
+        "the group is empty, so the tree counts as killed: the drop does not warn"
     );
     assert_eq!(
         sigusr1_and_wait(reuser),
