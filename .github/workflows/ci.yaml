@@ -1295,7 +1295,7 @@ jobs:
       - name: Elevation (Windows) - check the JUnit result
         if: ${{ !cancelled() && steps.win_elev_run.outcome == 'success' }}
         shell: bash
-        run: python3 .github/scripts/check-junit.py "$RUNNER_TEMP/junit/elevation.xml" --tests 4
+        run: python3 .github/scripts/check-junit.py "$RUNNER_TEMP/junit/elevation.xml" --tests 5
 
       - name: Elevation (Windows) - upload JUnit
         if: ${{ !cancelled() && steps.win_elev_run.outcome != 'skipped' && steps.win_elev_run.outcome != '' }}

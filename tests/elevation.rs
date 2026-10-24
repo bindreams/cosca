@@ -432,6 +432,98 @@ fn windows_kill_of_an_elevated_child_reports_what_happened(#[fixture(elevation)]
     payload.release();
 }
 
+/// M10, a measurement: the consent route's child runs in the `current_dir` given, which reaches it as
+/// `lpDirectory`, and its environment block is recorded next to the one its launcher had.
+///
+/// `cosca_testbin spawn-consent-with-block` starts `consent-spawn` with the test's block plus `=Q:=<dir>` and a nonce,
+/// and that mode elevates `cosca_testbin_image` through `ShellExecuteExW(runas)`. The child has its own console, so it
+/// reports to files. Both markers in the child's block mean it inherited its launcher's; neither, a fresh one.
+///
+/// Mutants: the elevated spawn drops `current_dir` (the cwd assertion fails, as the directory is fresh and neither the
+/// test's cwd nor `System32`); the spawn does not elevate (`elevated=1` fails).
+#[cfg(windows)]
+#[skuld::test]
+fn m10_the_consent_route_child_runs_in_lp_directory(#[fixture(elevation)] _group: &Group) {
+    require_unelevated();
+    let dir = tempfile::tempdir().expect("the child's directory");
+    let lp_directory = dir.path().to_str().expect("a UTF-8 temp path").to_owned();
+    let own_cwd = std::env::current_dir().expect("this test's cwd");
+    let system32 = PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot")).join("System32");
+    for other in [&own_cwd, &system32] {
+        assert!(
+            !lp_directory.eq_ignore_ascii_case(other.to_str().expect("a UTF-8 path")),
+            "the child's directory {lp_directory} must differ from {}, or a route that ignored lpDirectory would pass",
+            other.display()
+        );
+    }
+
+    let records = tempfile::tempdir().expect("a directory for the child's reports");
+    let report = records.path().join("report.txt");
+    let env_dump = records.path().join("env.bin");
+    let q_dir = tempfile::tempdir().expect("the `=Q:` marker's directory");
+    let nonce = format!("COSCA_M10_NONCE={}", common::payload::fresh_nonce());
+    let q_entry = format!("=Q:={}", q_dir.path().display());
+    let mut entries: Vec<String> = std::env::vars_os()
+        .filter(|(k, _)| !k.eq_ignore_ascii_case("=Q:"))
+        .map(|(k, v)| {
+            let mut entry = k;
+            entry.push("=");
+            entry.push(v);
+            entry.into_string().expect("a UTF-16-valid environment")
+        })
+        .collect();
+    entries.push(q_entry.clone());
+    entries.push(nonce.clone());
+    let block_file = records.path().join("block.txt");
+    std::fs::write(
+        &block_file,
+        entries.iter().map(|e| format!("{e}\0")).collect::<String>(),
+    )
+    .unwrap();
+
+    let mut cmd = std::process::Command::new(testbin());
+    cmd.arg("spawn-consent-with-block").args([
+        report.as_os_str(),
+        env_dump.as_os_str(),
+        dir.path().as_os_str(),
+        block_file.as_os_str(),
+    ]);
+    let out = common::output_locked(&mut cmd).expect("run spawn-consent-with-block");
+    assert!(out.status.success(), "spawn-consent-with-block failed: {out:?}");
+
+    let report = std::fs::read_to_string(&report).expect("the child's report");
+    let dump = std::fs::read(&env_dump).expect("the child's environment dump");
+    let child_entries: Vec<String> = dump
+        .chunks_exact(2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        .collect::<Vec<u16>>()
+        .split(|&u| u == 0)
+        .take_while(|e| !e.is_empty())
+        .map(String::from_utf16_lossy)
+        .collect();
+    let has_q = child_entries.contains(&q_entry);
+    let has_nonce = child_entries.contains(&nonce);
+    println!("M10 report:\n{report}");
+    println!("M10 launcher block ({} entries):", entries.len());
+    entries.iter().for_each(|e| println!("  {e}"));
+    println!("M10 child block ({} entries):", child_entries.len());
+    child_entries.iter().for_each(|e| println!("  {e}"));
+    println!(
+        "M10 verdict: =Q: {}, nonce {}",
+        if has_q { "inherited" } else { "absent" },
+        if has_nonce { "inherited" } else { "absent" }
+    );
+
+    assert!(
+        report.lines().any(|l| l == "elevated=1"),
+        "the child did not run elevated:\n{report}"
+    );
+    assert!(
+        report.lines().any(|l| l == format!("cwd={lp_directory}")),
+        "the child's cwd is not the lpDirectory given ({lp_directory}):\n{report}"
+    );
+}
+
 // The async twin of the Windows marker test.
 #[cfg(all(windows, feature = "tokio"))]
 #[skuld::test]
