@@ -485,10 +485,21 @@ impl Run {
     /// write end of.
     pub(super) fn holds_the_release_pipe(&mut self) -> bool {
         let (shim, child) = (self.pid(), self.program_pid() as u32);
+        // An fd or process that vanishes mid-scan (`ENOENT`, `ESRCH`) is a definite answer: it holds nothing.
+        let gone = |e: &std::io::Error| matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ESRCH));
         let ends = |pid: u32| -> Vec<(String, bool)> {
             let mut ends = vec![];
-            for entry in std::fs::read_dir(format!("/proc/{pid}/fd")).expect("the fd table") {
-                let path = entry.expect("an entry").path();
+            let table = match std::fs::read_dir(format!("/proc/{pid}/fd")) {
+                Ok(table) => table,
+                Err(e) if gone(&e) => return ends,
+                Err(e) => panic!("the fd table: {e}"),
+            };
+            for entry in table {
+                let path = match entry {
+                    Ok(entry) => entry.path(),
+                    Err(e) if gone(&e) => return ends,
+                    Err(e) => panic!("an entry: {e}"),
+                };
                 let Ok(target) = std::fs::read_link(&path) else {
                     continue;
                 };
@@ -496,11 +507,14 @@ impl Run {
                 if !target.starts_with("pipe:[") {
                     continue;
                 }
-                let info = std::fs::read_to_string(format!(
+                let info = match std::fs::read_to_string(format!(
                     "/proc/{pid}/fdinfo/{}",
                     path.file_name().expect("a name").to_string_lossy()
-                ))
-                .expect("fdinfo");
+                )) {
+                    Ok(info) => info,
+                    Err(e) if gone(&e) => continue,
+                    Err(e) => panic!("fdinfo: {e}"),
+                };
                 let flags = info
                     .lines()
                     .find_map(|l| l.strip_prefix("flags:"))
