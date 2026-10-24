@@ -55,7 +55,7 @@ pub(crate) fn root_number(attached: &Attached, pid: RawPid, state: impl FnOnce()
         (RootState::Reaped, true) => match crate::child::root_identity_now(pid) {
             Resolved::Gone => return own_reaped_free(attached),
             Resolved::Found(_) => return RootNumber::Empty,
-            Resolved::Unknown => format!("this handle reaped the root, and its pid ({pid}) could not be read"),
+            Resolved::Unknown => return own_reaped_free(attached),
         },
         (RootState::Reaped, false) => format!("the root (pid {pid}) was reaped elsewhere"),
         (RootState::Unknown(e), _) => {

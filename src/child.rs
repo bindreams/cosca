@@ -643,14 +643,14 @@ impl Child {
         // signalled by identity alone, and so is a group named by the root's pid once that pid may
         // name another process. This handle's reaps are held off from the look to the sweep's end.
         #[cfg(unix)]
-        let held = self.proc.hold_reaps();
+        let held = &self.proc;
         #[cfg(unix)]
         if let Some(result) = self
             .tree_call(crate::containment::dispatch::TreeSignal::Kill, "kill_tree", earlier)
             .root_checked(
-                || held.state_and_own_reap(),
+                || (held.state(), held.is_reaped()),
                 || {
-                    held.signal_sent(crate::signal::Sig::Kill)
+                    held.kill_sent()
                         .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper()))
                 },
             )
@@ -659,7 +659,7 @@ impl Child {
         }
         let group_result = self.attached.hard_kill_marking(&self.tree_killed);
         #[cfg(unix)]
-        drop(held);
+        let _ = held;
         // A TreeWalk that could not walk killed nothing, and the root's death would strand the
         // descendants beyond a retry: return the error with the tree intact.
         if self.attached.hard_kill_refused_to_walk(&group_result) {
