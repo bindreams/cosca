@@ -77,12 +77,18 @@ pub(crate) fn warns_since(mark: usize) -> Vec<String> {
 /// `cat` that called `setsid` (through `perl`, as macOS has no `setsid` command) and reads the
 /// root's stdin through fd 3, as `sh` points a background job's stdin at `/dev/null` otherwise. It
 /// prints its pid once it has left the group. It holds the stderr pipe's write end: once the root is
-/// gone, stderr reaches EOF exactly when the holder is.
+/// gone, stderr reaches EOF exactly when the holder is. With `ignore_term`, the holder ignores
+/// `SIGTERM` (an ignored signal stays ignored across `exec`), so only a kill ends it.
 #[cfg(target_os = "macos")]
-pub(crate) const ESCAPED_HOLDER_SCRIPT: &str = r#"exec 3<&0
-perl -MPOSIX -e 'POSIX::setsid() > 0 or die "setsid: $!"; $| = 1; print "$$\n"; open(STDOUT, ">", "/dev/null") or die; exec("cat") or die' <&3 3<&- &
+pub(crate) fn escaped_holder_script(ignore_term: bool) -> String {
+    let ignore = if ignore_term { r#"$SIG{TERM} = "IGNORE"; "# } else { "" };
+    format!(
+        r#"exec 3<&0
+perl -MPOSIX -e '{ignore}POSIX::setsid() > 0 or die "setsid: $!"; $| = 1; print "$$\n"; open(STDOUT, ">", "/dev/null") or die; exec("cat") or die' <&3 3<&- &
 exec 3<&-
-exec sleep 300"#;
+exec sleep 300"#
+    )
+}
 
 /// Asserts that `holder` leads its own process group, so a `killpg` of the root's group misses it.
 #[cfg(target_os = "macos")]
@@ -98,7 +104,7 @@ pub(crate) fn assert_left_the_group(holder: u32, root: u32) {
     );
 }
 
-/// A spawned [`ESCAPED_HOLDER_SCRIPT`] tree.
+/// A spawned [`escaped_holder_script`] tree.
 #[cfg(target_os = "macos")]
 pub(crate) struct EscapedHolder {
     pub(crate) pid: u32,
@@ -118,13 +124,13 @@ impl EscapedHolder {
     }
 }
 
-/// Spawns [`ESCAPED_HOLDER_SCRIPT`] behind an fd marker with a group, and waits for its holder to
+/// Spawns [`escaped_holder_script`] behind an fd marker with a group, and waits for its holder to
 /// leave the group.
 #[cfg(target_os = "macos")]
-pub(crate) fn escaped_holder_tree() -> (crate::Child, EscapedHolder) {
+pub(crate) fn escaped_holder_tree(ignore_term: bool) -> (crate::Child, EscapedHolder) {
     use std::io::BufRead as _;
     let mut cmd = crate::Command::new();
-    cmd.args(["sh", "-c", ESCAPED_HOLDER_SCRIPT]);
+    cmd.args(["sh", "-c", &escaped_holder_script(ignore_term)]);
     cmd.contain_with(crate::ContainMode::Session);
     cmd.stdin(crate::Stdio::pipe_in()).expect("stdin pipe");
     cmd.stdout(crate::Stdio::pipe_out()).expect("stdout pipe");

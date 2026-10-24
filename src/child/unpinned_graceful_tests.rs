@@ -13,7 +13,7 @@ use super::unpinned_public_tests::{
 };
 use crate::error::Error;
 use crate::send_log::Capture;
-use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peeks, Forced};
+use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peeks, forced_peeks_left, Forced};
 use crate::wait::exit_only::{Foreign, Peek};
 
 /// A hook slot that holds a forced peek until the test is over, so the guard is not dropped (and the
@@ -245,6 +245,35 @@ fn graceful_shutdown_tree_of_an_untrusted_session_root_signals_its_holders_only(
         assert_eq!(warns_since(mark), Vec::<String>::new(), "{state:?}");
         drop(writer);
     }
+}
+
+/// The cooperative signal is decided on one look at the root's state, as `terminate_tree`'s is. The
+/// hook right after it counts the looks left.
+///
+/// Mutant: the untrusted-root check and the reaped-root check each look, and the second look's
+/// `Unpinned` is let through to the group signal.
+#[skuld::test]
+fn graceful_shutdown_tree_decides_its_signal_on_one_look_at_the_root() {
+    let _termed = crate::containment::unix::fault::record_term_group();
+    let _killed = crate::containment::unix::fault::record_kill_group();
+    let (child, writer) = group_blocker();
+    let left: Arc<Mutex<Option<usize>>> = Arc::default();
+    let _hook = crate::graceful_hooks::at(crate::graceful_hooks::HookPoint::AfterTerminate, {
+        let left = Arc::clone(&left);
+        move || *left.lock().expect("the hook's slot") = Some(forced_peeks_left())
+    });
+    let looks = force_peeks([Ok(Peek::Running), Ok(Peek::Foreign(Foreign::Orphaned))]);
+
+    // The sweep and the reap that follow are not under test.
+    let _ = child.graceful_shutdown_tree(Duration::ZERO);
+
+    drop(looks);
+    assert_eq!(
+        *left.lock().expect("the hook's slot"),
+        Some(1),
+        "the signal's decision looked at the root twice"
+    );
+    drop(writer);
 }
 
 /// A root orphaned during the grace is refused by the sweep, which sends it nothing, and the

@@ -148,6 +148,63 @@ fn graceful_shutdown_tree_after_a_foreign_reap_warns_once_and_ends() {
     );
 }
 
+/// After this handle's own reap, with the pid held by another process, `graceful_shutdown_tree`
+/// sends no `SIGTERM` by the number: the group is empty. When its sweep then finds the pid
+/// unreadable, the warn says what the shutdown really sent before it: nothing on Linux, the
+/// `SIGTERM` to any marker holders on macOS.
+///
+/// Mutant: the sweep is told that "the SIGTERM" went out whatever the shutdown sent.
+#[skuld::test]
+fn graceful_shutdown_tree_after_own_wait_claims_no_sigterm_it_did_not_send() {
+    use crate::child::fault::force_next_root_read;
+    use crate::identity::{ProcessId, Resolved};
+    use crate::test_child::reaped_elsewhere::UNTRUSTED_NUMBER;
+    crate::log_capture::install();
+    let killed = record_kill_group();
+    let termed = record_term_group();
+    let child = session_sleep().spawn().expect("spawn");
+    let pid = child.id().pid();
+    child.kill().expect("kill the root");
+    child.wait().expect("this handle reaps the root");
+    let other = ProcessId::from_parts_for_test(pid, child.id().start_token_raw() + 1);
+    // The shutdown's look finds another process; the sweep's, after the terminate, cannot read the
+    // pid. This guard clears the second force too, should it go unconsumed.
+    let _reads = force_next_root_read(Resolved::Found(other));
+    let _unreadable = crate::graceful_hooks::at(crate::graceful_hooks::HookPoint::AfterTerminate, || {
+        std::mem::forget(force_next_root_read(Resolved::Unknown))
+    });
+
+    let mark = crate::log_capture::mark();
+    let err = child
+        .graceful_shutdown_tree(std::time::Duration::ZERO)
+        .expect_err("a sweep whose root's pid cannot be read is not assessable");
+
+    assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
+    assert_eq!(
+        termed.termed(),
+        Vec::<i32>::new(),
+        "no SIGTERM by a reaped root's number"
+    );
+    assert_eq!(
+        killed.killed(),
+        Vec::<i32>::new(),
+        "no killpg by a reaped root's number"
+    );
+    let warns = warns_since(mark);
+    assert_eq!(warns.len(), 1, "exactly one warn: {warns:?}");
+    assert!(warns[0].contains(UNTRUSTED_NUMBER), "{warns:?}");
+    #[cfg(target_os = "linux")]
+    assert!(
+        !warns[0].contains("was sent before it"),
+        "no SIGTERM was sent: {warns:?}"
+    );
+    #[cfg(target_os = "macos")]
+    assert!(
+        warns[0].contains("though the SIGTERM to any marker holders was sent before it"),
+        "the SIGTERM went to the marker holders alone: {warns:?}"
+    );
+}
+
 /// After this handle's own reap, with the pid reused, an fd marker still kills its holders by the
 /// pipe they hold, which no pid reuse redirects, including one that left the group. `Ok` follows
 /// the sweep, and the tree counts as killed, so the drop has nothing to warn about.
@@ -162,7 +219,7 @@ fn kill_tree_after_own_wait_and_reuse_kills_a_holder_that_left_the_group() {
     let groups = record_kill_group();
     let walks = crate::containment::treewalk::fault::record_walks();
     let holders = crate::containment::fdmarker::fault::record_holder_kills();
-    let (child, holder) = escaped_holder_tree();
+    let (child, holder) = escaped_holder_tree(false);
     let pid = child.id().pid();
     child.kill().expect("kill the root");
     child.wait().expect("this handle reaps the root");
@@ -205,7 +262,7 @@ fn kill_tree_after_a_foreign_reap_kills_a_holder_that_left_the_group() {
     let groups = record_kill_group();
     let walks = crate::containment::treewalk::fault::record_walks();
     let holders = crate::containment::fdmarker::fault::record_holder_kills();
-    let (child, holder) = escaped_holder_tree();
+    let (child, holder) = escaped_holder_tree(false);
     let pid = child.id().pid();
     child.kill().expect("kill the root");
     reap_behind(pid);
@@ -228,5 +285,54 @@ fn kill_tree_after_a_foreign_reap_kills_a_holder_that_left_the_group() {
         holders.killed()
     );
     assert_one_reaped_elsewhere_warn(mark, pid);
+    holder.assert_dies();
+}
+
+/// After a foreign reap, `graceful_shutdown_tree` still shuts an fd marker's holders down by the
+/// pipe they hold: the `SIGTERM`, then, after the grace, a kill of any left. This holder ignores the
+/// `SIGTERM`, so only that kill ends it. Nothing goes out by the root's number, and the call is
+/// `Unassessable`, with one warn.
+///
+/// Mutant: no kill after the grace.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn graceful_shutdown_tree_after_a_foreign_reap_kills_a_holder_that_ignores_sigterm() {
+    use crate::test_child::reaped_elsewhere::{escaped_holder_tree, reap_behind};
+    crate::log_capture::install();
+    let killed = record_kill_group();
+    let termed = record_term_group();
+    let walks = crate::containment::treewalk::fault::record_walks();
+    let holders = crate::containment::fdmarker::fault::record_holder_kills();
+    let (child, holder) = escaped_holder_tree(true);
+    let pid = child.id().pid();
+    child.kill().expect("kill the root");
+    reap_behind(pid);
+
+    let mark = crate::log_capture::mark();
+    let err = child
+        .graceful_shutdown_tree(std::time::Duration::ZERO)
+        .expect_err("a group whose root was reaped elsewhere is not assessable");
+
+    assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
+    assert_eq!(
+        killed.killed(),
+        Vec::<i32>::new(),
+        "no killpg by a reaped root's number"
+    );
+    assert_eq!(
+        termed.termed(),
+        Vec::<i32>::new(),
+        "no SIGTERM by a reaped root's number"
+    );
+    assert_eq!(walks.walked(), Vec::<u32>::new(), "no walk from a reaped root's number");
+    let signalled = holders
+        .killed()
+        .iter()
+        .filter(|signalled| **signalled == holder.pid)
+        .count();
+    assert_eq!(signalled, 2, "the SIGTERM, then the kill: {:?}", holders.killed());
+    assert_one_reaped_elsewhere_warn(mark, pid);
+    let warns = warns_since(mark);
+    assert_eq!(warns.len(), 1, "exactly one warn: {warns:?}");
     holder.assert_dies();
 }
