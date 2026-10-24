@@ -20,7 +20,7 @@ use windows::Win32::System::Threading::{
     PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTUPINFOEXW,
 };
 
-use crate::error::Error;
+use crate::error::{win32_io_error, Error};
 
 /// `WaitForSingleObject`/`WaitForMultipleObjects` "no timeout" sentinel.
 const INFINITE: u32 = 0xFFFF_FFFF;
@@ -186,7 +186,7 @@ impl RawChild {
                     Ok(())
                 }
             }
-            Err(e) => Err(e.into()),
+            Err(e) => Err(win32_io_error(e)),
         }
     }
 
@@ -277,7 +277,7 @@ pub(crate) fn wait_handle_or_cancel(proc: HANDLE, cancel: Option<HANDLE>) -> io:
 pub(crate) fn exit_status(handle: HANDLE) -> io::Result<ExitStatus> {
     let mut code: u32 = 0;
     // SAFETY: `handle` is a live, owned process handle; the process has exited so its code is final.
-    unsafe { GetExitCodeProcess(handle, &mut code) }?;
+    unsafe { GetExitCodeProcess(handle, &mut code) }.map_err(win32_io_error)?;
     Ok(ExitStatus::from_raw(code))
 }
 
@@ -324,18 +324,6 @@ pub(crate) fn create_process(
         log::debug!("CloseHandle(hThread): {e:?}");
     }
     Ok((proc, pi.dwProcessId))
-}
-
-/// `e` as the `io::Error` std's spawn would report: a `HRESULT_FROM_WIN32` code unwrapped to its
-/// Win32 code, which `kind()` classifies. `windows`' own conversion keeps the HRESULT, which
-/// `kind()` does not.
-pub(crate) fn win32_io_error(e: windows::core::Error) -> io::Error {
-    let code = e.code().0 as u32;
-    if code & 0xFFFF_0000 == 0x8007_0000 {
-        io::Error::from_raw_os_error((code & 0xFFFF) as i32)
-    } else {
-        io::Error::from_raw_os_error(code as i32)
-    }
 }
 
 /// Seam for [`RawChild::kill`] and [`RawChild::teardown_on_drop`].

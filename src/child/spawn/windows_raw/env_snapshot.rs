@@ -7,7 +7,7 @@ use windows::core::PCWSTR;
 use windows::Win32::System::Environment::{FreeEnvironmentStringsW, GetEnvironmentStringsW};
 
 use super::env_key::EnvKey;
-use crate::error::Error;
+use crate::error::{win32_io_error, Error};
 
 /// A copy of this process's environment block, exactly as `GetEnvironmentStringsW` returned it:
 /// `KEY=VAL\0` entries in the OS's order, closed by an empty entry. Every environment-dependent
@@ -36,7 +36,7 @@ impl EnvSnapshot {
         // SAFETY: `len` units were just read, plus the closing NUL at `len`.
         let block = unsafe { std::slice::from_raw_parts(raw.0, len + 1) }.to_vec();
         // SAFETY: `raw` came from `GetEnvironmentStringsW` and is freed once.
-        unsafe { FreeEnvironmentStringsW(PCWSTR(raw.0)) }.map_err(|e| Error::Io(e.into()))?;
+        unsafe { FreeEnvironmentStringsW(PCWSTR(raw.0)) }.map_err(|e| Error::Io(win32_io_error(e)))?;
         Ok(Self::from_block(block))
     }
 

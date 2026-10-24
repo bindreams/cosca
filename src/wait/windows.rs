@@ -11,7 +11,7 @@ use windows::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
 };
 
-use crate::error::Error;
+use crate::error::{win32_io_error, Error};
 use crate::identity::{HandleIdentity, Liveness, Opened, ProcessId};
 
 fn close(handle: HANDLE) {
@@ -42,7 +42,7 @@ pub(crate) fn block_until_exit(id: ProcessId, deadline: Option<Option<Instant>>)
                     );
                     Err(Error::Unassessable {
                         detail: format!("pid {} could not be opened to watch for its exit", id.pid()),
-                        source: Some(e.into()),
+                        source: Some(win32_io_error(e)),
                     })
                 }
             }
@@ -64,7 +64,7 @@ pub(crate) fn block_until_exit(id: ProcessId, deadline: Option<Option<Instant>>)
             close(handle);
             return Err(Error::Unassessable {
                 detail: format!("pid {} opened but its identity could not be verified", id.pid()),
-                source: Some(e.into()),
+                source: Some(win32_io_error(e)),
             });
         }
     }
@@ -93,7 +93,7 @@ pub(crate) fn block_until_exit(id: ProcessId, deadline: Option<Option<Instant>>)
 pub(crate) fn new_cancel_event() -> Result<OwnedHandle, Error> {
     // SAFETY: creating an unnamed event has no preconditions; the handle is immediately
     // wrapped in an OwnedHandle, which closes it.
-    let h = unsafe { CreateEventW(None, true, false, None) }.map_err(|e| Error::Io(e.into()))?;
+    let h = unsafe { CreateEventW(None, true, false, None) }.map_err(|e| Error::Io(win32_io_error(e)))?;
     // SAFETY: `h` is a freshly created, owned event handle.
     Ok(unsafe { OwnedHandle::from_raw_handle(h.0 as _) })
 }
@@ -154,7 +154,7 @@ pub(crate) fn open_verified(id: ProcessId) -> Result<Option<HANDLE>, Error> {
                     );
                     Err(Error::Unassessable {
                         detail: format!("pid {} could not be opened to watch for its exit", id.pid()),
-                        source: Some(e.into()),
+                        source: Some(win32_io_error(e)),
                     })
                 }
             }
@@ -176,7 +176,7 @@ pub(crate) fn open_verified(id: ProcessId) -> Result<Option<HANDLE>, Error> {
             close(handle);
             return Err(Error::Unassessable {
                 detail: format!("pid {} opened but its identity could not be verified", id.pid()),
-                source: Some(e.into()),
+                source: Some(win32_io_error(e)),
             });
         }
     }
@@ -279,7 +279,7 @@ pub(crate) fn kill(id: ProcessId) -> Result<(), Error> {
                     );
                     Err(Error::Unassessable {
                         detail: format!("pid {} could not be opened to terminate it", id.pid()),
-                        source: Some(e.into()),
+                        source: Some(win32_io_error(e)),
                     })
                 }
             }
@@ -301,7 +301,7 @@ pub(crate) fn kill(id: ProcessId) -> Result<(), Error> {
             close(handle);
             return Err(Error::Unassessable {
                 detail: format!("pid {} opened but its identity could not be verified", id.pid()),
-                source: Some(e.into()),
+                source: Some(win32_io_error(e)),
             });
         }
     }
@@ -322,7 +322,7 @@ pub(crate) fn kill(id: ProcessId) -> Result<(), Error> {
                 "wait: TerminateProcess(pid {}) failed and the target is not provably dead ({e})",
                 id.pid()
             );
-            Err(Error::Io(e.into()))
+            Err(Error::Io(win32_io_error(e)))
         }
     }
 }

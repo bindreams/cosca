@@ -37,6 +37,16 @@
 #
 # .github/scripts/check-disallowed-methods.sh requires every path below to have a call in
 # .github/fixtures/disallowed-methods that fires on each target that has the item.
+#
+# windows::core::Error -> io::Error -----
+#
+# Not bannable. The conversion is the `From<windows_result::Error> for io::Error` impl, whose method
+# `disallowed-methods` cannot name: every spelling reports "does not refer to a reachable
+# function". `.into()`, `io::Error::from` and `?` lower to the generic `Into::into`/`From::from`;
+# banning those bans every other conversion in the crate, and `?` is not matched even then.
+# `disallowed-types` matches a type written in the source, not an inferred one. The one sanctioned
+# conversion is `crate::error::win32_io_error`, which returns the Win32 code where the `windows`
+# crate keeps the HRESULT; review catches a bare conversion.
 disallowed-methods = [
     # Flag-less pipe constructors
     { path = "libc::pipe", reason = "libc::pipe's fds lack close-on-exec, so concurrently spawned children can inherit them and delay EOF. Use std::io::pipe(), which is atomic via pipe2 on Linux and the BSDs; on macOS it is pipe()+FD_CLOEXEC and still has a window, which a spawn can close with the opt-in tracked in cosca #248. Or use pipe2(O_CLOEXEC) where the platform has it." },

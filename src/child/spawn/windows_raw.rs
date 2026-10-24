@@ -54,7 +54,7 @@ use crate::child::spawn::{
 };
 use crate::child::Child;
 use crate::command::{Command, CommandInput, EnvOp, ExecutableSpec};
-use crate::error::{ChildFate, Error};
+use crate::error::{win32_io_error, ChildFate, Error};
 use crate::stdio::{Fd, ResolvedStdio};
 
 /// Spawn `cmd` via raw `CreateProcessW`. Handles descriptors 0/1/2 plus arbitrary fd >= 3 (wired
@@ -484,7 +484,8 @@ fn child_handle(ends: &BTreeMap<Fd, ChildEnd>, slot: Fd) -> HANDLE {
 /// Mark `h` inheritable (`bInheritHandles` + the HANDLE_LIST require it).
 fn set_inherit(h: HANDLE) -> Result<(), Error> {
     // SAFETY: `h` is a live child-end handle we own; SetHandleInformation only toggles its flags.
-    unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT) }.map_err(|e| Error::Io(e.into()))
+    unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT) }
+        .map_err(|e| Error::Io(win32_io_error(e)))
 }
 
 pub(crate) fn to_wide_nul(s: &OsStr) -> Vec<u16> {
@@ -600,7 +601,7 @@ impl AttributeList {
         let list = LPPROC_THREAD_ATTRIBUTE_LIST(buf.as_mut_ptr().cast());
         // SAFETY: `buf` is `size` bytes, matching the queried requirement; count = 1 (one attribute).
         unsafe { InitializeProcThreadAttributeList(Some(list), 1, None, &mut size) }
-            .map_err(|e| Error::Io(e.into()))?;
+            .map_err(|e| Error::Io(win32_io_error(e)))?;
         // SAFETY: `list` is initialized; the HANDLE_LIST attribute takes an array of `handles.len()`
         // HANDLEs by pointer (not copied), which the caller keeps alive until this list is deleted.
         let update = unsafe {
@@ -617,7 +618,7 @@ impl AttributeList {
         if let Err(e) = update {
             // SAFETY: `list` was initialized above; delete it before `buf` drops.
             unsafe { DeleteProcThreadAttributeList(list) };
-            return Err(Error::Io(e.into()));
+            return Err(Error::Io(win32_io_error(e)));
         }
         Ok(AttributeList { _buf: buf, list })
     }

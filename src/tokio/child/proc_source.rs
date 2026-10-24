@@ -555,12 +555,12 @@ impl ProcSource {
                     Err(e) if e.code() == windows::core::HRESULT::from_win32(ERROR_ACCESS_DENIED.0) => {
                         // SAFETY: as above; a zero-timeout wait only reads the handle's state.
                         if unsafe { WaitForSingleObject(HANDLE(h), 0) } == WAIT_FAILED {
-                            Err(Error::Io(e.into()))
+                            Err(Error::Io(crate::error::win32_io_error(e)))
                         } else {
                             Ok(Sent::Delivered)
                         }
                     }
-                    Err(e) => Err(Error::Io(e.into())),
+                    Err(e) => Err(Error::Io(crate::error::win32_io_error(e))),
                 }
             }
             #[cfg(windows)]

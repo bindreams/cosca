@@ -31,6 +31,8 @@ use windows::Win32::System::Threading::{
     PROCESS_SYNCHRONIZE, THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME,
 };
 
+use crate::error::win32_io_error;
+
 /// Sentinel: a null pointer means the handle has been consumed or is invalid.
 fn null_ptr() -> *mut c_void {
     std::ptr::null_mut()
@@ -119,7 +121,7 @@ impl JobHandle {
         let Some(job) = self.take() else { return Ok(()) };
         // SAFETY: job is a valid handle we own; Win32 calls are safe.
         unsafe {
-            let terminated = TerminateJobObject(job, 1).map_err(io::Error::from);
+            let terminated = TerminateJobObject(job, 1).map_err(win32_io_error);
             if let Err(e) = CloseHandle(job) {
                 log::warn!("CloseHandle on the job failed ({e}); the handle is leaked");
             }
@@ -322,8 +324,7 @@ pub(crate) fn caller_has_console() -> io::Result<bool> {
 /// probe are both parameters — so every arm is unit-testable without hooking the OS calls the
 /// live path depends on (the same injection idiom as `treewalk::descendants_with`).
 ///
-/// `err` is the `io::Error` converted from `windows::core::Error`, so its `raw_os_error` is
-/// the **HRESULT**, not the bare Win32 code.
+/// `err` carries the bare Win32 code (see [`win32_io_error`]), as `io::Error::last_os_error()` does.
 ///
 /// `Error::NoConsole` is returned ONLY when the failure code matches AND the probe confirms
 /// there is no console. A contradicted probe, a failed probe, or any other failure code keeps
@@ -331,7 +332,7 @@ pub(crate) fn caller_has_console() -> io::Result<bool> {
 /// to be false.
 pub(crate) fn classify_ctrl_event_failure(pid: u32, err: io::Error, console: io::Result<bool>) -> crate::error::Error {
     use windows::Win32::Foundation::ERROR_INVALID_HANDLE;
-    let no_console = windows::core::HRESULT::from_win32(ERROR_INVALID_HANDLE.0).0;
+    let no_console = ERROR_INVALID_HANDLE.0 as i32;
     if err.raw_os_error() == Some(no_console) && matches!(console, Ok(true)) {
         // warn, not debug: the crate's core mapping (this code <=> no console) was just
         // contradicted. Either another thread attached a console in the confirmation gap, or
@@ -491,7 +492,7 @@ pub(crate) fn terminate(pid: u32) -> Result<(), crate::error::Error> {
         Ok(()) => Ok(()),
         Err(e) => Err(classify_ctrl_event_failure(
             pid,
-            io::Error::from(e),
+            win32_io_error(e),
             caller_has_console(),
         )),
     }
@@ -664,7 +665,7 @@ pub(crate) fn assign_to_kill_on_close_job(proc_handle: std::os::windows::io::Raw
     let raw_handle = HANDLE(proc_handle.cast());
     // SAFETY: all calls are standard Win32; owned handles are closed on every error path.
     unsafe {
-        let job = CreateJobObjectW(None, windows::core::PCWSTR::null()).map_err(io::Error::from)?;
+        let job = CreateJobObjectW(None, windows::core::PCWSTR::null()).map_err(win32_io_error)?;
 
         let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
@@ -675,12 +676,12 @@ pub(crate) fn assign_to_kill_on_close_job(proc_handle: std::os::windows::io::Raw
             size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
         ) {
             _ = CloseHandle(job);
-            return Err(io::Error::from(e));
+            return Err(win32_io_error(e));
         }
 
         if let Err(e) = AssignProcessToJobObject(job, raw_handle) {
             _ = CloseHandle(job);
-            return Err(io::Error::from(e));
+            return Err(win32_io_error(e));
         }
 
         Ok(JobHandle::new(job))
@@ -691,7 +692,7 @@ pub(crate) fn assign_to_kill_on_close_job(proc_handle: std::os::windows::io::Raw
 /// resumed.
 pub(crate) fn assign_held(proc_handle: std::os::windows::io::RawHandle) -> io::Result<JobHandle> {
     #[cfg(test)]
-    forced(fault::Step::Assign, None).map_err(io::Error::from)?;
+    forced(fault::Step::Assign, None).map_err(win32_io_error)?;
     assign_to_kill_on_close_job(proc_handle)
 }
 
@@ -883,7 +884,7 @@ pub(crate) fn duplicate_job(handle: HANDLE) -> Result<HANDLE, crate::error::Erro
             DUPLICATE_SAME_ACCESS,
         )
     }
-    .map_err(io::Error::from)?;
+    .map_err(win32_io_error)?;
     Ok(dup)
 }
 
@@ -965,7 +966,7 @@ pub(crate) fn wait_drained_raw(
                         // other actionable failure rather than silently dropped: if it holds
                         // for every member it would otherwise be invisible.
                         Err(e) => {
-                            denied = Some(io::Error::from(e));
+                            denied = Some(win32_io_error(e));
                             // SAFETY: opened just above and not stored anywhere.
                             unsafe {
                                 _ = CloseHandle(h);
@@ -978,7 +979,7 @@ pub(crate) fn wait_drained_raw(
                 // progress (this round's tree is shrinking), not a failure: loop back to
                 // re-enumerate rather than treating it as denied.
                 Err(e) if e.code() == windows::Win32::Foundation::ERROR_INVALID_PARAMETER.to_hresult() => {}
-                Err(e) => denied = Some(io::Error::from(e)),
+                Err(e) => denied = Some(win32_io_error(e)),
             }
         }
 
@@ -1507,7 +1508,7 @@ pub(crate) fn resume_initial_threads(
 
     // SAFETY: snapshot/iterate with an owned handle, closed before return.
     unsafe {
-        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0).map_err(io::Error::from)?;
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0).map_err(win32_io_error)?;
         let mut entry = THREADENTRY32 {
             dwSize: size_of::<THREADENTRY32>() as u32,
             ..Default::default()
@@ -1522,7 +1523,7 @@ pub(crate) fn resume_initial_threads(
                 Err(e) => {
                     // A snapshot-API fault, not normal end-of-iteration.
                     _ = CloseHandle(snap);
-                    return Err(io::Error::from(e));
+                    return Err(win32_io_error(e));
                 }
             }
             entries.push(entry);

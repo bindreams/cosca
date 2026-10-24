@@ -2,13 +2,13 @@ use std::os::windows::ffi::OsStrExt;
 use std::time::{Duration, Instant};
 
 use windows::core::HRESULT;
-use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, HANDLE, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_HANDLE, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::System::Threading::{
     OpenProcess, TerminateProcess, WaitForSingleObject, CREATE_SUSPENDED, EXTENDED_STARTUPINFO_PRESENT, INFINITE,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, STARTUPINFOEXW,
 };
 
-use super::{create_process, win32_io_error, RawChild};
+use super::{create_process, RawChild};
 
 /// Kills and reaps the wrapped `RawChild` when dropped — including during a panicking unwind —
 /// so a deadline-contract test fixture never leaks a live process if an assertion fails
@@ -261,16 +261,15 @@ fn runas_kill_of_an_unterminable_child_surfaces_the_denial_without_blocking() {
     assert_eq!(observer.waits(), 0, "kill blocked on a child it cannot terminate");
 }
 
-/// A Win32 failure wrapped as `HRESULT_FROM_WIN32` comes back as its Win32 code, as std's own
-/// spawn reports it, so `kind()` classifies it. Any other HRESULT is kept whole.
+/// A failed `GetExitCodeProcess` reports the plain Win32 code. A null handle is a real
+/// `ERROR_INVALID_HANDLE`.
+///
+/// Mutant: `exit_status` propagates the `windows::core::Error` with `?`, whose `io::Error`
+/// conversion keeps the HRESULT.
 #[skuld::test]
-fn win32_io_error_unwraps_a_win32_hresult() {
-    use windows::core::{Error, HRESULT};
-    let dir = win32_io_error(Error::from_hresult(HRESULT(0x8007_010Bu32 as i32)));
-    assert_eq!(dir.raw_os_error(), Some(267));
-    assert_eq!(dir.kind(), std::io::ErrorKind::NotADirectory);
-    let e_fail = win32_io_error(Error::from_hresult(HRESULT(0x8000_4005u32 as i32)));
-    assert_eq!(e_fail.raw_os_error(), Some(0x8000_4005u32 as i32));
+fn a_failed_exit_status_read_is_reported_as_its_win32_code() {
+    let err = super::exit_status(HANDLE::default()).expect_err("a null handle has no exit status");
+    assert_eq!(err.raw_os_error(), Some(ERROR_INVALID_HANDLE.0 as i32), "{err:?}");
 }
 
 /// `CreateProcessW` refusing a working directory surfaces `ERROR_DIRECTORY`, not its HRESULT.
