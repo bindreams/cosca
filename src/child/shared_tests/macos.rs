@@ -492,6 +492,176 @@ fn a_wait_on_a_child_whose_tracer_dies_during_its_exit_is_woken_by_the_tracers_e
     tracer.wait().expect("reap the stand-in tracer");
 }
 
+/// The rounds of an `await_reapable_on` on `kq`: `hook` runs before each blocking round with the
+/// round's index and the kqueue. A round whose hook answers `false` (it found nothing pending that
+/// should be) gets a `SIGCHLD` to this process, which the wait also watches, so a wait that missed
+/// its event fails its test's assertion instead of hanging.
+fn on_rounds(
+    kq: &std::rc::Rc<nix::sys::event::Kqueue>,
+    mut hook: impl FnMut(u32, &nix::sys::event::Kqueue) -> bool + 'static,
+) -> ForcedOnce {
+    let kq = std::rc::Rc::clone(kq);
+    test_hooks::on_every_kevent_round(move |round| {
+        if !hook(round, &kq) {
+            test_hooks::send_signal(std::process::id(), libc::SIGCHLD);
+        }
+    })
+}
+
+/// A tracer that attaches after the wait's check: XNU reparents the child to it and sends the child
+/// `SIGSTOP` (xnu-12377.121.6 `mach_process.c:295`, `:304`). The wait watches the child's signals,
+/// so it peeks again, finds the tracer and watches it too; the tracer's exit, with launchd then
+/// holding the child, ends the wait: `Orphaned`. This process's own pid stands in for the child, and
+/// a blocker for the tracer; the parent read is forced: this process until the attach, then the
+/// stand-in, then launchd once that has exited. A `SIGCONT` to this process stands in for the
+/// attach's `SIGSTOP`.
+///
+/// Mutant: the wait registers no `NOTE_SIGNAL` on the child.
+#[skuld::test]
+fn a_wait_on_a_child_a_tracer_attaches_to_late_is_woken_by_the_attach() {
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    use crate::wait::backend::{await_reapable_on, Waited};
+    let (pid, unique) = echild_yet_resolvable();
+    let (mut tracer, tracer_stdin) = spawn_std_blocker();
+    let tracer_pid = tracer.id();
+    let holder = Rc::new(Cell::new(pid));
+    let _parent = ppid_fault::force_ppid_with({
+        let holder = Rc::clone(&holder);
+        move || Ok(holder.get())
+    });
+    let kq = Rc::new(nix::sys::event::Kqueue::new().expect("kqueue"));
+    let attach_woke = Rc::new(Cell::new(None));
+    let tracer_stdin = RefCell::new(Some(tracer_stdin));
+    let _rounds = on_rounds(&kq, {
+        let attach_woke = Rc::clone(&attach_woke);
+        move |round, kq| match round {
+            0 => {
+                holder.set(tracer_pid);
+                test_hooks::send_signal(pid, libc::SIGCONT);
+                attach_woke.set(Some(test_hooks::event_pending(kq)));
+                attach_woke.get() == Some(true)
+            }
+            1 => {
+                drop(tracer_stdin.borrow_mut().take());
+                crate::test_child::wait_until_zombie(tracer_pid);
+                holder.set(LAUNCHD);
+                true
+            }
+            _ => false,
+        }
+    });
+    let waited = await_reapable_on(&kq, pid, Some(unique), None).expect("wait");
+    assert_eq!(attach_woke.get(), Some(true), "the attach's signal must wake the wait");
+    assert_eq!(waited, Waited::Orphaned);
+    tracer.wait().expect("reap the stand-in tracer");
+}
+
+/// The parents a `kinfo_proc` read reports for a process this one started, held by `tracer`:
+/// `(p_oppid, e_ppid)`.
+fn started_by_us_traced_by(tracer: u32) -> (libc::pid_t, libc::pid_t) {
+    (std::process::id() as libc::pid_t, tracer as libc::pid_t)
+}
+
+/// A tracer that is itself traced: XNU sends its `NOTE_EXIT` only to its own tracer
+/// (xnu-12377.121.6 `kern_event.c:1200`), and its exit sends that tracer `SIGCHLD`
+/// (`kern_exit.c:2776`). The wait follows the chain of tracers and watches the signals of each, so
+/// that `SIGCHLD` wakes it, and the peek after it finds launchd holding the child: `Orphaned`. This
+/// process's own pid stands in for the child, held by one blocker; a second blocker stands in for
+/// that one's tracer, by its forced parents. A `SIGCHLD` to the second stands in for the first one's
+/// exit, and the child's parent read then answers launchd.
+///
+/// Mutant: the walk stops at the child's tracer.
+#[skuld::test]
+fn a_wait_on_a_child_whose_tracer_is_traced_is_woken_by_that_tracers_exit() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use crate::wait::backend::{await_reapable_on, Waited};
+    let (pid, unique) = echild_yet_resolvable();
+    let (tracer, tracer_stdin) = spawn_std_blocker();
+    let (outer, outer_stdin) = spawn_std_blocker();
+    let (tracer_pid, outer_pid) = (tracer.id(), outer.id());
+    let holder = Rc::new(Cell::new(tracer_pid));
+    let _parent = ppid_fault::force_ppid_with({
+        let holder = Rc::clone(&holder);
+        move || Ok(holder.get())
+    });
+    let _traced = crate::identity::kinfo::fault::force_parents(tracer_pid, move || started_by_us_traced_by(outer_pid));
+    let kq = Rc::new(nix::sys::event::Kqueue::new().expect("kqueue"));
+    let exit_woke = Rc::new(Cell::new(None));
+    let _rounds = on_rounds(&kq, {
+        let exit_woke = Rc::clone(&exit_woke);
+        move |round, kq| {
+            if round != 0 {
+                return false;
+            }
+            holder.set(LAUNCHD);
+            test_hooks::send_signal(outer_pid, libc::SIGCHLD);
+            exit_woke.set(Some(test_hooks::event_pending(kq)));
+            exit_woke.get() == Some(true)
+        }
+    });
+    let waited = await_reapable_on(&kq, pid, Some(unique), None).expect("wait");
+    assert_eq!(
+        exit_woke.get(),
+        Some(true),
+        "the SIGCHLD that the traced tracer's exit sends its tracer must wake the wait"
+    );
+    assert_eq!(waited, Waited::Orphaned);
+    for (mut child, stdin) in [(tracer, tracer_stdin), (outer, outer_stdin)] {
+        drop(stdin);
+        child.wait().expect("reap a stand-in tracer");
+    }
+}
+
+/// A tracer that began its exit, then lost its own tracer: XNU gives it to launchd and keeps its
+/// `p_oppid` (xnu-12377.121.6 `kern_exit.c:2612-2613`), so its `NOTE_EXIT` reaches only launchd
+/// (`kern_event.c:1200`), and its `SIGCHLD` goes to launchd too (`:2776`). It hands the child over
+/// once its exit reaches its children (`:2528`), so the wait peeks again on a backoff instead of
+/// blocking for an event that never comes. This process's own pid stands in for the child, held by
+/// a blocker whose forced parents say launchd holds it and a tracer attached to it; the child's
+/// parent read answers launchd from the first block on.
+///
+/// Mutant: a tracer launchd holds ends the walk, and the wait blocks with no timeout.
+#[skuld::test]
+fn a_wait_on_a_child_whose_tracer_is_exiting_at_launchd_peeks_again_on_a_backoff() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use crate::wait::backend::{await_reapable_on, Waited};
+    let (pid, unique) = echild_yet_resolvable();
+    let (mut tracer, tracer_stdin) = spawn_std_blocker();
+    let tracer_pid = tracer.id();
+    let holder = Rc::new(Cell::new(tracer_pid));
+    let _parent = ppid_fault::force_ppid_with({
+        let holder = Rc::clone(&holder);
+        move || Ok(holder.get())
+    });
+    let _dying = crate::identity::kinfo::fault::force_parents(tracer_pid, || started_by_us_traced_by(LAUNCHD));
+    let kq = Rc::new(nix::sys::event::Kqueue::new().expect("kqueue"));
+    let _rounds = on_rounds(&kq, move |round, _| {
+        holder.set(LAUNCHD);
+        // The first round's own wake, for a wait that blocked with no timeout.
+        round != 0
+    });
+    let before = test_hooks::await_requested_timeouts().len();
+    let waited = await_reapable_on(&kq, pid, Some(unique), None).expect("wait");
+    let blocks: Vec<_> = test_hooks::await_requested_timeouts()[before..]
+        .iter()
+        .copied()
+        .filter(|armed| *armed != Some(Duration::ZERO))
+        .collect();
+    assert!(
+        matches!(blocks.first(), Some(Some(_))),
+        "the first block must be timed, to peek again: {blocks:?}"
+    );
+    assert_eq!(waited, Waited::Orphaned);
+    drop(tracer_stdin);
+    tracer.wait().expect("reap the stand-in tracer");
+}
+
 /// launchd answers `ECHILD` to our `waitid` and refuses `PROC_PIDTBSDINFO` to a caller that is not
 /// root, yet its unique id and parent read unprivileged: it is held, not reaped. Its parent is the
 /// kernel, pid 0, not launchd.
