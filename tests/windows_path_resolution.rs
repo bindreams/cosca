@@ -37,9 +37,9 @@
 //! or network, so UNC and device inputs here reach no server or device. The file and spawn tests
 //! write inside a `tempfile` directory of their own and launch `cosca_testbin` and its image
 //! copies, with these exceptions: one canary has std create `cmd.exe` SUSPENDED and terminates it
-//! before it runs; `m5_what_std_loads` runs `whoami` and `find` from System32 and reaches its
-//! temp directory through `\\localhost\<drive>$`; `m19_app_execution_aliases` launches `winget
-//! --version` and makes a directory of its own beside `%LOCALAPPDATA%\Microsoft\WindowsApps`. The
+//! before it runs; `m5_what_std_loads` runs `whoami` and `find` from System32, launches `winget
+//! --version` and reaches its temp directory through `\\localhost\<drive>$`;
+//! `m19_app_execution_aliases` also launches `winget --version` and makes a directory of its own beside `%LOCALAPPDATA%\Microsoft\WindowsApps`. The
 //! symlink rows of `m19_` need the symlink privilege or Developer Mode, and record a refusal.
 //! Nothing here runs a batch file. Temp directories are removed on drop and planted files
 //! explicitly, but a removal failure is only printed; whatever it leaves goes with the ephemeral

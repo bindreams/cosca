@@ -15,9 +15,11 @@ mod common;
 /// - `bare_inherited`: the name, run by a `cosca_testbin` child whose own `PATH` is `dir`, so std
 ///   keeps `posix_spawnp`'s `PATH` search.
 ///
-/// Each row starts with `route=`. `spawn` is the route std gives to `posix_spawn(p)` where it has
-/// one (glibc, macOS); `fork` is fork and `execvp`, which `pre_exec` and a set `PATH` force. The
-/// `os` and `target_env` line says whether std has `posix_spawn(p)` at all.
+/// Each row starts with `route=`, a label taken from std's source and not observed: `spawn` is the
+/// route std gives to `posix_spawn(p)` where it has one (glibc, macOS); `fork` is fork and
+/// `execvp`, which `pre_exec` and a set `PATH` force. A change in std would leave the label wrong
+/// while the outcome and marker stay measured. The `os` and `target_env` line says whether std has
+/// `posix_spawn(p)` at all.
 #[cfg(unix)]
 #[skuld::test]
 fn m18_std_routes_and_the_shell_fallback() {

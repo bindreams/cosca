@@ -87,7 +87,7 @@ pub fn subst_cwd(base: &str, child: &str) {
     let first = Subst::new(&drive, &d1).expect("map X: to <d1>");
     let set = set_cwd(OsStr::new(&sub));
     println!("removed_set={}", outcome(&set));
-    drop(first);
+    first.remove().expect("remove the mapping of X:");
     assert_eq!(free_drive(), drive, "the mapping of {drive} was removed");
     if set.is_ok() {
         spawn_rows("removed", child, &render);
@@ -106,8 +106,13 @@ pub fn subst_cwd(base: &str, child: &str) {
         spawn_rows("repointed", child, &render);
     }
     set_cwd(d.as_os_str()).expect("leave the re-pointed drive");
-    drop(second);
-    drop(first);
+    // Both removals run before either check, so one failure leaves no mapping behind that the
+    // other would have removed.
+    let second = second.remove();
+    let first = first.remove();
+    second.expect("remove the second mapping of X:");
+    first.expect("remove the first mapping of X:");
+    assert_eq!(free_drive(), drive, "the mappings of {drive} were removed");
 }
 
 /// `verbatim-null <base> <image>`: enters `\\?\<d>` and spawns `<image>` from there.

@@ -26,6 +26,7 @@ fn gfpn(path: &OsStr) -> String {
 pub(crate) struct Subst {
     drive: String,
     target: Vec<u16>,
+    removed: bool,
 }
 
 impl Subst {
@@ -47,27 +48,42 @@ impl Subst {
         Ok(Self {
             drive: drive.to_owned(),
             target,
+            removed: false,
         })
     }
-}
 
-impl Drop for Subst {
-    fn drop(&mut self) {
+    /// Removes the mapping and reports a failure. The drop guard covers an early exit; a test that
+    /// must know the mapping is gone calls this instead.
+    pub(crate) fn remove(mut self) -> Result<(), String> {
+        self.removed = true;
+        self.undefine()
+    }
+
+    fn undefine(&self) -> Result<(), String> {
         use std::os::windows::ffi::OsStrExt;
         use windows::core::PCWSTR;
         use windows::Win32::Storage::FileSystem::{DefineDosDeviceW, DDD_EXACT_MATCH_ON_REMOVE, DDD_REMOVE_DEFINITION};
         let name: Vec<u16> = OsStr::new(&self.drive).encode_wide().chain([0]).collect();
         // SAFETY: both strings are NUL-terminated and outlive the call.
-        let removed = unsafe {
+        unsafe {
             DefineDosDeviceW(
                 DDD_REMOVE_DEFINITION | DDD_EXACT_MATCH_ON_REMOVE,
                 PCWSTR(name.as_ptr()),
                 PCWSTR(self.target.as_ptr()),
             )
-        };
+        }
+        .map_err(|e| format!("{e}"))
+    }
+}
+
+impl Drop for Subst {
+    fn drop(&mut self) {
+        if self.removed {
+            return;
+        }
         // Never a panic: this runs while unwinding too, and a second panic would abort before the
         // report reaches the test.
-        if let Err(e) = removed {
+        if let Err(e) = self.undefine() {
             eprintln!("could not remove the {} mapping: {e}", self.drive);
         }
     }
