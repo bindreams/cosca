@@ -8,6 +8,9 @@
 //! # Platform requirements
 //!
 //! **Linux 5.6 or newer**, with `pidfd_open` and `openat2` not blocked by a seccomp profile.
+//! 32-bit Linux is unsupported: cosca does not compile there, because its identity handling would
+//! be wrong before Linux 6.14 (32-bit process ids and pidfs ids).
+//!
 //! Each requirement comes from a different syscall:
 //!
 //! - `pidfd_open` needs 5.3, and cosca requires a pidfd for every child it spawns. A refusal is
@@ -61,6 +64,9 @@
 // result on purpose with `_ = expr;`. Crate-level, not in `[lints]`, which would extend it to the
 // tests and test binaries.
 #![warn(clippy::let_underscore_must_use)]
+
+#[cfg(all(target_os = "linux", target_pointer_width = "32"))]
+compile_error!("cosca does not support 32-bit Linux: process and pidfs ids would be wrong before Linux 6.14; see \"Platform requirements\" in the crate docs");
 
 pub mod containment;
 pub mod elevation;
