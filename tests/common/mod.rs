@@ -29,6 +29,11 @@ pub use accept::*;
 pub mod kevent_eintr;
 
 #[cfg(windows)]
+pub mod drive_rule;
+#[cfg(windows)]
+pub mod subst;
+
+#[cfg(windows)]
 pub mod windows_env;
 
 mod locked;

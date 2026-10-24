@@ -1,5 +1,6 @@
 //! The `dump-env-block` and `spawn-dump-env-block` modes: the environment block a child receives
-//! from each Windows backend, byte for byte.
+//! from each Windows backend, byte for byte. Also `with-env-block`, which runs any mode in a block
+//! given entry by entry.
 
 use std::io::Write;
 
@@ -70,14 +71,54 @@ pub fn spawn(backend: &str, ops: &[String]) {
 /// Run `spawn-dump-env-block <dump_args>` in a child whose environment block is exactly `entries`,
 /// in order, and relay its exit code. `dump_args` is the backend and any ops, space-separated.
 pub fn spawn_with_block(dump_args: &str, entries: &[String]) {
-    let code = create_with_block(entries, &format!("spawn-dump-env-block {dump_args}")).expect("CreateProcessW");
+    let code = create_with_block(entries, &format!("spawn-dump-env-block {dump_args}"), None).expect("CreateProcessW");
     std::process::exit(code as i32);
+}
+
+/// `with-env-block [--cwd <dir>] <entries>... -- <args>...`: run `cosca_testbin <args>` in a child
+/// given exactly `entries`, in order, as its environment block, and exit with its exit code. The
+/// child runs in `<dir>`, passed as `lpCurrentDirectory`, or without `--cwd` in this process's cwd.
+/// Windows on Arm adds `PROCESSOR_ARCHITECTURE` to that block on its own.
+pub fn with_block(args: &[String]) {
+    let (cwd, args) = match args {
+        [flag, cwd, rest @ ..] if flag == "--cwd" => (Some(cwd.as_str()), rest),
+        _ => (None, args),
+    };
+    let split = args
+        .iter()
+        .position(|a| a == "--")
+        .expect("with-env-block needs `--` before the mode");
+    let line: Vec<String> = args[split + 1..].iter().map(|a| quote(a)).collect();
+    let code = create_with_block(&args[..split], &line.join(" "), cwd).expect("CreateProcessW");
+    std::process::exit(code as i32);
+}
+
+/// `arg` quoted for the command line, as the CRT and `CommandLineToArgvW` parse it back.
+fn quote(arg: &str) -> String {
+    if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
+        return arg.to_owned();
+    }
+    let mut out = String::from('"');
+    let mut backslashes = 0;
+    for c in arg.chars() {
+        if c == '\\' {
+            backslashes += 1;
+            continue;
+        }
+        let escaped = if c == '"' { backslashes * 2 + 1 } else { backslashes };
+        out.push_str(&"\\".repeat(escaped));
+        out.push(c);
+        backslashes = 0;
+    }
+    out.push_str(&"\\".repeat(backslashes * 2));
+    out.push('"');
+    out
 }
 
 /// Report whether `CreateProcessW` accepts `entries` as a child's block: `ok`, or `err=<code>`
 /// with the Win32 error code.
 pub fn try_block(entries: &[String]) {
-    match create_with_block(entries, "exit 0") {
+    match create_with_block(entries, "exit 0", None) {
         Ok(code) => {
             assert_eq!(code, 0, "the probe child failed");
             println!("ok");
@@ -86,10 +127,10 @@ pub fn try_block(entries: &[String]) {
     }
 }
 
-/// Run `cosca_testbin <args>` with an environment block of exactly `entries`, in order, and wait for
-/// its exit code. std's `Command` cannot build such a block (it dedupes and sorts), so this calls
-/// `CreateProcessW` itself.
-fn create_with_block(entries: &[String], args: &str) -> windows::core::Result<u32> {
+/// Run `cosca_testbin <args>` with an environment block of exactly `entries`, in order, in `cwd` (or
+/// this process's cwd for `None`), and wait for its exit code. std's `Command` cannot build such a
+/// block (it dedupes and sorts), so this calls `CreateProcessW` itself.
+fn create_with_block(entries: &[String], args: &str, cwd: Option<&str>) -> windows::core::Result<u32> {
     use std::os::windows::ffi::OsStrExt;
     use windows::core::PWSTR;
     use windows::Win32::Foundation::{CloseHandle, SetHandleInformation, HANDLE_FLAG_INHERIT};
@@ -100,7 +141,12 @@ fn create_with_block(entries: &[String], args: &str) -> windows::core::Result<u3
     };
 
     let mut block: Vec<u16> = entries.iter().flat_map(|e| e.encode_utf16().chain([0])).collect();
+    // An empty block is two NULs, as std writes one.
+    if block.is_empty() {
+        block.push(0);
+    }
     block.push(0);
+    let cwd: Option<Vec<u16>> = cwd.map(|c| c.encode_utf16().chain([0]).collect());
     let exe: Vec<u16> = std::env::current_exe()
         .expect("current_exe")
         .as_os_str()
@@ -137,7 +183,7 @@ fn create_with_block(entries: &[String], args: &str) -> windows::core::Result<u3
             true,
             CREATE_UNICODE_ENVIRONMENT,
             Some(block.as_ptr().cast()),
-            PCWSTR::null(),
+            cwd.as_ref().map_or(PCWSTR::null(), |c| PCWSTR(c.as_ptr())),
             &si,
             &mut pi,
         )
