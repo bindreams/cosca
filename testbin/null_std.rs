@@ -11,7 +11,7 @@ use std::ffi::OsString;
 use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 
-use windows::Win32::Foundation::{SetHandleInformation, ERROR_INVALID_HANDLE, HANDLE, HANDLE_FLAG_INHERIT};
+use windows::Win32::Foundation::{SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT};
 use windows::Win32::Storage::FileSystem::{
     GetFileType, GetFinalPathNameByHandleW, FILE_NAME_NORMALIZED, FILE_TYPE_CHAR, FILE_TYPE_DISK, FILE_TYPE_PIPE,
 };
@@ -50,7 +50,7 @@ const STRAY: &str = "stray.txt";
 /// `usestdhandles=<bool>,stdin=<kind>,stdout=<kind>,stderr=<kind>,fd3=<open|closed>,stray=<state>`.
 /// A kind is `null`, `char`, `pipe`, `disk`, `invalid` or `unknown(err=<code>)`. `<stray>` is a hex
 /// handle value, or `fd:<n>` for the handle behind CRT fd `n`; `stray` is `true` if it names a file
-/// called `stray.txt` in this process, `false` if it is not a handle here, else `error(<code>)`.
+/// called `stray.txt` in this process, `false` if it is not (a handle to) a disk file here, else `error(<code>)`.
 pub fn report(path: &str, stray: &str) {
     let mut si = STARTUPINFOW::default();
     unsafe { GetStartupInfoW(&mut si) };
@@ -102,18 +102,21 @@ fn crt_handle(fd: i32) -> Option<HANDLE> {
     (h != -1 && h != -2).then_some(HANDLE(h as *mut _))
 }
 
-/// Whether `h` names `stray.txt` in this process. `ERROR_INVALID_HANDLE` alone means the handle was
-/// not inherited; any other failure is reported, so a broken probe cannot read as "not inherited".
+/// Whether `h` names `stray.txt` in this process. A value that is not a handle here, or that is
+/// another kind of object this process made at the same value, is not the stray: `false`. A disk
+/// file that the probe cannot name is reported as `error(<code>)`, so a broken probe cannot read as
+/// "not inherited".
 fn probe_stray(h: HANDLE) -> String {
     let mut buf = vec![0u16; 1024];
     // SAFETY: `buf` is a live buffer of its length; a handle value this process does not hold is an
     // error, not UB.
     let n = unsafe { GetFinalPathNameByHandleW(h, &mut buf, FILE_NAME_NORMALIZED) } as usize;
     if n == 0 {
-        return match std::io::Error::last_os_error().raw_os_error() {
-            Some(code) if code == ERROR_INVALID_HANDLE.0 as i32 => "false".to_owned(),
-            Some(code) => format!("error({code})"),
-            None => "error(?)".to_owned(),
+        let code = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+        return if unsafe { GetFileType(h) } == FILE_TYPE_DISK {
+            format!("error({code})")
+        } else {
+            "false".to_owned()
         };
     }
     assert!(
