@@ -283,17 +283,25 @@ impl Child {
             "graceful_shutdown_tree",
             None,
         );
+        // This handle's reaps are held off from the look until the `SIGTERM` is sent; the paths that
+        // send nothing by the root's number wait the grace without it.
         #[cfg(unix)]
-        let (decided, earlier) = match call.graceful(|| self.proc.state_and_own_reap()) {
+        let held = self.proc.hold_reaps();
+        #[cfg(unix)]
+        let (decided, earlier) = match call.graceful(|| held.state_and_own_reap()) {
             crate::child::Graceful::Signal => (None, Some("the SIGTERM")),
             crate::child::Graceful::Sent { result, earlier } => (Some(result), earlier),
             crate::child::Graceful::End(e) => return Err(e),
             #[cfg(target_os = "linux")]
             crate::child::Graceful::RootThroughPidfd(why) => {
-                return Err(self.shut_down_root_through_pidfd(&call, grace, &why))
+                drop(held);
+                return Err(self.shut_down_root_through_pidfd(&call, grace, &why));
             }
             #[cfg(target_os = "macos")]
-            crate::child::Graceful::HoldersOnly(why) => return Err(self.shut_down_holders_only(&call, grace, &why)),
+            crate::child::Graceful::HoldersOnly(why) => {
+                drop(held);
+                return Err(self.shut_down_holders_only(&call, grace, &why));
+            }
         };
         let term_signal = || {
             #[cfg(unix)]
@@ -310,6 +318,8 @@ impl Child {
         };
         #[cfg(not(test))]
         let term_result = term_signal();
+        #[cfg(unix)]
+        drop(held);
 
         // Hold-and-continue ONLY for the error shapes #61's fix can produce as ORDINARY
         // outcomes — a confirmed refusal (`Error::Containment`) or a per-member-unconfirmed

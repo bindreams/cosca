@@ -68,6 +68,10 @@ mod foreign_reap_tree_tests;
 #[path = "child/root_number_matrix_tests.rs"]
 mod root_number_matrix_tests;
 
+#[cfg(all(test, unix))]
+#[path = "child/own_reap_tests.rs"]
+mod own_reap_tests;
+
 #[cfg(all(test, target_os = "linux"))]
 #[path = "child/kill_tree_view_tests.rs"]
 mod kill_tree_view_tests;
@@ -635,15 +639,16 @@ impl Child {
         };
         // One look at the root decides: one launchd holds, or one the handle cannot vouch for, is
         // signalled by identity alone, and so is a group named by the root's pid once that pid may
-        // name another process.
+        // name another process. This handle's reaps are held off from the look to the sweep's end.
+        #[cfg(unix)]
+        let held = self.proc.hold_reaps();
         #[cfg(unix)]
         if let Some(result) = self
             .tree_call(crate::containment::dispatch::TreeSignal::Kill, "kill_tree", earlier)
             .root_checked(
-                || self.proc.state_and_own_reap(),
+                || held.state_and_own_reap(),
                 || {
-                    self.proc
-                        .kill_sent()
+                    held.signal_sent(crate::signal::Sig::Kill)
                         .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper()))
                 },
             )
@@ -651,6 +656,8 @@ impl Child {
             return result;
         }
         let group_result = self.attached.hard_kill_marking(&self.tree_killed);
+        #[cfg(unix)]
+        drop(held);
         // A TreeWalk that could not walk killed nothing, and the root's death would strand the
         // descendants beyond a retry: return the error with the tree intact.
         if self.attached.hard_kill_refused_to_walk(&group_result) {
@@ -761,13 +768,16 @@ impl Child {
     /// [`Error::Unassessable`](crate::error::Error::Unassessable), with one `warn` saying so.
     pub fn terminate_tree(&self) -> Result<(), Error> {
         self.require_contained()?;
-        // One look at the root decides, as for `kill_tree`.
+        // One look at the root decides, as for `kill_tree`, and this handle's reaps are held off
+        // until the signal is sent.
+        #[cfg(unix)]
+        let held = self.proc.hold_reaps();
         #[cfg(unix)]
         if let Some(result) = self
             .tree_call(crate::containment::dispatch::TreeSignal::Term, "terminate_tree", None)
             .root_checked(
-                || self.proc.state_and_own_reap(),
-                || self.proc.signal_sent(crate::signal::Sig::Term).map_err(Error::Io),
+                || held.state_and_own_reap(),
+                || held.signal_sent(crate::signal::Sig::Term).map_err(Error::Io),
             )
         {
             return result;

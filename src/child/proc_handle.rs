@@ -81,13 +81,6 @@ impl ProcHandle {
         s.state()
     }
 
-    /// [`state`](Self::state), and whether a `Reaped` is this handle's own reap, read together.
-    #[cfg(unix)]
-    pub(crate) fn state_and_own_reap(&self) -> (crate::signal::RootState, bool) {
-        let ProcHandle::Std(s) = self;
-        s.state_and_own_reap()
-    }
-
     /// Block until the child exits.
     pub(crate) fn wait(&self) -> io::Result<ExitStatus> {
         match self {
@@ -147,6 +140,14 @@ impl ProcHandle {
         match self {
             ProcHandle::Std(s) => s.signal_sent(sig),
         }
+    }
+
+    /// Hold off this handle's own reaps until the result drops (see
+    /// [`SharedChild::hold_reaps`](crate::child::shared::SharedChild::hold_reaps)).
+    #[cfg(unix)]
+    pub(crate) fn hold_reaps(&self) -> crate::child::shared::ReapsHeld<'_> {
+        let ProcHandle::Std(s) = self;
+        s.hold_reaps()
     }
 
     /// Whether the process has exited by the time `grace` is over, read only through its pidfd: no

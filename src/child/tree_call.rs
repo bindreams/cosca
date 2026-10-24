@@ -124,7 +124,10 @@ pub(crate) enum Graceful {
 impl TreeCall<'_> {
     /// The call's one look at the root ([`root_number`]).
     pub(crate) fn root_number(&self, state: impl FnOnce() -> (RootState, bool)) -> RootNumber {
-        root_number(self.attached, self.pid, state)
+        let number = root_number(self.attached, self.pid, state);
+        #[cfg(test)]
+        crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterRootLook);
+        number
     }
 
     /// What `kill_tree` and `terminate_tree` (sync and async) do instead of signalling a tree

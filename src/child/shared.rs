@@ -300,8 +300,13 @@ impl SharedChild {
     /// the lock: a reap of ours on another thread cannot land between the two answers.
     #[cfg(unix)]
     pub(crate) fn state_and_own_reap(&self) -> (crate::signal::RootState, bool) {
+        self.state_and_own_reap_locked(&self.lock())
+    }
+
+    /// [`state_and_own_reap`](Self::state_and_own_reap), under `lock`.
+    #[cfg(unix)]
+    fn state_and_own_reap_locked(&self, lock: &Guard<'_>) -> (crate::signal::RootState, bool) {
         use crate::signal::RootState;
-        let lock = self.lock();
         if matches!(lock.state, State::E(_)) {
             return (RootState::Reaped, true);
         }
@@ -343,7 +348,14 @@ impl SharedChild {
                 "self-deadlock: this thread locked a SharedChild it already holds"
             );
             drop(owner);
-            let guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+            let guard = match self.inner.try_lock() {
+                Ok(guard) => guard,
+                Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    seams::lock_contended();
+                    self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+                }
+            };
             *self.owner.lock().unwrap_or_else(PoisonError::into_inner) = Some(me);
             Guard {
                 guard: Some(guard),
@@ -553,7 +565,12 @@ impl SharedChild {
     /// [`kill_sent`](SharedChild::kill_sent) for any `sig`.
     #[cfg(unix)]
     pub(crate) fn signal_sent(&self, sig: crate::signal::Sig) -> io::Result<crate::signal::Sent> {
-        let lock = self.lock();
+        self.signal_sent_locked(&self.lock(), sig)
+    }
+
+    /// [`signal_sent`](Self::signal_sent), under `lock`.
+    #[cfg(unix)]
+    fn signal_sent_locked(&self, lock: &Guard<'_>, sig: crate::signal::Sig) -> io::Result<crate::signal::Sent> {
         if matches!(lock.state, State::E(_)) {
             return Ok(crate::signal::Sent::Gone);
         }
@@ -567,6 +584,17 @@ impl SharedChild {
         #[cfg(target_os = "macos")]
         {
             crate::signal::via_verified_pid(self.id(), self.identity, sig)
+        }
+    }
+
+    /// Hold off this handle's reaps (every reap is taken under its lock) until the result drops:
+    /// what it reads and sends meanwhile is one step to a `wait` on another thread. Nothing that
+    /// locks the handle may be called while it is held.
+    #[cfg(unix)]
+    pub(crate) fn hold_reaps(&self) -> ReapsHeld<'_> {
+        ReapsHeld {
+            child: self,
+            lock: self.lock(),
         }
     }
 
@@ -601,6 +629,26 @@ impl SharedChild {
             Peek::Exit(reaped) => status_of(reaped).map(Some),
             Peek::Foreign(_) => Err(echild()),
         }
+    }
+}
+
+/// [`SharedChild::hold_reaps`]: the handle's lock, and what may be read and sent under it.
+#[cfg(unix)]
+pub(crate) struct ReapsHeld<'a> {
+    child: &'a SharedChild,
+    lock: Guard<'a>,
+}
+
+#[cfg(unix)]
+impl ReapsHeld<'_> {
+    /// [`SharedChild::state_and_own_reap`].
+    pub(crate) fn state_and_own_reap(&self) -> (crate::signal::RootState, bool) {
+        self.child.state_and_own_reap_locked(&self.lock)
+    }
+
+    /// [`SharedChild::signal_sent`].
+    pub(crate) fn signal_sent(&self, sig: crate::signal::Sig) -> io::Result<crate::signal::Sent> {
+        self.child.signal_sent_locked(&self.lock, sig)
     }
 }
 
