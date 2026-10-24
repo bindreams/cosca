@@ -204,7 +204,7 @@ fn run_control_echo_pid(addr: &str, tag: &str) -> ! {
     let mut b = [0u8; 1];
     loop {
         match sock.read(&mut b) {
-            Ok(0) => std::process::exit(0), // the test dropped the socket
+            Ok(0) => std::process::exit(released_exit_code()), // the test dropped the socket
             Ok(_) => sock.write_all(&b).unwrap(),
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => panic!("control socket read failed: {e}"),
@@ -212,9 +212,14 @@ fn run_control_echo_pid(addr: &str, tag: &str) -> ! {
     }
 }
 
-/// The env var that makes [`hold`] answer the test's bytes instead of leaving on the first one. Keep in
-/// sync with `ECHO_HELD_ENV` in `tests/common/member.rs`.
-const ECHO_HELD_ENV: &str = "COSCA_TEST_ECHO_HELD";
+#[path = "echo_held.rs"]
+mod echo_held;
+use echo_held::{ECHO_HELD_ENV, RELEASED_EXIT_ENV};
+
+/// The exit code of a member the test released: `0`, or [`RELEASED_EXIT_ENV`] when set.
+fn released_exit_code() -> i32 {
+    std::env::var(RELEASED_EXIT_ENV).map_or(0, |v| v.parse().expect("an integer exit code"))
+}
 
 /// Block on `sock` until the test closes it, or writes a byte. With [`ECHO_HELD_ENV`] set the member
 /// echoes every byte and leaves only when the test closes the socket, so a test that releases the

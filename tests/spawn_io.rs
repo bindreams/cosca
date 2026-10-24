@@ -1015,9 +1015,7 @@ fn windows_child_is_inside_our_job_after_spawn() {
     // test_job_handle_contains_self() is cfg(all(windows,test)) — confirms the job we hold.
     let in_job = child.test_job_handle_contains_self();
     assert!(in_job, "child must be inside our job object after spawn");
-
-    child.kill_tree().expect("kill_tree");
-    let _ = child.wait();
+    // No `kill_tree`: the subject is membership, and dropping `child` ends the tree.
 }
 
 /// `detach()` must NOT kill the tree: `KILL_ON_JOB_CLOSE` has to be cleared before the job

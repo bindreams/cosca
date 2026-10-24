@@ -7,11 +7,12 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
-/// The env var that makes the testbin's `control-block` family echo each byte the test writes
-/// instead of leaving on it, so [`assert_dead`] can tell a killed member from one that is alive.
-/// The `control-echo-pid` members echo regardless. Keep in sync with `ECHO_HELD_ENV` in
-/// `testbin/main.rs`: a rename on one side makes `assert_dead` pass for a member that exited.
-pub const ECHO_HELD_ENV: &str = "COSCA_TEST_ECHO_HELD";
+#[path = "../../testbin/echo_held.rs"]
+mod echo_held;
+/// Makes the testbin's `control-block` family echo each byte the test writes instead of leaving on
+/// it, so [`assert_dead`] can tell a killed member from one that is alive.
+pub use echo_held::ECHO_HELD_ENV;
+pub use echo_held::RELEASED_EXIT_ENV;
 
 /// Prove a member that echoes (see [`ECHO_HELD_ENV`]) is DEAD without waiting for its death: send
 /// a byte and read. A killed member refuses the write or gives EOF or a reset on the read; one a
@@ -61,6 +62,10 @@ impl Member {
     }
 }
 
+/// The exit code a `control-echo-pid` member leaves with when released, for a tree started with
+/// [`RELEASED_EXIT_ENV`] set to it. Chosen to differ from every code a kill produces.
+pub const RELEASED_EXIT_CODE: u32 = 77;
+
 /// Assert that `kill_tree` killed every member, each named for the failure message. Call it right
 /// after the kill, before any wait on the tree.
 ///
@@ -75,20 +80,41 @@ pub fn assert_members_killed(members: Vec<(Member, &str)>) {
         assert_dead(&mut member.sock, who);
     }
     #[cfg(windows)]
-    {
-        let mut exits = Vec::new();
-        for (member, who) in members {
-            drop(member.sock);
-            exits.push((member.exit, who));
-        }
-        for (exit, who) in exits {
-            assert_eq!(
-                exit.wait_for_exit_code(),
-                1,
-                "{who} must die to the kill (exit code 1), not leave on its own when released"
-            );
-        }
+    for (code, who) in release_and_wait(members) {
+        assert_eq!(
+            code, 1,
+            "{who} must die to the kill (exit code 1), not leave on its own when released"
+        );
     }
+}
+
+/// Windows: assert that no member left because it was released. For a kill whose own exit code is
+/// not known (`KILL_ON_JOB_CLOSE`): the tree was started with [`RELEASED_EXIT_ENV`] set to
+/// [`RELEASED_EXIT_CODE`], so a member the kill missed leaves on the release with that code, and
+/// a killed one with any other. Call it right after the kill, before any wait on the tree.
+#[cfg(windows)]
+pub fn assert_members_not_released(members: Vec<(Member, &str)>) {
+    for (code, who) in release_and_wait(members) {
+        assert_ne!(
+            code, RELEASED_EXIT_CODE,
+            "{who} must be killed, not leave on its own when released"
+        );
+    }
+}
+
+/// Release every member (close its socket), then wait for each process to exit and return its
+/// exit code.
+#[cfg(windows)]
+fn release_and_wait(members: Vec<(Member, &str)>) -> Vec<(u32, &str)> {
+    let mut exits = Vec::new();
+    for (member, who) in members {
+        drop(member.sock);
+        exits.push((member.exit, who));
+    }
+    exits
+        .into_iter()
+        .map(|(exit, who)| (exit.wait_for_exit_code(), who))
+        .collect()
 }
 
 #[cfg(windows)]

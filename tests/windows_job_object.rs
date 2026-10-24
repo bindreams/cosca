@@ -8,8 +8,8 @@
 //! reaped yet": `control-block`'s EOF-on-death is proof of death, never proof of life. Both
 //! members here run the testbin's `control-echo-pid` round-trip (via `spawn-grandchild-echo`),
 //! mirroring `tests/macos_fdmarker.rs`'s `Member` (alive = a real write/read round trip). Death is
-//! proven by the exit event in `kill_tree_reaps_every_descendant`, because a job kill only starts
-//! termination.
+//! proven by the exit event in `kill_tree_reaps_every_descendant` and
+//! `dropping_a_live_job_reaps_every_descendant`, because a job kill only starts termination.
 
 #[cfg(windows)]
 use std::io::{BufRead, BufReader, Read, Write};
@@ -70,31 +70,40 @@ impl Member {
         assert_eq!(n, 1, "{who} (pid {}) must still be alive and echoing", self.pid);
         assert_eq!(&b, b"x", "{who} echoed {b:?} instead of the byte sent");
     }
-
-    /// Dead, proven by [`common::assert_dead`]: a write failure, or EOF or a reset on the read.
-    fn assert_dead(&mut self, who: &str) {
-        common::assert_dead(&mut self.sock, &format!("{who} (pid {})", self.pid));
-    }
 }
 
 #[cfg(windows)]
-/// An exit watch on `member` for [`assert_killed`], opened while the member is alive. It shares
-/// `member`'s socket, which stays open until [`assert_killed`] releases it.
+/// An exit watch on `member` for [`assert_killed`] and [`assert_not_released`], opened while the
+/// member is alive. It shares `member`'s socket, which stays open until [`release`] closes it.
 fn watch(member: &Member) -> common::Member {
     common::Member::new(member.sock.try_clone().expect("clone the control socket"), member.pid)
 }
 
 #[cfg(windows)]
-/// Assert that the kill that just ran killed every watched member. `TerminateJobObject` and the
-/// close of the last job handle only START termination, so a write/read probe could still be
-/// answered by a member about to die. Releasing `held` (the test's own sockets, which keep the
-/// members' peers open) and waiting for each exit code ends either way: a member the kill missed
+/// Assert that the kill that just ran killed every watched member. `TerminateJobObject` only
+/// STARTS termination, so a write/read probe could still be answered by a member about to die.
+/// Releasing `held` and waiting for each exit code ends either way: a member the kill missed
 /// leaves on the release with code `0`, and the assertion on code `1` fails.
 fn assert_killed(watched: Vec<(common::Member, &str)>, held: [&Member; 2]) {
+    release(held);
+    common::assert_members_killed(watched);
+}
+
+#[cfg(windows)]
+/// [`assert_killed`] for a kill whose exit code is not known (`KILL_ON_JOB_CLOSE`): the tree was
+/// started with `COSCA_TEST_RELEASED_EXIT` set (see [`spawn_contained_tree`]), so a member the kill
+/// missed leaves on the release with that code, and the assertion is that none did.
+fn assert_not_released(watched: Vec<(common::Member, &str)>, held: [&Member; 2]) {
+    release(held);
+    common::assert_members_not_released(watched);
+}
+
+#[cfg(windows)]
+/// Close the test's own sockets, which keep the members' peers open.
+fn release(held: [&Member; 2]) {
     for member in held {
         let _ = member.sock.shutdown(std::net::Shutdown::Both);
     }
-    common::assert_members_killed(watched);
 }
 
 #[cfg(windows)]
@@ -220,7 +229,10 @@ fn spawn_contained_tree() -> (Suspended, cosca::Job, Member, Member) {
     let mut root = Suspended::spawn(
         env!("CARGO_BIN_EXE_cosca_testbin"),
         &["spawn-grandchild-echo", &addr],
-        &[(common::GC_PID_ADDR_ENV, &report_addr)],
+        &[
+            (common::GC_PID_ADDR_ENV, &report_addr),
+            (common::RELEASED_EXIT_ENV, &common::RELEASED_EXIT_CODE.to_string()),
+        ],
     );
     // Step 1 (spawn suspended) already happened above. Step 2: assign, while still frozen.
     let job = cosca::Job::assign(root.borrow_process()).expect("Job::assign");
@@ -325,10 +337,15 @@ fn dropping_a_live_job_reaps_every_descendant() {
     root_member.assert_alive("the root, before drop");
     grand_member.assert_alive("the grandchild, before drop");
 
+    // Opened while both are alive and held; the closing of the last job handle only STARTS
+    // termination, and its exit code is not relied on.
+    let watched = vec![
+        (watch(&root_member), "the root, after dropping the Job"),
+        (watch(&grand_member), "the grandchild, after dropping the Job"),
+    ];
     drop(job);
 
-    root_member.assert_dead("the root, after dropping the Job");
-    grand_member.assert_dead("the grandchild, after dropping the Job");
+    assert_not_released(watched, [&root_member, &grand_member]);
     drop(root);
 }
 

@@ -33,8 +33,8 @@ fn public_surface_is_usable() {
 
 /// Containment public-surface smoke: `.contain()` on a supported host must
 /// report a mechanism other than `None`. The test spawns the simplest possible
-/// child (`exit 0`), asserts the achieved containment, kills the tree, and
-/// waits — all via the public API. The full tree-death proof lives in
+/// child (`exit 0`), asserts the achieved containment, and waits for the child to
+/// exit — all via the public API. The full tree-death proof lives in
 /// `spawn_io.rs`; this is just the surface reachability check.
 #[cfg(any(unix, windows))]
 #[skuld::test]
@@ -71,8 +71,7 @@ fn containment_smoke() {
         child.containment()
     );
 
-    child.kill_tree().expect("kill_tree");
-    let _ = child.wait();
+    child.wait().expect("reap the child that exited by itself");
 }
 
 #[skuld::test]
