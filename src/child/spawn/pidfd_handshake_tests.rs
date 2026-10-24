@@ -1465,7 +1465,8 @@ fn a_failed_first_look_followed_by_a_real_teardown_is_reaped() {
     drop(cat);
 }
 
-/// The same for a first look that saw the child uncollected: a later `Reaped` is the teardown's own.
+/// The same for a first look that saw the child uncollected: a later `Reaped` is the teardown's
+/// own.
 ///
 /// Mutant: the pass-through arm of `FirstLook::fate` maps a fate other than `Gone` to `Unknown` or
 /// `Collected`.
@@ -1476,8 +1477,8 @@ fn an_uncollected_first_look_leaves_a_real_teardown_reaped() {
     drop(cat);
 }
 
-/// A first look that found the child collected makes only a `Gone` `Collected`: a teardown that then
-/// finds the child live and reaps it answers `Reaped`.
+/// A first look that found the child collected makes only a `Gone` `Collected`: a teardown that
+/// then finds the child live and reaps it answers `Reaped`.
 ///
 /// Mutant: a collected first look makes every later fate `Collected`.
 #[skuld::test]
@@ -1487,8 +1488,8 @@ fn a_collected_first_look_followed_by_a_live_child_is_not_collected() {
     drop(cat);
 }
 
-/// An elevation front whose first look failed is taken to be there, and sent nothing; a foreign reap
-/// the front arm then finds blames nobody and names no time: `Unknown`.
+/// An elevation front whose first look failed is taken to be there, and sent nothing; a foreign
+/// reap the front arm then finds blames nobody and names no time: `Unknown`.
 ///
 /// Mutant: the front arm leaves such a `Gone` as `Gone` (or maps it to `Collected`).
 #[skuld::test]
@@ -1761,8 +1762,8 @@ fn conclude_answers_every_remaining_pair() {
 }
 
 /// Every `(spawned, outcome)` pair says whether its child is reaped, or will be. Only a pair whose
-/// failed `spawn` is tokio's, with no pidfd to tear the child down through, leaves one tokio dropped
-/// unreaped: the std child it wraps reaps nothing.
+/// failed `spawn` is tokio's, with no pidfd to tear the child down through, leaves one tokio
+/// dropped unreaped: the std child it wraps reaps nothing.
 ///
 /// Mutant: any of the three `Uncovered` pairs answers `Covered`, or any `Covered` pair `Uncovered`.
 #[skuld::test]

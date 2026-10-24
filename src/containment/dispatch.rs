@@ -71,8 +71,8 @@ impl Prepared {
     }
 
     /// End the placement exchange of a spawn that failed with no handle left on its child — tokio
-    /// can drop one it forked — and say what became of that child. Without a leaf, Linux's `reaping`
-    /// decides ([`AbandonedChild::Ended`], [`AbandonedChild::Described`] or
+    /// can drop one it forked — and say what became of that child. Without a leaf, Linux's
+    /// `reaping` decides ([`AbandonedChild::Ended`], [`AbandonedChild::Described`] or
     /// [`AbandonedChild::MaybeUnreaped`]); elsewhere nothing can tell, so
     /// [`AbandonedChild::MaybeUnreachable`]. A child that is an elevation `front` is sent no signal
     /// of its own (see [`CgroupLeaf::abandon_before_verdict`]); `handshake` is the pidfd its

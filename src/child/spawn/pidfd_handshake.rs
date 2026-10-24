@@ -833,7 +833,7 @@ pub(crate) enum Reaping {
 
 /// The [`Reaping`] of `conclude(spawned, outcome, ..)`, but for a front it leaves running, which
 /// [`conclude_noting`] marks [`Reaping::Described`]. Spelled out for every pair, so a new outcome
-/// must decide.
+/// must decide. `(Err, Unwatched)` never happens: only a spawn that returned a child is watched.
 fn reaping_of<T>(spawned: &io::Result<T>, outcome: &Outcome) -> Reaping {
     match (spawned, outcome) {
         (
@@ -850,18 +850,16 @@ fn reaping_of<T>(spawned: &io::Result<T>, outcome: &Outcome) -> Reaping {
 enum FirstLook {
     /// Already collected: by `std`'s failed spawn, or by someone else; cosca cannot tell.
     Collected,
-    /// Not collected: nobody in cosca, `std` or tokio collects it after this, so a later `Gone` is a
-    /// foreign reap that was shown.
+    /// Not collected: nobody in cosca, `std` or tokio collects it after this, so a later `Gone` is
+    /// a foreign reap that was shown.
     Uncollected,
     /// The look failed and showed nothing.
     Unseen,
 }
 
 impl FirstLook {
-    /// `fate`, a teardown's answer after this look. A `Gone` is `Collected` only if the first look
-    /// found the child collected: the one case where a collector that is not "someone else" is
-    /// possible and nothing shows otherwise. After a failed look, a `Gone` shows no time and no
-    /// collector, so it is `Unknown`.
+    /// Maps a teardown's `fate` given this look: `Gone` is `Collected` after a collected first
+    /// look, `Unknown` after a failed one (it then shows no time and no collector).
     fn fate(self, fate: ChildFate) -> ChildFate {
         match (self, fate) {
             (FirstLook::Collected, ChildFate::Gone) => ChildFate::Collected,
@@ -897,10 +895,9 @@ fn conclude_noting<T: Spawned>(
     let opened_teardown = |pidfd: OwnedFd, error: Error| {
         use crate::wait::exit_only::{peek, Peek, Target};
         use std::os::fd::AsFd as _;
-        // A child std collected never ran the program, and one collected at this look is taken for
-        // it: a foreign reaper's collection looks the same, so a front so collected is noted
-        // nothing. A peek that fails tells nothing, so the child is taken for a front still there,
-        // which is sent nothing.
+        // A child collected at this look is taken to be one std collected, which never ran the
+        // program: a foreign reap looks the same, so such a front is noted nothing. A failed peek is
+        // taken for a front still there, which is sent nothing.
         let look = match peek(&Target::PidFd(pidfd.as_fd())) {
             Ok(Peek::Foreign(_)) => FirstLook::Collected,
             Ok(_) => FirstLook::Uncollected,

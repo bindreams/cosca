@@ -1,8 +1,5 @@
-//! A tokio spawn whose program cannot be executed does not blame a foreign reaper for the child.
-//!
-//! tokio can also fail a spawn after `std`'s succeeded, so its error does not prove that the
-//! program never ran, and the error may say so. The child of a failed exec is gone because the
-//! spawn itself collected it, not because someone else did.
+//! A tokio spawn whose program cannot be executed does not blame a foreign reaper: the spawn itself
+//! collected the child.
 
 #[cfg(all(feature = "tokio", target_os = "linux"))]
 #[path = "common/mod.rs"]
@@ -181,7 +178,8 @@ async fn a_failed_tokio_exec_without_a_leaf_warns_of_no_abandoned_child() {
     }
 }
 
-/// [`a_failed_tokio_exec_blames_no_foreign_reaper`] in a cgroup leaf, which the failed spawn removes.
+/// [`a_failed_tokio_exec_blames_no_foreign_reaper`] in a cgroup leaf, which the failed spawn
+/// removes.
 ///
 /// Mutant: as there.
 #[cfg(all(feature = "tokio", target_os = "linux"))]

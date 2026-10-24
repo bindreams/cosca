@@ -85,9 +85,7 @@ pub(crate) enum Foreign {
 impl Foreign {
     /// What became of a child this evidence shows is not this process's to reap: it has exited, and
     /// someone else holds or has collected its exit. That includes a zombie launchd holds. Every path
-    /// that maps this evidence to a fate uses this, so one situation has one fate. (One path then
-    /// answers [`Collected`](ChildFate::Collected) for evidence a failed spawn's first look shows,
-    /// where `std` may have collected the child: `conclude` in `pidfd_handshake`.)
+    /// that maps this evidence to a fate uses this, so one situation has one fate:
     ///
     /// - `kill_delivered`: cosca's kill was delivered, so the child is [`Killed`](ChildFate::Killed):
     ///   dead or dying, its exit not collected by cosca.

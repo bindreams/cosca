@@ -862,7 +862,8 @@ mod frozen_attach {
 /// With no leaf, the handshake's `Reaping` decides what became of an abandoned child; each answer
 /// is its own, and a front it left running is not one that ended.
 ///
-/// Mutant: `Described` maps to `Ended` (or `Uncovered` to `Ended`, or `Covered` to `MaybeUnreaped`).
+/// Mutant: `Described` maps to `Ended` (or `Uncovered` to `Ended`, or `Covered` to
+/// `MaybeUnreaped`).
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn the_handshakes_reaping_decides_an_abandoned_child_with_no_leaf() {

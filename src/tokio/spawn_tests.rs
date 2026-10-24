@@ -335,8 +335,8 @@ async fn a_post_fork_tokio_failure_of_a_child_that_could_not_open_its_pidfd_warn
 /// could not watch: the handle tokio returned reaps the child, so nothing is warned, and the child
 /// is reaped.
 ///
-/// Mutant: a returned handle with an unwatched child answers `Uncovered`, and warns the child may be
-/// left unreaped.
+/// Mutant: a returned handle with an unwatched child answers `Uncovered`, and warns the child may
+/// be left unreaped.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn a_post_fork_tokio_failure_of_an_unwatched_child_is_left_to_tokios_handle() {
@@ -1153,8 +1153,8 @@ async fn a_failed_exec_may_have_started_the_program() {
     let mut cmd = Command::new();
     cmd.args(["cosca-no-such-program-142"]);
     let (err, fate) = expect_may_have_started_with(cmd.spawn().expect_err("a missing program fails the spawn"));
-    // Linux's handshake finds the child whose exec failed already collected (`std`'s failed
-    // spawn collects it; no collector is named). Elsewhere nothing holds it, so it may be running.
+    // Linux's handshake finds the child already collected. Elsewhere nothing holds it, so it may be
+    // running.
     let expected = if cfg!(target_os = "linux") {
         ChildFate::Collected
     } else {
