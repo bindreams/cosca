@@ -494,8 +494,10 @@ fn m10_the_consent_route_child_runs_in_lp_directory(#[fixture(elevation)] _group
     let report = std::fs::read_to_string(&report).expect("the child's report");
     let dump = std::fs::read(&env_dump).expect("the child's environment dump");
     let child_entries: Vec<String> = dump
-        .chunks_exact(2)
-        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| u16::from_le_bytes(*b))
         .collect::<Vec<u16>>()
         .split(|&u| u == 0)
         .take_while(|e| !e.is_empty())
