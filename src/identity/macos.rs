@@ -90,6 +90,10 @@ pub(crate) enum ReadPurpose {
     SecondPeek,
     /// The re-read after an exit watch is armed on a pid: is it still the child?
     Arm,
+    /// Whether a pid whose unique id is not known yet was forked by this process.
+    Origin,
+    /// A tracer on the chain that holds a child: which process it is, and who holds it.
+    Link,
 }
 
 /// The pid launchd runs as, the parent of every orphan.
@@ -252,6 +256,104 @@ pub(crate) fn held_by(pid: RawPid, expected: u64, purpose: ReadPurpose) -> Held 
     }
 }
 
+/// What [`origin`] saw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Origin {
+    /// This process forked it: its parent is this process, or was when a tracer attached.
+    /// `parent` holds it now: this process, a tracer, or launchd (a child whose tracer exited while
+    /// the child was exiting).
+    Ours { parent: RawPid },
+    /// Another process's, or not the same process from one read to the next.
+    NotOurs,
+    /// No process has the pid.
+    Gone,
+    /// A unique-id read failed with this errno.
+    Refused(i32),
+    /// The `kinfo_proc` read was refused.
+    Unreadable,
+}
+
+/// Whether the process `pid` names was forked by this process, for a pid whose unique id is not
+/// known yet. A tracer takes a child from its parent: the child's `p_ppid` names the tracer, and
+/// `p_oppid` keeps the parent it had at the attach (xnu `mach_process.c`, `PT_ATTACH`). So the child
+/// is ours when either names this process and its unique id is above this process's own, which
+/// excludes a stale `p_oppid` left by an earlier holder of this process's pid: ids are allocated in
+/// increasing order and never reused, so only a process created after this one has a higher one.
+/// The `kinfo_proc` read is between two unique-id reads, as in [`held_by`].
+pub(crate) fn origin(pid: RawPid) -> Origin {
+    let own = match own_unique_id() {
+        Ok(own) => own,
+        Err(errno) => return Origin::Refused(errno),
+    };
+    let unique = match uniq_info(pid, ReadPurpose::Origin) {
+        UniqRead::Found(info) => info.unique_id,
+        UniqRead::Gone => return Origin::Gone,
+        UniqRead::Refused(errno) => return Origin::Refused(errno),
+    };
+    let info = match kinfo::kinfo(pid) {
+        Resolved::Found(info) => info,
+        Resolved::Gone => return Origin::Gone,
+        Resolved::Unknown => return Origin::Unreadable,
+    };
+    match uniq_info(pid, ReadPurpose::Origin) {
+        UniqRead::Found(again) if again.unique_id == unique => {}
+        UniqRead::Found(_) => return Origin::NotOurs,
+        UniqRead::Gone => return Origin::Gone,
+        UniqRead::Refused(errno) => return Origin::Refused(errno),
+    }
+    let me = std::process::id() as libc::pid_t;
+    if unique > own && (info.kp_proc.p_oppid == me || info.e_ppid() == me) {
+        Origin::Ours {
+            parent: info.e_ppid() as RawPid,
+        }
+    } else {
+        Origin::NotOurs
+    }
+}
+
+/// What [`link`] saw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Link {
+    /// The process with unique id `unique`. `parent` holds it now; `at_attach` is its parent when a
+    /// tracer attached, or 0 when none did.
+    Found {
+        unique: u64,
+        parent: RawPid,
+        at_attach: RawPid,
+    },
+    /// No process has the pid, or another took it between the reads.
+    Gone,
+    /// A unique-id read failed with this errno.
+    Refused(i32),
+    /// The `kinfo_proc` read was refused.
+    Unreadable,
+}
+
+/// The process `pid` names on a chain of tracers, and its parents: who holds it now, and who held
+/// it when a tracer attached. The `kinfo_proc` read is between two unique-id reads, as in
+/// [`held_by`].
+pub(crate) fn link(pid: RawPid) -> Link {
+    let unique = match uniq_info(pid, ReadPurpose::Link) {
+        UniqRead::Found(info) => info.unique_id,
+        UniqRead::Gone => return Link::Gone,
+        UniqRead::Refused(errno) => return Link::Refused(errno),
+    };
+    let info = match kinfo::kinfo(pid) {
+        Resolved::Found(info) => info,
+        Resolved::Gone => return Link::Gone,
+        Resolved::Unknown => return Link::Unreadable,
+    };
+    match uniq_info(pid, ReadPurpose::Link) {
+        UniqRead::Found(again) if again.unique_id == unique => Link::Found {
+            unique,
+            parent: info.kp_proc.p_oppid as RawPid,
+            at_attach: info.kp_proc.p_oppid as RawPid,
+        },
+        UniqRead::Found(_) | UniqRead::Gone => Link::Gone,
+        UniqRead::Refused(errno) => Link::Refused(errno),
+    }
+}
+
 /// Why a `proc_pidinfo` read by pid failed: `ESRCH`, or any other errno.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReadErr {
@@ -345,8 +447,12 @@ pub(crate) mod ppid_fault {
 
     use super::ReadErr;
 
+    /// What [`force_ppid_with`] answers.
+    type Reads = Box<dyn FnMut() -> Result<u32, ReadErr>>;
+
     thread_local! {
         static FORCED: RefCell<Vec<Result<u32, ReadErr>>> = const { RefCell::new(Vec::new()) };
+        static READS: RefCell<Option<Reads>> = const { RefCell::new(None) };
     }
 
     #[must_use = "dropping this immediately disarms the force; bind it for the probe's duration"]
@@ -358,17 +464,34 @@ pub(crate) mod ppid_fault {
         Forced(())
     }
 
+    /// While the guard lives, every parent read on this thread that no queued force answers
+    /// answers what `reads` does at that read.
+    pub(crate) fn force_ppid_with(reads: impl FnMut() -> Result<u32, ReadErr> + 'static) -> ForcedReads {
+        READS.with(|r| *r.borrow_mut() = Some(Box::new(reads)));
+        ForcedReads(())
+    }
+
     impl Drop for Forced {
         fn drop(&mut self) {
             FORCED.with(|f| f.borrow_mut().clear());
         }
     }
 
+    #[must_use = "the reads are real again as soon as the guard is dropped"]
+    pub(crate) struct ForcedReads(());
+
+    impl Drop for ForcedReads {
+        fn drop(&mut self) {
+            READS.with(|r| r.borrow_mut().take());
+        }
+    }
+
     pub(super) fn take() -> Option<Result<u32, ReadErr>> {
-        FORCED.with(|f| {
+        let queued = FORCED.with(|f| {
             let mut forced = f.borrow_mut();
             (!forced.is_empty()).then(|| forced.remove(0))
-        })
+        });
+        queued.or_else(|| READS.with(|r| r.borrow_mut().as_mut().map(|reads| reads())))
     }
 }
 
@@ -611,3 +734,7 @@ pub(crate) mod fault {
 #[cfg(test)]
 #[path = "macos/ppid_tests.rs"]
 mod ppid_tests;
+
+#[cfg(test)]
+#[path = "macos/origin_tests.rs"]
+mod origin_tests;

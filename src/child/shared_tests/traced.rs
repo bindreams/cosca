@@ -129,3 +129,112 @@ fn a_zombie_a_tracer_holds_is_running_until_the_hand_back(#[fixture(tracer_group
         assert!(status.success(), "{status:?}");
     });
 }
+
+/// The live blocker [`tracer::spawn_tracee`] makes, its stdin (closing it ends the tracee), and its
+/// unique id.
+fn tracee_with_unique() -> (crate::Child, std::io::PipeWriter, u64) {
+    let (mut tracee, _) = tracer::spawn_tracee(tracer::Tracee::Plain);
+    let stdin = tracee.stdin().expect("the tracee's stdin is piped");
+    let unique = match uniq_info(tracee.id().pid(), ReadPurpose::Adopt) {
+        UniqRead::Found(info) => info.unique_id,
+        other => panic!("the tracee's unique id: {other:?}"),
+    };
+    (tracee, stdin, unique)
+}
+
+/// A real tracer that attaches while the wait is blocked: the attach's `SIGSTOP` wakes the wait
+/// through the child's `NOTE_SIGNAL`, before anything else happens to the child. The wait then
+/// watches the tracer; the child's exit and the tracer's hand-back end it as `Reapable`.
+///
+/// Mutant: the wait registers no `NOTE_SIGNAL` on the child.
+#[skuld::test]
+fn a_tracer_that_attaches_during_a_wait_wakes_it(#[fixture(tracer_group)] _group: &Group) {
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    use crate::wait::backend::await_reapable_on;
+    let (tracee, stdin, unique) = tracee_with_unique();
+    let pid = tracee.id().pid();
+    let pending = RefCell::new(Some(tracer::start(Mode::Auto)));
+    let helper = Rc::new(RefCell::new(None));
+    let stdin = RefCell::new(Some(stdin));
+    let attach_woke = Rc::new(Cell::new(None));
+    let kq = Rc::new(nix::sys::event::Kqueue::new().expect("kqueue"));
+    let _rounds = super::macos::on_rounds(&kq, {
+        let (helper, attach_woke) = (Rc::clone(&helper), Rc::clone(&attach_woke));
+        move |round, kq| match round {
+            0 => {
+                let mut attached = pending.borrow_mut().take().expect("the helper").attach_unheld(pid);
+                assert_eq!(attached.recv(), Report::Attached);
+                *helper.borrow_mut() = Some(attached);
+                attach_woke.set(Some(test_hooks::event_pending(kq)));
+                attach_woke.get() == Some(true)
+            }
+            1 => {
+                drop(stdin.borrow_mut().take());
+                true
+            }
+            _ => true,
+        }
+    });
+    let waited = await_reapable_on(&kq, pid, Some(unique), None).expect("wait");
+    assert_eq!(attach_woke.get(), Some(true), "the attach's SIGSTOP must wake the wait");
+    assert_eq!(waited, Waited::Reapable);
+    let mut helper = helper.borrow_mut().take().expect("the helper attached");
+    assert_eq!(helper.recv(), Report::Reaped);
+    drop(helper);
+    let status = tracee.wait().expect("the handed-back zombie is ours to reap");
+    assert!(status.success(), "{status:?}");
+}
+
+/// A child whose real tracer is itself traced by a second one: the wait walks the chain and
+/// registers the second tracer too, whose signals then wake it. A `SIGCONT` to the second tracer,
+/// which leaves a running process running, shows the registration. The child's exit and its
+/// tracer's hand-back end the wait as `Reapable`.
+///
+/// Mutant: the walk stops at the child's tracer.
+#[skuld::test]
+fn a_wait_on_a_child_whose_tracer_is_traced_watches_that_tracers_tracer(#[fixture(tracer_group)] _group: &Group) {
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    use crate::wait::backend::await_reapable_on;
+    let (tracee, stdin, unique) = tracee_with_unique();
+    let pid = tracee.id().pid();
+    let mut inner = tracer::start(Mode::Auto).attach_unheld(pid);
+    assert_eq!(inner.recv(), Report::Attached);
+    let mut outer = tracer::start(Mode::Auto).attach_unheld(inner.helper_pid());
+    assert_eq!(outer.recv(), Report::Attached);
+    let outer_pid = outer.helper_pid();
+    let stdin = RefCell::new(Some(stdin));
+    let watched = Rc::new(Cell::new(None));
+    let kq = Rc::new(nix::sys::event::Kqueue::new().expect("kqueue"));
+    let _rounds = super::macos::on_rounds(&kq, {
+        let watched = Rc::clone(&watched);
+        move |round, kq| match round {
+            0 => {
+                test_hooks::send_signal(outer_pid, libc::SIGCONT);
+                watched.set(Some(test_hooks::event_pending(kq)));
+                watched.get() == Some(true)
+            }
+            1 => {
+                drop(stdin.borrow_mut().take());
+                true
+            }
+            _ => true,
+        }
+    });
+    let waited = await_reapable_on(&kq, pid, Some(unique), None).expect("wait");
+    assert_eq!(
+        watched.get(),
+        Some(true),
+        "the wait must watch the signals of the tracer's own tracer"
+    );
+    assert_eq!(waited, Waited::Reapable);
+    assert_eq!(inner.recv(), Report::Reaped);
+    // The inner helper exits first, while the outer one still traces it and so hands it back.
+    drop(inner);
+    drop(outer);
+    let status = tracee.wait().expect("the handed-back zombie is ours to reap");
+    assert!(status.success(), "{status:?}");
+}
