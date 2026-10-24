@@ -52,7 +52,7 @@ mod child_tests;
 #[path = "child/pid_reuse_tests.rs"]
 mod pid_reuse_tests;
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, unix, any()))]
 #[path = "child/foreign_reap_tree_tests.rs"]
 mod foreign_reap_tree_tests;
 

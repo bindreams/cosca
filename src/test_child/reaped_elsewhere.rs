@@ -1,3 +1,4 @@
+#![allow(dead_code, reason = "throwaway probe")]
 //! Fixtures for a contained root reaped behind its handle's back, and the record its tree ops log
 //! for it.
 
