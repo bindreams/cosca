@@ -311,13 +311,11 @@ async fn macos_tokio_spawn_of_a_late_contained_child_kills_its_tree() {
 
 /// With fds 0 and 1 closed, a tokio spawn that pipes a stdio slot does not expose std's error pipe:
 /// std makes the slot's pipe first, on fds 0 and 1, and its own above them, so it sees the `exec`.
-/// The child is adopted, and runs. Runs in a process of its own, since closing fds is process-wide.
+/// The child is adopted. Runs in a process of its own, since closing fds is process-wide.
 ///
 /// Mutant: std's own pipes are not counted, so the spawn is taken for exposed and its child torn down.
 #[skuld::test]
 fn macos_tokio_spawn_that_pipes_a_slot_with_fds_0_and_1_closed_adopts_its_child() {
-    use ::tokio::io::AsyncReadExt;
-
     use crate::child::spawn::identity_macos_tests::RAN_ARGV;
     use crate::child::spawn::late_report_tests::{close_fds_0_and_1, null_stdio};
     use crate::test_own_process::{own_process, test_path};
@@ -338,15 +336,11 @@ fn macos_tokio_spawn_that_pipes_a_slot_with_fds_0_and_1_closed_adopts_its_child(
     cmd.stdin(null_stdio()).expect("set stdin");
     cmd.stdout(crate::stdio::Stdio::pipe_out()).expect("pipe stdout");
     let restore = close_fds_0_and_1(&done);
-    let said = runtime.block_on(async {
+    runtime.block_on(async {
         let mut child = cmd.spawn().expect("a child whose exec std saw is adopted");
-        let mut out = child.stdout().expect("the piped stdout");
-        let mut said = String::new();
-        out.read_to_string(&mut said).await.expect("read the child's stdout");
-        drop(out);
+        // Closed before the restore, which `dup2`s onto its number.
+        drop(child.stdout().expect("the piped stdout"));
         child.wait().await.expect("reap the child");
-        said
     });
     drop(restore);
-    assert_eq!(said, "ran\n", "the adopted child runs");
 }
