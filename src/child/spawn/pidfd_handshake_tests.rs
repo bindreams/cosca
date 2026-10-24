@@ -1317,6 +1317,60 @@ fn a_collected_front_is_no_front() {
     assert!(!err.to_string().contains("what sudo left"), "{err}");
 }
 
+/// A front tokio dropped after it ran the program is left running, and the failure it returns says
+/// so: it is `Described`, not a child that ended.
+///
+/// Mutant: the front arm leaves the reaping `Covered`, which `Prepared::abandon_before_verdict`
+/// answers `Ended`.
+#[skuld::test]
+fn a_dropped_front_is_described_not_covered() {
+    use super::Reaping;
+
+    let (mut cat, pidfd) = cat_with_pidfd();
+    let (failure, reaping) = super::conclude_noting(
+        Err::<NoChild, _>(std::io::Error::other("tokio failed")),
+        Outcome::Opened(pidfd),
+        sudo_front(),
+    );
+    failure.err().expect("the spawn fails");
+    assert_eq!(reaping, Reaping::Described);
+    drop(cat.stdin.take());
+    cat.wait().expect("collect the front");
+}
+
+/// A child that ended, whether torn down through its pidfd or already collected, is `Covered`,
+/// front or not: only a front left running is `Described`.
+///
+/// Mutant: the arm for a front that std collected, or the arm for a child that is not a front,
+/// answers `Described`.
+#[skuld::test]
+fn a_child_that_ended_is_covered_not_described() {
+    use super::Reaping;
+
+    // Torn down through its pidfd.
+    let (cat, pidfd) = cat_with_pidfd();
+    let (failure, reaping) = super::conclude_noting(
+        Err::<NoChild, _>(std::io::Error::other("tokio failed")),
+        Outcome::Opened(pidfd),
+        super::LeftFront::NotAFront,
+    );
+    failure.err().expect("the spawn fails");
+    assert_eq!(reaping, Reaping::Covered, "not a front");
+    drop(cat);
+
+    // A front that std had collected is no front.
+    let (mut cat, pidfd) = cat_with_pidfd();
+    drop(cat.stdin.take());
+    cat.wait().expect("collect the child");
+    let (failure, reaping) = super::conclude_noting(
+        Err::<NoChild, _>(std::io::Error::other("exec failed")),
+        Outcome::Opened(pidfd),
+        sudo_front(),
+    );
+    failure.err().expect("the spawn fails");
+    assert_eq!(reaping, Reaping::Covered, "a collected front");
+}
+
 /// `conclude` on a failed tokio-style spawn whose child is a live `cat`, with the peeks `looks`
 /// answering in order (conclude's own first, then the teardown's), as a foreign reaper between
 /// them would. The `cat` is cleaned up here.

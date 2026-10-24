@@ -961,7 +961,7 @@ fn abandoned_fate(child: crate::containment::AbandonedChild) -> ChildFate {
     use crate::containment::AbandonedChild;
 
     match child {
-        AbandonedChild::Ended | AbandonedChild::MaybeUnreaped => {
+        AbandonedChild::Ended | AbandonedChild::Described | AbandonedChild::MaybeUnreaped => {
             debug_assert!(false, "only Linux abandons a child as `{child:?}`");
             ChildFate::Unknown
         }
@@ -985,7 +985,7 @@ fn warn_for_abandoned(child: crate::containment::AbandonedChild, error: &Error) 
     use crate::containment::AbandonedChild;
 
     let consequence = match child {
-        AbandonedChild::Front(_) | AbandonedChild::Ended => return,
+        AbandonedChild::Front(_) | AbandonedChild::Ended | AbandonedChild::Described => return,
         AbandonedChild::MaybeUnreaped => {
             "the child exits before `exec`; if its spawn did not collect it, it is left unreaped, since \
              nothing names it and nothing holds its pid"
@@ -1052,6 +1052,8 @@ fn abandoned_after_handshake(
         AbandonedChild::Front(fate) => (fate.note(error, front, None), front_child_fate(fate)),
         // Out of the leaf's reach, and not known to be dead.
         AbandonedChild::MaybeUnreachable => (error, ChildFate::Running { id: None }),
-        AbandonedChild::Ended | AbandonedChild::MaybeUnreaped => (error, ChildFate::Unknown),
+        AbandonedChild::Ended | AbandonedChild::Described | AbandonedChild::MaybeUnreaped => {
+            (error, ChildFate::Unknown)
+        }
     })
 }

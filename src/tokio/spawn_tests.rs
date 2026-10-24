@@ -321,20 +321,29 @@ fn the_unreachable_child_warning_is_every_time() {
     }
 }
 
-/// `AbandonedChild::Ended` means the child is answered for (ended and reaped, or will be, or
-/// described by the spawn's error) — not a degraded guarantee, so it logs nothing at all.
+/// `AbandonedChild::Ended` (nothing of the child runs, and it is reaped or will be) and
+/// `AbandonedChild::Described` (a front left running, which the spawn's error notes) are not a
+/// degraded guarantee, so each logs nothing at all.
+///
+/// Mutant: either arm of `warn_for_abandoned` warns.
 #[skuld::test]
-fn ended_abandoned_child_logs_nothing() {
+fn answered_for_abandoned_children_log_nothing() {
     use crate::containment::AbandonedChild;
 
     crate::log_capture::install();
     let error = Error::Io(std::io::Error::other("cosca-abandoned-ended-probe-3a17"));
     let marker = "cosca-abandoned-ended-probe-3a17";
 
-    let mark = crate::log_capture::mark();
-    super::warn_for_abandoned(AbandonedChild::Ended, &error);
+    for child in [AbandonedChild::Ended, AbandonedChild::Described] {
+        let mark = crate::log_capture::mark();
+        super::warn_for_abandoned(child, &error);
 
-    assert_eq!(crate::log_capture::levels_since(mark, marker), Vec::<log::Level>::new());
+        assert_eq!(
+            crate::log_capture::levels_since(mark, marker),
+            Vec::<log::Level>::new(),
+            "{child:?}"
+        );
+    }
 }
 
 /// Whether a record since `mark` says `marker` of the seam's failed spawn of `pid` at `warn` —
@@ -1172,14 +1181,19 @@ fn an_abandoned_child_nothing_reaches_may_be_running() {
     );
 }
 
-/// Only Linux abandons a child as ended or unreaped; elsewhere either is a contract breach, asserted in debug. It claims nothing (`Unknown`), and in particular never `Killed`.
+/// Only Linux abandons a child as ended, described or unreaped; elsewhere each is a contract
+/// breach, asserted in debug. It claims nothing (`Unknown`), and in particular never `Killed`.
 ///
-/// Mutants: `Ended` is `Killed`, which says a kill was delivered; either arm is silent.
+/// Mutants: `Ended` is `Killed`, which says a kill was delivered; any arm is silent.
 #[cfg(not(target_os = "linux"))]
 #[skuld::test]
 fn an_abandoned_child_only_a_linux_leaf_can_report_asserts() {
     use crate::containment::AbandonedChild;
-    for abandoned in [AbandonedChild::Ended, AbandonedChild::MaybeUnreaped] {
+    for abandoned in [
+        AbandonedChild::Ended,
+        AbandonedChild::Described,
+        AbandonedChild::MaybeUnreaped,
+    ] {
         let outcome = std::panic::catch_unwind(|| super::abandoned_fate(abandoned));
         if cfg!(debug_assertions) {
             assert!(outcome.is_err(), "{abandoned:?} must assert");

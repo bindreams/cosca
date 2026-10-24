@@ -71,11 +71,11 @@ impl Prepared {
     }
 
     /// End the placement exchange of a spawn that failed with no handle left on its child — tokio
-    /// can drop one it forked — and say what became of that child. Without a leaf, on Linux the
-    /// handshake answered for the child, so it is [`AbandonedChild::Ended`] if `reaping` says it is
-    /// reaped or will be, and [`AbandonedChild::MaybeUnreaped`] if not; elsewhere nothing can tell,
-    /// so [`AbandonedChild::MaybeUnreachable`]. A child that is an elevation `front` is sent no
-    /// signal of its own (see [`CgroupLeaf::abandon_before_verdict`]); `handshake` is the pidfd its
+    /// can drop one it forked — and say what became of that child. Without a leaf, Linux's `reaping`
+    /// decides ([`AbandonedChild::Ended`], [`AbandonedChild::Described`] or
+    /// [`AbandonedChild::MaybeUnreaped`]); elsewhere nothing can tell, so
+    /// [`AbandonedChild::MaybeUnreachable`]. A child that is an elevation `front` is sent no signal
+    /// of its own (see [`CgroupLeaf::abandon_before_verdict`]); `handshake` is the pidfd its
     /// handshake left for a child the leaf cannot name.
     ///
     /// [`CgroupLeaf::abandon_before_verdict`]: crate::containment::cgroup::CgroupLeaf::abandon_before_verdict
@@ -109,6 +109,7 @@ impl Prepared {
             use crate::child::spawn::pidfd_handshake::Reaping;
             match reaping {
                 Reaping::Covered => AbandonedChild::Ended,
+                Reaping::Described => AbandonedChild::Described,
                 Reaping::Uncovered => AbandonedChild::MaybeUnreaped,
             }
         }
@@ -139,14 +140,14 @@ impl Prepared {
 )]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AbandonedChild {
-    /// Answered for, with nothing to warn of: it was ended and is reaped or will be, or the failure
-    /// the spawn returns already says what became of it (an elevation front is left running, and
-    /// its error notes so).
+    /// Nothing of it runs, and it is reaped or will be.
     Ended,
     /// If it was forked, it exits before `exec`, but nothing holds its pid to reap it.
     MaybeUnreaped,
     /// If it was forked, it may be running where nothing can reach it.
     MaybeUnreachable,
+    /// It is an elevation front that was left running, and the failure the spawn returns says so.
+    Described,
     /// It is an elevation front, which was sent no signal of its own, and this is what became of
     /// it.
     Front(crate::child::spawn::FrontFate),

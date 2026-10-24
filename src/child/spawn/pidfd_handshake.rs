@@ -453,8 +453,7 @@ impl Handshake {
                 (Outcome::NoReport, Some(cause)) => Outcome::Unwatched(cause),
                 (outcome, _) => outcome,
             };
-            let reaping = reaping_of(&spawned, &outcome);
-            (conclude(spawned, outcome, front), reaping)
+            conclude_noting(spawned, outcome, front)
         })
     }
 }
@@ -817,23 +816,30 @@ fn join_helper(helper: std::thread::ScopedJoinHandle<'_, Outcome>, #[cfg(test)] 
 
 /// Whether the child of a spawn that failed is reaped, or will be, once the handshake has concluded
 /// (see [`Handshake::run_noting`]). A teardown that could not look at the child says so itself.
+/// Only tokio's spawn reads this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Reaping {
-    /// There is no child, or the handshake tore it down through its pidfd (an elevation front it
-    /// sent nothing is described by the failure), or tokio's spawn returned its handle and the
-    /// handle reaps it. Only tokio's spawn reads this.
+    /// There is no child, or the handshake tore it down through its pidfd, or tokio's returned
+    /// handle reaps it.
     Covered,
-    /// No pidfd names the child and no handle reaps it: tokio failed after `std`'s `spawn` returned
-    /// `Ok`, dropped the `std` child, which reaps nothing, and the child may be a zombie nothing
-    /// collects. A `std` failure collected its child, so this is a possibility, not a fact.
+    /// An elevation front that tokio dropped after it ran the program, which the handshake sent
+    /// nothing: it is left running, and the failure's note says so.
+    Described,
+    /// No pidfd names the child and no handle reaps it: tokio dropped a `std` child, which reaps
+    /// nothing, so it may be a zombie. A `std` failure collected its child, so this is a
+    /// possibility. Nothing can reap such a child: no pidfd names it, and Linux never reaps by pid.
     Uncovered,
 }
 
-/// The [`Reaping`] of `conclude(spawned, outcome, ..)`. Spelled out for every pair, so a new
-/// outcome must decide.
+/// The [`Reaping`] of `conclude(spawned, outcome, ..)`, but for a front it leaves running, which
+/// [`conclude_noting`] marks [`Reaping::Described`]. Spelled out for every pair, so a new outcome
+/// must decide.
 fn reaping_of<T>(spawned: &io::Result<T>, outcome: &Outcome) -> Reaping {
     match (spawned, outcome) {
-        (Ok(_), _) => Reaping::Covered,
+        (
+            Ok(_),
+            Outcome::Opened(_) | Outcome::Gone(_) | Outcome::Failed(_, _) | Outcome::NoReport | Outcome::Unwatched(_),
+        ) => Reaping::Covered,
         (Err(_), Outcome::Opened(_) | Outcome::Gone(_) | Outcome::Failed(_, Some(_))) => Reaping::Covered,
         (Err(_), Outcome::Failed(_, None) | Outcome::NoReport | Outcome::Unwatched(_)) => Reaping::Uncovered,
     }
@@ -865,6 +871,12 @@ impl FirstLook {
     }
 }
 
+/// [`conclude_noting`], without the [`Reaping`].
+#[cfg(test)]
+fn conclude<T: Spawned>(spawned: io::Result<T>, outcome: Outcome, front: LeftFront) -> Result<Held<T>, SpawnFailure> {
+    conclude_noting(spawned, outcome, front).0
+}
+
 /// Combines the fork's answer with the helper's. A child that sent its pidfd and then failed its
 /// `spawn()` is torn down through that pidfd. The exception is the elevation `front` still there:
 /// tokio dropped it after it ran the program, so it is sent nothing. A child std already
@@ -874,7 +886,14 @@ impl FirstLook {
 ///
 /// Only a child the helper told to go can run the program, so only the one arm with
 /// [`Outcome::Opened`] and a failed `spawn` may answer that it started.
-fn conclude<T: Spawned>(spawned: io::Result<T>, outcome: Outcome, front: LeftFront) -> Result<Held<T>, SpawnFailure> {
+///
+/// Also says whether the child is reaped, or will be.
+fn conclude_noting<T: Spawned>(
+    spawned: io::Result<T>,
+    outcome: Outcome,
+    front: LeftFront,
+) -> (Result<Held<T>, SpawnFailure>, Reaping) {
+    let mut reaping = reaping_of(&spawned, &outcome);
     let opened_teardown = |pidfd: OwnedFd, error: Error| {
         use crate::wait::exit_only::{peek, Peek, Target};
         use std::os::fd::AsFd as _;
@@ -897,6 +916,7 @@ fn conclude<T: Spawned>(spawned: io::Result<T>, outcome: Outcome, front: LeftFro
                 (error, ChildFate::Unknown)
             }
             LeftFront::Here(front) if !collected => {
+                reaping = Reaping::Described;
                 let (fate, child_fate) = super::leave_front_through_pidfd(None, pidfd, front, None, None);
                 (fate.note(error, Some(front), None), look.fate(child_fate))
             }
@@ -907,7 +927,7 @@ fn conclude<T: Spawned>(spawned: io::Result<T>, outcome: Outcome, front: LeftFro
         }
     };
     let not_started = |error| Err(SpawnFailure::NotStarted(error));
-    match (spawned, outcome) {
+    let concluded = match (spawned, outcome) {
         (Ok(child), Outcome::Opened(pidfd)) => Ok(Held { child, pidfd }),
         // Not told to go, so it cannot have execed: it was killed on its way, which std reads as
         // success.
@@ -965,7 +985,8 @@ fn conclude<T: Spawned>(spawned: io::Result<T>, outcome: Outcome, front: LeftFro
             ))))
         }
         (Err(e), Outcome::NoReport | Outcome::Unwatched(_)) => not_started(Error::Io(e)),
-    }
+    };
+    (concluded, reaping)
 }
 
 /// Blocks until the child `pidfd` names has exited, without reaping it: a child that never ran
