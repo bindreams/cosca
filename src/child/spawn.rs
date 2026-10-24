@@ -1559,10 +1559,14 @@ impl ParentStd {
         }
     }
 
-    /// Whether the handle for std `slot` (0, 1 or 2) was non-null.
+    /// Whether the handle for std `slot` (0, 1 or 2) was non-null; `false` for any other slot,
+    /// which has no parent stream (`inherit_end` refuses it).
     #[cfg(windows)]
     pub(crate) fn is_live(self, slot: Fd) -> bool {
-        self.live[slot.raw() as usize]
+        usize::try_from(slot.raw())
+            .ok()
+            .and_then(|i| self.live.get(i).copied())
+            .unwrap_or(false)
     }
 
     /// Whether any of the three was non-null.
