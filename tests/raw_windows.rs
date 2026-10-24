@@ -534,8 +534,10 @@ fn fd3_only_routing_does_not_load_a_binary_planted_in_the_process_cwd() {
 
 #[cfg(windows)]
 /// All three parent std handles null (a GUI or service): the child gets null handles, no
-/// `STARTF_USESTDHANDLES`, and no unlisted handle. Mutants: `GetFileType(NULL)` (fails with 6);
-/// `STARTF_USESTDHANDLES` always set; `bInheritHandles` TRUE without a HANDLE_LIST.
+/// `STARTF_USESTDHANDLES`, and no unlisted handle; where the caller configures a child end (a pipe,
+/// the null device, fd 3), the child gets it. Mutants: `GetFileType(NULL)` (fails with 6);
+/// `STARTF_USESTDHANDLES` always set; `bInheritHandles` TRUE without a HANDLE_LIST; the flag set
+/// only when this process holds a live std handle (`pipe_out`, `null_io`, `pipe_fd3`).
 #[skuld::test]
 fn raw_spawn_with_null_parent_std_handles_gives_the_child_null() {
     common::null_std::assert_every_route("sync", "all");
@@ -561,6 +563,18 @@ fn raw_spawn_with_one_null_parent_std_handle_gives_the_child_that_one_null() {
 fn raw_spawn_with_two_null_parent_std_handles_gives_the_child_two_null() {
     for nulled in ["stdin+stdout", "stdin+stderr", "stdout+stderr"] {
         common::null_std::assert_every_route("sync", nulled);
+    }
+}
+
+#[cfg(windows)]
+/// A parent whose std handles are `INVALID_HANDLE_VALUE` (what a parent with none hands down) is
+/// treated as one whose are null, as `std` treats it: the child of the raw backend gets null where
+/// it would get this process's handle, and no handle of this process leaks. `std`'s own route hands
+/// down the -1 itself, which is the same absence of a handle.
+#[skuld::test]
+fn raw_spawn_with_invalid_parent_std_handles_gives_the_child_null() {
+    for set in ["invalid:all", "invalid:stdout"] {
+        common::null_std::assert_every_route("sync", set);
     }
 }
 

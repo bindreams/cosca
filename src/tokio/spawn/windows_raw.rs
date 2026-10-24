@@ -20,7 +20,7 @@ use windows::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
 
 use crate::child::spawn::windows_raw as sync_raw;
 use crate::child::spawn::{
-    attach_or_fault, dup, resolve_identity, resolve_non_merge, spawn_lock, Classify, SpawnFailure,
+    attach_or_fault, dup, resolve_identity, resolve_non_merge, spawn_lock, ChildEnd, Classify, SpawnFailure,
 };
 use crate::command::Command;
 use crate::error::Error;
@@ -289,13 +289,14 @@ pub(crate) fn spawn_raw(
     let (child_ends, owned_std, fd_pipes) = resolve_raw_ends(&fds).not_started()?;
 
     // Classify + encode the dense MSVCRT fd-table the child CRT reads back from `lpReserved2` — the
-    // SAME layout + single HANDLE_LIST source as the sync backend.
+    // SAME layout + HANDLE_LIST source as the sync backend.
     let table = sync_raw::build_fd_table(&child_ends).not_started()?;
 
     // `table` (`bytes`) and the attribute list stay alive until after CreateProcessW.
     let mut startup = sync_raw::startup_info(&child_ends, &table).not_started()?;
-    // SINGLE handle source: `table.handles` is 0/1/2 + fd >= 3, each a distinct fresh dup (its
-    // 0/1/2 entries ARE the hStd* handles), so no duplicate reaches the list.
+    // The listed handles: `table.handles` (the non-null ends among 0/1/2 + fd >= 3, each a distinct
+    // fresh dup, its 0/1/2 entries being the hStd* handles) or, when that is empty, the filler. No
+    // duplicate reaches the list.
     let all_handles: Vec<HANDLE> = startup.handles(&table).to_vec();
     // The complete word, composed above by the ONE function all three backends share — the two
     // structural bits this backend cannot spawn without included. Nothing ORs into it here.
@@ -375,11 +376,7 @@ pub(crate) fn spawn_raw(
 /// The raw backend's resolved stdio ends: the child's handle ends (0/1/2 + fd >= 3) keyed by slot,
 /// plus the async parent ends we own — std-slot pipes (for the stdin/stdout/stderr accessors) and
 /// fd >= 3 pipes (for fd_read_end/fd_write_end), each keyed by slot.
-type RawEnds = (
-    BTreeMap<Fd, OwnedHandle>,
-    BTreeMap<Fd, OwnedStd>,
-    BTreeMap<Fd, OwnedStd>,
-);
+type RawEnds = (BTreeMap<Fd, ChildEnd>, BTreeMap<Fd, OwnedStd>, BTreeMap<Fd, OwnedStd>);
 
 /// Resolve the child's handle ends (0/1/2 + fd >= 3) for the raw backend, plus the async parent ends
 /// we own. Piped slots use OUR overlapped pipe (tokio owns none here — there is no
@@ -406,7 +403,7 @@ fn resolve_raw_ends(fds: &BTreeMap<Fd, ResolvedStdio>) -> Result<RawEnds, Error>
             }
         }
     }
-    let mut child_ends: BTreeMap<Fd, OwnedHandle> = BTreeMap::new();
+    let mut child_ends: BTreeMap<Fd, ChildEnd> = BTreeMap::new();
     let mut owned_std: BTreeMap<Fd, OwnedStd> = BTreeMap::new();
     let mut fd_pipes: BTreeMap<Fd, OwnedStd> = BTreeMap::new();
     // First pass: non-merge slots. Piped slots use our overlapped pipe (async parent end stashed —
@@ -417,7 +414,7 @@ fn resolve_raw_ends(fds: &BTreeMap<Fd, ResolvedStdio>) -> Result<RawEnds, Error>
             Some(ResolvedStdio::Merge(_)) => continue, // second pass
             Some(ResolvedStdio::Pipe(dir)) => {
                 let (child_end, parent) = crate::tokio::stdio::owned_overlapped_pipe(*dir)?;
-                child_ends.insert(slot, child_end);
+                child_ends.insert(slot, ChildEnd::from(child_end));
                 if slot.raw() < 3 {
                     owned_std.insert(slot, parent);
                 } else {

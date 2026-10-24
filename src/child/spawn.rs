@@ -17,7 +17,7 @@ use crate::stdio::{Direction, Fd, ResolvedStdio};
 #[cfg(unix)]
 pub(crate) type ChildEnd = std::os::unix::io::OwnedFd;
 #[cfg(windows)]
-pub(crate) type ChildEnd = std::os::windows::io::OwnedHandle;
+pub(crate) use windows_child_end::ChildEnd;
 
 pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, SpawnFailure> {
     let child = spawn_uncommitted(cmd)?;
@@ -1420,8 +1420,7 @@ pub(crate) fn dup(end: &ChildEnd) -> Result<ChildEnd, Error> {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::io::AsHandle;
-        end.as_handle().try_clone_to_owned().map_err(Error::Io)
+        end.try_clone().map_err(Error::Io)
     }
 }
 
@@ -1477,18 +1476,20 @@ fn inherit_end(slot: Fd) -> Result<ChildEnd, Error> {
     #[cfg(windows)]
     {
         use std::os::windows::io::AsHandle;
+        // A null std handle (a GUI process's or a service's) is an absent end; so is -1, which `std`
+        // reports as null.
         let owned = match slot {
             Fd::STDIN => {
                 let s = std::io::stdin();
-                s.as_handle().try_clone_to_owned()
+                dup_std_handle(s.as_handle())
             }
             Fd::STDOUT => {
                 let s = std::io::stdout();
-                s.as_handle().try_clone_to_owned()
+                dup_std_handle(s.as_handle())
             }
             Fd::STDERR => {
                 let s = std::io::stderr();
-                s.as_handle().try_clone_to_owned()
+                dup_std_handle(s.as_handle())
             }
             // fd >= 3 has no defined parent std stream to dup (mirrors the Unix arm). Retained design
             // limit: the raw backend routes fd >= 3 inherit through here and rejects it too.
@@ -1504,6 +1505,16 @@ fn inherit_end(slot: Fd) -> Result<ChildEnd, Error> {
         };
         owned.map_err(Error::Io)
     }
+}
+
+/// A dup of this process's std handle `h`; absent when it is null.
+#[cfg(windows)]
+fn dup_std_handle(h: std::os::windows::io::BorrowedHandle<'_>) -> std::io::Result<ChildEnd> {
+    use std::os::windows::io::AsRawHandle;
+    if h.as_raw_handle().is_null() {
+        return Ok(ChildEnd::absent());
+    }
+    h.try_clone_to_owned().map(ChildEnd::from)
 }
 
 /// The error for a spawn whose child could not be identified. `Gone` is an absence;
@@ -2914,6 +2925,11 @@ pub(crate) mod pidfd_handshake;
 #[cfg(windows)]
 #[path = "spawn/windows_raw.rs"]
 pub(crate) mod windows_raw;
+
+// Windows: a child-side handle that may be absent.
+#[cfg(windows)]
+#[path = "spawn/windows_child_end.rs"]
+mod windows_child_end;
 
 #[cfg(test)]
 #[path = "spawn_tests.rs"]

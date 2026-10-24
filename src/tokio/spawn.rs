@@ -191,7 +191,10 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                 }
             };
             #[cfg(windows)]
-            let (child_end, parent_end) = super::stdio::owned_overlapped_pipe(dir).not_started()?;
+            let (child_end, parent_end) = {
+                let (child_end, parent_end) = super::stdio::owned_overlapped_pipe(dir).not_started()?;
+                (crate::child::spawn::ChildEnd::from(child_end), parent_end)
+            };
             // Merging slots: each gets a dup of the child end. A merging slot with
             // raw() >= 3 (Unix only — Windows routed fd >= 3 to the raw backend above) is not
             // assignable as std stdio: it joins the fd >= 3 child-ends collection the fd_map

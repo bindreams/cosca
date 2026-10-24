@@ -128,8 +128,9 @@ pub(crate) fn spawn_raw(
 
     // The table (`bytes`) and the attribute list stay alive until after CreateProcessW.
     let mut startup = startup_info(&child_ends, &table).not_started()?;
-    // SINGLE handle source: `table.handles` is 0/1/2 + fd >= 3, each a distinct fresh dup from
-    // `resolve_stdio` (its 0/1/2 entries ARE the hStd* handles), so no duplicate reaches the list.
+    // The listed handles: `table.handles` (the non-null ends among 0/1/2 + fd >= 3, each a distinct
+    // fresh dup from `resolve_stdio`, its 0/1/2 entries being the hStd* handles) or, when that is
+    // empty, the filler. No duplicate reaches the list.
     let all_handles: Vec<HANDLE> = startup.handles(&table).to_vec();
     // The complete word, composed above by the ONE function all three backends share — the two
     // structural bits this backend cannot spawn without included. Nothing ORs into it here.
@@ -222,9 +223,10 @@ pub(crate) fn ensure_fd_table_fits(fds: &BTreeMap<Fd, ResolvedStdio>) -> Result<
 
 /// Classify each resolved child end (0/1/2 + fd >= 3) for its CRT device flags, then encode the
 /// dense `0..=maxfd` MSVCRT fd-table the child CRT reads back from `lpReserved2`. The returned
-/// `handles` is the SINGLE inheritance source (0/1/2 + fd >= 3, each a distinct fresh dup), so no
-/// duplicate reaches the HANDLE_LIST. `pub(crate)`: shared with the async raw backend, which builds
-/// the identical table. Gate the caller on [`ensure_fd_table_fits`] first.
+/// `handles` are the non-null ends (0/1/2 + fd >= 3, each a distinct fresh dup), so no duplicate
+/// reaches the HANDLE_LIST; [`Startup::handles`] says what is listed when there are none.
+/// `pub(crate)`: shared with the async raw backend, which builds the identical table. Gate the
+/// caller on [`ensure_fd_table_fits`] first.
 pub(crate) fn build_fd_table(child_ends: &BTreeMap<Fd, ChildEnd>) -> Result<crt_fds::FdTable, Error> {
     let mut entries: BTreeMap<Fd, (HANDLE, crt_fds::FdKind)> = BTreeMap::new();
     for (&slot, end) in child_ends {
@@ -499,10 +501,14 @@ struct Filler {
 impl Startup {
     /// The handles to mark inheritable and list: `table.handles`, or the filler when that is empty.
     pub(crate) fn handles<'a>(&'a self, table: &'a crt_fds::FdTable) -> &'a [HANDLE] {
-        match &self.filler {
-            Some(f) => &*f.list,
-            None => &table.handles,
-        }
+        listed_handles(&self.filler, table)
+    }
+}
+
+fn listed_handles<'a>(filler: &'a Option<Filler>, table: &'a crt_fds::FdTable) -> &'a [HANDLE] {
+    match filler {
+        Some(f) => &*f.list,
+        None => &table.handles,
     }
 }
 
@@ -537,10 +543,7 @@ pub(crate) fn startup_info(child_ends: &BTreeMap<Fd, ChildEnd>, table: &crt_fds:
     } else {
         None
     };
-    let listed: &[HANDLE] = match &filler {
-        Some(f) => &*f.list,
-        None => &table.handles,
-    };
+    let listed = listed_handles(&filler, table);
     let attr = if listed.is_empty() {
         None
     } else {

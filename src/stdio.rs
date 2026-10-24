@@ -106,10 +106,14 @@ impl Stdio {
     }
     /// Duplicate another descriptor's target onto this one (e.g. `2>&1`).
     ///
-    /// On Windows, if the target is a std stream and this process's own handle for it is null (a GUI
+    /// On Windows, if the target is inherited and this process's own handle for it is null (a GUI
     /// program or a service), the child gets null for this descriptor too; for a descriptor >= 3,
-    /// that means it is closed in the child. The child gets null there even while another of this
-    /// process's std handles is live.
+    /// that means it is closed in the child. If the target is a pipe, a file or the null device,
+    /// the child gets that. The child keeps the null even while another of this process's std
+    /// handles is live, except on the `std::process::Command` route (argv-only commands): there,
+    /// when the merge leaves all three of the child's std ends null, `std` sets no flag and the
+    /// child gets this process's live handles instead. Moving every Windows spawn to the raw backend
+    /// (P7) removes that route.
     pub fn merge(other: Fd) -> Stdio {
         Stdio(StdioKind::Merge(other))
     }

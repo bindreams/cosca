@@ -199,8 +199,10 @@ async fn async_fd3_only_routing_does_not_load_a_binary_planted_in_the_process_cw
 
 #[cfg(all(windows, feature = "tokio"))]
 /// Async: All three parent std handles null (a GUI or service): the child gets null handles, no
-/// `STARTF_USESTDHANDLES`, and no unlisted handle. Mutants: `GetFileType(NULL)` (fails with 6);
-/// `STARTF_USESTDHANDLES` always set; `bInheritHandles` TRUE without a HANDLE_LIST.
+/// `STARTF_USESTDHANDLES`, and no unlisted handle; where the caller configures a child end (a pipe,
+/// the null device, fd 3), the child gets it. Mutants: `GetFileType(NULL)` (fails with 6);
+/// `STARTF_USESTDHANDLES` always set; `bInheritHandles` TRUE without a HANDLE_LIST; the flag set
+/// only when this process holds a live std handle (`pipe_out`, `null_io`, `pipe_fd3`).
 #[skuld::test]
 fn async_raw_spawn_with_null_parent_std_handles_gives_the_child_null() {
     common::null_std::assert_every_route("tokio", "all");
@@ -226,6 +228,16 @@ fn async_raw_spawn_with_one_null_parent_std_handle_gives_the_child_that_one_null
 fn async_raw_spawn_with_two_null_parent_std_handles_gives_the_child_two_null() {
     for nulled in ["stdin+stdout", "stdin+stderr", "stdout+stderr"] {
         common::null_std::assert_every_route("tokio", nulled);
+    }
+}
+
+#[cfg(all(windows, feature = "tokio"))]
+/// Async: a parent whose std handles are `INVALID_HANDLE_VALUE` is treated as one whose are null,
+/// as `std` treats it.
+#[skuld::test]
+fn async_raw_spawn_with_invalid_parent_std_handles_gives_the_child_null() {
+    for set in ["invalid:all", "invalid:stdout"] {
+        common::null_std::assert_every_route("tokio", set);
     }
 }
 

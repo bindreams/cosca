@@ -2,29 +2,39 @@
 //! process's std handles are null, as a GUI or service process's are.
 //!
 //! `spawn-with-null-std <backend> <nulled> <dir>` sets the std handles named by `<nulled>` (`all`,
-//! or names joined by `+`, e.g. `stdin+stderr`) to null, spawns `report-std-handles` once per
+//! or names joined by `+`, e.g. `stdin+stderr`; prefixed `invalid:` to set `INVALID_HANDLE_VALUE`
+//! instead, which is what a parent with no std handles hands down) to null, spawns `report-std-handles` once per
 //! route, restores the handles, and prints one `<route>=<report>` line per route. `<backend>` is
 //! `sync` or `tokio`. A route whose spawn fails prints `err=<error>`. Each grandchild also reports
-//! whether it inherited `<dir>\stray.txt`, an inheritable handle given to no `Command`.
+//! whether it inherited `<dir>\stray.txt`, an inheritable handle given to no `Command`, and how many
+//! handles it holds that name the NUL device.
 
 use std::ffi::OsString;
 use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 
-use windows::Win32::Foundation::{SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT};
+use windows::Win32::Foundation::{GetHandleInformation, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT};
 use windows::Win32::Storage::FileSystem::{
     GetFileType, GetFinalPathNameByHandleW, FILE_NAME_NORMALIZED, FILE_TYPE_CHAR, FILE_TYPE_DISK, FILE_TYPE_PIPE,
 };
 use windows::Win32::System::Console::{
     SetStdHandle, STD_ERROR_HANDLE, STD_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
-use windows::Win32::System::Threading::{GetStartupInfoW, STARTF_USESTDHANDLES, STARTUPINFOW};
+use windows::Win32::System::Threading::{
+    GetCurrentProcess, GetProcessHandleCount, GetStartupInfoW, STARTF_USESTDHANDLES, STARTUPINFOW,
+};
 
 #[link(name = "kernel32", kind = "raw-dylib")]
 extern "system" {
     /// `GetStdHandle` unwrapped: the `windows` crate turns a null handle into an error.
     #[link_name = "GetStdHandle"]
     fn raw_std_handle(id: STD_HANDLE) -> HANDLE;
+}
+
+#[link(name = "ntdll", kind = "raw-dylib")]
+extern "system" {
+    /// `class` 1 is `ObjectNameInformation`: a `UNICODE_STRING` followed by its characters.
+    fn NtQueryObject(handle: HANDLE, class: u32, info: *mut u8, len: u32, returned: *mut u32) -> i32;
 }
 
 /// This process's std handle `id`, null included.
@@ -43,8 +53,11 @@ const STD: [(&str, STD_HANDLE); 3] = [
 /// stdout), `listed` (fd 3 is the stray file: a handle that is listed, so it must be inherited) and
 /// `merge3` (fd 3 is merged from stdout, so it is null when stdout is) and `merge_live` (every std
 /// slot whose handle in this process is live is merged from the first nulled slot, so all three of
-/// the child's std ends are null while this process still holds a live handle).
-const ROUTES: [&str; 8] = [
+/// the child's std ends are null while this process still holds a live handle). Three routes
+/// configure real child ends, whatever this process's own handles are: `pipe_out` (stdout is a
+/// pipe), `null_io` (stdin and stdout are the null device) and `pipe_fd3` (stdout is a pipe, fd 3
+/// the null device).
+const ROUTES: [&str; 11] = [
     "std",
     "argv",
     "exe",
@@ -53,15 +66,19 @@ const ROUTES: [&str; 8] = [
     "listed",
     "merge3",
     "merge_live",
+    "pipe_out",
+    "null_io",
+    "pipe_fd3",
 ];
 
 const STRAY: &str = "stray.txt";
 
 /// `report-std-handles <report> <stray>`: writes to `<report>` one line,
-/// `usestdhandles=<bool>,stdin=<kind>,stdout=<kind>,stderr=<kind>,fd3=<open|closed>,stray=<state>`.
+/// `usestdhandles=<bool>,stdin=<kind>,stdout=<kind>,stderr=<kind>,fd3=<open|closed>,stray=<state>,nul=<n>`.
 /// A kind is `null`, `char`, `pipe`, `disk`, `invalid` or `unknown(err=<code>)`. `<stray>` is a hex
 /// handle value, or `fd:<n>` for the handle behind CRT fd `n`; `stray` is `true` if it names a file
 /// called `stray.txt` in this process, `false` if it is not (a handle to) a disk file here, else `error(<code>)`.
+/// `nul` is the number of handles this process holds that name the NUL device, `\Device\Null`.
 pub fn report(path: &str, stray: &str) {
     let mut si = STARTUPINFOW::default();
     unsafe { GetStartupInfoW(&mut si) };
@@ -94,7 +111,68 @@ pub fn report(path: &str, stray: &str) {
         None => HANDLE(usize::from_str_radix(stray, 16).expect("a hex handle value") as *mut _),
     };
     fields.push(format!("stray={}", probe_stray(stray)));
+    fields.push(format!("nul={}", count_nul_handles()));
     std::fs::write(path, fields.join(",")).expect("write the report");
+}
+
+/// How many handles this process holds that name `\Device\Null`. It visits every handle value:
+/// `GetProcessHandleCount` says how many handles there are, and the walk ends once it has seen that
+/// many.
+fn count_nul_handles() -> usize {
+    let mut count = 0u32;
+    // SAFETY: the pseudo-handle is always valid; `count` is a live out-parameter.
+    unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) }.expect("GetProcessHandleCount");
+    let (mut remaining, mut nul, mut value) = (count, 0, 0usize);
+    while remaining > 0 {
+        value += 4;
+        // A process holds at most 2^24 handles, each a multiple of 4.
+        assert!(value <= 1 << 26, "fewer handles found than the process says it holds");
+        let h = HANDLE(value as *mut _);
+        let mut flags = 0u32;
+        // SAFETY: a value that is not a handle in this process is an error, not UB.
+        if unsafe { GetHandleInformation(h, &mut flags) }.is_err() {
+            continue;
+        }
+        remaining -= 1;
+        if object_name(h).as_deref() == Some(r"\Device\Null") {
+            nul += 1;
+        }
+    }
+    nul
+}
+
+/// The NT name of the object `h` names, if the system gives one.
+fn object_name(h: HANDLE) -> Option<String> {
+    #[repr(C)]
+    struct UnicodeString {
+        length: u16,
+        capacity: u16,
+        buffer: *const u16,
+    }
+    // 8-byte aligned, and large enough for the `UnicodeString` and a long device name.
+    let mut buf = [0u64; 128];
+    // SAFETY: `buf` is a live buffer of the length passed.
+    let status = unsafe {
+        NtQueryObject(
+            h,
+            1,
+            buf.as_mut_ptr().cast(),
+            std::mem::size_of_val(&buf) as u32,
+            &mut 0,
+        )
+    };
+    if status < 0 {
+        return None;
+    }
+    // SAFETY: on success `buf` starts with a `UnicodeString`.
+    let us = unsafe { &*(buf.as_ptr() as *const UnicodeString) };
+    // An unnamed object has an empty name and a null `buffer`.
+    if us.buffer.is_null() {
+        return None;
+    }
+    // SAFETY: a non-null `buffer` points at `length` bytes inside `buf`.
+    let name = unsafe { std::slice::from_raw_parts(us.buffer, us.length as usize / 2) };
+    Some(String::from_utf16_lossy(name))
 }
 
 /// The handle behind CRT fd `fd`, or `None` if the fd is not open.
@@ -139,6 +217,10 @@ fn probe_stray(h: HANDLE) -> String {
 }
 
 pub fn spawn(backend: &str, nulled: &str, dir: &str) {
+    let (nulled, set_to) = match nulled.strip_prefix("invalid:") {
+        Some(rest) => (rest, HANDLE(-1isize as *mut _)),
+        None => (nulled, HANDLE::default()),
+    };
     let ids: Vec<(&str, STD_HANDLE)> = if nulled == "all" {
         STD.to_vec()
     } else {
@@ -168,7 +250,7 @@ pub fn spawn(backend: &str, nulled: &str, dir: &str) {
     }));
     for &(_, id) in &ids {
         // SAFETY: sets this process's own std handle; restored below.
-        unsafe { SetStdHandle(id, HANDLE::default()) }.expect("SetStdHandle(NULL)");
+        unsafe { SetStdHandle(id, set_to) }.expect("SetStdHandle");
     }
     let merges = live_merges(&ids);
     let lines: Vec<String> = ROUTES
@@ -289,7 +371,7 @@ fn configure_sync(
     merges: &[(cosca::Fd, cosca::Fd)],
 ) -> Result<(), String> {
     match route {
-        "exe" | "exe_merge" | "listed" | "merge3" | "merge_live" => {
+        "exe" | "exe_merge" | "listed" | "merge3" | "merge_live" | "pipe_out" | "null_io" | "pipe_fd3" => {
             cmd.executable(exe).args(argv);
         }
         "argv" => {
@@ -320,6 +402,16 @@ fn configure_sync(
         for &(slot, from) in merges {
             cmd.fd(slot, cosca::Stdio::merge(from)).map_err(|e| e.to_string())?;
         }
+    }
+    if route == "null_io" {
+        cmd.stdin(cosca::Stdio::null()).map_err(|e| e.to_string())?;
+        cmd.stdout(cosca::Stdio::null()).map_err(|e| e.to_string())?;
+    }
+    if route == "pipe_out" || route == "pipe_fd3" {
+        cmd.stdout(cosca::Stdio::pipe()).map_err(|e| e.to_string())?;
+    }
+    if route == "pipe_fd3" {
+        cmd.fd(3, cosca::Stdio::null()).map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -335,7 +427,7 @@ fn configure_tokio(
     merges: &[(cosca::Fd, cosca::Fd)],
 ) -> Result<(), String> {
     match route {
-        "exe" | "exe_merge" | "listed" | "merge3" | "merge_live" => {
+        "exe" | "exe_merge" | "listed" | "merge3" | "merge_live" | "pipe_out" | "null_io" | "pipe_fd3" => {
             cmd.executable(exe).args(argv);
         }
         "argv" => {
@@ -366,6 +458,16 @@ fn configure_tokio(
         for &(slot, from) in merges {
             cmd.fd(slot, cosca::Stdio::merge(from)).map_err(|e| e.to_string())?;
         }
+    }
+    if route == "null_io" {
+        cmd.stdin(cosca::Stdio::null()).map_err(|e| e.to_string())?;
+        cmd.stdout(cosca::Stdio::null()).map_err(|e| e.to_string())?;
+    }
+    if route == "pipe_out" || route == "pipe_fd3" {
+        cmd.stdout(cosca::Stdio::pipe()).map_err(|e| e.to_string())?;
+    }
+    if route == "pipe_fd3" {
+        cmd.fd(3, cosca::Stdio::null()).map_err(|e| e.to_string())?;
     }
     Ok(())
 }
