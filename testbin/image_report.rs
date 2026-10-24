@@ -68,7 +68,8 @@ fn main() {
     std::process::exit(code);
 }
 
-/// This process's environment block, UTF-16LE, through the empty entry that closes it.
+/// This process's environment block, UTF-16LE, through the empty entry that closes it. Copied from
+/// `env_block.rs` on purpose: this image depends on nothing else in the testbin.
 #[cfg(windows)]
 fn env_block() -> Vec<u8> {
     use windows::core::PCWSTR;

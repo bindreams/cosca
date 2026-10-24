@@ -11,32 +11,23 @@ use windows::Win32::System::Environment::{FreeEnvironmentStringsW, GetEnvironmen
 /// as four hex digits. Read from `GetEnvironmentStringsW`, so casing, order and unpaired
 /// surrogates are what the OS holds.
 pub fn dump() {
-    // SAFETY: no preconditions; the block is freed below.
-    let block = unsafe { GetEnvironmentStringsW() };
-    assert!(!block.is_null(), "GetEnvironmentStringsW failed");
+    let units = block_units();
     let mut out = std::io::stdout().lock();
-    let mut entry = block.0;
-    loop {
-        // SAFETY: the block is a run of NUL-terminated entries closed by an empty one, so every
-        // read up to and including the terminators is in bounds.
-        let len = (0..).take_while(|&i| unsafe { *entry.add(i) } != 0).count();
-        if len == 0 {
-            break;
-        }
-        // SAFETY: `len` units starting at `entry` were just read.
-        let units = unsafe { std::slice::from_raw_parts(entry, len) };
-        let hex: String = units.iter().map(|u| format!("{u:04x}")).collect();
+    for entry in units.split(|&u| u == 0).take_while(|e| !e.is_empty()) {
+        let hex: String = entry.iter().map(|u| format!("{u:04x}")).collect();
         writeln!(out, "{hex}").unwrap();
-        // SAFETY: skips this entry and its NUL, landing on the next entry or the terminator.
-        entry = unsafe { entry.add(len + 1) };
     }
     out.flush().unwrap();
-    // SAFETY: `block` came from `GetEnvironmentStringsW` and is freed once.
-    unsafe { FreeEnvironmentStringsW(PCWSTR(block.0)) }.expect("FreeEnvironmentStringsW");
 }
 
 /// This process's environment block, UTF-16LE, through the empty entry that closes it.
 pub fn block_bytes() -> Vec<u8> {
+    block_units().iter().flat_map(|u| u.to_le_bytes()).collect()
+}
+
+/// This process's environment block as UTF-16 units, through the empty entry that closes it. The
+/// one place in this file that reads the raw block.
+fn block_units() -> Vec<u16> {
     // SAFETY: no preconditions; the block is freed below.
     let block = unsafe { GetEnvironmentStringsW() };
     assert!(!block.is_null(), "GetEnvironmentStringsW failed");
@@ -46,11 +37,10 @@ pub fn block_bytes() -> Vec<u8> {
         .find(|&i| unsafe { *block.0.add(i - 1) == 0 && *block.0.add(i) == 0 })
         .unwrap();
     // SAFETY: the `end + 1` units starting at `block` were just read.
-    let units = unsafe { std::slice::from_raw_parts(block.0, end + 1) };
-    let bytes = units.iter().flat_map(|u| u.to_le_bytes()).collect();
+    let units = unsafe { std::slice::from_raw_parts(block.0, end + 1) }.to_vec();
     // SAFETY: `block` came from `GetEnvironmentStringsW` and is freed once.
     unsafe { FreeEnvironmentStringsW(PCWSTR(block.0)) }.expect("FreeEnvironmentStringsW");
-    bytes
+    units
 }
 
 /// Spawn `dump-env-block` through cosca's `backend` (`raw` or `std`) after replaying `ops`, and
@@ -93,10 +83,10 @@ pub fn spawn_with_block(dump_args: &str, entries: &[String]) {
     std::process::exit(code as i32);
 }
 
-/// `spawn-consent-with-block <report> <envdump> <own-envdump> <dir> <block-file>`: run
-/// `consent-spawn <report> <envdump> <own-envdump> <dir>` in a child whose environment block is exactly the entries of `<block-file>`, in
-/// order, and relay its exit code. Each entry in the file ends in a NUL. The block goes through a
-/// file because a whole inherited environment can exceed the command line's 32767 units.
+/// `spawn-consent-with-block <report> <envdump> <own-envdump> <dir> <block-file>`: run `consent-spawn`
+/// with the first four arguments in a child whose environment block is exactly the entries of
+/// `<block-file>`, in order, and relay its exit code. Each entry in the file ends in a NUL. The block
+/// goes through a file because a whole inherited environment can exceed the command line's 32767 units.
 pub fn spawn_consent_with_block(args: &[String]) {
     let [report, env_dump, own_dump, dir, block_file] = args else {
         panic!("spawn-consent-with-block <report> <envdump> <own-envdump> <dir> <block-file>, got {args:?}");

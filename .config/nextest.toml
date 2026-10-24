@@ -99,7 +99,7 @@ filter = 'test(=gui_elevated_child_runs_as_root)'
 slow-timeout = { period = "60s", terminate-after = 2, grace-period = "1s" }
 
 # M10 is a measurement: its output, the elevated child's cwd and environment, is the record, so it is printed on
-# success too. The Windows lane prints the run's output to the job log.
+# success too.
 [[profile.ci-elevation.overrides]]
 filter = 'test(=m10_the_consent_route_child_runs_in_lp_directory)'
 success-output = "final"

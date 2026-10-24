@@ -2,14 +2,11 @@
 //! environment block to `<own-envdump>`, then elevate `cosca_testbin_image --report-to <report>
 //! --dump-env-to <envdump>` through the consent route, in `<dir>`, and exit with its code.
 
-/// Dump this process's block, run the elevated image and exit with its exit code. The own dump is
-/// the positive control for the image's: it shows what the consent route had to carry over. The
-/// image is the one built beside this testbin.
+/// The own dump is the positive control for the image's: it shows what the consent route had to carry over.
 pub fn run(report: &str, env_dump: &str, own_dump: &str, dir: &str) {
-    // An elevated caller takes the already-elevated route, which never reaches `ShellExecuteExW`.
     assert!(
         !cosca::elevation::is_elevated(),
-        "consent-spawn must run unelevated to take the consent route"
+        "consent-spawn must run unelevated: an elevated caller takes the already-elevated route, which never reaches `ShellExecuteExW`"
     );
     std::fs::write(own_dump, crate::env_block::block_bytes()).expect("write the own env dump");
     let image = std::env::current_exe()

@@ -443,18 +443,29 @@ enum Marker {
     Absent,
 }
 
-/// The entries of a raw `GetEnvironmentStringsW` dump (UTF-16LE, through the closing empty entry).
+/// The entries of a raw `GetEnvironmentStringsW` dump (UTF-16LE, through the closing empty entry). A
+/// dump that is truncated or not valid UTF-16 fails here, so it never reads as "both markers absent".
 #[cfg(windows)]
 fn decode_block(dump: &[u8]) -> Vec<String> {
-    dump.as_chunks::<2>()
-        .0
-        .iter()
-        .map(|b| u16::from_le_bytes(*b))
-        .collect::<Vec<u16>>()
+    let (pairs, rest) = dump.as_chunks::<2>();
+    assert!(rest.is_empty(), "the dump has an odd length ({} bytes)", dump.len());
+    let units: Vec<u16> = pairs.iter().map(|b| u16::from_le_bytes(*b)).collect();
+    assert!(
+        units.ends_with(&[0, 0]),
+        "the dump does not end in the block's closing empty entry: truncated?"
+    );
+    units
         .split(|&u| u == 0)
         .take_while(|e| !e.is_empty())
-        .map(String::from_utf16_lossy)
+        .map(|e| String::from_utf16(e).expect("the dump holds valid UTF-16"))
         .collect()
+}
+
+/// `path` in canonical form, so case and short names do not decide a comparison.
+#[cfg(windows)]
+fn canonical(path: &std::path::Path) -> PathBuf {
+    path.canonicalize()
+        .unwrap_or_else(|e| panic!("canonicalize {}: {e}", path.display()))
 }
 
 /// The name of an environment entry. A leading `=` belongs to the name (`=Q:`).
@@ -480,27 +491,23 @@ fn marker_in(block: &[String], marker: &str) -> Marker {
 /// M10, a measurement: the consent route's child runs in the `current_dir` given, which reaches it as
 /// `lpDirectory`, and its environment block is recorded next to the one its launcher had.
 ///
-/// `cosca_testbin spawn-consent-with-block` starts `consent-spawn` with the test's block plus `=Q:=<dir>` and a nonce.
-/// That mode dumps its own block (the positive control: both markers reached it), then elevates `cosca_testbin_image`
-/// through `ShellExecuteExW(runas)`. The child has its own console, so it reports to files. Measured on windows/amd64
-/// and windows/arm64 (run 40104203592): neither marker reaches the child, which gets a fresh environment. The test
-/// records only variable names, the markers and entry counts, because values go to a public job log.
-///
-/// Mutants: the elevated spawn drops `current_dir` (the cwd assertion fails, as the directory is fresh and neither the
-/// test's cwd nor `System32`); the spawn does not elevate (`elevated=1` fails); the block never reaches `consent-spawn`
-/// (the control fails); the consent route starts carrying the launcher's environment (the verdict fails).
+/// The elevated child has its own console, so it reports to files. The test records only variable names,
+/// the markers and entry counts, because values go to a public job log. The directory is fresh, so it is
+/// neither the test's cwd nor `System32`.
 #[cfg(windows)]
 #[skuld::test]
 fn m10_the_consent_route_child_runs_in_lp_directory(#[fixture(elevation)] _group: &Group) {
     require_unelevated();
     let dir = tempfile::tempdir().expect("the child's directory");
-    let lp_directory = dir.path().to_str().expect("a UTF-8 temp path").to_owned();
     let own_cwd = std::env::current_dir().expect("this test's cwd");
     let system32 = PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot")).join("System32");
+    let lp_directory = canonical(dir.path());
     for other in [&own_cwd, &system32] {
-        assert!(
-            !lp_directory.eq_ignore_ascii_case(other.to_str().expect("a UTF-8 path")),
-            "the child's directory {lp_directory} must differ from {}, or a route that ignored lpDirectory would pass",
+        assert_ne!(
+            lp_directory,
+            canonical(other),
+            "the child's directory {} must differ from {}, or a route that ignored lpDirectory would pass",
+            dir.path().display(),
             other.display()
         );
     }
@@ -554,7 +561,6 @@ fn m10_the_consent_route_child_runs_in_lp_directory(#[fixture(elevation)] _group
     println!("M10 launcher block: {} entries", entries.len());
     println!("M10 markers (=Q:, nonce): consent-spawn {own:?}, child {child:?}");
 
-    // The positive control: without it, "absent" below could mean the block never reached `consent-spawn`.
     assert_eq!(
         own,
         (Marker::Exact, Marker::Exact),
@@ -564,9 +570,15 @@ fn m10_the_consent_route_child_runs_in_lp_directory(#[fixture(elevation)] _group
         report.lines().any(|l| l == "elevated=1"),
         "the child did not run elevated:\n{report}"
     );
-    assert!(
-        report.lines().any(|l| l == format!("cwd={lp_directory}")),
-        "the child's cwd is not the lpDirectory given ({lp_directory}):\n{report}"
+    let child_cwd = report
+        .lines()
+        .find_map(|l| l.strip_prefix("cwd="))
+        .unwrap_or_else(|| panic!("the child's report has no cwd line:\n{report}"));
+    assert_eq!(
+        canonical(std::path::Path::new(child_cwd)),
+        lp_directory,
+        "the child's cwd is not the lpDirectory given ({}):\n{report}",
+        dir.path().display()
     );
     assert_eq!(
         child,
