@@ -377,7 +377,7 @@ fn clear_only_yields_empty_double_nul_block() {
 //
 // The core ordering policy is pinned host-independently in `crate::resolve_tests` (it takes
 // `system_dirs` as fabricated `PathBuf`s, by design, so it can run without Windows at all). These
-// tests instead exercise the REAL `GetSystemDirectoryW`/`GetWindowsDirectoryW` wiring in
+// tests instead exercise the REAL `GetSystemDirectoryW`/`GetSystemWindowsDirectoryW` wiring in
 // `windows_system_dirs` — the one part of this policy a cross-compile cannot validate, because
 // `cargo xwin check`/`clippy` only prove the code TYPE-CHECKS for Windows, never that it runs
 // correctly there. What a real runner catches here is a wrong Win32 return-value convention and
@@ -403,9 +403,9 @@ fn windows_system_dirs_are_real_existing_directories() {
         // SAFETY: see `windows_system_dirs`'s own closures — identical contract.
         unsafe { GetSystemDirectoryW(buf) }
     });
-    let win = get_windows_directory_via(|buf| {
+    let win = get_system_windows_directory_via(|buf| {
         // SAFETY: see `windows_system_dirs`'s own closures — identical contract.
-        unsafe { GetWindowsDirectoryW(buf) }
+        unsafe { GetSystemWindowsDirectoryW(buf) }
     });
     assert!(
         sys32.is_ok(),
@@ -413,7 +413,7 @@ fn windows_system_dirs_are_real_existing_directories() {
     );
     assert!(
         win.is_ok(),
-        "GetWindowsDirectoryW should succeed under the test runner, got {win:?}"
+        "GetSystemWindowsDirectoryW should succeed under the test runner, got {win:?}"
     );
     let (sys32, win) = (sys32.unwrap(), win.unwrap());
 
@@ -438,14 +438,62 @@ fn windows_system_dirs_are_real_existing_directories() {
     );
 }
 
-/// A `GetSystemDirectoryW`/`GetWindowsDirectoryW`-shaped call reporting failure (`0`, its only
+/// The system directories come from the API, not from `SystemRoot` or `windir`: a child whose
+/// `SystemRoot` and `windir` name a bogus directory still reads the real ones. A fresh re-exec,
+/// never this runner, so the environment change reaches no other test.
+///
+/// Mutant: read `%SystemRoot%` for the Windows directory.
+#[skuld::test]
+fn the_system_dirs_ignore_systemroot_and_windir() {
+    let real = windows_system_dirs().unwrap();
+    let bogus = tempfile::tempdir().unwrap();
+    let mut cmd = crate::test_child::fixture_command(crate::test_child::fixture_path!(
+        fixture_the_system_dirs_ignore_systemroot_and_windir
+    ));
+    cmd.env(FIXTURE_SYSTEM_DIRS_MARKER, std::process::id().to_string())
+        .env(FIXTURE_SYSTEM_DIRS_EXPECTED, std::env::join_paths(&real).unwrap())
+        .env("SystemRoot", bogus.path())
+        .env("windir", bogus.path());
+    crate::test_child::run_fixture_command(
+        crate::test_child::fixture_path!(fixture_the_system_dirs_ignore_systemroot_and_windir),
+        cmd,
+    );
+}
+
+const FIXTURE_SYSTEM_DIRS_MARKER: &str = "COSCA_FIXTURE_SYSTEM_DIRS";
+const FIXTURE_SYSTEM_DIRS_EXPECTED: &str = "COSCA_FIXTURE_SYSTEM_DIRS_EXPECTED";
+
+/// The child half of [`the_system_dirs_ignore_systemroot_and_windir`].
+#[skuld::test]
+fn fixture_the_system_dirs_ignore_systemroot_and_windir() {
+    if !crate::test_child::is_marked_fixture_reexec(FIXTURE_SYSTEM_DIRS_MARKER) {
+        return; // picked up by an ordinary suite run: deliberately inert
+    }
+    let expected: Vec<PathBuf> = std::env::split_paths(
+        &std::env::var_os(FIXTURE_SYSTEM_DIRS_EXPECTED).expect("the driver sets the expectation"),
+    )
+    .collect();
+    assert_eq!(
+        expected.len(),
+        2,
+        "the driver passes System32 and the Windows directory"
+    );
+    let systemroot = PathBuf::from(std::env::var_os("SystemRoot").expect("the driver sets SystemRoot"));
+    assert!(
+        !expected.contains(&systemroot),
+        "the bogus SystemRoot {systemroot:?} must differ from the real directories {expected:?}"
+    );
+    assert_eq!(windows_system_dirs().unwrap(), expected);
+}
+
+/// A `GetSystemDirectoryW`/`GetSystemWindowsDirectoryW`-shaped call reporting failure (`0`, its only
 /// "give up" signal — see `grow_wide_buffer`'s doc) is not silently dropped: `query_wide_dir`
 /// propagates it as an `Err` naming which API failed. `windows_system_dirs` then fails the whole
 /// resolution on that `Err` rather than dropping the directory and letting `PATH` shadow it — see
 /// `windows_system_dirs`'s doc for why a silent drop would be a WIDENING this module treats as no
 /// more acceptable than a deliberate one. No real Win32 failure is needed to exercise this:
 /// `query_wide_dir` takes the Win32 call as a closure, so a fake one that always reports failure
-/// exercises the exact propagation path `get_system_directory_via`/`get_windows_directory_via` rely
+/// exercises the exact propagation path `get_system_directory_via`/`get_system_windows_directory_via` rely
 /// on, on any host that compiles this module.
 #[skuld::test]
 fn a_system_directory_query_failure_is_not_silently_dropped() {
@@ -464,7 +512,7 @@ fn a_system_directory_query_failure_is_not_silently_dropped() {
 /// [`windows_system_dirs_via`]'s `sys` parameter, for `System32` — `resolve_executable`'s real
 /// chain reaches it through no other path. Forcing failure HERE, rather than through a re-typed
 /// `query_wide_dir("...", ...)` call, is what would catch `get_system_directory_via`/
-/// `get_windows_directory_via` accidentally swapping which literal API name they hand to
+/// `get_system_windows_directory_via` accidentally swapping which literal API name they hand to
 /// `query_wide_dir`: asserting the OTHER api string is absent, not just that the right one is
 /// present, is what makes a swap fail this test instead of silently passing it (both queries fail
 /// identically, so a wrong name would still "contain an API name").
@@ -476,19 +524,19 @@ fn get_system_directory_via_names_its_own_api_on_failure() {
         other => panic!("expected Io, got {other:?}"),
     };
     assert!(msg.contains("GetSystemDirectoryW"), "{msg:?}");
-    assert!(!msg.contains("GetWindowsDirectoryW"), "{msg:?}");
+    assert!(!msg.contains("GetSystemWindowsDirectoryW"), "{msg:?}");
 }
 
-/// The [`get_windows_directory_via`] mirror of
+/// The [`get_system_windows_directory_via`] mirror of
 /// [`get_system_directory_via_names_its_own_api_on_failure`] — see its doc.
 #[skuld::test]
-fn get_windows_directory_via_names_its_own_api_on_failure() {
-    let err = get_windows_directory_via(|_buf| 0).unwrap_err();
+fn get_system_windows_directory_via_names_its_own_api_on_failure() {
+    let err = get_system_windows_directory_via(|_buf| 0).unwrap_err();
     let msg = match err {
         Error::Io(e) => e.to_string(),
         other => panic!("expected Io, got {other:?}"),
     };
-    assert!(msg.contains("GetWindowsDirectoryW"), "{msg:?}");
+    assert!(msg.contains("GetSystemWindowsDirectoryW"), "{msg:?}");
     assert!(!msg.contains("GetSystemDirectoryW"), "{msg:?}");
 }
 
@@ -541,7 +589,7 @@ fn a_bare_name_names_get_system_directory_w_when_the_system_query_fails() {
             |_buf| 0,
             |buf| {
                 // SAFETY: see `windows_system_dirs`'s own closures — identical contract.
-                unsafe { GetWindowsDirectoryW(buf) }
+                unsafe { GetSystemWindowsDirectoryW(buf) }
             },
         )
     };
@@ -558,13 +606,13 @@ fn a_bare_name_names_get_system_directory_w_when_the_system_query_fails() {
         other => panic!("expected Io, got {other:?}"),
     };
     assert!(msg.contains("GetSystemDirectoryW"), "{msg:?}");
-    assert!(!msg.contains("GetWindowsDirectoryW"), "{msg:?}");
+    assert!(!msg.contains("GetSystemWindowsDirectoryW"), "{msg:?}");
 }
 
 /// The [`a_bare_name_names_get_system_directory_w_when_the_system_query_fails`] mirror, with `win`
 /// forced to fail and `sys` left real — see its doc.
 #[skuld::test]
-fn a_bare_name_names_get_windows_directory_w_when_the_windows_query_fails() {
+fn a_bare_name_names_get_system_windows_directory_w_when_the_windows_query_fails() {
     let pathdir = tempfile::tempdir().unwrap();
     std::fs::write(pathdir.path().join("sp_winfail.exe"), b"x").unwrap();
     let cwd = tempfile::tempdir().unwrap();
@@ -589,7 +637,7 @@ fn a_bare_name_names_get_windows_directory_w_when_the_windows_query_fails() {
         Error::Io(e) => e.to_string(),
         other => panic!("expected Io, got {other:?}"),
     };
-    assert!(msg.contains("GetWindowsDirectoryW"), "{msg:?}");
+    assert!(msg.contains("GetSystemWindowsDirectoryW"), "{msg:?}");
     assert!(!msg.contains("GetSystemDirectoryW"), "{msg:?}");
 }
 
