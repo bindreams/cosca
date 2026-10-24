@@ -1,7 +1,42 @@
+//! `launch_runas` hands `is_elevated()` to `Host::detect` in one inline call, and the host is
+//! then only planned over, so a test could see the value only by elevating. That wiring is not
+//! covered here: `detect_reports_the_elevation_it_is_given` pins that `detect` honours what it is given.
+
 #[skuld::test]
 fn detect_reports_windows_os() {
-    let h = crate::elevation::plan::Host::detect(crate::elevation::Backend::Auto, &crate::elevation::Auth::Interactive);
+    let h = crate::elevation::plan::Host::detect(
+        crate::elevation::Backend::Auto,
+        &crate::elevation::Auth::Interactive,
+        None,
+        false,
+    );
     assert_eq!(h.os, crate::elevation::plan::Os::Windows);
+}
+
+/// Detection reports the privilege it is handed, not this process's.
+#[skuld::test]
+fn detect_reports_the_elevation_it_is_given() {
+    for elevated in [true, false] {
+        let h = crate::elevation::plan::Host::detect(
+            crate::elevation::Backend::Auto,
+            &crate::elevation::Auth::Interactive,
+            None,
+            elevated,
+        );
+        assert_eq!(h.elevated, elevated);
+    }
+}
+
+/// Windows has no backend to find: a `path_var` holding programs leaves `available` at its default.
+#[skuld::test]
+fn detect_ignores_the_path_it_is_given() {
+    let h = crate::elevation::plan::Host::detect(
+        crate::elevation::Backend::Auto,
+        &crate::elevation::Auth::Interactive,
+        Some(std::ffi::OsStr::new(r"C:\Windows\System32")),
+        false,
+    );
+    assert_eq!(h.available, crate::elevation::plan::BackendSet::default());
 }
 
 #[skuld::test]
