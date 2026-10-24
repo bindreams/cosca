@@ -509,6 +509,18 @@ impl TracerHelper<'_> {
         tx.write_all(b"x").expect("write a signal byte");
         tx.flush().expect("flush the signal byte");
     }
+
+    /// Closes the signal pipe, which ends the session as EOF does, but leaves the helper unreaped
+    /// until the drop: for a test that must see another event before it reaps the helper.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn close_signal_pipe(&mut self) {
+        drop(
+            self.session
+                .signal_tx
+                .take()
+                .expect("the signal pipe is already closed"),
+        );
+    }
 }
 
 /// The exit status of a tracee spawned to catch `SIGTERM`, once it gets one.

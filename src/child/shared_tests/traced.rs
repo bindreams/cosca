@@ -232,7 +232,10 @@ fn a_wait_on_a_child_whose_tracer_is_traced_watches_that_tracers_tracer(#[fixtur
     );
     assert_eq!(waited, Waited::Reapable);
     assert_eq!(inner.recv(), Report::Reaped);
-    // The inner helper exits first, while the outer one still traces it and so hands it back.
+    // The inner helper's exit goes to the outer one, its tracer and parent, which hands it back
+    // when it reaps it; until then this process's reap of it fails with `ECHILD`.
+    inner.close_signal_pipe();
+    assert_eq!(outer.recv(), Report::Reaped);
     drop(inner);
     drop(outer);
     let status = tracee.wait().expect("the handed-back zombie is ours to reap");
