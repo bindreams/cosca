@@ -280,6 +280,10 @@ impl Child {
     /// each in-flight call occupies one blocking-pool thread for up to `grace` — size the
     /// pool accordingly for many long concurrent shutdowns.
     ///
+    /// **A root reaped by something else** (see [`kill_tree`](Child::kill_tree)): when
+    /// [`terminate_tree`](Child::terminate_tree) answers it with an error, that error ends this call,
+    /// with no grace waited and no sweep.
+    ///
     /// **macOS, a root the handle cannot vouch for** is signalled as for
     /// [`terminate_tree`](Child::terminate_tree) and swept as for [`kill_tree`](Child::kill_tree). A
     /// mechanism with no channel by identity ends the call up front, with nothing sent and no grace
@@ -301,12 +305,33 @@ impl Child {
             Some(Err(e)) if !self.os.attached.names_tree_by_identity() => return Err(e),
             other => other,
         };
+        // A root whose pid may name another process (reaped elsewhere, or unreadable) ends the call
+        // with `terminate_tree`'s answer: a grace and a sweep would send nothing more by that number,
+        // and the sweep would warn again.
+        #[cfg(target_os = "macos")]
+        let reaped = if by_identity.is_none() {
+            self.reaped_root_term()
+        } else {
+            None
+        };
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let reaped = self.reaped_root_term();
+        #[cfg(unix)]
+        let reaped_sent = match reaped {
+            Some(Err(e)) => return Err(e),
+            Some(Ok(())) => true,
+            None => false,
+        };
         let term_signal = || {
             #[cfg(target_os = "macos")]
             if let Some(result) = by_identity {
                 return result;
             }
-            self.terminate_tree_signalling()
+            #[cfg(unix)]
+            if reaped_sent {
+                return Ok(());
+            }
+            self.terminate_tree_unchecked()
         };
 
         #[cfg(test)]

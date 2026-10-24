@@ -323,11 +323,22 @@ impl TreeKilled {
 }
 
 /// Which signal a tree path sends.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum TreeSignal {
     Kill,
     Term,
+}
+
+#[cfg(unix)]
+impl TreeSignal {
+    /// The verb for a log line: "kill" or "signal".
+    pub(crate) fn verb(self) -> &'static str {
+        match self {
+            TreeSignal::Kill => "kill",
+            TreeSignal::Term => "signal",
+        }
+    }
 }
 
 /// What [`Attached::hard_kill_for_drop`] did to the tree.
@@ -645,11 +656,7 @@ impl Attached {
         earlier: Option<&str>,
         killed: &TreeKilled,
     ) -> Option<Result<(), Error>> {
-        let verb = match signal {
-            TreeSignal::Kill => "kill",
-            TreeSignal::Term => "signal",
-        };
-        let skipped = self.named_by_root_number(root_pid, verb)?;
+        let skipped = self.named_by_root_number(root_pid, signal.verb())?;
         let why = crate::signal::why_untrusted(root);
         let Attached::FdMarker(m) = self else {
             let earlier = earlier.map_or_else(String::new, |sent| format!(", though {sent} was sent before it"));
@@ -671,6 +678,36 @@ impl Attached {
             killed.mark();
         }
         Some(result)
+    }
+
+    /// Send `signal` to the tree through what names it by identity alone, for a root that is
+    /// reaped: a macOS fd marker's holders, named by the pipe they hold, which no reuse of a pid
+    /// redirects. `None` for a mechanism with no such channel. For `Kill`, an `Ok` marks the tree
+    /// killed only if `mark` is set.
+    #[cfg(unix)]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(unused_variables, reason = "only a macOS fd marker names its tree by identity")
+    )]
+    pub(crate) fn signal_holders_only(
+        &self,
+        signal: TreeSignal,
+        mark: Option<&TreeKilled>,
+    ) -> Option<Result<(), Error>> {
+        match self {
+            #[cfg(target_os = "macos")]
+            Attached::FdMarker(m) => {
+                let result = match signal {
+                    TreeSignal::Kill => m.hard_kill_holders_only(None),
+                    TreeSignal::Term => m.terminate_holders_only(None),
+                };
+                if let (Ok(()), TreeSignal::Kill, Some(killed)) = (&result, signal, mark) {
+                    killed.mark();
+                }
+                Some(result)
+            }
+            _ => None,
+        }
     }
 
     /// Whether [`signal_tree_untrusted`](Self::signal_tree_untrusted) has a channel left to signal
