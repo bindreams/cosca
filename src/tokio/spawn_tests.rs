@@ -223,15 +223,14 @@ fn drive_until_reaped(
     }
 }
 
-/// A tokio spawn that fails with no cgroup leaf to kill through warns that a forked child may have
-/// been left running out of reach, unless its spawn collected it: tokio can drop a child it forked
-/// and return no pid. Here the failure comes under a tree walk, which holds no leaf, and the
-/// handshake's pidfd reaps the child: the answer says so.
+/// A tokio spawn that fails after its fork, with no cgroup leaf, warns of nothing: tokio dropped
+/// the child, but the handshake holds its pidfd and has killed and reaped it, so nothing was left
+/// running out of reach. Here the failure comes under a tree walk, which holds no leaf.
 ///
-/// Mutant: the handshake leaves the dropped child, or the warning is dropped.
+/// Mutant: a spawn with no leaf warns that its child "was left running and nothing can reach it".
 #[cfg(target_os = "linux")]
 #[skuld::test]
-async fn a_post_fork_tokio_failure_without_a_leaf_says_the_child_may_be_unreachable() {
+async fn a_post_fork_tokio_failure_without_a_leaf_warns_of_no_abandoned_child() {
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let mut cmd = blocker();
@@ -243,12 +242,10 @@ async fn a_post_fork_tokio_failure_without_a_leaf_says_the_child_may_be_unreacha
     };
     assert_eq!(fate, ChildFate::Reaped, "killed and reaped through its pidfd");
     let pid = fault::take_forgotten_pid().expect("the seam dropped a child");
-    assert!(
-        crate::log_capture::records_since(mark, "nothing can reach it")
-            .iter()
-            .zip(crate::log_capture::levels_since(mark, "nothing can reach it"))
-            .any(|(_, level)| level == log::Level::Warn),
-        "the failure must say the child may be left running"
+    assert_eq!(
+        crate::log_capture::levels_since(mark, "tokio spawn failed"),
+        Vec::<log::Level>::new(),
+        "the child {pid} was reaped, so nothing is warned"
     );
     let pidfd = fault::take_forgotten_pidfd().expect("the seam took a pidfd for the child");
     assert!(reaped_through(&pidfd), "the child {pid} must be reaped");

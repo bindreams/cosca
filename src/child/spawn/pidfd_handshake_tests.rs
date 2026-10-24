@@ -1339,7 +1339,7 @@ fn conclude_a_live_cat_with_looks(looks: impl IntoIterator<Item = std::io::Resul
 }
 
 /// A foreign reap shown after a look saw the child uncollected is "reaped by someone else", not
-/// "collected when the spawn failed": nobody in cosca, std or tokio reaps it after that look.
+/// "already collected": nobody in cosca, std or tokio reaps it after that look.
 ///
 /// Mutant: every `Gone` of the teardown becomes `Collected`.
 #[skuld::test]
@@ -1405,7 +1405,7 @@ fn a_child_collected_at_the_first_look_is_collected() {
         .expect("the spawn fails")
         .expect_may_have_started_with();
         assert_eq!(fate, ChildFate::Collected);
-        assert!(fate.to_string().contains("collected when the spawn failed"), "{fate}");
+        assert!(fate.to_string().contains("already been collected"), "{fate}");
     }
 }
 

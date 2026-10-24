@@ -125,6 +125,37 @@ async fn a_failed_tokio_exec_blames_no_foreign_reaper() {
     assert_all_honest(failures);
 }
 
+/// A failed exec without a cgroup leaf warns of no abandoned child: the handshake holds the child's
+/// pidfd, and has torn it down or found it collected.
+///
+/// Mutant: a spawn with no leaf warns that its child "was left running and nothing can reach it".
+#[cfg(all(feature = "tokio", target_os = "linux"))]
+#[skuld::test]
+async fn a_failed_tokio_exec_without_a_leaf_warns_of_no_abandoned_child() {
+    common::install_log_capture();
+    let (_dir, programs) = failing_programs();
+    let mark = common::log_mark();
+    // `Strongest` holds a cgroup leaf where the host has one, and the leaf answers for its child.
+    for mode in MODES
+        .into_iter()
+        .filter(|mode| !matches!(mode, Mode::Contained(cosca::ContainMode::Strongest)))
+    {
+        for (program, _, _) in &programs {
+            let mut cmd = cosca::tokio::Command::new();
+            cmd.args([program]);
+            if let Mode::Contained(mode) = mode {
+                cmd.contain_with(mode);
+            }
+            cmd.spawn().expect_err("the exec fails");
+        }
+    }
+    assert_eq!(
+        common::levels_since(mark, "tokio spawn failed"),
+        Vec::<log::Level>::new(),
+        "a failed exec abandoned no child, so nothing is warned"
+    );
+}
+
 /// [`a_failed_tokio_exec_blames_no_foreign_reaper`] in a cgroup leaf, which the failed spawn removes.
 ///
 /// Mutant: as there.

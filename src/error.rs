@@ -307,7 +307,7 @@ impl std::fmt::Display for ChildFate {
             ChildFate::Running { id: Some(id) } => write!(f, "its child, pid {}, may still be running", id.pid()),
             ChildFate::Running { id: None } => f.write_str("its child may still be running"),
             ChildFate::Gone => f.write_str("its child had been reaped by someone else"),
-            ChildFate::Collected => f.write_str("its child had already been collected when the spawn failed"),
+            ChildFate::Collected => f.write_str("its child had already been collected by the time cosca first looked"),
             ChildFate::Unknown => f.write_str("what became of its child is unknown"),
         }
     }

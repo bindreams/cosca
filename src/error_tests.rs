@@ -299,3 +299,15 @@ fn only_a_gone_child_is_blamed_on_someone_else() {
     assert!(ChildFate::Gone.to_string().contains("reaped by someone else"));
     assert!(!ChildFate::Collected.to_string().contains("someone else"));
 }
+
+/// `Collected` is true whoever collected the child, whether the failed spawn or a foreign reaper
+/// that got there before cosca's first look: it names no collector and no moment of the failure.
+///
+/// Mutant: the message anchors the collection to "when the spawn failed".
+#[skuld::test]
+fn a_collected_child_names_no_collector_and_no_time_of_failure() {
+    assert_eq!(
+        ChildFate::Collected.to_string(),
+        "its child had already been collected by the time cosca first looked"
+    );
+}
