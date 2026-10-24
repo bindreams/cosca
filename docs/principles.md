@@ -34,10 +34,8 @@ or stuck in D state between `fork` and `exec` holds the thread. The wait for mac
 report ([`unique_report::await_report`](../src/child/spawn/unique_report.rs)) is bounded the same
 way, with accepted residuals: if something else reaps the child and another child of this process
 takes its pid, the wait lasts as long as that process; and a tracer holding the child's zombie keeps
-it waiting until the tracer hands the zombie back. One more is open: a tracer that attaches after the
-wait's last check, or that is itself traced, and exits while the child is exiting leaves it waiting
-until launchd waits on the child (or, for a traced tracer, until its own tracer reaps it). The wait
-holds `spawn_lock`, so it stalls every other cosca spawn meanwhile.
+it waiting until the tracer hands the zombie back. The wait holds `spawn_lock`, so it stalls every
+other cosca spawn meanwhile.
 
 [`SuspendedChild::resume`](../src/tokio/child/suspended.rs) is the deferred second half of a spawn,
 so the exception covers it, and it is a sync `fn`. On Windows it walks the system's thread snapshot

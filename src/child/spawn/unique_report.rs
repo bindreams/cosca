@@ -170,24 +170,22 @@ const SAY_WAITING_AFTER: std::time::Duration = std::time::Duration::from_secs(1)
 /// The pipe's EOF alone cannot end the wait. `std::io::pipe` on macOS is `pipe()`, then a separate
 /// `FD_CLOEXEC`, so any process another thread starts in between (not only a fork that never execs)
 /// inherits the write end and holds the EOF off for as long as it lives. So one kqueue watches the
-/// pipe (`EVFILT_READ`) and the child (`EVFILT_PROC`, `NOTE_EXIT`), and [`check`] asks after the
-/// child once the watch is registered and again on every wake. The child is gone when that
+/// pipe (`EVFILT_READ`) and the child (`EVFILT_PROC`, `NOTE_EXIT | NOTE_SIGNAL`), and [`check`] asks
+/// after the child once the watch is registered and again on every wake. The child is gone when that
 /// registration answers `ESRCH`, when `NOTE_EXIT` comes, or when the check finds it gone; the pipe
 /// is then read once more.
 ///
 /// A traced child's `NOTE_EXIT` reaches this process only at its tracer's hand-back. So a live
 /// tracer that holds the child's zombie keeps the wait going until it hands the zombie back: the
-/// tracer owns its tracee's stops and hand-back. The wait also watches the tracer's exit
-/// ([`TracerWatch`](crate::wait::backend::TracerWatch)), which ends it when the tracer exits while
-/// the child is exiting and XNU gives the child to launchd.
+/// tracer owns its tracee's stops and hand-back. The wait also watches the tracer's exit, up a
+/// chain of traced tracers ([`TracerWatch`](crate::wait::backend::TracerWatch)), which ends it when
+/// the tracer exits while the child is exiting and XNU gives the child to launchd. A tracer that
+/// attaches after a check sends the child `SIGSTOP`, and `NOTE_SIGNAL` makes the wait check again.
 ///
-/// The residuals. Something else reaps the child (`SIGCHLD` ignored, or a `waitpid(-1)` reaper) and
-/// another child of this process, traced or not, takes its pid before the registration: the watch
-/// and the check then name that process, and the wait lasts as long as it does, unless the pipe hits
-/// EOF first. A tracer that attaches after the wait's last check is not watched, and a tracer that
-/// is itself traced has its own `NOTE_EXIT` held back until its tracer reaps it. If either exits
-/// while the child is exiting, nothing wakes the wait until launchd waits on the child (or, for a
-/// traced tracer, until its own tracer reaps it).
+/// The residual: something else reaps the child (`SIGCHLD` ignored, or a `waitpid(-1)` reaper) and
+/// another child of this process, traced or not, takes its pid before the registration. The watch
+/// and the check then name that process, and the wait lasts as long as it does, unless the pipe
+/// hits EOF first.
 ///
 /// It waits on events, never on a timer. Past one second it warns, once, naming what it waits for:
 /// a message only, never a decision.
@@ -244,8 +242,9 @@ fn watch(read_end: &OwnedFd, pid: u32) -> io::Result<Watch> {
         0 => {}
         errno => return Err(io::Error::from_raw_os_error(errno as i32)),
     }
-    // Registered before the first check, so a child that exits after it fires `NOTE_EXIT`.
-    if crate::wait::backend::arm_note_exit_on(&kq, pid)
+    // Registered before the first check, so a child that exits after it fires `NOTE_EXIT`, and one a
+    // tracer attaches to fires `NOTE_SIGNAL`.
+    if crate::wait::backend::arm_exit_and_signals_on(&kq, pid)
         .map_err(into_io)?
         .is_none()
     {
@@ -253,7 +252,7 @@ fn watch(read_end: &OwnedFd, pid: u32) -> io::Result<Watch> {
     }
     let mut tracer = TracerWatch::default();
     let blank = KEvent::new(0, EventFilter::EVFILT_READ, EvFlags::empty(), FilterFlag::empty(), 0, 0);
-    // Room for every knote at once: the pipe, the child, and the tracers watched.
+    // A batch: events past it stay pending for the next call.
     let mut events = [blank; 8];
     let started = std::time::Instant::now();
     let mut warned = false;
@@ -293,14 +292,15 @@ fn watch(read_end: &OwnedFd, pid: u32) -> io::Result<Watch> {
             );
         }
         let woke = &events[..n];
-        if woke
-            .iter()
-            .any(|e| e.filter() == Ok(EventFilter::EVFILT_PROC) && e.ident() == pid as usize)
-        {
+        if woke.iter().any(|e| {
+            e.filter() == Ok(EventFilter::EVFILT_PROC)
+                && e.ident() == pid as usize
+                && e.fflags().contains(FilterFlag::NOTE_EXIT)
+        }) {
             return Ok(Watch::ChildGone);
         }
-        // Any other wake (a tracer's exit, the pipe, a timer) reads the pipe and checks the child
-        // again.
+        // Any other wake (a signal to the child, a tracer's exit or signal, the pipe, a timer) reads
+        // the pipe and checks the child again.
         for event in woke {
             tracer.fired(event, pid);
         }

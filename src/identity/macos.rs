@@ -92,6 +92,8 @@ pub(crate) enum ReadPurpose {
     Arm,
     /// Whether a pid whose unique id is not known yet was forked by this process.
     Origin,
+    /// A tracer on the chain that holds a child: which process it is, and who holds it.
+    Link,
 }
 
 /// The pid launchd runs as, the parent of every orphan.
@@ -306,6 +308,49 @@ pub(crate) fn origin(pid: RawPid) -> Origin {
         }
     } else {
         Origin::NotOurs
+    }
+}
+
+/// What [`link`] saw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Link {
+    /// The process with unique id `unique`. `parent` holds it now; `at_attach` is its parent when a
+    /// tracer attached, or 0 when none did.
+    Found {
+        unique: u64,
+        parent: RawPid,
+        at_attach: RawPid,
+    },
+    /// No process has the pid, or another took it between the reads.
+    Gone,
+    /// A unique-id read failed with this errno.
+    Refused(i32),
+    /// The `kinfo_proc` read was refused.
+    Unreadable,
+}
+
+/// The process `pid` names on a chain of tracers, and its parents: who holds it now, and who held
+/// it when a tracer attached. The `kinfo_proc` read is between two unique-id reads, as in
+/// [`held_by`].
+pub(crate) fn link(pid: RawPid) -> Link {
+    let unique = match uniq_info(pid, ReadPurpose::Link) {
+        UniqRead::Found(info) => info.unique_id,
+        UniqRead::Gone => return Link::Gone,
+        UniqRead::Refused(errno) => return Link::Refused(errno),
+    };
+    let info = match kinfo::kinfo(pid) {
+        Resolved::Found(info) => info,
+        Resolved::Gone => return Link::Gone,
+        Resolved::Unknown => return Link::Unreadable,
+    };
+    match uniq_info(pid, ReadPurpose::Link) {
+        UniqRead::Found(again) if again.unique_id == unique => Link::Found {
+            unique,
+            parent: info.e_ppid() as RawPid,
+            at_attach: info.kp_proc.p_oppid as RawPid,
+        },
+        UniqRead::Found(_) | UniqRead::Gone => Link::Gone,
+        UniqRead::Refused(errno) => Link::Refused(errno),
     }
 }
 
