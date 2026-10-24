@@ -17,6 +17,22 @@ pub(crate) fn assert_one_reaped_elsewhere_warn(mark: usize, pgid: u32) {
     );
 }
 
+/// Asserts the one record since `mark` on this thread says the root was reaped elsewhere, is a
+/// `warn`, and names the walk from the root's pid it skipped.
+#[cfg(target_os = "macos")]
+#[track_caller]
+pub(crate) fn assert_one_reaped_elsewhere_walk_warn(mark: usize, pid: u32) {
+    let warns = crate::log_capture::records_since_on_current_thread(mark, REAPED_ELSEWHERE);
+    assert_eq!(warns.len(), 1, "exactly one record, got {warns:?}");
+    assert_eq!(warns[0].0, log::Level::Warn, "{warns:?}");
+    assert!(
+        warns[0]
+            .1
+            .contains(&format!("walk the process table from the root's pid (root pid {pid})")),
+        "it names the walk: {warns:?}"
+    );
+}
+
 /// Every record of the tree ops' skip for a root's number they cannot trust contains this.
 pub(crate) const UNTRUSTED_NUMBER: &str = "may name another process";
 
@@ -124,14 +140,14 @@ impl EscapedHolder {
     }
 }
 
-/// Spawns [`escaped_holder_script`] behind an fd marker with a group, and waits for its holder to
-/// leave the group.
+/// Spawns [`escaped_holder_script`] behind an fd marker, with a group unless `mode` is `TreeWalk`,
+/// and waits for its holder to leave the root's group.
 #[cfg(target_os = "macos")]
-pub(crate) fn escaped_holder_tree(ignore_term: bool) -> (crate::Child, EscapedHolder) {
+pub(crate) fn escaped_holder_tree(mode: crate::ContainMode, ignore_term: bool) -> (crate::Child, EscapedHolder) {
     use std::io::BufRead as _;
     let mut cmd = crate::Command::new();
     cmd.args(["sh", "-c", &escaped_holder_script(ignore_term)]);
-    cmd.contain_with(crate::ContainMode::Session);
+    cmd.contain_with(mode);
     cmd.stdin(crate::Stdio::pipe_in()).expect("stdin pipe");
     cmd.stdout(crate::Stdio::pipe_out()).expect("stdout pipe");
     cmd.stderr(crate::Stdio::pipe_out()).expect("stderr pipe");
