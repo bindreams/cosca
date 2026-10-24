@@ -229,9 +229,11 @@ fn hold(sock: &mut std::net::TcpStream) {
     let mut b = [0u8; 1];
     loop {
         match sock.read(&mut b) {
-            Ok(n) if n > 0 && echo => sock.write_all(&b).unwrap(),
+            Ok(0) => break,
+            Ok(_) if !echo => break,
+            Ok(_) => sock.write_all(&b).unwrap(),
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            _ => break,
+            Err(e) => panic!("control socket read failed: {e}"),
         }
     }
 }
@@ -1373,10 +1375,8 @@ fn main() {
             // only runs when the kill itself succeeded — on a failed kill the child is still
             // alive and blocked, so both would block forever and discard the kill error.
             //
-            // A `kill_tree` that sent nothing leaves the acker alive and blocked on the socket
-            // this helper holds, so each blocking step after the kill first lets go of the
-            // socket: the acker then leaves on EOF (exit code 0) where a killed one has exit
-            // code 1, and the report carries the code for the test to assert on.
+            // Sockets are released before each post-kill wait: a released acker exits 0, a killed one
+            // 1, and the report carries the code.
             let (terminate_break, kill_tree) = if c1_in_console && terminate == "Ok" {
                 let seen = saw_break(&mut ack1);
                 (seen, classify(c1.kill_tree()))
@@ -1384,8 +1384,14 @@ fn main() {
                 let killed = classify(c1.kill_tree());
                 let seen = if killed == "Ok" {
                     // Half-close: the read below still collects the acker's last word, and a
-                    // live acker (no kill sent) gets EOF and leaves instead of blocking it.
-                    let _ = ack1.shutdown(std::net::Shutdown::Write);
+                    // live acker (no kill sent) gets EOF and leaves instead of blocking it. A
+                    // failure here would leave that acker blocked and the read hung.
+                    match ack1.shutdown(std::net::Shutdown::Write) {
+                        Err(e) if e.kind() != std::io::ErrorKind::NotConnected => {
+                            panic!("releasing the probe root's socket failed: {e}")
+                        }
+                        _ => {}
+                    }
                     saw_break(&mut ack1)
                 } else {
                     "K"

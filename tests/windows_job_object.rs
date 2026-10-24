@@ -6,15 +6,15 @@
 //!
 //! Both required behaviors need a real, provably-alive descendant tree, not merely "hasn't been
 //! reaped yet": `control-block`'s EOF-on-death is proof of death, never proof of life. Both
-//! members here run the testbin's `control-echo-pid` round-trip (via `spawn-grandchild-echo`),
-//! mirroring `tests/macos_fdmarker.rs`'s `Member` (alive = a real write/read round trip). Death is
-//! proven by the exit event in `kill_tree_reaps_every_descendant` and
-//! `dropping_a_live_job_reaps_every_descendant`, because a job kill only starts termination.
+//! members here run the testbin's `control-echo-pid` round-trip (via `spawn-grandchild-echo`):
+//! alive = a real write/read round trip. Death is proven by the exit event in
+//! `kill_tree_reaps_every_descendant` and `dropping_a_live_job_reaps_every_descendant`, because a
+//! job kill only starts termination.
 
 #[cfg(windows)]
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader};
 #[cfg(windows)]
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 #[cfg(windows)]
 use std::os::windows::io::{BorrowedHandle, RawHandle};
 
@@ -31,80 +31,6 @@ use windows::Win32::System::Threading::{
     CreateProcessW, ResumeThread, TerminateProcess, WaitForSingleObject, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
     PROCESS_INFORMATION, STARTUPINFOW,
 };
-
-#[cfg(windows)]
-/// One tree member's control channel: its pid, the socket that proves it alive or dead, and
-/// an owned handle opened while it was provably alive.
-///
-/// The handle is what makes cleanup safe. Terminating by pid alone races the member's own
-/// exit: Windows recycles a dead process's pid, so a pid read at handshake time can name an
-/// unrelated process by the time a test tears down — and on a shared CI runner that is
-/// someone else's process. An open handle pins the pid for as long as it is held, so the
-/// terminate can only ever land on the intended member.
-///
-/// Mirrors `tests/macos_fdmarker.rs`'s `Member`.
-struct Member {
-    pid: u32,
-    sock: TcpStream,
-    process: HANDLE,
-}
-
-#[cfg(windows)]
-impl Drop for Member {
-    fn drop(&mut self) {
-        // SAFETY: `process` is this struct's own handle, opened once and closed only here.
-        unsafe {
-            let _ = TerminateProcess(self.process, 1);
-            let _ = CloseHandle(self.process);
-        }
-    }
-}
-
-#[cfg(windows)]
-impl Member {
-    /// Alive, proven positively: a byte in, the same byte back. A dead member EOFs instead.
-    fn assert_alive(&mut self, who: &str) {
-        self.sock.write_all(b"x").expect("write to the control socket");
-        let mut b = [0u8; 1];
-        let n = self.sock.read(&mut b).expect("read the control socket");
-        assert_eq!(n, 1, "{who} (pid {}) must still be alive and echoing", self.pid);
-        assert_eq!(&b, b"x", "{who} echoed {b:?} instead of the byte sent");
-    }
-}
-
-#[cfg(windows)]
-/// An exit watch on `member` for [`assert_killed`] and [`assert_not_released`], opened while the
-/// member is alive. It shares `member`'s socket, which stays open until [`release`] closes it.
-fn watch(member: &Member) -> common::Member {
-    common::Member::new(member.sock.try_clone().expect("clone the control socket"), member.pid)
-}
-
-#[cfg(windows)]
-/// Assert that the kill that just ran killed every watched member. `TerminateJobObject` only
-/// STARTS termination, so a write/read probe could still be answered by a member about to die.
-/// Releasing `held` and waiting for each exit code ends either way: a member the kill missed
-/// leaves on the release with code `0`, and the assertion on code `1` fails.
-fn assert_killed(watched: Vec<(common::Member, &str)>, held: [&Member; 2]) {
-    release(held);
-    common::assert_members_killed(watched);
-}
-
-#[cfg(windows)]
-/// [`assert_killed`] for a kill whose exit code is not known (`KILL_ON_JOB_CLOSE`): the tree was
-/// started with `COSCA_TEST_RELEASED_EXIT` set (see [`spawn_contained_tree`]), so a member the kill
-/// missed leaves on the release with that code, and the assertion is that none did.
-fn assert_not_released(watched: Vec<(common::Member, &str)>, held: [&Member; 2]) {
-    release(held);
-    common::assert_members_not_released(watched);
-}
-
-#[cfg(windows)]
-/// Close the test's own sockets, which keep the members' peers open.
-fn release(held: [&Member; 2]) {
-    for member in held {
-        let _ = member.sock.shutdown(std::net::Shutdown::Both);
-    }
-}
 
 #[cfg(windows)]
 /// A process created `CREATE_SUSPENDED` via a raw `CreateProcessW` call — never through
@@ -221,7 +147,7 @@ impl Drop for Suspended {
 /// assign it to a fresh `cosca::Job`, resume it, then demux both members' `<tag><pid>\n`
 /// handshakes by tag. The grandchild is spawned by the ROOT after resume — proving the job
 /// reaches a descendant this test process never itself created or assigned.
-fn spawn_contained_tree() -> (Suspended, cosca::Job, Member, Member) {
+fn spawn_contained_tree() -> (Suspended, cosca::Job, common::Member, common::Member) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr").to_string();
 
@@ -256,17 +182,8 @@ fn spawn_contained_tree() -> (Suspended, cosca::Job, Member, Member) {
     let mut grand_member = None;
     for ((tag, pid), sock) in handshakes.into_iter().zip(socks) {
         // Both members are alive and blocked on their sockets, which this test holds; see
-        // `Member`'s doc for why a pid captured earlier cannot be trusted at teardown.
-        // SAFETY: standard Win32 call; the handle is closed by `Member::drop`.
-        let process = unsafe {
-            windows::Win32::System::Threading::OpenProcess(
-                windows::Win32::System::Threading::PROCESS_TERMINATE,
-                false,
-                pid,
-            )
-            .expect("open the member that just completed its handshake")
-        };
-        let m = Member { pid, sock, process };
+        // `common::Member` for why a pid captured earlier cannot be trusted at teardown.
+        let m = common::Member::new(sock, pid);
         match tag.as_str() {
             "R" => root_member = Some(m),
             "G" => grand_member = Some(m),
@@ -291,13 +208,14 @@ fn kill_tree_reaps_every_descendant() {
     root_member.assert_alive("the root, before teardown");
     grand_member.assert_alive("the grandchild, before teardown");
 
-    let watched = vec![
-        (watch(&root_member), "the root, after kill_tree"),
-        (watch(&grand_member), "the grandchild, after kill_tree"),
-    ];
     job.kill_tree().expect("kill_tree");
 
-    assert_killed(watched, [&root_member, &grand_member]);
+    // `TerminateJobObject` only starts termination, so the proof is each member's exit event and
+    // kill exit code, with its socket released so a missing kill ends the wait too.
+    common::assert_members_killed(vec![
+        (root_member, "the root, after kill_tree"),
+        (grand_member, "the grandchild, after kill_tree"),
+    ]);
 }
 
 #[cfg(windows)]
@@ -317,8 +235,8 @@ fn disarm_leaves_every_descendant_running() {
     grand_member.assert_alive("the grandchild, after disarm + drop(Job)");
 
     // Cleanup: `Suspended::drop` only reaches the root; the grandchild survives it, because a
-    // disarmed job is by design no longer this test's tool for reaching it. `Member::drop`
-    // terminates each through its own pinned handle.
+    // disarmed job is by design no longer this test's tool for reaching it. Dropping a
+    // `common::Member` terminates it through its own pinned handle.
     root_member.sock.shutdown(std::net::Shutdown::Both).ok();
     grand_member.sock.shutdown(std::net::Shutdown::Both).ok();
     drop(root);
@@ -337,21 +255,19 @@ fn dropping_a_live_job_reaps_every_descendant() {
     root_member.assert_alive("the root, before drop");
     grand_member.assert_alive("the grandchild, before drop");
 
-    // Opened while both are alive and held; the closing of the last job handle only STARTS
-    // termination, and its exit code is only required not to be a release or crash code.
+    // Closing the last job handle only STARTS termination, and its exit code is only required not to
+    // be a release or crash code.
     //
-    // Soundness rests on a kernel ordering, not a documented guarantee: closing the last job handle
-    // terminates every member before `CloseHandle` returns (Microsoft's Job Objects page: it
-    // "terminates all associated processes and then destroys the job object"), so each member has its
-    // terminate APC queued before `assert_not_released` sends the release, and cannot return to user
-    // mode to read it. If that failed, the test would fail on correct code, never pass on broken code.
-    let watched = vec![
-        (watch(&root_member), "the root, after dropping the Job"),
-        (watch(&grand_member), "the grandchild, after dropping the Job"),
-    ];
+    // Soundness rests on `CloseHandle` of the last job handle terminating every member before it
+    // returns (Job Objects docs: it "terminates all associated processes and then destroys the job
+    // object"), so no member can read the release. If that failed the test would fail on correct
+    // code, never pass on broken code.
     drop(job);
 
-    assert_not_released(watched, [&root_member, &grand_member]);
+    common::assert_members_not_released(vec![
+        (root_member, "the root, after dropping the Job"),
+        (grand_member, "the grandchild, after dropping the Job"),
+    ]);
     drop(root);
 }
 

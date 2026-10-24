@@ -2,34 +2,27 @@
 //!
 //! A test that ends a tree and then reads a member's socket for EOF hangs if the kill sent
 //! nothing. [`assert_members_killed`] fails by assertion instead, and never waits on a member that
-//! a missing kill left alive.
+//! a missing kill left alive. Call them right after the kill, before any wait on the tree.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
 #[path = "../../testbin/echo_held.rs"]
 mod echo_held;
-/// Makes the testbin's `control-block` family echo each byte the test writes instead of leaving on
-/// it, so [`assert_dead`] can tell a killed member from one that is alive.
 pub use echo_held::ECHO_HELD_ENV;
 pub use echo_held::RELEASED_EXIT_ENV;
 
-/// Prove a member that echoes (see [`ECHO_HELD_ENV`]) is DEAD without waiting for its death: send
+/// Prove a member that echoes (see [`ECHO_HELD_ENV`]) is dead without waiting for its death: send
 /// a byte and read. A killed member refuses the write or gives EOF or a reset on the read; one a
-/// missing kill left alive echoes the byte. That makes a `kill_tree` that sends nothing fail here
-/// by assertion instead of hanging a blocking read for an EOF, so call it right after the kill,
-/// before any wait on the tree.
+/// missing kill left alive echoes the byte, so a `kill_tree` that sends nothing fails by assertion
+/// instead of hanging a read for an EOF.
 ///
-/// Unix only in effect (see [`assert_members_killed`] for the portable form): it rests on a
-/// delivered `SIGKILL` being pending before the kill call returns, so the member cannot run user
-/// code again. `TerminateProcess` and `TerminateJobObject` only START termination, so on Windows a
-/// member may still echo for a moment after the kill returned.
+/// Unix only: it relies on a delivered `SIGKILL` being pending before the kill returns. Windows uses
+/// [`assert_members_killed`].
 pub fn assert_dead(sock: &mut TcpStream, who: &str) {
     use std::io::ErrorKind::{BrokenPipe, ConnectionAborted, ConnectionReset};
-    // A dead peer can surface on the write (the FIN or RST already arrived) or, if the write went
-    // through, on the read: macOS (BSD `soreceive`) checks `so_error` before end-of-file, so the
-    // read can return `ECONNRESET` or `EPIPE` instead of `Ok(0)`. Every write error means the
-    // peer is gone; only an echoed byte means it is alive.
+    // A dead peer surfaces on the write, or on the read: BSD checks `so_error` before EOF, so the
+    // read may be a reset rather than `Ok(0)`. Only an echoed byte means alive.
     if sock.write_all(b"p").is_err() {
         return;
     }
@@ -41,10 +34,13 @@ pub fn assert_dead(sock: &mut TcpStream, who: &str) {
     }
 }
 
-/// A tree member's control socket, plus on Windows a handle on its process. Build it while the
-/// member is alive and blocked on `sock`, before the kill: a live member cannot exit, so its pid
-/// cannot be reissued before the handle is open.
+/// A tree member's pid and control socket, plus on Windows a handle on its process. Build it while
+/// the member is alive and blocked on `sock`, before the kill: a live member cannot exit, so its pid
+/// cannot be reissued before the handle is open. The open handle then pins the pid, so on Windows
+/// dropping a `Member` terminates the process it was built on and no other, which a bare pid could
+/// not promise once the member exits.
 pub struct Member {
+    pub pid: u32,
     pub sock: TcpStream,
     #[cfg(windows)]
     exit: windows_exit::ExitHandle,
@@ -52,13 +48,28 @@ pub struct Member {
 
 impl Member {
     pub fn new(sock: TcpStream, pid: u32) -> Member {
-        #[cfg(not(windows))]
-        let _ = pid;
         Member {
+            pid,
             sock,
             #[cfg(windows)]
             exit: windows_exit::ExitHandle::open(pid),
         }
+    }
+
+    /// Alive, proven positively: a byte in, the same byte back. The member must be one that echoes
+    /// (`control-echo-pid`, or a `control-block` family member with [`ECHO_HELD_ENV`] set).
+    pub fn assert_alive(&mut self, who: &str) {
+        self.sock.write_all(b"x").expect("write to the control socket");
+        let mut b = [0u8; 1];
+        let n = self.sock.read(&mut b).expect("read the control socket");
+        assert_eq!(n, 1, "{who} (pid {}) must still be alive and echoing", self.pid);
+        assert_eq!(&b, b"x", "{who} echoed {b:?} instead of the byte sent");
+    }
+
+    /// [`assert_dead`] on this member's socket, naming its pid.
+    #[cfg(unix)]
+    pub fn assert_dead(&mut self, who: &str) {
+        assert_dead(&mut self.sock, &format!("{who} (pid {})", self.pid));
     }
 }
 
@@ -66,8 +77,7 @@ impl Member {
 /// [`RELEASED_EXIT_ENV`] set to it. Chosen to differ from every code a kill produces.
 pub const RELEASED_EXIT_CODE: u32 = 77;
 
-/// Assert that `kill_tree` killed every member, each named for the failure message. Call it right
-/// after the kill, before any wait on the tree.
+/// Assert that `kill_tree` killed every member, each named for the failure message.
 ///
 /// Unix: [`assert_dead`] on each. Windows: release every member (close its socket), then wait for
 /// each process to exit and assert it died to the kill's exit code `1`. `TerminateProcess` only
@@ -98,9 +108,7 @@ const CRASH_EXIT_CODES: [u32; 4] = [101, 0xC000_0005, 0xC000_001D, 0xC000_0409];
 /// whose own exit code is not known (`KILL_ON_JOB_CLOSE`): the tree was started with
 /// [`RELEASED_EXIT_ENV`] set to [`RELEASED_EXIT_CODE`], so a member the kill missed leaves on the
 /// release with that code. A member that crashed on the release (a panic on a reset socket, say)
-/// leaves with one of [`CRASH_EXIT_CODES`] and must not pass as killed either. Each member's code is
-/// printed (`--no-capture`) and named in the failure. Call it right after the kill, before any wait
-/// on the tree.
+/// leaves with one of [`CRASH_EXIT_CODES`] and must not pass as killed either.
 #[cfg(windows)]
 pub fn assert_members_not_released(members: Vec<(Member, &str)>) {
     for (code, who) in release_and_wait(members) {
@@ -135,18 +143,24 @@ fn release_and_wait(members: Vec<(Member, &str)>) -> Vec<(u32, &str)> {
 mod windows_exit {
     use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
     use windows::Win32::System::Threading::{
-        GetExitCodeProcess, OpenProcess, WaitForSingleObject, INFINITE, PROCESS_QUERY_LIMITED_INFORMATION,
-        PROCESS_SYNCHRONIZE,
+        GetExitCodeProcess, OpenProcess, TerminateProcess, WaitForSingleObject, INFINITE,
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
     };
 
-    /// A process handle that can wait for the exit and read the exit code.
+    /// A process handle that can wait for the exit, read the exit code and terminate the process.
     pub struct ExitHandle(HANDLE);
 
     impl ExitHandle {
         pub fn open(pid: u32) -> ExitHandle {
             // SAFETY: plain Win32 call; the handle is owned and closed by `Drop`.
-            let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
-                .unwrap_or_else(|e| panic!("OpenProcess({pid}) for the exit watch: {e}"));
+            let handle = unsafe {
+                OpenProcess(
+                    PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+                    false,
+                    pid,
+                )
+            }
+            .unwrap_or_else(|e| panic!("OpenProcess({pid}) for the exit watch: {e}"));
             ExitHandle(handle)
         }
 
@@ -164,6 +178,10 @@ mod windows_exit {
 
     impl Drop for ExitHandle {
         fn drop(&mut self) {
+            // SAFETY: `self.0` is a live handle this struct owns. The open handle pins the pid, so
+            // this can only reach the member it was opened on; a process that already exited makes
+            // it fail harmlessly.
+            let _ = unsafe { TerminateProcess(self.0, 1) };
             // SAFETY: closes the handle `open` returned.
             let closed = unsafe { CloseHandle(self.0) };
             debug_assert!(closed.is_ok(), "CloseHandle on the exit watch failed: {closed:?}");

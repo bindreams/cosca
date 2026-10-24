@@ -4,43 +4,18 @@
 #[cfg(target_os = "macos")]
 use std::io::{BufRead, BufReader, Read, Write};
 #[cfg(target_os = "macos")]
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 
 #[cfg(target_os = "macos")]
 #[path = "common/mod.rs"]
 mod common;
 #[cfg(target_os = "macos")]
-use common::testbin;
+use common::{testbin, Member};
 
 #[cfg(target_os = "macos")]
 /// `Holder.clexec` is `pub(crate)`, unreachable from this crate; the ONLY observable production
 /// effect of `holders()`'s CLOEXEC AND-fold is this warning, so that is what this test asserts on.
 const WOULD_LOSE_MARKER_LOG_NEEDLE: &str = "will lose the marker at its next";
-
-#[cfg(target_os = "macos")]
-/// One tree member's control channel: its pid, and the socket that proves it alive or dead.
-struct Member {
-    pid: u32,
-    sock: TcpStream,
-}
-
-#[cfg(target_os = "macos")]
-impl Member {
-    /// Alive, proven positively: a byte in, the same byte back. A dead member EOFs instead.
-    fn assert_alive(&mut self, who: &str) {
-        self.sock.write_all(b"x").expect("write to the control socket");
-        let mut b = [0u8; 1];
-        let n = self.sock.read(&mut b).expect("read the control socket");
-        assert_eq!(n, 1, "{who} (pid {}) must still be alive and echoing", self.pid);
-        assert_eq!(&b, b"x", "{who} echoed {b:?} instead of the byte sent");
-    }
-
-    /// Dead, proven by [`common::assert_dead`] (a write failure, or EOF or a reset on the read,
-    /// on a socket the test still holds); only an echoed byte is proof of life.
-    fn assert_dead(&mut self, who: &str) {
-        common::assert_dead(&mut self.sock, &format!("{who} (pid {})", self.pid));
-    }
-}
 
 #[cfg(target_os = "macos")]
 /// Spawn the orphan-escapee tree contained. Returns the root child plus the root's and the
@@ -72,10 +47,7 @@ fn spawn_orphan_tree(mode: cosca::ContainMode) -> (cosca::Child, Member, Member)
     let mut grand = None;
     for (line, sock) in lines.into_iter().zip(socks) {
         let (tag, pid) = line.trim().split_at(1);
-        let m = Member {
-            pid: pid.parse().expect("member pid"),
-            sock,
-        };
+        let m = Member::new(sock, pid.parse().expect("member pid"));
         match tag {
             "R" => root = Some(m),
             "G" => grand = Some(m),
@@ -217,10 +189,7 @@ async fn spawn_orphan_tree_async(mode: cosca::ContainMode) -> (cosca::tokio::Chi
             .read_line(&mut line)
             .expect("read tag+pid");
         let (tag, pid) = line.trim().split_at(1);
-        let m = Member {
-            pid: pid.parse().expect("member pid"),
-            sock: s,
-        };
+        let m = Member::new(s, pid.parse().expect("member pid"));
         match tag {
             "R" => root = Some(m),
             "G" => grand = Some(m),
@@ -293,10 +262,7 @@ fn kill_tree_reaches_the_orphan_through_a_real_wide_fd_mapping() {
     let mut grand = None;
     for (line, sock) in lines.into_iter().zip(socks) {
         let (tag, pid) = line.trim().split_at(1);
-        let m = Member {
-            pid: pid.parse().expect("member pid"),
-            sock,
-        };
+        let m = Member::new(sock, pid.parse().expect("member pid"));
         match tag {
             "R" => root = Some(m),
             "G" => grand = Some(m),
