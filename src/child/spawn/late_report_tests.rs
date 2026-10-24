@@ -173,6 +173,118 @@ fn macos_sync_spawn_with_fds_0_and_1_closed_leaves_no_child_behind() {
     drop(writer);
 }
 
+/// With two of fds 0 to 2 closed in the parent, std returns before the child's hooks run and cannot
+/// see whether its `exec` ran, so the child is late even when its report beats the parent's first
+/// read: the seam holds that read until the report is in the pipe. The child is torn down through
+/// its id, not adopted. Runs in a process of its own, since closing fds is process-wide.
+///
+/// Mutant: the report's timing decides, so an id read on the first read is adopted.
+#[skuld::test]
+fn macos_sync_spawn_with_fds_0_and_1_closed_tears_down_a_child_whose_report_came_first() {
+    use crate::test_own_process::{own_process, test_path};
+    use crate::test_spawn::spawn;
+
+    let Some(done) = own_process(
+        test_path!(macos_sync_spawn_with_fds_0_and_1_closed_tears_down_a_child_whose_report_came_first),
+        spawn,
+    ) else {
+        return;
+    };
+    crate::log_capture::install();
+    let (mut cmd, writer) = sync_blocker();
+    cmd.stdout(null_stdio()).expect("set stdout");
+    let first = unique_report::seams::let_the_report_come_first();
+    let mark = crate::log_capture::mark();
+    let restore = close_fds_0_and_1(&done);
+    let spawned = cmd.spawn();
+    drop(restore);
+    drop(first);
+    let err = spawned.expect_err("a child whose exec std could not see is not adopted");
+    let (err, fate) = crate::child::spawn::failure::expect_may_have_started_with(err);
+    assert!(err.to_string().contains("exec cannot be confirmed"), "{err}");
+    assert_eq!(fate, ChildFate::Reaped, "the child is torn down through its id");
+    let Some(crate::identity::Resolved::Found(id)) = crate::child::spawn::fault::take_captured() else {
+        panic!("the spawn captured the child");
+    };
+    assert!(is_reaped(id.pid()), "nothing is left to wait for");
+    assert_one_warn(id.pid(), mark, &[SAID_REAPED], &[]);
+    drop(writer);
+}
+
+/// A spawn waiting for a late report does not hold `spawn_lock`: another spawn, on another thread,
+/// completes meanwhile. The child is held before its report, and the wait's first block starts the
+/// other spawn and waits for its first word: `completed` once it returns, or `contended` from the
+/// seam if it finds the lock held. Either arrives without the held child, so a wait under the lock
+/// fails the assertion instead of hanging; the report is released afterwards. Runs in a process of
+/// its own with fds 0 and 1 closed, so the child can be held before its report while the spawn goes
+/// on.
+///
+/// Mutant: the wait for the report runs under `spawn_lock`.
+#[skuld::test]
+fn macos_a_spawn_waiting_for_a_late_report_lets_another_spawn_complete() {
+    use crate::test_own_process::{own_process, test_path};
+    use crate::test_spawn::spawn;
+
+    let Some(done) = own_process(
+        test_path!(macos_a_spawn_waiting_for_a_late_report_lets_another_spawn_complete),
+        spawn,
+    ) else {
+        return;
+    };
+    crate::log_capture::install();
+    let (mut cmd, writer) = sync_blocker();
+    cmd.stdout(null_stdio()).expect("set stdout");
+    // Set up before the close, so its stdio lands above fds 0 to 2.
+    let mut other = crate::Command::new();
+    other.args(["/usr/bin/true"]);
+    other.stdin(null_stdio()).expect("set stdin");
+    other.stdout(null_stdio()).expect("set stdout");
+    let (said, heard) = std::sync::mpsc::channel::<&'static str>();
+    let _contended = crate::child::spawn::fault::on_spawn_lock_contended({
+        let said = said.clone();
+        move || {
+            // The receiver may be gone: the hook took the first word already.
+            said.send("contended").ok();
+        }
+    });
+    let first_word = Rc::new(Cell::new(None));
+    let second = Rc::new(std::cell::RefCell::new(None));
+    let _hook = unique_report::seams::on_first_block({
+        let (first_word, second) = (Rc::clone(&first_word), Rc::clone(&second));
+        move || {
+            let thread = std::thread::spawn(move || {
+                let spawned = other.spawn();
+                said.send("completed").ok();
+                // Whatever it answered: a spawn with fds 0 and 1 closed is late, and torn down.
+                drop(spawned);
+            });
+            first_word.set(Some(heard.recv().expect("the other spawn's first word")));
+            unique_report::seams::release_the_report();
+            *second.borrow_mut() = Some(thread);
+        }
+    });
+    let held = unique_report::seams::hold_the_report();
+    let restore = close_fds_0_and_1(&done);
+    let spawned = cmd.spawn();
+    drop(restore);
+    drop(held);
+    second
+        .borrow_mut()
+        .take()
+        .expect("the wait blocked and started the other spawn")
+        .join()
+        .expect("the other spawn's thread");
+    assert_eq!(
+        first_word.get(),
+        Some("completed"),
+        "another spawn must complete while this one waits for its report"
+    );
+    let err = spawned.expect_err("a late child is not adopted");
+    let (_err, fate) = crate::child::spawn::failure::expect_may_have_started_with(err);
+    assert_eq!(fate, ChildFate::Reaped, "the late child is torn down");
+    drop(writer);
+}
+
 /// An elevation front whose report came late is sent nothing and left unreaped, as every front is.
 /// The one `warn` says so, and says nothing of a kill.
 ///
@@ -872,4 +984,282 @@ fn macos_late_teardown_whose_reap_peek_fails_after_the_kill_is_unknown() {
         "{warn}"
     );
     reap_by_pid(pid);
+}
+
+// A root not shown a zombie after its kill =====
+
+/// What [`late_tree_not_zombie`] saw.
+struct NotZombie {
+    fate: ChildFate,
+    /// Whether the grandchild outlived the teardown.
+    survived: bool,
+    /// The walks from the root's pid after the root's kill.
+    walks_after: Vec<u32>,
+    /// The marker holders signalled after the root's kill.
+    holders_after: Vec<u32>,
+    warn: String,
+}
+
+/// A late [`TREE_ARGV`] child contained as `contain` sets, whose wait after the root's kill is forced
+/// to `waited`, so the root is not shown an unreaped zombie. `spoil` runs once the grandchild runs,
+/// before the first sweep. The root is left a zombie, which this reaps.
+fn late_tree_not_zombie(
+    contain: impl FnOnce(&mut crate::Command),
+    waited: crate::wait::exit_only::Foreign,
+    spoil: impl FnOnce() + 'static,
+) -> NotZombie {
+    use crate::child::spawn::fault::{set_at, SpawnPoint};
+    use std::cell::RefCell;
+    crate::log_capture::install();
+    let (tree, ends) = tree_pipes();
+    let mut cmd = crate::Command::new();
+    cmd.args(TREE_ARGV);
+    contain(&mut cmd);
+    for (fd, end) in ends {
+        cmd.fd(fd, end).expect("set the fd");
+    }
+    let tree = Rc::new(RefCell::new(Some(tree)));
+    let walks = Rc::new(crate::containment::treewalk::fault::record_walks());
+    let holders = crate::containment::fdmarker::fault::record_holder_kills();
+    let _first = set_at(SpawnPoint::BeforeLateTeardown, {
+        let tree = Rc::clone(&tree);
+        move || {
+            tree.borrow_mut().as_mut().expect("the tree").await_grandchild();
+            spoil();
+        }
+    });
+    let marks = Rc::new(Cell::new((0, 0)));
+    let forced: Rc<RefCell<Option<crate::wait::exit_only::seams::Forced>>> = Rc::default();
+    let _second = set_at(SpawnPoint::BeforeLateRootKill, {
+        let (walks, marks, forced) = (Rc::clone(&walks), Rc::clone(&marks), Rc::clone(&forced));
+        move || {
+            let holders = crate::containment::fdmarker::fault::holder_kills_so_far();
+            marks.set((walks.walked().len(), holders.len()));
+            *forced.borrow_mut() = Some(force_peek_once(Ok(Peek::Foreign(waited))));
+        }
+    });
+    let mark = crate::log_capture::mark();
+    let err = {
+        let _late = unique_report::seams::find_the_report_unwritten();
+        cmd.spawn().expect_err("a late child is not adopted")
+    };
+    drop(forced.borrow_mut().take());
+    let (_err, fate) = crate::child::spawn::failure::expect_may_have_started_with(err);
+    let Some(crate::identity::Resolved::Found(id)) = crate::child::spawn::fault::take_captured() else {
+        panic!("the spawn captured the child");
+    };
+    let survived = tree.borrow_mut().take().expect("the tree").grandchild_survived();
+    let (walk_mark, holder_mark) = marks.get();
+    let seen = NotZombie {
+        fate,
+        survived,
+        walks_after: walks.walked()[walk_mark..].to_vec(),
+        holders_after: holders.killed()[holder_mark..].to_vec(),
+        warn: only(&warns_of(id.pid(), mark)).to_owned(),
+    };
+    reap_by_pid(id.pid());
+    seen
+}
+
+/// The note of a root not shown an unreaped zombie after its kill.
+const NOT_SWEPT_AGAIN: &str = "not shown an unreaped zombie, so its tree was not killed again by its pid";
+
+/// A marked tree whose root is not shown a zombie after its kill: its marker's holders are still
+/// swept, and the root's pid is not walked again. The first sweep is spoiled (a blind snapshot), so
+/// only that holders' sweep can reach the grandchild.
+///
+/// Mutant: a root not shown a zombie gets no sweep of its marker's holders.
+#[skuld::test]
+fn macos_late_marked_tree_whose_root_is_not_shown_a_zombie_still_sweeps_its_holders() {
+    use crate::containment::ContainMode;
+    let seen = late_tree_not_zombie(
+        |cmd| {
+            cmd.contain_with(ContainMode::TreeWalk);
+        },
+        crate::wait::exit_only::Foreign::Gone,
+        || crate::containment::enumerate::force_blind_snapshot_for_next_call(true),
+    );
+    assert!(!seen.survived, "the grandchild holds the marker, so its sweep kills it");
+    assert!(
+        !seen.holders_after.is_empty(),
+        "the marker's holders are swept after the root's kill"
+    );
+    assert_eq!(
+        seen.walks_after,
+        Vec::<u32>::new(),
+        "the root's pid is not walked again"
+    );
+    assert_eq!(seen.fate, ChildFate::Killed);
+    assert!(
+        seen.warn.contains(NOT_SWEPT_AGAIN) && seen.warn.contains("its tree was not fully killed"),
+        "{}",
+        seen.warn
+    );
+}
+
+/// A tree walked from its root, whose root launchd holds after its kill: the root's pid is not
+/// walked again, and the warn says what that may leave.
+///
+/// Mutants: the root's pid is walked again; the note is dropped.
+#[skuld::test]
+fn macos_late_walked_tree_whose_root_is_not_shown_a_zombie_is_not_walked_again() {
+    use crate::containment::ContainMode;
+    let seen = late_tree_not_zombie(
+        |cmd| {
+            cmd.contain_with(ContainMode::TreeWalk).suppress_fd_marker();
+        },
+        crate::wait::exit_only::Foreign::Orphaned,
+        || {},
+    );
+    assert!(!seen.survived, "the first sweep kills the grandchild");
+    assert_eq!(
+        seen.walks_after,
+        Vec::<u32>::new(),
+        "the root's pid is not walked again"
+    );
+    assert_eq!(seen.fate, ChildFate::Killed);
+    assert!(seen.warn.contains(NOT_SWEPT_AGAIN), "{}", seen.warn);
+}
+
+/// A Session tree whose root is shown gone after its kill: the warn says its group was not killed
+/// again.
+///
+/// Mutant: the note is dropped.
+#[skuld::test]
+fn macos_late_session_tree_whose_root_is_not_shown_a_zombie_says_so() {
+    use crate::containment::ContainMode;
+    let seen = late_tree_not_zombie(
+        |cmd| {
+            cmd.contain_with(ContainMode::Session).suppress_fd_marker();
+        },
+        crate::wait::exit_only::Foreign::Gone,
+        || {},
+    );
+    assert!(!seen.survived, "the first sweep kills the grandchild");
+    assert_eq!(seen.fate, ChildFate::Killed);
+    assert!(seen.warn.contains(NOT_SWEPT_AGAIN), "{}", seen.warn);
+}
+
+/// Resets a spawn fault flag when dropped.
+struct Unforce(fn(bool));
+
+impl Drop for Unforce {
+    fn drop(&mut self) {
+        (self.0)(false);
+    }
+}
+
+/// Sets a spawn fault flag until the guard drops.
+fn force(set: fn(bool)) -> Box<dyn std::any::Any> {
+    set(true);
+    Box::new(Unforce(set))
+}
+
+/// A contained child whose identity cannot be read, and that has no marker: its tree is not killed,
+/// and the warn says why. The root's own kill, checked against its id, still runs.
+///
+/// Mutants: the note is dropped; it calls the child gone.
+#[skuld::test]
+fn macos_late_teardown_of_an_unreadable_child_without_a_marker_says_its_tree_was_not_killed() {
+    let (child, stdin, unique) = std_blocker_with_unique();
+    let stdin = Rc::new(Cell::new(Some(stdin)));
+    let pid = child.id();
+    let walked = crate::containment::Prepared {
+        mode: Some(crate::containment::ContainMode::TreeWalk),
+        is_root: true,
+        marker: None,
+    };
+    let (fate, warns, sent) = tear_down_with(walked, child, &stdin, unique, |_| {
+        vec![force(crate::child::spawn::fault::set_force_identity_unknown)]
+    });
+    assert_eq!(fate, ChildFate::Reaped);
+    assert_kill_sent(pid, &sent);
+    let warn = only(&warns);
+    assert!(
+        warn.contains("its tree was not killed: the child's identity could not be read"),
+        "{warn}"
+    );
+}
+
+/// A contained child whose identity cannot be read, with a marker: its tree is reached through the
+/// marker's holders alone, which kill the grandchild, and the warn says so.
+///
+/// Mutants: the marker's holders are not swept; the note is dropped.
+#[skuld::test]
+fn macos_late_teardown_of_an_unreadable_marked_child_sweeps_its_holders() {
+    use crate::child::spawn::fault::{set_at, SpawnPoint};
+    crate::log_capture::install();
+    let (tree, ends) = tree_pipes();
+    let mut cmd = crate::Command::new();
+    cmd.args(TREE_ARGV).contain();
+    for (fd, end) in ends {
+        cmd.fd(fd, end).expect("set the fd");
+    }
+    let tree = Rc::new(std::cell::RefCell::new(Some(tree)));
+    let unknown = Rc::new(std::cell::RefCell::new(None));
+    let _hook = set_at(SpawnPoint::BeforeLateTeardown, {
+        let (tree, unknown) = (Rc::clone(&tree), Rc::clone(&unknown));
+        move || {
+            tree.borrow_mut().as_mut().expect("the tree").await_grandchild();
+            *unknown.borrow_mut() = Some(force(crate::child::spawn::fault::set_force_identity_unknown));
+        }
+    });
+    let mark = crate::log_capture::mark();
+    let err = {
+        let _late = unique_report::seams::find_the_report_unwritten();
+        cmd.spawn().expect_err("a late child is not adopted")
+    };
+    drop(unknown.borrow_mut().take());
+    let (_err, _fate) = crate::child::spawn::failure::expect_may_have_started_with(err);
+    let Some(crate::identity::Resolved::Found(id)) = crate::child::spawn::fault::take_captured() else {
+        panic!("the spawn captured the child");
+    };
+    let tree = tree.borrow_mut().take().expect("the tree");
+    assert!(!tree.grandchild_survived(), "the marker's holders are swept");
+    let warn = only(&warns_of(id.pid(), mark)).to_owned();
+    assert!(
+        warn.contains(
+            "the child's identity could not be read, so its tree is reached only through its marker's holders"
+        ),
+        "{warn}"
+    );
+}
+
+/// A child whose identity was read but whose tree attach failed: its tree is not killed, and the
+/// warn gives the attach's error. The root's own kill still runs.
+///
+/// Mutant: the attach's note is dropped.
+#[skuld::test]
+fn macos_late_teardown_whose_tree_attach_fails_says_its_tree_was_not_killed() {
+    let (child, stdin, unique) = std_blocker_with_unique();
+    let stdin = Rc::new(Cell::new(Some(stdin)));
+    let pid = child.id();
+    let walked = crate::containment::Prepared {
+        mode: Some(crate::containment::ContainMode::TreeWalk),
+        is_root: true,
+        marker: None,
+    };
+    let (fate, warns, sent) = tear_down_with(walked, child, &stdin, unique, |_| {
+        vec![force(crate::child::spawn::fault::set_force_attach_failure)]
+    });
+    assert_eq!(fate, ChildFate::Reaped);
+    assert_kill_sent(pid, &sent);
+    let warn = only(&warns);
+    assert!(
+        warn.contains("its tree was not killed: ") && warn.contains("forced attach failure"),
+        "{warn}"
+    );
+}
+
+/// A child that could not be verified is said to be unsignalled for that reason, never gone.
+///
+/// Mutant: the outcome is worded as the no-send of a pid that names another process.
+#[skuld::test]
+fn macos_an_unverified_child_is_said_to_be_unsignalled_because_it_could_not_be_verified() {
+    let said = super::said(&super::KillOutcome::Unverified, ChildFate::Running { id: None });
+    assert!(
+        said.contains("could not be verified, so it was not signalled"),
+        "{said}"
+    );
+    assert!(!said.contains("was gone"), "{said}");
 }

@@ -290,48 +290,55 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
     // actually owns the marker write end's supervisor-side copy).
     #[cfg(target_os = "macos")]
     let (mut prepared, child, unique) = {
-        let _guard = crate::child::spawn::spawn_lock();
-        let mut prepared = crate::containment::prepare(
-            tcmd.as_std_mut(),
-            &cmd.contain_request(),
-            cmd.flags_request(),
-            &reserved,
-            cmd.fd_marker_suppressed(),
-            cmd.env_ops(),
-        )
-        .not_started()?;
-        let report = report.open(&_guard).not_started()?;
+        let (mut prepared, spawned, first) = {
+            let _guard = crate::child::spawn::spawn_lock();
+            let prepared = crate::containment::prepare(
+                tcmd.as_std_mut(),
+                &cmd.contain_request(),
+                cmd.flags_request(),
+                &reserved,
+                cmd.fd_marker_suppressed(),
+                cmd.env_ops(),
+            )
+            .not_started()?;
+            let report = report.open(&_guard).not_started()?;
 
-        // fd >= 3 merge SOURCES: their dup'd ends join the resolved fd >= 3 collection below
-        // (the pre-pass removed those slots from `fds`, so the numbers cannot collide).
-        for (fd, end) in merge_fd_ends {
-            let prev = child_ends.insert(fd, end);
-            debug_assert!(prev.is_none(), "pre-pass slots were removed from the resolved set");
-        }
+            // fd >= 3 merge SOURCES: their dup'd ends join the resolved fd >= 3 collection below
+            // (the pre-pass removed those slots from `fds`, so the numbers cannot collide).
+            for (fd, end) in merge_fd_ends {
+                let prev = child_ends.insert(fd, end);
+                debug_assert!(prev.is_none(), "pre-pass slots were removed from the resolved set");
+            }
 
-        use crate::child::spawn::fd_map;
-        let mappings: Vec<fd_map::FdMapping> = child_ends
-            .into_iter()
-            .map(|(fd, owned)| fd_map::FdMapping {
-                parent_fd: owned,
-                child_fd: fd.raw(),
-            })
-            .collect();
-        fd_map::install(tcmd.as_std_mut(), mappings).not_started()?;
+            use crate::child::spawn::fd_map;
+            let mappings: Vec<fd_map::FdMapping> = child_ends
+                .into_iter()
+                .map(|(fd, owned)| fd_map::FdMapping {
+                    parent_fd: owned,
+                    child_fd: fd.raw(),
+                })
+                .collect();
+            fd_map::install(tcmd.as_std_mut(), mappings).not_started()?;
 
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "spawn_lock is held by `_guard` at the top of this function"
-        )]
-        let (spawned, unique) = report.run(
-            || {
-                let spawned = tcmd.spawn();
-                #[cfg(test)]
-                let spawned = crate::child::spawn::fault::fail_tokio_spawn_after_fork(spawned);
-                spawned.map_err(Error::Io)
-            },
-            ::tokio::process::Child::id,
-        );
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "spawn_lock is held by `_guard` at the top of this function"
+            )]
+            let (spawned, first) = report.run(
+                || {
+                    let spawned = tcmd.spawn();
+                    #[cfg(test)]
+                    let spawned = crate::child::spawn::fault::fail_tokio_spawn_after_fork(spawned);
+                    spawned.map_err(Error::Io)
+                },
+                ::tokio::process::Child::id,
+            );
+            drop(tcmd);
+            (prepared, spawned, first)
+        };
+        // Outside the lock, as the sync spawn does. It still blocks this thread: principle 2's spawn
+        // exception.
+        let unique = first.finish();
         let c = match spawned {
             Ok(c) => c,
             Err(e) => {
@@ -361,7 +368,6 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                 });
             }
         };
-        drop(tcmd);
         (prepared, c, unique)
     };
     #[cfg(not(target_os = "macos"))]
