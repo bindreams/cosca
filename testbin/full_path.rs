@@ -26,12 +26,13 @@ pub fn run(name: &str) {
     let wide: Vec<u16> = OsStr::new(name).encode_wide().chain([0]).collect();
     // SAFETY: `wide` is NUL-terminated; `buf` is a live buffer the call writes at most its length of.
     let n = unsafe { GetFullPathNameW(PCWSTR(wide.as_ptr()), Some(&mut buf), None) } as usize;
-    if n == 0 || n > buf.len() {
+    if n == 0 {
         println!(
             "full=err={}",
             std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
         );
     } else {
+        assert!(n <= buf.len(), "GetFullPathNameW needs {n} units");
         println!("full={}", std::ffi::OsString::from_wide(&buf[..n]).to_string_lossy());
     }
     println!("var_after={}", drive_dir(&var));
@@ -44,9 +45,17 @@ fn drive_dir(var: &[u16]) -> String {
     unsafe { SetLastError(WIN32_ERROR(0)) };
     // SAFETY: `var` is NUL-terminated; `buf` is a live buffer the call writes at most its length of.
     let n = unsafe { GetEnvironmentVariableW(PCWSTR(var.as_ptr()), Some(&mut buf)) } as usize;
-    // SAFETY: no preconditions.
-    if n == 0 && unsafe { GetLastError() } == ERROR_ENVVAR_NOT_FOUND {
-        return "<unset>".to_owned();
+    if n == 0 {
+        // SAFETY: no preconditions.
+        let err = unsafe { GetLastError() };
+        if err == ERROR_ENVVAR_NOT_FOUND {
+            return "<unset>".to_owned();
+        }
+        assert_eq!(
+            err,
+            WIN32_ERROR(0),
+            "GetEnvironmentVariableW returned 0, neither an empty value nor not-found"
+        );
     }
     assert!(n <= buf.len(), "GetEnvironmentVariableW needs {n} units");
     std::ffi::OsString::from_wide(&buf[..n]).to_string_lossy().into_owned()

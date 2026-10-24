@@ -113,11 +113,12 @@ fn a_drive_relative_current_dir_takes_the_drives_own_directory_as_win32_does(#[f
 }
 
 #[cfg(windows)]
-/// M7 (#156, untangling P1a), the rows whose `=X:` value names a directory on drive X itself, and
-/// the partially qualified values whose target must exist: what a child's `GetFullPathNameW` makes
-/// of `X:tool` given a block with that value and a cwd on another drive (for those values, of
-/// `T:tool` with the child's cwd on X), against D1's prediction. `tests/common/drive_rule.rs` has
-/// the runner, and `windows_path_resolution`'s `m7_` survey the rows that need no mapping.
+/// M7, the rows whose `=X:` value names a directory on drive X itself, and the partially qualified
+/// values whose target must exist: what a child's `GetFullPathNameW` makes of `X:tool` given a block
+/// with that value and a cwd on another drive (for those values, of `T:tool` with the child's cwd
+/// on X), against D1's prediction. `tests/common/drive_rule.rs` has the runner, and
+/// `windows_path_resolution`'s `m7_` test has the rows that need no mapping. Drive X prints as
+/// `<X>:` and the temp directory's drive T as `<T>:`.
 ///
 /// Records only. Preconditions, asserted: the mapping serves its directories, the child runs in
 /// the row's cwd and sees the row's `=X:` value.
@@ -126,7 +127,7 @@ fn a_drive_relative_current_dir_takes_the_drives_own_directory_as_win32_does(#[f
 /// removes it when done, so it is the `DRIVE_MAPPING` group.
 #[skuld::test]
 fn m7_a_drive_relative_name_against_a_drive_directory_on_its_own_drive(#[fixture(drive_mapping)] _group: &Group) {
-    use common::drive_rule::{canonical, free_drive, run, Cwd, Render, Row, Var};
+    use common::drive_rule::{canonical, free_drive, run, Arm, Cwd, Render, Row, Var};
     use common::subst::Subst;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -159,80 +160,47 @@ fn m7_a_drive_relative_name_against_a_drive_directory_on_its_own_drive(#[fixture
     let e = format!(r"{d}\e");
     let sr = format!("SystemRoot={}", std::env::var("SystemRoot").expect("SystemRoot"));
     let render = Render(vec![(d.clone(), "<d>".into()), (long_rel.clone(), "<long>".into())]);
-    let row = |key, value: &str, name: &str, arm, predicted: String| Row {
+    // `taken`: D1 predicts that the child takes `value`; otherwise `Root`.
+    let row = |key, value: &str, name: &str, taken: bool| Row {
         key,
         cwd: Cwd::Given(e.clone()),
         block: vec![sr.clone(), format!("={x}={value}")],
         name: name.to_owned(),
-        arm,
-        predicted,
+        arm: if taken { Arm::Value(value.to_owned()) } else { Arm::Root },
         var: Var::Is(Some(value.to_owned())),
     };
+    let t = &d[..2];
+    let drives = [(letter, 'X'), (t.chars().next().expect("a drive"), 'T')];
     let tool = format!("{x}tool");
     let verbatim = format!(r"\\?\{x}\vx");
     let rows = [
-        row(
-            "existing",
-            &format!(r"{x}\exists"),
-            &tool,
-            "Value",
-            format!(r"{x}\exists\tool"),
-        ),
-        row("missing", &format!(r"{x}\gone"), &tool, "Root", format!(r"{x}\tool")),
-        row("a_file", &format!(r"{x}\afile"), &tool, "Root", format!(r"{x}\tool")),
-        row(
-            "trailing_separator",
-            &format!(r"{x}\exists\"),
-            &tool,
-            "Value",
-            format!(r"{x}\exists\tool"),
-        ),
-        // The child (`cosca_testbin`) has no `longPathAware` manifest: this records its behaviour,
-        // not ntdll's threshold, which M7b measures.
-        row("longer_than_max_path", &long, &tool, "Value", format!(r"{long}\tool")),
-        // A verbatim value: the plan expects the name it makes verbatim normalised. ntdll ignores
-        // the value (observed_arm=Root), so these three rows block P4 and P5 under the plan's rule
-        // (blocking if Win32 takes the value literally or ignores it).
-        row(
-            "verbatim_dotted_name",
-            &verbatim,
-            &format!(r"{x}sub.\tool.exe"),
-            "Value",
-            format!(r"{verbatim}\sub\tool.exe"),
-        ),
-        row(
-            "verbatim_dotted_dir",
-            &verbatim,
-            &format!("{x}sub."),
-            "Value",
-            format!(r"{verbatim}\sub"),
-        ),
-        // `main`'s `append` stops `..` at the drive, giving the prediction. Win32's floor question
-        // is unanswered, since ntdll ignores the value: the row blocks, like the two above.
-        row(
-            "verbatim_up_past_root",
-            &verbatim,
-            &format!(r"{x}..\..\t.exe"),
-            "Value",
-            format!(r"\\?\{x}\t.exe"),
-        ),
+        row("existing", &format!(r"{x}\exists"), &tool, true),
+        row("missing", &format!(r"{x}\gone"), &tool, false),
+        row("a_file", &format!(r"{x}\afile"), &tool, false),
+        row("trailing_separator", &format!(r"{x}\exists\"), &tool, true),
+        // The child (`cosca_testbin`) has no `longPathAware` manifest: this records its behaviour
+        // on a long value, not where ntdll's own threshold lies.
+        row("longer_than_max_path", &long, &tool, true),
+        // A verbatim value: D1 predicts the result normalised (dots dropped, `..` stopped at the
+        // drive).
+        row("verbatim_dotted_name", &verbatim, &format!(r"{x}sub.\tool.exe"), true),
+        row("verbatim_dotted_dir", &verbatim, &format!("{x}sub."), true),
+        row("verbatim_up_past_root", &verbatim, &format!(r"{x}..\..\t.exe"), true),
     ];
     for row in &rows {
-        run(row, &render, Some((letter, 'D')));
+        run(row, &render, &drives);
     }
 
     // A value that is not fully qualified must be refused even when it names an existing directory.
     // `exists` and `\exists` resolve against the child's own cwd, so it runs on X, and the name's
     // drive is T. The parent has asserted above that each target exists.
-    let t = &d[..2];
     let cwd_x = format!(r"{x}\e");
     let partial = |key, value: String| Row {
         key,
         cwd: Cwd::Given(cwd_x.clone()),
         block: vec![sr.clone(), format!("={t}={value}")],
         name: format!("{t}tool"),
-        arm: "Root",
-        predicted: format!(r"{t}\tool"),
+        arm: Arm::Root,
         var: Var::Is(Some(value)),
     };
     for row in [
@@ -240,7 +208,7 @@ fn m7_a_drive_relative_name_against_a_drive_directory_on_its_own_drive(#[fixture
         partial("relative", "exists".to_owned()),
         partial("rooted", r"\exists".to_owned()),
     ] {
-        run(&row, &render, Some((letter, 'D')));
+        run(&row, &render, &drives);
     }
 
     mapping
