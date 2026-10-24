@@ -128,10 +128,9 @@ pub enum Transition {
 
 impl Host {
     /// The facts for a request naming `backend` and `auth`, which decide whether `pkexec` is asked
-    /// its version. `elevated` is the caller's privilege. On Unix, `sudo`, `doas` and `pkexec` are
-    /// looked for on `path_var`, and `None` finds none of them. macOS also finds `/usr/bin/osascript`,
-    /// a fixed path that `path_var` does not reach. Windows has no backend to find and ignores
-    /// `path_var`.
+    /// its version. `elevated` is the caller's privilege. Unix looks for `sudo`, `doas` and `pkexec`
+    /// on `path_var` (`None` finds none); macOS also finds the fixed `/usr/bin/osascript`. Windows
+    /// ignores `path_var`.
     pub fn detect(backend: Backend, auth: &Auth, path_var: Option<&std::ffi::OsStr>, elevated: bool) -> Host {
         #[cfg(unix)]
         {
@@ -152,9 +151,9 @@ impl Host {
         }
         #[cfg(not(any(unix, windows)))]
         {
-            let _ = (backend, auth, path_var, elevated);
+            let _ = (backend, auth, path_var);
             Host {
-                elevated: false,
+                elevated,
                 has_tty: false,
                 available: BackendSet::default(),
                 os: Os::Unix,

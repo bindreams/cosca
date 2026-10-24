@@ -343,8 +343,7 @@ pub(super) fn host_os() -> Os {
     }
 }
 
-/// Detection over an explicit `PATH`, OS and privilege ([`Host::detect`]'s unix arm), resolving
-/// pkexec's real file with `canonicalize` and `run`ning the pkexec probe. The pkexec it stores is
+/// [`Host::detect`]'s unix arm over an explicit `PATH`, OS and privilege. The pkexec it stores is
 /// the one it probed.
 pub(crate) fn detect_with(
     path_var: Option<&OsStr>,
