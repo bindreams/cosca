@@ -30,7 +30,12 @@ must wait is an `async fn`. Sync code may block, as sync Rust normally does.
 One exception: spawning blocks until `exec`, as tokio's own `Command::spawn` does. That includes
 cosca's placement report ([`ReportChannel::wait`](../src/containment/cgroup/channel.rs)), which
 completes before `exec`. The wait is bounded by the child's own progress to `exec`; a child stopped
-or stuck in D state between `fork` and `exec` holds the thread.
+or stuck in D state between `fork` and `exec` holds the thread. The wait for macOS's unique-id
+report ([`unique_report::await_report`](../src/child/spawn/unique_report.rs)) is bounded the same
+way, with accepted residuals: if something else reaps the child and another child of this process
+takes its pid, the wait lasts as long as that process; and a tracer holding the child's zombie keeps
+it waiting until the tracer hands the zombie back. It runs after `spawn_lock` is released, so it
+holds up only its own spawn.
 
 **Why:** a blocked worker stops every task scheduled on it, and on a `current_thread` runtime it
 stops the runtime. tokio itself panics rather than block when a `Runtime` is dropped in async
@@ -95,7 +100,12 @@ doesn't do this yet either ([#341]).
 Where a group ID must be used (process-group or fd-marker containment), keep the root an unreaped
 zombie until the group kill is done.
 
-One by-number reap is outside this rule: tokio's reap of a dropped async root (principle 3).
+The by-number reaps outside this rule are all tokio's: its reap of a dropped async root (principle 3),
+and, on macOS, its orphan queue's reap of a child whose async spawn failed and whose kill did not
+end it. There cosca releases tokio's `Child` rather than forget it, which would leave a zombie
+nothing collects: `ProcSource::reap_now_noting` and `ProcSource::reap_unreported`
+([`proc_source.rs`](../src/tokio/child/proc_source.rs)), and the attach-failure arm of
+`spawn_uncommitted` ([`tokio/spawn.rs`](../src/tokio/spawn.rs)).
 
 **Why:** once the process is reaped its number can belong to anyone, and a signal sent to it hits an
 unrelated process.
