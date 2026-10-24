@@ -290,8 +290,8 @@ fn the_elevated_program_note_is_for_a_wrapper_elevated_spawn_only() {
     }
 }
 
-/// Only `Gone` blames someone else for the reap: a child that a failed spawn found collected was
-/// collected by that spawn's own wait or by tokio's reaper.
+/// Only `Gone` blames someone else for the reap: a child that a failed spawn found collected may
+/// have been collected by `std`'s own wait, and cosca cannot tell.
 ///
 /// Mutant: `Collected` displays as `Gone`.
 #[skuld::test]

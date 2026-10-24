@@ -23,6 +23,8 @@ use crate::stdio::Stdio;
 use crate::test_child::fixture_path;
 use crate::test_child::namespaces as ns;
 use crate::test_groups::{namespaces, Group};
+use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peeks};
+use crate::wait::exit_only::{Foreign, Peek, Reaped};
 
 /// A command that writes `ran` to a pipe and exits, and the read end of that pipe.
 fn marker_command() -> (Command, std::io::PipeReader) {
@@ -1313,6 +1315,98 @@ fn a_collected_front_is_no_front() {
     .expect_may_have_started_with();
     assert_eq!(fate, ChildFate::Collected, "std had collected it");
     assert!(!err.to_string().contains("what sudo left"), "{err}");
+}
+
+/// `conclude` on a failed tokio-style spawn whose child is a live `cat`, with the peeks `looks`
+/// answering in order (conclude's own first, then the teardown's), as a foreign reaper between
+/// them would. The `cat` is cleaned up here.
+fn conclude_a_live_cat_with_looks(looks: impl IntoIterator<Item = std::io::Result<Peek>>) -> ChildFate {
+    let (mut cat, pidfd) = cat_with_pidfd();
+    let forced = force_peeks(looks);
+    let (_, fate) = super::conclude(
+        Err::<NoChild, _>(std::io::Error::other("tokio failed")),
+        Outcome::Opened(pidfd),
+        super::LeftFront::NotAFront,
+    )
+    .err()
+    .expect("the spawn fails")
+    .expect_may_have_started_with();
+    assert_peeks_exhausted();
+    drop(forced);
+    cat.kill().expect("kill the cat");
+    cat.wait().expect("collect the cat");
+    fate
+}
+
+/// A foreign reap shown after a look saw the child uncollected is "reaped by someone else", not
+/// "collected when the spawn failed": nobody in cosca, std or tokio reaps it after that look.
+///
+/// Mutant: every `Gone` of the teardown becomes `Collected`.
+#[skuld::test]
+fn a_foreign_reap_after_an_uncollected_look_is_still_gone() {
+    for first in [Peek::Running, Peek::Exit(Reaped::Unreadable { si_code: 0 })] {
+        let fate = conclude_a_live_cat_with_looks([Ok(first), Ok(Peek::Foreign(Foreign::Gone))]);
+        assert_eq!(fate, ChildFate::Gone, "first look {first:?}");
+        assert!(fate.to_string().contains("reaped by someone else"), "{fate}");
+    }
+}
+
+/// The same for an elevation front: one seen uncollected is sent nothing, and a foreign reap of it
+/// that the front arm then finds is still "reaped by someone else".
+///
+/// Mutant: the front arm maps `Gone` to `Collected`.
+#[skuld::test]
+fn a_foreign_reap_of_a_front_after_an_uncollected_look_is_still_gone() {
+    let (mut cat, pidfd) = cat_with_pidfd();
+    drop(cat.stdin.take());
+    cat.wait().expect("the foreign reaper collects the child");
+    let forced = force_peeks([Ok(Peek::Running)]);
+    let (_, fate) = super::conclude(
+        Err::<NoChild, _>(std::io::Error::other("tokio failed")),
+        Outcome::Opened(pidfd),
+        sudo_front(),
+    )
+    .err()
+    .expect("the spawn fails")
+    .expect_may_have_started_with();
+    assert_peeks_exhausted();
+    drop(forced);
+    assert_eq!(fate, ChildFate::Gone);
+}
+
+/// A first look that fails proves nothing about when the child was collected, so a `Gone` that
+/// follows it blames nobody and claims no time: it is `Unknown`.
+///
+/// Mutant: a `Gone` after a failed first look is left `Gone` (or mapped to `Collected`).
+#[skuld::test]
+fn a_failed_first_look_leaves_a_later_gone_unknown() {
+    let fate = conclude_a_live_cat_with_looks([
+        Err(std::io::Error::other("forced peek failure")),
+        Ok(Peek::Foreign(Foreign::Gone)),
+    ]);
+    assert_eq!(fate, ChildFate::Unknown);
+}
+
+/// A child the first look finds collected is `Collected`, as a front or not.
+///
+/// Mutant: `Collected` is never answered (the pre-change `Gone`).
+#[skuld::test]
+fn a_child_collected_at_the_first_look_is_collected() {
+    for front in [super::LeftFront::NotAFront, sudo_front()] {
+        let (mut cat, pidfd) = cat_with_pidfd();
+        drop(cat.stdin.take());
+        cat.wait().expect("collect the child");
+        let (_, fate) = super::conclude(
+            Err::<NoChild, _>(std::io::Error::other("exec failed")),
+            Outcome::Opened(pidfd),
+            front,
+        )
+        .err()
+        .expect("the spawn fails")
+        .expect_may_have_started_with();
+        assert_eq!(fate, ChildFate::Collected);
+        assert!(fate.to_string().contains("collected when the spawn failed"), "{fate}");
+    }
 }
 
 /// A child that died before it was told to go never ran the program: it is reaped, with no note.

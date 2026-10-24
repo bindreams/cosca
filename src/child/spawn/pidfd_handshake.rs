@@ -806,12 +806,29 @@ fn join_helper(helper: std::thread::ScopedJoinHandle<'_, Outcome>, #[cfg(test)] 
     outcome
 }
 
-/// `fate`, for the child of a spawn that failed after its fork: one found already collected was
-/// collected by `std`'s failed spawn or by tokio's reaper, which is not "someone else".
-fn collected_by_the_spawn(fate: ChildFate) -> ChildFate {
-    match fate {
-        ChildFate::Gone => ChildFate::Collected,
-        other => other,
+/// What `conclude`'s first look at the pidfd of a spawn that failed after its fork showed.
+#[derive(Clone, Copy)]
+enum FirstLook {
+    /// Already collected: by `std`'s failed spawn, or by someone else; cosca cannot tell.
+    Collected,
+    /// Not collected: nobody in cosca, `std` or tokio collects it after this, so a later `Gone` is a
+    /// foreign reap that was shown.
+    Uncollected,
+    /// The look failed and showed nothing.
+    Unseen,
+}
+
+impl FirstLook {
+    /// `fate`, a teardown's answer after this look. A `Gone` is `Collected` only if the first look
+    /// found the child collected: the one case where a collector that is not "someone else" is
+    /// possible and nothing shows otherwise. After a failed look, a `Gone` shows no time and no
+    /// collector, so it is `Unknown`.
+    fn fate(self, fate: ChildFate) -> ChildFate {
+        match (self, fate) {
+            (FirstLook::Collected, ChildFate::Gone) => ChildFate::Collected,
+            (FirstLook::Unseen, ChildFate::Gone) => ChildFate::Unknown,
+            (_, fate) => fate,
+        }
     }
 }
 
@@ -830,14 +847,15 @@ fn conclude<T: Spawned>(spawned: io::Result<T>, outcome: Outcome, front: LeftFro
         use std::os::fd::AsFd as _;
         // A child std collected never ran the program. A peek that fails tells nothing, so the
         // child is taken for a front still there, which is sent nothing.
-        let collected = match peek(&Target::PidFd(pidfd.as_fd())) {
-            Ok(Peek::Foreign(_)) => true,
-            Ok(_) => false,
+        let look = match peek(&Target::PidFd(pidfd.as_fd())) {
+            Ok(Peek::Foreign(_)) => FirstLook::Collected,
+            Ok(_) => FirstLook::Uncollected,
             Err(e) => {
                 log::debug!("a failed spawn's child cannot be peeked ({e}); taken to be uncollected");
-                false
+                FirstLook::Unseen
             }
         };
+        let collected = matches!(look, FirstLook::Collected);
         match front {
             LeftFront::ToLeaf(leaf) => {
                 leaf.set(Some(pidfd));
@@ -845,11 +863,11 @@ fn conclude<T: Spawned>(spawned: io::Result<T>, outcome: Outcome, front: LeftFro
             }
             LeftFront::Here(front) if !collected => {
                 let (fate, child_fate) = super::leave_front_through_pidfd(None, pidfd, front, None, None);
-                (fate.note(error, Some(front), None), collected_by_the_spawn(child_fate))
+                (fate.note(error, Some(front), None), look.fate(child_fate))
             }
             LeftFront::Here(_) | LeftFront::NotAFront => {
                 let child_fate = super::teardown_through_pidfd(None, pidfd, None);
-                (error, collected_by_the_spawn(child_fate))
+                (error, look.fate(child_fate))
             }
         }
     };

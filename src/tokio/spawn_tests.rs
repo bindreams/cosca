@@ -1017,8 +1017,8 @@ async fn a_failed_exec_may_have_started_the_program() {
     let mut cmd = Command::new();
     cmd.args(["cosca-no-such-program-142"]);
     let (err, fate) = expect_may_have_started_with(cmd.spawn().expect_err("a missing program fails the spawn"));
-    // Linux's handshake finds the child whose exec failed already collected, by std's failed spawn
-    // and not by someone else. Elsewhere nothing holds it, so it may be running.
+    // Linux's handshake finds the child whose exec failed already collected (`std`'s failed
+    // spawn collects it; no collector is named). Elsewhere nothing holds it, so it may be running.
     let expected = if cfg!(target_os = "linux") {
         ChildFate::Collected
     } else {

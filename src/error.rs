@@ -256,7 +256,7 @@ pub enum Error {
 ///
 /// It is about the child cosca spawned. On a wrapper-elevated spawn that child is the backend
 /// (`sudo`, `doas`, `pkexec`, `osascript`), and the elevated program is its own child, which cosca
-/// never signals: `Reaped`, `Killed` and `Gone` say the backend is not running, not that the program
+/// never signals: `Reaped`, `Killed`, `Gone` and `Collected` say the backend is not running, not that the program
 /// is not. A front that had exited by itself is `Reaped` while the program it launched may still
 /// run. Descendants of a contained child are not covered either; the containment's own teardown is.
 #[non_exhaustive]
@@ -289,10 +289,11 @@ pub enum ChildFate {
     /// no kill: a child that was gone already, or not ours, when cosca came to it. (One cosca killed
     /// and found collected is [`Killed`](ChildFate::Killed).) The child is not running; on a wrapper-elevated spawn, the elevated program may be (see the type's doc).
     Gone,
-    /// A spawn that failed found its child already collected, and cosca delivered no kill: `std`
-    /// collects the child of a spawn it fails, and tokio's reaper may have collected it after that.
-    /// Unlike [`Gone`](ChildFate::Gone), this does not say that someone else did. The child is not
-    /// running; on a wrapper-elevated spawn, the elevated program may be (see the type's doc).
+    /// A spawn that failed found its child already collected at the first look after the failure,
+    /// and cosca delivered no kill. `std` collects the child of a spawn it fails, and cosca cannot
+    /// tell that from a collection by someone else, so this names no collector (unlike
+    /// [`Gone`](ChildFate::Gone)). The child is not running; on a wrapper-elevated spawn, the
+    /// elevated program may be (see the type's doc).
     Collected,
     /// cosca cannot say what became of the child.
     Unknown,
