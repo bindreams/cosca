@@ -343,6 +343,7 @@ async fn cgroup_a_post_fork_tokio_failure_warns_only_for_a_child_out_of_reach(#[
         let (reaped_tx, reaped_rx) = std::sync::mpsc::channel();
         if refuses {
             cgroup_fault::set_force_child_kill_denied(true);
+            cgroup_fault::set_force_group_kill_denied(true);
             cgroup_fault::set_background_reap_notifier(reaped_tx);
         }
         fault::set_force_post_fork_failure(true);

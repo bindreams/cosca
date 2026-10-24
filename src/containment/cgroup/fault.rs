@@ -14,6 +14,7 @@ thread_local! {
     static TERMINATED_BY_PID: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
     static HOOK_GATE: Cell<Option<std::os::fd::RawFd>> = const { Cell::new(None) };
     static FORCE_CHILD_KILL_DENIED: Cell<bool> = const { Cell::new(false) };
+    static FORCE_GROUP_KILL_DENIED: Cell<bool> = const { Cell::new(false) };
     static BACKGROUND_REAP_NOTIFY: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
     static AFTER_SHUT_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     static WAIT_POLLING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
@@ -491,9 +492,10 @@ pub(crate) fn run_after_shut_read() {
     }
 }
 
-/// Deny the NEXT abandoned child's kills, through its handle and as its group, with `EPERM`, as a
-/// child that exec'd a setuid program denies an unprivileged supervisor — which a root test lane
-/// cannot reproduce for real.
+/// Answer the NEXT abandoned child's kill through its handle with `EPERM` in place of the syscall,
+/// as a child that exec'd a setuid program denies an unprivileged supervisor — which a root test
+/// lane cannot reproduce for real. `end_child` never sees the flag: a send it makes by any other
+/// path is real. [`set_force_group_kill_denied`] does the same for its group kill.
 pub(crate) fn set_force_child_kill_denied(on: bool) {
     FORCE_CHILD_KILL_DENIED.with(|f| f.set(on));
 }
@@ -656,6 +658,15 @@ pub(crate) fn record_child_send(send: ChildSend) {
 /// The signals `end_child` sent on this thread since the last call, in order.
 pub(crate) fn take_child_sends() -> Vec<ChildSend> {
     CHILD_SENDS.with(|s| std::mem::take(&mut *s.borrow_mut()))
+}
+
+/// Answer the NEXT abandoned child's group kill with `EPERM` in place of the syscall (see
+/// [`set_force_child_kill_denied`]).
+pub(crate) fn set_force_group_kill_denied(on: bool) {
+    FORCE_GROUP_KILL_DENIED.with(|f| f.set(on));
+}
+pub(crate) fn take_force_group_kill_denied() -> bool {
+    FORCE_GROUP_KILL_DENIED.with(|f| f.replace(false))
 }
 
 /// Answer the NEXT abandoned child's group kill with `ESRCH`, as for a group with no member left.

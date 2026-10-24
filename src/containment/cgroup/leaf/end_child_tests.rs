@@ -23,6 +23,27 @@ fn paused_group_leader() -> KillOnDrop {
     child
 }
 
+/// A forked child that echoes each byte written to the returned writer back on the returned
+/// reader, until killed: an echo round trip proves it alive, where a `SIGKILL` lands
+/// asynchronously. Once it is dead the reader answers EOF, so a test fails without hanging.
+fn echoing_child() -> (KillOnDrop, std::io::PipeWriter, std::io::PipeReader) {
+    use std::os::fd::AsRawFd;
+    let (from_test, to_child) = std::io::pipe().expect("pipe");
+    let (from_child, to_test) = std::io::pipe().expect("pipe");
+    let (input, output) = (from_test.as_raw_fd(), to_test.as_raw_fd());
+    let child = fork_running(move || {
+        let mut byte = 0u8;
+        // SAFETY: async-signal-safe; a one-byte buffer on an fd the child holds.
+        while unsafe { libc::read(input, (&raw mut byte).cast(), 1) } == 1 {
+            // SAFETY: as above.
+            unsafe { libc::write(output, (&raw const byte).cast(), 1) };
+        }
+    });
+    // Only the child holds these ends now, so its death closes the test's reader.
+    drop((from_test, to_test));
+    (child, to_child, from_child)
+}
+
 /// What `end_child` receives for `child`, named by its pidfd, after `report`. `end_child` reaps
 /// it from here on.
 fn received(child: KillOnDrop, report: Option<PlacementReport>) -> Received {
@@ -119,13 +140,46 @@ fn an_abandoned_childs_group_kill_finding_no_group_is_logged_at_debug(#[fixture(
     assert!(records[0].1.contains(&pid.to_string()), "{records:?}");
 }
 
-/// A kill its handle refuses (`EPERM`, forced here, as from a setuid child) is not retried by the
-/// child's bare pid: the child is out of reach, and reaped once it exits.
+/// A child outside its leaf that refuses both its group kill and its handle's kill (as a setuid
+/// child does) is one abandoned child, warned about once, naming both refusals.
 ///
-/// Mutant: the by-pid fallback on `EPERM` (`[Handle, Pid]`, fate `Killed`).
+/// Mutant: each refusal warned about on its own (two warns).
+#[skuld::test]
+fn an_abandoned_child_refusing_both_kills_is_warned_about_once(#[fixture(cgroup)] _group: &Group) {
+    crate::log_capture::install();
+    let child = paused_group_leader();
+    let received = received(child, Some(PlacementReport::WriteFailed(libc::EBADF)));
+    let pid = received.pid.expect("a pid");
+    let pidfd = super::super::test_support::pidfd_of(pid);
+    let (reaped_tx, reaped_rx) = std::sync::mpsc::channel();
+    fault::set_force_group_kill_denied(true);
+    fault::set_force_child_kill_denied(true);
+    fault::set_background_reap_notifier(reaped_tx);
+
+    let mark = crate::log_capture::mark();
+    assert_eq!(end_child(&received), ChildFate::Unkillable);
+
+    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "")
+        .into_iter()
+        .filter(|(level, _)| *level <= log::Level::Warn)
+        .collect();
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(
+        warns[0].1.contains(&format!("process group {pid}")),
+        "it names the refused group kill: {warns:?}"
+    );
+    rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::KILL).expect("kill the child");
+    reaped_rx.recv().expect("the background reaper must reap it");
+}
+
+/// A kill its handle refuses (`EPERM`, forced here in place of the syscall, as from a setuid
+/// child) is not retried by the child's bare pid: the child is out of reach, still running, and
+/// reaped once it exits. `end_child` cannot see the forced refusal, so a retry would be real.
+///
+/// Mutant: a by-pid kill on `EPERM` (fate `Killed`, or no echo).
 #[skuld::test]
 fn an_abandoned_child_refusing_its_handles_kill_is_not_killed_by_pid() {
-    let child = paused_group_leader();
+    let (child, mut to_child, mut from_child) = echoing_child();
     let received = received(child, None);
     let pidfd = super::super::test_support::pidfd_of(received.pid.expect("a pid"));
     let (reaped_tx, reaped_rx) = std::sync::mpsc::channel();
@@ -134,6 +188,7 @@ fn an_abandoned_child_refusing_its_handles_kill_is_not_killed_by_pid() {
 
     assert_eq!(end_child(&received), ChildFate::Unkillable);
     assert_eq!(fault::take_child_sends(), [ChildSend::Handle]);
+    crate::test_child::assert_echoes(&mut to_child, &mut from_child);
 
     // Unreaped, so its pidfd still names it.
     rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::KILL).expect("kill the child");

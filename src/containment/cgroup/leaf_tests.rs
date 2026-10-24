@@ -2771,6 +2771,7 @@ fn an_abandoned_child_that_refuses_the_kill_is_reaped_once_it_exits() {
     drop(child);
     let (reaped_tx, reaped_rx) = std::sync::mpsc::channel();
     crate::containment::cgroup::fault::set_force_child_kill_denied(true);
+    crate::containment::cgroup::fault::set_force_group_kill_denied(true);
     crate::containment::cgroup::fault::set_background_reap_notifier(reaped_tx);
 
     crate::log_capture::install();
