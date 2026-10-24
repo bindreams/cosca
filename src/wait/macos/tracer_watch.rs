@@ -76,7 +76,7 @@ impl TracerWatch {
         let mut walked = Vec::new();
         let mut fresh = false;
         let mut at = tracer;
-        while !walked.contains(&at) {
+        loop {
             walked.push(at);
             let (unique, parent, at_attach) = match link(at) {
                 Link::Found {

@@ -943,10 +943,7 @@ impl LateTree {
             }
             // The root is not shown ours any more: only the holders, and never the root.
             (Reach::Attached(Attached::FdMarker(m)), Sweep::RootKilled { zombie: false }) => {
-                if let Err(e) = m.hard_kill_holders_only(m.root()) {
-                    self.notes
-                        .push(format!("its marker's holders were not all killed after its kill: {e}"));
-                }
+                let _ = m;
                 self.notes.push(NOT_SWEPT_AGAIN.to_owned());
             }
             (Reach::Attached(_), Sweep::RootKilled { zombie: false }) => self.notes.push(NOT_SWEPT_AGAIN.to_owned()),

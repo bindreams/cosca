@@ -346,7 +346,7 @@ pub(crate) fn link(pid: RawPid) -> Link {
     match uniq_info(pid, ReadPurpose::Link) {
         UniqRead::Found(again) if again.unique_id == unique => Link::Found {
             unique,
-            parent: info.e_ppid() as RawPid,
+            parent: info.kp_proc.p_oppid as RawPid,
             at_attach: info.kp_proc.p_oppid as RawPid,
         },
         UniqRead::Found(_) | UniqRead::Gone => Link::Gone,

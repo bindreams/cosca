@@ -337,7 +337,6 @@ fn watch(read_end: &OwnedFd, pid: u32) -> io::Result<Watch> {
             Check::Running => None,
             Check::Traced(by) => match tracer.held_by(&kq, by)? {
                 OnTracer::Block => None,
-                OnTracer::Recheck(after) if after.is_zero() => continue,
                 OnTracer::Recheck(after) => Some(after),
             },
         };
