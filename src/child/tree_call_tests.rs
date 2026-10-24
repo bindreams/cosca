@@ -231,6 +231,8 @@ enum State {
     Unreaped,
     Reaped,
     Unknown,
+    #[cfg(target_os = "macos")]
+    Unpinned,
 }
 
 fn answer(attached: &Attached, state: State, own: bool, read: Resolved<ProcessId>) -> (Answer, bool) {
@@ -242,6 +244,8 @@ fn answer(attached: &Attached, state: State, own: bool, read: Resolved<ProcessId
             State::Unreaped => RootState::Unreaped,
             State::Reaped => RootState::Reaped,
             State::Unknown => RootState::Unknown(std::io::Error::other("forced")),
+            #[cfg(target_os = "macos")]
+            State::Unpinned => RootState::Unpinned,
         };
         (state, own)
     });
@@ -274,7 +278,11 @@ fn root_number_answers_each_state_own_reap_and_identity_read() {
     let other = || ProcessId::from_parts_for_test(PGID as u32, 1);
     let reads = || [Resolved::Gone, Resolved::Found(other()), Resolved::Unknown];
     let group = Attached::ProcessGroup(PGID);
-    let exact = cfg!(target_os = "linux");
+    // macOS trusts no number its root's handle cannot vouch for, before the mechanism matters.
+    #[cfg(target_os = "macos")]
+    let unknown_answer = Answer::Untrusted;
+    #[cfg(not(target_os = "macos"))]
+    let unknown_answer = Answer::MayNameAnother(cfg!(target_os = "linux"), "could not say whether it");
     for own in [false, true] {
         for (i, read) in reads().into_iter().enumerate() {
             let case = format!("own: {own}, read #{i}");
@@ -288,7 +296,7 @@ fn root_number_answers_each_state_own_reap_and_identity_read() {
             let case = format!("own: {own}, read #{i}");
             assert_eq!(
                 answer(&group, State::Unknown, own, read).0,
-                Answer::MayNameAnother(exact, "could not say whether it"),
+                unknown_answer,
                 "unknown, {case}"
             );
         }
@@ -335,6 +343,30 @@ fn root_number_answers_each_state_own_reap_and_identity_read() {
                     };
                     assert_eq!((answer, looked), (expected, true), "{state:?}, own: {own}");
                 }
+            }
+        }
+    }
+}
+
+/// macOS: an `Unpinned` root is `Untrusted` for a `TreeWalk` and a process group alike, whatever
+/// the own-reap flag and the identity read.
+///
+/// Mutant: `Unpinned` left out of the macOS answer that comes before the mechanism is asked.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn root_number_answers_an_unpinned_root_untrusted() {
+    let other = || ProcessId::from_parts_for_test(PGID as u32, 1);
+    for (name, attached) in [
+        ("tree walk", Attached::TreeWalk(other())),
+        ("group", Attached::ProcessGroup(PGID)),
+    ] {
+        for own in [false, true] {
+            for read in [Resolved::Gone, Resolved::Found(other()), Resolved::Unknown] {
+                assert_eq!(
+                    answer(&attached, State::Unpinned, own, read),
+                    (Answer::Untrusted, true),
+                    "{name}, own: {own}"
+                );
             }
         }
     }
