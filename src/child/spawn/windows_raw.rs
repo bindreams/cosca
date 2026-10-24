@@ -126,21 +126,11 @@ pub(crate) fn spawn_raw(
     // fd-table the child CRT reads back from `lpReserved2`.
     let table = build_fd_table(&child_ends).not_started()?;
 
-    // STARTUPINFOEXW: STARTF_USESTDHANDLES + hStd* for 0/1/2; `lpReserved2` carries the fd-table so
-    // the child CRT recovers fd >= 3; the HANDLE_LIST scopes inheritance AND backs
-    // EXTENDED_STARTUPINFO_PRESENT. The table (`bytes`) is kept alive until after CreateProcessW.
-    let mut si = STARTUPINFOEXW::default();
-    si.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
-    si.StartupInfo.hStdInput = child_handle(&child_ends, Fd::STDIN);
-    si.StartupInfo.hStdOutput = child_handle(&child_ends, Fd::STDOUT);
-    si.StartupInfo.hStdError = child_handle(&child_ends, Fd::STDERR);
-    si.StartupInfo.cbReserved2 = table.bytes.len() as u16; // fits: capped above
-    si.StartupInfo.lpReserved2 = table.bytes.as_ptr() as *mut u8;
+    // The table (`bytes`) and the attribute list stay alive until after CreateProcessW.
+    let (mut si, attr) = startup_info(&child_ends, &table).not_started()?;
     // SINGLE handle source: `table.handles` is 0/1/2 + fd >= 3, each a distinct fresh dup from
     // `resolve_stdio` (its 0/1/2 entries ARE the hStd* handles), so no duplicate reaches the list.
     let all_handles: &[HANDLE] = &table.handles;
-    let attr = AttributeList::build(all_handles).not_started()?;
-    si.lpAttributeList = attr.as_ptr();
     // The complete word, composed above by the ONE function all three backends share — the two
     // structural bits this backend cannot spawn without included. Nothing ORs into it here.
     let flags = plan.creation_flags;
@@ -239,6 +229,10 @@ pub(crate) fn build_fd_table(child_ends: &BTreeMap<Fd, ChildEnd>) -> Result<crt_
     let mut entries: BTreeMap<Fd, (HANDLE, crt_fds::FdKind)> = BTreeMap::new();
     for (&slot, end) in child_ends {
         let h = HANDLE(end.as_raw_handle());
+        // A null end (an inherited null std handle) is a gap: not open in the child, not inherited.
+        if h.0.is_null() {
+            continue;
+        }
         entries.insert(slot, (h, crt_fds::classify(h)?));
     }
     Ok(crt_fds::encode(&entries))
@@ -476,9 +470,39 @@ pub(crate) fn can_terminate(pid: u32) -> bool {
     }
 }
 
-fn child_handle(ends: &BTreeMap<Fd, ChildEnd>, slot: Fd) -> HANDLE {
+/// The `STARTUPINFOEXW` for `child_ends` (0/1/2 + fd >= 3) and their encoded `table`: the std
+/// handles, `table` as `lpReserved2` (so the child CRT recovers fd >= 3), and the HANDLE_LIST that
+/// scopes inheritance to `table.handles`. Keep `table` and the list alive until after
+/// `CreateProcessW`. `pub(crate)`: shared with the async raw backend.
+///
+/// A null end, inherited from a null std handle of this process, reaches the child as null.
+/// `STARTF_USESTDHANDLES` is set only when one of 0/1/2 is non-null, as std does: that flag requires
+/// `bInheritHandles`, and with all three null the child gets the OS default, as from std's route.
+/// With no handle to inherit there is no list, and `create_process` passes `bInheritHandles` FALSE.
+pub(crate) fn startup_info(
+    child_ends: &BTreeMap<Fd, ChildEnd>,
+    table: &crt_fds::FdTable,
+) -> Result<(STARTUPINFOEXW, Option<AttributeList>), Error> {
     // resolve_stdio with the 0/1/2 slot list always resolves all three (None -> inherit).
-    HANDLE(ends[&slot].as_raw_handle())
+    let std_handle = |slot: Fd| HANDLE(child_ends[&slot].as_raw_handle());
+    let mut si = STARTUPINFOEXW::default();
+    let (stdin, stdout, stderr) = (std_handle(Fd::STDIN), std_handle(Fd::STDOUT), std_handle(Fd::STDERR));
+    if [stdin, stdout, stderr].iter().any(|h| !h.0.is_null()) {
+        si.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
+        si.StartupInfo.hStdInput = stdin;
+        si.StartupInfo.hStdOutput = stdout;
+        si.StartupInfo.hStdError = stderr;
+    }
+    si.StartupInfo.cbReserved2 = table.bytes.len() as u16; // fits: the caller capped it
+    si.StartupInfo.lpReserved2 = table.bytes.as_ptr() as *mut u8;
+    let attr = if table.handles.is_empty() {
+        None
+    } else {
+        let attr = AttributeList::build(&table.handles)?;
+        si.lpAttributeList = attr.as_ptr();
+        Some(attr)
+    };
+    Ok((si, attr))
 }
 
 /// Mark `h` inheritable (`bInheritHandles` + the HANDLE_LIST require it).

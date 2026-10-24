@@ -285,6 +285,9 @@ pub(crate) fn exit_status(handle: HANDLE) -> io::Result<ExitStatus> {
 /// pre-fills `si.StartupInfo` (`dwFlags`/`hStd*`) and `si.lpAttributeList`, and passes a mutable
 /// NUL-terminated `cmdline` (`CreateProcessW` may edit it in place). Sets `si.StartupInfo.cb` here
 /// so every caller gets the extended-struct size right. Returns the owned process handle + pid.
+///
+/// Handles are inherited only through a HANDLE_LIST: `bInheritHandles` is TRUE exactly when
+/// `si.lpAttributeList` is set, so no spawn hands the child every inheritable handle of this process.
 pub(crate) fn create_process(
     app: Option<&[u16]>,
     cmdline: &mut [u16],
@@ -298,6 +301,7 @@ pub(crate) fn create_process(
     let app = app.map_or(PCWSTR::null(), |w| PCWSTR(w.as_ptr()));
     let cwd = cwd.as_ref().map_or(PCWSTR::null(), |w| PCWSTR(w.as_ptr()));
     let env_ptr = env.map(|b| b.as_ptr() as *const core::ffi::c_void);
+    let inherit = !si.lpAttributeList.0.is_null();
     // SAFETY: all pointers are valid for the call; `cmdline` is a mutable NUL-terminated buffer
     // `CreateProcessW` may edit in place; `&si.StartupInfo` is backed by the full `STARTUPINFOEXW`
     // (cb set above, EXTENDED_STARTUPINFO_PRESENT in `flags`).
@@ -307,7 +311,7 @@ pub(crate) fn create_process(
             Some(PWSTR(cmdline.as_mut_ptr())),
             None,
             None,
-            true,
+            inherit,
             PROCESS_CREATION_FLAGS(flags),
             env_ptr,
             cwd,
