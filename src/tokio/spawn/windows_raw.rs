@@ -20,7 +20,7 @@ use windows::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
 
 use crate::child::spawn::windows_raw as sync_raw;
 use crate::child::spawn::{
-    attach_or_fault, dup, resolve_identity, resolve_non_merge, spawn_lock, ChildEnd, Classify, SpawnFailure,
+    attach_or_fault, dup, resolve_identity, resolve_non_merge, spawn_lock, ChildEnd, Classify, ParentStd, SpawnFailure,
 };
 use crate::command::Command;
 use crate::error::Error;
@@ -286,14 +286,15 @@ pub(crate) fn spawn_raw(
     // tokio overlapped-pipe machinery (we own the async parent ends — std slots via the
     // stdin/stdout/stderr accessors, fd >= 3 via fd_read_end/fd_write_end), merges as dups, the rest
     // (inherit/file/null) via the shared core (which rejects inherit on fd >= 3).
-    let (child_ends, owned_std, fd_pipes) = resolve_raw_ends(&fds).not_started()?;
+    let parent_std = ParentStd::read();
+    let (child_ends, owned_std, fd_pipes) = resolve_raw_ends(&fds, parent_std).not_started()?;
 
     // Classify + encode the dense MSVCRT fd-table the child CRT reads back from `lpReserved2` — the
     // SAME layout + HANDLE_LIST source as the sync backend.
     let table = sync_raw::build_fd_table(&child_ends).not_started()?;
 
     // `table` (`bytes`) and the attribute list stay alive until after CreateProcessW.
-    let mut startup = sync_raw::startup_info(&child_ends, &table).not_started()?;
+    let mut startup = sync_raw::startup_info(&child_ends, &table, parent_std).not_started()?;
     // The listed handles: `table.handles` (the non-null ends among 0/1/2 + fd >= 3, each a distinct
     // fresh dup, its 0/1/2 entries being the hStd* handles) or, when that is empty, the filler. No
     // duplicate reaches the list.
@@ -304,7 +305,7 @@ pub(crate) fn spawn_raw(
 
     // UNDER THE LOCK: mark the listed child ends inheritable, spawn, then CLOSE the child ends and
     // the attribute list BEFORE the guard releases on EVERY path (mirrors the sync raw backend —
-    // an early `?` would drop the inner guard before `child_ends`/`attr`, exposing inheritable
+    // an early `?` would drop the inner guard before `child_ends`/`startup`, exposing inheritable
     // handles to a concurrent spawn).
     let spawned = {
         let _guard = spawn_lock();
@@ -382,7 +383,7 @@ type RawEnds = (BTreeMap<Fd, ChildEnd>, BTreeMap<Fd, OwnedStd>, BTreeMap<Fd, Own
 /// we own. Piped slots use OUR overlapped pipe (tokio owns none here — there is no
 /// `tokio::process::Child`); merges dup their target's child end; the rest resolve via the shared
 /// core (which rejects inherit on fd >= 3).
-fn resolve_raw_ends(fds: &BTreeMap<Fd, ResolvedStdio>) -> Result<RawEnds, Error> {
+fn resolve_raw_ends(fds: &BTreeMap<Fd, ResolvedStdio>, parent_std: ParentStd) -> Result<RawEnds, Error> {
     // Slots to resolve: 0/1/2 always, plus every configured fd >= 3.
     let slots: Vec<Fd> = {
         let mut v = vec![Fd::STDIN, Fd::STDOUT, Fd::STDERR];
@@ -422,7 +423,7 @@ fn resolve_raw_ends(fds: &BTreeMap<Fd, ResolvedStdio>) -> Result<RawEnds, Error>
                 }
             }
             other => {
-                let (child_end, parent) = resolve_non_merge(slot, other)?;
+                let (child_end, parent) = resolve_non_merge(slot, other, parent_std)?;
                 debug_assert!(parent.is_none(), "a raw non-pipe slot yields no parent end");
                 child_ends.insert(slot, child_end);
             }

@@ -50,7 +50,7 @@ use windows::Win32::System::Threading::{
 use crate::child::proc_handle::ProcHandle;
 use crate::child::spawn::{
     attach_or_fault, null_end, reject_batch_path, resolve_identity, resolve_stdio, spawn_lock, ChildEnd, Classify,
-    PipeOwnership, SpawnFailure,
+    ParentStd, PipeOwnership, SpawnFailure,
 };
 use crate::child::Child;
 use crate::command::{Command, CommandInput, EnvOp, ExecutableSpec};
@@ -120,14 +120,15 @@ pub(crate) fn spawn_raw(
         v.extend(fds.keys().copied().filter(|f| f.raw() >= 3));
         v
     };
-    let (child_ends, parent_ends) = resolve_stdio(&fds, &slots, PipeOwnership::Owned).not_started()?;
+    let parent_std = ParentStd::read();
+    let (child_ends, parent_ends) = resolve_stdio(&fds, &slots, PipeOwnership::Owned, parent_std).not_started()?;
 
     // Classify each resolved child end (0/1/2 + fd >= 3) and encode the dense 0..=maxfd MSVCRT
     // fd-table the child CRT reads back from `lpReserved2`.
     let table = build_fd_table(&child_ends).not_started()?;
 
     // The table (`bytes`) and the attribute list stay alive until after CreateProcessW.
-    let mut startup = startup_info(&child_ends, &table).not_started()?;
+    let mut startup = startup_info(&child_ends, &table, parent_std).not_started()?;
     // The listed handles: `table.handles` (the non-null ends among 0/1/2 + fd >= 3, each a distinct
     // fresh dup from `resolve_stdio`, its 0/1/2 entries being the hStd* handles) or, when that is
     // empty, the filler. No duplicate reaches the list.
@@ -138,7 +139,7 @@ pub(crate) fn spawn_raw(
 
     // UNDER THE LOCK: mark the listed child ends inheritable, spawn, then CLOSE the child ends and
     // the attribute list BEFORE the guard releases on EVERY path. An early `?` here would drop the
-    // inner-scope guard before `child_ends`/`attr` (Rust drops inner locals first), leaving
+    // inner-scope guard before `child_ends`/`startup` (Rust drops inner locals first), leaving
     // inheritable handles exposed to a concurrent spawn — so compute a Result and drop explicitly.
     let spawned = {
         let _guard = spawn_lock();
@@ -518,16 +519,20 @@ fn listed_handles<'a>(filler: &'a Option<Filler>, table: &'a crt_fds::FdTable) -
 ///
 /// A null end reaches the child as null, but only through `STARTF_USESTDHANDLES`: without the flag
 /// the child gets this process's handle in that slot. So the flag is set whenever a child end or
-/// this process's handle for any std slot is non-null, and only when all six are null does the child
+/// this process's handle for any std slot (as read in `parent_std`) is non-null, and only when all six are null does the child
 /// get the OS default, as with std. The flag requires `bInheritHandles`, which needs a HANDLE_LIST
 /// (never blanket inheritance), and a list cannot be empty: when no child end is listed, a NUL
 /// handle opened for this spawn is the list.
-pub(crate) fn startup_info(child_ends: &BTreeMap<Fd, ChildEnd>, table: &crt_fds::FdTable) -> Result<Startup, Error> {
+pub(crate) fn startup_info(
+    child_ends: &BTreeMap<Fd, ChildEnd>,
+    table: &crt_fds::FdTable,
+    parent_std: ParentStd,
+) -> Result<Startup, Error> {
     // resolve_stdio with the 0/1/2 slot list always resolves all three (None -> inherit).
     let std_handle = |slot: Fd| HANDLE(child_ends[&slot].as_raw_handle());
     let mut si = STARTUPINFOEXW::default();
     let (stdin, stdout, stderr) = (std_handle(Fd::STDIN), std_handle(Fd::STDOUT), std_handle(Fd::STDERR));
-    if [stdin, stdout, stderr].iter().any(|h| !h.0.is_null()) || parent_std_is_live() {
+    if [stdin, stdout, stderr].iter().any(|h| !h.0.is_null()) || parent_std.any_live() {
         si.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
         si.StartupInfo.hStdInput = stdin;
         si.StartupInfo.hStdOutput = stdout;
@@ -556,18 +561,6 @@ pub(crate) fn startup_info(child_ends: &BTreeMap<Fd, ChildEnd>, table: &crt_fds:
         _attr: attr,
         filler,
     })
-}
-
-/// Whether this process's handle for any of stdin, stdout and stderr is non-null.
-fn parent_std_is_live() -> bool {
-    use std::os::windows::io::AsHandle;
-    [
-        std::io::stdin().as_handle().as_raw_handle(),
-        std::io::stdout().as_handle().as_raw_handle(),
-        std::io::stderr().as_handle().as_raw_handle(),
-    ]
-    .iter()
-    .any(|h| !h.is_null())
 }
 
 /// Mark `h` inheritable (`bInheritHandles` + the HANDLE_LIST require it).
@@ -671,8 +664,8 @@ pub(crate) fn raw_program_and_line(cmd: &Command) -> Result<Vec<u16>, Error> {
 }
 
 /// RAII owner of a `PROC_THREAD_ATTRIBUTE_LIST` carrying a HANDLE_LIST. Deletes the list on drop.
-/// The handle array it references must outlive the list (per `UpdateProcThreadAttribute`): callers
-/// keep `all_handles` alive across both `CreateProcessW` and this drop. `pub(crate)`: the async raw
+/// The slice passed to [`AttributeList::build`] must outlive the list (per
+/// `UpdateProcThreadAttribute`): callers keep it alive across both `CreateProcessW` and this drop. `pub(crate)`: the async raw
 /// backend builds the identical scoped inheritance list.
 pub(crate) struct AttributeList {
     _buf: Vec<u8>,

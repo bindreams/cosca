@@ -112,8 +112,8 @@ impl Stdio {
     /// the child gets that. The child keeps the null even while another of this process's std
     /// handles is live, except on the `std::process::Command` route (argv-only commands): there,
     /// when the merge leaves all three of the child's std ends null, `std` sets no flag and the
-    /// child gets this process's live handles instead. Moving every Windows spawn to the raw backend
-    /// (P7) removes that route.
+    /// child gets this process's live handles instead. Issue #156, which moves every Windows spawn
+    /// onto the raw backend, removes that route.
     pub fn merge(other: Fd) -> Stdio {
         Stdio(StdioKind::Merge(other))
     }

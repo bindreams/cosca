@@ -8,7 +8,7 @@ use std::process::Stdio as StdStdio;
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use crate::child::spawn::build_std_command;
-use crate::child::spawn::{dup, resolve_identity, resolve_stdio, Classify, PipeOwnership, SpawnFailure};
+use crate::child::spawn::{dup, resolve_identity, resolve_stdio, Classify, ParentStd, PipeOwnership, SpawnFailure};
 use crate::command::Command;
 use crate::error::{ChildFate, Error};
 use crate::identity::Resolved;
@@ -240,7 +240,8 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
     // fd >= 3 — a stray end cannot exist by construction, so no assert/drop pairing to keep in sync.
     #[cfg(windows)]
     let all_slots: Vec<Fd> = resolve_std_slots.collect();
-    let (mut child_ends, parent_ends) = resolve_stdio(&fds, &all_slots, PipeOwnership::Deferred).not_started()?;
+    let (mut child_ends, parent_ends) =
+        resolve_stdio(&fds, &all_slots, PipeOwnership::Deferred, ParentStd::read()).not_started()?;
     // Deferred skips only the piped STD slots; every parent end here is an fd >= 3 pipe's.
     debug_assert!(
         parent_ends.keys().all(|f| f.raw() >= 3),
