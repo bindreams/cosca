@@ -440,3 +440,7 @@ impl PidfdShutdown {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "tree_call_tests.rs"]
+mod tree_call_tests;
