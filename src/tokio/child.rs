@@ -235,11 +235,11 @@ impl Child {
         Ok(())
     }
 
-    /// Whether this child's tree is reached through the root's number, for a test that needs a
-    /// number-named group kill.
+    /// Whether this child's tree is a process group named by the root's pid, for a test that needs
+    /// one.
     #[cfg(all(test, unix))]
-    pub(super) fn needs_root_check(&self) -> bool {
-        self.os.attached.needs_root_check()
+    pub(super) fn signals_a_group(&self) -> bool {
+        self.os.attached.signals_a_group()
     }
 
     /// What names this child's tree in a message about a failed teardown of it.
@@ -762,20 +762,22 @@ impl Child {
     ///
     /// **A root reaped by something else.** A process group, and a macOS fd marker's group and
     /// walk, are named by the root's pid. If the root's own handle shows it was reaped by another
-    /// reaper in the process, or, on Linux, cannot say, that pid may name another process: nothing
-    /// is sent by it, and the call returns
-    /// [`Error::Unassessable`](crate::error::Error::Unassessable), with a `warn` naming what it
-    /// skipped. On macOS a root the handle cannot say about is answered as in the paragraph above.
-    /// Once this handle reaped the root itself, another process at that pid means the group is
-    /// empty, and a walk from the pid would find only that process's children: nothing is sent by
-    /// the pid, and the call is `Ok`; a pid that cannot be read is `Unassessable` as above. Either
-    /// way an fd marker still kills its marker holders, which are named by the pipe they hold, so
-    /// no pid reuse redirects the kill. After this handle's own reap the call is `Ok` only if every
-    /// holder was reached, and a pid that names no process is still signalled as the group's id:
-    /// the root's group while a member survives, but once none does, another process may take the
-    /// number, and lead a group by it, first (bindreams/cosca#382). A foreign reap after that look
-    /// is not seen, and the signals by that number (the group's, and an fd marker's walk from the
-    /// root's pid) then go out, for the whole sweep, to a number another process may hold.
+    /// reaper in the process, that pid may name another process: nothing is sent by it, and the call
+    /// returns [`Error::Unassessable`](crate::error::Error::Unassessable), with a `warn` naming what
+    /// it skipped. A root whose handle cannot say is answered the same way, except that on Linux the
+    /// root itself is still killed through its pidfd, which names it exactly, and the `warn` says so;
+    /// on macOS it is answered as in the paragraph above. An fd marker still kills its marker
+    /// holders, which are named by the pipe they hold, so no pid reuse redirects the kill.
+    ///
+    /// **After this handle's own reap.** As for the sync
+    /// [`Child::kill_tree`](crate::Child::kill_tree): no walk runs from the root's pid, another
+    /// process at that pid means the group is empty, and a pid that names no process is still
+    /// signalled as the group's id (bindreams/cosca#382).
+    ///
+    /// **A reap after the look.** All of this is decided on one look at the root. A foreign reap
+    /// after it is not seen, and what the sweep sends by that number (the group's signal, and an fd
+    /// marker's walk from the root's pid) then goes out, for the whole sweep, to a number another
+    /// process may hold.
     pub fn kill_tree(&mut self) -> Result<(), Error> {
         self.kill_tree_after(None)
     }
@@ -810,6 +812,7 @@ impl Child {
             earlier,
             &self.tree_killed,
             || self.root_state_and_own_reap(),
+            Some(&|| self.kill_root_through_handle()),
         ) {
             return result;
         }
@@ -934,10 +937,23 @@ impl Child {
             None,
             &self.tree_killed,
             || self.root_state_and_own_reap(),
+            None,
         ) {
             return result;
         }
         self.terminate_tree_unchecked()
+    }
+
+    /// A kill of the root through its own handle (Linux: its pidfd), with no look at its state.
+    #[cfg(unix)]
+    fn kill_root_through_handle(&self) -> Result<Sent, Error> {
+        let Some(proc) = self.os.proc.as_ref() else {
+            return Ok(Sent::Gone);
+        };
+        match proc.signal(Sig::Kill) {
+            Err(Error::Io(e)) => Err(crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper())),
+            other => other,
+        }
     }
 
     /// The tree paths' one look at the root ([`root_number`](crate::child::root_number)).

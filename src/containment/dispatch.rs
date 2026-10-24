@@ -553,6 +553,18 @@ impl Attached {
         }
     }
 
+    /// Whether this mechanism signals a process group named by the root's pid: `ProcessGroup`, and
+    /// a macOS fd marker whose mode made a group.
+    #[cfg(all(test, unix))]
+    pub(crate) fn signals_a_group(&self) -> bool {
+        match self {
+            Attached::ProcessGroup(_) => true,
+            #[cfg(target_os = "macos")]
+            Attached::FdMarker(m) => m.pgid().is_some(),
+            _ => false,
+        }
+    }
+
     /// Whether `kill_tree`/`terminate_tree` must check the root before signalling
     /// ([`crate::child::root_number`]): this mechanism reaches the tree through the root's number,
     /// which the root's reap frees for reuse, and nothing in it checks the root first.
@@ -708,6 +720,38 @@ impl Attached {
             }
             _ => None,
         }
+    }
+
+    /// Whether this is a macOS fd marker, and if so whether its mode made a group. `None`: not an
+    /// fd marker.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn fd_marker_has_group(&self) -> Option<bool> {
+        match self {
+            Attached::FdMarker(m) => Some(m.pgid().is_some()),
+            _ => None,
+        }
+    }
+
+    /// Send `signal` to a macOS fd marker's group and holders, with no walk from the root's pid: for
+    /// a root this process reaped, whose pid names no process. `None` for any other mechanism. For
+    /// `Kill`, an `Ok` marks the tree killed only if `mark` is set.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn signal_group_and_holders(
+        &self,
+        signal: TreeSignal,
+        mark: Option<&TreeKilled>,
+    ) -> Option<Result<(), Error>> {
+        let Attached::FdMarker(m) = self else {
+            return None;
+        };
+        let result = match signal {
+            TreeSignal::Kill => m.hard_kill_group_and_holders(),
+            TreeSignal::Term => m.terminate_group_and_holders(),
+        };
+        if let (Ok(()), TreeSignal::Kill, Some(killed)) = (&result, signal, mark) {
+            killed.mark();
+        }
+        Some(result)
     }
 
     /// Whether [`signal_tree_untrusted`](Self::signal_tree_untrusted) has a channel left to signal

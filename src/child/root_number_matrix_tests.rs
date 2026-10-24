@@ -8,6 +8,10 @@
 //! Each cell's tree is a root `sleep` and a `cat` in its group (in its leaf, holding its marker)
 //! that ignores `SIGTERM` and outlives the root. Every cell is checked, and the whole matrix is
 //! printed if any cell is wrong.
+//!
+//! Two sends by number are routed, and their cells expect them until the issue lands:
+//! [`KILLPG_AFTER_OWN_REAP`] (a group after this handle's own reap, the pid naming nothing) and
+//! [`CGROUP_TERM_BY_PID`] (a cgroup's `SIGTERM` to each member, reaped root or not).
 
 use std::time::Duration;
 
@@ -141,13 +145,16 @@ impl Reap {
 /// The tree entry point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Op {
-    KillTree,
-    TerminateTree,
-    GracefulShutdownTree,
+    /// `kill_tree`.
+    Kill,
+    /// `terminate_tree`.
+    Terminate,
+    /// `graceful_shutdown_tree`, with no grace.
+    GracefulShutdown,
 }
 
 impl Op {
-    const ALL: [Op; 3] = [Op::KillTree, Op::TerminateTree, Op::GracefulShutdownTree];
+    const ALL: [Op; 3] = [Op::Kill, Op::Terminate, Op::GracefulShutdown];
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,7 +237,7 @@ fn expected(mechanism: Mechanism, reap: Reap, op: Op) -> Expected {
     } else {
         Want::No
     };
-    let by_pid = if mechanism.is_cgroup() && op != Op::KillTree {
+    let by_pid = if mechanism.is_cgroup() && op != Op::Kill {
         CGROUP_TERM_BY_PID
     } else if reaped {
         Want::No
@@ -239,9 +246,9 @@ fn expected(mechanism: Mechanism, reap: Reap, op: Op) -> Expected {
     };
     let holder: Option<&'static [nix::sys::signal::Signal]> = match (mechanism.is_marker(), reaped) {
         (true, true) => Some(match op {
-            Op::KillTree => &[SIGKILL],
-            Op::TerminateTree => &[SIGTERM],
-            Op::GracefulShutdownTree => &[SIGTERM, SIGKILL],
+            Op::Kill => &[SIGKILL],
+            Op::Terminate => &[SIGTERM],
+            Op::GracefulShutdown => &[SIGTERM, SIGKILL],
         }),
         // The walk reaches the `cat` first.
         (true, false) => None,
@@ -251,10 +258,10 @@ fn expected(mechanism: Mechanism, reap: Reap, op: Op) -> Expected {
     let pidfd = match (cfg!(target_os = "linux"), reaped, op) {
         (false, _, _) => Want::No,
         (true, true, _) => Want::Any,
-        (true, false, Op::TerminateTree) => Want::No,
+        (true, false, Op::Terminate) => Want::No,
         (true, false, _) => Want::Yes,
     };
-    let cgroup_kill = if mechanism.is_cgroup() && op != Op::TerminateTree {
+    let cgroup_kill = if mechanism.is_cgroup() && op != Op::Terminate {
         Want::Yes
     } else {
         Want::No
@@ -379,17 +386,18 @@ fn run_sync(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
     let forced = reap.read(child.id()).map(crate::child::fault::force_root_reads);
 
     let recorders = Recorders::start();
-    let _ = match op {
-        Op::KillTree => child.kill_tree(),
-        Op::TerminateTree => child.terminate_tree(),
-        Op::GracefulShutdownTree => child.graceful_shutdown_tree(Duration::ZERO).map(drop),
+    // The cell checks what was sent, not what the call answered.
+    _ = match op {
+        Op::Kill => child.kill_tree(),
+        Op::Terminate => child.terminate_tree(),
+        Op::GracefulShutdown => child.graceful_shutdown_tree(Duration::ZERO).map(drop),
     };
     let sent = recorders.sent(root, cat);
 
     // The tree is gone before the drop, which runs under the recorders: it sends no killpg.
     if reap == Reap::None {
-        let _ = child.kill();
-        let _ = child.wait();
+        child.kill().expect("kill the root");
+        child.wait().expect("reap the root");
     }
     drop(stdin);
     let mut rest = Vec::new();
@@ -433,16 +441,17 @@ async fn run_tokio(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
     let forced = reap.read(child.id()).map(crate::child::fault::force_root_reads);
 
     let recorders = Recorders::start();
-    let _ = match op {
-        Op::KillTree => child.kill_tree(),
-        Op::TerminateTree => child.terminate_tree(),
-        Op::GracefulShutdownTree => child.graceful_shutdown_tree(Duration::ZERO).await.map(drop),
+    // The cell checks what was sent, not what the call answered.
+    _ = match op {
+        Op::Kill => child.kill_tree(),
+        Op::Terminate => child.terminate_tree(),
+        Op::GracefulShutdown => child.graceful_shutdown_tree(Duration::ZERO).await.map(drop),
     };
     let sent = recorders.sent(root, cat);
 
     if reap == Reap::None {
-        let _ = child.kill();
-        let _ = child.wait().await;
+        child.kill().expect("kill the root");
+        child.wait().await.expect("reap the root");
     }
     drop(stdin);
     let mut rest = Vec::new();

@@ -108,23 +108,28 @@ pub(crate) enum RootNumber {
     /// see [`Attached::signal_tree_untrusted`](crate::containment::Attached::signal_tree_untrusted).
     #[cfg(target_os = "macos")]
     Untrusted(crate::signal::RootState),
-    /// This handle reaped the root and another process holds its pid: the group is empty, since the
-    /// kernel does not reissue a pid while it is some group's id, and a walk from the pid would name
-    /// only that process's children, since the root's own were reparented at its exit.
+    /// macOS: this handle reaped the root, its pid names no process, and an fd marker made a group.
+    /// The group and the marker holders are signalled, but no walk runs from the pid: the root's
+    /// children were reparented at its exit, so a walk would find only a later process's children.
+    #[cfg(target_os = "macos")]
+    NoWalk,
+    /// This handle reaped the root, and its group is empty or it had none: another process holds
+    /// the pid, and the kernel does not reissue a pid while it is some group's id, or the pid of a
+    /// pid-less fd marker's root names nothing. Only the marker holders, if any, are signalled.
     Empty,
-    /// The pid may name another process, for the reason given: the root was reaped elsewhere, or
-    /// its handle or its pid cannot be read.
-    MayNameAnother(String),
+    /// The pid may name another process, for the reason `why`: the root was reaped elsewhere, or
+    /// its handle or its pid cannot be read. `exact_root`: the handle cannot say whether the root
+    /// was reaped, but still names it exactly (Linux: its pidfd), so a kill can still reach it.
+    MayNameAnother { why: String, exact_root: bool },
 }
 
 /// [`RootNumber`] for `attached`'s tree, from one call of `state`: the root's own handle's answer,
 /// and whether a `Reaped` is that handle's own reap. On macOS it is always called; elsewhere only
 /// for a mechanism that reaches its tree through the root's number
-/// ([`Attached::needs_root_check`](crate::containment::Attached::needs_root_check)). A pid that names
-/// nothing after this handle's own reap (`Gone`) is `Trusted`: it is the id of the root's group
-/// while a member survives, but once none does, a later process may take the number, and lead a
-/// group by it, or fork a child the walk takes for a member, before the sweep signals it
-/// (bindreams/cosca#382).
+/// ([`Attached::needs_root_check`](crate::containment::Attached::needs_root_check)). After this
+/// handle's own reap, a pid that names nothing (`Gone`) is still the id of the root's group while a
+/// member survives, so a group is signalled by it, though once none survives a later process may
+/// take the number, and lead a group by it, first (bindreams/cosca#382). No walk runs from it.
 #[cfg(unix)]
 pub(crate) fn root_number(
     attached: &crate::containment::Attached,
@@ -144,15 +149,17 @@ pub(crate) fn root_number(
     if !attached.needs_root_check() {
         return RootNumber::Trusted;
     }
+    let mut exact_root = false;
     let why = match state() {
         (RootState::Unreaped, _) => return RootNumber::Trusted,
         (RootState::Reaped, true) => match root_identity_now(pid) {
-            Resolved::Gone => return RootNumber::Trusted,
+            Resolved::Gone => return own_reaped_free(attached),
             Resolved::Found(_) => return RootNumber::Empty,
             Resolved::Unknown => format!("this handle reaped the root, and its pid ({pid}) could not be read"),
         },
         (RootState::Reaped, false) => format!("the root (pid {pid}) was reaped elsewhere"),
         (RootState::Unknown(e), _) => {
+            exact_root = cfg!(target_os = "linux");
             format!("the root's own handle could not say whether it (pid {pid}) was reaped ({e})")
         }
         (RootState::Unpinned, _) => {
@@ -160,23 +167,45 @@ pub(crate) fn root_number(
             format!("the root (pid {pid}) is not pinned by this process")
         }
     };
-    RootNumber::MayNameAnother(why)
+    RootNumber::MayNameAnother { why, exact_root }
+}
+
+/// [`RootNumber`] after this handle's own reap, with the root's pid naming no process.
+#[cfg(unix)]
+fn own_reaped_free(attached: &crate::containment::Attached) -> RootNumber {
+    #[cfg(target_os = "macos")]
+    match attached.fd_marker_has_group() {
+        Some(true) => return RootNumber::NoWalk,
+        Some(false) => return RootNumber::Empty,
+        None => {}
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = attached;
+    RootNumber::Trusted
 }
 
 /// What `kill_tree` and `terminate_tree` (sync and async) do instead of signalling a tree reached
 /// through the root's pid (a process group, or a macOS fd marker's group and walk) when that pid may
 /// name another process, decided on one look ([`root_number`]). `None`: signal it as usual.
 ///
-/// Nothing that names the tree by the root's number runs here: no `killpg`, no walk from its pid.
-/// What names it by identity still does: a macOS fd marker's holders, named by the pipe they hold.
+/// No walk from the root's pid runs here, and no `killpg` except a marker's group's after this
+/// handle's own reap ([`RootNumber::NoWalk`]). What names the tree by identity still runs: a macOS
+/// fd marker's holders, named by the pipe they hold.
 ///
 /// - `Untrusted` (macOS): `Attached::signal_tree_untrusted`.
+/// - `NoWalk` (macOS): the group and the holders. A `Kill` that is `Ok` marks the tree killed.
 /// - `Empty`: the holders are signalled, and the call is their sweep's answer (`Ok` with no holders
 ///   channel). A `Kill` that is `Ok` marks the tree killed.
-/// - `MayNameAnother`: [`number_skipped`].
+/// - `MayNameAnother`: [`number_skipped`], after `kill_root` for a `Kill` when the handle still
+///   names the root exactly.
 ///
-/// `op` names the call; `earlier` names what the same operation sent before.
+/// `op` names the call; `earlier` names what the same operation sent before. `kill_root` kills the
+/// root through its handle; only `kill_tree` passes it.
 #[cfg(unix)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each is one fact of the call the decision needs"
+)]
 pub(crate) fn root_checked_tree_signal(
     attached: &crate::containment::Attached,
     id: ProcessId,
@@ -185,6 +214,7 @@ pub(crate) fn root_checked_tree_signal(
     earlier: Option<&str>,
     killed: &crate::containment::TreeKilled,
     state: impl FnOnce() -> (crate::signal::RootState, bool),
+    kill_root: Option<&dyn Fn() -> Result<crate::signal::Sent, Error>>,
 ) -> Option<Result<(), Error>> {
     use crate::containment::dispatch::TreeSignal;
     let pid = id.pid();
@@ -192,6 +222,8 @@ pub(crate) fn root_checked_tree_signal(
         RootNumber::Trusted => None,
         #[cfg(target_os = "macos")]
         RootNumber::Untrusted(root) => attached.signal_tree_untrusted(signal, &root, pid, op, earlier, killed),
+        #[cfg(target_os = "macos")]
+        RootNumber::NoWalk => Some(no_walk_signal(attached, pid, signal, op, Some(killed))),
         RootNumber::Empty => Some(
             empty_group_signal(attached, pid, signal, op, Some(killed)).unwrap_or_else(|| {
                 if let TreeSignal::Kill = signal {
@@ -200,8 +232,34 @@ pub(crate) fn root_checked_tree_signal(
                 Ok(())
             }),
         ),
-        RootNumber::MayNameAnother(why) => Some(Err(number_skipped(attached, pid, signal, op, earlier, &why))),
+        RootNumber::MayNameAnother { why, exact_root } => {
+            let root = match (exact_root, signal, kill_root) {
+                (true, TreeSignal::Kill, Some(kill_root)) => Some(kill_root()),
+                _ => None,
+            };
+            Some(Err(number_skipped(attached, pid, signal, op, earlier, &why, root)))
+        }
     }
+}
+
+/// The signal for [`RootNumber::NoWalk`]: the group and a macOS fd marker's holders, and no walk
+/// from the root's pid. For `Kill`, an `Ok` marks the tree killed only if `mark` is set.
+#[cfg(target_os = "macos")]
+pub(crate) fn no_walk_signal(
+    attached: &crate::containment::Attached,
+    pid: crate::identity::RawPid,
+    signal: crate::containment::dispatch::TreeSignal,
+    op: &str,
+    mark: Option<&crate::containment::TreeKilled>,
+) -> Result<(), Error> {
+    log::debug!(
+        "{op}({pid}): this handle reaped the root, and its pid names no process: its group and the marker holders \
+         are signalled, and no walk runs from the pid, which would find none of the tree"
+    );
+    attached.signal_group_and_holders(signal, mark).unwrap_or_else(|| {
+        debug_assert!(false, "only an fd marker with a group gets here");
+        Ok(())
+    })
 }
 
 /// The signal for [`RootNumber::Empty`]: nothing by the root's number, and a macOS fd marker's
@@ -216,15 +274,16 @@ pub(crate) fn empty_group_signal(
     mark: Option<&crate::containment::TreeKilled>,
 ) -> Option<Result<(), Error>> {
     log::debug!(
-        "{op}({pid}): this handle reaped the root and another process holds its pid now, so its group is \
-         empty, a walk from that pid would find only that process's children, and nothing is sent by it"
+        "{op}({pid}): this handle reaped the root, so its group is empty or it had none, a walk from its pid \
+         would find none of the tree, and nothing is sent by it"
     );
     attached.signal_holders_only(signal, mark)
 }
 
 /// The answer for [`RootNumber::MayNameAnother`], `why` its reason: nothing is sent by the root's
-/// number, a macOS fd marker's holders are signalled, and one `warn` names what was skipped. The
-/// holders' sweep's error, or `Unassessable`.
+/// number, a macOS fd marker's holders are signalled, and one `warn` names what was skipped and
+/// what was sent, `root` included: the kill of the root through its handle, if one was sent. The
+/// holders' sweep's error, the root kill's error, or `Unassessable`.
 #[cfg(unix)]
 pub(crate) fn number_skipped(
     attached: &crate::containment::Attached,
@@ -233,18 +292,26 @@ pub(crate) fn number_skipped(
     op: &str,
     earlier: Option<&str>,
     why: &str,
+    root: Option<Result<crate::signal::Sent, Error>>,
 ) -> Error {
+    use crate::signal::Sent;
     let holders = attached.signal_holders_only(signal, None);
-    let sent = match &holders {
-        None => "sent nothing".to_owned(),
-        Some(Ok(())) => "signalled only the marker holders".to_owned(),
-        Some(Err(e)) => format!("signalled only the marker holders, which failed ({e})"),
+    let sent = match (&holders, &root) {
+        (Some(Ok(())), _) => "signalled only the marker holders".to_owned(),
+        (Some(Err(e)), _) => format!("signalled only the marker holders, which failed ({e})"),
+        (None, None) => "sent nothing".to_owned(),
+        (None, Some(Ok(Sent::Delivered))) => {
+            "killed the root through its pidfd, which names it exactly, and sent nothing else".to_owned()
+        }
+        (None, Some(Ok(Sent::Gone))) => "sent nothing: the root's pidfd shows it is gone".to_owned(),
+        (None, Some(Ok(_))) => "sent nothing: the root's handle no longer reaches it".to_owned(),
+        (None, Some(Err(e))) => format!("sent nothing: the kill of the root through its pidfd failed ({e})"),
     };
     let detail = skipped_detail(attached, pid, signal.verb(), op, why, &sent, earlier);
     log::warn!("{detail}");
-    match holders {
-        Some(Err(e)) => e,
-        None | Some(Ok(())) => Error::Unassessable { detail, source: None },
+    match (holders, root) {
+        (Some(Err(e)), _) | (None, Some(Err(e))) => e,
+        _ => Error::Unassessable { detail, source: None },
     }
 }
 
@@ -788,22 +855,27 @@ impl Child {
     ///
     /// **A root reaped by something else.** A process group, and a macOS fd marker's group and
     /// walk, are named by the root's pid. If the root's own handle shows it was reaped by another
-    /// reaper in the process, or, on Linux, cannot say, that pid may name another process: nothing
-    /// is sent by it, and the call returns
-    /// [`Error::Unassessable`](crate::error::Error::Unassessable), with a `warn` naming what it
-    /// skipped. On macOS a root the handle cannot say about is answered as in the paragraph above.
-    /// Once this handle reaped the root itself, another process at that pid means the group is
-    /// empty, and a walk from the pid would find only that process's children: nothing is sent by
-    /// the pid, and the call is `Ok`; a pid that cannot be read is `Unassessable` as above. Either
-    /// way an fd marker still kills its marker holders, which are named by the pipe they hold, so
-    /// no pid reuse redirects the kill. After this handle's own reap the call is `Ok` only if every
-    /// holder was reached, and a pid that names no process is still signalled as the group's id:
+    /// reaper in the process, that pid may name another process: nothing is sent by it, and the call
+    /// returns [`Error::Unassessable`](crate::error::Error::Unassessable), with a `warn` naming what
+    /// it skipped. A root whose handle cannot say is answered the same way, except that on Linux the
+    /// root itself is still killed through its pidfd, which names it exactly, and the `warn` says so;
+    /// on macOS it is answered as in the paragraph above. An fd marker still kills its marker
+    /// holders, which are named by the pipe they hold, so no pid reuse redirects the kill.
+    ///
+    /// **After this handle's own reap.** The root's children were reparented at its exit, so no walk
+    /// runs from its pid. Another process at that pid means the group is empty: nothing is sent by
+    /// the pid, and the call is `Ok` once every marker holder was reached. A pid that cannot be read
+    /// is `Unassessable` as above. A pid that names no process is still signalled as the group's id:
     /// the root's group while a member survives, but once none does, another process may take the
-    /// number, and lead a group by it, first (bindreams/cosca#382). A reap after that look, by
-    /// another reaper or by a [`wait`](Child::wait) on another thread, is not seen, and the signals
-    /// by that number (the group's, and an fd marker's walk from the root's pid) then go out, for
-    /// the whole sweep, to a number another process may hold. The `wait` case closes once `wait`
-    /// leaves such a root unreaped until drop (bindreams/cosca#54).
+    /// number, and lead a group by it, first (bindreams/cosca#382).
+    ///
+    /// **A reap after the look.** All of this is decided on one look at the root. A reap after it,
+    /// by another reaper or by a [`wait`](Child::wait) on another thread, is not seen, and what the
+    /// sweep sends by that number (the group's signal, and an fd marker's walk from the root's pid)
+    /// then goes out, for the whole sweep, to a number another process may hold. For a process group
+    /// and an fd marker with a group, the `wait` case closes once `wait` leaves such a root unreaped
+    /// until drop (bindreams/cosca#54); for an fd marker without a group, once its sweep checks the
+    /// root again after its process-table snapshot, as `TreeWalk` does.
     pub fn kill_tree(&self) -> Result<(), Error> {
         self.kill_tree_after(None)
     }
@@ -836,6 +908,11 @@ impl Child {
             earlier,
             &self.tree_killed,
             || self.proc.state_and_own_reap(),
+            Some(&|| {
+                self.proc
+                    .kill_sent()
+                    .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper()))
+            }),
         ) {
             return result;
         }
@@ -956,6 +1033,7 @@ impl Child {
             None,
             &self.tree_killed,
             || self.proc.state_and_own_reap(),
+            None,
         ) {
             return result;
         }

@@ -293,6 +293,15 @@ impl Child {
                 Some(Err(e)) if !self.attached.names_tree_by_identity() => return Err(e),
                 other => other,
             },
+            // This handle reaped the root: its marker's group and holders, and no walk from its pid.
+            #[cfg(target_os = "macos")]
+            crate::child::RootNumber::NoWalk => Some(crate::child::no_walk_signal(
+                &self.attached,
+                self.id.pid(),
+                crate::containment::dispatch::TreeSignal::Term,
+                "graceful_shutdown_tree",
+                None,
+            )),
             // The group is empty: nothing goes out by its number, only to the marker holders, if any.
             crate::child::RootNumber::Empty => {
                 let holders = crate::child::empty_group_signal(
@@ -308,7 +317,7 @@ impl Child {
             // The pid may name another process. A macOS fd marker shuts its holders down by the pipe
             // they hold; any other mechanism has nothing to send. Either way the call ends with one
             // warn: a sweep would warn again.
-            crate::child::RootNumber::MayNameAnother(why) => {
+            crate::child::RootNumber::MayNameAnother { why, .. } => {
                 #[cfg(target_os = "macos")]
                 if self.attached.names_tree_by_identity() {
                     return Err(self.shut_down_holders_only(grace, &why));
@@ -320,6 +329,7 @@ impl Child {
                     "graceful_shutdown_tree",
                     None,
                     &why,
+                    None,
                 ));
             }
         };

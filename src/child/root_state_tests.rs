@@ -66,8 +66,8 @@ mod linux {
         let recorder = record_kill_group();
         let (child, writer) = session_blocker();
         assert!(
-            child.attached.needs_root_check(),
-            "the test needs a number-named group kill"
+            child.attached.signals_a_group(),
+            "the test needs a group named by the root's pid, which ContainMode::Session makes"
         );
         let token = StartToken::from_raw(child.id().start_token_raw());
         drop(writer);

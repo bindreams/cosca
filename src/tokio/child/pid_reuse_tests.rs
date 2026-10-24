@@ -531,7 +531,10 @@ fn finish_elevated_of_an_aliased_process_group_sends_no_killpg_body() {
         cmd.stdin(stdin).expect("set stdin");
         cmd.contain_with(crate::ContainMode::Session);
         let child = cmd.spawn().expect("spawn");
-        assert!(child.needs_root_check(), "the test needs a number-named group kill");
+        assert!(
+            child.signals_a_group(),
+            "the test needs a group named by the root's pid, which ContainMode::Session makes"
+        );
         let (_reuser, _alias) = foreign_reaped_and_reused(&child, writer);
 
         let (err, fate) = crate::tokio::spawn::finish_elevated(child, failed_write())
@@ -1025,7 +1028,10 @@ fn spawn_group_blocker() -> (crate::tokio::Child, std::io::PipeWriter) {
     cmd.stdin(stdin).expect("set stdin");
     cmd.contain_with(crate::ContainMode::Session);
     let child = cmd.spawn().expect("spawn");
-    assert!(child.needs_root_check(), "the test needs a number-named group kill");
+    assert!(
+        child.signals_a_group(),
+        "the test needs a group named by the root's pid, which ContainMode::Session makes"
+    );
     (child, writer)
 }
 

@@ -1298,8 +1298,8 @@ fn finish_elevated_after_a_foreign_reap_sends_no_killpg_to_a_process_group() {
     cmd.contain_with(crate::containment::ContainMode::Session);
     let child = cmd.spawn().expect("spawn");
     assert!(
-        child.attached.needs_root_check(),
-        "the test needs a number-named group kill"
+        child.attached.signals_a_group(),
+        "the test needs a group named by the root's pid, which ContainMode::Session makes"
     );
     foreign_reap(&child, writer);
 
