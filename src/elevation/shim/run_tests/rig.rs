@@ -482,57 +482,58 @@ impl Run {
 
     /// Whether the shim still holds the write end of the pipe the program's process waits on to be
     /// released: a pipe the process holds the read end of and the shim does not, and the shim holds the
-    /// write end of. An fd or process that vanishes mid-scan holds nothing; any other error panics.
+    /// write end of. An fd that closes mid-scan holds nothing. Both processes must be alive throughout;
+    /// either one exiting fails the scan with that, not with a verdict.
     pub(super) fn holds_the_release_pipe(&mut self) -> bool {
         let (shim, child) = (self.pid(), self.program_pid() as u32);
+        let program_pidfd = self.program_pidfd();
+        let exited = |pidfd: &OwnedFd| {
+            let mut fds = [PollFd::new(pidfd, PollFlags::IN)];
+            let zero = rustix::event::Timespec { tv_sec: 0, tv_nsec: 0 };
+            matches!(poll(&mut fds, Some(&zero)), Ok(n) if n > 0)
+        };
         let gone = |e: &std::io::Error| matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ESRCH));
+        // pipefs's mount id, from a pipe of this process: an fd's `fdinfo` names its file's mount and inode.
+        let pipefs = {
+            let (r, _w) = std::io::pipe().expect("a pipe");
+            let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", std::os::fd::AsRawFd::as_raw_fd(&r)))
+                .expect("this process's fdinfo");
+            field(&info, "mnt_id").expect("mnt_id").to_owned()
+        };
+        // Each end comes from one `fdinfo` read, which names the file's mount, inode and flags together, so
+        // an fd number reused between reads cannot pair one pipe with another file's access mode.
         let ends = |pid: u32| -> Vec<(String, bool)> {
+            let table = std::fs::read_dir(format!("/proc/{pid}/fd"))
+                .unwrap_or_else(|e| panic!("process {pid} exited during the scan: {e}"));
             let mut ends = vec![];
-            let table = match std::fs::read_dir(format!("/proc/{pid}/fd")) {
-                Ok(table) => table,
-                Err(e) if gone(&e) => return ends,
-                Err(e) => panic!("the fd table: {e}"),
-            };
             for entry in table {
-                let path = match entry {
-                    Ok(entry) => entry.path(),
-                    Err(e) if gone(&e) => return vec![],
-                    Err(e) => panic!("an entry: {e}"),
-                };
-                let target = match std::fs::read_link(&path) {
-                    Ok(target) => target.to_string_lossy().into_owned(),
-                    Err(e) if gone(&e) => continue,
-                    Err(e) => panic!("an fd's target: {e}"),
-                };
-                if !target.starts_with("pipe:[") {
-                    continue;
-                }
-                let info = match std::fs::read_to_string(format!(
-                    "/proc/{pid}/fdinfo/{}",
-                    path.file_name().expect("a name").to_string_lossy()
-                )) {
+                let entry = entry.unwrap_or_else(|e| panic!("process {pid} exited during the scan: {e}"));
+                let fd = entry.file_name().to_string_lossy().into_owned();
+                let info = match std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{fd}")) {
                     Ok(info) => info,
                     Err(e) if gone(&e) => continue,
                     Err(e) => panic!("fdinfo: {e}"),
                 };
-                let flags = info
-                    .lines()
-                    .find_map(|l| l.strip_prefix("flags:"))
-                    .expect("flags")
-                    .trim();
-                let flags = u32::from_str_radix(flags, 8).expect("octal flags");
-                // The fd number may have been closed and reused between the two reads.
-                match std::fs::read_link(&path) {
-                    Ok(again) if again.to_string_lossy() == target => {}
-                    Ok(_) => continue,
-                    Err(e) if gone(&e) => continue,
-                    Err(e) => panic!("an fd's target: {e}"),
+                if field(&info, "mnt_id") != Some(pipefs.as_str()) {
+                    continue;
                 }
-                ends.push((target, flags & libc::O_ACCMODE as u32 == libc::O_WRONLY as u32));
+                let ino = field(&info, "ino").expect("ino");
+                let flags = u32::from_str_radix(field(&info, "flags").expect("flags"), 8).expect("octal flags");
+                ends.push((
+                    format!("pipe:[{ino}]"),
+                    flags & libc::O_ACCMODE as u32 == libc::O_WRONLY as u32,
+                ));
             }
             ends
         };
         let (shim_ends, child_ends) = (ends(shim), ends(child));
+        // An exited process lists an empty fd table, with no error, until it is reaped.
+        assert!(
+            !exited(&self.pidfd),
+            "the shim exited during the scan: {}",
+            self.how_it_ended()
+        );
+        assert!(!exited(&program_pidfd), "the program exited during the scan");
         child_ends
             .iter()
             .filter(|(pipe, writable)| !writable && !shim_ends.iter().any(|(p, w)| p == pipe && !w))
@@ -927,4 +928,11 @@ impl Drop for Owner {
         _ = self.child.kill();
         _ = self.child.wait();
     }
+}
+
+/// The value of `name:` in a `/proc/<pid>/fdinfo/<fd>` file.
+fn field<'a>(info: &'a str, name: &str) -> Option<&'a str> {
+    info.lines()
+        .find_map(|l| l.strip_prefix(name).and_then(|r| r.strip_prefix(':')))
+        .map(str::trim)
 }
