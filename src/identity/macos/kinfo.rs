@@ -157,6 +157,10 @@ pub(crate) const P_WEXIT: libc::c_int = 0x0000_2000;
 /// EINTR retries, per the codebase convention (see `wait/linux.rs`, `wait/macos.rs`).
 pub(crate) fn kinfo(pid: RawPid) -> Resolved<kinfo_proc> {
     #[cfg(test)]
+    if fault::take_unreadable() {
+        return Resolved::Unknown;
+    }
+    #[cfg(test)]
     if let Some(oppid) = fault::take_oppid() {
         return match read_record(pid, libc::KERN_PROC_PID) {
             Resolved::Found(mut info) => {
@@ -187,6 +191,16 @@ pub(crate) mod fault {
 
     thread_local! {
         static OPPID: Cell<Option<libc::pid_t>> = const { Cell::new(None) };
+        static UNREADABLE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// The next [`kinfo`](super::kinfo) on this thread is refused (`Unknown`).
+    pub(crate) fn force_unreadable_once() {
+        UNREADABLE.with(|u| u.set(true));
+    }
+
+    pub(super) fn take_unreadable() -> bool {
+        UNREADABLE.with(Cell::take)
     }
 
     /// The next [`kinfo`](super::kinfo) on this thread that finds its process reports `oppid` as its
