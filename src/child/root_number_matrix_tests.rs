@@ -131,6 +131,8 @@ enum Reap {
     Unpinned,
     OwnFree,
     OwnReused,
+    /// This handle reaped the root, and its pid cannot be read (`Resolved::Unknown`).
+    OwnUnknown,
     ForeignFree,
     ForeignReused,
 }
@@ -143,12 +145,13 @@ impl Reap {
         Reap::Unpinned,
         Reap::OwnFree,
         Reap::OwnReused,
+        Reap::OwnUnknown,
         Reap::ForeignFree,
         Reap::ForeignReused,
     ];
 
     fn own(self) -> bool {
-        matches!(self, Reap::OwnFree | Reap::OwnReused)
+        matches!(self, Reap::OwnFree | Reap::OwnReused | Reap::OwnUnknown)
     }
 
     /// Whether the root is reaped when the entry point runs.
@@ -173,13 +176,15 @@ impl Reap {
         true
     }
 
-    /// What every read of the root's pid answers after the reap: nothing, or another process.
+    /// What every read of the root's pid answers after the reap: nothing, another process, or no
+    /// answer.
     fn read(self, root: ProcessId) -> Option<Resolved<ProcessId>> {
         match self {
             Reap::None | Reap::Unanswered => None,
             #[cfg(target_os = "macos")]
             Reap::Unpinned => None,
             Reap::OwnFree | Reap::ForeignFree => Some(Resolved::Gone),
+            Reap::OwnUnknown => Some(Resolved::Unknown),
             Reap::OwnReused | Reap::ForeignReused => Some(Resolved::Found(ProcessId::from_parts_for_test(
                 root.pid(),
                 root.start_token_raw() + 1,
