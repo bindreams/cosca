@@ -33,9 +33,27 @@ extern "system" {
 
 #[link(name = "ntdll", kind = "raw-dylib")]
 extern "system" {
-    /// `class` 1 is `ObjectNameInformation`: a `UNICODE_STRING` followed by its characters.
-    fn NtQueryObject(handle: HANDLE, class: u32, info: *mut u8, len: u32, returned: *mut u32) -> i32;
+    /// `class` 4 is `FileFsDeviceInformation`: a [`DeviceInfo`]. `io_status` is an
+    /// `IO_STATUS_BLOCK`: two pointer-sized words.
+    fn NtQueryVolumeInformationFile(
+        handle: HANDLE,
+        io_status: *mut [usize; 2],
+        info: *mut DeviceInfo,
+        len: u32,
+        class: u32,
+    ) -> i32;
 }
+
+/// `FILE_FS_DEVICE_INFORMATION`.
+#[repr(C)]
+#[derive(Default)]
+struct DeviceInfo {
+    device_type: u32,
+    characteristics: u32,
+}
+
+/// `FILE_DEVICE_NULL`: the device type of `\Device\Null`.
+const FILE_DEVICE_NULL: u32 = 0x15;
 
 /// This process's std handle `id`, null included.
 fn std_handle(id: STD_HANDLE) -> HANDLE {
@@ -117,7 +135,9 @@ pub fn report(path: &str, stray: &str) {
 
 /// How many handles this process holds that name `\Device\Null`. It visits every handle value:
 /// `GetProcessHandleCount` says how many handles there are, and the walk ends once it has seen that
-/// many.
+/// many. It asks each handle for its device type, as `GetFileType` does, never for its name: a name
+/// query on a synchronous pipe blocks while any process has a read pending on the same file object,
+/// as a CI runner has on a pipe handle this process inherits.
 fn count_nul_handles() -> usize {
     let mut count = 0u32;
     // SAFETY: the pseudo-handle is always valid; `count` is a live out-parameter.
@@ -134,45 +154,20 @@ fn count_nul_handles() -> usize {
             continue;
         }
         remaining -= 1;
-        if object_name(h).as_deref() == Some(r"\Device\Null") {
+        if device_type(h) == Some(FILE_DEVICE_NULL) {
             nul += 1;
         }
     }
     nul
 }
 
-/// The NT name of the object `h` names, if the system gives one.
-fn object_name(h: HANDLE) -> Option<String> {
-    #[repr(C)]
-    struct UnicodeString {
-        length: u16,
-        capacity: u16,
-        buffer: *const u16,
-    }
-    // 8-byte aligned, and large enough for the `UnicodeString` and a long device name.
-    let mut buf = [0u64; 128];
-    // SAFETY: `buf` is a live buffer of the length passed.
-    let status = unsafe {
-        NtQueryObject(
-            h,
-            1,
-            buf.as_mut_ptr().cast(),
-            std::mem::size_of_val(&buf) as u32,
-            &mut 0,
-        )
-    };
-    if status < 0 {
-        return None;
-    }
-    // SAFETY: on success `buf` starts with a `UnicodeString`.
-    let us = unsafe { &*(buf.as_ptr() as *const UnicodeString) };
-    // An unnamed object has an empty name and a null `buffer`.
-    if us.buffer.is_null() {
-        return None;
-    }
-    // SAFETY: a non-null `buffer` points at `length` bytes inside `buf`.
-    let name = unsafe { std::slice::from_raw_parts(us.buffer, us.length as usize / 2) };
-    Some(String::from_utf16_lossy(name))
+/// The device type of the file `h` names, or `None` if `h` is not a file.
+fn device_type(h: HANDLE) -> Option<u32> {
+    let (mut io_status, mut info) = ([0usize; 2], DeviceInfo::default());
+    // SAFETY: `io_status` and `info` are live out-parameters of the sizes passed.
+    let status =
+        unsafe { NtQueryVolumeInformationFile(h, &mut io_status, &mut info, size_of::<DeviceInfo>() as u32, 4) };
+    (status >= 0).then_some(info.device_type)
 }
 
 /// The handle behind CRT fd `fd`, or `None` if the fd is not open.
@@ -194,19 +189,18 @@ fn crt_handle(fd: i32) -> Option<HANDLE> {
 /// Whether `h` names `stray.txt` in this process. A value that is not a handle here, or that is
 /// another kind of object this process made at the same value, is not the stray: `false`. A disk
 /// file that the probe cannot name is reported as `error(<code>)`, so a broken probe cannot read as
-/// "not inherited".
+/// "not inherited". Only a disk file is asked for its name, for the reason in [`count_nul_handles`].
 fn probe_stray(h: HANDLE) -> String {
+    // SAFETY: a handle value this process does not hold is an error, not UB.
+    if unsafe { GetFileType(h) } != FILE_TYPE_DISK {
+        return "false".to_owned();
+    }
     let mut buf = vec![0u16; 1024];
-    // SAFETY: `buf` is a live buffer of its length; a handle value this process does not hold is an
-    // error, not UB.
+    // SAFETY: `buf` is a live buffer of its length.
     let n = unsafe { GetFinalPathNameByHandleW(h, &mut buf, FILE_NAME_NORMALIZED) } as usize;
     if n == 0 {
         let code = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
-        return if unsafe { GetFileType(h) } == FILE_TYPE_DISK {
-            format!("error({code})")
-        } else {
-            "false".to_owned()
-        };
+        return format!("error({code})");
     }
     assert!(
         n < buf.len(),
