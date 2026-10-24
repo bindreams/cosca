@@ -78,10 +78,9 @@ fn attached_is_actionable() {
     assert!(Attached::JobObject(crate::containment::windows::JobHandle::create_empty_for_test()).is_actionable());
 }
 
-/// `Child::kill_tree`/`terminate_tree`'s pgid-recycle precondition assert gates on this
-/// predicate, not on `Attached::ProcessGroup` alone (`src/child.rs`, `src/tokio/child.rs`) —
-/// a macOS `FdMarker` that carries a pgid must be covered too, since it fires `killpg`
-/// unconditionally on pass 1 of every sweep, exactly the hazard this precondition guards.
+/// `kill_tree`/`terminate_tree`'s check of a reaped root (`child::reaped_root_tree_signal`) gates
+/// on this predicate, not on `Attached::ProcessGroup` alone: a macOS `FdMarker` that carries a
+/// pgid fires `killpg` on pass 1 of every sweep, the same hazard.
 #[cfg(unix)]
 #[skuld::test]
 fn attached_carries_recyclable_pgid() {

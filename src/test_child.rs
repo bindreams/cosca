@@ -8,6 +8,9 @@ pub(crate) mod namespaces;
 #[cfg(target_os = "linux")]
 pub(crate) mod pid_reuse;
 
+#[cfg(unix)]
+pub(crate) mod reaped_elsewhere;
+
 #[cfg(target_os = "macos")]
 #[path = "../tests/common/kevent_eintr.rs"]
 mod kevent_eintr;
