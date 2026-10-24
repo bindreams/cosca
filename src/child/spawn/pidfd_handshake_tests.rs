@@ -23,7 +23,9 @@ use crate::stdio::Stdio;
 use crate::test_child::fixture_path;
 use crate::test_child::namespaces as ns;
 use crate::test_groups::{namespaces, Group};
-use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peeks};
+use crate::wait::exit_only::seams::{
+    assert_peeks_exhausted, force_peeks, force_reap_once, take_forced_reap, ForcedReap,
+};
 use crate::wait::exit_only::{Foreign, Peek, Reaped};
 
 /// A command that writes `ran` to a pipe and exits, and the read end of that pipe.
@@ -1415,6 +1417,34 @@ fn a_front_found_reaped_by_someone_else_is_covered() {
     let (err, _) = failure.err().expect("the spawn fails").expect_may_have_started_with();
     assert_eq!(reaping, super::Reaping::Covered);
     assert!(err.to_string().contains("could not be waited on"), "{err}");
+}
+
+/// A front whose wait failed for a reason other than `ECHILD` is not shown gone: it may be running,
+/// so it is `Described`, and the failure's note says it could not be waited on.
+///
+/// Mutant: the front arm answers `Covered` for every `Unaccounted` front, not only for one whose
+/// wait answered `ECHILD`.
+#[skuld::test]
+fn a_front_whose_wait_failed_otherwise_is_described() {
+    let (mut cat, pidfd) = cat_with_pidfd();
+    drop(cat.stdin.take());
+    crate::test_child::wait_until_zombie(cat.id());
+    let forced = force_reap_once(ForcedReap::Errno(libc::EIO));
+    let (failure, reaping) = super::conclude_noting(
+        Err::<NoChild, _>(std::io::Error::other("tokio failed")),
+        Outcome::Opened(pidfd),
+        sudo_front(),
+    );
+    assert!(
+        take_forced_reap().is_none(),
+        "the teardown's wait consumed the forced failure"
+    );
+    drop(forced);
+    let (err, fate) = failure.err().expect("the spawn fails").expect_may_have_started_with();
+    assert_eq!(reaping, super::Reaping::Described);
+    assert_eq!(fate, ChildFate::Unknown, "the failed wait showed nothing");
+    assert!(err.to_string().contains("could not be waited on"), "{err}");
+    cat.wait().expect("collect the front");
 }
 
 /// `conclude` on a failed tokio-style spawn whose child is a live `cat` (`front` says whether it is

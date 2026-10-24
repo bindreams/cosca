@@ -820,10 +820,11 @@ fn join_helper(helper: std::thread::ScopedJoinHandle<'_, Outcome>, #[cfg(test)] 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Reaping {
     /// There is no child, or the handshake tore it down through its pidfd (a front it found
-    /// exited or reaped by someone else included), or tokio's returned handle reaps it.
+    /// exited, or whose wait answered `ECHILD`, included), or tokio's returned handle reaps it.
     Covered,
     /// An elevation front that tokio dropped after it ran the program, which the handshake sent
-    /// nothing and found still running: it is left, and the failure's note says so.
+    /// nothing and could not show gone: it was left running, or its wait failed for a reason other
+    /// than `ECHILD`. The failure's note says so.
     Described,
     /// No pidfd names the child and no handle reaps it: tokio dropped a `std` child, which reaps
     /// nothing, so it may be a zombie. A `std` failure collected its child, so this is a
@@ -832,9 +833,9 @@ pub(crate) enum Reaping {
 }
 
 /// The [`Reaping`] of `conclude(spawned, outcome, ..)`, but for a front it leaves running, which
-/// [`conclude_noting`] marks [`Reaping::Described`]. Spelled out for every pair, so a new outcome
-/// must decide. `(Err, Unwatched)` is a contract breach: only a spawn that returned a child is
-/// watched.
+/// [`conclude_noting`] marks [`Reaping::Described`] (one that may be running). Spelled out for
+/// every pair, so a new outcome must decide. `(Err, Unwatched)` is a contract breach: only a spawn
+/// that returned a child is watched.
 fn reaping_of<T>(spawned: &io::Result<T>, outcome: &Outcome) -> Reaping {
     match (spawned, outcome) {
         (
@@ -919,9 +920,15 @@ fn conclude_noting<T: Spawned>(
             }
             LeftFront::Here(front) if !collected => {
                 let (fate, child_fate) = super::leave_front_through_pidfd(None, pidfd, front, None, None);
-                // Only a front the teardown left alive is `Described`; one it reaped, or found
-                // reaped by someone else, ended.
-                if matches!(fate, super::FrontFate::LeftUnreaped | super::FrontFate::Unplaced) {
+                // Only a front that may still run is `Described`: one left alive, or one whose
+                // wait failed for any reason but `ECHILD` (`Gone`). A front reaped, or found
+                // reaped by someone else (`ECHILD`), ended.
+                let may_run = match fate {
+                    super::FrontFate::LeftUnreaped | super::FrontFate::Unplaced => true,
+                    super::FrontFate::Unaccounted => !matches!(child_fate, ChildFate::Gone),
+                    super::FrontFate::Reaped | super::FrontFate::NotAFront => false,
+                };
+                if may_run {
                     reaping = Reaping::Described;
                 }
                 (fate.note(error, Some(front), None), look.fate(child_fate))

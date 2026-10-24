@@ -146,7 +146,8 @@ pub(crate) enum AbandonedChild {
     MaybeUnreaped,
     /// If it was forked, it may be running where nothing can reach it.
     MaybeUnreachable,
-    /// It is an elevation front that was left running, and the failure the spawn returns says so.
+    /// It is an elevation front that may be running (left alive, or its wait failed for a reason
+    /// other than `ECHILD`), and the failure the spawn returns says so.
     Described,
     /// It is an elevation front, which was sent no signal of its own, and this is what became of
     /// it.
