@@ -96,12 +96,12 @@ pub(super) fn integrity_level() -> Option<u32> {
     }
 }
 
-pub(super) fn detect() -> Host {
+pub(super) fn detect(elevated: bool) -> Host {
     if let Some(rid) = integrity_level() {
         log::debug!("current process integrity RID = 0x{rid:04x}");
     }
     Host {
-        elevated: is_elevated(),
+        elevated,
         has_tty: false, // Windows never prompts on a TTY — UAC is a GUI gate.
         available: BackendSet::default(),
         os: Os::Windows,

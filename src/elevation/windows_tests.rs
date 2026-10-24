@@ -9,6 +9,21 @@ fn detect_reports_windows_os() {
     assert_eq!(h.os, crate::elevation::plan::Os::Windows);
 }
 
+/// Detection reports the privilege it is handed, not this process's. Kills `elevated: is_elevated()`:
+/// whichever value the process lacks comes back wrong.
+#[skuld::test]
+fn detect_reports_the_elevation_it_is_given() {
+    for elevated in [true, false] {
+        let h = crate::elevation::plan::Host::detect(
+            crate::elevation::Backend::Auto,
+            &crate::elevation::Auth::Interactive,
+            None,
+            elevated,
+        );
+        assert_eq!(h.elevated, elevated);
+    }
+}
+
 #[skuld::test]
 fn integrity_level_is_always_answerable() {
     // Every Windows process has a mandatory integrity label; a `None` here means the

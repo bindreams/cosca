@@ -160,12 +160,7 @@ fn detect_finds_backends_on_the_path_it_is_given() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().expect("tempdir");
     let sudo = dir.path().join("sudo");
-    std::fs::write(
-        &sudo,
-        "#!/bin/sh
-",
-    )
-    .expect("write the fake sudo");
+    std::fs::write(&sudo, "#!/bin/sh\n").expect("write the fake sudo");
     std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).expect("chmod");
     let h = super::plan::Host::detect(
         super::Backend::Auto,
@@ -176,7 +171,9 @@ fn detect_finds_backends_on_the_path_it_is_given() {
     assert_eq!(h.available.sudo.as_deref(), Some(sudo.as_path()));
 }
 
-/// Detection reports the privilege it is handed, not this process's.
+/// Detection reports the privilege it is handed, not this process's. Kills `elevated || is_elevated()`
+/// when the caller is root (`false` comes back `true`), and `elevated && is_elevated()` when it is not
+/// (`true` comes back `false`).
 #[cfg(unix)]
 #[skuld::test]
 fn detect_reports_the_elevation_it_is_given() {
