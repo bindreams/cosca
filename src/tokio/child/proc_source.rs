@@ -1081,7 +1081,6 @@ impl ProcSource {
                 Some("it is handed to tokio's orphan reaper, which reaps it once it exits"),
             );
         }
-        // The backend is dropped at once, so whether the child was shown reaped elsewhere is unread.
         let tail = self
             .forget_quietly(false)
             .map(|(_, leak)| format!("forgetting tokio's handle for it leaks {leak}"));

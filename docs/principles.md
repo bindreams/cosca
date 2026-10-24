@@ -34,8 +34,8 @@ or stuck in D state between `fork` and `exec` holds the thread. The wait for mac
 report ([`unique_report::await_report`](../src/child/spawn/unique_report.rs)) is bounded the same
 way, with accepted residuals: if something else reaps the child and another child of this process
 takes its pid, the wait lasts as long as that process; and a tracer holding the child's zombie keeps
-it waiting until the tracer hands the zombie back. The wait holds `spawn_lock`, so it stalls every
-other cosca spawn meanwhile.
+it waiting until the tracer hands the zombie back. It runs after `spawn_lock` is released, so it
+holds up only its own spawn.
 
 **Why:** a blocked worker stops every task scheduled on it, and on a `current_thread` runtime it
 stops the runtime. tokio itself panics rather than block when a `Runtime` is dropped in async

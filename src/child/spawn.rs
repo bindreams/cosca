@@ -447,44 +447,50 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     // code can close.
     #[cfg(target_os = "macos")]
     let (mut prepared, child, unique) = {
-        let _guard = spawn_lock();
-        let prepared = crate::containment::prepare(
-            &mut std_cmd,
-            &cmd.contain_request(),
-            cmd.flags_request(),
-            &reserved,
-            cmd.fd_marker_suppressed(),
-            cmd.env_ops(),
-        )
-        .not_started()?;
-        let report = report.open(&_guard).not_started()?;
+        let (prepared, spawned, first) = {
+            let _guard = spawn_lock();
+            let prepared = crate::containment::prepare(
+                &mut std_cmd,
+                &cmd.contain_request(),
+                cmd.flags_request(),
+                &reserved,
+                cmd.fd_marker_suppressed(),
+                cmd.env_ops(),
+            )
+            .not_started()?;
+            let report = report.open(&_guard).not_started()?;
 
-        // On Unix, hand n>=3 child ends to fd_map. This installs a pre_exec hook
-        // that dup2's each OwnedFd to its target number post-fork. It is registered
-        // LAST (after `prepare` above) so its dup2 cannot clobber the cgroup
-        // self-placement fd; std also dup2's 0/1/2 before any pre_exec runs (std
-        // disables posix_spawn when hooks are registered), so our n>=3 mappings never
-        // clobber the std stdio fds either. A duplicate child fd number is unreachable:
-        // child_ends keys come from a BTreeMap, so each child fd number is unique.
-        let mappings: Vec<fd_map::FdMapping> = child_ends
-            .into_iter()
-            .map(|(fd, owned)| fd_map::FdMapping {
-                parent_fd: owned,
-                child_fd: fd.raw(),
-            })
-            .collect();
-        fd_map::install(&mut std_cmd, mappings).not_started()?;
+            // On Unix, hand n>=3 child ends to fd_map. This installs a pre_exec hook
+            // that dup2's each OwnedFd to its target number post-fork. It is registered
+            // LAST (after `prepare` above) so its dup2 cannot clobber the cgroup
+            // self-placement fd; std also dup2's 0/1/2 before any pre_exec runs (std
+            // disables posix_spawn when hooks are registered), so our n>=3 mappings never
+            // clobber the std stdio fds either. A duplicate child fd number is unreachable:
+            // child_ends keys come from a BTreeMap, so each child fd number is unique.
+            let mappings: Vec<fd_map::FdMapping> = child_ends
+                .into_iter()
+                .map(|(fd, owned)| fd_map::FdMapping {
+                    parent_fd: owned,
+                    child_fd: fd.raw(),
+                })
+                .collect();
+            fd_map::install(&mut std_cmd, mappings).not_started()?;
 
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "spawn_lock is held by `_guard`, taken at the top of this block"
-        )]
-        let (spawned, unique) = report.run(|| std_cmd.spawn().map_err(Error::Io), |c| Some(c.id()));
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "spawn_lock is held by `_guard`, taken at the top of this block"
+            )]
+            let (spawned, first) = report.run(|| std_cmd.spawn().map_err(Error::Io), |c| Some(c.id()));
+            drop(std_cmd);
+            (prepared, spawned, first)
+        };
+        // Outside the lock, which covers only the window before the ends are close-on-exec: the wait
+        // for a report the first read missed has no bound.
+        let unique = first.finish();
         // std collected the child of a spawn it failed, which never ran the program.
         let c = spawned
             .map_err(|e| unique_report::failed_spawn_error(e, &unique))
             .not_started()?;
-        drop(std_cmd);
         (prepared, c, unique)
     };
     // Linux holds the child before `exec` until the parent has its pidfd; see `pidfd_handshake`.
@@ -744,7 +750,6 @@ fn leave_front_after_attach_failure(child: std::process::Child) -> FrontFate {
 /// Dropping the `std` `Child` closes our pipe ends only.
 #[cfg(target_os = "macos")]
 fn teardown_after_attach_failure(child: std::process::Child, unique: u64, id: ProcessId) -> ChildFate {
-    // The `std` `Child` reaps nothing when dropped: a child still running stays a zombie.
     let fate = kill_and_reap_verified(child.id(), unique, Some(id), ZOMBIE_NOTE);
     drop(child);
     fate
@@ -759,9 +764,10 @@ pub(crate) fn kill_and_reap_verified(pid: u32, unique: u64, id: Option<ProcessId
     let mut notes = Vec::new();
     let mut breach = None;
     let (fate, kill) = kill_and_reap_noting(pid, unique, id, &mut notes, &mut breach, |_| {});
-    if let KillOutcome::Refused(why) = kill {
-        // First, as the order of events: the kill, then the reap's notes.
-        notes.insert(0, format!("could not be killed: {why}"));
+    match kill {
+        KillOutcome::Refused(why) => notes.insert(0, format!("could not be killed: {why}")),
+        KillOutcome::Unverified => notes.insert(0, UNVERIFIED.to_owned()),
+        KillOutcome::Delivered | KillOutcome::NotSent => {}
     }
     if matches!(fate, ChildFate::Running { .. }) {
         notes.push(left_running.to_owned());
@@ -786,6 +792,8 @@ pub(crate) enum KillOutcome {
     Delivered,
     /// The id check found the child gone or its pid another process's: nothing was sent.
     NotSent,
+    /// The child could not be verified, so nothing was sent.
+    Unverified,
     /// The kill failed with this error; the child was not signalled.
     Refused(String),
 }
@@ -895,7 +903,7 @@ impl LateTree {
         let unshown = match resolved {
             Resolved::Found(id) => {
                 tree.id = Some(id);
-                match crate::containment::attach(id, prepared) {
+                match attach_or_fault(id, prepared) {
                     Ok(attachment) => tree.reach = Reach::Attached(attachment.attached),
                     Err(e) => {
                         assert_attach_cannot_fail(&e);
@@ -977,6 +985,10 @@ impl LateTree {
 const NOT_SWEPT_AGAIN: &str = "it was not shown an unreaped zombie, so its tree was not killed again by its pid: what \
                                it started after the first kill of its tree may be left running";
 
+/// What a teardown says of a child it could not verify.
+#[cfg(target_os = "macos")]
+const UNVERIFIED: &str = "could not be verified, so it was not signalled";
+
 /// The one `warn` of a spawn whose child's report came late (see [`Report::Late`]).
 #[cfg(target_os = "macos")]
 const LATE: &str = "had not reported its unique id when its spawn returned, so its exec cannot be confirmed and the \
@@ -989,6 +1001,7 @@ fn said(kill: &KillOutcome, fate: ChildFate) -> String {
     let sent = match kill {
         KillOutcome::Delivered => "was sent SIGKILL".to_owned(),
         KillOutcome::NotSent => "was gone, or its pid names another process, so nothing was sent".to_owned(),
+        KillOutcome::Unverified => UNVERIFIED.to_owned(),
         KillOutcome::Refused(why) => format!("could not be killed ({why})"),
     };
     let state = match fate {
@@ -1007,7 +1020,7 @@ impl Unreported {
     /// handle it holds, if that is worth saying (a forget's leak, a child left unreaped).
     pub(crate) fn warn(self, pid: u32, tail: Option<&str>) -> ChildFate {
         let mut line = format!("child {pid} {LATE}, and {}", said(&self.kill, self.fate));
-        // The sentence says it is still running.
+        // `said` already says so, from the fate.
         for note in self.notes.iter().filter(|note| *note != "is still running") {
             line.push_str("; ");
             line.push_str(note);
@@ -1070,14 +1083,16 @@ fn kill_and_reap_noting(
                     notes.push(unverifiable(&crate::signal::UNPINNED_WHY));
                     Foreign::Orphaned.fate(true)
                 }
-                // The wait has no deadline, so it cannot pass.
                 Ok(Waited::DeadlinePassed) => {
                     debug_assert!(false, "an unbounded wait reported a passed deadline");
                     notes.push("is still running after its kill".to_owned());
                     ChildFate::Running { id }
                 }
+                // Nothing reaps it after this: the std `Child` reaps nothing, and tokio's is forgotten.
                 Err(e) => {
-                    notes.push(format!("could not be waited for: {e}"));
+                    notes.push(format!(
+                        "could not be waited for ({e}), so it is left unreaped: it stays a zombie once it exits"
+                    ));
                     ChildFate::Killed
                 }
             };
@@ -1091,8 +1106,7 @@ fn kill_and_reap_noting(
         Ok(Sent::Unverified) => {
             debug_assert!(false, "`via_verified_pid` was given `Some(unique)`, so it verifies");
             after_kill(false);
-            notes.push("could not be verified, so it was not signalled".to_owned());
-            (ChildFate::Running { id }, KillOutcome::NotSent)
+            (ChildFate::Running { id }, KillOutcome::Unverified)
         }
         Err(kill) => {
             after_kill(false);
@@ -1293,7 +1307,10 @@ fn teardown_after_failed_adoption(
 /// **Poison-tolerant:** a panic mid-spawn must not wedge every future spawn, so a poisoned lock is
 /// recovered rather than propagated (the guarded data is unit — there is no invariant to protect).
 pub(crate) fn spawn_lock() -> SpawnLockGuard {
-    acquire_spawn_lock(|| {})
+    acquire_spawn_lock(|| {
+        #[cfg(all(test, target_os = "macos"))]
+        fault::spawn_lock_contended();
+    })
 }
 
 static SPAWN_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -2965,6 +2982,47 @@ pub(crate) mod fault {
         crate::oneshot_hook::fire(&BETWEEN_KILL_AND_WAIT);
     }
     pub(crate) type ArmedBetweenKillAndWait = crate::oneshot_hook::Armed;
+
+    /// What runs when a thread finds `spawn_lock` held, on any thread.
+    #[cfg(target_os = "macos")]
+    static ON_SPAWN_LOCK_CONTENDED: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> = std::sync::Mutex::new(None);
+
+    /// Runs `hook` once, on the first thread of this process that then finds `spawn_lock` held, before
+    /// that thread blocks on it. The guard drops an unfired hook.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn on_spawn_lock_contended(hook: impl FnOnce() + Send + 'static) -> ContendedHook {
+        let previous = ON_SPAWN_LOCK_CONTENDED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace(Box::new(hook));
+        debug_assert!(previous.is_none(), "a contention hook is already armed");
+        ContendedHook(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[must_use = "the hook is dropped as soon as the guard is dropped"]
+    pub(crate) struct ContendedHook(());
+
+    #[cfg(target_os = "macos")]
+    impl Drop for ContendedHook {
+        fn drop(&mut self) {
+            ON_SPAWN_LOCK_CONTENDED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn spawn_lock_contended() {
+        let hook = ON_SPAWN_LOCK_CONTENDED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
 
     /// A point in a spawn where a test can run a hook.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -194,7 +194,9 @@ fn run_through_channel(cmd: &mut std::process::Command) -> (std::io::Result<std:
     let guard = crate::child::spawn::spawn_lock();
     let channel = pending.open(&guard).expect("open");
     #[allow(clippy::disallowed_methods, reason = "spawn_lock is held by `guard`")]
-    channel.run(|| cmd.spawn(), |c| Some(c.id()))
+    let (spawned, first) = channel.run(|| cmd.spawn(), |c| Some(c.id()));
+    drop(guard);
+    (spawned, first.finish())
 }
 
 /// A program that cannot be exec'd fails the spawn after the hook reported an id: std's own error
@@ -242,7 +244,8 @@ fn a_child_killed_before_its_report_is_missing_on_ok() {
 /// the report pipe's write end before the child dies, and the parent's first read is forced to find
 /// nothing.
 ///
-/// Mutant: the spawn does not wait, and answers that the program may have started.
+/// Mutants: the spawn does not wait, and answers that the program may have started; the wait answers
+/// a failure (`WaitFailed`), which is no proof the program did not start.
 #[skuld::test]
 fn an_unwritten_report_then_a_killed_child_is_answered_died_before_exec() {
     let _killed = seams::force_child_killed_before_report();
@@ -255,6 +258,12 @@ fn an_unwritten_report_then_a_killed_child_is_answered_died_before_exec() {
     assert!(
         !matches!(error, Error::MayHaveStarted { .. }),
         "the program did not start: {error:?}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("died before exec; the program did not start"),
+        "the spawn is answered as a child that died before exec: {error}"
     );
 }
 
@@ -540,7 +549,7 @@ fn awaiting_a_child_whose_tracer_dies_during_its_exit_is_woken_by_the_tracers_ex
 }
 
 /// A tracer that attaches after the wait's check: XNU reparents the child to it and sends the child
-/// `SIGSTOP` (xnu-12377.121.6 `mach_process.c:295`, `:304`). The wait watches the child's signals,
+/// `SIGSTOP` (see `wait::backend::TracerWatch`). The wait watches the child's signals,
 /// so it checks again, finds the tracer and watches it too; the tracer's exit, with launchd then
 /// holding the child, ends the wait: `Missing`. A live `cat` stands in for the tracer. The child
 /// really runs; its `waitid` and its parents are forced: running until the attach, then held by the
@@ -616,7 +625,7 @@ fn awaiting_a_child_a_tracer_attaches_to_late_is_woken_by_the_attach() {
 /// fork holds one) keeps the empty pipe open, so it reads `Unwritten`.
 ///
 /// Mutant: the spawn waits for the report after a failed spawn (the refused wait answers
-/// `ReadFailed`).
+/// `WaitFailed`).
 #[skuld::test]
 fn a_failed_spawn_reads_the_report_once_and_does_not_wait() {
     let mut cmd = std::process::Command::new("/usr/bin/true");
@@ -625,7 +634,128 @@ fn a_failed_spawn_reads_the_report_once_and_does_not_wait() {
     let channel = pending.open(&guard).expect("open");
     let _foreign_copy = channel.write_end.try_clone().expect("dup the write end");
     let _refused = seams::refuse_the_wait();
-    let (spawned, report) = channel.run(|| Err::<(), ()>(()), |_| unreachable!("a failed spawn has no child"));
+    let (spawned, first) = channel.run(|| Err::<(), ()>(()), |_| unreachable!("a failed spawn has no child"));
+    drop(guard);
+    let report = first.finish();
     assert!(spawned.is_err());
     assert!(matches!(report, Report::Unwritten), "{report:?}");
+}
+
+// The wait's timeouts =====
+
+/// The `warn`s on this thread since `mark` that say a child has not reported its id.
+fn waiting_warns(mark: usize) -> usize {
+    crate::log_capture::records_since_on_current_thread(mark, "the spawned child")
+        .into_iter()
+        .filter(|(level, text)| *level == log::Level::Warn && text.contains("has not reported its unique id"))
+        .count()
+}
+
+/// A wait on `child` (a [`live_child`]) whose checks find it held by `tracer` (another live child),
+/// with the tracer walks answering `links`. The hook on block `release_at` drops a copy of the write
+/// end, so the wait ends at EOF. Answers the report, the blocks taken and each `kevent`'s timeout.
+fn await_held(
+    child: u32,
+    tracer: u32,
+    links: Vec<crate::identity::Link>,
+    say_after: std::time::Duration,
+    release_at: u32,
+) -> (Report, u32, Vec<Option<std::time::Duration>>) {
+    use std::cell::RefCell;
+
+    use crate::wait::exit_only::{seams::force_peeks, Foreign, Peek};
+    let (r, copy) = pipe();
+    let _echild = force_peeks((0..16).map(|_| Ok(Peek::Foreign(Foreign::Gone))));
+    let _parents = crate::identity::kinfo::fault::force_parents(child, move || forked_by_us_held_by(tracer));
+    let _links = crate::wait::backend::tracer_seams::force_links(links);
+    let recorded = seams::say_waiting_after_then_record(say_after);
+    let copy = RefCell::new(Some(copy));
+    let _hook = seams::on_each_block(move |n, _| {
+        if n == release_at {
+            drop(copy.borrow_mut().take());
+        }
+    });
+    let before = seams::block_count();
+    let report = await_report(&r, child);
+    (report, seams::block_count() - before, recorded.timeouts())
+}
+
+/// A walk that finds the tracer gone checks again at once without blocking, then blocks for no
+/// longer than the backoff asks, while the warning is far off.
+///
+/// Mutants: the wait blocks with no timeout on `Recheck(after)`; `Recheck(0)` blocks.
+#[skuld::test]
+fn a_tracer_found_gone_arms_the_wait_with_its_backoff() {
+    use crate::identity::Link;
+    let (child, stdin) = live_child();
+    let (tracer, tracer_stdin) = live_child();
+    let (report, blocks, timeouts) = await_held(
+        child.id(),
+        tracer.id(),
+        vec![Link::Gone, Link::Gone],
+        std::time::Duration::from_secs(3600),
+        1,
+    );
+    assert!(matches!(report, Report::Missing), "{report:?}");
+    assert_eq!(blocks, 1, "a re-check at once does not block");
+    assert_eq!(timeouts, [Some(std::time::Duration::from_millis(1))]);
+    end(child, stdin);
+    end(tracer, tracer_stdin);
+}
+
+/// The wait blocks for the sooner of the backoff and the time left to its warning.
+///
+/// Mutants: the backoff alone times the block; the later of the two does.
+#[skuld::test]
+fn a_wait_held_by_a_tracer_blocks_for_the_sooner_of_its_backoff_and_its_warning() {
+    use crate::identity::Link;
+    crate::log_capture::install();
+    let (child, stdin) = live_child();
+    let (tracer, tracer_stdin) = live_child();
+    let (report, blocks, timeouts) = await_held(
+        child.id(),
+        tracer.id(),
+        vec![Link::Gone, Link::Gone, Link::Gone],
+        std::time::Duration::ZERO,
+        2,
+    );
+    assert!(matches!(report, Report::Missing), "{report:?}");
+    assert_eq!(blocks, 2);
+    let ms = std::time::Duration::from_millis;
+    assert_eq!(
+        timeouts,
+        [Some(ms(0)), Some(ms(2))],
+        "the warning, due at once, times the first block; the backoff alone the next"
+    );
+    end(child, stdin);
+    end(tracer, tracer_stdin);
+}
+
+/// The wait warns once, when its warning is due, and blocks with no timeout after that.
+///
+/// Mutants: the warning repeats on every block; it never fires.
+#[skuld::test]
+fn a_wait_warns_once_that_the_report_is_late() {
+    use std::cell::RefCell;
+    crate::log_capture::install();
+    let (child, stdin) = live_child();
+    let (r, copy) = pipe();
+    let recorded = seams::say_waiting_after_then_record(std::time::Duration::ZERO);
+    let copy = RefCell::new(Some(copy));
+    let _hook = seams::on_each_block(move |n, _| {
+        if n == 2 {
+            drop(copy.borrow_mut().take());
+        }
+    });
+    let mark = crate::log_capture::mark();
+    let report = await_report(&r, child.id());
+    assert!(matches!(report, Report::Missing), "{report:?}");
+    assert_eq!(waiting_warns(mark), 1, "one warning, however long the wait");
+    let timeouts = recorded.timeouts();
+    assert_eq!(timeouts.first(), Some(&Some(std::time::Duration::ZERO)), "{timeouts:?}");
+    assert!(
+        timeouts[1..].iter().all(Option::is_none),
+        "once it has warned the wait has no timeout: {timeouts:?}"
+    );
+    end(child, stdin);
 }
