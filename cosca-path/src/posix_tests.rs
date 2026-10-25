@@ -234,6 +234,18 @@ fn set_file_name_replaces_only_a_name() {
     assert_eq!(gone, PathBuf::from("a/"));
 }
 
+/// A name holding `/` is not one component: a contract, asserted in debug.
+/// Mutant: the assertion removed, so `a/b` with `x/y` becomes `a/x/y`.
+#[skuld::test]
+fn set_file_name_refuses_a_path_in_debug() {
+    let caught = std::panic::catch_unwind(|| PathBuf::from("a/b").set_file_name("x/y"));
+    assert_eq!(
+        caught.is_err(),
+        cfg!(debug_assertions),
+        "debug builds assert; release builds append"
+    );
+}
+
 /// Every path over `{a, ., /}` of up to six bytes: the class that single examples miss, such as a
 /// root followed by a leading `Empty` component.
 fn small_paths() -> Vec<String> {

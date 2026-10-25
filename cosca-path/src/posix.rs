@@ -477,8 +477,12 @@ impl PathBuf {
 
     /// Replaces the last component with `name` if it is a [`Component::Normal`] name, keeping
     /// every other component and separator (`//x` becomes `//name`); otherwise appends `name`, as
-    /// [`push`](Self::push) does.
+    /// [`push`](Self::push) does. `name` is one component: it holds no `/`.
     pub fn set_file_name<S: AsRef<OsStr> + ?Sized>(&mut self, name: &S) {
+        debug_assert!(
+            !name.as_ref().as_bytes().iter().any(is_separator),
+            "set_file_name takes one component, not a path"
+        );
         if self.file_name().is_none() {
             self.push(Path::new(name));
             return;
