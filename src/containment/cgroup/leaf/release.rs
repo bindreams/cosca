@@ -1,12 +1,12 @@
-//! Giving up a leaf on an async `Drop` that kills nothing: bounded work only.
+//! Giving up a leaf on an async `Drop` that does not wait for its drain: bounded work only.
 
 use super::*;
 
 impl CgroupLeaf {
-    /// Give up the leaf without waiting: what an async `Drop` that kills nothing does (disarmed, or
-    /// its root's kill failed), where [`Drop`] would block on the drain. At most two `rmdir`s and,
-    /// with the drop's own tree kill, two `cgroup.kill` writes; a leaf that has not drained is left
-    /// behind.
+    /// Give up the leaf without waiting: what an async `Drop` does with a leaf whose drain it does
+    /// not wait for (disarmed, its root's kill failed, or no kill of the tree landed), where
+    /// [`Drop`] would block on the drain. At most two `rmdir`s and one `cgroup.kill` write; a leaf
+    /// that has not drained is left behind.
     ///
     /// A leaf this handle killed or was armed to kill is left with a `warn` naming its path and
     /// pointing at [`wait_tree`](crate::tokio::Child::wait_tree). A leaf nothing killed keeps

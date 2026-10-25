@@ -27,13 +27,14 @@ cosca's async methods, and the sync methods of its async types, never block the 
 run on: no wait for a process exit or a cgroup drain, and no sweep of unbounded length. Work that
 must wait is an `async fn`. Sync code may block, as sync Rust normally does.
 
-The armed async `Drop` is an exception, and so is the teardown the run-to-completion helpers share
-with it: it blocks until what it killed is reaped and drained (principle 3).
+The armed async `Drop` is an exception: it blocks until what it killed is reaped and drained
+(principle 3). A destructor cannot await.
 
-One exception: spawning blocks until `exec`, as tokio's own `Command::spawn` does. That includes
-cosca's placement report ([`ReportChannel::wait`](../src/containment/cgroup/channel.rs)), which
-completes before `exec`. The wait is bounded by the child's own progress to `exec`; a child stopped
-or stuck in D state between `fork` and `exec` holds the thread.
+Spawning is the other exception: it blocks until `exec`, as tokio's own `Command::spawn` does.
+That includes cosca's placement report
+([`ReportChannel::wait`](../src/containment/cgroup/channel.rs)), which completes before `exec`. The
+wait is bounded by the child's own progress to `exec`; a child stopped or stuck in D state between
+`fork` and `exec` holds the thread.
 
 [`SuspendedChild::resume`](../src/tokio/child/suspended.rs) is the deferred second half of a spawn,
 so the exception covers it, and it is a sync `fn`. On Windows it walks the system's thread snapshot
@@ -49,12 +50,13 @@ context ([tokio shutdown.rs]).
 ## 3. Async `Drop` waits only for what it killed
 
 With `kill_on_drop` set, an async `Drop` kills the contained tree and the root through their
-handles, then blocks until the root is reaped through its handle and a cgroup leaf has drained and
-been removed, as the sync `Drop` does. It waits in place on the dropping thread, on every runtime,
-never in `block_in_place`: tokio panics in it inside a `LocalSet`, even on a multi-thread runtime,
-and offers no way to ask first. Once the wait passes 1 s, the drop logs one `warn` naming the root's
-pid, and keeps waiting. The 1 s is for that message only: no wait ends on it. Failed async spawns
-drain the same way.
+handles, then blocks until the root's exit shows through its handle and is collected, and a cgroup
+leaf has drained and been removed, as the sync `Drop` does. The collect is tokio's `try_wait`, a
+reap by the root's number (principle 4). It waits in place on the dropping thread, on every
+runtime, never in `block_in_place`: tokio panics in it inside a `LocalSet`, even on a multi-thread
+runtime, and offers no way to ask first. Once the wait passes 1 s, the drop logs one `warn` naming
+the root's pid, and keeps waiting. The 1 s is for that message only: no wait ends on it. Failed
+async spawns drain the same way.
 
 The kills bound the wait, except for a process stuck in uninterruptible I/O (D state) or a root
 whose zombie a foreign tracer holds; either holds the dropping thread, which may be a tokio worker.
@@ -65,6 +67,8 @@ A drop that kills nothing does bounded work only: disarmed (`detach()`, `kill_on
 armed with a root kill that failed or could not be sent, so the root may still run. It may send a
 bounded number of signals and write `cgroup.kill`, one bounded file write, and never waits for a
 process exit or a cgroup drain. A leaf it leaves undrained stays behind, logged as principle 7 says.
+A leaf whose `cgroup.kill` fails twice, in the tree kill and again before the drain, is given up the
+same way, though the drop still reaps a root its kill reached.
 Its still-running root is left to tokio's drop of its `Child`: an in-drop `try_wait`
 ([tokio reap.rs], [tokio pidfd_reaper.rs]), then tokio's orphan queue. Both are tokio's state, not
 cosca's, and both reap with `waitpid(pid)`. That by-number reap is tokio's (principle 4). The orphan
@@ -118,8 +122,11 @@ doesn't do this yet either ([#341]).
 Where a group ID must be used (process-group or fd-marker containment), keep the root an unreaped
 zombie until the group kill is done.
 
-One by-number reap is outside this rule: tokio's reap of a dropped async root the drop could not
-kill (principle 3).
+Two by-number reaps are outside this rule, both tokio's `waitpid(pid)`: its reap of a dropped async
+root the drop could not kill (principle 3), and its collect of an async root whose exit cosca has
+already seen through the root's handle (the armed drop, `wait`, and a failed run-to-completion
+helper). The root is then an unreaped zombie of ours, but a foreign reap between that look and the
+collect is not detected.
 
 **Why:** once the process is reaped its number can belong to anyone, and a signal sent to it hits an
 unrelated process.

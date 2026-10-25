@@ -68,7 +68,8 @@ impl Root {
     }
 }
 
-/// The root is reaped when the drop returns, and the teardown says it collected the exit.
+/// The root is reaped when the drop returns, and the teardown says it collected the exit. So does
+/// the awaited teardown of a failed run-to-completion helper.
 ///
 /// Mutant: no reap (the drop hands tokio's `Child` to its own drop, as before).
 #[skuld::test]
@@ -80,6 +81,14 @@ async fn tokio_armed_drop_reaps_before_returning() {
 
     let (mut child, _stdin) = blocker();
     assert_eq!(child.tear_down_now(), ChildFate::Reaped);
+
+    let (mut child, _stdin) = blocker();
+    let root = Root::of(&child);
+    assert_eq!(child.tear_down_awaiting().await, ChildFate::Reaped);
+    assert!(
+        root.reaped(),
+        "the awaited teardown must reap the root before it returns"
+    );
 }
 
 /// Spawns a blocker on `rt`, drops it there, and says whether the root was reaped by then.
@@ -203,26 +212,46 @@ async fn tokio_armed_drop_warns_once_when_the_reap_waits_past_1s(#[fixture(trace
 }
 
 /// An armed drop whose tree kill fails, and fails again when fired once more, has nothing to bound
-/// the drain: it neither waits for it nor says it is waiting. The leaf is left behind, and a warning
-/// names it.
+/// the drain: it neither waits for it nor says it is waiting, even once a later `cgroup.kill` (the
+/// release's own) lands. The leaf is left behind, and a warning names it. The writes fail until the
+/// leaf's first `rmdir`; a drain wait that blocks after it releases the member and records it.
 ///
-/// Mutant: the drain is waited for after a failed kill (the drop says it is still waiting).
+/// Mutants: the drain is waited for after a failed kill (the drop says it is still waiting); the
+/// leaf's own drop, whose kill then lands, waits for the drain.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn tokio_armed_drop_whose_tree_kill_fails_does_not_wait_for_the_drain() {
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
     use super::child_drop_tests::linux;
     use crate::containment::cgroup::fault as leaf_fault;
+    use crate::containment::cgroup::test_support::FakeLeaf;
 
     crate::tokio::test_runtime::assert_current_thread();
     let name = "cosca-armed-drop-failed-tree-kill";
     let (fake, leaf) = linux::fake_leaf(name, true);
-    let _failing = leaf_fault::fail_kill_writes();
+    let failing = Rc::new(RefCell::new(Some(leaf_fault::fail_kill_writes())));
+    let (path, events) = (fake.leaf.clone(), fake.events.clone());
+    let until_rmdir = Rc::clone(&failing);
+    leaf_fault::set_rmdir_hook(move |_| {
+        drop(until_rmdir.borrow_mut().take());
+        FakeLeaf::rmdir(&path, &events)
+    });
+    let waited = Rc::new(Cell::new(false));
+    let (flag, events) = (Rc::clone(&waited), fake.events.clone());
+    let _release = leaf_fault::set_before_drain_block(move || {
+        flag.set(true);
+        FakeLeaf::set_populated(&events, false);
+    });
     let (child, _stdin) = blocker();
     let root = Root::of(&child);
     let mark = crate::log_capture::mark();
     let (steps, levels) = linux::dropped(linux::contained_by(child, leaf), name);
+    drop(failing.borrow_mut().take());
 
     assert!(root.reaped(), "the root's own kill landed, so it is reaped: {steps:?}");
+    assert!(!waited.get(), "nothing may wait for the drain: {steps:?}");
     assert!(fake.leaf.exists(), "the undrained leaf is left behind: {steps:?}");
     assert_eq!(
         crate::log_capture::levels_since(mark, "still waiting"),
@@ -236,15 +265,16 @@ async fn tokio_armed_drop_whose_tree_kill_fails_does_not_wait_for_the_drain() {
 }
 
 /// A leaf that has not drained 1 s after the drop's kill: the drop warns once, naming the root's
-/// pid and the leaf, and keeps waiting. The fake leaf's member is released by the leaf's own
-/// `rmdir`, which runs only after the bounded look that decides the warn, and which records
-/// whether the warn was already out.
+/// pid and the leaf, and keeps waiting until the leaf drains, then removes it. The fake leaf's member
+/// is released only from a drain wait that blocks after the leaf's first `rmdir`, which follows the
+/// bounded look that decides the warn; the release records whether the warn was out by then.
 ///
-/// Mutant: no warn on the drain.
+/// Mutants: no warn on the drain; a drop that waits at most 1 s, then releases the leaf without
+/// waiting (the member is never released, and the leaf is left behind).
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn tokio_armed_drop_warns_once_when_the_drain_waits_past_1s() {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
     use super::child_drop_tests::linux;
@@ -257,27 +287,31 @@ async fn tokio_armed_drop_warns_once_when_the_drain_waits_past_1s() {
     let (child, _stdin) = blocker();
     let needle = format!("async child {}", child.id().pid());
     let mark = crate::log_capture::mark();
-    let warned_by_rmdir = Rc::new(Cell::new(None));
-    let seen = Rc::clone(&warned_by_rmdir);
+    let warned_at_release = Rc::new(Cell::new(None));
+    let release: Rc<RefCell<Option<crate::oneshot_hook::Armed>>> = Rc::default();
     let (path, events) = (fake.leaf.clone(), fake.events.clone());
-    let warn_needle = needle.clone();
+    let (seen, armed) = (Rc::clone(&warned_at_release), Rc::clone(&release));
     leaf_fault::set_rmdir_hook(move |_| {
-        if seen.get().is_none() {
-            let warns = crate::log_capture::records_since(mark, &warn_needle)
-                .into_iter()
-                .filter(|text| text.contains("still waiting") && text.contains(name))
-                .count();
-            seen.set(Some(warns));
-            FakeLeaf::set_populated(&events, false);
+        if armed.borrow().is_none() {
+            let (seen, events, needle) = (Rc::clone(&seen), events.clone(), needle.clone());
+            *armed.borrow_mut() = Some(leaf_fault::set_before_drain_block(move || {
+                let warns = crate::log_capture::records_since(mark, &needle)
+                    .into_iter()
+                    .filter(|text| text.contains("still waiting") && text.contains(name))
+                    .count();
+                seen.set(Some(warns));
+                FakeLeaf::set_populated(&events, false);
+            }));
         }
         FakeLeaf::rmdir(&path, &events)
     });
     let (steps, _) = linux::dropped(linux::contained_by(child, leaf), name);
+    drop(release.borrow_mut().take());
 
     assert_eq!(
-        warned_by_rmdir.get(),
+        warned_at_release.get(),
         Some(1),
-        "one warn naming the leaf before the leaf's own removal: {steps:?}"
+        "the drop must wait for the drain past its look, with one warn naming the leaf by then: {steps:?}"
     );
     assert!(!fake.leaf.exists(), "the drained leaf is removed: {steps:?}");
     assert_eq!(
@@ -285,4 +319,115 @@ async fn tokio_armed_drop_warns_once_when_the_drain_waits_past_1s() {
         [log::Level::Warn],
         "exactly one warn"
     );
+}
+
+/// A run-to-completion helper that fails after its spawn awaits its teardown instead of blocking
+/// the runtime thread: on a `current_thread` runtime another task runs while the teardown waits for
+/// the leaf to drain, and it is that task that releases the leaf's member. The task is woken by the
+/// drain wait about to block. A teardown that blocks reaches the leaf's own `rmdir` with the member
+/// still there, and the `rmdir` releases it instead.
+///
+/// Mutant: the helper tears the child down as `Drop` does (`tear_down_now`), blocking the thread.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_failed_run_to_completion_helper_awaits_its_teardown() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use super::child_drop_tests::linux;
+    use crate::containment::cgroup::fault as leaf_fault;
+    use crate::containment::cgroup::test_support::FakeLeaf;
+
+    let rt = ::tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("current_thread runtime");
+    let name = "cosca-awaited-teardown";
+    let (fake, leaf) = linux::fake_leaf(name, true);
+    let released_by = Rc::new(Cell::new(None));
+    let (path, events, by) = (fake.leaf.clone(), fake.events.clone(), Rc::clone(&released_by));
+    leaf_fault::set_rmdir_hook(move |_| {
+        if by.get().is_none() {
+            by.set(Some("the leaf's rmdir"));
+            FakeLeaf::set_populated(&events, false);
+        }
+        FakeLeaf::rmdir(&path, &events)
+    });
+    let (blocking_tx, blocking_rx) = ::tokio::sync::oneshot::channel();
+    // Unsent only if the other task is gone, and then nothing releases the member but the `rmdir`.
+    let _wake = leaf_fault::set_before_drain_block(move || {
+        _ = blocking_tx.send(());
+    });
+    let (events, by) = (fake.events.clone(), Rc::clone(&released_by));
+    let other_task = async move {
+        if blocking_rx.await.is_ok() && by.get().is_none() {
+            by.set(Some("another task"));
+            FakeLeaf::set_populated(&events, false);
+        }
+    };
+    let error = rt.block_on(async {
+        let (child, _stdin) = blocker();
+        let mut child = linux::contained_by(child, leaf);
+        let failed =
+            crate::tokio::command::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), &mut child);
+        ::tokio::join!(failed, other_task).0
+    });
+    leaf_fault::take_rmdir_hook();
+
+    assert_eq!(
+        released_by.get(),
+        Some("another task"),
+        "the runtime must run another task while the teardown waits"
+    );
+    assert!(!fake.leaf.exists(), "the drained leaf is removed");
+    match error {
+        crate::error::Error::MayHaveStarted { fate, .. } => assert_eq!(fate, ChildFate::Reaped),
+        other => panic!("expected MayHaveStarted, got {other:?}"),
+    }
+}
+
+/// A helper's teardown dropped while it awaits the reap finishes as the drop would, on the dropping
+/// thread: it reaps the root, emits the drop's report (here, of the tree kill that failed), and
+/// drains and removes the leaf.
+///
+/// Mutant: the dropped teardown leaves what it holds to the fields' own drops (no report).
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_dropped_awaited_teardown_finishes_as_the_drop_would() {
+    use super::child_drop_tests::linux;
+    use crate::containment::cgroup::fault as leaf_fault;
+    use crate::containment::cgroup::test_support::FakeLeaf;
+
+    let rt = ::tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("current_thread runtime");
+    let name = "cosca-dropped-awaited-teardown";
+    let (fake, leaf) = linux::fake_leaf(name, true);
+    let events = fake.events.clone();
+    let _release = leaf_fault::set_before_drain_block(move || FakeLeaf::set_populated(&events, false));
+    let _tree_kill_fails = leaf_fault::fail_next_kill_write();
+    let _pending = super::fault::pend_awaited_reap();
+    let mark = crate::log_capture::mark();
+    let root = rt.block_on(async {
+        let (child, _stdin) = blocker();
+        let root = Root::of(&child);
+        let mut child = linux::contained_by(child, leaf);
+        let mut teardown = std::pin::pin!(child.tear_down_awaiting());
+        ::tokio::select! {
+            biased;
+            _ = &mut teardown => panic!("the awaited reap never completes"),
+            () = std::future::ready(()) => {}
+        }
+        root
+    });
+    leaf_fault::take_rmdir_hook();
+
+    assert_eq!(
+        crate::log_capture::levels_since(mark, "contained-tree teardown did not fully succeed"),
+        [log::Level::Warn],
+        "the dropped teardown must still emit the drop's report"
+    );
+    assert!(root.reaped(), "the dropped teardown must reap the root");
+    assert!(!fake.leaf.exists(), "the drained leaf is removed");
 }

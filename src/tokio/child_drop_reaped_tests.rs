@@ -433,7 +433,7 @@ async fn cgroup_drop_after_wait_still_kills_the_tree_and_does_not_warn(#[fixture
     cmd.stderr(crate::Stdio::pipe_out()).expect("stderr pipe");
     let mut child = cmd.spawn().expect("spawn");
     assert_eq!(child.containment(), Containment::CgroupV2);
-    // The drop is under test, so it stays the killer; the leaf is the test's to remove afterwards.
+    // The drop is under test, so it stays the killer.
     let leaf = match &child.os.attached {
         crate::containment::Attached::Cgroup(leaf) => leaf.path().to_path_buf(),
         other => panic!("a cgroup child holds its leaf, got {other:?}"),
@@ -459,9 +459,12 @@ async fn cgroup_drop_after_wait_still_kills_the_tree_and_does_not_warn(#[fixture
         .read_to_end(&mut rest)
         .await
         .expect("the cgroup kill ended the cat, closing stderr, with stdin still held");
-    // Stderr's EOF only proves the member is exiting. The drop may have left the leaf undrained:
-    // wait for the kernel's drain event, then remove it.
-    cgroup_common::drain_and_remove_leaf(&leaf);
+    // The drop waited for the leaf to drain, then removed it.
+    assert!(
+        !leaf.exists(),
+        "the drop must remove the drained leaf: {}",
+        leaf.display()
+    );
 }
 
 /// Exactly one record of the drop's skip since `mark`, at `debug`.

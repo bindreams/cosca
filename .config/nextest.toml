@@ -221,7 +221,7 @@ slow-timeout = { period = "10s", terminate-after = 3, grace-period = "1s" }
 # The two real-kernel async-drop tests wait on events outside the library: a member's death by
 # `cgroup.kill`, and the sockets' EOF. Each event is ordered before the wait by the test itself,
 # so this bound only stops a lost kill from stalling the cgroup lane.
-filter = 'binary(tokio_io) & test(/^linux_cgroup_v2_async_(kill_tree_then_wait_tree_then_drop_leaves_no_leaf|drop_alone_kills_the_members_and_logs_the_leftover)$/)'
+filter = 'binary(tokio_io) & test(/^linux_cgroup_v2_async_(kill_tree_then_wait_tree_then_drop_leaves_no_leaf|drop_alone_kills_the_members_and_removes_the_leaf)$/)'
 slow-timeout = { period = "30s", terminate-after = 2, grace-period = "1s" }
 
 [[profile.default.overrides]]

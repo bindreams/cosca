@@ -521,7 +521,7 @@ impl Command {
     /// cosca could re-kill on: `populated` does not change, and a fork writes no file. cosca does
     /// not probe for the fix.
     ///
-    /// **Both handles block until the root is reaped and the tree has drained.** The sync
+    /// **Both handles block until the root is reaped and a cgroup leaf has drained.** The sync
     /// [`Child`](crate::Child) does so as sync Rust normally does. The async
     /// [`Child`](crate::tokio::Child) does so on the dropping thread, which may be a tokio worker:
     /// a destructor cannot be awaited. Its root's kill bounds the wait, as does the tree's

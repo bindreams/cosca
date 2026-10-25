@@ -867,6 +867,62 @@ impl ProcSource {
         }
     }
 
+    /// [`wait_and_reap_caused`](ProcSource::wait_and_reap_caused) for an `async fn`, without
+    /// blocking: the gate and exit watch of [`wait`](ProcSource::wait), then tokio's own `wait`,
+    /// which collects the status (a `waitpid` by pid, run only for a child the handle shows ours).
+    /// What the gate finds instead is returned, not acted on or logged: the caller forgets the child
+    /// and reports it. **Never kills.**
+    #[cfg(unix)]
+    pub(crate) async fn wait_and_reap_awaiting(&mut self) -> (Waited, Option<String>) {
+        #[cfg(test)]
+        if super::fault::take_pend_awaited_reap() {
+            std::future::pending::<()>().await;
+        }
+        if let Err(found) = self.reap_verdict() {
+            return found;
+        }
+        if let Err(e) = self.await_exit().await {
+            return (Waited::Unverified, Some(format!("watching for its exit failed: {e}")));
+        }
+        if let Err(found) = self.reap_verdict() {
+            return found;
+        }
+        let ProcSource::Tokio { child, .. } = self else {
+            unreachable!("the gate answers a forgotten backend with an error")
+        };
+        match child.wait().await {
+            Ok(_) => (Waited::Exited, None),
+            Err(e) => (Waited::Unverified, Some(format!("tokio's wait failed: {e}"))),
+        }
+    }
+
+    /// [`gate`](ProcSource::gate) without its forget: `Ok` for a child the handle shows ours, or
+    /// that tokio already reaped; otherwise what a wait found, and why.
+    #[cfg(unix)]
+    fn reap_verdict(&self) -> Result<(), (Waited, Option<String>)> {
+        let ProcSource::Tokio { child, .. } = self else {
+            return Err((Waited::Unverified, None));
+        };
+        if child.id().is_none() {
+            return Ok(());
+        }
+        match self.state_of(child) {
+            RootState::Unreaped => Ok(()),
+            RootState::Reaped => Err((
+                Waited::Foreign,
+                Some("its handle shows it reaped by someone else".to_owned()),
+            )),
+            #[cfg(target_os = "macos")]
+            RootState::Unpinned => Err((Waited::Orphaned, Some(crate::signal::UNPINNED_WHY.to_owned()))),
+            #[cfg(not(target_os = "macos"))]
+            RootState::Unpinned => Err((Waited::Unverified, Some(crate::signal::UNPINNED_WHY.to_owned()))),
+            RootState::Unknown(e) => Err((
+                Waited::Unverified,
+                Some(format!("its handle cannot show it is ours ({e})")),
+            )),
+        }
+    }
+
     /// Block until the child's exit is visible to this process, or until `until`, and say which
     /// came first. For a message only: [`wait_and_reap_caused`](ProcSource::wait_and_reap_caused),
     /// which the caller runs next either way, is the wait that decides. Anything this cannot read

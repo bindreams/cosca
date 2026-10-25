@@ -298,6 +298,7 @@ fn remove_leftover_leaf(leaf: Option<std::path::PathBuf>) {
 #[skuld::test]
 async fn async_drop_tears_down_a_contained_tree() {
     use std::io::Read as _;
+    common::install_log_capture();
     let (child, mut root, mut grand) = common::spawn_grandchild_async(true).await;
     let leaf = cgroup_leaf_of(&child);
     let _leaf_cleanup = leaf_cleanup(&leaf);
@@ -307,10 +308,11 @@ async fn async_drop_tears_down_a_contained_tree() {
         cosca::Containment::None,
         "contained spawn must engage a mechanism"
     );
+    let mark = common::log_mark();
     drop(child);
-    // No post-drop liveness assertion: `Drop` signals and does not wait, and a kill is
-    // asynchronous. Each process's death is proven by its own control-socket EOF: a survivor
-    // blocks the read (a CI failure).
+    // No post-drop liveness assertion: the drop waits for the root and a cgroup leaf only, and on
+    // Windows for neither. Each process's death is proven by its own control-socket EOF: a
+    // survivor blocks the read (a CI failure).
     for (who, s) in [("root", &mut root), ("grandchild", &mut grand)] {
         let mut buf = [0u8; 1];
         match s.read(&mut buf) {
@@ -319,31 +321,30 @@ async fn async_drop_tears_down_a_contained_tree() {
             other => panic!("{who} not torn down on drop: {other:?}"),
         }
     }
-    // `Drop` releases the leaf right after the kill without waiting for the drain, so the killed
-    // members may not have left it yet.
-    remove_leftover_leaf(leaf);
+    #[cfg(target_os = "linux")]
+    if let Some(leaf) = &leaf {
+        assert_leaf_removed(leaf, mark);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (leaf, mark);
 }
 
 #[cfg(feature = "tokio")]
-/// Either the leaf `Drop` was given is gone and no warning names it, or it is still there and a
-/// warning at `warn` does. `Drop` writes `cgroup.kill` and reads the drain once: whether the kernel
-/// has finished the kill by then is not this test's to decide, and `Drop` waits for neither.
+/// The leaf an armed `Drop` killed is gone once the drop returns, and nothing warned about it: the
+/// drop waits for the leaf to drain, then removes it.
 #[cfg(target_os = "linux")]
-fn assert_leaf_gone_or_warned_about(leaf: &std::path::Path, mark: usize) {
-    let levels = common::levels_since(mark, &leaf.display().to_string());
-    if leaf.exists() {
-        assert!(
-            levels.contains(&log::Level::Warn),
-            "a leaf left behind must be warned about, got {levels:?}: {}",
-            leaf.display()
-        );
-    } else {
-        assert!(
-            !levels.contains(&log::Level::Warn),
-            "a leaf that was removed must not be warned about, got {levels:?}: {}",
-            leaf.display()
-        );
-    }
+fn assert_leaf_removed(leaf: &std::path::Path, mark: usize) {
+    assert!(
+        !leaf.exists(),
+        "the drop must drain and remove the leaf: {}",
+        leaf.display()
+    );
+    assert_eq!(
+        common::levels_since(mark, &leaf.display().to_string()),
+        Vec::<log::Level>::new(),
+        "a leaf that was removed must not be warned about: {}",
+        leaf.display()
+    );
 }
 
 // The mechanisms that still kill after the root is reaped: a macOS fd marker's holder sweep, a
@@ -387,15 +388,12 @@ async fn drop_after_wait_still_tears_down_the_tree() {
         Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
         other => panic!("grandchild not torn down by hard_kill after the root was waited: {other:?}"),
     }
-    // `Drop` releases the leaf without waiting for the drain: the leaf is removed if the kill had
-    // finished by then, and left with a warning if not.
     #[cfg(target_os = "linux")]
     if let Some(leaf) = &leaf {
-        assert_leaf_gone_or_warned_about(leaf, mark);
+        assert_leaf_removed(leaf, mark);
     }
     #[cfg(not(target_os = "linux"))]
-    let _ = mark;
-    remove_leftover_leaf(leaf);
+    let _ = (leaf, mark);
 }
 
 #[cfg(feature = "tokio")]
@@ -559,9 +557,9 @@ async fn linux_cgroup_v2_async_kill_on_drop_false_leaves_the_tree_running(#[fixt
 
 #[cfg(feature = "tokio")]
 /// Async twin of `linux_cgroup_v2_kill_on_drop_false_kill_tree_still_waits_for_the_leaf_to_drain`
-/// in `spawn_io.rs`, with the wait made explicit: the async `Drop` never waits for a drain, so an
-/// opted-out handle that killed its tree removes the leaf only if the caller awaited the drain
-/// first.
+/// in `spawn_io.rs`, with the wait made explicit: the async `Drop` of an opted-out handle never
+/// waits for a drain, so one that killed its tree removes the leaf only if the caller awaited the
+/// drain first.
 ///
 /// `kill_tree()`, `wait()` for the root, and `wait_tree().await` for the drain. After it the leaf
 /// reads `populated 0`, so the drop's one `rmdir` removes it, and nothing is warned.
@@ -603,11 +601,10 @@ async fn linux_cgroup_v2_async_kill_tree_then_wait_tree_then_drop_leaves_no_leaf
 /// placed in the leaf dies of `SIGKILL`, which the test reads by reaping it (a grandchild of the
 /// root cannot be reaped here, because tokio owns the root's children's parent).
 ///
-/// Whether the drain has finished by the drop's single read is a race this test does not depend
-/// on: either the leaf is gone and nothing warned, or it is left and a warning names it.
+/// The drop waits for the leaf to drain, so the leaf is gone and nothing warned.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-async fn linux_cgroup_v2_async_drop_alone_kills_the_members_and_logs_the_leftover(#[fixture(cgroup)] _group: &Group) {
+async fn linux_cgroup_v2_async_drop_alone_kills_the_members_and_removes_the_leaf(#[fixture(cgroup)] _group: &Group) {
     use std::io::Read as _;
     use std::os::unix::process::ExitStatusExt as _;
 
@@ -661,8 +658,7 @@ async fn linux_cgroup_v2_async_drop_alone_kills_the_members_and_logs_the_leftove
             other => panic!("{who} not torn down on drop: {other:?}"),
         }
     }
-    assert_leaf_gone_or_warned_about(&leaf, mark);
-    common::cgroup::drain_and_remove_leaf(&leaf);
+    assert_leaf_removed(&leaf, mark);
 }
 
 #[cfg(feature = "tokio")]

@@ -624,7 +624,6 @@ async fn run_tokio(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
         .read_to_end(&mut rest)
         .await
         .expect("the root and the cat are gone, closing stderr");
-    // An async drop does not wait for the leaf to drain: it would leave the leaf behind.
     if mechanism.is_cgroup() {
         child.wait_tree().await.expect("the leaf drains");
     }

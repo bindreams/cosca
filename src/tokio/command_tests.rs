@@ -13,6 +13,19 @@ fn contain_with_and_nesting_recorded() {
     assert_eq!(req.nesting, Nesting::Opaque);
 }
 
+/// The run-to-completion helpers' futures are `Send`, so a caller can `tokio::spawn` them: the
+/// teardown they await on a failure holds the child's resources across its waits.
+///
+/// Mutant: a `!Send` value held across the teardown's waits (fails to compile).
+#[skuld::test]
+fn run_to_completion_futures_are_send() {
+    fn assert_send<T: Send>(_: T) {}
+    let mut cmd = super::Command::new();
+    assert_send(cmd.status());
+    assert_send(cmd.output());
+    assert_send(cmd.read());
+}
+
 #[skuld::test]
 fn tokio_elevate_forwards_to_inner_request() {
     let mut c = super::Command::new();
@@ -79,7 +92,7 @@ fn held_blocker(kill_on_drop: bool) -> (super::Child, std::io::PipeWriter) {
 #[skuld::test]
 async fn a_failure_after_the_spawn_signals_the_child_and_says_so() {
     let (mut child, _writer) = held_blocker(true);
-    let error = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), &mut child);
+    let error = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), &mut child).await;
     assert_eq!(error.fate(), Some(crate::error::ChildFate::Reaped), "{error}");
 }
 
@@ -91,7 +104,7 @@ async fn a_failure_after_the_spawn_signals_the_child_and_says_so() {
 async fn a_failure_after_the_spawn_leaves_a_child_that_opted_out() {
     let (mut child, writer) = held_blocker(false);
     let id = child.id();
-    let error = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), &mut child);
+    let error = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), &mut child).await;
     assert_eq!(
         error.fate(),
         Some(crate::error::ChildFate::Running { id: Some(id) }),
@@ -108,14 +121,14 @@ async fn a_failure_after_the_spawn_notes_the_elevated_program_only_behind_a_back
     use crate::elevation::{Backend, ElevatedVia};
     let note = "an elevated program behind it may still run";
     let (mut plain, _w1) = held_blocker(true);
-    let plain = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), &mut plain);
+    let plain = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), &mut plain).await;
     assert!(!plain.to_string().contains(note), "{plain}");
 
     let (mut wrapped, _w2) = held_blocker(true);
     wrapped.set_elevation(crate::child::front_kill_tests::report(ElevatedVia::Wrapped(
         Backend::Sudo,
     )));
-    let wrapped = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), &mut wrapped);
+    let wrapped = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), &mut wrapped).await;
     assert_eq!(wrapped.fate(), Some(crate::error::ChildFate::Reaped), "{wrapped}");
     assert!(wrapped.to_string().contains(note), "{wrapped}");
 }
