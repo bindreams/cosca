@@ -8,7 +8,7 @@
 pub(crate) struct GroupRoot<'a> {
     /// Linux: the root's pidfd. A send through it with `PIDFD_SIGNAL_PROCESS_GROUP` names the group
     /// exactly: the kernel resolves it from the pidfd's process, never from a number.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     pidfd: Option<std::os::fd::BorrowedFd<'a>>,
     /// Whether the root's pid still names its group, read now. `None`: no root was given, for a
     /// caller whose mechanism names no group.
@@ -19,11 +19,13 @@ impl<'a> GroupRoot<'a> {
     /// The root that `pidfd` names (Linux; `None` elsewhere, or for a root that has none), checked by
     /// `check`: `Ok` while the root's pid still names its group, else why not.
     #[cfg(unix)]
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables, reason = "only Linux has a pidfd"))]
     pub(crate) fn new(
         pidfd: Option<std::os::fd::BorrowedFd<'a>>,
         check: &'a dyn Fn() -> Result<(), String>,
     ) -> GroupRoot<'a> {
         GroupRoot {
+            #[cfg(target_os = "linux")]
             pidfd,
             check: Some(check),
         }
@@ -31,13 +33,10 @@ impl<'a> GroupRoot<'a> {
 
     /// No root, for a caller whose mechanism names no group (a cgroup, a Job Object, a tree walk).
     /// A send by number with it is refused.
-    #[cfg_attr(
-        target_os = "linux",
-        allow(dead_code, reason = "Linux names no group outside a process group")
-    )]
+    #[cfg(any(not(unix), test))]
     pub(crate) fn none() -> GroupRoot<'static> {
         GroupRoot {
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             pidfd: None,
             check: None,
         }
@@ -50,13 +49,14 @@ impl<'a> GroupRoot<'a> {
             Ok(())
         }
         GroupRoot {
+            #[cfg(target_os = "linux")]
             pidfd: None,
             check: Some(&trusted),
         }
     }
 
-    /// The root's pidfd, if it has one (Linux).
-    #[cfg(unix)]
+    /// The root's pidfd, if it has one.
+    #[cfg(target_os = "linux")]
     pub(crate) fn pidfd(&self) -> Option<std::os::fd::BorrowedFd<'a>> {
         self.pidfd
     }
