@@ -432,6 +432,161 @@ fn windows_kill_of_an_elevated_child_reports_what_happened(#[fixture(elevation)]
     payload.release();
 }
 
+/// How an environment block holds one of the two M10 markers.
+#[cfg(windows)]
+#[derive(Debug, PartialEq, Eq)]
+enum Marker {
+    /// The entry, key and value.
+    Exact,
+    /// An entry with the marker's key (case-insensitive) and another value.
+    OtherValue,
+    Absent,
+}
+
+/// The entries of a raw `GetEnvironmentStringsW` dump (UTF-16LE, through the closing empty entry). A
+/// dump that is truncated or not valid UTF-16 fails here, so it never reads as "both markers absent".
+#[cfg(windows)]
+fn decode_block(dump: &[u8]) -> Vec<String> {
+    let (pairs, rest) = dump.as_chunks::<2>();
+    assert!(rest.is_empty(), "the dump has an odd length ({} bytes)", dump.len());
+    let units: Vec<u16> = pairs.iter().map(|b| u16::from_le_bytes(*b)).collect();
+    assert!(
+        units.ends_with(&[0, 0]),
+        "the dump does not end in the block's closing empty entry: truncated?"
+    );
+    units
+        .split(|&u| u == 0)
+        .take_while(|e| !e.is_empty())
+        .map(|e| String::from_utf16(e).expect("the dump holds valid UTF-16"))
+        .collect()
+}
+
+/// `path` in canonical form, so case and short names do not decide a comparison.
+#[cfg(windows)]
+fn canonical(path: &std::path::Path) -> PathBuf {
+    path.canonicalize()
+        .unwrap_or_else(|e| panic!("canonicalize {}: {e}", path.display()))
+}
+
+/// The name of an environment entry. A leading `=` belongs to the name (`=Q:`).
+#[cfg(windows)]
+fn entry_name(entry: &str) -> &str {
+    let from = usize::from(entry.starts_with('='));
+    entry[from..].find('=').map_or(entry, |i| &entry[..from + i])
+}
+
+#[cfg(windows)]
+fn marker_in(block: &[String], marker: &str) -> Marker {
+    if block.iter().any(|e| e == marker) {
+        return Marker::Exact;
+    }
+    let name = entry_name(marker);
+    if block.iter().any(|e| entry_name(e).eq_ignore_ascii_case(name)) {
+        Marker::OtherValue
+    } else {
+        Marker::Absent
+    }
+}
+
+/// M10, a measurement: the consent route's child runs in the `current_dir` given, which reaches it as
+/// `lpDirectory`, and its environment block is recorded next to the one its launcher had.
+///
+/// The elevated child has its own console, so it reports to files. The test records only variable names,
+/// the markers and entry counts, because values go to a public job log. The directory is fresh, so it is
+/// neither the test's cwd nor `System32`.
+#[cfg(windows)]
+#[skuld::test]
+fn m10_the_consent_route_child_runs_in_lp_directory(#[fixture(elevation)] _group: &Group) {
+    require_unelevated();
+    let dir = tempfile::tempdir().expect("the child's directory");
+    let own_cwd = std::env::current_dir().expect("this test's cwd");
+    let system32 = PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot")).join("System32");
+    let lp_directory = canonical(dir.path());
+    for other in [&own_cwd, &system32] {
+        assert_ne!(
+            lp_directory,
+            canonical(other),
+            "the child's directory {} must differ from {}, or a route that ignored lpDirectory would pass",
+            dir.path().display(),
+            other.display()
+        );
+    }
+
+    let records = tempfile::tempdir().expect("a directory for the child's reports");
+    let report = records.path().join("report.txt");
+    let env_dump = records.path().join("env.bin");
+    let own_dump = records.path().join("own-env.bin");
+    let q_dir = tempfile::tempdir().expect("the `=Q:` marker's directory");
+    let nonce = format!("COSCA_M10_NONCE={}", common::payload::fresh_nonce());
+    let q_entry = format!("=Q:={}", q_dir.path().display());
+    let mut entries: Vec<String> = std::env::vars_os()
+        .filter(|(k, _)| !k.eq_ignore_ascii_case("=Q:"))
+        .map(|(k, v)| {
+            let mut entry = k;
+            entry.push("=");
+            entry.push(v);
+            entry.into_string().expect("a UTF-16-valid environment")
+        })
+        .collect();
+    entries.push(q_entry.clone());
+    entries.push(nonce.clone());
+    let block_file = records.path().join("block.txt");
+    std::fs::write(
+        &block_file,
+        entries.iter().map(|e| format!("{e}\0")).collect::<String>(),
+    )
+    .unwrap();
+
+    let mut cmd = std::process::Command::new(testbin());
+    cmd.arg("spawn-consent-with-block").args([
+        report.as_os_str(),
+        env_dump.as_os_str(),
+        own_dump.as_os_str(),
+        dir.path().as_os_str(),
+        block_file.as_os_str(),
+    ]);
+    let out = common::output_locked(&mut cmd).expect("run spawn-consent-with-block");
+    assert!(out.status.success(), "spawn-consent-with-block failed: {out:?}");
+
+    let report = std::fs::read_to_string(&report).expect("the child's report");
+    let own_entries = decode_block(&std::fs::read(&own_dump).expect("consent-spawn's environment dump"));
+    let child_entries = decode_block(&std::fs::read(&env_dump).expect("the child's environment dump"));
+    let own = (marker_in(&own_entries, &q_entry), marker_in(&own_entries, &nonce));
+    let child = (marker_in(&child_entries, &q_entry), marker_in(&child_entries, &nonce));
+    println!("M10 report:\n{report}");
+    for (what, block) in [("consent-spawn", &own_entries), ("child", &child_entries)] {
+        println!("M10 {what} block: {} entries; names:", block.len());
+        block.iter().for_each(|e| println!("  {}", entry_name(e)));
+    }
+    println!("M10 launcher block: {} entries", entries.len());
+    println!("M10 markers (=Q:, nonce): consent-spawn {own:?}, child {child:?}");
+
+    assert_eq!(
+        own,
+        (Marker::Exact, Marker::Exact),
+        "consent-spawn did not receive both markers, so the child's block says nothing about the consent route"
+    );
+    assert!(
+        report.lines().any(|l| l == "elevated=1"),
+        "the child did not run elevated:\n{report}"
+    );
+    let child_cwd = report
+        .lines()
+        .find_map(|l| l.strip_prefix("cwd="))
+        .unwrap_or_else(|| panic!("the child's report has no cwd line:\n{report}"));
+    assert_eq!(
+        canonical(std::path::Path::new(child_cwd)),
+        lp_directory,
+        "the child's cwd is not the lpDirectory given ({}):\n{report}",
+        dir.path().display()
+    );
+    assert_eq!(
+        child,
+        (Marker::Absent, Marker::Absent),
+        "the consent route's child no longer gets a fresh environment (Exact: inherited as given; OtherValue: the name is there with another value)"
+    );
+}
+
 // The async twin of the Windows marker test.
 #[cfg(all(windows, feature = "tokio"))]
 #[skuld::test]

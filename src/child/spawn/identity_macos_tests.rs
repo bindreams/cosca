@@ -91,7 +91,7 @@ pub(crate) fn other_unique_id(pid: u32) -> UniqRead {
     })
 }
 
-fn sync_blocker() -> (crate::Command, std::io::PipeWriter) {
+pub(crate) fn sync_blocker() -> (crate::Command, std::io::PipeWriter) {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
     let mut cmd = crate::Command::new();
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
@@ -436,7 +436,7 @@ fn teardown(child: std::process::Child, unique: u64) -> crate::error::ChildFate 
 }
 
 /// A `std` blocker, its stdin writer, and its unique id.
-fn std_blocker_with_unique() -> (std::process::Child, std::process::ChildStdin, u64) {
+pub(crate) fn std_blocker_with_unique() -> (std::process::Child, std::process::ChildStdin, u64) {
     let mut cmd = std::process::Command::new(crate::test_child::BLOCKER_ARGV[0]);
     cmd.args(&crate::test_child::BLOCKER_ARGV[1..])
         .stdin(std::process::Stdio::piped());
@@ -506,7 +506,7 @@ fn teardown_records(mark: usize) -> Vec<(log::Level, String)> {
 
 /// A refused kill, with the child left running and an `EPERM` for every id read the teardown makes
 /// of it: arms the kill's refusal and returns the guard.
-fn refuse_the_kill() -> uniq_fault::Forced {
+pub(crate) fn refuse_the_kill() -> uniq_fault::Forced {
     uniq_fault::force_uniq_read_once(ReadPurpose::Kill, UniqRead::Refused(libc::EPERM))
 }
 
@@ -596,6 +596,49 @@ fn macos_attach_failure_teardown_with_a_refused_id_read_warns_it_cannot_be_shown
         records[0].1.contains("could not be killed") && records[0].1.contains("cannot be shown to be ours"),
         "{records:?}"
     );
+    end_unsignalled_and_reap(pid);
+}
+
+/// A child the teardown leaves running is left as its caller says: the warn ends with the caller's
+/// words, not the sync spawn's.
+///
+/// Mutant: the warn says the child stays a zombie whatever the caller passes.
+#[skuld::test]
+fn macos_kill_and_reap_verified_says_the_callers_words_of_a_child_left_running() {
+    const TAIL: &str = "it is handed to the caller's reaper";
+    crate::log_capture::install();
+    let (child, _stdin, unique) = std_blocker_with_unique();
+    let pid = child.id();
+    let mark = crate::log_capture::mark();
+    let _refused = refuse_the_kill();
+    let fate = super::kill_and_reap_verified(pid, unique, None, TAIL);
+    assert!(matches!(fate, crate::error::ChildFate::Running { .. }), "{fate:?}");
+    let records = teardown_records(mark);
+    assert_eq!(records.len(), 1, "one warn for the one event: {records:?}");
+    assert!(
+        records[0].1.contains(TAIL) && !records[0].1.contains("zombie"),
+        "{records:?}"
+    );
+    drop(child);
+    end_unsignalled_and_reap(pid);
+}
+
+/// The sync spawn drops its `std` `Child`, which reaps nothing: a child its teardown leaves running
+/// stays a zombie once it exits, and the warn says so.
+///
+/// Mutant: the sync caller says nothing of what it leaves.
+#[skuld::test]
+fn macos_attach_failure_teardown_says_a_child_left_running_stays_a_zombie() {
+    crate::log_capture::install();
+    let (child, _stdin, unique) = std_blocker_with_unique();
+    let pid = child.id();
+    let mark = crate::log_capture::mark();
+    let _refused = refuse_the_kill();
+    let fate = teardown(child, unique);
+    assert!(matches!(fate, crate::error::ChildFate::Running { .. }), "{fate:?}");
+    let records = teardown_records(mark);
+    assert_eq!(records.len(), 1, "one warn for the one event: {records:?}");
+    assert!(records[0].1.contains("stays a zombie once it exits"), "{records:?}");
     end_unsignalled_and_reap(pid);
 }
 
@@ -763,55 +806,4 @@ fn macos_treewalk_attach_reads_nothing_by_pid() {
         Some(child.id()),
         "the walk's root is the verified identity"
     );
-}
-
-// A report not yet written =====
-
-/// A child whose unique-id report was not yet written when its spawn returned is not taken for a
-/// corpse: the spawn says the program may have started, the child is left running and unreaped,
-/// and the warning says it may be running. A front gets its note, as for an unreadable report.
-///
-/// Mutants: the unreported child is logged as having died before `exec`; its fate is not
-/// `Running` with its pid; the front's note is dropped.
-#[skuld::test]
-fn macos_sync_spawn_of_an_unreported_child_leaves_it_running_and_says_so() {
-    use crate::elevation::{front::front, ElevatedVia};
-    crate::log_capture::install();
-    for front in [None, front(Some(&ElevatedVia::MacosOsascript))] {
-        let (mut cmd, writer) = sync_blocker();
-        cmd.set_elevation_front(front);
-        let mark = crate::log_capture::mark();
-        let err = {
-            let _unwritten = unique_report::seams::find_the_report_unwritten();
-            cmd.spawn().expect_err("an unreported child is not adopted")
-        };
-        let (err, fate) = crate::child::spawn::failure::expect_may_have_started_with(err);
-        // No unique id was read, so no identity names it.
-        assert_eq!(
-            fate,
-            crate::error::ChildFate::Running { id: None },
-            "an unreported child is left running"
-        );
-        let Some(crate::identity::Resolved::Found(id)) = crate::child::spawn::fault::take_captured() else {
-            panic!("the spawn captured the child");
-        };
-        let pid = id.pid();
-        assert!(has_not_exited(pid), "the child is left running");
-        assert!(
-            crate::log_capture::contains_since(mark, &format!("child {pid} had not reported its unique id")),
-            "the warning says what happened"
-        );
-        assert!(
-            !crate::log_capture::contains_since(mark, &format!("child {pid} died before exec")),
-            "an unreported child is not reported dead"
-        );
-        assert_eq!(
-            err.to_string().contains("it is left unreaped"),
-            front.is_some(),
-            "only a front is noted: {err}"
-        );
-        // The writer stays open until the reap: closing it would let the child exit by itself.
-        end_unsignalled_and_reap(pid);
-        drop(writer);
-    }
 }

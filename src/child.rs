@@ -982,7 +982,7 @@ impl Child {
     #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn test_marker_root(&self) -> Option<ProcessId> {
         match &self.attached {
-            crate::containment::Attached::FdMarker(m) => Some(m.root()),
+            crate::containment::Attached::FdMarker(m) => m.root(),
             _ => None,
         }
     }
