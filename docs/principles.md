@@ -28,7 +28,11 @@ run on: no wait for a process exit or a cgroup drain, and no sweep of unbounded 
 must wait is an `async fn`. Sync code may block, as sync Rust normally does.
 
 The armed async `Drop` is an exception: it blocks until what it killed is reaped and drained
-(principle 3). A destructor cannot await.
+(principle 3). A destructor cannot await. So are the places a destructor runs inside an `async fn`:
+a run-to-completion teardown (`status`, `output`, `read` failing after the spawn) dropped mid-reap
+or mid-drain finishes as the `Drop` does, and one whose exit or drain cannot be watched (the
+reactor refuses the registration, or the handle reports an error) waits for it in place instead of
+forgetting a child that is ours. Both warn past 1 s, as principle 3 says.
 
 Spawning is the other exception: it blocks until `exec`, as tokio's own `Command::spawn` does.
 That includes cosca's placement report
@@ -123,11 +127,11 @@ Where a group ID must be used (process-group or fd-marker containment), keep the
 zombie until the group kill is done.
 
 Two by-number reaps are outside this rule, both tokio's `waitpid(pid)`: its reap of a dropped async
-root the drop could not kill (principle 3), and its collect of an async root right after a look
-through the root's handle showed the exit (the armed drop, `wait`, and a failed run-to-completion
-helper). Every collect has its own look: an async wait whose look finds nothing to collect, as for
-a zombie a foreign tracer holds, waits for the handle's next event and looks again. The root is then
-an unreaped zombie of ours, but a foreign reap between a look and its collect is not detected.
+root the drop could not kill (principle 3), and every collect of an async root, which is tokio's
+`try_wait` right after cosca's own look through the root's handle showed the exit. A collect never
+goes without its look: an async wait whose look finds nothing to collect, as for a zombie a foreign
+tracer holds, waits for the handle's next event and looks again. The root is then an unreaped zombie
+of ours, but a foreign reap between a look and its collect is not detected.
 
 **Why:** once the process is reaped its number can belong to anyone, and a signal sent to it hits an
 unrelated process.

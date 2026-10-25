@@ -547,6 +547,12 @@ pub(crate) async fn cgroup_wait_tree_drained(
 ) -> Result<crate::containment::TreeDrain, Error> {
     use crate::containment::cgroup::DrainStep;
 
+    #[cfg(test)]
+    if crate::tokio::child::fault::take_fail_drain_watch() {
+        return Err(Error::Io(std::io::Error::other(
+            "forced drain watch failure (test seam)",
+        )));
+    }
     loop {
         match leaf.drain_step_on(deadline, tokio_now)? {
             DrainStep::Done(drain) => return Ok(drain),

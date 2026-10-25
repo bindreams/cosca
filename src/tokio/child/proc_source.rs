@@ -968,8 +968,9 @@ impl ProcSource {
     /// and is left to that wait.
     ///
     /// - **Linux:** a poll on the pidfd until `until`. A readable pidfd whose zombie a foreign
-    ///   tracer still holds shows no exit to a peek, and no further event comes when the tracer
-    ///   lets go, so the peek is repeated with a capped backoff until `until`.
+    ///   tracer still holds shows no exit to a peek. The kernel wakes the pidfd again when the
+    ///   tracer lets go, but `poll(2)` on an already readable pidfd returns at once and cannot wait
+    ///   for that wake, so the peek is repeated with a capped backoff until `until`.
     /// - **macOS:** the verified-id kqueue wait, with `until` as its deadline.
     #[cfg(unix)]
     pub(crate) fn exit_visible_by(&self, pid: u32, until: std::time::Instant) -> bool {

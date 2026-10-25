@@ -101,9 +101,9 @@ impl OsResources {
     }
 
     /// [`release_after_drain`](Self::release_after_drain) for an `async fn`: the drain is awaited
-    /// before the leaf's drop, which then finds the leaf drained. Dropped during the drain, the
-    /// future waits for it on the dropping thread, as the drop does, with the drop's warn for
-    /// async child `pid` past 1 s from then.
+    /// before the leaf's drop, which then finds the leaf drained. Dropped during the drain, or
+    /// with a drain that cannot be watched, the future waits for it on the dropping thread, as the
+    /// drop does, with the drop's warn for async child `pid` past 1 s from then.
     #[cfg(unix)]
     async fn release_after_drain_awaiting(self, pid: u32, tree_failed: bool) {
         let Some(attached) = self.release_backend_and_rekill(tree_failed) else {
@@ -113,10 +113,17 @@ impl OsResources {
             pid,
             attached: Some(attached),
         };
-        // A drain that cannot be watched is the leaf's own drop's to report.
         #[cfg(target_os = "linux")]
         if let Some(Attached::Cgroup(leaf)) = &draining.attached {
-            _ = crate::tokio::wait::cgroup_wait_tree_drained(leaf, None).await;
+            if let Err(e) = crate::tokio::wait::cgroup_wait_tree_drained(leaf, None).await {
+                // A drain that cannot be watched is waited for as the drop waits, with its warn:
+                // `draining` drops here.
+                log::debug!(
+                    "async child {pid}: its leaf's drain cannot be watched ({e}); the teardown waits for it on \
+                     this thread, blocking"
+                );
+                return;
+            }
         }
         draining.finish();
     }
@@ -1710,7 +1717,7 @@ impl LateWarn {
             return;
         }
         log::warn!(
-            "Child::drop: async child {} {what} {} s after its kill; still waiting: the drop blocks \
+            "Child::drop: async child {} {what} {} s into this wait; still waiting: the drop blocks \
              until the child is reaped and its tree has drained (call kill() and wait().await, and \
              wait_tree().await for a tree, before dropping, to wait without blocking)",
             self.pid,
@@ -2051,6 +2058,7 @@ pub(crate) mod fault {
         static FORCE_KILL_FAILURE: Cell<bool> = const { Cell::new(false) };
         static PEND_AWAITED_REAP: Cell<bool> = const { Cell::new(false) };
         static FAIL_REAP_WATCH: Cell<bool> = const { Cell::new(false) };
+        static FAIL_DRAIN_WATCH: Cell<bool> = const { Cell::new(false) };
         static REAP_PARKED: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
         static RELEASES: Cell<usize> = const { Cell::new(0) };
         static BACKEND_DROPS: Cell<usize> = const { Cell::new(0) };
@@ -2196,6 +2204,32 @@ pub(crate) mod fault {
 
     pub(crate) fn take_fail_reap_watch() -> bool {
         FAIL_REAP_WATCH.with(|f| f.replace(false))
+    }
+
+    /// The next awaited cgroup drain on this thread ([`cgroup_wait_tree_drained`]) fails before it
+    /// waits, as when its watch cannot be read.
+    ///
+    /// [`cgroup_wait_tree_drained`]: crate::tokio::wait::cgroup_wait_tree_drained
+    #[cfg(target_os = "linux")]
+    pub(crate) fn fail_drain_watch() -> FailDrainWatch {
+        FAIL_DRAIN_WATCH.with(|f| f.set(true));
+        FailDrainWatch(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[must_use = "the seam is cleared as soon as the guard is dropped"]
+    pub(crate) struct FailDrainWatch(());
+
+    #[cfg(target_os = "linux")]
+    impl Drop for FailDrainWatch {
+        fn drop(&mut self) {
+            FAIL_DRAIN_WATCH.with(|f| f.set(false));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn take_fail_drain_watch() -> bool {
+        FAIL_DRAIN_WATCH.with(|f| f.replace(false))
     }
 
     /// Run `hook` the first time a reap that waits on events (the awaited teardown's, or `wait`'s)
