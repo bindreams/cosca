@@ -561,8 +561,9 @@ impl SharedChild {
     /// was, because the child is already reaped (by us or by someone else).
     ///
     /// - **Linux:** through the pidfd. No pidfd (the child was gone when adopted) sends nothing.
-    /// - **macOS:** by pid, only while the pid's unique id is still the child's, under the lock:
-    ///   no reap of ours can run between the state read and the call.
+    /// - **macOS:** by pid, after a check that the pid's unique id is still the child's, under the
+    ///   lock: no reap of ours can run between the check and the send. A reap by another reaper
+    ///   there is not seen, and the signal then goes to whatever process holds the number.
     #[cfg(unix)]
     pub(crate) fn kill_sent(&self) -> io::Result<crate::signal::Sent> {
         self.signal_sent(crate::signal::Sig::Kill)

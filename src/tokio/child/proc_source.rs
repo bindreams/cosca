@@ -572,8 +572,9 @@ impl ProcSource {
     ///
     /// - **Linux:** `pidfd_send_signal` on the handshake pidfd, never by pid, so a foreign reap
     ///   followed by a pid reuse cannot redirect it.
-    /// - **macOS:** by pid, only while the pid still has the unique id read at spawn; macOS has no
-    ///   handle to send through, so a reap between check and send is an accepted gap.
+    /// - **macOS:** by pid, after a check that the pid still has the unique id read at spawn. macOS
+    ///   has no handle to send through: a reap by another reaper between that check and the send is
+    ///   not seen, and the signal then goes to whatever process holds the number.
     pub(crate) fn signal(&self, sig: Sig) -> Result<Sent, Error> {
         match self {
             #[cfg(unix)]
@@ -793,8 +794,9 @@ impl ProcSource {
     ///   hands it back. A foreign reap and a pid with another unique id are [`Waited::Foreign`], and
     ///   a launchd-held zombie is [`Waited::Orphaned`]. What cannot be shown to be ours or reaped is [`Waited::Unverified`]: a
     ///   refused read, a failed peek or kqueue (warned), and a child with no unique id (a
-    ///   spawn whose unique id was not adopted, see `adopted_id`), which is not waited on at all. A reap and reuse
-    ///   between the verified exit and tokio's reap is an accepted gap.
+    ///   spawn whose unique id was not adopted, see `adopted_id`), which is not waited on at all. A
+    ///   foreign reap between the verified exit and tokio's reap is not seen: if another child of
+    ///   ours has taken the number, tokio's reap collects it.
     /// - **Windows:** waits on tokio's process handle, which pins the child.
     ///
     /// On anything but [`Waited::Exited`] the caller calls

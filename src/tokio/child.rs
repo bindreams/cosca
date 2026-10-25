@@ -628,9 +628,9 @@ impl Child {
 
     /// Hard-kill the (lone) child. On Linux the signal goes through the pidfd the spawn holds, and
     /// on Windows through the process handle, so neither can race a recycled pid; a refused
-    /// `pidfd_open` cannot fail it. macOS has no such handle: it sends by pid, only while the pid
-    /// still has the unique id read at spawn, and a reap by someone else between that check and the
-    /// send is an accepted gap.
+    /// `pidfd_open` cannot fail it. macOS has no such handle: it sends by pid after a check that the
+    /// pid still has the unique id read at spawn. A reap by another reaper between that check and
+    /// the send is not seen, and the signal then goes to whatever process holds the number.
     /// `Ok(())` if the child already exited, was reaped by a prior `wait`, or was reaped by someone
     /// else.
     /// Signal-only: does not reap — `wait().await` (or `Drop`) collects the exit status.
