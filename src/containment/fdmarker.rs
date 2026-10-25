@@ -1311,7 +1311,8 @@ impl Marker {
     /// same class of check-then-act window `src/containment/unix.rs` already documents for
     /// `ProcessGroup`'s own one-shot `killpg` — narrowed here to "immediately after a live
     /// member was freshly confirmed," not eliminated, and this module makes no claim beyond
-    /// that.
+    /// that. Each pass's `killpg` also checks the root right before it (`root`, see
+    /// [`GroupRoot::check`]), on every pass, not once for the sweep.
     fn sweep_pass(
         &self,
         signal: nix::sys::signal::Signal,

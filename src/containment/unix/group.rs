@@ -589,20 +589,12 @@ fn reconfirm_survivor(outcome: MemberOutcome, recheck: impl FnOnce() -> crate::i
 /// "not a survivor" would manufacture the same false-`Ok` #61 exists to eliminate, just for
 /// this pid specifically.
 ///
-/// **Interaction with sibling #54 (pgid reuse), read before touching the resend below.** This
-/// function does not obtain, trust, or pin `pgid` itself — it is handed the same, still
-/// unpinned, group id `unix.rs::signal_group` already passed to `killpg`. #54 tracks that
-/// hazard and owns its eventual fix (pinning the pgid against reuse); nothing here changes
-/// how `pgid` is obtained or trusted, and the direct-to-leader fallback in `unix.rs` is left
-/// exactly as it was. What IS new, and worth stating plainly at the one place it bites
-/// hardest: unlike a plain probe, the loop below delivers a REAL `SIGKILL` to every member it
-/// classifies alive-and-reachable. If `pgid` was recycled onto an unrelated process group
-/// between `killpg`'s own call (in `signal_group`) and this function's `members(pgid)` listing
-/// a moment later — #54's race, reoccurring here in a strictly later, second window — this
-/// loop can deliver a real `SIGKILL` into that unrelated group, not merely misreport its
-/// state. This is a consequence of #54's still-open race showing up on this new code path; it
-/// is #54's fix to close (by pinning the pgid before either call), not something this function
-/// can safely work around on its own.
+/// **The group's number, and each resend.** The listing names members by `pgid`, a number that
+/// stays the root's group only while the root is unreaped (or its pid is free after this handle's
+/// own reap). Each `SIGKILL` resend therefore runs right after its own check of the root
+/// ([`GroupRoot::check`]), and a member whose check fails is unassessable, not signalled. A reap of
+/// the root by another reaper in the process between that check and the resend is not seen: the
+/// window `Child::kill_tree` documents.
 pub(crate) fn converge(pgid: i32, signal: Signal, root: &GroupRoot<'_>) -> std::io::Result<GroupState> {
     let listed = members(pgid)?;
     #[cfg(test)]

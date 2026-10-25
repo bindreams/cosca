@@ -114,7 +114,17 @@ child is ours leaks the child with a `warn` naming the pid; it never reaps on a 
 doesn't do this yet either ([#341]).
 
 Where a group ID must be used (process-group or fd-marker containment), keep the root an unreaped
-zombie until the group kill is done.
+zombie until the group kill is done. On Linux 6.9+ the group is signalled through the root's pidfd
+(`PIDFD_SIGNAL_PROCESS_GROUP`), which names it exactly; cosca detects the flag by acting, and an
+older kernel's `EINVAL` falls back to the group's number. Below 6.9 and on macOS a reaper elsewhere
+in the process can reap the root between the check and a send by its number, which then reaches
+whoever holds it: a standing property of process-group and fd-marker containment. A program with
+such a reaper should use cgroup containment.
+
+Where a check of a PID cannot be made atomic with its use, keep the window as small as it can be:
+check and use are two back-to-back actions. Every send by number has its own check right before it,
+never one check for several sends (a `killpg`, its resends, a walk), and no field or variable holds
+a checked PID for later use.
 
 The by-number reaps outside this rule are all tokio's: its reap of a dropped async root (principle 3),
 and, on macOS, its orphan queue's reap of a child whose async spawn failed and whose kill did not

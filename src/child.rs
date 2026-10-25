@@ -624,9 +624,14 @@ impl Child {
     ///
     /// **A reap after the look.** All of this is decided on one look at the root. A
     /// [`wait`](Child::wait) on another thread is held off from the look until the sweep has sent
-    /// what it sends by the root's number. A reap after the look by another reaper is not seen: what
-    /// the sweep sends by that number (the group's signal, an fd marker's walk from the root's pid)
-    /// then goes to a number another process may hold.
+    /// what it sends by the root's number. On Linux 6.9+ a process group's signal goes through the
+    /// root's pidfd, which names the group exactly, whoever reaps the root. Each send by the group's
+    /// number (the `killpg` below 6.9 and on macOS, the leader's signal, each member's resend) checks
+    /// the root again right before it, and nothing goes out once the root is shown reaped elsewhere. A reap by
+    /// another reaper between such a check and its send is not seen, and the send then goes to a
+    /// number another process may hold; a program with such a reaper should use
+    /// [`CgroupV2`](crate::Containment::CgroupV2), whose kill names no pid. An fd marker's walk from
+    /// the root's pid checks each process it signals by its identity.
     pub fn kill_tree(&self) -> Result<(), Error> {
         self.kill_tree_after(None)
     }

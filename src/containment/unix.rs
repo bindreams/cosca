@@ -36,10 +36,11 @@
 //!
 //! # PGID-reuse caveat
 //! Once the leader is reaped its PID/PGID may be reissued, and `killpg` would then signal that
-//! process's group. `kill_tree`/`terminate_tree` look at the root through its handle first
-//! (`child::tree_call::root_number`) and send no `killpg` for a root shown reaped elsewhere; the
-//! residual windows are documented on `Child::kill_tree`. cgroup v2 names no pid and has no such
-//! hole.
+//! process's group. On Linux 6.9+ the group is signalled through the root's pidfd instead, which
+//! names it exactly. Otherwise every send by the group's number (the `killpg`, the leader's signal,
+//! each member's resend) runs right after its own check of the root ([`GroupRoot::check`]), and
+//! nothing is sent once that check fails; the residual window between a check and its send is
+//! documented on `Child::kill_tree`. cgroup v2 names no pid and has no such hole.
 
 use std::io;
 
@@ -452,10 +453,8 @@ fn verify(pgid: i32, signal: Signal, root: &GroupRoot<'_>) -> Result<(), Error> 
 ///   any member whose liveness or identity the OS refuses to confirm (`Liveness::Unknown` /
 ///   `Resolved::Unknown`) is never signalled by `converge` at all — for THOSE, this direct
 ///   call is the only delivery attempt, not a duplicate. It is also not the same check: this
-///   call signals a bare `pid` number with NO identity verification, while `converge` refuses
-///   to signal a pid whose token no longer matches — under the #54 pgid-recycle hazard the two
-///   calls can have different, divergent targets. Kept because #54 forbids removing it, not
-///   because it is proven safe or proven duplicative.
+///   call checks the root itself, while `converge` checks each member's token as well. Kept
+///   because #54 forbids removing it, not because it is proven duplicative.
 /// - **`term_group` (`SIGTERM`)**: NOT redundant — the only real one. `converge`'s `SIGTERM`
 ///   path deliberately never resends — only probes, to avoid tripping a program's own
 ///   double-signal escalation convention — so this is the ONLY actual `SIGTERM`
@@ -465,6 +464,9 @@ fn verify(pgid: i32, signal: Signal, root: &GroupRoot<'_>) -> Result<(), Error> 
 /// Its failure is intentionally NOT propagated (best-effort; `verify`'s listing decides the
 /// contract answer either way), but is now logged rather than silently discarded, so a
 /// genuine `SIGTERM` delivery failure here — the one case that matters — leaves a trace.
+///
+/// On Linux it goes through the root's pidfd when it has one, which names the leader exactly;
+/// otherwise by `pid`, right after the root's own check, and not at all if that fails.
 fn signal_direct(pid: i32, signal: Signal, root: &GroupRoot<'_>) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     let sent = match root.pidfd() {
