@@ -1326,19 +1326,14 @@ fn denied_open_carries_the_win32_code() {
     assert!(matches!(gone, Ok(None)), "an exited pid is not a failure: {gone:?}");
 }
 
-/// `Thread32First` failing on a handle that is not a snapshot carries the plain Win32 code, and the
-/// handle is closed.
+/// `Thread32First` failing on a handle that is not a snapshot carries the plain Win32 code.
 ///
-/// Mutant: `thread_entries_closing` converts with `.into()`, so the code is an HRESULT
-/// (`0x8007xxxx`).
+/// Mutant: `thread_entries_closing` converts with `.into()`, so the code is `0x80070006`.
 #[skuld::test]
 fn thread_walk_failure_carries_the_win32_code() {
     let err = super::thread_entries_closing(event_handle()).expect_err("an event is not a snapshot");
     let code = err.raw_os_error();
-    assert!(
-        matches!(code, Some(c) if c != 0 && c < 0x1_0000),
-        "expected a plain Win32 code, got {code:?}"
-    );
+    assert_eq!(code, Some(ERROR_INVALID_HANDLE), "ERROR_INVALID_HANDLE expected");
 }
 
 /// A `CreateToolhelp32Snapshot` failure carries the plain Win32 code. The call cannot be made to

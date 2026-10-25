@@ -283,14 +283,42 @@ fn owned_event_failure_carries_the_win32_code() {
 /// `0x80070005`.
 #[skuld::test]
 fn open_verified_of_an_access_denied_live_process_carries_the_win32_code() {
+    let io = denied_open_source(|id| crate::wait::backend::open_verified(id).map(|_| ()));
+    assert_eq!(io.raw_os_error(), Some(ERROR_ACCESS_DENIED.0 as i32), "{io:?}");
+}
+
+/// The `Unassessable` source of a refused open of the unkillable fixture, which `call` runs `id`
+/// through. Needs the DACL fixture, which creates a Job Object: CI only.
+fn denied_open_source(call: impl FnOnce(ProcessId) -> Result<(), crate::error::Error>) -> std::io::Error {
     let child = crate::identity::windows_fixture::spawn_unkillable();
     let id = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
         .expect("the owned handle always yields an identity");
     assert!(child.is_running(), "precondition: the subject must be live");
-    let err = crate::wait::backend::open_verified(id).expect_err("an unopenable live process is not 'gone'");
+    let err = call(id).expect_err("an unopenable live process is not 'gone'");
     let crate::error::Error::Unassessable { source, .. } = err else {
         panic!("expected Unassessable, got {err:?}");
     };
-    let io = source.expect("the OS error is preserved");
+    source.expect("the OS error is preserved")
+}
+
+/// `block_until_exit` on a live process we may not open is `Unassessable` with the plain Win32
+/// code. CI only.
+///
+/// Mutant: the `Opened::Denied` arm of `block_until_exit` converts with `.into()`, so the code is
+/// `0x80070005`.
+#[skuld::test]
+fn block_until_exit_of_an_access_denied_live_process_carries_the_win32_code() {
+    let io = denied_open_source(|id| super::block_until_exit(id, Some(None)).map(|_| ()));
+    assert_eq!(io.raw_os_error(), Some(ERROR_ACCESS_DENIED.0 as i32), "{io:?}");
+}
+
+/// `kill` of a live process we may not open for termination is `Unassessable` with the plain Win32
+/// code. CI only.
+///
+/// Mutant: the `Opened::Denied` arm of `kill` converts with `.into()`, so the code is
+/// `0x80070005`.
+#[skuld::test]
+fn kill_of_an_access_denied_live_process_carries_the_win32_code() {
+    let io = denied_open_source(super::kill);
     assert_eq!(io.raw_os_error(), Some(ERROR_ACCESS_DENIED.0 as i32), "{io:?}");
 }

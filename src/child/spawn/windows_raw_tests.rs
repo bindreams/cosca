@@ -727,10 +727,9 @@ fn initialize_attribute_list_failure_carries_the_win32_code() {
 }
 
 /// An empty handle list is not a valid HANDLE_LIST attribute, so `UpdateProcThreadAttribute`
-/// fails; the error carries the plain Win32 code, and the list was deleted.
+/// fails with `ERROR_BAD_LENGTH`; the error carries the plain Win32 code.
 ///
-/// Mutant: `add_handle_list_or_delete` converts with `.into()`, so the code is an HRESULT
-/// (`0x8007xxxx`).
+/// Mutant: `add_handle_list_or_delete` converts with `.into()`, so the code is `0x80070018`.
 #[skuld::test]
 fn add_handle_list_failure_carries_the_win32_code() {
     let mut size = 0usize;
@@ -739,8 +738,5 @@ fn add_handle_list_failure_carries_the_win32_code() {
     let mut buf = vec![0u8; size];
     let list = initialize_attribute_list(&mut buf).expect("a right-sized buffer initializes");
     let code = io_code(add_handle_list_or_delete(list, &[]));
-    assert!(
-        matches!(code, Some(c) if c != 0 && c < 0x1_0000),
-        "expected a plain Win32 code, got {code:?}"
-    );
+    assert_eq!(code, Some(24), "ERROR_BAD_LENGTH (24) expected");
 }
