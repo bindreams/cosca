@@ -12,9 +12,7 @@ use windows::Win32::System::Diagnostics::Debug::WriteProcessMemory;
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
 };
-use windows::Win32::System::JobObjects::{
-    JobObjectBasicLimitInformation, QueryInformationJobObject, JOBOBJECT_BASIC_LIMIT_INFORMATION, JOB_OBJECT_LIMIT,
-};
+use windows::Win32::System::JobObjects::JOB_OBJECT_LIMIT;
 use windows::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
 use windows::Win32::System::Memory::{VirtualAllocEx, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
 use windows::Win32::System::Threading::{
@@ -256,22 +254,9 @@ pub(crate) fn inject_running_thread_into_pid(pid: u32) -> InjectedThread {
 
 /// The limit flags `job` holds now.
 pub(crate) fn limit_flags(job: &JobHandle) -> JOB_OBJECT_LIMIT {
-    let mut info = JOBOBJECT_BASIC_LIMIT_INFORMATION::default();
-    job.with_handle(|handle| {
-        // SAFETY: `handle` is live for the call, and `info` is a correctly sized out-parameter.
-        unsafe {
-            QueryInformationJobObject(
-                Some(handle),
-                JobObjectBasicLimitInformation,
-                std::ptr::addr_of_mut!(info).cast(),
-                std::mem::size_of::<JOBOBJECT_BASIC_LIMIT_INFORMATION>() as u32,
-                None,
-            )
-        }
-        .expect("query the job's limits");
-    })
-    .expect("the job handle is live");
-    info.LimitFlags
+    crate::containment::windows::job_limit_flags(job)
+        .expect("the job handle is live")
+        .expect("query the job's limits")
 }
 
 /// The raw process handle of a std child, as `attach` takes it.

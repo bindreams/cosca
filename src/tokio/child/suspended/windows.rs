@@ -15,10 +15,11 @@ impl SuspendedChild {
         self.child.test_job_handle_contains_self()
     }
 
-    /// Whether the child's containment job kills its members when its last handle closes.
+    /// Test-only: whether the child's containment job kills its members when its last handle closes.
+    /// `false` if the child is not job-contained; panics if the job's limits cannot be queried.
     #[doc(hidden)]
     pub fn test_job_kills_on_close(&self) -> bool {
-        self.child.test_job_kills_on_close()
+        crate::containment::windows::job_kills_on_close(&self.child.os.attached)
     }
 
     /// The containment the child has (and keeps after `resume`).
