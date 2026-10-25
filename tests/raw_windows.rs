@@ -559,7 +559,7 @@ fn an_unlisted_inheritable_handle_does_not_reach_the_child() {
 /// A child end left inheritable after a spawn would reach any spawner in this process that passes
 /// `bInheritHandles` TRUE with no list. After one spawn per kind of child end
 /// (`child_end_kinds`), this process holds no inheritable handle it did not hold before, with the
-/// child's `Child` still open. Single-threaded: nothing else opens handles during a snapshot.
+/// child's `Child` still open.
 /// Mutant: `drop(child_ends)` in `spawn_raw` replaced by `std::mem::forget(child_ends)`.
 #[skuld::test]
 fn no_inheritable_handle_outlives_a_raw_spawn() {

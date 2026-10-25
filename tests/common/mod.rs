@@ -40,6 +40,9 @@ pub mod windows_env;
 pub mod null_std;
 
 #[cfg(windows)]
+pub mod handle_snapshot;
+
+#[cfg(windows)]
 pub mod inheritable;
 
 mod locked;
