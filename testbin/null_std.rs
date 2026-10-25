@@ -15,16 +15,14 @@ use std::ffi::OsString;
 use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 
-use windows::Win32::Foundation::{GetHandleInformation, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT};
+use windows::Win32::Foundation::{SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT};
 use windows::Win32::Storage::FileSystem::{
     GetFileType, GetFinalPathNameByHandleW, FILE_NAME_NORMALIZED, FILE_TYPE_CHAR, FILE_TYPE_DISK, FILE_TYPE_PIPE,
 };
 use windows::Win32::System::Console::{
     SetStdHandle, STD_ERROR_HANDLE, STD_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
-use windows::Win32::System::Threading::{
-    GetCurrentProcess, GetProcessHandleCount, GetStartupInfoW, STARTF_USESTDHANDLES, STARTUPINFOW,
-};
+use windows::Win32::System::Threading::{GetCurrentProcess, GetStartupInfoW, STARTF_USESTDHANDLES, STARTUPINFOW};
 
 #[link(name = "kernel32", kind = "raw-dylib")]
 extern "system" {
@@ -35,6 +33,16 @@ extern "system" {
 
 #[link(name = "ntdll", kind = "raw-dylib")]
 extern "system" {
+    /// `process` is a process handle; `info` is `len` bytes for `class`, and `ret_len` receives the
+    /// size the class needs.
+    fn NtQueryInformationProcess(
+        process: HANDLE,
+        class: u32,
+        info: *mut std::ffi::c_void,
+        len: u32,
+        ret_len: *mut u32,
+    ) -> i32;
+
     /// `class` 4 is `FileFsDeviceInformation`: a [`DeviceInfo`]. `io_status` is an
     /// `IO_STATUS_BLOCK`: two pointer-sized words.
     fn NtQueryVolumeInformationFile(
@@ -135,27 +143,83 @@ pub fn report(path: &str, stray: &str) {
     std::fs::write(path, fields.join(",")).expect("write the report");
 }
 
-/// Calls `visit` with every handle this process holds and its `GetHandleInformation` flags. It
-/// visits every handle value: `GetProcessHandleCount` says how many handles there are, and the
-/// walk ends once it has seen that many. Only meaningful while no other thread opens or closes
-/// handles.
+/// `class` 51 of `NtQueryInformationProcess`, `ProcessHandleInformation`: a
+/// [`HandleSnapshotHeader`] followed by that many [`HandleTableEntry`].
+const PROCESS_HANDLE_INFORMATION: u32 = 51;
+
+/// `STATUS_INFO_LENGTH_MISMATCH`: the buffer is too small; the call reports the size it needs.
+const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC000_0004_u32 as i32;
+
+/// `OBJ_INHERIT`: the kernel's bit for `HANDLE_FLAG_INHERIT` in a handle table entry.
+const OBJ_INHERIT: u32 = 0x2;
+
+/// `PROCESS_HANDLE_SNAPSHOT_INFORMATION`, without its trailing array.
+#[repr(C)]
+struct HandleSnapshotHeader {
+    number_of_handles: usize,
+    reserved: usize,
+}
+
+/// `PROCESS_HANDLE_TABLE_ENTRY_INFO`.
+#[repr(C)]
+struct HandleTableEntry {
+    handle_value: usize,
+    handle_count: usize,
+    pointer_count: usize,
+    granted_access: u32,
+    object_type_index: u32,
+    handle_attributes: u32,
+    reserved: u32,
+}
+
+/// Calls `visit` with every handle this process holds and its `OBJ_*` attributes, from one
+/// snapshot the kernel takes in a single call. Other threads may close a handle in the snapshot, or
+/// reuse its value, before `visit` runs, so a caller that queries the handle must say why that
+/// cannot change its answer. The attributes are the snapshot's own and need no query.
 fn walk_handles(mut visit: impl FnMut(HANDLE, u32)) {
-    let mut count = 0u32;
-    // SAFETY: the pseudo-handle is always valid; `count` is a live out-parameter.
-    unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) }.expect("GetProcessHandleCount");
-    let (mut remaining, mut value) = (count, 0usize);
-    while remaining > 0 {
-        value += 4;
-        // A process holds at most 2^24 handles, each a multiple of 4.
-        assert!(value <= 1 << 26, "fewer handles found than the process says it holds");
-        let h = HANDLE(value as *mut _);
-        let mut flags = 0u32;
-        // SAFETY: a value that is not a handle in this process is an error, not UB.
-        if unsafe { GetHandleInformation(h, &mut flags) }.is_err() {
+    // `u64` words keep the buffer aligned for both structs.
+    let mut words = vec![0u64; (size_of::<HandleSnapshotHeader>() + 64 * size_of::<HandleTableEntry>()) / 8];
+    loop {
+        let mut needed = 0u32;
+        // SAFETY: the pseudo-handle is always valid; the buffer and `needed` are live and of the
+        // sizes passed.
+        let status = unsafe {
+            NtQueryInformationProcess(
+                GetCurrentProcess(),
+                PROCESS_HANDLE_INFORMATION,
+                words.as_mut_ptr().cast(),
+                (words.len() * 8) as u32,
+                &mut needed,
+            )
+        };
+        if status == STATUS_INFO_LENGTH_MISMATCH {
+            // The process may have opened more handles since: ask again at the size it reported.
+            let len = (needed as usize).div_ceil(8).max(words.len() * 2);
+            words.resize(len, 0);
             continue;
         }
-        remaining -= 1;
-        visit(h, flags);
+        assert!(
+            status >= 0,
+            "NtQueryInformationProcess(ProcessHandleInformation): {status:#x}"
+        );
+        break;
+    }
+    let base = words.as_ptr().cast::<u8>();
+    // SAFETY: a successful call filled the buffer with a header and `number_of_handles` entries.
+    let count = unsafe { (*base.cast::<HandleSnapshotHeader>()).number_of_handles };
+    debug_assert!(
+        size_of::<HandleSnapshotHeader>() + count * size_of::<HandleTableEntry>() <= words.len() * 8,
+        "the snapshot's entries fit the buffer"
+    );
+    // SAFETY: as above; the entries follow the header, whose size is a multiple of their alignment.
+    let entries = unsafe {
+        std::slice::from_raw_parts(
+            base.add(size_of::<HandleSnapshotHeader>()).cast::<HandleTableEntry>(),
+            count,
+        )
+    };
+    for entry in entries {
+        visit(HANDLE(entry.handle_value as *mut _), entry.handle_attributes);
     }
 }
 
@@ -163,6 +227,12 @@ fn walk_handles(mut visit: impl FnMut(HANDLE, u32)) {
 /// device type, as `GetFileType` does, never for its name: a name query on a synchronous pipe blocks
 /// while any process has a read pending on the same file object, as a CI runner has on a pipe
 /// handle this process inherits.
+///
+/// A snapshot handle that is closed before it is asked is skipped (`device_type` is `None`). One
+/// whose value is reused is asked about its new object, which counts only if that is a NUL device.
+/// Every NUL handle this process holds is inherited or made by cosca on the thread that calls
+/// this, and no other thread opens `\Device\Null`, so a reused value cannot add one. A NUL handle
+/// held throughout is counted once: the snapshot lists each value once.
 fn count_nul_handles() -> usize {
     let mut nul = 0;
     walk_handles(|h, _| {
@@ -173,11 +243,12 @@ fn count_nul_handles() -> usize {
     nul
 }
 
-/// The values of the handles this process holds with `HANDLE_FLAG_INHERIT` set.
+/// The values of the handles this process holds with `HANDLE_FLAG_INHERIT` set. The flag comes
+/// from the snapshot, so no handle is queried and a reused value cannot misreport it.
 fn inheritable_handles() -> BTreeSet<usize> {
     let mut found = BTreeSet::new();
-    walk_handles(|h, flags| {
-        if flags & HANDLE_FLAG_INHERIT.0 != 0 {
+    walk_handles(|h, attributes| {
+        if attributes & OBJ_INHERIT != 0 {
             found.insert(h.0 as usize);
         }
     });
