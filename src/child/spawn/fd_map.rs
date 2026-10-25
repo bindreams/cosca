@@ -1,5 +1,5 @@
-//! cosca-owned fd-mapping `pre_exec`: dup2's parent-process descriptors onto child descriptor
-//! numbers, replacing the `command-fds` dependency.
+//! cosca-owned fd mapping, the last step of the spawn's [`InChild`] hook: dup2's parent-process
+//! descriptors onto child descriptor numbers, replacing the `command-fds` dependency.
 //!
 //! # Why cosca owns this now
 //! `command-fds` 0.3.3 has two bugs that together made an out-of-range [`Fd`](crate::stdio::Fd)
@@ -19,7 +19,7 @@
 //!
 //! This module ports `command-fds`' actual algorithm (the collision-avoiding temporary-fd
 //! shuffle, and the `FD_CLOEXEC`-clearing `preserved_fds` the macOS fd marker uses, here
-//! [`install_preserved`]) but:
+//! [`preserve`]) but:
 //!  - picks each temporary with its own `F_DUPFD_CLOEXEC(fd, 3)` search, re-requesting above any
 //!    result that lands on another mapping's `child_fd`, instead of one global floor computed
 //!    from the highest fd anywhere in the set — so one distant `child_fd` no longer inflates
@@ -57,9 +57,10 @@
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
-use std::os::unix::process::CommandExt;
 
-/// A parent-fd -> child-fd mapping to install as part of `std_cmd`'s `pre_exec` dup2 plan.
+use super::in_child::InChild;
+
+/// A parent-fd -> child-fd mapping for the fd map's dup2 plan.
 /// Owns `parent_fd` so it stays open (and valid to dup2 from) until the spawn completes.
 #[derive(Debug)]
 pub(crate) struct FdMapping {
@@ -67,12 +68,10 @@ pub(crate) struct FdMapping {
     pub(crate) child_fd: RawFd,
 }
 
-/// Register `mappings` as the LAST `pre_exec` hook on `std_cmd`. Callers MUST register this
-/// after every containment pre_exec hook (see the ordering rationale in
-/// `child::spawn::spawn_unelevated` and `tokio::spawn::spawn_uncommitted`): it must run last so
-/// it cannot dup2 over an fd a containment hook still needs.
+/// Add `mappings` to `steps`, whose hook runs them last, after every step that may still need a
+/// descriptor they could replace (see [`InChild`]).
 ///
-/// A no-op (registers nothing) for an empty `mappings`.
+/// A no-op (adds no step) for an empty `mappings`.
 ///
 /// Every `child_fd` must already be non-negative — enforced once, upstream, at
 /// [`Command::fd`](crate::Command::fd); only asserted here, not re-checked (it is a contract,
@@ -90,14 +89,14 @@ pub(crate) struct FdMapping {
 /// itself cannot be made.
 ///
 /// The vacated original number is deliberately NOT freed at this point: it stays open, owned by
-/// the returned `Plan` (see `Plan::_retired`), until `std_cmd` itself drops. Freeing it any
-/// earlier would let `std_cmd.spawn()`'s own internal fd allocation — most importantly its
+/// the `Plan` (see `Plan::_retired`), until the command holding `steps`' hook drops. Freeing it any
+/// earlier would let `Command::spawn`'s own internal fd allocation — most importantly its
 /// child-to-parent CLOEXEC error-reporting pipe, which `spawn()` opens at the lowest free number —
 /// claim that exact number in the parent. Std's OWN child-side stdio dup2 runs before any
 /// `pre_exec` hook (including this module's own), so if that pipe's write end landed on a freed
 /// 0/1/2 slot, std's own dup2 would close it before this module's `pre_exec` ever got a chance to
 /// run, and a post-fork failure would then have nowhere left to report to.
-pub(crate) fn install(std_cmd: &mut std::process::Command, mut mappings: Vec<FdMapping>) -> io::Result<()> {
+pub(crate) fn install(steps: &mut InChild, mut mappings: Vec<FdMapping>) -> io::Result<()> {
     if mappings.is_empty() {
         return Ok(());
     }
@@ -140,37 +139,12 @@ pub(crate) fn install(std_cmd: &mut std::process::Command, mut mappings: Vec<FdM
         }
     }
 
-    let mut plan = Plan::build(mappings, retired);
-    // SAFETY: `Plan::apply` makes only raw `dup2`/`fcntl` syscalls, checks every return value,
-    // and reads the failure errno without allocating — the async-signal-safety `pre_exec`
-    // requires.
-    unsafe {
-        std_cmd.pre_exec(move || plan.apply());
-    }
+    steps.map_fds(Plan::build(mappings, retired));
     Ok(())
 }
 
-/// Register `fds` to survive `exec` without renumbering — clears `FD_CLOEXEC` on each, in the
-/// child only. The cosca-owned equivalent of `command-fds`' `preserved_fds`, used by
-/// `containment::fdmarker` to keep the marker write end open at the fd number it was placed
-/// at.
-///
-/// `cfg`-gated to macOS, the only platform with a caller (`containment::fdmarker`): an
-/// unconditional definition is dead code (and so a `-D warnings` clippy failure) on every other
-/// Unix this module also compiles for.
-#[cfg(target_os = "macos")]
-pub(crate) fn install_preserved(std_cmd: &mut std::process::Command, fds: Vec<OwnedFd>) {
-    if fds.is_empty() {
-        return;
-    }
-    // SAFETY: as `install` — `preserve` only calls `fcntl(F_SETFD)`, checked, no allocation.
-    unsafe {
-        std_cmd.pre_exec(move || preserve(&fds));
-    }
-}
-
 /// The dup2 plan, precomputed in the parent so the `pre_exec` closure does no allocation.
-struct Plan {
+pub(super) struct Plan {
     mappings: Vec<FdMapping>,
     /// Every child fd number in `mappings`, sorted+deduped — used post-fork both to detect a
     /// parent fd that collides with ANOTHER mapping's child fd (needs a temporary first) and,
@@ -201,7 +175,7 @@ impl Plan {
     /// except `dup_avoiding`'s own temporary-fd `close`, whose result is intentionally ignored —
     /// see `dup_avoiding`'s own comment for why), `EINTR` is retried with no arbitrary bound
     /// (matches the codebase's other `pre_exec`/raw-syscall retry sites).
-    fn apply(&mut self) -> io::Result<()> {
+    pub(super) fn apply(&mut self) -> io::Result<()> {
         if self.mappings.is_empty() {
             return Ok(());
         }
@@ -235,8 +209,13 @@ impl Plan {
     }
 }
 
+/// Keep `fds` open across `exec` without renumbering: clears `FD_CLOEXEC` on each, in the child.
+/// The cosca-owned equivalent of `command-fds`' `preserved_fds`, used by `containment::fdmarker`
+/// to keep the marker write end open at the fd number it was placed at.
+///
+/// Async-signal-safe: one checked `fcntl(F_SETFD)` per fd, no allocation.
 #[cfg(target_os = "macos")]
-fn preserve(fds: &[OwnedFd]) -> io::Result<()> {
+pub(super) fn preserve(fds: &[OwnedFd]) -> io::Result<()> {
     for fd in fds {
         clear_cloexec(fd.as_raw_fd())?;
     }

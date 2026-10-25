@@ -8,9 +8,8 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 
-#[cfg(target_os = "macos")]
-use super::install_preserved;
 use super::{install, FdMapping};
+use crate::child::spawn::in_child::register_alone;
 use crate::test_own_process::{own_process, test_path};
 use crate::test_spawn::spawn;
 use crate::test_stdio::RestoreStdio;
@@ -24,12 +23,17 @@ fn file_with(content: &str) -> File {
     f
 }
 
+/// `install` on `cmd`, as the only step of its hook.
+fn install_on(cmd: &mut Command, mappings: Vec<FdMapping>) -> std::io::Result<()> {
+    register_alone(cmd, |steps| install(steps, mappings))
+}
+
 /// Spawn `/bin/sh -c script` with `mappings` installed exactly as a real `Command::fd()` caller
 /// would, and return its captured stdout as a `String`.
 fn run_sh(script: &str, mappings: Vec<FdMapping>) -> String {
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-c").arg(script).stdout(Stdio::piped());
-    install(&mut cmd, mappings).expect("install");
+    install_on(&mut cmd, mappings).expect("install");
     let out = crate::test_spawn::output_captured(&mut cmd).expect("spawn /bin/sh");
     assert!(out.status.success(), "child failed: {out:?}");
     String::from_utf8(out.stdout).expect("utf8 stdout")
@@ -162,7 +166,7 @@ fn install_rejects_a_duplicate_child_fd_in_every_build_profile() {
     let b = file_with("B");
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-c").arg("true");
-    let err = install(
+    let err = install_on(
         &mut cmd,
         vec![
             FdMapping {
@@ -187,25 +191,25 @@ fn install_rejects_a_duplicate_child_fd_in_every_build_profile() {
 
 #[cfg(target_os = "macos")]
 #[skuld::test]
-fn install_preserved_clears_cloexec_so_the_fd_survives_exec() {
+fn preserve_clears_cloexec_so_the_fd_survives_exec() {
     let f = file_with("preserved");
     let owned: OwnedFd = f.into();
     let raw = owned.as_raw_fd();
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-c").arg(read_fd(raw)).stdout(Stdio::piped());
-    install_preserved(&mut cmd, vec![owned]);
+    register_alone(&mut cmd, |steps| steps.preserve(owned));
     let out = crate::test_spawn::output_captured(&mut cmd).expect("spawn");
     assert!(out.status.success());
     assert_eq!(String::from_utf8(out.stdout).unwrap(), "preserved");
 }
 
-/// Baseline for the previous test: the identical setup MINUS `install_preserved` must NOT
+/// Baseline for the previous test: the identical setup MINUS the preserve step must NOT
 /// survive exec (`std`'s `File`/`OwnedFd` is `FD_CLOEXEC` by default) — proves the previous
 /// test is actually exercising the CLOEXEC-clearing code path, not passing by accident (e.g.
 /// because `/bin/sh` itself happened to inherit the fd some other way).
 #[cfg(target_os = "macos")]
 #[skuld::test]
-fn without_install_preserved_the_fd_is_closed_at_exec() {
+fn without_preserve_the_fd_is_closed_at_exec() {
     let f = file_with("not-preserved");
     let owned: OwnedFd = f.into();
     let raw = owned.as_raw_fd();
@@ -229,7 +233,7 @@ fn an_i32_max_child_fd_fails_at_spawn_not_at_install() {
     let f = file_with("x");
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-c").arg("true").stdout(Stdio::piped());
-    install(
+    install_on(
         &mut cmd,
         vec![FdMapping {
             parent_fd: f.into(),
@@ -264,8 +268,8 @@ fn an_out_of_range_but_representable_child_fd_fails_at_spawn_not_at_install() {
     cmd.arg("-c").arg("true").stdout(Stdio::piped());
 
     // SAFETY: `pre_exec` runs post-fork, pre-exec, in the child only; `setrlimit` is a checked,
-    // non-allocating raw syscall. Registered BEFORE `install` below, since `install` documents
-    // that its own hook must be registered LAST.
+    // non-allocating raw syscall. Registered BEFORE `install_on` below, since the fd map's step
+    // runs last (see `InChild`).
     unsafe {
         cmd.pre_exec(|| {
             let lim = libc::rlimit {
@@ -279,7 +283,7 @@ fn an_out_of_range_but_representable_child_fd_fails_at_spawn_not_at_install() {
         });
     }
 
-    install(
+    install_on(
         &mut cmd,
         vec![FdMapping {
             parent_fd: f.into(),
@@ -319,10 +323,9 @@ fn a_distant_high_target_does_not_inflate_every_other_temporary_past_a_tight_rli
         .arg(format!("{}; {}", read_fd(b_raw), read_fd(a_raw)))
         .stdout(Stdio::piped());
 
-    // Lower the CHILD's RLIMIT_NOFILE to 256 before `install`'s own pre_exec hook runs.
-    // `pre_exec` hooks run in registration order, and `install` documents that its own hook
-    // must be registered LAST — so registering this one first mirrors that same ordering
-    // constraint containment hooks rely on in production.
+    // Lower the CHILD's RLIMIT_NOFILE to 256 before the fd map's hook runs. `pre_exec` hooks run
+    // in registration order, and the fd map's step runs last — so registering this one first
+    // mirrors the order containment steps rely on in production.
     unsafe {
         cmd.pre_exec(|| {
             let lim = libc::rlimit {
@@ -336,7 +339,7 @@ fn a_distant_high_target_does_not_inflate_every_other_temporary_past_a_tight_rli
         });
     }
 
-    install(
+    install_on(
         &mut cmd,
         vec![
             FdMapping {
@@ -403,7 +406,7 @@ fn a_source_starting_below_fd_3_is_moved_before_stdio_dup2_can_clobber_it() {
         ))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    install(
+    install_on(
         &mut cmd,
         vec![FdMapping {
             parent_fd: owned,
@@ -456,7 +459,7 @@ fn a_relocated_low_parent_fd_stays_open_in_the_parent_until_std_cmd_drops() {
 
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-c").arg("true");
-    install(
+    install_on(
         &mut cmd,
         vec![FdMapping {
             parent_fd: owned,

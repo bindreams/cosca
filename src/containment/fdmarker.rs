@@ -522,26 +522,29 @@ pub(crate) struct PreparedMarker {
     /// letting `Marker` re-assert "this really is still my pipe" at sweep time without
     /// depending on the write side's state.
     pub read_handle: u64,
-    /// The descriptor number the marker occupies in the child (`fd_map::install_preserved` does
-    /// not renumber, so it is the parent's number too).
+    /// The descriptor number the marker occupies in the child (`fd_map::preserve` does not
+    /// renumber, so it is the parent's number too).
     #[cfg_attr(not(test), allow(dead_code, reason = "read only by tests"))]
     pub fd: RawFd,
 }
 
-/// Create the marker pipe and hand its write end to `std_cmd`. `reserved` is every child fd
+/// Create the marker pipe and hand its write end to `steps`. `reserved` is every child fd
 /// number the spawn will `dup2` into (the caller's `fd()` mappings).
 ///
-/// `fd_map::install_preserved` registers a `pre_exec` hook that clears `FD_CLOEXEC` on the
-/// descriptor **in the forked child only**, so the supervisor's copy stays CLOEXEC and is never
-/// inherited by a concurrent, unrelated spawn's EXEC'D process image. `std_cmd` retains
-/// ownership of (and does not close) the write end until the `Command` itself is dropped — so
-/// the CALLER must drop `std_cmd` promptly after `.spawn()` returns to bound the (documented,
+/// The step clears `FD_CLOEXEC` on the descriptor **in the forked child only**, so the
+/// supervisor's copy stays CLOEXEC and is never inherited by a concurrent, unrelated spawn's
+/// EXEC'D process image. `steps`, and the `Command` it is registered on, own (and do not close)
+/// the write end until the `Command` itself is dropped — so the CALLER must drop it promptly
+/// after `.spawn()` returns to bound the (documented,
 /// non-zero) window where a truly concurrent `fork()` in this same process could transiently see
 /// this fd before its own `exec`; see the module docs.
 ///
 /// `None` on any failure — the caller falls back to the pre-existing mechanism rather than
 /// failing the spawn.
-pub(crate) fn install(std_cmd: &mut std::process::Command, reserved: &[RawFd]) -> Option<PreparedMarker> {
+pub(crate) fn install(
+    steps: &mut crate::child::spawn::in_child::InChild,
+    reserved: &[RawFd],
+) -> Option<PreparedMarker> {
     let (read, write) = match create_pipe() {
         Ok(p) => p,
         Err(e) => {
@@ -631,7 +634,7 @@ pub(crate) fn install(std_cmd: &mut std::process::Command, reserved: &[RawFd]) -
         return None;
     }
 
-    crate::child::spawn::fd_map::install_preserved(std_cmd, vec![write]);
+    steps.preserve(write);
     Some(PreparedMarker {
         read: OwnedFd::from(read),
         handle,

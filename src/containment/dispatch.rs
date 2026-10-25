@@ -868,7 +868,8 @@ pub(crate) fn windows_contain_setup(req: &ContainRequest, is_root: bool) -> Wind
     }
 }
 
-/// Phase 1 (before spawn): env-marker root detection + pre-spawn OS setup.
+/// Phase 1 (before spawn): env-marker root detection + pre-spawn OS setup. On Unix, what the child
+/// does for itself between `fork` and `exec` goes into `steps`, which the caller registers.
 ///
 /// `reserved_fds` and `marker_suppressed` drive the macOS fd-marker install only; every
 /// other platform ignores them. `flags` is the caller's creation-flag request, which only
@@ -880,6 +881,7 @@ pub(crate) fn windows_contain_setup(req: &ContainRequest, is_root: bool) -> Wind
 /// flags too.
 pub(crate) fn prepare(
     std_cmd: &mut std::process::Command,
+    #[cfg(unix)] steps: &mut crate::child::spawn::in_child::InChild,
     req: &ContainRequest,
     #[cfg_attr(
         not(windows),
@@ -977,7 +979,7 @@ pub(crate) fn prepare(
             match unix_setup_for(mode) {
                 UnixSetup::Session => {
                     // Session: setsid only — no process_group(0) (would EPERM).
-                    crate::containment::unix::set_session(std_cmd);
+                    crate::containment::unix::set_session(steps);
                     return Ok(Prepared {
                         mode,
                         is_root,
@@ -1010,22 +1012,13 @@ pub(crate) fn prepare(
                 }
             };
             if let Some(ref l) = leaf {
-                // Wire the pre_exec self-placement. The closure captures the raw
-                // fd integer (Copy) — not the leaf itself (which stays in Prepared).
-                // A failed placement (e.g. EBUSY — "no internal processes" rule) returns Ok,
-                // so the spawn proceeds and `attach` falls back to the already-configured
-                // process group. Only a report the child cannot send fails the spawn. Both the
-                // sync and the tokio spawn register this one closure through `prepare`.
-                // Safety: pre_exec runs post-fork, pre-exec; the function is
-                // async-signal-safe (libc::write + libc::close + libc::send, no alloc).
-                let procs_fd = l.procs_fd();
-                // The child's own outcome — success, or the write's errno — is sent here; it
-                // is the only channel out of a post-fork, pre-exec address space.
-                let slot = l.placement_slot();
-                unsafe {
-                    use std::os::unix::process::CommandExt;
-                    std_cmd.pre_exec(move || crate::containment::cgroup::placement_hook(procs_fd, slot));
-                }
+                // The child's self-placement step. A failed placement (e.g. EBUSY — "no internal
+                // processes" rule) returns Ok, so the spawn proceeds and `attach` falls back to the
+                // already-configured process group. Only a report the child cannot send fails the
+                // spawn. Both the sync and the tokio spawn add this one step through `prepare`.
+                // SAFETY: the leaf, which owns both the fd and the report channel, stays in
+                // `Prepared` until after the spawn.
+                unsafe { steps.place(l.procs_fd(), l.placement_slot()) };
             }
             return Ok(Prepared {
                 mode,
@@ -1046,7 +1039,7 @@ pub(crate) fn prepare(
     #[cfg(all(unix, not(target_os = "linux")))]
     if is_root && mode.is_some() {
         match unix_setup_for(mode) {
-            UnixSetup::Session => crate::containment::unix::set_session(std_cmd),
+            UnixSetup::Session => crate::containment::unix::set_session(steps),
             UnixSetup::ProcessGroup => crate::containment::unix::set_process_group(std_cmd),
             UnixSetup::None => {} // TreeWalk: no pre-spawn grouping (identity teardown)
         }
@@ -1058,7 +1051,7 @@ pub(crate) fn prepare(
     // on any failure rather than failing the spawn.
     #[cfg(target_os = "macos")]
     let marker = if crate::containment::fdmarker::marker_wanted(mode, is_root, marker_suppressed) {
-        crate::containment::fdmarker::install(std_cmd, reserved_fds)
+        crate::containment::fdmarker::install(steps, reserved_fds)
     } else {
         None
     };
