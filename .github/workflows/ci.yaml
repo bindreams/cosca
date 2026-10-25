@@ -162,7 +162,9 @@ jobs:
             runner: ubuntu-26.04
             # ubuntu:26.04
             root_image: ubuntu@sha256:f144425ff09be612d6d9ad965196e9cdc23dae1f42110a8a11a3e9a8198759f7
-            timeout: 35
+            # 1.5x the slowest measured run, as for the Windows lanes: about 35.6 min uncut (run 39997276335,
+            # cancelled at the old 35, with a 9.5 min virtme-ng install).
+            timeout: 54
             target: x86_64-unknown-linux-gnu
             other: aarch64-unknown-linux-gnu
             nextest: exec python3 .github/scripts/run-nextest.py
@@ -253,8 +255,8 @@ jobs:
         timeout-minutes: 8
         run: ${{ matrix.nextest }} tests cargo nextest run --locked --target ${{ matrix.target }}
 
-      # The one Windows test that maps a drive letter (`DefineDosDeviceW`, visible to the whole
-      # logon session) is the `DRIVE_MAPPING` group, off everywhere else.
+      # The Windows tests that map a drive letter (`DefineDosDeviceW`, visible to the whole logon
+      # session) are the `DRIVE_MAPPING` group, off everywhere else.
       - name: Run the drive-mapping test (Windows)
         if: matrix.os == 'windows'
         timeout-minutes: 8
@@ -1033,6 +1035,8 @@ jobs:
       - name: "Shim on Linux: install virtme-ng and allow KVM"
         id: shim_vng
         if: ${{ !cancelled() && matrix.os == 'linux' && matrix.arch == 'amd64' }}
+        # Installs take up to 9.5 min; bounds a hung apt or pipx.
+        timeout-minutes: 15
         shell: bash
         env:
           VIRTME_NG_VERSION: "1.30"

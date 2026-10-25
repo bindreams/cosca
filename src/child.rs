@@ -305,8 +305,11 @@ impl Child {
     /// passes still leaves a window in which the signal lands on a pid launchd has since reused.
     ///
     /// A root the handle cannot vouch for (`Unknown`: a failed peek or an unreadable unique id) is
-    /// still killed through the handle: on Linux its pidfd, which names it whoever reaped it; on
-    /// macOS its pid, only while the pid's unique id is still the one read at spawn.
+    /// still killed through the handle on Linux: its pidfd names it whoever reaped it. macOS has
+    /// no such handle, so there this root, like any other, is signalled by pid after a check that
+    /// the pid still has the unique id read at spawn. A root whose unique id was never adopted, or
+    /// cannot be read again, is sent nothing. A reap by another reaper between that check and the
+    /// send is not seen, and the signal then goes to whatever process holds the number.
     pub fn kill(&self) -> Result<(), Error> {
         #[cfg(unix)]
         {
@@ -1188,8 +1191,9 @@ impl Child {
     ///
     /// Nothing that names the tree by the root's number runs once the root is reaped, or when its
     /// handle cannot say: the handle's own answer (`RootState`), or the number no longer reading
-    /// as this root. A foreign reap landing after the read is the accepted gap. An unreaped root
-    /// stays a zombie, pinning its number, until `teardown_on_drop`.
+    /// as this root. A foreign reap after the read is not seen: if the number is then reused, what
+    /// is sent by it reaches whatever process holds it. An unreaped root stays a zombie, pinning its
+    /// number, until `teardown_on_drop`.
     fn drop_unix(&mut self) -> crate::error::ChildFate {
         use crate::child::drop_report::DropReport;
         use crate::error::ChildFate;

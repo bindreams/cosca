@@ -696,9 +696,9 @@ impl Child {
 
     /// Hard-kill the (lone) child. On Linux the signal goes through the pidfd the spawn holds, and
     /// on Windows through the process handle, so neither can race a recycled pid; a refused
-    /// `pidfd_open` cannot fail it. macOS has no such handle: it sends by pid, only while the pid
-    /// still has the unique id read at spawn, and a reap by someone else between that check and the
-    /// send is an accepted gap.
+    /// `pidfd_open` cannot fail it. macOS has no such handle: it sends by pid after a check that the
+    /// pid still has the unique id read at spawn. A reap by another reaper between that check and
+    /// the send is not seen, and the signal then goes to whatever process holds the number.
     /// `Ok(())` if the child already exited, was reaped by a prior `wait`, or was reaped by someone
     /// else.
     /// Signal-only: does not reap — `wait().await` (or `Drop`) collects the exit status.
@@ -1275,6 +1275,17 @@ mod child_wait_tree_tests;
 #[path = "child_kill_tree_view_tests.rs"]
 mod child_kill_tree_view_tests;
 
+#[cfg(all(test, target_os = "linux"))]
+impl Child {
+    /// Test-only: the path of the cgroup leaf this child holds, if any.
+    pub(crate) fn leaf_path_for_test(&self) -> Option<std::path::PathBuf> {
+        match &self.os.attached {
+            crate::containment::Attached::Cgroup(leaf) => Some(leaf.path().to_path_buf()),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(all(test, windows))]
 impl Child {
     /// Test-only: install the per-instance raw-wait observer on this child (see the raw backend's
@@ -1810,8 +1821,10 @@ fn signal_on_drop(
     //
     // On Unix, nothing that names the tree by the root's number runs once the root is reaped:
     // this handle's own state, or the number no longer reading as this root (tokio's state cannot
-    // see a foreign reap until it is polled). Accepted gaps: a foreign reap landing after `view`
-    // was read, and tokio's orphan queue reaping by number afterwards.
+    // see a foreign reap until it is polled). A foreign reap after `view` was read is not seen: if
+    // the number is then reused, what is sent by it reaches whatever process holds it. Tokio's
+    // orphan queue reaps by number afterwards, and may collect another child of this process that
+    // took the number.
     #[cfg(unix)]
     let tree = {
         let kill = os.attached.hard_kill_for_drop(view);

@@ -8,7 +8,7 @@ use std::process::Stdio as StdStdio;
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use crate::child::spawn::build_std_command;
-use crate::child::spawn::{dup, resolve_identity, resolve_stdio, Classify, PipeOwnership, SpawnFailure};
+use crate::child::spawn::{dup, resolve_identity, resolve_stdio, Classify, ParentStd, PipeOwnership, SpawnFailure};
 use crate::command::Command;
 use crate::error::{ChildFate, Error};
 use crate::identity::Resolved;
@@ -191,7 +191,10 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                 }
             };
             #[cfg(windows)]
-            let (child_end, parent_end) = super::stdio::owned_overlapped_pipe(dir).not_started()?;
+            let (child_end, parent_end) = {
+                let (child_end, parent_end) = super::stdio::owned_overlapped_pipe(dir).not_started()?;
+                (crate::child::spawn::ChildEnd::from(child_end), parent_end)
+            };
             // Merging slots: each gets a dup of the child end. A merging slot with
             // raw() >= 3 (Unix only — Windows routed fd >= 3 to the raw backend above) is not
             // assignable as std stdio: it joins the fd >= 3 child-ends collection the fd_map
@@ -237,7 +240,8 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
     // fd >= 3 — a stray end cannot exist by construction, so no assert/drop pairing to keep in sync.
     #[cfg(windows)]
     let all_slots: Vec<Fd> = resolve_std_slots.collect();
-    let (mut child_ends, parent_ends) = resolve_stdio(&fds, &all_slots, PipeOwnership::Deferred).not_started()?;
+    let (mut child_ends, parent_ends) =
+        resolve_stdio(&fds, &all_slots, PipeOwnership::Deferred, ParentStd::read()).not_started()?;
     // Deferred skips only the piped STD slots; every parent end here is an fd >= 3 pipe's.
     debug_assert!(
         parent_ends.keys().all(|f| f.raw() >= 3),
@@ -766,7 +770,7 @@ fn leave_unverified_front(
 /// front's gate is decided once, before the tree's kill. The backend has run, so the program may
 /// have started.
 #[cfg(unix)]
-pub(super) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> Result<Child, SpawnFailure> {
+pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> Result<Child, SpawnFailure> {
     let Err(write_err) = written else {
         return Ok(child);
     };

@@ -32,11 +32,11 @@
 //! never mistakes a platform measurement for coverage of cosca. The canary's own string logic and
 //! verdict are tested by `windows_path_logic`, which runs by default on every host. `GetFullPathNameW` works on the string alone and touches no disk
 //! or network, so UNC and device inputs here reach no server or device. The file and spawn tests
-//! write only inside a `tempfile` directory of their own and launch only `cosca_testbin_image`,
-//! except that one canary has std create `cmd.exe` SUSPENDED and terminates it before it runs.
-//! Nothing here runs a batch file or needs elevation. Temp directories are removed on drop and
-//! planted files explicitly, but a removal failure is only printed; whatever it leaves goes with
-//! the ephemeral runner.
+//! write only inside a `tempfile` directory of their own and launch only `cosca_testbin_image`
+//! and `cosca_testbin`, except that one canary has std create `cmd.exe` SUSPENDED and terminates it
+//! before it runs, and `m7_` reaches its temp directory through `\\localhost\<drive>$`. Nothing here
+//! runs a batch file. Temp directories are removed on drop and planted files explicitly, but a
+//! removal failure is only printed; whatever it leaves goes with the ephemeral runner.
 
 #[cfg(windows)]
 #[path = "common/mod.rs"]
@@ -44,6 +44,9 @@ mod common;
 #[cfg(windows)]
 #[path = "windows_path_resolution/dots_and_spaces.rs"]
 mod dots_and_spaces;
+#[cfg(windows)]
+#[path = "windows_path_resolution/drive_rule.rs"]
+mod drive_rule;
 #[cfg(windows)]
 #[path = "windows_path_resolution/harness.rs"]
 mod harness;
