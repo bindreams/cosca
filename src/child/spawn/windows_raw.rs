@@ -12,8 +12,8 @@
 //! This backend gives a child exactly the handles cosca lists, and no other handle of this
 //! process. That rests on Microsoft's guidance:
 //!
-//! - `bInheritHandles` TRUE makes a child inherit every inheritable handle of this process
-//!   ([`CreateProcessW`], Remarks), so the inheritable flag alone cannot scope a handle to one
+//! - `bInheritHandles` TRUE with no list makes a child inherit every inheritable handle of this
+//!   process ([`CreateProcessW`], Remarks), so the inheritable flag alone cannot scope a handle to one
 //!   child ([Handle Inheritance] lists the two steps that make a handle inheritable).
 //! - `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` names the handles one child inherits; each must be
 //!   inheritable, and `bInheritHandles` must be TRUE ([`UpdateProcThreadAttribute`]).
@@ -27,7 +27,8 @@
 //!
 //! # What the list does not cover
 //!
-//! - The std route (argv-only commands) is `std::process::Command`: it passes `bInheritHandles`
+//! - The std route (a command with no `executable()` and no fd >= 3) is `std::process::Command`: it
+//!   passes `bInheritHandles`
 //!   TRUE with no list, so its child inherits every inheritable handle. That is why `spawn_lock`
 //!   is held on both routes. A raw child ignores the ends of another cosca spawn because it has a
 //!   list; a std-route spawn has none, and would take a raw spawn's ends if it ran in the window
@@ -35,9 +36,9 @@
 //! - The ends are inheritable between the mark and the close. Another spawner in this process
 //!   that passes `bInheritHandles` TRUE with no list (an application's or library's own
 //!   `CreateProcessW`) can take them in that window: `spawn_lock` orders cosca's spawns only
-//!   ([Raymond Chen, 2026]). His remedy, which cosca does not adopt, is to create the handles
-//!   non-inheritable and duplicate them into a helper process that creates the child
-//!   (`PROC_THREAD_ATTRIBUTE_PARENT_PROCESS`).
+//!   ([Raymond Chen, 2026]). His remedy, which cosca does not adopt, keeps the handles
+//!   non-inheritable here, duplicates them into a helper process, and creates the child with
+//!   that helper as its parent (`PROC_THREAD_ATTRIBUTE_PARENT_PROCESS`).
 //!
 //! `windows_raw` here is `crate::child::spawn::windows_raw`; the async backend
 //! `crate::tokio::spawn::windows_raw` has the same properties.

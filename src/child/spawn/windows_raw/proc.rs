@@ -290,9 +290,9 @@ pub(crate) fn exit_status(handle: HANDLE) -> io::Result<ExitStatus> {
 /// child inherits only the listed handles, never every inheritable handle of this process.
 /// Microsoft's guidance ([`UpdateProcThreadAttribute`]) is to pass the list with `bInheritHandles`
 /// TRUE; `STARTF_USESTDHANDLES` requires `bInheritHandles` ([`STARTUPINFOW`]), so cosca passes a
-/// list whenever it sets the flag. The list scopes the child, not the window: another spawner in this process that passes `bInheritHandles` TRUE with
-/// no list can still take a listed handle while it is inheritable. See the module doc of
-/// `child::spawn::windows_raw`.
+/// list whenever it sets the flag. The list scopes the child, not the window: another spawner in
+/// this process that passes `bInheritHandles` TRUE with no list can still take a listed handle
+/// while it is inheritable. See the module doc of `child::spawn::windows_raw`.
 ///
 /// [`UpdateProcThreadAttribute`]: https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute
 /// [`STARTUPINFOW`]: https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/ns-processthreadsapi-startupinfow
