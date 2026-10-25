@@ -4,6 +4,11 @@
 use std::ffi::OsStr;
 use std::path::Path;
 
+#[path = "../../tests/common/subst.rs"]
+mod subst;
+
+use subst::Subst;
+
 use crate::probe::{canonical, cosca_output, outcome, set_cwd, spawned, std_output, verbatim_of, Render};
 
 /// `GetFullPathNameW` on `path`, reading this process's cwd and environment.
@@ -19,57 +24,6 @@ fn gfpn(path: &OsStr) -> String {
         return format!("err={}", std::io::Error::last_os_error().raw_os_error().unwrap_or(-1));
     }
     String::from_utf16_lossy(&buf[..n as usize])
-}
-
-/// A drive letter mapped to a directory with `DefineDosDeviceW` for as long as it lives.
-struct Subst {
-    drive: String,
-    target: Vec<u16>,
-}
-
-impl Subst {
-    fn new(drive: &str, target: &Path) -> Result<Self, String> {
-        use std::os::windows::ffi::OsStrExt;
-        use windows::core::PCWSTR;
-        use windows::Win32::Storage::FileSystem::{DefineDosDeviceW, DEFINE_DOS_DEVICE_FLAGS};
-        let name: Vec<u16> = OsStr::new(drive).encode_wide().chain([0]).collect();
-        let target: Vec<u16> = target.as_os_str().encode_wide().chain([0]).collect();
-        // SAFETY: both strings are NUL-terminated and outlive the call.
-        unsafe {
-            DefineDosDeviceW(
-                DEFINE_DOS_DEVICE_FLAGS(0),
-                PCWSTR(name.as_ptr()),
-                PCWSTR(target.as_ptr()),
-            )
-        }
-        .map_err(|e| format!("{e}"))?;
-        Ok(Self {
-            drive: drive.to_owned(),
-            target,
-        })
-    }
-}
-
-impl Drop for Subst {
-    fn drop(&mut self) {
-        use std::os::windows::ffi::OsStrExt;
-        use windows::core::PCWSTR;
-        use windows::Win32::Storage::FileSystem::{DefineDosDeviceW, DDD_EXACT_MATCH_ON_REMOVE, DDD_REMOVE_DEFINITION};
-        let name: Vec<u16> = OsStr::new(&self.drive).encode_wide().chain([0]).collect();
-        // SAFETY: both strings are NUL-terminated and outlive the call.
-        let removed = unsafe {
-            DefineDosDeviceW(
-                DDD_REMOVE_DEFINITION | DDD_EXACT_MATCH_ON_REMOVE,
-                PCWSTR(name.as_ptr()),
-                PCWSTR(self.target.as_ptr()),
-            )
-        };
-        // Never a panic: this runs while unwinding too, and a second panic would abort before the
-        // report reaches the test.
-        if let Err(e) = removed {
-            eprintln!("could not remove the {} mapping: {e}", self.drive);
-        }
-    }
 }
 
 /// Sets `=<drive>` in this process's environment, or removes it for `None`.
@@ -113,9 +67,9 @@ pub fn drive_dir(base: &str, image: &str) {
     let drive = format!("{}:", letter as char);
     let _subst = match Subst::new(&drive, &d) {
         Ok(s) => s,
-        Err(e) => return println!("subst=err {e}"),
+        Err(e) => return outln!("subst=err {e}"),
     };
-    println!("cwd_set={}", outcome(&set_cwd(d.as_os_str())));
+    outln!("cwd_set={}", outcome(&set_cwd(d.as_os_str())));
     let render = Render(vec![(drive.clone(), "X:"), (d.to_str().unwrap().to_owned(), "<d>")]);
     let other = format!(r"{}\exists", d.display());
     for (label, value) in [
@@ -133,13 +87,13 @@ pub fn drive_dir(base: &str, image: &str) {
         set();
         let mut raw = cosca::Command::new();
         raw.executable(image).commandline("x").current_dir(&name);
-        println!("cosca_{label}={}", spawned(cosca_output(&mut raw), "cwd=", &render));
+        outln!("cosca_{label}={}", spawned(cosca_output(&mut raw), "cwd=", &render));
         set();
-        println!("gfpn_{label}={}", render.apply(&gfpn(OsStr::new(&name))));
-        println!("after_{label}={}", render.apply(&drive_dir_value(&drive)));
+        outln!("gfpn_{label}={}", render.apply(&gfpn(OsStr::new(&name))));
+        outln!("after_{label}={}", render.apply(&drive_dir_value(&drive)));
         set();
         let std_run = std_output(std::process::Command::new(image).current_dir(&name));
-        println!("std_{label}={}", spawned(std_run, "cwd=", &render));
+        outln!("std_{label}={}", spawned(std_run, "cwd=", &render));
     }
 }
 
@@ -147,17 +101,17 @@ pub fn drive_dir(base: &str, image: &str) {
 pub fn rooted_cwd(image: &str, render: &Render) {
     let mut raw = cosca::Command::new();
     raw.executable(image).commandline("x").current_dir(r"\x");
-    println!("cosca_rooted_cwd={}", spawned(cosca_output(&mut raw), "cwd=", render));
+    outln!("cosca_rooted_cwd={}", spawned(cosca_output(&mut raw), "cwd=", render));
     let std_run = std_output(std::process::Command::new(image).current_dir(r"\x"));
-    println!("std_rooted_cwd={}", spawned(std_run, "cwd=", render));
+    outln!("std_rooted_cwd={}", spawned(std_run, "cwd=", render));
 }
 
 /// `GetFullPathNameW` of a rooted name and of a `..` run one past the root, on this process's cwd,
 /// `depth` components below its root.
 pub fn past_the_root(depth: usize, render: &Render) {
-    println!("gfpn_rooted={}", render.apply(&gfpn(OsStr::new(r"\t.exe"))));
+    outln!("gfpn_rooted={}", render.apply(&gfpn(OsStr::new(r"\t.exe"))));
     let up = format!(r"{}t.exe", r"..\".repeat(depth + 1));
-    println!("gfpn_up_past_root={}", render.apply(&gfpn(OsStr::new(&up))));
+    outln!("gfpn_up_past_root={}", render.apply(&gfpn(OsStr::new(&up))));
 }
 
 /// `verbatim-unc <base> <image-child>`: reaches `<d>` through the `\\localhost\<drive>$` share,
@@ -189,12 +143,12 @@ pub fn verbatim_unc(base: &str, image: &str) {
     for (key, dir) in [("unc", &unc), ("vunc", &vd)] {
         let mut raw = cosca::Command::new();
         raw.executable(image).commandline("x").current_dir(dir);
-        println!("cosca_{key}_cwd={}", spawned(cosca_output(&mut raw), "cwd=", &render));
+        outln!("cosca_{key}_cwd={}", spawned(cosca_output(&mut raw), "cwd=", &render));
         let std_run = std_output(std::process::Command::new(image).current_dir(dir));
-        println!("std_{key}_cwd={}", spawned(std_run, "cwd=", &render));
+        outln!("std_{key}_cwd={}", spawned(std_run, "cwd=", &render));
     }
     let set = set_cwd(OsStr::new(&vd));
-    println!("set={}", outcome(&set));
+    outln!("set={}", outcome(&set));
     if set.is_err() {
         return;
     }
@@ -209,6 +163,6 @@ pub fn verbatim_unc(base: &str, image: &str) {
         ("written_up", format!(r"{vd}\..\t.exe")),
         ("written_past_share", format!(r"{vd}\{}", up(depth + 1))),
     ] {
-        println!("gfpn_{key}={}", render.apply(&gfpn(OsStr::new(&name))));
+        outln!("gfpn_{key}={}", render.apply(&gfpn(OsStr::new(&name))));
     }
 }

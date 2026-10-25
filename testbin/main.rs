@@ -1,12 +1,18 @@
 //! Test-only helper spawned by the crate's integration tests. std-only, with
 //! exceptions that use the `cosca` crate: the `report-nested-kill-tree` mode, to exercise
-//! the real nested-member `kill_tree` path, `spawn-dump-env-block`, to spawn through each
-//! Windows backend, and the frozen-spawn modes of `frozen.rs`. Behavior is selected by argv[1].
+//! the real nested-member `kill_tree` path, `spawn-dump-env-block` and `spawn-with-null-std`, to
+//! spawn through each Windows backend, and the frozen-spawn modes of `frozen.rs`. Behavior is
+//! selected by argv[1].
 
 #[cfg(target_os = "macos")]
 use std::io::BufRead;
 use std::io::{Read, Write};
 use std::process::exit;
+
+/// Quiet-on-broken-pipe output; declared first so its macros reach every module below.
+#[macro_use]
+#[path = "quiet_io.rs"]
+mod quiet_io;
 
 /// The accept handshake (see the module doc). On Windows `accept` below includes it, so it is
 /// declared once, there.
@@ -55,6 +61,14 @@ mod frozen;
 #[path = "env_block.rs"]
 mod env_block;
 
+#[cfg(windows)]
+#[path = "full_path.rs"]
+mod full_path;
+
+#[cfg(windows)]
+#[path = "null_std.rs"]
+mod null_std;
+
 /// `tests/elevation_pkexec_version.rs`'s fake pkexec: this binary, copied to `real/pkexec-impl`.
 /// Appends one line to `../pkexec.log` (next to `real/`): `argv[0]`, the file running (so the
 /// test sees which inode was exec'd), the arguments, and, for a launch, whether its program
@@ -66,7 +80,7 @@ fn fake_pkexec(args: &[String]) {
     let real_dir = exe.parent().expect("real/");
     let mut line = format!("argv0={} exe={} args={}", args[0], exe.display(), args[1..].join(" "));
     if args.get(1).map(String::as_str) == Some("--version") {
-        print!(
+        out!(
             "{}",
             std::fs::read_to_string(real_dir.join("version")).expect("real/version")
         );
@@ -302,23 +316,26 @@ fn main() {
         "argv0" => {
             // Print this process's argv[0] so callers can verify it.
             let argv0 = std::env::args().next().unwrap_or_default();
-            println!("{argv0}");
+            outln!("{argv0}");
         }
         "argv0-report" => {
             // Report argv[0] and the resolved image path on separate lines, so the raw backend
             // tests can prove argv[0] is independent of the executable that actually ran.
             let argv0 = std::env::args().next().unwrap_or_default();
             let image = std::env::current_exe().expect("current_exe");
-            println!("argv0={argv0}");
-            println!("image={}", image.display());
+            outln!("argv0={argv0}");
+            outln!("image={}", image.display());
         }
         "read-fd" => {
             // Copy the given CRT fd to stdout (proves an inherited fd reached the child).
             let fd: i32 = args[2].parse().unwrap();
             let mut f = file_from_fd(fd);
-            let mut out = std::io::stdout().lock();
-            std::io::copy(&mut f, &mut out).unwrap();
-            out.flush().unwrap();
+            quiet_io::copy(
+                &mut f,
+                &mut std::io::stdout().lock(),
+                "read-fd: read the fd",
+                "read-fd: write stdout",
+            );
             std::mem::forget(f); // keep the inherited fd open; do not close on exit
         }
         "write-fd" => {
@@ -336,51 +353,49 @@ fn main() {
             let fd: i32 = args[2].parse().unwrap();
             // SAFETY: isatty only queries the fd; it has no preconditions.
             let tty = unsafe { libc::isatty(fd) };
-            println!("isatty={tty}");
+            outln!("isatty={tty}");
         }
         "echo-argv" => {
-            let mut out = std::io::stdout().lock();
             for a in &args[2..] {
-                writeln!(out, "{a}").unwrap();
+                outln!("{a}");
             }
         }
         "env" => {
-            let mut out = std::io::stdout().lock();
             for name in &args[2..] {
                 let val = std::env::var(name).unwrap_or_default();
-                writeln!(out, "{name}={val}").unwrap();
+                outln!("{name}={val}");
             }
         }
-        "cwd" => println!("{}", std::env::current_dir().unwrap().display()),
+        "cwd" => outln!("{}", std::env::current_dir().unwrap().display()),
         "emit" => {
             let n_out: usize = args[2].parse().unwrap();
             let n_err: usize = args[3].parse().unwrap();
-            // Flush explicitly: these bytes have no trailing newline, so the
-            // line-buffered Stdout would otherwise hold them until process exit.
-            let mut out = std::io::stdout().lock();
-            out.write_all(&vec![b'o'; n_out]).unwrap();
-            out.flush().unwrap();
-            let mut err = std::io::stderr().lock();
-            err.write_all(&vec![b'e'; n_err]).unwrap();
-            err.flush().unwrap();
+            // Each stream is independent: a closed stdout must not skip the stderr bytes. `put`
+            // flushes, which these bytes need: with no trailing newline the line-buffered Stdout
+            // would otherwise hold them until process exit.
+            quiet_io::put_stdout(&vec![b'o'; n_out], "emit: write stdout");
+            quiet_io::put(&mut std::io::stderr().lock(), &vec![b'e'; n_err], "emit: write stderr");
         }
         "tee-both" => {
             // Copy stdin to BOTH stdout and stderr in a loop, so a parent that
             // does not pump concurrently will deadlock once a pipe buffer fills.
+            // Each stream is independent: one whose reader hung up is dropped, the other keeps
+            // its copy, and stdin is drained until EOF or until both are gone.
             let mut stdin = std::io::stdin().lock();
             let mut stdout = std::io::stdout().lock();
             let mut stderr = std::io::stderr().lock();
+            let (mut stdout_open, mut stderr_open) = (true, true);
             let mut buf = [0u8; 8192];
-            loop {
-                let n = stdin.read(&mut buf).unwrap();
+            while stdout_open || stderr_open {
+                let n = stdin
+                    .read(&mut buf)
+                    .unwrap_or_else(|e| panic!("tee-both: read stdin: {e}"));
                 if n == 0 {
                     break;
                 }
-                stdout.write_all(&buf[..n]).unwrap();
-                stderr.write_all(&buf[..n]).unwrap();
+                stdout_open = stdout_open && quiet_io::put(&mut stdout, &buf[..n], "tee-both: write stdout");
+                stderr_open = stderr_open && quiet_io::put(&mut stderr, &buf[..n], "tee-both: write stderr");
             }
-            stdout.flush().unwrap();
-            stderr.flush().unwrap();
         }
         "stdin-split-echo" => {
             // Prove the In-direction merge dup: fd 0 and fd 2 are dups of ONE pipe, so
@@ -400,24 +415,22 @@ fn main() {
                 )
             };
             let mut head = vec![0u8; n];
-            fd0.read_exact(&mut head).unwrap();
+            fd0.read_exact(&mut head).expect("stdin-split-echo: read fd 0");
             let mut tail = Vec::new();
-            fd2.read_to_end(&mut tail).unwrap();
-            let mut out = std::io::stdout().lock();
-            out.write_all(&head).unwrap();
-            out.write_all(b"|").unwrap();
-            out.write_all(&tail).unwrap();
-            out.flush().unwrap();
+            fd2.read_to_end(&mut tail).expect("stdin-split-echo: read fd 2");
+            let mut out = head;
+            out.push(b'|');
+            out.extend_from_slice(&tail);
+            quiet_io::put_stdout(&out, "stdin-split-echo: write stdout");
         }
         "emit-raw" => {
             // Write raw bytes (as hex pairs) to stdout; used to test invalid-UTF-8 handling.
             // Each arg after "emit-raw" is a 2-hex-digit byte value.
-            let mut out = std::io::stdout().lock();
-            for hex in &args[2..] {
-                let byte = u8::from_str_radix(hex, 16).unwrap();
-                out.write_all(&[byte]).unwrap();
-            }
-            out.flush().unwrap();
+            let bytes: Vec<u8> = args[2..]
+                .iter()
+                .map(|hex| u8::from_str_radix(hex, 16).unwrap())
+                .collect();
+            quiet_io::put_stdout(&bytes, "emit-raw: write stdout");
         }
         "exit" => {
             let code: i32 = args[2].parse().unwrap();
@@ -832,15 +845,15 @@ fn main() {
                 // success — including a poisoned lock, same disposition as the unset-ACK case.
                 // Nothing panics: unwinding out of an `extern "system"` fn aborts.
                 let Some(m) = ACK.get() else {
-                    eprintln!("cosca_testbin: ctrl handler fired before ACK was set");
+                    errln!("cosca_testbin: ctrl handler fired before ACK was set");
                     return BOOL(0);
                 };
                 let Ok(mut s) = m.lock() else {
-                    eprintln!("cosca_testbin: ack socket mutex poisoned");
+                    errln!("cosca_testbin: ack socket mutex poisoned");
                     return BOOL(0);
                 };
                 if let Err(e) = s.write_all(b"B").and_then(|()| s.flush()) {
-                    eprintln!("cosca_testbin: ack write failed: {e}");
+                    errln!("cosca_testbin: ack write failed: {e}");
                 }
                 BOOL(1) // handled — do not die
             }
@@ -1034,13 +1047,13 @@ fn main() {
             match c.spawn() {
                 Ok(child) => {
                     let _ = child.wait();
-                    println!("loaded");
+                    outln!("loaded");
                 }
                 Err(cosca::error::Error::Io(io)) if io.kind() == std::io::ErrorKind::NotFound => {
-                    println!("notfound");
+                    outln!("notfound");
                 }
                 Err(e) => {
-                    println!("othererr={e}");
+                    outln!("othererr={e}");
                 }
             }
         }
@@ -1070,13 +1083,13 @@ fn main() {
                 match c.spawn() {
                     Ok(mut child) => {
                         let _ = child.wait().await;
-                        println!("loaded");
+                        outln!("loaded");
                     }
                     Err(cosca::error::Error::Io(io)) if io.kind() == std::io::ErrorKind::NotFound => {
-                        println!("notfound");
+                        outln!("notfound");
                     }
                     Err(e) => {
-                        println!("othererr={e}");
+                        outln!("othererr={e}");
                     }
                 }
             });
@@ -1224,6 +1237,10 @@ fn main() {
             report_sock.flush().unwrap();
         }
         #[cfg(windows)]
+        "spawn-with-null-std" => null_std::spawn(&args[2], &args[3], &args[4]),
+        #[cfg(windows)]
+        "report-std-handles" => null_std::report(&args[2], &args[3]),
+        #[cfg(windows)]
         "dump-env-block" => env_block::dump(),
         #[cfg(windows)]
         "spawn-dump-env-block" => env_block::spawn(&args[2], &args[3..]),
@@ -1231,6 +1248,10 @@ fn main() {
         "spawn-with-env-block" => env_block::spawn_with_block(&args[2], &args[3..]),
         #[cfg(windows)]
         "try-env-block" => env_block::try_block(&args[2..]),
+        #[cfg(windows)]
+        "with-env-block" => env_block::with_block(&args[2..]),
+        #[cfg(windows)]
+        "full-path" => full_path::run(&args[2]),
         #[cfg(windows)]
         "spawn-frozen-report" => frozen::spawn_frozen_report(&args[2], &args[3]),
         #[cfg(all(windows, feature = "tokio"))]
@@ -1450,7 +1471,7 @@ fn main() {
             // setsid() actually ran and the child is its own session leader.
             // Safety: getsid(0) has no preconditions and always succeeds for pid 0.
             let sid = unsafe { libc::getsid(0) };
-            println!("{sid}");
+            outln!("{sid}");
         }
         #[cfg(unix)]
         "fd3-echo" => {
@@ -1460,7 +1481,12 @@ fn main() {
             // the only caller and it always provides a valid, open fd 3.
             use std::os::fd::FromRawFd;
             let mut f = unsafe { std::fs::File::from_raw_fd(3) };
-            std::io::copy(&mut f, &mut std::io::stdout().lock()).unwrap();
+            quiet_io::copy(
+                &mut f,
+                &mut std::io::stdout().lock(),
+                "fd3-echo: read fd 3",
+                "fd3-echo: write stdout",
+            );
         }
         #[cfg(unix)]
         "fd3-write" => {
@@ -1511,7 +1537,7 @@ fn main() {
             hold(&mut sock);
         }
         "is-elevated-report" => {
-            println!("{}", if cosca::elevation::is_elevated() { "1" } else { "0" });
+            outln!("{}", if cosca::elevation::is_elevated() { "1" } else { "0" });
         }
         // `tests/elevation.rs`: spawn `true` with elevation requested and report how the spawn was
         // elevated (`ElevatedVia`'s name).
@@ -1520,7 +1546,7 @@ fn main() {
             let mut c = cosca::Command::new();
             c.args(["true"]).elevation_auth(cosca::elevation::Auth::NonInteractive);
             let child = c.spawn().expect("spawn");
-            println!("{:?}", child.elevation().expect("elevation requested").via);
+            outln!("{:?}", child.elevation().expect("elevation requested").via);
             let status = child.wait().expect("wait for `true`");
             assert!(status.success(), "the elevated `true` failed: {status:?}");
         }
@@ -1544,16 +1570,16 @@ fn main() {
             c.elevation_backend(cosca::elevation::Backend::Pkexec)
                 .elevation_auth(cosca::elevation::Auth::Gui);
             match c.output() {
-                Ok(o) if o.status.success() => println!("OK"),
-                Ok(o) => println!("EXIT {:?}", o.status),
-                Err(cosca::error::Error::Unsupported { detail, .. }) => println!("UNSUPPORTED {detail}"),
-                Err(e) => println!("ERROR {e}"),
+                Ok(o) if o.status.success() => outln!("OK"),
+                Ok(o) => outln!("EXIT {:?}", o.status),
+                Err(cosca::error::Error::Unsupported { detail, .. }) => outln!("UNSUPPORTED {detail}"),
+                Err(e) => outln!("ERROR {e}"),
             }
         }
         #[cfg(unix)]
         "controlling-terminal" => {
             let present = cosca::elevation::controlling_terminal_present();
-            println!("{}", if present { "1" } else { "0" });
+            outln!("{}", if present { "1" } else { "0" });
         }
         // Linux PTY harness: become a session leader with no ctty (setsid), acquire the
         // inherited pty slave (fd 3) as controlling terminal (TIOCSCTTY), then probe. stdin
@@ -1568,7 +1594,7 @@ fn main() {
                 rustix::process::ioctl_tiocsctty(slave).unwrap_or_else(|e| panic!("TIOCSCTTY failed: {e}"));
             }
             let present = cosca::elevation::controlling_terminal_present();
-            println!("{}", if present { "1" } else { "0" });
+            outln!("{}", if present { "1" } else { "0" });
         }
         "write-marker" => {
             let path = &args[2];
@@ -1595,7 +1621,7 @@ fn main() {
             }
         }
         other => {
-            eprintln!("cosca_testbin: unknown mode {other:?}");
+            errln!("cosca_testbin: unknown mode {other:?}");
             exit(2);
         }
     }

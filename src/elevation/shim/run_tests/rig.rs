@@ -482,36 +482,56 @@ impl Run {
 
     /// Whether the shim still holds the write end of the pipe the program's process waits on to be
     /// released: a pipe the process holds the read end of and the shim does not, and the shim holds the
-    /// write end of.
+    /// write end of. An fd that closes mid-scan holds nothing. Both processes must be alive throughout;
+    /// either one exiting fails the scan with that, not with a verdict.
     pub(super) fn holds_the_release_pipe(&mut self) -> bool {
         let (shim, child) = (self.pid(), self.program_pid() as u32);
-        let ends = |pid: u32| -> Vec<(String, bool)> {
+        let program_pidfd = self.program_pidfd();
+        let exited = |pidfd: &OwnedFd| {
+            let mut fds = [PollFd::new(pidfd, PollFlags::IN)];
+            let zero = rustix::event::Timespec { tv_sec: 0, tv_nsec: 0 };
+            matches!(poll(&mut fds, Some(&zero)), Ok(n) if n > 0)
+        };
+        // pipefs's device, from a pipe of this process: a pipe of any process is a FIFO on that device.
+        let pipefs = {
+            let (r, _w) = std::io::pipe().expect("a pipe");
+            rustix::fs::fstat(&r).expect("fstat").st_dev
+        };
+        // Each end is a copy of the fd, taken with `pidfd_getfd`: it names the open file description that
+        // was at that fd number when it was taken, so its inode and its access mode cannot come from two
+        // different files, as two reads of a reused number could. `EBADF` means the fd closed: it holds
+        // nothing. The copy makes this process a holder of that end until the iteration drops it.
+        // That never releases anything early; at most it delays an EOF by the `fstat` and `fcntl`.
+        let ends = |pid: u32, pidfd: &OwnedFd| -> Vec<(u64, bool)> {
+            let table = std::fs::read_dir(format!("/proc/{pid}/fd"))
+                .unwrap_or_else(|e| panic!("process {pid} exited during the scan: {e}"));
             let mut ends = vec![];
-            for entry in std::fs::read_dir(format!("/proc/{pid}/fd")).expect("the fd table") {
-                let path = entry.expect("an entry").path();
-                let Ok(target) = std::fs::read_link(&path) else {
-                    continue;
+            for entry in table {
+                let entry = entry.unwrap_or_else(|e| panic!("process {pid} exited during the scan: {e}"));
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let fd: i32 = name.parse().expect("an fd number");
+                let copy = match rustix::process::pidfd_getfd(pidfd, fd, rustix::process::PidfdGetfdFlags::empty()) {
+                    Ok(copy) => copy,
+                    Err(rustix::io::Errno::BADF) => continue,
+                    Err(e) => panic!("pidfd_getfd of fd {fd} of process {pid}: {e}"),
                 };
-                let target = target.to_string_lossy().into_owned();
-                if !target.starts_with("pipe:[") {
+                let stat = rustix::fs::fstat(&copy).expect("fstat of a copy");
+                if FileType::from_raw_mode(stat.st_mode) != FileType::Fifo || stat.st_dev != pipefs {
                     continue;
                 }
-                let info = std::fs::read_to_string(format!(
-                    "/proc/{pid}/fdinfo/{}",
-                    path.file_name().expect("a name").to_string_lossy()
-                ))
-                .expect("fdinfo");
-                let flags = info
-                    .lines()
-                    .find_map(|l| l.strip_prefix("flags:"))
-                    .expect("flags")
-                    .trim();
-                let flags = u32::from_str_radix(flags, 8).expect("octal flags");
-                ends.push((target, flags & libc::O_ACCMODE as u32 == libc::O_WRONLY as u32));
+                let flags = rustix::fs::fcntl_getfl(&copy).expect("fcntl F_GETFL of a copy");
+                ends.push((stat.st_ino, flags & OFlags::ACCMODE == OFlags::WRONLY));
             }
             ends
         };
-        let (shim_ends, child_ends) = (ends(shim), ends(child));
+        let (shim_ends, child_ends) = (ends(shim, &self.pidfd), ends(child, &program_pidfd));
+        // An exited process lists an empty fd table, with no error, until it is reaped.
+        assert!(
+            !exited(&self.pidfd),
+            "the shim exited during the scan: {}",
+            self.how_it_ended()
+        );
+        assert!(!exited(&program_pidfd), "the program exited during the scan");
         child_ends
             .iter()
             .filter(|(pipe, writable)| !writable && !shim_ends.iter().any(|(p, w)| p == pipe && !w))

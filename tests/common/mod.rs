@@ -29,7 +29,15 @@ pub use accept::*;
 pub mod kevent_eintr;
 
 #[cfg(windows)]
+pub mod drive_rule;
+#[cfg(windows)]
+pub mod subst;
+
+#[cfg(windows)]
 pub mod windows_env;
+
+#[cfg(windows)]
+pub mod null_std;
 
 mod locked;
 pub use locked::*;
@@ -60,9 +68,16 @@ pub mod test_own_process;
 #[cfg(unix)]
 #[path = "../../src/test_stdio.rs"]
 pub mod test_stdio;
+// Its Windows twin, under the same name: the token pipe and fd guards above are unix-only.
+#[cfg(windows)]
+#[path = "../../src/test_own_process_windows.rs"]
+pub mod test_own_process;
 // Re-exec builder, shared with the library's tests.
 #[path = "../../src/test_reexec.rs"]
 pub mod test_reexec;
+// The role marker, argv, gate and `Completion` that both `test_own_process` modules share.
+#[path = "../../src/test_own_process_gate.rs"]
+pub mod test_own_process_gate;
 // The setuid helper check of the `SETUID` group, shared with the library's tests.
 #[cfg(unix)]
 #[path = "../../src/test_privilege/setuid.rs"]

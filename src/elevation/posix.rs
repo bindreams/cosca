@@ -570,7 +570,7 @@ impl PendingPassword {
 /// resolved argv[0] the spawn arm passes to `remap_derived_spawn_error` (`None` when no
 /// backend wraps the child, i.e. already elevated).
 pub(crate) struct PosixRewrite {
-    pub derived: Option<Command>,
+    pub derived: Command,
     pub report: Option<ElevationReport>,
     pub password_write: Option<PendingPassword>,
     pub backend_path: Option<PathBuf>,
@@ -727,7 +727,7 @@ pub(crate) fn rewrite_with_host(cmd: &mut Command, host: &Host) -> Result<PosixR
             let (mut derived, report) = super::macos::build_rewrite(cmd, launch, &osascript, arg_max)?;
             derived.set_elevation_front(super::front::front(Some(&report.via)));
             Ok(PosixRewrite {
-                derived: Some(derived),
+                derived,
                 report: Some(report),
                 password_write: None,
                 // The derived program IS osascript, so an exec failure remaps to
@@ -750,7 +750,7 @@ pub(crate) fn rewrite_with_host(cmd: &mut Command, host: &Host) -> Result<PosixR
                 derived.fds_mut().insert(slot, resolved);
             }
             Ok(PosixRewrite {
-                derived: Some(derived),
+                derived,
                 report: Some(ElevationReport {
                     via: ElevatedVia::AlreadyElevated,
                     stripped_env: stripped,
@@ -858,7 +858,7 @@ pub(crate) fn rewrite_with_host(cmd: &mut Command, host: &Host) -> Result<PosixR
             let via = ElevatedVia::Wrapped(backend);
             derived.set_elevation_front(super::front::front(Some(&via)));
             Ok(PosixRewrite {
-                derived: Some(derived),
+                derived,
                 report: Some(ElevationReport {
                     via,
                     stripped_env: stripped,

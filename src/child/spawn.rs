@@ -17,7 +17,7 @@ use crate::stdio::{Direction, Fd, ResolvedStdio};
 #[cfg(unix)]
 pub(crate) type ChildEnd = std::os::unix::io::OwnedFd;
 #[cfg(windows)]
-pub(crate) type ChildEnd = std::os::windows::io::OwnedHandle;
+pub(crate) use windows_child_end::ChildEnd;
 
 pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, SpawnFailure> {
     let child = spawn_uncommitted(cmd)?;
@@ -40,7 +40,7 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
         #[cfg(unix)]
         {
             let crate::elevation::posix::PosixRewrite {
-                derived,
+                mut derived,
                 report,
                 password_write,
                 backend_path,
@@ -48,21 +48,14 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
             // From here the child is the backend: its elevated program may outlive what happens to it.
             let wrapper = report.as_ref().is_some_and(|r| r.via.program_outlives_child());
             let spawned = (|| {
-                let mut child = match derived {
-                    // The derived program IS the backend; remap an exec failure to
-                    // BackendUnavailable ONLY when the backend path is the culprit (a bad cwd
-                    // yields the same kind and stays a plain Io). An already-elevated derived
-                    // (sanitized original) has no backend path, so it is never remapped.
-                    Some(mut derived) => {
-                        let r = spawn_unelevated(&mut derived, kill_on_drop);
-                        match backend_path.as_deref() {
-                            Some(bp) => r.map_err(|f| f.map(|e| crate::elevation::remap_derived_spawn_error(e, bp)))?,
-                            None => r?,
-                        }
-                    }
-                    // No derived command: the current POSIX `rewrite` always returns `Some` (it
-                    // sanitizes even the already-elevated case into a derived), so this is defensive.
-                    None => spawn_unelevated(cmd, kill_on_drop)?,
+                // The derived program IS the backend; remap an exec failure to
+                // BackendUnavailable ONLY when the backend path is the culprit (a bad cwd
+                // yields the same kind and stays a plain Io). An already-elevated derived
+                // (sanitized original) has no backend path, so it is never remapped.
+                let r = spawn_unelevated(&mut derived, kill_on_drop);
+                let mut child = match backend_path.as_deref() {
+                    Some(bp) => r.map_err(|f| f.map(|e| crate::elevation::remap_derived_spawn_error(e, bp)))?,
+                    None => r?,
                 };
                 // Set the elevation report BEFORE handling the deferred password: a cleanup
                 // kill() in the write-failure path must see the elevated state so an EPERM maps
@@ -398,7 +391,8 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         }
         v
     };
-    let (mut child_ends, parent_ends) = resolve_stdio(&fds, &all_slots, PipeOwnership::Owned).not_started()?;
+    let (mut child_ends, parent_ends) =
+        resolve_stdio(&fds, &all_slots, PipeOwnership::Owned, ParentStd::read()).not_started()?;
 
     // Hand 0/1/2 child ends to std (consumes them; std closes its copies on spawn).
     for slot in std_slots {
@@ -447,44 +441,50 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     // code can close.
     #[cfg(target_os = "macos")]
     let (mut prepared, child, unique) = {
-        let _guard = spawn_lock();
-        let prepared = crate::containment::prepare(
-            &mut std_cmd,
-            &cmd.contain_request(),
-            cmd.flags_request(),
-            &reserved,
-            cmd.fd_marker_suppressed(),
-            cmd.env_ops(),
-        )
-        .not_started()?;
-        let report = report.open(&_guard).not_started()?;
+        let (prepared, spawned, first) = {
+            let _guard = spawn_lock();
+            let prepared = crate::containment::prepare(
+                &mut std_cmd,
+                &cmd.contain_request(),
+                cmd.flags_request(),
+                &reserved,
+                cmd.fd_marker_suppressed(),
+                cmd.env_ops(),
+            )
+            .not_started()?;
+            let report = report.open(&_guard).not_started()?;
 
-        // On Unix, hand n>=3 child ends to fd_map. This installs a pre_exec hook
-        // that dup2's each OwnedFd to its target number post-fork. It is registered
-        // LAST (after `prepare` above) so its dup2 cannot clobber the cgroup
-        // self-placement fd; std also dup2's 0/1/2 before any pre_exec runs (std
-        // disables posix_spawn when hooks are registered), so our n>=3 mappings never
-        // clobber the std stdio fds either. A duplicate child fd number is unreachable:
-        // child_ends keys come from a BTreeMap, so each child fd number is unique.
-        let mappings: Vec<fd_map::FdMapping> = child_ends
-            .into_iter()
-            .map(|(fd, owned)| fd_map::FdMapping {
-                parent_fd: owned,
-                child_fd: fd.raw(),
-            })
-            .collect();
-        fd_map::install(&mut std_cmd, mappings).not_started()?;
+            // On Unix, hand n>=3 child ends to fd_map. This installs a pre_exec hook
+            // that dup2's each OwnedFd to its target number post-fork. It is registered
+            // LAST (after `prepare` above) so its dup2 cannot clobber the cgroup
+            // self-placement fd; std also dup2's 0/1/2 before any pre_exec runs (std
+            // disables posix_spawn when hooks are registered), so our n>=3 mappings never
+            // clobber the std stdio fds either. A duplicate child fd number is unreachable:
+            // child_ends keys come from a BTreeMap, so each child fd number is unique.
+            let mappings: Vec<fd_map::FdMapping> = child_ends
+                .into_iter()
+                .map(|(fd, owned)| fd_map::FdMapping {
+                    parent_fd: owned,
+                    child_fd: fd.raw(),
+                })
+                .collect();
+            fd_map::install(&mut std_cmd, mappings).not_started()?;
 
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "spawn_lock is held by `_guard`, taken at the top of this block"
-        )]
-        let (spawned, unique) = report.run(|| std_cmd.spawn().map_err(Error::Io));
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "spawn_lock is held by `_guard`, taken at the top of this block"
+            )]
+            let (spawned, first) = report.run(|| std_cmd.spawn().map_err(Error::Io), |c| Some(c.id()));
+            drop(std_cmd);
+            (prepared, spawned, first)
+        };
+        // Outside the lock, which covers only the window before the ends are close-on-exec: the wait
+        // for a report the first read missed has no bound.
+        let unique = first.finish();
         // std collected the child of a spawn it failed, which never ran the program.
         let c = spawned
             .map_err(|e| unique_report::failed_spawn_error(e, &unique))
             .not_started()?;
-        drop(std_cmd);
         (prepared, c, unique)
     };
     // Linux holds the child before `exec` until the parent has its pidfd; see `pidfd_handshake`.
@@ -575,7 +575,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     #[cfg(target_os = "macos")]
     let unique = match unique_report::adopted_id(unique, child.id()) {
         Ok(unique) => unique,
-        Err(not_adopted) => return Err(abandon_unadopted(child, not_adopted, front)),
+        Err(not_adopted) => return Err(abandon_unadopted(child, not_adopted, front, prepared)),
     };
     // A front's leaf subtree, captured while it exists: a failure arm drops the leaf, killing it.
     #[cfg(target_os = "linux")]
@@ -744,19 +744,28 @@ fn leave_front_after_attach_failure(child: std::process::Child) -> FrontFate {
 /// Dropping the `std` `Child` closes our pipe ends only.
 #[cfg(target_os = "macos")]
 fn teardown_after_attach_failure(child: std::process::Child, unique: u64, id: ProcessId) -> ChildFate {
-    let fate = kill_and_reap_verified(child.id(), unique, Some(id));
+    let fate = kill_and_reap_verified(child.id(), unique, Some(id), ZOMBIE_NOTE);
     drop(child);
     fate
 }
 
 /// The kill and reap of [`teardown_after_attach_failure`], for a child by its pid, whoever holds its
 /// handle. `id` is its identity, if one was read. What it cannot do is one event, so one `warn`
-/// carries every note (a verified foreign reap is a `debug`).
+/// carries every note (a verified foreign reap is a `debug`). `left_running` is the caller's note of
+/// what becomes of a child this leaves running.
 #[cfg(target_os = "macos")]
-pub(crate) fn kill_and_reap_verified(pid: u32, unique: u64, id: Option<ProcessId>) -> ChildFate {
+pub(crate) fn kill_and_reap_verified(pid: u32, unique: u64, id: Option<ProcessId>, left_running: &str) -> ChildFate {
     let mut notes = Vec::new();
     let mut breach = None;
-    let fate = kill_and_reap_noting(pid, unique, id, &mut notes, &mut breach);
+    let (fate, kill) = kill_and_reap_noting(pid, unique, id, None, &mut notes, &mut breach, |_| {});
+    match kill {
+        KillOutcome::Refused(why) => notes.insert(0, format!("could not be killed: {why}")),
+        KillOutcome::Unverified => notes.insert(0, UNVERIFIED.to_owned()),
+        KillOutcome::Delivered | KillOutcome::NotSent => {}
+    }
+    if matches!(fate, ChildFate::Running { .. }) {
+        notes.push(left_running.to_owned());
+    }
     if !notes.is_empty() {
         log::warn!("spawn teardown: pid {pid} {}", notes.join("; "));
     }
@@ -765,52 +774,372 @@ pub(crate) fn kill_and_reap_verified(pid: u32, unique: u64, id: Option<ProcessId
     fate
 }
 
+/// What a teardown that leaves its child running leaves behind, when nothing holds the child's handle.
+#[cfg(target_os = "macos")]
+const ZOMBIE_NOTE: &str = "is left unreaped: it stays a zombie once it exits";
+
+/// What became of the kill of a teardown.
+#[cfg(target_os = "macos")]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum KillOutcome {
+    /// `SIGKILL` was sent.
+    Delivered,
+    /// The id check found the child gone or its pid another process's: nothing was sent.
+    NotSent,
+    /// The child could not be verified, so nothing was sent.
+    Unverified,
+    /// The kill failed with this error; the child was not signalled.
+    Refused(String),
+}
+
+/// What [`kill_and_reap_unreported`] did, before the event's one `warn`.
+#[cfg(target_os = "macos")]
+pub(crate) struct Unreported {
+    pub(crate) fate: ChildFate,
+    kill: KillOutcome,
+    notes: Vec<String>,
+    breach: Option<String>,
+}
+
+/// Kills and reaps `pid`, a child whose unique id `unique` arrived only after its spawn returned. Its
+/// exec cannot be confirmed, so it is torn down through the id, as the other post-spawn failures are,
+/// with its tree through `prepared`, its containment:
+/// 1. the tree, while the root is alive, so a walk from it still finds its descendants (the walk's
+///    own kill reaches the root first);
+/// 2. the root, so it can add no member after its kill lands (a `setsid`, an `exec`, a fork);
+/// 3. once the root is an unreaped zombie, whose pid still names its group, the tree again, for what
+///    it added before it died: a child held between its report and a `setsid` escapes the first
+///    `killpg`;
+/// 4. the root's reap.
+///
+/// The root's wait is unbounded. With `warn_after`, it logs one `warn` naming `pid` once the wait
+/// passes that long, and goes on waiting: the threshold is a message, never a decision. Otherwise it
+/// warns nothing: [`Unreported::warn`] does, once.
+#[cfg(target_os = "macos")]
+pub(crate) fn kill_and_reap_unreported(
+    pid: u32,
+    unique: u64,
+    prepared: crate::containment::Prepared,
+    warn_after: Option<std::time::Duration>,
+) -> Unreported {
+    #[cfg(test)]
+    fault::run_at(fault::SpawnPoint::BeforeLateTeardown, pid);
+    let mut tree = LateTree::attach(pid, unique, prepared);
+    tree.kill(Sweep::RootAlive);
+    #[cfg(test)]
+    fault::run_at(fault::SpawnPoint::BeforeLateRootKill, pid);
+    let mut notes = Vec::new();
+    let mut breach = None;
+    let (fate, kill) = kill_and_reap_noting(pid, unique, tree.id, warn_after, &mut notes, &mut breach, |zombie| {
+        tree.kill(Sweep::RootKilled { zombie })
+    });
+    let mut owed = std::mem::take(&mut tree.notes);
+    owed.extend(tree.failure_note());
+    notes.splice(0..0, owed);
+    Unreported {
+        fate,
+        kill,
+        notes,
+        breach,
+    }
+}
+
+/// Which sweep of a late child's tree [`LateTree::kill`] runs.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy)]
+enum Sweep {
+    /// Before the root's kill, while its identity is fresh from [`LateTree::attach`].
+    RootAlive,
+    /// After the root's kill. `zombie`: the root is shown an unreaped zombie of ours, so its pid
+    /// still names it and its group.
+    RootKilled { zombie: bool },
+}
+
+/// What can reach the tree of a child whose report came late.
+#[cfg(target_os = "macos")]
+enum Reach {
+    /// No tree of its own: uncontained, or a nested member of another root's.
+    None,
+    /// The containment, attached to the root, whose identity was read and shown ours.
+    Attached(crate::containment::Attached),
+    /// The root is not shown ours, so nothing may name the tree by its pid: only the fd marker's
+    /// holders, which the kernel names by the marker pipe, can be reached.
+    Holders(crate::containment::fdmarker::Marker),
+}
+
+/// The tree of a child whose report came late, and the notes its sweeps owe the teardown's `warn`.
+#[cfg(target_os = "macos")]
+struct LateTree {
+    reach: Reach,
+    /// The root's identity, when the attach read it.
+    id: Option<ProcessId>,
+    /// The first sweep's failure. No later sweep is shown to reach what it missed, so none clears it:
+    /// the root's kill reparents its descendants out of a walk from its pid, a member that refused the
+    /// kill can leave the group, and a holder can close its marker.
+    failed: Option<String>,
+    /// Whether a sweep succeeded after `failed`, and none failed since.
+    succeeded_after: bool,
+    /// What the sweeps could not do.
+    notes: Vec<String>,
+}
+
+#[cfg(target_os = "macos")]
+impl LateTree {
+    /// Reads the identity of `pid` and checks it against `unique`, then attaches `prepared` to it.
+    /// A root that is gone or not shown ours keeps only its marker's holders, when it has a marker.
+    /// A foreign reap after the check is the gap `Child::drop`'s tree kill accepts too.
+    fn attach(pid: u32, unique: u64, prepared: crate::containment::Prepared) -> LateTree {
+        use crate::identity::Resolved;
+        let mut tree = LateTree {
+            reach: Reach::None,
+            id: None,
+            failed: None,
+            succeeded_after: false,
+            notes: Vec::new(),
+        };
+        if prepared.mode.is_none() || !prepared.is_root {
+            return tree;
+        }
+        let (resolved, mut why) = resolve_identity(pid, &crate::wait::exit_only::Target::pid(pid, Some(unique)));
+        let unshown = match resolved {
+            Resolved::Found(id) => {
+                tree.id = Some(id);
+                match attach_or_fault(id, prepared) {
+                    Ok(attachment) => tree.reach = Reach::Attached(attachment.attached),
+                    Err(e) => {
+                        assert_attach_cannot_fail(&e);
+                        tree.notes.push(format!("its tree was not killed: {e}"));
+                    }
+                }
+                return tree;
+            }
+            Resolved::Gone => "the child is gone, or is not ours",
+            Resolved::Unknown => "the child's identity could not be read",
+        };
+        match prepared.marker {
+            Some(marker) => {
+                tree.notes.push(why.fold(format!(
+                    "{unshown}, so its tree is reached only through its marker's holders, not its process group \
+                     or the processes its pid parents"
+                )));
+                tree.reach = Reach::Holders(crate::containment::fdmarker::Marker::without_root(marker));
+            }
+            None => tree.notes.push(why.fold(format!("its tree was not killed: {unshown}"))),
+        }
+        tree
+    }
+
+    /// Runs `sweep`.
+    fn kill(&mut self, sweep: Sweep) {
+        use crate::containment::Attached;
+        match (&self.reach, sweep) {
+            (Reach::None, _) => {}
+            (Reach::Attached(attached), Sweep::RootAlive | Sweep::RootKilled { zombie: true }) => {
+                let result = match attached.hard_kill_report() {
+                    (Err(e), _) => Err(e.to_string()),
+                    (Ok(()), false) => Err("a member could not be killed".to_owned()),
+                    (Ok(()), true) => Ok(()),
+                };
+                self.fold(result);
+            }
+            // The root is not shown ours any more: only the holders, and never the root.
+            (Reach::Attached(Attached::FdMarker(m)), Sweep::RootKilled { zombie: false }) => {
+                if let Err(e) = m.hard_kill_holders_only(m.root()) {
+                    self.notes
+                        .push(format!("its marker's holders were not all killed after its kill: {e}"));
+                }
+                self.notes.push(NOT_SWEPT_AGAIN.to_owned());
+            }
+            (Reach::Attached(_), Sweep::RootKilled { zombie: false }) => self.notes.push(NOT_SWEPT_AGAIN.to_owned()),
+            (Reach::Holders(m), _) => {
+                let result = m.hard_kill_holders_only(None).map_err(|e| e.to_string());
+                self.fold(result);
+            }
+        }
+    }
+
+    /// Folds a sweep's result into [`failed`](Self::failed).
+    fn fold(&mut self, result: Result<(), String>) {
+        match (result, &self.failed) {
+            (Err(e), None) => self.failed = Some(e),
+            (Err(_), Some(_)) => self.succeeded_after = false,
+            (Ok(()), failed) => self.succeeded_after = failed.is_some(),
+        }
+    }
+
+    /// The `warn`'s note for a sweep that failed.
+    fn failure_note(&mut self) -> Option<String> {
+        let failed = self.failed.take()?;
+        Some(if self.succeeded_after {
+            format!(
+                "its tree may not be fully killed: a kill of it failed ({failed}), and the later one that succeeded \
+                 cannot be shown to reach what that one missed"
+            )
+        } else {
+            format!("its tree was not fully killed: {failed}")
+        })
+    }
+}
+
+/// The note of a tree whose root was not shown an unreaped zombie once its kill was tried.
+#[cfg(target_os = "macos")]
+const NOT_SWEPT_AGAIN: &str = "it was not shown an unreaped zombie, so its tree was not killed again by its pid: what \
+                               it started after the first kill of its tree may be left running";
+
+/// What a teardown says of a child it could not verify.
+#[cfg(target_os = "macos")]
+const UNVERIFIED: &str = "could not be verified, so it was not signalled";
+
+/// The one `warn` of a spawn whose child's report came late (see [`Report::Late`]).
+#[cfg(target_os = "macos")]
+const LATE: &str = "was spawned while at least two of this process's descriptors 0 to 2 were closed, so its exec \
+                    cannot be confirmed and the program may have started; it was not adopted";
+
+/// The sentence for what a teardown did, built from the kill and the fate, so that each is said only
+/// when it happened.
+#[cfg(target_os = "macos")]
+fn said(kill: &KillOutcome, fate: ChildFate) -> String {
+    let sent = match kill {
+        KillOutcome::Delivered => "was sent SIGKILL".to_owned(),
+        KillOutcome::NotSent => "was gone, or its pid names another process, so nothing was sent".to_owned(),
+        KillOutcome::Unverified => UNVERIFIED.to_owned(),
+        KillOutcome::Refused(why) => format!("could not be killed ({why})"),
+    };
+    let state = match fate {
+        ChildFate::Reaped => "it was reaped",
+        ChildFate::Killed => "its status was not collected",
+        ChildFate::Running { .. } => "it is still running",
+        ChildFate::Gone => "it is gone, or was reaped by someone else",
+        ChildFate::Unknown => "what became of it is unknown",
+    };
+    format!("{sent}; {state}")
+}
+
+#[cfg(target_os = "macos")]
+impl Unreported {
+    /// The event's one `warn`: what happened to child `pid`. `tail` is what the caller did with the
+    /// handle it holds, if that is worth saying (a forget's leak, a child left unreaped).
+    pub(crate) fn warn(self, pid: u32, tail: Option<&str>) -> ChildFate {
+        let mut line = format!("child {pid} {LATE}, and {}", said(&self.kill, self.fate));
+        // `said` already says so, from the fate.
+        for note in self.notes.iter().filter(|note| *note != "is still running") {
+            line.push_str("; ");
+            line.push_str(note);
+        }
+        if let Some(tail) = tail {
+            line.push_str("; ");
+            line.push_str(tail);
+        }
+        log::warn!("{line}");
+        // After the log: an assertion that fires first would take the warn with it.
+        debug_assert!(self.breach.is_none(), "{}", self.breach.unwrap_or_default());
+        self.fate
+    }
+
+    /// What the sync spawn says of a child it leaves behind, when it is still running.
+    pub(crate) fn zombie_tail(&self) -> Option<&'static str> {
+        matches!(self.fate, ChildFate::Running { .. }).then_some(ZOMBIE_NOTE)
+    }
+}
+
+/// The one `warn` for an elevation front whose report came late: it is sent nothing and left unreaped
+/// (it stays a zombie once it exits), whatever the id says.
+#[cfg(target_os = "macos")]
+pub(crate) fn warn_late_front(pid: u32, tail: Option<&str>) {
+    let tail = tail.map_or_else(String::new, |tail| format!("; {tail}"));
+    log::warn!(
+        "child {pid} {LATE}; it is an elevation front, so nothing was sent to it and it is left unreaped: it stays a \
+         zombie once it exits{tail}"
+    );
+}
+
+/// `warn_after`: see [`kill_and_reap_unreported`].
 #[cfg(target_os = "macos")]
 fn kill_and_reap_noting(
     pid: u32,
     unique: u64,
     id: Option<ProcessId>,
+    warn_after: Option<std::time::Duration>,
     notes: &mut Vec<String>,
     breach: &mut Option<String>,
-) -> ChildFate {
+    after_kill: impl FnOnce(bool),
+) -> (ChildFate, KillOutcome) {
     use crate::signal::{via_verified_pid, Sent, Sig};
-    use crate::wait::backend::{await_reapable, Waited};
+    use crate::wait::backend::Waited;
     use crate::wait::exit_only::Foreign;
 
     let target = crate::wait::exit_only::Target::pid(pid, Some(unique));
     match via_verified_pid(pid, Some(unique), Sig::Kill) {
-        Ok(Sent::Delivered) => match await_reapable(pid, Some(unique), None) {
-            Ok(Waited::Reapable) => reap_verified(pid, &target, id, true, notes, breach),
-            Ok(Waited::Gone) => {
-                log::debug!("spawn teardown: pid {pid} was reaped by someone else");
-                Foreign::Gone.fate(true)
-            }
-            Ok(Waited::Orphaned) => {
-                notes.push(unverifiable(&crate::signal::UNPINNED_WHY));
-                Foreign::Orphaned.fate(true)
-            }
-            Ok(Waited::DeadlinePassed) => {
-                notes.push("is still running after its kill".to_owned());
-                ChildFate::Running { id }
-            }
-            Err(e) => {
-                notes.push(format!("could not be waited for: {e}"));
-                ChildFate::Killed
-            }
-        },
+        Ok(Sent::Delivered) => {
+            // A fixture that only the kill would end is released here when no kill was sent.
+            #[cfg(test)]
+            fault::run_between_kill_and_wait();
+            let waited = await_exit_warning(pid, unique, warn_after);
+            after_kill(matches!(waited, Ok(Waited::Reapable)));
+            let fate = match waited {
+                Ok(Waited::Reapable) => reap_verified(pid, &target, id, true, notes, breach),
+                Ok(Waited::Gone) => {
+                    log::debug!("spawn teardown: pid {pid} was reaped by someone else");
+                    Foreign::Gone.fate(true)
+                }
+                Ok(Waited::Orphaned) => {
+                    notes.push(unverifiable(&crate::signal::UNPINNED_WHY));
+                    Foreign::Orphaned.fate(true)
+                }
+                Ok(Waited::DeadlinePassed) => {
+                    debug_assert!(false, "an unbounded wait reported a passed deadline");
+                    notes.push("is still running after its kill".to_owned());
+                    ChildFate::Running { id }
+                }
+                // Nothing reaps it after this: the std `Child` reaps nothing, and tokio's is forgotten.
+                Err(e) => {
+                    notes.push(format!(
+                        "could not be waited for ({e}), so it is left unreaped: it stays a zombie once it exits"
+                    ));
+                    ChildFate::Killed
+                }
+            };
+            (fate, KillOutcome::Delivered)
+        }
         Ok(Sent::Gone) => {
             log::debug!("spawn teardown: pid {pid} is already gone");
-            Foreign::Gone.fate(false)
+            after_kill(false);
+            (Foreign::Gone.fate(false), KillOutcome::NotSent)
         }
         Ok(Sent::Unverified) => {
             debug_assert!(false, "`via_verified_pid` was given `Some(unique)`, so it verifies");
-            notes.push("could not be verified, so it was not signalled".to_owned());
-            ChildFate::Running { id }
+            after_kill(false);
+            (ChildFate::Running { id }, KillOutcome::Unverified)
         }
         Err(kill) => {
-            notes.push(format!("could not be killed: {kill}"));
-            reap_verified(pid, &target, id, false, notes, breach)
+            after_kill(false);
+            let fate = reap_verified(pid, &target, id, false, notes, breach);
+            (fate, KillOutcome::Refused(kill.to_string()))
         }
+    }
+}
+
+/// Waits for the killed `pid` to become reapable. With `warn_after`, the wait that passes it logs one
+/// `warn` and then goes on, unbounded.
+#[cfg(target_os = "macos")]
+fn await_exit_warning(
+    pid: u32,
+    unique: u64,
+    warn_after: Option<std::time::Duration>,
+) -> std::io::Result<crate::wait::backend::Waited> {
+    use crate::wait::backend::{await_reapable, Waited};
+
+    let Some(after) = warn_after else {
+        return await_reapable(pid, Some(unique), None);
+    };
+    match await_reapable(pid, Some(unique), Some(std::time::Instant::now() + after))? {
+        Waited::DeadlinePassed => {
+            log::warn!(
+                "child {pid} is not reapable {after:?} after its kill (it is still running, or a tracer holds its exit); still waiting for it to exit"
+            );
+            await_reapable(pid, Some(unique), None)
+        }
+        done => Ok(done),
     }
 }
 
@@ -878,16 +1207,18 @@ fn reap_verified(
     }
 }
 
-/// macOS: `child` could not be adopted, so it is abandoned with nothing signalled or waited on by
-/// pid, and the spawn fails with `not_adopted.error`. A child that died before `exec` is only a
-/// corpse nothing collects, and the program did not start. A child that had not reported is left
-/// running and unreaped. Any other is left as `leave_unverified_child` leaves it. Either of those may
-/// have started the program, and the error notes that a `front` is left unreaped.
+/// macOS: `child` could not be adopted, and the spawn fails with `not_adopted.error`. A child that
+/// died before `exec` is only a corpse nothing collects, and the program did not start. A child
+/// whose id came late may have started the program: it is killed and reaped by pid, each act checked
+/// against that id, and its tree is killed through `prepared` (see [`kill_and_reap_unreported`]). A
+/// `front` is sent nothing and left running and unreaped instead, and the error notes it. Any other
+/// is never signalled or waited on by pid, and is left as `leave_unverified_child` leaves it.
 #[cfg(target_os = "macos")]
 fn abandon_unadopted(
     child: std::process::Child,
     not_adopted: unique_report::NotAdopted,
     front: Option<crate::elevation::front::Front>,
+    prepared: crate::containment::Prepared,
 ) -> SpawnFailure {
     use unique_report::Unadoptable;
 
@@ -901,19 +1232,26 @@ fn abandon_unadopted(
             drop(child);
             SpawnFailure::NotStarted(error)
         }
-        Unadoptable::Unreported => {
+        Unadoptable::Late(unique) => {
             #[cfg(test)]
             fault::capture(ProcessId::of(pid));
-            log::warn!(
-                "child {pid} had not reported its unique id when its spawn returned; it is not adopted, nothing is \
-                 signalled or waited on by pid, and it may be running"
-            );
+            // A front is sent nothing: it is left running and unreaped, with its note.
+            if front.is_some() {
+                warn_late_front(pid, None);
+                drop(child);
+                return SpawnFailure::started(
+                    FrontFate::LeftUnreaped.note(error, front, Some(pid)),
+                    // The id was reported, but no `ProcessId` was read from it.
+                    ChildFate::Running { id: None },
+                );
+            }
+            // Torn down through its unique id, exactly as every other post-spawn failure is. The `std`
+            // `Child` is dropped after: it reaps nothing, so a child still running stays a zombie.
+            let done = kill_and_reap_unreported(pid, unique, prepared, None);
+            let tail = done.zombie_tail();
+            let fate = done.warn(pid, tail);
             drop(child);
-            SpawnFailure::started(
-                FrontFate::LeftUnreaped.note(error, front, Some(pid)),
-                // No unique id was read, so there is no identity to give.
-                ChildFate::Running { id: None },
-            )
+            SpawnFailure::started(error, fate)
         }
         Unadoptable::Unverified => {
             // No unique id was read, so there is no identity to give.
@@ -996,7 +1334,10 @@ fn teardown_after_failed_adoption(
 /// **Poison-tolerant:** a panic mid-spawn must not wedge every future spawn, so a poisoned lock is
 /// recovered rather than propagated (the guarded data is unit — there is no invariant to protect).
 pub(crate) fn spawn_lock() -> SpawnLockGuard {
-    acquire_spawn_lock(|| {})
+    acquire_spawn_lock(|| {
+        #[cfg(all(test, target_os = "macos"))]
+        fault::spawn_lock_contended();
+    })
 }
 
 static SPAWN_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -1322,6 +1663,7 @@ pub(crate) fn resolve_stdio(
     fds: &BTreeMap<Fd, ResolvedStdio>,
     slots: &[Fd],
     pipe: PipeOwnership,
+    parent_std: ParentStd,
 ) -> Result<ResolvedStdioEnds, Error> {
     // Reject merge-targeting-a-merge: the two-pass algorithm resolves only one level of
     // indirection. Transitive chaining (a fixpoint loop) is an unsupported design limit — redirect
@@ -1353,7 +1695,7 @@ pub(crate) fn resolve_stdio(
             Some(ResolvedStdio::Pipe(_)) if matches!(pipe, PipeOwnership::Deferred) && slot.raw() < 3 => continue,
             None if slot.raw() >= 3 => continue,
             _ => {
-                let (child_end, parent) = resolve_non_merge(slot, resolved)?;
+                let (child_end, parent) = resolve_non_merge(slot, resolved, parent_std)?;
                 if let Some(p) = parent {
                     parent_ends.insert(slot, p);
                 }
@@ -1392,9 +1734,13 @@ pub(crate) fn resolve_stdio(
 }
 
 // Resolve a non-merge slot to its child-side end + the parent's pipe end (if any).
-pub(crate) fn resolve_non_merge(slot: Fd, r: Option<&ResolvedStdio>) -> Result<(ChildEnd, Option<ParentEnd>), Error> {
+pub(crate) fn resolve_non_merge(
+    slot: Fd,
+    r: Option<&ResolvedStdio>,
+    parent_std: ParentStd,
+) -> Result<(ChildEnd, Option<ParentEnd>), Error> {
     match r {
-        None | Some(ResolvedStdio::Inherit) => Ok((inherit_end(slot)?, None)),
+        None | Some(ResolvedStdio::Inherit) => Ok((inherit_end(slot, parent_std)?, None)),
         Some(ResolvedStdio::Null) => Ok((null_end()?, None)),
         Some(ResolvedStdio::File(f)) => Ok((file_end(f)?, None)),
         Some(ResolvedStdio::Pipe(dir)) => make_pipe(*dir),
@@ -1420,8 +1766,7 @@ pub(crate) fn dup(end: &ChildEnd) -> Result<ChildEnd, Error> {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::io::AsHandle;
-        end.as_handle().try_clone_to_owned().map_err(Error::Io)
+        end.try_clone().map_err(Error::Io)
     }
 }
 
@@ -1440,7 +1785,11 @@ fn file_end(f: &std::fs::File) -> Result<ChildEnd, Error> {
     Ok(ChildEnd::from(dup))
 }
 
-fn inherit_end(slot: Fd) -> Result<ChildEnd, Error> {
+#[cfg_attr(
+    not(windows),
+    allow(unused_variables, reason = "only the Windows arm reads the parent's std handles")
+)]
+fn inherit_end(slot: Fd, parent_std: ParentStd) -> Result<ChildEnd, Error> {
     // Duplicate the parent's matching std stream. Bind the stream to a variable
     // before borrowing its descriptor (a temporary would be dropped while borrowed).
     // For n>=3, Stdio::inherit() has no defined parent stream to dup — a design limit
@@ -1477,18 +1826,22 @@ fn inherit_end(slot: Fd) -> Result<ChildEnd, Error> {
     #[cfg(windows)]
     {
         use std::os::windows::io::AsHandle;
+        // A null std handle (a GUI process's or a service's) is an absent end; so is -1, which `std`
+        // reports as null. `parent_std` decides null-ness, so this end and the caller's
+        // `STARTF_USESTDHANDLES` decision come from one read.
+        let live = parent_std.is_live(slot);
         let owned = match slot {
             Fd::STDIN => {
                 let s = std::io::stdin();
-                s.as_handle().try_clone_to_owned()
+                dup_std_handle(s.as_handle(), live)
             }
             Fd::STDOUT => {
                 let s = std::io::stdout();
-                s.as_handle().try_clone_to_owned()
+                dup_std_handle(s.as_handle(), live)
             }
             Fd::STDERR => {
                 let s = std::io::stderr();
-                s.as_handle().try_clone_to_owned()
+                dup_std_handle(s.as_handle(), live)
             }
             // fd >= 3 has no defined parent std stream to dup (mirrors the Unix arm). Retained design
             // limit: the raw backend routes fd >= 3 inherit through here and rejects it too.
@@ -1503,6 +1856,63 @@ fn inherit_end(slot: Fd) -> Result<ChildEnd, Error> {
             }
         };
         owned.map_err(Error::Io)
+    }
+}
+
+/// A dup of this process's std handle `h`; absent when `live` is false (it was null when
+/// [`ParentStd`] was read).
+#[cfg(windows)]
+fn dup_std_handle(h: std::os::windows::io::BorrowedHandle<'_>, live: bool) -> std::io::Result<ChildEnd> {
+    use std::os::windows::io::AsRawHandle;
+    if !live || h.as_raw_handle().is_null() {
+        return Ok(ChildEnd::absent());
+    }
+    h.try_clone_to_owned().map(ChildEnd::from)
+}
+
+/// Which of this process's stdin, stdout and stderr handles were non-null when a spawn began.
+///
+/// Read once per spawn: the inherited ends and the Windows `STARTF_USESTDHANDLES` decision both
+/// come from it, so a concurrent `SetStdHandle` cannot make them disagree. Empty off Windows.
+#[derive(Clone, Copy)]
+pub(crate) struct ParentStd {
+    #[cfg(windows)]
+    live: [bool; 3],
+}
+
+impl ParentStd {
+    pub(crate) fn read() -> ParentStd {
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::{AsHandle, AsRawHandle};
+            ParentStd {
+                live: [
+                    !std::io::stdin().as_handle().as_raw_handle().is_null(),
+                    !std::io::stdout().as_handle().as_raw_handle().is_null(),
+                    !std::io::stderr().as_handle().as_raw_handle().is_null(),
+                ],
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            ParentStd {}
+        }
+    }
+
+    /// Whether the handle for std `slot` (0, 1 or 2) was non-null; `false` for any other slot,
+    /// which has no parent stream (`inherit_end` refuses it).
+    #[cfg(windows)]
+    pub(crate) fn is_live(self, slot: Fd) -> bool {
+        usize::try_from(slot.raw())
+            .ok()
+            .and_then(|i| self.live.get(i).copied())
+            .unwrap_or(false)
+    }
+
+    /// Whether any of the three was non-null.
+    #[cfg(windows)]
+    pub(crate) fn any_live(self) -> bool {
+        self.live.iter().any(|&l| l)
     }
 }
 
@@ -2406,6 +2816,10 @@ pub(crate) mod fault {
         static BEFORE_IDENTITY: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
         static BEFORE_ATTACH: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
         static AFTER_IDENTITY_READ: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
+        #[cfg(target_os = "macos")]
+        static BEFORE_LATE_TEARDOWN: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
+        #[cfg(target_os = "macos")]
+        static BEFORE_LATE_ROOT_KILL: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
         static TEARDOWN_REAPS: std::cell::RefCell<Option<Vec<TeardownReap>>> = const { std::cell::RefCell::new(None) };
         #[cfg(target_os = "linux")]
         static ATTACHMENT_OVERRIDE: std::cell::RefCell<Option<crate::containment::Attachment>> =
@@ -2665,6 +3079,47 @@ pub(crate) mod fault {
     }
     pub(crate) type ArmedBetweenKillAndWait = crate::oneshot_hook::Armed;
 
+    /// What runs when a thread finds `spawn_lock` held, on any thread.
+    #[cfg(target_os = "macos")]
+    static ON_SPAWN_LOCK_CONTENDED: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> = std::sync::Mutex::new(None);
+
+    /// Runs `hook` once, on the first thread of this process that then finds `spawn_lock` held, before
+    /// that thread blocks on it. The guard drops an unfired hook.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn on_spawn_lock_contended(hook: impl FnOnce() + Send + 'static) -> ContendedHook {
+        let previous = ON_SPAWN_LOCK_CONTENDED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace(Box::new(hook));
+        debug_assert!(previous.is_none(), "a contention hook is already armed");
+        ContendedHook(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[must_use = "the hook is dropped as soon as the guard is dropped"]
+    pub(crate) struct ContendedHook(());
+
+    #[cfg(target_os = "macos")]
+    impl Drop for ContendedHook {
+        fn drop(&mut self) {
+            ON_SPAWN_LOCK_CONTENDED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn spawn_lock_contended() {
+        let hook = ON_SPAWN_LOCK_CONTENDED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
     /// A point in a spawn where a test can run a hook.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) enum SpawnPoint {
@@ -2676,6 +3131,12 @@ pub(crate) mod fault {
         /// Right after the spawn read the child's identity, before it checks the read against the
         /// child's handle.
         AfterIdentityRead,
+        /// macOS: right before the teardown of a child whose unique id came late.
+        #[cfg(target_os = "macos")]
+        BeforeLateTeardown,
+        /// macOS: in that teardown, after the first kill of the tree and before the root's kill.
+        #[cfg(target_os = "macos")]
+        BeforeLateRootKill,
     }
 
     fn hook_at(point: SpawnPoint) -> &'static std::thread::LocalKey<crate::oneshot_hook::OneShotHook> {
@@ -2683,6 +3144,10 @@ pub(crate) mod fault {
             SpawnPoint::BeforeIdentity => &BEFORE_IDENTITY,
             SpawnPoint::BeforeAttach => &BEFORE_ATTACH,
             SpawnPoint::AfterIdentityRead => &AFTER_IDENTITY_READ,
+            #[cfg(target_os = "macos")]
+            SpawnPoint::BeforeLateTeardown => &BEFORE_LATE_TEARDOWN,
+            #[cfg(target_os = "macos")]
+            SpawnPoint::BeforeLateRootKill => &BEFORE_LATE_ROOT_KILL,
         }
     }
 
@@ -2915,6 +3380,11 @@ pub(crate) mod pidfd_handshake;
 #[path = "spawn/windows_raw.rs"]
 pub(crate) mod windows_raw;
 
+// Windows: a child-side handle that may be absent.
+#[cfg(windows)]
+#[path = "spawn/windows_child_end.rs"]
+mod windows_child_end;
+
 #[cfg(test)]
 #[path = "spawn_tests.rs"]
 mod spawn_tests;
@@ -2938,6 +3408,10 @@ mod identity_error_tests;
 #[cfg(all(test, target_os = "macos"))]
 #[path = "spawn/identity_macos_tests.rs"]
 pub(crate) mod identity_macos_tests;
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "spawn/late_report_tests.rs"]
+pub(crate) mod late_report_tests;
 
 #[cfg(all(test, target_os = "linux"))]
 #[path = "spawn/identity_peek_tests.rs"]

@@ -25,7 +25,7 @@
 
 use std::ffi::OsString;
 use std::fs::OpenOptions;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::fd::{IntoRawFd, RawFd};
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 use std::path::PathBuf;
@@ -57,7 +57,14 @@ pub fn init() {
     if var("COSCA_TEST_INIT_PROBE").is_some() {
         let before = cosca::installed();
         cosca::init();
-        println!("installed before={before} after={}", cosca::installed());
+        // Not `quiet_io`: the lib's unit-test binary includes this file too. A closed stdout is a
+        // normal end here, as in every testbin mode.
+        let mut out = std::io::stdout().lock();
+        match writeln!(out, "installed before={before} after={}", cosca::installed()).and_then(|()| out.flush()) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(e) => panic!("COSCA_TEST_INIT_PROBE: write stdout: {e}"),
+        }
         std::process::exit(0);
     }
     if var("COSCA_TEST_SHIM_SHIPPED").is_some() {
