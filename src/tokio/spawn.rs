@@ -770,13 +770,14 @@ pub(super) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     let Err(write_err) = written else {
         return Ok(child);
     };
+    // A live front outside a cgroup is not signalled, by its group or otherwise: the root's kill
+    // below then says why.
+    let gate = child.kill_gate();
+    // The look at the root, right before the tree kill it decides.
     let view = child.read_root_view("finish_elevated");
     // What forgetting tokio's `Child` leaked, if the cleanup forgot it: the one warn below says so.
     let mut forgot: Option<crate::child::drop_report::Forgot> = None;
     let mut skipped = None;
-    // A live front outside a cgroup is not signalled, by its group or otherwise: the root's kill
-    // below then says why.
-    let gate = child.kill_gate();
     let front_closed = matches!(gate, crate::elevation::front::Gate::Closed(_));
     let exited_front = matches!(gate, crate::elevation::front::Gate::Exited);
     let tree: Option<Result<(), Error>> = (child.containment().can_teardown() && !front_closed).then(|| {

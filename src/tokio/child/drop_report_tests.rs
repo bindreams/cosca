@@ -28,7 +28,7 @@ mod linux {
         let (mut child, _writer) = session_blocker(true);
         child.set_front(Some(crate::elevation::front::Front::Sudo));
         let mark = crate::log_capture::mark();
-        // The read, the gate's two looks at the front, then the second look.
+        // The gate's two looks at the front, the read, then the second look.
         let _looks = force_peeks([running(), running(), running(), gone()]);
 
         drop(child);
@@ -83,8 +83,8 @@ mod linux {
         let (mut child, _writer) = session_blocker(true);
         child.set_front(Some(crate::elevation::front::Front::Sudo));
         let mark = crate::log_capture::mark();
-        // The read shows the reap; the gate's look at the front sees it run.
-        let _looks = force_peeks([gone(), running()]);
+        // The gate's two looks at the front see it run; the read shows the reap.
+        let _looks = force_peeks([running(), running(), gone()]);
 
         drop(child);
 

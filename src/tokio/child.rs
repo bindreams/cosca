@@ -1301,6 +1301,11 @@ impl Child {
         // What an earlier forgetting recorded of a backend that no longer holds the child.
         #[cfg(unix)]
         let forgotten = os.proc.as_ref().and_then(|proc| proc.forgotten_fate(Some(self.id)));
+        // A live elevation front gets no signal of its own: outside a cgroup it is left running,
+        // and named in the drop's one warn. The gate comes first, so the look at the root is right
+        // before the signals it decides.
+        #[cfg(unix)]
+        let gate = self.kill_on_drop.then(|| kill_gate(self.front, &os, self.id.pid()));
         #[cfg(unix)]
         let view = crate::containment::DropView::read(
             "Child::drop",
@@ -1319,10 +1324,8 @@ impl Child {
         #[cfg(not(unix))]
         let mut signals = DropSignals::new(ChildFate::Running { id: Some(self.id) });
         if self.kill_on_drop {
-            // A live elevation front gets no signal of its own: outside a cgroup it is left running,
-            // and named in the drop's one warn.
             #[cfg(unix)]
-            match kill_gate(self.front, &os, self.id.pid()) {
+            match gate.expect("an armed drop reads the gate") {
                 crate::elevation::front::Gate::Closed(unkillable) => front_left = Some(unkillable),
                 gate => {
                     let cgroup_front = matches!(gate, crate::elevation::front::Gate::CgroupOnly)
