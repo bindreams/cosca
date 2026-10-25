@@ -255,8 +255,8 @@ pub fn report_grandchild(report: TcpListener, root: &mut cosca::Child) -> Proces
 
 /// [`accept_tree_also`](super::accept_tree_also) for a root started with [`GC_PID_ADDR_ENV`] set
 /// to `report`'s address: captures the grandchild's identity through the report protocol first.
-/// Both listeners are consumed: `report` closes once its connection is accepted, `listener` once
-/// both members are.
+/// Both listeners are consumed: `report` closes once its connection is accepted, `listener` when
+/// this function returns.
 pub fn accept_tree(
     listener: TcpListener,
     report: TcpListener,

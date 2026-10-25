@@ -226,12 +226,9 @@ impl Sources {
         self.armed
     }
 
-    /// Ends the accepting thread: it is blocked in `accept`, and a connection to its own address
-    /// is what returns it. Closes the listener.
+    /// Ends the accepting thread and closes the listener; see [`wake_acceptor`].
     fn stop_accepting(&self) {
-        self.stop.store(true, Ordering::SeqCst);
-        // A failed connect means `accept` already returned an error, and the thread has ended.
-        let _ = TcpStream::connect(self.addr);
+        wake_acceptor(&self.stop, self.addr);
     }
 
     /// Waits for the launcher watch to return, stops accepting, and returns everything reported
@@ -241,10 +238,26 @@ impl Sources {
         if let Some(watcher) = self.watcher {
             watcher.join().expect("client-exit watcher panicked");
         }
-        self.stop.store(true, Ordering::SeqCst);
-        let _ = TcpStream::connect(self.addr);
+        wake_acceptor(&self.stop, self.addr);
         self.acceptor.join().expect("accepting thread panicked");
         self.rx.try_iter().collect()
+    }
+}
+
+/// Sets `stop` and ends the accepting thread: it is blocked in `accept`, and a connection to
+/// its own address (`addr`) is what returns it.
+///
+/// Panics with the connect error if the wake-up connection cannot be made (for example
+/// `WSAENOBUFS`): the thread would stay blocked and joining it would hang. `ConnectionRefused`
+/// is the exception: the listener is already closed because the thread ended on an accept
+/// error, or a full backlog still holds connections that wake it.
+fn wake_acceptor(stop: &AtomicBool, addr: SocketAddr) {
+    stop.store(true, Ordering::SeqCst);
+    match TcpStream::connect(addr) {
+        Err(e) if e.kind() != std::io::ErrorKind::ConnectionRefused => {
+            panic!("cannot wake the accepting thread of {addr}: {e}")
+        }
+        _ => {}
     }
 }
 

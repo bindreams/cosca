@@ -220,7 +220,7 @@ pub fn accept_or_die_also(listener: &TcpListener, target: &mut impl Target, also
 /// Blocks until `pid` exits, with the same contract on `pid` as [`accept_or_die_also`]'s target:
 /// an unreaped child the caller does not `wait` on concurrently.
 ///
-/// It opens no socket: a loopback pair per call would add to the ephemeral ports the suite holds.
+/// It opens no socket.
 pub(crate) fn wait_for_exit(pid: u32) {
     match platform::wait(Source::Never, pid, None) {
         WatchEvent::Died(dead) => debug_assert_eq!(dead, pid, "the exit watch watches one pid"),
