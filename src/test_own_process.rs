@@ -9,16 +9,9 @@
 //! Also mounted by `#[path]` into `tests/common`, so it names nothing of its crate: the caller
 //! passes the [`Spawn`] hook that takes `spawn_lock` around the fork.
 //!
-//! # The gate
-//!
-//! The parent re-executes the test binary as
-//! `<exe> --exact <test> --test-threads=1 --nocapture` with
-//! `COSCA_TEST_OWN_PROCESS=<parent pid>:<token fd>:<test>`. A process takes the child role only if
-//! all of these hold at once: the value's pid is its real parent's, its test is the one being
-//! gated, and its argv is exactly the shape above. An environment variable alone is forgeable
-//! and inheritable (a shell export, an outer harness, a grandchild); the parent pid binds the
-//! value to the process that set it, and the argv proves libtest was told to run this one test on
-//! one thread, so the process is the test's own.
+//! The role marker, argv and gate are shared with the Windows twin: see [`super::test_own_process_gate`].
+//! A re-executed process takes the child role only through that gate, with the token fd in the
+//! marker's transport field.
 //!
 //! # The completion token
 //!
@@ -28,52 +21,22 @@
 //! token, and a filter that matches no test (libtest exits 0 for both) leaves no start token. A pipe
 //! rather than a stdout line because these bodies close fd 1 and 2, and because a private fd cannot
 //! be printed by anything else.
-//!
-//! # The witness
-//!
-//! [`own_process`] returns the [`Completion`] only in the child. A guard that changes
-//! process-global state takes `&Completion`, so a test that forgot `own_process` does not compile.
 
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{Read as _, Write as _};
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
 use std::os::unix::process::{parent_id, CommandExt as _};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{ExitStatus, Stdio};
 
-/// Forks `command` with `spawn_lock` held for the fork alone: `test_spawn::spawn` in the library's
-/// tests, `common::spawn_locked` in the integration tests.
-pub(crate) type Spawn = fn(&mut Command) -> std::io::Result<Child>;
-
-/// The role marker: `<parent pid>:<token fd>:<test>`. See the module doc.
-pub(crate) const ENV: &str = "COSCA_TEST_OWN_PROCESS";
+use super::test_own_process_gate::{child_args, child_role, env_value, gate, ENV};
+pub(crate) use super::test_own_process_gate::{test_filter, test_path, Completion, Spawn};
 
 /// What the child writes to the token pipe when it accepts the role.
 const STARTED: &[u8] = b"started";
 
 /// What the child writes to the token pipe once its body has returned.
 const RETURNED: &[u8] = b"returned";
-
-/// The path of the test fn `$name` (sync or `async`), for [`own_process`]. `let _ = $name;` makes a
-/// stale name a compile error rather than a filter that matches nothing.
-#[allow(
-    unused_macros,
-    reason = "unused in the integration binaries that mount this file only for `tests/common`"
-)]
-macro_rules! test_path {
-    ($name:ident) => {{
-        let _ = $name;
-        concat!(module_path!(), "::", stringify!($name))
-    }};
-}
-
-/// libtest's filter for a [`test_path!`]: `module_path!()` always leads with a crate segment, which
-/// the filter has none of.
-pub(crate) fn test_filter(path: &str) -> &str {
-    path.split_once("::")
-        .unwrap_or_else(|| panic!("{path:?} has no crate segment"))
-        .1
-}
 
 /// What [`role`] decided this process is.
 #[derive(Debug, PartialEq, Eq)]
@@ -84,56 +47,20 @@ pub(crate) enum Role {
     Child { token_fd: RawFd },
 }
 
-/// The argv (after the program name) of a re-executed test.
-///
-/// `--nocapture` keeps skuld's fd-level capture from swallowing the child's stdout and stderr,
-/// which the parent reports.
-pub(crate) fn child_args(test: &str) -> [&str; 4] {
-    ["--exact", test, "--test-threads=1", super::test_reexec::NOCAPTURE]
-}
-
 /// Classifies a process from its inherited [`ENV`] value, its real parent's pid and its argv; see
 /// the module doc.
 pub(crate) fn role(inherited: Option<&str>, parent_pid: u32, args: &[OsString], test: &str) -> Role {
-    let Some(inherited) = inherited else {
-        return Role::Parent;
-    };
-    let mut parts = inherited.splitn(3, ':');
-    let (Some(pid), Some(fd), Some(named)) = (parts.next(), parts.next(), parts.next()) else {
-        return Role::Parent;
-    };
-    let Ok(token_fd) = fd.parse::<RawFd>() else {
-        return Role::Parent;
-    };
-    let exact_argv = args
-        .iter()
-        .map(OsString::as_os_str)
-        .eq(child_args(test).iter().map(std::ffi::OsStr::new));
-    if pid == parent_pid.to_string() && named == test && exact_argv && token_fd > 2 {
-        Role::Child { token_fd }
-    } else {
-        Role::Parent
+    match gate(inherited, parent_pid, args, test)
+        .and_then(|fd| fd.parse::<RawFd>().ok())
+        .filter(|&token_fd| token_fd > 2)
+    {
+        Some(token_fd) => Role::Child { token_fd },
+        None => Role::Parent,
     }
 }
 
-/// Whether `inherited` says this very process was re-executed for `test` by its real parent. Such a
-/// process that was not accepted as the child is a bug in the gate; re-executing again would
-/// recurse without end.
-pub(crate) fn is_reexecution(inherited: Option<&str>, parent_pid: u32, test: &str) -> bool {
-    let mut parts = inherited.unwrap_or_default().splitn(3, ':');
-    matches!(
-        (parts.next(), parts.next(), parts.next()),
-        (Some(pid), Some(_), Some(named)) if pid == parent_pid.to_string() && named == test
-    )
-}
-
-/// Proof that this process is an `own_process` child, and the report that its body returned. A
-/// guard that changes process-global state takes `&Completion`.
-///
-/// Dropped by a panicking body, or never dropped by one that exits the process, it reports nothing.
-#[must_use = "the body's completion is reported when this drops; bind it for the whole body"]
-pub(crate) struct Completion(pub(crate) File);
-
+/// Reports that the body returned, unless it is panicking. A body that exits the process never
+/// drops it, and reports nothing either.
 impl Drop for Completion {
     fn drop(&mut self) {
         if !std::thread::panicking() {
@@ -144,8 +71,7 @@ impl Drop for Completion {
     }
 }
 
-/// Call first in a test that changes process-global state:
-/// `let Some(done) = own_process(test_path!(this_fn), spawn) else { return };`.
+/// Call first in a test that changes process-global state.
 ///
 /// In the parent this re-executes the test binary to run only this test, waits for it, and
 /// panics with its output unless it passed; it returns `None`. In the child it returns the
@@ -168,21 +94,15 @@ pub(crate) fn own_process(path: &str, spawn: Spawn) -> Option<Completion> {
 /// shell export or an outer harness can set.
 #[must_use = "without the witness the test is not isolated"]
 pub(crate) fn child_completion(path: &str) -> Option<Completion> {
-    let test = test_filter(path);
-    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
-    match role(std::env::var(ENV).ok().as_deref(), parent_id(), &args, test) {
-        Role::Child { token_fd } => Some(accept(token_fd)),
-        Role::Parent => {
-            let inherited = std::env::var(ENV).ok();
-            assert!(
-                !is_reexecution(inherited.as_deref(), parent_id(), test),
-                "re-executed for {test} but not accepted as its own process: got {args:?} with {ENV}={inherited:?}, \
-                 expected {:?}",
-                child_args(test)
-            );
-            None
-        }
-    }
+    child_role(
+        test_filter(path),
+        parent_id(),
+        |inherited, parent_pid, args, test| match role(inherited, parent_pid, args, test) {
+            Role::Child { token_fd } => Some(token_fd),
+            Role::Parent => None,
+        },
+    )
+    .map(accept)
 }
 
 /// Takes the token pipe and reports that the role was accepted.
@@ -269,7 +189,7 @@ pub(crate) fn run(test: &str, env: &[(&str, &str)], spawn: Spawn) -> Result<(), 
     let mut command = super::test_reexec::command(std::env::current_exe().expect("current_exe"));
     command
         .args(child_args(test))
-        .env(ENV, format!("{}:{token_fd}:{test}", std::process::id()))
+        .env(ENV, env_value(&token_fd.to_string(), test))
         .envs(env.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -312,5 +232,3 @@ pub(crate) fn run(test: &str, env: &[(&str, &str)], spawn: Spawn) -> Result<(), 
         ),
     })
 }
-
-pub(crate) use test_path;

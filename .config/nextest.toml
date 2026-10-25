@@ -156,12 +156,8 @@ filter = 'binary(windows_elevation_routes)'
 slow-timeout = { period = "60s", terminate-after = 10 }
 
 [test-groups]
-# `tests/windows_shell_execute.rs` serializes its tests with an in-process mutex, a holdover from
-# when `cargo test` ran them all in one shared process — there PATH and one env var were also
-# process-global state the mutex had to guard. Under nextest's one-process-per-test model, PATH
-# and that env var are already isolated per test; only the registry keys (App Paths, in HKLM and
-# HKCU) are genuinely machine-wide, and the in-process mutex cannot reach across processes to
-# guard them. This group caps concurrency for that binary at one test at a time instead.
+# `tests/windows_shell_execute.rs` shares machine-wide registry keys (App Paths, in HKLM and HKCU)
+# between its tests, so this group runs that binary one test at a time.
 windows-shell-execute = { max-threads = 1 }
 
 # `does_create_process_with_logon_elevate` and `which_logon_types_return_a_filtered_token` in
