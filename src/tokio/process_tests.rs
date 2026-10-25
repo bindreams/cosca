@@ -23,8 +23,14 @@ fn a_recycled_pid_reads_as_gone_through_the_async_wrapper() {
 #[cfg(windows)]
 #[skuld::test]
 fn a_denied_identity_reads_as_unknown_not_gone_through_the_async_wrapper() {
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(a_denied_identity_reads_as_unknown_not_gone_through_the_async_wrapper),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
     use windows::Win32::System::Threading::PROCESS_SYNCHRONIZE;
-    let child = crate::identity::windows_fixture::spawn_restricted(PROCESS_SYNCHRONIZE.0);
+    let child = crate::identity::windows_fixture::spawn_restricted(&done, PROCESS_SYNCHRONIZE.0);
     let id = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
         .expect("the owned handle always yields an identity");
     assert!(child.is_running(), "precondition: the subject must be live");

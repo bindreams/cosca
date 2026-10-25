@@ -40,8 +40,14 @@ fn process_is_send_and_sync() {
 #[cfg(windows)]
 #[skuld::test]
 fn from_pid_is_unknown_for_an_access_denied_process() {
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(from_pid_is_unknown_for_an_access_denied_process),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
     use windows::Win32::System::Threading::PROCESS_SYNCHRONIZE;
-    let child = crate::identity::windows_fixture::spawn_restricted(PROCESS_SYNCHRONIZE.0);
+    let child = crate::identity::windows_fixture::spawn_restricted(&done, PROCESS_SYNCHRONIZE.0);
     assert!(child.is_running(), "precondition: the subject must be live");
     assert_eq!(
         Process::from_pid(child.pid()),
@@ -56,8 +62,14 @@ fn from_pid_is_unknown_for_an_access_denied_process() {
 #[cfg(windows)]
 #[skuld::test]
 fn a_process_built_from_a_denied_identity_is_unknown_not_gone() {
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(a_process_built_from_a_denied_identity_is_unknown_not_gone),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
     use windows::Win32::System::Threading::PROCESS_SYNCHRONIZE;
-    let child = crate::identity::windows_fixture::spawn_restricted(PROCESS_SYNCHRONIZE.0);
+    let child = crate::identity::windows_fixture::spawn_restricted(&done, PROCESS_SYNCHRONIZE.0);
     let id = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
         .expect("the owned handle always yields an identity");
     assert!(child.is_running(), "precondition: the subject must be live");
@@ -81,8 +93,14 @@ fn a_process_built_from_a_denied_identity_is_unknown_not_gone() {
 #[cfg(windows)]
 #[skuld::test]
 fn parent_and_children_of_an_unassessable_anchor_are_unassessable() {
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(parent_and_children_of_an_unassessable_anchor_are_unassessable),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
     use windows::Win32::System::Threading::PROCESS_SYNCHRONIZE;
-    let child = crate::identity::windows_fixture::spawn_restricted(PROCESS_SYNCHRONIZE.0);
+    let child = crate::identity::windows_fixture::spawn_restricted(&done, PROCESS_SYNCHRONIZE.0);
     let id = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
         .expect("the owned handle always yields an identity");
     assert!(child.is_running(), "precondition: the subject must be live");
@@ -107,8 +125,16 @@ fn parent_and_children_of_an_unassessable_anchor_are_unassessable() {
 #[cfg(windows)]
 #[skuld::test]
 fn parent_of_a_process_whose_parent_is_access_denied_is_unassessable_naming_the_ppid() {
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(
+            parent_of_a_process_whose_parent_is_access_denied_is_unassessable_naming_the_ppid
+        ),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
     use windows::Win32::System::Threading::PROCESS_SYNCHRONIZE;
-    let parent = crate::identity::windows_fixture::spawn_restricted_shell(PROCESS_SYNCHRONIZE.0);
+    let parent = crate::identity::windows_fixture::spawn_restricted_shell(&done, PROCESS_SYNCHRONIZE.0);
     let kid_pid = parent.wait_for_child();
     assert!(parent.is_running(), "precondition: the denied parent must be live");
     let crate::identity::Resolved::Found(kid) = Process::from_pid(kid_pid) else {

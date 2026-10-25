@@ -222,6 +222,8 @@ try {
         param($account, $script, $work)
         $credential = New-Object System.Management.Automation.PSCredential(
             "$env:COMPUTERNAME\$account", (ConvertTo-SecureString $env:COSCA_LANE_PASSWORD -AsPlainText -Force))
+        # The run inherits this environment; the password must not reach it, and the tests dump whole blocks, values included, to files.
+        Remove-Item Env:COSCA_LANE_PASSWORD
         $process = Start-Process cmd.exe -ArgumentList '/c', $script -Credential $credential `
             -WorkingDirectory $work -Wait -PassThru
         exit $process.ExitCode
