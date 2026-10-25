@@ -1,7 +1,7 @@
 //! `sysctl(KERN_PROC_PID)` / `kinfo_proc` — the BSD interface that resolves ZOMBIES and
 //! EPERM-hidden cross-user processes (libproc's `proc_pidinfo` does not). libc has no apple
 //! definition for these structs, so this is a minimal faithful local one. Only
-//! `p_un.p_starttime`, `p_stat`, and `eproc.e_ppid` are read, and in tests `eproc.e_jobc`;
+//! `p_un.p_starttime`, `p_stat`, `p_oppid` and `eproc.e_ppid` are read, and in tests `eproc.e_jobc`;
 //! everything else is layout.
 //! Layout is triple-checked: the compile-time size tripwires below, the kernel-size oracle,
 //! and the token-vs-libproc / ppid-vs-libproc oracles (kinfo_tests.rs).
@@ -52,6 +52,11 @@ impl kinfo_proc {
         let at = kinfo_proc::E_JOBC_OFFSET;
         i16::from_ne_bytes(self.kp_eproc[at..at + 2].try_into().expect("2 bytes"))
     }
+
+    fn set_e_ppid(&mut self, ppid: libc::pid_t) {
+        let at = kinfo_proc::E_PPID_OFFSET;
+        self.kp_eproc[at..at + std::mem::size_of::<libc::pid_t>()].copy_from_slice(&ppid.to_ne_bytes());
+    }
 }
 
 // E_PPID_OFFSET must stay inside the opaque tail it reads from - a compile-time companion to
@@ -68,7 +73,8 @@ pub(crate) struct extern_proc {
     pub(crate) p_flag: libc::c_int,
     pub(crate) p_stat: libc::c_char,
     pub(crate) p_pid: libc::pid_t,
-    p_oppid: libc::pid_t,
+    /// The parent at a tracer's attach, which the tracer's detach restores (xnu `mach_process.c`).
+    pub(crate) p_oppid: libc::pid_t,
     p_dupfd: libc::c_int,
     user_stack: u64,
     exit_thread: u64,
@@ -150,7 +156,96 @@ pub(crate) const P_WEXIT: libc::c_int = 0x0000_2000;
 /// wrong-sized record is a contract violation and leaves a trace before the same `None`.
 /// EINTR retries, per the codebase convention (see `wait/linux.rs`, `wait/macos.rs`).
 pub(crate) fn kinfo(pid: RawPid) -> Resolved<kinfo_proc> {
+    #[cfg(test)]
+    if fault::take_unreadable() {
+        return Resolved::Unknown;
+    }
+    #[cfg(test)]
+    if let Some(oppid) = fault::take_oppid() {
+        return match read_record(pid, libc::KERN_PROC_PID) {
+            Resolved::Found(mut info) => {
+                info.kp_proc.p_oppid = oppid;
+                Resolved::Found(info)
+            }
+            other => other,
+        };
+    }
+    #[cfg(test)]
+    if let Some((oppid, ppid)) = fault::forced_parents(pid) {
+        return match read_record(pid, libc::KERN_PROC_PID) {
+            Resolved::Found(mut info) => {
+                info.kp_proc.p_oppid = oppid;
+                info.set_e_ppid(ppid);
+                Resolved::Found(info)
+            }
+            other => other,
+        };
+    }
     read_record(pid, libc::KERN_PROC_PID)
+}
+
+/// Forces a field of the next [`kinfo`] read.
+#[cfg(test)]
+pub(crate) mod fault {
+    use std::cell::Cell;
+
+    thread_local! {
+        static OPPID: Cell<Option<libc::pid_t>> = const { Cell::new(None) };
+        static UNREADABLE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// The next [`kinfo`](super::kinfo) on this thread is refused (`Unknown`).
+    pub(crate) fn force_unreadable_once() {
+        UNREADABLE.with(|u| u.set(true));
+    }
+
+    pub(super) fn take_unreadable() -> bool {
+        UNREADABLE.with(Cell::take)
+    }
+
+    /// The next [`kinfo`](super::kinfo) on this thread that finds its process reports `oppid` as its
+    /// `p_oppid`, the parent it had when a tracer attached.
+    pub(crate) fn force_oppid_once(oppid: libc::pid_t) {
+        OPPID.with(|o| o.set(Some(oppid)));
+    }
+
+    pub(super) fn take_oppid() -> Option<libc::pid_t> {
+        OPPID.with(Cell::take)
+    }
+
+    /// What [`force_parents`] answers: `(p_oppid, e_ppid)`.
+    type Parents = Box<dyn FnMut() -> (libc::pid_t, libc::pid_t)>;
+
+    thread_local! {
+        static PARENTS: std::cell::RefCell<Option<(crate::identity::RawPid, Parents)>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// While the guard lives, every [`kinfo`](super::kinfo) of `pid` on this thread that finds its
+    /// process reports the `(p_oppid, e_ppid)` that `parents` answers at that read: the parent at a
+    /// tracer's attach, and the parent now.
+    pub(crate) fn force_parents(
+        pid: crate::identity::RawPid,
+        parents: impl FnMut() -> (libc::pid_t, libc::pid_t) + 'static,
+    ) -> ForcedParents {
+        PARENTS.with(|p| *p.borrow_mut() = Some((pid, Box::new(parents))));
+        ForcedParents(())
+    }
+
+    #[must_use = "the reads are real again as soon as the guard is dropped"]
+    pub(crate) struct ForcedParents(());
+
+    impl Drop for ForcedParents {
+        fn drop(&mut self) {
+            PARENTS.with(|p| p.borrow_mut().take());
+        }
+    }
+
+    pub(super) fn forced_parents(pid: crate::identity::RawPid) -> Option<(libc::pid_t, libc::pid_t)> {
+        PARENTS.with(|p| match p.borrow_mut().as_mut() {
+            Some((forced, parents)) if *forced == pid => Some(parents()),
+            _ => None,
+        })
+    }
 }
 
 /// The selector-parameterized core. The `selector` parameter is a TEST SEAM (production

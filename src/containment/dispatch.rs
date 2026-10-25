@@ -455,7 +455,7 @@ impl Attached {
     }
 
     /// The kill's result, and whether it was complete. Only a `TreeWalk`'s `Ok` can be incomplete.
-    fn hard_kill_report(&self) -> (Result<(), crate::error::Error>, bool) {
+    pub(crate) fn hard_kill_report(&self) -> (Result<(), crate::error::Error>, bool) {
         let result = match self {
             Attached::None | Attached::Delegated => Ok(()),
             #[cfg(unix)]
@@ -648,7 +648,7 @@ impl Attached {
         };
         let result = match self {
             #[cfg(target_os = "macos")]
-            Attached::FdMarker(m) => m.hard_kill_holders_only(view.unpinned_root().then(|| m.root())),
+            Attached::FdMarker(m) => m.hard_kill_holders_only(m.root().filter(|_| view.unpinned_root())),
             _ => Ok(()),
         };
         DropKill {
@@ -686,7 +686,7 @@ impl Attached {
                 source: None,
             }));
         };
-        let except = matches!(root, crate::signal::RootState::Unpinned).then(|| m.root());
+        let except = m.root().filter(|_| matches!(root, crate::signal::RootState::Unpinned));
         log::debug!("{op}: {why}, so it does not {skipped}; it signals the marker holders");
         let result = match signal {
             TreeSignal::Kill => m.hard_kill_holders_only(except),
@@ -783,7 +783,7 @@ impl Attached {
         };
         match self {
             #[cfg(target_os = "macos")]
-            Attached::FdMarker(m) => m.hard_kill_holders_only(view.unpinned_root().then(|| m.root()))?,
+            Attached::FdMarker(m) => m.hard_kill_holders_only(m.root().filter(|_| view.unpinned_root()))?,
             _ => {}
         }
         Ok(Some(format!(
