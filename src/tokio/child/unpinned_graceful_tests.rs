@@ -236,7 +236,7 @@ async fn graceful_shutdown_tree_decides_its_signal_on_one_look_at_the_root() {
     let looks = force_peeks([Ok(Peek::Running), Ok(Peek::Foreign(Foreign::Orphaned))]);
 
     // The sweep and the reap that follow are not under test.
-    let _ = child.graceful_shutdown_tree(Duration::ZERO).await;
+    _ = child.graceful_shutdown_tree(Duration::ZERO).await;
 
     drop(looks);
     assert_eq!(
