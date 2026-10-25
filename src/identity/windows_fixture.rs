@@ -8,9 +8,8 @@
 //!
 //! One privilege defeats that: a token holding `SeDebugPrivilege` **enabled** bypasses the
 //! DACL outright. An interactive session does not hold it enabled; CI runners do. So
-//! [`drop_se_debug_privilege`] strips it from this process before the first fixture, making the
-//! DACL authoritative everywhere. The strip is irreversible and process-wide, so every fixture
-//! takes the [`Completion`] of `own_process` and runs in a process of its own.
+//! [`drop_se_debug_privilege`] strips it from this process, making the DACL authoritative
+//! everywhere; see it for why every fixture takes the [`Completion`] of `own_process`.
 //!
 //! Teardown is safe: the handle `CreateProcessW` hands the creator carries full access
 //! regardless of the DACL, and the child is assigned to a kill-on-close job object so any
@@ -57,8 +56,7 @@ use windows::Win32::System::Threading::{
 /// and its siblings fail loudly instead of passing vacuously.
 ///
 /// `SE_PRIVILEGE_REMOVED` is irreversible for the token and the token is shared by every thread of
-/// the process, so a test running beside others would change what they observe. The
-/// `&Completion` witness makes a caller that forgot `own_process` fail to compile. Calling it
+/// the process, so a test running beside others would change what they observe. Calling it
 /// again is harmless: the privilege is already gone.
 fn drop_se_debug_privilege(_alone: &Completion) {
     let mut token = HANDLE::default();
@@ -266,7 +264,7 @@ fn spawn_with_ace(alone: &Completion, granted: u32) -> RestrictedChild {
 /// Panics on any Win32 failure: a fixture that silently degrades would make its consumers
 /// pass vacuously.
 fn spawn_with_ace_cmdline(alone: &Completion, granted: u32, cmdline: &str) -> RestrictedChild {
-    // Before ANY fixture exists, so no denial assertion can observe a token that still
+    // Before the child is created, so no denial assertion can observe a token that still
     // bypasses DACLs.
     drop_se_debug_privilege(alone);
 
