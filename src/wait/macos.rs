@@ -87,11 +87,21 @@ pub(crate) fn add_with_receipt(kq: &Kqueue, change: KEvent) -> Result<i64, Error
 /// Arm an `EVFILT_PROC | NOTE_EXIT` filter for `pid` on an EXISTING kqueue. `Ok(None)` => the
 /// pid is already gone.
 pub(crate) fn arm_note_exit_on(kq: &Kqueue, pid: u32) -> Result<Option<()>, Error> {
+    arm_proc_on(kq, pid, FilterFlag::NOTE_EXIT)
+}
+
+/// [`arm_note_exit_on`] with `NOTE_SIGNAL` as well: every signal sent to `pid` wakes the kqueue,
+/// and so does its exit.
+pub(crate) fn arm_exit_and_signals_on(kq: &Kqueue, pid: u32) -> Result<Option<()>, Error> {
+    arm_proc_on(kq, pid, FilterFlag::NOTE_EXIT | FilterFlag::NOTE_SIGNAL)
+}
+
+fn arm_proc_on(kq: &Kqueue, pid: u32, fflags: FilterFlag) -> Result<Option<()>, Error> {
     let change = KEvent::new(
         pid as usize,
         EventFilter::EVFILT_PROC,
         EvFlags::EV_ADD | EvFlags::EV_RECEIPT,
-        FilterFlag::NOTE_EXIT,
+        fflags,
         0,
         0,
     );
@@ -311,9 +321,14 @@ pub(crate) mod test_hooks;
 
 #[path = "macos/await_reapable.rs"]
 mod await_reapable;
+#[path = "macos/tracer_watch.rs"]
+mod tracer_watch;
 #[cfg(test)]
 pub(crate) use await_reapable::await_reapable_on;
 pub(crate) use await_reapable::{await_reapable, Waited};
+#[cfg(test)]
+pub(crate) use tracer_watch::seams as tracer_seams;
+pub(crate) use tracer_watch::{OnTracer, TracerWatch};
 
 pub(crate) fn kill(id: ProcessId) -> Result<(), Error> {
     use nix::sys::signal::{kill as nix_kill, Signal};
