@@ -6,20 +6,23 @@
 //! instead, which is what a parent with no std handles hands down) to null, spawns `report-std-handles` once per
 //! route, restores the handles, and prints one `<route>=<report>` line per route. `<backend>` is
 //! `sync` or `tokio`. A route whose spawn fails prints `err=<error>`. Each grandchild also reports
-//! whether it inherited `<dir>\stray.txt`, an inheritable handle given to no `Command`.
+//! whether it inherited `<dir>\stray.txt`, an inheritable handle given to no `Command`, and how many
+//! handles it holds that name the NUL device.
 
 use std::ffi::OsString;
 use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 
-use windows::Win32::Foundation::{SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT};
+use windows::Win32::Foundation::{GetHandleInformation, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT};
 use windows::Win32::Storage::FileSystem::{
     GetFileType, GetFinalPathNameByHandleW, FILE_NAME_NORMALIZED, FILE_TYPE_CHAR, FILE_TYPE_DISK, FILE_TYPE_PIPE,
 };
 use windows::Win32::System::Console::{
     SetStdHandle, STD_ERROR_HANDLE, STD_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
-use windows::Win32::System::Threading::{GetStartupInfoW, STARTF_USESTDHANDLES, STARTUPINFOW};
+use windows::Win32::System::Threading::{
+    GetCurrentProcess, GetProcessHandleCount, GetStartupInfoW, STARTF_USESTDHANDLES, STARTUPINFOW,
+};
 
 #[link(name = "kernel32", kind = "raw-dylib")]
 extern "system" {
@@ -27,6 +30,30 @@ extern "system" {
     #[link_name = "GetStdHandle"]
     fn raw_std_handle(id: STD_HANDLE) -> HANDLE;
 }
+
+#[link(name = "ntdll", kind = "raw-dylib")]
+extern "system" {
+    /// `class` 4 is `FileFsDeviceInformation`: a [`DeviceInfo`]. `io_status` is an
+    /// `IO_STATUS_BLOCK`: two pointer-sized words.
+    fn NtQueryVolumeInformationFile(
+        handle: HANDLE,
+        io_status: *mut [usize; 2],
+        info: *mut DeviceInfo,
+        len: u32,
+        class: u32,
+    ) -> i32;
+}
+
+/// `FILE_FS_DEVICE_INFORMATION`.
+#[repr(C)]
+#[derive(Default)]
+struct DeviceInfo {
+    device_type: u32,
+    characteristics: u32,
+}
+
+/// `FILE_DEVICE_NULL`: the device type of `\Device\Null`.
+const FILE_DEVICE_NULL: u32 = 0x15;
 
 /// This process's std handle `id`, null included.
 fn std_handle(id: STD_HANDLE) -> HANDLE {
@@ -41,7 +68,7 @@ const STD: [(&str, STD_HANDLE); 3] = [
 
 /// `std`: `std::process::Command`. `argv`: cosca's std route. The rest are cosca's raw backend:
 /// `exe` (`executable()`), `fd3` (fd 3 is the null device), `exe_merge` (stderr merged into
-/// stdout), `stray_fd3` (fd 3 is the stray file, given to the child as a dup with another handle value) and
+/// stdout), `listed` (fd 3 is the stray file: a handle that is listed, so it must be inherited) and
 /// `merge3` (fd 3 is merged from stdout, so it is null when stdout is) and `merge_live` (every std
 /// slot whose handle in this process is live is merged from the first nulled slot, so all three of
 /// the child's std ends are null while this process still holds a live handle). Three routes
@@ -54,7 +81,7 @@ const ROUTES: [&str; 11] = [
     "exe",
     "fd3",
     "exe_merge",
-    "stray_fd3",
+    "listed",
     "merge3",
     "merge_live",
     "pipe_out",
@@ -65,10 +92,11 @@ const ROUTES: [&str; 11] = [
 const STRAY: &str = "stray.txt";
 
 /// `report-std-handles <report> <stray>`: writes to `<report>` one line,
-/// `usestdhandles=<bool>,stdin=<kind>,stdout=<kind>,stderr=<kind>,fd3=<open|closed>,stray=<state>`.
+/// `usestdhandles=<bool>,stdin=<kind>,stdout=<kind>,stderr=<kind>,fd3=<open|closed>,stray=<state>,nul=<n>`.
 /// A kind is `null`, `char`, `pipe`, `disk`, `invalid` or `unknown(err=<code>)`. `<stray>` is a hex
 /// handle value, or `fd:<n>` for the handle behind CRT fd `n`; `stray` is `true` if it names a file
 /// called `stray.txt` in this process, `false` if it is not (a handle to) a disk file here, else `error(<code>)`.
+/// `nul` is the number of handles this process holds that name the NUL device, `\Device\Null`.
 pub fn report(path: &str, stray: &str) {
     let mut si = STARTUPINFOW::default();
     unsafe { GetStartupInfoW(&mut si) };
@@ -101,7 +129,45 @@ pub fn report(path: &str, stray: &str) {
         None => HANDLE(usize::from_str_radix(stray, 16).expect("a hex handle value") as *mut _),
     };
     fields.push(format!("stray={}", probe_stray(stray)));
+    fields.push(format!("nul={}", count_nul_handles()));
     std::fs::write(path, fields.join(",")).expect("write the report");
+}
+
+/// How many handles this process holds that name `\Device\Null`. It visits every handle value:
+/// `GetProcessHandleCount` says how many handles there are, and the walk ends once it has seen that
+/// many. It asks each handle for its device type, as `GetFileType` does, never for its name: a name
+/// query on a synchronous pipe blocks while any process has a read pending on the same file object,
+/// as a CI runner has on a pipe handle this process inherits.
+fn count_nul_handles() -> usize {
+    let mut count = 0u32;
+    // SAFETY: the pseudo-handle is always valid; `count` is a live out-parameter.
+    unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) }.expect("GetProcessHandleCount");
+    let (mut remaining, mut nul, mut value) = (count, 0, 0usize);
+    while remaining > 0 {
+        value += 4;
+        // A process holds at most 2^24 handles, each a multiple of 4.
+        assert!(value <= 1 << 26, "fewer handles found than the process says it holds");
+        let h = HANDLE(value as *mut _);
+        let mut flags = 0u32;
+        // SAFETY: a value that is not a handle in this process is an error, not UB.
+        if unsafe { GetHandleInformation(h, &mut flags) }.is_err() {
+            continue;
+        }
+        remaining -= 1;
+        if device_type(h) == Some(FILE_DEVICE_NULL) {
+            nul += 1;
+        }
+    }
+    nul
+}
+
+/// The device type of the file `h` names, or `None` if `h` is not a file.
+fn device_type(h: HANDLE) -> Option<u32> {
+    let (mut io_status, mut info) = ([0usize; 2], DeviceInfo::default());
+    // SAFETY: `io_status` and `info` are live out-parameters of the sizes passed.
+    let status =
+        unsafe { NtQueryVolumeInformationFile(h, &mut io_status, &mut info, size_of::<DeviceInfo>() as u32, 4) };
+    (status >= 0).then_some(info.device_type)
 }
 
 /// The handle behind CRT fd `fd`, or `None` if the fd is not open.
@@ -123,9 +189,7 @@ fn crt_handle(fd: i32) -> Option<HANDLE> {
 /// Whether `h` names `stray.txt` in this process. A value that is not a handle here, or that is
 /// another kind of object this process made at the same value, is not the stray: `false`. A disk
 /// file that the probe cannot name is reported as `error(<code>)`, so a broken probe cannot read as
-/// "not inherited". Only a disk file is asked for its name: a name query on a synchronous pipe blocks
-/// while any process has a read pending on the same file object, as a CI runner has on a pipe handle
-/// this process inherits.
+/// "not inherited". Only a disk file is asked for its name, for the reason in [`count_nul_handles`].
 fn probe_stray(h: HANDLE) -> String {
     // SAFETY: a handle value this process does not hold is an error, not UB.
     if unsafe { GetFileType(h) } != FILE_TYPE_DISK {
@@ -256,8 +320,8 @@ fn run(
         "cosca_testbin".into(),
         "report-std-handles".into(),
         report.as_os_str().to_owned(),
-        // `stray_fd3` hands the child the stray file at fd 3, a dup with another handle value.
-        if route == "stray_fd3" { "fd:3" } else { stray_hex }.into(),
+        // `listed` hands the child the stray file at fd 3, a dup with another handle value.
+        if route == "listed" { "fd:3" } else { stray_hex }.into(),
     ];
     match backend {
         "sync" => {
@@ -301,7 +365,7 @@ fn configure_sync(
     merges: &[(cosca::Fd, cosca::Fd)],
 ) -> Result<(), String> {
     match route {
-        "exe" | "exe_merge" | "stray_fd3" | "merge3" | "merge_live" | "pipe_out" | "null_io" | "pipe_fd3" => {
+        "exe" | "exe_merge" | "listed" | "merge3" | "merge_live" | "pipe_out" | "null_io" | "pipe_fd3" => {
             cmd.executable(exe).args(argv);
         }
         "argv" => {
@@ -314,7 +378,7 @@ fn configure_sync(
         other => panic!("unknown route {other:?}"),
     }
     match route {
-        "stray_fd3" => {
+        "listed" => {
             let dup = stray.try_clone().map_err(|e| e.to_string())?;
             cmd.fd(3, cosca::Stdio::from_file(dup)).map_err(|e| e.to_string())?;
         }
@@ -357,7 +421,7 @@ fn configure_tokio(
     merges: &[(cosca::Fd, cosca::Fd)],
 ) -> Result<(), String> {
     match route {
-        "exe" | "exe_merge" | "stray_fd3" | "merge3" | "merge_live" | "pipe_out" | "null_io" | "pipe_fd3" => {
+        "exe" | "exe_merge" | "listed" | "merge3" | "merge_live" | "pipe_out" | "null_io" | "pipe_fd3" => {
             cmd.executable(exe).args(argv);
         }
         "argv" => {
@@ -370,7 +434,7 @@ fn configure_tokio(
         other => panic!("unknown route {other:?}"),
     }
     match route {
-        "stray_fd3" => {
+        "listed" => {
             let dup = stray.try_clone().map_err(|e| e.to_string())?;
             cmd.fd(3, cosca::Stdio::from_file(dup)).map_err(|e| e.to_string())?;
         }

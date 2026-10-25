@@ -234,7 +234,7 @@ pub(crate) fn windows_spawn(
 /// are both parameters — so every arm is unit-testable without the OS producing the configuration.
 ///
 /// It runs on the error path of a spawn SYSCALL and nowhere else. Everything above a syscall
-/// (stdio resolution, executable resolution, handle-inherit calls, the
+/// (stdio resolution, executable resolution, handle-inherit calls, the attribute list, the
 /// post-spawn attach) can fail access-denied for reasons that have nothing to do with a breakaway
 /// request, and the soundness argument below holds only for the error the spawn call itself
 /// returned.

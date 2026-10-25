@@ -533,14 +533,15 @@ fn fd3_only_routing_does_not_load_a_binary_planted_in_the_process_cwd() {
 }
 
 #[cfg(windows)]
-/// A write end that is inheritable and given to the child through no `Stdio` reaches it: the raw
-/// backend hands the child every inheritable handle, as `std` does (`bInheritHandles` TRUE, no
-/// handle list). The parent closes its own copy of the write end right after the spawn, so a child
-/// that did not inherit it leaves the read at EOF and the test fails by assertion. Reading the
-/// byte the child writes to that exact handle value cannot pass on a handle of the child's own.
-/// Mutant: a `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` scoped to the child's ends.
+/// An inheritable write end given to the child through no `Stdio` does not reach it: the child
+/// inherits the handles `cosca` lists, and no others ([Handle Inheritance]). The child writes a
+/// byte to that exact handle value; the parent closes its own copy, so the read returns EOF with
+/// no byte if the child did not inherit it. Mutant: no `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`
+/// (`bInheritHandles` TRUE, `lpAttributeList` null).
+///
+/// [Handle Inheritance]: https://learn.microsoft.com/en-us/windows/win32/sysinfo/handle-inheritance
 #[skuld::test]
-fn an_unlisted_inheritable_handle_reaches_the_child() {
+fn an_unlisted_inheritable_handle_does_not_reach_the_child() {
     let (mut reader, writer) = common::inheritable_pipe();
     let value = std::os::windows::io::AsRawHandle::as_raw_handle(&writer) as usize;
     let mut c = cosca::Command::new();
@@ -551,16 +552,15 @@ fn an_unlisted_inheritable_handle_reaches_the_child() {
     let mut got = Vec::new();
     std::io::Read::read_to_end(&mut reader, &mut got).expect("read the pipe");
     child.wait().unwrap();
-    assert_eq!(got, b"X", "the child did not inherit the unlisted handle {value:x}");
+    assert_eq!(got, b"", "the child inherited the unlisted handle {value:x}");
 }
 
 #[cfg(windows)]
-/// The child inherits every inheritable handle, so a child end left open and inheritable after a
-/// spawn would reach every later child. After one spawn per kind of child end (std pipes, null,
-/// inherit, files and a merge; fd 3 pipes, null, a file and a merge), this process holds no
-/// inheritable handle it did not hold before, with the child still running its `Child` handle open.
-/// Single-threaded: nothing else opens handles during a snapshot. Mutant: `drop(child_ends)` in
-/// `spawn_raw` replaced by `std::mem::forget(child_ends)`, or any path that skips the drop.
+/// A child end left inheritable after a spawn would reach any spawner in this process that passes
+/// `bInheritHandles` TRUE with no list. After one spawn per kind of child end
+/// (`child_end_kinds`), this process holds no inheritable handle it did not hold before, with the
+/// child's `Child` still open. Single-threaded: nothing else opens handles during a snapshot.
+/// Mutant: `drop(child_ends)` in `spawn_raw` replaced by `std::mem::forget(child_ends)`.
 #[skuld::test]
 fn no_inheritable_handle_outlives_a_raw_spawn() {
     for (kind, targets) in common::inheritable::child_end_kinds() {
@@ -578,11 +578,35 @@ fn no_inheritable_handle_outlives_a_raw_spawn() {
 }
 
 #[cfg(windows)]
+/// As `no_inheritable_handle_outlives_a_raw_spawn`, for a spawn that fails after its child ends
+/// exist: `CreateProcessW` is refused for a nonexistent `raw_executable()` (`executable()` fails in
+/// resolution, before any child end exists). Mutant: the error arm `forget`s `child_ends` instead
+/// of dropping it.
+#[skuld::test]
+fn no_inheritable_handle_outlives_a_failed_raw_spawn() {
+    let missing = format!("{}.missing", common::testbin());
+    for (kind, targets) in common::inheritable::child_end_kinds() {
+        let before = common::inheritable::snapshot();
+        let mut c = cosca::Command::new();
+        c.raw_executable(&missing).args(["cosca_testbin", "exit", "0"]);
+        for (slot, target) in targets {
+            c.fd(slot, target).unwrap();
+        }
+        assert!(
+            c.spawn().is_err(),
+            "{kind}: spawning a nonexistent executable succeeded"
+        );
+        let leaked: Vec<_> = common::inheritable::snapshot().difference(&before).copied().collect();
+        assert!(leaked.is_empty(), "{kind}: inheritable handles left open: {leaked:x?}");
+    }
+}
+
+#[cfg(windows)]
 /// All three parent std handles null (a GUI or service): the child gets null handles, no
-/// `STARTF_USESTDHANDLES`; where the caller configures a child end (a pipe, the null device,
-/// fd 3), the child gets it. Mutants: `GetFileType(NULL)` (fails with 6); `STARTF_USESTDHANDLES`
-/// always set; the flag set only when this process holds a live std handle (`pipe_out`, `null_io`,
-/// `pipe_fd3`).
+/// `STARTF_USESTDHANDLES`, and no unlisted handle; where the caller configures a child end (a pipe,
+/// the null device, fd 3), the child gets it. Mutants: `GetFileType(NULL)` (fails with 6);
+/// `STARTF_USESTDHANDLES` always set; `bInheritHandles` TRUE without a HANDLE_LIST; the flag set
+/// only when this process holds a live std handle (`pipe_out`, `null_io`, `pipe_fd3`).
 #[skuld::test]
 fn raw_spawn_with_null_parent_std_handles_gives_the_child_null() {
     common::null_std::assert_every_route("sync", "all");
@@ -601,9 +625,9 @@ fn raw_spawn_with_one_null_parent_std_handle_gives_the_child_that_one_null() {
 
 #[cfg(windows)]
 /// Two parent std handles null, one live: `STARTF_USESTDHANDLES` is still set, the null slots
-/// are gaps, and a live slot merged from a null one is null too. Mutants: the flag set only when
-/// some child end is non-null (`merge_live` and `exe_merge` with `stdin+stdout` nulled); the flag
-/// keyed on one parent slot only (each set).
+/// are gaps, and a live slot merged from a null one is null too, with a NUL device as the whole
+/// HANDLE_LIST. Mutants: the flag set only when some child end is non-null (`merge_live` and
+/// `exe_merge` with `stdin+stdout` nulled); the flag keyed on one parent slot only (each set).
 #[skuld::test]
 fn raw_spawn_with_two_null_parent_std_handles_gives_the_child_two_null() {
     for nulled in ["stdin+stdout", "stdin+stderr", "stdout+stderr"] {
@@ -613,11 +637,11 @@ fn raw_spawn_with_two_null_parent_std_handles_gives_the_child_two_null() {
 
 #[cfg(windows)]
 /// A parent whose std handles are `INVALID_HANDLE_VALUE` (what a parent with none hands down) is
-/// treated as one whose are null for the `STARTF_USESTDHANDLES` decision, as `std` treats it: with
-/// no flag the raw backend's child gets the -1 itself, as from `std`'s own route, which is the same
-/// absence of a handle.
+/// treated as one whose are null, as `std` treats it: the child of the raw backend gets null where
+/// it would get this process's handle, and no handle of this process leaks. `std`'s own route hands
+/// down the -1 itself, which is the same absence of a handle.
 #[skuld::test]
-fn raw_spawn_with_invalid_parent_std_handles_matches_std() {
+fn raw_spawn_with_invalid_parent_std_handles_gives_the_child_null() {
     for set in ["invalid:all", "invalid:stdout"] {
         common::null_std::assert_every_route("sync", set);
     }

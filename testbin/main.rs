@@ -315,12 +315,13 @@ fn main() {
         }
         #[cfg(windows)]
         "write-handle" => {
-            // Write one byte to the handle whose hex value is `args[2]`: proves the child
-            // inherited that exact handle. A failed write exits non-zero.
+            // Write one byte to the handle whose hex value is `args[2]`. The test reads the other
+            // end of that pipe: a byte arrives only if the child inherited that exact handle.
             use std::os::windows::io::FromRawHandle;
             let value = usize::from_str_radix(&args[2], 16).expect("a hex handle value");
-            // SAFETY: the value names a handle the parent made inheritable for this child, or
-            // nothing, in which case the write fails. It is not closed: the process exits next.
+            // SAFETY: the value names a handle of the parent's, or nothing or an unrelated handle
+            // here, in which case the write fails or goes elsewhere. It is not closed: the process
+            // exits next.
             let mut f = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_handle(value as *mut _) });
             if let Err(e) = f.write_all(b"X").and_then(|()| f.flush()) {
                 eprintln!("write-handle {}: {e}", args[2]);

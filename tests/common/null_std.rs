@@ -28,7 +28,8 @@ pub fn reports(backend: &str, nulled: &str) -> Vec<String> {
 
 /// Every route spawned, and its grandchild got the std handles that `set` implies (`all`, or std
 /// handle names joined by `+`, each optionally prefixed `invalid:`), saw fd 3 as expected, and
-/// inherited the stray handle: every route hands the child every inheritable handle.
+/// inherited the stray handle only where the route listed it. The std and argv routes inherit every
+/// inheritable handle (std's behavior), so their stray state is not checked.
 pub fn assert_every_route(backend: &str, set: &str) {
     // `invalid:` sets `INVALID_HANDLE_VALUE` rather than null; the child must see the same.
     let nulled = set.strip_prefix("invalid:").unwrap_or(set);
@@ -51,7 +52,7 @@ pub fn assert_every_route(backend: &str, set: &str) {
             _ => (stdin, stdout, stderr),
         };
         let fd3 = match route {
-            "fd3" | "stray_fd3" | "pipe_fd3" => "open",
+            "fd3" | "listed" | "pipe_fd3" => "open",
             "merge3" if stdout != "null" => "open",
             _ => "closed",
         };
@@ -59,9 +60,9 @@ pub fn assert_every_route(backend: &str, set: &str) {
         // handle for a slot: a child end that is null there (a merge from a null slot) takes its null
         // only through the flag.
         let used = nulled != "all" || matches!(route, "pipe_out" | "null_io" | "pipe_fd3");
-        // With no flag the child gets this process's own values, which `invalid:` made -1, on the
-        // raw routes as on `std`'s.
-        let blank = if set.starts_with("invalid:") && !used {
+        // `std`'s route has no flag and inherits blanket, so the child gets this process's own
+        // values, which `invalid:` made -1. The raw backend passes no handle to inherit: null.
+        let blank = if set.starts_with("invalid:") && !used && matches!(route, "std" | "argv") {
             "invalid"
         } else {
             "null"
@@ -77,7 +78,7 @@ pub fn assert_every_route(backend: &str, set: &str) {
         "exe",
         "fd3",
         "exe_merge",
-        "stray_fd3",
+        "listed",
         "merge3",
         "merge_live",
         "pipe_out",
@@ -86,9 +87,20 @@ pub fn assert_every_route(backend: &str, set: &str) {
     ];
     assert_eq!(got.len(), routes.len(), "{got:?}");
     for (route, line) in routes.iter().zip(&got) {
-        let (head, stray) = line.rsplit_once(",stray=").unwrap_or((line, "<missing>"));
+        let (line_no_nul, nul) = line.rsplit_once(",nul=").unwrap_or((line, "<missing>"));
+        let (head, stray) = line_no_nul.rsplit_once(",stray=").unwrap_or((line_no_nul, "<missing>"));
         assert_eq!(head, want(route), "route {route} with {nulled} nulled: {line}");
-        // Every route hands the grandchild every inheritable handle, the stray file included.
-        assert_eq!(stray, "true", "route {route} with {nulled} nulled: {line}");
+        if *route == "merge_live" {
+            // All three child ends are null, so the only handle the grandchild can hold that names
+            // the NUL device is the one that spawn adds to make the inheritance list non-empty. With
+            // no flag (all of this process's handles null) there is no list and no such handle.
+            let want_nul = if nulled == "all" { "0" } else { "1" };
+            assert_eq!(nul, want_nul, "route {route} with {nulled} nulled: {line}");
+        }
+        match *route {
+            "std" | "argv" => {}
+            "listed" => assert_eq!(stray, "true", "route {route} with {nulled} nulled: {line}"),
+            _ => assert_eq!(stray, "false", "route {route} with {nulled} nulled: {line}"),
+        }
     }
 }

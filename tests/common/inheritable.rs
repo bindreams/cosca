@@ -6,9 +6,11 @@ use std::collections::BTreeSet;
 use windows::Win32::Foundation::{GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT};
 use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
 
-/// The values of the handles this process holds with `HANDLE_FLAG_INHERIT` set. It visits every
-/// handle value: `GetProcessHandleCount` says how many handles there are, and the walk ends once
-/// it has seen that many. Only meaningful while no other thread opens or closes handles.
+/// The values of the handles this process holds with `HANDLE_FLAG_INHERIT` set. Only meaningful
+/// while no other thread opens or closes handles.
+///
+/// It visits every handle value: `GetProcessHandleCount` says how many handles there are, and the
+/// walk ends once it has seen that many.
 pub fn snapshot() -> BTreeSet<usize> {
     let mut count = 0u32;
     // SAFETY: the pseudo-handle is always valid; `count` is a live out-parameter.

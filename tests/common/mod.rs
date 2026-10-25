@@ -93,8 +93,7 @@ pub fn testbin() -> &'static str {
     })
 }
 
-/// An anonymous pipe whose write end is inheritable, as a handle a library or the application
-/// might hold open for its own reasons.
+/// An anonymous pipe whose write end is inheritable.
 #[cfg(windows)]
 pub fn inheritable_pipe() -> (std::io::PipeReader, std::io::PipeWriter) {
     use std::os::windows::io::AsRawHandle;

@@ -4,7 +4,7 @@
 //! independently of argv[0] (the case std/tokio cannot express on Windows), wires arbitrary
 //! descriptors (fd >= 3, via the MSVCRT `lpReserved2` table), and applies containment (Job Object /
 //! TreeWalk) — the full sync feature set. It reuses the sync backend's `CreateProcessW` FFI verbatim
-//! (`spawn_step`/`create_process`, the fd-table encode + cap, the STARTUPINFOEXW build,
+//! (`spawn_step`/`create_process`, the fd-table encode + cap, the STARTUPINFOEXW/HANDLE_LIST build,
 //! the containment decision, the lock/close discipline, the error-teardown) and differs only where
 //! async demands it: piped ends come from the tokio overlapped-named-pipe machinery (std slots via
 //! the stdin/stdout/stderr accessors, fd >= 3 via fd_read_end/fd_write_end), and the owned child is
@@ -232,7 +232,7 @@ struct WaitObserver {
 
 /// Spawn `cmd` via the async raw backend: an `executable()` loaded independently of argv[0], with
 /// arbitrary descriptors (fd >= 3) and containment — the full sync feature set. Reuses the sync
-/// backend's FFI (fd-table + containment decision + lock/close + error-teardown).
+/// backend's FFI (fd-table + HANDLE_LIST + containment decision + lock/close + error-teardown).
 ///
 /// Everything up to `CreateProcessW` fails before the program could start; everything after may
 /// come after it started.
@@ -290,31 +290,37 @@ pub(crate) fn spawn_raw(
     let (child_ends, owned_std, fd_pipes) = resolve_raw_ends(&fds, parent_std).not_started()?;
 
     // Classify + encode the dense MSVCRT fd-table the child CRT reads back from `lpReserved2` — the
-    // SAME layout as the sync backend.
+    // SAME layout + HANDLE_LIST source as the sync backend.
     let table = sync_raw::build_fd_table(&child_ends).not_started()?;
 
-    // `table` (`bytes`) stays alive until after CreateProcessW.
-    let mut si = sync_raw::startup_info(&child_ends, &table, parent_std);
+    // `table` (`bytes`) and the attribute list stay alive until after CreateProcessW.
+    let mut startup = sync_raw::startup_info(&child_ends, &table, parent_std).not_started()?;
+    // The listed handles: `table.handles` (the non-null ends among 0/1/2 + fd >= 3, each a distinct
+    // fresh dup, its 0/1/2 entries being the hStd* handles) or, when that is empty, the filler. No
+    // duplicate reaches the list.
+    let all_handles: Vec<HANDLE> = startup.handles(&table).to_vec();
     // The complete word, composed above by the ONE function all three backends share — the two
     // structural bits this backend cannot spawn without included. Nothing ORs into it here.
     let flags = plan.creation_flags;
 
-    // UNDER THE LOCK: mark the child ends (`table.handles`) inheritable, spawn, then CLOSE them
-    // BEFORE the guard releases on EVERY path (mirrors the sync raw backend — an early `?` would
-    // drop the inner guard before `child_ends`, exposing inheritable handles to a concurrent spawn).
+    // UNDER THE LOCK: mark the listed child ends inheritable, spawn, then CLOSE the child ends and
+    // the attribute list BEFORE the guard releases on EVERY path (mirrors the sync raw backend —
+    // an early `?` would drop the inner guard before `child_ends`/`startup`, exposing inheritable
+    // handles to a concurrent spawn).
     let spawned = {
         let _guard = spawn_lock();
         let r = sync_raw::spawn_step(
-            &table.handles,
+            &all_handles,
             &app_name,
             &mut cmdline,
-            &mut si,
+            &mut startup.si,
             &spawn_env.block,
             &cwd_w,
             flags,
             *cmd.flags_request(),
         );
         drop(child_ends); // close the child ends inside the lock, on success AND error
+        drop(startup); // DeleteProcThreadAttributeList and the filler before the guard releases
         r
     };
     let (proc, pid) = spawned.not_started()?;
