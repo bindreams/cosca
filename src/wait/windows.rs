@@ -66,7 +66,7 @@ pub(crate) fn block_until_exit(id: ProcessId, deadline: Option<Option<Instant>>)
                     );
                     Err(Error::Unassessable {
                         detail: format!("pid {} could not be opened to watch for its exit", id.pid()),
-                        source: Some(win32_io_error(e)),
+                        source: Some(e.into()),
                     })
                 }
             }
@@ -168,7 +168,7 @@ pub(crate) fn open_verified(id: ProcessId) -> Result<Option<HANDLE>, Error> {
                     );
                     Err(Error::Unassessable {
                         detail: format!("pid {} could not be opened to watch for its exit", id.pid()),
-                        source: Some(win32_io_error(e)),
+                        source: Some(e.into()),
                     })
                 }
             }
@@ -278,7 +278,7 @@ pub(crate) fn kill(id: ProcessId) -> Result<(), Error> {
                     );
                     Err(Error::Unassessable {
                         detail: format!("pid {} could not be opened to terminate it", id.pid()),
-                        source: Some(win32_io_error(e)),
+                        source: Some(e.into()),
                     })
                 }
             }
