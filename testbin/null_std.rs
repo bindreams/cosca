@@ -7,8 +7,10 @@
 //! route, restores the handles, and prints one `<route>=<report>` line per route. `<backend>` is
 //! `sync` or `tokio`. A route whose spawn fails prints `err=<error>`. Each grandchild also reports
 //! whether it inherited `<dir>\stray.txt`, an inheritable handle given to no `Command`, and how many
-//! handles it holds that name the NUL device.
+//! handles it holds that name the NUL device. A spawn that leaves an inheritable handle open in
+//! this process is a route failure: `err=inheritable handles left open: [...]`.
 
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::os::windows::io::AsRawHandle;
 use std::path::Path;
@@ -133,16 +135,15 @@ pub fn report(path: &str, stray: &str) {
     std::fs::write(path, fields.join(",")).expect("write the report");
 }
 
-/// How many handles this process holds that name `\Device\Null`. It visits every handle value:
-/// `GetProcessHandleCount` says how many handles there are, and the walk ends once it has seen that
-/// many. It asks each handle for its device type, as `GetFileType` does, never for its name: a name
-/// query on a synchronous pipe blocks while any process has a read pending on the same file object,
-/// as a CI runner has on a pipe handle this process inherits.
-fn count_nul_handles() -> usize {
+/// Calls `visit` with every handle this process holds and its `GetHandleInformation` flags. It
+/// visits every handle value: `GetProcessHandleCount` says how many handles there are, and the
+/// walk ends once it has seen that many. Only meaningful while no other thread opens or closes
+/// handles.
+fn walk_handles(mut visit: impl FnMut(HANDLE, u32)) {
     let mut count = 0u32;
     // SAFETY: the pseudo-handle is always valid; `count` is a live out-parameter.
     unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) }.expect("GetProcessHandleCount");
-    let (mut remaining, mut nul, mut value) = (count, 0, 0usize);
+    let (mut remaining, mut value) = (count, 0usize);
     while remaining > 0 {
         value += 4;
         // A process holds at most 2^24 handles, each a multiple of 4.
@@ -154,11 +155,33 @@ fn count_nul_handles() -> usize {
             continue;
         }
         remaining -= 1;
+        visit(h, flags);
+    }
+}
+
+/// How many handles this process holds that name `\Device\Null`. It asks each handle for its
+/// device type, as `GetFileType` does, never for its name: a name query on a synchronous pipe blocks
+/// while any process has a read pending on the same file object, as a CI runner has on a pipe
+/// handle this process inherits.
+fn count_nul_handles() -> usize {
+    let mut nul = 0;
+    walk_handles(|h, _| {
         if device_type(h) == Some(FILE_DEVICE_NULL) {
             nul += 1;
         }
-    }
+    });
     nul
+}
+
+/// The values of the handles this process holds with `HANDLE_FLAG_INHERIT` set.
+fn inheritable_handles() -> BTreeSet<usize> {
+    let mut found = BTreeSet::new();
+    walk_handles(|h, flags| {
+        if flags & HANDLE_FLAG_INHERIT.0 != 0 {
+            found.insert(h.0 as usize);
+        }
+    });
+    found
 }
 
 /// The device type of the file `h` names, or `None` if `h` is not a file.
@@ -251,7 +274,7 @@ pub fn spawn(backend: &str, nulled: &str, dir: &str) {
         .iter()
         .map(|route| {
             let report = Path::new(dir).join(format!("{route}.txt"));
-            match run(backend, route, &report, &stray_hex, &stray, &merges) {
+            match run_leaving_no_handle(backend, route, &report, &stray_hex, &stray, &merges) {
                 Ok(()) => format!(
                     "{route}={}",
                     std::fs::read_to_string(&report).expect("the grandchild's report")
@@ -287,6 +310,28 @@ fn restore_std(ids: &[(&str, STD_HANDLE)], saved: &[usize]) {
     for (&(_, id), &h) in ids.iter().zip(saved) {
         // SAFETY: sets this process's own std handle back to a value it held.
         unsafe { SetStdHandle(id, HANDLE(h as *mut _)) }.expect("restore the std handle");
+    }
+}
+
+/// [`run`], then check that the spawn left no inheritable handle open in this process: one left
+/// open would reach any other spawner here that passes `bInheritHandles` TRUE with no list. A route
+/// whose child ends are all null (`merge_live`, or `exe_merge` with stdin and stdout nulled)
+/// lists a NUL filler handle of cosca's own, and this is the check on its close.
+fn run_leaving_no_handle(
+    backend: &str,
+    route: &str,
+    report: &Path,
+    stray_hex: &str,
+    stray: &std::fs::File,
+    merges: &[(cosca::Fd, cosca::Fd)],
+) -> Result<(), String> {
+    let before = inheritable_handles();
+    run(backend, route, report, stray_hex, stray, merges)?;
+    let left: Vec<_> = inheritable_handles().difference(&before).copied().collect();
+    if left.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("inheritable handles left open: {left:x?}"))
     }
 }
 

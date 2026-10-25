@@ -534,12 +534,12 @@ fn fd3_only_routing_does_not_load_a_binary_planted_in_the_process_cwd() {
 
 #[cfg(windows)]
 /// An inheritable write end given to the child through no `Stdio` does not reach it: the child
-/// inherits the handles `cosca` lists, and no others ([Handle Inheritance]). The child writes a
+/// inherits the handles `cosca` lists, and no others ([Raymond Chen, 2011]). The child writes a
 /// byte to that exact handle value; the parent closes its own copy, so the read returns EOF with
 /// no byte if the child did not inherit it. Mutant: no `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`
 /// (`bInheritHandles` TRUE, `lpAttributeList` null).
 ///
-/// [Handle Inheritance]: https://learn.microsoft.com/en-us/windows/win32/sysinfo/handle-inheritance
+/// [Raymond Chen, 2011]: https://devblogs.microsoft.com/oldnewthing/20111216-00/?p=8873
 #[skuld::test]
 fn an_unlisted_inheritable_handle_does_not_reach_the_child() {
     let (mut reader, writer) = common::inheritable_pipe();
@@ -580,8 +580,8 @@ fn no_inheritable_handle_outlives_a_raw_spawn() {
 #[cfg(windows)]
 /// As `no_inheritable_handle_outlives_a_raw_spawn`, for a spawn that fails after its child ends
 /// exist: `CreateProcessW` is refused for a nonexistent `raw_executable()` (`executable()` fails in
-/// resolution, before any child end exists). Mutant: the error arm `forget`s `child_ends` instead
-/// of dropping it.
+/// resolution, before any child end exists). Mutant: `drop(child_ends)` in `spawn_raw` runs only
+/// when the spawn succeeded.
 #[skuld::test]
 fn no_inheritable_handle_outlives_a_failed_raw_spawn() {
     let missing = format!("{}.missing", common::testbin());

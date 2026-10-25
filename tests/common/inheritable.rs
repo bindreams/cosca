@@ -7,7 +7,9 @@ use windows::Win32::Foundation::{GetHandleInformation, HANDLE, HANDLE_FLAG_INHER
 use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
 
 /// The values of the handles this process holds with `HANDLE_FLAG_INHERIT` set. Only meaningful
-/// while no other thread opens or closes handles.
+/// while no other thread opens or closes handles: a handle closed mid-walk makes it run to its
+/// bound and assert. That holds under nextest, which runs each test in a process of its own; the
+/// suite runs under nothing else.
 ///
 /// It visits every handle value: `GetProcessHandleCount` says how many handles there are, and the
 /// walk ends once it has seen that many.

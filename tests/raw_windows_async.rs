@@ -285,8 +285,8 @@ async fn async_no_inheritable_handle_outlives_a_raw_spawn() {
 }
 
 #[cfg(all(windows, feature = "tokio"))]
-/// Async twin of sync `no_inheritable_handle_outlives_a_failed_raw_spawn`. Mutant: the error arm
-/// of the tokio `spawn_raw` `forget`s `child_ends` instead of dropping it.
+/// Async twin of sync `no_inheritable_handle_outlives_a_failed_raw_spawn`. Mutant: `drop(child_ends)` in the
+/// tokio `spawn_raw` runs only when the spawn succeeded.
 #[skuld::test]
 async fn async_no_inheritable_handle_outlives_a_failed_raw_spawn() {
     let missing = format!("{}.missing", common::testbin());

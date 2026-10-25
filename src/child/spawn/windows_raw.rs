@@ -9,27 +9,40 @@
 //!
 //! # Why a handle list
 //!
-//! A child receives exactly the handles cosca gives it, and no other handle of this process. That
-//! rests on Microsoft's guidance:
+//! This backend gives a child exactly the handles cosca lists, and no other handle of this
+//! process. That rests on Microsoft's guidance:
 //!
-//! - An inheritable handle is inherited by every child created with `bInheritHandles` TRUE
-//!   ([Handle Inheritance]), so the process-wide inheritable flag alone cannot scope a handle to
-//!   one child.
+//! - `bInheritHandles` TRUE makes a child inherit every inheritable handle of this process
+//!   ([`CreateProcessW`], Remarks), so the inheritable flag alone cannot scope a handle to one
+//!   child ([Handle Inheritance] lists the two steps that make a handle inheritable).
 //! - `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` names the handles one child inherits; each must be
 //!   inheritable, and `bInheritHandles` must be TRUE ([`UpdateProcThreadAttribute`]).
 //! - The flag is shared by all threads, so two threads that each mark a handle inheritable and
 //!   spawn race; the list is the fix ([Raymond Chen, 2011]).
 //!
-//! The listed ends are marked inheritable, spawned and closed under [`spawn_lock`]; a list cannot
-//! be empty, so when no end is listed a NUL handle is the list.
+//! The listed ends are marked inheritable, spawned and closed under [`spawn_lock`]. A list cannot
+//! be empty: when `STARTF_USESTDHANDLES` is set and no end is listed, a NUL handle is the list.
+//! Without that flag and without ends there is no list, `bInheritHandles` is FALSE and the child
+//! inherits nothing.
 //!
 //! # What the list does not cover
 //!
-//! The ends are inheritable between the mark and the close. Another spawner in this process that
-//! passes `bInheritHandles` TRUE with no list (an application's or library's own `CreateProcessW`)
-//! can take them in that window: `spawn_lock` orders cosca's spawns only, and cannot stop a spawn
-//! it does not know of ([Raymond Chen, 2026]).
+//! - The std route (argv-only commands) is `std::process::Command`: it passes `bInheritHandles`
+//!   TRUE with no list, so its child inherits every inheritable handle. That is why `spawn_lock`
+//!   is held on both routes. A raw child ignores the ends of another cosca spawn because it has a
+//!   list; a std-route spawn has none, and would take a raw spawn's ends if it ran in the window
+//!   below.
+//! - The ends are inheritable between the mark and the close. Another spawner in this process
+//!   that passes `bInheritHandles` TRUE with no list (an application's or library's own
+//!   `CreateProcessW`) can take them in that window: `spawn_lock` orders cosca's spawns only
+//!   ([Raymond Chen, 2026]). His remedy, which cosca does not adopt, is to create the handles
+//!   non-inheritable and duplicate them into a helper process that creates the child
+//!   (`PROC_THREAD_ATTRIBUTE_PARENT_PROCESS`).
 //!
+//! `windows_raw` here is `crate::child::spawn::windows_raw`; the async backend
+//! `crate::tokio::spawn::windows_raw` has the same properties.
+//!
+//! [`CreateProcessW`]: https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessw
 //! [Handle Inheritance]: https://learn.microsoft.com/en-us/windows/win32/sysinfo/handle-inheritance
 //! [`UpdateProcThreadAttribute`]: https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute
 //! [Raymond Chen, 2011]: https://devblogs.microsoft.com/oldnewthing/20111216-00/?p=8873
@@ -549,8 +562,9 @@ fn listed_handles<'a>(filler: &'a Option<Filler>, table: &'a crt_fds::FdTable) -
 /// the child gets this process's handle in that slot. So the flag is set whenever a child end or
 /// this process's handle for any std slot (as read in `parent_std`) is non-null, and only when all six are null does the child
 /// get the OS default, as with std. The flag requires `bInheritHandles`, which needs a HANDLE_LIST
-/// (never blanket inheritance), and a list cannot be empty: when no child end is listed, a NUL
-/// handle opened for this spawn is the list.
+/// (never blanket inheritance), and a list cannot be empty: when the flag is set and no child end
+/// is listed, a NUL handle opened for this spawn is the list. Without the flag and without ends
+/// there is no list.
 pub(crate) fn startup_info(
     child_ends: &BTreeMap<Fd, ChildEnd>,
     table: &crt_fds::FdTable,
