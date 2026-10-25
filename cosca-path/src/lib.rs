@@ -1,4 +1,5 @@
-//! Pure per-OS paths: [`posix::Path`] works on any host, with POSIX rules.
+//! Pure per-OS paths: [`posix::Path`] and [`windows::Path`] work on any host, each with its
+//! OS's rules.
 //!
 //! Nothing here normalises implicitly. Constructors, [`PurePath::join`], equality and `Debug` keep
 //! every component as written: `a/./b` has the components `a`, `.`, `b`, and differs from `a/b`.
@@ -13,6 +14,7 @@ use std::fmt::{self, Debug};
 use std::hash::Hash;
 
 pub mod posix;
+pub mod windows;
 
 /// One component of a path after its anchor, exactly as written.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
