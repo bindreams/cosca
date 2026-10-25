@@ -4,6 +4,7 @@
 #![cfg(windows)]
 
 use std::ffi::OsStr;
+use std::io::Write as _;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 
@@ -106,7 +107,8 @@ impl Subst {
 impl Drop for Subst {
     fn drop(&mut self) {
         if let Err(e) = self.remove() {
-            eprintln!("{e}");
+            // Never a panic: this runs while unwinding too, and in the testbin stderr may be closed.
+            let _ = writeln!(std::io::stderr(), "{e}");
         }
     }
 }

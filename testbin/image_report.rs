@@ -52,7 +52,7 @@ fn main() {
         Err(e) => format!("elevated-error={e}"),
     };
     let report = format!("{module}\n{image}\n{cwd}\n{elevated}\n");
-    print!("{report}");
+    say(&mut std::io::stdout().lock(), report.as_bytes());
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     let mut flags = args.iter();
     while let Some(flag) = flags.next() {
@@ -120,6 +120,19 @@ fn is_elevated() -> windows::core::Result<bool> {
 
 #[cfg(not(windows))]
 fn main() {
-    eprintln!("cosca_testbin_image is a Windows canary payload");
+    say(
+        &mut std::io::stderr().lock(),
+        b"cosca_testbin_image is a Windows canary payload\n",
+    );
     std::process::exit(1);
+}
+
+/// Write `bytes` and flush. A reader that hung up (`BrokenPipe`) is a normal end; any other error
+/// panics. Standalone, not `quiet_io`: this canary depends on nothing else in the testbin.
+fn say(w: &mut impl std::io::Write, bytes: &[u8]) {
+    match w.write_all(bytes).and_then(|()| w.flush()) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(e) => panic!("write the report: {e}"),
+    }
 }

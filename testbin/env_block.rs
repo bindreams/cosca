@@ -2,8 +2,6 @@
 //! from each Windows backend, byte for byte. Also `with-env-block`, which runs any mode in a block
 //! given entry by entry, and `spawn-consent-with-block`, which starts `consent-spawn` in a given block.
 
-use std::io::Write;
-
 use windows::core::PCWSTR;
 use windows::Win32::System::Environment::{FreeEnvironmentStringsW, GetEnvironmentStringsW};
 
@@ -12,12 +10,13 @@ use windows::Win32::System::Environment::{FreeEnvironmentStringsW, GetEnvironmen
 /// surrogates are what the OS holds.
 pub fn dump() {
     let units = block_units();
-    let mut out = std::io::stdout().lock();
+    let mut lines = String::new();
     for entry in units.split(|&u| u == 0).take_while(|e| !e.is_empty()) {
         let hex: String = entry.iter().map(|u| format!("{u:04x}")).collect();
-        writeln!(out, "{hex}").unwrap();
+        lines.push_str(&hex);
+        lines.push('\n');
     }
-    out.flush().unwrap();
+    crate::quiet_io::put_stdout(lines.as_bytes(), "dump-env-block: write stdout");
 }
 
 /// This process's environment block, UTF-16LE, through the empty entry that closes it.
@@ -73,7 +72,7 @@ pub fn spawn(backend: &str, ops: &[String]) {
         "dump-env-block failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    std::io::stdout().write_all(&out.stdout).unwrap();
+    crate::quiet_io::put_stdout(&out.stdout, "spawn-dump-env-block: write stdout");
 }
 
 /// Run `spawn-dump-env-block <dump_args>` in a child whose environment block is exactly `entries`,
@@ -147,9 +146,9 @@ pub fn try_block(entries: &[String]) {
     match create_with_block(entries, "exit 0", None) {
         Ok(code) => {
             assert_eq!(code, 0, "the probe child failed");
-            println!("ok");
+            outln!("ok");
         }
-        Err(e) => println!("err={}", e.code().0 & 0xFFFF),
+        Err(e) => outln!("err={}", e.code().0 & 0xFFFF),
     }
 }
 
