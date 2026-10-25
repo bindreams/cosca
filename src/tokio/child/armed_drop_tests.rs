@@ -234,3 +234,55 @@ async fn tokio_armed_drop_whose_tree_kill_fails_does_not_wait_for_the_drain() {
         "the leaf left behind is named: {steps:?}"
     );
 }
+
+/// A leaf that has not drained 1 s after the drop's kill: the drop warns once, naming the root's
+/// pid and the leaf, and keeps waiting. The fake leaf's member is released by the leaf's own
+/// `rmdir`, which runs only after the bounded look that decides the warn, and which records
+/// whether the warn was already out.
+///
+/// Mutant: no warn on the drain.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn tokio_armed_drop_warns_once_when_the_drain_waits_past_1s() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use super::child_drop_tests::linux;
+    use crate::containment::cgroup::fault as leaf_fault;
+    use crate::containment::cgroup::test_support::FakeLeaf;
+
+    crate::tokio::test_runtime::assert_current_thread();
+    let name = "cosca-armed-drop-slow-drain";
+    let (fake, leaf) = linux::fake_leaf(name, true);
+    let (child, _stdin) = blocker();
+    let needle = format!("async child {}", child.id().pid());
+    let mark = crate::log_capture::mark();
+    let warned_by_rmdir = Rc::new(Cell::new(None));
+    let seen = Rc::clone(&warned_by_rmdir);
+    let (path, events) = (fake.leaf.clone(), fake.events.clone());
+    let warn_needle = needle.clone();
+    leaf_fault::set_rmdir_hook(move |_| {
+        if seen.get().is_none() {
+            let warns = crate::log_capture::records_since(mark, &warn_needle)
+                .into_iter()
+                .filter(|text| text.contains("still waiting") && text.contains(name))
+                .count();
+            seen.set(Some(warns));
+            FakeLeaf::set_populated(&events, false);
+        }
+        FakeLeaf::rmdir(&path, &events)
+    });
+    let (steps, _) = linux::dropped(linux::contained_by(child, leaf), name);
+
+    assert_eq!(
+        warned_by_rmdir.get(),
+        Some(1),
+        "one warn naming the leaf before the leaf's own removal: {steps:?}"
+    );
+    assert!(!fake.leaf.exists(), "the drained leaf is removed: {steps:?}");
+    assert_eq!(
+        crate::log_capture::levels_since(mark, "still waiting"),
+        [log::Level::Warn],
+        "exactly one warn"
+    );
+}
