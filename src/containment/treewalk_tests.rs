@@ -219,9 +219,15 @@ fn children_of_duplicate_edge_yields_pid_once() {
 #[cfg(windows)]
 #[skuld::test]
 fn resolve_or_drop_drops_an_access_denied_pid_and_warns() {
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(resolve_or_drop_drops_an_access_denied_pid_and_warns),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
     use windows::Win32::System::Threading::PROCESS_SYNCHRONIZE;
     crate::log_capture::install();
-    let denied = crate::identity::windows_fixture::spawn_restricted(PROCESS_SYNCHRONIZE.0);
+    let denied = crate::identity::windows_fixture::spawn_restricted(&done, PROCESS_SYNCHRONIZE.0);
     assert!(denied.is_running(), "precondition: the subject must be live");
     let mark = crate::log_capture::mark();
     assert!(
@@ -239,7 +245,13 @@ fn resolve_or_drop_drops_an_access_denied_pid_and_warns() {
 #[cfg(windows)]
 #[skuld::test]
 fn kill_by_identity_reports_not_attempted_when_the_open_is_denied() {
-    let child = crate::identity::windows_fixture::spawn_unkillable();
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(kill_by_identity_reports_not_attempted_when_the_open_is_denied),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
+    let child = crate::identity::windows_fixture::spawn_unkillable(&done);
     let id = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
         .expect("the owned handle always yields an identity");
     assert!(child.is_running(), "precondition: the subject must be live");
@@ -252,10 +264,16 @@ fn kill_by_identity_reports_not_attempted_when_the_open_is_denied() {
 #[cfg(windows)]
 #[skuld::test]
 fn kill_by_identity_spares_a_stale_identity_and_kills_a_matching_one() {
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(kill_by_identity_spares_a_stale_identity_and_kills_a_matching_one),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
     use windows::Win32::System::Threading::PROCESS_QUERY_LIMITED_INFORMATION;
     // The ACE must grant QUERY_LIMITED as well as TERMINATE: kill_by_identity opens for
     // both, and a combined-mask OpenProcess fails entirely if ANY requested bit is ungranted.
-    let child = crate::identity::windows_fixture::spawn_restricted(PROCESS_QUERY_LIMITED_INFORMATION.0);
+    let child = crate::identity::windows_fixture::spawn_restricted(&done, PROCESS_QUERY_LIMITED_INFORMATION.0);
     let real = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
         .expect("the owned handle always yields an identity");
     let stale = crate::identity::ProcessId::from_parts_for_test(real.pid(), real.start_token_raw() ^ 1);
