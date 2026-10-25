@@ -72,8 +72,9 @@
 //! an elevation front, only after signalling it directly. It waits through the child's pidfd, or,
 //! for a child that sent only its `/proc` directory, by its pid once that directory shows it
 //! unreaped: a reap by another reaper after that look is not seen, and the wait may then collect
-//! another child of this process that took the number. That reap by number is the one gap on this
-//! path; the look and the reap follow one another with nothing between.
+//! another child of this process that took the number. For a front the look and that wait follow
+//! one another directly; for a child, `end_child`'s kills come between them, and a child left to
+//! the background reaper is waited for by its pid later.
 
 #[path = "cgroup/parse.rs"]
 mod parse;

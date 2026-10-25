@@ -1311,8 +1311,8 @@ fn still_unreaped(received: &Received, pid: rustix::process::Pid) -> bool {
 /// one its leaf's kill `reached` (given its pid and pidfd) is waited for and reaped; any other is
 /// left running and unreaped, with nothing that waits for it. The waits go through its pidfd, or by
 /// its pid if it sent only its `/proc` directory (see the module's Ownership paragraph). A front
-/// another reaper in the process collects first gets a `debug` record: before the leaf's kill it
-/// has `Ended`, as one seen reaped; after it, it is `Reaped`.
+/// another reaper in the process collects after the look gets a `debug` record: `Ended` before the
+/// leaf's kill, `Reaped` after it. One already gone at the look is `Ended`, with no record.
 ///
 /// A child that never named itself, or that `std` collected, never ran the elevated program, so it
 /// is no front: it is answered as any child.
