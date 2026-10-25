@@ -1175,22 +1175,24 @@ impl ProcSource {
         subtree: Option<&crate::containment::cgroup::Subtree>,
         why: &mut Diagnosis,
     ) -> (crate::child::spawn::FrontFate, ChildFate) {
-        // The forgets are owed to the one warn of the teardown below, not logged on their own.
+        // The forgets are owed to the one warn of the teardown below, not logged on their own. A
+        // front reaped elsewhere, or one its handle cannot answer for, is neither signalled nor
+        // waited on, as the sync teardown leaves it: the forget's warn goes out when `why` is
+        // dropped.
         if let Some((_, state)) = self.elsewhere() {
             self.forget_deferring(&foreign_why(&state), Forgotten::of(&state), why);
+            let fate = match state {
+                RootState::Unknown(_) => ChildFate::Unknown,
+                _ => ChildFate::Gone,
+            };
+            return (crate::child::spawn::FrontFate::Unaccounted, fate);
         }
         let ProcSource::Tokio { pidfd, .. } = &mut self else {
-            // Only something that broke the reaping precondition (see `Command::contain`) leaves a
-            // spawn's backend foreign this early.
-            log::warn!(
-                "{}",
-                why.fold(format!(
-                    "elevation front pid {pid}: its backend is foreign (reaped elsewhere), so it cannot be waited on"
-                ))
-            );
+            // `elsewhere` answers for every backend but a forgotten one, and a spawn's backend is
+            // forgotten only above.
             debug_assert!(
                 false,
-                "elevation front pid {pid}: a spawn's backend is foreign before its teardown"
+                "elevation front pid {pid}: a spawn's backend is forgotten before its teardown"
             );
             return (crate::child::spawn::FrontFate::Unaccounted, ChildFate::Unknown);
         };
