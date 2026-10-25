@@ -501,3 +501,17 @@ fn a_probe_whose_parent_is_gone_exits_without_reporting() {
     .expect("a blocking waitid returns a status");
     assert_eq!(status.exit_status(), Some(0));
 }
+
+/// The probe's child is killed through a pidfd that names it, never by its number. Mutant: "kill
+/// the probe's child by pid".
+#[skuld::test]
+fn the_probe_child_is_killed_through_its_pidfd() {
+    use crate::send_log::{Capture, Via};
+    use crate::signal::Sig;
+    let _missing = fault::miss_pidfd_info();
+    let _hidden = fault::hide_proc();
+    let capture = Capture::start();
+    front_placement(|| Ok(HIGH)).expect_err("a hidden /proc refuses");
+    let sends: Vec<_> = capture.entries().into_iter().map(|(_, sig, via)| (sig, via)).collect();
+    assert_eq!(sends, [(Sig::Kill, Via::Pidfd)]);
+}
