@@ -1,4 +1,4 @@
-//! `Backend::Pkexec` end to end, through the production `detect()`: a testbin child, whose `PATH`
+//! `Backend::Pkexec` end to end, through the production `Host::detect`: a testbin child, whose `PATH`
 //! holds only a fake `pkexec`, runs a cosca elevated spawn and reports the outcome. The fake is
 //! testbin itself, copied to `real/pkexec-impl` (an ELF, as the pinned exec needs), which logs
 //! what it was run as and prints a version; it never elevates. A root run's child drops to an id the
