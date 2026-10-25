@@ -248,17 +248,25 @@ fn tokio_tracee() {
     std::io::copy(&mut std::io::stdin(), &mut std::io::sink()).expect("read stdin to EOF");
 }
 
+/// A `cosca::tokio::Command` for [`tokio_tracee`], with no stdio set: its `allowed` report goes to
+/// its stdout.
+#[cfg(feature = "tokio")]
+pub(crate) fn tokio_tracee_command() -> crate::tokio::Command {
+    let mut cmd = crate::tokio::Command::new();
+    cmd.executable(std::env::current_exe().expect("current_exe"))
+        .args(crate::test_child::fixture_argv(fixture_path!(tokio_tracee)));
+    crate::test_reexec::scrub_env(|var| _ = cmd.env_remove(var));
+    cmd.env(TRACEE_MARKER, std::process::id().to_string());
+    cmd
+}
+
 /// Spawns [`tokio_tracee`] as a kill-on-drop `cosca::tokio::Child` and returns it, with its stdin,
 /// once [`spawn_helper`] may seize it.
 #[cfg(feature = "tokio")]
 pub(crate) async fn spawn_tokio_tracee() -> (crate::tokio::Child, crate::tokio::ChildStdin) {
     use ::tokio::io::AsyncBufReadExt as _;
 
-    let mut cmd = crate::tokio::Command::new();
-    cmd.executable(std::env::current_exe().expect("current_exe"))
-        .args(crate::test_child::fixture_argv(fixture_path!(tokio_tracee)));
-    crate::test_reexec::scrub_env(|var| _ = cmd.env_remove(var));
-    cmd.env(TRACEE_MARKER, std::process::id().to_string());
+    let mut cmd = tokio_tracee_command();
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
     let mut child = cmd.spawn().expect("spawn the tracee");

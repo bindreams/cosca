@@ -152,7 +152,7 @@ impl KqueueWatch {
 
     /// A look found the child held by `tracer`: watches the chain from it. `true` when the child
     /// must be looked at again at once, before any wait: the walk registered something new.
-    pub(super) fn held_by(&mut self, tracer: u32) -> std::io::Result<bool> {
+    pub(super) fn held_by(&mut self, tracer: u32) -> Result<bool, crate::wait::backend::WalkError> {
         use crate::wait::backend::OnTracer;
         match self.tracer.held_by(&self.afd.get_ref().0, tracer)? {
             OnTracer::Block => self.recheck = None,

@@ -366,6 +366,8 @@ pub(crate) fn drain_exit_events(kq: &Kqueue, pid: u32, tracer: &mut TracerWatch)
     allow(dead_code, reason = "the only consumer is the tokio backend's reap")
 )]
 pub(crate) fn arm_backoff_timer(kq: &Kqueue, interval: Duration) -> io::Result<()> {
+    #[cfg(test)]
+    super::test_hooks::record_backoff_timer(interval);
     let timer = KEvent::new(
         0,
         EventFilter::EVFILT_TIMER,

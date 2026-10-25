@@ -310,7 +310,7 @@ pub(crate) use await_reapable::{
 };
 #[cfg(test)]
 pub(crate) use tracer_watch::seams as tracer_seams;
-pub(crate) use tracer_watch::{OnTracer, TracerWatch};
+pub(crate) use tracer_watch::{OnTracer, TracerWatch, WalkError};
 
 pub(crate) fn kill(id: ProcessId) -> Result<(), Error> {
     use nix::sys::signal::{kill as nix_kill, Signal};

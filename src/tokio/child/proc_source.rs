@@ -181,16 +181,6 @@ impl std::os::fd::AsFd for PinnedPidfd {
     }
 }
 
-/// How long [`ProcSource::reap_unreported`] waits before it says it is still waiting. A message only:
-/// the wait never gives up.
-#[cfg(all(target_os = "macos", not(test)))]
-const SLOW_WAIT: Option<std::time::Duration> = Some(std::time::Duration::from_secs(1));
-
-/// No slow-wait message in a test: a loaded runner could pass the threshold, and a test's verdict
-/// must not depend on elapsed time. The threshold's own test is `child::spawn`'s.
-#[cfg(all(target_os = "macos", test))]
-const SLOW_WAIT: Option<std::time::Duration> = None;
-
 /// Why a child is forgotten by [`ProcSource::forget_foreign`], completing "child N ...".
 #[cfg(unix)]
 const FORGET_FOREIGN: &str = "was reaped by someone else, or cannot be shown to be ours";
@@ -887,7 +877,7 @@ impl ProcSource {
     /// [`wait_and_reap_caused`](ProcSource::wait_and_reap_caused) for an `async fn`, without
     /// blocking: [`reap_on_events`](ProcSource::reap_on_events). What it finds instead of a status
     /// is returned, not acted on or logged: the caller forgets the child and reports it. `Err` when
-    /// the exit cannot be watched, so nothing is known yet: the caller reaps by other means.
+    /// the exit cannot be watched, so nothing was collected: the caller reaps by other means.
     /// **Never kills.**
     #[cfg(unix)]
     pub(crate) async fn wait_and_reap_awaiting(&mut self) -> Result<(Waited, Option<String>), Error> {
@@ -965,10 +955,7 @@ impl ProcSource {
     /// (a failed poll or peek, a child it cannot show to be ours, a foreign reap) answers `true`,
     /// and is left to that wait.
     ///
-    /// - **Linux:** a poll on the pidfd until `until`. A readable pidfd whose zombie a foreign
-    ///   tracer still holds shows no exit to a peek. The kernel wakes the pidfd again when the
-    ///   tracer lets go, but `poll(2)` on an already readable pidfd returns at once and cannot wait
-    ///   for that wake, so the peek is repeated with a capped backoff until `until`.
+    /// - **Linux:** [`crate::wait::pidfd_exit_visible_by`].
     /// - **macOS:** the verified-id kqueue wait, with `until` as its deadline.
     #[cfg(unix)]
     pub(crate) fn exit_visible_by(&self, pid: u32, until: std::time::Instant) -> bool {
@@ -977,30 +964,11 @@ impl ProcSource {
         {
             use std::os::fd::AsFd as _;
 
-            use crate::wait::exit_only::{self, Peek, Target};
-
             let _ = pid;
             let ProcSource::Tokio { pidfd, .. } = self else {
                 return true;
             };
-            match crate::wait::poll_pidfd_exit(pidfd.as_fd(), Some(Some(until))) {
-                Ok(true) | Err(_) => {}
-                Ok(false) => return false,
-            }
-            let target = Target::PidFd(pidfd.as_fd());
-            let mut interval = std::time::Duration::from_millis(1);
-            loop {
-                match exit_only::peek(&target) {
-                    Ok(Peek::Running) => {}
-                    Ok(Peek::Exit(_) | Peek::Foreign(_)) | Err(_) => return true,
-                }
-                let now = crate::wait::now();
-                if now >= until {
-                    return false;
-                }
-                std::thread::sleep(interval.min(until - now));
-                interval = (interval * 2).min(std::time::Duration::from_millis(50));
-            }
+            crate::wait::pidfd_exit_visible_by(pidfd.as_fd(), until)
         }
         #[cfg(target_os = "macos")]
         {
@@ -1266,6 +1234,8 @@ impl ProcSource {
         // to be ours is dead or dying if the kill was delivered, and may be running if it was not.
         // The wait logs at `debug`: the forget's one warn carries its cause.
         #[cfg(unix)]
+        self.warn_if_slow(pid);
+        #[cfg(unix)]
         let (waited, cause) = self.wait_and_reap_caused(pid, log::Level::Debug);
         #[cfg(not(unix))]
         let waited = self.wait_and_reap(pid);
@@ -1301,7 +1271,7 @@ impl ProcSource {
     /// The wait for the killed child's exit blocks this thread in place, as the spawn's other waits do
     /// (principle 2), on every runtime: tokio's `block_in_place` panics inside a `LocalSet`, even on a
     /// multi-thread runtime, and cannot be asked beforehand. It logs one `warn` naming the child once it
-    /// passes [`SLOW_WAIT`], and goes on waiting.
+    /// passes [`slow_teardown_after`](super::slow_teardown_after), and goes on waiting.
     /// Consumes the backend. **Invariant:** no `wait()` future for this child is in flight.
     #[cfg(target_os = "macos")]
     pub(crate) fn reap_unreported(
@@ -1311,7 +1281,7 @@ impl ProcSource {
         prepared: crate::containment::Prepared,
     ) -> ChildFate {
         crate::bounded::assert_may_block("reap_unreported");
-        let done = crate::child::spawn::kill_and_reap_unreported(pid, unique, prepared, SLOW_WAIT);
+        let done = crate::child::spawn::kill_and_reap_unreported(pid, unique, prepared, super::slow_teardown_after());
         if matches!(done.fate, ChildFate::Running { .. }) {
             self.release();
             return done.warn(
@@ -1401,6 +1371,19 @@ impl ProcSource {
         crate::child::spawn::leave_front_through_pidfd_noting(Some(pid), pidfd, front, id, subtree, why)
     }
 
+    /// Before a failed spawn's teardown waits for the child it killed: one `warn` naming it if its exit
+    /// is not visible within [`slow_teardown_after`](super::slow_teardown_after). The caller's wait
+    /// then goes on, unbounded.
+    #[cfg(unix)]
+    pub(crate) fn warn_if_slow(&self, pid: u32) {
+        let Some(after) = super::slow_teardown_after() else {
+            return;
+        };
+        if !self.exit_visible_by(pid, crate::wait::now() + after) {
+            crate::child::spawn::warn_still_waiting(Some(pid), after);
+        }
+    }
+
     /// The teardown's kill: [`Sig::Kill`] through the handle, or (tests) the forced refusal of the
     /// sync seam's "leave it alive" form, which replaces the kill so the child is really left alone.
     fn teardown_kill(&self) -> Result<Sent, Error> {
@@ -1427,7 +1410,8 @@ impl ProcSource {
         // The original, moved out: a duplicate could fail at the fd limit and strand the child.
         let pidfd = pidfd.take();
         let leak = self.forget_quietly(Forgotten::Unproven).map(|(_, leak)| leak);
-        let fate = crate::child::spawn::teardown_through_pidfd(Some(pid), pidfd, id);
+        let fate =
+            crate::child::spawn::teardown_through_pidfd_warning(Some(pid), pidfd, id, super::slow_teardown_after());
         (Some(fate), leak)
     }
 
@@ -1464,6 +1448,7 @@ impl ProcSource {
             );
             return after_refused_kill(handed, foreign.map(|f| f.2), id);
         }
+        self.warn_if_slow(pid);
         let ProcSource::Tokio { pidfd, .. } = &self else {
             unreachable!("a freshly spawned backend is a tokio child");
         };
@@ -1541,7 +1526,7 @@ enum Halt {
     ReapedBetween(String),
     /// The `try_wait` right after a look that showed the exit failed otherwise.
     ReapFailed(std::io::Error),
-    /// The exit cannot be watched; nothing was looked at.
+    /// The exit cannot be watched; nothing was collected.
     Watch(Error),
 }
 
@@ -1600,10 +1585,14 @@ async fn look_on_events<T>(
             return Ok(found);
         }
         // A tracer whose identity cannot be read leaves the child's state unknown, as a refused peek
-        // does.
+        // does. A refused registration leaves it unwatched: the caller waits by other means.
         if let Some(holder) = holder {
-            if watch.held_by(holder).map_err(|e| Halt::State(RootState::Unknown(e)))? {
-                continue;
+            use crate::wait::backend::WalkError;
+            match watch.held_by(holder) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(WalkError::Identity(e)) => return Err(Halt::State(RootState::Unknown(e))),
+                Err(WalkError::Watch(e)) => return Err(Halt::Watch(Error::Io(e))),
             }
         }
         #[cfg(test)]

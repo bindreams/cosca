@@ -728,6 +728,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                     identity.expect("a spawn that reached the attach adopted its unique id"),
                     Some(id),
                     "is handed to tokio's orphan reaper, which reaps it once it exits",
+                    crate::tokio::child::slow_teardown_after(),
                 );
                 // A child its kill did not end is released to tokio's orphan reaper, not forgotten, which
                 // would leave a zombie nothing collects.
@@ -980,6 +981,14 @@ mod placement_reuse_tests;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "spawn/pidfd_tests.rs"]
 mod pidfd_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "spawn/slow_teardown_tests.rs"]
+mod slow_teardown_tests;
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "spawn/slow_teardown_macos_tests.rs"]
+mod slow_teardown_macos_tests;
 
 /// The fate of a child a failed tokio spawn abandoned with no handle on it (see
 /// [`warn_for_abandoned`]). Linux's handshake holds a pidfd on it, and answers itself.

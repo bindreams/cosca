@@ -33,8 +33,9 @@ a run-to-completion teardown (`status`, `output`, `read` failing after the spawn
 or mid-drain finishes as the `Drop` does, and one whose exit or drain cannot be watched (the
 reactor refuses the registration, or the handle reports an error) waits for it in place instead of
 forgetting a child that is ours. Both warn past 1 s, as principle 3 says. A failed async spawn's
-teardown waits the same way, macOS's for a child whose unique-id report came after the spawn
-returned included ([`reap_unreported`](../src/tokio/child/proc_source.rs)).
+teardown waits in place too, and its wait for the root it killed warns once past 1 s, naming it, as
+the drop's does. That includes macOS's teardown of a child whose unique-id report came after the
+spawn returned ([`reap_unreported`](../src/tokio/child/proc_source.rs)).
 
 Spawning is the other exception: it blocks until `exec`, as tokio's own `Command::spawn` does.
 That includes cosca's placement report
@@ -137,12 +138,14 @@ The by-number reaps outside this rule are all tokio's `waitpid(pid)`. One is its
 root cosca did not kill and leaves to it: a dropped root whose drop killed nothing, disarmed
 (`detach()`, `kill_on_drop(false)`) or armed with a failed kill (principle 3), or, on macOS, a
 child whose async spawn failed and whose kill did not end it, which cosca releases to tokio's
-orphan queue rather than forget it and leave a zombie nothing collects (`ProcSource::reap_now_noting` and `ProcSource::reap_unreported` in
+orphan queue rather than forget it and leave a zombie nothing collects
+(`ProcSource::reap_now_noting` and `ProcSource::reap_unreported` in
 [`proc_source.rs`](../src/tokio/child/proc_source.rs), and the attach-failure arm of
 `spawn_uncommitted` in [`tokio/spawn.rs`](../src/tokio/spawn.rs)). The other is every collect of an
 async root, which is tokio's `try_wait` right after cosca's own look through the root's handle
 showed the exit. A collect never goes without its look: an async wait whose look finds nothing to
-collect, as for a zombie a foreign tracer holds, waits for the handle's next event and looks again.
+collect, as for a zombie a foreign tracer holds, waits for the handle's next event (on macOS, or for
+a tracer's event or a re-check timer) and looks again.
 The root is then an unreaped zombie of ours, but a foreign reap between a look and its collect is
 not detected.
 

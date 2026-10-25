@@ -439,12 +439,15 @@ impl Child {
     /// Unix-only: the Windows elevation arm builds its child in-module with no deferred password.
     #[cfg(unix)]
     ///
+    /// The wait warns once past 1 s, naming the child, as a failed spawn's other teardown waits do.
+    ///
     /// Answers what the wait found, for a caller whose kill was delivered: the collected exit
     /// (`Reaped`), or, for a child it could not show to be ours, which is forgotten, `Killed`.
     pub(super) fn wait_and_reap_blocking(
         &mut self,
     ) -> (crate::error::ChildFate, Option<crate::child::drop_report::Forgot>) {
         let pid = self.id.pid();
+        self.proc_mut().warn_if_slow(pid);
         let (waited, cause) = self.proc_mut().wait_and_reap_caused(pid, log::Level::Debug);
         match waited {
             Waited::Exited => {
@@ -1684,9 +1687,21 @@ struct Signalled {
     front_left: Option<Error>,
 }
 
-/// How long the armed drop waits before it says so. Messaging only: no wait ends on it.
+/// How long the armed drop, or a failed spawn's teardown, waits before it says so. Messaging only: no
+/// wait ends on it.
 #[cfg(unix)]
 const LATE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long a failed spawn's teardown waits for the child it killed before it warns that it is still
+/// waiting: [`LATE`]. In a test, only one that opted in (`fault::warn_slow_teardowns`): a loaded
+/// runner could pass the threshold, and a test's verdict must not depend on elapsed time.
+#[cfg(unix)]
+pub(crate) fn slow_teardown_after() -> Option<std::time::Duration> {
+    #[cfg(test)]
+    return fault::slow_teardown_after();
+    #[cfg(not(test))]
+    Some(LATE)
+}
 
 /// The armed drop's one warn, once its waits pass [`LATE`]: the reap and the drain share it.
 #[cfg(unix)]
@@ -2062,6 +2077,38 @@ pub(crate) mod fault {
         static REAP_PARKED: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
         static RELEASES: Cell<usize> = const { Cell::new(0) };
         static BACKEND_DROPS: Cell<usize> = const { Cell::new(0) };
+        static SLOW_TEARDOWN_AFTER: Cell<Option<std::time::Duration>> = const { Cell::new(None) };
+    }
+
+    /// A failed spawn's teardown on THIS thread warns once its wait passes 1 s, as outside tests
+    /// (see [`slow_teardown_after`](super::slow_teardown_after)).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn warn_slow_teardowns() -> WarnSlowTeardowns {
+        warn_slow_teardowns_after(super::LATE)
+    }
+
+    /// As [`warn_slow_teardowns`], past `after`: zero, for a test whose forced looks keep the child
+    /// from showing its exit within it.
+    #[cfg(unix)]
+    pub(crate) fn warn_slow_teardowns_after(after: std::time::Duration) -> WarnSlowTeardowns {
+        SLOW_TEARDOWN_AFTER.with(|w| w.set(Some(after)));
+        WarnSlowTeardowns(())
+    }
+
+    #[cfg(unix)]
+    #[must_use = "the warn is off again as soon as the guard is dropped"]
+    pub(crate) struct WarnSlowTeardowns(());
+
+    #[cfg(unix)]
+    impl Drop for WarnSlowTeardowns {
+        fn drop(&mut self) {
+            SLOW_TEARDOWN_AFTER.with(|w| w.set(None));
+        }
+    }
+
+    #[cfg(unix)]
+    pub(super) fn slow_teardown_after() -> Option<std::time::Duration> {
+        SLOW_TEARDOWN_AFTER.with(Cell::get)
     }
 
     /// Counts the process backends ([`ProcSource`](super::ProcSource), so tokio's own `Child`

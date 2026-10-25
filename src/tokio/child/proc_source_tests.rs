@@ -159,3 +159,132 @@ async fn an_async_reap_of_a_child_whose_tracer_dies_during_its_exit_is_woken_by_
     );
     tracer.wait().expect("reap the stand-in tracer");
 }
+
+/// This process stands in for a traced child, as above, with a live blocker its parent read is forced
+/// to name as its tracer: the child's pid and unique id, the blocker, and the forced read's guard.
+#[cfg(target_os = "macos")]
+fn stand_in_traced_by_a_blocker() -> (u32, u64, std::process::Child, crate::identity::ppid_fault::ForcedReads) {
+    use crate::identity::{ppid_fault, uniq_info, ReadPurpose, UniqRead};
+
+    let pid = std::process::id();
+    let UniqRead::Found(info) = uniq_info(pid, ReadPurpose::Adopt) else {
+        panic!("this process's unique id must read");
+    };
+    let mut cmd = crate::test_child::held_std_blocker(std::process::Stdio::null());
+    let tracer = crate::test_spawn::spawn(&mut cmd).expect("spawn the stand-in tracer");
+    let tracer_pid = tracer.id();
+    let parent = ppid_fault::force_ppid_with(move || Ok(tracer_pid));
+    (pid, info.unique_id, tracer, parent)
+}
+
+/// Ends and reaps a stand-in tracer.
+#[cfg(target_os = "macos")]
+fn end_stand_in(mut tracer: std::process::Child) {
+    drop(tracer.stdin.take());
+    tracer.wait().expect("reap the stand-in tracer");
+}
+
+/// A look that finds the child running asks for another; any other look ends the reap.
+#[cfg(target_os = "macos")]
+fn still_running(looked: std::io::Result<crate::wait::exit_only::Peek>) -> Result<Option<()>, super::Halt> {
+    match looked {
+        Ok(crate::wait::exit_only::Peek::Running) => Ok(None),
+        other => Err(super::Halt::State(crate::signal::RootState::of_peek(other))),
+    }
+}
+
+/// A refused registration on the tracer leaves the child unwatched, not unknown: the reap halts so
+/// that its caller waits in place (principle 2), rather than forgetting a child that is ours.
+///
+/// Mutant: every walk error is `Halt::State(Unknown)`.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+async fn an_async_reap_whose_tracer_registration_is_refused_cannot_watch() {
+    use crate::identity::Link;
+    use crate::wait::backend::tracer_seams::{force_links, refuse_next_registration};
+
+    let (pid, unique, tracer, _parent) = stand_in_traced_by_a_blocker();
+    let _links = force_links([Link::Found {
+        unique: 1,
+        parent: std::process::id(),
+        at_attach: 0,
+    }]);
+    let _refused = refuse_next_registration(libc::EINVAL);
+
+    let looked = super::look_on_events(pid, unique, still_running).await;
+
+    assert!(matches!(looked, Err(super::Halt::Watch(_))), "{looked:?}");
+    end_stand_in(tracer);
+}
+
+/// A tracer whose identity cannot be read leaves the child's state unknown, as a refused peek does.
+///
+/// Mutant: every walk error is `Halt::Watch`.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+async fn an_async_reap_whose_tracer_cannot_be_read_finds_the_child_unknown() {
+    use crate::identity::Link;
+    use crate::signal::RootState;
+    use crate::wait::backend::tracer_seams::force_links;
+
+    let (pid, unique, tracer, _parent) = stand_in_traced_by_a_blocker();
+    let _links = force_links([Link::Refused(libc::EPERM)]);
+
+    let looked = super::look_on_events(pid, unique, still_running).await;
+
+    assert!(
+        matches!(looked, Err(super::Halt::State(RootState::Unknown(_)))),
+        "{looked:?}"
+    );
+    end_stand_in(tracer);
+}
+
+/// A tracer that is gone sends this process no event, so only the re-check timer wakes the reap to
+/// look again. The walks find the tracer gone twice: at once, then after 1 ms, which the reap's
+/// timer must wait for. The third look ends the reap. A backstop polled only while the reap waits,
+/// by which time it has armed what it waits on, ends the test if no timer was armed.
+///
+/// Mutant: `KqueueWatch::next` ignores the tracer watch's re-check.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+async fn an_async_reap_whose_tracer_is_gone_looks_again_when_the_recheck_timer_fires() {
+    use crate::identity::Link;
+    use crate::wait::backend::test_hooks;
+    use crate::wait::backend::tracer_seams::force_links;
+    use crate::wait::exit_only::Peek;
+
+    let (pid, unique, tracer, _parent) = stand_in_traced_by_a_blocker();
+    let _links = force_links([Link::Gone, Link::Gone]);
+    let _ = test_hooks::take_backoff_timers();
+    let mut looks = 0;
+    let look = super::look_on_events(pid, unique, |looked| match looked {
+        Ok(Peek::Running) => {
+            looks += 1;
+            Ok((looks == 3).then_some(()))
+        }
+        other => Err(super::Halt::State(crate::signal::RootState::of_peek(other))),
+    });
+    let armed = std::cell::RefCell::new(Vec::new());
+    let backstop = async {
+        *armed.borrow_mut() = test_hooks::take_backoff_timers();
+        if armed.borrow().is_empty() {
+            return;
+        }
+        std::future::pending::<()>().await;
+    };
+
+    let looked = ::tokio::select! {
+        biased;
+        looked = look => Some(looked),
+        () = backstop => None,
+    };
+
+    let looked = looked.expect("the walk asked for a re-check, but the reap armed no timer to wake it");
+    assert!(looked.is_ok(), "{looked:?}");
+    assert_eq!(
+        *armed.borrow(),
+        [std::time::Duration::from_millis(1)],
+        "the timer waits the re-check's 1 ms"
+    );
+    end_stand_in(tracer);
+}
