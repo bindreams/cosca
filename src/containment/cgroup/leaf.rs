@@ -1276,7 +1276,7 @@ fn kill_group_outside_leaf(
         Err(rustix::io::Errno::SRCH) => {
             let pid = rustix::process::Pid::as_raw(Some(pid));
             log::debug!(
-                "cgroup v2: an abandoned spawn's child's process group {pid} has no member left (the child left                  it, or was reaped elsewhere since the look)"
+                "cgroup v2: an abandoned spawn's child's process group {pid} has no member left (the child left it, or was reaped elsewhere since the look)"
             );
             Ok(false)
         }

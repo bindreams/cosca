@@ -36,11 +36,12 @@
 //!
 //! # PGID-reuse caveat
 //! Once the leader is reaped its PID/PGID may be reissued, and `killpg` would then signal that
-//! process's group. On Linux 6.9+ the group is signalled through the root's pidfd instead, which
-//! names it exactly. Otherwise every send by the group's number (the `killpg`, the leader's signal,
-//! each member's resend) runs right after its own check of the root ([`GroupRoot::check`]), and
-//! nothing is sent once that check fails; the residual window between a check and its send is
-//! documented on `Child::kill_tree`. cgroup v2 names no pid and has no such hole.
+//! process's group. On Linux 6.9+ the group's signal goes through the root's pidfd instead, which
+//! names the group exactly. Every send by the group's number (the `killpg` where the kernel refuses
+//! that, the leader's signal, each member's resend) runs right after its own check of the root
+//! ([`GroupRoot::check`]), and nothing is sent once that check fails; the residual window between a
+//! check and its send is documented on `Child::kill_tree`. cgroup v2 names no pid and has no such
+//! hole.
 
 use std::io;
 
@@ -325,7 +326,7 @@ fn send_to_group(pgid: i32, signal: Signal, root: &GroupRoot<'_>) -> Result<Resu
     if let Some(pidfd) = root.pidfd() {
         match pidfd_signal(pidfd, signal, Through::Group) {
             Err(nix::errno::Errno::EINVAL) => log::debug!(
-                "containment::unix: the kernel refused PIDFD_SIGNAL_PROCESS_GROUP (before Linux 6.9), so process                  group {pgid} is signalled by its number"
+                "containment::unix: the kernel refused PIDFD_SIGNAL_PROCESS_GROUP (before Linux 6.9), so process group {pgid} is signalled by its number"
             ),
             sent => return Ok(sent),
         }
