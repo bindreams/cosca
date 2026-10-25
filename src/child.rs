@@ -305,8 +305,8 @@ impl Child {
     /// passes still leaves a window in which the signal lands on a pid launchd has since reused.
     ///
     /// A root the handle cannot vouch for (`Unknown`: a failed peek or an unreadable unique id) is
-    /// still killed through the handle. It is this process's own unreaped child, and the send checks
-    /// its pid against the unique id read at spawn.
+    /// still killed through the handle: on Linux its pidfd, which names it whoever reaped it; on
+    /// macOS its pid, only while the pid's unique id is still the one read at spawn.
     pub fn kill(&self) -> Result<(), Error> {
         #[cfg(unix)]
         {

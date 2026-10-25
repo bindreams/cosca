@@ -781,8 +781,8 @@ impl ProcSource {
     /// caller's own successful kill is what bounds the wait.
     /// **Invariant:** no `wait()` future for this child is in flight when this runs.
     ///
-    /// The caller's child was never awaited, so an already-reaped one is a broken precondition,
-    /// asserted in debug.
+    /// The caller's child was never awaited, so one tokio has already reaped is a broken
+    /// precondition, asserted in debug.
     ///
     /// - **Linux:** `waitid(P_PIDFD, WEXITED | WNOWAIT)` on the kept pidfd, so tokio's own
     ///   field-drop reaps the zombie. `ECHILD` is [`Waited::Foreign`]. So is any other failure (a

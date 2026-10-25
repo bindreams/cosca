@@ -61,10 +61,11 @@
 //! itself, through its pidfd, whatever the leaf's kill returned — it may have left the leaf, or
 //! never entered it — and, when it exec'd outside the leaf, as the process group it leads.
 //!
-//! **Ownership.** Until `spawn` returns, the child is this process's own unreaped child, and cosca
-//! is the only thing that may signal it (see `Command::contain`). It leads its own process group
-//! (`process_group(0)`), and anything it forks after `exec` starts in that group. A process group's
-//! id cannot name another group while its leader is unreaped. cosca reaps a child only when no
+//! **Ownership.** The child is this process's own, but another reaper in the process may reap it
+//! (see `Command::contain`), so cosca looks at it through its handle before anything it sends by
+//! number. It leads its own process group (`process_group(0)`), and anything it forks after `exec`
+//! starts in that group. A process group's id cannot name another group while its leader is
+//! unreaped; `end_child` states the window between its look and its group kill. cosca reaps a child only when no
 //! handle owns it — an abandoned spawn whose runtime dropped it — only through its pidfd, and only
 //! after signalling it directly: a wait on anything else could block, or reap another's child.
 
