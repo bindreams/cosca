@@ -29,10 +29,9 @@
 # with a reasoned `#[expect]`. libc 0.2.189, windows 0.62.2 and windows-sys 0.61.2 declare no
 # `_wchdir`/`wchdir`, so there is nothing to ban for them.
 #
-# `allow-invalid = true` marks a path that is absent on some target/feature combination a workspace
-# crate is linted with while its crate is linked there (Windows libc has no `fchdir`/`daemon`, macOS
-# nix has no `daemon`; `cosca-path`'s tests link `windows` through skuld, without
-# `Win32_System_Environment`). Clippy skips a path whose crate is not linked at all; for one that is linked but
+# `allow-invalid = true` marks a path that is absent on some target/feature combination this crate
+# is linted with while its crate is linked there (Windows libc has no `fchdir`/`daemon`, macOS nix
+# has no `daemon`). Clippy skips a path whose crate is not linked at all; for one that is linked but
 # lacks the item it warns "does not refer to a reachable function", which `allow-invalid`
 # suppresses.
 #
@@ -73,8 +72,8 @@ disallowed-methods = [
     { path = "rustix::process::chdir", reason = "changes the process cwd, shared by all threads; use Command::current_dir", allow-invalid = true },
     { path = "rustix::process::fchdir", reason = "changes the process cwd, shared by all threads; use Command::current_dir", allow-invalid = true },
     { path = "rustix::fs::Dir::chdir", reason = "changes the process cwd, shared by all threads; use Command::current_dir", allow-invalid = true },
-    { path = "windows::Win32::System::Environment::SetCurrentDirectoryA", reason = "changes the process cwd, shared by all threads; use Command::current_dir", allow-invalid = true },
-    { path = "windows::Win32::System::Environment::SetCurrentDirectoryW", reason = "changes the process cwd, shared by all threads; use Command::current_dir", allow-invalid = true },
+    { path = "windows::Win32::System::Environment::SetCurrentDirectoryA", reason = "changes the process cwd, shared by all threads; use Command::current_dir" },
+    { path = "windows::Win32::System::Environment::SetCurrentDirectoryW", reason = "changes the process cwd, shared by all threads; use Command::current_dir" },
     { path = "windows_sys::Win32::System::Environment::SetCurrentDirectoryA", reason = "changes the process cwd, shared by all threads; use Command::current_dir", allow-invalid = true },
     { path = "windows_sys::Win32::System::Environment::SetCurrentDirectoryW", reason = "changes the process cwd, shared by all threads; use Command::current_dir", allow-invalid = true },
 ]
