@@ -264,7 +264,11 @@ fn the_unreachable_child_warning_is_every_time() {
     let error = || Error::Io(std::io::Error::other("cosca-abandoned-warn-probe-6f21"));
     let marker = "cosca-abandoned-warn-probe-6f21";
 
-    for child in [AbandonedChild::MaybeUnreachable, AbandonedChild::MaybeUnreaped] {
+    for child in [
+        AbandonedChild::MaybeUnreachable,
+        AbandonedChild::MaybeUnreaped,
+        AbandonedChild::OutOfReach("it sent no handle on itself".into()),
+    ] {
         let mark = crate::log_capture::mark();
         super::warn_for_abandoned(&child, &error());
         super::warn_for_abandoned(&child, &error());
