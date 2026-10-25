@@ -60,7 +60,9 @@ pub trait PurePath: Eq + Ord + Hash + Debug + ToOwned<Owned = Self::Buf> {
     /// on `self` stays an `Empty` component: `a/` joined with `b` is `a//b`.
     fn join(&self, rhs: &Self) -> Self::Buf;
 
-    /// `self` without its last component, or `None` if it has no components.
+    /// `self` without its last component, or `None` if it has no components. A POSIX path whose
+    /// remaining components would be just one `Empty` after the root (`//x`) has no spelling for
+    /// that, so its parent is the root `/`.
     fn parent(&self) -> Option<&Self>;
 
     /// The last component, if it is a [`Component::Normal`] name.
@@ -73,7 +75,8 @@ pub trait PurePath: Eq + Ord + Hash + Debug + ToOwned<Owned = Self::Buf> {
     fn is_bare_name(&self) -> bool;
 
     /// The path with `.` components, `name/..` pairs and repeated separators removed, as C++'s
-    /// `std::filesystem::path::lexically_normal` does. Nothing else changes: a trailing separator
+    /// `std::filesystem::path::lexically_normal` does, except that a run of separators alone
+    /// collapses to the root (libstdc++ keeps `//`). Nothing else changes: a trailing separator
     /// stays (except after `..`), and names stay as written, trailing dots included. A `..` at the
     /// root is dropped, and a relative path left empty becomes `.`. Lexical only: `link/..` is not
     /// the parent of `link`'s target.

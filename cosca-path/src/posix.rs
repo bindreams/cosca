@@ -466,7 +466,7 @@ impl PathBuf {
     }
 
     /// Truncates `self` to its [`parent`](PurePath::parent). Returns `false`, and leaves `self`
-    /// unchanged, if there is none.
+    /// unchanged, if there is none. As for `parent`, `//x` becomes `/`.
     pub fn pop(&mut self) -> bool {
         let Some(len) = self.parent().map(|p| p.as_bytes().len()) else {
             return false;
@@ -475,13 +475,18 @@ impl PathBuf {
         true
     }
 
-    /// Replaces the last component with `name` if it is a [`Component::Normal`] name; otherwise
-    /// appends `name`, as [`push`](Self::push) does.
+    /// Replaces the last component with `name` if it is a [`Component::Normal`] name, keeping
+    /// every other component and separator (`//x` becomes `//name`); otherwise appends `name`, as
+    /// [`push`](Self::push) does.
     pub fn set_file_name<S: AsRef<OsStr> + ?Sized>(&mut self, name: &S) {
-        if self.file_name().is_some() {
-            self.pop();
+        if self.file_name().is_none() {
+            self.push(Path::new(name));
+            return;
         }
-        self.push(Path::new(name));
+        // The last component is a name, so everything up to the last separator stays.
+        let keep = self.as_bytes().iter().rposition(is_separator).map_or(0, |i| i + 1);
+        self.0 .0.truncate(keep);
+        self.0 .0.extend_from_slice(name.as_ref().as_bytes());
     }
 }
 

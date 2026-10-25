@@ -143,7 +143,7 @@ fn lexically_normal_collapses_only_dots_and_separators() {
     assert_eq!(p("a /b").lexically_normal(), PathBuf::from("a /b"));
 }
 
-/// At the edges, `lexically_normal` gives what C++'s `lexically_normal` gives.
+/// At the edges, `lexically_normal` gives what C++'s `lexically_normal` gives (libstdc++ 14).
 ///
 /// Mutant: a trailing separator is dropped, and an emptied relative path stays empty.
 #[skuld::test]
@@ -157,11 +157,21 @@ fn lexically_normal_matches_cpp_at_the_edges() {
         (".", "."),
         ("../", ".."),
         ("a/../../", ".."),
-        ("//", "/"),
         ("", ""),
     ];
     for (input, expected) in cases {
         assert_eq!(p(input).lexically_normal(), PathBuf::from(expected), "input {input:?}");
+    }
+}
+
+/// A run of separators is repeated separators, so it collapses to the root. libstdc++ keeps `//`
+/// and `///` as they are; this is the one place `lexically_normal` differs from C++'s.
+///
+/// Mutant: an all-slash path is returned unchanged, as libstdc++ does.
+#[skuld::test]
+fn lexically_normal_collapses_a_run_of_slashes_to_the_root() {
+    for input in ["/", "//", "///", "////"] {
+        assert_eq!(p(input).lexically_normal(), PathBuf::from("/"), "input {input:?}");
     }
 }
 
@@ -218,6 +228,87 @@ fn set_file_name_replaces_only_a_name() {
     let mut dir = PathBuf::from("a/");
     dir.set_file_name("c");
     assert_eq!(dir, PathBuf::from("a//c"));
+    // An empty name is an `Empty` component, not a deletion.
+    let mut gone = PathBuf::from("a/b");
+    gone.set_file_name("");
+    assert_eq!(gone, PathBuf::from("a/"));
+}
+
+/// Every path over `{a, ., /}` of up to six bytes: the class that single examples miss, such as a
+/// root followed by a leading `Empty` component.
+fn small_paths() -> Vec<String> {
+    let mut all = vec![String::new()];
+    let mut level = vec![String::new()];
+    for _ in 0..6 {
+        level = level
+            .iter()
+            .flat_map(|s| ["a", ".", "/"].map(|c| format!("{s}{c}")))
+            .collect();
+        all.extend(level.iter().cloned());
+    }
+    all
+}
+
+/// `parent` is the path without its last component, for every path that can spell that.
+///
+/// A root followed by a single `Empty` component spells `/`, which parses to no components, so
+/// the parent of `//x` is `/`.
+///
+/// Mutant: `parent` cuts at `i` instead of `root + i`, which drops the root's offset.
+#[skuld::test]
+fn parent_is_the_components_minus_the_last() {
+    for input in small_paths() {
+        let path = p(&input);
+        let all = components(&input);
+        let Some(parent) = path.parent() else {
+            assert!(all.is_empty(), "{input:?} has components and no parent");
+            continue;
+        };
+        let got: Vec<_> = parent.components().collect();
+        let mut want = all[..all.len() - 1].to_vec();
+        if path.has_root() && want == [Component::Empty] {
+            want.clear();
+        }
+        assert_eq!(got, want, "parent of {input:?}");
+        assert_eq!(parent.has_root(), path.has_root(), "root of the parent of {input:?}");
+        assert!(path.as_bytes().starts_with(parent.as_bytes()), "{input:?}");
+    }
+}
+
+/// The parent of `//` and one more component is `/`, the nearest path that can be spelled.
+///
+/// Mutant: `parent` of `//x` is `None`.
+#[skuld::test]
+fn parent_of_a_double_slash_path_is_the_root() {
+    for input in ["//x", "//", "//.", "//.."] {
+        assert_eq!(p(input).parent(), Some(p("/")), "{input:?}");
+    }
+    assert_eq!(p("//x/y").parent(), Some(p("//x")));
+    assert_eq!(p("///").parent(), Some(p("//")));
+    let mut buf = PathBuf::from("//x");
+    assert!(buf.pop());
+    assert_eq!(buf, PathBuf::from("/"));
+}
+
+/// `set_file_name` changes the last component and nothing else, for every path.
+///
+/// Mutant: `set_file_name` is `pop` then `push`, which turns `//x` into `/y`.
+#[skuld::test]
+fn set_file_name_changes_only_the_last_component() {
+    for input in small_paths() {
+        let mut buf = PathBuf::from(input.as_str());
+        buf.set_file_name("z");
+        let mut want = components(&input);
+        if p(&input).file_name().is_some() {
+            want.pop();
+        }
+        want.push(n("z"));
+        assert_eq!(buf.components().collect::<Vec<_>>(), want, "set_file_name on {input:?}");
+        assert_eq!(buf.has_root(), p(&input).has_root(), "root of {input:?}");
+    }
+    let mut buf = PathBuf::from("//x");
+    buf.set_file_name("y");
+    assert_eq!(buf, PathBuf::from("//y"));
 }
 
 // Shape ===============================================================================================================
