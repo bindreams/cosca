@@ -150,11 +150,11 @@ fn an_abandoned_childs_group_kill_finding_no_group_is_logged_at_debug(#[fixture(
 }
 
 /// A child outside its leaf that refuses both its group kill and its handle's kill (as a setuid
-/// child does) is one abandoned child, warned about once, naming both refusals.
+/// child does) is one abandoned child: one refusal naming both, left to the caller's one warn.
 ///
-/// Mutant: each refusal warned about on its own (two warns).
+/// Mutant: either refusal warned about here (a warn), or the group's left out of the refusal.
 #[skuld::test]
-fn an_abandoned_child_refusing_both_kills_is_warned_about_once(#[fixture(cgroup)] _group: &Group) {
+fn an_abandoned_child_refusing_both_kills_is_one_refusal_naming_both(#[fixture(cgroup)] _group: &Group) {
     crate::log_capture::install();
     let child = paused_group_leader();
     let received = received(child, Some(PlacementReport::WriteFailed(libc::EBADF)));
@@ -166,17 +166,20 @@ fn an_abandoned_child_refusing_both_kills_is_warned_about_once(#[fixture(cgroup)
     fault::set_background_reap_notifier(reaped_tx);
 
     let mark = crate::log_capture::mark();
-    assert_eq!(end_child(&received), ChildFate::Unkillable);
+    let fate = end_child(&received);
 
+    let ChildFate::Unkillable(refused) = &fate else {
+        panic!("expected Unkillable, got {fate:?}");
+    };
+    assert!(
+        refused.contains(&format!("process group {pid}")),
+        "it names the refused group kill: {refused}"
+    );
     let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "")
         .into_iter()
         .filter(|(level, _)| *level <= log::Level::Warn)
         .collect();
-    assert_eq!(warns.len(), 1, "{warns:?}");
-    assert!(
-        warns[0].1.contains(&format!("process group {pid}")),
-        "it names the refused group kill: {warns:?}"
-    );
+    assert_eq!(warns, [], "the caller warns");
     rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::KILL).expect("kill the child");
     assert_handed_to_the_background_reaper();
     reaped_rx.recv().expect("the background reaper must reap it");
@@ -196,7 +199,8 @@ fn an_abandoned_child_refusing_its_handles_kill_is_not_killed_by_pid() {
     fault::set_force_child_kill_denied(true);
     fault::set_background_reap_notifier(reaped_tx);
 
-    assert_eq!(end_child(&received), ChildFate::Unkillable);
+    let fate = end_child(&received);
+    assert!(matches!(fate, ChildFate::Unkillable(_)), "{fate:?}");
     assert_eq!(fault::take_child_sends(), [ChildSend::Handle]);
     crate::test_child::assert_echoes(&mut to_child, &mut from_child);
 

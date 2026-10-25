@@ -780,7 +780,9 @@ impl Drop for CgroupLeaf {
         self.procs_fd = None;
         // Before the verdict — a spawn that failed, maybe after its fork — end the exchange.
         if self.report.is_some() {
-            self.abandon_before_verdict(false, None);
+            if let Abandoned::OutOfReach(why) = self.abandon_before_verdict(false, None) {
+                log::warn!("cgroup v2: {why}");
+            }
         }
         if self.abandoned {
             return;
@@ -877,7 +879,7 @@ impl Drop for CgroupLeaf {
 
 /// How an abandoned spawn's child ended up (see [`CgroupLeaf::abandon_before_verdict`]).
 #[cfg(target_os = "linux")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Abandoned {
     /// Nothing of the child's runs, and it is reaped or will be: it was killed, or had already
     /// exited and been reaped.
@@ -886,8 +888,8 @@ pub(crate) enum Abandoned {
     /// first send, before `exec` and outside the leaf — but that nothing here holds the pid to reap.
     MaybeUnreaped,
     /// The child may be running, and cosca could not kill it: it has no pidfd or refused the
-    /// signal, and its leaf does not hold it.
-    OutOfReach,
+    /// signal, and its leaf does not hold it. Says which, for the caller's one warn.
+    OutOfReach(String),
     /// The child is an elevation front, which was sent no signal of its own (see
     /// [`CgroupLeaf::abandon_before_verdict`]), and this is what became of it.
     Front(crate::child::spawn::FrontFate),
@@ -895,7 +897,7 @@ pub(crate) enum Abandoned {
 
 /// What became of the child itself when its spawn was abandoned.
 #[cfg(target_os = "linux")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ChildFate {
     /// Never sent its intent: if it exists, it exits at its first send, never entering the leaf,
     /// and nothing here can reap it.
@@ -905,8 +907,9 @@ enum ChildFate {
     Gone,
     /// Killed through its handle, and reaped.
     Killed,
-    /// Could not be killed: no pidfd, or the signal was refused.
-    Unkillable,
+    /// Could not be killed: no pidfd, or the signal was refused. Says which, unlogged: the caller
+    /// warns.
+    Unkillable(String),
 }
 
 #[cfg(target_os = "linux")]
@@ -970,8 +973,11 @@ impl CgroupLeaf {
             (ChildFate::NeverReached, _) => Abandoned::MaybeUnreaped,
             (ChildFate::Gone | ChildFate::Killed, _) => Abandoned::Ended,
             // `cgroup.kill` needs no credential, so a placed child is killed through its leaf.
-            (ChildFate::Unkillable, Some(Ok(()))) => Abandoned::Ended,
-            (ChildFate::Unkillable, _) => Abandoned::OutOfReach,
+            (ChildFate::Unkillable(why), Some(Ok(()))) => {
+                log::warn!("cgroup v2: {why}");
+                Abandoned::Ended
+            }
+            (ChildFate::Unkillable(why), _) => Abandoned::OutOfReach(why),
         }
     }
 
@@ -1129,8 +1135,9 @@ fn end_child(received: &Received) -> ChildFate {
         return ChildFate::NeverReached;
     };
     let Some(handle) = received.pidfd.as_ref().or(received.proc_dir.as_ref()) else {
-        log::warn!("cgroup v2: an abandoned spawn's child sent no handle on itself ({pid:?}); it is not signalled");
-        return ChildFate::Unkillable;
+        return ChildFate::Unkillable(format!(
+            "an abandoned spawn's child sent no handle on itself ({pid:?}); it is not signalled"
+        ));
     };
     let id = || wait_id(received, pid);
     if !still_unreaped(received, pid) {
@@ -1147,16 +1154,22 @@ fn end_child(received: &Received) -> ChildFate {
     #[cfg(test)]
     fault::run_before_handle_kill();
     let killed = kill_through(handle);
-    // One warn for the child, however many of its kills were refused.
+    // One warn for the child, however many of its kills were refused: the caller's, for a child
+    // whose own kill was refused.
     let group = group_refused.map(|e| format!("process group {} ({e})", rustix::process::Pid::as_raw(Some(pid))));
-    match (killed, group) {
+    let refused = match (killed, group) {
         (Err(e), group) if e != rustix::io::Errno::SRCH => {
             let group = group.map(|group| format!(" nor its {group}")).unwrap_or_default();
-            log::warn!("cgroup v2: could not kill an abandoned spawn's child ({e}){group}; it is reaped once it exits");
+            Some(format!(
+                "could not kill an abandoned spawn's child ({e}){group}; it is reaped once it exits"
+            ))
         }
-        (_, Some(group)) => log::warn!("cgroup v2: could not kill an abandoned spawn's child's {group}"),
-        _ => {}
-    }
+        (_, Some(group)) => {
+            log::warn!("cgroup v2: could not kill an abandoned spawn's child's {group}");
+            None
+        }
+        _ => None,
+    };
     if killed == Err(rustix::io::Errno::SRCH) {
         // Reaped since the look, by another reaper in the process: after the group kill, which
         // reached it unless it had left its group, or had exited.
@@ -1166,9 +1179,9 @@ fn end_child(received: &Received) -> ChildFate {
             ChildFate::Gone
         };
     }
-    if killed.is_err() {
+    if let Some(refused) = refused {
         reap_in_background(id_owned(received, pid));
-        return ChildFate::Unkillable;
+        return ChildFate::Unkillable(refused);
     }
     #[cfg(test)]
     fault::run_before_exit_wait();

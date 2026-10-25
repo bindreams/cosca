@@ -95,7 +95,7 @@ impl Prepared {
             return match leaf.abandon_before_verdict(front, handshake) {
                 Abandoned::Ended => AbandonedChild::Ended,
                 Abandoned::MaybeUnreaped => AbandonedChild::MaybeUnreaped,
-                Abandoned::OutOfReach => AbandonedChild::MaybeUnreachable,
+                Abandoned::OutOfReach(why) => AbandonedChild::OutOfReach(why),
                 Abandoned::Front(fate) => AbandonedChild::Front(fate),
             };
         }
@@ -125,7 +125,7 @@ impl Prepared {
         reason = "only a Linux leaf under tokio produces more than MaybeUnreachable"
     )
 )]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AbandonedChild {
     /// Nothing of it runs, and it is reaped or will be.
     Ended,
@@ -133,6 +133,9 @@ pub(crate) enum AbandonedChild {
     MaybeUnreaped,
     /// If it was forked, it may be running where nothing can reach it.
     MaybeUnreachable,
+    /// It may be running where nothing can reach it: its leaf does not hold it, and it sent no
+    /// handle on itself or refused its kill, as the text says.
+    OutOfReach(String),
     /// It is an elevation front, which was sent no signal of its own, and this is what became of
     /// it.
     Front(crate::child::spawn::FrontFate),

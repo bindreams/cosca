@@ -266,8 +266,8 @@ fn the_unreachable_child_warning_is_every_time() {
 
     for child in [AbandonedChild::MaybeUnreachable, AbandonedChild::MaybeUnreaped] {
         let mark = crate::log_capture::mark();
-        super::warn_for_abandoned(child, &error());
-        super::warn_for_abandoned(child, &error());
+        super::warn_for_abandoned(&child, &error());
+        super::warn_for_abandoned(&child, &error());
 
         assert_eq!(
             crate::log_capture::levels_since(mark, marker),
@@ -287,7 +287,7 @@ fn ended_abandoned_child_logs_nothing() {
     let marker = "cosca-abandoned-ended-probe-3a17";
 
     let mark = crate::log_capture::mark();
-    super::warn_for_abandoned(AbandonedChild::Ended, &error);
+    super::warn_for_abandoned(&AbandonedChild::Ended, &error);
 
     assert_eq!(crate::log_capture::levels_since(mark, marker), Vec::<log::Level>::new());
 }
@@ -362,6 +362,13 @@ async fn cgroup_a_post_fork_tokio_failure_warns_only_for_a_child_out_of_reach(#[
             "{case}: the warning must fire exactly when the child is out of reach"
         );
         if refuses {
+            // One child, one warn: the spawn's, carrying the refused kills.
+            let warns = crate::test_child::reaped_elsewhere::warns_since(mark);
+            assert_eq!(warns.len(), 1, "{case}: {warns:?}");
+            assert!(
+                warns[0].contains(&format!("process group {pid}")),
+                "{case}: the warn names the refused kills: {warns:?}"
+            );
             assert!(!reaped_through(&pidfd), "{case}: the child is still running");
             rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::KILL).expect("kill the child");
             assert!(
@@ -1132,16 +1139,20 @@ fn an_abandoned_child_nothing_reaches_may_be_running() {
     );
 }
 
-/// Only a Linux cgroup leaf abandons a child as ended or unreaped; elsewhere either is a contract
+/// Only a Linux cgroup leaf abandons a child as ended, unreaped or out of reach; elsewhere each is a contract
 /// breach, asserted in debug. It claims nothing (`Unknown`), and in particular never `Killed`.
 ///
-/// Mutants: `Ended` is `Killed`, which says a kill was delivered; either arm is silent.
+/// Mutants: `Ended` is `Killed`, which says a kill was delivered; any arm is silent.
 #[cfg(not(target_os = "linux"))]
 #[skuld::test]
 fn an_abandoned_child_only_a_linux_leaf_can_report_asserts() {
     use crate::containment::AbandonedChild;
-    for abandoned in [AbandonedChild::Ended, AbandonedChild::MaybeUnreaped] {
-        let outcome = std::panic::catch_unwind(|| super::abandoned_fate(abandoned));
+    for abandoned in [
+        AbandonedChild::Ended,
+        AbandonedChild::MaybeUnreaped,
+        AbandonedChild::OutOfReach("refused".to_owned()),
+    ] {
+        let outcome = std::panic::catch_unwind(|| super::abandoned_fate(abandoned.clone()));
         if cfg!(debug_assertions) {
             assert!(outcome.is_err(), "{abandoned:?} must assert");
         } else {
