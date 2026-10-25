@@ -555,6 +555,8 @@ impl CgroupLeaf {
                     listener,
                     deadline: None,
                 } => {
+                    #[cfg(all(test, feature = "tokio"))]
+                    fault::run_before_unbounded_drain_park();
                     listener.wait();
                     #[cfg(test)]
                     fault::notify_wait_site_park(fault::WaitSitePark {

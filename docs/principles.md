@@ -33,11 +33,15 @@ a run-to-completion teardown (`status`, `output`, `read` failing after the spawn
 or mid-drain finishes as the `Drop` does, and one whose exit or drain cannot be watched (the
 reactor refuses the registration, or the handle reports an error) waits for it in place instead of
 forgetting a child that is ours. Both warn past 1 s, as principle 3 says. A failed async spawn's
-teardown waits in place too. These of its waits warn once past 1 s, as the drop's does: the wait
-for the root it killed, naming it (on macOS including the teardown of a child whose unique-id report
-came after the spawn returned, [`reap_unreported`](../src/tokio/child/proc_source.rs)); on Linux,
-the wait for an elevation front its leaf's kill ended, naming it; and the wait for a cgroup leaf's
-drain, in the leaf's `Drop` or in `finish_elevated`'s cleanup, naming the leaf.
+teardown waits in place too. Exactly these of its waits warn once past 1 s, as the drop's does,
+each naming what it waits for: the wait for the root it killed, once the spawn has a child handle
+(on Linux, and on macOS including the teardown of a child whose unique-id report came after the
+spawn returned, [`reap_unreported`](../src/tokio/child/proc_source.rs)); on Linux, the wait for an
+elevation front its leaf's kill ended; and, on Linux, the wait for a cgroup leaf's drain, in the
+leaf's `Drop` or in `finish_elevated`'s cleanup. Its other blocking waits do not warn yet: the
+teardown and front paths of
+[`pidfd_handshake::conclude`](../src/child/spawn/pidfd_handshake.rs), and `end_child` and
+`end_front` in [`leaf.rs`](../src/containment/cgroup/leaf.rs).
 
 Spawning is the other exception: it blocks until `exec`, as tokio's own `Command::spawn` does.
 That includes the handshake's wait for a child that never ran the program to be gone
@@ -72,7 +76,7 @@ reap by the root's number (principle 4). It waits in place on the dropping threa
 runtime, never in `block_in_place`: tokio panics in it inside a `LocalSet`, even on a multi-thread
 runtime, and offers no way to ask first. Once the wait passes 1 s, the drop logs one `warn` naming
 the root's pid, and keeps waiting. The 1 s is for that message only: no wait ends on it. Failed
-async spawns drain the same way.
+async spawns wait the same way, with the warns principle 2 lists.
 
 The kills bound the wait, except for a process stuck in uninterruptible I/O (D state) or a root
 whose zombie a foreign tracer holds; either holds the dropping thread, which may be a tokio worker.

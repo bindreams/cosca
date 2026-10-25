@@ -49,6 +49,8 @@ thread_local! {
     static BEFORE_DRAIN_BLOCK: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     #[cfg(feature = "tokio")]
     static AFTER_DRAIN_WARN: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
+    #[cfg(feature = "tokio")]
+    static BEFORE_UNBOUNDED_DRAIN_PARK: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static WALK_FAILURE: std::cell::RefCell<Option<WalkFailure>> = const { std::cell::RefCell::new(None) };
     static PROC_HIDDEN_AS: Cell<Option<i32>> = const { Cell::new(None) };
     static PIDFD_INFO_FAILS: Cell<bool> = const { Cell::new(false) };
@@ -293,6 +295,20 @@ pub(crate) fn set_after_drain_warn(hook: impl FnOnce() + 'static) -> crate::ones
 #[cfg(feature = "tokio")]
 pub(crate) fn run_after_drain_warn() {
     crate::oneshot_hook::fire(&AFTER_DRAIN_WARN);
+}
+
+/// Run `hook` once right before `wait_drained` parks with no deadline on this thread. The bounded
+/// look a warning wait starts with never parks that way, so a fixture released here is let go only
+/// by a wait that skipped the warn: the backstop for [`set_after_drain_warn`]'s tests, where the
+/// mutant fails an assertion instead of hanging.
+#[cfg(feature = "tokio")]
+pub(crate) fn set_before_unbounded_drain_park(hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
+    crate::oneshot_hook::arm(&BEFORE_UNBOUNDED_DRAIN_PARK, hook)
+}
+
+#[cfg(feature = "tokio")]
+pub(crate) fn run_before_unbounded_drain_park() {
+    crate::oneshot_hook::fire(&BEFORE_UNBOUNDED_DRAIN_PARK);
 }
 
 pub(crate) fn notify_drain_blocking() {

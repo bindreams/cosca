@@ -13,7 +13,11 @@ use crate::test_groups::{cgroup, Group};
 /// (`Child::block_until_members_drained`). The fake leaf's member is released from the hook that
 /// runs right after the warn, which records how many warns were out by then.
 ///
-/// Mutant: the drain wait's warn call is removed (the hook still runs, and finds no warn).
+/// The wait's unbounded park releases the member too, so a wait that never warned fails the
+/// assertion on the warns out by then instead of hanging.
+///
+/// Mutants: the drain wait's warn call is removed (the hook still runs, and finds no warn);
+/// `block_until_members_drained` waits with `wait_drained(None)` (the park's hook finds no warn).
 #[skuld::test]
 async fn a_failed_elevation_writes_drain_warns_once_past_1s() {
     let mut cmd = crate::tokio::Command::new();
@@ -40,6 +44,10 @@ async fn a_failed_elevation_writes_drain_warns_once_past_1s() {
                     ));
                     FakeLeaf::set_populated(&events, false);
                 }
+            });
+            let _backstop = leaf_fault::set_before_unbounded_drain_park({
+                let events = fake.events.clone();
+                move || FakeLeaf::set_populated(&events, false)
             });
             let failed =
                 crate::tokio::spawn::finish_elevated(child, Err(crate::error::Error::Io(std::io::Error::other("w"))))
