@@ -1339,12 +1339,14 @@ fn end_front(
         log::warn!("cgroup v2: an abandoned spawn's elevation front (pid {raw}) sent no handle on itself; it is left");
         return Abandoned::Front(FrontFate::Unaccounted);
     }
+    // Read before the look, so that the look and the probe, and the probe and the wait, follow one
+    // another with nothing between. A front known only by its pid is probed and waited for by that
+    // number (see the module's Ownership paragraph). Acted on only once the probe has seen the
+    // front running: an exited or reaped front is answered whatever its place read.
+    let placed = reached(raw, received.pidfd.as_ref().map(AsFd::as_fd));
     if !still_unreaped(received, pid) {
         return Abandoned::Ended;
     }
-    // Read before the probe, so that a probe seeing the front running is followed at once by the
-    // wait it decides. Acted on only then: an exited front is reaped whatever its place read.
-    let placed = reached(raw, received.pidfd.as_ref().map(AsFd::as_fd));
     #[cfg(test)]
     fault::run_before_front_probe();
     #[cfg(test)]

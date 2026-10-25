@@ -59,18 +59,21 @@
 //! The one exception is a tree its caller opted out of teardown (`detach`, `kill_on_drop(false)`):
 //! that leaf is disarmed, and its `Drop` never kills. A child cosca gives up on is also killed
 //! itself, through its pidfd, whatever the leaf's kill returned — it may have left the leaf, or
-//! never entered it — and, when it exec'd outside the leaf, as the process group it leads.
+//! never entered it — and, when it exec'd outside the leaf, as the process group it leads. An
+//! elevation front is sent nothing: an exited one is reaped, and one its leaf's kill reached is
+//! waited for (see `end_front`).
 //!
 //! **Ownership.** The child is this process's own, but another reaper in the process may reap it
 //! (see `Command::contain`), so cosca looks at it through its handle before anything it sends by
 //! number. It leads its own process group (`process_group(0)`), and anything it forks after `exec`
 //! starts in that group. A process group's id cannot name another group while its leader is
 //! unreaped; `end_child` states the window between its look and its group kill. cosca reaps a
-//! child only when no handle owns it — an abandoned spawn whose runtime dropped it — and only after
-//! signalling it directly. It waits through the child's pidfd, or, for a child that sent only its
-//! `/proc` directory, by its pid once that directory shows it unreaped: a reap by another reaper
-//! after that look is not seen, and the wait may then collect another child of this process that
-//! took the number.
+//! child only when no handle owns it — an abandoned spawn whose runtime dropped it — and, but for
+//! an elevation front, only after signalling it directly. It waits through the child's pidfd, or,
+//! for a child that sent only its `/proc` directory, by its pid once that directory shows it
+//! unreaped: a reap by another reaper after that look is not seen, and the wait may then collect
+//! another child of this process that took the number. That reap by number is the one gap on this
+//! path; the look and the reap follow one another with nothing between.
 
 #[path = "cgroup/parse.rs"]
 mod parse;

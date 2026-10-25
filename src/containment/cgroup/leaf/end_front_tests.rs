@@ -151,6 +151,33 @@ fn a_front_is_placed_before_the_probe_that_decides_its_wait() {
     );
 }
 
+/// A front that sent only its `/proc` directory is waited for by its pid, so the look that finds it
+/// unreaped is followed at once by the probe: its place is read before the look. A reap landing while
+/// the place is read is then seen by the look (`Ended`, no record), not by the probe. Mutant:
+/// "`reached` runs after the look" (the probe then finds the pid gone: a `debug` record).
+#[skuld::test]
+fn a_front_known_by_its_proc_directory_is_placed_before_the_look_that_precedes_the_probe() {
+    crate::log_capture::install();
+    let (front, pidfd) = running_front();
+    let pid = front.defuse();
+    drop(pidfd);
+    let proc_dir = std::fs::File::open(format!("/proc/{pid}")).expect("open the front's /proc directory");
+    let received = Received {
+        report: Some(PlacementReport::Placed),
+        pid: Some(pid),
+        pidfd: None,
+        proc_dir: Some(OwnedFd::from(proc_dir)),
+    };
+    let mark = crate::log_capture::mark();
+    let fate = end_front(&received, |_, _| {
+        reap_behind(pid);
+        Ok(true)
+    });
+    assert_eq!(fate, Abandoned::Ended);
+    let records = records_about(mark, pid);
+    assert_eq!(records, Vec::new(), "{records:?}");
+}
+
 /// A front that exits before the probe is reaped whatever its place read, with no warn about its
 /// place. Mutant: "an unplaceable front is left before the probe looks" (`Unplaced`, warned).
 #[skuld::test]

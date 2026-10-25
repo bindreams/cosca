@@ -305,11 +305,11 @@ impl Child {
     /// passes still leaves a window in which the signal lands on a pid launchd has since reused.
     ///
     /// A root the handle cannot vouch for (`Unknown`: a failed peek or an unreadable unique id) is
-    /// still killed through the handle: on Linux its pidfd, which names it whoever reaped it. macOS
-    /// has no such handle, so there this root, like any other, is signalled by pid after a check
-    /// that the pid still has the unique id read at spawn. A reap by another reaper between that
-    /// check and the send is not seen, and the signal then goes to whatever process holds the
-    /// number.
+    /// still killed through the handle on Linux: its pidfd names it whoever reaped it. macOS has
+    /// no such handle, so there this root, like any other, is signalled by pid after a check that
+    /// the pid still has the unique id read at spawn. A root whose unique id was never adopted, or
+    /// cannot be read again, is sent nothing. A reap by another reaper between that check and the
+    /// send is not seen, and the signal then goes to whatever process holds the number.
     pub fn kill(&self) -> Result<(), Error> {
         #[cfg(unix)]
         {

@@ -1498,8 +1498,10 @@ fn signal_on_drop(
     //
     // On Unix, nothing that names the tree by the root's number runs once the root is reaped:
     // this handle's own state, or the number no longer reading as this root (tokio's state cannot
-    // see a foreign reap until it is polled). Accepted gaps: a foreign reap landing after `view`
-    // was read, and tokio's orphan queue reaping by number afterwards.
+    // see a foreign reap until it is polled). A foreign reap after `view` was read is not seen: if
+    // the number is then reused, what is sent by it reaches whatever process holds it. Tokio's
+    // orphan queue reaps by number afterwards, and may collect another child of this process that
+    // took the number.
     #[cfg(unix)]
     let tree = {
         let kill = os.attached.hard_kill_for_drop(view);
