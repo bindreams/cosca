@@ -469,10 +469,7 @@ fn verify(pgid: i32, signal: Signal, root: &GroupRoot<'_>) -> Result<(), Error> 
 /// otherwise by `pid`, right after the root's own check, and not at all if that fails.
 fn signal_direct(pid: i32, signal: Signal, root: &GroupRoot<'_>) -> io::Result<()> {
     #[cfg(target_os = "linux")]
-    let sent = match root.pidfd() {
-        Some(pidfd) => Some(pidfd_signal(pidfd, signal, Through::Leader)),
-        None => None,
-    };
+    let sent = root.pidfd().map(|pidfd| pidfd_signal(pidfd, signal, Through::Leader));
     #[cfg(not(target_os = "linux"))]
     let sent = None;
     let sent = match sent {
