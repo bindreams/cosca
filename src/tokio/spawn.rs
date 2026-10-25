@@ -389,6 +389,12 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
             cmd.env_ops(),
         )
         .not_started()?;
+        // A failed spawn's teardown drops this leaf, whose drain wait then warns once past 1 s (the
+        // handle's armed drop warns instead, so a successful attach clears it below).
+        #[cfg(target_os = "linux")]
+        if let Some(leaf) = prepared.cgroup_leaf.as_mut() {
+            leaf.warn_when_drain_is_slow(super::child::slow_teardown_after());
+        }
         // A front this host could not place after a cgroup kill is refused before it is spawned.
         #[cfg(target_os = "linux")]
         if let Some(leaf) = prepared
@@ -694,7 +700,8 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
         proc_handle,
         prepared,
     );
-    let attachment = match attach {
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+    let mut attachment = match attach {
         Ok(v) => v,
         Err(error) => {
             #[cfg(target_os = "macos")]
@@ -747,6 +754,11 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
         }
     };
 
+    #[cfg(target_os = "linux")]
+    if let crate::containment::Attached::Cgroup(leaf) = &mut attachment.attached {
+        leaf.warn_when_drain_is_slow(None);
+    }
+
     // fd >= 3 parent ends: Unix's `fd_map`-wired reactor pipes; on Windows the std path
     // resolves none (fd >= 3 routes to the raw backend), so `parent_ends` is provably empty and the
     // Windows `FdPipes` (overlapped async ends) is empty.
@@ -798,7 +810,7 @@ fn leave_unverified_front(
 /// Async twin of the sync `finish_elevated` (see there). The root's reap is blocking (`try_wait`
 /// cannot reap a just-killed child, so it would leak a zombie), and waits only on this kill. The
 /// front's gate is decided once, before the tree's kill. The backend has run, so the program may
-/// have started.
+/// have started. The waits for the root and for the tree's drain each warn once past 1 s.
 #[cfg(unix)]
 pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> Result<Child, SpawnFailure> {
     let Err(write_err) = written else {

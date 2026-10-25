@@ -344,11 +344,16 @@ impl Child {
     /// Block until a cgroup-contained tree has drained, so the leaf's drop can remove it on its
     /// first `rmdir`. For a path that may block, such as a failed spawn: never `Drop`, never an
     /// `async fn`. Nothing else leaves work on the drain, so any other mechanism returns at once.
+    /// The wait warns once past 1 s, naming the leaf, as a failed spawn's other teardown waits do.
     #[cfg(unix)]
     pub(super) fn block_until_members_drained(&self) -> Result<(), Error> {
         #[cfg(target_os = "linux")]
-        if matches!(self.os.attached, crate::containment::Attached::Cgroup(_)) {
-            return self.os.attached.wait_drained(None).map(drop);
+        if let crate::containment::Attached::Cgroup(leaf) = &self.os.attached {
+            return match slow_teardown_after() {
+                Some(after) => leaf.wait_drained_warning(after),
+                None => leaf.wait_drained(None),
+            }
+            .map(drop);
         }
         Ok(())
     }
@@ -1266,6 +1271,10 @@ mod pid_reuse_tests;
 #[cfg(all(test, unix))]
 #[path = "child/armed_drop_tests.rs"]
 mod armed_drop_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "child/failed_spawn_drain_tests.rs"]
+mod failed_spawn_drain_tests;
 
 #[cfg(all(test, unix))]
 #[path = "child/foreign_reap_tree_tests.rs"]

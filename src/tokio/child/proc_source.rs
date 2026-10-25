@@ -1317,8 +1317,9 @@ impl ProcSource {
 
     /// [`reap_now`](ProcSource::reap_now) for an elevation front (see [`crate::elevation::front`]):
     /// it is sent nothing, and tokio's `Child` is forgotten, never handed to a reaper. The sync
-    /// spawn's front teardown reaps it through its pidfd if it has already exited. **Invariant:** no
-    /// `wait()` future for this child is in flight.
+    /// spawn's front teardown reaps it through its pidfd if it has already exited, or waits for it if
+    /// its leaf's kill ended it, warning once past 1 s. **Invariant:** no `wait()` future for this
+    /// child is in flight.
     #[cfg(target_os = "linux")]
     pub(crate) fn leave_front(
         self,
@@ -1368,7 +1369,15 @@ impl ProcSource {
             Forgotten::Unproven,
             why,
         );
-        crate::child::spawn::leave_front_through_pidfd_noting(Some(pid), pidfd, front, id, subtree, why)
+        crate::child::spawn::leave_front_through_pidfd_noting(
+            Some(pid),
+            pidfd,
+            front,
+            id,
+            super::slow_teardown_after(),
+            subtree,
+            why,
+        )
     }
 
     /// Before a failed spawn's teardown waits for the child it killed: one `warn` naming it if its exit

@@ -22,9 +22,13 @@ const MARKER: &str = "COSCA_TEST_SHARED_FOREIGN_TRACER";
 
 const PID_ENV: &str = "COSCA_TEST_SHARED_FOREIGN_TRACER_PID";
 
-/// The go bytes. `STOP` makes the helper stop the tracee and report it; `REAP` and `EXIT` hand the
-/// zombie back.
+/// Set (to anything) for a helper that seizes its tracee with `PTRACE_O_TRACEEXIT`.
+const HOLD_EXIT_ENV: &str = "COSCA_TEST_SHARED_FOREIGN_TRACER_HOLD_EXIT";
+
+/// The go bytes. `STOP` makes the helper stop the tracee and report it; `LET_EXIT` lets a tracee
+/// held at its exit stop on from it; `REAP` and `EXIT` hand the zombie back.
 pub(crate) const STOP: u8 = b's';
+pub(crate) const LET_EXIT: u8 = b'c';
 pub(crate) const REAP: u8 = b'r';
 pub(crate) const EXIT: u8 = b'x';
 
@@ -48,11 +52,13 @@ fn waitpid_status(pid: libc::pid_t) -> libc::c_int {
 }
 
 /// The foreign tracer: seize the pid in [`PID_ENV`], report, and act on each go byte from stdin:
-/// `STOP` interrupts the tracee and reports the stop, `REAP` reaps the zombie with `waitpid` and
-/// reports, `EXIT` exits without reaping. A no-op unless it is the re-exec the driver started.
+/// `STOP` interrupts the tracee and reports the stop, `LET_EXIT` waits for the tracee's exit stop and
+/// lets it on from it, `REAP` reaps the zombie with `waitpid` and reports, `EXIT` exits without
+/// reaping. A no-op unless it is the re-exec the driver started.
 ///
-/// It seizes with no options, so no `PTRACE_O_TRACEEXIT`: the kill is not delayed by an exit stop,
-/// and the pidfd turns readable at the zombie.
+/// It seizes with no options (unless [`spawn_helper_holding_exit`] asked for `PTRACE_O_TRACEEXIT`),
+/// so the kill is not delayed by an exit stop, and the pidfd turns readable at the zombie. A tracee
+/// held at its exit stop is still alive: it is a member of its cgroup, and no pidfd is readable.
 #[skuld::test]
 fn foreign_tracer_helper() {
     if !is_marked_fixture_reexec(MARKER) {
@@ -64,7 +70,12 @@ fn foreign_tracer_helper() {
         .expect("a pid");
     // SAFETY: a ptrace request on a pid; variadic `addr`/`data` are read as pointers: typed nulls.
     let null = std::ptr::null_mut::<libc::c_void>;
-    let rc = unsafe { libc::ptrace(libc::PTRACE_SEIZE, pid, null(), null()) };
+    let options = if std::env::var_os(HOLD_EXIT_ENV).is_some() {
+        libc::PTRACE_O_TRACEEXIT
+    } else {
+        0
+    };
+    let rc = unsafe { libc::ptrace(libc::PTRACE_SEIZE, pid, null(), options as usize as *mut libc::c_void) };
     assert_eq!(rc, 0, "PTRACE_SEIZE: {}", std::io::Error::last_os_error());
     say("seized");
     loop {
@@ -79,6 +90,17 @@ fn foreign_tracer_helper() {
                 let status = waitpid_status(pid);
                 assert!(libc::WIFSTOPPED(status), "waitpid: not a stop: {status:#x}");
                 say("stopped");
+            }
+            LET_EXIT => {
+                let status = waitpid_status(pid);
+                assert!(
+                    libc::WIFSTOPPED(status) && status >> 16 == libc::PTRACE_EVENT_EXIT,
+                    "waitpid: not the exit stop: {status:#x}"
+                );
+                // SAFETY: as above.
+                let rc = unsafe { libc::ptrace(libc::PTRACE_CONT, pid, null(), null()) };
+                assert_eq!(rc, 0, "PTRACE_CONT: {}", std::io::Error::last_os_error());
+                say("continued");
             }
             REAP => {
                 // The driver saw the pidfd readable, so the tracee is a zombie, which `waitpid`
@@ -137,12 +159,27 @@ pub(crate) struct Tracer {
 /// Starts the helper on `pid`, which was spawned with [`allow_any_tracer`] or has reported that its
 /// [`allow_any_tracer_now`] returned, and returns once it has seized the tracee.
 pub(crate) fn spawn_helper(pid: u32) -> Tracer {
+    spawn_helper_with(pid, false)
+}
+
+/// [`spawn_helper`] whose tracee stops at its exit (`PTRACE_O_TRACEEXIT`) and stays a live member of
+/// its cgroup, whatever kills it, until the tracer sends [`LET_EXIT`].
+#[cfg(feature = "tokio")]
+pub(crate) fn spawn_helper_holding_exit(pid: u32) -> Tracer {
+    spawn_helper_with(pid, true)
+}
+
+fn spawn_helper_with(pid: u32, hold_exit: bool) -> Tracer {
     let mut cmd = fixture_command(fixture_path!(foreign_tracer_helper));
     cmd.env(MARKER, std::process::id().to_string())
         .env(PID_ENV, pid.to_string())
+        .env_remove(HOLD_EXIT_ENV)
         .env_remove("RUST_TEST_NOCAPTURE")
         .stdin(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit());
+    if hold_exit {
+        cmd.env(HOLD_EXIT_ENV, "1");
+    }
     let mut helper = Helper(crate::test_spawn::spawn(&mut cmd).expect("spawn the foreign tracer"));
     let go = helper.0.stdin.take().expect("piped stdin");
     let lines = BufReader::new(helper.0.stdout.take().expect("piped stdout")).lines();

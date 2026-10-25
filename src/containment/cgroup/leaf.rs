@@ -251,6 +251,10 @@ pub(crate) struct CgroupLeaf {
     /// silently folding a genuine failure into the same `debug` note used for a tree the caller
     /// never asked to kill at all.
     kill_attempt_failed: AtomicBool,
+    /// Set by a failed async spawn's teardown: this long into the wait for the leaf's drain, after
+    /// its kill, `Drop` warns once and keeps waiting (see `slow_drain.rs`).
+    #[cfg(feature = "tokio")]
+    drain_warn_after: Option<std::time::Duration>,
 }
 
 /// Why a spawn-side resource of a [`CgroupLeaf`] is missing.
@@ -673,6 +677,10 @@ impl CgroupLeaf {
     fn block_until_drained(&mut self) -> Result<(), crate::error::Error> {
         #[cfg(feature = "tokio")]
         crate::bounded::assert_may_block("waiting for a cgroup leaf to drain");
+        #[cfg(feature = "tokio")]
+        if let Some(after) = self.drain_warn_after {
+            return self.block_until_drained_warning(after);
+        }
         // Stops and joins the pump first: the watch is then this `Drop`'s alone.
         match self.watch.get_mut() {
             Some(watch) => watch.wait(),
@@ -752,6 +760,8 @@ impl CgroupLeaf {
             watched: None,
             placed: super::PlacedAtRemoval::default(),
             kill_attempt_failed: AtomicBool::new(false),
+            #[cfg(feature = "tokio")]
+            drain_warn_after: None,
         }
     }
 
@@ -1676,6 +1686,8 @@ pub(crate) fn create_leaf_under(current: &Path) -> Result<CgroupLeaf, LeafError>
         watched: None,
         placed: super::PlacedAtRemoval::default(),
         kill_attempt_failed: AtomicBool::new(false),
+        #[cfg(feature = "tokio")]
+        drain_warn_after: None,
     })
 }
 
@@ -1791,6 +1803,10 @@ pub(crate) unsafe fn place_self_in_cgroup_pre_exec(procs_fd: RawFd, slot: Report
 #[cfg(all(feature = "tokio", target_os = "linux"))]
 #[path = "leaf/release.rs"]
 mod release;
+
+#[cfg(all(target_os = "linux", feature = "tokio"))]
+#[path = "leaf/slow_drain.rs"]
+mod slow_drain;
 
 #[cfg(all(test, target_os = "linux"))]
 #[path = "leaf/end_front_tests.rs"]

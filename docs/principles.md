@@ -33,12 +33,16 @@ a run-to-completion teardown (`status`, `output`, `read` failing after the spawn
 or mid-drain finishes as the `Drop` does, and one whose exit or drain cannot be watched (the
 reactor refuses the registration, or the handle reports an error) waits for it in place instead of
 forgetting a child that is ours. Both warn past 1 s, as principle 3 says. A failed async spawn's
-teardown waits in place too, and its wait for the root it killed warns once past 1 s, naming it, as
-the drop's does. That includes macOS's teardown of a child whose unique-id report came after the
-spawn returned ([`reap_unreported`](../src/tokio/child/proc_source.rs)).
+teardown waits in place too. These of its waits warn once past 1 s, as the drop's does: the wait
+for the root it killed, naming it (on macOS including the teardown of a child whose unique-id report
+came after the spawn returned, [`reap_unreported`](../src/tokio/child/proc_source.rs)); on Linux,
+the wait for an elevation front its leaf's kill ended, naming it; and the wait for a cgroup leaf's
+drain, in the leaf's `Drop` or in `finish_elevated`'s cleanup, naming the leaf.
 
 Spawning is the other exception: it blocks until `exec`, as tokio's own `Command::spawn` does.
-That includes cosca's placement report
+That includes the handshake's wait for a child that never ran the program to be gone
+([`await_unexecuted_exit`](../src/child/spawn/pidfd_handshake.rs)): it belongs to the spawn, not to
+a teardown, and does not warn. It includes cosca's placement report
 ([`ReportChannel::wait`](../src/containment/cgroup/channel.rs)), which completes before `exec`. The
 wait is bounded by the child's own progress to `exec`; a child stopped or stuck in D state between
 `fork` and `exec` holds the thread. The wait for macOS's unique-id report

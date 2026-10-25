@@ -47,6 +47,8 @@ thread_local! {
     static BEFORE_WALK_OPEN: std::cell::RefCell<Option<WalkHook>> = const { std::cell::RefCell::new(None) };
     static BEFORE_SWEEP_REMOVE: std::cell::RefCell<Option<WalkHook>> = const { std::cell::RefCell::new(None) };
     static BEFORE_DRAIN_BLOCK: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
+    #[cfg(feature = "tokio")]
+    static AFTER_DRAIN_WARN: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static WALK_FAILURE: std::cell::RefCell<Option<WalkFailure>> = const { std::cell::RefCell::new(None) };
     static PROC_HIDDEN_AS: Cell<Option<i32>> = const { Cell::new(None) };
     static PIDFD_INFO_FAILS: Cell<bool> = const { Cell::new(false) };
@@ -278,6 +280,19 @@ pub(crate) fn take_drain_blocking_notifier() {
 #[cfg(feature = "tokio")]
 pub(crate) fn set_before_drain_block(hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
     crate::oneshot_hook::arm(&BEFORE_DRAIN_BLOCK, hook)
+}
+
+/// Run `hook` once right after the next slow-drain warn on this thread, before the wait goes on:
+/// a fixture only the drain's end would release is let go here, so a mutant that never warned
+/// fails an assertion instead of hanging.
+#[cfg(feature = "tokio")]
+pub(crate) fn set_after_drain_warn(hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
+    crate::oneshot_hook::arm(&AFTER_DRAIN_WARN, hook)
+}
+
+#[cfg(feature = "tokio")]
+pub(crate) fn run_after_drain_warn() {
+    crate::oneshot_hook::fire(&AFTER_DRAIN_WARN);
 }
 
 pub(crate) fn notify_drain_blocking() {
