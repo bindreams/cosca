@@ -59,7 +59,7 @@ fn spawned_child_has_live_identity() {
 fn try_wait_returns_none_before_exit_and_some_after() {
     let mut cmd = Command::new();
     // tee-both blocks on stdin — the child won't exit until stdin is closed.
-    // Null stdout/stderr so tee-both doesn't panic on broken pipe.
+    // Null stdout/stderr: nothing reads them, and tee-both's outputs need no pump.
     cmd.executable(testbin())
         .args(["cosca_testbin", "tee-both"])
         .stdin(Stdio::pipe())
@@ -144,7 +144,7 @@ fn stderr_pipe_captures_output() {
 fn stdin_pipe_is_writable() {
     let mut cmd = Command::new();
     // tee-both reads stdin and copies to stdout+stderr; we just need to confirm
-    // the write end is usable. Wire stdout to null to avoid a broken-pipe panic.
+    // the write end is usable. Stdout goes to null: nothing reads it, and no pump is needed.
     cmd.executable(testbin())
         .args(["cosca_testbin", "tee-both"])
         .stdin(Stdio::pipe())
