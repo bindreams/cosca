@@ -59,8 +59,8 @@ pub(crate) enum Waited {
 /// Slots in one `kevent` batch.
 const BATCH: usize = 8;
 
-const BACKOFF_START: Duration = Duration::from_millis(1);
-const BACKOFF_CAP: Duration = Duration::from_millis(50);
+pub(crate) const BACKOFF_START: Duration = Duration::from_millis(1);
+pub(crate) const BACKOFF_CAP: Duration = Duration::from_millis(50);
 
 fn blank() -> KEvent {
     KEvent::new(0, EventFilter::EVFILT_PROC, EvFlags::empty(), FilterFlag::empty(), 0, 0)
@@ -299,6 +299,57 @@ fn final_peek(pid: u32, unique: Option<u64>) -> io::Result<Waited> {
     #[cfg(test)]
     exit_only::seams::step(exit_only::seams::HolderStep::FinalPeek);
     Ok(settle(peek(pid, unique)?).unwrap_or(Waited::DeadlinePassed))
+}
+
+// For a waiter that drives the kqueue itself (the tokio backend's reap) =====
+
+/// Register on `kq` what [`await_reapable_on`] waits on. `Ok(true)` when the `EVFILT_PROC` receipt
+/// says `ESRCH`, so no `NOTE_EXIT` or `NOTE_REAP` will come.
+#[cfg_attr(
+    not(feature = "tokio"),
+    allow(dead_code, reason = "the only other consumer is the tokio backend's reap")
+)]
+pub(crate) fn register_exit_events(kq: &Kqueue, pid: u32) -> io::Result<bool> {
+    register(kq, pid)
+}
+
+/// Read every event pending on `kq` without blocking: whether one was `NOTE_REAP`, and whether one
+/// was `NOTE_EXIT`.
+#[cfg_attr(
+    not(feature = "tokio"),
+    allow(dead_code, reason = "the only consumer is the tokio backend's reap")
+)]
+pub(crate) fn drain_exit_events(kq: &Kqueue) -> io::Result<(bool, bool)> {
+    let mut events = [blank(); BATCH];
+    let (mut reaped, mut exited) = (false, false);
+    loop {
+        let n = kevent_round(kq, &mut events, Block::Poll)?;
+        let (reap, exit) = scan(&events[..n]);
+        reaped |= reap;
+        exited |= exit;
+        if n < BATCH {
+            return Ok((reaped, exited));
+        }
+    }
+}
+
+/// Arm `kq`'s one-shot backoff timer: one `EVFILT_TIMER` event after `interval`, replacing a timer
+/// still pending.
+#[cfg_attr(
+    not(feature = "tokio"),
+    allow(dead_code, reason = "the only consumer is the tokio backend's reap")
+)]
+pub(crate) fn arm_backoff_timer(kq: &Kqueue, interval: Duration) -> io::Result<()> {
+    let timer = KEvent::new(
+        0,
+        EventFilter::EVFILT_TIMER,
+        EvFlags::EV_ADD | EvFlags::EV_ONESHOT,
+        FilterFlag::empty(),
+        interval.as_millis().max(1) as isize,
+        0,
+    );
+    let mut none: [KEvent; 0] = [];
+    kq.kevent(&[timer], &mut none, None).map(drop).map_err(io::Error::from)
 }
 
 /// [`await_reapable_on`] on a kqueue of its own.

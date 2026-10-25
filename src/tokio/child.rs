@@ -95,40 +95,30 @@ impl OsResources {
     /// drop's one `late` warn. `tree_failed`: the drop's own tree kill failed.
     #[cfg(unix)]
     fn release_after_drain(self, late: &mut LateWarn, tree_failed: bool) {
-        let Some(attached) = self.release_backend_and_rekill(tree_failed) else {
-            return;
-        };
-        #[cfg(target_os = "linux")]
-        if let (Attached::Cgroup(leaf), Some(until)) = (&attached, late.due()) {
-            // Only the warn depends on this bounded look; the leaf's own drop waits for the drain.
-            if matches!(
-                leaf.wait_drained(Some(Some(until))),
-                Ok(crate::containment::TreeDrain::MembersRemain)
-            ) {
-                late.warn(&format!(
-                    "has a cgroup leaf {} that has not drained",
-                    leaf.path().display()
-                ));
-            }
+        if let Some(attached) = self.release_backend_and_rekill(tree_failed) {
+            drop_after_drain(attached, late);
         }
-        #[cfg(not(target_os = "linux"))]
-        let _ = late;
-        drop(attached);
     }
 
     /// [`release_after_drain`](Self::release_after_drain) for an `async fn`: the drain is awaited
-    /// before the leaf's drop, which then finds the leaf drained.
+    /// before the leaf's drop, which then finds the leaf drained. Dropped during the drain, the
+    /// future waits for it on the dropping thread, as the drop does, with the drop's warn for
+    /// async child `pid` past 1 s from then.
     #[cfg(unix)]
-    async fn release_after_drain_awaiting(self, tree_failed: bool) {
+    async fn release_after_drain_awaiting(self, pid: u32, tree_failed: bool) {
         let Some(attached) = self.release_backend_and_rekill(tree_failed) else {
             return;
         };
+        let draining = Draining {
+            pid,
+            attached: Some(attached),
+        };
         // A drain that cannot be watched is the leaf's own drop's to report.
         #[cfg(target_os = "linux")]
-        if let Attached::Cgroup(leaf) = &attached {
+        if let Some(Attached::Cgroup(leaf)) = &draining.attached {
             _ = crate::tokio::wait::cgroup_wait_tree_drained(leaf, None).await;
         }
-        drop(attached);
+        draining.finish();
     }
 
     /// The first half of both drain releases: the backend goes, and a failed tree kill is fired
@@ -152,6 +142,58 @@ impl OsResources {
         #[cfg(not(target_os = "linux"))]
         let _ = tree_failed;
         Some(attached)
+    }
+}
+
+/// Drop `attached`, whose drain its kills bound, as the sync `Drop` drops it: a cgroup leaf waits
+/// for its drain. A leaf not drained by `late`'s due time gets its one warn first.
+#[cfg(unix)]
+fn drop_after_drain(attached: Attached, late: &mut LateWarn) {
+    #[cfg(target_os = "linux")]
+    if let (Attached::Cgroup(leaf), Some(until)) = (&attached, late.due()) {
+        // Only the warn depends on this bounded look; the leaf's own drop waits for the drain.
+        if matches!(
+            leaf.wait_drained(Some(Some(until))),
+            Ok(crate::containment::TreeDrain::MembersRemain)
+        ) {
+            late.warn(&format!(
+                "has a cgroup leaf {} that has not drained",
+                leaf.path().display()
+            ));
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = late;
+    drop(attached);
+}
+
+/// An awaited teardown's drain in progress. Dropped with the drain unfinished (its future was), it
+/// drops the containment resource as [`drop_after_drain`] does, with a warn started then. While
+/// unwinding it drops the resource in place, whose own drop still waits for the drain.
+#[cfg(unix)]
+struct Draining {
+    pid: u32,
+    attached: Option<Attached>,
+}
+
+#[cfg(unix)]
+impl Draining {
+    /// The drain is over: the resource drops without a warn.
+    fn finish(mut self) {
+        drop(self.attached.take());
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Draining {
+    fn drop(&mut self) {
+        if let Some(attached) = self.attached.take() {
+            if std::thread::panicking() {
+                drop(attached);
+            } else {
+                drop_after_drain(attached, &mut LateWarn::new(self.pid));
+            }
+        }
     }
 }
 
@@ -1384,7 +1426,8 @@ impl Child {
     /// which fail after the spawn. The armed drop's waits (see [`Settle`]) are awaited instead of
     /// blocked on, without the drop's 1 s warn, which is about a blocked thread. Dropped before the
     /// reap is over, the future finishes the teardown as the drop does, blocking; dropped during the
-    /// drain, it leaves the leaf to its own drop, which blocks on the drain too.
+    /// drain, it waits for the drain as the drop does, with the drop's warn past 1 s from then. A
+    /// root whose exit cannot be watched is reaped as the drop does, blocking.
     pub(crate) async fn tear_down_awaiting(&mut self) -> crate::error::ChildFate {
         let teardown = self.signal_for_teardown();
         // Before the waits, so the handle's own drop does nothing more if this future is dropped.
@@ -1399,11 +1442,20 @@ impl Child {
                 };
                 let signalled = reaping.signalled.as_mut().expect("taken only once the reap is over");
                 if signalled.signals.settle == Settle::ReapAndDrain {
-                    reap_killed_root_awaiting(self.id, &mut signalled.os, &mut signalled.signals).await;
+                    if let Err(e) = reap_killed_root_awaiting(self.id, &mut signalled.os, &mut signalled.signals).await
+                    {
+                        log::warn!(
+                            "async child {}: its exit cannot be watched ({e}); the teardown reaps it on this \
+                             thread, blocking",
+                            self.id.pid()
+                        );
+                        let signalled = reaping.signalled.take().expect("taken only here before the drop");
+                        return self.settle(signalled);
+                    }
                 }
                 let signalled = reaping.signalled.take().expect("taken only here before the drop");
                 let (os, fate, tree_failed) = self.report(*signalled);
-                os.release_after_drain_awaiting(tree_failed).await;
+                os.release_after_drain_awaiting(self.id.pid(), tree_failed).await;
                 fate
             }
         }
@@ -1589,8 +1641,9 @@ enum Teardown {
 }
 
 /// An awaited teardown's reap in progress. Dropped with the reap unfinished (its future was), it
-/// settles the rest as the drop would, unless the thread is unwinding: then the resources go to
-/// their own drops, which log nothing.
+/// settles the rest as the drop would. While unwinding it leaves the resources to their own drops:
+/// the backend's, which hands tokio's `Child` to tokio's drop only for a child its handle shows
+/// ours, and a cgroup leaf's, which still waits for the drain and may warn.
 #[cfg(unix)]
 struct Reaping<'a> {
     child: &'a Child,
@@ -1692,20 +1745,26 @@ fn reap_killed_root(id: ProcessId, os: &mut OsResources, signals: &mut DropSigna
     }
 }
 
-/// [`reap_killed_root`] for an `async fn`: the exit is awaited, and nothing warns.
+/// [`reap_killed_root`] for an `async fn`: the exit is awaited, and nothing warns. `Err` when the
+/// exit cannot be watched: nothing was done, and the caller reaps by other means.
 #[cfg(unix)]
-async fn reap_killed_root_awaiting(id: ProcessId, os: &mut OsResources, signals: &mut DropSignals) {
+async fn reap_killed_root_awaiting(
+    id: ProcessId,
+    os: &mut OsResources,
+    signals: &mut DropSignals,
+) -> Result<(), Error> {
     let Some(proc) = os.proc.as_mut() else {
-        return;
+        return Ok(());
     };
     if proc.is_reaped() {
-        return;
+        return Ok(());
     }
-    let (waited, cause) = proc.wait_and_reap_awaiting().await;
+    let (waited, cause) = proc.wait_and_reap_awaiting().await?;
     match waited {
         Waited::Exited => signals.fate = proc.collect_exit(Some(id)),
         _ => signals.forgot = proc.forget_for_wait(waited, cause),
     }
+    Ok(())
 }
 
 /// What a forced kill of the child may do (see [`crate::elevation::front`]).
@@ -1991,6 +2050,8 @@ pub(crate) mod fault {
     thread_local! {
         static FORCE_KILL_FAILURE: Cell<bool> = const { Cell::new(false) };
         static PEND_AWAITED_REAP: Cell<bool> = const { Cell::new(false) };
+        static FAIL_REAP_WATCH: Cell<bool> = const { Cell::new(false) };
+        static REAP_PARKED: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
         static RELEASES: Cell<usize> = const { Cell::new(0) };
         static BACKEND_DROPS: Cell<usize> = const { Cell::new(0) };
     }
@@ -2100,6 +2161,13 @@ pub(crate) mod fault {
     #[must_use = "the seam is cleared as soon as the guard is dropped"]
     pub(crate) struct PendAwaitedReap(());
 
+    impl PendAwaitedReap {
+        /// Whether an awaited reap has reached the seam, and so pends.
+        pub(crate) fn taken(&self) -> bool {
+            !PEND_AWAITED_REAP.with(Cell::get)
+        }
+    }
+
     impl Drop for PendAwaitedReap {
         fn drop(&mut self) {
             PEND_AWAITED_REAP.with(|f| f.set(false));
@@ -2108,6 +2176,37 @@ pub(crate) mod fault {
 
     pub(super) fn take_pend_awaited_reap() -> bool {
         PEND_AWAITED_REAP.with(|f| f.replace(false))
+    }
+
+    /// The next reap on this thread that waits on events fails to register its watch, as when the
+    /// reactor refuses it.
+    pub(crate) fn fail_reap_watch() -> FailReapWatch {
+        FAIL_REAP_WATCH.with(|f| f.set(true));
+        FailReapWatch(())
+    }
+
+    #[must_use = "the seam is cleared as soon as the guard is dropped"]
+    pub(crate) struct FailReapWatch(());
+
+    impl Drop for FailReapWatch {
+        fn drop(&mut self) {
+            FAIL_REAP_WATCH.with(|f| f.set(false));
+        }
+    }
+
+    pub(crate) fn take_fail_reap_watch() -> bool {
+        FAIL_REAP_WATCH.with(|f| f.replace(false))
+    }
+
+    /// Run `hook` the first time a reap that waits on events (the awaited teardown's, or `wait`'s)
+    /// on this thread has looked at the root and found nothing to reap yet, before it waits for the
+    /// next event.
+    pub(crate) fn set_reap_parked(hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
+        crate::oneshot_hook::arm(&REAP_PARKED, hook)
+    }
+
+    pub(crate) fn run_reap_parked() {
+        crate::oneshot_hook::fire(&REAP_PARKED);
     }
 }
 

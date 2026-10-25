@@ -433,13 +433,13 @@ impl ProcSource {
         }
     }
 
-    /// Block until the child exits, returning its status.
+    /// Wait until the child exits, returning its status.
     ///
-    /// tokio's own `wait` is a `waitpid` by pid, so on Unix it runs only for a child the handle
-    /// shows ours, before and after the exit is awaited (Linux: through the pidfd; macOS: a watch
-    /// armed on the unique id read at spawn and checked again after arming). A child reaped
-    /// elsewhere is forgotten and answers `ECHILD`. A child the handle cannot answer for
-    /// (a failed peek, or macOS without a readable unique id) answers
+    /// tokio's own `wait` and `try_wait` are a `waitpid` by pid, so on Unix the status is collected
+    /// only by [`reap_on_events`](ProcSource::reap_on_events), right after a look through the handle
+    /// shows the exit (Linux: through the pidfd; macOS: by pid, checked against the unique id read
+    /// at spawn). A child reaped elsewhere is forgotten and answers `ECHILD`. A child the handle
+    /// cannot answer for (a failed peek, or macOS without a readable unique id) answers
     /// [`Error::Unassessable`], since it may well be running; it is not forgotten.
     pub(crate) async fn wait(&mut self) -> Result<ExitStatus, Error> {
         match self {
@@ -448,16 +448,30 @@ impl ProcSource {
                 drop(stdin.take());
                 #[cfg(unix)]
                 {
-                    // Checked before the watch too: a pid that names a stranger now would be
-                    // watched until the stranger exits.
+                    // Checked before the watch too, so a child already reaped elsewhere is not
+                    // watched.
                     self.gate()?;
-                    self.await_exit().await?;
-                    self.gate()?;
+                    match self.reap_on_events().await {
+                        Ok(status) => Ok(status),
+                        Err(Halt::State(state)) => Err(self.refuse(state)),
+                        Err(Halt::ReapedBetween(why)) => {
+                            self.forget_as(
+                                &format!("was reaped by someone else ({why})"),
+                                Forgotten::ReapedElsewhere,
+                            );
+                            Err(gone())
+                        }
+                        Err(Halt::ReapFailed(e)) => Err(Error::Io(e)),
+                        Err(Halt::Watch(e)) => Err(e),
+                    }
                 }
-                let ProcSource::Tokio { child: c, .. } = self else {
-                    unreachable!("a gate that forgot the child returned an error")
-                };
-                c.wait().await.map_err(Error::Io)
+                #[cfg(windows)]
+                {
+                    let ProcSource::Tokio { child: c, .. } = self else {
+                        unreachable!("matched above")
+                    };
+                    c.wait().await.map_err(Error::Io)
+                }
             }
             #[cfg(unix)]
             ProcSource::Foreign { .. } => Err(gone()),
@@ -483,34 +497,51 @@ impl ProcSource {
         }
     }
 
-    /// `Ok` for a child the handle shows ours, or that tokio already reaped. Reaped elsewhere: the
-    /// child is forgotten and the answer is `ECHILD`. Not shown either way: `Unassessable`, with the
-    /// child left in place, so a later call can still answer and a `Drop` forgets it.
+    /// `Ok` for a child the handle shows ours, or that tokio already reaped. Otherwise
+    /// [`refuse`](ProcSource::refuse)'s answer.
     #[cfg(unix)]
     fn gate(&mut self) -> Result<(), Error> {
         let ProcSource::Tokio { child, .. } = &*self else {
             return Ok(());
         };
-        let Some(pid) = child.id() else {
+        if child.id().is_none() {
             return Ok(());
-        };
+        }
         match self.state_of(child) {
             RootState::Unreaped => Ok(()),
-            RootState::Reaped => {
+            state => Err(self.refuse(state)),
+        }
+    }
+
+    /// The answer to a wait whose look found `state`, not `Unreaped`. Reaped elsewhere: the child is
+    /// forgotten and the answer is `ECHILD`. Not shown either way: `Unassessable`, with the child
+    /// left in place, so a later call can still answer and a `Drop` forgets it.
+    #[cfg(unix)]
+    fn refuse(&mut self, state: RootState) -> Error {
+        debug_assert!(
+            !matches!(state, RootState::Unreaped),
+            "a wait refused a child its handle shows ours"
+        );
+        let pid = match self {
+            ProcSource::Tokio { child, .. } => child.id().map_or_else(|| "?".to_owned(), |pid| pid.to_string()),
+            ProcSource::Foreign { .. } => "?".to_owned(),
+        };
+        match state {
+            RootState::Unreaped | RootState::Reaped => {
                 self.forget_as("was reaped by someone else", Forgotten::ReapedElsewhere);
-                Err(gone())
+                gone()
             }
-            RootState::Unknown(failed) => Err(Error::Unassessable {
+            RootState::Unknown(failed) => Error::Unassessable {
                 detail: format!("pid {pid}: the child cannot be shown to be ours; it was not waited on"),
                 source: Some(failed),
-            }),
-            RootState::Unpinned => Err(Error::Unassessable {
+            },
+            RootState::Unpinned => Error::Unassessable {
                 detail: format!(
                     "pid {pid}: the child cannot be shown to be ours ({}); it was not waited on",
                     crate::signal::UNPINNED_WHY
                 ),
                 source: None,
-            }),
+            },
         }
     }
 
@@ -525,32 +556,6 @@ impl ProcSource {
                 crate::tokio::wait::pidfd_exited_within(std::os::fd::AsFd::as_fd(pidfd), grace).await
             }
             ProcSource::Foreign { fate, .. } => Ok(fate.gone()),
-        }
-    }
-
-    /// Waits, without reaping, until the child's exit is visible through its handle (Linux: the
-    /// pidfd turns readable; macOS: the verified-id kqueue watch fires).
-    #[cfg(unix)]
-    async fn await_exit(&self) -> Result<(), Error> {
-        #[cfg(target_os = "linux")]
-        {
-            let ProcSource::Tokio { pidfd, .. } = self else {
-                return Ok(());
-            };
-            let pidfd = pidfd.try_clone().map_err(Error::Io)?;
-            crate::tokio::wait::watch_pidfd(pidfd).await
-        }
-        #[cfg(target_os = "macos")]
-        {
-            let ProcSource::Tokio { child, identity, .. } = self else {
-                return Ok(());
-            };
-            // No unique id, or the child already reaped: nothing to watch, and the gate after this
-            // decides what that means.
-            let (Some(pid), Some(identity)) = (child.id(), *identity) else {
-                return Ok(());
-            };
-            crate::tokio::wait::wait_exit_for(pid, identity).await
         }
     }
 
@@ -870,58 +875,89 @@ impl ProcSource {
     }
 
     /// [`wait_and_reap_caused`](ProcSource::wait_and_reap_caused) for an `async fn`, without
-    /// blocking: the gate and exit watch of [`wait`](ProcSource::wait), then tokio's own `wait`,
-    /// which collects the status (a `waitpid` by pid, run only for a child the handle shows ours).
-    /// What the gate finds instead is returned, not acted on or logged: the caller forgets the child
-    /// and reports it. **Never kills.**
+    /// blocking: [`reap_on_events`](ProcSource::reap_on_events). What it finds instead of a status
+    /// is returned, not acted on or logged: the caller forgets the child and reports it. `Err` when
+    /// the exit cannot be watched, so nothing is known yet: the caller reaps by other means.
+    /// **Never kills.**
     #[cfg(unix)]
-    pub(crate) async fn wait_and_reap_awaiting(&mut self) -> (Waited, Option<String>) {
+    pub(crate) async fn wait_and_reap_awaiting(&mut self) -> Result<(Waited, Option<String>), Error> {
+        #[cfg(test)]
+        crate::child::spawn::fault::run_between_kill_and_wait();
         #[cfg(test)]
         if super::fault::take_pend_awaited_reap() {
             std::future::pending::<()>().await;
         }
-        if let Err(found) = self.reap_verdict() {
-            return found;
-        }
-        if let Err(e) = self.await_exit().await {
-            return (Waited::Unverified, Some(format!("watching for its exit failed: {e}")));
-        }
-        if let Err(found) = self.reap_verdict() {
-            return found;
-        }
-        let ProcSource::Tokio { child, .. } = self else {
-            unreachable!("the gate answers a forgotten backend with an error")
-        };
-        match child.wait().await {
+        Ok(match self.reap_on_events().await {
             Ok(_) => (Waited::Exited, None),
-            Err(e) => (Waited::Unverified, Some(format!("tokio's wait failed: {e}"))),
-        }
+            Err(Halt::State(state)) => verdict_of(state),
+            Err(Halt::ReapedBetween(why)) => (Waited::Foreign, Some(why)),
+            Err(Halt::ReapFailed(e)) => (Waited::Unverified, Some(format!("tokio's try_wait failed: {e}"))),
+            Err(Halt::Watch(e)) => return Err(e),
+        })
     }
 
-    /// [`gate`](ProcSource::gate) without its forget: `Ok` for a child the handle shows ours, or
-    /// that tokio already reaped; otherwise what a wait found, and why.
+    /// Collect the child's status once it has exited, without blocking. tokio's `try_wait` is a
+    /// `waitpid` by pid, so it runs only right after a look through the child's handle shows the
+    /// exit, and every attempt has its own look. Between attempts the reap waits for an event on
+    /// the handle (see [`event_reap`]): a zombie a foreign tracer holds shows no exit until the
+    /// tracer hands it back. A foreign reap between a look and its `try_wait` is not seen: if
+    /// another child of ours has taken the number, `try_wait` collects it.
     #[cfg(unix)]
-    fn reap_verdict(&self) -> Result<(), (Waited, Option<String>)> {
-        let ProcSource::Tokio { child, .. } = self else {
-            return Err((Waited::Unverified, None));
-        };
-        if child.id().is_none() {
-            return Ok(());
+    async fn reap_on_events(&mut self) -> Result<ExitStatus, Halt> {
+        use crate::wait::exit_only::{self, Target};
+
+        if !matches!(self, ProcSource::Tokio { .. }) {
+            return Err(Halt::State(self.state()));
         }
-        match self.state_of(child) {
-            RootState::Unreaped => Ok(()),
-            RootState::Reaped => Err((
-                Waited::Foreign,
-                Some("its handle shows it reaped by someone else".to_owned()),
-            )),
-            #[cfg(target_os = "macos")]
-            RootState::Unpinned => Err((Waited::Orphaned, Some(crate::signal::UNPINNED_WHY.to_owned()))),
-            #[cfg(not(target_os = "macos"))]
-            RootState::Unpinned => Err((Waited::Unverified, Some(crate::signal::UNPINNED_WHY.to_owned()))),
-            RootState::Unknown(e) => Err((
-                Waited::Unverified,
-                Some(format!("its handle cannot show it is ours ({e})")),
-            )),
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsFd as _;
+
+            let ProcSource::Tokio { child, pidfd, .. } = self else {
+                unreachable!("checked above")
+            };
+            if child.id().is_none() {
+                return collected(child);
+            }
+            let target = Target::PidFd(pidfd.as_fd());
+            let watch = event_reap::PidfdWatch::arm(pidfd.as_fd()).map_err(Halt::Watch)?;
+            loop {
+                let ready = watch.ready().await.map_err(Halt::Watch)?;
+                if let Some(status) = reap_after_look(child, exit_only::peek(&target))? {
+                    return Ok(status);
+                }
+                #[cfg(test)]
+                super::fault::run_reap_parked();
+                ready.seen();
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let ProcSource::Tokio { child, identity, .. } = self else {
+                unreachable!("checked above")
+            };
+            if child.id().is_none() {
+                return collected(child);
+            }
+            let (Some(pid), Some(identity)) = (child.id(), *identity) else {
+                return Err(Halt::State(RootState::Unknown(std::io::Error::other(
+                    "the child's unique id is unknown, so nothing shows its pid still names it",
+                ))));
+            };
+            let target = Target::pid(pid, Some(identity));
+            let mut watch = event_reap::KqueueWatch::arm(pid).map_err(Halt::Watch)?;
+            loop {
+                // A `NOTE_REAP` means something else reaped it: no look by its pid may follow.
+                if watch.reaped().map_err(Halt::Watch)? {
+                    return Err(Halt::State(RootState::Reaped));
+                }
+                if let Some(status) = reap_after_look(child, exit_only::peek_verified(&target))? {
+                    return Ok(status);
+                }
+                #[cfg(test)]
+                super::fault::run_reap_parked();
+                watch.next().await.map_err(Halt::Watch)?;
+            }
         }
     }
 
@@ -1451,6 +1487,74 @@ fn after_refused_kill(handed: Option<ChildFate>, forgotten: Option<ChildFate>, i
     ChildFate::Running { id }
 }
 
+/// Why [`ProcSource::reap_on_events`] stopped without a status.
+#[cfg(unix)]
+#[derive(Debug)]
+enum Halt {
+    /// A look showed the child not this backend's to reap (never `Unreaped`).
+    State(RootState),
+    /// The `try_wait` right after a look that showed the exit found no record, or `ECHILD`:
+    /// something else reaped the child in between. What showed it.
+    ReapedBetween(String),
+    /// The `try_wait` right after a look that showed the exit failed otherwise.
+    ReapFailed(std::io::Error),
+    /// The exit cannot be watched; nothing was looked at.
+    Watch(Error),
+}
+
+/// What a wait whose look found `state`, not `Unreaped`, says: the verdict, and why.
+#[cfg(unix)]
+fn verdict_of(state: RootState) -> (Waited, Option<String>) {
+    match state {
+        RootState::Unreaped | RootState::Reaped => (
+            Waited::Foreign,
+            Some("its handle shows it reaped by someone else".to_owned()),
+        ),
+        #[cfg(target_os = "macos")]
+        RootState::Unpinned => (Waited::Orphaned, Some(crate::signal::UNPINNED_WHY.to_owned())),
+        #[cfg(not(target_os = "macos"))]
+        RootState::Unpinned => (Waited::Unverified, Some(crate::signal::UNPINNED_WHY.to_owned())),
+        RootState::Unknown(e) => (
+            Waited::Unverified,
+            Some(format!("its handle cannot show it is ours ({e})")),
+        ),
+    }
+}
+
+/// The status tokio already collected.
+#[cfg(unix)]
+fn collected(child: &mut ::tokio::process::Child) -> Result<ExitStatus, Halt> {
+    match child.try_wait() {
+        Ok(Some(status)) => Ok(status),
+        Ok(None) => unreachable!("tokio answers its collected status once it has reaped"),
+        Err(e) => Err(Halt::ReapFailed(e)),
+    }
+}
+
+/// Act on one look at the child: on an exit, collect it with tokio's `try_wait` at once; `None`
+/// while there is nothing to reap.
+#[cfg(unix)]
+fn reap_after_look(
+    child: &mut ::tokio::process::Child,
+    looked: std::io::Result<crate::wait::exit_only::Peek>,
+) -> Result<Option<ExitStatus>, Halt> {
+    use crate::wait::exit_only::Peek;
+    match looked {
+        Ok(Peek::Exit(_)) => match child.try_wait() {
+            Ok(Some(status)) => Ok(Some(status)),
+            Ok(None) => Err(Halt::ReapedBetween(
+                "waitpid found no exit record after its handle showed one".to_owned(),
+            )),
+            Err(e) if e.raw_os_error() == Some(libc::ECHILD) => Err(Halt::ReapedBetween(
+                "waitpid answered ECHILD after its handle showed its exit".to_owned(),
+            )),
+            Err(e) => Err(Halt::ReapFailed(e)),
+        },
+        Ok(Peek::Running) => Ok(None),
+        other => Err(Halt::State(RootState::of_peek(other))),
+    }
+}
+
 /// Whether tokio still holds the child, so its pid is pinned. Once tokio is `Done` (a prior
 /// `wait()` reaped it) the pid may be recycled and nothing may wait on it.
 fn still_ours(child: &::tokio::process::Child) -> bool {
@@ -1583,6 +1687,10 @@ fn wait_on_handle(child: &::tokio::process::Child, pid: u32) -> Waited {
     }
     Waited::Exited
 }
+
+#[cfg(unix)]
+#[path = "proc_source/event_reap.rs"]
+mod event_reap;
 
 #[cfg(test)]
 #[path = "proc_source_tests.rs"]

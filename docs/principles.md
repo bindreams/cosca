@@ -123,10 +123,11 @@ Where a group ID must be used (process-group or fd-marker containment), keep the
 zombie until the group kill is done.
 
 Two by-number reaps are outside this rule, both tokio's `waitpid(pid)`: its reap of a dropped async
-root the drop could not kill (principle 3), and its collect of an async root whose exit cosca has
-already seen through the root's handle (the armed drop, `wait`, and a failed run-to-completion
-helper). The root is then an unreaped zombie of ours, but a foreign reap between that look and the
-collect is not detected.
+root the drop could not kill (principle 3), and its collect of an async root right after a look
+through the root's handle showed the exit (the armed drop, `wait`, and a failed run-to-completion
+helper). Every collect has its own look: an async wait whose look finds nothing to collect, as for
+a zombie a foreign tracer holds, waits for the handle's next event and looks again. The root is then
+an unreaped zombie of ours, but a foreign reap between a look and its collect is not detected.
 
 **Why:** once the process is reaped its number can belong to anyone, and a signal sent to it hits an
 unrelated process.
@@ -262,8 +263,8 @@ workflow-wide and opts in only in the root lanes that can `setuid` to those uids
 with `SKULD_LABELS=root`. So does `COSCA_TEST_TRACER` (the tests that attach a tracer to their own
 children, as a debugger does), joined with `#[fixture(tracer_group)] _group: &Group`: CI turns it
 off workflow-wide, and the two tracer steps of the `test` job (debug and release) opt in, selected
-by `SKULD_LABELS=tracer`. So does
-`COSCA_TEST_CGROUP` (the tests that need the unconfined cgroup lane), a `test_group!` row joined
+by `SKULD_LABELS=tracer`; the cgroup step opts in too, for the `namespaces` tests that also trace.
+So does `COSCA_TEST_CGROUP` (the tests that need the unconfined cgroup lane), a `test_group!` row joined
 with `#[fixture(cgroup)] _group: &Group`: CI turns it off workflow-wide and the cgroup step opts
 in. So does
 `COSCA_TEST_DRIVE_MAPPING` (`windows_process_cwd`'s drive mapping), a `test_group!` row joined with

@@ -61,3 +61,40 @@ fn exit_visible_by_refuses_inside_a_section() {
     let _section = crate::bounded::Section::enter();
     proc.exit_visible_by(1, std::time::Instant::now());
 }
+
+/// `ECHILD` from the reap right after a look that showed the child's exit means something else
+/// reaped it in between: the awaited reap says so, not that it cannot show the child is ours. The
+/// child is killed and reaped behind tokio's back, and the look is made to show the exit.
+///
+/// Mutant: a failed `try_wait` is `Waited::Unverified` whatever its errno.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn an_echild_after_a_look_that_showed_the_exit_is_a_foreign_reap() {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    use crate::wait::exit_only::{seams::force_peeks, Peek, Reaped};
+
+    let mut cmd = crate::tokio::Command::new();
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+    let mut child = cmd.spawn().expect("spawn");
+    let pid = child.id().pid();
+    let proc = child.proc_mut();
+    assert_eq!(
+        proc.signal(crate::signal::Sig::Kill).expect("kill"),
+        crate::signal::Sent::Delivered
+    );
+    let raw = rustix::process::Pid::from_raw(pid as i32).expect("a positive pid");
+    rustix::process::waitid(
+        rustix::process::WaitId::Pid(raw),
+        rustix::process::WaitIdOptions::EXITED,
+    )
+    .expect("reap behind tokio's back")
+    .expect("an exit record");
+    let _shows_exit = force_peeks([Ok(Peek::Exit(Reaped::Status(std::process::ExitStatus::from_raw(9))))]);
+
+    let (waited, cause) = proc.wait_and_reap_awaiting().await.expect("the exit can be watched");
+
+    assert_eq!(waited, super::Waited::Foreign, "{cause:?}");
+    drop(child);
+}
