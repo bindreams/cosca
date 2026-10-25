@@ -723,7 +723,7 @@ impl Child {
     #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn test_marker_root(&self) -> Option<ProcessId> {
         match &self.os.attached {
-            crate::containment::Attached::FdMarker(m) => Some(m.root()),
+            crate::containment::Attached::FdMarker(m) => m.root(),
             _ => None,
         }
     }
@@ -2161,14 +2161,17 @@ pub(crate) mod fault {
     /// completes, as for a root a tracer holds, so a test can drop the future awaiting it.
     ///
     /// [`ProcSource::wait_and_reap_awaiting`]: super::ProcSource::wait_and_reap_awaiting
+    #[cfg(unix)]
     pub(crate) fn pend_awaited_reap() -> PendAwaitedReap {
         PEND_AWAITED_REAP.with(|f| f.set(true));
         PendAwaitedReap(())
     }
 
+    #[cfg(unix)]
     #[must_use = "the seam is cleared as soon as the guard is dropped"]
     pub(crate) struct PendAwaitedReap(());
 
+    #[cfg(unix)]
     impl PendAwaitedReap {
         /// Whether an awaited reap has reached the seam, and so pends.
         pub(crate) fn taken(&self) -> bool {
@@ -2176,32 +2179,38 @@ pub(crate) mod fault {
         }
     }
 
+    #[cfg(unix)]
     impl Drop for PendAwaitedReap {
         fn drop(&mut self) {
             PEND_AWAITED_REAP.with(|f| f.set(false));
         }
     }
 
+    #[cfg(unix)]
     pub(super) fn take_pend_awaited_reap() -> bool {
         PEND_AWAITED_REAP.with(|f| f.replace(false))
     }
 
     /// The next reap on this thread that waits on events fails to register its watch, as when the
     /// reactor refuses it.
+    #[cfg(unix)]
     pub(crate) fn fail_reap_watch() -> FailReapWatch {
         FAIL_REAP_WATCH.with(|f| f.set(true));
         FailReapWatch(())
     }
 
+    #[cfg(unix)]
     #[must_use = "the seam is cleared as soon as the guard is dropped"]
     pub(crate) struct FailReapWatch(());
 
+    #[cfg(unix)]
     impl Drop for FailReapWatch {
         fn drop(&mut self) {
             FAIL_REAP_WATCH.with(|f| f.set(false));
         }
     }
 
+    #[cfg(unix)]
     pub(crate) fn take_fail_reap_watch() -> bool {
         FAIL_REAP_WATCH.with(|f| f.replace(false))
     }
@@ -2235,10 +2244,12 @@ pub(crate) mod fault {
     /// Run `hook` the first time a reap that waits on events (the awaited teardown's, or `wait`'s)
     /// on this thread has looked at the root and found nothing to reap yet, before it waits for the
     /// next event.
+    #[cfg(unix)]
     pub(crate) fn set_reap_parked(hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
         crate::oneshot_hook::arm(&REAP_PARKED, hook)
     }
 
+    #[cfg(unix)]
     pub(crate) fn run_reap_parked() {
         crate::oneshot_hook::fire(&REAP_PARKED);
     }
@@ -2247,3 +2258,7 @@ pub(crate) mod fault {
 #[cfg(all(test, target_os = "macos"))]
 #[path = "child/identity_macos_tests.rs"]
 mod identity_macos_tests;
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "child/late_report_tests.rs"]
+mod late_report_tests;

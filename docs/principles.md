@@ -32,13 +32,20 @@ The armed async `Drop` is an exception: it blocks until what it killed is reaped
 a run-to-completion teardown (`status`, `output`, `read` failing after the spawn) dropped mid-reap
 or mid-drain finishes as the `Drop` does, and one whose exit or drain cannot be watched (the
 reactor refuses the registration, or the handle reports an error) waits for it in place instead of
-forgetting a child that is ours. Both warn past 1 s, as principle 3 says.
+forgetting a child that is ours. Both warn past 1 s, as principle 3 says. A failed async spawn's
+teardown waits the same way, macOS's for a child whose unique-id report came after the spawn
+returned included ([`reap_unreported`](../src/tokio/child/proc_source.rs)).
 
 Spawning is the other exception: it blocks until `exec`, as tokio's own `Command::spawn` does.
 That includes cosca's placement report
 ([`ReportChannel::wait`](../src/containment/cgroup/channel.rs)), which completes before `exec`. The
 wait is bounded by the child's own progress to `exec`; a child stopped or stuck in D state between
-`fork` and `exec` holds the thread.
+`fork` and `exec` holds the thread. The wait for macOS's unique-id report
+([`unique_report::await_report`](../src/child/spawn/unique_report.rs)) is bounded the same way, with
+accepted residuals: if something else reaps the child and another child of this process takes its
+pid before the wait registers its watch, the wait lasts as long as that process; and a tracer
+holding the child's zombie keeps it waiting until the tracer hands the zombie back. It runs after
+`spawn_lock` is released, so it holds up only its own spawn.
 
 [`SuspendedChild::resume`](../src/tokio/child/suspended.rs) is the deferred second half of a spawn,
 so the exception covers it, and it is a sync `fn`. On Windows it walks the system's thread snapshot
@@ -126,12 +133,17 @@ doesn't do this yet either ([#341]).
 Where a group ID must be used (process-group or fd-marker containment), keep the root an unreaped
 zombie until the group kill is done.
 
-Two by-number reaps are outside this rule, both tokio's `waitpid(pid)`: its reap of a dropped async
-root the drop could not kill (principle 3), and every collect of an async root, which is tokio's
-`try_wait` right after cosca's own look through the root's handle showed the exit. A collect never
-goes without its look: an async wait whose look finds nothing to collect, as for a zombie a foreign
-tracer holds, waits for the handle's next event and looks again. The root is then an unreaped zombie
-of ours, but a foreign reap between a look and its collect is not detected.
+The by-number reaps outside this rule are all tokio's `waitpid(pid)`. One is its reap of an async
+root cosca could not kill and leaves to it: a dropped root (principle 3), or, on macOS, a child
+whose async spawn failed, which cosca releases to tokio's orphan queue rather than forget it and
+leave a zombie nothing collects (`ProcSource::reap_now_noting` and `ProcSource::reap_unreported` in
+[`proc_source.rs`](../src/tokio/child/proc_source.rs), and the attach-failure arm of
+`spawn_uncommitted` in [`tokio/spawn.rs`](../src/tokio/spawn.rs)). The other is every collect of an
+async root, which is tokio's `try_wait` right after cosca's own look through the root's handle
+showed the exit. A collect never goes without its look: an async wait whose look finds nothing to
+collect, as for a zombie a foreign tracer holds, waits for the handle's next event and looks again.
+The root is then an unreaped zombie of ours, but a foreign reap between a look and its collect is
+not detected.
 
 **Why:** once the process is reaped its number can belong to anyone, and a signal sent to it hits an
 unrelated process.

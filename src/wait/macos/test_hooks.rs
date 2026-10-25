@@ -314,6 +314,28 @@ pub(crate) fn fire_kevent_round(round: u32) {
     }
 }
 
+/// Whether `kq` has an event pending, by a `poll` of its descriptor, which takes nothing from it.
+pub(crate) fn event_pending(kq: &Kqueue) -> bool {
+    use std::os::fd::{AsFd, AsRawFd};
+    let mut fd = libc::pollfd {
+        fd: kq.as_fd().as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid `pollfd`, and a zero timeout.
+    let n = unsafe { libc::poll(&mut fd, 1, 0) };
+    assert!(n >= 0, "poll the wait's kqueue: {}", std::io::Error::last_os_error());
+    n == 1
+}
+
+/// Sends `signal` to `pid`, asserting it was delivered.
+pub(crate) fn send_signal(pid: u32, signal: libc::c_int) {
+    // SAFETY: `kill` with a pid this test spawned (or its own) and a signal whose default action
+    // leaves a running process running.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, signal) };
+    assert_eq!(rc, 0, "kill({pid}, {signal}): {}", std::io::Error::last_os_error());
+}
+
 /// Disarms an unconsumed force on drop.
 #[must_use = "dropping this immediately disarms the force; bind it for the probe's duration"]
 pub(crate) struct ForcedOnce(fn());

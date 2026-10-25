@@ -12,6 +12,8 @@ pub(crate) mod pid_reuse;
 pub(crate) mod reaped_elsewhere;
 
 #[cfg(target_os = "macos")]
+use crate::test_own_process;
+#[cfg(target_os = "macos")]
 #[path = "../tests/common/kevent_eintr.rs"]
 mod kevent_eintr;
 

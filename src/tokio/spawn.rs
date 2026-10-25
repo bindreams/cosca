@@ -46,9 +46,10 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
 
     let kill_on_drop = cmd.kill_on_drop_flag();
 
-    // Elevation runs before fds are taken (mirrors sync). POSIX rewrites into a DERIVED command and
-    // recurses (the derived command has elevation disabled → no re-entry); Windows builds the async
-    // Child here (tokio::child::Child::from_parts is pub(super)).
+    // Elevation runs before fds are taken (mirrors sync). POSIX rewrites into a derived command and
+    // returns from the block below. On Windows an already-elevated caller falls through here with the
+    // report the child carries.
+    #[cfg(windows)]
     let mut elevation_report: Option<crate::elevation::ElevationReport> = None;
     if cmd.elevation_request().enabled {
         #[cfg(windows)]
@@ -78,32 +79,26 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
         }
         #[cfg(unix)]
         {
-            let rw = crate::elevation::posix::rewrite(cmd).not_started()?;
+            let mut rw = crate::elevation::posix::rewrite(cmd).not_started()?;
             let backend_path = rw.backend_path;
-            if let Some(mut derived) = rw.derived {
-                // Same shared honest remap as the sync path (parity-by-construction): remap a
-                // derived-backend exec failure to BackendUnavailable ONLY when the backend path is
-                // the culprit. An already-elevated derived (sanitized original) has no backend path.
-                // From here the child is the backend: its elevated program may outlive what happens to it.
-                let wrapper = rw.report.as_ref().is_some_and(|r| r.via.program_outlives_child());
-                let spawned = (|| {
-                    let child = spawn_uncommitted(&mut derived);
-                    let mut child = match backend_path.as_deref() {
-                        Some(bp) => child.map_err(|f| f.map(|e| crate::elevation::remap_derived_spawn_error(e, bp)))?,
-                        None => child?,
-                    };
-                    // Set the report BEFORE handling the deferred password: a cleanup kill() in the
-                    // write-failure path must see the elevated state so an EPERM maps to the typed
-                    // Unkillable rather than leaking a raw Io.
-                    child.set_elevation(rw.report);
-                    let written = rw.password_write.map_or(Ok(()), |pw| pw.write_after_spawn());
-                    finish_elevated(child, written)
-                })();
-                return spawned.map_err(|failure| if wrapper { failure.behind_wrapper() } else { failure });
-            }
-            // Defensive: the current POSIX `rewrite` always returns `Some(derived)` (it sanitizes
-            // even the already-elevated case), so this no-derived fall-through is not reached today.
-            elevation_report = rw.report;
+            // Remap an exec failure to BackendUnavailable only when the backend path is the culprit
+            // (see the sync path).
+            // From here the child is the backend: its elevated program may outlive what happens to it.
+            let wrapper = rw.report.as_ref().is_some_and(|r| r.via.program_outlives_child());
+            let spawned = (|| {
+                let child = spawn_uncommitted(&mut rw.derived);
+                let mut child = match backend_path.as_deref() {
+                    Some(bp) => child.map_err(|f| f.map(|e| crate::elevation::remap_derived_spawn_error(e, bp)))?,
+                    None => child?,
+                };
+                // Set the report BEFORE handling the deferred password: a cleanup kill() in the
+                // write-failure path must see the elevated state so an EPERM maps to the typed
+                // Unkillable rather than leaking a raw Io.
+                child.set_elevation(rw.report);
+                let written = rw.password_write.map_or(Ok(()), |pw| pw.write_after_spawn());
+                finish_elevated(child, written)
+            })();
+            return spawned.map_err(|failure| if wrapper { failure.behind_wrapper() } else { failure });
         }
     }
 
@@ -248,13 +243,22 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
         "Deferred pipe ownership must only produce fd >= 3 parent ends"
     );
 
+    // macOS: std makes these pipes itself, ahead of its error pipe (`unique_report::Channel`).
+    #[cfg(target_os = "macos")]
+    let mut std_pipes = 0;
     for slot in std_slots {
         let stdio: StdStdio = match preassigned.remove(&slot) {
             // The merge pre-pass already assigned this slot (our owned pipe's child end,
             // or a dup of it for a merging slot).
             Some(pre) => pre,
             None => match fds.get(&slot) {
-                Some(ResolvedStdio::Pipe(_)) => StdStdio::piped(),
+                Some(ResolvedStdio::Pipe(_)) => {
+                    #[cfg(target_os = "macos")]
+                    {
+                        std_pipes += 1;
+                    }
+                    StdStdio::piped()
+                }
                 _ => StdStdio::from(
                     child_ends
                         .remove(&slot)
@@ -294,45 +298,55 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
     // actually owns the marker write end's supervisor-side copy).
     #[cfg(target_os = "macos")]
     let (mut prepared, child, unique) = {
-        let _guard = crate::child::spawn::spawn_lock();
-        let mut prepared = crate::containment::prepare(
-            tcmd.as_std_mut(),
-            &cmd.contain_request(),
-            cmd.flags_request(),
-            &reserved,
-            cmd.fd_marker_suppressed(),
-            cmd.env_ops(),
-        )
-        .not_started()?;
-        let report = report.open(&_guard).not_started()?;
+        let (mut prepared, spawned, first) = {
+            let _guard = crate::child::spawn::spawn_lock();
+            let prepared = crate::containment::prepare(
+                tcmd.as_std_mut(),
+                &cmd.contain_request(),
+                cmd.flags_request(),
+                &reserved,
+                cmd.fd_marker_suppressed(),
+                cmd.env_ops(),
+            )
+            .not_started()?;
+            let report = report.open(&_guard).not_started()?.std_makes_pipes(std_pipes);
 
-        // fd >= 3 merge SOURCES: their dup'd ends join the resolved fd >= 3 collection below
-        // (the pre-pass removed those slots from `fds`, so the numbers cannot collide).
-        for (fd, end) in merge_fd_ends {
-            let prev = child_ends.insert(fd, end);
-            debug_assert!(prev.is_none(), "pre-pass slots were removed from the resolved set");
-        }
+            // fd >= 3 merge SOURCES: their dup'd ends join the resolved fd >= 3 collection below
+            // (the pre-pass removed those slots from `fds`, so the numbers cannot collide).
+            for (fd, end) in merge_fd_ends {
+                let prev = child_ends.insert(fd, end);
+                debug_assert!(prev.is_none(), "pre-pass slots were removed from the resolved set");
+            }
 
-        use crate::child::spawn::fd_map;
-        let mappings: Vec<fd_map::FdMapping> = child_ends
-            .into_iter()
-            .map(|(fd, owned)| fd_map::FdMapping {
-                parent_fd: owned,
-                child_fd: fd.raw(),
-            })
-            .collect();
-        fd_map::install(tcmd.as_std_mut(), mappings).not_started()?;
+            use crate::child::spawn::fd_map;
+            let mappings: Vec<fd_map::FdMapping> = child_ends
+                .into_iter()
+                .map(|(fd, owned)| fd_map::FdMapping {
+                    parent_fd: owned,
+                    child_fd: fd.raw(),
+                })
+                .collect();
+            fd_map::install(tcmd.as_std_mut(), mappings).not_started()?;
 
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "spawn_lock is held by `_guard` at the top of this function"
-        )]
-        let (spawned, unique) = report.run(|| {
-            let spawned = tcmd.spawn();
-            #[cfg(test)]
-            let spawned = crate::child::spawn::fault::fail_tokio_spawn_after_fork(spawned);
-            spawned.map_err(Error::Io)
-        });
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "spawn_lock is held by `_guard` at the top of this function"
+            )]
+            let (spawned, first) = report.run(
+                || {
+                    let spawned = tcmd.spawn();
+                    #[cfg(test)]
+                    let spawned = crate::child::spawn::fault::fail_tokio_spawn_after_fork(spawned);
+                    spawned.map_err(Error::Io)
+                },
+                ::tokio::process::Child::id,
+            );
+            drop(tcmd);
+            (prepared, spawned, first)
+        };
+        // Outside the lock, as the sync spawn does. It still blocks this thread: principle 2's spawn
+        // exception.
+        let unique = first.finish();
         let c = match spawned {
             Ok(c) => c,
             Err(e) => {
@@ -344,10 +358,11 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                 // after std returned `Ok`: a std `Err` has already collected the child.
                 use crate::child::spawn::unique_report::Report;
                 use crate::containment::AbandonedChild;
-                // A child that had not reported may yet `exec`, with nothing holding it.
                 let front = cmd.elevation_front();
                 let abandoned = match unique {
                     Report::ChildRefused(_) | Report::Missing => AbandonedChild::MaybeUnreaped,
+                    // Not waited for: tokio's error took the pid. If tokio failed after std's `Ok`, the
+                    // child may yet report and `exec`, with nothing holding it.
                     Report::Unwritten => AbandonedChild::MaybeUnreachable,
                     _ => prepared.abandon_before_verdict(front.is_some()),
                 };
@@ -361,7 +376,6 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                 });
             }
         };
-        drop(tcmd);
         (prepared, c, unique)
     };
     #[cfg(not(target_os = "macos"))]
@@ -516,7 +530,14 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
     #[cfg(target_os = "macos")]
     let (identity, not_adopted) = match crate::child::spawn::unique_report::adopted_id(unique, pid) {
         Ok(unique) => (Some(unique), None),
-        Err(not_adopted) => (None, Some(not_adopted)),
+        // A late id still names the child, for its teardown.
+        Err(not_adopted) => (
+            match not_adopted.why {
+                crate::child::spawn::unique_report::Unadoptable::Late(unique) => Some(unique),
+                _ => None,
+            },
+            Some(not_adopted),
+        ),
     };
     // Built first so failure arms tear the child down through its handle, not its pid. On macOS a
     // child with no adopted id is id-less, and the spawn fails below.
@@ -545,13 +566,13 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                 proc.forget_because("died before exec");
                 SpawnFailure::NotStarted(error)
             }
-            // It may yet report and `exec`: forgotten, as a corpse would be, but left running.
-            Unadoptable::Unreported => {
-                proc.forget_because(
-                    "had not reported its unique id when its spawn returned; it is not adopted, and may be running",
-                );
+            // An elevation front is sent nothing: forgotten and left unreaped, as for an unverified one.
+            Unadoptable::Late(_) if front.is_some() => {
+                proc.leave_late_front(pid);
                 SpawnFailure::started(left.note(error, front, Some(pid)), ChildFate::Running { id: None })
             }
+            // Its id came late: torn down through it, as the sync spawn does.
+            Unadoptable::Late(unique) => SpawnFailure::started(error, proc.reap_unreported(pid, unique, prepared)),
             // An elevation front is sent nothing and handed to no reaper: left unreaped, as the sync
             // spawn leaves it, and the error says so.
             Unadoptable::Unverified if front.is_some() => {
@@ -706,8 +727,15 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                     pid,
                     identity.expect("a spawn that reached the attach adopted its unique id"),
                     Some(id),
+                    "is handed to tokio's orphan reaper, which reaps it once it exits",
                 );
-                proc.forget_because("is a child whose attach failed, killed through its verified unique id");
+                // A child its kill did not end is released to tokio's orphan reaper, not forgotten, which
+                // would leave a zombie nothing collects.
+                if matches!(fate, ChildFate::Running { .. }) {
+                    proc.release();
+                } else {
+                    proc.forget_because("is a child whose attach failed, killed through its verified unique id");
+                }
                 fate
             };
             // The child is spawned (on Windows possibly CREATE_SUSPENDED) - tear it down so a failed
@@ -734,6 +762,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
     };
 
     let mut child = Child::from_parts(proc, id, kill_on_drop, attachment, pipes, owned_std);
+    #[cfg(windows)]
     child.set_elevation(elevation_report);
     child.set_front(cmd.elevation_front());
     Ok(child)

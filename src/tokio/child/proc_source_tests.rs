@@ -98,3 +98,64 @@ async fn an_echild_after_a_look_that_showed_the_exit_is_a_foreign_reap() {
     assert_eq!(waited, super::Waited::Foreign, "{cause:?}");
     drop(child);
 }
+
+/// The async reap's twin of `shared_tests::macos::a_wait_on_a_child_whose_tracer_dies_during_its_exit_is_woken_by_the_tracers_exit`:
+/// XNU sends a traced child's `NOTE_EXIT` and `SIGCHLD` to its tracer alone, and a tracer that dies
+/// while the child is exiting leaves it to launchd. The reap watches the tracer too, and its
+/// `NOTE_EXIT` makes it look again, which finds launchd holding the child: `Unpinned`. This
+/// process's own pid stands in for the child (`waitid` answers `ECHILD`, and its id resolves), and a
+/// blocker for the tracer; the parent read is forced: the stand-in while it runs, launchd once it
+/// has exited. The stand-in is this test's child, so its `SIGCHLD` wakes the reap too, and the
+/// assertion is on the tracer's `NOTE_EXIT` among the reap's events.
+///
+/// Mutant: the async reap does not watch the tracer.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+async fn an_async_reap_of_a_child_whose_tracer_dies_during_its_exit_is_woken_by_the_tracers_exit() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use crate::identity::{ppid_fault, uniq_info, ReadPurpose, UniqRead, LAUNCHD};
+    use crate::signal::RootState;
+    use crate::wait::backend::test_hooks;
+    use crate::wait::exit_only::Peek;
+
+    let pid = std::process::id();
+    let UniqRead::Found(info) = uniq_info(pid, ReadPurpose::Adopt) else {
+        panic!("this process's unique id must read");
+    };
+    let mut cmd = crate::test_child::held_std_blocker(std::process::Stdio::null());
+    let mut tracer = crate::test_spawn::spawn(&mut cmd).expect("spawn the stand-in tracer");
+    let tracer_stdin = tracer.stdin.take().expect("piped stdin");
+    let tracer_pid = tracer.id();
+    let exited = Rc::new(Cell::new(false));
+    let _parent = ppid_fault::force_ppid_with({
+        let exited = Rc::clone(&exited);
+        move || Ok(if exited.get() { LAUNCHD } else { tracer_pid })
+    });
+    let _end = crate::tokio::child::fault::set_reap_parked(move || {
+        drop(tracer_stdin);
+        crate::test_child::wait_until_zombie(tracer_pid);
+        exited.set(true);
+    });
+    let _ = test_hooks::take_events();
+
+    let looked = super::look_on_events(pid, info.unique_id, |looked| match looked {
+        Ok(Peek::Running) => Ok(None::<()>),
+        other => Err(super::Halt::State(RootState::of_peek(other))),
+    })
+    .await;
+
+    let events = test_hooks::take_events();
+    assert!(
+        events
+            .iter()
+            .any(|&(filter, fflags)| filter == libc::EVFILT_PROC && fflags & libc::NOTE_EXIT != 0),
+        "the tracer's exit must wake the reap: {events:?}"
+    );
+    assert!(
+        matches!(looked, Err(super::Halt::State(RootState::Unpinned))),
+        "launchd holds the child once its tracer is gone"
+    );
+    tracer.wait().expect("reap the stand-in tracer");
+}
