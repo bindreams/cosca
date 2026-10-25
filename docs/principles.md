@@ -134,9 +134,10 @@ Where a group ID must be used (process-group or fd-marker containment), keep the
 zombie until the group kill is done.
 
 The by-number reaps outside this rule are all tokio's `waitpid(pid)`. One is its reap of an async
-root cosca could not kill and leaves to it: a dropped root (principle 3), or, on macOS, a child
-whose async spawn failed, which cosca releases to tokio's orphan queue rather than forget it and
-leave a zombie nothing collects (`ProcSource::reap_now_noting` and `ProcSource::reap_unreported` in
+root cosca did not kill and leaves to it: a dropped root whose drop killed nothing, disarmed
+(`detach()`, `kill_on_drop(false)`) or armed with a failed kill (principle 3), or, on macOS, a
+child whose async spawn failed and whose kill did not end it, which cosca releases to tokio's
+orphan queue rather than forget it and leave a zombie nothing collects (`ProcSource::reap_now_noting` and `ProcSource::reap_unreported` in
 [`proc_source.rs`](../src/tokio/child/proc_source.rs), and the attach-failure arm of
 `spawn_uncommitted` in [`tokio/spawn.rs`](../src/tokio/spawn.rs)). The other is every collect of an
 async root, which is tokio's `try_wait` right after cosca's own look through the root's handle
