@@ -197,6 +197,50 @@ async fn async_fd3_only_routing_does_not_load_a_binary_planted_in_the_process_cw
     assert_eq!(s.trim(), "notfound", "helper report: {s}");
 }
 
+#[cfg(all(windows, feature = "tokio"))]
+/// Async: All three parent std handles null (a GUI or service): the child gets null handles, no
+/// `STARTF_USESTDHANDLES`, and no unlisted handle; where the caller configures a child end (a pipe,
+/// the null device, fd 3), the child gets it. Mutants: `GetFileType(NULL)` (fails with 6);
+/// `STARTF_USESTDHANDLES` always set; `bInheritHandles` TRUE without a HANDLE_LIST; the flag set
+/// only when this process holds a live std handle (`pipe_out`, `null_io`, `pipe_fd3`).
+#[skuld::test]
+fn async_raw_spawn_with_null_parent_std_handles_gives_the_child_null() {
+    common::null_std::assert_every_route("tokio", "all");
+}
+
+#[cfg(all(windows, feature = "tokio"))]
+/// Async: Only one parent std handle null: the child gets that one null and the others inherited,
+/// and a live slot merged from the null one is null too. Mutants: `STARTF_USESTDHANDLES` set only
+/// when some child end is non-null (`merge_live`); `GetFileType(NULL)`.
+#[skuld::test]
+fn async_raw_spawn_with_one_null_parent_std_handle_gives_the_child_that_one_null() {
+    for nulled in ["stdin", "stdout", "stderr"] {
+        common::null_std::assert_every_route("tokio", nulled);
+    }
+}
+
+#[cfg(all(windows, feature = "tokio"))]
+/// Async: Two parent std handles null, one live: `STARTF_USESTDHANDLES` is still set, the null slots
+/// are gaps, and a live slot merged from a null one is null too, with a NUL device as the whole
+/// HANDLE_LIST. Mutants: the flag set only when some child end is non-null (`merge_live` and
+/// `exe_merge` with `stdin+stdout` nulled); the flag keyed on one parent slot only (each set).
+#[skuld::test]
+fn async_raw_spawn_with_two_null_parent_std_handles_gives_the_child_two_null() {
+    for nulled in ["stdin+stdout", "stdin+stderr", "stdout+stderr"] {
+        common::null_std::assert_every_route("tokio", nulled);
+    }
+}
+
+#[cfg(all(windows, feature = "tokio"))]
+/// Async: a parent whose std handles are `INVALID_HANDLE_VALUE` is treated as one whose are null,
+/// as `std` treats it.
+#[skuld::test]
+fn async_raw_spawn_with_invalid_parent_std_handles_gives_the_child_null() {
+    for set in ["invalid:all", "invalid:stdout"] {
+        common::null_std::assert_every_route("tokio", set);
+    }
+}
+
 #[path = "../src/test_harness.rs"]
 mod test_harness;
 
