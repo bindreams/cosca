@@ -3,8 +3,6 @@
 //! given entry by entry, and `env-set-probe`, which records what `SetEnvironmentVariableW` does to
 //! such a block.
 
-use std::io::Write;
-
 use windows::core::PCWSTR;
 use windows::Win32::System::Environment::{FreeEnvironmentStringsW, GetEnvironmentStringsW};
 
@@ -15,7 +13,7 @@ pub fn dump() {
     // SAFETY: no preconditions; the block is freed below.
     let block = unsafe { GetEnvironmentStringsW() };
     assert!(!block.is_null(), "GetEnvironmentStringsW failed");
-    let mut out = std::io::stdout().lock();
+    let mut lines = String::new();
     let mut entry = block.0;
     loop {
         // SAFETY: the block is a run of NUL-terminated entries closed by an empty one, so every
@@ -27,11 +25,12 @@ pub fn dump() {
         // SAFETY: `len` units starting at `entry` were just read.
         let units = unsafe { std::slice::from_raw_parts(entry, len) };
         let hex: String = units.iter().map(|u| format!("{u:04x}")).collect();
-        writeln!(out, "{hex}").unwrap();
+        lines.push_str(&hex);
+        lines.push('\n');
         // SAFETY: skips this entry and its NUL, landing on the next entry or the terminator.
         entry = unsafe { entry.add(len + 1) };
     }
-    out.flush().unwrap();
+    crate::quiet_io::put_stdout(lines.as_bytes(), "dump-env-block: write stdout");
     // SAFETY: `block` came from `GetEnvironmentStringsW` and is freed once.
     unsafe { FreeEnvironmentStringsW(PCWSTR(block.0)) }.expect("FreeEnvironmentStringsW");
 }
@@ -66,7 +65,7 @@ pub fn spawn(backend: &str, ops: &[String]) {
         "dump-env-block failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    std::io::stdout().write_all(&out.stdout).unwrap();
+    crate::quiet_io::put_stdout(&out.stdout, "spawn-dump-env-block: write stdout");
 }
 
 /// Run `spawn-dump-env-block <dump_args>` in a child whose environment block is exactly `entries`,
@@ -149,9 +148,9 @@ pub fn try_block(entries: &[String]) {
     match create_with_block(entries, "exit 0", None) {
         Ok(code) => {
             assert_eq!(code, 0, "the probe child failed");
-            println!("ok");
+            outln!("ok");
         }
-        Err(e) => println!("err={}", e.code().0 & 0xFFFF),
+        Err(e) => outln!("err={}", e.code().0 & 0xFFFF),
     }
 }
 

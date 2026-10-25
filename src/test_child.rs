@@ -9,6 +9,8 @@ pub(crate) mod namespaces;
 pub(crate) mod pid_reuse;
 
 #[cfg(target_os = "macos")]
+use crate::test_own_process;
+#[cfg(target_os = "macos")]
 #[path = "../tests/common/kevent_eintr.rs"]
 mod kevent_eintr;
 
