@@ -82,7 +82,7 @@ fn an_already_elevated_raw_executable_is_refused() {
 fn an_elevated_search_programs_relative_cwd_is_passed_through() {
     let mut c = argv0_tool(Some("sub"));
     let rw = rewrite_with_host(&mut c, &sudo_host()).expect("rewrite");
-    assert_eq!(rw.derived.as_ref().expect("derived").cwd(), Some(Path::new("sub")));
+    assert_eq!(rw.derived.cwd(), Some(Path::new("sub")));
 }
 
 /// pkexec has no `--`, so a program starting with `-` would be read as an option: it is refused
@@ -126,7 +126,7 @@ fn pkexec_is_launched_through_the_pinned_descriptor() {
     let pin = host.pkexec_pin.clone().expect("pinned");
     let mut c = under(argv0("/opt/tool"), Backend::Pkexec);
     let rw = rewrite_with_host(&mut c, &host).expect("rewrite");
-    let derived = rw.derived.as_ref().expect("derived");
+    let derived = &rw.derived;
     assert!(
         derived_argv(&rw).contains(&"--keep-cwd".into()),
         "{:?}",
@@ -218,5 +218,5 @@ fn an_elevated_argv0_program_is_passed_as_written() {
         [OsString::from("--"), "tool".into(), "-x".into()],
         "{a:?}"
     );
-    assert_eq!(rw.derived.as_ref().expect("derived").cwd(), Some(Path::new("/work")));
+    assert_eq!(rw.derived.cwd(), Some(Path::new("/work")));
 }

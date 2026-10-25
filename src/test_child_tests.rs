@@ -48,7 +48,14 @@ fn windows_more_exits_zero_when_its_stdin_closes() {
 #[skuld::test]
 fn death_watch_accept_or_die_retries_a_kevent_wait_interrupted_by_a_signal() {
     use super::kevent_eintr;
+    use crate::test_own_process::{own_process, test_path};
 
+    let Some(done) = own_process(
+        test_path!(death_watch_accept_or_die_retries_a_kevent_wait_interrupted_by_a_signal),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind rendezvous listener");
     let mut cmd = std::process::Command::new("/bin/cat");
     cmd.stdin(std::process::Stdio::piped())
@@ -60,7 +67,7 @@ fn death_watch_accept_or_die_retries_a_kevent_wait_interrupted_by_a_signal() {
         .expect("resolve the freshly spawned target")
         .id();
     let stdin = child.stdin.take();
-    let interrupter = kevent_eintr::interrupt_once_blocked(move || drop(stdin));
+    let interrupter = kevent_eintr::interrupt_once_blocked(&done, move || drop(stdin));
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::test_child::accept_or_die(&listener, target)
     }));

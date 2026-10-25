@@ -15,6 +15,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
+use super::test_own_process::Completion;
+
 /// Handler runs since process start. The interrupter reads it before each signal and waits for it
 /// to change, so only its own deliveries are waited on.
 static HANDLED: AtomicUsize = AtomicUsize::new(0);
@@ -111,7 +113,9 @@ impl Drop for Interrupter {
 /// Call on the thread that is about to block in `kevent`. `release` runs on the helper thread once
 /// the wait has counted an `EINTR` retry, and also when the wait returned first or the helper
 /// panicked.
-pub fn interrupt_once_blocked(release: impl FnOnce() + Send + 'static) -> Interrupter {
+///
+/// The `SIGUSR2` action is process-wide, so it takes the [`Completion`] of `own_process`.
+pub fn interrupt_once_blocked(_own_process: &Completion, release: impl FnOnce() + Send + 'static) -> Interrupter {
     // SAFETY: a zeroed `sigaction` is a valid starting value; the handler only touches an atomic.
     let (previous, rc) = unsafe {
         let mut action: libc::sigaction = std::mem::zeroed();
