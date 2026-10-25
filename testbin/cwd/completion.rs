@@ -2,8 +2,12 @@
 //! a drive's own directory (`=X:`) and a verbatim UNC cwd.
 
 use std::ffi::OsStr;
-use std::io::Write as _;
 use std::path::Path;
+
+#[path = "../../tests/common/subst.rs"]
+mod subst;
+
+use subst::Subst;
 
 use crate::probe::{canonical, cosca_output, outcome, set_cwd, spawned, std_output, verbatim_of, Render};
 
@@ -20,57 +24,6 @@ fn gfpn(path: &OsStr) -> String {
         return format!("err={}", std::io::Error::last_os_error().raw_os_error().unwrap_or(-1));
     }
     String::from_utf16_lossy(&buf[..n as usize])
-}
-
-/// A drive letter mapped to a directory with `DefineDosDeviceW` for as long as it lives.
-struct Subst {
-    drive: String,
-    target: Vec<u16>,
-}
-
-impl Subst {
-    fn new(drive: &str, target: &Path) -> Result<Self, String> {
-        use std::os::windows::ffi::OsStrExt;
-        use windows::core::PCWSTR;
-        use windows::Win32::Storage::FileSystem::{DefineDosDeviceW, DEFINE_DOS_DEVICE_FLAGS};
-        let name: Vec<u16> = OsStr::new(drive).encode_wide().chain([0]).collect();
-        let target: Vec<u16> = target.as_os_str().encode_wide().chain([0]).collect();
-        // SAFETY: both strings are NUL-terminated and outlive the call.
-        unsafe {
-            DefineDosDeviceW(
-                DEFINE_DOS_DEVICE_FLAGS(0),
-                PCWSTR(name.as_ptr()),
-                PCWSTR(target.as_ptr()),
-            )
-        }
-        .map_err(|e| format!("{e}"))?;
-        Ok(Self {
-            drive: drive.to_owned(),
-            target,
-        })
-    }
-}
-
-impl Drop for Subst {
-    fn drop(&mut self) {
-        use std::os::windows::ffi::OsStrExt;
-        use windows::core::PCWSTR;
-        use windows::Win32::Storage::FileSystem::{DefineDosDeviceW, DDD_EXACT_MATCH_ON_REMOVE, DDD_REMOVE_DEFINITION};
-        let name: Vec<u16> = OsStr::new(&self.drive).encode_wide().chain([0]).collect();
-        // SAFETY: both strings are NUL-terminated and outlive the call.
-        let removed = unsafe {
-            DefineDosDeviceW(
-                DDD_REMOVE_DEFINITION | DDD_EXACT_MATCH_ON_REMOVE,
-                PCWSTR(name.as_ptr()),
-                PCWSTR(self.target.as_ptr()),
-            )
-        };
-        // Never a panic: this runs while unwinding too, and a second panic would abort before the
-        // report reaches the test. So the diagnostic is best-effort, whatever stderr does.
-        if let Err(e) = removed {
-            let _ = writeln!(std::io::stderr(), "could not remove the {} mapping: {e}", self.drive);
-        }
-    }
 }
 
 /// Sets `=<drive>` in this process's environment, or removes it for `None`.

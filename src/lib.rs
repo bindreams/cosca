@@ -8,6 +8,7 @@
 //! # Platform requirements
 //!
 //! **Linux 5.6 or newer**, with `pidfd_open` and `openat2` not blocked by a seccomp profile.
+//!
 //! Each requirement comes from a different syscall:
 //!
 //! - `pidfd_open` needs 5.3, and cosca requires a pidfd for every child it spawns. A refusal is
@@ -27,6 +28,9 @@
 //! - The elevation shim (`cosca::init`) runs on Linux. Other platforms have no shim; `init` reports
 //!   that and does not start the program. It needs `/proc` mounted: it reaches cosca's socket through
 //!   `/proc/thread-self/fd`. Without it the shim refuses, saying so, and the program is not started.
+//!
+//! 32-bit Linux is unsupported: cosca does not compile there. Before Linux 6.14 a 32-bit kernel gives
+//! only the low 32 bits of a pidfs inode number, so a process's identity would not be unique.
 //!
 //! [`Containment::CgroupV2`] additionally needs `cgroup.kill` (Linux 5.14); without it `CgroupV2`
 //! is not used and containment falls back as documented on [`Containment`]. It also assumes kernel
@@ -61,6 +65,9 @@
 // result on purpose with `_ = expr;`. Crate-level, not in `[lints]`, which would extend it to the
 // tests and test binaries.
 #![warn(clippy::let_underscore_must_use)]
+
+#[cfg(all(target_os = "linux", target_pointer_width = "32"))]
+compile_error!("cosca does not support 32-bit Linux (see \"Platform requirements\" in the crate docs)");
 
 pub mod containment;
 pub mod elevation;
