@@ -405,7 +405,7 @@ pub(crate) mod fault {
 
     /// Make the NEXT `hard_kill` on THIS thread report an incomplete walk, as an unreadable
     /// process table or a refused kill would. Take semantics.
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     pub(crate) fn force_incomplete_once() {
         FORCE_INCOMPLETE.with(|f| f.set(true));
     }
