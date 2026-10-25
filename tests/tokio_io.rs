@@ -701,9 +701,8 @@ async fn assert_async_opted_out_tree_survives(kill_on_drop: bool, opt_out: impl 
     common::cgroup::drain_and_remove_leaf(&leaf);
 }
 
-// The zombie check for a dropped root is `a_dropped_root_left_to_tokio_is_reaped` in the library's
-// tests: tokio's orphan queue reaps it, best-effort, once a runtime next sees `SIGCHLD`, and cosca
-// offers no edge to sequence one after (`docs/principles.md`, principle 3).
+// The zombie check for a dropped root is `tokio_armed_drop_reaps_before_returning` in the library's
+// tests: the armed drop reaps the root before it returns (`docs/principles.md`, principle 3).
 
 // Arbitrary fd (n>=3) — Unix only, wired via fd_map (async mirror of spawn_io.rs) =====
 

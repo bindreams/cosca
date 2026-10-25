@@ -867,6 +867,65 @@ impl ProcSource {
         }
     }
 
+    /// Block until the child's exit is visible to this process, or until `until`, and say which
+    /// came first. For a message only: [`wait_and_reap_caused`](ProcSource::wait_and_reap_caused),
+    /// which the caller runs next either way, is the wait that decides. Anything this cannot read
+    /// (a failed poll or peek, a child it cannot show to be ours, a foreign reap) answers `true`,
+    /// and is left to that wait.
+    ///
+    /// - **Linux:** a poll on the pidfd until `until`. A readable pidfd whose zombie a foreign
+    ///   tracer still holds shows no exit to a peek, and no further event comes when the tracer
+    ///   lets go, so the peek is repeated with a capped backoff until `until`.
+    /// - **macOS:** the verified-id kqueue wait, with `until` as its deadline.
+    #[cfg(unix)]
+    pub(crate) fn exit_visible_by(&self, pid: u32, until: std::time::Instant) -> bool {
+        crate::bounded::assert_may_block("exit_visible_by");
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsFd as _;
+
+            use crate::wait::exit_only::{self, Peek, Target};
+
+            let _ = pid;
+            let ProcSource::Tokio { pidfd, .. } = self else {
+                return true;
+            };
+            match crate::wait::poll_pidfd_exit(pidfd.as_fd(), Some(Some(until))) {
+                Ok(true) | Err(_) => {}
+                Ok(false) => return false,
+            }
+            let target = Target::PidFd(pidfd.as_fd());
+            let mut interval = std::time::Duration::from_millis(1);
+            loop {
+                match exit_only::peek(&target) {
+                    Ok(Peek::Running) => {}
+                    Ok(Peek::Exit(_) | Peek::Foreign(_)) | Err(_) => return true,
+                }
+                let now = crate::wait::now();
+                if now >= until {
+                    return false;
+                }
+                std::thread::sleep(interval.min(until - now));
+                interval = (interval * 2).min(std::time::Duration::from_millis(50));
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use crate::wait::backend::{await_reapable, Waited as Awaited};
+            let ProcSource::Tokio {
+                identity: Some(identity),
+                ..
+            } = self
+            else {
+                return true;
+            };
+            !matches!(
+                await_reapable(pid, Some(*identity), Some(until)),
+                Ok(Awaited::DeadlinePassed)
+            )
+        }
+    }
+
     /// Give up a child something else reaped, or that cannot be shown to be ours
     /// ([`Waited::Foreign`]): tokio's `Child` is forgotten, never dropped, because its drop
     /// would reap by pid, and the pid may name another process by now. The untaken

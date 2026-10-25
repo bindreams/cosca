@@ -43,3 +43,21 @@ fn a_refused_kill_with_no_other_answer_asserts_on_linux() {
     let id = Some(ProcessId::current());
     assert_eq!(after_refused_kill(None, None, id), ChildFate::Running { id });
 }
+
+/// `exit_visible_by` waits, so it refuses to run inside an async drop's bounded section, before it
+/// looks at the backend.
+///
+/// Mutant: drop the assert from `exit_visible_by`.
+#[cfg(unix)]
+#[skuld::test]
+#[should_panic(expected = "would block inside an async Drop")]
+fn exit_visible_by_refuses_inside_a_section() {
+    let proc = super::ProcSource::Foreign {
+        stdin: None,
+        stdout: None,
+        stderr: None,
+        fate: super::Forgotten::Unproven,
+    };
+    let _section = crate::bounded::Section::enter();
+    proc.exit_visible_by(1, std::time::Instant::now());
+}

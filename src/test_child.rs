@@ -1241,7 +1241,6 @@ pub(crate) fn assert_killed(who: &str, status: std::process::ExitStatus) {
 /// option placed there is silently eaten and `--exact` degrades to substring matching.
 /// `--test-threads=1` keeps a future filter that matches more than one test from running them
 /// concurrently inside a process the caller is about to signal.
-#[cfg(any(windows, target_os = "macos"))]
 pub(crate) fn fixture_argv(test: &str) -> [&str; 5] {
     let [threads, exact, test, nocapture] = crate::test_reexec::fixture_args(test);
     ["cosca_unit_tests", threads, exact, test, nocapture]

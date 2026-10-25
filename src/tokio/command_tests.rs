@@ -71,8 +71,8 @@ fn held_blocker(kill_on_drop: bool) -> (super::Child, std::io::PipeWriter) {
     (cmd.spawn().expect("spawn"), writer)
 }
 
-/// A run-to-completion helper that fails after its spawn signals the child, as its drop would, and
-/// says so: tokio collects the exit later.
+/// A run-to-completion helper that fails after its spawn kills and reaps the child, as its drop
+/// would, and says so.
 ///
 /// Mutant: the failure reports `Unknown` without tearing the child down.
 #[cfg(unix)]
@@ -80,7 +80,7 @@ fn held_blocker(kill_on_drop: bool) -> (super::Child, std::io::PipeWriter) {
 async fn a_failure_after_the_spawn_signals_the_child_and_says_so() {
     let (mut child, _writer) = held_blocker(true);
     let error = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), &mut child);
-    assert_eq!(error.fate(), Some(crate::error::ChildFate::Killed), "{error}");
+    assert_eq!(error.fate(), Some(crate::error::ChildFate::Reaped), "{error}");
 }
 
 /// A child `kill_on_drop(false)` keeps is left alone, and the failure names it.
@@ -116,7 +116,7 @@ async fn a_failure_after_the_spawn_notes_the_elevated_program_only_behind_a_back
         Backend::Sudo,
     )));
     let wrapped = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), &mut wrapped);
-    assert_eq!(wrapped.fate(), Some(crate::error::ChildFate::Killed), "{wrapped}");
+    assert_eq!(wrapped.fate(), Some(crate::error::ChildFate::Reaped), "{wrapped}");
     assert!(wrapped.to_string().contains(note), "{wrapped}");
 }
 
@@ -143,7 +143,8 @@ fn assert_failed_after_the_spawn(error: crate::error::Error, fate: crate::error:
 }
 
 /// Async twin of the sync `output_status_and_read_fail_as_may_have_started_after_the_spawn`. The
-/// fate is `Killed`: the drop signals the child and tokio collects it.
+/// fate is the drop's: `Reaped` on Unix, where it kills and reaps the child; `Killed` on Windows,
+/// where it terminates the child and closes its handle.
 ///
 /// Mutants: a helper returns the cause bare; drops the fate; drops the wrapper flag.
 #[skuld::test]
@@ -151,6 +152,11 @@ async fn output_status_and_read_fail_as_may_have_started_after_the_spawn() {
     use crate::child::spawn::failure::seams;
     use crate::error::ChildFate;
     crate::tokio::test_runtime::assert_current_thread();
+    let torn_down = if cfg!(unix) {
+        ChildFate::Reaped
+    } else {
+        ChildFate::Killed
+    };
     for wrapper in [false, true] {
         let _wrapper = wrapper.then(seams::pretend_wrapper);
         let mut cmd = super::Command::new();
@@ -158,19 +164,19 @@ async fn output_status_and_read_fail_as_may_have_started_after_the_spawn() {
         let _pump = seams::fail_the_next_pump();
         assert_failed_after_the_spawn(
             cmd.output().await.expect_err("a failed pump fails `output`"),
-            ChildFate::Killed,
+            torn_down,
             wrapper,
         );
         let _pump = seams::fail_the_next_pump();
         assert_failed_after_the_spawn(
             cmd.read().await.expect_err("a failed pump fails `read`"),
-            ChildFate::Killed,
+            torn_down,
             wrapper,
         );
         let _wait = seams::fail_the_next_wait();
         assert_failed_after_the_spawn(
             cmd.status().await.expect_err("a failed wait fails `status`"),
-            ChildFate::Killed,
+            torn_down,
             wrapper,
         );
     }

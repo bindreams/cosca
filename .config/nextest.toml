@@ -200,13 +200,6 @@ filter = 'test(cgroup_wait_drained_tracks_two_real_members_through_exit)'
 slow-timeout = { period = "15s", terminate-after = 1, grace-period = "1s" }
 
 [[profile.default.overrides]]
-# `a_dropped_root_left_to_tokio_is_reaped` yields until tokio reaps the root the drop killed. It
-# checks the hand-off first and fails at once if that is missing; this bound only turns a root
-# that is never reaped into a failure instead of a hang.
-filter = 'binary(cosca) & test(=tokio::child::child_drop_tests::a_dropped_root_left_to_tokio_is_reaped)'
-slow-timeout = { period = "10s", terminate-after = 1, grace-period = "1s" }
-
-[[profile.default.overrides]]
 # A backstop, not the proof: `async_wait_never_drains_past_the_low_water_clamp` asserts in-process
 # that the armed kqueue is already readable (which catches an `EV_DISABLE` arm) and then awaits
 # its `declined_hook` in a `select!`. What nothing in-process catches is the kqueue being readable

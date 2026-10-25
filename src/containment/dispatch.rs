@@ -804,9 +804,9 @@ impl Attached {
     }
 
     /// Give up the containment resource without waiting for anything: what an async
-    /// `Child::drop` does with it, where a plain drop could block. A cgroup leaf goes through
-    /// `CgroupLeaf::release_without_waiting`; every other mechanism drops in place, which is
-    /// bounded.
+    /// `Child::drop` that kills nothing does with it, where a plain drop could block. A cgroup
+    /// leaf goes through `CgroupLeaf::release_without_waiting`; every other mechanism drops in
+    /// place, which is bounded.
     #[cfg(feature = "tokio")]
     pub(crate) fn release_without_waiting(self) {
         match self {

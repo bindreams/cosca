@@ -184,3 +184,92 @@ impl Tracer {
         assert!(status.success(), "{status:?}");
     }
 }
+
+/// What [`await_blocked_or_finished`] found.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Holder {
+    /// Asleep in a `waitid` that waits.
+    Blocked,
+    Finished,
+}
+
+/// Re-reads `/proc/self/task/<tid>/syscall` until the thread sleeps in a `waitid` without
+/// `WNOHANG`, or is gone. Both are conditions the thread reaches by itself, so the only exit is
+/// the condition; the pauses between reads are a backoff, not a bound. Any other shape of the
+/// file than `running` or `<nr> ...` panics with its text.
+pub(crate) fn await_blocked_or_finished(tid: libc::pid_t) -> Holder {
+    let path = format!("/proc/self/task/{tid}/syscall");
+    let mut pause = std::time::Duration::from_micros(50);
+    loop {
+        match std::fs::read_to_string(&path) {
+            Ok(text) if text.trim() == "running" => {}
+            // `<nr> <a0> <a1> <a2> <a3> <a4> <a5> <sp> <pc>`, or `-1 <sp> <pc>`.
+            Ok(text) => {
+                let mut fields = text.split_whitespace();
+                let nr: libc::c_long = fields
+                    .next()
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or_else(|| panic!("{path}: no syscall number in {text:?}"));
+                if nr == libc::SYS_waitid {
+                    // `waitid(idtype, id, infop, options, rusage)`: `options` is argument 4.
+                    let options = fields
+                        .nth(3)
+                        .and_then(|o| u64::from_str_radix(o.trim_start_matches("0x"), 16).ok())
+                        .unwrap_or_else(|| panic!("{path}: no waitid options in {text:?}"));
+                    if options & libc::WNOHANG as u64 == 0 {
+                        return Holder::Blocked;
+                    }
+                }
+            }
+            Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => return Holder::Finished,
+            Err(e) => panic!("read {path}: {e}"),
+        }
+        std::thread::sleep(pause);
+        pause = (pause * 2).min(std::time::Duration::from_millis(5));
+    }
+}
+
+/// Marks the [`tokio_tracee`] re-exec; the value is the driver's pid.
+#[cfg(feature = "tokio")]
+const TRACEE_MARKER: &str = "COSCA_TEST_FOREIGN_TRACER_TOKIO_TRACEE";
+
+/// A tracee for a `cosca::tokio::Command`, which has no `pre_exec`: it calls
+/// [`allow_any_tracer_now`], reports `allowed`, and reads stdin to EOF. A no-op unless it is the
+/// re-exec [`spawn_tokio_tracee`] started.
+#[cfg(feature = "tokio")]
+#[skuld::test]
+fn tokio_tracee() {
+    let driver = std::env::var(TRACEE_MARKER).ok();
+    if driver != Some(std::os::unix::process::parent_id().to_string()) {
+        return;
+    }
+    allow_any_tracer_now().expect("allow any tracer");
+    say("allowed");
+    std::io::copy(&mut std::io::stdin(), &mut std::io::sink()).expect("read stdin to EOF");
+}
+
+/// Spawns [`tokio_tracee`] as a kill-on-drop `cosca::tokio::Child` and returns it, with its stdin,
+/// once [`spawn_helper`] may seize it.
+#[cfg(feature = "tokio")]
+pub(crate) async fn spawn_tokio_tracee() -> (crate::tokio::Child, crate::tokio::ChildStdin) {
+    use ::tokio::io::AsyncBufReadExt as _;
+
+    let mut cmd = crate::tokio::Command::new();
+    cmd.executable(std::env::current_exe().expect("current_exe"))
+        .args(crate::test_child::fixture_argv(fixture_path!(tokio_tracee)));
+    crate::test_reexec::scrub_env(|var| _ = cmd.env_remove(var));
+    cmd.env(TRACEE_MARKER, std::process::id().to_string());
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+    cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
+    let mut child = cmd.spawn().expect("spawn the tracee");
+    let stdin = child.stdin().expect("piped stdin");
+    let mut lines = ::tokio::io::BufReader::new(child.stdout().expect("piped stdout")).lines();
+    loop {
+        let line = lines.next_line().await.expect("read the tracee's stdout");
+        match line {
+            Some(line) if line.ends_with("@@allowed@@") => return (child, stdin),
+            Some(_) => {}
+            None => panic!("the tracee ended without reporting \"allowed\""),
+        }
+    }
+}

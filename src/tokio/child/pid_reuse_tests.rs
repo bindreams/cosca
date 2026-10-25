@@ -397,6 +397,58 @@ in_fresh_pid_ns!(
     drop_after_foreign_reap_and_reuse_reaps_nothing_body
 );
 
+/// An armed drop whose kill was delivered, and whose root is then reaped behind its back and its pid
+/// taken by a stranger, before the drop's wait: the wait goes through the child's pidfd, finds it
+/// gone, and neither signals nor reaps the stranger. The stranger is already a zombie of the test's
+/// `SIGUSR1` when the wait runs, so a by-pid reap would take its record.
+///
+/// Mutants: the drop's root kill by pid (the send log shows no pidfd kill); the wait reaps by pid
+/// (the test's own `waitid` on the stranger answers `ECHILD`).
+fn armed_drop_after_foreign_reap_and_reuse_signals_nothing_body() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    runtime().block_on(async {
+        let (child, writer) = spawn_blocker();
+        let pid = child.id().pid();
+        let token = StartToken::from_raw(child.id().start_token_raw());
+        // The reuser, and the token alias that keeps it the child's look-alike.
+        type Reused = Option<(std::process::Child, Box<dyn std::any::Any>)>;
+        let reused: Rc<RefCell<Reused>> = Rc::default();
+        let hand = Rc::clone(&reused);
+        let _between = crate::child::spawn::fault::set_between_kill_and_wait(move || {
+            let reuser = reap_behind_and_reuse(pid);
+            let alias = alias_token(reuser.id(), token);
+            assert_eq!(sigusr1_and_peek(&reuser), Some(libc::SIGUSR1));
+            *hand.borrow_mut() = Some((reuser, Box::new(alias)));
+        });
+        let log = Capture::start();
+
+        drop(child);
+
+        assert_eq!(
+            log.entries(),
+            vec![(pid, Sig::Kill, Via::Pidfd)],
+            "one kill, through the pidfd"
+        );
+        let (reuser, alias) = reused.borrow_mut().take().expect("the drop reached its wait");
+        let record = rustix::process::waitid(
+            WaitId::Pid(Pid::from_raw(pid as i32).expect("pid")),
+            WaitIdOptions::EXITED,
+        )
+        .expect("the reuser's exit record must still be unconsumed")
+        .expect("an exit record");
+        assert_eq!(record.terminating_signal(), Some(libc::SIGUSR1));
+        drop((reuser, alias, writer));
+    });
+}
+in_fresh_pid_ns!(
+    namespaces_tokio_armed_drop_after_foreign_reap_and_reuse_signals_nothing,
+    fixture_tokio_armed_drop_reuse_driver,
+    fixture_tokio_armed_drop_reuse_init,
+    armed_drop_after_foreign_reap_and_reuse_signals_nothing_body
+);
+
 /// The same with `kill_on_drop(false)`, which the derived elevated command reaches: the drop sends
 /// no kill, so nothing but the held pidfd can tell it the child is gone, and the start token (equal
 /// here, as for a reuse in the same tick) cannot.
