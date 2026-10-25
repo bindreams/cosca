@@ -135,6 +135,9 @@ enum Reap {
     OwnUnknown,
     ForeignFree,
     ForeignReused,
+    /// [`ForeignFree`](Reap::ForeignFree), seen by a `try_wait` first: it answers `ECHILD`, and a
+    /// tokio handle forgets its backend as reaped elsewhere.
+    ForeignSeen,
 }
 
 impl Reap {
@@ -148,6 +151,7 @@ impl Reap {
         Reap::OwnUnknown,
         Reap::ForeignFree,
         Reap::ForeignReused,
+        Reap::ForeignSeen,
     ];
 
     fn own(self) -> bool {
@@ -183,7 +187,7 @@ impl Reap {
             Reap::None | Reap::Unanswered => None,
             #[cfg(target_os = "macos")]
             Reap::Unpinned => None,
-            Reap::OwnFree | Reap::ForeignFree => Some(Resolved::Gone),
+            Reap::OwnFree | Reap::ForeignFree | Reap::ForeignSeen => Some(Resolved::Gone),
             Reap::OwnUnknown => Some(Resolved::Unknown),
             Reap::OwnReused | Reap::ForeignReused => Some(Resolved::Found(ProcessId::from_parts_for_test(
                 root.pid(),
@@ -493,6 +497,15 @@ impl Recorders {
     }
 }
 
+/// Checks a `try_wait` after a foreign reap answered `ECHILD`.
+#[track_caller]
+fn assert_echild<T: std::fmt::Debug>(waited: Result<T, crate::error::Error>) {
+    assert!(
+        matches!(&waited, Err(crate::error::Error::Io(e)) if e.raw_os_error() == Some(libc::ECHILD)),
+        "a try_wait after a foreign reap: {waited:?}"
+    );
+}
+
 /// Reads the `cat`'s pid, the line it prints once it ignores `SIGTERM`.
 fn cat_pid(line: &str) -> u32 {
     line.trim().parse().expect("the cat's pid")
@@ -519,6 +532,9 @@ fn run_sync(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
             child.wait().expect("this handle reaps the root");
         } else {
             crate::test_child::reaped_elsewhere::reap_behind(root);
+            if reap == Reap::ForeignSeen {
+                assert_echild(child.try_wait());
+            }
         }
     }
     let mut forced = reap.force(child.id());
@@ -578,6 +594,9 @@ async fn run_tokio(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
             child.wait().await.expect("this handle reaps the root");
         } else {
             crate::test_child::reaped_elsewhere::reap_behind(root);
+            if reap == Reap::ForeignSeen {
+                assert_echild(child.try_wait());
+            }
         }
     }
     let mut forced = reap.force(child.id());
@@ -673,7 +692,8 @@ fn check_matrix(mechanisms: &[Mechanism]) {
 ///
 /// Mutants: `root_number` answers `Trusted` for any of a foreign reap, an own reap whose pid is
 /// reused, (macOS, an fd marker) an own reap whose pid names nothing, or (macOS) a root that is
-/// `Unpinned` or `Unknown`; the holders sweep skipped after a reap or for an untrusted root; an
+/// `Unpinned` or `Unknown`; a tokio backend forgotten as reaped elsewhere counted as its own reap;
+/// the holders sweep skipped after a reap or for an untrusted root; an
 /// `Unpinned` root signalled as a holder; `treewalk::hard_kill` or `treewalk::terminate` walks
 /// without `anchor_present`.
 #[skuld::test]
