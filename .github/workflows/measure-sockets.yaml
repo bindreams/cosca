@@ -1,0 +1,73 @@
+name: measure-sockets
+# MEASURE (throwaway)
+on:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Every job here runs unprivileged unless it says otherwise, so the tests that only mean
+  # something as root opt out (principles 9 and 10).
+  COSCA_TEST_ROOT: "0"
+  # One place for values several jobs share. `.config/nextest.toml`, windows-probes.yaml and the devvm provision scripts carry the same nextest version; Renovate moves them together (.github/renovate.json).
+  NEXTEST_VERSION: "0.9.148"
+  # The root lanes' binaries, narrowed by `SKULD_LABELS=root`. Name only skuld binaries: a libtest
+  # binary ignores `SKULD_LABELS` and would run whole. `process_root`'s test is the `UID_SWITCH` group.
+  PRIVILEGE_TESTS: "binary(cosca) | binary(process_root)"
+  # Real uid switching needs real root that can `setuid`; only those lanes turn it on.
+  COSCA_TEST_UID_SWITCH: "0"
+  # System-affecting groups are off workflow-wide; each lane opts back in on its own steps.
+  COSCA_TEST_NAMESPACES: "0"
+  # The tracer tests run in the two tracer steps of the test job below.
+  COSCA_TEST_TRACER: "0"
+  # The setuid group runs only where a step provisions a setuid-root helper and opts back in.
+  COSCA_TEST_SETUID: "0"
+  # The cgroup tests need a delegated cgroup; only the cgroup lane below runs them.
+  COSCA_TEST_CGROUP: "0"
+  # The elevation tests gain real administrator or root privileges; only the elevation steps of the test job run them.
+  COSCA_TEST_ELEVATION: "0"
+  # Windows groups. The drive-mapping test and the canaries run in steps of the test job; the executing probes run
+  # only in windows-probes.yaml.
+  COSCA_TEST_DRIVE_MAPPING: "0"
+  COSCA_TEST_PATH_PROBES: "0"
+  COSCA_TEST_SHELL_EXECUTE: "0"
+  COSCA_TEST_SHELL_PROBES: "0"
+  COSCA_TEST_ELEVATION_ROUTES: "0"
+
+jobs:
+  measure:
+    name: Measure (windows/${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            other: aarch64-pc-windows-msvc
+          - arch: arm64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            other: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          targets: ${{ matrix.target }},${{ matrix.other }}
+          components: clippy
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
+        with:
+          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
+
+      - name: Build
+        run: cargo build --locked --target ${{ matrix.target }}
+
+      - name: Build tests
+        run: cargo nextest run --locked --no-run --target ${{ matrix.target }} --profile ci
+
+      - name: Measure sockets
+        run: ./.github/scripts/measure-sockets-run.ps1 ${{ matrix.target }}
