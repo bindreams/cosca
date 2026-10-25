@@ -1518,7 +1518,7 @@ impl Child {
             front_left,
         };
         #[cfg(unix)]
-        if self.kill_on_drop && signalled.signals.settle != Settle::Nothing {
+        if false && self.kill_on_drop && signalled.signals.settle != Settle::Nothing {
             drop(bounded);
             return Teardown::Waits(Box::new(signalled));
         }
