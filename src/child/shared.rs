@@ -332,6 +332,12 @@ impl SharedChild {
         self.identity
     }
 
+    /// Whether this thread holds the lock. Tests only.
+    #[cfg(all(unix, test))]
+    pub(crate) fn is_held_by_current_thread(&self) -> bool {
+        *self.owner.lock().unwrap_or_else(PoisonError::into_inner) == Some(std::thread::current().id())
+    }
+
     /// The child's process id.
     pub(crate) fn id(&self) -> u32 {
         self.id.pid()

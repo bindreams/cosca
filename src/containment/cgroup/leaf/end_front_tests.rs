@@ -1,5 +1,5 @@
 //! `end_front`'s arms for a front nothing places or reaps: its reach unreadable, no handle on it, a
-//! wait that fails. Unprivileged: the front is a forked process that pauses, and no cgroup is used.
+//! reap by another reaper. Unprivileged: the front is a forked process that pauses, and no cgroup is used.
 
 use std::os::fd::OwnedFd;
 
@@ -66,23 +66,52 @@ fn a_front_that_sent_no_handle_is_unaccounted_for() {
     assert_eq!(warns.len(), 1, "{warns:?}");
 }
 
-/// A front the leaf's kill reached whose final wait fails (something else reaped it between the
-/// check and the wait) is unaccounted for, and the warning names the cause. Mutant: "a failed final
-/// wait answers `Reaped`".
+/// Kills the forked `pid` and reaps it, as another reaper in the process would.
+fn reap_behind(pid: u32) {
+    // SAFETY: `pid` is this process's own unreaped child.
+    unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    crate::containment::cgroup::test_support::reap(pid);
+}
+
+/// The records about the front `pid` since `mark`, on this thread.
+fn records_about(mark: usize, pid: u32) -> Vec<(log::Level, String)> {
+    crate::log_capture::records_since_on_current_thread(mark, &format!("front (pid {pid})"))
+}
+
+/// A front the leaf's kill reached, reaped by another reaper before the final wait, was killed: only
+/// its status is lost, so it gets a `debug` record and no warn. Mutant: "`ECHILD` from the final wait
+/// stays on the warn arm, `Unaccounted`".
 #[skuld::test]
-fn a_front_reaped_by_someone_else_before_the_final_wait_is_unaccounted_for() {
+fn a_front_reaped_by_someone_else_before_the_final_wait_is_reaped_at_debug() {
     crate::log_capture::install();
     let (front, pidfd) = running_front();
     let received = received(&front, pidfd);
     let pid = front.defuse();
-    let _reaped_elsewhere = crate::containment::cgroup::fault::set_before_exit_wait(move || {
-        // SAFETY: `pid` is this process's own unreaped child.
-        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
-        crate::containment::cgroup::test_support::reap(pid);
-    });
+    let _reaped_elsewhere = crate::containment::cgroup::fault::set_before_exit_wait(move || reap_behind(pid));
     let mark = crate::log_capture::mark();
     let fate = end_front(&received, |_, _| Ok(true));
-    assert_eq!(fate, Abandoned::Front(FrontFate::Unaccounted));
-    let warns = crate::log_capture::records_since_on_current_thread(mark, "could not be reaped");
-    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert_eq!(fate, Abandoned::Front(FrontFate::Reaped));
+    let records = records_about(mark, pid);
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].0, log::Level::Debug, "{records:?}");
+    assert!(records[0].1.contains("reaped elsewhere"), "{records:?}");
+}
+
+/// A front reaped by another reaper between the look that saw it unreaped and the probe for its
+/// exit has ended, as one the look saw reaped: a `debug` record and no warn. Mutant: "`ECHILD` from
+/// the probe stays on the warn arm, `Unaccounted`".
+#[skuld::test]
+fn a_front_reaped_by_someone_else_before_the_probe_has_ended_at_debug() {
+    crate::log_capture::install();
+    let (front, pidfd) = running_front();
+    let received = received(&front, pidfd);
+    let pid = front.defuse();
+    let _reaped_elsewhere = crate::containment::cgroup::fault::set_before_front_probe(move || reap_behind(pid));
+    let mark = crate::log_capture::mark();
+    let fate = end_front(&received, |_, _| panic!("a front that has ended is not placed"));
+    assert_eq!(fate, Abandoned::Ended);
+    let records = records_about(mark, pid);
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].0, log::Level::Debug, "{records:?}");
+    assert!(records[0].1.contains("reaped elsewhere"), "{records:?}");
 }

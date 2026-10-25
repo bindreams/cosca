@@ -1194,11 +1194,13 @@ impl Child {
         use crate::child::drop_report::DropReport;
         use crate::error::ChildFate;
 
+        // A live elevation front gets no signal of its own: outside a cgroup it is left running,
+        // unreaped, and named. The gate comes first, so the look at the root is right before the
+        // kill it decides.
+        let gate = self.kill_gate();
         let view = crate::containment::DropView::read("Child::drop", self.id, || self.proc.state(), &self.tree_killed);
         let mut report = DropReport::new("Child::drop", &view);
-        // A live elevation front gets no signal of its own: outside a cgroup it is left running,
-        // unreaped, and named.
-        let cgroup_only = match self.kill_gate() {
+        let cgroup_only = match gate {
             crate::elevation::front::Gate::Closed(unkillable) => {
                 // The leaf stays armed: its teardown kills what it holds, a front among it if it is
                 // in it. Run now, not at field drop, so the look at the front comes after it.

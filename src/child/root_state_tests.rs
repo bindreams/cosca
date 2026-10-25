@@ -44,7 +44,7 @@ mod linux {
     use crate::signal::Sig;
     use crate::test_child::pid_reuse::{in_fresh_pid_ns, reap_behind_and_reuse, sigusr1_and_wait};
     use crate::test_groups::namespaces;
-    use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peek_once};
+    use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peek_once, force_peeks};
     use crate::ContainMode;
 
     fn session_blocker() -> (crate::Child, std::io::PipeWriter) {
@@ -178,8 +178,12 @@ mod linux {
         child.set_front(Some(crate::elevation::front::Front::Sudo));
         let sends = Capture::start();
         let mark = crate::log_capture::mark();
-        // The read sees the failed peek; the gate's own look at the front is real and sees it run.
-        let _failed = force_peek_once(Err(std::io::Error::other("forced peek failure")));
+        // The gate's two looks at the front see it run; the read after them sees the failed peek.
+        let _looks = force_peeks([
+            Ok(crate::wait::exit_only::Peek::Running),
+            Ok(crate::wait::exit_only::Peek::Running),
+            Err(std::io::Error::other("forced peek failure")),
+        ]);
 
         drop(child);
         drop(writer);
@@ -315,8 +319,12 @@ mod macos {
         child.set_front(Some(crate::elevation::front::Front::Sudo));
         let sends = Capture::start();
         let mark = crate::log_capture::mark();
-        // The read, then the gate's look at the front, which sees it run.
-        let _looks = force_peeks([Ok(Peek::Foreign(Foreign::Orphaned)), Ok(Peek::Running)]);
+        // The gate's two looks at the front, which see it run, then the read.
+        let _looks = force_peeks([
+            Ok(Peek::Running),
+            Ok(Peek::Running),
+            Ok(Peek::Foreign(Foreign::Orphaned)),
+        ]);
 
         drop(child);
 
