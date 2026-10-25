@@ -37,6 +37,9 @@ pub mod subst;
 pub mod windows_env;
 
 #[cfg(windows)]
+pub mod null_std;
+
+#[cfg(windows)]
 pub mod windows_reparse;
 
 mod locked;

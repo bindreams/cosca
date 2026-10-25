@@ -1,8 +1,8 @@
 //! Test-only helper spawned by the crate's integration tests. std-only, with
 //! exceptions that use the `cosca` crate: the `report-nested-kill-tree` mode, to exercise
-//! the real nested-member `kill_tree` path, `spawn-dump-env-block`, to spawn through each
-//! Windows backend, the frozen-spawn modes of `frozen.rs`, and the measurement modes
-//! (`handles-probe`, `std-loads`, `std-loads-dup`). Behavior is selected by `COSCA_TESTBIN_MODE`
+//! the real nested-member `kill_tree` path, `spawn-dump-env-block` and `spawn-with-null-std`, to
+//! spawn through each Windows backend, the frozen-spawn modes of `frozen.rs`, and the measurement
+//! modes (`handles-probe`, `std-loads`, `std-loads-dup`). Behavior is selected by `COSCA_TESTBIN_MODE`
 //! when set, else by argv[1]; the variable keeps the mode when a test shifts argv (`dump-argv`).
 
 #[cfg(target_os = "macos")]
@@ -77,6 +77,10 @@ mod measure;
 #[cfg(windows)]
 #[path = "std_loads.rs"]
 mod std_loads;
+
+#[cfg(windows)]
+#[path = "null_std.rs"]
+mod null_std;
 
 /// `tests/elevation_pkexec_version.rs`'s fake pkexec: this binary, copied to `real/pkexec-impl`.
 /// Appends one line to `../pkexec.log` (next to `real/`): `argv[0]`, the file running (so the
@@ -1261,6 +1265,10 @@ fn main() {
             report_sock.write_all(line.as_bytes()).unwrap();
             report_sock.flush().unwrap();
         }
+        #[cfg(windows)]
+        "spawn-with-null-std" => null_std::spawn(&args[2], &args[3], &args[4]),
+        #[cfg(windows)]
+        "report-std-handles" => null_std::report(&args[2], &args[3]),
         #[cfg(windows)]
         "dump-env-block" => env_block::dump(),
         #[cfg(windows)]

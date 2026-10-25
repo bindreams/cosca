@@ -137,7 +137,7 @@ pub(crate) struct ResolveInput<'a> {
     /// on `PATH` (a dev toolchain install, an `%LOCALAPPDATA%\...\WindowsApps` shim) shadow e.g.
     /// `System32\find.exe`, a way to load the wrong binary that `CreateProcessW`'s own order
     /// (`System32` ahead of `PATH`) prevents. The caller supplies this closure (rather than this
-    /// module calling `GetSystemDirectoryW`/`GetWindowsDirectoryW` itself) so the rule stays
+    /// module calling `GetSystemDirectoryW`/`GetSystemWindowsDirectoryW` itself) so the rule stays
     /// testable from a POSIX host, exactly like `windows` below.
     pub system_dirs: &'a dyn Fn() -> Result<Vec<PathBuf>, Error>,
     /// The `PATH` the CHILD will see, after `env()`/`env_clear()`.
