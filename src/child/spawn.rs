@@ -17,7 +17,7 @@ use crate::stdio::{Direction, Fd, ResolvedStdio};
 #[cfg(unix)]
 pub(crate) type ChildEnd = std::os::unix::io::OwnedFd;
 #[cfg(windows)]
-pub(crate) type ChildEnd = std::os::windows::io::OwnedHandle;
+pub(crate) use windows_child_end::ChildEnd;
 
 pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, SpawnFailure> {
     let child = spawn_uncommitted(cmd)?;
@@ -391,7 +391,8 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         }
         v
     };
-    let (mut child_ends, parent_ends) = resolve_stdio(&fds, &all_slots, PipeOwnership::Owned).not_started()?;
+    let (mut child_ends, parent_ends) =
+        resolve_stdio(&fds, &all_slots, PipeOwnership::Owned, ParentStd::read()).not_started()?;
 
     // Hand 0/1/2 child ends to std (consumes them; std closes its copies on spawn).
     for slot in std_slots {
@@ -1315,6 +1316,7 @@ pub(crate) fn resolve_stdio(
     fds: &BTreeMap<Fd, ResolvedStdio>,
     slots: &[Fd],
     pipe: PipeOwnership,
+    parent_std: ParentStd,
 ) -> Result<ResolvedStdioEnds, Error> {
     // Reject merge-targeting-a-merge: the two-pass algorithm resolves only one level of
     // indirection. Transitive chaining (a fixpoint loop) is an unsupported design limit — redirect
@@ -1346,7 +1348,7 @@ pub(crate) fn resolve_stdio(
             Some(ResolvedStdio::Pipe(_)) if matches!(pipe, PipeOwnership::Deferred) && slot.raw() < 3 => continue,
             None if slot.raw() >= 3 => continue,
             _ => {
-                let (child_end, parent) = resolve_non_merge(slot, resolved)?;
+                let (child_end, parent) = resolve_non_merge(slot, resolved, parent_std)?;
                 if let Some(p) = parent {
                     parent_ends.insert(slot, p);
                 }
@@ -1385,9 +1387,13 @@ pub(crate) fn resolve_stdio(
 }
 
 // Resolve a non-merge slot to its child-side end + the parent's pipe end (if any).
-pub(crate) fn resolve_non_merge(slot: Fd, r: Option<&ResolvedStdio>) -> Result<(ChildEnd, Option<ParentEnd>), Error> {
+pub(crate) fn resolve_non_merge(
+    slot: Fd,
+    r: Option<&ResolvedStdio>,
+    parent_std: ParentStd,
+) -> Result<(ChildEnd, Option<ParentEnd>), Error> {
     match r {
-        None | Some(ResolvedStdio::Inherit) => Ok((inherit_end(slot)?, None)),
+        None | Some(ResolvedStdio::Inherit) => Ok((inherit_end(slot, parent_std)?, None)),
         Some(ResolvedStdio::Null) => Ok((null_end()?, None)),
         Some(ResolvedStdio::File(f)) => Ok((file_end(f)?, None)),
         Some(ResolvedStdio::Pipe(dir)) => make_pipe(*dir),
@@ -1413,8 +1419,7 @@ pub(crate) fn dup(end: &ChildEnd) -> Result<ChildEnd, Error> {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::io::AsHandle;
-        end.as_handle().try_clone_to_owned().map_err(Error::Io)
+        end.try_clone().map_err(Error::Io)
     }
 }
 
@@ -1433,7 +1438,11 @@ fn file_end(f: &std::fs::File) -> Result<ChildEnd, Error> {
     Ok(ChildEnd::from(dup))
 }
 
-fn inherit_end(slot: Fd) -> Result<ChildEnd, Error> {
+#[cfg_attr(
+    not(windows),
+    allow(unused_variables, reason = "only the Windows arm reads the parent's std handles")
+)]
+fn inherit_end(slot: Fd, parent_std: ParentStd) -> Result<ChildEnd, Error> {
     // Duplicate the parent's matching std stream. Bind the stream to a variable
     // before borrowing its descriptor (a temporary would be dropped while borrowed).
     // For n>=3, Stdio::inherit() has no defined parent stream to dup — a design limit
@@ -1470,18 +1479,22 @@ fn inherit_end(slot: Fd) -> Result<ChildEnd, Error> {
     #[cfg(windows)]
     {
         use std::os::windows::io::AsHandle;
+        // A null std handle (a GUI process's or a service's) is an absent end; so is -1, which `std`
+        // reports as null. `parent_std` decides null-ness, so this end and the caller's
+        // `STARTF_USESTDHANDLES` decision come from one read.
+        let live = parent_std.is_live(slot);
         let owned = match slot {
             Fd::STDIN => {
                 let s = std::io::stdin();
-                s.as_handle().try_clone_to_owned()
+                dup_std_handle(s.as_handle(), live)
             }
             Fd::STDOUT => {
                 let s = std::io::stdout();
-                s.as_handle().try_clone_to_owned()
+                dup_std_handle(s.as_handle(), live)
             }
             Fd::STDERR => {
                 let s = std::io::stderr();
-                s.as_handle().try_clone_to_owned()
+                dup_std_handle(s.as_handle(), live)
             }
             // fd >= 3 has no defined parent std stream to dup (mirrors the Unix arm). Retained design
             // limit: the raw backend routes fd >= 3 inherit through here and rejects it too.
@@ -1496,6 +1509,63 @@ fn inherit_end(slot: Fd) -> Result<ChildEnd, Error> {
             }
         };
         owned.map_err(Error::Io)
+    }
+}
+
+/// A dup of this process's std handle `h`; absent when `live` is false (it was null when
+/// [`ParentStd`] was read).
+#[cfg(windows)]
+fn dup_std_handle(h: std::os::windows::io::BorrowedHandle<'_>, live: bool) -> std::io::Result<ChildEnd> {
+    use std::os::windows::io::AsRawHandle;
+    if !live || h.as_raw_handle().is_null() {
+        return Ok(ChildEnd::absent());
+    }
+    h.try_clone_to_owned().map(ChildEnd::from)
+}
+
+/// Which of this process's stdin, stdout and stderr handles were non-null when a spawn began.
+///
+/// Read once per spawn: the inherited ends and the Windows `STARTF_USESTDHANDLES` decision both
+/// come from it, so a concurrent `SetStdHandle` cannot make them disagree. Empty off Windows.
+#[derive(Clone, Copy)]
+pub(crate) struct ParentStd {
+    #[cfg(windows)]
+    live: [bool; 3],
+}
+
+impl ParentStd {
+    pub(crate) fn read() -> ParentStd {
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::{AsHandle, AsRawHandle};
+            ParentStd {
+                live: [
+                    !std::io::stdin().as_handle().as_raw_handle().is_null(),
+                    !std::io::stdout().as_handle().as_raw_handle().is_null(),
+                    !std::io::stderr().as_handle().as_raw_handle().is_null(),
+                ],
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            ParentStd {}
+        }
+    }
+
+    /// Whether the handle for std `slot` (0, 1 or 2) was non-null; `false` for any other slot,
+    /// which has no parent stream (`inherit_end` refuses it).
+    #[cfg(windows)]
+    pub(crate) fn is_live(self, slot: Fd) -> bool {
+        usize::try_from(slot.raw())
+            .ok()
+            .and_then(|i| self.live.get(i).copied())
+            .unwrap_or(false)
+    }
+
+    /// Whether any of the three was non-null.
+    #[cfg(windows)]
+    pub(crate) fn any_live(self) -> bool {
+        self.live.iter().any(|&l| l)
     }
 }
 
@@ -2907,6 +2977,11 @@ pub(crate) mod pidfd_handshake;
 #[cfg(windows)]
 #[path = "spawn/windows_raw.rs"]
 pub(crate) mod windows_raw;
+
+// Windows: a child-side handle that may be absent.
+#[cfg(windows)]
+#[path = "spawn/windows_child_end.rs"]
+mod windows_child_end;
 
 #[cfg(test)]
 #[path = "spawn_tests.rs"]
