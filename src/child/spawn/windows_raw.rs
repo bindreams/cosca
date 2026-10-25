@@ -28,9 +28,8 @@
 //! # What the list does not cover
 //!
 //! - The std route (a command with no `executable()` and no fd >= 3) is `std::process::Command`: it
-//!   passes `bInheritHandles`
-//!   TRUE with no list, so its child inherits every inheritable handle. That is why `spawn_lock`
-//!   is held on both routes. A raw child ignores the ends of another cosca spawn because it has a
+//!   passes `bInheritHandles` TRUE with no list, so its child inherits every inheritable handle.
+//!   That is why `spawn_lock` is held on both routes. A raw child ignores the ends of another cosca spawn because it has a
 //!   list; a std-route spawn has none, and would take a raw spawn's ends if it ran in the window
 //!   below.
 //! - The ends are inheritable between the mark and the close. Another spawner in this process
