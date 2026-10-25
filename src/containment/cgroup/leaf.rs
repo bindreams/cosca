@@ -902,10 +902,10 @@ enum ChildFate {
     /// Never sent its intent: if it exists, it exits at its first send, never entering the leaf,
     /// and nothing here can reap it.
     NeverReached,
-    /// Already exited and reaped by whoever failed the spawn (std reaps the child of a spawn it
-    /// failed).
+    /// Reaped before any kill of cosca's reached it: by whoever failed the spawn (std reaps the
+    /// child of a spawn it failed), or by another reaper in the process.
     Gone,
-    /// Killed through its handle, and reaped.
+    /// Killed through its handle or its group, and reaped, here or by another reaper.
     Killed,
     /// Could not be killed: no pidfd, or the signal was refused. Says which, unlogged: the caller
     /// warns.
