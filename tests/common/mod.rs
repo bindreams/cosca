@@ -83,6 +83,25 @@ pub fn testbin() -> &'static str {
     })
 }
 
+/// An anonymous pipe whose write end is inheritable, as a handle a library or the application
+/// might hold open for its own reasons.
+#[cfg(windows)]
+pub fn inheritable_pipe() -> (std::io::PipeReader, std::io::PipeWriter) {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::{SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT};
+    let (reader, writer) = std::io::pipe().expect("create a pipe");
+    // SAFETY: `writer` owns the handle for the call.
+    unsafe {
+        SetHandleInformation(
+            HANDLE(writer.as_raw_handle()),
+            HANDLE_FLAG_INHERIT.0,
+            HANDLE_FLAG_INHERIT,
+        )
+    }
+    .expect("mark the write end inheritable");
+    (reader, writer)
+}
+
 /// Blocks reading stdin; ends only by a kill or stdin EOF. `cat` on Unix; `more.com` on Windows
 /// (exits 0 on EOF, unlike `findstr x`). Spawn with piped stdin, null stdout.
 ///

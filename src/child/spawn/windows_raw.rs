@@ -2,7 +2,8 @@
 //!
 //! [`spawn_raw`] is the sync entry point: it loads an `executable()` file
 //! independently of argv[0] (the case std cannot express on Windows), wiring the
-//! child's std handles via `STARTUPINFOEXW` + a scoped `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`.
+//! child's std handles via `STARTUPINFOEXW`. The child inherits every inheritable handle of this
+//! process, as it does from `std`.
 //! The process-handle + FFI primitives live in [`proc`]; program/env/NUL
 //! resolution in [`resolve`]; the MSVCRT fd-table encoder (for fd >= 3)
 //! in [`crt_fds`].
@@ -41,16 +42,12 @@ use std::os::windows::io::{AsRawHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
 
 use windows::Win32::Foundation::{CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT};
-use windows::Win32::System::Threading::{
-    DeleteProcThreadAttributeList, InitializeProcThreadAttributeList, OpenProcess, UpdateProcThreadAttribute,
-    LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_TERMINATE, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, STARTF_USESTDHANDLES,
-    STARTUPINFOEXW,
-};
+use windows::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, STARTF_USESTDHANDLES, STARTUPINFOEXW};
 
 use crate::child::proc_handle::ProcHandle;
 use crate::child::spawn::{
-    attach_or_fault, null_end, reject_batch_path, resolve_identity, resolve_stdio, spawn_lock, ChildEnd, Classify,
-    ParentStd, PipeOwnership, SpawnFailure,
+    attach_or_fault, reject_batch_path, resolve_identity, resolve_stdio, spawn_lock, ChildEnd, Classify, ParentStd,
+    PipeOwnership, SpawnFailure,
 };
 use crate::child::Child;
 use crate::command::{Command, CommandInput, EnvOp, ExecutableSpec};
@@ -127,34 +124,30 @@ pub(crate) fn spawn_raw(
     // fd-table the child CRT reads back from `lpReserved2`.
     let table = build_fd_table(&child_ends).not_started()?;
 
-    // The table (`bytes`) and the attribute list stay alive until after CreateProcessW.
-    let mut startup = startup_info(&child_ends, &table, parent_std).not_started()?;
-    // The listed handles: `table.handles` (the non-null ends among 0/1/2 + fd >= 3, each a distinct
-    // fresh dup from `resolve_stdio`, its 0/1/2 entries being the hStd* handles) or, when that is
-    // empty, the filler. No duplicate reaches the list.
-    let all_handles: Vec<HANDLE> = startup.handles(&table).to_vec();
+    // The table (`bytes`) stays alive until after CreateProcessW.
+    let mut si = startup_info(&child_ends, &table, parent_std);
     // The complete word, composed above by the ONE function all three backends share — the two
     // structural bits this backend cannot spawn without included. Nothing ORs into it here.
     let flags = plan.creation_flags;
 
-    // UNDER THE LOCK: mark the listed child ends inheritable, spawn, then CLOSE the child ends and
-    // the attribute list BEFORE the guard releases on EVERY path. An early `?` here would drop the
-    // inner-scope guard before `child_ends`/`startup` (Rust drops inner locals first), leaving
-    // inheritable handles exposed to a concurrent spawn — so compute a Result and drop explicitly.
+    // UNDER THE LOCK: mark the child ends (`table.handles`: the non-null ends among 0/1/2 + fd >= 3,
+    // each a distinct fresh dup from `resolve_stdio`) inheritable, spawn, then CLOSE them BEFORE the
+    // guard releases on EVERY path. The child inherits every inheritable handle, so one left open
+    // here would reach a concurrent spawn. An early `?` here would drop the inner-scope guard before
+    // `child_ends` (Rust drops inner locals first), so compute a Result and drop explicitly.
     let spawned = {
         let _guard = spawn_lock();
         let r = spawn_step(
-            &all_handles,
+            &table.handles,
             &app_name,
             &mut cmdline,
-            &mut startup.si,
+            &mut si,
             &spawn_env.block,
             &cwd_w,
             flags,
             *cmd.flags_request(),
         );
         drop(child_ends); // close the child ends inside the lock, on success AND error
-        drop(startup); // DeleteProcThreadAttributeList and the filler before the guard releases
         r
     };
     let (proc, pid) = spawned.not_started()?;
@@ -224,8 +217,7 @@ pub(crate) fn ensure_fd_table_fits(fds: &BTreeMap<Fd, ResolvedStdio>) -> Result<
 
 /// Classify each resolved child end (0/1/2 + fd >= 3) for its CRT device flags, then encode the
 /// dense `0..=maxfd` MSVCRT fd-table the child CRT reads back from `lpReserved2`. The returned
-/// `handles` are the non-null ends (0/1/2 + fd >= 3, each a distinct fresh dup), so no duplicate
-/// reaches the HANDLE_LIST; [`Startup::handles`] says what is listed when there are none.
+/// `handles` are the non-null ends (0/1/2 + fd >= 3, each a distinct fresh dup).
 /// `pub(crate)`: shared with the async raw backend, which builds the identical table. Gate the
 /// caller on [`ensure_fd_table_fits`] first.
 pub(crate) fn build_fd_table(child_ends: &BTreeMap<Fd, ChildEnd>) -> Result<crt_fds::FdTable, Error> {
@@ -299,8 +291,8 @@ pub(crate) fn child_ops(ops: &[EnvOp], marker_env: bool) -> Cow<'_, [EnvOp]> {
     Cow::Owned(ops)
 }
 
-/// Mark each listed handle inheritable, then spawn. Returns a Result WITHOUT `?`-ing so the caller
-/// can close the child ends + attribute list before releasing the spawn lock on either arm.
+/// Mark each child end inheritable, then spawn. Returns a Result WITHOUT `?`-ing so the caller
+/// can close the child ends before releasing the spawn lock on either arm.
 /// `pub(crate)`: the async raw backend reuses the inheritable-mark + `create_process` window.
 // `CreateProcessW`'s own parameter list, plus the request its failure is classified against.
 // Bundling them would only rename the same values one call site deep.
@@ -318,11 +310,6 @@ pub(crate) fn spawn_step(
     flags: u32,
     request: crate::command::flags::FlagsRequest,
 ) -> Result<(OwnedHandle, u32), Error> {
-    debug_assert_eq!(
-        handles.is_empty(),
-        si.lpAttributeList.0.is_null(),
-        "a HANDLE_LIST is attached exactly when there are handles to list"
-    );
     for &h in handles {
         set_inherit(h)?;
     }
@@ -481,53 +468,20 @@ pub(crate) fn can_terminate(pid: u32) -> bool {
     }
 }
 
-/// The `STARTUPINFOEXW` for a raw spawn, with what it points at.
-///
-/// Keep it, and the `FdTable` it was built from, alive until after `CreateProcessW`; drop it under
-/// the spawn lock, with the child ends.
-pub(crate) struct Startup {
-    pub(crate) si: STARTUPINFOEXW,
-    // Declared before `filler`: the list points into it and is deleted first.
-    _attr: Option<AttributeList>,
-    filler: Option<Filler>,
-}
-
-/// An inheritable-for-this-spawn NUL handle that is the whole HANDLE_LIST when no child end is
-/// listed. It is in no std slot and no fd-table entry; the child inherits it and never uses it.
-struct Filler {
-    _nul: ChildEnd,
-    list: Box<[HANDLE; 1]>,
-}
-
-impl Startup {
-    /// The handles to mark inheritable and list: `table.handles`, or the filler when that is empty.
-    pub(crate) fn handles<'a>(&'a self, table: &'a crt_fds::FdTable) -> &'a [HANDLE] {
-        listed_handles(&self.filler, table)
-    }
-}
-
-fn listed_handles<'a>(filler: &'a Option<Filler>, table: &'a crt_fds::FdTable) -> &'a [HANDLE] {
-    match filler {
-        Some(f) => &*f.list,
-        None => &table.handles,
-    }
-}
-
 /// The `STARTUPINFOEXW` for `child_ends` (0/1/2 + fd >= 3) and their encoded `table`: the std
-/// handles, `table` as `lpReserved2` (so the child CRT recovers fd >= 3), and the HANDLE_LIST that
-/// scopes inheritance to [`Startup::handles`].
+/// handles, and `table` as `lpReserved2` (so the child CRT recovers fd >= 3). Keep `table` alive
+/// until after `CreateProcessW`. `lpAttributeList` is null: the child inherits every inheritable
+/// handle, and `CreateProcessW` is called with `bInheritHandles` TRUE.
 ///
 /// A null end reaches the child as null, but only through `STARTF_USESTDHANDLES`: without the flag
 /// the child gets this process's handle in that slot. So the flag is set whenever a child end or
-/// this process's handle for any std slot (as read in `parent_std`) is non-null, and only when all six are null does the child
-/// get the OS default, as with std. The flag requires `bInheritHandles`, which needs a HANDLE_LIST
-/// (never blanket inheritance), and a list cannot be empty: when no child end is listed, a NUL
-/// handle opened for this spawn is the list.
+/// this process's handle for any std slot (as read in `parent_std`) is non-null, and only when all
+/// six are null does the child get the OS default, as with std.
 pub(crate) fn startup_info(
     child_ends: &BTreeMap<Fd, ChildEnd>,
     table: &crt_fds::FdTable,
     parent_std: ParentStd,
-) -> Result<Startup, Error> {
+) -> STARTUPINFOEXW {
     // resolve_stdio with the 0/1/2 slot list always resolves all three (None -> inherit).
     let std_handle = |slot: Fd| HANDLE(child_ends[&slot].as_raw_handle());
     let mut si = STARTUPINFOEXW::default();
@@ -540,30 +494,10 @@ pub(crate) fn startup_info(
     }
     si.StartupInfo.cbReserved2 = table.bytes.len() as u16; // fits: the caller capped it
     si.StartupInfo.lpReserved2 = table.bytes.as_ptr() as *mut u8;
-    let flagged = si.StartupInfo.dwFlags.0 & STARTF_USESTDHANDLES.0 != 0;
-    let filler = if flagged && table.handles.is_empty() {
-        let nul = null_end()?;
-        let list = Box::new([HANDLE(nul.as_raw_handle())]);
-        Some(Filler { _nul: nul, list })
-    } else {
-        None
-    };
-    let listed = listed_handles(&filler, table);
-    let attr = if listed.is_empty() {
-        None
-    } else {
-        let attr = AttributeList::build(listed)?;
-        si.lpAttributeList = attr.as_ptr();
-        Some(attr)
-    };
-    Ok(Startup {
-        si,
-        _attr: attr,
-        filler,
-    })
+    si
 }
 
-/// Mark `h` inheritable (`bInheritHandles` + the HANDLE_LIST require it).
+/// Mark `h` inheritable, so `CreateProcessW` passes it to the child.
 fn set_inherit(h: HANDLE) -> Result<(), Error> {
     // SAFETY: `h` is a live child-end handle we own; SetHandleInformation only toggles its flags.
     unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT) }.map_err(|e| Error::Io(e.into()))
@@ -660,59 +594,6 @@ pub(crate) fn raw_program_and_line(cmd: &Command) -> Result<Vec<u16>, Error> {
 
             Ok(line.encode_wide().collect())
         }
-    }
-}
-
-/// RAII owner of a `PROC_THREAD_ATTRIBUTE_LIST` carrying a HANDLE_LIST. Deletes the list on drop.
-/// The slice passed to [`AttributeList::build`] must outlive the list (per
-/// `UpdateProcThreadAttribute`): callers keep it alive across both `CreateProcessW` and this drop. `pub(crate)`: the async raw
-/// backend builds the identical scoped inheritance list.
-pub(crate) struct AttributeList {
-    _buf: Vec<u8>,
-    list: LPPROC_THREAD_ATTRIBUTE_LIST,
-}
-
-impl AttributeList {
-    pub(crate) fn build(handles: &[HANDLE]) -> Result<AttributeList, Error> {
-        let mut size: usize = 0;
-        // Sizing call: returns ERROR_INSUFFICIENT_BUFFER and writes the required byte count.
-        // SAFETY: the null-list form is the documented way to query the buffer size.
-        _ = unsafe { InitializeProcThreadAttributeList(None, 1, None, &mut size) };
-        let mut buf: Vec<u8> = vec![0u8; size];
-        let list = LPPROC_THREAD_ATTRIBUTE_LIST(buf.as_mut_ptr().cast());
-        // SAFETY: `buf` is `size` bytes, matching the queried requirement; count = 1 (one attribute).
-        unsafe { InitializeProcThreadAttributeList(Some(list), 1, None, &mut size) }
-            .map_err(|e| Error::Io(e.into()))?;
-        // SAFETY: `list` is initialized; the HANDLE_LIST attribute takes an array of `handles.len()`
-        // HANDLEs by pointer (not copied), which the caller keeps alive until this list is deleted.
-        let update = unsafe {
-            UpdateProcThreadAttribute(
-                list,
-                0,
-                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
-                Some(handles.as_ptr().cast()),
-                std::mem::size_of_val(handles),
-                None,
-                None,
-            )
-        };
-        if let Err(e) = update {
-            // SAFETY: `list` was initialized above; delete it before `buf` drops.
-            unsafe { DeleteProcThreadAttributeList(list) };
-            return Err(Error::Io(e.into()));
-        }
-        Ok(AttributeList { _buf: buf, list })
-    }
-
-    pub(crate) fn as_ptr(&self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
-        self.list
-    }
-}
-
-impl Drop for AttributeList {
-    fn drop(&mut self) {
-        // SAFETY: `list` was initialized in `build`; Delete is its paired teardown.
-        unsafe { DeleteProcThreadAttributeList(self.list) };
     }
 }
 

@@ -313,6 +313,20 @@ fn main() {
             f.flush().unwrap();
             std::mem::forget(f); // keep the inherited fd open; do not close on exit
         }
+        #[cfg(windows)]
+        "write-handle" => {
+            // Write one byte to the handle whose hex value is `args[2]`: proves the child
+            // inherited that exact handle. A failed write exits non-zero.
+            use std::os::windows::io::FromRawHandle;
+            let value = usize::from_str_radix(&args[2], 16).expect("a hex handle value");
+            // SAFETY: the value names a handle the parent made inheritable for this child, or
+            // nothing, in which case the write fails. It is not closed: the process exits next.
+            let mut f = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_handle(value as *mut _) });
+            if let Err(e) = f.write_all(b"X").and_then(|()| f.flush()) {
+                eprintln!("write-handle {}: {e}", args[2]);
+                exit(1);
+            }
+        }
         "isatty-fd" => {
             // Report whether the given CRT fd is a character device (console) vs a pipe/file, so
             // the raw backend tests can classify inherited stdio.

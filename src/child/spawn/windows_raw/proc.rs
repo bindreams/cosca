@@ -17,7 +17,7 @@ use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, HANDLE, WAIT_EVENT, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{
     CreateProcessW, GetExitCodeProcess, TerminateProcess, WaitForMultipleObjects, WaitForSingleObject,
-    PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTUPINFOEXW,
 };
 
 use crate::error::Error;
@@ -282,12 +282,13 @@ pub(crate) fn exit_status(handle: HANDLE) -> io::Result<ExitStatus> {
 }
 
 /// The sole `CreateProcessW` call site, shared by the sync and async raw backends. The caller
-/// pre-fills `si.StartupInfo` (`dwFlags`/`hStd*`) and `si.lpAttributeList`, and passes a mutable
+/// pre-fills `si.StartupInfo` (`dwFlags`/`hStd*`), and passes a mutable
 /// NUL-terminated `cmdline` (`CreateProcessW` may edit it in place). Sets `si.StartupInfo.cb` here
 /// so every caller gets the extended-struct size right. Returns the owned process handle + pid.
 ///
-/// `bInheritHandles` is TRUE exactly when `si.lpAttributeList` (the HANDLE_LIST) is set, so
-/// inheritance is never blanket. `STARTF_USESTDHANDLES` requires a list.
+/// `bInheritHandles` is always TRUE and `si.lpAttributeList` stays null: the child inherits every
+/// inheritable handle, as from `std`'s route. The caller holds `spawn_lock` while the child-side
+/// handles are inheritable. `STARTF_USESTDHANDLES` requires `bInheritHandles`.
 pub(crate) fn create_process(
     app: Option<&[u16]>,
     cmdline: &mut [u16],
@@ -301,10 +302,9 @@ pub(crate) fn create_process(
     let app = app.map_or(PCWSTR::null(), |w| PCWSTR(w.as_ptr()));
     let cwd = cwd.as_ref().map_or(PCWSTR::null(), |w| PCWSTR(w.as_ptr()));
     let env_ptr = env.map(|b| b.as_ptr() as *const core::ffi::c_void);
-    let inherit = !si.lpAttributeList.0.is_null();
     debug_assert!(
-        si.StartupInfo.dwFlags.0 & STARTF_USESTDHANDLES.0 == 0 || inherit,
-        "STARTF_USESTDHANDLES requires a HANDLE_LIST"
+        si.lpAttributeList.0.is_null(),
+        "no attribute list: inheritance is blanket"
     );
     // SAFETY: all pointers are valid for the call; `cmdline` is a mutable NUL-terminated buffer
     // `CreateProcessW` may edit in place; `&si.StartupInfo` is backed by the full `STARTUPINFOEXW`
@@ -315,7 +315,7 @@ pub(crate) fn create_process(
             Some(PWSTR(cmdline.as_mut_ptr())),
             None,
             None,
-            inherit,
+            true,
             PROCESS_CREATION_FLAGS(flags),
             env_ptr,
             cwd,
