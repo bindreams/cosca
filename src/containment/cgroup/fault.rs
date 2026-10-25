@@ -9,6 +9,7 @@ thread_local! {
     static BETWEEN_CHECK_AND_KILL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     static ON_TAKE_PLACEMENT: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static BEFORE_EXIT_WAIT: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
+    static BEFORE_FRONT_PROBE: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static BEFORE_HANDLE_KILL: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static CHILD_SENDS: std::cell::RefCell<Vec<ChildSend>> = const { std::cell::RefCell::new(Vec::new()) };
     static FORCE_GROUP_KILL_GONE: Cell<bool> = const { Cell::new(false) };
@@ -565,6 +566,15 @@ pub(crate) type BeforeExitWaitGuard = crate::oneshot_hook::Armed;
 /// code under test returns, so a return before the fire point still releases its fixture.
 pub(crate) fn run_before_exit_wait() {
     crate::oneshot_hook::fire(&BEFORE_EXIT_WAIT);
+}
+
+/// Run `hook` in the NEXT abandonment of an elevation front on this thread, after it was seen
+/// unreaped and right before the probe for its exit.
+pub(crate) fn set_before_front_probe(hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
+    crate::oneshot_hook::arm(&BEFORE_FRONT_PROBE, hook)
+}
+pub(crate) fn run_before_front_probe() {
+    crate::oneshot_hook::fire(&BEFORE_FRONT_PROBE);
 }
 
 /// RAII: dropping this clears the hook [`set_after_fork_still_locked`] armed, even if

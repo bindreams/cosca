@@ -1308,8 +1308,11 @@ fn still_unreaped(received: &Received, pid: rustix::process::Pid) -> bool {
 }
 
 /// Answer for an abandoned spawn's elevation front, sent nothing: one that has exited is reaped,
-/// one its leaf's kill `reached` (given its pid and pidfd) is waited for, through its pidfd, and
-/// reaped; any other is left running and unreaped, with nothing that waits for it.
+/// one its leaf's kill `reached` (given its pid and pidfd) is waited for and reaped; any other is
+/// left running and unreaped, with nothing that waits for it. The waits go through its pidfd, or by
+/// its pid if it sent only its `/proc` directory (see the module's Ownership paragraph). A front
+/// another reaper in the process collects first gets a `debug` record: before the leaf's kill it
+/// has `Ended`, as one seen reaped; after it, it is `Reaped`.
 ///
 /// A child that never named itself, or that `std` collected, never ran the elevated program, so it
 /// is no front: it is answered as any child.
@@ -1340,6 +1343,8 @@ fn end_front(
         return Abandoned::Ended;
     }
     #[cfg(test)]
+    fault::run_before_front_probe();
+    #[cfg(test)]
     let seen_running = crate::child::spawn::fault::fronts_seen_running();
     #[cfg(not(test))]
     let seen_running = false;
@@ -1356,6 +1361,11 @@ fn end_front(
     match exited {
         Ok(Some(_)) => return Abandoned::Front(FrontFate::Reaped),
         Ok(None) => {}
+        // Reaped by another reaper in the process since the look: ended, as one the look saw reaped.
+        Err(rustix::io::Errno::CHILD) => {
+            log::debug!("cgroup v2: an abandoned spawn's elevation front (pid {raw}) was reaped elsewhere");
+            return Abandoned::Ended;
+        }
         Err(e) => {
             log::warn!("cgroup v2: an abandoned spawn's elevation front (pid {raw}) cannot be waited on ({e})");
             return Abandoned::Front(FrontFate::Unaccounted);
@@ -1389,6 +1399,13 @@ fn end_front(
     };
     match status {
         Ok(_) => Abandoned::Front(FrontFate::Reaped),
+        // Killed by its leaf, then reaped by another reaper in the process: only its status is lost.
+        Err(rustix::io::Errno::CHILD) => {
+            log::debug!(
+                "cgroup v2: an abandoned spawn's elevation front (pid {raw}) was reaped elsewhere after its leaf's kill"
+            );
+            Abandoned::Front(FrontFate::Reaped)
+        }
         Err(e) => {
             log::warn!("cgroup v2: an abandoned spawn's elevation front (pid {raw}) could not be reaped ({e})");
             Abandoned::Front(FrontFate::Unaccounted)
