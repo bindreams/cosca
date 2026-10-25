@@ -282,9 +282,9 @@ pub(crate) fn exit_status(handle: HANDLE) -> io::Result<ExitStatus> {
 }
 
 /// The sole `CreateProcessW` call site, shared by the sync and async raw backends. The caller
-/// pre-fills `si.StartupInfo` (`dwFlags`/`hStd*`), and passes a mutable
-/// NUL-terminated `cmdline` (`CreateProcessW` may edit it in place). Sets `si.StartupInfo.cb` here
-/// so every caller gets the extended-struct size right. Returns the owned process handle + pid.
+/// pre-fills `si.StartupInfo` (`dwFlags`/`hStd*`) and passes a mutable NUL-terminated `cmdline`
+/// (`CreateProcessW` may edit it in place). Sets `si.StartupInfo.cb` here so every caller gets the
+/// extended-struct size right. Returns the owned process handle + pid.
 ///
 /// `bInheritHandles` is always TRUE and `si.lpAttributeList` stays null: the child inherits every
 /// inheritable handle, as from `std`'s route. The caller holds `spawn_lock` while the child-side

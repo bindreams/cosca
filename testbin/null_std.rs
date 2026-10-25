@@ -41,7 +41,7 @@ const STD: [(&str, STD_HANDLE); 3] = [
 
 /// `std`: `std::process::Command`. `argv`: cosca's std route. The rest are cosca's raw backend:
 /// `exe` (`executable()`), `fd3` (fd 3 is the null device), `exe_merge` (stderr merged into
-/// stdout), `listed` (fd 3 is the stray file, given to the child as a dup with another handle value) and
+/// stdout), `stray_fd3` (fd 3 is the stray file, given to the child as a dup with another handle value) and
 /// `merge3` (fd 3 is merged from stdout, so it is null when stdout is) and `merge_live` (every std
 /// slot whose handle in this process is live is merged from the first nulled slot, so all three of
 /// the child's std ends are null while this process still holds a live handle). Three routes
@@ -54,7 +54,7 @@ const ROUTES: [&str; 11] = [
     "exe",
     "fd3",
     "exe_merge",
-    "listed",
+    "stray_fd3",
     "merge3",
     "merge_live",
     "pipe_out",
@@ -256,8 +256,8 @@ fn run(
         "cosca_testbin".into(),
         "report-std-handles".into(),
         report.as_os_str().to_owned(),
-        // `listed` hands the child the stray file at fd 3, a dup with another handle value.
-        if route == "listed" { "fd:3" } else { stray_hex }.into(),
+        // `stray_fd3` hands the child the stray file at fd 3, a dup with another handle value.
+        if route == "stray_fd3" { "fd:3" } else { stray_hex }.into(),
     ];
     match backend {
         "sync" => {
@@ -301,7 +301,7 @@ fn configure_sync(
     merges: &[(cosca::Fd, cosca::Fd)],
 ) -> Result<(), String> {
     match route {
-        "exe" | "exe_merge" | "listed" | "merge3" | "merge_live" | "pipe_out" | "null_io" | "pipe_fd3" => {
+        "exe" | "exe_merge" | "stray_fd3" | "merge3" | "merge_live" | "pipe_out" | "null_io" | "pipe_fd3" => {
             cmd.executable(exe).args(argv);
         }
         "argv" => {
@@ -314,7 +314,7 @@ fn configure_sync(
         other => panic!("unknown route {other:?}"),
     }
     match route {
-        "listed" => {
+        "stray_fd3" => {
             let dup = stray.try_clone().map_err(|e| e.to_string())?;
             cmd.fd(3, cosca::Stdio::from_file(dup)).map_err(|e| e.to_string())?;
         }
@@ -357,7 +357,7 @@ fn configure_tokio(
     merges: &[(cosca::Fd, cosca::Fd)],
 ) -> Result<(), String> {
     match route {
-        "exe" | "exe_merge" | "listed" | "merge3" | "merge_live" | "pipe_out" | "null_io" | "pipe_fd3" => {
+        "exe" | "exe_merge" | "stray_fd3" | "merge3" | "merge_live" | "pipe_out" | "null_io" | "pipe_fd3" => {
             cmd.executable(exe).args(argv);
         }
         "argv" => {
@@ -370,7 +370,7 @@ fn configure_tokio(
         other => panic!("unknown route {other:?}"),
     }
     match route {
-        "listed" => {
+        "stray_fd3" => {
             let dup = stray.try_clone().map_err(|e| e.to_string())?;
             cmd.fd(3, cosca::Stdio::from_file(dup)).map_err(|e| e.to_string())?;
         }

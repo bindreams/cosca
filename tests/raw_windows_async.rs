@@ -199,10 +199,10 @@ async fn async_fd3_only_routing_does_not_load_a_binary_planted_in_the_process_cw
 
 #[cfg(all(windows, feature = "tokio"))]
 /// Async: All three parent std handles null (a GUI or service): the child gets null handles, no
-/// `STARTF_USESTDHANDLES`; where the caller configures a child end (a pipe,
-/// the null device, fd 3), the child gets it. Mutants: `GetFileType(NULL)` (fails with 6);
-/// `STARTF_USESTDHANDLES` always set; the flag set
-/// only when this process holds a live std handle (`pipe_out`, `null_io`, `pipe_fd3`).
+/// `STARTF_USESTDHANDLES`; where the caller configures a child end (a pipe, the null device,
+/// fd 3), the child gets it. Mutants: `GetFileType(NULL)` (fails with 6); `STARTF_USESTDHANDLES`
+/// always set; the flag set only when this process holds a live std handle (`pipe_out`, `null_io`,
+/// `pipe_fd3`).
 #[skuld::test]
 fn async_raw_spawn_with_null_parent_std_handles_gives_the_child_null() {
     common::null_std::assert_every_route("tokio", "all");
@@ -221,8 +221,9 @@ fn async_raw_spawn_with_one_null_parent_std_handle_gives_the_child_that_one_null
 
 #[cfg(all(windows, feature = "tokio"))]
 /// Async: Two parent std handles null, one live: `STARTF_USESTDHANDLES` is still set, the null slots
-/// are gaps, and a live slot merged from a null one is null too. Mutants: the flag set only when some child end is non-null (`merge_live` and
-/// `exe_merge` with `stdin+stdout` nulled); the flag keyed on one parent slot only (each set).
+/// are gaps, and a live slot merged from a null one is null too. Mutants: the flag set only when
+/// some child end is non-null (`merge_live` and `exe_merge` with `stdin+stdout` nulled); the flag
+/// keyed on one parent slot only (each set).
 #[skuld::test]
 fn async_raw_spawn_with_two_null_parent_std_handles_gives_the_child_two_null() {
     for nulled in ["stdin+stdout", "stdin+stderr", "stdout+stderr"] {
@@ -253,11 +254,36 @@ async fn async_an_unlisted_inheritable_handle_reaches_the_child() {
         .args(["cosca_testbin", "write-handle", &format!("{value:x}")]);
     let mut child = c.spawn().expect("raw spawn");
     drop(writer);
+    // This process holds no write end: the read ends once the child's handles close, at its byte.
+    let got = tokio::task::spawn_blocking(move || {
+        let mut got = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut got).expect("read the pipe");
+        got
+    })
+    .await
+    .unwrap();
     child.wait().await.unwrap();
-    // The child has exited and this process holds no write end: the read ends at its byte.
-    let mut got = Vec::new();
-    std::io::Read::read_to_end(&mut reader, &mut got).expect("read the pipe");
     assert_eq!(got, b"X", "the child did not inherit the unlisted handle {value:x}");
+}
+
+#[cfg(all(windows, feature = "tokio"))]
+/// Async twin of sync `no_inheritable_handle_outlives_a_raw_spawn`, over the tokio backend's child
+/// ends (overlapped named pipes included). Mutant: `drop(child_ends)` in the tokio `spawn_raw`
+/// replaced by `std::mem::forget(child_ends)`.
+#[skuld::test]
+async fn async_no_inheritable_handle_outlives_a_raw_spawn() {
+    for (kind, targets) in common::inheritable::child_end_kinds() {
+        let before = common::inheritable::snapshot();
+        let mut c = cosca::tokio::Command::new();
+        c.executable(common::testbin()).args(["cosca_testbin", "exit", "0"]);
+        for (slot, target) in targets {
+            c.fd(slot, target).unwrap();
+        }
+        let mut child = c.spawn().unwrap_or_else(|e| panic!("{kind}: raw spawn: {e}"));
+        let leaked: Vec<_> = common::inheritable::snapshot().difference(&before).copied().collect();
+        child.wait().await.unwrap();
+        assert!(leaked.is_empty(), "{kind}: inheritable handles left open: {leaked:x?}");
+    }
 }
 
 #[path = "../src/test_harness.rs"]

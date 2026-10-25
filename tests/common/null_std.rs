@@ -51,7 +51,7 @@ pub fn assert_every_route(backend: &str, set: &str) {
             _ => (stdin, stdout, stderr),
         };
         let fd3 = match route {
-            "fd3" | "listed" | "pipe_fd3" => "open",
+            "fd3" | "stray_fd3" | "pipe_fd3" => "open",
             "merge3" if stdout != "null" => "open",
             _ => "closed",
         };
@@ -77,7 +77,7 @@ pub fn assert_every_route(backend: &str, set: &str) {
         "exe",
         "fd3",
         "exe_merge",
-        "listed",
+        "stray_fd3",
         "merge3",
         "merge_live",
         "pipe_out",

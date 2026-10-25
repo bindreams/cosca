@@ -555,11 +555,34 @@ fn an_unlisted_inheritable_handle_reaches_the_child() {
 }
 
 #[cfg(windows)]
+/// The child inherits every inheritable handle, so a child end left open and inheritable after a
+/// spawn would reach every later child. After one spawn per kind of child end (std pipes, null,
+/// inherit, files and a merge; fd 3 pipes, null, a file and a merge), this process holds no
+/// inheritable handle it did not hold before, with the child still running its `Child` handle open.
+/// Single-threaded: nothing else opens handles during a snapshot. Mutant: `drop(child_ends)` in
+/// `spawn_raw` replaced by `std::mem::forget(child_ends)`, or any path that skips the drop.
+#[skuld::test]
+fn no_inheritable_handle_outlives_a_raw_spawn() {
+    for (kind, targets) in common::inheritable::child_end_kinds() {
+        let before = common::inheritable::snapshot();
+        let mut c = cosca::Command::new();
+        c.executable(common::testbin()).args(["cosca_testbin", "exit", "0"]);
+        for (slot, target) in targets {
+            c.fd(slot, target).unwrap();
+        }
+        let child = c.spawn().unwrap_or_else(|e| panic!("{kind}: raw spawn: {e}"));
+        let leaked: Vec<_> = common::inheritable::snapshot().difference(&before).copied().collect();
+        child.wait().unwrap();
+        assert!(leaked.is_empty(), "{kind}: inheritable handles left open: {leaked:x?}");
+    }
+}
+
+#[cfg(windows)]
 /// All three parent std handles null (a GUI or service): the child gets null handles, no
-/// `STARTF_USESTDHANDLES`; where the caller configures a child end (a pipe,
-/// the null device, fd 3), the child gets it. Mutants: `GetFileType(NULL)` (fails with 6);
-/// `STARTF_USESTDHANDLES` always set; the flag set
-/// only when this process holds a live std handle (`pipe_out`, `null_io`, `pipe_fd3`).
+/// `STARTF_USESTDHANDLES`; where the caller configures a child end (a pipe, the null device,
+/// fd 3), the child gets it. Mutants: `GetFileType(NULL)` (fails with 6); `STARTF_USESTDHANDLES`
+/// always set; the flag set only when this process holds a live std handle (`pipe_out`, `null_io`,
+/// `pipe_fd3`).
 #[skuld::test]
 fn raw_spawn_with_null_parent_std_handles_gives_the_child_null() {
     common::null_std::assert_every_route("sync", "all");
@@ -578,8 +601,9 @@ fn raw_spawn_with_one_null_parent_std_handle_gives_the_child_that_one_null() {
 
 #[cfg(windows)]
 /// Two parent std handles null, one live: `STARTF_USESTDHANDLES` is still set, the null slots
-/// are gaps, and a live slot merged from a null one is null too. Mutants: the flag set only when some child end is non-null (`merge_live` and
-/// `exe_merge` with `stdin+stdout` nulled); the flag keyed on one parent slot only (each set).
+/// are gaps, and a live slot merged from a null one is null too. Mutants: the flag set only when
+/// some child end is non-null (`merge_live` and `exe_merge` with `stdin+stdout` nulled); the flag
+/// keyed on one parent slot only (each set).
 #[skuld::test]
 fn raw_spawn_with_two_null_parent_std_handles_gives_the_child_two_null() {
     for nulled in ["stdin+stdout", "stdin+stderr", "stdout+stderr"] {
