@@ -4,7 +4,7 @@
 use super::super::fault::{self, ChildSend};
 use super::super::test_support::{fork_running, KillOnDrop};
 use super::{end_child, ChildFate, PlacementReport, Received};
-use crate::test_groups::{cgroup, Group};
+use crate::test_groups::{cgroup, pidfd_group_signal, Group};
 
 /// A forked child that pauses until killed, leading its own process group, as a spawned child
 /// does. Its group is set from this side too, so it is in place before this returns.
@@ -260,4 +260,41 @@ fn an_abandoned_child_reaped_elsewhere_after_its_group_kill_is_killed(#[fixture(
 
         assert_eq!(end_child(&received), fate, "{report:?}");
     }
+}
+
+/// Where the kernel refuses `PIDFD_SIGNAL_PROCESS_GROUP` (before 6.9), the group kill of a child
+/// outside its leaf goes by its number only right after a check that the child is still unreaped.
+/// Mutants: "no check before the group kill by number", "`EINVAL` ends the group kill".
+#[skuld::test]
+fn an_abandoned_childs_group_kill_by_number_follows_its_own_check() {
+    use crate::send_log::{GroupStep, Route};
+    let child = paused_group_leader();
+    let received = received(child, Some(PlacementReport::WriteFailed(libc::EBADF)));
+    let capture = crate::send_log::Capture::start();
+    let refused = crate::containment::unix::fault::refuse_pidfd_group_flag();
+
+    assert_eq!(end_child(&received), ChildFate::Killed);
+    drop(refused);
+    assert_eq!(
+        capture.group_steps(),
+        [
+            GroupStep::Group(Route::Pidfd),
+            GroupStep::Check,
+            GroupStep::Group(Route::Number)
+        ]
+    );
+    assert_eq!(fault::take_child_sends(), [ChildSend::Group, ChildSend::Handle]);
+}
+
+/// Linux 6.9+: the group kill of a child outside its leaf goes through its handle, which names the
+/// group exactly. Mutant: "always by number".
+#[skuld::test]
+fn an_abandoned_childs_group_kill_goes_through_its_handle(#[fixture(pidfd_group_signal)] _group: &Group) {
+    use crate::send_log::{GroupStep, Route};
+    let child = paused_group_leader();
+    let received = received(child, Some(PlacementReport::WriteFailed(libc::EBADF)));
+    let capture = crate::send_log::Capture::start();
+
+    assert_eq!(end_child(&received), ChildFate::Killed);
+    assert_eq!(capture.group_steps(), [GroupStep::Group(Route::Pidfd)]);
 }
