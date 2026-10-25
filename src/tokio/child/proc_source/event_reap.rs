@@ -167,10 +167,8 @@ impl KqueueWatch {
     pub(super) async fn next(&mut self) -> Result<(), Error> {
         use crate::wait::backend::{arm_backoff_timer, BACKOFF_CAP};
         let backoff = self.backoff.then_some(self.interval);
-        let timer = match (backoff, self.recheck.take()) {
-            (Some(backoff), Some(recheck)) => Some(backoff.min(recheck)),
-            (backoff, recheck) => backoff.or(recheck),
-        };
+        let _ = self.recheck.take();
+        let timer = backoff;
         if let Some(timer) = timer {
             arm_backoff_timer(&self.afd.get_ref().0, timer).map_err(Error::Io)?;
         }

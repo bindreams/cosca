@@ -728,7 +728,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                     identity.expect("a spawn that reached the attach adopted its unique id"),
                     Some(id),
                     "is handed to tokio's orphan reaper, which reaps it once it exits",
-                    crate::tokio::child::slow_teardown_after(),
+                    None,
                 );
                 // A child its kill did not end is released to tokio's orphan reaper, not forgotten, which
                 // would leave a zombie nothing collects.

@@ -1233,7 +1233,7 @@ impl ProcSource {
         // have sent nothing at all (a macOS child with no unique id). A child the wait cannot show
         // to be ours is dead or dying if the kill was delivered, and may be running if it was not.
         // The wait logs at `debug`: the forget's one warn carries its cause.
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         self.warn_if_slow(pid);
         #[cfg(unix)]
         let (waited, cause) = self.wait_and_reap_caused(pid, log::Level::Debug);
@@ -1592,7 +1592,7 @@ async fn look_on_events<T>(
                 Ok(true) => continue,
                 Ok(false) => {}
                 Err(WalkError::Identity(e)) => return Err(Halt::State(RootState::Unknown(e))),
-                Err(WalkError::Watch(e)) => return Err(Halt::Watch(Error::Io(e))),
+                Err(WalkError::Watch(e)) => return Err(Halt::State(RootState::Unknown(e))),
             }
         }
         #[cfg(test)]
