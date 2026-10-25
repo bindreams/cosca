@@ -102,10 +102,23 @@ pub(crate) fn kill_group(pgid: i32) -> Result<(), Error> {
 pub(crate) mod fault {
     use std::cell::{Cell, RefCell};
 
+    type OnSend = Box<dyn FnMut(i32)>;
+
     thread_local! {
         static TERMED: RefCell<Option<Vec<i32>>> = const { RefCell::new(None) };
         static KILLED: RefCell<Option<Vec<i32>>> = const { RefCell::new(None) };
         static FAIL: Cell<bool> = const { Cell::new(false) };
+        static ON_TERM: RefCell<Option<OnSend>> = const { RefCell::new(None) };
+        static ON_KILL: RefCell<Option<OnSend>> = const { RefCell::new(None) };
+    }
+
+    /// Runs `slot`'s hook, if any, on `pgid`, with the slot free while it runs.
+    fn fire(slot: &'static std::thread::LocalKey<RefCell<Option<OnSend>>>, pgid: i32) {
+        let Some(mut hook) = slot.with(|h| h.borrow_mut().take()) else {
+            return;
+        };
+        hook(pgid);
+        slot.with(|h| *h.borrow_mut() = Some(hook));
     }
 
     /// From now on `kill_group` on THIS thread records its group and sends nothing, so a test can
@@ -129,16 +142,26 @@ pub(crate) mod fault {
         pub(crate) fn termed(&self) -> Vec<i32> {
             TERMED.with(|t| t.borrow().clone().expect("the recorder is live"))
         }
+
+        /// Runs `hook` at each recorded send, given its group.
+        pub(crate) fn on_send(&self, hook: impl FnMut(i32) + 'static) {
+            ON_TERM.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+        }
     }
 
     impl Drop for TermGroupRecorder {
         fn drop(&mut self) {
             TERMED.with(|t| *t.borrow_mut() = None);
+            ON_TERM.with(|h| *h.borrow_mut() = None);
         }
     }
 
     pub(super) fn intercept_term_group(pgid: i32) -> bool {
-        TERMED.with(|t| t.borrow_mut().as_mut().map(|termed| termed.push(pgid)).is_some())
+        let recorded = TERMED.with(|t| t.borrow_mut().as_mut().map(|termed| termed.push(pgid)).is_some());
+        if recorded {
+            fire(&ON_TERM, pgid);
+        }
+        recorded
     }
 
     #[must_use = "recording stops as soon as the recorder is dropped"]
@@ -154,6 +177,11 @@ pub(crate) mod fault {
         /// The groups `kill_group` was asked to kill since the recorder was made.
         pub(crate) fn killed(&self) -> Vec<i32> {
             KILLED.with(|k| k.borrow().clone().expect("the recorder is live"))
+        }
+
+        /// Runs `hook` at each recorded send, given its group.
+        pub(crate) fn on_send(&self, hook: impl FnMut(i32) + 'static) {
+            ON_KILL.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
         }
 
         /// Asserts `pgid` was killed, and nothing else was. More than once is fine: a macOS fd
@@ -172,22 +200,23 @@ pub(crate) mod fault {
         fn drop(&mut self) {
             KILLED.with(|k| *k.borrow_mut() = None);
             FAIL.with(|f| f.set(false));
+            ON_KILL.with(|h| *h.borrow_mut() = None);
         }
     }
 
     pub(super) fn intercept_kill_group(pgid: i32) -> Option<Result<(), crate::error::Error>> {
-        KILLED.with(|k| {
-            k.borrow_mut().as_mut().map(|killed| {
-                killed.push(pgid);
-                if FAIL.with(|f| f.get()) {
-                    Err(crate::error::Error::Unassessable {
-                        detail: "forced by a test".into(),
-                        source: None,
-                    })
-                } else {
-                    Ok(())
-                }
+        let recorded = KILLED.with(|k| k.borrow_mut().as_mut().map(|killed| killed.push(pgid)).is_some());
+        if !recorded {
+            return None;
+        }
+        fire(&ON_KILL, pgid);
+        Some(if FAIL.with(|f| f.get()) {
+            Err(crate::error::Error::Unassessable {
+                detail: "forced by a test".into(),
+                source: None,
             })
+        } else {
+            Ok(())
         })
     }
 }

@@ -67,10 +67,18 @@ fn run_with_a_wait_after_the_look(child: &Arc<crate::Child>, op: impl FnOnce(&cr
     seen
 }
 
-/// Mutant: the look and the sends not held against this handle's reaps.
-fn own_wait_lands_after_the_sends(op: impl FnOnce(&crate::Child), sent: impl FnOnce(u32) -> bool) {
+/// Mutants: the look and the sends not held against this handle's reaps; the hold dropped after
+/// the look, before the sends.
+fn own_wait_lands_after_the_sends(op: impl FnOnce(&crate::Child), on_send: impl FnOnce(Box<dyn FnMut(i32)>)) {
     let child = zombie_group_root();
-    let pgid = child.id().pid();
+    let pgid = child.id().pid() as i32;
+    // Each send to the group, and whether this thread held the handle's lock at it.
+    let sends: Rc<RefCell<Vec<(i32, bool)>>> = Rc::default();
+    on_send(Box::new({
+        let child = Arc::clone(&child);
+        let sends = Rc::clone(&sends);
+        move |group| sends.borrow_mut().push((group, child.proc.is_held_by_current_thread()))
+    }));
 
     let (first, wait) = run_with_a_wait_after_the_look(&child, op);
 
@@ -79,7 +87,15 @@ fn own_wait_lands_after_the_sends(op: impl FnOnce(&crate::Child), sent: impl FnO
         Waiter::Blocked,
         "an own wait reaped the root between the look and the sends"
     );
-    assert!(sent(pgid), "the group was signalled by its number");
+    let sends = sends.take();
+    assert!(
+        sends.iter().any(|(group, _)| *group == pgid),
+        "the group was signalled by its number: {sends:?}"
+    );
+    assert!(
+        sends.iter().all(|(group, held)| *group != pgid || *held),
+        "the group was signalled with this handle's reaps no longer held off: {sends:?}"
+    );
     // The root exited by itself (its stdin closed) before the call: the waiter collects that.
     let status = wait.join().expect("the waiter").expect("the waiter reaps the root");
     assert!(status.success(), "{status:?}");
@@ -90,7 +106,7 @@ fn kill_tree_holds_off_an_own_wait_until_its_sends_are_done() {
     let killed = record_kill_group();
     own_wait_lands_after_the_sends(
         |child| child.kill_tree().expect("kill the tree"),
-        |pgid| killed.killed().contains(&(pgid as i32)),
+        |hook| killed.on_send(hook),
     );
 }
 
@@ -99,7 +115,7 @@ fn terminate_tree_holds_off_an_own_wait_until_its_sends_are_done() {
     let termed = record_term_group();
     own_wait_lands_after_the_sends(
         |child| child.terminate_tree().expect("signal the tree"),
-        |pgid| termed.termed().contains(&(pgid as i32)),
+        |hook| termed.on_send(hook),
     );
 }
 
@@ -115,6 +131,6 @@ fn graceful_shutdown_tree_holds_off_an_own_wait_until_its_sigterm_is_sent() {
                 .map(drop)
                 .unwrap_or_else(|e| panic!("shut the tree down: {e}"))
         },
-        |pgid| termed.termed().contains(&(pgid as i32)),
+        |hook| termed.on_send(hook),
     );
 }

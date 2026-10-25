@@ -142,6 +142,13 @@ impl ProcHandle {
         }
     }
 
+    /// Whether this thread holds the handle's lock. Tests only.
+    #[cfg(all(unix, test))]
+    pub(crate) fn is_held_by_current_thread(&self) -> bool {
+        let ProcHandle::Std(s) = self;
+        s.is_held_by_current_thread()
+    }
+
     /// Hold off this handle's own reaps until the result drops (see
     /// [`SharedChild::hold_reaps`](crate::child::shared::SharedChild::hold_reaps)).
     #[cfg(unix)]
