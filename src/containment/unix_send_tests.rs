@@ -14,11 +14,12 @@ use crate::test_groups::{pidfd_group_signal, Group};
 fn group_of_three() -> (std::process::Child, std::process::ChildStdin) {
     use std::io::BufRead as _;
     use std::os::unix::process::CommandExt;
-    // `<&0`: an asynchronous list's stdin is `/dev/null` unless redirected.
+    // Through fd 3: an asynchronous list's stdin is `/dev/null`, and dash points it there before a
+    // `<&0` would apply.
     let mut child = crate::test_spawn::spawn(
         std::process::Command::new("sh")
             .arg("-c")
-            .arg("cat <&0 & cat <&0 & echo ready; wait")
+            .arg("exec 3<&0; cat <&3 & cat <&3 & echo ready; wait")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .process_group(0),
