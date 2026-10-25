@@ -334,8 +334,8 @@ pub(crate) fn io_context(context: impl Into<String>, source: std::io::Error) -> 
 /// its Win32 code, which `raw_os_error()` and `kind()` classify. Every `windows::core::Error` that
 /// becomes an `io::Error` goes through here: the `windows` crate's own conversion keeps the HRESULT
 /// (`0x8007xxxx`), which `kind()` cannot classify and which differs from what std returns. Clippy
-/// cannot ban that conversion (see `clippy.toml`), so a bare `.into()`, `io::Error::from` or `?` on
-/// a `windows::core::Error` is a defect to catch in review.
+/// cannot ban the `windows` crate's conversion (see `clippy.toml`); review catches a bare `.into()`,
+/// `io::Error::from` or `?`.
 #[cfg(windows)]
 pub(crate) fn win32_io_error(e: windows::core::Error) -> std::io::Error {
     let code = e.code().0 as u32;

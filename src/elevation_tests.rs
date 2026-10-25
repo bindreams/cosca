@@ -283,31 +283,6 @@ fn kill_error_on_an_elevated_wrapper_is_unkillable() {
     );
 }
 
-/// `TerminateProcess` refused with `ERROR_ACCESS_DENIED` on an elevated wrapper is `Unkillable`
-/// on Windows too, and on a plain child it stays `Io`: the conversion keeps the Win32 code, so
-/// `kind()` is `PermissionDenied`.
-///
-/// Mutant: `win32_io_error` keeps the HRESULT (`0x80070005`), whose kind is not `PermissionDenied`.
-#[cfg(windows)]
-#[skuld::test]
-fn a_denied_win32_kill_on_an_elevated_wrapper_is_unkillable() {
-    use crate::error::{win32_io_error, ElevationErrorKind, Error};
-    use windows::core::HRESULT;
-    let denied = || win32_io_error(windows::core::Error::from_hresult(HRESULT::from_win32(5)));
-    let e = super::map_elevated_kill_error(denied(), true);
-    assert!(
-        matches!(
-            e,
-            Error::Elevation {
-                kind: ElevationErrorKind::Unkillable,
-                ..
-            }
-        ),
-        "{e:?}"
-    );
-    assert!(matches!(super::map_elevated_kill_error(denied(), false), Error::Io(_)));
-}
-
 #[skuld::test]
 fn kill_error_on_a_plain_child_stays_io() {
     use crate::error::Error;

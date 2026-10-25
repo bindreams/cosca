@@ -285,6 +285,28 @@ fn duplicate_job_failure_carries_the_win32_code() {
     assert_eq!(err.raw_os_error(), Some(ERROR_INVALID_HANDLE), "{err:?}");
 }
 
+/// The error `GenerateConsoleCtrlEvent` returns when the caller has no console: what the `windows`
+/// crate builds from the thread's last error.
+fn no_console_failure() -> windows::core::Error {
+    // SAFETY: setting the calling thread's last error has no preconditions.
+    unsafe {
+        windows::Win32::Foundation::SetLastError(windows::Win32::Foundation::ERROR_INVALID_HANDLE);
+    }
+    windows::core::Error::from_thread()
+}
+
+/// `terminate` classifies the OS's own failure: `ERROR_INVALID_HANDLE` from the call, with the
+/// probe confirming no console, is `NoConsole`. This is the check that the converted error matches
+/// the classifier's code.
+///
+/// Mutant: `terminate_with` converts with `.into()`, so the code is `0x80070006`, the classifier
+/// does not recognise it, and the result is `Io`.
+#[skuld::test]
+fn terminate_classifies_a_real_no_console_failure() {
+    let e = super::terminate_with(4242, || Err(no_console_failure()), || Ok(false)).expect_err("the send failed");
+    assert!(matches!(e, crate::error::Error::NoConsole { .. }), "got {e:?}");
+}
+
 #[skuld::test]
 fn invalid_handle_with_a_failed_probe_stays_io() {
     let probe = Err(std::io::Error::from_raw_os_error(87)); // ERROR_INVALID_PARAMETER
@@ -830,14 +852,24 @@ fn process_pid_of_rejects_a_handle_that_names_no_process() {
     );
 }
 
-/// `GetProcessId` failing reaches the caller with its Win32 code: a null handle is
-/// `ERROR_INVALID_HANDLE`.
+/// `GetProcessId` failing reaches the caller with its Win32 code and the kind that code classifies
+/// to, and the message names the call: a null handle is `ERROR_INVALID_HANDLE`.
 ///
 /// Mutant: `process_pid_of` builds `io::Error::other(format!(..))`, losing the code and the kind.
 #[skuld::test]
 fn process_pid_of_failure_carries_the_win32_code() {
     let err = super::process_pid_of(windows::Win32::Foundation::HANDLE::default()).expect_err("a null handle");
     assert_eq!(source_os_code(&err), Some(ERROR_INVALID_HANDLE), "{err:?}");
+    assert_eq!(
+        err.kind(),
+        std::io::Error::from_raw_os_error(ERROR_INVALID_HANDLE).kind(),
+        "{err:?}"
+    );
+    assert!(
+        err.to_string()
+            .starts_with("GetProcessId failed on the child's handle: "),
+        "{err}"
+    );
 }
 
 /// A handle that names no process breaks the caller's contract. Debug builds assert it.

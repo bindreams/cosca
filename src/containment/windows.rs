@@ -324,7 +324,7 @@ pub(crate) fn caller_has_console() -> io::Result<bool> {
 /// probe are both parameters — so every arm is unit-testable without hooking the OS calls the
 /// live path depends on (the same injection idiom as `treewalk::descendants_with`).
 ///
-/// `err` carries the bare Win32 code (see [`win32_io_error`]), as `io::Error::last_os_error()` does.
+/// `err` carries the bare Win32 code (see [`win32_io_error`]).
 ///
 /// `Error::NoConsole` is returned ONLY when the failure code matches AND the probe confirms
 /// there is no console. A contradicted probe, a failed probe, or any other failure code keeps
@@ -487,14 +487,24 @@ pub(crate) fn terminate(pid: u32) -> Result<(), crate::error::Error> {
         pid != 0,
         "pid 0 addresses every process attached to the caller's console, including the caller"
     );
-    // SAFETY: standard Win32 call targeting the child's own console group.
-    match unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) } {
+    terminate_with(
+        pid,
+        // SAFETY: standard Win32 call targeting the child's own console group.
+        || unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) },
+        caller_has_console,
+    )
+}
+
+/// [`terminate`] with the OS call `send` and the console probe injected, so a test can make the
+/// call fail with the code the OS reports without detaching the test process from its console.
+fn terminate_with(
+    pid: u32,
+    send: impl FnOnce() -> windows::core::Result<()>,
+    console: impl FnOnce() -> io::Result<bool>,
+) -> Result<(), crate::error::Error> {
+    match send() {
         Ok(()) => Ok(()),
-        Err(e) => Err(classify_ctrl_event_failure(
-            pid,
-            win32_io_error(e),
-            caller_has_console(),
-        )),
+        Err(e) => Err(classify_ctrl_event_failure(pid, win32_io_error(e), console())),
     }
 }
 
@@ -1134,7 +1144,7 @@ impl Walk {
     }
 
     /// Record that the initial thread of `process_pid` cannot be told from the threads `first` and
-    /// `second`. No OS call failed, so the error has no OS code.
+    /// `second`.
     fn fail_unidentified(&mut self, process_pid: u32, first: u32, second: u32) {
         let msg = format!(
             "the initial thread of pid {process_pid} cannot be identified: threads {first} and {second} have the same creation time"
@@ -1143,7 +1153,7 @@ impl Walk {
         self.last_err.get_or_insert_with(|| io::Error::other(msg));
     }
 
-    /// Record a failure that is cosca's own finding about a thread, not a failed OS call: the error
+    /// Record a failure that is cosca's own finding about a thread. No OS call failed, so the error
     /// has no OS code.
     fn fail(&mut self, call: &str, tid: u32, process_pid: u32, cause: impl std::fmt::Display) -> Visit {
         let msg = format!("{call} failed for thread {tid} of pid {process_pid}: {cause}");
@@ -1152,8 +1162,7 @@ impl Walk {
         Visit::Failed
     }
 
-    /// Record the failure of the Win32 call `call`: the error keeps the call's Win32 code as its
-    /// source, and its kind.
+    /// Record the failure of the Win32 call `call`, keeping its code as the error's source.
     fn fail_win32(&mut self, call: &str, tid: u32, process_pid: u32, cause: windows::core::Error) -> Visit {
         let context = format!("{call} failed for thread {tid} of pid {process_pid}");
         let err = io_context(context, win32_io_error(cause));
@@ -1448,7 +1457,6 @@ fn process_pid_of(raw_handle: HANDLE) -> io::Result<u32> {
 }
 
 /// The error for a walk that resumed nothing, naming why every listed thread was skipped.
-/// No OS call failed, so the error has no OS code.
 fn none_resumed_error(process_pid: u32, last_skip: Option<&str>) -> io::Error {
     match last_skip {
         Some(reason) => io::Error::other(format!(
