@@ -9,6 +9,7 @@ thread_local! {
     static BETWEEN_CHECK_AND_KILL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     static ON_TAKE_PLACEMENT: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static BEFORE_EXIT_WAIT: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
+    static BEFORE_HANDLE_KILL: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static CHILD_SENDS: std::cell::RefCell<Vec<ChildSend>> = const { std::cell::RefCell::new(Vec::new()) };
     static FORCE_GROUP_KILL_GONE: Cell<bool> = const { Cell::new(false) };
     static TERMINATED_BY_PID: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -539,6 +540,15 @@ pub(crate) fn run_between_check_and_kill() {
     if let Some(hook) = BETWEEN_CHECK_AND_KILL.with(|h| h.borrow_mut().take()) {
         hook();
     }
+}
+
+/// Run `hook` in the NEXT abandonment on this thread, after any group kill and right before the
+/// kill through the child's handle.
+pub(crate) fn set_before_handle_kill(hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
+    crate::oneshot_hook::arm(&BEFORE_HANDLE_KILL, hook)
+}
+pub(crate) fn run_before_handle_kill() {
+    crate::oneshot_hook::fire(&BEFORE_HANDLE_KILL);
 }
 
 /// Run `hook` in the NEXT abandonment on this thread, after the child has been signalled (an

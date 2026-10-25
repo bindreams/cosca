@@ -1138,10 +1138,14 @@ fn end_child(received: &Received) -> ChildFate {
     }
     #[cfg(test)]
     fault::run_between_check_and_kill();
-    let group_refused = match received.report {
-        Some(PlacementReport::WriteFailed(_)) => kill_group_outside_leaf(pid),
+    let group = match received.report {
+        Some(PlacementReport::WriteFailed(_)) => Some(kill_group_outside_leaf(pid)),
         _ => None,
     };
+    let group_killed = matches!(group, Some(Ok(true)));
+    let group_refused = group.and_then(Result::err);
+    #[cfg(test)]
+    fault::run_before_handle_kill();
     let killed = kill_through(handle);
     // One warn for the child, however many of its kills were refused.
     let group = group_refused.map(|e| format!("process group {} ({e})", rustix::process::Pid::as_raw(Some(pid))));
@@ -1154,8 +1158,13 @@ fn end_child(received: &Received) -> ChildFate {
         _ => {}
     }
     if killed == Err(rustix::io::Errno::SRCH) {
-        // Reaped since the look, by another reaper in the process.
-        return ChildFate::Gone;
+        // Reaped since the look, by another reaper in the process: after the group kill, which
+        // reached it unless it had left its group, or had exited.
+        return if group_killed {
+            ChildFate::Killed
+        } else {
+            ChildFate::Gone
+        };
     }
     if killed.is_err() {
         reap_in_background(id_owned(received, pid));
@@ -1209,20 +1218,21 @@ fn kill_through(handle: &std::os::fd::OwnedFd) -> rustix::io::Result<()> {
 }
 
 /// Kill the process group an abandoned spawn's child leads, by its number `pid` (see
-/// [`end_child`]). Returns the error of a refused kill, for the child's one warn.
+/// [`end_child`]). Returns whether the kill was delivered (`false`: the group has no member left),
+/// or the error of a refused kill, for the child's one warn.
 #[cfg(target_os = "linux")]
-fn kill_group_outside_leaf(pid: rustix::process::Pid) -> Option<rustix::io::Errno> {
+fn kill_group_outside_leaf(pid: rustix::process::Pid) -> Result<bool, rustix::io::Errno> {
     match kill_group(pid) {
-        Ok(()) => None,
+        Ok(()) => Ok(true),
         Err(rustix::io::Errno::SRCH) => {
             let pid = rustix::process::Pid::as_raw(Some(pid));
             log::debug!(
                 "cgroup v2: an abandoned spawn's child's process group {pid} has no member left (the child left \
                  it, or was reaped elsewhere since the look)"
             );
-            None
+            Ok(false)
         }
-        Err(e) => Some(e),
+        Err(e) => Err(e),
     }
 }
 

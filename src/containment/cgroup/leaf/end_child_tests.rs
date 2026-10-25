@@ -44,6 +44,15 @@ fn echoing_child() -> (KillOnDrop, std::io::PipeWriter, std::io::PipeReader) {
     (child, to_child, from_child)
 }
 
+/// The background reaper took the notifier a test armed, so the test's wait for its reap ends.
+#[track_caller]
+fn assert_handed_to_the_background_reaper() {
+    assert!(
+        fault::take_background_reap_notifier().is_none(),
+        "the child must be handed to the background reaper"
+    );
+}
+
 /// What `end_child` receives for `child`, named by its pidfd, after `report`. `end_child` reaps
 /// it from here on.
 fn received(child: KillOnDrop, report: Option<PlacementReport>) -> Received {
@@ -169,6 +178,7 @@ fn an_abandoned_child_refusing_both_kills_is_warned_about_once(#[fixture(cgroup)
         "it names the refused group kill: {warns:?}"
     );
     rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::KILL).expect("kill the child");
+    assert_handed_to_the_background_reaper();
     reaped_rx.recv().expect("the background reaper must reap it");
 }
 
@@ -192,5 +202,58 @@ fn an_abandoned_child_refusing_its_handles_kill_is_not_killed_by_pid() {
 
     // Unreaped, so its pidfd still names it.
     rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::KILL).expect("kill the child");
+    assert_handed_to_the_background_reaper();
     reaped_rx.recv().expect("the background reaper must reap it");
+}
+
+/// A child outside its leaf whose group kill is refused, but whose own kill lands, is warned about
+/// once, naming the group: what is left in it may keep running.
+///
+/// Mutant: the group-refused arm removed, or logged at `debug`.
+#[skuld::test]
+fn an_abandoned_child_whose_group_kill_is_refused_is_warned_about_once(#[fixture(cgroup)] _group: &Group) {
+    crate::log_capture::install();
+    let child = paused_group_leader();
+    let received = received(child, Some(PlacementReport::WriteFailed(libc::EBADF)));
+    let pid = received.pid.expect("a pid");
+    fault::set_force_group_kill_denied(true);
+
+    let mark = crate::log_capture::mark();
+    assert_eq!(end_child(&received), ChildFate::Killed);
+
+    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "")
+        .into_iter()
+        .filter(|(level, _)| *level <= log::Level::Warn)
+        .collect();
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(
+        warns[0].1.contains(&format!("process group {pid}")),
+        "it names the refused group kill: {warns:?}"
+    );
+}
+
+/// A child reaped elsewhere after its group kill and before its handle's kill (`ESRCH`) is
+/// `Killed`: cosca's kill reached its group. One no kill of cosca's reached, killed and reaped by
+/// someone else, is `Gone`.
+///
+/// Mutant: `ESRCH` from the handle's kill read as `Gone` whatever the group kill did.
+#[skuld::test]
+fn an_abandoned_child_reaped_elsewhere_after_its_group_kill_is_killed(#[fixture(cgroup)] _group: &Group) {
+    for (report, fate) in [
+        (Some(PlacementReport::WriteFailed(libc::EBADF)), ChildFate::Killed),
+        (None, ChildFate::Gone),
+    ] {
+        let child = paused_group_leader();
+        let received = received(child, report);
+        let pid = received.pid.expect("a pid");
+        let pidfd = super::super::test_support::pidfd_of(pid);
+        let _reaped_elsewhere = fault::set_before_handle_kill(move || {
+            if report.is_none() {
+                rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::KILL).expect("kill the child");
+            }
+            crate::test_child::reaped_elsewhere::reap_behind(pid);
+        });
+
+        assert_eq!(end_child(&received), fate, "{report:?}");
+    }
 }

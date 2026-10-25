@@ -2803,6 +2803,10 @@ fn an_abandoned_child_that_refuses_the_kill_is_reaped_once_it_exits() {
 
     // Its pid is pinned while it is unreaped.
     rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::KILL).expect("kill the child");
+    assert!(
+        crate::containment::cgroup::fault::take_background_reap_notifier().is_none(),
+        "the child must be handed to the background reaper"
+    );
     reaped_rx.recv().expect("the background reaper must reap it");
     assert!(reaped(&pidfd), "the child must be reaped once it exits");
 }

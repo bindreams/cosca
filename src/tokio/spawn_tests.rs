@@ -364,6 +364,10 @@ async fn cgroup_a_post_fork_tokio_failure_warns_only_for_a_child_out_of_reach(#[
         if refuses {
             assert!(!reaped_through(&pidfd), "{case}: the child is still running");
             rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::KILL).expect("kill the child");
+            assert!(
+                cgroup_fault::take_background_reap_notifier().is_none(),
+                "{case}: the child must be handed to the background reaper"
+            );
             reaped_rx.recv().expect("the background reaper must reap it");
         } else {
             assert!(
