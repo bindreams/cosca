@@ -179,6 +179,8 @@ mod test_privilege;
 #[cfg(all(test, unix))]
 mod test_own_process;
 #[cfg(all(test, unix))]
+mod test_own_process_gate;
+#[cfg(all(test, unix))]
 mod test_own_process_tests;
 #[cfg(all(test, unix))]
 mod test_stdio;

@@ -21,14 +21,11 @@
 //! parent volatile (seen on arm64, whose HKCU has no `App Paths` key); the guard records which
 //! parents were missing and deletes those too.
 //!
-//! The tests share machine-wide state — the registry keys — so each holds [`serial`] for its
-//! whole body too, a holdover from when `cargo test` ran every test in one shared process and
-//! `PATH` and one environment variable were process-global state as well. Under nextest's
-//! one-process-per-test model, `PATH` and that env var are already isolated per test; only the
-//! registry keys are genuinely machine-wide, and `serial`'s mutex only serializes within one
-//! process, so it cannot reach across processes to guard them — `.config/nextest.toml`'s test
-//! group, capped at one concurrent test, is what actually keeps these from racing each other
-//! under nextest.
+//! The tests share machine-wide state — the registry keys — so `.config/nextest.toml`'s test group
+//! runs them one at a time.
+//!
+//! Tests that set an environment variable (`PATH` included) run in a re-executed process of their
+//! own (`test_own_process`), so the change never reaches a sibling test's thread.
 
 #[cfg(windows)]
 #[path = "common/mod.rs"]
@@ -38,13 +35,13 @@ mod common;
 mod windows_probe;
 
 #[cfg(windows)]
+use common::test_own_process::{own_process, test_path, Completion};
+#[cfg(windows)]
 use std::ffi::{OsStr, OsString};
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 #[cfg(windows)]
 use std::path::{Path, PathBuf};
-#[cfg(windows)]
-use std::sync::{Mutex, MutexGuard};
 
 #[cfg(windows)]
 use crate::test_groups::{shell_execute, Group};
@@ -79,21 +76,14 @@ const FILE_NOT_FOUND: i32 = 0x8007_0002_u32 as i32;
 const NO_ASSOCIATION: i32 = 0x8007_0483_u32 as i32;
 
 #[cfg(windows)]
-/// Serialize the tests in this file: see the module doc.
-fn serial() -> MutexGuard<'static, ()> {
-    static SERIAL: Mutex<()> = Mutex::new(());
-    SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-#[cfg(windows)]
 /// An environment variable set for a test's duration and restored on drop to exactly what it was,
-/// absent included.
+/// absent included. Process-wide, so [`EnvVar::set`] takes the [`Completion`] of `own_process`.
 struct EnvVar(&'static str, Option<OsString>);
 
 #[cfg(windows)]
 impl EnvVar {
     /// Set `name` to `value(previous)`.
-    fn set(name: &'static str, value: impl FnOnce(Option<&OsStr>) -> OsString) -> Self {
+    fn set(_own_process: &Completion, name: &'static str, value: impl FnOnce(Option<&OsStr>) -> OsString) -> Self {
         let previous = std::env::var_os(name);
         std::env::set_var(name, value(previous.as_deref()));
         Self(name, previous)
@@ -364,7 +354,9 @@ fn last_component(path: &str) -> String {
 /// where the same launch without the class finds both. `comfile` has no `runas` verb.
 #[skuld::test]
 fn classname_runas_needs_a_full_path(#[fixture(shell_execute)] _group: &Group) {
-    let _serial = serial();
+    let Some(done) = own_process(test_path!(classname_runas_needs_a_full_path), common::spawn_locked) else {
+        return;
+    };
     let l = layout();
     let mut failures: Vec<String> = Vec::new();
     let mut check = |ok: bool, what: &str, got: &Result<Report, Failure>| {
@@ -421,7 +413,7 @@ fn classname_runas_needs_a_full_path(#[fixture(shell_execute)] _group: &Group) {
     );
     check(failed_with(&got, NO_ASSOCIATION), "comfile has no runas verb", &got);
 
-    let path = EnvVar::set("PATH", |old| {
+    let path = EnvVar::set(&done, "PATH", |old| {
         let mut new = OsString::from(l.dir_path.as_os_str());
         if let Some(old) = old {
             new.push(";");
@@ -456,7 +448,6 @@ fn classname_runas_needs_a_full_path(#[fixture(shell_execute)] _group: &Group) {
 /// registration is not consulted at all; that is printed, not asserted.
 #[skuld::test]
 fn exefile_skips_the_app_paths_lookup(#[fixture(shell_execute)] _group: &Group) {
-    let _serial = serial();
     let l = layout();
     let app = OsStr::new(APP);
     let mut failures: Vec<String> = Vec::new();
@@ -492,7 +483,9 @@ fn exefile_skips_the_app_paths_lookup(#[fixture(shell_execute)] _group: &Group) 
 /// directory literally named that, not `…\exp\…`.
 #[skuld::test]
 fn exefile_takes_percent_literally(#[fixture(shell_execute)] _group: &Group) {
-    let _serial = serial();
+    let Some(done) = own_process(test_path!(exefile_takes_percent_literally), common::spawn_locked) else {
+        return;
+    };
     let l = layout();
     let literal_name = "%COSCA_PROBE_PCT%";
     let (literal, expanded) = (l.root.path().join(literal_name), l.root.path().join("exp"));
@@ -501,7 +494,7 @@ fn exefile_takes_percent_literally(#[fixture(shell_execute)] _group: &Group) {
         std::fs::create_dir(dir).expect("mkdir");
         std::fs::copy(source, dir.join("cosca_probe_pct.exe")).expect("copy the payload");
     }
-    let pct = EnvVar::set("COSCA_PROBE_PCT", |_| "exp".into());
+    let pct = EnvVar::set(&done, "COSCA_PROBE_PCT", |_| "exp".into());
     let file = literal.join("cosca_probe_pct.exe");
     let by_file = run(
         &l,

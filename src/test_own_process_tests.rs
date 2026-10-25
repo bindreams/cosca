@@ -4,9 +4,9 @@ use std::io::Write as _;
 use std::os::fd::{AsRawFd as _, RawFd};
 
 use crate::test_own_process::{
-    child_args, child_completion, drain, is_reexecution, own_process, role, run, test_path, Completion, FailureKind,
-    Role, ENV,
+    child_completion, drain, own_process, role, run, test_path, Completion, FailureKind, Role,
 };
+use crate::test_own_process_gate::{child_args, is_reexecution, ENV};
 use crate::test_spawn::spawn;
 
 const FIXTURE: &str = "test_own_process_tests::fixture_records_its_pid_and_misbehaves_on_request";
@@ -274,7 +274,7 @@ fn a_forged_environment_never_runs_the_body_in_a_shared_process() {
     let dir = tempfile::tempdir().expect("tempdir");
     let pidfile = dir.path().join("pid");
     let shared: Vec<String> = ["--exact", FIXTURE].map(String::from).to_vec();
-    let exact: Vec<String> = child_args(FIXTURE).map(String::from).to_vec();
+    let exact: Vec<String> = child_args(FIXTURE).into_iter().map(String::from).collect();
     let forged = [
         // Forged values with a shared argv: the bare test name, and a value naming another parent.
         (shared.clone(), FIXTURE.to_string()),
