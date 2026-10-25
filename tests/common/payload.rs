@@ -264,6 +264,8 @@ pub fn accept_payload(listener: TcpListener, nonce: &str, watch: ExitWatch) -> P
     // ends instead of blocking forever.
     let verdict = decide(nonce, sources.rx.iter());
     sources.stop_accepting();
+    // The acceptor owns the listener: joining it closes the listener before the verdict is acted on.
+    sources.acceptor.join().expect("accepting thread panicked");
     match verdict {
         Ok((sock, pid)) => Payload {
             sock,

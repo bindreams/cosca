@@ -237,8 +237,9 @@ fn identify(pid: u32) -> ProcessId {
 }
 
 /// Accepts the root's report connection, reads its pid line watching the root, captures the
-/// grandchild's identity and releases the root. See the module doc.
-pub fn report_grandchild(report: &TcpListener, root: &mut cosca::Child) -> ProcessId {
+/// grandchild's identity and releases the root. See the module doc. The report serves one
+/// connection, so `report` is consumed and closes as soon as it is accepted.
+pub fn report_grandchild(report: TcpListener, root: &mut cosca::Child) -> ProcessId {
     let (id, stream) = read_grandchild_report(report, root);
     let contained = is_contained_member(root.containment(), root.pid(), id.pid(), |_pid| {
         #[cfg(windows)]
@@ -254,28 +255,31 @@ pub fn report_grandchild(report: &TcpListener, root: &mut cosca::Child) -> Proce
 
 /// [`accept_tree_also`](super::accept_tree_also) for a root started with [`GC_PID_ADDR_ENV`] set
 /// to `report`'s address: captures the grandchild's identity through the report protocol first.
+/// Both listeners are consumed: `report` closes once its connection is accepted, `listener` once
+/// both members are.
 pub fn accept_tree(
-    listener: &TcpListener,
-    report: &TcpListener,
+    listener: TcpListener,
+    report: TcpListener,
     root: &mut cosca::Child,
     on_accept: impl FnMut(&mut TcpStream) -> bool,
 ) -> Vec<TcpStream> {
     let grandchild = report_grandchild(report, root);
-    super::accept::accept_tree_also(listener, root, grandchild, on_accept)
+    super::accept::accept_tree_also(&listener, root, grandchild, on_accept)
 }
 
 /// [`report_grandchild`] for a root that is not a `cosca::Child` (a raw `CreateProcessW` root,
 /// a `std::process::Child`): it records no containment membership, which needs the `Child`.
-pub fn report_grandchild_of(report: &TcpListener, root: &mut impl Target) -> ProcessId {
+pub fn report_grandchild_of(report: TcpListener, root: &mut impl Target) -> ProcessId {
     let (id, stream) = read_grandchild_report(report, root);
     release(stream);
     id
 }
 
 /// The shared part of the two: the accepted report stream, still unreleased, and the identity.
-fn read_grandchild_report(report: &TcpListener, root: &mut impl Target) -> (ProcessId, TcpStream) {
+fn read_grandchild_report(report: TcpListener, root: &mut impl Target) -> (ProcessId, TcpStream) {
     let root_pid = root.pid();
-    let mut stream = accept_or_die(report, root);
+    let mut stream = accept_or_die(&report, root);
+    drop(report);
     let mut line = Vec::new();
     let mut buf = [0u8; 64];
     while !line.contains(&b'\n') {
@@ -302,12 +306,13 @@ fn release(stream: TcpStream) {
 
 /// Async sibling of [`report_grandchild`].
 #[cfg(feature = "tokio")]
-pub async fn report_grandchild_async(report: &::tokio::net::TcpListener, root: &mut cosca::tokio::Child) -> ProcessId {
+pub async fn report_grandchild_async(report: ::tokio::net::TcpListener, root: &mut cosca::tokio::Child) -> ProcessId {
     use ::tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     LAST_ASYNC_ROOT.with(|c| c.set(Some(root.id())));
     let root_pid = root.id().pid();
-    let std_stream = super::accept::accept_or_die_async(report, root).await;
+    let std_stream = super::accept::accept_or_die_async(&report, root).await;
+    drop(report);
     std_stream
         .set_nonblocking(true)
         .expect("set the report stream nonblocking");
