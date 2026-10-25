@@ -74,6 +74,9 @@ inherits = "ci"
 [profile.ci-serde]
 inherits = "ci"
 
+[profile.ci-path]
+inherits = "ci"
+
 [profile.ci-release]
 inherits = "ci"
 

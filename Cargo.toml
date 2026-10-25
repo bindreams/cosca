@@ -11,6 +11,11 @@ keywords = ["subprocess", "process", "spawn", "elevation", "cross-platform"]
 categories = ["os", "development-tools", "asynchronous"]
 exclude = ["/build.rs", "/testbin", "/tests", "/.github", "/.claude", "/.config", "/prek.toml", "/clippy.toml"]
 
+[workspace]
+members = ["cosca-path"]
+# Standalone fixture crates the CI scripts build on their own.
+exclude = [".github/fixtures"]
+
 [package.metadata.docs.rs]
 all-features = true
 targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-apple-darwin"]
