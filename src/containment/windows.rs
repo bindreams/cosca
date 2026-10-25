@@ -31,7 +31,7 @@ use windows::Win32::System::Threading::{
     PROCESS_SYNCHRONIZE, THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME,
 };
 
-use crate::error::win32_io_error;
+use crate::error::{io_context, win32_io_error};
 
 /// Sentinel: a null pointer means the handle has been consumed or is invalid.
 fn null_ptr() -> *mut c_void {
@@ -1134,7 +1134,7 @@ impl Walk {
     }
 
     /// Record that the initial thread of `process_pid` cannot be told from the threads `first` and
-    /// `second`.
+    /// `second`. No OS call failed, so the error has no OS code.
     fn fail_unidentified(&mut self, process_pid: u32, first: u32, second: u32) {
         let msg = format!(
             "the initial thread of pid {process_pid} cannot be identified: threads {first} and {second} have the same creation time"
@@ -1143,10 +1143,22 @@ impl Walk {
         self.last_err.get_or_insert_with(|| io::Error::other(msg));
     }
 
+    /// Record a failure that is cosca's own finding about a thread, not a failed OS call: the error
+    /// has no OS code.
     fn fail(&mut self, call: &str, tid: u32, process_pid: u32, cause: impl std::fmt::Display) -> Visit {
         let msg = format!("{call} failed for thread {tid} of pid {process_pid}: {cause}");
         log::warn!("resume_initial_threads: {msg}");
         self.last_err.get_or_insert_with(|| io::Error::other(msg));
+        Visit::Failed
+    }
+
+    /// Record the failure of the Win32 call `call`: the error keeps the call's Win32 code as its
+    /// source, and its kind.
+    fn fail_win32(&mut self, call: &str, tid: u32, process_pid: u32, cause: windows::core::Error) -> Visit {
+        let context = format!("{call} failed for thread {tid} of pid {process_pid}");
+        let err = io_context(context, win32_io_error(cause));
+        log::warn!("resume_initial_threads: {err}");
+        self.last_err.get_or_insert(err);
         Visit::Failed
     }
 }
@@ -1249,7 +1261,7 @@ fn resume_if_owned(tid: u32, process_pid: u32, walk: &mut Walk) -> Visit {
             ));
             return Visit::Denied;
         }
-        Err(e) => return walk.fail("OpenThread(query)", tid, process_pid, e),
+        Err(e) => return walk.fail_win32("OpenThread(query)", tid, process_pid, e),
     };
 
     match owner_of(&query) {
@@ -1258,12 +1270,12 @@ fn resume_if_owned(tid: u32, process_pid: u32, walk: &mut Walk) -> Visit {
             walk.skip(format!("thread {tid} now belongs to pid {owner}"));
             return Visit::Foreign { owner };
         }
-        Err(e) => return walk.fail("GetProcessIdOfThread", tid, process_pid, e),
+        Err(e) => return walk.fail_win32("GetProcessIdOfThread", tid, process_pid, e),
     }
 
     let resume = match open_for_resume(tid) {
         Ok(h) => h,
-        Err(e) => return walk.fail("OpenThread(suspend/resume)", tid, process_pid, e),
+        Err(e) => return walk.fail_win32("OpenThread(suspend/resume)", tid, process_pid, e),
     };
     match owner_of(&resume) {
         Ok(again) if again == process_pid => {}
@@ -1275,7 +1287,7 @@ fn resume_if_owned(tid: u32, process_pid: u32, walk: &mut Walk) -> Visit {
                 format_args!("opened a thread of pid {again}, not the thread just checked"),
             )
         }
-        Err(e) => return walk.fail("GetProcessIdOfThread", tid, process_pid, e),
+        Err(e) => return walk.fail_win32("GetProcessIdOfThread", tid, process_pid, e),
     }
 
     match resume_thread(&resume) {
@@ -1304,7 +1316,7 @@ fn resume_if_owned(tid: u32, process_pid: u32, walk: &mut Walk) -> Visit {
                 }
             ),
         ),
-        Err(e) => walk.fail("ResumeThread", tid, process_pid, e),
+        Err(e) => walk.fail_win32("ResumeThread", tid, process_pid, e),
     }
 }
 
@@ -1371,7 +1383,7 @@ fn initial_thread_id(process_pid: u32, tids: &[u32], walk: &mut Walk) -> Option<
                 "thread {tid} is gone, is not pid {process_pid}'s, or cannot be opened by the child's creator"
             )),
             Err((call, e)) => {
-                walk.fail(call, tid, process_pid, e);
+                walk.fail_win32(call, tid, process_pid, e);
                 return None;
             }
         }
@@ -1418,7 +1430,8 @@ fn earliest_created(times: impl IntoIterator<Item = (u64, u32)>) -> Earliest {
     }
 }
 
-/// The pid of the process at `raw_handle`, or an error naming `GetProcessId`.
+/// The pid of the process at `raw_handle`, or an error naming `GetProcessId` that keeps its Win32
+/// code as its source.
 ///
 /// `GetProcessId` answers 0 on failure, and a walk filtered to owner 0 would match the System
 /// Idle process instead of the child.
@@ -1426,15 +1439,16 @@ fn process_pid_of(raw_handle: HANDLE) -> io::Result<u32> {
     // SAFETY: `GetProcessId` only reads the handle; an invalid one is reported as 0.
     let pid = unsafe { GetProcessId(raw_handle) };
     if pid == 0 {
-        let cause = io::Error::last_os_error();
-        return Err(io::Error::other(format!(
-            "GetProcessId failed on the child's handle: {cause}"
-        )));
+        return Err(io_context(
+            "GetProcessId failed on the child's handle",
+            io::Error::last_os_error(),
+        ));
     }
     Ok(pid)
 }
 
 /// The error for a walk that resumed nothing, naming why every listed thread was skipped.
+/// No OS call failed, so the error has no OS code.
 fn none_resumed_error(process_pid: u32, last_skip: Option<&str>) -> io::Error {
     match last_skip {
         Some(reason) => io::Error::other(format!(

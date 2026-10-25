@@ -242,9 +242,9 @@ fn console_probe_error_surfaces() {
 }
 
 /// `ERROR_INVALID_HANDLE`, the bare Win32 code every `io::Error` cosca returns carries.
-const E_INVALID_HANDLE: i32 = 6;
+const ERROR_INVALID_HANDLE: i32 = 6;
 /// `ERROR_ACCESS_DENIED` — a different failure, which must NOT be classified as a missing console.
-const E_ACCESS_DENIED: i32 = 5;
+const ERROR_ACCESS_DENIED: i32 = 5;
 
 fn io_err(code: i32) -> std::io::Error {
     std::io::Error::from_raw_os_error(code)
@@ -252,7 +252,7 @@ fn io_err(code: i32) -> std::io::Error {
 
 #[skuld::test]
 fn invalid_handle_with_no_console_is_typed_no_console() {
-    let e = super::classify_ctrl_event_failure(4242, io_err(E_INVALID_HANDLE), Ok(false));
+    let e = super::classify_ctrl_event_failure(4242, io_err(ERROR_INVALID_HANDLE), Ok(false));
     let crate::error::Error::NoConsole { detail } = e else {
         panic!("expected NoConsole, got {e:?}");
     };
@@ -266,7 +266,7 @@ fn invalid_handle_with_no_console_is_typed_no_console() {
 #[skuld::test]
 fn invalid_handle_with_a_console_attached_stays_io() {
     // The probe contradicts the code: never claim a cause we just measured to be false.
-    let e = super::classify_ctrl_event_failure(1, io_err(E_INVALID_HANDLE), Ok(true));
+    let e = super::classify_ctrl_event_failure(1, io_err(ERROR_INVALID_HANDLE), Ok(true));
     assert!(matches!(e, crate::error::Error::Io(_)), "got {e:?}");
 }
 
@@ -282,23 +282,23 @@ fn duplicate_job_failure_carries_the_win32_code() {
     let crate::error::Error::Io(err) = err else {
         panic!("expected Error::Io, got {err:?}");
     };
-    assert_eq!(err.raw_os_error(), Some(E_INVALID_HANDLE), "{err:?}");
+    assert_eq!(err.raw_os_error(), Some(ERROR_INVALID_HANDLE), "{err:?}");
 }
 
 #[skuld::test]
 fn invalid_handle_with_a_failed_probe_stays_io() {
     let probe = Err(std::io::Error::from_raw_os_error(87)); // ERROR_INVALID_PARAMETER
-    let e = super::classify_ctrl_event_failure(1, io_err(E_INVALID_HANDLE), probe);
+    let e = super::classify_ctrl_event_failure(1, io_err(ERROR_INVALID_HANDLE), probe);
     assert!(matches!(e, crate::error::Error::Io(_)), "got {e:?}");
 }
 
 #[skuld::test]
 fn a_different_failure_code_stays_io_whatever_the_probe_says() {
     for console in [Ok(true), Ok(false)] {
-        let e = super::classify_ctrl_event_failure(1, io_err(E_ACCESS_DENIED), console);
+        let e = super::classify_ctrl_event_failure(1, io_err(ERROR_ACCESS_DENIED), console);
         assert!(matches!(e, crate::error::Error::Io(_)), "got {e:?}");
     }
-    let e = super::classify_ctrl_event_failure(1, io_err(E_ACCESS_DENIED), Err(io_err(87)));
+    let e = super::classify_ctrl_event_failure(1, io_err(ERROR_ACCESS_DENIED), Err(io_err(87)));
     assert!(matches!(e, crate::error::Error::Io(_)), "got {e:?}");
 }
 
@@ -717,6 +717,45 @@ fn walk_verdict_returns_the_first_failure() {
     );
 }
 
+/// The OS code of an `io_context` error, read from its source.
+fn source_os_code(e: &std::io::Error) -> Option<i32> {
+    std::error::Error::source(e.get_ref()?)
+        .and_then(|s| s.downcast_ref::<std::io::Error>())
+        .and_then(std::io::Error::raw_os_error)
+}
+
+/// A failed Win32 call on a thread reaches the caller with its plain Win32 code and the kind it
+/// classifies to, and the message still names the call, the thread and the pid.
+///
+/// Mutant: `fail_win32` builds `io::Error::other(msg)`, so the code is lost and the kind is `Other`.
+#[skuld::test]
+fn fail_win32_keeps_the_win32_code_and_kind() {
+    use super::{walk_verdict, Walk};
+    use windows::core::{Error, HRESULT};
+    let mut walk = Walk::default();
+    let cause = Error::from_hresult(HRESULT::from_win32(ERROR_ACCESS_DENIED as u32));
+    walk.fail_win32("ResumeThread", 1, 9, cause);
+    let err = walk_verdict(9, walk).expect_err("a failure");
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err:?}");
+    assert_eq!(source_os_code(&err), Some(ERROR_ACCESS_DENIED), "{err:?}");
+    assert!(
+        err.to_string()
+            .starts_with("ResumeThread failed for thread 1 of pid 9: "),
+        "{err}"
+    );
+}
+
+/// A tie in creation times is cosca's finding, not a failed call: no OS code.
+#[skuld::test]
+fn fail_unidentified_has_no_os_code() {
+    use super::{walk_verdict, Walk};
+    let mut walk = Walk::default();
+    walk.fail_unidentified(7, 12, 34);
+    let err = walk_verdict(7, walk).expect_err("a failure");
+    assert_eq!(err.raw_os_error(), None, "{err:?}");
+    assert_eq!(source_os_code(&err), None, "{err:?}");
+}
+
 /// When every listed thread was stale the walk fails, and the error names the last skip.
 #[skuld::test]
 fn walk_verdict_with_only_skips_names_the_last_skip() {
@@ -789,6 +828,16 @@ fn process_pid_of_rejects_a_handle_that_names_no_process() {
         err.to_string().contains("GetProcessId"),
         "error must name the call: {err}"
     );
+}
+
+/// `GetProcessId` failing reaches the caller with its Win32 code: a null handle is
+/// `ERROR_INVALID_HANDLE`.
+///
+/// Mutant: `process_pid_of` builds `io::Error::other(format!(..))`, losing the code and the kind.
+#[skuld::test]
+fn process_pid_of_failure_carries_the_win32_code() {
+    let err = super::process_pid_of(windows::Win32::Foundation::HANDLE::default()).expect_err("a null handle");
+    assert_eq!(source_os_code(&err), Some(ERROR_INVALID_HANDLE), "{err:?}");
 }
 
 /// A handle that names no process breaks the caller's contract. Debug builds assert it.
