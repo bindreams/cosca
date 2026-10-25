@@ -123,6 +123,20 @@ impl Parts<'_> {
     fn start(&self) -> usize {
         self.head + usize::from(self.root)
     }
+
+    /// For a UNC path with no share or a device path with no name, and no root separator after
+    /// it: whether the separator after the server (or after `\\.`) is there. `None` for any
+    /// other anchor. Such an anchor takes the first component appended to it as its own.
+    fn unfinished(&self) -> Option<bool> {
+        if self.root {
+            return None;
+        }
+        match self.anchor {
+            Anchor::Unc { server, share } if share.as_wtf8().is_empty() => Some(self.head > 2 + server.as_wtf8().len()),
+            Anchor::Device { name } if name.as_wtf8().is_empty() => Some(self.head > 3),
+            _ => None,
+        }
+    }
 }
 
 fn parts(bytes: &[u8]) -> Parts<'_> {
@@ -272,13 +286,15 @@ impl Path {
         }
     }
 
-    /// Whether the path needs no current directory: a drive and a root, a UNC path (even one
-    /// missing its share) or a device path.
+    /// Whether the path needs no current directory: a drive and a root, a UNC path with a server
+    /// and a share, or a device path longer than `\\.` or `\\?` alone.
     pub fn is_fully_qualified(&self) -> bool {
-        matches!(
-            self.anchor(),
-            Anchor::Drive { rooted: true, .. } | Anchor::Unc { .. } | Anchor::Device { .. }
-        )
+        match self.anchor() {
+            Anchor::Drive { rooted, .. } => rooted,
+            Anchor::Unc { server, share } => !server.as_wtf8().is_empty() && !share.as_wtf8().is_empty(),
+            Anchor::Device { .. } => self.bytes().len() > 3,
+            Anchor::None | Anchor::Rooted => false,
+        }
     }
 
     /// Whether the path is a drive with no root, `C:a`, relative to that drive's own current
@@ -320,7 +336,11 @@ impl Path {
     fn needs_separator_to_append(&self) -> bool {
         let parts = self.parts();
         let has_components = self.bytes().len() > parts.start();
-        has_components || !(parts.root || matches!(parts.anchor, Anchor::Drive { .. } | Anchor::None))
+        has_components
+            || match parts.unfinished() {
+                Some(has_separator) => !has_separator,
+                None => !(parts.root || matches!(parts.anchor, Anchor::Drive { .. } | Anchor::None)),
+            }
     }
 }
 
@@ -368,8 +388,8 @@ impl PurePath for Path {
     /// As std's `push`: an `rhs` with a drive, share or device replaces `self`; a rooted `rhs`
     /// keeps `self`'s drive, share or device and replaces the rest; any other `rhs` is appended
     /// after a `\` where one is needed (`C:` joined with `a` is `C:a`). An unfinished anchor takes
-    /// the first appended component as its own, as Win32 reads the string: `\\s` joined with `h`
-    /// is the share `\\s\h`. `\\?` joined with `x` is `\\?/x`, not the verbatim `\\?\x`.
+    /// the first appended component as its own, as Win32 reads the string: `\\s` and `\\s\`
+    /// joined with `h` are both the share `\\s\h`. `\\?` joined with `x` is `\\?/x`, not the verbatim `\\?\x`.
     fn join(&self, rhs: &Path) -> PathBuf {
         match rhs.anchor() {
             Anchor::None => {}
@@ -381,7 +401,9 @@ impl PurePath for Path {
                 ) {
                     return rhs.to_path_buf();
                 }
-                let mut bytes = [&self.bytes()[..lhs.head], rhs.bytes()].concat();
+                // An unfinished anchor's own separator is the rhs's root.
+                let head = lhs.head - usize::from(lhs.unfinished() == Some(true));
+                let mut bytes = [&self.bytes()[..head], rhs.bytes()].concat();
                 respell_verbatim(&mut bytes);
                 return PathBuf::from_wtf8(bytes);
             }

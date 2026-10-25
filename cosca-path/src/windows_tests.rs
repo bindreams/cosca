@@ -3,7 +3,7 @@ use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::hash::{BuildHasher, RandomState};
 
-use super::{is_separator, is_verbatim_spelling, parts, Anchor, Drive, OsStr, OsString, ParseError, Path, PathBuf};
+use super::{is_verbatim_spelling, parts, Anchor, Drive, OsStr, OsString, ParseError, Path, PathBuf};
 use crate::{Component, PurePath};
 
 fn p(s: &str) -> PathBuf {
@@ -360,7 +360,7 @@ fn shape_predicates_follow_the_anchor() {
         ("C:a", false, true, false),
         (r"C:\a", true, false, false),
         (r"\\s\h", true, false, false),
-        (r"\\s", true, false, false),
+        (r"\\s", false, false, false),
         (r"\\.\d", true, false, false),
         ("", false, false, false),
     ];
@@ -370,6 +370,35 @@ fn shape_predicates_follow_the_anchor() {
         assert_eq!(path.is_absolute(), qualified, "{input:?}");
         assert_eq!(path.is_drive_relative(), drive_relative, "{input:?}");
         assert_eq!(path.is_rooted(), rooted, "{input:?}");
+    }
+}
+
+/// A UNC path needs a non-empty server and share, and a device path more than `\\.` or `\\?`
+/// alone: otherwise it is not fully qualified, as main's `is_absolute_name` has it.
+///
+/// Mutant: any UNC anchor, or a bare `\\.` or `\\?`, counts as fully qualified.
+#[skuld::test]
+fn an_incomplete_unc_or_device_is_not_fully_qualified() {
+    let cases = [
+        (r"\\s", false),
+        (r"\\s\", false),
+        (r"\\", false),
+        (r"\\\", false),
+        (r"\\\h", false),
+        (r"\\s\\", false),
+        (r"\\.", false),
+        (r"\\?", false),
+        (r"\\s\h", true),
+        (r"\\s\h\", true),
+        (r"\\s\h\x", true),
+        (r"\\.\", true),
+        (r"\\.\d", true),
+        (r"\\?/", true),
+    ];
+    for (input, qualified) in cases {
+        let path = p(input);
+        assert_eq!(path.is_fully_qualified(), qualified, "{input:?}");
+        assert_eq!(path.is_absolute(), qualified, "{input:?}");
     }
 }
 
@@ -504,6 +533,30 @@ fn order_agrees_with_equality() {
     }
 }
 
+/// Choosing `/` or `\` for a separator changes no comparison: `cmp` gives the same answer for a
+/// pair of paths and for the same pair with every `/` written `\`.
+///
+/// Mutant: `cmp` compares the raw bytes, where `/` sorts before `\`.
+#[skuld::test]
+fn order_ignores_the_choice_of_separator() {
+    // Writing every `/` as `\` would spell the device path `\\?/x` as the verbatim `\\?\x`.
+    let pairs: Vec<(PathBuf, PathBuf)> = small_paths_up_to(4)
+        .iter()
+        .filter_map(|s| PathBuf::parse(s.as_str()).ok())
+        .filter_map(|path| {
+            let folded = path.to_str().unwrap().replace('/', "\\");
+            (!folded.starts_with(r"\\?\")).then(|| (path, p(&folded)))
+        })
+        .collect();
+    assert_eq!(p("C:/a").cmp(&p(r"C:\a")), Ordering::Equal);
+    assert_eq!(p("C:/b").cmp(&p(r"C:\a")), Ordering::Greater);
+    for (a, folded_a) in &pairs {
+        for (b, folded_b) in &pairs {
+            assert_eq!(a.cmp(b), folded_a.cmp(folded_b), "{a:?} against {b:?}");
+        }
+    }
+}
+
 /// Order is by anchor, then component by component.
 ///
 /// Mutant: order by the bytes, where `-` sorts before `\`.
@@ -581,6 +634,63 @@ fn join_completes_an_unfinished_anchor() {
             share: os("h")
         }
     );
+}
+
+/// An unfinished anchor takes the first appended component whether or not its own separator is
+/// there: `\\s\` joined with `b` is `\\s\b`, as `\\s` joined with `b` is. A separator that ends the
+/// path after a name or share (`\\s\\`) is a root, and the component after it stays a component.
+///
+/// Mutant: the join adds a second `\` after `\\s\`, so the share stays empty.
+#[skuld::test]
+fn join_completes_an_unfinished_anchor_with_or_without_its_separator() {
+    let cases = [
+        (r"\\s", "b", r"\\s\b"),
+        (r"\\s\", "b", r"\\s\b"),
+        (r"\\s", r"\b", r"\\s\b"),
+        (r"\\s\", r"\b", r"\\s\b"),
+        (r"\\", "b", r"\\\b"),
+        (r"\\\", "b", r"\\\b"),
+        (r"\\.", "b", r"\\.\b"),
+        (r"\\.\", "b", r"\\.\b"),
+        (r"\\.\", r"\b", r"\\.\b"),
+        (r"\\?", "b", r"\\?/b"),
+        (r"\\?/", "b", r"\\?/b"),
+        (r"\\?/", r"\b", r"\\?/b"),
+        (r"\\s\\", "b", r"\\s\\b"),
+    ];
+    for (lhs, rhs, want) in cases {
+        let joined = p(lhs).join(&p(rhs));
+        assert_eq!(joined.to_str(), Some(want), "{lhs:?} joined with {rhs:?}");
+    }
+}
+
+/// For every small path whose anchor lacks its share or device name but has the separator after
+/// the server (or `\\.`), dropping that separator changes no join.
+///
+/// Mutant: the join keeps the separator when the rhs is rooted, so `\\s\` joined with `\h` is
+/// `\\s\\h`.
+#[skuld::test]
+fn an_unfinished_anchor_joins_the_same_with_or_without_its_separator() {
+    let rhs_all = small_paths_up_to(3);
+    for lhs in small_paths_up_to(5)
+        .iter()
+        .filter_map(|s| PathBuf::parse(s.as_str()).ok())
+    {
+        if parts(lhs.bytes()).unfinished() != Some(true) {
+            continue;
+        }
+        let text = lhs.to_str().unwrap();
+        let without = p(&text[..text.len() - 1]);
+        assert_eq!(parts(without.bytes()).unfinished(), Some(false), "{lhs:?}");
+        // An empty rhs adds nothing, so it leaves each spelling as it was.
+        for rhs in rhs_all
+            .iter()
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| PathBuf::parse(s.as_str()).ok())
+        {
+            assert_eq!(lhs.join(&rhs), without.join(&rhs), "{lhs:?} joined with {rhs:?}");
+        }
+    }
 }
 
 /// Completing `\\?` never spells the verbatim prefix: the separator after it is written `/`, so
@@ -1042,13 +1152,8 @@ fn has_root_separator(path: &Path) -> bool {
     parts(path.bytes()).root
 }
 
-/// Whether the anchor would take a following component as its own: `\\server` with no share
-/// separator, or `\\.` alone.
+/// Whether the anchor would take a following component as its own: a UNC path with no share or a
+/// device path with no name, and no root separator after it.
 fn has_unfinished_anchor(path: &Path) -> bool {
-    let b = path.bytes();
-    match path.anchor() {
-        Anchor::Unc { .. } => !b[2..].iter().any(is_separator),
-        Anchor::Device { .. } => b.len() == 3,
-        _ => false,
-    }
+    parts(path.bytes()).unfinished().is_some()
 }
