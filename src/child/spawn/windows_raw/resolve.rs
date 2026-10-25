@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 
 use windows::core::PCWSTR;
 use windows::Win32::Storage::FileSystem::GetFullPathNameW;
-use windows::Win32::System::SystemInformation::{GetSystemDirectoryW, GetWindowsDirectoryW};
+use windows::Win32::System::SystemInformation::{GetSystemDirectoryW, GetSystemWindowsDirectoryW};
 
 use super::env_key::EnvKey;
 use super::env_snapshot::EnvSnapshot;
@@ -114,12 +114,16 @@ pub(crate) fn reject_not_fully_qualified(what: &str, path: &Path) -> Result<(), 
 /// left out because Win32 provides no function to query it, and this crate does not reconstruct
 /// it: Microsoft's own `CreateProcess` reference lists it as searched and says "There is no
 /// function that obtains the path of this directory... The name of this directory is System."
-/// `GetSystemDirectoryW`/`GetWindowsDirectoryW` cover only steps 3 and 5; step 4's path is
+/// `GetSystemDirectoryW`/`GetSystemWindowsDirectoryW` cover only steps 3 and 5; step 4's path is
 /// conventionally `System` under the Windows directory step 5 returns, though Microsoft's text does
 /// not spell out that relationship explicitly, and this crate does not do that derivation — it
 /// omits step 4 rather than reconstruct a path Win32 itself provides no accessor for. Queried here,
 /// at the one caller that has ambient OS access, rather than inside `crate::resolve` itself, which
 /// is deliberately parameterised so its rules stay exercisable from a POSIX host.
+///
+/// Both directories come from the API, never from `%SystemRoot%`/`%windir%`, which any process can
+/// set. `GetSystemWindowsDirectoryW`, not `GetWindowsDirectoryW`: under Terminal Services
+/// compatibility the latter can return a per-user directory.
 ///
 /// This function is [`crate::resolve::ResolveInput::system_dirs`] itself — `resolve_executable`
 /// passes it, unevaluated, as that field's closure, so `crate::resolve::resolve` only calls it from
@@ -136,7 +140,7 @@ pub(crate) fn reject_not_fully_qualified(what: &str, path: &Path) -> Result<(), 
 ///
 /// For a bare name, a step this process cannot determine fails that resolution, rather than being
 /// dropped and falling through to whatever is left: a failed `GetSystemDirectoryW` or
-/// `GetWindowsDirectoryW` call is returned to [`resolve_executable`]'s caller as a spawn error
+/// `GetSystemWindowsDirectoryW` call is returned to [`resolve_executable`]'s caller as a spawn error
 /// instead of letting resolution continue on the other directory, then `PATH`. This fails CLOSED,
 /// on purpose: it produces the same accidental widening [`crate::resolve::ResolveInput::system_dirs`]'s
 /// doc describes for a `system_dirs` closure that returns no directories on purpose, so
@@ -144,7 +148,7 @@ pub(crate) fn reject_not_fully_qualified(what: &str, path: &Path) -> Result<(), 
 /// error instead of a silent search-order change. That propagation is proven through the real
 /// `windows_system_dirs_via` wiring, for each of the two queries independently (one leg real, one
 /// forced to fail), by `a_bare_name_names_get_system_directory_w_when_the_system_query_fails` and
-/// its `_windows_directory_w_` mirror below. `windows_system_dirs`'s own zero-argument body — which
+/// `a_bare_name_names_get_system_windows_directory_w_when_the_system_windows_query_fails`. `windows_system_dirs`'s own zero-argument body — which
 /// real closures it hands to `windows_system_dirs_via`, and that it does not discard the `Result` —
 /// is, like `resolve_executable`'s binding above, covered by review rather than by a test: nothing
 /// portable can make the real Win32 calls it hardcodes fail.
@@ -157,15 +161,15 @@ fn windows_system_dirs() -> Result<Vec<PathBuf>, Error> {
             unsafe { GetSystemDirectoryW(buf) }
         },
         |buf| {
-            // SAFETY: see the `GetSystemDirectoryW` closure above — `GetWindowsDirectoryW` has the
+            // SAFETY: see the `GetSystemDirectoryW` closure above — `GetSystemWindowsDirectoryW` has the
             // identical contract.
-            unsafe { GetWindowsDirectoryW(buf) }
+            unsafe { GetSystemWindowsDirectoryW(buf) }
         },
     )
 }
 
 /// [`windows_system_dirs`] with each Win32 call injectable — `sys` for `GetSystemDirectoryW`
-/// (`System32`, step 3), `win` for `GetWindowsDirectoryW` (the Windows directory, step 5) — the
+/// (`System32`, step 3), `win` for `GetSystemWindowsDirectoryW` (the Windows directory, step 5) — the
 /// exact function `windows_system_dirs` calls, with only its two real closures replaced. A test can
 /// therefore force either query to fail independently and check that the resulting error names the
 /// correct API, which catches `windows_system_dirs` accidentally pairing the wrong closure with the
@@ -175,7 +179,10 @@ fn windows_system_dirs_via(
     sys: impl Fn(Option<&mut [u16]>) -> u32,
     win: impl Fn(Option<&mut [u16]>) -> u32,
 ) -> Result<Vec<PathBuf>, Error> {
-    Ok(vec![get_system_directory_via(sys)?, get_windows_directory_via(win)?])
+    Ok(vec![
+        get_system_directory_via(sys)?,
+        get_system_windows_directory_via(win)?,
+    ])
 }
 
 /// `GetSystemDirectoryW`, injectable — the exact call [`windows_system_dirs`] makes for `System32`
@@ -187,11 +194,11 @@ fn get_system_directory_via(f: impl Fn(Option<&mut [u16]>) -> u32) -> Result<Pat
     query_wide_dir("GetSystemDirectoryW", f)
 }
 
-/// `GetWindowsDirectoryW`, injectable — the [`windows_system_dirs_via`] `win` mirror of
+/// `GetSystemWindowsDirectoryW`, injectable — the [`windows_system_dirs_via`] `win` mirror of
 /// [`get_system_directory_via`]; see its doc, and [`windows_system_dirs`]'s for why step 4 (the
 /// 16-bit system directory) is not derived from this one's result.
-fn get_windows_directory_via(f: impl Fn(Option<&mut [u16]>) -> u32) -> Result<PathBuf, Error> {
-    query_wide_dir("GetWindowsDirectoryW", f)
+fn get_system_windows_directory_via(f: impl Fn(Option<&mut [u16]>) -> u32) -> Result<PathBuf, Error> {
+    query_wide_dir("GetSystemWindowsDirectoryW", f)
 }
 
 /// Call a `GetXDirectoryW`-shaped Win32 function, growing the buffer until the directory fits, and
@@ -211,7 +218,7 @@ fn query_wide_dir(api: &str, f: impl Fn(Option<&mut [u16]>) -> u32) -> Result<Pa
 /// The shared buffer-growth loop, preserving the Win32 failure reason.
 ///
 /// Same convention for every `GetXW`-shaped path API used here — `GetSystemDirectoryW`,
-/// `GetWindowsDirectoryW` and `GetFullPathNameW` alike: the copied length EXCLUDING the NUL on
+/// `GetSystemWindowsDirectoryW` and `GetFullPathNameW` alike: the copied length EXCLUDING the NUL on
 /// success, the required length INCLUDING it when the buffer was too small, and `0` on failure.
 fn grow_wide_buffer(f: impl Fn(Option<&mut [u16]>) -> u32) -> Result<PathBuf, std::io::Error> {
     let mut buf = vec![0u16; 260];
