@@ -159,8 +159,12 @@ impl Child {
             crate::elevation::front::Gate::Open => self.proc.kill().map_err(Error::Io)?,
             // A live front in its cgroup: killed through it, and nothing signalled after it.
             crate::elevation::front::Gate::CgroupOnly => {
+                let check = || self.group_number_holds();
                 self.attached
-                    .hard_kill_marking(&self.tree_killed)
+                    .hard_kill_marking(
+                        &self.tree_killed,
+                        &crate::containment::GroupRoot::new(self.proc.pidfd(), &check),
+                    )
                     .map_err(|e| crate::elevation::front::cgroup_kill_failed(self.front, self.id.pid(), e))?;
                 self.cgroup_kill_reached()?;
             }
@@ -290,7 +294,13 @@ impl Child {
         #[cfg(unix)]
         let held = self.proc.hold_reaps();
         #[cfg(unix)]
-        let (decided, earlier) = match call.graceful(|| held.state_and_own_reap()) {
+        let check = || super::tree_call::group_number_holds(self.id.pid(), held.state_and_own_reap());
+        #[cfg(unix)]
+        let group = crate::containment::GroupRoot::new(self.proc.pidfd(), &check);
+        #[cfg(not(unix))]
+        let group = crate::containment::GroupRoot::none();
+        #[cfg(unix)]
+        let (decided, earlier) = match call.graceful(|| held.state_and_own_reap(), &group) {
             crate::child::Graceful::Signal => (None, Some("the SIGTERM")),
             crate::child::Graceful::Sent { result, earlier } => (Some(result), earlier),
             crate::child::Graceful::End(e) => return Err(e),
@@ -310,7 +320,7 @@ impl Child {
             if let Some(result) = decided {
                 return result;
             }
-            self.terminate_tree_unchecked()
+            self.terminate_tree_unchecked(&group)
         };
 
         #[cfg(test)]

@@ -373,8 +373,12 @@ impl Child {
             }
             // Nothing is signalled after the cgroup kill: it could only be refused.
             Gate::CgroupOnly => {
+                let check = || self.group_number_holds();
                 self.attached
-                    .hard_kill_marking(&self.tree_killed)
+                    .hard_kill_marking(
+                        &self.tree_killed,
+                        &crate::containment::GroupRoot::new(self.proc.pidfd(), &check),
+                    )
                     .map_err(|e| crate::elevation::front::cgroup_kill_failed(self.front, self.id.pid(), e))?;
                 self.cgroup_kill_reached()?;
                 return Ok(crate::signal::Sent::Delivered);
@@ -645,6 +649,12 @@ impl Child {
         #[cfg(unix)]
         let held = self.proc.hold_reaps();
         #[cfg(unix)]
+        let check = || tree_call::group_number_holds(self.id.pid(), held.state_and_own_reap());
+        #[cfg(unix)]
+        let group = crate::containment::GroupRoot::new(self.proc.pidfd(), &check);
+        #[cfg(not(unix))]
+        let group = crate::containment::GroupRoot::none();
+        #[cfg(unix)]
         if let Some(result) = self
             .tree_call(crate::containment::dispatch::TreeSignal::Kill, "kill_tree", earlier)
             .root_checked(
@@ -653,11 +663,12 @@ impl Child {
                     held.signal_sent(crate::signal::Sig::Kill)
                         .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper()))
                 },
+                &group,
             )
         {
             return result;
         }
-        let group_result = self.attached.hard_kill_marking(&self.tree_killed);
+        let group_result = self.attached.hard_kill_marking(&self.tree_killed, &group);
         #[cfg(unix)]
         drop(held);
         // A TreeWalk that could not walk killed nothing, and the root's death would strand the
@@ -776,21 +787,36 @@ impl Child {
         #[cfg(unix)]
         let held = self.proc.hold_reaps();
         #[cfg(unix)]
+        let check = || tree_call::group_number_holds(self.id.pid(), held.state_and_own_reap());
+        #[cfg(unix)]
+        let group = crate::containment::GroupRoot::new(self.proc.pidfd(), &check);
+        #[cfg(not(unix))]
+        let group = crate::containment::GroupRoot::none();
+        #[cfg(unix)]
         if let Some(result) = self
             .tree_call(crate::containment::dispatch::TreeSignal::Term, "terminate_tree", None)
             .root_checked(
                 || held.state_and_own_reap(),
                 || held.signal_sent(crate::signal::Sig::Term).map_err(Error::Io),
+                &group,
             )
         {
             return result;
         }
-        self.terminate_tree_unchecked()
+        self.terminate_tree_unchecked(&group)
     }
 
-    /// The group's termination signal, with no look at the root's state.
-    fn terminate_tree_unchecked(&self) -> Result<(), Error> {
-        self.attached.terminate(self.proc.id())
+    /// The group's termination signal, with no look at the root's state but `group`'s own check
+    /// before each send by the root's number.
+    fn terminate_tree_unchecked(&self, group: &crate::containment::GroupRoot<'_>) -> Result<(), Error> {
+        self.attached.terminate(self.proc.id(), group)
+    }
+
+    /// Whether the root's pid still names its group, read now through its handle, for a caller that
+    /// holds none of its reaps off (a drop, a front's cgroup kill).
+    #[cfg(unix)]
+    fn group_number_holds(&self) -> Result<(), String> {
+        tree_call::group_number_holds(self.id.pid(), self.proc.state_and_own_reap())
     }
 
     /// A tree call on this child's tree ([`TreeCall`]).
@@ -1166,7 +1192,7 @@ impl Child {
         #[cfg(not(unix))]
         {
             let mut left = Vec::new();
-            let tree = self.attached.hard_kill();
+            let tree = self.attached.hard_kill(&crate::containment::GroupRoot::none());
             if let Err(e) = &tree {
                 let orphaned = if self.attached.hard_kill_refused_to_walk(&tree) {
                     "; the root is killed regardless, so its descendants may be orphaned"
@@ -1215,7 +1241,10 @@ impl Child {
             }
             gate => matches!(gate, crate::elevation::front::Gate::CgroupOnly),
         };
-        let kill = self.attached.hard_kill_for_drop(&view);
+        let check = || self.group_number_holds();
+        let kill = self
+            .attached
+            .hard_kill_for_drop(&view, &crate::containment::GroupRoot::new(self.proc.pidfd(), &check));
         report.skipped = kill.skipped;
         if let Err(e) = &kill.result {
             // A live member refused, or couldn't be confirmed — visible, not silently

@@ -247,7 +247,7 @@ mod linux {
 
         let skipped = child
             .attached
-            .hard_kill_marking_unless_reaped(&view, &killed)
+            .hard_kill_marking_unless_reaped(&view, &killed, &crate::containment::GroupRoot::trusted_for_test())
             .expect("a skip is not an error");
 
         assert!(skipped.is_some(), "the number-named kill must be skipped");

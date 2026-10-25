@@ -307,13 +307,19 @@ impl Child {
         #[cfg(not(unix))]
         let earlier = Some("the SIGTERM");
         #[cfg(unix)]
+        let check = || self.group_number_holds();
+        #[cfg(unix)]
+        let group = crate::containment::GroupRoot::new(self.root_pidfd(), &check);
+        #[cfg(not(unix))]
+        let group = crate::containment::GroupRoot::none();
+        #[cfg(unix)]
         let (decided, earlier) = {
             let call = self.tree_call(
                 crate::containment::dispatch::TreeSignal::Term,
                 "graceful_shutdown_tree",
                 None,
             );
-            match call.graceful(|| self.root_state_and_own_reap()) {
+            match call.graceful(|| self.root_state_and_own_reap(), &group) {
                 crate::child::Graceful::Signal => (None, Some("the SIGTERM")),
                 crate::child::Graceful::Sent { result, earlier } => (Some(result), earlier),
                 crate::child::Graceful::End(e) => return Err(e),
@@ -332,7 +338,7 @@ impl Child {
             if let Some(result) = decided {
                 return result;
             }
-            self.terminate_tree_unchecked()
+            self.terminate_tree_unchecked(&group)
         };
 
         #[cfg(test)]

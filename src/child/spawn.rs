@@ -133,7 +133,11 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     let tree = (child.containment().can_teardown() && !front_closed).then(|| {
         child
             .attached
-            .hard_kill_marking_unless_reaped(&view, &child.tree_killed)
+            .hard_kill_marking_unless_reaped(
+                &view,
+                &child.tree_killed,
+                &crate::containment::GroupRoot::new(child.proc.pidfd(), &|| child.group_number_holds()),
+            )
             .map(|s| skipped = s)
     });
     let tree_failure = match &tree {
@@ -873,6 +877,9 @@ enum Reach {
 #[cfg(target_os = "macos")]
 struct LateTree {
     reach: Reach,
+    /// The root's pid and the unique id it must still have for a send by its number.
+    pid: u32,
+    unique: u64,
     /// The root's identity, when the attach read it.
     id: Option<ProcessId>,
     /// The first sweep's failure. No later sweep is shown to reach what it missed, so none clears it:
@@ -894,6 +901,8 @@ impl LateTree {
         use crate::identity::Resolved;
         let mut tree = LateTree {
             reach: Reach::None,
+            pid,
+            unique,
             id: None,
             failed: None,
             succeeded_after: false,
@@ -937,7 +946,15 @@ impl LateTree {
         match (&self.reach, sweep) {
             (Reach::None, _) => {}
             (Reach::Attached(attached), Sweep::RootAlive | Sweep::RootKilled { zombie: true }) => {
-                let result = match attached.hard_kill_report() {
+                let (pid, unique) = (self.pid, self.unique);
+                // The root is this process's unreaped child, shown by a verified peek right before each
+                // send by its pid.
+                let check = || {
+                    let target = crate::wait::exit_only::Target::pid(pid, Some(unique));
+                    let state = crate::signal::RootState::of_peek(crate::wait::exit_only::peek_verified(&target));
+                    crate::child::tree_call::group_number_holds(pid, (state, false))
+                };
+                let result = match attached.hard_kill_report(&crate::containment::GroupRoot::new(None, &check)) {
                     (Err(e), _) => Err(e.to_string()),
                     (Ok(()), false) => Err("a member could not be killed".to_owned()),
                     (Ok(()), true) => Ok(()),

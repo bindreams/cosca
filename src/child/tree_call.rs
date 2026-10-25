@@ -2,7 +2,7 @@
 //! by the sync and async `kill_tree`, `terminate_tree` and `graceful_shutdown_tree`.
 
 use crate::containment::dispatch::TreeSignal;
-use crate::containment::{Attached, TreeKilled};
+use crate::containment::{Attached, GroupRoot, TreeKilled};
 use crate::error::Error;
 use crate::identity::RawPid;
 use crate::signal::{RootState, Sent};
@@ -68,6 +68,31 @@ pub(crate) fn root_number(attached: &Attached, pid: RawPid, state: impl FnOnce()
         }
     };
     RootNumber::MayNameAnother { why, exact_root }
+}
+
+/// Whether the root's pid, `pid`, still names its process group, from `state`: the root's own
+/// handle's answer and whether a `Reaped` is that handle's own reap, read right before a send by that
+/// number ([`GroupRoot::check`]). `Ok` while the root is unreaped, and after this handle's own reap
+/// while the pid names no process, as [`root_number`] decides. `Err` says why not.
+pub(crate) fn group_number_holds(pid: RawPid, state: (RootState, bool)) -> Result<(), String> {
+    use crate::identity::Resolved;
+    match state {
+        (RootState::Unreaped, _) => Ok(()),
+        (RootState::Reaped, true) => match crate::child::root_identity_now(pid) {
+            Resolved::Gone => Ok(()),
+            Resolved::Found(_) => Err(format!(
+                "this handle reaped the root, and another process holds its pid ({pid})"
+            )),
+            Resolved::Unknown => Err(format!(
+                "this handle reaped the root, and its pid ({pid}) could not be read"
+            )),
+        },
+        (RootState::Reaped, false) => Err(format!("the root (pid {pid}) was reaped elsewhere")),
+        (RootState::Unknown(e), _) => Err(format!(
+            "the root's own handle could not say whether it (pid {pid}) was reaped ({e})"
+        )),
+        (RootState::Unpinned, _) => Err(format!("the root (pid {pid}) is not pinned by this process")),
+    }
 }
 
 /// [`RootNumber`] after this handle's own reap, with the root's pid naming no process.
@@ -143,18 +168,24 @@ impl TreeCall<'_> {
     /// - `MayNameAnother`: [`number_skipped`](Self::number_skipped), after `signal_root` when the
     ///   handle still names the root exactly.
     ///
-    /// `signal_root` sends the call's own signal to the root through its handle.
+    /// `signal_root` sends the call's own signal to the root through its handle. `group` is the root
+    /// a send to its group needs.
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(unused_variables, reason = "only a macOS fd marker signals here")
+    )]
     pub(crate) fn root_checked(
         &self,
         state: impl FnOnce() -> (RootState, bool),
         signal_root: impl FnOnce() -> Result<Sent, Error>,
+        group: &GroupRoot<'_>,
     ) -> Option<Result<(), Error>> {
         match self.root_number(state) {
             RootNumber::Trusted => None,
             #[cfg(target_os = "macos")]
             RootNumber::Untrusted(root) => self.untrusted(&root),
             #[cfg(target_os = "macos")]
-            RootNumber::NoWalk => Some(self.no_walk()),
+            RootNumber::NoWalk => Some(self.no_walk(group)),
             RootNumber::Empty => Some(self.empty_group().unwrap_or_else(|| {
                 if let TreeSignal::Kill = self.signal {
                     self.killed.mark();
@@ -171,7 +202,11 @@ impl TreeCall<'_> {
     /// `graceful_shutdown_tree`'s decision on its one look at the root, for its `SIGTERM`: what
     /// [`root_checked`](Self::root_checked) decides, except that a root whose number may name
     /// another process is shut down through what still names it exactly, if anything does.
-    pub(crate) fn graceful(&self, state: impl FnOnce() -> (RootState, bool)) -> Graceful {
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(unused_variables, reason = "only a macOS fd marker signals here")
+    )]
+    pub(crate) fn graceful(&self, state: impl FnOnce() -> (RootState, bool), group: &GroupRoot<'_>) -> Graceful {
         match self.root_number(state) {
             RootNumber::Trusted => Graceful::Signal,
             // By identity alone. With no channel by identity there is nothing to signal, wait for or
@@ -188,7 +223,7 @@ impl TreeCall<'_> {
             // This handle reaped the root: its marker's group and holders, and no walk from its pid.
             #[cfg(target_os = "macos")]
             RootNumber::NoWalk => Graceful::Sent {
-                result: self.no_walk(),
+                result: self.no_walk(group),
                 earlier: Some("the SIGTERM"),
             },
             // The group is empty: nothing goes out by its number, only to the marker holders, if any.
@@ -229,7 +264,7 @@ impl TreeCall<'_> {
     /// The signal for [`RootNumber::NoWalk`]: the group and a macOS fd marker's holders, and no
     /// walk from the root's pid.
     #[cfg(target_os = "macos")]
-    fn no_walk(&self) -> Result<(), Error> {
+    fn no_walk(&self, group: &GroupRoot<'_>) -> Result<(), Error> {
         log::debug!(
             "{}({}): this handle reaped the root, and its pid names no process: its group and the marker holders \
              are signalled, and no walk runs from the pid, which would find none of the tree",
@@ -237,7 +272,7 @@ impl TreeCall<'_> {
             self.pid
         );
         self.attached
-            .signal_group_and_holders(self.signal, Some(self.killed))
+            .signal_group_and_holders(self.signal, Some(self.killed), group)
             .unwrap_or_else(|| {
                 debug_assert!(false, "only an fd marker with a group gets here");
                 Ok(())

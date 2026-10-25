@@ -824,6 +824,7 @@ pub(crate) mod fault {
 
 use std::io;
 
+use crate::containment::GroupRoot;
 use crate::error::Error;
 use crate::identity::{ProcessId, Resolved};
 
@@ -1053,8 +1054,8 @@ impl Marker {
     /// particular `is_teardown_mechanism_failure` (this file), rely on that distinction
     /// surviving intact through this return value; see `sweep`'s own doc for where it is
     /// preserved.
-    pub(crate) fn hard_kill(&self) -> Result<(), Error> {
-        self.hard_kill_impl(Scope::Full)
+    pub(crate) fn hard_kill(&self, root: &GroupRoot<'_>) -> Result<(), Error> {
+        self.hard_kill_impl(Scope::Full, root)
     }
 
     /// [`hard_kill`](Self::hard_kill) through the marker-holder channel alone. For a caller whose
@@ -1067,18 +1068,18 @@ impl Marker {
     /// holds it), because signalling a process by a pid this process does not pin can hit whoever
     /// reuses the pid.
     pub(crate) fn hard_kill_holders_only(&self, except: Option<ProcessId>) -> Result<(), Error> {
-        self.hard_kill_impl(Scope::HoldersOnly { except })
+        self.hard_kill_impl(Scope::HoldersOnly { except }, &GroupRoot::none())
     }
 
     /// [`hard_kill`](Self::hard_kill) through the group and the marker-holder channel, with no root
     /// identity kill and no walk from the root's pid: for a root this process reaped, whose pid
     /// names no process. Its children were reparented at its exit, so a walk would find only a
     /// later process's children.
-    pub(crate) fn hard_kill_group_and_holders(&self) -> Result<(), Error> {
-        self.hard_kill_impl(Scope::GroupAndHolders)
+    pub(crate) fn hard_kill_group_and_holders(&self, root: &GroupRoot<'_>) -> Result<(), Error> {
+        self.hard_kill_impl(Scope::GroupAndHolders, root)
     }
 
-    fn hard_kill_impl(&self, scope: Scope) -> Result<(), Error> {
+    fn hard_kill_impl(&self, scope: Scope, root: &GroupRoot<'_>) -> Result<(), Error> {
         self.check_read_end_still_valid()?;
         let mut seen: std::collections::HashSet<ProcessId> = std::collections::HashSet::new();
         // Folds together across every pass — see `sweep_pass`'s doc for why an earlier pass's
@@ -1101,6 +1102,7 @@ impl Marker {
                 &mut incomplete,
                 first_pass,
                 scope,
+                root,
             );
             first_pass = false;
             if !progressed {
@@ -1117,23 +1119,23 @@ impl Marker {
     /// `terminate_tree()` — a blocking API with no timeout — forever. One pass, matching
     /// `term_group`'s own cooperative, best-effort contract; `hard_kill` (`kill_tree`) is the
     /// guaranteed sweep.
-    pub(crate) fn terminate(&self) -> Result<(), Error> {
-        self.terminate_impl(Scope::Full)
+    pub(crate) fn terminate(&self, root: &GroupRoot<'_>) -> Result<(), Error> {
+        self.terminate_impl(Scope::Full, root)
     }
 
     /// [`terminate`](Self::terminate) through the marker-holder channel alone, as
     /// [`hard_kill_holders_only`](Self::hard_kill_holders_only) does for the kill.
     pub(crate) fn terminate_holders_only(&self, except: Option<ProcessId>) -> Result<(), Error> {
-        self.terminate_impl(Scope::HoldersOnly { except })
+        self.terminate_impl(Scope::HoldersOnly { except }, &GroupRoot::none())
     }
 
     /// [`terminate`](Self::terminate) through the group and the marker-holder channel, as
     /// [`hard_kill_group_and_holders`](Self::hard_kill_group_and_holders) does for the kill.
-    pub(crate) fn terminate_group_and_holders(&self) -> Result<(), Error> {
-        self.terminate_impl(Scope::GroupAndHolders)
+    pub(crate) fn terminate_group_and_holders(&self, root: &GroupRoot<'_>) -> Result<(), Error> {
+        self.terminate_impl(Scope::GroupAndHolders, root)
     }
 
-    fn terminate_impl(&self, scope: Scope) -> Result<(), Error> {
+    fn terminate_impl(&self, scope: Scope, root: &GroupRoot<'_>) -> Result<(), Error> {
         self.check_read_end_still_valid()?;
         let mut seen: std::collections::HashSet<ProcessId> = std::collections::HashSet::new();
         let mut group_result: Result<(), Error> = Ok(());
@@ -1145,6 +1147,7 @@ impl Marker {
             &mut incomplete,
             true,
             scope,
+            root,
         );
         Self::finish_sweep(self.handle, group_result, incomplete)
     }
@@ -1317,6 +1320,7 @@ impl Marker {
         incomplete: &mut bool,
         first_pass: bool,
         scope: Scope,
+        root: &GroupRoot<'_>,
     ) -> bool {
         let walk = matches!(scope, Scope::Full);
         let group = matches!(scope, Scope::Full | Scope::GroupAndHolders);
@@ -1465,8 +1469,8 @@ impl Marker {
                 // ordinary refusal — preserved as-is here, NOT collapsed into a stringified
                 // `io::Error` (see this fn's doc, and `combine_group_errors` below).
                 let this_pass_group_result: Result<(), Error> = match (self.pgid, signal) {
-                    (Some(pgid), nix::sys::signal::Signal::SIGKILL) => crate::containment::unix::kill_group(pgid),
-                    (Some(pgid), _) => crate::containment::unix::term_group(pgid),
+                    (Some(pgid), nix::sys::signal::Signal::SIGKILL) => crate::containment::unix::kill_group(pgid, root),
+                    (Some(pgid), _) => crate::containment::unix::term_group(pgid, root),
                     (None, _) => Ok(()),
                 };
                 *group_result = match (std::mem::replace(group_result, Ok(())), this_pass_group_result) {

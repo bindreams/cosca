@@ -624,7 +624,7 @@ fn hard_kill_propagates_a_kill_the_kernel_refused() {
 
     let attached = crate::containment::Attached::Cgroup(leaf);
     assert!(
-        attached.hard_kill().is_err(),
+        attached.hard_kill(&crate::containment::GroupRoot::none()).is_err(),
         "Attached::Cgroup must propagate like every sibling arm; swallowing it makes \
          kill_tree() report a completed teardown over a live tree"
     );
@@ -668,10 +668,10 @@ fn terminate_reads_an_already_removed_leaf_as_a_completed_teardown() {
 
     let attached = crate::containment::Attached::Cgroup(leaf);
     assert!(
-        attached.terminate(0).is_ok(),
+        attached.terminate(0, &crate::containment::GroupRoot::none()).is_ok(),
         "terminate and hard_kill must agree about an already-gone leaf"
     );
-    assert!(attached.hard_kill().is_ok());
+    assert!(attached.hard_kill(&crate::containment::GroupRoot::none()).is_ok());
 }
 
 // Drop's leaf-removal reporting -----

@@ -23,9 +23,44 @@ pub(crate) type Entry = (u32, Sig, Via);
 /// number. Kept apart from [`Entry`] so the by-handle log of the drops keeps its shape.
 pub(crate) type IdentityEntry = (u32, i32);
 
+/// One step of a send to a process group, in order: a check of the root, or a send.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GroupStep {
+    /// The root's pid was checked to still name its group.
+    Check,
+    /// The signal to the whole group.
+    Group(Route),
+    /// The signal to the leader alone, after the group's was refused.
+    Leader(Route),
+    /// A member's resend.
+    Member(Route),
+}
+
+/// How a [`GroupStep`] send named its target.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code, reason = "only Linux sends through a pidfd")]
+pub(crate) enum Route {
+    Pidfd,
+    Number,
+}
+
 thread_local! {
     static LOG: RefCell<Option<Vec<Entry>>> = const { RefCell::new(None) };
     static BY_IDENTITY: RefCell<Option<Vec<IdentityEntry>>> = const { RefCell::new(None) };
+    #[cfg(unix)]
+    static GROUP: RefCell<Option<Vec<GroupStep>>> = const { RefCell::new(None) };
+}
+
+/// Records one step of a send to a process group on this thread, if a [`Capture`] is live.
+#[cfg(unix)]
+pub(crate) fn record_group(step: GroupStep) {
+    GROUP.with(|log| {
+        if let Some(steps) = log.borrow_mut().as_mut() {
+            steps.push(step);
+        }
+    });
 }
 
 /// Records one identity-checked send attempt by number (`signo`), if a [`Capture`] is live.
@@ -58,6 +93,8 @@ impl Capture {
             *log = Some(Vec::new());
         });
         BY_IDENTITY.with(|log| *log.borrow_mut() = Some(Vec::new()));
+        #[cfg(unix)]
+        GROUP.with(|log| *log.borrow_mut() = Some(Vec::new()));
         Capture(())
     }
 
@@ -74,9 +111,19 @@ impl Capture {
     }
 }
 
+impl Capture {
+    /// The steps of the sends to process groups, in order.
+    #[cfg(unix)]
+    pub(crate) fn group_steps(&self) -> Vec<GroupStep> {
+        GROUP.with(|log| log.borrow().clone().expect("a live capture has a log"))
+    }
+}
+
 impl Drop for Capture {
     fn drop(&mut self) {
         LOG.with(|log| *log.borrow_mut() = None);
         BY_IDENTITY.with(|log| *log.borrow_mut() = None);
+        #[cfg(unix)]
+        GROUP.with(|log| *log.borrow_mut() = None);
     }
 }

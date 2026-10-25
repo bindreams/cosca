@@ -46,6 +46,7 @@ use std::io;
 use nix::sys::signal::{kill, killpg, Signal};
 use nix::unistd::Pid;
 
+use crate::containment::GroupRoot;
 use crate::error::Error;
 
 /// Apply pre-spawn group setup to `std_cmd` (root spawns only).
@@ -89,12 +90,12 @@ pub(crate) fn set_session(std_cmd: &mut std::process::Command) {
 /// only an adversarial fork-bomb) is never seen, never signalled, and does not affect the
 /// verdict. `Attached::Cgroup` (Linux cgroup v2, `cgroup.kill`) is fork-proof where this
 /// mechanism structurally cannot be; prefer it when that atomicity matters.
-pub(crate) fn kill_group(pgid: i32) -> Result<(), Error> {
+pub(crate) fn kill_group(pgid: i32, root: &GroupRoot<'_>) -> Result<(), Error> {
     #[cfg(test)]
     if let Some(outcome) = fault::intercept_kill_group(pgid) {
         return outcome;
     }
-    signal_group(pgid, Signal::SIGKILL)
+    signal_group(pgid, Signal::SIGKILL, root)
 }
 
 /// Test seam for [`kill_group`]. Thread-local, with an RAII reset.
@@ -110,6 +111,44 @@ pub(crate) mod fault {
         static FAIL: Cell<bool> = const { Cell::new(false) };
         static ON_TERM: RefCell<Option<OnSend>> = const { RefCell::new(None) };
         static ON_KILL: RefCell<Option<OnSend>> = const { RefCell::new(None) };
+        static REFUSE_GROUP: Cell<bool> = const { Cell::new(false) };
+        static REFUSE_FLAG: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// While the guard lives, every send to a whole group on THIS thread (the `killpg`, or the
+    /// group send through the root's pidfd) is refused with `EPERM` and not sent, as the kernel
+    /// refuses a group whose every member belongs to another user. The leader's signal and the
+    /// members' resends after it are sent for real.
+    pub(crate) fn refuse_group_sends() -> Refused {
+        REFUSE_GROUP.with(|r| r.set(true));
+        Refused(())
+    }
+
+    /// While the guard lives, the group send through the root's pidfd on THIS thread fails with
+    /// `EINVAL` and is not sent, as a kernel before 6.9 refuses `PIDFD_SIGNAL_PROCESS_GROUP`.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn refuse_pidfd_group_flag() -> Refused {
+        REFUSE_FLAG.with(|r| r.set(true));
+        Refused(())
+    }
+
+    #[must_use = "the sends go out again as soon as the guard is dropped"]
+    pub(crate) struct Refused(());
+
+    impl Drop for Refused {
+        fn drop(&mut self) {
+            REFUSE_GROUP.with(|r| r.set(false));
+            REFUSE_FLAG.with(|r| r.set(false));
+        }
+    }
+
+    pub(super) fn group_sends_refused() -> bool {
+        REFUSE_GROUP.with(Cell::get)
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code, reason = "only Linux has the flag"))]
+    pub(super) fn pidfd_group_flag_refused() -> bool {
+        REFUSE_FLAG.with(Cell::get)
     }
 
     /// Runs `slot`'s hook, if any, on `pgid`, with the slot free while it runs.
@@ -223,12 +262,12 @@ pub(crate) mod fault {
 
 /// Send the graceful signal to the whole process group, then confirm no live
 /// member refused it. See [`signal_group`].
-pub(crate) fn term_group(pgid: i32) -> Result<(), Error> {
+pub(crate) fn term_group(pgid: i32, root: &GroupRoot<'_>) -> Result<(), Error> {
     #[cfg(test)]
     if fault::intercept_term_group(pgid) {
         return Ok(());
     }
-    signal_group(pgid, Signal::SIGTERM)
+    signal_group(pgid, Signal::SIGTERM, root)
 }
 
 /// Signal the group and report what was actually achieved. `killpg`'s return value is a
@@ -239,7 +278,7 @@ pub(crate) fn term_group(pgid: i32) -> Result<(), Error> {
 /// A `pgid` of `0` signals the CALLER's own process group (per POSIX); a negative one risks
 /// the broadcast/double-negation hazard this file's Background measures. A check placed after
 /// the dangerous syscall it claims to guard is not a guard.
-fn signal_group(pgid: i32, signal: Signal) -> Result<(), Error> {
+fn signal_group(pgid: i32, signal: Signal, root: &GroupRoot<'_>) -> Result<(), Error> {
     // NOT a debug_assert!: an invalid `pgid` reaching this function is a directly and deliberately
     // TESTED, ordinary input-validation outcome, not a "should never happen" internal contract —
     // `kill_group_and_term_group_reject_non_positive_pgid` (this file) calls this path with
@@ -253,7 +292,7 @@ fn signal_group(pgid: i32, signal: Signal) -> Result<(), Error> {
             source: None,
         });
     }
-    match killpg(Pid::from_raw(pgid), signal) {
+    match send_to_group(pgid, signal, root)? {
         Ok(()) => {}
         // NOT trusted as "definitely empty": Linux's __kill_pgrp_info returns the LAST
         // per-member error once none succeed, so ESRCH can mean "empty" or "a departed member
@@ -263,18 +302,105 @@ fn signal_group(pgid: i32, signal: Signal) -> Result<(), Error> {
         // Preserved exactly as before this fix: the pgid == pid direct-to-leader fallback
         // for the sudo-wrapper case (sibling #54 territory — do not remove or reshape).
         Err(nix::errno::Errno::EPERM) => {
-            _ = signal_direct(pgid, signal);
+            _ = signal_direct(pgid, signal, root);
         }
         Err(e) => return Err(Error::Io(io::Error::from(e))),
     }
-    verify(pgid, signal)
+    verify(pgid, signal, root)
+}
+
+/// The send to the whole group, and the kernel's answer to it. On Linux it goes through the root's
+/// pidfd with `PIDFD_SIGNAL_PROCESS_GROUP`, which names the group exactly: the kernel resolves it
+/// from the pidfd's process, not from a number. Only when the kernel refuses the flag (`EINVAL`,
+/// before Linux 6.9), or the root has no pidfd, and always on macOS, it goes by the group's number,
+/// right after the root's check. A failed check sends nothing and is the call's error.
+///
+/// The check and the `killpg` are two syscalls: a reaper elsewhere in the process can reap the root
+/// between them, and the number can then name another group. That window is a standing property of
+/// process-group containment without the flag; a program with such a reaper should use cgroup
+/// containment, whose kill names no pid.
+fn send_to_group(pgid: i32, signal: Signal, root: &GroupRoot<'_>) -> Result<Result<(), nix::errno::Errno>, Error> {
+    #[cfg(target_os = "linux")]
+    if let Some(pidfd) = root.pidfd() {
+        match pidfd_signal(pidfd, signal, Through::Group) {
+            Err(nix::errno::Errno::EINVAL) => log::debug!(
+                "containment::unix: the kernel refused PIDFD_SIGNAL_PROCESS_GROUP (before Linux 6.9), so process                  group {pgid} is signalled by its number"
+            ),
+            sent => return Ok(sent),
+        }
+    }
+    root.check().map_err(|why| Error::Unassessable {
+        detail: format!(
+            "process group {pgid}: {why}, so its number may name another group, and {signal} was not sent by it"
+        ),
+        source: None,
+    })?;
+    #[cfg(test)]
+    {
+        crate::send_log::record_group(crate::send_log::GroupStep::Group(crate::send_log::Route::Number));
+        if fault::group_sends_refused() {
+            return Ok(Err(nix::errno::Errno::EPERM));
+        }
+    }
+    Ok(killpg(Pid::from_raw(pgid), signal))
+}
+
+/// What a send through the root's pidfd reaches.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Through {
+    /// The root's whole process group (`PIDFD_SIGNAL_PROCESS_GROUP`).
+    Group,
+    /// The root alone.
+    Leader,
+}
+
+/// `signal` through `pidfd`, to what `through` names. The kernel's errno is the answer: `EINVAL`
+/// for a flag it does not know.
+#[cfg(target_os = "linux")]
+fn pidfd_signal(pidfd: std::os::fd::BorrowedFd<'_>, signal: Signal, through: Through) -> Result<(), nix::errno::Errno> {
+    use std::os::fd::AsRawFd as _;
+    #[cfg(test)]
+    {
+        use crate::send_log::{record_group, GroupStep, Route};
+        record_group(match through {
+            Through::Group => GroupStep::Group(Route::Pidfd),
+            Through::Leader => GroupStep::Leader(Route::Pidfd),
+        });
+        if through == Through::Group && fault::pidfd_group_flag_refused() {
+            return Err(nix::errno::Errno::EINVAL);
+        }
+        if through == Through::Group && fault::group_sends_refused() {
+            return Err(nix::errno::Errno::EPERM);
+        }
+    }
+    let flags = match through {
+        Through::Group => libc::PIDFD_SIGNAL_PROCESS_GROUP,
+        Through::Leader => 0,
+    };
+    // SAFETY: `pidfd` is a live pidfd for the call's duration, and a null `siginfo_t` asks the kernel
+    // to fill in the defaults, as `kill(2)` does.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd(),
+            signal as libc::c_int,
+            std::ptr::null::<libc::siginfo_t>(),
+            flags,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(nix::errno::Errno::last())
+    }
 }
 
 /// Turn the group's actual membership into a contract answer — the single source of truth
 /// regardless of what `killpg` reported. See `group`'s module docs for the listing and
 /// signal-delivery design (one pass; `SIGKILL` resends for real, `SIGTERM` only probes).
-fn verify(pgid: i32, signal: Signal) -> Result<(), Error> {
-    match group::state(pgid, signal) {
+fn verify(pgid: i32, signal: Signal, root: &GroupRoot<'_>) -> Result<(), Error> {
+    match group::state(pgid, signal, root) {
         group::GroupState::Cleared => Ok(()),
         group::GroupState::Refused { refused, unassessable } => {
             let list = |pids: &[u32]| pids.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ");
@@ -331,8 +457,27 @@ fn verify(pgid: i32, signal: Signal) -> Result<(), Error> {
 /// Its failure is intentionally NOT propagated (best-effort; `verify`'s listing decides the
 /// contract answer either way), but is now logged rather than silently discarded, so a
 /// genuine `SIGTERM` delivery failure here — the one case that matters — leaves a trace.
-fn signal_direct(pid: i32, signal: Signal) -> io::Result<()> {
-    match kill(Pid::from_raw(pid), signal) {
+fn signal_direct(pid: i32, signal: Signal, root: &GroupRoot<'_>) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    let sent = match root.pidfd() {
+        Some(pidfd) => Some(pidfd_signal(pidfd, signal, Through::Leader)),
+        None => None,
+    };
+    #[cfg(not(target_os = "linux"))]
+    let sent = None;
+    let sent = match sent {
+        Some(sent) => sent,
+        None => {
+            if let Err(why) = root.check() {
+                log::debug!("containment::unix::signal_direct: {why}, so {signal} was not sent to pid {pid}");
+                return Err(io::Error::other(why));
+            }
+            #[cfg(test)]
+            crate::send_log::record_group(crate::send_log::GroupStep::Leader(crate::send_log::Route::Number));
+            kill(Pid::from_raw(pid), signal)
+        }
+    };
+    match sent {
         Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
         Err(e) => {
             log::debug!("containment::unix::signal_direct: kill({pid}, {signal}) failed: {e}");
@@ -347,3 +492,7 @@ mod group;
 #[cfg(test)]
 #[path = "unix_tests.rs"]
 mod unix_tests;
+
+#[cfg(test)]
+#[path = "unix_send_tests.rs"]
+mod unix_send_tests;

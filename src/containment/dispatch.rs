@@ -439,15 +439,19 @@ impl Attached {
     }
 
     /// Hard-kill the contained tree (best-effort; already-gone is success).
-    pub(crate) fn hard_kill(&self) -> Result<(), crate::error::Error> {
-        self.hard_kill_report().0
+    pub(crate) fn hard_kill(&self, root: &crate::containment::GroupRoot<'_>) -> Result<(), crate::error::Error> {
+        self.hard_kill_report(root).0
     }
 
     /// [`hard_kill`](Self::hard_kill), and record in `killed` that the tree is gone when the kill
     /// was complete: `Ok`, and for a `TreeWalk` also a walk with no unresolved member. A kill
     /// that failed or left members behind marks nothing.
-    pub(crate) fn hard_kill_marking(&self, killed: &TreeKilled) -> Result<(), crate::error::Error> {
-        let (result, complete) = self.hard_kill_report();
+    pub(crate) fn hard_kill_marking(
+        &self,
+        killed: &TreeKilled,
+        root: &crate::containment::GroupRoot<'_>,
+    ) -> Result<(), crate::error::Error> {
+        let (result, complete) = self.hard_kill_report(root);
         if result.is_ok() && complete {
             killed.mark();
         }
@@ -455,17 +459,27 @@ impl Attached {
     }
 
     /// The kill's result, and whether it was complete. Only a `TreeWalk`'s `Ok` can be incomplete.
-    pub(crate) fn hard_kill_report(&self) -> (Result<(), crate::error::Error>, bool) {
+    ///
+    /// `root` is the root a send to a group named by its pid needs (see
+    /// [`GroupRoot`](crate::containment::GroupRoot)); every other mechanism ignores it.
+    #[cfg_attr(
+        not(unix),
+        allow(unused_variables, reason = "only Unix names a group by the root's pid")
+    )]
+    pub(crate) fn hard_kill_report(
+        &self,
+        root: &crate::containment::GroupRoot<'_>,
+    ) -> (Result<(), crate::error::Error>, bool) {
         let result = match self {
             Attached::None | Attached::Delegated => Ok(()),
             #[cfg(unix)]
-            Attached::ProcessGroup(pgid) => crate::containment::unix::kill_group(*pgid),
+            Attached::ProcessGroup(pgid) => crate::containment::unix::kill_group(*pgid, root),
             #[cfg(target_os = "linux")]
             Attached::Cgroup(leaf) => leaf.hard_kill(),
             #[cfg(windows)]
             Attached::JobObject(job) => job.hard_kill().map_err(Error::Io),
             #[cfg(target_os = "macos")]
-            Attached::FdMarker(m) => m.hard_kill(),
+            Attached::FdMarker(m) => m.hard_kill(root),
             Attached::TreeWalk(root) => {
                 return match crate::containment::treewalk::hard_kill(*root) {
                     Ok(complete) => (Ok(()), complete),
@@ -486,7 +500,11 @@ impl Attached {
     }
 
     /// Send the graceful termination signal to the group (signal-only).
-    pub(crate) fn terminate(&self, _child_pid: u32) -> Result<(), Error> {
+    #[cfg_attr(
+        not(unix),
+        allow(unused_variables, reason = "only Unix names a group by the root's pid")
+    )]
+    pub(crate) fn terminate(&self, _child_pid: u32, root: &crate::containment::GroupRoot<'_>) -> Result<(), Error> {
         match self {
             Attached::None | Attached::Delegated => {
                 debug_assert!(
@@ -500,13 +518,13 @@ impl Attached {
                 })
             }
             #[cfg(unix)]
-            Attached::ProcessGroup(pgid) => crate::containment::unix::term_group(*pgid),
+            Attached::ProcessGroup(pgid) => crate::containment::unix::term_group(*pgid, root),
             #[cfg(target_os = "linux")]
             Attached::Cgroup(leaf) => leaf.terminate().map_err(Error::Io),
             #[cfg(windows)]
             Attached::JobObject(_) => crate::containment::windows::terminate(_child_pid),
             #[cfg(target_os = "macos")]
-            Attached::FdMarker(m) => m.terminate(),
+            Attached::FdMarker(m) => m.terminate(root),
             Attached::TreeWalk(root) => crate::containment::treewalk::terminate(*root),
         }
     }
@@ -625,10 +643,10 @@ impl Attached {
     /// Logs nothing above `debug`: what the skip left undone is returned in
     /// [`DropKill::skipped`], for the drop's one warn.
     #[cfg(unix)]
-    pub(crate) fn hard_kill_for_drop(&self, view: &DropView) -> DropKill {
+    pub(crate) fn hard_kill_for_drop(&self, view: &DropView, root: &crate::containment::GroupRoot<'_>) -> DropKill {
         let Some(skipped) = view.skipped_action(self) else {
             return DropKill {
-                result: self.hard_kill(),
+                result: self.hard_kill(root),
                 skipped: None,
             };
         };
@@ -746,13 +764,14 @@ impl Attached {
         &self,
         signal: TreeSignal,
         mark: Option<&TreeKilled>,
+        root: &crate::containment::GroupRoot<'_>,
     ) -> Option<Result<(), Error>> {
         let Attached::FdMarker(m) = self else {
             return None;
         };
         let result = match signal {
-            TreeSignal::Kill => m.hard_kill_group_and_holders(),
-            TreeSignal::Term => m.terminate_group_and_holders(),
+            TreeSignal::Kill => m.hard_kill_group_and_holders(root),
+            TreeSignal::Term => m.terminate_group_and_holders(root),
         };
         if let (Ok(()), TreeSignal::Kill, Some(killed)) = (&result, signal, mark) {
             killed.mark();
@@ -777,9 +796,10 @@ impl Attached {
         &self,
         view: &DropView,
         killed: &TreeKilled,
+        root: &crate::containment::GroupRoot<'_>,
     ) -> Result<Option<String>, crate::error::Error> {
         let Some(skipped) = view.skipped_action(self) else {
-            return self.hard_kill_marking(killed).map(|()| None);
+            return self.hard_kill_marking(killed, root).map(|()| None);
         };
         match self {
             #[cfg(target_os = "macos")]
