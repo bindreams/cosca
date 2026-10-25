@@ -85,19 +85,28 @@ jobs:
 
       - uses: ./.github/actions/setup-rust
 
-      - name: Re-verify manifest version matches the release
+      # `cosca-path` and `cosca` release in lockstep at one version. Each is picked
+      # by name: `.packages[0]` is whichever member cargo lists first.
+      - name: Re-verify manifest versions match the release
         env:
           VERSION: ${{ steps.version.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
-          MANIFEST="$(cargo metadata --no-deps --locked --format-version 1 | jq -r '.packages[] | select(.name == "cosca") | .version')"
-          if [ "$MANIFEST" != "$VERSION" ]; then
-            echo "::error::Checked-out commit declares $MANIFEST but this dispatch asked for $VERSION"
-            exit 1
-          fi
+          METADATA="$(cargo metadata --no-deps --locked --format-version 1)"
+          for crate in cosca-path cosca; do
+            MANIFEST="$(jq -r --arg name "$crate" '.packages[] | select(.name == $name) | .version' <<<"$METADATA")"
+            if [ "$MANIFEST" != "$VERSION" ]; then
+              echo "::error::Checked-out commit declares '${MANIFEST}' for $crate but this dispatch asked for $VERSION"
+              exit 1
+            fi
+          done
 
-      - name: Check crates.io for an existing version
+      # Per crate, so a re-dispatch after a partial publish (one crate uploaded,
+      # the next failed) publishes only what is missing. The same skip covers the
+      # first `cosca-path` release, which the owner uploads by hand (see the
+      # note on the publish step).
+      - name: Check crates.io for existing versions
         id: crates_check
         env:
           VERSION: ${{ steps.version.outputs.version }}
@@ -106,34 +115,61 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          CODE=$(curl -sL -A "$CRATES_UA" -o /dev/null -w "%{http_code}" \
-            "https://crates.io/api/v1/crates/cosca/${VERSION}")
-          case "$CODE" in
-            200)
-              echo "already_published=true" >> "$GITHUB_OUTPUT"
-              echo "Version ${VERSION} already on crates.io; skipping publish."
-              ;;
-            404) echo "already_published=false" >> "$GITHUB_OUTPUT" ;;
-            *)
-              echo "::error::Unexpected HTTP $CODE from crates.io API"
-              exit 1
-              ;;
-          esac
+          # Dependency first, as `cargo publish` orders them anyway.
+          to_publish=()
+          for crate in cosca-path cosca; do
+            CODE=$(curl -sL -A "$CRATES_UA" -o /dev/null -w "%{http_code}" \
+              "https://crates.io/api/v1/crates/${crate}/${VERSION}")
+            case "$CODE" in
+              200) echo "$crate ${VERSION} already on crates.io; skipping it." ;;
+              404) to_publish+=("$crate") ;;
+              *)
+                echo "::error::Unexpected HTTP $CODE from crates.io API for $crate"
+                exit 1
+                ;;
+            esac
+          done
+          echo "to_publish=${to_publish[*]}" >> "$GITHUB_OUTPUT"
 
-      # Nothing to authenticate for once the version is already published.
+      # Nothing to authenticate for once every crate is already published.
       #
       # This action's post step can fail the job after publish already
       # succeeded; see the completion-marker note on the final step for how
       # to tell that apart from a real failure.
       - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1
         id: auth
-        if: steps.crates_check.outputs.already_published == 'false'
+        if: steps.crates_check.outputs.to_publish != ''
 
+      # FIRST RELEASE OF A CRATE: crates.io trusted publishing cannot create a
+      # crate, so the token above is refused for a crate that does not exist yet.
+      # For `cosca-path`, the first release needs one token-based upload by the
+      # owner, after the Draft Release run (whose dry run has verified the
+      # package) and before the Publish Release dispatch:
+      #
+      #   1. Check out the draft's target commit; `cargo login` with a token that
+      #      may create crates; `cargo publish --locked -p cosca-path`.
+      #   2. On crates.io, add a trusted publisher to `cosca-path`: repository
+      #      bindreams/cosca, workflow publish-release.yaml, environment Deploy.
+      #   3. Dispatch Publish Release. The check above sees `cosca-path` at this
+      #      version and publishes only `cosca`.
+      #
+      # Later releases need none of this: both crates publish from here.
       - name: Publish to crates.io
-        if: steps.crates_check.outputs.already_published == 'false'
+        if: steps.crates_check.outputs.to_publish != ''
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-        run: cargo publish --locked
+          TO_PUBLISH: ${{ steps.crates_check.outputs.to_publish }}
+        shell: bash
+        # One invocation: cargo orders the crates by dependency and waits for
+        # each to appear in the index before uploading the next.
+        run: |
+          set -euo pipefail
+          args=()
+          # Unquoted on purpose: split the space-separated crate names.
+          for crate in $TO_PUBLISH; do
+            args+=(-p "$crate")
+          done
+          cargo publish --locked "${args[@]}"
 
       - name: Publish GitHub release
         env:

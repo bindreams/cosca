@@ -47,17 +47,22 @@ jobs:
           V="$(bash .github/scripts/normalize-version.sh "$INPUT_VERSION")"
           echo "version=$V" >> "$GITHUB_OUTPUT"
 
-      - name: Verify manifest version matches
+      # `cosca-path` and `cosca` release in lockstep at one version. Each is picked
+      # by name: `.packages[0]` is whichever member cargo lists first.
+      - name: Verify manifest versions match
         env:
           VERSION: ${{ steps.version.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
-          MANIFEST="$(cargo metadata --no-deps --locked --format-version 1 | jq -r '.packages[] | select(.name == "cosca") | .version')"
-          if [ "$MANIFEST" != "$VERSION" ]; then
-            echo "::error::Cargo.toml declares $MANIFEST but this dispatch asked for $VERSION"
-            exit 1
-          fi
+          METADATA="$(cargo metadata --no-deps --locked --format-version 1)"
+          for crate in cosca-path cosca; do
+            MANIFEST="$(jq -r --arg name "$crate" '.packages[] | select(.name == $name) | .version' <<<"$METADATA")"
+            if [ "$MANIFEST" != "$VERSION" ]; then
+              echo "::error::$crate declares '${MANIFEST}' but this dispatch asked for $VERSION"
+              exit 1
+            fi
+          done
 
       - name: Fail if the release already exists
         env:
@@ -161,8 +166,13 @@ jobs:
         # On all three hosts: the verification build only compiles for the host,
         # while `ci` builds the repository rather than the tarball, so nothing
         # else would catch an `exclude` that breaks a non-Linux build.
+        #
+        # Both crates in one invocation: cargo verifies the dependent against
+        # the dependency's just-built package (an overlay registry), so no
+        # `--no-verify` is needed even though the dependency is not on
+        # crates.io yet.
         shell: bash
-        run: cargo publish --dry-run --locked
+        run: cargo publish --dry-run --locked -p cosca-path -p cosca
 
   release:
     name: Create draft release
