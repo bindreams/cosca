@@ -82,14 +82,22 @@ pub(super) fn peek(target: &Target<'_>) -> io::Result<Peek> {
 
 /// [`peek`]; with `verified`, a `Running` child whose id cannot be read is an error.
 pub(super) fn peek_with(target: &Target<'_>, verified: bool) -> io::Result<Peek> {
+    peek_holder(target, verified).map(|(peeked, _)| peeked)
+}
+
+/// [`peek_with`], and the tracer that holds the child when the verdict is `Running` because a
+/// process other than this one and launchd holds it.
+pub(super) fn peek_holder(target: &Target<'_>, verified: bool) -> io::Result<(Peek, Option<u32>)> {
     let (pid, unique) = pid_and_unique(target);
     let peeked = peek_raw(pid)?;
-    let Some(unique) = unique else { return Ok(peeked) };
+    let Some(unique) = unique else {
+        return Ok((peeked, None));
+    };
     match peeked {
         Peek::Exit(_) => match check_unique(pid, unique, ReadPurpose::Peek) {
-            IdCheck::Matches => Ok(peeked),
-            IdCheck::Other => Ok(Peek::Foreign(Foreign::Other)),
-            IdCheck::Gone => Ok(Peek::Foreign(Foreign::Gone)),
+            IdCheck::Matches => Ok((peeked, None)),
+            IdCheck::Other => Ok((Peek::Foreign(Foreign::Other), None)),
+            IdCheck::Gone => Ok((Peek::Foreign(Foreign::Gone), None)),
             // The read was refused (a MACF denial): an exit that cannot be tied to the child is not
             // consumed by a bare pid. The errno stays in the error, so `EPERM` stays
             // `PermissionDenied`.
@@ -101,12 +109,12 @@ pub(super) fn peek_with(target: &Target<'_>, verified: bool) -> io::Result<Peek>
         // `waitid` found a child of ours that has not exited. A foreign reap followed by a reuse
         // of the pid by another child of ours also looks like this, so the id decides.
         Peek::Running => match check_unique(pid, unique, ReadPurpose::Running) {
-            IdCheck::Other => Ok(Peek::Foreign(Foreign::Other)),
+            IdCheck::Other => Ok((Peek::Foreign(Foreign::Other), None)),
             // `waitid` found the child running and the id read finds no such process: it was
             // reaped in between, so nothing is left to call running.
-            IdCheck::Gone => Ok(Peek::Foreign(Foreign::Gone)),
-            IdCheck::Matches => Ok(peeked),
-            IdCheck::Unreadable(_) if !verified => Ok(peeked),
+            IdCheck::Gone => Ok((Peek::Foreign(Foreign::Gone), None)),
+            IdCheck::Matches => Ok((peeked, None)),
+            IdCheck::Unreadable(_) if !verified => Ok((peeked, None)),
             IdCheck::Unreadable(errno) => Err(io::Error::new(
                 io::Error::from_raw_os_error(errno).kind(),
                 format!("pid {pid}: its identity could not be read (errno {errno}); it cannot be shown to be ours"),
@@ -115,7 +123,9 @@ pub(super) fn peek_with(target: &Target<'_>, verified: bool) -> io::Result<Peek>
         // `ECHILD` is not proof of a reap: while a tracer holds our child the parent's `waitid`
         // answers `ECHILD` (`src/test_support/tracer.rs`), and the tracer's hand-back re-sends
         // `NOTE_EXIT`. The pid names our child and a live process other than launchd holds it:
-        // running. A child held by launchd is a zombie (or a child mid-exit) whose tracer died:
+        // running, held by that tracer. No `NOTE_EXIT` of the child's reaches us before the
+        // hand-back, so a kqueue wait also watches the tracer's exit (`wait::backend::TracerWatch`).
+        // A child held by launchd is a zombie (or a child mid-exit) whose tracer died:
         // XNU reparents it to launchd and keeps `p_oppid` naming us (xnu-12377.121.6
         // `kern_exit.c:2612-2613` and `:2748`, which sends the `SIGCHLD` to launchd). It comes
         // back to us only if launchd waits on it: `reap_child_locked` then finds `p_oppid`, hands
@@ -126,20 +136,22 @@ pub(super) fn peek_with(target: &Target<'_>, verified: bool) -> io::Result<Peek>
         // with its child `Gone`, and its child (dropped or forgotten) is not reaped by pid, so a
         // hand-back leaves the zombie.
         Peek::Foreign(Foreign::Gone) => match held_by(pid, unique, ReadPurpose::Echild) {
-            Held::Other => Ok(Peek::Foreign(Foreign::Other)),
-            Held::Parent(ppid) if ppid == LAUNCHD => Ok(Peek::Foreign(Foreign::Orphaned)),
-            Held::Parent(_) => Ok(Peek::Running),
+            Held::Other => Ok((Peek::Foreign(Foreign::Other), None)),
+            Held::Parent(ppid) if ppid == LAUNCHD => Ok((Peek::Foreign(Foreign::Orphaned), None)),
+            // A tracer detached between the two reads: our child again.
+            Held::Parent(ppid) if ppid == std::process::id() => Ok((Peek::Running, None)),
+            Held::Parent(tracer) => Ok((Peek::Running, Some(tracer))),
             // `ESRCH` with `arg = 1` is a reap: a process resolves from `P_REF_DEAD` until then.
-            Held::Gone => Ok(peeked),
+            Held::Gone => Ok((peeked, None)),
             // A MACF denial: not ours to see. A caller that treats `Running` as "this is our
             // child" cannot tell a reap from a denial, so it gets the error, with the errno.
-            Held::Refused(_) if !verified => Ok(peeked),
+            Held::Refused(_) if !verified => Ok((peeked, None)),
             Held::Refused(errno) => Err(io::Error::new(
                 io::Error::from_raw_os_error(errno).kind(),
                 format!("pid {pid}: its identity could not be read (errno {errno}); it cannot be shown to be reaped"),
             )),
         },
-        Peek::Foreign(Foreign::Other | Foreign::Orphaned) => Ok(peeked),
+        Peek::Foreign(Foreign::Other | Foreign::Orphaned) => Ok((peeked, None)),
     }
 }
 

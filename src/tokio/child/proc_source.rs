@@ -125,6 +125,16 @@ impl std::os::fd::AsFd for PinnedPidfd {
     }
 }
 
+/// How long [`ProcSource::reap_unreported`] waits before it says it is still waiting. A message only:
+/// the wait never gives up.
+#[cfg(all(target_os = "macos", not(test)))]
+const SLOW_WAIT: Option<std::time::Duration> = Some(std::time::Duration::from_secs(1));
+
+/// No slow-wait message in a test: a loaded runner could pass the threshold, and a test's verdict
+/// must not depend on elapsed time. The threshold's own test is `child::spawn`'s.
+#[cfg(all(target_os = "macos", test))]
+const SLOW_WAIT: Option<std::time::Duration> = None;
+
 /// Why a child is forgotten by [`ProcSource::forget_foreign`], completing "child N ...".
 #[cfg(unix)]
 const FORGET_FOREIGN: &str = "was reaped by someone else, or cannot be shown to be ours";
@@ -1049,6 +1059,50 @@ impl ProcSource {
         }
         self.release();
         fate
+    }
+
+    /// macOS: tears down a child whose unique id `unique` arrived only after its spawn returned, and
+    /// its tree through `prepared` (see `kill_and_reap_unreported`). Tokio's `Child` is forgotten,
+    /// never dropped, because its drop would `waitpid` a number already collected; the event's one
+    /// warn says what that leaks. A child its kill did not end (a setuid child refuses the kill) is
+    /// released instead, to tokio's orphan reaper, which reaps it once it exits: forgetting it would
+    /// leave a zombie nothing collects.
+    ///
+    /// The wait for the killed child's exit blocks this thread in place, as the spawn's other waits do
+    /// (principle 2), on every runtime: tokio's `block_in_place` panics inside a `LocalSet`, even on a
+    /// multi-thread runtime, and cannot be asked beforehand. It logs one `warn` naming the child once it
+    /// passes [`SLOW_WAIT`], and goes on waiting.
+    /// Consumes the backend. **Invariant:** no `wait()` future for this child is in flight.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn reap_unreported(
+        mut self,
+        pid: u32,
+        unique: u64,
+        prepared: crate::containment::Prepared,
+    ) -> ChildFate {
+        crate::bounded::assert_may_block("reap_unreported");
+        let done = crate::child::spawn::kill_and_reap_unreported(pid, unique, prepared, SLOW_WAIT);
+        if matches!(done.fate, ChildFate::Running { .. }) {
+            self.release();
+            return done.warn(
+                pid,
+                Some("it is handed to tokio's orphan reaper, which reaps it once it exits"),
+            );
+        }
+        let tail = self
+            .forget_quietly(false)
+            .map(|(_, leak)| format!("forgetting tokio's handle for it leaks {leak}"));
+        done.warn(pid, tail.as_deref())
+    }
+
+    /// macOS: an elevation front whose id came late is sent nothing: tokio's `Child` is forgotten, and
+    /// the event's one warn says so.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn leave_late_front(mut self, pid: u32) {
+        let tail = self
+            .forget_quietly(false)
+            .map(|(_, leak)| format!("forgetting tokio's handle for it leaks {leak}"));
+        crate::child::spawn::warn_late_front(pid, tail.as_deref());
     }
 
     /// Collects the exit status of a child [`wait_and_reap`](ProcSource::wait_and_reap) saw exit and
