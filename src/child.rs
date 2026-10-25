@@ -917,6 +917,14 @@ impl Child {
         crate::containment::windows::job_contains_pid(&self.attached, pid)
     }
 
+    /// Test-only: whether the child's containment job kills its members when the last handle on it
+    /// closes. `false` if the child is not job-contained.
+    #[cfg(windows)]
+    #[doc(hidden)]
+    pub fn test_job_kills_on_close(&self) -> bool {
+        crate::containment::windows::job_kills_on_close(&self.attached)
+    }
+
     /// Test-only: the marker pipe's kernel identity, for tests that must sweep this tree.
     #[cfg(all(test, target_os = "macos"))]
     #[allow(

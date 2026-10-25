@@ -1637,6 +1637,30 @@ pub(crate) fn job_contains_pid(attached: &crate::containment::Attached, pid: u32
     matches!(queried, Some(Ok(()))) && in_job.as_bool()
 }
 
+/// Test-only: whether the Job Object held by `attached` kills its members when its last handle
+/// closes. `false` when `attached` is not a job. Backs the `test_job_kills_on_close` accessors.
+pub(crate) fn job_kills_on_close(attached: &crate::containment::Attached) -> bool {
+    use windows::Win32::System::JobObjects::{JobObjectBasicLimitInformation, JOBOBJECT_BASIC_LIMIT_INFORMATION};
+
+    let crate::containment::Attached::JobObject(job) = attached else {
+        return false;
+    };
+    let mut info = JOBOBJECT_BASIC_LIMIT_INFORMATION::default();
+    let queried = job.with_handle(|handle| {
+        // SAFETY: `handle` is live for the call, and `info` is a correctly sized out-parameter.
+        unsafe {
+            QueryInformationJobObject(
+                Some(handle),
+                JobObjectBasicLimitInformation,
+                std::ptr::addr_of_mut!(info).cast(),
+                size_of::<JOBOBJECT_BASIC_LIMIT_INFORMATION>() as u32,
+                None,
+            )
+        }
+    });
+    matches!(queried, Some(Ok(()))) && info.LimitFlags.0 & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.0 != 0
+}
+
 #[cfg(test)]
 #[path = "windows_tests.rs"]
 mod windows_tests;

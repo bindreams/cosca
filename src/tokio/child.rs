@@ -592,6 +592,14 @@ impl Child {
         crate::containment::windows::job_contains_pid(&self.os.attached, pid)
     }
 
+    /// Test-only: whether the child's containment job kills its members when the last handle on it
+    /// closes. `false` if the child is not job-contained.
+    #[cfg(windows)]
+    #[doc(hidden)]
+    pub fn test_job_kills_on_close(&self) -> bool {
+        crate::containment::windows::job_kills_on_close(&self.os.attached)
+    }
+
     /// The root a `TreeWalk` attachment walks from.
     #[cfg(all(test, unix))]
     pub(crate) fn test_treewalk_root(&self) -> Option<ProcessId> {
