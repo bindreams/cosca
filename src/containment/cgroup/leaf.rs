@@ -1302,14 +1302,20 @@ fn kill_group(handle: &std::os::fd::OwnedFd, received: &Received, pid: rustix::p
         Err(nix::errno::Errno::EINVAL) => {}
         sent => return sent.map_err(|e| rustix::io::Errno::from_raw_os_error(e as i32)),
     }
-    #[cfg(test)]
-    crate::send_log::record_group(crate::send_log::GroupStep::Check);
-    if !still_unreaped(received, pid) {
+    if !still_unreaped_right_before_a_group_send(received, pid) {
         return Err(rustix::io::Errno::SRCH);
     }
     #[cfg(test)]
     crate::send_log::record_group(crate::send_log::GroupStep::Group(crate::send_log::Route::Number));
     rustix::process::kill_process_group(pid, rustix::process::Signal::KILL)
+}
+
+/// [`still_unreaped`], as the check right before a group send by `pid`.
+#[cfg(target_os = "linux")]
+fn still_unreaped_right_before_a_group_send(received: &Received, pid: rustix::process::Pid) -> bool {
+    #[cfg(test)]
+    crate::send_log::record_group(crate::send_log::GroupStep::Check);
+    still_unreaped(received, pid)
 }
 
 /// What names the child `received` names, `pid`, to its reaper: its pidfd, or — with its `/proc`

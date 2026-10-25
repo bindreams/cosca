@@ -298,3 +298,33 @@ fn an_abandoned_childs_group_kill_goes_through_its_handle(#[fixture(pidfd_group_
     assert_eq!(end_child(&received), ChildFate::Killed);
     assert_eq!(capture.group_steps(), [GroupStep::Group(Route::Pidfd)]);
 }
+
+/// A child reaped elsewhere after the look gets no group kill by its number: the check right before
+/// it finds the child gone. Mutant: "the check's answer is not heeded".
+#[skuld::test]
+fn an_abandoned_child_reaped_before_its_group_kill_by_number_is_not_sent_it() {
+    use crate::send_log::{GroupStep, Route};
+    let child = paused_group_leader();
+    let pid = child.pid();
+    let received = received(child, Some(PlacementReport::WriteFailed(libc::EBADF)));
+    // The kill through the handle and the reap are this test's: nothing else reaches the child.
+    fault::set_between_check_and_kill(move || {
+        // SAFETY: a plain syscall on this process's own child.
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        super::super::test_support::reap(pid);
+    });
+    let capture = crate::send_log::Capture::start();
+    let refused = crate::containment::unix::fault::refuse_pidfd_group_flag();
+
+    let fate = end_child(&received);
+    drop(refused);
+    assert_eq!(
+        capture.group_steps(),
+        [GroupStep::Group(Route::Pidfd), GroupStep::Check]
+    );
+    assert!(
+        !capture.group_steps().contains(&GroupStep::Group(Route::Number)),
+        "nothing went by the number"
+    );
+    assert_eq!(fate, ChildFate::Gone);
+}
