@@ -1176,7 +1176,7 @@ fn end_child(received: &Received) -> ChildFate {
     #[cfg(test)]
     fault::run_between_check_and_kill();
     let group = match received.report {
-        Some(PlacementReport::WriteFailed(_)) => Some(kill_group_outside_leaf(pid)),
+        Some(PlacementReport::WriteFailed(_)) => Some(kill_group_outside_leaf(handle, received, pid)),
         _ => None,
     };
     let group_killed = matches!(group, Some(Ok(true)));
@@ -1260,18 +1260,23 @@ fn kill_through(handle: &std::os::fd::OwnedFd) -> rustix::io::Result<()> {
     rustix::process::pidfd_send_signal(handle, rustix::process::Signal::KILL)
 }
 
-/// Kill the process group an abandoned spawn's child leads, by its number `pid` (see
-/// [`end_child`]). Returns whether the kill was delivered (`false`: the group has no member left),
-/// or the error of a refused kill, for the child's one warn.
+/// Kill the process group an abandoned spawn's child leads (see [`end_child`]): through `handle`,
+/// which names the group exactly; by its number `pid` only where the kernel refuses that (before
+/// Linux 6.9), right after a check that the child is still unreaped. Returns whether the kill was
+/// delivered (`false`: the group has no member left, or the child is gone), or the error of a
+/// refused kill, for the child's one warn.
 #[cfg(target_os = "linux")]
-fn kill_group_outside_leaf(pid: rustix::process::Pid) -> Result<bool, rustix::io::Errno> {
-    match kill_group(pid) {
+fn kill_group_outside_leaf(
+    handle: &std::os::fd::OwnedFd,
+    received: &Received,
+    pid: rustix::process::Pid,
+) -> Result<bool, rustix::io::Errno> {
+    match kill_group(handle, received, pid) {
         Ok(()) => Ok(true),
         Err(rustix::io::Errno::SRCH) => {
             let pid = rustix::process::Pid::as_raw(Some(pid));
             log::debug!(
-                "cgroup v2: an abandoned spawn's child's process group {pid} has no member left (the child left \
-                 it, or was reaped elsewhere since the look)"
+                "cgroup v2: an abandoned spawn's child's process group {pid} has no member left (the child left                  it, or was reaped elsewhere since the look)"
             );
             Ok(false)
         }
@@ -1279,9 +1284,10 @@ fn kill_group_outside_leaf(pid: rustix::process::Pid) -> Result<bool, rustix::io
     }
 }
 
-/// `SIGKILL` the process group `pid`.
+/// `SIGKILL` the process group the child `handle` names leads, as [`kill_group_outside_leaf`] says.
 #[cfg(target_os = "linux")]
-fn kill_group(pid: rustix::process::Pid) -> rustix::io::Result<()> {
+fn kill_group(handle: &std::os::fd::OwnedFd, received: &Received, pid: rustix::process::Pid) -> rustix::io::Result<()> {
+    use std::os::fd::AsFd as _;
     #[cfg(test)]
     {
         fault::record_child_send(fault::ChildSend::Group);
@@ -1292,6 +1298,17 @@ fn kill_group(pid: rustix::process::Pid) -> rustix::io::Result<()> {
             return Err(rustix::io::Errno::SRCH);
         }
     }
+    match crate::containment::unix::pidfd_signal_group(handle.as_fd(), nix::sys::signal::Signal::SIGKILL) {
+        Err(nix::errno::Errno::EINVAL) => {}
+        sent => return sent.map_err(|e| rustix::io::Errno::from_raw_os_error(e as i32)),
+    }
+    #[cfg(test)]
+    crate::send_log::record_group(crate::send_log::GroupStep::Check);
+    if !still_unreaped(received, pid) {
+        return Err(rustix::io::Errno::SRCH);
+    }
+    #[cfg(test)]
+    crate::send_log::record_group(crate::send_log::GroupStep::Group(crate::send_log::Route::Number));
     rustix::process::kill_process_group(pid, rustix::process::Signal::KILL)
 }
 

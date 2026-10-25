@@ -345,6 +345,14 @@ fn send_to_group(pgid: i32, signal: Signal, root: &GroupRoot<'_>) -> Result<Resu
     Ok(killpg(Pid::from_raw(pgid), signal))
 }
 
+/// `signal` to the process group `pidfd`'s process leads, through `pidfd` (a pidfd, or a
+/// `/proc/<pid>` directory, which the kernel takes as one): exact, as [`send_to_group`]'s. `EINVAL`
+/// is a kernel before 6.9, which refuses the flag.
+#[cfg(target_os = "linux")]
+pub(crate) fn pidfd_signal_group(pidfd: std::os::fd::BorrowedFd<'_>, signal: Signal) -> Result<(), nix::errno::Errno> {
+    pidfd_signal(pidfd, signal, Through::Group)
+}
+
 /// What a send through the root's pidfd reaches.
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, PartialEq, Eq)]
