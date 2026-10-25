@@ -113,6 +113,110 @@ fn a_drive_relative_current_dir_takes_the_drives_own_directory_as_win32_does(#[f
 }
 
 #[cfg(windows)]
+/// M7, the rows whose `=X:` value names a directory on drive X itself, and the partially qualified
+/// values whose target must exist: what a child's `GetFullPathNameW` makes of `X:tool` given a block
+/// with that value and a cwd on another drive (for those values, of `T:tool` with the child's cwd
+/// on X), against D1's prediction. `tests/common/drive_rule.rs` has the runner, and
+/// `windows_path_resolution`'s `m7_` test has the rows that need no mapping. Drive X prints as
+/// `<X>:` and the temp directory's drive T as `<T>:`.
+///
+/// Records only. Preconditions, asserted: the mapping serves its directories, the child runs in
+/// the row's cwd and sees the row's `=X:` value.
+///
+/// System-affecting: it maps a drive letter (`DefineDosDeviceW`) for the whole logon session, and
+/// removes it when done, so it is the `DRIVE_MAPPING` group.
+#[skuld::test]
+fn m7_a_drive_relative_name_against_a_drive_directory_on_its_own_drive(#[fixture(drive_mapping)] _group: &Group) {
+    use common::drive_rule::{canonical, free_drive, run, Arm, Cwd, Render, Row, Var};
+    use common::subst::Subst;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let d = canonical(tmp.path());
+    let m = format!(r"{d}\m");
+    let long_rel = format!(r"long\{}\{}\{}", "a".repeat(100), "a".repeat(100), "a".repeat(60));
+    for sub in [r"e", r"m\exists", r"m\vx", r"m\e\exists", &format!(r"m\{long_rel}")] {
+        std::fs::create_dir_all(format!(r"{d}\{sub}")).expect("create the row directories");
+    }
+    std::fs::write(format!(r"{m}\afile"), b"x").expect("create the file");
+    let letter = free_drive((b'M'..=b'Z').rev());
+    let x = format!("{letter}:");
+    let mut mapping = Subst::new(&x, std::path::Path::new(&m)).unwrap_or_else(|e| panic!("map {x} to {m}: {e}"));
+    let long = format!(r"{x}\{long_rel}");
+    assert!(
+        long.encode_utf16().count() > 260,
+        "precondition: {long} is longer than MAX_PATH"
+    );
+    for dir in [
+        format!(r"{x}\exists"),
+        format!(r"{x}\e\exists"),
+        format!(r"\\?\{x}\vx"),
+        long.clone(),
+    ] {
+        assert!(
+            std::path::Path::new(&dir).is_dir(),
+            "precondition: the mapping serves {dir}"
+        );
+    }
+    let e = format!(r"{d}\e");
+    let sr = format!("SystemRoot={}", std::env::var("SystemRoot").expect("SystemRoot"));
+    let render = Render(vec![(d.clone(), "<d>".into()), (long_rel.clone(), "<long>".into())]);
+    // `taken`: D1 predicts that the child takes `value`; otherwise `Root`.
+    let row = |key, value: &str, name: &str, taken: bool| Row {
+        key,
+        cwd: Cwd::Given(e.clone()),
+        block: vec![sr.clone(), format!("={x}={value}")],
+        name: name.to_owned(),
+        arm: if taken { Arm::Value(value.to_owned()) } else { Arm::Root },
+        var: Var::Is(Some(value.to_owned())),
+    };
+    let t = &d[..2];
+    let drives = [(letter, 'X'), (t.chars().next().expect("a drive"), 'T')];
+    let tool = format!("{x}tool");
+    let verbatim = format!(r"\\?\{x}\vx");
+    let rows = [
+        row("existing", &format!(r"{x}\exists"), &tool, true),
+        row("missing", &format!(r"{x}\gone"), &tool, false),
+        row("a_file", &format!(r"{x}\afile"), &tool, false),
+        row("trailing_separator", &format!(r"{x}\exists\"), &tool, true),
+        // The child (`cosca_testbin`) has no `longPathAware` manifest: this records its behaviour
+        // on a long value, not where ntdll's own threshold lies.
+        row("longer_than_max_path", &long, &tool, true),
+        // A verbatim value: D1 predicts the result normalised (dots dropped, `..` stopped at the
+        // drive).
+        row("verbatim_dotted_name", &verbatim, &format!(r"{x}sub.\tool.exe"), true),
+        row("verbatim_dotted_dir", &verbatim, &format!("{x}sub."), true),
+        row("verbatim_up_past_root", &verbatim, &format!(r"{x}..\..\t.exe"), true),
+    ];
+    for row in &rows {
+        run(row, &render, &drives);
+    }
+
+    // A value that is not fully qualified must be refused even when it names an existing directory.
+    // `exists` and `\exists` resolve against the child's own cwd, so it runs on X, and the name's
+    // drive is T. The parent has asserted above that each target exists.
+    let cwd_x = format!(r"{x}\e");
+    let partial = |key, value: String| Row {
+        key,
+        cwd: Cwd::Given(cwd_x.clone()),
+        block: vec![sr.clone(), format!("={t}={value}")],
+        name: format!("{t}tool"),
+        arm: Arm::Root,
+        var: Var::Is(Some(value)),
+    };
+    for row in [
+        partial("drive_relative", format!("{x}exists")),
+        partial("relative", "exists".to_owned()),
+        partial("rooted", r"\exists".to_owned()),
+    ] {
+        run(&row, &render, &drives);
+    }
+
+    mapping
+        .remove()
+        .unwrap_or_else(common::test_groups::fail_unless_panicking);
+}
+
+#[cfg(windows)]
 /// A UNC `current_dir` runs the child there, plainly and verbatim; and against a verbatim UNC
 /// process cwd, `GetFullPathNameW` completes a rooted name and a `..` run as measured here.
 ///
@@ -147,7 +251,7 @@ fn a_unc_current_dir_runs_there_and_a_verbatim_unc_cwd_completes_as_win32_does()
 
 #[cfg(windows)]
 mod drive_mapping_group {
-    //! Re-execs this binary on the one `DRIVE_MAPPING` test. Its body never runs here: each case is
+    //! Re-execs this binary on one `DRIVE_MAPPING` test. Its body never runs here: each case is
     //! either opted out or refused at setup, so these are safe on any host.
 
     use crate::common::test_reexec::{command, suite_outcome, with_json_events, SuiteOutcome, NOCAPTURE};

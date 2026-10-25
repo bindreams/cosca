@@ -153,17 +153,102 @@ fn is_elevated_matches_effective_uid_ground_truth() {
     assert_eq!(super::is_elevated(), euid0, "is_elevated disagreed with geteuid()==0");
 }
 
+/// Detection looks for the backends on the `PATH` it is handed, not on this process's.
+#[cfg(unix)]
+#[skuld::test]
+fn detect_finds_backends_on_the_path_it_is_given() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sudo = dir.path().join("sudo");
+    std::fs::write(&sudo, "#!/bin/sh\n").expect("write the fake sudo");
+    std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let h = super::plan::Host::detect(
+        super::Backend::Auto,
+        &super::Auth::Interactive,
+        Some(dir.path().as_os_str()),
+        false,
+    );
+    assert_eq!(h.available.sudo.as_deref(), Some(sudo.as_path()));
+}
+
+/// Detection reports the privilege it is handed, not this process's.
+#[cfg(unix)]
+#[skuld::test]
+fn detect_reports_the_elevation_it_is_given() {
+    for elevated in [true, false] {
+        let h = super::plan::Host::detect(super::Backend::Auto, &super::Auth::Interactive, None, elevated);
+        assert_eq!(h.elevated, elevated);
+    }
+}
+
+/// `path_var: None` finds no backend, even when this process's own `PATH` holds all three.
+///
+/// Runs in a copy of this test binary whose `PATH` is a directory of fake `sudo`, `doas` and `pkexec`,
+/// so no `set_var` races a sibling test.
+#[cfg(unix)]
+#[skuld::test]
+fn detect_without_a_path_finds_no_backend_on_the_process_path() {
+    use std::os::unix::fs::PermissionsExt;
+
+    const NAME: &str = "elevation::elevation_tests::detect_without_a_path_finds_no_backend_on_the_process_path";
+    const INNER: &str = "COSCA_TEST_DETECT_NONE_PATH";
+    if std::env::var_os(INNER).is_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for program in ["sudo", "doas", "pkexec"] {
+            let fake = dir.path().join(program);
+            std::fs::write(&fake, "#!/bin/sh\n").expect("write a fake backend");
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        let out = crate::test_spawn::output_captured(
+            crate::test_reexec::with_json_events(
+                crate::test_reexec::command(std::env::current_exe().expect("this test binary")).args([
+                    NAME,
+                    "--exact",
+                    crate::test_reexec::NOCAPTURE,
+                    "--test-threads=1",
+                ]),
+            )
+            .env(INNER, "1")
+            .env("PATH", dir.path()),
+        )
+        .expect("run the case alone");
+        if let Err(why) = crate::test_reexec::suite_passed_exactly_one(&out) {
+            panic!(
+                "{why}\n{}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+                out.status,
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        return;
+    }
+
+    let process_path = std::env::var_os("PATH").expect("the outer test sets PATH");
+    for program in ["sudo", "doas", "pkexec"] {
+        assert!(
+            super::posix::resolve_in_path_var(&process_path, program).is_some(),
+            "the process PATH must hold a {program}, or this test proves nothing"
+        );
+    }
+    for backend in [super::Backend::Auto, super::Backend::Pkexec] {
+        let h = super::plan::Host::detect(backend, &super::Auth::Interactive, None, false);
+        assert_eq!(h.available.sudo, None, "{backend:?}");
+        assert_eq!(h.available.doas, None, "{backend:?}");
+        assert_eq!(h.available.pkexec, None, "{backend:?}");
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn detect_reports_linux() {
-    let h = super::plan::Host::detect(super::Backend::Auto, &super::Auth::Interactive);
+    let h = super::plan::Host::detect(super::Backend::Auto, &super::Auth::Interactive, None, false);
     assert_eq!(h.os, super::plan::Os::Linux);
 }
 
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
 #[skuld::test]
 fn detect_reports_unix_os() {
-    let h = super::plan::Host::detect(super::Backend::Auto, &super::Auth::Interactive);
+    let h = super::plan::Host::detect(super::Backend::Auto, &super::Auth::Interactive, None, false);
     assert_eq!(h.os, super::plan::Os::Unix);
 }
 
@@ -172,7 +257,7 @@ fn detect_reports_unix_os() {
 #[cfg(target_os = "macos")]
 #[skuld::test]
 fn detect_reports_macos() {
-    let h = super::plan::Host::detect(super::Backend::Auto, &super::Auth::Interactive);
+    let h = super::plan::Host::detect(super::Backend::Auto, &super::Auth::Interactive, None, false);
     assert_eq!(h.os, super::plan::Os::MacOs);
     assert!(
         h.available.osascript.is_some(),
