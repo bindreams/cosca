@@ -132,7 +132,7 @@ impl InChild {
             unsafe { crate::containment::cgroup::placement_hook(procs_fd, slot) }?;
         }
         #[cfg(target_os = "macos")]
-        fd_map::preserve(&self.preserved)?;
+        fd_map::preserve(&[])?;
         if let Some(plan) = &mut self.fd_map {
             plan.apply()?;
         }
