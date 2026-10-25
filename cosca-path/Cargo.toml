@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 keywords = ["path", "posix", "windows", "cross-platform"]
 categories = ["filesystem", "os"]
+exclude = ["/clippy.toml"]
 
 [dependencies]
 # Zero-copy `&OsStr` -> `&Path` casts without hand-written `unsafe`.

@@ -1,8 +1,9 @@
 use std::borrow::Cow;
+use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::hash::{BuildHasher, RandomState};
 
-use super::{OsStr, Path, PathBuf};
+use super::{OsStr, OsString, Path, PathBuf};
 use crate::{Component, PurePath};
 
 fn p(s: &str) -> &Path {
@@ -78,6 +79,35 @@ fn order_is_component_wise() {
     assert!(p("a") < p("a/b"));
 }
 
+/// A rooted path sorts after the unrooted one, and component kinds sort `.`, `..`, empty, name.
+///
+/// Mutant: `cmp` leaves out the root, so `/a` equals `a`.
+#[skuld::test]
+fn order_ranks_the_root_and_component_kinds() {
+    assert_ne!(p("/a"), p("a"));
+    assert_ne!(p("/a").cmp(p("a")), Ordering::Equal);
+    assert!(p("a") < p("/a"));
+    assert!(p("") < p("/"));
+    assert!(p("a/.") < p("a/.."));
+    assert!(p("a/..") < p("a//"));
+    assert!(p("a//") < p("a/b"));
+}
+
+/// `cmp` is `Equal` exactly when `==` holds, and swapping the operands reverses it.
+///
+/// Mutant: `cmp` leaves out the root, so `/` equals the empty path.
+#[skuld::test]
+fn order_agrees_with_equality() {
+    let all = small_paths();
+    for a in &all {
+        for b in &all {
+            let (a, b) = (p(a), p(b));
+            assert_eq!(a.cmp(b) == Ordering::Equal, a == b, "{a:?} against {b:?}");
+            assert_eq!(a.cmp(b), b.cmp(a).reverse(), "{a:?} against {b:?}");
+        }
+    }
+}
+
 /// Equal paths hash equal, so a borrowed `Path` finds an owned key.
 ///
 /// Mutant: the hash includes the storage address.
@@ -115,9 +145,34 @@ fn join_appends_components() {
     assert_eq!(p("a").join(p("")), PathBuf::from("a"));
 }
 
-/// `push` is an in-place `join`.
+/// For every pair of small paths, a rooted rhs replaces the lhs, and any other rhs adds its
+/// components after the lhs's.
 ///
-/// Mutant: `push` does nothing.
+/// Mutant: the separator is added after a root alone too, so `/` joined with `c` is `//c`.
+#[skuld::test]
+fn join_concatenates_components() {
+    let all = small_paths_up_to(4);
+    for lhs in &all {
+        for rhs in &all {
+            let (lhs, rhs) = (p(lhs), p(rhs));
+            let joined = lhs.join(rhs);
+            if rhs.has_root() {
+                assert_eq!(joined, rhs.to_path_buf(), "{lhs:?} joined with {rhs:?}");
+                continue;
+            }
+            let mut want: Vec<_> = lhs.components().collect();
+            want.extend(rhs.components());
+            assert_eq!(
+                joined.components().collect::<Vec<_>>(),
+                want,
+                "{lhs:?} joined with {rhs:?}"
+            );
+            assert_eq!(joined.has_root(), lhs.has_root(), "{lhs:?} joined with {rhs:?}");
+        }
+    }
+}
+
+/// `push` is an in-place `join`.
 #[skuld::test]
 fn push_is_join() {
     let mut buf = PathBuf::from("a/");
@@ -164,14 +219,48 @@ fn lexically_normal_matches_cpp_at_the_edges() {
     }
 }
 
-/// A run of separators is repeated separators, so it collapses to the root. libstdc++ keeps `//`
-/// and `///` as they are; this is the one place `lexically_normal` differs from C++'s.
+/// A run of separators alone collapses to the root.
 ///
 /// Mutant: an all-slash path is returned unchanged, as libstdc++ does.
 #[skuld::test]
 fn lexically_normal_collapses_a_run_of_slashes_to_the_root() {
     for input in ["/", "//", "///", "////"] {
         assert_eq!(p(input).lexically_normal(), PathBuf::from("/"), "input {input:?}");
+    }
+}
+
+/// For every small path, the normal form is a fixed point, has the same root, and holds no `.`,
+/// no empty name but a last one after a name, and no `..` after a name.
+///
+/// Mutant: `name/..` is kept instead of cancelled.
+#[skuld::test]
+fn lexically_normal_result_is_normal() {
+    for input in small_paths() {
+        let path = p(&input);
+        let normal = path.lexically_normal();
+        let again = normal.lexically_normal();
+        assert_eq!(again, normal, "not idempotent on {input:?}");
+        assert_eq!(normal.has_root(), path.has_root(), "root of {input:?}");
+        // An emptied relative path is spelled `.`: the one result that holds a `.` component.
+        if normal.as_path() == p(".") {
+            continue;
+        }
+        let all: Vec<_> = normal.components().collect();
+        for (i, c) in all.iter().enumerate() {
+            let last = i + 1 == all.len();
+            match c {
+                Component::CurDir => panic!("`.` in the normal form of {input:?}"),
+                Component::Empty => assert!(
+                    last && i > 0 && matches!(all[i - 1], Component::Normal(_)),
+                    "empty name at {i} in the normal form of {input:?}"
+                ),
+                Component::ParentDir => assert!(
+                    i == 0 || all[i - 1] == Component::ParentDir,
+                    "`..` after a name in the normal form of {input:?}"
+                ),
+                Component::Normal(_) => {}
+            }
+        }
     }
 }
 
@@ -193,8 +282,6 @@ fn parent_drops_only_the_last_component() {
 }
 
 /// `pop` truncates to the parent and reports whether there was one.
-///
-/// Mutant: `pop` does nothing and returns `false`.
 #[skuld::test]
 fn pop_truncates_to_the_parent() {
     let mut buf = PathBuf::from("/a/b/");
@@ -246,12 +333,16 @@ fn set_file_name_refuses_a_path_in_debug() {
     );
 }
 
-/// Every path over `{a, ., /}` of up to six bytes: the class that single examples miss, such as a
-/// root followed by a leading `Empty` component.
+/// Every path over `{a, ., /}` of up to six bytes.
 fn small_paths() -> Vec<String> {
+    small_paths_up_to(6)
+}
+
+/// Every path over `{a, ., /}` of up to `max_len` bytes.
+fn small_paths_up_to(max_len: usize) -> Vec<String> {
     let mut all = vec![String::new()];
     let mut level = vec![String::new()];
-    for _ in 0..6 {
+    for _ in 0..max_len {
         level = level
             .iter()
             .flat_map(|s| ["a", ".", "/"].map(|c| format!("{s}{c}")))
@@ -407,11 +498,70 @@ fn debug_is_faithful_for_a_non_utf8_byte() {
 }
 
 /// `display` replaces what is not UTF-8 with U+FFFD.
-///
-/// Mutant: `display` writes nothing.
 #[skuld::test]
 fn display_is_lossy() {
     assert_eq!(Path::from_bytes(b"a\xffb").display().to_string(), "a\u{FFFD}b");
+}
+
+/// `display` writes valid UTF-8 and the empty path as they are.
+///
+/// Mutant: `display` writes the `Debug` form.
+#[skuld::test]
+fn display_keeps_valid_unicode() {
+    assert_eq!(p("a/é b").display().to_string(), "a/é b");
+    assert_eq!(p("").display().to_string(), "");
+}
+
+/// `Debug` of `display()` is `Debug` of the path, so a non-UTF-8 byte stays visible in logs.
+///
+/// Mutant: `Debug` of `display()` debug-prints the lossy string.
+#[skuld::test]
+fn display_debug_is_the_path_debug() {
+    for path in [Path::from_bytes(b"a\xffb"), p("a/é\"b"), p("")] {
+        assert_eq!(format!("{:?}", path.display()), format!("{path:?}"));
+    }
+}
+
+/// The conversion error's message names the offset of the NUL.
+///
+/// Mutant: the message leaves out the offset.
+#[skuld::test]
+fn conversion_error_message_names_the_offset() {
+    let mut bytes = vec![b'a'; 17];
+    bytes.push(0);
+    let err = Path::from_bytes(&bytes).to_cstring().unwrap_err();
+    assert!(err.to_string().contains("offset 17"), "{err}");
+}
+
+/// Every owned conversion keeps the bytes it is given.
+///
+/// Mutant: `PathBuf::from(String)` gives the empty path.
+#[skuld::test]
+fn conversions_keep_the_bytes() {
+    let raw = b"/a\xffb".to_vec();
+    let text = "/a\u{e9}b";
+    assert_eq!(PathBuf::from(raw.clone()).as_bytes(), raw);
+    assert_eq!(PathBuf::from(OsString::from(raw.clone())).as_bytes(), raw);
+    assert_eq!(PathBuf::from(text.to_string()).as_bytes(), text.as_bytes());
+    assert_eq!(PathBuf::from(text).as_bytes(), text.as_bytes());
+    assert_eq!(OsString::from(raw.clone()).into_vec(), raw);
+    assert_eq!(OsString::from(text.to_string()).into_vec(), text.as_bytes());
+    assert_eq!(OsString::from(text).into_vec(), text.as_bytes());
+    assert_eq!(PathBuf::from(raw.clone()).into_os_string().into_vec(), raw);
+}
+
+/// `AsRef<Path>` is a view of the same bytes, for every source that has one.
+///
+/// Mutant: `AsRef<Path>` for `str` gives the empty path.
+#[skuld::test]
+fn as_ref_path_keeps_the_bytes() {
+    fn bytes<P: AsRef<Path> + ?Sized>(source: &P) -> &[u8] {
+        source.as_ref().as_bytes()
+    }
+    assert_eq!(bytes("/a/é"), "/a/é".as_bytes());
+    assert_eq!(bytes(OsStr::from_bytes(b"/a\xff")), b"/a\xff");
+    assert_eq!(bytes(&PathBuf::from("/a")), b"/a");
+    assert_eq!(bytes(p("/a")), b"/a");
 }
 
 /// The `std` conversions borrow, in both directions.

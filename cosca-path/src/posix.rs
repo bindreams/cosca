@@ -319,7 +319,6 @@ impl PurePath for Path {
         let root = self.has_root();
         // Only `Normal` and `ParentDir` survive.
         let mut names: Vec<Component<'_, OsStr>> = Vec::new();
-        // Whether the result ends with a separator after its last name.
         let mut trailing = false;
         for c in self.components() {
             match c {
@@ -379,9 +378,8 @@ impl PurePath for Path {
     }
 }
 
-// The root and the components spell the bytes back exactly, so comparing bytes is comparing
-// components, for `Eq` and `Hash`. `Ord` still walks components: the bytes would sort `a-b` before
-// `a/b`.
+// `Eq` and `Hash` use the bytes, which spell the components exactly. `Ord` walks components: bytes
+// would sort `a-b` before `a/b`.
 impl PartialEq for Path {
     fn eq(&self, other: &Path) -> bool {
         self.as_bytes() == other.as_bytes()

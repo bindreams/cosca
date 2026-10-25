@@ -307,7 +307,7 @@ jobs:
         timeout-minutes: 8
         run: ${{ matrix.nextest }} serde cargo nextest run --locked --features serde --target ${{ matrix.target }}
 
-      # The workspace's other crate. The steps above select the root package only.
+      # The steps above run the root package only.
       - name: Build tests (cosca-path)
         run: cargo nextest run --locked --no-run -p cosca-path --target ${{ matrix.target }} --profile ci
 

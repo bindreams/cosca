@@ -56,8 +56,7 @@ pub trait PurePath: Eq + Ord + Hash + Debug + ToOwned<Owned = Self::Buf> {
     fn components(&self) -> Self::Components<'_>;
 
     /// `rhs` appended to `self`. An `rhs` with an anchor of its own replaces `self`, as in std.
-    /// Otherwise the result's components are `self`'s followed by `rhs`'s, so a trailing separator
-    /// on `self` stays an `Empty` component: `a/` joined with `b` is `a//b`.
+    /// Otherwise `self`'s components then `rhs`'s: `a/` joined with `b` is `a//b`.
     fn join(&self, rhs: &Self) -> Self::Buf;
 
     /// `self` without its last component, or `None` if it has no components. A POSIX path whose
@@ -74,12 +73,10 @@ pub trait PurePath: Eq + Ord + Hash + Debug + ToOwned<Owned = Self::Buf> {
     /// Whether the path is a name an OS's program search looks up, rather than a location.
     fn is_bare_name(&self) -> bool;
 
-    /// The path with `.` components, `name/..` pairs and repeated separators removed, as C++'s
-    /// `std::filesystem::path::lexically_normal` does, except that a run of separators alone
-    /// collapses to the root (libstdc++ keeps `//`). Nothing else changes: a trailing separator
-    /// stays (except after `..`), and names stay as written, trailing dots included. A `..` at the
-    /// root is dropped, and a relative path left empty becomes `.`. Lexical only: `link/..` is not
-    /// the parent of `link`'s target.
+    /// Removes `.` components, `name/..` pairs and repeated separators, as C++'s
+    /// `lexically_normal` does, except that separators alone collapse to the root. Trailing
+    /// separators and names (trailing dots included) stay; `..` at the root is dropped; an emptied
+    /// relative path becomes `.`. `link/..` is not the parent of `link`'s target.
     fn lexically_normal(&self) -> Self::Buf;
 
     /// A lossy adapter for user messages: anything that is not Unicode becomes U+FFFD.
