@@ -50,10 +50,7 @@ fn root_that_leaves_a_cat() -> Command {
 }
 
 /// The pipes of a [`spawn_cat_tree`]: the `cat`'s stdin, and its stdout and stderr.
-#[cfg_attr(
-    target_os = "macos",
-    allow(dead_code, reason = "the echo round trip is the non-macOS test's")
-)]
+#[cfg(not(target_os = "macos"))]
 struct CatPipes {
     stdin: std::io::PipeWriter,
     stdout: std::io::PipeReader,
@@ -63,6 +60,7 @@ struct CatPipes {
 /// Spawn [`root_that_leaves_a_cat`] and read its `started`: the `cat` is forked, and the root is
 /// exiting, a zombie, or already reaped by the spawn (`SharedChild::new` reaps a root that has
 /// exited by then).
+#[cfg(not(target_os = "macos"))]
 fn spawn_cat_tree() -> (crate::Child, CatPipes) {
     let mut child = root_that_leaves_a_cat().spawn().expect("spawn");
     assert_eq!(child.containment(), SESSION_CONTAINMENT);
