@@ -29,7 +29,7 @@
 //!  - relocates, in the parent before any fork, any mapping whose `parent_fd` sits below fd 3
 //!    (see [`install`]) — std's OWN stdio setup (`.stdin()`/`.stdout()`/`.stderr()`) runs its
 //!    `dup2`s in the child BEFORE any `pre_exec` hook, so a mapping source left at fd 0/1/2
-//!    would otherwise be silently clobbered before this module's own `pre_exec` ever ran;
+//!    would otherwise be silently clobbered before the [`InChild`] hook ever ran;
 //!  - checks every post-fork syscall (raw `libc` or rustix) and turns a failure into an
 //!    `io::Error` — except the one `close` of a temporary this module exclusively owns (see
 //!    [`dup_avoiding`]), whose result is intentionally ignored: on Linux a same-process `close`

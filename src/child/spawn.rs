@@ -1075,9 +1075,9 @@ pub(crate) fn build_std_command(cmd: &Command) -> Result<std::process::Command, 
     build_std_command_with(cmd, |_| ()).map(|(std_cmd, ())| std_cmd)
 }
 
-/// [`build_std_command`], running `first` on the command before any hook of its own is
-/// registered, so a hook `first` registers runs first in the child. Returns what `first` returned.
-/// On Unix the child's own steps go into `steps`, for the caller to register.
+/// [`build_std_command`], running `first` on the command before anything else is set on it, so a
+/// hook `first` registers runs first in the child. Returns what `first` returned. On Unix this
+/// registers no hook: the child's own steps go into `steps`, for the caller to register last.
 pub(crate) fn build_std_command_with<R>(
     cmd: &Command,
     #[cfg(unix)] steps: &mut in_child::InChild,

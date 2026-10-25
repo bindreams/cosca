@@ -14,9 +14,10 @@ fn line_from(pipe: impl Read) -> String {
 }
 
 /// Every step the hook carries takes effect in the one child it registers on. One child carries
-/// every step, so a hook that drops any of them fails its row here. Rows: the directory the child
-/// enters, its own session, its cgroup placement (Linux; a pipe stands in for `cgroup.procs`), the
-/// marker descriptor it keeps open across `exec` (macOS), and its fd mapping.
+/// every step, so a hook that drops any of them fails its row here. On Linux the fd map targets the
+/// descriptor the placement step writes to, so a hook that runs the map first fails too. Rows: the
+/// directory the child enters, its own session, its cgroup placement (Linux; a pipe stands in for
+/// `cgroup.procs`), the marker descriptor it keeps open across `exec` (macOS), and its fd mapping.
 #[skuld::test]
 fn every_in_child_step_takes_effect() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -41,11 +42,16 @@ fn every_in_child_step_takes_effect() {
         (read, fd)
     };
 
-    const MAPPED: i32 = 5;
+    // On Linux the map targets the descriptor the placement step writes to, so a map that ran
+    // before placement would take the "0" and leave `cgroup.procs` empty. The order is the point.
+    #[cfg(target_os = "linux")]
+    let mapped_fd = procs_write.as_raw_fd();
+    #[cfg(not(target_os = "linux"))]
+    let mapped_fd = 5;
     let (mapped_read, mapped_write) = std::io::pipe().expect("pipe");
     let mapping = FdMapping {
         parent_fd: OwnedFd::from(mapped_write),
-        child_fd: MAPPED,
+        child_fd: mapped_fd,
     };
     fd_map::install(&mut steps, vec![mapping]).expect("install the mapping");
 
@@ -56,7 +62,7 @@ fn every_in_child_step_takes_effect() {
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-c")
         .arg(format!(
-            "pwd -P; echo mapped > /dev/fd/{MAPPED}; {marker_line}read _ || true"
+            "pwd -P; echo mapped > /dev/fd/{mapped_fd}; {marker_line}read _ || true"
         ))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped());
@@ -92,7 +98,7 @@ fn every_in_child_step_takes_effect() {
     assert_eq!(
         line_from(mapped_read),
         "mapped",
-        "the fd map lands the pipe on fd {MAPPED}"
+        "the fd map lands the pipe on fd {mapped_fd}"
     );
     #[cfg(target_os = "macos")]
     assert_eq!(
