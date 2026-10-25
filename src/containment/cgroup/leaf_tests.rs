@@ -3051,3 +3051,27 @@ fn a_leaf_watches_one_front() {
         .unwrap_or_default();
     assert!(message.contains("a leaf watches one front"), "{message}");
 }
+
+/// `terminate` signals a member only once it is shown, through a pidfd that pins it, to still be in
+/// the leaf: one that left between the `cgroup.procs` read and its signal is not signalled. Mutant:
+/// "signal every listed pid by number".
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn cgroup_terminate_leaves_alone_a_member_that_left_after_the_listing(#[fixture(cgroup)] _group: &Group) {
+    use std::os::unix::process::ExitStatusExt as _;
+    let (leaf, mut member, stdin) = entered_real_leaf();
+    let pid = member.id();
+    let _armed = crate::containment::cgroup::fault::set_after_procs_read(move || {
+        crate::child::front_cgroup_tests::move_out_of_its_leaf(pid);
+    });
+    crate::containment::cgroup::fault::take_terminated_by_pid();
+    leaf.terminate().expect("terminate");
+    assert_eq!(
+        crate::containment::cgroup::fault::take_terminated_by_pid(),
+        Vec::<u32>::new()
+    );
+    drop(stdin);
+    let status = member.wait().expect("reap the member");
+    assert_eq!(status.signal(), None, "the member exited on its own EOF: {status:?}");
+    drop(leaf);
+}

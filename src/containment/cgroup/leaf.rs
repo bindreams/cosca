@@ -21,11 +21,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(target_os = "linux")]
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(target_os = "linux")]
-use nix::sys::signal::{kill, Signal};
-#[cfg(target_os = "linux")]
-use nix::unistd::Pid;
-
 /// Whether `e` is the kernel's proof that this leaf's `cgroup.events` node is already gone —
 /// either because the whole path was already removed (`ENOENT`, on a fresh `open` through the
 /// now-unlinked leaf directory) or because THIS fd was opened before removal and the
@@ -680,19 +675,17 @@ impl CgroupLeaf {
         }
     }
 
-    /// SIGTERM every pid currently listed in `cgroup.procs`.
+    /// SIGTERM every process listed in `cgroup.procs` that is still in the leaf.
     ///
     /// An already-gone leaf is `Ok`, on the same proof [`hard_kill`](Self::hard_kill) rests on
     /// ([`removed_after_drain`]): there is no member left to signal. The two halves must agree
     /// about one leaf — a caller doing terminate-then-kill would otherwise take an error from
     /// the graceful half and success from the hard one over the identical directory.
     ///
-    /// # PID-reuse window
-    /// This reads the pid list then signals each entry. Between the read and
-    /// the signal a pid may exit and be recycled, potentially signalling an
-    /// unrelated process. This is the same race as the process-group `SIGTERM`
-    /// path; the cgroup mechanism's advantage (atomic, pid-free kill) applies
-    /// only to `hard_kill` via `cgroup.kill`.
+    /// Each listed pid is pinned by a pidfd first, then shown to be in the leaf (or under it) and
+    /// still running, and signalled through the pidfd: a pid that exited and was reused after the
+    /// read names a process outside the leaf, and is left alone. A member that cannot be pinned or
+    /// placed is not signalled, as `cgroup.kill` (the hard half) still reaches it.
     pub(crate) fn terminate(&self) -> io::Result<()> {
         let path = self.leaf_path.join("cgroup.procs");
         let content = match self.dir.read("cgroup.procs") {
@@ -703,14 +696,51 @@ impl CgroupLeaf {
             }
             Err(e) => return Err(e),
         };
+        #[cfg(test)]
+        fault::run_after_procs_read();
         for line in content.lines() {
-            if let Ok(pid) = line.trim().parse::<i32>() {
-                #[cfg(test)]
-                fault::record_terminated_by_pid(pid as u32);
-                _ = kill(Pid::from_raw(pid), Signal::SIGTERM);
+            if let Ok(pid) = line.trim().parse::<u32>() {
+                self.terminate_member(pid);
             }
         }
         Ok(())
+    }
+
+    /// [`terminate`](Self::terminate)'s `SIGTERM` to the listed `pid`, if it is still a running
+    /// member of the leaf. Logs what it leaves alone at `debug`.
+    fn terminate_member(&self, pid: u32) {
+        use std::os::fd::AsFd as _;
+        let pidfd = match rustix::process::Pid::from_raw(pid as i32)
+            .ok_or(rustix::io::Errno::INVAL)
+            .and_then(|raw| rustix::process::pidfd_open(raw, rustix::process::PidfdFlags::empty()))
+        {
+            Ok(pidfd) => pidfd,
+            Err(e) => {
+                log::debug!("cgroup terminate: pid {pid} could not be pinned ({e}); not signalled");
+                return;
+            }
+        };
+        // A pid read while its pidfd's process still runs names that process: the membership check
+        // read the process the pidfd pins.
+        match self
+            .names(pid, Some(pidfd.as_fd()))
+            .and_then(|inside| Ok(inside && !pidfd_exited(pidfd.as_fd())?))
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                log::debug!("cgroup terminate: pid {pid} is not a running member of the leaf; not signalled");
+                return;
+            }
+            Err(e) => {
+                log::debug!("cgroup terminate: pid {pid} could not be placed ({e}); not signalled");
+                return;
+            }
+        }
+        #[cfg(test)]
+        fault::record_terminated_by_pid(pid);
+        if let Err(e) = rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::TERM) {
+            log::debug!("cgroup terminate: SIGTERM to pid {pid} failed ({e})");
+        }
     }
 }
 

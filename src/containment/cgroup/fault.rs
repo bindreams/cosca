@@ -11,6 +11,7 @@ thread_local! {
     static BEFORE_EXIT_WAIT: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static BEFORE_FRONT_PROBE: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static BEFORE_HANDLE_KILL: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
+    static AFTER_PROCS_READ: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static CHILD_SENDS: std::cell::RefCell<Vec<ChildSend>> = const { std::cell::RefCell::new(Vec::new()) };
     static FORCE_GROUP_KILL_GONE: Cell<bool> = const { Cell::new(false) };
     static TERMINATED_BY_PID: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -697,11 +698,20 @@ pub(crate) fn take_force_group_kill_gone() -> bool {
     FORCE_GROUP_KILL_GONE.with(|f| f.replace(false))
 }
 
-/// Note a member `CgroupLeaf::terminate` signalled by its bare pid on this thread.
+/// Run `hook` in the NEXT `CgroupLeaf::terminate` on this thread, once it has read `cgroup.procs`
+/// and before it signals any member: the window in which a listed member can leave the leaf.
+pub(crate) fn set_after_procs_read(hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
+    crate::oneshot_hook::arm(&AFTER_PROCS_READ, hook)
+}
+pub(crate) fn run_after_procs_read() {
+    crate::oneshot_hook::fire(&AFTER_PROCS_READ);
+}
+
+/// Note a member `CgroupLeaf::terminate` signalled on this thread.
 pub(crate) fn record_terminated_by_pid(pid: u32) {
     TERMINATED_BY_PID.with(|t| t.borrow_mut().push(pid));
 }
-/// The members this thread's `CgroupLeaf::terminate` signalled by bare pid since the last call.
+/// The members this thread's `CgroupLeaf::terminate` signalled since the last call.
 pub(crate) fn take_terminated_by_pid() -> Vec<u32> {
     TERMINATED_BY_PID.with(|t| std::mem::take(&mut *t.borrow_mut()))
 }
