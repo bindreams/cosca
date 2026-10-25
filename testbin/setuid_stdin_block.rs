@@ -30,7 +30,7 @@ use std::io::{Read, Write};
 use std::process::exit;
 
 fn die(msg: &str) -> ! {
-    eprintln!("setuid-stdin-block: {msg}");
+    errln!("setuid-stdin-block: {msg}");
     exit(3)
 }
 

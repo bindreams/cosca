@@ -39,11 +39,7 @@ fn front_named(backend: Backend, host: &Host) -> Option<&'static str> {
     };
     c.args(["id"]).elevation_backend(backend).elevation_auth(auth);
     let rewrite = rewrite_with_host(&mut c, host).expect("rewrite");
-    rewrite
-        .derived
-        .expect("a derived command")
-        .elevation_front()
-        .map(|front| front.name())
+    rewrite.derived.elevation_front().map(|front| front.name())
 }
 
 /// sudo and doas leave this process tracking a front; pkexec does not.
