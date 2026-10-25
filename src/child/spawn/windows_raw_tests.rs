@@ -706,3 +706,41 @@ fn a_failed_set_inherit_is_reported_as_its_win32_code() {
         "{err:?}"
     );
 }
+
+// Win32 codes of attribute-list failures =====
+
+fn io_code(r: Result<impl std::fmt::Debug, Error>) -> Option<i32> {
+    match r {
+        Err(Error::Io(e)) => e.raw_os_error(),
+        other => panic!("expected Io, got {other:?}"),
+    }
+}
+
+/// A buffer smaller than the sizing call reported fails to initialize with
+/// `ERROR_INSUFFICIENT_BUFFER` (122), not its HRESULT.
+///
+/// Mutant: `initialize_attribute_list` converts with `.into()`, so the code is `0x8007007A`.
+#[skuld::test]
+fn initialize_attribute_list_failure_carries_the_win32_code() {
+    let code = io_code(initialize_attribute_list(&mut []).map(|_| ()));
+    assert_eq!(code, Some(122), "ERROR_INSUFFICIENT_BUFFER expected");
+}
+
+/// An empty handle list is not a valid HANDLE_LIST attribute, so `UpdateProcThreadAttribute`
+/// fails; the error carries the plain Win32 code, and the list was deleted.
+///
+/// Mutant: `add_handle_list_or_delete` converts with `.into()`, so the code is an HRESULT
+/// (`0x8007xxxx`).
+#[skuld::test]
+fn add_handle_list_failure_carries_the_win32_code() {
+    let mut size = 0usize;
+    // SAFETY: the null-list form is the documented way to query the buffer size.
+    _ = unsafe { InitializeProcThreadAttributeList(None, 1, None, &mut size) };
+    let mut buf = vec![0u8; size];
+    let list = initialize_attribute_list(&mut buf).expect("a right-sized buffer initializes");
+    let code = io_code(add_handle_list_or_delete(list, &[]));
+    assert!(
+        matches!(code, Some(c) if c != 0 && c < 0x1_0000),
+        "expected a plain Win32 code, got {code:?}"
+    );
+}

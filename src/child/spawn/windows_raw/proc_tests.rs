@@ -395,3 +395,21 @@ fn a_failed_wait_after_a_refused_kill_is_unknown_not_killed() {
     assert_eq!(super::fate_after_reap(true, exited()), ChildFate::Reaped);
     assert_eq!(super::fate_after_reap(false, exited()), ChildFate::Reaped);
 }
+
+/// `kill` on a handle `TerminateProcess` rejects with something other than a denial is `Err` with
+/// the plain Win32 code. An event handle is a real handle that is not a process, so the call fails
+/// with `ERROR_INVALID_HANDLE`.
+///
+/// Mutant: the generic `Err(e)` arm of `kill` converts with `.into()`, so the code is `0x80070006`.
+#[skuld::test]
+fn kill_of_a_handle_that_is_not_a_process_carries_the_win32_code() {
+    use std::os::windows::io::{FromRawHandle as _, OwnedHandle};
+    // SAFETY: creating an unnamed event has no preconditions.
+    let event = unsafe { windows::Win32::System::Threading::CreateEventW(None, true, false, None) }
+        .expect("create an event handle");
+    // SAFETY: `event` is a fresh handle that nothing else owns.
+    let owned = unsafe { OwnedHandle::from_raw_handle(event.0) };
+    let child = RawChild::new(owned, 0);
+    let err = child.kill().expect_err("an event cannot be terminated");
+    assert_eq!(err.raw_os_error(), Some(ERROR_INVALID_HANDLE.0 as i32), "{err:?}");
+}

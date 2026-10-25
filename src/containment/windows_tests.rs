@@ -1233,3 +1233,123 @@ fn death_watch_assign_held_assigns_the_job_without_resuming() {
     let mut child = child;
     child.wait().expect("the job's close killed the frozen child");
 }
+
+// Win32 codes of job failures =====
+//
+// Each site converts a `windows::core::Error` to an `io::Error`. A bare `.into()` keeps the
+// HRESULT (`0x8007xxxx`) where std reports the Win32 code. An event handle is a real handle that
+// is not a job, so each job call on it fails with `ERROR_INVALID_HANDLE`: no Job Object is made.
+
+fn event_handle() -> windows::Win32::Foundation::HANDLE {
+    // SAFETY: creating an unnamed event has no preconditions.
+    unsafe { windows::Win32::System::Threading::CreateEventW(None, true, false, None) }.expect("create an event handle")
+}
+
+/// `TerminateJobObject` failing reaches the caller with its Win32 code.
+///
+/// Mutant: `hard_kill` converts with `.into()`, so the code is `0x80070006`.
+#[skuld::test]
+fn hard_kill_failure_carries_the_win32_code() {
+    let h = super::JobHandle::new(event_handle());
+    let err = h.hard_kill().expect_err("an event is not a job");
+    assert_eq!(err.raw_os_error(), Some(ERROR_INVALID_HANDLE), "{err:?}");
+}
+
+/// A `CreateJobObjectW` failure carries the plain Win32 code. The call cannot be made to fail, so
+/// the failure is injected at `owned_job`.
+///
+/// Mutant: `owned_job` converts with `.into()`, so the code is `0x80070008`.
+#[skuld::test]
+fn owned_job_failure_carries_the_win32_code() {
+    use windows::core::HRESULT;
+    use windows::Win32::Foundation::ERROR_NOT_ENOUGH_MEMORY;
+    let failed = windows::core::Error::from_hresult(HRESULT::from_win32(ERROR_NOT_ENOUGH_MEMORY.0));
+    let err = super::owned_job(Err(failed)).expect_err("the creation failed");
+    assert_eq!(err.raw_os_error(), Some(ERROR_NOT_ENOUGH_MEMORY.0 as i32), "{err:?}");
+}
+
+/// `SetInformationJobObject` failing carries the plain Win32 code.
+///
+/// Mutant: `set_kill_on_close_or_close` converts with `.into()`, so the code is `0x80070006`.
+#[skuld::test]
+fn set_kill_on_close_failure_carries_the_win32_code() {
+    let err = super::set_kill_on_close_or_close(event_handle()).expect_err("an event is not a job");
+    assert_eq!(err.raw_os_error(), Some(ERROR_INVALID_HANDLE), "{err:?}");
+}
+
+/// `AssignProcessToJobObject` failing carries the plain Win32 code.
+///
+/// Mutant: `assign_or_close` converts with `.into()`, so the code is `0x80070006`.
+#[skuld::test]
+fn assign_failure_carries_the_win32_code() {
+    // SAFETY: `GetCurrentProcess` returns a pseudo-handle and has no preconditions.
+    let me = unsafe { windows::Win32::System::Threading::GetCurrentProcess() };
+    let err = super::assign_or_close(event_handle(), me).expect_err("an event is not a job");
+    assert_eq!(err.raw_os_error(), Some(ERROR_INVALID_HANDLE), "{err:?}");
+}
+
+/// A member check that fails (`IsProcessInJob` on a handle that is not a job) is reported with the
+/// plain Win32 code, not dropped.
+///
+/// Mutant: the `IsProcessInJob` arm of `member_to_watch` converts with `.into()`, so the code is
+/// `0x80070006`.
+#[skuld::test]
+fn member_check_failure_carries_the_win32_code() {
+    use windows::Win32::System::Threading::{
+        GetCurrentProcessId, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    };
+    // SAFETY: opening this process has no preconditions; `member_to_watch` closes the handle.
+    let opened = unsafe {
+        OpenProcess(
+            PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+            false,
+            GetCurrentProcessId(),
+        )
+    };
+    let err = super::member_to_watch(opened, event_handle()).expect_err("an event is not a job");
+    assert_eq!(err.raw_os_error(), Some(ERROR_INVALID_HANDLE), "{err:?}");
+}
+
+/// An `OpenProcess` refusal is reported with the plain Win32 code, while `ERROR_INVALID_PARAMETER`
+/// (the process already exited) is not a failure.
+///
+/// Mutant: the generic `Err(e)` arm of `member_to_watch` converts with `.into()`, so the code is
+/// `0x80070005`.
+#[skuld::test]
+fn denied_open_carries_the_win32_code() {
+    use windows::core::HRESULT;
+    use windows::Win32::Foundation::{ERROR_ACCESS_DENIED as DENIED, ERROR_INVALID_PARAMETER, HANDLE};
+    let refused = |code| Err(windows::core::Error::from_hresult(HRESULT::from_win32(code)));
+    let err = super::member_to_watch(refused(DENIED.0), HANDLE::default()).expect_err("denied");
+    assert_eq!(err.raw_os_error(), Some(ERROR_ACCESS_DENIED), "{err:?}");
+    let gone = super::member_to_watch(refused(ERROR_INVALID_PARAMETER.0), HANDLE::default());
+    assert!(matches!(gone, Ok(None)), "an exited pid is not a failure: {gone:?}");
+}
+
+/// `Thread32First` failing on a handle that is not a snapshot carries the plain Win32 code, and the
+/// handle is closed.
+///
+/// Mutant: `thread_entries_closing` converts with `.into()`, so the code is an HRESULT
+/// (`0x8007xxxx`).
+#[skuld::test]
+fn thread_walk_failure_carries_the_win32_code() {
+    let err = super::thread_entries_closing(event_handle()).expect_err("an event is not a snapshot");
+    let code = err.raw_os_error();
+    assert!(
+        matches!(code, Some(c) if c != 0 && c < 0x1_0000),
+        "expected a plain Win32 code, got {code:?}"
+    );
+}
+
+/// A `CreateToolhelp32Snapshot` failure carries the plain Win32 code. The call cannot be made to
+/// fail, so the failure is injected at `thread_snapshot`.
+///
+/// Mutant: `thread_snapshot` converts with `.into()`, so the code is `0x80070008`.
+#[skuld::test]
+fn thread_snapshot_failure_carries_the_win32_code() {
+    use windows::core::HRESULT;
+    use windows::Win32::Foundation::ERROR_NOT_ENOUGH_MEMORY;
+    let failed = windows::core::Error::from_hresult(HRESULT::from_win32(ERROR_NOT_ENOUGH_MEMORY.0));
+    let err = super::thread_snapshot(Err(failed)).expect_err("the snapshot failed");
+    assert_eq!(err.raw_os_error(), Some(ERROR_NOT_ENOUGH_MEMORY.0 as i32), "{err:?}");
+}
