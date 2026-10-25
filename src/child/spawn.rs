@@ -365,8 +365,6 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     if to_raw_backend {
         return windows_raw::spawn_raw(cmd, fds, kill_on_drop);
     }
-    // Every step the child runs for itself between `fork` and `exec`, registered as one hook right
-    // before the spawn.
     #[cfg(unix)]
     let mut steps = in_child::InChild::default();
     #[cfg(target_os = "linux")]
@@ -417,18 +415,9 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     #[cfg(not(unix))]
     let reserved: Vec<i32> = Vec::new();
 
-    // Phase 1 (before spawn): root detection + pre-spawn containment setup, whose in-child steps
-    // go into `steps` (see `in_child` for the order they run in). The hook is registered after the
-    // fd map's step is added, right before the spawn. The Linux cgroup self-placement step writes
-    // "0" to a pre-opened cgroup.procs fd (CLOEXEC, which is still open between fork and exec). If
-    // fd_map's dup2 ran FIRST, it could dup2 the user's fd over the number that cgroup.procs fd
-    // occupies — closing/replacing it — so the later cgroup write would hit a closed/wrong fd
-    // (silent CgroupV2->ProcessGroup downgrade, or a stray "0" corrupting the user's fd). By running
-    // fd_map LAST, the cgroup write+close happens while its fd is still valid; fd_map may then
-    // freely reuse the now-closed slot. The same holds for the channel the child reports that
-    // write's outcome through (`cgroup::ReportChannel`). Net child order: std stdio (0/1/2) -> the
-    // handshake or report hook -> `steps`: the `raw_executable()` chdir, setsid or cgroup
-    // placement, the macOS marker, fd_map dup2 (last).
+    // Phase 1 (before spawn): root detection + pre-spawn containment setup, whose in-child steps go
+    // into `steps` (order and why: see `in_child`). The hook is registered right before the spawn,
+    // after the fd map's step is added.
     //
     // On macOS, `prepare` also clears FD_CLOEXEC on the marker write end for the forked
     // child only (the supervisor's own copy stays CLOEXEC — see `fdmarker::install`'s doc
@@ -507,9 +496,9 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         }
 
         let _guard = spawn_lock();
-        // The handshake's hook was registered first of all (see `build_std_command_with`), so
-        // `steps`', whose fd map may `dup2` a mapping onto any number, including the channel's, runs
-        // after it is done.
+        // The handshake's hook was registered first of all (see `build_std_command_with`), so the fd
+        // map, which may `dup2` a mapping onto any number including the channel's, runs after the
+        // handshake is done.
         let handshake = handshake.open(&_guard).not_started()?;
         let mappings: Vec<fd_map::FdMapping> = child_ends
             .into_iter()

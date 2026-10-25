@@ -125,8 +125,6 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
         return windows_raw::spawn_raw(cmd, fds, kill_on_drop);
     }
 
-    // Every step the child runs for itself between `fork` and `exec`, registered as one hook right
-    // before the spawn.
     #[cfg(unix)]
     let mut steps = crate::child::spawn::in_child::InChild::default();
     #[cfg(target_os = "linux")]
@@ -404,8 +402,8 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
         let _guard = crate::child::spawn::spawn_lock();
 
         // Linux: the child is held before `exec` until the parent holds the pidfd it sent, which
-        // the child then keeps. Its hook was registered first of all, so `steps`', whose fd map may
-        // `dup2` a mapping onto the channel's descriptor number, runs after it is done.
+        // the child then keeps. Its hook was registered first of all, so the fd map, which may
+        // `dup2` a mapping onto any number including the channel's, runs after the handshake is done.
         // A front spawned for a cgroup leaf is left to the leaf, which alone knows whether it holds
         // the front, with the handshake's pidfd for a child the leaf cannot name (see
         // `Handshake::leaving_front`).

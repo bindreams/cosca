@@ -268,8 +268,7 @@ fn an_out_of_range_but_representable_child_fd_fails_at_spawn_not_at_install() {
     cmd.arg("-c").arg("true").stdout(Stdio::piped());
 
     // SAFETY: `pre_exec` runs post-fork, pre-exec, in the child only; `setrlimit` is a checked,
-    // non-allocating raw syscall. Registered BEFORE `install_on` below, since the fd map's step
-    // runs last (see `InChild`).
+    // non-allocating raw syscall. Registered first so it runs before the fd map's hook.
     unsafe {
         cmd.pre_exec(|| {
             let lim = libc::rlimit {

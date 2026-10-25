@@ -9,7 +9,7 @@ pub(crate) struct Prepared {
     pub mode: Option<ContainMode>,
     pub is_root: bool,
     /// Pre-created cgroup leaf (Linux only). `Some` means the child must be
-    /// placed in the cgroup via the `pre_exec` closure; `None` means fall back
+    /// placed in the cgroup by the in-child placement step; `None` means fall back
     /// to the process-group mechanism.
     #[cfg(target_os = "linux")]
     pub cgroup_leaf: Option<crate::containment::cgroup::CgroupLeaf>,
@@ -809,7 +809,7 @@ pub(crate) enum RootIdentity {
 #[cfg(unix)]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum UnixSetup {
-    /// Apply `setsid` via `pre_exec` (ContainMode::Session). Must NOT be
+    /// Add the `setsid` step to the spawn's in-child hook (ContainMode::Session). Must NOT be
     /// combined with ProcessGroup on the same Command (EPERM on a session leader).
     Session,
     /// Apply `process_group(0)` (ContainMode::Strongest or default).

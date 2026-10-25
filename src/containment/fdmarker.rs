@@ -533,11 +533,10 @@ pub(crate) struct PreparedMarker {
 ///
 /// The step clears `FD_CLOEXEC` on the descriptor **in the forked child only**, so the
 /// supervisor's copy stays CLOEXEC and is never inherited by a concurrent, unrelated spawn's
-/// EXEC'D process image. `steps`, and the `Command` it is registered on, own (and do not close)
-/// the write end until the `Command` itself is dropped — so the CALLER must drop it promptly
-/// after `.spawn()` returns to bound the (documented,
-/// non-zero) window where a truly concurrent `fork()` in this same process could transiently see
-/// this fd before its own `exec`; see the module docs.
+/// EXEC'D process image. `steps`, then the `Command` it is registered on, own the write end until
+/// that `Command` drops, so the CALLER must drop it promptly after `.spawn()` returns to bound the
+/// (documented, non-zero) window where a concurrent `fork()` in this process could see this fd
+/// before its own `exec`; see the module docs.
 ///
 /// `None` on any failure — the caller falls back to the pre-existing mechanism rather than
 /// failing the spawn.

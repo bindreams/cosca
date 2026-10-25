@@ -6,7 +6,9 @@
 //!
 //! 1. enter the child's directory (`raw_executable()`; see `child::spawn::enter_in_child`);
 //! 2. `setsid` (session containment);
-//! 3. cgroup self-placement (Linux), whose descriptor a later `dup2` could replace;
+//! 3. cgroup self-placement (Linux), whose `cgroup.procs` descriptor, and the channel it reports
+//!    through, a later `dup2` could replace: the write would then miss, silently downgrading
+//!    `CgroupV2` to a process group, or put a stray "0" into the caller's descriptor;
 //! 4. keep the fd marker open across `exec` (macOS);
 //! 5. the fd map's `dup2`s, last, so they cannot replace a descriptor an earlier step still needs.
 //!
@@ -41,13 +43,11 @@ pub(crate) struct InChild {
 }
 
 impl InChild {
-    /// `chdir` to `dir` in the child.
     pub(crate) fn enter(&mut self, dir: CString) {
         debug_assert!(self.enter.is_none(), "a spawn enters one directory");
         self.enter = Some(dir);
     }
 
-    /// Make the child a session leader.
     pub(crate) fn session(&mut self) {
         debug_assert!(!self.session, "a spawn asks for its session once");
         self.session = true;
@@ -102,6 +102,8 @@ impl InChild {
         let other = placement.is_none();
         #[cfg(target_os = "macos")]
         let other = preserved.is_empty();
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let other = true;
         enter.is_none() && !session && other && fd_map.is_none()
     }
 

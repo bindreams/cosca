@@ -679,10 +679,7 @@ fn linux_contain_with_fd3_delivers_the_exact_payload() {
     assert_eq!(buf, b"FD3PAYLOAD", "fd 3 stream corrupted");
 }
 
-/// Under a delegated cgroup, `.fd(3, ..)` must still leave the spawn in a cgroup. This does not
-/// pin the order of placement and the fd map's dup2s: `cgroup.procs` takes the lowest free number,
-/// which is not 3 here. `every_in_child_step_takes_effect` (`in_child_tests.rs`) pins that order, by
-/// mapping onto the number placement writes to.
+/// Under a delegated cgroup, `.fd(3, ..)` must still leave the spawn in a cgroup (`CgroupV2`).
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn linux_cgroup_v2_contain_with_fd3_does_not_clobber_cgroup_procs_fd(#[fixture(cgroup)] _group: &Group) {

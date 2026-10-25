@@ -282,7 +282,7 @@ impl CgroupLeaf {
         self.report.is_some()
     }
 
-    /// Returns the raw `cgroup.procs` fd for capture in a `pre_exec` closure. Only before the
+    /// Returns the raw `cgroup.procs` fd for the in-child placement step. Only before the
     /// placement verdict is taken.
     pub(crate) fn procs_fd(&self) -> RawFd {
         self.procs_fd.as_ref().expect(RELEASED).as_raw_fd()
@@ -329,8 +329,8 @@ impl CgroupLeaf {
         debug_assert!(!self.child_entered(), "remove_unentered on a leaf its child entered");
     }
 
-    /// A `Copy` handle to this leaf's placement-report slot, for capture by the `pre_exec`
-    /// closure. Only before the placement verdict is taken.
+    /// A `Copy` handle to this leaf's placement-report slot, for the in-child placement step.
+    /// Only before the placement verdict is taken.
     pub(crate) fn placement_slot(&self) -> ReportSlot {
         self.report.as_ref().expect(RELEASED).slot()
     }
