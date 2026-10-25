@@ -7,7 +7,9 @@ use super::handle_snapshot::{walk_handles, OBJ_INHERIT};
 
 /// The values of the handles this process holds with `HANDLE_FLAG_INHERIT` set. The flag comes
 /// from one kernel snapshot, so other threads opening or closing handles cannot skew it, and no
-/// handle is queried afterwards that a reused value could misreport.
+/// handle is queried afterwards that a reused value could misreport. A before/after difference
+/// of two snapshots still counts an inheritable handle another thread creates in between: callers
+/// rely on the test's other threads creating none.
 pub fn snapshot() -> BTreeSet<usize> {
     let mut found = BTreeSet::new();
     walk_handles(|h, attributes| {

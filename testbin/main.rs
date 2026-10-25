@@ -40,7 +40,6 @@ mod accept;
 
 /// The kernel handle snapshot shared with `tests/`.
 #[cfg(windows)]
-#[allow(dead_code, reason = "shared with tests/, which uses the parts this binary does not")]
 #[path = "../tests/common/handle_snapshot.rs"]
 mod handle_snapshot;
 

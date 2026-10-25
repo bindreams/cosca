@@ -142,8 +142,8 @@ pub fn report(path: &str, stray: &str) {
 ///
 /// A snapshot handle that is closed before it is asked is skipped (`device_type` is `None`). One
 /// whose value is reused is asked about its new object, which counts only if that is a NUL device.
-/// Every NUL handle this process holds is inherited or made by cosca on the thread that calls
-/// this, and no other thread opens `\Device\Null`, so a reused value cannot add one. A NUL handle
+/// Every NUL handle this process holds is inherited, and it starts no thread that opens
+/// `\Device\Null`, so a reused value cannot add one. A NUL handle
 /// held throughout is counted once: the snapshot lists each value once.
 fn count_nul_handles() -> usize {
     let mut nul = 0;
