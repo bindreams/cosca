@@ -65,9 +65,12 @@
 //! (see `Command::contain`), so cosca looks at it through its handle before anything it sends by
 //! number. It leads its own process group (`process_group(0)`), and anything it forks after `exec`
 //! starts in that group. A process group's id cannot name another group while its leader is
-//! unreaped; `end_child` states the window between its look and its group kill. cosca reaps a child only when no
-//! handle owns it — an abandoned spawn whose runtime dropped it — only through its pidfd, and only
-//! after signalling it directly: a wait on anything else could block, or reap another's child.
+//! unreaped; `end_child` states the window between its look and its group kill. cosca reaps a
+//! child only when no handle owns it — an abandoned spawn whose runtime dropped it — and only after
+//! signalling it directly. It waits through the child's pidfd, or, for a child that sent only its
+//! `/proc` directory, by its pid once that directory shows it unreaped: a reap by another reaper
+//! after that look is not seen, and the wait may then collect another child of this process that
+//! took the number.
 
 #[path = "cgroup/parse.rs"]
 mod parse;
