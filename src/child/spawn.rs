@@ -40,7 +40,7 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
         #[cfg(unix)]
         {
             let crate::elevation::posix::PosixRewrite {
-                derived,
+                mut derived,
                 report,
                 password_write,
                 backend_path,
@@ -48,21 +48,14 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
             // From here the child is the backend: its elevated program may outlive what happens to it.
             let wrapper = report.as_ref().is_some_and(|r| r.via.program_outlives_child());
             let spawned = (|| {
-                let mut child = match derived {
-                    // The derived program IS the backend; remap an exec failure to
-                    // BackendUnavailable ONLY when the backend path is the culprit (a bad cwd
-                    // yields the same kind and stays a plain Io). An already-elevated derived
-                    // (sanitized original) has no backend path, so it is never remapped.
-                    Some(mut derived) => {
-                        let r = spawn_unelevated(&mut derived, kill_on_drop);
-                        match backend_path.as_deref() {
-                            Some(bp) => r.map_err(|f| f.map(|e| crate::elevation::remap_derived_spawn_error(e, bp)))?,
-                            None => r?,
-                        }
-                    }
-                    // No derived command: the current POSIX `rewrite` always returns `Some` (it
-                    // sanitizes even the already-elevated case into a derived), so this is defensive.
-                    None => spawn_unelevated(cmd, kill_on_drop)?,
+                // The derived program IS the backend; remap an exec failure to
+                // BackendUnavailable ONLY when the backend path is the culprit (a bad cwd
+                // yields the same kind and stays a plain Io). An already-elevated derived
+                // (sanitized original) has no backend path, so it is never remapped.
+                let r = spawn_unelevated(&mut derived, kill_on_drop);
+                let mut child = match backend_path.as_deref() {
+                    Some(bp) => r.map_err(|f| f.map(|e| crate::elevation::remap_derived_spawn_error(e, bp)))?,
+                    None => r?,
                 };
                 // Set the elevation report BEFORE handling the deferred password: a cleanup
                 // kill() in the write-failure path must see the elevated state so an EPERM maps
