@@ -305,6 +305,8 @@ impl Child {
                 return Err(self.shut_down_holders_only(&call, grace, &why));
             }
         };
+        #[cfg(unix)]
+        drop(held);
         let term_signal = || {
             #[cfg(unix)]
             if let Some(result) = decided {
@@ -320,8 +322,6 @@ impl Child {
         };
         #[cfg(not(test))]
         let term_result = term_signal();
-        #[cfg(unix)]
-        drop(held);
 
         // Hold-and-continue ONLY for the error shapes #61's fix can produce as ORDINARY
         // outcomes — a confirmed refusal (`Error::Containment`) or a per-member-unconfirmed
