@@ -140,7 +140,8 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     let tree = (child.containment().can_teardown() && !front_closed).then(|| {
         child
             .attached
-            .hard_kill_marking_unless_reaped(&view, &child.tree_killed)
+            .hard_kill_marking(&child.tree_killed)
+            .map(|()| None::<String>)
             .map(|s| skipped = s)
     });
     let tree_failure = match &tree {

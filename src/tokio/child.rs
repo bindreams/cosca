@@ -202,9 +202,10 @@ impl Child {
         &self,
         view: &crate::containment::DropView,
     ) -> Result<Option<String>, Error> {
-        self.os
-            .attached
-            .hard_kill_marking_unless_reaped(view, &self.tree_killed)
+        self.os.attached.hard_kill_marking(&self.tree_killed).map(|()| {
+            let _ = view;
+            None
+        })
     }
 
     /// What this child's own handle and the root's number say about the root, for a cleanup that
@@ -1502,7 +1503,10 @@ fn signal_on_drop(
     // was read, and tokio's orphan queue reaping by number afterwards.
     #[cfg(unix)]
     let tree = {
-        let kill = os.attached.hard_kill_for_drop(view);
+        let kill = crate::containment::dispatch::DropKill {
+            result: os.attached.hard_kill(),
+            skipped: None,
+        };
         signals.skipped = kill.skipped;
         kill.result
     };

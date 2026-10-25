@@ -1215,7 +1215,10 @@ impl Child {
             }
             gate => matches!(gate, crate::elevation::front::Gate::CgroupOnly),
         };
-        let kill = self.attached.hard_kill_for_drop(&view);
+        let kill = crate::containment::dispatch::DropKill {
+            result: self.attached.hard_kill(),
+            skipped: None,
+        };
         report.skipped = kill.skipped;
         if let Err(e) = &kill.result {
             // A live member refused, or couldn't be confirmed — visible, not silently
