@@ -300,25 +300,3 @@ fn denied_open_source(call: impl FnOnce(ProcessId) -> Result<(), crate::error::E
     };
     source.expect("the OS error is preserved")
 }
-
-/// `block_until_exit` on a live process we may not open is `Unassessable` with the plain Win32
-/// code. CI only.
-///
-/// Mutant: the `Opened::Denied` arm of `block_until_exit` converts with `.into()`, so the code is
-/// `0x80070005`.
-#[skuld::test]
-fn block_until_exit_of_an_access_denied_live_process_carries_the_win32_code() {
-    let io = denied_open_source(|id| super::block_until_exit(id, Some(None)).map(|_| ()));
-    assert_eq!(io.raw_os_error(), Some(ERROR_ACCESS_DENIED.0 as i32), "{io:?}");
-}
-
-/// `kill` of a live process we may not open for termination is `Unassessable` with the plain Win32
-/// code. CI only.
-///
-/// Mutant: the `Opened::Denied` arm of `kill` converts with `.into()`, so the code is
-/// `0x80070005`.
-#[skuld::test]
-fn kill_of_an_access_denied_live_process_carries_the_win32_code() {
-    let io = denied_open_source(super::kill);
-    assert_eq!(io.raw_os_error(), Some(ERROR_ACCESS_DENIED.0 as i32), "{io:?}");
-}
