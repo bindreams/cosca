@@ -1342,6 +1342,9 @@ fn end_front(
     if !still_unreaped(received, pid) {
         return Abandoned::Ended;
     }
+    // Read before the probe, so that a probe seeing the front running is followed at once by the
+    // wait it decides. Acted on only then: an exited front is reaped whatever its place read.
+    let placed = reached(raw, received.pidfd.as_ref().map(AsFd::as_fd));
     #[cfg(test)]
     fault::run_before_front_probe();
     #[cfg(test)]
@@ -1371,7 +1374,7 @@ fn end_front(
             return Abandoned::Front(FrontFate::Unaccounted);
         }
     }
-    match reached(raw, received.pidfd.as_ref().map(AsFd::as_fd)) {
+    match placed {
         Ok(true) => {}
         Ok(false) => {
             log::warn!(

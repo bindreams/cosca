@@ -569,7 +569,7 @@ pub(crate) fn run_before_exit_wait() {
 }
 
 /// Run `hook` in the NEXT abandonment of an elevation front on this thread, after it was seen
-/// unreaped and right before the probe for its exit.
+/// unreaped and placed, right before the probe for its exit.
 pub(crate) fn set_before_front_probe(hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
     crate::oneshot_hook::arm(&BEFORE_FRONT_PROBE, hook)
 }
