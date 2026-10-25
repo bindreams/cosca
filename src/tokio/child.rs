@@ -1203,6 +1203,17 @@ mod child_wait_tree_tests;
 #[path = "child_kill_tree_view_tests.rs"]
 mod child_kill_tree_view_tests;
 
+#[cfg(all(test, target_os = "linux"))]
+impl Child {
+    /// Test-only: the path of the cgroup leaf this child holds, if any.
+    pub(crate) fn leaf_path_for_test(&self) -> Option<std::path::PathBuf> {
+        match &self.os.attached {
+            crate::containment::Attached::Cgroup(leaf) => Some(leaf.path().to_path_buf()),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(all(test, windows))]
 impl Child {
     /// Test-only: install the per-instance raw-wait observer on this child (see the raw backend's

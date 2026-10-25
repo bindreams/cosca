@@ -1,5 +1,6 @@
 //! What the tree paths send, for every mechanism that has a root, every way the root can be reaped
-//! or its handle fail to vouch for it, and every tree entry point, sync and tokio. After a reap the
+//! or its handle fail to vouch for it, and every entry point that decides on one look at the root:
+//! the tree calls, the armed drop and a failed spawn's `finish_elevated`, sync and tokio. After a reap the
 //! root's number may name another process, so nothing may go out by it: no `killpg`, no walk from
 //! the root's pid, no signal by a bare pid. What names the tree exactly still runs: an fd marker's
 //! holders, a cgroup's kill. A `TreeWalk` checks the root after its snapshot instead, and walks
@@ -7,8 +8,9 @@
 //!
 //! The recorders replace `killpg` with a record and record every walk, holder signal, pidfd signal,
 //! `cgroup.kill` write and bare-pid `SIGTERM`, so a mutant that sends by number reaches no process.
-//! Each cell's tree is a root `sleep` and a `cat` in its group (in its leaf, holding its marker)
-//! that ignores `SIGTERM` and outlives the root. Every cell is checked, and the whole matrix is
+//! Each cell's tree is a root `cat` and a second `cat` in its group (in its leaf, holding its
+//! marker) that ignores `SIGTERM` and outlives the root. Both end once stdin closes, so a root an
+//! entry point leaves alone ends without a signal. Every cell is checked, and the whole matrix is
 //! printed if any cell is wrong.
 //!
 //! Two sends by number are routed, and their cells expect them until the issue lands:
@@ -109,14 +111,15 @@ impl Mechanism {
     }
 }
 
-/// A root `sleep` and a `cat` it forked, in its group, that ignores `SIGTERM` (an ignored signal stays
+/// A root `cat` and a `cat` it forked, in its group, that ignores `SIGTERM` (an ignored signal stays
 /// ignored across `exec`) and reads the root's stdin through fd 3, as `sh` points a background job's
-/// stdin at `/dev/null` otherwise. The `cat` prints its pid once it ignores `SIGTERM`. Both hold the
-/// stderr pipe's write end, so stderr reaches EOF once both are gone. Closing stdin ends the `cat`.
+/// stdin at `/dev/null` otherwise. The forked `cat` prints its pid once it ignores `SIGTERM`. Both
+/// hold the stderr pipe's write end, so stderr reaches EOF once both are gone. Closing stdin ends
+/// both.
 const TREE: &str = r#"exec 3<&0
 sh -c 'trap "" TERM; echo $$; exec cat >/dev/null' <&3 3<&- &
 exec 3<&-
-exec sleep 300"#;
+exec cat >/dev/null"#;
 
 /// How the root was reaped before the entry point ran, and what its pid reads as then.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -254,7 +257,7 @@ impl Reap {
     }
 }
 
-/// The tree entry point.
+/// The entry point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Op {
     /// `kill_tree`.
@@ -263,10 +266,31 @@ enum Op {
     Terminate,
     /// `graceful_shutdown_tree`, with no grace.
     GracefulShutdown,
+    /// The handle's armed drop.
+    Drop,
+    /// A failed spawn's cleanup after a failed password write.
+    FinishElevated,
 }
 
 impl Op {
-    const ALL: [Op; 3] = [Op::Kill, Op::Terminate, Op::GracefulShutdown];
+    const ALL: [Op; 5] = [
+        Op::Kill,
+        Op::Terminate,
+        Op::GracefulShutdown,
+        Op::Drop,
+        Op::FinishElevated,
+    ];
+
+    /// Whether the entry point consumes the handle: it kills the tree and the root, as `kill_tree`
+    /// and `kill` together do.
+    fn tears_down(self) -> bool {
+        matches!(self, Op::Drop | Op::FinishElevated)
+    }
+
+    /// Whether the tree's signal is `SIGKILL` alone.
+    fn kills(self) -> bool {
+        self == Op::Kill || self.tears_down()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -345,7 +369,8 @@ fn expected(mechanism: Mechanism, reap: Reap, op: Op) -> Expected {
     let killpg = match (mechanism.has_group(), reap) {
         (false, _) => Want::No,
         (true, Reap::None) => Want::Yes,
-        (true, Reap::OwnFree) => KILLPG_AFTER_OWN_REAP,
+        // A teardown reads its own reap as a reap.
+        (true, Reap::OwnFree) if !op.tears_down() => KILLPG_AFTER_OWN_REAP,
         (true, _) => Want::No,
     };
     let walk = if mechanism.walks() && reap == Reap::None {
@@ -353,8 +378,12 @@ fn expected(mechanism: Mechanism, reap: Reap, op: Op) -> Expected {
     } else {
         Want::No
     };
-    let by_pid = if mechanism.is_cgroup() && op != Op::Kill {
+    let by_pid = if mechanism.is_cgroup() && !op.kills() {
         CGROUP_TERM_BY_PID
+    } else if cfg!(target_os = "macos") && op.tears_down() && reap == Reap::Unanswered {
+        // A teardown kills the root through its handle, as `kill` does: on macOS by pid, after a
+        // check of its unique id.
+        Want::Yes
     } else if reaped || reap != Reap::None {
         Want::No
     } else {
@@ -362,7 +391,7 @@ fn expected(mechanism: Mechanism, reap: Reap, op: Op) -> Expected {
     };
     let holder: Option<&'static [nix::sys::signal::Signal]> = match (mechanism.is_marker(), reap == Reap::None) {
         (true, false) => Some(match op {
-            Op::Kill => &[SIGKILL],
+            Op::Kill | Op::Drop | Op::FinishElevated => &[SIGKILL],
             Op::Terminate => &[SIGTERM],
             Op::GracefulShutdown => &[SIGTERM, SIGKILL],
         }),
@@ -379,7 +408,7 @@ fn expected(mechanism: Mechanism, reap: Reap, op: Op) -> Expected {
         Some(&[])
     } else {
         match op {
-            Op::Kill => Some(&[SIGKILL]),
+            Op::Kill | Op::Drop | Op::FinishElevated => Some(&[SIGKILL]),
             Op::Terminate => Some(&[SIGTERM]),
             Op::GracefulShutdown => None,
         }
@@ -545,6 +574,14 @@ fn run_sync(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
         Op::Kill => child.kill_tree(),
         Op::Terminate => child.terminate_tree(),
         Op::GracefulShutdown => child.graceful_shutdown_tree(Duration::ZERO).map(drop),
+        Op::Drop => {
+            drop(child);
+            return finish_teardown(reap, forced, recorders, root, cat, stdin, stderr);
+        }
+        Op::FinishElevated => {
+            _ = crate::child::spawn::finish_elevated(child, failed_write());
+            return finish_teardown(reap, forced, recorders, root, cat, stdin, stderr);
+        }
     };
     reap.assert_forced_used();
     let sent = recorders.sent(root, cat);
@@ -567,6 +604,37 @@ fn run_sync(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
     }
     drop(child);
     drop(forced);
+    drop(recorders);
+    sent
+}
+
+fn failed_write() -> Result<(), crate::error::Error> {
+    Err(crate::error::Error::Io(std::io::Error::other(
+        "forced password-write failure",
+    )))
+}
+
+/// What a sync teardown sent, then the end of what it left: closing stdin ends a root it left
+/// alone and a `cat` it did not kill. A root left unreaped stays a zombie until the test process
+/// ends, as nothing may reap it by its number.
+fn finish_teardown(
+    reap: Reap,
+    forced: Option<Box<dyn std::any::Any>>,
+    recorders: Recorders,
+    root: u32,
+    cat: u32,
+    stdin: std::io::PipeWriter,
+    mut stderr: std::io::PipeReader,
+) -> Sent {
+    use std::io::Read as _;
+    reap.assert_forced_used();
+    let sent = recorders.sent(root, cat);
+    drop(forced);
+    drop(stdin);
+    let mut rest = Vec::new();
+    stderr
+        .read_to_end(&mut rest)
+        .expect("the root and the cat are gone, closing stderr");
     drop(recorders);
     sent
 }
@@ -601,13 +669,51 @@ async fn run_tokio(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
     }
     let mut forced = reap.force(child.id());
 
+    // An async teardown does not wait for the leaf to drain, so the cell removes it.
+    #[cfg(target_os = "linux")]
+    let leaf = child
+        .leaf_path_for_test()
+        .map(|path| (crate::test_groups::cgroup_leaf::LeafGuard::new(path.clone()), path));
     let recorders = Recorders::start();
     // The cell checks what was sent, not what the call answered.
-    _ = match op {
-        Op::Kill => child.kill_tree(),
-        Op::Terminate => child.terminate_tree(),
-        Op::GracefulShutdown => child.graceful_shutdown_tree(Duration::ZERO).await.map(drop),
+    let teardown = match op {
+        Op::Kill => {
+            _ = child.kill_tree();
+            false
+        }
+        Op::Terminate => {
+            _ = child.terminate_tree();
+            false
+        }
+        Op::GracefulShutdown => {
+            _ = child.graceful_shutdown_tree(Duration::ZERO).await;
+            false
+        }
+        Op::Drop => true,
+        Op::FinishElevated => true,
     };
+    if teardown {
+        if op == Op::Drop {
+            drop(child);
+        } else {
+            _ = crate::tokio::finish_elevated(child, failed_write());
+        }
+        reap.assert_forced_used();
+        let sent = recorders.sent(root, cat);
+        drop(forced);
+        drop(stdin);
+        let mut rest = Vec::new();
+        stderr
+            .read_to_end(&mut rest)
+            .await
+            .expect("the root and the cat are gone, closing stderr");
+        #[cfg(target_os = "linux")]
+        if let Some((_guard, path)) = leaf {
+            crate::test_groups::cgroup_leaf::drain_and_remove_leaf(&path);
+        }
+        drop(recorders);
+        return sent;
+    }
     reap.assert_forced_used();
     let sent = recorders.sent(root, cat);
     if reap.lift_before_cleanup() {

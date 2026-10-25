@@ -770,7 +770,7 @@ fn leave_unverified_front(
 /// front's gate is decided once, before the tree's kill. The backend has run, so the program may
 /// have started.
 #[cfg(unix)]
-pub(super) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> Result<Child, SpawnFailure> {
+pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> Result<Child, SpawnFailure> {
     let Err(write_err) = written else {
         return Ok(child);
     };
