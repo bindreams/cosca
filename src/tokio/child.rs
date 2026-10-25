@@ -1191,6 +1191,10 @@ mod foreign_reap_tree_tests;
 #[path = "child/root_state_tests.rs"]
 mod root_state_tests;
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "child/group_route_tests.rs"]
+mod group_route_tests;
+
 #[cfg(all(test, unix))]
 #[path = "child/drop_report_tests.rs"]
 mod drop_report_tests;

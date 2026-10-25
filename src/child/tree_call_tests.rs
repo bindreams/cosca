@@ -371,3 +371,31 @@ fn root_number_answers_an_unpinned_root_untrusted() {
         }
     }
 }
+
+// group_number_holds -----
+
+/// A send by the group's number is allowed only while the root is unreaped, or after this handle's
+/// own reap with its pid naming no process. Mutant: "a root reaped elsewhere, or one its handle
+/// cannot answer for, passes the check".
+#[skuld::test]
+fn group_number_holds_only_for_an_unreaped_root_or_a_free_number_after_its_own_reap() {
+    use super::group_number_holds;
+    let own = std::process::id();
+    assert_eq!(group_number_holds(own, (RootState::Unreaped, false)), Ok(()));
+    let refused = [
+        (RootState::Reaped, false, "reaped elsewhere"),
+        (
+            RootState::Unknown(std::io::Error::other("a failed peek")),
+            false,
+            "a failed peek",
+        ),
+        (RootState::Unpinned, false, "not pinned"),
+        // This process holds its own pid, so the number names another process than the root.
+        (RootState::Reaped, true, "another process holds"),
+    ];
+    for (state, own_reap, why) in refused {
+        let label = format!("{state:?}, own reap {own_reap}");
+        let err = group_number_holds(own, (state, own_reap)).expect_err(&label);
+        assert!(err.contains(why), "{label}: {err}");
+    }
+}
