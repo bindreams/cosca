@@ -1443,14 +1443,14 @@ fn display_debug_is_the_path_debug() {
 /// `parse` does, refusals included. They exist only on Windows, where std's strings are UTF-16, so
 /// only the Windows lanes run this.
 ///
-/// Mutant: `to_std_os_string` goes through the lossy string.
+/// Mutant: `to_os_string` goes through the lossy string.
 #[cfg(windows)]
 #[skuld::test]
 fn std_conversions_round_trip() {
     use std::os::windows::ffi::OsStrExt;
     let units = c_root_then(&[0xD800, u16::from(b'x')]);
     let path = wide(&units);
-    let std_os = path.as_os_str().to_std_os_string();
+    let std_os = path.as_os_str().to_os_string();
     assert_eq!(std_os.encode_wide().collect::<Vec<_>>(), units);
     assert_eq!(PathBuf::from_std_path(std::path::Path::new(&std_os)).unwrap(), path);
     assert_eq!(
@@ -1557,6 +1557,69 @@ fn std_names(path: &std::path::Path) -> Vec<String> {
         .collect()
 }
 
+/// `path`'s anchor, `drive`, `is_rooted`, `as_unc` and root are what std's `Prefix` and `has_root`
+/// say of `std_path`, its spelling in std: a drive is `Prefix::Disk`, a UNC path `Prefix::UNC`
+/// with the same server and share, a device path `Prefix::DeviceNS` with the same name. A UNC or
+/// device prefix has an implicit root; a drive has one only with a separator.
+///
+/// Mutant: `is_rooted` is also true for a UNC path, whose root std counts but whose anchor is not
+/// `Rooted`.
+#[cfg(windows)]
+fn assert_std_prefix_and_root(path: &Path, std_path: &std::path::Path) {
+    use std::path::Prefix;
+    let std_prefix = match std_path.components().next() {
+        Some(std::path::Component::Prefix(prefix)) => Some(prefix.kind()),
+        _ => None,
+    };
+    let ctx = format!("{path:?} and std's {std_prefix:?}");
+    let name_of = |s: &std::ffi::OsStr| s.to_str().unwrap().to_owned();
+    let unc = path.as_unc().map(|u| {
+        (
+            u.server.to_str().unwrap().to_owned(),
+            u.share.to_str().unwrap().to_owned(),
+        )
+    });
+    match (path.anchor(), std_prefix) {
+        (Anchor::None | Anchor::Rooted, None) => {}
+        (Anchor::Drive { .. }, Some(Prefix::Disk(_))) => {}
+        (Anchor::Unc { .. }, Some(Prefix::UNC(server, share))) => {
+            assert_eq!(unc, Some((name_of(server), name_of(share))), "{ctx}")
+        }
+        (Anchor::Device { name }, Some(Prefix::DeviceNS(std_name))) => {
+            assert_eq!(name.to_str().unwrap(), name_of(std_name), "{ctx}")
+        }
+        _ => panic!("anchors differ: {ctx}"),
+    }
+    // std reads the letter in upper case; the filter on std's anchors leaves only ASCII letters.
+    let drive_letter = path
+        .drive()
+        .map(|d| u8::try_from(d.unit()).unwrap().to_ascii_uppercase());
+    assert_eq!(
+        drive_letter,
+        match std_prefix {
+            Some(Prefix::Disk(letter)) => Some(letter),
+            _ => None,
+        },
+        "drive of {ctx}"
+    );
+    assert_eq!(
+        unc.is_some(),
+        matches!(std_prefix, Some(Prefix::UNC(..))),
+        "as_unc of {ctx}"
+    );
+    assert_eq!(
+        path.is_rooted(),
+        std_prefix.is_none() && std_path.has_root(),
+        "is_rooted of {ctx}"
+    );
+    let rooted = match path.anchor() {
+        Anchor::None => false,
+        Anchor::Drive { rooted, .. } => rooted,
+        Anchor::Rooted | Anchor::Unc { .. } | Anchor::Device { .. } => true,
+    };
+    assert_eq!(rooted, std_path.has_root(), "has_root of {ctx}");
+}
+
 /// Over every pair of small paths whose anchors std reads as Win32 does, `join` is std's `push`,
 /// and `is_absolute` and the names and `..` of the components are std's. The only deviations are
 /// the joins [`join_keeps_components_where_std_does_not`] lists (an empty rhs, and a relative rhs
@@ -1567,7 +1630,7 @@ fn std_names(path: &std::path::Path) -> Vec<String> {
 #[cfg(windows)]
 #[skuld::test]
 fn join_shape_and_names_agree_with_std() {
-    let std_of = |path: &Path| std::path::PathBuf::from(path.as_os_str().to_std_os_string());
+    let std_of = |path: &Path| std::path::PathBuf::from(path.as_os_str().to_os_string());
     let keep = |path: &PathBuf| !std_reads_the_anchor_otherwise(path);
     let mut lhs_inputs = small_paths_up_to(4);
     // Complete shares and devices are longer than the small paths.
@@ -1590,6 +1653,7 @@ fn join_shape_and_names_agree_with_std() {
     for lhs in &lhs_all {
         let std_lhs = std_of(lhs);
         assert_eq!(lhs.is_absolute(), std_lhs.is_absolute(), "is_absolute of {lhs:?}");
+        assert_std_prefix_and_root(lhs, &std_lhs);
         let names: Vec<String> = lhs
             .components()
             .filter_map(|c| match c {

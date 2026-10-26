@@ -11,7 +11,9 @@
 //!
 //! Parsing drops a verbatim `\\?\` prefix: `\\?\C:\x` is stored as `C:\x`, `\\?\UNC\s\h` as
 //! `\\s\h`, and any other verbatim rest as the device path `\\.\` and that rest. Stored text never
-//! starts with `\\?\`.
+//! starts with `\\?\`. A `.` or `..` in a verbatim rest is a literal name to Win32's file APIs
+//! (`\\?\C:\Windows\..\Windows` is invalid), but parses as [`CurDir`](crate::Component::CurDir) or
+//! [`ParentDir`](crate::Component::ParentDir) here, as in any other spelling.
 //!
 //! So the stored text ([`Path::as_os_str`]) is a lexical spelling, not a string to hand Win32.
 //! Win32 reads `\\?\C:\a.` as written but the stored `C:\a.` as `C:\a`, and `\\?\C:\nul` as a
@@ -313,9 +315,13 @@ impl Path {
     }
 
     pub fn to_path_buf(&self) -> PathBuf {
-        PathBuf(self.0.to_os_string())
+        PathBuf(self.0.to_owned())
     }
 
+    /// The anchor as written, as `RtlDetermineDosPathNameType_U` classifies a string. A `..` after
+    /// a share or device name that follows extra separators pops it only when the path is
+    /// resolved: `\\s\\h\..` is anchored at the share `h`, and its
+    /// [normal form](PurePath::lexically_normal), `\\s\`, is not.
     pub fn anchor(&self) -> Anchor<'_> {
         self.parts().anchor
     }
@@ -328,7 +334,9 @@ impl Path {
     }
 
     /// Whether the path needs no current directory: a drive and a root, a UNC path with a server
-    /// and a share, or a device path longer than `\\.` or `\\?` alone. A device path with no name
+    /// and a share, or a device path longer than `\\.` or `\\?` alone. The path is judged as
+    /// written, as Win32 judges a string, not as resolved: `\\s\\h\..` is fully qualified and its
+    /// [normal form](PurePath::lexically_normal), `\\s\`, is not. A device path with no name
     /// (`\\.\`) counts, as `RtlDetermineDosPathNameType_U` reports it a local device path rather
     /// than the root local device `\\.`.
     pub fn is_fully_qualified(&self) -> bool {
@@ -351,7 +359,8 @@ impl Path {
         self.anchor() == Anchor::Rooted
     }
 
-    /// The server, share and rest of a UNC path; `None` for any other anchor.
+    /// The server, share and rest of a UNC path, as written (see [`Path::anchor`]); `None` for any
+    /// other anchor.
     pub fn as_unc(&self) -> Option<Unc<'_>> {
         let parts = self.parts();
         match parts.anchor {
@@ -489,6 +498,10 @@ impl PurePath for Path {
     /// drive keeps a `.` before it (`.\a:`). A device name, and a share after extra separators, is
     /// the first component under `\\.\` or `\\server\` (see [`Anchor`]), so `..` pops it:
     /// `\\.\d\..\a` is `\\.\a`, `\\s\\h\x` is `\\s\h\x` and `\\s\\h\..` is `\\s\`.
+    ///
+    /// A separate step from classification: [`Path::is_fully_qualified`] and [`Path::anchor`] read
+    /// the path as written, so a path and its normal form can differ in both (`\\s\\h\..` is fully
+    /// qualified, `\\s\` is not).
     fn lexically_normal(&self) -> PathBuf {
         let bytes = self.bytes();
         if bytes.is_empty() {

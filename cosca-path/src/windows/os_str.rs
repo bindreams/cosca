@@ -62,14 +62,11 @@ impl OsStr {
         Cow::Owned(out)
     }
 
-    pub fn to_os_string(&self) -> OsString {
-        OsString(self.0.to_vec())
-    }
-
     /// The string as a `std` OS string, unit for unit. A path's [stored text](super::Path::as_os_str)
-    /// stays a lexical spelling, not a string for Win32.
+    /// stays a lexical spelling, not a string for Win32. [`ToOwned::to_owned`] clones into an
+    /// [`OsString`].
     #[cfg(windows)]
-    pub fn to_std_os_string(&self) -> std::ffi::OsString {
+    pub fn to_os_string(&self) -> std::ffi::OsString {
         use std::os::windows::ffi::OsStringExt;
         std::ffi::OsString::from_wide(&self.to_wide())
     }
@@ -122,7 +119,7 @@ impl fmt::Debug for OsStr {
 impl ToOwned for OsStr {
     type Owned = OsString;
     fn to_owned(&self) -> OsString {
-        self.to_os_string()
+        OsString(self.0.to_vec())
     }
 }
 

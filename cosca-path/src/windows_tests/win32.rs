@@ -3,22 +3,22 @@
 //! device anchors and the normal form.
 //!
 //! Deliberate deviations, each excluded or allowed for by name below:
-//! - Names ending in a dot or a space where Win32 strips them (`has_strippable_name`): the Win32
+//! - Names ending in a dot or a space, which Win32 strips (`has_strippable_name`): the Win32
 //!   conversions refuse those.
 //! - A trailing separator after a name: Win32 drops the one a final `.` leaves (`C:\a\.` is
 //!   `C:\a`); the normal form keeps it, as C++'s does.
 //! - `\\.` or `\\?` alone: Win32 completes it to `\\.\` (`\\?\`); the normal form keeps the anchor.
 //! - Verbatim spellings: Win32 takes the rest as written; parsing drops the prefix.
 //!
-//! Win32 reads an anchor only after resolving `..`, which can pop a device name or a share after
-//! extra separators; the parse reads it as written. Where a `..` follows, the anchor is compared
-//! on the normal form.
+//! Win32 reads a path's type from the string as written, and `lexically_normal` is a separate
+//! step: `\\s\h\..` is a UNC path with a share as written, and resolves to `\\s\`, which is not.
+//! The anchor is compared on the string as written (`without_pops`), and the normal form on its own.
 
 use std::ptr;
 
-use super::{p, paths_over, small_paths};
-use crate::windows::{parts, Anchor, OsStr, Path};
-use crate::{Component, PurePath};
+use super::{os, p, paths_over, small_paths};
+use crate::windows::{Anchor, OsStr};
+use crate::PurePath;
 
 #[link(name = "ntdll", kind = "raw-dylib")]
 extern "system" {
@@ -79,31 +79,75 @@ fn win32_grid() -> Vec<String> {
     all
 }
 
-/// Whether `path` has a name ending in a dot or a space that Win32 strips: a component, device name
-/// or share after extra separators anywhere, and a share right after the server, or a server
-/// alone, only where no name follows it once `.` and `..` resolve (`\\s\h.` and `\\s\h.\x\..` but
-/// not `\\s\h.\x`), as measured.
-fn has_strippable_name(path: &Path) -> bool {
-    let strippable = |name: &OsStr| matches!(name.as_wtf8().last(), Some(b'.' | b' '));
-    let bytes = path.as_os_str().as_wtf8();
-    let parts = parts(bytes);
-    let anchor_name = match parts.anchor {
-        // Win32 skips `.` and `..` here; were one read as the name, it should fail the comparison.
-        Anchor::Device { name } | Anchor::Unc { share: name, .. } if parts.loose_root.is_some() => {
-            strippable(name) && !matches!(name.as_wtf8(), b"." | b"..")
+/// Whether `input` has a segment, between separators, that ends in a dot or a space: what Win32
+/// strips, found from the string alone. `.` and `..` are exempt (Win32 resolves them) except as the
+/// last name in the server, share or device slot of a path that starts with two separators and has
+/// no name left after it (`\\..`, `\\s\.`, `\\s\.\a\..`), where Win32 strips them as a name. Wider than Win32, which leaves some
+/// (`\\s\h.\x`, `C:\a. \x`).
+fn has_strippable_name(input: &str) -> bool {
+    let segments: Vec<&str> = input.split(['\\', '/']).collect();
+    let two_separators = segments.len() > 2 && segments[0].is_empty() && segments[1].is_empty();
+    segments.iter().enumerate().any(|(i, segment)| {
+        let in_slot = two_separators && (2..4).contains(&i) && names_left(&segments[i + 1..]) == 0;
+        segment.ends_with(['.', ' ']) && (in_slot || !matches!(*segment, "." | ".."))
+    })
+}
+
+/// How many names are left once `segments` resolve their `.` and `..`.
+fn names_left(segments: &[&str]) -> usize {
+    segments.iter().fold(0, |depth, segment| match *segment {
+        "" | "." => depth,
+        ".." => depth.saturating_sub(1),
+        _ => depth + 1,
+    })
+}
+
+/// `input` with every `..` segment replaced by a name, so that nothing after the anchor pops it
+/// when Win32 resolves the string; `None` when a `..` comes before the anchor is complete (a share
+/// or device name), where the anchor as written cannot be told from the string alone. `kind` is
+/// `input`'s type: `UNC_ABSOLUTE` or `LOCAL_DEVICE`.
+fn without_pops(input: &str, kind: u32) -> Option<String> {
+    let mut start = 0;
+    let mut first_pop = None;
+    for segment in input.split(['\\', '/']) {
+        if segment == ".." {
+            first_pop.get_or_insert(start);
         }
-        Anchor::Unc { server, share } => {
-            let last = if share.as_wtf8().is_empty() { server } else { share };
-            let named = |c: Component<'_, OsStr>| matches!(c, Component::Normal(_));
-            strippable(last) && !path.lexically_normal().components().any(named)
+        start += segment.len() + 1;
+    }
+    let Some(pop) = first_pop else {
+        return Some(input.to_owned());
+    };
+    let full = full_path(&input[..pop]);
+    let complete = match kind {
+        UNC_ABSOLUTE => !win32_unc(&full).1.is_empty(),
+        _ => !win32_device(&full).is_empty(),
+    };
+    complete.then(|| {
+        let mut out = String::new();
+        let mut rest = input;
+        while let Some(i) = rest.find(['\\', '/']) {
+            let (segment, tail) = rest.split_at(i);
+            out.push_str(if segment == ".." { "zz" } else { segment });
+            out.push_str(&tail[..1]);
+            rest = &tail[1..];
+        }
+        out.push_str(if rest == ".." { "zz" } else { rest });
+        out
+    })
+}
+
+/// Whether Win32 reads the full path `full` as needing no current directory: a rooted drive, a
+/// device path under `\\.\`, or a UNC path with a server and a share.
+fn win32_qualified(full: &str) -> bool {
+    match path_type(full) {
+        DRIVE_ABSOLUTE | LOCAL_DEVICE => true,
+        UNC_ABSOLUTE => {
+            let (server, share) = win32_unc(full);
+            !server.is_empty() && !share.is_empty()
         }
         _ => false,
-    };
-    anchor_name
-        || path.components().any(|c| match c {
-            Component::Normal(name) => strippable(name),
-            _ => false,
-        })
+    }
 }
 
 /// The server and share of Win32's full UNC path `full`; the share is empty when missing.
@@ -154,39 +198,83 @@ fn anchors_agree_with_win32() {
             "{input:?} is {:?}; Win32 type {kind}",
             path.anchor()
         );
-        if has_strippable_name(&path) {
+        if has_strippable_name(&input) {
             continue;
         }
-        let normal = path.lexically_normal();
-        let subject = if path.components().any(|c| c == Component::ParentDir) {
-            normal.as_path()
-        } else {
-            path.as_path()
-        };
-        let qualified = match kind {
-            DRIVE_ABSOLUTE | LOCAL_DEVICE => true,
-            UNC_ABSOLUTE => {
-                let full = full_path(&input);
-                let (server, share) = win32_unc(&full);
-                let want = Anchor::Unc {
-                    server: OsStr::new(server),
-                    share: OsStr::new(share),
+        let ctx = format!("{input:?}; Win32 type {kind}");
+        match kind {
+            UNC_ABSOLUTE | LOCAL_DEVICE => {
+                let Some(written) = without_pops(&input, kind) else {
+                    continue;
                 };
-                assert_eq!(subject.anchor(), want, "{input:?} as {subject:?}; Win32 {full:?}");
-                !server.is_empty() && !share.is_empty()
+                let full = full_path(&written);
+                let want = if kind == UNC_ABSOLUTE {
+                    let (server, share) = win32_unc(&full);
+                    Anchor::Unc {
+                        server: OsStr::new(server),
+                        share: OsStr::new(share),
+                    }
+                } else {
+                    Anchor::Device {
+                        name: OsStr::new(win32_device(&full)),
+                    }
+                };
+                assert_eq!(path.anchor(), want, "{ctx}; Win32 {full:?} of {written:?}");
+                assert_eq!(path.is_fully_qualified(), win32_qualified(&full), "{ctx}");
             }
-            _ => false,
-        };
-        let ctx = format!("{input:?} as {subject:?}; Win32 type {kind}");
-        assert_eq!(subject.is_fully_qualified(), qualified, "{ctx}");
-        if kind == LOCAL_DEVICE {
-            let full = full_path(&input);
-            let want = Anchor::Device {
-                name: OsStr::new(win32_device(&full)),
-            };
-            assert_eq!(subject.anchor(), want, "{ctx}; Win32 {full:?}");
+            _ => assert_eq!(path.is_fully_qualified(), kind == DRIVE_ABSOLUTE, "{ctx}"),
         }
+        assert_eq!(path.is_absolute(), path.is_fully_qualified(), "{ctx}");
     }
+}
+
+/// `is_fully_qualified`, `is_absolute` and `anchor` classify the path as written, as
+/// `RtlDetermineDosPathNameType_U` does, and `lexically_normal` is a separate step: a `..` after a
+/// complete share or device name leaves the written path qualified, and its normal form, which is
+/// what Win32 resolves the string to, may not be. For each input the raw string has Win32's path
+/// type, the written anchor is the share or device before the `..`, and the normal form is Win32's
+/// full path with Win32's qualification.
+///
+/// Mutant: `is_fully_qualified` reads a UNC path's share from the normal form, so `\\s\h\..` is not
+/// fully qualified.
+#[skuld::test]
+fn anchor_is_read_as_written_before_a_pop() {
+    let unc = |server, share| Anchor::Unc {
+        server: OsStr::new(server),
+        share: OsStr::new(share),
+    };
+    let device = |name| Anchor::Device { name: OsStr::new(name) };
+    // (input, path type, anchor as written); the first is a control, where the `..` pops nothing.
+    let cases = [
+        (r"\\s\h\..", UNC_ABSOLUTE, unc("s", "h")),
+        (r"\\s\\h\..", UNC_ABSOLUTE, unc("s", "h")),
+        (r"\\s\\h\.\..", UNC_ABSOLUTE, unc("s", "h")),
+        (r"\\s\\h\..\..", UNC_ABSOLUTE, unc("s", "h")),
+        (r"//s//h/..", UNC_ABSOLUTE, unc("s", "h")),
+        (r"//s//h/./..", UNC_ABSOLUTE, unc("s", "h")),
+        (r"\\s\\h\..\x", UNC_ABSOLUTE, unc("s", "h")),
+        (r"\\.\d\..", LOCAL_DEVICE, device("d")),
+        (r"\\.\\d\..", LOCAL_DEVICE, device("d")),
+        (r"//.//d/..", LOCAL_DEVICE, device("d")),
+        (r"\\.\\d\.\..", LOCAL_DEVICE, device("d")),
+    ];
+    for (input, want_kind, want_anchor) in cases {
+        let path = p(input);
+        let normal = path.lexically_normal();
+        let full = full_path(input);
+        let ctx = format!("{input:?} normalises to {normal:?}; Win32 {full:?}");
+        assert_eq!(path_type(input), want_kind, "{ctx}");
+        assert_eq!(path.anchor(), want_anchor, "{ctx}");
+        // The written path is qualified, even where its normal form is not.
+        assert!(path.is_fully_qualified() && path.is_absolute(), "{ctx}");
+        assert_eq!(trim(&normal.to_str().unwrap().replace('/', "\\")), trim(&full), "{ctx}");
+        assert_eq!(normal.is_fully_qualified(), win32_qualified(&full), "{ctx}");
+    }
+    // The class exists: a share that the `..` pops is gone from the normal form.
+    let popped = p(r"\\s\\h\..");
+    assert!(popped.is_fully_qualified() && !popped.lexically_normal().is_fully_qualified());
+    assert_eq!(popped.lexically_normal(), p(r"\\s\"));
+    assert_eq!(popped.as_unc().map(|u| (u.server, u.share)), Some((os("s"), os("h"))));
 }
 
 /// `lexically_normal` is `GetFullPathNameW` without the current directory: a path that needs none
@@ -198,7 +286,7 @@ fn anchors_agree_with_win32() {
 fn lexically_normal_agrees_with_win32() {
     for input in win32_grid() {
         let path = p(&input);
-        if has_strippable_name(&path) {
+        if has_strippable_name(&input) {
             continue;
         }
         let normal = path.lexically_normal();

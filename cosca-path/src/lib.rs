@@ -97,7 +97,8 @@ pub trait PurePath: Eq + Ord + Hash + Debug + ToOwned<Owned = Self::Buf> {
     fn to_string_lossy(&self) -> Cow<'_, str>;
 
     /// The path in the OS's native encoding: POSIX bytes, borrowed; Windows UTF-16LE, possibly
-    /// ill-formed, owned.
+    /// ill-formed, owned. An encoding of the stored spelling, not a string for Win32 (see the
+    /// [`windows`] module docs): do not hand it to a Win32 API.
     fn to_native_bytes(&self) -> Cow<'_, [u8]>;
 }
 
