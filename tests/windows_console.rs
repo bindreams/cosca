@@ -231,6 +231,11 @@ fn tree_graceful_ops_work_from_a_caller_that_has_a_console() {
     assert_eq!(field(&r, "containment"), "job", "{r}");
     assert_eq!(field(&r, "terminate_tree"), "Ok", "{r}");
     assert_eq!(
+        field(&r, "terminate_sent"),
+        "1",
+        "terminate_tree must send one CTRL_BREAK, to the root's group: {r}"
+    );
+    assert_eq!(
         field(&r, "terminate_break"),
         "1",
         "the child must receive CTRL_BREAK: {r}"
@@ -328,6 +333,11 @@ fn lone_graceful_ops_work_from_a_caller_that_has_a_console() {
     assert_eq!(field(&r, "c_in_console"), "1", "the child must share our console: {r}");
     assert_eq!(field(&r, "mechanism"), "console-group", "{r}");
     assert_eq!(field(&r, "terminate"), "Ok", "{r}");
+    assert_eq!(
+        field(&r, "sent"),
+        "1",
+        "terminate must send one CTRL_BREAK, to the child's group: {r}"
+    );
     assert_eq!(
         field(&r, "alive_after_terminate"),
         "alive",

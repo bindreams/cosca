@@ -13,7 +13,7 @@
 use std::ffi::c_void;
 use std::io;
 use std::mem::size_of;
-use std::sync::RwLock;
+use std::sync::{OnceLock, RwLock};
 
 use windows::Win32::Foundation::{
     CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAGS, HANDLE_FLAG_INHERIT, WAIT_FAILED, WAIT_OBJECT_0,
@@ -492,6 +492,9 @@ pub(crate) fn terminate(pid: u32) -> Result<(), crate::error::Error> {
         Ok(()) => {
             #[cfg(test)]
             observe::record_ctrl_break(pid);
+            if let Some(hook) = CTRL_BREAK_SENT.get() {
+                hook(pid);
+            }
             Ok(())
         }
         Err(e) => Err(classify_ctrl_event_failure(
@@ -500,6 +503,22 @@ pub(crate) fn terminate(pid: u32) -> Result<(), crate::error::Error> {
             caller_has_console(),
         )),
     }
+}
+
+/// Called with the group's pid each time Windows accepts a `CTRL_BREAK`. Empty unless a test
+/// binary installs it with [`set_ctrl_break_sent_hook`]; the library installs none.
+static CTRL_BREAK_SENT: OnceLock<fn(u32)> = OnceLock::new();
+
+/// Test seam for this crate's own `testbin` (`#[doc(hidden)]`, not public API): `hook` runs with the
+/// group's pid after each `CTRL_BREAK` Windows accepts, on the calling thread. A separate process
+/// has no other way to tell a break that was never sent from one still in flight, and a probe that
+/// blocks reading the target's acknowledgement would wait for ever. Installed at most once per
+/// process.
+#[doc(hidden)]
+pub fn set_ctrl_break_sent_hook(hook: fn(u32)) {
+    CTRL_BREAK_SENT
+        .set(hook)
+        .expect("the CTRL_BREAK hook is installed once per process");
 }
 
 /// Test-only records of what THIS thread did, with take semantics, mirroring `fault`.

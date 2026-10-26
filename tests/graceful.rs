@@ -258,6 +258,11 @@ fn nested_delegated_child_can_be_gracefully_terminated() {
     assert_eq!(field(&r, "in_console"), "1", "{r}");
     assert_eq!(field(&r, "terminate"), "Ok", "{r}");
     assert_eq!(
+        field(&r, "sent"),
+        "1",
+        "terminate must send one CTRL_BREAK, to the nested child's group: {r}"
+    );
+    assert_eq!(
         field(&r, "break"),
         "1",
         "the nested child's own handler must have acknowledged the event: {r}"

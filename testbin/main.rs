@@ -23,6 +23,12 @@ mod ack;
 #[cfg(windows)]
 use accept::ack;
 
+/// The breaks the crate sent from this process: the console probes read an acknowledgement only
+/// after one went out.
+#[cfg(windows)]
+#[path = "break_sent.rs"]
+mod break_sent;
+
 /// The `report-console-identity` mode, shared verbatim with the GUI-subsystem fixture.
 #[cfg(windows)]
 #[path = "console_identity.rs"]
@@ -931,6 +937,8 @@ fn main() {
             // anywhere below reaches the test as socket EOF instead of hanging it.
             let mut report_sock = crate::ack::connect_control(&args[2]).unwrap();
 
+            break_sent::install();
+
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let ack_addr = listener.local_addr().unwrap().to_string();
             let exe = std::env::current_exe().unwrap();
@@ -1005,8 +1013,10 @@ fn main() {
                 Err(e) => describe(&e),
             };
             // The blocking read happens ONLY where delivery is guaranteed: nothing else this process
-            // does would end it (a kill that sent nothing leaves the child holding the socket).
-            let delivered = membership == Some(true) && mechanism == "console-group" && terminate == "Ok";
+            // does would end it, and a call that returned `Ok` without sending leaves the child
+            // holding the socket. `sent` is the crate's own record that the break went out.
+            let sent = break_sent::sent_to(child.id().pid());
+            let delivered = membership == Some(true) && mechanism == "console-group" && terminate == "Ok" && sent;
             let seen = if delivered { saw_break(&mut ack) } else { "-" };
 
             // Unconditional, so the happy path (where the child is still alive by design) reaps
@@ -1035,7 +1045,8 @@ fn main() {
             write!(
                 line,
                 "containment={containment} mechanism={mechanism} in_console={in_console} \
-                 terminate={terminate} break={seen} tree={tree} cleanup={cleanup}"
+                 terminate={terminate} sent={} break={seen} tree={tree} cleanup={cleanup}",
+                u8::from(sent),
             )
             .unwrap();
             report_sock.write_all(line.as_bytes()).unwrap();
@@ -1136,6 +1147,7 @@ fn main() {
             // socket EOF instead of hanging the suite. Sibling of `report-console-terminate`;
             // see there for why each token is whitespace-free.
             let mut report_sock = crate::ack::connect_control(&args[2]).unwrap();
+            break_sent::install();
 
             let mut list = [0u32; 1];
             // SAFETY: both calls are standard Win32; `list` is a valid writable slice.
@@ -1225,9 +1237,11 @@ fn main() {
             let alive_after_terminate = liveness(child.is_alive());
             // The blocking read happens ONLY where delivery is guaranteed: the child was MEASURED
             // to be in our console, its mechanism says the flags do not exclude delivery, and the
-            // call reported success. Every other combination defers the read until the cleanup kill
-            // below, so it collects EOF or a reset and this mode always reports.
-            let delivered = c_in_console == Some(true) && mechanism == "console-group" && terminate == "Ok";
+            // call reported success and recorded the break it sent. Every other combination defers
+            // the read until the cleanup kill below, so it collects EOF or a reset and this mode
+            // always reports.
+            let sent = break_sent::sent_to(child.id().pid());
+            let delivered = c_in_console == Some(true) && mechanism == "console-group" && terminate == "Ok" && sent;
             let early_break = delivered.then(|| saw_break(&mut ack));
 
             // The escalating call runs only for a caller with NO console, where it fails before it
@@ -1289,11 +1303,12 @@ fn main() {
             let mut line = String::new();
             write!(
                 line,
-                "console={console} c_in_console={} mechanism={mechanism} terminate={terminate} \
+                "console={console} c_in_console={} mechanism={mechanism} terminate={terminate} sent={} \
                  alive_after_terminate={alive_after_terminate} break={seen} graceful={graceful} \
                  graceful_code={graceful_code} alive_after_graceful={alive_after_graceful} \
                  cleanup={cleanup} cleanup_exit={cleanup_exit}",
                 three_way(c_in_console),
+                u8::from(sent),
             )
             .unwrap();
             report_sock.write_all(line.as_bytes()).unwrap();
@@ -1368,6 +1383,7 @@ fn main() {
             // Connect FIRST. The test blocks on accept(), so a panic anywhere below must still
             // reach it as socket EOF instead of hanging the suite.
             let mut report_sock = crate::ack::connect_control(&args[2]).unwrap();
+            break_sent::install();
 
             // Three-way: a zero return is also how this API reports failure, so "?" must never
             // be able to satisfy the test's `console=0` vacuity guard. The last error is
@@ -1469,17 +1485,19 @@ fn main() {
             };
             let c1_in_console = in_our_console(c1.id().pid());
             let terminate = classify(c1.terminate_tree());
+            let sent = break_sent::sent_to(c1.id().pid());
             let alive_after_terminate = liveness(c1.is_alive());
             // The blocking wait for delivery happens ONLY where delivery is guaranteed: the
-            // root was MEASURED to be in our console AND terminate reported success. Every
-            // other combination kills first and collects EOF, so it always reaches the report
-            // and fails as an assertion rather than as a suite hang. The post-kill read/reap
-            // only runs when the kill itself succeeded — on a failed kill the child is still
-            // alive and blocked, so both would block forever and discard the kill error.
+            // root was MEASURED to be in our console, terminate reported success and the crate
+            // recorded the break it sent. Every other combination kills first and collects EOF,
+            // so it always reaches the report and fails as an assertion rather than as a suite
+            // hang. The post-kill read/reap only runs when the kill itself succeeded — on a
+            // failed kill the child is still alive and blocked, so both would block forever and
+            // discard the kill error.
             //
             // Sockets are released before each post-kill wait: a released acker exits 0, a killed one
             // 1, and the report carries the code.
-            let (terminate_break, kill_tree) = if c1_in_console && terminate == "Ok" {
+            let (terminate_break, kill_tree) = if c1_in_console && terminate == "Ok" && sent {
                 let seen = saw_break(&mut ack1);
                 (seen, classify(c1.kill_tree()))
             } else {
@@ -1550,11 +1568,12 @@ fn main() {
             write!(
                 line,
                 "console={console} c1_in_console={} containment={containment_tag} \
-                 terminate_tree={terminate} alive_after_terminate={alive_after_terminate} \
+                 terminate_tree={terminate} terminate_sent={} alive_after_terminate={alive_after_terminate} \
                  terminate_break={terminate_break} kill_tree={kill_tree} acker1_exit={acker1_exit} \
                  graceful={graceful} alive_after_graceful={alive_after_graceful} \
                  graceful_cleanup={graceful_cleanup} graceful_cleanup_exit={graceful_cleanup_exit}",
                 u8::from(c1_in_console),
+                u8::from(sent),
             )
             .unwrap();
             report_sock.write_all(line.as_bytes()).unwrap();
