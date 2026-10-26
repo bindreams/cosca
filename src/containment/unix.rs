@@ -119,6 +119,7 @@ pub(crate) mod fault {
         static ON_KILL: RefCell<Option<OnSend>> = const { RefCell::new(None) };
         static REFUSE_GROUP: Cell<bool> = const { Cell::new(false) };
         static REFUSE_FLAG: Cell<bool> = const { Cell::new(false) };
+        static GROUP_PROBE_ERRNO: Cell<Option<i32>> = const { Cell::new(None) };
     }
 
     /// While the guard lives, every send to a whole group on THIS thread (the `killpg`, or the
@@ -138,6 +139,14 @@ pub(crate) mod fault {
         Refused(())
     }
 
+    /// While the guard lives, the signal-0 send through a root's pidfd that asks whether its group
+    /// has a member fails with `errno` on THIS thread, and is not made.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn answer_group_probes_with(errno: i32) -> Refused {
+        GROUP_PROBE_ERRNO.with(|e| e.set(Some(errno)));
+        Refused(())
+    }
+
     #[must_use = "the sends go out again as soon as the guard is dropped"]
     pub(crate) struct Refused(());
 
@@ -145,11 +154,17 @@ pub(crate) mod fault {
         fn drop(&mut self) {
             REFUSE_GROUP.with(|r| r.set(false));
             REFUSE_FLAG.with(|r| r.set(false));
+            GROUP_PROBE_ERRNO.with(|e| e.set(None));
         }
     }
 
     pub(super) fn group_sends_refused() -> bool {
         REFUSE_GROUP.with(Cell::get)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn group_probe_errno() -> Option<i32> {
+        GROUP_PROBE_ERRNO.with(Cell::get)
     }
 
     #[cfg_attr(not(target_os = "linux"), allow(dead_code, reason = "only Linux has the flag"))]
@@ -382,23 +397,23 @@ enum Through {
 /// signal-0 send with `PIDFD_SIGNAL_PROCESS_GROUP`, which names the group exactly. While it has one,
 /// the group's number is still its own: the kernel does not reissue a pid that is any process's
 /// group id. `None` where the kernel refuses the flag (before Linux 6.9), or gives an answer that
-/// says neither. A seccomp filter that answers `EPERM` reads as a group with a member; each member's
-/// resend after it still checks the member's identity, and goes through the member's own pidfd; only
-/// if that filter also refuses the member's `pidfd_open` does the resend go by the member's pid, to
-/// a group that may have taken the number.
+/// says neither. `EPERM` is one of those: the kernel gives it for a group whose every member is
+/// another user's, and a seccomp filter may give it for any group, one that took the number
+/// included.
 #[cfg(target_os = "linux")]
 pub(crate) fn pidfd_group_has_member(pidfd: std::os::fd::BorrowedFd<'_>) -> Option<bool> {
     #[cfg(test)]
     let answer = if fault::pidfd_group_flag_refused() {
         Err(nix::errno::Errno::EINVAL)
+    } else if let Some(errno) = fault::group_probe_errno() {
+        Err(nix::errno::Errno::from_raw(errno))
     } else {
         pidfd_send(pidfd, 0, libc::PIDFD_SIGNAL_PROCESS_GROUP)
     };
     #[cfg(not(test))]
     let answer = pidfd_send(pidfd, 0, libc::PIDFD_SIGNAL_PROCESS_GROUP);
     match answer {
-        // `EPERM`: every member belongs to another user, so the group has one.
-        Ok(()) | Err(nix::errno::Errno::EPERM) => Some(true),
+        Ok(()) => Some(true),
         Err(nix::errno::Errno::ESRCH) => Some(false),
         Err(nix::errno::Errno::EINVAL) => None,
         Err(e) => {
