@@ -221,7 +221,7 @@ fn spawn_contained_tree() -> (Suspended, cosca::Job, Member, Member) {
     let job = cosca::Job::assign(root.borrow_process()).expect("Job::assign");
     // Step 3: only now resume.
     root.resume();
-    let watched = common::report_grandchild_of(&report, &mut root);
+    let watched = common::report_grandchild_of(report, &mut root);
 
     // Both members' `<tag><pid>\n` handshakes, in arrival order; the root is watched throughout
     // and the grandchild until it has connected.
