@@ -487,6 +487,10 @@ pub(crate) fn terminate(pid: u32) -> Result<(), crate::error::Error> {
         pid != 0,
         "pid 0 addresses every process attached to the caller's console, including the caller"
     );
+    // RED mutant: the break send is a no-op that returns Ok.
+    if pid != 0 {
+        return Ok(());
+    }
     // SAFETY: standard Win32 call targeting the child's own console group.
     match unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) } {
         Ok(()) => {

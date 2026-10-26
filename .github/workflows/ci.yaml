@@ -279,9 +279,11 @@ jobs:
 
 
       - name: Build tests (tokio feature)
+        if: ${{ !cancelled() }}
         run: cargo nextest run --locked --no-run --features tokio --target ${{ matrix.target }} --profile ci
 
       - name: Run tests (tokio feature)
+        if: ${{ !cancelled() }}
         timeout-minutes: 8
         run: ${{ matrix.nextest }} tokio cargo nextest run --locked --features tokio --target ${{ matrix.target }}
 
