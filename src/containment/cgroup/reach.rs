@@ -378,8 +378,8 @@ enum Unreadable {
 /// A forked probe child (see [`fork_probe`]).
 struct Probe {
     pid: libc::pid_t,
-    /// The child's pidfd, shown to name this process's own child: it is killed and reaped through it.
-    pidfd: OwnedFd,
+    /// How the child is killed and reaped.
+    hold: Hold,
     /// Where the child reports whether it is dumpable and its parent-death signal, a byte each. Its
     /// end closes when it exits.
     ready_read: std::io::PipeReader,
@@ -426,31 +426,115 @@ fn fork_probe(parent: libc::pid_t, dumpable: bool) -> io::Result<Probe> {
         return Err(io::Error::last_os_error());
     }
     drop(ready_write);
-    Ok(Probe {
-        pid,
-        pidfd: own_child_pidfd(pid)?,
-        ready_read,
-    })
+    let hold = match own_child_pidfd(pid) {
+        Ok(pidfd) => Hold::Pidfd(pidfd),
+        Err(Unpinned::Gone(e)) => return Err(e),
+        Err(Unpinned::Failed(e)) => {
+            log::debug!(
+                "containment::cgroup: no pidfd pins the placement probe's child {pid} ({e}), so it is killed and reaped by its number"
+            );
+            Hold::Number
+        }
+    };
+    Ok(Probe { pid, hold, ready_read })
+}
+
+/// How the parent holds a probe's child, to kill and reap it.
+enum Hold {
+    /// A pidfd shown to name a child of this process ([`own_child_pidfd`]).
+    Pidfd(OwnedFd),
+    /// Its pid alone, when no pidfd could be opened (`EMFILE`, say). The child pauses until killed,
+    /// so the number names it unless something else in the process kills it and another reaper reaps
+    /// it; the kill and the reap then reach whoever holds the number: a child of this process, or, for
+    /// the kill, any process. A pidfd from the fork itself (#383) removes this case.
+    Number,
+}
+
+/// Why [`own_child_pidfd`] has no pidfd for the probe's child.
+enum Unpinned {
+    /// The child was reaped by another reaper in this process: nothing is the probe's to kill.
+    Gone(io::Error),
+    /// No pidfd could be opened or shown to name a child; as far as this process can tell, the number
+    /// still names the probe's child.
+    Failed(io::Error),
 }
 
 /// A pidfd for `pid`, a child this process just forked, opened by that number and shown to name an
 /// unreaped child of this process: a pidfd that can be waited on names one. That child is the probe
 /// unless the probe was killed from outside and reaped by another reaper in the process before
 /// `pidfd_open`, and another child of this process took its pid; the probe's kill and reap then reach
-/// that child. Obtaining the pidfd from the fork itself would close this. If no child can be shown,
-/// nothing is sent by the number.
-fn own_child_pidfd(pid: libc::pid_t) -> io::Result<OwnedFd> {
+/// that child. Obtaining the pidfd from the fork itself would close this. A pid that names no process
+/// (`ESRCH`), or a pidfd that names no child of this process (`ECHILD`), is [`Unpinned::Gone`].
+fn own_child_pidfd(pid: libc::pid_t) -> Result<OwnedFd, Unpinned> {
     use rustix::process::{pidfd_open, waitid, Pid, PidfdFlags, WaitId, WaitIdOptions};
-    let raw = Pid::from_raw(pid).ok_or_else(|| io::Error::other(format!("fork returned pid {pid}")))?;
-    let pidfd = pidfd_open(raw, PidfdFlags::empty()).map_err(io::Error::from)?;
+    let Some(raw) = Pid::from_raw(pid) else {
+        unreachable!("fork returned pid {pid} to its parent");
+    };
+    let gone = |e: rustix::io::Errno| {
+        Unpinned::Gone(io::Error::other(format!(
+            "the placement probe's child {pid} was reaped by another reaper in this process ({e})"
+        )))
+    };
+    #[cfg(test)]
+    let opened = match super::fault::run_before_probe_pin(pid) {
+        Some(errno) => Err(rustix::io::Errno::from_raw_os_error(errno)),
+        None => pidfd_open(raw, PidfdFlags::empty()),
+    };
+    #[cfg(not(test))]
+    let opened = pidfd_open(raw, PidfdFlags::empty());
+    let pidfd = match opened {
+        Ok(pidfd) => pidfd,
+        Err(e @ rustix::io::Errno::SRCH) => return Err(gone(e)),
+        Err(e) => return Err(Unpinned::Failed(io::Error::from(e))),
+    };
     loop {
         match waitid(
             WaitId::PidFd(pidfd.as_fd()),
             WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
         ) {
             Err(rustix::io::Errno::INTR) => continue,
-            Err(e) => return Err(io::Error::from(e)),
+            Err(e @ rustix::io::Errno::CHILD) => return Err(gone(e)),
+            Err(e) => return Err(Unpinned::Failed(io::Error::from(e))),
             Ok(_) => return Ok(pidfd),
+        }
+    }
+}
+
+/// Kills the probe's child `pid` and reaps it, through `hold`.
+fn kill_and_reap(pid: libc::pid_t, hold: Hold) -> io::Result<()> {
+    match hold {
+        Hold::Pidfd(pidfd) => {
+            #[cfg(test)]
+            crate::send_log::record(pid as u32, crate::signal::Sig::Kill, crate::send_log::Via::Pidfd);
+            rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::KILL)?;
+            loop {
+                match rustix::process::waitid(
+                    rustix::process::WaitId::PidFd(pidfd.as_fd()),
+                    rustix::process::WaitIdOptions::EXITED,
+                ) {
+                    Err(rustix::io::Errno::INTR) => continue,
+                    Err(e) => return Err(io::Error::from(e)),
+                    Ok(_) => return Ok(()),
+                }
+            }
+        }
+        Hold::Number => {
+            #[cfg(test)]
+            crate::send_log::record(pid as u32, crate::signal::Sig::Kill, crate::send_log::Via::Pid);
+            // SAFETY: plain syscalls on `pid`, this process's own child, with the residual
+            // `Hold::Number` documents.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            let mut status = 0;
+            loop {
+                // SAFETY: as above.
+                if unsafe { libc::waitpid(pid, &mut status, 0) } == pid {
+                    return Ok(());
+                }
+                let e = io::Error::last_os_error();
+                if e.raw_os_error() != Some(libc::EINTR) {
+                    return Err(e);
+                }
+            }
         }
     }
 }
@@ -476,7 +560,7 @@ fn untraceable_cgroup_readable() -> Result<(), Unreadable> {
     let dumpable = super::fault::probe_kept_dumpable();
     #[cfg(not(test))]
     let dumpable = false;
-    let Probe { pid, pidfd, ready_read } =
+    let Probe { pid, hold, ready_read } =
         fork_probe(rustix::process::getpid().as_raw_nonzero().get(), dumpable).map_err(Unreadable::Probe)?;
     let mut ready = [0u8; 2];
     let readied = loop {
@@ -513,21 +597,7 @@ fn untraceable_cgroup_readable() -> Result<(), Unreadable> {
         ))),
         Err(e) => Err(Unreadable::Probe(e)),
     };
-    #[cfg(test)]
-    crate::send_log::record(pid as u32, crate::signal::Sig::Kill, crate::send_log::Via::Pidfd);
-    if let Err(e) = rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::KILL) {
-        return Err(Unreadable::Probe(io::Error::from(e)));
-    }
-    loop {
-        match rustix::process::waitid(
-            rustix::process::WaitId::PidFd(pidfd.as_fd()),
-            rustix::process::WaitIdOptions::EXITED,
-        ) {
-            Err(rustix::io::Errno::INTR) => continue,
-            Err(e) => return Err(Unreadable::Probe(io::Error::from(e))),
-            Ok(_) => break,
-        }
-    }
+    kill_and_reap(pid, hold).map_err(Unreadable::Probe)?;
     read
 }
 
