@@ -101,3 +101,23 @@ fn kill_tree_below_6_9_kills_the_group_by_number_after_this_handles_own_reap() {
     );
     await_the_cat_gone(stderr);
 }
+
+/// 6.9+: a root whose handle cannot say whether it was reaped still names its group exactly through
+/// its pidfd, so `kill_tree` kills the group as usual. Mutant: "only a reaped root's group is
+/// decided by the pidfd".
+#[skuld::test]
+fn kill_tree_of_a_root_its_handle_cannot_read_kills_its_group_through_the_pidfd(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+) {
+    use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peek_once};
+    let (child, _stdin, stderr) = root_with_a_cat();
+    let capture = Capture::start();
+    let forced = force_peek_once(Err(std::io::Error::other("forced peek failure")));
+    let result = child.kill_tree();
+    assert_peeks_exhausted();
+    drop(forced);
+    let steps = capture.group_steps();
+    result.expect("the group is killed through the root's pidfd");
+    assert_eq!(steps.first(), Some(&GroupStep::Group(Route::Pidfd)), "{steps:?}");
+    await_the_cat_gone(stderr);
+}
