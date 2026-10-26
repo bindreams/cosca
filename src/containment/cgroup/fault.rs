@@ -94,14 +94,17 @@ pub(crate) fn kill_writes_fail() -> bool {
 
 /// A drain pump started on this thread fails to start, with `EAGAIN`, as a spawn at a thread limit
 /// does, until the guard drops.
+#[cfg(feature = "tokio")]
 pub(crate) fn fail_pump_starts() -> FailPumpStarts {
     FAIL_PUMP_STARTS.with(|f| f.set(true));
     FailPumpStarts(())
 }
 
+#[cfg(feature = "tokio")]
 #[must_use = "pumps start again as soon as the guard is dropped"]
 pub(crate) struct FailPumpStarts(());
 
+#[cfg(feature = "tokio")]
 impl Drop for FailPumpStarts {
     fn drop(&mut self) {
         FAIL_PUMP_STARTS.with(|f| f.set(false));
