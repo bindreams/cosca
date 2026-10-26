@@ -96,8 +96,9 @@ fn the_group_probe_is_a_recorded_send() {
     let (leader, pidfd) = leader();
     let passes = || Ok(());
     let capture = crate::send_log::Capture::start();
-    let _ = GroupRoot::new(Some(pidfd.as_fd()), &passes).check();
+    let checked = GroupRoot::new(Some(pidfd.as_fd()), &passes).check();
     let steps = capture.group_steps_with_probes();
     kill_and_reap(leader);
     assert_eq!(steps, [GroupStep::Check, GroupStep::Group(Route::Pidfd, 0)]);
+    assert_eq!(checked, Ok(()), "the leader's group has a member");
 }

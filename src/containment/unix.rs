@@ -183,7 +183,6 @@ pub(crate) mod fault {
         GROUP_PROBE_ERRNO.with(Cell::get)
     }
 
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code, reason = "only Linux has the flag"))]
     pub(super) fn pidfd_group_flag_refused() -> bool {
         REFUSE_FLAG.with(Cell::get)
     }
