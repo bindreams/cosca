@@ -190,6 +190,9 @@ pub(crate) fn via_pidfd(pidfd: Option<std::os::fd::BorrowedFd<'_>>, pid: u32, si
     if let Some(errno) = seams::kills_refused() {
         return Err(io_context("pidfd_send_signal", io::Error::from_raw_os_error(errno)));
     }
+    if matches!(sig, Sig::Kill) {
+        return Ok(Sent::Delivered); // RED mutant: SIGKILL sends nothing
+    }
     match rustix::process::pidfd_send_signal(pidfd, sig.as_rustix()) {
         Ok(()) => Ok(Sent::Delivered),
         Err(rustix::io::Errno::SRCH) => {
@@ -262,6 +265,9 @@ pub(crate) fn via_verified_pid(pid: u32, identity: Option<u64>, sig: Sig) -> io:
     #[cfg(test)]
     if let Some(errno) = seams::kills_refused() {
         return Err(io_context("kill", io::Error::from_raw_os_error(errno)));
+    }
+    if matches!(sig, Sig::Kill) {
+        return Ok(Sent::Delivered); // RED mutant: SIGKILL sends nothing
     }
     // SAFETY: `target` is a positive pid, so the signal goes to one process.
     if unsafe { libc::kill(target, sig.as_libc()) } == 0 {

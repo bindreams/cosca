@@ -198,8 +198,8 @@ impl RawChild {
     pub(crate) fn teardown_on_drop(&self, id: crate::identity::ProcessId) -> crate::child::proc_handle::Torn {
         use crate::child::proc_handle::Torn;
         use crate::error::ChildFate;
-        // SAFETY: `handle` is our live, owned process handle.
-        match unsafe { TerminateProcess(self.handle(), 1) } {
+        // RED mutant: the drop's kill sends nothing.
+        match Ok::<(), windows::core::Error>(()) {
             Ok(()) => {
                 #[cfg(test)]
                 crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterDropKill);

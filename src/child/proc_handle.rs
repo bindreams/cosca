@@ -215,7 +215,7 @@ impl ProcHandle {
                     (sent.map(drop), delivered)
                 };
                 #[cfg(not(unix))]
-                let kill_result = s.kill();
+                let kill_result: io::Result<()> = Ok(());
                 match std_teardown_action(&kill_result) {
                     // Kill succeeded: reap the zombie with a bounded blocking wait (SIGKILL
                     // cannot be caught, so the child's exit is guaranteed — this is the
