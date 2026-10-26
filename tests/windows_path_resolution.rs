@@ -65,6 +65,9 @@ mod dots_and_spaces;
 #[path = "windows_path_resolution/drive_rule.rs"]
 mod drive_rule;
 #[cfg(windows)]
+#[path = "windows_path_resolution/drive_rule_length.rs"]
+mod drive_rule_length;
+#[cfg(windows)]
 #[path = "windows_path_resolution/env_set.rs"]
 mod env_set;
 #[cfg(windows)]
@@ -94,6 +97,9 @@ mod surveys;
 #[cfg(windows)]
 #[path = "windows_path_resolution/unc_and_device.rs"]
 mod unc_and_device;
+#[cfg(windows)]
+#[path = "windows_path_resolution/verbatim_cwd.rs"]
+mod verbatim_cwd;
 #[cfg(windows)]
 #[path = "windows_path_resolution/verdict.rs"]
 mod verdict;

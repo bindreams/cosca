@@ -138,7 +138,9 @@ debug-asserts on it.
 After a foreign reap:
 
 - On Linux, cgroup plus pidfd stays exact; only the exit status is lost.
-- Process-group and fd-marker kills are unsafe (principle 4).
+- Process-group kills, and an fd marker's kills by the root's number (its group and its ppid walk),
+  are unsafe (principle 4). The marker's holders are named by the pipe they hold and are still
+  killed exactly.
 - macOS has no pidfd, and cosca has no exact kill there.
 
 **Why:** a library cannot require the whole process to leave its children alone, and processes that

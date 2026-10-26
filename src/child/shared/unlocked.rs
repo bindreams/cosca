@@ -47,8 +47,6 @@ impl SharedChild {
     fn platform_wait(&self, deadline: Option<Instant>) -> io::Result<Unlocked> {
         use std::os::fd::AsFd;
 
-        use rustix::event::{poll, PollFd, PollFlags, Timespec};
-
         use crate::wait::exit_only::{self, Peek, Target};
 
         let Some(pidfd) = &self.pidfd else {
@@ -56,42 +54,7 @@ impl SharedChild {
         };
         #[cfg(test)]
         exit_only::seams::step(exit_only::seams::HolderStep::Poll);
-        let seen = crate::wait::rearm_until(deadline.map(Some), |remaining| {
-            // Capped like every timed block; the round is re-armed against the real deadline.
-            let remaining = remaining.map(crate::wait::clamp_block);
-            #[cfg(test)]
-            crate::wait::block_probe::record(remaining);
-            let ts = remaining.map(|d| Timespec {
-                tv_sec: d.as_secs() as i64,
-                tv_nsec: d.subsec_nanos() as _,
-            });
-            // A deadline wait never arms an unbounded poll.
-            debug_assert!(
-                deadline.is_none() || ts.is_some(),
-                "a deadline wait armed an unbounded poll"
-            );
-            let mut fds = [PollFd::new(pidfd, PollFlags::IN)];
-            match poll(&mut fds, ts.as_ref()) {
-                Ok(0) => Ok(None),
-                Ok(_) => {
-                    let revents = fds[0].revents();
-                    // POLLNVAL on an fd we own and hold alive is a contract violation.
-                    debug_assert!(
-                        !revents.contains(PollFlags::NVAL),
-                        "pidfd reported POLLNVAL: owned-fd contract violation"
-                    );
-                    if revents.contains(PollFlags::ERR) {
-                        return Err(io::Error::other("pidfd poll returned POLLERR"));
-                    }
-                    // POLLIN (zombie), or POLLHUP once reaped.
-                    Ok(Some(()))
-                }
-                // A signal: go round again against the recomputed remaining time.
-                Err(rustix::io::Errno::INTR) => Ok(None),
-                Err(e) => Err(io::Error::from(e)),
-            }
-        })?;
-        if seen.is_some() {
+        if crate::wait::poll_pidfd_exit(pidfd.as_fd(), deadline.map(Some))? {
             return Ok(Unlocked::ExitSeen);
         }
         // Expired: one final peek.

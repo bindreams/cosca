@@ -6,18 +6,25 @@ use crate::oneshot_hook::{arm, fire, Armed, OneShotHook};
 /// Where in a graceful shutdown a test hook runs.
 #[derive(Clone, Copy)]
 pub(crate) enum HookPoint {
-    /// After `terminate_tree` returned `Ok` (or was held), before any drain or exit watch.
+    /// After `terminate_tree` returned `Ok` (or was held), or the `SIGTERM` to a root its handle
+    /// cannot answer for went out through its pidfd, before any drain or exit watch.
     AfterTerminate,
     /// After the kill or sweep returned `Ok` (or was skipped), before the root is reaped.
     BeforeReap,
     /// `graceful_shutdown`: after the grace ran out, before the escalation.
     BeforeEscalation,
+    /// A tree call (`kill_tree`, `terminate_tree`, `graceful_shutdown_tree`): after its one look at
+    /// the root, before anything is sent.
+    #[cfg(unix)]
+    AfterRootLook,
 }
 
 thread_local! {
     static AFTER_TERMINATE: OneShotHook = const { OneShotHook::new() };
     static BEFORE_REAP: OneShotHook = const { OneShotHook::new() };
     static BEFORE_ESCALATION: OneShotHook = const { OneShotHook::new() };
+    #[cfg(unix)]
+    static AFTER_ROOT_LOOK: OneShotHook = const { OneShotHook::new() };
 }
 
 fn slot(point: HookPoint) -> &'static std::thread::LocalKey<OneShotHook> {
@@ -25,6 +32,8 @@ fn slot(point: HookPoint) -> &'static std::thread::LocalKey<OneShotHook> {
         HookPoint::AfterTerminate => &AFTER_TERMINATE,
         HookPoint::BeforeReap => &BEFORE_REAP,
         HookPoint::BeforeEscalation => &BEFORE_ESCALATION,
+        #[cfg(unix)]
+        HookPoint::AfterRootLook => &AFTER_ROOT_LOOK,
     }
 }
 

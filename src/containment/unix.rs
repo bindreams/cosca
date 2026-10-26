@@ -35,18 +35,11 @@
 //! the group's actual membership — see the `group` submodule.
 //!
 //! # PGID-reuse caveat
-//! Reaping the leader (`wait`) alone is harmless: `killpg` on an absent pgid returns `ESRCH`,
-//! which `signal_group`/`verify` above already treat as `Cleared`. The actual hazard is
-//! narrower — the kernel recycling the leader's already-reaped PID/PGID onto a *different,
-//! live* process group before `kill_tree`/`term_group` next runs: only then does `killpg` risk
-//! signalling that unrelated group. This is reachable without an explicit `wait()` before
-//! `kill_tree()`: `SharedChild::adopt` (inside `Command::spawn`) reaps nothing, but something
-//! else in the process can reap a fast-exiting leader (`SIGCHLD` set to `SIG_IGN`, a
-//! `waitpid(-1)` reaper) before the caller ever gets a `Child` handle back — see
-//! `Child::kill_tree`'s precondition assert (`src/child.rs`), which fires on POSITIVE
-//! evidence of an actual recycle (a different, live identity at the same pid), not on a mere
-//! reap. cgroup v2 and the identity-reverifying TreeWalk mechanism do not have this hole at
-//! all — prefer them when the guarantee matters.
+//! Once the leader is reaped its PID/PGID may be reissued, and `killpg` would then signal that
+//! process's group. `kill_tree`/`terminate_tree` look at the root through its handle first
+//! (`child::tree_call::root_number`) and send no `killpg` for a root shown reaped elsewhere; the
+//! residual windows are documented on `Child::kill_tree`. cgroup v2 names no pid and has no such
+//! hole.
 
 use std::io;
 
@@ -109,10 +102,23 @@ pub(crate) fn kill_group(pgid: i32) -> Result<(), Error> {
 pub(crate) mod fault {
     use std::cell::{Cell, RefCell};
 
+    type OnSend = Box<dyn FnMut(i32)>;
+
     thread_local! {
         static TERMED: RefCell<Option<Vec<i32>>> = const { RefCell::new(None) };
         static KILLED: RefCell<Option<Vec<i32>>> = const { RefCell::new(None) };
         static FAIL: Cell<bool> = const { Cell::new(false) };
+        static ON_TERM: RefCell<Option<OnSend>> = const { RefCell::new(None) };
+        static ON_KILL: RefCell<Option<OnSend>> = const { RefCell::new(None) };
+    }
+
+    /// Runs `slot`'s hook, if any, on `pgid`, with the slot free while it runs.
+    fn fire(slot: &'static std::thread::LocalKey<RefCell<Option<OnSend>>>, pgid: i32) {
+        let Some(mut hook) = slot.with(|h| h.borrow_mut().take()) else {
+            return;
+        };
+        hook(pgid);
+        slot.with(|h| *h.borrow_mut() = Some(hook));
     }
 
     /// From now on `kill_group` on THIS thread records its group and sends nothing, so a test can
@@ -123,33 +129,39 @@ pub(crate) mod fault {
     }
 
     /// From now on `term_group` on THIS thread records its group and sends nothing.
-    #[cfg(target_os = "macos")]
     pub(crate) fn record_term_group() -> TermGroupRecorder {
         TERMED.with(|t| *t.borrow_mut() = Some(Vec::new()));
         TermGroupRecorder(())
     }
 
-    #[cfg(target_os = "macos")]
     #[must_use = "recording stops as soon as the recorder is dropped"]
     pub(crate) struct TermGroupRecorder(());
 
-    #[cfg(target_os = "macos")]
     impl TermGroupRecorder {
         /// The groups `term_group` was asked to signal since the recorder was made.
         pub(crate) fn termed(&self) -> Vec<i32> {
             TERMED.with(|t| t.borrow().clone().expect("the recorder is live"))
         }
+
+        /// Runs `hook` at each recorded send, given its group.
+        pub(crate) fn on_send(&self, hook: impl FnMut(i32) + 'static) {
+            ON_TERM.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+        }
     }
 
-    #[cfg(target_os = "macos")]
     impl Drop for TermGroupRecorder {
         fn drop(&mut self) {
             TERMED.with(|t| *t.borrow_mut() = None);
+            ON_TERM.with(|h| *h.borrow_mut() = None);
         }
     }
 
     pub(super) fn intercept_term_group(pgid: i32) -> bool {
-        TERMED.with(|t| t.borrow_mut().as_mut().map(|termed| termed.push(pgid)).is_some())
+        let recorded = TERMED.with(|t| t.borrow_mut().as_mut().map(|termed| termed.push(pgid)).is_some());
+        if recorded {
+            fire(&ON_TERM, pgid);
+        }
+        recorded
     }
 
     #[must_use = "recording stops as soon as the recorder is dropped"]
@@ -165,6 +177,11 @@ pub(crate) mod fault {
         /// The groups `kill_group` was asked to kill since the recorder was made.
         pub(crate) fn killed(&self) -> Vec<i32> {
             KILLED.with(|k| k.borrow().clone().expect("the recorder is live"))
+        }
+
+        /// Runs `hook` at each recorded send, given its group.
+        pub(crate) fn on_send(&self, hook: impl FnMut(i32) + 'static) {
+            ON_KILL.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
         }
 
         /// Asserts `pgid` was killed, and nothing else was. More than once is fine: a macOS fd
@@ -183,22 +200,23 @@ pub(crate) mod fault {
         fn drop(&mut self) {
             KILLED.with(|k| *k.borrow_mut() = None);
             FAIL.with(|f| f.set(false));
+            ON_KILL.with(|h| *h.borrow_mut() = None);
         }
     }
 
     pub(super) fn intercept_kill_group(pgid: i32) -> Option<Result<(), crate::error::Error>> {
-        KILLED.with(|k| {
-            k.borrow_mut().as_mut().map(|killed| {
-                killed.push(pgid);
-                if FAIL.with(|f| f.get()) {
-                    Err(crate::error::Error::Unassessable {
-                        detail: "forced by a test".into(),
-                        source: None,
-                    })
-                } else {
-                    Ok(())
-                }
+        let recorded = KILLED.with(|k| k.borrow_mut().as_mut().map(|killed| killed.push(pgid)).is_some());
+        if !recorded {
+            return None;
+        }
+        fire(&ON_KILL, pgid);
+        Some(if FAIL.with(|f| f.get()) {
+            Err(crate::error::Error::Unassessable {
+                detail: "forced by a test".into(),
+                source: None,
             })
+        } else {
+            Ok(())
         })
     }
 }
@@ -222,15 +240,10 @@ pub(crate) fn term_group(pgid: i32) -> Result<(), Error> {
 /// the broadcast/double-negation hazard this file's Background measures. A check placed after
 /// the dangerous syscall it claims to guard is not a guard.
 fn signal_group(pgid: i32, signal: Signal) -> Result<(), Error> {
-    // NOT a debug_assert!: unlike the reaped-root precondition in `Child::kill_tree`/
-    // `terminate_tree`, an invalid `pgid` reaching this function is a directly
-    // and deliberately TESTED, ordinary input-validation outcome, not a "should never happen"
-    // internal contract — `kill_group_and_term_group_reject_non_positive_pgid` (this file)
-    // calls this path with `0`/`-1`/`i32::MIN` on purpose and asserts a plain `Err`, not a
-    // panic. A `debug_assert!` here would turn that legitimate, always-possible defensive
-    // check into a test-build panic and break that test outright — the two are not the same
-    // kind of precondition, even though both guard "this input should not reach the syscall
-    // below."
+    // NOT a debug_assert!: an invalid `pgid` reaching this function is a directly and deliberately
+    // TESTED, ordinary input-validation outcome, not a "should never happen" internal contract —
+    // `kill_group_and_term_group_reject_non_positive_pgid` (this file) calls this path with
+    // `0`/`-1`/`i32::MIN` on purpose and asserts a plain `Err`, not a panic.
     if pgid <= 0 {
         return Err(Error::Unassessable {
             detail: format!(

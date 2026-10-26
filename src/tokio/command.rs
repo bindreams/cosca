@@ -22,7 +22,7 @@ pub struct Command {
 
 impl Command {
     /// The sync builder this one wraps, for the frozen spawn, which shares its core.
-    pub(super) fn as_sync_mut(&mut self) -> &mut SyncCommand {
+    pub(crate) fn as_sync_mut(&mut self) -> &mut SyncCommand {
         &mut self.inner
     }
 
@@ -112,7 +112,7 @@ impl Command {
         self
     }
     /// Contain the child's tree with the strongest available mechanism. See
-    /// [`Command::contain`](crate::Command::contain) for the Linux precondition.
+    /// [`Command::contain`](crate::Command::contain) for a child reaped by something else.
     ///
     /// tokio itself can fail a spawn after forking the child, and then drops it neither killed nor
     /// reaped, without reporting its pid. Only a child contained in a cgroup leaf
