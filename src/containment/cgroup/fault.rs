@@ -53,6 +53,7 @@ thread_local! {
     static PROBE_DUMPABLE: Cell<bool> = const { Cell::new(false) };
     static BEFORE_PROBE_PIN: std::cell::RefCell<Option<ProbePinHook>> = const { std::cell::RefCell::new(None) };
     static BEFORE_PROBE_KILL: std::cell::RefCell<Option<ProbePinHook>> = const { std::cell::RefCell::new(None) };
+    static PROBE_STEPS: std::cell::RefCell<Vec<ProbeStep>> = const { std::cell::RefCell::new(Vec::new()) };
     static CGROUP_ID_FAILS: Cell<Option<i32>> = const { Cell::new(None) };
     static LIVENESS_READ_FAILS: Cell<Option<i32>> = const { Cell::new(None) };
     static SUBTREE_FAILS: Cell<Option<i32>> = const { Cell::new(None) };
@@ -247,6 +248,26 @@ impl Drop for BeforeProbeKill {
     fn drop(&mut self) {
         BEFORE_PROBE_KILL.with(|h| *h.borrow_mut() = None);
     }
+}
+
+/// A step of a placement probe's end, in order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProbeStep {
+    /// A kill of the probe's child (the signal's number), recorded once the syscall, or the seam
+    /// standing in for it, answered.
+    Kill(crate::send_log::Via, i32),
+    /// The reap of the probe's child, and the signal that ended it (`None`: it exited).
+    Reap(crate::send_log::Via, Option<i32>),
+}
+
+/// Notes a step of a placement probe's end on this thread.
+pub(crate) fn record_probe_step(step: ProbeStep) {
+    PROBE_STEPS.with(|s| s.borrow_mut().push(step));
+}
+
+/// The steps of the placement probes' ends on this thread since the last call.
+pub(crate) fn take_probe_steps() -> Vec<ProbeStep> {
+    PROBE_STEPS.with(|s| std::mem::take(&mut *s.borrow_mut()))
 }
 
 /// Runs the [`set_before_probe_kill`] hook, if armed: the errno the `pidfd_send_signal` fails with.

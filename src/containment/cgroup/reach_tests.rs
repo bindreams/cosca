@@ -6,7 +6,8 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use super::{dying_in, front_placement, Subtree};
-use crate::containment::cgroup::fault;
+use crate::containment::cgroup::fault::{self, ProbeStep};
+use crate::send_log::Via;
 use crate::test_groups::{cgroup, Group};
 
 /// A cgroup id with bits above the low 32, as kernfs gives once its 32-bit counter wraps.
@@ -443,11 +444,14 @@ fn the_probe_child_dies_with_the_thread_that_forked_it() {
             let mut probe = super::fork_probe(parent, false).expect("fork the probe");
             let mut report = [0u8; 2];
             probe.ready_read.read_exact(&mut report).expect("the probe reports");
-            ready_tx.send((probe.pid, report)).expect("report the probe");
+            // Kept past this thread's end: the probe exits by itself once it closes.
+            ready_tx
+                .send((probe.pid, report, probe.release))
+                .expect("report the probe");
             // The thread ends when the test lets it go, or when the test fails and drops `go_tx`.
             _ = go_rx.recv();
         });
-        let (pid, report) = ready_rx.recv().expect("the probe's pid");
+        let (pid, report, _release) = ready_rx.recv().expect("the probe's pid");
         let pidfd = ProbeGuard(
             rustix::process::pidfd_open(
                 rustix::process::Pid::from_raw(pid).expect("a positive pid"),
@@ -502,18 +506,22 @@ fn a_probe_whose_parent_is_gone_exits_without_reporting() {
     assert_eq!(status.exit_status(), Some(0));
 }
 
-/// The probe's child is killed through a pidfd that names it, never by its number. Mutant: "kill
-/// the probe's child by pid".
+/// The probe's child is killed through a pidfd that names it, never by its number, and reaped
+/// through it. Mutants: "kill the probe's child by pid", "the kill is recorded and not made" (the
+/// child then exits by itself, unkilled, once its release pipe closes).
 #[skuld::test]
 fn the_probe_child_is_killed_through_its_pidfd() {
-    use crate::send_log::{Capture, Via};
-    use crate::signal::Sig;
     let _missing = fault::miss_pidfd_info();
     let _hidden = fault::hide_proc();
-    let capture = Capture::start();
+    fault::take_probe_steps();
     front_placement(|| Ok(HIGH)).expect_err("a hidden /proc refuses");
-    let sends: Vec<_> = capture.entries().into_iter().map(|(_, sig, via)| (sig, via)).collect();
-    assert_eq!(sends, [(Sig::Kill, Via::Pidfd)]);
+    assert_eq!(
+        fault::take_probe_steps(),
+        [
+            ProbeStep::Kill(Via::Pidfd, libc::SIGKILL),
+            ProbeStep::Reap(Via::Pidfd, Some(libc::SIGKILL))
+        ]
+    );
 }
 
 /// Whether no child of this process holds `pid`: a probe's child that was reaped, by anyone.
@@ -531,12 +539,10 @@ fn no_child_holds(pid: libc::pid_t) -> Result<bool, rustix::io::Errno> {
 }
 
 /// A probe's child that no pidfd can pin (`pidfd_open` fails with `EMFILE`) is killed and reaped by
-/// its number, as before pidfds, and no probe process is left. Mutant: "a failed `pidfd_open`
-/// returns, leaving the probe's child paused".
+/// its number, as before pidfds, and no probe process is left. Mutants: "a failed `pidfd_open`
+/// returns, leaving the probe's child paused", "the kill by number is not made".
 #[skuld::test]
 fn a_probe_child_no_pidfd_can_pin_is_killed_and_reaped_by_its_number() {
-    use crate::send_log::{Capture, Via};
-    use crate::signal::Sig;
     let _missing = fault::miss_pidfd_info();
     let _hidden = fault::hide_proc();
     let forked = std::rc::Rc::new(std::cell::Cell::new(None));
@@ -547,10 +553,16 @@ fn a_probe_child_no_pidfd_can_pin_is_killed_and_reaped_by_its_number() {
             Some(libc::EMFILE)
         }
     });
-    let capture = Capture::start();
+    fault::take_probe_steps();
     front_placement(|| Ok(HIGH)).expect_err("a hidden /proc refuses");
     let pid = forked.get().expect("the probe forked");
-    assert_eq!(capture.entries(), [(pid as u32, Sig::Kill, Via::Pid)]);
+    assert_eq!(
+        fault::take_probe_steps(),
+        [
+            ProbeStep::Kill(Via::Pid, libc::SIGKILL),
+            ProbeStep::Reap(Via::Pid, Some(libc::SIGKILL))
+        ]
+    );
     assert_eq!(no_child_holds(pid), Ok(true), "the probe's child {pid} is left");
 }
 
@@ -566,19 +578,18 @@ fn a_probe_child_reaped_elsewhere_before_its_pin_is_sent_nothing() {
         crate::test_child::reaped_elsewhere::reap_behind(pid as u32);
         None
     });
-    let capture = crate::send_log::Capture::start();
+    fault::take_probe_steps();
     let err = front_placement(|| Ok(HIGH)).expect_err("the probe has no child left");
-    assert_eq!(capture.entries(), [], "nothing was sent");
+    assert_eq!(fault::take_probe_steps(), [], "nothing was sent");
     assert!(matches!(err, crate::error::Error::Io(_)), "{err:?}");
 }
 
-/// A probe's child whose kill through its pidfd fails other than `ESRCH` is still killed and reaped,
-/// by its number, as when no pidfd can be opened: no probe process is left. Mutant: "a failed send
-/// returns, leaving the probe's child paused".
+/// A probe's child whose kill through its pidfd fails other than `ESRCH` is killed by its number,
+/// and reaped through the pidfd that still names it: no probe process is left, and nothing reaps by
+/// number. Mutants: "a failed send returns, leaving the probe's child paused", "the reap goes by
+/// number".
 #[skuld::test]
-fn a_probe_child_whose_pidfd_send_fails_is_killed_and_reaped_by_its_number() {
-    use crate::send_log::{Capture, Via};
-    use crate::signal::Sig;
+fn a_probe_child_whose_pidfd_send_fails_is_killed_by_its_number_and_reaped_through_its_pidfd() {
     let _missing = fault::miss_pidfd_info();
     let _hidden = fault::hide_proc();
     let forked = std::rc::Rc::new(std::cell::Cell::new(None));
@@ -589,12 +600,16 @@ fn a_probe_child_whose_pidfd_send_fails_is_killed_and_reaped_by_its_number() {
             Some(libc::EPERM)
         }
     });
-    let capture = Capture::start();
+    fault::take_probe_steps();
     front_placement(|| Ok(HIGH)).expect_err("a hidden /proc refuses");
     let pid = forked.get().expect("the probe's child was to be killed");
     assert_eq!(
-        capture.entries(),
-        [(pid as u32, Sig::Kill, Via::Pidfd), (pid as u32, Sig::Kill, Via::Pid)]
+        fault::take_probe_steps(),
+        [
+            ProbeStep::Kill(Via::Pidfd, libc::SIGKILL),
+            ProbeStep::Kill(Via::Pid, libc::SIGKILL),
+            ProbeStep::Reap(Via::Pidfd, Some(libc::SIGKILL))
+        ]
     );
     assert_eq!(no_child_holds(pid), Ok(true), "the probe's child {pid} is left");
 }
@@ -604,8 +619,6 @@ fn a_probe_child_whose_pidfd_send_fails_is_killed_and_reaped_by_its_number() {
 /// zombie", "`ESRCH` falls back to the number".
 #[skuld::test]
 fn a_probe_child_already_dead_at_its_pidfd_send_is_reaped_through_the_pidfd() {
-    use crate::send_log::{Capture, Via};
-    use crate::signal::Sig;
     let _missing = fault::miss_pidfd_info();
     let _hidden = fault::hide_proc();
     let forked = std::rc::Rc::new(std::cell::Cell::new(None));
@@ -619,9 +632,15 @@ fn a_probe_child_already_dead_at_its_pidfd_send_is_reaped_through_the_pidfd() {
             Some(libc::ESRCH)
         }
     });
-    let capture = Capture::start();
+    fault::take_probe_steps();
     front_placement(|| Ok(HIGH)).expect_err("a hidden /proc refuses");
     let pid = forked.get().expect("the probe's child was to be killed");
-    assert_eq!(capture.entries(), [(pid as u32, Sig::Kill, Via::Pidfd)]);
+    assert_eq!(
+        fault::take_probe_steps(),
+        [
+            ProbeStep::Kill(Via::Pidfd, libc::SIGKILL),
+            ProbeStep::Reap(Via::Pidfd, Some(libc::SIGKILL))
+        ]
+    );
     assert_eq!(no_child_holds(pid), Ok(true), "the probe's child {pid} is left");
 }
