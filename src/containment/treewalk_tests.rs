@@ -273,7 +273,8 @@ fn kill_by_identity_spares_a_stale_identity_and_kills_a_matching_one() {
     use windows::Win32::System::Threading::PROCESS_QUERY_LIMITED_INFORMATION;
     // The ACE must grant QUERY_LIMITED as well as TERMINATE: kill_by_identity opens for
     // both, and a combined-mask OpenProcess fails entirely if ANY requested bit is ungranted.
-    let child = crate::identity::windows_fixture::spawn_restricted(&done, PROCESS_QUERY_LIMITED_INFORMATION.0);
+    let (child, stdin) =
+        crate::identity::windows_fixture::spawn_restricted_releasable(&done, PROCESS_QUERY_LIMITED_INFORMATION.0);
     let real = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
         .expect("the owned handle always yields an identity");
     let stale = crate::identity::ProcessId::from_parts_for_test(real.pid(), real.start_token_raw() ^ 1);
@@ -291,9 +292,15 @@ fn kill_by_identity_spares_a_stale_identity_and_kills_a_matching_one() {
     assert_eq!(
         super::kill_by_identity(real),
         super::KillOutcome::Terminated,
-        "a matching identity must reach TerminateProcess - otherwise the wait below is unbounded"
+        "a matching identity must reach TerminateProcess"
     );
-    // Bounded by the exit kill_by_identity just reported it requested.
+    // The child reads `stdin` to its end and exits 0, so a kill that sent nothing ends the wait
+    // below with that code, not with the kill's `1`.
+    drop(stdin);
     child.await_exit();
-    assert!(!child.is_running(), "a matching identity must terminate the process");
+    assert_eq!(
+        child.exit_code(),
+        1,
+        "a matching identity must terminate the process, not leave it to exit when released"
+    );
 }

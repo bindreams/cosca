@@ -93,6 +93,23 @@ mod on_windows {
         crate::test_child::assert_killed("the resumed child", child.wait().expect("reap the resumed child"));
     }
 
+    /// [`end`] for children alive at once. Every kill is sent and every stdin released before any
+    /// assertion: a child still holding its stdin when an earlier assertion fails would make its own
+    /// drop block for ever.
+    fn end_all(mut children: Vec<crate::Child>) {
+        let stdins: Vec<_> = children
+            .iter_mut()
+            .map(|child| child.stdin().expect("the blocker's piped stdin"))
+            .collect();
+        for child in &mut children {
+            child.kill().expect("kill the resumed child");
+        }
+        drop(stdins);
+        for child in children {
+            crate::test_child::assert_killed("the resumed child", child.wait().expect("reap the resumed child"));
+        }
+    }
+
     // Refusals =====
 
     #[skuld::test]
@@ -485,8 +502,7 @@ mod on_windows {
             let b = blocker(false).spawn_suspended().expect("second");
             let (x, y) = if in_spawn_order { (a, b) } else { (b, a) };
             let (cx, cy) = (x.resume().expect("resume x"), y.resume().expect("resume y"));
-            end(cx);
-            end(cy);
+            end_all(vec![cx, cy]);
         }
     }
 
