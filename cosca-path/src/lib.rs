@@ -78,9 +78,11 @@ pub trait PurePath: Eq + Ord + Hash + Debug + ToOwned<Owned = Self::Buf> {
     fn is_bare_name(&self) -> bool;
 
     /// Removes `.` components, `name/..` pairs and repeated separators, as C++'s
-    /// `lexically_normal` does, except that separators alone collapse to the root. Trailing
-    /// separators and names (trailing dots included) stay; `..` at the root is dropped; an emptied
-    /// relative path becomes `.`. `link/..` is not the parent of `link`'s target.
+    /// `lexically_normal` does, except that separators alone collapse to the root. Names stay,
+    /// trailing dots included. A path that ended in a separator, `.` or `name/..` ends in one
+    /// separator after a name (`a/.` and `a/b/..` are `a/`), but never after `..` (`../` is `..`);
+    /// `..` at the root is dropped; an emptied relative path becomes `.`. `link/..` is not the
+    /// parent of `link`'s target.
     fn lexically_normal(&self) -> Self::Buf;
 
     /// A lossy adapter for user messages: anything that is not Unicode becomes U+FFFD.

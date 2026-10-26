@@ -3,11 +3,11 @@
 //! A path is an [`Anchor`], then components separated by `\` or `/`. The anchors follow Win32's
 //! path types (`RtlDetermineDosPathNameType_U`): two separators and `.` or `?` and a separator
 //! start a device path, any other two separators a UNC path, one a rooted path, and any one UTF-16
-//! unit then `:` a drive. A repeated or trailing separator is an
-//! [`Empty`](crate::Component::Empty) component, so the anchor's text, its root separator and the
-//! components spell the path back, up to the choice of separator. The [`Anchor`] value alone does
-//! not: `\\s` and `\\s\`, `\\.\x` and `\\?/x`, `C:/a` and `C:\a` each share an anchor and
-//! components.
+//! unit then `:` a drive. Within an anchor, the parse skips what Win32 skips (see [`Anchor`]). A
+//! repeated or trailing separator after the anchor is an [`Empty`](crate::Component::Empty)
+//! component, so the anchor's text, its root separator and the components spell the path back, up
+//! to the choice of separator. The [`Anchor`] value alone does not: `\\s` and `\\s\`, `\\s\h` and
+//! `\\s\\h`, `\\.\x` and `\\?/x`, `C:/a` and `C:\a` each share an anchor and components.
 //!
 //! Parsing drops a verbatim `\\?\` prefix: `\\?\C:\x` is stored as `C:\x`, `\\?\UNC\s\h` as
 //! `\\s\h`, and any other verbatim rest as the device path `\\.\` and that rest. Stored text never
@@ -16,7 +16,9 @@
 //! So the stored text ([`Path::as_os_str`]) is a lexical spelling, not a string to hand Win32.
 //! Win32 reads `\\?\C:\a.` as written but the stored `C:\a.` as `C:\a`, and `\\?\C:\nul` as a
 //! file but `C:\nul` as the NUL device; the stored text also loses a long verbatim path's exemption
-//! from `MAX_PATH`. Nothing here converts a path for Win32.
+//! from `MAX_PATH`. Nothing here converts a path for Win32 yet: `Path::to_wide` and
+//! `Path::to_std_path` arrive with that conversion, and will hand over the string that names the
+//! same object.
 
 use std::borrow::{Borrow, Cow};
 use std::cmp::Ordering;
@@ -57,10 +59,17 @@ pub enum Anchor<'a> {
     Rooted,
     /// `C:a` (`rooted: false`, relative to that drive's current directory) or `C:\a`.
     Drive { drive: Drive, rooted: bool },
-    /// `\\server\share`. The share is empty when missing: `\\server`, `\\server\`.
+    /// `\\server\share`. A share that does not directly follow the server's separator Win32
+    /// resolves against `\\server\`, as it does a device name: empty names, `.` and `..` before it
+    /// are skipped (`\\s\\h` and `\\s\\.\h` are the share `h`; `\\s\.\h` is the share `.`), and
+    /// to `..` after it the share is a component. The share is empty when missing: `\\server`,
+    /// `\\server\`, `\\server\\`.
     Unc { server: &'a OsStr, share: &'a OsStr },
     /// `\\.\name` or `\\?/name`, and `\\?\name` for any verbatim rest that is not a drive or UNC
-    /// path (`\\?\C:foo` is the device `C:foo`). `\\.` alone is the device with an empty name.
+    /// path (`\\?\C:foo` is the device `C:foo`). Win32 resolves the name against the device root,
+    /// so empty names, `.` and `..` before it are skipped (`\\.\.\x` and `\\.\..\x` are the
+    /// device `x`), and to `..` after it the name is a component (see
+    /// [`PurePath::lexically_normal`]). The name is empty when missing: `\\.`, `\\.\`, `\\.\..`.
     Device { name: &'a OsStr },
 }
 
@@ -69,9 +78,12 @@ pub enum Anchor<'a> {
 pub struct Unc<'a> {
     pub server: &'a OsStr,
     pub share: &'a OsStr,
-    /// The text after the share and its separator, as written. It is not a path of its own:
-    /// `\\s\h\\x` has the rest `\x`, which would parse as rooted.
-    pub rest: &'a OsStr,
+    /// The path within the share: the text from the last separator after the share, so empty or
+    /// rooted. Win32 collapses the separators it skips: `\\s\h\a` and `\\s\h\\a` both have the
+    /// rest `\a`, and `\\s\h` the empty rest. After a share that Win32 reads as a component (see
+    /// [`Anchor::Unc`]), a `..` in the rest pops the share itself: `\\s\\h\..\x` has the share `h`
+    /// and the rest `\..\x`, and Win32 reads it as the share `x`.
+    pub rest: &'a Path,
 }
 
 /// Whether `s` starts with the verbatim prefix `\\?\`, exactly: `//?/` is a device path, not
@@ -126,6 +138,13 @@ struct Parts<'a> {
     anchor: Anchor<'a>,
     head: usize,
     root: bool,
+    /// Whether the anchor's text ends in a separator after the server or `\\.`. Read only for an
+    /// unfinished anchor.
+    open: bool,
+    /// For a device path, or a UNC path whose share does not directly follow the server's
+    /// separator: the length of the root Win32 resolves the rest against, `\\.\` or `\\server\`.
+    /// Under that root the device name or share is a component that `..` can pop.
+    loose_root: Option<usize>,
 }
 
 impl Parts<'_> {
@@ -133,16 +152,13 @@ impl Parts<'_> {
         self.head + usize::from(self.root)
     }
 
-    /// For a UNC path with no share or a device path with no name, and no root separator after
-    /// it: whether the separator after the server (or after `\\.`) is there. `None` for any
-    /// other anchor. Such an anchor takes the first component appended to it as its own.
+    /// For a UNC path with no share or a device path with no name: whether the anchor ends in a
+    /// separator after the server (or after `\\.`). `None` for any other anchor. Such an anchor
+    /// takes the first component appended to it as its own, and has no root separator.
     fn unfinished(&self) -> Option<bool> {
-        if self.root {
-            return None;
-        }
         match self.anchor {
-            Anchor::Unc { server, share } if share.as_wtf8().is_empty() => Some(self.head > 2 + server.as_wtf8().len()),
-            Anchor::Device { name } if name.as_wtf8().is_empty() => Some(self.head > 3),
+            Anchor::Unc { share, .. } if share.as_wtf8().is_empty() => Some(self.open),
+            Anchor::Device { name } if name.as_wtf8().is_empty() => Some(self.open),
             _ => None,
         }
     }
@@ -151,71 +167,86 @@ impl Parts<'_> {
 fn parts(bytes: &[u8]) -> Parts<'_> {
     let sep = |i: usize| bytes.get(i).is_some_and(is_separator);
     let text = |range: std::ops::Range<usize>| OsStr::from_wtf8(&bytes[range]);
+    let plain = |anchor, head, root| Parts {
+        anchor,
+        head,
+        root,
+        open: false,
+        loose_root: None,
+    };
     if sep(0) {
         if !sep(1) {
-            return Parts {
-                anchor: Anchor::Rooted,
-                head: 0,
-                root: true,
-            };
+            return plain(Anchor::Rooted, 0, true);
         }
         if matches!(bytes.get(2), Some(b'.' | b'?')) {
             if bytes.len() == 3 {
-                return Parts {
-                    anchor: Anchor::Device { name: text(3..3) },
-                    head: 3,
-                    root: false,
-                };
+                return plain(Anchor::Device { name: text(3..3) }, 3, false);
             }
             if sep(3) {
-                let end = next_separator(bytes, 4);
-                let anchor = Anchor::Device { name: text(4..end) };
-                return Parts {
-                    anchor,
-                    head: end,
-                    root: sep(end),
-                };
+                return loose_parts(bytes, 4, |name| Anchor::Device { name });
             }
         }
         let server_end = next_separator(bytes, 2);
+        let server = text(2..server_end);
         if !sep(server_end) {
-            let anchor = Anchor::Unc {
-                server: text(2..server_end),
-                share: text(server_end..server_end),
-            };
-            return Parts {
-                anchor,
-                head: server_end,
-                root: false,
-            };
+            return plain(
+                Anchor::Unc {
+                    server,
+                    share: text(server_end..server_end),
+                },
+                server_end,
+                false,
+            );
+        }
+        if sep(server_end + 1) || server_end + 1 == bytes.len() {
+            return loose_parts(bytes, server_end + 1, |share| Anchor::Unc { server, share });
         }
         let share_end = next_separator(bytes, server_end + 1);
         let anchor = Anchor::Unc {
-            server: text(2..server_end),
+            server,
             share: text(server_end + 1..share_end),
         };
-        return Parts {
-            anchor,
-            head: share_end,
-            root: sep(share_end),
-        };
+        return plain(anchor, share_end, sep(share_end));
     }
     if let Some(len) = drive_len(bytes) {
         let unit = text(0..len - 1).to_wide()[0];
         let rooted = sep(len);
-        return Parts {
-            anchor: Anchor::Drive {
-                drive: Drive(unit),
-                rooted,
-            },
-            head: len,
-            root: rooted,
+        let anchor = Anchor::Drive {
+            drive: Drive(unit),
+            rooted,
         };
+        return plain(anchor, len, rooted);
     }
-    Parts {
-        anchor: Anchor::None,
-        head: 0,
-        root: false,
+    plain(Anchor::None, 0, false)
+}
+
+/// The parts of a path whose device name or share Win32 resolves against the root `bytes[..root]`
+/// (`\\.\`, `\\server\`). Empty names, `.` and `..` change nothing there: the name is the first
+/// other one, and the text before it belongs to the anchor.
+fn loose_parts<'a>(bytes: &'a [u8], root: usize, anchor: impl Fn(&'a OsStr) -> Anchor<'a>) -> Parts<'a> {
+    let mut start = root;
+    loop {
+        let end = next_separator(bytes, start);
+        let name = &bytes[start..end];
+        if !matches!(name, b"" | b"." | b"..") {
+            return Parts {
+                anchor: anchor(OsStr::from_wtf8(name)),
+                head: end,
+                root: end < bytes.len(),
+                open: false,
+                loose_root: Some(root),
+            };
+        }
+        if end == bytes.len() {
+            return Parts {
+                anchor: anchor(OsStr::from_wtf8(&bytes[end..])),
+                head: end,
+                root: false,
+                open: is_separator(&bytes[end - 1]),
+                loose_root: Some(root),
+            };
+        }
+        start = end + 1;
     }
 }
 
@@ -297,7 +328,9 @@ impl Path {
     }
 
     /// Whether the path needs no current directory: a drive and a root, a UNC path with a server
-    /// and a share, or a device path longer than `\\.` or `\\?` alone.
+    /// and a share, or a device path longer than `\\.` or `\\?` alone. A device path with no name
+    /// (`\\.\`) counts, as `RtlDetermineDosPathNameType_U` reports it a local device path rather
+    /// than the root local device `\\.`.
     pub fn is_fully_qualified(&self) -> bool {
         match self.anchor() {
             Anchor::Drive { rooted, .. } => rooted,
@@ -322,11 +355,16 @@ impl Path {
     pub fn as_unc(&self) -> Option<Unc<'_>> {
         let parts = self.parts();
         match parts.anchor {
-            Anchor::Unc { server, share } => Some(Unc {
-                server,
-                share,
-                rest: OsStr::from_wtf8(&self.bytes()[parts.start()..]),
-            }),
+            Anchor::Unc { server, share } => {
+                let bytes = self.bytes();
+                let separators = bytes[parts.head..].iter().take_while(|b| is_separator(b)).count();
+                let rest = &bytes[parts.head + separators.saturating_sub(1)..];
+                Some(Unc {
+                    server,
+                    share,
+                    rest: Path::from_wtf8(rest),
+                })
+            }
             _ => None,
         }
     }
@@ -386,10 +424,11 @@ impl PurePath for Path {
 
     /// As std's `push`: an `rhs` with a drive, share or device replaces `self`; a rooted `rhs`
     /// keeps `self`'s drive, share or device and replaces the rest; any other `rhs` is appended
-    /// after a `\` where one is needed (`C:` joined with `a` is `C:a`). An unfinished anchor takes
-    /// the first appended component as its own, as Win32 reads the string: `\\s` and `\\s\`
-    /// joined with `h` are both the share `\\s\h`. `\\?` joined with `x` is `\\?/x` (see
-    /// `respell_verbatim`).
+    /// after a `\` where one is needed (`C:` joined with `a` is `C:a`). An anchor with no share or
+    /// device name takes the first appended name as its own, as Win32 reads the joined string:
+    /// `\\s`, `\\s\` and `\\s\\` joined with `h` all have the share `h`, and a first `.` or `..`
+    /// counts only where it directly follows the server's separator (see [`Anchor::Unc`]). `\\?`
+    /// joined with `x` is `\\?/x` (see `respell_verbatim`).
     fn join(&self, rhs: &Path) -> PathBuf {
         match rhs.anchor() {
             Anchor::None => {}
@@ -444,19 +483,27 @@ impl PurePath for Path {
         !self.bytes().is_empty() && !self.bytes().iter().any(is_separator) && self.anchor() == Anchor::None
     }
 
-    /// As for POSIX, and: the anchor is kept as written, `\` goes between components, `..` is
-    /// dropped after a root separator (`C:\..` is `C:\`) and kept after `C:`, an emptied path
-    /// after `C:` stays `C:`, and a first name that would read as a drive keeps a `.` before it
-    /// (`.\a:`).
+    /// As for POSIX, and as Win32 reads `.` and `..`: the anchor is kept as written; `\` goes
+    /// between components; `..` is dropped after a root separator (`C:\..` is `C:\`) and kept
+    /// after `C:`; an emptied path after `C:` stays `C:`; and a first name that would read as a
+    /// drive keeps a `.` before it (`.\a:`). A device name, and a share after extra separators, is
+    /// the first component under `\\.\` or `\\server\` (see [`Anchor`]), so `..` pops it:
+    /// `\\.\d\..\a` is `\\.\a`, `\\s\\h\x` is `\\s\h\x` and `\\s\\h\..` is `\\s\`.
     fn lexically_normal(&self) -> PathBuf {
-        if self.bytes().is_empty() {
+        let bytes = self.bytes();
+        if bytes.is_empty() {
             return PathBuf::new();
         }
         let parts = self.parts();
+        let (prefix, root, pieces): (usize, bool, Vec<Component<'_, OsStr>>) = match parts.loose_root {
+            Some(len) => (len, true, bytes[len..].split(is_separator).map(component).collect()),
+            None => (parts.start(), parts.root, self.components().collect()),
+        };
+        let mut out = bytes[..prefix].to_vec();
         // Only `Normal` and `ParentDir` survive.
         let mut names: Vec<Component<'_, OsStr>> = Vec::new();
         let mut trailing = false;
-        for c in self.components() {
+        for c in pieces {
             match c {
                 Component::Normal(_) => {
                     names.push(c);
@@ -468,7 +515,7 @@ impl PurePath for Path {
                         names.pop();
                         trailing = !names.is_empty();
                     }
-                    None if parts.root => {}
+                    None if root => {}
                     _ => {
                         names.push(c);
                         trailing = false;
@@ -479,23 +526,22 @@ impl PurePath for Path {
         if names.last() == Some(&Component::ParentDir) {
             trailing = false;
         }
-        let mut bytes = self.bytes()[..parts.start()].to_vec();
         if parts.anchor == Anchor::None && names.first().is_some_and(|c| reads_as_drive(c.as_wtf8())) {
-            bytes.extend_from_slice(br".\");
+            out.extend_from_slice(br".\");
         }
         for (i, c) in names.iter().enumerate() {
             if i > 0 {
-                bytes.push(b'\\');
+                out.push(b'\\');
             }
-            bytes.extend_from_slice(c.as_wtf8());
+            out.extend_from_slice(c.as_wtf8());
         }
         if trailing {
-            bytes.push(b'\\');
+            out.push(b'\\');
         }
-        if bytes.is_empty() {
-            bytes.push(b'.');
+        if out.is_empty() {
+            out.push(b'.');
         }
-        PathBuf::from_wtf8(bytes)
+        PathBuf::from_wtf8(out)
     }
 
     fn to_str(&self) -> Option<&str> {

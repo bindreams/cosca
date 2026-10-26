@@ -385,6 +385,48 @@ fn anchors_follow_win32_path_types() {
     }
 }
 
+/// As Win32 reads them (`RtlDosPathNameToNtPathName_U`), empty names, `.` and `..` between `\\.\`
+/// and a device name are skipped, and so are they between `\\server\` and a share that does not
+/// directly follow it. A share that does is taken as written, `.` included. The skipped text
+/// belongs to the anchor.
+///
+/// Mutant: the empty name after `\\s\` is read as the share, so `\\s\\h` has an empty share.
+#[skuld::test]
+fn parsing_skips_what_win32_skips_before_a_share_or_device_name() {
+    let unc = |server, share| Anchor::Unc {
+        server: os(server),
+        share: os(share),
+    };
+    let device = |name| Anchor::Device { name: os(name) };
+    let cases = [
+        (r"\\s\\h\x", unc("s", "h"), vec![n("x")]),
+        (r"\\s\\\h\x", unc("s", "h"), vec![n("x")]),
+        ("//s//h/x", unc("s", "h"), vec![n("x")]),
+        (r"\\s\\h", unc("s", "h"), vec![]),
+        (r"\\\\s\h", unc("", "s"), vec![n("h")]),
+        (r"\\s\\", unc("s", ""), vec![]),
+        (r"\\s\.\h", unc("s", "."), vec![n("h")]),
+        (r"\\s\..\h", unc("s", ".."), vec![n("h")]),
+        (r"\\s\\.\h", unc("s", "h"), vec![]),
+        (r"\\s\\..\h\x", unc("s", "h"), vec![n("x")]),
+        (r"\\s\\.", unc("s", ""), vec![]),
+        (r"\\s\\h\..\x", unc("s", "h"), vec![Component::ParentDir, n("x")]),
+        (r"\\.\\x", device("x"), vec![]),
+        (r"\\.\.\x", device("x"), vec![]),
+        (r"\\.\..\x\y", device("x"), vec![n("y")]),
+        (r"\\.\.\..\\x\", device("x"), vec![]),
+        (r"\\?/./x", device("x"), vec![]),
+        (r"\\.\.", device(""), vec![]),
+        (r"\\.\..", device(""), vec![]),
+        (r"\\.\\", device(""), vec![]),
+        (r"\\.\d\..\x", device("d"), vec![Component::ParentDir, n("x")]),
+    ];
+    for (input, anchor, want) in cases {
+        assert_eq!(p(input).anchor(), anchor, "{input:?}");
+        assert_eq!(components(input), want, "{input:?}");
+    }
+}
+
 /// A drive's unit is any UTF-16 unit, a lone surrogate included.
 ///
 /// Mutant: the drive is read from the first byte, not the first unit.
@@ -423,7 +465,8 @@ fn shape_predicates_follow_the_anchor() {
 }
 
 /// A UNC path needs a non-empty server and share, and a device path more than `\\.` or `\\?`
-/// alone: otherwise it is not fully qualified.
+/// alone: otherwise it is not fully qualified. A device path with no name (`\\.\`) is, as
+/// `RtlDetermineDosPathNameType_U` reports it a local device path and not the root local device.
 ///
 /// Mutant: any UNC anchor, or a bare `\\.` or `\\?`, counts as fully qualified.
 #[skuld::test]
@@ -440,7 +483,11 @@ fn an_incomplete_unc_or_device_is_not_fully_qualified() {
         (r"\\s\h", true),
         (r"\\s\h\", true),
         (r"\\s\h\x", true),
+        (r"\\s\\h", true),
+        (r"\\s\\\h\x", true),
         (r"\\.\", true),
+        (r"\\.\\", true),
+        (r"\\.\..", true),
         (r"\\.\d", true),
         (r"\\?/", true),
     ];
@@ -464,18 +511,65 @@ fn a_bare_name_has_no_separator_or_drive() {
     }
 }
 
-/// `as_unc` views a UNC path's server, share and the text after the share's separator.
+/// `as_unc` views a UNC path's server, share and the rooted path within the share, from the last
+/// of the separators after the share, as Win32 collapses them.
 ///
-/// Mutant: `rest` keeps the separator after the share.
+/// Mutant: `rest` starts after the first separator, so `\\s\h\a` has the rest `a`.
 #[skuld::test]
 fn as_unc_views_server_share_and_rest() {
-    let path = p(r"\\s\h\a\\b");
-    let unc = path.as_unc().unwrap();
-    assert_eq!((unc.server, unc.share, unc.rest), (os("s"), os("h"), os(r"a\\b")));
-    let bare = p(r"\\s\h");
-    assert_eq!(bare.as_unc().unwrap().rest, os(""));
+    let cases = [
+        (r"\\s\h\a\\b", "s", "h", r"\a\\b"),
+        (r"\\s\\h\x", "s", "h", r"\x"),
+        (r"\\s\h\\x", "s", "h", r"\x"),
+        (r"\\s\h\\\?\x", "s", "h", r"\?\x"),
+        (r"\\s\h\C:x", "s", "h", r"\C:x"),
+        (r"\\s\h\", "s", "h", r"\"),
+        (r"\\s\h", "s", "h", ""),
+        (r"\\s", "s", "", ""),
+    ];
+    for (input, server, share, rest) in cases {
+        let path = p(input);
+        let unc = path.as_unc().unwrap();
+        assert_eq!(
+            (unc.server, unc.share, unc.rest.as_os_str()),
+            (os(server), os(share), os(rest)),
+            "{input:?}"
+        );
+    }
     assert!(p(r"\\.\d\x").as_unc().is_none());
     assert!(p(r"C:\x").as_unc().is_none());
+}
+
+/// For every small UNC path, the rest is empty or rooted, never a verbatim spelling, and holds the
+/// path's components without the empty names Win32 collapses after the share.
+///
+/// Mutant: `rest` keeps every separator after the share, so `\\s\h\\\?\x` has the verbatim rest
+/// `\\?\x`.
+#[skuld::test]
+fn a_unc_rest_is_the_rooted_path_within_the_share() {
+    let mut inputs = small_paths();
+    inputs.extend(
+        paths_over(&["a", ".", "?", "\\", "/"], 5)
+            .iter()
+            .map(|s| format!(r"\\s\h{s}")),
+    );
+    for (input, path) in parsed_grid(&inputs) {
+        let Some(unc) = path.as_unc() else {
+            continue;
+        };
+        let rest = unc.rest;
+        assert!(
+            rest.as_os_str().as_wtf8().is_empty() || rest.is_rooted(),
+            "{input:?} has the rest {rest:?}"
+        );
+        assert!(
+            !is_verbatim_spelling(rest.as_os_str()),
+            "{input:?} has the rest {rest:?}"
+        );
+        let want: Vec<_> = path.components().skip_while(|c| *c == Component::Empty).collect();
+        let got: Vec<_> = rest.components().collect();
+        assert_eq!(got, want, "{input:?} has the rest {rest:?}");
+    }
 }
 
 // Components ==========================================================================================================
@@ -779,9 +873,8 @@ fn join_completes_an_unfinished_anchor() {
     );
 }
 
-/// An unfinished anchor takes the first appended component whether or not its own separator is
-/// there: `\\s\` joined with `b` is `\\s\b`, as `\\s` joined with `b` is. A separator that ends the
-/// path after a name or share (`\\s\\`) is a root, and the component after it stays a component.
+/// An unfinished anchor takes the first appended component whether or not its own separators are
+/// there: `\\s\` and `\\s\\` joined with `b` have the share `b`, as `\\s` joined with `b` has.
 ///
 /// Mutant: the join adds a second `\` after `\\s\`, so the share stays empty.
 #[skuld::test]
@@ -800,31 +893,53 @@ fn join_completes_an_unfinished_anchor_with_or_without_its_separator() {
         (r"\\?/", "b", r"\\?/b"),
         (r"\\?/", r"\b", r"\\?/b"),
         (r"\\s\\", "b", r"\\s\\b"),
+        (r"\\s\\", r"\b", r"\\s\\b"),
+        (r"\\.\.", "b", r"\\.\.\b"),
+        (r"\\.\..", r"\b", r"\\.\..\b"),
+        (r"\\.\\", "b", r"\\.\\b"),
     ];
     for (lhs, rhs, want) in cases {
         let joined = p(lhs).join(&p(rhs));
         assert_eq!(joined.to_str(), Some(want), "{lhs:?} joined with {rhs:?}");
+        let took = match joined.anchor() {
+            Anchor::Unc { share, .. } => share,
+            Anchor::Device { name } => name,
+            other => panic!("{lhs:?} joined with {rhs:?} has the anchor {other:?}"),
+        };
+        assert_eq!(took, os("b"), "{lhs:?} joined with {rhs:?}");
     }
 }
 
-/// For every small path whose anchor lacks its share or device name but has the separator after
-/// the server (or `\\.`), dropping that separator changes no join.
+/// For every small path whose anchor lacks its share or device name but ends in separators after
+/// the server (or `\\.`), dropping those separators changes no join's anchor or components. Except
+/// for an rhs that starts with `.` or `..`: Win32 takes that as the share right after the server's
+/// separator (`\\s\.` is the share `.`) but skips it after more separators (`\\s\\.` has none).
 ///
-/// Mutant: the join keeps the separator when the rhs is rooted, so `\\s\` joined with `\h` is
-/// `\\s\\h`.
+/// Mutant: the join adds no separator after an unfinished anchor, so `\\s` joined with `b` is the
+/// server `sb`.
 #[skuld::test]
-fn an_unfinished_anchor_joins_the_same_with_or_without_its_separator() {
+fn an_unfinished_anchor_joins_the_same_with_or_without_its_separators() {
     let rhs_all = small_paths_up_to(3);
     for (_, lhs) in parsed_grid(&small_paths_up_to(5)) {
         if parts(lhs.bytes()).unfinished() != Some(true) {
             continue;
         }
-        let text = lhs.to_str().unwrap();
-        let without = p(&text[..text.len() - 1]);
+        // `\\` itself stays: it is the UNC prefix, not a separator after the server.
+        let mut text = lhs.to_str().unwrap();
+        while text.len() > 2 && text.ends_with(['\\', '/']) {
+            text = &text[..text.len() - 1];
+        }
+        let without = p(text);
         assert_eq!(parts(without.bytes()).unfinished(), Some(false), "{lhs:?}");
         // An empty rhs adds nothing, so it leaves each spelling as it was.
         for (_, rhs) in parsed_grid(&rhs_all).into_iter().filter(|(s, _)| !s.is_empty()) {
-            assert_eq!(lhs.join(&rhs), without.join(&rhs), "{lhs:?} joined with {rhs:?}");
+            if matches!(rhs.components().next(), Some(Component::CurDir | Component::ParentDir)) {
+                continue;
+            }
+            let (joined, joined_without) = (lhs.join(&rhs), without.join(&rhs));
+            let ctx = format!("{lhs:?} joined with {rhs:?} is {joined:?}, and without is {joined_without:?}");
+            assert_eq!(joined.anchor(), joined_without.anchor(), "{ctx}");
+            assert!(joined.components().eq(joined_without.components()), "{ctx}");
         }
     }
 }
@@ -939,7 +1054,7 @@ fn lexically_normal_collapses_only_dots_and_separators() {
         (r"C:\..\a", r"C:\a"),
         (r"\..\a", r"\a"),
         (r"\\s\h\..\a", r"\\s\h\a"),
-        (r"\\.\d\..", r"\\.\d\"),
+        (r"\\.\d\..", r"\\.\"),
         (r"C:..\a", r"C:..\a"),
         (r"..\a", r"..\a"),
         (r"a\\.\b", r"a\b"),
@@ -948,6 +1063,9 @@ fn lexically_normal_collapses_only_dots_and_separators() {
         (r"a.\b..\...", r"a.\b..\..."),
         (r"a \b", r"a \b"),
         (r"a\", r"a\"),
+        (r"a\.", r"a\"),
+        (r"a\b\..", r"a\"),
+        (r"..\", ".."),
         (r"a\..", "."),
         (r"C:a\..", "C:"),
         (r"\\s\h", r"\\s\h"),
@@ -955,6 +1073,47 @@ fn lexically_normal_collapses_only_dots_and_separators() {
     ];
     for (input, want) in cases {
         assert_eq!(p(input).lexically_normal().to_str(), Some(want), "input {input:?}");
+    }
+}
+
+/// Under `\\.\`, and under `\\server\` when extra separators precede the share, the device name or
+/// share is the first component, as Win32 reads it: `..` pops it, and the empty names, `.` and `..`
+/// before it vanish. A share that directly follows the server's separator is no component and
+/// stays. Each `want` is `GetFullPathNameW`'s, up to the trailing separator a final `.` or `..`
+/// leaves and the choice of separator.
+///
+/// Mutant: the device name is part of the anchor, so `\\.\d\..` stays `\\.\d\`.
+#[skuld::test]
+fn lexically_normal_pops_a_device_name_or_a_loose_share() {
+    let cases = [
+        (r"\\.\d\..", r"\\.\", Some("")),
+        (r"\\.\d\..\a", r"\\.\a", Some("a")),
+        (r"\\.\C:\..\x", r"\\.\x", Some("x")),
+        (r"\\.\d\..\..\x", r"\\.\x", Some("x")),
+        ("//./d/../x", r"//./x", Some("x")),
+        (r"\\?/d\..", r"\\?/", Some("")),
+        (r"\\.\.\x", r"\\.\x", Some("x")),
+        (r"\\.\\x", r"\\.\x", Some("x")),
+        (r"\\.\..", r"\\.\", Some("")),
+        (r"\\.\d\.", r"\\.\d\", Some("d")),
+        (r"\\s\h\..", r"\\s\h\", None),
+        (r"\\s\\h\x", r"\\s\h\x", None),
+        (r"\\s\\\h\.\x", r"\\s\h\x", None),
+        ("//s//h/x", r"//s/h\x", None),
+        (r"\\s\\", r"\\s\", None),
+        (r"\\s\\h\..", r"\\s\", None),
+        (r"\\s\\h\..\x", r"\\s\x", None),
+        (r"\\s\\.\h", r"\\s\h", None),
+        (r"\\\\h\..", r"\\\", None),
+        (r"\\\h\..", r"\\\h\", None),
+        (r"\\s\.\h\..", r"\\s\.\", None),
+    ];
+    for (input, want, device) in cases {
+        let normal = p(input).lexically_normal();
+        assert_eq!(normal.to_str(), Some(want), "input {input:?}");
+        if let Some(name) = device {
+            assert_eq!(normal.anchor(), Anchor::Device { name: os(name) }, "input {input:?}");
+        }
     }
 }
 
@@ -970,9 +1129,11 @@ fn lexically_normal_keeps_a_drive_like_name_relative() {
     }
 }
 
-/// For every small path, the normal form is a fixed point, has the same anchor, holds the names
-/// and `..` a stack reduction of the components leaves, and holds no `.`, no empty name but a last
-/// one after a name, and no `..` after a name or at a root.
+/// For every small path, the normal form is a fixed point, has the same anchor (or, for a device
+/// path, another device), and holds no `.`, no empty name but a last one after a name, and no `..`
+/// after a name or at a root. Off Windows, it also holds the names and `..` a stack reduction of
+/// the device name and components leaves; on Windows, `lexically_normal_agrees_with_win32` checks
+/// the result against Win32 instead.
 ///
 /// Mutant: `name\..` drops the `..` and keeps the name, so `a\..\b` becomes `a\b`.
 #[skuld::test]
@@ -980,12 +1141,18 @@ fn lexically_normal_result_is_normal() {
     for (input, path) in parsed_grid(&small_paths()) {
         let normal = path.lexically_normal();
         assert_eq!(normal.lexically_normal(), normal, "not idempotent on {input:?}");
-        assert_eq!(normal.anchor(), path.anchor(), "anchor of {input:?}");
-        let kept: Vec<_> = normal
-            .components()
-            .filter(|c| matches!(c, Component::Normal(_) | Component::ParentDir))
-            .collect();
-        assert_eq!(kept, reduce(&path), "names of the normal form of {input:?}");
+        match path.anchor() {
+            Anchor::Device { .. } => assert!(matches!(normal.anchor(), Anchor::Device { .. }), "anchor of {input:?}"),
+            anchor => assert_eq!(normal.anchor(), anchor, "anchor of {input:?}"),
+        }
+        #[cfg(not(windows))]
+        {
+            let kept: Vec<_> = names_under_root(&normal)
+                .into_iter()
+                .filter(|c| matches!(c, Component::Normal(_) | Component::ParentDir))
+                .collect();
+            assert_eq!(kept, reduce(&path), "names of the normal form of {input:?}");
+        }
         if normal.to_str() == Some(".") {
             continue;
         }
@@ -1010,24 +1177,40 @@ fn lexically_normal_result_is_normal() {
     }
 }
 
-/// The names and `..` left after reducing `path`'s components on a stack: a name is pushed, `..`
-/// pops a name, is dropped at a root, and is pushed otherwise; `.` and empty names vanish.
+/// The names and `..` left after reducing `path`'s device name and components on a stack: a name is
+/// pushed, `..` pops a name, is dropped at a root or under `\\.\`, and is pushed otherwise; `.` and
+/// empty names vanish.
+#[cfg(not(windows))]
 fn reduce(path: &Path) -> Vec<Component<'_, OsStr>> {
+    let rooted = has_root_separator(path) || matches!(path.anchor(), Anchor::Device { .. });
     let mut stack = Vec::new();
-    for c in path.components() {
+    for c in names_under_root(path) {
         match c {
             Component::Normal(_) => stack.push(c),
             Component::ParentDir => match stack.last() {
                 Some(Component::Normal(_)) => {
                     stack.pop();
                 }
-                None if has_root_separator(path) => {}
+                None if rooted => {}
                 _ => stack.push(c),
             },
             Component::CurDir | Component::Empty => {}
         }
     }
     stack
+}
+
+/// A device path's name, if it has one, then the components: what Win32 resolves under `\\.\`.
+#[cfg(not(windows))]
+fn names_under_root(path: &Path) -> Vec<Component<'_, OsStr>> {
+    let mut all = Vec::new();
+    if let Anchor::Device { name } = path.anchor() {
+        if !name.as_wtf8().is_empty() {
+            all.push(Component::Normal(name));
+        }
+    }
+    all.extend(path.components());
+    all
 }
 
 // Parent and file name ================================================================================================
@@ -1436,3 +1619,9 @@ fn join_shape_and_names_agree_with_std() {
         }
     }
 }
+
+// Agreement with Win32 ================================================================================================
+
+#[cfg(windows)]
+#[path = "windows_tests/win32.rs"]
+mod win32;
