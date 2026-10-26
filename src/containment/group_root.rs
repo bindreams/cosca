@@ -61,13 +61,31 @@ impl<'a> GroupRoot<'a> {
         self.pidfd
     }
 
+    /// Linux 6.9+: whether the root's group still has a member, zombies included, asked through the
+    /// root's pidfd, which names the group exactly whoever reaped the root. `None` without a pidfd,
+    /// or where the kernel cannot say ([`pidfd_group_has_member`](crate::containment::unix::pidfd_group_has_member)).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn has_member(&self) -> Option<bool> {
+        self.pidfd.and_then(crate::containment::unix::pidfd_group_has_member)
+    }
+
     /// Whether the root's pid still names its group, read now. Called right before each send by
     /// that number, and its answer serves that send alone: where a pid check cannot be made atomic
     /// with its send, the two are back to back.
+    ///
+    /// On Linux 6.9+ the root's pidfd answers (`has_member`): while the group
+    /// has a member its number is its own, whoever reaped the root. Elsewhere the caller's check
+    /// answers from the root's state.
     #[cfg_attr(not(unix), allow(dead_code, reason = "only Unix sends to a group by number"))]
     pub(crate) fn check(&self) -> Result<(), String> {
         #[cfg(all(test, unix))]
         crate::send_log::record_group(crate::send_log::GroupStep::Check);
+        #[cfg(target_os = "linux")]
+        match self.has_member() {
+            Some(true) => return Ok(()),
+            Some(false) => return Err("the root's process group has no member left".to_owned()),
+            None => {}
+        }
         match self.check {
             Some(check) => check(),
             None => {
@@ -77,3 +95,7 @@ impl<'a> GroupRoot<'a> {
         }
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "group_root_tests.rs"]
+mod group_root_tests;

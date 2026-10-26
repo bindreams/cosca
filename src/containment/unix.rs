@@ -39,9 +39,9 @@
 //! process's group. On Linux 6.9+ the group's signal goes through the root's pidfd instead, which
 //! names the group exactly. Every send by the group's number (the `killpg` where the kernel refuses
 //! that, the leader's signal, each member's resend) runs right after its own check of the root
-//! ([`GroupRoot::check`]), and nothing is sent once that check fails; the residual window between a
-//! check and its send is documented on `Child::kill_tree`. cgroup v2 names no pid and has no such
-//! hole.
+//! ([`GroupRoot::check`]: on 6.9+ whether the pidfd's group still has a member), and nothing is
+//! sent once that check fails; the residual window between a check and its send is documented on
+//! `Child::kill_tree`. cgroup v2 names no pid and has no such hole.
 
 use std::io;
 
@@ -365,11 +365,37 @@ enum Through {
     Leader,
 }
 
+/// Whether the process group `pidfd`'s process leads still has a member, zombies included, from a
+/// signal-0 send with `PIDFD_SIGNAL_PROCESS_GROUP`, which names the group exactly. While it has one,
+/// the group's number is still its own: the kernel does not reissue a pid that is any process's
+/// group id. `None` where the kernel refuses the flag (before Linux 6.9), or gives an answer that
+/// says neither.
+#[cfg(target_os = "linux")]
+pub(crate) fn pidfd_group_has_member(pidfd: std::os::fd::BorrowedFd<'_>) -> Option<bool> {
+    #[cfg(test)]
+    let answer = if fault::pidfd_group_flag_refused() {
+        Err(nix::errno::Errno::EINVAL)
+    } else {
+        pidfd_send(pidfd, 0, libc::PIDFD_SIGNAL_PROCESS_GROUP)
+    };
+    #[cfg(not(test))]
+    let answer = pidfd_send(pidfd, 0, libc::PIDFD_SIGNAL_PROCESS_GROUP);
+    match answer {
+        // `EPERM`: every member belongs to another user, so the group has one.
+        Ok(()) | Err(nix::errno::Errno::EPERM) => Some(true),
+        Err(nix::errno::Errno::ESRCH) => Some(false),
+        Err(nix::errno::Errno::EINVAL) => None,
+        Err(e) => {
+            log::debug!("containment::unix: a signal-0 send to a process group through its root's pidfd answered {e}");
+            None
+        }
+    }
+}
+
 /// `signal` through `pidfd`, to what `through` names. The kernel's errno is the answer: `EINVAL`
 /// for a flag it does not know.
 #[cfg(target_os = "linux")]
 fn pidfd_signal(pidfd: std::os::fd::BorrowedFd<'_>, signal: Signal, through: Through) -> Result<(), nix::errno::Errno> {
-    use std::os::fd::AsRawFd as _;
     #[cfg(test)]
     {
         use crate::send_log::{record_group, GroupStep, Route};
@@ -388,13 +414,24 @@ fn pidfd_signal(pidfd: std::os::fd::BorrowedFd<'_>, signal: Signal, through: Thr
         Through::Group => libc::PIDFD_SIGNAL_PROCESS_GROUP,
         Through::Leader => 0,
     };
+    pidfd_send(pidfd, signal as libc::c_int, flags)
+}
+
+/// `pidfd_send_signal(pidfd, signo, NULL, flags)`.
+#[cfg(target_os = "linux")]
+fn pidfd_send(
+    pidfd: std::os::fd::BorrowedFd<'_>,
+    signo: libc::c_int,
+    flags: libc::c_uint,
+) -> Result<(), nix::errno::Errno> {
+    use std::os::fd::AsRawFd as _;
     // SAFETY: `pidfd` is a live pidfd for the call's duration, and a null `siginfo_t` asks the kernel
     // to fill in the defaults, as `kill(2)` does.
     let rc = unsafe {
         libc::syscall(
             libc::SYS_pidfd_send_signal,
             pidfd.as_raw_fd(),
-            signal as libc::c_int,
+            signo,
             std::ptr::null::<libc::siginfo_t>(),
             flags,
         )

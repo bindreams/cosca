@@ -1199,6 +1199,10 @@ mod root_state_tests;
 #[path = "child/group_route_tests.rs"]
 mod group_route_tests;
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "child/group_exact_tests.rs"]
+mod group_exact_tests;
+
 #[cfg(all(test, unix))]
 #[path = "child/drop_report_tests.rs"]
 mod drop_report_tests;
@@ -1546,8 +1550,9 @@ fn signal_on_drop(
     //
     // On Unix, nothing that names the tree by the root's number runs once the root is reaped:
     // this handle's own state, or the number no longer reading as this root (tokio's state cannot
-    // see a foreign reap until it is polled). A foreign reap after `view` was read is not seen: if
-    // the number is then reused, what is sent by it reaches whatever process holds it. Tokio's
+    // see a foreign reap until it is polled). Each send by the group's number checks the root again
+    // right before it; a foreign reap between that check and its send is not seen, and the send then
+    // reaches whatever process holds the number. Tokio's
     // orphan queue reaps by number afterwards, and may collect another child of this process that
     // took the number.
     #[cfg(unix)]

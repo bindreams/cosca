@@ -27,6 +27,10 @@ pub(crate) enum RootNumber {
     /// The pid may name another process, for the reason `why`. `exact_root` (Linux): the root's
     /// handle still reaches the root exactly, if it reaches it at all.
     MayNameAnother { why: String, exact_root: bool },
+    /// Linux 6.9+: the root is reaped, and its pidfd shows its group has no member left, so there is
+    /// no tree to signal and nothing is sent.
+    #[cfg(target_os = "linux")]
+    GroupGone,
 }
 
 /// [`RootNumber`] for `attached`'s tree, from one call of `state`: the root's own handle's answer,
@@ -95,6 +99,32 @@ pub(crate) fn group_number_holds(pid: RawPid, state: (RootState, bool)) -> Resul
     }
 }
 
+/// Linux 6.9+: `number` for a process group whose root's pid may name another process, decided again
+/// by the root's pidfd (`group`), which names the group exactly whoever reaped the root. While the
+/// group has a member it is signalled as usual: the group's own signal goes through the pidfd, and
+/// each send by its number is checked the same way ([`GroupRoot::check`]). A reaped root's group with
+/// no member left is [`RootNumber::GroupGone`]. A root its handle cannot answer for, whose group has
+/// no member, may have left the group alive, so it keeps `number`; so does a kernel that cannot say.
+#[cfg(target_os = "linux")]
+fn through_the_pidfd(attached: &Attached, number: RootNumber, group: &GroupRoot<'_>) -> RootNumber {
+    let RootNumber::MayNameAnother { why, exact_root } = &number else {
+        return number;
+    };
+    if !matches!(attached, Attached::ProcessGroup(_)) {
+        return number;
+    }
+    match group.has_member() {
+        Some(true) => {
+            log::debug!(
+                "{why}, but its pidfd names its process group exactly, which still has a member: it is signalled"
+            );
+            RootNumber::Trusted
+        }
+        Some(false) if !*exact_root => RootNumber::GroupGone,
+        _ => number,
+    }
+}
+
 /// [`RootNumber`] after this handle's own reap, with the root's pid naming no process.
 fn own_reaped_free(attached: &Attached) -> RootNumber {
     #[cfg(target_os = "macos")]
@@ -144,9 +174,13 @@ pub(crate) enum Graceful {
 }
 
 impl TreeCall<'_> {
-    /// The call's one look at the root ([`root_number`]).
-    pub(crate) fn root_number(&self, state: impl FnOnce() -> (RootState, bool)) -> RootNumber {
+    /// The call's one look at the root ([`root_number`]), and on Linux 6.9+ at its group through
+    /// `group`'s pidfd (`through_the_pidfd`).
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables, reason = "only Linux has a pidfd"))]
+    pub(crate) fn root_number(&self, state: impl FnOnce() -> (RootState, bool), group: &GroupRoot<'_>) -> RootNumber {
         let number = root_number(self.attached, self.pid, state);
+        #[cfg(target_os = "linux")]
+        let number = through_the_pidfd(self.attached, number, group);
         #[cfg(test)]
         crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterRootLook);
         number
@@ -165,6 +199,7 @@ impl TreeCall<'_> {
     /// - `NoWalk` (macOS): the group and the holders. A `Kill` that is `Ok` marks the tree killed.
     /// - `Empty`: the holders are signalled, and the call is their sweep's answer (`Ok` with no
     ///   holders channel). A `Kill` that is `Ok` marks the tree killed.
+    /// - `GroupGone` (Linux): nothing is sent, the call is `Ok`, and a `Kill` marks the tree killed.
     /// - `MayNameAnother`: [`number_skipped`](Self::number_skipped), after `signal_root` when the
     ///   handle still names the root exactly.
     ///
@@ -180,7 +215,7 @@ impl TreeCall<'_> {
         signal_root: impl FnOnce() -> Result<Sent, Error>,
         group: &GroupRoot<'_>,
     ) -> Option<Result<(), Error>> {
-        match self.root_number(state) {
+        match self.root_number(state, group) {
             RootNumber::Trusted => None,
             #[cfg(target_os = "macos")]
             RootNumber::Untrusted(root) => self.untrusted(&root),
@@ -192,6 +227,11 @@ impl TreeCall<'_> {
                 }
                 Ok(())
             })),
+            #[cfg(target_os = "linux")]
+            RootNumber::GroupGone => {
+                self.group_gone();
+                Some(Ok(()))
+            }
             RootNumber::MayNameAnother { why, exact_root } => {
                 let root = exact_root.then(signal_root);
                 Some(Err(self.number_skipped(&why, root)))
@@ -207,7 +247,7 @@ impl TreeCall<'_> {
         allow(unused_variables, reason = "only a macOS fd marker signals here")
     )]
     pub(crate) fn graceful(&self, state: impl FnOnce() -> (RootState, bool), group: &GroupRoot<'_>) -> Graceful {
-        match self.root_number(state) {
+        match self.root_number(state, group) {
             RootNumber::Trusted => Graceful::Signal,
             // By identity alone. With no channel by identity there is nothing to signal, wait for or
             // sweep, so the call ends here with nothing sent.
@@ -226,6 +266,15 @@ impl TreeCall<'_> {
                 result: self.no_walk(group),
                 earlier: Some("the SIGTERM"),
             },
+            // The group has no member left: nothing to signal, wait for or sweep but the root.
+            #[cfg(target_os = "linux")]
+            RootNumber::GroupGone => {
+                self.group_gone();
+                Graceful::Sent {
+                    result: Ok(()),
+                    earlier: None,
+                }
+            }
             // The group is empty: nothing goes out by its number, only to the marker holders, if any.
             RootNumber::Empty => {
                 let holders = self.empty_group();
@@ -277,6 +326,19 @@ impl TreeCall<'_> {
                 debug_assert!(false, "only an fd marker with a group gets here");
                 Ok(())
             })
+    }
+
+    /// [`RootNumber::GroupGone`]: nothing is sent, and a `Kill` marks the tree killed.
+    #[cfg(target_os = "linux")]
+    fn group_gone(&self) {
+        log::debug!(
+            "{}({}): the root is reaped, and its pidfd shows its process group has no member left, so nothing is sent",
+            self.op,
+            self.pid
+        );
+        if let TreeSignal::Kill = self.signal {
+            self.killed.mark();
+        }
     }
 
     /// The signal for [`RootNumber::Empty`]: nothing by the root's number, and a macOS fd marker's
