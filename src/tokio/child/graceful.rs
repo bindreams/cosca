@@ -280,8 +280,8 @@ impl Child {
     /// each in-flight call occupies one blocking-pool thread for up to `grace` — size the
     /// pool accordingly for many long concurrent shutdowns.
     ///
-    /// **A root reaped by something else** (see [`kill_tree`](Child::kill_tree)): on Linux 6.9+ a
-    /// process group that still has a member gets the `SIGTERM` through the root's pidfd, then the
+    /// **A root reaped by something else** (see [`kill_tree`](Child::kill_tree), and its exception for a
+    /// reap this handle saw): on Linux 6.9+ a process group that still has a member gets the `SIGTERM` through the root's pidfd, then the
     /// sweep at once: the grace watches only the root, which is gone. One with none left has nothing
     /// to shut down. Either way, once the tree is down the call returns
     /// [`Error::Unassessable`](crate::error::Error::Unassessable) saying so: the root's exit status

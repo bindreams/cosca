@@ -771,7 +771,9 @@ impl Child {
     /// is an exited zombie, so the backstop is skipped and the sweep's answer stands.
     ///
     /// **A root reaped by something else, after this handle's own reap, and a reap after the
-    /// look.** As for the sync [`Child::kill_tree`](crate::Child::kill_tree).
+    /// look.** As for the sync [`Child::kill_tree`](crate::Child::kill_tree). On Linux 6.9+, not yet
+    /// once this handle's `wait`, `try_wait` or `kill` saw the root reaped elsewhere: it no longer
+    /// holds the root's pidfd, so it treats the group as below 6.9.
     pub fn kill_tree(&mut self) -> Result<(), Error> {
         self.kill_tree_after(None)
     }
@@ -902,12 +904,6 @@ impl Child {
     /// [`Error::Containment`](crate::error::Error::Containment) when a live member of the
     /// group refused the signal — a setuid binary in the tree is the ordinary cause. The
     /// tree is still running and this process cannot bring it down.
-    ///
-    /// In a cgroup v2 leaf, a listed member that got no `SIGTERM` makes this
-    /// [`Error::Containment`](crate::error::Error::Containment) when its send failed, and otherwise
-    /// [`Error::Unassessable`](crate::error::Error::Unassessable) when it could not be pinned or shown
-    /// to be in the leaf; one `warn` names the leaf and the pids. [`kill_tree`](Child::kill_tree)
-    /// still reaches them.
     ///
     /// See [`kill_tree`](Child::kill_tree)'s doc for four things that also apply here: the
     /// `ProcessGroup`/`Session`-only scope of this guarantee (a separate, unfixed gap for
@@ -1324,8 +1320,7 @@ impl Child {
 /// front if it is in the leaf. cosca does not wait for the front; tokio reaps it once it exits.
 ///
 /// Once the root is reaped the drop skips kills named by its number and warns; see
-/// [`Command::kill_on_drop`](crate::tokio::Command::kill_on_drop). On Linux 6.9+ a process
-/// group is decided by the root's pidfd instead: killed while it has a member left.
+/// [`Command::kill_on_drop`](crate::tokio::Command::kill_on_drop).
 ///
 /// A root reaped outside this handle also makes the drop forget tokio's `Child`, armed or not, so
 /// tokio cannot reap by that number. The evidence is the number no longer reading as this root, or

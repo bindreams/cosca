@@ -123,14 +123,15 @@ reissued. So a tree call, a drop and the cleanup of a spawn that fails at its id
 elevated spawn that cannot finish, or of an abandoned spawn whose cgroup leaf did not take its root
 still kill the group of a reaped root while it has a member, whoever reaped the root, and send
 nothing once it has none; that signal-0 send is also the check before each send by the group's
-number. The cleanup of a tokio spawn that fails after its fork does not yet: it kills the root
-alone. cosca detects the flag by acting, and an older kernel's `EINVAL` is handled per path. A tree
-call, a drop and the cleanup of an elevated spawn that cannot finish fall back to the group's
-number, checked against the root's state, and send nothing once that check fails. The cleanup of an
-abandoned spawn does the same while its child is unreaped, and sends the group of a reaped child
-nothing. The cleanup of a spawn that fails at its identity read sends the group nothing, whatever
-the root's state. These last two `warn` once, naming the root's pid, that members of its process
-group may be left running.
+number. Not yet: the cleanup of a tokio spawn that fails after its fork kills the root alone, and an
+async handle whose `wait`, `try_wait` or `kill` saw the root reaped elsewhere no longer holds its
+pidfd, so it treats the group as below 6.9. cosca detects the flag by acting, and an older kernel's
+`EINVAL` is handled per path. A tree call, a drop and the cleanup of an elevated spawn that cannot
+finish fall back to the group's number, checked against the root's state, and send nothing once that
+check fails. The cleanup of an abandoned spawn does the same while its child is unreaped, and sends
+the group of a reaped child nothing. The cleanup of a spawn that fails at its identity read sends
+the group nothing, whatever the root's state. These last two `warn` once, naming the root's pid,
+that members of its process group may be left running.
 On 6.9+ a member's resend still goes by its pid when the member's own `pidfd_open` fails (`EMFILE`,
 say), right after a check of its identity. Below 6.9 and on macOS a reaper elsewhere in the process
 can reap the root between the check and a send by its number, which then reaches whoever holds it: a
@@ -165,10 +166,11 @@ After a foreign reap:
 
 - On Linux, cgroup plus pidfd stays exact; only the exit status is lost.
 - On Linux 6.9+ a process-group kill, by a tree call, a drop or the cleanup of a failed spawn
-  (not yet a tokio spawn's that fails after its fork), stays exact through the root's pidfd
-  (principle 4). Below 6.9 and on macOS, process-group kills, and an fd marker's kills by the
-  root's number (its group and its ppid walk), are unsafe. The marker's holders are named by the
-  pipe they hold and are still killed exactly.
+  (not yet a tokio spawn's that fails after its fork, nor an async handle's whose `wait`,
+  `try_wait` or `kill` saw the reap), stays exact through the root's pidfd (principle 4). Below
+  6.9 and on macOS, process-group kills, and an fd marker's kills by the root's number (its group
+  and its ppid walk), are unsafe. The marker's holders are named by the pipe they hold and are
+  still killed exactly.
 - macOS has no pidfd, and cosca has no exact kill there.
 
 **Why:** a library cannot require the whole process to leave its children alone, and processes that

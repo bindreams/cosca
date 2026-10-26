@@ -798,12 +798,6 @@ impl Child {
     /// group refused the signal — a setuid binary in the tree is the ordinary cause. The
     /// tree is still running and this process cannot bring it down.
     ///
-    /// In a cgroup v2 leaf, a listed member that got no `SIGTERM` makes this
-    /// [`Error::Containment`](crate::error::Error::Containment) when its send failed, and otherwise
-    /// [`Error::Unassessable`](crate::error::Error::Unassessable) when it could not be pinned or shown
-    /// to be in the leaf; one `warn` names the leaf and the pids. [`kill_tree`](Child::kill_tree)
-    /// still reaches them.
-    ///
     /// See [`kill_tree`](Child::kill_tree)'s doc for four things that also apply here: the
     /// `ProcessGroup`/`Session`-only scope of this guarantee (a separate, unfixed gap for
     /// `TreeWalk`), the residual `hidepid` gap on Linux, a root reaped by something else, and a reap
