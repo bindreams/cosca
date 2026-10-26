@@ -157,6 +157,76 @@ async fn a_leafless_child_dead_before_its_report_is_not_said_to_be_left_running(
     assert!(said[0].1.contains("its child was killed"), "{said:?}");
 }
 
+/// The one `warn` a leafless tokio spawn's failure logs when its child, never told to go, was
+/// dropped with no pidfd held on it: the child never ran the program, and only its reaping is open.
+#[track_caller]
+fn assert_says_the_child_never_ran_and_may_be_unreaped(said: &[(log::Level, String)]) {
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert_eq!(said[0].0, log::Level::Warn, "{said:?}");
+    let text = &said[0].1;
+    assert!(text.contains("the child never ran the program"), "{said:?}");
+    assert!(text.contains("may be left unreaped"), "{said:?}");
+    assert!(
+        !text.contains("left running") && !text.contains("nothing can reach it"),
+        "{said:?}"
+    );
+    assert!(!text.contains("  "), "{said:?}");
+}
+
+/// A tokio spawn that fails after its fork, with no cgroup leaf, for a child that died before it
+/// sent its pidfd, drops a child that never ran the program and that nothing holds. The warn says
+/// that, and that it may be left unreaped: never that it may be left running.
+///
+/// Mutant: the `(Err, NoReport)` arm answers a plain `not started`, so the abandonment hedges that
+/// the child "may be left running and nothing can reach it".
+#[skuld::test]
+async fn a_leafless_tokio_failure_for_a_child_dead_before_its_report_says_it_never_ran() {
+    use std::os::fd::AsFd as _;
+
+    use rustix::process::{waitid, WaitId, WaitIdOptions};
+
+    crate::log_capture::install();
+    let (mut cmd, _reader) = marker_command();
+    cmd.contain_with(crate::ContainMode::Session);
+    let armed = fault::arm_child_fault(ChildFault::Sigkill);
+    let mark = crate::log_capture::mark();
+    let err = {
+        let _failing = crate::child::spawn::fault::fail_tokio_spawns_after_fork();
+        cmd.spawn().err()
+    };
+    drop(armed);
+
+    expect_not_started(err.expect("the forced failure must fail the spawn"));
+    let said = crate::log_capture::records_since_on_current_thread(mark, "tokio spawn failed");
+    // The seam dropped the child, as tokio does: this test reaps it.
+    crate::child::spawn::fault::take_forgotten_pid().expect("the seam dropped a child");
+    let pidfd = crate::child::spawn::fault::take_forgotten_pidfd().expect("the seam took a pidfd for the child");
+    waitid(WaitId::PidFd(pidfd.as_fd()), WaitIdOptions::EXITED).expect("reap the dropped child");
+    assert_says_the_child_never_ran_and_may_be_unreaped(&said);
+}
+
+/// As above, for a child whose own `pidfd_open` failed: it reported an errno, so the helper has no
+/// pidfd to hold it by.
+///
+/// Mutant: the `(Err, Failed(_, None))` arm answers a plain `not started`.
+#[skuld::test]
+async fn a_leafless_tokio_failure_for_a_child_with_no_usable_pidfd_says_it_never_ran() {
+    crate::log_capture::install();
+    let (mut cmd, _reader) = marker_command();
+    cmd.contain_with(crate::ContainMode::Session);
+    let forced = crate::wait::backend::fault::force_pidfd_open_script([None, Some(Errno::MFILE)]);
+    let mark = crate::log_capture::mark();
+    let err = {
+        let _failing = crate::child::spawn::fault::fail_tokio_spawns_after_fork();
+        cmd.spawn().err()
+    };
+    drop(forced);
+
+    expect_not_started(err.expect("the failed pidfd_open must fail the spawn"));
+    let said = crate::log_capture::records_since_on_current_thread(mark, "tokio spawn failed");
+    assert_says_the_child_never_ran_and_may_be_unreaped(&said);
+}
+
 /// The fate a tokio spawn, contained by its session, that failed without running the program
 /// carries for the child its handshake held.
 fn fate_of_unexecuted() -> ChildFate {

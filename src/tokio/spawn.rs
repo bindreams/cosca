@@ -1076,6 +1076,17 @@ fn warn_for_abandoned(child: &crate::containment::AbandonedChild, error: &Error,
     log::warn!("tokio spawn failed ({error}); if it failed after forking, {consequence}");
 }
 
+/// Warns of a leafless tokio spawn that failed for a child never told to go and dropped with nothing
+/// holding it: it never ran the program, and only its reaping is open. tokio's error took its pid,
+/// so none is named.
+#[cfg(target_os = "linux")]
+fn warn_for_unreaped(error: &Error) {
+    log::warn!(
+        "tokio spawn failed ({error}); if it failed after forking, the child never ran the program, but it may be \
+         left unreaped: nothing here holds its pid, and cosca never reaps a Linux child by pid"
+    );
+}
+
 /// The fate of an elevation front the leaf's abandonment found: reaped through the leaf, left
 /// running, or in a place that could not be read.
 fn front_child_fate(fate: crate::child::spawn::FrontFate) -> ChildFate {
@@ -1125,7 +1136,13 @@ fn abandoned_after_handshake(
     // Except for a front left to the leaf, the handshake held the child; `ended_child` says whether
     // it ended it.
     let ended = failure.ended_child().filter(|_| !left_to_leaf);
-    warn_for_abandoned(&abandoned, failure.error(), ended);
+    match abandoned {
+        // The child was never told to go, so what no leaf can tell is only whether it was reaped.
+        AbandonedChild::MaybeUnreachable if failure.left_child_unreaped() => {
+            warn_for_unreaped(failure.error());
+        }
+        _ => warn_for_abandoned(&abandoned, failure.error(), ended),
+    }
     if !left_to_leaf {
         return failure;
     }

@@ -850,7 +850,9 @@ fn join_helper(helper: std::thread::ScopedJoinHandle<'_, Outcome>, #[cfg(test)] 
 /// failure's fate is a placeholder (`Unknown`) that the leaf's abandonment replaces.
 ///
 /// Only a child the helper told to go can run the program, so only the one arm with
-/// [`Outcome::Opened`] and a failed `spawn` may answer that it started.
+/// [`Outcome::Opened`] and a failed `spawn` may answer that it started. A failed tokio `spawn`
+/// with no pidfd held on the child drops a child that never ran the program, and nothing reaps
+/// it: that is [`SpawnFailure::NotStartedUnreaped`].
 fn conclude<T: Spawned>(spawned: io::Result<T>, outcome: Outcome, front: LeftFront) -> Result<Held<T>, SpawnFailure> {
     let opened_teardown = |pidfd: OwnedFd, error: Error| {
         use crate::wait::exit_only::{peek, Peek, Target};
@@ -896,7 +898,15 @@ fn conclude<T: Spawned>(spawned: io::Result<T>, outcome: Outcome, front: LeftFro
             }
         }
     };
-    let not_started = |error| Err(SpawnFailure::NotStarted(error));
+    // A failed spawn that dropped a child it never told to go, with nothing holding it. std's
+    // collected its own; tokio's `Err` leaves the child unreaped if it forked one.
+    let not_started_unreaped = |error| -> Result<Held<T>, SpawnFailure> {
+        Err(if T::ERR_PROVES_NO_EXEC {
+            SpawnFailure::NotStarted(error)
+        } else {
+            SpawnFailure::NotStartedUnreaped(error)
+        })
+    };
     let with_child = |cause, fate| Err(SpawnFailure::NotStartedWithChild { cause, fate });
     match (spawned, outcome) {
         (Ok(child), Outcome::Opened(pidfd)) => Ok(Held { child, pidfd }),
@@ -953,7 +963,7 @@ fn conclude<T: Spawned>(spawned: io::Result<T>, outcome: Outcome, front: LeftFro
                 let fate = super::teardown_through_pidfd(None, pidfd, None);
                 with_child(e, fate)
             }
-            None => not_started(e),
+            None => not_started_unreaped(e),
         },
         // The child reads EOF in place of its verdict, whenever it reaches its hook.
         (Ok(child), Outcome::Unwatched(cause)) => {
@@ -966,7 +976,7 @@ fn conclude<T: Spawned>(spawned: io::Result<T>, outcome: Outcome, front: LeftFro
                 ChildFate::Killed,
             )
         }
-        (Err(e), Outcome::NoReport | Outcome::Unwatched(_)) => not_started(Error::Io(e)),
+        (Err(e), Outcome::NoReport | Outcome::Unwatched(_)) => not_started_unreaped(Error::Io(e)),
     }
 }
 

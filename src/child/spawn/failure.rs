@@ -28,6 +28,11 @@ pub(crate) enum SpawnFailure {
         )]
         fate: ChildFate,
     },
+    /// As [`NotStarted`](Self::NotStarted), after tokio failed a spawn whose child was never told to
+    /// go, and dropped it: the child never ran the program, but nothing held its pid or pidfd, so
+    /// whether it was reaped, and by whom, is unknown. The cause says what failed.
+    #[cfg(target_os = "linux")]
+    NotStartedUnreaped(Error),
     /// The program may have started: the child reached `exec` (on Windows, `CreateProcess` or
     /// `ShellExecuteEx` succeeded), or cosca cannot prove it did not.
     MayHaveStarted {
@@ -56,6 +61,8 @@ impl SpawnFailure {
     pub(crate) fn map(self, f: impl FnOnce(Error) -> Error) -> SpawnFailure {
         match self {
             SpawnFailure::NotStarted(e) => SpawnFailure::NotStarted(f(e)),
+            #[cfg(target_os = "linux")]
+            SpawnFailure::NotStartedUnreaped(e) => SpawnFailure::NotStartedUnreaped(f(e)),
             #[cfg(target_os = "linux")]
             SpawnFailure::NotStartedWithChild { cause, fate } => {
                 SpawnFailure::NotStartedWithChild { cause: f(cause), fate }
@@ -110,9 +117,17 @@ impl SpawnFailure {
     #[cfg(all(feature = "tokio", target_os = "linux"))]
     pub(crate) fn error(&self) -> &Error {
         match self {
-            SpawnFailure::NotStarted(e) | SpawnFailure::MayHaveStarted { cause: e, .. } => e,
+            SpawnFailure::NotStarted(e)
+            | SpawnFailure::NotStartedUnreaped(e)
+            | SpawnFailure::MayHaveStarted { cause: e, .. } => e,
             SpawnFailure::NotStartedWithChild { cause, .. } => cause,
         }
+    }
+
+    /// Whether this failure is [`NotStartedUnreaped`](Self::NotStartedUnreaped).
+    #[cfg(all(feature = "tokio", target_os = "linux"))]
+    pub(crate) fn left_child_unreaped(&self) -> bool {
+        matches!(self, SpawnFailure::NotStartedUnreaped(_))
     }
 
     /// What the failed spawn did with a child it held, when that ended it: the child is reaped, or
@@ -153,6 +168,8 @@ impl SpawnFailure {
             SpawnFailure::MayHaveStarted { cause, fate, .. } => (cause, fate),
             SpawnFailure::NotStarted(e) => panic!("expected `may have started`, got `not started`: {e:?}"),
             #[cfg(target_os = "linux")]
+            SpawnFailure::NotStartedUnreaped(e) => panic!("expected `may have started`, got `not started`: {e:?}"),
+            #[cfg(target_os = "linux")]
             SpawnFailure::NotStartedWithChild { cause, .. } => {
                 panic!("expected `may have started`, got `not started`: {cause:?}")
             }
@@ -182,6 +199,8 @@ impl SpawnFailure {
     pub(crate) fn expect_not_started(self) -> Error {
         match self {
             SpawnFailure::NotStarted(e) => e,
+            #[cfg(target_os = "linux")]
+            SpawnFailure::NotStartedUnreaped(e) => e,
             #[cfg(target_os = "linux")]
             SpawnFailure::NotStartedWithChild { cause, .. } => cause,
             SpawnFailure::MayHaveStarted { cause, fate, .. } => {
@@ -229,6 +248,14 @@ impl From<SpawnFailure> for Error {
     fn from(failure: SpawnFailure) -> Error {
         match failure {
             SpawnFailure::NotStarted(error) => {
+                debug_assert!(
+                    !matches!(error, Error::MayHaveStarted { .. }),
+                    "a spawn answered both `not started` and `may have started`: {error}"
+                );
+                error
+            }
+            #[cfg(target_os = "linux")]
+            SpawnFailure::NotStartedUnreaped(error) => {
                 debug_assert!(
                     !matches!(error, Error::MayHaveStarted { .. }),
                     "a spawn answered both `not started` and `may have started`: {error}"

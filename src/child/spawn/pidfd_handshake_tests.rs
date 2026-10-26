@@ -1354,8 +1354,9 @@ fn a_front_gone_before_its_go_is_no_front() {
 /// afterwards says what happened; one that held no child carries none. The child never ran the
 /// program, so none of these answers that it may have started.
 ///
-/// Mutant: an arm that tears the child down answers a plain `not started`, or an arm that held none
-/// claims a fate.
+/// Mutant: an arm that tears the child down answers a plain `not started`, an arm that held none
+/// claims a fate, or a failed tokio spawn's child with no pidfd is answered as std's, which std
+/// collected.
 #[skuld::test]
 fn a_not_started_failure_carries_the_fate_of_the_child_it_held() {
     let io = |what: &str| std::io::Error::other(what.to_string());
@@ -1387,9 +1388,23 @@ fn a_not_started_failure_carries_the_fate_of_the_child_it_held() {
     .expect_not_started_with_child();
     assert_eq!(fate, ChildFate::Reaped);
 
-    // No pidfd, so no child was held.
-    for outcome in [Outcome::Failed(Error::Io(io("helper")), None), Outcome::NoReport] {
+    // No pidfd, so no child was held. A child tokio dropped, never told to go, is left to nobody;
+    // one std failed was collected by std.
+    let outcomes = || {
+        [
+            Outcome::Failed(Error::Io(io("helper")), None),
+            Outcome::NoReport,
+            Outcome::Unwatched("cause".into()),
+        ]
+    };
+    for outcome in outcomes() {
         let failure = super::conclude(Err::<NoChild, _>(io("x")), outcome, super::LeftFront::NotAFront)
+            .err()
+            .expect("the spawn fails");
+        assert!(matches!(failure, SpawnFailure::NotStartedUnreaped(_)), "{failure:?}");
+    }
+    for outcome in outcomes() {
+        let failure = super::conclude(Err::<NoChild<false>, _>(io("x")), outcome, super::LeftFront::NotAFront)
             .err()
             .expect("the spawn fails");
         assert!(matches!(failure, SpawnFailure::NotStarted(_)), "{failure:?}");
