@@ -831,8 +831,9 @@ pub(crate) struct Marker {
     /// doc comment. What `sweep`'s entry contract re-checks against `read` at signal time.
     read_handle: u64,
     /// The root's identity, for the ppid-walk channel: the one the spawn verified against the
-    /// child's handle, never a read by pid at attach.
-    root: ProcessId,
+    /// child's handle, never a read by pid at attach. `None` only for a marker made by
+    /// [`without_root`](Marker::without_root), which sweeps its holders alone.
+    root: Option<ProcessId>,
     /// The root's process group, when the requested mode created one. `None` for TreeWalk.
     pgid: Option<i32>,
     /// The descriptor number the marker occupies in the child, copied from
@@ -931,8 +932,22 @@ impl Marker {
             read: prepared.read,
             handle: prepared.handle,
             read_handle: prepared.read_handle,
-            root,
+            root: Some(root),
             pgid,
+            own_fd: prepared.fd,
+        }
+    }
+
+    /// The marker of a root that is not shown to be this process's child: no channel that names the
+    /// tree by the root's number may run, so only
+    /// [`hard_kill_holders_only`](Self::hard_kill_holders_only) is called on it.
+    pub(crate) fn without_root(prepared: PreparedMarker) -> Marker {
+        Marker {
+            read: prepared.read,
+            handle: prepared.handle,
+            read_handle: prepared.read_handle,
+            root: None,
+            pgid: None,
             own_fd: prepared.fd,
         }
     }
@@ -962,8 +977,8 @@ impl Marker {
         self.pgid.is_some()
     }
 
-    /// The root the ppid walk starts from.
-    pub(crate) fn root(&self) -> ProcessId {
+    /// The root the ppid walk starts from; `None` for a marker made [`without_root`](Self::without_root).
+    pub(crate) fn root(&self) -> Option<ProcessId> {
         self.root
     }
 
@@ -1319,8 +1334,11 @@ impl Marker {
         //
         // Skipped when `by_root_number` is false: the root's pid names no one reliably any more.
         let mut new_walk: Vec<ProcessId> = Vec::new();
-        if by_root_number {
-            let root = self.root;
+        debug_assert!(
+            !by_root_number || self.root.is_some(),
+            "a full sweep of a marker made without its root"
+        );
+        if let Some(root) = self.root.filter(|_| by_root_number) {
             #[cfg(test)]
             crate::containment::treewalk::fault::note_walk(root.pid());
             if seen.insert(root) {
@@ -1453,7 +1471,7 @@ impl Marker {
             // `kill_tree` handle backstop to be the sole killer regardless of which mechanism a
             // given platform actually attaches for a request.
             #[cfg(test)]
-            if id == self.root && fault::take_force_root_kill_noop() {
+            if Some(id) == self.root && fault::take_force_root_kill_noop() {
                 continue;
             }
             // `KillOutcome::NotAttempted` means the OS refused to query or signal an identity

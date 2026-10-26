@@ -605,7 +605,7 @@ impl Child {
     #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn test_marker_root(&self) -> Option<ProcessId> {
         match &self.os.attached {
-            crate::containment::Attached::FdMarker(m) => Some(m.root()),
+            crate::containment::Attached::FdMarker(m) => m.root(),
             _ => None,
         }
     }
@@ -1729,3 +1729,7 @@ pub(crate) mod fault {
 #[cfg(all(test, target_os = "macos"))]
 #[path = "child/identity_macos_tests.rs"]
 mod identity_macos_tests;
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "child/late_report_tests.rs"]
+mod late_report_tests;

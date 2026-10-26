@@ -62,6 +62,10 @@ mod frozen;
 mod env_block;
 
 #[cfg(windows)]
+#[path = "consent_spawn.rs"]
+mod consent_spawn;
+
+#[cfg(windows)]
 #[path = "full_path.rs"]
 mod full_path;
 
@@ -1228,6 +1232,10 @@ fn main() {
         "spawn-with-env-block" => env_block::spawn_with_block(&args[2], &args[3..]),
         #[cfg(windows)]
         "try-env-block" => env_block::try_block(&args[2..]),
+        #[cfg(windows)]
+        "spawn-consent-with-block" => env_block::spawn_consent_with_block(&args[2..]),
+        #[cfg(windows)]
+        "consent-spawn" => consent_spawn::run(&args[2], &args[3], &args[4], &args[5]),
         #[cfg(windows)]
         "with-env-block" => env_block::with_block(&args[2..]),
         #[cfg(windows)]
