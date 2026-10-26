@@ -491,9 +491,10 @@ impl Command {
     /// **Once the root has been reaped, the drop does not kill by the root's number, and logs a
     /// `warn` naming what it skipped.** On Linux 6.9+ a process group is the exception: the root's
     /// pidfd names the group exactly, whoever reaped the root, so the drop kills the group while it
-    /// has a member left, and sends nothing and warns of nothing once it has none. The same holds
-    /// when the root's handle cannot say whether it was reaped. The rest of this paragraph is about
-    /// other mechanisms, kernels before 6.9 and macOS.
+    /// has a member left, and sends nothing and warns of nothing once it has none. A root whose
+    /// handle cannot say whether it was reaped has its group killed the same way while the group has
+    /// a member. The rest of this paragraph is about other mechanisms, kernels before 6.9 and
+    /// macOS.
     ///
     /// The root is reaped by [`wait`](crate::Child::wait), by a
     /// reaper outside the handle, or (on the sync handle) by the spawn itself, which reaps a root
