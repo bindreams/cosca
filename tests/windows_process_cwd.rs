@@ -113,6 +113,30 @@ fn a_drive_relative_current_dir_takes_the_drives_own_directory_as_win32_does(#[f
 }
 
 #[cfg(windows)]
+/// M12: a process cwd on a `subst` drive that is then removed, or re-pointed at another
+/// directory. A child spawned with `NULL` (std's route), with the cwd string explicitly (std's and
+/// the raw backend's), and by the raw backend with no `current_dir` (which passes the cwd string,
+/// not `NULL`), reports its cwd string and what it finds there. Records `M12` lines;
+/// asserts only that the probe entered the drive and that the mapping was removed or re-pointed
+/// before each recording.
+///
+/// System-affecting: the probe maps a drive letter for the logon session, so it is the
+/// `DRIVE_MAPPING` group.
+#[skuld::test]
+fn m12_a_cwd_on_a_removed_or_repointed_subst(#[fixture(drive_mapping)] _group: &Group) {
+    let report = probe("subst-cwd", env!("CARGO_BIN_EXE_cosca_testbin_cwd"));
+    for line in report.lines() {
+        println!("M12 {line}");
+    }
+    for key in ["removed_set", "repointed_set"] {
+        assert!(
+            report.lines().any(|line| line == format!("{key}=ok")),
+            "precondition: {key}=ok, the probe entered the mapped drive; full report:\n{report}"
+        );
+    }
+}
+
+#[cfg(windows)]
 /// M7, the rows whose `=X:` value names a directory on drive X itself, and the partially qualified
 /// values whose target must exist: what a child's `GetFullPathNameW` makes of `X:tool` given a block
 /// with that value and a cwd on another drive (for those values, of `T:tool` with the child's cwd
@@ -127,7 +151,7 @@ fn a_drive_relative_current_dir_takes_the_drives_own_directory_as_win32_does(#[f
 /// removes it when done, so it is the `DRIVE_MAPPING` group.
 #[skuld::test]
 fn m7_a_drive_relative_name_against_a_drive_directory_on_its_own_drive(#[fixture(drive_mapping)] _group: &Group) {
-    use common::drive_rule::{canonical, free_drive, run, Arm, Cwd, Render, Row, Var};
+    use common::drive_rule::{canonical, run, Arm, Cwd, Render, Row, Var};
     use common::subst::Subst;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -138,9 +162,10 @@ fn m7_a_drive_relative_name_against_a_drive_directory_on_its_own_drive(#[fixture
         std::fs::create_dir_all(format!(r"{d}\{sub}")).expect("create the row directories");
     }
     std::fs::write(format!(r"{m}\afile"), b"x").expect("create the file");
-    let letter = free_drive((b'M'..=b'Z').rev());
-    let x = format!("{letter}:");
-    let mut mapping = Subst::new(&x, std::path::Path::new(&m)).unwrap_or_else(|e| panic!("map {x} to {m}: {e}"));
+    let mut mapping =
+        Subst::map_free(std::path::Path::new(&m)).unwrap_or_else(|e| panic!("map a free letter to {m}: {e}"));
+    let x = mapping.drive().to_owned();
+    let letter = x.chars().next().expect("a drive letter");
     let long = format!(r"{x}\{long_rel}");
     assert!(
         long.encode_utf16().count() > 260,
@@ -251,7 +276,7 @@ fn a_unc_current_dir_runs_there_and_a_verbatim_unc_cwd_completes_as_win32_does()
 
 #[cfg(windows)]
 mod drive_mapping_group {
-    //! Re-execs this binary on one `DRIVE_MAPPING` test. Its body never runs here: each case is
+    //! Re-execs this binary on a `DRIVE_MAPPING` test. Its body never runs here: each case is
     //! either opted out or refused at setup, so these are safe on any host.
 
     use crate::common::test_reexec::{command, suite_outcome, with_json_events, SuiteOutcome, NOCAPTURE};

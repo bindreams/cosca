@@ -1,8 +1,9 @@
 //! Test-only helper spawned by the crate's integration tests. std-only, with
 //! exceptions that use the `cosca` crate: the `report-nested-kill-tree` mode, to exercise
 //! the real nested-member `kill_tree` path, `spawn-dump-env-block` and `spawn-with-null-std`, to
-//! spawn through each Windows backend, and the frozen-spawn modes of `frozen.rs`. Behavior is
-//! selected by argv[1].
+//! spawn through each Windows backend, the frozen-spawn modes of `frozen.rs`, and the measurement
+//! modes (`handles-probe`, `std-loads`, `std-loads-dup`). Behavior is selected by `COSCA_TESTBIN_MODE`
+//! when set, else by argv[1]; the variable keeps the mode when a test shifts argv (`dump-argv`).
 
 #[cfg(target_os = "macos")]
 use std::io::BufRead;
@@ -62,12 +63,29 @@ mod frozen;
 mod env_block;
 
 #[cfg(windows)]
+#[path = "handles.rs"]
+mod handles;
+
+#[cfg(windows)]
 #[path = "consent_spawn.rs"]
 mod consent_spawn;
 
 #[cfg(windows)]
 #[path = "full_path.rs"]
 mod full_path;
+
+#[cfg(windows)]
+#[path = "long_image.rs"]
+mod long_image;
+
+#[cfg(windows)]
+#[allow(dead_code, reason = "shared with cosca_testbin_cwd, which uses other parts")]
+#[path = "measure.rs"]
+mod measure;
+
+#[cfg(windows)]
+#[path = "std_loads.rs"]
+mod std_loads;
 
 #[cfg(windows)]
 #[path = "null_std.rs"]
@@ -315,8 +333,43 @@ fn main() {
         fake_pkexec(&args);
         return;
     }
-    let mode = args.get(1).map(String::as_str).unwrap_or("");
+    let mode_var = std::env::var_os("COSCA_TESTBIN_MODE").map(|v| {
+        v.into_string()
+            .unwrap_or_else(|v| panic!("COSCA_TESTBIN_MODE is not Unicode: {v:?}"))
+    });
+    let mode = mode_var
+        .as_deref()
+        .unwrap_or_else(|| args.get(1).map(String::as_str).unwrap_or(""));
     match mode {
+        // Every argument, argv[0] included: `argc=`, then `arg<i>=` lines.
+        "dump-argv" => {
+            let argv: Vec<String> = std::env::args_os().map(|a| a.to_string_lossy().into_owned()).collect();
+            println!("argc={}", argv.len());
+            for (i, arg) in argv.iter().enumerate() {
+                println!("arg{i}={arg}");
+            }
+        }
+        // `std-spawn-bare <name> <plain|pre_exec>`: runs `<name>` as a bare name through std with this
+        // process's `PATH`, which std keeps to its `posix_spawnp` route where it has one, and prints
+        // `ok,<status>` or `err=<errno>,<kind>`. `pre_exec` forces the fork route.
+        #[cfg(unix)]
+        "std-spawn-bare" => {
+            use std::os::unix::process::CommandExt;
+            let mut cmd = std::process::Command::new(&args[2]);
+            if args[3] == "pre_exec" {
+                // SAFETY: the closure does nothing, so it is async-signal-safe.
+                unsafe { cmd.pre_exec(|| Ok(())) };
+            }
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "no other thread of this process forks: this mode starts none"
+            )]
+            let status = cmd.status();
+            match status {
+                Ok(status) => println!("ok,{status}"),
+                Err(e) => println!("err={},{:?}", e.raw_os_error().unwrap_or(-1), e.kind()),
+            }
+        }
         "argv0" => {
             // Print this process's argv[0] so callers can verify it.
             let argv0 = std::env::args().next().unwrap_or_default();
@@ -1278,6 +1331,18 @@ fn main() {
         "spawn-report-pid" => frozen::spawn_report_pid(&args[2]),
         #[cfg(windows)]
         "report-pid" => frozen::report_pid(&args[2]),
+        #[cfg(windows)]
+        "env-set-probe" => env_block::set_probe(&args[2..]),
+        #[cfg(windows)]
+        "handles-probe" => handles::probe(&args[2], &args[3]),
+        #[cfg(windows)]
+        "report-handles" => handles::report(&args[2], args.get(3).map(String::as_str)),
+        #[cfg(windows)]
+        "std-loads" => std_loads::run(&args[2], &args[3]),
+        #[cfg(windows)]
+        "std-loads-dup" => std_loads::run_dup(&args[2], &args[3]),
+        #[cfg(windows)]
+        "long-image" => long_image::run(&args[2], &args[3]),
         #[cfg(windows)]
         "report-breakaway" => {
             breakaway::run(&args[2], &args[3], &args[4]);

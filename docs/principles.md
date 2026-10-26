@@ -259,7 +259,7 @@ by `SKULD_LABELS=tracer`. So does
 `COSCA_TEST_CGROUP` (the tests that need the unconfined cgroup lane), a `test_group!` row joined
 with `#[fixture(cgroup)] _group: &Group`: CI turns it off workflow-wide and the cgroup step opts
 in. So does
-`COSCA_TEST_DRIVE_MAPPING` (`windows_process_cwd`'s drive mapping), a `test_group!` row joined with
+`COSCA_TEST_DRIVE_MAPPING` (the two drive-mapping tests of `windows_process_cwd`), a `test_group!` row joined with
 `#[fixture(drive_mapping)] _group: &Group`, selected by `SKULD_LABELS=drive_mapping`. So does
 `COSCA_TEST_ELEVATION` (tests that run commands with real administrator or root privileges), a `test_group!` row
 joined with `#[fixture(elevation)] _group: &Group`, selected by `SKULD_LABELS=elevation`. So do the other
