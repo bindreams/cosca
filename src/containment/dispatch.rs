@@ -72,15 +72,16 @@ impl Prepared {
 
     /// Linux 6.9+: `SIGKILL`, through `child`'s pidfd, the process group of a spawn that failed
     /// before its attach, while the group has a member. The pidfd names the group exactly, whoever
-    /// reaped the root. Only a root whose group is its containment (Session, or a process group
-    /// with no cgroup leaf) is sent it: a leaf's drop ends a child in the leaf or outside it. Below
-    /// 6.9 the kernel refuses the flag and nothing is sent, as the group's number may name another
-    /// group. `Err` is the kernel's refusal of the kill.
+    /// reaped the root. Only a root whose group is its containment is sent it: a Session root, or a
+    /// process-group root with no cgroup leaf or one its leaf did not take, as `attach` would decide.
+    /// The leaf's verdict is settled first ([`settle_verdict`](Self::settle_verdict)); a leaf that
+    /// took the child kills it with the leaf. Below 6.9 the kernel refuses the flag and nothing is
+    /// sent, as the group's number may name another group. `Err` is the kernel's refusal of the kill.
     #[cfg(target_os = "linux")]
     pub(crate) fn kill_group_before_attach(&self, child: ChildHandle<'_>) -> Result<(), nix::errno::Errno> {
         use nix::errno::Errno;
         let group_is_containment = self.is_root
-            && self.cgroup_leaf.is_none()
+            && self.cgroup_leaf.as_ref().is_none_or(|leaf| !leaf.child_entered())
             && matches!(self.mode, Some(mode) if !matches!(mode, ContainMode::TreeWalk));
         if !group_is_containment {
             return Ok(());

@@ -289,7 +289,7 @@ impl CgroupLeaf {
     }
 
     /// Whether the child reported entering this leaf, once the verdict is taken.
-    fn child_entered(&self) -> bool {
+    pub(crate) fn child_entered(&self) -> bool {
         debug_assert!(self.report.is_none(), "the verdict is not taken yet");
         self.entered
     }
