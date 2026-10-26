@@ -92,7 +92,9 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
 /// reaped)".
 ///
 /// A reaped root's number may name another process by now, so the tree kill is skipped when it
-/// would name the tree by that number (a process group, a ppid walk), and the note says so.
+/// would name the tree by that number (a process group, a ppid walk), and the note says so. This is
+/// decided on one look at the root: a reap by another reaper after it is not seen, and the tree
+/// kill then goes to a number another process may hold.
 ///
 /// A live front outside a cgroup (see [`Child::kill`]) is signalled by neither kill: the root's
 /// kill is the typed `Unkillable`, and the note says so. A front that had already exited is reaped,
@@ -119,13 +121,14 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     let Err(write_err) = written else {
         return Ok(child);
     };
+    // A live front outside a cgroup is not signalled, by its group or otherwise: the root's kill
+    // below then says why.
+    let gate = child.kill_gate();
+    // The look at the root, right before the tree kill it decides.
     let view =
         crate::containment::DropView::read("finish_elevated", child.id, || child.proc.state(), &child.tree_killed);
     let mut report = crate::child::drop_report::DropReport::new("finish_elevated", &view);
     let mut skipped = None;
-    // A live front outside a cgroup is not signalled, by its group or otherwise: the root's kill
-    // below then says why.
-    let gate = child.kill_gate();
     let front_closed = matches!(gate, crate::elevation::front::Gate::Closed(_));
     let tree = (child.containment().can_teardown() && !front_closed).then(|| {
         child
@@ -249,10 +252,9 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     let warned = report.emit(&[]);
     if tree_settled && root_settled {
         child.kill_on_drop = false;
-    } else {
-        // The drop tries again; it need not warn of what the cleanup warned of again.
-        child.reported = warned;
     }
+    // The drop, armed to try again or not, need not warn of what the cleanup warned of again.
+    child.reported = warned;
     Err(SpawnFailure::started(
         Error::Elevation {
             kind: crate::error::ElevationErrorKind::AuthFailed,

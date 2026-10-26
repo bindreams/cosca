@@ -84,8 +84,8 @@ impl<'a> DropReport<'a> {
     }
 
     /// Log the report: one `warn`, or nothing when there is nothing to report. `reported`: what an
-    /// earlier step of this same event warned of (a cleanup that left its handle armed, whose drop
-    /// retries). A report that only repeats it is a `debug` record; one with anything new warns.
+    /// earlier step of this same event warned of (a failed spawn's cleanup, before its handle's
+    /// drop). A report that only repeats it is a `debug` record; one with anything new warns.
     /// Returns the kinds of part it warned of, none when it did not warn.
     pub(crate) fn emit(self, reported: &[PartKey]) -> Vec<PartKey> {
         let parts = self.parts();
