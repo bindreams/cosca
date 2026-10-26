@@ -398,6 +398,19 @@ fn main() {
             }
         }
         "cwd" => outln!("{}", std::env::current_dir().unwrap().display()),
+        // The cwd (or why it cannot be read) and whether the relative name `cosca-marker`, a file in
+        // the directory the parent meant as the cwd, opens: that is, whether this process's cwd is
+        // that directory.
+        "cwd-marker" => {
+            match std::env::current_dir() {
+                Ok(p) => outln!("cwd={}", p.display()),
+                Err(e) => outln!("cwd-error={e}"),
+            }
+            match std::fs::File::open("cosca-marker") {
+                Ok(_) => outln!("marker=ok"),
+                Err(e) => outln!("marker=err={}", e.raw_os_error().unwrap_or(-1)),
+            }
+        }
         "emit" => {
             let n_out: usize = args[2].parse().unwrap();
             let n_err: usize = args[3].parse().unwrap();

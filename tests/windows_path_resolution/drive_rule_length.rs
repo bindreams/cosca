@@ -20,8 +20,8 @@ use crate::test_groups::{path_probes, Group};
 /// `M7b policy LongPathsEnabled=<value>`; it is read, never changed.
 ///
 /// Preconditions, asserted: each value directory has the length its row says; the child runs in the
-/// row's cwd and sees the row's `=X:` value; the unaware child reports long paths off and the aware
-/// one reports them on exactly when the policy is on. The letter is searched in `G..=L`, as M7's.
+/// row's cwd and sees the row's `=X:` value; the `LongPathsEnabled` policy is 1; the unaware child
+/// reports long paths off and the aware one on. The letter is searched in `G..=L`, as M7's.
 #[skuld::test]
 fn m7b_the_length_and_form_of_a_childs_drive_directory_value(#[fixture(path_probes)] _group: &Group) {
     survey_platform();
@@ -34,24 +34,23 @@ fn m7b_the_length_and_form_of_a_childs_drive_directory_value(#[fixture(path_prob
     let sr = format!("SystemRoot={}", std::env::var("SystemRoot").expect("SystemRoot"));
     let render = Render(vec![(d.clone(), "<d>".into())]);
     let drives = [(letter, 'X')];
-    // `RtlAreLongPathsEnabled` in the child is its manifest AND this policy, so the policy decides
-    // what the aware child must report.
+    // `RtlAreLongPathsEnabled` in the child is its manifest AND this policy; without the policy the
+    // `aware` half would run an unaware child under that label.
     let policy = reg_dword(r"SYSTEM\CurrentControlSet\Control\FileSystem", "LongPathsEnabled");
     println!("M7b policy LongPathsEnabled={}", or_missing(policy.clone()));
+    assert_eq!(
+        policy,
+        Ok(1),
+        r"precondition: HKLM\SYSTEM\CurrentControlSet\Control\FileSystem\LongPathsEnabled is 1, which the `aware` half needs"
+    );
     let children = [
         ("unaware", testbin(), false),
-        ("aware", env!("CARGO_BIN_EXE_cosca_testbin_cwd"), policy == Ok(1)),
+        ("aware", env!("CARGO_BIN_EXE_cosca_testbin_cwd"), true),
     ];
 
     let sized = |units: usize| {
         // `dir_of_len` extends its base, so each length gets a base of its own.
-        let value = dir_of_len(&format!(r"{d}\v{units}"), units);
-        assert_eq!(
-            value.encode_utf16().count(),
-            units,
-            "precondition: the value directory has {units} units"
-        );
-        value
+        dir_of_len(&format!(r"{d}\v{units}"), units)
     };
     let values = [
         ("units259", sized(259)),

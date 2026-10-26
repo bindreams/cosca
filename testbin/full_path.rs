@@ -11,9 +11,9 @@ use windows::Win32::Storage::FileSystem::GetFullPathNameW;
 use windows::Win32::System::Environment::{GetCurrentDirectoryW, GetEnvironmentVariableW};
 
 /// Prints `long_paths_enabled=` (this process's manifest and the `LongPathsEnabled` policy, as
-/// `RtlAreLongPathsEnabled` reports them), `cwd=` (`GetCurrentDirectoryW`), `var=` (`GetEnvironmentVariableW("=X:")` for `name`'s
-/// drive `X:`, or `<unset>`), `full=` (`GetFullPathNameW(name)`, or `err=<code>`), then `var_after=`,
-/// read again after the call.
+/// `RtlAreLongPathsEnabled` reports them), `cwd=` (`GetCurrentDirectoryW`), `var=`
+/// (`GetEnvironmentVariableW("=X:")` for `name`'s drive `X:`, or `<unset>`), `full=`
+/// (`GetFullPathNameW(name)`, or `err=<code>`), then `var_after=`, read again after the call.
 pub fn run(name: &str) {
     println!("long_paths_enabled={}", crate::long_image::long_paths_enabled());
     let mut buf = vec![0u16; 32 * 1024];

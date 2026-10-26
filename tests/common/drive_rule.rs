@@ -264,9 +264,9 @@ fn render_drives(s: &str, drives: &[(char, char)]) -> String {
 
 /// The arm the child's result took, from its report: `Error` when `GetFullPathNameW` failed;
 /// `Base` when the name's drive is the drive of a drive-absolute `cwd` and `full` is under the cwd;
-/// `Value` when `var` is fully qualified, an existing directory, and `full` is under it; `Root` when
-/// `full` is not under the cwd and starts with the name's drive root; else `Other`. Case-insensitive
-/// for ASCII only.
+/// `Value` when `var` is fully qualified, an existing directory, and `full` is under it or is it (a
+/// bare `X:`); `Root` when `full` is not under the cwd and starts with the name's drive root; else
+/// `Other`. Case-insensitive for ASCII only.
 fn observed_arm(cwd: &str, name: &str, var: &str, full: &str) -> &'static str {
     let under = |path: &str, dir: &str| starts_with_ignore_case(path, &format!("{}\\", dir.trim_end_matches('\\')));
     if full.starts_with("err=") {
@@ -280,7 +280,10 @@ fn observed_arm(cwd: &str, name: &str, var: &str, full: &str) -> &'static str {
     let fully_qualified = drive_root_len(var) > 0 || (var.starts_with(r"\\") && !var.starts_with(r"\\.\"));
     if cwd_drive.is_some_and(|c| c.eq_ignore_ascii_case(&name_drive)) && under(full, cwd) {
         "Base"
-    } else if fully_qualified && std::path::Path::new(var).is_dir() && under(full, var) {
+    } else if fully_qualified
+        && std::path::Path::new(var).is_dir()
+        && (under(full, var) || full.eq_ignore_ascii_case(var))
+    {
         "Value"
     } else if !under(full, cwd) && starts_with_ignore_case(full, &format!("{name_drive}:\\")) {
         "Root"
