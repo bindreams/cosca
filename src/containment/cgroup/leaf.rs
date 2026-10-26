@@ -723,24 +723,26 @@ impl CgroupLeaf {
     fn terminate_listed(&self, procs: &str) -> Result<(), crate::error::Error> {
         let mut pids = Vec::new();
         let mut unproven = Vec::new();
-        for pid in procs.lines().filter_map(|line| line.trim().parse::<u32>().ok()) {
-            if pid == 0 {
+        for line in procs.lines() {
+            match line.trim().parse::<u32>() {
                 // A live member outside this process's pid namespace: it has no number here to
-                // pin or signal, and the caller is told so.
-                unproven.push("pid 0: it is a member in a pid namespace this process cannot see".to_owned());
-            } else {
-                pids.push(pid);
+                // pin or signal.
+                Ok(0) => {
+                    unproven.push("pid 0: it is a member in a pid namespace this process cannot see".to_owned());
+                }
+                Ok(pid) => pids.push(pid),
+                Err(_) => unproven.push(format!("cgroup.procs line {line:?} is no pid")),
             }
         }
         if pids.is_empty() && unproven.is_empty() {
             return Ok(());
         }
         // One subtree for every member. Where the leaf's id cannot be read, the pidfd route cannot
-        // place a member, and `/proc` does, as before kernel 6.13.
+        // place a member, and `/proc` does.
         let subtree = self.subtree_with(match self.id() {
             Ok(id) => Some(id),
             Err(e) => {
-                log::warn!(
+                log::debug!(
                     "cgroup terminate: leaf {}'s cgroup id cannot be read ({e}); its members are placed through /proc",
                     self.leaf_path.display()
                 );
@@ -791,18 +793,7 @@ impl CgroupLeaf {
     /// it logs at `debug`; `Err` says why a pid that may be a member got none.
     fn terminate_member(&self, pid: u32, subtree: &Subtree) -> Result<(), Unsignalled> {
         use std::os::fd::AsFd as _;
-        #[cfg(test)]
-        let pinned = match fault::terminate_fails(fault::TerminateStep::Pin) {
-            Some(errno) => Err(rustix::io::Errno::from_raw_os_error(errno)),
-            None => rustix::process::Pid::from_raw(pid as i32)
-                .ok_or(rustix::io::Errno::INVAL)
-                .and_then(|raw| rustix::process::pidfd_open(raw, rustix::process::PidfdFlags::empty())),
-        };
-        #[cfg(not(test))]
-        let pinned = rustix::process::Pid::from_raw(pid as i32)
-            .ok_or(rustix::io::Errno::INVAL)
-            .and_then(|raw| rustix::process::pidfd_open(raw, rustix::process::PidfdFlags::empty()));
-        let pidfd = match pinned {
+        let pidfd = match pin_member(pid) {
             Ok(pidfd) => pidfd,
             Err(rustix::io::Errno::SRCH) => {
                 log::debug!("cgroup terminate: pid {pid} is gone; not signalled");
@@ -812,20 +803,13 @@ impl CgroupLeaf {
         };
         #[cfg(test)]
         fault::run_after_terminate_pin();
-        // A pid read while its pidfd's process still runs names that process: the membership check
-        // read the process the pidfd pins.
-        match subtree
-            .holds(pid, Some(pidfd.as_fd()))
-            .and_then(|inside| Ok(inside && !pidfd_exited(pidfd.as_fd())?))
-        {
-            Ok(true) => {}
-            Ok(false) => {
-                log::debug!("cgroup terminate: pid {pid} is not a running member of the leaf; not signalled");
-                return Ok(());
-            }
+        // The exit check follows the read: a process still running after it held `pid` throughout,
+        // so the read was its own and not a reused pid's.
+        let inside = match subtree.holds(pid, Some(pidfd.as_fd())) {
+            Ok(inside) => inside,
             // A member that exited and was reaped since its pin has no place left to read
             // (`ENOENT` from `/proc`, `ESRCH` from `PIDFD_GET_INFO`): its pidfd tells it apart.
-            Err(e) => match pidfd_exited(pidfd.as_fd()) {
+            Err(e) => match member_exited(pidfd.as_fd()) {
                 Ok(true) => {
                     log::debug!("cgroup terminate: pid {pid} exited before it was placed ({e}); not signalled");
                     return Ok(());
@@ -837,6 +821,18 @@ impl CgroupLeaf {
                     )))
                 }
             },
+        };
+        if !inside {
+            log::debug!("cgroup terminate: pid {pid} is not a member of the leaf; not signalled");
+            return Ok(());
+        }
+        match member_exited(pidfd.as_fd()) {
+            Ok(false) => {}
+            Ok(true) => {
+                log::debug!("cgroup terminate: pid {pid} has exited; not signalled");
+                return Ok(());
+            }
+            Err(e) => return Err(Unsignalled::Unproven(format!("its exit could not be read ({e})"))),
         }
         match send_term(pidfd.as_fd()) {
             Ok(()) => Ok(()),
@@ -847,6 +843,28 @@ impl CgroupLeaf {
             Err(e) => Err(Unsignalled::Failed(format!("{e}"))),
         }
     }
+}
+
+/// A pidfd that pins the process `pid` names, for [`CgroupLeaf::terminate`]; a test build lets a
+/// `fail_terminate` seam answer in its place.
+fn pin_member(pid: u32) -> rustix::io::Result<std::os::fd::OwnedFd> {
+    #[cfg(test)]
+    if let Some(errno) = fault::terminate_fails(fault::TerminateStep::Pin) {
+        return Err(rustix::io::Errno::from_raw_os_error(errno));
+    }
+    rustix::process::Pid::from_raw(pid as i32)
+        .ok_or(rustix::io::Errno::INVAL)
+        .and_then(|raw| rustix::process::pidfd_open(raw, rustix::process::PidfdFlags::empty()))
+}
+
+/// [`pidfd_exited`] for [`CgroupLeaf::terminate`]'s member; a test build lets a `fail_terminate`
+/// seam answer in its place.
+fn member_exited(pidfd: std::os::fd::BorrowedFd<'_>) -> io::Result<bool> {
+    #[cfg(test)]
+    if let Some(errno) = fault::terminate_fails(fault::TerminateStep::Exited) {
+        return Err(io::Error::from_raw_os_error(errno));
+    }
+    pidfd_exited(pidfd)
 }
 
 /// [`CgroupLeaf::terminate`]'s `SIGTERM` to the member `pidfd` pins, through that pidfd, and the

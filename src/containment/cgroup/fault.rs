@@ -56,7 +56,7 @@ thread_local! {
     static CGROUP_ID_FAILS: Cell<Option<i32>> = const { Cell::new(None) };
     static LIVENESS_READ_FAILS: Cell<Option<i32>> = const { Cell::new(None) };
     static SUBTREE_FAILS: Cell<Option<i32>> = const { Cell::new(None) };
-    static TERMINATE_FAILS: Cell<Option<(TerminateStep, i32)>> = const { Cell::new(None) };
+    static TERMINATE_FAILS: Cell<Option<(TerminateStep, i32, bool)>> = const { Cell::new(None) };
     static RMDIR_HOOK: std::cell::RefCell<Option<RmdirHook>> = std::cell::RefCell::new(None);
     static FORCE_FORK_RUNNING_PIDFD_FAILURE: Cell<bool> = const { Cell::new(false) };
     static FORK_RUNNING_PIDFD_FAILURE_PROBE: std::cell::RefCell<Option<std::os::fd::OwnedFd>> =
@@ -976,6 +976,8 @@ impl Drop for FailSubtree {
 pub(crate) enum TerminateStep {
     /// The `pidfd_open` that pins the member.
     Pin,
+    /// The read of whether the pinned member has exited.
+    Exited,
     /// The `pidfd_send_signal`.
     Send,
 }
@@ -983,7 +985,13 @@ pub(crate) enum TerminateStep {
 /// While the guard lives, `step` of each member's `SIGTERM` in `CgroupLeaf::terminate` on this
 /// thread fails with `errno`, and the call it stands for is not made.
 pub(crate) fn fail_terminate(step: TerminateStep, errno: i32) -> FailTerminate {
-    TERMINATE_FAILS.with(|f| f.set(Some((step, errno))));
+    TERMINATE_FAILS.with(|f| f.set(Some((step, errno, false))));
+    FailTerminate(())
+}
+
+/// [`fail_terminate`] for the first member's `step` only: the members after it are not refused.
+pub(crate) fn fail_terminate_once(step: TerminateStep, errno: i32) -> FailTerminate {
+    TERMINATE_FAILS.with(|f| f.set(Some((step, errno, true))));
     FailTerminate(())
 }
 
@@ -996,11 +1004,17 @@ impl Drop for FailTerminate {
     }
 }
 
-/// The errno `step` fails with, if a [`fail_terminate`] guard is live for it.
+/// The errno `step` fails with, if a [`fail_terminate`] guard is live for it. A
+/// [`fail_terminate_once`] refusal is spent by the call that gets it.
 pub(crate) fn terminate_fails(step: TerminateStep) -> Option<i32> {
-    TERMINATE_FAILS
-        .with(Cell::get)
-        .and_then(|(failing, errno)| (failing == step).then_some(errno))
+    let (failing, errno, once) = TERMINATE_FAILS.with(Cell::get)?;
+    if failing != step {
+        return None;
+    }
+    if once {
+        TERMINATE_FAILS.with(|f| f.set(None));
+    }
+    Some(errno)
 }
 
 pub(crate) fn subtree_fails() -> Option<i32> {
