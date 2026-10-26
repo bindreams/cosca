@@ -1,4 +1,4 @@
-# Throwaway: measures reserved-name trailing-dot strings on older and newer Windows. Do not merge.
+# Throwaway: measures reserved names in middle and trailing-separator positions on older and newer Windows. Do not merge.
 name: probe-772-reserved
 
 on:

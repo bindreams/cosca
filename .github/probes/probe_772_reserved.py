@@ -2,7 +2,7 @@
 # requires-python = ">=3.9"
 # dependencies = []
 # ///
-r"""Throwaway probe: do reserved-name strings with a trailing `\.` name the file on this Windows?
+"""Throwaway probe: are reserved names in a middle position, or before a trailing separator, devices?
 
 Prints, per string, `RtlIsDosDeviceName_U` (hex: length<<16 | offset, 0 = not a device),
 `GetFullPathNameW` and the NT path from `RtlDosPathNameToNtPathName_U_WithStatus`.
@@ -57,39 +57,21 @@ def nt_path(s: str) -> str:
     return repr(out)
 
 
-# (input, proposed faithful string) pairs from review F1.
-PAIRS = [
-    (r"a\nul", r"a\nul\."),
-    (r"nul", r".\nul\."),
-    (r"\x\nul", r"\x\nul\."),
-    (r"\nul", r"\nul\."),
-    (r"C:nul", r"C:.\nul\."),
-    (r"\:nul", r"\.\:nul"),
-    (r"a\com1", r"a\com1\."),
-    (r"a\nul.txt", r"a\nul.txt\."),
-    (r"nul\x", r".\nul\x"),
-    (r"com1.txt\f", r".\com1.txt\f"),
-    # A rooted path that starts `\??\`, which Win32 hands to the object manager untouched.
-    (r"\??\C:\x", r"\.\??\C:\x"),
-    (r"\??\x", r"\.\??\x"),
-    (r"\??\nul", r"\.\??\nul\."),
-    (r"\??\C:\nul", r"\.\??\C:\nul\."),
-    ("\\??\\", "\\.\\??\\"),
+# Spellings `to_win32_string` accepts as written, never measured on the older device rules: a reserved
+# name in a middle position, a trailing separator after one, and names with a space or `:` suffix.
+ROWS = [
+    r"C:\x\NUL" + "\\",
+    r"C:\NUL\x",
+    r"x\NUL\y",
+    r"\NUL.txt\x",
+    r"C:\x\COM1" + "\\",
+    r"x\COM1.txt\y",
+    r"C:\x\nul .txt",
+    r"C:\x\NUL:",
+    r"C:\x\NUL:stream",
 ]
-# UNC and device paths: does any Windows read a reserved name in them as a device?
-UNC_AND_DEVICE = [
-    r"\\s\h\nul",
-    r"\\s\h\com1",
-    r"\\s\h\a\nul.txt",
-    r"\\.\x\nul",
-    r"\\.\nul",
-    "//s/h/nul",
-    r"\\s\nul",
-    r"\\s\h\nul\.",
-    r"\\.\x\nul\.",
-]
-# Controls: no proposal.
-CONTROLS = [r"com1.txt\x", r"COM1.TXT\file1.txt", r"C:\x\nul", r"C:\x\nul\.", r"a\nul\.", r"a\com1\."]
+# Controls: known last-name and relative-first-name readings.
+CONTROLS = [r"C:\x\nul", r"nul\x", r"COM1.TXT\file1.txt", r"C:\x\a.txt"]
 
 
 def show(label: str, s: str) -> None:
@@ -103,16 +85,12 @@ def main() -> None:
     os.chdir(cwd)
     print(f"platform: {platform.platform()} {platform.machine()} (sys.getwindowsversion={sys.getwindowsversion()})")
     print(f"cwd: {os.getcwd()}")
-    for inp, prop in PAIRS:
-        print("pair")
-        show("input", inp)
-        show("proposed", prop)
     for c in CONTROLS:
         print("control")
         show("control", c)
-    for u in UNC_AND_DEVICE:
-        print("unc_or_device")
-        show("row", u)
+    for r in ROWS:
+        print("row")
+        show("row", r)
 
 
 main()
