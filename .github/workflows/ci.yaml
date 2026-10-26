@@ -307,6 +307,14 @@ jobs:
         timeout-minutes: 8
         run: ${{ matrix.nextest }} serde cargo nextest run --locked --features serde --target ${{ matrix.target }}
 
+      # The steps above run the root package only.
+      - name: Build tests (cosca-path)
+        run: cargo nextest run --locked --no-run -p cosca-path --target ${{ matrix.target }} --profile ci
+
+      - name: Run tests (cosca-path)
+        timeout-minutes: 8
+        run: ${{ matrix.nextest }} path cargo nextest run --locked -p cosca-path --target ${{ matrix.target }}
+
 
       # nextest does not run doctests (https://github.com/nextest-rs/nextest/issues/16), so they use
       # `cargo test --doc`. On Unix the runner signals only the step's top-level shell when the
@@ -320,7 +328,7 @@ jobs:
         if: matrix.os == 'linux' || matrix.os == 'darwin'
         timeout-minutes: 2
         shell: bash
-        run: exec python3 .github/scripts/forward.py cargo test --locked --no-fail-fast --doc --all-features --target ${{ matrix.target }}
+        run: exec python3 .github/scripts/forward.py cargo test --locked --no-fail-fast --doc --workspace --all-features --target ${{ matrix.target }}
 
       # The forwarding scripts run on every Unix lane of the workflow; Linux is covered by the Lint job.
       # macOS differs: forward.py waits for signals with a kqueue there, because `sigwait` loses a
@@ -350,14 +358,14 @@ jobs:
       - name: Run doctests (Windows)
         if: matrix.os == 'windows'
         timeout-minutes: 2
-        run: cargo test --locked --no-fail-fast --doc --all-features --target ${{ matrix.target }}
+        run: cargo test --locked --no-fail-fast --doc --workspace --all-features --target ${{ matrix.target }}
 
       - name: Check rustdoc
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --no-deps --all-features --locked --target "$TARGET"
+        run: cargo doc --no-deps --workspace --all-features --locked --target "$TARGET"
 
       - name: Assert the package excludes test-only paths
         shell: bash
@@ -372,14 +380,14 @@ jobs:
           cargo package --list --locked --target "$TARGET" > "$LIST"
 
           set +e
-          grep -qE '^(testbin/|tests/|\.github/|\.claude/|\.config/|prek\.toml$)' "$LIST"
+          grep -qE '^(testbin/|tests/|cosca-path/|\.github/|\.claude/|\.config/|prek\.toml$)' "$LIST"
           grep_status=$?
           set -e
 
           case "$grep_status" in
             0)
               echo "::error::Excluded paths leaked into the package:"
-              grep -E '^(testbin/|tests/|\.github/|\.claude/|\.config/|prek\.toml$)' "$LIST"
+              grep -E '^(testbin/|tests/|cosca-path/|\.github/|\.claude/|\.config/|prek\.toml$)' "$LIST"
               exit 1
               ;;
             1) echo "no excluded paths in the package" ;;
