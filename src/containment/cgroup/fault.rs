@@ -39,6 +39,7 @@ thread_local! {
     static FORCE_LEAF_OPEN_FAILURE: Cell<bool> = const { Cell::new(false) };
     static FAIL_KILL_WRITES: Cell<bool> = const { Cell::new(false) };
     static FAIL_NEXT_KILL_WRITE: Cell<bool> = const { Cell::new(false) };
+    static FAIL_PUMP_STARTS: Cell<bool> = const { Cell::new(false) };
     static PIDFD_INFO_MISSING: Cell<bool> = const { Cell::new(false) };
     static PROC_HIDDEN: Cell<bool> = const { Cell::new(false) };
     static BEFORE_KILL_WRITE: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
@@ -92,6 +93,26 @@ impl Drop for FailKillWrites {
 
 pub(crate) fn kill_writes_fail() -> bool {
     FAIL_KILL_WRITES.with(Cell::get)
+}
+
+/// A drain pump started on this thread fails to start, with `EAGAIN`, as a spawn at a thread limit
+/// does, until the guard drops.
+pub(crate) fn fail_pump_starts() -> FailPumpStarts {
+    FAIL_PUMP_STARTS.with(|f| f.set(true));
+    FailPumpStarts(())
+}
+
+#[must_use = "pumps start again as soon as the guard is dropped"]
+pub(crate) struct FailPumpStarts(());
+
+impl Drop for FailPumpStarts {
+    fn drop(&mut self) {
+        FAIL_PUMP_STARTS.with(|f| f.set(false));
+    }
+}
+
+pub(crate) fn pump_starts_fail() -> bool {
+    FAIL_PUMP_STARTS.with(Cell::get)
 }
 
 /// The next `cgroup.kill` write on this thread fails with `EIO` and kills nothing; the writes after

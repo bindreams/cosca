@@ -586,3 +586,84 @@ fn a_teardown_whose_drain_watch_fails_warns_once_past_1s() {
         "exactly one warn"
     );
 }
+
+/// A blocker whose root has exited and been reaped: an armed drop of it waits only for the drain.
+#[cfg(target_os = "linux")]
+async fn reaped_blocker() -> Child {
+    let (mut child, stdin) = blocker();
+    drop(stdin);
+    child.wait().await.expect("the blocker exits once its stdin closes");
+    child
+}
+
+/// The fake leaf's member is released only from a drain wait that blocks after the leaf's first
+/// `rmdir`, so after any look that decides a warn. The release records how many warns naming
+/// `needle` and the leaf `name` were out by then. Answers that record, and the release's guard, to
+/// drop once the teardown is over.
+#[cfg(target_os = "linux")]
+#[allow(clippy::type_complexity, reason = "a test helper's two shared cells")]
+fn release_from_the_blocking_wait(
+    fake: &crate::containment::cgroup::test_support::FakeLeaf,
+    name: &'static str,
+    needle: String,
+    mark: usize,
+) -> (
+    std::rc::Rc<std::cell::Cell<Option<usize>>>,
+    std::rc::Rc<std::cell::RefCell<Option<crate::oneshot_hook::Armed>>>,
+) {
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    use crate::containment::cgroup::fault as leaf_fault;
+    use crate::containment::cgroup::test_support::FakeLeaf;
+
+    let warned_at_release = Rc::new(Cell::new(None));
+    let release: Rc<RefCell<Option<crate::oneshot_hook::Armed>>> = Rc::default();
+    let (path, events) = (fake.leaf.clone(), fake.events.clone());
+    let (seen, armed) = (Rc::clone(&warned_at_release), Rc::clone(&release));
+    leaf_fault::set_rmdir_hook(move |_| {
+        if armed.borrow().is_none() {
+            let (seen, events, needle) = (Rc::clone(&seen), events.clone(), needle.clone());
+            *armed.borrow_mut() = Some(leaf_fault::set_before_drain_block(move || {
+                let warns = crate::log_capture::records_since(mark, &needle)
+                    .into_iter()
+                    .filter(|text| text.contains("still waiting") && text.contains(name))
+                    .count();
+                seen.set(Some(warns));
+                FakeLeaf::set_populated(&events, false);
+            }));
+        }
+        FakeLeaf::rmdir(&path, &events)
+    });
+    (warned_at_release, release)
+}
+
+/// An armed drop whose leaf's drain pump cannot start (a thread limit) still warns once its drain
+/// wait passes the threshold, and still waits for the drain: the wait that blocks decides the warn.
+///
+/// Mutant: the warn is decided by a look through the pump, whose failure skips it.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn tokio_armed_drop_whose_drain_pump_cannot_start_warns_once() {
+    use super::child_drop_tests::linux;
+    use crate::containment::cgroup::fault as leaf_fault;
+
+    crate::tokio::test_runtime::assert_current_thread();
+    let name = "cosca-armed-drop-pump-refused";
+    let child = reaped_blocker().await;
+    let (fake, leaf) = linux::fake_leaf(name, true);
+    let needle = format!("async child {}", child.id().pid());
+    let mark = crate::log_capture::mark();
+    let (warned_at_release, release) = release_from_the_blocking_wait(&fake, name, needle, mark);
+    let _warn = super::fault::warn_slow_teardowns_after(std::time::Duration::ZERO);
+    let _no_pump = leaf_fault::fail_pump_starts();
+    let (steps, _) = linux::dropped(linux::contained_by(child, leaf), name);
+    drop(release.borrow_mut().take());
+
+    assert_eq!(
+        warned_at_release.get(),
+        Some(1),
+        "one warn naming the leaf, out before its member was released: {steps:?}"
+    );
+    assert!(!fake.leaf.exists(), "the drained leaf is removed: {steps:?}");
+}
