@@ -443,10 +443,12 @@ fn fork_probe(parent: libc::pid_t, dumpable: bool) -> io::Result<Probe> {
 enum Hold {
     /// A pidfd shown to name a child of this process ([`own_child_pidfd`]).
     Pidfd(OwnedFd),
-    /// Its pid alone, when no pidfd could be opened (`EMFILE`, say). The child pauses until killed,
-    /// so the number names it unless something else in the process kills it and another reaper reaps
-    /// it; the kill and the reap then reach whoever holds the number: a child of this process, or, for
-    /// the kill, any process. A pidfd from the fork itself (#383) removes this case.
+    /// Its pid alone, when no pidfd could be opened (`EMFILE`, say), or the kill through the pidfd
+    /// failed other than with `ESRCH`: the fallback is main's, a kill and a reap by the number. The
+    /// child pauses until killed, so the number names it unless something else in the process kills
+    /// it and another reaper reaps it; the kill and the reap then reach whoever holds the number: a
+    /// child of this process, or, for the kill, any process. A pidfd from the fork itself (#383)
+    /// removes this case.
     Number,
 }
 
@@ -500,41 +502,66 @@ fn own_child_pidfd(pid: libc::pid_t) -> Result<OwnedFd, Unpinned> {
     }
 }
 
-/// Kills the probe's child `pid` and reaps it, through `hold`.
+/// Kills the probe's child `pid` and reaps it, through `hold`. Every exit that returns leaves no
+/// probe process, except a reap that itself fails. A kill through the pidfd that answers `ESRCH`
+/// finds the child already dead, and the pidfd reaps it. Any other error of that kill falls back to
+/// the child's number, as [`Hold::Number`] does.
 fn kill_and_reap(pid: libc::pid_t, hold: Hold) -> io::Result<()> {
     match hold {
         Hold::Pidfd(pidfd) => {
             #[cfg(test)]
             crate::send_log::record(pid as u32, crate::signal::Sig::Kill, crate::send_log::Via::Pidfd);
-            rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::KILL)?;
-            loop {
-                match rustix::process::waitid(
-                    rustix::process::WaitId::PidFd(pidfd.as_fd()),
-                    rustix::process::WaitIdOptions::EXITED,
-                ) {
-                    Err(rustix::io::Errno::INTR) => continue,
-                    Err(e) => return Err(io::Error::from(e)),
-                    Ok(_) => return Ok(()),
+            #[cfg(test)]
+            let sent = match super::fault::run_before_probe_kill(pid) {
+                Some(errno) => Err(rustix::io::Errno::from_raw_os_error(errno)),
+                None => rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::KILL),
+            };
+            #[cfg(not(test))]
+            let sent = rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::KILL);
+            match sent {
+                Ok(()) | Err(rustix::io::Errno::SRCH) => reap_through(&pidfd),
+                Err(e) => {
+                    log::debug!(
+                        "containment::cgroup: the kill of the placement probe's child {pid} through its pidfd failed ({e}), so it is killed and reaped by its number"
+                    );
+                    kill_and_reap_by_number(pid)
                 }
             }
         }
-        Hold::Number => {
-            #[cfg(test)]
-            crate::send_log::record(pid as u32, crate::signal::Sig::Kill, crate::send_log::Via::Pid);
-            // SAFETY: plain syscalls on `pid`, this process's own child, with the residual
-            // `Hold::Number` documents.
-            unsafe { libc::kill(pid, libc::SIGKILL) };
-            let mut status = 0;
-            loop {
-                // SAFETY: as above.
-                if unsafe { libc::waitpid(pid, &mut status, 0) } == pid {
-                    return Ok(());
-                }
-                let e = io::Error::last_os_error();
-                if e.raw_os_error() != Some(libc::EINTR) {
-                    return Err(e);
-                }
-            }
+        Hold::Number => kill_and_reap_by_number(pid),
+    }
+}
+
+/// Reaps the probe's child `pidfd` names, waiting for it to exit.
+fn reap_through(pidfd: &OwnedFd) -> io::Result<()> {
+    loop {
+        match rustix::process::waitid(
+            rustix::process::WaitId::PidFd(pidfd.as_fd()),
+            rustix::process::WaitIdOptions::EXITED,
+        ) {
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(e) => return Err(io::Error::from(e)),
+            Ok(_) => return Ok(()),
+        }
+    }
+}
+
+/// Kills the probe's child `pid` by its number and reaps it, with the residual [`Hold::Number`]
+/// documents.
+fn kill_and_reap_by_number(pid: libc::pid_t) -> io::Result<()> {
+    #[cfg(test)]
+    crate::send_log::record(pid as u32, crate::signal::Sig::Kill, crate::send_log::Via::Pid);
+    // SAFETY: plain syscalls on `pid`, this process's own child, with that residual.
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    let mut status = 0;
+    loop {
+        // SAFETY: as above.
+        if unsafe { libc::waitpid(pid, &mut status, 0) } == pid {
+            return Ok(());
+        }
+        let e = io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::EINTR) {
+            return Err(e);
         }
     }
 }

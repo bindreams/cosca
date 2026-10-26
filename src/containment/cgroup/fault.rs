@@ -53,6 +53,7 @@ thread_local! {
     static PIDFD_INFO_FAILS: Cell<bool> = const { Cell::new(false) };
     static PROBE_DUMPABLE: Cell<bool> = const { Cell::new(false) };
     static BEFORE_PROBE_PIN: std::cell::RefCell<Option<ProbePinHook>> = const { std::cell::RefCell::new(None) };
+    static BEFORE_PROBE_KILL: std::cell::RefCell<Option<ProbePinHook>> = const { std::cell::RefCell::new(None) };
     static CGROUP_ID_FAILS: Cell<Option<i32>> = const { Cell::new(None) };
     static LIVENESS_READ_FAILS: Cell<Option<i32>> = const { Cell::new(None) };
     static SUBTREE_FAILS: Cell<Option<i32>> = const { Cell::new(None) };
@@ -231,6 +232,29 @@ impl Drop for BeforeProbePin {
     fn drop(&mut self) {
         BEFORE_PROBE_PIN.with(|h| *h.borrow_mut() = None);
     }
+}
+
+/// Run `hook` once, in the next placement probe forked from this thread, right before its child is
+/// killed through its pidfd, given the child's pid. `Some(errno)`: the `pidfd_send_signal` fails with
+/// it and is not made. The guard clears it.
+pub(crate) fn set_before_probe_kill(hook: impl FnOnce(libc::pid_t) -> Option<i32> + 'static) -> BeforeProbeKill {
+    BEFORE_PROBE_KILL.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    BeforeProbeKill(())
+}
+
+#[must_use = "the hook is cleared as soon as the guard is dropped"]
+pub(crate) struct BeforeProbeKill(());
+
+impl Drop for BeforeProbeKill {
+    fn drop(&mut self) {
+        BEFORE_PROBE_KILL.with(|h| *h.borrow_mut() = None);
+    }
+}
+
+/// Runs the [`set_before_probe_kill`] hook, if armed: the errno the `pidfd_send_signal` fails with.
+pub(crate) fn run_before_probe_kill(pid: libc::pid_t) -> Option<i32> {
+    let hook = BEFORE_PROBE_KILL.with(|h| h.borrow_mut().take());
+    hook.and_then(|hook| hook(pid))
 }
 
 /// Runs the [`set_before_probe_pin`] hook, if armed: the errno the `pidfd_open` fails with.
