@@ -1,5 +1,5 @@
-//! M7's runner: what a child's own `GetFullPathNameW` makes of a drive-relative name, given an
-//! environment block and a cwd built here, against what D1 predicts. `cosca_testbin with-env-block`
+//! M7's runner (M7b reuses it): what a child's own `GetFullPathNameW` makes of a drive-relative name,
+//! given an environment block and a cwd built here, against what D1 predicts. `cosca_testbin with-env-block`
 //! starts the child with exactly the row's block, and the child's `full-path` mode reports.
 //!
 //! D1, the drive rule (`complete` plus `HostOs::drive_base`), completes `X:rest` onto, in order: the
@@ -144,10 +144,15 @@ fn replace_ignore_case(s: &str, from: &str, to: &str) -> String {
     out
 }
 
-/// Runs `row` and prints it as `M7 <key> <field>=<value>` lines, rendered by `render` and then
+/// [`run_as`] for M7.
+pub fn run(row: &Row, render: &Render, drives: &[(char, char)]) {
+    run_as("M7", row, render, drives);
+}
+
+/// Runs `row` and prints it as `<id> <key> <field>=<value>` lines, rendered by `render` and then
 /// `drives`: each `(letter, placeholder)` pair prints the drive `letter:` as `<P>:`, or `<p>:` for a
 /// lowercase letter, so two drives never print alike and a lowercase one stays visible.
-pub fn run(row: &Row, render: &Render, drives: &[(char, char)]) {
+pub fn run_as(id: &str, row: &Row, render: &Render, drives: &[(char, char)]) {
     let mut cmd = Command::new(crate::common::testbin());
     cmd.arg("with-env-block");
     match &row.cwd {
@@ -163,7 +168,7 @@ pub fn run(row: &Row, render: &Render, drives: &[(char, char)]) {
     let report = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(
         out.status.success(),
-        "M7 {}: the probe failed ({}): {report}\n{}",
+        "{id} {}: the probe failed ({}): {report}\n{}",
         row.key,
         out.status,
         String::from_utf8_lossy(&out.stderr)
@@ -172,7 +177,7 @@ pub fn run(row: &Row, render: &Render, drives: &[(char, char)]) {
     assert_eq!(
         cwd,
         row.cwd.path(),
-        "M7 {}: precondition: the child runs in the row's cwd",
+        "{id} {}: precondition: the child runs in the row's cwd",
         row.key
     );
     let var = value(&report, "var");
@@ -180,7 +185,7 @@ pub fn run(row: &Row, render: &Render, drives: &[(char, char)]) {
         Var::Is(expected) => assert_eq!(
             var,
             expected.as_deref().unwrap_or("<unset>"),
-            "M7 {}: precondition: the child sees the block's =X: value",
+            "{id} {}: precondition: the child sees the block's =X: value",
             row.key
         ),
         Var::Recorded => assert!(
@@ -188,7 +193,7 @@ pub fn run(row: &Row, render: &Render, drives: &[(char, char)]) {
                 .iter()
                 .filter_map(|e| e.strip_prefix('=')?.split_once('='))
                 .any(|(_, v)| v == var),
-            "M7 {}: precondition: the child sees one of the block's =X: values, not {var:?}",
+            "{id} {}: precondition: the child sees one of the block's =X: values, not {var:?}",
             row.key
         ),
     }
@@ -198,19 +203,21 @@ pub fn run(row: &Row, render: &Render, drives: &[(char, char)]) {
     let predicted = row.predicted();
     let show = |s: &str| render_drives(&render.apply(s), drives);
     let k = row.key;
-    println!("M7 {k} cwd={}", show(cwd));
+    println!("{id} {k} cwd={}", show(cwd));
     println!(
-        "M7 {k} block={:?}",
+        "{id} {k} block={:?}",
         row.block.iter().map(|e| show(e)).collect::<Vec<_>>()
     );
-    println!("M7 {k} name={}", show(&row.name));
-    println!("M7 {k} var={}", show(var));
-    println!("M7 {k} predicted_arm={}", row.arm.name());
-    println!("M7 {k} observed_arm={observed}");
-    println!("M7 {k} predicted={}", show(&predicted));
-    println!("M7 {k} full={}", show(full));
-    println!("M7 {k} var_after={}", show(var_after));
-    println!("M7 {k} agrees={}", full == predicted);
+    println!("{id} {k} name={}", show(&row.name));
+    println!("{id} {k} var={}", show(var));
+    println!("{id} {k} predicted_arm={}", row.arm.name());
+    println!("{id} {k} observed_arm={observed}");
+    println!("{id} {k} predicted={}", show(&predicted));
+    println!("{id} {k} full={}", show(full));
+    println!("{id} {k} var_after={}", show(var_after));
+    println!("{id} {k} var_units={}", var.encode_utf16().count());
+    println!("{id} {k} full_units={}", full.encode_utf16().count());
+    println!("{id} {k} agrees={}", full == predicted);
 }
 
 /// Prints each `letter:` of `drives` as its placeholder, in one pass so a placeholder is never
@@ -304,4 +311,30 @@ pub fn free_drive(letters: impl IntoIterator<Item = u8>) -> char {
         .into_iter()
         .find(|l| mask & (1 << (l - b'A')) == 0)
         .expect("a free drive letter") as char
+}
+
+/// A new directory under `base` whose path is exactly `units` UTF-16 units long, made of components
+/// of at most 100 units, and its path.
+pub fn dir_of_len(base: &str, units: usize) -> String {
+    let len = |p: &str| p.encode_utf16().count();
+    assert!(
+        len(base) + 2 <= units,
+        "{base:?} is already {} units, past {units}",
+        len(base)
+    );
+    let mut dir = base.to_owned();
+    while len(&dir) < units {
+        let room = units - len(&dir) - 1;
+        // Never leave a single unit, which a separator alone would take.
+        let take = if room > 100 && room - 100 < 2 {
+            room - 2
+        } else {
+            room.min(100)
+        };
+        dir.push('\\');
+        dir.push_str(&"a".repeat(take));
+    }
+    assert_eq!(len(&dir), units);
+    std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("create {dir:?}: {e}"));
+    dir
 }
