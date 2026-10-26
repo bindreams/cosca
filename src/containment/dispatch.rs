@@ -95,7 +95,7 @@ impl Prepared {
             return match leaf.abandon_before_verdict(front, handshake) {
                 Abandoned::Ended => AbandonedChild::Ended,
                 Abandoned::MaybeUnreaped => AbandonedChild::MaybeUnreaped,
-                Abandoned::OutOfReach => AbandonedChild::MaybeUnreachable,
+                Abandoned::OutOfReach(why) => AbandonedChild::OutOfReach(why),
                 Abandoned::Front(fate) => AbandonedChild::Front(fate),
             };
         }
@@ -125,7 +125,7 @@ impl Prepared {
         reason = "only a Linux leaf under tokio produces more than MaybeUnreachable"
     )
 )]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AbandonedChild {
     /// Nothing of it runs, and it is reaped or will be.
     Ended,
@@ -133,6 +133,9 @@ pub(crate) enum AbandonedChild {
     MaybeUnreaped,
     /// If it was forked, it may be running where nothing can reach it.
     MaybeUnreachable,
+    /// It may be running where nothing can reach it: its leaf does not hold it, and it sent no
+    /// handle on itself or refused its kill, as the text says.
+    OutOfReach(String),
     /// It is an elevation front, which was sent no signal of its own, and this is what became of
     /// it.
     Front(crate::child::spawn::FrontFate),
@@ -323,11 +326,21 @@ impl TreeKilled {
 }
 
 /// Which signal a tree path sends.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum TreeSignal {
     Kill,
     Term,
+}
+
+#[cfg(unix)]
+impl TreeSignal {
+    pub(crate) fn verb(self) -> &'static str {
+        match self {
+            TreeSignal::Kill => "kill",
+            TreeSignal::Term => "signal",
+        }
+    }
 }
 
 /// What [`Attached::hard_kill_for_drop`] did to the tree.
@@ -542,21 +555,29 @@ impl Attached {
         }
     }
 
-    /// Whether this mechanism fires `killpg` against a pgid subject to the reap-then-recycle
-    /// hazard `Child::kill_tree`/`terminate_tree`'s precondition assert guards against: the OS
-    /// reaping the leader and recycling its pid/pgid onto a different, live process group
-    /// before the signal is sent. `ProcessGroup` always carries one; a macOS `FdMarker` does
-    /// too, when its mode created one (`Marker::has_pgid` — `None` for `TreeWalk`, which needs
-    /// no pgid and stays exempt, matching `Attached::TreeWalk` below). `FdMarker` fires
-    /// `killpg` on `self.pgid` unconditionally on pass 1 of every sweep, so the hazard is
-    /// identical, not merely analogous — routing every contained macOS root through
-    /// `FdMarker` instead of `ProcessGroup` must not silently drop this precondition's coverage.
-    #[cfg(unix)]
-    pub(crate) fn carries_recyclable_pgid(&self) -> bool {
+    /// Whether this mechanism signals a process group named by the root's pid: `ProcessGroup`, and
+    /// a macOS fd marker whose mode made a group.
+    #[cfg(all(test, unix))]
+    pub(crate) fn signals_a_group(&self) -> bool {
         match self {
             Attached::ProcessGroup(_) => true,
             #[cfg(target_os = "macos")]
-            Attached::FdMarker(m) => m.has_pgid(),
+            Attached::FdMarker(m) => m.pgid().is_some(),
+            _ => false,
+        }
+    }
+
+    /// Whether this mechanism reaches the tree through the root's number (`ProcessGroup`'s `killpg`;
+    /// a macOS `FdMarker`'s walk and group), which the root's reap frees for reuse, so
+    /// `kill_tree`/`terminate_tree` check the root first
+    /// ([`crate::child::tree_call::root_number`]). `TreeWalk` checks for itself
+    /// (`treewalk::anchor_present`).
+    #[cfg(unix)]
+    pub(crate) fn needs_root_check(&self) -> bool {
+        match self {
+            Attached::ProcessGroup(_) => true,
+            #[cfg(target_os = "macos")]
+            Attached::FdMarker(_) => true,
             _ => false,
         }
     }
@@ -569,7 +590,7 @@ impl Attached {
     /// that names no descendant of the reaped root: reparenting cleared those edges, so the only
     /// processes with that ppid belong to whoever reused the number. A macOS fd marker does both.
     #[cfg(unix)]
-    fn named_by_root_number(&self, root_pid: u32, verb: &str) -> Option<String> {
+    pub(crate) fn named_by_root_number(&self, root_pid: u32, verb: &str) -> Option<String> {
         match self {
             Attached::ProcessGroup(pgid) => Some(format!("{verb} its process group (pgid {pgid})")),
             #[cfg(target_os = "macos")]
@@ -588,10 +609,15 @@ impl Attached {
         }
     }
 
-    /// [`hard_kill`](Self::hard_kill) for a drop. Once the root is reaped nothing pins its number, so no channel that names the tree by that number may run: not the
-    /// `killpg`, not a ppid walk from the root's pid, not a kill of the root by that pid. Each
-    /// could hit an unrelated process that reused the number. A macOS fd marker still sweeps its
-    /// marker holders, which are named by identity. Cgroup and Job Object never skip.
+    /// [`hard_kill`](Self::hard_kill) for a drop. Once the root is reaped nothing pins its number,
+    /// so no channel that names the tree by that number may run: not the `killpg`, not a ppid walk
+    /// from the root's pid, not a kill of the root by that pid. Each could hit an unrelated process
+    /// that reused the number. A macOS fd marker still sweeps its marker holders, which are named
+    /// by identity. Cgroup and Job Object never skip.
+    ///
+    /// `view` is one look at the root, taken right before this call: a reap by another reaper
+    /// after it is not seen, and what is sent by the number then goes to a number another process
+    /// may hold.
     ///
     /// The same skip when the root's own handle could not say whether it is reaped
     /// (`RootState::Unknown`): nothing then shows the number still names the root.
@@ -648,11 +674,7 @@ impl Attached {
         earlier: Option<&str>,
         killed: &TreeKilled,
     ) -> Option<Result<(), Error>> {
-        let verb = match signal {
-            TreeSignal::Kill => "kill",
-            TreeSignal::Term => "signal",
-        };
-        let skipped = self.named_by_root_number(root_pid, verb)?;
+        let skipped = self.named_by_root_number(root_pid, signal.verb())?;
         let why = crate::signal::why_untrusted(root);
         let Attached::FdMarker(m) = self else {
             let earlier = earlier.map_or_else(String::new, |sent| format!(", though {sent} was sent before it"));
@@ -671,6 +693,68 @@ impl Attached {
             TreeSignal::Term => m.terminate_holders_only(except),
         };
         if result.is_ok() && matches!(signal, TreeSignal::Kill) {
+            killed.mark();
+        }
+        Some(result)
+    }
+
+    /// Send `signal` to the tree through what names it by identity alone, for a root that is
+    /// reaped: a macOS fd marker's holders, named by the pipe they hold, which no reuse of a pid
+    /// redirects. `None` for a mechanism with no such channel. For `Kill`, an `Ok` marks the tree
+    /// killed only if `mark` is set.
+    #[cfg(unix)]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(unused_variables, reason = "only a macOS fd marker names its tree by identity")
+    )]
+    pub(crate) fn signal_holders_only(
+        &self,
+        signal: TreeSignal,
+        mark: Option<&TreeKilled>,
+    ) -> Option<Result<(), Error>> {
+        match self {
+            #[cfg(target_os = "macos")]
+            Attached::FdMarker(m) => {
+                let result = match signal {
+                    TreeSignal::Kill => m.hard_kill_holders_only(None),
+                    TreeSignal::Term => m.terminate_holders_only(None),
+                };
+                if let (Ok(()), TreeSignal::Kill, Some(killed)) = (&result, signal, mark) {
+                    killed.mark();
+                }
+                Some(result)
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether this is a macOS fd marker, and if so whether its mode made a group. `None`: not an
+    /// fd marker.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn fd_marker_has_group(&self) -> Option<bool> {
+        match self {
+            Attached::FdMarker(m) => Some(m.pgid().is_some()),
+            _ => None,
+        }
+    }
+
+    /// Send `signal` to a macOS fd marker's group and holders, with no walk from the root's pid: for
+    /// a root this process reaped, whose pid names no process. `None` for any other mechanism. For
+    /// `Kill`, an `Ok` marks the tree killed only if `mark` is set.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn signal_group_and_holders(
+        &self,
+        signal: TreeSignal,
+        mark: Option<&TreeKilled>,
+    ) -> Option<Result<(), Error>> {
+        let Attached::FdMarker(m) = self else {
+            return None;
+        };
+        let result = match signal {
+            TreeSignal::Kill => m.hard_kill_group_and_holders(),
+            TreeSignal::Term => m.terminate_group_and_holders(),
+        };
+        if let (Ok(()), TreeSignal::Kill, Some(killed)) = (&result, signal, mark) {
             killed.mark();
         }
         Some(result)

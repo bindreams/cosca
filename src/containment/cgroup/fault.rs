@@ -9,9 +9,14 @@ thread_local! {
     static BETWEEN_CHECK_AND_KILL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     static ON_TAKE_PLACEMENT: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static BEFORE_EXIT_WAIT: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
-    static SIGNALLED_BY_PID: Cell<usize> = const { Cell::new(0) };
+    static BEFORE_FRONT_PROBE: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
+    static BEFORE_HANDLE_KILL: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
+    static CHILD_SENDS: std::cell::RefCell<Vec<ChildSend>> = const { std::cell::RefCell::new(Vec::new()) };
+    static FORCE_GROUP_KILL_GONE: Cell<bool> = const { Cell::new(false) };
+    static TERMINATED_BY_PID: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
     static HOOK_GATE: Cell<Option<std::os::fd::RawFd>> = const { Cell::new(None) };
     static FORCE_CHILD_KILL_DENIED: Cell<bool> = const { Cell::new(false) };
+    static FORCE_GROUP_KILL_DENIED: Cell<bool> = const { Cell::new(false) };
     static BACKGROUND_REAP_NOTIFY: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
     static AFTER_SHUT_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     static WAIT_POLLING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
@@ -489,8 +494,10 @@ pub(crate) fn run_after_shut_read() {
     }
 }
 
-/// Deny the NEXT abandoned child's kill with `EPERM`, as a child that exec'd a setuid program
-/// denies an unprivileged supervisor — which a root test lane cannot reproduce for real.
+/// Answer the NEXT abandoned child's kill through its handle with `EPERM` in place of the syscall,
+/// as a child that exec'd a setuid program denies an unprivileged supervisor — which a root test
+/// lane cannot reproduce for real. `end_child` never sees the flag: a send it makes by any other
+/// path is real. [`set_force_group_kill_denied`] does the same for its group kill.
 pub(crate) fn set_force_child_kill_denied(on: bool) {
     FORCE_CHILD_KILL_DENIED.with(|f| f.set(on));
 }
@@ -536,6 +543,15 @@ pub(crate) fn run_between_check_and_kill() {
     }
 }
 
+/// Run `hook` in the NEXT abandonment on this thread, after any group kill and right before the
+/// kill through the child's handle.
+pub(crate) fn set_before_handle_kill(hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
+    crate::oneshot_hook::arm(&BEFORE_HANDLE_KILL, hook)
+}
+pub(crate) fn run_before_handle_kill() {
+    crate::oneshot_hook::fire(&BEFORE_HANDLE_KILL);
+}
+
 /// Run `hook` in the NEXT abandonment on this thread, after the child has been signalled (an
 /// elevation front: after its leaf's kill reached it) and right before the wait for its exit. A
 /// test whose child blocks on a stdin it
@@ -550,6 +566,15 @@ pub(crate) type BeforeExitWaitGuard = crate::oneshot_hook::Armed;
 /// code under test returns, so a return before the fire point still releases its fixture.
 pub(crate) fn run_before_exit_wait() {
     crate::oneshot_hook::fire(&BEFORE_EXIT_WAIT);
+}
+
+/// Run `hook` in the NEXT abandonment of an elevation front on this thread, after it was seen
+/// unreaped and placed, right before the probe for its exit.
+pub(crate) fn set_before_front_probe(hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
+    crate::oneshot_hook::arm(&BEFORE_FRONT_PROBE, hook)
+}
+pub(crate) fn run_before_front_probe() {
+    crate::oneshot_hook::fire(&BEFORE_FRONT_PROBE);
 }
 
 /// RAII: dropping this clears the hook [`set_after_fork_still_locked`] armed, even if
@@ -638,13 +663,47 @@ pub(crate) fn take_fork_running_lock_held_report_fd() -> Option<std::os::fd::Raw
     FORK_RUNNING_LOCK_HELD_REPORT_FD.with(|f| f.take())
 }
 
-/// Count an abandoned child signalled by its bare pid on this thread.
-pub(crate) fn record_signalled_by_pid() {
-    SIGNALLED_BY_PID.with(|c| c.set(c.get() + 1));
+/// A signal `end_child` sent an abandoned spawn's child.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChildSend {
+    /// Through its pidfd or `/proc` directory.
+    Handle,
+    /// To the process group it leads, by number.
+    Group,
 }
-/// How many abandoned children this thread signalled by bare pid since the last call.
-pub(crate) fn take_signalled_by_pid() -> usize {
-    SIGNALLED_BY_PID.with(|c| c.replace(0))
+/// Note a signal `end_child` sent on this thread.
+pub(crate) fn record_child_send(send: ChildSend) {
+    CHILD_SENDS.with(|s| s.borrow_mut().push(send));
+}
+/// The signals `end_child` sent on this thread since the last call, in order.
+pub(crate) fn take_child_sends() -> Vec<ChildSend> {
+    CHILD_SENDS.with(|s| std::mem::take(&mut *s.borrow_mut()))
+}
+
+/// Answer the NEXT abandoned child's group kill with `EPERM` in place of the syscall (see
+/// [`set_force_child_kill_denied`]).
+pub(crate) fn set_force_group_kill_denied(on: bool) {
+    FORCE_GROUP_KILL_DENIED.with(|f| f.set(on));
+}
+pub(crate) fn take_force_group_kill_denied() -> bool {
+    FORCE_GROUP_KILL_DENIED.with(|f| f.replace(false))
+}
+
+/// Answer the NEXT abandoned child's group kill with `ESRCH`, as for a group with no member left.
+pub(crate) fn set_force_group_kill_gone(on: bool) {
+    FORCE_GROUP_KILL_GONE.with(|f| f.set(on));
+}
+pub(crate) fn take_force_group_kill_gone() -> bool {
+    FORCE_GROUP_KILL_GONE.with(|f| f.replace(false))
+}
+
+/// Note a member `CgroupLeaf::terminate` signalled by its bare pid on this thread.
+pub(crate) fn record_terminated_by_pid(pid: u32) {
+    TERMINATED_BY_PID.with(|t| t.borrow_mut().push(pid));
+}
+/// The members this thread's `CgroupLeaf::terminate` signalled by bare pid since the last call.
+pub(crate) fn take_terminated_by_pid() -> Vec<u32> {
+    TERMINATED_BY_PID.with(|t| std::mem::take(&mut *t.borrow_mut()))
 }
 
 /// Pumps started and ended, per leaf name, process-wide.

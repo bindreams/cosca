@@ -134,6 +134,41 @@ impl ProcHandle {
         }
     }
 
+    /// [`kill_sent`](Self::kill_sent) for any `sig`.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn signal_sent(&self, sig: crate::signal::Sig) -> io::Result<crate::signal::Sent> {
+        match self {
+            ProcHandle::Std(s) => s.signal_sent(sig),
+        }
+    }
+
+    /// Whether this thread holds the handle's lock. Tests only.
+    #[cfg(all(unix, test))]
+    pub(crate) fn is_held_by_current_thread(&self) -> bool {
+        let ProcHandle::Std(s) = self;
+        s.is_held_by_current_thread()
+    }
+
+    /// Hold off this handle's own reaps until the result drops (see
+    /// [`SharedChild::hold_reaps`](crate::child::shared::SharedChild::hold_reaps)).
+    #[cfg(unix)]
+    pub(crate) fn hold_reaps(&self) -> crate::child::shared::ReapsHeld<'_> {
+        let ProcHandle::Std(s) = self;
+        s.hold_reaps()
+    }
+
+    /// Whether the process has exited by the time `grace` is over, read only through its pidfd: no
+    /// state is read and nothing is reaped. A process with no pidfd was gone when adopted.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn exited_within(&self, grace: std::time::Duration) -> io::Result<bool> {
+        #[cfg(feature = "tokio")]
+        crate::bounded::assert_may_block("waiting for a process to exit");
+        let Some(pidfd) = self.pidfd() else {
+            return Ok(true);
+        };
+        crate::wait::poll_pidfd_exit(pidfd, crate::wait::deadline_from(grace))
+    }
+
     /// The pidfd naming the process, if it holds one (Linux).
     #[cfg(unix)]
     pub(crate) fn pidfd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {

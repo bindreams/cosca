@@ -293,10 +293,22 @@ impl SharedChild {
     /// unique id, with an unreadable id on a running child an error).
     #[cfg(unix)]
     pub(crate) fn state(&self) -> crate::signal::RootState {
+        self.state_and_own_reap().0
+    }
+
+    /// [`state`](Self::state), and whether a `Reaped` is this handle's own reap, from one read under
+    /// the lock: a reap of ours on another thread cannot land between the two answers.
+    #[cfg(unix)]
+    pub(crate) fn state_and_own_reap(&self) -> (crate::signal::RootState, bool) {
+        self.state_and_own_reap_locked(&self.lock())
+    }
+
+    /// [`state_and_own_reap`](Self::state_and_own_reap), under `lock`.
+    #[cfg(unix)]
+    fn state_and_own_reap_locked(&self, lock: &Guard<'_>) -> (crate::signal::RootState, bool) {
         use crate::signal::RootState;
-        let lock = self.lock();
         if matches!(lock.state, State::E(_)) {
-            return RootState::Reaped;
+            return (RootState::Reaped, true);
         }
         let Some(target) = self.target() else {
             #[cfg(not(test))]
@@ -305,19 +317,25 @@ impl SharedChild {
                 "child {} has no handle (it was gone when adopted); treating it as reaped",
                 self.id()
             );
-            return RootState::Reaped;
+            return (RootState::Reaped, false);
         };
         #[cfg(target_os = "macos")]
         let peeked = exit_only::peek_verified(&target);
         #[cfg(not(target_os = "macos"))]
         let peeked = exit_only::peek(&target);
-        RootState::of_peek(peeked)
+        (RootState::of_peek(peeked), false)
     }
 
     /// The unique id this handle checks its by-pid actions against. Tests only.
     #[cfg(all(target_os = "macos", test))]
     pub(crate) fn adopted_unique(&self) -> Option<u64> {
         self.identity
+    }
+
+    /// Whether this thread holds the lock. Tests only.
+    #[cfg(all(unix, test))]
+    pub(crate) fn is_held_by_current_thread(&self) -> bool {
+        *self.owner.lock().unwrap_or_else(PoisonError::into_inner) == Some(std::thread::current().id())
     }
 
     /// The child's process id.
@@ -336,7 +354,14 @@ impl SharedChild {
                 "self-deadlock: this thread locked a SharedChild it already holds"
             );
             drop(owner);
-            let guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+            let guard = match self.inner.try_lock() {
+                Ok(guard) => guard,
+                Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    seams::lock_contended();
+                    self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+                }
+            };
             *self.owner.lock().unwrap_or_else(PoisonError::into_inner) = Some(me);
             Guard {
                 guard: Some(guard),
@@ -536,11 +561,23 @@ impl SharedChild {
     /// was, because the child is already reaped (by us or by someone else).
     ///
     /// - **Linux:** through the pidfd. No pidfd (the child was gone when adopted) sends nothing.
-    /// - **macOS:** by pid, only while the pid's unique id is still the child's, under the lock:
-    ///   no reap of ours can run between the state read and the call.
+    /// - **macOS:** by pid, after a check that the pid's unique id is still the child's, under the
+    ///   lock: no reap of ours can run between the check and the send. A reap by another reaper
+    ///   there is not seen, and the signal then goes to whatever process holds the number.
     #[cfg(unix)]
     pub(crate) fn kill_sent(&self) -> io::Result<crate::signal::Sent> {
-        let lock = self.lock();
+        self.signal_sent(crate::signal::Sig::Kill)
+    }
+
+    /// [`kill_sent`](SharedChild::kill_sent) for any `sig`.
+    #[cfg(unix)]
+    pub(crate) fn signal_sent(&self, sig: crate::signal::Sig) -> io::Result<crate::signal::Sent> {
+        self.signal_sent_locked(&self.lock(), sig)
+    }
+
+    /// [`signal_sent`](Self::signal_sent), under `lock`.
+    #[cfg(unix)]
+    fn signal_sent_locked(&self, lock: &Guard<'_>, sig: crate::signal::Sig) -> io::Result<crate::signal::Sent> {
         if matches!(lock.state, State::E(_)) {
             return Ok(crate::signal::Sent::Gone);
         }
@@ -549,15 +586,22 @@ impl SharedChild {
         #[cfg(target_os = "linux")]
         {
             use std::os::fd::AsFd;
-            crate::signal::via_pidfd(
-                self.pidfd.as_ref().map(AsFd::as_fd),
-                self.id(),
-                crate::signal::Sig::Kill,
-            )
+            crate::signal::via_pidfd(self.pidfd.as_ref().map(AsFd::as_fd), self.id(), sig)
         }
         #[cfg(target_os = "macos")]
         {
-            crate::signal::via_verified_pid(self.id(), self.identity, crate::signal::Sig::Kill)
+            crate::signal::via_verified_pid(self.id(), self.identity, sig)
+        }
+    }
+
+    /// Hold off this handle's reaps (every reap is taken under its lock) until the result drops:
+    /// what it reads and sends meanwhile is one step to a `wait` on another thread. Nothing that
+    /// locks the handle may be called while it is held.
+    #[cfg(unix)]
+    pub(crate) fn hold_reaps(&self) -> ReapsHeld<'_> {
+        ReapsHeld {
+            child: self,
+            lock: self.lock(),
         }
     }
 
@@ -592,6 +636,26 @@ impl SharedChild {
             Peek::Exit(reaped) => status_of(reaped).map(Some),
             Peek::Foreign(_) => Err(echild()),
         }
+    }
+}
+
+/// [`SharedChild::hold_reaps`]: the handle's lock, and what may be read and sent under it.
+#[cfg(unix)]
+pub(crate) struct ReapsHeld<'a> {
+    child: &'a SharedChild,
+    lock: Guard<'a>,
+}
+
+#[cfg(unix)]
+impl ReapsHeld<'_> {
+    /// [`SharedChild::state_and_own_reap`].
+    pub(crate) fn state_and_own_reap(&self) -> (crate::signal::RootState, bool) {
+        self.child.state_and_own_reap_locked(&self.lock)
+    }
+
+    /// [`SharedChild::signal_sent`].
+    pub(crate) fn signal_sent(&self, sig: crate::signal::Sig) -> io::Result<crate::signal::Sent> {
+        self.child.signal_sent_locked(&self.lock, sig)
     }
 }
 
