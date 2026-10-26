@@ -1,7 +1,9 @@
 //! `Command::spawn_suspended` and `SuspendedChild`, on real frozen children.
 //!
-//! Every Windows child is a windowless `findstr x` blocker (no console window on a developer's
+//! Every Windows child is a windowless `more.com` blocker (no console window on a developer's
 //! desktop), held by a pipe the test keeps, so it ends only when the code under test kills it.
+//! `more.com` exits 0 on EOF, so a kill that sent nothing fails on how the child ended; `findstr x`
+//! would exit 1, the kill's own code.
 
 use static_assertions::assert_impl_all;
 
@@ -42,13 +44,14 @@ mod on_windows {
 
     const ERROR_ACCESS_DENIED: u32 = 5;
 
-    /// A windowless blocker; `raw` routes it to the raw `CreateProcessW` backend by giving it an
-    /// `executable()`.
+    /// A windowless blocker that exits 0 once its stdin closes; `raw` routes it to the raw
+    /// `CreateProcessW` backend by giving it an `executable()`.
     fn blocker(raw: bool) -> crate::Command {
+        let more = crate::test_child::windows_more();
         let mut cmd = crate::Command::new();
-        cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+        cmd.args([&more]);
         if raw {
-            cmd.executable(crate::test_child::BLOCKER_ARGV[0]);
+            cmd.executable(&more);
         }
         cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
         cmd.stdout(crate::Stdio::null()).expect("stdout null");
@@ -60,9 +63,13 @@ mod on_windows {
     /// Both spawn backends, so a backend that drops the hold fails its own leg.
     const BACKENDS: [bool; 2] = [false, true];
 
-    fn end(child: crate::Child) {
+    /// Kill `child`, then release its stdin: it exits 0 on EOF, so a kill that sent nothing fails
+    /// the assertion on how it ended instead of the reap blocking for ever.
+    fn end(mut child: crate::Child) {
+        let stdin = child.stdin().expect("the blocker's piped stdin");
         child.kill().expect("kill the resumed child");
-        child.wait().expect("reap the resumed child");
+        drop(stdin);
+        crate::test_child::assert_killed("the resumed child", child.wait().expect("reap the resumed child"));
     }
 
     // Refusals =====
@@ -203,8 +210,7 @@ mod on_windows {
             let kills_on_close =
                 limit_flags(job).0 & windows::Win32::System::JobObjects::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.0 != 0;
             assert_eq!(kills_on_close, kill_on_drop, "kill_on_drop({kill_on_drop})");
-            child.kill().expect("kill");
-            child.wait().expect("reap");
+            end(child);
         }
     }
 
