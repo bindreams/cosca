@@ -65,13 +65,16 @@ pub enum Anchor<'a> {
     /// resolves against `\\server\`, as it does a device name: empty names, `.` and `..` before it
     /// are skipped (`\\s\\h` and `\\s\\.\h` are the share `h`; `\\s\.\h` is the share `.`), and
     /// to `..` after it the share is a component. The share is empty when missing: `\\server`,
-    /// `\\server\`, `\\server\\`.
+    /// `\\server\`, `\\server\\`. A share that is only dots or spaces and ends the path
+    /// (`\\s\.`, `\\s\ `) stays the share as written, though Win32 strips it to `\\s\`.
     Unc { server: &'a OsStr, share: &'a OsStr },
     /// `\\.\name` or `\\?/name`, and `\\?\name` for any verbatim rest that is not a drive or UNC
     /// path (`\\?\C:foo` is the device `C:foo`). Win32 resolves the name against the device root,
     /// so empty names, `.` and `..` before it are skipped (`\\.\.\x` and `\\.\..\x` are the
     /// device `x`), and to `..` after it the name is a component (see
-    /// [`PurePath::lexically_normal`]). The name is empty when missing: `\\.`, `\\.\`, `\\.\..`.
+    /// [`PurePath::lexically_normal`]). The name is empty when missing: `\\.`, `\\.\`, `\\.\..`. A name
+    /// that ends in dots or spaces stays as written, though Win32 strips them: `\\.\d.\x` is the
+    /// device `d.`, which Win32 reads as `\\.\d\x`.
     Device { name: &'a OsStr },
 }
 
@@ -336,7 +339,9 @@ impl Path {
     /// Whether the path needs no current directory: a drive and a root, a UNC path with a server
     /// and a share, or a device path longer than `\\.` or `\\?` alone. The path is judged as
     /// written, as Win32 judges a string, not as resolved: `\\s\\h\..` is fully qualified and its
-    /// [normal form](PurePath::lexically_normal), `\\s\`, is not. A device path with no name
+    /// [normal form](PurePath::lexically_normal), `\\s\`, is not. A share that is only dots or
+    /// spaces and ends the path counts as a share, though Win32 strips it: `\\s\.` is fully
+    /// qualified and Win32 resolves it to `\\s\`. A device path with no name
     /// (`\\.\`) counts, as `RtlDetermineDosPathNameType_U` reports it a local device path rather
     /// than the root local device `\\.`.
     pub fn is_fully_qualified(&self) -> bool {
