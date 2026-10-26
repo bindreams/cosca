@@ -479,7 +479,7 @@ impl Command {
     /// [`graceful_shutdown_tree`](crate::Child::graceful_shutdown_tree) before dropping if the
     /// child needs one.
     ///
-    /// **Under [`CgroupV2`](crate::Containment::CgroupV2) the sync drop waits for the tree to be
+    /// **Under [`CgroupV2`](crate::Containment::CgroupV2) the drop waits for the tree to be
     /// gone** before it removes the tree's leaf: it waits while any process remains in the leaf.
     /// That is almost always instant, since every member was just sent `SIGKILL`. It lasts as long
     /// as a member stuck in uninterruptible I/O (D state) stays stuck, and as long as any process
@@ -525,37 +525,27 @@ impl Command {
     /// kernel that carries it (confirmed in 6.1.129, 6.12.16 and 6.13.4; tagged
     /// `Cc: stable # v5.14+`). On a kernel without it, a child forked while `cgroup.kill` runs can
     /// escape the kill and keep running. [`wait_tree`](crate::Child::wait_tree) then waits for it,
-    /// and so does the sync drop, which waits for that child's whole life. A bare async drop leaves
-    /// the leaf behind with its warning. Neither case raises an event cosca could re-kill on:
-    /// `populated` does not change, and a fork writes no file. cosca does not probe for the fix.
+    /// and so does the drop, which waits for that child's whole life. Neither raises an event
+    /// cosca could re-kill on: `populated` does not change, and a fork writes no file. cosca does
+    /// not probe for the fix.
     ///
-    /// **Where the two handles differ is the wait.** The sync [`Child`](crate::Child) blocks
-    /// until the root has exited, so after `drop` returns the child is gone. The async
-    /// [`Child`](crate::tokio::Child) does bounded work only, because a destructor cannot be
-    /// awaited or cancelled and parking a runtime worker in one stops every task on it: it sends
-    /// the signals, writes `cgroup.kill`, tries `rmdir` (and, if the leaf is still populated,
-    /// writes `cgroup.kill` once more and tries `rmdir` once more), and returns. It never waits for
-    /// the root or for a drain.
+    /// **Both handles block until the root is reaped and a cgroup leaf has drained.** The sync
+    /// [`Child`](crate::Child) does so as sync Rust normally does. The async
+    /// [`Child`](crate::tokio::Child) does so on the dropping thread, which may be a tokio worker:
+    /// a destructor cannot be awaited. Its root's kill bounds the wait, as does the tree's
+    /// `cgroup.kill`, unless a process stays stuck in uninterruptible I/O (D state) or a foreign
+    /// tracer holds the root's zombie. See that `Drop`'s rustdoc. On Windows the async drop
+    /// terminates the root and the tree, and waits for neither.
     ///
-    /// - A root still running when the async handle drops is left to tokio's own drop of its
-    ///   `Child`, which reaps it best-effort: an in-drop `try_wait`, then tokio's orphan queue,
-    ///   which drains only while some tokio runtime runs. cosca keeps no reaper of its own.
-    /// - A cgroup leaf that has not drained is **left behind**, and a warning names it, if the
-    ///   drop killed it or was armed to. [`wait_tree`](crate::tokio::Child::wait_tree) awaited
-    ///   before the drop is how to have the leaf removed.
-    ///
-    /// Code that must know the child is gone should `kill` and `await`
-    /// [`wait`](crate::tokio::Child::wait) rather than rely on the drop. See that `Drop`'s
-    /// rustdoc, which also covers a process that forks without `exec`.
-    ///
-    /// An elevated child this process cannot signal is the one case the sync handle does not
-    /// block on: the teardown gives up rather than wait forever, and the child is left running.
-    /// So is an elevated child behind a front outside a cgroup (see
-    /// [`Child::kill`](crate::Child::kill)), which the sync drop also leaves unreaped. Each logs a
-    /// `warn` naming it. The rest of the tree is still killed: the drop's cgroup leaf stays armed, and
-    /// its `cgroup.kill` ends what it holds, a front among it. The sync drop waits for that and
-    /// reaps a front that has exited or that the leaf held, and warns of one still running outside
-    /// it. The async drop waits for nothing: tokio reaps the front once it exits.
+    /// An elevated child this process cannot signal is the one case neither handle blocks on: the
+    /// teardown gives up rather than wait forever, and the child is left running. So is an elevated
+    /// child behind a front outside a cgroup (see [`Child::kill`](crate::Child::kill)), which the
+    /// drop also leaves unreaped. Each logs a `warn` naming it. The rest of the tree is still
+    /// killed: the drop's cgroup leaf stays armed, and its `cgroup.kill` ends what it holds, a front
+    /// among it. The sync drop waits for that and reaps a front that has exited or that the leaf
+    /// held, and warns of one still running outside it. The async drop reaps a front the leaf's kill
+    /// is shown to have reached, as it reaps any killed root; it waits for no other front, and
+    /// tokio reaps that one once it exits.
     ///
     /// **Under [`CgroupV2`](crate::Containment::CgroupV2), opting out can leave the tree's cgroup
     /// leaf behind.** Dropping the handle still removes the leaf if the whole tree has exited,
