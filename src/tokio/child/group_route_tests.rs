@@ -23,28 +23,35 @@ async fn kill_tree_signals_the_group_through_the_root_pidfd(#[fixture(pidfd_grou
     child.wait().await.expect("reap the root");
 }
 
+/// Its `SIGTERM` kills the group's member. Mutant: "the send through the pidfd carries signal 0".
 #[skuld::test]
 async fn terminate_tree_signals_the_group_through_the_root_pidfd(#[fixture(pidfd_group_signal)] _group: &Group) {
     crate::tokio::test_runtime::assert_current_thread();
-    let (mut child, _writer) = super::root_state_tests::session_blocker(true);
+    let (mut child, member) = super::group_exact_tests::root_with_a_member();
     let capture = Capture::start();
     child.terminate_tree().expect("terminate_tree");
     assert_through_the_pidfd(&capture.group_steps());
+    member.assert_killed();
     child.wait().await.expect("reap the root");
 }
 
+/// Its `SIGTERM` kills the group's member before the sweep could. Mutant: "graceful sends no
+/// `SIGTERM`".
 #[skuld::test]
 async fn graceful_shutdown_tree_signals_the_group_through_the_root_pidfd(
     #[fixture(pidfd_group_signal)] _group: &Group,
 ) {
+    use crate::child::group_exact_tests::EndedAtTheSigterm;
     crate::tokio::test_runtime::assert_current_thread();
-    let (mut child, _writer) = super::root_state_tests::session_blocker(true);
+    let (mut child, member) = super::group_exact_tests::root_with_a_member();
+    let ended = EndedAtTheSigterm::new(member);
     let capture = Capture::start();
     child
         .graceful_shutdown_tree(std::time::Duration::ZERO)
         .await
         .expect("graceful_shutdown_tree");
     assert_through_the_pidfd(&capture.group_steps());
+    ended.assert_killed_by_the_sigterm();
 }
 
 #[skuld::test]

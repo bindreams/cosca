@@ -2,7 +2,7 @@
 //! On 6.9+ the root's pidfd names the group exactly, whoever reaped the root, so they decide as
 //! `kill_tree` does (`group_exact_tests`); below 6.9 nothing goes out by the group's number.
 
-use crate::child::group_exact_tests::{await_the_cat_gone, root_with_a_cat};
+use crate::child::group_exact_tests::root_with_a_member;
 use crate::send_log::{Capture, GroupStep, Route};
 use crate::test_child::reaped_elsewhere::{reap_behind, session_sleep};
 use crate::test_groups::{pidfd_group_signal, Group};
@@ -56,7 +56,7 @@ fn tear_down(child: crate::Child, teardown: Teardown) -> Option<String> {
 /// 6.9+: a reaped root whose group still has a member: the teardown kills the group through the
 /// root's pidfd. Mutant: "a teardown never signals the group of a reaped root".
 fn kills_the_group_left_behind(reap: Reap, teardown: Teardown) {
-    let (child, _stdin, stderr) = root_with_a_cat();
+    let (child, member) = root_with_a_member();
     reap_root(&child, reap);
     let capture = Capture::start();
     tear_down(child, teardown);
@@ -66,13 +66,13 @@ fn kills_the_group_left_behind(reap: Reap, teardown: Teardown) {
         !steps.contains(&GroupStep::Group(Route::Number)),
         "nothing went by the group's number: {steps:?}"
     );
-    await_the_cat_gone(stderr);
+    member.assert_killed();
 }
 
 /// Below 6.9 the old behaviour holds: a reaped root's group is sent nothing, and its member lives
 /// on. Mutant: "a refused flag still lets the teardown signal the group".
 fn below_6_9_sends_nothing_to_the_group(reap: Reap, teardown: Teardown) {
-    let (child, stdin, stderr) = root_with_a_cat();
+    let (child, member) = root_with_a_member();
     reap_root(&child, reap);
     let old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     let capture = Capture::start();
@@ -80,9 +80,7 @@ fn below_6_9_sends_nothing_to_the_group(reap: Reap, teardown: Teardown) {
     let steps = capture.group_steps();
     drop(old_kernel);
     assert_eq!(steps, [], "nothing was sent to the group");
-    // Closing its stdin ends the `cat`.
-    drop(stdin);
-    await_the_cat_gone(stderr);
+    member.assert_survived();
 }
 
 /// 6.9+: a reaped root whose group has no member left has no tree left behind: the teardown sends
@@ -186,7 +184,7 @@ fn a_drop_of_a_root_its_handle_cannot_read_kills_its_group_through_the_pidfd(
     #[fixture(pidfd_group_signal)] _group: &Group,
 ) {
     use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peek_once};
-    let (child, _stdin, stderr) = root_with_a_cat();
+    let (child, member) = root_with_a_member();
     let capture = Capture::start();
     let forced = force_peek_once(Err(std::io::Error::other("forced peek failure")));
     drop(child);
@@ -194,7 +192,7 @@ fn a_drop_of_a_root_its_handle_cannot_read_kills_its_group_through_the_pidfd(
     drop(forced);
     let steps = capture.group_steps();
     assert_eq!(steps.first(), Some(&GroupStep::Group(Route::Pidfd)), "{steps:?}");
-    await_the_cat_gone(stderr);
+    member.assert_killed();
 }
 
 /// 6.9+: a root whose handle cannot say whether it was reaped, whose group has no member, may have

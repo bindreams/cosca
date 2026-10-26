@@ -2,7 +2,7 @@
 //! for a process group whose root is reaped. On Linux 6.9+ the root's pidfd decides; below 6.9
 //! nothing goes out by the group's number.
 
-use super::group_exact_tests::{await_the_cat_gone, root_with_a_cat};
+use super::group_exact_tests::root_with_a_member;
 use crate::send_log::{Capture, GroupStep, Route};
 use crate::test_child::reaped_elsewhere::reap_behind;
 use crate::test_groups::{pidfd_group_signal, Group};
@@ -57,7 +57,7 @@ fn tear_down(child: crate::tokio::Child, teardown: Teardown) -> Option<String> {
 /// root's pidfd. Mutant: "a teardown never signals the group of a reaped root".
 async fn kills_the_group_left_behind(reap: Reap, teardown: Teardown) {
     crate::tokio::test_runtime::assert_current_thread();
-    let (mut child, _stdin, stderr) = root_with_a_cat().await;
+    let (mut child, member) = root_with_a_member();
     reap_root(&mut child, reap).await;
     let capture = Capture::start();
     tear_down(child, teardown);
@@ -67,14 +67,14 @@ async fn kills_the_group_left_behind(reap: Reap, teardown: Teardown) {
         !steps.contains(&GroupStep::Group(Route::Number)),
         "nothing went by the group's number: {steps:?}"
     );
-    await_the_cat_gone(stderr).await;
+    member.assert_killed();
 }
 
 /// Below 6.9 the old behaviour holds: a reaped root's group is sent nothing, and its member lives
 /// on. Mutant: "a refused flag still lets the teardown signal the group".
 async fn below_6_9_sends_nothing_to_the_group(reap: Reap, teardown: Teardown) {
     crate::tokio::test_runtime::assert_current_thread();
-    let (mut child, stdin, stderr) = root_with_a_cat().await;
+    let (mut child, member) = root_with_a_member();
     reap_root(&mut child, reap).await;
     let old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     let capture = Capture::start();
@@ -82,9 +82,7 @@ async fn below_6_9_sends_nothing_to_the_group(reap: Reap, teardown: Teardown) {
     let steps = capture.group_steps();
     drop(old_kernel);
     assert_eq!(steps, [], "nothing was sent to the group");
-    // Closing its stdin ends the `cat`.
-    drop(stdin);
-    await_the_cat_gone(stderr).await;
+    member.assert_survived();
 }
 
 /// 6.9+: a reaped root whose group has no member left has no tree left behind: the teardown sends

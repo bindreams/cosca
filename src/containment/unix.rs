@@ -39,9 +39,10 @@
 //! process's group. On Linux 6.9+ the group's signal goes through the root's pidfd instead, which
 //! names the group exactly. Every send by the group's number (the `killpg` where the kernel refuses
 //! that, and the leader's signal) runs right after its own check of the root ([`GroupRoot::check`]:
-//! on 6.9+ whether the pidfd's group still has a member). Each member's resend runs after a check
-//! of the root, then a check of the member's identity right before it. Nothing is sent once a check
-//! fails; the residual window between a check and its send is documented on `Child::kill_tree`. cgroup v2 names no pid and has no such hole.
+//! on 6.9+ whether the pidfd's group still has a member). Each member's resend or probe runs after
+//! a check of the root, then a check of the member's identity right before it. Nothing is sent once
+//! a check fails; the residual window between a check and its send is documented on
+//! `Child::kill_tree`. cgroup v2 names no pid and has no such hole.
 
 use std::io;
 
@@ -106,7 +107,7 @@ pub(crate) mod fault {
     use std::cell::{Cell, RefCell};
 
     #[cfg(target_os = "linux")]
-    pub(crate) use super::group::fault::{list_instead, set_after_listing};
+    pub(crate) use super::group::fault::{list_instead, refuse_probes, set_after_listing};
 
     type OnSend = Box<dyn FnMut(i32)>;
 
@@ -373,7 +374,9 @@ enum Through {
 /// the group's number is still its own: the kernel does not reissue a pid that is any process's
 /// group id. `None` where the kernel refuses the flag (before Linux 6.9), or gives an answer that
 /// says neither. A seccomp filter that answers `EPERM` reads as a group with a member; each member's
-/// resend after it still checks the member's identity, and goes through the member's own pidfd.
+/// resend after it still checks the member's identity, and goes through the member's own pidfd; only
+/// if that filter also refuses the member's `pidfd_open` does the resend go by the member's pid, to
+/// a group that may have taken the number.
 #[cfg(target_os = "linux")]
 pub(crate) fn pidfd_group_has_member(pidfd: std::os::fd::BorrowedFd<'_>) -> Option<bool> {
     #[cfg(test)]

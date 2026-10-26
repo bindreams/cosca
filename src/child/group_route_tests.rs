@@ -31,23 +31,30 @@ fn kill_tree_signals_the_group_through_the_root_pidfd(#[fixture(pidfd_group_sign
     assert_through_the_pidfd(&capture.group_steps());
 }
 
+/// Its `SIGTERM` kills the group's member. Mutant: "the send through the pidfd carries signal 0".
 #[skuld::test]
 fn terminate_tree_signals_the_group_through_the_root_pidfd(#[fixture(pidfd_group_signal)] _group: &Group) {
-    let (child, _writer) = group_root();
+    let (child, member) = crate::child::group_exact_tests::root_with_a_member();
     let capture = Capture::start();
     child.terminate_tree().expect("terminate_tree");
     assert_through_the_pidfd(&capture.group_steps());
+    member.assert_killed();
 }
 
+/// Its `SIGTERM` kills the group's member before the sweep could. Mutant: "graceful sends no
+/// `SIGTERM`".
 #[skuld::test]
 fn graceful_shutdown_tree_signals_the_group_through_the_root_pidfd(#[fixture(pidfd_group_signal)] _group: &Group) {
-    let (child, _writer) = group_root();
+    use crate::child::group_exact_tests::{root_with_a_member, EndedAtTheSigterm};
+    let (child, member) = root_with_a_member();
+    let ended = EndedAtTheSigterm::new(member);
     let capture = Capture::start();
     child
         .graceful_shutdown_tree(std::time::Duration::ZERO)
         .expect("graceful_shutdown_tree");
     let steps = capture.group_steps();
     assert_through_the_pidfd(&steps);
+    ended.assert_killed_by_the_sigterm();
 }
 
 #[skuld::test]
