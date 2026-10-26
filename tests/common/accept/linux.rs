@@ -37,9 +37,11 @@ pub(super) fn wait(source: Source<'_>, target_pid: u32, also: Option<ProcessId>)
         }
     }
 
+    // `poll` ignores a negative fd, so `Never` leaves only the pidfds to wake it.
     let source_fd = match source {
         Source::Listener(l) => l.as_raw_fd(),
         Source::Stream(s) => s.as_raw_fd(),
+        Source::Never => -1,
     };
     let mut fds = vec![libc::pollfd {
         fd: source_fd,

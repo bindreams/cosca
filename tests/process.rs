@@ -780,7 +780,7 @@ fn death_watch_accept_tree_panics_when_the_grandchild_dies_before_connecting_whi
         .env(common::GC_PID_ADDR_ENV, &report_addr);
     common::silence(&mut cmd);
     let mut root = cmd.spawn().expect("spawn the tree");
-    let grandchild = common::report_grandchild(&report, &mut root);
+    let grandchild = common::report_grandchild(report, &mut root);
     let grandchild_pid = grandchild.pid();
     // The root connects as soon as it is released. Waiting for the grandchild's exit first makes
     // accept #1 report it dead on every interleaving.

@@ -1,18 +1,19 @@
-//! Giving up a leaf on an async `Drop`: bounded work only.
+//! Giving up a leaf on an async `Drop` that does not wait for its drain: bounded work only.
 
 use super::*;
 
 impl CgroupLeaf {
-    /// Give up the leaf without waiting: what an async `Drop` does where [`Drop`] would block on
-    /// the drain. At most two `rmdir`s and, with the drop's own tree kill, two `cgroup.kill`
-    /// writes; a leaf that has not drained is left behind.
+    /// Give up the leaf without waiting: what an async `Drop` does with a leaf whose drain it does
+    /// not wait for (disarmed, its root's kill failed, or no kill of the tree landed), where
+    /// [`Drop`] would block on the drain. At most two `rmdir`s and one `cgroup.kill` write; a leaf
+    /// that has not drained is left behind.
     ///
     /// A leaf this handle killed or was armed to kill is left with a `warn` naming its path and
     /// pointing at [`wait_tree`](crate::tokio::Child::wait_tree). A leaf nothing killed keeps
     /// the levels of `Drop`: `debug`, or `warn` only if a kill attempt failed. A drain that could
     /// not be read is reported as that, at the same level.
     ///
-    /// Never calls [`abandon`](Self::abandon_before_verdict), `disarm` or `block_until_drained`:
+    /// Never calls [`abandon`](Self::abandon_before_verdict), `disarm` or `wait_drained_then_warn`:
     /// the first two would clear the kill record this reads, and the last is the wait.
     pub(crate) fn release_without_waiting(mut self) {
         debug_assert!(self.report.is_none(), "a released leaf has taken its placement verdict");

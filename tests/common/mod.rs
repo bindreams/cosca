@@ -472,7 +472,7 @@ pub fn spawn_tree_with(
     cmd.env(GC_PID_ADDR_ENV, report.local_addr().unwrap().to_string());
     configure(&mut cmd);
     let mut child = cmd.spawn().expect("spawn tree");
-    let grand = report_grandchild(&report, &mut child);
+    let grand = report_grandchild(report, &mut child);
     // Demux by tag exactly like spawn_tree_async (accept order is not guaranteed, and a
     // duplicate or foreign tag is a harness bug worth failing loudly on). The root is watched
     // throughout, the grandchild until it has connected: either dying first fails the helper.
@@ -576,7 +576,7 @@ pub async fn spawn_tree_async(
     let (report, report_addr) = bind_async_listener();
     cmd.env(GC_PID_ADDR_ENV, report_addr);
     let mut child = cmd.spawn().expect("spawn async tree");
-    let grand = report_grandchild_async(&report, &mut child).await;
+    let grand = report_grandchild_async(report, &mut child).await;
     let (mut root, mut grandchild) = (None, None);
     for _ in 0..2 {
         let watch_grand = grandchild.is_none().then_some(grand);
@@ -638,7 +638,7 @@ pub async fn spawn_echo_tree_async_configured(
     let (report, report_addr) = bind_async_listener();
     cmd.env(GC_PID_ADDR_ENV, report_addr);
     let mut child = cmd.spawn().expect("spawn async echo tree");
-    let watched_grand = report_grandchild_async(&report, &mut child).await;
+    let watched_grand = report_grandchild_async(report, &mut child).await;
     let (mut root, mut grand) = (None, None);
     for _ in 0..2 {
         let watch_grand = grand.is_none().then_some(watched_grand);
