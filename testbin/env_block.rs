@@ -1,6 +1,8 @@
 //! The `dump-env-block` and `spawn-dump-env-block` modes: the environment block a child receives
 //! from each Windows backend, byte for byte. Also `with-env-block`, which runs any mode in a block
-//! given entry by entry.
+//! given entry by entry, `env-set-probe`, which records what `SetEnvironmentVariableW` does to
+//! such a block, `spawn-consent-with-block`, which starts `consent-spawn` in a given block, and
+//! `try-cwd`, which reports what `CreateProcessW` does with a given `lpCurrentDirectory`.
 
 use windows::core::PCWSTR;
 use windows::Win32::System::Environment::{FreeEnvironmentStringsW, GetEnvironmentStringsW};
@@ -9,29 +11,37 @@ use windows::Win32::System::Environment::{FreeEnvironmentStringsW, GetEnvironmen
 /// as four hex digits. Read from `GetEnvironmentStringsW`, so casing, order and unpaired
 /// surrogates are what the OS holds.
 pub fn dump() {
+    let units = block_units();
+    let mut lines = String::new();
+    for entry in units.split(|&u| u == 0).take_while(|e| !e.is_empty()) {
+        let hex: String = entry.iter().map(|u| format!("{u:04x}")).collect();
+        lines.push_str(&hex);
+        lines.push('\n');
+    }
+    crate::quiet_io::put_stdout(lines.as_bytes(), "dump-env-block: write stdout");
+}
+
+/// This process's environment block, UTF-16LE, through the empty entry that closes it.
+pub fn block_bytes() -> Vec<u8> {
+    block_units().iter().flat_map(|u| u.to_le_bytes()).collect()
+}
+
+/// This process's environment block as UTF-16 units, through the empty entry that closes it. The
+/// one place in this file that reads the raw block.
+fn block_units() -> Vec<u16> {
     // SAFETY: no preconditions; the block is freed below.
     let block = unsafe { GetEnvironmentStringsW() };
     assert!(!block.is_null(), "GetEnvironmentStringsW failed");
-    let mut lines = String::new();
-    let mut entry = block.0;
-    loop {
-        // SAFETY: the block is a run of NUL-terminated entries closed by an empty one, so every
-        // read up to and including the terminators is in bounds.
-        let len = (0..).take_while(|&i| unsafe { *entry.add(i) } != 0).count();
-        if len == 0 {
-            break;
-        }
-        // SAFETY: `len` units starting at `entry` were just read.
-        let units = unsafe { std::slice::from_raw_parts(entry, len) };
-        let hex: String = units.iter().map(|u| format!("{u:04x}")).collect();
-        lines.push_str(&hex);
-        lines.push('\n');
-        // SAFETY: skips this entry and its NUL, landing on the next entry or the terminator.
-        entry = unsafe { entry.add(len + 1) };
-    }
-    crate::quiet_io::put_stdout(lines.as_bytes(), "dump-env-block: write stdout");
+    // SAFETY: the block is a run of NUL-terminated entries closed by an empty one, so every read up
+    // to the first two NULs in a row is in bounds.
+    let end = (1..)
+        .find(|&i| unsafe { *block.0.add(i - 1) == 0 && *block.0.add(i) == 0 })
+        .unwrap();
+    // SAFETY: the `end + 1` units starting at `block` were just read.
+    let units = unsafe { std::slice::from_raw_parts(block.0, end + 1) }.to_vec();
     // SAFETY: `block` came from `GetEnvironmentStringsW` and is freed once.
     unsafe { FreeEnvironmentStringsW(PCWSTR(block.0)) }.expect("FreeEnvironmentStringsW");
+    units
 }
 
 /// Spawn `dump-env-block` through cosca's `backend` (`raw` or `std`) after replaying `ops`, and
@@ -71,6 +81,24 @@ pub fn spawn(backend: &str, ops: &[String]) {
 /// in order, and relay its exit code. `dump_args` is the backend and any ops, space-separated.
 pub fn spawn_with_block(dump_args: &str, entries: &[String]) {
     let code = create_with_block(entries, &format!("spawn-dump-env-block {dump_args}"), None).expect("CreateProcessW");
+    std::process::exit(code as i32);
+}
+
+/// `spawn-consent-with-block <report> <envdump> <own-envdump> <dir> <block-file>`: run `consent-spawn`
+/// with the first four arguments in a child whose environment block is exactly the entries of
+/// `<block-file>`, in order, and relay its exit code. Each entry in the file ends in a NUL. The block
+/// goes through a file because a whole inherited environment can exceed the command line's 32767 units.
+pub fn spawn_consent_with_block(args: &[String]) {
+    let [report, env_dump, own_dump, dir, block_file] = args else {
+        panic!("spawn-consent-with-block <report> <envdump> <own-envdump> <dir> <block-file>, got {args:?}");
+    };
+    let block = std::fs::read_to_string(block_file).expect("read the block file");
+    let entries: Vec<String> = block.split_terminator('\0').map(str::to_owned).collect();
+    let line: Vec<String> = ["consent-spawn", report, env_dump, own_dump, dir]
+        .iter()
+        .map(|a| quote(a))
+        .collect();
+    let code = create_with_block(&entries, &line.join(" "), None).expect("CreateProcessW");
     std::process::exit(code as i32);
 }
 
@@ -114,6 +142,33 @@ fn quote(arg: &str) -> String {
     out
 }
 
+/// `env-set-probe <op>...`: dump this process's block under `# before`, then apply each op to this
+/// process's own environment with `SetEnvironmentVariableW` and dump it again under
+/// `# after <op>`. An op is `set:NAME=VALUE` or `remove:NAME`.
+pub fn set_probe(ops: &[String]) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::System::Environment::SetEnvironmentVariableW;
+
+    let wide = |s: &str| std::ffi::OsStr::new(s).encode_wide().chain([0]).collect::<Vec<u16>>();
+    println!("# before");
+    dump();
+    for op in ops {
+        let (name, value) = if let Some(kv) = op.strip_prefix("set:") {
+            let (name, value) = kv.split_once('=').expect("set:NAME=VALUE");
+            (wide(name), Some(wide(value)))
+        } else if let Some(name) = op.strip_prefix("remove:") {
+            (wide(name), None)
+        } else {
+            panic!("unknown op {op:?}");
+        };
+        let value = value.as_ref().map_or(PCWSTR::null(), |v| PCWSTR(v.as_ptr()));
+        // SAFETY: `name` and `value` are NUL-terminated and outlive the call.
+        unsafe { SetEnvironmentVariableW(PCWSTR(name.as_ptr()), value) }.expect("SetEnvironmentVariableW");
+        println!("# after {op}");
+        dump();
+    }
+}
+
 /// Report whether `CreateProcessW` accepts `entries` as a child's block: `ok`, or `err=<code>`
 /// with the Win32 error code.
 pub fn try_block(entries: &[String]) {
@@ -122,6 +177,18 @@ pub fn try_block(entries: &[String]) {
             assert_eq!(code, 0, "the probe child failed");
             outln!("ok");
         }
+        Err(e) => outln!("err={}", e.code().0 & 0xFFFF),
+    }
+}
+
+/// `try-cwd <dir>`: run `cosca_testbin cwd-marker` through a bare `CreateProcessW` with `<dir>` as
+/// `lpCurrentDirectory`. After the child's report prints `ok`, `exit=<code>` (nonzero exit) or
+/// `err=<code>` (Win32 error; the call failed).
+pub fn try_cwd(dir: &str) {
+    let system_root = format!("SystemRoot={}", std::env::var("SystemRoot").expect("SystemRoot"));
+    match create_with_block(&[system_root], "cwd-marker", Some(dir)) {
+        Ok(0) => outln!("ok"),
+        Ok(code) => outln!("exit={code}"),
         Err(e) => outln!("err={}", e.code().0 & 0xFFFF),
     }
 }
