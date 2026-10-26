@@ -1188,6 +1188,10 @@ mod pid_reuse_tests;
 mod foreign_reap_tree_tests;
 
 #[cfg(all(test, unix))]
+#[path = "child/foreign_reap_after_look_tests.rs"]
+mod foreign_reap_after_look_tests;
+
+#[cfg(all(test, unix))]
 #[path = "child/root_state_tests.rs"]
 mod root_state_tests;
 

@@ -72,6 +72,10 @@ mod root_number_matrix_tests;
 #[path = "child/own_reap_tests.rs"]
 mod own_reap_tests;
 
+#[cfg(all(test, unix))]
+#[path = "child/foreign_reap_after_look_tests.rs"]
+pub(crate) mod foreign_reap_after_look_tests;
+
 #[cfg(all(test, target_os = "linux"))]
 #[path = "child/group_route_tests.rs"]
 mod group_route_tests;
