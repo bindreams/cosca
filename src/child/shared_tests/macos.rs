@@ -322,10 +322,15 @@ fn a_sync_drop_of_a_child_the_kernel_reaped_returns() {
     let (_sibling, _sibling_stdin) = spawn_std_blocker();
     let mut cmd = crate::Command::new();
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
-    cmd.stdin(crate::test_child::leaked_writer_stdin()).expect("stdin");
+    // Released once the drop's kill returned: with a kill that sent nothing the child exits on EOF
+    // and the kernel reaps it, so the drop returns and the assertion below fails instead.
+    let (stdin, writer) = crate::test_child::held_writer_stdin();
+    let teardown = crate::child::spawn::fault::release_at_drop_kill(writer);
+    cmd.stdin(stdin).expect("stdin");
     cmd.stdout(crate::Stdio::null()).expect("stdout");
     let child = cmd.spawn().expect("spawn");
     drop(child);
+    teardown.assert_released();
 }
 
 // Identity: the unique id is checked on every by-pid surface =====

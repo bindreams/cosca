@@ -13,12 +13,17 @@ pub(crate) enum HookPoint {
     BeforeReap,
     /// `graceful_shutdown`: after the grace ran out, before the escalation.
     BeforeEscalation,
+    /// The sync `Child`'s kill-on-drop teardown: after the root kill returned `Ok`, before the
+    /// blocking wait for the root. A test releases a holder only a kill ends here, so a kill that
+    /// sent nothing fails an assertion on how the root ended instead of hanging the drop.
+    AfterDropKill,
 }
 
 thread_local! {
     static AFTER_TERMINATE: OneShotHook = const { OneShotHook::new() };
     static BEFORE_REAP: OneShotHook = const { OneShotHook::new() };
     static BEFORE_ESCALATION: OneShotHook = const { OneShotHook::new() };
+    static AFTER_DROP_KILL: OneShotHook = const { OneShotHook::new() };
 }
 
 fn slot(point: HookPoint) -> &'static std::thread::LocalKey<OneShotHook> {
@@ -26,6 +31,7 @@ fn slot(point: HookPoint) -> &'static std::thread::LocalKey<OneShotHook> {
         HookPoint::AfterTerminate => &AFTER_TERMINATE,
         HookPoint::BeforeReap => &BEFORE_REAP,
         HookPoint::BeforeEscalation => &BEFORE_ESCALATION,
+        HookPoint::AfterDropKill => &AFTER_DROP_KILL,
     }
 }
 

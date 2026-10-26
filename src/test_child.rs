@@ -43,7 +43,9 @@ mod kevent_eintr;
 pub(crate) const BLOCKER_ARGV: &[&str] = if cfg!(windows) { &["findstr", "x"] } else { &["cat"] };
 
 /// A [`Stdio`](crate::stdio::Stdio) reading from a pipe whose write end is leaked (see
-/// [`BLOCKER_ARGV`]).
+/// [`BLOCKER_ARGV`]). For a child the test leaves alone: any test that expects a kill holds the
+/// writer instead ([`held_writer_stdin`]) and releases it after the kill.
+#[cfg(any(target_os = "macos", all(target_os = "linux", feature = "tokio")))]
 pub(crate) fn leaked_writer_stdin() -> crate::stdio::Stdio {
     let (reader, writer) = std::io::pipe().expect("pipe");
     #[cfg(unix)]
@@ -136,8 +138,6 @@ impl Drop for ClosedStdio {
 /// Like [`leaked_writer_stdin`], but the caller keeps the write end: dropping it is the only way
 /// to make the [`BLOCKER_ARGV`] child exit by itself (status 0), so a test that must see a kill
 /// end it drops the writer only after the kill.
-// Consumed by the Unix kill tests in `spawn_tests` and the Linux async ones.
-#[cfg(unix)]
 pub(crate) fn held_writer_stdin() -> (crate::stdio::Stdio, std::io::PipeWriter) {
     let (reader, writer) = std::io::pipe().expect("pipe");
     #[cfg(unix)]
@@ -327,11 +327,17 @@ pub(crate) fn assert_zombie_sigkilled(who: &str, pid: u32) {
 
 #[cfg(unix)]
 fn zombie_record(pid: u32) -> libc::siginfo_t {
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    // SAFETY: `info` is a valid out-parameter. WNOWAIT leaves the child reapable.
-    let rc = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT) };
-    assert_eq!(rc, 0, "waitid: {}", std::io::Error::last_os_error());
-    info
+    loop {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is a valid out-parameter. WNOWAIT leaves the child reapable.
+        let rc = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT) };
+        if rc == 0 {
+            return info;
+        }
+        // A signal interrupting the wait is a restart, not a failure.
+        let e = std::io::Error::last_os_error();
+        assert_eq!(e.raw_os_error(), Some(libc::EINTR), "waitid: {e}");
+    }
 }
 
 /// Whether `pid` is still this process's unreaped child (running, or a zombie nobody collected):
@@ -1196,6 +1202,16 @@ pub(crate) fn windows_blocker_async(
 #[cfg(unix)]
 const TERM_IGNORING_BLOCKER_ARGV: &[&str] = &["sh", "-c", "trap '' TERM; echo r; exec cat"];
 
+/// A root and a grandchild that both ignore `SIGTERM` (an ignored disposition survives `exec`) and
+/// block on one stdin pipe. The grandchild prints `eof` if its `cat` ends of its own accord; the
+/// root prints `r` once the grandchild is forked.
+#[cfg(unix)]
+pub(crate) const TERM_IGNORING_TREE_ARGV: &[&str] = &[
+    "sh",
+    "-c",
+    "trap '' TERM; exec 3<&0; { cat <&3 3<&-; echo eof; } & echo r; exec cat",
+];
+
 /// A spawned, contained `SIGTERM`-ignoring [`TERM_IGNORING_BLOCKER_ARGV`] child and the write end of
 /// its stdin, returned once its readiness byte proves the trap is installed. A test whose only end
 /// for it is a sweep or escalation holds the stdin and releases it after the kill.
@@ -1241,9 +1257,9 @@ pub(crate) async fn term_ignoring_blocker_async() -> (crate::tokio::Child, crate
     (child, stdin)
 }
 
-/// A blocker died to a kill, not by exiting on its own once its stdin closed: `SIGKILL` on Unix, a
-/// non-zero exit on Windows (`more.com` exits 0 on EOF). Separate compilation units cannot share
-/// it: `tests/common` keeps its own copy.
+/// A blocker died to a kill, not by exiting on its own once its stdin closed: `SIGKILL` on Unix, the
+/// kill's exit code `1` on Windows (`more.com` exits 0 on EOF), so a crash on the release fails too.
+/// Separate compilation units cannot share it: `tests/common` keeps its own copy.
 pub(crate) fn assert_killed(who: &str, status: std::process::ExitStatus) {
     #[cfg(unix)]
     {
@@ -1255,9 +1271,10 @@ pub(crate) fn assert_killed(who: &str, status: std::process::ExitStatus) {
         );
     }
     #[cfg(windows)]
-    assert!(
-        !status.success(),
-        "{who} must be killed, not exit on its own: {status:?}"
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "{who} must be killed (exit code 1), not exit on its own: {status:?}"
     );
 }
 
