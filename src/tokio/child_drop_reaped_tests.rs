@@ -540,13 +540,17 @@ async fn fd_marker_drop_after_wait_sweeps_the_marker_holders_but_names_nothing_b
 #[cfg(target_os = "macos")]
 async fn reaped_sleep_root(mode: ContainMode) -> (u32, crate::tokio::Child) {
     let mut cmd = Command::new();
-    cmd.args(["sleep", "300"]);
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
     cmd.contain_with(mode);
     let mut child = cmd.spawn().expect("spawn");
+    let stdin = child.stdin().expect("stdin pipe");
     assert_eq!(child.containment(), Containment::FdMarker);
     let pid = child.id().pid();
     child.kill().expect("kill the root");
-    child.wait().await.expect("reap the root");
+    // Released after the kill: a `kill` that sent nothing fails the assertion, not the reap.
+    drop(stdin);
+    crate::test_child::assert_killed("the root", child.wait().await.expect("reap the root"));
     (pid, child)
 }
 
