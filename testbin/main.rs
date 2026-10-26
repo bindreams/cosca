@@ -1071,12 +1071,31 @@ fn main() {
                 Ok(()) => "Ok".to_string(),
                 Err(e) => describe(&e),
             };
-            if cleanup == "Ok" {
-                child.wait().expect("reap the acker");
-            }
             // `K`: the teardown that should have ended the child failed, so delivery was never
             // observable — distinct from an observed non-delivery.
-            let seen = if cleanup == "Ok" { saw_break(&mut ack) } else { "K" };
+            //
+            // Released after the kill and before the reap: a released acker exits 0, a killed one
+            // 1, and the report carries the code, so a `kill` that sent nothing fails the test on
+            // `cleanup_exit` instead of hanging the reap on a root that is still held.
+            let (seen, cleanup_exit) = if cleanup == "Ok" {
+                // Half-close: the read below still collects the acker's last word, and a live
+                // acker (no kill sent) gets EOF and leaves instead of blocking it.
+                match ack.shutdown(std::net::Shutdown::Write) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotConnected => {
+                        panic!("releasing the acker's socket failed: {e}")
+                    }
+                    _ => {}
+                }
+                let seen = saw_break(&mut ack);
+                drop(ack);
+                let status = child.wait().expect("reap the acker");
+                (
+                    seen,
+                    status.code().map_or_else(|| "none".to_string(), |c| c.to_string()),
+                )
+            } else {
+                ("K", "none".to_string())
+            };
 
             let mut line = String::new();
             write!(
@@ -1084,7 +1103,7 @@ fn main() {
                 "console={console} c_in_console={} mechanism={mechanism} terminate={terminate} \
                  alive_after_terminate={alive_after_terminate} break={seen} graceful={graceful} \
                  graceful_code={graceful_code} alive_after_graceful={alive_after_graceful} \
-                 cleanup={cleanup}",
+                 cleanup={cleanup} cleanup_exit={cleanup_exit}",
                 three_way(c_in_console),
             )
             .unwrap();
