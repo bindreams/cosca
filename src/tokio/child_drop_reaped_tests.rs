@@ -402,6 +402,28 @@ async fn drop_after_a_failed_kill_tree_and_wait_still_warns() {
     assert_eq!(records[0].0, log::Level::Warn);
 }
 
+/// A `terminate_tree` is a request, not a kill, so a root reaped after it still leaves the drop
+/// unable to vouch for the group, and it warns (below Linux 6.9 and on macOS; on 6.9+ the pidfd
+/// finds the group empty, see `drop_group_exact_tests`). Mutant: `terminate_tree` sets the
+/// tree-killed flag.
+#[skuld::test]
+async fn drop_after_terminate_tree_and_wait_still_warns() {
+    #[cfg(target_os = "linux")]
+    let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let mut child = session(&["sleep", "300"]).spawn().expect("spawn");
+    child.terminate_tree().expect("terminate_tree");
+    child.wait().await.expect("reap the root");
+
+    let mark = crate::log_capture::mark();
+    drop(child);
+
+    let records = drop_warns_since(mark);
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].0, log::Level::Warn);
+}
+
 /// The same for a `TreeWalk` whose walk was incomplete but returned `Ok`. Not on macOS, where
 /// `TreeWalk` mode is an fd marker, whose incompleteness is an `Err` (the test above).
 #[cfg(not(target_os = "macos"))]

@@ -6,6 +6,8 @@
 #[path = "common/mod.rs"]
 mod common;
 
+#[cfg(all(feature = "tokio", target_os = "linux"))]
+use common::test_groups::{pidfd_group_signal, Group};
 #[cfg(feature = "tokio")]
 use std::io::Read;
 
@@ -81,13 +83,12 @@ async fn async_kill_tree_tears_down_tree() {
     );
 }
 
+/// The soft signal alone is the subject, so the root is reaped before the drop: a `kill_tree()`
+/// first would race the SIGTERM for the exit status. What the drop then says depends on the host
+/// (#382, #782), so each host's test names `_warns` for it.
 #[cfg(feature = "tokio")]
 #[cfg(unix)]
-#[skuld::test]
-async fn async_terminate_tree_soft_kills_the_group() {
-    // The soft signal alone is the subject, so the root is reaped before the drop and the drop
-    // says so (#382): a `kill_tree()` first would race the SIGTERM for the exit status.
-    let _warns = common::warn_watch().expecting("call kill_tree() before wait()");
+async fn terminate_tree_soft_kills_the_group(_warns: common::WarnWatch) {
     use std::os::unix::process::ExitStatusExt;
     // control-block honors SIGTERM: the group signal alone (signal-only op) tears it down. It also
     // exits at the test's byte, so a root the SIGTERM missed exits by itself: the wait cannot hang,
@@ -101,6 +102,24 @@ async fn async_terminate_tree_soft_kills_the_group() {
         Some(libc::SIGTERM),
         "soft group signal must be SIGTERM, got {status:?}"
     );
+}
+
+/// Linux 6.9+: the drop reads the reaped root's group through its pidfd, finds it empty and says
+/// nothing at warn. The same drop below 6.9 is `drop_after_terminate_tree_and_wait_still_warns`
+/// in `src/tokio/child_drop_reaped_tests.rs`, which refuses the flag: `tests/` cannot.
+#[cfg(feature = "tokio")]
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn async_terminate_tree_soft_kills_the_group(#[fixture(pidfd_group_signal)] _group: &Group) {
+    terminate_tree_soft_kills_the_group(common::warn_watch()).await;
+}
+
+/// macOS has no pidfd: the drop of a reaped root cannot vouch for its group, so it warns (#382).
+#[cfg(feature = "tokio")]
+#[cfg(target_os = "macos")]
+#[skuld::test]
+async fn async_terminate_tree_soft_kills_the_group() {
+    terminate_tree_soft_kills_the_group(common::warn_watch().expecting("call kill_tree() before wait()")).await;
 }
 
 #[cfg(feature = "tokio")]
