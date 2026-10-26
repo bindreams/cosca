@@ -121,13 +121,14 @@ reaped the root: the group is signalled through it (`PIDFD_SIGNAL_PROCESS_GROUP`
 send through it shows whether the group still has a member; while it has one, its number cannot be
 reissued. So a tree call, a drop and a failed spawn's cleanup still kill the group of a reaped root
 while it has a member, whoever reaped the root, and send nothing once it has none; that signal-0
-send is also the check before each send by the group's number. cosca detects the flag by acting,
-and an older kernel's `EINVAL` falls back to the group's number, checked against the root's state.
-On 6.9+ a member's resend still goes by its pid when the member's own `pidfd_open` fails (`EMFILE`,
-say), right after a check of its identity. Below 6.9 and on macOS a reaper elsewhere in the process
-can reap the root between the check and a send by its number, which then reaches whoever holds it: a
-standing property of process-group and fd-marker containment. A program with such a reaper should
-use cgroup containment.
+send is also the check before each send by the group's number. A handle keeps its pidfd after its
+`wait` or `try_wait` observes a foreign reap, so that holds after it too. cosca detects the flag by
+acting, and an older kernel's `EINVAL` falls back to the group's number, checked against the root's
+state. On 6.9+ a member's resend still goes by its pid when the member's own `pidfd_open` fails
+(`EMFILE`, say), right after a check of its identity. Below 6.9 and on macOS a reaper elsewhere in
+the process can reap the root between the check and a send by its number, which then reaches whoever
+holds it: a standing property of process-group and fd-marker containment. A program with such a
+reaper should use cgroup containment.
 
 Where a check of a PID cannot be made atomic with its use, keep the window as small as it can be:
 check and use are two back-to-back actions. Every send by number has its own check right before it,

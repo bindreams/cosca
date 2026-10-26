@@ -134,6 +134,12 @@ pub(crate) enum ProcSource {
         stderr: Option<::tokio::process::ChildStderr>,
         /// What became of the child, as far as the forget knew.
         fate: Forgotten,
+        /// The pidfd of a child forgotten as reaped elsewhere, kept so that its process group is
+        /// still decided through it, as for every other reaped root (see [`ProcSource::pidfd`]).
+        /// Closed with the backend, so the handle owns its lifetime. Empty for any other fate, and
+        /// once a teardown took it to reap through.
+        #[cfg(target_os = "linux")]
+        pidfd: PinnedPidfd,
     },
     /// A raw `CreateProcessW` child owning its process handle directly — the executable/argv[0]
     /// independence (and, later, arbitrary descriptors) that tokio's `Command` cannot express.
@@ -154,6 +160,21 @@ impl PinnedPidfd {
         self.0
             .take()
             .expect("the pidfd was taken by a hand-off that forgot the backend")
+    }
+
+    /// Moves the pidfd, if it is still held, into a new `PinnedPidfd`: for the backend that
+    /// replaces this one when tokio's `Child` is forgotten.
+    fn hand_off(&mut self) -> PinnedPidfd {
+        PinnedPidfd(self.0.take())
+    }
+
+    fn none() -> PinnedPidfd {
+        PinnedPidfd(None)
+    }
+
+    /// The pidfd, unless a teardown took it.
+    fn get(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        self.0.as_ref().map(std::os::fd::AsFd::as_fd)
     }
 }
 
@@ -525,7 +546,7 @@ impl ProcSource {
     }
 
     /// Whether the child has exited by the time `grace` is over, read only through its pidfd: nothing
-    /// is reaped and no state is read. A forgotten backend has no pidfd and is not waited on: its
+    /// is reaped and no state is read. A forgotten backend is not waited on: its
     /// child has exited if it was reaped elsewhere, and may still run if it was never shown to be
     /// ours.
     #[cfg(target_os = "linux")]
@@ -748,9 +769,14 @@ impl ProcSource {
         }
     }
 
-    /// The pidfd naming the child, if the backend holds one (Linux).
+    /// The pidfd naming the child, if the backend holds one (Linux). A backend that forgot a child
+    /// reaped elsewhere keeps it, so the root's group is decided through it whoever reaped the root.
     #[cfg(unix)]
     pub(crate) fn pidfd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        #[cfg(target_os = "linux")]
+        if let ProcSource::Foreign { pidfd, .. } = self {
+            return pidfd.get();
+        }
         match self.target()? {
             #[cfg(target_os = "linux")]
             crate::wait::exit_only::Target::PidFd(fd) => Some(fd),
@@ -959,7 +985,8 @@ impl ProcSource {
     /// Forget tokio's `Child` without logging, for a caller that reports the forget in its own one
     /// warn. Returns the child's pid and what the forget leaks, or `None` if the backend was
     /// already forgotten (or never held a child): nothing was forgotten, so nothing leaked.
-    /// `fate`: what became of the child, as far as the caller knows.
+    /// `fate`: what became of the child, as far as the caller knows. On Linux, a child shown
+    /// reaped elsewhere keeps its pidfd in the backend (see [`ProcSource::pidfd`]).
     #[cfg(unix)]
     fn forget_quietly(&mut self, fate: Forgotten) -> Option<(String, &'static str)> {
         let leak = if cfg!(target_os = "linux") {
@@ -972,6 +999,8 @@ impl ProcSource {
             stdin,
             stdout,
             stderr,
+            #[cfg(target_os = "linux")]
+            pidfd,
             ..
         } = self
         else {
@@ -983,6 +1012,15 @@ impl ProcSource {
             stdout: stdout.take(),
             stderr: stderr.take(),
             fate,
+            // Moved, not duplicated (a duplicate can fail at the fd limit), and out of the backend
+            // that `forget` drops next. Only a reap by someone else leaves the group's decision to
+            // the pidfd: a child not shown to be ours is not reached through the handle any more.
+            #[cfg(target_os = "linux")]
+            pidfd: if fate == Forgotten::ReapedElsewhere {
+                pidfd.hand_off()
+            } else {
+                PinnedPidfd::none()
+            },
         };
         std::mem::replace(self, foreign).forget();
         #[cfg(test)]
