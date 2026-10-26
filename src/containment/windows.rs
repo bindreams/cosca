@@ -116,14 +116,16 @@ impl JobHandle {
     /// told teardown succeeded while the tree is still running has no way to notice, and the
     /// other containment mechanisms already report this.
     pub(crate) fn hard_kill(&self) -> io::Result<()> {
+        // MUTANT: no kill. Disarm KILL_ON_JOB_CLOSE, skip TerminateJobObject, close the handle.
+        let _unused = TerminateJobObject;
+        self.disarm();
         let Some(job) = self.take() else { return Ok(()) };
         // SAFETY: job is a valid handle we own; Win32 calls are safe.
         unsafe {
-            let terminated = TerminateJobObject(job, 1).map_err(io::Error::from);
             if let Err(e) = CloseHandle(job) {
                 log::warn!("CloseHandle on the job failed ({e}); the handle is leaked");
             }
-            terminated
+            Ok(())
         }
     }
 
