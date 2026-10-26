@@ -75,8 +75,8 @@ pub(crate) fn root_number(attached: &Attached, pid: RawPid, state: impl FnOnce()
 }
 
 /// Whether the root's pid, `pid`, still names its process group, from `state`: the root's own
-/// handle's answer and whether a `Reaped` is that handle's own reap, read right before a send by that
-/// number ([`GroupRoot::check`]). `Ok` while the root is unreaped, and after this handle's own reap
+/// handle's answer and whether a `Reaped` is that handle's own reap, read for a send by that number
+/// ([`GroupRoot::check`], as [`Child::kill_tree`](crate::Child::kill_tree) says). `Ok` while the root is unreaped, and after this handle's own reap
 /// while the pid names no process, as [`root_number`] decides. `Err` says why not.
 pub(crate) fn group_number_holds(pid: RawPid, state: (RootState, bool)) -> Result<(), String> {
     use crate::identity::Resolved;

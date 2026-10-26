@@ -93,10 +93,9 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
 ///
 /// A reaped root's number may name another process by now, so the tree kill is skipped when it
 /// would name the tree by that number (a process group, a ppid walk), and the note says so. On Linux
-/// 6.9+ the root's pidfd decides a process group instead: it is killed while it has a member left,
-/// and needs no kill once it has none. This is
-/// decided on one look at the root; each send by the group's number after it checks the root again
-/// right before it, as for [`Child::kill_tree`].
+/// 6.9+ the root's pidfd decides a process group instead: it is killed while it has a member. The
+/// decision is one look at the root; each send by the group's number then checks the root again, as
+/// for [`Child::kill_tree`].
 ///
 /// A live front outside a cgroup (see [`Child::kill`]) is signalled by neither kill: the root's
 /// kill is the typed `Unkillable`, and the note says so. A front that had already exited is reaped,

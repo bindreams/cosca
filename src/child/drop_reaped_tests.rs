@@ -83,7 +83,6 @@ fn drop_warns_since(mark: usize) -> Vec<(log::Level, String)> {
 /// Mutants: `killpg` still sent after the reap; no warn; the warn without the pgid.
 #[skuld::test]
 fn dropping_a_waited_on_process_group_child_sends_no_killpg_and_warns_with_the_pgid() {
-    // The pre-6.9 path: on 6.9+ the root's pidfd decides (`drop_group_exact_tests`).
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();
@@ -179,7 +178,6 @@ fn kill_tree_before_wait_ends_a_descendant_of_an_exited_root() {
 #[cfg(not(target_os = "macos"))]
 #[skuld::test]
 fn drop_after_wait_leaves_a_descendant_running_until_it_is_ended_explicitly() {
-    // The pre-6.9 path: on 6.9+ the root's pidfd decides (`drop_group_exact_tests`).
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     let (child, mut pipes) = spawn_cat_tree();
@@ -268,7 +266,6 @@ fn waited_on_sleep_root() -> (u32, crate::Child) {
 /// Mutants: the own-reap flag is ignored; `wait()` does not set it.
 #[skuld::test]
 fn dropping_a_waited_on_child_whose_number_reads_unknown_still_sends_no_killpg() {
-    // The pre-6.9 path: on 6.9+ the root's pidfd decides (`drop_group_exact_tests`).
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();
@@ -315,7 +312,6 @@ fn dropping_an_unreaped_child_whose_number_reads_unknown_kills_and_logs_the_fail
 /// A root reaped by someone else is seen through its number. Mutant: the identity read dropped.
 #[skuld::test]
 fn dropping_a_foreign_reaped_process_group_child_sends_no_killpg() {
-    // The pre-6.9 path: on 6.9+ the root's pidfd decides (`drop_group_exact_tests`).
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();
@@ -346,7 +342,6 @@ fn dropping_a_foreign_reaped_process_group_child_sends_no_killpg() {
 /// (`kill_tree()` then `wait()`) must not draw it. Mutant: the tree-killed flag is ignored.
 #[skuld::test]
 fn drop_after_kill_tree_and_wait_skips_at_debug_and_does_not_warn() {
-    // The pre-6.9 path: on 6.9+ the root's pidfd decides (`drop_group_exact_tests`).
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();
@@ -368,7 +363,6 @@ fn drop_after_kill_tree_and_wait_skips_at_debug_and_does_not_warn() {
 /// `graceful_shutdown_tree` sweeps with `kill_tree` and reaps the root, so its drop is quiet too.
 #[skuld::test]
 fn drop_after_graceful_shutdown_tree_skips_at_debug_and_does_not_warn() {
-    // The pre-6.9 path: on 6.9+ the root's pidfd decides (`drop_group_exact_tests`).
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();
@@ -420,7 +414,6 @@ fn a_failed_elevated_spawns_cleanup_drops_its_handle_silently() {
 /// tree-killed flag is set on the attempt.
 #[skuld::test]
 fn drop_after_a_failed_kill_tree_and_wait_still_warns() {
-    // The pre-6.9 path: on 6.9+ the root's pidfd decides (`drop_group_exact_tests`).
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();

@@ -1113,12 +1113,9 @@ impl CgroupLeaf {
 /// its number has been reused since. An intent with no handle names nothing cosca may signal.
 ///
 /// A child that reported a failed placement exec'd outside the leaf, so what it forked is reached
-/// only as the process group it leads, killed before the handle's kill: through the handle, which
-/// names the group exactly, and by its number only where the kernel refuses that (before Linux
-/// 6.9), right after a check that the child is still unreaped. A reap by another reaper between
-/// that check and the kill is not seen, and the number may then name another group. A child reaped
-/// before the look still has its group killed through the handle while the group has a member, and
-/// is sent nothing by number. A child in the leaf is killed with the leaf, and one that never
+/// only as the process group it leads, killed before the handle's kill ([`kill_group_outside_leaf`]).
+/// A child reaped before the look still has its group killed through the handle while the group has
+/// a member, and is sent nothing by number. A child in the leaf is killed with the leaf, and one that never
 /// reported never exec'd, so neither is sent anything by number.
 ///
 /// A child its handle may not signal (`EPERM`) is handed to a background reaper, so it is reaped
@@ -1222,10 +1219,9 @@ fn end_child(received: &Received) -> ChildFate {
 }
 
 /// [`end_child`]'s answer for a child reaped before its look. One that exec'd outside its leaf may
-/// have left members in its process group, which `handle` still names exactly: the group is killed
-/// through it while it has a member. Where the kernel refuses that (expected below Linux 6.9),
-/// nothing is sent, as the group's number may name another group, and a `warn` says the members may
-/// be left running. The child is `Gone` either way: no kill reached it.
+/// have left members in its process group, killed as [`kill_group_outside_leaf`] says: with the
+/// child reaped, nothing goes by the group's number, and a `warn` says the members may be left
+/// running. The child is `Gone` either way: no kill reached it.
 #[cfg(target_os = "linux")]
 fn end_reaped_child(handle: &std::os::fd::OwnedFd, received: &Received, pid: rustix::process::Pid) -> ChildFate {
     if !matches!(received.report, Some(PlacementReport::WriteFailed(_))) {
@@ -1256,9 +1252,11 @@ fn kill_through(handle: &std::os::fd::OwnedFd) -> rustix::io::Result<()> {
 
 /// Kill the process group an abandoned spawn's child leads (see [`end_child`]): through `handle`,
 /// which names the group exactly; by its number `pid` only where the kernel refuses that (expected
-/// below Linux 6.9), right after a check that the child is still unreaped. Returns whether the kill
-/// was delivered (`false`: the group has no member left), or the refusal, for the child's one warn:
-/// the kernel's error, or that the flag was refused and the child is reaped, so nothing was sent.
+/// below Linux 6.9), right after a check that the child is still unreaped. A reap by another reaper
+/// between that check and the kill is not seen, and the number may then name another group. Returns
+/// whether the kill was delivered (`false`: the group has no member left), or the refusal, for the
+/// child's one warn: the kernel's error, or that the flag was refused and the child is reaped, so
+/// nothing was sent.
 #[cfg(target_os = "linux")]
 fn kill_group_outside_leaf(
     handle: &std::os::fd::OwnedFd,

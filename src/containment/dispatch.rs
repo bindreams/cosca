@@ -674,8 +674,7 @@ impl Attached {
     /// the root's pidfd instead, as a tree call decides it ([`DropReach`]).
     ///
     /// `view` is one look at the root, taken right before this call. Each send by the group's number
-    /// after it checks the root again right before it
-    /// ([`GroupRoot::check`](crate::containment::GroupRoot::check)).
+    /// after it checks the root again, as for [`Child::kill_tree`](crate::Child::kill_tree).
     ///
     /// The same skip when the root's own handle could not say whether it is reaped
     /// (`RootState::Unknown`): nothing then shows the number still names the root.

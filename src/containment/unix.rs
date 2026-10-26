@@ -146,7 +146,9 @@ pub(crate) mod fault {
     }
 
     /// While the guard lives, the group send through the root's pidfd on THIS thread fails with
-    /// `EINVAL` and is not sent, as a kernel before 6.9 refuses `PIDFD_SIGNAL_PROCESS_GROUP`.
+    /// `EINVAL` and is not sent, as a kernel before 6.9 refuses `PIDFD_SIGNAL_PROCESS_GROUP`. A test
+    /// of the pre-6.9 path holds it; on 6.9+ the root's pidfd decides (`group_exact_tests`,
+    /// `drop_group_exact_tests`).
     #[cfg(target_os = "linux")]
     pub(crate) fn refuse_pidfd_group_flag() -> Refused {
         REFUSE_FLAG.with(|r| r.set(true));
@@ -584,8 +586,8 @@ fn verify(pgid: i32, signal: Signal, root: &GroupRoot<'_>) -> Result<(), Error> 
 ///   any member whose liveness or identity the OS refuses to confirm (`Liveness::Unknown` /
 ///   `Resolved::Unknown`) is never signalled by `converge` at all — for THOSE, this direct
 ///   call is the only delivery attempt, not a duplicate. It is also not the same check: this
-///   call checks the root itself, while `converge` checks each member's token as well. Kept
-///   because #54 forbids removing it, not because it is proven duplicative.
+///   call checks the root itself, while `converge` checks each member's token as well. Kept as
+///   the only delivery for members `converge` never signals.
 /// - **`term_group` (`SIGTERM`)**: NOT redundant — the only real one. `converge`'s `SIGTERM`
 ///   path deliberately never resends — only probes, to avoid tripping a program's own
 ///   double-signal escalation convention — so this is the ONLY actual `SIGTERM`

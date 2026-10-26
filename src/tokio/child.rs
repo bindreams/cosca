@@ -1326,8 +1326,8 @@ impl Child {
 /// tokio cannot reap by that number. The evidence is the number no longer reading as this root, or
 /// the child's own handle (on Linux its pidfd, on macOS the pid's unique id) showing it reaped. The
 /// handle is asked before the signals, so a number-named tree kill is skipped, and again after
-/// them, for a reap that lands in between. On macOS a child with no unique id, or whose peek fails, cannot be shown to be ours and
-/// is forgotten too.
+/// them, for a reap that lands in between. On macOS a child with no unique id, or whose peek fails,
+/// cannot be shown to be ours and is forgotten too.
 ///
 /// # Known limitation: `fork()` without `exec`
 ///
@@ -1559,12 +1559,10 @@ fn signal_on_drop(
     //
     // On Unix, nothing that names the tree by the root's number runs once the root is reaped:
     // this handle's own state, or the number no longer reading as this root (tokio's state cannot
-    // see a foreign reap until it is polled). Each send by the group's number checks the root again
-    // right before it; a foreign reap between that check and its send is not seen, and the send then
-    // reaches whatever process holds the number. On Linux 6.9+ the root's pidfd decides a process
-    // group instead (`Attached::hard_kill_for_drop`). Tokio's
-    // orphan queue reaps by number afterwards, and may collect another child of this process that
-    // took the number.
+    // see a foreign reap until it is polled). Each send by the group's number checks the root again,
+    // as for `Child::kill_tree`. On Linux 6.9+ the root's pidfd decides a process group instead
+    // (`Attached::hard_kill_for_drop`). Tokio's orphan queue reaps by number afterwards, and may
+    // collect another child of this process that took the number.
     #[cfg(unix)]
     let tree = {
         let proc = os.proc.as_ref();
