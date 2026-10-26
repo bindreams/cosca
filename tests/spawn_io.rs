@@ -1394,15 +1394,18 @@ fn linux_cgroup_v2_kill_tree_reaps_the_grandchild(#[fixture(cgroup)] _group: &Gr
     assert_eq!(n, 0, "cgroup.kill must kill the grandchild, not just the root");
 }
 
-/// `terminate_tree` under cgroup v2 containment. Mirrors the kill_tree cgroup
-/// test but exercises the SIGTERM path (`CgroupLeaf::terminate` SIGTERMs every
-/// pid in cgroup.procs). The control-block grandchild has no SIGTERM handler so
-/// the default action kills it. Proof of death: grandchild socket EOF.
+/// `terminate_tree` under cgroup v2 containment: `CgroupLeaf::terminate` SIGTERMs every member of
+/// the leaf. The echo grandchild has no SIGTERM handler, so the default action kills it, and a
+/// fatal signal ends a process before it runs again: once `terminate_tree` returns, a grandchild
+/// that answers the test's byte did not get its SIGTERM. A failure leaves the tree to the handle's
+/// drop, so a missing SIGTERM fails the assertion rather than hanging a wait.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn linux_cgroup_v2_terminate_tree_reaps_the_grandchild(#[fixture(cgroup)] _group: &Group) {
     stderr_log::install();
-    let (child, mut gc_stream) = spawn_contained_tree();
+    let EchoTree {
+        child, root, mut grand, ..
+    } = spawn_contained_echo_tree(true);
     assert_eq!(
         child.containment(),
         cosca::Containment::CgroupV2,
@@ -1412,12 +1415,17 @@ fn linux_cgroup_v2_terminate_tree_reaps_the_grandchild(#[fixture(cgroup)] _group
     );
 
     child.terminate_tree().expect("terminate_tree");
-    let _ = child.wait(); // reap the root
 
-    // Deterministic proof: the grandchild's control socket EOFs on its death.
+    // A dead grandchild's socket answers end of file or a reset; a live one echoes the byte.
+    _ = grand.write_all(b"x");
     let mut buf = [0u8; 1];
-    let n = gc_stream.read(&mut buf).expect("read grandchild control socket");
-    assert_eq!(n, 0, "cgroup terminate must SIGTERM the grandchild, not just the root");
+    let echoed = grand.read(&mut buf).unwrap_or(0);
+    assert_eq!(
+        echoed, 0,
+        "cgroup terminate must SIGTERM the grandchild, not just the root"
+    );
+    drop(root);
+    let _ = child.wait(); // reap the root
 }
 
 /// `detach()` must NOT kill a cgroup-contained tree. `CgroupLeaf::drop` runs whatever

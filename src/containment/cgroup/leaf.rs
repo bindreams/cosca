@@ -785,14 +785,14 @@ impl CgroupLeaf {
             Err(e) => return Err(Unsignalled::Unproven(format!("it could not be placed ({e})"))),
         }
         #[cfg(test)]
-        fault::record_terminated_by_pid(pid);
-        #[cfg(test)]
         let sent = match fault::terminate_fails(fault::TerminateStep::Send) {
             Some(errno) => Err(rustix::io::Errno::from_raw_os_error(errno)),
             None => rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::TERM),
         };
         #[cfg(not(test))]
         let sent = rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::TERM);
+        #[cfg(test)]
+        fault::record_terminated_by_pid(pid);
         match sent {
             Ok(()) => Ok(()),
             Err(rustix::io::Errno::SRCH) => {

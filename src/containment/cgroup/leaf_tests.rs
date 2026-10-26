@@ -3160,3 +3160,23 @@ fn cgroup_terminate_leaves_alone_a_member_that_left_after_the_listing(#[fixture(
     assert_eq!(status.signal(), None, "the member exited on its own EOF: {status:?}");
     drop(leaf);
 }
+
+/// `terminate` sends a running member its `SIGTERM`, and notes it once sent. The member exits at its
+/// stdin's EOF too, so a send that was skipped shows as a plain exit, never as a hang. Mutant: "the
+/// `SIGTERM` is noted and not sent".
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn cgroup_terminate_sends_a_member_its_sigterm(#[fixture(cgroup)] _group: &Group) {
+    use std::os::unix::process::ExitStatusExt as _;
+    let (leaf, mut member, stdin) = entered_real_leaf();
+    let pid = member.id();
+    crate::containment::cgroup::fault::take_terminated_by_pid();
+    let result = leaf.terminate();
+    let noted = crate::containment::cgroup::fault::take_terminated_by_pid();
+    drop(stdin);
+    let status = member.wait().expect("reap the member");
+    drop(leaf);
+    assert_eq!(status.signal(), Some(libc::SIGTERM), "got {status:?}");
+    assert_eq!(noted, [pid]);
+    result.expect("terminate");
+}

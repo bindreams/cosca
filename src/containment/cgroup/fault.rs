@@ -708,7 +708,8 @@ pub(crate) fn run_after_procs_read() {
     crate::oneshot_hook::fire(&AFTER_PROCS_READ);
 }
 
-/// Note a member `CgroupLeaf::terminate` signalled on this thread.
+/// Note a member `CgroupLeaf::terminate` sent its `SIGTERM` on this thread, once the send (or the
+/// seam standing in for it) answered.
 pub(crate) fn record_terminated_by_pid(pid: u32) {
     TERMINATED_BY_PID.with(|t| t.borrow_mut().push(pid));
 }
