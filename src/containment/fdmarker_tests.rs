@@ -891,7 +891,7 @@ fn sweep_pass_refires_the_group_signal_on_a_later_pass_that_confirms_a_new_live_
         &mut group_result,
         &mut incomplete,
         true,
-        super::Scope::Full,
+        super::Scope::Full(&crate::containment::GroupRoot::trusted_for_test()),
     );
     drop(pass1_marker); // its scratch handle has no further use.
 
@@ -946,7 +946,7 @@ fn sweep_pass_refires_the_group_signal_on_a_later_pass_that_confirms_a_new_live_
         &mut group_result,
         &mut incomplete,
         false,
-        super::Scope::Full,
+        super::Scope::Full(&crate::containment::GroupRoot::trusted_for_test()),
     );
 
     // Keyed on THIS marker's handle, per the module docs' rule: the bare sentence is emitted by
