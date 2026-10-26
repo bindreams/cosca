@@ -178,6 +178,42 @@ async fn a_tokio_exec_failure_kills_a_group_with_no_member_and_sends_nothing_by_
     );
 }
 
+/// The route `contain()` takes on a host without a delegated cgroup: `Strongest` with no leaf, whose
+/// process group is the containment. Mutant: the leafless route treats only `Session` as a group
+/// containment.
+#[skuld::test]
+async fn a_tokio_spawn_failing_after_its_fork_kills_the_group_its_leafless_strongest_root_left_a_member_in(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+) {
+    kills_the_group(Root::Running, Container::Leafless);
+}
+
+#[skuld::test]
+async fn a_tokio_spawn_failing_after_its_fork_below_6_9_sends_nothing_to_its_leafless_strongest_roots_group() {
+    below_6_9_sends_nothing_to_the_group(Root::Running, Container::Leafless);
+}
+
+/// A nested spawn (the marker is in the environment) leads no group of its own, so none is sent
+/// anything, whatever the kernel. Runs in a process of its own, since the marker is process-wide.
+/// Mutant: the cleanup kills the group of a nested root.
+#[skuld::test]
+async fn a_nested_tokio_spawn_failing_after_its_fork_sends_no_group_anything() {
+    use crate::test_own_process::{own_process, test_path};
+    use crate::test_spawn::spawn;
+
+    let Some(_done) = own_process(
+        test_path!(a_nested_tokio_spawn_failing_after_its_fork_sends_no_group_anything),
+        spawn,
+    ) else {
+        return;
+    };
+    std::env::set_var(crate::containment::NESTED_ENV, "1");
+    let (fate, steps, member) = failed_spawn(Root::Running, crate::ContainMode::Session, ());
+    assert_eq!(fate, ChildFate::Reaped, "killed and reaped through its pidfd");
+    assert!(steps.is_empty(), "no group is sent anything: {steps:?}");
+    member.assert_survived();
+}
+
 #[skuld::test]
 async fn cgroup_a_tokio_spawn_failing_after_its_fork_kills_the_group_of_a_root_its_leaf_did_not_take(
     #[fixture(cgroup)] _cgroup: &Group,
