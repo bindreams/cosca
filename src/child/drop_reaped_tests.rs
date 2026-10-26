@@ -155,17 +155,18 @@ fn dropping_an_exited_but_unreaped_process_group_child_still_kills_the_group() {
     assert_eq!(drop_warns_since(mark), []);
 }
 
-/// Real `killpg`: `kill_tree()` before `wait()` ends a descendant that outlives the root.
+/// Real `killpg`: `kill_tree()` before `wait()` ends a descendant that outlives the root. A killed
+/// `cat` cannot echo the test's byte, and a live one does, so a kill that was not made fails the
+/// assertion rather than hanging a read.
 #[skuld::test]
 fn kill_tree_before_wait_ends_a_descendant_of_an_exited_root() {
     let (child, mut pipes) = spawn_cat_tree();
 
     child.kill_tree().expect("kill_tree");
-    let mut rest = Vec::new();
-    pipes
-        .stderr
-        .read_to_end(&mut rest)
-        .expect("stderr reaches EOF once the cat is dead");
+    _ = std::io::Write::write_all(&mut pipes.stdin, b"x");
+    let mut echoed = [0u8; 1];
+    let n = pipes.stdout.read(&mut echoed).unwrap_or(0);
+    assert_eq!(n, 0, "kill_tree must end the cat");
     child.wait().expect("reap the root");
 }
 

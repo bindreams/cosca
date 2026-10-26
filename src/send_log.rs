@@ -1,7 +1,11 @@
 //! Test-only record of every signal cosca sends to a process, and how it addressed it.
 //!
-//! An entry is written immediately BEFORE the syscall, whatever the syscall answers: a `kill(2)`
-//! that fails with `ESRCH` still records, so a test sees an attempt that reached the OS.
+//! A by-pid entry is written immediately BEFORE the syscall, whatever the syscall answers: a
+//! `kill(2)` that fails with `ESRCH` still records, so a test sees an attempt that reached the OS.
+//! A [`GroupStep`] send (to a group, its leader or a member) is written by
+//! [`send_signal`](crate::containment::unix::send_signal) AFTER the syscall returned, whatever it
+//! answers, with the signal it handed the syscall: a send that was skipped leaves no record. Where a
+//! test seam answers in the kernel's place, no syscall is made, and the step is still recorded.
 
 use std::cell::RefCell;
 
@@ -29,12 +33,24 @@ pub(crate) type IdentityEntry = (u32, i32);
 pub(crate) enum GroupStep {
     /// The root's pid was checked to still name its group.
     Check,
-    /// The signal to the whole group.
-    Group(Route),
-    /// The signal to the leader alone, after the group's was refused.
-    Leader(Route),
-    /// A member's resend, and the member's pid.
-    Member(Route, u32),
+    /// The signal (its number) to the whole group.
+    Group(Route, i32),
+    /// The signal (its number) to the leader alone, after the group's was refused.
+    Leader(Route, i32),
+    /// A member's resend: the member's pid, and the signal's number.
+    Member(Route, u32, i32),
+}
+
+/// Asserts that the first step is `signo` sent to the whole group through the root's pidfd, before
+/// any resend, and that nothing went to the group by its number.
+#[cfg(all(target_os = "linux", test))]
+#[track_caller]
+pub(crate) fn assert_group_signalled_first_through_the_pidfd(steps: &[GroupStep], signo: i32) {
+    assert_eq!(steps.first(), Some(&GroupStep::Group(Route::Pidfd, signo)), "{steps:?}");
+    assert!(
+        !steps.iter().any(|s| matches!(s, GroupStep::Group(Route::Number, _))),
+        "nothing went by the group's number: {steps:?}"
+    );
 }
 
 /// How a [`GroupStep`] send named its target.

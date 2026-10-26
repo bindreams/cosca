@@ -11,7 +11,6 @@ thread_local! {
     static BEFORE_EXIT_WAIT: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static BEFORE_FRONT_PROBE: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static BEFORE_HANDLE_KILL: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
-    static AFTER_PROCS_READ: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static CHILD_SENDS: std::cell::RefCell<Vec<ChildSend>> = const { std::cell::RefCell::new(Vec::new()) };
     static FORCE_GROUP_KILL_GONE: Cell<bool> = const { Cell::new(false) };
     static TERMINATED_BY_PID: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -55,7 +54,6 @@ thread_local! {
     static CGROUP_ID_FAILS: Cell<Option<i32>> = const { Cell::new(None) };
     static LIVENESS_READ_FAILS: Cell<Option<i32>> = const { Cell::new(None) };
     static SUBTREE_FAILS: Cell<Option<i32>> = const { Cell::new(None) };
-    static TERMINATE_FAILS: Cell<Option<(TerminateStep, i32)>> = const { Cell::new(None) };
     static RMDIR_HOOK: std::cell::RefCell<Option<RmdirHook>> = std::cell::RefCell::new(None);
     static FORCE_FORK_RUNNING_PIDFD_FAILURE: Cell<bool> = const { Cell::new(false) };
     static FORK_RUNNING_PIDFD_FAILURE_PROBE: std::cell::RefCell<Option<std::os::fd::OwnedFd>> =
@@ -699,20 +697,11 @@ pub(crate) fn take_force_group_kill_gone() -> bool {
     FORCE_GROUP_KILL_GONE.with(|f| f.replace(false))
 }
 
-/// Run `hook` in the NEXT `CgroupLeaf::terminate` on this thread, once it has read `cgroup.procs`
-/// and before it signals any member: the window in which a listed member can leave the leaf.
-pub(crate) fn set_after_procs_read(hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
-    crate::oneshot_hook::arm(&AFTER_PROCS_READ, hook)
-}
-pub(crate) fn run_after_procs_read() {
-    crate::oneshot_hook::fire(&AFTER_PROCS_READ);
-}
-
-/// Note a member `CgroupLeaf::terminate` signalled on this thread.
+/// Note a member `CgroupLeaf::terminate` signalled by its bare pid on this thread.
 pub(crate) fn record_terminated_by_pid(pid: u32) {
     TERMINATED_BY_PID.with(|t| t.borrow_mut().push(pid));
 }
-/// The members this thread's `CgroupLeaf::terminate` signalled since the last call.
+/// The members this thread's `CgroupLeaf::terminate` signalled by bare pid since the last call.
 pub(crate) fn take_terminated_by_pid() -> Vec<u32> {
     TERMINATED_BY_PID.with(|t| std::mem::take(&mut *t.borrow_mut()))
 }
@@ -931,38 +920,6 @@ impl Drop for FailSubtree {
     fn drop(&mut self) {
         SUBTREE_FAILS.with(|f| f.set(None));
     }
-}
-
-/// A step of `CgroupLeaf::terminate`'s `SIGTERM` to one member.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TerminateStep {
-    /// The `pidfd_open` that pins the member.
-    Pin,
-    /// The `pidfd_send_signal`.
-    Send,
-}
-
-/// While the guard lives, `step` of each member's `SIGTERM` in `CgroupLeaf::terminate` on this
-/// thread fails with `errno`, and the call it stands for is not made.
-pub(crate) fn fail_terminate(step: TerminateStep, errno: i32) -> FailTerminate {
-    TERMINATE_FAILS.with(|f| f.set(Some((step, errno))));
-    FailTerminate(())
-}
-
-#[must_use = "terminate's steps run again as soon as the guard is dropped"]
-pub(crate) struct FailTerminate(());
-
-impl Drop for FailTerminate {
-    fn drop(&mut self) {
-        TERMINATE_FAILS.with(|f| f.set(None));
-    }
-}
-
-/// The errno `step` fails with, if a [`fail_terminate`] guard is live for it.
-pub(crate) fn terminate_fails(step: TerminateStep) -> Option<i32> {
-    TERMINATE_FAILS
-        .with(Cell::get)
-        .and_then(|(failing, errno)| (failing == step).then_some(errno))
 }
 
 pub(crate) fn subtree_fails() -> Option<i32> {

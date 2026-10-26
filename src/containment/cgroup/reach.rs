@@ -378,8 +378,6 @@ enum Unreadable {
 /// A forked probe child (see [`fork_probe`]).
 struct Probe {
     pid: libc::pid_t,
-    /// The child's pidfd, shown to name this process's own child: it is killed and reaped through it.
-    pidfd: OwnedFd,
     /// Where the child reports whether it is dumpable and its parent-death signal, a byte each. Its
     /// end closes when it exits.
     ready_read: std::io::PipeReader,
@@ -426,33 +424,7 @@ fn fork_probe(parent: libc::pid_t, dumpable: bool) -> io::Result<Probe> {
         return Err(io::Error::last_os_error());
     }
     drop(ready_write);
-    Ok(Probe {
-        pid,
-        pidfd: own_child_pidfd(pid)?,
-        ready_read,
-    })
-}
-
-/// A pidfd for `pid`, a child this process just forked, opened by that number and shown to name an
-/// unreaped child of this process: a pidfd that can be waited on names one. That child is the probe
-/// unless the probe was killed from outside and reaped by another reaper in the process before
-/// `pidfd_open`, and another child of this process took its pid; the probe's kill and reap then reach
-/// that child. Obtaining the pidfd from the fork itself would close this. If no child can be shown,
-/// nothing is sent by the number.
-fn own_child_pidfd(pid: libc::pid_t) -> io::Result<OwnedFd> {
-    use rustix::process::{pidfd_open, waitid, Pid, PidfdFlags, WaitId, WaitIdOptions};
-    let raw = Pid::from_raw(pid).ok_or_else(|| io::Error::other(format!("fork returned pid {pid}")))?;
-    let pidfd = pidfd_open(raw, PidfdFlags::empty()).map_err(io::Error::from)?;
-    loop {
-        match waitid(
-            WaitId::PidFd(pidfd.as_fd()),
-            WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
-        ) {
-            Err(rustix::io::Errno::INTR) => continue,
-            Err(e) => return Err(io::Error::from(e)),
-            Ok(_) => return Ok(pidfd),
-        }
-    }
+    Ok(Probe { pid, ready_read })
 }
 
 /// Reads the cgroup of a non-dumpable child of this process (see [`front_placement`]).
@@ -476,7 +448,7 @@ fn untraceable_cgroup_readable() -> Result<(), Unreadable> {
     let dumpable = super::fault::probe_kept_dumpable();
     #[cfg(not(test))]
     let dumpable = false;
-    let Probe { pid, pidfd, ready_read } =
+    let Probe { pid, ready_read } =
         fork_probe(rustix::process::getpid().as_raw_nonzero().get(), dumpable).map_err(Unreadable::Probe)?;
     let mut ready = [0u8; 2];
     let readied = loop {
@@ -513,19 +485,17 @@ fn untraceable_cgroup_readable() -> Result<(), Unreadable> {
         ))),
         Err(e) => Err(Unreadable::Probe(e)),
     };
-    #[cfg(test)]
-    crate::send_log::record(pid as u32, crate::signal::Sig::Kill, crate::send_log::Via::Pidfd);
-    if let Err(e) = rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::KILL) {
-        return Err(Unreadable::Probe(io::Error::from(e)));
-    }
+    // SAFETY: `pid` is this function's own unreaped child, so the number names it.
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    let mut status = 0;
     loop {
-        match rustix::process::waitid(
-            rustix::process::WaitId::PidFd(pidfd.as_fd()),
-            rustix::process::WaitIdOptions::EXITED,
-        ) {
-            Err(rustix::io::Errno::INTR) => continue,
-            Err(e) => return Err(Unreadable::Probe(io::Error::from(e))),
-            Ok(_) => break,
+        // SAFETY: `pid` is this function's own unreaped child.
+        if unsafe { libc::waitpid(pid, &mut status, 0) } == pid {
+            break;
+        }
+        let e = io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::EINTR) {
+            return Err(Unreadable::Probe(e));
         }
     }
     read

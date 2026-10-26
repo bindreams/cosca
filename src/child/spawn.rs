@@ -626,6 +626,11 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
                 #[cfg(not(target_os = "linux"))]
                 pid,
             );
+            // Linux 6.9+: the group the root may have left members in, whoever reaped the root.
+            #[cfg(target_os = "linux")]
+            if front.is_none() {
+                kill_group_before_teardown(&prepared, handle, &mut why);
+            }
             // A front's containment goes first: a cgroup leaf's drop kills it, so the teardown below
             // waits for a contained front that kill reached, and says what became of it.
             #[cfg(target_os = "linux")]
@@ -2033,7 +2038,7 @@ impl Diagnosis {
     }
 
     /// Owe `text` too: the next [`fold`](Diagnosis::fold) leads with it, after what was owed.
-    #[cfg(all(target_os = "linux", feature = "tokio"))]
+    #[cfg(target_os = "linux")]
     pub(crate) fn add(&mut self, text: impl std::fmt::Display) {
         match &mut self.0 {
             Some(owed) => owed.push_str(&format!("; {text}")),
@@ -2390,6 +2395,31 @@ pub(crate) fn settle_before_teardown(
         #[cfg(not(target_os = "linux"))]
         pid,
     );
+}
+
+/// Linux 6.9+: kill the process group of a failed spawn's root before its teardown, as
+/// [`Prepared::kill_group_before_attach`](crate::containment::Prepared::kill_group_before_attach)
+/// decides. A refused kill is owed to `why`, the teardown's one warn, which says the group's
+/// members may be left running. Not for an elevation front, which is sent nothing.
+#[cfg(target_os = "linux")]
+pub(crate) fn kill_group_before_teardown(
+    prepared: &crate::containment::Prepared,
+    child: crate::containment::ChildHandle<'_>,
+    why: &mut Diagnosis,
+) {
+    let pid = child.pid;
+    match prepared.kill_group_before_attach(child) {
+        Ok(()) => {}
+        Err(nix::errno::Errno::EINVAL) => why.add(format!(
+            "members of the process group of pid {pid} may be left running: the kernel refused \
+             PIDFD_SIGNAL_PROCESS_GROUP (EINVAL, expected below Linux 6.9), so nothing was sent to the \
+             group, whose number may name another group"
+        )),
+        Err(e) => why.add(format!(
+            "spawn teardown could not kill the process group of pid {pid} through its pidfd ({e}); its \
+             members may be left running"
+        )),
+    }
 }
 
 /// The subtree of the leaf of an elevation front, captured while the leaf exists: a failure arm
@@ -3445,3 +3475,7 @@ pub(crate) mod unique_report;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "spawn/front_teardown_tests.rs"]
 mod front_teardown_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "spawn/identity_group_tests.rs"]
+pub(crate) mod identity_group_tests;

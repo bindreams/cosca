@@ -351,13 +351,11 @@ fn check_or_signal(
         "check_or_signal called with {signal:?}; only None (probe) or Some(SIGKILL) (resend) \
          are ever valid here — SIGTERM must never resend, see converge's design note"
     );
-    // A resend reaches the group's member only while the group's number is still the root's. The
-    // root's check proves the listing named the root's group; the member's identity check, after
-    // it and right before the `kill`, guards the send by the member's pid. A probe sends nothing.
-    if signal.is_some() {
-        if let Err(reached) = root_check_before_resend(root, pid, signal) {
-            return reached;
-        }
+    // The listing named the root's group only while the group's number is still the root's: the
+    // root's check proves it, for a resend and a probe alike. The member's identity check, after it
+    // and right before the `kill`, guards the send by the member's pid.
+    if let Err(reached) = root_check_before_send(root, pid, signal) {
+        return reached;
     }
     match crate::identity::ProcessId::of(pid) {
         crate::identity::Resolved::Found(live) if live == id => {}
@@ -399,11 +397,13 @@ fn check_or_signal(
         log::warn!("containment::unix::group: pid {pid} is not a single-process signal target");
         return Reached::Unknown;
     };
-    #[cfg(test)]
-    if signal.is_some() {
-        crate::send_log::record_group(crate::send_log::GroupStep::Member(crate::send_log::Route::Number, pid));
-    }
-    match nix::sys::signal::kill(nix::unistd::Pid::from_raw(target), signal) {
+    let sent = match signal {
+        Some(signal) => super::send_signal(super::Target::Member(pid), super::Sys::Process(target), signal),
+        #[cfg(test)]
+        None if fault::probes_refused() => Err(nix::errno::Errno::EPERM),
+        None => nix::sys::signal::kill(nix::unistd::Pid::from_raw(target), None),
+    };
+    match sent {
         Ok(()) | Err(nix::errno::Errno::ESRCH) => Reached::Yes,
         Err(nix::errno::Errno::EPERM) => {
             // The expected, common case for a genuine refuser — logged at debug (not warn),
@@ -423,20 +423,20 @@ fn check_or_signal(
     }
 }
 
-/// The root's check before the resend of `signal` to the listed `pid` ([`GroupRoot::check`]). `Err`
-/// is the member's answer when the resend may not go out: a group with no member left holds no
-/// listed process, so that process is not a survivor; any other failed check leaves it unassessable.
-fn root_check_before_resend(root: &GroupRoot<'_>, pid: RawPid, signal: Option<Signal>) -> Result<(), Reached> {
+/// The root's check before the resend of `signal` (`None`: the probe) to the listed `pid`
+/// ([`GroupRoot::check`]). `Err` is the member's answer when nothing may go out: a group with no
+/// member left holds no listed process, so that process is not a survivor; any other failed check
+/// leaves it unassessable.
+fn root_check_before_send(root: &GroupRoot<'_>, pid: RawPid, signal: Option<Signal>) -> Result<(), Reached> {
+    let send = signal.map_or_else(|| "probed".to_owned(), |signal| format!("resent {signal}"));
     match root.check() {
         Ok(()) => Ok(()),
         Err(why @ crate::containment::NotItsGroup::Empty) => {
-            log::debug!(
-                "containment::unix::group: {why}, so pid {pid} is in another group, and is not resent {signal:?}"
-            );
+            log::debug!("containment::unix::group: {why}, so pid {pid} is in another group, and is not {send}");
             Err(Reached::Yes)
         }
         Err(why) => {
-            log::warn!("containment::unix::group: {why}, so pid {pid} is not resent {signal:?}; it is unassessable");
+            log::warn!("containment::unix::group: {why}, so pid {pid} is not {send}; it is unassessable");
             Err(Reached::Unknown)
         }
     }
@@ -488,12 +488,12 @@ fn root_check_before_resend(root: &GroupRoot<'_>, pid: RawPid, signal: Option<Si
 fn check_or_signal_linux_sigkill(pid: RawPid, id: crate::identity::ProcessId, root: &GroupRoot<'_>) -> Reached {
     match crate::wait::backend::open_verified(id, crate::wait::backend::PidfdOp::GroupTeardown) {
         Ok(None) => Reached::Yes, // already gone
-        Ok(Some(pidfd)) => match root_check_before_resend(root, id.pid(), Some(Signal::SIGKILL)) {
+        Ok(Some(pidfd)) => match root_check_before_send(root, id.pid(), Some(Signal::SIGKILL)) {
             Err(reached) => reached,
             Ok(()) => match send_member_pidfd(&pidfd, id.pid()) {
                 Ok(()) => Reached::Yes,
-                Err(rustix::io::Errno::SRCH) => Reached::Yes, // exited between open and signal
-                Err(rustix::io::Errno::PERM) => {
+                Err(nix::errno::Errno::ESRCH) => Reached::Yes, // exited between open and signal
+                Err(nix::errno::Errno::EPERM) => {
                     log::debug!(
                         "containment::unix::group: pidfd_send_signal({}, KILL) refused: EPERM",
                         id.pid()
@@ -536,11 +536,13 @@ fn check_or_signal_linux_sigkill(pid: RawPid, id: crate::identity::ProcessId, ro
 
 /// `SIGKILL` through a member's own pidfd, `pid` the member's.
 #[cfg(target_os = "linux")]
-#[cfg_attr(not(test), allow(unused_variables, reason = "only the test log names the pid"))]
-fn send_member_pidfd(pidfd: &rustix::fd::OwnedFd, pid: RawPid) -> rustix::io::Result<()> {
-    #[cfg(test)]
-    crate::send_log::record_group(crate::send_log::GroupStep::Member(crate::send_log::Route::Pidfd, pid));
-    rustix::process::pidfd_send_signal(pidfd, rustix::process::Signal::KILL)
+fn send_member_pidfd(pidfd: &rustix::fd::OwnedFd, pid: RawPid) -> nix::Result<()> {
+    use std::os::fd::AsFd as _;
+    super::send_signal(
+        super::Target::Member(pid),
+        super::Sys::Pidfd(pidfd.as_fd(), 0),
+        Signal::SIGKILL,
+    )
 }
 
 /// "Ask forgiveness, one more time": re-confirm a `Survivor` verdict with a SECOND liveness
@@ -608,12 +610,15 @@ fn reconfirm_survivor(outcome: MemberOutcome, recheck: impl FnOnce() -> crate::i
 /// **The group's number, and each resend.** The listing names members by `pgid`, a number that
 /// stays the root's group only while the group has a member: on Linux 6.9+ the root's pidfd shows
 /// that exactly, and elsewhere the root's state stands in for it (unreaped, or its pid free after
-/// this handle's own reap). Each `SIGKILL` resend therefore follows its own check of the root
-/// ([`GroupRoot::check`]), which shows the listing named the root's group, and then the member's
-/// identity check right before the send. A member whose root check fails is unassessable and not
-/// signalled; on 6.9+, once the group has no member left, it is in another group that took the
-/// number, and is not a survivor. A change between a check and the resend is not seen: the window
-/// `Child::kill_tree` documents.
+/// this handle's own reap). Each `SIGKILL` resend and each `SIGTERM` probe therefore has its own
+/// check of the root ([`GroupRoot::check`]), which shows the listing named the root's group. On Linux
+/// a `SIGKILL` resend first pins the member by a pidfd that its identity check vouches for, then
+/// checks the root, then sends through that pidfd. A `SIGTERM` probe, and a resend by the member's
+/// pid (on macOS, or where the pidfd cannot be opened), checks the root, then the member's identity
+/// right before the send. A member whose root check fails is unassessable and not signalled; on
+/// 6.9+, once the group has no member left, it is in another group that took the number, and is not
+/// a survivor. A change between a check and the send is not seen: the window `Child::kill_tree`
+/// documents.
 pub(crate) fn converge(pgid: i32, signal: Signal, root: &GroupRoot<'_>) -> std::io::Result<GroupState> {
     #[cfg(test)]
     let listed = members(fault::listed(pgid))?;
@@ -734,6 +739,30 @@ pub(crate) mod fault {
     thread_local! {
         static AFTER_LISTING: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
         static LIST_INSTEAD: Cell<Option<i32>> = const { Cell::new(None) };
+        static PROBES_REFUSED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// While the guard lives, every signal-0 probe `converge` sends on this thread answers `EPERM`
+    /// and is not sent, as a process of another user answers.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn refuse_probes() -> RefuseProbes {
+        PROBES_REFUSED.with(|r| r.set(true));
+        RefuseProbes(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[must_use = "the probes go out again as soon as the guard is dropped"]
+    pub(crate) struct RefuseProbes(());
+
+    #[cfg(target_os = "linux")]
+    impl Drop for RefuseProbes {
+        fn drop(&mut self) {
+            PROBES_REFUSED.with(|r| r.set(false));
+        }
+    }
+
+    pub(super) fn probes_refused() -> bool {
+        PROBES_REFUSED.with(Cell::get)
     }
 
     /// While the guard lives, `converge` on this thread lists process group `pgid` instead of the

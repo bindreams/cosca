@@ -70,6 +70,32 @@ impl Prepared {
         let _ = pid;
     }
 
+    /// Linux 6.9+: `SIGKILL`, through `child`'s pidfd, the process group of a spawn that failed
+    /// before its attach, while the group has a member. The pidfd names the group exactly, whoever
+    /// reaped the root. Only a root whose group is its containment is sent it: a Session root, or a
+    /// process-group root with no cgroup leaf or one its leaf did not take, as `attach` would decide.
+    /// The leaf's verdict is settled first ([`settle_verdict`](Self::settle_verdict)); a leaf that
+    /// took the child kills it with the leaf. `Err` is the kernel's refusal of the kill, with the
+    /// group's members possibly left running: `EINVAL` when it refuses the flag (expected below
+    /// 6.9), in which case nothing is sent, as the group's number may name another group.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn kill_group_before_attach(&self, child: ChildHandle<'_>) -> Result<(), nix::errno::Errno> {
+        use nix::errno::Errno;
+        let group_is_containment = self.is_root
+            && self.cgroup_leaf.as_ref().is_none_or(|leaf| !leaf.child_entered())
+            && matches!(self.mode, Some(mode) if !matches!(mode, ContainMode::TreeWalk));
+        if !group_is_containment {
+            return Ok(());
+        }
+        let pid = child.pid;
+        match crate::containment::unix::pidfd_signal_group(child.pidfd, nix::sys::signal::Signal::SIGKILL) {
+            Ok(()) => log::debug!("spawn teardown: sent SIGKILL to the process group of pid {pid} through its pidfd"),
+            Err(Errno::ESRCH) => log::debug!("spawn teardown: the process group of pid {pid} has no member left"),
+            Err(e) => return Err(e),
+        }
+        Ok(())
+    }
+
     /// End the placement exchange of a spawn that failed with no handle left on its child — tokio
     /// can drop one it forked — and say what became of that child. Without a leaf nothing can
     /// tell, so [`AbandonedChild::MaybeUnreachable`]. A child that is an elevation `front` is sent
@@ -533,7 +559,7 @@ impl Attached {
             #[cfg(unix)]
             Attached::ProcessGroup(pgid) => crate::containment::unix::term_group(*pgid, root),
             #[cfg(target_os = "linux")]
-            Attached::Cgroup(leaf) => leaf.terminate(),
+            Attached::Cgroup(leaf) => leaf.terminate().map_err(Error::Io),
             #[cfg(windows)]
             Attached::JobObject(_) => crate::containment::windows::terminate(_child_pid),
             #[cfg(target_os = "macos")]

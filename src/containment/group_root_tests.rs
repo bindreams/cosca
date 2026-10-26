@@ -69,3 +69,21 @@ fn check_asks_the_callers_check_when_the_kernel_refuses_the_flag() {
     );
     assert_eq!(passed, Ok(()));
 }
+
+/// A signal-0 group send answered `EPERM` (as a seccomp filter may answer for a group whose number
+/// another group took) says nothing about the group: the caller's check answers. Mutant: "`EPERM`
+/// reads as a group with a member".
+#[skuld::test]
+fn check_asks_the_callers_check_when_the_group_probe_answers_eperm() {
+    let (mut leader, pidfd) = leader();
+    let reaped = || Err("the root was reaped elsewhere".to_owned());
+    let answered = crate::containment::unix::fault::answer_group_probes_with(libc::EPERM);
+    let checked = GroupRoot::new(Some(pidfd.as_fd()), &reaped).check();
+    drop(answered);
+    leader.kill().expect("kill the leader");
+    leader.wait().expect("reap the leader");
+    assert_eq!(
+        checked,
+        Err(NotItsGroup::Unproven("the root was reaped elsewhere".to_owned()))
+    );
+}
