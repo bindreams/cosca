@@ -196,3 +196,29 @@ fn a_drop_of_a_root_its_handle_cannot_read_kills_its_group_through_the_pidfd(
     assert_eq!(steps.first(), Some(&GroupStep::Group(Route::Pidfd)), "{steps:?}");
     await_the_cat_gone(stderr);
 }
+
+/// 6.9+: a root whose handle cannot say whether it was reaped, whose group has no member, may have
+/// left the group alive, so the drop still skips the group and says so. Mutant: "the drop takes an
+/// unanswered root for a reaped one".
+#[skuld::test]
+fn a_drop_of_a_root_its_handle_cannot_read_with_no_member_left_still_skips_the_group(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+) {
+    use crate::identity::Resolved;
+    use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peek_once};
+    crate::log_capture::install();
+    let child = session_sleep().spawn().expect("spawn");
+    let id = child.id();
+    reap_root(&child, Reap::Foreign);
+    let mark = crate::log_capture::mark();
+    let capture = Capture::start();
+    let _as_root = crate::child::fault::force_next_root_read(Resolved::Found(id));
+    let forced = force_peek_once(Err(std::io::Error::other("forced peek failure")));
+    drop(child);
+    assert_peeks_exhausted();
+    drop(forced);
+    let steps = capture.group_steps();
+    assert_eq!(steps, [], "nothing was sent to the group");
+    let skips = crate::log_capture::records_since_on_current_thread(mark, "so it does not kill its process group");
+    assert_eq!(skips.len(), 1, "{skips:?}");
+}
