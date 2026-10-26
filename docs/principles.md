@@ -109,8 +109,8 @@ tokio's `try_wait`.
 On Windows the async `Drop` terminates the tree and the root, and waits for neither.
 
 **Why:** a kill the drop delivered makes the wait as bounded as the kernel makes it, the same wait
-the sync `Drop` already does, and a drop that returns early leaks the zombie and the cgroup leaf
-(owner, 2026-10-03 and 2026-10-25). A kill that failed bounds nothing, so that drop stays bounded.
+the sync `Drop` already does, and a drop that returns early leaks the zombie and the cgroup leaf.
+A kill that failed bounds nothing, so that drop stays bounded.
 Global reapers (`waitpid(-1)`, a subreaper) belong to programs that own the whole process, such as
 tini and the containerd shim. Embeddable libraries decline the role: sd-event avoids
 `waitid(P_ALL)` ([sd-event.c]), and runc's Go `libcontainer` requires its embedder to supply the

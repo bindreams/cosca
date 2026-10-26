@@ -432,7 +432,7 @@ impl Child {
     /// Unix-only: the Windows elevation arm builds its child in-module with no deferred password.
     #[cfg(unix)]
     ///
-    /// The wait warns once past 1 s, naming the child, as a failed spawn's other teardown waits do.
+    /// The wait warns once past 1 s, naming the child.
     ///
     /// Answers what the wait found, for a caller whose kill was delivered: the collected exit
     /// (`Reaped`), or, for a child it could not show to be ours, which is forgotten, `Killed`.
@@ -1431,10 +1431,9 @@ impl Child {
 
     /// [`tear_down_now`](Self::tear_down_now) for an `async fn`: the run-to-completion helpers,
     /// which fail after the spawn. The armed drop's waits (see [`Settle`]) are awaited instead of
-    /// blocked on, without the drop's 1 s warn, which is about a blocked thread. Dropped before the
-    /// reap is over, the future finishes the teardown as the drop does, blocking; dropped during the
-    /// drain, it waits for the drain as the drop does, with the drop's warn past 1 s from then. A
-    /// root whose exit cannot be watched is reaped as the drop does, blocking.
+    /// blocked on, without the drop's 1 s warn, which is about a blocked thread. Dropped
+    /// mid-teardown, or with an exit or drain that cannot be watched, it finishes as the drop does
+    /// (see `Reaping`, `Draining`).
     pub(crate) async fn tear_down_awaiting(&mut self) -> crate::error::ChildFate {
         let teardown = self.signal_for_teardown();
         // Before the waits, so the handle's own drop does nothing more if this future is dropped.
@@ -2104,8 +2103,8 @@ pub(crate) mod fault {
         static SLOW_TEARDOWN_AFTER: Cell<Option<std::time::Duration>> = const { Cell::new(None) };
     }
 
-    /// A failed spawn's teardown on THIS thread warns once its wait passes 1 s, as outside tests
-    /// (see [`slow_teardown_after`](super::slow_teardown_after)).
+    /// A failed spawn's teardown, or an armed drop, on THIS thread warns once its wait passes 1 s, as
+    /// outside tests (see [`slow_teardown_after`](super::slow_teardown_after)).
     #[cfg(target_os = "linux")]
     pub(crate) fn warn_slow_teardowns() -> WarnSlowTeardowns {
         warn_slow_teardowns_after(super::LATE)

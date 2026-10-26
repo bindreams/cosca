@@ -526,11 +526,7 @@ impl Command {
     /// [`Child`](crate::tokio::Child) does so on the dropping thread, which may be a tokio worker:
     /// a destructor cannot be awaited. Its root's kill bounds the wait, as does the tree's
     /// `cgroup.kill`, unless a process stays stuck in uninterruptible I/O (D state) or a foreign
-    /// tracer holds the root's zombie; past 1 s the async drop logs one `warn` naming the root's
-    /// pid, and keeps waiting. To wait without blocking, call
-    /// [`kill_tree`](crate::tokio::Child::kill_tree) or [`kill`](crate::tokio::Child::kill), then
-    /// await [`wait`](crate::tokio::Child::wait) (and [`wait_tree`](crate::tokio::Child::wait_tree)
-    /// for a tree), before dropping. See that `Drop`'s rustdoc. On Windows the async drop
+    /// tracer holds the root's zombie. See that `Drop`'s rustdoc. On Windows the async drop
     /// terminates the root and the tree, and waits for neither.
     ///
     /// An elevated child this process cannot signal is the one case neither handle blocks on: the

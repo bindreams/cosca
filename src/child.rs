@@ -1231,8 +1231,7 @@ impl Child {
         }
         // Kill, block until the child has exited, and collect its status here — this handle owns
         // the child outright, and a sync caller owns the thread it is blocking. The async twin
-        // (`cosca::tokio::Child`'s `Drop`) does the same on Unix, collecting through tokio's
-        // `Child` once the exit is visible through the child's own handle.
+        // (`cosca::tokio::Child`'s `Drop`) does the same on Unix.
         // A reaped root is neither killed nor waited for: its number may name another child by now.
         // Neither is a root this process does not pin (macOS: launchd holds its zombie). Its fate is
         // `Reaped` by this handle's own reap, else `Gone`: nothing was signalled, so a root someone

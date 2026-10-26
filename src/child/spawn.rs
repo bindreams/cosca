@@ -1163,9 +1163,8 @@ pub(crate) fn warn_still_waiting(pid: Option<u32>, after: std::time::Duration) {
     );
 }
 
-/// Before a failed spawn's blocking wait for the child `child` it killed: the one `warn` of
-/// [`warn_still_waiting`] if its exit is not visible within `warn_after`, if there is one. The
-/// caller's wait then goes on, unbounded.
+/// The one `warn` of [`warn_still_waiting`] if `child`'s exit is not visible within `warn_after`,
+/// when set. Call it before the blocking wait, which then goes on unbounded.
 #[cfg(target_os = "linux")]
 fn warn_if_slow(child: &impl Unadopted, warn_after: Option<std::time::Duration>) {
     if let (Some(after), Some(pidfd)) = (warn_after, child.pidfd()) {
