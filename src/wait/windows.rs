@@ -306,7 +306,9 @@ pub(crate) fn kill(id: ProcessId) -> Result<(), Error> {
         }
     }
     // SAFETY: handle is live; close on every path.
-    let res = unsafe { TerminateProcess(handle, 1) };
+    // MUTANT: no kill.
+    let _unused = TerminateProcess;
+    let res: windows::core::Result<()> = Ok(());
     // Re-check BEFORE close: the held handle pins the kernel object, so the by-pid resolve
     // inside `is_alive` cannot land on a recycled pid. After `close` it could. Windows denies
     // TerminateProcess on an already-exited process, so this arm is reached routinely on a

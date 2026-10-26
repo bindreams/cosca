@@ -614,6 +614,10 @@ impl SharedChild {
         }
         #[cfg(test)]
         exit_only::seams::signal_sent();
+        // MUTANT: no kill.
+        if true {
+            return Ok(());
+        }
         lock.child.kill()
     }
 

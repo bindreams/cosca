@@ -184,6 +184,8 @@ impl JobHandle {
 
 impl Drop for JobHandle {
     fn drop(&mut self) {
+        // MUTANT: no kill. Clear KILL_ON_JOB_CLOSE so closing the handle kills nothing.
+        self.disarm();
         // If `hard_kill` was not called and `disarm` did not clear the flag,
         // KILL_ON_JOB_CLOSE fires here when we close the handle, tearing down
         // the tree — the drop backstop for `kill_on_drop=true` semantics.

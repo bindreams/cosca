@@ -290,7 +290,9 @@ pub(crate) fn kill_by_identity(id: ProcessId) -> KillOutcome {
     let outcome = match crate::identity::windows_handle_identity(handle, id) {
         HandleIdentity::Same => {
             // SAFETY: `handle` is live and pins the verified process.
-            match unsafe { TerminateProcess(handle, 1) } {
+            // MUTANT: no kill.
+            let _unused = TerminateProcess;
+            match Ok::<(), windows::core::Error>(()) {
                 Ok(()) => KillOutcome::Terminated,
                 Err(e) => {
                     log::warn!("treewalk: TerminateProcess(pid {}) failed: {e}", id.pid());
