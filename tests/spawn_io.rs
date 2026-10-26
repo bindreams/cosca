@@ -1275,8 +1275,12 @@ fn treewalk_kills_process_group_escapee() {
 /// (the lone-child case) but wraps a contained `spawn-grandchild` tree so the
 /// grandchild must also die. Proof of death: the grandchild's control socket
 /// closes — either a graceful EOF (n==0) or a ConnectionReset; the match below
-/// accepts EITHER on ALL platforms (the OS may surface either form on any host).
-#[cfg(any(unix, windows))]
+/// accepts EITHER form (the OS may surface either on any host).
+///
+/// Windows only. On Unix a drop that killed nothing leaves the read below waiting for an EOF that
+/// never comes, so `drop_kills_a_contained_tree` in `src/child/lifecycle_tests.rs` proves it there,
+/// failing by assertion.
+#[cfg(windows)]
 #[skuld::test]
 fn drop_kills_contained_tree() {
     let (child, mut gc_stream) = spawn_contained_tree();

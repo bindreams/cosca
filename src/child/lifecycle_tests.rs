@@ -291,3 +291,49 @@ fn drop_kills_and_reaps_the_child() {
         "child must be dead (and reaped) after drop"
     );
 }
+
+/// Dropping a `Child` whose tree is contained kills the whole tree, the grandchild too. The tree's
+/// stdin is released once the drop's root kill returned, so a drop that sent nothing lets the
+/// root exit 0 and the grandchild print `eof`, and fails the assertions instead of hanging in the
+/// drop. Both members hold the stdout pipe, so its end is the moment both are gone.
+#[cfg(unix)]
+#[skuld::test]
+fn drop_kills_a_contained_tree() {
+    use std::io::Read as _;
+    let mut cmd = crate::Command::new();
+    cmd.args(crate::test_child::CAT_TREE_ARGV.iter().copied());
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+    cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
+    cmd.contain();
+    let mut child = cmd.spawn().expect("spawn");
+    let stdin = child.stdin().expect("piped stdin");
+    let mut stdout = child.stdout().expect("piped stdout");
+    let mut ready = [0u8; 2];
+    stdout.read_exact(&mut ready).expect("readiness line");
+    assert_eq!(&ready, b"r\n");
+    // Containment was established, so a tree that survives the drop is a missing kill and not a
+    // missing mechanism.
+    let got = child.containment();
+    let established = if cfg!(target_os = "linux") {
+        matches!(got, crate::Containment::CgroupV2 | crate::Containment::ProcessGroup)
+    } else {
+        matches!(
+            got,
+            crate::Containment::ProcessGroup | crate::Containment::Session | crate::Containment::FdMarker
+        )
+    };
+    assert!(
+        established,
+        "unexpected containment for a contained tree on this host: {got:?}"
+    );
+    let teardown = crate::child::spawn::fault::release_at_drop_kill(stdin);
+
+    drop(child);
+
+    teardown.assert_killed();
+    let mut rest = Vec::new();
+    stdout
+        .read_to_end(&mut rest)
+        .expect("both members are gone, so the pipe ends");
+    assert!(rest.is_empty(), "the drop missed the grandchild: {rest:?}");
+}

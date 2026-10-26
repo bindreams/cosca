@@ -297,21 +297,33 @@ fn remove_leftover_leaf(leaf: Option<std::path::PathBuf>) {
 #[cfg(feature = "tokio")]
 #[skuld::test]
 async fn async_drop_tears_down_a_contained_tree() {
-    use std::io::Read as _;
-    let (child, mut root, mut grand) = common::spawn_grandchild_async(true).await;
+    // The members echo until released (`ECHO_HELD_ENV`), so on Unix a drop that killed nothing is
+    // caught by an echo, not by a read that never ends.
+    let (child, mut root, mut grand) = common::spawn_tree_async("spawn-grandchild", |cmd| {
+        cmd.contain();
+        cmd.kill_on_drop(true);
+        cmd.env(common::ECHO_HELD_ENV, "1");
+    })
+    .await;
     let leaf = cgroup_leaf_of(&child);
     let _leaf_cleanup = leaf_cleanup(&leaf);
-    // The containment assert guards the EOFs below from passing for unrelated reasons.
+    // The containment assert guards the death proof below from passing for unrelated reasons.
     assert_ne!(
         child.containment(),
         cosca::Containment::None,
         "contained spawn must engage a mechanism"
     );
     drop(child);
-    // No post-drop liveness assertion: `Drop` signals and does not wait, and a kill is
-    // asynchronous. Each process's death is proven by its own control-socket EOF: a survivor
-    // blocks the read (a CI failure).
+    // No wait: `Drop` signals and does not wait. On Unix the kill is pending once the drop returns,
+    // and a killed member cannot echo. Windows proves each death by the member's socket EOF.
+    #[cfg(unix)]
+    {
+        common::assert_dead(&mut root, "the root after the drop");
+        common::assert_dead(&mut grand, "the grandchild after the drop");
+    }
+    #[cfg(windows)]
     for (who, s) in [("root", &mut root), ("grandchild", &mut grand)] {
+        use std::io::Read as _;
         let mut buf = [0u8; 1];
         match s.read(&mut buf) {
             Ok(0) => {}

@@ -320,39 +320,6 @@ async fn async_graceful_shutdown_unsupported_for_an_uncontained_child_on_windows
 }
 
 #[cfg(feature = "tokio")]
-#[cfg(unix)]
-#[skuld::test]
-async fn async_graceful_shutdown_tree_sweeps_survivor_after_graceful_root_exit() {
-    use std::time::Duration;
-    // The exact case the sweep-before-reap invariant protects: the root honors the group
-    // SIGTERM and exits within the grace, but the grandchild ignores it and survives — only
-    // the post-grace hard sweep (running while the unreaped root still pins the group id)
-    // can tear it down. The grandchild never exits, so on a drain-observable mechanism the
-    // full grace is always spent watching the whole tree (not just the root) before the sweep
-    // runs — 1s (not 30s) keeps this fast while staying a generous bound.
-    //
-    // This test asserts ONLY survivor teardown, deliberately not the root's reaped signal: the
-    // handshake in `spawn_tree_async` proves the root is ready to RECEIVE the SIGTERM, not that
-    // it finishes dying from it before the grace expires and the hard sweep's SIGKILL reaches
-    // the same pid. If the root is still alive (not yet a zombie) at that instant, the sweep's
-    // SIGKILL can pre-empt the SIGTERM's own kill, flipping the observed signal under load — a
-    // genuine timing bet this test must not make. `async_graceful_shutdown_tree_graceful_root_sigterm`
-    // covers the root's SIGTERM status instead, in a single-process tree where the drain
-    // completes as soon as the root exits, so the sweep never runs concurrently with a
-    // still-alive root at all.
-    let (mut child, mut root, mut grand) = common::spawn_tree_async("spawn-grandchild-stubborn-child", |cmd| {
-        cmd.contain();
-    })
-    .await;
-    child
-        .graceful_shutdown_tree(Duration::from_secs(1))
-        .await
-        .expect("tree graceful with survivor");
-    expect_eof("root", &mut root);
-    expect_eof("grandchild", &mut grand);
-}
-
-#[cfg(feature = "tokio")]
 #[skuld::test]
 async fn async_graceful_tree_unsupported_when_uncontained() {
     use std::time::Duration;

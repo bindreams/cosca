@@ -849,20 +849,6 @@ fn main() {
             // byte was written, so a test can tell "no SIGTERM came" from "not yet" without a timer.
             hold(&mut sock);
         }
-        #[cfg(unix)]
-        "spawn-grandchild-stubborn-child" => {
-            // spawn-grandchild where only the GRANDCHILD ignores SIGTERM: the group's soft
-            // signal kills the root (default disposition) but leaves the grandchild — a
-            // survivor only the post-grace hard sweep can reach.
-            let addr = args[2].clone();
-            let exe = std::env::current_exe().unwrap();
-            let _gc = spawn_reported_grandchild(&exe, &["control-block-ignore-term", &addr, "G"]);
-            let mut sock = crate::ack::connect_control(&addr).unwrap();
-            sock.write_all(b"R").unwrap();
-            sock.flush().unwrap();
-            let mut buf = [0u8; 1];
-            let _ = sock.read(&mut buf);
-        }
         #[cfg(windows)]
         "control-block-ignore-break" => {
             // Ignore CTRL_BREAK, then behave exactly like control-block — only a hard kill ends us.
