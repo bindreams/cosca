@@ -14,6 +14,10 @@ enum Reap {
     Own,
     /// Another reaper in the process, behind the handle's back.
     Foreign,
+    /// A foreign reap that this handle's `try_wait` then observed: it forgets tokio's `Child`.
+    ForeignSeenByTryWait,
+    /// A foreign reap that this handle's `wait` then observed: it forgets tokio's `Child`.
+    ForeignSeenByWait,
 }
 
 /// The teardown under test.
@@ -31,6 +35,14 @@ async fn reap_root(child: &mut crate::tokio::Child, reap: Reap) {
             child.wait().await.expect("this handle reaps the root");
         }
         Reap::Foreign => reap_behind(child.id().pid()),
+        Reap::ForeignSeenByTryWait => {
+            reap_behind(child.id().pid());
+            child.try_wait().expect_err("a foreign reap answers ECHILD");
+        }
+        Reap::ForeignSeenByWait => {
+            reap_behind(child.id().pid());
+            child.wait().await.expect_err("a foreign reap answers ECHILD");
+        }
     }
 }
 
@@ -180,4 +192,80 @@ async fn a_failed_elevated_spawns_cleanup_after_a_foreign_reap_reports_no_skip_f
     #[fixture(pidfd_group_signal)] _group: &Group,
 ) {
     sends_nothing_to_an_empty_group_and_reports_no_skip(Reap::Foreign, Teardown::FinishElevated).await;
+}
+
+#[skuld::test]
+async fn a_drop_after_a_foreign_reap_seen_by_try_wait_kills_the_group_left_behind(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+) {
+    kills_the_group_left_behind(Reap::ForeignSeenByTryWait, Teardown::Drop).await;
+}
+
+#[skuld::test]
+async fn a_failed_elevated_spawns_cleanup_after_a_foreign_reap_seen_by_try_wait_kills_the_group_left_behind(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+) {
+    kills_the_group_left_behind(Reap::ForeignSeenByTryWait, Teardown::FinishElevated).await;
+}
+
+#[skuld::test]
+async fn a_drop_after_a_foreign_reap_seen_by_wait_kills_the_group_left_behind(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+) {
+    kills_the_group_left_behind(Reap::ForeignSeenByWait, Teardown::Drop).await;
+}
+
+#[skuld::test]
+async fn a_failed_elevated_spawns_cleanup_after_a_foreign_reap_seen_by_wait_kills_the_group_left_behind(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+) {
+    kills_the_group_left_behind(Reap::ForeignSeenByWait, Teardown::FinishElevated).await;
+}
+
+#[skuld::test]
+async fn a_drop_after_a_foreign_reap_seen_by_try_wait_below_6_9_sends_nothing_to_the_group() {
+    below_6_9_sends_nothing_to_the_group(Reap::ForeignSeenByTryWait, Teardown::Drop).await;
+}
+
+#[skuld::test]
+async fn a_failed_elevated_spawns_cleanup_after_a_foreign_reap_seen_by_try_wait_below_6_9_sends_nothing_to_the_group() {
+    below_6_9_sends_nothing_to_the_group(Reap::ForeignSeenByTryWait, Teardown::FinishElevated).await;
+}
+
+#[skuld::test]
+async fn a_drop_after_a_foreign_reap_seen_by_wait_below_6_9_sends_nothing_to_the_group() {
+    below_6_9_sends_nothing_to_the_group(Reap::ForeignSeenByWait, Teardown::Drop).await;
+}
+
+#[skuld::test]
+async fn a_failed_elevated_spawns_cleanup_after_a_foreign_reap_seen_by_wait_below_6_9_sends_nothing_to_the_group() {
+    below_6_9_sends_nothing_to_the_group(Reap::ForeignSeenByWait, Teardown::FinishElevated).await;
+}
+
+#[skuld::test]
+async fn a_drop_after_a_foreign_reap_seen_by_try_wait_sends_nothing_to_an_empty_group_and_reports_no_skip(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+) {
+    sends_nothing_to_an_empty_group_and_reports_no_skip(Reap::ForeignSeenByTryWait, Teardown::Drop).await;
+}
+
+#[skuld::test]
+async fn a_failed_elevated_spawns_cleanup_after_a_foreign_reap_seen_by_try_wait_sends_nothing_to_an_empty_group_and_reports_no_skip(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+) {
+    sends_nothing_to_an_empty_group_and_reports_no_skip(Reap::ForeignSeenByTryWait, Teardown::FinishElevated).await;
+}
+
+#[skuld::test]
+async fn a_drop_after_a_foreign_reap_seen_by_wait_sends_nothing_to_an_empty_group_and_reports_no_skip(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+) {
+    sends_nothing_to_an_empty_group_and_reports_no_skip(Reap::ForeignSeenByWait, Teardown::Drop).await;
+}
+
+#[skuld::test]
+async fn a_failed_elevated_spawns_cleanup_after_a_foreign_reap_seen_by_wait_sends_nothing_to_an_empty_group_and_reports_no_skip(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+) {
+    sends_nothing_to_an_empty_group_and_reports_no_skip(Reap::ForeignSeenByWait, Teardown::FinishElevated).await;
 }
