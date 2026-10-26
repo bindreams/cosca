@@ -1180,7 +1180,8 @@ pub(crate) mod fault {
 /// root. See [`Command::kill_on_drop`](crate::Command::kill_on_drop) for the rest.
 ///
 /// Once the root is reaped the drop skips kills named by its number and warns; see
-/// [`Command::kill_on_drop`](crate::Command::kill_on_drop).
+/// [`Command::kill_on_drop`](crate::Command::kill_on_drop). On Linux 6.9+ a process
+/// group is decided by the root's pidfd instead: killed while it has a member left.
 ///
 /// An elevated child behind a front (see [`Child::kill`]) gets no signal of its own while it runs.
 /// In a cgroup that holds it, the tree's kill ends it and the drop reaps it. Otherwise, or when
@@ -1251,8 +1252,9 @@ impl Child {
     /// handle cannot say: the handle's own answer (`RootState`), or the number no longer reading
     /// as this root. Each send by the group's number checks the root again right before it; a foreign
     /// reap between that check and its send is not seen, and the send then reaches whatever process
-    /// holds the number. An unreaped root stays a zombie, pinning its
-    /// number, until `teardown_on_drop`.
+    /// holds the number. On Linux 6.9+ the root's pidfd decides a process group instead
+    /// ([`Attached::hard_kill_for_drop`](crate::containment::Attached::hard_kill_for_drop)). An
+    /// unreaped root stays a zombie, pinning its number, until `teardown_on_drop`.
     fn drop_unix(&mut self) -> crate::error::ChildFate {
         use crate::child::drop_report::DropReport;
         use crate::error::ChildFate;

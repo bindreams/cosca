@@ -105,8 +105,10 @@ pub(crate) fn group_number_holds(pid: RawPid, state: (RootState, bool)) -> Resul
 /// each send by its number is checked the same way ([`GroupRoot::check`]). A reaped root's group with
 /// no member left is [`RootNumber::GroupGone`]. A root its handle cannot answer for, whose group has
 /// no member, may have left the group alive, so it keeps `number`; so does a kernel that cannot say.
+/// A drop and a failed spawn's cleanup take the same decision
+/// ([`Attached::hard_kill_for_drop`](crate::containment::Attached::hard_kill_for_drop)).
 #[cfg(target_os = "linux")]
-fn through_the_pidfd(attached: &Attached, number: RootNumber, group: &GroupRoot<'_>) -> RootNumber {
+pub(crate) fn through_the_pidfd(attached: &Attached, number: RootNumber, group: &GroupRoot<'_>) -> RootNumber {
     let RootNumber::MayNameAnother { why, exact_root } = &number else {
         return number;
     };

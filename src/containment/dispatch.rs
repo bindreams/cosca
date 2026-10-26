@@ -343,6 +343,19 @@ impl TreeSignal {
     }
 }
 
+/// What a drop's kill does to the tree ([`Attached::drop_reach`]).
+#[cfg(unix)]
+enum DropReach {
+    /// Kill it as usual.
+    Kill,
+    /// Linux 6.9+: the root is reaped, and its pidfd shows its process group has no member left:
+    /// nothing to kill.
+    #[cfg(target_os = "linux")]
+    GroupGone,
+    /// Skip what names the tree by the root's number, which this says.
+    Skip(String),
+}
+
 /// What [`Attached::hard_kill_for_drop`] did to the tree.
 #[cfg(unix)]
 pub(crate) struct DropKill {
@@ -631,7 +644,8 @@ impl Attached {
     /// so no channel that names the tree by that number may run: not the `killpg`, not a ppid walk
     /// from the root's pid, not a kill of the root by that pid. Each could hit an unrelated process
     /// that reused the number. A macOS fd marker still sweeps its marker holders, which are named
-    /// by identity. Cgroup and Job Object never skip.
+    /// by identity. Cgroup and Job Object never skip. On Linux 6.9+ a process group is decided by
+    /// the root's pidfd instead, as a tree call decides it ([`DropReach`]).
     ///
     /// `view` is one look at the root, taken right before this call. Each send by the group's number
     /// after it checks the root again right before it
@@ -644,11 +658,21 @@ impl Attached {
     /// [`DropKill::skipped`], for the drop's one warn.
     #[cfg(unix)]
     pub(crate) fn hard_kill_for_drop(&self, view: &DropView, root: &crate::containment::GroupRoot<'_>) -> DropKill {
-        let Some(skipped) = view.skipped_action(self) else {
-            return DropKill {
-                result: self.hard_kill(root),
-                skipped: None,
-            };
+        let skipped = match self.drop_reach(view, root) {
+            DropReach::Kill => {
+                return DropKill {
+                    result: self.hard_kill(root),
+                    skipped: None,
+                };
+            }
+            #[cfg(target_os = "linux")]
+            DropReach::GroupGone => {
+                return DropKill {
+                    result: Ok(()),
+                    skipped: None,
+                };
+            }
+            DropReach::Skip(skipped) => skipped,
         };
         let why = view.why_number_untrusted();
         let left_behind = if view.tree_killed {
@@ -673,6 +697,41 @@ impl Attached {
             result,
             skipped: left_behind,
         }
+    }
+
+    /// What a drop, or a failed spawn's cleanup, does to the tree after its look at the root
+    /// (`view`). A root whose number is trusted, or a mechanism that does not name the tree by it,
+    /// is killed as usual. On Linux 6.9+ a process group whose root's number is not trusted is
+    /// decided by the root's pidfd, exactly as a tree call decides it
+    /// ([`through_the_pidfd`](crate::child::tree_call::through_the_pidfd)): killed while the group
+    /// has a member, whoever reaped the root, and gone once a reaped root's group has none.
+    /// Otherwise, and below 6.9 and on macOS, what names the tree by the root's number is skipped.
+    #[cfg(unix)]
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables, reason = "only Linux has a pidfd"))]
+    fn drop_reach(&self, view: &DropView, root: &crate::containment::GroupRoot<'_>) -> DropReach {
+        let Some(skipped) = view.skipped_action(self) else {
+            return DropReach::Kill;
+        };
+        #[cfg(target_os = "linux")]
+        {
+            use crate::child::tree_call::{through_the_pidfd, RootNumber};
+            let why = view.why_number_untrusted();
+            let number = RootNumber::MayNameAnother {
+                exact_root: matches!(view.root, RootView::Unknown(_)),
+                why: why.clone(),
+            };
+            match through_the_pidfd(self, number, root) {
+                RootNumber::Trusted => return DropReach::Kill,
+                RootNumber::GroupGone => {
+                    log::debug!(
+                        "Child::drop: {why}, and its pidfd shows its process group has no member left, so nothing is sent"
+                    );
+                    return DropReach::GroupGone;
+                }
+                _ => {}
+            }
+        }
+        DropReach::Skip(skipped)
     }
 
     /// A tree path's signal while the root's number cannot be trusted (`root` is `Unpinned` or
@@ -790,7 +849,9 @@ impl Attached {
     /// root may already be reaped, or its handle could not say: then nothing that names the tree by
     /// the root's number runs (see [`hard_kill_for_drop`](Self::hard_kill_for_drop)), the tree is
     /// not marked killed, and why and what was skipped is returned as `Ok(Some(note))`. Otherwise
-    /// the kill runs and is `Ok(None)` or its error.
+    /// the kill runs and is `Ok(None)` or its error. On Linux 6.9+ the root's pidfd decides a
+    /// process group ([`DropReach`]): one with a member left is killed, and one with none is marked
+    /// killed, with `Ok(None)`.
     #[cfg(unix)]
     pub(crate) fn hard_kill_marking_unless_reaped(
         &self,
@@ -798,8 +859,14 @@ impl Attached {
         killed: &TreeKilled,
         root: &crate::containment::GroupRoot<'_>,
     ) -> Result<Option<String>, crate::error::Error> {
-        let Some(skipped) = view.skipped_action(self) else {
-            return self.hard_kill_marking(killed, root).map(|()| None);
+        let skipped = match self.drop_reach(view, root) {
+            DropReach::Kill => return self.hard_kill_marking(killed, root).map(|()| None),
+            #[cfg(target_os = "linux")]
+            DropReach::GroupGone => {
+                killed.mark();
+                return Ok(None);
+            }
+            DropReach::Skip(skipped) => skipped,
         };
         match self {
             #[cfg(target_os = "macos")]

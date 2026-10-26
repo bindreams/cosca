@@ -196,7 +196,9 @@ impl Child {
     /// separately. The root may already be reaped: when it is (this handle's own reap, the number
     /// no longer reading as the root, or the child's own handle showing it reaped), nothing that
     /// names the tree by the root's number runs, and why and what was skipped is returned as
-    /// `Ok(Some(note))`. The same when the handle could not say (`RootState::Unknown`).
+    /// `Ok(Some(note))`. The same when the handle could not say (`RootState::Unknown`). On Linux
+    /// 6.9+ the root's pidfd decides a process group instead
+    /// ([`Attached::hard_kill_marking_unless_reaped`](crate::containment::Attached::hard_kill_marking_unless_reaped)).
     #[cfg(unix)]
     pub(super) fn kill_tree_members_unless_reaped(
         &self,
@@ -1316,12 +1318,14 @@ impl Child {
 /// front if it is in the leaf. cosca does not wait for the front; tokio reaps it once it exits.
 ///
 /// Once the root is reaped the drop skips kills named by its number and warns; see
-/// [`Command::kill_on_drop`](crate::tokio::Command::kill_on_drop). A root reaped outside this
-/// handle also makes the drop forget tokio's `Child`, armed or not, so tokio cannot reap by that
-/// number. The evidence is the number no longer reading as this root, or the child's own handle (on
-/// Linux its pidfd, on macOS the pid's unique id) showing it reaped. The handle is asked before the
-/// signals, so a number-named tree kill is skipped, and again after them, for a reap that lands in
-/// between. On macOS a child with no unique id, or whose peek fails, cannot be shown to be ours and
+/// [`Command::kill_on_drop`](crate::tokio::Command::kill_on_drop). On Linux 6.9+ a process
+/// group is decided by the root's pidfd instead: killed while it has a member left.
+///
+/// A root reaped outside this handle also makes the drop forget tokio's `Child`, armed or not, so
+/// tokio cannot reap by that number. The evidence is the number no longer reading as this root, or
+/// the child's own handle (on Linux its pidfd, on macOS the pid's unique id) showing it reaped. The
+/// handle is asked before the signals, so a number-named tree kill is skipped, and again after
+/// them, for a reap that lands in between. On macOS a child with no unique id, or whose peek fails, cannot be shown to be ours and
 /// is forgotten too.
 ///
 /// # Known limitation: `fork()` without `exec`
@@ -1556,7 +1560,8 @@ fn signal_on_drop(
     // this handle's own state, or the number no longer reading as this root (tokio's state cannot
     // see a foreign reap until it is polled). Each send by the group's number checks the root again
     // right before it; a foreign reap between that check and its send is not seen, and the send then
-    // reaches whatever process holds the number. Tokio's
+    // reaches whatever process holds the number. On Linux 6.9+ the root's pidfd decides a process
+    // group instead (`Attached::hard_kill_for_drop`). Tokio's
     // orphan queue reaps by number afterwards, and may collect another child of this process that
     // took the number.
     #[cfg(unix)]

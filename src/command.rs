@@ -489,7 +489,13 @@ impl Command {
     /// [`kill_tree`](crate::Child::kill_tree) then [`wait_tree`](crate::Child::wait_tree).
     ///
     /// **Once the root has been reaped, the drop does not kill by the root's number, and logs a
-    /// `warn` naming what it skipped.** The root is reaped by [`wait`](crate::Child::wait), by a
+    /// `warn` naming what it skipped.** On Linux 6.9+ a process group is the exception: the root's
+    /// pidfd names the group exactly, whoever reaped the root, so the drop kills the group while it
+    /// has a member left, and sends nothing and warns of nothing once it has none. The same holds
+    /// when the root's handle cannot say whether it was reaped. The rest of this paragraph is about
+    /// other mechanisms, kernels before 6.9 and macOS.
+    ///
+    /// The root is reaped by [`wait`](crate::Child::wait), by a
     /// reaper outside the handle, or (on the sync handle) by the spawn itself, which reaps a root
     /// that has already exited. Nothing pins the number after the reap, so a `killpg` to it, or a
     /// walk of the process table from it, could hit an unrelated process that reused it. That
@@ -574,8 +580,9 @@ impl Command {
     ///
     /// # A child reaped by something else
     /// Another reaper in the process (`SIGCHLD` set to `SIG_IGN`, `waitpid(-1, …)`) may reap the
-    /// child. A cgroup kill stays exact (only the exit status is lost). Kills named by the root's pid
-    /// (a process group; a macOS fd marker's group and walk) are skipped on evidence of a foreign
+    /// child. A cgroup kill stays exact (only the exit status is lost), and so, on Linux 6.9+, does a
+    /// process group's, through the root's pidfd. Below 6.9 and on macOS, kills named by the root's
+    /// pid (a process group; a macOS fd marker's group and walk) are skipped on evidence of a foreign
     /// reap, and [`kill_tree`](crate::Child::kill_tree),
     /// [`terminate_tree`](crate::Child::terminate_tree) and
     /// [`graceful_shutdown_tree`](crate::Child::graceful_shutdown_tree) return
