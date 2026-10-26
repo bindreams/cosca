@@ -263,18 +263,20 @@ fn an_abandoned_child_reaped_elsewhere_after_its_group_kill_is_killed(#[fixture(
 }
 
 /// Where the kernel refuses `PIDFD_SIGNAL_PROCESS_GROUP` (before 6.9), the group kill of a child
-/// outside its leaf goes by its number only right after a check that the child is still unreaped.
-/// Mutants: "no check before the group kill by number", "`EINVAL` ends the group kill".
+/// outside its leaf goes by its number only right after a check that the child is still unreaped,
+/// and kills its member. Mutants: "no check before the group kill by number", "`EINVAL` ends the
+/// group kill", "the group kill by number is not made".
 #[skuld::test]
 fn an_abandoned_childs_group_kill_by_number_follows_its_own_check() {
     use crate::send_log::{GroupStep, Route};
-    let child = paused_group_leader();
+    let (child, to_member, from_member) = leader_with_member(false);
     let received = received(child, Some(PlacementReport::WriteFailed(libc::EBADF)));
     let capture = crate::send_log::Capture::start();
     let refused = crate::containment::unix::fault::refuse_pidfd_group_flag();
 
     assert_eq!(end_child(&received), ChildFate::Killed);
     drop(refused);
+    assert_eq!(member_output(to_member, from_member), "", "the member was killed");
     assert_eq!(
         capture.group_steps(),
         [
@@ -332,11 +334,12 @@ fn an_abandoned_child_reaped_before_its_group_kill_by_number_is_not_sent_it() {
     assert_eq!(fate, ChildFate::Gone);
 }
 
-/// A forked group leader that forked a member into its group and exited, as a child that exec'd
-/// outside its leaf may. The member blocks reading the returned writer's pipe; once that closes it
-/// writes `survived` to the returned reader's pipe and exits, so a member a kill missed is seen as
-/// that marker, never as a hang.
-fn exited_leader_with_member() -> (KillOnDrop, std::io::PipeWriter, std::io::PipeReader) {
+/// A forked group leader that forked a member into its group, as a child that exec'd outside its
+/// leaf may, then exited if `leader_exits`, else paused until killed. The member blocks reading the
+/// returned writer's pipe; once that closes it writes `survived` to the returned reader's pipe and
+/// exits, so a member a kill missed is seen as that marker, never as a hang. Returns once the member
+/// exists.
+fn leader_with_member(leader_exits: bool) -> (KillOnDrop, std::io::PipeWriter, std::io::PipeReader) {
     use std::os::fd::AsRawFd;
     let (from_test, to_member) = std::io::pipe().expect("pipe");
     let (from_member, to_test) = std::io::pipe().expect("pipe");
@@ -359,13 +362,21 @@ fn exited_leader_with_member() -> (KillOnDrop, std::io::PipeWriter, std::io::Pip
                 libc::write(output, b"survived".as_ptr().cast(), 8);
                 libc::_exit(0);
             }
+            libc::write(output, b"r".as_ptr().cast(), 1);
+            while !leader_exits {
+                libc::pause();
+            }
         }
     });
     drop((from_test, to_test));
+    let mut from_member = from_member;
+    let mut ready = [0u8; 1];
+    std::io::Read::read_exact(&mut from_member, &mut ready).expect("the member exists");
+    assert_eq!(&ready, b"r");
     (leader, to_member, from_member)
 }
 
-/// What the member of [`exited_leader_with_member`] wrote once its pipe closed: `survived`, or
+/// What the member of [`leader_with_member`] wrote once its pipe closed: `survived`, or
 /// nothing if it was killed.
 fn member_output(to_member: std::io::PipeWriter, mut from_member: std::io::PipeReader) -> String {
     drop(to_member);
@@ -380,7 +391,7 @@ fn member_output(to_member: std::io::PipeWriter, mut from_member: std::io::PipeR
 #[skuld::test]
 fn an_abandoned_child_reaped_before_the_look_has_its_group_killed(#[fixture(pidfd_group_signal)] _group: &Group) {
     use crate::send_log::{GroupStep, Route};
-    let (leader, to_member, from_member) = exited_leader_with_member();
+    let (leader, to_member, from_member) = leader_with_member(true);
     let received = received(leader, Some(PlacementReport::WriteFailed(libc::EBADF)));
     crate::test_child::reaped_elsewhere::reap_behind(received.pid.expect("a pid"));
     let capture = crate::send_log::Capture::start();
@@ -399,7 +410,7 @@ fn an_abandoned_child_reaped_before_the_look_has_its_group_killed(#[fixture(pidf
 #[skuld::test]
 fn an_abandoned_child_reaped_before_the_look_gets_no_group_kill_by_number() {
     use crate::send_log::{GroupStep, Route};
-    let (leader, to_member, from_member) = exited_leader_with_member();
+    let (leader, to_member, from_member) = leader_with_member(true);
     let received = received(leader, Some(PlacementReport::WriteFailed(libc::EBADF)));
     crate::test_child::reaped_elsewhere::reap_behind(received.pid.expect("a pid"));
     let capture = crate::send_log::Capture::start();

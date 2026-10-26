@@ -1300,13 +1300,13 @@ fn kill_group(handle: &std::os::fd::OwnedFd, received: &Received, pid: rustix::p
     if !still_unreaped_right_before_a_group_send(received, pid) {
         return Err(rustix::io::Errno::SRCH);
     }
-    let sent = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
-    #[cfg(test)]
-    crate::send_log::record_group(crate::send_log::GroupStep::Group(
-        crate::send_log::Route::Number,
-        libc::SIGKILL,
-    ));
-    sent
+    use crate::containment::unix::{send_signal, Route, Target};
+    send_signal(
+        Target::Group(Route::Number),
+        nix::sys::signal::Signal::SIGKILL,
+        |signal| nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pid.as_raw_nonzero().get()), signal),
+    )
+    .map_err(|e| rustix::io::Errno::from_raw_os_error(e as i32))
 }
 
 /// [`still_unreaped`], as the check right before a group send by `pid`.

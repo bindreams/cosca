@@ -84,7 +84,7 @@ fn each_send_by_the_group_number_has_its_own_check_right_before_it() {
     let resent: Vec<u32> = steps
         .iter()
         .filter_map(|s| match s {
-            GroupStep::Member(_, pid) => Some(*pid),
+            GroupStep::Member(_, pid, _) => Some(*pid),
             _ => None,
         })
         .collect();
@@ -227,4 +227,30 @@ fn the_leader_signal_goes_through_the_root_pidfd() {
     assert_each_send_by_number_follows_its_check(&steps);
     let status = child.wait().expect("reap the leader");
     assert_eq!(status.signal(), Some(libc::SIGKILL), "got {status:?}");
+}
+
+/// After a refused group send, a root with no pidfd gets the leader's `SIGTERM` by its number,
+/// right after a check, and it ends the leader. Mutant: "the leader's signal by number is not made"
+/// (the leader then exits once its members end at their stdin's EOF).
+#[skuld::test]
+fn term_group_ends_the_leader_by_its_number_when_the_group_send_is_refused() {
+    let (mut child, stdin, _) = group_of_three();
+    let root = GroupRoot::trusted_for_test();
+    let capture = crate::send_log::Capture::start();
+    let refused = super::fault::refuse_group_sends();
+    let result = super::term_group(child.id() as i32, &root);
+    drop(refused);
+    let steps = capture.group_steps();
+    drop(stdin);
+    let status = child.wait().expect("reap the leader");
+
+    assert_eq!(status.signal(), Some(libc::SIGTERM), "got {status:?}");
+    assert!(
+        steps
+            .iter()
+            .any(|s| matches!(s, GroupStep::Leader(Route::Number, libc::SIGTERM))),
+        "{steps:?}"
+    );
+    assert_each_send_by_number_follows_its_check(&steps);
+    result.expect("term_group on an owned group");
 }

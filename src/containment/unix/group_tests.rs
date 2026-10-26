@@ -417,17 +417,27 @@ fn a_transient_pidfd_open_failure_falls_back_to_kill_naming_the_syscall() {
 }
 
 /// A member whose `pidfd_open` fails (`EMFILE`) is resent its kill by its pid only right after a
-/// check of the root, and not at all when that check fails. Mutant: "the by-number fallback skips
-/// the root's check".
+/// check of the root, and not at all when that check fails. Mutants: "the by-number fallback skips
+/// the root's check", "the resend by number is not made" (the member then ends at its gate's EOF,
+/// unkilled).
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn the_by_number_fallback_resends_only_after_a_check_of_the_root() {
-    use crate::containment::cgroup::test_support::{block_on, fork_running};
+    use crate::containment::cgroup::test_support::fork_running;
     use crate::send_log::{Capture, GroupStep, Route};
+    use std::os::fd::AsRawFd as _;
 
     let (gate_r, gate_w) = std::io::pipe().expect("pipe");
-    let gate_r_fd = std::os::fd::AsRawFd::as_raw_fd(&gate_r);
-    let child = fork_running(|| block_on(gate_r_fd));
+    let (gate_r_fd, gate_w_fd) = (gate_r.as_raw_fd(), gate_w.as_raw_fd());
+    // Waits until the test's end of the gate closes, then exits.
+    let child = fork_running(|| {
+        let mut byte = 0u8;
+        // SAFETY: async-signal-safe syscalls on fds this process holds.
+        unsafe {
+            libc::close(gate_w_fd);
+            while libc::read(gate_r_fd, (&raw mut byte).cast(), 1) != 0 {}
+        }
+    });
     let id = ProcessId::of(child.pid()).found().expect("the live child resolves");
     let resend = |check: &dyn Fn() -> Result<(), String>| {
         let root = crate::containment::GroupRoot::new(None, check);
@@ -447,7 +457,15 @@ fn the_by_number_fallback_resends_only_after_a_check_of_the_root() {
     assert!(matches!(sent, super::Reached::Yes), "got {sent:?}");
     assert_eq!(
         sent_steps,
-        [GroupStep::Check, GroupStep::Member(Route::Number, child.pid())]
+        [
+            GroupStep::Check,
+            GroupStep::Member(Route::Number, child.pid(), libc::SIGKILL)
+        ]
+    );
+    let status = crate::containment::cgroup::test_support::reap_status(child.defuse());
+    assert!(
+        libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL,
+        "the resend killed the member: status {status:#x}"
     );
 }
 

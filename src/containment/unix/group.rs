@@ -397,18 +397,15 @@ fn check_or_signal(
         log::warn!("containment::unix::group: pid {pid} is not a single-process signal target");
         return Reached::Unknown;
     };
-    #[cfg(test)]
-    if signal.is_some() {
-        crate::send_log::record_group(crate::send_log::GroupStep::Member(crate::send_log::Route::Number, pid));
-    }
-    #[cfg(test)]
-    let sent = if signal.is_none() && fault::probes_refused() {
-        Err(nix::errno::Errno::EPERM)
-    } else {
-        nix::sys::signal::kill(nix::unistd::Pid::from_raw(target), signal)
+    let target = nix::unistd::Pid::from_raw(target);
+    let sent = match signal {
+        Some(signal) => super::send_signal(super::Target::Member(super::Route::Number, pid), signal, |signal| {
+            nix::sys::signal::kill(target, signal)
+        }),
+        #[cfg(test)]
+        None if fault::probes_refused() => Err(nix::errno::Errno::EPERM),
+        None => nix::sys::signal::kill(target, None),
     };
-    #[cfg(not(test))]
-    let sent = nix::sys::signal::kill(nix::unistd::Pid::from_raw(target), signal);
     match sent {
         Ok(()) | Err(nix::errno::Errno::ESRCH) => Reached::Yes,
         Err(nix::errno::Errno::EPERM) => {
@@ -498,8 +495,8 @@ fn check_or_signal_linux_sigkill(pid: RawPid, id: crate::identity::ProcessId, ro
             Err(reached) => reached,
             Ok(()) => match send_member_pidfd(&pidfd, id.pid()) {
                 Ok(()) => Reached::Yes,
-                Err(rustix::io::Errno::SRCH) => Reached::Yes, // exited between open and signal
-                Err(rustix::io::Errno::PERM) => {
+                Err(nix::errno::Errno::ESRCH) => Reached::Yes, // exited between open and signal
+                Err(nix::errno::Errno::EPERM) => {
                     log::debug!(
                         "containment::unix::group: pidfd_send_signal({}, KILL) refused: EPERM",
                         id.pid()
@@ -542,11 +539,13 @@ fn check_or_signal_linux_sigkill(pid: RawPid, id: crate::identity::ProcessId, ro
 
 /// `SIGKILL` through a member's own pidfd, `pid` the member's.
 #[cfg(target_os = "linux")]
-#[cfg_attr(not(test), allow(unused_variables, reason = "only the test log names the pid"))]
-fn send_member_pidfd(pidfd: &rustix::fd::OwnedFd, pid: RawPid) -> rustix::io::Result<()> {
-    #[cfg(test)]
-    crate::send_log::record_group(crate::send_log::GroupStep::Member(crate::send_log::Route::Pidfd, pid));
-    rustix::process::pidfd_send_signal(pidfd, rustix::process::Signal::KILL)
+fn send_member_pidfd(pidfd: &rustix::fd::OwnedFd, pid: RawPid) -> nix::Result<()> {
+    use std::os::fd::AsFd as _;
+    super::send_signal(
+        super::Target::Member(super::Route::Pidfd, pid),
+        Signal::SIGKILL,
+        |signal| super::pidfd_send_syscall(pidfd.as_fd(), signal as libc::c_int, 0),
+    )
 }
 
 /// "Ask forgiveness, one more time": re-confirm a `Survivor` verdict with a SECOND liveness
