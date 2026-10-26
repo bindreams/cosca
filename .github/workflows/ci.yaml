@@ -149,6 +149,32 @@ jobs:
         shell: bash
         run: .github/scripts/clippy.sh --feature-powerset --release
 
+  # cosca-path's Win32 conversions must hold under Windows 10's device-name rules as well as
+  # Windows 11's (`a\com1` is COM1 under the old rules). The test matrix's Windows runners all
+  # have the new rules; Server 2022 (build 20348) still has the old ones.
+  test-path-old-windows:
+    name: Test (cosca-path, windows-2022)
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
+        with:
+          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
+
+      - name: Build tests (cosca-path)
+        run: cargo nextest run --locked --no-run -p cosca-path --target x86_64-pc-windows-msvc --profile ci
+
+      - name: Run tests (cosca-path)
+        timeout-minutes: 8
+        run: ./.github/scripts/run-nextest.ps1 path cargo nextest run --locked -p cosca-path --target x86_64-pc-windows-msvc
+
   test:
     name: Test (${{ matrix.os }}/${{ matrix.arch }})
     strategy:
