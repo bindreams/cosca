@@ -115,9 +115,13 @@ impl Command {
     /// [`Command::contain`](crate::Command::contain) for a child reaped by something else.
     ///
     /// tokio itself can fail a spawn after forking the child, and then drops it neither killed nor
-    /// reaped, without reporting its pid. Only a child contained in a cgroup leaf
-    /// ([`Containment::CgroupV2`](crate::Containment::CgroupV2)) is still killed then; under any
-    /// other containment it keeps running.
+    /// reaped, without reporting its pid. On Linux the spawn's pidfd kills and reaps the root, and a
+    /// child contained in a cgroup leaf ([`Containment::CgroupV2`](crate::Containment::CgroupV2)) is
+    /// killed with its leaf. Without a leaf the root's process group is not killed yet, so a
+    /// process-group or session child's descendants keep running. On Linux 6.9+ the cleanup of a
+    /// spawn that fails at its identity read, of an elevated spawn that cannot finish, and of an
+    /// abandoned spawn whose cgroup leaf did not take its child do kill the group, through the
+    /// root's pidfd. Elsewhere this failure leaves the child running.
     pub fn contain(&mut self) -> &mut Command {
         self.inner.contain();
         self
@@ -251,7 +255,7 @@ impl Command {
         let mut child = self.spawn()?;
         match child.wait().await {
             Ok(status) => Ok(status),
-            Err(e) => Err(after_the_spawn(e, &mut child)),
+            Err(e) => Err(after_the_spawn(e, &mut child).await),
         }
     }
 
@@ -265,7 +269,7 @@ impl Command {
         let mut child = self.spawn()?;
         match child.communicate(None).await {
             Ok(output) => Ok(output),
-            Err(e) => Err(after_the_spawn(e, &mut child)),
+            Err(e) => Err(after_the_spawn(e, &mut child).await),
         }
     }
 
@@ -278,7 +282,7 @@ impl Command {
         let mut child = self.spawn()?;
         let out = match child.communicate(None).await {
             Ok(out) => out,
-            Err(e) => return Err(after_the_spawn(e, &mut child)),
+            Err(e) => return Err(after_the_spawn(e, &mut child).await),
         };
         // `communicate` collected the exit.
         String::from_utf8(out.stdout).map_err(|e| {
@@ -307,9 +311,10 @@ impl Command {
 }
 
 /// The error of a run-to-completion helper that failed after its spawn: the program may have
-/// started, and `child` is torn down now as its drop would, which says what became of it.
-fn after_the_spawn(error: Error, child: &mut Child) -> Error {
-    let fate = child.tear_down_now();
+/// started, and `child` is torn down now as its drop would, awaiting what the drop would block on.
+/// The teardown says what became of the child.
+pub(super) async fn after_the_spawn(error: Error, child: &mut Child) -> Error {
+    let fate = child.tear_down_awaiting().await;
     crate::child::spawn::after_the_spawn(error, fate, child.behind_wrapper())
 }
 

@@ -13,6 +13,11 @@ pub(crate) struct Prepared {
     /// to the process-group mechanism.
     #[cfg(target_os = "linux")]
     pub cgroup_leaf: Option<crate::containment::cgroup::CgroupLeaf>,
+    /// Set by a failed async spawn's teardown: this long into each of its waits for the leaf's
+    /// drain, a leaf dropped or abandoned here, before `attach` takes it, warns once and keeps
+    /// waiting (principle 2). The handle's armed drop warns for a leaf `attach` took.
+    #[cfg(all(target_os = "linux", feature = "tokio"))]
+    pub teardown_warn_after: Option<std::time::Duration>,
     /// The marker pipe for a contained macOS root. `None` for a nested member, an
     /// uncontained or elevation-derived spawn, or a failed install (which degrades to the
     /// process group).
@@ -70,6 +75,32 @@ impl Prepared {
         let _ = pid;
     }
 
+    /// Linux 6.9+: `SIGKILL`, through `child`'s pidfd, the process group of a spawn that failed
+    /// before its attach, while the group has a member. The pidfd names the group exactly, whoever
+    /// reaped the root. Only a root whose group is its containment is sent it: a Session root, or a
+    /// process-group root with no cgroup leaf or one its leaf did not take, as `attach` would decide.
+    /// The leaf's verdict is settled first ([`settle_verdict`](Self::settle_verdict)); a leaf that
+    /// took the child kills it with the leaf. `Err` is the kernel's refusal of the kill, with the
+    /// group's members possibly left running: `EINVAL` when it refuses the flag (expected below
+    /// 6.9), in which case nothing is sent, as the group's number may name another group.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn kill_group_before_attach(&self, child: ChildHandle<'_>) -> Result<(), nix::errno::Errno> {
+        use nix::errno::Errno;
+        let group_is_containment = self.is_root
+            && self.cgroup_leaf.as_ref().is_none_or(|leaf| !leaf.child_entered())
+            && matches!(self.mode, Some(mode) if !matches!(mode, ContainMode::TreeWalk));
+        if !group_is_containment {
+            return Ok(());
+        }
+        let pid = child.pid;
+        match crate::containment::unix::pidfd_signal_group(child.pidfd, nix::sys::signal::Signal::SIGKILL) {
+            Ok(()) => log::debug!("spawn teardown: sent SIGKILL to the process group of pid {pid} through its pidfd"),
+            Err(Errno::ESRCH) => log::debug!("spawn teardown: the process group of pid {pid} has no member left"),
+            Err(e) => return Err(e),
+        }
+        Ok(())
+    }
+
     /// End the placement exchange of a spawn that failed with no handle left on its child — tokio
     /// can drop one it forked — and say what became of that child. Without a leaf nothing can
     /// tell, so [`AbandonedChild::MaybeUnreachable`]. A child that is an elevation `front` is sent
@@ -92,7 +123,11 @@ impl Prepared {
         #[cfg(target_os = "linux")]
         if let Some(leaf) = self.cgroup_leaf.as_mut() {
             use crate::containment::cgroup::Abandoned;
-            return match leaf.abandon_before_verdict(front, handshake) {
+            #[cfg(feature = "tokio")]
+            let mut warn = crate::containment::cgroup::WarnAfter(self.teardown_warn_after);
+            #[cfg(not(feature = "tokio"))]
+            let mut warn = crate::containment::cgroup::NoWarn;
+            return match leaf.abandon_before_verdict(front, handshake, &mut warn) {
                 Abandoned::Ended => AbandonedChild::Ended,
                 Abandoned::MaybeUnreaped => AbandonedChild::MaybeUnreaped,
                 Abandoned::OutOfReach(why) => AbandonedChild::OutOfReach(why),
@@ -113,6 +148,15 @@ impl Prepared {
         }
         #[cfg(not(target_os = "linux"))]
         let _ = pid;
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "tokio"))]
+impl Drop for Prepared {
+    fn drop(&mut self) {
+        if let Some(leaf) = self.cgroup_leaf.take() {
+            leaf.drop_warning(&mut crate::containment::cgroup::WarnAfter(self.teardown_warn_after));
+        }
     }
 }
 
@@ -343,6 +387,19 @@ impl TreeSignal {
     }
 }
 
+/// What a drop's kill does to the tree ([`Attached::drop_reach`]).
+#[cfg(unix)]
+enum DropReach {
+    /// Kill it as usual.
+    Kill,
+    /// Linux 6.9+: the root is reaped, and its pidfd shows its process group has no member left:
+    /// nothing to kill.
+    #[cfg(target_os = "linux")]
+    GroupGone,
+    /// Skip what names the tree by the root's number, which this says.
+    Skip(String),
+}
+
 /// What [`Attached::hard_kill_for_drop`] did to the tree.
 #[cfg(unix)]
 pub(crate) struct DropKill {
@@ -439,15 +496,19 @@ impl Attached {
     }
 
     /// Hard-kill the contained tree (best-effort; already-gone is success).
-    pub(crate) fn hard_kill(&self) -> Result<(), crate::error::Error> {
-        self.hard_kill_report().0
+    pub(crate) fn hard_kill(&self, root: &crate::containment::GroupRoot<'_>) -> Result<(), crate::error::Error> {
+        self.hard_kill_report(root).0
     }
 
     /// [`hard_kill`](Self::hard_kill), and record in `killed` that the tree is gone when the kill
     /// was complete: `Ok`, and for a `TreeWalk` also a walk with no unresolved member. A kill
     /// that failed or left members behind marks nothing.
-    pub(crate) fn hard_kill_marking(&self, killed: &TreeKilled) -> Result<(), crate::error::Error> {
-        let (result, complete) = self.hard_kill_report();
+    pub(crate) fn hard_kill_marking(
+        &self,
+        killed: &TreeKilled,
+        root: &crate::containment::GroupRoot<'_>,
+    ) -> Result<(), crate::error::Error> {
+        let (result, complete) = self.hard_kill_report(root);
         if result.is_ok() && complete {
             killed.mark();
         }
@@ -455,17 +516,27 @@ impl Attached {
     }
 
     /// The kill's result, and whether it was complete. Only a `TreeWalk`'s `Ok` can be incomplete.
-    pub(crate) fn hard_kill_report(&self) -> (Result<(), crate::error::Error>, bool) {
+    ///
+    /// `root` is the root a send to a group named by its pid needs (see
+    /// [`GroupRoot`](crate::containment::GroupRoot)); every other mechanism ignores it.
+    #[cfg_attr(
+        not(unix),
+        allow(unused_variables, reason = "only Unix names a group by the root's pid")
+    )]
+    pub(crate) fn hard_kill_report(
+        &self,
+        root: &crate::containment::GroupRoot<'_>,
+    ) -> (Result<(), crate::error::Error>, bool) {
         let result = match self {
             Attached::None | Attached::Delegated => Ok(()),
             #[cfg(unix)]
-            Attached::ProcessGroup(pgid) => crate::containment::unix::kill_group(*pgid),
+            Attached::ProcessGroup(pgid) => crate::containment::unix::kill_group(*pgid, root),
             #[cfg(target_os = "linux")]
             Attached::Cgroup(leaf) => leaf.hard_kill(),
             #[cfg(windows)]
             Attached::JobObject(job) => job.hard_kill().map_err(Error::Io),
             #[cfg(target_os = "macos")]
-            Attached::FdMarker(m) => m.hard_kill(),
+            Attached::FdMarker(m) => m.hard_kill(root),
             Attached::TreeWalk(root) => {
                 return match crate::containment::treewalk::hard_kill(*root) {
                     Ok(complete) => (Ok(()), complete),
@@ -486,7 +557,11 @@ impl Attached {
     }
 
     /// Send the graceful termination signal to the group (signal-only).
-    pub(crate) fn terminate(&self, _child_pid: u32) -> Result<(), Error> {
+    #[cfg_attr(
+        not(unix),
+        allow(unused_variables, reason = "only Unix names a group by the root's pid")
+    )]
+    pub(crate) fn terminate(&self, _child_pid: u32, root: &crate::containment::GroupRoot<'_>) -> Result<(), Error> {
         match self {
             Attached::None | Attached::Delegated => {
                 debug_assert!(
@@ -500,13 +575,13 @@ impl Attached {
                 })
             }
             #[cfg(unix)]
-            Attached::ProcessGroup(pgid) => crate::containment::unix::term_group(*pgid),
+            Attached::ProcessGroup(pgid) => crate::containment::unix::term_group(*pgid, root),
             #[cfg(target_os = "linux")]
             Attached::Cgroup(leaf) => leaf.terminate().map_err(Error::Io),
             #[cfg(windows)]
             Attached::JobObject(_) => crate::containment::windows::terminate(_child_pid),
             #[cfg(target_os = "macos")]
-            Attached::FdMarker(m) => m.terminate(),
+            Attached::FdMarker(m) => m.terminate(root),
             Attached::TreeWalk(root) => crate::containment::treewalk::terminate(*root),
         }
     }
@@ -613,11 +688,11 @@ impl Attached {
     /// so no channel that names the tree by that number may run: not the `killpg`, not a ppid walk
     /// from the root's pid, not a kill of the root by that pid. Each could hit an unrelated process
     /// that reused the number. A macOS fd marker still sweeps its marker holders, which are named
-    /// by identity. Cgroup and Job Object never skip.
+    /// by identity. Cgroup and Job Object never skip. On Linux 6.9+ a process group is decided by
+    /// the root's pidfd instead, as a tree call decides it ([`DropReach`]).
     ///
-    /// `view` is one look at the root, taken right before this call: a reap by another reaper
-    /// after it is not seen, and what is sent by the number then goes to a number another process
-    /// may hold.
+    /// `view` is one look at the root, taken right before this call. Each send by the group's number
+    /// after it checks the root again, as for [`Child::kill_tree`](crate::Child::kill_tree).
     ///
     /// The same skip when the root's own handle could not say whether it is reaped
     /// (`RootState::Unknown`): nothing then shows the number still names the root.
@@ -625,12 +700,22 @@ impl Attached {
     /// Logs nothing above `debug`: what the skip left undone is returned in
     /// [`DropKill::skipped`], for the drop's one warn.
     #[cfg(unix)]
-    pub(crate) fn hard_kill_for_drop(&self, view: &DropView) -> DropKill {
-        let Some(skipped) = view.skipped_action(self) else {
-            return DropKill {
-                result: self.hard_kill(),
-                skipped: None,
-            };
+    pub(crate) fn hard_kill_for_drop(&self, view: &DropView, root: &crate::containment::GroupRoot<'_>) -> DropKill {
+        let skipped = match self.drop_reach(view, root) {
+            DropReach::Kill => {
+                return DropKill {
+                    result: self.hard_kill(root),
+                    skipped: None,
+                };
+            }
+            #[cfg(target_os = "linux")]
+            DropReach::GroupGone => {
+                return DropKill {
+                    result: Ok(()),
+                    skipped: None,
+                };
+            }
+            DropReach::Skip(skipped) => skipped,
         };
         let why = view.why_number_untrusted();
         let left_behind = if view.tree_killed {
@@ -655,6 +740,50 @@ impl Attached {
             result,
             skipped: left_behind,
         }
+    }
+
+    /// What a drop, or a failed spawn's cleanup, does to the tree after its look at the root
+    /// (`view`). A root whose number is trusted, or a mechanism that does not name the tree by it,
+    /// is killed as usual. On Linux 6.9+ a process group whose root's number is not trusted is
+    /// decided by the root's pidfd, exactly as a tree call decides it
+    /// ([`through_the_pidfd`](crate::child::tree_call::through_the_pidfd)): killed while the group
+    /// has a member, whoever reaped the root, and gone once a reaped root's group has none.
+    /// Otherwise, and below 6.9 and on macOS, what names the tree by the root's number is skipped.
+    #[cfg(unix)]
+    fn drop_reach(&self, view: &DropView, root: &crate::containment::GroupRoot<'_>) -> DropReach {
+        let reach = self.decide_drop_reach(view, root);
+        #[cfg(test)]
+        crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterRootLook);
+        reach
+    }
+
+    /// [`drop_reach`](Self::drop_reach)'s decision.
+    #[cfg(unix)]
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables, reason = "only Linux has a pidfd"))]
+    fn decide_drop_reach(&self, view: &DropView, root: &crate::containment::GroupRoot<'_>) -> DropReach {
+        let Some(skipped) = view.skipped_action(self) else {
+            return DropReach::Kill;
+        };
+        #[cfg(target_os = "linux")]
+        {
+            use crate::child::tree_call::{through_the_pidfd, RootNumber};
+            let why = view.why_number_untrusted();
+            let number = RootNumber::MayNameAnother {
+                exact_root: matches!(view.root, RootView::Unknown(_)),
+                why: why.clone(),
+            };
+            match through_the_pidfd(self, number, root) {
+                RootNumber::Trusted => return DropReach::Kill,
+                RootNumber::GroupGone => {
+                    log::debug!(
+                        "Child::drop: {why}, and its pidfd shows its process group has no member left, so nothing is sent"
+                    );
+                    return DropReach::GroupGone;
+                }
+                _ => {}
+            }
+        }
+        DropReach::Skip(skipped)
     }
 
     /// A tree path's signal while the root's number cannot be trusted (`root` is `Unpinned` or
@@ -746,13 +875,14 @@ impl Attached {
         &self,
         signal: TreeSignal,
         mark: Option<&TreeKilled>,
+        root: &crate::containment::GroupRoot<'_>,
     ) -> Option<Result<(), Error>> {
         let Attached::FdMarker(m) = self else {
             return None;
         };
         let result = match signal {
-            TreeSignal::Kill => m.hard_kill_group_and_holders(),
-            TreeSignal::Term => m.terminate_group_and_holders(),
+            TreeSignal::Kill => m.hard_kill_group_and_holders(root),
+            TreeSignal::Term => m.terminate_group_and_holders(root),
         };
         if let (Ok(()), TreeSignal::Kill, Some(killed)) = (&result, signal, mark) {
             killed.mark();
@@ -771,15 +901,24 @@ impl Attached {
     /// root may already be reaped, or its handle could not say: then nothing that names the tree by
     /// the root's number runs (see [`hard_kill_for_drop`](Self::hard_kill_for_drop)), the tree is
     /// not marked killed, and why and what was skipped is returned as `Ok(Some(note))`. Otherwise
-    /// the kill runs and is `Ok(None)` or its error.
+    /// the kill runs and is `Ok(None)` or its error. On Linux 6.9+ the root's pidfd decides a
+    /// process group ([`DropReach`]): one with a member left is killed, and one with none is marked
+    /// killed, with `Ok(None)`.
     #[cfg(unix)]
     pub(crate) fn hard_kill_marking_unless_reaped(
         &self,
         view: &DropView,
         killed: &TreeKilled,
+        root: &crate::containment::GroupRoot<'_>,
     ) -> Result<Option<String>, crate::error::Error> {
-        let Some(skipped) = view.skipped_action(self) else {
-            return self.hard_kill_marking(killed).map(|()| None);
+        let skipped = match self.drop_reach(view, root) {
+            DropReach::Kill => return self.hard_kill_marking(killed, root).map(|()| None),
+            #[cfg(target_os = "linux")]
+            DropReach::GroupGone => {
+                killed.mark();
+                return Ok(None);
+            }
+            DropReach::Skip(skipped) => skipped,
         };
         match self {
             #[cfg(target_os = "macos")]
@@ -809,9 +948,9 @@ impl Attached {
     }
 
     /// Give up the containment resource without waiting for anything: what an async
-    /// `Child::drop` does with it, where a plain drop could block. A cgroup leaf goes through
-    /// `CgroupLeaf::release_without_waiting`; every other mechanism drops in place, which is
-    /// bounded.
+    /// `Child::drop` that does not wait for the drain does with it, where a plain drop could
+    /// block. A cgroup leaf goes through `CgroupLeaf::release_without_waiting`; every other
+    /// mechanism drops in place, which is bounded.
     #[cfg(feature = "tokio")]
     pub(crate) fn release_without_waiting(self) {
         match self {
@@ -1026,6 +1165,8 @@ pub(crate) fn prepare(
             is_root: false,
             #[cfg(target_os = "linux")]
             cgroup_leaf: None,
+            #[cfg(all(target_os = "linux", feature = "tokio"))]
+            teardown_warn_after: None,
             #[cfg(target_os = "macos")]
             marker: None,
             #[cfg(windows)]
@@ -1066,6 +1207,8 @@ pub(crate) fn prepare(
                         mode,
                         is_root,
                         cgroup_leaf: None, // cgroup not used for Session
+                        #[cfg(all(target_os = "linux", feature = "tokio"))]
+                        teardown_warn_after: None,
                     });
                 }
                 UnixSetup::None => {
@@ -1075,6 +1218,8 @@ pub(crate) fn prepare(
                         mode,
                         is_root,
                         cgroup_leaf: None,
+                        #[cfg(all(target_os = "linux", feature = "tokio"))]
+                        teardown_warn_after: None,
                     });
                 }
                 UnixSetup::ProcessGroup => {
@@ -1115,12 +1260,16 @@ pub(crate) fn prepare(
                 mode,
                 is_root,
                 cgroup_leaf: leaf,
+                #[cfg(all(target_os = "linux", feature = "tokio"))]
+                teardown_warn_after: None,
             });
         }
         return Ok(Prepared {
             mode,
             is_root,
             cgroup_leaf: None,
+            #[cfg(all(target_os = "linux", feature = "tokio"))]
+            teardown_warn_after: None,
         });
     }
 
@@ -1165,6 +1314,8 @@ pub(crate) fn prepare(
         is_root,
         #[cfg(target_os = "linux")]
         cgroup_leaf: None,
+        #[cfg(all(target_os = "linux", feature = "tokio"))]
+        teardown_warn_after: None,
         #[cfg(target_os = "macos")]
         marker,
         #[cfg(windows)]
@@ -1212,6 +1363,7 @@ fn attach_tree(
     // Linux: session, or cgroup v2 / process group.
     #[cfg(target_os = "linux")]
     {
+        let mut prepared = prepared;
         if prepared.mode.is_some() {
             if prepared.is_root {
                 // TreeWalk root: no kernel container / process group; teardown is
@@ -1234,7 +1386,7 @@ fn attach_tree(
                 }
 
                 // Strongest: cgroup v2 if available, else process group.
-                if let Some(mut leaf) = prepared.cgroup_leaf {
+                if let Some(mut leaf) = prepared.cgroup_leaf.take() {
                     // The pre_exec write can fail (EBUSY — the "no internal processes" rule
                     // when the supervisor is itself an undelegated leaf). The child's own
                     // report of that write decides membership; re-reading cgroup.procs cannot,

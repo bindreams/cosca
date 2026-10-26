@@ -1079,7 +1079,10 @@ fn leaf_of(child: &crate::Child) -> &crate::containment::cgroup::CgroupLeaf {
 fn cgroup_a_killed_front_is_placed_in_its_leaf_by_its_pidfd(#[fixture(cgroup)] _group: &Group) {
     let (child, _stdin) = spawn_as(in_cgroup(cat()), SUDO);
     let pid = child.id().pid();
-    child.attached.hard_kill().expect("cgroup.kill");
+    child
+        .attached
+        .hard_kill(&crate::containment::GroupRoot::none())
+        .expect("cgroup.kill");
     crate::test_child::wait_until_zombie(pid);
     let hidden = crate::containment::cgroup::fault::hide_proc();
     let names = leaf_of(&child).names(pid, child.proc.pidfd());
@@ -1096,7 +1099,10 @@ fn cgroup_without_pidfd_info_a_front_is_placed_through_proc(#[fixture(cgroup)] _
     let _missing = crate::containment::cgroup::fault::miss_pidfd_info();
     let (killed, _stdin) = spawn_as(in_cgroup(cat()), SUDO);
     let pid = killed.id().pid();
-    killed.attached.hard_kill().expect("cgroup.kill");
+    killed
+        .attached
+        .hard_kill(&crate::containment::GroupRoot::none())
+        .expect("cgroup.kill");
     crate::test_child::wait_until_zombie(pid);
     assert!(leaf_of(&killed)
         .names(pid, killed.proc.pidfd())

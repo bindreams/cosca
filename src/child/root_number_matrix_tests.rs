@@ -669,7 +669,7 @@ async fn run_tokio(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
     }
     let mut forced = reap.force(child.id());
 
-    // An async teardown does not wait for the leaf to drain, so the cell removes it.
+    // A teardown that does not wait for the drain leaves the leaf, so the cell removes it.
     #[cfg(target_os = "linux")]
     let leaf = child
         .leaf_path_for_test()
@@ -730,7 +730,6 @@ async fn run_tokio(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
         .read_to_end(&mut rest)
         .await
         .expect("the root and the cat are gone, closing stderr");
-    // An async drop does not wait for the leaf to drain: it would leave the leaf behind.
     if mechanism.is_cgroup() {
         child.wait_tree().await.expect("the leaf drains");
     }
@@ -804,6 +803,8 @@ fn check_matrix(mechanisms: &[Mechanism]) {
 /// without `anchor_present`.
 #[skuld::test]
 fn tree_paths_send_nothing_by_the_root_number_after_a_reap() {
+    #[cfg(target_os = "linux")]
+    let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     check_matrix(&[
         Mechanism::Group,
         Mechanism::TreeWalk,

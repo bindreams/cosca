@@ -83,7 +83,7 @@ fn spawn_orphan_tree(mode: cosca::ContainMode) -> (cosca::Child, Member, Member)
     let mut child = cmd.spawn().expect("spawn the orphan tree");
 
     let mut lines = Vec::new();
-    let socks = common::accept_tree(&listener, &report, &mut child, |s| {
+    let socks = common::accept_tree(listener, report, &mut child, |s| {
         let mut line = String::new();
         BufReader::new(s.try_clone().expect("clone"))
             .read_line(&mut line)
@@ -228,7 +228,7 @@ async fn spawn_orphan_tree_async(mode: cosca::ContainMode) -> (cosca::tokio::Chi
     let (report, report_addr) = common::bind_async_listener();
     cmd.env(common::GC_PID_ADDR_ENV, report_addr);
     let mut child = cmd.spawn().expect("spawn the orphan tree (tokio)");
-    let watched = common::report_grandchild_async(&report, &mut child).await;
+    let watched = common::report_grandchild_async(report, &mut child).await;
 
     let mut root = None;
     let mut grand = None;
@@ -304,7 +304,7 @@ fn kill_tree_reaches_the_orphan_through_a_real_wide_fd_mapping() {
         .expect("spawn the orphan tree with a wide reserved-fd range");
 
     let mut lines = Vec::new();
-    let socks = common::accept_tree(&listener, &report, &mut child, |s| {
+    let socks = common::accept_tree(listener, report, &mut child, |s| {
         let mut line = String::new();
         BufReader::new(s.try_clone().expect("clone"))
             .read_line(&mut line)

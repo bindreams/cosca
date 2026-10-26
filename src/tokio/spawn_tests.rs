@@ -963,6 +963,8 @@ async fn a_failed_tree_kill_and_an_unknown_root_share_one_warn() {
 #[cfg(unix)]
 #[skuld::test]
 async fn finish_elevated_after_a_foreign_reap_sends_no_killpg_to_a_process_group() {
+    #[cfg(target_os = "linux")]
+    let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::tokio::test_runtime::assert_current_thread();
     let recorder = crate::containment::unix::fault::record_kill_group();
     let (stdin, writer) = crate::test_child::held_writer_stdin();

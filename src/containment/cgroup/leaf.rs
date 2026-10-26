@@ -229,8 +229,8 @@ pub(crate) struct CgroupLeaf {
     /// created outside the cgroup filesystem.
     cgroup_path: Option<String>,
     /// Whether the leaf is already dealt with, so `Drop` has nothing left to do: the spawn was
-    /// abandoned before its verdict, or an async `Drop` released it
-    /// ([`release_without_waiting`](Self::release_without_waiting)).
+    /// abandoned before its verdict, an async `Drop` released it
+    /// ([`release_without_waiting`](Self::release_without_waiting)), or it was torn down.
     pub(super) abandoned: bool,
     /// Whether the caller still wants cosca to manage the tree. Cleared by `disarm`, for
     /// `detach()` and `kill_on_drop(false)`. `Drop` kills only while this and `entered` both hold.
@@ -289,7 +289,7 @@ impl CgroupLeaf {
     }
 
     /// Whether the child reported entering this leaf, once the verdict is taken.
-    fn child_entered(&self) -> bool {
+    pub(crate) fn child_entered(&self) -> bool {
         debug_assert!(self.report.is_none(), "the verdict is not taken yet");
         self.entered
     }
@@ -669,17 +669,6 @@ impl CgroupLeaf {
         }
     }
 
-    /// Block until the leaf drains, on the watch held since creation.
-    fn block_until_drained(&mut self) -> Result<(), crate::error::Error> {
-        #[cfg(feature = "tokio")]
-        crate::bounded::assert_may_block("waiting for a cgroup leaf to drain");
-        // Stops and joins the pump first: the watch is then this `Drop`'s alone.
-        match self.watch.get_mut() {
-            Some(watch) => watch.wait(),
-            None => Ok(()),
-        }
-    }
-
     /// SIGTERM every pid currently listed in `cgroup.procs`.
     ///
     /// An already-gone leaf is `Ok`, on the same proof [`hard_kill`](Self::hard_kill) rests on
@@ -774,17 +763,25 @@ impl CgroupLeaf {
 #[cfg(target_os = "linux")]
 impl Drop for CgroupLeaf {
     fn drop(&mut self) {
+        self.tear_down(&mut NoWarn);
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl CgroupLeaf {
+    /// What [`Drop`] does, with `warn` for each wait for the drain; `Drop` does nothing after it.
+    fn tear_down(&mut self, warn: &mut dyn DrainWarn) {
         // The pump the leaf owns stops and is joined before anything else: the teardown below
         // uses the watch itself.
         self.watch.stop_pump();
         self.procs_fd = None;
         // Before the verdict — a spawn that failed, maybe after its fork — end the exchange.
         if self.report.is_some() {
-            if let Abandoned::OutOfReach(why) = self.abandon_before_verdict(false, None) {
+            if let Abandoned::OutOfReach(why) = self.abandon_before_verdict(false, None, warn) {
                 log::warn!("cgroup v2: {why}");
             }
         }
-        if self.abandoned {
+        if std::mem::replace(&mut self.abandoned, true) {
             return;
         }
         // Remove the leaf. If still occupied (e.g. hard_kill not yet called), fire cgroup.kill,
@@ -832,6 +829,7 @@ impl Drop for CgroupLeaf {
                 self.drain_and_remove(
                     false,
                     "after an explicit kill through a handle that opted out of Drop's own teardown",
+                    warn,
                 );
                 return;
             }
@@ -872,7 +870,7 @@ impl Drop for CgroupLeaf {
         // Armed: kill through the leaf, wait for it to drain, and only then remove it. A leaf
         // that is already gone left nothing behind.
         if !removed_after_drain(&first) {
-            self.drain_and_remove(false, "after its handle's teardown");
+            self.drain_and_remove(false, "after its handle's teardown", warn);
         }
     }
 }
@@ -928,7 +926,14 @@ impl CgroupLeaf {
     /// A child that is an elevation `front` (see [`crate::elevation::front`]) is sent no signal of
     /// its own, which would orphan its elevated program: it is killed through the leaf alone (see
     /// [`end_front`]).
-    pub(crate) fn abandon_before_verdict(&mut self, front: bool, handshake: Option<OwnedFd>) -> Abandoned {
+    ///
+    /// `warn` is for the wait for the leaf's drain.
+    pub(crate) fn abandon_before_verdict(
+        &mut self,
+        front: bool,
+        handshake: Option<OwnedFd>,
+        warn: &mut dyn DrainWarn,
+    ) -> Abandoned {
         let Some(channel) = self.report.take() else {
             return Abandoned::Ended;
         };
@@ -955,7 +960,7 @@ impl CgroupLeaf {
             if let Some(pid) = received.pid {
                 self.watch_front(pid);
             }
-            return self.abandon_front(&received);
+            return self.abandon_front(&received, warn);
         }
         // The child first, through its handle, whatever the leaf's own kill does: it may have left
         // the leaf, or never entered it.
@@ -965,6 +970,7 @@ impl CgroupLeaf {
             self.remove_killing_through(
                 through_leaf.as_ref().is_some_and(Result::is_ok),
                 "after its spawn was abandoned",
+                warn,
             );
         } else {
             self.remove_holding_nothing();
@@ -984,14 +990,14 @@ impl CgroupLeaf {
     /// [`abandon_before_verdict`](Self::abandon_before_verdict) for an elevation front: the leaf
     /// is killed through and removed as for any child, and the front itself is sent nothing. Its
     /// subtree is read first, so the front can still be placed in it once the leaf is gone.
-    fn abandon_front(&mut self, received: &Received) -> Abandoned {
+    fn abandon_front(&mut self, received: &Received, warn: &mut dyn DrainWarn) -> Abandoned {
         let subtree = self.subtree();
         if let Err(e) = &subtree {
             log::debug!("cgroup v2: an abandoned front's leaf subtree cannot be read ({e})");
         }
         if self.entered {
             let killed = self.hard_kill().is_ok();
-            self.remove_killing_through(killed, "after its spawn was abandoned");
+            self.remove_killing_through(killed, "after its spawn was abandoned", warn);
         } else {
             self.remove_holding_nothing();
         }
@@ -1008,23 +1014,24 @@ impl CgroupLeaf {
     /// Remove a leaf its child entered: killed through, drained, its empty child cgroups removed,
     /// then removed once, a failure reported (see [`drain_and_remove`](Self::drain_and_remove)). `killed`
     /// says whether the caller's own kill through it succeeded; `context` says what removal this
-    /// is, for the report of a leaf left behind.
-    fn remove_killing_through(&mut self, killed: bool, context: &str) {
+    /// is, for the report of a leaf left behind; `warn`, for the wait for the drain.
+    fn remove_killing_through(&mut self, killed: bool, context: &str, warn: &mut dyn DrainWarn) {
         match self.rmdir_leaf() {
             Ok(()) => {}
             Err(e) if removed_after_drain(&e) => {}
-            Err(_) => self.drain_and_remove(killed, context),
+            Err(_) => self.drain_and_remove(killed, context, warn),
         }
     }
 
     /// [`remove_killing_through`](Self::remove_killing_through) after an `rmdir` that failed.
     ///
-    /// Kills through the leaf, waits however long the drain takes (a [`DrainWatch`]), removes the
+    /// Kills through the leaf, waits however long the drain takes, with `warn`
+    /// ([`wait_drained_then_warn`](Self::wait_drained_then_warn)), removes the
     /// leaf's child cgroups, and makes one more `rmdir`. Any failure of that `rmdir` is final and
     /// reported: after the drain and the sweep, an `EBUSY` means something another party did
     /// since ([`LEFT_BEHIND_CAUSES`]), which another attempt would only make rarer, never
     /// impossible.
-    fn drain_and_remove(&mut self, killed: bool, context: &str) {
+    fn drain_and_remove(&mut self, killed: bool, context: &str, warn: &mut dyn DrainWarn) {
         if !killed {
             if let Err(e) = self.hard_kill() {
                 return warn_leaf_left_behind(
@@ -1033,7 +1040,7 @@ impl CgroupLeaf {
                 );
             }
         }
-        if let Err(e) = self.block_until_drained() {
+        if let Err(e) = self.wait_drained_then_warn(warn) {
             return warn_leaf_left_behind(
                 &self.leaf_path,
                 format_args!("rmdir failed {context}; its drain could not be watched ({e})"),
@@ -1113,10 +1120,11 @@ impl CgroupLeaf {
 /// its number has been reused since. An intent with no handle names nothing cosca may signal.
 ///
 /// A child that reported a failed placement exec'd outside the leaf, so what it forked is reached
-/// only as the process group it leads, killed by number after one look at the child through its
-/// handle and before the handle's kill. A reap by another reaper after that look is not seen, and
-/// the number may then name another group. A child in the leaf is killed with the leaf, and one
-/// that never reported never exec'd, so neither is sent anything by number.
+/// only as the process group it leads, killed before the handle's kill
+/// ([`kill_group_outside_leaf`]). A child reaped before the look still has its group killed through
+/// the handle while the group has a member, and is sent nothing by number. A child in the leaf is
+/// killed with the leaf, and one that never reported never exec'd, so neither is sent anything by
+/// number.
 ///
 /// A child its handle may not signal (`EPERM`) is handed to a background reaper, so it is reaped
 /// once it exits, however that comes.
@@ -1141,12 +1149,12 @@ fn end_child(received: &Received) -> ChildFate {
     };
     let id = || wait_id(received, pid);
     if !still_unreaped(received, pid) {
-        return ChildFate::Gone;
+        return end_reaped_child(handle, received, pid);
     }
     #[cfg(test)]
     fault::run_between_check_and_kill();
     let group = match received.report {
-        Some(PlacementReport::WriteFailed(_)) => Some(kill_group_outside_leaf(pid)),
+        Some(PlacementReport::WriteFailed(_)) => Some(kill_group_outside_leaf(handle, received, pid)),
         _ => None,
     };
     let group_killed = matches!(group, Some(Ok(true)));
@@ -1165,7 +1173,9 @@ fn end_child(received: &Received) -> ChildFate {
             ))
         }
         (_, Some(group)) => {
-            log::warn!("cgroup v2: could not kill an abandoned spawn's child's {group}");
+            log::warn!(
+                "cgroup v2: could not kill an abandoned spawn's child's {group}; its members may be left running"
+            );
             None
         }
         _ => None,
@@ -1216,6 +1226,24 @@ fn end_child(received: &Received) -> ChildFate {
     ChildFate::Killed
 }
 
+/// [`end_child`]'s answer for a child reaped before its look. One that exec'd outside its leaf may
+/// have left members in its process group, killed as [`kill_group_outside_leaf`] says: with the
+/// child reaped, nothing goes by the group's number, and a `warn` says the members may be left
+/// running. The child is `Gone` either way: no kill reached it.
+#[cfg(target_os = "linux")]
+fn end_reaped_child(handle: &std::os::fd::OwnedFd, received: &Received, pid: rustix::process::Pid) -> ChildFate {
+    if !matches!(received.report, Some(PlacementReport::WriteFailed(_))) {
+        return ChildFate::Gone;
+    }
+    if let Err(e) = kill_group_outside_leaf(handle, received, pid) {
+        log::warn!(
+            "cgroup v2: could not kill an abandoned spawn's child's process group {} ({e}); the child was already reaped, and the group's members may be left running",
+            rustix::process::Pid::as_raw(Some(pid))
+        );
+    }
+    ChildFate::Gone
+}
+
 /// `SIGKILL` an abandoned spawn's child through `handle`: the kernel takes a `/proc/<pid>`
 /// directory as a pidfd here.
 #[cfg(target_os = "linux")]
@@ -1230,39 +1258,62 @@ fn kill_through(handle: &std::os::fd::OwnedFd) -> rustix::io::Result<()> {
     rustix::process::pidfd_send_signal(handle, rustix::process::Signal::KILL)
 }
 
-/// Kill the process group an abandoned spawn's child leads, by its number `pid` (see
-/// [`end_child`]). Returns whether the kill was delivered (`false`: the group has no member left),
-/// or the error of a refused kill, for the child's one warn.
+/// Kill the process group an abandoned spawn's child leads (see [`end_child`]): through `handle`,
+/// which names the group exactly; by its number `pid` only where the kernel refuses that (expected
+/// below Linux 6.9), right after a check that the child is still unreaped. A reap by another reaper
+/// between that check and the kill is not seen, and the number may then name another group. Returns
+/// whether the kill was delivered (`false`: the group has no member left), or the refusal, for the
+/// child's one warn: the kernel's error, or that the flag was refused and the child is reaped, so
+/// nothing was sent.
 #[cfg(target_os = "linux")]
-fn kill_group_outside_leaf(pid: rustix::process::Pid) -> Result<bool, rustix::io::Errno> {
-    match kill_group(pid) {
+fn kill_group_outside_leaf(
+    handle: &std::os::fd::OwnedFd,
+    received: &Received,
+    pid: rustix::process::Pid,
+) -> Result<bool, crate::error::Error> {
+    match kill_group(handle, received, pid)? {
         Ok(()) => Ok(true),
-        Err(rustix::io::Errno::SRCH) => {
+        Err(nix::errno::Errno::ESRCH) => {
             let pid = rustix::process::Pid::as_raw(Some(pid));
-            log::debug!(
-                "cgroup v2: an abandoned spawn's child's process group {pid} has no member left (the child left \
-                 it, or was reaped elsewhere since the look)"
-            );
+            log::debug!("cgroup v2: an abandoned spawn's child's process group {pid} has no member left");
             Ok(false)
         }
-        Err(e) => Err(e),
+        Err(e) => Err(crate::error::Error::Io(e.into())),
     }
 }
 
-/// `SIGKILL` the process group `pid`.
+/// `SIGKILL` the process group the child `handle` names leads, through the shared group send
+/// ([`send_to_group`](crate::containment::unix::send_to_group)), whose check of the root is that
+/// the child is still unreaped. The kernel's answer, or why nothing was sent.
 #[cfg(target_os = "linux")]
-fn kill_group(pid: rustix::process::Pid) -> rustix::io::Result<()> {
+fn kill_group(
+    handle: &std::os::fd::OwnedFd,
+    received: &Received,
+    pid: rustix::process::Pid,
+) -> Result<nix::Result<()>, crate::error::Error> {
+    use std::os::fd::AsFd as _;
     #[cfg(test)]
     {
         fault::record_child_send(fault::ChildSend::Group);
         if fault::take_force_group_kill_denied() {
-            return Err(rustix::io::Errno::PERM);
+            return Ok(Err(nix::errno::Errno::EPERM));
         }
         if fault::take_force_group_kill_gone() {
-            return Err(rustix::io::Errno::SRCH);
+            return Ok(Err(nix::errno::Errno::ESRCH));
         }
     }
-    rustix::process::kill_process_group(pid, rustix::process::Signal::KILL)
+    let check = || {
+        if still_unreaped(received, pid) {
+            Ok(())
+        } else {
+            Err("the child is reaped".to_owned())
+        }
+    };
+    crate::containment::unix::send_to_group(
+        pid.as_raw_nonzero().get(),
+        nix::sys::signal::Signal::SIGKILL,
+        &crate::containment::GroupRoot::new(Some(handle.as_fd()), &check),
+    )
 }
 
 /// What names the child `received` names, `pid`, to its reaper: its pidfd, or — with its `/proc`
@@ -1791,6 +1842,12 @@ pub(crate) unsafe fn place_self_in_cgroup_pre_exec(procs_fd: RawFd, slot: Report
 #[cfg(all(feature = "tokio", target_os = "linux"))]
 #[path = "leaf/release.rs"]
 mod release;
+
+#[cfg(target_os = "linux")]
+#[path = "leaf/slow_drain.rs"]
+mod slow_drain;
+#[cfg(target_os = "linux")]
+pub(crate) use slow_drain::*;
 
 #[cfg(all(test, target_os = "linux"))]
 #[path = "leaf/end_front_tests.rs"]

@@ -155,6 +155,39 @@ impl DrainWatch {
             }
         }
     }
+
+    /// [`wait`](Self::wait), and `warn` runs once if the leaf is still populated at `until`. The wait
+    /// goes on, unbounded, after the warn: the time decides the message and nothing else. An error
+    /// ends the wait, before the warn or after it.
+    pub(crate) fn wait_warning(&mut self, until: Option<std::time::Instant>, warn: impl FnOnce()) -> Result<(), Error> {
+        use rustix::event::{poll, PollFd, PollFlags, Timespec};
+
+        let Some(until) = until else {
+            return self.wait();
+        };
+        let drained = crate::wait::rearm_until(Some(Some(until)), |remaining| {
+            if !self.populated()? {
+                return Ok(Some(()));
+            }
+            let timeout = remaining.map(crate::wait::clamp_block).map(|d| Timespec {
+                tv_sec: d.as_secs() as i64,
+                tv_nsec: d.subsec_nanos() as _,
+            });
+            let mut fds = [PollFd::from_borrowed_fd(self.fd.as_fd(), PollFlags::IN)];
+            match poll(&mut fds, timeout.as_ref()) {
+                Ok(_) => drop(self.consume()?),
+                // The round is re-armed against the real deadline.
+                Err(rustix::io::Errno::INTR) => {}
+                Err(e) => return Err(Error::Io(e.into())),
+            }
+            Ok(None)
+        })?;
+        if drained.is_some() || !self.populated()? {
+            return Ok(());
+        }
+        warn();
+        self.wait()
+    }
 }
 
 impl AsRawFd for DrainWatch {

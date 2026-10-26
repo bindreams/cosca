@@ -824,20 +824,22 @@ pub(crate) mod fault {
 
 use std::io;
 
+use crate::containment::GroupRoot;
 use crate::error::Error;
 use crate::identity::{ProcessId, Resolved};
 
 /// What a sweep may do.
-#[derive(Debug, Clone, Copy)]
-enum Scope {
-    /// Every channel: the group, the root's number, the ppid walk and the marker holders.
-    Full,
+#[derive(Clone, Copy)]
+enum Scope<'r> {
+    /// Every channel: the group, the root's number, the ppid walk and the marker holders. The group
+    /// is signalled as `root` allows.
+    Full(&'r GroupRoot<'r>),
     /// The marker holders alone, for a root whose number names no one reliably any more. `except`
     /// is a holder to leave alone: the root, when this process does not pin it.
     HoldersOnly { except: Option<ProcessId> },
     /// The group and the marker holders, for a root this process reaped whose pid names no process:
     /// the group lives while a member does, but a walk from the pid would find none of the tree.
-    GroupAndHolders,
+    GroupAndHolders(&'r GroupRoot<'r>),
 }
 
 /// The live marker for one contained tree.
@@ -1053,8 +1055,8 @@ impl Marker {
     /// particular `is_teardown_mechanism_failure` (this file), rely on that distinction
     /// surviving intact through this return value; see `sweep`'s own doc for where it is
     /// preserved.
-    pub(crate) fn hard_kill(&self) -> Result<(), Error> {
-        self.hard_kill_impl(Scope::Full)
+    pub(crate) fn hard_kill(&self, root: &GroupRoot<'_>) -> Result<(), Error> {
+        self.hard_kill_impl(Scope::Full(root))
     }
 
     /// [`hard_kill`](Self::hard_kill) through the marker-holder channel alone. For a caller whose
@@ -1074,11 +1076,11 @@ impl Marker {
     /// identity kill and no walk from the root's pid: for a root this process reaped, whose pid
     /// names no process. Its children were reparented at its exit, so a walk would find only a
     /// later process's children.
-    pub(crate) fn hard_kill_group_and_holders(&self) -> Result<(), Error> {
-        self.hard_kill_impl(Scope::GroupAndHolders)
+    pub(crate) fn hard_kill_group_and_holders(&self, root: &GroupRoot<'_>) -> Result<(), Error> {
+        self.hard_kill_impl(Scope::GroupAndHolders(root))
     }
 
-    fn hard_kill_impl(&self, scope: Scope) -> Result<(), Error> {
+    fn hard_kill_impl(&self, scope: Scope<'_>) -> Result<(), Error> {
         self.check_read_end_still_valid()?;
         let mut seen: std::collections::HashSet<ProcessId> = std::collections::HashSet::new();
         // Folds together across every pass — see `sweep_pass`'s doc for why an earlier pass's
@@ -1117,8 +1119,8 @@ impl Marker {
     /// `terminate_tree()` — a blocking API with no timeout — forever. One pass, matching
     /// `term_group`'s own cooperative, best-effort contract; `hard_kill` (`kill_tree`) is the
     /// guaranteed sweep.
-    pub(crate) fn terminate(&self) -> Result<(), Error> {
-        self.terminate_impl(Scope::Full)
+    pub(crate) fn terminate(&self, root: &GroupRoot<'_>) -> Result<(), Error> {
+        self.terminate_impl(Scope::Full(root))
     }
 
     /// [`terminate`](Self::terminate) through the marker-holder channel alone, as
@@ -1129,11 +1131,11 @@ impl Marker {
 
     /// [`terminate`](Self::terminate) through the group and the marker-holder channel, as
     /// [`hard_kill_group_and_holders`](Self::hard_kill_group_and_holders) does for the kill.
-    pub(crate) fn terminate_group_and_holders(&self) -> Result<(), Error> {
-        self.terminate_impl(Scope::GroupAndHolders)
+    pub(crate) fn terminate_group_and_holders(&self, root: &GroupRoot<'_>) -> Result<(), Error> {
+        self.terminate_impl(Scope::GroupAndHolders(root))
     }
 
-    fn terminate_impl(&self, scope: Scope) -> Result<(), Error> {
+    fn terminate_impl(&self, scope: Scope<'_>) -> Result<(), Error> {
         self.check_read_end_still_valid()?;
         let mut seen: std::collections::HashSet<ProcessId> = std::collections::HashSet::new();
         let mut group_result: Result<(), Error> = Ok(());
@@ -1308,7 +1310,8 @@ impl Marker {
     /// same class of check-then-act window `src/containment/unix.rs` already documents for
     /// `ProcessGroup`'s own one-shot `killpg` — narrowed here to "immediately after a live
     /// member was freshly confirmed," not eliminated, and this module makes no claim beyond
-    /// that.
+    /// that. Each pass's `killpg` also checks the root right before it (`root`, see
+    /// [`GroupRoot::check`]), on every pass, not once for the sweep.
     fn sweep_pass(
         &self,
         signal: nix::sys::signal::Signal,
@@ -1316,13 +1319,16 @@ impl Marker {
         group_result: &mut Result<(), Error>,
         incomplete: &mut bool,
         first_pass: bool,
-        scope: Scope,
+        scope: Scope<'_>,
     ) -> bool {
-        let walk = matches!(scope, Scope::Full);
-        let group = matches!(scope, Scope::Full | Scope::GroupAndHolders);
+        let walk = matches!(scope, Scope::Full(_));
+        let group = match scope {
+            Scope::Full(root) | Scope::GroupAndHolders(root) => Some(root),
+            Scope::HoldersOnly { .. } => None,
+        };
         let except = match scope {
             Scope::HoldersOnly { except } => except,
-            Scope::Full | Scope::GroupAndHolders => None,
+            Scope::Full(_) | Scope::GroupAndHolders(_) => None,
         };
         // Snapshot FIRST, always — the group-signal-ordering invariant below depends on this
         // pass's snapshot (when one is obtained) predating any signal sent this pass.
@@ -1333,10 +1339,10 @@ impl Marker {
             *incomplete = true;
             if first_pass {
                 let still = match scope {
-                    Scope::Full => {
+                    Scope::Full(_) => {
                         "the group signal and root kill below still run, since neither needs the process table"
                     }
-                    Scope::GroupAndHolders => "the group signal below still runs, since it needs no process table",
+                    Scope::GroupAndHolders(_) => "the group signal below still runs, since it needs no process table",
                     Scope::HoldersOnly { .. } => "nothing else runs, so nothing is signalled this pass",
                 };
                 log::warn!(
@@ -1458,15 +1464,15 @@ impl Marker {
                         .any(|h| is_signalable(h.pid) && pid_is_live_group_member(h.pid, pgid))
                 });
             let should_fire = first_pass || live_holder_confirms_pgid;
-            if !group {
-            } else if should_fire {
+            if group.is_none() {
+            } else if let (Some(root), true) = (group, should_fire) {
                 // `kill_group`/`term_group` already return `crate::error::Error`, carrying
                 // #61's own `Error::Containment`/`Error::Unassessable` distinction for an
                 // ordinary refusal — preserved as-is here, NOT collapsed into a stringified
                 // `io::Error` (see this fn's doc, and `combine_group_errors` below).
                 let this_pass_group_result: Result<(), Error> = match (self.pgid, signal) {
-                    (Some(pgid), nix::sys::signal::Signal::SIGKILL) => crate::containment::unix::kill_group(pgid),
-                    (Some(pgid), _) => crate::containment::unix::term_group(pgid),
+                    (Some(pgid), nix::sys::signal::Signal::SIGKILL) => crate::containment::unix::kill_group(pgid, root),
+                    (Some(pgid), _) => crate::containment::unix::term_group(pgid, root),
                     (None, _) => Ok(()),
                 };
                 *group_result = match (std::mem::replace(group_result, Ok(())), this_pass_group_result) {

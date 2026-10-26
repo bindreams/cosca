@@ -211,6 +211,7 @@ fn reuser_token(child: &crate::Child, same_tick: bool) -> crate::identity::Start
 /// Mutants: the precondition assert kept (a debug panic on the later-tick reuse); `killpg` sent;
 /// the decision taken on the number alone (the same-tick reuse reads as the root).
 fn kill_tree_after_a_foreign_reap_and_reuse(same_tick: bool) {
+    let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();
     let recorder = crate::containment::unix::fault::record_kill_group();
     let (child, writer) = spawn_group_blocker();
@@ -259,6 +260,7 @@ in_fresh_pid_ns!(
 
 /// `terminate_tree`'s twin of [`kill_tree_after_a_foreign_reap_and_reuse`]. Same mutants.
 fn terminate_tree_after_a_foreign_reap_and_reuse_body() {
+    let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();
     let recorder = crate::containment::unix::fault::record_term_group();
     let (child, writer) = spawn_group_blocker();
@@ -461,6 +463,7 @@ in_fresh_pid_ns!(
 ///
 /// Mutant: a foreign reap answered as `Trusted`.
 fn graceful_shutdown_tree_after_a_foreign_reap_and_reuse_body() {
+    let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();
     let killed = crate::containment::unix::fault::record_kill_group();
     let termed = crate::containment::unix::fault::record_term_group();
