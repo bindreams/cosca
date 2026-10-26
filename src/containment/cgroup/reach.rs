@@ -375,6 +375,17 @@ enum Unreadable {
     Probe(io::Error),
 }
 
+/// The probe child's exit status once its parent sent it the release byte.
+const RELEASED: i32 = 0;
+/// The probe child's exit status when it was not released: its release socket closed or failed
+/// with no byte, its descriptors could not be set up, or its parent was gone.
+const ABANDONED: i32 = 1;
+
+/// The probe child's only descriptors once it has closed every other: the write end of its report
+/// pipe, and its end of the release socket.
+const CHILD_READY_FD: libc::c_int = 3;
+const CHILD_RELEASE_FD: libc::c_int = 4;
+
 /// A forked probe child (see [`fork_probe`]).
 struct Probe {
     pid: libc::pid_t,
@@ -383,60 +394,38 @@ struct Probe {
     /// Where the child reports whether it is dumpable and its parent-death signal, a byte each. Its
     /// end closes when it exits.
     ready_read: std::io::PipeReader,
-    /// The child exits by itself once this closes, so a kill that was not made leaves it to exit
-    /// rather than wait forever. Closed after the kill, before the reap.
-    release: std::io::PipeWriter,
+    /// The child exits by itself once it reads a byte from this, or once this closes, so a kill
+    /// that was not made or failed leaves it to exit rather than wait forever ([`release_probe`]).
+    release: std::os::unix::net::UnixStream,
 }
 
-/// Forks the probe child of `parent`, this process's pid as recorded before the fork. The child is
-/// made non-dumpable (`dumpable`: left so, for a test), reports `PR_GET_DUMPABLE` and
-/// `PR_GET_PDEATHSIG` on `ready_read`, and waits to be killed, or for `release` to close, when it
-/// exits. It dies with its parent: `PR_SET_PDEATHSIG` is set before it reports, and a parent that
-/// died before that took effect is no longer `parent`, so the child exits instead.
-fn fork_probe(parent: libc::pid_t, dumpable: bool) -> io::Result<Probe> {
+/// Forks the probe child of `parent`, this process's pid as recorded before the fork. The child
+/// keeps only its own two descriptors, is made non-dumpable (`dumpable`: left so, for a test),
+/// reports `PR_GET_DUMPABLE` and `PR_GET_PDEATHSIG` on `ready_read`, and waits to be killed or
+/// released. It dies with its parent: `PR_SET_PDEATHSIG` is set before it reports, and a parent
+/// that died before that took effect is no longer `parent`, so the child exits instead. `proc` is
+/// this process's `/proc`, through which the child lists its descriptors where `close_range` is
+/// refused.
+fn fork_probe(proc: &crate::identity::ProcDir, parent: libc::pid_t, dumpable: bool) -> io::Result<Probe> {
     use std::os::fd::AsRawFd;
 
-    let (ready_read, ready_write) = std::io::pipe()?;
-    let (ready_r, ready_w) = (ready_read.as_raw_fd(), ready_write.as_raw_fd());
-    let (release_read, release) = std::io::pipe()?;
-    let (release_r, release_w) = (release_read.as_raw_fd(), release.as_raw_fd());
-    // The fork is under the spawn lock, as every fork of cosca's is, so no other spawn's descriptor
-    // is copied into the child mid-handshake.
+    // The descriptors are made, and the child's ends closed here, under the spawn lock, as every
+    // fork of cosca's is: no other fork of cosca's copies the child's ends. A probe child forked
+    // later copies this probe's parent ends, and closes them before anything else.
     let _guard = crate::child::spawn::spawn_lock();
-    // SAFETY: the child makes only async-signal-safe syscalls, then waits for the parent's kill or
-    // release; it never returns into Rust.
+    let (ready_read, ready_write) = std::io::pipe()?;
+    let (release, release_end) = std::os::unix::net::UnixStream::pair()?;
+    let (ready_w, release_r) = (ready_write.as_raw_fd(), release_end.as_raw_fd());
+    // SAFETY: the child makes only async-signal-safe calls and never returns into Rust.
     let pid = unsafe { libc::fork() };
     if pid == 0 {
-        // SAFETY: async-signal-safe syscalls in the forked child.
-        unsafe {
-            libc::close(ready_r);
-            libc::close(release_w);
-            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0);
-            if libc::getppid() != parent {
-                libc::_exit(0);
-            }
-            if !dumpable {
-                libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
-            }
-            // What the parent checks: this child is not dumpable, as a front is not, and dies with
-            // its parent.
-            let mut pdeathsig: libc::c_int = 0;
-            libc::prctl(libc::PR_GET_PDEATHSIG, (&raw mut pdeathsig) as libc::c_ulong, 0, 0, 0);
-            let report = [libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) as u8, pdeathsig as u8];
-            libc::write(ready_w, report.as_ptr().cast(), report.len());
-            let mut byte = 0u8;
-            while libc::read(release_r, (&raw mut byte).cast(), 1) != 0 {
-                if *libc::__errno_location() != libc::EINTR {
-                    break;
-                }
-            }
-            libc::_exit(0);
-        }
+        // SAFETY: this is the forked child.
+        unsafe { probe_child(proc, parent, dumpable, ready_w, release_r) }
     }
     if pid < 0 {
         return Err(io::Error::last_os_error());
     }
-    drop((ready_write, release_read));
+    drop((ready_write, release_end));
     let hold = match own_child_pidfd(pid) {
         Ok(pidfd) => Hold::Pidfd(pidfd),
         Err(Unpinned::Gone(e)) => return Err(e),
@@ -455,17 +444,161 @@ fn fork_probe(parent: libc::pid_t, dumpable: bool) -> io::Result<Probe> {
     })
 }
 
+/// The probe child's body (see [`fork_probe`]): keeps only `ready_w` and `release_r`
+/// ([`keep_only_own`]), reports, and waits for the release byte or the socket's close.
+///
+/// # Safety
+///
+/// Called only in a child just forked from this (multithreaded) process: it makes only
+/// async-signal-safe calls.
+unsafe fn probe_child(
+    proc: &crate::identity::ProcDir,
+    parent: libc::pid_t,
+    dumpable: bool,
+    ready_w: libc::c_int,
+    release_r: libc::c_int,
+) -> ! {
+    // SAFETY: async-signal-safe calls in the forked child.
+    unsafe {
+        if !keep_only_own(proc, ready_w, release_r) {
+            libc::_exit(ABANDONED);
+        }
+        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0);
+        if libc::getppid() != parent {
+            libc::_exit(ABANDONED);
+        }
+        if !dumpable {
+            libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+        }
+        // What the parent checks: this child is not dumpable, as a front is not, and dies with
+        // its parent.
+        let mut pdeathsig: libc::c_int = 0;
+        libc::prctl(libc::PR_GET_PDEATHSIG, (&raw mut pdeathsig) as libc::c_ulong, 0, 0, 0);
+        let report = [libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) as u8, pdeathsig as u8];
+        libc::write(CHILD_READY_FD, report.as_ptr().cast(), report.len());
+        let mut byte = 0u8;
+        let read = loop {
+            let n = libc::read(CHILD_RELEASE_FD, (&raw mut byte).cast(), 1);
+            if n < 0 && *libc::__errno_location() == libc::EINTR {
+                continue;
+            }
+            break n;
+        };
+        libc::_exit(if read == 1 { RELEASED } else { ABANDONED });
+    }
+}
+
+/// Moves `ready_w` and `release_r` to [`CHILD_READY_FD`] and [`CHILD_RELEASE_FD`] and closes every
+/// other descriptor of this forked child: by `close_range` (Linux 5.9), else by a walk of its
+/// `/proc/self/fd`. A fork copies every descriptor of the process, another probe's release end
+/// included, which would otherwise stay open as long as this child. `false` if it could not.
+///
+/// # Safety
+///
+/// As [`probe_child`]'s.
+unsafe fn keep_only_own(proc: &crate::identity::ProcDir, ready_w: libc::c_int, release_r: libc::c_int) -> bool {
+    use std::os::fd::IntoRawFd;
+
+    let above = CHILD_RELEASE_FD + 1;
+    // SAFETY: async-signal-safe calls in the forked child, on descriptors it holds.
+    unsafe {
+        // Opened before the moves, which may land on `proc`'s descriptor. Each source is first
+        // copied above both targets, so no move lands on a source not yet moved.
+        let dir = proc
+            .open_own_fd_dir()
+            .map_or(-1, |dir| libc::fcntl(dir.into_raw_fd(), libc::F_DUPFD, above));
+        let ready = libc::fcntl(ready_w, libc::F_DUPFD, above);
+        let release = libc::fcntl(release_r, libc::F_DUPFD, above);
+        if ready < 0
+            || release < 0
+            || libc::dup2(ready, CHILD_READY_FD) < 0
+            || libc::dup2(release, CHILD_RELEASE_FD) < 0
+        {
+            return false;
+        }
+        #[cfg(test)]
+        let refused = super::fault::probe_close_range_refused();
+        #[cfg(not(test))]
+        let refused = false;
+        let close_range = |first: libc::c_uint, last: libc::c_uint| {
+            libc::syscall(libc::SYS_close_range, first, last, 0 as libc::c_uint) == 0
+        };
+        if !refused && close_range(0, CHILD_READY_FD as libc::c_uint - 1) && close_range(above as libc::c_uint, !0) {
+            return true;
+        }
+        dir >= 0 && close_by_walk(dir)
+    }
+}
+
+/// Closes every descriptor `dir` (this child's `/proc/self/fd`) lists but [`CHILD_READY_FD`],
+/// [`CHILD_RELEASE_FD`] and `dir`, then `dir`. A pass that closed any starts the listing over, as
+/// glibc's `closefrom` fallback does; the walk ends at a pass that closes none. `false` if the
+/// listing failed.
+///
+/// # Safety
+///
+/// As [`probe_child`]'s.
+unsafe fn close_by_walk(dir: libc::c_int) -> bool {
+    /// `getdents64`'s buffer, aligned for its records.
+    #[repr(C, align(8))]
+    struct Buf([u8; 1024]);
+    // `struct linux_dirent64`: `d_ino` (8), `d_off` (8), `d_reclen` (2), `d_type` (1), `d_name`.
+    const RECLEN: usize = 16;
+    const NAME: usize = 19;
+
+    let mut buf = Buf([0; 1024]);
+    // SAFETY: async-signal-safe calls in the forked child; the kernel fills `buf` with whole records.
+    unsafe {
+        loop {
+            let n = libc::syscall(libc::SYS_getdents64, dir, buf.0.as_mut_ptr(), buf.0.len());
+            if n < 0 {
+                libc::close(dir);
+                return false;
+            }
+            if n == 0 {
+                break;
+            }
+            let mut closed = false;
+            let mut at = 0;
+            while at < n as usize {
+                let reclen = usize::from(u16::from_ne_bytes([buf.0[at + RECLEN], buf.0[at + RECLEN + 1]]));
+                let name = &buf.0[at + NAME..at + reclen];
+                at += reclen;
+                let mut fd: libc::c_int = 0;
+                let mut digits = 0;
+                for &b in name.iter().take_while(|&&b| b != 0) {
+                    if !b.is_ascii_digit() {
+                        digits = 0;
+                        break;
+                    }
+                    fd = fd.wrapping_mul(10).wrapping_add(libc::c_int::from(b - b'0'));
+                    digits += 1;
+                }
+                if digits == 0 || fd == dir || fd == CHILD_READY_FD || fd == CHILD_RELEASE_FD {
+                    continue;
+                }
+                libc::close(fd);
+                closed = true;
+            }
+            if closed && libc::lseek(dir, 0, libc::SEEK_SET) < 0 {
+                libc::close(dir);
+                return false;
+            }
+        }
+        libc::close(dir);
+    }
+    true
+}
+
 /// How the parent holds a probe's child, to kill and reap it.
 enum Hold {
     /// A pidfd shown to name a child of this process ([`own_child_pidfd`]).
     Pidfd(OwnedFd),
     /// Its pid alone, when no pidfd could be opened (`EMFILE`, say): the fallback is main's, a kill
-    /// and a reap by the number. The child waits until killed, so the number names it unless
-    /// something else in the process kills it and another reaper reaps it; the kill and the reap
-    /// then reach whoever holds the number: a child of this process, or, for the kill, any process.
-    /// A kill through the pidfd that fails other than with `ESRCH` falls back to the number for the
-    /// kill alone, with the same residual, and still reaps through the pidfd. A pidfd from the fork
-    /// itself (#383) removes this case.
+    /// and a reap by the number. The child runs until killed or released, so the number names it
+    /// unless something else in the process kills it and another reaper reaps it; the kill and the
+    /// reap then reach whoever holds the number: a child of this process, or, for the kill, any
+    /// process. A pidfd from the fork itself (#383) removes this case.
     Number,
 }
 
@@ -519,57 +652,117 @@ fn own_child_pidfd(pid: libc::pid_t) -> Result<OwnedFd, Unpinned> {
     }
 }
 
-/// Kills the probe's child `pid` and reaps it, through `hold`, closing `release` between the two.
-/// Every exit that returns leaves no probe process, except a reap that itself fails. A kill through
-/// the pidfd that answers `ESRCH` finds the child already dead, and the pidfd reaps it. Any other
-/// error of that kill falls back to the child's number for the kill, as [`Hold::Number`] says, and
-/// the pidfd still reaps it.
-fn kill_and_reap(pid: libc::pid_t, hold: Hold, release: std::io::PipeWriter) -> io::Result<()> {
+/// Kills the probe's child `pid` through `hold`, releases it ([`release_probe`]), and reaps it.
+/// Every exit that returns leaves no probe process, except a reap that itself fails. A kill that
+/// answers `ESRCH` finds the child already dead or reaped; any other failure is a `warn`, and the
+/// release ends the child. Nothing is sent by the child's number while a pidfd holds it. A reap
+/// that answers `ECHILD` finds the child reaped by another reaper: it is gone, and that is no
+/// failure.
+fn kill_and_reap(pid: libc::pid_t, hold: Hold, release: std::os::unix::net::UnixStream) -> io::Result<()> {
+    #[cfg(test)]
+    let seam = super::fault::run_before_probe_kill(pid).map(rustix::io::Errno::from_raw_os_error);
+    #[cfg(not(test))]
+    let seam: Option<rustix::io::Errno> = None;
+    let killed = match &hold {
+        Hold::Pidfd(pidfd) => kill_probe(ProbeKill::Pidfd(pidfd.as_fd()), seam),
+        Hold::Number => kill_probe(ProbeKill::Number(pid), seam),
+    };
+    match killed {
+        Ok(()) => {}
+        Err(rustix::io::Errno::SRCH) => log::debug!(
+            "containment::cgroup: the placement probe's child {pid} had already exited, or was reaped by another reaper in this process, when it was to be killed"
+        ),
+        Err(e) => log::warn!(
+            "containment::cgroup: the kill of the placement probe's child {pid} failed ({e}); it is released to exit by itself"
+        ),
+    }
+    release_probe(pid, release);
     match hold {
-        Hold::Pidfd(pidfd) => {
-            #[cfg(test)]
-            let sent = match super::fault::run_before_probe_kill(pid) {
-                Some(errno) => Err(rustix::io::Errno::from_raw_os_error(errno)),
-                None => rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::KILL),
-            };
-            #[cfg(not(test))]
-            let sent = rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::KILL);
-            #[cfg(test)]
-            super::fault::record_probe_step(super::fault::ProbeStep::Kill(
-                crate::send_log::Via::Pidfd,
-                libc::SIGKILL,
-            ));
-            if let Err(e) = sent.or_else(|e| if e == rustix::io::Errno::SRCH { Ok(()) } else { Err(e) }) {
-                log::debug!(
-                    "containment::cgroup: the kill of the placement probe's child {pid} through its pidfd failed ({e}), so it is killed by its number"
-                );
-                kill_by_number(pid);
-            }
-            drop(release);
-            reap_through(&pidfd)
-        }
-        Hold::Number => {
-            kill_by_number(pid);
-            drop(release);
-            reap_by_number(pid)
-        }
+        Hold::Pidfd(pidfd) => reap_through(pid, &pidfd),
+        Hold::Number => reap_by_number(pid),
     }
 }
 
-/// Reaps the probe's child `pidfd` names, waiting for it to exit.
-fn reap_through(pidfd: &OwnedFd) -> io::Result<()> {
+/// How [`kill_probe`] names the probe's child.
+enum ProbeKill<'a> {
+    /// Through its pidfd.
+    Pidfd(BorrowedFd<'a>),
+    /// By its number, with the residual [`Hold::Number`] documents.
+    Number(libc::pid_t),
+}
+
+/// Sends the probe's child `SIGKILL` as `kill` names it, and gives the kernel's answer; in a test
+/// build `seam` answers in its place. A test build records the step once the syscall answered,
+/// with the route of the syscall made.
+fn kill_probe(kill: ProbeKill<'_>, seam: Option<rustix::io::Errno>) -> rustix::io::Result<()> {
+    use rustix::process::{kill_process, pidfd_send_signal, Pid, Signal};
+    let sent = match (seam, &kill) {
+        (Some(errno), _) => Err(errno),
+        (None, ProbeKill::Pidfd(pidfd)) => pidfd_send_signal(pidfd, Signal::KILL),
+        (None, ProbeKill::Number(pid)) => match Pid::from_raw(*pid) {
+            Some(pid) => kill_process(pid, Signal::KILL),
+            None => unreachable!("fork returned pid {pid} to its parent"),
+        },
+    };
+    #[cfg(test)]
+    super::fault::record_probe_step(super::fault::ProbeStep::Kill(
+        match kill {
+            ProbeKill::Pidfd(_) => crate::send_log::Via::Pidfd,
+            ProbeKill::Number(_) => crate::send_log::Via::Pid,
+        },
+        libc::SIGKILL,
+    ));
+    sent
+}
+
+/// Sends the probe's child `pid` its release byte and closes `release`. The child exits once it
+/// reads the byte, which no other holder of a copy of `release` (a process forked meanwhile) can
+/// hold back as it holds back the close. `MSG_NOSIGNAL`: a child already gone answers `EPIPE`, not
+/// `SIGPIPE`.
+fn release_probe(pid: libc::pid_t, release: std::os::unix::net::UnixStream) {
+    let sent = loop {
+        match rustix::net::send(&release, &[0], rustix::net::SendFlags::NOSIGNAL) {
+            Err(rustix::io::Errno::INTR) => continue,
+            other => break other,
+        }
+    };
+    match sent {
+        Ok(_) | Err(rustix::io::Errno::PIPE | rustix::io::Errno::CONNRESET) => {}
+        Err(e) => log::warn!(
+            "containment::cgroup: the placement probe's child {pid} could not be released ({e}); it exits once every copy of its release socket closes"
+        ),
+    }
+}
+
+/// Reaps the probe's child `pid`, which `pidfd` names, waiting for it to exit.
+fn reap_through(pid: libc::pid_t, pidfd: &OwnedFd) -> io::Result<()> {
     loop {
         match rustix::process::waitid(
             rustix::process::WaitId::PidFd(pidfd.as_fd()),
             rustix::process::WaitIdOptions::EXITED,
         ) {
             Err(rustix::io::Errno::INTR) => continue,
+            Err(rustix::io::Errno::CHILD) => {
+                reaped_elsewhere(pid);
+                #[cfg(test)]
+                super::fault::record_probe_step(super::fault::ProbeStep::Reap(
+                    crate::send_log::Via::Pidfd,
+                    super::fault::ProbeEnd::Elsewhere,
+                ));
+                return Ok(());
+            }
             Err(e) => return Err(io::Error::from(e)),
             Ok(status) => {
                 #[cfg(test)]
                 super::fault::record_probe_step(super::fault::ProbeStep::Reap(
                     crate::send_log::Via::Pidfd,
-                    status.and_then(|status| status.terminating_signal()),
+                    match status {
+                        Some(status) => match status.terminating_signal() {
+                            Some(signo) => super::fault::ProbeEnd::Signal(signo),
+                            None => super::fault::ProbeEnd::Exit(status.exit_status().unwrap_or(-1)),
+                        },
+                        None => unreachable!("a waitid without WNOHANG returns a status"),
+                    },
                 ));
                 #[cfg(not(test))]
                 let _ = status;
@@ -577,14 +770,6 @@ fn reap_through(pidfd: &OwnedFd) -> io::Result<()> {
             }
         }
     }
-}
-
-/// Kills the probe's child `pid` by its number, with the residual [`Hold::Number`] documents.
-fn kill_by_number(pid: libc::pid_t) {
-    // SAFETY: a plain syscall on `pid`, this process's own child, with that residual.
-    unsafe { libc::kill(pid, libc::SIGKILL) };
-    #[cfg(test)]
-    super::fault::record_probe_step(super::fault::ProbeStep::Kill(crate::send_log::Via::Pid, libc::SIGKILL));
 }
 
 /// Reaps the probe's child `pid` by its number, with the residual [`Hold::Number`] documents.
@@ -596,15 +781,35 @@ fn reap_by_number(pid: libc::pid_t) -> io::Result<()> {
             #[cfg(test)]
             super::fault::record_probe_step(super::fault::ProbeStep::Reap(
                 crate::send_log::Via::Pid,
-                libc::WIFSIGNALED(status).then(|| libc::WTERMSIG(status)),
+                if libc::WIFSIGNALED(status) {
+                    super::fault::ProbeEnd::Signal(libc::WTERMSIG(status))
+                } else {
+                    super::fault::ProbeEnd::Exit(libc::WEXITSTATUS(status))
+                },
             ));
             return Ok(());
         }
         let e = io::Error::last_os_error();
-        if e.raw_os_error() != Some(libc::EINTR) {
-            return Err(e);
+        match e.raw_os_error() {
+            Some(libc::EINTR) => {}
+            Some(libc::ECHILD) => {
+                reaped_elsewhere(pid);
+                #[cfg(test)]
+                super::fault::record_probe_step(super::fault::ProbeStep::Reap(
+                    crate::send_log::Via::Pid,
+                    super::fault::ProbeEnd::Elsewhere,
+                ));
+                return Ok(());
+            }
+            _ => return Err(e),
         }
     }
+}
+
+/// Notes that the probe's child `pid` was reaped by another reaper (`SIGCHLD` ignored, or a
+/// `waitpid(-1)` elsewhere): it is gone, so nothing of the probe is left.
+fn reaped_elsewhere(pid: libc::pid_t) {
+    log::debug!("containment::cgroup: the placement probe's child {pid} was reaped by another reaper in this process");
 }
 
 /// Reads the cgroup of a non-dumpable child of this process (see [`front_placement`]).
@@ -633,7 +838,7 @@ fn untraceable_cgroup_readable() -> Result<(), Unreadable> {
         hold,
         ready_read,
         release,
-    } = fork_probe(rustix::process::getpid().as_raw_nonzero().get(), dumpable).map_err(Unreadable::Probe)?;
+    } = fork_probe(&proc_dir, rustix::process::getpid().as_raw_nonzero().get(), dumpable).map_err(Unreadable::Probe)?;
     let mut ready = [0u8; 2];
     let readied = loop {
         match std::io::Read::read(&mut &ready_read, &mut ready) {
