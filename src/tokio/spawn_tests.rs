@@ -296,11 +296,17 @@ fn an_abandonment_nothing_answered_for_hedges() {
     let marker = "cosca-abandoned-hedge-probe-5d02";
     let error = Error::Io(std::io::Error::other(marker));
     for (child, says) in [
-        (AbandonedChild::MaybeUnreachable, "may be left running"),
-        (AbandonedChild::MaybeUnreaped, "may be left unreaped"),
+        (
+            AbandonedChild::MaybeUnreachable,
+            "may be left running and nothing can reach it",
+        ),
+        (
+            AbandonedChild::MaybeUnreaped,
+            "may be left unreaped, since it never reached",
+        ),
         (
             AbandonedChild::OutOfReach("it sent no handle on itself".into()),
-            "may be left running",
+            "may be left running and nothing can reach it outside its cgroup v2 leaf: it sent",
         ),
     ] {
         let mark = crate::log_capture::mark();
@@ -309,6 +315,7 @@ fn an_abandonment_nothing_answered_for_hedges() {
         assert_eq!(said.len(), 1, "{child:?}: {said:?}");
         assert_eq!(said[0].0, log::Level::Warn, "{child:?}");
         assert!(said[0].1.contains(says), "{child:?}: {said:?}");
+        assert!(!said[0].1.contains("  "), "{child:?}: {said:?}");
     }
 }
 
@@ -348,6 +355,12 @@ fn an_abandonment_after_a_handshake_that_ended_the_child_says_so() {
         assert!(said[0].1.contains(&fate.to_string()), "after {fate:?}: {said:?}");
         assert!(
             !said[0].1.contains("left running") && !said[0].1.contains("nothing can reach it"),
+            "after {fate:?}: {said:?}"
+        );
+        assert!(
+            said[0]
+                .1
+                .contains("it sent no handle on itself; a descendant of it outside the leaf"),
             "after {fate:?}: {said:?}"
         );
     }

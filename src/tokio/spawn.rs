@@ -1025,7 +1025,7 @@ fn abandoned_fate(child: crate::containment::AbandonedChild) -> ChildFate {
 /// tokio can fail a spawn after its fork, dropping the child neither killed nor reaped and
 /// returning no pid. Only a cgroup leaf still reaches such a child, and only once the child has
 /// told it who it is. The error cannot tell a failure before the fork from one after it, hence
-/// "may". Reported at `warn` every time.
+/// "may". Reported at `warn` every time, unless `ended` says the child is gone.
 ///
 /// `ended` is what the Linux handshake did with the child before the abandonment ran: it killed and
 /// reaped it through its pidfd, or found it reaped. The abandonment then says nothing of the child
@@ -1039,7 +1039,8 @@ fn warn_for_abandoned(child: &crate::containment::AbandonedChild, error: &Error,
         (AbandonedChild::Front(_) | AbandonedChild::Ended, _) => return,
         (AbandonedChild::OutOfReach(why), Some(fate)) => {
             log::warn!(
-                "tokio spawn failed ({error}); {fate}, but its cgroup v2 leaf holds no handle on it ({why}): a                  descendant of it outside the leaf, if any, is out of reach"
+                "tokio spawn failed ({error}); {fate}, and its cgroup v2 leaf's abandonment says: {why}; a \
+                 descendant of it outside the leaf, if any, is out of reach"
             );
             return;
         }
@@ -1049,15 +1050,18 @@ fn warn_for_abandoned(child: &crate::containment::AbandonedChild, error: &Error,
         }
         (AbandonedChild::OutOfReach(why), None) => {
             log::warn!(
-                "tokio spawn failed ({error}); if it failed after forking, unless its spawn collected it, the child                  may be left running and nothing can reach it outside its cgroup v2 leaf: {why}"
+                "tokio spawn failed ({error}); if it failed after forking, unless its spawn collected it, the child \
+                 may be left running and nothing can reach it outside its cgroup v2 leaf: {why}"
             );
             return;
         }
         (AbandonedChild::MaybeUnreaped, None) => {
-            "the child exits before `exec`; unless its spawn collected it, it may be left unreaped, since it              never reached the point where it names itself and nothing here holds its pid"
+            "the child exits before `exec`; unless its spawn collected it, it may be left unreaped, since it \
+             never reached the point where it names itself and nothing here holds its pid"
         }
         (AbandonedChild::MaybeUnreachable, None) => {
-            "unless its spawn collected it, the child may be left running and nothing              can reach it: only a cgroup v2 leaf is killed without the child's pid"
+            "unless its spawn collected it, the child may be left running and nothing \
+             can reach it: only a cgroup v2 leaf is killed without the child's pid"
         }
     };
     log::warn!("tokio spawn failed ({error}); if it failed after forking, {consequence}");
