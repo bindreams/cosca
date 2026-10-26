@@ -69,10 +69,12 @@ fn full_path(s: &str) -> String {
 }
 
 /// Every small path, and longer ones after `\\`, `\\.\` and `C:\` that reach extra separators
-/// before a share or device name and a device name popped by `..`. No verbatim spellings.
+/// before a share or device name and a device name popped by `..`, and names ending in a space. No
+/// verbatim spellings.
 fn win32_grid() -> Vec<String> {
     let mut all = small_paths();
-    let tails = paths_over(&["a", ".", "..", "\\", "/"], 6);
+    let mut tails = paths_over(&["a", ".", "..", "\\", "/"], 6);
+    tails.extend(paths_over(&["a", " ", ".", "\\"], 6));
     for prefix in [r"\\", r"\\.\", r"C:\"] {
         all.extend(tails.iter().map(|tail| format!("{prefix}{tail}")));
     }
