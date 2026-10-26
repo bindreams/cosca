@@ -85,7 +85,7 @@ async fn async_kill_tree_tears_down_tree() {
 
 /// The soft signal alone is the subject, so the root is reaped before the drop: a `kill_tree()`
 /// first would race the SIGTERM for the exit status. What the drop then says depends on the host
-/// (#382, #782), so each host's test names `_warns` for it.
+/// (#382, #782), so each host's test passes the `WarnWatch` that states it.
 #[cfg(feature = "tokio")]
 #[cfg(unix)]
 async fn terminate_tree_soft_kills_the_group(_warns: common::WarnWatch) {
