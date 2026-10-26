@@ -624,7 +624,7 @@ fn hard_kill_propagates_a_kill_the_kernel_refused() {
 
     let attached = crate::containment::Attached::Cgroup(leaf);
     assert!(
-        attached.hard_kill().is_err(),
+        attached.hard_kill(&crate::containment::GroupRoot::none()).is_err(),
         "Attached::Cgroup must propagate like every sibling arm; swallowing it makes \
          kill_tree() report a completed teardown over a live tree"
     );
@@ -668,10 +668,10 @@ fn terminate_reads_an_already_removed_leaf_as_a_completed_teardown() {
 
     let attached = crate::containment::Attached::Cgroup(leaf);
     assert!(
-        attached.terminate(0).is_ok(),
+        attached.terminate(0, &crate::containment::GroupRoot::none()).is_ok(),
         "terminate and hard_kill must agree about an already-gone leaf"
     );
-    assert!(attached.hard_kill().is_ok());
+    assert!(attached.hard_kill(&crate::containment::GroupRoot::none()).is_ok());
 }
 
 // Drop's leaf-removal reporting -----
@@ -744,8 +744,15 @@ fn drop_kills_through_a_leaf_unless_the_child_provably_never_entered() {
             );
             assert!(!leaf.holds_spawn_resources());
         }
+        // This process stands in for the child that reported, and is no child of its own, so the
+        // abandoned spawn's cleanup takes it for one reaped elsewhere and kills the group it
+        // leads (on Linux 6.9+, through its pidfd): this test's own, under nextest. The group is
+        // reported gone instead.
+        let gone = matches!(report, PlacementReport::WriteFailed(_))
+            .then(crate::containment::cgroup::fault::force_group_kill_gone);
         let mark = crate::log_capture::mark();
         drop(leaf);
+        drop(gone);
 
         assert_eq!(
             leaf_path.join("cgroup.kill").exists(),
@@ -2602,7 +2609,7 @@ fn an_abandoned_intent_without_a_handle_is_never_signalled() {
     }
 
     assert!(matches!(
-        leaf.abandon_before_verdict(false, None),
+        leaf.abandon_before_verdict(false, None, &mut crate::containment::cgroup::NoWarn),
         crate::containment::cgroup::Abandoned::OutOfReach(_)
     ));
     assert_eq!(crate::containment::cgroup::fault::take_child_sends(), []);
@@ -2679,7 +2686,7 @@ fn an_abandoned_child_with_no_handle_on_itself_is_out_of_reach() {
     crate::containment::cgroup::fault::set_force_child_proc_dir_failure(false);
 
     assert!(matches!(
-        leaf.abandon_before_verdict(false, None),
+        leaf.abandon_before_verdict(false, None, &mut crate::containment::cgroup::NoWarn),
         crate::containment::cgroup::Abandoned::OutOfReach(_)
     ));
     assert_eq!(crate::containment::cgroup::fault::take_child_sends(), []);
@@ -2719,7 +2726,7 @@ fn an_abandoned_child_std_already_reaped_is_never_signalled() {
     reap(guard.defuse());
 
     assert_eq!(
-        leaf.abandon_before_verdict(false, None),
+        leaf.abandon_before_verdict(false, None, &mut crate::containment::cgroup::NoWarn),
         crate::containment::cgroup::Abandoned::Ended
     );
     assert_eq!(crate::containment::cgroup::fault::take_child_sends(), []);
@@ -2737,7 +2744,7 @@ fn an_abandoned_spawn_whose_child_sent_nothing_may_leave_it_unreaped() {
     let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path.clone());
 
     assert_eq!(
-        leaf.abandon_before_verdict(false, None),
+        leaf.abandon_before_verdict(false, None, &mut crate::containment::cgroup::NoWarn),
         crate::containment::cgroup::Abandoned::MaybeUnreaped
     );
     assert!(!leaf_path.exists(), "the empty leaf is removed");
@@ -2766,7 +2773,7 @@ fn a_child_reaped_between_the_check_and_the_kill_is_not_signalled_by_number() {
     crate::containment::cgroup::fault::set_between_check_and_kill(move || reap(pid));
 
     assert_eq!(
-        leaf.abandon_before_verdict(false, None),
+        leaf.abandon_before_verdict(false, None, &mut crate::containment::cgroup::NoWarn),
         crate::containment::cgroup::Abandoned::Ended
     );
     assert_eq!(
@@ -2808,7 +2815,7 @@ fn an_abandoned_child_that_refuses_the_kill_is_reaped_once_it_exits() {
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
 
-    let abandoned = leaf.abandon_before_verdict(false, None);
+    let abandoned = leaf.abandon_before_verdict(false, None, &mut crate::containment::cgroup::NoWarn);
     let crate::containment::cgroup::Abandoned::OutOfReach(refused) = &abandoned else {
         panic!("expected OutOfReach, got {abandoned:?}");
     };
@@ -2869,7 +2876,7 @@ fn an_abandoned_child_in_its_leaf_refusing_its_kill_is_warned_about_once() {
     let mark = crate::log_capture::mark();
 
     assert_eq!(
-        leaf.abandon_before_verdict(false, None),
+        leaf.abandon_before_verdict(false, None, &mut crate::containment::cgroup::NoWarn),
         crate::containment::cgroup::Abandoned::Ended
     );
 
@@ -2880,8 +2887,8 @@ fn an_abandoned_child_in_its_leaf_refusing_its_kill_is_warned_about_once() {
         .collect();
     assert_eq!(refusals.len(), 1, "{refusals:?}");
     // Dropped after its kill: its stdin's EOF would end it by itself.
-    drop(child);
     rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::KILL).expect("kill the child");
+    drop(child);
     assert!(
         crate::containment::cgroup::fault::take_background_reap_notifier().is_none(),
         "the child must be handed to the background reaper"

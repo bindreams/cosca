@@ -152,6 +152,8 @@ fn nested_attach_is_delegated() {
             is_root: false, // nested member
             #[cfg(target_os = "linux")]
             cgroup_leaf: None,
+            #[cfg(all(target_os = "linux", feature = "tokio"))]
+            teardown_warn_after: None,
             #[cfg(target_os = "macos")]
             marker: None,
             #[cfg(windows)]
@@ -566,6 +568,8 @@ fn decide(leaf_path: &std::path::Path, report: ChildReport) -> (crate::containme
         mode: Some(crate::containment::ContainMode::Strongest),
         is_root: true,
         cgroup_leaf: Some(leaf),
+        #[cfg(all(target_os = "linux", feature = "tokio"))]
+        teardown_warn_after: None,
     };
     super::attach_tree(
         crate::identity::ProcessId::current(),

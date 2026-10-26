@@ -308,9 +308,9 @@ async fn async_drop_tears_down_a_contained_tree() {
         "contained spawn must engage a mechanism"
     );
     drop(child);
-    // No post-drop liveness assertion: `Drop` signals and does not wait, and a kill is
-    // asynchronous. Each process's death is proven by its own control-socket EOF: a survivor
-    // blocks the read (a CI failure).
+    // No post-drop liveness assertion: the drop waits for the root and a cgroup leaf only, and on
+    // Windows for neither. Each process's death is proven by its own control-socket EOF: a
+    // survivor blocks the read (a CI failure).
     for (who, s) in [("root", &mut root), ("grandchild", &mut grand)] {
         let mut buf = [0u8; 1];
         match s.read(&mut buf) {
@@ -319,36 +319,30 @@ async fn async_drop_tears_down_a_contained_tree() {
             other => panic!("{who} not torn down on drop: {other:?}"),
         }
     }
-    // `Drop` releases the leaf right after the kill without waiting for the drain, so the killed
-    // members may not have left it yet.
-    remove_leftover_leaf(leaf);
+    #[cfg(target_os = "linux")]
+    if let Some(leaf) = &leaf {
+        assert_leaf_removed(leaf);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = leaf;
 }
 
 #[cfg(feature = "tokio")]
-/// Either the leaf `Drop` was given is gone and no warning names it, or it is still there and a
-/// warning at `warn` does. `Drop` writes `cgroup.kill` and reads the drain once: whether the kernel
-/// has finished the kill by then is not this test's to decide, and `Drop` waits for neither.
+/// The leaf an armed `Drop` killed is gone once the drop returns: the drop waits for the leaf to
+/// drain, then removes it. Whether the drop warned is not asserted: past 1 s it warns, and this
+/// test cannot hold the drain under it.
 #[cfg(target_os = "linux")]
-fn assert_leaf_gone_or_warned_about(leaf: &std::path::Path, mark: usize) {
-    let levels = common::levels_since(mark, &leaf.display().to_string());
-    if leaf.exists() {
-        assert!(
-            levels.contains(&log::Level::Warn),
-            "a leaf left behind must be warned about, got {levels:?}: {}",
-            leaf.display()
-        );
-    } else {
-        assert!(
-            !levels.contains(&log::Level::Warn),
-            "a leaf that was removed must not be warned about, got {levels:?}: {}",
-            leaf.display()
-        );
-    }
+fn assert_leaf_removed(leaf: &std::path::Path) {
+    assert!(
+        !leaf.exists(),
+        "the drop must drain and remove the leaf: {}",
+        leaf.display()
+    );
 }
 
 // The mechanisms that still kill after the root is reaped: a macOS fd marker's holder sweep, a
-// Windows Job Object, and (in the cgroup lane) a cgroup. A process group does not, being named by
-// the root's number: see the Unix test below.
+// Windows Job Object, and (in the cgroup lane) a cgroup. A process group does on Linux 6.9+, through
+// the root's pidfd, and not below 6.9: both are `src/tokio/child/drop_group_exact_tests.rs`'s.
 #[cfg(feature = "tokio")]
 #[cfg(any(windows, target_os = "macos"))]
 #[skuld::test]
@@ -379,7 +373,6 @@ async fn drop_after_wait_still_tears_down_the_tree() {
     root.write_all(b"x").expect("release the root so it exits");
     child.wait().await.expect("wait reaps the root");
     assert_eq!(root_id.is_alive(), cosca::identity::Liveness::Dead, "root exited");
-    let mark = common::log_mark();
     drop(child); // root already reaped → nothing to signal; attached.hard_kill must still kill the grandchild
     let mut buf = [0u8; 1];
     match grand.read(&mut buf) {
@@ -387,40 +380,12 @@ async fn drop_after_wait_still_tears_down_the_tree() {
         Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
         other => panic!("grandchild not torn down by hard_kill after the root was waited: {other:?}"),
     }
-    // `Drop` releases the leaf without waiting for the drain: the leaf is removed if the kill had
-    // finished by then, and left with a warning if not.
     #[cfg(target_os = "linux")]
     if let Some(leaf) = &leaf {
-        assert_leaf_gone_or_warned_about(leaf, mark);
+        assert_leaf_removed(leaf);
     }
     #[cfg(not(target_os = "linux"))]
-    let _ = mark;
-    remove_leftover_leaf(leaf);
-}
-
-#[cfg(feature = "tokio")]
-/// The contract for a bare process group: once the root is reaped its number may name an
-/// unrelated group, so the drop does not `killpg` it and the grandchild keeps running. The
-/// grandchild echoes a byte if it is alive and gives EOF if it was killed, so the round trip
-/// proves it, with no wait on a signal's delivery. It exits when its control socket closes.
-#[cfg(all(unix, not(target_os = "macos")))]
-#[skuld::test]
-async fn async_drop_after_wait_leaves_a_process_group_grandchild_running() {
-    let common::AsyncEchoTree {
-        mut child,
-        root,
-        mut grand,
-        ..
-    } = common::spawn_echo_tree_async_configured("spawn-grandchild-echo", |cmd| {
-        cmd.contain_with(cosca::ContainMode::Session);
-    })
-    .await;
-    assert_eq!(child.containment(), cosca::Containment::Session);
-    drop(root); // the root exits when its control socket closes
-    child.wait().await.expect("wait reaps the root");
-    drop(child);
-
-    common::assert_echoes(&mut grand, "the grandchild of a reaped process-group root");
+    let _ = leaf;
 }
 
 #[cfg(feature = "tokio")]
@@ -559,9 +524,9 @@ async fn linux_cgroup_v2_async_kill_on_drop_false_leaves_the_tree_running(#[fixt
 
 #[cfg(feature = "tokio")]
 /// Async twin of `linux_cgroup_v2_kill_on_drop_false_kill_tree_still_waits_for_the_leaf_to_drain`
-/// in `spawn_io.rs`, with the wait made explicit: the async `Drop` never waits for a drain, so an
-/// opted-out handle that killed its tree removes the leaf only if the caller awaited the drain
-/// first.
+/// in `spawn_io.rs`, with the wait made explicit: the async `Drop` of an opted-out handle never
+/// waits for a drain, so one that killed its tree removes the leaf only if the caller awaited the
+/// drain first.
 ///
 /// `kill_tree()`, `wait()` for the root, and `wait_tree().await` for the drain. After it the leaf
 /// reads `populated 0`, so the drop's one `rmdir` removes it, and nothing is warned.
@@ -603,11 +568,10 @@ async fn linux_cgroup_v2_async_kill_tree_then_wait_tree_then_drop_leaves_no_leaf
 /// placed in the leaf dies of `SIGKILL`, which the test reads by reaping it (a grandchild of the
 /// root cannot be reaped here, because tokio owns the root's children's parent).
 ///
-/// Whether the drain has finished by the drop's single read is a race this test does not depend
-/// on: either the leaf is gone and nothing warned, or it is left and a warning names it.
+/// The drop waits for the leaf to drain, so the leaf is gone.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-async fn linux_cgroup_v2_async_drop_alone_kills_the_members_and_logs_the_leftover(#[fixture(cgroup)] _group: &Group) {
+async fn linux_cgroup_v2_async_drop_alone_kills_the_members_and_removes_the_leaf(#[fixture(cgroup)] _group: &Group) {
     use std::io::Read as _;
     use std::os::unix::process::ExitStatusExt as _;
 
@@ -641,7 +605,6 @@ async fn linux_cgroup_v2_async_drop_alone_kills_the_members_and_logs_the_leftove
         "the member must be in the tree's leaf"
     );
 
-    let mark = common::log_mark();
     drop(child);
 
     // `cgroup.kill` signalled the member before its stdin closes, so it dies of SIGKILL rather
@@ -661,8 +624,7 @@ async fn linux_cgroup_v2_async_drop_alone_kills_the_members_and_logs_the_leftove
             other => panic!("{who} not torn down on drop: {other:?}"),
         }
     }
-    assert_leaf_gone_or_warned_about(&leaf, mark);
-    common::cgroup::drain_and_remove_leaf(&leaf);
+    assert_leaf_removed(&leaf);
 }
 
 #[cfg(feature = "tokio")]
@@ -701,9 +663,8 @@ async fn assert_async_opted_out_tree_survives(kill_on_drop: bool, opt_out: impl 
     common::cgroup::drain_and_remove_leaf(&leaf);
 }
 
-// The zombie check for a dropped root is `a_dropped_root_left_to_tokio_is_reaped` in the library's
-// tests: tokio's orphan queue reaps it, best-effort, once a runtime next sees `SIGCHLD`, and cosca
-// offers no edge to sequence one after (`docs/principles.md`, principle 3).
+// The zombie check for a dropped root is `tokio_armed_drop_reaps_before_returning` in the library's
+// tests: the armed drop reaps the root before it returns (`docs/principles.md`, principle 3).
 
 // Arbitrary fd (n>=3) — Unix only, wired via fd_map (async mirror of spawn_io.rs) =====
 

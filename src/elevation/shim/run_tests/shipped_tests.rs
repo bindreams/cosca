@@ -4,6 +4,7 @@
 use super::*;
 use crate::elevation::shim::link::probe::LinkEvent;
 use crate::elevation::shim::protocol::Command;
+use rustix::io::Errno;
 
 #[skuld::test]
 fn a_shipped_shim_starts_the_program_and_reports_its_exit() {
@@ -21,13 +22,20 @@ fn a_shipped_shim_starts_the_program_and_reports_its_exit() {
 #[skuld::test]
 fn a_shipped_shim_takes_p_for_a_protocol_violation() {
     // With hooks `P` is a ping and the `T` after it ends the program with SIGTERM. Shipped, `P` is
-    // a byte no cosca sends: the program is killed, and the `T` that follows finds it dead.
+    // a byte no cosca sends: the program is killed before the `T` that follows can end it.
     let rig = ShimRig::new();
     let run = rig.spawn(Spec::new("cat", &[]).stdin_held().shipped());
     rig.link.expect_event(LinkEvent::Accepted);
     rig.link.expect_event(LinkEvent::Answered(Command::Allow));
     rig.link.link.send_control(b'P').unwrap();
-    rig.link.link.send_control(b'T').unwrap();
+    // The shim may already have closed the link, so `T` can be refused; the verdict is the same
+    // either way. `T` stays so a shim that took `P` for a ping ends the program with SIGTERM and
+    // fails the assertion below.
+    let sent = rig.link.link.send_control(b'T');
+    assert!(
+        matches!(sent, Ok(()) | Err(Errno::PIPE | Errno::CONNRESET | Errno::NOTCONN)),
+        "{sent:?}"
+    );
     assert_eq!(rig.link.link.wait().unwrap(), LinkOutcome::Exited(libc::SIGKILL));
     assert_eq!(run.finish().code, Some(128 + libc::SIGKILL));
 }

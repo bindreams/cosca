@@ -7,6 +7,8 @@ use super::{root_number, RootNumber};
 use crate::containment::Attached;
 use crate::identity::{ProcessId, Resolved};
 use crate::signal::RootState;
+#[cfg(target_os = "linux")]
+use crate::test_groups::{pidfd_group_signal, Group};
 
 /// A pgid no test process holds: the decisions only name it in their text.
 const PGID: i32 = 999_999;
@@ -256,6 +258,8 @@ fn answer(attached: &Attached, state: State, own: bool, read: Resolved<ProcessId
         RootNumber::Untrusted(_) => Answer::Untrusted,
         #[cfg(target_os = "macos")]
         RootNumber::NoWalk => Answer::NoWalk,
+        #[cfg(target_os = "linux")]
+        RootNumber::GroupGone => panic!("only a tree call's look through the root's pidfd answers GroupGone"),
         RootNumber::MayNameAnother { why, exact_root } => {
             let phrase = ["could not be read", "was reaped elsewhere", "could not say whether it"]
                 .into_iter()
@@ -370,4 +374,65 @@ fn root_number_answers_an_unpinned_root_untrusted() {
             }
         }
     }
+}
+
+// group_number_holds -----
+
+/// A send by the group's number is allowed only while the root is unreaped, or after this handle's
+/// own reap with its pid naming no process. Mutant: "a root reaped elsewhere, or one its handle
+/// cannot answer for, passes the check".
+#[skuld::test]
+fn group_number_holds_only_for_an_unreaped_root_or_a_free_number_after_its_own_reap() {
+    use super::group_number_holds;
+    let own = std::process::id();
+    assert_eq!(group_number_holds(own, (RootState::Unreaped, false)), Ok(()));
+    let refused = [
+        (RootState::Reaped, false, "reaped elsewhere"),
+        (
+            RootState::Unknown(std::io::Error::other("a failed peek")),
+            false,
+            "a failed peek",
+        ),
+        (RootState::Unpinned, false, "not pinned"),
+        // This process holds its own pid, so the number names another process than the root.
+        (RootState::Reaped, true, "another process holds"),
+    ];
+    for (state, own_reap, why) in refused {
+        let label = format!("{state:?}, own reap {own_reap}");
+        let err = group_number_holds(own, (state, own_reap)).expect_err(&label);
+        assert!(err.contains(why), "{label}: {err}");
+    }
+}
+
+// through_the_pidfd -----
+
+/// Linux 6.9+: a reaped root's group with no member left has no tree to signal, but a root its
+/// handle cannot answer for may have left its group alive, so it keeps the reason it may name
+/// another process. Mutant: "a group with no member left is gone whatever the root's state".
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn through_the_pidfd_keeps_a_root_its_handle_cannot_answer_for(#[fixture(pidfd_group_signal)] _group: &Group) {
+    use std::os::fd::AsFd as _;
+    use std::os::unix::process::CommandExt as _;
+    let mut lone = crate::test_spawn::spawn(std::process::Command::new("true").process_group(0)).expect("spawn");
+    let pidfd = crate::containment::cgroup::test_support::pidfd_of(lone.id());
+    lone.wait().expect("reap it");
+    let passes = || Ok(());
+    let group = crate::containment::GroupRoot::new(Some(pidfd.as_fd()), &passes);
+    let attached = Attached::ProcessGroup(PGID);
+    let decide = |exact_root| {
+        super::through_the_pidfd(
+            &attached,
+            RootNumber::MayNameAnother {
+                why: "forced".to_owned(),
+                exact_root,
+            },
+            &group,
+        )
+    };
+    assert!(matches!(decide(false), RootNumber::GroupGone));
+    assert!(matches!(
+        decide(true),
+        RootNumber::MayNameAnother { exact_root: true, .. }
+    ));
 }

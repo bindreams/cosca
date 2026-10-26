@@ -72,6 +72,22 @@ mod root_number_matrix_tests;
 #[path = "child/own_reap_tests.rs"]
 mod own_reap_tests;
 
+#[cfg(all(test, unix))]
+#[path = "child/foreign_reap_after_look_tests.rs"]
+pub(crate) mod foreign_reap_after_look_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "child/group_route_tests.rs"]
+mod group_route_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "child/group_exact_tests.rs"]
+pub(crate) mod group_exact_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "child/drop_group_exact_tests.rs"]
+mod drop_group_exact_tests;
+
 #[cfg(all(test, target_os = "linux"))]
 #[path = "child/kill_tree_view_tests.rs"]
 mod kill_tree_view_tests;
@@ -373,8 +389,12 @@ impl Child {
             }
             // Nothing is signalled after the cgroup kill: it could only be refused.
             Gate::CgroupOnly => {
+                let check = || self.group_number_holds();
                 self.attached
-                    .hard_kill_marking(&self.tree_killed)
+                    .hard_kill_marking(
+                        &self.tree_killed,
+                        &crate::containment::GroupRoot::new(self.proc.pidfd(), &check),
+                    )
                     .map_err(|e| crate::elevation::front::cgroup_kill_failed(self.front, self.id.pid(), e))?;
                 self.cgroup_kill_reached()?;
                 return Ok(crate::signal::Sent::Delivered);
@@ -593,6 +613,14 @@ impl Child {
     /// was skipped. The handle backstop reads the root's state again: a root orphaned during the sweep
     /// is an exited zombie, so the backstop is skipped and the sweep's answer stands.
     ///
+    /// **On Linux 6.9+, a process group whose root is reaped, or whose root's handle cannot say,** is
+    /// still named exactly by the root's pidfd, whoever reaped it: while the group has a member it is
+    /// killed through the pidfd as usual, and each member's resend checks the group the same way
+    /// first (below). A process listed by the group's number once the group has no member left is
+    /// in another group that took the number, and is sent nothing. A root reaped elsewhere, or after
+    /// this handle's own reap with its pid unreadable, whose group has no member left has no tree
+    /// left: nothing is sent, and the call is `Ok`.
+    ///
     /// **A root reaped by something else.** A process group, and a macOS fd marker's group and
     /// walk, are named by the root's pid. If the root's own handle shows it was reaped by another
     /// reaper in the process, that pid may name another process: nothing is sent by it, and the call
@@ -612,13 +640,22 @@ impl Child {
     /// the pid, and the call is `Ok` once every marker holder was reached. A pid that cannot be read
     /// is `Unassessable` as above. A pid that names no process is still signalled as the group's id:
     /// the root's group while a member survives, but once none does, another process may take the
-    /// number, and lead a group by it, first.
+    /// number, and lead a group by it, first. On Linux 6.9+ the root's pidfd shows exactly whether
+    /// the group still has a member, so no send by number reaches a group that took the number.
     ///
     /// **A reap after the look.** All of this is decided on one look at the root. A
     /// [`wait`](Child::wait) on another thread is held off from the look until the sweep has sent
-    /// what it sends by the root's number. A reap after the look by another reaper is not seen: what
-    /// the sweep sends by that number (the group's signal, an fd marker's walk from the root's pid)
-    /// then goes to a number another process may hold.
+    /// what it sends by the root's number. On Linux 6.9+ a process group's signal goes through the
+    /// root's pidfd, which names the group exactly, whoever reaps the root. Each send by the group's
+    /// number (the `killpg` below 6.9 and on macOS, and the leader's signal) checks the root again
+    /// right before it. Each member's resend checks the root, which shows the listing named the
+    /// root's group, then the member's own identity right before the send by the member's pid.
+    /// Nothing goes out once a check fails: on 6.9+ the root's check asks the pidfd whether the
+    /// group still has a member, and elsewhere it asks the root's handle whether the root was reaped
+    /// elsewhere. A reap by another reaper between such a check and its send is not seen, and the
+    /// send then goes to a number another process may hold; a program with such a reaper should use
+    /// [`CgroupV2`](crate::Containment::CgroupV2), whose kill names no pid. An fd marker's walk from
+    /// the root's pid checks each process it signals by its identity.
     pub fn kill_tree(&self) -> Result<(), Error> {
         self.kill_tree_after(None)
     }
@@ -645,6 +682,12 @@ impl Child {
         #[cfg(unix)]
         let held = self.proc.hold_reaps();
         #[cfg(unix)]
+        let check = || tree_call::group_number_holds(self.id.pid(), held.state_and_own_reap());
+        #[cfg(unix)]
+        let group = crate::containment::GroupRoot::new(self.proc.pidfd(), &check);
+        #[cfg(not(unix))]
+        let group = crate::containment::GroupRoot::none();
+        #[cfg(unix)]
         if let Some(result) = self
             .tree_call(crate::containment::dispatch::TreeSignal::Kill, "kill_tree", earlier)
             .root_checked(
@@ -653,11 +696,12 @@ impl Child {
                     held.signal_sent(crate::signal::Sig::Kill)
                         .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper()))
                 },
+                &group,
             )
         {
             return result;
         }
-        let group_result = self.attached.hard_kill_marking(&self.tree_killed);
+        let group_result = self.attached.hard_kill_marking(&self.tree_killed, &group);
         #[cfg(unix)]
         drop(held);
         // A TreeWalk that could not walk killed nothing, and the root's death would strand the
@@ -756,7 +800,7 @@ impl Child {
     /// See [`kill_tree`](Child::kill_tree)'s doc for four things that also apply here: the
     /// `ProcessGroup`/`Session`-only scope of this guarantee (a separate, unfixed gap for
     /// `TreeWalk`), the residual `hidepid` gap on Linux, a root reaped by something else, and a reap
-    /// after the look, which may send the `SIGTERM` to a number another process holds.
+    /// between a check and its send, which may send the `SIGTERM` to a number another process holds.
     ///
     /// **macOS, a root the handle cannot vouch for.** If the root is `Unpinned` (launchd holds its
     /// zombie, see [`kill`](Child::kill)) or `Unknown`, nothing that names the tree by the root's
@@ -776,21 +820,35 @@ impl Child {
         #[cfg(unix)]
         let held = self.proc.hold_reaps();
         #[cfg(unix)]
+        let check = || tree_call::group_number_holds(self.id.pid(), held.state_and_own_reap());
+        #[cfg(unix)]
+        let group = crate::containment::GroupRoot::new(self.proc.pidfd(), &check);
+        #[cfg(not(unix))]
+        let group = crate::containment::GroupRoot::none();
+        #[cfg(unix)]
         if let Some(result) = self
             .tree_call(crate::containment::dispatch::TreeSignal::Term, "terminate_tree", None)
             .root_checked(
                 || held.state_and_own_reap(),
                 || held.signal_sent(crate::signal::Sig::Term).map_err(Error::Io),
+                &group,
             )
         {
             return result;
         }
-        self.terminate_tree_unchecked()
+        self.terminate_tree_unchecked(&group)
     }
 
-    /// The group's termination signal, with no look at the root's state.
-    fn terminate_tree_unchecked(&self) -> Result<(), Error> {
-        self.attached.terminate(self.proc.id())
+    /// The group's termination signal, with no look at the root's state but `group`'s own check
+    /// before each send by the root's number.
+    fn terminate_tree_unchecked(&self, group: &crate::containment::GroupRoot<'_>) -> Result<(), Error> {
+        self.attached.terminate(self.proc.id(), group)
+    }
+
+    /// Whether the root's pid still names its group, read now through its handle.
+    #[cfg(unix)]
+    fn group_number_holds(&self) -> Result<(), String> {
+        tree_call::group_number_holds(self.id.pid(), self.proc.state_and_own_reap())
     }
 
     /// A tree call on this child's tree ([`TreeCall`]).
@@ -1122,7 +1180,8 @@ pub(crate) mod fault {
 /// root. See [`Command::kill_on_drop`](crate::Command::kill_on_drop) for the rest.
 ///
 /// Once the root is reaped the drop skips kills named by its number and warns; see
-/// [`Command::kill_on_drop`](crate::Command::kill_on_drop).
+/// [`Command::kill_on_drop`](crate::Command::kill_on_drop). On Linux 6.9+ a process
+/// group is decided by the root's pidfd instead: killed while it has a member left.
 ///
 /// An elevated child behind a front (see [`Child::kill`]) gets no signal of its own while it runs.
 /// In a cgroup that holds it, the tree's kill ends it and the drop reaps it. Otherwise, or when
@@ -1166,7 +1225,7 @@ impl Child {
         #[cfg(not(unix))]
         {
             let mut left = Vec::new();
-            let tree = self.attached.hard_kill();
+            let tree = self.attached.hard_kill(&crate::containment::GroupRoot::none());
             if let Err(e) = &tree {
                 let orphaned = if self.attached.hard_kill_refused_to_walk(&tree) {
                     "; the root is killed regardless, so its descendants may be orphaned"
@@ -1190,10 +1249,11 @@ impl Child {
     /// The kill-on-drop teardown, with one report of the event.
     ///
     /// Nothing that names the tree by the root's number runs once the root is reaped, or when its
-    /// handle cannot say: the handle's own answer (`RootState`), or the number no longer reading
-    /// as this root. A foreign reap after the read is not seen: if the number is then reused, what
-    /// is sent by it reaches whatever process holds it. An unreaped root stays a zombie, pinning its
-    /// number, until `teardown_on_drop`.
+    /// handle cannot say: the handle's own answer (`RootState`), or the number no longer reading as
+    /// this root. Each send by the group's number checks the root again, as for
+    /// [`kill_tree`](Child::kill_tree). On Linux 6.9+ a process group is decided by the root's pidfd
+    /// ([`Attached::hard_kill_for_drop`](crate::containment::Attached::hard_kill_for_drop)). An
+    /// unreaped root stays a zombie, pinning its number, until `teardown_on_drop`.
     fn drop_unix(&mut self) -> crate::error::ChildFate {
         use crate::child::drop_report::DropReport;
         use crate::error::ChildFate;
@@ -1215,7 +1275,10 @@ impl Child {
             }
             gate => matches!(gate, crate::elevation::front::Gate::CgroupOnly),
         };
-        let kill = self.attached.hard_kill_for_drop(&view);
+        let check = || self.group_number_holds();
+        let kill = self
+            .attached
+            .hard_kill_for_drop(&view, &crate::containment::GroupRoot::new(self.proc.pidfd(), &check));
         report.skipped = kill.skipped;
         if let Err(e) = &kill.result {
             // A live member refused, or couldn't be confirmed — visible, not silently
@@ -1231,9 +1294,7 @@ impl Child {
         }
         // Kill, block until the child has exited, and collect its status here — this handle owns
         // the child outright, and a sync caller owns the thread it is blocking. The async twin
-        // (`cosca::tokio::Child`'s `Drop`) diverges twice, deliberately: it only signals and
-        // never waits, rather than parking a runtime worker, and it must not collect, since tokio
-        // owns that child and its own reaping.
+        // (`cosca::tokio::Child`'s `Drop`) does the same on Unix.
         // A reaped root is neither killed nor waited for: its number may name another child by now.
         // Neither is a root this process does not pin (macOS: launchd holds its zombie). Its fate is
         // `Reaped` by this handle's own reap, else `Gone`: nothing was signalled, so a root someone

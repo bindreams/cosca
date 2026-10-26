@@ -48,7 +48,7 @@ if [[ "$release" -eq 1 ]]; then
     cmd+=(--release)
 fi
 
-cmd+=(--all-targets)
+cmd+=(--workspace --all-targets)
 
 if [[ "$powerset" -eq 1 ]]; then
     cmd+=(--feature-powerset)

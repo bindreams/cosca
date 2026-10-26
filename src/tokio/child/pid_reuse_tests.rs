@@ -14,7 +14,7 @@ use crate::test_child::pid_reuse::{
     in_fresh_pid_ns, reap_behind_and_reuse, sigusr1_and_peek, sigusr1_and_wait, wait_pollin,
 };
 use crate::test_child::reaped_elsewhere::{assert_one_reaped_elsewhere_warn, REAPED_ELSEWHERE};
-use crate::test_groups::namespaces;
+use crate::test_groups::{namespaces, tracer_group};
 use crate::tokio::Command;
 
 fn runtime() -> tokio::runtime::Runtime {
@@ -395,6 +395,209 @@ in_fresh_pid_ns!(
     fixture_tokio_drop_reaps_nothing_driver,
     fixture_tokio_drop_reaps_nothing_init,
     drop_after_foreign_reap_and_reuse_reaps_nothing_body
+);
+
+/// An armed drop whose kill was delivered, and whose root is then reaped behind its back and its pid
+/// taken by a stranger, before the drop's wait: the wait goes through the child's pidfd, finds it
+/// gone, and neither signals nor reaps the stranger. The stranger is already a zombie of the test's
+/// `SIGUSR1` when the wait runs, so a by-pid reap would take its record.
+///
+/// Mutants: the drop's root kill by pid (the send log shows no pidfd kill); the wait reaps by pid
+/// (the test's own `waitid` on the stranger answers `ECHILD`).
+fn armed_drop_after_foreign_reap_and_reuse_signals_nothing_body() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    runtime().block_on(async {
+        let (child, writer) = spawn_blocker();
+        let pid = child.id().pid();
+        let token = StartToken::from_raw(child.id().start_token_raw());
+        // The reuser, and the token alias that keeps it the child's look-alike.
+        type Reused = Option<(std::process::Child, Box<dyn std::any::Any>)>;
+        let reused: Rc<RefCell<Reused>> = Rc::default();
+        let hand = Rc::clone(&reused);
+        let _between = crate::child::spawn::fault::set_between_kill_and_wait(move || {
+            let reuser = reap_behind_and_reuse(pid);
+            let alias = alias_token(reuser.id(), token);
+            assert_eq!(sigusr1_and_peek(&reuser), Some(libc::SIGUSR1));
+            *hand.borrow_mut() = Some((reuser, Box::new(alias)));
+        });
+        let log = Capture::start();
+
+        drop(child);
+
+        assert_eq!(
+            log.entries(),
+            vec![(pid, Sig::Kill, Via::Pidfd)],
+            "one kill, through the pidfd"
+        );
+        let (reuser, alias) = reused.borrow_mut().take().expect("the drop reached its wait");
+        let record = rustix::process::waitid(
+            WaitId::Pid(Pid::from_raw(pid as i32).expect("pid")),
+            WaitIdOptions::EXITED,
+        )
+        .expect("the reuser's exit record must still be unconsumed")
+        .expect("an exit record");
+        assert_eq!(record.terminating_signal(), Some(libc::SIGUSR1));
+        drop((reuser, alias, writer));
+    });
+}
+in_fresh_pid_ns!(
+    namespaces_tokio_armed_drop_after_foreign_reap_and_reuse_signals_nothing,
+    fixture_tokio_armed_drop_reuse_driver,
+    fixture_tokio_armed_drop_reuse_init,
+    armed_drop_after_foreign_reap_and_reuse_signals_nothing_body
+);
+
+/// The same for a failed run-to-completion helper's awaited teardown: the root is reaped behind
+/// its back and its pid taken by a stranger that is already a zombie, before the awaited reap
+/// looks. The reap finds the root gone through its pidfd and takes nothing.
+///
+/// Mutant: the awaited reap tries tokio's `try_wait` without looking first (it takes the
+/// stranger's record).
+fn awaited_teardown_after_foreign_reap_and_reuse_takes_nothing_body() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    runtime().block_on(async {
+        let (mut child, writer) = spawn_blocker();
+        let pid = child.id().pid();
+        type Reused = Option<std::process::Child>;
+        let reused: Rc<RefCell<Reused>> = Rc::default();
+        let hand = Rc::clone(&reused);
+        let _between = crate::child::spawn::fault::set_between_kill_and_wait(move || {
+            let reuser = reap_behind_and_reuse(pid);
+            assert_eq!(sigusr1_and_peek(&reuser), Some(libc::SIGUSR1));
+            *hand.borrow_mut() = Some(reuser);
+        });
+        let log = Capture::start();
+
+        let fate = child.tear_down_awaiting().await;
+
+        assert_eq!(
+            log.entries(),
+            vec![(pid, Sig::Kill, Via::Pidfd)],
+            "one kill, through the pidfd"
+        );
+        let mut reuser = reused.borrow_mut().take().expect("the teardown reached its reap");
+        let status = reuser
+            .wait()
+            .expect("the reuser's exit record must still be unconsumed");
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(libc::SIGUSR1)
+        );
+        assert_ne!(
+            fate,
+            crate::error::ChildFate::Reaped,
+            "the root's exit was not collected"
+        );
+        drop(writer);
+    });
+}
+in_fresh_pid_ns!(
+    namespaces_tokio_awaited_teardown_after_foreign_reap_and_reuse_takes_nothing,
+    fixture_tokio_awaited_teardown_reuse_driver,
+    fixture_tokio_awaited_teardown_reuse_init,
+    awaited_teardown_after_foreign_reap_and_reuse_takes_nothing_body
+);
+
+// A traced zombie reaped elsewhere while a reap waits on events =====
+
+/// Spawns a tokio tracee, has a foreign tracer seize it, and arms the reap-parked seam: once a reap
+/// that waits on events has looked and found the zombie held by the tracer, the tracer hands it
+/// back, the test reaps it behind its owner's back, and a stranger that is already a zombie of ours
+/// takes its pid. Answers the child, its stdin and the slot the seam leaves the stranger in.
+async fn traced_then_reaped_elsewhere_on_park() -> (
+    crate::tokio::Child,
+    crate::tokio::ChildStdin,
+    std::rc::Rc<std::cell::RefCell<Option<std::process::Child>>>,
+    crate::oneshot_hook::Armed,
+) {
+    use crate::test_support::foreign_tracer::{self, REAP};
+
+    let (child, stdin) = foreign_tracer::spawn_tokio_tracee().await;
+    let pid = child.id().pid();
+    let mut tracer = foreign_tracer::spawn_helper(pid);
+    let reused: std::rc::Rc<std::cell::RefCell<Option<std::process::Child>>> = std::rc::Rc::default();
+    let hand = std::rc::Rc::clone(&reused);
+    let parked = crate::tokio::child::fault::set_reap_parked(move || {
+        tracer.send(REAP);
+        tracer.expect("reaped");
+        let reuser = reap_behind_and_reuse(pid);
+        assert_eq!(sigusr1_and_peek(&reuser), Some(libc::SIGUSR1));
+        *hand.borrow_mut() = Some(reuser);
+    });
+    (child, stdin, reused, parked)
+}
+
+/// Asserts the stranger the seam left in `reused` still has its exit record, of `SIGUSR1`.
+fn assert_stranger_untouched(reused: &std::cell::RefCell<Option<std::process::Child>>) {
+    let mut reuser = reused
+        .borrow_mut()
+        .take()
+        .expect("the reap parked on the traced zombie");
+    let status = reuser
+        .wait()
+        .expect("the stranger's exit record must still be unconsumed");
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&status),
+        Some(libc::SIGUSR1)
+    );
+}
+
+/// An awaited teardown whose root a foreign tracer holds as a zombie looks at the root again
+/// before every reap it tries. Here the tracer lets go after the teardown found the zombie held,
+/// the application reaps the root, and its pid goes to a stranger that is already a zombie of ours:
+/// the teardown takes nothing.
+///
+/// Mutant: tokio's own `wait` after one look (its repeated `waitpid(pid)` takes the stranger's
+/// record).
+fn awaited_teardown_of_a_traced_zombie_reaped_elsewhere_body() {
+    runtime().block_on(async {
+        let (mut child, stdin, reused, _parked) = traced_then_reaped_elsewhere_on_park().await;
+        let fate = child.tear_down_awaiting().await;
+        assert_stranger_untouched(&reused);
+        assert_ne!(
+            fate,
+            crate::error::ChildFate::Reaped,
+            "the root's exit was not collected"
+        );
+        drop(stdin);
+    });
+}
+in_fresh_pid_ns!(
+    namespaces_tokio_awaited_teardown_of_a_traced_zombie_reaped_elsewhere_takes_nothing,
+    fixture_tokio_awaited_traced_driver,
+    fixture_tokio_awaited_traced_init,
+    awaited_teardown_of_a_traced_zombie_reaped_elsewhere_body,
+    tracer
+);
+
+/// The same for `wait` after `kill`: `wait` answers `ECHILD` and takes nothing. (Killed, not left to
+/// exit on its own: any other signal, even an ignored `SIGPIPE`, stops a tracee until its tracer
+/// resumes it.)
+///
+/// Mutant: tokio's own `wait` after one look.
+fn wait_of_a_traced_zombie_reaped_elsewhere_body() {
+    runtime().block_on(async {
+        let (mut child, stdin, reused, _parked) = traced_then_reaped_elsewhere_on_park().await;
+        child.kill().expect("kill the tracee");
+        let answer = child.wait().await;
+        assert_stranger_untouched(&reused);
+        assert!(
+            matches!(&answer, Err(crate::error::Error::Io(e)) if e.raw_os_error() == Some(libc::ECHILD)),
+            "wait answered {answer:?}"
+        );
+        drop(stdin);
+    });
+}
+in_fresh_pid_ns!(
+    namespaces_tokio_wait_of_a_traced_zombie_reaped_elsewhere_takes_nothing,
+    fixture_tokio_wait_traced_driver,
+    fixture_tokio_wait_traced_init,
+    wait_of_a_traced_zombie_reaped_elsewhere_body,
+    tracer
 );
 
 /// The same with `kill_on_drop(false)`, which the derived elevated command reaches: the drop sends
@@ -1047,6 +1250,7 @@ fn reuser_token(child: &crate::tokio::Child, same_tick: bool) -> StartToken {
 /// kept (a debug panic on the later-tick reuse); `killpg` sent; the decision taken on the number
 /// alone (the same-tick reuse reads as the root).
 fn kill_tree_after_a_foreign_reap_and_reuse(same_tick: bool) {
+    let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     runtime().block_on(async {
         crate::log_capture::install();
         let recorder = crate::containment::unix::fault::record_kill_group();
@@ -1097,6 +1301,7 @@ in_fresh_pid_ns!(
 
 /// `terminate_tree`'s twin. Same mutants.
 fn terminate_tree_after_a_foreign_reap_and_reuse_body() {
+    let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     runtime().block_on(async {
         crate::log_capture::install();
         let recorder = crate::containment::unix::fault::record_term_group();
@@ -1292,6 +1497,7 @@ in_fresh_pid_ns!(
 
 /// The sync `graceful_shutdown_tree_after_a_foreign_reap_and_reuse_body`'s twin. Same mutant.
 fn graceful_shutdown_tree_after_a_foreign_reap_and_reuse_body() {
+    let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     runtime().block_on(async {
         crate::log_capture::install();
         let killed = crate::containment::unix::fault::record_kill_group();
