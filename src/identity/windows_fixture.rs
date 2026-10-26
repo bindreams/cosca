@@ -8,8 +8,8 @@
 //!
 //! One privilege defeats that: a token holding `SeDebugPrivilege` **enabled** bypasses the
 //! DACL outright. An interactive session does not hold it enabled; CI runners do. So
-//! [`drop_se_debug_privilege`] strips it from this process once, up front, making the DACL
-//! authoritative everywhere.
+//! [`drop_se_debug_privilege`] strips it from this process, making the DACL authoritative
+//! everywhere; see it for why every fixture takes the [`Completion`] of `own_process`.
 //!
 //! Teardown is safe: the handle `CreateProcessW` hands the creator carries full access
 //! regardless of the DACL, and the child is assigned to a kill-on-close job object so any
@@ -23,6 +23,7 @@
 
 use std::mem::size_of;
 
+use crate::test_own_process::Completion;
 use windows::core::PWSTR;
 use windows::Win32::Foundation::LUID;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, STILL_ACTIVE, WAIT_OBJECT_0};
@@ -42,10 +43,6 @@ use windows::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, STARTUPINFOW,
 };
 
-/// Runs [`drop_se_debug_privilege`] exactly once per test binary. Mirrors the crate's
-/// existing one-time test-setup idiom (`log_capture::install`).
-static SE_DEBUG_DROPPED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-
 /// Remove `SeDebugPrivilege` from THIS process's token.
 ///
 /// A token holding that privilege **enabled** bypasses a process object's DACL outright, so
@@ -58,35 +55,31 @@ static SE_DEBUG_DROPPED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 /// than a skip: if the precondition still fails to hold, `spawn_unkillable_denies_everything`
 /// and its siblings fail loudly instead of passing vacuously.
 ///
-/// `SE_PRIVILEGE_REMOVED` is irreversible for the token, so this runs ONCE, before the first
-/// fixture exists — not lazily inside whichever denial test happens to run first. Tests run
-/// in parallel, and a privilege that vanished partway through a run would make behaviour
-/// depend on test order even though nothing currently reads it.
-fn drop_se_debug_privilege() {
-    SE_DEBUG_DROPPED.get_or_init(|| {
-        let mut token = HANDLE::default();
-        // SAFETY: GetCurrentProcess returns a pseudo-handle needing no close.
-        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &mut token) }
-            .expect("OpenProcessToken(TOKEN_ADJUST_PRIVILEGES)");
-        let mut luid = LUID::default();
-        // SAFETY: `SE_DEBUG_NAME` is a static NUL-terminated wide string.
-        unsafe { LookupPrivilegeValueW(None, SE_DEBUG_NAME, &mut luid) }
-            .expect("LookupPrivilegeValueW(SeDebugPrivilege)");
-        let privileges = TOKEN_PRIVILEGES {
-            PrivilegeCount: 1,
-            Privileges: [LUID_AND_ATTRIBUTES {
-                Luid: luid,
-                Attributes: SE_PRIVILEGE_REMOVED,
-            }],
-        };
-        // Succeeds with ERROR_NOT_ALL_ASSIGNED when the token never held the privilege —
-        // the normal local case, and exactly the state we want either way.
-        // SAFETY: `privileges` describes one LUID and `PrivilegeCount` matches.
-        let adjusted = unsafe { AdjustTokenPrivileges(token, false, Some(&privileges), 0, None, None) };
-        // SAFETY: `token` is an owned handle we are done with.
-        unsafe { CloseHandle(token) }.expect("CloseHandle(process token)");
-        adjusted.expect("AdjustTokenPrivileges(SeDebugPrivilege, SE_PRIVILEGE_REMOVED)");
-    });
+/// `SE_PRIVILEGE_REMOVED` is irreversible for the token and the token is shared by every thread of
+/// the process, so a test running beside others would change what they observe. Calling it
+/// again is harmless: the privilege is already gone.
+fn drop_se_debug_privilege(_alone: &Completion) {
+    let mut token = HANDLE::default();
+    // SAFETY: GetCurrentProcess returns a pseudo-handle needing no close.
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &mut token) }
+        .expect("OpenProcessToken(TOKEN_ADJUST_PRIVILEGES)");
+    let mut luid = LUID::default();
+    // SAFETY: `SE_DEBUG_NAME` is a static NUL-terminated wide string.
+    unsafe { LookupPrivilegeValueW(None, SE_DEBUG_NAME, &mut luid) }.expect("LookupPrivilegeValueW(SeDebugPrivilege)");
+    let privileges = TOKEN_PRIVILEGES {
+        PrivilegeCount: 1,
+        Privileges: [LUID_AND_ATTRIBUTES {
+            Luid: luid,
+            Attributes: SE_PRIVILEGE_REMOVED,
+        }],
+    };
+    // Succeeds with ERROR_NOT_ALL_ASSIGNED when the token never held the privilege —
+    // the normal local case, and exactly the state we want either way.
+    // SAFETY: `privileges` describes one LUID and `PrivilegeCount` matches.
+    let adjusted = unsafe { AdjustTokenPrivileges(token, false, Some(&privileges), 0, None, None) };
+    // SAFETY: `token` is an owned handle we are done with.
+    unsafe { CloseHandle(token) }.expect("CloseHandle(process token)");
+    adjusted.expect("AdjustTokenPrivileges(SeDebugPrivilege, SE_PRIVILEGE_REMOVED)");
 }
 
 /// Sentinel for [`spawn_with_ace`]: build the DACL with no ACE at all.
@@ -229,8 +222,8 @@ impl Drop for RestrictedChild {
 
 /// Spawn a long-running child whose process-object DACL allows our user SID exactly
 /// `granted | PROCESS_TERMINATE` and nothing else.
-pub(crate) fn spawn_restricted(granted: u32) -> RestrictedChild {
-    spawn_with_ace(granted | PROCESS_TERMINATE.0)
+pub(crate) fn spawn_restricted(alone: &Completion, granted: u32) -> RestrictedChild {
+    spawn_with_ace(alone, granted | PROCESS_TERMINATE.0)
 }
 
 /// Spawn a child that even `PROCESS_TERMINATE` cannot open by pid. `Drop` still tears it
@@ -241,38 +234,39 @@ pub(crate) fn spawn_restricted(granted: u32) -> RestrictedChild {
 /// might be rejected by `AddAccessAllowedAce` (panicking the fixture) or normalized away
 /// (silently granting access, which would send all of its consumers down the `Opened::Found`
 /// path while still reporting green).
-pub(crate) fn spawn_unkillable() -> RestrictedChild {
-    spawn_with_ace(NO_ACE)
+pub(crate) fn spawn_unkillable(alone: &Completion) -> RestrictedChild {
+    spawn_with_ace(alone, NO_ACE)
 }
 
 /// Grants `PROCESS_QUERY_LIMITED_INFORMATION` and nothing else — identity is readable by pid
 /// but `PROCESS_TERMINATE` is denied, which is the only shape that drives `wait::kill`'s
 /// `Opened::Denied` arm (its mask is `TERMINATE | QUERY_LIMITED`, so `spawn_restricted` —
 /// which always ORs in `PROCESS_TERMINATE` — opens successfully and never reaches it).
-pub(crate) fn spawn_query_only() -> RestrictedChild {
-    spawn_with_ace(PROCESS_QUERY_LIMITED_INFORMATION.0)
+pub(crate) fn spawn_query_only(alone: &Completion) -> RestrictedChild {
+    spawn_with_ace(alone, PROCESS_QUERY_LIMITED_INFORMATION.0)
 }
 
 /// Like [`spawn_restricted`], but the restricted process is a shell that spawns an ordinary
 /// grandchild. A DACL is not inherited, so the grandchild is freely openable while its
 /// parent is not — the only way to build "my parent is access-denied" from a test.
-pub(crate) fn spawn_restricted_shell(granted: u32) -> RestrictedChild {
+pub(crate) fn spawn_restricted_shell(alone: &Completion, granted: u32) -> RestrictedChild {
     spawn_with_ace_cmdline(
+        alone,
         granted | PROCESS_TERMINATE.0,
         "C:\\Windows\\System32\\cmd.exe /c ping.exe -n 3600 127.0.0.1",
     )
 }
 
-fn spawn_with_ace(granted: u32) -> RestrictedChild {
-    spawn_with_ace_cmdline(granted, "C:\\Windows\\System32\\ping.exe -n 3600 127.0.0.1")
+fn spawn_with_ace(alone: &Completion, granted: u32) -> RestrictedChild {
+    spawn_with_ace_cmdline(alone, granted, "C:\\Windows\\System32\\ping.exe -n 3600 127.0.0.1")
 }
 
 /// Panics on any Win32 failure: a fixture that silently degrades would make its consumers
 /// pass vacuously.
-fn spawn_with_ace_cmdline(granted: u32, cmdline: &str) -> RestrictedChild {
-    // Before ANY fixture exists, so no denial assertion can observe a token that still
-    // bypasses DACLs. Idempotent and one-shot.
-    drop_se_debug_privilege();
+fn spawn_with_ace_cmdline(alone: &Completion, granted: u32, cmdline: &str) -> RestrictedChild {
+    // Before the child is created, so no denial assertion can observe a token that still
+    // bypasses DACLs.
+    drop_se_debug_privilege(alone);
 
     // Our own user SID, from our own token. `token` is a real handle — closed below.
     let mut token = HANDLE::default();

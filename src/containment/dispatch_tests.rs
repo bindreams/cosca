@@ -418,9 +418,15 @@ fn prepare_installs_no_marker_for_an_elevation_derived_spawn() {
 #[cfg(windows)]
 #[skuld::test]
 fn spawn_identity_distinguishes_a_denied_pid_from_a_vanished_one() {
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(spawn_identity_distinguishes_a_denied_pid_from_a_vanished_one),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
     use crate::child::spawn::{resolve_identity_unchecked, spawn_identity_error};
     use windows::Win32::System::Threading::PROCESS_SYNCHRONIZE;
-    let child = crate::identity::windows_fixture::spawn_restricted(PROCESS_SYNCHRONIZE.0);
+    let child = crate::identity::windows_fixture::spawn_restricted(&done, PROCESS_SYNCHRONIZE.0);
     assert!(child.is_running(), "precondition: the subject must be live");
 
     let denied = spawn_identity_error(resolve_identity_unchecked(child.pid()));

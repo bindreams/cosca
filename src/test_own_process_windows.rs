@@ -1,6 +1,7 @@
 //! Windows twin of the unix `test_own_process`: runs a test that must change process-global state
-//! (the environment, here) in a process of its own. Mounted by `#[path]` into `tests/common` as
-//! `test_own_process`, so a caller names the same items on both platforms.
+//! (the environment or this process's token) in a process of its own. Mounted as
+//! `test_own_process` in the library's tests and, by `#[path]`, in `tests/common`, so a caller
+//! names the same items on both platforms.
 //!
 //! The role marker, argv and gate are shared with the unix module: see
 //! [`super::test_own_process_gate`]. The transport differs. The parent reads the child's suite
