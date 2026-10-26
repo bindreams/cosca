@@ -4,7 +4,8 @@
 //! `kill(2)` that fails with `ESRCH` still records, so a test sees an attempt that reached the OS.
 //! A [`GroupStep`] send (to a group, its leader or a member) is written by
 //! [`send_signal`](crate::containment::unix::send_signal) AFTER the syscall returned, whatever it
-//! answers, with the signal it handed the syscall: a send that was skipped leaves no record.
+//! answers, with the signal it handed the syscall: a send that was skipped leaves no record. Where a
+//! test seam answers in the kernel's place, no syscall is made, and the step is still recorded.
 
 use std::cell::RefCell;
 
