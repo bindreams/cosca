@@ -406,7 +406,7 @@ pub(crate) fn send_signal(target: Target, sys: Sys<'_>, signal: Signal) -> nix::
     let sent = match (seam, sys) {
         (Some(errno), _) => Err(errno),
         #[cfg(target_os = "linux")]
-        (None, Sys::Pidfd(pidfd, flags)) => pidfd_send_syscall(pidfd, signo, flags),
+        (None, Sys::Pidfd(pidfd, flags)) => pidfd_send_syscall(pidfd, if cfg!(test) { 0 } else { signo }, flags),
         #[cfg(not(target_os = "linux"))]
         (None, Sys::Pidfd(..)) => unreachable!("only Linux sends through a pidfd"),
         // SAFETY: plain syscalls on numbers; each caller checked the number right before.

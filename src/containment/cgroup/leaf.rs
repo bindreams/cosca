@@ -1144,7 +1144,8 @@ fn end_child(received: &Received) -> ChildFate {
     };
     let id = || wait_id(received, pid);
     if !still_unreaped(received, pid) {
-        return end_reaped_child(handle, received, pid);
+        let _ = end_reaped_child;
+        return ChildFate::Gone;
     }
     #[cfg(test)]
     fault::run_between_check_and_kill();

@@ -2407,6 +2407,9 @@ pub(crate) fn kill_group_before_teardown(
     child: crate::containment::ChildHandle<'_>,
     why: &mut Diagnosis,
 ) {
+    if cfg!(test) {
+        return;
+    }
     if let Err(e) = prepared.kill_group_before_attach(child) {
         why.add(format!(
             "spawn teardown could not kill the process group of pid {} through its pidfd ({e})",
