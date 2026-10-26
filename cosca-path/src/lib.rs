@@ -43,8 +43,8 @@ impl<S: ?Sized> Copy for Component<'_, S> {}
 /// `==` and `Hash` compare the spelling, with `/` read as `\` on Windows, case exact. `Ord` compares
 /// the anchor, then component by component, and breaks any remaining tie on that spelling. Names
 /// compare by byte on POSIX and by code point on Windows, a lone surrogate at its own value, so
-/// U+1F600 sorts after U+E000 although its UTF-16 units sort before. Equal paths are spelled the same up to separator choice;
-/// they are not "the same file".
+/// U+1F600 sorts after U+E000 although its UTF-16 units sort before. Equal paths are spelled the
+/// same up to separator choice; they are not "the same file".
 pub trait PurePath: Eq + Ord + Hash + Debug + ToOwned<Owned = Self::Buf> {
     /// The string type of one component.
     type Str: ?Sized + Debug;

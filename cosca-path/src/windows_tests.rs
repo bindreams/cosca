@@ -151,7 +151,7 @@ fn verbatim_parses_like_its_plain_spelling() {
 /// alone the UNC path with an empty server, and a drive or a UNC server and share may be any unit,
 /// non-ASCII or a lone surrogate.
 ///
-/// Mutant: a verbatim drive is only an ASCII letter, so `\\?\é:\x` is the device `é:`.
+/// Mutant: a drive is only an ASCII unit, so `\\?\é:\x` is the device `é:`.
 #[skuld::test]
 fn verbatim_unc_and_non_ascii_rests() {
     assert_eq!(p(r"\\?\UNC").anchor(), Anchor::Device { name: os("UNC") });
