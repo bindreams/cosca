@@ -126,7 +126,8 @@ pub(crate) enum ProcSource {
     },
     /// A child something else reaped, or one that cannot be shown to be ours (macOS: no unique id,
     /// or a peek that failed): tokio's `Child` is forgotten, and only the streams it had not yet
-    /// handed out remain, so a caller who waits and then reads keeps its output.
+    /// handed out remain, so a caller who waits and then reads keeps its output. On Linux, a child
+    /// reaped elsewhere also keeps its pidfd (`pidfd`).
     #[cfg(unix)]
     Foreign {
         stdin: Option<::tokio::process::ChildStdin>,
@@ -136,8 +137,7 @@ pub(crate) enum ProcSource {
         fate: Forgotten,
         /// The pidfd of a child forgotten as reaped elsewhere, kept so that its process group is
         /// still decided through it, as for every other reaped root (see [`ProcSource::pidfd`]).
-        /// Closed with the backend, so the handle owns its lifetime. Empty for any other fate, and
-        /// once a teardown took it to reap through.
+        /// Closed with the backend, so the handle owns its lifetime. Empty for any other fate.
         #[cfg(target_os = "linux")]
         pidfd: PinnedPidfd,
     },
@@ -148,8 +148,10 @@ pub(crate) enum ProcSource {
 }
 
 /// The backend's pidfd. A [`ProcSource`] has a `Drop`, so a field cannot be moved out of it; this
-/// lets the teardown take the original (never a duplicate, which can fail at the fd limit) and hand
-/// it on. Taken only by the hand-off, which forgets the backend at once.
+/// lets a teardown take the original (never a duplicate, which can fail at the fd limit) and hand
+/// it on. [`take`](PinnedPidfd::take) is for a teardown that reaps through the pidfd and forgets
+/// the backend at once; [`hand_off`](PinnedPidfd::hand_off) moves it to the `Foreign` backend that
+/// replaces a `Tokio` one.
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub(crate) struct PinnedPidfd(Option<std::os::fd::OwnedFd>);
@@ -172,7 +174,7 @@ impl PinnedPidfd {
         PinnedPidfd(None)
     }
 
-    /// The pidfd, unless a teardown took it.
+    /// The pidfd, or `None` for a backend that kept none.
     fn get(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
         self.0.as_ref().map(std::os::fd::AsFd::as_fd)
     }
@@ -546,9 +548,8 @@ impl ProcSource {
     }
 
     /// Whether the child has exited by the time `grace` is over, read only through its pidfd: nothing
-    /// is reaped and no state is read. A forgotten backend is not waited on: its
-    /// child has exited if it was reaped elsewhere, and may still run if it was never shown to be
-    /// ours.
+    /// is reaped and no state is read. A forgotten backend is not waited on: its child has exited if
+    /// it was reaped elsewhere, and may still run if it was never shown to be ours.
     #[cfg(target_os = "linux")]
     pub(crate) async fn exited_within(&self, grace: std::time::Duration) -> Result<bool, Error> {
         match self {
@@ -749,8 +750,10 @@ impl ProcSource {
 
     /// Forget the child: tokio's `Child` is leaked, never dropped, because its drop would reap by
     /// pid, and the pid may name another process by now. The untaken streams close, and so does
-    /// cosca's own pidfd. What leaks is tokio's own: on Linux its pidfd and its reactor
-    /// registration, on macOS its `SIGCHLD` watch.
+    /// cosca's own pidfd, unless the caller moved it to the backend that replaces this one
+    /// ([`forget_quietly`](ProcSource::forget_quietly) does, for a child reaped elsewhere). What
+    /// leaks is tokio's own: on Linux its pidfd and its reactor registration, on macOS its
+    /// `SIGCHLD` watch.
     #[cfg(unix)]
     pub(crate) fn forget(mut self) {
         if let ProcSource::Tokio { child, .. } = &mut self {
