@@ -331,3 +331,88 @@ fn an_abandoned_child_reaped_before_its_group_kill_by_number_is_not_sent_it() {
     );
     assert_eq!(fate, ChildFate::Gone);
 }
+
+/// A forked group leader that forked a member into its group and exited, as a child that exec'd
+/// outside its leaf may. The member blocks reading the returned writer's pipe; once that closes it
+/// writes `survived` to the returned reader's pipe and exits, so a member a kill missed is seen as
+/// that marker, never as a hang.
+fn exited_leader_with_member() -> (KillOnDrop, std::io::PipeWriter, std::io::PipeReader) {
+    use std::os::fd::AsRawFd;
+    let (from_test, to_member) = std::io::pipe().expect("pipe");
+    let (from_member, to_test) = std::io::pipe().expect("pipe");
+    let fds = [
+        from_test.as_raw_fd(),
+        to_member.as_raw_fd(),
+        from_member.as_raw_fd(),
+        to_test.as_raw_fd(),
+    ];
+    let leader = fork_running(move || {
+        let [input, test_end, _, output] = fds;
+        // SAFETY: async-signal-safe syscalls on fds this process holds.
+        unsafe {
+            libc::setpgid(0, 0);
+            if libc::fork() == 0 {
+                libc::close(test_end);
+                libc::close(fds[2]);
+                let mut byte = 0u8;
+                while libc::read(input, (&raw mut byte).cast(), 1) == 1 {}
+                libc::write(output, b"survived".as_ptr().cast(), 8);
+                libc::_exit(0);
+            }
+        }
+    });
+    drop((from_test, to_test));
+    (leader, to_member, from_member)
+}
+
+/// What the member of [`exited_leader_with_member`] wrote once its pipe closed: `survived`, or
+/// nothing if it was killed.
+fn member_output(to_member: std::io::PipeWriter, mut from_member: std::io::PipeReader) -> String {
+    drop(to_member);
+    let mut out = String::new();
+    std::io::Read::read_to_string(&mut from_member, &mut out).expect("read the member's output");
+    out
+}
+
+/// Linux 6.9+: a child outside its leaf that another reaper reaped before `end_child`'s look still
+/// names its process group through its handle, so the member it left there is killed, and the
+/// child is `Killed`. Mutant: "a child reaped before the look is `Gone` without the group kill".
+#[skuld::test]
+fn an_abandoned_child_reaped_before_the_look_has_its_group_killed(#[fixture(pidfd_group_signal)] _group: &Group) {
+    use crate::send_log::{GroupStep, Route};
+    let (leader, to_member, from_member) = exited_leader_with_member();
+    let received = received(leader, Some(PlacementReport::WriteFailed(libc::EBADF)));
+    crate::test_child::reaped_elsewhere::reap_behind(received.pid.expect("a pid"));
+    let capture = crate::send_log::Capture::start();
+
+    let fate = end_child(&received);
+    let steps = capture.group_steps();
+    let out = member_output(to_member, from_member);
+    assert_eq!(steps, [GroupStep::Group(Route::Pidfd, libc::SIGKILL)]);
+    assert_eq!(out, "", "the member was killed");
+    assert_eq!(fate, ChildFate::Killed);
+}
+
+/// Where the kernel refuses `PIDFD_SIGNAL_PROCESS_GROUP` (before 6.9), a child reaped before the
+/// look is `Gone`, and nothing goes to its group's number: the check before it finds the child
+/// reaped. Mutant: "a group kill by number for a reaped child".
+#[skuld::test]
+fn an_abandoned_child_reaped_before_the_look_gets_no_group_kill_by_number() {
+    use crate::send_log::{GroupStep, Route};
+    let (leader, to_member, from_member) = exited_leader_with_member();
+    let received = received(leader, Some(PlacementReport::WriteFailed(libc::EBADF)));
+    crate::test_child::reaped_elsewhere::reap_behind(received.pid.expect("a pid"));
+    let capture = crate::send_log::Capture::start();
+    let refused = crate::containment::unix::fault::refuse_pidfd_group_flag();
+
+    let fate = end_child(&received);
+    drop(refused);
+    let steps = capture.group_steps();
+    let out = member_output(to_member, from_member);
+    assert!(
+        !steps.iter().any(|s| matches!(s, GroupStep::Group(Route::Number, _))),
+        "nothing went by the number: {steps:?}"
+    );
+    assert_eq!(out, "survived");
+    assert_eq!(fate, ChildFate::Gone);
+}
