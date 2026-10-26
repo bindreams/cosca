@@ -684,9 +684,10 @@ impl CgroupLeaf {
     ///
     /// Each listed pid is pinned by a pidfd first, then shown to be in the leaf (or under it) and
     /// still running, and signalled through the pidfd: a pid that exited and was reused after the
-    /// read names a process outside the leaf, and is left alone. A member that cannot be pinned or
-    /// placed is not signalled, as a pid it names may be another process's; `cgroup.kill` (the hard
-    /// half) still reaches it.
+    /// read names a process outside the leaf, and is left alone. A pinned member whose place can no
+    /// longer be read because it exited is gone, as one that exited before its pin. A member that
+    /// cannot be pinned or placed is not signalled, as a pid it names may be another process's;
+    /// `cgroup.kill` (the hard half) still reaches it.
     ///
     /// A listed member that got no `SIGTERM` for any reason but its exit is logged at `warn`, naming
     /// the leaf and the pid, and makes the call an error once every member was tried:
@@ -771,6 +772,8 @@ impl CgroupLeaf {
             }
             Err(e) => return Err(Unsignalled::Unproven(format!("it could not be pinned ({e})"))),
         };
+        #[cfg(test)]
+        fault::run_after_terminate_pin();
         // A pid read while its pidfd's process still runs names that process: the membership check
         // read the process the pidfd pins.
         match self
@@ -782,18 +785,22 @@ impl CgroupLeaf {
                 log::debug!("cgroup terminate: pid {pid} is not a running member of the leaf; not signalled");
                 return Ok(());
             }
-            Err(e) => return Err(Unsignalled::Unproven(format!("it could not be placed ({e})"))),
+            // A member that exited and was reaped since its pin has no place left to read
+            // (`ENOENT` from `/proc`, `ESRCH` from `PIDFD_GET_INFO`): its pidfd tells it apart.
+            Err(e) => match pidfd_exited(pidfd.as_fd()) {
+                Ok(true) => {
+                    log::debug!("cgroup terminate: pid {pid} exited before it was placed ({e}); not signalled");
+                    return Ok(());
+                }
+                Ok(false) => return Err(Unsignalled::Unproven(format!("it could not be placed ({e})"))),
+                Err(exited) => {
+                    return Err(Unsignalled::Unproven(format!(
+                        "it could not be placed ({e}), nor its exit read ({exited})"
+                    )))
+                }
+            },
         }
-        #[cfg(test)]
-        let sent = match fault::terminate_fails(fault::TerminateStep::Send) {
-            Some(errno) => Err(rustix::io::Errno::from_raw_os_error(errno)),
-            None => rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::TERM),
-        };
-        #[cfg(not(test))]
-        let sent = rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::TERM);
-        #[cfg(test)]
-        fault::record_terminated_by_pid(pid);
-        match sent {
+        match send_term(pidfd.as_fd()) {
             Ok(()) => Ok(()),
             Err(rustix::io::Errno::SRCH) => {
                 log::debug!("cgroup terminate: pid {pid} exited before its SIGTERM");
@@ -802,6 +809,23 @@ impl CgroupLeaf {
             Err(e) => Err(Unsignalled::Failed(format!("{e}"))),
         }
     }
+}
+
+/// [`CgroupLeaf::terminate`]'s `SIGTERM` to the member `pidfd` pins, through that pidfd, and the
+/// kernel's answer; in a test build a `fail_terminate` seam answers in its
+/// place. It is given no pid, so it cannot send by one. A test build notes the send once it
+/// answered, with the route it took.
+fn send_term(pidfd: std::os::fd::BorrowedFd<'_>) -> rustix::io::Result<()> {
+    #[cfg(test)]
+    let sent = match fault::terminate_fails(fault::TerminateStep::Send) {
+        Some(errno) => Err(rustix::io::Errno::from_raw_os_error(errno)),
+        None => rustix::process::pidfd_send_signal(pidfd, rustix::process::Signal::TERM),
+    };
+    #[cfg(not(test))]
+    let sent = rustix::process::pidfd_send_signal(pidfd, rustix::process::Signal::TERM);
+    #[cfg(test)]
+    fault::record_member_term_through(pidfd);
+    sent
 }
 
 /// Why [`CgroupLeaf::terminate`] sent a listed pid no `SIGTERM`.

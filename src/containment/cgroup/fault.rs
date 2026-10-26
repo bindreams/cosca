@@ -12,9 +12,10 @@ thread_local! {
     static BEFORE_FRONT_PROBE: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static BEFORE_HANDLE_KILL: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static AFTER_PROCS_READ: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
+    static AFTER_TERMINATE_PIN: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static CHILD_SENDS: std::cell::RefCell<Vec<ChildSend>> = const { std::cell::RefCell::new(Vec::new()) };
     static FORCE_GROUP_KILL_GONE: Cell<bool> = const { Cell::new(false) };
-    static TERMINATED_BY_PID: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+    static MEMBER_TERMS: std::cell::RefCell<Vec<MemberTerm>> = const { std::cell::RefCell::new(Vec::new()) };
     static HOOK_GATE: Cell<Option<std::os::fd::RawFd>> = const { Cell::new(None) };
     static FORCE_CHILD_KILL_DENIED: Cell<bool> = const { Cell::new(false) };
     static FORCE_GROUP_KILL_DENIED: Cell<bool> = const { Cell::new(false) };
@@ -708,14 +709,40 @@ pub(crate) fn run_after_procs_read() {
     crate::oneshot_hook::fire(&AFTER_PROCS_READ);
 }
 
-/// Note a member `CgroupLeaf::terminate` sent its `SIGTERM` on this thread, once the send (or the
-/// seam standing in for it) answered.
-pub(crate) fn record_terminated_by_pid(pid: u32) {
-    TERMINATED_BY_PID.with(|t| t.borrow_mut().push(pid));
+/// Run `hook` in the NEXT `CgroupLeaf::terminate` on this thread, once it has pinned its first
+/// member by a pidfd and before it places that member: the window in which a pinned member can
+/// exit and be reaped.
+pub(crate) fn set_after_terminate_pin(hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
+    crate::oneshot_hook::arm(&AFTER_TERMINATE_PIN, hook)
 }
-/// The members this thread's `CgroupLeaf::terminate` signalled since the last call.
-pub(crate) fn take_terminated_by_pid() -> Vec<u32> {
-    TERMINATED_BY_PID.with(|t| std::mem::take(&mut *t.borrow_mut()))
+pub(crate) fn run_after_terminate_pin() {
+    crate::oneshot_hook::fire(&AFTER_TERMINATE_PIN);
+}
+
+/// A `SIGTERM` `CgroupLeaf::terminate` sent a member: the pid its pidfd names (`None` once that
+/// process is reaped, or where it cannot be read), and the route of the send.
+pub(crate) type MemberTerm = (Option<u32>, crate::send_log::Via);
+
+/// Notes a member's `SIGTERM` on this thread, sent through `pidfd`, once the send (or the seam
+/// standing in for it) answered. The pid is read from the pidfd's fdinfo, so the sender needs no
+/// pid to record one.
+pub(crate) fn record_member_term_through(pidfd: std::os::fd::BorrowedFd<'_>) {
+    use std::os::fd::AsRawFd as _;
+    let pid = std::fs::read_to_string(format!("/proc/thread-self/fdinfo/{}", pidfd.as_raw_fd()))
+        .ok()
+        .and_then(|fdinfo| {
+            fdinfo
+                .lines()
+                .find_map(|line| line.strip_prefix("Pid:"))
+                .and_then(|pid| pid.trim().parse::<i64>().ok())
+        })
+        .and_then(|pid| u32::try_from(pid).ok().filter(|&pid| pid > 0));
+    MEMBER_TERMS.with(|t| t.borrow_mut().push((pid, crate::send_log::Via::Pidfd)));
+}
+
+/// The `SIGTERM`s this thread's `CgroupLeaf::terminate` sent members since the last call.
+pub(crate) fn take_member_terms() -> Vec<MemberTerm> {
+    MEMBER_TERMS.with(|t| std::mem::take(&mut *t.borrow_mut()))
 }
 
 /// Pumps started and ended, per leaf name, process-wide.

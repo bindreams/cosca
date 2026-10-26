@@ -3071,10 +3071,13 @@ enum Unsignalled {
 }
 
 /// A member `terminate` could not pin, place or signal got no `SIGTERM`: the call is an error, and
-/// one `warn` names the leaf and the pid. Mutant: "a member left unsignalled is a `debug` line and
-/// `Ok`".
+/// one `warn` names the leaf and the pid. The member ends at its stdin's EOF, after the call, so a
+/// `SIGTERM` sent anyway shows as its death by that signal. Mutants: "a member left unsignalled is a
+/// `debug` line and `Ok`", "the member is signalled anyway, then reported".
 #[cfg(target_os = "linux")]
 fn terminate_reports_a_member_it_could_not_signal(how: Unsignalled) {
+    use std::os::unix::process::ExitStatusExt as _;
+
     use crate::containment::cgroup::fault::{fail_subtree, fail_terminate, TerminateStep};
     crate::log_capture::install();
     let (leaf, mut member, stdin) = entered_real_leaf();
@@ -3097,11 +3100,10 @@ fn terminate_reports_a_member_it_could_not_signal(how: Unsignalled) {
         .into_iter()
         .filter(|(level, _)| *level == log::Level::Warn)
         .collect();
-    let running = member.try_wait().expect("look at the member");
     drop(stdin);
-    member.wait().expect("reap the member");
+    let status = member.wait().expect("reap the member");
     drop(leaf);
-    assert_eq!(running, None, "the member got no SIGTERM");
+    assert_eq!(status.signal(), None, "the member got no SIGTERM: {status:?}");
     let err = result.expect_err("a member got no SIGTERM");
     let detail = err.to_string();
     assert!(
@@ -3149,34 +3151,69 @@ fn cgroup_terminate_leaves_alone_a_member_that_left_after_the_listing(#[fixture(
     let _armed = crate::containment::cgroup::fault::set_after_procs_read(move || {
         crate::child::front_cgroup_tests::move_out_of_its_leaf(pid);
     });
-    crate::containment::cgroup::fault::take_terminated_by_pid();
+    crate::containment::cgroup::fault::take_member_terms();
     leaf.terminate().expect("terminate");
-    assert_eq!(
-        crate::containment::cgroup::fault::take_terminated_by_pid(),
-        Vec::<u32>::new()
-    );
+    assert_eq!(crate::containment::cgroup::fault::take_member_terms(), []);
     drop(stdin);
     let status = member.wait().expect("reap the member");
     assert_eq!(status.signal(), None, "the member exited on its own EOF: {status:?}");
     drop(leaf);
 }
 
-/// `terminate` sends a running member its `SIGTERM`, and notes it once sent. The member exits at its
-/// stdin's EOF too, so a send that was skipped shows as a plain exit, never as a hang. Mutant: "the
-/// `SIGTERM` is noted and not sent".
+/// `terminate` sends a running member its `SIGTERM` through the member's pidfd, noted by the helper
+/// that makes the send, once sent. The member exits at its stdin's EOF too, so a send that was
+/// skipped shows as a plain exit, never as a hang. Mutants: "the `SIGTERM` is noted and not sent",
+/// "the `SIGTERM` goes by the member's number" (nothing notes a send the helper did not make).
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn cgroup_terminate_sends_a_member_its_sigterm(#[fixture(cgroup)] _group: &Group) {
     use std::os::unix::process::ExitStatusExt as _;
     let (leaf, mut member, stdin) = entered_real_leaf();
     let pid = member.id();
-    crate::containment::cgroup::fault::take_terminated_by_pid();
+    crate::containment::cgroup::fault::take_member_terms();
     let result = leaf.terminate();
-    let noted = crate::containment::cgroup::fault::take_terminated_by_pid();
+    let noted = crate::containment::cgroup::fault::take_member_terms();
     drop(stdin);
     let status = member.wait().expect("reap the member");
     drop(leaf);
     assert_eq!(status.signal(), Some(libc::SIGTERM), "got {status:?}");
-    assert_eq!(noted, [pid]);
+    assert_eq!(noted, [(Some(pid), crate::send_log::Via::Pidfd)]);
     result.expect("terminate");
+}
+
+/// A member that exits and is reaped after `terminate` pinned it, before it is placed, is gone, not
+/// a failure: its place can no longer be read, and its pidfd says it exited. Nothing is sent, and
+/// nothing warns. Mutant: "a placement error after the pin is a failure".
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn cgroup_terminate_counts_a_member_reaped_after_its_pin_as_gone(#[fixture(cgroup)] _group: &Group) {
+    crate::log_capture::install();
+    let (leaf, member, _stdin) = entered_real_leaf();
+    let pid = member.id();
+    let leaf_name = leaf
+        .path()
+        .file_name()
+        .expect("a leaf name")
+        .to_string_lossy()
+        .into_owned();
+    let _armed = crate::containment::cgroup::fault::set_after_terminate_pin(move || {
+        // SAFETY: `pid` is this test's own unreaped child.
+        assert_eq!(
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) },
+            0,
+            "kill the member"
+        );
+        crate::test_child::reaped_elsewhere::reap_behind(pid);
+    });
+    crate::containment::cgroup::fault::take_member_terms();
+    let mark = crate::log_capture::mark();
+    let result = leaf.terminate();
+    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, &leaf_name)
+        .into_iter()
+        .filter(|(level, _)| *level == log::Level::Warn)
+        .collect();
+    assert_eq!(crate::containment::cgroup::fault::take_member_terms(), []);
+    result.expect("a member reaped after its pin is gone");
+    assert_eq!(warns, [], "nothing warns of a member that is gone");
+    drop(leaf);
 }

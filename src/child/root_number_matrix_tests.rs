@@ -7,15 +7,16 @@
 //! nothing once the root is gone.
 //!
 //! The recorders replace `killpg` with a record and record every walk, holder signal, pidfd signal,
-//! `cgroup.kill` write and bare-pid `SIGTERM`, so a mutant that sends by number reaches no process.
+//! `cgroup.kill` write and cgroup member's `SIGTERM` with its route, so a mutant that sends by
+//! number reaches no process.
 //! Each cell's tree is a root `cat` and a second `cat` in its group (in its leaf, holding its
 //! marker) that ignores `SIGTERM` and outlives the root. Both end once stdin closes, so a root an
 //! entry point leaves alone ends without a signal. Every cell is checked, and the whole matrix is
 //! printed if any cell is wrong.
 //!
-//! Two sends by number are routed, and their cells expect them until the issue lands:
-//! [`KILLPG_AFTER_OWN_REAP`] (a group after this handle's own reap, the pid naming nothing) and
-//! [`CGROUP_TERM_BY_PID`] (a cgroup's `SIGTERM` to each member, reaped root or not).
+//! One send by number is routed, and its cells expect it until the issue lands:
+//! [`KILLPG_AFTER_OWN_REAP`] (a group after this handle's own reap, the pid naming nothing). A
+//! cgroup's `SIGTERM` goes to each member through the member's pidfd, never by its number.
 
 use std::time::Duration;
 
@@ -314,7 +315,7 @@ struct Sent {
     killpg: bool,
     walk: bool,
     /// A signal to a bare pid: macOS's identity-checked kill of the root, or a cgroup member's
-    /// `SIGTERM`.
+    /// `SIGTERM` by its number.
     by_pid: bool,
     // Exact.
     /// The signals the `cat`, a marker holder, got through the holders channel.
@@ -322,6 +323,8 @@ struct Sent {
     /// The signals the root, also a marker holder, got through the holders channel.
     root_holder: Vec<nix::sys::signal::Signal>,
     pidfd: bool,
+    /// A cgroup member's `SIGTERM` through its pidfd.
+    member_term: bool,
     cgroup_kill: bool,
 }
 
@@ -354,14 +357,14 @@ struct Expected {
     /// `None`: not checked.
     root_holder: Option<&'static [nix::sys::signal::Signal]>,
     pidfd: Want,
+    /// A cgroup member's `SIGTERM` through its pidfd.
+    member_term: Want,
     cgroup_kill: Want,
 }
 
 /// The killpg after this handle's own reap, while the pid names nothing: the group may still have
 /// members, but once none survives another process may take the number first.
 const KILLPG_AFTER_OWN_REAP: Want = Want::Routed("bindreams/cosca#382");
-/// A cgroup's `SIGTERM` goes to each member by the pid `cgroup.procs` lists.
-const CGROUP_TERM_BY_PID: Want = Want::Routed("bindreams/cosca#106");
 
 fn expected(mechanism: Mechanism, reap: Reap, op: Op) -> Expected {
     use nix::sys::signal::Signal::{SIGKILL, SIGTERM};
@@ -379,7 +382,7 @@ fn expected(mechanism: Mechanism, reap: Reap, op: Op) -> Expected {
         Want::No
     };
     let by_pid = if mechanism.is_cgroup() && !op.kills() {
-        CGROUP_TERM_BY_PID
+        Want::No
     } else if cfg!(target_os = "macos") && op.tears_down() && reap == Reap::Unanswered {
         // A teardown kills the root through its handle, as `kill` does: on macOS by pid, after a
         // check of its unique id.
@@ -422,6 +425,13 @@ fn expected(mechanism: Mechanism, reap: Reap, op: Op) -> Expected {
         (true, false, Op::Terminate) => Want::No,
         (true, false, _) => Want::Yes,
     };
+    // The tree's second `cat` stays a running member, so the graceful half reaches it, reaped root
+    // or not.
+    let member_term = if mechanism.is_cgroup() && !op.kills() {
+        Want::Yes
+    } else {
+        Want::No
+    };
     let cgroup_kill = if mechanism.is_cgroup() && op != Op::Terminate {
         Want::Yes
     } else {
@@ -434,6 +444,7 @@ fn expected(mechanism: Mechanism, reap: Reap, op: Op) -> Expected {
         holder,
         root_holder,
         pidfd,
+        member_term,
         cgroup_kill,
     }
 }
@@ -450,6 +461,7 @@ fn mismatches(want: &Expected, sent: &Sent) -> Vec<String> {
     check("walk", want.walk, sent.walk);
     check("by-pid", want.by_pid, sent.by_pid);
     check("pidfd", want.pidfd, sent.pidfd);
+    check("member SIGTERM", want.member_term, sent.member_term);
     check("cgroup.kill", want.cgroup_kill, sent.cgroup_kill);
     if let Some(holder) = want.holder {
         if sent.holder != holder {
@@ -479,7 +491,7 @@ impl Recorders {
         #[cfg(target_os = "linux")]
         {
             crate::containment::cgroup::fault::record_leaf_steps();
-            crate::containment::cgroup::fault::take_terminated_by_pid();
+            crate::containment::cgroup::fault::take_member_terms();
         }
         Recorders {
             groups: crate::containment::unix::fault::record_kill_group(),
@@ -500,18 +512,20 @@ impl Recorders {
         use crate::send_log::Via;
         let entries = self.sends.entries();
         #[cfg(target_os = "linux")]
-        let (cgroup_kill, terminated) = (
+        let (cgroup_kill, member_terms) = (
             crate::containment::cgroup::fault::take_leaf_steps()
                 .iter()
                 .any(|step| step == "kill"),
-            !crate::containment::cgroup::fault::take_terminated_by_pid().is_empty(),
+            crate::containment::cgroup::fault::take_member_terms(),
         );
         #[cfg(not(target_os = "linux"))]
-        let (cgroup_kill, terminated) = (false, false);
+        let (cgroup_kill, member_terms): (bool, Vec<(Option<u32>, Via)>) = (false, Vec::new());
         Sent {
             killpg: !self.groups.killed().is_empty() || !self.terms.termed().is_empty(),
             walk: !self.walks.walked().is_empty(),
-            by_pid: terminated || entries.iter().any(|(_, _, via)| *via == Via::Pid),
+            by_pid: member_terms.iter().any(|(_, via)| *via == Via::Pid)
+                || entries.iter().any(|(_, _, via)| *via == Via::Pid),
+            member_term: member_terms.iter().any(|(_, via)| *via == Via::Pidfd),
             #[cfg(target_os = "macos")]
             holder: self.holders.signals_to(cat),
             #[cfg(not(target_os = "macos"))]
