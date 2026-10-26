@@ -101,6 +101,10 @@ pub(crate) enum Container {
     LeafNotTaken,
     /// `Strongest` with no cgroup leaf made (what a host without a delegated cgroup gives), so the
     /// process group set before the spawn is the containment.
+    #[cfg_attr(
+        not(feature = "tokio"),
+        allow(dead_code, reason = "only the async post-fork tests use it")
+    )]
     Leafless,
 }
 
