@@ -69,6 +69,24 @@ PAIRS = [
     (r"a\nul.txt", r"a\nul.txt\."),
     (r"nul\x", r".\nul\x"),
     (r"com1.txt\f", r".\com1.txt\f"),
+    # A rooted path that starts `\??\`, which Win32 hands to the object manager untouched.
+    (r"\??\C:\x", r"\.\??\C:\x"),
+    (r"\??\x", r"\.\??\x"),
+    (r"\??\nul", r"\.\??\nul\."),
+    (r"\??\C:\nul", r"\.\??\C:\nul\."),
+    ("\\??\\", "\\.\\??\\"),
+]
+# UNC and device paths: does any Windows read a reserved name in them as a device?
+UNC_AND_DEVICE = [
+    r"\\s\h\nul",
+    r"\\s\h\com1",
+    r"\\s\h\a\nul.txt",
+    r"\\.\x\nul",
+    r"\\.\nul",
+    "//s/h/nul",
+    r"\\s\nul",
+    r"\\s\h\nul\.",
+    r"\\.\x\nul\.",
 ]
 # Controls: no proposal.
 CONTROLS = [r"com1.txt\x", r"COM1.TXT\file1.txt", r"C:\x\nul", r"C:\x\nul\.", r"a\nul\.", r"a\com1\."]
@@ -92,6 +110,9 @@ def main() -> None:
     for c in CONTROLS:
         print("control")
         show("control", c)
+    for u in UNC_AND_DEVICE:
+        print("unc_or_device")
+        show("row", u)
 
 
 main()
