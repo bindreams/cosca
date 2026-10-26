@@ -1,6 +1,7 @@
 //! `Child::drop` once the root is reaped: a kill that names the tree by the root's number
 //! (`killpg`, a ppid walk from the root's pid) could hit an unrelated process that reused the
-//! number, so the drop skips it and warns instead.
+//! number, so the drop skips it and warns instead. On Linux 6.9+ the root's pidfd decides a
+//! process group instead (`drop_group_exact_tests`), so the tests here refuse that flag.
 //!
 //! The recorder tests replace `killpg` with a recorder (`unix::fault::record_kill_group`) and
 //! record the ppid walks (`treewalk::fault::record_walks`), so a mutant that still sends either
@@ -50,7 +51,10 @@ fn root_that_leaves_a_cat() -> Command {
 }
 
 /// The pipes of a [`spawn_cat_tree`]: the `cat`'s stdin, and its stdout and stderr.
-#[cfg(not(target_os = "macos"))]
+#[cfg_attr(
+    target_os = "macos",
+    allow(dead_code, reason = "the echo round trip is the non-macOS test's")
+)]
 struct CatPipes {
     stdin: std::io::PipeWriter,
     stdout: std::io::PipeReader,
@@ -60,7 +64,6 @@ struct CatPipes {
 /// Spawn [`root_that_leaves_a_cat`] and read its `started`: the `cat` is forked, and the root is
 /// exiting, a zombie, or already reaped by the spawn (`SharedChild::new` reaps a root that has
 /// exited by then).
-#[cfg(not(target_os = "macos"))]
 fn spawn_cat_tree() -> (crate::Child, CatPipes) {
     let mut child = root_that_leaves_a_cat().spawn().expect("spawn");
     assert_eq!(child.containment(), SESSION_CONTAINMENT);
@@ -80,6 +83,8 @@ fn drop_warns_since(mark: usize) -> Vec<(log::Level, String)> {
 /// Mutants: `killpg` still sent after the reap; no warn; the warn without the pgid.
 #[skuld::test]
 fn dropping_a_waited_on_process_group_child_sends_no_killpg_and_warns_with_the_pgid() {
+    #[cfg(target_os = "linux")]
+    let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();
     let recorder = record_kill_group();
     let teardowns = record_root_teardowns();
@@ -149,50 +154,23 @@ fn dropping_an_exited_but_unreaped_process_group_child_still_kills_the_group() {
     assert_eq!(drop_warns_since(mark), []);
 }
 
-/// Root `sh` prints `started` and exits, leaving a reader in its group that holds the stdin pipe
-/// the test keeps open. The reader is the one background process (`{ ...; } &` forks no second
-/// one), so it prints `eof` on stdout exactly when it was not killed first and the test later
-/// closes stdin.
-fn root_that_leaves_an_eof_reporter() -> Command {
-    let mut cmd = session(&[
-        "sh",
-        "-c",
-        "exec 3<&0; { read -r _; echo eof; } <&3 3<&- & echo started; exit 0",
-    ]);
-    cmd.stdin(Stdio::pipe_in()).expect("stdin pipe");
-    cmd.stdout(Stdio::pipe_out()).expect("stdout pipe");
-    cmd
-}
-
-/// Real `killpg`: `kill_tree()` before `wait()` ends a descendant that outlives the root. Stdin is
-/// closed after the kill, so a `kill_tree` that sends nothing lets the descendant report `eof`
-/// instead of leaving the read below unbounded.
+/// Real `killpg`: `kill_tree()` before `wait()` ends a descendant that outlives the root. A killed
+/// `cat` cannot echo the test's byte, and a live one does, so a kill that was not made fails the
+/// assertion rather than hanging a read.
 #[skuld::test]
 fn kill_tree_before_wait_ends_a_descendant_of_an_exited_root() {
-    let mut child = root_that_leaves_an_eof_reporter().spawn().expect("spawn");
-    assert_eq!(child.containment(), SESSION_CONTAINMENT);
-    let mut stdout = child.stdout().expect("stdout pipe");
-    let stdin = child.stdin().expect("stdin pipe");
-    let mut started = [0u8; 8];
-    stdout.read_exact(&mut started).expect("read `started`");
-    assert_eq!(&started, b"started\n");
+    let (child, mut pipes) = spawn_cat_tree();
 
     child.kill_tree().expect("kill_tree");
-    drop(stdin);
-    let mut rest = Vec::new();
-    stdout
-        .read_to_end(&mut rest)
-        .expect("stdout reaches EOF once the descendant is gone");
-    assert_eq!(
-        String::from_utf8_lossy(&rest),
-        "",
-        "the descendant must be killed, not see stdin close"
-    );
+    _ = std::io::Write::write_all(&mut pipes.stdin, b"x");
+    let mut echoed = [0u8; 1];
+    let n = pipes.stdout.read(&mut echoed).unwrap_or(0);
+    assert_eq!(n, 0, "kill_tree must end the cat");
     child.wait().expect("reap the root");
 }
 
-/// The contract this fix sets for a bare process group: after `wait()` the drop leaves the
-/// descendant running, proven by an echo round trip; the test then ends it by closing its stdin.
+/// For a bare process group below Linux 6.9: after `wait()` the drop leaves the descendant running,
+/// proven by an echo round trip; the test then ends it by closing its stdin.
 ///
 /// Not on macOS: there the tree is an fd marker, whose drop still sweeps the marker holders by
 /// identity after a reap and so ends this descendant. That path is
@@ -200,6 +178,8 @@ fn kill_tree_before_wait_ends_a_descendant_of_an_exited_root() {
 #[cfg(not(target_os = "macos"))]
 #[skuld::test]
 fn drop_after_wait_leaves_a_descendant_running_until_it_is_ended_explicitly() {
+    #[cfg(target_os = "linux")]
+    let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     let (child, mut pipes) = spawn_cat_tree();
     child.wait().expect("reap the root");
     drop(child);
@@ -286,6 +266,8 @@ fn waited_on_sleep_root() -> (u32, crate::Child) {
 /// Mutants: the own-reap flag is ignored; `wait()` does not set it.
 #[skuld::test]
 fn dropping_a_waited_on_child_whose_number_reads_unknown_still_sends_no_killpg() {
+    #[cfg(target_os = "linux")]
+    let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();
     let recorder = record_kill_group();
     let teardowns = record_root_teardowns();
@@ -330,6 +312,8 @@ fn dropping_an_unreaped_child_whose_number_reads_unknown_kills_and_logs_the_fail
 /// A root reaped by someone else is seen through its number. Mutant: the identity read dropped.
 #[skuld::test]
 fn dropping_a_foreign_reaped_process_group_child_sends_no_killpg() {
+    #[cfg(target_os = "linux")]
+    let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();
     let recorder = record_kill_group();
     let teardowns = record_root_teardowns();
@@ -358,6 +342,8 @@ fn dropping_a_foreign_reaped_process_group_child_sends_no_killpg() {
 /// (`kill_tree()` then `wait()`) must not draw it. Mutant: the tree-killed flag is ignored.
 #[skuld::test]
 fn drop_after_kill_tree_and_wait_skips_at_debug_and_does_not_warn() {
+    #[cfg(target_os = "linux")]
+    let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();
     let recorder = record_kill_group();
     let child = session(&["true"]).spawn().expect("spawn");
@@ -377,6 +363,8 @@ fn drop_after_kill_tree_and_wait_skips_at_debug_and_does_not_warn() {
 /// `graceful_shutdown_tree` sweeps with `kill_tree` and reaps the root, so its drop is quiet too.
 #[skuld::test]
 fn drop_after_graceful_shutdown_tree_skips_at_debug_and_does_not_warn() {
+    #[cfg(target_os = "linux")]
+    let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();
     let recorder = record_kill_group();
     let child = session(&["sleep", "300"]).spawn().expect("spawn");
@@ -426,6 +414,8 @@ fn a_failed_elevated_spawns_cleanup_drops_its_handle_silently() {
 /// tree-killed flag is set on the attempt.
 #[skuld::test]
 fn drop_after_a_failed_kill_tree_and_wait_still_warns() {
+    #[cfg(target_os = "linux")]
+    let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();
     let recorder = record_kill_group();
     recorder.fail_with_unassessable();

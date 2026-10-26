@@ -1,7 +1,8 @@
 //! The `dump-env-block` and `spawn-dump-env-block` modes: the environment block a child receives
 //! from each Windows backend, byte for byte. Also `with-env-block`, which runs any mode in a block
 //! given entry by entry, `env-set-probe`, which records what `SetEnvironmentVariableW` does to
-//! such a block, and `spawn-consent-with-block`, which starts `consent-spawn` in a given block.
+//! such a block, `spawn-consent-with-block`, which starts `consent-spawn` in a given block, and
+//! `try-cwd`, which reports what `CreateProcessW` does with a given `lpCurrentDirectory`.
 
 use windows::core::PCWSTR;
 use windows::Win32::System::Environment::{FreeEnvironmentStringsW, GetEnvironmentStringsW};
@@ -176,6 +177,18 @@ pub fn try_block(entries: &[String]) {
             assert_eq!(code, 0, "the probe child failed");
             outln!("ok");
         }
+        Err(e) => outln!("err={}", e.code().0 & 0xFFFF),
+    }
+}
+
+/// `try-cwd <dir>`: run `cosca_testbin cwd-marker` through a bare `CreateProcessW` with `<dir>` as
+/// `lpCurrentDirectory`. After the child's report prints `ok`, `exit=<code>` (nonzero exit) or
+/// `err=<code>` (Win32 error; the call failed).
+pub fn try_cwd(dir: &str) {
+    let system_root = format!("SystemRoot={}", std::env::var("SystemRoot").expect("SystemRoot"));
+    match create_with_block(&[system_root], "cwd-marker", Some(dir)) {
+        Ok(0) => outln!("ok"),
+        Ok(code) => outln!("exit={code}"),
         Err(e) => outln!("err={}", e.code().0 & 0xFFFF),
     }
 }

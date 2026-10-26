@@ -54,7 +54,7 @@ runs:
     - name: Windows canaries - check the path-resolution result
       if: ${{ !cancelled() && steps.path.outcome == 'success' && inputs.filter == '' }}
       shell: bash
-      run: python3 .github/scripts/check-junit.py "$RUNNER_TEMP/junit/canary-path.xml" --tests 24
+      run: python3 .github/scripts/check-junit.py "$RUNNER_TEMP/junit/canary-path.xml" --tests 26
 
     # These elevate through ShellExecuteEx(runas), which a runner already elevated grants without a prompt, and
     # register one volatile App Paths key in HKLM and one in HKCU, deleting each again; a volatile parent key they had

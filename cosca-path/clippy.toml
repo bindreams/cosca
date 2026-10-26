@@ -1,0 +1,6 @@
+# Clippy reads this file instead of the root `clippy.toml`, which bans calls cosca-path has no use for
+# (spawns, timers, pipes) and paths its dependency graph may not link. A pure-path crate and its
+# tests never need to change the process's cwd.
+disallowed-methods = [
+    { path = "std::env::set_current_dir", reason = "changes the process cwd, shared by all threads" },
+]
