@@ -834,9 +834,9 @@ impl CgroupLeaf {
             }
             Err(e) => return Err(Unsignalled::Unproven(format!("its exit could not be read ({e})"))),
         }
-        match send_term(pidfd.as_fd()) {
+        match send_term(pidfd.as_fd(), pid) {
             Ok(()) => Ok(()),
-            Err(rustix::io::Errno::SRCH) => {
+            Err(nix::errno::Errno::ESRCH) => {
                 log::debug!("cgroup terminate: pid {pid} exited before its SIGTERM");
                 Ok(())
             }
@@ -867,20 +867,20 @@ fn member_exited(pidfd: std::os::fd::BorrowedFd<'_>) -> io::Result<bool> {
     pidfd_exited(pidfd)
 }
 
-/// [`CgroupLeaf::terminate`]'s `SIGTERM` to the member `pidfd` pins, through that pidfd, and the
-/// kernel's answer; in a test build a `fail_terminate` seam answers in its place, and no send is
-/// made. It is given no pid, so it cannot send by one. A test build notes a send made once it
-/// answered, with its route and signal.
-fn send_term(pidfd: std::os::fd::BorrowedFd<'_>) -> rustix::io::Result<()> {
-    let signal = rustix::process::Signal::TERM;
+/// [`CgroupLeaf::terminate`]'s `SIGTERM` to the member `pidfd` pins, and the kernel's answer. It
+/// goes through the shared send, which makes the syscall, so a test build notes the route of the send
+/// made. A test build lets a `fail_terminate` seam answer in its place without sending.
+fn send_term(pidfd: std::os::fd::BorrowedFd<'_>, pid: u32) -> nix::Result<()> {
+    use crate::containment::unix::{send_signal, Sys, Target};
     #[cfg(test)]
     if let Some(errno) = fault::terminate_fails(fault::TerminateStep::Send) {
-        return Err(rustix::io::Errno::from_raw_os_error(errno));
+        return Err(nix::errno::Errno::from_raw(errno));
     }
-    let sent = rustix::process::pidfd_send_signal(pidfd, signal);
-    #[cfg(test)]
-    fault::record_member_term_through(pidfd, signal.as_raw());
-    sent
+    send_signal(
+        Target::LeafMember(pid),
+        Sys::Pidfd(pidfd, 0),
+        nix::sys::signal::Signal::SIGTERM,
+    )
 }
 
 /// Why [`CgroupLeaf::terminate`] sent a listed pid no `SIGTERM`.

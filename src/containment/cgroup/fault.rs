@@ -734,20 +734,29 @@ pub(crate) fn run_after_terminate_pin() {
 /// process is reaped, or where it cannot be read), the route of the send, and the signal's number.
 pub(crate) type MemberTerm = (Option<u32>, crate::send_log::Via, i32);
 
-/// Notes a member's signal `signo` on this thread, sent through `pidfd`, once the send was made
-/// and answered. The pid is read from the pidfd's fdinfo, so the sender needs no pid to record one.
-pub(crate) fn record_member_term_through(pidfd: std::os::fd::BorrowedFd<'_>, signo: i32) {
+/// Notes a signal `signo` sent to the leaf member `pid` by `sys` on this thread, once answered; the
+/// route is the syscall's own, and a pidfd's pid is read from its fdinfo.
+pub(crate) fn record_member_term(sys: crate::containment::unix::Sys<'_>, pid: u32, signo: i32) {
     use std::os::fd::AsRawFd as _;
-    let pid = std::fs::read_to_string(format!("/proc/thread-self/fdinfo/{}", pidfd.as_raw_fd()))
-        .ok()
-        .and_then(|fdinfo| {
-            fdinfo
-                .lines()
-                .find_map(|line| line.strip_prefix("Pid:"))
-                .and_then(|pid| pid.trim().parse::<i64>().ok())
-        })
-        .and_then(|pid| u32::try_from(pid).ok().filter(|&pid| pid > 0));
-    MEMBER_TERMS.with(|t| t.borrow_mut().push((pid, crate::send_log::Via::Pidfd, signo)));
+
+    use crate::containment::unix::Sys;
+    use crate::send_log::Via;
+    let entry = match sys {
+        Sys::Pidfd(pidfd, _) => {
+            let pid = std::fs::read_to_string(format!("/proc/thread-self/fdinfo/{}", pidfd.as_raw_fd()))
+                .ok()
+                .and_then(|fdinfo| {
+                    fdinfo
+                        .lines()
+                        .find_map(|line| line.strip_prefix("Pid:"))
+                        .and_then(|pid| pid.trim().parse::<i64>().ok())
+                })
+                .and_then(|pid| u32::try_from(pid).ok().filter(|&pid| pid > 0));
+            (pid, Via::Pidfd, signo)
+        }
+        Sys::Group(_) | Sys::Process(_) => (Some(pid), Via::Pid, signo),
+    };
+    MEMBER_TERMS.with(|t| t.borrow_mut().push(entry));
 }
 
 /// The `SIGTERM`s this thread's `CgroupLeaf::terminate` sent members since the last call.

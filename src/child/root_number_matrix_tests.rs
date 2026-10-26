@@ -15,8 +15,7 @@
 //! printed if any cell is wrong.
 //!
 //! One send by number is routed, and its cells expect it until the issue lands:
-//! [`KILLPG_AFTER_OWN_REAP`] (a group after this handle's own reap, the pid naming nothing). A
-//! cgroup's `SIGTERM` goes to each member through the member's pidfd, never by its number.
+//! [`KILLPG_AFTER_OWN_REAP`] (a group after this handle's own reap, the pid naming nothing).
 
 use std::time::Duration;
 
