@@ -2305,17 +2305,17 @@ pub(crate) mod fault {
     /// completes, as for a root a tracer holds, so a test can drop the future awaiting it.
     ///
     /// [`ProcSource::wait_and_reap_awaiting`]: super::ProcSource::wait_and_reap_awaiting
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     pub(crate) fn pend_awaited_reap() -> PendAwaitedReap {
         PEND_AWAITED_REAP.with(|f| f.set(true));
         PendAwaitedReap(())
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[must_use = "the seam is cleared as soon as the guard is dropped"]
     pub(crate) struct PendAwaitedReap(());
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     impl PendAwaitedReap {
         /// Whether an awaited reap has reached the seam, and so pends.
         pub(crate) fn taken(&self) -> bool {
@@ -2323,7 +2323,7 @@ pub(crate) mod fault {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     impl Drop for PendAwaitedReap {
         fn drop(&mut self) {
             PEND_AWAITED_REAP.with(|f| f.set(false));
