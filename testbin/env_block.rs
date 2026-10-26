@@ -1,6 +1,7 @@
 //! The `dump-env-block` and `spawn-dump-env-block` modes: the environment block a child receives
 //! from each Windows backend, byte for byte. Also `with-env-block`, which runs any mode in a block
-//! given entry by entry, and `spawn-consent-with-block`, which starts `consent-spawn` in a given block.
+//! given entry by entry, `env-set-probe`, which records what `SetEnvironmentVariableW` does to
+//! such a block, and `spawn-consent-with-block`, which starts `consent-spawn` in a given block.
 
 use windows::core::PCWSTR;
 use windows::Win32::System::Environment::{FreeEnvironmentStringsW, GetEnvironmentStringsW};
@@ -138,6 +139,33 @@ fn quote(arg: &str) -> String {
     out.push_str(&"\\".repeat(backslashes * 2));
     out.push('"');
     out
+}
+
+/// `env-set-probe <op>...`: dump this process's block under `# before`, then apply each op to this
+/// process's own environment with `SetEnvironmentVariableW` and dump it again under
+/// `# after <op>`. An op is `set:NAME=VALUE` or `remove:NAME`.
+pub fn set_probe(ops: &[String]) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::System::Environment::SetEnvironmentVariableW;
+
+    let wide = |s: &str| std::ffi::OsStr::new(s).encode_wide().chain([0]).collect::<Vec<u16>>();
+    println!("# before");
+    dump();
+    for op in ops {
+        let (name, value) = if let Some(kv) = op.strip_prefix("set:") {
+            let (name, value) = kv.split_once('=').expect("set:NAME=VALUE");
+            (wide(name), Some(wide(value)))
+        } else if let Some(name) = op.strip_prefix("remove:") {
+            (wide(name), None)
+        } else {
+            panic!("unknown op {op:?}");
+        };
+        let value = value.as_ref().map_or(PCWSTR::null(), |v| PCWSTR(v.as_ptr()));
+        // SAFETY: `name` and `value` are NUL-terminated and outlive the call.
+        unsafe { SetEnvironmentVariableW(PCWSTR(name.as_ptr()), value) }.expect("SetEnvironmentVariableW");
+        println!("# after {op}");
+        dump();
+    }
 }
 
 /// Report whether `CreateProcessW` accepts `entries` as a child's block: `ok`, or `err=<code>`

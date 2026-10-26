@@ -22,7 +22,7 @@ use crate::containment::cgroup::test_support::alone;
 use crate::test_child::fixture_path;
 
 #[cfg(target_os = "linux")]
-mod linux {
+pub(super) mod linux {
     use std::os::fd::{AsFd, OwnedFd};
 
     use super::Child;
@@ -49,7 +49,7 @@ mod linux {
 
     /// How a root ended.
     #[derive(Debug, PartialEq, Eq)]
-    pub(super) enum Ended {
+    pub(crate) enum Ended {
         Exited(i32),
         Signalled(i32),
         /// Reaped before its stdin closed, by tokio's own `Child` drop (its `try_wait` ran after
@@ -66,10 +66,10 @@ mod linux {
     /// this thread never yields to has not run it. That holds only in a process running this one
     /// test (tokio's orphan queue is process-global, and any runtime that parks drains it), so
     /// [`ended_after_closing`](Self::ended_after_closing) requires `alone()`.
-    pub(super) struct Pidfd(OwnedFd);
+    pub(crate) struct Pidfd(OwnedFd);
 
     impl Pidfd {
-        pub(super) fn of(child: &Child) -> Pidfd {
+        pub(crate) fn of(child: &Child) -> Pidfd {
             let pid = rustix::process::Pid::from_raw(child.id().pid() as i32).expect("a positive pid");
             Pidfd(rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()).expect("pidfd_open"))
         }
@@ -99,7 +99,7 @@ mod linux {
         /// [`Ended::ReapedWhileStdinOpen`].
         /// The read is exact only under `alone()`: nothing else reaps before this thread yields to
         /// a runtime.
-        pub(super) fn ended_after_closing(&self, stdin: crate::tokio::ChildStdin) -> Ended {
+        pub(crate) fn ended_after_closing(&self, stdin: crate::tokio::ChildStdin) -> Ended {
             debug_assert!(
                 std::env::var_os("COSCA_TEST_ALONE").is_some(),
                 "`ended_after_closing` is exact only in a process running this test alone (`alone()`): \
@@ -543,6 +543,11 @@ async fn unreaped_root_could_not_be_terminated_on_drop_is_logged() {
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn drop_warns_instead_of_asserting_on_a_real_teardown_mechanism_failure() {
+    if !alone(fixture_path!(
+        drop_warns_instead_of_asserting_on_a_real_teardown_mechanism_failure
+    )) {
+        return;
+    }
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let dir = tempfile::tempdir().expect("tempdir");
@@ -559,10 +564,14 @@ async fn drop_warns_instead_of_asserting_on_a_real_teardown_mechanism_failure() 
     });
 
     let mut cmd = crate::tokio::Command::new();
-    cmd.args(["sleep", "30"]);
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+    cmd.stdout(crate::Stdio::null()).expect("set stdout");
     // The override is consumed by this spawn; `kill_on_drop` defaults to true. The tree-kill call
     // in Drop runs on the dropping thread, so no probe is needed to observe it.
     let mut child = cmd.spawn().expect("spawn");
+    let stdin = child.stdin().expect("piped stdin");
+    let root = linux::Pidfd::of(&child);
 
     // Pin that the forced failure is the mechanism class this test claims (a raw `EISDIR` from
     // the `cgroup.kill` write, surfaced as `Error::Io`), so it cannot go vacuous if the forcing
@@ -594,6 +603,16 @@ async fn drop_warns_instead_of_asserting_on_a_real_teardown_mechanism_failure() 
         records.iter().map(|(level, _)| *level).collect::<Vec<_>>(),
         [log::Level::Warn],
         "a real teardown-mechanism failure during Drop must be logged at warn, got {records:?}"
+    );
+    // The failed tree kill must not cost the root its own kill. Released after the drop: the root's
+    // stdin never ends it on its own here.
+    let ended = root.ended_after_closing(stdin);
+    assert!(
+        matches!(
+            ended,
+            linux::Ended::Signalled(libc::SIGKILL) | linux::Ended::ReapedWhileStdinOpen
+        ),
+        "the drop must kill the root with SIGKILL, got {ended:?}"
     );
 }
 
