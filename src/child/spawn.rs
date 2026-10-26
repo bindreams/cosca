@@ -2418,7 +2418,9 @@ pub(crate) fn kill_group_before_teardown(
 
 /// Owes `why` a refused kill of the process group of `pid`'s root through its pidfd, which says the
 /// group's members may be left running. `reaped`: the root was already reaped, so it may never have
-/// run the program (std collects the child of an exec that failed).
+/// run the program (std collects the child of an exec that failed). A failed exec is not told apart:
+/// a foreign reap after tokio's post-fork failure reaches the same state, and tokio does not say
+/// whether std's spawn failed, so both keep the warn.
 #[cfg(target_os = "linux")]
 pub(crate) fn note_refused_group_kill(pid: Option<u32>, refusal: nix::errno::Errno, reaped: bool, why: &mut Diagnosis) {
     let named = named(pid);
