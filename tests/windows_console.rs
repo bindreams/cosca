@@ -1,9 +1,10 @@
 //! Windows: the console-group graceful signal (`CTRL_BREAK`) is delivered only within the
 //! CALLING process's console. Every test process the test runner spawns inherits its console (it
 //! sets neither `DETACHED_PROCESS` nor `CREATE_NO_WINDOW`), so the console-less caller is reached
-//! by re-launching the testbin with `DETACHED_PROCESS`. The with-console side, where a break really
-//! arrives, is in `src/child/ctrl_break_tests.rs`: it needs the sender's own record of the break,
-//! which only this crate's unit-test binary has.
+//! by re-launching the testbin with `DETACHED_PROCESS`. These tests assert `NoConsole` and that the
+//! target stays alive. That no break was sent, and the with-console side where one really arrives,
+//! are in `src/child/ctrl_break_tests.rs`: they need the sender's own record of the breaks, which
+//! only this crate's unit-test binary has.
 //!
 //! The flag-matrix tests at the top measure what the creation-flag word does and does not
 //! settle about console membership, and their discriminating power comes from the control legs
@@ -192,13 +193,6 @@ fn tree_graceful_ops_report_no_console_from_a_console_less_caller() {
         "alive",
         "a fail-fast terminate must leave the tree untouched: {r}"
     );
-    // The live acker answers `0`: it has seen no break. `E` (a socket failure) and `?` (an
-    // unexpected reply) stay distinct and neither may pass here.
-    assert_eq!(
-        field(&r, "terminate_break"),
-        "0",
-        "no signal can have been delivered: {r}"
-    );
     assert_eq!(field(&r, "graceful"), "NoConsole", "{r}");
     assert_eq!(
         field(&r, "alive_after_graceful"),
@@ -262,9 +256,6 @@ fn lone_graceful_ops_report_no_console_from_a_console_less_caller() {
         "alive",
         "a fail-fast terminate must leave the child untouched: {r}"
     );
-    // The live acker answers `0`: it has seen no break. `E` (a socket failure) and `?` (an
-    // unexpected reply) stay distinct and neither may pass here.
-    assert_eq!(field(&r, "break"), "0", "no signal can have been delivered: {r}");
     assert_eq!(field(&r, "graceful"), "NoConsole", "{r}");
     assert_eq!(field(&r, "graceful_code"), "none", "{r}");
     assert_eq!(

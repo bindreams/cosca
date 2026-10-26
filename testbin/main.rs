@@ -216,26 +216,6 @@ fn install_ignore_break() {
     unsafe { SetConsoleCtrlHandler(Some(ignore), true) }.expect("install ctrl handler");
 }
 
-/// Asks a `control-block-ack-break` target whether it has seen a `CTRL_BREAK`: `1` seen, `0` not
-/// seen, `?` an unexpected reply, `E` a socket failure. The target replies at once either way, so
-/// this never waits for a break, and a break still in flight reads as `0`. So a test asserts its
-/// answer only where no break can have been sent; one that needs a break to have arrived is a unit
-/// test (see `src/child/ctrl_break_tests.rs`).
-#[cfg(windows)]
-fn saw_break(sock: &mut std::net::TcpStream) -> &'static str {
-    let mut b = [0u8; 1];
-    if sock.write_all(b"?").and_then(|()| sock.flush()).is_err() {
-        return "E";
-    }
-    match sock.read(&mut b) {
-        Ok(1) if &b == b"1" => "1",
-        Ok(1) if &b == b"0" => "0",
-        Ok(1) => "?",
-        Ok(_) => "0",
-        Err(_) => "E",
-    }
-}
-
 /// `set_current_dir`s THIS process — never a spawned child — to `dir`. The one legitimate call
 /// site `clippy.toml`'s `disallowed-methods` exempts here: `cosca_testbin` is a freshly spawned,
 /// single-purpose PROCESS per invocation, never the shared multithreaded `cargo test` binary, so
@@ -894,48 +874,6 @@ fn main() {
             hold(&mut sock);
         }
         #[cfg(windows)]
-        "control-block-ack-break" => {
-            // Record a CTRL_BREAK and STAY ALIVE (the handler returns "handled"), then tell the
-            // probe on request whether one arrived: the probe writes a byte once it is done
-            // sending, and the reply is `1` or `0`. A probe that sent nothing therefore reads `0`
-            // at once instead of waiting for an acknowledgement that never comes. The probe's
-            // close ends this process (exit 0); a kill ends it with 1.
-            use std::sync::atomic::{AtomicBool, Ordering};
-            use windows::core::BOOL;
-            use windows::Win32::System::Console::SetConsoleCtrlHandler;
-
-            // A console ctrl handler runs on an OS-spawned thread, not in signal context. Only
-            // CTRL_BREAK is recorded: counting any event would let a stray CTRL_C or CTRL_CLOSE
-            // satisfy a "the child received CTRL_BREAK" assertion.
-            static SEEN: AtomicBool = AtomicBool::new(false);
-            unsafe extern "system" fn record(event: u32) -> BOOL {
-                if event != windows::Win32::System::Console::CTRL_BREAK_EVENT {
-                    return BOOL(0); // not handled — default disposition applies
-                }
-                SEEN.store(true, Ordering::SeqCst);
-                BOOL(1) // handled — do not die
-            }
-
-            let addr = &args[2];
-            let tag = args.get(3).map(String::as_str).unwrap_or("?");
-            let mut sock = crate::ack::connect_control(addr).unwrap();
-            // SAFETY: installing a console ctrl handler has no preconditions.
-            unsafe { SetConsoleCtrlHandler(Some(record), true) }.expect("install ctrl handler");
-            sock.write_all(tag.as_bytes()).unwrap();
-            sock.flush().unwrap();
-            let mut buf = [0u8; 1];
-            loop {
-                match sock.read(&mut buf) {
-                    Ok(0) | Err(_) => break, // the probe let go of the socket
-                    Ok(_) => {
-                        let reply = if SEEN.load(Ordering::SeqCst) { b"1" } else { b"0" };
-                        sock.write_all(reply).unwrap();
-                        sock.flush().unwrap();
-                    }
-                }
-            }
-        }
-        #[cfg(windows)]
         "report-bare-argv0-cwd-spawn" => {
             // Set OUR OWN cwd to the decoy directory given as argv[2], then attempt — from
             // inside this fully isolated process — the exact vulnerable/fixed spawn shape B2
@@ -1053,7 +991,7 @@ fn main() {
 
             let mut cmd = cosca::Command::new();
             cmd.executable(&exe)
-                .args(["cosca_testbin", "control-block-ack-break", &ack_addr, "R"])
+                .args(["cosca_testbin", "control-block-ignore-break", &ack_addr, "R"])
                 .env(ack::ACK_ENV, "1")
                 .contain();
             let mut child = cmd.spawn().expect("spawn contained root");
@@ -1108,10 +1046,6 @@ fn main() {
                 Err(e) => describe(&e),
             };
             let alive_after_terminate = liveness(child.is_alive());
-            // The child answers at once whether it has seen a break, so this read ends whether or
-            // not one was ever sent. It comes before the kills below, which would end the child
-            // first.
-            let seen = saw_break(&mut ack);
 
             // The escalating call runs only for a caller with NO console, where it fails before it
             // signals or kills anything. From a caller with a console its zero-grace escalation
@@ -1154,7 +1088,7 @@ fn main() {
             write!(
                 line,
                 "console={console} c_in_console={} mechanism={mechanism} terminate={terminate} \
-                 alive_after_terminate={alive_after_terminate} break={seen} graceful={graceful} \
+                 alive_after_terminate={alive_after_terminate} graceful={graceful} \
                  graceful_code={graceful_code} alive_after_graceful={alive_after_graceful} \
                  cleanup={cleanup} cleanup_exit={cleanup_exit}",
                 three_way(c_in_console),
@@ -1256,11 +1190,11 @@ fn main() {
             let ack_addr = listener.local_addr().unwrap().to_string();
             let exe = std::env::current_exe().unwrap();
 
-            // A contained root that acks CTRL_BREAK over its own socket and keeps running.
+            // A contained root that ignores console events and keeps running.
             let spawn_acker = |tag: &str| {
                 let mut cmd = cosca::Command::new();
                 cmd.executable(&exe)
-                    .args(["cosca_testbin", "control-block-ack-break", &ack_addr, tag])
+                    .args(["cosca_testbin", "control-block-ignore-break", &ack_addr, tag])
                     .env(ack::ACK_ENV, "1")
                     .contain();
                 let mut child = cmd.spawn().expect("spawn contained root");
@@ -1303,7 +1237,7 @@ fn main() {
             let exit_code = |s: cosca::ExitStatus| s.code().map_or_else(|| "none".to_string(), |c| c.to_string());
 
             // (1) terminate_tree — signal-only, so delivery is observable without escalation.
-            let (c1, mut ack1) = spawn_acker("R");
+            let (c1, ack1) = spawn_acker("R");
             // One whitespace-free token per field, so the report parses unambiguously; the
             // Display form ("job object") would split across two fields.
             let containment_tag = match c1.containment() {
@@ -1321,9 +1255,6 @@ fn main() {
             let c1_in_console = in_our_console(c1.id().pid());
             let terminate = classify(c1.terminate_tree());
             let alive_after_terminate = liveness(c1.is_alive());
-            // The root answers at once whether it has seen a break, so this read ends whether or
-            // not one was ever sent. It comes before the kill, which would end the root first.
-            let terminate_break = saw_break(&mut ack1);
             let kill_tree = classify(c1.kill_tree());
             // The socket is released before the wait: a released acker exits 0, a killed one 1,
             // and the report carries the code.
@@ -1378,7 +1309,7 @@ fn main() {
                 line,
                 "console={console} c1_in_console={} containment={containment_tag} \
                  terminate_tree={terminate} alive_after_terminate={alive_after_terminate} \
-                 terminate_break={terminate_break} kill_tree={kill_tree} acker1_exit={acker1_exit} \
+                 kill_tree={kill_tree} acker1_exit={acker1_exit} \
                  graceful={graceful} alive_after_graceful={alive_after_graceful} \
                  graceful_cleanup={graceful_cleanup} graceful_cleanup_exit={graceful_cleanup_exit}",
                 u8::from(c1_in_console),

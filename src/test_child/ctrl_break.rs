@@ -9,12 +9,16 @@
 //! its handler's ack, or its exit code. A call that sent nothing fails that assertion instead of
 //! leaving the wait unbounded, and nothing is released that could race the break. The sender must
 //! therefore run in a process of this binary: a probe in another binary has no record to read.
+//!
+//! The same record proves a break was *not* sent ([`assert_no_break_sent`]), which no reply from
+//! the target can: a handler thread that has not run yet looks like one that never will.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 
 use super::{accept_or_die, ack, fixture_argv};
 
+pub(crate) mod console_less;
 pub(crate) mod nested;
 
 /// The fully-qualified libtest path of [`fixture_ctrl_break_member`].
@@ -262,6 +266,57 @@ pub(crate) fn assert_break_sent_to(group: u32) {
         [group],
         "the call must send one CTRL_BREAK, to the group led by {group}"
     );
+}
+
+/// Assert that the call under test sent no `CTRL_BREAK` at all.
+pub(crate) fn assert_no_break_sent() {
+    assert_eq!(
+        crate::containment::windows::observe::take_ctrl_breaks(),
+        Vec::<u32>::new(),
+        "the call must not send any CTRL_BREAK"
+    );
+}
+
+/// What a reporter writes once every check passed. Anything else read before EOF, or none, means
+/// it did not get that far: it panicked, or its filter matched no test.
+pub(crate) const DONE: &[u8] = b"K";
+
+/// A reporter's side of [`drive_reporter`]: connects to the driver at the address in `addr_env`
+/// first, so a panic later reaches the driver as EOF. `None` when `addr_env` is unset: the fixture
+/// was picked up by an ordinary suite run and stays inert.
+pub(crate) fn connect_reporter(addr_env: &str) -> Option<TcpStream> {
+    let addr = std::env::var_os(addr_env)?.into_string().expect("utf8 addr");
+    Some(ack::connect_control(&addr).expect("connect to the driver"))
+}
+
+/// A reporter's last act: [`DONE`], after every check passed.
+pub(crate) fn report_done(report: &mut TcpStream) {
+    report.write_all(DONE).expect("report");
+    report.flush().expect("flush the report");
+}
+
+/// The driver of a reporter: a re-exec of this binary running the fixture `test`, which finds the
+/// driver's address in `addr_env` (see [`connect_reporter`]). `configure` is applied to the
+/// command last. Passes only if the reporter wrote [`DONE`] and exited 0.
+pub(crate) fn drive_reporter(test: &str, addr_env: &str, configure: impl FnOnce(&mut crate::Command)) {
+    let (listener, addr) = crate::test_child::registration_rendezvous();
+    let mut cmd = crate::Command::new();
+    cmd.executable(std::env::current_exe().expect("current_exe"))
+        .args(fixture_argv(test))
+        .env(addr_env, addr)
+        .env(ack::ACK_ENV, "1");
+    crate::test_reexec::scrub_env(|var| _ = cmd.env_remove(var));
+    configure(&mut cmd);
+    let child = cmd.spawn().expect("spawn the reporter");
+    let mut sock = accept_or_die(&listener, child.id());
+    let mut report = Vec::new();
+    sock.read_to_end(&mut report).expect("read the report");
+    assert_eq!(
+        report, DONE,
+        "the reporter did not finish its checks; its panic is in its stderr"
+    );
+    let status = child.wait().expect("reap the reporter");
+    assert!(status.success(), "the reporter failed: {status:?}");
 }
 
 /// Is `pid` attached to our console? `None` when the probe found no console at all. A break to a
