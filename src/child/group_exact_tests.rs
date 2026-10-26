@@ -132,7 +132,7 @@ impl EndedAtTheSigterm {
 }
 
 /// 6.9+: a root reaped by another reaper still names its group through its pidfd, so `kill_tree`
-/// kills the members left. Mutant: "a root reaped elsewhere is never signalled".
+/// kills the members left.
 #[skuld::test]
 fn kill_tree_kills_the_group_of_a_root_reaped_elsewhere(#[fixture(pidfd_group_signal)] _group: &Group) {
     let (child, member) = root_with_a_member();

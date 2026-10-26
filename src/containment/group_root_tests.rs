@@ -87,3 +87,18 @@ fn check_asks_the_callers_check_when_the_group_probe_answers_eperm() {
         Err(NotItsGroup::Unproven("the root was reaped elsewhere".to_owned()))
     );
 }
+
+/// The check's signal-0 group send is a send like any other: recorded, through the root's pidfd,
+/// on any kernel. Mutant: "the group probe bypasses `send_signal`".
+#[skuld::test]
+fn the_group_probe_is_a_recorded_send() {
+    use crate::send_log::{GroupStep, Route};
+    let (leader, pidfd) = leader();
+    let passes = || Ok(());
+    let capture = crate::send_log::Capture::start();
+    let checked = GroupRoot::new(Some(pidfd.as_fd()), &passes).check();
+    let steps = capture.group_steps_with_probes();
+    kill_and_reap(leader);
+    assert_eq!(steps, [GroupStep::Check, GroupStep::Group(Route::Pidfd, 0)]);
+    assert_eq!(checked, Ok(()), "the leader's group has a member");
+}

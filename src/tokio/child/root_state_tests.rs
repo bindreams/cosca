@@ -74,7 +74,6 @@ pub(super) fn failed_peek(what: &str) -> std::io::Result<crate::wait::exit_only:
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn a_tokio_drop_with_an_unknown_root_warns_once() {
-    // The pre-6.9 path: on 6.9+ the root's pidfd decides (`drop_group_exact_tests`).
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peeks};

@@ -14,7 +14,6 @@ use crate::test_child::reaped_elsewhere::{
 /// Mutants: `killpg` sent; the decision taken on the number alone (it shows no recycle).
 #[skuld::test]
 fn kill_tree_after_a_foreign_reap_sends_no_killpg() {
-    // The pre-6.9 path: on 6.9+ the root's pidfd decides (`group_exact_tests`).
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();
@@ -38,7 +37,6 @@ fn kill_tree_after_a_foreign_reap_sends_no_killpg() {
 /// The twin of [`kill_tree_after_a_foreign_reap_sends_no_killpg`]. Same mutants.
 #[skuld::test]
 fn terminate_tree_after_a_foreign_reap_sends_no_signal() {
-    // The pre-6.9 path: on 6.9+ the root's pidfd decides (`group_exact_tests`).
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();
@@ -65,7 +63,6 @@ fn terminate_tree_after_a_foreign_reap_sends_no_signal() {
 /// Mutant: an unreadable pid after our own reap is taken as free, and `killpg` is sent.
 #[skuld::test]
 fn kill_tree_after_own_wait_whose_pid_reads_unknown_sends_no_killpg() {
-    // The pre-6.9 path: on 6.9+ the root's pidfd decides (`group_exact_tests`).
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();
@@ -99,7 +96,6 @@ fn kill_tree_after_own_wait_whose_pid_reads_unknown_sends_no_killpg() {
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn kill_tree_of_a_root_its_handle_cannot_read_kills_it_through_its_pidfd_alone() {
-    // The pre-6.9 path: on 6.9+ the root's pidfd decides (`group_exact_tests`).
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peek_once};
     use std::os::unix::process::ExitStatusExt as _;
@@ -143,7 +139,6 @@ fn kill_tree_of_a_root_its_handle_cannot_read_kills_it_through_its_pidfd_alone()
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn terminate_tree_of_a_root_its_handle_cannot_read_terms_it_through_its_pidfd_alone() {
-    // The pre-6.9 path: on 6.9+ the root's pidfd decides (`group_exact_tests`).
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     use crate::test_child::reaped_elsewhere::ROOT_TERMED_BY_PIDFD;
     use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peek_once};
@@ -189,7 +184,6 @@ fn terminate_tree_of_a_root_its_handle_cannot_read_terms_it_through_its_pidfd_al
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn graceful_shutdown_tree_of_a_root_its_handle_cannot_read_escalates_through_its_pidfd_alone() {
-    // The pre-6.9 path: on 6.9+ the root's pidfd decides (`group_exact_tests`).
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     use crate::signal::Sig::{Kill, Term};
     use crate::test_child::reaped_elsewhere::{term_ignoring_session_sleep, ROOT_TERMED_BY_PIDFD};
@@ -243,7 +237,6 @@ fn graceful_shutdown_tree_of_a_root_its_handle_cannot_read_escalates_through_its
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn graceful_shutdown_tree_of_a_root_its_handle_cannot_read_sends_no_kill_to_one_that_exited() {
-    // The pre-6.9 path: on 6.9+ the root's pidfd decides (`group_exact_tests`).
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     use crate::graceful_hooks::{at, HookPoint};
     use crate::signal::Sig::Term;
@@ -296,7 +289,6 @@ fn graceful_shutdown_tree_of_a_root_its_handle_cannot_read_sends_no_kill_to_one_
 /// Mutant: the `Unassessable` falls through to the grace and the sweep.
 #[skuld::test]
 fn graceful_shutdown_tree_after_a_foreign_reap_warns_once_and_ends() {
-    // The pre-6.9 path: on 6.9+ the root's pidfd decides (`group_exact_tests`).
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();
@@ -337,7 +329,6 @@ fn graceful_shutdown_tree_after_a_foreign_reap_warns_once_and_ends() {
 /// Mutant: the sweep is told that "the SIGTERM" went out whatever the shutdown sent.
 #[skuld::test]
 fn graceful_shutdown_tree_after_own_wait_claims_no_sigterm_it_did_not_send() {
-    // The pre-6.9 path: on 6.9+ the root's pidfd decides (`group_exact_tests`).
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     use crate::child::fault::force_next_root_read;

@@ -93,10 +93,9 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
 ///
 /// A reaped root's number may name another process by now, so the tree kill is skipped when it
 /// would name the tree by that number (a process group, a ppid walk), and the note says so. On Linux
-/// 6.9+ the root's pidfd decides a process group instead: it is killed while it has a member left,
-/// and needs no kill once it has none. This is
-/// decided on one look at the root; each send by the group's number after it checks the root again
-/// right before it, as for [`Child::kill_tree`].
+/// 6.9+ the root's pidfd decides a process group instead: it is killed while it has a member. The
+/// decision is one look at the root; each send by the group's number then checks the root again, as
+/// for [`Child::kill_tree`].
 ///
 /// A live front outside a cgroup (see [`Child::kill`]) is signalled by neither kill: the root's
 /// kill is the typed `Unkillable`, and the note says so. A front that had already exited is reaped,
@@ -956,6 +955,8 @@ impl LateTree {
                 let (pid, unique) = (self.pid, self.unique);
                 // The root is this process's unreaped child, shown by a verified peek right before each
                 // send by its pid.
+                #[cfg(test)]
+                crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterRootLook);
                 let check = || {
                     let target = crate::wait::exit_only::Target::pid(pid, Some(unique));
                     let state = crate::signal::RootState::of_peek(crate::wait::exit_only::peek_verified(&target));
@@ -2399,19 +2400,26 @@ pub(crate) fn settle_before_teardown(
 
 /// Linux 6.9+: kill the process group of a failed spawn's root before its teardown, as
 /// [`Prepared::kill_group_before_attach`](crate::containment::Prepared::kill_group_before_attach)
-/// decides. A refused kill is owed to `why`, the teardown's one warn. Not for an elevation front,
-/// which is sent nothing.
+/// decides. A refused kill is owed to `why`, the teardown's one warn, which says the group's
+/// members may be left running. Not for an elevation front, which is sent nothing.
 #[cfg(target_os = "linux")]
 pub(crate) fn kill_group_before_teardown(
     prepared: &crate::containment::Prepared,
     child: crate::containment::ChildHandle<'_>,
     why: &mut Diagnosis,
 ) {
-    if let Err(e) = prepared.kill_group_before_attach(child) {
-        why.add(format!(
-            "spawn teardown could not kill the process group of pid {} through its pidfd ({e})",
-            child.pid
-        ));
+    let pid = child.pid;
+    match prepared.kill_group_before_attach(child) {
+        Ok(()) => {}
+        Err(nix::errno::Errno::EINVAL) => why.add(format!(
+            "members of the process group of pid {pid} may be left running: the kernel refused \
+             PIDFD_SIGNAL_PROCESS_GROUP (EINVAL, expected below Linux 6.9), so nothing was sent to the \
+             group, whose number may name another group"
+        )),
+        Err(e) => why.add(format!(
+            "spawn teardown could not kill the process group of pid {pid} through its pidfd ({e}); its \
+             members may be left running"
+        )),
     }
 }
 
