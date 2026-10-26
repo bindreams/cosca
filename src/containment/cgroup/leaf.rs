@@ -1233,7 +1233,7 @@ fn end_reaped_child(handle: &std::os::fd::OwnedFd, received: &Received, pid: rus
     }
     if let Err(e) = kill_group_outside_leaf(handle, received, pid) {
         log::warn!(
-            "cgroup v2: could not kill an abandoned spawn's child's process group {} ({e}); the child was reaped elsewhere, and the group's members may be left running",
+            "cgroup v2: could not kill an abandoned spawn's child's process group {} ({e}); the child was already reaped, and the group's members may be left running",
             rustix::process::Pid::as_raw(Some(pid))
         );
     }
