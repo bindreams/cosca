@@ -1252,6 +1252,9 @@ impl ProcSource {
             unreachable!("a freshly spawned backend is a tokio child");
         };
         let mut failed = None;
+        // A fixture only the kill above would end is released here.
+        #[cfg(test)]
+        crate::child::spawn::fault::run_between_kill_and_wait();
         let fate = match exit_only::reap_blocking(&Target::PidFd(std::os::fd::AsFd::as_fd(pidfd))) {
             Ok(Ok(_reaped)) => {
                 #[cfg(test)]
