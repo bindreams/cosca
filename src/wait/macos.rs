@@ -305,12 +305,16 @@ mod await_reapable;
 mod tracer_watch;
 #[cfg(test)]
 pub(crate) use await_reapable::await_reapable_on;
+#[cfg(feature = "tokio")]
 pub(crate) use await_reapable::{
-    arm_backoff_timer, await_reapable, drain_exit_events, register_exit_events, Waited, BACKOFF_CAP, BACKOFF_START,
+    arm_backoff_timer, drain_exit_events, register_exit_events, BACKOFF_CAP, BACKOFF_START,
 };
+pub(crate) use await_reapable::{await_reapable, Waited};
 #[cfg(test)]
 pub(crate) use tracer_watch::seams as tracer_seams;
-pub(crate) use tracer_watch::{OnTracer, TracerWatch, WalkError};
+#[cfg(feature = "tokio")]
+pub(crate) use tracer_watch::WalkError;
+pub(crate) use tracer_watch::{OnTracer, TracerWatch};
 
 pub(crate) fn kill(id: ProcessId) -> Result<(), Error> {
     use nix::sys::signal::{kill as nix_kill, Signal};
