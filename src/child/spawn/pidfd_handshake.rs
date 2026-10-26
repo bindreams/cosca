@@ -861,8 +861,10 @@ fn conclude<T: Spawned>(spawned: io::Result<T>, outcome: Outcome, front: LeftFro
                 let (fate, child_fate) = super::leave_front_through_pidfd(None, pidfd, front, None, None);
                 (fate.note(error, Some(front), None), child_fate)
             }
-            // The group first: it holds the root too, and a root already collected never ran.
-            LeftFront::GroupRoot if !collected => {
+            // The group first: it holds the root too. The pidfd names the group exactly, whoever
+            // reaped the root; a root std collected after a failed `exec` left no member, and the
+            // send answers `ESRCH`.
+            LeftFront::GroupRoot => {
                 let mut why = super::Diagnosis::default();
                 if let Err(e) = crate::containment::kill_group_through_pidfd(pidfd.as_fd(), None) {
                     super::note_refused_group_kill(None, e, &mut why);
@@ -870,7 +872,7 @@ fn conclude<T: Spawned>(spawned: io::Result<T>, outcome: Outcome, front: LeftFro
                 let child_fate = super::teardown_through_pidfd_noting(None, pidfd, None, &mut why);
                 (error, child_fate)
             }
-            LeftFront::Here(_) | LeftFront::NotAFront | LeftFront::GroupRoot => {
+            LeftFront::Here(_) | LeftFront::NotAFront => {
                 let child_fate = super::teardown_through_pidfd(None, pidfd, None);
                 (error, child_fate)
             }

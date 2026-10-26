@@ -9,19 +9,29 @@ use crate::error::ChildFate;
 use crate::send_log::{assert_group_signalled_first_through_the_pidfd, Capture, GroupStep, Route};
 use crate::test_groups::{cgroup, pidfd_group_signal, Group};
 
-/// The root's state when the spawn fails: running with its member, or exited by itself and
-/// unreaped, with its member left in the group.
+/// The root's state when the spawn fails: running with its member, exited by itself and
+/// unreaped, or killed and reaped by another reaper in the process, with its member left in the
+/// group.
 #[derive(Debug, Clone, Copy)]
 enum Root {
     Running,
     Exited,
+    ReapedBehind,
 }
 
 impl Root {
     fn argv(self) -> [&'static str; 3] {
         match self {
-            Root::Running => ROOT_WITH_A_MEMBER,
+            Root::Running | Root::ReapedBehind => ROOT_WITH_A_MEMBER,
             Root::Exited => ROOT_LEAVING_A_MEMBER,
+        }
+    }
+
+    /// What the cleanup finds of the root: reaped by itself, or already reaped by someone else.
+    fn fate(self) -> ChildFate {
+        match self {
+            Root::Running | Root::Exited => ChildFate::Reaped,
+            Root::ReapedBehind => ChildFate::Gone,
         }
     }
 }
@@ -34,7 +44,14 @@ fn failed_spawn(root: Root, mode: crate::ContainMode, placement: impl Sized) -> 
     let (stdio, started, member) = Member::pipes();
     let capture = Capture::start();
     let spawned = {
-        let _failing = fault::fail_tokio_spawns_after_fork_then(move |_| await_started(started));
+        let _failing = fault::fail_tokio_spawns_after_fork_then(move |pid| {
+            await_started(started);
+            if matches!(root, Root::ReapedBehind) {
+                // SAFETY: `pid` is this process's own unreaped child.
+                unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+                crate::test_child::reaped_elsewhere::reap_behind(pid);
+            }
+        });
         let mut cmd = crate::tokio::Command::new();
         cmd.args(root.argv());
         cmd.contain_with(mode);
@@ -53,12 +70,13 @@ fn failed_spawn(root: Root, mode: crate::ContainMode, placement: impl Sized) -> 
     (fate, steps, member)
 }
 
-/// 6.9+: the cleanup kills the root's group through its pidfd. Mutant: "a tokio spawn's cleanup
-/// after a failed fork kills the root alone".
+/// 6.9+: the cleanup kills the root's group through its pidfd, whoever reaped the root. Mutants: "a
+/// tokio spawn's cleanup after a failed fork kills the root alone", and "the group is killed only
+/// of a root nobody else reaped".
 fn kills_the_group(root: Root, container: Container) {
     let (mode, placement) = container.arm();
     let (fate, steps, member) = failed_spawn(root, mode, placement);
-    assert_eq!(fate, ChildFate::Reaped, "killed and reaped through its pidfd");
+    assert_eq!(fate, root.fate(), "{root:?}");
     assert_group_signalled_first_through_the_pidfd(&steps, libc::SIGKILL);
     member.assert_killed();
 }
@@ -71,7 +89,7 @@ fn below_6_9_sends_nothing_to_the_group(root: Root, container: Container) {
     let (mode, placement) = container.arm();
     let (fate, steps, member) = failed_spawn(root, mode, placement);
     drop(old_kernel);
-    assert_eq!(fate, ChildFate::Reaped, "killed and reaped through its pidfd");
+    assert_eq!(fate, root.fate(), "{root:?}");
     assert_eq!(
         steps.first(),
         Some(&GroupStep::Group(Route::Pidfd, libc::SIGKILL)),
@@ -104,6 +122,13 @@ async fn a_tokio_spawn_failing_after_its_fork_kills_the_group_its_exited_root_le
 }
 
 #[skuld::test]
+async fn a_tokio_spawn_failing_after_its_fork_kills_the_group_its_foreign_reaped_root_left_a_member_in(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+) {
+    kills_the_group(Root::ReapedBehind, Container::Session);
+}
+
+#[skuld::test]
 async fn a_tokio_spawn_failing_after_its_fork_below_6_9_sends_nothing_to_its_running_roots_group() {
     below_6_9_sends_nothing_to_the_group(Root::Running, Container::Session);
 }
@@ -111,6 +136,11 @@ async fn a_tokio_spawn_failing_after_its_fork_below_6_9_sends_nothing_to_its_run
 #[skuld::test]
 async fn a_tokio_spawn_failing_after_its_fork_below_6_9_sends_nothing_to_its_exited_roots_group() {
     below_6_9_sends_nothing_to_the_group(Root::Exited, Container::Session);
+}
+
+#[skuld::test]
+async fn a_tokio_spawn_failing_after_its_fork_below_6_9_sends_nothing_to_its_foreign_reaped_roots_group() {
+    below_6_9_sends_nothing_to_the_group(Root::ReapedBehind, Container::Session);
 }
 
 /// A tree walk's root leads no group of its own: no group is its containment, so none is sent
@@ -125,10 +155,12 @@ async fn a_tokio_spawn_failing_after_its_fork_under_a_tree_walk_sends_no_group_a
     member.assert_survived();
 }
 
-/// A child std collected, because its `exec` failed, never ran the program and left no group to kill.
-/// Mutant: the cleanup sends the group of a collected child the kill.
+/// A child std collected, because its `exec` failed, never ran the program and left no group: the
+/// group kill through its pidfd finds no member (`ESRCH`), and nothing goes by a number. Mutant: the
+/// cleanup sends the group of a collected child by its number, or kills a group the child did not
+/// lead.
 #[skuld::test]
-async fn a_tokio_exec_failure_sends_no_group_anything() {
+async fn a_tokio_exec_failure_kills_a_group_with_no_member_and_sends_nothing_by_number() {
     crate::tokio::test_runtime::assert_current_thread();
     let capture = Capture::start();
     let mut cmd = crate::tokio::Command::new();
@@ -139,7 +171,11 @@ async fn a_tokio_exec_failure_sends_no_group_anything() {
     );
     assert_eq!(fate, ChildFate::Gone, "std had collected the child whose exec failed");
     let steps = capture.group_steps();
-    assert!(steps.is_empty(), "no group is sent anything: {steps:?}");
+    assert_eq!(
+        steps,
+        [GroupStep::Group(Route::Pidfd, libc::SIGKILL)],
+        "one kill through the pidfd, answered with no member, and nothing by a number"
+    );
 }
 
 #[skuld::test]
