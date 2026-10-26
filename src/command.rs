@@ -491,7 +491,8 @@ impl Command {
     /// **Once the root has been reaped, the drop does not kill by the root's number, and logs a
     /// `warn` naming what it skipped.** On Linux 6.9+ a process group is the exception: the root's
     /// pidfd names the group exactly, whoever reaped the root, so the drop kills the group while it
-    /// has a member left, and sends nothing and warns of nothing once it has none. A root whose
+    /// has a member left, and sends nothing and logs no skipped kill once it has none (the async
+    /// drop after a foreign reap still warns that it forgot tokio's `Child`). A root whose
     /// handle cannot say whether it was reaped has its group killed the same way while the group has
     /// a member. The rest of this paragraph is about other mechanisms, kernels before 6.9 and
     /// macOS.

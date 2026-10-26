@@ -156,8 +156,8 @@ debug-asserts on it.
 After a foreign reap:
 
 - On Linux, cgroup plus pidfd stays exact; only the exit status is lost.
-- On Linux 6.9+ a process-group kill, by a tree call or a drop, stays exact through the root's
-  pidfd (principle 4). Below 6.9 and on macOS, process-group kills, and an fd marker's kills by the
+- On Linux 6.9+ a process-group kill, by a tree call, a drop or a failed spawn's cleanup, stays
+  exact through the root's pidfd (principle 4). Below 6.9 and on macOS, process-group kills, and an fd marker's kills by the
   root's number (its group and its ppid walk), are unsafe. The marker's holders are named by the
   pipe they hold and are still killed exactly.
 - macOS has no pidfd, and cosca has no exact kill there.
