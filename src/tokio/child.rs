@@ -1215,6 +1215,10 @@ mod group_exact_tests;
 #[path = "child/drop_group_exact_tests.rs"]
 mod drop_group_exact_tests;
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "child/forget_pidfd_tests.rs"]
+mod forget_pidfd_tests;
+
 #[cfg(all(test, unix))]
 #[path = "child/drop_report_tests.rs"]
 mod drop_report_tests;

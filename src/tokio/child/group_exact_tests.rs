@@ -63,11 +63,13 @@ async fn tokio_kill_tree_kills_the_group_of_a_root_reaped_elsewhere(#[fixture(pi
     await_the_cat_gone(stderr).await;
 }
 
-/// How this handle observes a foreign reap of its root: either way it then holds no tokio `Child`.
+/// How this handle observes a foreign reap of its root: any way it then holds no tokio `Child`.
 #[derive(Debug, Clone, Copy)]
 enum Seen {
     ByTryWait,
     ByWait,
+    /// A second `kill`, which finds the root gone and sends nothing.
+    ByKill,
 }
 
 /// Kills `child`'s root alone, has another reaper reap it, and has `seen` observe that.
@@ -77,6 +79,7 @@ async fn reap_behind_and_observe(child: &mut crate::tokio::Child, seen: Seen) {
     match seen {
         Seen::ByTryWait => drop(child.try_wait().expect_err("a foreign reap answers ECHILD")),
         Seen::ByWait => drop(child.wait().await.expect_err("a foreign reap answers ECHILD")),
+        Seen::ByKill => child.kill().expect("a root reaped elsewhere has nothing left to kill"),
     }
 }
 
@@ -121,19 +124,21 @@ async fn terminate_tree_after_a_seen_foreign_reap(seen: Seen) {
 /// pidfd, and the call ends with the root's status unknown. Same mutant.
 async fn graceful_shutdown_tree_after_a_seen_foreign_reap(seen: Seen) {
     crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
     let (mut child, _stdin, stderr) = root_with_a_cat().await;
     reap_behind_and_observe(&mut child, seen).await;
 
+    let mark = crate::log_capture::mark();
     let capture = Capture::start();
     let result = child.graceful_shutdown_tree(std::time::Duration::ZERO).await;
     let steps = capture.group_steps();
-    drop(result);
     assert_eq!(steps.first(), Some(&GroupStep::Group(Route::Pidfd)), "{steps:?}");
     assert!(
         !steps.contains(&GroupStep::Group(Route::Number)),
         "nothing went by the group's number: {steps:?}"
     );
     await_the_cat_gone(stderr).await;
+    crate::child::group_exact_tests::assert_down_without_status(result, mark);
 }
 
 /// Below 6.9 the old behaviour holds: nothing goes out by the reaped root's number, the call is
@@ -185,6 +190,18 @@ async fn tokio_terminate_tree_terminates_the_group_after_a_foreign_reap_seen_by_
     #[fixture(pidfd_group_signal)] _group: &Group,
 ) {
     terminate_tree_after_a_seen_foreign_reap(Seen::ByWait).await;
+}
+
+#[skuld::test]
+async fn tokio_kill_tree_kills_the_group_after_a_foreign_reap_seen_by_kill(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+) {
+    kill_tree_after_a_seen_foreign_reap(Seen::ByKill).await;
+}
+
+#[skuld::test]
+async fn tokio_kill_tree_below_6_9_sends_nothing_by_number_after_a_foreign_reap_seen_by_kill() {
+    kill_tree_below_6_9_after_a_seen_foreign_reap(Seen::ByKill).await;
 }
 
 #[skuld::test]
