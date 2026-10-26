@@ -13,6 +13,11 @@ pub(crate) struct Prepared {
     /// to the process-group mechanism.
     #[cfg(target_os = "linux")]
     pub cgroup_leaf: Option<crate::containment::cgroup::CgroupLeaf>,
+    /// Set by a failed async spawn's teardown: this long into each of its waits for the leaf's
+    /// drain, a leaf dropped or abandoned here, before `attach` takes it, warns once and keeps
+    /// waiting (principle 2). The handle's armed drop warns for a leaf `attach` took.
+    #[cfg(all(target_os = "linux", feature = "tokio"))]
+    pub teardown_warn_after: Option<std::time::Duration>,
     /// The marker pipe for a contained macOS root. `None` for a nested member, an
     /// uncontained or elevation-derived spawn, or a failed install (which degrades to the
     /// process group).
@@ -147,7 +152,11 @@ impl Prepared {
         #[cfg(target_os = "linux")]
         if let Some(leaf) = self.cgroup_leaf.as_mut() {
             use crate::containment::cgroup::Abandoned;
-            return match leaf.abandon_before_verdict(front, handshake) {
+            #[cfg(feature = "tokio")]
+            let mut warn = crate::containment::cgroup::WarnAfter(self.teardown_warn_after);
+            #[cfg(not(feature = "tokio"))]
+            let mut warn = crate::containment::cgroup::NoWarn;
+            return match leaf.abandon_before_verdict(front, handshake, &mut warn) {
                 Abandoned::Ended => AbandonedChild::Ended,
                 Abandoned::MaybeUnreaped => AbandonedChild::MaybeUnreaped,
                 Abandoned::OutOfReach(why) => AbandonedChild::OutOfReach(why),
@@ -168,6 +177,15 @@ impl Prepared {
         }
         #[cfg(not(target_os = "linux"))]
         let _ = pid;
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "tokio"))]
+impl Drop for Prepared {
+    fn drop(&mut self) {
+        if let Some(leaf) = self.cgroup_leaf.take() {
+            leaf.drop_warning(&mut crate::containment::cgroup::WarnAfter(self.teardown_warn_after));
+        }
     }
 }
 
@@ -959,9 +977,9 @@ impl Attached {
     }
 
     /// Give up the containment resource without waiting for anything: what an async
-    /// `Child::drop` does with it, where a plain drop could block. A cgroup leaf goes through
-    /// `CgroupLeaf::release_without_waiting`; every other mechanism drops in place, which is
-    /// bounded.
+    /// `Child::drop` that does not wait for the drain does with it, where a plain drop could
+    /// block. A cgroup leaf goes through `CgroupLeaf::release_without_waiting`; every other
+    /// mechanism drops in place, which is bounded.
     #[cfg(feature = "tokio")]
     pub(crate) fn release_without_waiting(self) {
         match self {
@@ -1176,6 +1194,8 @@ pub(crate) fn prepare(
             is_root: false,
             #[cfg(target_os = "linux")]
             cgroup_leaf: None,
+            #[cfg(all(target_os = "linux", feature = "tokio"))]
+            teardown_warn_after: None,
             #[cfg(target_os = "macos")]
             marker: None,
             #[cfg(windows)]
@@ -1216,6 +1236,8 @@ pub(crate) fn prepare(
                         mode,
                         is_root,
                         cgroup_leaf: None, // cgroup not used for Session
+                        #[cfg(all(target_os = "linux", feature = "tokio"))]
+                        teardown_warn_after: None,
                     });
                 }
                 UnixSetup::None => {
@@ -1225,6 +1247,8 @@ pub(crate) fn prepare(
                         mode,
                         is_root,
                         cgroup_leaf: None,
+                        #[cfg(all(target_os = "linux", feature = "tokio"))]
+                        teardown_warn_after: None,
                     });
                 }
                 UnixSetup::ProcessGroup => {
@@ -1265,12 +1289,16 @@ pub(crate) fn prepare(
                 mode,
                 is_root,
                 cgroup_leaf: leaf,
+                #[cfg(all(target_os = "linux", feature = "tokio"))]
+                teardown_warn_after: None,
             });
         }
         return Ok(Prepared {
             mode,
             is_root,
             cgroup_leaf: None,
+            #[cfg(all(target_os = "linux", feature = "tokio"))]
+            teardown_warn_after: None,
         });
     }
 
@@ -1315,6 +1343,8 @@ pub(crate) fn prepare(
         is_root,
         #[cfg(target_os = "linux")]
         cgroup_leaf: None,
+        #[cfg(all(target_os = "linux", feature = "tokio"))]
+        teardown_warn_after: None,
         #[cfg(target_os = "macos")]
         marker,
         #[cfg(windows)]
@@ -1362,6 +1392,7 @@ fn attach_tree(
     // Linux: session, or cgroup v2 / process group.
     #[cfg(target_os = "linux")]
     {
+        let mut prepared = prepared;
         if prepared.mode.is_some() {
             if prepared.is_root {
                 // TreeWalk root: no kernel container / process group; teardown is
@@ -1384,7 +1415,7 @@ fn attach_tree(
                 }
 
                 // Strongest: cgroup v2 if available, else process group.
-                if let Some(mut leaf) = prepared.cgroup_leaf {
+                if let Some(mut leaf) = prepared.cgroup_leaf.take() {
                     // The pre_exec write can fail (EBUSY — the "no internal processes" rule
                     // when the supervisor is itself an undelegated leaf). The child's own
                     // report of that write decides membership; re-reading cgroup.procs cannot,

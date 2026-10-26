@@ -256,7 +256,7 @@ impl Command {
         let mut child = self.spawn()?;
         match child.wait().await {
             Ok(status) => Ok(status),
-            Err(e) => Err(after_the_spawn(e, &mut child)),
+            Err(e) => Err(after_the_spawn(e, &mut child).await),
         }
     }
 
@@ -270,7 +270,7 @@ impl Command {
         let mut child = self.spawn()?;
         match child.communicate(None).await {
             Ok(output) => Ok(output),
-            Err(e) => Err(after_the_spawn(e, &mut child)),
+            Err(e) => Err(after_the_spawn(e, &mut child).await),
         }
     }
 
@@ -283,7 +283,7 @@ impl Command {
         let mut child = self.spawn()?;
         let out = match child.communicate(None).await {
             Ok(out) => out,
-            Err(e) => return Err(after_the_spawn(e, &mut child)),
+            Err(e) => return Err(after_the_spawn(e, &mut child).await),
         };
         // `communicate` collected the exit.
         String::from_utf8(out.stdout).map_err(|e| {
@@ -312,9 +312,10 @@ impl Command {
 }
 
 /// The error of a run-to-completion helper that failed after its spawn: the program may have
-/// started, and `child` is torn down now as its drop would, which says what became of it.
-fn after_the_spawn(error: Error, child: &mut Child) -> Error {
-    let fate = child.tear_down_now();
+/// started, and `child` is torn down now as its drop would, awaiting what the drop would block on.
+/// The teardown says what became of the child.
+pub(super) async fn after_the_spawn(error: Error, child: &mut Child) -> Error {
+    let fate = child.tear_down_awaiting().await;
     crate::child::spawn::after_the_spawn(error, fate, child.behind_wrapper())
 }
 

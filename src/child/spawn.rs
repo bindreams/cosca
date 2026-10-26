@@ -653,9 +653,10 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             };
             // The read failed, so no identity is known.
             #[cfg(target_os = "linux")]
-            let (fate, child_fate) = teardown_unadopted_or_front_noting(child, front, None, subtree.as_ref(), &mut why);
+            let (fate, child_fate) =
+                teardown_unadopted_or_front_noting(child, front, None, None, subtree.as_ref(), &mut why);
             #[cfg(all(not(target_os = "macos"), not(target_os = "linux")))]
-            let (fate, child_fate) = teardown_unadopted_or_front_noting(child, front, None, &mut why);
+            let (fate, child_fate) = teardown_unadopted_or_front_noting(child, front, None, None, &mut why);
             // The distinction must survive as a VARIANT, not as prose: a supervisor matching
             // on `Unassessable` to retry elevated would otherwise see an I/O failure and
             // treat a live, merely-unreadable child as a startup failure. A front's fate is a note.
@@ -760,7 +761,7 @@ fn leave_front_after_attach_failure(child: std::process::Child) -> FrontFate {
 /// Dropping the `std` `Child` closes our pipe ends only.
 #[cfg(target_os = "macos")]
 fn teardown_after_attach_failure(child: std::process::Child, unique: u64, id: ProcessId) -> ChildFate {
-    let fate = kill_and_reap_verified(child.id(), unique, Some(id), ZOMBIE_NOTE);
+    let fate = kill_and_reap_verified(child.id(), unique, Some(id), ZOMBIE_NOTE, None);
     drop(child);
     fate
 }
@@ -768,12 +769,18 @@ fn teardown_after_attach_failure(child: std::process::Child, unique: u64, id: Pr
 /// The kill and reap of [`teardown_after_attach_failure`], for a child by its pid, whoever holds its
 /// handle. `id` is its identity, if one was read. What it cannot do is one event, so one `warn`
 /// carries every note (a verified foreign reap is a `debug`). `left_running` is the caller's note of
-/// what becomes of a child this leaves running.
+/// what becomes of a child this leaves running. `warn_after`: see [`kill_and_reap_unreported`].
 #[cfg(target_os = "macos")]
-pub(crate) fn kill_and_reap_verified(pid: u32, unique: u64, id: Option<ProcessId>, left_running: &str) -> ChildFate {
+pub(crate) fn kill_and_reap_verified(
+    pid: u32,
+    unique: u64,
+    id: Option<ProcessId>,
+    left_running: &str,
+    warn_after: Option<std::time::Duration>,
+) -> ChildFate {
     let mut notes = Vec::new();
     let mut breach = None;
-    let (fate, kill) = kill_and_reap_noting(pid, unique, id, None, &mut notes, &mut breach, |_| {});
+    let (fate, kill) = kill_and_reap_noting(pid, unique, id, warn_after, &mut notes, &mut breach, |_| {});
     match kill {
         KillOutcome::Refused(why) => notes.insert(0, format!("could not be killed: {why}")),
         KillOutcome::Unverified => notes.insert(0, UNVERIFIED.to_owned()),
@@ -1165,12 +1172,34 @@ fn await_exit_warning(
     };
     match await_reapable(pid, Some(unique), Some(std::time::Instant::now() + after))? {
         Waited::DeadlinePassed => {
-            log::warn!(
-                "child {pid} is not reapable {after:?} after its kill (it is still running, or a tracer holds its exit); still waiting for it to exit"
-            );
+            warn_still_waiting(Some(pid), after);
             await_reapable(pid, Some(unique), None)
         }
         done => Ok(done),
+    }
+}
+
+/// The one `warn` of a spawn teardown whose wait for the child it killed has passed `after`; the
+/// wait goes on.
+#[cfg(unix)]
+pub(crate) fn warn_still_waiting(pid: Option<u32>, after: std::time::Duration) {
+    let who = pid.map_or_else(
+        || "the spawned child (pid unknown)".to_owned(),
+        |pid| format!("child {pid}"),
+    );
+    log::warn!(
+        "{who} is not reapable {after:?} after its kill (it is still running, or a tracer holds its exit); still waiting for it to exit"
+    );
+}
+
+/// The one `warn` of [`warn_still_waiting`] if `child`'s exit is not visible within `warn_after`,
+/// when set. Call it before the blocking wait, which then goes on unbounded.
+#[cfg(target_os = "linux")]
+fn warn_if_slow(child: &impl Unadopted, warn_after: Option<std::time::Duration>) {
+    if let (Some(after), Some(pidfd)) = (warn_after, child.pidfd()) {
+        if !crate::wait::pidfd_exit_visible_by(pidfd, crate::wait::now() + after) {
+            warn_still_waiting(child.pid(), after);
+        }
     }
 }
 
@@ -2488,6 +2517,7 @@ fn teardown_unadopted_or_front(
         child,
         front,
         id,
+        None,
         #[cfg(target_os = "linux")]
         subtree,
         &mut Diagnosis::default(),
@@ -2495,18 +2525,26 @@ fn teardown_unadopted_or_front(
 }
 
 /// [`teardown_unadopted_or_front`] for a spawn whose identity check found `why`: the teardown's
-/// `warn`, if it has one, carries it.
+/// `warn`, if it has one, carries it. Linux: with `warn_after`, the wait for a front or child the
+/// teardown killed warns once it passes that long ([`warn_still_waiting`]), and goes on.
 #[cfg(not(target_os = "macos"))]
 fn teardown_unadopted_or_front_noting(
     mut child: impl Unadopted,
     front: Option<crate::elevation::front::Front>,
     id: Option<ProcessId>,
+    warn_after: Option<std::time::Duration>,
     #[cfg(target_os = "linux")] subtree: Option<&crate::containment::cgroup::Subtree>,
     why: &mut Diagnosis,
 ) -> (FrontFate, ChildFate) {
     if front.is_none() {
-        return (FrontFate::NotAFront, teardown_unadopted_noting(child, id, why));
+        return (
+            FrontFate::NotAFront,
+            teardown_unadopted_noting(child, id, warn_after, why),
+        );
     }
+    // Only Linux has a pidfd to wait on before the blocking reap.
+    #[cfg(not(target_os = "linux"))]
+    let _ = warn_after;
     // Dropping the handle afterwards closes it; it neither signals nor reaps the child.
     #[cfg(all(test, target_os = "linux"))]
     if fault::fronts_exit_before_teardown() {
@@ -2543,6 +2581,7 @@ fn teardown_unadopted_or_front_noting(
                     Ok(true) => {
                         #[cfg(test)]
                         fault::run_between_kill_and_wait();
+                        warn_if_slow(&child, warn_after);
                         return match child.wait() {
                             Ok(_status) => {
                                 #[cfg(test)]
@@ -2607,20 +2646,23 @@ pub(crate) fn leave_front_through_pidfd(
     id: Option<ProcessId>,
     subtree: Option<&crate::containment::cgroup::Subtree>,
 ) -> (FrontFate, ChildFate) {
-    leave_front_through_pidfd_noting(pid, pidfd, front, id, subtree, &mut Diagnosis::default())
+    leave_front_through_pidfd_noting(pid, pidfd, front, id, None, subtree, &mut Diagnosis::default())
 }
 
-/// [`leave_front_through_pidfd`] for a spawn whose identity check found `why`.
+/// [`leave_front_through_pidfd`] for a spawn whose identity check found `why`. With `warn_after`, the
+/// wait for a front its leaf's kill ended warns once it passes that long ([`warn_still_waiting`]),
+/// and goes on.
 #[cfg(target_os = "linux")]
 pub(crate) fn leave_front_through_pidfd_noting(
     pid: Option<u32>,
     pidfd: std::os::fd::OwnedFd,
     front: crate::elevation::front::Front,
     id: Option<ProcessId>,
+    warn_after: Option<std::time::Duration>,
     subtree: Option<&crate::containment::cgroup::Subtree>,
     why: &mut Diagnosis,
 ) -> (FrontFate, ChildFate) {
-    teardown_unadopted_or_front_noting(PidfdChild::new(pid, pidfd), Some(front), id, subtree, why)
+    teardown_unadopted_or_front_noting(PidfdChild::new(pid, pidfd), Some(front), id, warn_after, subtree, why)
 }
 
 /// Kill and reap, through `pidfd`, the child of a spawn that failed after its fork, unless it is
@@ -2633,15 +2675,28 @@ pub(crate) fn teardown_through_pidfd(
     pidfd: std::os::fd::OwnedFd,
     id: Option<ProcessId>,
 ) -> ChildFate {
-    teardown_through_pidfd_noting(pid, pidfd, id, &mut Diagnosis::default())
+    teardown_through_pidfd_noting(pid, pidfd, id, None, &mut Diagnosis::default())
+}
+
+/// [`teardown_through_pidfd`] whose wait for the killed child warns once it passes `warn_after`
+/// ([`warn_still_waiting`]), and goes on.
+#[cfg(all(target_os = "linux", feature = "tokio"))]
+pub(crate) fn teardown_through_pidfd_warning(
+    pid: Option<u32>,
+    pidfd: std::os::fd::OwnedFd,
+    id: Option<ProcessId>,
+    warn_after: Option<std::time::Duration>,
+) -> ChildFate {
+    teardown_through_pidfd_noting(pid, pidfd, id, warn_after, &mut Diagnosis::default())
 }
 
 /// [`teardown_through_pidfd`] for a spawn whose identity check found `why`.
 #[cfg(target_os = "linux")]
-pub(crate) fn teardown_through_pidfd_noting(
+fn teardown_through_pidfd_noting(
     pid: Option<u32>,
     pidfd: std::os::fd::OwnedFd,
     id: Option<ProcessId>,
+    warn_after: Option<std::time::Duration>,
     why: &mut Diagnosis,
 ) -> ChildFate {
     use crate::wait::exit_only::{peek, Peek};
@@ -2666,7 +2721,7 @@ pub(crate) fn teardown_through_pidfd_noting(
             return ChildFate::Unknown;
         }
     }
-    teardown_unadopted_noting(child, id, why)
+    teardown_unadopted_noting(child, id, warn_after, why)
 }
 
 /// Kill and reap a spawned child that an error path is abandoning before adoption, logging a
@@ -2681,13 +2736,22 @@ pub(crate) fn teardown_through_pidfd_noting(
 /// `id` is the child's identity, if the spawn had read one.
 #[cfg(windows)]
 fn teardown_unadopted(child: impl Unadopted, id: Option<ProcessId>) -> ChildFate {
-    teardown_unadopted_noting(child, id, &mut Diagnosis::default())
+    teardown_unadopted_noting(child, id, None, &mut Diagnosis::default())
 }
 
 /// [`teardown_unadopted`] for a spawn whose identity check found `why`: the teardown's `warn`, if it
-/// has one, carries it.
+/// has one, carries it. Linux: with `warn_after`, the wait for the killed child warns once it passes
+/// that long ([`warn_still_waiting`]), and goes on.
 #[cfg(not(target_os = "macos"))]
-fn teardown_unadopted_noting(mut child: impl Unadopted, id: Option<ProcessId>, why: &mut Diagnosis) -> ChildFate {
+fn teardown_unadopted_noting(
+    mut child: impl Unadopted,
+    id: Option<ProcessId>,
+    warn_after: Option<std::time::Duration>,
+    why: &mut Diagnosis,
+) -> ChildFate {
+    // Only Linux has a pidfd to wait on before the blocking reap.
+    #[cfg(not(target_os = "linux"))]
+    let _ = warn_after;
     // warn before any assert: `debug_assert` is compiled out in release, and a swallowed failure
     // would otherwise leave no trace at all there.
     if let Err(kill) = kill_unadopted(&mut child) {
@@ -2712,6 +2776,8 @@ fn teardown_unadopted_noting(mut child: impl Unadopted, id: Option<ProcessId>, w
     }
     #[cfg(test)]
     fault::run_between_kill_and_wait();
+    #[cfg(target_os = "linux")]
+    warn_if_slow(&child, warn_after);
     match reap_unadopted(&mut child) {
         Ok(_) => ChildFate::Reaped,
         // Reaped by someone else: a handled case, not a contract violation.

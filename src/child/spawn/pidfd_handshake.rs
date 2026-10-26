@@ -882,7 +882,7 @@ fn conclude<T: Spawned>(spawned: io::Result<T>, outcome: Outcome, front: LeftFro
                 if let Err(e) = crate::containment::kill_group_through_pidfd(pidfd.as_fd(), None) {
                     super::note_refused_group_kill(None, e, collected, &mut why);
                 }
-                let child_fate = super::teardown_through_pidfd_noting(None, pidfd, None, &mut why);
+                let child_fate = super::teardown_through_pidfd_noting(None, pidfd, None, None, &mut why);
                 (error, child_fate)
             }
             LeftFront::LeafHeld(leaf) => {

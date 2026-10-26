@@ -706,7 +706,7 @@ fn macos_kill_and_reap_verified_says_the_callers_words_of_a_child_left_running()
     let pid = child.id();
     let mark = crate::log_capture::mark();
     let _refused = refuse_the_kill();
-    let fate = super::kill_and_reap_verified(pid, unique, None, TAIL);
+    let fate = super::kill_and_reap_verified(pid, unique, None, TAIL, None);
     assert!(matches!(fate, crate::error::ChildFate::Running { .. }), "{fate:?}");
     let records = teardown_records(mark);
     assert_eq!(records.len(), 1, "one warn for the one event: {records:?}");

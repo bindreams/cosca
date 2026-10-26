@@ -389,6 +389,12 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
             cmd.env_ops(),
         )
         .not_started()?;
+        // Until `attach` takes the leaf, a failed spawn's teardown drops or abandons it here, and its
+        // drain waits warn once past 1 s.
+        #[cfg(target_os = "linux")]
+        {
+            prepared.teardown_warn_after = super::child::slow_teardown_after();
+        }
         // A front this host could not place after a cgroup kill is refused before it is spawned.
         #[cfg(target_os = "linux")]
         if let Some(leaf) = prepared
@@ -738,6 +744,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                     identity.expect("a spawn that reached the attach adopted its unique id"),
                     Some(id),
                     "is handed to tokio's orphan reaper, which reaps it once it exits",
+                    crate::tokio::child::slow_teardown_after(),
                 );
                 // A child its kill did not end is released to tokio's orphan reaper, not forgotten, which
                 // would leave a zombie nothing collects.
@@ -807,7 +814,7 @@ fn leave_unverified_front(
 /// Async twin of the sync `finish_elevated` (see there). The root's reap is blocking (`try_wait`
 /// cannot reap a just-killed child, so it would leak a zombie), and waits only on this kill. The
 /// front's gate is decided once, before the tree's kill. The backend has run, so the program may
-/// have started.
+/// have started. The waits for the root and for the tree's drain each warn once past 1 s.
 #[cfg(unix)]
 pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> Result<Child, SpawnFailure> {
     let Err(write_err) = written else {
@@ -997,6 +1004,14 @@ mod placement_reuse_tests;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "spawn/pidfd_tests.rs"]
 mod pidfd_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "spawn/slow_teardown_tests.rs"]
+mod slow_teardown_tests;
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "spawn/slow_teardown_macos_tests.rs"]
+mod slow_teardown_macos_tests;
 
 #[cfg(all(test, target_os = "linux"))]
 #[path = "spawn/identity_group_tests.rs"]
