@@ -428,7 +428,7 @@ impl Drop for ProbeGuard {
 
 /// The probe child reports that it is non-dumpable and asks to die with its parent, both before it
 /// is read, and dies of `SIGKILL` once the thread that forked it has exited: a supervisor that dies
-/// mid-probe leaves no process paused for good. Mutant: "the probe sets no parent-death signal" (the
+/// mid-probe leaves no process waiting for good. Mutant: "the probe sets no parent-death signal" (the
 /// report names it, so the test fails by assertion before it waits for the death).
 #[skuld::test]
 fn the_probe_child_dies_with_the_thread_that_forked_it() {
@@ -493,7 +493,7 @@ fn a_probe_whose_parent_is_gone_exits_without_reporting() {
     );
     // The child's end of the pipe closes with the child: end of file, with nothing reported. One
     // read, so a probe that reports instead fails the assertion, and does not leave the read
-    // waiting for the end of a probe that pauses.
+    // waiting for the end of a probe that waits to be killed.
     let mut reported = [0u8; 2];
     let read = probe.ready_read.read(&mut reported).expect("read the probe's report");
     assert_eq!(read, 0, "the probe reported {reported:?}");
@@ -540,7 +540,7 @@ fn no_child_holds(pid: libc::pid_t) -> Result<bool, rustix::io::Errno> {
 
 /// A probe's child that no pidfd can pin (`pidfd_open` fails with `EMFILE`) is killed and reaped by
 /// its number, as before pidfds, and no probe process is left. Mutants: "a failed `pidfd_open`
-/// returns, leaving the probe's child paused", "the kill by number is not made".
+/// returns, leaving the probe's child unreaped", "the kill by number is not made".
 #[skuld::test]
 fn a_probe_child_no_pidfd_can_pin_is_killed_and_reaped_by_its_number() {
     let _missing = fault::miss_pidfd_info();
@@ -586,7 +586,7 @@ fn a_probe_child_reaped_elsewhere_before_its_pin_is_sent_nothing() {
 
 /// A probe's child whose kill through its pidfd fails other than `ESRCH` is killed by its number,
 /// and reaped through the pidfd that still names it: no probe process is left, and nothing reaps by
-/// number. Mutants: "a failed send returns, leaving the probe's child paused", "the reap goes by
+/// number. Mutants: "a failed send returns, leaving the probe's child unreaped", "the reap goes by
 /// number".
 #[skuld::test]
 fn a_probe_child_whose_pidfd_send_fails_is_killed_by_its_number_and_reaped_through_its_pidfd() {
