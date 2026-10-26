@@ -1,4 +1,5 @@
-//! Pure per-OS paths: [`posix::Path`] works on any host, with POSIX rules.
+//! Pure per-OS paths: [`posix::Path`] and [`windows::Path`] work on any host, each with its
+//! OS's rules.
 //!
 //! Nothing here normalises implicitly. Constructors, [`PurePath::join`], equality and `Debug` keep
 //! every component as written: `a/./b` has the components `a`, `.`, `b`, and differs from `a/b`.
@@ -13,6 +14,7 @@ use std::fmt::{self, Debug};
 use std::hash::Hash;
 
 pub mod posix;
+pub mod windows;
 
 /// One component of a path after its anchor, exactly as written.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -38,9 +40,11 @@ impl<S: ?Sized> Copy for Component<'_, S> {}
 
 /// The operations every per-OS path shares.
 ///
-/// `==`, `Hash` and `Ord` are lexical: the anchor, then component by component, with the choice of
-/// separator not significant and case exact. Equal paths are spelled the same up to separator
-/// syntax; they are not "the same file".
+/// `==` and `Hash` compare the spelling, with `/` read as `\` on Windows, case exact. `Ord` compares
+/// the anchor, then component by component, and breaks any remaining tie on that spelling. Names
+/// compare by byte on POSIX and by code point on Windows, a lone surrogate at its own value, so
+/// U+1F600 sorts after U+E000 although its UTF-16 units sort before. Equal paths are spelled the
+/// same up to separator choice; they are not "the same file".
 pub trait PurePath: Eq + Ord + Hash + Debug + ToOwned<Owned = Self::Buf> {
     /// The string type of one component.
     type Str: ?Sized + Debug;
@@ -74,9 +78,12 @@ pub trait PurePath: Eq + Ord + Hash + Debug + ToOwned<Owned = Self::Buf> {
     fn is_bare_name(&self) -> bool;
 
     /// Removes `.` components, `name/..` pairs and repeated separators, as C++'s
-    /// `lexically_normal` does, except that separators alone collapse to the root. Trailing
-    /// separators and names (trailing dots included) stay; `..` at the root is dropped; an emptied
-    /// relative path becomes `.`. `link/..` is not the parent of `link`'s target.
+    /// `lexically_normal` does, except that separators alone collapse to the root. Names stay,
+    /// trailing dots included. On POSIX, a path that ended in a separator, `.` or `name/..` ends in
+    /// one separator after a name (`a/.` and `a/b/..` are `a/`), but never after `..` (`../` is
+    /// `..`). On Windows, only a separator written last leaves one, as Win32 reads it (`a\.\` is
+    /// `a\`, `a\..\` is `.\` and `..\` stays; `a\.` and `a\b\..` are `a`). `..` at the root is
+    /// dropped; an emptied relative path becomes `.`. `link/..` is not the parent of `link`'s target.
     fn lexically_normal(&self) -> Self::Buf;
 
     /// A lossy adapter for user messages: anything that is not Unicode becomes U+FFFD.
@@ -91,7 +98,8 @@ pub trait PurePath: Eq + Ord + Hash + Debug + ToOwned<Owned = Self::Buf> {
     fn to_string_lossy(&self) -> Cow<'_, str>;
 
     /// The path in the OS's native encoding: POSIX bytes, borrowed; Windows UTF-16LE, possibly
-    /// ill-formed, owned.
+    /// ill-formed, owned. An encoding of the stored spelling, not a string for Win32 (see the
+    /// [`windows`] module docs): do not hand it to a Win32 API.
     fn to_native_bytes(&self) -> Cow<'_, [u8]>;
 }
 
