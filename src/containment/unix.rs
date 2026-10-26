@@ -42,8 +42,9 @@
 //! on 6.9+ whether the pidfd's group still has a member). On Linux a member's `SIGKILL` resend pins
 //! the member by a pidfd its identity check vouches for, then checks the root, then sends through
 //! that pidfd. A member's `SIGTERM` probe, and a resend by the member's pid, checks the root, then
-//! the member's identity right before it. Nothing is sent once a check fails; the residual window between a check and its send is documented on
-//! `Child::kill_tree`. cgroup v2 names no pid and has no such hole.
+//! the member's identity right before it. Nothing is sent once a check fails; the residual window
+//! between a check and its send is documented on `Child::kill_tree`. cgroup v2 names no pid and has
+//! no such hole.
 
 use std::io;
 
