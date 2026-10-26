@@ -57,3 +57,17 @@ fn a_drop_kills_the_group_through_the_root_pidfd(#[fixture(pidfd_group_signal)] 
     drop(child);
     assert_through_the_pidfd(&capture.group_steps());
 }
+
+#[skuld::test]
+fn a_failed_elevated_spawns_cleanup_kills_the_group_through_the_root_pidfd(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+) {
+    let (child, _writer) = group_root();
+    let capture = Capture::start();
+    let failed = crate::child::spawn::finish_elevated(
+        child,
+        Err(crate::error::Error::Io(std::io::Error::other("no password"))),
+    );
+    assert!(failed.is_err(), "the password write failed");
+    assert_through_the_pidfd(&capture.group_steps());
+}
