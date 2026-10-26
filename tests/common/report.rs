@@ -237,8 +237,8 @@ fn identify(pid: u32) -> ProcessId {
 }
 
 /// Accepts the root's report connection, reads its pid line watching the root, captures the
-/// grandchild's identity and releases the root. See the module doc. The report serves one
-/// connection, so `report` is consumed and closes as soon as it is accepted.
+/// grandchild's identity and releases the root. See the module doc. `report` closes once its
+/// connection is accepted.
 pub fn report_grandchild(report: TcpListener, root: &mut cosca::Child) -> ProcessId {
     let (id, stream) = read_grandchild_report(report, root);
     let contained = is_contained_member(root.containment(), root.pid(), id.pid(), |_pid| {
@@ -255,8 +255,7 @@ pub fn report_grandchild(report: TcpListener, root: &mut cosca::Child) -> Proces
 
 /// [`accept_tree_also`](super::accept_tree_also) for a root started with [`GC_PID_ADDR_ENV`] set
 /// to `report`'s address: captures the grandchild's identity through the report protocol first.
-/// Both listeners are consumed: `report` closes once its connection is accepted, `listener` when
-/// this function returns.
+/// `report` closes once accepted, `listener` on return.
 pub fn accept_tree(
     listener: TcpListener,
     report: TcpListener,

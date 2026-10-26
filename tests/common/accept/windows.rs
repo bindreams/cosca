@@ -90,7 +90,6 @@ pub(super) fn wait(source: Source<'_>, target_pid: u32, also: Option<ProcessId>)
         }
     }
 
-    // Armed only for a socket source; `Never` waits on the processes alone.
     let armed = watched_socket.map(|(raw, mask)| {
         // SAFETY: creates an unnamed, unowned manual-reset event; `ReadinessEvent` closes it.
         let event =
@@ -130,7 +129,7 @@ pub(super) fn wait(source: Source<'_>, target_pid: u32, also: Option<ProcessId>)
         match source {
             Source::Listener(l) => l.set_nonblocking(false),
             Source::Stream(s) => s.set_nonblocking(false),
-            Source::Never => unreachable!("a socket was armed for a source that is not one"),
+            Source::Never => unreachable!("Never arms no socket"),
         }
         .expect("restore the watched socket to blocking mode");
         drop(event);
