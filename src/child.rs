@@ -1249,9 +1249,9 @@ impl Child {
     /// The kill-on-drop teardown, with one report of the event.
     ///
     /// Nothing that names the tree by the root's number runs once the root is reaped, or when its
-    /// handle cannot say: the handle's own answer (`RootState`), or the number no longer reading
-    /// as this root. Each send by the group's number checks the root again, as for
-    /// [`kill_tree`](Child::kill_tree). On Linux 6.9+ the root's pidfd decides a process group instead
+    /// handle cannot say: the handle's own answer (`RootState`), or the number no longer reading as
+    /// this root. Each send by the group's number checks the root again, as for
+    /// [`kill_tree`](Child::kill_tree). On Linux 6.9+ a process group is decided by the root's pidfd
     /// ([`Attached::hard_kill_for_drop`](crate::containment::Attached::hard_kill_for_drop)). An
     /// unreaped root stays a zombie, pinning its number, until `teardown_on_drop`.
     fn drop_unix(&mut self) -> crate::error::ChildFate {

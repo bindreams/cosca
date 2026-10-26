@@ -585,9 +585,9 @@ impl Command {
     /// child. A cgroup kill stays exact (only the exit status is lost), and so, on Linux 6.9+, does a
     /// process group's, through the root's pidfd (not yet an async handle's whose `wait`, `try_wait`
     /// or `kill` saw the reap: it no longer holds the pidfd). Below 6.9 and on macOS, kills named by
-    /// the root's pid (a process group; a macOS fd marker's group and walk) are skipped on evidence of
-    /// a foreign reap, and [`kill_tree`](crate::Child::kill_tree),
-    /// [`terminate_tree`](crate::Child::terminate_tree) and
+    /// the root's pid (a process group; a macOS fd marker's group and walk) are skipped on evidence
+    /// of a foreign reap, and
+    /// [`kill_tree`](crate::Child::kill_tree), [`terminate_tree`](crate::Child::terminate_tree) and
     /// [`graceful_shutdown_tree`](crate::Child::graceful_shutdown_tree) return
     /// [`Error::Unassessable`](crate::error::Error::Unassessable); see `kill_tree` for the rest.
     /// macOS has no pidfd, so cosca has no exact kill of the root there.

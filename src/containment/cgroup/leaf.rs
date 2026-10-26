@@ -1113,10 +1113,11 @@ impl CgroupLeaf {
 /// its number has been reused since. An intent with no handle names nothing cosca may signal.
 ///
 /// A child that reported a failed placement exec'd outside the leaf, so what it forked is reached
-/// only as the process group it leads, killed before the handle's kill ([`kill_group_outside_leaf`]).
-/// A child reaped before the look still has its group killed through the handle while the group has
-/// a member, and is sent nothing by number. A child in the leaf is killed with the leaf, and one that never
-/// reported never exec'd, so neither is sent anything by number.
+/// only as the process group it leads, killed before the handle's kill
+/// ([`kill_group_outside_leaf`]). A child reaped before the look still has its group killed through
+/// the handle while the group has a member, and is sent nothing by number. A child in the leaf is
+/// killed with the leaf, and one that never reported never exec'd, so neither is sent anything by
+/// number.
 ///
 /// A child its handle may not signal (`EPERM`) is handed to a background reaper, so it is reaped
 /// once it exits, however that comes.
