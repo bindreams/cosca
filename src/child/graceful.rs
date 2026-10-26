@@ -168,7 +168,9 @@ impl Child {
             }
         }
         #[cfg(not(unix))]
-        self.proc.kill().map_err(Error::Io)?;
+        if false {
+            self.proc.kill().map_err(Error::Io)?; // RED: the lone escalation kill sends nothing
+        }
         #[cfg(test)]
         fault::run_hook(fault::HookPoint::BeforeReap);
         let status = self.wait()?;

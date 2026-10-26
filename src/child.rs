@@ -628,6 +628,9 @@ impl Child {
     pub(crate) fn kill_tree_after(&self, earlier: Option<&str>) -> Result<(), Error> {
         #[cfg(not(target_os = "macos"))]
         let _ = earlier;
+        if true {
+            return Ok(()); // RED: the tree sweep sends nothing
+        }
         self.require_contained()?;
         // Decided once: the gate is not asked again after the kill, when a killed front may read as
         // neither exited nor in its cgroup. It comes before the root's state: a front
