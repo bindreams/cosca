@@ -351,6 +351,15 @@ fn check_or_signal(
         "check_or_signal called with {signal:?}; only None (probe) or Some(SIGKILL) (resend) \
          are ever valid here — SIGTERM must never resend, see converge's design note"
     );
+    // A resend reaches the group's member only while the group's number is still the root's: the
+    // root's check, then the member's own, each right before the `kill` they guard. A probe sends
+    // nothing.
+    if signal.is_some() {
+        if let Err(why) = root.check() {
+            log::warn!("containment::unix::group: {why}, so pid {pid} is not resent {signal:?}; it is unassessable");
+            return Reached::Unknown;
+        }
+    }
     match crate::identity::ProcessId::of(pid) {
         crate::identity::Resolved::Found(live) if live == id => {}
         // Gone — nothing to refuse.
@@ -391,15 +400,9 @@ fn check_or_signal(
         log::warn!("containment::unix::group: pid {pid} is not a single-process signal target");
         return Reached::Unknown;
     };
-    // A resend reaches the group's member only while the group's number is still the root's: its
-    // own check, right before it. A probe sends nothing.
+    #[cfg(test)]
     if signal.is_some() {
-        if let Err(why) = root.check() {
-            log::warn!("containment::unix::group: {why}, so pid {pid} is not resent {signal:?}; it is unassessable");
-            return Reached::Unknown;
-        }
-        #[cfg(test)]
-        crate::send_log::record_group(crate::send_log::GroupStep::Member(crate::send_log::Route::Number));
+        crate::send_log::record_group(crate::send_log::GroupStep::Member(crate::send_log::Route::Number, pid));
     }
     match nix::sys::signal::kill(nix::unistd::Pid::from_raw(target), signal) {
         Ok(()) | Err(nix::errno::Errno::ESRCH) => Reached::Yes,
@@ -475,7 +478,7 @@ fn check_or_signal_linux_sigkill(pid: RawPid, id: crate::identity::ProcessId, ro
                 );
                 Reached::Unknown
             }
-            Ok(()) => match send_member_pidfd(&pidfd) {
+            Ok(()) => match send_member_pidfd(&pidfd, id.pid()) {
                 Ok(()) => Reached::Yes,
                 Err(rustix::io::Errno::SRCH) => Reached::Yes, // exited between open and signal
                 Err(rustix::io::Errno::PERM) => {
@@ -519,11 +522,12 @@ fn check_or_signal_linux_sigkill(pid: RawPid, id: crate::identity::ProcessId, ro
     }
 }
 
-/// `SIGKILL` through a member's own pidfd.
+/// `SIGKILL` through a member's own pidfd, `pid` the member's.
 #[cfg(target_os = "linux")]
-fn send_member_pidfd(pidfd: &rustix::fd::OwnedFd) -> rustix::io::Result<()> {
+#[cfg_attr(not(test), allow(unused_variables, reason = "only the test log names the pid"))]
+fn send_member_pidfd(pidfd: &rustix::fd::OwnedFd, pid: RawPid) -> rustix::io::Result<()> {
     #[cfg(test)]
-    crate::send_log::record_group(crate::send_log::GroupStep::Member(crate::send_log::Route::Pidfd));
+    crate::send_log::record_group(crate::send_log::GroupStep::Member(crate::send_log::Route::Pidfd, pid));
     rustix::process::pidfd_send_signal(pidfd, rustix::process::Signal::KILL)
 }
 

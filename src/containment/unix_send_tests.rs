@@ -9,9 +9,9 @@ use crate::send_log::{GroupStep, Route};
 #[cfg(target_os = "linux")]
 use crate::test_groups::{pidfd_group_signal, Group};
 
-/// A leader in a group of its own with two members, all blocked on reads of the test's pipe, and
-/// the write end that ends them once dropped. Returns once both members exist.
-fn group_of_three() -> (std::process::Child, std::process::ChildStdin) {
+/// A leader in a group of its own with two members, all blocked on reads of the test's pipe, the
+/// write end that ends them once dropped, and the members' pids. Returns once both members exist.
+fn group_of_three() -> (std::process::Child, std::process::ChildStdin, [u32; 2]) {
     use std::io::BufRead as _;
     use std::os::unix::process::CommandExt;
     // Through fd 3: an asynchronous list's stdin is `/dev/null`, and dash points it there before a
@@ -19,7 +19,7 @@ fn group_of_three() -> (std::process::Child, std::process::ChildStdin) {
     let mut child = crate::test_spawn::spawn(
         std::process::Command::new("sh")
             .arg("-c")
-            .arg("exec 3<&0; cat <&3 & cat <&3 & echo ready; wait")
+            .arg(r#"exec 3<&0; cat <&3 & a=$!; cat <&3 & echo "$a $!"; wait"#)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .process_group(0),
@@ -29,9 +29,13 @@ fn group_of_three() -> (std::process::Child, std::process::ChildStdin) {
     let mut line = String::new();
     std::io::BufReader::new(child.stdout.take().expect("piped stdout"))
         .read_line(&mut line)
-        .expect("read the leader's ready line");
-    assert_eq!(line, "ready\n", "the leader started both members");
-    (child, stdin)
+        .expect("read the members' pids");
+    let members: Vec<u32> = line
+        .split_whitespace()
+        .map(|pid| pid.parse().expect("a member's pid"))
+        .collect();
+    let members = <[u32; 2]>::try_from(members).unwrap_or_else(|got| panic!("two members' pids, got {got:?}"));
+    (child, stdin, members)
 }
 
 /// Every send whose target is named by the group's number is right after its own check of the
@@ -42,7 +46,7 @@ fn assert_each_send_by_number_follows_its_check(steps: &[GroupStep]) {
     for (i, step) in steps.iter().enumerate() {
         let by_number = matches!(
             step,
-            GroupStep::Group(Route::Number) | GroupStep::Leader(Route::Number) | GroupStep::Member(_)
+            GroupStep::Group(Route::Number) | GroupStep::Leader(Route::Number) | GroupStep::Member(..)
         );
         if by_number {
             assert!(
@@ -59,7 +63,7 @@ fn assert_each_send_by_number_follows_its_check(steps: &[GroupStep]) {
 /// "check once before the members' resends".
 #[skuld::test]
 fn each_send_by_the_group_number_has_its_own_check_right_before_it() {
-    let (mut child, stdin) = group_of_three();
+    let (mut child, stdin, members) = group_of_three();
     let pgid = child.id() as i32;
     let check = || Ok(());
     let root = GroupRoot::new(None, &check);
@@ -75,8 +79,25 @@ fn each_send_by_the_group_number_has_its_own_check_right_before_it() {
         steps.contains(&GroupStep::Group(Route::Number)) && steps.iter().any(|s| matches!(s, GroupStep::Leader(_))),
         "the group's send and the leader's signal were made: {steps:?}"
     );
-    let members = steps.iter().filter(|s| matches!(s, GroupStep::Member(_))).count();
-    assert_eq!(members, 2, "both members were resent the kill: {steps:?}");
+    // The leader is resent too when it had not yet exited from its own kill at the listing.
+    let resent: Vec<u32> = steps
+        .iter()
+        .filter_map(|s| match s {
+            GroupStep::Member(_, pid) => Some(*pid),
+            _ => None,
+        })
+        .collect();
+    for member in members {
+        assert_eq!(
+            resent.iter().filter(|&&pid| pid == member).count(),
+            1,
+            "member {member} was resent the kill once: {steps:?}"
+        );
+    }
+    assert!(
+        resent.iter().all(|&pid| members.contains(&pid) || pid == child.id()),
+        "only the group was resent the kill: {steps:?}"
+    );
     let status = child.wait().expect("reap the leader");
     assert_eq!(status.signal(), Some(libc::SIGKILL), "got {status:?}");
 }
@@ -85,7 +106,7 @@ fn each_send_by_the_group_number_has_its_own_check_right_before_it() {
 /// check".
 #[skuld::test]
 fn a_failed_check_sends_nothing_by_the_group_number() {
-    let (mut child, stdin) = group_of_three();
+    let (mut child, stdin, _) = group_of_three();
     let pgid = child.id() as i32;
     let check = || Err("the root was reaped elsewhere".to_owned());
     let root = GroupRoot::new(None, &check);
@@ -111,7 +132,7 @@ fn a_failed_check_sends_nothing_by_the_group_number() {
 #[skuld::test]
 fn kill_group_signals_through_the_root_pidfd(#[fixture(pidfd_group_signal)] _group: &Group) {
     use std::os::fd::AsFd as _;
-    let (mut child, stdin) = group_of_three();
+    let (mut child, stdin, _) = group_of_three();
     let pidfd = crate::containment::cgroup::test_support::pidfd_of(child.id());
     let check = || Ok(());
     let root = GroupRoot::new(Some(pidfd.as_fd()), &check);
@@ -148,7 +169,7 @@ fn kernel_release() -> String {
 #[skuld::test]
 fn kill_group_falls_back_to_the_number_when_the_kernel_refuses_the_flag() {
     use std::os::fd::AsFd as _;
-    let (mut child, stdin) = group_of_three();
+    let (mut child, stdin, _) = group_of_three();
     let pidfd = crate::containment::cgroup::test_support::pidfd_of(child.id());
     let check = || Ok(());
     let root = GroupRoot::new(Some(pidfd.as_fd()), &check);
@@ -181,7 +202,7 @@ fn kill_group_falls_back_to_the_number_when_the_kernel_refuses_the_flag() {
 #[skuld::test]
 fn the_leader_signal_goes_through_the_root_pidfd() {
     use std::os::fd::AsFd as _;
-    let (mut child, stdin) = group_of_three();
+    let (mut child, stdin, _) = group_of_three();
     let pidfd = crate::containment::cgroup::test_support::pidfd_of(child.id());
     let check = || Ok(());
     let root = GroupRoot::new(Some(pidfd.as_fd()), &check);

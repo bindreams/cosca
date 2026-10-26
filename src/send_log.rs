@@ -33,8 +33,8 @@ pub(crate) enum GroupStep {
     Group(Route),
     /// The signal to the leader alone, after the group's was refused.
     Leader(Route),
-    /// A member's resend.
-    Member(Route),
+    /// A member's resend, and the member's pid.
+    Member(Route, u32),
 }
 
 /// How a [`GroupStep`] send named its target.
