@@ -124,8 +124,13 @@ elevated spawn that cannot finish, or of an abandoned spawn whose cgroup leaf di
 still kill the group of a reaped root while it has a member, whoever reaped the root, and send
 nothing once it has none; that signal-0 send is also the check before each send by the group's
 number. The cleanup of a tokio spawn that fails after its fork does not yet: it kills the root
-alone. cosca detects the flag by acting,
-and an older kernel's `EINVAL` falls back to the group's number, checked against the root's state.
+alone. cosca detects the flag by acting, and an older kernel's `EINVAL` is handled per path. A tree
+call, a drop and the cleanup of an elevated spawn that cannot finish fall back to the group's
+number, checked against the root's state, and send nothing once that check fails. The cleanup of an
+abandoned spawn does the same while its child is unreaped, and sends the group of a reaped child
+nothing. The cleanup of a spawn that fails at its identity read sends the group nothing, whatever
+the root's state. These last two `warn` once, naming the root's pid, that members of its process
+group may be left running.
 On 6.9+ a member's resend still goes by its pid when the member's own `pidfd_open` fails (`EMFILE`,
 say), right after a check of its identity. Below 6.9 and on macOS a reaper elsewhere in the process
 can reap the root between the check and a send by its number, which then reaches whoever holds it: a

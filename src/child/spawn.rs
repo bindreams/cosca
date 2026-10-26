@@ -2399,19 +2399,26 @@ pub(crate) fn settle_before_teardown(
 
 /// Linux 6.9+: kill the process group of a failed spawn's root before its teardown, as
 /// [`Prepared::kill_group_before_attach`](crate::containment::Prepared::kill_group_before_attach)
-/// decides. A refused kill is owed to `why`, the teardown's one warn. Not for an elevation front,
-/// which is sent nothing.
+/// decides. A refused kill is owed to `why`, the teardown's one warn, which says the group's
+/// members may be left running. Not for an elevation front, which is sent nothing.
 #[cfg(target_os = "linux")]
 pub(crate) fn kill_group_before_teardown(
     prepared: &crate::containment::Prepared,
     child: crate::containment::ChildHandle<'_>,
     why: &mut Diagnosis,
 ) {
-    if let Err(e) = prepared.kill_group_before_attach(child) {
-        why.add(format!(
-            "spawn teardown could not kill the process group of pid {} through its pidfd ({e})",
-            child.pid
-        ));
+    let pid = child.pid;
+    match prepared.kill_group_before_attach(child) {
+        Ok(()) => {}
+        Err(nix::errno::Errno::EINVAL) => why.add(format!(
+            "members of the process group of pid {pid} may be left running: the kernel refused \
+             PIDFD_SIGNAL_PROCESS_GROUP (EINVAL, expected below Linux 6.9), so nothing was sent to the \
+             group, whose number may name another group"
+        )),
+        Err(e) => why.add(format!(
+            "spawn teardown could not kill the process group of pid {pid} through its pidfd ({e}); its \
+             members may be left running"
+        )),
     }
 }
 

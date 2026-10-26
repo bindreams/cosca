@@ -75,8 +75,9 @@ impl Prepared {
     /// reaped the root. Only a root whose group is its containment is sent it: a Session root, or a
     /// process-group root with no cgroup leaf or one its leaf did not take, as `attach` would decide.
     /// The leaf's verdict is settled first ([`settle_verdict`](Self::settle_verdict)); a leaf that
-    /// took the child kills it with the leaf. Below 6.9 the kernel refuses the flag and nothing is
-    /// sent, as the group's number may name another group. `Err` is the kernel's refusal of the kill.
+    /// took the child kills it with the leaf. `Err` is the kernel's refusal of the kill, with the
+    /// group's members possibly left running: `EINVAL` when it refuses the flag (expected below
+    /// 6.9), in which case nothing is sent, as the group's number may name another group.
     #[cfg(target_os = "linux")]
     pub(crate) fn kill_group_before_attach(&self, child: ChildHandle<'_>) -> Result<(), nix::errno::Errno> {
         use nix::errno::Errno;
@@ -88,12 +89,8 @@ impl Prepared {
         }
         let pid = child.pid;
         match crate::containment::unix::pidfd_signal_group(child.pidfd, nix::sys::signal::Signal::SIGKILL) {
-            Ok(()) => log::debug!("spawn teardown: killed the process group of pid {pid} through its pidfd"),
+            Ok(()) => log::debug!("spawn teardown: sent SIGKILL to the process group of pid {pid} through its pidfd"),
             Err(Errno::ESRCH) => log::debug!("spawn teardown: the process group of pid {pid} has no member left"),
-            Err(Errno::EINVAL) => log::debug!(
-                "spawn teardown: the kernel refused PIDFD_SIGNAL_PROCESS_GROUP (before Linux 6.9), so the process \
-                 group of pid {pid} is sent nothing"
-            ),
             Err(e) => return Err(e),
         }
         Ok(())
