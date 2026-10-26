@@ -52,8 +52,14 @@ pub(crate) fn assert_group_signalled_first_through_the_pidfd(steps: &[GroupStep]
     );
 }
 
+/// How a [`GroupStep`] send named its target.
 #[cfg(unix)]
-pub(crate) use crate::containment::unix::Route;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code, reason = "only Linux sends through a pidfd")]
+pub(crate) enum Route {
+    Pidfd,
+    Number,
+}
 
 thread_local! {
     static LOG: RefCell<Option<Vec<Entry>>> = const { RefCell::new(None) };

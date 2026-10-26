@@ -48,8 +48,7 @@
 
 use std::io;
 
-use nix::sys::signal::{kill, killpg, Signal};
-use nix::unistd::Pid;
+use nix::sys::signal::Signal;
 
 use crate::containment::GroupRoot;
 use crate::error::Error;
@@ -358,52 +357,74 @@ fn send_to_group(pgid: i32, signal: Signal, root: &GroupRoot<'_>) -> Result<Resu
         ),
         source: None,
     })?;
-    Ok(send_signal(Target::Group(Route::Number), signal, |signal| {
-        #[cfg(test)]
-        if fault::group_sends_refused() {
-            return Err(nix::errno::Errno::EPERM);
-        }
-        killpg(Pid::from_raw(pgid), signal)
-    }))
+    Ok(send_signal(Target::Group, Sys::Group(pgid), signal))
 }
 
-/// How a send names its target.
+/// What a send through [`send_signal`] reaches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code, reason = "only a test build records it"))]
+pub(crate) enum Target {
+    /// A whole process group.
+    Group,
+    /// A group's leader alone, after the group's send was refused.
+    Leader,
+    /// A listed member of a group, by its pid.
+    Member(u32),
+}
+
+/// The syscall [`send_signal`] makes.
+#[derive(Clone, Copy)]
 #[cfg_attr(
     not(target_os = "linux"),
     allow(dead_code, reason = "only Linux sends through a pidfd")
 )]
-pub(crate) enum Route {
-    Pidfd,
-    Number,
+pub(crate) enum Sys<'a> {
+    /// `pidfd_send_signal` through a pidfd, with its flags.
+    Pidfd(std::os::fd::BorrowedFd<'a>, libc::c_uint),
+    /// `killpg` of a group's number.
+    Group(i32),
+    /// `kill` of a pid.
+    Process(i32),
 }
 
-/// What a send through [`send_signal`] reaches.
-#[derive(Debug, Clone, Copy)]
-#[cfg_attr(not(test), allow(dead_code, reason = "only a test build records it"))]
-pub(crate) enum Target {
-    /// A whole process group.
-    Group(Route),
-    /// A group's leader alone, after the group's send was refused.
-    Leader(Route),
-    /// A listed member of a group, by its pid.
-    Member(Route, u32),
-}
-
-/// Makes a send to a process group, its leader or a member: `send` makes the syscall with `signal`.
-/// Every such send goes through here, so a test build records it once the syscall returned, with
-/// the signal handed to `send` ([`GroupStep`](crate::send_log::GroupStep)): a send that is skipped
-/// leaves no record.
-pub(crate) fn send_signal<R>(target: Target, signal: Signal, send: impl FnOnce(Signal) -> R) -> R {
-    let sent = send(signal);
+/// Sends `signal` to `target` by `sys`, and gives the kernel's answer. Every send to a process
+/// group, its leader or a member goes through here, and makes its syscall here, so a test build
+/// records it ([`GroupStep`](crate::send_log::GroupStep)) once the syscall returned, with the
+/// signal it was given: a send that is skipped leaves no record. In a test build a seam may answer
+/// in place of the kernel for a whole group: `EINVAL` for the pidfd flag, `EPERM` for a refused
+/// group.
+pub(crate) fn send_signal(target: Target, sys: Sys<'_>, signal: Signal) -> nix::Result<()> {
+    let signo = signal as libc::c_int;
+    #[cfg(test)]
+    let seam = match (target, sys) {
+        (Target::Group, Sys::Pidfd(..)) if fault::pidfd_group_flag_refused() => Some(nix::errno::Errno::EINVAL),
+        (Target::Group, _) if fault::group_sends_refused() => Some(nix::errno::Errno::EPERM),
+        _ => None,
+    };
+    #[cfg(not(test))]
+    let seam: Option<nix::errno::Errno> = None;
+    let sent = match (seam, sys) {
+        (Some(errno), _) => Err(errno),
+        #[cfg(target_os = "linux")]
+        (None, Sys::Pidfd(pidfd, flags)) => pidfd_send_syscall(pidfd, signo, flags),
+        #[cfg(not(target_os = "linux"))]
+        (None, Sys::Pidfd(..)) => unreachable!("only Linux sends through a pidfd"),
+        // SAFETY: plain syscalls on numbers; each caller checked the number right before.
+        (None, Sys::Group(pgid)) => nix::errno::Errno::result(unsafe { libc::killpg(pgid, signo) }).map(drop),
+        // SAFETY: as above.
+        (None, Sys::Process(pid)) => nix::errno::Errno::result(unsafe { libc::kill(pid, signo) }).map(drop),
+    };
     #[cfg(test)]
     {
-        use crate::send_log::GroupStep;
-        let signo = signal as i32;
+        use crate::send_log::{GroupStep, Route};
+        let route = match sys {
+            Sys::Pidfd(..) => Route::Pidfd,
+            Sys::Group(_) | Sys::Process(_) => Route::Number,
+        };
         crate::send_log::record_group(match target {
-            Target::Group(route) => GroupStep::Group(route, signo),
-            Target::Leader(route) => GroupStep::Leader(route, signo),
-            Target::Member(route, pid) => GroupStep::Member(route, pid, signo),
+            Target::Group => GroupStep::Group(route, signo),
+            Target::Leader => GroupStep::Leader(route, signo),
+            Target::Member(pid) => GroupStep::Member(route, pid, signo),
         });
     }
     #[cfg(not(test))]
@@ -464,22 +485,10 @@ pub(crate) fn pidfd_group_has_member(pidfd: std::os::fd::BorrowedFd<'_>) -> Opti
 #[cfg(target_os = "linux")]
 fn pidfd_signal(pidfd: std::os::fd::BorrowedFd<'_>, signal: Signal, through: Through) -> Result<(), nix::errno::Errno> {
     let (target, flags) = match through {
-        Through::Group => (Target::Group(Route::Pidfd), libc::PIDFD_SIGNAL_PROCESS_GROUP),
-        Through::Leader => (Target::Leader(Route::Pidfd), 0),
+        Through::Group => (Target::Group, libc::PIDFD_SIGNAL_PROCESS_GROUP),
+        Through::Leader => (Target::Leader, 0),
     };
-    send_signal(target, signal, |signal| {
-        // A seam answers in place of the kernel.
-        #[cfg(test)]
-        if through == Through::Group {
-            if fault::pidfd_group_flag_refused() {
-                return Err(nix::errno::Errno::EINVAL);
-            }
-            if fault::group_sends_refused() {
-                return Err(nix::errno::Errno::EPERM);
-            }
-        }
-        pidfd_send_syscall(pidfd, signal as libc::c_int, flags)
-    })
+    send_signal(target, Sys::Pidfd(pidfd, flags), signal)
 }
 
 /// `pidfd_send_signal(pidfd, signo, NULL, flags)`. The kernel's errno is the answer.
@@ -582,9 +591,7 @@ fn signal_direct(pid: i32, signal: Signal, root: &GroupRoot<'_>) -> io::Result<(
                 log::debug!("containment::unix::signal_direct: {why}, so {signal} was not sent to pid {pid}");
                 return Err(io::Error::other(why.to_string()));
             }
-            send_signal(Target::Leader(Route::Number), signal, |signal| {
-                kill(Pid::from_raw(pid), signal)
-            })
+            send_signal(Target::Leader, Sys::Process(pid), signal)
         }
     };
     match sent {

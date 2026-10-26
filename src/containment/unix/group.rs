@@ -397,14 +397,11 @@ fn check_or_signal(
         log::warn!("containment::unix::group: pid {pid} is not a single-process signal target");
         return Reached::Unknown;
     };
-    let target = nix::unistd::Pid::from_raw(target);
     let sent = match signal {
-        Some(signal) => super::send_signal(super::Target::Member(super::Route::Number, pid), signal, |signal| {
-            nix::sys::signal::kill(target, signal)
-        }),
+        Some(signal) => super::send_signal(super::Target::Member(pid), super::Sys::Process(target), signal),
         #[cfg(test)]
         None if fault::probes_refused() => Err(nix::errno::Errno::EPERM),
-        None => nix::sys::signal::kill(target, None),
+        None => nix::sys::signal::kill(nix::unistd::Pid::from_raw(target), None),
     };
     match sent {
         Ok(()) | Err(nix::errno::Errno::ESRCH) => Reached::Yes,
@@ -542,9 +539,9 @@ fn check_or_signal_linux_sigkill(pid: RawPid, id: crate::identity::ProcessId, ro
 fn send_member_pidfd(pidfd: &rustix::fd::OwnedFd, pid: RawPid) -> nix::Result<()> {
     use std::os::fd::AsFd as _;
     super::send_signal(
-        super::Target::Member(super::Route::Pidfd, pid),
+        super::Target::Member(pid),
+        super::Sys::Pidfd(pidfd.as_fd(), 0),
         Signal::SIGKILL,
-        |signal| super::pidfd_send_syscall(pidfd.as_fd(), signal as libc::c_int, 0),
     )
 }
 
