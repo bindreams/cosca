@@ -291,7 +291,7 @@ fn kill_tree_reports_refused_and_leaves_the_real_setuid_survivor_running(#[fixtu
     let mut priv_pid = None;
     let mut priv_sock = None;
     let mut lines = Vec::new();
-    let streams = common::accept_tree(&listener, &report, &mut child, |s| {
+    let streams = common::accept_tree(listener, report, &mut child, |s| {
         let line = read_handshake_line(s);
         // The root's handshake line is `R`; the privileged helper's starts with its tag `P`.
         let is_grandchild = !line.starts_with('R');
