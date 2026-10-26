@@ -45,6 +45,9 @@ pub mod handle_snapshot;
 #[cfg(windows)]
 pub mod inheritable;
 
+#[cfg(windows)]
+pub mod windows_reparse;
+
 mod locked;
 pub use locked::*;
 
