@@ -2,7 +2,7 @@
 //! names its group exactly, whoever reaped the root.
 
 use crate::child::group_exact_tests::{await_started, EndedAtTheSigterm, Member, ROOT_WITH_A_MEMBER};
-use crate::send_log::{Capture, GroupStep, Route};
+use crate::send_log::{assert_group_signalled_first_through_the_pidfd, Capture, GroupStep, Route};
 use crate::test_child::reaped_elsewhere::reap_behind;
 use crate::test_groups::{pidfd_group_signal, Group};
 
@@ -46,10 +46,10 @@ async fn tokio_kill_tree_kills_the_group_of_a_root_reaped_elsewhere(#[fixture(pi
 /// How this handle observes a foreign reap of its root: any way it then holds no tokio `Child`.
 #[derive(Debug, Clone, Copy)]
 enum Seen {
-    ByTryWait,
-    ByWait,
+    TryWait,
+    Wait,
     /// A second `kill`, which finds the root gone and sends nothing.
-    ByKill,
+    Kill,
 }
 
 /// Kills `child`'s root alone, has another reaper reap it, and has `seen` observe that.
@@ -57,9 +57,9 @@ async fn reap_behind_and_observe(child: &mut crate::tokio::Child, seen: Seen) {
     child.kill().expect("kill the root alone");
     reap_behind(child.id().pid());
     match seen {
-        Seen::ByTryWait => drop(child.try_wait().expect_err("a foreign reap answers ECHILD")),
-        Seen::ByWait => drop(child.wait().await.expect_err("a foreign reap answers ECHILD")),
-        Seen::ByKill => child.kill().expect("a root reaped elsewhere has nothing left to kill"),
+        Seen::TryWait => drop(child.try_wait().expect_err("a foreign reap answers ECHILD")),
+        Seen::Wait => drop(child.wait().await.expect_err("a foreign reap answers ECHILD")),
+        Seen::Kill => child.kill().expect("a root reaped elsewhere has nothing left to kill"),
     }
 }
 
@@ -67,37 +67,29 @@ async fn reap_behind_and_observe(child: &mut crate::tokio::Child, seen: Seen) {
 /// its pidfd, so `kill_tree` kills the group. Mutant: "observing a foreign reap drops the pidfd".
 async fn kill_tree_after_a_seen_foreign_reap(seen: Seen) {
     crate::tokio::test_runtime::assert_current_thread();
-    let (mut child, _stdin, stderr) = root_with_a_cat().await;
+    let (mut child, member) = root_with_a_member();
     reap_behind_and_observe(&mut child, seen).await;
 
     let capture = Capture::start();
     let result = child.kill_tree();
     let steps = capture.group_steps();
     result.expect("the group is killed through the root's pidfd");
-    assert_eq!(steps.first(), Some(&GroupStep::Group(Route::Pidfd)), "{steps:?}");
-    assert!(
-        !steps.contains(&GroupStep::Group(Route::Number)),
-        "nothing went by the group's number: {steps:?}"
-    );
-    await_the_cat_gone(stderr).await;
+    assert_group_signalled_first_through_the_pidfd(&steps, libc::SIGKILL);
+    member.assert_killed();
 }
 
 /// The `SIGTERM` twin of [`kill_tree_after_a_seen_foreign_reap`]. Same mutant.
 async fn terminate_tree_after_a_seen_foreign_reap(seen: Seen) {
     crate::tokio::test_runtime::assert_current_thread();
-    let (mut child, _stdin, stderr) = root_with_a_cat().await;
+    let (mut child, member) = root_with_a_member();
     reap_behind_and_observe(&mut child, seen).await;
 
     let capture = Capture::start();
     let result = child.terminate_tree();
     let steps = capture.group_steps();
     result.expect("the group is termed through the root's pidfd");
-    assert_eq!(steps.first(), Some(&GroupStep::Group(Route::Pidfd)), "{steps:?}");
-    assert!(
-        !steps.contains(&GroupStep::Group(Route::Number)),
-        "nothing went by the group's number: {steps:?}"
-    );
-    await_the_cat_gone(stderr).await;
+    assert_group_signalled_first_through_the_pidfd(&steps, libc::SIGTERM);
+    member.assert_killed();
 }
 
 /// The graceful twin of [`kill_tree_after_a_seen_foreign_reap`]: the `SIGTERM` goes through the
@@ -105,19 +97,15 @@ async fn terminate_tree_after_a_seen_foreign_reap(seen: Seen) {
 async fn graceful_shutdown_tree_after_a_seen_foreign_reap(seen: Seen) {
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
-    let (mut child, _stdin, stderr) = root_with_a_cat().await;
+    let (mut child, member) = root_with_a_member();
     reap_behind_and_observe(&mut child, seen).await;
 
     let mark = crate::log_capture::mark();
     let capture = Capture::start();
     let result = child.graceful_shutdown_tree(std::time::Duration::ZERO).await;
     let steps = capture.group_steps();
-    assert_eq!(steps.first(), Some(&GroupStep::Group(Route::Pidfd)), "{steps:?}");
-    assert!(
-        !steps.contains(&GroupStep::Group(Route::Number)),
-        "nothing went by the group's number: {steps:?}"
-    );
-    await_the_cat_gone(stderr).await;
+    assert_group_signalled_first_through_the_pidfd(&steps, libc::SIGTERM);
+    member.assert_killed();
     crate::child::group_exact_tests::assert_down_without_status(result, mark);
 }
 
@@ -126,7 +114,7 @@ async fn graceful_shutdown_tree_after_a_seen_foreign_reap(seen: Seen) {
 /// group by number".
 async fn kill_tree_below_6_9_after_a_seen_foreign_reap(seen: Seen) {
     crate::tokio::test_runtime::assert_current_thread();
-    let (mut child, stdin, stderr) = root_with_a_cat().await;
+    let (mut child, member) = root_with_a_member();
     reap_behind_and_observe(&mut child, seen).await;
     let old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     let capture = Capture::start();
@@ -136,76 +124,74 @@ async fn kill_tree_below_6_9_after_a_seen_foreign_reap(seen: Seen) {
     let err = result.expect_err("a group whose root was reaped elsewhere is not assessable");
     assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
     assert!(
-        !steps.contains(&GroupStep::Group(Route::Number)),
+        !steps.iter().any(|s| matches!(s, GroupStep::Group(Route::Number, _))),
         "nothing went by the group's number: {steps:?}"
     );
-    // Closing its stdin ends the `cat`.
-    drop(stdin);
-    await_the_cat_gone(stderr).await;
+    member.assert_survived();
 }
 
 #[skuld::test]
 async fn tokio_kill_tree_kills_the_group_after_a_foreign_reap_seen_by_try_wait(
     #[fixture(pidfd_group_signal)] _group: &Group,
 ) {
-    kill_tree_after_a_seen_foreign_reap(Seen::ByTryWait).await;
+    kill_tree_after_a_seen_foreign_reap(Seen::TryWait).await;
 }
 
 #[skuld::test]
 async fn tokio_kill_tree_kills_the_group_after_a_foreign_reap_seen_by_wait(
     #[fixture(pidfd_group_signal)] _group: &Group,
 ) {
-    kill_tree_after_a_seen_foreign_reap(Seen::ByWait).await;
+    kill_tree_after_a_seen_foreign_reap(Seen::Wait).await;
 }
 
 #[skuld::test]
 async fn tokio_terminate_tree_terminates_the_group_after_a_foreign_reap_seen_by_try_wait(
     #[fixture(pidfd_group_signal)] _group: &Group,
 ) {
-    terminate_tree_after_a_seen_foreign_reap(Seen::ByTryWait).await;
+    terminate_tree_after_a_seen_foreign_reap(Seen::TryWait).await;
 }
 
 #[skuld::test]
 async fn tokio_terminate_tree_terminates_the_group_after_a_foreign_reap_seen_by_wait(
     #[fixture(pidfd_group_signal)] _group: &Group,
 ) {
-    terminate_tree_after_a_seen_foreign_reap(Seen::ByWait).await;
+    terminate_tree_after_a_seen_foreign_reap(Seen::Wait).await;
 }
 
 #[skuld::test]
 async fn tokio_kill_tree_kills_the_group_after_a_foreign_reap_seen_by_kill(
     #[fixture(pidfd_group_signal)] _group: &Group,
 ) {
-    kill_tree_after_a_seen_foreign_reap(Seen::ByKill).await;
+    kill_tree_after_a_seen_foreign_reap(Seen::Kill).await;
 }
 
 #[skuld::test]
 async fn tokio_kill_tree_below_6_9_sends_nothing_by_number_after_a_foreign_reap_seen_by_kill() {
-    kill_tree_below_6_9_after_a_seen_foreign_reap(Seen::ByKill).await;
+    kill_tree_below_6_9_after_a_seen_foreign_reap(Seen::Kill).await;
 }
 
 #[skuld::test]
 async fn tokio_kill_tree_below_6_9_sends_nothing_by_number_after_a_foreign_reap_seen_by_try_wait() {
-    kill_tree_below_6_9_after_a_seen_foreign_reap(Seen::ByTryWait).await;
+    kill_tree_below_6_9_after_a_seen_foreign_reap(Seen::TryWait).await;
 }
 
 #[skuld::test]
 async fn tokio_kill_tree_below_6_9_sends_nothing_by_number_after_a_foreign_reap_seen_by_wait() {
-    kill_tree_below_6_9_after_a_seen_foreign_reap(Seen::ByWait).await;
+    kill_tree_below_6_9_after_a_seen_foreign_reap(Seen::Wait).await;
 }
 
 #[skuld::test]
 async fn tokio_graceful_shutdown_tree_shuts_the_group_down_after_a_foreign_reap_seen_by_try_wait(
     #[fixture(pidfd_group_signal)] _group: &Group,
 ) {
-    graceful_shutdown_tree_after_a_seen_foreign_reap(Seen::ByTryWait).await;
+    graceful_shutdown_tree_after_a_seen_foreign_reap(Seen::TryWait).await;
 }
 
 #[skuld::test]
 async fn tokio_graceful_shutdown_tree_shuts_the_group_down_after_a_foreign_reap_seen_by_wait(
     #[fixture(pidfd_group_signal)] _group: &Group,
 ) {
-    graceful_shutdown_tree_after_a_seen_foreign_reap(Seen::ByWait).await;
+    graceful_shutdown_tree_after_a_seen_foreign_reap(Seen::Wait).await;
 }
 
 /// A `sleep` in its own session, killed and reaped behind its handle's back.
