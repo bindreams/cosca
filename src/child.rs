@@ -616,8 +616,8 @@ impl Child {
     /// **On Linux 6.9+, a process group whose root is reaped, or whose root's handle cannot say,** is
     /// still named exactly by the root's pidfd, whoever reaped it: while the group has a member it is
     /// killed through the pidfd as usual, and each member's resend checks the group the same way
-    /// right before it. A root reaped
-    /// elsewhere, or after this handle's own reap with its pid unreadable, whose group has no member
+    /// first (below). A process listed by the group's number once the group has no member left is
+    /// in another group that took the number, and is sent nothing. A root reaped elsewhere, or after this handle's own reap with its pid unreadable, whose group has no member
     /// left has no tree left: nothing is sent, and the call is `Ok`. Otherwise, and below 6.9 and on
     /// macOS, the paragraphs below apply.
     ///
@@ -647,11 +647,12 @@ impl Child {
     /// [`wait`](Child::wait) on another thread is held off from the look until the sweep has sent
     /// what it sends by the root's number. On Linux 6.9+ a process group's signal goes through the
     /// root's pidfd, which names the group exactly, whoever reaps the root. Each send by the group's
-    /// number (the `killpg` below 6.9 and on macOS, the leader's signal, each member's resend) checks
-    /// the root again right before it, and nothing goes out once the check fails: on 6.9+ the
-    /// check asks the pidfd whether the group still has a member, and elsewhere it asks the root's
-    /// handle whether the root was reaped elsewhere. A reap by another reaper between such a check
-    /// and its send is not seen, and the send then goes to a number another process may hold; a
+    /// number (the `killpg` below 6.9 and on macOS, and the leader's signal) checks the root again
+    /// right before it. Each member's resend checks the root, which shows the listing named the
+    /// root's group, then the member's own identity right before the send by the member's pid.
+    /// Nothing goes out once a check fails: on 6.9+ the root's check asks the pidfd whether the
+    /// group still has a member, and elsewhere it asks the root's handle whether the root was reaped
+    /// elsewhere. A reap by another reaper between such a check and its send is not seen, and the send then goes to a number another process may hold; a
     /// program with such a reaper should use [`CgroupV2`](crate::Containment::CgroupV2), whose kill
     /// names no pid. An fd marker's walk from the root's pid checks each process it signals by its
     /// identity.

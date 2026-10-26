@@ -38,10 +38,10 @@
 //! Once the leader is reaped its PID/PGID may be reissued, and `killpg` would then signal that
 //! process's group. On Linux 6.9+ the group's signal goes through the root's pidfd instead, which
 //! names the group exactly. Every send by the group's number (the `killpg` where the kernel refuses
-//! that, the leader's signal, each member's resend) runs right after its own check of the root
-//! ([`GroupRoot::check`]: on 6.9+ whether the pidfd's group still has a member), and nothing is
-//! sent once that check fails; the residual window between a check and its send is documented on
-//! `Child::kill_tree`. cgroup v2 names no pid and has no such hole.
+//! that, and the leader's signal) runs right after its own check of the root ([`GroupRoot::check`]:
+//! on 6.9+ whether the pidfd's group still has a member). Each member's resend runs after a check
+//! of the root, then a check of the member's identity right before it. Nothing is sent once a check
+//! fails; the residual window between a check and its send is documented on `Child::kill_tree`. cgroup v2 names no pid and has no such hole.
 
 use std::io;
 
@@ -372,7 +372,8 @@ enum Through {
 /// signal-0 send with `PIDFD_SIGNAL_PROCESS_GROUP`, which names the group exactly. While it has one,
 /// the group's number is still its own: the kernel does not reissue a pid that is any process's
 /// group id. `None` where the kernel refuses the flag (before Linux 6.9), or gives an answer that
-/// says neither.
+/// says neither. A seccomp filter that answers `EPERM` reads as a group with a member; each member's
+/// resend after it still checks the member's identity, and goes through the member's own pidfd.
 #[cfg(target_os = "linux")]
 pub(crate) fn pidfd_group_has_member(pidfd: std::os::fd::BorrowedFd<'_>) -> Option<bool> {
     #[cfg(test)]
