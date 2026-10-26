@@ -170,9 +170,8 @@ fn failed_spawn(failure: Failure, container: Container) -> Failed {
     }
 }
 
-/// 6.9+: the cleanup kills the root's group through its pidfd. Mutant: "a failed spawn's cleanup
-/// kills the root alone"; "the cleanup says members may be left running although it killed the
-/// group".
+/// 6.9+: the cleanup kills the root's group through its pidfd. Mutant: "the cleanup says members
+/// may be left running although it killed the group".
 fn kills_the_group(failure: Failure, container: Container) {
     let failed = failed_spawn(failure, container);
     assert_group_signalled_first_through_the_pidfd(&failed.steps, libc::SIGKILL);

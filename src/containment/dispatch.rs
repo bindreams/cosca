@@ -703,8 +703,7 @@ impl Attached {
     /// the root's pidfd instead, as a tree call decides it ([`DropReach`]).
     ///
     /// `view` is one look at the root, taken right before this call. Each send by the group's number
-    /// after it checks the root again right before it
-    /// ([`GroupRoot::check`](crate::containment::GroupRoot::check)).
+    /// after it checks the root again, as for [`Child::kill_tree`](crate::Child::kill_tree).
     ///
     /// The same skip when the root's own handle could not say whether it is reaped
     /// (`RootState::Unknown`): nothing then shows the number still names the root.
@@ -762,8 +761,17 @@ impl Attached {
     /// has a member, whoever reaped the root, and gone once a reaped root's group has none.
     /// Otherwise, and below 6.9 and on macOS, what names the tree by the root's number is skipped.
     #[cfg(unix)]
-    #[cfg_attr(not(target_os = "linux"), allow(unused_variables, reason = "only Linux has a pidfd"))]
     fn drop_reach(&self, view: &DropView, root: &crate::containment::GroupRoot<'_>) -> DropReach {
+        let reach = self.decide_drop_reach(view, root);
+        #[cfg(test)]
+        crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterRootLook);
+        reach
+    }
+
+    /// [`drop_reach`](Self::drop_reach)'s decision.
+    #[cfg(unix)]
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables, reason = "only Linux has a pidfd"))]
+    fn decide_drop_reach(&self, view: &DropView, root: &crate::containment::GroupRoot<'_>) -> DropReach {
         let Some(skipped) = view.skipped_action(self) else {
             return DropReach::Kill;
         };

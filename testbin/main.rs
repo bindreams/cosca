@@ -398,6 +398,18 @@ fn main() {
             }
         }
         "cwd" => outln!("{}", std::env::current_dir().unwrap().display()),
+        // Opens the relative `cosca-marker` (a file in the directory the parent meant as cwd): proves
+        // the cwd, which a printed path does not.
+        "cwd-marker" => {
+            match std::env::current_dir() {
+                Ok(p) => outln!("cwd={}", p.display()),
+                Err(e) => outln!("cwd-error={e}"),
+            }
+            match std::fs::File::open("cosca-marker") {
+                Ok(_) => outln!("marker=ok"),
+                Err(e) => outln!("marker=err={}", e.raw_os_error().unwrap_or(-1)),
+            }
+        }
         "emit" => {
             let n_out: usize = args[2].parse().unwrap();
             let n_err: usize = args[3].parse().unwrap();
@@ -1285,6 +1297,8 @@ fn main() {
         "spawn-with-env-block" => env_block::spawn_with_block(&args[2], &args[3..]),
         #[cfg(windows)]
         "try-env-block" => env_block::try_block(&args[2..]),
+        #[cfg(windows)]
+        "try-cwd" => env_block::try_cwd(&args[2]),
         #[cfg(windows)]
         "spawn-consent-with-block" => env_block::spawn_consent_with_block(&args[2..]),
         #[cfg(windows)]

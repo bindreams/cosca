@@ -101,7 +101,6 @@ mod linux {
     /// Mutant: `Unknown` is taken as `Reaped` (no root kill, and the log names no `Unknown`).
     #[skuld::test]
     fn a_failed_root_peek_skips_number_named_channels_and_still_kills_the_root() {
-        // The pre-6.9 path: on 6.9+ the root's pidfd decides (`drop_group_exact_tests`).
         #[cfg(target_os = "linux")]
         let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
         crate::log_capture::install();
