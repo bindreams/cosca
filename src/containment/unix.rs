@@ -105,6 +105,9 @@ pub(crate) fn kill_group(pgid: i32, root: &GroupRoot<'_>) -> Result<(), Error> {
 pub(crate) mod fault {
     use std::cell::{Cell, RefCell};
 
+    #[cfg(target_os = "linux")]
+    pub(crate) use super::group::fault::{list_instead, set_after_listing};
+
     type OnSend = Box<dyn FnMut(i32)>;
 
     thread_local! {
@@ -515,7 +518,7 @@ fn signal_direct(pid: i32, signal: Signal, root: &GroupRoot<'_>) -> io::Result<(
         None => {
             if let Err(why) = root.check() {
                 log::debug!("containment::unix::signal_direct: {why}, so {signal} was not sent to pid {pid}");
-                return Err(io::Error::other(why));
+                return Err(io::Error::other(why.to_string()));
             }
             #[cfg(test)]
             crate::send_log::record_group(crate::send_log::GroupStep::Leader(crate::send_log::Route::Number));

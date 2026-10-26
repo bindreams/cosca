@@ -121,3 +121,129 @@ fn kill_tree_of_a_root_its_handle_cannot_read_kills_its_group_through_the_pidfd(
     assert_eq!(steps.first(), Some(&GroupStep::Group(Route::Pidfd)), "{steps:?}");
     await_the_cat_gone(stderr);
 }
+
+/// A session root reaped elsewhere whose group keeps one member, and a process of this test that
+/// leads a group of its own. Armed, the group's own send is refused, the member then leaves the
+/// group, which leaves it empty, and the other group stands in for one that took its number before
+/// `converge` lists it.
+pub(crate) struct EmptiedGroup {
+    root: crate::Child,
+    stdin: std::io::PipeWriter,
+    stdout: std::io::PipeReader,
+    stderr: std::io::PipeReader,
+    other: std::process::Child,
+}
+
+impl EmptiedGroup {
+    pub(crate) fn new() -> EmptiedGroup {
+        use crate::test_child::{await_member_ready, member_command};
+        // The member waits for a line on stdin, then leaves the group by `setsid`, says so, and holds
+        // stderr's write end until stdin's EOF.
+        let mut cmd = crate::Command::new();
+        cmd.args([
+            "sh",
+            "-c",
+            r#"exec 3<&0; sh -c 'read _ <&3; exec setsid sh -c "echo left; exec cat <&3 3<&- >/dev/null"' & echo started; exec sleep 300 <&- 2>/dev/null"#,
+        ]);
+        cmd.contain_with(crate::ContainMode::Session);
+        cmd.stdin(crate::Stdio::pipe_in()).expect("stdin pipe");
+        cmd.stdout(crate::Stdio::pipe_out()).expect("stdout pipe");
+        cmd.stderr(crate::Stdio::pipe_out()).expect("stderr pipe");
+        let mut root = cmd.spawn().expect("spawn the root");
+        let mut stdout = root.stdout().expect("stdout pipe");
+        let mut started = [0u8; 8];
+        stdout.read_exact(&mut started).expect("read `started`");
+        assert_eq!(&started, b"started\n");
+        let (stdin, stderr) = (root.stdin().expect("stdin pipe"), root.stderr().expect("stderr pipe"));
+        let pid = root.id().pid();
+        root.kill().expect("kill the root alone");
+        reap_behind(pid);
+        let mut other = crate::test_spawn::spawn(&mut member_command(0)).expect("spawn the other group's leader");
+        await_member_ready(&mut other);
+        EmptiedGroup {
+            root,
+            stdin,
+            stdout,
+            stderr,
+            other,
+        }
+    }
+
+    /// Arms the refusal, the listing of the other group, and the member's leaving right after the
+    /// listing. Returns the root, and what ends the test ([`Armed::finish`]).
+    pub(crate) fn arm(self) -> (crate::Child, Armed) {
+        use std::io::Write as _;
+        let EmptiedGroup {
+            root,
+            stdin,
+            mut stdout,
+            stderr,
+            other,
+        } = self;
+        let refused = crate::containment::unix::fault::refuse_group_sends();
+        let listed = crate::containment::unix::fault::list_instead(other.id() as i32);
+        let mut tell = stdin.try_clone().expect("clone stdin");
+        let left = crate::containment::unix::fault::set_after_listing(move || {
+            tell.write_all(b"\n").expect("tell the member to leave");
+            let mut left = [0u8; 5];
+            stdout.read_exact(&mut left).expect("read `left`");
+            assert_eq!(&left, b"left\n");
+        });
+        let armed = Armed {
+            guard: Box::new((refused, listed, left)),
+            stdin,
+            stderr,
+            other,
+        };
+        (root, armed)
+    }
+}
+
+/// An armed [`EmptiedGroup`] without its root.
+pub(crate) struct Armed {
+    guard: Box<dyn std::any::Any>,
+    stdin: std::io::PipeWriter,
+    stderr: std::io::PipeReader,
+    other: std::process::Child,
+}
+
+impl Armed {
+    /// Disarms, asserts the other group's leader was sent nothing and ends it, and ends the member
+    /// that left the group.
+    pub(crate) fn finish(self) {
+        use std::os::unix::process::ExitStatusExt as _;
+        let Armed {
+            guard,
+            stdin,
+            stderr,
+            mut other,
+        } = self;
+        drop(guard);
+        let running = other.try_wait().expect("look at the other group's leader");
+        other.kill().expect("kill the other group's leader");
+        let status = other.wait().expect("reap the other group's leader");
+        drop(stdin);
+        await_the_cat_gone(stderr);
+        assert_eq!(running, None, "the other group's leader was signalled");
+        assert_eq!(status.signal(), Some(libc::SIGKILL), "got {status:?}");
+    }
+}
+
+/// 6.9+: a process listed by the number of a group the root's pidfd shows has no member left is in
+/// another group that took the number: it is sent nothing, and `kill_tree` succeeds. Mutant: "a
+/// group with no member left leaves the listed process unassessable".
+#[skuld::test]
+fn kill_tree_leaves_alone_a_group_that_took_the_number_of_its_emptied_group(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+) {
+    let (child, armed) = EmptiedGroup::new().arm();
+    let capture = Capture::start();
+    let result = child.kill_tree();
+    let steps = capture.group_steps();
+    armed.finish();
+    result.expect("the tree is gone");
+    assert!(
+        !steps.iter().any(|step| matches!(step, GroupStep::Member(..))),
+        "nothing was resent: {steps:?}"
+    );
+}

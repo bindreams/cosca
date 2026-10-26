@@ -222,3 +222,29 @@ fn a_drop_of_a_root_its_handle_cannot_read_with_no_member_left_still_skips_the_g
     let skips = crate::log_capture::records_since_on_current_thread(mark, "so it does not kill its process group");
     assert_eq!(skips.len(), 1, "{skips:?}");
 }
+
+/// 6.9+: a drop that finds, listed by its group's number, a process the root's pidfd shows is not a
+/// member sends it nothing and does not warn. Mutant: "a group with no member left leaves the
+/// listed process unassessable".
+#[skuld::test]
+fn a_drop_leaves_alone_a_group_that_took_the_number_of_its_emptied_group(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+) {
+    use crate::child::group_exact_tests::EmptiedGroup;
+    crate::log_capture::install();
+    let (child, armed) = EmptiedGroup::new().arm();
+    let mark = crate::log_capture::mark();
+    let capture = Capture::start();
+    drop(child);
+    let steps = capture.group_steps();
+    armed.finish();
+    assert!(
+        !steps.iter().any(|step| matches!(step, GroupStep::Member(..))),
+        "nothing was resent: {steps:?}"
+    );
+    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "")
+        .into_iter()
+        .filter(|(level, _)| *level == log::Level::Warn)
+        .collect();
+    assert_eq!(warns, [], "the tree is gone");
+}

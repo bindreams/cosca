@@ -4,7 +4,7 @@
 use std::os::fd::AsFd as _;
 use std::os::unix::process::ExitStatusExt as _;
 
-use super::GroupRoot;
+use super::{GroupRoot, NotItsGroup};
 use crate::test_child::{await_member_ready, member_command};
 use crate::test_groups::{pidfd_group_signal, Group};
 
@@ -30,10 +30,8 @@ fn check_fails_once_the_group_has_no_member(#[fixture(pidfd_group_signal)] _grou
     let (leader, pidfd) = leader();
     kill_and_reap(leader);
     let passes = || Ok(());
-    let err = GroupRoot::new(Some(pidfd.as_fd()), &passes)
-        .check()
-        .expect_err("a group with no member left");
-    assert!(err.contains("no member left"), "{err}");
+    let checked = GroupRoot::new(Some(pidfd.as_fd()), &passes).check();
+    assert_eq!(checked, Err(NotItsGroup::Empty));
 }
 
 /// A root reaped elsewhere whose group still has a member passes the check, though the caller's
@@ -65,6 +63,9 @@ fn check_asks_the_callers_check_when_the_kernel_refuses_the_flag() {
     drop(refused);
     leader.kill().expect("kill the leader");
     leader.wait().expect("reap the leader");
-    assert_eq!(failed, Err("the root was reaped elsewhere".to_owned()));
+    assert_eq!(
+        failed,
+        Err(NotItsGroup::Unproven("the root was reaped elsewhere".to_owned()))
+    );
     assert_eq!(passed, Ok(()));
 }

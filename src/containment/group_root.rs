@@ -74,24 +74,44 @@ impl<'a> GroupRoot<'a> {
     /// with its send, the two are back to back.
     ///
     /// On Linux 6.9+ the root's pidfd answers (`has_member`): while the group
-    /// has a member its number is its own, whoever reaped the root. Elsewhere the caller's check
-    /// answers from the root's state.
+    /// has a member its number is its own, whoever reaped the root, and once it has none it is
+    /// [`NotItsGroup::Empty`]. Elsewhere the caller's check answers from the root's state.
     #[cfg_attr(not(unix), allow(dead_code, reason = "only Unix sends to a group by number"))]
-    pub(crate) fn check(&self) -> Result<(), String> {
+    pub(crate) fn check(&self) -> Result<(), NotItsGroup> {
         #[cfg(all(test, unix))]
         crate::send_log::record_group(crate::send_log::GroupStep::Check);
         #[cfg(target_os = "linux")]
         match self.has_member() {
             Some(true) => return Ok(()),
-            Some(false) => return Err("the root's process group has no member left".to_owned()),
+            Some(false) => return Err(NotItsGroup::Empty),
             None => {}
         }
         match self.check {
-            Some(check) => check(),
+            Some(check) => check().map_err(NotItsGroup::Unproven),
             None => {
                 debug_assert!(false, "a send by the root's number was given no root to check");
-                Err("no root was given to check".to_owned())
+                Err(NotItsGroup::Unproven("no root was given to check".to_owned()))
             }
+        }
+    }
+}
+
+/// Why [`GroupRoot::check`] refused a send by the group's number.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NotItsGroup {
+    /// Linux 6.9+: the root's pidfd shows the group has no member left, so it can gain none: a
+    /// process listed by its number is in another group that took the number.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code, reason = "only Linux has a pidfd"))]
+    Empty,
+    /// Nothing shows the number is still the group's, for this reason.
+    Unproven(String),
+}
+
+impl std::fmt::Display for NotItsGroup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NotItsGroup::Empty => f.write_str("the root's process group has no member left"),
+            NotItsGroup::Unproven(why) => f.write_str(why),
         }
     }
 }
