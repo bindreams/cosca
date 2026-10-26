@@ -160,8 +160,8 @@ impl ProcDir {
     }
 
     /// This process's `self/fd` directory under this `/proc`, opened as
-    /// [`open_beneath`](Self::open_beneath) opens. Async-signal-safe (one `openat2`, nothing
-    /// allocated), so a forked child may call it: `self` is then that child.
+    /// [`open_beneath`](Self::open_beneath) opens. Async-signal-safe (one `openat2`, no allocation);
+    /// in a forked child `self` is the child.
     pub(crate) fn open_own_fd_dir(&self) -> rustix::io::Result<OwnedFd> {
         openat2(
             &self.0,

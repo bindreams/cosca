@@ -5,10 +5,12 @@ use std::os::fd::{AsFd as _, OwnedFd};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
+use super::ProbeEnd;
 use super::{dying_in, front_placement, Subtree};
-use crate::containment::cgroup::fault::{self, ProbeEnd, ProbeStep};
+use crate::containment::cgroup::fault::{self, ProbeStep};
 use crate::containment::cgroup::test_support::alone;
 use crate::send_log::Via;
+use crate::test_child::reaped_elsewhere::warns_since;
 use crate::test_groups::{cgroup, Group};
 
 /// A cgroup id with bits above the low 32, as kernfs gives once its 32-bit counter wraps.
@@ -462,18 +464,17 @@ fn the_probe_child_dies_with_the_thread_that_forked_it() {
     std::thread::scope(move |scope| {
         scope.spawn(move || {
             let parent = rustix::process::getpid().as_raw_nonzero().get();
-            let mut probe = super::fork_probe(&proc_dir(), parent, false).expect("fork the probe");
+            let probe = super::fork_probe(&proc_dir(), parent, false).expect("fork the probe");
             let mut report = [0u8; 2];
-            probe.channel.read_exact(&mut report).expect("the probe reports");
-            // Kept past this thread's end: the probe exits by itself once it closes.
-            ready_tx
-                .send((probe.pid, report, probe.channel))
-                .expect("report the probe");
+            probe.channel().read_exact(&mut report).expect("the probe reports");
+            // Kept past this thread's end: the child must die of its parent-death signal, which the
+            // probe's own end (a kill) would pre-empt.
+            ready_tx.send((probe, report)).expect("report the probe");
             // The thread ends when the test lets it go, or when the test fails and drops `go_tx`.
             _ = go_rx.recv();
         });
-        let (pid, report, _release) = ready_rx.recv().expect("the probe's pid");
-        let pidfd = ProbeGuard::of(pid);
+        let (probe, report) = ready_rx.recv().expect("the probe");
+        let pidfd = ProbeGuard::of(probe.pid);
         assert_eq!(
             report,
             [0, libc::SIGKILL as u8],
@@ -498,13 +499,13 @@ fn a_probe_whose_parent_is_gone_exits_without_reporting() {
 
     // Not this process's pid, so the child's `getppid` differs from it, as after a reparenting.
     let not_the_parent = rustix::process::getpid().as_raw_nonzero().get() + 1;
-    let mut probe = super::fork_probe(&proc_dir(), not_the_parent, false).expect("fork the probe");
+    let probe = super::fork_probe(&proc_dir(), not_the_parent, false).expect("fork the probe");
     let pidfd = ProbeGuard::of(probe.pid);
-    // The child's end of the pipe closes with the child: end of file, with nothing reported. One
+    // The child's end of the socket closes with the child: end of file, with nothing reported. One
     // read, so a probe that reports instead fails the assertion, and does not leave the read
     // waiting for the end of a probe that waits to be killed.
     let mut reported = [0u8; 2];
-    let read = probe.channel.read(&mut reported).expect("read the probe's report");
+    let read = probe.channel().read(&mut reported).expect("read the probe's report");
     assert_eq!(read, 0, "the probe reported {reported:?}");
     let status = rustix::process::waitid(
         rustix::process::WaitId::PidFd(pidfd.0.as_fd()),
@@ -538,24 +539,23 @@ fn own_descriptor(fd: &impl std::os::fd::AsRawFd) -> String {
     target.to_string_lossy().into_owned()
 }
 
-/// Forks two probes, the second while the first's descriptors are open in this process, and checks
-/// that each child holds only its end of its socket: no other probe's descriptor, nor anything else
-/// of this process's. Dumpable, so its `/proc/<pid>/fd` is
-/// readable without `CAP_SYS_PTRACE`.
+/// Forks two probes, the second while the first's parent end is open here, and checks each child holds
+/// only its own socket end. Dumpable, so `/proc/<pid>/fd` is readable without `CAP_SYS_PTRACE`.
 fn assert_two_probes_hold_only_their_own() {
     use std::io::Read as _;
 
     let proc = proc_dir();
     let parent = rustix::process::getpid().as_raw_nonzero().get();
-    let mut first = super::fork_probe(&proc, parent, true).expect("fork the first probe");
-    let _first_guard = ProbeGuard::of(first.pid);
-    let mut second = super::fork_probe(&proc, parent, true).expect("fork the second probe");
-    let _second_guard = ProbeGuard::of(second.pid);
+    let first = super::fork_probe(&proc, parent, true).expect("fork the first probe");
+    let second = super::fork_probe(&proc, parent, true).expect("fork the second probe");
     // Each child closes what it inherited before it reports.
     let mut report = [0u8; 2];
-    first.channel.read_exact(&mut report).expect("the first probe reports");
+    first
+        .channel()
+        .read_exact(&mut report)
+        .expect("the first probe reports");
     second
-        .channel
+        .channel()
         .read_exact(&mut report)
         .expect("the second probe reports");
     for (name, probe) in [("first", &first), ("second", &second)] {
@@ -566,11 +566,11 @@ fn assert_two_probes_hold_only_their_own() {
         );
         assert_ne!(
             held[0],
-            own_descriptor(&probe.channel),
+            own_descriptor(probe.channel()),
             "the {name} probe's child holds its parent's end"
         );
     }
-    let first_parent_end = own_descriptor(&first.channel);
+    let first_parent_end = own_descriptor(first.channel());
     assert!(
         !descriptors_of(second.pid)
             .values()
@@ -591,6 +591,16 @@ fn concurrent_probes_children_each_hold_only_their_own_descriptors() {
 #[skuld::test]
 fn probes_children_hold_only_their_own_descriptors_without_close_range() {
     let _refused = fault::refuse_probe_close_range();
+    assert_two_probes_hold_only_their_own();
+}
+
+/// A `close_range` that closes the first range and is refused the next leaves the child to close the
+/// rest by the walk: the walk's directory is opened before any range is closed. Mutant: "the walk
+/// opens its directory only after the ranges ran" (the first range closes the `/proc` handle it opens
+/// through, and the child dies `ABANDONED`).
+#[skuld::test]
+fn probes_children_hold_only_their_own_descriptors_when_a_later_close_range_is_refused() {
+    let _refused = fault::refuse_probe_close_range_after(1);
     assert_two_probes_hold_only_their_own();
 }
 
@@ -625,15 +635,6 @@ fn no_child_holds(pid: libc::pid_t) -> Result<bool, rustix::io::Errno> {
         Err(e) => Err(e),
         Ok(_) => Ok(false),
     }
-}
-
-/// The `warn`s on this thread since `mark`.
-fn warns_since(mark: usize) -> Vec<String> {
-    crate::log_capture::records_since_on_current_thread(mark, "")
-        .into_iter()
-        .filter(|(level, _)| *level == log::Level::Warn)
-        .map(|(_, text)| text)
-        .collect()
 }
 
 /// A probe's child that no pidfd can pin (`pidfd_open` fails with `EMFILE`) is killed and reaped by
@@ -769,9 +770,12 @@ fn a_failed_kill_of_one_probe_is_not_stalled_by_another_probes_child() {
         move |_| {
             use std::io::Read as _;
             let parent = rustix::process::getpid().as_raw_nonzero().get();
-            let mut probe = super::fork_probe(&proc_dir(), parent, false).expect("fork the second probe");
+            let probe = super::fork_probe(&proc_dir(), parent, false).expect("fork the second probe");
             let mut report = [0u8; 2];
-            probe.channel.read_exact(&mut report).expect("the second probe reports");
+            probe
+                .channel()
+                .read_exact(&mut report)
+                .expect("the second probe reports");
             *second.borrow_mut() = Some(probe);
             Some(libc::EPERM)
         }
@@ -785,13 +789,14 @@ fn a_failed_kill_of_one_probe_is_not_stalled_by_another_probes_child() {
             ProbeStep::Reap(Via::Pidfd, ProbeEnd::Exit(super::RELEASED))
         ]
     );
-    let super::Probe { pid, hold, channel } = second.borrow_mut().take().expect("the second probe forked");
+    let second = second.borrow_mut().take().expect("the second probe forked");
+    let pid = second.pid;
     assert_eq!(
         no_child_holds(pid),
         Ok(false),
         "the second probe's child {pid} still runs"
     );
-    super::kill_and_reap(pid, hold, channel).expect("end the second probe");
+    second.end().expect("end the second probe");
     assert_eq!(
         fault::take_probe_steps(),
         [
@@ -971,31 +976,44 @@ impl Drop for NofileLimit {
 }
 
 /// The placement probe answers its verdict (here that `/proc` hides the child) with only `spare`
-/// descriptor numbers free below the soft limit: its child needs none beyond its parent's.
+/// descriptor numbers free below the soft limit, and its child is still pinned by a pidfd: killed and
+/// reaped through it, with no `warn`.
 fn assert_probe_answers_with_spare_descriptors(spare: usize) {
+    crate::log_capture::install();
     let _missing = fault::miss_pidfd_info();
     let _hidden = fault::hide_proc();
     let _limit = limit_nofile(spare);
+    fault::take_probe_steps();
+    let mark = crate::log_capture::mark();
     let err = front_placement(|| Ok(HIGH)).expect_err("a hidden /proc refuses");
     assert!(
         matches!(&err, crate::error::Error::Unsupported { detail, .. } if detail.contains("hides the cgroup")),
         "the refusal is the hidden /proc's: {err:?}"
     );
+    assert_eq!(
+        fault::take_probe_steps(),
+        [
+            ProbeStep::Kill(Via::Pidfd, libc::SIGKILL),
+            ProbeStep::Reap(Via::Pidfd, ProbeEnd::Signal(libc::SIGKILL))
+        ]
+    );
+    assert_eq!(warns_since(mark), Vec::<String>::new());
 }
 
-/// A low `RLIMIT_NOFILE` does not turn the probe's verdict into an `Io` failure: with 4 descriptor
-/// numbers free, as many as the probe needs in its parent (the `/proc` handle, the socket's two
-/// ends, and the child's pidfd, which the probe does without when it cannot have it), the child
-/// still reports, for it opens nothing. Mutant: "the child copies its descriptors to the lowest
-/// free numbers above its own" (it then needs three more than its parent holds, and dies
-/// `ABANDONED`). Run [`alone`]: the limit is process-wide.
+/// A low `RLIMIT_NOFILE` does not turn the probe's verdict into an `Io` failure, nor cost the child its
+/// pidfd: with 3 descriptor numbers free (the `/proc` handle and the socket's two ends; the child's
+/// end is closed here before the child's pidfd takes its number), the child still reports: it opens
+/// nothing. Mutants: "the child copies its descriptors to the lowest free numbers above its own" (it
+/// then needs three more than its parent holds, and dies `ABANDONED`), "this process's own pidfd
+/// stays open during the probe" (the socket then fails with `EMFILE`). Run [`alone`]: the limit is
+/// process-wide.
 #[skuld::test]
 fn the_probe_answers_with_the_fewest_descriptors_its_parent_needs() {
     if !alone("containment::cgroup::reach::reach_tests::the_probe_answers_with_the_fewest_descriptors_its_parent_needs")
     {
         return;
     }
-    assert_probe_answers_with_spare_descriptors(4);
+    assert_probe_answers_with_spare_descriptors(3);
 }
 
 /// A probe's child that exits before its pin, with `SIGCHLD` ignored, is reaped by the kernel as it
@@ -1027,4 +1045,186 @@ fn a_probe_child_that_exits_early_with_sigchld_ignored_says_so() {
         err.to_string().contains("SIGCHLD"),
         "the error names the ignored SIGCHLD: {err}"
     );
+}
+
+/// A probe dropped before it was ended, as by an unwind between its fork and its end, kills and reaps
+/// its child. Mutant: "`Probe` has no `Drop`" (the child, exiting by itself on its socket's close, is
+/// left a zombie).
+#[skuld::test]
+fn a_probe_dropped_unended_is_killed_and_reaped() {
+    fault::take_probe_steps();
+    let parent = rustix::process::getpid().as_raw_nonzero().get();
+    let pid = {
+        let probe = super::fork_probe(&proc_dir(), parent, false).expect("fork the probe");
+        probe.pid
+    };
+    assert_eq!(
+        fault::take_probe_steps(),
+        [
+            ProbeStep::Kill(Via::Pidfd, libc::SIGKILL),
+            ProbeStep::Reap(Via::Pidfd, ProbeEnd::Signal(libc::SIGKILL))
+        ]
+    );
+    assert_eq!(no_child_holds(pid), Ok(true), "the probe's child {pid} is left");
+}
+
+/// A probe's child that cannot open its `/proc/self/fd` exits `ABANDONED` without reporting, whether or
+/// not `close_range` works: the probe's error names that status, and a `warn` names the child and the
+/// status. Mutant: "the child's exit status is dropped" (the error is the generic one).
+#[skuld::test]
+fn a_probe_child_that_cannot_close_its_descriptors_is_reported_abandoned() {
+    crate::log_capture::install();
+    let _missing = fault::miss_pidfd_info();
+    let _no_dir = fault::fail_probe_fd_dir();
+    let forked = std::rc::Rc::new(std::cell::Cell::new(None));
+    let _seen = fault::set_before_probe_kill({
+        let forked = forked.clone();
+        move |pid| {
+            forked.set(Some(pid));
+            None
+        }
+    });
+    fault::take_probe_steps();
+    let mark = crate::log_capture::mark();
+    let err = front_placement(|| Ok(HIGH)).expect_err("the probe fails");
+    let pid = forked.get().expect("the probe's child was to be killed");
+    assert!(
+        matches!(&err, crate::error::Error::Io(e) if e.to_string().contains("ABANDONED")),
+        "the error names the child's status: {err:?}"
+    );
+    assert_eq!(
+        fault::take_probe_steps(),
+        [
+            ProbeStep::Kill(Via::Pidfd, libc::SIGKILL),
+            ProbeStep::Reap(Via::Pidfd, ProbeEnd::Exit(super::ABANDONED))
+        ]
+    );
+    let warns = warns_since(mark);
+    assert!(
+        warns
+            .iter()
+            .any(|w| w.contains(&format!("child {pid}")) && w.contains("ABANDONED")),
+        "a warn names the probe's child {pid} and its status: {warns:?}"
+    );
+}
+
+/// With fds 0 and 1 closed and `close_range` refused, the lowest numbers hold the `/proc` handle, the
+/// socket's parent end and the walk's directory, and the walk still closes all but the child's end.
+/// Mutant: "the walk skips the entry for descriptor 0". Runs in a process of its own: closing 0 and 1
+/// is process-wide.
+#[skuld::test]
+fn the_walk_closes_the_lowest_descriptors_with_fds_0_and_1_closed() {
+    use crate::test_own_process::{own_process, test_path};
+    use crate::test_spawn::spawn;
+    use crate::test_stdio::RestoreStdio;
+    use std::io::Read as _;
+
+    let Some(done) = own_process(
+        test_path!(the_walk_closes_the_lowest_descriptors_with_fds_0_and_1_closed),
+        spawn,
+    ) else {
+        return;
+    };
+    let _refused = fault::refuse_probe_close_range();
+    // Declared before `proc`, which takes descriptor 0: it is closed before the restore puts back
+    // the standard descriptor there.
+    let restore = RestoreStdio::close(&done, &[0, 1]);
+    let proc = proc_dir();
+    let parent = rustix::process::getpid().as_raw_nonzero().get();
+    let probe = super::fork_probe(&proc, parent, true).expect("fork the probe");
+    let mut report = [0u8; 2];
+    probe.channel().read_exact(&mut report).expect("the probe reports");
+    let held: Vec<_> = descriptors_of(probe.pid).into_values().collect();
+    drop(probe);
+    drop(proc);
+    drop(restore);
+    assert!(
+        matches!(held.as_slice(), [one] if one.starts_with("socket:")),
+        "the probe's child holds only its end of the socket: {held:?}"
+    );
+}
+
+/// The walk closes a long listing: with about 100 descriptors open, two of the low ones freed so the
+/// socket lands below the rest, and `close_range` refused, the child still holds only its socket. The
+/// listing outgrows one `getdents64` buffer, and each pass closes entries it is reading. Mutant: "the
+/// walk stops after its first batch". Run [`alone`]: the descriptor numbers are process-wide.
+#[skuld::test]
+fn the_walk_closes_a_listing_longer_than_one_batch() {
+    use std::io::Read as _;
+
+    if !alone("containment::cgroup::reach::reach_tests::the_walk_closes_a_listing_longer_than_one_batch") {
+        return;
+    }
+    let mut files: Vec<_> = (0..100)
+        .map(|_| std::fs::File::open("/dev/null").expect("open /dev/null"))
+        .collect();
+    drop(files.drain(10..12));
+    let _refused = fault::refuse_probe_close_range();
+    let parent = rustix::process::getpid().as_raw_nonzero().get();
+    let probe = super::fork_probe(&proc_dir(), parent, true).expect("fork the probe");
+    let mut report = [0u8; 2];
+    probe.channel().read_exact(&mut report).expect("the probe reports");
+    let held: Vec<_> = descriptors_of(probe.pid).into_values().collect();
+    assert!(
+        matches!(held.as_slice(), [one] if one.starts_with("socket:")),
+        "the probe's child holds only its end of the socket: {held:?}"
+    );
+}
+
+/// A release byte that cannot be sent is a `warn` naming the probe's child. Mutant: "the failed send is
+/// ignored".
+#[skuld::test]
+fn a_release_that_cannot_be_sent_is_a_warn_naming_the_child() {
+    crate::log_capture::install();
+    // Not a socket: the send fails with `ENOTSOCK`, not the `EPIPE` of a child already gone.
+    let not_a_socket =
+        std::os::unix::net::UnixStream::from(OwnedFd::from(std::fs::File::open("/dev/null").expect("open /dev/null")));
+    let mark = crate::log_capture::mark();
+    super::release_probe(4242, not_a_socket);
+    let warns = warns_since(mark);
+    assert!(
+        warns.iter().any(|w| w.contains("child 4242")),
+        "a warn names the probe's child: {warns:?}"
+    );
+}
+
+/// The ranges `keep_only_own` closes leave exactly the kept descriptor and the walk's directory open,
+/// and none is empty, which `close_range` refuses. Mutant: "the first range ends at the lower kept
+/// descriptor, not below it".
+#[skuld::test]
+fn the_ranges_around_two_descriptors_cover_every_other_number() {
+    use super::ranges_around;
+    const MAX: u32 = u32::MAX;
+    assert_eq!(ranges_around(0, 1), [None, None, Some((2, MAX))]);
+    assert_eq!(ranges_around(1, 0), [None, None, Some((2, MAX))]);
+    assert_eq!(ranges_around(5, 2), [Some((0, 1)), Some((3, 4)), Some((6, MAX))]);
+    assert_eq!(ranges_around(2, 5), [Some((0, 1)), Some((3, 4)), Some((6, MAX))]);
+    assert_eq!(ranges_around(0, 3), [None, Some((1, 2)), Some((4, MAX))]);
+    assert_eq!(ranges_around(MAX, 0), [None, Some((1, MAX - 1)), None]);
+}
+
+/// A pidfd that names a process that is no child of this one (`ECHILD` at its `waitid`) does not pin
+/// the probe's child: it is gone, not killed. Mutant: "`ECHILD` at the pin's `waitid` is a failed pin"
+/// (the child would then be killed by its number).
+#[skuld::test]
+fn a_pidfd_naming_no_child_of_this_process_leaves_the_probe_child_gone() {
+    let own = std::process::id() as libc::pid_t;
+    match super::own_child_pidfd(own) {
+        Err(super::Unpinned::Gone(e)) => assert!(e.to_string().contains(&format!("child {own}")), "{e}"),
+        Err(super::Unpinned::Failed(e)) => panic!("expected Gone, got Failed({e})"),
+        Ok(_) => panic!("expected Gone, got a pidfd"),
+    }
+}
+
+/// A descriptor that cannot be waited on as a pidfd (`EBADF`) is a failed pin, not a gone child: the
+/// number still names the probe's child, which is then held by it. Mutant: "any `waitid` failure at
+/// the pin is a gone child".
+#[skuld::test]
+fn a_descriptor_that_is_no_pidfd_fails_the_pin() {
+    let not_a_pidfd = OwnedFd::from(std::fs::File::open("/dev/null").expect("open /dev/null"));
+    match super::confirm_child(4242, not_a_pidfd) {
+        Err(super::Unpinned::Failed(e)) => assert_eq!(e.raw_os_error(), Some(libc::EBADF), "{e}"),
+        Err(super::Unpinned::Gone(e)) => panic!("expected Failed, got Gone({e})"),
+        Ok(_) => panic!("expected Failed, got a pidfd"),
+    }
 }
