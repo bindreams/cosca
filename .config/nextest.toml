@@ -257,16 +257,14 @@ filter = 'binary(tokio_io) & test(=async_kill_tree_before_wait_tears_down_the_tr
 slow-timeout = { period = "10s", terminate-after = 2, grace-period = "1s" }
 
 [[profile.default.overrides]]
-# The macOS tracer tests re-exec a freshly signed copy of the test binary (up to ~2s on amd64).
-# This bound must outlast the fixture's watchdog (8s) and the driver's wait bound (12s), so that
-# their messages surface.
+# A backstop, not a detector. Each `traced` tracer helper runs from its own freshly signed copy of the test
+# binary (seconds on macOS/amd64), and one test chains two of them.
 filter = 'test(/^child::shared::shared_tests::tracer::macos::/)'
 slow-timeout = { period = "20s", terminate-after = 1, grace-period = "1s" }
 
 [[profile.default.overrides]]
-# A backstop like the `shared_tests` one below, sized for the `traced` tests' tracer helpers: each runs from its own
-# freshly signed copy of the test binary. On darwin/amd64 a one-helper test takes up to ~7 s, and the test that chains
-# two helpers twice that (#805).
+# A backstop, not a detector. Each `traced` tracer helper runs from its own freshly signed copy of the test
+# binary (seconds on macOS/amd64), and one test chains two of them.
 filter = 'test(/^child::shared::shared_tests::traced::/)'
 slow-timeout = { period = "30s", terminate-after = 1, grace-period = "1s" }
 
