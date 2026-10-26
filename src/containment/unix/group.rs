@@ -351,13 +351,12 @@ fn check_or_signal(
         "check_or_signal called with {signal:?}; only None (probe) or Some(SIGKILL) (resend) \
          are ever valid here — SIGTERM must never resend, see converge's design note"
     );
-    // A resend reaches the group's member only while the group's number is still the root's: the
-    // root's check, then the member's own, each right before the `kill` they guard. A probe sends
-    // nothing.
+    // A resend reaches the group's member only while the group's number is still the root's. The
+    // root's check proves the listing named the root's group; the member's identity check, after
+    // it and right before the `kill`, guards the send by the member's pid. A probe sends nothing.
     if signal.is_some() {
-        if let Err(why) = root.check() {
-            log::warn!("containment::unix::group: {why}, so pid {pid} is not resent {signal:?}; it is unassessable");
-            return Reached::Unknown;
+        if let Err(reached) = root_check_before_resend(root, pid, signal) {
+            return reached;
         }
     }
     match crate::identity::ProcessId::of(pid) {
@@ -424,6 +423,25 @@ fn check_or_signal(
     }
 }
 
+/// The root's check before the resend of `signal` to the listed `pid` ([`GroupRoot::check`]). `Err`
+/// is the member's answer when the resend may not go out: a group with no member left holds no
+/// listed process, so that process is not a survivor; any other failed check leaves it unassessable.
+fn root_check_before_resend(root: &GroupRoot<'_>, pid: RawPid, signal: Option<Signal>) -> Result<(), Reached> {
+    match root.check() {
+        Ok(()) => Ok(()),
+        Err(why @ crate::containment::NotItsGroup::Empty) => {
+            log::debug!(
+                "containment::unix::group: {why}, so pid {pid} is in another group, and is not resent {signal:?}"
+            );
+            Err(Reached::Yes)
+        }
+        Err(why) => {
+            log::warn!("containment::unix::group: {why}, so pid {pid} is not resent {signal:?}; it is unassessable");
+            Err(Reached::Unknown)
+        }
+    }
+}
+
 /// Linux-only, `SIGKILL`-only: the atomic version of `check_or_signal`'s resend, via the
 /// crate's own existing pidfd primitive (`src/wait/linux.rs::open_verified` — reused, not
 /// reimplemented, per this module's own stated preference; it already does exactly "open a
@@ -470,14 +488,8 @@ fn check_or_signal(
 fn check_or_signal_linux_sigkill(pid: RawPid, id: crate::identity::ProcessId, root: &GroupRoot<'_>) -> Reached {
     match crate::wait::backend::open_verified(id, crate::wait::backend::PidfdOp::GroupTeardown) {
         Ok(None) => Reached::Yes, // already gone
-        Ok(Some(pidfd)) => match root.check() {
-            Err(why) => {
-                log::warn!(
-                    "containment::unix::group: {why}, so pid {} is not resent KILL; it is unassessable",
-                    id.pid()
-                );
-                Reached::Unknown
-            }
+        Ok(Some(pidfd)) => match root_check_before_resend(root, id.pid(), Some(Signal::SIGKILL)) {
+            Err(reached) => reached,
             Ok(()) => match send_member_pidfd(&pidfd, id.pid()) {
                 Ok(()) => Reached::Yes,
                 Err(rustix::io::Errno::SRCH) => Reached::Yes, // exited between open and signal
@@ -596,10 +608,16 @@ fn reconfirm_survivor(outcome: MemberOutcome, recheck: impl FnOnce() -> crate::i
 /// **The group's number, and each resend.** The listing names members by `pgid`, a number that
 /// stays the root's group only while the group has a member: on Linux 6.9+ the root's pidfd shows
 /// that exactly, and elsewhere the root's state stands in for it (unreaped, or its pid free after
-/// this handle's own reap). Each `SIGKILL` resend therefore runs right after its own check of the
-/// root ([`GroupRoot::check`]), and a member whose check fails is unassessable, not signalled. A
-/// change between that check and the resend is not seen: the window `Child::kill_tree` documents.
+/// this handle's own reap). Each `SIGKILL` resend therefore follows its own check of the root
+/// ([`GroupRoot::check`]), which shows the listing named the root's group, and then the member's
+/// identity check right before the send. A member whose root check fails is unassessable and not
+/// signalled; on 6.9+, once the group has no member left, it is in another group that took the
+/// number, and is not a survivor. A change between a check and the resend is not seen: the window
+/// `Child::kill_tree` documents.
 pub(crate) fn converge(pgid: i32, signal: Signal, root: &GroupRoot<'_>) -> std::io::Result<GroupState> {
+    #[cfg(test)]
+    let listed = members(fault::listed(pgid))?;
+    #[cfg(not(test))]
     let listed = members(pgid)?;
     #[cfg(test)]
     fault::run_after_listing();
@@ -711,8 +729,35 @@ pub(crate) fn state(pgid: i32, signal: Signal, root: &GroupRoot<'_>) -> GroupSta
 /// Test-only seam inside [`converge`].
 #[cfg(test)]
 pub(crate) mod fault {
+    use std::cell::Cell;
+
     thread_local! {
         static AFTER_LISTING: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
+        static LIST_INSTEAD: Cell<Option<i32>> = const { Cell::new(None) };
+    }
+
+    /// While the guard lives, `converge` on this thread lists process group `pgid` instead of the
+    /// one it was given, as it would once another group took the given group's number.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn list_instead(pgid: i32) -> ListInstead {
+        LIST_INSTEAD.with(|l| l.set(Some(pgid)));
+        ListInstead(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[must_use = "the listing names the given group again as soon as the guard is dropped"]
+    pub(crate) struct ListInstead(());
+
+    #[cfg(target_os = "linux")]
+    impl Drop for ListInstead {
+        fn drop(&mut self) {
+            LIST_INSTEAD.with(|l| l.set(None));
+        }
+    }
+
+    /// The group `converge` lists for `pgid`.
+    pub(super) fn listed(pgid: i32) -> i32 {
+        LIST_INSTEAD.with(Cell::get).unwrap_or(pgid)
     }
 
     /// Run `hook` in the NEXT `converge` on this thread, once `members(pgid)` has returned and

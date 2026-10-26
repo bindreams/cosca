@@ -540,6 +540,28 @@ impl PidfdShutdown {
     }
 }
 
+/// `graceful_shutdown_tree`'s answer (sync and async) from the root's reap, `waited`, once the tree is
+/// down. A root reaped elsewhere (`ECHILD`) leaves no exit status for this handle: that is
+/// `Unassessable`, saying the tree is down, as for a root launchd holds. Any other answer stands.
+pub(crate) fn status_unless_reaped_elsewhere(
+    waited: Result<std::process::ExitStatus, Error>,
+    pid: RawPid,
+) -> Result<std::process::ExitStatus, Error> {
+    match waited {
+        Err(Error::Io(e)) if e.raw_os_error() == Some(libc::ECHILD) => {
+            log::debug!("graceful_shutdown_tree({pid}): the tree is down, and the root was reaped elsewhere");
+            Err(Error::Unassessable {
+                detail: format!(
+                    "pid {pid}: graceful_shutdown_tree brought the tree down, but its exit status cannot be \
+                     collected: the root was reaped elsewhere"
+                ),
+                source: None,
+            })
+        }
+        other => other,
+    }
+}
+
 #[cfg(test)]
 #[path = "tree_call_tests.rs"]
 mod tree_call_tests;

@@ -340,6 +340,8 @@ pub(crate) use dispatch::DropView;
 )]
 pub(crate) use dispatch::{attach, prepare, AbandonedChild, Attached, Attachment, Prepared, RootIdentity, TreeKilled};
 pub(crate) use group_root::GroupRoot;
+#[cfg(unix)]
+pub(crate) use group_root::NotItsGroup;
 
 #[cfg(target_os = "macos")]
 #[path = "containment/marker_eof.rs"]

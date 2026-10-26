@@ -210,3 +210,89 @@ async fn tokio_graceful_shutdown_tree_shuts_the_group_down_after_a_foreign_reap_
 ) {
     graceful_shutdown_tree_after_a_seen_foreign_reap(Seen::ByWait).await;
 }
+
+/// A `sleep` in its own session, killed and reaped behind its handle's back.
+fn foreign_reaped_group_root() -> crate::tokio::Child {
+    let mut cmd = crate::tokio::Command::new();
+    cmd.args(["sleep", "300"]);
+    cmd.contain_with(crate::ContainMode::Session);
+    let mut child = cmd.spawn().expect("spawn");
+    child.kill().expect("kill the root");
+    reap_behind(child.id().pid());
+    child
+}
+
+/// [`root_with_a_cat`], its root killed and reaped behind its handle's back.
+async fn foreign_reaped_root_with_a_cat() -> (crate::tokio::Child, ChildStdin, ChildStderr) {
+    let (mut child, stdin, stderr) = root_with_a_cat().await;
+    child.kill().expect("kill the root alone");
+    reap_behind(child.id().pid());
+    (child, stdin, stderr)
+}
+
+/// The sync `terminate_tree_signals_the_group_of_a_root_reaped_elsewhere`'s twin. Same mutant.
+#[skuld::test]
+async fn tokio_terminate_tree_signals_the_group_of_a_root_reaped_elsewhere(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+) {
+    crate::tokio::test_runtime::assert_current_thread();
+    let (child, _stdin, stderr) = foreign_reaped_root_with_a_cat().await;
+    let capture = Capture::start();
+    let result = child.terminate_tree();
+    let steps = capture.group_steps();
+    result.expect("the group is signalled through the root's pidfd");
+    assert_eq!(steps.first(), Some(&GroupStep::Group(Route::Pidfd)), "{steps:?}");
+    await_the_cat_gone(stderr).await;
+}
+
+/// The sync `terminate_tree_of_a_root_reaped_elsewhere_with_no_member_left_sends_nothing`'s twin.
+/// Same mutants.
+#[skuld::test]
+async fn tokio_terminate_tree_of_a_root_reaped_elsewhere_with_no_member_left_sends_nothing(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+) {
+    crate::tokio::test_runtime::assert_current_thread();
+    let child = foreign_reaped_group_root();
+    let capture = Capture::start();
+    let result = child.terminate_tree();
+    let steps = capture.group_steps();
+    result.expect("an empty group has nothing to signal");
+    assert_eq!(steps, [], "nothing was sent");
+}
+
+/// The sync `graceful_shutdown_tree_shuts_down_the_group_of_a_root_reaped_elsewhere`'s twin. Same
+/// mutants.
+#[skuld::test]
+async fn tokio_graceful_shutdown_tree_shuts_down_the_group_of_a_root_reaped_elsewhere(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+) {
+    use crate::child::group_exact_tests::assert_down_without_status;
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let (mut child, _stdin, stderr) = foreign_reaped_root_with_a_cat().await;
+    let mark = crate::log_capture::mark();
+    let capture = Capture::start();
+    let result = child.graceful_shutdown_tree(std::time::Duration::from_secs(1)).await;
+    let steps = capture.group_steps();
+    assert_eq!(steps.first(), Some(&GroupStep::Group(Route::Pidfd)), "{steps:?}");
+    await_the_cat_gone(stderr).await;
+    assert_down_without_status(result, mark);
+}
+
+/// The sync `graceful_shutdown_tree_of_a_root_reaped_elsewhere_with_no_member_left_sends_nothing`'s
+/// twin. Same mutants.
+#[skuld::test]
+async fn tokio_graceful_shutdown_tree_of_a_root_reaped_elsewhere_with_no_member_left_sends_nothing(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+) {
+    use crate::child::group_exact_tests::assert_down_without_status;
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let mut child = foreign_reaped_group_root();
+    let mark = crate::log_capture::mark();
+    let capture = Capture::start();
+    let result = child.graceful_shutdown_tree(std::time::Duration::from_secs(1)).await;
+    let steps = capture.group_steps();
+    assert_eq!(steps, [], "nothing was sent");
+    assert_down_without_status(result, mark);
+}
