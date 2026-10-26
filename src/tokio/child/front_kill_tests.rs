@@ -216,7 +216,9 @@ fn failed_password_write_detail(child: Child) -> (String, ChildFate) {
 #[skuld::test]
 async fn graceful_shutdown_of_a_front_that_exits_within_the_grace_returns_its_status() {
     use std::os::unix::process::ExitStatusExt as _;
-    let (mut child, _stdin) = spawn_as(cat(), ElevatedVia::Wrapped(Backend::Sudo));
+    let (mut child, stdin) = spawn_as(cat(), ElevatedVia::Wrapped(Backend::Sudo));
+    // Released once the `SIGTERM` has been sent, as in the sync twin.
+    let _release = crate::graceful_hooks::release_at(crate::graceful_hooks::HookPoint::AfterTerminate, stdin);
     let status = child
         .graceful_shutdown(Duration::from_secs(3600))
         .await

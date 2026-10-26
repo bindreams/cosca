@@ -17,7 +17,8 @@ pub use echo_held::RELEASED_EXIT_ENV;
 /// missing kill left alive echoes the byte, so a `kill_tree` that sends nothing fails by assertion
 /// instead of hanging a read for an EOF.
 ///
-/// Unix only: it relies on a delivered `SIGKILL` being pending before the kill returns. Windows uses
+/// Unix only: it relies on a delivered `SIGKILL` (or a `SIGTERM` the member does not handle) being
+/// pending before the call returns, so the member dies before it can echo. Windows uses
 /// [`assert_members_killed`].
 pub fn assert_dead(sock: &mut TcpStream, who: &str) {
     use std::io::ErrorKind::{BrokenPipe, ConnectionAborted, ConnectionReset};
@@ -96,6 +97,16 @@ pub fn assert_members_killed(members: Vec<(Member, &str)>) {
             "{who} must die to the kill (exit code 1), not leave on its own when released"
         );
     }
+}
+
+/// Assert that a soft signal (`terminate_tree`) ended every member, each named for the failure
+/// message. Unix: [`assert_dead`] on each, as for a kill. Windows: [`assert_members_not_released`],
+/// since a `CTRL_BREAK` leaves its own exit code, not the kill's.
+pub fn assert_members_terminated(members: Vec<(Member, &str)>) {
+    #[cfg(unix)]
+    assert_members_killed(members);
+    #[cfg(windows)]
+    assert_members_not_released(members);
 }
 
 /// The exit codes a testbin member can leave with for a reason other than the kill, besides

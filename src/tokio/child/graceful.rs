@@ -145,6 +145,8 @@ impl Child {
     /// sent nothing though the `SIGTERM` was sent.
     pub async fn graceful_shutdown(&mut self, grace: Duration) -> Result<ExitStatus, Error> {
         self.terminate()?;
+        #[cfg(test)]
+        fault::run_hook(fault::HookPoint::AfterTerminate);
         // A watch failure must not strand the child between the soft signal and the escalation —
         // kill and reap still run (grace unobservable => escalate now); the watch error surfaces
         // only after they succeed (a kill/reap error wins — deliberate subsumption, mirroring

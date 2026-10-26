@@ -9,17 +9,12 @@ mod common;
 #[cfg(unix)]
 #[skuld::test]
 fn child_terminate_sends_sigterm() {
-    use std::io::Read;
     use std::os::unix::process::ExitStatusExt;
-    let (child, mut sock) = common::spawn_blocker();
+    let (child, sock) = common::spawn_blocker();
     child.terminate().expect("terminate sends SIGTERM");
-    // Prove death by a real event: the control socket EOFs.
-    let mut buf = [0u8; 1];
-    match sock.read(&mut buf) {
-        Ok(0) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
-        other => panic!("expected EOF/ConnectionReset after SIGTERM, got {other:?}"),
-    }
+    // Release the member after the signal. It leaves with 0 on the release, so a `terminate` that
+    // sent nothing fails the signal assertion instead of leaving the reap waiting for a death.
+    drop(sock);
     // Reap and assert it died by SIGTERM (soft), NOT SIGKILL.
     let status = child.wait().expect("reap");
     assert_eq!(
@@ -32,7 +27,7 @@ fn child_terminate_sends_sigterm() {
 #[cfg(windows)]
 #[skuld::test]
 fn child_terminate_unsupported_for_an_uncontained_child_on_windows() {
-    let (child, _sock) = common::spawn_blocker();
+    let (child, sock) = common::spawn_blocker();
     assert_eq!(
         child.graceful_mechanism(),
         cosca::GracefulMechanism::None,
@@ -42,8 +37,7 @@ fn child_terminate_unsupported_for_an_uncontained_child_on_windows() {
         .terminate()
         .expect_err("a child that leads no group cannot be addressed");
     assert!(matches!(err, cosca::error::Error::Unsupported { .. }), "got {err:?}");
-    child.kill().expect("cleanup");
-    let _ = child.wait();
+    common::kill_release_reap(&child, sock);
 }
 
 #[cfg(unix)]
@@ -94,7 +88,7 @@ fn child_graceful_shutdown_escalates() {
 #[skuld::test]
 fn child_graceful_shutdown_unsupported_for_an_uncontained_child_on_windows() {
     use std::time::Duration;
-    let (child, _sock) = common::spawn_blocker();
+    let (child, sock) = common::spawn_blocker();
     assert_eq!(
         child.graceful_mechanism(),
         cosca::GracefulMechanism::None,
@@ -104,8 +98,7 @@ fn child_graceful_shutdown_unsupported_for_an_uncontained_child_on_windows() {
         .graceful_shutdown(Duration::from_secs(1))
         .expect_err("a child that leads no group cannot be addressed");
     assert!(matches!(err, cosca::error::Error::Unsupported { .. }), "got {err:?}");
-    child.kill().expect("cleanup");
-    let _ = child.wait();
+    common::kill_release_reap(&child, sock);
 }
 
 #[skuld::test]
@@ -255,15 +248,14 @@ fn process_graceful_shutdown_escalates() {
 #[skuld::test]
 fn process_lone_graceful_unsupported_on_windows() {
     use std::time::Duration;
-    let (child, _sock) = common::spawn_blocker();
+    let (child, sock) = common::spawn_blocker();
     let p = cosca::Process::from_pid(child.id().pid()).found().expect("resolves");
     assert!(matches!(p.terminate(), Err(cosca::error::Error::Unsupported { .. })));
     assert!(matches!(
         p.graceful_shutdown(Duration::from_secs(1)),
         Err(cosca::error::Error::Unsupported { .. })
     ));
-    child.kill().expect("cleanup");
-    let _ = child.wait();
+    common::kill_release_reap(&child, sock);
 }
 
 #[skuld::test]
@@ -309,7 +301,7 @@ fn process_graceful_shutdown_tree_tears_down_tree() {
 #[skuld::test]
 fn process_soft_tree_unsupported_on_windows() {
     use std::time::Duration;
-    let (child, _sock) = common::spawn_blocker();
+    let (child, sock) = common::spawn_blocker();
     let p = cosca::Process::from_pid(child.id().pid()).found().expect("resolves");
     assert!(matches!(
         p.terminate_tree(),
@@ -319,8 +311,7 @@ fn process_soft_tree_unsupported_on_windows() {
         p.graceful_shutdown_tree(Duration::from_secs(1)),
         Err(cosca::error::Error::Unsupported { .. })
     ));
-    child.kill().expect("cleanup");
-    let _ = child.wait();
+    common::kill_release_reap(&child, sock);
 }
 
 // GracefulMechanism =====
@@ -333,13 +324,12 @@ fn process_soft_tree_unsupported_on_windows() {
 fn graceful_mechanism_is_process_on_unix() {
     use cosca::GracefulMechanism;
 
-    let (uncontained, _s1) = common::spawn_blocker();
-    let (contained, _s2) = common::spawn_control("control-block", &["R"], true);
+    let (uncontained, s1) = common::spawn_blocker();
+    let (contained, s2) = common::spawn_control("control-block", &["R"], true);
     assert_eq!(uncontained.graceful_mechanism(), GracefulMechanism::Process);
     assert_eq!(contained.graceful_mechanism(), GracefulMechanism::Process);
-    for child in [uncontained, contained] {
-        child.kill().expect("cleanup");
-        let _ = child.wait();
+    for (child, sock) in [(uncontained, s1), (contained, s2)] {
+        common::kill_release_reap(&child, sock);
     }
 }
 
@@ -351,13 +341,12 @@ fn graceful_mechanism_is_process_on_unix() {
 fn graceful_mechanism_distinguishes_contained_from_uncontained_on_windows() {
     use cosca::GracefulMechanism;
 
-    let (uncontained, _s1) = common::spawn_blocker();
-    let (contained, _s2) = common::spawn_control("control-block", &["R"], true);
+    let (uncontained, s1) = common::spawn_blocker();
+    let (contained, s2) = common::spawn_control("control-block", &["R"], true);
     assert_eq!(uncontained.graceful_mechanism(), GracefulMechanism::None);
     assert_eq!(contained.graceful_mechanism(), GracefulMechanism::ConsoleGroup);
-    for child in [uncontained, contained] {
-        child.kill().expect("cleanup");
-        let _ = child.wait();
+    for (child, sock) in [(uncontained, s1), (contained, s2)] {
+        common::kill_release_reap(&child, sock);
     }
 }
 
@@ -436,9 +425,8 @@ fn child_graceful_shutdown_escalates_when_the_break_is_ignored() {
 /// platform.
 #[skuld::test]
 fn child_terminate_reports_ok_for_an_already_exited_child() {
-    let (child, _sock) = common::spawn_control("control-block", &["R"], true);
-    child.kill().expect("kill");
-    let _status = child.wait().expect("reap");
+    let (child, sock) = common::spawn_control("control-block", &["R"], true);
+    common::kill_release_reap(&child, sock);
     child.terminate().expect("already-dead must be Ok");
 }
 

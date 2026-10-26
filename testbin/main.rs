@@ -237,12 +237,14 @@ fn released_exit_code() -> i32 {
 
 /// Block on `sock` until the test closes it, or writes a byte. With [`ECHO_HELD_ENV`] set the member
 /// echoes every byte and leaves only when the test closes the socket, so a test that releases the
-/// tree can tell a member that was killed (no echo) from one that is merely alive.
+/// tree can tell a member that was killed (no echo) from one that is merely alive. With
+/// [`RELEASED_EXIT_ENV`] set, a member the test closed leaves with that code.
 fn hold(sock: &mut std::net::TcpStream) {
     let echo = std::env::var_os(ECHO_HELD_ENV).is_some();
     let mut b = [0u8; 1];
     loop {
         match sock.read(&mut b) {
+            Ok(0) if std::env::var_os(RELEASED_EXIT_ENV).is_some() => std::process::exit(released_exit_code()),
             Ok(0) => break,
             Ok(_) if !echo => break,
             Ok(_) => sock.write_all(&b).unwrap(),
@@ -775,14 +777,10 @@ fn main() {
             }
             sock.write_all(tag.as_bytes()).unwrap();
             sock.flush().unwrap();
-            let mut buf = [0u8; 1];
-            // Retry EINTR: the SIGTERM interrupts this read on platforms without SA_RESTART.
-            loop {
-                match sock.read(&mut buf) {
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    _ => break,
-                }
-            }
+            // `hold` retries EINTR, which the SIGTERM causes on platforms without SA_RESTART. With
+            // `ECHO_HELD_ENV` set it echoes each byte, after the ack of a SIGTERM sent before the
+            // byte was written, so a test can tell "no SIGTERM came" from "not yet" without a timer.
+            hold(&mut sock);
         }
         #[cfg(unix)]
         "spawn-grandchild-stubborn-child" => {

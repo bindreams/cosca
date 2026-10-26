@@ -302,10 +302,33 @@ pub(crate) fn assert_echoes(stdin: &mut impl std::io::Write, stdout: &mut impl s
 /// Block until `pid` has exited without reaping it: a zombie, which still pins its group number.
 #[cfg(unix)]
 pub(crate) fn wait_until_zombie(pid: u32) {
+    let _ = zombie_record(pid);
+}
+
+/// [`wait_until_zombie`], then assert it was ended by `SIGKILL` and did not exit on its own once
+/// its stdin closed. The zombie stays unreaped.
+#[cfg(unix)]
+pub(crate) fn assert_zombie_sigkilled(who: &str, pid: u32) {
+    let info = zombie_record(pid);
+    #[cfg(target_os = "linux")]
+    // SAFETY: `waitid` returned a `SIGCHLD` record, whose status field is set.
+    let status = unsafe { info.si_status() };
+    #[cfg(target_os = "macos")]
+    let status = info.si_status;
+    assert_eq!(
+        (info.si_code, status),
+        (libc::CLD_KILLED, libc::SIGKILL),
+        "{who} must be SIGKILLed, not exit on its own"
+    );
+}
+
+#[cfg(unix)]
+fn zombie_record(pid: u32) -> libc::siginfo_t {
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     // SAFETY: `info` is a valid out-parameter. WNOWAIT leaves the child reapable.
     let rc = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT) };
     assert_eq!(rc, 0, "waitid: {}", std::io::Error::last_os_error());
+    info
 }
 
 /// Whether `pid` is still this process's unreaped child (running, or a zombie nobody collected):

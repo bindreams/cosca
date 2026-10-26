@@ -31,6 +31,16 @@ fn session(argv: &[&str]) -> Command {
     cmd
 }
 
+/// A session-contained [`BLOCKER_ARGV`](crate::test_child::BLOCKER_ARGV) command with piped stdin.
+/// A test that kills it takes the writer and drops it only after the kill: dropping the writer is
+/// the only way for the blocker to end on its own (status 0), so a `kill` that sent nothing fails the
+/// assertion on how the root ended, instead of leaving a wait unbounded.
+fn session_blocker_cmd() -> Command {
+    let mut cmd = session(crate::test_child::BLOCKER_ARGV);
+    cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
+    cmd
+}
+
 fn drop_warns_since(mark: usize) -> Vec<(log::Level, String)> {
     crate::log_capture::records_since_on_current_thread(mark, WARN)
 }
@@ -98,10 +108,12 @@ async fn dropping_an_exited_but_unreaped_process_group_child_still_kills_the_gro
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let recorder = record_kill_group();
-    let mut child = session(&["sleep", "300"]).spawn().expect("spawn");
+    let mut child = session_blocker_cmd().spawn().expect("spawn");
+    let stdin = child.stdin().expect("stdin pipe");
     let pid = child.id().pid();
     child.kill().expect("kill the root");
-    crate::test_child::wait_until_zombie(pid);
+    drop(stdin);
+    crate::test_child::assert_zombie_sigkilled("the root", pid);
 
     let mark = crate::log_capture::mark();
     drop(child);
@@ -173,14 +185,7 @@ async fn dropping_a_foreign_reaped_process_group_child_sends_no_killpg() {
     crate::log_capture::install();
     let recorder = record_kill_group();
     let root = drop_fault::record();
-    let mut child = session(&["sleep", "300"]).spawn().expect("spawn");
-    let pid = child.id().pid();
-    child.kill().expect("kill the root");
-    crate::test_child::wait_until_zombie(pid);
-    let mut status = 0;
-    // SAFETY: `pid` is this test's own zombie child. This plays the application that reaps it.
-    let reaped = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
-    assert_eq!(reaped, pid as libc::pid_t, "{}", std::io::Error::last_os_error());
+    let child = foreign_reaped(session_blocker_cmd());
 
     let mark = crate::log_capture::mark();
     drop(child);
@@ -203,9 +208,11 @@ async fn dropping_a_foreign_reaped_process_group_child_sends_no_killpg() {
 /// while the handle still reads it as running.
 fn foreign_reaped(mut cmd: Command) -> crate::tokio::Child {
     let mut child = cmd.spawn().expect("spawn");
+    let stdin = child.stdin().expect("stdin pipe");
     let pid = child.id().pid();
     child.kill().expect("kill the root");
-    crate::test_child::wait_until_zombie(pid);
+    drop(stdin);
+    crate::test_child::assert_zombie_sigkilled("the root", pid);
     let mut status = 0;
     // SAFETY: `pid` is this test's own zombie child. This plays the application that reaps it.
     let reaped = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
@@ -222,7 +229,7 @@ async fn a_detached_drop_after_a_foreign_reap_forgets_tokios_child() {
     crate::log_capture::install();
     let root = drop_fault::record();
     let backend_drops = crate::tokio::child::fault::count_backend_drops();
-    let mut child = foreign_reaped(session(&["sleep", "300"]));
+    let mut child = foreign_reaped(session_blocker_cmd());
     child.detach();
     drop(child);
     assert_eq!(
@@ -239,7 +246,7 @@ async fn a_kill_on_drop_false_drop_after_a_foreign_reap_forgets_tokios_child() {
     crate::log_capture::install();
     let root = drop_fault::record();
     let backend_drops = crate::tokio::child::fault::count_backend_drops();
-    let mut cmd = session(&["sleep", "300"]);
+    let mut cmd = session_blocker_cmd();
     cmd.kill_on_drop(false);
     let child = foreign_reaped(cmd);
     drop(child);
@@ -321,9 +328,11 @@ async fn a_failed_elevated_spawns_cleanup_drops_its_handle_without_a_warn() {
 
 /// A `sleep` root, killed and then waited for, so that only `wait()` marks tokio's state.
 async fn waited_on_sleep_root() -> crate::tokio::Child {
-    let mut child = session(&["sleep", "300"]).spawn().expect("spawn");
+    let mut child = session_blocker_cmd().spawn().expect("spawn");
+    let stdin = child.stdin().expect("stdin pipe");
     child.kill().expect("kill the root");
-    child.wait().await.expect("reap the root");
+    drop(stdin);
+    crate::test_child::assert_killed("the root", child.wait().await.expect("reap the root"));
     child
 }
 

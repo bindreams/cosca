@@ -34,15 +34,14 @@ fn foreign_wait_returns_when_the_process_exits() {
 fn foreign_wait_timeout_times_out_on_a_live_process() {
     // The blocker is structurally wedged on its never-written socket, so it cannot
     // exit; wait_timeout returns Ok(false) regardless of the (short) duration.
-    let (child, _sock) = spawn_blocker();
+    let (child, sock) = spawn_blocker();
     let p = cosca::Process::from_pid(child.id().pid()).found().expect("resolves");
     let exited = p.wait_timeout(Duration::from_millis(200)).expect("wait_timeout");
     assert!(
         !exited,
         "a wedged process must time out to Ok(false), got exited={exited}"
     );
-    child.kill().expect("kill cleanup");
-    let _ = child.wait();
+    common::kill_release_reap(&child, sock);
 }
 
 #[skuld::test]
@@ -57,11 +56,10 @@ fn foreign_wait_timeout_observes_an_exit() {
 #[skuld::test]
 fn foreign_wait_timeout_zero_returns_immediately_on_a_live_process() {
     // ZERO is the poll-once edge in each backend; a wedged child must yield Ok(false).
-    let (child, _sock) = spawn_blocker();
+    let (child, sock) = spawn_blocker();
     let p = cosca::Process::from_pid(child.id().pid()).found().expect("resolves");
     assert!(!p.wait_timeout(Duration::ZERO).expect("wait_timeout"));
-    child.kill().expect("kill cleanup");
-    let _ = child.wait();
+    common::kill_release_reap(&child, sock);
 }
 
 #[skuld::test]
@@ -92,7 +90,7 @@ fn from_pid_resolves_a_live_foreign_child_then_reports_it_dead() {
     // killed+reaped, that resolved Process reports !is_alive (the zombie-EXCLUSIVE liveness
     // check, distinct from the zombie-inclusive exists()). The reap is what makes the liveness
     // assertion sound — an exit event alone would not (see the module doc).
-    let (child, _sock) = spawn_blocker();
+    let (child, sock) = spawn_blocker();
     let p = cosca::Process::from_pid(child.id().pid())
         .found()
         .expect("live foreign child resolves");
@@ -102,8 +100,8 @@ fn from_pid_resolves_a_live_foreign_child_then_reports_it_dead() {
         cosca::identity::Liveness::Alive,
         "a freshly spawned foreign child is alive"
     );
-    child.kill().expect("kill");
-    child.wait().expect("reap"); // synchronously confirm exit before the liveness assertion
+    // The reap is synchronous: it confirms the exit before the liveness assertion.
+    common::kill_release_reap(&child, sock);
     assert_eq!(
         p.is_alive(),
         cosca::identity::Liveness::Dead,
@@ -183,8 +181,10 @@ fn children_recursive_distinguishes_direct_from_descendant() {
 
     // Teardown: kill the direct child; the reparented grandchild exits when its socket closes.
     child.kill().expect("kill child");
-    let _ = child.wait();
+    // Releasing the sockets right after the kill lets a `kill` that sent nothing fail the signal
+    // assertion, not hang the reap.
     drop(socks);
+    common::assert_killed("the killed child", child.wait().expect("reap the child"));
     grandkid.wait().expect("wait for the orphaned grandchild");
 }
 
@@ -810,7 +810,11 @@ fn death_watch_accept_tree_panics_when_the_grandchild_dies_before_connecting_whi
     );
     // The grandchild exited, so it must not be named a `G` connection; the root stays alive.
     root.kill().expect("kill the root");
-    root.wait().expect("reap the root");
+    // The root's connection still waits in the listener's backlog, and the root reads from it:
+    // closing the listener resets it and ends the root by itself (status 0), so a `kill` that sent
+    // nothing fails the assertion on how the root ended, not the reap.
+    drop(listener);
+    common::assert_killed("the root", root.wait().expect("reap the root"));
     assert_died_before_connecting(&message, grandchild_pid);
 }
 

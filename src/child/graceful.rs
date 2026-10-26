@@ -123,6 +123,8 @@ impl Child {
     /// the `SIGTERM` was sent, and the grace wait does not warn.
     pub fn graceful_shutdown(&self, grace: Duration) -> Result<ExitStatus, Error> {
         self.terminate()?;
+        #[cfg(test)]
+        fault::run_hook(fault::HookPoint::AfterTerminate);
 
         // Quiet about a zombie launchd holds: the refusal below is the one report of it.
         #[cfg(unix)]

@@ -22,11 +22,9 @@ fn expect_eof(who: &str, s: &mut std::net::TcpStream) {
 #[cfg(feature = "tokio")]
 #[skuld::test]
 async fn async_kill_terminates_the_child() {
-    let (mut child, mut sock) = common::spawn_blocker_async().await;
-    child.kill().expect("kill");
-    expect_eof("blocker", &mut sock);
-    let status = child.wait().await.expect("reap");
-    assert!(!status.success(), "killed child cannot report success, got {status:?}");
+    let (mut child, sock) = common::spawn_blocker_async().await;
+    // Releases the member after the kill, so a `kill` that sent nothing fails on how it ended.
+    common::kill_release_reap_async(&mut child, sock).await;
 }
 
 #[cfg(feature = "tokio")]
@@ -53,14 +51,12 @@ async fn async_kill_on_exited_unreaped_child_is_ok() {
 #[cfg(feature = "tokio")]
 #[skuld::test]
 async fn async_tree_ops_unsupported_when_uncontained() {
-    let (mut child, mut sock) = common::spawn_blocker_async().await;
+    let (mut child, sock) = common::spawn_blocker_async().await;
     let err = child.kill_tree().expect_err("uncontained kill_tree");
     assert!(matches!(err, cosca::error::Error::Unsupported { .. }), "got {err:?}");
     let err = child.terminate_tree().expect_err("uncontained terminate_tree");
     assert!(matches!(err, cosca::error::Error::Unsupported { .. }), "got {err:?}");
-    child.kill().expect("cleanup");
-    expect_eof("blocker", &mut sock);
-    let _ = child.wait().await;
+    common::kill_release_reap_async(&mut child, sock).await;
 }
 
 #[cfg(feature = "tokio")]
@@ -92,9 +88,11 @@ async fn async_kill_tree_tears_down_tree() {
 async fn async_terminate_tree_soft_kills_the_group() {
     use std::os::unix::process::ExitStatusExt;
     // control-block honors SIGTERM: the group signal alone (signal-only op) tears it down.
-    let (mut child, mut sock) = common::spawn_control_async("control-block", &["R"], true).await;
+    let (mut child, sock) = common::spawn_control_async("control-block", &["R"], true).await;
     child.terminate_tree().expect("terminate_tree");
-    expect_eof("root", &mut sock);
+    // Release the member after the signal: it leaves with 0 on the release, so a `terminate_tree`
+    // that sent nothing fails the signal assertion below.
+    drop(sock);
     let status = child.wait().await.expect("reap");
     assert_eq!(
         status.signal(),
@@ -139,9 +137,11 @@ async fn async_contain_with_treewalk_tears_down_tree() {
 #[skuld::test]
 async fn async_terminate_sends_sigterm() {
     use std::os::unix::process::ExitStatusExt;
-    let (mut child, mut sock) = common::spawn_blocker_async().await;
+    let (mut child, sock) = common::spawn_blocker_async().await;
     child.terminate().expect("terminate sends SIGTERM");
-    expect_eof("blocker", &mut sock);
+    // Release the member after the signal: it leaves with 0 on the release, so a `terminate` that
+    // sent nothing fails the signal assertion below.
+    drop(sock);
     let status = child.wait().await.expect("reap");
     assert_eq!(
         status.signal(),
@@ -154,7 +154,7 @@ async fn async_terminate_sends_sigterm() {
 #[cfg(windows)]
 #[skuld::test]
 async fn async_terminate_unsupported_for_an_uncontained_child_on_windows() {
-    let (mut child, mut sock) = common::spawn_blocker_async().await;
+    let (mut child, sock) = common::spawn_blocker_async().await;
     assert_eq!(
         child.graceful_mechanism(),
         cosca::GracefulMechanism::None,
@@ -164,9 +164,7 @@ async fn async_terminate_unsupported_for_an_uncontained_child_on_windows() {
         .terminate()
         .expect_err("a child that leads no group cannot be addressed");
     assert!(matches!(err, cosca::error::Error::Unsupported { .. }), "got {err:?}");
-    child.kill().expect("cleanup");
-    expect_eof("blocker", &mut sock);
-    let _ = child.wait().await;
+    common::kill_release_reap_async(&mut child, sock).await;
 }
 
 #[cfg(feature = "tokio")]
@@ -221,7 +219,11 @@ async fn async_graceful_cancel_mid_grace_leaves_child_owned() {
     // the watch and performs no further signalling. Deterministic, no timers: poll the future
     // exactly ONCE (that sends SIGTERM and arms the watch), then drop it. The acking child's
     // handler returns without exiting, so nothing escalated => it must still be alive.
-    let (mut child, mut sock) = common::spawn_control_async("control-block-ack-term", &["R"], false).await;
+    // The child echoes a probe byte: see the `probe` below.
+    let (mut child, mut sock) = common::spawn_control_async_with("control-block-ack-term", &["R"], false, |cmd| {
+        cmd.env(common::ECHO_HELD_ENV, "1");
+    })
+    .await;
     {
         // Duration::MAX: the watch cannot time out, the SIGTERM-acking (never-exiting) child
         // cannot exit on the soft signal, and nothing escalates before the drop — so the
@@ -234,7 +236,11 @@ async fn async_graceful_cancel_mid_grace_leaves_child_owned() {
             panic!("graceful future resolved at first poll instead of parking: {r:?}");
         }
         // The ack byte proves the single poll actually DELIVERED the SIGTERM (a real event,
-        // not an assumption about await points) while the future is still parked.
+        // not an assumption about await points) while the future is still parked. The probe is
+        // written after the poll, so the child handles a SIGTERM that poll sent, and acks it,
+        // before it echoes the probe: with no SIGTERM the first byte back is the echo, and the
+        // assertion fails instead of the read waiting for an ack that never comes.
+        std::io::Write::write_all(&mut sock, b"p").expect("write the probe");
         let mut ack = [0u8; 1];
         sock.read_exact(&mut ack).expect("SIGTERM ack");
         assert_eq!(&ack, b"T", "child must ack the SIGTERM sent by the first poll");
@@ -249,9 +255,7 @@ async fn async_graceful_cancel_mid_grace_leaves_child_owned() {
         cosca::identity::Liveness::Alive,
         "cancelled graceful must not have escalated"
     );
-    child.kill().expect("explicit teardown after cancel");
-    expect_eof("blocker", &mut sock);
-    let _ = child.wait().await.expect("reap");
+    common::kill_release_reap_async(&mut child, sock).await;
 }
 
 #[cfg(feature = "tokio")]
@@ -358,7 +362,7 @@ async fn async_graceful_shutdown_tree_sweep_is_load_bearing_on_windows() {
 #[skuld::test]
 async fn async_graceful_shutdown_unsupported_for_an_uncontained_child_on_windows() {
     use std::time::Duration;
-    let (mut child, mut sock) = common::spawn_blocker_async().await;
+    let (mut child, sock) = common::spawn_blocker_async().await;
     assert_eq!(
         child.graceful_mechanism(),
         cosca::GracefulMechanism::None,
@@ -369,9 +373,7 @@ async fn async_graceful_shutdown_unsupported_for_an_uncontained_child_on_windows
         .await
         .expect_err("a child that leads no group cannot be addressed");
     assert!(matches!(err, cosca::error::Error::Unsupported { .. }), "got {err:?}");
-    child.kill().expect("cleanup");
-    expect_eof("blocker", &mut sock);
-    let _ = child.wait().await;
+    common::kill_release_reap_async(&mut child, sock).await;
 }
 
 #[cfg(feature = "tokio")]
@@ -473,15 +475,13 @@ async fn async_graceful_shutdown_tree_sweeps_survivor_after_graceful_root_exit()
 #[skuld::test]
 async fn async_graceful_tree_unsupported_when_uncontained() {
     use std::time::Duration;
-    let (mut child, mut sock) = common::spawn_blocker_async().await;
+    let (mut child, sock) = common::spawn_blocker_async().await;
     let err = child
         .graceful_shutdown_tree(Duration::from_secs(1))
         .await
         .expect_err("uncontained tree graceful");
     assert!(matches!(err, cosca::error::Error::Unsupported { .. }), "got {err:?}");
-    child.kill().expect("cleanup");
-    expect_eof("blocker", &mut sock);
-    let _ = child.wait().await;
+    common::kill_release_reap_async(&mut child, sock).await;
 }
 
 // The lone graceful ops on a console-group child — async twins of tests/graceful.rs's =====
@@ -560,9 +560,8 @@ async fn async_child_graceful_shutdown_escalates_when_the_break_is_ignored() {
 #[cfg(unix)]
 #[skuld::test]
 async fn async_child_terminate_reports_ok_for_an_already_exited_child() {
-    let (mut child, _sock) = common::spawn_control_async("control-block", &["R"], true).await;
-    child.kill().expect("kill");
-    let _status = child.wait().await.expect("reap");
+    let (mut child, sock) = common::spawn_control_async("control-block", &["R"], true).await;
+    common::kill_release_reap_async(&mut child, sock).await;
     child.terminate().expect("already-dead must be Ok");
 }
 
@@ -609,10 +608,10 @@ async fn async_child_graceful_ops_report_success_for_a_child_that_shares_no_cons
 /// contained child.
 #[skuld::test]
 async fn async_graceful_mechanism_matches_the_sync_surface() {
-    let (mut uncontained, _s1) = common::spawn_blocker_async().await;
-    let (mut contained, _s2) = common::spawn_control_async("control-block", &["R"], true).await;
-    let (sync_uncontained, _s3) = common::spawn_blocker();
-    let (sync_contained, _s4) = common::spawn_control("control-block", &["R"], true);
+    let (mut uncontained, s1) = common::spawn_blocker_async().await;
+    let (mut contained, s2) = common::spawn_control_async("control-block", &["R"], true).await;
+    let (sync_uncontained, s3) = common::spawn_blocker();
+    let (sync_contained, s4) = common::spawn_control("control-block", &["R"], true);
     assert_eq!(
         uncontained.graceful_mechanism(),
         sync_uncontained.graceful_mechanism(),
@@ -667,13 +666,10 @@ async fn async_graceful_mechanism_matches_the_sync_surface() {
         "uncontained, after a reap: the two mirrors answer with different error shapes"
     );
 
-    uncontained.kill().expect("cleanup");
-    let _ = uncontained.wait().await;
-    contained.kill().expect("cleanup");
-    let _ = contained.wait().await;
-    for child in [sync_uncontained, sync_contained] {
-        child.kill().expect("cleanup");
-        let _ = child.wait();
+    common::kill_release_reap_async(&mut uncontained, s1).await;
+    common::kill_release_reap_async(&mut contained, s2).await;
+    for (child, sock) in [(sync_uncontained, s3), (sync_contained, s4)] {
+        common::kill_release_reap(&child, sock);
     }
 }
 

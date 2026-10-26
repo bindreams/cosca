@@ -6,7 +6,8 @@ use crate::oneshot_hook::{arm, fire, Armed, OneShotHook};
 /// Where in a graceful shutdown a test hook runs.
 #[derive(Clone, Copy)]
 pub(crate) enum HookPoint {
-    /// After `terminate_tree` returned `Ok` (or was held), before any drain or exit watch.
+    /// After `terminate_tree` (`graceful_shutdown`: `terminate`) returned `Ok` (or was held), before
+    /// any drain or exit watch.
     AfterTerminate,
     /// After the kill or sweep returned `Ok` (or was skipped), before the root is reaped.
     BeforeReap,
