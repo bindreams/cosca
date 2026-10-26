@@ -806,7 +806,6 @@ fn spawn_contained_tree() -> (cosca::Child, std::net::TcpStream) {
     let mut cmd = Command::new();
     cmd.env(common::ACK_ENV, "1");
     cmd.env(common::ECHO_HELD_ENV, "1");
-    cmd.env(common::RELEASED_EXIT_ENV, common::RELEASED_EXIT_CODE.to_string());
     cmd.executable(testbin())
         .args(["cosca_testbin", "spawn-grandchild", &addr]);
     cmd.contain();
@@ -976,27 +975,6 @@ fn windows_kill_tree_reaps_the_grandchild() {
     // `TerminateJobObject` only starts the termination: the proof is the grandchild's exit event
     // and its kill exit code, with its socket released so a missing kill ends the wait too.
     common::assert_members_killed(vec![(grand, "the grandchild")]);
-    let _ = child.wait(); // reap the root
-}
-
-/// `terminate_tree` under JobObject containment reaps the whole tree. The
-/// JobObject `terminate` path sends CTRL_BREAK to the root's process group; the
-/// grandchild (spawned plainly by the root, not contained itself) shares that
-/// console group and dies too. Proof of death: the grandchild's exit event, with its socket
-/// released so that a `terminate_tree` that sent nothing ends the wait too, and an exit code that
-/// is not the release's.
-#[cfg(windows)]
-#[skuld::test]
-fn windows_terminate_tree_reaps_the_grandchild() {
-    let (child, gc_stream) = spawn_contained_tree();
-    assert_eq!(child.containment(), cosca::Containment::JobObject);
-    let grand = common::Member::new(
-        gc_stream,
-        common::last_reported_grandchild().expect("the grandchild's pid"),
-    );
-
-    child.terminate_tree().expect("terminate_tree");
-    common::assert_members_terminated(vec![(grand, "the grandchild")]);
     let _ = child.wait(); // reap the root
 }
 
@@ -1173,7 +1151,6 @@ fn spawn_treewalk_tree() -> (cosca::Child, std::net::TcpStream, std::net::TcpStr
     let mut cmd = Command::new();
     cmd.env(common::ACK_ENV, "1");
     cmd.env(common::ECHO_HELD_ENV, "1");
-    cmd.env(common::RELEASED_EXIT_ENV, common::RELEASED_EXIT_CODE.to_string());
     cmd.executable(testbin())
         .args(["cosca_testbin", "spawn-grandchild", &addr]);
     cmd.contain_with(cosca::ContainMode::TreeWalk);
@@ -1231,22 +1208,21 @@ fn treewalk_kill_tree_reaps_the_grandchild() {
 /// `terminate_tree` under TreeWalk reaps the whole tree. Unix: TreeWalk's
 /// terminate SIGTERMs each genuine identity (root then descendants); the
 /// control-block grandchild has no SIGTERM handler so the default action kills
-/// it. Windows: terminate sends CTRL_BREAK to the root's process group, which
-/// the grandchild shares (it was NOT spawned contained), so it dies too. Proof
-/// of death is the grandchild's control socket EOFing / ConnectionReset — never
-/// a timer or an is_alive() race.
-#[cfg(any(unix, windows))]
+/// it. A live member would echo, so a `terminate_tree` that sent nothing fails by
+/// assertion. The Windows leg, whose break lands asynchronously, is in
+/// `src/child/ctrl_break_tests.rs`.
+#[cfg(unix)]
 #[skuld::test]
 fn treewalk_terminate_tree_reaps_the_grandchild() {
     // Hold `root_stream` until the signal (see spawn_treewalk_tree): it keeps the root alive so
     // TreeWalk enumerates a live root's descendants. It also means a `terminate_tree` that sent
     // nothing leaves the root running, so the members are proven ended before any wait.
     let (child, gc_stream, root_stream) = spawn_treewalk_tree();
-    let grand = common::Member::new(
+    let mut grand = common::Member::new(
         gc_stream,
         common::last_reported_grandchild().expect("the grandchild's pid"),
     );
-    let root = common::Member::new(root_stream, child.id().pid());
+    let mut root = common::Member::new(root_stream, child.id().pid());
     let expected = if cfg!(target_os = "macos") {
         cosca::Containment::FdMarker
     } else {
@@ -1255,7 +1231,8 @@ fn treewalk_terminate_tree_reaps_the_grandchild() {
     assert_eq!(child.containment(), expected);
 
     child.terminate_tree().expect("terminate_tree");
-    common::assert_members_terminated(vec![(root, "the root"), (grand, "the grandchild")]);
+    root.assert_dead("the root");
+    grand.assert_dead("the grandchild");
     let _ = child.wait(); // reap the root
 }
 

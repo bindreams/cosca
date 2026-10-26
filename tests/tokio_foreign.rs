@@ -58,8 +58,10 @@ async fn async_foreign_wait_timeout_observes_an_exit() {
     let p = Process::from_pid(child.id().pid()).found().expect("resolves");
     child.kill().expect("kill");
     // Release the member after the kill: a `kill` that sent nothing lets it leave with 0, which the
-    // assertion on how it ended catches.
+    // assertion on how it ended catches. The exit is waited for first, so `wait_timeout` observes
+    // an exit that already happened.
     drop(sock);
+    common::assert_killed("the killed child", common::exit_status_once_exited(child.id().pid()));
     assert!(
         p.wait_timeout(std::time::Duration::from_secs(30)).await.expect("wait"),
         "exited child must report exited (30 s is the failure bound)"

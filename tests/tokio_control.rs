@@ -170,27 +170,6 @@ async fn async_terminate_unsupported_for_an_uncontained_child_on_windows() {
 #[cfg(feature = "tokio")]
 #[cfg(unix)]
 #[skuld::test]
-async fn async_graceful_shutdown_graceful_path() {
-    use std::os::unix::process::ExitStatusExt;
-    use std::time::Duration;
-    // control-block dies on default-disposition SIGTERM. The long grace is the safety bound on
-    // a child that exits promptly — never the synchronization; correctness is the exit signal.
-    let (mut child, mut sock) = common::spawn_blocker_async().await;
-    let status = child
-        .graceful_shutdown(Duration::from_secs(30))
-        .await
-        .expect("graceful_shutdown");
-    assert_eq!(
-        status.signal(),
-        Some(libc::SIGTERM),
-        "graceful path must exit via SIGTERM, got {status:?}"
-    );
-    expect_eof("blocker", &mut sock);
-}
-
-#[cfg(feature = "tokio")]
-#[cfg(unix)]
-#[skuld::test]
 async fn async_graceful_shutdown_escalates() {
     use std::os::unix::process::ExitStatusExt;
     use std::time::Duration;
@@ -239,11 +218,16 @@ async fn async_graceful_cancel_mid_grace_leaves_child_owned() {
         // not an assumption about await points) while the future is still parked. The probe is
         // written after the poll, so the child handles a SIGTERM that poll sent, and acks it,
         // before it echoes the probe: with no SIGTERM the first byte back is the echo, and the
-        // assertion fails instead of the read waiting for an ack that never comes.
+        // assertion fails instead of the read waiting for an ack that never comes. Both bytes are
+        // read, so that order is asserted, not assumed.
         std::io::Write::write_all(&mut sock, b"p").expect("write the probe");
-        let mut ack = [0u8; 1];
-        sock.read_exact(&mut ack).expect("SIGTERM ack");
-        assert_eq!(&ack, b"T", "child must ack the SIGTERM sent by the first poll");
+        let mut reply = [0u8; 2];
+        sock.read_exact(&mut reply)
+            .expect("the SIGTERM ack, then the probe's echo");
+        assert_eq!(
+            &reply, b"Tp",
+            "child must ack the SIGTERM sent by the first poll, then echo the probe"
+        );
     } // <- future dropped mid-grace here
 
     // is_alive is THE non-escalation discriminator: this child can only die by SIGKILL (its
@@ -485,50 +469,6 @@ async fn async_graceful_tree_unsupported_when_uncontained() {
 }
 
 // The lone graceful ops on a console-group child — async twins of tests/graceful.rs's =====
-
-#[cfg(feature = "tokio")]
-/// Async twin of `child_terminate_delivers_ctrl_break_to_a_contained_root`.
-#[cfg(windows)]
-#[skuld::test]
-async fn async_child_terminate_delivers_ctrl_break_to_a_contained_root() {
-    use cosca::GracefulMechanism;
-
-    let (mut child, mut sock) = common::spawn_control_async("control-block-ack-break", &["R"], true).await;
-    assert_eq!(child.graceful_mechanism(), GracefulMechanism::ConsoleGroup);
-    assert_eq!(
-        common::in_our_console(child.id().pid()),
-        Some(true),
-        "the root must share our console for the event to be deliverable"
-    );
-    child.terminate().expect("terminate a console-group child");
-    let mut ack = [0u8; 1];
-    sock.read_exact(&mut ack).expect("the child must acknowledge the break");
-    assert_eq!(&ack, b"B", "wrong ack byte");
-    // As the sync twin: release the root, then exit code 1 (kill) vs 0 (released).
-    child.kill_tree().expect("kill_tree");
-    drop(sock);
-    let status = child.wait().await.expect("reap");
-    assert_eq!(status.code(), Some(1), "kill_tree must kill the root, got {status:?}");
-}
-
-#[cfg(feature = "tokio")]
-/// Async twin of `child_graceful_shutdown_exits_via_ctrl_break_on_windows`.
-#[cfg(windows)]
-#[skuld::test]
-async fn async_child_graceful_shutdown_exits_via_ctrl_break_on_windows() {
-    use std::time::Duration;
-
-    let (mut child, _sock) = common::spawn_control_async("control-block", &["R"], true).await;
-    let status = child
-        .graceful_shutdown(Duration::from_secs(30))
-        .await
-        .expect("graceful_shutdown on a console-group child");
-    assert_eq!(
-        status.code(),
-        Some(0xC000013A_u32 as i32),
-        "the child must die to the console event, got {status:?}"
-    );
-}
 
 #[cfg(feature = "tokio")]
 /// Async twin of `child_graceful_shutdown_escalates_when_the_break_is_ignored`.

@@ -153,6 +153,29 @@ async fn async_graceful_lone_watch_error_still_escalates_and_reaps() {
     crate::test_child::assert_killed("the escalated child", status);
 }
 
+// Async twin of `child_graceful_shutdown_graceful_path` in `src/child/graceful_tests.rs`.
+#[cfg(unix)]
+#[skuld::test]
+async fn async_graceful_shutdown_graceful_path() {
+    use std::os::unix::process::ExitStatusExt;
+    crate::tokio::test_runtime::assert_current_thread();
+    let mut cmd = crate::tokio::Command::new();
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+    let mut child = cmd.spawn().expect("spawn");
+    let stdin = child.stdin().expect("piped stdin");
+    let _release = term_fault::release_at(term_fault::HookPoint::AfterTerminate, stdin);
+    let status = child
+        .graceful_shutdown(Duration::from_secs(30))
+        .await
+        .expect("graceful_shutdown");
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGTERM),
+        "graceful path must exit via SIGTERM, got {status:?}"
+    );
+}
+
 // Async twin of `graceful_tree_terminate_refusal_still_sweeps_and_reaps` in
 // `src/child/graceful_tests.rs` — see there for the full rationale.
 #[skuld::test]
