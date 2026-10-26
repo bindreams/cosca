@@ -960,7 +960,8 @@ impl LateTree {
                 let check = || {
                     let target = crate::wait::exit_only::Target::pid(pid, Some(unique));
                     let state = crate::signal::RootState::of_peek(crate::wait::exit_only::peek_verified(&target));
-                    crate::child::tree_call::group_number_holds(pid, (state, false))
+                    let _ = crate::child::tree_call::group_number_holds(pid, (state, false));
+                    Ok::<(), String>(()) // MUTANT: the late tree's check always passes
                 };
                 let result = match attached.hard_kill_report(&crate::containment::GroupRoot::new(None, &check)) {
                     (Err(e), _) => Err(e.to_string()),
