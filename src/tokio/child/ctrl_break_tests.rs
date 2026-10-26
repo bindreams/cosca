@@ -169,6 +169,38 @@ async fn async_child_graceful_shutdown_signals_the_group_but_only_kills_the_chil
     assert_eq!(exit.wait_for_exit_code(), 1, "kill_tree must kill the grandchild");
 }
 
+/// Async twin of `child_graceful_ops_report_success_for_a_child_that_shares_no_console`: the same
+/// known limitation, pinned on the async surface too.
+#[skuld::test]
+async fn async_child_graceful_ops_report_success_for_a_child_that_shares_no_console() {
+    crate::tokio::test_runtime::assert_current_thread();
+    let (mut child, sock) = spawn_root(Handler::Detached);
+    let pid = child.id().pid();
+    assert_eq!(
+        child.graceful_mechanism(),
+        GracefulMechanism::ConsoleGroup,
+        "the flags do not exclude delivery, which is what makes this a gap"
+    );
+    assert_eq!(
+        ctrl_break::in_our_console(pid),
+        Some(false),
+        "a child that freed its console is not in ours"
+    );
+    child.terminate().expect("the documented false success");
+    ctrl_break::assert_break_sent_to(pid);
+    assert_eq!(
+        child.is_alive(),
+        crate::identity::Liveness::Alive,
+        "nothing was delivered, so the child must still be running"
+    );
+    let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, sock);
+    let status = child
+        .graceful_shutdown(Duration::ZERO)
+        .await
+        .expect("the forced half needs no console");
+    assert_eq!(status.code(), Some(1), "the escalation's kill, got {status:?}");
+}
+
 /// Both members ignore the break, so only the ZERO-grace hard sweep can end the tree. The root's
 /// socket is closed once the sweep returned, and the grandchild's after the root is reaped: a sweep
 /// that sent nothing, or only to the root, yields code 0 for the member it missed, not a hang.

@@ -221,49 +221,6 @@ fn child_terminate_reports_ok_for_an_already_exited_child() {
     child.terminate().expect("already-dead must be Ok");
 }
 
-/// Pins a KNOWN LIMITATION, not desired behaviour. A child that shares no console with us is
-/// signalled with a success Windows reports for an event that reached nobody, and nothing inside
-/// this process can tell that case apart from a healthy one. Revisit when a route that reads the
-/// TARGET's console exists — this test must then flip rather than the behaviour changing
-/// silently.
-#[cfg(windows)]
-#[skuld::test]
-fn child_graceful_ops_report_success_for_a_child_that_shares_no_console() {
-    use std::io::Read;
-    use std::time::Duration;
-
-    use cosca::GracefulMechanism;
-
-    let (child, mut sock) = common::spawn_gui_control(true);
-    assert_eq!(
-        child.graceful_mechanism(),
-        GracefulMechanism::ConsoleGroup,
-        "the flags do not exclude delivery — that is exactly what makes this a gap"
-    );
-    assert_eq!(
-        common::in_our_console(child.id().pid()),
-        Some(false),
-        "a GUI-subsystem child is not in our console"
-    );
-    child.terminate().expect("the documented false success");
-    // Neither shut down nor killed — this is also what catches an accidental auto-escalation
-    // inside terminate.
-    assert_eq!(
-        child.is_alive(),
-        cosca::identity::Liveness::Alive,
-        "nothing was delivered, so the child must still be running"
-    );
-    // The FORCED half still works, so the op ends the child even though its cooperative half
-    // reached nobody.
-    let status = child
-        .graceful_shutdown(Duration::ZERO)
-        .expect("the forced half needs no console");
-    assert_eq!(status.code(), Some(1), "escalation's kill, got {status:?}");
-    let mut buf = [0u8; 1];
-    let _ = sock.read(&mut buf);
-    let _ = child.wait();
-}
-
 /// The case this capability exists for, end to end: a nested contained Windows child owns no
 /// tree, leads a console process group of its own, and had no cooperative shutdown at all.
 /// `break=1` is reachable only if that child's own handler acknowledged an event no tree op on

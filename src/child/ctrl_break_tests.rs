@@ -156,6 +156,45 @@ fn child_graceful_shutdown_signals_the_group_but_only_kills_the_child() {
     assert_eq!(exit.wait_for_exit_code(), 1, "kill_tree must kill the grandchild");
 }
 
+/// Pins a KNOWN LIMITATION, not desired behaviour. A child that shares no console with us is
+/// signalled with a success Windows reports for an event that reached nobody, and nothing inside
+/// this process can tell that case apart from a healthy one. Revisit when a route that reads the
+/// TARGET's console exists: this test must then flip, not the behaviour change silently.
+///
+/// The child freed its console after it started, so the flags do not exclude delivery and the
+/// mechanism is still the console group. Its socket is closed once the escalation's kill returned,
+/// so a kill that sent nothing gives code 0, not a hang in the reap.
+#[skuld::test]
+fn child_graceful_ops_report_success_for_a_child_that_shares_no_console() {
+    let (child, sock) = spawn_root(Handler::Detached, crate::ContainMode::Strongest);
+    let pid = child.id().pid();
+    assert_eq!(
+        child.graceful_mechanism(),
+        GracefulMechanism::ConsoleGroup,
+        "the flags do not exclude delivery, which is what makes this a gap"
+    );
+    assert_eq!(
+        ctrl_break::in_our_console(pid),
+        Some(false),
+        "a child that freed its console is not in ours"
+    );
+    child.terminate().expect("the documented false success");
+    ctrl_break::assert_break_sent_to(pid);
+    // Neither shut down nor killed: this also catches an accidental escalation inside `terminate`.
+    assert_eq!(
+        child.is_alive(),
+        crate::identity::Liveness::Alive,
+        "nothing was delivered, so the child must still be running"
+    );
+    // The forced half still works, so the op ends the child although its cooperative half reached
+    // nobody.
+    let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, sock);
+    let status = child
+        .graceful_shutdown(Duration::ZERO)
+        .expect("the forced half needs no console");
+    assert_eq!(status.code(), Some(1), "the escalation's kill, got {status:?}");
+}
+
 /// `terminate_tree` under Job Object containment: the break to the root's group reaches the
 /// grandchild, an ordinary spawn of the root, which dies to it. Neither member is released, so its
 /// exit code is the break's.
