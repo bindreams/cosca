@@ -70,6 +70,34 @@ impl Prepared {
         let _ = pid;
     }
 
+    /// Linux 6.9+: `SIGKILL`, through `child`'s pidfd, the process group of a spawn that failed
+    /// before its attach, while the group has a member. The pidfd names the group exactly, whoever
+    /// reaped the root. Only a root whose group is its containment (Session, or a process group
+    /// with no cgroup leaf) is sent it: a leaf's drop ends a child in the leaf or outside it. Below
+    /// 6.9 the kernel refuses the flag and nothing is sent, as the group's number may name another
+    /// group. `Err` is the kernel's refusal of the kill.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn kill_group_before_attach(&self, child: ChildHandle<'_>) -> Result<(), nix::errno::Errno> {
+        use nix::errno::Errno;
+        let group_is_containment = self.is_root
+            && self.cgroup_leaf.is_none()
+            && matches!(self.mode, Some(mode) if !matches!(mode, ContainMode::TreeWalk));
+        if !group_is_containment {
+            return Ok(());
+        }
+        let pid = child.pid;
+        match crate::containment::unix::pidfd_signal_group(child.pidfd, nix::sys::signal::Signal::SIGKILL) {
+            Ok(()) => log::debug!("spawn teardown: killed the process group of pid {pid} through its pidfd"),
+            Err(Errno::ESRCH) => log::debug!("spawn teardown: the process group of pid {pid} has no member left"),
+            Err(Errno::EINVAL) => log::debug!(
+                "spawn teardown: the kernel refused PIDFD_SIGNAL_PROCESS_GROUP (before Linux 6.9), so the process \
+                 group of pid {pid} is sent nothing"
+            ),
+            Err(e) => return Err(e),
+        }
+        Ok(())
+    }
+
     /// End the placement exchange of a spawn that failed with no handle left on its child — tokio
     /// can drop one it forked — and say what became of that child. Without a leaf nothing can
     /// tell, so [`AbandonedChild::MaybeUnreachable`]. A child that is an elevation `front` is sent
