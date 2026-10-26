@@ -28,9 +28,9 @@ fn a_shipped_shim_takes_p_for_a_protocol_violation() {
     rig.link.expect_event(LinkEvent::Accepted);
     rig.link.expect_event(LinkEvent::Answered(Command::Allow));
     rig.link.link.send_control(b'P').unwrap();
-    // The shim may have closed the link by now, so the `T` is either delivered to a shim about to
-    // close or refused by one that has. The verdict below is the same either way, and a shim that
-    // took `P` for a ping would end the program with SIGTERM here.
+    // The shim may already have closed the link, so `T` can be refused; the verdict is the same
+    // either way. `T` stays so a shim that took `P` for a ping ends the program with SIGTERM and
+    // fails the assertion below.
     let sent = rig.link.link.send_control(b'T');
     assert!(
         matches!(sent, Ok(()) | Err(Errno::PIPE | Errno::CONNRESET | Errno::NOTCONN)),
