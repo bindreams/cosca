@@ -186,9 +186,7 @@ fn graceful_mechanism_is_process_on_unix() {
     let (contained, s2) = common::spawn_control("control-block", &["R"], true);
     assert_eq!(uncontained.graceful_mechanism(), GracefulMechanism::Process);
     assert_eq!(contained.graceful_mechanism(), GracefulMechanism::Process);
-    for (child, sock) in [(uncontained, s1), (contained, s2)] {
-        common::kill_release_reap(&child, sock);
-    }
+    common::kill_release_reap_all(vec![(uncontained, s1), (contained, s2)]);
 }
 
 /// On Windows the two must DISAGREE: containment is what sets `CREATE_NEW_PROCESS_GROUP`, so an
@@ -203,9 +201,7 @@ fn graceful_mechanism_distinguishes_contained_from_uncontained_on_windows() {
     let (contained, s2) = common::spawn_control("control-block", &["R"], true);
     assert_eq!(uncontained.graceful_mechanism(), GracefulMechanism::None);
     assert_eq!(contained.graceful_mechanism(), GracefulMechanism::ConsoleGroup);
-    for (child, sock) in [(uncontained, s1), (contained, s2)] {
-        common::kill_release_reap(&child, sock);
-    }
+    common::kill_release_reap_all(vec![(uncontained, s1), (contained, s2)]);
 }
 
 // The lone graceful ops on a console-group child =====

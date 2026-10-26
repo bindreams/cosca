@@ -828,9 +828,8 @@ struct EchoTree {
     child: cosca::Child,
     root: std::net::TcpStream,
     grand: std::net::TcpStream,
-    /// The grandchild's own pid: for reading the tree's cgroup back out of `/proc` (Linux), and for
-    /// the exit watch on a member (Windows).
-    #[cfg(any(windows, target_os = "linux"))]
+    /// The grandchild's own pid, for reading the tree's cgroup back out of `/proc`.
+    #[cfg(target_os = "linux")]
     grand_pid: u32,
 }
 
@@ -840,10 +839,6 @@ fn spawn_contained_echo_tree(kill_on_drop: bool) -> EchoTree {
     let addr = listener.local_addr().unwrap().to_string();
     let mut cmd = Command::new();
     cmd.env(common::ACK_ENV, "1");
-    // A member a missing kill leaves alive then leaves on the release with this code, which a
-    // kill never produces, so a test can tell the two by the exit code (`assert_members_not_released`).
-    #[cfg(windows)]
-    cmd.env(common::RELEASED_EXIT_ENV, common::RELEASED_EXIT_CODE.to_string());
     cmd.executable(testbin())
         .args(["cosca_testbin", "spawn-grandchild-echo", &addr]);
     common::silence(&mut cmd);
@@ -879,7 +874,7 @@ fn spawn_contained_echo_tree(kill_on_drop: bool) -> EchoTree {
         child,
         root,
         grand,
-        #[cfg(any(windows, target_os = "linux"))]
+        #[cfg(target_os = "linux")]
         grand_pid: _grand_pid,
     }
 }
@@ -887,13 +882,11 @@ fn spawn_contained_echo_tree(kill_on_drop: bool) -> EchoTree {
 /// The mechanism `spawn_contained_tree` gets depends on the host (`CgroupV2` if the caller may
 /// create a cgroup, else `ProcessGroup`); the tree-kill tests hold under either, so accept any
 /// mechanism that tears down a tree.
-#[cfg(any(unix, windows))]
+#[cfg(unix)]
 fn assert_host_tree_containment(child: &cosca::Child) {
     use cosca::Containment as C;
     let got = child.containment();
-    let ok = if cfg!(windows) {
-        got == C::JobObject
-    } else if cfg!(target_os = "linux") {
+    let ok = if cfg!(target_os = "linux") {
         matches!(got, C::CgroupV2 | C::ProcessGroup)
     } else {
         matches!(got, C::ProcessGroup | C::Session | C::FdMarker)
@@ -1276,45 +1269,6 @@ fn treewalk_kills_process_group_escapee() {
     common::assert_dead(&mut root_stream, "the escapee root after kill_tree");
     common::assert_dead(&mut gc_stream, "the grandchild after kill_tree");
     let _ = child.wait();
-}
-
-/// Drop kills the whole contained tree: the grandchild as well as the root.
-///
-/// Windows only. On Unix a drop that killed nothing leaves the sockets open, so
-/// `drop_kills_a_contained_tree` in `src/child/lifecycle_tests.rs` proves it there, failing by
-/// assertion. Here both members are released after the drop and the proof is each one's exit
-/// code: a member the drop did not kill leaves with [`common::RELEASED_EXIT_CODE`], which
-/// `assert_members_not_released` rejects, so a missing kill fails by assertion, not by a wait.
-#[cfg(windows)]
-#[skuld::test]
-fn drop_kills_contained_tree() {
-    let EchoTree {
-        child,
-        root,
-        grand,
-        grand_pid,
-    } = spawn_contained_echo_tree(true);
-    // Assert containment was actually established BEFORE dropping, so a failure here (the tree
-    // survived the drop) is diagnosable as "containment was set up" vs "containment never engaged".
-    assert_ne!(
-        child.containment(),
-        cosca::Containment::None,
-        "drop test requires real containment; got None"
-    );
-    assert_host_tree_containment(&child);
-    // Both members are alive and echoing, which this test holds; see `common::Member` for why a
-    // pid is only trusted while the member is.
-    let root = common::Member::new(root, child.id().pid());
-    let grand = common::Member::new(grand, grand_pid);
-
-    // Drop triggers: attached.hard_kill() -> TerminateJobObject, which initiates the termination of
-    // every member before it returns.
-    drop(child);
-
-    common::assert_members_not_released(vec![
-        (root, "the root, after dropping the Child"),
-        (grand, "the grandchild, after dropping the Child"),
-    ]);
 }
 
 // cgroup v2 integration tests =====

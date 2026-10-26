@@ -416,9 +416,7 @@ async fn async_graceful_mechanism_matches_the_sync_surface() {
 
     common::kill_release_reap_async(&mut uncontained, s1).await;
     common::kill_release_reap_async(&mut contained, s2).await;
-    for (child, sock) in [(sync_uncontained, s3), (sync_contained, s4)] {
-        common::kill_release_reap(&child, sock);
-    }
+    common::kill_release_reap_all(vec![(sync_uncontained, s3), (sync_contained, s4)]);
 }
 
 #[cfg(feature = "tokio")]

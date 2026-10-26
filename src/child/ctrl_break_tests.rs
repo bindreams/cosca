@@ -336,3 +336,20 @@ fn graceful_shutdown_tree_sweep_is_load_bearing_on_windows() {
     drop(sock);
     assert_eq!(exit.wait_for_exit_code(), 1, "the sweep must kill the grandchild");
 }
+
+/// Dropping a `Child` with a Job Object tree kills the grandchild as well as the root. Both
+/// sockets are released once the drop's root kill returned, so a drop that sent nothing lets each
+/// member leave on its own with 0, which the code assertions reject, instead of hanging the drop's
+/// reap of the root. A drop whose job kill ended the root first never reaches that release.
+#[skuld::test]
+fn drop_kills_a_job_object_tree() {
+    let (child, root_sock, grand) = spawn_tree(Handler::Default, Handler::Default, crate::ContainMode::Strongest);
+    assert_eq!(child.containment(), Containment::JobObject);
+    let Grandchild { sock, exit } = grand;
+    let teardown = crate::child::spawn::fault::release_at_drop_kill((root_sock, sock));
+
+    drop(child);
+
+    teardown.assert_reaps_killed();
+    assert_eq!(exit.wait_for_exit_code(), 1, "the drop must kill the grandchild");
+}

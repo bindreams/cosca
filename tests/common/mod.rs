@@ -146,6 +146,25 @@ pub fn kill_release_reap(child: &cosca::Child, control: TcpStream) -> std::proce
     status
 }
 
+/// [`kill_release_reap`] for several children: every kill is sent and every control socket
+/// released before any assertion, so a failed one cannot leave the others to a `Child` drop that
+/// waits on a member still holding its socket.
+pub fn kill_release_reap_all(children: Vec<(cosca::Child, TcpStream)>) {
+    for (child, _) in &children {
+        child.kill().expect("kill");
+    }
+    let statuses: Vec<_> = children
+        .into_iter()
+        .map(|(child, control)| {
+            drop(control);
+            child.wait().expect("reap the killed child")
+        })
+        .collect();
+    for status in statuses {
+        assert_killed("the killed child", status);
+    }
+}
+
 /// [`kill_release_reap`] for the tokio `Child`.
 #[cfg(feature = "tokio")]
 pub async fn kill_release_reap_async(child: &mut cosca::tokio::Child, control: TcpStream) -> std::process::ExitStatus {
