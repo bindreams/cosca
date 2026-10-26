@@ -91,7 +91,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          MANIFEST="$(cargo metadata --no-deps --locked --format-version 1 | jq -r '.packages[0].version')"
+          MANIFEST="$(cargo metadata --no-deps --locked --format-version 1 | jq -r '.packages[] | select(.name == "cosca") | .version')"
           if [ "$MANIFEST" != "$VERSION" ]; then
             echo "::error::Checked-out commit declares $MANIFEST but this dispatch asked for $VERSION"
             exit 1
