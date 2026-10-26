@@ -14,6 +14,8 @@
 use std::io::Read;
 #[cfg(windows)]
 use std::net::TcpListener;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 
 #[cfg(windows)]
 #[path = "common/mod.rs"]
@@ -23,12 +25,20 @@ mod common;
 const SEAM_ENV: &str = "COSCA_TEST_ACK_SEAM";
 
 #[cfg(windows)]
+/// `DETACHED_PROCESS` (winbase.h): the new process gets no console and does not inherit ours.
+const DETACHED_PROCESS: u32 = 0x0000_0008;
+
+#[cfg(windows)]
 /// How a mode is launched and read.
 struct Case {
     /// The mode's argv after the executable, given the report address.
     args: fn(&str) -> Vec<String>,
     /// The mode reports one line and then waits for the socket to close, instead of closing.
     one_line: bool,
+    /// Creation flags for the mode. The two console modes are launched console-less: they are
+    /// the console-less probes, and with a console they would wait for a `CTRL_BREAK` that a
+    /// broken `terminate` never sends.
+    flags: u32,
 }
 
 #[cfg(windows)]
@@ -47,6 +57,7 @@ fn run(case: &Case, seam: &str) -> Run {
     cmd.args(&args)
         .env(common::ACK_ENV, "1")
         .env(SEAM_ENV, seam)
+        .creation_flags(case.flags)
         .stderr(std::process::Stdio::piped());
     let mut helper = common::spawn_locked(&mut cmd).expect("spawn the mode");
     let mut sock = common::accept_or_die(&listener, &mut helper);
@@ -125,11 +136,11 @@ fn breakaway_exec_args(addr: &str) -> Vec<String> {
 
 #[cfg(windows)]
 mode_tests! {
-    report_console_terminate: Case { args: console_terminate_args, one_line: false };
-    report_console_lone: Case { args: console_lone_args, one_line: false };
-    report_breakaway_raw: Case { args: breakaway_raw_args, one_line: true };
-    report_breakaway_argv: Case { args: breakaway_argv_args, one_line: true };
-    report_breakaway_exec: Case { args: breakaway_exec_args, one_line: true };
+    report_console_terminate: Case { args: console_terminate_args, one_line: false, flags: DETACHED_PROCESS };
+    report_console_lone: Case { args: console_lone_args, one_line: false, flags: DETACHED_PROCESS };
+    report_breakaway_raw: Case { args: breakaway_raw_args, one_line: true, flags: 0 };
+    report_breakaway_argv: Case { args: breakaway_argv_args, one_line: true, flags: 0 };
+    report_breakaway_exec: Case { args: breakaway_exec_args, one_line: true, flags: 0 };
 }
 
 #[path = "../src/test_harness.rs"]

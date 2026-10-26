@@ -1069,12 +1069,9 @@ fn main() {
                 Err(e) => describe(&e),
             };
             let alive_after_terminate = liveness(child.is_alive());
-            // The blocking read happens ONLY where delivery is guaranteed: the child was MEASURED
-            // to be in our console, its mechanism says the flags do not exclude delivery, and the
-            // call reported success. Every other combination defers the read until after the
-            // cleanup kill below, so it collects EOF or a reset and this mode always reports.
-            let delivered = c_in_console == Some(true) && mechanism == "console-group" && terminate == "Ok";
-            let early_break = delivered.then(|| saw_break(&mut ack));
+            // Console-less callers only (every test launches this mode `DETACHED_PROCESS`): no
+            // break can arrive, so the read happens after the cleanup kill below and collects EOF
+            // or a reset. A read before it would block forever on a break nobody sends.
 
             // ZERO grace: the acker survives its break by design, so the escalation is
             // deterministic and its exit code is what proves the forced half ran.
@@ -1096,11 +1093,7 @@ fn main() {
             }
             // `K`: the teardown that should have ended the child failed, so delivery was never
             // observable — distinct from an observed non-delivery.
-            let seen = match early_break {
-                Some(seen) => seen,
-                None if cleanup == "Ok" => saw_break(&mut ack),
-                None => "K",
-            };
+            let seen = if cleanup == "Ok" { saw_break(&mut ack) } else { "K" };
 
             let mut line = String::new();
             write!(
@@ -1272,35 +1265,28 @@ fn main() {
             let c1_in_console = in_our_console(c1.id().pid());
             let terminate = classify(c1.terminate_tree());
             let alive_after_terminate = liveness(c1.is_alive());
-            // The blocking wait for delivery happens ONLY where delivery is guaranteed: the
-            // root was MEASURED to be in our console AND terminate reported success. Every
-            // other combination kills first and collects EOF, so it always reaches the report
-            // and fails as an assertion rather than as a suite hang. The post-kill read/reap
-            // only runs when the kill itself succeeded — on a failed kill the child is still
-            // alive and blocked, so both would block forever and discard the kill error.
+            // Console-less callers only (every test launches this mode `DETACHED_PROCESS`): no
+            // break can arrive, so the root is killed first and the read collects EOF or a reset.
+            // A read before the kill would block forever on a break nobody sends. The post-kill
+            // read/reap only runs when the kill itself succeeded — on a failed kill the child is
+            // still alive and blocked, so both would block forever and discard the kill error.
             //
             // Sockets are released before each post-kill wait: a released acker exits 0, a killed one
             // 1, and the report carries the code.
-            let (terminate_break, kill_tree) = if c1_in_console && terminate == "Ok" {
-                let seen = saw_break(&mut ack1);
-                (seen, classify(c1.kill_tree()))
-            } else {
-                let killed = classify(c1.kill_tree());
-                let seen = if killed == "Ok" {
-                    // Half-close: the read below still collects the acker's last word, and a
-                    // live acker (no kill sent) gets EOF and leaves instead of blocking it. A
-                    // failure here would leave that acker blocked and the read hung.
-                    match ack1.shutdown(std::net::Shutdown::Write) {
-                        Err(e) if e.kind() != std::io::ErrorKind::NotConnected => {
-                            panic!("releasing the probe root's socket failed: {e}")
-                        }
-                        _ => {}
+            let kill_tree = classify(c1.kill_tree());
+            let terminate_break = if kill_tree == "Ok" {
+                // Half-close: the read below still collects the acker's last word, and a
+                // live acker (no kill sent) gets EOF and leaves instead of blocking it. A
+                // failure here would leave that acker blocked and the read hung.
+                match ack1.shutdown(std::net::Shutdown::Write) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotConnected => {
+                        panic!("releasing the probe root's socket failed: {e}")
                     }
-                    saw_break(&mut ack1)
-                } else {
-                    "K"
-                };
-                (seen, killed)
+                    _ => {}
+                }
+                saw_break(&mut ack1)
+            } else {
+                "K"
             };
             let acker1_exit = if kill_tree == "Ok" {
                 drop(ack1);

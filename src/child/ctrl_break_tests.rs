@@ -229,8 +229,9 @@ fn treewalk_terminate_tree_reaps_the_grandchild() {
 /// The tree ops from a caller that has a console. `terminate_tree` is asserted sent, then the
 /// root's own handler acks the break (the Win32 return value reports success for an event that
 /// reached nobody). `kill_tree` ends the root, which exits 0 when released, so code 1 is the
-/// kill's. `graceful_shutdown_tree` with no grace escalates, because the root survives its break,
-/// and nothing is left alive.
+/// kill's. `graceful_shutdown_tree` with no grace sends its own break (asserted through the
+/// `AfterTerminate` hook) and escalates, because the root survives its break, and nothing is left
+/// alive.
 #[skuld::test]
 fn tree_graceful_ops_work_from_a_caller_that_has_a_console() {
     let (child, mut sock) = spawn_root(Handler::Ack, crate::ContainMode::Strongest);
@@ -242,6 +243,10 @@ fn tree_graceful_ops_work_from_a_caller_that_has_a_console() {
     kill_tree_release_reap(&child, sock);
 
     let (child, _sock) = spawn_root(Handler::Ack, crate::ContainMode::Strongest);
+    let pid = child.id().pid();
+    let _check = term_fault::at(term_fault::HookPoint::AfterTerminate, move || {
+        ctrl_break::assert_break_sent_to(pid)
+    });
     child
         .graceful_shutdown_tree(Duration::ZERO)
         .expect("graceful_shutdown_tree");
@@ -253,8 +258,9 @@ fn tree_graceful_ops_work_from_a_caller_that_has_a_console() {
 }
 
 /// The lone ops from a caller that has a console. `terminate` is asserted sent and acked, and the
-/// root survives its break by design. `graceful_shutdown` with no grace then escalates, so exit
-/// code 1 is the escalation's kill, and a later `kill` of the dead child is `Ok`.
+/// root survives its break by design. `graceful_shutdown` with no grace sends its own break
+/// (asserted through the `AfterTerminate` hook) and then escalates, so exit code 1 is the
+/// escalation's kill, and a later `kill` of the dead child is `Ok`.
 #[skuld::test]
 fn lone_graceful_ops_work_from_a_caller_that_has_a_console() {
     let (child, mut sock) = spawn_root(Handler::Ack, crate::ContainMode::Strongest);
@@ -268,6 +274,10 @@ fn lone_graceful_ops_work_from_a_caller_that_has_a_console() {
         crate::identity::Liveness::Alive,
         "the root handles the break and keeps running"
     );
+    let pid = child.id().pid();
+    let _check = term_fault::at(term_fault::HookPoint::AfterTerminate, move || {
+        ctrl_break::assert_break_sent_to(pid)
+    });
     let status = child.graceful_shutdown(Duration::ZERO).expect("graceful_shutdown");
     assert_eq!(status.code(), Some(1), "the escalation's kill, got {status:?}");
     assert_eq!(child.is_alive(), crate::identity::Liveness::Dead);

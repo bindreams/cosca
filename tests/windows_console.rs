@@ -1,8 +1,8 @@
 //! Windows: the console-group graceful signal (`CTRL_BREAK`) is delivered only within the
 //! CALLING process's console. Every test process the test runner spawns inherits its console (it
 //! sets neither `DETACHED_PROCESS` nor `CREATE_NO_WINDOW`), so the console-less caller is reached
-//! by re-launching the testbin with `DETACHED_PROCESS`.
-//! Each console-less/with-console pair drives the SAME helper mode; the pair must disagree.
+//! by re-launching the testbin with `DETACHED_PROCESS`. The with-console counterparts live in
+//! `src/child/ctrl_break_tests.rs` (and `src/test_child/ctrl_break/nested.rs`).
 //!
 //! The flag-matrix tests at the top measure what the creation-flag word does and does not
 //! settle about console membership, and their discriminating power comes from the control legs
@@ -134,14 +134,13 @@ fn a_gui_subsystem_child_is_outside_our_console_whatever_its_flags() {
 ///
 /// The helper connects before doing any work, so the read returns on socket EOF whether it
 /// reported or crashed — a real event, never a timer. `wait()` then supplies the real status.
-fn run_probe(detached: bool) -> String {
+fn run_probe() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap().to_string();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_cosca_testbin"));
-    cmd.args(["report-console-terminate", &addr]).env(common::ACK_ENV, "1");
-    if detached {
-        cmd.creation_flags(DETACHED_PROCESS);
-    }
+    cmd.args(["report-console-terminate", &addr])
+        .env(common::ACK_ENV, "1")
+        .creation_flags(DETACHED_PROCESS);
     let mut helper = common::spawn_locked(&mut cmd).expect("spawn probe helper");
     let mut sock = common::accept_or_die(&listener, &mut helper);
     let mut report = String::new();
@@ -168,7 +167,7 @@ fn field<'a>(report: &'a str, key: &str) -> &'a str {
 #[cfg(windows)]
 #[skuld::test]
 fn tree_graceful_ops_report_no_console_from_a_console_less_caller() {
-    let r = run_probe(true);
+    let r = run_probe();
     // A MEASURED absence — the helper reports `?` if its own probe failed — so this guard
     // cannot be satisfied by a broken probe.
     assert_eq!(
@@ -223,14 +222,13 @@ fn tree_graceful_ops_report_no_console_from_a_console_less_caller() {
 /// Sibling of [`run_probe`] driving the `report-console-lone` mode — the LONE graceful ops
 /// (`terminate` / `graceful_shutdown`) against a contained root, instead of the tree ops. Same
 /// direct-launch discipline and same connect-before-work EOF guarantee; see [`run_probe`].
-fn run_lone_probe(detached: bool) -> String {
+fn run_lone_probe() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap().to_string();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_cosca_testbin"));
-    cmd.args(["report-console-lone", &addr]).env(common::ACK_ENV, "1");
-    if detached {
-        cmd.creation_flags(DETACHED_PROCESS);
-    }
+    cmd.args(["report-console-lone", &addr])
+        .env(common::ACK_ENV, "1")
+        .creation_flags(DETACHED_PROCESS);
     let mut helper = common::spawn_locked(&mut cmd).expect("spawn lone probe helper");
     let mut sock = common::accept_or_die(&listener, &mut helper);
     let mut report = String::new();
@@ -246,7 +244,7 @@ fn run_lone_probe(detached: bool) -> String {
 #[cfg(windows)]
 #[skuld::test]
 fn lone_graceful_ops_report_no_console_from_a_console_less_caller() {
-    let r = run_lone_probe(true);
+    let r = run_lone_probe();
     // A MEASURED absence — the helper reports `?` if its own probe failed — so this guard
     // cannot be satisfied by a broken probe.
     assert_eq!(
