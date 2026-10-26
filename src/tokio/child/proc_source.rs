@@ -150,8 +150,8 @@ pub(crate) enum ProcSource {
 
 /// The backend's pidfd. A [`ProcSource`] has a `Drop`, so a field cannot be moved out of it; this
 /// lets a teardown take the original (never a duplicate, which can fail at the fd limit) and hand
-/// it on. Held from the spawn until [`take`](PinnedPidfd::take), which only a teardown that
-/// consumes the backend calls.
+/// it on. Held from the spawn until [`take`](PinnedPidfd::take), which a forget (`hand_off`, from
+/// the backend's replacement by a `Foreign` one) and a teardown that consumes the backend call.
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub(crate) struct PinnedPidfd(Option<std::os::fd::OwnedFd>);
@@ -783,9 +783,24 @@ impl ProcSource {
     }
 
     /// Whether the child is still running, read without reaping it: `false` once it is reaped, by
-    /// tokio or by someone else, or has exited. On macOS a child with no unique id cannot be read.
+    /// tokio or by someone else, or has exited. On Linux a backend forgotten as not shown to be ours
+    /// asks its kept pidfd, which names the child whoever reaped it. On macOS a child with no unique
+    /// id cannot be read.
     #[cfg(unix)]
     pub(crate) fn is_running(&self) -> std::io::Result<bool> {
+        #[cfg(target_os = "linux")]
+        if let ProcSource::Foreign {
+            fate: Forgotten::Unproven,
+            pidfd,
+            ..
+        } = self
+        {
+            let target = crate::wait::exit_only::Target::PidFd(std::os::fd::AsFd::as_fd(pidfd));
+            return Ok(matches!(
+                crate::wait::exit_only::peek(&target)?,
+                crate::wait::exit_only::Peek::Running
+            ));
+        }
         if self.is_reaped() {
             return Ok(false);
         }

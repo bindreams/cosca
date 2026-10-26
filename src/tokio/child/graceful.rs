@@ -299,8 +299,9 @@ impl Child {
     /// its group is shut down as usual while it has a member, and the call then returns
     /// [`Error::Unassessable`](crate::error::Error::Unassessable): no status is collected. After
     /// this handle's own reap, with another process at the pid, the group is empty: only the holders
-    /// get the `SIGTERM`, and the call goes on as usual. The `SIGTERM` and the sweep each decide on a look of their own at the
-    /// root, and each send by the group's number after it is checked as for `kill_tree`.
+    /// get the `SIGTERM`, and the call goes on as usual. The `SIGTERM` and the sweep each decide on a
+    /// look of their own at the root, and each send by the group's number after it is checked as for
+    /// `kill_tree`.
     ///
     /// **macOS, a root the handle cannot vouch for** is signalled as for
     /// [`terminate_tree`](Child::terminate_tree) and swept as for [`kill_tree`](Child::kill_tree). A

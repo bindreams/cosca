@@ -132,6 +132,71 @@ async fn the_drop_of_a_child_forgotten_unproven_claims_no_reap() {
     assert_eq!(fate, ChildFate::Running { id: Some(id) });
 }
 
+/// Linux: a root another reaper took, whose handle then forgot it as not shown to be ours (a kill
+/// whose peek failed), is shown gone by the drop's own kill through the kept pidfd (`ESRCH`). The
+/// pidfd names the root exactly, so the drop says `Gone`, not the forgotten backend's `Running`.
+///
+/// Mutant: the forgotten backend's `Running` overrides the drop's own `Gone`.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn the_drop_of_an_unproven_backend_whose_root_its_pidfd_shows_gone_says_gone() {
+    use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peek_once};
+    crate::tokio::test_runtime::assert_current_thread();
+    let (mut child, writer) = live(true);
+    let id = child.id();
+    child.kill().expect("kill the root");
+    crate::test_child::reaped_elsewhere::reap_behind(id.pid());
+    let failed = force_peek_once(Err(std::io::Error::other("forced peek failure 3c7f")));
+    child.kill().expect("a root reaped elsewhere has nothing left to kill");
+    assert_peeks_exhausted();
+    drop(failed);
+    let fate = child.tear_down_now();
+    drop(writer);
+    assert_eq!(fate, ChildFate::Gone);
+}
+
+/// Linux: a kill refused through the kept pidfd of a backend forgotten unproven leaves the child
+/// possibly running, and the drop's one warn names the refused kill.
+///
+/// Mutant: the backend counts as reaped, so the refused kill is not named.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn a_refused_kill_of_an_unproven_backend_at_drop_is_named() {
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let (mut child, writer) = forgotten(false);
+    let id = child.id();
+    let refused = super::fault::force_kill_failure();
+    let mark = crate::log_capture::mark();
+    let fate = child.tear_down_now();
+    drop(refused);
+    collect(id, writer);
+    assert_eq!(fate, ChildFate::Running { id: Some(id) });
+    assert_eq!(
+        crate::log_capture::records_since(mark, "could not be terminated on drop").len(),
+        1,
+        "the refused kill is named once"
+    );
+}
+
+/// Linux: a backend forgotten unproven is asked of its kept pidfd whether the child runs, so a
+/// kill or terminate gate does not read it as gone while it lives.
+///
+/// Mutant: a forgotten backend answers `false` whatever its pidfd shows.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn an_unproven_backend_reads_its_kept_pidfd_for_whether_the_child_runs() {
+    use crate::signal::Sig;
+    crate::tokio::test_runtime::assert_current_thread();
+    let (child, writer) = forgotten(false);
+    let id = child.id();
+    let proc = child.os.proc.as_ref().expect("backend");
+    assert!(proc.is_running().expect("the pidfd answers"), "the child lives");
+    proc.signal(Sig::Kill).expect("kill through the pidfd");
+    collect(id, writer);
+    assert!(!proc.is_running().expect("the pidfd answers"), "the child is gone");
+}
+
 /// A backend forgotten on proof of a foreign reap is `Gone`, not `Reaped`: this handle collected
 /// no status.
 ///
