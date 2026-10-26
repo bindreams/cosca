@@ -265,9 +265,9 @@ impl Drop for ShutOnDrop<'_> {
     }
 }
 
-/// Where a front spawned for a cgroup leaf leaves the handshake's pidfd when its spawn fails after
-/// its fork: for the leaf's abandonment, which uses it for a child the leaf cannot name (see
-/// [`Handshake::leaving_front`]).
+/// Where a child spawned for a cgroup leaf leaves the handshake's pidfd, or a copy of it, when its
+/// spawn fails after its fork: for the leaf's abandonment, which uses it for a child the leaf cannot
+/// name (see [`Handshake::leaving_front`]).
 pub(crate) type LeftPidfd = std::rc::Rc<std::cell::Cell<Option<OwnedFd>>>;
 
 /// Who answers for a child whose spawn failed after its fork, when that child is an elevation
@@ -275,9 +275,16 @@ pub(crate) type LeftPidfd = std::rc::Rc<std::cell::Cell<Option<OwnedFd>>>;
 enum LeftFront {
     /// Not a front: torn down as any child.
     NotAFront,
+    /// Not a front, spawned for a cgroup leaf: torn down as any child, after a copy of its pidfd
+    /// is left for the leaf's abandonment.
+    #[cfg_attr(
+        not(feature = "tokio"),
+        allow(dead_code, reason = "only tokio's spawn leaves a child to a leaf")
+    )]
+    LeafHeld(LeftPidfd),
     /// Not a front, and the process group the root leads is its containment (no cgroup leaf can have
-    /// taken it): on Linux 6.9+ the group is killed through the pidfd before the root is torn down,
-    /// whether or not std had already collected the child.
+    /// taken it): the group is killed through the pidfd before the root is torn down
+    /// ([`killing_group`](Handshake::killing_group)).
     #[cfg_attr(
         not(feature = "tokio"),
         allow(
@@ -311,7 +318,9 @@ impl Handshake {
     /// A front spawned for a cgroup leaf (`leaf` names where its pidfd goes) is left to the leaf,
     /// whose abandonment kills through it and then answers for the front: the handshake neither
     /// signals nor waits on it, nor notes its fate. Its pidfd goes to `leaf`, for a child the leaf
-    /// cannot name: one whose intent carried no handle, or that never sent one.
+    /// cannot name: one whose intent carried no handle, or that never sent one. Any other child
+    /// spawned for a leaf leaves a copy there, through which the leaf kills the group of a root it
+    /// did not take and could not name.
     #[cfg(feature = "tokio")]
     pub(crate) fn leaving_front(
         mut self,
@@ -321,7 +330,8 @@ impl Handshake {
         self.front = match (front, leaf) {
             (Some(_), Some(leaf)) => LeftFront::ToLeaf(leaf),
             (Some(front), None) => LeftFront::Here(front),
-            (None, _) => LeftFront::NotAFront,
+            (None, Some(leaf)) => LeftFront::LeafHeld(leaf),
+            (None, None) => LeftFront::NotAFront,
         };
         self
     }
@@ -330,9 +340,7 @@ impl Handshake {
     /// a spawn that fails after its fork sends the group `SIGKILL` through the child's pidfd while it
     /// has a member (Linux 6.9+), before it tears the child down. The send is made to a child std
     /// already collected too: its exec failed, so it never ran the program and left no group, and the
-    /// kernel answers `ESRCH`. Where the kernel refuses the flag (expected below 6.9) nothing goes by
-    /// the group's number, and the spawn's one `warn` says the group's members may be left running.
-    /// Not for a front, which is sent nothing.
+    /// kernel answers `ESRCH`. Not for a front, which is sent nothing.
     #[cfg(feature = "tokio")]
     pub(crate) fn killing_group(mut self, yes: bool) -> Handshake {
         if yes && matches!(self.front, LeftFront::NotAFront) {
@@ -359,9 +367,8 @@ impl Handshake {
     /// - A spawn that fails after its fork: std collected the child (see residuals b and c in
     ///   [`child_exited_before_the_helper_finished`]), or tokio dropped it neither
     ///   killed nor reaped. The pidfd tells which, and a child still there is killed and reaped
-    ///   through it. If its process group is named as the containment
-    ///   ([`killing_group`](Self::killing_group)), the group is sent `SIGKILL` through the pidfd first,
-    ///   for a child std already collected too.
+    ///   through it. If its group is named ([`killing_group`](Self::killing_group)), the group is
+    ///   killed first.
     ///
     /// The child runs the program only once told to go, so every failure but one proves the program
     /// did not start: a failed `spawn` after the child was told to go, from a spawn whose error does
@@ -838,8 +845,7 @@ fn join_helper(helper: std::thread::ScopedJoinHandle<'_, Outcome>, #[cfg(test)] 
 /// Combines the fork's answer with the helper's. A child that sent its pidfd and then failed its
 /// `spawn()` is torn down through that pidfd. The exception is the elevation `front` still there:
 /// tokio dropped it after it ran the program, so it is sent nothing. A child std already
-/// collected never ran the program (its exec failed): it is not a front, and its group, if named as
-/// the containment, is still sent `SIGKILL` through the pidfd (`ESRCH`). A front spawned for a
+/// collected never ran the program (its exec failed): it is not a front. A front spawned for a
 /// cgroup leaf is the leaf's to answer for: its pidfd is left for the leaf, unused here, and the
 /// failure's fate is a placeholder (`Unknown`) that the leaf's abandonment replaces.
 ///
@@ -868,9 +874,7 @@ fn conclude<T: Spawned>(spawned: io::Result<T>, outcome: Outcome, front: LeftFro
                 let (fate, child_fate) = super::leave_front_through_pidfd(None, pidfd, front, None, None);
                 (fate.note(error, Some(front), None), child_fate)
             }
-            // The group first: it holds the root too. The pidfd names the group exactly, whoever
-            // reaped the root; a root std collected after a failed `exec` left no member, and the
-            // send answers `ESRCH`.
+            // The group first: it holds the root too.
             LeftFront::GroupRoot => {
                 let mut why = super::Diagnosis::default();
                 if let Err(e) = crate::containment::kill_group_through_pidfd(pidfd.as_fd(), None) {
@@ -879,6 +883,13 @@ fn conclude<T: Spawned>(spawned: io::Result<T>, outcome: Outcome, front: LeftFro
                 let child_fate = super::teardown_through_pidfd_noting(None, pidfd, None, &mut why);
                 (error, child_fate)
             }
+            LeftFront::LeafHeld(leaf) => {
+                match pidfd.try_clone() {
+                    Ok(copy) => leaf.set(Some(copy)),
+                    Err(e) => log::debug!("a failed spawn's pidfd could not be copied for its cgroup leaf ({e})"),
+                }
+                (error, super::teardown_through_pidfd(None, pidfd, None))
+            }
             LeftFront::Here(_) | LeftFront::NotAFront => {
                 let child_fate = super::teardown_through_pidfd(None, pidfd, None);
                 (error, child_fate)
@@ -886,7 +897,6 @@ fn conclude<T: Spawned>(spawned: io::Result<T>, outcome: Outcome, front: LeftFro
         }
     };
     let not_started = |error| Err(SpawnFailure::NotStarted(error));
-    // The child was held and dealt with through its pidfd: the answer carries what became of it.
     let with_child = |cause, fate| Err(SpawnFailure::NotStartedWithChild { cause, fate });
     match (spawned, outcome) {
         (Ok(child), Outcome::Opened(pidfd)) => Ok(Held { child, pidfd }),
@@ -907,16 +917,20 @@ fn conclude<T: Spawned>(spawned: io::Result<T>, outcome: Outcome, front: LeftFro
             let fate = child.reap_unexecuted(pidfd);
             with_child(e, fate)
         }
+        // Not told to go either: it dies at its hook, if it has not yet, and is left to its reaper.
         (Ok(child), Outcome::Failed(e, None)) => {
             child.abandon_unreported(&format!("its pidfd could not be used ({e})"));
-            not_started(e)
+            with_child(e, ChildFate::Killed)
         }
         (Ok(child), Outcome::NoReport) => {
             let named = super::named(child.pid());
             child.abandon_unreported("it died before it sent its pidfd");
-            not_started(Error::Io(io::Error::other(format!(
-                "the spawned child ({named}) died before it could send its pidfd"
-            ))))
+            with_child(
+                Error::Io(io::Error::other(format!(
+                    "the spawned child ({named}) died before it could send its pidfd"
+                ))),
+                ChildFate::Killed,
+            )
         }
         // The spawn failed after the fork. std collects the child of a spawn it fails; tokio can
         // fail one after std's succeeded, and drops that child neither killed nor reaped.
@@ -945,38 +959,57 @@ fn conclude<T: Spawned>(spawned: io::Result<T>, outcome: Outcome, front: LeftFro
         (Ok(child), Outcome::Unwatched(cause)) => {
             let named = super::named(child.pid());
             child.abandon_unreported("it sent no pidfd, and its exit could not be watched");
-            not_started(Error::Io(io::Error::other(format!(
-                "the spawned child ({named}) sent no pidfd, and its exit could not be watched ({cause})"
-            ))))
+            with_child(
+                Error::Io(io::Error::other(format!(
+                    "the spawned child ({named}) sent no pidfd, and its exit could not be watched ({cause})"
+                ))),
+                ChildFate::Killed,
+            )
         }
         (Err(e), Outcome::NoReport | Outcome::Unwatched(_)) => not_started(Error::Io(e)),
     }
 }
 
 /// Blocks until the child `pidfd` names has exited, without reaping it: a child that never ran
-/// the program, and is dead or on its way out. Killed first, in case it is not.
+/// the program, and is dead or on its way out. Killed first, in case it is not. Says whether the
+/// kill was delivered: `false` for a child already reaped.
 #[cfg(feature = "tokio")]
-pub(crate) fn await_unexecuted_exit(pidfd: &OwnedFd, pid: Option<u32>) {
+pub(crate) fn await_unexecuted_exit(pidfd: &OwnedFd, pid: Option<u32>) -> bool {
     use std::os::fd::AsFd;
 
     use crate::wait::exit_only::{wait_visible_exit, Target};
 
     // It never execed, so it has this process's credentials: nothing but its being gone, which the
     // helper answers `Ok`, can refuse.
-    if let Err(e) = crate::signal::via_pidfd(Some(pidfd.as_fd()), pid.unwrap_or(0), crate::signal::Sig::Kill) {
-        log::warn!(
-            "{}: a spawned child that never ran could not be killed: {e}",
-            super::named(pid)
-        );
-        debug_assert!(false, "SIGKILL through a pidfd to an unexecuted child failed: {e}");
-    }
-    if let Err(e) = wait_visible_exit(&Target::PidFd(pidfd.as_fd())) {
+    let delivered = match crate::signal::via_pidfd(Some(pidfd.as_fd()), pid.unwrap_or(0), crate::signal::Sig::Kill) {
+        Ok(sent) => sent == crate::signal::Sent::Delivered,
+        Err(e) => {
+            log::warn!(
+                "{}: a spawned child that never ran could not be killed: {e}",
+                super::named(pid)
+            );
+            debug_assert!(false, "SIGKILL through a pidfd to an unexecuted child failed: {e}");
+            false
+        }
+    };
+    #[cfg(test)]
+    super::fault::run_between_kill_and_wait();
+    #[cfg(test)]
+    let injected = fault::take_unexecuted_wait_failure();
+    #[cfg(not(test))]
+    let injected: Option<Errno> = None;
+    let waited = match injected {
+        Some(errno) => Err(io::Error::from(errno)),
+        None => wait_visible_exit(&Target::PidFd(pidfd.as_fd())).map(drop),
+    };
+    if let Err(e) = waited {
         log::warn!(
             "{}: a spawned child that never ran could not be waited on: {e}",
             super::named(pid)
         );
-        debug_assert!(false, "waitid on an unexecuted child's pidfd failed: {e}");
+        debug_assert!(injected.is_some(), "waitid on an unexecuted child's pidfd failed: {e}");
     }
+    delivered
 }
 
 /// Warns that a child stays unreaped: without its pidfd its number cannot be trusted.

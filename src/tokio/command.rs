@@ -118,12 +118,11 @@ impl Command {
     /// reaped, without reporting its pid. On Linux the spawn's pidfd kills and reaps the root, and
     /// a child contained in a cgroup leaf ([`Containment::CgroupV2`](crate::Containment::CgroupV2))
     /// is killed with its leaf. On Linux 6.9+ a process-group or session root's whole group is
-    /// killed too, through the root's pidfd, while the group has a member, whoever reaped the root;
-    /// the send is also made to a child std had already collected, which finds no member. Below 6.9
-    /// the root alone is killed, and a `warn` says the group's members may be left running. An
-    /// elevation front is the exception: it is sent no signal of its own and no group kill, and is
-    /// reaped only if it had exited, as its error says; a cgroup leaf's kill still ends what is in
-    /// the leaf. Elsewhere this failure leaves the child running.
+    /// killed too, through the root's pidfd, while the group has a member, whoever reaped the root.
+    /// Below 6.9 the root alone is killed, and a `warn` says the group's members may be left
+    /// running. An elevation front is the exception: it is sent no signal of its own and no group
+    /// kill, and is reaped only if it had exited, as its error says; a cgroup leaf's kill still ends
+    /// what is in the leaf. Elsewhere this failure leaves the child running.
     pub fn contain(&mut self) -> &mut Command {
         self.inner.contain();
         self

@@ -1273,6 +1273,22 @@ fn cat_with_pidfd() -> (std::process::Child, OwnedFd) {
     (cat, pidfd)
 }
 
+/// [`cat_with_pidfd`], leading a process group of its own, so a kill of its group reaches nothing
+/// but it.
+fn group_leading_cat_with_pidfd() -> (std::process::Child, OwnedFd) {
+    use std::os::unix::process::CommandExt as _;
+
+    let cat = crate::test_spawn::spawn(
+        std::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .process_group(0),
+    )
+    .expect("spawn cat");
+    let pid = rustix::process::Pid::from_raw(cat.id() as i32).expect("a positive pid");
+    let pidfd = rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()).expect("pidfd_open");
+    (cat, pidfd)
+}
+
 /// A front tokio dropped after it ran the program is sent nothing and left, and the error says so.
 #[skuld::test]
 fn a_dropped_front_is_left_and_noted() {
@@ -1349,8 +1365,6 @@ fn a_not_started_failure_carries_the_fate_of_the_child_it_held() {
         crate::test_child::wait_until_zombie(cat.id());
         pidfd
     };
-    let ended = |fate: ChildFate| matches!(fate, ChildFate::Reaped | ChildFate::Killed);
-
     // Told no go, spawn failed, child killed on its way: torn down through its pidfd.
     let (_, fate) = super::conclude(
         Err::<NoChild, _>(io("gone")),
@@ -1360,7 +1374,7 @@ fn a_not_started_failure_carries_the_fate_of_the_child_it_held() {
     .err()
     .expect("the spawn fails")
     .expect_not_started_with_child();
-    assert!(ended(fate), "{fate:?}");
+    assert_eq!(fate, ChildFate::Reaped);
 
     // The helper failed after sending the pidfd.
     let (_, fate) = super::conclude(
@@ -1371,7 +1385,7 @@ fn a_not_started_failure_carries_the_fate_of_the_child_it_held() {
     .err()
     .expect("the spawn fails")
     .expect_not_started_with_child();
-    assert!(ended(fate), "{fate:?}");
+    assert_eq!(fate, ChildFate::Reaped);
 
     // No pidfd, so no child was held.
     for outcome in [Outcome::Failed(Error::Io(io("helper")), None), Outcome::NoReport] {
@@ -1380,6 +1394,89 @@ fn a_not_started_failure_carries_the_fate_of_the_child_it_held() {
             .expect("the spawn fails");
         assert!(matches!(failure, SpawnFailure::NotStarted(_)), "{failure:?}");
     }
+}
+
+/// A child `spawn` returned, whose teardown through its pidfd answers `.0`.
+struct Fated(ChildFate);
+
+impl super::Spawned for Fated {
+    const ERR_PROVES_NO_EXEC: bool = false;
+
+    fn pid(&self) -> Option<u32> {
+        Some(4)
+    }
+    fn reap_unexecuted(self, _: OwnedFd) -> ChildFate {
+        self.0
+    }
+    fn abandon_unreported(self, _: &str) {}
+}
+
+/// Any descriptor, for a [`Fated`] child's pidfd, which its teardown ignores.
+fn any_fd() -> OwnedFd {
+    std::fs::File::open("/dev/null").expect("open /dev/null").into()
+}
+
+/// A failure of a spawn that returned a child it held carries exactly the fate that child's
+/// teardown answered. Mutant: an arm that tears the child down drops or replaces its fate.
+#[skuld::test]
+fn a_returned_childs_failure_carries_its_teardowns_fate() {
+    let (_, fate) = super::conclude(
+        Ok(Fated(ChildFate::Gone)),
+        Outcome::Gone(any_fd()),
+        super::LeftFront::NotAFront,
+    )
+    .err()
+    .expect("the spawn fails")
+    .expect_not_started_with_child();
+    assert_eq!(fate, ChildFate::Gone);
+
+    let (_, fate) = super::conclude(
+        Ok(Fated(ChildFate::Killed)),
+        Outcome::Failed(Error::Io(std::io::Error::other("helper")), Some(any_fd())),
+        super::LeftFront::NotAFront,
+    )
+    .err()
+    .expect("the spawn fails")
+    .expect_not_started_with_child();
+    assert_eq!(fate, ChildFate::Killed);
+}
+
+/// A returned child whose pidfd never reached this process was never told to go, so it dies at its
+/// hook without running the program, and is left to its reaper: `Killed`, dead or dying with its
+/// exit not collected here. Mutant: these arms answer a plain `not started`, with no fate, so a
+/// leaf's abandonment hedges that the child may be left running.
+#[skuld::test]
+fn a_returned_child_with_no_pidfd_is_killed() {
+    for outcome in [
+        Outcome::Failed(Error::Io(std::io::Error::other("helper")), None),
+        Outcome::NoReport,
+        Outcome::Unwatched("forced".to_string()),
+    ] {
+        let (_, fate) = super::conclude(Ok(Fated(ChildFate::Reaped)), outcome, super::LeftFront::NotAFront)
+            .err()
+            .expect("the spawn fails")
+            .expect_not_started_with_child();
+        assert_eq!(fate, ChildFate::Killed);
+    }
+}
+
+/// A group root torn down after tokio's failure carries its teardown's fate: one killed on its way
+/// is reaped through its pidfd, after its group's kill. Mutant: the group root's arm drops or
+/// replaces the teardown's fate.
+#[skuld::test]
+fn a_group_roots_failure_carries_its_teardowns_fate() {
+    let (mut cat, pidfd) = group_leading_cat_with_pidfd();
+    cat.kill().expect("kill the child");
+    crate::test_child::wait_until_zombie(cat.id());
+    let (_, fate) = super::conclude(
+        Err::<NoChild, _>(std::io::Error::other("tokio failed")),
+        Outcome::Opened(pidfd),
+        super::LeftFront::GroupRoot,
+    )
+    .err()
+    .expect("the spawn fails")
+    .expect_may_have_started_with();
+    assert_eq!(fate, ChildFate::Reaped);
 }
 
 /// A dropped front whose pidfd cannot be peeked is taken to be there still: sent nothing, and left.

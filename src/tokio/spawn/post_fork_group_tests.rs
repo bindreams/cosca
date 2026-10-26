@@ -42,7 +42,6 @@ struct Failed {
     fate: ChildFate,
     steps: Vec<GroupStep>,
     member: Member,
-    /// The pid of the child tokio dropped.
     pid: u32,
     /// The records, at `warn` or above, that say a process group's members are left running.
     group_warns: Vec<String>,
@@ -138,8 +137,8 @@ fn below_6_9_sends_nothing_to_the_group(root: Root, container: Container) {
         fate,
         steps,
         member,
+        pid,
         group_warns,
-        ..
     } = failed;
     assert_eq!(fate, root.fate(), "{root:?}");
     assert_eq!(
@@ -163,9 +162,11 @@ fn below_6_9_sends_nothing_to_the_group(root: Root, container: Container) {
         "one warn says the members may be left running: {group_warns:?}"
     );
     // A root its leaf did not take is answered for by the leaf's abandonment, in its own words.
-    if !matches!(container, Container::LeafNotTaken) {
-        assert!(group_warns[0].contains(&left_running_note()), "{group_warns:?}");
-    }
+    let note = match container {
+        Container::LeafNotTaken => format!("could not kill an abandoned spawn's child's process group {pid}"),
+        Container::Session | Container::Leafless => left_running_note(),
+    };
+    assert!(group_warns[0].contains(&note), "{group_warns:?}");
 }
 
 #[skuld::test]
@@ -290,6 +291,41 @@ async fn cgroup_a_tokio_spawn_failing_after_its_fork_below_6_9_sends_nothing_to_
     below_6_9_sends_nothing_to_the_group(Root::Running, Container::LeafNotTaken);
 }
 
+/// Makes the next intent go with no handle on its child: both its `pidfd_open` and its `/proc/self`
+/// open fail. Only the forked child takes the flags; the guard clears this thread's.
+struct NoHandle;
+
+impl NoHandle {
+    fn arm() -> NoHandle {
+        crate::containment::cgroup::fault::set_force_child_pidfd_failure(true);
+        crate::containment::cgroup::fault::set_force_child_proc_dir_failure(true);
+        NoHandle
+    }
+}
+
+impl Drop for NoHandle {
+    fn drop(&mut self) {
+        crate::containment::cgroup::fault::take_force_child_pidfd_failure();
+        crate::containment::cgroup::fault::take_force_child_proc_dir_failure();
+    }
+}
+
+/// A root its leaf did not take, whose intent carried no handle on it, still has its group killed
+/// by the leaf's abandonment, through the handshake's pidfd. Mutant: the leaf gets no pidfd for a
+/// child that is not a front, so it cannot name the child and kills nothing.
+#[skuld::test]
+async fn cgroup_a_tokio_spawn_failing_after_its_fork_kills_the_group_of_a_root_its_leaf_did_not_take_and_cannot_name(
+    #[fixture(cgroup)] _cgroup: &Group,
+    #[fixture(pidfd_group_signal)] _group: &Group,
+) {
+    let no_handle = NoHandle::arm();
+    let (mode, placement) = Container::LeafNotTaken.arm();
+    let failed = failed_spawn(Root::Running, mode, (placement, no_handle));
+    assert_eq!(failed.fate, ChildFate::Reaped);
+    failed.member.assert_killed();
+    assert_eq!(failed.group_warns, Vec::<String>::new(), "the group was killed");
+}
+
 /// A `sudo`/`doas`-style front is sent nothing: a kill of its group would orphan the elevated
 /// program. So a spawn of one that fails after its fork sends the group no signal, though the group
 /// is its containment and has a live member. Mutant: `killing_group` drops its front check.
@@ -344,6 +380,43 @@ async fn a_tokio_spawn_failing_after_its_fork_whose_group_kill_is_refused_warns_
         group_warns[0].contains(&format!("could not kill the process group of {named}"))
             && group_warns[0].contains("may be left running"),
         "{group_warns:?}"
+    );
+}
+
+/// A group kill the kernel refuses for a reason other than the flag (`EPERM`, forced), sent to a
+/// child std collected because its exec failed: the `warn` says the child was reaped, so it may
+/// never have run the program. Mutant: the non-`EINVAL` refusal drops that.
+#[skuld::test]
+async fn a_tokio_exec_failure_whose_group_kill_is_refused_warns_that_the_reaped_child_may_never_have_run() {
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let refused = crate::containment::unix::fault::refuse_group_sends();
+    let mark = crate::log_capture::mark();
+    let mut cmd = crate::tokio::Command::new();
+    cmd.args(["cosca-no-such-program-142"]);
+    cmd.contain_with(crate::ContainMode::Session);
+    let (_err, fate) = crate::child::spawn::failure::expect_may_have_started_with(
+        cmd.spawn().expect_err("a missing program fails the spawn"),
+    );
+    drop(refused);
+    assert_eq!(fate, ChildFate::Gone, "std had collected the child whose exec failed");
+    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "the process group of")
+        .into_iter()
+        .filter(|(level, _)| *level <= log::Level::Warn)
+        .collect();
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    let named = crate::child::spawn::named(None);
+    assert!(
+        warns[0]
+            .1
+            .contains(&format!("could not kill the process group of {named}")),
+        "{warns:?}"
+    );
+    assert!(
+        warns[0]
+            .1
+            .contains("already reaped, so it may never have run the program"),
+        "{warns:?}"
     );
 }
 

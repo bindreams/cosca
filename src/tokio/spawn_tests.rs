@@ -256,8 +256,8 @@ fn drive_until_reaped(
 }
 
 /// A tokio spawn that fails after its fork, with no cgroup leaf, is torn down by the handshake's
-/// pidfd, and says so: the child was reaped, at `debug`. It never claims the child is left running
-/// or unreaped, and warns of nothing. Here the failure comes under a tree walk, which holds no leaf.
+/// pidfd, and says so: the child was reaped, at `debug`. Here the failure comes under a tree walk,
+/// which holds no leaf.
 ///
 /// Mutant: the abandonment warns that the child "was left running and nothing can reach it" or
 /// "may be left unreaped", or says nothing.

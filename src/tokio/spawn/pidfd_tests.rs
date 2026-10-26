@@ -2,15 +2,18 @@
 //! `child/spawn/pidfd_handshake_tests.rs`. A program that "ran" is told apart by its stdout, read
 //! to EOF after the command is dropped.
 
+use std::cell::Cell;
 use std::io::Read;
 use std::os::fd::OwnedFd;
+use std::rc::Rc;
 
 use rustix::io::Errno;
 
 use crate::child::spawn::failure::{expect_may_have_started_with, expect_not_started};
 use crate::child::spawn::pidfd_handshake::fault::{self, ChildFault};
-use crate::error::Error;
+use crate::error::{ChildFate, Error};
 use crate::stdio::Stdio;
+use crate::test_groups::{tracer_group, Group};
 use crate::tokio::Command;
 
 fn marker_command() -> (Command, std::io::PipeReader) {
@@ -106,11 +109,10 @@ async fn a_child_gone_before_its_go_ahead_fails_the_spawn_and_is_reaped() {
     assert!(!program_ran(cmd, reader));
 }
 
-/// With no cgroup leaf, a child the handshake reaped (it died before it was told to go) is not
-/// said to be left running or unreaped: the spawn logs, at `debug`, that its child was reaped.
+/// With no cgroup leaf, a child the handshake reaped before its go is logged at `debug` as reaped,
+/// not warned as left running.
 ///
-/// Mutant: the abandonment ignores the fate of a `not started` failure and hedges, at `warn`, that
-/// the child may be left running.
+/// Mutant: the abandonment hedges at `warn` despite the child's fate.
 #[skuld::test]
 async fn a_leafless_child_the_handshake_reaped_is_not_said_to_be_left_running() {
     crate::log_capture::install();
@@ -131,6 +133,129 @@ async fn a_leafless_child_the_handshake_reaped_is_not_said_to_be_left_running() 
         !said[0].1.contains("left running") && !said[0].1.contains("unreaped"),
         "{said:?}"
     );
+}
+
+/// With no cgroup leaf, a child that died before it sent its pidfd never ran the program, and tokio
+/// collects it: the spawn logs at `debug` what became of it.
+///
+/// Mutant: the arm answers a plain `not started`, with no fate, so the abandonment hedges at `warn`
+/// that the child may be left running.
+#[skuld::test]
+async fn a_leafless_child_dead_before_its_report_is_not_said_to_be_left_running() {
+    crate::log_capture::install();
+    let (mut cmd, _reader) = marker_command();
+    cmd.contain_with(crate::ContainMode::Session);
+    let armed = fault::arm_child_fault(ChildFault::Sigkill);
+    let mark = crate::log_capture::mark();
+    let err = cmd.spawn().err();
+    drop(armed);
+
+    err.expect("a child that never sent its pidfd must fail the spawn");
+    let said = crate::log_capture::records_since_on_current_thread(mark, "died before it could send its pidfd");
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert_eq!(said[0].0, log::Level::Debug, "{said:?}");
+    assert!(said[0].1.contains("its child was killed"), "{said:?}");
+}
+
+/// The fate a tokio spawn, contained by its session, that failed without running the program
+/// carries for the child its handshake held.
+fn fate_of_unexecuted() -> ChildFate {
+    let mut cmd = crate::Command::new();
+    cmd.args(["sh", "-c", "echo ran"]);
+    cmd.contain_with(crate::ContainMode::Session);
+    match super::spawn(&mut cmd) {
+        Ok(_) => panic!("a child that never ran the program must fail the spawn"),
+        Err(failure) => failure.expect_not_started_with_child().1,
+    }
+}
+
+/// A child reaped by another reaper after the handshake's kill was killed: the kill reached it,
+/// though its exit is lost.
+///
+/// Mutant: tokio's failed look after the kill is `Gone`, as if no kill had reached the child.
+#[skuld::test]
+async fn a_child_reaped_elsewhere_after_the_handshakes_kill_was_killed() {
+    let pid = Rc::new(Cell::new(None));
+    let armed = fault::arm_child_fault(ChildFault::SigkillAfterReport);
+    let held = fault::hold_verdict_until_spawn_returns({
+        let pid = Rc::clone(&pid);
+        move |p| pid.set(p)
+    });
+    let reaped = crate::child::spawn::fault::set_between_kill_and_wait({
+        let pid = Rc::clone(&pid);
+        move || crate::test_child::reaped_elsewhere::reap_behind(pid.get().expect("the child's pid"))
+    });
+    let fate = fate_of_unexecuted();
+    drop((reaped, held, armed));
+    assert_eq!(fate, ChildFate::Killed);
+}
+
+/// A child reaped by another reaper before the handshake's kill is `Gone`: no kill of cosca's
+/// reached it.
+///
+/// Mutant: tokio's failed look is `Killed` whether or not the kill was delivered.
+#[skuld::test]
+async fn a_child_reaped_elsewhere_before_the_handshakes_kill_is_gone() {
+    let armed = fault::arm_child_fault(ChildFault::SigkillAfterReport);
+    let held = fault::hold_verdict_until_spawn_returns(|pid| {
+        crate::test_child::reaped_elsewhere::reap_behind(pid.expect("the child's pid"));
+    });
+    let fate = fate_of_unexecuted();
+    drop((held, armed));
+    assert_eq!(fate, ChildFate::Gone);
+}
+
+/// A foreign tracer holds the zombie of a child that died before its go, and the handshake's wait
+/// for its exit fails (forced), so tokio finds it unexited: the handshake's kill reached it, and
+/// tokio collects it once the tracer lets go. With no cgroup leaf, the spawn logs that at `debug`.
+///
+/// Mutant: the tracer-held arm's fate is `Unknown`, so the abandonment hedges at `warn` that the
+/// child may be left running.
+#[skuld::test]
+async fn a_leafless_child_a_tracer_holds_after_the_handshakes_kill_is_not_said_to_be_left_running(
+    #[fixture(tracer_group)] _group: &Group,
+) {
+    use std::io::Write as _;
+    use std::os::fd::AsRawFd as _;
+
+    use crate::test_support::foreign_tracer::{self, EXIT};
+
+    crate::log_capture::install();
+    // Started first: the spawning thread holds `spawn_lock` until the child dies.
+    let mut tracer = foreign_tracer::spawn_unseized_helper();
+    let (mut ready_read, ready_write) = std::io::pipe().expect("ready pipe");
+    let (gate_read, mut gate_write) = std::io::pipe().expect("gate pipe");
+    let child_fault = ChildFault::TracedThenSigkillAfterReport {
+        ready: ready_write.as_raw_fd(),
+        gate: gate_read.as_raw_fd(),
+        parent_ends: [ready_read.as_raw_fd(), gate_write.as_raw_fd()],
+    };
+    // Opens the child's gate once the tracer holds the child; a panic here closes it, which the
+    // child reads as EOF.
+    let seizer = std::thread::spawn(move || {
+        let mut pid = [0u8; 4];
+        ready_read.read_exact(&mut pid).expect("the child's pid");
+        tracer.seize(u32::try_from(i32::from_ne_bytes(pid)).expect("a positive pid"));
+        gate_write.write_all(b"g").expect("open the child's gate");
+        tracer
+    });
+    let (mut cmd, _reader) = marker_command();
+    cmd.contain_with(crate::ContainMode::Session);
+    let armed = fault::arm_child_fault(child_fault);
+    let held = fault::hold_verdict_until_spawn_returns(|_| {});
+    let unwaited = fault::fail_unexecuted_wait(Errno::NOMEM);
+    let mark = crate::log_capture::mark();
+    let err = cmd.spawn().err();
+    drop((unwaited, held, armed, ready_write, gate_read));
+    let mut tracer = seizer.join().expect("the tracer seized the child");
+
+    err.expect("a child that never ran the program must fail the spawn");
+    let said = crate::log_capture::records_since_on_current_thread(mark, "died before exec");
+    tracer.send(EXIT);
+    tracer.finish();
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert_eq!(said[0].0, log::Level::Debug, "{said:?}");
+    assert!(said[0].1.contains("its child was killed"), "{said:?}");
 }
 
 /// tokio can fail a spawn after std's succeeded, so after the child's `exec`, and its error does not

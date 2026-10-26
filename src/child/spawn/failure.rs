@@ -15,8 +15,8 @@ pub(crate) enum SpawnFailure {
     /// The program did not start, and cosca has proved it.
     NotStarted(Error),
     /// As [`NotStarted`](Self::NotStarted), after the spawn forked a child it held and dealt with:
-    /// `fate` says what became of it. A leaf's abandonment, which runs after, can then say what
-    /// happened to the child instead of what may have.
+    /// `fate` is what became of it, so the leaf's abandonment, which runs after, can state it rather
+    /// than hedge.
     #[cfg(target_os = "linux")]
     NotStartedWithChild {
         /// What failed.

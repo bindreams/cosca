@@ -417,8 +417,8 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
         // the child then keeps. Its hook was registered first of all, so `fd_map`'s, which may
         // `dup2` a mapping onto the channel's descriptor number, runs after it is done.
         // A front spawned for a cgroup leaf is left to the leaf, which alone knows whether it holds
-        // the front, with the handshake's pidfd for a child the leaf cannot name (see
-        // `Handshake::leaving_front`).
+        // the front; any child spawned for one leaves the leaf the handshake's pidfd, or a copy,
+        // for a child the leaf cannot name (see `Handshake::leaving_front`).
         #[cfg(target_os = "linux")]
         let left_pidfd = crate::child::spawn::pidfd_handshake::LeftPidfd::default();
         #[cfg(target_os = "linux")]
@@ -951,23 +951,24 @@ impl crate::child::spawn::pidfd_handshake::Spawned for ::tokio::process::Child {
 
     /// Waits through the pidfd until the child is a zombie, then has tokio reap it at once.
     fn reap_unexecuted(mut self, pidfd: std::os::fd::OwnedFd) -> ChildFate {
-        crate::child::spawn::pidfd_handshake::await_unexecuted_exit(&pidfd, self.id());
+        let delivered = crate::child::spawn::pidfd_handshake::await_unexecuted_exit(&pidfd, self.id());
         match self.try_wait() {
             Ok(Some(_)) => ChildFate::Reaped,
-            // A tracer holds the zombie: tokio's drop hands it to its orphan queue.
+            // Killed, and its zombie not yet visible here (the wait for it failed, so a tracer may
+            // hold it): tokio's drop hands it to its orphan queue.
             Ok(None) => {
                 log::debug!(
-                    "{}: held by a tracer; left to tokio's reaper",
+                    "{}: not yet collectable; left to tokio's reaper",
                     crate::child::spawn::named(self.id())
                 );
-                ChildFate::Unknown
+                ChildFate::Killed
             }
             Err(e) => {
                 log::debug!(
-                    "{}: already reaped by someone else ({e})",
+                    "{}: reaped by someone else ({e})",
                     crate::child::spawn::named(self.id())
                 );
-                ChildFate::Gone
+                crate::wait::exit_only::Foreign::Gone.fate(delivered)
             }
         }
     }
@@ -1036,11 +1037,10 @@ fn abandoned_fate(child: crate::containment::AbandonedChild) -> ChildFate {
 /// told it who it is. The error cannot tell a failure before the fork from one after it, hence
 /// "may". Reported at `warn` every time, unless `ended` says the child is gone.
 ///
-/// `ended` is what the Linux handshake did with the child before the abandonment ran: it killed and
-/// reaped it through its pidfd, or found it reaped. The abandonment then says nothing of the child
-/// itself, which is not left running or unreaped, so that is logged at `debug` as what happened;
-/// only a descendant outside the leaf can still be out of reach. The fate of an elevation `front`
-/// the leaf found is noted on the error instead, as the spawn's other failures note it.
+/// `ended`: the handshake killed and reaped the child through its pidfd, or found it reaped. The
+/// child is then not at risk, so its fate is logged at `debug`; only an `OutOfReach` leaf still
+/// warns, of a descendant outside it. The fate of an elevation `front` the leaf found is noted on
+/// the error instead, as the spawn's other failures note it.
 fn warn_for_abandoned(child: &crate::containment::AbandonedChild, error: &Error, ended: Option<ChildFate>) {
     use crate::containment::AbandonedChild;
 
@@ -1122,8 +1122,8 @@ fn abandoned_after_handshake(
 ) -> SpawnFailure {
     use crate::containment::AbandonedChild;
 
-    // The handshake held the child unless it was a front left to the leaf; its fate says whether it
-    // ended the child, whether the spawn may have started or not.
+    // Except for a front left to the leaf, the handshake held the child; `ended_child` says whether
+    // it ended it.
     let ended = failure.ended_child().filter(|_| !left_to_leaf);
     warn_for_abandoned(&abandoned, failure.error(), ended);
     if !left_to_leaf {

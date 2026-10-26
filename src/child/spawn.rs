@@ -2419,9 +2419,8 @@ pub(crate) fn kill_group_before_teardown(
 
 /// Owes `why` a refused kill of the process group of `pid`'s root through its pidfd, which says the
 /// group's members may be left running. `reaped`: the root was already reaped, so it may never have
-/// run the program (std collects the child of an exec that failed). A failed exec is not told apart:
-/// a foreign reap after tokio's post-fork failure reaches the same state, and tokio does not say
-/// whether std's spawn failed, so both keep the warn.
+/// run the program. A std-collected failed exec cannot be told from a foreign reap (tokio does not
+/// report std's failure), so both warn.
 #[cfg(target_os = "linux")]
 pub(crate) fn note_refused_group_kill(pid: Option<u32>, refusal: nix::errno::Errno, reaped: bool, why: &mut Diagnosis) {
     let named = named(pid);
@@ -3152,8 +3151,8 @@ pub(crate) mod fault {
     }
 
     /// Run `hook` at the next kill-then-blocking-wait teardown on this thread, once the kill has
-    /// returned `Ok` and before the wait: `teardown_unadopted`, the sync `finish_elevated`, or the
-    /// async `wait_and_reap`. A fixture that only that kill would end is released here, so a
+    /// returned `Ok` and before the wait: `teardown_unadopted`, the sync `finish_elevated`, the
+    /// async `wait_and_reap`, or `await_unexecuted_exit`. A fixture that only that kill would end is released here, so a
     /// no-kill mutant fails an assertion on how the child died (see [`record_teardown_reaps`])
     /// instead of hanging the wait.
     pub(crate) fn set_between_kill_and_wait(hook: impl FnOnce() + 'static) -> ArmedBetweenKillAndWait {

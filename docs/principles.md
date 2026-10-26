@@ -131,11 +131,8 @@ checked against the root's state, and send nothing once that check fails. The cl
 abandoned spawn does the same while its child is unreaped, and sends the group of a reaped child
 nothing. The cleanups of a spawn that fails at its identity read and of a tokio spawn that fails
 after its fork send the group nothing, whatever the root's state. These last three `warn` once that
-members of the root's process group may be left running. Each names the root's pid where it is
-known: the tokio cleanup, which never has it, says "the spawned child". The abandoned spawn's warn
-adds that the child was already reaped; the tokio cleanup's, for a child already reaped, that the
-child may never have run the program. On macOS, which has no exact kill of a group, the cleanup of a
-group root whose spawn fails at its identity read warns the same.
+members of the root's process group may be left running. On macOS, which has no exact kill of a
+group, the cleanup of a group root whose spawn fails at its identity read warns the same.
 On 6.9+ a member's resend still goes by its pid when the member's own `pidfd_open` fails (`EMFILE`,
 say), right after a check of its identity. Below 6.9 and on macOS a reaper elsewhere in the process
 can reap the root between the check and a send by its number, which then reaches whoever holds it: a
