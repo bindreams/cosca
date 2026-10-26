@@ -67,6 +67,18 @@ fn spawn_marker_holder(script: &str) -> (crate::Child, std::io::PipeReader, std:
     (child, marker, stdin)
 }
 
+/// Kill a holder that only a kill ends, release what it blocks on, reap it, and assert the
+/// kill's own signature (`SIGKILL`). Releasing AFTER the kill makes a `kill` that sends nothing
+/// fail the status assertion, not hang the `wait` on a holder that has nothing to end it.
+///
+/// `held` is what the holder blocks on and the test keeps: its stdin writer (`cat` exits `0` on
+/// EOF) or the marker read end (`yes` then dies of `SIGPIPE`). Dropped right after the kill.
+fn kill_release_reap<T>(child: crate::Child, held: T) {
+    child.kill().expect("kill the holder");
+    drop(held);
+    crate::test_child::assert_killed("the holder", child.wait().expect("reap the holder"));
+}
+
 /// The `FIONREAD` ioctl: how many bytes are currently buffered and unread on `fd`. Exact,
 /// kernel-reported — used to prove a drain did or did not happen, rather than inferring it
 /// from a verdict that reports the same thing (`MembersRemain`) either way.
@@ -121,7 +133,8 @@ fn drain_kqueue_reports_declined_for_a_full_pipe_and_leaves_its_bytes() {
     cmd.fd(0, crate::Stdio::pipe_in()).expect("stdin pipe");
     cmd.fd(3, crate::Stdio::from_file(std::fs::File::from(OwnedFd::from(marker_w))))
         .expect("marker pipe");
-    let child = cmd.spawn().expect("spawn /bin/sh");
+    let mut child = cmd.spawn().expect("spawn /bin/sh");
+    let stdin = child.fd_write_end(crate::Fd::STDIN).expect("stdin write end");
 
     let kq = arm(marker_r.as_fd(), false).expect("arm");
     let outcome = drain_kqueue(&kq, marker_r.as_fd(), true).expect("drain_kqueue");
@@ -136,8 +149,7 @@ fn drain_kqueue_reports_declined_for_a_full_pipe_and_leaves_its_bytes() {
     );
 
     // Killed through the `Child` handle before it is reaped (`docs/principles.md` §10).
-    child.kill().expect("kill the holder");
-    child.wait().expect("reap");
+    kill_release_reap(child, stdin);
 }
 
 #[skuld::test]
@@ -743,7 +755,8 @@ async fn async_wait_never_drains_past_the_low_water_clamp() {
         crate::Stdio::from_file(std::fs::File::from(std::os::fd::OwnedFd::from(marker_w))),
     )
     .expect("marker pipe");
-    let child = cmd.spawn().expect("spawn /bin/sh");
+    let mut child = cmd.spawn().expect("spawn /bin/sh");
+    let stdin = child.fd_write_end(crate::Fd::STDIN).expect("stdin write end");
     let fd = marker_r.as_fd();
     assert_eq!(
         child.try_wait().expect("try_wait"),
@@ -803,6 +816,5 @@ async fn async_wait_never_drains_past_the_low_water_clamp() {
 
     // A single child, killed through the `Child` handle cosca returned, before that handle
     // reaps it — `docs/principles.md` §10's own exemption.
-    child.kill().expect("kill the holder");
-    child.wait().expect("reap");
+    kill_release_reap(child, stdin);
 }
