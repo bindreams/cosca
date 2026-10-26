@@ -4,6 +4,7 @@
 use super::*;
 use crate::elevation::shim::link::probe::LinkEvent;
 use crate::elevation::shim::protocol::Command;
+use rustix::io::Errno;
 
 #[skuld::test]
 fn a_shipped_shim_starts_the_program_and_reports_its_exit() {
@@ -27,7 +28,14 @@ fn a_shipped_shim_takes_p_for_a_protocol_violation() {
     rig.link.expect_event(LinkEvent::Accepted);
     rig.link.expect_event(LinkEvent::Answered(Command::Allow));
     rig.link.link.send_control(b'P').unwrap();
-    rig.link.link.send_control(b'T').unwrap();
+    // The shim may have closed the link by now, so the `T` is either delivered to a shim about to
+    // close or refused by one that has. The verdict below is the same either way, and a shim that
+    // took `P` for a ping would end the program with SIGTERM here.
+    let sent = rig.link.link.send_control(b'T');
+    assert!(
+        matches!(sent, Ok(()) | Err(Errno::PIPE | Errno::CONNRESET | Errno::NOTCONN)),
+        "{sent:?}"
+    );
     assert_eq!(rig.link.link.wait().unwrap(), LinkOutcome::Exited(libc::SIGKILL));
     assert_eq!(run.finish().code, Some(128 + libc::SIGKILL));
 }
