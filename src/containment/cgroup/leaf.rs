@@ -1143,10 +1143,12 @@ impl CgroupLeaf {
 /// its number has been reused since. An intent with no handle names nothing cosca may signal.
 ///
 /// A child that reported a failed placement exec'd outside the leaf, so what it forked is reached
-/// only as the process group it leads, killed by number after one look at the child through its
-/// handle and before the handle's kill. A reap by another reaper after that look is not seen, and
-/// the number may then name another group. A child in the leaf is killed with the leaf, and one
-/// that never reported never exec'd, so neither is sent anything by number.
+/// only as the process group it leads, killed before the handle's kill: through the handle, which
+/// names the group exactly, and by its number only where the kernel refuses that (before Linux
+/// 6.9), right after a check that the child is still unreaped. A reap by another reaper between
+/// that check and the kill is not seen, and the number may then name another group. A child in the
+/// leaf is killed with the leaf, and one that never reported never exec'd, so neither is sent
+/// anything by number.
 ///
 /// A child its handle may not signal (`EPERM`) is handed to a background reaper, so it is reaped
 /// once it exits, however that comes.

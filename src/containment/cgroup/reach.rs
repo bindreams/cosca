@@ -433,9 +433,12 @@ fn fork_probe(parent: libc::pid_t, dumpable: bool) -> io::Result<Probe> {
     })
 }
 
-/// A pidfd for `pid`, a child this process just forked, shown to name it: a pidfd that can be waited
-/// on names a child of this process, and the child pauses until killed, so it is still unreaped. If
-/// that cannot be shown, the child is left alone: nothing is sent by its number.
+/// A pidfd for `pid`, a child this process just forked, opened by that number and shown to name an
+/// unreaped child of this process: a pidfd that can be waited on names one. That child is the probe
+/// unless the probe was killed from outside and reaped by another reaper in the process before
+/// `pidfd_open`, and another child of this process took its pid; the probe's kill and reap then reach
+/// that child. Obtaining the pidfd from the fork itself would close this. If no child can be shown,
+/// nothing is sent by the number.
 fn own_child_pidfd(pid: libc::pid_t) -> io::Result<OwnedFd> {
     use rustix::process::{pidfd_open, waitid, Pid, PidfdFlags, WaitId, WaitIdOptions};
     let raw = Pid::from_raw(pid).ok_or_else(|| io::Error::other(format!("fork returned pid {pid}")))?;

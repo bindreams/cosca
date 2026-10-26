@@ -594,11 +594,11 @@ fn reconfirm_survivor(outcome: MemberOutcome, recheck: impl FnOnce() -> crate::i
 /// this pid specifically.
 ///
 /// **The group's number, and each resend.** The listing names members by `pgid`, a number that
-/// stays the root's group only while the root is unreaped (or its pid is free after this handle's
-/// own reap). Each `SIGKILL` resend therefore runs right after its own check of the root
-/// ([`GroupRoot::check`]), and a member whose check fails is unassessable, not signalled. A reap of
-/// the root by another reaper in the process between that check and the resend is not seen: the
-/// window `Child::kill_tree` documents.
+/// stays the root's group only while the group has a member: on Linux 6.9+ the root's pidfd shows
+/// that exactly, and elsewhere the root's state stands in for it (unreaped, or its pid free after
+/// this handle's own reap). Each `SIGKILL` resend therefore runs right after its own check of the
+/// root ([`GroupRoot::check`]), and a member whose check fails is unassessable, not signalled. A
+/// change between that check and the resend is not seen: the window `Child::kill_tree` documents.
 pub(crate) fn converge(pgid: i32, signal: Signal, root: &GroupRoot<'_>) -> std::io::Result<GroupState> {
     let listed = members(pgid)?;
     #[cfg(test)]

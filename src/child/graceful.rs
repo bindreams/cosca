@@ -255,8 +255,9 @@ impl Child {
     /// A refused Linux `pidfd_open` while watching the root is `Unsupported` (see [`Error::Unsupported`](crate::error::Error::Unsupported)); it is a
     /// watch failure, so the sweep still runs.
     ///
-    /// **A root reaped by something else** (see [`kill_tree`](Child::kill_tree)): nothing goes out by
-    /// the root's number, and the call ends with one `warn` and
+    /// **A root reaped by something else** (see [`kill_tree`](Child::kill_tree)): on Linux 6.9+ a
+    /// process group that still has a member is shut down through the root's pidfd as usual, and one
+    /// with none left has nothing to shut down. Otherwise nothing goes out by the root's number, and the call ends with one `warn` and
     /// [`Error::Unassessable`](crate::error::Error::Unassessable), with no sweep. A macOS fd marker's
     /// holders, named by the pipe they hold, still get the `SIGTERM`, the grace, and a kill of any
     /// left, whose error is returned if it fails; any other mechanism ends at once, with no grace.
@@ -265,8 +266,8 @@ impl Child {
     /// is still running; nothing goes out by its number, and the call ends the same way.
     /// After this handle's own reap, with another process at the pid, the group is empty: only the
     /// holders get the `SIGTERM`, and the call goes on as usual. The `SIGTERM` and the sweep each
-    /// decide on a look of their own at the root, and each has `kill_tree`'s window between its look
-    /// and its sends: a reap after the look by another reaper is not seen.
+    /// decide on a look of their own at the root, and each send by the group's number after it checks
+    /// the root again right before it, as for `kill_tree`.
     ///
     /// **macOS, a root the handle cannot vouch for** is signalled as for
     /// [`terminate_tree`](Child::terminate_tree) and swept as for [`kill_tree`](Child::kill_tree). A

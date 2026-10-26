@@ -93,8 +93,8 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
 ///
 /// A reaped root's number may name another process by now, so the tree kill is skipped when it
 /// would name the tree by that number (a process group, a ppid walk), and the note says so. This is
-/// decided on one look at the root: a reap by another reaper after it is not seen, and the tree
-/// kill then goes to a number another process may hold.
+/// decided on one look at the root; each send by the group's number after it checks the root again
+/// right before it, as for [`Child::kill_tree`].
 ///
 /// A live front outside a cgroup (see [`Child::kill`]) is signalled by neither kill: the root's
 /// kill is the typed `Unkillable`, and the note says so. A front that had already exited is reaped,

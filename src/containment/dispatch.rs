@@ -633,9 +633,9 @@ impl Attached {
     /// that reused the number. A macOS fd marker still sweeps its marker holders, which are named
     /// by identity. Cgroup and Job Object never skip.
     ///
-    /// `view` is one look at the root, taken right before this call: a reap by another reaper
-    /// after it is not seen, and what is sent by the number then goes to a number another process
-    /// may hold.
+    /// `view` is one look at the root, taken right before this call. Each send by the group's number
+    /// after it checks the root again right before it
+    /// ([`GroupRoot::check`](crate::containment::GroupRoot::check)).
     ///
     /// The same skip when the root's own handle could not say whether it is reaped
     /// (`RootState::Unknown`): nothing then shows the number still names the root.

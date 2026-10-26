@@ -503,8 +503,9 @@ impl Command {
     /// longer reading as the root. If the handle cannot say (a failed peek), the same kills are
     /// skipped and a warning says so; the root itself is still killed through its handle. This is
     /// decided on one look at the root, as is the cleanup of an elevated spawn whose password could
-    /// not be written: a reap by another reaper after it is not seen, and a kill by the number then
-    /// goes to a number another process may hold.
+    /// not be written. Each send by the group's number after that look checks the root again right
+    /// before it, and nothing goes out once the check fails; a reap by another reaper between a
+    /// check and its send is not seen (see [`kill_tree`](crate::Child::kill_tree)).
     ///
     /// **On macOS, a root whose zombie launchd holds** (its tracer died, so this process no longer
     /// pins its pid) is neither signalled, waited for nor reaped by the drop, which logs one `warn`

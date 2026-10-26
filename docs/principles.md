@@ -114,12 +114,17 @@ child is ours leaks the child with a `warn` naming the pid; it never reaps on a 
 doesn't do this yet either ([#341]).
 
 Where a group ID must be used (process-group or fd-marker containment), keep the root an unreaped
-zombie until the group kill is done. On Linux 6.9+ the group is signalled through the root's pidfd
-(`PIDFD_SIGNAL_PROCESS_GROUP`), which names it exactly; cosca detects the flag by acting, and an
-older kernel's `EINVAL` falls back to the group's number. Below 6.9 and on macOS a reaper elsewhere
-in the process can reap the root between the check and a send by its number, which then reaches
-whoever holds it: a standing property of process-group and fd-marker containment. A program with
-such a reaper should use cgroup containment.
+zombie until the group kill is done. On Linux 6.9+ the root's pidfd names its group exactly, whoever
+reaped the root: the group is signalled through it (`PIDFD_SIGNAL_PROCESS_GROUP`), and a signal-0
+send through it shows whether the group still has a member; while it has one, its number cannot be
+reissued. So a tree call still signals the group of a root reaped elsewhere, and that signal-0 send
+is the check before each send by the group's number. cosca detects the flag by acting, and an older
+kernel's `EINVAL` falls back to the group's number, checked against the root's state. On 6.9+ a
+member's resend still goes by its pid when the member's own `pidfd_open` fails (`EMFILE`, say),
+right after a check of its identity. Below 6.9 and on macOS a reaper elsewhere in the process can
+reap the root between the check and a send by its number, which then reaches whoever holds it: a
+standing property of process-group and fd-marker containment. A program with such a reaper should
+use cgroup containment.
 
 Where a check of a PID cannot be made atomic with its use, keep the window as small as it can be:
 check and use are two back-to-back actions. Every send by number has its own check right before it,
@@ -148,9 +153,10 @@ debug-asserts on it.
 After a foreign reap:
 
 - On Linux, cgroup plus pidfd stays exact; only the exit status is lost.
-- Process-group kills, and an fd marker's kills by the root's number (its group and its ppid walk),
-  are unsafe (principle 4). The marker's holders are named by the pipe they hold and are still
-  killed exactly.
+- On Linux 6.9+ a tree call's process-group kill stays exact through the root's pidfd
+  (principle 4). Below 6.9 and on macOS, process-group kills, and an fd marker's kills by the root's
+  number (its group and its ppid walk), are unsafe. The marker's holders are named by the pipe they
+  hold and are still killed exactly.
 - macOS has no pidfd, and cosca has no exact kill there.
 
 **Why:** a library cannot require the whole process to leave its children alone, and processes that
