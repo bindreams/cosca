@@ -488,20 +488,33 @@ async fn a_root_whose_kill_fails_is_handed_off_not_waited_on() {
 /// `Child` its own drop, so tokio's orphan handling owns the reap (principle 3).
 ///
 /// Sequenced on the root's pidfd, opened before the drop, so it names that process whatever
-/// happens to its number. The loop yields to the runtime, which does the reaping, and re-checks a
-/// condition that becomes true; its expiry proves nothing. A root that is never reaped hangs it,
-/// which the nextest override on this test turns into a failure.
+/// happens to its number. The root's stdin is closed only after the drop, and the root must have died
+/// of `SIGKILL` (as `a_kill_on_drop_drop_kills_the_root` reads it), so a drop that killed nothing
+/// fails there instead of hanging the loop below. The loop yields to the runtime, which does the
+/// reaping, and re-checks a condition that becomes true; its expiry proves nothing. A root that is
+/// never reaped hangs it, which the nextest override on this test turns into a failure.
 ///
 /// Mutant: `OsResources::release_without_waiting` forgets the backend instead of dropping it.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn a_dropped_root_left_to_tokio_is_reaped() {
-    let (child, _stdin) = blocker();
+    if !alone(fixture_path!(a_dropped_root_left_to_tokio_is_reaped)) {
+        return;
+    }
+    let (child, stdin, _stdout) = ignoring_blocker().await;
     let root = linux::Pidfd::of(&child);
     let backend_drops = fault::count_backend_drops();
     drop(child);
     // Fails at once for a backend that was forgotten, before the loop could wait on it.
     assert_eq!(backend_drops.get(), 1, "the drop must hand tokio its own Child to drop");
+    let ended = root.ended_after_closing(stdin);
+    assert!(
+        matches!(
+            ended,
+            linux::Ended::Signalled(libc::SIGKILL) | linux::Ended::ReapedWhileStdinOpen
+        ),
+        "the drop must kill the root with SIGKILL, got {ended:?}"
+    );
     while !root.reaped() {
         tokio::task::yield_now().await;
     }

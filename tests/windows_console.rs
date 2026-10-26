@@ -278,6 +278,9 @@ fn lone_graceful_ops_report_no_console_from_a_console_less_caller() {
         "graceful_shutdown must fail before signalling, never after hard-killing: {r}"
     );
     assert_eq!(field(&r, "cleanup"), "Ok", "hard teardown needs no console: {r}");
+    // The acker leaves with exit code 1 when killed and 0 when the helper lets go of its socket,
+    // so a `kill` that sends nothing fails here instead of hanging the helper's reap.
+    assert_eq!(field(&r, "cleanup_exit"), "1", "kill must kill the root: {r}");
 }
 
 #[path = "../src/test_harness.rs"]

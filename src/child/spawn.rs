@@ -2695,7 +2695,10 @@ fn kill_unadopted(child: &mut impl Unadopted) -> std::io::Result<()> {
     if let Some((marker, kind, alive)) = fault::take_force_kill_failure() {
         if !alive {
             child.kill()?;
-            child.wait()?;
+            // A fixture only that kill would end is released here.
+            fault::run_between_kill_and_wait();
+            let status = child.wait()?;
+            fault::record_teardown_reap(child.pid().unwrap_or(0), status);
         }
         return Err(std::io::Error::new(kind, marker));
     }
@@ -3068,7 +3071,7 @@ pub(crate) mod fault {
 
     /// Run `hook` at the next kill-then-blocking-wait teardown on this thread, once the kill has
     /// returned `Ok` and before the wait: `teardown_unadopted`, the sync `finish_elevated`, or the
-    /// async `wait_and_reap`. A fixture that only that kill would end is released here, so a
+    /// async `wait_and_reap` and `teardown_through_pidfd`. A fixture that only that kill would end is released here, so a
     /// no-kill mutant fails an assertion on how the child died (see [`record_teardown_reaps`])
     /// instead of hanging the wait.
     pub(crate) fn set_between_kill_and_wait(hook: impl FnOnce() + 'static) -> ArmedBetweenKillAndWait {
@@ -3203,6 +3206,30 @@ pub(crate) mod fault {
         pub(crate) fn recorded(&self) -> Vec<TeardownReap> {
             TEARDOWN_REAPS.with(|r| r.borrow().clone().unwrap_or_default())
         }
+
+        /// At least one child was reaped, and each died of `SIGKILL` (Unix) or exit code 1
+        /// (Windows): killed by the teardown, not merely reaped once it exited on its own.
+        pub(crate) fn assert_killed(&self) {
+            let reaps = self.recorded();
+            assert!(!reaps.is_empty(), "the teardown must have reaped the child");
+            for (pid, status) in reaps {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt as _;
+                    assert_eq!(
+                        status.signal(),
+                        Some(libc::SIGKILL),
+                        "pid {pid} must be SIGKILLed by its teardown kill, not merely reaped once it exits on its own: {status:?}"
+                    );
+                }
+                #[cfg(windows)]
+                assert_eq!(
+                    status.code(),
+                    Some(1),
+                    "pid {pid} must be terminated by its teardown kill (`TerminateProcess` exits 1), not merely reaped once it exits on its own: {status:?}"
+                );
+            }
+        }
     }
     impl Drop for TeardownReaps {
         fn drop(&mut self) {
@@ -3225,24 +3252,47 @@ pub(crate) mod fault {
         let reader = std::os::fd::OwnedFd::from(reader);
         #[cfg(windows)]
         let reader = std::os::windows::io::OwnedHandle::from(reader);
-        let fired = std::rc::Rc::new(std::cell::Cell::new(false));
-        let release = set_between_kill_and_wait({
-            let fired = std::rc::Rc::clone(&fired);
-            move || {
-                drop(writer);
-                fired.set(true);
-            }
-        });
-        let reaps = record_teardown_reaps();
         (
             crate::stdio::Stdio::from_file(std::fs::File::from(reader)),
-            TeardownBlocker {
-                _release: release,
-                #[cfg(any(not(target_os = "macos"), feature = "tokio"))]
-                fired,
-                reaps,
-            },
+            release_between_kill_and_wait(writer),
         )
+    }
+
+    /// [`teardown_blocker_stdin`] for a child a test already spawned: `held`, whatever only a kill
+    /// ends the child without (its stdin writer, a control socket), is dropped between the code
+    /// under test's kill and its blocking wait, and the reaps it makes are recorded. Arm it before
+    /// the code under test runs and keep the guard through [`TeardownBlocker::assert_killed`].
+    pub(crate) fn release_between_kill_and_wait(held: impl Sized + 'static) -> TeardownBlocker {
+        let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+        let release = set_between_kill_and_wait(release_hook(held, &fired));
+        TeardownBlocker {
+            _release: release,
+            fired,
+            reaps: record_teardown_reaps(),
+        }
+    }
+
+    /// [`release_between_kill_and_wait`] for the sync `Child`'s kill-on-drop teardown, whose root
+    /// kill is followed by a blocking wait inside `drop`: `held` is dropped once that kill returned.
+    pub(crate) fn release_at_drop_kill(held: impl Sized + 'static) -> TeardownBlocker {
+        let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+        let release = crate::graceful_hooks::at(
+            crate::graceful_hooks::HookPoint::AfterDropKill,
+            release_hook(held, &fired),
+        );
+        TeardownBlocker {
+            _release: release,
+            fired,
+            reaps: record_teardown_reaps(),
+        }
+    }
+
+    fn release_hook(held: impl Sized + 'static, fired: &std::rc::Rc<std::cell::Cell<bool>>) -> impl FnOnce() + 'static {
+        let fired = std::rc::Rc::clone(fired);
+        move || {
+            drop(held);
+            fired.set(true);
+        }
     }
 
     /// Everything a test needs to configure a [`teardown_blocker_stdin`] child on either
@@ -3276,7 +3326,6 @@ pub(crate) mod fault {
     #[must_use]
     pub(crate) struct TeardownBlocker {
         _release: ArmedBetweenKillAndWait,
-        #[cfg(any(not(target_os = "macos"), feature = "tokio"))]
         fired: std::rc::Rc<std::cell::Cell<bool>>,
         reaps: TeardownReaps,
     }
@@ -3289,31 +3338,29 @@ pub(crate) mod fault {
 
         /// The teardown's kill fired the release hook, and every child it reaped died of
         /// `SIGKILL` (Unix) or exit code 1 (Windows).
-        #[cfg(any(not(target_os = "macos"), feature = "tokio"))]
         pub(crate) fn assert_killed(&self) {
             assert!(
                 self.fired.get(),
-                "the teardown must have reached its between-kill-and-wait hook"
+                "the teardown must have reached its release hook (the kill returned)"
             );
-            let reaps = self.reaps.recorded();
-            assert!(!reaps.is_empty(), "the teardown must have reaped the child");
-            for (pid, status) in reaps {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::process::ExitStatusExt as _;
-                    assert_eq!(
-                        status.signal(),
-                        Some(libc::SIGKILL),
-                        "pid {pid} must be SIGKILLed by its teardown kill, not merely reaped once it exits on its own: {status:?}"
-                    );
-                }
-                #[cfg(windows)]
-                assert_eq!(
-                    status.code(),
-                    Some(1),
-                    "pid {pid} must be terminated by its teardown kill (`TerminateProcess` exits 1), not merely reaped once it exits on its own"
-                );
-            }
+            self.reaps.assert_killed();
+        }
+
+        /// The release hook fired: the teardown's kill returned. For a teardown whose reap the kernel
+        /// did (no status to read).
+        #[cfg(target_os = "macos")]
+        pub(crate) fn assert_released(&self) {
+            assert!(
+                self.fired.get(),
+                "the teardown must have reached its release hook (the kill returned)"
+            );
+        }
+
+        /// [`assert_killed`](Self::assert_killed) without requiring the release hook to have fired,
+        /// for a teardown whose own kill may find the child already dying (a job object's close).
+        #[cfg(windows)]
+        pub(crate) fn assert_reaps_killed(&self) {
+            self.reaps.assert_killed();
         }
     }
 

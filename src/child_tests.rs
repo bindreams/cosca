@@ -143,9 +143,13 @@ fn drop_warns_instead_of_asserting_on_a_real_teardown_mechanism_failure() {
     });
 
     let mut cmd = crate::Command::new();
-    cmd.args(["sleep", "30"]);
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     // The override is consumed by this spawn; `kill_on_drop` defaults to true.
-    let child = cmd.spawn().expect("spawn");
+    let mut child = cmd.spawn().expect("spawn");
+    // Released once the drop's root kill has returned: the drop blocks until the root is reaped.
+    let stdin = child.stdin().expect("piped stdin");
+    let blocker = crate::child::spawn::fault::release_at_drop_kill(stdin);
 
     // Pin that the forced failure is the mechanism class this test claims (a raw `EISDIR` from
     // the `cgroup.kill` write, surfaced as `Error::Io`), so it cannot go vacuous if the forcing
@@ -170,6 +174,7 @@ fn drop_warns_instead_of_asserting_on_a_real_teardown_mechanism_failure() {
         unwound.is_ok(),
         "Child::drop must not panic on a real teardown-mechanism failure: {unwound:?}"
     );
+    blocker.assert_killed();
 
     // `Drop` logs on the dropping thread (the tree kill runs there before any reaper hand-off),
     // so the current-thread scan sees exactly its record.

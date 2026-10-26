@@ -17,7 +17,9 @@ fn a_failed_identity_peek_is_unknown_and_kills_and_reaps_the_child() {
     use std::rc::Rc;
 
     crate::log_capture::install();
-    let (stdin, _writer) = crate::test_child::held_writer_stdin();
+    // Released once the teardown's kill returned, so a kill that sent nothing fails the SIGKILL
+    // assertion below instead of hanging the reap.
+    let (stdin, teardown) = fault::teardown_blocker_stdin();
     let mut cmd = crate::Command::new();
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
@@ -32,7 +34,6 @@ fn a_failed_identity_peek_is_unknown_and_kills_and_reaps_the_child() {
             ))])));
         }
     });
-    let reaps = fault::record_teardown_reaps();
     let mark = crate::log_capture::mark();
 
     let outcome = cmd.spawn();
@@ -58,7 +59,7 @@ fn a_failed_identity_peek_is_unknown_and_kills_and_reaps_the_child() {
         warns[0].contains("could not be checked against its handle (forced identity-check failure 3b7e)"),
         "the failed peek is warned, naming its own error: {warns:?}"
     );
-    let recorded = reaps.recorded();
+    let recorded = teardown.recorded();
     assert_eq!(
         recorded.len(),
         1,
@@ -92,7 +93,8 @@ fn a_failed_identity_peek_and_a_refused_kill_share_one_warn() {
     use std::rc::Rc;
 
     crate::log_capture::install();
-    let (stdin, _writer) = crate::test_child::held_writer_stdin();
+    // The seam kills the child and reaps it: released once its kill returned.
+    let (stdin, teardown) = fault::teardown_blocker_stdin();
     let mut cmd = crate::Command::new();
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
@@ -128,4 +130,5 @@ fn a_failed_identity_peek_and_a_refused_kill_share_one_warn() {
             && warns[0].contains("failed to kill"),
         "the one warn names the failed check and the refused kill: {warns:?}"
     );
+    teardown.assert_killed();
 }

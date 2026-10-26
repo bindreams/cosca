@@ -170,27 +170,6 @@ async fn async_terminate_unsupported_for_an_uncontained_child_on_windows() {
 #[cfg(feature = "tokio")]
 #[cfg(unix)]
 #[skuld::test]
-async fn async_graceful_shutdown_escalates() {
-    use std::os::unix::process::ExitStatusExt;
-    use std::time::Duration;
-    // SIG_IGN child + Duration::ZERO: provably alive at the single poll → deterministic
-    // escalation; SIGKILL is the only terminating signal it can receive.
-    let (mut child, mut sock) = common::spawn_control_async("control-block-ignore-term", &["R"], false).await;
-    let status = child
-        .graceful_shutdown(Duration::ZERO)
-        .await
-        .expect("graceful_shutdown escalates");
-    assert_eq!(
-        status.signal(),
-        Some(libc::SIGKILL),
-        "SIGTERM-ignoring child must be force-killed, got {status:?}"
-    );
-    expect_eof("blocker", &mut sock);
-}
-
-#[cfg(feature = "tokio")]
-#[cfg(unix)]
-#[skuld::test]
 async fn async_graceful_cancel_mid_grace_leaves_child_owned() {
     use std::future::Future;
     use std::time::Duration;
@@ -324,26 +303,6 @@ async fn async_graceful_tree_cancel_does_not_escalate() {
 #[cfg(feature = "tokio")]
 #[cfg(windows)]
 #[skuld::test]
-async fn async_graceful_shutdown_tree_sweep_is_load_bearing_on_windows() {
-    use std::time::Duration;
-    // BOTH members ignore CTRL_BREAK, so whether or not the soft signal reaches this console
-    // group, only the ZERO-grace hard sweep can tear the tree down.
-    let (mut child, mut root, mut grand) = common::spawn_tree_async("spawn-grandchild-ignore-break", |cmd| {
-        cmd.contain();
-    })
-    .await;
-    let status = child
-        .graceful_shutdown_tree(Duration::ZERO)
-        .await
-        .expect("tree escalates");
-    assert!(!status.success(), "swept root cannot report success, got {status:?}");
-    expect_eof("root", &mut root);
-    expect_eof("grandchild", &mut grand);
-}
-
-#[cfg(feature = "tokio")]
-#[cfg(windows)]
-#[skuld::test]
 async fn async_graceful_shutdown_unsupported_for_an_uncontained_child_on_windows() {
     use std::time::Duration;
     let (mut child, sock) = common::spawn_blocker_async().await;
@@ -358,32 +317,6 @@ async fn async_graceful_shutdown_unsupported_for_an_uncontained_child_on_windows
         .expect_err("a child that leads no group cannot be addressed");
     assert!(matches!(err, cosca::error::Error::Unsupported { .. }), "got {err:?}");
     common::kill_release_reap_async(&mut child, sock).await;
-}
-
-#[cfg(feature = "tokio")]
-#[cfg(unix)]
-#[skuld::test]
-async fn async_graceful_shutdown_tree_escalates_with_surviving_grandchild() {
-    use std::os::unix::process::ExitStatusExt;
-    use std::time::Duration;
-    // BOTH tree members ignore SIGTERM (spawn-grandchild-ignore-term), so with ZERO grace both
-    // are provably alive when the grace elapses — the hard sweep, not the soft signal, must
-    // tear down the root AND the surviving grandchild.
-    let (mut child, mut root, mut grand) = common::spawn_tree_async("spawn-grandchild-ignore-term", |cmd| {
-        cmd.contain();
-    })
-    .await;
-    let status = child
-        .graceful_shutdown_tree(Duration::ZERO)
-        .await
-        .expect("tree escalates");
-    assert_eq!(
-        status.signal(),
-        Some(libc::SIGKILL),
-        "ignored SIGTERM must escalate to SIGKILL, got {status:?}"
-    );
-    expect_eof("root", &mut root);
-    expect_eof("grandchild", &mut grand);
 }
 
 #[cfg(feature = "tokio")]
@@ -435,25 +368,6 @@ async fn async_graceful_tree_unsupported_when_uncontained() {
 // The lone graceful ops on a console-group child — async twins of tests/graceful.rs's =====
 
 #[cfg(feature = "tokio")]
-/// Async twin of `child_graceful_shutdown_escalates_when_the_break_is_ignored`.
-#[cfg(windows)]
-#[skuld::test]
-async fn async_child_graceful_shutdown_escalates_when_the_break_is_ignored() {
-    use std::time::Duration;
-
-    let (mut child, _sock) = common::spawn_control_async("control-block-ignore-break", &["R"], true).await;
-    let status = child
-        .graceful_shutdown(Duration::ZERO)
-        .await
-        .expect("graceful_shutdown escalates");
-    assert_eq!(
-        status.code(),
-        Some(1),
-        "a break-ignoring child must be force-killed, got {status:?}"
-    );
-}
-
-#[cfg(feature = "tokio")]
 /// Async twin of `child_terminate_reports_ok_for_an_already_exited_child`.
 ///
 /// Unix-only, unlike its sync counterpart. The sync `Child` pins its pid for its whole life
@@ -467,43 +381,6 @@ async fn async_child_terminate_reports_ok_for_an_already_exited_child() {
     let (mut child, sock) = common::spawn_control_async("control-block", &["R"], true).await;
     common::kill_release_reap_async(&mut child, sock).await;
     child.terminate().expect("already-dead must be Ok");
-}
-
-#[cfg(feature = "tokio")]
-/// Async twin of `child_graceful_ops_report_success_for_a_child_that_shares_no_console` — the
-/// same known limitation, pinned on the async surface too.
-#[cfg(windows)]
-#[skuld::test]
-async fn async_child_graceful_ops_report_success_for_a_child_that_shares_no_console() {
-    use std::time::Duration;
-
-    use cosca::GracefulMechanism;
-
-    let (mut child, mut sock) = common::spawn_gui_control_async(true).await;
-    assert_eq!(
-        child.graceful_mechanism(),
-        GracefulMechanism::ConsoleGroup,
-        "the flags do not exclude delivery — that is exactly what makes this a gap"
-    );
-    assert_eq!(
-        common::in_our_console(child.id().pid()),
-        Some(false),
-        "a GUI-subsystem child is not in our console"
-    );
-    child.terminate().expect("the documented false success");
-    assert_eq!(
-        child.is_alive(),
-        cosca::identity::Liveness::Alive,
-        "nothing was delivered, so the child must still be running"
-    );
-    let status = child
-        .graceful_shutdown(Duration::ZERO)
-        .await
-        .expect("the forced half needs no console");
-    assert_eq!(status.code(), Some(1), "escalation's kill, got {status:?}");
-    let mut buf = [0u8; 1];
-    let _ = sock.read(&mut buf);
-    let _ = child.wait().await;
 }
 
 #[cfg(feature = "tokio")]

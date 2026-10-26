@@ -38,14 +38,17 @@ async fn drop_over_an_untrusted_view_warns_of_orphans_and_still_kills_the_root()
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
-    let (child, _stdin) = treewalk_blocker();
+    let (child, stdin) = treewalk_blocker();
     let id = child.id();
     // The drop reads the root's number first, which would consume the one-shot forced view before
     // the tree kill sees it: pin that read to "still this root".
     let _root_read = crate::child::fault::force_next_root_read(crate::identity::Resolved::Found(id));
     let forced = force_proc_view_once(ForcedView::Diverged);
+    let sends = crate::send_log::Capture::start();
     drop(child);
     drop(forced);
+    // Released after the drop, which does not wait: the root's stdin never ends it on its own here.
+    drop(stdin);
     let records = crate::log_capture::records_since_on_current_thread(mark, "Child::drop");
     assert!(
         records
@@ -53,12 +56,13 @@ async fn drop_over_an_untrusted_view_warns_of_orphans_and_still_kills_the_root()
             .any(|(level, m)| *level == log::Level::Warn && m.contains("may be orphaned")),
         "{records:?}"
     );
-    // Its stdin is held, so only the drop can end the root; the bound is the failure report.
-    let exited = crate::tokio::Process::from_id(id)
-        .wait_timeout(std::time::Duration::from_secs(30))
-        .await;
+    // The drop's kill of the root, through its pidfd. The status is tokio's to collect, so the send
+    // record is what shows the drop killed it.
     assert!(
-        matches!(exited, Ok(true)),
-        "the root must be killed by the drop: {exited:?}"
+        sends
+            .entries()
+            .contains(&(id.pid(), crate::signal::Sig::Kill, crate::send_log::Via::Pidfd)),
+        "the root must be killed by the drop: {:?}",
+        sends.entries()
     );
 }

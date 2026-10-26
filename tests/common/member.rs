@@ -99,6 +99,24 @@ pub fn assert_members_killed(members: Vec<(Member, &str)>) {
     }
 }
 
+/// Assert that a teardown that does not wait (a drop) ended every member. Windows: as
+/// [`assert_members_not_released`], so the tree must have been started with [`RELEASED_EXIT_ENV`];
+/// a drop that killed nothing fails by assertion where a read for an EOF would block on the
+/// survivor. Unix: each member's socket gives EOF or a reset.
+pub fn assert_members_torn_down(members: Vec<(Member, &str)>) {
+    #[cfg(windows)]
+    assert_members_not_released(members);
+    #[cfg(unix)]
+    for (mut member, who) in members {
+        let mut buf = [0u8; 1];
+        match member.sock.read(&mut buf) {
+            Ok(0) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+            other => panic!("{who} not torn down: {other:?}"),
+        }
+    }
+}
+
 /// The exit codes a testbin member can leave with for a reason other than the kill, besides
 /// [`RELEASED_EXIT_CODE`]: `101` (a Rust panic) and the NTSTATUS codes of an access violation, an
 /// illegal instruction and a fast-fail abort.
