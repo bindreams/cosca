@@ -798,14 +798,11 @@ impl Child {
     /// tree is still running and this process cannot bring it down.
     ///
     /// In a cgroup v2 leaf, a listed member that got no `SIGTERM` makes this
-    /// [`Error::Containment`](crate::error::Error::Containment) when its send failed, and otherwise
-    /// [`Error::Unassessable`](crate::error::Error::Unassessable) when it could not be pinned or shown
-    /// to be in the leaf; one `warn` names the leaf and the pids. [`kill_tree`](Child::kill_tree)
-    /// still reaches them. Before Linux 6.13, or where the leaf's cgroup id cannot be read, a member is
-    /// placed through `/proc`, so one of another user that a `hidepid` mount hides gets no `SIGTERM`
-    /// and is reported this way, not skipped as `Ok`. A member listed as pid `0`, alive in a pid
-    /// namespace this process cannot see, can be neither named nor signalled: it is reported as
-    /// `Unassessable`, like one that could not be pinned.
+    /// [`Error::Containment`](crate::error::Error::Containment) if its send failed, else
+    /// [`Error::Unassessable`](crate::error::Error::Unassessable) (it could not be pinned or shown to
+    /// be in the leaf: a `hidepid`-hidden member of another user before Linux 6.13 or without a
+    /// readable leaf id, or a member listed as pid `0` in an unseen pid namespace); one `warn` names
+    /// the leaf and pids. [`kill_tree`](Child::kill_tree) still reaches them.
     ///
     /// See [`kill_tree`](Child::kill_tree)'s doc for four things that also apply here: the
     /// `ProcessGroup`/`Session`-only scope of this guarantee (a separate, unfixed gap for

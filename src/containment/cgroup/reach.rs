@@ -159,10 +159,10 @@ impl PlacedAtRemoval {
 }
 
 /// A leaf's subtree, captured while the leaf exists, so a task can be placed in it even once the
-/// leaf is removed: the leaf's own cgroup id (`None` where it cannot be read, so that no pidfd's
-/// cgroup id is compared and every task is placed through `/proc`), its directory, its unified-hierarchy path, the ids of
-/// the cgroups its sweep removed, its front's place before its removal, and whether a kill through
-/// it has landed (the leaf's own record).
+/// leaf is removed: the leaf's own cgroup id (`None` if unreadable: tasks are then placed through
+/// `/proc`), its directory, its unified-hierarchy path, the ids of the cgroups its sweep removed,
+/// its front's place before its removal, and whether a kill through it has landed (the leaf's own
+/// record).
 #[derive(Debug)]
 pub(crate) struct Subtree {
     leaf_id: Option<u64>,
@@ -195,11 +195,11 @@ impl Subtree {
     /// Whether the task `pid`, which `pidfd` names when there is one, is in this subtree. A task
     /// keeps its cgroup until it is freed, so a killed task on its way out, or a zombie, still has
     /// the leaf's id, and a task moved out has its new cgroup's. Where the kernel gives a pidfd's
-    /// cgroup id (6.13+) and the leaf's own id is known, the task is in the subtree if that id is the leaf's, or one the leaf's
-    /// sweep removed, or one a walk of the leaf's descendants finds; outside if the walk finds it
-    /// nowhere (see [`walk_places`](Self::walk_places)). Otherwise, before 6.13 or when the walk
-    /// cannot tell, by `/proc/<pid>/cgroup`'s path. A subtree with no unified-hierarchy path (a
-    /// test leaf) holds nothing that read would place.
+    /// cgroup id (6.13+) and the leaf's own id is known, the task is in the subtree if that id is the
+    /// leaf's, or one the leaf's sweep removed, or one a walk of the leaf's descendants finds;
+    /// outside if the walk finds it nowhere (see [`walk_places`](Self::walk_places)). Otherwise,
+    /// before 6.13 or when the walk cannot tell, by `/proc/<pid>/cgroup`'s path. A subtree with no
+    /// unified-hierarchy path (a test leaf) holds nothing that read would place.
     pub(crate) fn holds(&self, pid: u32, pidfd: Option<BorrowedFd<'_>>) -> io::Result<bool> {
         let mut elsewhere = false;
         if let (Some(pidfd), Some(leaf_id)) = (pidfd, self.leaf_id) {

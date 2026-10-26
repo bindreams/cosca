@@ -687,23 +687,19 @@ impl CgroupLeaf {
     /// about one leaf — a caller doing terminate-then-kill would otherwise take an error from
     /// the graceful half and success from the hard one over the identical directory.
     ///
-    /// Each listed pid is pinned by a pidfd first, then shown to be in the leaf (or under it) and
-    /// still running, and signalled through the pidfd: a pid that exited and was reused after the
-    /// read names a process outside the leaf, and is left alone. A pinned member whose place can no
-    /// longer be read because it exited is gone, as one that exited before its pin. A member that
-    /// cannot be pinned or placed is not signalled, as a pid it names may be another process's;
-    /// `cgroup.kill` (the hard half) still reaches it. Before 6.13, or where the leaf's cgroup id
-    /// cannot be read, a member is placed by `/proc/<pid>/cgroup`: one of another user hidden by
-    /// `hidepid` cannot be placed, so it is reported, not skipped as `Ok`. A listed pid `0` is a
-    /// live member in a pid namespace this process cannot see, which it can neither name nor
-    /// signal: it is reported like any member that could not be pinned, after the others are
-    /// signalled.
+    /// Each listed pid is pinned by a pidfd, shown to be in the leaf (or under it) and still
+    /// running, then signalled through the pidfd, so a pid that exited and was reused after the read
+    /// is left alone. A member that leaves the leaf after that check still gets the `SIGTERM`: it is
+    /// the process that was checked. A member that cannot be pinned or placed gets no `SIGTERM` and
+    /// makes the call an error (see [`terminate_tree`](crate::Child::terminate_tree)); `cgroup.kill`
+    /// still reaches it.
     ///
     /// A listed member that got no `SIGTERM` for any reason but its exit is logged at `warn`, naming
     /// the leaf and the pid, and makes the call an error once every member was tried:
     /// [`Error::Containment`](crate::error::Error::Containment) if a send failed, otherwise
     /// [`Error::Unassessable`](crate::error::Error::Unassessable) for members that could not be
-    /// pinned or placed.
+    /// pinned or placed, a listed pid `0` (a member in a pid namespace this process cannot see), or
+    /// a `cgroup.procs` line that is no pid.
     pub(crate) fn terminate(&self) -> Result<(), crate::error::Error> {
         let path = self.leaf_path.join("cgroup.procs");
         let content = match self.dir.read("cgroup.procs") {
@@ -867,9 +863,9 @@ fn member_exited(pidfd: std::os::fd::BorrowedFd<'_>) -> io::Result<bool> {
     pidfd_exited(pidfd)
 }
 
-/// [`CgroupLeaf::terminate`]'s `SIGTERM` to the member `pidfd` pins, and the kernel's answer. It
-/// goes through the shared send, which makes the syscall, so a test build notes the route of the send
-/// made. A test build lets a `fail_terminate` seam answer in its place without sending.
+/// [`CgroupLeaf::terminate`]'s `SIGTERM` to the member `pidfd` pins, and the kernel's answer. It goes
+/// through the shared send, which a test build notes the route of. A test build lets a
+/// `fail_terminate` seam answer in its place without sending.
 fn send_term(pidfd: std::os::fd::BorrowedFd<'_>, pid: u32) -> nix::Result<()> {
     use crate::containment::unix::{send_signal, Sys, Target};
     #[cfg(test)]

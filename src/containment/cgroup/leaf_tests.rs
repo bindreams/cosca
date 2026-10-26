@@ -1397,11 +1397,11 @@ fn sweeping_a_leaf_that_is_already_gone_removes_nothing() {
 /// A real leaf whose one member, a `cat` blocked on a piped stdin, entered it. For the lane tests.
 ///
 /// Returns the member's `ChildStdin` separately so a caller cannot forget it: the member's only
-/// job is to keep the leaf populated until a real kill through the leaf (under test in every
-/// caller) ends it, which needs the writer held for exactly that long. Dropping it, or
-/// `member.wait()` (which closes a piped stdin before waiting), is an EOF that ends the `cat`
-/// without any kill, so every caller either releases it from a seam that fires after the kill
-/// ([`drop_under_a_mount`]) or asserts the exit status carries `SIGKILL`.
+/// job is to keep the leaf populated until a signal under test ends it, which needs the writer held
+/// for exactly that long. Dropping it, or `member.wait()` (which closes a piped stdin before
+/// waiting), is an EOF that ends the member without any signal, so every caller either releases it
+/// from a seam that fires after the signal under test ([`drop_under_a_mount`]), or asserts the exit
+/// status carries the signal it expects, or asserts none.
 #[cfg(target_os = "linux")]
 fn entered_real_leaf() -> (
     crate::containment::cgroup::CgroupLeaf,
@@ -3163,8 +3163,9 @@ fn cgroup_terminate_reports_a_member_whose_sigterm_failed(#[fixture(cgroup)] _gr
 }
 
 /// `terminate` signals a member only once it is shown, through a pidfd that pins it, to still be in
-/// the leaf: one that left between the `cgroup.procs` read and its signal is not signalled. Mutant:
-/// "signal every listed pid by number".
+/// the leaf: one that left between the `cgroup.procs` read and that check is not signalled. A member
+/// that leaves after the check is signalled anyway (see `CgroupLeaf::terminate`). Mutant: "signal
+/// every listed pid by number".
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn cgroup_terminate_leaves_alone_a_member_that_left_after_the_listing(#[fixture(cgroup)] _group: &Group) {
@@ -3183,11 +3184,9 @@ fn cgroup_terminate_leaves_alone_a_member_that_left_after_the_listing(#[fixture(
     drop(leaf);
 }
 
-/// `terminate` sends a running member its `SIGTERM` through the member's pidfd, noted by the helper
-/// that makes the send, once sent. The member exits at its stdin's EOF too, so a send that was
-/// skipped shows as a plain exit, never as a hang. Mutants: "the `SIGTERM` is noted and not sent",
-/// "the `SIGTERM` goes by the member's number" (nothing notes a send the helper did not make), "the
-/// note names another signal than the one sent".
+/// `terminate` sends a running member its `SIGTERM` through the member's pidfd, which the shared
+/// send notes once made, with the route of its syscall. Mutants: "the `SIGTERM` is not sent", "the
+/// `SIGTERM` goes by the member's number", "the `SIGTERM` is another signal".
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn cgroup_terminate_sends_a_member_its_sigterm(#[fixture(cgroup)] _group: &Group) {
