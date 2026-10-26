@@ -973,6 +973,7 @@ async fn cgroup_a_front_spawn_that_cannot_read_its_leaf_subtree_says_why(#[fixtu
         let _failing = crate::containment::cgroup::fault::fail_subtree(libc::EIO);
         spawn_as(in_cgroup(cat()), SUDO)
     };
+    let _leaf_cleanup = clean_up_leaf_of(&child);
     let logs = crate::log_capture::records_since_on_current_thread(mark, "leaf subtree cannot be read");
     assert_eq!(logs.len(), 1, "{logs:?}");
     assert_eq!(logs[0].0, log::Level::Debug);
