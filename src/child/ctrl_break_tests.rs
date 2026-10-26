@@ -9,7 +9,9 @@ use std::time::Duration;
 
 use super::fault as term_fault;
 use crate::containment::Containment;
-use crate::test_child::ctrl_break::{self, Grandchild, Handler, STATUS_CONTROL_C_EXIT};
+use crate::test_child::ctrl_break::{
+    self, assert_acked, assert_in_our_console, Grandchild, Handler, STATUS_CONTROL_C_EXIT,
+};
 use crate::GracefulMechanism;
 
 /// A contained [`ctrl_break`] root answering with `handler`, after its handshake.
@@ -30,48 +32,7 @@ fn spawn(
     grandchild: Option<Handler>,
     mode: crate::ContainMode,
 ) -> (crate::Child, TcpStream, Option<Grandchild>) {
-    spawn_configured(handler, grandchild, mode, |_| {})
-}
-
-/// [`spawn`] with `configure` applied to the command last.
-fn spawn_configured(
-    handler: Handler,
-    grandchild: Option<Handler>,
-    mode: crate::ContainMode,
-    configure: impl FnOnce(&mut crate::Command),
-) -> (crate::Child, TcpStream, Option<Grandchild>) {
-    let (listener, addr) = crate::test_child::registration_rendezvous();
-    let mut cmd = crate::Command::new();
-    cmd.executable(std::env::current_exe().expect("current_exe"))
-        .args(ctrl_break::member_argv());
-    crate::test_reexec::scrub_env(|var| _ = cmd.env_remove(var));
-    for (key, value) in ctrl_break::member_env(&addr, handler, grandchild) {
-        cmd.env(key, value);
-    }
-    cmd.contain_with(mode);
-    configure(&mut cmd);
-    let child = cmd.spawn().expect("spawn the root");
-    let mut sock = ctrl_break::accept_root(&listener, child.id());
-    let grand = grandchild.map(|_| ctrl_break::accept_grandchild(&listener, &mut sock));
-    (child, sock, grand)
-}
-
-/// Require that `pid` shares our console, after its handshake: a break to a group outside it is
-/// accepted and lost.
-fn assert_in_our_console(pid: u32, who: &str) {
-    assert_eq!(
-        ctrl_break::in_our_console(pid),
-        Some(true),
-        "{who} must share our console for the break to be deliverable"
-    );
-}
-
-/// Read the `B` an acking member writes when its handler receives the break.
-fn assert_acked(sock: &mut TcpStream, who: &str) {
-    let mut ack = [0u8; 1];
-    sock.read_exact(&mut ack)
-        .unwrap_or_else(|e| panic!("{who} must acknowledge the break: {e}"));
-    assert_eq!(&ack, b"B", "{who} acked something other than CTRL_BREAK");
+    ctrl_break::spawn_member(handler, grandchild, mode, |_| {})
 }
 
 /// Kill the tree, then release the root: it leaves with 0 when released, so code 1 is the kill's.
@@ -80,6 +41,14 @@ fn kill_tree_release_reap(child: &crate::Child, sock: TcpStream) {
     drop(sock);
     let status = child.wait().expect("reap");
     assert_eq!(status.code(), Some(1), "kill_tree must kill the root, got {status:?}");
+}
+
+/// Kill the root alone, then release it: it leaves with 0 when released, so code 1 is the kill's.
+fn kill_release_reap(child: &crate::Child, sock: TcpStream) {
+    child.kill().expect("kill");
+    drop(sock);
+    let status = child.wait().expect("reap");
+    assert_eq!(status.code(), Some(1), "kill must kill the root, got {status:?}");
 }
 
 /// `terminate` delivers to the root's console group: proved by a byte the root's own handler
@@ -93,7 +62,12 @@ fn child_terminate_delivers_ctrl_break_to_a_contained_root() {
     child.terminate().expect("terminate a console-group child");
     ctrl_break::assert_break_sent_to(child.id().pid());
     assert_acked(&mut sock, "the root");
-    kill_tree_release_reap(&child, sock);
+    assert_eq!(
+        child.is_alive(),
+        crate::identity::Liveness::Alive,
+        "the root handles the break and keeps running"
+    );
+    kill_release_reap(&child, sock);
 }
 
 /// The control leg of `tests/windows_false_success.rs`: a contained root with no flag methods
@@ -102,6 +76,7 @@ fn child_terminate_delivers_ctrl_break_to_a_contained_root() {
 #[skuld::test]
 fn a_plain_contained_root_really_receives_the_break() {
     let (child, mut sock) = spawn_root(Handler::Ack, crate::ContainMode::Strongest);
+    assert_eq!(child.containment(), Containment::JobObject);
     assert_eq!(child.graceful_mechanism(), GracefulMechanism::ConsoleGroup);
     assert_in_our_console(child.id().pid(), "the root");
     child.terminate_tree().expect("terminate_tree on a contained root");
@@ -224,7 +199,7 @@ fn graceful_shutdown_tree_ends_a_root_that_has_a_console_of_its_own() {
         ("no_window, treewalk", crate::ContainMode::TreeWalk, false),
     ];
     for (what, mode, detached) in legs {
-        let (child, sock, _) = spawn_configured(Handler::Ignore, None, mode, |c| {
+        let (child, sock, _) = ctrl_break::spawn_member(Handler::Ignore, None, mode, |c| {
             _ = if detached { c.detached() } else { c.no_window() }
         });
         let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, sock);
@@ -335,4 +310,36 @@ fn graceful_shutdown_tree_sweep_is_load_bearing_on_windows() {
     let Grandchild { sock, exit } = grand;
     drop(sock);
     assert_eq!(exit.wait_for_exit_code(), 1, "the sweep must kill the grandchild");
+}
+
+/// The case the capability exists for, end to end: a nested contained child owns no tree, leads a
+/// console process group of its own, and had no cooperative shutdown at all. The checks run in a
+/// re-exec of this binary spawned contained, so its own spawn is nested and its thread holds the
+/// record of the break it sends; see `test_child::ctrl_break::nested`. Only [`DONE`] (written
+/// after every check) passes: a panic closes the socket first, and a filter that matched no test
+/// writes nothing.
+///
+/// [`DONE`]: ctrl_break::nested::DONE
+#[skuld::test]
+fn nested_delegated_child_can_be_gracefully_terminated() {
+    let (listener, addr) = crate::test_child::registration_rendezvous();
+    let mut cmd = crate::Command::new();
+    cmd.executable(std::env::current_exe().expect("current_exe"))
+        .args(ctrl_break::nested::reporter_argv());
+    crate::test_reexec::scrub_env(|var| _ = cmd.env_remove(var));
+    for (key, value) in ctrl_break::nested::reporter_env(&addr) {
+        cmd.env(key, value);
+    }
+    cmd.contain();
+    let child = cmd.spawn().expect("spawn the reporter");
+    let mut sock = crate::test_child::accept_or_die(&listener, child.id());
+    let mut report = Vec::new();
+    sock.read_to_end(&mut report).expect("read the report");
+    assert_eq!(
+        report,
+        ctrl_break::nested::DONE,
+        "the reporter did not finish its checks; its panic is in its stderr"
+    );
+    let status = child.wait().expect("reap the reporter");
+    assert!(status.success(), "the reporter failed: {status:?}");
 }

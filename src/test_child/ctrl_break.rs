@@ -2,15 +2,20 @@
 //! chosen console-ctrl disposition, optionally the root of a grandchild in its own console process
 //! group, and the caller's side of its handshake.
 //!
-//! A break lands asynchronously. The tests built on these assert first that the break was sent to
-//! the expected group ([`assert_break_sent_to`]) and only then wait for the member's own evidence:
+//! A break lands asynchronously, and the OS runs a console handler on a thread it creates in the
+//! target, so "did it see a break yet?" has no answer a caller can trust. The tests built on these
+//! assert first that the break was sent to the expected group ([`assert_break_sent_to`], which reads
+//! the sender's own record) and only then wait, with no deadline, for the member's own evidence:
 //! its handler's ack, or its exit code. A call that sent nothing fails that assertion instead of
-//! leaving the wait unbounded, and nothing is released that could race the break.
+//! leaving the wait unbounded, and nothing is released that could race the break. The sender must
+//! therefore run in a process of this binary: a probe in another binary has no record to read.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 
 use super::{accept_or_die, ack, fixture_argv};
+
+pub(crate) mod nested;
 
 /// The fully-qualified libtest path of [`fixture_ctrl_break_member`].
 pub(crate) const MEMBER_TEST: &str = "test_child::ctrl_break::fixture_ctrl_break_member";
@@ -168,6 +173,52 @@ fn install_ignore() {
 }
 
 // The caller's side =====
+
+/// A [`fixture_ctrl_break_member`] root answering with `handler`, after its handshake, and the
+/// grandchild it starts in its console process group when `grandchild` is given. It is spawned
+/// contained (`mode`), or as a nested member when the caller is itself contained; `configure` is
+/// applied to the command last. The root's socket keeps it running while held.
+pub(crate) fn spawn_member(
+    handler: Handler,
+    grandchild: Option<Handler>,
+    mode: crate::ContainMode,
+    configure: impl FnOnce(&mut crate::Command),
+) -> (crate::Child, TcpStream, Option<Grandchild>) {
+    let (listener, addr) = crate::test_child::registration_rendezvous();
+    let mut cmd = crate::Command::new();
+    cmd.executable(std::env::current_exe().expect("current_exe"))
+        .args(member_argv());
+    crate::test_reexec::scrub_env(|var| _ = cmd.env_remove(var));
+    for (key, value) in member_env(&addr, handler, grandchild) {
+        cmd.env(key, value);
+    }
+    cmd.contain_with(mode);
+    configure(&mut cmd);
+    let child = cmd.spawn().expect("spawn the root");
+    let mut sock = accept_root(&listener, child.id());
+    let grand = grandchild.map(|_| accept_grandchild(&listener, &mut sock));
+    (child, sock, grand)
+}
+
+/// Require that `pid` shares our console, after its handshake: a break to a group outside it is
+/// accepted and lost.
+pub(crate) fn assert_in_our_console(pid: u32, who: &str) {
+    assert_eq!(
+        in_our_console(pid),
+        Some(true),
+        "{who} must share our console for the break to be deliverable"
+    );
+}
+
+/// Read the `B` an acking member writes when its handler receives the break. Call it only after
+/// [`assert_break_sent_to`]: the handler runs on a thread the OS creates, so the read waits for it,
+/// and only a send that really happened ends that wait.
+pub(crate) fn assert_acked(sock: &mut TcpStream, who: &str) {
+    let mut ack = [0u8; 1];
+    sock.read_exact(&mut ack)
+        .unwrap_or_else(|e| panic!("{who} must acknowledge the break: {e}"));
+    assert_eq!(&ack, b"B", "{who} acked something other than CTRL_BREAK");
+}
 
 /// Accepts the root member `root` (death-watched) and reads its tag.
 pub(crate) fn accept_root(listener: &TcpListener, root: crate::identity::ProcessId) -> TcpStream {

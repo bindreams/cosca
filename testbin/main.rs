@@ -216,10 +216,11 @@ fn install_ignore_break() {
     unsafe { SetConsoleCtrlHandler(Some(ignore), true) }.expect("install ctrl handler");
 }
 
-/// Asks a `control-block-ack-break` target whether it has seen a `CTRL_BREAK` (call it once the
-/// send under test is over): `1` seen, `0` not seen, `?` an unexpected reply, `E` a socket failure.
-/// A target that died answers `0` or `E`. The target replies at once either way, so this never
-/// waits for a break.
+/// Asks a `control-block-ack-break` target whether it has seen a `CTRL_BREAK`: `1` seen, `0` not
+/// seen, `?` an unexpected reply, `E` a socket failure. The target replies at once either way, so
+/// this never waits for a break, and a break still in flight reads as `0`. So a test asserts its
+/// answer only where no break can have been sent; one that needs a break to have arrived is a unit
+/// test (see `src/child/ctrl_break_tests.rs`).
 #[cfg(windows)]
 fn saw_break(sock: &mut std::net::TcpStream) -> &'static str {
     let mut b = [0u8; 1];
@@ -933,116 +934,6 @@ fn main() {
                     }
                 }
             }
-        }
-        #[cfg(windows)]
-        "report-nested-terminate" => {
-            use std::fmt::Write as _;
-
-            // This process is itself spawned CONTAINED (so NESTED_ENV is set), which makes the
-            // crate spawn below a nested member: Containment::Delegated, owning no tree teardown
-            // of its own, yet leading its own console process group. Connect FIRST so a panic
-            // anywhere below reaches the test as socket EOF instead of hanging it.
-            let mut report_sock = crate::ack::connect_control(&args[2]).unwrap();
-
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let ack_addr = listener.local_addr().unwrap().to_string();
-            let exe = std::env::current_exe().unwrap();
-            let mut cmd = cosca::Command::new();
-            cmd.executable(&exe)
-                .args(["cosca_testbin", "control-block-ack-break", &ack_addr, "G"])
-                .env(ack::ACK_ENV, "1")
-                .contain();
-            let mut child = cmd.spawn().expect("spawn nested delegated child");
-            // The tag proves the child is alive AND has completed console registration — it is
-            // written after its ctrl handler is installed — before anything is signalled.
-            let mut ack = accept::accept_or_die(&listener, &mut child);
-            let mut t = [0u8; 1];
-            ack.read_exact(&mut t).expect("read ack tag");
-            assert_eq!(&t, b"G", "wrong ack tag");
-
-            let in_our_console = |pid: u32| {
-                let mut buf = vec![0u32; 16];
-                loop {
-                    // SAFETY: standard Win32; `buf` is a valid writable slice.
-                    let n = unsafe { windows::Win32::System::Console::GetConsoleProcessList(&mut buf) } as usize;
-                    if n == 0 {
-                        return None; // no console at all
-                    }
-                    if n <= buf.len() {
-                        return Some(buf[..n].contains(&pid));
-                    }
-                    buf.resize(n, 0);
-                }
-            };
-            let describe = |e: &cosca::error::Error| match e {
-                cosca::error::Error::NoConsole { .. } => "NoConsole".to_string(),
-                cosca::error::Error::Unsupported { .. } => "Unsupported".to_string(),
-                cosca::error::Error::Containment { .. } => "Containment".to_string(),
-                other => format!("Other({})", other.to_string().replace(char::is_whitespace, "_")),
-            };
-
-            let containment = if child.containment() == cosca::Containment::Delegated {
-                "delegated"
-            } else {
-                "other" // anything else fails the assertion, which is the point
-            };
-            let mechanism = match child.graceful_mechanism() {
-                cosca::GracefulMechanism::ConsoleGroup => "console-group",
-                cosca::GracefulMechanism::OtherConsoleGroup => "other-console-group",
-                cosca::GracefulMechanism::Process => "process",
-                _ => "none",
-            };
-            let membership = in_our_console(child.id().pid());
-            let in_console = match membership {
-                Some(true) => "1",
-                Some(false) => "0",
-                None => "?",
-            };
-            // The invariant that did NOT change, pinned in the same report as the one that did:
-            // a nested member owns no tree teardown.
-            let tree = match child.terminate_tree() {
-                Err(cosca::error::Error::Unsupported { .. }) => "Unsupported",
-                _ => "other",
-            };
-            let terminate = match child.terminate() {
-                Ok(()) => "Ok".to_string(),
-                Err(e) => describe(&e),
-            };
-            // The child answers at once whether it has seen a break, so this read ends whether or
-            // not one was ever sent. It comes before the kill, which would end the child first.
-            let seen = saw_break(&mut ack);
-
-            // Unconditional, so the happy path (where the child is still alive by design) reaps
-            // too. `kill()`, never `kill_tree()`: this child's kill_tree is unconditionally
-            // Unsupported (the `tree` field above). The socket is closed once the kill returned, so
-            // a child it did not end leaves by itself (the testbin's own exit code 0) and is
-            // reported as not killed, where a wait on it would otherwise never return.
-            let cleanup = match child.kill() {
-                Ok(()) => {
-                    drop(ack);
-                    let status = child.wait().expect("reap the nested child");
-                    // `TerminateProcess` exits 1.
-                    if status.code() == Some(1) {
-                        "Ok".to_string()
-                    } else {
-                        format!("NotKilled({status})").replace(char::is_whitespace, "_")
-                    }
-                }
-                // Skip the reap: an unbounded wait on a provably-live child would block forever.
-                // Nothing leaks — this process is itself contained by the test, so the kernel
-                // removes any survivor when that job handle closes.
-                Err(e) => describe(&e),
-            };
-
-            let mut line = String::new();
-            write!(
-                line,
-                "containment={containment} mechanism={mechanism} in_console={in_console} \
-                 terminate={terminate} break={seen} tree={tree} cleanup={cleanup}"
-            )
-            .unwrap();
-            report_sock.write_all(line.as_bytes()).unwrap();
-            report_sock.flush().unwrap();
         }
         #[cfg(windows)]
         "report-bare-argv0-cwd-spawn" => {
