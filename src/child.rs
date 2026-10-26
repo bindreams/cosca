@@ -82,7 +82,7 @@ mod group_route_tests;
 
 #[cfg(all(test, target_os = "linux"))]
 #[path = "child/group_exact_tests.rs"]
-mod group_exact_tests;
+pub(crate) mod group_exact_tests;
 
 #[cfg(all(test, target_os = "linux"))]
 #[path = "child/drop_group_exact_tests.rs"]

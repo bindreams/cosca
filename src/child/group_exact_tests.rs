@@ -247,3 +247,91 @@ fn kill_tree_leaves_alone_a_group_that_took_the_number_of_its_emptied_group(
         "nothing was resent: {steps:?}"
     );
 }
+
+/// What `graceful_shutdown_tree` returns once the tree of a root reaped elsewhere is down.
+pub(crate) const STATUS_REAPED_ELSEWHERE: &str = "exit status cannot be collected: the root was reaped elsewhere";
+
+/// Asserts `result` is the answer of a shutdown that brought the tree down but could not collect the
+/// root's status, and that it warned of nothing left behind but, for an async handle, tokio's own
+/// handle of the root reaped elsewhere.
+#[track_caller]
+pub(crate) fn assert_down_without_status(result: Result<std::process::ExitStatus, crate::error::Error>, mark: usize) {
+    match result {
+        Err(crate::error::Error::Unassessable { detail, source: None }) => {
+            assert!(detail.contains(STATUS_REAPED_ELSEWHERE), "{detail}");
+        }
+        other => panic!("expected the tree down without the root's status, got {other:?}"),
+    }
+    let mut warns = crate::test_child::reaped_elsewhere::warns_since(mark);
+    warns.retain(|warn| !warn.contains("forgetting tokio's handle for it leaks"));
+    assert_eq!(warns, Vec::<String>::new(), "nothing was left behind");
+}
+
+/// 6.9+: `terminate_tree` of a root reaped elsewhere still signals its group through the root's
+/// pidfd. Mutant: "the pidfd decides only `kill_tree`".
+#[skuld::test]
+fn terminate_tree_signals_the_group_of_a_root_reaped_elsewhere(#[fixture(pidfd_group_signal)] _group: &Group) {
+    let (child, _stdin, stderr) = root_with_a_cat();
+    let pid = child.id().pid();
+    child.kill().expect("kill the root alone");
+    reap_behind(pid);
+    let capture = Capture::start();
+    let result = child.terminate_tree();
+    let steps = capture.group_steps();
+    result.expect("the group is signalled through the root's pidfd");
+    assert_eq!(steps.first(), Some(&GroupStep::Group(Route::Pidfd)), "{steps:?}");
+    await_the_cat_gone(stderr);
+}
+
+/// 6.9+: `terminate_tree` of a root reaped elsewhere whose group has no member left sends nothing
+/// and succeeds. Mutants: "a group with no member left is still unassessable", "it is signalled
+/// through the pidfd regardless".
+#[skuld::test]
+fn terminate_tree_of_a_root_reaped_elsewhere_with_no_member_left_sends_nothing(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+) {
+    let (child, _pgid) = foreign_reaped_group_root();
+    let capture = Capture::start();
+    let result = child.terminate_tree();
+    let steps = capture.group_steps();
+    result.expect("an empty group has nothing to signal");
+    assert_eq!(steps, [], "nothing was sent");
+}
+
+/// 6.9+: `graceful_shutdown_tree` of a root reaped elsewhere shuts its group down through the root's
+/// pidfd, then answers that the root's status went to the other reaper. Mutants: "only the root is
+/// shut down through its pidfd", "the shutdown ends on the root's lost status".
+#[skuld::test]
+fn graceful_shutdown_tree_shuts_down_the_group_of_a_root_reaped_elsewhere(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+) {
+    crate::log_capture::install();
+    let (child, _stdin, stderr) = root_with_a_cat();
+    let pid = child.id().pid();
+    child.kill().expect("kill the root alone");
+    reap_behind(pid);
+    let mark = crate::log_capture::mark();
+    let capture = Capture::start();
+    let result = child.graceful_shutdown_tree(std::time::Duration::from_secs(1));
+    let steps = capture.group_steps();
+    assert_eq!(steps.first(), Some(&GroupStep::Group(Route::Pidfd)), "{steps:?}");
+    await_the_cat_gone(stderr);
+    assert_down_without_status(result, mark);
+}
+
+/// 6.9+: `graceful_shutdown_tree` of a root reaped elsewhere whose group has no member left sends
+/// nothing, and answers that the root's status went to the other reaper. Mutants: "a group with no
+/// member left ends the call unassessable", "it is signalled through the pidfd regardless".
+#[skuld::test]
+fn graceful_shutdown_tree_of_a_root_reaped_elsewhere_with_no_member_left_sends_nothing(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+) {
+    crate::log_capture::install();
+    let (child, _pgid) = foreign_reaped_group_root();
+    let mark = crate::log_capture::mark();
+    let capture = Capture::start();
+    let result = child.graceful_shutdown_tree(std::time::Duration::from_secs(1));
+    let steps = capture.group_steps();
+    assert_eq!(steps, [], "nothing was sent");
+    assert_down_without_status(result, mark);
+}

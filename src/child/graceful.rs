@@ -256,9 +256,13 @@ impl Child {
     /// watch failure, so the sweep still runs.
     ///
     /// **A root reaped by something else** (see [`kill_tree`](Child::kill_tree)): on Linux 6.9+ a
-    /// process group that still has a member is shut down through the root's pidfd as usual, and one
-    /// with none left has nothing to shut down. Otherwise nothing goes out by the root's number, and the call ends with one `warn` and
-    /// [`Error::Unassessable`](crate::error::Error::Unassessable), with no sweep. A macOS fd marker's
+    /// process group that still has a member gets the `SIGTERM` through the root's pidfd, then the
+    /// sweep at once: the grace watches only the root, which is gone. One with none left has nothing
+    /// to shut down. Either way, once the tree is down the call returns
+    /// [`Error::Unassessable`](crate::error::Error::Unassessable) saying so, with no `warn`: the
+    /// root's exit status went to the other reaper. Otherwise nothing goes out by the root's number,
+    /// and the call ends with one `warn` and [`Error::Unassessable`](crate::error::Error::Unassessable),
+    /// with no sweep. A macOS fd marker's
     /// holders, named by the pipe they hold, still get the `SIGTERM`, the grace, and a kill of any
     /// left, whose error is returned if it fails; any other mechanism ends at once, with no grace.
     /// On Linux, a root whose handle cannot say whether it was reaped still gets the `SIGTERM`
@@ -449,6 +453,9 @@ impl Child {
         if self.root_is_unpinned() {
             return Err(crate::signal::unpinned_status(self.id.pid(), "graceful_shutdown_tree"));
         }
+        #[cfg(unix)]
+        let status = super::tree_call::status_unless_reaped_elsewhere(self.wait(), self.id.pid())?;
+        #[cfg(not(unix))]
         let status = self.wait()?;
         if let Some(e) = watch_err {
             return Err(e);

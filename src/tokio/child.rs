@@ -906,7 +906,7 @@ impl Child {
     /// See [`kill_tree`](Child::kill_tree)'s doc for four things that also apply here: the
     /// `ProcessGroup`/`Session`-only scope of this guarantee (a separate, unfixed gap for
     /// `TreeWalk`), the residual `hidepid` gap on Linux, a root reaped by something else, and a reap
-    /// after the look, which may send the `SIGTERM` to a number another process holds.
+    /// between a check and its send, which may send the `SIGTERM` to a number another process holds.
     ///
     /// **Windows, after the root's exit has been observed.** The event is addressed by the
     /// ROOT's pid — on the job-object mechanism and the tree walk alike — and this handle stops
