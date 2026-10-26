@@ -284,8 +284,8 @@ impl Child {
     /// process group that still has a member gets the `SIGTERM` through the root's pidfd, then the
     /// sweep at once: the grace watches only the root, which is gone. One with none left has nothing
     /// to shut down. Either way, once the tree is down the call returns
-    /// [`Error::Unassessable`](crate::error::Error::Unassessable) saying so, with no `warn`: the
-    /// root's exit status went to the other reaper. Otherwise nothing goes out by the root's number,
+    /// [`Error::Unassessable`](crate::error::Error::Unassessable) saying so: the root's exit status
+    /// went to the other reaper. Otherwise nothing goes out by the root's number,
     /// and the call ends with one `warn` and [`Error::Unassessable`](crate::error::Error::Unassessable),
     /// with no sweep. A macOS fd marker's
     /// holders, named by the pipe they hold, still get the `SIGTERM`, the grace, and a kill of any
