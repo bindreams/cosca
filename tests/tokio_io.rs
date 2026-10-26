@@ -370,25 +370,31 @@ async fn linux_cgroup_v2_async_drop_after_wait_still_tears_down_the_tree(#[fixtu
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 async fn drop_after_wait_still_tears_down_the_tree() {
     // After awaiting the root's exit it is already reaped, so the drop has no root to signal and
-    // the tree teardown must come from attached.hard_kill() — proven by the grandchild's EOF.
-    // The drop stays the killer: `wait_tree` never kills, so waiting on it first would hang.
-    use std::io::{Read as _, Write as _};
+    // the tree teardown must come from attached.hard_kill(). The drop stays the killer:
+    // `wait_tree` never kills, so waiting on it first would hang. The members echo until released
+    // (`ECHO_HELD_ENV`), so a drop that killed nothing is caught by an echo, not by a read that
+    // never ends.
     common::install_log_capture();
-    let (mut child, mut root, mut grand) = common::spawn_grandchild_async(true).await;
+    let (mut child, root, mut grand) = common::spawn_tree_async("spawn-grandchild", |cmd| {
+        cmd.contain();
+        cmd.kill_on_drop(true);
+        cmd.env(common::ECHO_HELD_ENV, "1");
+    })
+    .await;
     let leaf = cgroup_leaf_of(&child);
     let _leaf_cleanup = leaf_cleanup(&leaf);
     let root_id = child.id();
-    root.write_all(b"x").expect("release the root so it exits");
+    drop(root); // EOF: the root leaves on its own, so the drop below has no root to kill
     child.wait().await.expect("wait reaps the root");
     assert_eq!(root_id.is_alive(), cosca::identity::Liveness::Dead, "root exited");
     let mark = common::log_mark();
-    drop(child); // root already reaped → nothing to signal; attached.hard_kill must still kill the grandchild
-    let mut buf = [0u8; 1];
-    match grand.read(&mut buf) {
-        Ok(0) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
-        other => panic!("grandchild not torn down by hard_kill after the root was waited: {other:?}"),
-    }
+    // Root already reaped → nothing to signal; attached.hard_kill must still kill the grandchild.
+    // No wait after the drop: the kill is pending once it returns, and a killed member cannot echo.
+    drop(child);
+    common::assert_dead(
+        &mut grand,
+        "the grandchild not torn down by hard_kill after the root was waited",
+    );
     // `Drop` releases the leaf without waiting for the drain: the leaf is removed if the kill had
     // finished by then, and left with a warning if not.
     #[cfg(target_os = "linux")]
