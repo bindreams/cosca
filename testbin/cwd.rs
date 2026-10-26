@@ -18,6 +18,8 @@
 //! - `report-cwd`: prints `cwd=` and this process's cwd; the long-path-aware child.
 //! - `subst-cwd`, `verbatim-null` and `report-cwd-final`: see [`null_cwd`].
 //! - `long-image`: see [`long_image`]; this binary is its long-path-aware half.
+//! - `with-env-block` and `full-path`: see `env_block` and `full_path`; `with-env-block` starts
+//!   this binary as the child, so `full-path` measures a long-path-aware process.
 //!
 //! A `[[bin]]` cannot be `cfg`-ed out, so off Windows it exits 1.
 
@@ -39,6 +41,8 @@ fn main() {
         Some("subst-cwd") => null_cwd::subst_cwd(&args[2], &args[3]),
         Some("verbatim-null") => null_cwd::verbatim_null(&args[2], &args[3]),
         Some("long-image") => long_image::run(&args[2], &args[3]),
+        Some("with-env-block") => env_block::with_block(&args[2..]),
+        Some("full-path") => full_path::run(&args[2]),
         other => panic!("unknown mode {other:?}"),
     }
 }
@@ -60,6 +64,15 @@ mod null_cwd;
 #[cfg(windows)]
 #[path = "long_image.rs"]
 mod long_image;
+
+#[cfg(windows)]
+#[path = "full_path.rs"]
+mod full_path;
+
+#[cfg(windows)]
+#[allow(dead_code, reason = "shared with cosca_testbin, which uses other parts")]
+#[path = "env_block.rs"]
+mod env_block;
 
 #[cfg(windows)]
 #[allow(dead_code, reason = "shared with cosca_testbin, which uses other parts")]

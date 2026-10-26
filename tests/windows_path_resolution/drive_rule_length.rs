@@ -2,8 +2,9 @@
 //! a value over `MAX_PATH` is ignored; this finds where the line is. The runner and D1's arms are in
 //! `tests/common/drive_rule.rs`; M7 has the other rows.
 
-use crate::common::drive_rule::{canonical, dir_of_len, free_drive, run_as, Arm, Cwd, Render, Row, Var};
-use crate::provenance::survey_platform;
+use crate::common::drive_rule::{canonical, dir_of_len, free_drive, run_in, Arm, Cwd, Render, Row, Var};
+use crate::common::testbin;
+use crate::provenance::{or_missing, reg_dword, survey_platform};
 use crate::test_groups::{path_probes, Group};
 
 /// M7b: an `=X:` value naming an existing directory, of exactly 259, 260 and 261 UTF-16 units, and
@@ -13,8 +14,14 @@ use crate::test_groups::{path_probes, Group};
 /// predicts (`Value`) and the arm observed (`Root` when ntdll falls back to `X:\`, `Error` when
 /// `GetFullPathNameW` fails).
 ///
+/// Each row runs twice, in a child without a `longPathAware` manifest (`cosca_testbin`, lines
+/// labelled `M7b unaware`) and in one with it (`cosca_testbin_cwd`, `M7b aware`). Awareness takes
+/// effect only with the machine's `LongPathsEnabled` policy, so the policy is printed too, as
+/// `M7b policy LongPathsEnabled=<value>`; it is read, never changed.
+///
 /// Preconditions, asserted: each value directory has the length its row says; the child runs in the
-/// row's cwd and sees the row's `=X:` value. The letter is searched in `G..=L`, as M7's.
+/// row's cwd and sees the row's `=X:` value; the unaware child reports long paths off and the aware
+/// one reports them on exactly when the policy is on. The letter is searched in `G..=L`, as M7's.
 #[skuld::test]
 fn m7b_the_length_and_form_of_a_childs_drive_directory_value(#[fixture(path_probes)] _group: &Group) {
     survey_platform();
@@ -27,6 +34,14 @@ fn m7b_the_length_and_form_of_a_childs_drive_directory_value(#[fixture(path_prob
     let sr = format!("SystemRoot={}", std::env::var("SystemRoot").expect("SystemRoot"));
     let render = Render(vec![(d.clone(), "<d>".into())]);
     let drives = [(letter, 'X')];
+    // `RtlAreLongPathsEnabled` in the child is its manifest AND this policy, so the policy decides
+    // what the aware child must report.
+    let policy = reg_dword(r"SYSTEM\CurrentControlSet\Control\FileSystem", "LongPathsEnabled");
+    println!("M7b policy LongPathsEnabled={}", or_missing(policy.clone()));
+    let children = [
+        ("unaware", testbin(), false),
+        ("aware", env!("CARGO_BIN_EXE_cosca_testbin_cwd"), policy == Ok(1)),
+    ];
 
     let sized = |units: usize| {
         // `dir_of_len` extends its base, so each length gets a base of its own.
@@ -46,15 +61,17 @@ fn m7b_the_length_and_form_of_a_childs_drive_directory_value(#[fixture(path_prob
     ];
     for (key, value) in &values {
         for (suffix, name) in [("tool", format!("{q}tool")), ("bare", q.clone())] {
-            let row = Row {
-                key: Box::leak(format!("{key}_{suffix}").into_boxed_str()),
-                cwd: Cwd::Given(e.clone()),
-                block: vec![sr.clone(), format!("={q}={value}")],
-                name,
-                arm: Arm::Value(value.clone()),
-                var: Var::Is(Some(value.clone())),
-            };
-            run_as("M7b", &row, &render, &drives);
+            for (half, bin, long_paths) in &children {
+                let row = Row {
+                    key: Box::leak(format!("{key}_{suffix}").into_boxed_str()),
+                    cwd: Cwd::Given(e.clone()),
+                    block: vec![sr.clone(), format!("={q}={value}")],
+                    name: name.clone(),
+                    arm: Arm::Value(value.clone()),
+                    var: Var::Is(Some(value.clone())),
+                };
+                run_in(&format!("M7b {half}"), bin, *long_paths, &row, &render, &drives);
+            }
         }
     }
 }

@@ -1,6 +1,7 @@
 //! M7's runner (M7b reuses it): what a child's own `GetFullPathNameW` makes of a drive-relative name,
 //! given an environment block and a cwd built here, against what D1 predicts. `cosca_testbin with-env-block`
-//! starts the child with exactly the row's block, and the child's `full-path` mode reports.
+//! starts the child with exactly the row's block, and the child's `full-path` mode reports; `cosca_testbin_cwd`
+//! does the same for a long-path-aware child.
 //!
 //! D1, the drive rule (`complete` plus `HostOs::drive_base`), completes `X:rest` onto, in order: the
 //! cwd E, when E is drive-absolute on drive X (`Base`); the child's first `=X:` entry, when it is
@@ -144,16 +145,21 @@ fn replace_ignore_case(s: &str, from: &str, to: &str) -> String {
     out
 }
 
-/// [`run_as`] for M7.
+/// [`run_in`] for M7: the child has no `longPathAware` manifest.
 pub fn run(row: &Row, render: &Render, drives: &[(char, char)]) {
-    run_as("M7", row, render, drives);
+    run_in("M7", crate::common::testbin(), false, row, render, drives);
 }
 
 /// Runs `row` and prints it as `<id> <key> <field>=<value>` lines, rendered by `render` and then
 /// `drives`: each `(letter, placeholder)` pair prints the drive `letter:` as `<P>:`, or `<p>:` for a
 /// lowercase letter, so two drives never print alike and a lowercase one stays visible.
-pub fn run_as(id: &str, row: &Row, render: &Render, drives: &[(char, char)]) {
-    let mut cmd = Command::new(crate::common::testbin());
+///
+/// `bin` is the testbin that launches the child and is the child (`with-env-block` starts its own
+/// image): `cosca_testbin`, or `cosca_testbin_cwd` for a long-path-aware child. The child's
+/// `RtlAreLongPathsEnabled` must equal `long_paths`, which fails the row if a manifest is missing or
+/// the policy differs from what the caller read.
+pub fn run_in(id: &str, bin: &str, long_paths: bool, row: &Row, render: &Render, drives: &[(char, char)]) {
+    let mut cmd = Command::new(bin);
     cmd.arg("with-env-block");
     match &row.cwd {
         Cwd::Given(cwd) => {
@@ -172,6 +178,12 @@ pub fn run_as(id: &str, row: &Row, render: &Render, drives: &[(char, char)]) {
         row.key,
         out.status,
         String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        value(&report, "long_paths_enabled"),
+        long_paths.to_string(),
+        "{id} {}: precondition: the child's long-path state (its manifest and the LongPathsEnabled policy)",
+        row.key
     );
     let cwd = value(&report, "cwd");
     assert_eq!(
@@ -203,6 +215,7 @@ pub fn run_as(id: &str, row: &Row, render: &Render, drives: &[(char, char)]) {
     let predicted = row.predicted();
     let show = |s: &str| render_drives(&render.apply(s), drives);
     let k = row.key;
+    println!("{id} {k} long_paths_enabled={long_paths}");
     println!("{id} {k} cwd={}", show(cwd));
     println!(
         "{id} {k} block={:?}",
