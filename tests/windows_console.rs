@@ -192,14 +192,12 @@ fn tree_graceful_ops_report_no_console_from_a_console_less_caller() {
         "alive",
         "a fail-fast terminate must leave the tree untouched: {r}"
     );
-    // The acker is hard-killed on this path, and a killed peer resets its socket rather than
-    // closing it, so the read errors (`E`) about as often as it sees EOF (`0`) — both mean
-    // "died without acking". `?` (an unexpected byte) and `K` (the teardown failed, so
-    // delivery was never observable) stay distinct and neither may pass here.
-    let seen = field(&r, "terminate_break");
-    assert!(
-        matches!(seen, "0" | "E"),
-        "no signal can have been delivered, got {seen}: {r}"
+    // The live acker answers `0`: it has seen no break. `E` (a socket failure) and `?` (an
+    // unexpected reply) stay distinct and neither may pass here.
+    assert_eq!(
+        field(&r, "terminate_break"),
+        "0",
+        "no signal can have been delivered: {r}"
     );
     assert_eq!(field(&r, "graceful"), "NoConsole", "{r}");
     assert_eq!(
@@ -230,11 +228,6 @@ fn tree_graceful_ops_work_from_a_caller_that_has_a_console() {
     assert_eq!(field(&r, "c1_in_console"), "1", "the root must share our console: {r}");
     assert_eq!(field(&r, "containment"), "job", "{r}");
     assert_eq!(field(&r, "terminate_tree"), "Ok", "{r}");
-    assert_eq!(
-        field(&r, "terminate_sent"),
-        "1",
-        "terminate_tree must send one CTRL_BREAK, to the root's group: {r}"
-    );
     assert_eq!(
         field(&r, "terminate_break"),
         "1",
@@ -299,13 +292,9 @@ fn lone_graceful_ops_report_no_console_from_a_console_less_caller() {
         "alive",
         "a fail-fast terminate must leave the child untouched: {r}"
     );
-    // Killed rather than signalled, and a killed peer resets its socket about as often as it
-    // closes it. `?` and `K` stay distinct and neither may pass here.
-    let seen = field(&r, "break");
-    assert!(
-        matches!(seen, "0" | "E"),
-        "no signal can have been delivered, got {seen}: {r}"
-    );
+    // The live acker answers `0`: it has seen no break. `E` (a socket failure) and `?` (an
+    // unexpected reply) stay distinct and neither may pass here.
+    assert_eq!(field(&r, "break"), "0", "no signal can have been delivered: {r}");
     assert_eq!(field(&r, "graceful"), "NoConsole", "{r}");
     assert_eq!(field(&r, "graceful_code"), "none", "{r}");
     assert_eq!(
@@ -333,11 +322,6 @@ fn lone_graceful_ops_work_from_a_caller_that_has_a_console() {
     assert_eq!(field(&r, "c_in_console"), "1", "the child must share our console: {r}");
     assert_eq!(field(&r, "mechanism"), "console-group", "{r}");
     assert_eq!(field(&r, "terminate"), "Ok", "{r}");
-    assert_eq!(
-        field(&r, "sent"),
-        "1",
-        "terminate must send one CTRL_BREAK, to the child's group: {r}"
-    );
     assert_eq!(
         field(&r, "alive_after_terminate"),
         "alive",

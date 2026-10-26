@@ -76,9 +76,6 @@ pub mod graceful;
 pub mod identity;
 pub mod quote;
 pub mod stdio;
-#[doc(hidden)]
-#[cfg(windows)]
-pub use containment::windows::set_ctrl_break_sent_hook;
 #[cfg(windows)]
 pub use containment::Job;
 pub use containment::{ContainMode, Containment};
