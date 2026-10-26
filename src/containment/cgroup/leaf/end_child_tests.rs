@@ -236,29 +236,65 @@ fn an_abandoned_child_whose_group_kill_is_refused_is_warned_about_once(#[fixture
     );
 }
 
+/// A forked child that leads its own process group, as a spawned child does, and exits by itself
+/// once the returned writer closes. So a kill that was never made shows as an exit that is not a
+/// `SIGKILL`, where waiting on the child would hang.
+fn group_leader_ending_at_eof() -> (KillOnDrop, std::io::PipeWriter) {
+    use std::os::fd::AsRawFd;
+    let (from_test, to_child) = std::io::pipe().expect("pipe");
+    let (input, test_end) = (from_test.as_raw_fd(), to_child.as_raw_fd());
+    let child = fork_running(move || {
+        // SAFETY: async-signal-safe syscalls on fds this process holds.
+        unsafe {
+            libc::setpgid(0, 0);
+            libc::close(test_end);
+            let mut byte = 0u8;
+            while libc::read(input, (&raw mut byte).cast(), 1) == 1 {}
+        }
+    });
+    drop(from_test);
+    // SAFETY: plain syscall on this process's own child.
+    let set = unsafe { libc::setpgid(child.pid() as i32, child.pid() as i32) };
+    assert_eq!(set, 0, "setpgid: {}", std::io::Error::last_os_error());
+    (child, to_child)
+}
+
 /// A child reaped elsewhere after its group kill and before its handle's kill (`ESRCH`) is
 /// `Killed`: cosca's kill reached its group. One no kill of cosca's reached, killed and reaped by
-/// someone else, is `Gone`.
+/// someone else, is `Gone`. The reaper ends the child's input first and checks that it died of
+/// `SIGKILL`: a kill sent before the hook lands before the child can read the end of its input.
 ///
-/// Mutant: `ESRCH` from the handle's kill read as `Gone` whatever the group kill did.
+/// Mutants: `ESRCH` from the handle's kill read as `Gone` whatever the group kill did; the group
+/// kill not made.
 #[skuld::test]
 fn an_abandoned_child_reaped_elsewhere_after_its_group_kill_is_killed(#[fixture(cgroup)] _group: &Group) {
     for (report, fate) in [
         (Some(PlacementReport::WriteFailed(libc::EBADF)), ChildFate::Killed),
         (None, ChildFate::Gone),
     ] {
-        let child = paused_group_leader();
+        let (child, input) = group_leader_ending_at_eof();
         let received = received(child, report);
         let pid = received.pid.expect("a pid");
         let pidfd = super::super::test_support::pidfd_of(pid);
-        let _reaped_elsewhere = fault::set_before_handle_kill(move || {
-            if report.is_none() {
-                rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::KILL).expect("kill the child");
+        let signal = std::rc::Rc::new(std::cell::Cell::new(None));
+        let _reaped_elsewhere = fault::set_before_handle_kill({
+            let signal = std::rc::Rc::clone(&signal);
+            move || {
+                if report.is_none() {
+                    rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::KILL).expect("kill the child");
+                }
+                drop(input);
+                let mut status = 0;
+                // SAFETY: `pid` is this test's own child; this plays another reaper in the process.
+                let reaped = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
+                assert_eq!(reaped, pid as libc::pid_t, "{}", std::io::Error::last_os_error());
+                signal.set(libc::WIFSIGNALED(status).then(|| libc::WTERMSIG(status)));
             }
-            crate::test_child::reaped_elsewhere::reap_behind(pid);
         });
 
-        assert_eq!(end_child(&received), fate, "{report:?}");
+        let ended = end_child(&received);
+        assert_eq!(signal.get(), Some(libc::SIGKILL), "the child was killed: {report:?}");
+        assert_eq!(ended, fate, "{report:?}");
     }
 }
 
@@ -363,8 +399,10 @@ fn leader_with_member(leader_exits: bool) -> (KillOnDrop, std::io::PipeWriter, s
                 libc::_exit(0);
             }
             libc::write(output, b"r".as_ptr().cast(), 1);
-            while !leader_exits {
-                libc::pause();
+            if !leader_exits {
+                loop {
+                    libc::pause();
+                }
             }
         }
     });
