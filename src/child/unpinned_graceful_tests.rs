@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use super::graceful::fault as graceful_fault;
 use super::unpinned_public_tests::{
-    assert_nothing_sent, assert_refused, assert_tree_refused, group_blocker, orphaned, session_tree, walked_blocker,
-    warns_since, Untrusted, BOTH,
+    assert_nothing_sent, assert_refused, assert_sent_by_identity, assert_tree_refused, group_blocker, orphaned,
+    session_tree, walked_blocker, warns_since, Untrusted, BOTH,
 };
 use crate::error::Error;
 use crate::send_log::Capture;
@@ -208,6 +208,7 @@ fn graceful_shutdown_tree_of_an_untrusted_session_root_signals_its_holders_only(
         let groups = crate::containment::unix::fault::record_term_group();
         let _holders = crate::containment::fdmarker::fault::record_holder_kills();
         let (child, writer, descendant) = session_tree();
+        let sends = Capture::start();
         let pid = child.id().pid();
         let mark = crate::log_capture::mark();
         let after_terminate: Arc<Mutex<Option<Vec<u32>>>> = Arc::default();
@@ -242,6 +243,7 @@ fn graceful_shutdown_tree_of_an_untrusted_session_root_signals_its_holders_only(
             }
         };
         assert_eq!(signalled, want, "{state:?}");
+        assert_sent_by_identity(&sends, libc::SIGTERM, &want, state);
         assert_eq!(warns_since(mark), Vec::<String>::new(), "{state:?}");
         drop(writer);
     }

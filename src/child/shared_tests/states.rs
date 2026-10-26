@@ -565,17 +565,21 @@ fn kill_sent_after_our_own_reap_is_gone() {
     assert_eq!(exit_seams::signals_sent(), 0);
 }
 
-/// `kill_sent` on a live child reports `Delivered`.
+/// `kill_sent` on a live child reports `Delivered`, and the kill lands: the blocker is released
+/// only after the call, so a call that sent nothing ends it with status 0.
 ///
-/// Mutant: `kill_sent` reports `Gone` for a live child.
+/// Mutants: `kill_sent` reports `Gone` for a live child; it reports `Delivered` and sends nothing.
 #[cfg(unix)]
 #[skuld::test]
 fn kill_sent_on_a_live_child_is_delivered() {
-    let b = Blocker::spawn();
+    let mut b = Blocker::spawn();
     assert_eq!(
         b.shared.kill_sent().expect("kill a live child"),
         crate::signal::Sent::Delivered
     );
+    b.end_child();
+    let status = b.shared.wait().expect("reap the killed child");
+    assert_eq!(super::fixtures::signal_of(status), Some(libc::SIGKILL));
 }
 
 // L8: an unreadable consuming record =====

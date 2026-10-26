@@ -66,6 +66,12 @@ impl Capture {
     pub(crate) fn entries(&self) -> Vec<Entry> {
         LOG.with(|log| log.borrow().clone().expect("a live capture has a log"))
     }
+
+    /// Whether `sig` was sent to `pid`, by whatever route: the send was made, which a root reaped
+    /// before its status could be read still shows.
+    pub(crate) fn sent(&self, pid: u32, sig: Sig) -> bool {
+        self.entries().iter().any(|&(p, s, _)| p == pid && s == sig)
+    }
 }
 
 impl Capture {

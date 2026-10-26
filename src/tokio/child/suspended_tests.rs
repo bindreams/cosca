@@ -475,15 +475,26 @@ mod on_windows {
         writer
     }
 
-    /// Drop `frozen`, release its stdin, and require it to die with the kill's exit code. The drop is
-    /// the async `Child`'s bounded one: it signals and returns, so the proof is the process object,
-    /// opened while the frozen child pins the pid.
+    /// Release a frozen child's stdin and let its initial thread run, once the code under test has
+    /// torn it down. A frozen child runs nothing, so the release alone cannot end it; with the thread
+    /// resumed, a kill that sent nothing lets the blocker exit 0 and fail the exit-code assertion
+    /// instead of leaving the wait for its death to hang. After a real kill the resume fails, and is
+    /// ignored.
+    fn release_and_expect_it_killed(thread: &InitialThread, writer: std::io::PipeWriter, remote: &Remote, what: &str) {
+        drop(writer);
+        thread.resume_whatever_the_outcome();
+        remote.wait_for_death();
+        assert_eq!(remote.exit_code(), 1, "{what}: the teardown must kill the frozen child");
+    }
+
+    /// Drop `frozen`, then release it (see [`release_and_expect_it_killed`]). The drop is the async
+    /// `Child`'s bounded one: it signals and returns, so the proof is the process object, opened
+    /// while the frozen child pins the pid.
     fn drop_frozen_and_expect_it_killed(frozen: crate::tokio::SuspendedChild, writer: std::io::PipeWriter, what: &str) {
         let remote = Remote::open(frozen.id().pid());
+        let thread = InitialThread::of(frozen.id().pid());
         drop(frozen);
-        drop(writer);
-        remote.wait_for_death();
-        assert_eq!(remote.exit_code(), 1, "{what}: the drop must kill the frozen child");
+        release_and_expect_it_killed(&thread, writer, &remote, what);
     }
 
     /// A dropped frozen child is killed whatever `kill_on_drop` says. Nothing but the drop can end
@@ -535,8 +546,11 @@ mod on_windows {
     #[skuld::test]
     async fn a_failed_thread_resume_kills_the_child_and_reports_its_fate() {
         crate::tokio::test_runtime::assert_current_thread();
-        let frozen = blocker(false).spawn_suspended().expect("spawn suspended");
+        let mut cmd = blocker(false);
+        let writer = hold_stdin(&mut cmd);
+        let frozen = cmd.spawn_suspended().expect("spawn suspended");
         let remote = Remote::open(frozen.id().pid());
+        let thread = InitialThread::of(frozen.id().pid());
         let forced = force_next(Step::Resume, ERROR_ACCESS_DENIED);
 
         let err = frozen.resume().expect_err("the resume was forced to fail");
@@ -546,7 +560,7 @@ mod on_windows {
             .fate()
             .unwrap_or_else(|| panic!("expected MayHaveStarted, got {err:?}"));
         assert!(matches!(fate, ChildFate::Killed | ChildFate::Reaped), "{fate:?}");
-        remote.wait_for_death();
+        release_and_expect_it_killed(&thread, writer, &remote, "a failed resume");
     }
 
     /// Something else killed the frozen process. The process is observed dead (its handle is
@@ -582,14 +596,17 @@ mod on_windows {
     /// frozen, so `resume` must not return `Ok`.
     #[skuld::test]
     async fn resume_when_the_initial_thread_was_suspended_twice_kills_the_child_instead_of_returning_ok() {
-        let frozen = blocker(false).spawn_suspended().expect("spawn suspended");
+        let mut cmd = blocker(false);
+        let writer = hold_stdin(&mut cmd);
+        let frozen = cmd.spawn_suspended().expect("spawn suspended");
         let remote = Remote::open(frozen.id().pid());
-        InitialThread::of(frozen.id().pid()).suspend_once();
+        let thread = InitialThread::of(frozen.id().pid());
+        thread.suspend_once();
 
         let err = frozen.resume().expect_err("the child is still frozen after one resume");
 
         assert!(err.fate().is_some(), "got {err:?}");
-        remote.wait_for_death();
+        release_and_expect_it_killed(&thread, writer, &remote, "a half-resumed child");
     }
 
     // The command =====

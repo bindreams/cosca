@@ -6,7 +6,8 @@
 use ::tokio::io::AsyncBufReadExt as _;
 
 use crate::child::unpinned_public_tests::{
-    assert_nothing_sent, assert_refused, assert_tree_refused, orphaned, sorted, warns_since, Untrusted, BOTH,
+    assert_nothing_sent, assert_refused, assert_sent_by_identity, assert_tree_refused, orphaned, sorted, warns_since,
+    Untrusted, BOTH,
 };
 use crate::error::Error;
 use crate::send_log::{Capture, Via};
@@ -270,6 +271,7 @@ async fn kill_tree_of_an_untrusted_session_root_kills_its_holders_only() {
             Untrusted::Unknown => sorted(vec![pid, descendant]),
         };
         assert_eq!(sorted(holders.killed()), want, "{state:?}");
+        assert_sent_by_identity(&sends, libc::SIGKILL, &want, state);
         assert_eq!(warns_since(mark), Vec::<String>::new(), "{state:?}");
         drop(writer);
     }
@@ -395,6 +397,7 @@ async fn terminate_tree_of_an_untrusted_session_root_signals_its_holders_only() 
             Untrusted::Unknown => sorted(vec![pid, descendant]),
         };
         assert_eq!(sorted(holders.killed()), want, "{state:?}");
+        assert_sent_by_identity(&sends, libc::SIGTERM, &want, state);
         assert_eq!(warns_since(mark), Vec::<String>::new(), "{state:?}");
         drop(writer);
     }

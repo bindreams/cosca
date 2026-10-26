@@ -22,7 +22,7 @@ use crate::containment::cgroup::test_support::alone;
 use crate::test_child::fixture_path;
 
 #[cfg(target_os = "linux")]
-pub(super) mod linux {
+pub(crate) mod linux {
     use std::os::fd::{AsFd, OwnedFd};
 
     use super::Child;
@@ -99,7 +99,7 @@ pub(super) mod linux {
         /// [`Ended::ReapedWhileStdinOpen`].
         /// The read is exact only under `alone()`: nothing else reaps before this thread yields to
         /// a runtime.
-        pub(crate) fn ended_after_closing(&self, stdin: crate::tokio::ChildStdin) -> Ended {
+        pub(crate) fn ended_after_closing(&self, stdin: impl Sized) -> Ended {
             debug_assert!(
                 std::env::var_os("COSCA_TEST_ALONE").is_some(),
                 "`ended_after_closing` is exact only in a process running this test alone (`alone()`): \
@@ -572,6 +572,8 @@ async fn drop_warns_instead_of_asserting_on_a_real_teardown_mechanism_failure() 
     let mut child = cmd.spawn().expect("spawn");
     let stdin = child.stdin().expect("piped stdin");
     let root = linux::Pidfd::of(&child);
+    let pid = child.id().pid();
+    let sends = crate::send_log::Capture::start();
 
     // Pin that the forced failure is the mechanism class this test claims (a raw `EISDIR` from
     // the `cgroup.kill` write, surfaced as `Error::Io`), so it cannot go vacuous if the forcing
@@ -613,6 +615,12 @@ async fn drop_warns_instead_of_asserting_on_a_real_teardown_mechanism_failure() 
             linux::Ended::Signalled(libc::SIGKILL) | linux::Ended::ReapedWhileStdinOpen
         ),
         "the drop must kill the root with SIGKILL, got {ended:?}"
+    );
+    // A root reaped before its status could be read would pass for a kill above whatever the drop sent.
+    assert!(
+        sends.sent(pid, crate::signal::Sig::Kill),
+        "the drop must send the root SIGKILL: {:?}",
+        sends.entries()
     );
 }
 
