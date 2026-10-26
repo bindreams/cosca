@@ -614,9 +614,12 @@ fn reconfirm_survivor(outcome: MemberOutcome, recheck: impl FnOnce() -> crate::i
 /// **The group's number, and each resend.** The listing names members by `pgid`, a number that
 /// stays the root's group only while the group has a member: on Linux 6.9+ the root's pidfd shows
 /// that exactly, and elsewhere the root's state stands in for it (unreaped, or its pid free after
-/// this handle's own reap). Each `SIGKILL` resend and each `SIGTERM` probe therefore follows its own
-/// check of the root ([`GroupRoot::check`]), which shows the listing named the root's group, and then
-/// the member's identity check right before the send. A member whose root check fails is
+/// this handle's own reap). Each `SIGKILL` resend and each `SIGTERM` probe therefore has its own
+/// check of the root ([`GroupRoot::check`]), which shows the listing named the root's group. On Linux
+/// a `SIGKILL` resend first pins the member by a pidfd that its identity check vouches for, then
+/// checks the root, then sends through that pidfd. A `SIGTERM` probe, and a resend by the member's
+/// pid (on macOS, or where the pidfd cannot be opened), checks the root, then the member's identity
+/// right before the send. A member whose root check fails is
 /// unassessable and not signalled; on 6.9+, once the group has no member left, it is in another
 /// group that took the number, and is not a survivor. A change between a check and the send is not
 /// seen: the window `Child::kill_tree` documents.
