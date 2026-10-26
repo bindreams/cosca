@@ -351,6 +351,52 @@ fn an_abandonment_nothing_answered_for_hedges() {
     }
 }
 
+/// A cgroup-leaf spawn that tokio failed for a child never told to go, whose leaf could neither hold
+/// nor kill it (`OutOfReach`), says what is known: the child never ran the program, and whether it
+/// was reaped is unknown. It does not hedge that the child "may be left running", and it passes on
+/// what the leaf's abandonment says. A failure that does not hold that fact keeps the hedge.
+///
+/// Mutant: the `OutOfReach` arm hedges "may be left running and nothing can reach it" for a child
+/// never told to go, or every failure gets the never-ran wording.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn an_out_of_reach_child_never_told_to_go_is_said_to_have_never_run() {
+    use crate::child::spawn::failure::SpawnFailure;
+    use crate::containment::AbandonedChild;
+
+    crate::log_capture::install();
+    let marker = "cosca-abandoned-never-told-probe-2c7e";
+    let why = "an abandoned spawn's child sent no handle on itself (Pid(7)); it is not signalled";
+    let abandon = |failure: SpawnFailure| {
+        let mark = crate::log_capture::mark();
+        let _ = super::abandoned_after_handshake(AbandonedChild::OutOfReach(why.into()), failure, None, false);
+        crate::log_capture::records_since_on_current_thread(mark, marker)
+    };
+    let error = || Error::Io(std::io::Error::other(marker));
+
+    let said = abandon(SpawnFailure::NotStartedUnreaped(error()));
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert_eq!(said[0].0, log::Level::Warn, "{said:?}");
+    let text = &said[0].1;
+    assert!(text.contains("the child never ran the program"), "{said:?}");
+    assert!(text.contains("whether it was reaped is unknown"), "{said:?}");
+    assert!(text.contains(why), "{said:?}");
+    assert!(
+        !text.contains("left running") && !text.contains("nothing can reach it"),
+        "{said:?}"
+    );
+    assert!(!text.contains("  "), "{said:?}");
+
+    let said = abandon(SpawnFailure::NotStarted(error()));
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert!(
+        said[0]
+            .1
+            .contains("may be left running and nothing can reach it outside its cgroup v2 leaf"),
+        "{said:?}"
+    );
+}
+
 /// When the handshake already killed and reaped the child, the abandonment does not say it is left
 /// running or unreaped: it states the handshake's answer at `debug`. Only an `OutOfReach`
 /// abandonment still warns, of a descendant outside the leaf, and says the child was reaped.
