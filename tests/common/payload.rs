@@ -233,7 +233,7 @@ impl Sources {
 
     /// See [`wake_acceptor`].
     fn stop_accepting(&self) -> Result<(), String> {
-        wake_acceptor(&self.stop, self.addr, &self.acceptor)
+        wake_acceptor(&self.stop, self.addr)
     }
 
     /// Waits for the launcher watch to return, stops accepting, and returns everything reported
@@ -259,12 +259,13 @@ impl Sources {
 /// process's listener.
 ///
 /// Errs with the connect error if the connection cannot be made: the thread would stay blocked
-/// and joining it would hang. `ConnectionRefused` is tolerated only once `acceptor` has ended; a
-/// refusal with a live acceptor has no known cause.
-fn wake_acceptor(stop: &AtomicBool, addr: SocketAddr, acceptor: &JoinHandle<()>) -> Result<(), String> {
+/// and joining it would hang. `ConnectionRefused` is the exception: with the listener held open,
+/// it means a full backlog (Windows refuses then), and the thread's next `accept` takes a queued
+/// connection and sees `stop`.
+fn wake_acceptor(stop: &AtomicBool, addr: SocketAddr) -> Result<(), String> {
     stop.store(true, Ordering::SeqCst);
     match TcpStream::connect(addr) {
-        Err(e) if e.kind() != std::io::ErrorKind::ConnectionRefused || !acceptor.is_finished() => {
+        Err(e) if e.kind() != std::io::ErrorKind::ConnectionRefused => {
             Err(format!("cannot wake the accepting thread of {addr}: {e}"))
         }
         _ => Ok(()),
