@@ -112,26 +112,85 @@ fn verbatim_unc_server_with_no_plain_spelling_is_refused() {
     );
 }
 
-/// For every small rest without `/`, `\\?\` and that rest is the plain drive path it spells, or
-/// else the device path `\\.\` and that rest.
+/// For every small rest without `/`, `\\?\` and that rest is the plain drive path it spells, the
+/// UNC path `\\` and what follows `UNC\`, or else the device path `\\.\` and that rest. A UNC
+/// server `.` or `?` is refused.
 ///
 /// Mutant: a separator counts as a verbatim drive's unit, so `\\?\\:\` is stored as the rooted
 /// `\:\`.
 #[skuld::test]
 fn verbatim_parses_like_its_plain_spelling() {
-    for rest in small_paths_up_to(5) {
+    for rest in small_paths() {
         if rest.contains('/') {
             continue;
         }
-        let verbatim = p(&format!(r"\\?\{rest}"));
-        let plain = p(&rest);
-        let want = match plain.anchor() {
-            Anchor::Drive { rooted: true, .. } => plain,
-            _ => p(&format!(r"\\.\{rest}")),
+        let input = format!(r"\\?\{rest}");
+        let parsed = PathBuf::parse(input.as_str());
+        let want = if let Some(unc) = rest.strip_prefix(r"UNC\") {
+            if matches!(unc.split('\\').next(), Some("." | "?")) {
+                assert_eq!(parsed, Err(ParseError::UnspellableUncServer), "{input:?}");
+                continue;
+            }
+            let plain = p(&format!(r"\\{unc}"));
+            assert!(matches!(plain.anchor(), Anchor::Unc { .. }), "{input:?}");
+            plain
+        } else {
+            let plain = p(&rest);
+            match plain.anchor() {
+                Anchor::Drive { rooted: true, .. } => plain,
+                _ => p(&format!(r"\\.\{rest}")),
+            }
         };
-        assert_eq!(verbatim, want, "\\\\?\\ then {rest:?}");
-        assert!(!is_verbatim_spelling(verbatim.as_os_str()), "{rest:?} kept its prefix");
+        let verbatim = parsed.unwrap_or_else(|e| panic!("{input:?} refused: {e}"));
+        assert_eq!(verbatim, want, "{input:?}");
+        assert!(!is_verbatim_spelling(verbatim.as_os_str()), "{input:?} kept its prefix");
     }
+}
+
+/// The verbatim cases the small sweep cannot reach: `UNC` with no separator is a device, `UNC\`
+/// alone the UNC path with an empty server, and a drive or a UNC server and share may be any unit,
+/// non-ASCII or a lone surrogate.
+///
+/// Mutant: a verbatim drive is only an ASCII letter, so `\\?\é:\x` is the device `é:`.
+#[skuld::test]
+fn verbatim_unc_and_non_ascii_rests() {
+    assert_eq!(p(r"\\?\UNC").anchor(), Anchor::Device { name: os("UNC") });
+    let empty = p(r"\\?\UNC\");
+    assert_eq!(empty.to_str(), Some(r"\\"));
+    assert_eq!(
+        empty.anchor(),
+        Anchor::Unc {
+            server: os(""),
+            share: os("")
+        }
+    );
+    assert_eq!(p(r"\\?\é:\x"), p(r"é:\x"));
+    assert_eq!(p(r"\\?\é:\x").drive(), Some(drive('é')));
+
+    let units = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
+    let (high, low) = (OsString::from_wide(&[0xD800]), OsString::from_wide(&[0xDC00]));
+    let unc = wide(
+        &[
+            units(r"\\?\UNC\"),
+            vec![0xD800],
+            units(r"\"),
+            vec![0xDC00],
+            units(r"\x"),
+        ]
+        .concat(),
+    );
+    let plain = wide(&[units(r"\\"), vec![0xD800], units(r"\"), vec![0xDC00], units(r"\x")].concat());
+    assert_eq!(unc, plain);
+    assert_eq!(
+        unc.anchor(),
+        Anchor::Unc {
+            server: &high,
+            share: &low
+        }
+    );
+    let lone_drive = wide(&[units(r"\\?\"), vec![0xD800], units(r":\x")].concat());
+    assert_eq!(lone_drive, wide(&[vec![0xD800], units(r":\x")].concat()));
+    assert_eq!(lone_drive.drive(), Some(Drive(0xD800)));
 }
 
 /// Only the exact four units `\\?\` are the verbatim spelling.
@@ -153,19 +212,9 @@ fn verbatim_spelling_is_the_exact_prefix() {
 /// Mutant: the components drop `.` and empty names, as std's do.
 #[skuld::test]
 fn parse_and_spell_round_trip() {
-    for input in small_paths() {
-        let parsed = match PathBuf::parse(input.as_str()) {
-            Ok(path) => path,
-            Err(e) => {
-                assert!(
-                    input.starts_with(r"\\?\") && input[4..].contains('/'),
-                    "{input:?} refused: {e}"
-                );
-                continue;
-            }
-        };
+    for (input, parsed) in parsed_grid(&small_paths()) {
         if !input.starts_with(r"\\?\") {
-            assert_eq!(parsed.to_str(), Some(input.as_str()), "{input:?} was rewritten");
+            assert_eq!(parsed.to_str(), Some(input), "{input:?} was rewritten");
         }
         let again = PathBuf::parse(parsed.as_os_str()).unwrap();
         assert_eq!(again.to_str(), parsed.to_str(), "{input:?} does not reparse to itself");
@@ -374,7 +423,7 @@ fn shape_predicates_follow_the_anchor() {
 }
 
 /// A UNC path needs a non-empty server and share, and a device path more than `\\.` or `\\?`
-/// alone: otherwise it is not fully qualified, as main's `is_absolute_name` has it.
+/// alone: otherwise it is not fully qualified.
 ///
 /// Mutant: any UNC anchor, or a bare `\\.` or `\\?`, counts as fully qualified.
 #[skuld::test]
@@ -517,9 +566,9 @@ fn drive_letters_compare_exactly() {
 /// Mutant: `cmp` compares only the anchor and components, so `\\s` equals `\\s\`.
 #[skuld::test]
 fn order_agrees_with_equality() {
-    let all: Vec<PathBuf> = small_paths_up_to(4)
-        .iter()
-        .filter_map(|s| PathBuf::parse(s.as_str()).ok())
+    let all: Vec<PathBuf> = parsed_grid(&small_paths_up_to(4))
+        .into_iter()
+        .map(|(_, path)| path)
         .collect();
     let state = RandomState::new();
     for a in &all {
@@ -540,10 +589,9 @@ fn order_agrees_with_equality() {
 #[skuld::test]
 fn order_ignores_the_choice_of_separator() {
     // Writing every `/` as `\` would spell the device path `\\?/x` as the verbatim `\\?\x`.
-    let pairs: Vec<(PathBuf, PathBuf)> = small_paths_up_to(4)
-        .iter()
-        .filter_map(|s| PathBuf::parse(s.as_str()).ok())
-        .filter_map(|path| {
+    let pairs: Vec<(PathBuf, PathBuf)> = parsed_grid(&small_paths_up_to(4))
+        .into_iter()
+        .filter_map(|(_, path)| {
             let folded = path.to_str().unwrap().replace('/', "\\");
             (!folded.starts_with(r"\\?\")).then(|| (path, p(&folded)))
         })
@@ -557,7 +605,7 @@ fn order_ignores_the_choice_of_separator() {
     }
 }
 
-/// Order is by anchor, then component by component.
+/// Order is by anchor, then component by component, and anchors in the order `Anchor` declares.
 ///
 /// Mutant: order by the bytes, where `-` sorts before `\`.
 #[skuld::test]
@@ -567,6 +615,38 @@ fn order_is_anchor_then_components() {
     assert!(p(r"\a") < p(r"C:\a"));
     assert!(p(r"C:\z") < p(r"\\s\h"));
     assert!(p(r"\\s\h") < p(r"\\.\d"));
+}
+
+/// Over the small paths, the order is total and groups paths by anchor: sorted, every path is at
+/// most every later one, and so is its anchor.
+///
+/// Mutant: `cmp` compares the components before the anchor, so `C:a` sorts before `\b`.
+#[skuld::test]
+fn order_is_total_and_grouped_by_anchor() {
+    let mut all: Vec<PathBuf> = parsed_grid(&small_paths_up_to(4))
+        .into_iter()
+        .map(|(_, path)| path)
+        .collect();
+    all.sort();
+    for (i, a) in all.iter().enumerate() {
+        for b in &all[i + 1..] {
+            assert!(a <= b, "{a:?} sorted before {b:?}");
+            assert!(a.anchor() <= b.anchor(), "{a:?} sorted before {b:?}");
+        }
+    }
+}
+
+/// Names compare by code point, a lone surrogate at its own value, not by UTF-16 unit: U+1F600
+/// (`D83D DE00`) sorts after U+E000.
+///
+/// Mutant: names compare by their UTF-16 units.
+#[skuld::test]
+fn names_order_by_code_point() {
+    assert!(p("\u{E000}") < p("\u{1F600}"));
+    assert!(p("C:\\\u{FFFF}") < p("C:\\\u{10000}"));
+    let lone = wide(&[0xD800]);
+    assert!(p("\u{D7FF}") < lone);
+    assert!(lone < p("\u{E000}"));
 }
 
 /// A borrowed `Path` finds an owned key spelled with the other separator.
@@ -582,7 +662,8 @@ fn a_set_finds_a_path_by_either_separator() {
 // Join ================================================================================================================
 
 /// `join` follows std's `push`: an rhs with a drive, share or device replaces the lhs; a rooted
-/// rhs keeps the lhs's drive, share or device; a relative rhs appends after a `\`.
+/// rhs keeps the lhs's drive, share or device; a relative rhs appends after a `\`. Each `want` is
+/// std's result.
 ///
 /// Mutant: a rooted rhs replaces the lhs entirely, so `C:\a` joined with `\x` is `\x`.
 #[skuld::test]
@@ -598,19 +679,81 @@ fn join_follows_std() {
         (r"C:\a", "C:x", "C:x"),
         ("a", r"\\s\h", r"\\s\h"),
         (r"C:\a", "b", r"C:\a\b"),
-        (r"C:\a\", "b", r"C:\a\\b"),
         ("C:", "b", "C:b"),
         (r"C:\", "b", r"C:\b"),
         (r"\\s\h", "b", r"\\s\h\b"),
         (r"\\s\h\", "b", r"\\s\h\b"),
         ("", "b", "b"),
-        ("a", "", "a"),
         ("a", "./b", r"a\./b"),
     ];
     for (lhs, rhs, want) in cases {
         let joined = p(lhs).join(&p(rhs));
         assert_eq!(joined.to_str(), Some(want), "{lhs:?} joined with {rhs:?}");
+        assert_std_push(lhs, rhs, want);
     }
+}
+
+/// Where `join` deliberately differs from std's `push`, so that components stay as written: an
+/// lhs ending in a separator still gets one before a relative rhs (std adds none), and an empty
+/// rhs adds nothing (std adds `\`). Past an anchor alone, a trailing separator is the anchor's own,
+/// and std agrees.
+///
+/// Mutant: std's rule, so `C:\a\` joined with `b` is `C:\a\b`, dropping the `Empty` component.
+#[skuld::test]
+fn join_keeps_components_where_std_does_not() {
+    let cases = [
+        (r"C:\a\", "b", r"C:\a\\b", r"C:\a\b"),
+        (r"a\", "b", r"a\\b", r"a\b"),
+        ("a", "", "a", r"a\"),
+        (r"C:\a", "", r"C:\a", r"C:\a\"),
+    ];
+    for (lhs, rhs, want, std_want) in cases {
+        let (lhs_path, rhs_path) = (p(lhs), p(rhs));
+        let joined = lhs_path.join(&rhs_path);
+        assert_eq!(joined.to_str(), Some(want), "{lhs:?} joined with {rhs:?}");
+        let mut want_components: Vec<_> = lhs_path.components().collect();
+        want_components.extend(rhs_path.components());
+        assert_eq!(
+            joined.components().collect::<Vec<_>>(),
+            want_components,
+            "{lhs:?} joined with {rhs:?}"
+        );
+        assert_std_push(lhs, rhs, std_want);
+    }
+}
+
+/// Where `join` differs from std's `push` because std reads an anchor otherwise than Win32 does
+/// (see `std_reads_the_anchor_otherwise`), and where an unfinished anchor's own separator is a
+/// rooted rhs's root (see [`join_completes_an_unfinished_anchor`]).
+///
+/// Mutant: a drive is only an ASCII letter, as in std, so `C:\a` joined with `1:x` is `C:\a\1:x`.
+#[skuld::test]
+fn join_reads_anchors_as_win32_where_std_does_not() {
+    let cases = [
+        (r"C:\a", "1:x", "1:x", r"C:\a\1:x"),
+        ("1:", r"\x", r"1:\x", r"\x"),
+        (r"C:\a", r"\\s", r"\\s", r"C:\\s"),
+        (r"\\?/", r"\x", r"\\?/x", r"\x"),
+        (r"C:\a", r"\\.", r"\\.", r"C:\\."),
+        (r"\\.\", r"\x", r"\\.\x", r"\\.\\x"),
+    ];
+    for (lhs, rhs, want, std_want) in cases {
+        assert_eq!(p(lhs).join(&p(rhs)).to_str(), Some(want), "{lhs:?} joined with {rhs:?}");
+        assert_std_push(lhs, rhs, std_want);
+    }
+}
+
+/// On Windows, that std's `push` of `rhs` onto `lhs` is `want`; elsewhere std has no Windows
+/// paths, and the tables stand as measured on Windows.
+fn assert_std_push(lhs: &str, rhs: &str, want: &str) {
+    #[cfg(windows)]
+    {
+        let mut pushed = std::path::PathBuf::from(lhs);
+        pushed.push(rhs);
+        assert_eq!(pushed.to_str(), Some(want), "std: {lhs:?} pushed with {rhs:?}");
+    }
+    #[cfg(not(windows))]
+    let _ = (lhs, rhs, want);
 }
 
 /// An unfinished UNC or device anchor takes the rhs's first component, as Win32 reads the
@@ -672,10 +815,7 @@ fn join_completes_an_unfinished_anchor_with_or_without_its_separator() {
 #[skuld::test]
 fn an_unfinished_anchor_joins_the_same_with_or_without_its_separator() {
     let rhs_all = small_paths_up_to(3);
-    for lhs in small_paths_up_to(5)
-        .iter()
-        .filter_map(|s| PathBuf::parse(s.as_str()).ok())
-    {
+    for (_, lhs) in parsed_grid(&small_paths_up_to(5)) {
         if parts(lhs.bytes()).unfinished() != Some(true) {
             continue;
         }
@@ -683,11 +823,7 @@ fn an_unfinished_anchor_joins_the_same_with_or_without_its_separator() {
         let without = p(&text[..text.len() - 1]);
         assert_eq!(parts(without.bytes()).unfinished(), Some(false), "{lhs:?}");
         // An empty rhs adds nothing, so it leaves each spelling as it was.
-        for rhs in rhs_all
-            .iter()
-            .filter(|s| !s.is_empty())
-            .filter_map(|s| PathBuf::parse(s.as_str()).ok())
-        {
+        for (_, rhs) in parsed_grid(&rhs_all).into_iter().filter(|(s, _)| !s.is_empty()) {
             assert_eq!(lhs.join(&rhs), without.join(&rhs), "{lhs:?} joined with {rhs:?}");
         }
     }
@@ -717,9 +853,10 @@ fn completing_an_unfinished_anchor_never_spells_verbatim() {
 fn join_reparses_to_itself() {
     let all = small_paths_up_to(4);
     let rhs_all = small_paths_up_to(3);
-    for lhs in all.iter().filter_map(|s| PathBuf::parse(s.as_str()).ok()) {
-        for rhs in rhs_all.iter().filter_map(|s| PathBuf::parse(s.as_str()).ok()) {
-            let joined = lhs.join(&rhs);
+    let rhs_all = parsed_grid(&rhs_all);
+    for (_, lhs) in parsed_grid(&all) {
+        for (_, rhs) in &rhs_all {
+            let joined = lhs.join(rhs);
             let ctx = format!("{lhs:?} joined with {rhs:?} is {joined:?}");
             assert!(!is_verbatim_spelling(joined.as_os_str()), "{ctx}");
             let again = PathBuf::parse(joined.as_os_str()).unwrap();
@@ -739,12 +876,13 @@ fn join_concatenates_components() {
     let mut lhs_all = small_paths_up_to(4);
     lhs_all.extend([r"\\s\h", r"\\s\h\", r"\\s\h\a", r"\\.\d", r"\\.\d\a", r"C:\a"].map(String::from));
     let rhs_all = small_paths_up_to(3);
-    for lhs in lhs_all.iter().filter_map(|s| PathBuf::parse(s.as_str()).ok()) {
+    let rhs_all = parsed_grid(&rhs_all);
+    for (_, lhs) in parsed_grid(&lhs_all) {
         if has_unfinished_anchor(&lhs) {
             continue;
         }
-        for rhs in rhs_all.iter().filter_map(|s| PathBuf::parse(s.as_str()).ok()) {
-            let joined = lhs.join(&rhs);
+        for (_, rhs) in &rhs_all {
+            let joined = lhs.join(rhs);
             let ctx = format!("{lhs:?} joined with {rhs:?} is {joined:?}");
             let keeps_lhs_prefix = matches!(
                 lhs.anchor(),
@@ -832,19 +970,22 @@ fn lexically_normal_keeps_a_drive_like_name_relative() {
     }
 }
 
-/// For every small path, the normal form is a fixed point, has the same anchor, and holds no `.`,
-/// no empty name but a last one after a name, and no `..` after a name or at a root.
+/// For every small path, the normal form is a fixed point, has the same anchor, holds the names
+/// and `..` a stack reduction of the components leaves, and holds no `.`, no empty name but a last
+/// one after a name, and no `..` after a name or at a root.
 ///
-/// Mutant: `..` at a drive's root is kept.
+/// Mutant: `name\..` drops the `..` and keeps the name, so `a\..\b` becomes `a\b`.
 #[skuld::test]
 fn lexically_normal_result_is_normal() {
-    for input in small_paths() {
-        let Ok(path) = PathBuf::parse(input.as_str()) else {
-            continue;
-        };
+    for (input, path) in parsed_grid(&small_paths()) {
         let normal = path.lexically_normal();
         assert_eq!(normal.lexically_normal(), normal, "not idempotent on {input:?}");
         assert_eq!(normal.anchor(), path.anchor(), "anchor of {input:?}");
+        let kept: Vec<_> = normal
+            .components()
+            .filter(|c| matches!(c, Component::Normal(_) | Component::ParentDir))
+            .collect();
+        assert_eq!(kept, reduce(&path), "names of the normal form of {input:?}");
         if normal.to_str() == Some(".") {
             continue;
         }
@@ -867,6 +1008,26 @@ fn lexically_normal_result_is_normal() {
             }
         }
     }
+}
+
+/// The names and `..` left after reducing `path`'s components on a stack: a name is pushed, `..`
+/// pops a name, is dropped at a root, and is pushed otherwise; `.` and empty names vanish.
+fn reduce(path: &Path) -> Vec<Component<'_, OsStr>> {
+    let mut stack = Vec::new();
+    for c in path.components() {
+        match c {
+            Component::Normal(_) => stack.push(c),
+            Component::ParentDir => match stack.last() {
+                Some(Component::Normal(_)) => {
+                    stack.pop();
+                }
+                None if has_root_separator(path) => {}
+                _ => stack.push(c),
+            },
+            Component::CurDir | Component::Empty => {}
+        }
+    }
+    stack
 }
 
 // Parent and file name ================================================================================================
@@ -902,10 +1063,7 @@ fn parent_drops_only_the_last_component() {
 /// Mutant: `parent` cuts at the offset within the components, dropping the anchor.
 #[skuld::test]
 fn parent_is_the_components_minus_the_last() {
-    for input in small_paths() {
-        let Ok(path) = PathBuf::parse(input.as_str()) else {
-            continue;
-        };
+    for (input, path) in parsed_grid(&small_paths()) {
         let all: Vec<_> = path.components().collect();
         let Some(parent) = path.parent() else {
             assert!(all.is_empty(), "{input:?} has components and no parent");
@@ -985,10 +1143,7 @@ fn set_file_name_replaces_only_a_name() {
 /// Mutant: `set_file_name` is `pop` then `push`, which turns `C:\\x` into `C:\z`.
 #[skuld::test]
 fn set_file_name_changes_only_the_last_component() {
-    for input in small_paths() {
-        let Ok(path) = PathBuf::parse(input.as_str()) else {
-            continue;
-        };
+    for (input, path) in parsed_grid(&small_paths()) {
         if has_unfinished_anchor(&path) {
             continue;
         }
@@ -1031,7 +1186,7 @@ fn wide_round_trips() {
         vec![],
     ] {
         let path = wide(&units);
-        assert_eq!(path.to_wide(), units, "{units:X?}");
+        assert_eq!(path.as_os_str().to_wide(), units, "{units:X?}");
         assert_eq!(OsString::from_wide(&units).to_wide(), units, "{units:X?}");
     }
 }
@@ -1051,6 +1206,10 @@ fn a_surrogate_pair_is_one_character() {
 fn native_bytes_are_utf16le() {
     let path = wide(&[u16::from(b'a'), 0xD800]);
     assert_eq!(path.to_native_bytes(), Cow::<[u8]>::Owned(vec![b'a', 0, 0x00, 0xD8]));
+    assert_eq!(
+        p("\u{1F600}").to_native_bytes(),
+        Cow::<[u8]>::Owned(vec![0x3D, 0xD8, 0x00, 0xDE])
+    );
 }
 
 /// `to_str` is exact or nothing; `to_string_lossy` replaces each lone surrogate with one U+FFFD.
@@ -1097,23 +1256,28 @@ fn display_debug_is_the_path_debug() {
     }
 }
 
-/// The `std` conversions keep every unit, lone surrogates included.
+/// The `std` conversions keep every unit, lone surrogates included, and `from_std_path` parses as
+/// `parse` does, refusals included. They exist only on Windows, where std's strings are UTF-16, so
+/// only the Windows lanes run this.
 ///
-/// Mutant: `to_std_path` goes through the lossy string.
+/// Mutant: `to_std_os_string` goes through the lossy string.
 #[cfg(windows)]
 #[skuld::test]
 fn std_conversions_round_trip() {
     use std::os::windows::ffi::OsStrExt;
     let units = c_root_then(&[0xD800, u16::from(b'x')]);
     let path = wide(&units);
-    let std_path = path.to_std_path();
-    assert_eq!(std_path.as_os_str().encode_wide().collect::<Vec<_>>(), units);
-    assert_eq!(PathBuf::from_std_path(&std_path).unwrap(), path);
+    let std_os = path.as_os_str().to_std_os_string();
+    assert_eq!(std_os.encode_wide().collect::<Vec<_>>(), units);
+    assert_eq!(PathBuf::from_std_path(std::path::Path::new(&std_os)).unwrap(), path);
     assert_eq!(
         PathBuf::from_std_path(std::path::Path::new(r"\\?\C:\x")).unwrap(),
         p(r"C:\x")
     );
-    assert_eq!(path.as_os_str().to_std_os_string(), std_path.into_os_string());
+    assert_eq!(
+        PathBuf::from_std_path(std::path::Path::new(r"\\?\UNC\.\x")),
+        Err(ParseError::UnspellableUncServer)
+    );
     let std_os = std::ffi::OsString::from("é");
     assert_eq!(OsString::from(std_os.as_os_str()).to_str(), Some("é"));
 }
@@ -1123,23 +1287,46 @@ fn reads_as_drive(c: &Component<'_, OsStr>) -> bool {
     matches!(c, Component::Normal(name) if p(name.to_str().unwrap()).drive().is_some())
 }
 
-/// Every path over `{a, ., :, ?, \, /}` of up to five units.
+/// Every path of up to five units over `{a, ., :, ?, \, /}`, and over the same with `a` replaced by
+/// `U`, `N`, `C` and `é`, which reach `UNC` and a drive past ASCII.
 fn small_paths() -> Vec<String> {
-    small_paths_up_to(5)
+    let mut all = small_paths_up_to(5);
+    all.extend(paths_over(&["U", "N", "C", "é", ".", ":", "?", "\\", "/"], 5));
+    all.sort_unstable();
+    all.dedup();
+    all
 }
 
 /// Every path over `{a, ., :, ?, \, /}` of up to `max_len` units.
 fn small_paths_up_to(max_len: usize) -> Vec<String> {
+    paths_over(&["a", ".", ":", "?", "\\", "/"], max_len)
+}
+
+/// Every string of up to `max_len` letters of `alphabet`.
+fn paths_over(alphabet: &[&str], max_len: usize) -> Vec<String> {
     let mut all = vec![String::new()];
     let mut level = vec![String::new()];
     for _ in 0..max_len {
         level = level
             .iter()
-            .flat_map(|s| ["a", ".", ":", "?", "\\", "/"].map(|c| format!("{s}{c}")))
+            .flat_map(|s| alphabet.iter().map(move |c| format!("{s}{c}")))
             .collect();
         all.extend(level.iter().cloned());
     }
     all
+}
+
+/// Each of `inputs` with its parse. Only a verbatim spelling holding `/` may be refused; it is
+/// skipped. Any other refusal fails the test.
+fn parsed_grid(inputs: &[String]) -> Vec<(&str, PathBuf)> {
+    inputs
+        .iter()
+        .filter_map(|s| match PathBuf::parse(s.as_str()) {
+            Ok(path) => Some((s.as_str(), path)),
+            Err(ParseError::SlashInVerbatim) if s.starts_with(r"\\?\") => None,
+            Err(e) => panic!("{s:?} refused: {e}"),
+        })
+        .collect()
 }
 
 /// The length of the anchor's text without its root separator.
@@ -1156,4 +1343,87 @@ fn has_root_separator(path: &Path) -> bool {
 /// device path with no name, and no root separator after it.
 fn has_unfinished_anchor(path: &Path) -> bool {
     parts(path.bytes()).unfinished().is_some()
+}
+
+// Agreement with std ==================================================================================================
+
+/// Whether std reads the anchor otherwise than Win32, and so this crate, does. std takes only an
+/// ASCII letter for a drive (Win32 takes any unit: `1:`, `::`); reads a UNC path missing its server
+/// or share (`\\s`) as a root and names; and reads the nameless devices `\\.`, `\\?` and `\\?/` as a
+/// root and a name, or as UNC. (`\\?/d` it reads as the UNC server `?` and share `d`, which agrees
+/// in every check here.)
+#[cfg(windows)]
+fn std_reads_the_anchor_otherwise(path: &Path) -> bool {
+    match path.anchor() {
+        Anchor::Drive { drive, .. } => !u8::try_from(drive.unit()).is_ok_and(|b| b.is_ascii_alphabetic()),
+        Anchor::Unc { server, share } => server.as_wtf8().is_empty() || share.as_wtf8().is_empty(),
+        Anchor::Device { name } => name.as_wtf8().is_empty() && (path.bytes()[2] == b'?' || path.bytes().len() == 3),
+        Anchor::None | Anchor::Rooted => false,
+    }
+}
+
+/// The names and `..` of `path`, the components std and this crate both keep.
+#[cfg(windows)]
+fn std_names(path: &std::path::Path) -> Vec<String> {
+    path.components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(name) => Some(name.to_str().unwrap().to_owned()),
+            std::path::Component::ParentDir => Some("..".to_owned()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Over every pair of small paths whose anchors std reads as Win32 does, `join` is std's `push`,
+/// and `is_absolute` and the names and `..` of the components are std's. The only deviations are
+/// those [`join_keeps_components_where_std_does_not`] lists: an empty rhs, and a relative rhs
+/// after a component and a trailing separator.
+///
+/// Mutant: a relative rhs after a share gets no separator, so `\\s\h` joined with `b` is `\\s\hb`.
+#[cfg(windows)]
+#[skuld::test]
+fn join_shape_and_names_agree_with_std() {
+    let std_of = |path: &Path| std::path::PathBuf::from(path.as_os_str().to_std_os_string());
+    let keep = |path: &PathBuf| !std_reads_the_anchor_otherwise(path);
+    let lhs_all: Vec<PathBuf> = parsed_grid(&small_paths_up_to(4))
+        .into_iter()
+        .map(|(_, path)| path)
+        .filter(keep)
+        .collect();
+    let rhs_all: Vec<PathBuf> = parsed_grid(&small_paths_up_to(3))
+        .into_iter()
+        .map(|(_, path)| path)
+        .filter(|path| keep(path) && !path.as_os_str().as_wtf8().is_empty())
+        .collect();
+    for lhs in &lhs_all {
+        let std_lhs = std_of(lhs);
+        assert_eq!(lhs.is_absolute(), std_lhs.is_absolute(), "is_absolute of {lhs:?}");
+        let names: Vec<String> = lhs
+            .components()
+            .filter_map(|c| match c {
+                Component::Normal(name) => Some(name.to_str().unwrap().to_owned()),
+                Component::ParentDir => Some("..".to_owned()),
+                Component::CurDir | Component::Empty => None,
+            })
+            .collect();
+        assert_eq!(names, std_names(&std_lhs), "names of {lhs:?}");
+        let separator_after_component = lhs.components().next_back() == Some(Component::Empty);
+        for rhs in &rhs_all {
+            let deviates = match rhs.anchor() {
+                Anchor::None => separator_after_component,
+                Anchor::Rooted => has_unfinished_anchor(lhs),
+                _ => false,
+            };
+            if deviates {
+                continue;
+            }
+            let mut std_joined = std_lhs.clone();
+            std_joined.push(std_of(rhs));
+            assert_eq!(
+                lhs.join(rhs).to_str(),
+                std_joined.to_str(),
+                "{lhs:?} joined with {rhs:?}"
+            );
+        }
+    }
 }

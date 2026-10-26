@@ -66,7 +66,8 @@ impl OsStr {
         OsString(self.0.to_vec())
     }
 
-    /// The string as a `std` OS string, unit for unit.
+    /// The string as a `std` OS string, unit for unit. A path's [stored text](super::Path::as_os_str)
+    /// stays a lexical spelling, not a string for Win32.
     #[cfg(windows)]
     pub fn to_std_os_string(&self) -> std::ffi::OsString {
         use std::os::windows::ffi::OsStringExt;

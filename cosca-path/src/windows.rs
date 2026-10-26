@@ -4,12 +4,19 @@
 //! path types (`RtlDetermineDosPathNameType_U`): two separators and `.` or `?` and a separator
 //! start a device path, any other two separators a UNC path, one a rooted path, and any one UTF-16
 //! unit then `:` a drive. A repeated or trailing separator is an
-//! [`Empty`](crate::Component::Empty) component, so the anchor and the components spell the path
-//! back exactly.
+//! [`Empty`](crate::Component::Empty) component, so the anchor's text, its root separator and the
+//! components spell the path back, up to the choice of separator. The [`Anchor`] value alone does
+//! not: `\\s` and `\\s\`, `\\.\x` and `\\?/x`, `C:/a` and `C:\a` each share an anchor and
+//! components.
 //!
 //! Parsing drops a verbatim `\\?\` prefix: `\\?\C:\x` is stored as `C:\x`, `\\?\UNC\s\h` as
 //! `\\s\h`, and any other verbatim rest as the device path `\\.\` and that rest. Stored text never
 //! starts with `\\?\`.
+//!
+//! So the stored text ([`Path::as_os_str`]) is a lexical spelling, not a string to hand Win32.
+//! Win32 reads `\\?\C:\a.` as written but the stored `C:\a.` as `C:\a`, and `\\?\C:\nul` as a
+//! file but `C:\nul` as the NUL device; the stored text also loses a long verbatim path's exemption
+//! from `MAX_PATH`. Nothing here converts a path for Win32.
 
 use std::borrow::{Borrow, Cow};
 use std::cmp::Ordering;
@@ -39,6 +46,9 @@ impl Drive {
 }
 
 /// What a path is anchored to. A verbatim `\\?\` spelling parses to the same anchors.
+///
+/// Ordered by variant as declared, then by drive unit and `rooted`, by server then share, or by
+/// name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Anchor<'a> {
     /// `a\b`, relative to the current directory.
@@ -82,8 +92,8 @@ fn next_separator(bytes: &[u8], from: usize) -> usize {
         .map_or(bytes.len(), |i| from + i)
 }
 
-/// The byte length of a leading drive, one UTF-16 unit and `:`, or `None`. A lead byte of up to
-/// three bytes is one unit; a four-byte one is two. The caller rules out a separator unit.
+/// The byte length of a leading drive, one UTF-16 unit and `:`, or `None`. The caller rules out a
+/// separator unit.
 fn drive_len(bytes: &[u8]) -> Option<usize> {
     let unit = match *bytes.first()? {
         b if b < 0x80 => 1,
@@ -100,7 +110,6 @@ fn reads_as_drive(name: &[u8]) -> bool {
 }
 
 impl<'a> Component<'a, OsStr> {
-    /// The component as written.
     fn as_wtf8(&self) -> &'a [u8] {
         match self {
             Component::CurDir => b".",
@@ -267,6 +276,7 @@ impl Path {
         parts(self.bytes())
     }
 
+    /// The stored text: a lexical spelling, not a string for Win32 (see the [module docs](self)).
     pub fn as_os_str(&self) -> &OsStr {
         &self.0
     }
@@ -303,7 +313,7 @@ impl Path {
         matches!(self.anchor(), Anchor::Drive { rooted: false, .. })
     }
 
-    /// Whether the anchor is [`Anchor::Rooted`]: `\a`, relative to the current drive or share.
+    /// Whether the anchor is [`Anchor::Rooted`].
     pub fn is_rooted(&self) -> bool {
         self.anchor() == Anchor::Rooted
     }
@@ -319,17 +329,6 @@ impl Path {
             }),
             _ => None,
         }
-    }
-
-    /// The path as UTF-16 units, as written.
-    pub fn to_wide(&self) -> Vec<u16> {
-        self.0.to_wide()
-    }
-
-    /// The path as a `std` path, unit for unit.
-    #[cfg(windows)]
-    pub fn to_std_path(&self) -> std::path::PathBuf {
-        self.0.to_std_os_string().into()
     }
 
     /// Whether appending a relative path needs a `\` first.
@@ -389,7 +388,8 @@ impl PurePath for Path {
     /// keeps `self`'s drive, share or device and replaces the rest; any other `rhs` is appended
     /// after a `\` where one is needed (`C:` joined with `a` is `C:a`). An unfinished anchor takes
     /// the first appended component as its own, as Win32 reads the string: `\\s` and `\\s\`
-    /// joined with `h` are both the share `\\s\h`. `\\?` joined with `x` is `\\?/x`, not the verbatim `\\?\x`.
+    /// joined with `h` are both the share `\\s\h`. `\\?` joined with `x` is `\\?/x` (see
+    /// `respell_verbatim`).
     fn join(&self, rhs: &Path) -> PathBuf {
         match rhs.anchor() {
             Anchor::None => {}
@@ -506,8 +506,10 @@ impl PurePath for Path {
         self.0.to_string_lossy()
     }
 
+    /// The stored text as UTF-16LE: an encoding of the spelling, not a string for Win32 (see the
+    /// [module docs](self)).
     fn to_native_bytes(&self) -> Cow<'_, [u8]> {
-        Cow::Owned(self.to_wide().into_iter().flat_map(u16::to_le_bytes).collect())
+        Cow::Owned(self.0.to_wide().into_iter().flat_map(u16::to_le_bytes).collect())
     }
 }
 
@@ -643,6 +645,7 @@ impl PathBuf {
         Path::from_os_str(&self.0)
     }
 
+    /// The stored text, as [`Path::as_os_str`].
     pub fn into_os_string(self) -> OsString {
         self.0
     }
