@@ -342,9 +342,24 @@ pub(crate) fn start_forced(mode: Mode, force: &str) -> Pending {
     launch(mode, Some(force))
 }
 
+/// Throwaway (#805) diagnostic: one stderr line stamped with wall-clock milliseconds.
+pub(crate) fn diag805(what: &str) {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    let line = format!(
+        "[805] {ms} pid {} {what}
+",
+        std::process::id()
+    );
+    eprint!("{line}");
+}
+
 fn launch(mode: Mode, force: Option<&str>) -> Pending {
     let exe_dir = tempfile::tempdir().expect("create a directory for the signed helper");
+    diag805("launch: signing a copy");
     let exe = debugger_signed_copy(exe_dir.path());
+    diag805("launch: signed; spawning the helper");
     let marker = DEFAULT_MARKER.to_string();
     let mut cmd = crate::test_reexec::command(exe);
     cmd.args(crate::test_reexec::fixture_args(crate::test_child::fixture_path!(
@@ -365,6 +380,7 @@ fn launch(mode: Mode, force: Option<&str>) -> Pending {
     // Under `spawn_lock()` (via `test_spawn`): macOS pipes get `FD_CLOEXEC` after `pipe()`, so a
     // concurrent fork could otherwise inherit this helper's pipe ends.
     let mut helper = crate::test_spawn::spawn(&mut cmd).expect("spawn the tracer helper");
+    diag805(&format!("launch: spawned helper {}", helper.id()));
     UNREAPED.set(UNREAPED.get() + 1);
     let signal_tx = helper.stdin.take().expect("the helper's stdin is piped");
     let rx = std::io::BufReader::new(helper.stdout.take().expect("the helper's stdout is piped"));
@@ -394,7 +410,8 @@ pub(crate) fn debugger_signed_copy(dir: &std::path::Path) -> std::path::PathBuf 
         // Writes and the fork under one guard, as `test_child::cwd_and_path_tools` does: no
         // concurrent fork may hold the copy's writable descriptor.
         let _guard = crate::child::spawn::spawn_lock();
-        std::fs::copy(std::env::current_exe().expect("current_exe"), &exe).expect("copy the test binary");
+        let size = std::fs::copy(std::env::current_exe().expect("current_exe"), &exe).expect("copy the test binary");
+        diag805(&format!("signed copy: copied {size} bytes"));
         std::fs::write(&plist, ENTITLEMENTS).expect("write the entitlements plist");
         let mut cmd = std::process::Command::new("/usr/bin/codesign");
         cmd.args(["--sign", "-", "--force", "--entitlements"])
@@ -411,6 +428,7 @@ pub(crate) fn debugger_signed_copy(dir: &std::path::Path) -> std::path::PathBuf 
         cmd.spawn().expect("spawn codesign")
     };
     let out = codesign.wait_with_output().expect("wait for codesign");
+    diag805("signed copy: codesign done");
     assert!(
         out.status.success(),
         "codesign of the tracer helper failed ({}): {}{}",
@@ -776,6 +794,7 @@ fn uh_helper_entry() {
     if std::env::var("COSCA_UH_ROLE").as_deref() != Ok("helper") {
         return;
     }
+    diag805("helper entry");
     machine::main();
 }
 

@@ -199,12 +199,17 @@ fn a_wait_on_a_child_whose_tracer_is_traced_watches_that_tracers_tracer(#[fixtur
     use std::rc::Rc;
 
     use crate::wait::backend::await_reapable_on;
+    let d = tracer::diag805;
+    d("test: start");
     let (tracee, stdin, unique) = tracee_with_unique();
+    d("test: tracee ready");
     let pid = tracee.id().pid();
     let mut inner = tracer::start(Mode::Auto).attach_unheld(pid);
     assert_eq!(inner.recv(), Report::Attached);
+    d("test: inner attached");
     let mut outer = tracer::start(Mode::Auto).attach_unheld(inner.helper_pid());
     assert_eq!(outer.recv(), Report::Attached);
+    d("test: outer attached");
     let outer_pid = outer.helper_pid();
     let stdin = RefCell::new(Some(stdin));
     let watched = Rc::new(Cell::new(None));
@@ -225,6 +230,7 @@ fn a_wait_on_a_child_whose_tracer_is_traced_watches_that_tracers_tracer(#[fixtur
         }
     });
     let waited = await_reapable_on(&kq, pid, Some(unique), None).expect("wait");
+    d("test: wait returned");
     assert_eq!(
         watched.get(),
         Some(true),
@@ -232,12 +238,15 @@ fn a_wait_on_a_child_whose_tracer_is_traced_watches_that_tracers_tracer(#[fixtur
     );
     assert_eq!(waited, Waited::Reapable);
     assert_eq!(inner.recv(), Report::Reaped);
+    d("test: inner reaped");
     // The inner helper's exit goes to the outer one, its tracer and parent, which hands it back
     // when it reaps it; until then this process's reap of it fails with `ECHILD`.
     inner.close_signal_pipe();
     assert_eq!(outer.recv(), Report::Reaped);
+    d("test: outer reaped");
     drop(inner);
     drop(outer);
     let status = tracee.wait().expect("the handed-back zombie is ours to reap");
     assert!(status.success(), "{status:?}");
+    d("test: end");
 }
