@@ -35,7 +35,11 @@ async fn tokio_kill_tree_kills_the_group_of_a_root_reaped_elsewhere(#[fixture(pi
     let result = child.kill_tree();
     let steps = capture.group_steps();
     result.expect("the group is killed through the root's pidfd");
-    assert_eq!(steps.first(), Some(&GroupStep::Group(Route::Pidfd)), "{steps:?}");
+    assert_eq!(
+        steps.first(),
+        Some(&GroupStep::Group(Route::Pidfd, libc::SIGKILL)),
+        "{steps:?}"
+    );
     member.assert_killed();
 }
 
@@ -69,7 +73,11 @@ async fn tokio_terminate_tree_signals_the_group_of_a_root_reaped_elsewhere(
     let result = child.terminate_tree();
     let steps = capture.group_steps();
     result.expect("the group is signalled through the root's pidfd");
-    assert_eq!(steps.first(), Some(&GroupStep::Group(Route::Pidfd)), "{steps:?}");
+    assert_eq!(
+        steps.first(),
+        Some(&GroupStep::Group(Route::Pidfd, libc::SIGTERM)),
+        "{steps:?}"
+    );
     member.assert_killed();
 }
 
@@ -103,7 +111,11 @@ async fn tokio_graceful_shutdown_tree_shuts_down_the_group_of_a_root_reaped_else
     let capture = Capture::start();
     let result = child.graceful_shutdown_tree(std::time::Duration::from_secs(1)).await;
     let steps = capture.group_steps();
-    assert_eq!(steps.first(), Some(&GroupStep::Group(Route::Pidfd)), "{steps:?}");
+    assert_eq!(
+        steps.first(),
+        Some(&GroupStep::Group(Route::Pidfd, libc::SIGTERM)),
+        "{steps:?}"
+    );
     ended.assert_killed_by_the_sigterm();
     assert_down_without_status(result, mark);
 }

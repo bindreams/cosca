@@ -143,7 +143,11 @@ fn kill_tree_kills_the_group_of_a_root_reaped_elsewhere(#[fixture(pidfd_group_si
     let result = child.kill_tree();
     let steps = capture.group_steps();
     result.expect("the group is killed through the root's pidfd");
-    assert_eq!(steps.first(), Some(&GroupStep::Group(Route::Pidfd)), "{steps:?}");
+    assert_eq!(
+        steps.first(),
+        Some(&GroupStep::Group(Route::Pidfd, libc::SIGKILL)),
+        "{steps:?}"
+    );
     member.assert_killed();
 }
 
@@ -180,9 +184,9 @@ fn kill_tree_below_6_9_kills_the_group_by_number_after_this_handles_own_reap() {
         steps.get(..3),
         Some(
             &[
-                GroupStep::Group(Route::Pidfd),
+                GroupStep::Group(Route::Pidfd, libc::SIGKILL),
                 GroupStep::Check,
-                GroupStep::Group(Route::Number)
+                GroupStep::Group(Route::Number, libc::SIGKILL)
             ][..]
         ),
         "{steps:?}"
@@ -206,7 +210,11 @@ fn kill_tree_of_a_root_its_handle_cannot_read_kills_its_group_through_the_pidfd(
     drop(forced);
     let steps = capture.group_steps();
     result.expect("the group is killed through the root's pidfd");
-    assert_eq!(steps.first(), Some(&GroupStep::Group(Route::Pidfd)), "{steps:?}");
+    assert_eq!(
+        steps.first(),
+        Some(&GroupStep::Group(Route::Pidfd, libc::SIGKILL)),
+        "{steps:?}"
+    );
     member.assert_killed();
 }
 
@@ -384,7 +392,11 @@ fn terminate_tree_signals_the_group_of_a_root_reaped_elsewhere(#[fixture(pidfd_g
     let result = child.terminate_tree();
     let steps = capture.group_steps();
     result.expect("the group is signalled through the root's pidfd");
-    assert_eq!(steps.first(), Some(&GroupStep::Group(Route::Pidfd)), "{steps:?}");
+    assert_eq!(
+        steps.first(),
+        Some(&GroupStep::Group(Route::Pidfd, libc::SIGTERM)),
+        "{steps:?}"
+    );
     member.assert_killed();
 }
 
@@ -421,7 +433,11 @@ fn graceful_shutdown_tree_shuts_down_the_group_of_a_root_reaped_elsewhere(
     let capture = Capture::start();
     let result = child.graceful_shutdown_tree(std::time::Duration::from_secs(1));
     let steps = capture.group_steps();
-    assert_eq!(steps.first(), Some(&GroupStep::Group(Route::Pidfd)), "{steps:?}");
+    assert_eq!(
+        steps.first(),
+        Some(&GroupStep::Group(Route::Pidfd, libc::SIGTERM)),
+        "{steps:?}"
+    );
     ended.assert_killed_by_the_sigterm();
     assert_down_without_status(result, mark);
 }

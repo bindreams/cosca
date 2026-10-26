@@ -3,7 +3,7 @@
 //! nothing goes out by the group's number.
 
 use super::group_exact_tests::root_with_a_member;
-use crate::send_log::{Capture, GroupStep, Route};
+use crate::send_log::{assert_group_signalled_first_through_the_pidfd, Capture};
 use crate::test_child::reaped_elsewhere::reap_behind;
 use crate::test_groups::{pidfd_group_signal, Group};
 
@@ -62,11 +62,7 @@ async fn kills_the_group_left_behind(reap: Reap, teardown: Teardown) {
     let capture = Capture::start();
     tear_down(child, teardown);
     let steps = capture.group_steps();
-    assert_eq!(steps.first(), Some(&GroupStep::Group(Route::Pidfd)), "{steps:?}");
-    assert!(
-        !steps.contains(&GroupStep::Group(Route::Number)),
-        "nothing went by the group's number: {steps:?}"
-    );
+    assert_group_signalled_first_through_the_pidfd(&steps, libc::SIGKILL);
     member.assert_killed();
 }
 

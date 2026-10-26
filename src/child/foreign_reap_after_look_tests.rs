@@ -46,7 +46,7 @@ pub(crate) fn assert_nothing_by_number(steps: &[GroupStep]) {
     assert!(
         !steps.iter().any(|s| matches!(
             s,
-            GroupStep::Group(Route::Number) | GroupStep::Leader(Route::Number) | GroupStep::Member(..)
+            GroupStep::Group(Route::Number, _) | GroupStep::Leader(Route::Number, _) | GroupStep::Member(..)
         )),
         "nothing went by the group's number: {steps:?}"
     );

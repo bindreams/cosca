@@ -278,9 +278,9 @@ fn an_abandoned_childs_group_kill_by_number_follows_its_own_check() {
     assert_eq!(
         capture.group_steps(),
         [
-            GroupStep::Group(Route::Pidfd),
+            GroupStep::Group(Route::Pidfd, libc::SIGKILL),
             GroupStep::Check,
-            GroupStep::Group(Route::Number)
+            GroupStep::Group(Route::Number, libc::SIGKILL)
         ]
     );
     assert_eq!(fault::take_child_sends(), [ChildSend::Group, ChildSend::Handle]);
@@ -296,7 +296,7 @@ fn an_abandoned_childs_group_kill_goes_through_its_handle(#[fixture(pidfd_group_
     let capture = crate::send_log::Capture::start();
 
     assert_eq!(end_child(&received), ChildFate::Killed);
-    assert_eq!(capture.group_steps(), [GroupStep::Group(Route::Pidfd)]);
+    assert_eq!(capture.group_steps(), [GroupStep::Group(Route::Pidfd, libc::SIGKILL)]);
 }
 
 /// A child reaped elsewhere after the look gets no group kill by its number: the check right before
@@ -320,10 +320,13 @@ fn an_abandoned_child_reaped_before_its_group_kill_by_number_is_not_sent_it() {
     drop(refused);
     assert_eq!(
         capture.group_steps(),
-        [GroupStep::Group(Route::Pidfd), GroupStep::Check]
+        [GroupStep::Group(Route::Pidfd, libc::SIGKILL), GroupStep::Check]
     );
     assert!(
-        !capture.group_steps().contains(&GroupStep::Group(Route::Number)),
+        !capture
+            .group_steps()
+            .iter()
+            .any(|s| matches!(s, GroupStep::Group(Route::Number, _))),
         "nothing went by the number"
     );
     assert_eq!(fate, ChildFate::Gone);
