@@ -159,8 +159,12 @@ impl Child {
             crate::elevation::front::Gate::Open => self.proc.kill().map_err(Error::Io)?,
             // A live front in its cgroup: killed through it, and nothing signalled after it.
             crate::elevation::front::Gate::CgroupOnly => {
+                let check = || self.group_number_holds();
                 self.attached
-                    .hard_kill_marking(&self.tree_killed)
+                    .hard_kill_marking(
+                        &self.tree_killed,
+                        &crate::containment::GroupRoot::new(self.proc.pidfd(), &check),
+                    )
                     .map_err(|e| crate::elevation::front::cgroup_kill_failed(self.front, self.id.pid(), e))?;
                 self.cgroup_kill_reached()?;
             }
@@ -251,18 +255,26 @@ impl Child {
     /// A refused Linux `pidfd_open` while watching the root is `Unsupported` (see [`Error::Unsupported`](crate::error::Error::Unsupported)); it is a
     /// watch failure, so the sweep still runs.
     ///
-    /// **A root reaped by something else** (see [`kill_tree`](Child::kill_tree)): nothing goes out by
-    /// the root's number, and the call ends with one `warn` and
-    /// [`Error::Unassessable`](crate::error::Error::Unassessable), with no sweep. A macOS fd marker's
-    /// holders, named by the pipe they hold, still get the `SIGTERM`, the grace, and a kill of any
-    /// left, whose error is returned if it fails; any other mechanism ends at once, with no grace.
+    /// **A root reaped by something else** (see [`kill_tree`](Child::kill_tree)):
+    ///
+    /// - On Linux 6.9+ a process group that still has a member gets the `SIGTERM` through the
+    ///   root's pidfd, then the sweep at once: the grace watches only the root, which is gone. One
+    ///   with none left has nothing to shut down. Either way, once the tree is down the call
+    ///   returns [`Error::Unassessable`](crate::error::Error::Unassessable) saying so, with no
+    ///   `warn`: the root's exit status went to the other reaper.
+    /// - Otherwise nothing goes out by the root's number, and the call ends with one `warn` and
+    ///   [`Error::Unassessable`](crate::error::Error::Unassessable), with no sweep. A macOS fd
+    ///   marker's holders, named by the pipe they hold, still get the `SIGTERM`, the grace, and a
+    ///   kill of any left, whose error is returned if it fails; any other mechanism ends at once,
+    ///   with no grace.
+    ///
     /// On Linux, a root whose handle cannot say whether it was reaped still gets the `SIGTERM`
-    /// through its pidfd, which names it exactly, then the grace, and a kill through the pidfd if it
-    /// is still running; nothing goes out by its number, and the call ends the same way.
-    /// After this handle's own reap, with another process at the pid, the group is empty: only the
-    /// holders get the `SIGTERM`, and the call goes on as usual. The `SIGTERM` and the sweep each
-    /// decide on a look of their own at the root, and each has `kill_tree`'s window between its look
-    /// and its sends: a reap after the look by another reaper is not seen.
+    /// through its pidfd, which names it exactly, then the grace, and a kill through the pidfd if
+    /// it is still running; nothing goes out by its number, and the call ends the same way. On 6.9+
+    /// its group is shut down as usual while it has a member. After this handle's own reap, with
+    /// another process at the pid, the group is empty: only the holders get the `SIGTERM`, and the
+    /// call goes on as usual. The `SIGTERM` and the sweep each decide on a look of their own at the
+    /// root, and each send by the group's number after it is checked as for `kill_tree`.
     ///
     /// **macOS, a root the handle cannot vouch for** is signalled as for
     /// [`terminate_tree`](Child::terminate_tree) and swept as for [`kill_tree`](Child::kill_tree). A
@@ -290,7 +302,13 @@ impl Child {
         #[cfg(unix)]
         let held = self.proc.hold_reaps();
         #[cfg(unix)]
-        let (decided, earlier) = match call.graceful(|| held.state_and_own_reap()) {
+        let check = || super::tree_call::group_number_holds(self.id.pid(), held.state_and_own_reap());
+        #[cfg(unix)]
+        let group = crate::containment::GroupRoot::new(self.proc.pidfd(), &check);
+        #[cfg(not(unix))]
+        let group = crate::containment::GroupRoot::none();
+        #[cfg(unix)]
+        let (decided, earlier) = match call.graceful(|| held.state_and_own_reap(), &group) {
             crate::child::Graceful::Signal => (None, Some("the SIGTERM")),
             crate::child::Graceful::Sent { result, earlier } => (Some(result), earlier),
             crate::child::Graceful::End(e) => return Err(e),
@@ -310,7 +328,7 @@ impl Child {
             if let Some(result) = decided {
                 return result;
             }
-            self.terminate_tree_unchecked()
+            self.terminate_tree_unchecked(&group)
         };
 
         #[cfg(test)]
@@ -437,6 +455,9 @@ impl Child {
         if self.root_is_unpinned() {
             return Err(crate::signal::unpinned_status(self.id.pid(), "graceful_shutdown_tree"));
         }
+        #[cfg(unix)]
+        let status = super::tree_call::status_unless_reaped_elsewhere(self.wait(), self.id.pid())?;
+        #[cfg(not(unix))]
         let status = self.wait()?;
         if let Some(e) = watch_err {
             return Err(e);
