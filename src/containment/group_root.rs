@@ -33,7 +33,7 @@ impl<'a> GroupRoot<'a> {
 
     /// No root, for a caller whose mechanism names no group (a cgroup, a Job Object, a tree walk).
     /// A send by number with it is refused.
-    #[cfg(any(not(unix), test))]
+    #[cfg(any(not(unix), all(test, target_os = "linux")))]
     pub(crate) fn none() -> GroupRoot<'static> {
         GroupRoot {
             #[cfg(target_os = "linux")]

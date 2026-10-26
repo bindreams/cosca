@@ -43,7 +43,7 @@ pub(crate) enum GroupStep {
 
 /// Asserts that the first step is `signo` sent to the whole group through the root's pidfd, before
 /// any resend, and that nothing went to the group by its number.
-#[cfg(all(unix, test))]
+#[cfg(all(target_os = "linux", test))]
 #[track_caller]
 pub(crate) fn assert_group_signalled_first_through_the_pidfd(steps: &[GroupStep], signo: i32) {
     assert_eq!(steps.first(), Some(&GroupStep::Group(Route::Pidfd, signo)), "{steps:?}");
