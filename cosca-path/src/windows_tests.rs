@@ -1063,8 +1063,27 @@ fn lexically_normal_collapses_only_dots_and_separators() {
         (r"a.\b..\...", r"a.\b..\..."),
         (r"a \b", r"a \b"),
         (r"a\", r"a\"),
-        (r"a\.", r"a\"),
-        (r"a\b\..", r"a\"),
+        (r"a\.", "a"),
+        (r"a\b\..", "a"),
+        (r"a\.\", r"a\"),
+        (r"a\b\..\", r"a\"),
+        (r"a\b\..\.", "a"),
+        (r"a\\", r"a\"),
+        (r"C:\a\.", r"C:\a"),
+        (r"C:\a\b\..", r"C:\a"),
+        (r"C:\a\b\..\.", r"C:\a"),
+        (r"C:\a\.\", r"C:\a\"),
+        (r"C:\a\b\..\", r"C:\a\"),
+        (r"C:\a\..", r"C:\"),
+        (r"C:\a\..\", r"C:\"),
+        (r"\a\..", r"\"),
+        (r"\a\.", r"\a"),
+        (r"\\s\h\a\..", r"\\s\h"),
+        (r"\\s\h\a\.", r"\\s\h\a"),
+        (r"\\s\h\a\.\", r"\\s\h\a\"),
+        (r"\\.\d\x\..", r"\\.\d"),
+        (r"\\.\d\x\.", r"\\.\d\x"),
+        (r"\\.\d\x\.\", r"\\.\d\x\"),
         (r"..\", ".."),
         (r"a\..", "."),
         (r"C:a\..", "C:"),
@@ -1079,8 +1098,7 @@ fn lexically_normal_collapses_only_dots_and_separators() {
 /// Under `\\.\`, and under `\\server\` when extra separators precede the share, the device name or
 /// share is the first component, as Win32 reads it: `..` pops it, and the empty names, `.` and `..`
 /// before it vanish. A share that directly follows the server's separator is no component and
-/// stays. Each `want` is `GetFullPathNameW`'s, up to the trailing separator a final `.` or `..`
-/// leaves and the choice of separator.
+/// stays. Each `want` is `GetFullPathNameW`'s, up to the choice of separator.
 ///
 /// Mutant: the device name is part of the anchor, so `\\.\d\..` stays `\\.\d\`.
 #[skuld::test]
@@ -1095,8 +1113,11 @@ fn lexically_normal_pops_a_device_name_or_a_loose_share() {
         (r"\\.\.\x", r"\\.\x", Some("x")),
         (r"\\.\\x", r"\\.\x", Some("x")),
         (r"\\.\..", r"\\.\", Some("")),
-        (r"\\.\d\.", r"\\.\d\", Some("d")),
-        (r"\\s\h\..", r"\\s\h\", None),
+        (r"\\.\d\.", r"\\.\d", Some("d")),
+        (r"\\.\d\.\", r"\\.\d\", Some("d")),
+        (r"\\s\h\..", r"\\s\h", None),
+        (r"\\s\h\.", r"\\s\h", None),
+        (r"\\s\h\.\", r"\\s\h\", None),
         (r"\\s\\h\x", r"\\s\h\x", None),
         (r"\\s\\\h\.\x", r"\\s\h\x", None),
         ("//s//h/x", r"//s/h\x", None),
@@ -1105,8 +1126,8 @@ fn lexically_normal_pops_a_device_name_or_a_loose_share() {
         (r"\\s\\h\..\x", r"\\s\x", None),
         (r"\\s\\.\h", r"\\s\h", None),
         (r"\\\\h\..", r"\\\", None),
-        (r"\\\h\..", r"\\\h\", None),
-        (r"\\s\.\h\..", r"\\s\.\", None),
+        (r"\\\h\..", r"\\\h", None),
+        (r"\\s\.\h\..", r"\\s\.", None),
     ];
     for (input, want, device) in cases {
         let normal = p(input).lexically_normal();

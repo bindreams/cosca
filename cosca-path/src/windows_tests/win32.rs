@@ -3,13 +3,14 @@
 //! device anchors and the normal form.
 //!
 //! Deliberate deviations, each excluded or allowed for by name below:
-//! - Names ending in a dot or a space, which Win32 strips (`win32_strips_a_name`): a stored
+//! - Names ending in a dot or a space, which Win32 strips (`win32_strips_a_name`): a dot from any
+//!   name, a space only from the last (a final `.` or `..` can make an earlier name last). A stored
 //!   spelling is lexical and names what it spells. That covers a share made only of dots or spaces
 //!   at the end of the path (`\\s\.`, `\\s\ `), which stays `Anchor::Unc` and fully qualified though
 //!   Win32 resolves it to `\\s\`, and a device name that ends in them (`\\.\d.\x`, which Win32
 //!   reads as `\\.\d\x`).
-//! - A trailing separator after a name: Win32 drops the one a final `.` leaves (`C:\a\.` is
-//!   `C:\a`); the normal form keeps it, as C++'s does.
+//! - Pending a decision: a relative normal form that ends in `.` or `..` carries no separator, so
+//!   `a\..\` is `.` where Win32 keeps the separator it ended in.
 //! - `\\.` or `\\?` alone: Win32 completes it to `\\.\` (`\\?\`); the normal form keeps the anchor.
 //! - Verbatim spellings: Win32 takes the rest as written; parsing drops the prefix.
 //!
@@ -179,16 +180,6 @@ fn win32_device(full: &str) -> &str {
     full[4..].split('\\').next().unwrap()
 }
 
-/// `s` without a trailing separator after a name (see the module docs). The separator after a
-/// drive, `\\.`, `\\?` or another separator stays.
-fn trim(s: &str) -> &str {
-    let is_drive = |rest: &str| rest.chars().count() == 2 && rest.ends_with(':');
-    match s.strip_suffix('\\') {
-        Some(rest) if !rest.ends_with('\\') && !is_drive(rest) && !matches!(rest, "" | r"\\." | r"\\?") => rest,
-        _ => s,
-    }
-}
-
 /// The anchor kind is Win32's, and a path is fully qualified when Win32 reads it as a rooted drive,
 /// a device path under `\\.\` or a UNC path with a server and a share. A UNC path's server and
 /// share and a device name are Win32's. Where a `..` follows them, it can pop a device name or a
@@ -291,7 +282,7 @@ fn anchor_is_read_as_written_before_a_pop() {
         assert_eq!(path.anchor(), want_anchor, "{ctx}");
         // The written path is qualified, even where its normal form is not.
         assert!(path.is_fully_qualified() && path.is_absolute(), "{ctx}");
-        assert_eq!(trim(&normal.to_str().unwrap().replace('/', "\\")), trim(&full), "{ctx}");
+        assert_eq!(normal.to_str().unwrap().replace('/', "\\"), full, "{ctx}");
         assert_eq!(normal.is_fully_qualified(), win32_qualified(&full), "{ctx}");
     }
     // The class exists: a share that the `..` pops is gone from the normal form.
@@ -362,13 +353,21 @@ fn lexically_normal_agrees_with_win32() {
             _ if path_type(&input) == ROOT_LOCAL_DEVICE => (full_path(&input), full_path(normal)),
             _ => {
                 let full = full_path(&input);
-                assert_eq!(trim(&normal.replace('/', "\\")), trim(&full), "{ctx}; Win32 {full:?}");
+                assert_eq!(normal.replace('/', "\\"), full, "{ctx}; Win32 {full:?}");
                 if let Anchor::Device { name } = p(normal).anchor() {
                     assert_eq!(name, OsStr::new(win32_device(&full)), "{ctx}; Win32 {full:?}");
                 }
                 continue;
             }
         };
-        assert_eq!(trim(&from_normal), trim(&from_input), "{ctx}");
+        if matches!(path.anchor(), Anchor::None | Anchor::Drive { rooted: false, .. })
+            && matches!(normal.rsplit(['\\', '/', ':']).next(), Some("." | ".."))
+            && from_input == format!("{from_normal}\\")
+        {
+            // Pending a decision: a relative normal form that ends in `.` or `..` has no place for
+            // the separator the path ended in (`a\..\`), which Win32 keeps.
+            continue;
+        }
+        assert_eq!(from_normal, from_input, "{ctx}");
     }
 }

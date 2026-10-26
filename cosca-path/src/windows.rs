@@ -498,10 +498,12 @@ impl PurePath for Path {
     }
 
     /// As for POSIX, and as Win32 reads `.` and `..`: the anchor is kept as written; `\` goes
-    /// between components; `..` is dropped after a root separator (`C:\..` is `C:\`) and kept
-    /// after `C:`; an emptied path after `C:` stays `C:`; and a first name that would read as a
-    /// drive keeps a `.` before it (`.\a:`). A device name, and a share after extra separators, is
-    /// the first component under `\\.\` or `\\server\` (see [`Anchor`]), so `..` pops it:
+    /// between components; a final `.` or `..` leaves no trailing separator, and only one written
+    /// last stays (`C:\a\b\..` is `C:\a`, `C:\a\.\` is `C:\a\`); `..` is dropped after a root
+    /// separator (`C:\..` is `C:\`) and kept after `C:`; an emptied path after `C:` stays `C:`;
+    /// and a first name that would read as a drive keeps a `.` before it (`.\a:`). A device name,
+    /// and a share after extra separators, is the first component under `\\.\` or `\\server\` (see
+    /// [`Anchor`]), so `..` pops it:
     /// `\\.\d\..\a` is `\\.\a`, `\\s\\h\x` is `\\s\h\x` and `\\s\\h\..` is `\\s\`.
     ///
     /// A separate step from classification: [`Path::is_fully_qualified`] and [`Path::anchor`] read
@@ -518,6 +520,9 @@ impl PurePath for Path {
             None => (parts.start(), parts.root, self.components().collect()),
         };
         let mut out = bytes[..prefix].to_vec();
+        // After a UNC share, the separator is a trailing one like any other: it stays only if the
+        // path ends in one (`\\s\h\..` is `\\s\h`, `\\s\h\.\` is `\\s\h\`).
+        let share_separator = parts.loose_root.is_none() && parts.root && matches!(parts.anchor, Anchor::Unc { .. });
         // Only `Normal` and `ParentDir` survive.
         let mut names: Vec<Component<'_, OsStr>> = Vec::new();
         let mut trailing = false;
@@ -527,22 +532,26 @@ impl PurePath for Path {
                     names.push(c);
                     trailing = false;
                 }
-                Component::Empty | Component::CurDir => trailing = !names.is_empty(),
-                Component::ParentDir => match names.last() {
-                    Some(Component::Normal(_)) => {
-                        names.pop();
-                        trailing = !names.is_empty();
+                // Only a separator written last leaves one; a final `.` or `..` does not.
+                Component::Empty => trailing = !names.is_empty(),
+                Component::CurDir => trailing = false,
+                Component::ParentDir => {
+                    trailing = false;
+                    match names.last() {
+                        Some(Component::Normal(_)) => {
+                            names.pop();
+                        }
+                        None if root => {}
+                        _ => names.push(c),
                     }
-                    None if root => {}
-                    _ => {
-                        names.push(c);
-                        trailing = false;
-                    }
-                },
+                }
             }
         }
         if names.last() == Some(&Component::ParentDir) {
             trailing = false;
+        }
+        if share_separator && names.is_empty() && !bytes.last().is_some_and(is_separator) {
+            out.pop();
         }
         if parts.anchor == Anchor::None && names.first().is_some_and(|c| reads_as_drive(c.as_wtf8())) {
             out.extend_from_slice(br".\");
