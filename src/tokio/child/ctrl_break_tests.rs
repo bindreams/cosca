@@ -23,6 +23,16 @@ fn spawn_tree(root: Handler, grandchild: Handler) -> (crate::tokio::Child, TcpSt
 }
 
 fn spawn(handler: Handler, grandchild: Option<Handler>) -> (crate::tokio::Child, TcpStream, Option<Grandchild>) {
+    spawn_configured(handler, grandchild, crate::ContainMode::Strongest, |_| {})
+}
+
+/// [`spawn`] contained as `mode`, with `configure` applied to the command last.
+fn spawn_configured(
+    handler: Handler,
+    grandchild: Option<Handler>,
+    mode: crate::ContainMode,
+    configure: impl FnOnce(&mut crate::tokio::Command),
+) -> (crate::tokio::Child, TcpStream, Option<Grandchild>) {
     let (listener, addr) = crate::test_child::registration_rendezvous();
     let mut cmd = crate::tokio::Command::new();
     cmd.executable(std::env::current_exe().expect("current_exe"))
@@ -31,7 +41,8 @@ fn spawn(handler: Handler, grandchild: Option<Handler>) -> (crate::tokio::Child,
     for (key, value) in ctrl_break::member_env(&addr, handler, grandchild) {
         cmd.env(key, value);
     }
-    cmd.contain();
+    cmd.contain_with(mode);
+    configure(&mut cmd);
     let child = cmd.spawn().expect("spawn the root");
     let mut sock = ctrl_break::accept_root(&listener, child.id());
     let grand = grandchild.map(|_| ctrl_break::accept_grandchild(&listener, &mut sock));
@@ -218,4 +229,36 @@ async fn async_graceful_shutdown_tree_sweep_is_load_bearing_on_windows() {
     let Grandchild { sock, exit } = grand;
     drop(sock);
     assert_eq!(exit.wait_for_exit_code(), 1, "the sweep must kill the grandchild");
+}
+
+/// Async twin of `graceful_shutdown_tree_ends_a_root_that_has_a_console_of_its_own`.
+#[skuld::test]
+async fn async_graceful_shutdown_tree_ends_a_root_that_has_a_console_of_its_own() {
+    crate::tokio::test_runtime::assert_current_thread();
+    // The last field: `detached()` rather than `no_window()`.
+    let legs = [
+        ("no_window, job", crate::ContainMode::Strongest, false),
+        ("detached, job", crate::ContainMode::Strongest, true),
+        ("no_window, treewalk", crate::ContainMode::TreeWalk, false),
+    ];
+    for (what, mode, detached) in legs {
+        let (mut child, sock, _) = spawn_configured(Handler::Ignore, None, mode, |c| {
+            _ = if detached { c.detached() } else { c.no_window() }
+        });
+        let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, sock);
+        let status = child
+            .graceful_shutdown_tree(Duration::ZERO)
+            .await
+            .unwrap_or_else(|e| panic!("{what}: the forced half tears the tree down: {e:?}"));
+        assert_eq!(
+            status.code(),
+            Some(1),
+            "{what}: the forced half must kill the root, got {status:?}"
+        );
+        assert_eq!(
+            child.is_alive(),
+            crate::identity::Liveness::Dead,
+            "{what}: the forced half really ended it"
+        );
+    }
 }

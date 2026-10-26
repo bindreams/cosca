@@ -22,11 +22,7 @@
 use std::io::{Read, Write};
 #[cfg(windows)]
 use std::net::{TcpListener, TcpStream};
-#[cfg(windows)]
-use std::time::Duration;
 
-#[cfg(windows)]
-use cosca::identity::Liveness;
 #[cfg(windows)]
 use cosca::{ContainMode, Containment, GracefulMechanism};
 
@@ -107,9 +103,9 @@ const STATUS_CONTROL_C_EXIT: i32 = 0xC000_013Au32 as i32;
 /// `Alive` for a plain contained child that is already dying, so it is the same value in both
 /// worlds.
 ///
-/// The second child is for the other half: the FORCED op still works on such a child even though
-/// the cooperative one reached nobody. `graceful_shutdown_tree` waits out the exit before it
-/// returns, so the `Dead` there is an edge and not a poll.
+/// That the FORCED op still ends such a child is not asserted here: `graceful_shutdown_tree` kills
+/// and reaps in one call, so only a unit test can release the child between the two
+/// (`graceful_shutdown_tree_ends_a_root_that_has_a_console_of_its_own`, in `src/child/ctrl_break_tests.rs`).
 fn assert_false_success(expected_containment: Containment, configure: impl Fn(&mut cosca::Command)) {
     let (child, mut sock) = spawn_configured("control-block", &configure);
     assert_eq!(
@@ -135,15 +131,6 @@ fn assert_false_success(expected_containment: Containment, configure: impl Fn(&m
         "the child exited on OUR release byte, so the cooperative op delivered nothing; a \
          delivered break would have ended it with STATUS_CONTROL_C_EXIT ({STATUS_CONTROL_C_EXIT})"
     );
-    drop(sock);
-
-    // A second child, because the first is already gone: the FORCED half of the graceful op
-    // still tears such a tree down.
-    let (child, sock) = spawn_configured("control-block", &configure);
-    child
-        .graceful_shutdown_tree(Duration::ZERO)
-        .expect("the forced half tears the tree down");
-    assert_eq!(child.is_alive(), Liveness::Dead, "the forced half really ended it");
     drop(sock);
 }
 
@@ -195,14 +182,6 @@ async fn assert_false_success_async(expected_containment: Containment, configure
         Some(0),
         "the child exited on OUR release byte, so the cooperative op delivered nothing"
     );
-    drop(sock);
-
-    let (mut child, sock) = spawn_configured_async("control-block", &configure).await;
-    child
-        .graceful_shutdown_tree(Duration::ZERO)
-        .await
-        .expect("the forced half tears the tree down");
-    assert_eq!(child.is_alive(), Liveness::Dead);
     drop(sock);
 }
 

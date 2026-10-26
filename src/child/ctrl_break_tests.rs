@@ -30,6 +30,16 @@ fn spawn(
     grandchild: Option<Handler>,
     mode: crate::ContainMode,
 ) -> (crate::Child, TcpStream, Option<Grandchild>) {
+    spawn_configured(handler, grandchild, mode, |_| {})
+}
+
+/// [`spawn`] with `configure` applied to the command last.
+fn spawn_configured(
+    handler: Handler,
+    grandchild: Option<Handler>,
+    mode: crate::ContainMode,
+    configure: impl FnOnce(&mut crate::Command),
+) -> (crate::Child, TcpStream, Option<Grandchild>) {
     let (listener, addr) = crate::test_child::registration_rendezvous();
     let mut cmd = crate::Command::new();
     cmd.executable(std::env::current_exe().expect("current_exe"))
@@ -39,6 +49,7 @@ fn spawn(
         cmd.env(key, value);
     }
     cmd.contain_with(mode);
+    configure(&mut cmd);
     let child = cmd.spawn().expect("spawn the root");
     let mut sock = ctrl_break::accept_root(&listener, child.id());
     let grand = grandchild.map(|_| ctrl_break::accept_grandchild(&listener, &mut sock));
@@ -193,6 +204,39 @@ fn child_graceful_ops_report_success_for_a_child_that_shares_no_console() {
         .graceful_shutdown(Duration::ZERO)
         .expect("the forced half needs no console");
     assert_eq!(status.code(), Some(1), "the escalation's kill, got {status:?}");
+}
+
+/// The cooperative half of a tree op reports success for a contained root whose creation flags put it
+/// in a console of its own, and reaches nobody (see `tests/windows_false_success.rs`); the forced
+/// half still ends it. The root's socket is closed once the sweep returned, so a sweep that sent
+/// nothing gives code 0, not a hang in the reap.
+#[skuld::test]
+fn graceful_shutdown_tree_ends_a_root_that_has_a_console_of_its_own() {
+    // The last field: `detached()` rather than `no_window()`.
+    let legs = [
+        ("no_window, job", crate::ContainMode::Strongest, false),
+        ("detached, job", crate::ContainMode::Strongest, true),
+        ("no_window, treewalk", crate::ContainMode::TreeWalk, false),
+    ];
+    for (what, mode, detached) in legs {
+        let (child, sock, _) = spawn_configured(Handler::Ignore, None, mode, |c| {
+            _ = if detached { c.detached() } else { c.no_window() }
+        });
+        let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, sock);
+        let status = child
+            .graceful_shutdown_tree(Duration::ZERO)
+            .unwrap_or_else(|e| panic!("{what}: the forced half tears the tree down: {e:?}"));
+        assert_eq!(
+            status.code(),
+            Some(1),
+            "{what}: the forced half must kill the root, got {status:?}"
+        );
+        assert_eq!(
+            child.is_alive(),
+            crate::identity::Liveness::Dead,
+            "{what}: the forced half really ended it"
+        );
+    }
 }
 
 /// `terminate_tree` under Job Object containment: the break to the root's group reaches the
