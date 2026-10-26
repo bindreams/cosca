@@ -899,6 +899,26 @@ fn spawn_contained_echo_tree(kill_on_drop: bool) -> EchoTree {
     }
 }
 
+/// Fails with `why` unless the echo grandchild behind `grand` is dead. A dead peer's socket answers
+/// end of file or a reset, and a live one echoes the byte, so only those answers count; any other
+/// error, or an echo, fails.
+#[cfg(unix)]
+fn assert_echo_grandchild_dead(grand: &mut std::net::TcpStream, why: &str) {
+    use std::io::ErrorKind::{BrokenPipe, ConnectionReset};
+    match grand.write_all(b"x") {
+        Ok(()) => {}
+        Err(e) if matches!(e.kind(), BrokenPipe | ConnectionReset) => {}
+        Err(e) => panic!("unexpected error writing to the grandchild's socket: {e}"),
+    }
+    let mut buf = [0u8; 1];
+    match grand.read(&mut buf) {
+        Ok(0) => {}
+        Err(e) if matches!(e.kind(), BrokenPipe | ConnectionReset) => {}
+        Ok(n) => panic!("{why}: the grandchild echoed {n} bytes"),
+        Err(e) => panic!("unexpected error reading the grandchild's socket: {e}"),
+    }
+}
+
 /// The mechanism `spawn_contained_tree` gets depends on the host (`CgroupV2` if the caller may
 /// create a cgroup, else `ProcessGroup`); the tree-kill tests hold under either, so accept any
 /// mechanism that tears down a tree.
@@ -947,13 +967,9 @@ fn unix_terminate_tree_reaps_the_grandchild() {
 
     child.terminate_tree().expect("terminate_tree");
 
-    // A dead grandchild's socket answers end of file or a reset; a live one echoes the byte.
-    _ = grand.write_all(b"x");
-    let mut buf = [0u8; 1];
-    let echoed = grand.read(&mut buf).unwrap_or(0);
-    assert_eq!(
-        echoed, 0,
-        "terminate_tree must SIGTERM the grandchild, not just the root"
+    assert_echo_grandchild_dead(
+        &mut grand,
+        "terminate_tree must SIGTERM the grandchild, not just the root",
     );
     drop(root);
     let _ = child.wait(); // reap the root
@@ -1397,8 +1413,7 @@ fn linux_cgroup_v2_kill_tree_reaps_the_grandchild(#[fixture(cgroup)] _group: &Gr
 /// `terminate_tree` under cgroup v2 containment: `CgroupLeaf::terminate` SIGTERMs every member of
 /// the leaf. The echo grandchild has no SIGTERM handler, so the default action kills it, and a
 /// fatal signal ends a process before it runs again: once `terminate_tree` returns, a grandchild
-/// that answers the test's byte did not get its SIGTERM. A failure leaves the tree to the handle's
-/// drop, so a missing SIGTERM fails the assertion rather than hanging a wait.
+/// that answers the test's byte did not get its SIGTERM.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn linux_cgroup_v2_terminate_tree_reaps_the_grandchild(#[fixture(cgroup)] _group: &Group) {
@@ -1416,13 +1431,9 @@ fn linux_cgroup_v2_terminate_tree_reaps_the_grandchild(#[fixture(cgroup)] _group
 
     child.terminate_tree().expect("terminate_tree");
 
-    // A dead grandchild's socket answers end of file or a reset; a live one echoes the byte.
-    _ = grand.write_all(b"x");
-    let mut buf = [0u8; 1];
-    let echoed = grand.read(&mut buf).unwrap_or(0);
-    assert_eq!(
-        echoed, 0,
-        "cgroup terminate must SIGTERM the grandchild, not just the root"
+    assert_echo_grandchild_dead(
+        &mut grand,
+        "cgroup terminate must SIGTERM the grandchild, not just the root",
     );
     drop(root);
     let _ = child.wait(); // reap the root
