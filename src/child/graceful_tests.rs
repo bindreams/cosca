@@ -152,6 +152,30 @@ fn graceful_lone_watch_error_still_escalates_and_reaps() {
     crate::test_child::assert_killed("the escalated child", status);
 }
 
+// The graceful path: an uncontained `cat` dies to `SIGTERM`'s default disposition within the
+// grace. Its stdin is released once `terminate` has returned (see `release_at`), so a `terminate`
+// that sent nothing lets `cat` exit 0 and fails the assertion, instead of the grace running out
+// first. A sent `SIGTERM` is already pending then, so it beats the release.
+#[cfg(unix)]
+#[skuld::test]
+fn child_graceful_shutdown_graceful_path() {
+    use std::os::unix::process::ExitStatusExt;
+    let mut cmd = crate::Command::new();
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+    let mut child = cmd.spawn().expect("spawn");
+    let stdin = child.stdin().expect("piped stdin");
+    let _release = term_fault::release_at(term_fault::HookPoint::AfterTerminate, stdin);
+    let status = child
+        .graceful_shutdown(Duration::from_secs(30))
+        .expect("graceful_shutdown");
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGTERM),
+        "graceful path must exit via SIGTERM, got {status:?}"
+    );
+}
+
 // A term_group refusal must not strand the tree between the soft signal and the hard sweep:
 // the sweep and reap still run, then the refusal surfaces. Mirrors
 // `graceful_tree_watch_error_still_sweeps_and_reaps` above, for the terminate seam instead

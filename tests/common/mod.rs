@@ -111,8 +111,9 @@ pub fn stdin_blocker_program() -> std::path::PathBuf {
     }
 }
 
-/// The child of [`stdin_blocker_program`] died to a kill, not by exiting on its own once its
-/// stdin closed: `SIGKILL` on Unix, a non-zero exit on Windows.
+/// The child died to a kill, not by exiting on its own once released (its stdin or control socket
+/// closed): `SIGKILL` on Unix, the kill's exit code `1` on Windows. A crash on the release (a
+/// panic's `101`, say) fails too.
 pub fn assert_killed(who: &str, status: std::process::ExitStatus) {
     #[cfg(unix)]
     {
@@ -124,9 +125,10 @@ pub fn assert_killed(who: &str, status: std::process::ExitStatus) {
         );
     }
     #[cfg(windows)]
-    assert!(
-        !status.success(),
-        "{who} must be killed, not exit on its own: {status:?}"
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "{who} must be killed (exit code 1), not exit on its own: {status:?}"
     );
 }
 

@@ -8,6 +8,9 @@ pub(crate) mod namespaces;
 #[cfg(target_os = "linux")]
 pub(crate) mod pid_reuse;
 
+#[cfg(windows)]
+pub(crate) mod ctrl_break;
+
 #[cfg(target_os = "macos")]
 use crate::test_own_process;
 #[cfg(target_os = "macos")]

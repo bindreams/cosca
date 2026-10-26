@@ -808,13 +808,14 @@ fn death_watch_accept_tree_panics_when_the_grandchild_dies_before_connecting_whi
             })
         },
     );
-    // The grandchild exited, so it must not be named a `G` connection; the root stays alive.
-    root.kill().expect("kill the root");
-    // The root's connection still waits in the listener's backlog, and the root reads from it:
-    // closing the listener resets it and ends the root by itself (status 0), so a `kill` that sent
-    // nothing fails the assertion on how the root ended, not the reap.
-    drop(listener);
-    common::assert_killed("the root", root.wait().expect("reap the root"));
+    // The grandchild exited, so it must not be named a `G` connection; the root stays alive. Take
+    // the root's connection before the kill: released after it, the root leaves with 0, so a `kill`
+    // that sent nothing fails the assertion on how the root ended, not the reap.
+    let mut root_sock = common::accept_or_die(&listener, &mut root);
+    let mut tag = [0u8; 1];
+    root_sock.read_exact(&mut tag).expect("the root's tag");
+    assert_eq!(&tag, b"R", "wrong root tag");
+    common::kill_release_reap(&root, root_sock);
     assert_died_before_connecting(&message, grandchild_pid);
 }
 

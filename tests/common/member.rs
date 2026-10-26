@@ -99,16 +99,6 @@ pub fn assert_members_killed(members: Vec<(Member, &str)>) {
     }
 }
 
-/// Assert that a soft signal (`terminate_tree`) ended every member, each named for the failure
-/// message. Unix: [`assert_dead`] on each, as for a kill. Windows: [`assert_members_not_released`],
-/// since a `CTRL_BREAK` leaves its own exit code, not the kill's.
-pub fn assert_members_terminated(members: Vec<(Member, &str)>) {
-    #[cfg(unix)]
-    assert_members_killed(members);
-    #[cfg(windows)]
-    assert_members_not_released(members);
-}
-
 /// The exit codes a testbin member can leave with for a reason other than the kill, besides
 /// [`RELEASED_EXIT_CODE`]: `101` (a Rust panic) and the NTSTATUS codes of an access violation, an
 /// illegal instruction and a fast-fail abort.
@@ -132,6 +122,21 @@ pub fn assert_members_not_released(members: Vec<(Member, &str)>) {
             !CRASH_EXIT_CODES.contains(&code),
             "{who} must be killed, not crash when released (exit code {code:#x})"
         );
+    }
+}
+
+/// Block until `pid` has exited, then its exit status, consuming nothing: on Unix it stays an
+/// unreaped zombie ([`zombie_exit_status`](super::zombie_exit_status)), on Windows the wait is on a
+/// handle of its own. The caller's handle on the child must pin `pid`.
+pub fn exit_status_once_exited(pid: u32) -> std::process::ExitStatus {
+    #[cfg(unix)]
+    {
+        super::zombie_exit_status(pid)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::ExitStatusExt as _;
+        std::process::ExitStatus::from_raw(windows_exit::ExitHandle::open(pid).wait_for_exit_code())
     }
 }
 

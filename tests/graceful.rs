@@ -42,27 +42,6 @@ fn child_terminate_unsupported_for_an_uncontained_child_on_windows() {
 
 #[cfg(unix)]
 #[skuld::test]
-fn child_graceful_shutdown_graceful_path() {
-    use std::io::Read;
-    use std::os::unix::process::ExitStatusExt;
-    use std::time::Duration;
-    // control-block dies on default-disposition SIGTERM. The long grace is the safety bound on
-    // a child that exits promptly — never the synchronization; correctness is the exit signal.
-    let (child, mut sock) = common::spawn_blocker();
-    let status = child
-        .graceful_shutdown(Duration::from_secs(30))
-        .expect("graceful_shutdown");
-    assert_eq!(
-        status.signal(),
-        Some(libc::SIGTERM),
-        "graceful path must exit via SIGTERM, got {status:?}"
-    );
-    let mut buf = [0u8; 1];
-    let _ = sock.read(&mut buf); // dead — EOF
-}
-
-#[cfg(unix)]
-#[skuld::test]
 fn child_graceful_shutdown_escalates() {
     use std::io::Read;
     use std::os::unix::process::ExitStatusExt;
@@ -356,56 +335,6 @@ fn graceful_mechanism_distinguishes_contained_from_uncontained_on_windows() {
 
 // The lone graceful ops on a console-group child =====
 
-/// Delivery is proved by a byte the CHILD's own console-ctrl handler writes — never by the Win32
-/// return value, which reports success for an event that reached nobody. The child survives its
-/// break by design (its handler reports "handled"), so the read cannot race a teardown.
-#[cfg(windows)]
-#[skuld::test]
-fn child_terminate_delivers_ctrl_break_to_a_contained_root() {
-    use std::io::Read;
-
-    use cosca::GracefulMechanism;
-
-    let (child, mut sock) = common::spawn_control("control-block-ack-break", &["R"], true);
-    assert_eq!(child.graceful_mechanism(), GracefulMechanism::ConsoleGroup);
-    // A MEASURED precondition, so the blocking read below cannot hang on a vacuous scenario.
-    assert_eq!(
-        common::in_our_console(child.id().pid()),
-        Some(true),
-        "the root must share our console for the event to be deliverable"
-    );
-    child.terminate().expect("terminate a console-group child");
-    let mut ack = [0u8; 1];
-    sock.read_exact(&mut ack).expect("the child must acknowledge the break");
-    assert_eq!(&ack, b"B", "wrong ack byte");
-    // The root survives the break by design; releasing it ends the wait either way, and exit code 1
-    // (kill) tells it from a clean exit on release (0).
-    child.kill_tree().expect("kill_tree");
-    drop(sock);
-    let status = child.wait().expect("reap");
-    assert_eq!(status.code(), Some(1), "kill_tree must kill the root, got {status:?}");
-}
-
-/// The graceful path end to end: no handler, so the default disposition applies and the child
-/// dies to the console event. `0xC000013A` discriminates against `1` (this crate's escalation)
-/// and `0xC0000142` (a signal that landed before the child could handle it).
-#[cfg(windows)]
-#[skuld::test]
-fn child_graceful_shutdown_exits_via_ctrl_break_on_windows() {
-    use std::time::Duration;
-
-    // The long grace is a failure bound on the child's own exit, never the synchronization.
-    let (child, _sock) = common::spawn_control("control-block", &["R"], true);
-    let status = child
-        .graceful_shutdown(Duration::from_secs(30))
-        .expect("graceful_shutdown on a console-group child");
-    assert_eq!(
-        status.code(),
-        Some(0xC000013A_u32 as i32),
-        "the child must die to the console event, got {status:?}"
-    );
-}
-
 /// `Duration::ZERO` makes the escalation deterministic — the break-ignoring child is provably
 /// alive at the single poll — so code `1` is this crate's kill and nothing else.
 #[cfg(windows)]
@@ -474,54 +403,6 @@ fn child_graceful_ops_report_success_for_a_child_that_shares_no_console() {
     assert_eq!(status.code(), Some(1), "escalation's kill, got {status:?}");
     let mut buf = [0u8; 1];
     let _ = sock.read(&mut buf);
-    let _ = child.wait();
-}
-
-/// The lone graceful shutdown's two halves have different radii on Windows: the cooperative
-/// signal reaches the child's whole console group, the escalation reaches only the child. The
-/// root here ignores the break (so only the escalation can have ended it) while its grandchild —
-/// an ordinary spawn that stayed in the root's group — acks the break and survives.
-#[cfg(windows)]
-#[skuld::test]
-fn child_graceful_shutdown_signals_the_group_but_only_kills_the_child() {
-    use std::io::Read;
-    use std::time::Duration;
-
-    use cosca::containment::TreeDrain;
-
-    let (child, socks) = common::spawn_tree("spawn-grandchild-ack-break", true);
-    let [_root_sock, grand_sock]: [_; 2] = socks.try_into().expect("a root and a grandchild socket");
-    let mut grand = common::Member::new(
-        grand_sock,
-        common::last_reported_grandchild().expect("the grandchild's pid"),
-    );
-    let status = child
-        .graceful_shutdown(Duration::ZERO)
-        .expect("graceful_shutdown on a console-group root");
-    assert_eq!(
-        status.code(),
-        Some(1),
-        "the root ignores the break, so only the escalation can have ended it, got {status:?}"
-    );
-    // Positive proof the cooperative half reached a descendant the forced half will not touch.
-    // The grandchild's handler reports "handled", so this read cannot race its death.
-    let mut ack = [0u8; 1];
-    grand
-        .sock
-        .read_exact(&mut ack)
-        .expect("the grandchild must acknowledge the break");
-    assert_eq!(&ack, b"B", "wrong ack byte");
-    // The job object's own live-member count: a kernel-authoritative, non-blocking verdict that
-    // the grandchild is still running after a graceful_shutdown that returned Ok.
-    assert_eq!(
-        child.wait_tree_timeout(Duration::ZERO).expect("drain verdict"),
-        TreeDrain::MembersRemain,
-        "the escalation must not have reached the group"
-    );
-    // The grandchild survived the break and holds its socket, so it ends only by the kill. The
-    // root is already dead.
-    child.kill_tree().expect("kill_tree");
-    common::assert_members_killed(vec![(grand, "the grandchild")]);
     let _ = child.wait();
 }
 
