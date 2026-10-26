@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use super::{dying_in, front_placement, Subtree};
 use crate::containment::cgroup::fault::{self, ProbeEnd, ProbeStep};
+use crate::containment::cgroup::test_support::alone;
 use crate::send_log::Via;
 use crate::test_groups::{cgroup, Group};
 
@@ -821,7 +822,7 @@ struct SigchldIgnored(nix::sys::signal::SigAction);
 fn ignore_sigchld() -> SigchldIgnored {
     use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
     let ignore = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
-    // SAFETY: installs no handler; nextest runs this test alone in its process.
+    // SAFETY: installs no handler; the callers run [`alone`], so no other test shares the process.
     SigchldIgnored(unsafe { sigaction(Signal::SIGCHLD, &ignore) }.expect("ignore SIGCHLD"))
 }
 
@@ -834,9 +835,13 @@ impl Drop for SigchldIgnored {
 
 /// A probe's child the kernel reaps itself (`SIGCHLD` ignored) is gone, not a failure: the reap's
 /// `ECHILD` keeps the verdict already read, here that `/proc` hides the child. Mutant: "`ECHILD` at
-/// the reap fails the probe" (the spawn's error is then `Io`, not the refusal).
+/// the reap fails the probe" (the spawn's error is then `Io`, not the refusal). Run [`alone`]: the
+/// disposition is process-wide.
 #[skuld::test]
 fn a_probe_child_reaped_by_an_ignored_sigchld_keeps_the_verdict() {
+    if !alone("containment::cgroup::reach::reach_tests::a_probe_child_reaped_by_an_ignored_sigchld_keeps_the_verdict") {
+        return;
+    }
     let _ignored = ignore_sigchld();
     let _missing = fault::miss_pidfd_info();
     let _hidden = fault::hide_proc();
@@ -853,9 +858,14 @@ fn a_probe_child_reaped_by_an_ignored_sigchld_keeps_the_verdict() {
 }
 
 /// The same for a child no pidfd pins, killed and reaped by its number. Mutant: "`ECHILD` at the
-/// reap by number fails the probe".
+/// reap by number fails the probe". Run [`alone`].
 #[skuld::test]
 fn a_probe_child_no_pidfd_pins_reaped_by_an_ignored_sigchld_keeps_the_verdict() {
+    if !alone(
+        "containment::cgroup::reach::reach_tests::a_probe_child_no_pidfd_pins_reaped_by_an_ignored_sigchld_keeps_the_verdict",
+    ) {
+        return;
+    }
     let _ignored = ignore_sigchld();
     let _missing = fault::miss_pidfd_info();
     let _hidden = fault::hide_proc();

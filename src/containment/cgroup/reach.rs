@@ -430,7 +430,7 @@ fn fork_probe(proc: &crate::identity::ProcDir, parent: libc::pid_t, dumpable: bo
         Ok(pidfd) => Hold::Pidfd(pidfd),
         Err(Unpinned::Gone(e)) => return Err(e),
         Err(Unpinned::Failed(e)) => {
-            log::debug!(
+            log::warn!(
                 "containment::cgroup: no pidfd pins the placement probe's child {pid} ({e}), so it is killed and reaped by its number"
             );
             Hold::Number
@@ -696,11 +696,17 @@ enum ProbeKill<'a> {
 /// with the route of the syscall made.
 fn kill_probe(kill: ProbeKill<'_>, seam: Option<rustix::io::Errno>) -> rustix::io::Result<()> {
     use rustix::process::{kill_process, pidfd_send_signal, Pid, Signal};
-    let sent = match (seam, &kill) {
-        (Some(errno), _) => Err(errno),
-        (None, ProbeKill::Pidfd(pidfd)) => pidfd_send_signal(pidfd, Signal::KILL),
+    let (signal, sent) = match (seam, &kill) {
+        (Some(errno), _) => (Signal::KILL, Err(errno)),
+        (None, ProbeKill::Pidfd(pidfd)) => {
+            let signal = Signal::KILL;
+            (signal, pidfd_send_signal(pidfd, signal))
+        }
         (None, ProbeKill::Number(pid)) => match Pid::from_raw(*pid) {
-            Some(pid) => kill_process(pid, Signal::KILL),
+            Some(pid) => {
+                let signal = Signal::KILL;
+                (signal, kill_process(pid, signal))
+            }
             None => unreachable!("fork returned pid {pid} to its parent"),
         },
     };
@@ -710,8 +716,10 @@ fn kill_probe(kill: ProbeKill<'_>, seam: Option<rustix::io::Errno>) -> rustix::i
             ProbeKill::Pidfd(_) => crate::send_log::Via::Pidfd,
             ProbeKill::Number(_) => crate::send_log::Via::Pid,
         },
-        libc::SIGKILL,
+        signal.as_raw(),
     ));
+    #[cfg(not(test))]
+    let _ = signal;
     sent
 }
 
