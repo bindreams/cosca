@@ -49,6 +49,9 @@ enum Seen {
     Wait,
     /// A second `kill`, which finds the root gone and sends nothing.
     Kill,
+    /// A second `kill` whose look at the root fails: the handle forgets tokio's `Child` as not
+    /// shown to be ours.
+    KillWithAFailedPeek,
 }
 
 /// Kills `child`'s root alone, has another reaper reap it, and has `seen` observe that.
@@ -59,6 +62,17 @@ async fn reap_behind_and_observe(child: &mut crate::tokio::Child, seen: Seen) {
         Seen::TryWait => drop(child.try_wait().expect_err("a foreign reap answers ECHILD")),
         Seen::Wait => drop(child.wait().await.expect_err("a foreign reap answers ECHILD")),
         Seen::Kill => child.kill().expect("a root reaped elsewhere has nothing left to kill"),
+        Seen::KillWithAFailedPeek => {
+            use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peek_once};
+            let failed = force_peek_once(Err(std::io::Error::other("forced peek failure")));
+            child.kill().expect("a root reaped elsewhere has nothing left to kill");
+            assert_peeks_exhausted();
+            drop(failed);
+            assert!(
+                matches!(child.root_state(), crate::signal::RootState::Unknown(_)),
+                "the handle forgot its root as not shown to be ours"
+            );
+        }
     }
 }
 
@@ -162,6 +176,36 @@ async fn tokio_kill_tree_kills_the_group_after_a_foreign_reap_seen_by_kill(
     #[fixture(pidfd_group_signal)] _group: &Group,
 ) {
     kill_tree_after_a_seen_foreign_reap(Seen::Kill).await;
+}
+
+#[skuld::test]
+async fn tokio_terminate_tree_terminates_the_group_after_a_foreign_reap_seen_by_kill(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+) {
+    terminate_tree_after_a_seen_foreign_reap(Seen::Kill).await;
+}
+
+#[skuld::test]
+async fn tokio_graceful_shutdown_tree_shuts_the_group_down_after_a_foreign_reap_seen_by_kill(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+) {
+    graceful_shutdown_tree_after_a_seen_foreign_reap(Seen::Kill).await;
+}
+
+/// A handle that forgot its root as not shown to be ours still holds the root's pidfd, which names
+/// it exactly whatever the look said. Mutant: "only a child shown reaped elsewhere keeps its pidfd".
+#[skuld::test]
+async fn tokio_kill_tree_kills_the_group_after_a_foreign_reap_seen_by_a_kill_whose_look_failed(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+) {
+    kill_tree_after_a_seen_foreign_reap(Seen::KillWithAFailedPeek).await;
+}
+
+#[skuld::test]
+async fn tokio_terminate_tree_terminates_the_group_after_a_foreign_reap_seen_by_a_kill_whose_look_failed(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+) {
+    terminate_tree_after_a_seen_foreign_reap(Seen::KillWithAFailedPeek).await;
 }
 
 #[skuld::test]

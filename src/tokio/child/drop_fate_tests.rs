@@ -113,17 +113,22 @@ fn forgotten(reaped_elsewhere: bool) -> (crate::tokio::Child, std::io::PipeWrite
     (child, writer)
 }
 
-/// A backend forgotten without proof of a foreign reap says nothing of a reap at its drop: the
-/// child may be running, and no status of ours was collected.
+/// A backend forgotten without proof of a foreign reap says nothing of a reap at its drop: no status
+/// of ours was collected. On Linux the armed drop kills the child through the pidfd the backend
+/// kept; on macOS nothing reaches it, and it may be running.
 ///
-/// Mutants: a forgotten backend reads as `Reaped`; one not shown ours reads as `Gone`.
+/// Mutants: a forgotten backend reads as `Reaped`; one not shown ours reads as `Gone`; (Linux) the
+/// kill through its pidfd is not reported.
 #[skuld::test]
-async fn the_drop_of_a_child_forgotten_unproven_says_running() {
+async fn the_drop_of_a_child_forgotten_unproven_claims_no_reap() {
     crate::tokio::test_runtime::assert_current_thread();
     let (mut child, writer) = forgotten(false);
     let id = child.id();
     let fate = child.tear_down_now();
     collect(id, writer);
+    #[cfg(target_os = "linux")]
+    assert_eq!(fate, ChildFate::Killed);
+    #[cfg(target_os = "macos")]
     assert_eq!(fate, ChildFate::Running { id: Some(id) });
 }
 
@@ -141,10 +146,12 @@ async fn the_drop_of_a_child_forgotten_as_reaped_elsewhere_says_gone() {
     assert_eq!(fate, ChildFate::Gone);
 }
 
-/// A kill of a forgotten backend sends nothing. It is `Gone` only when the forgetting had proof of a
-/// foreign reap; otherwise the child may be running.
+/// A kill of a forgotten backend is `Gone` only when the forgetting had proof of a foreign reap.
+/// Otherwise, on Linux, it goes through the pidfd the backend kept; on macOS nothing is sent, and the
+/// child may be running.
 ///
-/// Mutant: `Foreign` answers `Gone` whatever the forgetting knew.
+/// Mutants: `Foreign` answers `Gone` whatever the forgetting knew; (Linux) it sends nothing through
+/// the pidfd.
 #[skuld::test]
 async fn a_kill_of_a_forgotten_backend_is_gone_only_with_proof() {
     use crate::signal::{Sent, Sig};
@@ -158,8 +165,12 @@ async fn a_kill_of_a_forgotten_backend_is_gone_only_with_proof() {
             .as_ref()
             .expect("backend")
             .signal(Sig::Kill)
-            .expect("sends nothing"),
-        Sent::Unverified
+            .expect("the kill is answered"),
+        if cfg!(target_os = "linux") {
+            Sent::Delivered
+        } else {
+            Sent::Unverified
+        }
     );
     assert_eq!(
         proven
@@ -175,14 +186,21 @@ async fn a_kill_of_a_forgotten_backend_is_gone_only_with_proof() {
     collect(proven.id(), w2);
 }
 
-/// The failed password write of an elevated child whose root cannot be signalled: `Gone` only with
-/// proof the root was reaped by someone else.
+/// The failed password write of an elevated child whose backend was forgotten: `Gone` only with
+/// proof the root was reaped by someone else. Otherwise, on Linux, the root is killed through the
+/// pidfd the backend kept; on macOS nothing reaches it.
 ///
-/// Mutants: a kill that sent nothing is read as a foreign reap (`Gone`) for a child not shown ours.
+/// Mutants: a kill that sent nothing is read as a foreign reap (`Gone`) for a child not shown ours;
+/// (Linux) the kill through its pidfd is not reported.
 #[skuld::test]
-async fn a_failed_password_write_on_an_unproven_backend_leaves_the_child_running() {
+async fn a_failed_password_write_on_a_forgotten_backend_is_gone_only_with_proof() {
     crate::tokio::test_runtime::assert_current_thread();
-    for (reaped_elsewhere, expected) in [(false, None), (true, Some(ChildFate::Gone))] {
+    let unproven = if cfg!(target_os = "linux") {
+        Some(ChildFate::Killed)
+    } else {
+        None
+    };
+    for (reaped_elsewhere, expected) in [(false, unproven), (true, Some(ChildFate::Gone))] {
         let (child, writer) = forgotten(reaped_elsewhere);
         let id = child.id();
         let (_err, fate) = crate::tokio::spawn::finish_elevated(

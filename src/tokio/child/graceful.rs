@@ -296,7 +296,8 @@ impl Child {
     /// On Linux, a root whose handle cannot say whether it was reaped still gets the `SIGTERM`
     /// through its pidfd, which names it exactly, then the grace, and a kill through the pidfd if
     /// it is still running; nothing goes out by its number, and the call ends the same way. On 6.9+
-    /// its group is shut down as usual while it has a member. After this handle's own reap, with
+    /// its group is shut down as usual while it has a member, and the call then returns
+    /// [`Error::Unassessable`](crate::error::Error::Unassessable): no status is collected. After this handle's own reap, with
     /// another process at the pid, the group is empty: only the holders get the `SIGTERM`, and the
     /// call goes on as usual. The `SIGTERM` and the sweep each decide on a look of their own at the
     /// root, and each send by the group's number after it is checked as for `kill_tree`.
@@ -469,6 +470,10 @@ impl Child {
                 self.id().pid(),
                 "graceful_shutdown_tree",
             ));
+        }
+        #[cfg(unix)]
+        if self.os.proc.as_ref().is_some_and(|proc| proc.forgot_unproven()) {
+            return Err(crate::child::tree_call::status_of_an_unproven_root(self.id().pid()));
         }
         #[cfg(unix)]
         let status = crate::child::tree_call::status_unless_reaped_elsewhere(self.wait().await, self.id().pid())?;

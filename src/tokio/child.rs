@@ -771,8 +771,8 @@ impl Child {
     /// is an exited zombie, so the backstop is skipped and the sweep's answer stands.
     ///
     /// **A root reaped by something else, after this handle's own reap, and a reap after the
-    /// look.** As for the sync [`Child::kill_tree`](crate::Child::kill_tree). On Linux 6.9+ the handle
-    /// keeps the root's pidfd after its `wait`, `try_wait` or `kill` saw the root reaped elsewhere.
+    /// look.** As for the sync [`Child::kill_tree`](crate::Child::kill_tree). On Linux the handle
+    /// keeps the root's pidfd when it forgets tokio's `Child`, whatever it saw.
     pub fn kill_tree(&mut self) -> Result<(), Error> {
         self.kill_tree_after(None)
     }
@@ -1439,9 +1439,13 @@ impl Child {
         // A backend forgotten earlier says why: a status collected by this handle is `Reaped`, and
         // nothing else is. This holds whether or not the drop is armed.
         if own_reap {
+            // A child not shown ours that the kill reached through its pidfd (Linux) was killed.
             #[cfg(unix)]
             {
-                signals.fate = forgotten.unwrap_or(ChildFate::Reaped);
+                signals.fate = match forgotten {
+                    Some(ChildFate::Running { .. }) if signals.fate == ChildFate::Killed => ChildFate::Killed,
+                    forgotten => forgotten.unwrap_or(ChildFate::Reaped),
+                };
             }
             #[cfg(not(unix))]
             {
@@ -1657,8 +1661,8 @@ fn signal_on_drop(
     let killed = proc.signal(Sig::Kill);
     // Nothing was delivered because the child is gone (reaped by someone else, and its pid
     // possibly reused): the pid names nothing of ours to wait for.
-    // `Unverified`: nothing was sent because the pid cannot be verified (a backend forgotten without
-    // proof of a foreign reap), so the child may be running.
+    // `Unverified`: nothing was sent because the pid cannot be verified (macOS: a backend forgotten
+    // without proof of a foreign reap), so the child may be running.
     // Nothing is logged here: the drop forgets the child next, and logs that.
     match killed {
         Ok(Sent::Gone) => {
