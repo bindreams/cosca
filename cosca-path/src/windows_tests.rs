@@ -1376,8 +1376,9 @@ fn std_names(path: &std::path::Path) -> Vec<String> {
 
 /// Over every pair of small paths whose anchors std reads as Win32 does, `join` is std's `push`,
 /// and `is_absolute` and the names and `..` of the components are std's. The only deviations are
-/// those [`join_keeps_components_where_std_does_not`] lists: an empty rhs, and a relative rhs
-/// after a component and a trailing separator.
+/// the joins [`join_keeps_components_where_std_does_not`] lists (an empty rhs, and a relative rhs
+/// after a component and a trailing separator) and a rooted rhs after an unfinished anchor, which
+/// [`join_reads_anchors_as_win32_where_std_does_not`] lists.
 ///
 /// Mutant: a relative rhs after a share gets no separator, so `\\s\h` joined with `b` is `\\s\hb`.
 #[cfg(windows)]
@@ -1385,7 +1386,15 @@ fn std_names(path: &std::path::Path) -> Vec<String> {
 fn join_shape_and_names_agree_with_std() {
     let std_of = |path: &Path| std::path::PathBuf::from(path.as_os_str().to_std_os_string());
     let keep = |path: &PathBuf| !std_reads_the_anchor_otherwise(path);
-    let lhs_all: Vec<PathBuf> = parsed_grid(&small_paths_up_to(4))
+    let mut lhs_inputs = small_paths_up_to(4);
+    // Complete shares and devices are longer than the small paths.
+    lhs_inputs.extend(
+        [
+            r"\\s\h", r"\\s\h\", r"\\s\h\a", r"\\s\h\\", r"\\.\d", r"\\.\d\", r"\\.\d\a", r"C:\a",
+        ]
+        .map(String::from),
+    );
+    let lhs_all: Vec<PathBuf> = parsed_grid(&lhs_inputs)
         .into_iter()
         .map(|(_, path)| path)
         .filter(keep)
