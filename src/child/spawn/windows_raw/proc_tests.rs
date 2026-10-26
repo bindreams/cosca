@@ -114,6 +114,8 @@ fn raw_is_reaped_only_once_its_own_wait_returns() {
     let child = spawn_suspended();
     assert!(!child.is_reaped());
     child.kill().expect("kill");
+    // Keeps a no-op `kill` from hanging the wait below, which this test does not exercise.
+    end_with_code_zero(child.handle());
     wait_for_exit_unrecorded(child.handle());
     assert!(!child.is_reaped(), "an exit nobody waited on is not a recorded reap");
     child.wait().expect("wait");
@@ -129,10 +131,13 @@ fn proc_handle_raw_is_reaped_only_once_its_own_wait_returns() {
     let handle = ProcHandle::Raw(suspended_raw(RawChild::new));
     assert!(!handle.is_reaped());
     handle.kill().expect("kill");
-    wait_for_exit_unrecorded(match &handle {
+    let raw = match &handle {
         ProcHandle::Raw(r) => r.handle(),
         ProcHandle::Std(_) => unreachable!(),
-    });
+    };
+    // Keeps a no-op `kill` from hanging the wait below, which this test does not exercise.
+    end_with_code_zero(raw);
+    wait_for_exit_unrecorded(raw);
     assert!(!handle.is_reaped(), "an exit nobody waited on is not a recorded reap");
     handle.wait().expect("wait");
     assert!(handle.is_reaped());

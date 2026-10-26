@@ -294,11 +294,14 @@ fn remove_leftover_leaf(leaf: Option<std::path::PathBuf>) {
     let _ = leaf;
 }
 
+// Unix only: `async_windows_contained_spawn_runs_then_job_tears_down` proves the same drop on Windows,
+// by exit code.
 #[cfg(feature = "tokio")]
+#[cfg(unix)]
 #[skuld::test]
 async fn async_drop_tears_down_a_contained_tree() {
-    // The members echo until released (`ECHO_HELD_ENV`), so on Unix a drop that killed nothing is
-    // caught by an echo, not by a read that never ends.
+    // The members echo until released (`ECHO_HELD_ENV`), so a drop that killed nothing is caught by
+    // an echo, not by a read that never ends.
     let (child, mut root, mut grand) = common::spawn_tree_async("spawn-grandchild", |cmd| {
         cmd.contain();
         cmd.kill_on_drop(true);
@@ -314,23 +317,10 @@ async fn async_drop_tears_down_a_contained_tree() {
         "contained spawn must engage a mechanism"
     );
     drop(child);
-    // No wait: `Drop` signals and does not wait. On Unix the kill is pending once the drop returns,
-    // and a killed member cannot echo. Windows proves each death by the member's socket EOF.
-    #[cfg(unix)]
-    {
-        common::assert_dead(&mut root, "the root after the drop");
-        common::assert_dead(&mut grand, "the grandchild after the drop");
-    }
-    #[cfg(windows)]
-    for (who, s) in [("root", &mut root), ("grandchild", &mut grand)] {
-        use std::io::Read as _;
-        let mut buf = [0u8; 1];
-        match s.read(&mut buf) {
-            Ok(0) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
-            other => panic!("{who} not torn down on drop: {other:?}"),
-        }
-    }
+    // No wait: `Drop` signals and does not wait. The kill is pending once the drop returns, and a
+    // killed member cannot echo.
+    common::assert_dead(&mut root, "the root after the drop");
+    common::assert_dead(&mut grand, "the grandchild after the drop");
     // `Drop` releases the leaf right after the kill without waiting for the drain, so the killed
     // members may not have left it yet.
     remove_leftover_leaf(leaf);
@@ -377,7 +367,7 @@ async fn linux_cgroup_v2_async_drop_after_wait_still_tears_down_the_tree(#[fixtu
 }
 
 #[cfg(feature = "tokio")]
-#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 async fn drop_after_wait_still_tears_down_the_tree() {
     // After awaiting the root's exit it is already reaped, so the drop has no root to signal and
     // the tree teardown must come from attached.hard_kill() — proven by the grandchild's EOF.
@@ -408,6 +398,33 @@ async fn drop_after_wait_still_tears_down_the_tree() {
     #[cfg(not(target_os = "linux"))]
     let _ = mark;
     remove_leftover_leaf(leaf);
+}
+
+#[cfg(feature = "tokio")]
+/// Windows case of the test above. The grandchild echoes and is released only after the drop, with
+/// [`common::RELEASED_EXIT_ENV`] set: one the drop's Job Object kill missed leaves with that code,
+/// so a missing kill fails by assertion, not by a read that never ends.
+#[cfg(windows)]
+async fn drop_after_wait_still_tears_down_the_tree() {
+    let common::AsyncEchoTree {
+        mut child,
+        root,
+        grand,
+        grand_pid,
+    } = common::spawn_echo_tree_async_configured("spawn-grandchild-echo", |cmd| {
+        cmd.contain();
+        cmd.kill_on_drop(true);
+        cmd.env(common::RELEASED_EXIT_ENV, common::RELEASED_EXIT_CODE.to_string());
+    })
+    .await;
+    // The grandchild is alive and echoing, which pins its pid for the `Member`.
+    let grand = common::Member::new(grand, grand_pid);
+    let root_id = child.id();
+    drop(root); // EOF: the root leaves on its own, so the drop below has no root to kill
+    child.wait().await.expect("wait reaps the root");
+    assert_eq!(root_id.is_alive(), cosca::identity::Liveness::Dead, "root exited");
+    drop(child); // root already reaped: only the Job Object kill can reach the grandchild
+    common::assert_members_not_released(vec![(grand, "the grandchild, after dropping the reaped Child")]);
 }
 
 #[cfg(feature = "tokio")]

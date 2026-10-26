@@ -190,17 +190,13 @@ fn children_recursive_distinguishes_direct_from_descendant() {
 
 #[skuld::test]
 fn foreign_kill_terminates_the_process() {
-    let (child, mut sock) = spawn_blocker();
+    let (child, sock) = spawn_blocker();
     let p = cosca::Process::from_pid(child.id().pid()).found().expect("resolves");
     p.kill().expect("kill");
-    let mut buf = [0u8; 1];
-    match sock.read(&mut buf) {
-        Ok(0) => {}                                                     // EOF — process died
-        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {} // reset — also death
-        Ok(n) => panic!("expected EOF/ConnectionReset after kill, got {n} bytes"),
-        Err(e) => panic!("unexpected error: {e}"),
-    }
-    let _ = child.wait();
+    // Release the member after the kill: it leaves with 0 on the release, so a `kill` that sent
+    // nothing fails the assertion on how it ended, not a read that never sees an EOF.
+    drop(sock);
+    common::assert_killed("the killed child", child.wait().expect("reap"));
     p.kill().expect("second kill on a dead process must be Ok");
 }
 

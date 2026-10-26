@@ -6,13 +6,13 @@
 #[path = "common/mod.rs"]
 mod common;
 
-#[cfg(feature = "tokio")]
+#[cfg(all(feature = "tokio", unix))]
 use std::io::Read;
 
 #[cfg(feature = "tokio")]
 use cosca::tokio::Process;
 
-#[cfg(feature = "tokio")]
+#[cfg(all(feature = "tokio", unix))]
 fn expect_eof(who: &str, s: &mut std::net::TcpStream) {
     let mut buf = [0u8; 1];
     match s.read(&mut buf) {
@@ -84,12 +84,13 @@ async fn async_foreign_introspection_delegates() {
 #[cfg(feature = "tokio")]
 #[skuld::test]
 async fn async_foreign_kill_terminates_the_process() {
-    let (child, mut sock) = common::spawn_blocker();
+    let (child, sock) = common::spawn_blocker();
     let p = Process::from_pid(child.id().pid()).found().expect("resolves");
     p.kill().expect("foreign kill");
-    expect_eof("blocker", &mut sock);
-    let status = child.wait().expect("reap");
-    assert!(!status.success(), "killed child cannot report success, got {status:?}");
+    // Released after the kill: a `kill` that sent nothing lets the member leave with 0 and fails
+    // the assertion, where an EOF read would never return.
+    drop(sock);
+    common::assert_killed("the killed child", child.wait().expect("reap"));
 }
 
 #[cfg(feature = "tokio")]
