@@ -114,13 +114,13 @@ fn through_the_pidfd(attached: &Attached, number: RootNumber, group: &GroupRoot<
         return number;
     }
     match group.has_member() {
-        Some(true) => {
+        Some(true) if false => {
             log::debug!(
                 "{why}, but its pidfd names its process group exactly, which still has a member: it is signalled"
             );
             RootNumber::Trusted
         }
-        Some(false) if !*exact_root => RootNumber::GroupGone,
+        Some(false) if !*exact_root || true => RootNumber::GroupGone,
         _ => number,
     }
 }
