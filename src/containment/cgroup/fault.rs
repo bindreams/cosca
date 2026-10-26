@@ -39,6 +39,7 @@ thread_local! {
     static FORCE_LEAF_OPEN_FAILURE: Cell<bool> = const { Cell::new(false) };
     static FAIL_KILL_WRITES: Cell<bool> = const { Cell::new(false) };
     static FAIL_NEXT_KILL_WRITE: Cell<bool> = const { Cell::new(false) };
+    static FAIL_PUMP_STARTS: Cell<bool> = const { Cell::new(false) };
     static PIDFD_INFO_MISSING: Cell<bool> = const { Cell::new(false) };
     static PROC_HIDDEN: Cell<bool> = const { Cell::new(false) };
     static BEFORE_KILL_WRITE: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
@@ -47,6 +48,7 @@ thread_local! {
     static BEFORE_WALK_OPEN: std::cell::RefCell<Option<WalkHook>> = const { std::cell::RefCell::new(None) };
     static BEFORE_SWEEP_REMOVE: std::cell::RefCell<Option<WalkHook>> = const { std::cell::RefCell::new(None) };
     static BEFORE_DRAIN_BLOCK: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
+    static AFTER_DRAIN_WARN: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static WALK_FAILURE: std::cell::RefCell<Option<WalkFailure>> = const { std::cell::RefCell::new(None) };
     static PROC_HIDDEN_AS: Cell<Option<i32>> = const { Cell::new(None) };
     static PIDFD_INFO_FAILS: Cell<bool> = const { Cell::new(false) };
@@ -93,6 +95,29 @@ impl Drop for FailKillWrites {
 
 pub(crate) fn kill_writes_fail() -> bool {
     FAIL_KILL_WRITES.with(Cell::get)
+}
+
+/// A drain pump started on this thread fails to start, with `EAGAIN`, as a spawn at a thread limit
+/// does, until the guard drops.
+#[cfg(feature = "tokio")]
+pub(crate) fn fail_pump_starts() -> FailPumpStarts {
+    FAIL_PUMP_STARTS.with(|f| f.set(true));
+    FailPumpStarts(())
+}
+
+#[cfg(feature = "tokio")]
+#[must_use = "pumps start again as soon as the guard is dropped"]
+pub(crate) struct FailPumpStarts(());
+
+#[cfg(feature = "tokio")]
+impl Drop for FailPumpStarts {
+    fn drop(&mut self) {
+        FAIL_PUMP_STARTS.with(|f| f.set(false));
+    }
+}
+
+pub(crate) fn pump_starts_fail() -> bool {
+    FAIL_PUMP_STARTS.with(Cell::get)
 }
 
 /// The next `cgroup.kill` write on this thread fails with `EIO` and kills nothing; the writes after
@@ -382,6 +407,18 @@ pub(crate) fn take_drain_blocking_notifier() {
 #[cfg(feature = "tokio")]
 pub(crate) fn set_before_drain_block(hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
     crate::oneshot_hook::arm(&BEFORE_DRAIN_BLOCK, hook)
+}
+
+/// Run `hook` once right after the next slow-drain warn on this thread, before the wait goes on:
+/// a fixture only the drain's end would release is let go here, so a mutant that never warned
+/// fails an assertion instead of hanging.
+#[cfg(feature = "tokio")]
+pub(crate) fn set_after_drain_warn(hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
+    crate::oneshot_hook::arm(&AFTER_DRAIN_WARN, hook)
+}
+
+pub(crate) fn run_after_drain_warn() {
+    crate::oneshot_hook::fire(&AFTER_DRAIN_WARN);
 }
 
 pub(crate) fn notify_drain_blocking() {

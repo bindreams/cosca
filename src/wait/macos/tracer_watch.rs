@@ -48,6 +48,23 @@ pub(crate) enum OnTracer {
     Recheck(Duration),
 }
 
+/// Why a walk stopped before the end of the chain.
+#[derive(Debug)]
+pub(crate) enum WalkError {
+    /// A tracer's identity could not be read: who holds the child is unknown.
+    Identity(std::io::Error),
+    /// The kqueue refused a registration or its deletion: the chain cannot be watched.
+    Watch(std::io::Error),
+}
+
+impl From<WalkError> for std::io::Error {
+    fn from(e: WalkError) -> std::io::Error {
+        match e {
+            WalkError::Identity(e) | WalkError::Watch(e) => e,
+        }
+    }
+}
+
 /// The tracers a wait watches. One per wait, on the wait's own kqueue.
 #[derive(Debug, Default)]
 pub(crate) struct TracerWatch {
@@ -71,7 +88,7 @@ impl TracerWatch {
     /// launchd, has not necessarily released the child yet, so the wait checks again: at once the
     /// first time, then after 1 ms, doubling to 50 ms, with no cap on rounds, while walks keep
     /// finding one. Each wake re-checks the child and walks again; the elapsed time decides nothing.
-    pub(crate) fn held_by(&mut self, kq: &Kqueue, tracer: u32) -> std::io::Result<OnTracer> {
+    pub(crate) fn held_by(&mut self, kq: &Kqueue, tracer: u32) -> Result<OnTracer, WalkError> {
         let me = std::process::id();
         let mut walked = Vec::new();
         let mut fresh = false;
@@ -90,14 +107,14 @@ impl TracerWatch {
                 }
                 Link::Refused(errno) => return Err(refused(at, errno)),
                 Link::Unreadable => {
-                    return Err(std::io::Error::other(format!(
+                    return Err(WalkError::Identity(std::io::Error::other(format!(
                         "tracer {at}: who holds it could not be read (kinfo_proc refused)"
-                    )))
+                    ))))
                 }
             };
             if !self.armed.contains(&(at, unique)) {
                 self.disarm(kq, at)?;
-                let armed = arm_exit_and_signals_on(kq, at).map_err(into_io)?;
+                let armed = arm(kq, at).map_err(|e| WalkError::Watch(into_io(e)))?;
                 if armed.is_none() {
                     return Ok(self.gone());
                 }
@@ -132,7 +149,7 @@ impl TracerWatch {
     }
 
     /// Deletes the registration on `pid`, if one was made, and forgets it.
-    fn disarm(&mut self, kq: &Kqueue, pid: u32) -> std::io::Result<()> {
+    fn disarm(&mut self, kq: &Kqueue, pid: u32) -> Result<(), WalkError> {
         if self.armed.iter().any(|&(armed, _)| armed == pid) {
             delete(kq, pid)?;
             self.armed.retain(|&(armed, _)| armed != pid);
@@ -162,7 +179,7 @@ impl TracerWatch {
 
 /// Deletes the `EVFILT_PROC` registration on `pid`. `ENOENT`: none is left, as after a `NOTE_EXIT`
 /// was delivered, which deletes its one-shot knote.
-fn delete(kq: &Kqueue, pid: u32) -> std::io::Result<()> {
+fn delete(kq: &Kqueue, pid: u32) -> Result<(), WalkError> {
     let change = KEvent::new(
         pid as usize,
         EventFilter::EVFILT_PROC,
@@ -171,10 +188,10 @@ fn delete(kq: &Kqueue, pid: u32) -> std::io::Result<()> {
         0,
         0,
     );
-    match super::add_with_receipt(kq, change).map_err(into_io)? {
+    match super::add_with_receipt(kq, change).map_err(|e| WalkError::Watch(into_io(e)))? {
         0 => Ok(()),
         e if e == libc::ENOENT as i64 => Ok(()),
-        e => Err(std::io::Error::from_raw_os_error(e as i32)),
+        e => Err(WalkError::Watch(std::io::Error::from_raw_os_error(e as i32))),
     }
 }
 
@@ -185,11 +202,20 @@ fn into_io(e: crate::error::Error) -> std::io::Error {
     }
 }
 
-fn refused(pid: u32, errno: i32) -> std::io::Error {
-    std::io::Error::new(
+fn refused(pid: u32, errno: i32) -> WalkError {
+    WalkError::Identity(std::io::Error::new(
         std::io::Error::from_raw_os_error(errno).kind(),
         format!("tracer {pid}: its identity could not be read (errno {errno})"),
-    )
+    ))
+}
+
+/// [`arm_exit_and_signals_on`], or the refusal a test queued for it.
+fn arm(kq: &Kqueue, pid: u32) -> Result<Option<()>, crate::error::Error> {
+    #[cfg(test)]
+    if let Some(errno) = seams::take_refused_registration() {
+        return Err(crate::error::Error::Io(std::io::Error::from_raw_os_error(errno)));
+    }
+    arm_exit_and_signals_on(kq, pid)
 }
 
 /// [`crate::identity::link`], or the answer a test queued for it.
@@ -208,6 +234,30 @@ pub(crate) mod seams {
 
     thread_local! {
         static LINKS: RefCell<VecDeque<Link>> = const { RefCell::new(VecDeque::new()) };
+        static REFUSED_REGISTRATION: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// The next registration a walk on this thread makes on a tracer is refused with `errno`, as a
+    /// kqueue refuses one. The guard clears an unused refusal.
+    #[cfg(feature = "tokio")]
+    pub(crate) fn refuse_next_registration(errno: i32) -> RefusedRegistration {
+        REFUSED_REGISTRATION.with(|r| r.set(Some(errno)));
+        RefusedRegistration(())
+    }
+
+    #[cfg(feature = "tokio")]
+    #[must_use = "the refusal is cleared as soon as the guard is dropped"]
+    pub(crate) struct RefusedRegistration(());
+
+    #[cfg(feature = "tokio")]
+    impl Drop for RefusedRegistration {
+        fn drop(&mut self) {
+            REFUSED_REGISTRATION.with(|r| r.set(None));
+        }
+    }
+
+    pub(super) fn take_refused_registration() -> Option<i32> {
+        REFUSED_REGISTRATION.with(std::cell::Cell::take)
     }
 
     /// While the guard lives, the walks on this thread take their `link` reads from `links`, in
