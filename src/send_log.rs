@@ -41,6 +41,17 @@ pub(crate) enum GroupStep {
     Member(Route, u32, i32),
 }
 
+#[cfg(unix)]
+impl GroupStep {
+    /// A send of signal 0, which asks whether its target exists and delivers nothing.
+    fn is_probe(self) -> bool {
+        matches!(
+            self,
+            GroupStep::Group(_, 0) | GroupStep::Leader(_, 0) | GroupStep::Member(_, _, 0)
+        )
+    }
+}
+
 /// Asserts that the first step is `signo` sent to the whole group through the root's pidfd, before
 /// any resend, and that nothing went to the group by its number.
 #[cfg(all(target_os = "linux", test))]
@@ -128,9 +139,17 @@ impl Capture {
 }
 
 impl Capture {
-    /// The steps of the sends to process groups, in order.
+    /// The checks and the signals of the sends to process groups, in order: no signal-0 probe.
     #[cfg(unix)]
     pub(crate) fn group_steps(&self) -> Vec<GroupStep> {
+        let mut steps = self.group_steps_with_probes();
+        steps.retain(|step| !step.is_probe());
+        steps
+    }
+
+    /// Every step of the sends to process groups, in order, the signal-0 probes included.
+    #[cfg(unix)]
+    pub(crate) fn group_steps_with_probes(&self) -> Vec<GroupStep> {
         GROUP.with(|log| log.borrow().clone().expect("a live capture has a log"))
     }
 }

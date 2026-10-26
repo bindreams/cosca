@@ -254,3 +254,34 @@ fn term_group_ends_the_leader_by_its_number_when_the_group_send_is_refused() {
     assert_each_send_by_number_follows_its_check(&steps);
     result.expect("term_group on an owned group");
 }
+
+/// A member's signal-0 probe is a send like any other: recorded, and refused by the probe seam.
+/// The group's own `SIGTERM` is refused, so the members are alive at the listing. Mutant: "the
+/// member probe bypasses `send_signal`".
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_member_probe_is_a_recorded_send() {
+    let (mut child, stdin, members) = group_of_three();
+    let root = GroupRoot::trusted_for_test();
+    let capture = crate::send_log::Capture::start();
+    let refused = super::fault::refuse_group_sends();
+    let refusing = super::fault::refuse_probes();
+    let result = super::term_group(child.id() as i32, &root);
+    drop((refused, refusing));
+    let steps = capture.group_steps_with_probes();
+    drop(stdin);
+    child.wait().expect("reap the leader");
+
+    for member in members {
+        assert!(
+            steps.contains(&GroupStep::Member(Route::Number, member, 0)),
+            "member {member} was probed: {steps:?}"
+        );
+    }
+    match result {
+        Err(crate::error::Error::Containment { detail }) => {
+            assert!(members.iter().all(|m| detail.contains(&m.to_string())), "{detail}");
+        }
+        other => panic!("the refused probes leave the members refused, got {other:?}"),
+    }
+}

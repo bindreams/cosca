@@ -1264,83 +1264,50 @@ fn kill_group_outside_leaf(
     handle: &std::os::fd::OwnedFd,
     received: &Received,
     pid: rustix::process::Pid,
-) -> Result<bool, GroupKillRefused> {
-    match kill_group(handle, received, pid) {
+) -> Result<bool, crate::error::Error> {
+    match kill_group(handle, received, pid)? {
         Ok(()) => Ok(true),
-        Err(GroupKillRefused::Errno(rustix::io::Errno::SRCH)) => {
+        Err(nix::errno::Errno::ESRCH) => {
             let pid = rustix::process::Pid::as_raw(Some(pid));
             log::debug!("cgroup v2: an abandoned spawn's child's process group {pid} has no member left");
             Ok(false)
         }
-        Err(e) => Err(e),
+        Err(e) => Err(crate::error::Error::Io(e.into())),
     }
 }
 
-/// Why a group kill of an abandoned spawn's child was not made, or not delivered.
-#[cfg(target_os = "linux")]
-#[derive(Debug)]
-enum GroupKillRefused {
-    /// The kernel's answer.
-    Errno(rustix::io::Errno),
-    /// The kernel refused `PIDFD_SIGNAL_PROCESS_GROUP` (expected below Linux 6.9), and the child is
-    /// reaped, so its group's number may name another group: nothing was sent.
-    Unsent,
-}
-
-#[cfg(target_os = "linux")]
-impl std::fmt::Display for GroupKillRefused {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            GroupKillRefused::Errno(e) => e.fmt(f),
-            GroupKillRefused::Unsent => f.write_str(
-                "the kernel refused PIDFD_SIGNAL_PROCESS_GROUP (expected below Linux 6.9) and the child is \
-                 reaped, so the group's number may name another group and nothing was sent",
-            ),
-        }
-    }
-}
-
-/// `SIGKILL` the process group the child `handle` names leads, as [`kill_group_outside_leaf`] says.
+/// `SIGKILL` the process group the child `handle` names leads, through the shared group send
+/// ([`send_to_group`](crate::containment::unix::send_to_group)), whose check of the root is that
+/// the child is still unreaped. The kernel's answer, or why nothing was sent.
 #[cfg(target_os = "linux")]
 fn kill_group(
     handle: &std::os::fd::OwnedFd,
     received: &Received,
     pid: rustix::process::Pid,
-) -> Result<(), GroupKillRefused> {
+) -> Result<nix::Result<()>, crate::error::Error> {
     use std::os::fd::AsFd as _;
-    use GroupKillRefused::{Errno, Unsent};
     #[cfg(test)]
     {
         fault::record_child_send(fault::ChildSend::Group);
         if fault::take_force_group_kill_denied() {
-            return Err(Errno(rustix::io::Errno::PERM));
+            return Ok(Err(nix::errno::Errno::EPERM));
         }
         if fault::take_force_group_kill_gone() {
-            return Err(Errno(rustix::io::Errno::SRCH));
+            return Ok(Err(nix::errno::Errno::ESRCH));
         }
     }
-    match crate::containment::unix::pidfd_signal_group(handle.as_fd(), nix::sys::signal::Signal::SIGKILL) {
-        Err(nix::errno::Errno::EINVAL) => {}
-        sent => return sent.map_err(|e| Errno(rustix::io::Errno::from_raw_os_error(e as i32))),
-    }
-    if !still_unreaped_right_before_a_group_send(received, pid) {
-        return Err(Unsent);
-    }
-    use crate::containment::unix::{send_signal, Sys, Target};
-    send_signal(
-        Target::Group,
-        Sys::Group(pid.as_raw_nonzero().get()),
+    let check = || {
+        if still_unreaped(received, pid) {
+            Ok(())
+        } else {
+            Err("the child is reaped".to_owned())
+        }
+    };
+    crate::containment::unix::send_to_group(
+        pid.as_raw_nonzero().get(),
         nix::sys::signal::Signal::SIGKILL,
+        &crate::containment::GroupRoot::new(Some(handle.as_fd()), &check),
     )
-    .map_err(|e| Errno(rustix::io::Errno::from_raw_os_error(e as i32)))
-}
-
-/// [`still_unreaped`], as the check right before a group send by `pid`.
-#[cfg(target_os = "linux")]
-fn still_unreaped_right_before_a_group_send(received: &Received, pid: rustix::process::Pid) -> bool {
-    #[cfg(test)]
-    crate::send_log::record_group(crate::send_log::GroupStep::Check);
-    still_unreaped(received, pid)
 }
 
 /// What names the child `received` names, `pid`, to its reaper: its pidfd, or — with its `/proc`

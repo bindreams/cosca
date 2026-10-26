@@ -108,7 +108,7 @@ pub(crate) mod fault {
     use std::cell::{Cell, RefCell};
 
     #[cfg(target_os = "linux")]
-    pub(crate) use super::group::fault::{list_instead, refuse_probes, set_after_listing};
+    pub(crate) use super::group::fault::{list_instead, set_after_listing};
 
     type OnSend = Box<dyn FnMut(i32)>;
 
@@ -121,6 +121,19 @@ pub(crate) mod fault {
         static REFUSE_GROUP: Cell<bool> = const { Cell::new(false) };
         static REFUSE_FLAG: Cell<bool> = const { Cell::new(false) };
         static GROUP_PROBE_ERRNO: Cell<Option<i32>> = const { Cell::new(None) };
+        static PROBES_REFUSED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// While the guard lives, every signal-0 probe of a group's member on THIS thread answers
+    /// `EPERM` and is not sent, as a process of another user answers.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn refuse_probes() -> Refused {
+        PROBES_REFUSED.with(|r| r.set(true));
+        Refused(())
+    }
+
+    pub(super) fn probes_refused() -> bool {
+        PROBES_REFUSED.with(Cell::get)
     }
 
     /// While the guard lives, every send to a whole group on THIS thread (the `killpg`, or the
@@ -156,6 +169,7 @@ pub(crate) mod fault {
             REFUSE_GROUP.with(|r| r.set(false));
             REFUSE_FLAG.with(|r| r.set(false));
             GROUP_PROBE_ERRNO.with(|e| e.set(None));
+            PROBES_REFUSED.with(|r| r.set(false));
         }
     }
 
@@ -163,7 +177,6 @@ pub(crate) mod fault {
         REFUSE_GROUP.with(Cell::get)
     }
 
-    #[cfg(target_os = "linux")]
     pub(super) fn group_probe_errno() -> Option<i32> {
         GROUP_PROBE_ERRNO.with(Cell::get)
     }
@@ -341,7 +354,11 @@ fn signal_group(pgid: i32, signal: Signal, root: &GroupRoot<'_>) -> Result<(), E
 /// between them, and the number can then name another group. That window is a standing property of
 /// process-group containment without the flag; a program with such a reaper should use cgroup
 /// containment, whose kill names no pid.
-fn send_to_group(pgid: i32, signal: Signal, root: &GroupRoot<'_>) -> Result<Result<(), nix::errno::Errno>, Error> {
+pub(crate) fn send_to_group(
+    pgid: i32,
+    signal: Signal,
+    root: &GroupRoot<'_>,
+) -> Result<Result<(), nix::errno::Errno>, Error> {
     #[cfg(target_os = "linux")]
     if let Some(pidfd) = root.pidfd() {
         match pidfd_signal(pidfd, signal, Through::Group) {
@@ -387,22 +404,34 @@ pub(crate) enum Sys<'a> {
     Process(i32),
 }
 
-/// Sends `signal` to `target` by `sys`, and gives the kernel's answer. Every send to a process
-/// group, its leader or a member goes through here, and makes its syscall here, so a test build
-/// records it ([`GroupStep`](crate::send_log::GroupStep)) once the syscall returned, with the
-/// signal it was given: a send that is skipped leaves no record. In a test build a seam may answer
-/// in place of the kernel for a whole group: `EINVAL` for the pidfd flag, `EPERM` for a refused
-/// group.
+/// Sends `signal` to `target` by `sys`, and gives the kernel's answer. See [`send`].
 pub(crate) fn send_signal(target: Target, sys: Sys<'_>, signal: Signal) -> nix::Result<()> {
-    let signo = signal as libc::c_int;
+    send(target, sys, signal as libc::c_int)
+}
+
+/// Sends signal 0 to `target` by `sys`: whether it exists and may be signalled. See [`send`].
+pub(crate) fn probe_signal(target: Target, sys: Sys<'_>) -> nix::Result<()> {
+    send(target, sys, 0)
+}
+
+/// Sends `signo` to `target` by `sys`, and gives the kernel's answer. Every send to a process
+/// group, its leader or a member, signal 0 included, goes through here and makes its syscall here,
+/// so a test build records it ([`GroupStep`](crate::send_log::GroupStep)) once the syscall
+/// returned, with its signal number: a send that is skipped leaves no record. In a test build a
+/// seam may answer in place of the kernel: `EINVAL` for the pidfd group flag, `EPERM` for a group's
+/// signal, the seam's errno for a group's probe, `EPERM` for a member's probe.
+fn send(target: Target, sys: Sys<'_>, signo: libc::c_int) -> nix::Result<()> {
+    use nix::errno::Errno;
     #[cfg(test)]
     let seam = match (target, sys) {
-        (Target::Group, Sys::Pidfd(..)) if fault::pidfd_group_flag_refused() => Some(nix::errno::Errno::EINVAL),
-        (Target::Group, _) if fault::group_sends_refused() => Some(nix::errno::Errno::EPERM),
+        (Target::Group, Sys::Pidfd(..)) if fault::pidfd_group_flag_refused() => Some(Errno::EINVAL),
+        (Target::Group, Sys::Pidfd(..)) if signo == 0 => fault::group_probe_errno().map(Errno::from_raw),
+        (Target::Group, _) if signo != 0 && fault::group_sends_refused() => Some(Errno::EPERM),
+        (Target::Member(_), _) if signo == 0 && fault::probes_refused() => Some(Errno::EPERM),
         _ => None,
     };
     #[cfg(not(test))]
-    let seam: Option<nix::errno::Errno> = None;
+    let seam: Option<Errno> = None;
     let sent = match (seam, sys) {
         (Some(errno), _) => Err(errno),
         #[cfg(target_os = "linux")]
@@ -410,9 +439,9 @@ pub(crate) fn send_signal(target: Target, sys: Sys<'_>, signal: Signal) -> nix::
         #[cfg(not(target_os = "linux"))]
         (None, Sys::Pidfd(..)) => unreachable!("only Linux sends through a pidfd"),
         // SAFETY: plain syscalls on numbers; each caller checked the number right before.
-        (None, Sys::Group(pgid)) => nix::errno::Errno::result(unsafe { libc::killpg(pgid, signo) }).map(drop),
+        (None, Sys::Group(pgid)) => Errno::result(unsafe { libc::killpg(pgid, signo) }).map(drop),
         // SAFETY: as above.
-        (None, Sys::Process(pid)) => nix::errno::Errno::result(unsafe { libc::kill(pid, signo) }).map(drop),
+        (None, Sys::Process(pid)) => Errno::result(unsafe { libc::kill(pid, signo) }).map(drop),
     };
     #[cfg(test)]
     {
@@ -459,17 +488,7 @@ enum Through {
 /// included.
 #[cfg(target_os = "linux")]
 pub(crate) fn pidfd_group_has_member(pidfd: std::os::fd::BorrowedFd<'_>) -> Option<bool> {
-    #[cfg(test)]
-    let answer = if fault::pidfd_group_flag_refused() {
-        Err(nix::errno::Errno::EINVAL)
-    } else if let Some(errno) = fault::group_probe_errno() {
-        Err(nix::errno::Errno::from_raw(errno))
-    } else {
-        pidfd_send_syscall(pidfd, 0, libc::PIDFD_SIGNAL_PROCESS_GROUP)
-    };
-    #[cfg(not(test))]
-    let answer = pidfd_send_syscall(pidfd, 0, libc::PIDFD_SIGNAL_PROCESS_GROUP);
-    match answer {
+    match probe_signal(Target::Group, Sys::Pidfd(pidfd, libc::PIDFD_SIGNAL_PROCESS_GROUP)) {
         Ok(()) => Some(true),
         Err(nix::errno::Errno::ESRCH) => Some(false),
         Err(nix::errno::Errno::EINVAL) => None,
@@ -493,7 +512,7 @@ fn pidfd_signal(pidfd: std::os::fd::BorrowedFd<'_>, signal: Signal, through: Thr
 
 /// `pidfd_send_signal(pidfd, signo, NULL, flags)`. The kernel's errno is the answer.
 #[cfg(target_os = "linux")]
-pub(crate) fn pidfd_send_syscall(
+fn pidfd_send_syscall(
     pidfd: std::os::fd::BorrowedFd<'_>,
     signo: libc::c_int,
     flags: libc::c_uint,
