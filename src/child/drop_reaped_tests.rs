@@ -285,7 +285,7 @@ fn dropping_a_running_tree_walk_child_walks_from_its_pid_and_does_not_warn() {
 }
 
 /// A blocker root, killed and then waited for, so that only `wait()` sets the own-reap flag.
-fn waited_on_sleep_root() -> (u32, crate::Child) {
+fn waited_on_blocker_root() -> (u32, crate::Child) {
     let (child, stdin) = session_blocker();
     let pid = child.id().pid();
     child.kill().expect("kill the root");
@@ -303,7 +303,7 @@ fn dropping_a_waited_on_child_whose_number_reads_unknown_still_sends_no_killpg()
     crate::log_capture::install();
     let recorder = record_kill_group();
     let teardowns = record_root_teardowns();
-    let (_, child) = waited_on_sleep_root();
+    let (_, child) = waited_on_blocker_root();
     let _unknown = super::fault::force_next_root_read(crate::identity::Resolved::Unknown);
 
     let mark = crate::log_capture::mark();
@@ -564,7 +564,7 @@ fn fd_marker_drop_after_wait_sweeps_the_marker_holders_but_names_nothing_by_the_
 /// before the attach has no identity to walk from (`Marker::root` is `None`), which would make a
 /// "no walk" assertion vacuous.
 #[cfg(target_os = "macos")]
-fn reaped_sleep_root(mode: ContainMode) -> (u32, crate::Child) {
+fn reaped_blocker_root(mode: ContainMode) -> (u32, crate::Child) {
     let mut cmd = Command::new();
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(Stdio::pipe_in()).expect("stdin pipe");
@@ -587,7 +587,7 @@ fn reaped_sleep_root(mode: ContainMode) -> (u32, crate::Child) {
 fn fd_marker_without_a_group_drop_after_wait_only_sweeps_the_marker_holders() {
     crate::log_capture::install();
     let walks = record_walks();
-    let (pid, child) = reaped_sleep_root(ContainMode::TreeWalk);
+    let (pid, child) = reaped_blocker_root(ContainMode::TreeWalk);
 
     let mark = crate::log_capture::mark();
     drop(child);
@@ -606,7 +606,7 @@ fn fd_marker_with_a_group_drop_after_wait_neither_signals_the_group_nor_walks() 
     crate::log_capture::install();
     let recorder = record_kill_group();
     let walks = record_walks();
-    let (pid, child) = reaped_sleep_root(ContainMode::Strongest);
+    let (pid, child) = reaped_blocker_root(ContainMode::Strongest);
 
     let mark = crate::log_capture::mark();
     drop(child);

@@ -488,7 +488,11 @@ pub(crate) fn terminate(pid: u32) -> Result<(), crate::error::Error> {
     );
     // SAFETY: standard Win32 call targeting the child's own console group.
     match unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) } {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            #[cfg(test)]
+            observe::record_ctrl_break(pid);
+            Ok(())
+        }
         Err(e) => Err(classify_ctrl_event_failure(
             pid,
             io::Error::from(e),
@@ -497,23 +501,35 @@ pub(crate) fn terminate(pid: u32) -> Result<(), crate::error::Error> {
     }
 }
 
-/// Test-only: record that `clear_std_handle_inheritance` ran on THIS thread, so a test can prove
-/// a refused spawn did not mutate this process first. Take semantics, mirroring `fault`.
+/// Test-only records of what THIS thread did, with take semantics, mirroring `fault`.
 ///
-/// The real handle flags cannot serve as the observation: the mutation is process-global and
-/// permanent, so any earlier contained spawn in the same test binary would already have made it
-/// meaningless.
+/// - `clear_std_handle_inheritance` ran, so a test can prove a refused spawn did not mutate this
+///   process first. The real handle flags cannot serve as the observation: the mutation is
+///   process-global and permanent, so any earlier contained spawn in the same test binary would
+///   already have made it meaningless.
+/// - A `CTRL_BREAK` went out: the group `terminate` addressed, once Windows accepted the event.
+///   The event lands asynchronously, so a test asserts this before it waits for the target's own
+///   evidence, and a call that sent nothing fails that assertion instead of leaving the wait
+///   unbounded.
 #[cfg(test)]
 pub(crate) mod observe {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     thread_local! {
         static INHERITANCE_CLEARED: Cell<bool> = const { Cell::new(false) };
+        static CTRL_BREAKS: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
     }
     pub(crate) fn record_inheritance_cleared() {
         INHERITANCE_CLEARED.with(|f| f.set(true));
     }
     pub(crate) fn take_inheritance_cleared() -> bool {
         INHERITANCE_CLEARED.with(|f| f.replace(false))
+    }
+    pub(crate) fn record_ctrl_break(group: u32) {
+        CTRL_BREAKS.with(|b| b.borrow_mut().push(group));
+    }
+    /// The groups sent a `CTRL_BREAK` on this thread since the last take, in order.
+    pub(crate) fn take_ctrl_breaks() -> Vec<u32> {
+        CTRL_BREAKS.with(|b| std::mem::take(&mut *b.borrow_mut()))
     }
 }
 

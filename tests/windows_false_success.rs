@@ -9,7 +9,9 @@
 //! silence.
 //!
 //! The control leg is not optional: without a leg that measures a DELIVERED signal under the same
-//! handshake, "still alive" is satisfied by any build that never signals anything.
+//! handshake, "still alive" is satisfied by any build that never signals anything. It lives in
+//! `src/child/ctrl_break_tests.rs` (`a_plain_contained_root_really_receives_the_break`, and its
+//! async twin in `src/tokio/child/`), which asserts the break was sent before it waits for the ack.
 //!
 //! Console-list hygiene: each false-success leg signals an out-of-console pid, which leaves one
 //! persistent dead entry in the caller's console process list. CI runners get a fresh console per
@@ -40,10 +42,9 @@ use common::testbin;
 /// BEFORE returning — the real edge proving the child is running and has completed console
 /// registration.
 ///
-/// The handshake applies to every leg, not only the control. Without it every child sits in the
-/// measured pre-registration window, where a console-group signal IS delivered and kills the
-/// child at loader init — so "still alive" would be false for the wrong reason in the
-/// false-success legs, and the control would fail too.
+/// Without the handshake every child sits in the measured pre-registration window, where a
+/// console-group signal IS delivered and kills the child at loader init — so "still alive" would
+/// be false for the wrong reason in the false-success legs.
 ///
 /// `common::spawn_control` cannot serve: it takes no extra configuration.
 fn spawn_configured(mode: &str, configure: impl Fn(&mut cosca::Command)) -> (cosca::Child, TcpStream) {
@@ -82,30 +83,6 @@ async fn spawn_configured_async(
     sock.read_exact(&mut tag).expect("read tag");
     assert_eq!(&tag, b"R", "wrong control tag");
     (child, sock)
-}
-
-#[cfg(windows)]
-/// THE CONTROL. A contained root with no flag methods really receives the break: its own console
-/// ctrl handler writes `B` back over its socket, which is the only positive evidence of delivery
-/// — the Win32 return value is evidence in neither direction.
-///
-/// Without this leg the three below pass against any build that never signals anything.
-#[skuld::test]
-fn a_plain_contained_root_really_receives_the_break() {
-    let (child, mut sock) = spawn_configured("control-block-ack-break", |c| {
-        c.contain();
-    });
-    assert_eq!(child.graceful_mechanism(), GracefulMechanism::ConsoleGroup);
-    child.terminate_tree().expect("terminate_tree on a contained root");
-
-    let mut ack = [0u8; 1];
-    sock.read_exact(&mut ack)
-        .expect("the child's ctrl handler must write its ack; EOF here means it died instead");
-    assert_eq!(&ack, b"B", "the child acked something other than CTRL_BREAK");
-
-    drop(sock);
-    child.kill_tree().expect("kill_tree");
-    child.wait().expect("reap");
 }
 
 #[cfg(windows)]
@@ -198,27 +175,6 @@ fn a_treewalk_contained_root_gets_a_false_success_too() {
 }
 
 // ===== async mirrors: parity is not compiler-enforced =====
-
-#[cfg(windows)]
-#[cfg(feature = "tokio")]
-#[skuld::test]
-async fn an_async_plain_contained_root_really_receives_the_break() {
-    let (mut child, mut sock) = spawn_configured_async("control-block-ack-break", |c| {
-        c.contain();
-    })
-    .await;
-    assert_eq!(child.graceful_mechanism(), GracefulMechanism::ConsoleGroup);
-    child.terminate_tree().expect("terminate_tree on a contained root");
-
-    let mut ack = [0u8; 1];
-    sock.read_exact(&mut ack)
-        .expect("the child's ctrl handler must write its ack; EOF here means it died instead");
-    assert_eq!(&ack, b"B");
-
-    drop(sock);
-    child.kill_tree().expect("kill_tree");
-    child.wait().await.expect("reap");
-}
 
 #[cfg(windows)]
 #[cfg(feature = "tokio")]
