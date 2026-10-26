@@ -138,7 +138,7 @@ fn an_abandoned_childs_group_kill_finding_no_group_is_logged_at_debug(#[fixture(
     let child = paused_group_leader();
     let received = received(child, Some(PlacementReport::WriteFailed(libc::EBADF)));
     let pid = received.pid.expect("a pid");
-    fault::set_force_group_kill_gone(true);
+    let _gone = fault::force_group_kill_gone();
 
     let mark = crate::log_capture::mark();
     assert_eq!(end_child(&received), ChildFate::Killed);
@@ -325,7 +325,7 @@ fn an_abandoned_childs_group_kill_by_number_follows_its_own_check() {
 }
 
 /// Linux 6.9+: the group kill of a child outside its leaf goes through its handle, which names the
-/// group exactly. Mutant: "always by number".
+/// group exactly.
 #[skuld::test]
 fn an_abandoned_childs_group_kill_goes_through_its_handle(#[fixture(pidfd_group_signal)] _group: &Group) {
     use crate::send_log::{GroupStep, Route};

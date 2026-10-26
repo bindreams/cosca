@@ -399,9 +399,7 @@ fn check_or_signal(
     };
     let sent = match signal {
         Some(signal) => super::send_signal(super::Target::Member(pid), super::Sys::Process(target), signal),
-        #[cfg(test)]
-        None if fault::probes_refused() => Err(nix::errno::Errno::EPERM),
-        None => nix::sys::signal::kill(nix::unistd::Pid::from_raw(target), None),
+        None => super::probe_signal(super::Target::Member(pid), super::Sys::Process(target)),
     };
     match sent {
         Ok(()) | Err(nix::errno::Errno::ESRCH) => Reached::Yes,
@@ -739,30 +737,6 @@ pub(crate) mod fault {
     thread_local! {
         static AFTER_LISTING: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
         static LIST_INSTEAD: Cell<Option<i32>> = const { Cell::new(None) };
-        static PROBES_REFUSED: Cell<bool> = const { Cell::new(false) };
-    }
-
-    /// While the guard lives, every signal-0 probe `converge` sends on this thread answers `EPERM`
-    /// and is not sent, as a process of another user answers.
-    #[cfg(target_os = "linux")]
-    pub(crate) fn refuse_probes() -> RefuseProbes {
-        PROBES_REFUSED.with(|r| r.set(true));
-        RefuseProbes(())
-    }
-
-    #[cfg(target_os = "linux")]
-    #[must_use = "the probes go out again as soon as the guard is dropped"]
-    pub(crate) struct RefuseProbes(());
-
-    #[cfg(target_os = "linux")]
-    impl Drop for RefuseProbes {
-        fn drop(&mut self) {
-            PROBES_REFUSED.with(|r| r.set(false));
-        }
-    }
-
-    pub(super) fn probes_refused() -> bool {
-        PROBES_REFUSED.with(Cell::get)
     }
 
     /// While the guard lives, `converge` on this thread lists process group `pgid` instead of the

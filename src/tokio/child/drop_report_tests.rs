@@ -104,7 +104,6 @@ mod linux {
     /// Mutants: the skip warns on its own; the forget warns on its own.
     #[skuld::test]
     async fn a_reaped_root_in_a_process_group_warns_once_for_the_skip_and_the_forget() {
-        // The pre-6.9 path: on 6.9+ the root's pidfd decides (`drop_group_exact_tests`).
         #[cfg(target_os = "linux")]
         let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
         crate::log_capture::install();
@@ -321,7 +320,6 @@ mod linux {
     /// Mutant: the drop's report ignores that the cleanup already warned.
     #[skuld::test]
     async fn a_retried_cleanup_does_not_warn_of_its_event_twice() {
-        // The pre-6.9 path: on 6.9+ the root's pidfd decides (`drop_group_exact_tests`).
         #[cfg(target_os = "linux")]
         let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
         crate::log_capture::install();

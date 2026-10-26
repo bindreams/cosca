@@ -280,24 +280,26 @@ impl Child {
     /// each in-flight call occupies one blocking-pool thread for up to `grace` — size the
     /// pool accordingly for many long concurrent shutdowns.
     ///
-    /// **A root reaped by something else** (see [`kill_tree`](Child::kill_tree)): on Linux 6.9+ a
-    /// process group that still has a member gets the `SIGTERM` through the root's pidfd, then the
-    /// sweep at once: the grace watches only the root, which is gone. One with none left has nothing
-    /// to shut down. Either way, once the tree is down the call returns
-    /// [`Error::Unassessable`](crate::error::Error::Unassessable) saying so: the root's exit status
-    /// went to the other reaper. Otherwise nothing goes out by the root's number,
-    /// and the call ends with one `warn` and [`Error::Unassessable`](crate::error::Error::Unassessable),
-    /// with no sweep. A macOS fd marker's
-    /// holders, named by the pipe they hold, still get the `SIGTERM`, the grace, and a kill of any
-    /// left, whose error is returned if it fails; any other mechanism ends at once, with no grace.
+    /// **A root reaped by something else** (see [`kill_tree`](Child::kill_tree)):
+    ///
+    /// - On Linux 6.9+ a process group that still has a member gets the `SIGTERM` through the
+    ///   root's pidfd, then the sweep at once: the grace watches only the root, which is gone. One
+    ///   with none left has nothing to shut down. Either way, once the tree is down the call
+    ///   returns [`Error::Unassessable`](crate::error::Error::Unassessable) saying so: the root's
+    ///   exit status went to the other reaper.
+    /// - Otherwise nothing goes out by the root's number, and the call ends with one `warn` and
+    ///   [`Error::Unassessable`](crate::error::Error::Unassessable), with no sweep. A macOS fd
+    ///   marker's holders, named by the pipe they hold, still get the `SIGTERM`, the grace, and a
+    ///   kill of any left, whose error is returned if it fails; any other mechanism ends at once,
+    ///   with no grace.
+    ///
     /// On Linux, a root whose handle cannot say whether it was reaped still gets the `SIGTERM`
-    /// through its pidfd, which names it exactly, then the grace, and a kill through the pidfd if it
-    /// is still running; nothing goes out by its number, and the call ends the same way. On 6.9+ its
-    /// group is shut down as usual while it has a member.
-    /// After this handle's own reap, with another process at the pid, the group is empty: only the
-    /// holders get the `SIGTERM`, and the call goes on as usual. The `SIGTERM` and the sweep each
-    /// decide on a look of their own at the root, and each send by the group's number after it checks
-    /// the root again right before it, as for `kill_tree`.
+    /// through its pidfd, which names it exactly, then the grace, and a kill through the pidfd if
+    /// it is still running; nothing goes out by its number, and the call ends the same way. On 6.9+
+    /// its group is shut down as usual while it has a member. After this handle's own reap, with
+    /// another process at the pid, the group is empty: only the holders get the `SIGTERM`, and the
+    /// call goes on as usual. The `SIGTERM` and the sweep each decide on a look of their own at the
+    /// root, and each send by the group's number after it is checked as for `kill_tree`.
     ///
     /// **macOS, a root the handle cannot vouch for** is signalled as for
     /// [`terminate_tree`](Child::terminate_tree) and swept as for [`kill_tree`](Child::kill_tree). A

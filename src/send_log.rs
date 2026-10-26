@@ -2,10 +2,12 @@
 //!
 //! A by-pid entry is written immediately BEFORE the syscall, whatever the syscall answers: a
 //! `kill(2)` that fails with `ESRCH` still records, so a test sees an attempt that reached the OS.
-//! A [`GroupStep`] send (to a group, its leader or a member) is written by
-//! [`send_signal`](crate::containment::unix::send_signal) AFTER the syscall returned, whatever it
-//! answers, with the signal it handed the syscall: a send that was skipped leaves no record. Where a
-//! test seam answers in the kernel's place, no syscall is made, and the step is still recorded.
+//! A [`GroupStep`] send (to a group, its leader or a member, signal 0 included) is written by
+//! [`send_signal`](crate::containment::unix::send_signal) or
+//! [`probe_signal`](crate::containment::unix::probe_signal) AFTER the syscall returned, whatever it
+//! answers, with the signal number it handed the syscall: a send that was skipped leaves no record.
+//! Where a test seam answers in the kernel's place, no syscall is made, and the step is still
+//! recorded.
 
 use std::cell::RefCell;
 
@@ -39,6 +41,17 @@ pub(crate) enum GroupStep {
     Leader(Route, i32),
     /// A member's resend: the member's pid, and the signal's number.
     Member(Route, u32, i32),
+}
+
+#[cfg(unix)]
+impl GroupStep {
+    /// A send of signal 0, which asks whether its target exists and delivers nothing.
+    fn is_probe(self) -> bool {
+        matches!(
+            self,
+            GroupStep::Group(_, 0) | GroupStep::Leader(_, 0) | GroupStep::Member(_, _, 0)
+        )
+    }
 }
 
 /// Asserts that the first step is `signo` sent to the whole group through the root's pidfd, before
@@ -128,9 +141,17 @@ impl Capture {
 }
 
 impl Capture {
-    /// The steps of the sends to process groups, in order.
+    /// The checks and the signals of the sends to process groups, in order: no signal-0 probe.
     #[cfg(unix)]
     pub(crate) fn group_steps(&self) -> Vec<GroupStep> {
+        let mut steps = self.group_steps_with_probes();
+        steps.retain(|step| !step.is_probe());
+        steps
+    }
+
+    /// Every step of the sends to process groups, in order, the signal-0 probes included.
+    #[cfg(unix)]
+    pub(crate) fn group_steps_with_probes(&self) -> Vec<GroupStep> {
         GROUP.with(|log| log.borrow().clone().expect("a live capture has a log"))
     }
 }

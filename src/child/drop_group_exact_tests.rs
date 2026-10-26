@@ -54,7 +54,7 @@ fn tear_down(child: crate::Child, teardown: Teardown) -> Option<String> {
 }
 
 /// 6.9+: a reaped root whose group still has a member: the teardown kills the group through the
-/// root's pidfd. Mutant: "a teardown never signals the group of a reaped root".
+/// root's pidfd.
 fn kills_the_group_left_behind(reap: Reap, teardown: Teardown) {
     let (child, member) = root_with_a_member();
     reap_root(&child, reap);
@@ -66,7 +66,7 @@ fn kills_the_group_left_behind(reap: Reap, teardown: Teardown) {
 }
 
 /// Below 6.9 the old behaviour holds: a reaped root's group is sent nothing, and its member lives
-/// on. Mutant: "a refused flag still lets the teardown signal the group".
+/// on.
 fn below_6_9_sends_nothing_to_the_group(reap: Reap, teardown: Teardown) {
     let (child, member) = root_with_a_member();
     reap_root(&child, reap);
@@ -80,7 +80,7 @@ fn below_6_9_sends_nothing_to_the_group(reap: Reap, teardown: Teardown) {
 }
 
 /// 6.9+: a reaped root whose group has no member left has no tree left behind: the teardown sends
-/// nothing and reports no skipped kill. Mutant: "an empty group is still a skip".
+/// nothing and reports no skipped kill.
 fn sends_nothing_to_an_empty_group_and_reports_no_skip(reap: Reap, teardown: Teardown) {
     crate::log_capture::install();
     let child = session_sleep().spawn().expect("spawn");

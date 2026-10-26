@@ -15,10 +15,15 @@ extern "system" {
     fn RtlAreLongPathsEnabled() -> u8;
 }
 
-pub fn run(base: &str, image: &str) {
+/// Whether this process may use paths past `MAX_PATH`: its manifest opts in AND the
+/// `LongPathsEnabled` policy is set.
+pub fn long_paths_enabled() -> bool {
     // SAFETY: no arguments; reads this process's own state.
-    let enabled = unsafe { RtlAreLongPathsEnabled() } != 0;
-    println!("long_paths_enabled={enabled}");
+    unsafe { RtlAreLongPathsEnabled() != 0 }
+}
+
+pub fn run(base: &str, image: &str) {
+    println!("long_paths_enabled={}", long_paths_enabled());
     let base = Path::new(base);
     let report = base.join("report.txt");
     for units in [259, 260, 300] {

@@ -22,7 +22,6 @@ pub(crate) fn root_with_a_member() -> (crate::tokio::Child, Member) {
     (child, member)
 }
 
-/// Mutant: "a root reaped elsewhere is never signalled".
 #[skuld::test]
 async fn tokio_kill_tree_kills_the_group_of_a_root_reaped_elsewhere(#[fixture(pidfd_group_signal)] _group: &Group) {
     crate::tokio::test_runtime::assert_current_thread();

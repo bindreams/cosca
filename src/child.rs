@@ -619,8 +619,7 @@ impl Child {
     /// first (below). A process listed by the group's number once the group has no member left is
     /// in another group that took the number, and is sent nothing. A root reaped elsewhere, or after
     /// this handle's own reap with its pid unreadable, whose group has no member left has no tree
-    /// left: nothing is sent, and the call is `Ok`. Otherwise, and below 6.9 and on macOS, the
-    /// paragraphs below apply.
+    /// left: nothing is sent, and the call is `Ok`.
     ///
     /// **A root reaped by something else.** A process group, and a macOS fd marker's group and
     /// walk, are named by the root's pid. If the root's own handle shows it was reaped by another
@@ -798,12 +797,6 @@ impl Child {
     /// group refused the signal — a setuid binary in the tree is the ordinary cause. The
     /// tree is still running and this process cannot bring it down.
     ///
-    /// In a cgroup v2 leaf, a listed member that got no `SIGTERM` makes this
-    /// [`Error::Containment`](crate::error::Error::Containment) when its send failed, and otherwise
-    /// [`Error::Unassessable`](crate::error::Error::Unassessable) when it could not be pinned or shown
-    /// to be in the leaf; one `warn` names the leaf and the pids. [`kill_tree`](Child::kill_tree)
-    /// still reaches them.
-    ///
     /// See [`kill_tree`](Child::kill_tree)'s doc for four things that also apply here: the
     /// `ProcessGroup`/`Session`-only scope of this guarantee (a separate, unfixed gap for
     /// `TreeWalk`), the residual `hidepid` gap on Linux, a root reaped by something else, and a reap
@@ -852,8 +845,7 @@ impl Child {
         self.attached.terminate(self.proc.id(), group)
     }
 
-    /// Whether the root's pid still names its group, read now through its handle, for a caller that
-    /// holds none of its reaps off (a drop, a front's cgroup kill).
+    /// Whether the root's pid still names its group, read now through its handle.
     #[cfg(unix)]
     fn group_number_holds(&self) -> Result<(), String> {
         tree_call::group_number_holds(self.id.pid(), self.proc.state_and_own_reap())
@@ -1257,10 +1249,9 @@ impl Child {
     /// The kill-on-drop teardown, with one report of the event.
     ///
     /// Nothing that names the tree by the root's number runs once the root is reaped, or when its
-    /// handle cannot say: the handle's own answer (`RootState`), or the number no longer reading
-    /// as this root. Each send by the group's number checks the root again right before it; a foreign
-    /// reap between that check and its send is not seen, and the send then reaches whatever process
-    /// holds the number. On Linux 6.9+ the root's pidfd decides a process group instead
+    /// handle cannot say: the handle's own answer (`RootState`), or the number no longer reading as
+    /// this root. Each send by the group's number checks the root again, as for
+    /// [`kill_tree`](Child::kill_tree). On Linux 6.9+ a process group is decided by the root's pidfd
     /// ([`Attached::hard_kill_for_drop`](crate::containment::Attached::hard_kill_for_drop)). An
     /// unreaped root stays a zombie, pinning its number, until `teardown_on_drop`.
     fn drop_unix(&mut self) -> crate::error::ChildFate {

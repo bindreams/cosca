@@ -28,7 +28,6 @@ fn foreign_reaped_group_root() -> (crate::tokio::Child, u32) {
 /// Mutants: `killpg` sent; the decision taken on the number alone (it shows no recycle).
 #[skuld::test]
 async fn tokio_kill_tree_after_a_foreign_reap_sends_no_killpg() {
-    // The pre-6.9 path: on 6.9+ the root's pidfd decides (`group_exact_tests`).
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::tokio::test_runtime::assert_current_thread();
@@ -53,7 +52,6 @@ async fn tokio_kill_tree_after_a_foreign_reap_sends_no_killpg() {
 /// The twin of [`tokio_kill_tree_after_a_foreign_reap_sends_no_killpg`]. Same mutants.
 #[skuld::test]
 async fn tokio_terminate_tree_after_a_foreign_reap_sends_no_signal() {
-    // The pre-6.9 path: on 6.9+ the root's pidfd decides (`group_exact_tests`).
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::tokio::test_runtime::assert_current_thread();
@@ -79,7 +77,6 @@ async fn tokio_terminate_tree_after_a_foreign_reap_sends_no_signal() {
 /// mutant.
 #[skuld::test]
 async fn tokio_kill_tree_after_own_wait_whose_pid_reads_unknown_sends_no_killpg() {
-    // The pre-6.9 path: on 6.9+ the root's pidfd decides (`group_exact_tests`).
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::tokio::test_runtime::assert_current_thread();
@@ -110,7 +107,6 @@ async fn tokio_kill_tree_after_own_wait_whose_pid_reads_unknown_sends_no_killpg(
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn tokio_kill_tree_of_a_root_its_handle_cannot_read_kills_it_through_its_pidfd_alone() {
-    // The pre-6.9 path: on 6.9+ the root's pidfd decides (`group_exact_tests`).
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     use crate::test_child::reaped_elsewhere::ROOT_KILLED_BY_PIDFD;
     use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peek_once};
@@ -164,7 +160,6 @@ fn term_ignoring_session_sleep() -> crate::tokio::Command {
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn tokio_terminate_tree_of_a_root_its_handle_cannot_read_terms_it_through_its_pidfd_alone() {
-    // The pre-6.9 path: on 6.9+ the root's pidfd decides (`group_exact_tests`).
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     use crate::test_child::reaped_elsewhere::ROOT_TERMED_BY_PIDFD;
     use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peek_once};
@@ -207,7 +202,6 @@ async fn tokio_terminate_tree_of_a_root_its_handle_cannot_read_terms_it_through_
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn tokio_graceful_shutdown_tree_of_a_root_its_handle_cannot_read_escalates_through_its_pidfd_alone() {
-    // The pre-6.9 path: on 6.9+ the root's pidfd decides (`group_exact_tests`).
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     use crate::signal::Sig::{Kill, Term};
     use crate::test_child::reaped_elsewhere::{ROOT_KILLED_BY_PIDFD, ROOT_TERMED_BY_PIDFD};
@@ -264,7 +258,6 @@ async fn tokio_graceful_shutdown_tree_of_a_root_its_handle_cannot_read_escalates
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn tokio_graceful_shutdown_tree_of_a_root_its_handle_cannot_read_sends_no_kill_to_one_that_exited() {
-    // The pre-6.9 path: on 6.9+ the root's pidfd decides (`group_exact_tests`).
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     use crate::signal::Sig::Term;
     use crate::test_child::reaped_elsewhere::{ROOT_KILLED_BY_PIDFD, ROOT_TERMED_BY_PIDFD};
@@ -319,7 +312,6 @@ async fn tokio_graceful_shutdown_tree_of_a_root_its_handle_cannot_read_sends_no_
 /// The sync `graceful_shutdown_tree_after_a_foreign_reap_warns_once_and_ends`'s twin. Same mutant.
 #[skuld::test]
 async fn tokio_graceful_shutdown_tree_after_a_foreign_reap_warns_once_and_ends() {
-    // The pre-6.9 path: on 6.9+ the root's pidfd decides (`group_exact_tests`).
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::tokio::test_runtime::assert_current_thread();
@@ -358,7 +350,6 @@ async fn tokio_graceful_shutdown_tree_after_a_foreign_reap_warns_once_and_ends()
 /// mutant.
 #[skuld::test]
 async fn tokio_graceful_shutdown_tree_after_own_wait_claims_no_sigterm_it_did_not_send() {
-    // The pre-6.9 path: on 6.9+ the root's pidfd decides (`group_exact_tests`).
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     use crate::child::fault::force_next_root_read;

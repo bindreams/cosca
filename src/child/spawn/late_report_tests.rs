@@ -1315,3 +1315,42 @@ fn macos_an_unverified_child_is_said_to_be_unsignalled_because_it_could_not_be_v
     );
     assert!(!said.contains("was gone"), "{said}");
 }
+
+/// A root reaped by another reaper after the look that decides the sweep after its kill, and before
+/// that sweep's send by its group's number: the check right before the send sees the reap, and
+/// nothing goes by that number. Mutant: "the late tree's check always passes".
+#[skuld::test]
+fn macos_late_tree_checks_the_root_again_before_a_send_by_number() {
+    use crate::child::spawn::fault::{set_at, SpawnPoint};
+    use crate::graceful_hooks::{at, HookPoint};
+    use std::cell::RefCell;
+    crate::log_capture::install();
+    let (mut cmd, writer) = sync_blocker();
+    cmd.contain_with(crate::ContainMode::Session);
+    cmd.suppress_fd_marker();
+    let capture: Rc<RefCell<Option<crate::send_log::Capture>>> = Rc::default();
+    let reap: Rc<RefCell<Option<crate::oneshot_hook::Armed>>> = Rc::default();
+    let _second = set_at(SpawnPoint::BeforeLateRootKill, {
+        let (capture, reap) = (Rc::clone(&capture), Rc::clone(&reap));
+        move || {
+            let pid = crate::child::spawn::fault::spawn_pid();
+            *capture.borrow_mut() = Some(crate::send_log::Capture::start());
+            *reap.borrow_mut() = Some(at(HookPoint::AfterRootLook, move || {
+                crate::test_child::reaped_elsewhere::reap_behind(pid);
+            }));
+        }
+    });
+    let err = {
+        let _late = unique_report::seams::find_the_report_unwritten();
+        cmd.spawn().expect_err("a late child is not adopted")
+    };
+    drop(writer);
+    let steps = capture
+        .borrow()
+        .as_ref()
+        .expect("the root's kill came after the first sweep")
+        .group_steps();
+    drop((reap.borrow_mut().take(), capture.borrow_mut().take()));
+    crate::child::foreign_reap_after_look_tests::assert_nothing_by_number(&steps);
+    crate::child::spawn::failure::expect_may_have_started_with(err);
+}
