@@ -1,6 +1,7 @@
 //! Linux: a tokio spawn that fails after its fork, for a root that left a member in the process
 //! group that is its containment. On 6.9+ the cleanup kills the group through the root's pidfd
-//! while it has a member, as the identity-failure cleanup does; below 6.9 it kills the root alone.
+//! while it has a member, as the identity-failure cleanup does; below 6.9 it kills the root alone and
+//! warns once that members of its group may be left running.
 
 use crate::child::group_exact_tests::{await_started, Member, ROOT_WITH_A_MEMBER};
 use crate::child::spawn::fault;
@@ -36,13 +37,44 @@ impl Root {
     }
 }
 
+/// What a failed spawn did, as the tests below read it.
+struct Failed {
+    fate: ChildFate,
+    steps: Vec<GroupStep>,
+    member: Member,
+    /// The pid of the child tokio dropped.
+    pid: u32,
+    /// The records, at `warn` or above, that say a process group's members are left running.
+    group_warns: Vec<String>,
+}
+
+/// The start of the record that says the members of the dropped child's group may be left running.
+/// The child's pid is unknown to the cleanup, as tokio returns none.
+fn left_running_note() -> String {
+    format!(
+        "members of the process group of {} may be left running",
+        crate::child::spawn::named(None)
+    )
+}
+
 /// Spawns `root` contained by `mode`, failing tokio's spawn after its fork once the root's member
-/// exists: the failure's fate, the group steps recorded, and the member. `placement` guards a
-/// forced placement failure.
-fn failed_spawn(root: Root, mode: crate::ContainMode, placement: impl Sized) -> (ChildFate, Vec<GroupStep>, Member) {
+/// exists. `placement` guards a forced placement failure.
+fn failed_spawn(root: Root, mode: crate::ContainMode, placement: impl Sized) -> Failed {
+    failed_spawn_as(root, mode, placement, None)
+}
+
+/// [`failed_spawn`], with the root launched by `front`, if any.
+fn failed_spawn_as(
+    root: Root,
+    mode: crate::ContainMode,
+    placement: impl Sized,
+    front: Option<crate::elevation::front::Front>,
+) -> Failed {
     crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
     let (stdio, started, member) = Member::pipes();
     let capture = Capture::start();
+    let mark = crate::log_capture::mark();
     let spawned = {
         let _failing = fault::fail_tokio_spawns_after_fork_then(move |pid| {
             await_started(started);
@@ -55,6 +87,7 @@ fn failed_spawn(root: Root, mode: crate::ContainMode, placement: impl Sized) -> 
         let mut cmd = crate::tokio::Command::new();
         cmd.args(root.argv());
         cmd.contain_with(mode);
+        cmd.set_elevation_front(front);
         cmd.stdin(stdio.stdin).expect("set stdin");
         cmd.stdout(stdio.stdout).expect("set stdout");
         cmd.stderr(stdio.stderr).expect("set stderr");
@@ -62,12 +95,23 @@ fn failed_spawn(root: Root, mode: crate::ContainMode, placement: impl Sized) -> 
     };
     let steps = capture.group_steps();
     drop(placement);
-    fault::take_forgotten_pid().expect("the seam forked a child");
+    let pid = fault::take_forgotten_pid().expect("the seam forked a child");
     let (_err, fate) = match spawned {
         Ok(child) => panic!("the spawn must fail after its fork: {:?}", child.id()),
         Err(e) => crate::child::spawn::failure::expect_may_have_started_with(e),
     };
-    (fate, steps, member)
+    let group_warns = crate::log_capture::records_since_on_current_thread(mark, "left running")
+        .into_iter()
+        .filter(|(level, text)| *level <= log::Level::Warn && text.contains("process group"))
+        .map(|(_, text)| text)
+        .collect();
+    Failed {
+        fate,
+        steps,
+        member,
+        pid,
+        group_warns,
+    }
 }
 
 /// 6.9+: the cleanup kills the root's group through its pidfd, whoever reaped the root. Mutants: "a
@@ -75,20 +119,28 @@ fn failed_spawn(root: Root, mode: crate::ContainMode, placement: impl Sized) -> 
 /// of a root nobody else reaped".
 fn kills_the_group(root: Root, container: Container) {
     let (mode, placement) = container.arm();
-    let (fate, steps, member) = failed_spawn(root, mode, placement);
-    assert_eq!(fate, root.fate(), "{root:?}");
-    assert_group_signalled_first_through_the_pidfd(&steps, libc::SIGKILL);
-    member.assert_killed();
+    let failed = failed_spawn(root, mode, placement);
+    assert_eq!(failed.fate, root.fate(), "{root:?}");
+    assert_group_signalled_first_through_the_pidfd(&failed.steps, libc::SIGKILL);
+    failed.member.assert_killed();
+    assert_eq!(failed.group_warns, Vec::<String>::new(), "the group was killed");
 }
 
-/// Below 6.9 the old behaviour holds: the kernel refuses the group's send through the pidfd,
-/// nothing goes by the group's number, and its member lives on. Mutant: "a refused flag falls back
-/// to the group's number".
+/// Below 6.9 the kernel refuses the group's send through the pidfd, nothing goes by the group's
+/// number, and its member lives on, which the cleanup says in one `warn`. Mutants: "a refused flag
+/// falls back to the group's number"; "the refusal is only a `debug`".
 fn below_6_9_sends_nothing_to_the_group(root: Root, container: Container) {
     let old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     let (mode, placement) = container.arm();
-    let (fate, steps, member) = failed_spawn(root, mode, placement);
+    let failed = failed_spawn(root, mode, placement);
     drop(old_kernel);
+    let Failed {
+        fate,
+        steps,
+        member,
+        group_warns,
+        ..
+    } = failed;
     assert_eq!(fate, root.fate(), "{root:?}");
     assert_eq!(
         steps.first(),
@@ -105,6 +157,15 @@ fn below_6_9_sends_nothing_to_the_group(root: Root, container: Container) {
         "nothing goes by a number: {steps:?}"
     );
     member.assert_survived();
+    assert_eq!(
+        group_warns.len(),
+        1,
+        "one warn says the members may be left running: {group_warns:?}"
+    );
+    // A root its leaf did not take is answered for by the leaf's abandonment, in its own words.
+    if !matches!(container, Container::LeafNotTaken) {
+        assert!(group_warns[0].contains(&left_running_note()), "{group_warns:?}");
+    }
 }
 
 #[skuld::test]
@@ -149,10 +210,10 @@ async fn a_tokio_spawn_failing_after_its_fork_below_6_9_sends_nothing_to_its_for
 async fn a_tokio_spawn_failing_after_its_fork_under_a_tree_walk_sends_no_group_anything(
     #[fixture(pidfd_group_signal)] _group: &Group,
 ) {
-    let (fate, steps, member) = failed_spawn(Root::Running, crate::ContainMode::TreeWalk, ());
-    assert_eq!(fate, ChildFate::Reaped, "killed and reaped through its pidfd");
-    assert!(steps.is_empty(), "no group is sent anything: {steps:?}");
-    member.assert_survived();
+    let failed = failed_spawn(Root::Running, crate::ContainMode::TreeWalk, ());
+    assert_eq!(failed.fate, ChildFate::Reaped, "killed and reaped through its pidfd");
+    assert!(failed.steps.is_empty(), "no group is sent anything: {:?}", failed.steps);
+    failed.member.assert_survived();
 }
 
 /// A child std collected, because its `exec` failed, never ran the program and left no group: the
@@ -208,10 +269,10 @@ async fn a_nested_tokio_spawn_failing_after_its_fork_sends_no_group_anything() {
         return;
     };
     std::env::set_var(crate::containment::NESTED_ENV, "1");
-    let (fate, steps, member) = failed_spawn(Root::Running, crate::ContainMode::Session, ());
-    assert_eq!(fate, ChildFate::Reaped, "killed and reaped through its pidfd");
-    assert!(steps.is_empty(), "no group is sent anything: {steps:?}");
-    member.assert_survived();
+    let failed = failed_spawn(Root::Running, crate::ContainMode::Session, ());
+    assert_eq!(failed.fate, ChildFate::Reaped, "killed and reaped through its pidfd");
+    assert!(failed.steps.is_empty(), "no group is sent anything: {:?}", failed.steps);
+    failed.member.assert_survived();
 }
 
 #[skuld::test]
@@ -227,4 +288,95 @@ async fn cgroup_a_tokio_spawn_failing_after_its_fork_below_6_9_sends_nothing_to_
     #[fixture(cgroup)] _cgroup: &Group,
 ) {
     below_6_9_sends_nothing_to_the_group(Root::Running, Container::LeafNotTaken);
+}
+
+/// A `sudo`/`doas`-style front is sent nothing: a kill of its group would orphan the elevated
+/// program. So a spawn of one that fails after its fork sends the group no signal, though the group
+/// is its containment and has a live member. Mutant: `killing_group` drops its front check.
+#[skuld::test]
+async fn a_tokio_spawn_of_a_front_failing_after_its_fork_sends_its_group_nothing() {
+    use crate::elevation::{Backend, ElevatedVia};
+    let front = crate::elevation::front::front(Some(&ElevatedVia::Wrapped(Backend::Sudo)));
+    assert!(front.is_some(), "sudo launches a front");
+    let failed = failed_spawn_as(Root::Running, crate::ContainMode::Session, (), front);
+    let Failed {
+        fate,
+        steps,
+        member,
+        pid,
+        ..
+    } = failed;
+    // Asserted before anything is sent to `pid`: a front torn down by mistake is reaped, and its
+    // number may be reused.
+    assert_eq!(fate, ChildFate::Running { id: None }, "the front is left running");
+    assert!(steps.is_empty(), "the front's group is sent nothing: {steps:?}");
+    // The front is left running and unreaped: what the test made is ended here.
+    // SAFETY: `pid` is this process's own unreaped child.
+    unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    crate::child::front_kill_tests::reap(pid).expect("the front is left unreaped");
+    let said = member.end();
+    assert!(said.contains("survived"), "the group's member was killed: {said:?}");
+}
+
+/// A group kill the kernel refuses for a reason other than the flag (`EPERM`, forced) is one `warn`
+/// that names the refusal and says the members may be left running; the root is still reaped.
+/// Mutant: the refusal is not noted, or is a `debug`.
+#[skuld::test]
+async fn a_tokio_spawn_failing_after_its_fork_whose_group_kill_is_refused_warns_once() {
+    let refused = crate::containment::unix::fault::refuse_group_sends();
+    let failed = failed_spawn(Root::Running, crate::ContainMode::Session, ());
+    drop(refused);
+    let Failed {
+        fate,
+        member,
+        group_warns,
+        ..
+    } = failed;
+    assert_eq!(
+        fate,
+        ChildFate::Reaped,
+        "the root is killed and reaped through its pidfd"
+    );
+    member.assert_survived();
+    assert_eq!(group_warns.len(), 1, "{group_warns:?}");
+    let named = crate::child::spawn::named(None);
+    assert!(
+        group_warns[0].contains(&format!("could not kill the process group of {named}"))
+            && group_warns[0].contains("may be left running"),
+        "{group_warns:?}"
+    );
+}
+
+/// Below 6.9 the group kill sent to a child std collected, because its exec failed, is refused too.
+/// The child never ran the program, which the `warn` says it may not have: the child was reaped, so
+/// nothing shows otherwise. Mutants: the refusal is not warned about; the `warn` drops that the
+/// child was reaped.
+#[skuld::test]
+async fn a_tokio_exec_failure_below_6_9_warns_that_the_reaped_child_may_never_have_run() {
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
+    let capture = Capture::start();
+    let mark = crate::log_capture::mark();
+    let mut cmd = crate::tokio::Command::new();
+    cmd.args(["cosca-no-such-program-142"]);
+    cmd.contain_with(crate::ContainMode::Session);
+    let (_err, fate) = crate::child::spawn::failure::expect_may_have_started_with(
+        cmd.spawn().expect_err("a missing program fails the spawn"),
+    );
+    drop(old_kernel);
+    assert_eq!(fate, ChildFate::Gone, "std had collected the child whose exec failed");
+    assert_eq!(capture.group_steps(), [GroupStep::Group(Route::Pidfd, libc::SIGKILL)]);
+    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "the process group of")
+        .into_iter()
+        .filter(|(level, _)| *level <= log::Level::Warn)
+        .collect();
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(warns[0].1.contains(&left_running_note()), "{warns:?}");
+    assert!(
+        warns[0]
+            .1
+            .contains("already reaped, so it may never have run the program"),
+        "{warns:?}"
+    );
 }

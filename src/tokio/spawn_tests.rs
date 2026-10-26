@@ -63,6 +63,38 @@ async fn identity_failure_reaps_the_spawned_child() {
     teardown.assert_killed();
 }
 
+/// macOS: the identity failure of a session root kills and reaps the root through its unique id and
+/// sends its process group nothing, as macOS has no exact kill of a group. The teardown's one warn
+/// says the group's members may be left running.
+///
+/// Mutant: the group's note is dropped.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+async fn macos_identity_failure_of_a_group_root_warns_that_its_members_may_be_left_running() {
+    crate::log_capture::install();
+    fault::set_force_identity_vanished(true);
+    let (mut cmd, teardown) = teardown_blocker();
+    cmd.contain_with(crate::ContainMode::Session);
+    let mark = crate::log_capture::mark();
+    let err = cmd.spawn().err();
+    fault::set_force_identity_vanished(false);
+    let _ = expect_may_have_started_with(err.expect("forced identity-vanish must make spawn return Err"));
+    let Some(crate::identity::Resolved::Found(id)) = fault::take_captured() else {
+        panic!("the seam must have captured the child's identity");
+    };
+    teardown.assert_killed();
+    let note = format!("members of the process group of pid {} may be left running", id.pid());
+    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, &note)
+        .into_iter()
+        .filter(|(level, _)| *level <= log::Level::Warn)
+        .collect();
+    assert_eq!(
+        warns.len(),
+        1,
+        "one warn says the group's members may be left running: {warns:?}"
+    );
+}
+
 // macOS: the attach cannot fail; see `macos_tokio_a_failed_attach_kills_and_reaps_a_child_that_is_not_a_front`.
 #[cfg(not(target_os = "macos"))]
 #[skuld::test]

@@ -90,13 +90,15 @@ impl Prepared {
     }
 
     /// Whether the root's process group is its containment: the root is a Session or process-group
-    /// root, and no cgroup leaf took it, as `attach` would decide. The leaf's verdict is taken
-    /// first ([`settle_verdict`](Self::settle_verdict)).
-    #[cfg(target_os = "linux")]
-    fn group_is_containment(&self) -> bool {
-        self.is_root
-            && self.cgroup_leaf.as_ref().is_none_or(|leaf| !leaf.child_entered())
-            && matches!(self.mode, Some(mode) if !matches!(mode, ContainMode::TreeWalk))
+    /// root, and no cgroup leaf took it, as `attach` would decide. On Linux the leaf's verdict is
+    /// taken first ([`settle_verdict`](Self::settle_verdict)).
+    #[cfg(unix)]
+    pub(crate) fn group_is_containment(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        let taken_by_a_leaf = self.cgroup_leaf.as_ref().is_some_and(|leaf| leaf.child_entered());
+        #[cfg(not(target_os = "linux"))]
+        let taken_by_a_leaf = false;
+        self.is_root && !taken_by_a_leaf && matches!(self.mode, Some(mode) if !matches!(mode, ContainMode::TreeWalk))
     }
 
     /// [`group_is_containment`](Self::group_is_containment) for a spawn with no cgroup leaf, which

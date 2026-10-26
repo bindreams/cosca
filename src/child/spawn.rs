@@ -638,6 +638,10 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
                 drop(prepared);
             }
             #[cfg(target_os = "macos")]
+            if front.is_none() {
+                note_group_left_running(&prepared, pid, &mut why);
+            }
+            #[cfg(target_os = "macos")]
             let (fate, child_fate) = {
                 let identity = if matches!(other, crate::identity::Resolved::Gone) {
                     crate::containment::RootIdentity::Gone
@@ -2038,7 +2042,7 @@ impl Diagnosis {
     }
 
     /// Owe `text` too: the next [`fold`](Diagnosis::fold) leads with it, after what was owed.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     pub(crate) fn add(&mut self, text: impl std::fmt::Display) {
         match &mut self.0 {
             Some(owed) => owed.push_str(&format!("; {text}")),
@@ -2408,25 +2412,44 @@ pub(crate) fn kill_group_before_teardown(
     why: &mut Diagnosis,
 ) {
     if let Err(e) = prepared.kill_group_before_attach(child) {
-        note_refused_group_kill(Some(child.pid), e, why);
+        note_refused_group_kill(Some(child.pid), e, false, why);
     }
 }
 
 /// Owes `why` a refused kill of the process group of `pid`'s root through its pidfd, which says the
-/// group's members may be left running.
+/// group's members may be left running. `reaped`: the root was already reaped, so it may never have
+/// run the program (std collects the child of an exec that failed).
 #[cfg(target_os = "linux")]
-pub(crate) fn note_refused_group_kill(pid: Option<u32>, refusal: nix::errno::Errno, why: &mut Diagnosis) {
+pub(crate) fn note_refused_group_kill(pid: Option<u32>, refusal: nix::errno::Errno, reaped: bool, why: &mut Diagnosis) {
     let named = named(pid);
+    let reaped = if reaped {
+        "; the child was already reaped, so it may never have run the program"
+    } else {
+        ""
+    };
     match refusal {
         nix::errno::Errno::EINVAL => why.add(format!(
             "members of the process group of {named} may be left running: the kernel refused \
              PIDFD_SIGNAL_PROCESS_GROUP (EINVAL, expected below Linux 6.9), so nothing was sent to the \
-             group, whose number may name another group"
+             group, whose number may name another group{reaped}"
         )),
         e => why.add(format!(
             "spawn teardown could not kill the process group of {named} through its pidfd ({e}); its \
-             members may be left running"
+             members may be left running{reaped}"
         )),
+    }
+}
+
+/// macOS: owes `why` that a failed spawn's cleanup sends the process group of the root `pid` nothing,
+/// since macOS has no exact kill of a group, so its members may be left running. Only for a root
+/// whose group is its containment, which is not an elevation front's.
+#[cfg(target_os = "macos")]
+pub(crate) fn note_group_left_running(prepared: &crate::containment::Prepared, pid: u32, why: &mut Diagnosis) {
+    if prepared.group_is_containment() {
+        why.add(format!(
+            "members of the process group of pid {pid} may be left running: macOS has no exact kill of a \
+             process group, so the group is sent nothing"
+        ));
     }
 }
 

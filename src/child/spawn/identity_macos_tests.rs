@@ -211,6 +211,46 @@ fn macos_sync_spawn_identity_with_a_refused_reread_is_unassessable() {
     );
 }
 
+/// A spawn whose identity re-read is refused leaves a session root unsignalled. macOS has no exact
+/// kill of its process group, so the one warn also says the group's members may be left running.
+///
+/// Mutant: the group's note is dropped.
+#[skuld::test]
+fn macos_sync_spawn_identity_failure_of_a_group_root_warns_that_its_members_may_be_left_running() {
+    crate::log_capture::install();
+    let (mut cmd, _writer) = sync_blocker();
+    cmd.contain_with(crate::ContainMode::Session);
+    let pid = Rc::new(Cell::new(0));
+    let armed: Rc<RefCell<Option<Box<dyn std::any::Any>>>> = Rc::default();
+    let _hook = fault::set_at(SpawnPoint::AfterIdentityRead, {
+        let (pid, armed) = (Rc::clone(&pid), Rc::clone(&armed));
+        move || {
+            pid.set(fault::spawn_pid());
+            *armed.borrow_mut() = Some(Box::new(force_peek_once(Err(std::io::Error::other(
+                "forced re-read refusal 7c2e",
+            )))));
+        }
+    });
+    let mark = crate::log_capture::mark();
+    let outcome = cmd.spawn();
+    drop(armed);
+    assert_ne!(pid.get(), 0, "the hook must have run");
+    end_unsignalled_and_reap(pid.get());
+    let _ = outcome.expect_err("a refused re-read fails the spawn");
+    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "")
+        .into_iter()
+        .filter(|(level, _)| *level <= log::Level::Warn)
+        .collect();
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(
+        warns[0].1.contains(&format!(
+            "members of the process group of pid {} may be left running",
+            pid.get()
+        )),
+        "the one warn says the group's members may be left running: {warns:?}"
+    );
+}
+
 /// At the re-read the child answers `ECHILD` (the test reaped it) yet its pid still names it, held
 /// by launchd (forced): a dead tracer's tracee in transit. That is neither a reap nor ours, so it
 /// is `Gone` (it exited, and is not ours to reap) with a warn naming the pid, and the error says its

@@ -665,6 +665,9 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
             // Linux 6.9+: the group the root may have left members in, whoever reaped the root.
             #[cfg(target_os = "linux")]
             crate::child::spawn::kill_group_before_teardown(&prepared, handle, &mut why);
+            // macOS: nothing kills the group, which the teardown's one warn says.
+            #[cfg(target_os = "macos")]
+            crate::child::spawn::note_group_left_running(&prepared, pid, &mut why);
             // Linux: a failed check says nothing about the child, and its pidfd pins it whatever
             // the peek said, so it is killed and reaped through the pidfd, as the sync spawn does.
             #[cfg(target_os = "linux")]

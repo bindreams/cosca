@@ -275,7 +275,8 @@ enum LeftFront {
     /// Not a front: torn down as any child.
     NotAFront,
     /// Not a front, and the process group the root leads is its containment (no cgroup leaf can have
-    /// taken it): on Linux 6.9+ the group is killed through the pidfd before the root is torn down.
+    /// taken it): on Linux 6.9+ the group is killed through the pidfd before the root is torn down,
+    /// whether or not std had already collected the child.
     #[cfg_attr(
         not(feature = "tokio"),
         allow(
@@ -325,9 +326,12 @@ impl Handshake {
     }
 
     /// Names the root's process group as its containment (`Prepared::leafless_group_is_containment`):
-    /// a spawn that fails after its fork, with the child still there, kills the group through the
-    /// child's pidfd while it has a member (Linux 6.9+), before it kills the child. Not for a front,
-    /// which is sent nothing.
+    /// a spawn that fails after its fork sends the group `SIGKILL` through the child's pidfd while it
+    /// has a member (Linux 6.9+), before it tears the child down. The send is made to a child std
+    /// already collected too: its exec failed, so it never ran the program and left no group, and the
+    /// kernel answers `ESRCH`. Where the kernel refuses the flag (expected below 6.9) nothing goes by
+    /// the group's number, and the spawn's one `warn` says the group's members may be left running.
+    /// Not for a front, which is sent nothing.
     #[cfg(feature = "tokio")]
     pub(crate) fn killing_group(mut self, yes: bool) -> Handshake {
         if yes && matches!(self.front, LeftFront::NotAFront) {
@@ -354,8 +358,9 @@ impl Handshake {
     /// - A spawn that fails after its fork: std collected the child (see residuals b and c in
     ///   [`child_exited_before_the_helper_finished`]), or tokio dropped it neither
     ///   killed nor reaped. The pidfd tells which, and a child still there is killed and reaped
-    ///   through it, after its process group is killed if it is named as the containment
-    ///   ([`killing_group`](Self::killing_group)).
+    ///   through it. If its process group is named as the containment
+    ///   ([`killing_group`](Self::killing_group)), the group is sent `SIGKILL` through the pidfd first,
+    ///   for a child std already collected too.
     ///
     /// The child runs the program only once told to go, so every failure but one proves the program
     /// did not start: a failed `spawn` after the child was told to go, from a spawn whose error does
@@ -832,7 +837,8 @@ fn join_helper(helper: std::thread::ScopedJoinHandle<'_, Outcome>, #[cfg(test)] 
 /// Combines the fork's answer with the helper's. A child that sent its pidfd and then failed its
 /// `spawn()` is torn down through that pidfd. The exception is the elevation `front` still there:
 /// tokio dropped it after it ran the program, so it is sent nothing. A child std already
-/// collected never ran the program (its exec failed): it is not a front. A front spawned for a
+/// collected never ran the program (its exec failed): it is not a front, and its group, if named as
+/// the containment, is still sent `SIGKILL` through the pidfd (`ESRCH`). A front spawned for a
 /// cgroup leaf is the leaf's to answer for: its pidfd is left for the leaf, unused here, and the
 /// failure's fate is a placeholder (`Unknown`) that the leaf's abandonment replaces.
 ///
@@ -867,7 +873,7 @@ fn conclude<T: Spawned>(spawned: io::Result<T>, outcome: Outcome, front: LeftFro
             LeftFront::GroupRoot => {
                 let mut why = super::Diagnosis::default();
                 if let Err(e) = crate::containment::kill_group_through_pidfd(pidfd.as_fd(), None) {
-                    super::note_refused_group_kill(None, e, &mut why);
+                    super::note_refused_group_kill(None, e, collected, &mut why);
                 }
                 let child_fate = super::teardown_through_pidfd_noting(None, pidfd, None, &mut why);
                 (error, child_fate)
