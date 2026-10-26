@@ -268,8 +268,7 @@ pub enum ChildFate {
     Reaped,
     /// The child is dead or dying, but cosca did not collect its exit, and cosca's kill was delivered
     /// (or the child had exited by itself): the wait for it failed, someone else collected its exit
-    /// or holds its zombie after the kill, a Windows child was terminated and not
-    /// waited for, a dropped async child was signalled and left to tokio to collect, or a
+    /// or holds its zombie after the kill, a Windows child was terminated and not waited for, or a
     /// containment teardown ended it. On a wrapper-elevated spawn, the elevated program may still
     /// run.
     Killed,

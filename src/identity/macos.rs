@@ -88,8 +88,6 @@ pub(crate) enum ReadPurpose {
     PreReap,
     /// The second peek's.
     SecondPeek,
-    /// The re-read after an exit watch is armed on a pid: is it still the child?
-    Arm,
     /// Whether a pid whose unique id is not known yet was forked by this process.
     Origin,
     /// A tracer on the chain that holds a child: which process it is, and who holds it.
