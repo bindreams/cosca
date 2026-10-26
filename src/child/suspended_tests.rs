@@ -39,7 +39,7 @@ mod on_windows {
 
     use crate::containment::windows::fault::{force_next, Step};
     use crate::error::{ChildFate, Error};
-    use crate::test_frozen::{limit_flags, InitialThread, Remote};
+    use crate::test_frozen::{limit_flags, InitialThread, Remote, ResumeOnDrop};
     use crate::Containment;
 
     const ERROR_ACCESS_DENIED: u32 = 5;
@@ -62,6 +62,27 @@ mod on_windows {
 
     /// Both spawn backends, so a backend that drops the hold fails its own leg.
     const BACKENDS: [bool; 2] = [false, true];
+
+    /// [`blocker`] with a stdin whose write end the test holds, for a frozen child the test drops.
+    fn held_blocker(raw: bool) -> (crate::Command, std::io::PipeWriter) {
+        let mut cmd = blocker(raw);
+        let (stdin, writer) = crate::test_child::held_writer_stdin();
+        cmd.stdin(stdin).expect("stdin");
+        (cmd, writer)
+    }
+
+    /// For a frozen child that the code under test tears down (a drop, a failed resume): once the
+    /// teardown's kill returned, release the stdin `writer` and let the child's initial thread run.
+    /// A frozen child runs nothing, so the release alone cannot end it; with the thread resumed, a
+    /// kill that sent nothing lets the blocker exit 0, which `assert_reaps_killed` rejects by
+    /// assertion instead of the teardown's reap hanging on a child that never runs.
+    fn release_at_teardown_kill(
+        frozen: &crate::child::SuspendedChild,
+        writer: std::io::PipeWriter,
+    ) -> crate::child::spawn::fault::TeardownBlocker {
+        let thread = InitialThread::of(frozen.id().pid());
+        crate::child::spawn::fault::release_at_drop_kill((writer, ResumeOnDrop(thread)))
+    }
 
     /// Kill `child`, then release its stdin: it exits 0 on EOF, so a kill that sent nothing fails
     /// the assertion on how it ended instead of the reap blocking for ever.
@@ -297,10 +318,10 @@ mod on_windows {
 
     /// A dropped frozen child is killed by the `Child` teardown whatever `kill_on_drop` says, for every
     /// containment: the uncontained and `TreeWalk` shapes have no job to end it, so the teardown's
-    /// own kill is all that does. The stdin write end is released once the teardown's kill returned,
-    /// so a drop that does not kill fails the exit-code assertion (`more.com` exits 0 on EOF, the
-    /// kill's code is 1). The teardown count shows the drop ran the `Child` teardown, not the job's
-    /// asynchronous close.
+    /// own kill is all that does. The stdin write end is released and the child let run once the
+    /// teardown's kill returned, so a drop that does not kill fails the exit-code assertion
+    /// (`more.com` exits 0 on EOF, the kill's code is 1). The teardown count shows the drop ran the
+    /// `Child` teardown, not the job's asynchronous close.
     #[skuld::test]
     fn death_watch_dropping_a_frozen_child_kills_it_whatever_kill_on_drop_says() {
         for (shape, contain) in [
@@ -309,16 +330,15 @@ mod on_windows {
             ("strongest", Some(crate::ContainMode::Strongest)),
         ] {
             for kill_on_drop in [false, true] {
-                let mut cmd = blocker(false);
+                let (mut cmd, writer) = held_blocker(false);
                 if let Some(mode) = contain {
                     cmd.contain_with(mode);
                 }
                 cmd.kill_on_drop(kill_on_drop);
-                let (stdin, writer) = crate::test_child::held_writer_stdin();
-                cmd.stdin(stdin).expect("stdin");
-                // Released once the drop's kill returned: `more.com` then exits 0, not 1.
-                let teardown = crate::child::spawn::fault::release_at_drop_kill(writer);
                 let frozen = cmd.spawn_suspended().expect("spawn suspended");
+                // Released, and the child let run, once the drop's kill returned: `more.com` then
+                // exits 0, not 1.
+                let teardown = release_at_teardown_kill(&frozen, writer);
                 let remote = Remote::open(frozen.id().pid());
                 let teardowns = crate::test_frozen::record_root_teardowns();
 
@@ -336,13 +356,12 @@ mod on_windows {
     #[skuld::test]
     fn death_watch_dropping_a_frozen_child_with_piped_stdio_kills_it_without_hanging() {
         for raw in BACKENDS {
-            let mut cmd = blocker(raw);
+            let (mut cmd, writer) = held_blocker(raw);
             cmd.stdout(crate::Stdio::pipe()).expect("stdout pipe");
-            let (stdin, writer) = crate::test_child::held_writer_stdin();
-            cmd.stdin(stdin).expect("stdin");
-            // Released once the drop's kill returned: `more.com` then exits 0, not 1.
-            let teardown = crate::child::spawn::fault::release_at_drop_kill(writer);
             let frozen = cmd.spawn_suspended().expect("spawn suspended");
+            // Released, and the child let run, once the drop's kill returned: `more.com` then exits
+            // 0, not 1.
+            let teardown = release_at_teardown_kill(&frozen, writer);
             let remote = Remote::open(frozen.id().pid());
 
             drop(frozen);
@@ -356,8 +375,10 @@ mod on_windows {
 
     #[skuld::test]
     fn a_failed_thread_resume_kills_the_child_and_reports_its_fate() {
-        let frozen = blocker(false).spawn_suspended().expect("spawn suspended");
+        let (mut cmd, writer) = held_blocker(false);
+        let frozen = cmd.spawn_suspended().expect("spawn suspended");
         let id = frozen.id();
+        let teardown = release_at_teardown_kill(&frozen, writer);
         let forced = force_next(Step::Resume, ERROR_ACCESS_DENIED);
 
         let err = frozen.resume().expect_err("the resume was forced to fail");
@@ -365,6 +386,7 @@ mod on_windows {
 
         assert!(matches!(err.fate(), Some(ChildFate::Reaped)), "got {err:?}");
         assert_eq!(id.is_alive(), crate::identity::Liveness::Dead);
+        teardown.assert_reaps_killed();
     }
 
     /// Something else killed the frozen process. The process is observed dead (its handle is
@@ -400,14 +422,17 @@ mod on_windows {
     /// frozen, so `resume` must not return `Ok`.
     #[skuld::test]
     fn resume_when_the_initial_thread_was_suspended_twice_kills_the_child_instead_of_returning_ok() {
-        let frozen = blocker(false).spawn_suspended().expect("spawn suspended");
+        let (mut cmd, writer) = held_blocker(false);
+        let frozen = cmd.spawn_suspended().expect("spawn suspended");
         let id = frozen.id();
+        let teardown = release_at_teardown_kill(&frozen, writer);
         InitialThread::of(id.pid()).suspend_once();
 
         let err = frozen.resume().expect_err("the child is still frozen after one resume");
 
         assert!(err.fate().is_some(), "got {err:?}");
         assert_eq!(id.is_alive(), crate::identity::Liveness::Dead);
+        teardown.assert_reaps_killed();
     }
 
     // The command =====
@@ -416,21 +441,27 @@ mod on_windows {
     #[skuld::test]
     fn spawn_suspended_leaves_kill_on_drop_and_flags_as_they_were() {
         for kill_on_drop in [true, false] {
-            let mut cmd = blocker(false);
+            let (mut cmd, writer) = held_blocker(false);
             cmd.kill_on_drop(kill_on_drop);
+            let frozen = cmd.spawn_suspended().expect("spawn suspended");
+            let teardown = release_at_teardown_kill(&frozen, writer);
 
-            drop(cmd.spawn_suspended().expect("spawn suspended"));
+            drop(frozen);
 
             assert_eq!(cmd.kill_on_drop_flag(), kill_on_drop);
             assert!(!cmd.flags_request().suspended);
+            teardown.assert_reaps_killed();
         }
     }
 
     /// A command used for `spawn_suspended` and then for `spawn` yields a running child.
     #[skuld::test]
     fn the_command_spawns_an_ordinary_child_after_a_frozen_one() {
-        let mut cmd = blocker(false);
-        drop(cmd.spawn_suspended().expect("spawn suspended"));
+        let (mut cmd, writer) = held_blocker(false);
+        let frozen = cmd.spawn_suspended().expect("spawn suspended");
+        let teardown = release_at_teardown_kill(&frozen, writer);
+        drop(frozen);
+        teardown.assert_reaps_killed();
 
         // A spawn takes the stdio configuration out of the command. Without its own piped stdin the
         // second blocker would read the harness's stdin and, where that is at EOF, exit at once.
@@ -462,10 +493,13 @@ mod on_windows {
     /// No lock is held across the window: an ordinary spawn completes while another child is frozen.
     #[skuld::test]
     fn spawning_while_another_child_is_frozen_does_not_block() {
-        let frozen = blocker(false).spawn_suspended().expect("spawn suspended");
+        let (mut cmd, writer) = held_blocker(false);
+        let frozen = cmd.spawn_suspended().expect("spawn suspended");
+        let teardown = release_at_teardown_kill(&frozen, writer);
         let other = blocker(false).spawn().expect("an ordinary spawn while one is frozen");
         end(other);
         drop(frozen);
+        teardown.assert_reaps_killed();
     }
 
     #[skuld::test]

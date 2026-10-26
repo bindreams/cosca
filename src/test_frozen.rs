@@ -128,6 +128,28 @@ impl Drop for InitialThread {
     }
 }
 
+impl InitialThread {
+    /// `ResumeThread` with its outcome ignored. A frozen child's drop releases the child's holders
+    /// with this, so a drop whose kill sent nothing lets the child run to its natural exit (code 0)
+    /// and fail the test's exit-code assertion rather than hang on a child that never runs. After a
+    /// kill the thread is gone and the call fails, which is the expected case.
+    pub(crate) fn resume_whatever_the_outcome(&self) {
+        // SAFETY: `self.0` is a live thread handle with resume rights; a terminated thread only
+        // makes the call fail.
+        unsafe { _ = ResumeThread(self.0) };
+    }
+}
+
+/// Resumes the frozen child's initial thread when dropped: held with the holders a drop's kill
+/// releases (see [`InitialThread::resume_whatever_the_outcome`]).
+pub(crate) struct ResumeOnDrop(pub(crate) InitialThread);
+
+impl Drop for ResumeOnDrop {
+    fn drop(&mut self) {
+        self.0.resume_whatever_the_outcome();
+    }
+}
+
 /// A thread another party started in a child, as an EDR agent or a debugger does: held by handle,
 /// closed on drop. It is not the child's initial thread.
 pub(crate) struct InjectedThread(HANDLE);

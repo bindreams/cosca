@@ -12,6 +12,8 @@ use super::child_drop_tests::linux::{Ended, Pidfd};
 use crate::containment::cgroup::test_support::alone;
 use crate::containment::treewalk::fault::record_walks;
 use crate::containment::unix::fault::record_kill_group;
+use crate::send_log::Capture;
+use crate::signal::Sig;
 #[cfg(target_os = "linux")]
 use crate::test_child::fixture_path;
 #[cfg(target_os = "linux")]
@@ -47,16 +49,33 @@ fn session_blocker_cmd() -> Command {
     cmd
 }
 
-/// What the drop did to a [`session_blocker_cmd`] root, once the drop has run: its stdin is closed
-/// here, so a root nothing killed exits `0`. On Linux the root's status is read through `pidfd`,
-/// opened before the drop, and must be the drop's `SIGKILL` (or a reap that came first, which
-/// leaves none to read). Elsewhere the release only lets the child end.
-#[cfg(target_os = "linux")]
-fn assert_the_drop_killed(root: &Pidfd, stdin: crate::tokio::ChildStdin) {
-    let ended = root.ended_after_closing(stdin);
+/// What the drop did to a [`session_blocker_cmd`] root `pid`, once the drop has run: its stdin is
+/// closed here, so a root nothing killed exits `0`. On Linux the root's status is read through
+/// `pidfd`, opened before the drop, and must be the drop's `SIGKILL` (or a reap that came first,
+/// which leaves none to read). On every platform `sends`, logged after the syscall, must hold the
+/// `SIGKILL` to `pid`: a root reaped before its status could be read would otherwise pass for a kill
+/// when the drop sent another signal.
+#[track_caller]
+fn assert_the_drop_killed(
+    #[cfg(target_os = "linux")] root: &Pidfd,
+    stdin: crate::tokio::ChildStdin,
+    sends: &Capture,
+    pid: u32,
+) {
+    #[cfg(target_os = "linux")]
+    {
+        let ended = root.ended_after_closing(stdin);
+        assert!(
+            matches!(ended, Ended::Signalled(libc::SIGKILL) | Ended::ReapedWhileStdinOpen),
+            "the drop must kill the root with SIGKILL, got {ended:?}"
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
+    drop(stdin);
     assert!(
-        matches!(ended, Ended::Signalled(libc::SIGKILL) | Ended::ReapedWhileStdinOpen),
-        "the drop must kill the root with SIGKILL, got {ended:?}"
+        sends.sent(pid, Sig::Kill),
+        "the drop must send the root SIGKILL: {:?}",
+        sends.entries()
     );
 }
 
@@ -121,6 +140,7 @@ async fn dropping_a_running_process_group_child_still_kills_the_group_and_does_n
     #[cfg(target_os = "linux")]
     let pidfd = Pidfd::of(&child);
 
+    let sends = Capture::start();
     let mark = crate::log_capture::mark();
     drop(child);
 
@@ -129,9 +149,9 @@ async fn dropping_a_running_process_group_child_still_kills_the_group_and_does_n
     assert_eq!(drop_warns_since(mark), []);
     // Released after the drop: the root's stdin never ends it on its own here.
     #[cfg(target_os = "linux")]
-    assert_the_drop_killed(&pidfd, stdin);
+    assert_the_drop_killed(&pidfd, stdin, &sends, pid);
     #[cfg(not(target_os = "linux"))]
-    drop(stdin);
+    assert_the_drop_killed(stdin, &sends, pid);
 }
 
 /// A root that exited but is not reaped is a zombie: it still pins its group number, so the group
@@ -426,6 +446,7 @@ async fn dropping_an_unreaped_child_whose_number_reads_unknown_kills_and_logs_th
     let pidfd = Pidfd::of(&child);
     let _unknown = crate::child::fault::force_next_root_read(crate::identity::Resolved::Unknown);
 
+    let sends = Capture::start();
     let mark = crate::log_capture::mark();
     drop(child);
 
@@ -437,9 +458,9 @@ async fn dropping_an_unreaped_child_whose_number_reads_unknown_kills_and_logs_th
     assert_eq!(reads[0].0, log::Level::Debug);
     // Released after the drop: the root's stdin never ends it on its own here.
     #[cfg(target_os = "linux")]
-    assert_the_drop_killed(&pidfd, stdin);
+    assert_the_drop_killed(&pidfd, stdin, &sends, pid);
     #[cfg(not(target_os = "linux"))]
-    drop(stdin);
+    assert_the_drop_killed(stdin, &sends, pid);
 }
 
 /// A `kill_tree` that failed may have left members running, so the drop still warns. Mutant: the

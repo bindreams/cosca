@@ -259,8 +259,6 @@ pub(crate) fn mechanism_from_flags(creation_flags: u32) -> crate::graceful::Grac
 /// Clear the inherit flag on the parent's std handles before spawning. Prevents
 /// the child from inheriting the test runner's console handles. Best-effort.
 pub(crate) fn clear_std_handle_inheritance() {
-    #[cfg(test)]
-    observe::record_inheritance_cleared();
     for std_handle in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
         // SAFETY: standard Win32 call; handle is not closed.
         unsafe {
@@ -272,6 +270,9 @@ pub(crate) fn clear_std_handle_inheritance() {
             }
         }
     }
+    // Recorded after the calls, as every test record is.
+    #[cfg(test)]
+    observe::record_inheritance_cleared();
 }
 
 /// Whether THIS process is attached to a console: `Ok(true)` attached, `Ok(false)` genuinely

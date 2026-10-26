@@ -177,6 +177,24 @@ pub(crate) fn sorted(mut pids: Vec<u32>) -> Vec<u32> {
     pids
 }
 
+/// Every pid in `want` was sent signal `signo` by identity, as `sends` logged it: the log is written
+/// after the `kill(2)`, so a holder the recorder names but no signal went to fails here.
+#[track_caller]
+pub(crate) fn assert_sent_by_identity(sends: &Capture, signo: i32, want: &[u32], what: impl std::fmt::Debug) {
+    let sent: Vec<u32> = sends
+        .by_identity()
+        .into_iter()
+        .filter(|&(_, sent)| sent == signo)
+        .map(|(pid, _)| pid)
+        .collect();
+    for pid in want {
+        assert!(
+            sent.contains(pid),
+            "{what:?}: signal {signo} never went to pid {pid}: {sent:?}"
+        );
+    }
+}
+
 // Lone kill and terminate =====
 
 /// Mutant: `kill` sends without reading the root's state.
@@ -364,6 +382,7 @@ fn kill_tree_of_an_untrusted_session_root_kills_its_holders_only() {
             Untrusted::Unknown => sorted(vec![pid, descendant]),
         };
         assert_eq!(sorted(holders.killed()), want, "{state:?}");
+        assert_sent_by_identity(&sends, libc::SIGKILL, &want, state);
         assert_eq!(warns_since(mark), Vec::<String>::new(), "{state:?}");
         drop(writer);
     }
@@ -485,6 +504,7 @@ fn terminate_tree_of_an_untrusted_session_root_signals_its_holders_only() {
             Untrusted::Unknown => sorted(vec![pid, descendant]),
         };
         assert_eq!(sorted(holders.killed()), want, "{state:?}");
+        assert_sent_by_identity(&sends, libc::SIGTERM, &want, state);
         assert_eq!(warns_since(mark), Vec::<String>::new(), "{state:?}");
         drop(writer);
     }
