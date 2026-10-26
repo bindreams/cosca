@@ -509,6 +509,8 @@ pub(crate) mod fault {
         crate::error::Error::Io(std::io::Error::other("forced kill_tree failure (test seam)"))
     }
 
+    #[cfg(windows)]
+    pub(crate) use crate::graceful_hooks::at;
     pub(crate) use crate::graceful_hooks::{release_at, run_hook, HookPoint};
 
     /// RAII disarm for `FORCE_KILL_TREE_ERROR` — see the sync twin's identical guard for the
@@ -554,3 +556,7 @@ pub(crate) mod fault {
 #[cfg(test)]
 #[path = "graceful_tests.rs"]
 mod graceful_tests;
+
+#[cfg(all(test, windows))]
+#[path = "ctrl_break_tests.rs"]
+mod ctrl_break_tests;
