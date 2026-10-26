@@ -366,6 +366,11 @@ name = "windows_testbin_ack"
 path = "tests/windows_testbin_ack.rs"
 harness = false
 
+[[test]]
+name = "posix_path_resolution"
+path = "tests/posix_path_resolution.rs"
+harness = false
+
 [[bin]]
 name = "cosca_testbin"
 path = "testbin/main.rs"
