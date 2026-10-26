@@ -549,6 +549,54 @@ pub(crate) fn wait_until(
     }
 }
 
+/// Polls `pidfd` until its process has exited (the pidfd is readable: a zombie, or reaped) or
+/// `deadline` passes, and says which. `None`/`Some(None)` is unbounded. Reads no state and reaps
+/// nothing: the pidfd names the process for good, so a reused pid cannot answer it.
+#[cfg(target_os = "linux")]
+pub(crate) fn poll_pidfd_exit(
+    pidfd: std::os::fd::BorrowedFd<'_>,
+    deadline: Option<Option<Instant>>,
+) -> std::io::Result<bool> {
+    use rustix::event::{poll, PollFd, PollFlags, Timespec};
+
+    let seen = rearm_until(deadline, |remaining| {
+        // Capped like every timed block; the round is re-armed against the real deadline.
+        let remaining = remaining.map(clamp_block);
+        #[cfg(test)]
+        block_probe::record(remaining);
+        let ts = remaining.map(|d| Timespec {
+            tv_sec: d.as_secs() as i64,
+            tv_nsec: d.subsec_nanos() as _,
+        });
+        // A deadline wait never arms an unbounded poll.
+        debug_assert!(
+            matches!(deadline, None | Some(None)) || ts.is_some(),
+            "a deadline wait armed an unbounded poll"
+        );
+        let mut fds = [PollFd::new(&pidfd, PollFlags::IN)];
+        match poll(&mut fds, ts.as_ref()) {
+            Ok(0) => Ok(None),
+            Ok(_) => {
+                let revents = fds[0].revents();
+                // POLLNVAL on an fd we own and hold alive is a contract violation.
+                debug_assert!(
+                    !revents.contains(PollFlags::NVAL),
+                    "pidfd reported POLLNVAL: owned-fd contract violation"
+                );
+                if revents.contains(PollFlags::ERR) {
+                    return Err(std::io::Error::other("pidfd poll returned POLLERR"));
+                }
+                // POLLIN (zombie), or POLLHUP once reaped.
+                Ok(Some(()))
+            }
+            // A signal: go round again against the recomputed remaining time.
+            Err(rustix::io::Errno::INTR) => Ok(None),
+            Err(e) => Err(std::io::Error::from(e)),
+        }
+    })?;
+    Ok(seen.is_some())
+}
+
 /// The longest a single timed block may be armed for: `0xFFFF_FFFE` ms. std's Windows
 /// `Condvar::wait_timeout` turns anything above `u32::MAX` ms into `INFINITE` (`dur2timeout`),
 /// and `u32::MAX` ms is `INFINITE` itself, so an unclamped huge remaining would block forever.

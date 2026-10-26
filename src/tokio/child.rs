@@ -10,6 +10,8 @@ pub use suspended::SuspendedChild;
 
 #[path = "child/proc_source.rs"]
 mod proc_source;
+#[cfg(target_os = "macos")]
+pub(crate) use proc_source::Forgotten;
 pub(crate) use proc_source::ProcSource;
 #[cfg(any(unix, test))]
 pub(crate) use proc_source::Waited;
@@ -99,8 +101,8 @@ pub struct Child {
     elevation: Option<crate::elevation::ElevationReport>,
     /// The elevation front this child is, if any, as its spawn found it (see the sync `Child`).
     front: Option<crate::elevation::front::Front>,
-    /// What a failed-spawn cleanup that left this handle armed already warned of, so the drop that
-    /// retries reports a repeat of it at `debug` and anything new at `warn`.
+    /// What a failed-spawn cleanup already warned of, so the drop reports a repeat of it at `debug`
+    /// and anything new at `warn`.
     #[cfg(unix)]
     reported: Vec<crate::child::drop_report::PartKey>,
 }
@@ -157,15 +159,14 @@ impl Child {
 
     /// End a failed spawn's cleanup: `settled` (the tree and the root were each killed, are gone, or
     /// were deliberately left alone) disarms the drop, whose error reports what the cleanup did and
-    /// left. Otherwise the handle stays armed so its drop tries again; `warned` is what the cleanup
-    /// already warned of, so the drop does not warn of the same twice.
+    /// left. Otherwise the handle stays armed so its drop tries again. `warned` is what the cleanup
+    /// already warned of, so the drop, armed or not, does not warn of the same twice.
     #[cfg(unix)]
     pub(super) fn end_cleanup(&mut self, settled: bool, warned: Vec<crate::child::drop_report::PartKey>) {
         if settled {
             self.kill_on_drop = false;
-        } else {
-            self.reported = warned;
         }
+        self.reported = warned;
     }
 
     /// Set by the spawn, from its command.
@@ -195,15 +196,20 @@ impl Child {
     /// separately. The root may already be reaped: when it is (this handle's own reap, the number
     /// no longer reading as the root, or the child's own handle showing it reaped), nothing that
     /// names the tree by the root's number runs, and why and what was skipped is returned as
-    /// `Ok(Some(note))`. The same when the handle could not say (`RootState::Unknown`).
+    /// `Ok(Some(note))`. The same when the handle could not say (`RootState::Unknown`). On Linux
+    /// 6.9+ the root's pidfd decides a process group instead
+    /// ([`Attached::hard_kill_marking_unless_reaped`](crate::containment::Attached::hard_kill_marking_unless_reaped)).
     #[cfg(unix)]
     pub(super) fn kill_tree_members_unless_reaped(
         &self,
         view: &crate::containment::DropView,
     ) -> Result<Option<String>, Error> {
-        self.os
-            .attached
-            .hard_kill_marking_unless_reaped(view, &self.tree_killed)
+        let check = || self.group_number_holds();
+        self.os.attached.hard_kill_marking_unless_reaped(
+            view,
+            &self.tree_killed,
+            &crate::containment::GroupRoot::new(self.root_pidfd(), &check),
+        )
     }
 
     /// What this child's own handle and the root's number say about the root, for a cleanup that
@@ -235,11 +241,11 @@ impl Child {
         Ok(())
     }
 
-    /// Whether this child's tree is named by a number that outlives the root's reap (a process
-    /// group), for a test that needs a number-named group kill.
+    /// Whether this child's tree is a process group named by the root's pid, for a test that needs
+    /// one.
     #[cfg(all(test, unix))]
-    pub(super) fn carries_recyclable_pgid(&self) -> bool {
-        self.os.attached.carries_recyclable_pgid()
+    pub(super) fn signals_a_group(&self) -> bool {
+        self.os.attached.signals_a_group()
     }
 
     /// What names this child's tree in a message about a failed teardown of it.
@@ -333,7 +339,7 @@ impl Child {
                 let id = Some(self.id);
                 (self.proc_mut().collect_exit(id), None)
             }
-            Waited::Foreign | Waited::Unverified => (
+            _ => (
                 crate::error::ChildFate::Killed,
                 self.proc_mut().forget_for_wait(waited, cause),
             ),
@@ -627,9 +633,9 @@ impl Child {
 
     /// Hard-kill the (lone) child. On Linux the signal goes through the pidfd the spawn holds, and
     /// on Windows through the process handle, so neither can race a recycled pid; a refused
-    /// `pidfd_open` cannot fail it. macOS has no such handle: it sends by pid, only while the pid
-    /// still has the unique id read at spawn, and a reap by someone else between that check and the
-    /// send is an accepted gap.
+    /// `pidfd_open` cannot fail it. macOS has no such handle: it sends by pid after a check that the
+    /// pid still has the unique id read at spawn. A reap by another reaper between that check and
+    /// the send is not seen, and the signal then goes to whatever process holds the number.
     /// `Ok(())` if the child already exited, was reaped by a prior `wait`, or was reaped by someone
     /// else.
     /// Signal-only: does not reap — `wait().await` (or `Drop`) collects the exit status.
@@ -694,9 +700,13 @@ impl Child {
             crate::elevation::front::Gate::Open | crate::elevation::front::Gate::Exited => {}
             // Nothing is signalled after the cgroup kill: it could only be refused.
             crate::elevation::front::Gate::CgroupOnly => {
+                let check = || self.group_number_holds();
                 self.os
                     .attached
-                    .hard_kill_marking(&self.tree_killed)
+                    .hard_kill_marking(
+                        &self.tree_killed,
+                        &crate::containment::GroupRoot::new(self.root_pidfd(), &check),
+                    )
                     .map_err(|e| crate::elevation::front::cgroup_kill_failed(self.front, self.id.pid(), e))?;
                 cgroup_kill_reached(self.front, &self.os, self.id.pid())?;
                 return Ok(Sent::Delivered);
@@ -759,6 +769,11 @@ impl Child {
     /// [`Error::Unassessable`](crate::error::Error::Unassessable) saying that nothing was sent and what
     /// was skipped. The handle backstop reads the root's state again: a root orphaned during the sweep
     /// is an exited zombie, so the backstop is skipped and the sweep's answer stands.
+    ///
+    /// **A root reaped by something else, after this handle's own reap, and a reap after the
+    /// look.** As for the sync [`Child::kill_tree`](crate::Child::kill_tree). On Linux 6.9+, not yet
+    /// once this handle's `wait`, `try_wait` or `kill` saw the root reaped elsewhere: it no longer
+    /// holds the root's pidfd, so it treats the group as below 6.9.
     pub fn kill_tree(&mut self) -> Result<(), Error> {
         self.kill_tree_after(None)
     }
@@ -766,7 +781,7 @@ impl Child {
     /// [`kill_tree`](Self::kill_tree), as a step of an operation that already sent `earlier`, so an
     /// error never claims the whole operation sent nothing.
     pub(crate) fn kill_tree_after(&mut self, earlier: Option<&str>) -> Result<(), Error> {
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(unix))]
         let _ = earlier;
         self.require_contained()?;
         // Decided once: the gate is not asked again after the kill, when a killed front may read as
@@ -781,34 +796,27 @@ impl Child {
             crate::elevation::front::Gate::Exited => Some(false),
             crate::elevation::front::Gate::CgroupOnly => Some(true),
         };
-        // A root launchd holds, or one the handle cannot vouch for, is signalled by identity alone.
-        #[cfg(target_os = "macos")]
-        if let Some(result) =
-            self.tree_signal_untrusted(crate::containment::dispatch::TreeSignal::Kill, "kill_tree", earlier)
+        // One look at the root decides: one launchd holds, or one the handle cannot vouch for, is
+        // signalled by identity alone, and so is a group named by the root's pid once that pid may
+        // name another process.
+        #[cfg(unix)]
+        let check = || self.group_number_holds();
+        #[cfg(unix)]
+        let group = crate::containment::GroupRoot::new(self.root_pidfd(), &check);
+        #[cfg(not(unix))]
+        let group = crate::containment::GroupRoot::none();
+        #[cfg(unix)]
+        if let Some(result) = self
+            .tree_call(crate::containment::dispatch::TreeSignal::Kill, "kill_tree", earlier)
+            .root_checked(
+                || self.root_state_and_own_reap(),
+                || self.kill_root_through_handle(),
+                &group,
+            )
         {
             return result;
         }
-        // Precondition (a separate, unfixed gap — asserted, not fixed, here): see the sync
-        // twin, `Child::kill_tree` in `src/child.rs`, for the full rationale (including which
-        // mechanisms `carries_recyclable_pgid` covers, and why this is `#[cfg(unix)]`).
-        #[cfg(unix)]
-        debug_assert!(
-            !self.os.attached.carries_recyclable_pgid() || {
-                let now = ProcessId::of(self.id.pid());
-                let now_liveness = match now {
-                    crate::identity::Resolved::Found(id) => id.is_alive(),
-                    crate::identity::Resolved::Gone | crate::identity::Resolved::Unknown => {
-                        crate::identity::Liveness::Unknown
-                    }
-                };
-                !crate::child::root_pid_was_recycled(self.id, now, now_liveness)
-            },
-            "kill_tree/terminate_tree called after the contained root's pid ({}) was reaped and \
-             recycled onto a different, live process; a pgid-based mechanism would now signal an \
-             unrelated process group",
-            self.id.pid()
-        );
-        let group_result = self.os.attached.hard_kill_marking(&self.tree_killed);
+        let group_result = self.os.attached.hard_kill_marking(&self.tree_killed, &group);
         // A TreeWalk that could not walk killed nothing, and the root's death would strand the
         // descendants beyond a retry: return the error with the tree intact.
         if self.os.attached.hard_kill_refused_to_walk(&group_result) {
@@ -897,9 +905,10 @@ impl Child {
     /// group refused the signal — a setuid binary in the tree is the ordinary cause. The
     /// tree is still running and this process cannot bring it down.
     ///
-    /// See [`kill_tree`](Child::kill_tree)'s doc for two things that also apply here: the
+    /// See [`kill_tree`](Child::kill_tree)'s doc for four things that also apply here: the
     /// `ProcessGroup`/`Session`-only scope of this guarantee (a separate, unfixed gap for
-    /// `TreeWalk`), and the residual `hidepid` gap on Linux.
+    /// `TreeWalk`), the residual `hidepid` gap on Linux, a root reaped by something else, and a reap
+    /// between a check and its send, which may send the `SIGTERM` to a number another process holds.
     ///
     /// **Windows, after the root's exit has been observed.** The event is addressed by the
     /// ROOT's pid — on the job-object mechanism and the tree walk alike — and this handle stops
@@ -917,46 +926,94 @@ impl Child {
     /// is `Ok` only if every holder was reached. Any other mechanism has nothing left to send, and the
     /// call returns [`Error::Unassessable`](crate::error::Error::Unassessable) saying that nothing was
     /// sent and what was skipped.
+    ///
+    /// **Linux, a root whose handle cannot say whether it was reaped** is sent the `SIGTERM` through
+    /// its pidfd, which names it exactly. Nothing goes out by its number, and the call returns
+    /// [`Error::Unassessable`](crate::error::Error::Unassessable), with one `warn` saying so.
     pub fn terminate_tree(&self) -> Result<(), Error> {
         self.require_contained()?;
-        // A root launchd holds, or one the handle cannot vouch for, is signalled by identity alone.
-        #[cfg(target_os = "macos")]
-        if let Some(result) =
-            self.tree_signal_untrusted(crate::containment::dispatch::TreeSignal::Term, "terminate_tree", None)
+        // One look at the root decides, as for `kill_tree`.
+        #[cfg(unix)]
+        let check = || self.group_number_holds();
+        #[cfg(unix)]
+        let group = crate::containment::GroupRoot::new(self.root_pidfd(), &check);
+        #[cfg(not(unix))]
+        let group = crate::containment::GroupRoot::none();
+        #[cfg(unix)]
+        if let Some(result) = self
+            .tree_call(crate::containment::dispatch::TreeSignal::Term, "terminate_tree", None)
+            .root_checked(
+                || self.root_state_and_own_reap(),
+                || self.term_root_through_handle(),
+                &group,
+            )
         {
             return result;
         }
-        self.terminate_tree_signalling()
+        self.terminate_tree_unchecked(&group)
     }
 
-    /// The signal itself, for a root whose number is trusted.
-    fn terminate_tree_signalling(&self) -> Result<(), Error> {
+    /// Whether the root's pid still names its group, read now through its handle.
+    #[cfg(unix)]
+    pub(super) fn group_number_holds(&self) -> Result<(), String> {
+        crate::child::tree_call::group_number_holds(self.id.pid(), self.root_state_and_own_reap())
+    }
+
+    /// The root's pidfd, if its handle holds one (Linux).
+    #[cfg(unix)]
+    pub(super) fn root_pidfd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        self.os.proc.as_ref().and_then(ProcSource::pidfd)
+    }
+
+    /// A kill of the root through its own handle (Linux: its pidfd), with no look at its state.
+    #[cfg(unix)]
+    fn kill_root_through_handle(&self) -> Result<Sent, Error> {
+        let Some(proc) = self.os.proc.as_ref() else {
+            return Ok(Sent::Gone);
+        };
+        match proc.signal(Sig::Kill) {
+            Err(Error::Io(e)) => Err(crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper())),
+            other => other,
+        }
+    }
+
+    /// A `SIGTERM` to the root through its own handle (Linux: its pidfd), with no look at its state.
+    #[cfg(unix)]
+    fn term_root_through_handle(&self) -> Result<Sent, Error> {
+        self.os
+            .proc
+            .as_ref()
+            .map_or(Ok(Sent::Gone), |proc| proc.signal(Sig::Term))
+    }
+
+    /// A tree call on this child's tree ([`TreeCall`](crate::child::TreeCall)).
+    #[cfg(unix)]
+    fn tree_call<'a>(
+        &'a self,
+        signal: crate::containment::dispatch::TreeSignal,
+        op: &'static str,
+        earlier: Option<&'a str>,
+    ) -> crate::child::TreeCall<'a> {
+        crate::child::TreeCall {
+            attached: &self.os.attached,
+            pid: self.id.pid(),
+            signal,
+            op,
+            earlier,
+            killed: &self.tree_killed,
+        }
+    }
+
+    /// The group's termination signal, with no look at the root's state but `group`'s own check
+    /// before each send by the root's number.
+    pub(super) fn terminate_tree_unchecked(&self, group: &crate::containment::GroupRoot<'_>) -> Result<(), Error> {
         // After the mechanism guard, which is permanent and pid-independent: an uncontained
         // child must keep hearing why it has no tree to signal, not why a pid is unpinned.
         #[cfg(windows)]
         if !self.proc().pins_pid() {
             return Err(self.unpinned_pid_refusal("terminate_tree"));
         }
-        // See kill_tree's identical precondition assert for the full rationale, including the
-        // `#[cfg(unix)]` gate (`carries_recyclable_pgid` does not exist on Windows).
-        #[cfg(unix)]
-        debug_assert!(
-            !self.os.attached.carries_recyclable_pgid() || {
-                let now = ProcessId::of(self.id.pid());
-                let now_liveness = match now {
-                    crate::identity::Resolved::Found(id) => id.is_alive(),
-                    crate::identity::Resolved::Gone | crate::identity::Resolved::Unknown => {
-                        crate::identity::Liveness::Unknown
-                    }
-                };
-                !crate::child::root_pid_was_recycled(self.id, now, now_liveness)
-            },
-            "kill_tree/terminate_tree called after the contained root's pid ({}) was reaped and \
-             recycled onto a different, live process; a pgid-based mechanism would now signal an \
-             unrelated process group",
-            self.id.pid()
-        );
-        self.os.attached.terminate(self.id.pid())
+        self.os.attached.terminate(self.id.pid(), group)
     }
 
     /// The refusal both cooperative ops answer with once this handle has stopped pinning the
@@ -978,13 +1035,23 @@ impl Child {
         }
     }
 
-    /// The root's state through its own handle (`Reaped` for a forgotten child).
+    /// The root's state through its own handle; see [`ProcSource::state`].
     #[cfg(unix)]
     fn root_state(&self) -> crate::signal::RootState {
         self.os
             .proc
             .as_ref()
             .map_or(crate::signal::RootState::Reaped, ProcSource::state)
+    }
+
+    /// [`root_state`](Self::root_state), and whether a `Reaped` is this handle's own reap (a
+    /// forgotten child's is not).
+    #[cfg(unix)]
+    fn root_state_and_own_reap(&self) -> (crate::signal::RootState, bool) {
+        self.os.proc.as_ref().map_or(
+            (crate::signal::RootState::Reaped, false),
+            ProcSource::state_and_own_reap,
+        )
     }
 
     /// Refuse `op` while the root is not pinned by this process (macOS: launchd holds its zombie).
@@ -1001,22 +1068,6 @@ impl Child {
         return crate::signal::is_unpinned(|| self.root_state());
         #[cfg(not(unix))]
         false
-    }
-
-    /// A tree path's signal while the root cannot be vouched for (`Unpinned` or `Unknown`): it
-    /// signals by identity alone. `Some` ends the call; see the sync
-    /// [`Child`](crate::Child)'s twin.
-    #[cfg(target_os = "macos")]
-    pub(super) fn tree_signal_untrusted(
-        &self,
-        signal: crate::containment::dispatch::TreeSignal,
-        op: &str,
-        earlier: Option<&str>,
-    ) -> Option<Result<(), Error>> {
-        let root = crate::signal::untrusted_root(|| self.root_state())?;
-        self.os
-            .attached
-            .signal_tree_untrusted(signal, &root, self.id.pid(), op, earlier, &self.tree_killed)
     }
 
     /// Guard for the `_tree` operations (single-sourced with the sync `Child`).
@@ -1137,8 +1188,28 @@ mod child_drop_reaped_tests;
 mod pid_reuse_tests;
 
 #[cfg(all(test, unix))]
+#[path = "child/foreign_reap_tree_tests.rs"]
+mod foreign_reap_tree_tests;
+
+#[cfg(all(test, unix))]
+#[path = "child/foreign_reap_after_look_tests.rs"]
+mod foreign_reap_after_look_tests;
+
+#[cfg(all(test, unix))]
 #[path = "child/root_state_tests.rs"]
 mod root_state_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "child/group_route_tests.rs"]
+mod group_route_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "child/group_exact_tests.rs"]
+mod group_exact_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "child/drop_group_exact_tests.rs"]
+mod drop_group_exact_tests;
 
 #[cfg(all(test, unix))]
 #[path = "child/drop_report_tests.rs"]
@@ -1192,6 +1263,17 @@ mod child_wait_tree_tests;
 #[path = "child_kill_tree_view_tests.rs"]
 mod child_kill_tree_view_tests;
 
+#[cfg(all(test, target_os = "linux"))]
+impl Child {
+    /// Test-only: the path of the cgroup leaf this child holds, if any.
+    pub(crate) fn leaf_path_for_test(&self) -> Option<std::path::PathBuf> {
+        match &self.os.attached {
+            crate::containment::Attached::Cgroup(leaf) => Some(leaf.path().to_path_buf()),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(all(test, windows))]
 impl Child {
     /// Test-only: install the per-instance raw-wait observer on this child (see the raw backend's
@@ -1238,13 +1320,14 @@ impl Child {
 /// front if it is in the leaf. cosca does not wait for the front; tokio reaps it once it exits.
 ///
 /// Once the root is reaped the drop skips kills named by its number and warns; see
-/// [`Command::kill_on_drop`](crate::tokio::Command::kill_on_drop). A root reaped outside this
-/// handle also makes the drop forget tokio's `Child`, armed or not, so tokio cannot reap by that
-/// number. The evidence is the number no longer reading as this root, or the child's own handle (on
-/// Linux its pidfd, on macOS the pid's unique id) showing it reaped. The handle is asked before the
-/// signals, so a number-named tree kill is skipped, and again after them, for a reap that lands in
-/// between. On macOS a child with no unique id, or whose peek fails, cannot be shown to be ours and
-/// is forgotten too.
+/// [`Command::kill_on_drop`](crate::tokio::Command::kill_on_drop).
+///
+/// A root reaped outside this handle also makes the drop forget tokio's `Child`, armed or not, so
+/// tokio cannot reap by that number. The evidence is the number no longer reading as this root, or
+/// the child's own handle (on Linux its pidfd, on macOS the pid's unique id) showing it reaped. The
+/// handle is asked before the signals, so a number-named tree kill is skipped, and again after
+/// them, for a reap that lands in between. On macOS a child with no unique id, or whose peek fails,
+/// cannot be shown to be ours and is forgotten too.
 ///
 /// # Known limitation: `fork()` without `exec`
 ///
@@ -1290,6 +1373,11 @@ impl Child {
         // What an earlier forgetting recorded of a backend that no longer holds the child.
         #[cfg(unix)]
         let forgotten = os.proc.as_ref().and_then(|proc| proc.forgotten_fate(Some(self.id)));
+        // A live elevation front gets no signal of its own: outside a cgroup it is left running,
+        // and named in the drop's one warn. The gate comes first, so the look at the root is right
+        // before the signals it decides.
+        #[cfg(unix)]
+        let gate = self.kill_on_drop.then(|| kill_gate(self.front, &os, self.id.pid()));
         #[cfg(unix)]
         let view = crate::containment::DropView::read(
             "Child::drop",
@@ -1308,10 +1396,8 @@ impl Child {
         #[cfg(not(unix))]
         let mut signals = DropSignals::new(ChildFate::Running { id: Some(self.id) });
         if self.kill_on_drop {
-            // A live elevation front gets no signal of its own: outside a cgroup it is left running,
-            // and named in the drop's one warn.
             #[cfg(unix)]
-            match kill_gate(self.front, &os, self.id.pid()) {
+            match gate.expect("an armed drop reads the gate") {
                 crate::elevation::front::Gate::Closed(unkillable) => front_left = Some(unkillable),
                 gate => {
                     let cgroup_front = matches!(gate, crate::elevation::front::Gate::CgroupOnly)
@@ -1473,18 +1559,33 @@ fn signal_on_drop(
     //
     // On Unix, nothing that names the tree by the root's number runs once the root is reaped:
     // this handle's own state, or the number no longer reading as this root (tokio's state cannot
-    // see a foreign reap until it is polled). Accepted gaps: a foreign reap landing after `view`
-    // was read, and tokio's orphan queue reaping by number afterwards.
+    // see a foreign reap until it is polled). Each send by the group's number checks the root again,
+    // as for `Child::kill_tree`. On Linux 6.9+ the root's pidfd decides a process group instead
+    // (`Attached::hard_kill_for_drop`). Tokio's orphan queue reaps by number afterwards, and may
+    // collect another child of this process that took the number.
     #[cfg(unix)]
     let tree = {
-        let kill = os.attached.hard_kill_for_drop(view);
+        let proc = os.proc.as_ref();
+        let check = || {
+            crate::child::tree_call::group_number_holds(
+                pid,
+                proc.map_or(
+                    (crate::signal::RootState::Reaped, false),
+                    ProcSource::state_and_own_reap,
+                ),
+            )
+        };
+        let kill = os.attached.hard_kill_for_drop(
+            view,
+            &crate::containment::GroupRoot::new(proc.and_then(ProcSource::pidfd), &check),
+        );
         signals.skipped = kill.skipped;
         kill.result
     };
     #[cfg(not(unix))]
     let tree = {
         _ = tree_killed;
-        os.attached.hard_kill()
+        os.attached.hard_kill(&crate::containment::GroupRoot::none())
     };
     if let Err(e) = &tree {
         // A real OS outcome (e.g. `EACCES`/`EIO` on `cgroup.kill`): reported, never asserted on.

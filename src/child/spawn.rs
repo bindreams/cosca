@@ -92,7 +92,10 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
 /// reaped)".
 ///
 /// A reaped root's number may name another process by now, so the tree kill is skipped when it
-/// would name the tree by that number (a process group, a ppid walk), and the note says so.
+/// would name the tree by that number (a process group, a ppid walk), and the note says so. On Linux
+/// 6.9+ the root's pidfd decides a process group instead: it is killed while it has a member. The
+/// decision is one look at the root; each send by the group's number then checks the root again, as
+/// for [`Child::kill_tree`].
 ///
 /// A live front outside a cgroup (see [`Child::kill`]) is signalled by neither kill: the root's
 /// kill is the typed `Unkillable`, and the note says so. A front that had already exited is reaped,
@@ -119,18 +122,23 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     let Err(write_err) = written else {
         return Ok(child);
     };
+    // A live front outside a cgroup is not signalled, by its group or otherwise: the root's kill
+    // below then says why.
+    let gate = child.kill_gate();
+    // The look at the root, right before the tree kill it decides.
     let view =
         crate::containment::DropView::read("finish_elevated", child.id, || child.proc.state(), &child.tree_killed);
     let mut report = crate::child::drop_report::DropReport::new("finish_elevated", &view);
     let mut skipped = None;
-    // A live front outside a cgroup is not signalled, by its group or otherwise: the root's kill
-    // below then says why.
-    let gate = child.kill_gate();
     let front_closed = matches!(gate, crate::elevation::front::Gate::Closed(_));
     let tree = (child.containment().can_teardown() && !front_closed).then(|| {
         child
             .attached
-            .hard_kill_marking_unless_reaped(&view, &child.tree_killed)
+            .hard_kill_marking_unless_reaped(
+                &view,
+                &child.tree_killed,
+                &crate::containment::GroupRoot::new(child.proc.pidfd(), &|| child.group_number_holds()),
+            )
             .map(|s| skipped = s)
     });
     let tree_failure = match &tree {
@@ -249,10 +257,9 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     let warned = report.emit(&[]);
     if tree_settled && root_settled {
         child.kill_on_drop = false;
-    } else {
-        // The drop tries again; it need not warn of what the cleanup warned of again.
-        child.reported = warned;
     }
+    // The drop, armed to try again or not, need not warn of what the cleanup warned of again.
+    child.reported = warned;
     Err(SpawnFailure::started(
         Error::Elevation {
             kind: crate::error::ElevationErrorKind::AuthFailed,
@@ -618,6 +625,11 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
                 #[cfg(not(target_os = "linux"))]
                 pid,
             );
+            // Linux 6.9+: the group the root may have left members in, whoever reaped the root.
+            #[cfg(target_os = "linux")]
+            if front.is_none() {
+                kill_group_before_teardown(&prepared, handle, &mut why);
+            }
             // A front's containment goes first: a cgroup leaf's drop kills it, so the teardown below
             // waits for a contained front that kill reached, and says what became of it.
             #[cfg(target_os = "linux")]
@@ -871,6 +883,9 @@ enum Reach {
 #[cfg(target_os = "macos")]
 struct LateTree {
     reach: Reach,
+    /// The root's pid and the unique id it must still have for a send by its number.
+    pid: u32,
+    unique: u64,
     /// The root's identity, when the attach read it.
     id: Option<ProcessId>,
     /// The first sweep's failure. No later sweep is shown to reach what it missed, so none clears it:
@@ -892,6 +907,8 @@ impl LateTree {
         use crate::identity::Resolved;
         let mut tree = LateTree {
             reach: Reach::None,
+            pid,
+            unique,
             id: None,
             failed: None,
             succeeded_after: false,
@@ -935,7 +952,17 @@ impl LateTree {
         match (&self.reach, sweep) {
             (Reach::None, _) => {}
             (Reach::Attached(attached), Sweep::RootAlive | Sweep::RootKilled { zombie: true }) => {
-                let result = match attached.hard_kill_report() {
+                let (pid, unique) = (self.pid, self.unique);
+                // The root is this process's unreaped child, shown by a verified peek right before each
+                // send by its pid.
+                #[cfg(test)]
+                crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterRootLook);
+                let check = || {
+                    let target = crate::wait::exit_only::Target::pid(pid, Some(unique));
+                    let state = crate::signal::RootState::of_peek(crate::wait::exit_only::peek_verified(&target));
+                    crate::child::tree_call::group_number_holds(pid, (state, false))
+                };
+                let result = match attached.hard_kill_report(&crate::containment::GroupRoot::new(None, &check)) {
                     (Err(e), _) => Err(e.to_string()),
                     (Ok(()), false) => Err("a member could not be killed".to_owned()),
                     (Ok(()), true) => Ok(()),
@@ -2012,7 +2039,7 @@ impl Diagnosis {
     }
 
     /// Owe `text` too: the next [`fold`](Diagnosis::fold) leads with it, after what was owed.
-    #[cfg(all(target_os = "linux", feature = "tokio"))]
+    #[cfg(target_os = "linux")]
     pub(crate) fn add(&mut self, text: impl std::fmt::Display) {
         match &mut self.0 {
             Some(owed) => owed.push_str(&format!("; {text}")),
@@ -2369,6 +2396,31 @@ pub(crate) fn settle_before_teardown(
         #[cfg(not(target_os = "linux"))]
         pid,
     );
+}
+
+/// Linux 6.9+: kill the process group of a failed spawn's root before its teardown, as
+/// [`Prepared::kill_group_before_attach`](crate::containment::Prepared::kill_group_before_attach)
+/// decides. A refused kill is owed to `why`, the teardown's one warn, which says the group's
+/// members may be left running. Not for an elevation front, which is sent nothing.
+#[cfg(target_os = "linux")]
+pub(crate) fn kill_group_before_teardown(
+    prepared: &crate::containment::Prepared,
+    child: crate::containment::ChildHandle<'_>,
+    why: &mut Diagnosis,
+) {
+    let pid = child.pid;
+    match prepared.kill_group_before_attach(child) {
+        Ok(()) => {}
+        Err(nix::errno::Errno::EINVAL) => why.add(format!(
+            "members of the process group of pid {pid} may be left running: the kernel refused \
+             PIDFD_SIGNAL_PROCESS_GROUP (EINVAL, expected below Linux 6.9), so nothing was sent to the \
+             group, whose number may name another group"
+        )),
+        Err(e) => why.add(format!(
+            "spawn teardown could not kill the process group of pid {pid} through its pidfd ({e}); its \
+             members may be left running"
+        )),
+    }
 }
 
 /// The subtree of the leaf of an elevation front, captured while the leaf exists: a failure arm
@@ -3471,3 +3523,7 @@ pub(crate) mod unique_report;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "spawn/front_teardown_tests.rs"]
 mod front_teardown_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "spawn/identity_group_tests.rs"]
+pub(crate) mod identity_group_tests;

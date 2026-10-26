@@ -330,6 +330,8 @@ async fn finish_elevated_after_a_refused_kill_and_a_foreign_reap_reaps_nothing()
 /// by-pid reap.
 #[skuld::test]
 async fn a_panicking_logger_in_the_tree_teardown_warn_does_not_reap_the_child_by_pid() {
+    #[cfg(target_os = "linux")]
+    let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let (stdin, writer) = crate::test_child::held_writer_stdin();

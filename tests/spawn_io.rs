@@ -833,10 +833,6 @@ struct EchoTree {
     grand_pid: u32,
 }
 
-#[cfg_attr(
-    not(any(windows, target_os = "linux")),
-    allow(dead_code, reason = "used only by the windows and linux tests")
-)]
 fn spawn_contained_echo_tree(kill_on_drop: bool) -> EchoTree {
     use std::net::TcpListener;
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind control listener");
@@ -915,18 +911,23 @@ fn unix_kill_tree_reaps_the_grandchild() {
     common::assert_dead(&mut gc_stream, "the grandchild after kill_tree");
 }
 
+/// The echo grandchild has no SIGTERM handler, so the default action kills it, and a fatal signal
+/// ends a process before it runs again: once `terminate_tree` returns, a grandchild that answers
+/// the test's byte did not get its SIGTERM. A failure leaves the tree to the handle's drop, so a
+/// missing SIGTERM fails the assertion rather than hanging a wait.
 #[cfg(unix)]
 #[skuld::test]
 fn unix_terminate_tree_reaps_the_grandchild() {
-    let (child, mut gc_stream) = spawn_contained_tree();
+    let EchoTree {
+        child, root, mut grand, ..
+    } = spawn_contained_echo_tree(true);
     assert_host_tree_containment(&child);
 
     child.terminate_tree().expect("terminate_tree");
 
-    // SIGTERM should have reached the grandchild too (a member of the contained tree). A live
-    // grandchild would echo, so a `terminate_tree` that sent nothing fails here by assertion
-    // instead of hanging a read for an EOF.
-    common::assert_dead(&mut gc_stream, "the grandchild after terminate_tree");
+    // A dead grandchild's socket answers end of file or a reset; a live one echoes the byte.
+    common::assert_dead(&mut grand, "the grandchild after terminate_tree");
+    drop(root);
     let _ = child.wait(); // reap the root
 }
 

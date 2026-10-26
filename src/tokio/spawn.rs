@@ -369,7 +369,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                 // tokio's error does not say whether std's spawn failed, so only the report can prove
                 // the program never ran.
                 return Err(if crate::child::spawn::unique_report::proves_no_exec(&unique) {
-                    warn_for_abandoned(abandoned, &e);
+                    warn_for_abandoned(&abandoned, &e);
                     SpawnFailure::NotStarted(e)
                 } else {
                     abandoned_failure(abandoned, e, front)
@@ -658,6 +658,9 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                     child_fate,
                 ));
             }
+            // Linux 6.9+: the group the root may have left members in, whoever reaped the root.
+            #[cfg(target_os = "linux")]
+            crate::child::spawn::kill_group_before_teardown(&prepared, handle, &mut why);
             // Linux: a failed check says nothing about the child, and its pidfd pins it whatever
             // the peek said, so it is killed and reaped through the pidfd, as the sync spawn does.
             #[cfg(target_os = "linux")]
@@ -784,7 +787,7 @@ fn leave_unverified_front(
                 "is an elevation front whose identity could not be read, sent nothing, and left unreaped"
             }
         },
-        false,
+        super::child::Forgotten::Unproven,
         why,
     );
     let fate = match identity {
@@ -799,17 +802,18 @@ fn leave_unverified_front(
 /// front's gate is decided once, before the tree's kill. The backend has run, so the program may
 /// have started.
 #[cfg(unix)]
-pub(super) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> Result<Child, SpawnFailure> {
+pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> Result<Child, SpawnFailure> {
     let Err(write_err) = written else {
         return Ok(child);
     };
+    // A live front outside a cgroup is not signalled, by its group or otherwise: the root's kill
+    // below then says why.
+    let gate = child.kill_gate();
+    // The look at the root, right before the tree kill it decides.
     let view = child.read_root_view("finish_elevated");
     // What forgetting tokio's `Child` leaked, if the cleanup forgot it: the one warn below says so.
     let mut forgot: Option<crate::child::drop_report::Forgot> = None;
     let mut skipped = None;
-    // A live front outside a cgroup is not signalled, by its group or otherwise: the root's kill
-    // below then says why.
-    let gate = child.kill_gate();
     let front_closed = matches!(gate, crate::elevation::front::Gate::Closed(_));
     let exited_front = matches!(gate, crate::elevation::front::Gate::Exited);
     let tree: Option<Result<(), Error>> = (child.containment().can_teardown() && !front_closed).then(|| {
@@ -980,6 +984,10 @@ mod placement_reuse_tests;
 #[path = "spawn/pidfd_tests.rs"]
 mod pidfd_tests;
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "spawn/identity_group_tests.rs"]
+mod identity_group_tests;
+
 /// The fate of a child a failed tokio spawn abandoned with no handle on it (see
 /// [`warn_for_abandoned`]). Linux's handshake holds a pidfd on it, and answers itself.
 ///
@@ -991,7 +999,7 @@ fn abandoned_fate(child: crate::containment::AbandonedChild) -> ChildFate {
     use crate::containment::AbandonedChild;
 
     match child {
-        AbandonedChild::Ended | AbandonedChild::MaybeUnreaped => {
+        AbandonedChild::Ended | AbandonedChild::MaybeUnreaped | AbandonedChild::OutOfReach(_) => {
             debug_assert!(false, "only a Linux cgroup leaf abandons a child as `{child:?}`");
             ChildFate::Unknown
         }
@@ -1011,11 +1019,18 @@ fn abandoned_fate(child: crate::containment::AbandonedChild) -> ChildFate {
 /// told it who it is. The error cannot tell a failure before the fork from one after it, hence
 /// "may". Reported at `warn` every time. The fate of an elevation `front` the leaf found is noted
 /// on the error instead, as the spawn's other failures note it.
-fn warn_for_abandoned(child: crate::containment::AbandonedChild, error: &Error) {
+fn warn_for_abandoned(child: &crate::containment::AbandonedChild, error: &Error) {
     use crate::containment::AbandonedChild;
 
     let consequence = match child {
         AbandonedChild::Front(_) | AbandonedChild::Ended => return,
+        AbandonedChild::OutOfReach(why) => {
+            log::warn!(
+                "tokio spawn failed ({error}); if it failed after forking, unless its spawn collected it, the child \
+                 was left running and nothing can reach it outside its cgroup v2 leaf: {why}"
+            );
+            return;
+        }
         AbandonedChild::MaybeUnreaped => {
             "the child exits before `exec`; if its spawn did not collect it, it is left unreaped, since it \
              never reached the point where it names itself and nothing holds its pid"
@@ -1053,7 +1068,7 @@ fn abandoned_failure(
     error: Error,
     front: Option<crate::elevation::front::Front>,
 ) -> SpawnFailure {
-    warn_for_abandoned(abandoned, &error);
+    warn_for_abandoned(&abandoned, &error);
     match abandoned {
         crate::containment::AbandonedChild::Front(fate) => {
             SpawnFailure::started(fate.note(error, front, None), front_child_fate(fate))
@@ -1074,14 +1089,14 @@ fn abandoned_after_handshake(
 ) -> SpawnFailure {
     use crate::containment::AbandonedChild;
 
-    warn_for_abandoned(abandoned, failure.error());
+    warn_for_abandoned(&abandoned, failure.error());
     if !left_to_leaf {
         return failure;
     }
     failure.answered_by(|error| match abandoned {
         AbandonedChild::Front(fate) => (fate.note(error, front, None), front_child_fate(fate)),
         // Out of the leaf's reach, and not known to be dead.
-        AbandonedChild::MaybeUnreachable => (error, ChildFate::Running { id: None }),
+        AbandonedChild::MaybeUnreachable | AbandonedChild::OutOfReach(_) => (error, ChildFate::Running { id: None }),
         AbandonedChild::Ended | AbandonedChild::MaybeUnreaped => (error, ChildFate::Unknown),
     })
 }

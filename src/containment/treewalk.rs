@@ -353,8 +353,6 @@ pub(crate) fn unqueryable(subject: &str, cause: UnknownCause) -> Error {
 /// `Ok(false)`: the walk ran but was not complete, because an identity it resolved refused the
 /// kill, so members may be left running.
 pub(crate) fn hard_kill(root: ProcessId) -> Result<bool, Error> {
-    #[cfg(test)]
-    fault::note_walk(root.pid());
     // Test-only fault seam: skip the root's identity kill (take semantics — see `fault`).
     #[cfg(test)]
     let skip_root = fault::take_force_root_kill_noop();
@@ -364,6 +362,8 @@ pub(crate) fn hard_kill(root: ProcessId) -> Result<bool, Error> {
     if !anchor_present(root)? {
         return Ok(true);
     }
+    #[cfg(test)]
+    fault::note_walk(root.pid());
     let mut complete = true;
     #[cfg(test)]
     if fault::take_force_incomplete() {
@@ -416,9 +416,10 @@ pub(crate) mod fault {
         FORCE_INCOMPLETE.with(|f| f.replace(false))
     }
 
-    /// From now on every ppid walk from a root's pid on THIS thread (`treewalk::hard_kill`, a
-    /// macOS fd marker's channel 1+2) records that pid, so a test can tell a walk ran without a
-    /// process having to die. The walk itself still runs.
+    /// From now on every ppid walk from a root's pid on THIS thread (`treewalk::hard_kill` and
+    /// `terminate` once `anchor_present` lets them walk, a macOS fd marker's channel 1+2) records
+    /// that pid, so a test can tell a walk ran without a process having to die. The walk itself
+    /// still runs.
     #[cfg(unix)]
     pub(crate) fn record_walks() -> WalkRecorder {
         WALKS.with(|w| *w.borrow_mut() = Some(Vec::new()));
@@ -506,6 +507,8 @@ pub(crate) fn terminate(root: ProcessId) -> Result<(), Error> {
         if !anchor_present(root)? {
             return Ok(());
         }
+        #[cfg(test)]
+        fault::note_walk(root.pid());
         let descendants = descendants(root, &parents);
         let _ = kill_by_identity(root, Signal::SIGTERM);
         for id in descendants {

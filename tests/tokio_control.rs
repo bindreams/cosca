@@ -87,12 +87,12 @@ async fn async_kill_tree_tears_down_tree() {
 #[skuld::test]
 async fn async_terminate_tree_soft_kills_the_group() {
     use std::os::unix::process::ExitStatusExt;
-    // control-block honors SIGTERM: the group signal alone (signal-only op) tears it down.
-    let (mut child, sock) = common::spawn_control_async("control-block", &["R"], true).await;
+    // control-block honors SIGTERM: the group signal alone (signal-only op) tears it down. It also
+    // exits at the test's byte, so a root the SIGTERM missed exits by itself: the wait cannot hang,
+    // and its status shows no signal.
+    let (mut child, mut sock) = common::spawn_control_async("control-block", &["R"], true).await;
     child.terminate_tree().expect("terminate_tree");
-    // Release the member after the signal: it leaves with 0 on the release, so a `terminate_tree`
-    // that sent nothing fails the signal assertion below.
-    drop(sock);
+    _ = std::io::Write::write_all(&mut sock, b"x");
     let status = child.wait().await.expect("reap");
     assert_eq!(
         status.signal(),

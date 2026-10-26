@@ -102,10 +102,14 @@ async fn a_disarmed_teardown_with_a_failed_peek_says_running_not_gone() {
 /// ours (`false`).
 fn forgotten(reaped_elsewhere: bool) -> (crate::tokio::Child, std::io::PipeWriter) {
     let (mut child, writer) = live(true);
-    child
-        .os
-        .proc_mut()
-        .forget_as("was forgotten by a test", reaped_elsewhere);
+    child.os.proc_mut().forget_as(
+        "was forgotten by a test",
+        if reaped_elsewhere {
+            super::proc_source::Forgotten::ReapedElsewhere
+        } else {
+            super::proc_source::Forgotten::Unproven
+        },
+    );
     (child, writer)
 }
 

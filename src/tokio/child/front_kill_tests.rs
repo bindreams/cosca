@@ -502,6 +502,39 @@ async fn a_front_whose_exec_fails_is_not_noted() {
     assert!(!err.to_string().contains("what sudo left"), "no note: {err}");
 }
 
+/// A front reaped behind its handle before its identity is read, as another reaper in the process
+/// may (`SIGCHLD` set to `SIG_IGN`), is `Gone`, in one warn that carries the forget of tokio's
+/// `Child`. The sync spawn answers it the same way.
+///
+/// Mutant: `leave_front_noting` keeps its `debug_assert!(false)` on a backend forgotten as foreign
+/// (a debug panic), or answers `Unknown`.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn a_front_reaped_elsewhere_before_its_identity_read_is_gone() {
+    use crate::child::spawn::fault;
+    crate::log_capture::install();
+    let (stdin, writer) = crate::test_child::held_writer_stdin();
+    let mut cmd = crate::command::Command::new();
+    cmd.args(["cat"]);
+    cmd.stdin(stdin).expect("stdin");
+    cmd.set_elevation_front(crate::elevation::front::front(Some(&ElevatedVia::Wrapped(
+        Backend::Sudo,
+    ))));
+    let _reaped_elsewhere = fault::set_at(fault::SpawnPoint::BeforeIdentity, move || {
+        drop(writer);
+        crate::test_child::reaped_elsewhere::reap_behind(fault::spawn_pid());
+    });
+    let mark = crate::log_capture::mark();
+    let (err, fate) = crate::tokio::spawn::spawn(&mut cmd)
+        .map(drop)
+        .expect_err("a front reaped before its identity read fails the spawn")
+        .expect_may_have_started_with();
+    assert_eq!(fate, ChildFate::Gone, "{err}");
+    let warns = crate::test_child::reaped_elsewhere::warns_since(mark);
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(warns[0].contains("leaks"), "the warn carries the forget: {warns:?}");
+}
+
 /// macOS: a child that is not a front, whose report cannot be read, cannot be shown to be ours. The
 /// teardown sends it nothing, so it may be running: not `Gone`, which would say someone else reaped it.
 ///

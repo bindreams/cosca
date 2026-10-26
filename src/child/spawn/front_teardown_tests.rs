@@ -78,7 +78,10 @@ fn cgroup_a_front_the_leaf_kill_reached_is_waited_for_and_reaped(#[fixture(cgrou
     let id = Some(child.id());
     let observer = pidfd_of(pid);
     let subtree = leaf_of(&child).subtree().expect("the leaf's subtree");
-    child.attached.hard_kill().expect("cgroup.kill");
+    child
+        .attached
+        .hard_kill(&crate::containment::GroupRoot::none())
+        .expect("cgroup.kill");
     let waited = Arc::new(AtomicBool::new(false));
     let front = NotYetExited {
         inner: PidfdChild::new(Some(pid), pidfd_of(pid)),
@@ -101,7 +104,10 @@ fn cgroup_a_front_outside_its_leaf_is_left_unwaited(#[fixture(cgroup)] _group: &
     let observer = pidfd_of(pid);
     let subtree = leaf_of(&child).subtree().expect("the leaf's subtree");
     move_out_of_its_leaf(pid);
-    child.attached.hard_kill().expect("cgroup.kill of the emptied leaf");
+    child
+        .attached
+        .hard_kill(&crate::containment::GroupRoot::none())
+        .expect("cgroup.kill of the emptied leaf");
     let waited = Arc::new(AtomicBool::new(false));
     let front = NotYetExited {
         inner: PidfdChild::new(Some(pid), pidfd_of(pid)),
@@ -134,7 +140,13 @@ fn cgroup_a_front_its_leaf_could_not_kill_is_left_unwaited(#[fixture(cgroup)] _g
     let subtree = leaf_of(&child).subtree().expect("the leaf's subtree");
     {
         let _failing = crate::containment::cgroup::fault::fail_kill_writes();
-        assert!(child.attached.hard_kill().is_err(), "the forced cgroup.kill failure");
+        assert!(
+            child
+                .attached
+                .hard_kill(&crate::containment::GroupRoot::none())
+                .is_err(),
+            "the forced cgroup.kill failure"
+        );
     }
     let waited = Arc::new(AtomicBool::new(false));
     let front = NotYetExited {
@@ -168,7 +180,10 @@ fn cgroup_a_front_whose_place_cannot_be_read_is_left_unwaited(#[fixture(cgroup)]
     let id = Some(child.id());
     let observer = pidfd_of(pid);
     let subtree = leaf_of(&child).subtree().expect("the leaf's subtree");
-    child.attached.hard_kill().expect("cgroup.kill");
+    child
+        .attached
+        .hard_kill(&crate::containment::GroupRoot::none())
+        .expect("cgroup.kill");
     let waited = Arc::new(AtomicBool::new(false));
     let front = NotYetExited {
         inner: PidfdChild::new(Some(pid), pidfd_of(pid)),
@@ -204,7 +219,10 @@ fn cgroup_a_front_the_leaf_kill_reached_whose_wait_fails_is_unaccounted_for(#[fi
     let id = Some(child.id());
     let observer = pidfd_of(pid);
     let subtree = leaf_of(&child).subtree().expect("the leaf's subtree");
-    child.attached.hard_kill().expect("cgroup.kill");
+    child
+        .attached
+        .hard_kill(&crate::containment::GroupRoot::none())
+        .expect("cgroup.kill");
     let waited = Arc::new(AtomicBool::new(false));
     let front = NotYetExited {
         inner: PidfdChild::new(Some(pid), pidfd_of(pid)),

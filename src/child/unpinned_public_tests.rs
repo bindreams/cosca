@@ -528,6 +528,50 @@ fn terminate_tree_terminates_a_trusted_session_root() {
     assert_eq!(child.wait().expect("wait").signal(), Some(libc::SIGTERM));
 }
 
+// One look per decision =====
+
+/// `terminate_tree` decides on one look at the root's state. That look reads `Running`, so the group
+/// is signalled; the root's orphaning after it is not looked at again, by a check that would let it
+/// through.
+///
+/// Mutant: the untrusted-root check and the reaped-root check each look, and the second look's
+/// `Unpinned` is let through to the group signal.
+#[skuld::test]
+fn terminate_tree_decides_on_one_look_at_the_root() {
+    let groups = crate::containment::unix::fault::record_term_group();
+    let (child, writer) = group_blocker();
+    let pid = child.id().pid();
+    let _looks = force_peeks([Ok(Peek::Running), Ok(Peek::Foreign(Foreign::Orphaned))]);
+
+    child.terminate_tree().expect("a running root's group is signalled");
+
+    assert_eq!(forced_peeks_left(), 1, "the decision looked at the root twice");
+    assert_eq!(groups.termed(), vec![pid as i32]);
+    drop(writer);
+}
+
+/// `kill_tree`'s twin of [`terminate_tree_decides_on_one_look_at_the_root`]: one look decides the
+/// sweep, and the backstop's own look takes the second.
+///
+/// Mutant: as there.
+#[skuld::test]
+fn kill_tree_decides_on_one_look_at_the_root() {
+    let groups = crate::containment::unix::fault::record_kill_group();
+    let (child, writer) = group_blocker();
+    let pid = child.id().pid();
+    let _looks = force_peeks([
+        Ok(Peek::Running),
+        Ok(Peek::Foreign(Foreign::Orphaned)),
+        Ok(Peek::Foreign(Foreign::Orphaned)),
+    ]);
+
+    child.kill_tree().expect("a running root's group is killed");
+
+    assert_eq!(forced_peeks_left(), 1, "the decision looked at the root twice");
+    assert_eq!(groups.killed(), vec![pid as i32]);
+    drop(writer);
+}
+
 // The backstop =====
 
 /// The tree kill reads the root's state again before its handle backstop. A root orphaned during

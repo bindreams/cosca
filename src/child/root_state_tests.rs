@@ -44,7 +44,7 @@ mod linux {
     use crate::signal::Sig;
     use crate::test_child::pid_reuse::{in_fresh_pid_ns, reap_behind_and_reuse, sigusr1_and_wait};
     use crate::test_groups::namespaces;
-    use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peek_once};
+    use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peek_once, force_peeks};
     use crate::ContainMode;
 
     fn session_blocker() -> (crate::Child, std::io::PipeWriter) {
@@ -66,8 +66,8 @@ mod linux {
         let recorder = record_kill_group();
         let (child, writer) = session_blocker();
         assert!(
-            child.attached.carries_recyclable_pgid(),
-            "the test needs a number-named group kill"
+            child.attached.signals_a_group(),
+            "the test needs a group named by the root's pid, which ContainMode::Session makes"
         );
         let token = StartToken::from_raw(child.id().start_token_raw());
         drop(writer);
@@ -101,6 +101,8 @@ mod linux {
     /// Mutant: `Unknown` is taken as `Reaped` (no root kill, and the log names no `Unknown`).
     #[skuld::test]
     fn a_failed_root_peek_skips_number_named_channels_and_still_kills_the_root() {
+        #[cfg(target_os = "linux")]
+        let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
         crate::log_capture::install();
         let recorder = record_kill_group();
         let (child, writer) = session_blocker();
@@ -183,8 +185,12 @@ mod linux {
         child.set_front(Some(crate::elevation::front::Front::Sudo));
         let sends = Capture::start();
         let mark = crate::log_capture::mark();
-        // The read sees the failed peek; the gate's own look at the front is real and sees it run.
-        let _failed = force_peek_once(Err(std::io::Error::other("forced peek failure")));
+        // The gate's two looks at the front see it run; the read after them sees the failed peek.
+        let _looks = force_peeks([
+            Ok(crate::wait::exit_only::Peek::Running),
+            Ok(crate::wait::exit_only::Peek::Running),
+            Err(std::io::Error::other("forced peek failure")),
+        ]);
 
         drop(child);
         drop(writer);
@@ -250,7 +256,7 @@ mod linux {
 
         let skipped = child
             .attached
-            .hard_kill_marking_unless_reaped(&view, &killed)
+            .hard_kill_marking_unless_reaped(&view, &killed, &crate::containment::GroupRoot::trusted_for_test())
             .expect("a skip is not an error");
 
         assert!(skipped.is_some(), "the number-named kill must be skipped");
@@ -322,8 +328,12 @@ mod macos {
         child.set_front(Some(crate::elevation::front::Front::Sudo));
         let sends = Capture::start();
         let mark = crate::log_capture::mark();
-        // The read, then the gate's look at the front, which sees it run.
-        let _looks = force_peeks([Ok(Peek::Foreign(Foreign::Orphaned)), Ok(Peek::Running)]);
+        // The gate's two looks at the front, which see it run, then the read.
+        let _looks = force_peeks([
+            Ok(Peek::Running),
+            Ok(Peek::Running),
+            Ok(Peek::Foreign(Foreign::Orphaned)),
+        ]);
 
         drop(child);
 

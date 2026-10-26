@@ -11,6 +11,8 @@ use crate::error::io_context;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Sig {
     Kill,
+    #[cfg(unix)]
+    Term,
 }
 
 #[cfg(target_os = "linux")]
@@ -18,6 +20,7 @@ impl Sig {
     fn as_rustix(self) -> rustix::process::Signal {
         match self {
             Sig::Kill => rustix::process::Signal::KILL,
+            Sig::Term => rustix::process::Signal::TERM,
         }
     }
 }
@@ -27,6 +30,7 @@ impl Sig {
     fn as_libc(self) -> libc::c_int {
         match self {
             Sig::Kill => libc::SIGKILL,
+            Sig::Term => libc::SIGTERM,
         }
     }
 }
@@ -122,7 +126,8 @@ pub(crate) fn unpinned_status(pid: u32, op: &str) -> crate::error::Error {
 }
 
 /// Refuse `op` if [`is_unpinned`], so the lone `kill` and `terminate` send no signal by number to a
-/// pid launchd may reap and reuse. The tree paths do not refuse outright: see [`untrusted_root`].
+/// pid launchd may reap and reuse. The tree paths do not refuse outright: see
+/// [`root_number`](crate::child::tree_call::root_number).
 #[cfg(unix)]
 pub(crate) fn refuse_unpinned(
     pid: u32,
@@ -137,15 +142,6 @@ pub(crate) fn refuse_unpinned(
     #[cfg(not(target_os = "macos"))]
     let _ = (pid, op, earlier, state);
     Ok(())
-}
-
-/// The root's state, if it is one the tree paths cannot name targets by number for: `Unpinned`
-/// (launchd holds its zombie) or `Unknown` (the handle cannot vouch for it). They then send only
-/// by identity, as the drop does. Read once per call.
-#[cfg(target_os = "macos")]
-pub(crate) fn untrusted_root(state: impl FnOnce() -> RootState) -> Option<RootState> {
-    let state = state();
-    matches!(state, RootState::Unpinned | RootState::Unknown(_)).then_some(state)
 }
 
 /// Why `state` leaves the root's number untrusted, for a message.

@@ -210,6 +210,38 @@ async fn kill_tree_of_an_untrusted_walked_root_sends_nothing() {
     }
 }
 
+/// A backend forgotten because launchd holds its root still reads the root as `Unpinned`, so
+/// `kill_tree` refuses it as it refuses a live `Unpinned` root (and as the sync `Child` does), and no
+/// warn claims the root was reaped elsewhere.
+///
+/// Mutant: the forgotten backend reads a root launchd holds as reaped elsewhere.
+#[skuld::test]
+async fn kill_tree_of_a_backend_forgotten_as_launchd_held_says_launchd_holds_it() {
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let groups = crate::containment::unix::fault::record_kill_group();
+    let (mut child, writer) = group_blocker();
+    let pid = child.id().pid();
+    let looks = orphaned();
+    child
+        .proc_mut()
+        .forget_if_foreign()
+        .expect("a root launchd holds is forgotten");
+    assert_peeks_exhausted();
+    drop(looks);
+    let sends = Capture::start();
+    let mark = crate::log_capture::mark();
+
+    let err = child.kill_tree().expect_err("the group is named by the root's number");
+
+    assert_tree_refused(&err, "kill_tree", Untrusted::Unpinned);
+    assert_nothing_sent(&sends);
+    assert_eq!(groups.killed(), Vec::<i32>::new());
+    assert_eq!(warns_since(mark), Vec::<String>::new());
+    drop(writer);
+    crate::test_child::reaped_elsewhere::reap_behind(pid);
+}
+
 /// Mutants: `kill_tree` fires `killpg` without reading the root's state; it refuses only `Unpinned`.
 #[skuld::test]
 async fn kill_tree_of_an_untrusted_group_root_sends_no_killpg() {
@@ -419,6 +451,44 @@ async fn terminate_tree_terminates_a_trusted_session_root() {
 
     drop(writer);
     assert_eq!(child.wait().await.expect("wait").signal(), Some(libc::SIGTERM));
+}
+
+// One look per decision =====
+
+/// The sync `terminate_tree_decides_on_one_look_at_the_root`'s twin. Same mutant.
+#[skuld::test]
+async fn terminate_tree_decides_on_one_look_at_the_root() {
+    crate::tokio::test_runtime::assert_current_thread();
+    let groups = crate::containment::unix::fault::record_term_group();
+    let (child, writer) = group_blocker();
+    let pid = child.id().pid();
+    let _looks = force_peeks([Ok(Peek::Running), Ok(Peek::Foreign(Foreign::Orphaned))]);
+
+    child.terminate_tree().expect("a running root's group is signalled");
+
+    assert_eq!(forced_peeks_left(), 1, "the decision looked at the root twice");
+    assert_eq!(groups.termed(), vec![pid as i32]);
+    drop(writer);
+}
+
+/// The sync `kill_tree_decides_on_one_look_at_the_root`'s twin. Same mutant.
+#[skuld::test]
+async fn kill_tree_decides_on_one_look_at_the_root() {
+    crate::tokio::test_runtime::assert_current_thread();
+    let groups = crate::containment::unix::fault::record_kill_group();
+    let (mut child, writer) = group_blocker();
+    let pid = child.id().pid();
+    let _looks = force_peeks([
+        Ok(Peek::Running),
+        Ok(Peek::Foreign(Foreign::Orphaned)),
+        Ok(Peek::Foreign(Foreign::Orphaned)),
+    ]);
+
+    child.kill_tree().expect("a running root's group is killed");
+
+    assert_eq!(forced_peeks_left(), 1, "the decision looked at the root twice");
+    assert_eq!(groups.killed(), vec![pid as i32]);
+    drop(writer);
 }
 
 // The backstop =====

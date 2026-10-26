@@ -155,7 +155,9 @@ pub(crate) fn require_consent(
 
 /// Declares a test group: the fixture `$fixture`, labelled `$label` (declared in
 /// `test_harness.rs`), switched off by `env = "<NAME>"` set to `0`. With `consent = "<what the
-/// group does>"` its setup also fails the test unless `<NAME>_CONSENT` is exactly `1`.
+/// group does>"` its setup also fails the test unless `<NAME>_CONSENT` is exactly `1`. With
+/// `precondition = <fn>` it fails the test with the `Err` of `<fn>(<NAME>)`, which names what the
+/// host lacks and the opt-out.
 ///
 /// A test file brings the fixture into scope with `use crate::test_groups::{$fixture, Group};`.
 macro_rules! test_group {
@@ -165,6 +167,10 @@ macro_rules! test_group {
     };
     ($label:ident => $fixture:ident, env = $env:literal, consent = $what:literal) => {
         test_group!(@declare $label, $fixture, $env, require_consent($env, $what, |name| std::env::var(name).ok()));
+    };
+    ($label:ident => $fixture:ident, env = $env:literal, precondition = $check:path) => {
+        test_group!(@declare $label, $fixture, $env,
+            require_enabled($env, |name| std::env::var(name).ok()).and_then(|()| $check($env)).map(|()| Group::plain()));
     };
     ($label:ident => $fixture:ident, env = $env:literal) => {
         test_group!(@declare $label, $fixture, $env, require_enabled($env, |name| std::env::var(name).ok()).map(|()| Group::plain()));
@@ -189,7 +195,7 @@ test_group!(ROOT => root, env = "COSCA_TEST_ROOT", consent = "runs as root, for 
 test_group!(NAMESPACES => namespaces, env = "COSCA_TEST_NAMESPACES", consent = "unshares namespaces and mounts");
 test_group!(DRIVE_MAPPING => drive_mapping, env = "COSCA_TEST_DRIVE_MAPPING", consent = "maps a drive letter for the whole logon session");
 test_group!(SETUID => setuid, env = "COSCA_TEST_SETUID", consent = "runs a setuid-root copy of cosca_testbin");
-test_group!(PATH_PROBES => path_probes, env = "COSCA_TEST_PATH_PROBES", consent = "launches copies of cosca_testbin_image, creates a suspended process, makes a directory of its own under the Microsoft folder in %LOCALAPPDATA% and plants a file symlink in it, makes symlinks, junctions and app execution aliases in its temp directory, runs whoami and find from System32 and winget --version, and reaches its temp directory through the administrative share of localhost");
+test_group!(PATH_PROBES => path_probes, env = "COSCA_TEST_PATH_PROBES", consent = "launches copies of cosca_testbin_image, creates a suspended process, makes a directory of its own under the Microsoft folder in %LOCALAPPDATA% and plants a file symlink in it, makes symlinks, junctions and app execution aliases and directory trees whose paths run past MAX_PATH, to over 300 characters, in its temp directory, runs whoami and find from System32 and winget --version, and reaches its temp directory through the administrative share of localhost");
 test_group!(SHELL_EXECUTE => shell_execute, env = "COSCA_TEST_SHELL_EXECUTE", consent = "elevates through ShellExecuteEx and registers volatile App Paths keys");
 test_group!(SHELL_PROBES => shell_probes, env = "COSCA_TEST_SHELL_PROBES", consent = "plants and executes batch files through ShellExecuteEx and launches copies of cosca_testbin_image");
 test_group!(ELEVATION_ROUTES => elevation_routes, env = "COSCA_TEST_ELEVATION_ROUTES", consent = "derives tokens, creates accounts and a scheduled task, launches copies of this test binary under derived tokens and scratch accounts, and plants a batch file that CreateProcessW may run");
@@ -197,3 +203,48 @@ test_group!(CGROUP => cgroup, env = "COSCA_TEST_CGROUP", consent = "creates, kil
 test_group!(TRACER => tracer_group, env = "COSCA_TEST_TRACER", consent = "attaches a tracer with ptrace to its own children as a debugger would, re-executes the test binary as that tracer (on macOS an ad-hoc signed copy with the debugger entitlement), and on Linux allows any process to trace its tracee");
 test_group!(UID_SWITCH => uid_switch, env = "COSCA_TEST_UID_SWITCH", consent = "runs as real root and switches to other real uids, spawning and signalling processes under them");
 test_group!(ELEVATION => elevation, env = "COSCA_TEST_ELEVATION", consent = "runs commands with real administrator or root privileges");
+test_group!(PIDFD_GROUP_SIGNAL => pidfd_group_signal, env = "COSCA_TEST_PIDFD_GROUP_SIGNAL", precondition = kernel_signals_groups_through_pidfds);
+
+/// The `PIDFD_GROUP_SIGNAL` group's precondition: the kernel takes `PIDFD_SIGNAL_PROCESS_GROUP`
+/// (Linux 6.9+). Asked by a signal-0 send through this process's own pidfd, which signals nothing; a
+/// kernel before 6.9 refuses the flag with `EINVAL`.
+#[allow(dead_code, reason = "a root that includes this file may have no test in the group")]
+fn kernel_signals_groups_through_pidfds(enabled_var: &str) -> Result<(), String> {
+    let lacks = |why: String| {
+        format!(
+            "the group needs Linux 6.9+, whose pidfd_send_signal takes PIDFD_SIGNAL_PROCESS_GROUP, and {why}; \
+             set {enabled_var}=0 to turn it off"
+        )
+    };
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: a plain syscall.
+        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0) };
+        if pidfd < 0 {
+            return Err(lacks(format!(
+                "pidfd_open failed ({})",
+                std::io::Error::last_os_error()
+            )));
+        }
+        // SAFETY: `pidfd` is the pidfd just opened, and a null `siginfo_t` asks for the defaults.
+        let sent = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                pidfd,
+                0,
+                std::ptr::null::<libc::siginfo_t>(),
+                libc::PIDFD_SIGNAL_PROCESS_GROUP,
+            )
+        };
+        let errno = std::io::Error::last_os_error();
+        // SAFETY: closes the pidfd opened above, which nothing else holds.
+        unsafe { libc::close(pidfd as libc::c_int) };
+        // Any other answer (`ESRCH`: this process leads no group) comes from a kernel that took the flag.
+        if sent < 0 && errno.raw_os_error() == Some(libc::EINVAL) {
+            return Err(lacks(format!("this kernel refused the flag ({errno})")));
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    Err(lacks("this host is not Linux".to_owned()))
+}
