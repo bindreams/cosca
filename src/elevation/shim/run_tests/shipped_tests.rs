@@ -22,7 +22,7 @@ fn a_shipped_shim_starts_the_program_and_reports_its_exit() {
 #[skuld::test]
 fn a_shipped_shim_takes_p_for_a_protocol_violation() {
     // With hooks `P` is a ping and the `T` after it ends the program with SIGTERM. Shipped, `P` is
-    // a byte no cosca sends: the program is killed, and the `T` that follows finds it dead.
+    // a byte no cosca sends: the program is killed before the `T` that follows can end it.
     let rig = ShimRig::new();
     let run = rig.spawn(Spec::new("cat", &[]).stdin_held().shipped());
     rig.link.expect_event(LinkEvent::Accepted);
