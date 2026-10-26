@@ -1286,6 +1286,8 @@ fn main() {
         #[cfg(windows)]
         "try-env-block" => env_block::try_block(&args[2..]),
         #[cfg(windows)]
+        "try-cwd" => env_block::try_cwd(&args[2]),
+        #[cfg(windows)]
         "spawn-consent-with-block" => env_block::spawn_consent_with_block(&args[2..]),
         #[cfg(windows)]
         "consent-spawn" => consent_spawn::run(&args[2], &args[3], &args[4], &args[5]),
