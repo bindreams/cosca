@@ -89,10 +89,12 @@ async fn async_terminate_tree_soft_kills_the_group() {
     // says so (#382): a `kill_tree()` first would race the SIGTERM for the exit status.
     let _warns = common::warn_watch().expecting("call kill_tree() before wait()");
     use std::os::unix::process::ExitStatusExt;
-    // control-block honors SIGTERM: the group signal alone (signal-only op) tears it down.
+    // control-block honors SIGTERM: the group signal alone (signal-only op) tears it down. It also
+    // exits at the test's byte, so a root the SIGTERM missed exits by itself: the wait cannot hang,
+    // and its status shows no signal.
     let (mut child, mut sock) = common::spawn_control_async("control-block", &["R"], true).await;
     child.terminate_tree().expect("terminate_tree");
-    expect_eof("root", &mut sock);
+    _ = std::io::Write::write_all(&mut sock, b"x");
     let status = child.wait().await.expect("reap");
     assert_eq!(
         status.signal(),

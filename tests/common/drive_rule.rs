@@ -1,6 +1,7 @@
-//! M7's runner: what a child's own `GetFullPathNameW` makes of a drive-relative name, given an
-//! environment block and a cwd built here, against what D1 predicts. `cosca_testbin with-env-block`
-//! starts the child with exactly the row's block, and the child's `full-path` mode reports.
+//! M7's runner (M7b reuses it): what a child's own `GetFullPathNameW` makes of a drive-relative name,
+//! given an environment block and a cwd built here, against what D1 predicts. `cosca_testbin with-env-block`
+//! starts the child with exactly the row's block, and the child's `full-path` mode reports; `cosca_testbin_cwd`
+//! does the same for a long-path-aware child.
 //!
 //! D1, the drive rule (`complete` plus `HostOs::drive_base`), completes `X:rest` onto, in order: the
 //! cwd E, when E is drive-absolute on drive X (`Base`); the child's first `=X:` entry, when it is
@@ -144,11 +145,19 @@ fn replace_ignore_case(s: &str, from: &str, to: &str) -> String {
     out
 }
 
-/// Runs `row` and prints it as `M7 <key> <field>=<value>` lines, rendered by `render` and then
+/// [`run_in`] for M7: the child has no `longPathAware` manifest.
+pub fn run(row: &Row, render: &Render, drives: &[(char, char)]) {
+    run_in("M7", crate::common::testbin(), false, row, render, drives);
+}
+
+/// Runs `row` and prints it as `<id> <key> <field>=<value>` lines, rendered by `render` and then
 /// `drives`: each `(letter, placeholder)` pair prints the drive `letter:` as `<P>:`, or `<p>:` for a
 /// lowercase letter, so two drives never print alike and a lowercase one stays visible.
-pub fn run(row: &Row, render: &Render, drives: &[(char, char)]) {
-    let mut cmd = Command::new(crate::common::testbin());
+///
+/// `bin` both launches and is the child (`with-env-block` starts its own image). The child's
+/// `RtlAreLongPathsEnabled` must equal `long_paths`.
+pub fn run_in(id: &str, bin: &str, long_paths: bool, row: &Row, render: &Render, drives: &[(char, char)]) {
+    let mut cmd = Command::new(bin);
     cmd.arg("with-env-block");
     match &row.cwd {
         Cwd::Given(cwd) => {
@@ -163,16 +172,22 @@ pub fn run(row: &Row, render: &Render, drives: &[(char, char)]) {
     let report = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(
         out.status.success(),
-        "M7 {}: the probe failed ({}): {report}\n{}",
+        "{id} {}: the probe failed ({}): {report}\n{}",
         row.key,
         out.status,
         String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        value(&report, "long_paths_enabled"),
+        long_paths.to_string(),
+        "{id} {}: precondition: the child's long-path state (its manifest and the LongPathsEnabled policy)",
+        row.key
     );
     let cwd = value(&report, "cwd");
     assert_eq!(
         cwd,
         row.cwd.path(),
-        "M7 {}: precondition: the child runs in the row's cwd",
+        "{id} {}: precondition: the child runs in the row's cwd",
         row.key
     );
     let var = value(&report, "var");
@@ -180,7 +195,7 @@ pub fn run(row: &Row, render: &Render, drives: &[(char, char)]) {
         Var::Is(expected) => assert_eq!(
             var,
             expected.as_deref().unwrap_or("<unset>"),
-            "M7 {}: precondition: the child sees the block's =X: value",
+            "{id} {}: precondition: the child sees the block's =X: value",
             row.key
         ),
         Var::Recorded => assert!(
@@ -188,7 +203,7 @@ pub fn run(row: &Row, render: &Render, drives: &[(char, char)]) {
                 .iter()
                 .filter_map(|e| e.strip_prefix('=')?.split_once('='))
                 .any(|(_, v)| v == var),
-            "M7 {}: precondition: the child sees one of the block's =X: values, not {var:?}",
+            "{id} {}: precondition: the child sees one of the block's =X: values, not {var:?}",
             row.key
         ),
     }
@@ -198,19 +213,30 @@ pub fn run(row: &Row, render: &Render, drives: &[(char, char)]) {
     let predicted = row.predicted();
     let show = |s: &str| render_drives(&render.apply(s), drives);
     let k = row.key;
-    println!("M7 {k} cwd={}", show(cwd));
+    println!("{id} {k} long_paths_enabled={long_paths}");
+    println!("{id} {k} cwd={}", show(cwd));
     println!(
-        "M7 {k} block={:?}",
+        "{id} {k} block={:?}",
         row.block.iter().map(|e| show(e)).collect::<Vec<_>>()
     );
-    println!("M7 {k} name={}", show(&row.name));
-    println!("M7 {k} var={}", show(var));
-    println!("M7 {k} predicted_arm={}", row.arm.name());
-    println!("M7 {k} observed_arm={observed}");
-    println!("M7 {k} predicted={}", show(&predicted));
-    println!("M7 {k} full={}", show(full));
-    println!("M7 {k} var_after={}", show(var_after));
-    println!("M7 {k} agrees={}", full == predicted);
+    println!("{id} {k} name={}", show(&row.name));
+    println!("{id} {k} var={}", show(var));
+    println!("{id} {k} predicted_arm={}", row.arm.name());
+    println!("{id} {k} observed_arm={observed}");
+    println!("{id} {k} predicted={}", show(&predicted));
+    println!("{id} {k} full={}", show(full));
+    println!("{id} {k} var_after={}", show(var_after));
+    // The lengths of real values only: `<unset>` and `err=<code>` are not paths.
+    let units = |s: &str, real: bool| {
+        if real {
+            s.encode_utf16().count().to_string()
+        } else {
+            "-".to_owned()
+        }
+    };
+    println!("{id} {k} var_units={}", units(var, var != "<unset>"));
+    println!("{id} {k} full_units={}", units(full, !full.starts_with("err=")));
+    println!("{id} {k} agrees={}", full == predicted);
 }
 
 /// Prints each `letter:` of `drives` as its placeholder, in one pass so a placeholder is never
@@ -244,9 +270,9 @@ fn render_drives(s: &str, drives: &[(char, char)]) -> String {
 
 /// The arm the child's result took, from its report: `Error` when `GetFullPathNameW` failed;
 /// `Base` when the name's drive is the drive of a drive-absolute `cwd` and `full` is under the cwd;
-/// `Value` when `var` is fully qualified, an existing directory, and `full` is under it; `Root` when
-/// `full` is not under the cwd and starts with the name's drive root; else `Other`. Case-insensitive
-/// for ASCII only.
+/// `Value` when `var` is fully qualified, an existing directory, and `full` is under it or is it (a
+/// bare `X:`); `Root` when `full` is not under the cwd and starts with the name's drive root; else
+/// `Other`. Case-insensitive for ASCII only.
 fn observed_arm(cwd: &str, name: &str, var: &str, full: &str) -> &'static str {
     let under = |path: &str, dir: &str| starts_with_ignore_case(path, &format!("{}\\", dir.trim_end_matches('\\')));
     if full.starts_with("err=") {
@@ -260,12 +286,22 @@ fn observed_arm(cwd: &str, name: &str, var: &str, full: &str) -> &'static str {
     let fully_qualified = drive_root_len(var) > 0 || (var.starts_with(r"\\") && !var.starts_with(r"\\.\"));
     if cwd_drive.is_some_and(|c| c.eq_ignore_ascii_case(&name_drive)) && under(full, cwd) {
         "Base"
-    } else if fully_qualified && std::path::Path::new(var).is_dir() && under(full, var) {
+    } else if fully_qualified && is_dir(var) && (under(full, var) || full.eq_ignore_ascii_case(var)) {
         "Value"
     } else if !under(full, cwd) && starts_with_ignore_case(full, &format!("{name_drive}:\\")) {
         "Root"
     } else {
         "Other"
+    }
+}
+
+/// Whether `path` is an existing directory. Only `NotFound` means it is not one; any other failure
+/// to stat it fails the test.
+fn is_dir(path: &str) -> bool {
+    match std::fs::metadata(path) {
+        Ok(m) => m.is_dir(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => panic!("stat {path:?}: {e}"),
     }
 }
 
@@ -304,4 +340,31 @@ pub fn free_drive(letters: impl IntoIterator<Item = u8>) -> char {
         .into_iter()
         .find(|l| mask & (1 << (l - b'A')) == 0)
         .expect("a free drive letter") as char
+}
+
+/// A new directory under `base` whose path is exactly `units` UTF-16 units long, made of components
+/// of at most 100 units, and its path.
+pub fn dir_of_len(base: &str, units: usize) -> String {
+    let len = |p: &str| p.encode_utf16().count();
+    assert!(
+        len(base) + 2 <= units,
+        "{base:?} is already {} units, past {units}",
+        len(base)
+    );
+    let mut dir = base.to_owned();
+    while len(&dir) < units {
+        let room = units - len(&dir) - 1;
+        // A last component needs at least one unit past its separator, and 1 unit would leave 0;
+        // keep >= 2 units remaining.
+        let take = if room > 100 && room - 100 < 2 {
+            room - 2
+        } else {
+            room.min(100)
+        };
+        dir.push('\\');
+        dir.push_str(&"a".repeat(take));
+    }
+    assert_eq!(len(&dir), units);
+    std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("create {dir:?}: {e}"));
+    dir
 }

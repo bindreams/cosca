@@ -58,10 +58,7 @@ path = "junit.xml"
 # One profile per Unix step in ci.yaml (`.github/scripts/run-nextest.py` selects it through
 # `NEXTEST_PROFILE`), so a straggler from one step can only ever write that step's own JUnit file.
 # Settings and `[[...overrides]]` are inherited (nextest 0.9.146). Windows runs its steps under the
-# shared `ci` profile (run-nextest.ps1), the canaries and the elevation step under profiles of their own. A
-# Windows step leaves no process in the job behind: run-nextest.ps1 ends the step's Job Object, and waits for it to
-# be empty, before the next step starts. Processes started under another logon (the elevation lane's administrator,
-# which runs last) are outside it.
+# shared `ci` profile (run-nextest.ps1), the canaries and the elevation step under profiles of their own.
 [profile.ci-tests]
 inherits = "ci"
 
@@ -72,6 +69,9 @@ inherits = "ci"
 inherits = "ci"
 
 [profile.ci-serde]
+inherits = "ci"
+
+[profile.ci-path]
 inherits = "ci"
 
 [profile.ci-release]
@@ -173,9 +173,10 @@ windows-shell-execute = { max-threads = 1 }
 # that binary at one test at a time instead.
 windows-elevation-routes = { max-threads = 1 }
 
-# The `DRIVE_MAPPING` tests in `tests/windows_process_cwd.rs` each map the highest free drive letter
-# for the whole logon session, so two at once could pick the same letter and read each other's
-# mapping.
+# The `DRIVE_MAPPING` tests in `tests/windows_process_cwd.rs` each map a drive letter for the whole
+# logon session, so two at once would contend for the same letters and see each other's mappings.
+# This group runs that whole binary one test at a time, so a new drive-mapping test is covered
+# without a filter naming it.
 windows-drive-mapping = { max-threads = 1 }
 
 [[profile.default.overrides]]
@@ -187,7 +188,7 @@ filter = 'binary(windows_elevation_routes)'
 test-group = 'windows-elevation-routes'
 
 [[profile.default.overrides]]
-filter = 'binary(windows_process_cwd) & (test(=a_drive_relative_current_dir_takes_the_drives_own_directory_as_win32_does) | test(=m7_a_drive_relative_name_against_a_drive_directory_on_its_own_drive))'
+filter = 'binary(windows_process_cwd)'
 test-group = 'windows-drive-mapping'
 
 [[profile.default.overrides]]
