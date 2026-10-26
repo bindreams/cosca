@@ -237,6 +237,56 @@ fn child_graceful_shutdown_tree_tears_down_tree() {
     assert!(rest.is_empty(), "nothing was written: {rest:?}");
 }
 
+// The escalation: a child that ignores `SIGTERM` is still alive at `Duration::ZERO`'s one poll, so
+// only the hard kill can end it, and `SIGKILL` is the only signal it can die of. Its stdin is
+// released once the kill returned (`release_at`), so an escalation that sent nothing lets it exit 0
+// and fails the signal assertion, instead of hanging the reap.
+#[cfg(unix)]
+#[skuld::test]
+fn child_graceful_shutdown_escalates() {
+    let (child, stdin) = crate::test_child::term_ignoring_blocker();
+    let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, stdin);
+    let status = child
+        .graceful_shutdown(Duration::ZERO)
+        .expect("graceful_shutdown escalates");
+    crate::test_child::assert_killed("the SIGTERM-ignoring child", status);
+}
+
+// The tree escalation: both members ignore the group's `SIGTERM`, so the hard sweep has to end the
+// root and the grandchild. The grandchild is `cat` in a subshell that prints `eof` when `cat`
+// exits: a member the sweep missed would print it once the stdin is released, so an empty stdout
+// shows both were killed.
+#[cfg(unix)]
+#[skuld::test]
+fn child_graceful_shutdown_tree_escalates_with_a_surviving_grandchild() {
+    use std::io::Read as _;
+    let mut cmd = crate::Command::new();
+    cmd.args(crate::test_child::TERM_IGNORING_TREE_ARGV.iter().copied());
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+    cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
+    cmd.contain();
+    let mut child = cmd.spawn().expect("spawn");
+    let stdin = child.stdin().expect("piped stdin");
+    let mut stdout = child.stdout().expect("piped stdout");
+    let mut ready = [0u8; 2];
+    stdout.read_exact(&mut ready).expect("readiness line");
+    assert_eq!(
+        &ready,
+        b"r
+"
+    );
+
+    let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, stdin);
+    let status = child.graceful_shutdown_tree(Duration::ZERO).expect("tree escalates");
+
+    crate::test_child::assert_killed("the SIGTERM-ignoring root", status);
+    let mut rest = Vec::new();
+    stdout
+        .read_to_end(&mut rest)
+        .expect("both members are gone, so the pipe ends");
+    assert!(rest.is_empty(), "the sweep missed the grandchild: {rest:?}");
+}
+
 // A term_group refusal must not strand the tree between the soft signal and the hard sweep:
 // the sweep and reap still run, then the refusal surfaces. Mirrors
 // `graceful_tree_watch_error_still_sweeps_and_reaps` above, for the terminate seam instead
@@ -437,6 +487,15 @@ fn graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_authoritative() 
     // pending on the root, so it beats the EOF this release causes.
     #[cfg(unix)]
     let _release = term_fault::release_at(term_fault::HookPoint::AfterTerminate, stdin);
+    // Windows: assert the break was sent once `terminate_tree` returns, so a missing one fails
+    // here and not when the grace runs out.
+    #[cfg(windows)]
+    let _check = {
+        let pid = child.id().pid();
+        term_fault::at(term_fault::HookPoint::AfterTerminate, move || {
+            crate::test_child::ctrl_break::assert_break_sent_to(pid)
+        })
+    };
     let result = child.graceful_shutdown_tree(Duration::from_secs(30));
     if authoritative {
         let status = result.expect("an authoritatively-drained tree must not invoke the sweep at all");

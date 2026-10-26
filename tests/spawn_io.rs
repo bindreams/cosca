@@ -721,28 +721,6 @@ fn read_errors_on_invalid_utf8() {
 // Drop policy =====
 
 #[skuld::test]
-fn drop_kills_and_reaps_the_child() {
-    let mut cmd = Command::new();
-    // tee-both with a piped (but never-written, never-closed) stdin blocks the
-    // child reading stdin -> it stays alive until we drop the Child.
-    cmd.executable(testbin()).args(["cosca_testbin", "tee-both"]);
-    cmd.stdin(Stdio::pipe()).unwrap();
-    let child = cmd.spawn().expect("spawn");
-    let id = child.id();
-    assert_eq!(
-        id.is_alive(),
-        cosca::identity::Liveness::Alive,
-        "child runs while its stdin stays open"
-    );
-    drop(child); // kill_on_drop default true => SIGKILL/TerminateProcess + reap
-    assert_eq!(
-        id.is_alive(),
-        cosca::identity::Liveness::Dead,
-        "child must be dead (and reaped) after drop"
-    );
-}
-
-#[skuld::test]
 fn detach_leaves_the_child_running() {
     let mut cmd = Command::new();
     cmd.executable(testbin()).args(["cosca_testbin", "tee-both"]);

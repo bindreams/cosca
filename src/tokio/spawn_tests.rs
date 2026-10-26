@@ -107,13 +107,14 @@ async fn a_bare_exact_name_loads_the_file_in_the_childs_cwd_not_one_on_path() {
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn cgroup_a_post_fork_tokio_failure_leaves_no_live_child_in_a_leaked_leaf(#[fixture(cgroup)] _group: &Group) {
-    let mut cmd = blocker();
+    let (mut cmd, teardown) = teardown_blocker();
     cmd.contain();
     let (_err, fate) = {
         let _failing = fault::fail_tokio_spawns_after_fork();
         expect_may_have_started_with(cmd.spawn().expect_err("the forced failure must fail the spawn"))
     };
     assert_eq!(fate, ChildFate::Reaped, "killed and reaped through its pidfd");
+    teardown.assert_killed();
     let pid = fault::take_forgotten_pid().expect("the seam dropped a child");
     let leaf = fault::take_forgotten_leaf().expect("the dropped spawn was contained in a leaf");
 
@@ -149,12 +150,18 @@ fn a_failed_teardown_kill_in_the_async_spawn_asserts_all_but_eperm() {
             .build()
             .unwrap();
         let releases = crate::tokio::child::fault::count_backend_drops();
-        let reaps = fault::record_teardown_reaps();
+        // Linux: the pidfd teardown kills and reaps the child, so its stdin is released once that
+        // kill returned (a kill that sent nothing then fails the SIGKILL assertion below). Elsewhere
+        // tokio's orphan queue reaps it once the failed spawn drops the pipe's parent end.
+        #[cfg(target_os = "linux")]
+        let (stdin, reaps) = fault::teardown_blocker_stdin();
+        #[cfg(not(target_os = "linux"))]
+        let (stdin, reaps) = (Stdio::pipe_in(), fault::record_teardown_reaps());
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             runtime.block_on(async {
                 let mut cmd = crate::tokio::Command::new();
                 cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
-                cmd.stdin(Stdio::pipe_in()).unwrap().stdout(Stdio::null()).unwrap();
+                cmd.stdin(stdin).unwrap().stdout(Stdio::null()).unwrap();
                 // The attach, except on macOS, where it cannot fail: the identity check's failure
                 // reaches the same teardown.
                 let force: fn(bool) = if cfg!(target_os = "macos") {
@@ -192,11 +199,14 @@ fn a_failed_teardown_kill_in_the_async_spawn_asserts_all_but_eperm() {
         // Linux: the pidfd teardown has reaped the child by now. Asserted before the driver, which
         // would spin on a missing hand-off.
         #[cfg(target_os = "linux")]
-        assert_eq!(
-            reaps.recorded().len(),
-            1,
-            "{kind:?}: the refused-kill arm must have reaped the child through its pidfd"
-        );
+        {
+            assert_eq!(
+                reaps.recorded().len(),
+                1,
+                "{kind:?}: the refused-kill arm must have reaped the child through its pidfd"
+            );
+            reaps.assert_killed();
+        }
         drop(reaps);
         let captured = fault::take_captured().expect("seam captured the child's identity");
         drive_until_reaped(&runtime, &captured);
@@ -234,7 +244,7 @@ fn drive_until_reaped(
 async fn a_post_fork_tokio_failure_without_a_leaf_says_the_child_may_be_unreachable() {
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
-    let mut cmd = blocker();
+    let (mut cmd, teardown) = teardown_blocker();
     cmd.contain_with(crate::ContainMode::TreeWalk);
     let mark = crate::log_capture::mark();
     let (_err, fate) = {
@@ -242,6 +252,7 @@ async fn a_post_fork_tokio_failure_without_a_leaf_says_the_child_may_be_unreacha
         expect_may_have_started_with(cmd.spawn().expect_err("the forced failure must fail the spawn"))
     };
     assert_eq!(fate, ChildFate::Reaped, "killed and reaped through its pidfd");
+    teardown.assert_killed();
     let pid = fault::take_forgotten_pid().expect("the seam dropped a child");
     assert!(
         crate::log_capture::records_since(mark, "nothing can reach it")
@@ -459,7 +470,8 @@ async fn cgroup_an_identity_failure_whose_kill_is_refused_leaves_the_child_to_to
         "cosca-identity-eperm-4c19",
         std::io::ErrorKind::PermissionDenied,
     );
-    let mut cmd = blocker();
+    // The leaf's kill ends the child, not a landed root kill; the writer is released with the guard.
+    let (mut cmd, _teardown) = teardown_blocker();
     cmd.contain();
     let err = cmd.spawn().err();
     fault::set_force_identity_vanished(false);
@@ -1155,10 +1167,7 @@ fn an_abandoned_child_only_a_linux_leaf_can_report_asserts() {
 #[skuld::test]
 async fn a_tokio_spawn_failing_after_the_fork_leaves_the_child_running_and_says_so() {
     crate::tokio::test_runtime::assert_current_thread();
-    #[cfg(unix)]
     let (stdin, writer) = crate::test_child::held_writer_stdin();
-    #[cfg(not(unix))]
-    let stdin = crate::test_child::leaked_writer_stdin();
     let mut cmd = Command::new();
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
@@ -1182,7 +1191,10 @@ async fn a_tokio_spawn_failing_after_the_fork_leaves_the_child_running_and_says_
         );
     }
     #[cfg(not(unix))]
-    let _ = pid;
+    {
+        let _ = pid;
+        drop(writer);
+    }
 }
 
 /// What a leaf's abandonment found of an elevation front is what the spawn answers: reaped through

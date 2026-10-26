@@ -62,12 +62,18 @@ fn a_poisoned_lock_neither_aborts_nor_hangs() {
             .spawn(|| shared.kill().expect("kill on a poisoned lock"))
             .join()
             .expect("kill must not panic");
-        scope
+        // Released after the kill, so a kill that sent nothing ends the child with 0 and fails the
+        // status assertion instead of hanging the wait.
+        b.end_child();
+        let status = scope
             .spawn(|| shared.wait().expect("wait on a poisoned lock"))
             .join()
             .expect("wait must not panic");
+        #[cfg(unix)]
+        assert_eq!(super::fixtures::signal_of(status), Some(libc::SIGKILL));
+        #[cfg(windows)]
+        assert_eq!(status.code(), Some(1));
     });
-    b.end_child();
 }
 
 /// S1 (`Debug`): formatting the handle inside a blocked waiter does not block, and shows
@@ -172,7 +178,7 @@ fn a_try_wait_reap_error_returns_it_and_stays_n() {
 /// Mutant: `kill` blocks on the `Condvar` while `W`; the kill thread's hook panics.
 #[skuld::test]
 fn kill_during_a_parked_wait_signals_and_the_holder_reaps() {
-    let b = Blocker::spawn();
+    let mut b = Blocker::spawn();
     let holder = park_holder(&b.shared, None, || ());
     let killer = std::thread::spawn({
         let shared = Arc::clone(&b.shared);
@@ -182,6 +188,9 @@ fn kill_during_a_parked_wait_signals_and_the_holder_reaps() {
         }
     });
     killer.join().expect("kill must not block").expect("kill");
+    // Released after the kill, so a kill that sent nothing ends the child with 0 and fails the
+    // status assertion below instead of hanging the holder's wait.
+    b.end_child();
     let status = holder.release_and_join().expect("holder wait").expect("a status");
     #[cfg(unix)]
     assert_eq!(super::fixtures::signal_of(status), Some(libc::SIGKILL));

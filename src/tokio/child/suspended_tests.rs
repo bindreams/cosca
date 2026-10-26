@@ -2,8 +2,9 @@
 //!
 //! Every Windows child is a windowless blocker (no console window on a developer's desktop): by
 //! default `more.com`, which exits 0 on EOF, so a kill that sent nothing fails on how the child
-//! ended; `findstr x` where a test needs its match or its exit 1. Tests that need a job, a `TreeWalk` root or any other containment are named for it;
-//! the uncontained ones are the ones that are safe to run on a developer's host.
+//! ended; `findstr x` where a test needs its match or its exit 1. Tests that need a job, a
+//! `TreeWalk` root or any other containment are named for it; the uncontained ones are the ones
+//! that are safe to run on a developer's host.
 
 use static_assertions::assert_impl_all;
 
@@ -104,17 +105,32 @@ mod on_windows {
     }
 
     /// The blocker for one `kill_on_drop` leg of a drop test. Stdin decides the child's fate: the
-    /// `true` leg leaks its write end, so only the drop's kill can end the child. The `false` leg
+    /// `true` leg is `more.com` (exit 0 on EOF) and returns its write end, which the test drops only
+    /// after the drop's kill, so the exit code tells a kill (1) from a release (0). The `false` leg
     /// pipes stdin and stdout, which [`drop_and_expect_it_runs`] keeps past the drop.
-    fn drop_leg_blocker(kill_on_drop: bool) -> Command {
-        let mut cmd = findstr_blocker(false);
-        cmd.kill_on_drop(kill_on_drop);
+    fn drop_leg_blocker(kill_on_drop: bool) -> (Command, Option<std::io::PipeWriter>) {
         if kill_on_drop {
-            cmd.stdin(crate::test_child::leaked_writer_stdin()).expect("stdin");
+            let mut cmd = blocker(false);
+            cmd.kill_on_drop(true);
+            let (stdin, writer) = crate::test_child::held_writer_stdin();
+            cmd.stdin(stdin).expect("stdin");
+            (cmd, Some(writer))
         } else {
+            let mut cmd = findstr_blocker(false);
+            cmd.kill_on_drop(false);
             cmd.stdout(crate::Stdio::pipe()).expect("stdout pipe");
+            (cmd, None)
         }
-        cmd
+    }
+
+    /// Drop `child` (built by [`drop_leg_blocker`]`(true)`), then release its stdin: the drop's kill
+    /// came first, so the child dies with the kill's exit code, or the test fails by assertion.
+    fn drop_and_expect_it_killed(child: Child, writer: Option<std::io::PipeWriter>, what: &str) {
+        let remote = Remote::open(child.id().pid());
+        drop(child);
+        drop(writer);
+        remote.wait_for_death();
+        assert_eq!(remote.exit_code(), 1, "{what}: the drop must kill the resumed child");
     }
 
     /// Drop `child` (built by [`drop_leg_blocker`]`(false)`) and prove the drop did not kill it, by
@@ -366,13 +382,14 @@ mod on_windows {
     /// The command's `kill_on_drop` decides what dropping the resumed `Child` does: a resumed child
     /// that kept the frozen spawn's forced `true` would be killed by a command that opted out.
     ///
-    /// The `true` leg's child can only end by the drop's kill (without it the run is bounded by
-    /// nextest's terminate-after). The `false` leg proves the child alive after the drop with a
+    /// The `true` leg's child dies with the kill's exit code, its stdin released only after the drop
+    /// (see [`drop_and_expect_it_killed`]). The `false` leg proves the child alive after the drop with a
     /// round trip, not a look at the process.
     #[skuld::test]
     async fn death_watch_dropping_an_uncontained_resumed_child_follows_the_commands_kill_on_drop() {
         for kill_on_drop in [true, false] {
-            let child = drop_leg_blocker(kill_on_drop)
+            let (mut cmd, writer) = drop_leg_blocker(kill_on_drop);
+            let child = cmd
                 .spawn_suspended()
                 .expect("spawn suspended")
                 .resume()
@@ -380,9 +397,7 @@ mod on_windows {
             assert_eq!(child.kill_on_drop, kill_on_drop);
 
             if kill_on_drop {
-                let remote = Remote::open(child.id().pid());
-                drop(child);
-                remote.wait_for_death();
+                drop_and_expect_it_killed(child, writer, "uncontained");
             } else {
                 drop_and_expect_it_runs(child, "uncontained").await;
             }
@@ -394,7 +409,7 @@ mod on_windows {
     async fn death_watch_dropping_a_contained_resumed_child_follows_the_commands_kill_on_drop() {
         for mode in [crate::ContainMode::TreeWalk, crate::ContainMode::Strongest] {
             for kill_on_drop in [true, false] {
-                let mut cmd = drop_leg_blocker(kill_on_drop);
+                let (mut cmd, writer) = drop_leg_blocker(kill_on_drop);
                 cmd.contain_with(mode);
                 let child = cmd
                     .spawn_suspended()
@@ -404,9 +419,7 @@ mod on_windows {
                 assert_eq!(child.kill_on_drop, kill_on_drop, "{mode:?}");
 
                 if kill_on_drop {
-                    let remote = Remote::open(child.id().pid());
-                    drop(child);
-                    remote.wait_for_death();
+                    drop_and_expect_it_killed(child, writer, &format!("{mode:?}"));
                 } else {
                     drop_and_expect_it_runs(child, &format!("{mode:?}")).await;
                 }
@@ -454,21 +467,36 @@ mod on_windows {
 
     // Drop =====
 
+    /// Hold `cmd`'s stdin (`more.com` exits 0 on EOF): the test releases it only after the drop, so
+    /// the exit code tells the drop's kill (1) from a release (0).
+    fn hold_stdin(cmd: &mut Command) -> std::io::PipeWriter {
+        let (stdin, writer) = crate::test_child::held_writer_stdin();
+        cmd.stdin(stdin).expect("stdin");
+        writer
+    }
+
+    /// Drop `frozen`, release its stdin, and require it to die with the kill's exit code. The drop is
+    /// the async `Child`'s bounded one: it signals and returns, so the proof is the process object,
+    /// opened while the frozen child pins the pid.
+    fn drop_frozen_and_expect_it_killed(frozen: crate::tokio::SuspendedChild, writer: std::io::PipeWriter, what: &str) {
+        let remote = Remote::open(frozen.id().pid());
+        drop(frozen);
+        drop(writer);
+        remote.wait_for_death();
+        assert_eq!(remote.exit_code(), 1, "{what}: the drop must kill the frozen child");
+    }
+
     /// A dropped frozen child is killed whatever `kill_on_drop` says. Nothing but the drop can end
-    /// it (its stdin write end is leaked), and the drop is the async `Child`'s bounded one: it signals
-    /// and returns, so the proof is the process object, opened while the frozen child pins the pid.
+    /// it (its stdin is released only after the drop).
     #[skuld::test]
     async fn death_watch_dropping_an_uncontained_frozen_child_kills_it_whatever_kill_on_drop_says() {
         for kill_on_drop in [false, true] {
             let mut cmd = blocker(false);
             cmd.kill_on_drop(kill_on_drop);
-            cmd.stdin(crate::test_child::leaked_writer_stdin()).expect("stdin");
+            let writer = hold_stdin(&mut cmd);
             let frozen = cmd.spawn_suspended().expect("spawn suspended");
-            let remote = Remote::open(frozen.id().pid());
 
-            drop(frozen);
-
-            remote.wait_for_death();
+            drop_frozen_and_expect_it_killed(frozen, writer, "uncontained");
         }
     }
 
@@ -479,13 +507,10 @@ mod on_windows {
             for kill_on_drop in [false, true] {
                 let mut cmd = blocker(false);
                 cmd.contain_with(mode).kill_on_drop(kill_on_drop);
-                cmd.stdin(crate::test_child::leaked_writer_stdin()).expect("stdin");
+                let writer = hold_stdin(&mut cmd);
                 let frozen = cmd.spawn_suspended().expect("spawn suspended");
-                let remote = Remote::open(frozen.id().pid());
 
-                drop(frozen);
-
-                remote.wait_for_death();
+                drop_frozen_and_expect_it_killed(frozen, writer, &format!("{mode:?}"));
             }
         }
     }
@@ -498,13 +523,10 @@ mod on_windows {
             let mut cmd = blocker(raw);
             cmd.stdout(crate::Stdio::pipe()).expect("stdout pipe");
             cmd.stderr(crate::Stdio::pipe()).expect("stderr pipe");
-            cmd.stdin(crate::test_child::leaked_writer_stdin()).expect("stdin");
+            let writer = hold_stdin(&mut cmd);
             let frozen = cmd.spawn_suspended().expect("spawn suspended");
-            let remote = Remote::open(frozen.id().pid());
 
-            drop(frozen);
-
-            remote.wait_for_death();
+            drop_frozen_and_expect_it_killed(frozen, writer, &format!("raw={raw}"));
         }
     }
 

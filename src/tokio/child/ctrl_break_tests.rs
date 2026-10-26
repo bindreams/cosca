@@ -135,3 +135,55 @@ async fn async_child_graceful_shutdown_tree_tears_down_tree_on_windows() {
         "the grandchild must die to the break"
     );
 }
+
+/// Async twin of `child_graceful_shutdown_signals_the_group_but_only_kills_the_child`. The root
+/// ignores the break, so only the escalation can end it; its socket is closed once the escalation
+/// returned, so an escalation that sent nothing yields code 0, not a hang.
+#[skuld::test]
+async fn async_child_graceful_shutdown_signals_the_group_but_only_kills_the_child() {
+    crate::tokio::test_runtime::assert_current_thread();
+    let (mut child, root_sock, mut grand) = spawn_tree(Handler::Ignore, Handler::Ack);
+    assert_in_our_console(child.id().pid());
+    let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, root_sock);
+    let status = child
+        .graceful_shutdown(Duration::ZERO)
+        .await
+        .expect("graceful_shutdown on a console-group root");
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "the root ignores the break, so only the escalation can have ended it, got {status:?}"
+    );
+    ctrl_break::assert_break_sent_to(child.id().pid());
+    // The break reached a descendant the escalation does not touch.
+    assert_acked(&mut grand.sock);
+    assert_eq!(
+        child.wait_tree_timeout(Duration::ZERO).await.expect("drain verdict"),
+        crate::containment::TreeDrain::MembersRemain,
+        "the escalation must not have reached the group"
+    );
+    // Released after the kill, so code 1 is the kill's, not a release.
+    child.kill_tree().expect("kill_tree");
+    let Grandchild { sock, exit } = grand;
+    drop(sock);
+    assert_eq!(exit.wait_for_exit_code(), 1, "kill_tree must kill the grandchild");
+}
+
+/// Both members ignore the break, so only the ZERO-grace hard sweep can end the tree. The root's
+/// socket is closed once the sweep returned, and the grandchild's after the root is reaped: a sweep
+/// that sent nothing, or only to the root, yields code 0 for the member it missed, not a hang.
+#[skuld::test]
+async fn async_graceful_shutdown_tree_sweep_is_load_bearing_on_windows() {
+    crate::tokio::test_runtime::assert_current_thread();
+    let (mut child, root_sock, grand) = spawn_tree(Handler::Ignore, Handler::Ignore);
+    assert_in_our_console(child.id().pid());
+    let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, root_sock);
+    let status = child
+        .graceful_shutdown_tree(Duration::ZERO)
+        .await
+        .expect("tree escalates");
+    assert_eq!(status.code(), Some(1), "the sweep ends the root, got {status:?}");
+    let Grandchild { sock, exit } = grand;
+    drop(sock);
+    assert_eq!(exit.wait_for_exit_code(), 1, "the sweep must kill the grandchild");
+}

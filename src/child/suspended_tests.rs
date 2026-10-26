@@ -218,9 +218,9 @@ mod on_windows {
     /// containment: a resumed child that kept the frozen spawn's forced `true` would be killed by a
     /// command that opted out.
     ///
-    /// The child's stdin write end is leaked, so no EOF can end it: it dies only if the drop kills
-    /// it. Without the drop's kill the `true` leg never sees the child die (the run is bounded by
-    /// nextest's terminate-after); a drop that kills regardless fails the `false` leg's check.
+    /// The `true` leg releases the child's stdin only once the drop's kill returned, so it dies with
+    /// the kill's exit code or the leg fails by assertion; the `false` leg keeps the writer, so no EOF
+    /// can end the child, and a drop that kills regardless fails that leg's check.
     #[skuld::test]
     fn death_watch_dropping_a_resumed_child_follows_the_commands_kill_on_drop_for_every_containment() {
         for (shape, contain) in [
@@ -234,7 +234,15 @@ mod on_windows {
                     cmd.contain_with(mode);
                 }
                 cmd.kill_on_drop(kill_on_drop);
-                cmd.stdin(crate::test_child::leaked_writer_stdin()).expect("stdin");
+                let (stdin, writer) = crate::test_child::held_writer_stdin();
+                cmd.stdin(stdin).expect("stdin");
+                // Armed legs release the writer once the drop's kill returned; the others keep it,
+                // so only a kill could end the child.
+                let (teardown, held) = if kill_on_drop {
+                    (Some(crate::child::spawn::fault::release_at_drop_kill(writer)), None)
+                } else {
+                    (None, Some(writer))
+                };
                 let child = cmd
                     .spawn_suspended()
                     .expect("spawn suspended")
@@ -245,8 +253,9 @@ mod on_windows {
 
                 drop(child);
 
-                if kill_on_drop {
+                if let Some(teardown) = teardown {
                     remote.wait_for_death();
+                    teardown.assert_reaps_killed();
                 } else {
                     assert!(
                         !remote.is_dead_now(),
@@ -254,6 +263,7 @@ mod on_windows {
                     );
                     remote.end();
                 }
+                drop(held);
             }
         }
     }
@@ -287,9 +297,9 @@ mod on_windows {
 
     /// A dropped frozen child is killed by the `Child` teardown whatever `kill_on_drop` says, for every
     /// containment: the uncontained and `TreeWalk` shapes have no job to end it, so the teardown's
-    /// own kill is all that does. The stdin write end is leaked, so nothing but a kill can end the
-    /// process; a drop that does not kill leaves the wait below blocked (bounded by nextest's
-    /// terminate-after). The teardown count shows the drop ran the `Child` teardown, not the job's
+    /// own kill is all that does. The stdin write end is released once the teardown's kill returned,
+    /// so a drop that does not kill fails the exit-code assertion (`more.com` exits 0 on EOF, the
+    /// kill's code is 1). The teardown count shows the drop ran the `Child` teardown, not the job's
     /// asynchronous close.
     #[skuld::test]
     fn death_watch_dropping_a_frozen_child_kills_it_whatever_kill_on_drop_says() {
@@ -304,7 +314,10 @@ mod on_windows {
                     cmd.contain_with(mode);
                 }
                 cmd.kill_on_drop(kill_on_drop);
-                cmd.stdin(crate::test_child::leaked_writer_stdin()).expect("stdin");
+                let (stdin, writer) = crate::test_child::held_writer_stdin();
+                cmd.stdin(stdin).expect("stdin");
+                // Released once the drop's kill returned: `more.com` then exits 0, not 1.
+                let teardown = crate::child::spawn::fault::release_at_drop_kill(writer);
                 let frozen = cmd.spawn_suspended().expect("spawn suspended");
                 let remote = Remote::open(frozen.id().pid());
                 let teardowns = crate::test_frozen::record_root_teardowns();
@@ -313,6 +326,7 @@ mod on_windows {
 
                 remote.wait_for_death();
                 assert_eq!(teardowns.count(), 1, "{shape}, kill_on_drop({kill_on_drop})");
+                teardown.assert_reaps_killed();
             }
         }
     }
@@ -324,13 +338,17 @@ mod on_windows {
         for raw in BACKENDS {
             let mut cmd = blocker(raw);
             cmd.stdout(crate::Stdio::pipe()).expect("stdout pipe");
-            cmd.stdin(crate::test_child::leaked_writer_stdin()).expect("stdin");
+            let (stdin, writer) = crate::test_child::held_writer_stdin();
+            cmd.stdin(stdin).expect("stdin");
+            // Released once the drop's kill returned: `more.com` then exits 0, not 1.
+            let teardown = crate::child::spawn::fault::release_at_drop_kill(writer);
             let frozen = cmd.spawn_suspended().expect("spawn suspended");
             let remote = Remote::open(frozen.id().pid());
 
             drop(frozen);
 
             remote.wait_for_death();
+            teardown.assert_reaps_killed();
         }
     }
 

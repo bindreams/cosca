@@ -88,8 +88,10 @@ fn fixture_outer_procfs_inner() {
     // A spawn cannot identify its child, and says the view is why.
     let mut cmd = crate::command::Command::new();
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
-    cmd.stdin(crate::test_child::leaked_writer_stdin())
-        .expect("set stdin pipe");
+    // Released once the teardown's kill returned, so a kill that sent nothing fails the SIGKILL
+    // assertion below instead of hanging the reap.
+    let (stdin, teardown) = crate::child::spawn::fault::teardown_blocker_stdin();
+    cmd.stdin(stdin).expect("set stdin pipe");
     let (error, fate) =
         crate::child::spawn::failure::expect_may_have_started_with(cmd.spawn().expect_err("the spawn fails"));
     assert_eq!(
@@ -97,6 +99,7 @@ fn fixture_outer_procfs_inner() {
         crate::error::ChildFate::Reaped,
         "the pidfd pins the child, so it is killed and reaped"
     );
+    teardown.assert_killed();
     match error {
         crate::error::Error::Unassessable { detail, .. } => assert!(
             detail.contains(

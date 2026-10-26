@@ -396,8 +396,12 @@ fn held_blocker(kill_on_drop: bool) -> (crate::Child, std::io::PipeWriter) {
 #[cfg(unix)]
 #[skuld::test]
 fn a_failure_after_the_spawn_tears_the_child_down_and_says_so() {
-    let (mut child, _writer) = held_blocker(true);
+    let (mut child, writer) = held_blocker(true);
+    // Released once the teardown's root kill returned, so a kill that sent nothing fails the
+    // SIGKILL assertion instead of hanging the reap.
+    let teardown = crate::child::spawn::fault::release_at_drop_kill(writer);
     let error = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), &mut child);
+    teardown.assert_killed();
     assert_eq!(error.fate(), Some(crate::error::ChildFate::Reaped), "{error}");
     assert_eq!(child.id().is_alive(), crate::identity::Liveness::Dead, "{error}");
 }
@@ -442,15 +446,22 @@ fn a_failure_after_the_spawn_does_not_call_a_collected_child_running() {
 fn a_failure_after_the_spawn_notes_the_elevated_program_only_behind_a_backend() {
     use crate::elevation::{Backend, ElevatedVia};
     let note = "an elevated program behind it may still run";
-    let (mut plain, _w1) = held_blocker(true);
+    // Each teardown's writer is released once its root kill returned, so a kill that sent nothing
+    // fails the SIGKILL assertion instead of hanging the reap.
+    let (mut plain, w1) = held_blocker(true);
+    let teardown = crate::child::spawn::fault::release_at_drop_kill(w1);
     let plain = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), &mut plain);
     assert!(!plain.to_string().contains(note), "{plain}");
+    teardown.assert_killed();
+    drop(teardown);
 
-    let (mut wrapped, _w2) = held_blocker(true);
+    let (mut wrapped, w2) = held_blocker(true);
+    let teardown = crate::child::spawn::fault::release_at_drop_kill(w2);
     wrapped.set_elevation(crate::child::front_kill_tests::report(ElevatedVia::Wrapped(
         Backend::Sudo,
     )));
     let wrapped = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), &mut wrapped);
+    teardown.assert_killed();
     assert_eq!(wrapped.fate(), Some(crate::error::ChildFate::Reaped), "{wrapped}");
     assert!(wrapped.to_string().contains(note), "{wrapped}");
 }
