@@ -23,6 +23,8 @@ impl Process {
     /// defaults) — missing either, tokio panics rather than returning a typed error.
     pub async fn graceful_shutdown(&self, grace: Duration) -> Result<(), Error> {
         crate::wait::terminate(self.id())?;
+        #[cfg(test)]
+        crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterTerminate);
         // Watch failure escalates now (kill still runs); a kill Err wins — mirrors the
         // sync twin's subsumption.
         let watch = crate::tokio::wait::grace_wait(self.id(), grace).await;
@@ -51,6 +53,8 @@ impl Process {
     /// error includes a refused `pidfd_open` (see [`Error::Unsupported`](crate::error::Error::Unsupported)).
     pub async fn graceful_shutdown_tree(&self, grace: Duration) -> Result<(), Error> {
         self.terminate_tree()?; // SIGTERM-walk (Windows: Unsupported, early return)
+        #[cfg(test)]
+        crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterTerminate);
         let watch = crate::tokio::wait::grace_wait(self.id(), grace).await;
         // The sweep is unconditional — a gracefully-exited root does NOT mean the
         // descendants drained. If the watch failed, log it before the sweep so both
