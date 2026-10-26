@@ -161,3 +161,46 @@ pub(crate) fn force_duplicate_handle_error_once() -> Forced {
 pub(super) fn take_forced_duplicate_handle_error() -> bool {
     FORCE_DUPLICATE_HANDLE_ERROR.with(Cell::take)
 }
+
+/// Run on any thread whose lock of a `SharedChild` finds it held, before it blocks.
+#[cfg(unix)]
+type ContendedHook = Box<dyn Fn() + Send>;
+
+/// Process-wide, unlike the rest: the thread that contends is not the test's own.
+#[cfg(unix)]
+static ON_LOCK_CONTENDED: std::sync::Mutex<Option<ContendedHook>> = std::sync::Mutex::new(None);
+
+/// Disarms [`on_lock_contended`] on drop.
+#[cfg(unix)]
+#[must_use = "dropping this immediately disarms the hook; bind it for the probe's duration"]
+pub(crate) struct ContendedArmed(());
+
+#[cfg(unix)]
+impl Drop for ContendedArmed {
+    fn drop(&mut self) {
+        *ON_LOCK_CONTENDED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+}
+
+/// Run `hook` each time a thread's lock of a `SharedChild` finds it held, just before that thread
+/// blocks on it: proof the thread has not got past the lock.
+#[cfg(unix)]
+pub(crate) fn on_lock_contended(hook: impl Fn() + Send + 'static) -> ContendedArmed {
+    *ON_LOCK_CONTENDED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(hook));
+    ContendedArmed(())
+}
+
+pub(super) fn lock_contended() {
+    #[cfg(unix)]
+    if let Some(hook) = ON_LOCK_CONTENDED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+    {
+        hook();
+    }
+}

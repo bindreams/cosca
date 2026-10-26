@@ -62,9 +62,10 @@ impl Drop for ReadinessEvent {
 }
 
 pub(super) fn wait(source: Source<'_>, target_pid: u32, also: Option<ProcessId>) -> WatchEvent {
-    let (raw, mask): (RawSocket, u32) = match source {
-        Source::Listener(l) => (l.as_raw_socket(), FD_ACCEPT),
-        Source::Stream(s) => (s.as_raw_socket(), FD_READ | FD_CLOSE),
+    let watched_socket: Option<(RawSocket, u32)> = match source {
+        Source::Listener(l) => Some((l.as_raw_socket(), FD_ACCEPT)),
+        Source::Stream(s) => Some((s.as_raw_socket(), FD_READ | FD_CLOSE)),
+        Source::Never => None,
     };
     let pids: Vec<u32> = std::iter::once(target_pid).chain(also.map(|id| id.pid())).collect();
     let mut processes: Vec<ProcessHandle> = Vec::new();
@@ -89,41 +90,50 @@ pub(super) fn wait(source: Source<'_>, target_pid: u32, also: Option<ProcessId>)
         }
     }
 
-    // SAFETY: creates an unnamed, unowned manual-reset event; `ReadinessEvent` closes it.
-    let event = ReadinessEvent(unsafe { WSACreateEvent() }.expect("WSACreateEvent for the source's readiness watch"));
-    let sock = SOCKET(raw as usize);
-    // SAFETY: `sock` is the source's own live socket; `event` was just created above.
-    let rc = unsafe { WSAEventSelect(sock, Some(event.0), mask as i32) };
-    assert_eq!(
-        rc,
-        0,
-        "WSAEventSelect on the watched socket: {}",
-        std::io::Error::last_os_error()
-    );
+    let armed = watched_socket.map(|(raw, mask)| {
+        // SAFETY: creates an unnamed, unowned manual-reset event; `ReadinessEvent` closes it.
+        let event =
+            ReadinessEvent(unsafe { WSACreateEvent() }.expect("WSACreateEvent for the source's readiness watch"));
+        let sock = SOCKET(raw as usize);
+        // SAFETY: `sock` is the source's own live socket; `event` was just created above.
+        let rc = unsafe { WSAEventSelect(sock, Some(event.0), mask as i32) };
+        assert_eq!(
+            rc,
+            0,
+            "WSAEventSelect on the watched socket: {}",
+            std::io::Error::last_os_error()
+        );
+        (sock, event)
+    });
     notify_armed(target_pid, also);
 
     // Process handles come BEFORE the event: the lowest signalled index wins, so an exit beats a
     // ready source.
     let mut handles: Vec<HANDLE> = processes.iter().map(|p| p.0).collect();
-    handles.push(HANDLE(event.0 .0 as *mut _));
+    if let Some((_, event)) = &armed {
+        handles.push(HANDLE(event.0 .0 as *mut _));
+    }
     let woken = wait_handles(&handles);
 
-    // Cancel the association, then restore blocking mode explicitly: cancelling alone does not
-    // reliably leave the socket blocking.
-    // SAFETY: `sock` is still the source's own live socket.
-    let rc = unsafe { WSAEventSelect(sock, None, 0) };
-    assert_eq!(
-        rc,
-        0,
-        "WSAEventSelect(0) to cancel the readiness association: {}",
-        std::io::Error::last_os_error()
-    );
-    match source {
-        Source::Listener(l) => l.set_nonblocking(false),
-        Source::Stream(s) => s.set_nonblocking(false),
+    if let Some((sock, event)) = armed {
+        // Cancel the association, then restore blocking mode explicitly: cancelling alone does not
+        // reliably leave the socket blocking.
+        // SAFETY: `sock` is still the source's own live socket.
+        let rc = unsafe { WSAEventSelect(sock, None, 0) };
+        assert_eq!(
+            rc,
+            0,
+            "WSAEventSelect(0) to cancel the readiness association: {}",
+            std::io::Error::last_os_error()
+        );
+        match source {
+            Source::Listener(l) => l.set_nonblocking(false),
+            Source::Stream(s) => s.set_nonblocking(false),
+            Source::Never => unreachable!("Never arms no socket"),
+        }
+        .expect("restore the watched socket to blocking mode");
+        drop(event);
     }
-    .expect("restore the watched socket to blocking mode");
-    drop(event);
     drop(processes);
 
     let index = woken.unwrap_or_else(|e| panic!("WaitForMultipleObjects while waiting for a control connection: {e}"));

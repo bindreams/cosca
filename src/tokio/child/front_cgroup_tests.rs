@@ -22,7 +22,7 @@ use crate::{ContainMode, Containment, Stdio};
 
 use super::child_drop_reaped_tests::cgroup_common;
 
-/// Removes the child's leaf when the test ends, a failing one too: a tokio drop does not wait for the leaf to drain.
+/// Removes the child's leaf when the test ends, a failing one too: a drop that kills nothing leaves it.
 fn clean_up_leaf_of(child: &Child) -> Option<cgroup_common::LeafGuard> {
     match &child.os.attached {
         crate::containment::Attached::Cgroup(leaf) => Some(cgroup_common::LeafGuard::new(leaf.path().to_path_buf())),

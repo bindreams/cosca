@@ -8,6 +8,9 @@ pub(crate) mod namespaces;
 #[cfg(target_os = "linux")]
 pub(crate) mod pid_reuse;
 
+#[cfg(unix)]
+pub(crate) mod reaped_elsewhere;
+
 #[cfg(target_os = "macos")]
 use crate::test_own_process;
 #[cfg(target_os = "macos")]
@@ -1240,7 +1243,7 @@ pub(crate) fn assert_killed(who: &str, status: std::process::ExitStatus) {
 /// option placed there is silently eaten and `--exact` degrades to substring matching.
 /// `--test-threads=1` keeps a future filter that matches more than one test from running them
 /// concurrently inside a process the caller is about to signal.
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", feature = "tokio"))]
 pub(crate) fn fixture_argv(test: &str) -> [&str; 5] {
     let [threads, exact, test, nocapture] = crate::test_reexec::fixture_args(test);
     ["cosca_unit_tests", threads, exact, test, nocapture]

@@ -479,7 +479,7 @@ impl Command {
     /// [`graceful_shutdown_tree`](crate::Child::graceful_shutdown_tree) before dropping if the
     /// child needs one.
     ///
-    /// **Under [`CgroupV2`](crate::Containment::CgroupV2) the sync drop waits for the tree to be
+    /// **Under [`CgroupV2`](crate::Containment::CgroupV2) the drop waits for the tree to be
     /// gone** before it removes the tree's leaf: it waits while any process remains in the leaf.
     /// That is almost always instant, since every member was just sent `SIGKILL`. It lasts as long
     /// as a member stuck in uninterruptible I/O (D state) stays stuck, and as long as any process
@@ -489,7 +489,16 @@ impl Command {
     /// [`kill_tree`](crate::Child::kill_tree) then [`wait_tree`](crate::Child::wait_tree).
     ///
     /// **Once the root has been reaped, the drop does not kill by the root's number, and logs a
-    /// `warn` naming what it skipped.** The root is reaped by [`wait`](crate::Child::wait), by a
+    /// `warn` naming what it skipped.** On Linux 6.9+ a process group is the exception: the root's
+    /// pidfd names the group exactly, whoever reaped the root, so the drop kills the group while it
+    /// has a member left, and sends nothing and logs no skipped kill once it has none (the async
+    /// drop after a foreign reap still warns that it forgot tokio's `Child`). A root whose
+    /// handle cannot say whether it was reaped has its group killed the same way while the group has
+    /// a member. Not yet for an async handle whose `wait`, `try_wait` or `kill` saw the root reaped
+    /// elsewhere: it no longer holds the root's pidfd, so it treats the group as below 6.9. The rest
+    /// of this paragraph is about other mechanisms, kernels before 6.9 and macOS.
+    ///
+    /// The root is reaped by [`wait`](crate::Child::wait), by a
     /// reaper outside the handle, or (on the sync handle) by the spawn itself, which reaps a root
     /// that has already exited. Nothing pins the number after the reap, so a `killpg` to it, or a
     /// walk of the process table from it, could hit an unrelated process that reused it. That
@@ -501,111 +510,43 @@ impl Command {
     /// `debug`. A root reaped by someone else is neither killed nor waited for by its number
     /// either. The evidence is the child's own handle (on Linux its pidfd), or the number no
     /// longer reading as the root. If the handle cannot say (a failed peek), the same kills are
-    /// skipped and a warning says so; the root itself is still killed through its handle.
+    /// skipped and a warning says so; the root itself is still killed through its handle. This is
+    /// decided on one look at the root, as is the cleanup of an elevated spawn whose password could
+    /// not be written. Each send by the group's number after that look checks the root again, as
+    /// for [`kill_tree`](crate::Child::kill_tree).
     ///
     /// **On macOS, a root whose zombie launchd holds** (its tracer died, so this process no longer
     /// pins its pid) is neither signalled, waited for nor reaped by the drop, which logs one `warn`
     /// instead: the pid is not this process's, and a signal or reap by it could hit whoever
     /// reuses it. An fd marker's drop still sweeps the descendants that hold the marker, by
-    /// identity, but leaves that root out of the sweep. The public kill paths do not yet handle this
-    /// case.
+    /// identity, but leaves that root out of the sweep.
     ///
     /// **Kernel requirement.** Complete cgroup containment assumes the kernel fix `b69bb476dee9`
     /// ("cgroup: fix race between fork and cgroup.kill"): mainline 6.14 and later, or a stable
     /// kernel that carries it (confirmed in 6.1.129, 6.12.16 and 6.13.4; tagged
     /// `Cc: stable # v5.14+`). On a kernel without it, a child forked while `cgroup.kill` runs can
     /// escape the kill and keep running. [`wait_tree`](crate::Child::wait_tree) then waits for it,
-    /// and so does the sync drop, which waits for that child's whole life. A bare async drop leaves
-    /// the leaf behind with its warning. Neither case raises an event cosca could re-kill on:
-    /// `populated` does not change, and a fork writes no file. cosca does not probe for the fix.
+    /// and so does the drop, which waits for that child's whole life. Neither raises an event
+    /// cosca could re-kill on: `populated` does not change, and a fork writes no file. cosca does
+    /// not probe for the fix.
     ///
-    /// **Where the two handles differ is the wait.** The sync [`Child`](crate::Child) blocks
-    /// until the root has exited, so after `drop` returns the child is gone. The async
-    /// [`Child`](crate::tokio::Child) does bounded work only, because a destructor cannot be
-    /// awaited or cancelled and parking a runtime worker in one stops every task on it: it sends
-    /// the signals, writes `cgroup.kill`, tries `rmdir` (and, if the leaf is still populated,
-    /// writes `cgroup.kill` once more and tries `rmdir` once more), and returns. It never waits for
-    /// the root or for a drain.
+    /// **Both handles block until the root is reaped and a cgroup leaf has drained.** The sync
+    /// [`Child`](crate::Child) does so as sync Rust normally does. The async
+    /// [`Child`](crate::tokio::Child) does so on the dropping thread, which may be a tokio worker:
+    /// a destructor cannot be awaited. Its root's kill bounds the wait, as does the tree's
+    /// `cgroup.kill`, unless a process stays stuck in uninterruptible I/O (D state) or a foreign
+    /// tracer holds the root's zombie. See that `Drop`'s rustdoc. On Windows the async drop
+    /// terminates the root and the tree, and waits for neither.
     ///
-    /// - A root still running when the async handle drops is left to tokio's own drop of its
-    ///   `Child`, which reaps it best-effort: an in-drop `try_wait`, then tokio's orphan queue,
-    ///   which drains only while some tokio runtime runs. cosca keeps no reaper of its own.
-    /// - A cgroup leaf that has not drained is **left behind**, and a warning names it, if the
-    ///   drop killed it or was armed to. [`wait_tree`](crate::tokio::Child::wait_tree) awaited
-    ///   before the drop is how to have the leaf removed.
-    ///
-    /// Code that must know the child is gone should `kill` and `await`
-    /// [`wait`](crate::tokio::Child::wait) rather than rely on the drop. See that `Drop`'s
-    /// rustdoc, which also covers a process that forks without `exec`.
-    ///
-    /// An elevated child this process cannot signal is the one case the sync handle does not
-    /// block on: the teardown gives up rather than wait forever, and the child is left running.
-    /// So is an elevated child behind a front outside a cgroup (see
-    /// [`Child::kill`](crate::Child::kill)), which the sync drop also leaves unreaped. Each logs a
-    /// `warn` naming it. The rest of the tree is still killed: the drop's cgroup leaf stays armed, and
-    /// its `cgroup.kill` ends what it holds, a front among it. The sync drop waits for that and
-    /// reaps a front that has exited or that the leaf held, and warns of one still running outside
-    /// it. The async drop waits for nothing: tokio reaps the front once it exits.
-    ///
-    /// **Under [`CgroupV2`](crate::Containment::CgroupV2) the sync drop waits for the tree to be
-    /// gone** before it removes the tree's leaf: it waits while any process remains in the leaf.
-    /// That is almost always instant, since every member was just sent `SIGKILL`. It lasts as long
-    /// as a member stuck in uninterruptible I/O (D state) stays stuck, and as long as any process
-    /// another party (the same uid, or root) moves into the leaf after the kill keeps running:
-    /// the kill reaches only the processes in the leaf when it is written. Under every other
-    /// mechanism descendants are killed, not waited for. To wait explicitly, call
-    /// [`kill_tree`](crate::Child::kill_tree) then [`wait_tree`](crate::Child::wait_tree).
-    ///
-    /// **Once the root has been reaped, the drop does not kill by the root's number, and logs a
-    /// `warn` naming what it skipped.** The root is reaped by [`wait`](crate::Child::wait), by a
-    /// reaper outside the handle, or (on the sync handle) by the spawn itself, which reaps a root
-    /// that has already exited. Nothing pins the number after the reap, so a `killpg` to it, or a
-    /// walk of the process table from it, could hit an unrelated process that reused it. That
-    /// covers a process group, a Unix tree walk, and a macOS fd marker's group and walk; the fd
-    /// marker still sweeps the descendants that hold the marker, which it names by identity. A
-    /// cgroup and a Job Object name their tree without the number, and still kill. A descendant
-    /// that outlived the reaped root keeps running: call [`kill_tree`](crate::Child::kill_tree)
-    /// **before** `wait()` to end it; once it has killed the tree completely, the skip is logged at
-    /// `debug`. A root reaped by someone else is neither killed nor waited for by its number
-    /// either.
-    ///
-    /// **Kernel requirement.** Complete cgroup containment assumes the kernel fix `b69bb476dee9`
-    /// ("cgroup: fix race between fork and cgroup.kill"): mainline 6.14 and later, or a stable
-    /// kernel that carries it (confirmed in 6.1.129, 6.12.16 and 6.13.4; tagged
-    /// `Cc: stable # v5.14+`). On a kernel without it, a child forked while `cgroup.kill` runs can
-    /// escape the kill and keep running. [`wait_tree`](crate::Child::wait_tree) then waits for it,
-    /// and so does the sync drop, which waits for that child's whole life. A bare async drop leaves
-    /// the leaf behind with its warning. Neither case raises an event cosca could re-kill on:
-    /// `populated` does not change, and a fork writes no file. cosca does not probe for the fix.
-    ///
-    /// **Where the two handles differ is the wait.** The sync [`Child`](crate::Child) blocks
-    /// until the root has exited, so after `drop` returns the child is gone. The async
-    /// [`Child`](crate::tokio::Child) does bounded work only, because a destructor cannot be
-    /// awaited or cancelled and parking a runtime worker in one stops every task on it: it sends
-    /// the signals, writes `cgroup.kill`, tries `rmdir` (and, if the leaf is still populated,
-    /// writes `cgroup.kill` once more and tries `rmdir` once more), and returns. It never waits for
-    /// the root or for a drain.
-    ///
-    /// - A root still running when the async handle drops is left to tokio's own drop of its
-    ///   `Child`, which reaps it best-effort: an in-drop `try_wait`, then tokio's orphan queue,
-    ///   which drains only while some tokio runtime runs. cosca keeps no reaper of its own.
-    /// - A cgroup leaf that has not drained is **left behind**, and a warning names it, if the
-    ///   drop killed it or was armed to. [`wait_tree`](crate::tokio::Child::wait_tree) awaited
-    ///   before the drop is how to have the leaf removed.
-    ///
-    /// Code that must know the child is gone should `kill` and `await`
-    /// [`wait`](crate::tokio::Child::wait) rather than rely on the drop. See that `Drop`'s
-    /// rustdoc, which also covers a process that forks without `exec`.
-    ///
-    /// An elevated child this process cannot signal is the one case the sync handle does not
-    /// block on: the teardown gives up rather than wait forever, and the child is left running.
-    /// So is an elevated child behind a front outside a cgroup (see
-    /// [`Child::kill`](crate::Child::kill)), which the sync drop also leaves unreaped. Each logs a
-    /// `warn` naming it. The rest of the tree is still killed: the drop's cgroup leaf stays armed, and
-    /// its `cgroup.kill` ends what it holds, a front among it. The sync drop waits for that and
-    /// reaps a front that has exited or that the leaf held, and warns of one still running outside
-    /// it; the async drop waits for
-    /// nothing, and leaves the front unreaped.
+    /// An elevated child this process cannot signal is the one case neither handle blocks on: the
+    /// teardown gives up rather than wait forever, and the child is left running. So is an elevated
+    /// child behind a front outside a cgroup (see [`Child::kill`](crate::Child::kill)), which the
+    /// drop also leaves unreaped. Each logs a `warn` naming it. The rest of the tree is still
+    /// killed: the drop's cgroup leaf stays armed, and its `cgroup.kill` ends what it holds, a front
+    /// among it. The sync drop waits for that and reaps a front that has exited or that the leaf
+    /// held, and warns of one still running outside it. The async drop reaps a front the leaf's kill
+    /// is shown to have reached, as it reaps any killed root; it waits for no other front, and
+    /// tokio reaps that one once it exits.
     ///
     /// **Under [`CgroupV2`](crate::Containment::CgroupV2), opting out can leave the tree's cgroup
     /// leaf behind.** Dropping the handle still removes the leaf if the whole tree has exited,
@@ -629,10 +570,17 @@ impl Command {
     /// available, so dropping or `kill_tree`-ing the child tears down every
     /// descendant. See [`crate::Containment`] for the per-OS mechanisms.
     ///
-    /// # Linux: the child must stay this process's to reap
-    /// Until `spawn` returns, nothing else in the process may reap the child: do not set `SIGCHLD`
-    /// to `SIG_IGN` or run a reaper that calls `waitpid(-1, …)`/`wait()`, since that frees the pid
-    /// for reuse by an unrelated process.
+    /// # A child reaped by something else
+    /// Another reaper in the process (`SIGCHLD` set to `SIG_IGN`, `waitpid(-1, …)`) may reap the
+    /// child. A cgroup kill stays exact (only the exit status is lost), and so, on Linux 6.9+, does a
+    /// process group's, through the root's pidfd (not yet an async handle's whose `wait`, `try_wait`
+    /// or `kill` saw the reap: it no longer holds the pidfd). Below 6.9 and on macOS, kills named by
+    /// the root's pid (a process group; a macOS fd marker's group and walk) are skipped on evidence
+    /// of a foreign reap, and
+    /// [`kill_tree`](crate::Child::kill_tree), [`terminate_tree`](crate::Child::terminate_tree) and
+    /// [`graceful_shutdown_tree`](crate::Child::graceful_shutdown_tree) return
+    /// [`Error::Unassessable`](crate::error::Error::Unassessable); see `kill_tree` for the rest.
+    /// macOS has no pidfd, so cosca has no exact kill of the root there.
     ///
     /// # Linux: an elevated child behind a front
     /// A `sudo` or `doas` front in a cgroup is killed through the cgroup alone, and whether that kill
