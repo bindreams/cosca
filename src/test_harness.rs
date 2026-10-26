@@ -68,3 +68,8 @@ pub const UID_SWITCH: skuld::Label;
 /// Selects the tests that gain real administrator or root privileges (the `ELEVATION` group).
 #[skuld::label]
 pub const ELEVATION: skuld::Label;
+
+/// Selects the `PIDFD_GROUP_SIGNAL` group's tests: those that need Linux 6.9+, whose
+/// `pidfd_send_signal` signals a whole process group through its leader's pidfd.
+#[skuld::label]
+pub const PIDFD_GROUP_SIGNAL: skuld::Label;

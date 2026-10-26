@@ -803,6 +803,8 @@ fn check_matrix(mechanisms: &[Mechanism]) {
 /// without `anchor_present`.
 #[skuld::test]
 fn tree_paths_send_nothing_by_the_root_number_after_a_reap() {
+    #[cfg(target_os = "linux")]
+    let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     check_matrix(&[
         Mechanism::Group,
         Mechanism::TreeWalk,

@@ -101,6 +101,8 @@ mod linux {
     /// Mutant: `Unknown` is taken as `Reaped` (no root kill, and the log names no `Unknown`).
     #[skuld::test]
     fn a_failed_root_peek_skips_number_named_channels_and_still_kills_the_root() {
+        #[cfg(target_os = "linux")]
+        let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
         crate::log_capture::install();
         let recorder = record_kill_group();
         let (child, writer) = session_blocker();
@@ -247,7 +249,7 @@ mod linux {
 
         let skipped = child
             .attached
-            .hard_kill_marking_unless_reaped(&view, &killed)
+            .hard_kill_marking_unless_reaped(&view, &killed, &crate::containment::GroupRoot::trusted_for_test())
             .expect("a skip is not an error");
 
         assert!(skipped.is_some(), "the number-named kill must be skipped");

@@ -1250,6 +1250,7 @@ fn reuser_token(child: &crate::tokio::Child, same_tick: bool) -> StartToken {
 /// kept (a debug panic on the later-tick reuse); `killpg` sent; the decision taken on the number
 /// alone (the same-tick reuse reads as the root).
 fn kill_tree_after_a_foreign_reap_and_reuse(same_tick: bool) {
+    let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     runtime().block_on(async {
         crate::log_capture::install();
         let recorder = crate::containment::unix::fault::record_kill_group();
@@ -1300,6 +1301,7 @@ in_fresh_pid_ns!(
 
 /// `terminate_tree`'s twin. Same mutants.
 fn terminate_tree_after_a_foreign_reap_and_reuse_body() {
+    let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     runtime().block_on(async {
         crate::log_capture::install();
         let recorder = crate::containment::unix::fault::record_term_group();
@@ -1495,6 +1497,7 @@ in_fresh_pid_ns!(
 
 /// The sync `graceful_shutdown_tree_after_a_foreign_reap_and_reuse_body`'s twin. Same mutant.
 fn graceful_shutdown_tree_after_a_foreign_reap_and_reuse_body() {
+    let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     runtime().block_on(async {
         crate::log_capture::install();
         let killed = crate::containment::unix::fault::record_kill_group();

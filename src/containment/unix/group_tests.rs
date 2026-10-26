@@ -131,7 +131,14 @@ fn state_of_an_owned_group_is_cleared_and_the_signal_was_real() {
     await_member_ready(&mut child);
     let pgid = child.id() as i32;
     assert!(
-        matches!(state(pgid, Signal::SIGKILL), GroupState::Cleared),
+        matches!(
+            state(
+                pgid,
+                Signal::SIGKILL,
+                &crate::containment::GroupRoot::trusted_for_test()
+            ),
+            GroupState::Cleared
+        ),
         "a group we own must never report refusers"
     );
     let status = child.wait().expect("wait after state()'s own SIGKILL");
@@ -154,7 +161,14 @@ fn state_of_an_all_zombie_group_is_cleared() {
     let pid = child.id();
     await_zombie(pid);
     assert!(
-        matches!(state(pid as i32, Signal::SIGKILL), GroupState::Cleared),
+        matches!(
+            state(
+                pid as i32,
+                Signal::SIGKILL,
+                &crate::containment::GroupRoot::trusted_for_test()
+            ),
+            GroupState::Cleared
+        ),
         "a group holding only a zombie has nothing left to kill"
     );
     let mut child = child;
@@ -302,7 +316,14 @@ fn term_group_probe_reports_pid_1_as_a_refuser_unless_reachable() {
     // permission check — this is the independent oracle, a syscall issued directly by the
     // test, not a call into any function this plan adds or modifies.
     let reachable = unsafe { libc::kill(1, 0) } == 0;
-    match (state(pgid, Signal::SIGTERM), reachable) {
+    match (
+        state(
+            pgid,
+            Signal::SIGTERM,
+            &crate::containment::GroupRoot::trusted_for_test(),
+        ),
+        reachable,
+    ) {
         (GroupState::Refused { refused, .. }, false) => {
             assert!(
                 refused.contains(&1),
@@ -347,7 +368,8 @@ fn a_refused_pidfd_open_falls_back_to_kill_naming_group_teardown() {
     let mark = crate::log_capture::mark();
 
     let forced = crate::wait::backend::fault::force_pidfd_open_errno_once(rustix::io::Errno::PERM);
-    let reached = super::check_or_signal_linux_sigkill(child.pid(), id);
+    let reached =
+        super::check_or_signal_linux_sigkill(child.pid(), id, &crate::containment::GroupRoot::trusted_for_test());
     drop(forced);
 
     assert!(matches!(reached, super::Reached::Yes), "got {reached:?}");
@@ -382,7 +404,8 @@ fn a_transient_pidfd_open_failure_falls_back_to_kill_naming_the_syscall() {
     let mark = crate::log_capture::mark();
 
     let forced = crate::wait::backend::fault::force_pidfd_open_errno_once(rustix::io::Errno::MFILE);
-    let reached = super::check_or_signal_linux_sigkill(child.pid(), id);
+    let reached =
+        super::check_or_signal_linux_sigkill(child.pid(), id, &crate::containment::GroupRoot::trusted_for_test());
     drop(forced);
 
     assert!(matches!(reached, super::Reached::Yes), "got {reached:?}");
@@ -391,6 +414,59 @@ fn a_transient_pidfd_open_failure_falls_back_to_kill_naming_the_syscall() {
     assert_eq!(lines[0].0, log::Level::Debug);
     assert!(lines[0].1.contains("pidfd_open: Too many open files"), "{lines:?}");
     drop(gate_w);
+}
+
+/// A member whose `pidfd_open` fails (`EMFILE`) is resent its kill by its pid only right after a
+/// check of the root, and not at all when that check fails. Mutants: "the by-number fallback skips
+/// the root's check", "the resend by number is not made" (the member then ends at its gate's EOF,
+/// unkilled).
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn the_by_number_fallback_resends_only_after_a_check_of_the_root() {
+    use crate::containment::cgroup::test_support::fork_running;
+    use crate::send_log::{Capture, GroupStep, Route};
+    use std::os::fd::AsRawFd as _;
+
+    let (gate_r, gate_w) = std::io::pipe().expect("pipe");
+    let (gate_r_fd, gate_w_fd) = (gate_r.as_raw_fd(), gate_w.as_raw_fd());
+    // Waits until the test's end of the gate closes, then exits.
+    let child = fork_running(|| {
+        let mut byte = 0u8;
+        // SAFETY: async-signal-safe syscalls on fds this process holds.
+        unsafe {
+            libc::close(gate_w_fd);
+            while libc::read(gate_r_fd, (&raw mut byte).cast(), 1) != 0 {}
+        }
+    });
+    let id = ProcessId::of(child.pid()).found().expect("the live child resolves");
+    let resend = |check: &dyn Fn() -> Result<(), String>| {
+        let root = crate::containment::GroupRoot::new(None, check);
+        let capture = Capture::start();
+        let forced = crate::wait::backend::fault::force_pidfd_open_errno_once(rustix::io::Errno::MFILE);
+        let reached = super::check_or_signal_linux_sigkill(child.pid(), id, &root);
+        drop(forced);
+        (reached, capture.group_steps())
+    };
+
+    let (refused, refused_steps) = resend(&|| Err("the root was reaped elsewhere".to_owned()));
+    let (sent, sent_steps) = resend(&|| Ok(()));
+    drop(gate_w);
+
+    assert!(matches!(refused, super::Reached::Unknown), "got {refused:?}");
+    assert_eq!(refused_steps, [GroupStep::Check], "nothing was resent");
+    assert!(matches!(sent, super::Reached::Yes), "got {sent:?}");
+    assert_eq!(
+        sent_steps,
+        [
+            GroupStep::Check,
+            GroupStep::Member(Route::Number, child.pid(), libc::SIGKILL)
+        ]
+    );
+    let status = crate::containment::cgroup::test_support::reap_status(child.defuse());
+    assert!(
+        libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL,
+        "the resend killed the member: status {status:#x}"
+    );
 }
 
 /// A member that is a live non-leader thread is `Unknown`, with a warn naming that cause, and is
@@ -419,7 +495,8 @@ fn a_live_non_leader_thread_member_is_unknown_and_never_falls_back_to_kill() {
     let mark = crate::log_capture::mark();
 
     let forced = crate::wait::backend::fault::force_pidfd_open_errno_once(rustix::io::Errno::NOENT);
-    let reached = super::check_or_signal_linux_sigkill(child.pid(), id);
+    let reached =
+        super::check_or_signal_linux_sigkill(child.pid(), id, &crate::containment::GroupRoot::trusted_for_test());
     drop(forced);
 
     assert!(matches!(reached, super::Reached::Unknown), "got {reached:?}");

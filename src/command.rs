@@ -489,7 +489,16 @@ impl Command {
     /// [`kill_tree`](crate::Child::kill_tree) then [`wait_tree`](crate::Child::wait_tree).
     ///
     /// **Once the root has been reaped, the drop does not kill by the root's number, and logs a
-    /// `warn` naming what it skipped.** The root is reaped by [`wait`](crate::Child::wait), by a
+    /// `warn` naming what it skipped.** On Linux 6.9+ a process group is the exception: the root's
+    /// pidfd names the group exactly, whoever reaped the root, so the drop kills the group while it
+    /// has a member left, and sends nothing and logs no skipped kill once it has none (the async
+    /// drop after a foreign reap still warns that it forgot tokio's `Child`). A root whose
+    /// handle cannot say whether it was reaped has its group killed the same way while the group has
+    /// a member. Not yet for an async handle whose `wait`, `try_wait` or `kill` saw the root reaped
+    /// elsewhere: it no longer holds the root's pidfd, so it treats the group as below 6.9. The rest
+    /// of this paragraph is about other mechanisms, kernels before 6.9 and macOS.
+    ///
+    /// The root is reaped by [`wait`](crate::Child::wait), by a
     /// reaper outside the handle, or (on the sync handle) by the spawn itself, which reaps a root
     /// that has already exited. Nothing pins the number after the reap, so a `killpg` to it, or a
     /// walk of the process table from it, could hit an unrelated process that reused it. That
@@ -503,8 +512,8 @@ impl Command {
     /// longer reading as the root. If the handle cannot say (a failed peek), the same kills are
     /// skipped and a warning says so; the root itself is still killed through its handle. This is
     /// decided on one look at the root, as is the cleanup of an elevated spawn whose password could
-    /// not be written: a reap by another reaper after it is not seen, and a kill by the number then
-    /// goes to a number another process may hold.
+    /// not be written. Each send by the group's number after that look checks the root again, as
+    /// for [`kill_tree`](crate::Child::kill_tree).
     ///
     /// **On macOS, a root whose zombie launchd holds** (its tracer died, so this process no longer
     /// pins its pid) is neither signalled, waited for nor reaped by the drop, which logs one `warn`
@@ -563,10 +572,12 @@ impl Command {
     ///
     /// # A child reaped by something else
     /// Another reaper in the process (`SIGCHLD` set to `SIG_IGN`, `waitpid(-1, …)`) may reap the
-    /// child. A cgroup kill stays exact (only the exit status is lost). Kills named by the root's pid
-    /// (a process group; a macOS fd marker's group and walk) are skipped on evidence of a foreign
-    /// reap, and [`kill_tree`](crate::Child::kill_tree),
-    /// [`terminate_tree`](crate::Child::terminate_tree) and
+    /// child. A cgroup kill stays exact (only the exit status is lost), and so, on Linux 6.9+, does a
+    /// process group's, through the root's pidfd (not yet an async handle's whose `wait`, `try_wait`
+    /// or `kill` saw the reap: it no longer holds the pidfd). Below 6.9 and on macOS, kills named by
+    /// the root's pid (a process group; a macOS fd marker's group and walk) are skipped on evidence
+    /// of a foreign reap, and
+    /// [`kill_tree`](crate::Child::kill_tree), [`terminate_tree`](crate::Child::terminate_tree) and
     /// [`graceful_shutdown_tree`](crate::Child::graceful_shutdown_tree) return
     /// [`Error::Unassessable`](crate::error::Error::Unassessable); see `kill_tree` for the rest.
     /// macOS has no pidfd, so cosca has no exact kill of the root there.

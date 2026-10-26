@@ -624,7 +624,7 @@ fn hard_kill_propagates_a_kill_the_kernel_refused() {
 
     let attached = crate::containment::Attached::Cgroup(leaf);
     assert!(
-        attached.hard_kill().is_err(),
+        attached.hard_kill(&crate::containment::GroupRoot::none()).is_err(),
         "Attached::Cgroup must propagate like every sibling arm; swallowing it makes \
          kill_tree() report a completed teardown over a live tree"
     );
@@ -668,10 +668,10 @@ fn terminate_reads_an_already_removed_leaf_as_a_completed_teardown() {
 
     let attached = crate::containment::Attached::Cgroup(leaf);
     assert!(
-        attached.terminate(0).is_ok(),
+        attached.terminate(0, &crate::containment::GroupRoot::none()).is_ok(),
         "terminate and hard_kill must agree about an already-gone leaf"
     );
-    assert!(attached.hard_kill().is_ok());
+    assert!(attached.hard_kill(&crate::containment::GroupRoot::none()).is_ok());
 }
 
 // Drop's leaf-removal reporting -----
@@ -744,8 +744,15 @@ fn drop_kills_through_a_leaf_unless_the_child_provably_never_entered() {
             );
             assert!(!leaf.holds_spawn_resources());
         }
+        // This process stands in for the child that reported, and is no child of its own, so the
+        // abandoned spawn's cleanup takes it for one reaped elsewhere and kills the group it
+        // leads (on Linux 6.9+, through its pidfd): this test's own, under nextest. The group is
+        // reported gone instead.
+        let gone = matches!(report, PlacementReport::WriteFailed(_))
+            .then(crate::containment::cgroup::fault::force_group_kill_gone);
         let mark = crate::log_capture::mark();
         drop(leaf);
+        drop(gone);
 
         assert_eq!(
             leaf_path.join("cgroup.kill").exists(),

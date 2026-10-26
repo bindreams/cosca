@@ -664,6 +664,9 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                     child_fate,
                 ));
             }
+            // Linux 6.9+: the group the root may have left members in, whoever reaped the root.
+            #[cfg(target_os = "linux")]
+            crate::child::spawn::kill_group_before_teardown(&prepared, handle, &mut why);
             // Linux: a failed check says nothing about the child, and its pidfd pins it whatever
             // the peek said, so it is killed and reaped through the pidfd, as the sync spawn does.
             #[cfg(target_os = "linux")]
@@ -995,6 +998,10 @@ mod slow_teardown_tests;
 #[cfg(all(test, target_os = "macos"))]
 #[path = "spawn/slow_teardown_macos_tests.rs"]
 mod slow_teardown_macos_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "spawn/identity_group_tests.rs"]
+mod identity_group_tests;
 
 /// The fate of a child a failed tokio spawn abandoned with no handle on it (see
 /// [`warn_for_abandoned`]). Linux's handshake holds a pidfd on it, and answers itself.

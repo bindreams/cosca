@@ -726,9 +726,20 @@ pub(crate) fn take_force_group_kill_denied() -> bool {
     FORCE_GROUP_KILL_DENIED.with(|f| f.replace(false))
 }
 
-/// Answer the NEXT abandoned child's group kill with `ESRCH`, as for a group with no member left.
-pub(crate) fn set_force_group_kill_gone(on: bool) {
-    FORCE_GROUP_KILL_GONE.with(|f| f.set(on));
+/// While the guard lives, answer the NEXT abandoned child's group kill with `ESRCH`, as for a group
+/// with no member left.
+pub(crate) fn force_group_kill_gone() -> GroupKillGone {
+    FORCE_GROUP_KILL_GONE.with(|f| f.set(true));
+    GroupKillGone(())
+}
+
+#[must_use = "the group kill is made again as soon as the guard is dropped"]
+pub(crate) struct GroupKillGone(());
+
+impl Drop for GroupKillGone {
+    fn drop(&mut self) {
+        FORCE_GROUP_KILL_GONE.with(|f| f.set(false));
+    }
 }
 pub(crate) fn take_force_group_kill_gone() -> bool {
     FORCE_GROUP_KILL_GONE.with(|f| f.replace(false))
