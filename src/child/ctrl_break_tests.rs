@@ -198,3 +198,77 @@ fn treewalk_terminate_tree_reaps_the_grandchild() {
         "the root must die to the break"
     );
 }
+
+/// The tree ops from a caller that has a console. `terminate_tree` is asserted sent, then the
+/// root's own handler acks the break (the Win32 return value reports success for an event that
+/// reached nobody). `kill_tree` ends the root, which exits 0 when released, so code 1 is the
+/// kill's. `graceful_shutdown_tree` with no grace escalates, because the root survives its break,
+/// and nothing is left alive.
+#[skuld::test]
+fn tree_graceful_ops_work_from_a_caller_that_has_a_console() {
+    let (child, mut sock) = spawn_root(Handler::Ack, crate::ContainMode::Strongest);
+    assert_eq!(child.containment(), Containment::JobObject);
+    assert_in_our_console(child.id().pid(), "the root");
+    child.terminate_tree().expect("terminate_tree");
+    ctrl_break::assert_break_sent_to(child.id().pid());
+    assert_acked(&mut sock, "the root");
+    kill_tree_release_reap(&child, sock);
+
+    let (child, _sock) = spawn_root(Handler::Ack, crate::ContainMode::Strongest);
+    child
+        .graceful_shutdown_tree(Duration::ZERO)
+        .expect("graceful_shutdown_tree");
+    assert_eq!(
+        child.is_alive(),
+        crate::identity::Liveness::Dead,
+        "a successful graceful_shutdown_tree must leave nothing alive"
+    );
+}
+
+/// The lone ops from a caller that has a console. `terminate` is asserted sent and acked, and the
+/// root survives its break by design. `graceful_shutdown` with no grace then escalates, so exit
+/// code 1 is the escalation's kill, and a later `kill` of the dead child is `Ok`.
+#[skuld::test]
+fn lone_graceful_ops_work_from_a_caller_that_has_a_console() {
+    let (child, mut sock) = spawn_root(Handler::Ack, crate::ContainMode::Strongest);
+    assert_eq!(child.graceful_mechanism(), GracefulMechanism::ConsoleGroup);
+    assert_in_our_console(child.id().pid(), "the root");
+    child.terminate().expect("terminate");
+    ctrl_break::assert_break_sent_to(child.id().pid());
+    assert_acked(&mut sock, "the root");
+    assert_eq!(
+        child.is_alive(),
+        crate::identity::Liveness::Alive,
+        "the root handles the break and keeps running"
+    );
+    let status = child.graceful_shutdown(Duration::ZERO).expect("graceful_shutdown");
+    assert_eq!(status.code(), Some(1), "the escalation's kill, got {status:?}");
+    assert_eq!(child.is_alive(), crate::identity::Liveness::Dead);
+    child.kill().expect("killing a dead child is Ok");
+}
+
+/// A nested contained child owns no tree and leads a console process group of its own. A nested
+/// root ([`ctrl_break::nested`]) spawns one and asserts that `terminate` sends it the break and its
+/// own handler acks it, and that `terminate_tree` is `Unsupported`. That root runs in a process of
+/// its own so it is a contained member, which is what makes its spawn nested.
+#[skuld::test]
+fn nested_delegated_child_can_be_gracefully_terminated() {
+    let (listener, addr) = crate::test_child::registration_rendezvous();
+    let mut cmd = crate::Command::new();
+    cmd.executable(std::env::current_exe().expect("current_exe"))
+        .args(ctrl_break::nested::root_argv())
+        .env(ctrl_break::nested::ADDR_ENV, &addr)
+        .env(crate::test_child::ack::ACK_ENV, "1");
+    crate::test_reexec::scrub_env(|var| _ = cmd.env_remove(var));
+    cmd.contain();
+    let root = cmd.spawn().expect("spawn the nested root");
+    let mut sock = crate::test_child::accept_or_die(&listener, root.id());
+    let mut report = String::new();
+    sock.read_to_string(&mut report).expect("read the report");
+    let status = root.wait().expect("reap the nested root");
+    assert!(
+        status.success(),
+        "the nested root failed: {status:?}, report: {report:?}"
+    );
+    assert_eq!(report, ctrl_break::nested::DONE, "the nested root did not finish");
+}

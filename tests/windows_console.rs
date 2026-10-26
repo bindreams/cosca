@@ -220,43 +220,6 @@ fn tree_graceful_ops_report_no_console_from_a_console_less_caller() {
 }
 
 #[cfg(windows)]
-#[skuld::test]
-fn tree_graceful_ops_work_from_a_caller_that_has_a_console() {
-    // Positive control. `terminate_break=1` is load-bearing: the child acknowledges the
-    // CTRL_BREAK over its own socket, so this cannot pass on a return code alone —
-    // `GenerateConsoleCtrlEvent` reports success even when it delivers nothing.
-    let r = run_probe(false);
-    assert_eq!(field(&r, "console"), "1", "{r}");
-    assert_eq!(field(&r, "c1_in_console"), "1", "the root must share our console: {r}");
-    assert_eq!(field(&r, "containment"), "job", "{r}");
-    assert_eq!(field(&r, "terminate_tree"), "Ok", "{r}");
-    assert_eq!(
-        field(&r, "terminate_break"),
-        "1",
-        "the child must receive CTRL_BREAK: {r}"
-    );
-    assert_eq!(field(&r, "graceful"), "Ok", "{r}");
-    assert_eq!(field(&r, "kill_tree"), "Ok", "{r}");
-    assert_eq!(
-        field(&r, "acker1_exit"),
-        "1",
-        "kill_tree must kill the root, not leave it to exit when released: {r}"
-    );
-    assert_eq!(
-        field(&r, "graceful_cleanup"),
-        "Skipped",
-        "a successful graceful needs no sweep: {r}"
-    );
-    // Independent of the function's own word for it: the tree is actually gone. The acker
-    // ignores CTRL_BREAK, so only the escalation can have killed it.
-    assert_eq!(
-        field(&r, "alive_after_graceful"),
-        "dead",
-        "a successful graceful_shutdown_tree must leave nothing alive: {r}"
-    );
-}
-
-#[cfg(windows)]
 /// Sibling of [`run_probe`] driving the `report-console-lone` mode — the LONE graceful ops
 /// (`terminate` / `graceful_shutdown`) against a contained root, instead of the tree ops. Same
 /// direct-launch discipline and same connect-before-work EOF guarantee; see [`run_probe`].
@@ -317,30 +280,6 @@ fn lone_graceful_ops_report_no_console_from_a_console_less_caller() {
         "graceful_shutdown must fail before signalling, never after hard-killing: {r}"
     );
     assert_eq!(field(&r, "cleanup"), "Ok", "hard teardown needs no console: {r}");
-}
-
-#[cfg(windows)]
-#[skuld::test]
-fn lone_graceful_ops_work_from_a_caller_that_has_a_console() {
-    // Positive control. `break=1` is load-bearing: the child acknowledges the CTRL_BREAK over
-    // its own socket, so this cannot pass on a return code alone. `graceful_code=1` names the
-    // escalation's exit code — the acker survives its break, so ZERO grace escalates — and a
-    // build that escalated nothing would report a different code and `alive_after_graceful=alive`.
-    let r = run_lone_probe(false);
-    assert_eq!(field(&r, "console"), "1", "{r}");
-    assert_eq!(field(&r, "c_in_console"), "1", "the child must share our console: {r}");
-    assert_eq!(field(&r, "mechanism"), "console-group", "{r}");
-    assert_eq!(field(&r, "terminate"), "Ok", "{r}");
-    assert_eq!(
-        field(&r, "alive_after_terminate"),
-        "alive",
-        "the acker handles the break and keeps running: {r}"
-    );
-    assert_eq!(field(&r, "break"), "1", "the child must receive CTRL_BREAK: {r}");
-    assert_eq!(field(&r, "graceful"), "Ok", "{r}");
-    assert_eq!(field(&r, "graceful_code"), "1", "the escalation's kill: {r}");
-    assert_eq!(field(&r, "alive_after_graceful"), "dead", "{r}");
-    assert_eq!(field(&r, "cleanup"), "Ok", "{r}");
 }
 
 #[path = "../src/test_harness.rs"]

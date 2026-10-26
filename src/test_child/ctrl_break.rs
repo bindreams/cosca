@@ -12,6 +12,8 @@ use std::net::{TcpListener, TcpStream};
 
 use super::{accept_or_die, ack, fixture_argv};
 
+pub(crate) mod nested;
+
 /// The fully-qualified libtest path of [`fixture_ctrl_break_member`].
 pub(crate) const MEMBER_TEST: &str = "test_child::ctrl_break::fixture_ctrl_break_member";
 
