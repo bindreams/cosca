@@ -18,8 +18,8 @@
 //! - `report-cwd`: prints `cwd=` and this process's cwd; the long-path-aware child.
 //! - `subst-cwd`, `verbatim-null` and `report-cwd-final`: see [`null_cwd`].
 //! - `long-image`: see [`long_image`]; this binary is its long-path-aware half.
-//! - `with-env-block` and `full-path`: see `env_block` and `full_path`; `with-env-block` starts
-//!   this binary as the child, so `full-path` measures a long-path-aware process.
+//! - `with-env-block` and `full-path`: see `env_block` and `full_path`; the child is this binary, so
+//!   `full-path` measures a long-path-aware process.
 //!
 //! A `[[bin]]` cannot be `cfg`-ed out, so off Windows it exits 1.
 

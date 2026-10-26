@@ -154,10 +154,8 @@ pub fn run(row: &Row, render: &Render, drives: &[(char, char)]) {
 /// `drives`: each `(letter, placeholder)` pair prints the drive `letter:` as `<P>:`, or `<p>:` for a
 /// lowercase letter, so two drives never print alike and a lowercase one stays visible.
 ///
-/// `bin` is the testbin that launches the child and is the child (`with-env-block` starts its own
-/// image): `cosca_testbin`, or `cosca_testbin_cwd` for a long-path-aware child. The child's
-/// `RtlAreLongPathsEnabled` must equal `long_paths`, which fails the row if a manifest is missing or
-/// the policy differs from what the caller read.
+/// `bin` both launches and is the child (`with-env-block` starts its own image). The child's
+/// `RtlAreLongPathsEnabled` must equal `long_paths`.
 pub fn run_in(id: &str, bin: &str, long_paths: bool, row: &Row, render: &Render, drives: &[(char, char)]) {
     let mut cmd = Command::new(bin);
     cmd.arg("with-env-block");
@@ -228,8 +226,16 @@ pub fn run_in(id: &str, bin: &str, long_paths: bool, row: &Row, render: &Render,
     println!("{id} {k} predicted={}", show(&predicted));
     println!("{id} {k} full={}", show(full));
     println!("{id} {k} var_after={}", show(var_after));
-    println!("{id} {k} var_units={}", var.encode_utf16().count());
-    println!("{id} {k} full_units={}", full.encode_utf16().count());
+    // The lengths of real values only: `<unset>` and `err=<code>` are not paths.
+    let units = |s: &str, real: bool| {
+        if real {
+            s.encode_utf16().count().to_string()
+        } else {
+            "-".to_owned()
+        }
+    };
+    println!("{id} {k} var_units={}", units(var, var != "<unset>"));
+    println!("{id} {k} full_units={}", units(full, !full.starts_with("err=")));
     println!("{id} {k} agrees={}", full == predicted);
 }
 
@@ -280,15 +286,22 @@ fn observed_arm(cwd: &str, name: &str, var: &str, full: &str) -> &'static str {
     let fully_qualified = drive_root_len(var) > 0 || (var.starts_with(r"\\") && !var.starts_with(r"\\.\"));
     if cwd_drive.is_some_and(|c| c.eq_ignore_ascii_case(&name_drive)) && under(full, cwd) {
         "Base"
-    } else if fully_qualified
-        && std::path::Path::new(var).is_dir()
-        && (under(full, var) || full.eq_ignore_ascii_case(var))
-    {
+    } else if fully_qualified && is_dir(var) && (under(full, var) || full.eq_ignore_ascii_case(var)) {
         "Value"
     } else if !under(full, cwd) && starts_with_ignore_case(full, &format!("{name_drive}:\\")) {
         "Root"
     } else {
         "Other"
+    }
+}
+
+/// Whether `path` is an existing directory. Only `NotFound` means it is not one; any other failure
+/// to stat it fails the test.
+fn is_dir(path: &str) -> bool {
+    match std::fs::metadata(path) {
+        Ok(m) => m.is_dir(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => panic!("stat {path:?}: {e}"),
     }
 }
 
@@ -341,7 +354,8 @@ pub fn dir_of_len(base: &str, units: usize) -> String {
     let mut dir = base.to_owned();
     while len(&dir) < units {
         let room = units - len(&dir) - 1;
-        // Never leave a single unit, which a separator alone would take.
+        // A last component needs at least one unit past its separator, and 1 unit would leave 0;
+        // keep >= 2 units remaining.
         let take = if room > 100 && room - 100 < 2 {
             room - 2
         } else {

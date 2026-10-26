@@ -1,6 +1,6 @@
 //! The `full-path <name>` mode: what this process's own `GetFullPathNameW` makes of `name`, from
 //! the cwd and environment block it was started with. Built into `cosca_testbin` and into the
-//! long-path-aware `cosca_testbin_cwd`, so a measurement can name which it ran in.
+//! long-path-aware `cosca_testbin_cwd`.
 
 use std::ffi::OsStr;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
@@ -10,8 +10,7 @@ use windows::Win32::Foundation::{GetLastError, SetLastError, ERROR_ENVVAR_NOT_FO
 use windows::Win32::Storage::FileSystem::GetFullPathNameW;
 use windows::Win32::System::Environment::{GetCurrentDirectoryW, GetEnvironmentVariableW};
 
-/// Prints `long_paths_enabled=` (this process's manifest and the `LongPathsEnabled` policy, as
-/// `RtlAreLongPathsEnabled` reports them), `cwd=` (`GetCurrentDirectoryW`), `var=`
+/// Prints `long_paths_enabled=` (see [`long_paths_enabled`]), `cwd=` (`GetCurrentDirectoryW`), `var=`
 /// (`GetEnvironmentVariableW("=X:")` for `name`'s drive `X:`, or `<unset>`), `full=`
 /// (`GetFullPathNameW(name)`, or `err=<code>`), then `var_after=`, read again after the call.
 pub fn run(name: &str) {

@@ -7,20 +7,10 @@ use crate::common::testbin;
 use crate::provenance::survey_platform;
 use crate::test_groups::{path_probes, Group};
 
-/// M21: `current_dir(\\?\<d>\a.)` where only `<d>\a` exists, so the verbatim name `a.` is absent.
-/// Four routes each run `cosca_testbin cwd-marker`, which reports its cwd and whether it opens the
-/// relative name `cosca-marker`, a file in `<d>\a` and nowhere else: `std` (`std::process::Command`),
-/// `cosca` (an argv-only `cosca::Command`, std's route on `main`), `raw_exe` (`executable()`, the raw
-/// backend) and `create_process` (`cosca_testbin try-cwd`, a bare `CreateProcessW` with that
-/// `lpCurrentDirectory`). The rows around it are controls: the verbatim `\\?\<d>\a` and the plain
-/// `<d>\a.`, which Win32 normalises to `<d>\a`.
-///
-/// A route prints `ok,` and the child's `cwd=` (or `cwd-error=`) and `marker=` lines, `exit=<code>`
-/// for a child that exits nonzero, or `err=<code>` when the spawn fails. `marker=ok` is what shows
-/// that the child's cwd is the directory `a`, not only that it prints a string for it.
-///
-/// Preconditions, asserted: `<d>\a` is a directory holding the marker file and verbatim `a.` does
-/// not exist.
+/// M21: `current_dir(\\?\<d>\a.)` where only `<d>\a` exists, per spawn route (std, argv-only cosca,
+/// raw `executable()`, bare CreateProcessW). The child opens the relative `cosca-marker`, which
+/// exists only in `<d>\a`, so `marker=ok` proves its cwd is `a`, not just that it prints a string.
+/// `verbatim` and `plain_dot` are controls.
 #[skuld::test]
 fn m21_a_verbatim_trailing_dot_current_dir(#[fixture(path_probes)] _group: &Group) {
     survey_platform();
@@ -41,8 +31,7 @@ fn m21_a_verbatim_trailing_dot_current_dir(#[fixture(path_probes)] _group: &Grou
         r"precondition: verbatim <d>\a. does not exist"
     );
     let bin = testbin();
-    // A cosca error that is not an I/O error prints its text, which spells the path with doubled
-    // backslashes.
+    // Non-I/O cosca errors print the path with doubled backslashes.
     let render = Render(vec![(d.clone(), "<d>".into()), (d.replace('\\', r"\\"), "<d>".into())]);
 
     for (key, cwd) in [
@@ -74,7 +63,6 @@ fn m21_a_verbatim_trailing_dot_current_dir(#[fixture(path_probes)] _group: &Grou
                 .map_err(into_io),
         );
 
-        // `try-cwd` prints the child's report and then `ok`, `exit=<code>` or `err=<code>`.
         let mut bare = Command::new(bin);
         bare.args(["try-cwd", &cwd]);
         let out = crate::common::output_locked(&mut bare).expect("spawn the try-cwd probe");
@@ -86,6 +74,7 @@ fn m21_a_verbatim_trailing_dot_current_dir(#[fixture(path_probes)] _group: &Grou
             None => "no output".to_owned(),
         };
 
+        let std_marker_ok = std_col.ends_with("marker=ok");
         for (route, col) in [
             ("std", std_col),
             ("cosca", cosca_col),
@@ -94,6 +83,12 @@ fn m21_a_verbatim_trailing_dot_current_dir(#[fixture(path_probes)] _group: &Grou
         ] {
             println!("M21 {key} {route}={}", render.apply(&col));
         }
+        if key == "verbatim" {
+            assert!(
+                std_marker_ok,
+                "the control: std's route on the existing verbatim directory runs in it"
+            );
+        }
     }
 }
 
@@ -101,7 +96,10 @@ fn m21_a_verbatim_trailing_dot_current_dir(#[fixture(path_probes)] _group: &Grou
 fn finished(run: std::io::Result<(bool, Option<i32>, Vec<u8>)>) -> String {
     match run {
         Ok((true, _, stdout)) => format!("ok,{}", child_report(&String::from_utf8_lossy(&stdout))),
-        Ok((false, code, _)) => format!("exit={code:?}"),
+        Ok((false, code, _)) => match code {
+            Some(code) => format!("exit={code}"),
+            None => "exit=<none>".to_owned(),
+        },
         Err(e) => match e.raw_os_error() {
             Some(code) => format!("err={code}"),
             None => format!("err({:?}: {e})", e.kind()),
@@ -109,7 +107,6 @@ fn finished(run: std::io::Result<(bool, Option<i32>, Vec<u8>)>) -> String {
     }
 }
 
-/// The `cwd=` or `cwd-error=` line and the `marker=` line of a `cwd-marker` child, joined by a comma.
 fn child_report(stdout: &str) -> String {
     let lines: Vec<&str> = stdout
         .lines()
@@ -122,7 +119,6 @@ fn child_report(stdout: &str) -> String {
     }
 }
 
-/// A cosca error as an I/O error: an I/O error as is, any other by its text.
 fn into_io(e: cosca::error::Error) -> std::io::Error {
     match e {
         cosca::error::Error::Io(io) => io,

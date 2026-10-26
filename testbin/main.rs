@@ -398,9 +398,8 @@ fn main() {
             }
         }
         "cwd" => outln!("{}", std::env::current_dir().unwrap().display()),
-        // The cwd (or why it cannot be read) and whether the relative name `cosca-marker`, a file in
-        // the directory the parent meant as the cwd, opens: that is, whether this process's cwd is
-        // that directory.
+        // Opens the relative `cosca-marker` (a file in the directory the parent meant as cwd): proves
+        // the cwd, which a printed path does not.
         "cwd-marker" => {
             match std::env::current_dir() {
                 Ok(p) => outln!("cwd={}", p.display()),

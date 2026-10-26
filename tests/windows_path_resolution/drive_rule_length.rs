@@ -1,6 +1,5 @@
-//! M7b: how long, and of what form, a child's `=X:` value may be for ntdll to use it. M7 found that
-//! a value over `MAX_PATH` is ignored; this finds where the line is. The runner and D1's arms are in
-//! `tests/common/drive_rule.rs`; M7 has the other rows.
+//! M7b: how long, and of what form, a child's `=X:` value may be for ntdll to use it. The runner and
+//! D1's arms are in `tests/common/drive_rule.rs`.
 
 use crate::common::drive_rule::{canonical, dir_of_len, free_drive, run_in, Arm, Cwd, Render, Row, Var};
 use crate::common::testbin;
@@ -10,18 +9,12 @@ use crate::test_groups::{path_probes, Group};
 /// M7b: an `=X:` value naming an existing directory, of exactly 259, 260 and 261 UTF-16 units, and
 /// one spelled `\\.\<T>:\…`, for the names `X:tool` and `X:` (X unmapped, printed `<X>:`). With the
 /// bare name the result is the value, so its length is the value's; with `X:tool` it is five units
-/// more, which tells a limit on the value from a limit on the result. A row prints the arm D1
-/// predicts (`Value`) and the arm observed (`Root` when ntdll falls back to `X:\`, `Error` when
-/// `GetFullPathNameW` fails).
+/// more, which tells a limit on the value from a limit on the result.
 ///
 /// Each row runs twice, in a child without a `longPathAware` manifest (`cosca_testbin`, lines
 /// labelled `M7b unaware`) and in one with it (`cosca_testbin_cwd`, `M7b aware`). Awareness takes
 /// effect only with the machine's `LongPathsEnabled` policy, so the policy is printed too, as
 /// `M7b policy LongPathsEnabled=<value>`; it is read, never changed.
-///
-/// Preconditions, asserted: each value directory has the length its row says; the child runs in the
-/// row's cwd and sees the row's `=X:` value; the `LongPathsEnabled` policy is 1; the unaware child
-/// reports long paths off and the aware one on. The letter is searched in `G..=L`, as M7's.
 #[skuld::test]
 fn m7b_the_length_and_form_of_a_childs_drive_directory_value(#[fixture(path_probes)] _group: &Group) {
     survey_platform();
@@ -34,8 +27,6 @@ fn m7b_the_length_and_form_of_a_childs_drive_directory_value(#[fixture(path_prob
     let sr = format!("SystemRoot={}", std::env::var("SystemRoot").expect("SystemRoot"));
     let render = Render(vec![(d.clone(), "<d>".into())]);
     let drives = [(letter, 'X')];
-    // `RtlAreLongPathsEnabled` in the child is its manifest AND this policy; without the policy the
-    // `aware` half would run an unaware child under that label.
     let policy = reg_dword(r"SYSTEM\CurrentControlSet\Control\FileSystem", "LongPathsEnabled");
     println!("M7b policy LongPathsEnabled={}", or_missing(policy.clone()));
     assert_eq!(
@@ -48,10 +39,7 @@ fn m7b_the_length_and_form_of_a_childs_drive_directory_value(#[fixture(path_prob
         ("aware", env!("CARGO_BIN_EXE_cosca_testbin_cwd"), true),
     ];
 
-    let sized = |units: usize| {
-        // `dir_of_len` extends its base, so each length gets a base of its own.
-        dir_of_len(&format!(r"{d}\v{units}"), units)
-    };
+    let sized = |units: usize| dir_of_len(&format!(r"{d}\v{units}"), units);
     let values = [
         ("units259", sized(259)),
         ("units260", sized(260)),

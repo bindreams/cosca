@@ -182,9 +182,8 @@ pub fn try_block(entries: &[String]) {
 }
 
 /// `try-cwd <dir>`: run `cosca_testbin cwd-marker` through a bare `CreateProcessW` with `<dir>` as
-/// its `lpCurrentDirectory`. The child prints its report, then this prints `ok`, or `exit=<code>`
-/// if the child exited nonzero; if the call fails it prints `err=<code>` with the Win32 error code
-/// instead.
+/// `lpCurrentDirectory`. After the child's report prints `ok`, `exit=<code>` (nonzero exit) or
+/// `err=<code>` (Win32 error; the call failed).
 pub fn try_cwd(dir: &str) {
     let system_root = format!("SystemRoot={}", std::env::var("SystemRoot").expect("SystemRoot"));
     match create_with_block(&[system_root], "cwd-marker", Some(dir)) {
