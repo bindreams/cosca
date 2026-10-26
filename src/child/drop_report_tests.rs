@@ -73,10 +73,13 @@ fn finish_elevated_with_an_unknown_root_and_a_failed_reap_warns_once() {
     crate::log_capture::install();
     let _recorder = crate::containment::unix::fault::record_kill_group();
     let (child, writer) = session_blocker();
-    // Released once the cleanup's root kill returned, before its reap (the forced failure comes
-    // after the reap).
-    let blocker = crate::child::spawn::fault::release_between_kill_and_wait(writer);
     let pid = child.id().pid();
+    // Released once the cleanup's root kill returned, before its reap (the forced failure comes
+    // after the reap, which records nothing): the root must be a zombie that died of `SIGKILL`.
+    let _released = crate::child::spawn::fault::set_between_kill_and_wait(move || {
+        drop(writer);
+        crate::test_child::assert_zombie_sigkilled("the root", pid);
+    });
     let mark = crate::log_capture::mark();
     let _failed = force_peek_once(Err(std::io::Error::other("forced peek failure")));
     crate::child::spawn::fault::set_force_reap_failure("cosca-unknown-reap-9d1c");
@@ -96,7 +99,6 @@ fn finish_elevated_with_an_unknown_root_and_a_failed_reap_warns_once() {
             && warns[0].contains(&format!("could not reap the killed elevated child pid {pid}")),
         "{warns:?}"
     );
-    blocker.assert_killed();
 }
 
 /// A failed spawn's cleanup whose root kill is refused has not settled the root, so it leaves the
