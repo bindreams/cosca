@@ -236,6 +236,7 @@ pub(crate) fn record_backoff_timer(interval: Duration) {
 }
 
 /// The interval of each backoff timer armed on this thread since the last call, in order.
+#[cfg(feature = "tokio")]
 pub(crate) fn take_backoff_timers() -> Vec<Duration> {
     BACKOFF_TIMERS.with(|t| std::mem::take(&mut *t.borrow_mut()))
 }

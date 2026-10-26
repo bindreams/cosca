@@ -239,14 +239,17 @@ pub(crate) mod seams {
 
     /// The next registration a walk on this thread makes on a tracer is refused with `errno`, as a
     /// kqueue refuses one. The guard clears an unused refusal.
+    #[cfg(feature = "tokio")]
     pub(crate) fn refuse_next_registration(errno: i32) -> RefusedRegistration {
         REFUSED_REGISTRATION.with(|r| r.set(Some(errno)));
         RefusedRegistration(())
     }
 
+    #[cfg(feature = "tokio")]
     #[must_use = "the refusal is cleared as soon as the guard is dropped"]
     pub(crate) struct RefusedRegistration(());
 
+    #[cfg(feature = "tokio")]
     impl Drop for RefusedRegistration {
         fn drop(&mut self) {
             REFUSED_REGISTRATION.with(|r| r.set(None));
