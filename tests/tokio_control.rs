@@ -218,16 +218,16 @@ async fn async_graceful_cancel_mid_grace_leaves_child_owned() {
         // not an assumption about await points) while the future is still parked. The probe is
         // written after the poll, so the child handles a SIGTERM that poll sent, and acks it,
         // before it echoes the probe: with no SIGTERM the first byte back is the echo, and the
-        // assertion fails instead of the read waiting for an ack that never comes. Both bytes are
-        // read, so that order is asserted, not assumed.
+        // assertion fails instead of the read waiting for an ack that never comes. The echo is
+        // read after the ack, so that order is asserted, not assumed; it is read one byte at a
+        // time, so a missing ack fails on the first byte instead of waiting for a second.
         std::io::Write::write_all(&mut sock, b"p").expect("write the probe");
-        let mut reply = [0u8; 2];
-        sock.read_exact(&mut reply)
-            .expect("the SIGTERM ack, then the probe's echo");
-        assert_eq!(
-            &reply, b"Tp",
-            "child must ack the SIGTERM sent by the first poll, then echo the probe"
-        );
+        let mut ack = [0u8; 1];
+        sock.read_exact(&mut ack).expect("SIGTERM ack");
+        assert_eq!(&ack, b"T", "child must ack the SIGTERM sent by the first poll");
+        let mut echo = [0u8; 1];
+        sock.read_exact(&mut echo).expect("the probe's echo");
+        assert_eq!(&echo, b"p", "the probe's echo must follow the ack");
     } // <- future dropped mid-grace here
 
     // is_alive is THE non-escalation discriminator: this child can only die by SIGKILL (its
