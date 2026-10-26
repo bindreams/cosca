@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use super::fixtures::Blocker;
 use crate::test_groups::{tracer_group, Group};
-use crate::test_support::foreign_tracer::{self, EXIT, REAP, STOP};
+use crate::test_support::foreign_tracer::{self, await_blocked_or_finished, Holder, EXIT, REAP, STOP};
 use crate::wait::exit_only::seams::{self as exit_seams, HolderStep};
 use crate::wait::exit_only::Target;
 
@@ -31,49 +31,6 @@ enum Msg {
     Spun(String),
     /// `wait` returned, with the holder's steps.
     Done(std::io::Result<Option<std::process::ExitStatus>>, Vec<HolderStep>),
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum Holder {
-    /// Asleep in a `waitid` that waits.
-    Blocked,
-    Finished,
-}
-
-/// Re-reads `/proc/self/task/<tid>/syscall` until the thread sleeps in a `waitid` without
-/// `WNOHANG`, or is gone. Both are conditions the holder reaches by itself, so the only exit is
-/// the condition; the pauses between reads are a backoff, not a bound. Any other shape of the
-/// file than `running` or `<nr> ...` panics with its text.
-fn await_blocked_or_finished(tid: libc::pid_t) -> Holder {
-    let path = format!("/proc/self/task/{tid}/syscall");
-    let mut pause = std::time::Duration::from_micros(50);
-    loop {
-        match std::fs::read_to_string(&path) {
-            Ok(text) if text.trim() == "running" => {}
-            // `<nr> <a0> <a1> <a2> <a3> <a4> <a5> <sp> <pc>`, or `-1 <sp> <pc>`.
-            Ok(text) => {
-                let mut fields = text.split_whitespace();
-                let nr: libc::c_long = fields
-                    .next()
-                    .and_then(|n| n.parse().ok())
-                    .unwrap_or_else(|| panic!("{path}: no syscall number in {text:?}"));
-                if nr == libc::SYS_waitid {
-                    // `waitid(idtype, id, infop, options, rusage)`: `options` is argument 4.
-                    let options = fields
-                        .nth(3)
-                        .and_then(|o| u64::from_str_radix(o.trim_start_matches("0x"), 16).ok())
-                        .unwrap_or_else(|| panic!("{path}: no waitid options in {text:?}"));
-                    if options & libc::WNOHANG as u64 == 0 {
-                        return Holder::Blocked;
-                    }
-                }
-            }
-            Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => return Holder::Finished,
-            Err(e) => panic!("read {path}: {e}"),
-        }
-        std::thread::sleep(pause);
-        pause = (pause * 2).min(std::time::Duration::from_millis(5));
-    }
 }
 
 /// How the driver waits on the held zombie.

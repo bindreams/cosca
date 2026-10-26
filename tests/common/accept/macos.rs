@@ -10,8 +10,9 @@ use super::{first_ready, notify_armed, Ready, Source, WatchEvent};
 
 pub(super) fn wait(source: Source<'_>, target_pid: u32, also: Option<ProcessId>) -> WatchEvent {
     let source_fd = match source {
-        Source::Listener(l) => l.as_raw_fd(),
-        Source::Stream(s) => s.as_raw_fd(),
+        Source::Listener(l) => Some(l.as_raw_fd()),
+        Source::Stream(s) => Some(s.as_raw_fd()),
+        Source::Never => None,
     };
     let kq = Kqueue::new().expect("kqueue() for the death-watch");
     let also_pid = also.map(|id| id.pid());
@@ -28,14 +29,16 @@ pub(super) fn wait(source: Source<'_>, target_pid: u32, also: Option<ProcessId>)
             )
         })
         .collect();
-    changes.push(KEvent::new(
-        source_fd as usize,
-        EventFilter::EVFILT_READ,
-        EvFlags::EV_ADD | EvFlags::EV_RECEIPT,
-        FilterFlag::empty(),
-        0,
-        0,
-    ));
+    changes.extend(source_fd.map(|fd| {
+        KEvent::new(
+            fd as usize,
+            EventFilter::EVFILT_READ,
+            EvFlags::EV_ADD | EvFlags::EV_RECEIPT,
+            FilterFlag::empty(),
+            0,
+            0,
+        )
+    }));
     let mut receipts = vec![changes[0]; changes.len()];
     kq.kevent(&changes, &mut receipts, None)
         .expect("kevent(EV_ADD) to arm the death-watch and the source watch");

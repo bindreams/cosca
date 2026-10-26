@@ -817,7 +817,7 @@ fn spawn_contained_tree() -> (cosca::Child, std::net::TcpStream) {
     // Accept both connections; keep the grandchild's (tag 'G'). Accepting it is
     // proof the grandchild is alive — no is_alive() race.
     let mut tags = Vec::new();
-    let socks = common::accept_tree(&listener, &report, &mut child, |s| {
+    let socks = common::accept_tree(listener, report, &mut child, |s| {
         let mut tag = [0u8; 1];
         s.read_exact(&mut tag).expect("read tag");
         tags.push(tag[0]);
@@ -874,7 +874,7 @@ fn spawn_contained_echo_tree(kill_on_drop: bool) -> EchoTree {
     // Accept order is not guaranteed, so demux by tag. Both connections being accepted is
     // itself proof both members are alive — no is_alive() race.
     let mut demux = Vec::new();
-    let socks = common::accept_tree(&listener, &report, &mut child, |s| {
+    let socks = common::accept_tree(listener, report, &mut child, |s| {
         let member = common::read_tag_and_pid(s);
         let is_grandchild = member.0 == b'G';
         demux.push(member);
@@ -1093,7 +1093,7 @@ fn spawn_session_tree() -> (cosca::Child, std::net::TcpStream) {
     cmd.env(common::GC_PID_ADDR_ENV, &report_addr);
     let mut child = cmd.spawn().expect("spawn session-contained tree");
     let mut tags = Vec::new();
-    let socks = common::accept_tree(&listener, &report, &mut child, |s| {
+    let socks = common::accept_tree(listener, report, &mut child, |s| {
         let mut tag = [0u8; 1];
         s.read_exact(&mut tag).expect("read tag");
         tags.push(tag[0]);
@@ -1196,7 +1196,7 @@ fn spawn_treewalk_tree() -> (cosca::Child, std::net::TcpStream, std::net::TcpStr
     cmd.env(common::GC_PID_ADDR_ENV, &report_addr);
     let mut child = cmd.spawn().expect("spawn tree-walk-contained tree");
     let mut tags = Vec::new();
-    let socks = common::accept_tree(&listener, &report, &mut child, |s| {
+    let socks = common::accept_tree(listener, report, &mut child, |s| {
         let mut tag = [0u8; 1];
         s.read_exact(&mut tag).expect("read tag");
         tags.push(tag[0]);
@@ -1306,7 +1306,7 @@ fn treewalk_kills_process_group_escapee() {
     assert_eq!(child.containment(), expected);
 
     let mut tags = Vec::new();
-    let socks = common::accept_tree(&listener, &report, &mut child, |s| {
+    let socks = common::accept_tree(listener, report, &mut child, |s| {
         let mut tag = [0u8; 1];
         s.read_exact(&mut tag).expect("read tag");
         tags.push(tag[0]);
