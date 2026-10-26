@@ -26,7 +26,8 @@ env:
   COSCA_TEST_UID_SWITCH: "0"
   # System-affecting groups are off workflow-wide; each lane opts back in on its own steps.
   COSCA_TEST_NAMESPACES: "0"
-  # The tracer tests run in the two tracer steps of the test job below.
+  # The tracer tests run in the two tracer steps of the test job below, and those that also need
+  # `NAMESPACES` in the cgroup lane.
   COSCA_TEST_TRACER: "0"
   # The setuid group runs only where a step provisions a setuid-root helper and opts back in.
   COSCA_TEST_SETUID: "0"
@@ -539,6 +540,8 @@ jobs:
             # The profile is passed explicitly: sudo-rs (Ubuntu 26.04) ignores -E, so no variable survives.
             export COSCA_TEST_CGROUP=1 COSCA_TEST_CGROUP_CONSENT=1
             export COSCA_TEST_NAMESPACES=1 COSCA_TEST_NAMESPACES_CONSENT=1
+            # For the namespace tests that also attach a foreign tracer; no other test here takes it.
+            export COSCA_TEST_TRACER=1 COSCA_TEST_TRACER_CONSENT=1
             status=0
             SKULD_LABELS="cgroup | namespaces" "$0" nextest run --archive-file "$1" --workspace-remap "$PWD" --profile ci-cgroup --no-capture --no-tests=fail -E "binary(cosca) | binary(spawn_io) | binary(tokio_io)" || status=1
             # Hand the target dir back so later steps can write to it.

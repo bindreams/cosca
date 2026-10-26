@@ -1,4 +1,5 @@
-//! `Child::drop` does bounded work only. A real delegated cgroup needs root, so these use
+//! `Child::drop`'s signals and its bounded arms: everything but the armed drop's reap and drain
+//! (`armed_drop_tests.rs`). A real delegated cgroup needs root, so these use
 //! `CgroupLeaf::for_test_at` (real errnos on any Linux host) and `FakeLeaf` (answers `rmdir` as
 //! cgroupfs does).
 
@@ -22,7 +23,7 @@ use crate::containment::cgroup::test_support::alone;
 use crate::test_child::fixture_path;
 
 #[cfg(target_os = "linux")]
-mod linux {
+pub(super) mod linux {
     use std::os::fd::{AsFd, OwnedFd};
 
     use super::Child;
@@ -31,14 +32,20 @@ mod linux {
     use crate::containment::{Attached, Containment};
 
     /// `child`, contained by `leaf` instead of what it spawned with.
-    pub(super) fn contained_by(mut child: Child, leaf: crate::containment::cgroup::CgroupLeaf) -> Child {
+    pub(in crate::tokio::child) fn contained_by(
+        mut child: Child,
+        leaf: crate::containment::cgroup::CgroupLeaf,
+    ) -> Child {
         child.os.attached = Attached::Cgroup(leaf);
         child.containment = Containment::CgroupV2;
         child
     }
 
     /// A `FakeLeaf` whose `rmdir` answers as cgroupfs does, and an entered leaf on it.
-    pub(super) fn fake_leaf(name: &str, populated: bool) -> (FakeLeaf, crate::containment::cgroup::CgroupLeaf) {
+    pub(in crate::tokio::child) fn fake_leaf(
+        name: &str,
+        populated: bool,
+    ) -> (FakeLeaf, crate::containment::cgroup::CgroupLeaf) {
         crate::log_capture::install();
         let fake = FakeLeaf::new(name, populated);
         let (path, events) = (fake.leaf.clone(), fake.events.clone());
@@ -135,7 +142,7 @@ mod linux {
     }
 
     /// The steps `drop` took and the levels of the records naming `needle`.
-    pub(super) fn dropped(child: Child, needle: &str) -> (Vec<String>, Vec<log::Level>) {
+    pub(in crate::tokio::child) fn dropped(child: Child, needle: &str) -> (Vec<String>, Vec<log::Level>) {
         let mark = crate::log_capture::mark();
         leaf_fault::record_leaf_steps();
         drop(child);
@@ -205,9 +212,9 @@ async fn an_async_drop_closes_the_childs_untaken_stdout() {
     assert_eq!(after, -1, "the drop must close the child's untaken stdout");
 }
 
-/// Dropping a live, kill-on-drop root returns, on every platform and whatever contains it: the
-/// drop signals and releases, and waits for nothing. A wait added to `signal_on_drop`, for the
-/// root's exit or for the tree to drain, trips the bounded-section contract here at once.
+/// Dropping a live, kill-on-drop root returns, on every platform: its kill bounds the drop's
+/// wait. A wait added to `signal_on_drop`, for the root's exit or for the tree to drain, trips
+/// the bounded-section contract here at once.
 ///
 /// Mutants: `block_until_exit(id, None)` or `os.attached.wait_drained(None)` added to
 /// `signal_on_drop`.
@@ -307,53 +314,56 @@ async fn a_kill_on_drop_drop_kills_the_root() {
     );
 }
 
-/// The drop runs inside a bounded section, which is what turns a wait added to it into a debug
-/// panic: a hook run by the leaf's `rmdir`, inside the drop, sees it.
+/// The drop's signals run inside a bounded section, which is what turns a wait added to them into a
+/// debug panic: a hook run before the drop's `cgroup.kill` write sees it. So does a disarmed drop's
+/// release, through its `rmdir`. An armed drop's own reap and drain run after the section: its
+/// leaf's `rmdir` is outside it.
+///
+/// Mutants: the section ends before the signals; a disarmed drop leaves it before its release; the
+/// armed drop waits inside it (the bounded contract panics there).
 #[cfg(target_os = "linux")]
 #[skuld::test]
-async fn an_async_drop_runs_inside_a_bounded_section() {
-    crate::tokio::test_runtime::assert_current_thread();
+async fn an_async_drops_signals_and_bounded_release_run_inside_a_bounded_section() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
     use crate::containment::cgroup::fault as leaf_fault;
 
-    let name = "cosca-async-drop-in-section";
-    crate::log_capture::install();
-    let fake = crate::containment::cgroup::test_support::FakeLeaf::new(name, true);
-    let seen = std::rc::Rc::new(std::cell::Cell::new(false));
-    let saw = seen.clone();
-    leaf_fault::set_rmdir_hook(move |_| {
-        saw.set(crate::bounded::in_section());
-        Err(std::io::Error::from_raw_os_error(libc::EBUSY))
-    });
-    let leaf = crate::containment::cgroup::test_support::entered_leaf_at(fake.leaf.clone());
-    let (child, _stdin) = blocker();
-    drop(linux::contained_by(child, leaf));
-    leaf_fault::take_rmdir_hook();
-    assert!(seen.get(), "Child::drop must enter a bounded section");
-    assert!(!crate::bounded::in_section(), "and leave it");
-}
-
-/// A leaf that never drains does not hold the drop: it returns, the leaf stays, and a warning names
-/// it and points at `wait_tree`. A drop that waited for the drain would panic on the debug
-/// contract instead.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-async fn an_async_drop_never_blocks_on_an_undrained_leaf() {
     crate::tokio::test_runtime::assert_current_thread();
-    let name = "cosca-async-drop-undrained";
-    let (fake, leaf) = linux::fake_leaf(name, true);
-    let (child, _stdin) = blocker();
-    let child = linux::contained_by(child, leaf);
-    let mark = crate::log_capture::mark();
-    let (steps, levels) = linux::dropped(child, name);
+    crate::log_capture::install();
+    let in_section_at = |name: &str, detach: bool| {
+        let fake = crate::containment::cgroup::test_support::FakeLeaf::new(name, false);
+        let at_kill = Rc::new(Cell::new(None));
+        let at_rmdir = Rc::new(Cell::new(None));
+        let (kill, rmdir) = (Rc::clone(&at_kill), Rc::clone(&at_rmdir));
+        let _kill = leaf_fault::set_before_kill_write(move || kill.set(Some(crate::bounded::in_section())));
+        let (path, events) = (fake.leaf.clone(), fake.events.clone());
+        leaf_fault::set_rmdir_hook(move |_| {
+            rmdir.set(Some(crate::bounded::in_section()));
+            crate::containment::cgroup::test_support::FakeLeaf::rmdir(&path, &events)
+        });
+        let leaf = crate::containment::cgroup::test_support::entered_leaf_at(fake.leaf.clone());
+        let (child, _stdin) = blocker();
+        let mut child = linux::contained_by(child, leaf);
+        if detach {
+            child.detach();
+        }
+        drop(child);
+        leaf_fault::take_rmdir_hook();
+        (at_kill.get(), at_rmdir.get())
+    };
 
     assert_eq!(
-        steps,
-        ["kill", "rmdir populated 1", "kill"],
-        "tree kill, release, re-fired kill"
+        in_section_at("cosca-async-drop-armed-section", false),
+        (Some(true), Some(false)),
+        "(the armed drop's tree kill, its leaf's rmdir)"
     );
-    assert!(fake.leaf.exists(), "an undrained leaf is left behind");
-    assert_eq!(levels, [log::Level::Warn]);
-    assert!(crate::log_capture::records_since(mark, name)[0].contains("wait_tree"));
+    assert_eq!(
+        in_section_at("cosca-async-drop-detached-section", true),
+        (None, Some(true)),
+        "(no kill, the disarmed release's rmdir)"
+    );
+    assert!(!crate::bounded::in_section(), "the drop leaves the section");
 }
 
 #[cfg(target_os = "linux")]
@@ -482,29 +492,6 @@ async fn a_root_whose_kill_fails_is_handed_off_not_waited_on() {
         linux::Ended::Exited(0),
         "neither the tree kill nor the drop may have signalled the root"
     );
-}
-
-/// The root a drop leaves to tokio is reaped by tokio: the drop killed it and handed tokio's
-/// `Child` its own drop, so tokio's orphan handling owns the reap (principle 3).
-///
-/// Sequenced on the root's pidfd, opened before the drop, so it names that process whatever
-/// happens to its number. The loop yields to the runtime, which does the reaping, and re-checks a
-/// condition that becomes true; its expiry proves nothing. A root that is never reaped hangs it,
-/// which the nextest override on this test turns into a failure.
-///
-/// Mutant: `OsResources::release_without_waiting` forgets the backend instead of dropping it.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-async fn a_dropped_root_left_to_tokio_is_reaped() {
-    let (child, _stdin) = blocker();
-    let root = linux::Pidfd::of(&child);
-    let backend_drops = fault::count_backend_drops();
-    drop(child);
-    // Fails at once for a backend that was forgotten, before the loop could wait on it.
-    assert_eq!(backend_drops.get(), 1, "the drop must hand tokio its own Child to drop");
-    while !root.reaped() {
-        tokio::task::yield_now().await;
-    }
 }
 
 /// A root the drop could not signal is logged, and the drop returns: it does not wait for a root
