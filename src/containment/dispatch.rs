@@ -533,7 +533,7 @@ impl Attached {
             #[cfg(unix)]
             Attached::ProcessGroup(pgid) => crate::containment::unix::term_group(*pgid, root),
             #[cfg(target_os = "linux")]
-            Attached::Cgroup(leaf) => leaf.terminate(),
+            Attached::Cgroup(leaf) => leaf.terminate().map_err(Error::Io),
             #[cfg(windows)]
             Attached::JobObject(_) => crate::containment::windows::terminate(_child_pid),
             #[cfg(target_os = "macos")]
