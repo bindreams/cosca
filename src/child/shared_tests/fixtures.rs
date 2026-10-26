@@ -10,7 +10,7 @@ use crate::child::shared::seams::{self, ForcedWait};
 use crate::child::shared::SharedChild;
 use crate::identity::ProcessId;
 
-/// A running blocker child (see [`crate::test_child::BLOCKER_ARGV`]) adopted into a
+/// A running blocker child (see [`crate::test_child::held_std_killable_blocker`]) adopted into a
 /// [`SharedChild`], and the write end of its stdin. Closing the stdin ends the child.
 pub(super) struct Blocker {
     pub(super) shared: Arc<SharedChild>,
@@ -26,7 +26,7 @@ pub(super) fn spawn_std_blocker() -> (std::process::Child, ChildStdin) {
 pub(super) fn spawn_std_blocker_with(
     configure: impl FnOnce(&mut std::process::Command),
 ) -> (std::process::Child, ChildStdin) {
-    let mut cmd = crate::test_child::held_std_blocker(std::process::Stdio::null());
+    let mut cmd = crate::test_child::held_std_killable_blocker();
     configure(&mut cmd);
     let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn the blocker");
     let stdin = child.stdin.take().expect("piped stdin");

@@ -1,7 +1,9 @@
 //! Test-only record of every signal cosca sends to a process, and how it addressed it.
 //!
-//! An entry is written immediately BEFORE the syscall, whatever the syscall answers: a `kill(2)`
-//! that fails with `ESRCH` still records, so a test sees an attempt that reached the OS.
+//! An entry is written immediately AFTER the syscall, whatever the syscall answers: a `kill(2)`
+//! that fails with `ESRCH` still records, so a test sees an attempt that reached the OS. A send
+//! that was skipped leaves no record, so an entry is evidence the call was made, not that the
+//! signal arrived: a test that needs the effect reads the target's status.
 
 use std::cell::RefCell;
 

@@ -157,6 +157,24 @@ pub(crate) fn held_std_blocker(stdout: std::process::Stdio) -> std::process::Com
     cmd
 }
 
+/// [`held_std_blocker`] with a null stdout, for a test that tells a kill from the child's own exit
+/// by its status. On Windows it is `more.com` (see [`windows_more`]): it exits 0 on EOF, where the
+/// `findstr x` of [`BLOCKER_ARGV`] exits 1, the code `TerminateProcess(_, 1)` reports too, so a
+/// released `findstr` would pass for a killed one.
+pub(crate) fn held_std_killable_blocker() -> std::process::Command {
+    #[cfg(unix)]
+    {
+        held_std_blocker(std::process::Stdio::null())
+    }
+    #[cfg(windows)]
+    {
+        let mut cmd = std::process::Command::new(windows_more());
+        cmd.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null());
+        cmd
+    }
+}
+
 /// A spawned, contained [`BLOCKER_ARGV`] child and the write end of its stdin.
 pub(crate) fn held_contained_blocker(stdout: crate::Stdio) -> (crate::Child, std::io::PipeWriter) {
     let mut cmd = crate::Command::new();

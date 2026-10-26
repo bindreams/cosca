@@ -320,17 +320,30 @@ fn a_sync_drop_of_a_child_the_kernel_reaped_returns() {
     }
     crate::test_child::set_sigchld_ignored(true);
     let (_sibling, _sibling_stdin) = spawn_std_blocker();
+    use std::io::Read as _;
     let mut cmd = crate::Command::new();
-    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
-    // Released once the drop's kill returned: with a kill that sent nothing the child exits on EOF
-    // and the kernel reaps it, so the drop returns and the assertion below fails instead.
+    // Prints `eof` only if `cat` ends of its own accord, as it does on EOF once the writer is
+    // released. The kill ends the shell first; `cat` outlives it until the release, and prints nothing.
+    cmd.args(["sh", "-c", "cat; echo eof"]);
+    // Released once the drop's kill returned. With a kill that sent nothing the shell prints `eof`
+    // and exits, the kernel reaps it, and the drop returns all the same (`ECHILD`): the output is
+    // what shows the kill.
     let (stdin, writer) = crate::test_child::held_writer_stdin();
     let teardown = crate::child::spawn::fault::release_at_drop_kill(writer);
     cmd.stdin(stdin).expect("stdin");
-    cmd.stdout(crate::Stdio::null()).expect("stdout");
-    let child = cmd.spawn().expect("spawn");
+    cmd.stdout(crate::Stdio::pipe()).expect("stdout");
+    let mut child = cmd.spawn().expect("spawn");
+    let mut stdout = child.stdout().expect("piped stdout");
     drop(child);
     teardown.assert_released();
+    let mut printed = Vec::new();
+    stdout
+        .read_to_end(&mut printed)
+        .expect("the pipe ends once `cat` is gone");
+    assert!(
+        printed.is_empty(),
+        "the drop's kill must end the shell first: {printed:?}"
+    );
 }
 
 // Identity: the unique id is checked on every by-pid surface =====

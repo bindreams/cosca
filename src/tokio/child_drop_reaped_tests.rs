@@ -6,8 +6,14 @@
 //! sends it never reaches a real group. The recorder is thread-local and skuld's default
 //! runtime is current-thread, so the drop's kill runs on the recording thread.
 
+#[cfg(target_os = "linux")]
+use super::child_drop_tests::linux::{Ended, Pidfd};
+#[cfg(target_os = "linux")]
+use crate::containment::cgroup::test_support::alone;
 use crate::containment::treewalk::fault::record_walks;
 use crate::containment::unix::fault::record_kill_group;
+#[cfg(target_os = "linux")]
+use crate::test_child::fixture_path;
 #[cfg(target_os = "linux")]
 use crate::test_groups::{cgroup, Group};
 use crate::tokio::child::drop_fault;
@@ -39,6 +45,19 @@ fn session_blocker_cmd() -> Command {
     let mut cmd = session(crate::test_child::BLOCKER_ARGV);
     cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
     cmd
+}
+
+/// What the drop did to a [`session_blocker_cmd`] root, once the drop has run: its stdin is closed
+/// here, so a root nothing killed exits `0`. On Linux the root's status is read through `pidfd`,
+/// opened before the drop, and must be the drop's `SIGKILL` (or a reap that came first, which
+/// leaves none to read). Elsewhere the release only lets the child end.
+#[cfg(target_os = "linux")]
+fn assert_the_drop_killed(root: &Pidfd, stdin: crate::tokio::ChildStdin) {
+    let ended = root.ended_after_closing(stdin);
+    assert!(
+        matches!(ended, Ended::Signalled(libc::SIGKILL) | Ended::ReapedWhileStdinOpen),
+        "the drop must kill the root with SIGKILL, got {ended:?}"
+    );
 }
 
 fn drop_warns_since(mark: usize) -> Vec<(log::Level, String)> {
@@ -86,12 +105,21 @@ async fn dropping_a_waited_on_process_group_child_sends_no_killpg_and_warns_with
 /// root is skipped too.
 #[skuld::test]
 async fn dropping_a_running_process_group_child_still_kills_the_group_and_does_not_warn() {
+    #[cfg(target_os = "linux")]
+    if !alone(fixture_path!(
+        dropping_a_running_process_group_child_still_kills_the_group_and_does_not_warn
+    )) {
+        return;
+    }
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let recorder = record_kill_group();
     let root = drop_fault::record();
-    let child = session(&["sleep", "300"]).spawn().expect("spawn");
+    let mut child = session_blocker_cmd().spawn().expect("spawn");
+    let stdin = child.stdin().expect("stdin pipe");
     let pid = child.id().pid();
+    #[cfg(target_os = "linux")]
+    let pidfd = Pidfd::of(&child);
 
     let mark = crate::log_capture::mark();
     drop(child);
@@ -99,6 +127,11 @@ async fn dropping_a_running_process_group_child_still_kills_the_group_and_does_n
     recorder.assert_killed_only(pid as i32);
     assert_eq!((root.kills(), root.forgets()), (1, 0));
     assert_eq!(drop_warns_since(mark), []);
+    // Released after the drop: the root's stdin never ends it on its own here.
+    #[cfg(target_os = "linux")]
+    assert_the_drop_killed(&pidfd, stdin);
+    #[cfg(not(target_os = "linux"))]
+    drop(stdin);
 }
 
 /// A root that exited but is not reaped is a zombie: it still pins its group number, so the group
@@ -376,12 +409,21 @@ async fn dropping_a_waited_on_child_whose_number_reads_unknown_still_sends_no_ki
 /// Mutant: `Unknown` is treated as reaped.
 #[skuld::test]
 async fn dropping_an_unreaped_child_whose_number_reads_unknown_kills_and_logs_the_failed_read() {
+    #[cfg(target_os = "linux")]
+    if !alone(fixture_path!(
+        dropping_an_unreaped_child_whose_number_reads_unknown_kills_and_logs_the_failed_read
+    )) {
+        return;
+    }
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let recorder = record_kill_group();
     let root = drop_fault::record();
-    let child = session(&["sleep", "300"]).spawn().expect("spawn");
+    let mut child = session_blocker_cmd().spawn().expect("spawn");
+    let stdin = child.stdin().expect("stdin pipe");
     let pid = child.id().pid();
+    #[cfg(target_os = "linux")]
+    let pidfd = Pidfd::of(&child);
     let _unknown = crate::child::fault::force_next_root_read(crate::identity::Resolved::Unknown);
 
     let mark = crate::log_capture::mark();
@@ -393,6 +435,11 @@ async fn dropping_an_unreaped_child_whose_number_reads_unknown_kills_and_logs_th
     let reads = crate::log_capture::records_since_on_current_thread(mark, "could not be read");
     assert_eq!(reads.len(), 1, "{reads:?}");
     assert_eq!(reads[0].0, log::Level::Debug);
+    // Released after the drop: the root's stdin never ends it on its own here.
+    #[cfg(target_os = "linux")]
+    assert_the_drop_killed(&pidfd, stdin);
+    #[cfg(not(target_os = "linux"))]
+    drop(stdin);
 }
 
 /// A `kill_tree` that failed may have left members running, so the drop still warns. Mutant: the
