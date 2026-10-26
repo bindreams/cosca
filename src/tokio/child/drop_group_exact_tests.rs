@@ -54,7 +54,7 @@ fn tear_down(child: crate::tokio::Child, teardown: Teardown) -> Option<String> {
 }
 
 /// 6.9+: a reaped root whose group still has a member: the teardown kills the group through the
-/// root's pidfd. Mutant: "a teardown never signals the group of a reaped root".
+/// root's pidfd.
 async fn kills_the_group_left_behind(reap: Reap, teardown: Teardown) {
     crate::tokio::test_runtime::assert_current_thread();
     let (mut child, member) = root_with_a_member();
@@ -67,7 +67,7 @@ async fn kills_the_group_left_behind(reap: Reap, teardown: Teardown) {
 }
 
 /// Below 6.9 the old behaviour holds: a reaped root's group is sent nothing, and its member lives
-/// on. Mutant: "a refused flag still lets the teardown signal the group".
+/// on.
 async fn below_6_9_sends_nothing_to_the_group(reap: Reap, teardown: Teardown) {
     crate::tokio::test_runtime::assert_current_thread();
     let (mut child, member) = root_with_a_member();
@@ -82,7 +82,7 @@ async fn below_6_9_sends_nothing_to_the_group(reap: Reap, teardown: Teardown) {
 }
 
 /// 6.9+: a reaped root whose group has no member left has no tree left behind: the teardown sends
-/// nothing and reports no skipped kill. Mutant: "an empty group is still a skip".
+/// nothing and reports no skipped kill.
 async fn sends_nothing_to_an_empty_group_and_reports_no_skip(reap: Reap, teardown: Teardown) {
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
@@ -99,10 +99,24 @@ async fn sends_nothing_to_an_empty_group_and_reports_no_skip(reap: Reap, teardow
     if let Some(detail) = detail {
         assert!(!detail.contains("tree was not killed"), "{detail}");
     }
-    // A foreign reap still warns of forgetting tokio's `Child`; no record names a skipped kill.
-    let skips = crate::log_capture::records_since_on_current_thread(mark, "so this drop does not");
-    assert_eq!(skips, [], "nothing was left behind");
+    // Nothing was left behind. A foreign reap still warns of forgetting tokio's `Child`, and of
+    // nothing else.
+    let warns: Vec<String> = crate::log_capture::records_since_on_current_thread(mark, "")
+        .into_iter()
+        .filter(|(level, _)| *level == log::Level::Warn)
+        .map(|(_, text)| text)
+        .collect();
+    match reap {
+        Reap::Own => assert_eq!(warns, Vec::<String>::new(), "nothing was left behind"),
+        Reap::Foreign => assert!(
+            warns.iter().all(|warn| warn.contains(FORGOT_TOKIO_CHILD)),
+            "only the forget of tokio's `Child` is warned of: {warns:?}"
+        ),
+    }
 }
+
+/// What the one warn of a teardown that forgot tokio's `Child` says.
+const FORGOT_TOKIO_CHILD: &str = "forgetting tokio's handle for it leaks";
 
 #[skuld::test]
 async fn a_drop_after_its_own_wait_kills_the_group_left_behind(#[fixture(pidfd_group_signal)] _group: &Group) {
