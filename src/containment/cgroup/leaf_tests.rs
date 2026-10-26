@@ -880,51 +880,54 @@ fn a_disarmed_leaf_whose_tree_was_killed_but_still_refuses_rmdir_is_reported_onc
 }
 
 /// A SIGTERM is catchable, so `terminate_tree()` proves no teardown: a disarmed leaf whose tree
-/// ignored it is a live opted-out tree keeping its leaf, reported at `debug`, not a leak.
+/// ignored a SIGTERM that was sent is a live opted-out tree keeping its leaf, reported at `debug`,
+/// not a leak. Mutant for the premise: "`terminate` sends nothing" (the SIGTERM assertion fails).
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn a_disarmed_leaf_whose_tree_survived_terminate_is_not_reported_as_a_leak() {
-    use std::os::fd::AsRawFd;
+fn a_disarmed_leaf_whose_tree_survived_terminate_is_not_reported_as_a_leak(#[fixture(cgroup)] _group: &Group) {
+    use std::io::Read as _;
 
     crate::log_capture::install();
-    let dir = tempfile::tempdir().expect("tempdir");
-    let leaf_path = dir.path().join("cosca-terminate-survivor-leaf");
-    std::fs::create_dir(&leaf_path).expect("create the leaf");
-    let (ready_read, ready_write) = std::io::pipe().expect("pipe");
-    let ready_write_fd = ready_write.as_raw_fd();
-    let guard = fork_running(move || {
-        // SAFETY (in the child): `signal`, `write`, `_exit` and `pause` are async-signal-safe.
-        unsafe {
-            libc::signal(libc::SIGTERM, libc::SIG_IGN);
-            if libc::write(ready_write_fd, b"r".as_ptr().cast(), 1) != 1 {
-                // The parent's `block_on` below would otherwise hang forever on a write that
-                // never lands: exit so it sees EOF instead.
-                libc::_exit(1);
-            }
-            libc::pause();
-        }
-    });
-    drop(ready_write);
-    block_on(ready_read.as_raw_fd()); // the member ignores SIGTERM from here on
-    drop(ready_read);
-    std::fs::write(leaf_path.join("cgroup.procs"), format!("{}\n", guard.pid())).expect("list the member");
-    // `populated 1`: the member is still alive, and Drop's never-killed branch reads this file
-    // to tell a leaf still holding its tree from one that already drained on its own.
-    std::fs::write(leaf_path.join("cgroup.events"), b"populated 1\nfrozen 0\n").expect("create cgroup.events");
-
-    let leaf = entered_leaf_at(leaf_path);
+    let mut cmd = std::process::Command::new("sh");
+    cmd.args(["-c", "trap '' TERM; echo r; exec cat"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
+    let (leaf, mut member, stdin) = entered_real_leaf_of(cmd);
+    let pid = member.id();
+    let leaf_path = leaf.path().to_owned();
+    let leaf_name = leaf_path
+        .file_name()
+        .expect("a leaf name")
+        .to_string_lossy()
+        .into_owned();
+    // The member ignores SIGTERM from here on, and keeps it ignored through its `exec`.
+    let mut ready = [0u8; 2];
+    member
+        .stdout
+        .as_mut()
+        .expect("piped stdout")
+        .read_exact(&mut ready)
+        .expect("the member reports that it ignores SIGTERM");
     leaf.disarm();
-    // A fake leaf has no cgroup path to show its member is in it, so the member is not signalled; it
-    // ignores the SIGTERM either way.
-    leaf.terminate()
-        .expect("a fake leaf shows no member to be in it, and none is reported");
+    crate::containment::cgroup::fault::take_member_terms();
+    leaf.terminate().expect("terminate the leaf");
+    assert_eq!(
+        crate::containment::cgroup::fault::take_member_terms(),
+        [(Some(pid), crate::send_log::Via::Pidfd, libc::SIGTERM)],
+        "the SIGTERM the member survives was sent"
+    );
     let mark = crate::log_capture::mark();
     drop(leaf);
-    drop(guard); // SIGKILLs and reaps the member through its pidfd
+    let levels = crate::log_capture::levels_since(mark, &leaf_name);
+    let records = crate::log_capture::records_since(mark, &leaf_name);
+    // The member lives until its stdin closes: the leaf's `Drop` has run with it alive.
+    drop(stdin);
+    member.wait().expect("reap the member");
+    // The disarmed leaf was left for its tree; the tree is gone, and the leaf is empty.
+    std::fs::remove_dir(&leaf_path).expect("remove the emptied leaf");
 
-    let records = crate::log_capture::records_since(mark, "cosca-terminate-survivor-leaf");
     assert_eq!(
-        crate::log_capture::levels_since(mark, "cosca-terminate-survivor-leaf"),
+        levels,
         vec![log::Level::Debug],
         "a tree that survived SIGTERM is left running, not leaked, got {records:?}"
     );
@@ -1404,11 +1407,22 @@ fn entered_real_leaf() -> (
     std::process::Child,
     std::process::ChildStdin,
 ) {
+    entered_real_leaf_of(crate::test_child::held_std_blocker(std::process::Stdio::null()))
+}
+
+/// [`entered_real_leaf`] with `cmd` as the member: it must have a piped stdin.
+#[cfg(target_os = "linux")]
+fn entered_real_leaf_of(
+    mut cmd: std::process::Command,
+) -> (
+    crate::containment::cgroup::CgroupLeaf,
+    std::process::Child,
+    std::process::ChildStdin,
+) {
     use std::os::unix::process::CommandExt;
 
     let mut leaf = crate::containment::cgroup::try_create_leaf().expect("create a real leaf");
     let (procs_fd, slot) = (leaf.procs_fd(), leaf.placement_slot());
-    let mut cmd = crate::test_child::held_std_blocker(std::process::Stdio::null());
     // SAFETY: as `cgroup_wait_drained_tracks_two_real_members_through_exit`'s member spawn: the
     // closure runs between fork and exec, and `leaf` outlives the spawn.
     unsafe {
@@ -3249,12 +3263,14 @@ fn cgroup_terminate_signals_a_member_when_the_leafs_id_cannot_be_read(#[fixture(
     result.expect("terminate");
 }
 
-/// A listed pid `0` is a member in a pid namespace this process cannot see: it is skipped with a
-/// `warn` naming the leaf, and the members after it are still signalled. The call is not an error
-/// for it. Mutant: "a listed `0` is pinned like any pid" (the call is then `Unassessable`).
+/// A listed pid `0` is a live member in a pid namespace this process cannot see, which it can
+/// neither name nor signal: the members after it are still signalled, and the call is
+/// `Unassessable`, with one `warn` naming the leaf and `pid 0`, as for any member that got no
+/// `SIGTERM`. Mutants: "a listed `0` is skipped and the call is `Ok`", "a listed `0` is pinned like
+/// any pid" (it is then reported as a pin failure, not as a member in another namespace).
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn cgroup_terminate_skips_a_listed_pid_zero_with_a_warn(#[fixture(cgroup)] _group: &Group) {
+fn cgroup_terminate_reports_a_listed_pid_zero_as_unassessable(#[fixture(cgroup)] _group: &Group) {
     use std::os::unix::process::ExitStatusExt as _;
     crate::log_capture::install();
     let (leaf, mut member, stdin) = entered_real_leaf();
@@ -3279,8 +3295,36 @@ fn cgroup_terminate_skips_a_listed_pid_zero_with_a_warn(#[fixture(cgroup)] _grou
     drop(stdin);
     let status = member.wait().expect("reap the member");
     drop(leaf);
-    result.expect("a listed pid 0 is skipped, not an error");
-    assert_eq!(status.signal(), Some(libc::SIGTERM), "got {status:?}");
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGTERM),
+        "the member after the 0 is signalled: {status:?}"
+    );
+    match result {
+        Err(crate::error::Error::Unassessable { detail, .. }) => {
+            assert!(detail.contains("pid 0: "), "{detail}");
+            assert!(detail.contains("pid namespace"), "{detail}");
+            assert!(
+                !detail.contains(&format!("pid {pid}:")),
+                "the signalled member is not reported: {detail}"
+            );
+        }
+        other => panic!("a listed pid 0 was not signalled: expected Unassessable, got {other:?}"),
+    }
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(warns[0].1.contains("pid 0"), "{warns:?}");
+}
+
+/// A leaf that lists only pid `0` has nothing signalled, and says so: `Unassessable`, not `Ok`.
+/// Mutant: "no pid left to signal is `Ok`, whatever was skipped".
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn cgroup_terminate_reports_a_leaf_listing_only_pid_zero(#[fixture(cgroup)] _group: &Group) {
+    let leaf = crate::containment::cgroup::try_create_leaf().expect("create a real leaf");
+    let result = leaf.terminate_listed("0\n");
+    drop(leaf);
+    assert!(
+        matches!(result, Err(crate::error::Error::Unassessable { .. })),
+        "got {result:?}"
+    );
 }

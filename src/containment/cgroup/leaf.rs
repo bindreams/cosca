@@ -695,8 +695,9 @@ impl CgroupLeaf {
     /// `cgroup.kill` (the hard half) still reaches it. Before 6.13, or where the leaf's cgroup id
     /// cannot be read, a member is placed by `/proc/<pid>/cgroup`: one of another user hidden by
     /// `hidepid` cannot be placed, so it is reported, not skipped as `Ok`. A listed pid `0` is a
-    /// member in a pid namespace this process cannot see: it is skipped with a `warn`, and is no
-    /// error.
+    /// live member in a pid namespace this process cannot see, which it can neither name nor
+    /// signal: it is reported like any member that could not be pinned, after the others are
+    /// signalled.
     ///
     /// A listed member that got no `SIGTERM` for any reason but its exit is logged at `warn`, naming
     /// the leaf and the pid, and makes the call an error once every member was tried:
@@ -721,17 +722,17 @@ impl CgroupLeaf {
     /// [`terminate`](Self::terminate) for the members `procs` lists, in `cgroup.procs`' format.
     fn terminate_listed(&self, procs: &str) -> Result<(), crate::error::Error> {
         let mut pids = Vec::new();
+        let mut unproven = Vec::new();
         for pid in procs.lines().filter_map(|line| line.trim().parse::<u32>().ok()) {
             if pid == 0 {
-                log::warn!(
-                    "cgroup terminate: leaf {} lists pid 0, a member in a pid namespace this process cannot see; it is not signalled",
-                    self.leaf_path.display()
-                );
+                // A live member outside this process's pid namespace: it has no number here to
+                // pin or signal, and the caller is told so.
+                unproven.push("pid 0: it is a member in a pid namespace this process cannot see".to_owned());
             } else {
                 pids.push(pid);
             }
         }
-        if pids.is_empty() {
+        if pids.is_empty() && unproven.is_empty() {
             return Ok(());
         }
         // One subtree for every member. Where the leaf's id cannot be read, the pidfd route cannot
@@ -747,7 +748,6 @@ impl CgroupLeaf {
             }
         });
         let mut failed = Vec::new();
-        let mut unproven = Vec::new();
         for pid in pids {
             match self.terminate_member(pid, &subtree) {
                 Ok(()) => {}
