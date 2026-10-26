@@ -14,16 +14,23 @@ fn blocker() -> (crate::Child, std::io::PipeWriter) {
     crate::test_child::held_contained_blocker(crate::Stdio::pipe())
 }
 
+/// What keeps a [`kill_only_blocker`] running while the caller holds it.
+#[cfg(unix)]
+type Held = std::io::PipeWriter;
+#[cfg(windows)]
+type Held = std::net::TcpStream;
+
 /// A [`blocker`] for a test whose only end is a real kill: on Unix it ignores `SIGTERM`, on Windows
-/// it is `more.com` (see [`crate::test_child::windows_more`]).
-fn kill_only_blocker() -> (crate::Child, std::io::PipeWriter) {
+/// it ignores every console event and is returned after its handshake, so a break sent at once
+/// cannot land before it could handle it (that ends a child with `0xC0000142`, not the kill's 1).
+fn kill_only_blocker() -> (crate::Child, Held) {
     #[cfg(unix)]
     {
         crate::test_child::term_ignoring_blocker()
     }
     #[cfg(windows)]
     {
-        crate::test_child::windows_blocker()
+        crate::test_child::ctrl_break::spawn_ignoring_root()
     }
 }
 
