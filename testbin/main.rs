@@ -1004,27 +1004,26 @@ fn main() {
                 Ok(()) => "Ok".to_string(),
                 Err(e) => describe(&e),
             };
-            // The blocking read happens ONLY where delivery is guaranteed; otherwise kill first
-            // and then read, so the read collects EOF or a reset and this mode always reports.
-            // `kill()`, never `kill_tree()`: this child's kill_tree is unconditionally
-            // Unsupported (the `tree` field above), so a kill_tree fallback would error every
-            // time, never perform the read, and leave a live unreaped grandchild behind.
+            // The blocking read happens ONLY where delivery is guaranteed: nothing else this process
+            // does would end it (a kill that sent nothing leaves the child holding the socket).
             let delivered = membership == Some(true) && mechanism == "console-group" && terminate == "Ok";
-            let seen = if delivered {
-                saw_break(&mut ack)
-            } else {
-                match child.kill() {
-                    Ok(()) => saw_break(&mut ack),
-                    Err(_) => "K", // the teardown failed, so delivery was never observable
-                }
-            };
+            let seen = if delivered { saw_break(&mut ack) } else { "-" };
 
             // Unconditional, so the happy path (where the child is still alive by design) reaps
-            // too rather than relying on the fallback branch having run.
+            // too. `kill()`, never `kill_tree()`: this child's kill_tree is unconditionally
+            // Unsupported (the `tree` field above). The socket is closed once the kill returned, so
+            // a child it did not end leaves by itself (the testbin's own exit code 0) and is
+            // reported as not killed, where a wait on it would otherwise never return.
             let cleanup = match child.kill() {
                 Ok(()) => {
-                    child.wait().expect("reap the nested child");
-                    "Ok".to_string()
+                    drop(ack);
+                    let status = child.wait().expect("reap the nested child");
+                    // `TerminateProcess` exits 1.
+                    if status.code() == Some(1) {
+                        "Ok".to_string()
+                    } else {
+                        format!("NotKilled({status})").replace(char::is_whitespace, "_")
+                    }
                 }
                 // Skip the reap: an unbounded wait on a provably-live child would block forever.
                 // Nothing leaks — this process is itself contained by the test, so the kernel
@@ -1226,19 +1225,26 @@ fn main() {
             let alive_after_terminate = liveness(child.is_alive());
             // The blocking read happens ONLY where delivery is guaranteed: the child was MEASURED
             // to be in our console, its mechanism says the flags do not exclude delivery, and the
-            // call reported success. Every other combination defers the read until after the
-            // cleanup kill below, so it collects EOF or a reset and this mode always reports.
+            // call reported success. Every other combination defers the read until the cleanup kill
+            // below, so it collects EOF or a reset and this mode always reports.
             let delivered = c_in_console == Some(true) && mechanism == "console-group" && terminate == "Ok";
             let early_break = delivered.then(|| saw_break(&mut ack));
 
-            // ZERO grace: the acker survives its break by design, so the escalation is
-            // deterministic and its exit code is what proves the forced half ran.
-            let (graceful, graceful_code) = match child.graceful_shutdown(Duration::ZERO) {
-                Ok(status) => (
-                    "Ok".to_string(),
-                    status.code().map(|c| c.to_string()).unwrap_or_else(|| "none".into()),
-                ),
-                Err(e) => (describe(&e), "none".to_string()),
+            // The escalating call runs only for a caller with NO console, where it fails before it
+            // signals or kills anything. From a caller with a console its zero-grace escalation
+            // kills and then reaps INSIDE the call, a wait nothing here could release if that kill
+            // sent nothing; the unit tests of `graceful_shutdown` cover that arm, with the member
+            // released between the kill and the reap.
+            let (graceful, graceful_code) = if console == "0" {
+                match child.graceful_shutdown(Duration::ZERO) {
+                    Ok(status) => (
+                        "Ok".to_string(),
+                        status.code().map(|c| c.to_string()).unwrap_or_else(|| "none".into()),
+                    ),
+                    Err(e) => (describe(&e), "none".to_string()),
+                }
+            } else {
+                ("Skipped".to_string(), "none".to_string())
             };
             let alive_after_graceful = liveness(child.is_alive());
 
@@ -1246,15 +1252,33 @@ fn main() {
                 Ok(()) => "Ok".to_string(),
                 Err(e) => describe(&e),
             };
-            if cleanup == "Ok" {
-                child.wait().expect("reap the acker");
-            }
             // `K`: the teardown that should have ended the child failed, so delivery was never
             // observable — distinct from an observed non-delivery.
-            let seen = match early_break {
-                Some(seen) => seen,
-                None if cleanup == "Ok" => saw_break(&mut ack),
-                None => "K",
+            let (seen, cleanup_exit) = if cleanup == "Ok" {
+                let seen = match early_break {
+                    Some(seen) => seen,
+                    None => {
+                        // Half-close: the read below still collects the acker's last word, and an
+                        // acker no kill reached gets EOF and leaves instead of blocking it.
+                        match ack.shutdown(std::net::Shutdown::Write) {
+                            Err(e) if e.kind() != std::io::ErrorKind::NotConnected => {
+                                panic!("releasing the probe root's socket failed: {e}")
+                            }
+                            _ => {}
+                        }
+                        saw_break(&mut ack)
+                    }
+                };
+                // Released once the kill returned: an acker it ended exits 1, one it did not exits
+                // 0, and the report carries the code.
+                drop(ack);
+                let status = child.wait().expect("reap the acker");
+                (
+                    seen,
+                    status.code().map_or_else(|| "none".to_string(), |c| c.to_string()),
+                )
+            } else {
+                (early_break.unwrap_or("K"), "none".to_string())
             };
 
             let mut line = String::new();
@@ -1263,7 +1287,7 @@ fn main() {
                 "console={console} c_in_console={} mechanism={mechanism} terminate={terminate} \
                  alive_after_terminate={alive_after_terminate} break={seen} graceful={graceful} \
                  graceful_code={graceful_code} alive_after_graceful={alive_after_graceful} \
-                 cleanup={cleanup}",
+                 cleanup={cleanup} cleanup_exit={cleanup_exit}",
                 three_way(c_in_console),
             )
             .unwrap();
@@ -1480,27 +1504,41 @@ fn main() {
 
             // (2) graceful_shutdown_tree — the escalation trio, ZERO grace. Delivery is proved
             // by (1); this leg proves the trio's own classification and that a failure leaves
-            // the tree untouched.
-            let (c2, ack2) = spawn_acker("S");
-            let graceful = match c2.graceful_shutdown_tree(Duration::ZERO) {
-                Ok(_) => "Ok".to_string(),
-                Err(e) => describe(&e),
-            };
-            let alive_after_graceful = liveness(c2.is_alive());
-            // "Skipped" — NOT "Ok": nothing was called on this path, so reporting a success
-            // would be a tautology. Whether the tree really went away is carried by the
-            // measured `alive_after_graceful`.
-            let (graceful_cleanup, graceful_cleanup_exit) = if graceful == "Ok" {
-                ("Skipped".to_string(), "none".to_string())
-            } else {
-                let killed = classify(c2.kill_tree());
-                let exit = if killed == "Ok" {
-                    drop(ack2); // a failed sweep leaves it alive, so keep the socket then
-                    exit_code(c2.wait().expect("reap probe root 2"))
-                } else {
-                    "none".to_string()
+            // the tree untouched. It runs only for a caller with NO console, where it fails
+            // before it signals or kills anything. From a caller with a console its escalation
+            // kills and then reaps INSIDE the call, a wait nothing here could release if that
+            // kill sent nothing; the unit tests of `graceful_shutdown_tree` cover that arm, with
+            // the member released between the kill and the reap.
+            let (graceful, alive_after_graceful, graceful_cleanup, graceful_cleanup_exit) = if console == "0" {
+                let (c2, ack2) = spawn_acker("S");
+                let graceful = match c2.graceful_shutdown_tree(Duration::ZERO) {
+                    Ok(_) => "Ok".to_string(),
+                    Err(e) => describe(&e),
                 };
-                (killed, exit)
+                let alive_after_graceful = liveness(c2.is_alive());
+                // "Skipped" — NOT "Ok": nothing was called on this path, so reporting a success
+                // would be a tautology. Whether the tree really went away is carried by the
+                // measured `alive_after_graceful`.
+                let (graceful_cleanup, graceful_cleanup_exit) = if graceful == "Ok" {
+                    ("Skipped".to_string(), "none".to_string())
+                } else {
+                    let killed = classify(c2.kill_tree());
+                    let exit = if killed == "Ok" {
+                        drop(ack2); // a failed sweep leaves it alive, so keep the socket then
+                        exit_code(c2.wait().expect("reap probe root 2"))
+                    } else {
+                        "none".to_string()
+                    };
+                    (killed, exit)
+                };
+                (graceful, alive_after_graceful, graceful_cleanup, graceful_cleanup_exit)
+            } else {
+                (
+                    "Skipped".to_string(),
+                    "skipped",
+                    "Skipped".to_string(),
+                    "none".to_string(),
+                )
             };
 
             let mut line = String::new();
