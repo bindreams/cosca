@@ -956,6 +956,8 @@ impl LateTree {
                 let (pid, unique) = (self.pid, self.unique);
                 // The root is this process's unreaped child, shown by a verified peek right before each
                 // send by its pid.
+                #[cfg(test)]
+                crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterRootLook);
                 let check = || {
                     let target = crate::wait::exit_only::Target::pid(pid, Some(unique));
                     let state = crate::signal::RootState::of_peek(crate::wait::exit_only::peek_verified(&target));

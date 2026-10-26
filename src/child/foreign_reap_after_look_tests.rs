@@ -90,3 +90,23 @@ fn graceful_shutdown_tree_checks_the_root_again_before_a_send_by_number() {
     assert_nothing_by_number(&steps);
     assert_reaped_elsewhere(&result.expect_err("a root reaped elsewhere is not assessable"));
 }
+
+#[skuld::test]
+fn a_drop_checks_the_root_again_before_a_send_by_number() {
+    let child = zombie_group_root();
+    let (steps, ()) = reaped_after_the_look(child.id().pid(), || drop(child));
+    assert_nothing_by_number(&steps);
+}
+
+#[skuld::test]
+fn finish_elevated_checks_the_root_again_before_a_send_by_number() {
+    let child = zombie_group_root();
+    let (steps, failed) = reaped_after_the_look(child.id().pid(), || {
+        crate::child::spawn::finish_elevated(
+            child,
+            Err(crate::error::Error::Io(std::io::Error::other("no password"))),
+        )
+    });
+    assert_nothing_by_number(&steps);
+    assert!(failed.is_err(), "the password write failed");
+}
