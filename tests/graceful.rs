@@ -290,24 +290,6 @@ fn graceful_mechanism_distinguishes_contained_from_uncontained_on_windows() {
 
 // The lone graceful ops on a console-group child =====
 
-/// `Duration::ZERO` makes the escalation deterministic — the break-ignoring child is provably
-/// alive at the single poll — so code `1` is this crate's kill and nothing else.
-#[cfg(windows)]
-#[skuld::test]
-fn child_graceful_shutdown_escalates_when_the_break_is_ignored() {
-    use std::time::Duration;
-
-    let (child, _sock) = common::spawn_control("control-block-ignore-break", &["R"], true);
-    let status = child
-        .graceful_shutdown(Duration::ZERO)
-        .expect("graceful_shutdown escalates");
-    assert_eq!(
-        status.code(),
-        Some(1),
-        "a break-ignoring child must be force-killed, got {status:?}"
-    );
-}
-
 /// The parity contract, deliberately not `cfg`-gated so it is one test rather than two: the
 /// `Child` pins the pid for its whole life, so an already-exited child is `Ok` on every
 /// platform.

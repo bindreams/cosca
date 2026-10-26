@@ -126,8 +126,11 @@ fn child_graceful_shutdown_exits_via_ctrl_break_on_windows() {
 /// escalation can end it, while its grandchild acks the break and survives.
 #[skuld::test]
 fn child_graceful_shutdown_signals_the_group_but_only_kills_the_child() {
-    let (child, _root_sock, mut grand) = spawn_tree(Handler::Ignore, Handler::Ack, crate::ContainMode::Strongest);
+    let (child, root_sock, mut grand) = spawn_tree(Handler::Ignore, Handler::Ack, crate::ContainMode::Strongest);
     assert_in_our_console(child.id().pid(), "the root");
+    // The root leaves with 0 when its socket closes. Closed once the escalation returned, so an
+    // escalation that sent nothing fails the code assertion below instead of hanging the reap.
+    let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, root_sock);
     let status = child
         .graceful_shutdown(Duration::ZERO)
         .expect("graceful_shutdown on a console-group root");
@@ -224,4 +227,19 @@ fn treewalk_terminate_tree_reaps_the_grandchild() {
         Some(STATUS_CONTROL_C_EXIT),
         "the root must die to the break"
     );
+}
+
+/// Both members ignore the break, so only the ZERO-grace hard sweep can end the tree. The root's
+/// socket is closed once the sweep returned, and the grandchild's after the root is reaped: a sweep
+/// that sent nothing, or only to the root, yields code 0 for the member it missed, not a hang.
+#[skuld::test]
+fn graceful_shutdown_tree_sweep_is_load_bearing_on_windows() {
+    let (child, root_sock, grand) = spawn_tree(Handler::Ignore, Handler::Ignore, crate::ContainMode::Strongest);
+    assert_in_our_console(child.id().pid(), "the root");
+    let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, root_sock);
+    let status = child.graceful_shutdown_tree(Duration::ZERO).expect("tree escalates");
+    assert_eq!(status.code(), Some(1), "the sweep ends the root, got {status:?}");
+    let Grandchild { sock, exit } = grand;
+    drop(sock);
+    assert_eq!(exit.wait_for_exit_code(), 1, "the sweep must kill the grandchild");
 }
