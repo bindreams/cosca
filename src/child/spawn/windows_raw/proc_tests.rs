@@ -10,11 +10,12 @@ use windows::Win32::System::Threading::{
 
 use super::{create_process, win32_io_error, RawChild};
 
-/// Kills and reaps the wrapped `RawChild` when dropped — including during a panicking unwind —
+/// Ends and reaps the wrapped `RawChild` when dropped — including during a panicking unwind —
 /// so a deadline-contract test fixture never leaks a live process if an assertion fails
-/// partway through. `RawChild::kill`/`wait` are both idempotent (an already-exited/-killed
-/// child is success), so this is safe even if a test also kills it explicitly on its own
-/// happy path.
+/// partway through. It ends the child with `TerminateProcess` itself and not with
+/// `RawChild::kill`, which some tests are about: a `kill` that did nothing would leave the wait
+/// below unbounded. Safe even if a test also kills it explicitly: `wait` is idempotent and an
+/// already-exited child answers the call with an error nothing reads.
 struct KillOnDrop(RawChild);
 
 impl std::ops::Deref for KillOnDrop {
@@ -26,7 +27,8 @@ impl std::ops::Deref for KillOnDrop {
 
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
-        _ = self.0.kill();
+        // SAFETY: the wrapped child's live process handle.
+        _ = unsafe { TerminateProcess(self.0.handle(), 1) };
         _ = self.0.wait();
     }
 }
