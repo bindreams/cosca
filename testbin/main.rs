@@ -1067,7 +1067,8 @@ fn main() {
             };
             let alive_after_graceful = liveness(child.is_alive());
 
-            let cleanup = match child.kill() {
+            let cleanup = match std::convert::identity(Ok::<(), cosca::error::Error>(())) {
+                // RED: the probe's `kill` sends nothing.
                 Ok(()) => "Ok".to_string(),
                 Err(e) => describe(&e),
             };

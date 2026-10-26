@@ -1283,6 +1283,11 @@ impl Child {
         // Enforced in debug builds: nothing below may wait for an exit or a drain. Declared before
         // `os`, so a panic in the signals unwinds through the resources while still inside it.
         let _bounded = crate::bounded::Section::enter();
+        if true {
+            // RED: the drop kills nothing and releases nothing, so the tree outlives the handle.
+            std::mem::forget(std::mem::take(&mut self.os));
+            return ChildFate::Unknown;
+        }
         let mut os = std::mem::take(&mut self.os);
         // Read before the `kill_on_drop` branch: a disarmed drop signals nothing, but releasing
         // tokio's `Child` still `try_wait`s the root's number, so it needs the same evidence.
