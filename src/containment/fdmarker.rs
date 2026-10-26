@@ -745,12 +745,14 @@ pub(crate) mod fault {
         FORCE_ROOT_KILL_NOOP.with(|f| f.get())
     }
 
+    type HolderSignal = (u32, nix::sys::signal::Signal);
+
     thread_local! {
-        static HOLDER_KILLS: std::cell::RefCell<Option<Vec<u32>>> = const { std::cell::RefCell::new(None) };
+        static HOLDER_KILLS: std::cell::RefCell<Option<Vec<HolderSignal>>> = const { std::cell::RefCell::new(None) };
     }
 
-    /// From now on `kill_holder` on THIS thread records each marker holder it signals, so a test
-    /// can tell that the sweep ran without waiting for a process to die.
+    /// From now on `kill_holder` on THIS thread records each marker holder it signals, and the
+    /// signal, so a test can tell that the sweep ran without waiting for a process to die.
     pub(crate) fn record_holder_kills() -> HolderKillRecorder {
         HOLDER_KILLS.with(|k| *k.borrow_mut() = Some(Vec::new()));
         HolderKillRecorder(())
@@ -761,6 +763,18 @@ pub(crate) mod fault {
 
     impl HolderKillRecorder {
         pub(crate) fn killed(&self) -> Vec<u32> {
+            self.sent().into_iter().map(|(pid, _)| pid).collect()
+        }
+
+        /// The signals sent to `pid`, in order.
+        pub(crate) fn signals_to(&self, pid: u32) -> Vec<nix::sys::signal::Signal> {
+            self.sent()
+                .into_iter()
+                .filter_map(|(to, signal)| (to == pid).then_some(signal))
+                .collect()
+        }
+
+        fn sent(&self) -> Vec<HolderSignal> {
             HOLDER_KILLS.with(|k| k.borrow().clone().expect("the recorder is live"))
         }
     }
@@ -774,13 +788,17 @@ pub(crate) mod fault {
     /// The holders signalled so far under a live [`record_holder_kills`], for a hook that cannot
     /// borrow the recorder.
     pub(crate) fn holder_kills_so_far() -> Vec<u32> {
-        HOLDER_KILLS.with(|k| k.borrow().clone().expect("a recorder is live"))
+        HOLDER_KILLS
+            .with(|k| k.borrow().clone().expect("a recorder is live"))
+            .into_iter()
+            .map(|(pid, _)| pid)
+            .collect()
     }
 
-    pub(super) fn note_holder_kill(pid: u32) {
+    pub(super) fn note_holder_kill(pid: u32, signal: nix::sys::signal::Signal) {
         HOLDER_KILLS.with(|k| {
             if let Some(killed) = k.borrow_mut().as_mut() {
-                killed.push(pid);
+                killed.push((pid, signal));
             }
         });
     }
@@ -806,17 +824,22 @@ pub(crate) mod fault {
 
 use std::io;
 
+use crate::containment::GroupRoot;
 use crate::error::Error;
 use crate::identity::{ProcessId, Resolved};
 
 /// What a sweep may do.
-#[derive(Debug, Clone, Copy)]
-enum Scope {
-    /// Every channel: the group, the root's number, the ppid walk and the marker holders.
-    Full,
+#[derive(Clone, Copy)]
+enum Scope<'r> {
+    /// Every channel: the group, the root's number, the ppid walk and the marker holders. The group
+    /// is signalled as `root` allows.
+    Full(&'r GroupRoot<'r>),
     /// The marker holders alone, for a root whose number names no one reliably any more. `except`
     /// is a holder to leave alone: the root, when this process does not pin it.
     HoldersOnly { except: Option<ProcessId> },
+    /// The group and the marker holders, for a root this process reaped whose pid names no process:
+    /// the group lives while a member does, but a walk from the pid would find none of the tree.
+    GroupAndHolders(&'r GroupRoot<'r>),
 }
 
 /// The live marker for one contained tree.
@@ -829,8 +852,9 @@ pub(crate) struct Marker {
     /// doc comment. What `sweep`'s entry contract re-checks against `read` at signal time.
     read_handle: u64,
     /// The root's identity, for the ppid-walk channel: the one the spawn verified against the
-    /// child's handle, never a read by pid at attach.
-    root: ProcessId,
+    /// child's handle, never a read by pid at attach. `None` only for a marker made by
+    /// [`without_root`](Marker::without_root), which sweeps its holders alone.
+    root: Option<ProcessId>,
     /// The root's process group, when the requested mode created one. `None` for TreeWalk.
     pgid: Option<i32>,
     /// The descriptor number the marker occupies in the child, copied from
@@ -929,8 +953,22 @@ impl Marker {
             read: prepared.read,
             handle: prepared.handle,
             read_handle: prepared.read_handle,
-            root,
+            root: Some(root),
             pgid,
+            own_fd: prepared.fd,
+        }
+    }
+
+    /// The marker of a root that is not shown to be this process's child: no channel that names the
+    /// tree by the root's number may run, so only
+    /// [`hard_kill_holders_only`](Self::hard_kill_holders_only) is called on it.
+    pub(crate) fn without_root(prepared: PreparedMarker) -> Marker {
+        Marker {
+            read: prepared.read,
+            handle: prepared.handle,
+            read_handle: prepared.read_handle,
+            root: None,
+            pgid: None,
             own_fd: prepared.fd,
         }
     }
@@ -950,18 +988,8 @@ impl Marker {
         self.own_fd
     }
 
-    /// Whether this marker carries a pgid to `killpg`/`term_group` on sweep — `true` for
-    /// every mode except `TreeWalk` (`pgid: None`, no process group). Exposed so
-    /// `Child::kill_tree`/`terminate_tree`'s pgid-recycle precondition assert
-    /// (`src/child.rs`, `src/tokio/child.rs`) can extend to `Attached::FdMarker` exactly as
-    /// it already covers `Attached::ProcessGroup`: this mechanism fires `killpg` on `self.pgid`
-    /// unconditionally on pass 1, so the same recycled-pgid hazard applies to it.
-    pub(crate) fn has_pgid(&self) -> bool {
-        self.pgid.is_some()
-    }
-
-    /// The root the ppid walk starts from.
-    pub(crate) fn root(&self) -> ProcessId {
+    /// The root the ppid walk starts from; `None` for a marker made [`without_root`](Self::without_root).
+    pub(crate) fn root(&self) -> Option<ProcessId> {
         self.root
     }
 
@@ -1027,8 +1055,8 @@ impl Marker {
     /// particular `is_teardown_mechanism_failure` (this file), rely on that distinction
     /// surviving intact through this return value; see `sweep`'s own doc for where it is
     /// preserved.
-    pub(crate) fn hard_kill(&self) -> Result<(), Error> {
-        self.hard_kill_impl(Scope::Full)
+    pub(crate) fn hard_kill(&self, root: &GroupRoot<'_>) -> Result<(), Error> {
+        self.hard_kill_impl(Scope::Full(root))
     }
 
     /// [`hard_kill`](Self::hard_kill) through the marker-holder channel alone. For a caller whose
@@ -1044,7 +1072,15 @@ impl Marker {
         self.hard_kill_impl(Scope::HoldersOnly { except })
     }
 
-    fn hard_kill_impl(&self, scope: Scope) -> Result<(), Error> {
+    /// [`hard_kill`](Self::hard_kill) through the group and the marker-holder channel, with no root
+    /// identity kill and no walk from the root's pid: for a root this process reaped, whose pid
+    /// names no process. Its children were reparented at its exit, so a walk would find only a
+    /// later process's children.
+    pub(crate) fn hard_kill_group_and_holders(&self, root: &GroupRoot<'_>) -> Result<(), Error> {
+        self.hard_kill_impl(Scope::GroupAndHolders(root))
+    }
+
+    fn hard_kill_impl(&self, scope: Scope<'_>) -> Result<(), Error> {
         self.check_read_end_still_valid()?;
         let mut seen: std::collections::HashSet<ProcessId> = std::collections::HashSet::new();
         // Folds together across every pass — see `sweep_pass`'s doc for why an earlier pass's
@@ -1083,8 +1119,8 @@ impl Marker {
     /// `terminate_tree()` — a blocking API with no timeout — forever. One pass, matching
     /// `term_group`'s own cooperative, best-effort contract; `hard_kill` (`kill_tree`) is the
     /// guaranteed sweep.
-    pub(crate) fn terminate(&self) -> Result<(), Error> {
-        self.terminate_impl(Scope::Full)
+    pub(crate) fn terminate(&self, root: &GroupRoot<'_>) -> Result<(), Error> {
+        self.terminate_impl(Scope::Full(root))
     }
 
     /// [`terminate`](Self::terminate) through the marker-holder channel alone, as
@@ -1093,7 +1129,13 @@ impl Marker {
         self.terminate_impl(Scope::HoldersOnly { except })
     }
 
-    fn terminate_impl(&self, scope: Scope) -> Result<(), Error> {
+    /// [`terminate`](Self::terminate) through the group and the marker-holder channel, as
+    /// [`hard_kill_group_and_holders`](Self::hard_kill_group_and_holders) does for the kill.
+    pub(crate) fn terminate_group_and_holders(&self, root: &GroupRoot<'_>) -> Result<(), Error> {
+        self.terminate_impl(Scope::GroupAndHolders(root))
+    }
+
+    fn terminate_impl(&self, scope: Scope<'_>) -> Result<(), Error> {
         self.check_read_end_still_valid()?;
         let mut seen: std::collections::HashSet<ProcessId> = std::collections::HashSet::new();
         let mut group_result: Result<(), Error> = Ok(());
@@ -1268,7 +1310,8 @@ impl Marker {
     /// same class of check-then-act window `src/containment/unix.rs` already documents for
     /// `ProcessGroup`'s own one-shot `killpg` — narrowed here to "immediately after a live
     /// member was freshly confirmed," not eliminated, and this module makes no claim beyond
-    /// that.
+    /// that. Each pass's `killpg` also checks the root right before it (`root`, see
+    /// [`GroupRoot::check`]), on every pass, not once for the sweep.
     fn sweep_pass(
         &self,
         signal: nix::sys::signal::Signal,
@@ -1276,12 +1319,16 @@ impl Marker {
         group_result: &mut Result<(), Error>,
         incomplete: &mut bool,
         first_pass: bool,
-        scope: Scope,
+        scope: Scope<'_>,
     ) -> bool {
-        let by_root_number = matches!(scope, Scope::Full);
+        let walk = matches!(scope, Scope::Full(_));
+        let group = match scope {
+            Scope::Full(root) | Scope::GroupAndHolders(root) => Some(root),
+            Scope::HoldersOnly { .. } => None,
+        };
         let except = match scope {
             Scope::HoldersOnly { except } => except,
-            Scope::Full => None,
+            Scope::Full(_) | Scope::GroupAndHolders(_) => None,
         };
         // Snapshot FIRST, always — the group-signal-ordering invariant below depends on this
         // pass's snapshot (when one is obtained) predating any signal sent this pass.
@@ -1291,10 +1338,16 @@ impl Marker {
         if blind {
             *incomplete = true;
             if first_pass {
+                let still = match scope {
+                    Scope::Full(_) => {
+                        "the group signal and root kill below still run, since neither needs the process table"
+                    }
+                    Scope::GroupAndHolders(_) => "the group signal below still runs, since it needs no process table",
+                    Scope::HoldersOnly { .. } => "nothing else runs, so nothing is signalled this pass",
+                };
                 log::warn!(
                     "fd marker {:#x}: the host process table could not be read on the first \
-                     pass; the ppid-walk and marker channels are blind (the group signal and \
-                     root kill below still run, since neither needs the process table)",
+                     pass; the ppid-walk and marker channels are blind ({still})",
                     self.handle
                 );
             } else {
@@ -1315,10 +1368,14 @@ impl Marker {
         // skipped when blind, since there is nothing to walk). `descendants` applies the
         // crate's own token guard against the root.
         //
-        // Skipped when `by_root_number` is false: the root's pid names no one reliably any more.
+        // Skipped outside `Scope::Full`: the root's pid names no one reliably any more, or names no
+        // process and has no descendants left to walk to.
         let mut new_walk: Vec<ProcessId> = Vec::new();
-        if by_root_number {
-            let root = self.root;
+        debug_assert!(
+            !walk || self.root.is_some(),
+            "a full sweep of a marker made without its root"
+        );
+        if let Some(root) = self.root.filter(|_| walk) {
             #[cfg(test)]
             crate::containment::treewalk::fault::note_walk(root.pid());
             if seen.insert(root) {
@@ -1407,15 +1464,15 @@ impl Marker {
                         .any(|h| is_signalable(h.pid) && pid_is_live_group_member(h.pid, pgid))
                 });
             let should_fire = first_pass || live_holder_confirms_pgid;
-            if !by_root_number {
-            } else if should_fire {
+            if group.is_none() {
+            } else if let (Some(root), true) = (group, should_fire) {
                 // `kill_group`/`term_group` already return `crate::error::Error`, carrying
                 // #61's own `Error::Containment`/`Error::Unassessable` distinction for an
                 // ordinary refusal — preserved as-is here, NOT collapsed into a stringified
                 // `io::Error` (see this fn's doc, and `combine_group_errors` below).
                 let this_pass_group_result: Result<(), Error> = match (self.pgid, signal) {
-                    (Some(pgid), nix::sys::signal::Signal::SIGKILL) => crate::containment::unix::kill_group(pgid),
-                    (Some(pgid), _) => crate::containment::unix::term_group(pgid),
+                    (Some(pgid), nix::sys::signal::Signal::SIGKILL) => crate::containment::unix::kill_group(pgid, root),
+                    (Some(pgid), _) => crate::containment::unix::term_group(pgid, root),
                     (None, _) => Ok(()),
                 };
                 *group_result = match (std::mem::replace(group_result, Ok(())), this_pass_group_result) {
@@ -1451,7 +1508,7 @@ impl Marker {
             // `kill_tree` handle backstop to be the sole killer regardless of which mechanism a
             // given platform actually attaches for a request.
             #[cfg(test)]
-            if id == self.root && fault::take_force_root_kill_noop() {
+            if Some(id) == self.root && fault::take_force_root_kill_noop() {
                 continue;
             }
             // `KillOutcome::NotAttempted` means the OS refused to query or signal an identity
@@ -1560,7 +1617,7 @@ impl Marker {
             }
             MarkerQuery::Held => {
                 #[cfg(test)]
-                fault::note_holder_kill(id.pid());
+                fault::note_holder_kill(id.pid(), signal);
                 crate::containment::treewalk::kill_by_identity(id, signal)
                     == crate::containment::treewalk::KillOutcome::NotAttempted
             }

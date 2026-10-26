@@ -83,7 +83,11 @@ pub(crate) fn reap_behind_and_reuse(pid: u32) -> Child {
     let reaped = waitid(WaitId::Pid(pid_of(pid)), WaitIdOptions::EXITED).expect("raw reap");
     assert!(reaped.is_some(), "the raw reap must consume an exit record");
     drop(pidfd);
+    reuse(pid)
+}
 
+/// Starts a `std` child that takes `pid`, which must name no process now.
+pub(crate) fn reuse(pid: u32) -> Child {
     ns::set_last_pid(pid - 1);
     let mut cmd = std::process::Command::new("sleep");
     cmd.arg("3600");

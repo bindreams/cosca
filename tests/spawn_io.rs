@@ -59,7 +59,7 @@ fn spawned_child_has_live_identity() {
 fn try_wait_returns_none_before_exit_and_some_after() {
     let mut cmd = Command::new();
     // tee-both blocks on stdin — the child won't exit until stdin is closed.
-    // Null stdout/stderr so tee-both doesn't panic on broken pipe.
+    // Null stdout/stderr: nothing reads them, and tee-both's outputs need no pump.
     cmd.executable(testbin())
         .args(["cosca_testbin", "tee-both"])
         .stdin(Stdio::pipe())
@@ -144,7 +144,7 @@ fn stderr_pipe_captures_output() {
 fn stdin_pipe_is_writable() {
     let mut cmd = Command::new();
     // tee-both reads stdin and copies to stdout+stderr; we just need to confirm
-    // the write end is usable. Wire stdout to null to avoid a broken-pipe panic.
+    // the write end is usable. Stdout goes to null: nothing reads it, and no pump is needed.
     cmd.executable(testbin())
         .args(["cosca_testbin", "tee-both"])
         .stdin(Stdio::pipe())
@@ -853,10 +853,6 @@ struct EchoTree {
     grand_pid: u32,
 }
 
-#[cfg_attr(
-    not(any(windows, target_os = "linux")),
-    allow(dead_code, reason = "used only by the windows and linux tests")
-)]
 fn spawn_contained_echo_tree(kill_on_drop: bool) -> EchoTree {
     use std::net::TcpListener;
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind control listener");
@@ -937,22 +933,30 @@ fn unix_kill_tree_reaps_the_grandchild() {
     assert_eq!(n, 0, "kill_tree must kill the grandchild, not just the root");
 }
 
+/// The echo grandchild has no SIGTERM handler, so the default action kills it, and a fatal signal
+/// ends a process before it runs again: once `terminate_tree` returns, a grandchild that answers
+/// the test's byte did not get its SIGTERM. A failure leaves the tree to the handle's drop, so a
+/// missing SIGTERM fails the assertion rather than hanging a wait.
 #[cfg(unix)]
 #[skuld::test]
 fn unix_terminate_tree_reaps_the_grandchild() {
-    let (child, mut gc_stream) = spawn_contained_tree();
+    let EchoTree {
+        child, root, mut grand, ..
+    } = spawn_contained_echo_tree(true);
     assert_host_tree_containment(&child);
 
     child.terminate_tree().expect("terminate_tree");
-    let _ = child.wait(); // reap the root
 
-    // Same EOF-based proof: SIGTERM should have reached both the root and the
-    // grandchild (both are members of the contained tree).
+    // A dead grandchild's socket answers end of file or a reset; a live one echoes the byte.
+    _ = grand.write_all(b"x");
     let mut buf = [0u8; 1];
-    let n = gc_stream
-        .read(&mut buf)
-        .expect("read grandchild control socket after SIGTERM");
-    assert_eq!(n, 0, "terminate_tree must SIGTERM the grandchild, not just the root");
+    let echoed = grand.read(&mut buf).unwrap_or(0);
+    assert_eq!(
+        echoed, 0,
+        "terminate_tree must SIGTERM the grandchild, not just the root"
+    );
+    drop(root);
+    let _ = child.wait(); // reap the root
 }
 
 // unix_nested_contained_spawn_reports_process_group was removed: it used

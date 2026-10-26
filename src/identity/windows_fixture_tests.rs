@@ -24,7 +24,13 @@ fn open_err(pid: u32, mask: PROCESS_ACCESS_RIGHTS) -> Option<u32> {
 
 #[skuld::test]
 fn the_fixture_child_is_actually_running() {
-    let child = spawn_restricted(PROCESS_SYNCHRONIZE.0);
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(the_fixture_child_is_actually_running),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
+    let child = spawn_restricted(&done, PROCESS_SYNCHRONIZE.0);
     assert!(
         child.is_running(),
         "the fixture must hand back a LIVE process, or every denial test below is vacuous"
@@ -33,7 +39,13 @@ fn the_fixture_child_is_actually_running() {
 
 #[skuld::test]
 fn query_limited_is_denied_when_not_granted() {
-    let child = spawn_restricted(PROCESS_SYNCHRONIZE.0);
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(query_limited_is_denied_when_not_granted),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
+    let child = spawn_restricted(&done, PROCESS_SYNCHRONIZE.0);
     assert_eq!(
         open_err(child.pid(), PROCESS_QUERY_LIMITED_INFORMATION),
         Some(ERROR_ACCESS_DENIED.0),
@@ -47,7 +59,13 @@ fn query_limited_is_denied_when_not_granted() {
 
 #[skuld::test]
 fn synchronize_is_denied_while_query_limited_is_granted() {
-    let child = spawn_restricted(PROCESS_QUERY_LIMITED_INFORMATION.0);
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(synchronize_is_denied_while_query_limited_is_granted),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
+    let child = spawn_restricted(&done, PROCESS_QUERY_LIMITED_INFORMATION.0);
     assert_eq!(open_err(child.pid(), PROCESS_QUERY_LIMITED_INFORMATION), None);
     assert_eq!(
         open_err(child.pid(), PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE),
@@ -59,9 +77,15 @@ fn synchronize_is_denied_while_query_limited_is_granted() {
 
 #[skuld::test]
 fn spawn_unkillable_denies_everything() {
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(spawn_unkillable_denies_everything),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
     // The empty DACL is load-bearing for four downstream tests; if it ever granted anything
     // they would all take the Opened::Found path and pass vacuously.
-    let child = spawn_unkillable();
+    let child = spawn_unkillable(&done);
     assert_eq!(
         open_err(child.pid(), PROCESS_QUERY_LIMITED_INFORMATION),
         Some(ERROR_ACCESS_DENIED.0)
@@ -72,9 +96,15 @@ fn spawn_unkillable_denies_everything() {
 
 #[skuld::test]
 fn spawn_query_only_denies_terminate_and_grants_query_limited() {
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(spawn_query_only_denies_terminate_and_grants_query_limited),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
     // Its denial property is what makes `wait::kill`'s Denied arm reachable at all; without
     // this the test that depends on it would pass by terminating a corpse instead.
-    let child = spawn_query_only();
+    let child = spawn_query_only(&done);
     assert_eq!(open_err(child.pid(), PROCESS_QUERY_LIMITED_INFORMATION), None);
     assert_eq!(
         open_err(child.pid(), PROCESS_TERMINATE),
@@ -86,20 +116,32 @@ fn spawn_query_only_denies_terminate_and_grants_query_limited() {
 
 #[skuld::test]
 fn terminate_is_granted_by_spawn_restricted_and_denied_by_spawn_unkillable() {
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(terminate_is_granted_by_spawn_restricted_and_denied_by_spawn_unkillable),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
     // Bound, not temporaries: the fixture's own handle keeps a dead child's kernel object
     // (and pid) alive, so both verdicts below hold on a corpse. Liveness must be asserted.
-    let granted = spawn_restricted(0);
+    let granted = spawn_restricted(&done, 0);
     assert_eq!(open_err(granted.pid(), PROCESS_TERMINATE), None);
     assert!(granted.is_running(), "precondition: the subject must be live");
 
-    let denied = spawn_unkillable();
+    let denied = spawn_unkillable(&done);
     assert_eq!(open_err(denied.pid(), PROCESS_TERMINATE), Some(ERROR_ACCESS_DENIED.0));
     assert!(denied.is_running(), "precondition: the subject must be live");
 }
 
 #[skuld::test]
 fn terminate_records_the_exit_and_is_idempotent() {
-    let child = spawn_restricted(PROCESS_QUERY_LIMITED_INFORMATION.0);
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(terminate_records_the_exit_and_is_idempotent),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
+    let child = spawn_restricted(&done, PROCESS_QUERY_LIMITED_INFORMATION.0);
     child.terminate();
     assert!(!child.is_running(), "terminate must record an exit");
     child.terminate(); // second call must not panic — Drop calls it again

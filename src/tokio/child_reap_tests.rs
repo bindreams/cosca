@@ -754,13 +754,14 @@ async fn macos_wait_and_reap_on_a_failed_peek_is_unverified() {
     reap_behind_the_owner(pid);
 }
 
-/// A zombie launchd holds (its tracer died) has exited and is not ours to reap: `Foreign`, with a
+/// A zombie launchd holds (its tracer died) has exited and is not ours to reap: `Orphaned`, with a
 /// `warn` saying so.
 ///
-/// Mutants: `Awaited::Orphaned` is folded into `Gone` without a log; or it is `Unverified`.
+/// Mutants: `Awaited::Orphaned` is folded into `Gone` without a log; or it is `Unverified` or
+/// `Foreign`.
 #[cfg(target_os = "macos")]
 #[skuld::test]
-async fn macos_wait_and_reap_of_a_zombie_launchd_holds_is_foreign_and_warns() {
+async fn macos_wait_and_reap_of_a_zombie_launchd_holds_is_orphaned_and_warns() {
     use crate::wait::exit_only::seams::force_peek_once;
     use crate::wait::exit_only::{Foreign, Peek};
     crate::log_capture::install();
@@ -768,7 +769,7 @@ async fn macos_wait_and_reap_of_a_zombie_launchd_holds_is_foreign_and_warns() {
     let mark = crate::log_capture::mark();
     let _orphaned = force_peek_once(Ok(Peek::Foreign(Foreign::Orphaned)));
 
-    assert_eq!(proc.wait_and_reap(pid), Waited::Foreign);
+    assert_eq!(proc.wait_and_reap(pid), Waited::Orphaned);
 
     let records = crate::log_capture::records_since_on_current_thread(mark, &format!("child {pid}"));
     assert!(
@@ -841,4 +842,33 @@ async fn reap_now_of_a_child_reaped_behind_the_owner_after_the_kill_is_killed() 
     let fate = proc.reap_now(pid, None);
 
     assert_eq!(fate, crate::error::ChildFate::Killed);
+}
+
+/// A backend forgotten before it was shown to be ours holds no pidfd, and its child may still be
+/// running: its grace never says it exited.
+///
+/// Mutant: a backend with no pidfd answers that its child exited.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn exited_within_of_a_child_never_shown_ours_is_false() {
+    crate::tokio::test_runtime::assert_current_thread();
+    // `cat` runs until the backend, which keeps its stdin, drops.
+    let child = crate::test_spawn::spawn_tokio(
+        ::tokio::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null()),
+    )
+    .expect("spawn");
+    let pid = child.id().expect("tokio owns an un-reaped child");
+    let mut proc = proc_source(child);
+    proc.forget_foreign();
+
+    let exited = proc.exited_within(std::time::Duration::ZERO).await;
+
+    assert!(
+        !exited.expect("a forgotten backend's grace"),
+        "its child may still be running"
+    );
+    drop(proc);
+    reap_behind_the_owner(pid);
 }

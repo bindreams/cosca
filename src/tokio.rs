@@ -21,6 +21,8 @@ pub(crate) mod wait;
 pub use child::{Child, SuspendedChild};
 pub use command::Command;
 pub use process::Process;
+#[cfg(all(test, unix))]
+pub(crate) use spawn::finish_elevated;
 pub use stdio::{ChildStderr, ChildStdin, ChildStdout};
 
 /// Start building an async command from an argument vector.

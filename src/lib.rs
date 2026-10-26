@@ -178,6 +178,12 @@ mod test_privilege;
 
 #[cfg(all(test, unix))]
 mod test_own_process;
+// Its Windows twin, under the same name.
+#[cfg(all(test, windows))]
+#[path = "test_own_process_windows.rs"]
+mod test_own_process;
+#[cfg(test)]
+mod test_own_process_gate;
 #[cfg(all(test, unix))]
 mod test_own_process_tests;
 #[cfg(all(test, unix))]
