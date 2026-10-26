@@ -418,9 +418,8 @@ pub fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 
 /// Spawn a 2-level tree via a grandchild-spawning testbin `mode` (root tag "R" + one grandchild
 /// tag "G"), optionally contained, and return the owned `Child` plus BOTH accepted sockets (the
-/// two tag reads prove the 2-level tree is alive). The tree dies — and both sockets EOF — only
-/// when the whole tree is torn down, so callers prove teardown by reading EOF on both, never by
-/// a timer.
+/// two tag reads prove the 2-level tree is alive). Callers prove teardown by an exit code or an
+/// echo (see [`Member`] and `assert_members_killed`), never by a timer or an unbounded read.
 pub fn spawn_tree(mode: &str, contain: bool) -> (cosca::Child, Vec<TcpStream>) {
     spawn_tree_with(mode, contain, |_| {})
 }

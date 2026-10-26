@@ -1246,7 +1246,12 @@ fn main() {
             } else {
                 ("Skipped".to_string(), "none".to_string())
             };
-            let alive_after_graceful = liveness(child.is_alive());
+            // Skipped with the call: a liveness here would read as its result.
+            let alive_after_graceful = if console == "0" {
+                liveness(child.is_alive())
+            } else {
+                "skipped"
+            };
 
             let cleanup = match child.kill() {
                 Ok(()) => "Ok".to_string(),

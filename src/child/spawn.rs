@@ -3122,10 +3122,10 @@ pub(crate) mod fault {
     }
 
     /// Run `hook` at the next kill-then-blocking-wait teardown on this thread, once the kill has
-    /// returned `Ok` and before the wait: `teardown_unadopted`, the sync `finish_elevated`, or the
-    /// async `wait_and_reap` and `teardown_through_pidfd`. A fixture that only that kill would end is released here, so a
-    /// no-kill mutant fails an assertion on how the child died (see [`record_teardown_reaps`])
-    /// instead of hanging the wait.
+    /// returned `Ok` and before the wait: `teardown_unadopted`, the sync `finish_elevated`,
+    /// `raw_spawn_teardown` (Windows), or the async `wait_and_reap` and `teardown_through_pidfd`.
+    /// A fixture that only that kill would end is released here, so a no-kill mutant fails an
+    /// assertion on how the child died (see [`record_teardown_reaps`]) instead of hanging the wait.
     pub(crate) fn set_between_kill_and_wait(hook: impl FnOnce() + 'static) -> ArmedBetweenKillAndWait {
         crate::oneshot_hook::arm(&BETWEEN_KILL_AND_WAIT, hook)
     }
@@ -3235,8 +3235,8 @@ pub(crate) mod fault {
     /// A reaped teardown child's pid and exit status.
     type TeardownReap = (u32, std::process::ExitStatus);
 
-    /// Record the pid and status of every child those three teardowns (see
-    /// [`set_between_kill_and_wait`]) wait on for real on this thread until the returned guard
+    /// Record the pid and status of every child the teardowns listed at
+    /// [`set_between_kill_and_wait`] wait on for real on this thread until the returned guard
     /// drops. A failed wait records nothing.
     pub(crate) fn record_teardown_reaps() -> TeardownReaps {
         let previous = TEARDOWN_REAPS.with(|r| r.borrow_mut().replace(Vec::new()));

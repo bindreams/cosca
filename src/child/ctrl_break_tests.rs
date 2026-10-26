@@ -150,6 +150,11 @@ fn child_graceful_shutdown_signals_the_group_but_only_kills_the_child() {
         Some(1),
         "the root ignores the break, so only the escalation can have ended it, got {status:?}"
     );
+    assert_eq!(
+        child.is_alive(),
+        crate::identity::Liveness::Dead,
+        "the escalation really ended the root"
+    );
     ctrl_break::assert_break_sent_to(child.id().pid());
     // The break reached a descendant the escalation does not touch. Its handler reports "handled",
     // so this read cannot race its death.
@@ -322,6 +327,11 @@ fn graceful_shutdown_tree_sweep_is_load_bearing_on_windows() {
     let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, root_sock);
     let status = child.graceful_shutdown_tree(Duration::ZERO).expect("tree escalates");
     assert_eq!(status.code(), Some(1), "the sweep ends the root, got {status:?}");
+    assert_eq!(
+        child.is_alive(),
+        crate::identity::Liveness::Dead,
+        "the sweep really ended the root"
+    );
     let Grandchild { sock, exit } = grand;
     drop(sock);
     assert_eq!(exit.wait_for_exit_code(), 1, "the sweep must kill the grandchild");

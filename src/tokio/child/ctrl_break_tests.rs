@@ -165,6 +165,11 @@ async fn async_child_graceful_shutdown_signals_the_group_but_only_kills_the_chil
         Some(1),
         "the root ignores the break, so only the escalation can have ended it, got {status:?}"
     );
+    assert_eq!(
+        child.is_alive(),
+        crate::identity::Liveness::Dead,
+        "the escalation really ended the root"
+    );
     ctrl_break::assert_break_sent_to(child.id().pid());
     // The break reached a descendant the escalation does not touch.
     assert_acked(&mut grand.sock);
@@ -226,6 +231,11 @@ async fn async_graceful_shutdown_tree_sweep_is_load_bearing_on_windows() {
         .await
         .expect("tree escalates");
     assert_eq!(status.code(), Some(1), "the sweep ends the root, got {status:?}");
+    assert_eq!(
+        child.is_alive(),
+        crate::identity::Liveness::Dead,
+        "the sweep really ended the root"
+    );
     let Grandchild { sock, exit } = grand;
     drop(sock);
     assert_eq!(exit.wait_for_exit_code(), 1, "the sweep must kill the grandchild");
