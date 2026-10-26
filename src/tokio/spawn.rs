@@ -700,7 +700,10 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
         proc_handle,
         prepared,
     );
-    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(unused_mut, reason = "only the Linux leaf below is mutated")
+    )]
     let mut attachment = match attach {
         Ok(v) => v,
         Err(error) => {
