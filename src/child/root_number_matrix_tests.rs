@@ -682,7 +682,7 @@ async fn run_tokio(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
     }
     let mut forced = reap.force(child.id());
 
-    // An async teardown does not wait for the leaf to drain, so the cell removes it.
+    // A teardown that does not wait for the drain leaves the leaf, so the cell removes it.
     #[cfg(target_os = "linux")]
     let leaf = child
         .leaf_path_for_test()
@@ -743,7 +743,6 @@ async fn run_tokio(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
         .read_to_end(&mut rest)
         .await
         .expect("the root and the cat are gone, closing stderr");
-    // An async drop does not wait for the leaf to drain: it would leave the leaf behind.
     if mechanism.is_cgroup() {
         child.wait_tree().await.expect("the leaf drains");
     }

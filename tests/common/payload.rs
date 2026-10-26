@@ -151,6 +151,9 @@ pub struct Sources {
     watcher: Option<JoinHandle<String>>,
     armed: bool,
     acceptor: JoinHandle<()>,
+    /// A clone of the acceptor's listener, dropped only after the acceptor is joined, so the port
+    /// stays ours until then; see [`wake_acceptor`].
+    held: TcpListener,
     stop: Arc<AtomicBool>,
     addr: SocketAddr,
 }
@@ -159,6 +162,7 @@ impl Sources {
     /// Starts the threads. Returns once the launcher watch, if it is an OS one, is armed.
     pub fn start(listener: TcpListener, watch: ExitWatch) -> Sources {
         let addr = listener.local_addr().expect("local_addr of the readiness listener");
+        let held = listener.try_clone().expect("clone the readiness listener");
         let (tx, rx) = mpsc::channel();
         let mut armed = false;
         let watcher = match watch {
@@ -214,6 +218,7 @@ impl Sources {
             watcher,
             armed,
             acceptor,
+            held,
             stop,
             addr,
         }
@@ -226,25 +231,44 @@ impl Sources {
         self.armed
     }
 
-    /// Ends the accepting thread: it is blocked in `accept`, and a connection to its own address
-    /// is what returns it. Closes the listener.
-    fn stop_accepting(&self) {
-        self.stop.store(true, Ordering::SeqCst);
-        // A failed connect means `accept` already returned an error, and the thread has ended.
-        let _ = TcpStream::connect(self.addr);
+    /// See [`wake_acceptor`].
+    fn stop_accepting(&self) -> Result<(), String> {
+        wake_acceptor(&self.stop, self.addr)
     }
 
     /// Waits for the launcher watch to return, stops accepting, and returns everything reported
     /// so far. For tests of the wiring: unlike [`accept_payload`] it cannot block on an event
     /// that never comes.
-    pub fn settle(self) -> Vec<Event> {
-        if let Some(watcher) = self.watcher {
+    pub fn settle(mut self) -> Vec<Event> {
+        if let Some(watcher) = self.watcher.take() {
             watcher.join().expect("client-exit watcher panicked");
         }
-        self.stop.store(true, Ordering::SeqCst);
-        let _ = TcpStream::connect(self.addr);
+        if let Err(wake) = self.stop_accepting() {
+            panic!("{wake}");
+        }
         self.acceptor.join().expect("accepting thread panicked");
         self.rx.try_iter().collect()
+    }
+}
+
+/// Sets `stop` and ends the accepting thread: it is blocked in `accept`, and a connection to
+/// its own address (`addr`) is what returns it.
+///
+/// [`Sources`] keeps a clone of the listener, so the port stays ours and the connection queues in
+/// its backlog even if the thread has already ended on an accept error; it never reaches another
+/// process's listener.
+///
+/// Errs with the connect error if the connection cannot be made: the thread would stay blocked
+/// and joining it would hang. `ConnectionRefused` is the exception: with the listener held open,
+/// it means a full backlog (Windows refuses then), and the thread's next `accept` takes a queued
+/// connection and sees `stop`.
+fn wake_acceptor(stop: &AtomicBool, addr: SocketAddr) -> Result<(), String> {
+    stop.store(true, Ordering::SeqCst);
+    match TcpStream::connect(addr) {
+        Err(e) if e.kind() != std::io::ErrorKind::ConnectionRefused => {
+            Err(format!("cannot wake the accepting thread of {addr}: {e}"))
+        }
+        _ => Ok(()),
     }
 }
 
@@ -263,7 +287,17 @@ pub fn accept_payload(listener: TcpListener, nonce: &str, watch: ExitWatch) -> P
     // The threads hold every sender and the main thread none, so if all hang up the iterator
     // ends instead of blocking forever.
     let verdict = decide(nonce, sources.rx.iter());
-    sources.stop_accepting();
+    // The wake failure must not replace a real verdict, and joining after it would hang.
+    if let Err(wake) = sources.stop_accepting() {
+        match verdict {
+            Ok(_) => panic!("{wake}"),
+            Err(message) => panic!("{message} (and {wake})"),
+        }
+    }
+    // Once the acceptor is joined and `held` dropped, the listener is closed before the verdict is
+    // acted on.
+    sources.acceptor.join().expect("accepting thread panicked");
+    drop(sources.held);
     match verdict {
         Ok((sock, pid)) => Payload {
             sock,

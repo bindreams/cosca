@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 
-use super::{seams::force_links, OnTracer, TracerWatch};
+use super::{seams::force_links, OnTracer, TracerWatch, WalkError};
 use crate::child::spawn::identity_macos_tests::{other_unique_id, std_blocker_with_unique};
 use crate::identity::{uniq_fault, Link, ReadPurpose, UniqRead};
 use crate::wait::backend::test_hooks::{event_pending, send_signal};
@@ -85,6 +85,15 @@ fn registered(kq: &Kqueue, pid: u32) -> bool {
 /// One walk, which must not fail.
 fn walk(watch: &mut TracerWatch, kq: &Kqueue, tracer: u32) -> OnTracer {
     watch.held_by(kq, tracer).expect("no read is refused")
+}
+
+/// The identity error a walk that must fail on a read returned.
+#[track_caller]
+fn identity_error(walked: Result<OnTracer, WalkError>) -> std::io::Error {
+    match walked {
+        Err(WalkError::Identity(e)) => e,
+        other => panic!("a refused read is an identity error: {other:?}"),
+    }
 }
 
 const MS: Duration = Duration::from_millis(1);
@@ -251,9 +260,7 @@ fn a_refused_read_of_a_tracer_is_an_error() {
     let kq = Kqueue::new().expect("kqueue");
     let mut watch = TracerWatch::default();
     let _links = force_links([Link::Refused(libc::EPERM)]);
-    let err = watch
-        .held_by(&kq, u32::MAX - 1)
-        .expect_err("a refused read is an error");
+    let err = identity_error(watch.held_by(&kq, u32::MAX - 1));
     assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
 }
 
@@ -265,9 +272,7 @@ fn an_unreadable_tracer_is_an_error() {
     let kq = Kqueue::new().expect("kqueue");
     let mut watch = TracerWatch::default();
     let _links = force_links([Link::Unreadable]);
-    let err = watch
-        .held_by(&kq, u32::MAX - 1)
-        .expect_err("an unreadable tracer is an error");
+    let err = identity_error(watch.held_by(&kq, u32::MAX - 1));
     assert!(err.to_string().contains("kinfo_proc refused"), "{err}");
 }
 
@@ -281,8 +286,6 @@ fn a_refused_re_read_after_the_registration_is_an_error() {
     let mut watch = TracerWatch::default();
     let _links = force_links([tracer.untraced()]);
     let _refused = uniq_fault::force_uniq_read_once(ReadPurpose::Link, UniqRead::Refused(libc::EPERM));
-    let err = watch
-        .held_by(&kq, tracer.pid())
-        .expect_err("a refused re-read is an error");
+    let err = identity_error(watch.held_by(&kq, tracer.pid()));
     assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
 }

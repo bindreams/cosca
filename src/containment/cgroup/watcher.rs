@@ -123,6 +123,10 @@ impl Watcher {
         if pump.is_some() {
             return Ok(());
         }
+        #[cfg(test)]
+        if super::fault::pump_starts_fail() {
+            return Err(std::io::Error::from_raw_os_error(libc::EAGAIN));
+        }
         let stop = rustix::event::eventfd(0, rustix::event::EventfdFlags::CLOEXEC)?;
         let stop = super::above_stdio(stop)?;
         let polled = stop.try_clone()?;
