@@ -1777,7 +1777,7 @@ fn reap_killed_root(id: ProcessId, os: &mut OsResources, signals: &mut DropSigna
     if let Some(until) = late.due() {
         #[cfg(test)]
         fault::run_before_reap_look();
-        if !proc.exit_visible_by(pid, until) {
+        if !proc.exit_visible_by(pid, until) && cfg!(not(target_os = "macos")) {
             late.warn("has not been reaped");
         }
     }
