@@ -7,7 +7,7 @@ use std::path::Path;
 #[path = "../../tests/common/subst.rs"]
 mod subst;
 
-use subst::Subst;
+pub(crate) use subst::{assert_undefined, Subst};
 
 use crate::probe::{canonical, cosca_output, outcome, set_cwd, spawned, std_output, verbatim_of, Render};
 
@@ -17,13 +17,9 @@ fn gfpn(path: &OsStr) -> String {
     use windows::core::PCWSTR;
     use windows::Win32::Storage::FileSystem::GetFullPathNameW;
     let wide: Vec<u16> = path.encode_wide().chain([0]).collect();
-    let mut buf = vec![0u16; 32 * 1024];
     // SAFETY: `wide` is NUL-terminated; `buf` is a live buffer the call writes at most its length of.
-    let n = unsafe { GetFullPathNameW(PCWSTR(wide.as_ptr()), Some(&mut buf), None) };
-    if n == 0 || n as usize > buf.len() {
-        return format!("err={}", std::io::Error::last_os_error().raw_os_error().unwrap_or(-1));
-    }
-    String::from_utf16_lossy(&buf[..n as usize])
+    crate::measure::wide_string(|buf| unsafe { GetFullPathNameW(PCWSTR(wide.as_ptr()), Some(buf), None) })
+        .unwrap_or_else(|code| format!("err={code}"))
 }
 
 /// Sets `=<drive>` in this process's environment, or removes it for `None`.
@@ -52,23 +48,16 @@ fn drive_dir_value(drive: &str) -> String {
 /// `current_dir("X:sub")`, what `GetFullPathNameW` makes of `X:sub` and the value it leaves in
 /// `=X:`, and where std runs the child.
 pub fn drive_dir(base: &str, image: &str) {
-    use windows::Win32::Storage::FileSystem::GetLogicalDrives;
     let d = canonical(base);
     for sub in ["sub", r"exists\sub"] {
         std::fs::create_dir_all(d.join(sub)).expect("create the drive's directories");
     }
     std::fs::write(d.join("afile"), b"x").expect("create <d>\\afile");
-    // SAFETY: no arguments; reads the mounted drives.
-    let mask = unsafe { GetLogicalDrives() };
-    let letter = (b'M'..=b'Z')
-        .rev()
-        .find(|l| mask & (1 << (l - b'A')) == 0)
-        .expect("a free drive letter");
-    let drive = format!("{}:", letter as char);
-    let _subst = match Subst::new(&drive, &d) {
+    let _subst = match Subst::map_free(&d) {
         Ok(s) => s,
         Err(e) => return outln!("subst=err {e}"),
     };
+    let drive = _subst.drive().to_owned();
     outln!("cwd_set={}", outcome(&set_cwd(d.as_os_str())));
     let render = Render(vec![(drive.clone(), "X:"), (d.to_str().unwrap().to_owned(), "<d>")]);
     let other = format!(r"{}\exists", d.display());
