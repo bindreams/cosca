@@ -610,7 +610,8 @@ pub(crate) fn pidfd_exit_visible_by(pidfd: std::os::fd::BorrowedFd<'_>, until: I
     use crate::wait::exit_only::{self, Peek, Target};
 
     match poll_pidfd_exit(pidfd, Some(Some(until))) {
-        Ok(true) | Err(_) => {}
+        Ok(true) => {}
+        Err(e) => log::debug!("a look at a killed child's exit could not poll its pidfd ({e}); it peeks instead"),
         Ok(false) => return false,
     }
     let target = Target::PidFd(pidfd);
@@ -618,7 +619,13 @@ pub(crate) fn pidfd_exit_visible_by(pidfd: std::os::fd::BorrowedFd<'_>, until: I
     loop {
         match exit_only::peek(&target) {
             Ok(Peek::Running) => {}
-            Ok(Peek::Exit(_) | Peek::Foreign(_)) | Err(_) => return true,
+            Ok(Peek::Exit(_) | Peek::Foreign(_)) => return true,
+            Err(e) => {
+                log::debug!(
+                    "a look at a killed child's exit could not peek at it ({e}); the wait that follows decides"
+                );
+                return true;
+            }
         }
         let at = now();
         if at >= until {

@@ -518,16 +518,13 @@ impl ProcSource {
     /// left in place, so a later call can still answer and a `Drop` forgets it.
     #[cfg(unix)]
     fn refuse(&mut self, state: RootState) -> Error {
-        debug_assert!(
-            !matches!(state, RootState::Unreaped),
-            "a wait refused a child its handle shows ours"
-        );
         let pid = match self {
             ProcSource::Tokio { child, .. } => child.id().map_or_else(|| "?".to_owned(), |pid| pid.to_string()),
             ProcSource::Foreign { .. } => "?".to_owned(),
         };
         match state {
-            RootState::Unreaped | RootState::Reaped => {
+            RootState::Unreaped => unreachable!("a wait refused a child its handle shows ours"),
+            RootState::Reaped => {
                 self.forget_as("was reaped by someone else", Forgotten::ReapedElsewhere);
                 gone()
             }
@@ -980,10 +977,13 @@ impl ProcSource {
             else {
                 return true;
             };
-            !matches!(
-                await_reapable(pid, Some(*identity), Some(until)),
-                Ok(Awaited::DeadlinePassed)
-            )
+            match await_reapable(pid, Some(*identity), Some(until)) {
+                Ok(waited) => waited != Awaited::DeadlinePassed,
+                Err(e) => {
+                    log::debug!("child {pid}: a look at its exit failed ({e}); the wait that follows decides");
+                    true
+                }
+            }
         }
     }
 
@@ -1543,7 +1543,8 @@ enum Halt {
 #[cfg(unix)]
 fn verdict_of(state: RootState) -> (Waited, Option<String>) {
     match state {
-        RootState::Unreaped | RootState::Reaped => (
+        RootState::Unreaped => unreachable!("a wait's look halted on a child its handle shows ours"),
+        RootState::Reaped => (
             Waited::Foreign,
             Some("its handle shows it reaped by someone else".to_owned()),
         ),
