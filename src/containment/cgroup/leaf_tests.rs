@@ -744,8 +744,14 @@ fn drop_kills_through_a_leaf_unless_the_child_provably_never_entered() {
             );
             assert!(!leaf.holds_spawn_resources());
         }
+        // This process stands in for the child that reported, and is no child of its own, so the
+        // abandoned spawn's cleanup takes it for one reaped elsewhere and kills the group it
+        // leads (on Linux 6.9+, through its pidfd): this test's own, under nextest. The group is
+        // reported gone instead.
+        crate::containment::cgroup::fault::set_force_group_kill_gone(matches!(report, PlacementReport::WriteFailed(_)));
         let mark = crate::log_capture::mark();
         drop(leaf);
+        crate::containment::cgroup::fault::set_force_group_kill_gone(false);
 
         assert_eq!(
             leaf_path.join("cgroup.kill").exists(),
