@@ -55,6 +55,7 @@ thread_local! {
     static CGROUP_ID_FAILS: Cell<Option<i32>> = const { Cell::new(None) };
     static LIVENESS_READ_FAILS: Cell<Option<i32>> = const { Cell::new(None) };
     static SUBTREE_FAILS: Cell<Option<i32>> = const { Cell::new(None) };
+    static TERMINATE_FAILS: Cell<Option<(TerminateStep, i32)>> = const { Cell::new(None) };
     static RMDIR_HOOK: std::cell::RefCell<Option<RmdirHook>> = std::cell::RefCell::new(None);
     static FORCE_FORK_RUNNING_PIDFD_FAILURE: Cell<bool> = const { Cell::new(false) };
     static FORK_RUNNING_PIDFD_FAILURE_PROBE: std::cell::RefCell<Option<std::os::fd::OwnedFd>> =
@@ -930,6 +931,38 @@ impl Drop for FailSubtree {
     fn drop(&mut self) {
         SUBTREE_FAILS.with(|f| f.set(None));
     }
+}
+
+/// A step of `CgroupLeaf::terminate`'s `SIGTERM` to one member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminateStep {
+    /// The `pidfd_open` that pins the member.
+    Pin,
+    /// The `pidfd_send_signal`.
+    Send,
+}
+
+/// While the guard lives, `step` of each member's `SIGTERM` in `CgroupLeaf::terminate` on this
+/// thread fails with `errno`, and the call it stands for is not made.
+pub(crate) fn fail_terminate(step: TerminateStep, errno: i32) -> FailTerminate {
+    TERMINATE_FAILS.with(|f| f.set(Some((step, errno))));
+    FailTerminate(())
+}
+
+#[must_use = "terminate's steps run again as soon as the guard is dropped"]
+pub(crate) struct FailTerminate(());
+
+impl Drop for FailTerminate {
+    fn drop(&mut self) {
+        TERMINATE_FAILS.with(|f| f.set(None));
+    }
+}
+
+/// The errno `step` fails with, if a [`fail_terminate`] guard is live for it.
+pub(crate) fn terminate_fails(step: TerminateStep) -> Option<i32> {
+    TERMINATE_FAILS
+        .with(Cell::get)
+        .and_then(|(failing, errno)| (failing == step).then_some(errno))
 }
 
 pub(crate) fn subtree_fails() -> Option<i32> {
