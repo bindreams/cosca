@@ -82,8 +82,8 @@ pub trait PurePath: Eq + Ord + Hash + Debug + ToOwned<Owned = Self::Buf> {
     /// trailing dots included. On POSIX, a path that ended in a separator, `.` or `name/..` ends in
     /// one separator after a name (`a/.` and `a/b/..` are `a/`), but never after `..` (`../` is
     /// `..`). On Windows, only a separator written last leaves one, as Win32 reads it (`a\.\` is
-    /// `a\`; `a\.` and `a\b\..` are `a`). `..` at the root is dropped; an emptied relative path
-    /// becomes `.`. `link/..` is not the parent of `link`'s target.
+    /// `a\`, `a\..\` is `.\` and `..\` stays; `a\.` and `a\b\..` are `a`). `..` at the root is
+    /// dropped; an emptied relative path becomes `.`. `link/..` is not the parent of `link`'s target.
     fn lexically_normal(&self) -> Self::Buf;
 
     /// A lossy adapter for user messages: anything that is not Unicode becomes U+FFFD.

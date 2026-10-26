@@ -499,7 +499,8 @@ impl PurePath for Path {
 
     /// As for POSIX, and as Win32 reads `.` and `..`: the anchor is kept as written; `\` goes
     /// between components; a final `.` or `..` leaves no trailing separator, and only one written
-    /// last stays (`C:\a\b\..` is `C:\a`, `C:\a\.\` is `C:\a\`); `..` is dropped after a root
+    /// last stays, after `.` and `..` too (`C:\a\b\..` is `C:\a`, `C:\a\.\` is `C:\a\`, `a\..\` is
+    /// `.\`, `..\` stays, `C:a\..\` is `C:.\`); `..` is dropped after a root
     /// separator (`C:\..` is `C:\`) and kept after `C:`; an emptied path after `C:` stays `C:`;
     /// and a first name that would read as a drive keeps a `.` before it (`.\a:`). A device name,
     /// and a share after extra separators, is the first component under `\\.\` or `\\server\` (see
@@ -532,8 +533,9 @@ impl PurePath for Path {
                     names.push(c);
                     trailing = false;
                 }
-                // Only a separator written last leaves one; a final `.` or `..` does not.
-                Component::Empty => trailing = !names.is_empty(),
+                // Only a separator written last leaves one; a final `.` or `..` does not. After a
+                // root separator, that separator is the root.
+                Component::Empty => trailing = !names.is_empty() || !root,
                 Component::CurDir => trailing = false,
                 Component::ParentDir => {
                     trailing = false;
@@ -546,9 +548,6 @@ impl PurePath for Path {
                     }
                 }
             }
-        }
-        if names.last() == Some(&Component::ParentDir) {
-            trailing = false;
         }
         if share_separator && names.is_empty() && !bytes.last().is_some_and(is_separator) {
             out.pop();
@@ -563,6 +562,10 @@ impl PurePath for Path {
             out.extend_from_slice(c.as_wtf8());
         }
         if trailing {
+            // Only a relative path can end here with no name: `a\..\` is `.\`.
+            if names.is_empty() {
+                out.push(b'.');
+            }
             out.push(b'\\');
         }
         if out.is_empty() {

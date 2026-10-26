@@ -9,8 +9,6 @@
 //!   at the end of the path (`\\s\.`, `\\s\ `), which stays `Anchor::Unc` and fully qualified though
 //!   Win32 resolves it to `\\s\`, and a device name that ends in them (`\\.\d.\x`, which Win32
 //!   reads as `\\.\d\x`).
-//! - Pending a decision: a relative normal form that ends in `.` or `..` carries no separator, so
-//!   `a\..\` is `.` where Win32 keeps the separator it ended in.
 //! - `\\.` or `\\?` alone: Win32 completes it to `\\.\` (`\\?\`); the normal form keeps the anchor.
 //! - Verbatim spellings: Win32 takes the rest as written; parsing drops the prefix.
 //!
@@ -69,14 +67,14 @@ fn full_path(s: &str) -> String {
     String::from_utf16(&buf[..n as usize]).unwrap()
 }
 
-/// Every small path, and longer ones after `\\`, `\\.\` and `C:\` that reach extra separators
+/// Every small path, and longer ones after `\\`, `\\.\`, `C:\` and `C:` that reach extra separators
 /// before a share or device name and a device name popped by `..`, and names ending in a space. No
 /// verbatim spellings.
 fn win32_grid() -> Vec<String> {
     let mut all = small_paths();
     let mut tails = paths_over(&["a", ".", "..", "\\", "/"], 6);
     tails.extend(paths_over(&["a", " ", ".", "\\"], 6));
-    for prefix in [r"\\", r"\\.\", r"C:\"] {
+    for prefix in [r"\\", r"\\.\", r"C:\", "C:"] {
         all.extend(tails.iter().map(|tail| format!("{prefix}{tail}")));
     }
     all.retain(|s| !s.starts_with(r"\\?\"));
@@ -346,7 +344,13 @@ fn lexically_normal_agrees_with_win32() {
             Anchor::Drive { rooted: false, .. } => {
                 let under_base = |s: &str| {
                     let drive_len = s.chars().next().unwrap().len_utf8() + 1;
-                    full_path(&format!("{}{BASE}{}", &s[..drive_len], &s[drive_len..]))
+                    // A bare drive is the drive's directory itself, with no separator after it.
+                    let base = if s.len() == drive_len {
+                        &BASE[..BASE.len() - 1]
+                    } else {
+                        BASE
+                    };
+                    full_path(&format!("{}{base}{}", &s[..drive_len], &s[drive_len..]))
                 };
                 (under_base(&input), under_base(normal))
             }
@@ -360,14 +364,6 @@ fn lexically_normal_agrees_with_win32() {
                 continue;
             }
         };
-        if matches!(path.anchor(), Anchor::None | Anchor::Drive { rooted: false, .. })
-            && matches!(normal.rsplit(['\\', '/', ':']).next(), Some("." | ".."))
-            && from_input == format!("{from_normal}\\")
-        {
-            // Pending a decision: a relative normal form that ends in `.` or `..` has no place for
-            // the separator the path ended in (`a\..\`), which Win32 keeps.
-            continue;
-        }
         assert_eq!(from_normal, from_input, "{ctx}");
     }
 }

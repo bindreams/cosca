@@ -1084,9 +1084,17 @@ fn lexically_normal_collapses_only_dots_and_separators() {
         (r"\\.\d\x\..", r"\\.\d"),
         (r"\\.\d\x\.", r"\\.\d\x"),
         (r"\\.\d\x\.\", r"\\.\d\x\"),
-        (r"..\", ".."),
+        (r"..\", r"..\"),
+        (r"a\..\..\", r"..\"),
         (r"a\..", "."),
+        (r"a\..\", r".\"),
+        (r".\", r".\"),
+        (r".\\", r".\"),
+        ("a/../", r".\"),
         (r"C:a\..", "C:"),
+        (r"C:a\..\", r"C:.\"),
+        (r"C:.\", r"C:.\"),
+        (r"C:..\", r"C:..\"),
         (r"\\s\h", r"\\s\h"),
         ("", ""),
     ];
@@ -1151,10 +1159,10 @@ fn lexically_normal_keeps_a_drive_like_name_relative() {
 }
 
 /// For every small path, the normal form is a fixed point, has the same anchor (or, for a device
-/// path, another device), and holds no `.`, no empty name but a last one after a name, and no `..`
-/// after a name or at a root. Off Windows, it also holds the names and `..` a stack reduction of
-/// the device name and components leaves; on Windows, `lexically_normal_agrees_with_win32` checks
-/// the result against Win32 instead.
+/// path, another device), and holds no `.` but the one in `.\`, no empty name but a last one after a
+/// name, and no `..` after a name or at a root. Off Windows, it also holds the names and `..` a stack
+/// reduction of the device name and components leaves; on Windows,
+/// `lexically_normal_agrees_with_win32` checks the result against Win32 instead.
 ///
 /// Mutant: `name\..` drops the `..` and keeps the name, so `a\..\b` becomes `a\b`.
 #[skuld::test]
@@ -1178,14 +1186,22 @@ fn lexically_normal_result_is_normal() {
             continue;
         }
         let all: Vec<_> = normal.components().collect();
+        // A relative path that ends in a separator with no name before it is `.` and that
+        // separator.
+        let dot_then_separator = all.len() == 2 && all[0] == Component::CurDir && all[1] == Component::Empty;
         for (i, c) in all.iter().enumerate() {
             let last = i + 1 == all.len();
             match c {
                 // A first name that reads as a drive keeps a `.` before it.
                 Component::CurDir if i == 0 && all.get(1).is_some_and(reads_as_drive) => {}
+                Component::CurDir if i == 0 && dot_then_separator => {}
                 Component::CurDir => panic!("`.` in the normal form of {input:?}"),
                 Component::Empty => assert!(
-                    last && i > 0 && matches!(all[i - 1], Component::Normal(_)),
+                    last && i > 0
+                        && matches!(
+                            all[i - 1],
+                            Component::Normal(_) | Component::ParentDir | Component::CurDir
+                        ),
                     "empty name at {i} in the normal form of {input:?}"
                 ),
                 Component::ParentDir => assert!(
