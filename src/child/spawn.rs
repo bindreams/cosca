@@ -287,6 +287,10 @@ fn wait_killed_elevated(child: &Child) -> Result<std::process::ExitStatus, Error
     let waited = child.wait();
     #[cfg(test)]
     if let Some(marker) = fault::take_force_reap_failure() {
+        // The caller records a reap it sees succeed: this one it sees fail, so record it here.
+        if let Ok(status) = &waited {
+            fault::record_teardown_reap(child.id().pid(), *status);
+        }
         return waited.and(Err(Error::Io(std::io::Error::other(marker))));
     }
     waited
