@@ -315,14 +315,17 @@ impl Armed {
             mut other,
         } = self;
         drop(guard);
-        let running = other.try_wait().expect("look at the other group's leader");
-        other.kill().expect("kill the other group's leader");
+        // It exits at its stdin's EOF, so a signal that ended it shows in its status.
+        drop(other.stdin.take());
         let status = other.wait().expect("reap the other group's leader");
         drop(stdin);
         let mut rest = Vec::new();
         stderr.read_to_end(&mut rest).expect("read stderr to the member's end");
-        assert_eq!(running, None, "the other group's leader was signalled");
-        assert_eq!(status.signal(), Some(libc::SIGKILL), "got {status:?}");
+        assert_eq!(
+            status.signal(),
+            None,
+            "the other group's leader was signalled: {status:?}"
+        );
     }
 }
 
