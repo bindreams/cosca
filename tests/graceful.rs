@@ -137,20 +137,21 @@ fn process_kill_tree_tears_down_tree() {
 #[cfg(unix)]
 #[skuld::test]
 fn process_graceful_shutdown_tree_tears_down_tree() {
-    use std::io::Read;
     use std::time::Duration;
-    let (child, mut socks) = common::spawn_grandchild(false);
+    // The members echo until released, so a shutdown that signalled nothing is caught by an echo,
+    // not by a read that never ends.
+    let (child, socks) = common::spawn_tree_with("spawn-grandchild", false, |cmd| {
+        cmd.env(common::ECHO_HELD_ENV, "1");
+    });
+    let [root, grand]: [_; 2] = socks.try_into().expect("a root and a grandchild socket");
+    let (root, grand) = (
+        common::Member::new(root, child.id().pid()),
+        common::Member::new(grand, common::last_reported_grandchild().expect("the grandchild's pid")),
+    );
     let p = cosca::Process::from_pid(child.id().pid()).found().expect("resolves");
     p.graceful_shutdown_tree(Duration::from_secs(30))
         .expect("foreign tree graceful");
-    for (i, s) in socks.iter_mut().enumerate() {
-        let mut buf = [0u8; 1];
-        match s.read(&mut buf) {
-            Ok(0) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
-            other => panic!("tree member {i} not torn down: {other:?}"),
-        }
-    }
+    common::assert_members_killed(vec![(root, "the root"), (grand, "the grandchild")]);
     let _ = child.wait();
 }
 
