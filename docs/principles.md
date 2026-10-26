@@ -119,9 +119,12 @@ Where a group ID must be used (process-group or fd-marker containment), keep the
 zombie until the group kill is done. On Linux 6.9+ the root's pidfd names its group exactly, whoever
 reaped the root: the group is signalled through it (`PIDFD_SIGNAL_PROCESS_GROUP`), and a signal-0
 send through it shows whether the group still has a member; while it has one, its number cannot be
-reissued. So a tree call, a drop and a failed spawn's cleanup still kill the group of a reaped root
-while it has a member, whoever reaped the root, and send nothing once it has none; that signal-0
-send is also the check before each send by the group's number. cosca detects the flag by acting,
+reissued. So a tree call, a drop and the cleanup of a spawn that fails at its identity read, of an
+elevated spawn that cannot finish, or of an abandoned spawn whose cgroup leaf did not take its root
+still kill the group of a reaped root while it has a member, whoever reaped the root, and send
+nothing once it has none; that signal-0 send is also the check before each send by the group's
+number. The cleanup of a tokio spawn that fails after its fork does not yet: it kills the root
+alone. cosca detects the flag by acting,
 and an older kernel's `EINVAL` falls back to the group's number, checked against the root's state.
 On 6.9+ a member's resend still goes by its pid when the member's own `pidfd_open` fails (`EMFILE`,
 say), right after a check of its identity. Below 6.9 and on macOS a reaper elsewhere in the process
@@ -156,8 +159,9 @@ debug-asserts on it.
 After a foreign reap:
 
 - On Linux, cgroup plus pidfd stays exact; only the exit status is lost.
-- On Linux 6.9+ a process-group kill, by a tree call, a drop or a failed spawn's cleanup, stays
-  exact through the root's pidfd (principle 4). Below 6.9 and on macOS, process-group kills, and an fd marker's kills by the
+- On Linux 6.9+ a process-group kill, by a tree call, a drop or the cleanup of a failed spawn
+  (not yet a tokio spawn's that fails after its fork), stays exact through the root's pidfd
+  (principle 4). Below 6.9 and on macOS, process-group kills, and an fd marker's kills by the
   root's number (its group and its ppid walk), are unsafe. The marker's holders are named by the
   pipe they hold and are still killed exactly.
 - macOS has no pidfd, and cosca has no exact kill there.
