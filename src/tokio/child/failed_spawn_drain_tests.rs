@@ -7,17 +7,16 @@ use std::rc::Rc;
 use super::child_drop_tests::linux;
 use crate::containment::cgroup::fault as leaf_fault;
 use crate::containment::cgroup::test_support::FakeLeaf;
-use crate::test_groups::{cgroup, Group};
 
 /// `finish_elevated` after a failed elevation write kills the tree and waits for its leaf to drain
 /// (`Child::block_until_members_drained`). The fake leaf's member is released from the hook that
 /// runs right after the warn, which records how many warns were out by then.
 ///
-/// The wait's unbounded park releases the member too, so a wait that never warned fails the
+/// A wait that blocks with no warn releases the member too, so a wait that never warned fails the
 /// assertion on the warns out by then instead of hanging.
 ///
 /// Mutants: the drain wait's warn call is removed (the hook still runs, and finds no warn);
-/// `block_until_members_drained` waits with `wait_drained(None)` (the park's hook finds no warn).
+/// `block_until_members_drained` waits with `NoWarn` (the blocking wait's hook finds no warn).
 #[skuld::test]
 async fn a_failed_elevation_writes_drain_warns_once_past_1s() {
     let mut cmd = crate::tokio::Command::new();
@@ -45,9 +44,16 @@ async fn a_failed_elevation_writes_drain_warns_once_past_1s() {
                     FakeLeaf::set_populated(&events, false);
                 }
             });
-            let _backstop = leaf_fault::set_before_unbounded_drain_park({
-                let events = fake.events.clone();
-                move || FakeLeaf::set_populated(&events, false)
+            let _backstop = leaf_fault::set_before_drain_block({
+                let (events, warns_at_release) = (fake.events.clone(), Rc::clone(&warns_at_release));
+                move || {
+                    if warns_at_release.get().is_none() {
+                        warns_at_release.set(Some(
+                            crate::log_capture::records_since(mark, "still waiting for it to drain").len(),
+                        ));
+                    }
+                    FakeLeaf::set_populated(&events, false);
+                }
             });
             let failed =
                 crate::tokio::spawn::finish_elevated(child, Err(crate::error::Error::Io(std::io::Error::other("w"))))
@@ -73,24 +79,4 @@ async fn a_failed_elevation_writes_drain_warns_once_past_1s() {
     );
     assert_eq!(levels, [log::Level::Warn], "exactly one warn, at warn");
     assert!(removed, "the drained leaf is removed");
-}
-
-/// A spawn that succeeds hands its leaf to the handle, whose armed drop warns of a slow drain
-/// itself: the leaf must not also warn from its own `Drop`, which would make two warns of one wait.
-///
-/// Mutant: a successful spawn leaves the failed-spawn warn set on its leaf.
-#[skuld::test]
-async fn a_successful_spawn_leaves_its_leaf_to_the_armed_drops_warn(#[fixture(cgroup)] _group: &Group) {
-    let _warn = crate::tokio::child::fault::warn_slow_teardowns();
-    let mut cmd = crate::tokio::Command::new();
-    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
-    cmd.contain_with(crate::ContainMode::Strongest);
-    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
-    cmd.stdout(crate::Stdio::null()).expect("set stdout");
-    let mut child = cmd.spawn().expect("spawn");
-    let _stdin = child.stdin().expect("piped stdin");
-    let crate::containment::Attached::Cgroup(leaf) = &child.os.attached else {
-        panic!("expected a cgroup leaf, got {:?}", child.os.attached);
-    };
-    assert_eq!(leaf.drain_warn_after_for_test(), None);
 }

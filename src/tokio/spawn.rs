@@ -389,11 +389,11 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
             cmd.env_ops(),
         )
         .not_started()?;
-        // A failed spawn's teardown drops this leaf, whose drain wait then warns once past 1 s (the
-        // handle's armed drop warns instead, so a successful attach clears it below).
+        // Until `attach` takes the leaf, a failed spawn's teardown drops or abandons it here, and its
+        // drain waits warn once past 1 s.
         #[cfg(target_os = "linux")]
-        if let Some(leaf) = prepared.cgroup_leaf.as_mut() {
-            leaf.warn_when_drain_is_slow(super::child::slow_teardown_after());
+        {
+            prepared.teardown_warn_after = super::child::slow_teardown_after();
         }
         // A front this host could not place after a cgroup kill is refused before it is spawned.
         #[cfg(target_os = "linux")]
@@ -700,11 +700,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
         proc_handle,
         prepared,
     );
-    #[cfg_attr(
-        not(target_os = "linux"),
-        allow(unused_mut, reason = "only the Linux leaf below is mutated")
-    )]
-    let mut attachment = match attach {
+    let attachment = match attach {
         Ok(v) => v,
         Err(error) => {
             #[cfg(target_os = "macos")]
@@ -756,11 +752,6 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
             return Err(SpawnFailure::started(error, child_fate));
         }
     };
-
-    #[cfg(target_os = "linux")]
-    if let crate::containment::Attached::Cgroup(leaf) = &mut attachment.attached {
-        leaf.warn_when_drain_is_slow(None);
-    }
 
     // fd >= 3 parent ends: Unix's `fd_map`-wired reactor pipes; on Windows the std path
     // resolves none (fd >= 3 routes to the raw backend), so `parent_ends` is provably empty and the

@@ -156,13 +156,15 @@ impl DrainWatch {
         }
     }
 
-    /// [`wait`](Self::wait), and `warn` runs once if the leaf is still populated `after` into it. The
-    /// wait goes on, unbounded, after the warn: the time decides the message and nothing else.
-    #[cfg(feature = "tokio")]
-    pub(crate) fn wait_warning(&mut self, after: std::time::Duration, warn: impl FnOnce()) -> Result<(), Error> {
+    /// [`wait`](Self::wait), and `warn` runs once if the leaf is still populated at `until`. The wait
+    /// goes on, unbounded, after the warn: the time decides the message and nothing else. An error
+    /// ends the wait, before the warn or after it.
+    pub(crate) fn wait_warning(&mut self, until: Option<std::time::Instant>, warn: impl FnOnce()) -> Result<(), Error> {
         use rustix::event::{poll, PollFd, PollFlags, Timespec};
 
-        let until = crate::wait::now() + after;
+        let Some(until) = until else {
+            return self.wait();
+        };
         let drained = crate::wait::rearm_until(Some(Some(until)), |remaining| {
             if !self.populated()? {
                 return Ok(Some(()));

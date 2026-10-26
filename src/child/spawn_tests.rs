@@ -771,7 +771,7 @@ fn a_failed_password_write_kills_the_contained_tree() {
 /// the leaf, warning of nothing. The members of the fake leaf exit when the wait is about to
 /// block, not before.
 ///
-/// Mutant: the leaf's `Drop` does not wait for the drain (`block_until_drained` returns at once).
+/// Mutant: the leaf's `Drop` does not wait for the drain (`wait_drained_then_warn` returns at once).
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn a_failed_password_write_removes_the_leaf_once_the_tree_drains() {

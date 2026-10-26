@@ -13,7 +13,7 @@ impl CgroupLeaf {
     /// the levels of `Drop`: `debug`, or `warn` only if a kill attempt failed. A drain that could
     /// not be read is reported as that, at the same level.
     ///
-    /// Never calls [`abandon`](Self::abandon_before_verdict), `disarm` or `block_until_drained`:
+    /// Never calls [`abandon`](Self::abandon_before_verdict), `disarm` or `wait_drained_then_warn`:
     /// the first two would clear the kill record this reads, and the last is the wait.
     pub(crate) fn release_without_waiting(mut self) {
         debug_assert!(self.report.is_none(), "a released leaf has taken its placement verdict");

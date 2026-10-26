@@ -71,7 +71,7 @@ impl Root {
 /// The root is reaped when the drop returns, and the teardown says it collected the exit. So does
 /// the awaited teardown of a failed run-to-completion helper.
 ///
-/// Mutant: no reap (the drop hands tokio's `Child` to its own drop, as before).
+/// Mutant: no reap.
 #[skuld::test]
 async fn tokio_armed_drop_reaps_before_returning() {
     let (child, _stdin) = blocker();
@@ -196,6 +196,7 @@ async fn tokio_armed_drop_warns_once_when_the_reap_waits_past_1s(#[fixture(trace
             tid_tx
                 .send(rustix::thread::gettid().as_raw_nonzero().get())
                 .expect("report the tid");
+            let _warn = super::fault::warn_slow_teardowns();
             drop(child);
         });
         let tid = tid_rx.recv().expect("the dropper's tid");
@@ -277,54 +278,32 @@ async fn tokio_armed_drop_whose_tree_kill_fails_does_not_wait_for_the_drain() {
     );
 }
 
-/// A leaf that has not drained 1 s after the drop's kill: the drop warns once, naming the root's
-/// pid and the leaf, and keeps waiting until the leaf drains, then removes it. The fake leaf's member
-/// is released only from a drain wait that blocks after the leaf's first `rmdir`, which follows the
-/// bounded look that decides the warn; the release records whether the warn was out by then.
+/// A leaf that has not drained when the drop's warn is due: the drop warns once, naming the root's
+/// pid and the leaf, and keeps waiting until the leaf drains, then removes it. The root is reaped
+/// before the drop, so the drain's is the only wait.
 ///
-/// Mutants: no warn on the drain; a drop that waits at most 1 s, then releases the leaf without
-/// waiting (the member is never released, and the leaf is left behind).
+/// Mutants: no warn on the drain; a drop that waits only until the warn is due, then releases the
+/// leaf without waiting (the member is never released, and the leaf is left behind).
 #[cfg(target_os = "linux")]
 #[skuld::test]
-async fn tokio_armed_drop_warns_once_when_the_drain_waits_past_1s() {
-    use std::cell::{Cell, RefCell};
-    use std::rc::Rc;
-
+async fn tokio_armed_drop_warns_once_when_the_drain_is_slow() {
     use super::child_drop_tests::linux;
-    use crate::containment::cgroup::fault as leaf_fault;
-    use crate::containment::cgroup::test_support::FakeLeaf;
 
     crate::tokio::test_runtime::assert_current_thread();
     let name = "cosca-armed-drop-slow-drain";
+    let child = reaped_blocker().await;
     let (fake, leaf) = linux::fake_leaf(name, true);
-    let (child, _stdin) = blocker();
     let needle = format!("async child {}", child.id().pid());
     let mark = crate::log_capture::mark();
-    let warned_at_release = Rc::new(Cell::new(None));
-    let release: Rc<RefCell<Option<crate::oneshot_hook::Armed>>> = Rc::default();
-    let (path, events) = (fake.leaf.clone(), fake.events.clone());
-    let (seen, armed) = (Rc::clone(&warned_at_release), Rc::clone(&release));
-    leaf_fault::set_rmdir_hook(move |_| {
-        if armed.borrow().is_none() {
-            let (seen, events, needle) = (Rc::clone(&seen), events.clone(), needle.clone());
-            *armed.borrow_mut() = Some(leaf_fault::set_before_drain_block(move || {
-                let warns = crate::log_capture::records_since(mark, &needle)
-                    .into_iter()
-                    .filter(|text| text.contains("still waiting") && text.contains(name))
-                    .count();
-                seen.set(Some(warns));
-                FakeLeaf::set_populated(&events, false);
-            }));
-        }
-        FakeLeaf::rmdir(&path, &events)
-    });
+    let (warned_at_release, release) = release_from_the_blocking_wait(&fake, name, needle, mark);
+    let _warn = super::fault::warn_slow_teardowns_after(std::time::Duration::ZERO);
     let (steps, _) = linux::dropped(linux::contained_by(child, leaf), name);
     drop(release.borrow_mut().take());
 
     assert_eq!(
         warned_at_release.get(),
         Some(1),
-        "the drop must wait for the drain past its look, with one warn naming the leaf by then: {steps:?}"
+        "the drop must wait for the drain past its warn, with one warn naming the leaf by then: {steps:?}"
     );
     assert!(!fake.leaf.exists(), "the drained leaf is removed: {steps:?}");
     assert_eq!(
@@ -448,20 +427,14 @@ fn a_dropped_awaited_teardown_finishes_as_the_drop_would() {
 }
 
 /// A helper's teardown dropped while it awaits the drain leaves the leaf to a wait on the dropping
-/// thread, as the drop does, with the drop's one warn once that wait passes 1 s. The fake leaf's
-/// member is released only from a drain wait that blocks after the leaf's first `rmdir`, which
-/// follows the bounded look that decides the warn.
+/// thread, as the drop does, with the drop's one warn once that wait is slow.
 ///
 /// Mutant: the dropped teardown leaves the leaf to its own drop, which blocks with no warn.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn a_teardown_dropped_during_the_drain_warns_once_past_1s() {
-    use std::cell::{Cell, RefCell};
-    use std::rc::Rc;
-
+fn a_teardown_dropped_during_the_drain_warns_once() {
     use super::child_drop_tests::linux;
     use crate::containment::cgroup::fault as leaf_fault;
-    use crate::containment::cgroup::test_support::FakeLeaf;
 
     let rt = ::tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -469,40 +442,25 @@ fn a_teardown_dropped_during_the_drain_warns_once_past_1s() {
         .expect("current_thread runtime");
     let name = "cosca-teardown-dropped-in-drain";
     let (fake, leaf) = linux::fake_leaf(name, true);
-    let warned_at_release = Rc::new(Cell::new(None));
-    let release: Rc<RefCell<Option<crate::oneshot_hook::Armed>>> = Rc::default();
     let mark = crate::log_capture::mark();
+    let _warn = super::fault::warn_slow_teardowns_after(std::time::Duration::ZERO);
     let (draining_tx, draining_rx) = ::tokio::sync::oneshot::channel();
     // The awaited drain is about to wait: the test drops the teardown then.
     let _draining = leaf_fault::set_before_drain_block(move || {
         _ = draining_tx.send(());
     });
-    let fate = rt.block_on(async {
+    let (fate, warned_at_release, release) = rt.block_on(async {
         let (child, _stdin) = blocker();
         let needle = format!("async child {}", child.id().pid());
-        let (path, events) = (fake.leaf.clone(), fake.events.clone());
-        let (seen, armed) = (Rc::clone(&warned_at_release), Rc::clone(&release));
-        leaf_fault::set_rmdir_hook(move |_| {
-            if armed.borrow().is_none() {
-                let (seen, events, needle) = (Rc::clone(&seen), events.clone(), needle.clone());
-                *armed.borrow_mut() = Some(leaf_fault::set_before_drain_block(move || {
-                    let warns = crate::log_capture::records_since(mark, &needle)
-                        .into_iter()
-                        .filter(|text| text.contains("still waiting") && text.contains(name))
-                        .count();
-                    seen.set(Some(warns));
-                    FakeLeaf::set_populated(&events, false);
-                }));
-            }
-            FakeLeaf::rmdir(&path, &events)
-        });
+        let (warned_at_release, release) = release_from_the_blocking_wait(&fake, name, needle, mark);
         let mut child = linux::contained_by(child, leaf);
         let teardown = child.tear_down_awaiting();
-        ::tokio::select! {
+        let fate = ::tokio::select! {
             biased;
             fate = teardown => Some(fate),
             _ = draining_rx => None,
-        }
+        };
+        (fate, warned_at_release, release)
     });
     leaf_fault::take_rmdir_hook();
     drop(release.borrow_mut().take());
@@ -511,7 +469,7 @@ fn a_teardown_dropped_during_the_drain_warns_once_past_1s() {
     assert_eq!(
         warned_at_release.get(),
         Some(1),
-        "the dropped teardown must wait for the drain past its look, with one warn naming the leaf by then"
+        "the dropped teardown must wait for the drain past its warn, with one warn naming the leaf by then"
     );
     assert!(!fake.leaf.exists(), "the drained leaf is removed");
     assert_eq!(
@@ -522,21 +480,15 @@ fn a_teardown_dropped_during_the_drain_warns_once_past_1s() {
 }
 
 /// A helper's teardown whose drain cannot be watched hands the leaf to a wait on this thread, as
-/// the drop does, with the drop's one warn once that wait passes 1 s. The fake leaf's member is
-/// released only from a drain wait that blocks after the leaf's first `rmdir`, which follows the
-/// bounded look that decides the warn.
+/// the drop does, with the drop's one warn once that wait is slow.
 ///
 /// Mutant: a failed drain watch is ignored and the leaf is dropped at once, so its own drop blocks
 /// with no warn.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn a_teardown_whose_drain_watch_fails_warns_once_past_1s() {
-    use std::cell::{Cell, RefCell};
-    use std::rc::Rc;
-
+fn a_teardown_whose_drain_watch_fails_warns_once() {
     use super::child_drop_tests::linux;
     use crate::containment::cgroup::fault as leaf_fault;
-    use crate::containment::cgroup::test_support::FakeLeaf;
 
     let rt = ::tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -544,31 +496,15 @@ fn a_teardown_whose_drain_watch_fails_warns_once_past_1s() {
         .expect("current_thread runtime");
     let name = "cosca-teardown-drain-watch-fails";
     let (fake, leaf) = linux::fake_leaf(name, true);
-    let warned_at_release = Rc::new(Cell::new(None));
-    let release: Rc<RefCell<Option<crate::oneshot_hook::Armed>>> = Rc::default();
     let mark = crate::log_capture::mark();
+    let _warn = super::fault::warn_slow_teardowns_after(std::time::Duration::ZERO);
     let _watch_fails = super::fault::fail_drain_watch();
-    let fate = rt.block_on(async {
+    let (fate, warned_at_release, release) = rt.block_on(async {
         let (child, _stdin) = blocker();
         let needle = format!("async child {}", child.id().pid());
-        let (path, events) = (fake.leaf.clone(), fake.events.clone());
-        let (seen, armed) = (Rc::clone(&warned_at_release), Rc::clone(&release));
-        leaf_fault::set_rmdir_hook(move |_| {
-            if armed.borrow().is_none() {
-                let (seen, events, needle) = (Rc::clone(&seen), events.clone(), needle.clone());
-                *armed.borrow_mut() = Some(leaf_fault::set_before_drain_block(move || {
-                    let warns = crate::log_capture::records_since(mark, &needle)
-                        .into_iter()
-                        .filter(|text| text.contains("still waiting") && text.contains(name))
-                        .count();
-                    seen.set(Some(warns));
-                    FakeLeaf::set_populated(&events, false);
-                }));
-            }
-            FakeLeaf::rmdir(&path, &events)
-        });
+        let (warned_at_release, release) = release_from_the_blocking_wait(&fake, name, needle, mark);
         let mut child = linux::contained_by(child, leaf);
-        child.tear_down_awaiting().await
+        (child.tear_down_awaiting().await, warned_at_release, release)
     });
     leaf_fault::take_rmdir_hook();
     drop(release.borrow_mut().take());
@@ -577,7 +513,7 @@ fn a_teardown_whose_drain_watch_fails_warns_once_past_1s() {
     assert_eq!(
         warned_at_release.get(),
         Some(1),
-        "the teardown must wait for the drain past its look, with one warn naming the leaf by then"
+        "the teardown must wait for the drain past its warn, with one warn naming the leaf by then"
     );
     assert!(!fake.leaf.exists(), "the drained leaf is removed");
     assert_eq!(
@@ -666,4 +602,41 @@ async fn tokio_armed_drop_whose_drain_pump_cannot_start_warns_once() {
         "one warn naming the leaf, out before its member was released: {steps:?}"
     );
     assert!(!fake.leaf.exists(), "the drained leaf is removed: {steps:?}");
+}
+
+/// macOS: a root whose exit the drop's look does not see by the threshold gets the drop's one warn,
+/// naming its pid, and the drop then waits for it and reaps it. A test here can have no foreign
+/// tracer, so the threshold is zero and the look's two peeks are forced to find the root running.
+///
+/// Mutant: the drop's reap has no warn.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+async fn macos_tokio_armed_drop_warns_once_when_the_reap_is_slow() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peeks, Forced};
+    use crate::wait::exit_only::Peek;
+
+    crate::log_capture::install();
+    let (child, _stdin) = blocker();
+    let pid = child.id().pid();
+    let root = Root::of(&child);
+    let mark = crate::log_capture::mark();
+    let forced: Rc<RefCell<Option<Forced>>> = Rc::default();
+    let _look = super::fault::set_before_reap_look({
+        let forced = Rc::clone(&forced);
+        move || *forced.borrow_mut() = Some(force_peeks([Ok(Peek::Running), Ok(Peek::Running)]))
+    });
+    let _warn = super::fault::warn_slow_teardowns_after(std::time::Duration::ZERO);
+    drop(child);
+    assert_peeks_exhausted();
+    drop(forced.borrow_mut().take());
+
+    let warns: Vec<_> = crate::log_capture::records_since(mark, &format!("async child {pid}"))
+        .into_iter()
+        .filter(|text| text.contains("still waiting"))
+        .collect();
+    assert_eq!(warns.len(), 1, "one warn, and the wait goes on: {warns:?}");
+    assert!(root.reaped(), "the drop reaps the root past its warn");
 }

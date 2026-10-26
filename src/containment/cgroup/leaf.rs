@@ -229,8 +229,8 @@ pub(crate) struct CgroupLeaf {
     /// created outside the cgroup filesystem.
     cgroup_path: Option<String>,
     /// Whether the leaf is already dealt with, so `Drop` has nothing left to do: the spawn was
-    /// abandoned before its verdict, or an async `Drop` released it
-    /// ([`release_without_waiting`](Self::release_without_waiting)).
+    /// abandoned before its verdict, an async `Drop` released it
+    /// ([`release_without_waiting`](Self::release_without_waiting)), or it was torn down.
     pub(super) abandoned: bool,
     /// Whether the caller still wants cosca to manage the tree. Cleared by `disarm`, for
     /// `detach()` and `kill_on_drop(false)`. `Drop` kills only while this and `entered` both hold.
@@ -251,10 +251,6 @@ pub(crate) struct CgroupLeaf {
     /// silently folding a genuine failure into the same `debug` note used for a tree the caller
     /// never asked to kill at all.
     kill_attempt_failed: AtomicBool,
-    /// Set by a failed async spawn's teardown: this long into the wait for the leaf's drain, after
-    /// its kill, `Drop` warns once and keeps waiting (see `slow_drain.rs`).
-    #[cfg(feature = "tokio")]
-    drain_warn_after: Option<std::time::Duration>,
 }
 
 /// Why a spawn-side resource of a [`CgroupLeaf`] is missing.
@@ -555,8 +551,6 @@ impl CgroupLeaf {
                     listener,
                     deadline: None,
                 } => {
-                    #[cfg(all(test, feature = "tokio"))]
-                    fault::run_before_unbounded_drain_park();
                     listener.wait();
                     #[cfg(test)]
                     fault::notify_wait_site_park(fault::WaitSitePark {
@@ -675,21 +669,6 @@ impl CgroupLeaf {
         }
     }
 
-    /// Block until the leaf drains, on the watch held since creation.
-    fn block_until_drained(&mut self) -> Result<(), crate::error::Error> {
-        #[cfg(feature = "tokio")]
-        crate::bounded::assert_may_block("waiting for a cgroup leaf to drain");
-        #[cfg(feature = "tokio")]
-        if let Some(after) = self.drain_warn_after {
-            return self.block_until_drained_warning(after);
-        }
-        // Stops and joins the pump first: the watch is then this `Drop`'s alone.
-        match self.watch.get_mut() {
-            Some(watch) => watch.wait(),
-            None => Ok(()),
-        }
-    }
-
     /// SIGTERM every pid currently listed in `cgroup.procs`.
     ///
     /// An already-gone leaf is `Ok`, on the same proof [`hard_kill`](Self::hard_kill) rests on
@@ -762,8 +741,6 @@ impl CgroupLeaf {
             watched: None,
             placed: super::PlacedAtRemoval::default(),
             kill_attempt_failed: AtomicBool::new(false),
-            #[cfg(feature = "tokio")]
-            drain_warn_after: None,
         }
     }
 
@@ -786,17 +763,25 @@ impl CgroupLeaf {
 #[cfg(target_os = "linux")]
 impl Drop for CgroupLeaf {
     fn drop(&mut self) {
+        self.tear_down(&mut NoWarn);
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl CgroupLeaf {
+    /// What [`Drop`] does, with `warn` for each wait for the drain; `Drop` does nothing after it.
+    fn tear_down(&mut self, warn: &mut dyn DrainWarn) {
         // The pump the leaf owns stops and is joined before anything else: the teardown below
         // uses the watch itself.
         self.watch.stop_pump();
         self.procs_fd = None;
         // Before the verdict — a spawn that failed, maybe after its fork — end the exchange.
         if self.report.is_some() {
-            if let Abandoned::OutOfReach(why) = self.abandon_before_verdict(false, None) {
+            if let Abandoned::OutOfReach(why) = self.abandon_before_verdict(false, None, warn) {
                 log::warn!("cgroup v2: {why}");
             }
         }
-        if self.abandoned {
+        if std::mem::replace(&mut self.abandoned, true) {
             return;
         }
         // Remove the leaf. If still occupied (e.g. hard_kill not yet called), fire cgroup.kill,
@@ -844,6 +829,7 @@ impl Drop for CgroupLeaf {
                 self.drain_and_remove(
                     false,
                     "after an explicit kill through a handle that opted out of Drop's own teardown",
+                    warn,
                 );
                 return;
             }
@@ -884,7 +870,7 @@ impl Drop for CgroupLeaf {
         // Armed: kill through the leaf, wait for it to drain, and only then remove it. A leaf
         // that is already gone left nothing behind.
         if !removed_after_drain(&first) {
-            self.drain_and_remove(false, "after its handle's teardown");
+            self.drain_and_remove(false, "after its handle's teardown", warn);
         }
     }
 }
@@ -940,7 +926,14 @@ impl CgroupLeaf {
     /// A child that is an elevation `front` (see [`crate::elevation::front`]) is sent no signal of
     /// its own, which would orphan its elevated program: it is killed through the leaf alone (see
     /// [`end_front`]).
-    pub(crate) fn abandon_before_verdict(&mut self, front: bool, handshake: Option<OwnedFd>) -> Abandoned {
+    ///
+    /// `warn` is for the wait for the leaf's drain.
+    pub(crate) fn abandon_before_verdict(
+        &mut self,
+        front: bool,
+        handshake: Option<OwnedFd>,
+        warn: &mut dyn DrainWarn,
+    ) -> Abandoned {
         let Some(channel) = self.report.take() else {
             return Abandoned::Ended;
         };
@@ -967,7 +960,7 @@ impl CgroupLeaf {
             if let Some(pid) = received.pid {
                 self.watch_front(pid);
             }
-            return self.abandon_front(&received);
+            return self.abandon_front(&received, warn);
         }
         // The child first, through its handle, whatever the leaf's own kill does: it may have left
         // the leaf, or never entered it.
@@ -977,6 +970,7 @@ impl CgroupLeaf {
             self.remove_killing_through(
                 through_leaf.as_ref().is_some_and(Result::is_ok),
                 "after its spawn was abandoned",
+                warn,
             );
         } else {
             self.remove_holding_nothing();
@@ -996,14 +990,14 @@ impl CgroupLeaf {
     /// [`abandon_before_verdict`](Self::abandon_before_verdict) for an elevation front: the leaf
     /// is killed through and removed as for any child, and the front itself is sent nothing. Its
     /// subtree is read first, so the front can still be placed in it once the leaf is gone.
-    fn abandon_front(&mut self, received: &Received) -> Abandoned {
+    fn abandon_front(&mut self, received: &Received, warn: &mut dyn DrainWarn) -> Abandoned {
         let subtree = self.subtree();
         if let Err(e) = &subtree {
             log::debug!("cgroup v2: an abandoned front's leaf subtree cannot be read ({e})");
         }
         if self.entered {
             let killed = self.hard_kill().is_ok();
-            self.remove_killing_through(killed, "after its spawn was abandoned");
+            self.remove_killing_through(killed, "after its spawn was abandoned", warn);
         } else {
             self.remove_holding_nothing();
         }
@@ -1020,23 +1014,24 @@ impl CgroupLeaf {
     /// Remove a leaf its child entered: killed through, drained, its empty child cgroups removed,
     /// then removed once, a failure reported (see [`drain_and_remove`](Self::drain_and_remove)). `killed`
     /// says whether the caller's own kill through it succeeded; `context` says what removal this
-    /// is, for the report of a leaf left behind.
-    fn remove_killing_through(&mut self, killed: bool, context: &str) {
+    /// is, for the report of a leaf left behind; `warn`, for the wait for the drain.
+    fn remove_killing_through(&mut self, killed: bool, context: &str, warn: &mut dyn DrainWarn) {
         match self.rmdir_leaf() {
             Ok(()) => {}
             Err(e) if removed_after_drain(&e) => {}
-            Err(_) => self.drain_and_remove(killed, context),
+            Err(_) => self.drain_and_remove(killed, context, warn),
         }
     }
 
     /// [`remove_killing_through`](Self::remove_killing_through) after an `rmdir` that failed.
     ///
-    /// Kills through the leaf, waits however long the drain takes (a [`DrainWatch`]), removes the
+    /// Kills through the leaf, waits however long the drain takes, with `warn`
+    /// ([`wait_drained_then_warn`](Self::wait_drained_then_warn)), removes the
     /// leaf's child cgroups, and makes one more `rmdir`. Any failure of that `rmdir` is final and
     /// reported: after the drain and the sweep, an `EBUSY` means something another party did
     /// since ([`LEFT_BEHIND_CAUSES`]), which another attempt would only make rarer, never
     /// impossible.
-    fn drain_and_remove(&mut self, killed: bool, context: &str) {
+    fn drain_and_remove(&mut self, killed: bool, context: &str, warn: &mut dyn DrainWarn) {
         if !killed {
             if let Err(e) = self.hard_kill() {
                 return warn_leaf_left_behind(
@@ -1045,7 +1040,7 @@ impl CgroupLeaf {
                 );
             }
         }
-        if let Err(e) = self.block_until_drained() {
+        if let Err(e) = self.wait_drained_then_warn(warn) {
             return warn_leaf_left_behind(
                 &self.leaf_path,
                 format_args!("rmdir failed {context}; its drain could not be watched ({e})"),
@@ -1688,8 +1683,6 @@ pub(crate) fn create_leaf_under(current: &Path) -> Result<CgroupLeaf, LeafError>
         watched: None,
         placed: super::PlacedAtRemoval::default(),
         kill_attempt_failed: AtomicBool::new(false),
-        #[cfg(feature = "tokio")]
-        drain_warn_after: None,
     })
 }
 
@@ -1806,9 +1799,11 @@ pub(crate) unsafe fn place_self_in_cgroup_pre_exec(procs_fd: RawFd, slot: Report
 #[path = "leaf/release.rs"]
 mod release;
 
-#[cfg(all(target_os = "linux", feature = "tokio"))]
+#[cfg(target_os = "linux")]
 #[path = "leaf/slow_drain.rs"]
 mod slow_drain;
+#[cfg(target_os = "linux")]
+pub(crate) use slow_drain::*;
 
 #[cfg(all(test, target_os = "linux"))]
 #[path = "leaf/end_front_tests.rs"]

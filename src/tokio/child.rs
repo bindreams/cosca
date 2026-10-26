@@ -153,25 +153,17 @@ impl OsResources {
 }
 
 /// Drop `attached`, whose drain its kills bound, as the sync `Drop` drops it: a cgroup leaf waits
-/// for its drain. A leaf not drained by `late`'s due time gets its one warn first.
+/// for its drain, with `late`'s warn.
 #[cfg(unix)]
 fn drop_after_drain(attached: Attached, late: &mut LateWarn) {
-    #[cfg(target_os = "linux")]
-    if let (Attached::Cgroup(leaf), Some(until)) = (&attached, late.due()) {
-        // Only the warn depends on this bounded look; the leaf's own drop waits for the drain.
-        if matches!(
-            leaf.wait_drained(Some(Some(until))),
-            Ok(crate::containment::TreeDrain::MembersRemain)
-        ) {
-            late.warn(&format!(
-                "has a cgroup leaf {} that has not drained",
-                leaf.path().display()
-            ));
+    match attached {
+        #[cfg(target_os = "linux")]
+        Attached::Cgroup(leaf) => leaf.drop_warning(late),
+        other => {
+            let _ = late;
+            drop(other);
         }
     }
-    #[cfg(not(target_os = "linux"))]
-    let _ = late;
-    drop(attached);
 }
 
 /// An awaited teardown's drain in progress. Dropped with the drain unfinished (its future was), it
@@ -344,16 +336,12 @@ impl Child {
     /// Block until a cgroup-contained tree has drained, so the leaf's drop can remove it on its
     /// first `rmdir`. For a path that may block, such as a failed spawn: never `Drop`, never an
     /// `async fn`. Nothing else leaves work on the drain, so any other mechanism returns at once.
-    /// The wait warns once past 1 s, naming the leaf, as a failed spawn's other teardown waits do.
+    /// The wait warns once past 1 s, naming the leaf.
     #[cfg(unix)]
-    pub(super) fn block_until_members_drained(&self) -> Result<(), Error> {
+    pub(super) fn block_until_members_drained(&mut self) -> Result<(), Error> {
         #[cfg(target_os = "linux")]
-        if let crate::containment::Attached::Cgroup(leaf) = &self.os.attached {
-            return match slow_teardown_after() {
-                Some(after) => leaf.wait_drained_warning(after),
-                None => leaf.wait_drained(None),
-            }
-            .map(drop);
+        if let crate::containment::Attached::Cgroup(leaf) = &mut self.os.attached {
+            return leaf.wait_drained_then_warn(&mut crate::containment::cgroup::WarnAfter(slow_teardown_after()));
         }
         Ok(())
     }
@@ -1699,11 +1687,16 @@ struct Signalled {
 /// How long the armed drop, or a failed spawn's teardown, waits before it says so. Messaging only: no
 /// wait ends on it.
 #[cfg(unix)]
+#[cfg_attr(
+    all(test, not(target_os = "linux")),
+    allow(dead_code, reason = "a test opts in with its own threshold off Linux")
+)]
 const LATE: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// How long a failed spawn's teardown waits for the child it killed before it warns that it is still
-/// waiting: [`LATE`]. In a test, only one that opted in (`fault::warn_slow_teardowns`): a loaded
-/// runner could pass the threshold, and a test's verdict must not depend on elapsed time.
+/// How long a failed spawn's teardown, or the armed drop, waits for what it killed before it warns
+/// that it is still waiting: [`LATE`]. In a test, only one that opted in
+/// (`fault::warn_slow_teardowns`): a loaded runner could pass the threshold, and a test's verdict
+/// must not depend on elapsed time.
 #[cfg(unix)]
 pub(crate) fn slow_teardown_after() -> Option<std::time::Duration> {
     #[cfg(test)]
@@ -1712,11 +1705,14 @@ pub(crate) fn slow_teardown_after() -> Option<std::time::Duration> {
     Some(LATE)
 }
 
-/// The armed drop's one warn, once its waits pass [`LATE`]: the reap and the drain share it.
+/// The armed drop's one warn, once its waits pass [`slow_teardown_after`]: the reap and the drain
+/// share it.
 #[cfg(unix)]
 struct LateWarn {
     pid: u32,
-    until: std::time::Instant,
+    /// When the warn is due, and how long into the wait that is; `None`: no warn (a test that did
+    /// not opt in).
+    due: Option<(std::time::Instant, std::time::Duration)>,
     warned: bool,
 }
 
@@ -1725,27 +1721,43 @@ impl LateWarn {
     fn new(pid: u32) -> LateWarn {
         LateWarn {
             pid,
-            until: crate::wait::now() + LATE,
+            due: slow_teardown_after().map(|after| (crate::wait::now() + after, after)),
             warned: false,
         }
     }
 
     /// When the warn is due, or `None` once it has gone out: the next wait is unbounded.
     fn due(&self) -> Option<std::time::Instant> {
-        (!self.warned).then_some(self.until)
+        self.due.filter(|_| !self.warned).map(|(until, _)| until)
     }
 
     /// Warn, once, that `what` (completing "async child N ...") still holds the drop.
     fn warn(&mut self, what: &str) {
+        let Some((_, after)) = self.due else {
+            return;
+        };
         if std::mem::replace(&mut self.warned, true) {
             return;
         }
         log::warn!(
-            "Child::drop: async child {} {what} {} s into this wait; still waiting: the drop blocks \
+            "Child::drop: async child {} {what} {after:?} into this wait; still waiting: the drop blocks \
              until the child is reaped and its tree has drained (call kill() and wait().await, and \
              wait_tree().await for a tree, before dropping, to wait without blocking)",
             self.pid,
-            LATE.as_secs()
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl crate::containment::cgroup::DrainWarn for LateWarn {
+    fn due(&self) -> Option<std::time::Instant> {
+        LateWarn::due(self)
+    }
+
+    fn warn(&mut self, leaf: &std::path::Path) {
+        LateWarn::warn(
+            self,
+            &format!("has a cgroup leaf {} that has not drained", leaf.display()),
         );
     }
 }
@@ -1764,6 +1776,8 @@ fn reap_killed_root(id: ProcessId, os: &mut OsResources, signals: &mut DropSigna
     }
     let pid = id.pid();
     if let Some(until) = late.due() {
+        #[cfg(test)]
+        fault::run_before_reap_look();
         if !proc.exit_visible_by(pid, until) {
             late.warn("has not been reaped");
         }
@@ -2084,6 +2098,7 @@ pub(crate) mod fault {
         static FAIL_REAP_WATCH: Cell<bool> = const { Cell::new(false) };
         static FAIL_DRAIN_WATCH: Cell<bool> = const { Cell::new(false) };
         static REAP_PARKED: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
+        static BEFORE_REAP_LOOK: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
         static RELEASES: Cell<usize> = const { Cell::new(0) };
         static BACKEND_DROPS: Cell<usize> = const { Cell::new(0) };
         static SLOW_TEARDOWN_AFTER: Cell<Option<std::time::Duration>> = const { Cell::new(None) };
@@ -2308,6 +2323,18 @@ pub(crate) mod fault {
     #[cfg(unix)]
     pub(crate) fn run_reap_parked() {
         crate::oneshot_hook::fire(&REAP_PARKED);
+    }
+
+    /// Run `hook` once on THIS thread, right before the armed drop's look at the root it killed,
+    /// whose answer decides the drop's warn.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn set_before_reap_look(hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
+        crate::oneshot_hook::arm(&BEFORE_REAP_LOOK, hook)
+    }
+
+    #[cfg(unix)]
+    pub(super) fn run_before_reap_look() {
+        crate::oneshot_hook::fire(&BEFORE_REAP_LOOK);
     }
 }
 
