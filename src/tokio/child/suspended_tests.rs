@@ -2,8 +2,9 @@
 //!
 //! Every Windows child is a windowless blocker (no console window on a developer's desktop): by
 //! default `more.com`, which exits 0 on EOF, so a kill that sent nothing fails on how the child
-//! ended; `findstr x` where a test needs its match or its exit 1. Tests that need a job, a `TreeWalk` root or any other containment are named for it;
-//! the uncontained ones are the ones that are safe to run on a developer's host.
+//! ended; `findstr x` where a test needs its match or its exit 1. Tests that need a job, a
+//! `TreeWalk` root or any other containment are named for it; the uncontained ones are the ones
+//! that are safe to run on a developer's host.
 
 use static_assertions::assert_impl_all;
 

@@ -327,11 +327,17 @@ pub(crate) fn assert_zombie_sigkilled(who: &str, pid: u32) {
 
 #[cfg(unix)]
 fn zombie_record(pid: u32) -> libc::siginfo_t {
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    // SAFETY: `info` is a valid out-parameter. WNOWAIT leaves the child reapable.
-    let rc = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT) };
-    assert_eq!(rc, 0, "waitid: {}", std::io::Error::last_os_error());
-    info
+    loop {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is a valid out-parameter. WNOWAIT leaves the child reapable.
+        let rc = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT) };
+        if rc == 0 {
+            return info;
+        }
+        // A signal interrupting the wait is a restart, not a failure.
+        let e = std::io::Error::last_os_error();
+        assert_eq!(e.raw_os_error(), Some(libc::EINTR), "waitid: {e}");
+    }
 }
 
 /// Whether `pid` is still this process's unreaped child (running, or a zombie nobody collected):
@@ -1241,9 +1247,9 @@ pub(crate) async fn term_ignoring_blocker_async() -> (crate::tokio::Child, crate
     (child, stdin)
 }
 
-/// A blocker died to a kill, not by exiting on its own once its stdin closed: `SIGKILL` on Unix, a
-/// non-zero exit on Windows (`more.com` exits 0 on EOF). Separate compilation units cannot share
-/// it: `tests/common` keeps its own copy.
+/// A blocker died to a kill, not by exiting on its own once its stdin closed: `SIGKILL` on Unix, the
+/// kill's exit code `1` on Windows (`more.com` exits 0 on EOF), so a crash on the release fails too.
+/// Separate compilation units cannot share it: `tests/common` keeps its own copy.
 pub(crate) fn assert_killed(who: &str, status: std::process::ExitStatus) {
     #[cfg(unix)]
     {
@@ -1255,9 +1261,10 @@ pub(crate) fn assert_killed(who: &str, status: std::process::ExitStatus) {
         );
     }
     #[cfg(windows)]
-    assert!(
-        !status.success(),
-        "{who} must be killed, not exit on its own: {status:?}"
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "{who} must be killed (exit code 1), not exit on its own: {status:?}"
     );
 }
 
