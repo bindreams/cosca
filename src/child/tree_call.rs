@@ -569,7 +569,8 @@ pub(crate) fn status_unless_reaped_elsewhere(
 pub(crate) fn status_of_an_unproven_root(pid: RawPid) -> Error {
     Error::Unassessable {
         detail: format!(
-            "pid {pid}: graceful_shutdown_tree brought the tree down, but its exit status cannot be collected: the              root's handle could not say whether it was reaped"
+            "pid {pid}: graceful_shutdown_tree brought the tree down, but its exit status cannot be \
+             collected: the root's handle could not say whether it was reaped"
         ),
         source: None,
     }
