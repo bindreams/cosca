@@ -1,7 +1,8 @@
 //! `tokio::Command::spawn_suspended` and `tokio::SuspendedChild`, on real frozen children.
 //!
-//! Every Windows child is a windowless `findstr x` blocker (no console window on a developer's
-//! desktop). Tests that need a job, a `TreeWalk` root or any other containment are named for it;
+//! Every Windows child is a windowless blocker (no console window on a developer's desktop): by
+//! default `more.com`, which exits 0 on EOF, so a kill that sent nothing fails on how the child
+//! ended; `findstr x` where a test needs its match or its exit 1. Tests that need a job, a `TreeWalk` root or any other containment are named for it;
 //! the uncontained ones are the ones that are safe to run on a developer's host.
 
 use static_assertions::assert_impl_all;
@@ -59,9 +60,25 @@ mod on_windows {
 
     const ERROR_ACCESS_DENIED: u32 = 5;
 
-    /// A windowless blocker; `raw` routes it to the raw `CreateProcessW` backend by giving it an
-    /// `executable()`.
+    /// A windowless blocker that exits 0 once its stdin closes; `raw` routes it to the raw
+    /// `CreateProcessW` backend by giving it an `executable()`.
     fn blocker(raw: bool) -> Command {
+        let more = crate::test_child::windows_more();
+        let mut cmd = Command::new();
+        cmd.args([&more]);
+        if raw {
+            cmd.executable(&more);
+        }
+        cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
+        cmd.stdout(crate::Stdio::null()).expect("stdout null");
+        cmd.stderr(crate::Stdio::null()).expect("stderr null");
+        cmd.no_window();
+        cmd
+    }
+
+    /// [`blocker`] with `findstr x`: it prints the matching line, and exits 1 on input with no
+    /// match.
+    fn findstr_blocker(raw: bool) -> Command {
         let mut cmd = Command::new();
         cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
         if raw {
@@ -77,16 +94,20 @@ mod on_windows {
     /// Both spawn backends, so a backend that drops the hold fails its own leg.
     const BACKENDS: [bool; 2] = [false, true];
 
+    /// Kill `child`, then release its stdin: it exits 0 on EOF, so a kill that sent nothing fails
+    /// the assertion on how it ended instead of the reap blocking for ever.
     async fn end(mut child: Child) {
+        let stdin = child.stdin().expect("the blocker's piped stdin");
         child.kill().expect("kill the resumed child");
-        child.wait().await.expect("reap the resumed child");
+        drop(stdin);
+        crate::test_child::assert_killed("the resumed child", child.wait().await.expect("reap the resumed child"));
     }
 
     /// The blocker for one `kill_on_drop` leg of a drop test. Stdin decides the child's fate: the
     /// `true` leg leaks its write end, so only the drop's kill can end the child. The `false` leg
     /// pipes stdin and stdout, which [`drop_and_expect_it_runs`] keeps past the drop.
     fn drop_leg_blocker(kill_on_drop: bool) -> Command {
-        let mut cmd = blocker(false);
+        let mut cmd = findstr_blocker(false);
         cmd.kill_on_drop(kill_on_drop);
         if kill_on_drop {
             cmd.stdin(crate::test_child::leaked_writer_stdin()).expect("stdin");
@@ -283,7 +304,7 @@ mod on_windows {
     async fn a_resumed_child_serves_its_piped_stdin_and_stdout_and_is_awaited() {
         use ::tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         for raw in BACKENDS {
-            let mut cmd = blocker(raw);
+            let mut cmd = findstr_blocker(raw);
             cmd.stdout(crate::Stdio::pipe()).expect("stdout pipe");
             let mut child = cmd
                 .spawn_suspended()
@@ -569,7 +590,7 @@ mod on_windows {
     /// that stayed frozen never exits, so the wait is bounded by nextest's `death_watch_` override.
     #[skuld::test]
     async fn death_watch_the_command_spawns_an_ordinary_child_after_a_frozen_one() {
-        let mut cmd = blocker(false);
+        let mut cmd = findstr_blocker(false);
         drop(cmd.spawn_suspended().expect("spawn suspended"));
 
         // A spawn takes the stdio configuration out of the command, so the second one is given its own.

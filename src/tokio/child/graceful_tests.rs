@@ -176,6 +176,66 @@ async fn async_graceful_shutdown_graceful_path() {
     );
 }
 
+// Async twin of `child_graceful_shutdown_tree_graceful_root_sigterm` in
+// `src/child/graceful_tests.rs` — see there for the full rationale.
+#[cfg(unix)]
+#[skuld::test]
+async fn async_graceful_shutdown_tree_graceful_root_sigterm() {
+    use std::os::unix::process::ExitStatusExt;
+    crate::tokio::test_runtime::assert_current_thread();
+    let (mut child, stdin) = blocker();
+    let _release = term_fault::release_at(term_fault::HookPoint::AfterTerminate, stdin);
+    let status = child
+        .graceful_shutdown_tree(Duration::from_secs(30))
+        .await
+        .expect("tree graceful");
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGTERM),
+        "root must exit via SIGTERM, got {status:?}"
+    );
+}
+
+// Async twin of `child_graceful_shutdown_tree_tears_down_tree` in `src/child/graceful_tests.rs` —
+// see there for the full rationale.
+#[cfg(unix)]
+#[skuld::test]
+async fn async_graceful_shutdown_tree_tears_down_tree() {
+    use std::os::unix::process::ExitStatusExt;
+
+    use ::tokio::io::AsyncReadExt as _;
+    crate::tokio::test_runtime::assert_current_thread();
+    let mut cmd = crate::tokio::Command::new();
+    cmd.args(["sh", "-c", "exec 3<&0; cat <&3 3<&- & echo r; exec cat"]);
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+    cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
+    cmd.contain();
+    let mut child = cmd.spawn().expect("spawn");
+    let stdin = child.stdin().expect("piped stdin");
+    let mut stdout = child.stdout().expect("piped stdout");
+    let mut ready = [0u8; 2];
+    stdout.read_exact(&mut ready).await.expect("readiness line");
+    assert_eq!(&ready, b"r\n");
+
+    let _release = term_fault::release_at(term_fault::HookPoint::AfterTerminate, stdin);
+    let status = child
+        .graceful_shutdown_tree(Duration::from_secs(30))
+        .await
+        .expect("tree graceful");
+
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGTERM),
+        "root must exit via SIGTERM, got {status:?}"
+    );
+    let mut rest = Vec::new();
+    stdout
+        .read_to_end(&mut rest)
+        .await
+        .expect("both members are gone, so the pipe ends");
+    assert!(rest.is_empty(), "nothing was written: {rest:?}");
+}
+
 // Async twin of `graceful_tree_terminate_refusal_still_sweeps_and_reaps` in
 // `src/child/graceful_tests.rs` — see there for the full rationale.
 #[skuld::test]

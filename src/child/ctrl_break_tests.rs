@@ -176,6 +176,33 @@ fn windows_terminate_tree_reaps_the_grandchild() {
     );
 }
 
+/// The graceful tree path end to end: no handlers, so the break ends the root and its grandchild
+/// within the grace, and the job object drains without the sweep. The break is asserted sent as
+/// soon as `terminate_tree` returns, so a missing one fails there, not when the grace runs out.
+#[skuld::test]
+fn child_graceful_shutdown_tree_tears_down_tree_on_windows() {
+    let (child, _root_sock, grand) = spawn_tree(Handler::Default, Handler::Default, crate::ContainMode::Strongest);
+    assert_eq!(child.containment(), Containment::JobObject);
+    let pid = child.id().pid();
+    assert_in_our_console(pid, "the root");
+    let _check = term_fault::at(term_fault::HookPoint::AfterTerminate, move || {
+        ctrl_break::assert_break_sent_to(pid)
+    });
+    let status = child
+        .graceful_shutdown_tree(Duration::from_secs(30))
+        .expect("graceful_shutdown_tree on a console-group root");
+    assert_eq!(
+        status.code(),
+        Some(STATUS_CONTROL_C_EXIT),
+        "the root must die to the break, got {status:?}"
+    );
+    assert_eq!(
+        grand.exit.wait_for_exit_code(),
+        STATUS_CONTROL_C_EXIT,
+        "the grandchild must die to the break"
+    );
+}
+
 /// `terminate_tree` under `TreeWalk`, which on Windows reaches `containment::windows::terminate`
 /// by its own route: the break to the root's group ends the root and its grandchild. The root's
 /// socket keeps it alive until the break, so the walk has a live root to start from.

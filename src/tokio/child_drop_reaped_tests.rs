@@ -275,17 +275,30 @@ async fn drop_after_kill_tree_and_wait_skips_at_debug_and_does_not_warn() {
 }
 
 /// `graceful_shutdown_tree` sweeps with `kill_tree` and reaps the root, so its drop is quiet too.
+///
+/// The root's stdin is released once `terminate_tree` has returned (`release_at`), so a
+/// `terminate_tree` that sent nothing ends it with status 0 and fails the assertion on its status,
+/// instead of the grace running out. A sent `SIGTERM` is already pending then, so it beats the
+/// release.
 #[skuld::test]
 async fn drop_after_graceful_shutdown_tree_skips_at_debug_and_does_not_warn() {
+    use std::os::unix::process::ExitStatusExt as _;
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let recorder = record_kill_group();
-    let mut child = session(&["sleep", "300"]).spawn().expect("spawn");
+    let mut child = session_blocker_cmd().spawn().expect("spawn");
+    let stdin = child.stdin().expect("stdin pipe");
     let pid = child.id().pid();
-    child
+    let _release = crate::graceful_hooks::release_at(crate::graceful_hooks::HookPoint::AfterTerminate, stdin);
+    let status = child
         .graceful_shutdown_tree(std::time::Duration::from_secs(60))
         .await
         .expect("graceful_shutdown_tree");
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGTERM),
+        "the root dies to the group's SIGTERM: {status:?}"
+    );
     recorder.assert_killed_only(pid as i32);
 
     let mark = crate::log_capture::mark();
