@@ -338,10 +338,12 @@ fn an_abandoned_childs_group_kill_goes_through_its_handle(#[fixture(pidfd_group_
 }
 
 /// A child reaped elsewhere after the look gets no group kill by its number: the check right before
-/// it finds the child gone. Mutant: "the check's answer is not heeded".
+/// it finds the child gone. What may be left in its group is one `warn` naming the group. Mutants:
+/// "the check's answer is not heeded"; "the unsent group kill is a `debug`".
 #[skuld::test]
 fn an_abandoned_child_reaped_before_its_group_kill_by_number_is_not_sent_it() {
     use crate::send_log::{GroupStep, Route};
+    crate::log_capture::install();
     let child = paused_group_leader();
     let pid = child.pid();
     let received = received(child, Some(PlacementReport::WriteFailed(libc::EBADF)));
@@ -353,9 +355,11 @@ fn an_abandoned_child_reaped_before_its_group_kill_by_number_is_not_sent_it() {
     });
     let capture = crate::send_log::Capture::start();
     let refused = crate::containment::unix::fault::refuse_pidfd_group_flag();
+    let mark = crate::log_capture::mark();
 
     let fate = end_child(&received);
     drop(refused);
+    assert_one_warn_for_the_unsent_group_kill(mark, pid);
     assert_eq!(
         capture.group_steps(),
         [GroupStep::Group(Route::Pidfd, libc::SIGKILL), GroupStep::Check]
@@ -368,6 +372,20 @@ fn an_abandoned_child_reaped_before_its_group_kill_by_number_is_not_sent_it() {
         "nothing went by the number"
     );
     assert_eq!(fate, ChildFate::Gone);
+}
+
+/// The one `warn` for a group kill that was not sent because the kernel refused the flag and the
+/// child was reaped: it names the group, as a kill that was refused does.
+fn assert_one_warn_for_the_unsent_group_kill(mark: usize, pid: u32) {
+    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "")
+        .into_iter()
+        .filter(|(level, _)| *level <= log::Level::Warn)
+        .collect();
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(
+        warns[0].1.contains(&format!("process group {pid}")),
+        "it names the group: {warns:?}"
+    );
 }
 
 /// A forked group leader that forked a member into its group, as a child that exec'd outside its
@@ -445,18 +463,23 @@ fn an_abandoned_child_reaped_before_the_look_has_its_group_killed(#[fixture(pidf
 
 /// Where the kernel refuses `PIDFD_SIGNAL_PROCESS_GROUP` (before 6.9), a child reaped before the
 /// look is `Gone`, and nothing goes to its group's number: the check before it finds the child
-/// reaped. Mutant: "a group kill by number for a reaped child".
+/// reaped. Its member lives on, which is one `warn` naming the group. Mutants: "a group kill by
+/// number for a reaped child"; "the unsent group kill is a `debug`".
 #[skuld::test]
 fn an_abandoned_child_reaped_before_the_look_gets_no_group_kill_by_number() {
     use crate::send_log::{GroupStep, Route};
+    crate::log_capture::install();
     let (leader, to_member, from_member) = leader_with_member(true);
     let received = received(leader, Some(PlacementReport::WriteFailed(libc::EBADF)));
-    crate::test_child::reaped_elsewhere::reap_behind(received.pid.expect("a pid"));
+    let pid = received.pid.expect("a pid");
+    crate::test_child::reaped_elsewhere::reap_behind(pid);
     let capture = crate::send_log::Capture::start();
     let refused = crate::containment::unix::fault::refuse_pidfd_group_flag();
+    let mark = crate::log_capture::mark();
 
     let fate = end_child(&received);
     drop(refused);
+    assert_one_warn_for_the_unsent_group_kill(mark, pid);
     let steps = capture.group_steps();
     let out = member_output(to_member, from_member);
     assert!(

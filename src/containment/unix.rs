@@ -334,7 +334,7 @@ fn signal_group(pgid: i32, signal: Signal, root: &GroupRoot<'_>) -> Result<(), E
 /// The send to the whole group, and the kernel's answer to it. On Linux it goes through the root's
 /// pidfd with `PIDFD_SIGNAL_PROCESS_GROUP`, which names the group exactly: the kernel resolves it
 /// from the pidfd's process, not from a number. Only when the kernel refuses the flag (`EINVAL`,
-/// before Linux 6.9), or the root has no pidfd, and always on macOS, it goes by the group's number,
+/// expected below Linux 6.9), or the root has no pidfd, and always on macOS, it goes by the group's number,
 /// right after the root's check. A failed check sends nothing and is the call's error.
 ///
 /// The check and the `killpg` are two syscalls: a reaper elsewhere in the process can reap the root
@@ -346,7 +346,7 @@ fn send_to_group(pgid: i32, signal: Signal, root: &GroupRoot<'_>) -> Result<Resu
     if let Some(pidfd) = root.pidfd() {
         match pidfd_signal(pidfd, signal, Through::Group) {
             Err(nix::errno::Errno::EINVAL) => log::debug!(
-                "containment::unix: the kernel refused PIDFD_SIGNAL_PROCESS_GROUP (before Linux 6.9), so process group {pgid} is signalled by its number"
+                "containment::unix: the kernel refused PIDFD_SIGNAL_PROCESS_GROUP (expected below Linux 6.9), so process group {pgid} is signalled by its number"
             ),
             sent => return Ok(sent),
         }
