@@ -2887,8 +2887,8 @@ fn an_abandoned_child_in_its_leaf_refusing_its_kill_is_warned_about_once() {
         .collect();
     assert_eq!(refusals.len(), 1, "{refusals:?}");
     // Dropped after its kill: its stdin's EOF would end it by itself.
-    drop(child);
     rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::KILL).expect("kill the child");
+    drop(child);
     assert!(
         crate::containment::cgroup::fault::take_background_reap_notifier().is_none(),
         "the child must be handed to the background reaper"
