@@ -85,8 +85,7 @@ jobs:
 
       - uses: ./.github/actions/setup-rust
 
-      # `cosca-path` and `cosca` release in lockstep at one version. Each is picked
-      # by name: `.packages[0]` is whichever member cargo lists first.
+      # Lockstep: both crates share one version.
       - name: Re-verify manifest versions match the release
         env:
           VERSION: ${{ steps.version.outputs.version }}
@@ -102,10 +101,8 @@ jobs:
             fi
           done
 
-      # Per crate, so a re-dispatch after a partial publish (one crate uploaded,
-      # the next failed) publishes only what is missing. The same skip covers the
-      # first `cosca-path` release, which the owner uploads by hand (see the
-      # note on the publish step).
+      # Per crate, so a re-dispatch after a partial publish uploads only what is
+      # missing.
       - name: Check crates.io for existing versions
         id: crates_check
         env:
@@ -115,7 +112,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Dependency first, as `cargo publish` orders them anyway.
           to_publish=()
           for crate in cosca-path cosca; do
             CODE=$(curl -sL -A "$CRATES_UA" -o /dev/null -w "%{http_code}" \
@@ -131,8 +127,6 @@ jobs:
           done
           echo "to_publish=${to_publish[*]}" >> "$GITHUB_OUTPUT"
 
-      # Nothing to authenticate for once every crate is already published.
-      #
       # This action's post step can fail the job after publish already
       # succeeded; see the completion-marker note on the final step for how
       # to tell that apart from a real failure.
@@ -160,12 +154,11 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
           TO_PUBLISH: ${{ steps.crates_check.outputs.to_publish }}
         shell: bash
-        # One invocation: cargo orders the crates by dependency and waits for
-        # each to appear in the index before uploading the next.
         run: |
           set -euo pipefail
+          # One invocation: cargo orders the crates by dependency and waits for
+          # each to appear in the index before uploading the next.
           args=()
-          # Unquoted on purpose: split the space-separated crate names.
           for crate in $TO_PUBLISH; do
             args+=(-p "$crate")
           done

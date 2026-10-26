@@ -47,8 +47,7 @@ jobs:
           V="$(bash .github/scripts/normalize-version.sh "$INPUT_VERSION")"
           echo "version=$V" >> "$GITHUB_OUTPUT"
 
-      # `cosca-path` and `cosca` release in lockstep at one version. Each is picked
-      # by name: `.packages[0]` is whichever member cargo lists first.
+      # Lockstep: both crates share one version.
       - name: Verify manifest versions match
         env:
           VERSION: ${{ steps.version.outputs.version }}
@@ -167,10 +166,9 @@ jobs:
         # while `ci` builds the repository rather than the tarball, so nothing
         # else would catch an `exclude` that breaks a non-Linux build.
         #
-        # Both crates in one invocation: cargo verifies the dependent against
-        # the dependency's just-built package (an overlay registry), so no
-        # `--no-verify` is needed even though the dependency is not on
-        # crates.io yet.
+        # Cargo verifies the dependent against the dependency's just-built
+        # package, so `--no-verify` is not needed while the dependency is
+        # absent from crates.io.
         shell: bash
         run: cargo publish --dry-run --locked -p cosca-path -p cosca
 
