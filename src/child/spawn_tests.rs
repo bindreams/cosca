@@ -771,7 +771,7 @@ fn a_failed_password_write_kills_the_contained_tree() {
 /// the leaf, warning of nothing. The members of the fake leaf exit when the wait is about to
 /// block, not before.
 ///
-/// Mutant: the leaf's `Drop` does not wait for the drain (`block_until_drained` returns at once).
+/// Mutant: the leaf's `Drop` does not wait for the drain (`wait_drained_then_warn` returns at once).
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn a_failed_password_write_removes_the_leaf_once_the_tree_drains() {
@@ -1293,13 +1293,15 @@ fn finish_elevated_after_a_foreign_reap_does_not_claim_a_kill() {
 #[cfg(unix)]
 #[skuld::test]
 fn finish_elevated_after_a_foreign_reap_sends_no_killpg_to_a_process_group() {
+    #[cfg(target_os = "linux")]
+    let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     let recorder = crate::containment::unix::fault::record_kill_group();
     let (mut cmd, writer) = blocker_with_held_stdin();
     cmd.contain_with(crate::containment::ContainMode::Session);
     let child = cmd.spawn().expect("spawn");
     assert!(
-        child.attached.carries_recyclable_pgid(),
-        "the test needs a number-named group kill"
+        child.attached.signals_a_group(),
+        "the test needs a group named by the root's pid, which ContainMode::Session makes"
     );
     foreign_reap(&child, writer);
 

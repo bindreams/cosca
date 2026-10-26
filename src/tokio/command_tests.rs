@@ -13,6 +13,19 @@ fn contain_with_and_nesting_recorded() {
     assert_eq!(req.nesting, Nesting::Opaque);
 }
 
+/// The run-to-completion helpers' futures are `Send`, so a caller can `tokio::spawn` them: the
+/// teardown they await on a failure holds the child's resources across its waits.
+///
+/// Mutant: a `!Send` value held across the teardown's waits (fails to compile).
+#[skuld::test]
+fn run_to_completion_futures_are_send() {
+    fn assert_send<T: Send>(_: T) {}
+    let mut cmd = super::Command::new();
+    assert_send(cmd.status());
+    assert_send(cmd.output());
+    assert_send(cmd.read());
+}
+
 #[skuld::test]
 fn tokio_elevate_forwards_to_inner_request() {
     let mut c = super::Command::new();
@@ -71,16 +84,16 @@ fn held_blocker(kill_on_drop: bool) -> (super::Child, std::io::PipeWriter) {
     (cmd.spawn().expect("spawn"), writer)
 }
 
-/// A run-to-completion helper that fails after its spawn signals the child, as its drop would, and
-/// says so: tokio collects the exit later.
+/// A run-to-completion helper that fails after its spawn kills and reaps the child, as its drop
+/// would, and says so.
 ///
 /// Mutant: the failure reports `Unknown` without tearing the child down.
 #[cfg(unix)]
 #[skuld::test]
 async fn a_failure_after_the_spawn_signals_the_child_and_says_so() {
     let (mut child, _writer) = held_blocker(true);
-    let error = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), &mut child);
-    assert_eq!(error.fate(), Some(crate::error::ChildFate::Killed), "{error}");
+    let error = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), &mut child).await;
+    assert_eq!(error.fate(), Some(crate::error::ChildFate::Reaped), "{error}");
 }
 
 /// A child `kill_on_drop(false)` keeps is left alone, and the failure names it.
@@ -91,7 +104,7 @@ async fn a_failure_after_the_spawn_signals_the_child_and_says_so() {
 async fn a_failure_after_the_spawn_leaves_a_child_that_opted_out() {
     let (mut child, writer) = held_blocker(false);
     let id = child.id();
-    let error = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), &mut child);
+    let error = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), &mut child).await;
     assert_eq!(
         error.fate(),
         Some(crate::error::ChildFate::Running { id: Some(id) }),
@@ -108,15 +121,15 @@ async fn a_failure_after_the_spawn_notes_the_elevated_program_only_behind_a_back
     use crate::elevation::{Backend, ElevatedVia};
     let note = "an elevated program behind it may still run";
     let (mut plain, _w1) = held_blocker(true);
-    let plain = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), &mut plain);
+    let plain = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), &mut plain).await;
     assert!(!plain.to_string().contains(note), "{plain}");
 
     let (mut wrapped, _w2) = held_blocker(true);
     wrapped.set_elevation(crate::child::front_kill_tests::report(ElevatedVia::Wrapped(
         Backend::Sudo,
     )));
-    let wrapped = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), &mut wrapped);
-    assert_eq!(wrapped.fate(), Some(crate::error::ChildFate::Killed), "{wrapped}");
+    let wrapped = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), &mut wrapped).await;
+    assert_eq!(wrapped.fate(), Some(crate::error::ChildFate::Reaped), "{wrapped}");
     assert!(wrapped.to_string().contains(note), "{wrapped}");
 }
 
@@ -143,7 +156,8 @@ fn assert_failed_after_the_spawn(error: crate::error::Error, fate: crate::error:
 }
 
 /// Async twin of the sync `output_status_and_read_fail_as_may_have_started_after_the_spawn`. The
-/// fate is `Killed`: the drop signals the child and tokio collects it.
+/// fate is the drop's: `Reaped` on Unix, where it kills and reaps the child; `Killed` on Windows,
+/// where it terminates the child and closes its handle.
 ///
 /// Mutants: a helper returns the cause bare; drops the fate; drops the wrapper flag.
 #[skuld::test]
@@ -151,6 +165,11 @@ async fn output_status_and_read_fail_as_may_have_started_after_the_spawn() {
     use crate::child::spawn::failure::seams;
     use crate::error::ChildFate;
     crate::tokio::test_runtime::assert_current_thread();
+    let torn_down = if cfg!(unix) {
+        ChildFate::Reaped
+    } else {
+        ChildFate::Killed
+    };
     for wrapper in [false, true] {
         let _wrapper = wrapper.then(seams::pretend_wrapper);
         let mut cmd = super::Command::new();
@@ -158,19 +177,19 @@ async fn output_status_and_read_fail_as_may_have_started_after_the_spawn() {
         let _pump = seams::fail_the_next_pump();
         assert_failed_after_the_spawn(
             cmd.output().await.expect_err("a failed pump fails `output`"),
-            ChildFate::Killed,
+            torn_down,
             wrapper,
         );
         let _pump = seams::fail_the_next_pump();
         assert_failed_after_the_spawn(
             cmd.read().await.expect_err("a failed pump fails `read`"),
-            ChildFate::Killed,
+            torn_down,
             wrapper,
         );
         let _wait = seams::fail_the_next_wait();
         assert_failed_after_the_spawn(
             cmd.status().await.expect_err("a failed wait fails `status`"),
-            ChildFate::Killed,
+            torn_down,
             wrapper,
         );
     }

@@ -249,6 +249,23 @@ pub(crate) async fn watch_pidfd(pidfd: std::os::fd::OwnedFd) -> Result<(), Error
     }
 }
 
+/// Whether the process `pidfd` names has exited by the time `grace` is over, read only through the
+/// pidfd: non-reaping, and no pid is looked up. A `grace` that overflows, or sits inside tokio's
+/// timer margin, is unbounded.
+#[cfg(target_os = "linux")]
+pub(crate) async fn pidfd_exited_within(pidfd: std::os::fd::BorrowedFd<'_>, grace: Duration) -> Result<bool, Error> {
+    let watched = pidfd.try_clone_to_owned().map_err(Error::Io)?;
+    match deadline_from(grace) {
+        Some(Some(at)) => match arm_at(at, watch_pidfd(watched)).await {
+            Some(watch) => watch.map(|()| true),
+            // The timer can win the first poll before the reactor reports an exit that was already
+            // pending: answer from one final non-blocking look, as `grace_wait` does.
+            None => crate::wait::poll_pidfd_exit(pidfd, crate::wait::deadline_from(Duration::ZERO)).map_err(Error::Io),
+        },
+        _ => watch_pidfd(watched).await.map(|()| true),
+    }
+}
+
 /// Map a pidfd readiness to the watch verdict; `None` = unclassified readiness (tokio's
 /// documented `ready()` false positive) — re-await: never a false "exited" (which would skip
 /// escalation on a live child) and never a false watch failure (which would force-kill a
@@ -256,7 +273,7 @@ pub(crate) async fn watch_pidfd(pidfd: std::os::fd::OwnedFd) -> Result<(), Error
 /// are unit-testable with synthetic `Ready` values — a real pidfd cannot be made to surface
 /// POLLERR on demand.
 #[cfg(target_os = "linux")]
-fn classify_pidfd_ready(ready: ::tokio::io::Ready) -> Option<Result<(), Error>> {
+pub(crate) fn classify_pidfd_ready(ready: ::tokio::io::Ready) -> Option<Result<(), Error>> {
     // Mirror the sync backend: POLLERR is an error; POLLIN (zombie) / POLLHUP (reaped) = exited.
     if ready.is_error() {
         return Some(Err(Error::Io(std::io::Error::other("pidfd poll returned POLLERR"))));
@@ -273,19 +290,6 @@ async fn exit_watch(id: ProcessId) -> Result<(), Error> {
     use ::tokio::io::unix::AsyncFd;
     use ::tokio::io::Interest;
     let Some(kq) = crate::wait::backend::arm_proc_exit(id)? else {
-        return Ok(());
-    };
-    let afd = AsyncFd::with_interest(KqueueFd(kq), Interest::READABLE).map_err(Error::Io)?;
-    watch_readable(&afd, crate::wait::backend::drain_proc_exit).await
-}
-
-/// Resolve when the process `pid`, whose unique id was `unique`, exits (no internal timeout), or at
-/// once if it no longer has that id. Non-reaping.
-#[cfg(target_os = "macos")]
-pub(crate) async fn wait_exit_for(pid: u32, unique: u64) -> Result<(), Error> {
-    use ::tokio::io::unix::AsyncFd;
-    use ::tokio::io::Interest;
-    let Some(kq) = crate::wait::backend::arm_proc_exit_for(pid, unique)? else {
         return Ok(());
     };
     let afd = AsyncFd::with_interest(KqueueFd(kq), Interest::READABLE).map_err(Error::Io)?;
@@ -543,6 +547,12 @@ pub(crate) async fn cgroup_wait_tree_drained(
 ) -> Result<crate::containment::TreeDrain, Error> {
     use crate::containment::cgroup::DrainStep;
 
+    #[cfg(test)]
+    if crate::tokio::child::fault::take_fail_drain_watch() {
+        return Err(Error::Io(std::io::Error::other(
+            "forced drain watch failure (test seam)",
+        )));
+    }
     loop {
         match leaf.drain_step_on(deadline, tokio_now)? {
             DrainStep::Done(drain) => return Ok(drain),

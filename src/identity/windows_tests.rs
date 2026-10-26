@@ -38,7 +38,13 @@ fn is_running_alive_for_self_dead_for_wrong_token() {
 /// A LIVE process we may not open at all: ERROR_ACCESS_DENIED must NOT read as absence.
 #[skuld::test]
 fn denied_query_limited_reads_unknown_not_gone() {
-    let child = spawn_restricted(PROCESS_SYNCHRONIZE.0);
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(denied_query_limited_reads_unknown_not_gone),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
+    let child = spawn_restricted(&done, PROCESS_SYNCHRONIZE.0);
     let token = creation_token(child.handle()).expect("the owned handle can always read the token");
     assert!(child.is_running(), "precondition: the subject must be live");
     assert_eq!(
@@ -59,7 +65,13 @@ fn denied_query_limited_reads_unknown_not_gone() {
 /// "running" from "exited with code 259". Unknown, not Alive, not Dead.
 #[skuld::test]
 fn denied_synchronize_resolves_identity_but_liveness_is_unknown_while_running() {
-    let child = spawn_restricted(PROCESS_QUERY_LIMITED_INFORMATION.0);
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(denied_synchronize_resolves_identity_but_liveness_is_unknown_while_running),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
+    let child = spawn_restricted(&done, PROCESS_QUERY_LIMITED_INFORMATION.0);
     let token = creation_token(child.handle()).expect("owned handle reads the token");
     assert!(child.is_running(), "precondition: the subject must be live");
     assert_eq!(start_token(child.pid()), Resolved::Found(token));
@@ -76,7 +88,13 @@ fn denied_synchronize_resolves_identity_but_liveness_is_unknown_while_running() 
 /// `kill` on such a process would report failure.
 #[skuld::test]
 fn exited_process_denying_synchronize_reads_dead() {
-    let child = spawn_restricted(PROCESS_QUERY_LIMITED_INFORMATION.0);
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(exited_process_denying_synchronize_reads_dead),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
+    let child = spawn_restricted(&done, PROCESS_QUERY_LIMITED_INFORMATION.0);
     let token = creation_token(child.handle()).expect("owned handle reads the token");
     child.terminate(); // exit code 1
     assert!(!child.is_running(), "precondition: the subject must have exited");
@@ -101,7 +119,13 @@ fn nonexistent_pid_is_gone_not_unknown() {
 /// => Err". An access-denied live process must therefore not produce Ok.
 #[skuld::test]
 fn kill_of_an_access_denied_live_process_is_an_error() {
-    let child = crate::identity::windows_fixture::spawn_unkillable();
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(kill_of_an_access_denied_live_process_is_an_error),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
+    let child = crate::identity::windows_fixture::spawn_unkillable(&done);
     let id = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
         .expect("the owned handle always yields an identity");
     assert!(child.is_running(), "precondition: the subject must be live");
@@ -117,7 +141,13 @@ fn kill_of_an_access_denied_live_process_is_an_error() {
 /// `Process::wait` must not report an exit it never observed.
 #[skuld::test]
 fn block_until_exit_of_an_access_denied_live_process_is_an_error() {
-    let child = crate::identity::windows_fixture::spawn_unkillable();
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(block_until_exit_of_an_access_denied_live_process_is_an_error),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
+    let child = crate::identity::windows_fixture::spawn_unkillable(&done);
     let id = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
         .expect("the owned handle always yields an identity");
     assert!(child.is_running(), "precondition: the subject must be live");
@@ -135,7 +165,13 @@ fn block_until_exit_of_an_access_denied_live_process_is_an_error() {
 /// two entry points need DIFFERENT fixtures, because their masks differ.
 #[skuld::test]
 fn wait_of_a_synchronize_denied_but_exited_process_reports_exited() {
-    let child = spawn_restricted(PROCESS_QUERY_LIMITED_INFORMATION.0);
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(wait_of_a_synchronize_denied_but_exited_process_reports_exited),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
+    let child = spawn_restricted(&done, PROCESS_QUERY_LIMITED_INFORMATION.0);
     let id = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
         .expect("the owned handle always yields an identity");
     child.terminate();
@@ -147,8 +183,14 @@ fn wait_of_a_synchronize_denied_but_exited_process_reports_exited() {
 
 #[skuld::test]
 fn kill_of_a_terminate_denied_but_exited_process_reports_success() {
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(kill_of_a_terminate_denied_but_exited_process_reports_success),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
     use windows::Win32::System::Threading::PROCESS_TERMINATE;
-    let child = crate::identity::windows_fixture::spawn_query_only();
+    let child = crate::identity::windows_fixture::spawn_query_only(&done);
     let id = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
         .expect("the owned handle always yields an identity");
     // Precondition: kill's own mask must actually be refused, or this exercises the
@@ -170,7 +212,13 @@ fn kill_of_a_terminate_denied_but_exited_process_reports_success() {
 /// a different process, and reports the original exited.
 #[skuld::test]
 fn wait_on_a_stale_identity_over_a_readable_pid_reports_exited() {
-    let child = spawn_restricted(PROCESS_QUERY_LIMITED_INFORMATION.0);
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(wait_on_a_stale_identity_over_a_readable_pid_reports_exited),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
+    let child = spawn_restricted(&done, PROCESS_QUERY_LIMITED_INFORMATION.0);
     let real = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
         .expect("the owned handle always yields an identity");
     let stale = crate::identity::ProcessId::from_parts_for_test(real.pid(), real.start_token_raw() ^ 1);
@@ -183,7 +231,13 @@ fn wait_on_a_stale_identity_over_a_readable_pid_reports_exited() {
 /// either, the original's exit cannot be established. `Err`, not a guessed `Ok`.
 #[skuld::test]
 fn wait_on_a_stale_identity_over_an_unreadable_pid_is_an_error() {
-    let child = crate::identity::windows_fixture::spawn_unkillable();
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(wait_on_a_stale_identity_over_an_unreadable_pid_is_an_error),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
+    let child = crate::identity::windows_fixture::spawn_unkillable(&done);
     let real = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
         .expect("the owned handle always yields an identity");
     let stale = crate::identity::ProcessId::from_parts_for_test(real.pid(), real.start_token_raw() ^ 1);

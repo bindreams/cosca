@@ -28,7 +28,7 @@ mod linux {
         let (mut child, _writer) = session_blocker(true);
         child.set_front(Some(crate::elevation::front::Front::Sudo));
         let mark = crate::log_capture::mark();
-        // The read, the gate's two looks at the front, then the second look.
+        // The gate's two looks at the front, the read, then the second look.
         let _looks = force_peeks([running(), running(), running(), gone()]);
 
         drop(child);
@@ -83,8 +83,8 @@ mod linux {
         let (mut child, _writer) = session_blocker(true);
         child.set_front(Some(crate::elevation::front::Front::Sudo));
         let mark = crate::log_capture::mark();
-        // The read shows the reap; the gate's look at the front sees it run.
-        let _looks = force_peeks([gone(), running()]);
+        // The gate's two looks at the front see it run; the read shows the reap.
+        let _looks = force_peeks([running(), running(), gone()]);
 
         drop(child);
 
@@ -104,6 +104,8 @@ mod linux {
     /// Mutants: the skip warns on its own; the forget warns on its own.
     #[skuld::test]
     async fn a_reaped_root_in_a_process_group_warns_once_for_the_skip_and_the_forget() {
+        #[cfg(target_os = "linux")]
+        let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
         crate::log_capture::install();
         let recorder = crate::containment::unix::fault::record_kill_group();
         let (child, _writer) = session_blocker(true);
@@ -318,6 +320,8 @@ mod linux {
     /// Mutant: the drop's report ignores that the cleanup already warned.
     #[skuld::test]
     async fn a_retried_cleanup_does_not_warn_of_its_event_twice() {
+        #[cfg(target_os = "linux")]
+        let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
         crate::log_capture::install();
         let recorder = crate::containment::unix::fault::record_kill_group();
         let (child, _writer) = session_blocker(true);

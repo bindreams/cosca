@@ -58,10 +58,7 @@ path = "junit.xml"
 # One profile per Unix step in ci.yaml (`.github/scripts/run-nextest.py` selects it through
 # `NEXTEST_PROFILE`), so a straggler from one step can only ever write that step's own JUnit file.
 # Settings and `[[...overrides]]` are inherited (nextest 0.9.146). Windows runs its steps under the
-# shared `ci` profile (run-nextest.ps1), the canaries and the elevation step under profiles of their own. A
-# Windows step leaves no process in the job behind: run-nextest.ps1 ends the step's Job Object, and waits for it to
-# be empty, before the next step starts. Processes started under another logon (the elevation lane's administrator,
-# which runs last) are outside it.
+# shared `ci` profile (run-nextest.ps1), the canaries and the elevation step under profiles of their own.
 [profile.ci-tests]
 inherits = "ci"
 
@@ -72,6 +69,9 @@ inherits = "ci"
 inherits = "ci"
 
 [profile.ci-serde]
+inherits = "ci"
+
+[profile.ci-path]
 inherits = "ci"
 
 [profile.ci-release]
@@ -103,6 +103,12 @@ report-skipped = "ignored"
 [[profile.ci-elevation.overrides]]
 filter = 'test(=gui_elevated_child_runs_as_root)'
 slow-timeout = { period = "60s", terminate-after = 2, grace-period = "1s" }
+
+# M10 is a measurement: its output, the elevated child's cwd and environment, is the record, so it is printed on
+# success too.
+[[profile.ci-elevation.overrides]]
+filter = 'test(=m10_the_consent_route_child_runs_in_lp_directory)'
+success-output = "final"
 
 [profile.ci-setuid]
 inherits = "ci"
@@ -167,9 +173,10 @@ windows-shell-execute = { max-threads = 1 }
 # that binary at one test at a time instead.
 windows-elevation-routes = { max-threads = 1 }
 
-# The `DRIVE_MAPPING` tests in `tests/windows_process_cwd.rs` each map the highest free drive letter
-# for the whole logon session, so two at once could pick the same letter and read each other's
-# mapping.
+# The `DRIVE_MAPPING` tests in `tests/windows_process_cwd.rs` each map a drive letter for the whole
+# logon session, so two at once would contend for the same letters and see each other's mappings.
+# This group runs that whole binary one test at a time, so a new drive-mapping test is covered
+# without a filter naming it.
 windows-drive-mapping = { max-threads = 1 }
 
 [[profile.default.overrides]]
@@ -181,7 +188,7 @@ filter = 'binary(windows_elevation_routes)'
 test-group = 'windows-elevation-routes'
 
 [[profile.default.overrides]]
-filter = 'binary(windows_process_cwd) & (test(=a_drive_relative_current_dir_takes_the_drives_own_directory_as_win32_does) | test(=m7_a_drive_relative_name_against_a_drive_directory_on_its_own_drive))'
+filter = 'binary(windows_process_cwd)'
 test-group = 'windows-drive-mapping'
 
 [[profile.default.overrides]]
@@ -211,13 +218,6 @@ filter = 'test(cgroup_wait_drained_tracks_two_real_members_through_exit)'
 slow-timeout = { period = "15s", terminate-after = 1, grace-period = "1s" }
 
 [[profile.default.overrides]]
-# `a_dropped_root_left_to_tokio_is_reaped` yields until tokio reaps the root the drop killed. It
-# checks the hand-off first and fails at once if that is missing; this bound only turns a root
-# that is never reaped into a failure instead of a hang.
-filter = 'binary(cosca) & test(=tokio::child::child_drop_tests::a_dropped_root_left_to_tokio_is_reaped)'
-slow-timeout = { period = "10s", terminate-after = 1, grace-period = "1s" }
-
-[[profile.default.overrides]]
 # A backstop, not the proof: `async_wait_never_drains_past_the_low_water_clamp` asserts in-process
 # that the armed kqueue is already readable (which catches an `EV_DISABLE` arm) and then awaits
 # its `declined_hook` in a `select!`. What nothing in-process catches is the kqueue being readable
@@ -239,7 +239,7 @@ slow-timeout = { period = "10s", terminate-after = 3, grace-period = "1s" }
 # The two real-kernel async-drop tests wait on events outside the library: a member's death by
 # `cgroup.kill`, and the sockets' EOF. Each event is ordered before the wait by the test itself,
 # so this bound only stops a lost kill from stalling the cgroup lane.
-filter = 'binary(tokio_io) & test(/^linux_cgroup_v2_async_(kill_tree_then_wait_tree_then_drop_leaves_no_leaf|drop_alone_kills_the_members_and_logs_the_leftover)$/)'
+filter = 'binary(tokio_io) & test(/^linux_cgroup_v2_async_(kill_tree_then_wait_tree_then_drop_leaves_no_leaf|drop_alone_kills_the_members_and_removes_the_leaf)$/)'
 slow-timeout = { period = "30s", terminate-after = 2, grace-period = "1s" }
 
 [[profile.default.overrides]]
@@ -255,6 +255,12 @@ slow-timeout = { period = "10s", terminate-after = 2, grace-period = "1s" }
 # their messages surface.
 filter = 'test(/^child::shared::shared_tests::tracer::macos::/)'
 slow-timeout = { period = "20s", terminate-after = 1, grace-period = "1s" }
+
+[[profile.default.overrides]]
+# A backstop, not a detector. Each `traced` tracer helper runs from its own freshly signed copy of the test
+# binary (seconds on macOS/amd64), and one test chains two of them.
+filter = 'test(/^child::shared::shared_tests::traced::/)'
+slow-timeout = { period = "30s", terminate-after = 1, grace-period = "1s" }
 
 [[profile.default.overrides]]
 # A backstop, not a detector: the `SharedChild` tests fail by assertion (see `assert_handed_off`),

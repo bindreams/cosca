@@ -29,6 +29,13 @@ macro_rules! in_fresh_pid_ns {
             #[fixture(cgroup)] _cgroup: &crate::test_groups::Group
         ]);
     };
+    // For a body that also attaches a foreign tracer: the entry test holds the `tracer_group` too.
+    ($test:ident, $driver:ident, $init:ident, $body:path, tracer) => {
+        $crate::test_child::pid_reuse::in_fresh_pid_ns!(@define $test, $driver, $init, $body, [
+            #[fixture(namespaces)] _group: &crate::test_groups::Group,
+            #[fixture(tracer_group)] _tracer: &crate::test_groups::Group
+        ]);
+    };
     (@define $test:ident, $driver:ident, $init:ident, $body:path, [$($params:tt)*]) => {
         #[skuld::test]
         fn $test($($params)*) {
@@ -83,7 +90,11 @@ pub(crate) fn reap_behind_and_reuse(pid: u32) -> Child {
     let reaped = waitid(WaitId::Pid(pid_of(pid)), WaitIdOptions::EXITED).expect("raw reap");
     assert!(reaped.is_some(), "the raw reap must consume an exit record");
     drop(pidfd);
+    reuse(pid)
+}
 
+/// Starts a `std` child that takes `pid`, which must name no process now.
+pub(crate) fn reuse(pid: u32) -> Child {
     ns::set_last_pid(pid - 1);
     let mut cmd = std::process::Command::new("sleep");
     cmd.arg("3600");

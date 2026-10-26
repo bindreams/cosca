@@ -549,6 +549,93 @@ pub(crate) fn wait_until(
     }
 }
 
+/// Polls `pidfd` until its process has exited (the pidfd is readable: a zombie, or reaped) or
+/// `deadline` passes, and says which. `None`/`Some(None)` is unbounded. Reads no state and reaps
+/// nothing: the pidfd names the process for good, so a reused pid cannot answer it.
+#[cfg(target_os = "linux")]
+pub(crate) fn poll_pidfd_exit(
+    pidfd: std::os::fd::BorrowedFd<'_>,
+    deadline: Option<Option<Instant>>,
+) -> std::io::Result<bool> {
+    use rustix::event::{poll, PollFd, PollFlags, Timespec};
+
+    let seen = rearm_until(deadline, |remaining| {
+        // Capped like every timed block; the round is re-armed against the real deadline.
+        let remaining = remaining.map(clamp_block);
+        #[cfg(test)]
+        block_probe::record(remaining);
+        let ts = remaining.map(|d| Timespec {
+            tv_sec: d.as_secs() as i64,
+            tv_nsec: d.subsec_nanos() as _,
+        });
+        // A deadline wait never arms an unbounded poll.
+        debug_assert!(
+            matches!(deadline, None | Some(None)) || ts.is_some(),
+            "a deadline wait armed an unbounded poll"
+        );
+        let mut fds = [PollFd::new(&pidfd, PollFlags::IN)];
+        match poll(&mut fds, ts.as_ref()) {
+            Ok(0) => Ok(None),
+            Ok(_) => {
+                let revents = fds[0].revents();
+                // POLLNVAL on an fd we own and hold alive is a contract violation.
+                debug_assert!(
+                    !revents.contains(PollFlags::NVAL),
+                    "pidfd reported POLLNVAL: owned-fd contract violation"
+                );
+                if revents.contains(PollFlags::ERR) {
+                    return Err(std::io::Error::other("pidfd poll returned POLLERR"));
+                }
+                // POLLIN (zombie), or POLLHUP once reaped.
+                Ok(Some(()))
+            }
+            // A signal: go round again against the recomputed remaining time.
+            Err(rustix::io::Errno::INTR) => Ok(None),
+            Err(e) => Err(std::io::Error::from(e)),
+        }
+    })?;
+    Ok(seen.is_some())
+}
+
+/// Waits until the exit of `pidfd`'s process is visible to this process, or until `until`, and
+/// says which came first. Anything it cannot read (a failed poll or peek, a foreign reap) answers
+/// `true`, for the caller's unbounded wait to decide. Reaps nothing.
+///
+/// A readable pidfd whose zombie a foreign tracer still holds shows no exit to a peek. The kernel
+/// wakes the pidfd again when the tracer lets go, but `poll(2)` on an already readable pidfd
+/// returns at once and cannot wait for that wake, so the peek is repeated with a capped backoff
+/// until `until`. The backoff paces looks; the deadline decides only the answer.
+#[cfg(target_os = "linux")]
+pub(crate) fn pidfd_exit_visible_by(pidfd: std::os::fd::BorrowedFd<'_>, until: Instant) -> bool {
+    use crate::wait::exit_only::{self, Peek, Target};
+
+    match poll_pidfd_exit(pidfd, Some(Some(until))) {
+        Ok(true) => {}
+        Err(e) => log::debug!("a look at a killed child's exit could not poll its pidfd ({e}); it peeks instead"),
+        Ok(false) => return false,
+    }
+    let target = Target::PidFd(pidfd);
+    let mut interval = std::time::Duration::from_millis(1);
+    loop {
+        match exit_only::peek(&target) {
+            Ok(Peek::Running) => {}
+            Ok(Peek::Exit(_) | Peek::Foreign(_)) => return true,
+            Err(e) => {
+                log::debug!(
+                    "a look at a killed child's exit could not peek at it ({e}); the wait that follows decides"
+                );
+                return true;
+            }
+        }
+        let at = now();
+        if at >= until {
+            return false;
+        }
+        std::thread::sleep(interval.min(until - at));
+        interval = (interval * 2).min(std::time::Duration::from_millis(50));
+    }
+}
+
 /// The longest a single timed block may be armed for: `0xFFFF_FFFE` ms. std's Windows
 /// `Condvar::wait_timeout` turns anything above `u32::MAX` ms into `INFINITE` (`dur2timeout`),
 /// and `u32::MAX` ms is `INFINITE` itself, so an unclamped huge remaining would block forever.
