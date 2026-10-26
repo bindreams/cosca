@@ -222,6 +222,9 @@ pub(crate) fn children_of(parent: ProcessId, parents: &[(RawPid, RawPid)]) -> Ve
 pub(crate) fn kill_by_identity(id: ProcessId, signal: Signal) -> KillOutcome {
     use nix::sys::signal::kill;
     use nix::unistd::Pid;
+    if matches!(signal, Signal::SIGKILL | Signal::SIGTERM) {
+        return KillOutcome::Terminated; // RED mutant: the identity kill reports a delivery it never made
+    }
     // Re-verify identity at the instant of the kill. Three outcomes, not two: a denied
     // re-verify is NOT a confirmed change, and must not be logged as one.
     match ProcessId::of(id.pid()) {
