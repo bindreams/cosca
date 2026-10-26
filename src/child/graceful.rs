@@ -263,7 +263,8 @@ impl Child {
     /// left, whose error is returned if it fails; any other mechanism ends at once, with no grace.
     /// On Linux, a root whose handle cannot say whether it was reaped still gets the `SIGTERM`
     /// through its pidfd, which names it exactly, then the grace, and a kill through the pidfd if it
-    /// is still running; nothing goes out by its number, and the call ends the same way.
+    /// is still running; nothing goes out by its number, and the call ends the same way. On 6.9+ its
+    /// group is shut down as usual while it has a member.
     /// After this handle's own reap, with another process at the pid, the group is empty: only the
     /// holders get the `SIGTERM`, and the call goes on as usual. The `SIGTERM` and the sweep each
     /// decide on a look of their own at the root, and each send by the group's number after it checks

@@ -609,9 +609,10 @@ impl Child {
     /// was skipped. The handle backstop reads the root's state again: a root orphaned during the sweep
     /// is an exited zombie, so the backstop is skipped and the sweep's answer stands.
     ///
-    /// **On Linux 6.9+, a process group whose root is reaped** is still named exactly by the root's
-    /// pidfd, whoever reaped it: while the group has a member it is killed through the pidfd as
-    /// usual, and each member's resend checks the group the same way right before it. A root reaped
+    /// **On Linux 6.9+, a process group whose root is reaped, or whose root's handle cannot say,** is
+    /// still named exactly by the root's pidfd, whoever reaped it: while the group has a member it is
+    /// killed through the pidfd as usual, and each member's resend checks the group the same way
+    /// right before it. A root reaped
     /// elsewhere, or after this handle's own reap with its pid unreadable, whose group has no member
     /// left has no tree left: nothing is sent, and the call is `Ok`. Otherwise, and below 6.9 and on
     /// macOS, the paragraphs below apply.
