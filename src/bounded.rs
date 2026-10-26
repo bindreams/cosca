@@ -1,8 +1,10 @@
-//! The debug-checked contract behind principle 3: an async `Drop` does bounded work only.
+//! The debug-checked contract behind principle 3: an async `Drop` waits only where it decides to.
 //!
-//! `Child::drop` enters a [`Section`]. Every function that waits for a process exit or a cgroup
-//! drain calls [`assert_may_block`] first, so a wait that creeps into a drop panics at once in a
-//! debug build instead of hanging a runtime thread. A new wait must too. The assert is live in
+//! `Child::drop` enters a [`Section`] for its signals, and keeps it over a release that does not
+//! wait; an armed drop ends it before its own reap and drain. Every function that waits for a
+//! process exit or a cgroup drain calls [`assert_may_block`] first, so a wait that creeps into the
+//! signals or a bounded release panics at once in a debug build instead of hanging a runtime
+//! thread. A new wait must too. The assert is live in
 //! debug builds and in this crate's own tests, whatever their profile, so the release test lane
 //! detects a wait as well. In a release build of the library it is a no-op.
 
@@ -37,7 +39,7 @@ pub(crate) fn assert_may_block(what: &str) {
     #[cfg(any(debug_assertions, test))]
     assert!(
         DEPTH.with(std::cell::Cell::get) == 0,
-        "{what} would block inside an async Drop, which does bounded work only (principle 3)"
+        "{what} would block inside an async Drop's bounded section (principle 3)"
     );
     #[cfg(not(any(debug_assertions, test)))]
     let _ = what;
