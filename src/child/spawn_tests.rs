@@ -1293,6 +1293,9 @@ fn finish_elevated_after_a_foreign_reap_does_not_claim_a_kill() {
 #[cfg(unix)]
 #[skuld::test]
 fn finish_elevated_after_a_foreign_reap_sends_no_killpg_to_a_process_group() {
+    // The pre-6.9 path: on 6.9+ the root's pidfd decides (`drop_group_exact_tests`).
+    #[cfg(target_os = "linux")]
+    let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     let recorder = crate::containment::unix::fault::record_kill_group();
     let (mut cmd, writer) = blocker_with_held_stdin();
     cmd.contain_with(crate::containment::ContainMode::Session);

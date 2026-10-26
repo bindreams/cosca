@@ -85,6 +85,10 @@ mod group_route_tests;
 mod group_exact_tests;
 
 #[cfg(all(test, target_os = "linux"))]
+#[path = "child/drop_group_exact_tests.rs"]
+mod drop_group_exact_tests;
+
+#[cfg(all(test, target_os = "linux"))]
 #[path = "child/kill_tree_view_tests.rs"]
 mod kill_tree_view_tests;
 

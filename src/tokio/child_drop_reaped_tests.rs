@@ -1,6 +1,7 @@
 //! Async twins of `child/drop_reaped_tests.rs`: `cosca::tokio::Child`'s drop once the root is
 //! reaped. A pgid-based group kill would name a number that may now belong to an unrelated
-//! group, so the drop skips it and warns instead.
+//! group, so the drop skips it and warns instead. On Linux 6.9+ the root's pidfd decides a process
+//! group instead (`child/drop_group_exact_tests.rs`), so the tests here refuse that flag.
 //!
 //! The recorder replaces `killpg` (`unix::fault::record_kill_group`), so a mutant that still
 //! sends it never reaches a real group. The recorder is thread-local and skuld's default
@@ -39,6 +40,9 @@ fn drop_warns_since(mark: usize) -> Vec<(log::Level, String)> {
 /// without the pgid.
 #[skuld::test]
 async fn dropping_a_waited_on_process_group_child_sends_no_killpg_and_warns_with_the_pgid() {
+    // The pre-6.9 path: on 6.9+ the root's pidfd decides (`drop_group_exact_tests`).
+    #[cfg(target_os = "linux")]
+    let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let recorder = record_kill_group();
@@ -169,6 +173,9 @@ async fn dropping_a_running_tree_walk_child_walks_from_its_pid_and_does_not_warn
 /// takes only its own state.
 #[skuld::test]
 async fn dropping_a_foreign_reaped_process_group_child_sends_no_killpg() {
+    // The pre-6.9 path: on 6.9+ the root's pidfd decides (`drop_group_exact_tests`).
+    #[cfg(target_os = "linux")]
+    let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let recorder = record_kill_group();
@@ -250,6 +257,9 @@ async fn a_kill_on_drop_false_drop_after_a_foreign_reap_forgets_tokios_child() {
 /// flag is ignored.
 #[skuld::test]
 async fn drop_after_kill_tree_and_wait_skips_at_debug_and_does_not_warn() {
+    // The pre-6.9 path: on 6.9+ the root's pidfd decides (`drop_group_exact_tests`).
+    #[cfg(target_os = "linux")]
+    let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let recorder = record_kill_group();
@@ -270,6 +280,9 @@ async fn drop_after_kill_tree_and_wait_skips_at_debug_and_does_not_warn() {
 /// `graceful_shutdown_tree` sweeps with `kill_tree` and reaps the root, so its drop is quiet too.
 #[skuld::test]
 async fn drop_after_graceful_shutdown_tree_skips_at_debug_and_does_not_warn() {
+    // The pre-6.9 path: on 6.9+ the root's pidfd decides (`drop_group_exact_tests`).
+    #[cfg(target_os = "linux")]
+    let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let recorder = record_kill_group();
@@ -331,6 +344,9 @@ async fn waited_on_sleep_root() -> crate::tokio::Child {
 /// drop takes only the number's read.
 #[skuld::test]
 async fn dropping_a_waited_on_child_whose_number_reads_unknown_still_sends_no_killpg() {
+    // The pre-6.9 path: on 6.9+ the root's pidfd decides (`drop_group_exact_tests`).
+    #[cfg(target_os = "linux")]
+    let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let recorder = record_kill_group();
@@ -373,6 +389,9 @@ async fn dropping_an_unreaped_child_whose_number_reads_unknown_kills_and_logs_th
 /// tree-killed flag is set on the attempt.
 #[skuld::test]
 async fn drop_after_a_failed_kill_tree_and_wait_still_warns() {
+    // The pre-6.9 path: on 6.9+ the root's pidfd decides (`drop_group_exact_tests`).
+    #[cfg(target_os = "linux")]
+    let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let recorder = record_kill_group();
