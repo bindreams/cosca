@@ -75,8 +75,9 @@ impl Prepared {
     /// reaped the root. Only a root whose group is its containment is sent it: a Session root, or a
     /// process-group root with no cgroup leaf or one its leaf did not take, as `attach` would decide.
     /// The leaf's verdict is settled first ([`settle_verdict`](Self::settle_verdict)); a leaf that
-    /// took the child kills it with the leaf. Below 6.9 the kernel refuses the flag and nothing is
-    /// sent, as the group's number may name another group. `Err` is the kernel's refusal of the kill.
+    /// took the child kills it with the leaf. `Err` is the kernel's refusal of the kill, with the
+    /// group's members possibly left running: `EINVAL` when it refuses the flag (expected below
+    /// 6.9), in which case nothing is sent, as the group's number may name another group.
     #[cfg(target_os = "linux")]
     pub(crate) fn kill_group_before_attach(&self, child: ChildHandle<'_>) -> Result<(), nix::errno::Errno> {
         use nix::errno::Errno;
@@ -88,12 +89,8 @@ impl Prepared {
         }
         let pid = child.pid;
         match crate::containment::unix::pidfd_signal_group(child.pidfd, nix::sys::signal::Signal::SIGKILL) {
-            Ok(()) => log::debug!("spawn teardown: killed the process group of pid {pid} through its pidfd"),
+            Ok(()) => log::debug!("spawn teardown: sent SIGKILL to the process group of pid {pid} through its pidfd"),
             Err(Errno::ESRCH) => log::debug!("spawn teardown: the process group of pid {pid} has no member left"),
-            Err(Errno::EINVAL) => log::debug!(
-                "spawn teardown: the kernel refused PIDFD_SIGNAL_PROCESS_GROUP (before Linux 6.9), so the process \
-                 group of pid {pid} is sent nothing"
-            ),
             Err(e) => return Err(e),
         }
         Ok(())
@@ -677,8 +674,7 @@ impl Attached {
     /// the root's pidfd instead, as a tree call decides it ([`DropReach`]).
     ///
     /// `view` is one look at the root, taken right before this call. Each send by the group's number
-    /// after it checks the root again right before it
-    /// ([`GroupRoot::check`](crate::containment::GroupRoot::check)).
+    /// after it checks the root again, as for [`Child::kill_tree`](crate::Child::kill_tree).
     ///
     /// The same skip when the root's own handle could not say whether it is reaped
     /// (`RootState::Unknown`): nothing then shows the number still names the root.
@@ -736,8 +732,17 @@ impl Attached {
     /// has a member, whoever reaped the root, and gone once a reaped root's group has none.
     /// Otherwise, and below 6.9 and on macOS, what names the tree by the root's number is skipped.
     #[cfg(unix)]
-    #[cfg_attr(not(target_os = "linux"), allow(unused_variables, reason = "only Linux has a pidfd"))]
     fn drop_reach(&self, view: &DropView, root: &crate::containment::GroupRoot<'_>) -> DropReach {
+        let reach = self.decide_drop_reach(view, root);
+        #[cfg(test)]
+        crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterRootLook);
+        reach
+    }
+
+    /// [`drop_reach`](Self::drop_reach)'s decision.
+    #[cfg(unix)]
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables, reason = "only Linux has a pidfd"))]
+    fn decide_drop_reach(&self, view: &DropView, root: &crate::containment::GroupRoot<'_>) -> DropReach {
         let Some(skipped) = view.skipped_action(self) else {
             return DropReach::Kill;
         };

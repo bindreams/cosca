@@ -13,8 +13,8 @@ pub(crate) enum HookPoint {
     BeforeReap,
     /// `graceful_shutdown`: after the grace ran out, before the escalation.
     BeforeEscalation,
-    /// A tree call (`kill_tree`, `terminate_tree`, `graceful_shutdown_tree`): after its one look at
-    /// the root, before anything is sent.
+    /// A tree call (`kill_tree`, `terminate_tree`, `graceful_shutdown_tree`), a drop, a failed
+    /// spawn's cleanup: after its one look at the root, before anything is sent.
     #[cfg(unix)]
     AfterRootLook,
 }

@@ -1,7 +1,8 @@
 //! Linux: a spawn that fails because its root's identity cannot be read, for a root that left a
 //! member in the process group that is its containment: a session, or the group a cgroup leaf that
 //! did not take the root falls back to. On 6.9+ the cleanup kills the group through the root's pidfd
-//! while it has a member, whoever reaped the root; below 6.9 it kills the root alone.
+//! while it has a member, whoever reaped the root; below 6.9 it kills the root alone and warns once that
+//! members of its group may be left running.
 
 use crate::child::group_exact_tests::{await_started, Member, ROOT_WITH_A_MEMBER};
 use crate::child::spawn::failure::expect_may_have_started_with;
@@ -40,20 +41,49 @@ impl Failure {
     /// Arms the spawn's `BeforeIdentity` hook: it waits for the member, then brings this failure
     /// about. Dropping the guard disarms both.
     pub(crate) fn arm(self, started: std::io::PipeReader) -> Armed {
-        let hook = fault::set_at(fault::SpawnPoint::BeforeIdentity, move || {
-            await_started(started);
-            if matches!(self, Failure::ReapedElsewhere) {
-                reap_behind(fault::spawn_pid());
+        let pid = std::rc::Rc::new(std::cell::Cell::new(0));
+        let hook = fault::set_at(fault::SpawnPoint::BeforeIdentity, {
+            let pid = std::rc::Rc::clone(&pid);
+            move || {
+                pid.set(fault::spawn_pid());
+                await_started(started);
+                if matches!(self, Failure::ReapedElsewhere) {
+                    reap_behind(fault::spawn_pid());
+                }
             }
         });
         fault::set_force_identity_unknown(matches!(self, Failure::Unreadable));
-        Armed { _hook: hook }
+        Armed { _hook: hook, pid }
     }
 }
 
 /// [`Failure::arm`]'s guard.
 pub(crate) struct Armed {
     _hook: crate::oneshot_hook::Armed,
+    pid: std::rc::Rc<std::cell::Cell<u32>>,
+}
+
+impl Armed {
+    /// The pid of the root the spawn forked; set once the hook has run.
+    pub(crate) fn pid(&self) -> u32 {
+        let pid = self.pid.get();
+        assert_ne!(pid, 0, "the spawn's hook has run");
+        pid
+    }
+}
+
+/// The record the cleanup owes when it cannot kill the group of `pid`: one `warn` that names it.
+pub(crate) fn left_running_note(pid: u32) -> String {
+    format!("members of the process group of pid {pid} may be left running")
+}
+
+/// What a failed spawn did, as the tests below read it.
+pub(crate) struct Failed {
+    pub(crate) fate: ChildFate,
+    pub(crate) steps: Vec<GroupStep>,
+    pub(crate) member: Member,
+    /// The levels of the records that say members of the root's group may be left running.
+    pub(crate) left_running: Vec<log::Level>,
 }
 
 impl Drop for Armed {
@@ -95,11 +125,13 @@ impl Drop for PlacementForced {
 
 /// Spawns `failure`'s root in `container`, which fails at the identity read: the failure's fate,
 /// the group steps it recorded and the root's member.
-fn failed_spawn(failure: Failure, container: Container) -> (ChildFate, Vec<GroupStep>, Member) {
+fn failed_spawn(failure: Failure, container: Container) -> Failed {
+    crate::log_capture::install();
     let (stdio, started, member) = Member::pipes();
     let armed = failure.arm(started);
     let (mode, placement) = container.arm();
     let capture = Capture::start();
+    let mark = crate::log_capture::mark();
     let spawned = {
         let mut cmd = crate::Command::new();
         cmd.args(failure.argv());
@@ -110,39 +142,59 @@ fn failed_spawn(failure: Failure, container: Container) -> (ChildFate, Vec<Group
         cmd.spawn()
     };
     let steps = capture.group_steps();
+    let pid = armed.pid();
     drop((armed, placement));
     let (_err, fate) = match spawned {
         Ok(child) => panic!("the spawn must fail at its identity read: {:?}", child.id()),
         Err(e) => expect_may_have_started_with(e),
     };
-    (fate, steps, member)
+    let left_running = crate::log_capture::levels_since(mark, &left_running_note(pid));
+    Failed {
+        fate,
+        steps,
+        member,
+        left_running,
+    }
 }
 
-/// 6.9+: the cleanup kills the root's group through its pidfd. Mutant: "a failed spawn's cleanup
-/// kills the root alone".
+/// 6.9+: the cleanup kills the root's group through its pidfd. Mutant: "the cleanup says members
+/// may be left running although it killed the group".
 fn kills_the_group(failure: Failure, container: Container) {
-    let (fate, steps, member) = failed_spawn(failure, container);
-    assert_group_signalled_first_through_the_pidfd(&steps, libc::SIGKILL);
-    member.assert_killed();
+    let failed = failed_spawn(failure, container);
+    assert_group_signalled_first_through_the_pidfd(&failed.steps, libc::SIGKILL);
+    failed.member.assert_killed();
+    assert!(
+        failed.left_running.is_empty(),
+        "the group was killed, so nothing is left running: {:?}",
+        failed.left_running
+    );
     if matches!(failure, Failure::ReapedElsewhere) {
-        assert_eq!(fate, ChildFate::Gone, "the root was reaped before any kill");
+        assert_eq!(failed.fate, ChildFate::Gone, "the root was reaped before any kill");
     }
 }
 
 /// Below 6.9 the old behaviour holds: the kernel refuses the group's send through the pidfd,
-/// nothing goes by the group's number, and its member lives on. Mutant: "a refused flag falls back
-/// to the group's number".
+/// nothing goes by the group's number, and its member lives on, which the cleanup says in one
+/// `warn` naming the root. Mutants: "a refused flag falls back to the group's number"; "the refusal
+/// is only a `debug`".
 fn below_6_9_sends_nothing_to_the_group(failure: Failure, container: Container) {
     let old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
-    let (_fate, steps, member) = failed_spawn(failure, container);
+    let failed = failed_spawn(failure, container);
     drop(old_kernel);
     assert!(
-        steps
+        failed
+            .steps
             .iter()
             .all(|s| *s == GroupStep::Group(Route::Pidfd, libc::SIGKILL)),
-        "nothing but the refused send through the pidfd: {steps:?}"
+        "nothing but the refused send through the pidfd: {:?}",
+        failed.steps
     );
-    member.assert_survived();
+    failed.member.assert_survived();
+    assert_eq!(
+        failed.left_running,
+        [log::Level::Warn],
+        "one warn says members of the root's group may be left running"
+    );
 }
 
 #[skuld::test]
