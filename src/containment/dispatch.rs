@@ -39,6 +39,28 @@ pub(crate) struct ChildHandle<'a> {
     pub(crate) pidfd: std::os::fd::BorrowedFd<'a>,
 }
 
+/// Linux 6.9+: `SIGKILL`, through a root's pidfd, the root's process group while the group has a
+/// member. `pid` only labels the log. Below 6.9 the kernel refuses the flag and nothing is sent, as
+/// the group's number may name another group. `Err` is the kernel's refusal of the kill.
+#[cfg(target_os = "linux")]
+pub(crate) fn kill_group_through_pidfd(
+    pidfd: std::os::fd::BorrowedFd<'_>,
+    pid: Option<u32>,
+) -> Result<(), nix::errno::Errno> {
+    use nix::errno::Errno;
+    let named = crate::child::spawn::named(pid);
+    match crate::containment::unix::pidfd_signal_group(pidfd, nix::sys::signal::Signal::SIGKILL) {
+        Ok(()) => log::debug!("spawn teardown: killed the process group of {named} through its pidfd"),
+        Err(Errno::ESRCH) => log::debug!("spawn teardown: the process group of {named} has no member left"),
+        Err(Errno::EINVAL) => log::debug!(
+            "spawn teardown: the kernel refused PIDFD_SIGNAL_PROCESS_GROUP (before Linux 6.9), so the process \
+             group of {named} is sent nothing"
+        ),
+        Err(e) => return Err(e),
+    }
+    Ok(())
+}
+
 impl Prepared {
     /// The cooperative-signal mechanism for a child spawned from this decision. The `cfg` lives
     /// here, once, so no spawn path carries one for it: every non-Windows child cosca owns can
@@ -70,6 +92,24 @@ impl Prepared {
         let _ = pid;
     }
 
+    /// Whether the root's process group is its containment: the root is a Session or process-group
+    /// root, and no cgroup leaf took it, as `attach` would decide. The leaf's verdict is taken
+    /// first ([`settle_verdict`](Self::settle_verdict)).
+    #[cfg(target_os = "linux")]
+    fn group_is_containment(&self) -> bool {
+        self.is_root
+            && self.cgroup_leaf.as_ref().is_none_or(|leaf| !leaf.child_entered())
+            && matches!(self.mode, Some(mode) if !matches!(mode, ContainMode::TreeWalk))
+    }
+
+    /// [`group_is_containment`](Self::group_is_containment) for a spawn with no cgroup leaf, which
+    /// needs no verdict: a tokio spawn that fails after its fork has no handle on its child to take
+    /// one through. With a leaf the leaf's abandonment decides (see `end_child`).
+    #[cfg(all(target_os = "linux", feature = "tokio"))]
+    pub(crate) fn leafless_group_is_containment(&self) -> bool {
+        self.cgroup_leaf.is_none() && self.group_is_containment()
+    }
+
     /// Linux 6.9+: `SIGKILL`, through `child`'s pidfd, the process group of a spawn that failed
     /// before its attach, while the group has a member. The pidfd names the group exactly, whoever
     /// reaped the root. Only a root whose group is its containment is sent it: a Session root, or a
@@ -79,24 +119,10 @@ impl Prepared {
     /// sent, as the group's number may name another group. `Err` is the kernel's refusal of the kill.
     #[cfg(target_os = "linux")]
     pub(crate) fn kill_group_before_attach(&self, child: ChildHandle<'_>) -> Result<(), nix::errno::Errno> {
-        use nix::errno::Errno;
-        let group_is_containment = self.is_root
-            && self.cgroup_leaf.as_ref().is_none_or(|leaf| !leaf.child_entered())
-            && matches!(self.mode, Some(mode) if !matches!(mode, ContainMode::TreeWalk));
-        if !group_is_containment {
+        if !self.group_is_containment() {
             return Ok(());
         }
-        let pid = child.pid;
-        match crate::containment::unix::pidfd_signal_group(child.pidfd, nix::sys::signal::Signal::SIGKILL) {
-            Ok(()) => log::debug!("spawn teardown: killed the process group of pid {pid} through its pidfd"),
-            Err(Errno::ESRCH) => log::debug!("spawn teardown: the process group of pid {pid} has no member left"),
-            Err(Errno::EINVAL) => log::debug!(
-                "spawn teardown: the kernel refused PIDFD_SIGNAL_PROCESS_GROUP (before Linux 6.9), so the process \
-                 group of pid {pid} is sent nothing"
-            ),
-            Err(e) => return Err(e),
-        }
-        Ok(())
+        kill_group_through_pidfd(child.pidfd, Some(child.pid))
     }
 
     /// End the placement exchange of a spawn that failed with no handle left on its child — tokio

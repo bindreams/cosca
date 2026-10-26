@@ -426,6 +426,10 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
             cmd.elevation_front(),
             prepared.cgroup_leaf.is_some().then(|| std::rc::Rc::clone(&left_pidfd)),
         );
+        // A root whose group is its containment, with no leaf to kill through: a spawn tokio fails after
+        // its fork kills the group too.
+        #[cfg(target_os = "linux")]
+        let handshake = handshake.killing_group(prepared.leafless_group_is_containment());
 
         // On Unix, hand n>=3 child ends to fd_map — registered AFTER `prepare` so its dup2
         // pre_exec runs LAST in the child (see the ordering rationale in child/spawn.rs).
@@ -450,9 +454,9 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
             // tokio can fail this spawn after its fork succeeded (its `build_child`: stdio
             // registration, its pidfd reaper, its signal driver), dropping the child neither killed
             // nor reaped, and it returns no pid. A cgroup leaf is still killed through when
-            // `prepared` drops, since that needs no pid (see `cgroup`'s report contract). Under any
-            // other containment — a process group, a session, a tree walk, none, or a spawn that
-            // degraded — nothing reaches the child, and it keeps running.
+            // `prepared` drops, since that needs no pid (see `cgroup`'s report contract). The
+            // handshake's pidfd kills and reaps the child, and, on 6.9+, kills its process group
+            // when that is its containment and no leaf holds it (`killing_group`).
             #[cfg(target_os = "linux")]
             let spawned = {
                 #[allow(clippy::disallowed_methods, reason = "spawn_lock is held by `_guard` above")]
@@ -987,6 +991,10 @@ mod pidfd_tests;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "spawn/identity_group_tests.rs"]
 mod identity_group_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "spawn/post_fork_group_tests.rs"]
+mod post_fork_group_tests;
 
 /// The fate of a child a failed tokio spawn abandoned with no handle on it (see
 /// [`warn_for_abandoned`]). Linux's handshake holds a pidfd on it, and answers itself.

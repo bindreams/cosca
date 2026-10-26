@@ -274,6 +274,16 @@ pub(crate) type LeftPidfd = std::rc::Rc<std::cell::Cell<Option<OwnedFd>>>;
 enum LeftFront {
     /// Not a front: torn down as any child.
     NotAFront,
+    /// Not a front, and the process group the root leads is its containment (no cgroup leaf can have
+    /// taken it): on Linux 6.9+ the group is killed through the pidfd before the root is torn down.
+    #[cfg_attr(
+        not(feature = "tokio"),
+        allow(
+            dead_code,
+            reason = "only tokio's spawn leaves a child unreaped, and names its group"
+        )
+    )]
+    GroupRoot,
     /// A front, left here: sent nothing, reaped only if it has exited, its fate noted.
     #[cfg_attr(
         not(feature = "tokio"),
@@ -314,6 +324,18 @@ impl Handshake {
         self
     }
 
+    /// Names the root's process group as its containment (`Prepared::leafless_group_is_containment`):
+    /// a spawn that fails after its fork, with the child still there, kills the group through the
+    /// child's pidfd while it has a member (Linux 6.9+), before it kills the child. Not for a front,
+    /// which is sent nothing.
+    #[cfg(feature = "tokio")]
+    pub(crate) fn killing_group(mut self, yes: bool) -> Handshake {
+        if yes && matches!(self.front, LeftFront::NotAFront) {
+            self.front = LeftFront::GroupRoot;
+        }
+        self
+    }
+
     /// Runs `spawn` (the fork) with the helper thread alive beside it, then answers the pidfd.
     ///
     /// - A failed `pidfd_open` in the child is the error, whatever `spawn` answered: the child
@@ -332,7 +354,8 @@ impl Handshake {
     /// - A spawn that fails after its fork: std collected the child (see residuals b and c in
     ///   [`child_exited_before_the_helper_finished`]), or tokio dropped it neither
     ///   killed nor reaped. The pidfd tells which, and a child still there is killed and reaped
-    ///   through it.
+    ///   through it, after its process group is killed if it is named as the containment
+    ///   ([`killing_group`](Self::killing_group)).
     ///
     /// The child runs the program only once told to go, so every failure but one proves the program
     /// did not start: a failed `spawn` after the child was told to go, from a spawn whose error does
@@ -838,7 +861,16 @@ fn conclude<T: Spawned>(spawned: io::Result<T>, outcome: Outcome, front: LeftFro
                 let (fate, child_fate) = super::leave_front_through_pidfd(None, pidfd, front, None, None);
                 (fate.note(error, Some(front), None), child_fate)
             }
-            LeftFront::Here(_) | LeftFront::NotAFront => {
+            // The group first: it holds the root too, and a root already collected never ran.
+            LeftFront::GroupRoot if !collected => {
+                let mut why = super::Diagnosis::default();
+                if let Err(e) = crate::containment::kill_group_through_pidfd(pidfd.as_fd(), None) {
+                    super::note_refused_group_kill(None, e, &mut why);
+                }
+                let child_fate = super::teardown_through_pidfd_noting(None, pidfd, None, &mut why);
+                (error, child_fate)
+            }
+            LeftFront::Here(_) | LeftFront::NotAFront | LeftFront::GroupRoot => {
                 let child_fate = super::teardown_through_pidfd(None, pidfd, None);
                 (error, child_fate)
             }

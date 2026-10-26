@@ -2408,11 +2408,17 @@ pub(crate) fn kill_group_before_teardown(
     why: &mut Diagnosis,
 ) {
     if let Err(e) = prepared.kill_group_before_attach(child) {
-        why.add(format!(
-            "spawn teardown could not kill the process group of pid {} through its pidfd ({e})",
-            child.pid
-        ));
+        note_refused_group_kill(Some(child.pid), e, why);
     }
+}
+
+/// Owes `why` a refused kill of the process group of `pid`'s root through its pidfd.
+#[cfg(target_os = "linux")]
+pub(crate) fn note_refused_group_kill(pid: Option<u32>, refusal: nix::errno::Errno, why: &mut Diagnosis) {
+    why.add(format!(
+        "spawn teardown could not kill the process group of {} through its pidfd ({refusal})",
+        named(pid)
+    ));
 }
 
 /// The subtree of the leaf of an elevation front, captured while the leaf exists: a failure arm
