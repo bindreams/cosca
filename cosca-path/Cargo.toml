@@ -1,0 +1,26 @@
+[package]
+name = "cosca-path"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Pure per-OS paths for cosca: faithful components, exact equality, no implicit normalisation."
+license.workspace = true
+repository.workspace = true
+keywords = ["path", "posix", "windows", "cross-platform"]
+categories = ["filesystem", "os"]
+exclude = ["/clippy.toml"]
+
+[dependencies]
+# Zero-copy `&OsStr` -> `&Path` casts without hand-written `unsafe`.
+ref-cast = "1"
+
+[dev-dependencies]
+# The test harness for the `harness = false` lib.
+skuld.workspace = true
+
+[lib]
+# The lib's unit tests run on skuld (`src/lib.rs` has the `main`).
+harness = false
+
+[lints]
+workspace = true
