@@ -264,6 +264,13 @@ filter = 'test(/^child::shared::shared_tests::tracer::macos::/)'
 slow-timeout = { period = "20s", terminate-after = 1, grace-period = "1s" }
 
 [[profile.default.overrides]]
+# A backstop like the `shared_tests` one below, sized for the `traced` tests' tracer helpers: each runs from its own
+# freshly signed copy of the test binary. On darwin/amd64 a one-helper test takes up to ~7 s, and the test that chains
+# two helpers twice that (#805).
+filter = 'test(/^child::shared::shared_tests::traced::/)'
+slow-timeout = { period = "30s", terminate-after = 1, grace-period = "1s" }
+
+[[profile.default.overrides]]
 # A backstop, not a detector: the `SharedChild` tests fail by assertion (see `assert_handed_off`),
 # not by timing out. This bound only stops a regression those checks did not anticipate, in a test
 # that `recv()`s or `join()`s on our own code, from stalling the job. The macOS wait's tests
