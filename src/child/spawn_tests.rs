@@ -1293,13 +1293,15 @@ fn finish_elevated_after_a_foreign_reap_does_not_claim_a_kill() {
 #[cfg(unix)]
 #[skuld::test]
 fn finish_elevated_after_a_foreign_reap_sends_no_killpg_to_a_process_group() {
+    #[cfg(target_os = "linux")]
+    let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     let recorder = crate::containment::unix::fault::record_kill_group();
     let (mut cmd, writer) = blocker_with_held_stdin();
     cmd.contain_with(crate::containment::ContainMode::Session);
     let child = cmd.spawn().expect("spawn");
     assert!(
-        child.attached.carries_recyclable_pgid(),
-        "the test needs a number-named group kill"
+        child.attached.signals_a_group(),
+        "the test needs a group named by the root's pid, which ContainMode::Session makes"
     );
     foreign_reap(&child, writer);
 

@@ -350,6 +350,12 @@ fn death_watch_accept_or_die_reports_a_target_that_exits_after_the_watch_is_arme
 fn death_watch_accept_or_die_retries_a_kevent_wait_interrupted_by_a_signal() {
     use std::net::TcpListener;
     use std::process::Stdio;
+    let Some(done) = common::test_own_process::own_process(
+        common::test_own_process::test_path!(death_watch_accept_or_die_retries_a_kevent_wait_interrupted_by_a_signal),
+        common::spawn_locked,
+    ) else {
+        return;
+    };
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let mut child = common::spawn_locked(
         std::process::Command::new(common::testbin())
@@ -359,7 +365,7 @@ fn death_watch_accept_or_die_retries_a_kevent_wait_interrupted_by_a_signal() {
     .expect("spawn a target that waits for its stdin to close");
     let pid = child.id();
     let stdin = child.stdin.take();
-    let interrupter = common::kevent_eintr::interrupt_once_blocked(move || drop(stdin));
+    let interrupter = common::kevent_eintr::interrupt_once_blocked(&done, move || drop(stdin));
     let message = panic_message_of(|| common::accept_or_die(&listener, &mut child));
     interrupter.finish();
     assert_died_before_connecting(&message, pid);

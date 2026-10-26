@@ -16,8 +16,17 @@
 //!   past its root.
 //! - `drive-dir` and `verbatim-unc`: see [`completion`].
 //! - `report-cwd`: prints `cwd=` and this process's cwd; the long-path-aware child.
+//! - `subst-cwd`, `verbatim-null` and `report-cwd-final`: see [`null_cwd`].
+//! - `long-image`: see [`long_image`]; this binary is its long-path-aware half.
+//! - `with-env-block` and `full-path`: see `env_block` and `full_path`; the child is this binary, so
+//!   `full-path` measures a long-path-aware process.
 //!
 //! A `[[bin]]` cannot be `cfg`-ed out, so off Windows it exits 1.
+
+/// Quiet-on-broken-pipe output; declared first so its macros reach every module below.
+#[macro_use]
+#[path = "quiet_io.rs"]
+mod quiet_io;
 
 #[cfg(windows)]
 fn main() {
@@ -27,20 +36,48 @@ fn main() {
         Some("verbatim") => probe::verbatim(&args[2], &args[3]),
         Some("drive-dir") => completion::drive_dir(&args[2], &args[3]),
         Some("verbatim-unc") => completion::verbatim_unc(&args[2], &args[3]),
-        Some("report-cwd") => println!("cwd={}", std::env::current_dir().unwrap().display()),
+        Some("report-cwd") => outln!("cwd={}", std::env::current_dir().unwrap().display()),
+        Some("report-cwd-final") => null_cwd::report_cwd_final(),
+        Some("subst-cwd") => null_cwd::subst_cwd(&args[2], &args[3]),
+        Some("verbatim-null") => null_cwd::verbatim_null(&args[2], &args[3]),
+        Some("long-image") => long_image::run(&args[2], &args[3]),
+        Some("with-env-block") => env_block::with_block(&args[2..]),
+        Some("full-path") => full_path::run(&args[2]),
         other => panic!("unknown mode {other:?}"),
     }
 }
 
 #[cfg(not(windows))]
 fn main() {
-    eprintln!("cosca_testbin_cwd is a Windows probe");
+    errln!("cosca_testbin_cwd is a Windows probe");
     std::process::exit(1);
 }
 
 #[cfg(windows)]
 #[path = "cwd/completion.rs"]
 mod completion;
+
+#[cfg(windows)]
+#[path = "cwd/null_cwd.rs"]
+mod null_cwd;
+
+#[cfg(windows)]
+#[path = "long_image.rs"]
+mod long_image;
+
+#[cfg(windows)]
+#[path = "full_path.rs"]
+mod full_path;
+
+#[cfg(windows)]
+#[allow(dead_code, reason = "shared with cosca_testbin, which uses other parts")]
+#[path = "env_block.rs"]
+mod env_block;
+
+#[cfg(windows)]
+#[allow(dead_code, reason = "shared with cosca_testbin, which uses other parts")]
+#[path = "measure.rs"]
+mod measure;
 
 #[cfg(windows)]
 mod probe {
@@ -134,7 +171,7 @@ mod probe {
     pub fn long(base: &str, unaware: &str) {
         // SAFETY: no arguments; reads this process's own state.
         let enabled = unsafe { RtlAreLongPathsEnabled() } != 0;
-        println!("long_paths_enabled={enabled}");
+        outln!("long_paths_enabled={enabled}");
         let d = canonical(base);
         let mut long = d.clone();
         while long.as_os_str().len() <= 300 {
@@ -142,9 +179,9 @@ mod probe {
         }
         std::fs::create_dir_all(verbatim_of(&long)).expect("create the long directory");
         let plain = set_cwd(long.as_os_str());
-        println!("set_plain={}", outcome(&plain));
+        outln!("set_plain={}", outcome(&plain));
         if plain.is_err() {
-            println!("set_verbatim={}", outcome(&set_cwd(&verbatim_of(&long))));
+            outln!("set_verbatim={}", outcome(&set_cwd(&verbatim_of(&long))));
             return;
         }
         let render = Render(vec![
@@ -163,11 +200,11 @@ mod probe {
             }
             let mut raw = cosca::Command::new();
             raw.executable(child).commandline(line);
-            println!("cosca_raw_{label}={}", spawned(cosca_output(&mut raw), "cwd=", &render));
+            outln!("cosca_raw_{label}={}", spawned(cosca_output(&mut raw), "cwd=", &render));
             let null = std_output(std::process::Command::new(child).args(args));
-            println!("null_cwd_{label}={}", spawned(null, "cwd=", &render));
+            outln!("null_cwd_{label}={}", spawned(null, "cwd=", &render));
             let explicit = std_output(std::process::Command::new(child).args(args).current_dir(&long));
-            println!("explicit_cwd_{label}={}", spawned(explicit, "cwd=", &render));
+            outln!("explicit_cwd_{label}={}", spawned(explicit, "cwd=", &render));
         }
     }
 
@@ -178,7 +215,7 @@ mod probe {
         std::fs::copy(image, d.join("sub").join("tool.exe")).expect("copy the image child into sub");
         let vd = verbatim_of(&d);
         let set = set_cwd(&vd);
-        println!("set={}", outcome(&set));
+        outln!("set={}", outcome(&set));
         if set.is_err() {
             return;
         }
@@ -189,12 +226,12 @@ mod probe {
         for (key, name) in [("gfpn_tool", "tool.exe."), ("gfpn_sub", "sub.")] {
             // `std::path::absolute` is `GetFullPathNameW` for a relative name.
             let full = std::path::absolute(name).expect("GetFullPathNameW");
-            println!("{key}={}", render.apply(full.to_str().unwrap()));
+            outln!("{key}={}", render.apply(full.to_str().unwrap()));
         }
-        println!("win32_tool={}", win32_tool(&d, &render));
+        outln!("win32_tool={}", win32_tool(&d, &render));
         let mut raw_tool = cosca::Command::new();
         raw_tool.raw_executable("tool.exe.").commandline("tool");
-        println!("raw_tool={}", spawned(cosca_output(&mut raw_tool), "image=", &render));
+        outln!("raw_tool={}", spawned(cosca_output(&mut raw_tool), "image=", &render));
         for (key, raw) in [("raw_nested", true), ("exe_nested", false)] {
             let mut nested = cosca::Command::new();
             if raw {
@@ -203,13 +240,13 @@ mod probe {
                 nested.executable(r"sub.\tool.exe");
             }
             nested.commandline("tool");
-            println!("{key}={}", spawned(cosca_output(&mut nested), "image=", &render));
+            outln!("{key}={}", spawned(cosca_output(&mut nested), "image=", &render));
         }
         let mut raw_sub = cosca::Command::new();
         raw_sub.executable(image).commandline("x").current_dir("sub.");
-        println!("raw_sub={}", spawned(cosca_output(&mut raw_sub), "cwd=", &render));
+        outln!("raw_sub={}", spawned(cosca_output(&mut raw_sub), "cwd=", &render));
         let std_sub = std_output(std::process::Command::new(image).current_dir("sub."));
-        println!("std_sub={}", spawned(std_sub, "cwd=", &render));
+        outln!("std_sub={}", spawned(std_sub, "cwd=", &render));
         let depth = d.components().count() - 2;
         crate::completion::past_the_root(depth, &render);
         crate::completion::rooted_cwd(image, &render);

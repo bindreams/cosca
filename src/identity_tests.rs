@@ -87,8 +87,14 @@ fn imposter_token_neither_exists_nor_is_alive() {
 #[cfg(windows)]
 #[skuld::test]
 fn an_access_denied_live_process_is_unknown_everywhere() {
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(an_access_denied_live_process_is_unknown_everywhere),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
     use windows::Win32::System::Threading::PROCESS_SYNCHRONIZE;
-    let child = crate::identity::windows_fixture::spawn_restricted(PROCESS_SYNCHRONIZE.0);
+    let child = crate::identity::windows_fixture::spawn_restricted(&done, PROCESS_SYNCHRONIZE.0);
     let id = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
         .expect("the owned handle always yields an identity");
     assert!(child.is_running(), "precondition: the subject must be live");
@@ -103,8 +109,14 @@ fn an_access_denied_live_process_is_unknown_everywhere() {
 #[cfg(windows)]
 #[skuld::test]
 fn a_process_denying_only_synchronize_exists_but_has_unknown_liveness() {
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(a_process_denying_only_synchronize_exists_but_has_unknown_liveness),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
     use windows::Win32::System::Threading::PROCESS_QUERY_LIMITED_INFORMATION;
-    let child = crate::identity::windows_fixture::spawn_restricted(PROCESS_QUERY_LIMITED_INFORMATION.0);
+    let child = crate::identity::windows_fixture::spawn_restricted(&done, PROCESS_QUERY_LIMITED_INFORMATION.0);
     assert!(child.is_running(), "precondition: the subject must be live");
     let Resolved::Found(id) = ProcessId::of(child.pid()) else {
         panic!("QUERY_LIMITED is granted, so the identity must resolve");
