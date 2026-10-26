@@ -454,12 +454,21 @@ pub(crate) fn raw_spawn_teardown(proc: OwnedHandle, pid: u32, id: Option<crate::
         log::warn!("raw spawn teardown: kill of pid {pid} failed: {e}; not waiting");
         return ChildFate::Running { id };
     }
-    if let Err(e) = rc.wait() {
-        log::warn!("raw spawn teardown failed to reap pid {pid}: {e}");
-        debug_assert!(false, "raw spawn teardown failed to reap child: {e}");
-        return ChildFate::Killed;
+    // A fixture only that kill would end is released here.
+    #[cfg(test)]
+    crate::child::spawn::fault::run_between_kill_and_wait();
+    match rc.wait() {
+        Ok(_status) => {
+            #[cfg(test)]
+            crate::child::spawn::fault::record_teardown_reap(pid, _status);
+            ChildFate::Reaped
+        }
+        Err(e) => {
+            log::warn!("raw spawn teardown failed to reap pid {pid}: {e}");
+            debug_assert!(false, "raw spawn teardown failed to reap child: {e}");
+            ChildFate::Killed
+        }
     }
-    ChildFate::Reaped
 }
 
 /// Does the caller hold `PROCESS_TERMINATE` on `pid`? A STATIC permission answer (a second
