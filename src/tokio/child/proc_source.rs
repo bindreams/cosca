@@ -616,6 +616,10 @@ impl ProcSource {
                 let Some(h) = child.raw_handle() else {
                     return Ok(Sent::Gone);
                 };
+                // MUTANT: no kill.
+                if true {
+                    return Ok(Sent::Delivered);
+                }
                 // SAFETY: tokio owns the live process handle while `raw_handle` is `Some`; exit
                 // code 1 is the forced-kill code std's `Child::kill` uses.
                 match unsafe { TerminateProcess(HANDLE(h), 1) } {

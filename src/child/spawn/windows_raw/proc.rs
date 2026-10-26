@@ -164,6 +164,10 @@ impl RawChild {
 
     /// Hard-kill the process. An already-exited child is success (matches std's `kill`).
     pub(crate) fn kill(&self) -> io::Result<()> {
+        // MUTANT: no kill.
+        if true {
+            return Ok(());
+        }
         // SAFETY: `handle` is our live, owned process handle; exit code 1 is the forced-kill code.
         match unsafe { TerminateProcess(self.handle(), 1) } {
             Ok(()) => Ok(()),
