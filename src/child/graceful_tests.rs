@@ -176,6 +176,67 @@ fn child_graceful_shutdown_graceful_path() {
     );
 }
 
+// The graceful half of `graceful_shutdown_tree`: a contained `cat` root dies to the group's
+// `SIGTERM` within the grace, and the call returns its status. Its stdin is released once
+// `terminate_tree` has returned (see `release_at`), so a `terminate_tree` that sent nothing lets
+// `cat` exit 0 and fails the assertion, instead of the grace running out first. A sent `SIGTERM`
+// is already pending then, so it beats the release.
+#[cfg(unix)]
+#[skuld::test]
+fn child_graceful_shutdown_tree_graceful_root_sigterm() {
+    use std::os::unix::process::ExitStatusExt;
+    let (child, stdin) = blocker();
+    let _release = term_fault::release_at(term_fault::HookPoint::AfterTerminate, stdin);
+    let status = child
+        .graceful_shutdown_tree(Duration::from_secs(30))
+        .expect("tree graceful");
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGTERM),
+        "root must exit via SIGTERM, got {status:?}"
+    );
+}
+
+// A contained two-member tree, a root `cat` and a `cat` grandchild reading the same stdin pipe:
+// the group's `SIGTERM` and the sweep leave neither alive. The root's status is `SIGTERM`, which
+// the release (as in the test above) turns into 0 if no `SIGTERM` was sent. Both members hold the
+// stdout pipe's write end, so its EOF is exactly the moment both are gone.
+#[cfg(unix)]
+#[skuld::test]
+fn child_graceful_shutdown_tree_tears_down_tree() {
+    use std::io::Read as _;
+    use std::os::unix::process::ExitStatusExt;
+    let mut cmd = crate::Command::new();
+    // `exec 3<&0` keeps the backgrounded `cat` on the real pipe (see `test_child::BLOCKER_ARGV`).
+    cmd.args(["sh", "-c", "exec 3<&0; cat <&3 3<&- & echo r; exec cat"]);
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+    cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
+    cmd.contain();
+    let mut child = cmd.spawn().expect("spawn");
+    let stdin = child.stdin().expect("piped stdin");
+    let mut stdout = child.stdout().expect("piped stdout");
+    // The grandchild is forked before the readiness line is written.
+    let mut ready = [0u8; 2];
+    stdout.read_exact(&mut ready).expect("readiness line");
+    assert_eq!(&ready, b"r\n");
+
+    let _release = term_fault::release_at(term_fault::HookPoint::AfterTerminate, stdin);
+    let status = child
+        .graceful_shutdown_tree(Duration::from_secs(30))
+        .expect("tree graceful");
+
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGTERM),
+        "root must exit via SIGTERM, got {status:?}"
+    );
+    let mut rest = Vec::new();
+    stdout
+        .read_to_end(&mut rest)
+        .expect("both members are gone, so the pipe ends");
+    assert!(rest.is_empty(), "nothing was written: {rest:?}");
+}
+
 // A term_group refusal must not strand the tree between the soft signal and the hard sweep:
 // the sweep and reap still run, then the refusal surfaces. Mirrors
 // `graceful_tree_watch_error_still_sweeps_and_reaps` above, for the terminate seam instead

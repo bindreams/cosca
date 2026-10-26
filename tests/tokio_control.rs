@@ -361,42 +361,6 @@ async fn async_graceful_shutdown_unsupported_for_an_uncontained_child_on_windows
 }
 
 #[cfg(feature = "tokio")]
-#[skuld::test]
-async fn async_graceful_shutdown_tree_tears_down_tree() {
-    use std::time::Duration;
-    // A contained 2-level tree: the group's graceful signal (SIGTERM / CTRL_BREAK) plus the
-    // hard sweep tear down BOTH members; both sockets EOF. All OSes.
-    let (mut child, mut root, mut grand) = common::spawn_grandchild_async(true).await;
-    child
-        .graceful_shutdown_tree(Duration::from_secs(30))
-        .await
-        .expect("tree graceful");
-    expect_eof("root", &mut root);
-    expect_eof("grandchild", &mut grand);
-}
-
-#[cfg(feature = "tokio")]
-#[cfg(unix)]
-#[skuld::test]
-async fn async_graceful_shutdown_tree_graceful_root_sigterm() {
-    use std::os::unix::process::ExitStatusExt;
-    use std::time::Duration;
-    // A contained root that honors SIGTERM: the group signal makes it exit; the reaped status
-    // is SIGTERM (15), not escalated.
-    let (mut child, mut sock) = common::spawn_control_async("control-block", &["R"], true).await;
-    let status = child
-        .graceful_shutdown_tree(Duration::from_secs(30))
-        .await
-        .expect("tree graceful");
-    assert_eq!(
-        status.signal(),
-        Some(libc::SIGTERM),
-        "root must exit via SIGTERM, got {status:?}"
-    );
-    expect_eof("root", &mut sock);
-}
-
-#[cfg(feature = "tokio")]
 #[cfg(unix)]
 #[skuld::test]
 async fn async_graceful_shutdown_tree_escalates_with_surviving_grandchild() {

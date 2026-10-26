@@ -80,47 +80,6 @@ fn child_graceful_shutdown_unsupported_for_an_uncontained_child_on_windows() {
     common::kill_release_reap(&child, sock);
 }
 
-#[skuld::test]
-fn child_graceful_shutdown_tree_tears_down_tree() {
-    use std::io::Read;
-    use std::time::Duration;
-    // A contained 2-level tree (root R + grandchild G). The group's graceful signal
-    // (SIGTERM / CTRL_BREAK) plus the hard sweep tear down BOTH; both sockets EOF. All OSes.
-    let (child, mut socks) = common::spawn_grandchild(true);
-    child
-        .graceful_shutdown_tree(Duration::from_secs(30))
-        .expect("tree graceful");
-    for (i, s) in socks.iter_mut().enumerate() {
-        let mut buf = [0u8; 1];
-        match s.read(&mut buf) {
-            Ok(0) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
-            other => panic!("tree member {i} not torn down: {other:?}"),
-        }
-    }
-}
-
-#[cfg(unix)]
-#[skuld::test]
-fn child_graceful_shutdown_tree_graceful_root_sigterm() {
-    use std::io::Read;
-    use std::os::unix::process::ExitStatusExt;
-    use std::time::Duration;
-    // A contained control-block root that honors SIGTERM: the group signal makes it exit;
-    // the root's reaped status is SIGTERM (15), not escalated.
-    let (child, mut sock) = common::spawn_control("control-block", &["R"], true);
-    let status = child
-        .graceful_shutdown_tree(Duration::from_secs(30))
-        .expect("tree graceful");
-    assert_eq!(
-        status.signal(),
-        Some(libc::SIGTERM),
-        "root must exit via SIGTERM, got {status:?}"
-    );
-    let mut buf = [0u8; 1];
-    let _ = sock.read(&mut buf);
-}
-
 #[cfg(unix)]
 #[skuld::test]
 fn child_graceful_shutdown_tree_escalates() {

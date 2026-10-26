@@ -6,23 +6,36 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 use super::fault as term_fault;
-use crate::test_child::ctrl_break::{self, Handler, STATUS_CONTROL_C_EXIT};
+use crate::test_child::ctrl_break::{self, Grandchild, Handler, STATUS_CONTROL_C_EXIT};
 use crate::GracefulMechanism;
 
 /// A contained [`ctrl_break`] root answering with `handler`, after its handshake.
 fn spawn_root(handler: Handler) -> (crate::tokio::Child, TcpStream) {
+    let (child, sock, _) = spawn(handler, None);
+    (child, sock)
+}
+
+/// A contained root and the grandchild it starts in its console process group, after both
+/// handshakes. The root's socket keeps the root running while held.
+fn spawn_tree(root: Handler, grandchild: Handler) -> (crate::tokio::Child, TcpStream, Grandchild) {
+    let (child, sock, grand) = spawn(root, Some(grandchild));
+    (child, sock, grand.expect("a grandchild was asked for"))
+}
+
+fn spawn(handler: Handler, grandchild: Option<Handler>) -> (crate::tokio::Child, TcpStream, Option<Grandchild>) {
     let (listener, addr) = crate::test_child::registration_rendezvous();
     let mut cmd = crate::tokio::Command::new();
     cmd.executable(std::env::current_exe().expect("current_exe"))
         .args(ctrl_break::member_argv());
     crate::test_reexec::scrub_env(|var| _ = cmd.env_remove(var));
-    for (key, value) in ctrl_break::member_env(&addr, handler, None) {
+    for (key, value) in ctrl_break::member_env(&addr, handler, grandchild) {
         cmd.env(key, value);
     }
     cmd.contain();
     let child = cmd.spawn().expect("spawn the root");
-    let sock = ctrl_break::accept_root(&listener, child.id());
-    (child, sock)
+    let mut sock = ctrl_break::accept_root(&listener, child.id());
+    let grand = grandchild.map(|_| ctrl_break::accept_grandchild(&listener, &mut sock));
+    (child, sock, grand)
 }
 
 /// As the sync twin's.
@@ -94,5 +107,31 @@ async fn async_child_graceful_shutdown_exits_via_ctrl_break_on_windows() {
         status.code(),
         Some(STATUS_CONTROL_C_EXIT),
         "the child must die to the console event, got {status:?}"
+    );
+}
+
+/// Async twin of `child_graceful_shutdown_tree_tears_down_tree_on_windows`.
+#[skuld::test]
+async fn async_child_graceful_shutdown_tree_tears_down_tree_on_windows() {
+    crate::tokio::test_runtime::assert_current_thread();
+    let (mut child, _root_sock, grand) = spawn_tree(Handler::Default, Handler::Default);
+    let pid = child.id().pid();
+    assert_in_our_console(pid);
+    let _check = term_fault::at(term_fault::HookPoint::AfterTerminate, move || {
+        ctrl_break::assert_break_sent_to(pid)
+    });
+    let status = child
+        .graceful_shutdown_tree(Duration::from_secs(30))
+        .await
+        .expect("graceful_shutdown_tree on a console-group root");
+    assert_eq!(
+        status.code(),
+        Some(STATUS_CONTROL_C_EXIT),
+        "the root must die to the break, got {status:?}"
+    );
+    assert_eq!(
+        grand.exit.wait_for_exit_code(),
+        STATUS_CONTROL_C_EXIT,
+        "the grandchild must die to the break"
     );
 }
