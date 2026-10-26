@@ -14,6 +14,20 @@ use crate::error::{ChildFate, Error};
 pub(crate) enum SpawnFailure {
     /// The program did not start, and cosca has proved it.
     NotStarted(Error),
+    /// As [`NotStarted`](Self::NotStarted), after the spawn forked a child it held and dealt with:
+    /// `fate` says what became of it. A leaf's abandonment, which runs after, can then say what
+    /// happened to the child instead of what may have.
+    #[cfg(target_os = "linux")]
+    NotStartedWithChild {
+        /// What failed.
+        cause: Error,
+        /// What the failed spawn did with the child it held.
+        #[cfg_attr(
+            not(feature = "tokio"),
+            allow(dead_code, reason = "only the tokio spawn's abandonment reads it")
+        )]
+        fate: ChildFate,
+    },
     /// The program may have started: the child reached `exec` (on Windows, `CreateProcess` or
     /// `ShellExecuteEx` succeeded), or cosca cannot prove it did not.
     MayHaveStarted {
@@ -42,6 +56,10 @@ impl SpawnFailure {
     pub(crate) fn map(self, f: impl FnOnce(Error) -> Error) -> SpawnFailure {
         match self {
             SpawnFailure::NotStarted(e) => SpawnFailure::NotStarted(f(e)),
+            #[cfg(target_os = "linux")]
+            SpawnFailure::NotStartedWithChild { cause, fate } => {
+                SpawnFailure::NotStartedWithChild { cause: f(cause), fate }
+            }
             SpawnFailure::MayHaveStarted {
                 cause,
                 fate,
@@ -93,6 +111,21 @@ impl SpawnFailure {
     pub(crate) fn error(&self) -> &Error {
         match self {
             SpawnFailure::NotStarted(e) | SpawnFailure::MayHaveStarted { cause: e, .. } => e,
+            SpawnFailure::NotStartedWithChild { cause, .. } => cause,
+        }
+    }
+
+    /// What the failed spawn did with a child it held, when that ended it: the child is reaped, or
+    /// was found reaped. `None` for any other failure, and for a child the spawn left as it was.
+    #[cfg(all(feature = "tokio", target_os = "linux"))]
+    pub(crate) fn ended_child(&self) -> Option<ChildFate> {
+        match self {
+            SpawnFailure::NotStartedWithChild { fate, .. } | SpawnFailure::MayHaveStarted { fate, .. }
+                if matches!(fate, ChildFate::Reaped | ChildFate::Killed | ChildFate::Gone) =>
+            {
+                Some(*fate)
+            }
+            _ => None,
         }
     }
 }
@@ -119,6 +152,21 @@ impl SpawnFailure {
         match self {
             SpawnFailure::MayHaveStarted { cause, fate, .. } => (cause, fate),
             SpawnFailure::NotStarted(e) => panic!("expected `may have started`, got `not started`: {e:?}"),
+            #[cfg(target_os = "linux")]
+            SpawnFailure::NotStartedWithChild { cause, .. } => {
+                panic!("expected `may have started`, got `not started`: {cause:?}")
+            }
+        }
+    }
+
+    /// The error and fate of a failure that answered that the program did not start and that the
+    /// spawn dealt with a child it held; panics otherwise.
+    #[cfg(target_os = "linux")]
+    #[track_caller]
+    pub(crate) fn expect_not_started_with_child(self) -> (Error, ChildFate) {
+        match self {
+            SpawnFailure::NotStartedWithChild { cause, fate } => (cause, fate),
+            other => panic!("expected `not started` with a child's fate, got {other:?}"),
         }
     }
 
@@ -134,6 +182,8 @@ impl SpawnFailure {
     pub(crate) fn expect_not_started(self) -> Error {
         match self {
             SpawnFailure::NotStarted(e) => e,
+            #[cfg(target_os = "linux")]
+            SpawnFailure::NotStartedWithChild { cause, .. } => cause,
             SpawnFailure::MayHaveStarted { cause, fate, .. } => {
                 panic!("expected `not started`, got `may have started` ({fate:?}): {cause:?}")
             }
@@ -179,6 +229,14 @@ impl From<SpawnFailure> for Error {
     fn from(failure: SpawnFailure) -> Error {
         match failure {
             SpawnFailure::NotStarted(error) => {
+                debug_assert!(
+                    !matches!(error, Error::MayHaveStarted { .. }),
+                    "a spawn answered both `not started` and `may have started`: {error}"
+                );
+                error
+            }
+            #[cfg(target_os = "linux")]
+            SpawnFailure::NotStartedWithChild { cause: error, .. } => {
                 debug_assert!(
                     !matches!(error, Error::MayHaveStarted { .. }),
                     "a spawn answered both `not started` and `may have started`: {error}"

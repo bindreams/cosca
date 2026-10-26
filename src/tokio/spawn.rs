@@ -950,19 +950,25 @@ impl crate::child::spawn::pidfd_handshake::Spawned for ::tokio::process::Child {
     }
 
     /// Waits through the pidfd until the child is a zombie, then has tokio reap it at once.
-    fn reap_unexecuted(mut self, pidfd: std::os::fd::OwnedFd) {
+    fn reap_unexecuted(mut self, pidfd: std::os::fd::OwnedFd) -> ChildFate {
         crate::child::spawn::pidfd_handshake::await_unexecuted_exit(&pidfd, self.id());
         match self.try_wait() {
-            Ok(Some(_)) => {}
+            Ok(Some(_)) => ChildFate::Reaped,
             // A tracer holds the zombie: tokio's drop hands it to its orphan queue.
-            Ok(None) => log::debug!(
-                "{}: held by a tracer; left to tokio's reaper",
-                crate::child::spawn::named(self.id())
-            ),
-            Err(e) => log::debug!(
-                "{}: already reaped by someone else ({e})",
-                crate::child::spawn::named(self.id())
-            ),
+            Ok(None) => {
+                log::debug!(
+                    "{}: held by a tracer; left to tokio's reaper",
+                    crate::child::spawn::named(self.id())
+                );
+                ChildFate::Unknown
+            }
+            Err(e) => {
+                log::debug!(
+                    "{}: already reaped by someone else ({e})",
+                    crate::child::spawn::named(self.id())
+                );
+                ChildFate::Gone
+            }
         }
     }
 
@@ -1117,14 +1123,8 @@ fn abandoned_after_handshake(
     use crate::containment::AbandonedChild;
 
     // The handshake held the child unless it was a front left to the leaf; its fate says whether it
-    // ended the child.
-    let ended = match &failure {
-        SpawnFailure::MayHaveStarted {
-            fate: fate @ (ChildFate::Reaped | ChildFate::Killed | ChildFate::Gone),
-            ..
-        } if !left_to_leaf => Some(*fate),
-        _ => None,
-    };
+    // ended the child, whether the spawn may have started or not.
+    let ended = failure.ended_child().filter(|_| !left_to_leaf);
     warn_for_abandoned(&abandoned, failure.error(), ended);
     if !left_to_leaf {
         return failure;

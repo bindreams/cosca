@@ -115,7 +115,8 @@ pub(crate) trait Spawned {
     /// Its pid, for logs.
     fn pid(&self) -> Option<u32>;
     /// Reap this child through `pidfd`: it never ran the program, and is dead or on its way out.
-    fn reap_unexecuted(self, pidfd: OwnedFd);
+    /// Says what became of it.
+    fn reap_unexecuted(self, pidfd: OwnedFd) -> ChildFate;
     /// Give up on this child: no pidfd reached this process, so there is none to reap it through.
     /// `why` says what happened to the report.
     fn abandon_unreported(self, why: &str);
@@ -129,8 +130,8 @@ impl Spawned for std::process::Child {
     }
 
     // std's `Child` reaps nothing on drop: the pidfd is the only reaper.
-    fn reap_unexecuted(self, pidfd: OwnedFd) {
-        _ = super::teardown_through_pidfd(Some(self.id()), pidfd, None);
+    fn reap_unexecuted(self, pidfd: OwnedFd) -> ChildFate {
+        super::teardown_through_pidfd(Some(self.id()), pidfd, None)
     }
 
     fn abandon_unreported(self, why: &str) {
@@ -885,21 +886,26 @@ fn conclude<T: Spawned>(spawned: io::Result<T>, outcome: Outcome, front: LeftFro
         }
     };
     let not_started = |error| Err(SpawnFailure::NotStarted(error));
+    // The child was held and dealt with through its pidfd: the answer carries what became of it.
+    let with_child = |cause, fate| Err(SpawnFailure::NotStartedWithChild { cause, fate });
     match (spawned, outcome) {
         (Ok(child), Outcome::Opened(pidfd)) => Ok(Held { child, pidfd }),
         // Not told to go, so it cannot have execed: it was killed on its way, which std reads as
         // success.
         (Ok(child), Outcome::Gone(pidfd)) => {
             let named = super::named(child.pid());
-            child.reap_unexecuted(pidfd);
-            not_started(Error::Io(io::Error::other(format!(
-                "the spawned child ({named}) died before exec: the program never ran"
-            ))))
+            let fate = child.reap_unexecuted(pidfd);
+            with_child(
+                Error::Io(io::Error::other(format!(
+                    "the spawned child ({named}) died before exec: the program never ran"
+                ))),
+                fate,
+            )
         }
         // Not told to go, as in every arm below but the first with `Opened`.
         (Ok(child), Outcome::Failed(e, Some(pidfd))) => {
-            child.reap_unexecuted(pidfd);
-            not_started(e)
+            let fate = child.reap_unexecuted(pidfd);
+            with_child(e, fate)
         }
         (Ok(child), Outcome::Failed(e, None)) => {
             child.abandon_unreported(&format!("its pidfd could not be used ({e})"));
@@ -924,16 +930,17 @@ fn conclude<T: Spawned>(spawned: io::Result<T>, outcome: Outcome, front: LeftFro
         }
         // Not told to go, so it never ran the program.
         (Err(e), Outcome::Gone(pidfd)) => {
-            _ = super::teardown_through_pidfd(None, pidfd, None);
-            not_started(Error::Io(e))
+            let fate = super::teardown_through_pidfd(None, pidfd, None);
+            with_child(Error::Io(e), fate)
         }
         // The helper's error explains the abort std reports.
-        (Err(_), Outcome::Failed(e, pidfd)) => {
-            if let Some(pidfd) = pidfd {
-                _ = super::teardown_through_pidfd(None, pidfd, None);
+        (Err(_), Outcome::Failed(e, pidfd)) => match pidfd {
+            Some(pidfd) => {
+                let fate = super::teardown_through_pidfd(None, pidfd, None);
+                with_child(e, fate)
             }
-            not_started(e)
-        }
+            None => not_started(e),
+        },
         // The child reads EOF in place of its verdict, whenever it reaches its hook.
         (Ok(child), Outcome::Unwatched(cause)) => {
             let named = super::named(child.pid());

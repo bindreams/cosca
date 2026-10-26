@@ -106,6 +106,33 @@ async fn a_child_gone_before_its_go_ahead_fails_the_spawn_and_is_reaped() {
     assert!(!program_ran(cmd, reader));
 }
 
+/// With no cgroup leaf, a child the handshake reaped (it died before it was told to go) is not
+/// said to be left running or unreaped: the spawn logs, at `debug`, that its child was reaped.
+///
+/// Mutant: the abandonment ignores the fate of a `not started` failure and hedges, at `warn`, that
+/// the child may be left running.
+#[skuld::test]
+async fn a_leafless_child_the_handshake_reaped_is_not_said_to_be_left_running() {
+    crate::log_capture::install();
+    let (mut cmd, _reader) = marker_command();
+    let armed = fault::arm_child_fault(ChildFault::SigkillAfterReport);
+    let held = fault::hold_verdict_until_spawn_returns(|_| {});
+    let mark = crate::log_capture::mark();
+    let err = cmd.spawn().err();
+    drop(held);
+    drop(armed);
+
+    err.expect("a child that never ran the program must fail the spawn");
+    let said = crate::log_capture::records_since_on_current_thread(mark, "died before exec");
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert_eq!(said[0].0, log::Level::Debug, "{said:?}");
+    assert!(said[0].1.contains("its child was reaped"), "{said:?}");
+    assert!(
+        !said[0].1.contains("left running") && !said[0].1.contains("unreaped"),
+        "{said:?}"
+    );
+}
+
 /// tokio can fail a spawn after std's succeeded, so after the child's `exec`, and its error does not
 /// say which failed: the spawn says the program may have started. The child, which tokio dropped, is
 /// killed and reaped through its pidfd.

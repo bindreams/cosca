@@ -1095,7 +1095,7 @@ fn an_abandoned_child_is_worded_by_its_cause() {
         fn pid(&self) -> Option<u32> {
             Some(4)
         }
-        fn reap_unexecuted(self, _: OwnedFd) {
+        fn reap_unexecuted(self, _: OwnedFd) -> ChildFate {
             panic!("there is no pidfd to reap through");
         }
         fn abandon_unreported(self, why: &str) {
@@ -1246,7 +1246,7 @@ impl<const TOKIO: bool> super::Spawned for NoChild<TOKIO> {
     fn pid(&self) -> Option<u32> {
         None
     }
-    fn reap_unexecuted(self, _: OwnedFd) {
+    fn reap_unexecuted(self, _: OwnedFd) -> ChildFate {
         panic!("no child was handed back");
     }
     fn abandon_unreported(self, _: &str) {
@@ -1332,6 +1332,54 @@ fn a_front_gone_before_its_go_is_no_front() {
     .expect_not_started();
     assert!(!err.to_string().contains("what sudo left"), "{err}");
     assert_eq!(crate::child::front_kill_tests::reap(pid), None, "the teardown reaps it");
+}
+
+/// A failure that ends a child the handshake held carries what became of it, so a leaf's abandonment
+/// afterwards says what happened; one that held no child carries none. The child never ran the
+/// program, so none of these answers that it may have started.
+///
+/// Mutant: an arm that tears the child down answers a plain `not started`, or an arm that held none
+/// claims a fate.
+#[skuld::test]
+fn a_not_started_failure_carries_the_fate_of_the_child_it_held() {
+    let io = |what: &str| std::io::Error::other(what.to_string());
+    let killed = || {
+        let (mut cat, pidfd) = cat_with_pidfd();
+        cat.kill().expect("kill the child");
+        crate::test_child::wait_until_zombie(cat.id());
+        pidfd
+    };
+    let ended = |fate: ChildFate| matches!(fate, ChildFate::Reaped | ChildFate::Killed);
+
+    // Told no go, spawn failed, child killed on its way: torn down through its pidfd.
+    let (_, fate) = super::conclude(
+        Err::<NoChild, _>(io("gone")),
+        Outcome::Gone(killed()),
+        super::LeftFront::NotAFront,
+    )
+    .err()
+    .expect("the spawn fails")
+    .expect_not_started_with_child();
+    assert!(ended(fate), "{fate:?}");
+
+    // The helper failed after sending the pidfd.
+    let (_, fate) = super::conclude(
+        Err::<NoChild, _>(io("x")),
+        Outcome::Failed(Error::Io(io("helper")), Some(killed())),
+        super::LeftFront::NotAFront,
+    )
+    .err()
+    .expect("the spawn fails")
+    .expect_not_started_with_child();
+    assert!(ended(fate), "{fate:?}");
+
+    // No pidfd, so no child was held.
+    for outcome in [Outcome::Failed(Error::Io(io("helper")), None), Outcome::NoReport] {
+        let failure = super::conclude(Err::<NoChild, _>(io("x")), outcome, super::LeftFront::NotAFront)
+            .err()
+            .expect("the spawn fails");
+        assert!(matches!(failure, SpawnFailure::NotStarted(_)), "{failure:?}");
+    }
 }
 
 /// A dropped front whose pidfd cannot be peeked is taken to be there still: sent nothing, and left.
