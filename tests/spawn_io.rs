@@ -828,8 +828,9 @@ struct EchoTree {
     child: cosca::Child,
     root: std::net::TcpStream,
     grand: std::net::TcpStream,
-    /// The grandchild's own pid, for reading the tree's cgroup back out of `/proc`.
-    #[cfg(target_os = "linux")]
+    /// The grandchild's own pid: for reading the tree's cgroup back out of `/proc` (Linux), and for
+    /// the exit watch on a member (Windows).
+    #[cfg(any(windows, target_os = "linux"))]
     grand_pid: u32,
 }
 
@@ -839,6 +840,10 @@ fn spawn_contained_echo_tree(kill_on_drop: bool) -> EchoTree {
     let addr = listener.local_addr().unwrap().to_string();
     let mut cmd = Command::new();
     cmd.env(common::ACK_ENV, "1");
+    // A member a missing kill leaves alive then leaves on the release with this code, which a
+    // kill never produces, so a test can tell the two by the exit code (`assert_members_not_released`).
+    #[cfg(windows)]
+    cmd.env(common::RELEASED_EXIT_ENV, common::RELEASED_EXIT_CODE.to_string());
     cmd.executable(testbin())
         .args(["cosca_testbin", "spawn-grandchild-echo", &addr]);
     common::silence(&mut cmd);
@@ -874,7 +879,7 @@ fn spawn_contained_echo_tree(kill_on_drop: bool) -> EchoTree {
         child,
         root,
         grand,
-        #[cfg(target_os = "linux")]
+        #[cfg(any(windows, target_os = "linux"))]
         grand_pid: _grand_pid,
     }
 }
@@ -981,6 +986,7 @@ fn windows_detach_leaves_the_tree_running() {
         child,
         mut root,
         mut grand,
+        ..
     } = spawn_contained_echo_tree(true);
     assert_eq!(child.containment(), cosca::Containment::JobObject);
 
@@ -1003,6 +1009,7 @@ fn windows_kill_on_drop_false_leaves_the_tree_running() {
         child,
         mut root,
         mut grand,
+        ..
     } = spawn_contained_echo_tree(false);
     assert_eq!(child.containment(), cosca::Containment::JobObject);
 
@@ -1271,40 +1278,43 @@ fn treewalk_kills_process_group_escapee() {
     let _ = child.wait();
 }
 
-/// Drop kills the whole contained tree. Mirrors `drop_kills_and_reaps_the_child`
-/// (the lone-child case) but wraps a contained `spawn-grandchild` tree so the
-/// grandchild must also die. Proof of death: the grandchild's control socket
-/// closes — either a graceful EOF (n==0) or a ConnectionReset; the match below
-/// accepts EITHER form (the OS may surface either on any host).
+/// Drop kills the whole contained tree: the grandchild as well as the root.
 ///
-/// Windows only. On Unix a drop that killed nothing leaves the read below waiting for an EOF that
-/// never comes, so `drop_kills_a_contained_tree` in `src/child/lifecycle_tests.rs` proves it there,
-/// failing by assertion.
+/// Windows only. On Unix a drop that killed nothing leaves the sockets open, so
+/// `drop_kills_a_contained_tree` in `src/child/lifecycle_tests.rs` proves it there, failing by
+/// assertion. Here both members are released after the drop and the proof is each one's exit
+/// code: a member the drop did not kill leaves with [`common::RELEASED_EXIT_CODE`], which
+/// `assert_members_not_released` rejects, so a missing kill fails by assertion, not by a wait.
 #[cfg(windows)]
 #[skuld::test]
 fn drop_kills_contained_tree() {
-    let (child, mut gc_stream) = spawn_contained_tree();
-    // Assert containment was actually established BEFORE dropping, so a failure
-    // here (e.g. the tree survived drop) is diagnosable as "containment was set
-    // up" vs "containment never engaged". spawn_contained_tree uses contain()
-    // (Strongest), so the achieved mechanism is the host's strongest.
+    let EchoTree {
+        child,
+        root,
+        grand,
+        grand_pid,
+    } = spawn_contained_echo_tree(true);
+    // Assert containment was actually established BEFORE dropping, so a failure here (the tree
+    // survived the drop) is diagnosable as "containment was set up" vs "containment never engaged".
     assert_ne!(
         child.containment(),
         cosca::Containment::None,
         "drop test requires real containment; got None"
     );
     assert_host_tree_containment(&child);
+    // Both members are alive and echoing, which this test holds; see `common::Member` for why a
+    // pid is only trusted while the member is.
+    let root = common::Member::new(root, child.id().pid());
+    let grand = common::Member::new(grand, grand_pid);
 
-    // Drop triggers: attached.hard_kill() → shared.kill() → shared.wait()
+    // Drop triggers: attached.hard_kill() -> TerminateJobObject, which initiates the termination of
+    // every member before it returns.
     drop(child);
 
-    let mut buf = [0u8; 1];
-    match gc_stream.read(&mut buf) {
-        Ok(0) => {}                                                     // graceful EOF — grandchild exited
-        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {} // forceful kill — also proof of death
-        Ok(n) => panic!("expected EOF/ConnectionReset after drop, got {n} bytes"),
-        Err(e) => panic!("unexpected error reading grandchild control socket after drop: {e}"),
-    }
+    common::assert_members_not_released(vec![
+        (root, "the root, after dropping the Child"),
+        (grand, "the grandchild, after dropping the Child"),
+    ]);
 }
 
 // cgroup v2 integration tests =====

@@ -1217,24 +1217,33 @@ async fn async_fd3_source_merges_into_piped_stdin() {
 #[skuld::test]
 async fn async_windows_contained_spawn_runs_then_job_tears_down() {
     // Verifies the CREATE_SUSPENDED + job-assign + out-of-band resume dance works under tokio.
-    use std::io::Read as _;
-    let (child, mut root, mut grand) = common::spawn_grandchild_async(true).await;
+    // `Drop` does not wait, and a member the drop did not kill leaves with the released code once the
+    // test releases it, so a missing job kill fails by assertion (`assert_members_not_released`).
+    let common::AsyncEchoTree {
+        child,
+        root,
+        grand,
+        grand_pid,
+    } = common::spawn_echo_tree_async_configured("spawn-grandchild-echo", |cmd| {
+        cmd.contain();
+        cmd.kill_on_drop(true);
+        cmd.env(common::RELEASED_EXIT_ENV, common::RELEASED_EXIT_CODE.to_string());
+    })
+    .await;
     assert_eq!(
         child.containment(),
         cosca::Containment::JobObject,
         "Windows Strongest => JobObject"
     );
+    // Both members are alive and echoing, which this test holds; see `common::Member` for why a
+    // pid is only trusted while the member is.
+    let root = common::Member::new(root, child.id().pid());
+    let grand = common::Member::new(grand, grand_pid);
     drop(child);
-    // As in `async_drop_tears_down_a_contained_tree`: `Drop` does not wait, so the control-socket
-    // EOFs are the real edges.
-    for (who, s) in [("root", &mut root), ("grandchild", &mut grand)] {
-        let mut buf = [0u8; 1];
-        match s.read(&mut buf) {
-            Ok(0) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
-            other => panic!("{who} not torn down: {other:?}"),
-        }
-    }
+    common::assert_members_not_released(vec![
+        (root, "the root, after dropping the Child"),
+        (grand, "the grandchild, after dropping the Child"),
+    ]);
 }
 
 // Death-watched accept =====
