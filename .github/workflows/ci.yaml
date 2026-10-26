@@ -153,8 +153,13 @@ jobs:
   # Windows 11's (`a\com1` is COM1 under the old rules). The test matrix's Windows runners all
   # have the new rules; Server 2022 (build 20348) still has the old ones.
   test-path-old-windows:
-    name: Test (cosca-path, windows-2022)
-    runs-on: windows-2022
+    name: Test (cosca-path, ${{ matrix.runner }})
+    strategy:
+      matrix:
+        # A matrix key, not a bare `runs-on` label: Renovate bumps a bare label, and windows-2025 has
+        # the new rules, which would end this coverage silently.
+        runner: [windows-2022]
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -174,6 +179,12 @@ jobs:
       - name: Run tests (cosca-path)
         timeout-minutes: 8
         run: ./.github/scripts/run-nextest.ps1 path cargo nextest run --locked -p cosca-path --target x86_64-pc-windows-msvc
+
+      - name: Upload JUnit
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/upload-junit
+        with:
+          name: test-path-${{ matrix.runner }}
 
   test:
     name: Test (${{ matrix.os }}/${{ matrix.arch }})
