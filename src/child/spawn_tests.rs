@@ -12,9 +12,9 @@ use crate::error::Error;
 #[cfg(target_os = "linux")]
 use crate::test_groups::{cgroup, Group};
 
-// A child only a real kill ends, so a teardown leak shows as an alive process at the assert
-// rather than a self-exit, and a mutant that skips the kill hangs instead of passing. See
-// `test_child::BLOCKER_ARGV` for why, and `leaked_writer_stdin` for the stdin.
+/// A command for a child that only a real kill ends and that the test never holds, for the macOS
+/// tests whose child is left alone: its stdin writer is leaked.
+#[cfg(target_os = "macos")]
 fn blocker() -> Command {
     let mut cmd = Command::new();
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
@@ -23,7 +23,9 @@ fn blocker() -> Command {
     cmd
 }
 
-/// [`blocker`] for a test that drives a kill-then-reap; see [`fault::teardown_blocker_stdin`].
+/// A command for a child only a real kill ends, so a teardown leak shows as an alive process at the
+/// assert rather than a self-exit, and a mutant that skips the kill fails an assertion on how the
+/// child ended instead of hanging. See [`fault::teardown_blocker_stdin`] and `test_child::BLOCKER_ARGV`.
 pub(super) fn teardown_blocker() -> (Command, fault::TeardownBlocker) {
     let fault::TeardownBlockerParts {
         argv,
@@ -212,10 +214,12 @@ fn a_failed_teardown_kill_is_logged_and_skips_the_blocking_reap_on_both_arms() {
     for (index, (marker, kind, asserted)) in cases.into_iter().enumerate() {
         let force_arm = force_arms[index / 2];
         let mark = crate::log_capture::mark();
+        // The forced failure kills and reaps the child first; released once that kill returned.
+        let (mut cmd, teardown) = teardown_blocker();
         force_arm(true);
         fault::set_force_kill_failure(marker, kind);
         fault::set_force_reap_failure("cosca-reap-tripwire-9f31");
-        let outcome = std::panic::catch_unwind(|| blocker().spawn().err());
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cmd.spawn().err()));
         force_arm(false);
         assert_eq!(
             fault::take_force_kill_failure(),
@@ -240,6 +244,7 @@ fn a_failed_teardown_kill_is_logged_and_skips_the_blocking_reap_on_both_arms() {
             "{marker}: a failed teardown kill must be logged"
         );
         fault::assert_child_reaped(fault::take_captured().expect("seam captured the child's identity"));
+        teardown.assert_killed();
     }
 }
 
@@ -1510,11 +1515,12 @@ fn a_handshake_that_cannot_open_did_not_start() {
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn a_child_reaped_elsewhere_after_the_teardowns_kill_is_killed() {
-    let (stdin, _writer) = crate::test_child::held_writer_stdin();
+    let (stdin, writer) = crate::test_child::held_writer_stdin();
     let mut cmd = Command::new();
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
-    // The hook reaps the zombie the kill made, so the teardown's own reap finds `ECHILD`.
+    // The hook reaps the zombie the kill made, so the teardown's own reap finds `ECHILD`. The
+    // writer is released after the kill, so a kill that sent nothing fails the SIGKILL assertion.
     let pid = std::rc::Rc::new(std::cell::Cell::new(0));
     let _noted = fault::set_at(fault::SpawnPoint::BeforeIdentity, {
         let pid = std::rc::Rc::clone(&pid);
@@ -1523,7 +1529,8 @@ fn a_child_reaped_elsewhere_after_the_teardowns_kill_is_killed() {
     let _foreign_reap = fault::set_between_kill_and_wait(move || {
         let pid = pid.get();
         assert_ne!(pid, 0, "the spawn noted the child's pid");
-        crate::test_child::wait_until_zombie(pid);
+        drop(writer);
+        crate::test_child::assert_zombie_sigkilled("the child", pid);
         let mut status = 0;
         // SAFETY: `pid` is this test's own zombie child; this plays the application that reaps it.
         let reaped = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };

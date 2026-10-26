@@ -45,6 +45,16 @@ pub(in crate::tokio::child) fn reap_behind_the_owner(pid: u32) {
     assert_eq!(rc, 0, "waitid: {}", std::io::Error::last_os_error());
 }
 
+/// For the hook between a teardown's kill and its wait: release `held` (what only that kill ends the
+/// child without), require that the kill ended it, then reap it behind its owner's back. A kill that
+/// sent nothing ends the child with status 0 and fails the assertion, not the wait.
+#[cfg(target_os = "linux")]
+pub(in crate::tokio::child) fn release_then_reap_behind_the_owner(pid: u32, held: impl Sized) {
+    drop(held);
+    crate::test_child::assert_zombie_sigkilled("the child", pid);
+    reap_behind_the_owner(pid);
+}
+
 // `wait_and_reap` is the half of the teardown primitive that a caller which has ALREADY killed
 // uses. Its whole point is that it issues no kill of its own, so its wait rests on the caller's
 // kill instead of on a second one that can be refused.
@@ -397,6 +407,8 @@ async fn wait_closes_the_untaken_stdin_first() {
         .try_clone_to_owned()
         .expect("duplicate the stdin write end");
     let mut proc = proc_source(child);
+    // Released between `reap_now`'s kill and its reap, below.
+    let teardown = crate::child::spawn::fault::release_between_kill_and_wait(held_writer);
     {
         let mut waiting = Box::pin(proc.wait());
         std::future::poll_fn(|cx| {
@@ -411,7 +423,7 @@ async fn wait_closes_the_untaken_stdin_first() {
     let closed = stdin.is_none();
     assert!(!proc.is_reaped(), "the one poll finished the wait");
     proc.reap_now(pid, None); // the test's own `cat`: end it whatever happened
-    drop(held_writer);
+    teardown.assert_killed();
     assert!(closed, "wait must close stdin before it waits");
 }
 
@@ -823,18 +835,21 @@ async fn macos_wait_and_reap_of_a_child_a_tracer_holds_waits_for_the_hand_back(
 #[skuld::test]
 async fn reap_now_of_a_child_reaped_behind_the_owner_after_the_kill_is_killed() {
     crate::tokio::test_runtime::assert_current_thread();
-    let child = crate::test_spawn::spawn_tokio(
-        ::tokio::process::Command::new("sleep")
-            .arg("600")
+    let mut child = crate::test_spawn::spawn_tokio(
+        ::tokio::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null()),
     )
     .expect("spawn");
     let pid = child.id().expect("tokio owns an un-reaped child");
+    let stdin = child.stdin.take().expect("piped stdin");
     let proc = proc_source(child);
-    // Between the kill and the wait, the application reaps the zombie the kill made.
+    // Between the kill and the wait, the application reaps the zombie the kill made. The stdin is
+    // released first, after the kill, so a kill that sent nothing fails the SIGKILL assertion.
     let _foreign_reap = crate::child::spawn::fault::set_between_kill_and_wait(move || {
-        crate::test_child::wait_until_zombie(pid);
+        drop(stdin);
+        crate::test_child::assert_zombie_sigkilled("the child", pid);
         reap_behind_the_owner(pid);
     });
 

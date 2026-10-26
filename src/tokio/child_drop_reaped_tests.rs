@@ -316,7 +316,10 @@ async fn a_failed_elevated_spawns_cleanup_drops_its_handle_without_a_warn() {
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let recorder = record_kill_group();
-    let child = session(&["sleep", "300"]).spawn().expect("spawn");
+    let mut child = session_blocker_cmd().spawn().expect("spawn");
+    // Released once the cleanup's root kill returned, before its reap.
+    let stdin = child.stdin().expect("piped stdin");
+    let teardown = crate::child::spawn::fault::release_between_kill_and_wait(stdin);
     let pid = child.id().pid();
 
     let mark = crate::log_capture::mark();
@@ -334,6 +337,7 @@ async fn a_failed_elevated_spawns_cleanup_drops_its_handle_without_a_warn() {
         "the group's kill and the root's reap"
     );
     recorder.assert_killed_only(pid as i32);
+    teardown.assert_killed();
     // The cleanup disarmed the handle (tree and root settled), so its drop reads nothing and logs
     // nothing: not a warn, and not a skip record either.
     assert_eq!(drop_warns_since(mark), []);

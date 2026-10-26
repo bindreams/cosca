@@ -43,7 +43,9 @@ mod kevent_eintr;
 pub(crate) const BLOCKER_ARGV: &[&str] = if cfg!(windows) { &["findstr", "x"] } else { &["cat"] };
 
 /// A [`Stdio`](crate::stdio::Stdio) reading from a pipe whose write end is leaked (see
-/// [`BLOCKER_ARGV`]).
+/// [`BLOCKER_ARGV`]). For a child the test leaves alone: any test that expects a kill holds the
+/// writer instead ([`held_writer_stdin`]) and releases it after the kill.
+#[cfg(any(target_os = "macos", all(target_os = "linux", feature = "tokio")))]
 pub(crate) fn leaked_writer_stdin() -> crate::stdio::Stdio {
     let (reader, writer) = std::io::pipe().expect("pipe");
     #[cfg(unix)]
@@ -136,8 +138,6 @@ impl Drop for ClosedStdio {
 /// Like [`leaked_writer_stdin`], but the caller keeps the write end: dropping it is the only way
 /// to make the [`BLOCKER_ARGV`] child exit by itself (status 0), so a test that must see a kill
 /// end it drops the writer only after the kill.
-// Consumed by the Unix kill tests in `spawn_tests` and the Linux async ones.
-#[cfg(unix)]
 pub(crate) fn held_writer_stdin() -> (crate::stdio::Stdio, std::io::PipeWriter) {
     let (reader, writer) = std::io::pipe().expect("pipe");
     #[cfg(unix)]
@@ -1201,6 +1201,16 @@ pub(crate) fn windows_blocker_async(
 /// its stdout it is ready, then blocks on stdin as `cat`. Only `SIGKILL` or stdin EOF ends it.
 #[cfg(unix)]
 const TERM_IGNORING_BLOCKER_ARGV: &[&str] = &["sh", "-c", "trap '' TERM; echo r; exec cat"];
+
+/// A root and a grandchild that both ignore `SIGTERM` (an ignored disposition survives `exec`) and
+/// block on one stdin pipe. The grandchild prints `eof` if its `cat` ends of its own accord; the
+/// root prints `r` once the grandchild is forked.
+#[cfg(unix)]
+pub(crate) const TERM_IGNORING_TREE_ARGV: &[&str] = &[
+    "sh",
+    "-c",
+    "trap '' TERM; exec 3<&0; { cat <&3 3<&-; echo eof; } & echo r; exec cat",
+];
 
 /// A spawned, contained `SIGTERM`-ignoring [`TERM_IGNORING_BLOCKER_ARGV`] child and the write end of
 /// its stdin, returned once its readiness byte proves the trap is installed. A test whose only end

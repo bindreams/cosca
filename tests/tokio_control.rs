@@ -170,27 +170,6 @@ async fn async_terminate_unsupported_for_an_uncontained_child_on_windows() {
 #[cfg(feature = "tokio")]
 #[cfg(unix)]
 #[skuld::test]
-async fn async_graceful_shutdown_escalates() {
-    use std::os::unix::process::ExitStatusExt;
-    use std::time::Duration;
-    // SIG_IGN child + Duration::ZERO: provably alive at the single poll → deterministic
-    // escalation; SIGKILL is the only terminating signal it can receive.
-    let (mut child, mut sock) = common::spawn_control_async("control-block-ignore-term", &["R"], false).await;
-    let status = child
-        .graceful_shutdown(Duration::ZERO)
-        .await
-        .expect("graceful_shutdown escalates");
-    assert_eq!(
-        status.signal(),
-        Some(libc::SIGKILL),
-        "SIGTERM-ignoring child must be force-killed, got {status:?}"
-    );
-    expect_eof("blocker", &mut sock);
-}
-
-#[cfg(feature = "tokio")]
-#[cfg(unix)]
-#[skuld::test]
 async fn async_graceful_cancel_mid_grace_leaves_child_owned() {
     use std::future::Future;
     use std::time::Duration;
@@ -338,32 +317,6 @@ async fn async_graceful_shutdown_unsupported_for_an_uncontained_child_on_windows
         .expect_err("a child that leads no group cannot be addressed");
     assert!(matches!(err, cosca::error::Error::Unsupported { .. }), "got {err:?}");
     common::kill_release_reap_async(&mut child, sock).await;
-}
-
-#[cfg(feature = "tokio")]
-#[cfg(unix)]
-#[skuld::test]
-async fn async_graceful_shutdown_tree_escalates_with_surviving_grandchild() {
-    use std::os::unix::process::ExitStatusExt;
-    use std::time::Duration;
-    // BOTH tree members ignore SIGTERM (spawn-grandchild-ignore-term), so with ZERO grace both
-    // are provably alive when the grace elapses — the hard sweep, not the soft signal, must
-    // tear down the root AND the surviving grandchild.
-    let (mut child, mut root, mut grand) = common::spawn_tree_async("spawn-grandchild-ignore-term", |cmd| {
-        cmd.contain();
-    })
-    .await;
-    let status = child
-        .graceful_shutdown_tree(Duration::ZERO)
-        .await
-        .expect("tree escalates");
-    assert_eq!(
-        status.signal(),
-        Some(libc::SIGKILL),
-        "ignored SIGTERM must escalate to SIGKILL, got {status:?}"
-    );
-    expect_eof("root", &mut root);
-    expect_eof("grandchild", &mut grand);
 }
 
 #[cfg(feature = "tokio")]

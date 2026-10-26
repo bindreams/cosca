@@ -40,29 +40,6 @@ fn child_terminate_unsupported_for_an_uncontained_child_on_windows() {
     common::kill_release_reap(&child, sock);
 }
 
-#[cfg(unix)]
-#[skuld::test]
-fn child_graceful_shutdown_escalates() {
-    use std::io::Read;
-    use std::os::unix::process::ExitStatusExt;
-    use std::time::Duration;
-    // This child installs SIG_IGN for SIGTERM, so it NEVER exits on the soft signal. With
-    // Duration::ZERO the child is provably alive at the single poll → escalation to SIGKILL is
-    // deterministic (no timing dependency at all). Because SIGTERM is ignored, SIGKILL is the
-    // ONLY terminating signal the child can receive, so signal()==SIGKILL is unambiguous.
-    let (child, mut sock) = common::spawn_control("control-block-ignore-term", &["R"], false);
-    let status = child
-        .graceful_shutdown(Duration::ZERO)
-        .expect("graceful_shutdown escalates");
-    assert_eq!(
-        status.signal(),
-        Some(libc::SIGKILL),
-        "SIGTERM-ignoring child must be force-killed, got {status:?}"
-    );
-    let mut buf = [0u8; 1];
-    let _ = sock.read(&mut buf);
-}
-
 #[cfg(windows)]
 #[skuld::test]
 fn child_graceful_shutdown_unsupported_for_an_uncontained_child_on_windows() {
@@ -78,27 +55,6 @@ fn child_graceful_shutdown_unsupported_for_an_uncontained_child_on_windows() {
         .expect_err("a child that leads no group cannot be addressed");
     assert!(matches!(err, cosca::error::Error::Unsupported { .. }), "got {err:?}");
     common::kill_release_reap(&child, sock);
-}
-
-#[cfg(unix)]
-#[skuld::test]
-fn child_graceful_shutdown_tree_escalates() {
-    use std::io::Read;
-    use std::os::unix::process::ExitStatusExt;
-    use std::time::Duration;
-    // A contained SIGTERM-ignoring root: the group SIGTERM is ignored, so with Duration::ZERO
-    // the root is provably alive at the poll and the hard sweep (kill_tree) SIGKILLs it. SIGKILL
-    // is the only terminating signal it can receive (SIGTERM ignored), so the assertion is
-    // unambiguous.
-    let (child, mut sock) = common::spawn_control("control-block-ignore-term", &["R"], true);
-    let status = child.graceful_shutdown_tree(Duration::ZERO).expect("tree escalates");
-    assert_eq!(
-        status.signal(),
-        Some(libc::SIGKILL),
-        "ignored SIGTERM must escalate to SIGKILL, got {status:?}"
-    );
-    let mut buf = [0u8; 1];
-    let _ = sock.read(&mut buf);
 }
 
 #[cfg(unix)]
