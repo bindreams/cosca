@@ -336,8 +336,8 @@ impl Path {
         }
     }
 
-    /// Whether the path needs no current directory: a drive and a root, a UNC path with a server
-    /// and a share, or a device path longer than `\\.` or `\\?` alone. The path is judged as
+    /// Whether the path is fully qualified: a drive and a root, a UNC path with a server and a
+    /// share, or a device path longer than `\\.` or `\\?` alone. The path is judged as
     /// written, as Win32 judges a string, not as resolved: `\\s\\h\..` is fully qualified and its
     /// [normal form](PurePath::lexically_normal), `\\s\`, is not. A share that is only dots or
     /// spaces and ends the path counts as a share, though Win32 strips it: `\\s\.` is fully
