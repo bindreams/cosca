@@ -404,6 +404,15 @@ async fn async_graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_auth
     // pending on the root, so it beats the EOF this release causes.
     #[cfg(unix)]
     let _release = term_fault::release_at(term_fault::HookPoint::AfterTerminate, stdin);
+    // Windows: assert the break was sent once `terminate_tree` returns, so a missing one fails
+    // here and not when the grace runs out.
+    #[cfg(windows)]
+    let _check = {
+        let pid = child.id().pid();
+        term_fault::at(term_fault::HookPoint::AfterTerminate, move || {
+            crate::test_child::ctrl_break::assert_break_sent_to(pid)
+        })
+    };
     let result = child.graceful_shutdown_tree(Duration::from_secs(30)).await;
     if authoritative {
         let status = result.expect("an authoritatively-drained tree must not invoke the sweep at all");
