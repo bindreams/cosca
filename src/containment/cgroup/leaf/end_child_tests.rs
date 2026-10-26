@@ -386,8 +386,9 @@ fn member_output(to_member: std::io::PipeWriter, mut from_member: std::io::PipeR
 }
 
 /// Linux 6.9+: a child outside its leaf that another reaper reaped before `end_child`'s look still
-/// names its process group through its handle, so the member it left there is killed, and the
-/// child is `Killed`. Mutant: "a child reaped before the look is `Gone` without the group kill".
+/// names its process group through its handle, so the member it left there is killed. The child is
+/// `Gone`: no kill of cosca's reached it. Mutants: "a child reaped before the look gets no group
+/// kill", "the group kill makes it `Killed`".
 #[skuld::test]
 fn an_abandoned_child_reaped_before_the_look_has_its_group_killed(#[fixture(pidfd_group_signal)] _group: &Group) {
     use crate::send_log::{GroupStep, Route};
@@ -401,7 +402,7 @@ fn an_abandoned_child_reaped_before_the_look_has_its_group_killed(#[fixture(pidf
     let out = member_output(to_member, from_member);
     assert_eq!(steps, [GroupStep::Group(Route::Pidfd, libc::SIGKILL)]);
     assert_eq!(out, "", "the member was killed");
-    assert_eq!(fate, ChildFate::Killed);
+    assert_eq!(fate, ChildFate::Gone);
 }
 
 /// Where the kernel refuses `PIDFD_SIGNAL_PROCESS_GROUP` (before 6.9), a child reaped before the
