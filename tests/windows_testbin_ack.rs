@@ -35,9 +35,9 @@ struct Case {
     args: fn(&str) -> Vec<String>,
     /// The mode reports one line and then waits for the socket to close, instead of closing.
     one_line: bool,
-    /// Creation flags for the mode. The two console modes are launched console-less: they are
-    /// the console-less probes, and with a console they would wait for a `CTRL_BREAK` that a
-    /// broken `terminate` never sends.
+    /// Creation flags for the mode. The two console modes are launched console-less because they
+    /// probe the console-less caller; the console-attached ops are covered by
+    /// `src/child/ctrl_break_tests.rs`.
     flags: u32,
 }
 

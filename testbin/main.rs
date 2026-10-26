@@ -1069,9 +1069,9 @@ fn main() {
                 Err(e) => describe(&e),
             };
             let alive_after_terminate = liveness(child.is_alive());
-            // Console-less callers only (every test launches this mode `DETACHED_PROCESS`): no
-            // break can arrive, so the read happens after the cleanup kill below and collects EOF
-            // or a reset. A read before it would block forever on a break nobody sends.
+            // Probes a console-less caller (every test launches this mode `DETACHED_PROCESS`),
+            // where no break can arrive. The read happens after the cleanup kill below and
+            // collects EOF or a reset, so the report is the same whether or not a console exists.
 
             // ZERO grace: the acker survives its break by design, so the escalation is
             // deterministic and its exit code is what proves the forced half ran.
@@ -1265,11 +1265,11 @@ fn main() {
             let c1_in_console = in_our_console(c1.id().pid());
             let terminate = classify(c1.terminate_tree());
             let alive_after_terminate = liveness(c1.is_alive());
-            // Console-less callers only (every test launches this mode `DETACHED_PROCESS`): no
-            // break can arrive, so the root is killed first and the read collects EOF or a reset.
-            // A read before the kill would block forever on a break nobody sends. The post-kill
-            // read/reap only runs when the kill itself succeeded — on a failed kill the child is
-            // still alive and blocked, so both would block forever and discard the kill error.
+            // Probes a console-less caller (every test launches this mode `DETACHED_PROCESS`),
+            // where no break can arrive. The root is killed first and the read collects EOF or a
+            // reset. The post-kill read/reap only runs when the kill itself succeeded — on a
+            // failed kill the child is still alive and blocked, so both would block forever and
+            // discard the kill error.
             //
             // Sockets are released before each post-kill wait: a released acker exits 0, a killed one
             // 1, and the report carries the code.

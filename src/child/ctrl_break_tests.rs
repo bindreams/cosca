@@ -242,14 +242,22 @@ fn tree_graceful_ops_work_from_a_caller_that_has_a_console() {
     assert_acked(&mut sock, "the root");
     kill_tree_release_reap(&child, sock);
 
-    let (child, _sock) = spawn_root(Handler::Ack, crate::ContainMode::Strongest);
+    let (child, sock) = spawn_root(Handler::Ack, crate::ContainMode::Strongest);
     let pid = child.id().pid();
     let _check = term_fault::at(term_fault::HookPoint::AfterTerminate, move || {
         ctrl_break::assert_break_sent_to(pid)
     });
-    child
+    // Released after the escalation and before the reap: a no-op escalation then ends the root
+    // with 0, so the status assertion fails instead of the reap hanging on the held root.
+    let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, sock);
+    let status = child
         .graceful_shutdown_tree(Duration::ZERO)
         .expect("graceful_shutdown_tree");
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "the escalation's kill ends the root, got {status:?}"
+    );
     assert_eq!(
         child.is_alive(),
         crate::identity::Liveness::Dead,
@@ -278,6 +286,9 @@ fn lone_graceful_ops_work_from_a_caller_that_has_a_console() {
     let _check = term_fault::at(term_fault::HookPoint::AfterTerminate, move || {
         ctrl_break::assert_break_sent_to(pid)
     });
+    // Released after the escalation and before the reap: a no-op escalation then ends the root
+    // with 0, so the status assertion fails instead of the reap hanging on the held root.
+    let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, sock);
     let status = child.graceful_shutdown(Duration::ZERO).expect("graceful_shutdown");
     assert_eq!(status.code(), Some(1), "the escalation's kill, got {status:?}");
     assert_eq!(child.is_alive(), crate::identity::Liveness::Dead);
