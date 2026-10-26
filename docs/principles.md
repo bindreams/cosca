@@ -124,18 +124,19 @@ read, an elevated spawn that cannot finish, an abandoned spawn whose cgroup leaf
 root, a tokio spawn that fails after its fork) still kill the group of a reaped root while it has a
 member, whoever reaped the root, and send nothing once it has none; that signal-0 send is also the
 check before each send by the group's number. cosca detects the flag by acting, and an older
-kernel's `EINVAL` is handled per path. A tree call, a drop and the cleanup of an elevated spawn
-that cannot finish fall back to the group's number, checked against the root's state, and send
-nothing once that check fails. The cleanup of an abandoned spawn does the same while its child is
-unreaped, and sends the group of a reaped child nothing. The cleanups of a spawn that fails at its
-identity read and of a tokio spawn that fails after its fork send the group nothing, whatever the
-root's state. These last three `warn` once that members of the root's process group may be left
-running, naming the root's pid where it is known (a tokio spawn's failure after its fork warns only
-for a child that ran the program). On 6.9+ a member's resend still goes by its pid when the member's
-own `pidfd_open` fails (`EMFILE`, say), right after a check of its identity. Below 6.9 and on macOS
-a reaper elsewhere in the process can reap the root between the check and a send by its number,
-which then reaches whoever holds it: a standing property of process-group and fd-marker
-containment. A program with such a reaper should use cgroup containment.
+kernel's `EINVAL` is handled per path. A tree call, a drop and the cleanup of an elevated spawn that
+cannot finish fall back to the group's number, checked against the root's state, and send nothing
+once that check fails. The cleanup of an abandoned spawn does the same while its child is unreaped,
+and sends the group of a reaped child nothing. The cleanups of a spawn that fails at its identity
+read and of a tokio spawn that fails after its fork send the group nothing, whatever the root's
+state. These last three `warn` once that members of the root's process group may be left running,
+naming the root's pid where it is known; for a child already reaped, the warn adds that the child
+may never have run the program. On macOS, which has no exact kill of a group, the cleanup of a group
+root whose spawn fails at its identity read warns the same. On 6.9+ a member's resend still goes by
+its pid when the member's own `pidfd_open` fails (`EMFILE`, say), right after a check of its
+identity. Below 6.9 and on macOS a reaper elsewhere in the process can reap the root between the
+check and a send by its number, which then reaches whoever holds it: a standing property of
+process-group and fd-marker containment. A program with such a reaper should use cgroup containment.
 
 Where a check of a PID cannot be made atomic with its use, keep the window as small as it can be:
 check and use are two back-to-back actions. Every send by number has its own check right before it,
