@@ -907,7 +907,10 @@ impl Child {
     /// [`Error::Containment`](crate::error::Error::Containment) when its send failed, and otherwise
     /// [`Error::Unassessable`](crate::error::Error::Unassessable) when it could not be pinned or shown
     /// to be in the leaf; one `warn` names the leaf and the pids. [`kill_tree`](Child::kill_tree)
-    /// still reaches them.
+    /// still reaches them. Before Linux 6.13 a member is placed through `/proc`, so one of another
+    /// user that a `hidepid` mount hides gets no `SIGTERM` and is reported this way, not skipped as
+    /// `Ok`. A member listed as pid `0`, in a pid namespace this process cannot see, is skipped with
+    /// a `warn` and does not make the call an error.
     ///
     /// See [`kill_tree`](Child::kill_tree)'s doc for four things that also apply here: the
     /// `ProcessGroup`/`Session`-only scope of this guarantee (a separate, unfixed gap for

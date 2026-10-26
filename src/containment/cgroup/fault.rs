@@ -719,14 +719,13 @@ pub(crate) fn run_after_terminate_pin() {
     crate::oneshot_hook::fire(&AFTER_TERMINATE_PIN);
 }
 
-/// A `SIGTERM` `CgroupLeaf::terminate` sent a member: the pid its pidfd names (`None` once that
-/// process is reaped, or where it cannot be read), and the route of the send.
-pub(crate) type MemberTerm = (Option<u32>, crate::send_log::Via);
+/// A signal `CgroupLeaf::terminate` sent a member: the pid its pidfd names (`None` once that
+/// process is reaped, or where it cannot be read), the route of the send, and the signal's number.
+pub(crate) type MemberTerm = (Option<u32>, crate::send_log::Via, i32);
 
-/// Notes a member's `SIGTERM` on this thread, sent through `pidfd`, once the send (or the seam
-/// standing in for it) answered. The pid is read from the pidfd's fdinfo, so the sender needs no
-/// pid to record one.
-pub(crate) fn record_member_term_through(pidfd: std::os::fd::BorrowedFd<'_>) {
+/// Notes a member's signal `signo` on this thread, sent through `pidfd`, once the send was made
+/// and answered. The pid is read from the pidfd's fdinfo, so the sender needs no pid to record one.
+pub(crate) fn record_member_term_through(pidfd: std::os::fd::BorrowedFd<'_>, signo: i32) {
     use std::os::fd::AsRawFd as _;
     let pid = std::fs::read_to_string(format!("/proc/thread-self/fdinfo/{}", pidfd.as_raw_fd()))
         .ok()
@@ -737,7 +736,7 @@ pub(crate) fn record_member_term_through(pidfd: std::os::fd::BorrowedFd<'_>) {
                 .and_then(|pid| pid.trim().parse::<i64>().ok())
         })
         .and_then(|pid| u32::try_from(pid).ok().filter(|&pid| pid > 0));
-    MEMBER_TERMS.with(|t| t.borrow_mut().push((pid, crate::send_log::Via::Pidfd)));
+    MEMBER_TERMS.with(|t| t.borrow_mut().push((pid, crate::send_log::Via::Pidfd, signo)));
 }
 
 /// The `SIGTERM`s this thread's `CgroupLeaf::terminate` sent members since the last call.

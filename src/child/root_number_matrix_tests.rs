@@ -519,13 +519,13 @@ impl Recorders {
             crate::containment::cgroup::fault::take_member_terms(),
         );
         #[cfg(not(target_os = "linux"))]
-        let (cgroup_kill, member_terms): (bool, Vec<(Option<u32>, Via)>) = (false, Vec::new());
+        let (cgroup_kill, member_terms): (bool, Vec<(Option<u32>, Via, i32)>) = (false, Vec::new());
         Sent {
             killpg: !self.groups.killed().is_empty() || !self.terms.termed().is_empty(),
             walk: !self.walks.walked().is_empty(),
-            by_pid: member_terms.iter().any(|(_, via)| *via == Via::Pid)
+            by_pid: member_terms.iter().any(|(_, via, _)| *via == Via::Pid)
                 || entries.iter().any(|(_, _, via)| *via == Via::Pid),
-            member_term: member_terms.iter().any(|(_, via)| *via == Via::Pidfd),
+            member_term: member_terms.iter().any(|(_, via, _)| *via == Via::Pidfd),
             #[cfg(target_os = "macos")]
             holder: self.holders.signals_to(cat),
             #[cfg(not(target_os = "macos"))]
