@@ -201,13 +201,13 @@ fn child_graceful_shutdown_tree_sweeps_survivor_after_graceful_root_exit() {
 #[cfg(unix)]
 #[skuld::test]
 fn process_terminate_sends_sigterm() {
-    use std::io::Read;
     use std::os::unix::process::ExitStatusExt;
-    let (child, mut sock) = common::spawn_blocker();
+    let (child, sock) = common::spawn_blocker();
     let p = cosca::Process::from_pid(child.id().pid()).found().expect("resolves");
     p.terminate().expect("foreign terminate");
-    let mut buf = [0u8; 1];
-    let _ = sock.read(&mut buf); // dead — EOF
+    // Release the member after the signal: a `terminate` that sent nothing lets it leave with 0,
+    // which the assertion on how it ended catches, where a read for an EOF would hang.
+    drop(sock);
     let status = child.wait().expect("reap");
     assert_eq!(status.signal(), Some(libc::SIGTERM), "got {status:?}");
 }
@@ -281,6 +281,7 @@ fn process_kill_tree_tears_down_tree() {
 #[skuld::test]
 fn process_graceful_shutdown_tree_tears_down_tree() {
     use std::io::Read;
+    use std::os::unix::process::ExitStatusExt;
     use std::time::Duration;
     let (child, mut socks) = common::spawn_grandchild(false);
     let p = cosca::Process::from_pid(child.id().pid()).found().expect("resolves");
@@ -294,7 +295,10 @@ fn process_graceful_shutdown_tree_tears_down_tree() {
             other => panic!("tree member {i} not torn down: {other:?}"),
         }
     }
-    let _ = child.wait();
+    // The root left to the soft signal, not to the sweep: a `terminate_tree` that sent nothing
+    // leaves it to `SIGKILL` once the grace runs out.
+    let status = child.wait().expect("reap the root");
+    assert_eq!(status.signal(), Some(libc::SIGTERM), "got {status:?}");
 }
 
 #[cfg(windows)]

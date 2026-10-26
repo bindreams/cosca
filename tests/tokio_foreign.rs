@@ -7,12 +7,14 @@
 mod common;
 
 #[cfg(feature = "tokio")]
+#[cfg(unix)]
 use std::io::Read;
 
 #[cfg(feature = "tokio")]
 use cosca::tokio::Process;
 
 #[cfg(feature = "tokio")]
+#[cfg(unix)]
 fn expect_eof(who: &str, s: &mut std::net::TcpStream) {
     let mut buf = [0u8; 1];
     match s.read(&mut buf) {
@@ -82,12 +84,13 @@ async fn async_foreign_introspection_delegates() {
 #[cfg(feature = "tokio")]
 #[skuld::test]
 async fn async_foreign_kill_terminates_the_process() {
-    let (child, mut sock) = common::spawn_blocker();
+    let (child, sock) = common::spawn_blocker();
     let p = Process::from_pid(child.id().pid()).found().expect("resolves");
     p.kill().expect("foreign kill");
-    expect_eof("blocker", &mut sock);
-    let status = child.wait().expect("reap");
-    assert!(!status.success(), "killed child cannot report success, got {status:?}");
+    // Release the member after the kill: a `kill` that sent nothing lets it leave with 0, which the
+    // assertion on how it ended catches, where a read for an EOF would hang.
+    drop(sock);
+    common::assert_killed("the killed child", child.wait().expect("reap"));
 }
 
 #[cfg(feature = "tokio")]
@@ -95,10 +98,12 @@ async fn async_foreign_kill_terminates_the_process() {
 #[skuld::test]
 async fn async_foreign_terminate_sends_sigterm() {
     use std::os::unix::process::ExitStatusExt;
-    let (child, mut sock) = common::spawn_blocker();
+    let (child, sock) = common::spawn_blocker();
     let p = Process::from_pid(child.id().pid()).found().expect("resolves");
     p.terminate().expect("foreign terminate");
-    expect_eof("blocker", &mut sock);
+    // Release the member after the signal: a `terminate` that sent nothing lets it leave with 0,
+    // which the assertion on how it ended catches, where a read for an EOF would hang.
+    drop(sock);
     let status = child.wait().expect("reap");
     assert_eq!(status.signal(), Some(libc::SIGTERM), "got {status:?}");
 }
@@ -157,6 +162,7 @@ async fn async_foreign_kill_tree_tears_down_tree() {
 #[cfg(unix)]
 #[skuld::test]
 async fn async_foreign_graceful_shutdown_tree_tears_down_tree() {
+    use std::os::unix::process::ExitStatusExt;
     use std::time::Duration;
     let (child, mut socks) = common::spawn_grandchild(false);
     let p = Process::from_pid(child.id().pid()).found().expect("resolves");
@@ -171,7 +177,10 @@ async fn async_foreign_graceful_shutdown_tree_tears_down_tree() {
             other => panic!("tree member {i} not torn down: {other:?}"),
         }
     }
-    let _ = child.wait();
+    // The root left to the soft signal, not to the sweep: a `terminate_tree` that sent nothing
+    // leaves it to `SIGKILL` once the grace runs out.
+    let status = child.wait().expect("reap the root");
+    assert_eq!(status.signal(), Some(libc::SIGTERM), "got {status:?}");
 }
 
 #[cfg(feature = "tokio")]
