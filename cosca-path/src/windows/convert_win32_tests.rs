@@ -395,13 +395,15 @@ fn nt_prefix_passes_through_to_the_object_manager() {
     }
 }
 
-/// `s` with a `Z` after every name that is not `.`, `..` or empty, so that Win32 trims nothing from
-/// it. A leading drive designator (`C:`, and `.:`, `?:` or `::`, which Win32 skips the same way) and
+/// `s` with a `Z` around every name that is not `.`, `..` or empty: the trailing `Z` so that Win32
+/// trims nothing from it, the leading `ZZ` so that no name is a device under Windows 10's rules,
+/// where the part before a name's first `.` or `:` decides (`nul.` and `nulZ.` are both NUL there,
+/// `ZZnul.Z` is a file); two units, as one unit before a `:` would read as a drive (`:` → `Z:`). A leading drive designator (`C:`, and `.:`, `?:` or `::`, which Win32 skips the same way) and
 /// the `?` of a leading `\\?` are not names: marking them would change what the string is.
 fn sentinel(s: &str) -> String {
     let mark = |name: &str| match name {
         "" | "." | ".." => name.to_owned(),
-        _ => format!("{name}Z"),
+        _ => format!("ZZ{name}Z"),
     };
     let separators: Vec<char> = s.chars().filter(|c| matches!(c, '\\' | '/')).collect();
     let segments: Vec<&str> = s.split(['\\', '/']).collect();
@@ -452,7 +454,7 @@ fn marked_name(name: &OsStr) -> String {
     let name = name.to_str().unwrap();
     match name {
         "" | "." | ".." => name.to_owned(),
-        _ => format!("{name}Z"),
+        _ => format!("ZZ{name}Z"),
     }
 }
 
@@ -637,16 +639,11 @@ fn to_wide_names_the_nt_path_win32_reaches_by_the_names_as_written() {
                     "{s:?} was refused: {e}"
                 );
                 assert!(!path.is_fully_qualified(), "{s:?} is fully qualified, refused as {e}");
-                // Under Windows 10's rules a reserved stem stays the device whatever follows its
-                // dot, so the input and its marked names both read as the device (`nul.` and
-                // `nulZ.Z` are `\??\nul` on build 20348): no string names the file there either.
-                if !is_dos_device(&s) {
-                    assert_ne!(
-                        nt_path_folded(&s),
-                        Some(expected),
-                        "{s:?} was refused ({e}), but Win32 reads it as written"
-                    );
-                }
+                assert_ne!(
+                    nt_path_folded(&s),
+                    Some(expected),
+                    "{s:?} was refused ({e}), but Win32 reads it as written"
+                );
                 refused += 1;
                 nt_refused += usize::from(s.starts_with(r"\??\"));
             }
