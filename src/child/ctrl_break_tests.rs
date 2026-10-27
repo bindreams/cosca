@@ -293,9 +293,10 @@ fn tree_graceful_ops_work_from_a_caller_that_has_a_console() {
 }
 
 /// The lone ops from a caller that has a console. `terminate` is asserted sent and acked, and the
-/// root survives its break by design. `graceful_shutdown` with no grace sends its own break
-/// (asserted through the `AfterTerminate` hook) and then escalates, so exit code 1 is the
-/// escalation's kill, and a later `kill` of the dead child is `Ok`.
+/// root survives its break by design; a live `kill` then ends it with code 1. On a second root,
+/// `graceful_shutdown` with no grace sends its own break (asserted through the `AfterTerminate`
+/// hook) and then escalates, so exit code 1 is the escalation's kill, and a later `kill` of the
+/// dead child is `Ok`.
 #[skuld::test]
 fn lone_graceful_ops_work_from_a_caller_that_has_a_console() {
     let (child, mut sock) = spawn_root(Handler::Ack, crate::ContainMode::Strongest);
@@ -309,6 +310,13 @@ fn lone_graceful_ops_work_from_a_caller_that_has_a_console() {
         crate::identity::Liveness::Alive,
         "the root handles the break and keeps running"
     );
+    // A live `kill`, released after it: the acker leaves with 0 when released, so code 1 is the kill's.
+    child.kill().expect("kill the live root");
+    drop(sock);
+    let status = child.wait().expect("reap");
+    assert_eq!(status.code(), Some(1), "kill must end the live root, got {status:?}");
+
+    let (child, sock) = spawn_root(Handler::Ack, crate::ContainMode::Strongest);
     let pid = child.id().pid();
     let check = term_fault::at_checked(term_fault::HookPoint::AfterTerminate, move || {
         ctrl_break::assert_break_sent_to(pid)
@@ -371,6 +379,22 @@ fn graceful_shutdown_tree_sweep_is_load_bearing_on_windows() {
 
 // A root outside our console =====
 
+/// Require of a root spawned for [`assert_false_success`] the containment the leg is about, and the
+/// route that reads its creation flags whole: a derivation reading only the containment half of the
+/// word says `ConsoleGroup` here.
+fn assert_own_console_route(child: &crate::Child, expected_containment: Containment) {
+    assert_eq!(
+        child.containment(),
+        expected_containment,
+        "this test is about the wrong thing if containment did not take"
+    );
+    assert_eq!(
+        child.graceful_mechanism(),
+        GracefulMechanism::OtherConsoleGroup,
+        "cosca's honest report of the route"
+    );
+}
+
 /// A root whose creation flags put it in a console of its own gets a false success from the
 /// cooperative ops: they return `Ok` having sent a break that reached nobody. The subject is HOW
 /// the root ended, so the assertions are on its exit code.
@@ -378,8 +402,9 @@ fn graceful_shutdown_tree_sweep_is_load_bearing_on_windows() {
 /// The root has no handler, so a delivered break would end it with [`STATUS_CONTROL_C_EXIT`]. It is
 /// released through its own socket after the cooperative op, and must then leave with `0`: it ended
 /// on the release, having received nothing. The exit code alone cannot rule out a break that lands
-/// after the release (no ordering exists for a negative claim); the send record and the liveness
-/// are read before the release, so they do not depend on that timing. A second root checks the
+/// after the release (no ordering exists for a negative claim). The send record is read before the
+/// release, so it does not depend on that timing; the liveness read cannot fail on a build that
+/// delivers the break, and is not what carries the claim. A second root checks the
 /// other half: the forced `graceful_shutdown_tree` still ends such a tree, and its release comes
 /// after the sweep, so a sweep that sent nothing yields `0` instead of a hang on the held root.
 ///
@@ -394,16 +419,7 @@ fn assert_false_success(
     use std::io::Write as _;
 
     let (child, mut sock) = spawn_root_configured(Handler::Default, mode, &configure);
-    assert_eq!(
-        child.containment(),
-        expected_containment,
-        "this test is about the wrong thing if containment did not take"
-    );
-    assert_eq!(
-        child.graceful_mechanism(),
-        GracefulMechanism::OtherConsoleGroup,
-        "cosca's honest report of the route; a derivation reading only the containment half of the creation-flag word says ConsoleGroup here"
-    );
+    assert_own_console_route(&child, expected_containment);
     child
         .terminate_tree()
         .expect("the cooperative op reports success: that is the gap this pins");
@@ -424,6 +440,7 @@ fn assert_false_success(
 
     // A second root, because the first is already gone.
     let (child, sock) = spawn_root_configured(Handler::Default, mode, &configure);
+    assert_own_console_route(&child, expected_containment);
     let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, sock);
     let status = child
         .graceful_shutdown_tree(Duration::ZERO)
@@ -469,18 +486,17 @@ fn a_treewalk_contained_root_gets_a_false_success_too() {
 /// that reached nobody, and nothing inside this process can tell that case apart from a healthy
 /// one (#832). This test must flip when #832 lands, not the behaviour change silently.
 ///
-/// The child is a contained root that frees its console after it connects, so its creation flags
-/// exclude nothing; the test asserts the root's own report that it has none. `terminate` is asserted
-/// sent, and the child is still running afterwards. The forced half still ends it: its release comes
-/// after the escalation, so an escalation that sent nothing yields `0` instead of a hang.
+/// The child is a contained GUI-subsystem root, which never attaches to our console, so its
+/// creation flags exclude nothing and a break reaches nobody. `terminate` is asserted sent, and the
+/// child is still running afterwards. The forced half still ends it: its release comes after the
+/// escalation, so an escalation that sent nothing yields `0` instead of a hang.
 ///
 /// Mutants: `terminate` sends nothing (the break record); `graceful_shutdown` skips the kill (the
 /// exit code).
 #[skuld::test]
 fn child_graceful_ops_report_success_for_a_child_that_shares_no_console() {
     let _warns = crate::log_capture::warn_watch();
-    let (child, mut sock) = spawn_root(Handler::Detached, crate::ContainMode::Strongest);
-    ctrl_break::assert_left_console(&mut sock);
+    let (child, sock) = ctrl_break::spawn_consoleless_root();
     let pid = child.id().pid();
     assert_eq!(
         child.graceful_mechanism(),

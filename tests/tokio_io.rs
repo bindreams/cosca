@@ -306,6 +306,12 @@ async fn async_drop_tears_down_a_contained_tree() {
         cosca::Containment::None,
         "contained spawn must engage a mechanism"
     );
+    #[cfg(windows)]
+    assert_eq!(
+        child.containment(),
+        cosca::Containment::JobObject,
+        "Windows Strongest => JobObject"
+    );
     drop(child);
     // No post-drop liveness assertion: the drop waits for the root and a cgroup leaf only, and on
     // Windows for neither. Each member's death is proven by how it ended, and a drop that killed
@@ -1174,23 +1180,6 @@ async fn async_fd3_source_merges_into_piped_stdin() {
         .expect("read");
     let _ = child.wait().await;
     assert_eq!(buf, b"via-the-dup");
-}
-
-#[cfg(feature = "tokio")]
-#[cfg(windows)]
-#[skuld::test]
-async fn async_windows_contained_spawn_runs_then_job_tears_down() {
-    // Verifies the CREATE_SUSPENDED + job-assign + out-of-band resume dance works under tokio.
-    let (child, root, grand) = common::spawn_released_tree_async().await;
-    assert_eq!(
-        child.containment(),
-        cosca::Containment::JobObject,
-        "Windows Strongest => JobObject"
-    );
-    drop(child);
-    // As in `async_drop_tears_down_a_contained_tree`: `Drop` does not wait, so how each member
-    // ended is the evidence.
-    common::assert_members_torn_down(vec![(root, "the root"), (grand, "the grandchild")]);
 }
 
 // Death-watched accept =====

@@ -215,6 +215,21 @@ async fn async_graceful_shutdown_tree_sweep_is_load_bearing_on_windows() {
 
 // A root outside our console =====
 
+/// Async twin of `child::ctrl_break_tests::assert_own_console_route`: the async derivation must
+/// read the composed creation-flag word too.
+fn assert_own_console_route(child: &crate::tokio::Child, expected_containment: Containment) {
+    assert_eq!(
+        child.containment(),
+        expected_containment,
+        "this test is about the wrong thing if containment did not take"
+    );
+    assert_eq!(
+        child.graceful_mechanism(),
+        GracefulMechanism::OtherConsoleGroup,
+        "cosca's honest report of the route"
+    );
+}
+
 /// Async twin of the sync `assert_false_success`; see there.
 async fn assert_false_success(
     expected_containment: Containment,
@@ -225,12 +240,7 @@ async fn assert_false_success(
 
     crate::tokio::test_runtime::assert_current_thread();
     let (mut child, mut sock) = spawn_root_configured(Handler::Default, mode, &configure);
-    assert_eq!(child.containment(), expected_containment);
-    assert_eq!(
-        child.graceful_mechanism(),
-        GracefulMechanism::OtherConsoleGroup,
-        "the async derivation must read the composed word too"
-    );
+    assert_own_console_route(&child, expected_containment);
     child.terminate_tree().expect("the cooperative op reports success");
     ctrl_break::assert_break_sent_to(child.id().pid());
     assert_eq!(
@@ -248,6 +258,7 @@ async fn assert_false_success(
     drop(sock);
 
     let (mut child, sock) = spawn_root_configured(Handler::Default, mode, &configure);
+    assert_own_console_route(&child, expected_containment);
     let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, sock);
     let status = child
         .graceful_shutdown_tree(Duration::ZERO)
@@ -291,8 +302,7 @@ async fn an_async_treewalk_contained_root_gets_a_false_success_too() {
 async fn async_child_graceful_ops_report_success_for_a_child_that_shares_no_console() {
     let _warns = crate::log_capture::warn_watch();
     crate::tokio::test_runtime::assert_current_thread();
-    let (mut child, mut sock) = spawn_root(Handler::Detached);
-    ctrl_break::assert_left_console(&mut sock);
+    let (mut child, sock) = ctrl_break::spawn_consoleless_root_async();
     let pid = child.id().pid();
     assert_eq!(
         child.graceful_mechanism(),
