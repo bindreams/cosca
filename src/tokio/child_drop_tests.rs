@@ -3,14 +3,19 @@
 //! `CgroupLeaf::for_test_at` (real errnos on any Linux host) and `FakeLeaf` (answers `rmdir` as
 //! cgroupfs does).
 
+#[cfg(unix)]
 use crate::child::spawn::fault::{release_between_kill_and_wait, TeardownBlocker};
 use crate::tokio::child::{fault, Child};
 
 /// A real root that only a kill or a closed stdin ends, in no containment. The write end of its
-/// stdin is returned: dropping it lets the root exit.
+/// stdin is returned: dropping it lets the root exit. On Windows the root is `more.com`, which
+/// exits `0` on EOF, where the `findstr x` of `BLOCKER_ARGV` exits `1`, the code a kill gives.
 fn blocker() -> (Child, crate::tokio::ChildStdin) {
     let mut cmd = crate::tokio::Command::new();
+    #[cfg(unix)]
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    #[cfg(windows)]
+    cmd.args([crate::test_child::windows_more()]);
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(crate::Stdio::null()).expect("set stdout");
     let mut child = cmd.spawn().expect("spawn");
@@ -21,9 +26,71 @@ fn blocker() -> (Child, crate::tokio::ChildStdin) {
 /// [`blocker`], its stdin released once the drop's root kill returned, before its reap: a drop whose
 /// kill sent nothing lets the root exit `0`, which [`TeardownBlocker::assert_killed`] then fails by
 /// assertion instead of the drop hanging on the reap. Keep the guard through the assertion.
+#[cfg(unix)]
 pub(crate) fn released_blocker() -> (Child, TeardownBlocker) {
     let (child, stdin) = blocker();
     (child, release_between_kill_and_wait(stdin))
+}
+
+/// What [`released_blocker`] gives on Windows, where the drop waits for nothing and so has no point
+/// between its kill and a wait to release at. It holds the root's stdin and a handle of its own to
+/// the root, opened before the drop. [`assert_killed`](Self::assert_killed) releases the stdin
+/// after the drop returned, then reads how the root ended: `TerminateProcess(_, 1)` set the exit
+/// code `1` before the drop returned, so a root the drop left alone exits `0` on the released
+/// stdin, and the assertion fails instead of the wait hanging.
+#[cfg(windows)]
+pub(crate) struct TerminatedBlocker {
+    stdin: std::cell::Cell<Option<crate::tokio::ChildStdin>>,
+    process: std::os::windows::io::OwnedHandle,
+}
+
+#[cfg(windows)]
+impl TerminatedBlocker {
+    /// The root was ended by the drop's `TerminateProcess` (exit code 1), not by its own exit.
+    pub(crate) fn assert_killed(&self) {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+        use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject, INFINITE};
+
+        drop(self.stdin.take());
+        let process = HANDLE(self.process.as_raw_handle());
+        // SAFETY: `process` is a live handle this struct owns, opened with `SYNCHRONIZE`.
+        let waited = unsafe { WaitForSingleObject(process, INFINITE) };
+        assert_eq!(waited, WAIT_OBJECT_0, "wait for the root's exit");
+        let mut code = 0u32;
+        // SAFETY: as above; the handle was opened with `PROCESS_QUERY_LIMITED_INFORMATION`.
+        unsafe { GetExitCodeProcess(process, &mut code) }.expect("read the root's exit code");
+        assert_eq!(
+            code, 1,
+            "the drop must terminate the root (`TerminateProcess` exits 1), not leave it to exit on its own (0)"
+        );
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn released_blocker() -> (Child, TerminatedBlocker) {
+    use std::os::windows::io::{FromRawHandle as _, OwnedHandle};
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE};
+
+    let (child, stdin) = blocker();
+    // SAFETY: opens the live root by its pid; the handle then pins that process.
+    let process = unsafe {
+        OpenProcess(
+            PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+            false,
+            child.id().pid(),
+        )
+    }
+    .expect("open the root");
+    // SAFETY: `OpenProcess` returned a handle nothing else owns.
+    let process = unsafe { OwnedHandle::from_raw_handle(process.0) };
+    (
+        child,
+        TerminatedBlocker {
+            stdin: std::cell::Cell::new(Some(stdin)),
+            process,
+        },
+    )
 }
 
 #[cfg(target_os = "linux")]

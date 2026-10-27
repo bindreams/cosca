@@ -92,13 +92,14 @@ fn held_blocker(kill_on_drop: bool) -> (super::Child, std::io::PipeWriter) {
 
 /// A killed blocker `pid`: `sends` (logged after the syscall) holds the `SIGKILL` to it. On Linux
 /// it also died of `SIGKILL`, or was reaped while its stdin was open, read through a pidfd opened
-/// before the teardown. Its stdin `writer` is released only here, so a teardown that sent nothing
-/// leaves the blocker to exit `0`. Needs `alone()` on Linux.
+/// before the teardown; elsewhere [`after_a_pump_failure`] reads the status of the teardown's reap.
+/// Its stdin `writer` is released only here, so a teardown that sent nothing leaves the blocker to
+/// exit `0`. Needs `alone()` on Linux.
 #[cfg(unix)]
 #[track_caller]
 fn assert_the_teardown_killed(
     #[cfg(target_os = "linux")] root: &Pidfd,
-    writer: std::io::PipeWriter,
+    #[cfg(target_os = "linux")] writer: std::io::PipeWriter,
     sends: &crate::send_log::Capture,
     pid: u32,
 ) {
@@ -110,8 +111,6 @@ fn assert_the_teardown_killed(
             "the teardown must kill the child with SIGKILL, got {ended:?}"
         );
     }
-    #[cfg(not(target_os = "linux"))]
-    drop(writer);
     assert!(
         sends.sent(pid, crate::signal::Sig::Kill),
         "the teardown must send the child SIGKILL: {:?}",
@@ -122,7 +121,9 @@ fn assert_the_teardown_killed(
 /// What `after_the_spawn` answers for a failed pump on `child`, a held blocker whose stdin `writer`
 /// is released only once the teardown's kill is checked. The teardown sends its signals on its first
 /// poll and awaits the reap after, so a kill that sent nothing fails that check by assertion instead
-/// of leaving the reap to hang on a blocker that never exits. Needs `alone()` on Linux.
+/// of leaving the reap to hang on a blocker that never exits. Needs `alone()` on Linux. Elsewhere the
+/// writer is dropped between the teardown's kill and its reap, and the reap's status must be
+/// `SIGKILL`, as on Linux.
 #[cfg(unix)]
 async fn after_a_pump_failure(child: &mut super::Child, writer: std::io::PipeWriter) -> crate::error::Error {
     use std::future::Future as _;
@@ -130,6 +131,8 @@ async fn after_a_pump_failure(child: &mut super::Child, writer: std::io::PipeWri
 
     #[cfg(target_os = "linux")]
     let root = Pidfd::of(child);
+    #[cfg(not(target_os = "linux"))]
+    let released = crate::child::spawn::fault::release_between_kill_and_wait(writer);
     let pid = child.id().pid();
     let sends = crate::send_log::Capture::start();
     let mut teardown = std::pin::pin!(super::after_the_spawn(
@@ -140,11 +143,14 @@ async fn after_a_pump_failure(child: &mut super::Child, writer: std::io::PipeWri
     #[cfg(target_os = "linux")]
     assert_the_teardown_killed(&root, writer, &sends, pid);
     #[cfg(not(target_os = "linux"))]
-    assert_the_teardown_killed(writer, &sends, pid);
-    match first {
+    assert_the_teardown_killed(&sends, pid);
+    let error = match first {
         Poll::Ready(error) => error,
         Poll::Pending => teardown.await,
-    }
+    };
+    #[cfg(not(target_os = "linux"))]
+    released.assert_killed();
+    error
 }
 
 /// A run-to-completion helper that fails after its spawn kills and reaps the child, as its drop
@@ -229,11 +235,44 @@ fn assert_failed_after_the_spawn(error: crate::error::Error, fate: crate::error:
     );
 }
 
+/// A root that only a kill or the drop of its release pipe ends, and the guard that drops that pipe
+/// once the teardown's kill returned, before its reap. The root reads fd 4, which `output`, `read`
+/// and `status` leave alone: they set the child's stdin, stdout and stderr themselves, so none of
+/// those can hold it. A teardown that kills nothing lets the root exit `0`, which `assert_killed`
+/// on the guard fails by assertion instead of the reap hanging.
+#[cfg(unix)]
+fn releasable_root() -> (super::Command, crate::child::spawn::fault::TeardownBlocker) {
+    let (gate, release) = crate::test_child::held_writer_stdin();
+    let mut cmd = super::Command::new();
+    cmd.args(["sh", "-c", "exec cat <&4 4<&-"]);
+    cmd.fd(4, gate).expect("set the root's release pipe");
+    (cmd, crate::child::spawn::fault::release_between_kill_and_wait(release))
+}
+
+/// Windows has no release point in the drop and no pipe a run-to-completion helper leaves to the
+/// caller, so the kill is not witnessed there: this test pins the error's shape, and the kill is
+/// pinned by `child_drop_tests::a_kill_on_drop_drop_of_a_live_blocker_returns`.
+#[cfg(windows)]
+fn releasable_root() -> (super::Command, Released) {
+    let mut cmd = super::Command::new();
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    (cmd, Released)
+}
+
+#[cfg(windows)]
+struct Released;
+#[cfg(windows)]
+impl Released {
+    fn assert_killed(&self) {}
+}
+
 /// Async twin of the sync `output_status_and_read_fail_as_may_have_started_after_the_spawn`. The
-/// fate is the drop's: `Reaped` on Unix, where it kills and reaps the child; `Killed` on Windows,
-/// where it terminates the child and closes its handle.
+/// fate is the drop's: `Reaped` on Unix, where it kills and reaps the child, which the test checks
+/// (the root is `SIGKILL`ed, not ended by its release); `Killed` on Windows, where it terminates the
+/// child and closes its handle.
 ///
-/// Mutants: a helper returns the cause bare; drops the fate; drops the wrapper flag.
+/// Mutants: a helper returns the cause bare; drops the fate; drops the wrapper flag; the teardown's
+/// kill sends nothing.
 #[skuld::test]
 async fn output_status_and_read_fail_as_may_have_started_after_the_spawn() {
     use crate::child::spawn::failure::seams;
@@ -246,26 +285,36 @@ async fn output_status_and_read_fail_as_may_have_started_after_the_spawn() {
     };
     for wrapper in [false, true] {
         let _wrapper = wrapper.then(seams::pretend_wrapper);
-        let mut cmd = super::Command::new();
-        cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
-        let _pump = seams::fail_the_next_pump();
-        assert_failed_after_the_spawn(
-            cmd.output().await.expect_err("a failed pump fails `output`"),
-            torn_down,
-            wrapper,
-        );
-        let _pump = seams::fail_the_next_pump();
-        assert_failed_after_the_spawn(
-            cmd.read().await.expect_err("a failed pump fails `read`"),
-            torn_down,
-            wrapper,
-        );
-        let _wait = seams::fail_the_next_wait();
-        assert_failed_after_the_spawn(
-            cmd.status().await.expect_err("a failed wait fails `status`"),
-            torn_down,
-            wrapper,
-        );
+        {
+            let (mut cmd, killed) = releasable_root();
+            let _pump = seams::fail_the_next_pump();
+            assert_failed_after_the_spawn(
+                cmd.output().await.expect_err("a failed pump fails `output`"),
+                torn_down,
+                wrapper,
+            );
+            killed.assert_killed();
+        }
+        {
+            let (mut cmd, killed) = releasable_root();
+            let _pump = seams::fail_the_next_pump();
+            assert_failed_after_the_spawn(
+                cmd.read().await.expect_err("a failed pump fails `read`"),
+                torn_down,
+                wrapper,
+            );
+            killed.assert_killed();
+        }
+        {
+            let (mut cmd, killed) = releasable_root();
+            let _wait = seams::fail_the_next_wait();
+            assert_failed_after_the_spawn(
+                cmd.status().await.expect_err("a failed wait fails `status`"),
+                torn_down,
+                wrapper,
+            );
+            killed.assert_killed();
+        }
     }
 }
 
