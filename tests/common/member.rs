@@ -99,6 +99,18 @@ pub fn assert_members_killed(members: Vec<(Member, &str)>) {
     }
 }
 
+/// Assert that a teardown that does not wait (a drop) ended every member. Windows: as
+/// [`assert_members_not_released`], so the tree must have been started with [`RELEASED_EXIT_ENV`].
+/// Unix: [`assert_dead`] on each, so the members must echo.
+pub fn assert_members_torn_down(members: Vec<(Member, &str)>) {
+    #[cfg(windows)]
+    assert_members_not_released(members);
+    #[cfg(unix)]
+    for (mut member, who) in members {
+        assert_dead(&mut member.sock, who);
+    }
+}
+
 /// The exit codes a testbin member can leave with for a reason other than the kill, besides
 /// [`RELEASED_EXIT_CODE`]: `101` (a Rust panic) and the NTSTATUS codes of an access violation, an
 /// illegal instruction and a fast-fail abort.

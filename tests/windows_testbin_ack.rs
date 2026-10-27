@@ -1,6 +1,6 @@
 //! Windows: the testbin modes that spawn a child of their own and accept its connection
-//! (`report-nested-terminate`, `report-console-terminate`, `report-console-lone`,
-//! `report-breakaway`) watch that child's death, and opt it in to the accept handshake themselves.
+//! (`report-console-terminate`, `report-console-lone`, `report-breakaway`) watch that child's death,
+//! and opt it in to the accept handshake themselves.
 //!
 //! Both properties are invisible from the outside when everything goes right, so each mode runs
 //! under a testbin seam (`testbin/ack.rs`, `SEAM_ENV`):
@@ -14,26 +14,30 @@
 use std::io::Read;
 #[cfg(windows)]
 use std::net::TcpListener;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 
 #[cfg(windows)]
 #[path = "common/mod.rs"]
 mod common;
 
 #[cfg(windows)]
-use common::Target;
+const SEAM_ENV: &str = "COSCA_TEST_ACK_SEAM";
 
 #[cfg(windows)]
-const SEAM_ENV: &str = "COSCA_TEST_ACK_SEAM";
+/// `DETACHED_PROCESS` (winbase.h): the new process gets no console and does not inherit ours.
+const DETACHED_PROCESS: u32 = 0x0000_0008;
 
 #[cfg(windows)]
 /// How a mode is launched and read.
 struct Case {
     /// The mode's argv after the executable, given the report address.
     args: fn(&str) -> Vec<String>,
-    /// Spawned through `cosca::Command::contain`, as `report-nested-terminate` requires.
-    contained: bool,
     /// The mode reports one line and then waits for the socket to close, instead of closing.
     one_line: bool,
+    /// Creation flags for the mode. The two console modes are launched console-less because they
+    /// probe the console-less caller.
+    flags: u32,
 }
 
 #[cfg(windows)]
@@ -44,51 +48,17 @@ struct Run {
 }
 
 #[cfg(windows)]
-enum Helper {
-    Std(std::process::Child),
-    Cosca(cosca::Child),
-}
-
-#[cfg(windows)]
-impl Target for Helper {
-    fn pid(&self) -> u32 {
-        match self {
-            Helper::Std(c) => c.id(),
-            Helper::Cosca(c) => c.id().pid(),
-        }
-    }
-
-    fn has_exited(&mut self) -> bool {
-        match self {
-            Helper::Std(c) => c.has_exited(),
-            Helper::Cosca(c) => c.has_exited(),
-        }
-    }
-}
-
-#[cfg(windows)]
 fn run(case: &Case, seam: &str) -> Run {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap().to_string();
     let args = (case.args)(&addr);
-    let mut helper = if case.contained {
-        let mut cmd = cosca::Command::new();
-        cmd.executable(common::testbin())
-            .args(&args)
-            .env(common::ACK_ENV, "1")
-            .env(SEAM_ENV, seam)
-            .stderr(cosca::Stdio::pipe())
-            .expect("pipe stderr")
-            .contain();
-        Helper::Cosca(cmd.spawn().expect("spawn the mode"))
-    } else {
-        let mut cmd = std::process::Command::new(common::testbin());
-        cmd.args(&args)
-            .env(common::ACK_ENV, "1")
-            .env(SEAM_ENV, seam)
-            .stderr(std::process::Stdio::piped());
-        Helper::Std(common::spawn_locked(&mut cmd).expect("spawn the mode"))
-    };
+    let mut cmd = std::process::Command::new(common::testbin());
+    cmd.args(&args)
+        .env(common::ACK_ENV, "1")
+        .env(SEAM_ENV, seam)
+        .creation_flags(case.flags)
+        .stderr(std::process::Stdio::piped());
+    let mut helper = common::spawn_locked(&mut cmd).expect("spawn the mode");
     let mut sock = common::accept_or_die(&listener, &mut helper);
     let mut report = String::new();
     if case.one_line {
@@ -97,18 +67,14 @@ fn run(case: &Case, seam: &str) -> Run {
     } else {
         sock.read_to_string(&mut report).expect("read the report");
     }
-    let (success, mut stderr) = (
-        match &mut helper {
-            Helper::Std(c) => c.wait().expect("reap the mode").success(),
-            Helper::Cosca(c) => c.wait().expect("reap the mode").success(),
-        },
-        String::new(),
-    );
-    match &mut helper {
-        Helper::Std(c) => c.stderr.take().expect("piped").read_to_string(&mut stderr),
-        Helper::Cosca(c) => c.stderr().expect("piped").read_to_string(&mut stderr),
-    }
-    .expect("read the mode's stderr");
+    let success = helper.wait().expect("reap the mode").success();
+    let mut stderr = String::new();
+    helper
+        .stderr
+        .take()
+        .expect("piped")
+        .read_to_string(&mut stderr)
+        .expect("read the mode's stderr");
     Run {
         report,
         success,
@@ -147,12 +113,6 @@ macro_rules! mode_tests {
 }
 
 #[cfg(windows)]
-fn nested_terminate_args(addr: &str) -> Vec<String> {
-    ["cosca_testbin", "report-nested-terminate", addr]
-        .map(String::from)
-        .to_vec()
-}
-#[cfg(windows)]
 fn console_terminate_args(addr: &str) -> Vec<String> {
     ["report-console-terminate", addr].map(String::from).to_vec()
 }
@@ -175,12 +135,11 @@ fn breakaway_exec_args(addr: &str) -> Vec<String> {
 
 #[cfg(windows)]
 mode_tests! {
-    report_nested_terminate: Case { args: nested_terminate_args, contained: true, one_line: false };
-    report_console_terminate: Case { args: console_terminate_args, contained: false, one_line: false };
-    report_console_lone: Case { args: console_lone_args, contained: false, one_line: false };
-    report_breakaway_raw: Case { args: breakaway_raw_args, contained: false, one_line: true };
-    report_breakaway_argv: Case { args: breakaway_argv_args, contained: false, one_line: true };
-    report_breakaway_exec: Case { args: breakaway_exec_args, contained: false, one_line: true };
+    report_console_terminate: Case { args: console_terminate_args, one_line: false, flags: DETACHED_PROCESS };
+    report_console_lone: Case { args: console_lone_args, one_line: false, flags: DETACHED_PROCESS };
+    report_breakaway_raw: Case { args: breakaway_raw_args, one_line: true, flags: 0 };
+    report_breakaway_argv: Case { args: breakaway_argv_args, one_line: true, flags: 0 };
+    report_breakaway_exec: Case { args: breakaway_exec_args, one_line: true, flags: 0 };
 }
 
 #[path = "../src/test_harness.rs"]
