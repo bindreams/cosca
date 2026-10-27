@@ -241,6 +241,40 @@ async fn async_graceful_shutdown_tree_tears_down_tree() {
     assert!(rest.is_empty(), "nothing was written: {rest:?}");
 }
 
+// Async twin of `child_graceful_shutdown_tree_sweeps_survivor_after_graceful_root_exit` in
+// `src/child/graceful_tests.rs` — see there for the full rationale.
+#[cfg(unix)]
+#[skuld::test]
+async fn async_graceful_shutdown_tree_sweeps_survivor_after_graceful_root_exit() {
+    let _warns = crate::log_capture::warn_watch();
+    use ::tokio::io::AsyncReadExt as _;
+    crate::tokio::test_runtime::assert_current_thread();
+    let mut cmd = crate::tokio::Command::new();
+    cmd.args(crate::test_child::TERM_SURVIVOR_TREE_ARGV.iter().copied());
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+    cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
+    crate::test_child::contain_without_cgroup_async(&mut cmd);
+    let mut child = cmd.spawn().expect("spawn");
+    let stdin = child.stdin().expect("piped stdin");
+    let mut stdout = child.stdout().expect("piped stdout");
+    let mut ready = [0u8; 2];
+    stdout.read_exact(&mut ready).await.expect("readiness line");
+    assert_eq!(&ready, b"r\n");
+
+    let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, stdin);
+    child
+        .graceful_shutdown_tree(Duration::from_secs(1))
+        .await
+        .expect("tree graceful with survivor");
+
+    let mut rest = Vec::new();
+    stdout
+        .read_to_end(&mut rest)
+        .await
+        .expect("every member is gone, so the pipe ends");
+    assert!(rest.is_empty(), "the sweep missed the grandchild: {rest:?}");
+}
+
 #[cfg(unix)]
 #[skuld::test]
 async fn async_graceful_shutdown_escalates() {

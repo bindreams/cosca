@@ -248,6 +248,42 @@ fn child_graceful_shutdown_tree_tears_down_tree() {
     assert!(rest.is_empty(), "nothing was written: {rest:?}");
 }
 
+// The case the sweep-before-reap invariant protects: the root honors the group's `SIGTERM` and ends
+// within the grace, but the grandchild ignores it and survives, so only the hard sweep, which runs
+// while the unreaped root still pins the group, can end it. The grandchild never ends on its own,
+// so the grace runs out (1 s, the call's own bound). Its stdin is released once the sweep returned
+// (`release_at`): a grandchild the sweep missed then ends of its own accord and prints `eof`, so an
+// empty stdout shows it was killed. The root's own status is not asserted: the sweep's `SIGKILL`
+// may reach it before its `SIGTERM` has ended it.
+#[cfg(unix)]
+#[skuld::test]
+fn child_graceful_shutdown_tree_sweeps_survivor_after_graceful_root_exit() {
+    let _warns = crate::log_capture::warn_watch();
+    use std::io::Read as _;
+    let mut cmd = crate::Command::new();
+    cmd.args(crate::test_child::TERM_SURVIVOR_TREE_ARGV.iter().copied());
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+    cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
+    crate::test_child::contain_without_cgroup(&mut cmd);
+    let mut child = cmd.spawn().expect("spawn");
+    let stdin = child.stdin().expect("piped stdin");
+    let mut stdout = child.stdout().expect("piped stdout");
+    let mut ready = [0u8; 2];
+    stdout.read_exact(&mut ready).expect("readiness line");
+    assert_eq!(&ready, b"r\n");
+
+    let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, stdin);
+    child
+        .graceful_shutdown_tree(Duration::from_secs(1))
+        .expect("tree graceful with survivor");
+
+    let mut rest = Vec::new();
+    stdout
+        .read_to_end(&mut rest)
+        .expect("every member is gone, so the pipe ends");
+    assert!(rest.is_empty(), "the sweep missed the grandchild: {rest:?}");
+}
+
 // The escalation: a child that ignores `SIGTERM` is still alive at `Duration::ZERO`'s one poll, so
 // only the hard kill can end it, and `SIGKILL` is the only signal it can die of. Its stdin is
 // released via `release_at` after the kill; an escalation that sent nothing yields exit 0.

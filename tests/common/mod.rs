@@ -180,6 +180,31 @@ pub fn kill_tree_release_reap(child: &cosca::Child, control: TcpStream) -> std::
     status
 }
 
+/// [`kill_release_reap`] for several children. A `Child` dropped while its member still holds the
+/// control socket blocks in the drop's wait, so every socket is released before any `Child` can
+/// drop, on every path: `controls` is declared after `children` and so unwinds first, and the
+/// reaping starts only once it is gone.
+pub fn kill_release_reap_all(pairs: Vec<(cosca::Child, TcpStream)>) {
+    let (children, controls): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
+    for child in &children {
+        // A contained child by its group: a contained root reaped after a plain `kill` and then
+        // dropped warns.
+        if child.containment().can_teardown() {
+            child.kill_tree().expect("kill_tree");
+        } else {
+            child.kill().expect("kill");
+        }
+    }
+    drop(controls);
+    let statuses: Vec<_> = children
+        .into_iter()
+        .map(|child| child.wait().expect("reap the killed child"))
+        .collect();
+    for status in statuses {
+        assert_killed("the killed child", status);
+    }
+}
+
 /// [`kill_release_reap`] for the tokio `Child`.
 #[cfg(feature = "tokio")]
 pub async fn kill_release_reap_async(child: &mut cosca::tokio::Child, control: TcpStream) -> std::process::ExitStatus {
@@ -529,55 +554,6 @@ pub fn spawn_control(mode: &str, extra: &[&str], contain: bool) -> (cosca::Child
     (child, sock)
 }
 
-/// `spawn_control`'s shape against the GUI-subsystem helper: it takes no mode argument (the
-/// binary has exactly one behaviour) and tags `b"G"`. A GUI-subsystem image never attaches to
-/// its spawner's console, so this is the only way to construct a child whose creation flags say
-/// nothing excludes delivery while the OS puts it out of reach.
-#[cfg(windows)]
-pub fn spawn_gui_control(contain: bool) -> (cosca::Child, TcpStream) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().unwrap().to_string();
-    let exe = env!("CARGO_BIN_EXE_cosca_testbin_gui");
-    let mut cmd = cosca::Command::new();
-    cmd.executable(exe).args([exe, addr.as_str()]).env(ACK_ENV, "1");
-    silence(&mut cmd);
-    if contain {
-        cmd.contain();
-    }
-    let mut child = cmd.spawn().expect("spawn gui control child");
-    let mut sock = accept_or_die(&listener, &mut child);
-    let mut tag = [0u8; 1];
-    sock.read_exact(&mut tag).expect("read tag");
-    assert_eq!(&tag, b"G", "wrong gui tag");
-    (child, sock)
-}
-
-/// Async sibling of [`spawn_gui_control`] — see there for why the GUI-subsystem image is the
-/// only way to construct a child whose flags say nothing excludes delivery while the OS puts it
-/// out of reach.
-#[cfg(all(windows, feature = "tokio"))]
-pub async fn spawn_gui_control_async(contain: bool) -> (cosca::tokio::Child, TcpStream) {
-    let std_listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = std_listener.local_addr().unwrap().to_string();
-    std_listener
-        .set_nonblocking(true)
-        .expect("set the listener nonblocking for tokio");
-    let listener = ::tokio::net::TcpListener::from_std(std_listener).expect("wrap the listener for tokio");
-    let exe = env!("CARGO_BIN_EXE_cosca_testbin_gui");
-    let mut cmd = cosca::tokio::Command::new();
-    cmd.args([exe, addr.as_str()]).env(ACK_ENV, "1");
-    silence_async(&mut cmd);
-    if contain {
-        cmd.contain();
-    }
-    let mut child = cmd.spawn().expect("spawn async gui control child");
-    let mut sock = accept_or_die_async(&listener, &mut child).await;
-    let mut tag = [0u8; 1];
-    sock.read_exact(&mut tag).expect("read tag");
-    assert_eq!(&tag, b"G", "wrong gui tag");
-    (child, sock)
-}
-
 /// Convenience alias for the common `control-block` blocker (no `.contain()`). A one-line
 /// shortcut over `spawn_control`, NOT a second copy of the body.
 pub fn spawn_blocker() -> (cosca::Child, TcpStream) {
@@ -595,9 +571,8 @@ pub fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 
 /// Spawn a 2-level tree via a grandchild-spawning testbin `mode` (root tag "R" + one grandchild
 /// tag "G"), optionally contained, and return the owned `Child` plus BOTH accepted sockets (the
-/// two tag reads prove the 2-level tree is alive). The tree dies — and both sockets EOF — only
-/// when the whole tree is torn down, so callers prove teardown by reading EOF on both, never by
-/// a timer.
+/// two tag reads prove the 2-level tree is alive). Callers prove teardown by an exit code or an
+/// echo (see [`Member`] and `assert_members_killed`), never by a timer or an unbounded read.
 pub fn spawn_tree(mode: &str, contain: bool) -> (cosca::Child, Vec<TcpStream>) {
     spawn_tree_with(mode, contain, |_| {})
 }
@@ -850,6 +825,28 @@ pub async fn spawn_grandchild_async_with(
         cmd.kill_on_drop(kill_on_drop);
     })
     .await
+}
+
+/// A contained async `spawn-grandchild-echo` tree for a test that drops its handle: the root and the
+/// grandchild as [`Member`]s, built while both are blocked on their sockets. A member that is
+/// released leaves with [`RELEASED_EXIT_CODE`], which no kill produces, so
+/// [`assert_members_torn_down`] tells a teardown from a release.
+#[cfg(feature = "tokio")]
+pub async fn spawn_released_tree_async() -> (cosca::tokio::Child, Member, Member) {
+    let AsyncEchoTree {
+        child,
+        root,
+        grand,
+        grand_pid,
+    } = spawn_echo_tree_async_configured("spawn-grandchild-echo", |cmd| {
+        cmd.contain();
+        cmd.kill_on_drop(true);
+        cmd.env(RELEASED_EXIT_ENV, RELEASED_EXIT_CODE.to_string());
+    })
+    .await;
+    let root = Member::new(root, child.id().pid());
+    let grand = Member::new(grand, grand_pid);
+    (child, root, grand)
 }
 
 /// Read one `<tag><pid>\n` line from a freshly accepted `control-echo-pid` connection.

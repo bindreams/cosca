@@ -36,6 +36,44 @@ pub(crate) fn spawn_suspended_blocker() -> std::process::Child {
     crate::test_spawn::spawn(&mut cmd).expect("spawn a suspended blocker")
 }
 
+/// What [`spawn_suspended_releasable`]'s child exits with when it runs to its end. No kill leaves
+/// that code, whichever the kill (`TerminateProcess` gives its own, a job close gives the one the
+/// OS picks), so an exit with it means the kill under test sent nothing.
+pub(crate) const RELEASED_EXIT_CODE: i32 = 77;
+
+/// [`spawn_suspended_blocker`] for a test whose kill is the behaviour under test, and whose child
+/// then has to end without it: once released (see [`release`]) it reads its stdin to EOF and exits
+/// with [`RELEASED_EXIT_CODE`]. A kill that sent nothing fails [`assert_not_released`] instead of
+/// leaving a wait on a child that never runs.
+pub(crate) fn spawn_suspended_releasable() -> std::process::Child {
+    let mut cmd = std::process::Command::new("cmd.exe");
+    cmd.args(["/d", "/c"])
+        .arg(format!("more >nul & exit {RELEASED_EXIT_CODE}"))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(CREATE_SUSPENDED.0 | CREATE_NO_WINDOW.0);
+    crate::test_spawn::spawn(&mut cmd).expect("spawn a suspended releasable child")
+}
+
+/// Lets a [`spawn_suspended_releasable`] child run to its end by itself: closes its stdin and
+/// resumes its initial thread. Call it after the kill under test. A killed child's thread is gone
+/// and the resume's outcome is ignored.
+pub(crate) fn release(child: &mut std::process::Child, thread: &InitialThread) {
+    drop(child.stdin.take());
+    thread.resume_whatever_the_outcome();
+}
+
+/// Fails by assertion when a [`spawn_suspended_releasable`] child ran to its end, that is when the
+/// kill under test did not reach it.
+pub(crate) fn assert_not_released(who: &str, status: std::process::ExitStatus) {
+    assert_ne!(
+        status.code(),
+        Some(RELEASED_EXIT_CODE),
+        "{who} must be killed, not run to its end when released: {status:?}"
+    );
+}
+
 /// The initial thread of a process that is still alive, held by handle: its earliest-created
 /// thread, the product's rule. Opened while the caller's own handle on the process pins the pid.
 /// The handle is live, owned and closed once, with suspend rights, for as long as the value exists.
