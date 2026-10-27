@@ -284,3 +284,17 @@ fn the_elevated_program_note_is_for_a_wrapper_elevated_spawn_only() {
         assert!(!message(fate, true).contains(note), "{fate:?}");
     }
 }
+
+/// A Win32 failure wrapped as `HRESULT_FROM_WIN32` comes back as its Win32 code, as std's own
+/// spawn reports it, so `kind()` classifies it. Any other HRESULT is kept whole.
+#[cfg(windows)]
+#[skuld::test]
+fn win32_io_error_unwraps_a_win32_hresult() {
+    use crate::error::win32_io_error;
+    use windows::core::{Error, HRESULT};
+    let dir = win32_io_error(Error::from_hresult(HRESULT(0x8007_010Bu32 as i32)));
+    assert_eq!(dir.raw_os_error(), Some(267));
+    assert_eq!(dir.kind(), std::io::ErrorKind::NotADirectory);
+    let e_fail = win32_io_error(Error::from_hresult(HRESULT(0x8000_4005u32 as i32)));
+    assert_eq!(e_fail.raw_os_error(), Some(0x8000_4005u32 as i32));
+}

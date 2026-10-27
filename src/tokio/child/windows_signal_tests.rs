@@ -44,3 +44,70 @@ async fn a_kill_of_an_exited_unreaped_child_is_a_success() {
         Sent::Delivered
     );
 }
+
+// Win32 codes of failures =====
+//
+// A bare `.into()` on a `windows::core::Error` keeps the HRESULT (`0x8007xxxx`) where std reports
+// the Win32 code. Each test makes the real call fail and asserts the code.
+
+/// `TerminateProcess` on a handle that is not a process fails with `ERROR_INVALID_HANDLE`, which
+/// reaches the caller as that plain code.
+///
+/// Mutant: the final arm of `terminate_unreaped` converts with `.into()`, so the code is
+/// `0x80070006`.
+#[skuld::test]
+fn a_terminate_failure_carries_its_win32_code() {
+    use super::proc_source::terminate_unreaped;
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::{ERROR_INVALID_HANDLE, HANDLE};
+
+    let event = crate::wait::backend::new_cancel_event().expect("create an event");
+    let err = terminate_unreaped(HANDLE(event.as_raw_handle())).expect_err("an event cannot be terminated");
+    let crate::error::Error::Io(err) = err else {
+        panic!("expected Io, got {err:?}");
+    };
+    assert_eq!(err.raw_os_error(), Some(ERROR_INVALID_HANDLE.0 as i32), "{err:?}");
+}
+
+/// A handle that denies both `TerminateProcess` and the wait on it is a real denial, not an exiting
+/// child: it is an error with `ERROR_ACCESS_DENIED` as its code and `PermissionDenied` as its kind,
+/// which `map_elevated_kill_error` turns into `Unkillable` for an elevated wrapper.
+///
+/// Mutant: the `ACCESS_DENIED` arm of `terminate_unreaped` converts with `.into()`, so the code is
+/// `0x80070005` and the kind is not `PermissionDenied`.
+#[skuld::test]
+fn a_denied_terminate_of_an_unwaitable_handle_carries_its_win32_code() {
+    use super::proc_source::terminate_unreaped;
+    use windows::Win32::Foundation::{
+        CloseHandle, DuplicateHandle, DUPLICATE_HANDLE_OPTIONS, ERROR_ACCESS_DENIED, HANDLE,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    // A handle to this very process with only QUERY_LIMITED: no TERMINATE, no SYNCHRONIZE.
+    let mut limited = HANDLE::default();
+    // SAFETY: duplicating this process's pseudo-handle into this process; `limited` is a valid
+    // out-parameter.
+    unsafe {
+        let me = GetCurrentProcess();
+        DuplicateHandle(
+            me,
+            me,
+            me,
+            &mut limited,
+            PROCESS_QUERY_LIMITED_INFORMATION.0,
+            false,
+            DUPLICATE_HANDLE_OPTIONS(0),
+        )
+    }
+    .expect("duplicate this process's handle with reduced access");
+    let result = terminate_unreaped(limited);
+    // SAFETY: `limited` is the owned duplicate made above.
+    unsafe { CloseHandle(limited) }.expect("close the duplicate");
+
+    let err = result.expect_err("a handle with no terminate and no synchronize right is a denial");
+    let crate::error::Error::Io(err) = err else {
+        panic!("expected Io, got {err:?}");
+    };
+    assert_eq!(err.raw_os_error(), Some(ERROR_ACCESS_DENIED.0 as i32), "{err:?}");
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err:?}");
+}

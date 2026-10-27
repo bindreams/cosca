@@ -4,7 +4,9 @@
 use std::os::windows::io::AsRawHandle;
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::HANDLE;
+use windows::core::HRESULT;
+use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_HANDLE, ERROR_NOT_ENOUGH_MEMORY, HANDLE};
+use windows::Win32::System::Threading::CreateEventW;
 
 use crate::identity::ProcessId;
 use crate::wait::test_clock::FrozenClockGuard;
@@ -218,4 +220,92 @@ fn block_until_exit_or_cancel_re_arms_past_a_clamped_timeout() {
     child.wait().expect("reap the child after it exits");
     assert!(exited, "a clamped WAIT_TIMEOUT was trusted");
     wait_ms_probe::assert_rearmed_with_fresh_remaining(&arms, 5);
+}
+
+// Win32 codes of failures =====
+//
+// Each site converts a `windows::core::Error` to an `io::Error`. A bare `.into()` keeps the
+// HRESULT (`0x8007xxxx`) where std reports the Win32 code, so each test drives the failing call
+// and asserts the code.
+
+/// An event handle: a real handle that is not a process, so `GetProcessTimes` and
+/// `TerminateProcess` on it fail with `ERROR_INVALID_HANDLE`. The callee under test closes it.
+fn event_handle() -> HANDLE {
+    // SAFETY: creating an unnamed event has no preconditions.
+    unsafe { CreateEventW(None, true, false, None) }.expect("create an event handle")
+}
+
+/// An identity that cannot be read from the held handle is `Unassessable` with the plain Win32
+/// code, for `kill`, `block_until_exit` and `open_verified`, which share `holds_process`.
+///
+/// Mutant: `holds_process` converts with `.into()`, so the source's code is `0x80070006`.
+#[skuld::test]
+fn holds_process_of_an_unreadable_handle_carries_the_win32_code() {
+    let err = super::holds_process(event_handle(), ProcessId::current()).expect_err("an event has no creation time");
+    let crate::error::Error::Unassessable { source, .. } = err else {
+        panic!("expected Unassessable, got {err:?}");
+    };
+    let io = source.expect("the OS error is preserved");
+    assert_eq!(io.raw_os_error(), Some(ERROR_INVALID_HANDLE.0 as i32), "{io:?}");
+}
+
+/// A `TerminateProcess` failure on a process that is not provably dead is `Io` with the plain
+/// Win32 code.
+///
+/// Mutant: `terminate_held` converts with `.into()`, so the code is `0x80070006`.
+#[skuld::test]
+fn terminate_held_failure_carries_the_win32_code() {
+    let err = super::terminate_held(event_handle(), ProcessId::current()).expect_err("an event cannot be terminated");
+    let crate::error::Error::Io(io) = err else {
+        panic!("expected Io, got {err:?}");
+    };
+    assert_eq!(io.raw_os_error(), Some(ERROR_INVALID_HANDLE.0 as i32), "{io:?}");
+}
+
+/// A `CreateEventW` failure is `Io` with the plain Win32 code. The call cannot be made to fail, so
+/// the failure is injected at `owned_event`.
+///
+/// Mutant: `owned_event` converts with `.into()`, so the code is `0x80070008`.
+#[skuld::test]
+fn owned_event_failure_carries_the_win32_code() {
+    let failed = windows::core::Error::from_hresult(HRESULT::from_win32(ERROR_NOT_ENOUGH_MEMORY.0));
+    let err = super::owned_event(Err(failed)).expect_err("the creation failed");
+    let crate::error::Error::Io(io) = err else {
+        panic!("expected Io, got {err:?}");
+    };
+    assert_eq!(io.raw_os_error(), Some(ERROR_NOT_ENOUGH_MEMORY.0 as i32), "{io:?}");
+}
+
+/// `open_verified` on a live process we may not open is `Unassessable` with the plain Win32 code.
+/// Needs the DACL fixture, which creates a Job Object: CI only.
+///
+/// Mutant: the `Opened::Denied` arm of `open_verified` converts with `.into()`, so the code is
+/// `0x80070005`.
+#[skuld::test]
+fn open_verified_of_an_access_denied_live_process_carries_the_win32_code() {
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(open_verified_of_an_access_denied_live_process_carries_the_win32_code),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
+    let io = denied_open_source(&done, |id| crate::wait::backend::open_verified(id).map(|_| ()));
+    assert_eq!(io.raw_os_error(), Some(ERROR_ACCESS_DENIED.0 as i32), "{io:?}");
+}
+
+/// The `Unassessable` source of a refused open of the unkillable fixture, which `call` runs `id`
+/// through. Needs the DACL fixture, which creates a Job Object: CI only.
+fn denied_open_source(
+    done: &crate::test_own_process::Completion,
+    call: impl FnOnce(ProcessId) -> Result<(), crate::error::Error>,
+) -> std::io::Error {
+    let child = crate::identity::windows_fixture::spawn_unkillable(done);
+    let id = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
+        .expect("the owned handle always yields an identity");
+    assert!(child.is_running(), "precondition: the subject must be live");
+    let err = call(id).expect_err("an unopenable live process is not 'gone'");
+    let crate::error::Error::Unassessable { source, .. } = err else {
+        panic!("expected Unassessable, got {err:?}");
+    };
+    source.expect("the OS error is preserved")
 }
