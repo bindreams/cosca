@@ -55,6 +55,11 @@ thread_local! {
     static PROC_HIDDEN_AS: Cell<Option<i32>> = const { Cell::new(None) };
     static PIDFD_INFO_FAILS: Cell<bool> = const { Cell::new(false) };
     static PROBE_DUMPABLE: Cell<bool> = const { Cell::new(false) };
+    static PROBE_CLOSE_RANGE_ALLOWED: Cell<Option<u32>> = const { Cell::new(None) };
+    static PROBE_FD_DIR_FAILS: Cell<bool> = const { Cell::new(false) };
+    static BEFORE_PROBE_PIN: crate::oneshot_hook::OneShotHook<libc::pid_t, Option<i32>> = const { crate::oneshot_hook::OneShotHook::new() };
+    static BEFORE_PROBE_KILL: crate::oneshot_hook::OneShotHook<libc::pid_t, Option<i32>> = const { crate::oneshot_hook::OneShotHook::new() };
+    static PROBE_STEPS: std::cell::RefCell<Vec<ProbeStep>> = const { std::cell::RefCell::new(Vec::new()) };
     static CGROUP_ID_FAILS: Cell<Option<i32>> = const { Cell::new(None) };
     static LIVENESS_READ_FAILS: Cell<Option<i32>> = const { Cell::new(None) };
     static SUBTREE_FAILS: Cell<Option<i32>> = const { Cell::new(None) };
@@ -236,6 +241,105 @@ impl Drop for KeepProbeDumpable {
 
 pub(crate) fn probe_kept_dumpable() -> bool {
     PROBE_DUMPABLE.with(Cell::get)
+}
+
+/// While the guard lives, the placement probe's child forked from this thread finds `close_range`
+/// refused, as on a kernel before 5.9, and closes its other descriptors by a walk of `/proc`.
+pub(crate) fn refuse_probe_close_range() -> RefuseProbeCloseRange {
+    refuse_probe_close_range_after(0)
+}
+
+/// [`refuse_probe_close_range`], once the child's first `allowed` calls have succeeded.
+pub(crate) fn refuse_probe_close_range_after(allowed: u32) -> RefuseProbeCloseRange {
+    PROBE_CLOSE_RANGE_ALLOWED.with(|f| f.set(Some(allowed)));
+    RefuseProbeCloseRange(())
+}
+
+#[must_use = "close_range is allowed again as soon as the guard is dropped"]
+pub(crate) struct RefuseProbeCloseRange(());
+
+impl Drop for RefuseProbeCloseRange {
+    fn drop(&mut self) {
+        PROBE_CLOSE_RANGE_ALLOWED.with(|f| f.set(None));
+    }
+}
+
+/// Whether the forked probe child's next `close_range` is refused, counting it. Read in the child: a
+/// `const` thread-local with no destructor, so async-signal-safe.
+pub(crate) fn probe_close_range_refused() -> bool {
+    PROBE_CLOSE_RANGE_ALLOWED.with(|f| match f.get() {
+        None => false,
+        Some(0) => true,
+        Some(allowed) => {
+            f.set(Some(allowed - 1));
+            false
+        }
+    })
+}
+
+/// While the guard lives, the placement probe's child forked from this thread cannot open its
+/// `/proc/self/fd`, as under a seccomp filter that refuses `openat2`.
+pub(crate) fn fail_probe_fd_dir() -> FailProbeFdDir {
+    PROBE_FD_DIR_FAILS.with(|f| f.set(true));
+    FailProbeFdDir(())
+}
+
+#[must_use = "the directory opens again as soon as the guard is dropped"]
+pub(crate) struct FailProbeFdDir(());
+
+impl Drop for FailProbeFdDir {
+    fn drop(&mut self) {
+        PROBE_FD_DIR_FAILS.with(|f| f.set(false));
+    }
+}
+
+/// Read in the forked probe child: a `const` thread-local with no destructor, so async-signal-safe.
+pub(crate) fn probe_fd_dir_fails() -> bool {
+    PROBE_FD_DIR_FAILS.with(Cell::get)
+}
+
+/// A hook given the probe child's pid; `Some(errno)` makes the guarded syscall fail with it.
+pub(crate) type ProbeHook = crate::oneshot_hook::Armed<libc::pid_t, Option<i32>>;
+
+/// Run `hook` once, in the next placement probe forked from this thread, after the fork and before
+/// the child is pinned by a pidfd. `Some(errno)`: the `pidfd_open` fails with it and is not made.
+pub(crate) fn set_before_probe_pin(hook: impl FnOnce(libc::pid_t) -> Option<i32> + 'static) -> ProbeHook {
+    crate::oneshot_hook::arm_with(&BEFORE_PROBE_PIN, hook)
+}
+
+/// Run `hook` once, in the next placement probe forked from this thread, right before its child is
+/// killed (through its pidfd, or by its number). `Some(errno)`: the kill fails with it and is not made.
+pub(crate) fn set_before_probe_kill(hook: impl FnOnce(libc::pid_t) -> Option<i32> + 'static) -> ProbeHook {
+    crate::oneshot_hook::arm_with(&BEFORE_PROBE_KILL, hook)
+}
+
+/// A step of a placement probe's end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProbeStep {
+    /// A kill of the child (signal number), recorded once the syscall or its seam answered.
+    Kill(crate::send_log::Via, i32),
+    /// The child's reap and how it ended.
+    Reap(crate::send_log::Via, super::reach::ProbeEnd),
+}
+
+/// Notes a step of a placement probe's end on this thread.
+pub(crate) fn record_probe_step(step: ProbeStep) {
+    PROBE_STEPS.with(|s| s.borrow_mut().push(step));
+}
+
+/// The steps of the placement probes' ends on this thread since the last call.
+pub(crate) fn take_probe_steps() -> Vec<ProbeStep> {
+    PROBE_STEPS.with(|s| std::mem::take(&mut *s.borrow_mut()))
+}
+
+/// Runs the [`set_before_probe_kill`] hook, if armed: the errno the kill fails with.
+pub(crate) fn run_before_probe_kill(pid: libc::pid_t) -> Option<i32> {
+    crate::oneshot_hook::fire_with(&BEFORE_PROBE_KILL, pid).flatten()
+}
+
+/// Runs the [`set_before_probe_pin`] hook, if armed: the errno the `pidfd_open` fails with.
+pub(crate) fn run_before_probe_pin(pid: libc::pid_t) -> Option<i32> {
+    crate::oneshot_hook::fire_with(&BEFORE_PROBE_PIN, pid).flatten()
 }
 
 /// Run `hook` once, right before the next `cgroup.kill` write on this thread; the guard clears it.

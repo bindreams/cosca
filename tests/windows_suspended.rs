@@ -139,6 +139,9 @@ fn contained_frozen_child_dies_with_its_parent(mode: &str, backend: &str) {
 
     assert_eq!(report_field(&report, "containment"), "JobObject", "{backend}: {report}");
     assert_eq!(report_field(&report, "job"), "1", "{backend}: {report}");
+    // The frozen child never runs, so only the job's kill on close can end it. Without the flag the
+    // wait below would never return: fail on the flag instead.
+    assert_eq!(report_field(&report, "kill_on_close"), "1", "{backend}: {report}");
     let pid: u32 = report_field(&report, "pid").parse().expect("the frozen child's pid");
     // The helper holds the frozen child until the go byte, so this pid cannot be anyone else's.
     let watch = Watch::open(pid);

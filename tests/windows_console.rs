@@ -209,6 +209,14 @@ fn tree_graceful_ops_report_no_console_from_a_console_less_caller() {
     );
     assert_eq!(field(&r, "kill_tree"), "Ok", "hard teardown needs no console: {r}");
     assert_eq!(field(&r, "graceful_cleanup"), "Ok", "{r}");
+    // The acker leaves with exit code 1 when killed and 0 when the helper lets go of its socket,
+    // so a `kill_tree` that sends nothing fails here instead of hanging the helper.
+    assert_eq!(field(&r, "acker1_exit"), "1", "kill_tree must kill the root: {r}");
+    assert_eq!(
+        field(&r, "graceful_cleanup_exit"),
+        "1",
+        "the cleanup kill_tree must kill the root: {r}"
+    );
 }
 
 #[cfg(windows)]
@@ -229,6 +237,11 @@ fn tree_graceful_ops_work_from_a_caller_that_has_a_console() {
     );
     assert_eq!(field(&r, "graceful"), "Ok", "{r}");
     assert_eq!(field(&r, "kill_tree"), "Ok", "{r}");
+    assert_eq!(
+        field(&r, "acker1_exit"),
+        "1",
+        "kill_tree must kill the root, not leave it to exit when released: {r}"
+    );
     assert_eq!(
         field(&r, "graceful_cleanup"),
         "Skipped",

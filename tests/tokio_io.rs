@@ -390,15 +390,15 @@ async fn drop_after_wait_still_tears_down_the_tree() {
 
 #[cfg(feature = "tokio")]
 /// `kill_tree()` before `wait()` is how a process-group tree is ended when the root will be waited
-/// on: the group kill happens while the live root still pins its number. The grandchild gives EOF
-/// (or a reset) once killed, so the read proves the teardown with no wait on a signal's delivery.
+/// on: the group kill happens while the live root still pins its number. Both members give EOF (or
+/// a reset) once killed and echo a byte otherwise, so a probe proves the teardown with no wait on a
+/// signal's delivery.
 #[cfg(unix)]
 #[skuld::test]
 async fn async_kill_tree_before_wait_tears_down_the_tree() {
-    use std::io::Read as _;
     let common::AsyncEchoTree {
         mut child,
-        root: _root,
+        mut root,
         mut grand,
         ..
     } = common::spawn_echo_tree_async_configured("spawn-grandchild-echo", |cmd| {
@@ -406,14 +406,12 @@ async fn async_kill_tree_before_wait_tears_down_the_tree() {
     })
     .await;
     child.kill_tree().expect("kill_tree");
+    // The root still holds its socket, so a kill that did not come leaves it alive and the wait
+    // below unbounded: prove both members dead first.
+    common::assert_dead(&mut root, "the root after kill_tree");
+    common::assert_dead(&mut grand, "the grandchild not torn down by kill_tree before wait");
     child.wait().await.expect("wait reaps the killed root");
     drop(child);
-    let mut buf = [0u8; 1];
-    match grand.read(&mut buf) {
-        Ok(0) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
-        other => panic!("grandchild not torn down by kill_tree before wait: {other:?}"),
-    }
 }
 
 #[cfg(feature = "tokio")]
@@ -536,8 +534,8 @@ async fn linux_cgroup_v2_async_kill_tree_then_wait_tree_then_drop_leaves_no_leaf
     common::install_log_capture();
     let common::AsyncEchoTree {
         mut child,
-        root,
-        grand,
+        mut root,
+        mut grand,
         grand_pid,
     } = common::spawn_echo_tree_async(false).await;
     assert_eq!(child.containment(), cosca::Containment::CgroupV2);
@@ -546,6 +544,8 @@ async fn linux_cgroup_v2_async_kill_tree_then_wait_tree_then_drop_leaves_no_leaf
 
     let mark = common::log_mark();
     child.kill_tree().expect("kill_tree");
+    common::assert_dead(&mut root, "the root after kill_tree");
+    common::assert_dead(&mut grand, "the grandchild after kill_tree");
     child.wait().await.expect("reap the root");
     child.wait_tree().await.expect("wait_tree");
     drop(child);
@@ -569,10 +569,11 @@ async fn linux_cgroup_v2_async_kill_tree_then_wait_tree_then_drop_leaves_no_leaf
 /// root cannot be reaped here, because tokio owns the root's children's parent).
 ///
 /// The drop waits for the leaf to drain, so the leaf is gone.
+///
+/// Mutant: the drop's `cgroup.kill` write is a no-op.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn linux_cgroup_v2_async_drop_alone_kills_the_members_and_removes_the_leaf(#[fixture(cgroup)] _group: &Group) {
-    use std::io::Read as _;
     use std::os::unix::process::ExitStatusExt as _;
 
     common::install_log_capture();
@@ -616,14 +617,8 @@ async fn linux_cgroup_v2_async_drop_alone_kills_the_members_and_removes_the_leaf
         Some(libc::SIGKILL),
         "the drop must kill the leaf's members"
     );
-    for (who, s) in [("root", &mut root), ("grandchild", &mut grand)] {
-        let mut buf = [0u8; 1];
-        match s.read(&mut buf) {
-            Ok(0) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
-            other => panic!("{who} not torn down on drop: {other:?}"),
-        }
-    }
+    common::assert_dead(&mut root, "the root not torn down on drop");
+    common::assert_dead(&mut grand, "the grandchild not torn down on drop");
     assert_leaf_removed(&leaf);
 }
 

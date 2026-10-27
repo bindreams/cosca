@@ -804,6 +804,7 @@ fn spawn_contained_tree() -> (cosca::Child, std::net::TcpStream) {
     let addr = listener.local_addr().unwrap().to_string();
     let mut cmd = Command::new();
     cmd.env(common::ACK_ENV, "1");
+    cmd.env(common::ECHO_HELD_ENV, "1");
     cmd.executable(testbin())
         .args(["cosca_testbin", "spawn-grandchild", &addr]);
     cmd.contain();
@@ -945,12 +946,10 @@ fn unix_kill_tree_reaps_the_grandchild() {
     child.kill_tree().expect("kill_tree");
     let _ = child.wait(); // reap the root
 
-    // Deterministic proof the grandchild died: its control socket EOFs (the OS
-    // closed it on the process's death). A blocking read returns 0 — no timer,
-    // no immediate-is_alive race against the async group teardown.
-    let mut buf = [0u8; 1];
-    let n = gc_stream.read(&mut buf).expect("read grandchild control socket");
-    assert_eq!(n, 0, "kill_tree must kill the grandchild, not just the root");
+    // Deterministic proof the grandchild died: its control socket gives EOF (the OS closed it on
+    // the process's death) and a live grandchild would echo. No timer, no immediate-is_alive race
+    // against the async group teardown.
+    common::assert_dead(&mut gc_stream, "the grandchild after kill_tree");
 }
 
 /// The echo grandchild has no SIGTERM handler, so the default action kills it, and a fatal signal
@@ -987,23 +986,18 @@ fn unix_terminate_tree_reaps_the_grandchild() {
 #[cfg(windows)]
 #[skuld::test]
 fn windows_kill_tree_reaps_the_grandchild() {
-    let (child, mut gc_stream) = spawn_contained_tree();
+    let (child, gc_stream) = spawn_contained_tree();
     assert_eq!(child.containment(), cosca::Containment::JobObject);
+    let grand = common::Member::new(
+        gc_stream,
+        common::last_reported_grandchild().expect("the grandchild's pid"),
+    );
 
     child.kill_tree().expect("kill_tree");
+    // `TerminateJobObject` only starts the termination: the proof is the grandchild's exit event
+    // and its kill exit code, with its socket released so a missing kill ends the wait too.
+    common::assert_members_killed(vec![(grand, "the grandchild")]);
     let _ = child.wait(); // reap the root
-
-    // Deterministic proof: the grandchild's control socket closes on its death.
-    // On Windows, TerminateJobObject causes the TCP socket to close with a
-    // ConnectionReset (WSAECONNRESET/10054) rather than a graceful EOF — both
-    // prove the grandchild is dead. Accept either: n==0 (EOF) or ConnectionReset.
-    let mut buf = [0u8; 1];
-    match gc_stream.read(&mut buf) {
-        Ok(0) => {}                                                     // graceful EOF — grandchild exited
-        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {} // forceful kill — also proof of death
-        Ok(n) => panic!("expected EOF/ConnectionReset after kill_tree, got {n} bytes"),
-        Err(e) => panic!("unexpected error reading grandchild control socket: {e}"),
-    }
 }
 
 /// `terminate_tree` under JobObject containment reaps the whole tree. The
@@ -1041,9 +1035,6 @@ fn windows_child_is_inside_our_job_after_spawn() {
     // test_job_handle_contains_self() is cfg(all(windows,test)) — confirms the job we hold.
     let in_job = child.test_job_handle_contains_self();
     assert!(in_job, "child must be inside our job object after spawn");
-
-    child.kill_tree().expect("kill_tree");
-    let _ = child.wait();
 }
 
 /// `detach()` must NOT kill the tree: `KILL_ON_JOB_CLOSE` has to be cleared before the job
@@ -1102,6 +1093,7 @@ fn spawn_session_tree() -> (cosca::Child, std::net::TcpStream) {
     let addr = listener.local_addr().unwrap().to_string();
     let mut cmd = Command::new();
     cmd.env(common::ACK_ENV, "1");
+    cmd.env(common::ECHO_HELD_ENV, "1");
     cmd.executable(testbin())
         .args(["cosca_testbin", "spawn-grandchild", &addr]);
     cmd.contain_with(cosca::ContainMode::Session);
@@ -1139,9 +1131,7 @@ fn unix_session_containment_reports_session() {
     let _ = child.wait();
 
     // Deterministic proof: grandchild's control socket EOFs on its death.
-    let mut buf = [0u8; 1];
-    let n = gc_stream.read(&mut buf).expect("read grandchild control socket");
-    assert_eq!(n, 0, "session kill_tree must kill the grandchild, not just the root");
+    common::assert_dead(&mut gc_stream, "the grandchild after a session kill_tree");
 }
 
 /// Prove that `ContainMode::Session` actually calls `setsid`: the child must
@@ -1205,6 +1195,7 @@ fn spawn_treewalk_tree() -> (cosca::Child, std::net::TcpStream, std::net::TcpStr
     let addr = listener.local_addr().unwrap().to_string();
     let mut cmd = Command::new();
     cmd.env(common::ACK_ENV, "1");
+    cmd.env(common::ECHO_HELD_ENV, "1");
     cmd.executable(testbin())
         .args(["cosca_testbin", "spawn-grandchild", &addr]);
     cmd.contain_with(cosca::ContainMode::TreeWalk);
@@ -1237,9 +1228,14 @@ fn spawn_treewalk_tree() -> (cosca::Child, std::net::TcpStream, std::net::TcpStr
 #[cfg(any(unix, windows))]
 #[skuld::test]
 fn treewalk_kill_tree_reaps_the_grandchild() {
-    // Hold `_root_stream` for the whole test: it keeps the root alive so TreeWalk
+    // Hold `root_stream` until the kill: it keeps the root alive so TreeWalk
     // enumerates the grandchild as a live descendant (not a reparented orphan).
-    let (child, mut gc_stream, _root_stream) = spawn_treewalk_tree();
+    let (child, gc_stream, root_stream) = spawn_treewalk_tree();
+    let grand = common::Member::new(
+        gc_stream,
+        common::last_reported_grandchild().expect("the grandchild's pid"),
+    );
+    let root = common::Member::new(root_stream, child.id().pid());
     let expected = if cfg!(target_os = "macos") {
         cosca::Containment::FdMarker
     } else {
@@ -1248,18 +1244,10 @@ fn treewalk_kill_tree_reaps_the_grandchild() {
     assert_eq!(child.containment(), expected);
 
     child.kill_tree().expect("kill_tree");
+    // The root still holds its socket, so a kill that did not come would leave it alive: prove
+    // both members dead before the wait that only their death ends.
+    common::assert_members_killed(vec![(root, "the root"), (grand, "the grandchild")]);
     let _ = child.wait(); // reap the root
-
-    // Deterministic proof: the grandchild's control socket closes on its death.
-    // Accept graceful EOF (n==0) or, on Windows, a ConnectionReset — both prove
-    // the grandchild is dead. (See windows_kill_tree_reaps_the_grandchild.)
-    let mut buf = [0u8; 1];
-    match gc_stream.read(&mut buf) {
-        Ok(0) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
-        Ok(n) => panic!("expected EOF/ConnectionReset after kill_tree, got {n} bytes"),
-        Err(e) => panic!("unexpected error reading grandchild control socket: {e}"),
-    }
 }
 
 /// `terminate_tree` under TreeWalk reaps the whole tree. Unix: TreeWalk's
@@ -1308,6 +1296,7 @@ fn treewalk_kills_process_group_escapee() {
     let addr = listener.local_addr().unwrap().to_string();
     let mut cmd = Command::new();
     cmd.env(common::ACK_ENV, "1");
+    cmd.env(common::ECHO_HELD_ENV, "1");
     cmd.executable(testbin())
         .args(["cosca_testbin", "spawn-grandchild-escapee", &addr]);
     cmd.contain_with(cosca::ContainMode::TreeWalk);
@@ -1339,16 +1328,14 @@ fn treewalk_kills_process_group_escapee() {
     let mut gc_stream = gc.expect("grandchild connected");
     // Hold the root's socket open so the escapee root stays alive until kill_tree;
     // otherwise it exits, the grandchild is reparented, and TreeWalk can't reach it.
-    let _root_stream = root.expect("root connected");
+    let mut root_stream = root.expect("root connected");
 
     child.kill_tree().expect("kill_tree");
+    // The escapee left its process group; only identity-based teardown reaches it and its
+    // grandchild. A kill that did not come would leave the root alive, which no wait here could end.
+    common::assert_dead(&mut root_stream, "the escapee root after kill_tree");
+    common::assert_dead(&mut gc_stream, "the grandchild after kill_tree");
     let _ = child.wait();
-
-    // The escapee left its process group; only identity-based teardown reaches
-    // it and its grandchild. EOF proves the grandchild died.
-    let mut buf = [0u8; 1];
-    let n = gc_stream.read(&mut buf).expect("read grandchild control socket");
-    assert_eq!(n, 0, "TreeWalk must kill a setsid-escapee tree, not just the root");
 }
 
 /// Drop kills the whole contained tree. Mirrors `drop_kills_and_reaps_the_child`
@@ -1405,9 +1392,7 @@ fn linux_cgroup_v2_kill_tree_reaps_the_grandchild(#[fixture(cgroup)] _group: &Gr
     let _ = child.wait(); // reap the root
 
     // Deterministic proof: the grandchild's control socket EOFs on its death.
-    let mut buf = [0u8; 1];
-    let n = gc_stream.read(&mut buf).expect("read grandchild control socket");
-    assert_eq!(n, 0, "cgroup.kill must kill the grandchild, not just the root");
+    common::assert_dead(&mut gc_stream, "the grandchild after cgroup.kill");
 }
 
 /// `terminate_tree` under cgroup v2 containment: `CgroupLeaf::terminate` SIGTERMs every member of
@@ -1470,8 +1455,8 @@ fn linux_cgroup_v2_kill_on_drop_false_removes_the_leaf_of_a_drained_tree(#[fixtu
     stderr_log::install();
     let EchoTree {
         child,
-        root,
-        grand,
+        mut root,
+        mut grand,
         grand_pid,
     } = spawn_contained_echo_tree(false);
     assert_eq!(child.containment(), cosca::Containment::CgroupV2);
@@ -1479,6 +1464,8 @@ fn linux_cgroup_v2_kill_on_drop_false_removes_the_leaf_of_a_drained_tree(#[fixtu
     let _leaf_cleanup = common::cgroup::LeafGuard::new(leaf.clone());
 
     child.kill_tree().expect("kill_tree");
+    common::assert_dead(&mut root, "the root after kill_tree");
+    common::assert_dead(&mut grand, "the grandchild after kill_tree");
     let _ = child.wait();
     child.wait_tree().expect("wait_tree");
     drop(child);
@@ -1499,7 +1486,8 @@ fn linux_cgroup_v2_kill_on_drop_false_removes_the_leaf_of_a_drained_tree(#[fixtu
 ///
 /// Unlike `linux_cgroup_v2_kill_on_drop_false_removes_the_leaf_of_a_drained_tree`, this test does
 /// NOT call `wait_tree()` before dropping: an explicit wait would force the drain itself and mask
-/// exactly the race under test. `drop(child)` follows `kill_tree()` directly.
+/// exactly the race under test. Between `kill_tree()` and `drop(child)` it only probes that both
+/// members are dead; the probes return a little before the kernel finishes the drain.
 ///
 /// This is a real-kernel regression check, not the deterministic proof of the fix: the leaf being
 /// gone when `drop` returns is also what the pre-fix single, unwaited `rmdir` would produce if the
@@ -1514,8 +1502,8 @@ fn linux_cgroup_v2_kill_on_drop_false_kill_tree_still_waits_for_the_leaf_to_drai
     common::install_log_capture();
     let EchoTree {
         child,
-        root,
-        grand,
+        mut root,
+        mut grand,
         grand_pid,
     } = spawn_contained_echo_tree(false);
     assert_eq!(child.containment(), cosca::Containment::CgroupV2);
@@ -1524,6 +1512,8 @@ fn linux_cgroup_v2_kill_on_drop_false_kill_tree_still_waits_for_the_leaf_to_drai
 
     let mark = common::log_mark();
     child.kill_tree().expect("kill_tree");
+    common::assert_dead(&mut root, "the root after kill_tree");
+    common::assert_dead(&mut grand, "the grandchild after kill_tree");
     let _ = child.wait(); // reap the root
     drop(child); // no wait_tree(): Drop alone must wait for the drain before its rmdir
 
@@ -1719,9 +1709,10 @@ fn linux_cgroup_v2_keeps_the_worker_of_a_root_that_already_exited(#[fixture(cgro
         }
     };
     child.wait().expect("reap the root");
-    let mut buf = [0u8; 1];
-    let n = worker.read(&mut buf).expect("read the worker's control socket");
-    assert_eq!(n, 0, "cgroup.kill must reach the worker the exited root left behind");
+    common::assert_dead(
+        worker.get_mut(),
+        "the worker the exited root left behind, after cgroup.kill",
+    );
 
     // The worker is dead, so the leaf drains and the watcher ends; `Drop` then removes the leaf.
     watcher.join().expect("the drain watcher");
@@ -2016,10 +2007,10 @@ fn spawn_with_slots_closed(done: &common::test_own_process::Completion, slots: &
     assert_eq!(&echo, b"x");
 
     child.kill_tree().expect("kill_tree");
+    // The root waits for the worker, so a kill that did not come leaves both alive and the reap
+    // below unbounded: prove the worker dead first.
+    common::assert_dead(worker.get_mut(), "the worker after cgroup.kill");
     child.wait().expect("reap the root");
-    let mut buf = [0u8; 1];
-    let n = worker.read(&mut buf).expect("read the worker's control socket");
-    assert_eq!(n, 0, "cgroup.kill must kill the worker");
 
     // The leaf is removed with the child: nothing is left behind once its members have exited.
     let own_dir = std::path::Path::new("/sys/fs/cgroup").join(own.trim_start_matches('/'));
@@ -2059,8 +2050,7 @@ fn linux_cgroup_v2_a_live_child_holds_no_cgroup_procs_fd_in_the_supervisor(#[fix
 
     child.kill_tree().expect("kill_tree");
     let _ = child.wait();
-    let mut buf = [0u8; 1];
-    assert_eq!(gc_stream.read(&mut buf).expect("read the grandchild's socket"), 0);
+    common::assert_dead(&mut gc_stream, "the grandchild after kill_tree");
 }
 
 // The process-global-state guards =====

@@ -69,11 +69,12 @@ impl Job {
 
     /// Terminate every process still in the job, then close the handle.
     ///
-    /// Idempotent: calling this (or dropping the `Job`) again is a no-op. A subsequent
-    /// [`wait_tree`](Job::wait_tree) call cannot confirm the tree has actually finished exiting —
-    /// `TerminateJobObject`/`CloseHandle` are not documented as synchronous with member process
-    /// teardown, and once this closes the handle there is nothing left to watch. Call
-    /// [`wait_tree`](Job::wait_tree) *before* `kill_tree` if the caller needs the drain outcome.
+    /// Idempotent: calling this (or dropping the `Job`) again is a no-op. The kernel documents that
+    /// termination of every member is initiated before `TerminateJobObject`/`CloseHandle` returns,
+    /// not that their teardown has finished. A subsequent [`wait_tree`](Job::wait_tree) call cannot
+    /// confirm the tree has finished exiting: once this closes the handle there is nothing left to
+    /// watch. Call [`wait_tree`](Job::wait_tree) *before* `kill_tree` if the caller needs the drain
+    /// outcome.
     pub fn kill_tree(&self) -> Result<(), Error> {
         self.0.hard_kill().map_err(Error::Io)
     }
