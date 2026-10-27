@@ -143,16 +143,6 @@ fn a_refused_pidfd_open_during_graceful_shutdown_names_the_step_that_hit_it() {
     }
 }
 
-/// The `SIGTERM`s the tree walk sent by number: `root` first, and exactly one more, to the
-/// grandchild of a [`foreign::blocked_tree`].
-fn assert_tree_sigtermed(sends: &Capture, root: u32) {
-    let sent = sends.by_identity();
-    assert!(
-        sent.len() == 2 && sent.iter().all(|&(_, signo)| signo == libc::SIGTERM) && sent[0].0 == root,
-        "the walk must SIGTERM the root {root}, then its one descendant, got {sent:?}"
-    );
-}
-
 // `terminate_tree` sends `SIGTERM` to the root and to its descendant. The send record is asserted
 // before anything waits, so a call that sent nothing fails there, and nothing is released that
 // could race the signal.
@@ -160,36 +150,30 @@ fn assert_tree_sigtermed(sends: &Capture, root: u32) {
 // Mutants: `terminate_tree` sends nothing; sends another signal; stops at the root.
 #[skuld::test]
 fn foreign_terminate_tree_sigterms_the_root_and_its_descendant() {
-    let (mut child, stdout) = foreign::blocked_tree();
-    let p = crate::Process::from_pid(child.id()).found().expect("resolves");
+    let tree = foreign::blocked_tree();
+    let p = crate::Process::from_pid(tree.root.id()).found().expect("resolves");
     let sends = Capture::start();
     p.terminate_tree().expect("terminate_tree");
-    assert_tree_sigtermed(&sends, child.id());
-    let status = child.wait().expect("reap the root");
-    assert_eq!(status.signal(), Some(libc::SIGTERM), "got {status:?}");
-    foreign::assert_tree_gone(stdout);
+    foreign::assert_tree_sigtermed(&sends, tree.root.id(), tree.grandchild);
+    tree.assert_died_of_sigterm();
 }
 
 // The graceful path of the tree shutdown: the walk's `SIGTERM`s are asserted at `AfterTerminate`,
-// inside the call, so a `terminate_tree` that sent nothing fails there at once instead of leaving
-// the call to wait out its 30 s grace. The root then leaves to the soft signal, not to the sweep.
+// inside the call, so the root must leave to the soft signal, not to the sweep.
 //
 // Mutants: `terminate_tree` sends nothing; `graceful_shutdown_tree` skips it.
 #[skuld::test]
 fn foreign_graceful_shutdown_tree_graceful_path() {
-    let (mut child, stdout) = foreign::blocked_tree();
-    let root = child.id();
+    let tree = foreign::blocked_tree();
+    let (root, grandchild) = (tree.root.id(), tree.grandchild);
     let p = crate::Process::from_pid(root).found().expect("resolves");
-    let sends = std::rc::Rc::new(Capture::start());
-    let _armed = at(HookPoint::AfterTerminate, {
-        let sends = sends.clone();
-        move || assert_tree_sigtermed(&sends, root)
+    let sends = Capture::start();
+    let _armed = at(HookPoint::AfterTerminate, move || {
+        foreign::assert_tree_sigtermed(&sends, root, grandchild)
     });
     p.graceful_shutdown_tree(Duration::from_secs(30))
         .expect("graceful_shutdown_tree");
-    let status = child.wait().expect("reap the root");
-    assert_eq!(status.signal(), Some(libc::SIGTERM), "got {status:?}");
-    foreign::assert_tree_gone(stdout);
+    tree.assert_died_of_sigterm();
 }
 
 // The graceful path of the lone shutdown: a blocker dies to `SIGTERM`'s default disposition within
