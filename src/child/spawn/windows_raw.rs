@@ -95,7 +95,7 @@ use crate::child::spawn::{
 };
 use crate::child::Child;
 use crate::command::{Command, CommandInput, EnvOp, ExecutableSpec};
-use crate::error::{ChildFate, Error};
+use crate::error::{win32_io_error, ChildFate, Error};
 use crate::stdio::{Fd, ResolvedStdio};
 
 /// Spawn `cmd` via raw `CreateProcessW`. Handles descriptors 0/1/2 plus arbitrary fd >= 3 (wired
@@ -608,7 +608,8 @@ pub(crate) fn startup_info(
 /// Mark `h` inheritable (`bInheritHandles` + the HANDLE_LIST require it).
 fn set_inherit(h: HANDLE) -> Result<(), Error> {
     // SAFETY: `h` is a live child-end handle we own; SetHandleInformation only toggles its flags.
-    unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT) }.map_err(|e| Error::Io(e.into()))
+    unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT) }
+        .map_err(|e| Error::Io(win32_io_error(e)))
 }
 
 pub(crate) fn to_wide_nul(s: &OsStr) -> Vec<u16> {
@@ -705,6 +706,41 @@ pub(crate) fn raw_program_and_line(cmd: &Command) -> Result<Vec<u16>, Error> {
     }
 }
 
+/// Initialize `buf` as a `PROC_THREAD_ATTRIBUTE_LIST` of one attribute. A `buf` smaller than the
+/// sizing call reported fails with the plain Win32 code.
+fn initialize_attribute_list(buf: &mut [u8]) -> Result<LPPROC_THREAD_ATTRIBUTE_LIST, Error> {
+    let mut size = buf.len();
+    let list = LPPROC_THREAD_ATTRIBUTE_LIST(buf.as_mut_ptr().cast());
+    // SAFETY: `buf` is `size` bytes; the call fails rather than write past a buffer it finds too small.
+    unsafe { InitializeProcThreadAttributeList(Some(list), 1, None, &mut size) }
+        .map_err(|e| Error::Io(win32_io_error(e)))?;
+    Ok(list)
+}
+
+/// Put the HANDLE_LIST attribute for `handles` into the initialized `list`. On failure `list` is
+/// deleted and the error has the plain Win32 code.
+fn add_handle_list_or_delete(list: LPPROC_THREAD_ATTRIBUTE_LIST, handles: &[HANDLE]) -> Result<(), Error> {
+    // SAFETY: `list` is initialized; the HANDLE_LIST attribute takes an array of `handles.len()`
+    // HANDLEs by pointer (not copied), which the caller keeps alive until the list is deleted.
+    let update = unsafe {
+        UpdateProcThreadAttribute(
+            list,
+            0,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+            Some(handles.as_ptr().cast()),
+            std::mem::size_of_val(handles),
+            None,
+            None,
+        )
+    };
+    if let Err(e) = update {
+        // SAFETY: `list` was initialized by the caller; delete it before its buffer drops.
+        unsafe { DeleteProcThreadAttributeList(list) };
+        return Err(Error::Io(win32_io_error(e)));
+    }
+    Ok(())
+}
+
 /// RAII owner of a `PROC_THREAD_ATTRIBUTE_LIST` carrying a HANDLE_LIST. Deletes the list on drop.
 /// The slice passed to [`AttributeList::build`] must outlive the list (per
 /// `UpdateProcThreadAttribute`): callers keep it alive across both `CreateProcessW` and this drop. `pub(crate)`: the async raw
@@ -721,28 +757,8 @@ impl AttributeList {
         // SAFETY: the null-list form is the documented way to query the buffer size.
         _ = unsafe { InitializeProcThreadAttributeList(None, 1, None, &mut size) };
         let mut buf: Vec<u8> = vec![0u8; size];
-        let list = LPPROC_THREAD_ATTRIBUTE_LIST(buf.as_mut_ptr().cast());
-        // SAFETY: `buf` is `size` bytes, matching the queried requirement; count = 1 (one attribute).
-        unsafe { InitializeProcThreadAttributeList(Some(list), 1, None, &mut size) }
-            .map_err(|e| Error::Io(e.into()))?;
-        // SAFETY: `list` is initialized; the HANDLE_LIST attribute takes an array of `handles.len()`
-        // HANDLEs by pointer (not copied), which the caller keeps alive until this list is deleted.
-        let update = unsafe {
-            UpdateProcThreadAttribute(
-                list,
-                0,
-                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
-                Some(handles.as_ptr().cast()),
-                std::mem::size_of_val(handles),
-                None,
-                None,
-            )
-        };
-        if let Err(e) = update {
-            // SAFETY: `list` was initialized above; delete it before `buf` drops.
-            unsafe { DeleteProcThreadAttributeList(list) };
-            return Err(Error::Io(e.into()));
-        }
+        let list = initialize_attribute_list(&mut buf)?;
+        add_handle_list_or_delete(list, handles)?;
         Ok(AttributeList { _buf: buf, list })
     }
 

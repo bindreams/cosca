@@ -238,3 +238,24 @@ async fn async_raw_refusals_before_create_process_did_not_start() {
         assert!(variant(&err), "{what}: not the refusal's own error: {err:?}");
     }
 }
+
+/// A failed `TerminateProcess` reports the plain Win32 code. An event handle is a real handle that
+/// is not a process, so the kill fails with `ERROR_INVALID_HANDLE`.
+///
+/// Mutant: the final arm of `RawAsyncChild::start_kill` converts with `.into()`, so the code is
+/// `0x80070006`.
+#[skuld::test]
+fn a_failed_start_kill_is_reported_as_its_win32_code() {
+    use crate::tokio::spawn::windows_raw::RawAsyncChild;
+    let event = crate::wait::backend::new_cancel_event().expect("create an event");
+    let child = RawAsyncChild::new(event, 0);
+    let err = child.start_kill().expect_err("an event cannot be terminated");
+    let crate::error::Error::Io(err) = err else {
+        panic!("expected Io, got {err:?}");
+    };
+    assert_eq!(
+        err.raw_os_error(),
+        Some(windows::Win32::Foundation::ERROR_INVALID_HANDLE.0 as i32),
+        "{err:?}"
+    );
+}

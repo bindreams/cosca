@@ -683,6 +683,8 @@ fn raw_spawn_with_invalid_parent_std_handles_gives_the_child_null() {
 mod test_harness;
 
 fn main() {
+    #[cfg(windows)]
+    common::install_log_capture();
     let mut runner = skuld::TestRunner::new();
     runner.libtest_names();
     runner.require_known_labels();

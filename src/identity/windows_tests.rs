@@ -134,13 +134,7 @@ fn kill_of_an_access_denied_live_process_is_an_error() {
         panic!("a denial must not read as an I/O failure: {err:?}");
     };
     let io = source.expect("the OS error is preserved");
-    // `From<windows::core::Error> for io::Error` stores the HRESULT, not the bare Win32
-    // code, so compare against the wrapped form — `Some(5)` would never match.
-    assert_eq!(
-        io.raw_os_error(),
-        Some(windows::core::HRESULT::from_win32(ERROR_ACCESS_DENIED.0).0),
-        "{io}"
-    );
+    assert_eq!(io.raw_os_error(), Some(ERROR_ACCESS_DENIED.0 as i32), "{io}");
     assert!(child.is_running(), "and it must still be running — nothing killed it");
 }
 
@@ -163,11 +157,7 @@ fn block_until_exit_of_an_access_denied_live_process_is_an_error() {
         panic!("a denial must not read as an I/O failure: {err:?}");
     };
     let io = source.expect("the OS error is preserved");
-    assert_eq!(
-        io.raw_os_error(),
-        Some(windows::core::HRESULT::from_win32(ERROR_ACCESS_DENIED.0).0),
-        "{io}"
-    );
+    assert_eq!(io.raw_os_error(), Some(ERROR_ACCESS_DENIED.0 as i32), "{io}");
 }
 
 /// The other side of the same branch: `Denied` plus a provably-Dead target must still report

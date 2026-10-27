@@ -338,6 +338,8 @@ async fn async_no_inheritable_handle_outlives_a_failed_raw_spawn() {
 mod test_harness;
 
 fn main() {
+    #[cfg(all(windows, feature = "tokio"))]
+    common::install_log_capture();
     let mut runner = skuld::TestRunner::new();
     runner.libtest_names();
     runner.require_known_labels();

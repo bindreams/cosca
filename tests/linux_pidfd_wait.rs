@@ -255,6 +255,8 @@ fn death_watch_accept_or_die_reader_panics_when_the_tid_reporter_dies_before_con
 mod test_harness;
 
 fn main() {
+    #[cfg(target_os = "linux")]
+    common::install_log_capture();
     let mut runner = skuld::TestRunner::new();
     runner.libtest_names();
     runner.require_known_labels();

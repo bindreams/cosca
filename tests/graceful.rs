@@ -110,6 +110,7 @@ fn child_graceful_shutdown_unsupported_for_an_uncontained_child_on_windows() {
 
 #[skuld::test]
 fn child_graceful_shutdown_tree_tears_down_tree() {
+    let _warns = common::warn_watch();
     use std::io::Read;
     use std::time::Duration;
     // A contained 2-level tree (root R + grandchild G). The group's graceful signal
@@ -131,6 +132,7 @@ fn child_graceful_shutdown_tree_tears_down_tree() {
 #[cfg(unix)]
 #[skuld::test]
 fn child_graceful_shutdown_tree_graceful_root_sigterm() {
+    let _warns = common::warn_watch();
     use std::io::Read;
     use std::os::unix::process::ExitStatusExt;
     use std::time::Duration;
@@ -152,6 +154,7 @@ fn child_graceful_shutdown_tree_graceful_root_sigterm() {
 #[cfg(unix)]
 #[skuld::test]
 fn child_graceful_shutdown_tree_escalates() {
+    let _warns = common::warn_watch();
     use std::io::Read;
     use std::os::unix::process::ExitStatusExt;
     use std::time::Duration;
@@ -173,6 +176,7 @@ fn child_graceful_shutdown_tree_escalates() {
 #[cfg(unix)]
 #[skuld::test]
 fn child_graceful_shutdown_tree_sweeps_survivor_after_graceful_root_exit() {
+    let _warns = common::warn_watch();
     use std::io::Read;
     use std::time::Duration;
     // The exact case the sweep-before-reap invariant protects: the root honors the group
@@ -331,16 +335,18 @@ fn process_soft_tree_unsupported_on_windows() {
 #[cfg(unix)]
 #[skuld::test]
 fn graceful_mechanism_is_process_on_unix() {
+    let _warns = common::warn_watch();
     use cosca::GracefulMechanism;
 
     let (uncontained, _s1) = common::spawn_blocker();
     let (contained, _s2) = common::spawn_control("control-block", &["R"], true);
     assert_eq!(uncontained.graceful_mechanism(), GracefulMechanism::Process);
     assert_eq!(contained.graceful_mechanism(), GracefulMechanism::Process);
-    for child in [uncontained, contained] {
-        child.kill().expect("cleanup");
-        let _ = child.wait();
-    }
+    uncontained.kill().expect("cleanup");
+    let _ = uncontained.wait();
+    // The group, before the reap: a contained child reaped first and then dropped warns (#382).
+    contained.kill_tree().expect("cleanup the group");
+    let _ = contained.wait();
 }
 
 /// On Windows the two must DISAGREE: containment is what sets `CREATE_NEW_PROCESS_GROUP`, so an
@@ -349,6 +355,7 @@ fn graceful_mechanism_is_process_on_unix() {
 #[cfg(windows)]
 #[skuld::test]
 fn graceful_mechanism_distinguishes_contained_from_uncontained_on_windows() {
+    let _warns = common::warn_watch();
     use cosca::GracefulMechanism;
 
     let (uncontained, _s1) = common::spawn_blocker();
@@ -369,6 +376,7 @@ fn graceful_mechanism_distinguishes_contained_from_uncontained_on_windows() {
 #[cfg(windows)]
 #[skuld::test]
 fn child_terminate_delivers_ctrl_break_to_a_contained_root() {
+    let _warns = common::warn_watch();
     use std::io::Read;
 
     use cosca::GracefulMechanism;
@@ -399,6 +407,7 @@ fn child_terminate_delivers_ctrl_break_to_a_contained_root() {
 #[cfg(windows)]
 #[skuld::test]
 fn child_graceful_shutdown_exits_via_ctrl_break_on_windows() {
+    let _warns = common::warn_watch();
     use std::time::Duration;
 
     // The long grace is a failure bound on the child's own exit, never the synchronization.
@@ -418,6 +427,7 @@ fn child_graceful_shutdown_exits_via_ctrl_break_on_windows() {
 #[cfg(windows)]
 #[skuld::test]
 fn child_graceful_shutdown_escalates_when_the_break_is_ignored() {
+    let _warns = common::warn_watch();
     use std::time::Duration;
 
     let (child, _sock) = common::spawn_control("control-block-ignore-break", &["R"], true);
@@ -436,8 +446,10 @@ fn child_graceful_shutdown_escalates_when_the_break_is_ignored() {
 /// platform.
 #[skuld::test]
 fn child_terminate_reports_ok_for_an_already_exited_child() {
+    let _warns = common::warn_watch();
     let (child, _sock) = common::spawn_control("control-block", &["R"], true);
-    child.kill().expect("kill");
+    // `kill_tree`, not `kill`: reaping a contained root first and then dropping it warns (#382).
+    child.kill_tree().expect("kill");
     let _status = child.wait().expect("reap");
     child.terminate().expect("already-dead must be Ok");
 }
@@ -450,6 +462,7 @@ fn child_terminate_reports_ok_for_an_already_exited_child() {
 #[cfg(windows)]
 #[skuld::test]
 fn child_graceful_ops_report_success_for_a_child_that_shares_no_console() {
+    let _warns = common::warn_watch();
     use std::io::Read;
     use std::time::Duration;
 
@@ -492,6 +505,7 @@ fn child_graceful_ops_report_success_for_a_child_that_shares_no_console() {
 #[cfg(windows)]
 #[skuld::test]
 fn child_graceful_shutdown_signals_the_group_but_only_kills_the_child() {
+    let _warns = common::warn_watch();
     use std::io::Read;
     use std::time::Duration;
 
@@ -541,6 +555,7 @@ fn child_graceful_shutdown_signals_the_group_but_only_kills_the_child() {
 #[cfg(windows)]
 #[skuld::test]
 fn nested_delegated_child_can_be_gracefully_terminated() {
+    let _warns = common::warn_watch();
     use std::io::Read;
     use std::net::TcpListener;
 
@@ -589,6 +604,7 @@ fn nested_delegated_child_can_be_gracefully_terminated() {
 mod test_harness;
 
 fn main() {
+    common::install_log_capture();
     let mut runner = skuld::TestRunner::new();
     runner.libtest_names();
     runner.require_known_labels();

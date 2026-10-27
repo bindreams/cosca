@@ -31,6 +31,8 @@ use windows::Win32::System::Threading::{
     PROCESS_SYNCHRONIZE, THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME,
 };
 
+use crate::error::{io_context, win32_io_error};
+
 /// Sentinel: a null pointer means the handle has been consumed or is invalid.
 fn null_ptr() -> *mut c_void {
     std::ptr::null_mut()
@@ -119,7 +121,7 @@ impl JobHandle {
         let Some(job) = self.take() else { return Ok(()) };
         // SAFETY: job is a valid handle we own; Win32 calls are safe.
         unsafe {
-            let terminated = TerminateJobObject(job, 1).map_err(io::Error::from);
+            let terminated = TerminateJobObject(job, 1).map_err(win32_io_error);
             if let Err(e) = CloseHandle(job) {
                 log::warn!("CloseHandle on the job failed ({e}); the handle is leaked");
             }
@@ -322,8 +324,7 @@ pub(crate) fn caller_has_console() -> io::Result<bool> {
 /// probe are both parameters — so every arm is unit-testable without hooking the OS calls the
 /// live path depends on (the same injection idiom as `treewalk::descendants_with`).
 ///
-/// `err` is the `io::Error` converted from `windows::core::Error`, so its `raw_os_error` is
-/// the **HRESULT**, not the bare Win32 code.
+/// `err` carries the bare Win32 code (see [`win32_io_error`]).
 ///
 /// `Error::NoConsole` is returned ONLY when the failure code matches AND the probe confirms
 /// there is no console. A contradicted probe, a failed probe, or any other failure code keeps
@@ -331,7 +332,7 @@ pub(crate) fn caller_has_console() -> io::Result<bool> {
 /// to be false.
 pub(crate) fn classify_ctrl_event_failure(pid: u32, err: io::Error, console: io::Result<bool>) -> crate::error::Error {
     use windows::Win32::Foundation::ERROR_INVALID_HANDLE;
-    let no_console = windows::core::HRESULT::from_win32(ERROR_INVALID_HANDLE.0).0;
+    let no_console = ERROR_INVALID_HANDLE.0 as i32;
     if err.raw_os_error() == Some(no_console) && matches!(console, Ok(true)) {
         // warn, not debug: the crate's core mapping (this code <=> no console) was just
         // contradicted. Either another thread attached a console in the confirmation gap, or
@@ -486,14 +487,24 @@ pub(crate) fn terminate(pid: u32) -> Result<(), crate::error::Error> {
         pid != 0,
         "pid 0 addresses every process attached to the caller's console, including the caller"
     );
-    // SAFETY: standard Win32 call targeting the child's own console group.
-    match unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) } {
+    terminate_with(
+        pid,
+        // SAFETY: standard Win32 call targeting the child's own console group.
+        || unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) },
+        caller_has_console,
+    )
+}
+
+/// [`terminate`] with the OS call `send` and the console probe injected, so a test can make the
+/// call fail with the code the OS reports without detaching the test process from its console.
+fn terminate_with(
+    pid: u32,
+    send: impl FnOnce() -> windows::core::Result<()>,
+    console: impl FnOnce() -> io::Result<bool>,
+) -> Result<(), crate::error::Error> {
+    match send() {
         Ok(()) => Ok(()),
-        Err(e) => Err(classify_ctrl_event_failure(
-            pid,
-            io::Error::from(e),
-            caller_has_console(),
-        )),
+        Err(e) => Err(classify_ctrl_event_failure(pid, win32_io_error(e), console())),
     }
 }
 
@@ -662,36 +673,56 @@ pub(crate) mod fault {
 pub(crate) fn assign_to_kill_on_close_job(proc_handle: std::os::windows::io::RawHandle) -> io::Result<JobHandle> {
     // A Windows `RawHandle` is a `*mut c_void`.
     let raw_handle = HANDLE(proc_handle.cast());
-    // SAFETY: all calls are standard Win32; owned handles are closed on every error path.
-    unsafe {
-        let job = CreateJobObjectW(None, windows::core::PCWSTR::null()).map_err(io::Error::from)?;
+    // SAFETY: a standard Win32 call; its handle is closed on every error path below.
+    let job = owned_job(unsafe { CreateJobObjectW(None, windows::core::PCWSTR::null()) })?;
+    set_kill_on_close_or_close(job)?;
+    assign_or_close(job, raw_handle)?;
+    Ok(JobHandle::new(job))
+}
 
-        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        if let Err(e) = SetInformationJobObject(
+/// The job `CreateJobObjectW` made, or its failure with the plain Win32 code.
+fn owned_job(created: windows::core::Result<HANDLE>) -> io::Result<HANDLE> {
+    created.map_err(win32_io_error)
+}
+
+/// Set `KILL_ON_JOB_CLOSE` on `job`. On failure `job` is closed and the error has the plain Win32
+/// code.
+fn set_kill_on_close_or_close(job: HANDLE) -> io::Result<()> {
+    let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    // SAFETY: `info` is a live local of exactly the size passed.
+    let set = unsafe {
+        SetInformationJobObject(
             job,
             JobObjectExtendedLimitInformation,
             std::ptr::addr_of!(info).cast(),
             size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-        ) {
-            _ = CloseHandle(job);
-            return Err(io::Error::from(e));
-        }
-
-        if let Err(e) = AssignProcessToJobObject(job, raw_handle) {
-            _ = CloseHandle(job);
-            return Err(io::Error::from(e));
-        }
-
-        Ok(JobHandle::new(job))
+        )
+    };
+    if let Err(e) = set {
+        // SAFETY: the caller hands `job` over; nothing else closes it.
+        _ = unsafe { CloseHandle(job) };
+        return Err(win32_io_error(e));
     }
+    Ok(())
+}
+
+/// Assign `process` to `job`. On failure `job` is closed and the error has the plain Win32 code.
+fn assign_or_close(job: HANDLE, process: HANDLE) -> io::Result<()> {
+    // SAFETY: a standard Win32 call on handles the caller keeps open across it.
+    if let Err(e) = unsafe { AssignProcessToJobObject(job, process) } {
+        // SAFETY: the caller hands `job` over; nothing else closes it.
+        _ = unsafe { CloseHandle(job) };
+        return Err(win32_io_error(e));
+    }
+    Ok(())
 }
 
 /// [`assign_to_kill_on_close_job`] as `attach` takes it: the job is assigned and the child is NOT
 /// resumed.
 pub(crate) fn assign_held(proc_handle: std::os::windows::io::RawHandle) -> io::Result<JobHandle> {
     #[cfg(test)]
-    forced(fault::Step::Assign, None).map_err(io::Error::from)?;
+    forced(fault::Step::Assign, None).map_err(win32_io_error)?;
     assign_to_kill_on_close_job(proc_handle)
 }
 
@@ -883,8 +914,89 @@ pub(crate) fn duplicate_job(handle: HANDLE) -> Result<HANDLE, crate::error::Erro
             DUPLICATE_SAME_ACCESS,
         )
     }
-    .map_err(io::Error::from)?;
+    .map_err(win32_io_error)?;
     Ok(dup)
+}
+
+/// Whether the process `OpenProcess` returned as `opened` is a member of `job`: its handle to wait
+/// on if so, `None` if it is not one, and the failure (with the plain Win32 code) if membership
+/// could not be established. The handle is closed unless it is returned.
+fn member_to_watch(opened: windows::core::Result<HANDLE>, job: HANDLE) -> io::Result<Option<HANDLE>> {
+    match opened {
+        // A pid enumerated a moment ago can have exited and had its number reused by the time it
+        // is opened, so membership is re-confirmed against the job rather than assumed. Waiting
+        // on a bystander would either hang the drain (it outlives the tree) or, if it exits
+        // first, report the tree drained while members run.
+        Ok(h) => {
+            use windows::Win32::System::JobObjects::IsProcessInJob;
+            let mut in_job = windows::core::BOOL(0);
+            // SAFETY: both handles are valid for the duration of the call.
+            let confirmed = unsafe { IsProcessInJob(h, Some(job), &mut in_job) };
+            match confirmed {
+                // A member: wait on it.
+                Ok(()) if in_job.as_bool() => Ok(Some(h)),
+                // Openable but not in this job: the pid was recycled between the enumeration and
+                // the open. Filtering it out is the point.
+                Ok(()) => {
+                    // SAFETY: opened by the caller and not stored anywhere.
+                    _ = unsafe { CloseHandle(h) };
+                    Ok(None)
+                }
+                // The query itself failed, so membership is unknown. Recorded like any other
+                // actionable failure rather than silently dropped: if it holds for every member
+                // it would otherwise be invisible.
+                Err(e) => {
+                    // SAFETY: opened by the caller and not stored anywhere.
+                    _ = unsafe { CloseHandle(h) };
+                    Err(win32_io_error(e))
+                }
+            }
+        }
+        // ERROR_INVALID_PARAMETER: the pid no longer names a process: it exited in the race
+        // between the enumeration and the open. That is real progress (this round's tree is
+        // shrinking), not a failure: loop back to re-enumerate rather than treating it as denied.
+        Err(e) if e.code() == windows::Win32::Foundation::ERROR_INVALID_PARAMETER.to_hresult() => Ok(None),
+        Err(e) => Err(win32_io_error(e)),
+    }
+}
+
+/// The Toolhelp thread snapshot `CreateToolhelp32Snapshot` made, or its failure with the plain
+/// Win32 code.
+fn thread_snapshot(created: windows::core::Result<HANDLE>) -> io::Result<HANDLE> {
+    created.map_err(win32_io_error)
+}
+
+/// Every entry of the thread snapshot `snap`, which is closed on every path. A failure of the
+/// snapshot API has the plain Win32 code; the end of the walk is not one.
+fn thread_entries_closing(
+    snap: HANDLE,
+) -> io::Result<Vec<windows::Win32::System::Diagnostics::ToolHelp::THREADENTRY32>> {
+    use windows::Win32::Foundation::ERROR_NO_MORE_FILES;
+    use windows::Win32::System::Diagnostics::ToolHelp::{Thread32First, Thread32Next, THREADENTRY32};
+
+    // Thread32First/Next signal end-of-enumeration with ERROR_NO_MORE_FILES.
+    let end_of_walk = windows::core::HRESULT::from_win32(ERROR_NO_MORE_FILES.0);
+    let mut entry = THREADENTRY32 {
+        dwSize: size_of::<THREADENTRY32>() as u32,
+        ..Default::default()
+    };
+    let mut entries = Vec::new();
+    // SAFETY: `snap` is a handle the caller hands over; `entry` has its `dwSize` set.
+    let mut step = unsafe { Thread32First(snap, &mut entry) };
+    let walked = loop {
+        match step {
+            Ok(()) => {}
+            Err(e) if e.code() == end_of_walk => break Ok(entries),
+            // A snapshot-API fault, not normal end-of-iteration.
+            Err(e) => break Err(win32_io_error(e)),
+        }
+        entries.push(entry);
+        // SAFETY: as for `Thread32First`.
+        step = unsafe { Thread32Next(snap, &mut entry) };
+    };
+    // SAFETY: handed over by the caller; closed once, here.
+    _ = unsafe { CloseHandle(snap) };
+    walked
 }
 
 /// The loop body of [`JobHandle::wait_drained`], taking an already-resolved raw handle rather
@@ -936,49 +1048,18 @@ pub(crate) fn wait_drained_raw(
         let mut handles: Vec<HANDLE> = Vec::new();
         let mut denied: Option<io::Error> = None;
         for pid in pids.iter().take(budget) {
-            // SAFETY: standard Win32 call; the handle is closed below on every path.
-            // `PROCESS_QUERY_LIMITED_INFORMATION` is required by `IsProcessInJob` below and is
-            // NOT implied by `PROCESS_SYNCHRONIZE`; without it every membership check fails
+            // SAFETY: standard Win32 call; the handle is closed by `member_to_watch` unless it is
+            // returned. `PROCESS_QUERY_LIMITED_INFORMATION` is required by `IsProcessInJob` there
+            // and is NOT implied by `PROCESS_SYNCHRONIZE`; without it every membership check fails
             // ACCESS_DENIED, `handles` stays empty forever, and this loop spins instead of
             // ever reaching `WaitForMultipleObjects`. (`job_contains_pid` opens for the same
             // reason.) `LIMITED` rather than full query: it is the least right that works and
             // is grantable across integrity levels.
-            match unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, false, *pid) } {
-                // A pid enumerated a moment ago can have exited and had its number reused by
-                // the time it is opened, so membership is re-confirmed against the job rather
-                // than assumed. Waiting on a bystander would either hang the drain (it outlives
-                // the tree) or, if it exits first, report the tree drained while members run.
-                Ok(h) => {
-                    use windows::Win32::System::JobObjects::IsProcessInJob;
-                    let mut in_job = windows::core::BOOL(0);
-                    // SAFETY: both handles are valid for the duration of the call.
-                    let confirmed = unsafe { IsProcessInJob(h, Some(job), &mut in_job) };
-                    match confirmed {
-                        // A member: wait on it.
-                        Ok(()) if in_job.as_bool() => handles.push(h),
-                        // Openable but not in this job — the pid was recycled between the
-                        // enumeration and the open. Filtering it out is the point.
-                        Ok(()) => unsafe {
-                            _ = CloseHandle(h);
-                        },
-                        // The query itself failed, so membership is unknown. Recorded like any
-                        // other actionable failure rather than silently dropped: if it holds
-                        // for every member it would otherwise be invisible.
-                        Err(e) => {
-                            denied = Some(io::Error::from(e));
-                            // SAFETY: opened just above and not stored anywhere.
-                            unsafe {
-                                _ = CloseHandle(h);
-                            }
-                        }
-                    }
-                }
-                // ERROR_INVALID_PARAMETER: the pid no longer names a process — it exited in
-                // the race between the enumeration above and this open. That is real
-                // progress (this round's tree is shrinking), not a failure: loop back to
-                // re-enumerate rather than treating it as denied.
-                Err(e) if e.code() == windows::Win32::Foundation::ERROR_INVALID_PARAMETER.to_hresult() => {}
-                Err(e) => denied = Some(io::Error::from(e)),
+            let opened = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, false, *pid) };
+            match member_to_watch(opened, job) {
+                Ok(Some(h)) => handles.push(h),
+                Ok(None) => {}
+                Err(e) => denied = Some(e),
             }
         }
 
@@ -1142,10 +1223,21 @@ impl Walk {
         self.last_err.get_or_insert_with(|| io::Error::other(msg));
     }
 
+    /// Record a failure that is cosca's own finding about a thread. No OS call failed, so the error
+    /// has no OS code.
     fn fail(&mut self, call: &str, tid: u32, process_pid: u32, cause: impl std::fmt::Display) -> Visit {
         let msg = format!("{call} failed for thread {tid} of pid {process_pid}: {cause}");
         log::warn!("resume_initial_threads: {msg}");
         self.last_err.get_or_insert_with(|| io::Error::other(msg));
+        Visit::Failed
+    }
+
+    /// Record the failure of the Win32 call `call`, keeping its code as the error's source.
+    fn fail_win32(&mut self, call: &str, tid: u32, process_pid: u32, cause: windows::core::Error) -> Visit {
+        let context = format!("{call} failed for thread {tid} of pid {process_pid}");
+        let err = io_context(context, win32_io_error(cause));
+        log::warn!("resume_initial_threads: {err}");
+        self.last_err.get_or_insert(err);
         Visit::Failed
     }
 }
@@ -1248,7 +1340,7 @@ fn resume_if_owned(tid: u32, process_pid: u32, walk: &mut Walk) -> Visit {
             ));
             return Visit::Denied;
         }
-        Err(e) => return walk.fail("OpenThread(query)", tid, process_pid, e),
+        Err(e) => return walk.fail_win32("OpenThread(query)", tid, process_pid, e),
     };
 
     match owner_of(&query) {
@@ -1257,12 +1349,12 @@ fn resume_if_owned(tid: u32, process_pid: u32, walk: &mut Walk) -> Visit {
             walk.skip(format!("thread {tid} now belongs to pid {owner}"));
             return Visit::Foreign { owner };
         }
-        Err(e) => return walk.fail("GetProcessIdOfThread", tid, process_pid, e),
+        Err(e) => return walk.fail_win32("GetProcessIdOfThread", tid, process_pid, e),
     }
 
     let resume = match open_for_resume(tid) {
         Ok(h) => h,
-        Err(e) => return walk.fail("OpenThread(suspend/resume)", tid, process_pid, e),
+        Err(e) => return walk.fail_win32("OpenThread(suspend/resume)", tid, process_pid, e),
     };
     match owner_of(&resume) {
         Ok(again) if again == process_pid => {}
@@ -1274,7 +1366,7 @@ fn resume_if_owned(tid: u32, process_pid: u32, walk: &mut Walk) -> Visit {
                 format_args!("opened a thread of pid {again}, not the thread just checked"),
             )
         }
-        Err(e) => return walk.fail("GetProcessIdOfThread", tid, process_pid, e),
+        Err(e) => return walk.fail_win32("GetProcessIdOfThread", tid, process_pid, e),
     }
 
     match resume_thread(&resume) {
@@ -1303,7 +1395,7 @@ fn resume_if_owned(tid: u32, process_pid: u32, walk: &mut Walk) -> Visit {
                 }
             ),
         ),
-        Err(e) => walk.fail("ResumeThread", tid, process_pid, e),
+        Err(e) => walk.fail_win32("ResumeThread", tid, process_pid, e),
     }
 }
 
@@ -1370,7 +1462,7 @@ fn initial_thread_id(process_pid: u32, tids: &[u32], walk: &mut Walk) -> Option<
                 "thread {tid} is gone, is not pid {process_pid}'s, or cannot be opened by the child's creator"
             )),
             Err((call, e)) => {
-                walk.fail(call, tid, process_pid, e);
+                walk.fail_win32(call, tid, process_pid, e);
                 return None;
             }
         }
@@ -1417,7 +1509,8 @@ fn earliest_created(times: impl IntoIterator<Item = (u64, u32)>) -> Earliest {
     }
 }
 
-/// The pid of the process at `raw_handle`, or an error naming `GetProcessId`.
+/// The pid of the process at `raw_handle`, or an error naming `GetProcessId` that keeps its Win32
+/// code as its source.
 ///
 /// `GetProcessId` answers 0 on failure, and a walk filtered to owner 0 would match the System
 /// Idle process instead of the child.
@@ -1425,10 +1518,10 @@ fn process_pid_of(raw_handle: HANDLE) -> io::Result<u32> {
     // SAFETY: `GetProcessId` only reads the handle; an invalid one is reported as 0.
     let pid = unsafe { GetProcessId(raw_handle) };
     if pid == 0 {
-        let cause = io::Error::last_os_error();
-        return Err(io::Error::other(format!(
-            "GetProcessId failed on the child's handle: {cause}"
-        )));
+        return Err(io_context(
+            "GetProcessId failed on the child's handle",
+            io::Error::last_os_error(),
+        ));
     }
     Ok(pid)
 }
@@ -1484,15 +1577,10 @@ pub(crate) fn resume_initial_threads(
     proc_handle: std::os::windows::io::RawHandle,
     expected: SuspendCount,
 ) -> io::Result<()> {
-    use windows::Win32::Foundation::ERROR_NO_MORE_FILES;
-    use windows::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
-    };
+    use windows::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD};
 
     let raw_handle = HANDLE(proc_handle.cast());
 
-    // Thread32First/Next signal end-of-enumeration with ERROR_NO_MORE_FILES.
-    let end_of_walk = windows::core::HRESULT::from_win32(ERROR_NO_MORE_FILES.0);
     let mut walk = Walk {
         expected,
         ..Walk::default()
@@ -1507,28 +1595,8 @@ pub(crate) fn resume_initial_threads(
 
     // SAFETY: snapshot/iterate with an owned handle, closed before return.
     unsafe {
-        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0).map_err(io::Error::from)?;
-        let mut entry = THREADENTRY32 {
-            dwSize: size_of::<THREADENTRY32>() as u32,
-            ..Default::default()
-        };
-
-        let mut entries = Vec::new();
-        let mut step = Thread32First(snap, &mut entry);
-        loop {
-            match step {
-                Ok(()) => {}
-                Err(e) if e.code() == end_of_walk => break,
-                Err(e) => {
-                    // A snapshot-API fault, not normal end-of-iteration.
-                    _ = CloseHandle(snap);
-                    return Err(io::Error::from(e));
-                }
-            }
-            entries.push(entry);
-            step = Thread32Next(snap, &mut entry);
-        }
-        _ = CloseHandle(snap);
+        let snap = thread_snapshot(CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0))?;
+        let entries = thread_entries_closing(snap)?;
 
         if walk.expected == SuspendCount::ExactlyOne {
             // Only the initial thread is resumed. The others are opened query-only, to read their
@@ -1551,7 +1619,7 @@ pub(crate) fn resume_initial_threads(
     // Test-only: the injected entry goes through the same owner filter as a real one.
     #[cfg(test)]
     if let Some((tid, owner)) = fault::injected_entry() {
-        let entry = THREADENTRY32 {
+        let entry = windows::Win32::System::Diagnostics::ToolHelp::THREADENTRY32 {
             th32OwnerProcessID: owner.unwrap_or(process_pid),
             th32ThreadID: tid,
             ..Default::default()

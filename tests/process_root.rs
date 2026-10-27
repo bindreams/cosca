@@ -290,6 +290,7 @@ mod test_harness;
 skuld::default_labels!(test_harness::ROOT);
 
 fn main() {
+    common::install_log_capture();
     #[cfg(unix)]
     {
         let inherited = std::env::var_os(ENV_TARGET_PID).map(|v| v.to_string_lossy().into_owned());
