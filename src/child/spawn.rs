@@ -372,10 +372,12 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     if to_raw_backend {
         return windows_raw::spawn_raw(cmd, fds, kill_on_drop);
     }
+    #[cfg(unix)]
+    let mut steps = in_child::InChild::default();
     #[cfg(target_os = "linux")]
-    let (mut std_cmd, handshake) = build_std_command_with(cmd, pidfd_handshake::register).not_started()?;
+    let (mut std_cmd, handshake) = build_std_command_with(cmd, &mut steps, pidfd_handshake::register).not_started()?;
     #[cfg(target_os = "macos")]
-    let (mut std_cmd, report) = build_std_command_with(cmd, unique_report::register).not_started()?;
+    let (mut std_cmd, report) = build_std_command_with(cmd, &mut steps, unique_report::register).not_started()?;
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let mut std_cmd = build_std_command(cmd).not_started()?;
 
@@ -420,21 +422,9 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     #[cfg(not(unix))]
     let reserved: Vec<i32> = Vec::new();
 
-    // Phase 1 (before spawn): root detection + pre-spawn containment setup. This
-    // MUST run before the fd_map block below so that fd_map installs
-    // the LAST pre_exec hook. Why ordering matters: pre_exec hooks run in
-    // registration order in the forked child. The Linux cgroup self-placement
-    // hook (registered inside `prepare`) writes "0" to a pre-opened cgroup.procs
-    // fd (CLOEXEC, which is still open between fork and exec). If
-    // fd_map's dup2 ran FIRST, it could dup2 the user's fd over the number
-    // that cgroup.procs fd occupies — closing/replacing it — so the later cgroup
-    // write would hit a closed/wrong fd (silent CgroupV2->ProcessGroup downgrade,
-    // or a stray "0" corrupting the user's fd). By running fd_map LAST, the
-    // cgroup write+close happens while its fd is still valid; fd_map may then
-    // freely reuse the now-closed slot. The same holds for the channel the child
-    // reports that write's outcome through (`cgroup::ReportChannel`). Net child order: std stdio
-    // (0/1/2) -> the `raw_executable()` chdir (`build_std_command`'s `enter_in_child`) ->
-    // containment pre_execs (cgroup placement / setsid) -> fd_map dup2 (last).
+    // Phase 1 (before spawn): root detection + pre-spawn containment setup, whose in-child steps go
+    // into `steps` (order and why: see `in_child`). The hook is registered right before the spawn,
+    // after the fd map's step is added.
     //
     // On macOS, `prepare` also clears FD_CLOEXEC on the marker write end for the forked
     // child only (the supervisor's own copy stays CLOEXEC — see `fdmarker::install`'s doc
@@ -452,6 +442,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             let _guard = spawn_lock();
             let prepared = crate::containment::prepare(
                 &mut std_cmd,
+                &mut steps,
                 &cmd.contain_request(),
                 cmd.flags_request(),
                 &reserved,
@@ -461,13 +452,12 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             .not_started()?;
             let report = report.open(&_guard).not_started()?;
 
-            // On Unix, hand n>=3 child ends to fd_map. This installs a pre_exec hook
-            // that dup2's each OwnedFd to its target number post-fork. It is registered
-            // LAST (after `prepare` above) so its dup2 cannot clobber the cgroup
-            // self-placement fd; std also dup2's 0/1/2 before any pre_exec runs (std
-            // disables posix_spawn when hooks are registered), so our n>=3 mappings never
-            // clobber the std stdio fds either. A duplicate child fd number is unreachable:
-            // child_ends keys come from a BTreeMap, so each child fd number is unique.
+            // On Unix, hand n>=3 child ends to fd_map, whose step dup2's each OwnedFd to its target
+            // number post-fork. The hook runs it last, after every step that may still need a
+            // descriptor it could replace; std also dup2's 0/1/2 before any pre_exec runs (std
+            // disables posix_spawn when hooks are registered), so our n>=3 mappings never clobber the
+            // std stdio fds either. A duplicate child fd number is unreachable: child_ends keys come
+            // from a BTreeMap, so each child fd number is unique.
             let mappings: Vec<fd_map::FdMapping> = child_ends
                 .into_iter()
                 .map(|(fd, owned)| fd_map::FdMapping {
@@ -475,7 +465,8 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
                     child_fd: fd.raw(),
                 })
                 .collect();
-            fd_map::install(&mut std_cmd, mappings).not_started()?;
+            fd_map::install(&mut steps, mappings).not_started()?;
+            steps.register(&mut std_cmd);
 
             #[allow(
                 clippy::disallowed_methods,
@@ -500,6 +491,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     let (mut prepared, child, pidfd) = {
         let prepared = crate::containment::prepare(
             &mut std_cmd,
+            &mut steps,
             &cmd.contain_request(),
             cmd.flags_request(),
             &reserved,
@@ -517,8 +509,9 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         }
 
         let _guard = spawn_lock();
-        // The hook was registered first of all (see `build_std_command_with`), so `fd_map`'s, which
-        // may `dup2` a mapping onto any number, including the channel's, runs after it is done.
+        // The handshake's hook was registered first of all (see `build_std_command_with`), so the fd
+        // map, which may `dup2` a mapping onto any number including the channel's, runs after the
+        // handshake is done.
         let handshake = handshake.open(&_guard).not_started()?;
         let mappings: Vec<fd_map::FdMapping> = child_ends
             .into_iter()
@@ -527,7 +520,8 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
                 child_fd: fd.raw(),
             })
             .collect();
-        fd_map::install(&mut std_cmd, mappings).not_started()?;
+        fd_map::install(&mut steps, mappings).not_started()?;
+        steps.register(&mut std_cmd);
 
         // Classified at the SYSCALL, not around the whole spawn: an access-denied from stdio
         // resolution or the post-spawn attach has nothing to do with a breakaway request.
@@ -1391,6 +1385,9 @@ fn teardown_after_failed_adoption(
 /// Serializes spawns against the process-global inheritable-handle window: on Windows both the std
 /// path and the raw `CreateProcessW` backend must mark child-side handles inheritable, spawn, then
 /// un-mark/close without a concurrent spawn inheriting them. Held across that window on both paths.
+/// It orders cosca's own spawns only: another spawner in the process that passes `bInheritHandles`
+/// TRUE with no handle list is not under it, and can take those handles while they are inheritable
+/// (see the module doc of `child::spawn::windows_raw`).
 /// **Poison-tolerant:** a panic mid-spawn must not wedge every future spawn, so a poisoned lock is
 /// recovered rather than propagated (the guarded data is unit — there is no invariant to protect).
 pub(crate) fn spawn_lock() -> SpawnLockGuard {
@@ -1459,13 +1456,23 @@ pub(crate) fn spawn_lock_held_by_this_thread() -> bool {
 
 #[cfg(any(not(any(target_os = "linux", target_os = "macos")), test))]
 pub(crate) fn build_std_command(cmd: &Command) -> Result<std::process::Command, Error> {
+    #[cfg(unix)]
+    {
+        let mut steps = in_child::InChild::default();
+        let (mut std_cmd, ()) = build_std_command_with(cmd, &mut steps, |_| ())?;
+        steps.register(&mut std_cmd);
+        Ok(std_cmd)
+    }
+    #[cfg(not(unix))]
     build_std_command_with(cmd, |_| ()).map(|(std_cmd, ())| std_cmd)
 }
 
-/// [`build_std_command`], running `first` on the command before any hook of its own is
-/// registered, so a hook `first` registers runs first in the child. Returns what `first` returned.
+/// [`build_std_command`], running `first` on the command before anything else is set on it, so a
+/// hook `first` registers runs first in the child. Returns what `first` returned. On Unix this
+/// registers no hook: the child's own steps go into `steps`, for the caller to register last.
 pub(crate) fn build_std_command_with<R>(
     cmd: &Command,
+    #[cfg(unix)] steps: &mut in_child::InChild,
     first: impl FnOnce(&mut std::process::Command) -> R,
 ) -> Result<(std::process::Command, R), Error> {
     // Program + args via the `quote` model.
@@ -1507,7 +1514,10 @@ pub(crate) fn build_std_command_with<R>(
     apply_env(&mut std_cmd, cmd.env_ops());
     let first = first(&mut std_cmd);
     match cwd {
-        Some(dir) if enter => enter_in_child(&mut std_cmd, &dir)?,
+        #[cfg(unix)]
+        Some(dir) if enter => enter_in_child(steps, &dir)?,
+        #[cfg(not(unix))]
+        Some(_) if enter => unreachable!("only anchor_posix asks the child to enter its directory"),
         Some(dir) => {
             std_cmd.current_dir(dir);
         }
@@ -1529,38 +1539,16 @@ pub(crate) fn build_std_command_with<R>(
 /// documents `pre_exec` hooks as running in the child just before the exec, so the ordering is
 /// pinned. The cost is that a hook rules out `posix_spawn`, for these commands only.
 #[cfg(unix)]
-fn enter_in_child(std_cmd: &mut std::process::Command, dir: &std::path::Path) -> Result<(), Error> {
+fn enter_in_child(steps: &mut in_child::InChild, dir: &std::path::Path) -> Result<(), Error> {
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::process::CommandExt;
     let dir = std::ffi::CString::new(dir.as_os_str().as_bytes()).map_err(|_| {
         Error::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "current_dir() contains an embedded NUL",
         ))
     })?;
-    // SAFETY: `chdir` is async-signal-safe, and `dir` is allocated before the fork and only read
-    // after it.
-    unsafe {
-        std_cmd.pre_exec(move || {
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "this closure runs in the forked child, between fork and exec, so the chdir \
-                          moves that child's cwd and never this process's — see this function's doc"
-            )]
-            let status = libc::chdir(dir.as_ptr());
-            if status == 0 {
-                Ok(())
-            } else {
-                Err(std::io::Error::last_os_error())
-            }
-        });
-    }
+    steps.enter(dir);
     Ok(())
-}
-
-#[cfg(not(unix))]
-fn enter_in_child(_: &mut std::process::Command, _: &std::path::Path) -> Result<(), Error> {
-    unreachable!("only anchor_posix asks the child to enter its directory")
 }
 
 /// The program to load and the directory to run it in.
@@ -3552,10 +3540,15 @@ pub(crate) mod fault {
 mod batch_gate;
 pub(crate) use batch_gate::reject_batch_path;
 
-// cosca-owned fd-mapping pre_exec (replaces `command-fds` — see the module docs).
+// cosca-owned fd mapping (replaces `command-fds` — see the module docs).
 #[cfg(unix)]
 #[path = "spawn/fd_map.rs"]
 pub(crate) mod fd_map;
+
+// The one `pre_exec` hook that runs every in-child step of a spawn.
+#[cfg(unix)]
+#[path = "spawn/in_child.rs"]
+pub(crate) mod in_child;
 
 // The `pre_exec` fd-channel primitive of `pidfd_handshake` and, on macOS, `unique_report`.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
