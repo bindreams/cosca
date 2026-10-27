@@ -38,7 +38,7 @@ mod linux {
     /// Mutant: the send is not recorded, or recorded under another address.
     #[skuld::test]
     fn a_live_child_is_signalled_through_its_pidfd_and_recorded() {
-        let (mut child, _stdin) = spawn();
+        let (mut child, stdin) = spawn();
         let pidfd = pidfd_of(&child);
         let log = Capture::start();
         assert_eq!(
@@ -46,6 +46,8 @@ mod linux {
             Sent::Delivered
         );
         assert_eq!(log.entries(), [(child.id(), Sig::Kill, Via::Pidfd)]);
+        // Released after the kill: a kill that sent nothing exits 0.
+        drop(stdin);
         let status = child.wait().expect("reap");
         assert_eq!(
             std::os::unix::process::ExitStatusExt::signal(&status),

@@ -352,9 +352,10 @@ pub(crate) fn kill(id: ProcessId) -> Result<(), Error> {
             source: None,
         });
     };
+    let sent = nix_kill(Pid::from_raw(target), Signal::SIGKILL);
     #[cfg(test)]
     crate::send_log::record_by_identity(id.pid(), Signal::SIGKILL as i32);
-    match nix_kill(Pid::from_raw(target), Signal::SIGKILL) {
+    match sent {
         Ok(()) => Ok(()),
         Err(nix::errno::Errno::ESRCH) => Ok(()), // exited between re-verify and kill
         Err(e) => Err(Error::Io(e.into())),      // EPERM etc. surfaced, not swallowed
@@ -395,9 +396,10 @@ pub(crate) fn terminate(id: ProcessId) -> Result<(), Error> {
             source: None,
         });
     };
+    let sent = nix_kill(Pid::from_raw(target), Signal::SIGTERM);
     #[cfg(test)]
     crate::send_log::record_by_identity(id.pid(), Signal::SIGTERM as i32);
-    match nix_kill(Pid::from_raw(target), Signal::SIGTERM) {
+    match sent {
         Ok(()) => Ok(()),
         Err(nix::errno::Errno::ESRCH) => Ok(()),
         Err(e) => Err(Error::Io(e.into())),

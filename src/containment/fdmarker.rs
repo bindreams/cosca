@@ -1618,10 +1618,15 @@ impl Marker {
                 true
             }
             MarkerQuery::Held => {
+                use crate::containment::treewalk::KillOutcome;
+                let outcome = crate::containment::treewalk::kill_by_identity(id, signal);
+                // From the outcome, after the call: a kill that re-verified a different process, or
+                // sent nothing, leaves no record of a holder killed.
                 #[cfg(test)]
-                fault::note_holder_kill(id.pid(), signal);
-                crate::containment::treewalk::kill_by_identity(id, signal)
-                    == crate::containment::treewalk::KillOutcome::NotAttempted
+                if outcome == KillOutcome::Terminated {
+                    fault::note_holder_kill(id.pid(), signal);
+                }
+                outcome == KillOutcome::NotAttempted
             }
         }
     }

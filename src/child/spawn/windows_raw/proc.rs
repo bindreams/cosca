@@ -200,7 +200,16 @@ impl RawChild {
         use crate::error::ChildFate;
         // SAFETY: `handle` is our live, owned process handle.
         match unsafe { TerminateProcess(self.handle(), 1) } {
-            Ok(()) => Torn::new(fate_after_reap(true, self.reap())),
+            Ok(()) => {
+                #[cfg(test)]
+                crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterDropKill);
+                let reaped = self.reap();
+                #[cfg(test)]
+                if let Ok(status) = &reaped {
+                    crate::child::spawn::fault::record_teardown_reap(self.pid, *status);
+                }
+                Torn::new(fate_after_reap(true, reaped))
+            }
             Err(e) if e.code() == windows::core::HRESULT::from_win32(ERROR_ACCESS_DENIED.0) => {
                 if self.runas && !self.can_terminate() {
                     Torn {
@@ -212,7 +221,12 @@ impl RawChild {
                     }
                 } else {
                     // The kill was refused: only the wait's result says what became of the child.
-                    Torn::new(fate_after_reap(false, self.reap()))
+                    let reaped = self.reap();
+                    #[cfg(test)]
+                    if let Ok(status) = &reaped {
+                        crate::child::spawn::fault::record_teardown_reap(self.pid, *status);
+                    }
+                    Torn::new(fate_after_reap(false, reaped))
                 }
             }
             Err(e) => Torn {

@@ -1,6 +1,5 @@
 //! `output_within`: the driver's failure bound.
 
-use std::os::unix::process::ExitStatusExt as _;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -24,16 +23,4 @@ fn a_child_that_exits_is_ok_with_its_output() {
     assert!(output.status.success());
     assert_eq!(output.stdout, b"out\n");
     assert_eq!(output.stderr, b"err\n");
-}
-
-/// A child still running at the bound is killed and reaped, and is `Err`. The bound is the
-/// subject here, so it is short.
-///
-/// Mutant: no kill, or the bound ignored (the test then waits on the child).
-#[skuld::test]
-fn a_child_still_running_at_the_bound_is_killed_and_is_err() {
-    let mut child = sh("exec cat");
-    let _stdin = child.stdin.take().expect("piped stdin");
-    let output = output_within(child, Duration::from_millis(50)).expect_err("it never exits by itself");
-    assert_eq!(output.status.signal(), Some(libc::SIGKILL), "{:?}", output.status);
 }

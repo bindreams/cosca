@@ -316,12 +316,12 @@ async fn finish_elevated_with_an_unknown_root_and_a_foreign_reap_during_the_wait
 
     crate::log_capture::install();
     let _recorder = crate::containment::unix::fault::record_kill_group();
-    let (child, _writer) = session_blocker(true);
+    let (child, writer) = session_blocker(true);
     let pid = child.id().pid();
     let mark = crate::log_capture::mark();
     let _failed = force_peeks([failed_peek("forced")]);
     let _reap = crate::child::spawn::fault::set_between_kill_and_wait(move || {
-        super::child_reap_tests::reap_behind_the_owner(pid);
+        super::child_reap_tests::release_then_reap_behind_the_owner(pid, writer);
     });
 
     let err = crate::tokio::spawn::finish_elevated(child, Err(crate::error::Error::Io(std::io::Error::other("w"))))
@@ -348,11 +348,11 @@ async fn finish_elevated_with_an_unknown_root_and_a_foreign_reap_during_the_wait
 async fn finish_elevated_with_a_trusted_root_and_a_foreign_reap_during_the_wait_warns_once() {
     crate::log_capture::install();
     let _recorder = crate::containment::unix::fault::record_kill_group();
-    let (child, _writer) = session_blocker(true);
+    let (child, writer) = session_blocker(true);
     let pid = child.id().pid();
     let mark = crate::log_capture::mark();
     let _reap = crate::child::spawn::fault::set_between_kill_and_wait(move || {
-        super::child_reap_tests::reap_behind_the_owner(pid);
+        super::child_reap_tests::release_then_reap_behind_the_owner(pid, writer);
     });
 
     let err = crate::tokio::spawn::finish_elevated(child, Err(crate::error::Error::Io(std::io::Error::other("w"))))

@@ -7,6 +7,8 @@ use crate::test_child::reaped_elsewhere::{
     assert_one_reaped_elsewhere_warn, assert_one_untrusted_number_warn, reap_behind, warns_since, MAY_STILL_RUN,
     REAPED_ELSEWHERE,
 };
+#[cfg(target_os = "linux")]
+use crate::test_groups::{pidfd_group_signal, Group};
 
 /// A `sleep` in its own session: `Attached::ProcessGroup`, or on macOS an fd marker with a group.
 fn session_sleep() -> crate::tokio::Command {
@@ -404,12 +406,17 @@ async fn tokio_graceful_shutdown_tree_after_own_wait_claims_no_sigterm_it_did_no
 }
 
 /// A backend forgotten because it could not be shown to be ours may still be running: `kill_tree`
-/// treats its root as `Unknown`, never as reaped elsewhere. On macOS that is the identity path: the
-/// marker holders, the root among them, are killed by the pipe they hold.
+/// treats its root as `Unknown`, never as reaped elsewhere. On Linux below 6.9 the root is killed
+/// through the pidfd the handle kept, which names it exactly, and nothing goes by its number. On
+/// macOS that is the identity path: the marker holders, the root among them, are killed by the pipe
+/// they hold.
 ///
-/// Mutant: a backend forgotten unproven reads as `Reaped`.
+/// Mutants: a backend forgotten unproven reads as `Reaped`; it drops its pidfd; it answers a signal
+/// without sending it through its pidfd.
 #[skuld::test]
 async fn tokio_kill_tree_of_a_backend_forgotten_unproven_treats_the_root_as_unknown() {
+    #[cfg(target_os = "linux")]
+    let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let groups = record_kill_group();
@@ -427,6 +434,8 @@ async fn tokio_kill_tree_of_a_backend_forgotten_unproven_treats_the_root_as_unkn
         .forget_as("was forgotten by a test", super::proc_source::Forgotten::Unproven);
 
     let mark = crate::log_capture::mark();
+    #[cfg(target_os = "linux")]
+    let sends = crate::send_log::Capture::start();
     let result = child.kill_tree();
 
     assert_eq!(
@@ -441,8 +450,14 @@ async fn tokio_kill_tree_of_a_backend_forgotten_unproven_treats_the_root_as_unkn
     );
     #[cfg(target_os = "linux")]
     {
+        use crate::test_child::reaped_elsewhere::ROOT_KILLED_BY_PIDFD;
         let err = result.expect_err("a group whose root nothing can answer for is not assessable");
         assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
+        assert_eq!(
+            sends.entries(),
+            [(pid, crate::signal::Sig::Kill, crate::send_log::Via::Pidfd)],
+            "the root alone is killed, through its pidfd"
+        );
         let warns = warns_since(mark);
         assert_eq!(warns.len(), 1, "exactly one warn: {warns:?}");
         assert!(
@@ -453,6 +468,7 @@ async fn tokio_kill_tree_of_a_backend_forgotten_unproven_treats_the_root_as_unkn
             warns[0].contains(&format!("pgid {pid}")),
             "it names the group: {warns:?}"
         );
+        assert!(warns[0].contains(ROOT_KILLED_BY_PIDFD), "{warns:?}");
     }
     #[cfg(target_os = "macos")]
     {
@@ -468,15 +484,21 @@ async fn tokio_kill_tree_of_a_backend_forgotten_unproven_treats_the_root_as_unkn
     reap_behind(pid);
 }
 
-/// `graceful_shutdown_tree` of a backend forgotten because it could not be shown to be ours: the
-/// root is `Unknown`, so the `SIGTERM` would go through its pidfd, but the forgotten backend holds
-/// none. Its handle answers `Sent::Unverified`: nothing is sent, no grace is waited, and the one
-/// warn says the handle no longer reaches the root.
+/// `graceful_shutdown_tree` of a backend forgotten because it could not be shown to be ours, below
+/// 6.9: the root is `Unknown`, so the `SIGTERM` goes through the pidfd the handle kept, and the grace
+/// watches the root's exit through it. A hook after the `SIGTERM` checks it went out, then waits for
+/// the root to exit, so the grace's one look at expiry finds it gone and no kill follows.
 ///
-/// Mutant: a backend forgotten unproven answers a signal as `Sent::Gone`.
+/// Mutants: a backend forgotten unproven answers a signal without sending it through its pidfd; its
+/// grace does not watch the pidfd.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-async fn tokio_graceful_shutdown_tree_of_a_backend_forgotten_unproven_sends_nothing() {
+async fn tokio_graceful_shutdown_tree_of_a_backend_forgotten_unproven_shuts_the_root_down_through_its_pidfd() {
+    use crate::graceful_hooks::{at, HookPoint};
+    use crate::signal::Sig::Term;
+    use crate::test_child::reaped_elsewhere::{reap_behind_status, ROOT_KILLED_BY_PIDFD, ROOT_TERMED_BY_PIDFD};
+    use std::os::unix::process::ExitStatusExt as _;
+    let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let killed = record_kill_group();
@@ -493,23 +515,81 @@ async fn tokio_graceful_shutdown_tree_of_a_backend_forgotten_unproven_sends_noth
         .forget_as("was forgotten by a test", super::proc_source::Forgotten::Unproven);
 
     let mark = crate::log_capture::mark();
-    let sends = crate::send_log::Capture::start();
+    let sends = std::rc::Rc::new(crate::send_log::Capture::start());
+    let exited_first = at(HookPoint::AfterTerminate, {
+        let sends = std::rc::Rc::clone(&sends);
+        move || {
+            assert_eq!(
+                sends.entries(),
+                [(pid, Term, crate::send_log::Via::Pidfd)],
+                "the SIGTERM went out before the grace"
+            );
+            // Released after the SIGTERM, so a SIGTERM that never took effect fails the assertion
+            // on how the root ended below, not the wait here.
+            drop(writer);
+            crate::test_child::wait_until_zombie(pid);
+        }
+    });
     let err = child
-        .graceful_shutdown_tree(std::time::Duration::from_secs(3600))
+        .graceful_shutdown_tree(std::time::Duration::ZERO)
         .await
         .expect_err("a group whose root nothing can answer for is not assessable");
+    drop(exited_first);
 
     assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
-    assert_eq!(sends.entries(), [], "nothing is sent, through the handle or otherwise");
+    assert_eq!(
+        sends.entries(),
+        [(pid, Term, crate::send_log::Via::Pidfd)],
+        "only the SIGTERM, through the pidfd"
+    );
     assert_eq!(killed.killed(), Vec::<i32>::new(), "no killpg by the root's number");
     assert_eq!(termed.termed(), Vec::<i32>::new(), "no SIGTERM by the root's number");
     let warns = warns_since(mark);
     assert_eq!(warns.len(), 1, "exactly one warn: {warns:?}");
     assert!(warns[0].contains(MAY_STILL_RUN), "{warns:?}");
-    assert!(
-        warns[0].contains("sent nothing: the root's handle no longer reaches it"),
-        "{warns:?}"
+    assert!(warns[0].contains(ROOT_TERMED_BY_PIDFD), "{warns:?}");
+    assert!(!warns[0].contains(ROOT_KILLED_BY_PIDFD), "{warns:?}");
+    assert_eq!(
+        reap_behind_status(pid).signal(),
+        Some(libc::SIGTERM),
+        "the SIGTERM ended the root"
     );
+}
+
+/// 6.9+: `graceful_shutdown_tree` of a live root whose backend was forgotten unproven shuts its
+/// group down through the pidfd the handle kept, and does not say the root was reaped elsewhere: the
+/// handle cannot say whether it was reaped, so its status is not collected.
+///
+/// Mutants: an unproven forget drops the pidfd; the answer says the root was reaped elsewhere.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn tokio_graceful_shutdown_tree_of_a_backend_forgotten_unproven_shuts_its_group_down(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+) {
+    crate::tokio::test_runtime::assert_current_thread();
+    let (stdin, writer) = crate::test_child::held_writer_stdin();
+    let mut cmd = crate::tokio::Command::new();
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(stdin).expect("set stdin");
+    cmd.contain_with(crate::ContainMode::Session);
+    let mut child = cmd.spawn().expect("spawn");
+    let pid = child.id().pid();
+    child
+        .proc_mut()
+        .forget_as("was forgotten by a test", super::proc_source::Forgotten::Unproven);
+
+    let capture = crate::send_log::Capture::start();
+    let result = child.graceful_shutdown_tree(std::time::Duration::ZERO).await;
+    let steps = capture.group_steps();
+
+    crate::send_log::assert_group_signalled_first_through_the_pidfd(&steps, libc::SIGTERM);
+    match result {
+        Err(crate::error::Error::Unassessable { detail, source: None }) => {
+            assert!(detail.contains("could not say whether it was reaped"), "{detail}");
+            assert!(!detail.contains(REAPED_ELSEWHERE), "{detail}");
+        }
+        other => panic!("expected the tree down without the root's status, got {other:?}"),
+    }
     drop(writer);
     reap_behind(pid);
 }

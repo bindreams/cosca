@@ -94,12 +94,12 @@ fn kill_terminates_running_child() {
         .stdin(Stdio::pipe())
         .expect("stdin pipe");
     let mut child = cmd.spawn().expect("spawn");
-    let _stdin = child.stdin();
+    let stdin = child.stdin();
 
     child.kill().expect("kill");
-    // On Unix killed-by-signal exit code is None; on Windows it's Some(1) or similar.
-    // Either way the process is gone; we just need wait() to not error.
-    let _ = child.wait().expect("wait after kill");
+    // Close stdin after the kill: `tee-both` exits 0 on EOF, so an unsent kill shows.
+    drop(stdin);
+    common::assert_killed("tee-both", child.wait().expect("wait after kill"));
 }
 
 // Pipe I/O =====
@@ -718,28 +718,6 @@ fn read_errors_on_invalid_utf8() {
 // Drop policy =====
 
 #[skuld::test]
-fn drop_kills_and_reaps_the_child() {
-    let mut cmd = Command::new();
-    // tee-both with a piped (but never-written, never-closed) stdin blocks the
-    // child reading stdin -> it stays alive until we drop the Child.
-    cmd.executable(testbin()).args(["cosca_testbin", "tee-both"]);
-    cmd.stdin(Stdio::pipe()).unwrap();
-    let child = cmd.spawn().expect("spawn");
-    let id = child.id();
-    assert_eq!(
-        id.is_alive(),
-        cosca::identity::Liveness::Alive,
-        "child runs while its stdin stays open"
-    );
-    drop(child); // kill_on_drop default true => SIGKILL/TerminateProcess + reap
-    assert_eq!(
-        id.is_alive(),
-        cosca::identity::Liveness::Dead,
-        "child must be dead (and reaped) after drop"
-    );
-}
-
-#[skuld::test]
 fn detach_leaves_the_child_running() {
     let mut cmd = Command::new();
     cmd.executable(testbin()).args(["cosca_testbin", "tee-both"]);
@@ -998,29 +976,6 @@ fn windows_kill_tree_reaps_the_grandchild() {
     let _ = child.wait(); // reap the root
 }
 
-/// `terminate_tree` under JobObject containment reaps the whole tree. The
-/// JobObject `terminate` path sends CTRL_BREAK to the root's process group; the
-/// grandchild (spawned plainly by the root, not contained itself) shares that
-/// console group and dies too. Proof of death: the grandchild's control socket
-/// EOFs / ConnectionReset — never a timer or an is_alive() race.
-#[cfg(windows)]
-#[skuld::test]
-fn windows_terminate_tree_reaps_the_grandchild() {
-    let (child, mut gc_stream) = spawn_contained_tree();
-    assert_eq!(child.containment(), cosca::Containment::JobObject);
-
-    child.terminate_tree().expect("terminate_tree");
-    let _ = child.wait(); // reap the root
-
-    let mut buf = [0u8; 1];
-    match gc_stream.read(&mut buf) {
-        Ok(0) => {}                                                     // graceful EOF — grandchild exited
-        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {} // forceful — also proof of death
-        Ok(n) => panic!("expected EOF/ConnectionReset after terminate_tree, got {n} bytes"),
-        Err(e) => panic!("unexpected error reading grandchild control socket: {e}"),
-    }
-}
-
 /// Probe that our child is inside OUR job object (not just any job).
 /// Uses the test-only `Child::test_job_handle_contains_self()` accessor so `IsProcessInJob`
 /// asks about the handle we created, not an inherited one.
@@ -1251,16 +1206,20 @@ fn treewalk_kill_tree_reaps_the_grandchild() {
 /// `terminate_tree` under TreeWalk reaps the whole tree. Unix: TreeWalk's
 /// terminate SIGTERMs each genuine identity (root then descendants); the
 /// control-block grandchild has no SIGTERM handler so the default action kills
-/// it. Windows: terminate sends CTRL_BREAK to the root's process group, which
-/// the grandchild shares (it was NOT spawned contained), so it dies too. Proof
-/// of death is the grandchild's control socket EOFing / ConnectionReset — never
-/// a timer or an is_alive() race.
-#[cfg(any(unix, windows))]
+/// it. A live member would echo, so a `terminate_tree` that sent nothing fails by
+/// assertion. The Windows leg, whose break lands asynchronously, is in
+/// `src/child/ctrl_break_tests.rs`.
+#[cfg(unix)]
 #[skuld::test]
 fn treewalk_terminate_tree_reaps_the_grandchild() {
-    // Hold `_root_stream` so the root stays alive through teardown (see
-    // spawn_treewalk_tree): TreeWalk must enumerate a live root's descendants.
-    let (child, mut gc_stream, _root_stream) = spawn_treewalk_tree();
+    // Hold `root_stream` until the signal (see spawn_treewalk_tree): it keeps the root alive so
+    // TreeWalk enumerates a live root's descendants.
+    let (child, gc_stream, root_stream) = spawn_treewalk_tree();
+    let mut grand = common::Member::new(
+        gc_stream,
+        common::last_reported_grandchild().expect("the grandchild's pid"),
+    );
+    let mut root = common::Member::new(root_stream, child.id().pid());
     let expected = if cfg!(target_os = "macos") {
         cosca::Containment::FdMarker
     } else {
@@ -1269,15 +1228,9 @@ fn treewalk_terminate_tree_reaps_the_grandchild() {
     assert_eq!(child.containment(), expected);
 
     child.terminate_tree().expect("terminate_tree");
+    root.assert_dead("the root");
+    grand.assert_dead("the grandchild");
     let _ = child.wait(); // reap the root
-
-    let mut buf = [0u8; 1];
-    match gc_stream.read(&mut buf) {
-        Ok(0) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
-        Ok(n) => panic!("expected EOF/ConnectionReset after terminate_tree, got {n} bytes"),
-        Err(e) => panic!("unexpected error reading grandchild control socket: {e}"),
-    }
 }
 
 /// Prove TreeWalk's distinguishing capability: it kills a child that has

@@ -1,13 +1,14 @@
 //! Test-only record of every signal cosca sends to a process, and how it addressed it.
 //!
-//! A by-pid entry is written immediately BEFORE the syscall, whatever the syscall answers: a
-//! `kill(2)` that fails with `ESRCH` still records, so a test sees an attempt that reached the OS.
-//! A [`GroupStep`] send (to a group, its leader or a member, signal 0 included) is written by
+//! An entry is written immediately AFTER the syscall, whatever the syscall answers: a `kill(2)`
+//! that fails with `ESRCH` still records, so a test sees an attempt that reached the OS. A send
+//! that was skipped leaves no record, so an entry is evidence the call was made, not that the
+//! signal arrived: a test that needs the effect reads the target's status. A [`GroupStep`] send (to
+//! a group, its leader or a member, signal 0 included) is written by
 //! [`send_signal`](crate::containment::unix::send_signal) or
-//! [`probe_signal`](crate::containment::unix::probe_signal) AFTER the syscall returned, whatever it
-//! answers, with the signal number it handed the syscall: a send that was skipped leaves no record.
-//! Where a test seam answers in the kernel's place, no syscall is made, and the step is still
-//! recorded.
+//! [`probe_signal`](crate::containment::unix::probe_signal) after the syscall returned, with the
+//! signal number it handed the syscall. Where a test seam answers in the kernel's place, no syscall
+//! is made, and the step is still recorded.
 
 use std::cell::RefCell;
 
@@ -129,6 +130,13 @@ impl Capture {
 
     pub(crate) fn entries(&self) -> Vec<Entry> {
         LOG.with(|log| log.borrow().clone().expect("a live capture has a log"))
+    }
+
+    /// Whether `sig` was sent to `pid`, by whatever route: the send was made, which a root reaped
+    /// before its status could be read still shows.
+    #[cfg(feature = "tokio")]
+    pub(crate) fn sent(&self, pid: u32, sig: Sig) -> bool {
+        self.entries().iter().any(|&(p, s, _)| p == pid && s == sig)
     }
 }
 
