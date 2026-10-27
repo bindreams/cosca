@@ -12,6 +12,8 @@ use std::net::{TcpListener, TcpStream};
 
 use super::{accept_or_die, ack, fixture_argv};
 
+pub(crate) mod nested;
+
 /// The fully-qualified libtest path of [`fixture_ctrl_break_member`].
 pub(crate) const MEMBER_TEST: &str = "test_child::ctrl_break::fixture_ctrl_break_member";
 
@@ -24,6 +26,9 @@ const TAG_ENV: &str = "COSCA_FIXTURE_CTRL_BREAK_TAG";
 const HANDLER_ENV: &str = "COSCA_FIXTURE_CTRL_BREAK_HANDLER";
 /// Set on a root: the [`Handler`] of the grandchild it starts.
 const GRANDCHILD_ENV: &str = "COSCA_FIXTURE_CTRL_BREAK_GRANDCHILD";
+/// When set, the member leaves its console before it writes its tag, so it shares no console with
+/// the caller although its creation flags say nothing excludes delivery.
+pub(crate) const DETACH_ENV: &str = "COSCA_FIXTURE_CTRL_BREAK_DETACH";
 
 /// How a member answers a console control event.
 #[derive(Clone, Copy)]
@@ -71,12 +76,13 @@ pub(crate) fn member_env(addr: &str, handler: Handler, grandchild: Option<Handle
     env
 }
 
-/// Connects, installs its [`Handler`], writes its tag, and blocks on a read of its socket until the
-/// caller closes it (then exits 0) or something ends it. A root with [`GRANDCHILD_ENV`] set starts
-/// that grandchild after its tag, with no creation flags, so it stays in the root's console process
-/// group, and then writes the grandchild's pid (4 bytes, little-endian). The grandchild connects to
-/// the same address with tag `G`. The root holds the grandchild's process handle while it lives, so
-/// the pid stays the grandchild's.
+/// Connects, installs its [`Handler`] (after leaving its console when [`DETACH_ENV`] is set), writes
+/// its tag, and blocks on a read of its socket until the caller closes it (then exits 0) or
+/// something ends it. A root with [`GRANDCHILD_ENV`] set starts that grandchild after its tag, with
+/// no creation flags, so it stays in the root's console process group, and then writes the
+/// grandchild's pid (4 bytes, little-endian). The grandchild connects to the same address with tag
+/// `G`. The root holds the grandchild's process handle while it lives, so the pid stays the
+/// grandchild's.
 ///
 /// The tag is the readiness edge: the member cannot write it before it runs its own code, which on
 /// Windows is also after the console has registered it and after its handler is installed.
@@ -88,6 +94,10 @@ fn fixture_ctrl_break_member() {
     let addr = addr.into_string().expect("utf8 addr");
     let tag = std::env::var(TAG_ENV).expect("the member's tag");
     let mut sock = ack::connect_control(&addr).expect("connect the control socket");
+    if std::env::var_os(DETACH_ENV).is_some() {
+        // SAFETY: no preconditions; this process holds no console handle it uses afterwards.
+        unsafe { windows::Win32::System::Console::FreeConsole() }.expect("leave the console");
+    }
     match std::env::var(HANDLER_ENV).expect("the member's handler").as_str() {
         "default" => {}
         "ack" => install_ack(&sock),

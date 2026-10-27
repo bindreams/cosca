@@ -936,127 +936,6 @@ fn main() {
             let _ = sock.read(&mut buf); // blocks until the socket closes (our death)
         }
         #[cfg(windows)]
-        "report-nested-terminate" => {
-            use std::fmt::Write as _;
-
-            // This process is itself spawned CONTAINED (so NESTED_ENV is set), which makes the
-            // crate spawn below a nested member: Containment::Delegated, owning no tree teardown
-            // of its own, yet leading its own console process group. Connect FIRST so a panic
-            // anywhere below reaches the test as socket EOF instead of hanging it.
-            let mut report_sock = crate::ack::connect_control(&args[2]).unwrap();
-
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let ack_addr = listener.local_addr().unwrap().to_string();
-            let exe = std::env::current_exe().unwrap();
-            let mut cmd = cosca::Command::new();
-            cmd.executable(&exe)
-                .args(["cosca_testbin", "control-block-ack-break", &ack_addr, "G"])
-                .env(ack::ACK_ENV, "1")
-                .contain();
-            let mut child = cmd.spawn().expect("spawn nested delegated child");
-            // The tag proves the child is alive AND has completed console registration — it is
-            // written after its ctrl handler is installed — before anything is signalled.
-            let mut ack = accept::accept_or_die(&listener, &mut child);
-            let mut t = [0u8; 1];
-            ack.read_exact(&mut t).expect("read ack tag");
-            assert_eq!(&t, b"G", "wrong ack tag");
-
-            let in_our_console = |pid: u32| {
-                let mut buf = vec![0u32; 16];
-                loop {
-                    // SAFETY: standard Win32; `buf` is a valid writable slice.
-                    let n = unsafe { windows::Win32::System::Console::GetConsoleProcessList(&mut buf) } as usize;
-                    if n == 0 {
-                        return None; // no console at all
-                    }
-                    if n <= buf.len() {
-                        return Some(buf[..n].contains(&pid));
-                    }
-                    buf.resize(n, 0);
-                }
-            };
-            let saw_break = |sock: &mut std::net::TcpStream| -> &'static str {
-                let mut b = [0u8; 1];
-                match sock.read(&mut b) {
-                    Ok(1) if &b == b"B" => "1",
-                    Ok(1) => "?",
-                    Ok(_) => "0",
-                    Err(_) => "E",
-                }
-            };
-            let describe = |e: &cosca::error::Error| match e {
-                cosca::error::Error::NoConsole { .. } => "NoConsole".to_string(),
-                cosca::error::Error::Unsupported { .. } => "Unsupported".to_string(),
-                cosca::error::Error::Containment { .. } => "Containment".to_string(),
-                other => format!("Other({})", other.to_string().replace(char::is_whitespace, "_")),
-            };
-
-            let containment = if child.containment() == cosca::Containment::Delegated {
-                "delegated"
-            } else {
-                "other" // anything else fails the assertion, which is the point
-            };
-            let mechanism = match child.graceful_mechanism() {
-                cosca::GracefulMechanism::ConsoleGroup => "console-group",
-                cosca::GracefulMechanism::OtherConsoleGroup => "other-console-group",
-                cosca::GracefulMechanism::Process => "process",
-                _ => "none",
-            };
-            let membership = in_our_console(child.id().pid());
-            let in_console = match membership {
-                Some(true) => "1",
-                Some(false) => "0",
-                None => "?",
-            };
-            // The invariant that did NOT change, pinned in the same report as the one that did:
-            // a nested member owns no tree teardown.
-            let tree = match child.terminate_tree() {
-                Err(cosca::error::Error::Unsupported { .. }) => "Unsupported",
-                _ => "other",
-            };
-            let terminate = match child.terminate() {
-                Ok(()) => "Ok".to_string(),
-                Err(e) => describe(&e),
-            };
-            // The blocking read happens ONLY where delivery is guaranteed; otherwise kill first
-            // and then read, so the read collects EOF or a reset and this mode always reports.
-            // `kill()`, never `kill_tree()`: this child's kill_tree is unconditionally
-            // Unsupported (the `tree` field above), so a kill_tree fallback would error every
-            // time, never perform the read, and leave a live unreaped grandchild behind.
-            let delivered = membership == Some(true) && mechanism == "console-group" && terminate == "Ok";
-            let seen = if delivered {
-                saw_break(&mut ack)
-            } else {
-                match child.kill() {
-                    Ok(()) => saw_break(&mut ack),
-                    Err(_) => "K", // the teardown failed, so delivery was never observable
-                }
-            };
-
-            // Unconditional, so the happy path (where the child is still alive by design) reaps
-            // too rather than relying on the fallback branch having run.
-            let cleanup = match child.kill() {
-                Ok(()) => {
-                    child.wait().expect("reap the nested child");
-                    "Ok".to_string()
-                }
-                // Skip the reap: an unbounded wait on a provably-live child would block forever.
-                // Nothing leaks — this process is itself contained by the test, so the kernel
-                // removes any survivor when that job handle closes.
-                Err(e) => describe(&e),
-            };
-
-            let mut line = String::new();
-            write!(
-                line,
-                "containment={containment} mechanism={mechanism} in_console={in_console} \
-                 terminate={terminate} break={seen} tree={tree} cleanup={cleanup}"
-            )
-            .unwrap();
-            report_sock.write_all(line.as_bytes()).unwrap();
-            report_sock.flush().unwrap();
-        }
-        #[cfg(windows)]
         "report-bare-argv0-cwd-spawn" => {
             // Set OUR OWN cwd to the decoy directory given as argv[2], then attempt — from
             // inside this fully isolated process — the exact vulnerable/fixed spawn shape B2
@@ -1238,12 +1117,9 @@ fn main() {
                 Err(e) => describe(&e),
             };
             let alive_after_terminate = liveness(child.is_alive());
-            // The blocking read happens ONLY where delivery is guaranteed: the child was MEASURED
-            // to be in our console, its mechanism says the flags do not exclude delivery, and the
-            // call reported success. Every other combination defers the read until after the
-            // cleanup kill below, so it collects EOF or a reset and this mode always reports.
-            let delivered = c_in_console == Some(true) && mechanism == "console-group" && terminate == "Ok";
-            let early_break = delivered.then(|| saw_break(&mut ack));
+            // Probes a console-less caller (every test launches this mode `DETACHED_PROCESS`),
+            // where no break can arrive. The read happens after the cleanup kill below and
+            // collects EOF or a reset, so the report is the same whether or not a console exists.
 
             // ZERO grace: the acker survives its break by design, so the escalation is
             // deterministic and its exit code is what proves the forced half ran.
@@ -1260,15 +1136,30 @@ fn main() {
                 Ok(()) => "Ok".to_string(),
                 Err(e) => describe(&e),
             };
-            if cleanup == "Ok" {
-                child.wait().expect("reap the acker");
-            }
             // `K`: the teardown that should have ended the child failed, so delivery was never
             // observable — distinct from an observed non-delivery.
-            let seen = match early_break {
-                Some(seen) => seen,
-                None if cleanup == "Ok" => saw_break(&mut ack),
-                None => "K",
+            //
+            // Released after the kill and before the reap: a released acker exits 0, a killed one
+            // 1, and the report carries the code, so a `kill` that sent nothing fails the test on
+            // `cleanup_exit` instead of hanging the reap on a root that is still held.
+            let (seen, cleanup_exit) = if cleanup == "Ok" {
+                // Half-close: the read below still collects the acker's last word, and a live
+                // acker (no kill sent) gets EOF and leaves instead of blocking it.
+                match ack.shutdown(std::net::Shutdown::Write) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotConnected => {
+                        panic!("releasing the acker's socket failed: {e}")
+                    }
+                    _ => {}
+                }
+                let seen = saw_break(&mut ack);
+                drop(ack);
+                let status = child.wait().expect("reap the acker");
+                (
+                    seen,
+                    status.code().map_or_else(|| "none".to_string(), |c| c.to_string()),
+                )
+            } else {
+                ("K", "none".to_string())
             };
 
             let mut line = String::new();
@@ -1277,7 +1168,7 @@ fn main() {
                 "console={console} c_in_console={} mechanism={mechanism} terminate={terminate} \
                  alive_after_terminate={alive_after_terminate} break={seen} graceful={graceful} \
                  graceful_code={graceful_code} alive_after_graceful={alive_after_graceful} \
-                 cleanup={cleanup}",
+                 cleanup={cleanup} cleanup_exit={cleanup_exit}",
                 three_way(c_in_console),
             )
             .unwrap();
@@ -1455,35 +1346,28 @@ fn main() {
             let c1_in_console = in_our_console(c1.id().pid());
             let terminate = classify(c1.terminate_tree());
             let alive_after_terminate = liveness(c1.is_alive());
-            // The blocking wait for delivery happens ONLY where delivery is guaranteed: the
-            // root was MEASURED to be in our console AND terminate reported success. Every
-            // other combination kills first and collects EOF, so it always reaches the report
-            // and fails as an assertion rather than as a suite hang. The post-kill read/reap
-            // only runs when the kill itself succeeded — on a failed kill the child is still
-            // alive and blocked, so both would block forever and discard the kill error.
+            // Probes a console-less caller (every test launches this mode `DETACHED_PROCESS`),
+            // where no break can arrive. The root is killed first and the read collects EOF or a
+            // reset. The post-kill read/reap only runs when the kill itself succeeded — on a
+            // failed kill the child is still alive and blocked, so both would block forever and
+            // discard the kill error.
             //
             // Sockets are released before each post-kill wait: a released acker exits 0, a killed one
             // 1, and the report carries the code.
-            let (terminate_break, kill_tree) = if c1_in_console && terminate == "Ok" {
-                let seen = saw_break(&mut ack1);
-                (seen, classify(c1.kill_tree()))
-            } else {
-                let killed = classify(c1.kill_tree());
-                let seen = if killed == "Ok" {
-                    // Half-close: the read below still collects the acker's last word, and a
-                    // live acker (no kill sent) gets EOF and leaves instead of blocking it. A
-                    // failure here would leave that acker blocked and the read hung.
-                    match ack1.shutdown(std::net::Shutdown::Write) {
-                        Err(e) if e.kind() != std::io::ErrorKind::NotConnected => {
-                            panic!("releasing the probe root's socket failed: {e}")
-                        }
-                        _ => {}
+            let kill_tree = classify(c1.kill_tree());
+            let terminate_break = if kill_tree == "Ok" {
+                // Half-close: the read below still collects the acker's last word, and a
+                // live acker (no kill sent) gets EOF and leaves instead of blocking it. A
+                // failure here would leave that acker blocked and the read hung.
+                match ack1.shutdown(std::net::Shutdown::Write) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotConnected => {
+                        panic!("releasing the probe root's socket failed: {e}")
                     }
-                    saw_break(&mut ack1)
-                } else {
-                    "K"
-                };
-                (seen, killed)
+                    _ => {}
+                }
+                saw_break(&mut ack1)
+            } else {
+                "K"
             };
             let acker1_exit = if kill_tree == "Ok" {
                 drop(ack1);

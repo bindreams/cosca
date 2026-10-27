@@ -297,11 +297,10 @@ fn remove_leftover_leaf(leaf: Option<std::path::PathBuf>) {
 #[cfg(feature = "tokio")]
 #[skuld::test]
 async fn async_drop_tears_down_a_contained_tree() {
-    use std::io::Read as _;
-    let (child, mut root, mut grand) = common::spawn_grandchild_async(true).await;
+    let (child, root, grand) = common::spawn_released_tree_async().await;
     let leaf = cgroup_leaf_of(&child);
     let _leaf_cleanup = leaf_cleanup(&leaf);
-    // The containment assert guards the EOFs below from passing for unrelated reasons.
+    // The containment assert guards the teardown below from passing for unrelated reasons.
     assert_ne!(
         child.containment(),
         cosca::Containment::None,
@@ -309,16 +308,9 @@ async fn async_drop_tears_down_a_contained_tree() {
     );
     drop(child);
     // No post-drop liveness assertion: the drop waits for the root and a cgroup leaf only, and on
-    // Windows for neither. Each process's death is proven by its own control-socket EOF: a
-    // survivor blocks the read (a CI failure).
-    for (who, s) in [("root", &mut root), ("grandchild", &mut grand)] {
-        let mut buf = [0u8; 1];
-        match s.read(&mut buf) {
-            Ok(0) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
-            other => panic!("{who} not torn down on drop: {other:?}"),
-        }
-    }
+    // Windows for neither. Each member's death is proven by how it ended, and a drop that killed
+    // nothing fails there by assertion, not by a read blocked on the survivor.
+    common::assert_members_torn_down(vec![(root, "the root"), (grand, "the grandchild")]);
     #[cfg(target_os = "linux")]
     if let Some(leaf) = &leaf {
         assert_leaf_removed(leaf);
@@ -362,24 +354,22 @@ async fn linux_cgroup_v2_async_drop_after_wait_still_tears_down_the_tree(#[fixtu
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 async fn drop_after_wait_still_tears_down_the_tree() {
     // After awaiting the root's exit it is already reaped, so the drop has no root to signal and
-    // the tree teardown must come from attached.hard_kill() — proven by the grandchild's EOF.
+    // the tree teardown must come from attached.hard_kill() — proven by how the grandchild ended.
     // The drop stays the killer: `wait_tree` never kills, so waiting on it first would hang.
-    use std::io::{Read as _, Write as _};
     common::install_log_capture();
-    let (mut child, mut root, mut grand) = common::spawn_grandchild_async(true).await;
+    let (mut child, root, grand) = common::spawn_released_tree_async().await;
     let leaf = cgroup_leaf_of(&child);
     let _leaf_cleanup = leaf_cleanup(&leaf);
     let root_id = child.id();
-    root.write_all(b"x").expect("release the root so it exits");
+    // The echoing root leaves only when its socket closes: closing the socket releases it.
+    root.sock
+        .shutdown(std::net::Shutdown::Both)
+        .expect("release the root so it exits");
     child.wait().await.expect("wait reaps the root");
     assert_eq!(root_id.is_alive(), cosca::identity::Liveness::Dead, "root exited");
     drop(child); // root already reaped → nothing to signal; attached.hard_kill must still kill the grandchild
-    let mut buf = [0u8; 1];
-    match grand.read(&mut buf) {
-        Ok(0) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
-        other => panic!("grandchild not torn down by hard_kill after the root was waited: {other:?}"),
-    }
+    drop(root);
+    common::assert_members_torn_down(vec![(grand, "the grandchild, after the root was waited")]);
     #[cfg(target_os = "linux")]
     if let Some(leaf) = &leaf {
         assert_leaf_removed(leaf);
@@ -1191,24 +1181,16 @@ async fn async_fd3_source_merges_into_piped_stdin() {
 #[skuld::test]
 async fn async_windows_contained_spawn_runs_then_job_tears_down() {
     // Verifies the CREATE_SUSPENDED + job-assign + out-of-band resume dance works under tokio.
-    use std::io::Read as _;
-    let (child, mut root, mut grand) = common::spawn_grandchild_async(true).await;
+    let (child, root, grand) = common::spawn_released_tree_async().await;
     assert_eq!(
         child.containment(),
         cosca::Containment::JobObject,
         "Windows Strongest => JobObject"
     );
     drop(child);
-    // As in `async_drop_tears_down_a_contained_tree`: `Drop` does not wait, so the control-socket
-    // EOFs are the real edges.
-    for (who, s) in [("root", &mut root), ("grandchild", &mut grand)] {
-        let mut buf = [0u8; 1];
-        match s.read(&mut buf) {
-            Ok(0) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
-            other => panic!("{who} not torn down: {other:?}"),
-        }
-    }
+    // As in `async_drop_tears_down_a_contained_tree`: `Drop` does not wait, so how each member
+    // ended is the evidence.
+    common::assert_members_torn_down(vec![(root, "the root"), (grand, "the grandchild")]);
 }
 
 // Death-watched accept =====

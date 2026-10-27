@@ -409,44 +409,6 @@ async fn async_child_terminate_reports_ok_for_an_already_exited_child() {
 }
 
 #[cfg(feature = "tokio")]
-/// Async twin of `child_graceful_ops_report_success_for_a_child_that_shares_no_console` — the
-/// same known limitation, pinned on the async surface too.
-#[cfg(windows)]
-#[skuld::test]
-async fn async_child_graceful_ops_report_success_for_a_child_that_shares_no_console() {
-    let _warns = common::warn_watch();
-    use std::time::Duration;
-
-    use cosca::GracefulMechanism;
-
-    let (mut child, mut sock) = common::spawn_gui_control_async(true).await;
-    assert_eq!(
-        child.graceful_mechanism(),
-        GracefulMechanism::ConsoleGroup,
-        "the flags do not exclude delivery — that is exactly what makes this a gap"
-    );
-    assert_eq!(
-        common::in_our_console(child.id().pid()),
-        Some(false),
-        "a GUI-subsystem child is not in our console"
-    );
-    child.terminate().expect("the documented false success");
-    assert_eq!(
-        child.is_alive(),
-        cosca::identity::Liveness::Alive,
-        "nothing was delivered, so the child must still be running"
-    );
-    let status = child
-        .graceful_shutdown(Duration::ZERO)
-        .await
-        .expect("the forced half needs no console");
-    assert_eq!(status.code(), Some(1), "escalation's kill, got {status:?}");
-    let mut buf = [0u8; 1];
-    let _ = sock.read(&mut buf);
-    let _ = child.wait().await;
-}
-
-#[cfg(feature = "tokio")]
 /// The one assertion that catches a future divergence between the two hand-mirrored surfaces:
 /// the async query must report exactly what the sync side pins, for both an uncontained and a
 /// contained child.
