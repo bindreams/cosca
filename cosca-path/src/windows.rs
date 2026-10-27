@@ -11,16 +11,17 @@
 //!
 //! Parsing drops a verbatim `\\?\` prefix: `\\?\C:\x` is stored as `C:\x`, `\\?\UNC\s\h` as
 //! `\\s\h`, and any other verbatim rest as the device path `\\.\` and that rest. Stored text never
-//! starts with `\\?\`. A `.` or `..` in a verbatim rest is a literal name to Win32's file APIs
-//! (`\\?\C:\Windows\..\Windows` is invalid), but parses as [`CurDir`](crate::Component::CurDir) or
-//! [`ParentDir`](crate::Component::ParentDir) here, as in any other spelling.
+//! starts with `\\?\`. A verbatim rest whose plain spelling Win32 would navigate is refused
+//! ([`ParseError::DotOrEmptyNameInVerbatim`]): `\\?\.\x` names `\??\.\x`, but `\\.\.\x` is the
+//! device `x`.
 //!
 //! So the stored text ([`Path::as_os_str`]) is a lexical spelling, not a string to hand Win32.
 //! Win32 reads `\\?\C:\a.` as written but the stored `C:\a.` as `C:\a`, and `\\?\C:\nul` as a
-//! file but `C:\nul` as the NUL device; the stored text also loses a long verbatim path's exemption
-//! from `MAX_PATH`. Nothing here converts a path for Win32 yet: `Path::to_wide` and
-//! `Path::to_std_path` arrive with that conversion, and will hand over the string that names the
-//! same object.
+//! file but `C:\nul` as the NUL device. [`Path::to_wide`] and, on Windows, `Path::to_std_path`
+//! give the string that names what the path names: the stored text where Win32 reads it as
+//! written, else the verbatim string, else the text with a `.` that Win32 drops where a name would
+//! read as a device (`a\nul\.`). [`Path::to_win32_string`] never rewrites: it gives the stored text
+//! or refuses.
 
 use std::borrow::{Borrow, Cow};
 use std::cmp::Ordering;
@@ -32,7 +33,9 @@ use ref_cast::{ref_cast_custom, RefCastCustom};
 
 use crate::{Component, PurePath};
 
+mod convert;
 mod os_str;
+pub use convert::{ConversionError, ConversionReason};
 pub use os_str::{OsStr, OsString};
 
 const VERBATIM: &[u8] = br"\\?\";
@@ -279,6 +282,10 @@ pub enum ParseError {
     /// `\\?\UNC\.\…` or `\\?\UNC\?\…`: without the prefix, a server named `.` or `?` reads as a
     /// device path.
     UnspellableUncServer,
+    /// A `.`, `..` or empty name after `\\?\` (a trailing separator aside) that Win32 would apply
+    /// to the plain spelling: under the prefix it is a name, and no plain spelling keeps it.
+    /// `\\?\C:\a\..\b` names `\??\C:\a\..\b`, but `C:\a\..\b` names `C:\b`.
+    DotOrEmptyNameInVerbatim,
 }
 
 impl fmt::Display for ParseError {
@@ -289,6 +296,9 @@ impl fmt::Display for ParseError {
             }
             ParseError::UnspellableUncServer => {
                 r"a verbatim UNC path (\\?\UNC\) names the server `.` or `?`, which has no plain spelling"
+            }
+            ParseError::DotOrEmptyNameInVerbatim => {
+                r"a verbatim (\\?\) path holds a `.`, `..` or empty name, which has no plain spelling"
             }
         })
     }
@@ -381,6 +391,34 @@ impl Path {
             }
             _ => None,
         }
+    }
+
+    /// The offset of the device name or share that follows a loose root, so the text from there on
+    /// spells the path without what Win32 skips before the name; `None` for any other anchor.
+    fn loose_name_start(&self) -> Option<usize> {
+        let parts = self.parts();
+        parts.loose_root?;
+        match parts.anchor {
+            Anchor::Device { name } | Anchor::Unc { share: name, .. } => Some(parts.head - name.as_wtf8().len()),
+            _ => None,
+        }
+    }
+
+    /// Whether Win32 applies a `.`, `..` or empty name in the text: one it skips before a device
+    /// name or a share, or a component other than the empty one a trailing separator leaves.
+    fn has_navigated_name(&self) -> bool {
+        let skipped = self
+            .parts()
+            .loose_root
+            .is_some_and(|root| self.loose_name_start() != Some(root));
+        let components: Vec<_> = self.components().collect();
+        let last = components.len().saturating_sub(1);
+        skipped
+            || components.iter().enumerate().any(|(i, c)| match c {
+                Component::CurDir | Component::ParentDir => true,
+                Component::Empty => i != last,
+                Component::Normal(_) => false,
+            })
     }
 
     /// Whether appending a relative path needs a `\` first.
@@ -681,8 +719,9 @@ impl PathBuf {
     }
 
     /// Parses `s`, keeping every component as written. A verbatim `\\?\` prefix is dropped (see
-    /// the [module docs](self)); a verbatim rest that holds `/`, or names a UNC server `.` or `?`,
-    /// is refused.
+    /// the [module docs](self)); a verbatim rest that holds `/`, names a UNC server `.` or `?`, or
+    /// holds a `.`, `..` or empty name that Win32 would apply to the plain spelling
+    /// ([`ParseError::DotOrEmptyNameInVerbatim`]) is refused.
     pub fn parse<S: AsRef<OsStr> + ?Sized>(s: &S) -> Result<PathBuf, ParseError> {
         let bytes = s.as_ref().as_wtf8();
         let Some(rest) = bytes.strip_prefix(VERBATIM) else {
@@ -692,18 +731,22 @@ impl PathBuf {
             return Err(ParseError::SlashInVerbatim);
         }
         let is_drive = rest.first() != Some(&b'\\') && drive_len(rest).is_some_and(|len| rest.get(len) == Some(&b'\\'));
-        if is_drive {
-            return Ok(PathBuf::from_wtf8(rest.to_vec()));
-        }
         let unc = (rest.len() >= 4 && rest[..3].eq_ignore_ascii_case(b"UNC") && rest[3] == b'\\').then(|| &rest[4..]);
-        if let Some(unc) = unc {
+        let plain = if is_drive {
+            PathBuf::from_wtf8(rest.to_vec())
+        } else if let Some(unc) = unc {
             let server = &unc[..next_separator(unc, 0)];
             if matches!(server, b"." | b"?") {
                 return Err(ParseError::UnspellableUncServer);
             }
-            return Ok(PathBuf::from_wtf8([br"\\", unc].concat()));
+            PathBuf::from_wtf8([br"\\", unc].concat())
+        } else {
+            PathBuf::from_wtf8([br"\\.\", rest].concat())
+        };
+        if plain.has_navigated_name() {
+            return Err(ParseError::DotOrEmptyNameInVerbatim);
         }
-        Ok(PathBuf::from_wtf8([br"\\.\", rest].concat()))
+        Ok(plain)
     }
 
     /// Parses the path `units` spell, as [`parse`](Self::parse) does.
