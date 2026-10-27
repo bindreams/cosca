@@ -3,18 +3,92 @@
 //! `CgroupLeaf::for_test_at` (real errnos on any Linux host) and `FakeLeaf` (answers `rmdir` as
 //! cgroupfs does).
 
+#[cfg(unix)]
+use crate::child::spawn::fault::{release_between_kill_and_wait, TeardownBlocker};
 use crate::tokio::child::{fault, Child};
 
 /// A real root that only a kill or a closed stdin ends, in no containment. The write end of its
-/// stdin is returned: dropping it lets the root exit.
+/// stdin is returned: dropping it lets the root exit. On Windows the root is `more.com`, which
+/// exits `0` on EOF, where the `findstr x` of `BLOCKER_ARGV` exits `1`, the code a kill gives.
 fn blocker() -> (Child, crate::tokio::ChildStdin) {
     let mut cmd = crate::tokio::Command::new();
+    #[cfg(unix)]
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    #[cfg(windows)]
+    cmd.args([crate::test_child::windows_more()]);
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(crate::Stdio::null()).expect("set stdout");
     let mut child = cmd.spawn().expect("spawn");
     let stdin = child.stdin().expect("piped stdin");
     (child, stdin)
+}
+
+/// Releases the root's stdin once the drop's kill returned; `assert_killed` fails if the root exited
+/// `0`. Keep the guard through the assertion.
+#[cfg(unix)]
+pub(crate) fn released_blocker() -> (Child, TeardownBlocker) {
+    let (child, stdin) = blocker();
+    (child, release_between_kill_and_wait(stdin))
+}
+
+/// What [`released_blocker`] gives on Windows, where the drop waits for nothing and so has no point
+/// to release at. It holds the root's stdin and a handle of its own to the root, opened before the
+/// drop. [`assert_killed`](Self::assert_killed) releases the stdin after the drop returned, then
+/// reads the exit code: `TerminateProcess(_, 1)` set `1` before the drop returned, so a root the
+/// drop left alone exits `0`.
+#[cfg(windows)]
+pub(crate) struct TerminatedBlocker {
+    stdin: std::cell::Cell<Option<crate::tokio::ChildStdin>>,
+    process: std::os::windows::io::OwnedHandle,
+}
+
+#[cfg(windows)]
+impl TerminatedBlocker {
+    /// The root was ended by the drop's `TerminateProcess` (exit code 1), not by its own exit.
+    pub(crate) fn assert_killed(&self) {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+        use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject, INFINITE};
+
+        drop(self.stdin.take());
+        let process = HANDLE(self.process.as_raw_handle());
+        // SAFETY: `process` is a live handle this struct owns, opened with `SYNCHRONIZE`.
+        let waited = unsafe { WaitForSingleObject(process, INFINITE) };
+        assert_eq!(waited, WAIT_OBJECT_0, "wait for the root's exit");
+        let mut code = 0u32;
+        // SAFETY: as above; the handle was opened with `PROCESS_QUERY_LIMITED_INFORMATION`.
+        unsafe { GetExitCodeProcess(process, &mut code) }.expect("read the root's exit code");
+        assert_eq!(
+            code, 1,
+            "the drop must terminate the root (`TerminateProcess` exits 1), not leave it to exit on its own (0)"
+        );
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn released_blocker() -> (Child, TerminatedBlocker) {
+    use std::os::windows::io::{FromRawHandle as _, OwnedHandle};
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE};
+
+    let (child, stdin) = blocker();
+    // SAFETY: opens the live root by its pid; the handle then pins that process.
+    let process = unsafe {
+        OpenProcess(
+            PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+            false,
+            child.id().pid(),
+        )
+    }
+    .expect("open the root");
+    // SAFETY: `OpenProcess` returned a handle nothing else owns.
+    let process = unsafe { OwnedHandle::from_raw_handle(process.0) };
+    (
+        child,
+        TerminatedBlocker {
+            stdin: std::cell::Cell::new(Some(stdin)),
+            process,
+        },
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -23,7 +97,7 @@ use crate::containment::cgroup::test_support::alone;
 use crate::test_child::fixture_path;
 
 #[cfg(target_os = "linux")]
-pub(super) mod linux {
+pub(crate) mod linux {
     use std::os::fd::{AsFd, OwnedFd};
 
     use super::Child;
@@ -56,7 +130,7 @@ pub(super) mod linux {
 
     /// How a root ended.
     #[derive(Debug, PartialEq, Eq)]
-    pub(super) enum Ended {
+    pub(crate) enum Ended {
         Exited(i32),
         Signalled(i32),
         /// Reaped before its stdin closed, by tokio's own `Child` drop (its `try_wait` ran after
@@ -73,10 +147,10 @@ pub(super) mod linux {
     /// this thread never yields to has not run it. That holds only in a process running this one
     /// test (tokio's orphan queue is process-global, and any runtime that parks drains it), so
     /// [`ended_after_closing`](Self::ended_after_closing) requires `alone()`.
-    pub(super) struct Pidfd(OwnedFd);
+    pub(crate) struct Pidfd(OwnedFd);
 
     impl Pidfd {
-        pub(super) fn of(child: &Child) -> Pidfd {
+        pub(crate) fn of(child: &Child) -> Pidfd {
             let pid = rustix::process::Pid::from_raw(child.id().pid() as i32).expect("a positive pid");
             Pidfd(rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()).expect("pidfd_open"))
         }
@@ -99,21 +173,21 @@ pub(super) mod linux {
             }
         }
 
-        /// Close the root's stdin, so a root nothing signalled exits on its own, wait for its
+        /// Drop `release` (the root's stdin writer), so a root nothing signalled exits on its own, wait for its
         /// exit, and say how it ended. A root a drop killed died of `SIGKILL` before its stdin
         /// closed; one nothing killed exits `0`. The drop's own `try_wait` may reap a root that
         /// something already ended, which leaves no status to read: that is
         /// [`Ended::ReapedWhileStdinOpen`].
         /// The read is exact only under `alone()`: nothing else reaps before this thread yields to
         /// a runtime.
-        pub(super) fn ended_after_closing(&self, stdin: crate::tokio::ChildStdin) -> Ended {
+        pub(crate) fn ended_after_closing(&self, release: impl Sized) -> Ended {
             debug_assert!(
                 std::env::var_os("COSCA_TEST_ALONE").is_some(),
                 "`ended_after_closing` is exact only in a process running this test alone (`alone()`): \
                  tokio's orphan queue is process-global"
             );
             let reaped_while_open = self.reaped();
-            drop(stdin);
+            drop(release);
             if reaped_while_open {
                 return Ended::ReapedWhileStdinOpen;
             }
@@ -173,11 +247,12 @@ async fn an_async_drop_starts_no_thread() {
     if !alone(fixture_path!(an_async_drop_starts_no_thread)) {
         return;
     }
-    let (child, _stdin) = blocker();
+    let (child, teardown) = released_blocker();
     let before = thread_ids();
     drop(child);
     let started: Vec<_> = thread_ids().difference(&before).cloned().collect();
     assert!(started.is_empty(), "a drop started threads: {started:?}");
+    teardown.assert_killed();
 }
 
 /// The parent's end of a piped stdout nobody took is closed by the time `drop` returns. Runs alone,
@@ -195,7 +270,7 @@ async fn an_async_drop_closes_the_childs_untaken_stdout() {
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
     let mut child = cmd.spawn().expect("spawn");
-    let _stdin = child.stdin().expect("piped stdin");
+    let teardown = release_between_kill_and_wait(child.stdin().expect("piped stdin"));
     let Some(crate::tokio::child::ProcSource::Tokio { stdout, .. }) = child.os.proc.as_ref() else {
         panic!("a fresh child is a tokio backend");
     };
@@ -210,6 +285,7 @@ async fn an_async_drop_closes_the_childs_untaken_stdout() {
     // SAFETY: as above.
     let after = unsafe { libc::fcntl(stdout, libc::F_GETFD) };
     assert_eq!(after, -1, "the drop must close the child's untaken stdout");
+    teardown.assert_killed();
 }
 
 /// Dropping a live, kill-on-drop root returns, on every platform: its kill bounds the drop's
@@ -220,8 +296,9 @@ async fn an_async_drop_closes_the_childs_untaken_stdout() {
 /// `signal_on_drop`.
 #[skuld::test]
 async fn a_kill_on_drop_drop_of_a_live_blocker_returns() {
-    let (child, _stdin) = blocker();
+    let (child, teardown) = released_blocker();
     drop(child);
+    teardown.assert_killed();
 }
 
 /// `child`, contained by a process group led by its own pid, as a `ProcessGroup` spawn leaves it.
@@ -236,12 +313,13 @@ fn in_its_own_group(mut child: Child) -> Child {
 #[skuld::test]
 async fn a_drop_of_a_live_group_root_kills_its_group() {
     crate::tokio::test_runtime::assert_current_thread();
-    let (child, _stdin) = blocker();
+    let (child, teardown) = released_blocker();
     let child = in_its_own_group(child);
     let pgid = child.id().pid() as i32;
     let killed = crate::containment::unix::fault::record_kill_group();
     drop(child);
     assert_eq!(killed.killed(), [pgid]);
+    teardown.assert_killed();
 }
 
 /// The drop releases the resources once, on the dropping thread: a release handed to another
@@ -252,7 +330,7 @@ async fn a_drop_of_a_live_group_root_kills_its_group() {
 async fn a_drop_releases_its_resources_once_on_the_dropping_thread() {
     let releases = fault::count_releases();
     let backend_drops = fault::count_backend_drops();
-    let (child, _stdin) = blocker();
+    let (child, teardown) = released_blocker();
     assert_eq!(releases.get(), 0, "nothing is released before the drop");
     assert_eq!(backend_drops.get(), 0, "nothing is dropped before the drop");
     drop(child);
@@ -262,6 +340,7 @@ async fn a_drop_releases_its_resources_once_on_the_dropping_thread() {
         1,
         "the drop hands the backend, and tokio's Child with it, its own drop, on this thread"
     );
+    teardown.assert_killed();
 }
 
 /// A root that ignores signals 1-8, 10-18 and 20-64 (`trap '' $(seq 1 8) $(seq 10 18) $(seq 20
@@ -293,25 +372,15 @@ async fn ignoring_blocker() -> (Child, crate::tokio::ChildStdin, crate::tokio::C
 
 /// The drop kills the root itself, and with `SIGKILL`: the root ignores every signal but `SIGKILL`,
 /// `SIGSTOP` and 32 and 33 (see [`ignoring_blocker`]), so a drop that sent any other would leave it
-/// running until its stdin closes (`Exited(0)`). Mutants: the drop skips the kill, or sends
-/// `SIGTERM` or `SIGPROF`.
+/// running until its stdin, released once the kill returned, closes (`Exited(0)`). Mutants: the drop
+/// skips the kill, or sends `SIGTERM` or `SIGPROF`.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn a_kill_on_drop_drop_kills_the_root() {
-    if !alone(fixture_path!(a_kill_on_drop_drop_kills_the_root)) {
-        return;
-    }
     let (child, stdin, _stdout) = ignoring_blocker().await;
-    let root = linux::Pidfd::of(&child);
+    let teardown = release_between_kill_and_wait(stdin);
     drop(child);
-    let ended = root.ended_after_closing(stdin);
-    assert!(
-        matches!(
-            ended,
-            linux::Ended::Signalled(libc::SIGKILL) | linux::Ended::ReapedWhileStdinOpen
-        ),
-        "the drop must kill the root with SIGKILL, got {ended:?}"
-    );
+    teardown.assert_killed();
 }
 
 /// The drop's signals run inside a bounded section, which is what turns a wait added to them into a
@@ -343,13 +412,22 @@ async fn an_async_drops_signals_and_bounded_release_run_inside_a_bounded_section
             crate::containment::cgroup::test_support::FakeLeaf::rmdir(&path, &events)
         });
         let leaf = crate::containment::cgroup::test_support::entered_leaf_at(fake.leaf.clone());
-        let (child, _stdin) = blocker();
+        let (child, stdin) = blocker();
+        // A detached drop kills nothing: its root ends when `_stdin` drops with the closure.
+        let (teardown, _stdin) = if detach {
+            (None, Some(stdin))
+        } else {
+            (Some(release_between_kill_and_wait(stdin)), None)
+        };
         let mut child = linux::contained_by(child, leaf);
         if detach {
             child.detach();
         }
         drop(child);
         leaf_fault::take_rmdir_hook();
+        if let Some(teardown) = teardown {
+            teardown.assert_killed();
+        }
         (at_kill.get(), at_rmdir.get())
     };
 
@@ -371,12 +449,13 @@ async fn an_async_drops_signals_and_bounded_release_run_inside_a_bounded_section
 async fn an_async_drop_removes_an_already_drained_leaf() {
     let name = "cosca-async-drop-drained";
     let (fake, leaf) = linux::fake_leaf(name, false);
-    let (child, _stdin) = blocker();
+    let (child, teardown) = released_blocker();
     let (steps, levels) = linux::dropped(linux::contained_by(child, leaf), name);
 
     assert_eq!(steps, ["kill", "rmdir populated 0"]);
     assert!(!fake.leaf.exists(), "a drained leaf is removed");
     assert_eq!(levels, Vec::<log::Level>::new());
+    teardown.assert_killed();
 }
 
 /// `kill_on_drop(false)` on a spawn that has not committed, with a `kill_tree()` behind it, as
@@ -533,10 +612,15 @@ async fn drop_warns_instead_of_asserting_on_a_real_teardown_mechanism_failure() 
     });
 
     let mut cmd = crate::tokio::Command::new();
-    cmd.args(["sleep", "30"]);
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+    cmd.stdout(crate::Stdio::null()).expect("set stdout");
     // The override is consumed by this spawn; `kill_on_drop` defaults to true. The tree-kill call
     // in Drop runs on the dropping thread, so no probe is needed to observe it.
     let mut child = cmd.spawn().expect("spawn");
+    let teardown = release_between_kill_and_wait(child.stdin().expect("piped stdin"));
+    let pid = child.id().pid();
+    let sends = crate::send_log::Capture::start();
 
     // Pin that the forced failure is the mechanism class this test claims (a raw `EISDIR` from
     // the `cgroup.kill` write, surfaced as `Error::Io`), so it cannot go vacuous if the forcing
@@ -568,6 +652,14 @@ async fn drop_warns_instead_of_asserting_on_a_real_teardown_mechanism_failure() 
         records.iter().map(|(level, _)| *level).collect::<Vec<_>>(),
         [log::Level::Warn],
         "a real teardown-mechanism failure during Drop must be logged at warn, got {records:?}"
+    );
+    // The failed tree kill must not cost the root its own kill: its stdin, released once that kill
+    // returned, would otherwise let it exit `0`.
+    teardown.assert_killed();
+    assert!(
+        sends.sent(pid, crate::signal::Sig::Kill),
+        "the drop must send the root SIGKILL: {:?}",
+        sends.entries()
     );
 }
 

@@ -224,8 +224,7 @@ fn sync_kill_tree_backstop_is_load_bearing() {
     cmd.stdout(crate::Stdio::null()).expect("set stdout null");
     cmd.contain_with(crate::ContainMode::TreeWalk);
     let mut child = cmd.spawn().expect("spawn");
-    // Closed right after the kill: only a real kill can end the child before then, so a no-op
-    // backstop exits 0 and fails the assertion instead of hanging `wait()`.
+    // Closed right after the kill: a no-op backstop exits 0.
     let stdin = child.stdin().expect("piped stdin");
     fault::set_force_root_kill_noop(true);
     let result = child.kill_tree();
@@ -259,8 +258,7 @@ async fn async_kill_tree_backstop_is_load_bearing() {
     cmd.stdout(crate::Stdio::null()).expect("set stdout null");
     cmd.contain_with(crate::ContainMode::TreeWalk);
     let mut child = cmd.spawn().expect("spawn");
-    // Closed right after the kill: only a real kill can end the child before then, so a no-op
-    // backstop exits 0 and fails the assertion instead of hanging `wait()`.
+    // Closed right after the kill: a no-op backstop exits 0.
     let stdin = child.stdin().expect("piped stdin");
     fault::set_force_root_kill_noop(true);
     let result = child.kill_tree();

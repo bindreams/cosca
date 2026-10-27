@@ -4,7 +4,7 @@
 use std::os::fd::{AsRawFd, RawFd};
 
 use super::proc_source::{Forgotten, Waited};
-use crate::test_child::reaped_elsewhere::reap_behind;
+use crate::test_child::reaped_elsewhere::{reap_behind, reap_behind_status};
 
 /// Forgets the live root of a fresh handle as `fate`, and answers whether the handle still holds
 /// the root's pidfd.
@@ -39,15 +39,17 @@ async fn a_forget_as_reaped_elsewhere_keeps_the_pidfd() {
 }
 
 /// A root killed and reaped behind its handle's back, and the handle's pidfd number.
-fn reaped_elsewhere_root() -> (crate::tokio::Child, std::io::PipeWriter, RawFd) {
+fn reaped_elsewhere_root() -> (crate::tokio::Child, RawFd) {
     let (mut child, writer) = super::root_state_tests::session_blocker(false);
     let fd = child
         .root_pidfd()
         .expect("a spawned handle holds its root's pidfd")
         .as_raw_fd();
     child.kill().expect("kill the root");
-    reap_behind(child.id().pid());
-    (child, writer, fd)
+    // Released after the kill, so a kill that sent nothing fails the assertion on how the root ended.
+    drop(writer);
+    crate::test_child::assert_killed("the root", reap_behind_status(child.id().pid()));
+    (child, fd)
 }
 
 /// The pidfd number `child` holds after `forget` forgets its tokio `Child`, which it must.
@@ -60,7 +62,7 @@ fn pidfd_after(child: &mut crate::tokio::Child, forget: impl FnOnce(&mut super::
 #[skuld::test]
 async fn a_forget_for_a_drop_keeps_the_pidfd() {
     crate::tokio::test_runtime::assert_current_thread();
-    let (mut child, _writer, fd) = reaped_elsewhere_root();
+    let (mut child, fd) = reaped_elsewhere_root();
     let view = child.read_root_view("a test");
     assert_eq!(pidfd_after(&mut child, |proc| proc.forget_for(&view).is_some()), fd);
 }
@@ -71,7 +73,7 @@ async fn a_forget_for_a_drop_keeps_the_pidfd() {
 async fn a_forget_for_a_wait_keeps_the_pidfd() {
     crate::tokio::test_runtime::assert_current_thread();
     for waited in [Waited::Foreign, Waited::Unverified] {
-        let (mut child, _writer, fd) = reaped_elsewhere_root();
+        let (mut child, fd) = reaped_elsewhere_root();
         assert_eq!(
             pidfd_after(&mut child, |proc| proc.forget_for_wait(waited, None).is_some()),
             fd,
@@ -86,7 +88,7 @@ async fn a_forget_for_a_wait_keeps_the_pidfd() {
 #[skuld::test]
 async fn the_forget_moves_the_pidfd_and_the_handle_closes_it() {
     crate::tokio::test_runtime::assert_current_thread();
-    let (mut child, _writer, fd) = reaped_elsewhere_root();
+    let (mut child, fd) = reaped_elsewhere_root();
     child.try_wait().expect_err("a foreign reap answers ECHILD");
     assert_eq!(
         child.root_pidfd().expect("the forget kept the pidfd").as_raw_fd(),

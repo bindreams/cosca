@@ -145,6 +145,8 @@ impl Child {
     /// sent nothing though the `SIGTERM` was sent.
     pub async fn graceful_shutdown(&mut self, grace: Duration) -> Result<ExitStatus, Error> {
         self.terminate()?;
+        #[cfg(test)]
+        fault::run_hook(fault::HookPoint::AfterTerminate);
         // A watch failure must not strand the child between the soft signal and the escalation —
         // kill and reap still run (grace unobservable => escalate now); the watch error surfaces
         // only after they succeed (a kill/reap error wins — deliberate subsumption, mirroring
@@ -601,6 +603,8 @@ pub(crate) mod fault {
         crate::error::Error::Io(std::io::Error::other("forced kill_tree failure (test seam)"))
     }
 
+    #[cfg(windows)]
+    pub(crate) use crate::graceful_hooks::at_checked;
     pub(crate) use crate::graceful_hooks::{release_at, run_hook, HookPoint};
 
     /// RAII disarm for `FORCE_KILL_TREE_ERROR` — see the sync twin's identical guard for the
@@ -646,3 +650,7 @@ pub(crate) mod fault {
 #[cfg(test)]
 #[path = "graceful_tests.rs"]
 mod graceful_tests;
+
+#[cfg(all(test, windows))]
+#[path = "ctrl_break_tests.rs"]
+mod ctrl_break_tests;

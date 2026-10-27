@@ -14,16 +14,23 @@ fn blocker() -> (crate::Child, std::io::PipeWriter) {
     crate::test_child::held_contained_blocker(crate::Stdio::pipe())
 }
 
+/// What keeps a [`kill_only_blocker`] running while the caller holds it.
+#[cfg(unix)]
+type Held = std::io::PipeWriter;
+#[cfg(windows)]
+type Held = std::net::TcpStream;
+
 /// A [`blocker`] for a test whose only end is a real kill: on Unix it ignores `SIGTERM`, on Windows
-/// it is `more.com` (see [`crate::test_child::windows_more`]).
-fn kill_only_blocker() -> (crate::Child, std::io::PipeWriter) {
+/// it ignores every console event and is returned after its handshake, so a break sent at once
+/// cannot land before it could handle it (that ends a child with `0xC0000142`, not the kill's 1).
+fn kill_only_blocker() -> (crate::Child, Held) {
     #[cfg(unix)]
     {
         crate::test_child::term_ignoring_blocker()
     }
     #[cfg(windows)]
     {
-        crate::test_child::windows_blocker()
+        crate::test_child::ctrl_break::spawn_ignoring_root()
     }
 }
 
@@ -150,6 +157,145 @@ fn graceful_lone_watch_error_still_escalates_and_reaps() {
     );
     let status = child.wait().expect("cached status — already reaped by the graceful op");
     crate::test_child::assert_killed("the escalated child", status);
+}
+
+// The graceful path: an uncontained `cat` dies to `SIGTERM`'s default disposition within the
+// grace. Its stdin is released via `release_at` after `terminate` returns; a `terminate` that sent
+// nothing yields exit 0 and fails the assertion.
+#[cfg(unix)]
+#[skuld::test]
+fn child_graceful_shutdown_graceful_path() {
+    use std::os::unix::process::ExitStatusExt;
+    let mut cmd = crate::Command::new();
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+    let mut child = cmd.spawn().expect("spawn");
+    let stdin = child.stdin().expect("piped stdin");
+    let _release = term_fault::release_at(term_fault::HookPoint::AfterTerminate, stdin);
+    let status = child
+        .graceful_shutdown(Duration::from_secs(30))
+        .expect("graceful_shutdown");
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGTERM),
+        "graceful path must exit via SIGTERM, got {status:?}"
+    );
+}
+
+// The graceful half of `graceful_shutdown_tree`: a contained `cat` root dies to the group's
+// `SIGTERM` within the grace, and the call returns its status. Its stdin is released via
+// `release_at` after `terminate_tree` returns; a `terminate_tree` that sent nothing yields exit 0
+// and fails the assertion.
+#[cfg(unix)]
+#[skuld::test]
+fn child_graceful_shutdown_tree_graceful_root_sigterm() {
+    let _warns = crate::log_capture::warn_watch();
+    use std::os::unix::process::ExitStatusExt;
+    let (child, stdin) = crate::test_child::held_contained_blocker_without_cgroup(crate::Stdio::pipe());
+    let _release = term_fault::release_at(term_fault::HookPoint::AfterTerminate, stdin);
+    let status = child
+        .graceful_shutdown_tree(Duration::from_secs(30))
+        .expect("tree graceful");
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGTERM),
+        "root must exit via SIGTERM, got {status:?}"
+    );
+}
+
+// A contained two-member tree, a root `cat` and a grandchild `sh` reading the same stdin pipe: the
+// group's `SIGTERM` leaves neither alive. The root's status is `SIGTERM`, which the release (as in
+// the test above) turns into 0 if no `SIGTERM` was sent. The grandchild prints `leaf` once the
+// released stdin ends it, so an empty stdout shows it was ended by the `SIGTERM`.
+#[cfg(unix)]
+#[skuld::test]
+fn child_graceful_shutdown_tree_tears_down_tree() {
+    let _warns = crate::log_capture::warn_watch();
+    use std::io::Read as _;
+    use std::os::unix::process::ExitStatusExt;
+    let mut cmd = crate::Command::new();
+    // `exec 3<&0` keeps the backgrounded `sh` on the real pipe (see `test_child::BLOCKER_ARGV`).
+    cmd.args([
+        "sh",
+        "-c",
+        "exec 3<&0; sh -c 'echo r; read -r _; echo leaf' <&3 3<&- & exec cat",
+    ]);
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+    cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
+    crate::test_child::contain_without_cgroup(&mut cmd);
+    let mut child = cmd.spawn().expect("spawn");
+    let stdin = child.stdin().expect("piped stdin");
+    let mut stdout = child.stdout().expect("piped stdout");
+    // The grandchild writes the readiness line, so both members exist.
+    let mut ready = [0u8; 2];
+    stdout.read_exact(&mut ready).expect("readiness line");
+    assert_eq!(&ready, b"r\n");
+
+    let _release = term_fault::release_at(term_fault::HookPoint::AfterTerminate, stdin);
+    let status = child
+        .graceful_shutdown_tree(Duration::from_secs(30))
+        .expect("tree graceful");
+
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGTERM),
+        "root must exit via SIGTERM, got {status:?}"
+    );
+    let mut rest = Vec::new();
+    stdout
+        .read_to_end(&mut rest)
+        .expect("both members are gone, so the pipe ends");
+    assert!(rest.is_empty(), "nothing was written: {rest:?}");
+}
+
+// The escalation: a child that ignores `SIGTERM` is still alive at `Duration::ZERO`'s one poll, so
+// only the hard kill can end it, and `SIGKILL` is the only signal it can die of. Its stdin is
+// released via `release_at` after the kill; an escalation that sent nothing yields exit 0.
+#[cfg(unix)]
+#[skuld::test]
+fn child_graceful_shutdown_escalates() {
+    let (child, stdin) = crate::test_child::term_ignoring_blocker();
+    let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, stdin);
+    let status = child
+        .graceful_shutdown(Duration::ZERO)
+        .expect("graceful_shutdown escalates");
+    crate::test_child::assert_killed("the SIGTERM-ignoring child", status);
+}
+
+// The tree escalation: all three members ignore the group's `SIGTERM` (`TERM_IGNORING_TREE_ARGV`),
+// so only the hard sweep ends them. The root's status shows it was killed; the subshell and its
+// child each print a marker once the released stdin ends them, so an empty stdout shows the sweep
+// ended both.
+#[cfg(unix)]
+#[skuld::test]
+fn child_graceful_shutdown_tree_escalates_with_a_surviving_grandchild() {
+    let _warns = crate::log_capture::warn_watch();
+    use std::io::Read as _;
+    let mut cmd = crate::Command::new();
+    cmd.args(crate::test_child::TERM_IGNORING_TREE_ARGV.iter().copied());
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+    cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
+    crate::test_child::contain_without_cgroup(&mut cmd);
+    let mut child = cmd.spawn().expect("spawn");
+    let stdin = child.stdin().expect("piped stdin");
+    let mut stdout = child.stdout().expect("piped stdout");
+    let mut ready = [0u8; 2];
+    stdout.read_exact(&mut ready).expect("readiness line");
+    assert_eq!(
+        &ready,
+        b"r
+"
+    );
+
+    let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, stdin);
+    let status = child.graceful_shutdown_tree(Duration::ZERO).expect("tree escalates");
+
+    crate::test_child::assert_killed("the SIGTERM-ignoring root", status);
+    let mut rest = Vec::new();
+    stdout
+        .read_to_end(&mut rest)
+        .expect("every member is gone, so the pipe ends");
+    assert!(rest.is_empty(), "the sweep missed a grandchild: {rest:?}");
 }
 
 // A term_group refusal must not strand the tree between the soft signal and the hard sweep:
@@ -352,7 +498,18 @@ fn graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_authoritative() 
     // pending on the root, so it beats the EOF this release causes.
     #[cfg(unix)]
     let _release = term_fault::release_at(term_fault::HookPoint::AfterTerminate, stdin);
+    // Windows: assert the break was sent once `terminate_tree` returns, so a missing one fails
+    // here and not when the grace runs out.
+    #[cfg(windows)]
+    let check = {
+        let pid = child.id().pid();
+        term_fault::at_checked(term_fault::HookPoint::AfterTerminate, move || {
+            crate::test_child::ctrl_break::assert_break_sent_to(pid)
+        })
+    };
     let result = child.graceful_shutdown_tree(Duration::from_secs(30));
+    #[cfg(windows)]
+    check.assert_fired();
     if authoritative {
         let status = result.expect("an authoritatively-drained tree must not invoke the sweep at all");
         assert!(

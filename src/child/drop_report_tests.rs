@@ -72,8 +72,14 @@ fn an_unknown_root_with_a_refused_kill_warns_once() {
 fn finish_elevated_with_an_unknown_root_and_a_failed_reap_warns_once() {
     crate::log_capture::install();
     let _recorder = crate::containment::unix::fault::record_kill_group();
-    let (child, _writer) = session_blocker();
+    let (child, writer) = session_blocker();
     let pid = child.id().pid();
+    // Released once the cleanup's root kill returned, before its reap (the forced failure comes
+    // after the reap, which records nothing): the root must be a zombie that died of `SIGKILL`.
+    let _released = crate::child::spawn::fault::set_between_kill_and_wait(move || {
+        drop(writer);
+        crate::test_child::assert_zombie_sigkilled("the root", pid);
+    });
     let mark = crate::log_capture::mark();
     let _failed = force_peek_once(Err(std::io::Error::other("forced peek failure")));
     crate::child::spawn::fault::set_force_reap_failure("cosca-unknown-reap-9d1c");
@@ -168,6 +174,8 @@ fn a_retry_that_only_repeats_the_cleanups_warn_is_debug() {
 
     crate::log_capture::install();
     let (child, writer) = bare_blocker();
+    // Released once the drop's retried kill returned: that kill is the one that lands.
+    let blocker = crate::child::spawn::fault::release_at_drop_kill(writer);
     let teardowns = crate::child::fault::record_root_teardowns();
     let mark = crate::log_capture::mark();
     let err_peek = || Err(std::io::Error::other("forced peek failure"));
@@ -188,7 +196,7 @@ fn a_retry_that_only_repeats_the_cleanups_warn_is_debug() {
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(warns[0].starts_with("finish_elevated:"), "{warns:?}");
     // Whatever the drop says of the unknown root again is not a warn.
-    drop(writer);
+    blocker.assert_killed();
 }
 
 /// A tree kill that fails once, in a cleanup that then kills the root: the tree is not settled, so
@@ -216,18 +224,21 @@ fn a_transient_tree_kill_failure_is_retried_by_the_drop() {
         )),
         graceful: crate::graceful::GracefulMechanism::Process,
     });
-    let (stdin, _writer) = crate::test_child::held_writer_stdin();
+    let (stdin, writer) = crate::test_child::held_writer_stdin();
     let mut cmd = Command::new();
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
     let child = crate::child::spawn::spawn_uncommitted(&mut cmd).expect("spawn");
     // Rule out the leaf's own `Drop`: only the handle's drop may retry.
     child.attached.disarm();
-    // The failure ends once the root is killed: the retry finds a file it can write.
+    // The failure ends once the root is killed: the retry finds a file it can write. The root is
+    // released there too: a kill that sent nothing exits 0.
+    let reaps = fault::record_teardown_reaps();
     let healed = kill_file.clone();
     let _hook = fault::set_between_kill_and_wait(move || {
         std::fs::remove_dir(&healed).expect("remove the directory");
         std::fs::write(&healed, b"").expect("create cgroup.kill");
+        drop(writer);
     });
     let mark = crate::log_capture::mark();
 
@@ -243,6 +254,7 @@ fn a_transient_tree_kill_failure_is_retried_by_the_drop() {
         [log::Level::Warn],
         "the failed kill is reported once, and the retry adds nothing"
     );
+    reaps.assert_killed();
 }
 
 /// A handle that could not say, when the root's number shows it reaped: the doubt is not dropped

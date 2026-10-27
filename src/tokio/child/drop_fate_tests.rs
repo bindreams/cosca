@@ -15,8 +15,10 @@ fn live(kill_on_drop: bool) -> (crate::tokio::Child, std::io::PipeWriter) {
     (cmd.spawn().expect("spawn"), writer)
 }
 
-/// Collects a forgotten child the test still owns: ends its stdin, waits for its exit.
-fn collect(id: crate::identity::ProcessId, writer: std::io::PipeWriter) {
+/// Collects a forgotten child the test still owns: ends its stdin, waits for its exit, and answers
+/// how it ended.
+fn collect(id: crate::identity::ProcessId, writer: std::io::PipeWriter) -> std::process::ExitStatus {
+    use std::os::unix::process::ExitStatusExt as _;
     drop(writer);
     let mut status = 0;
     // SAFETY: reaps this test's own forgotten child, which nothing else reaps.
@@ -26,6 +28,7 @@ fn collect(id: crate::identity::ProcessId, writer: std::io::PipeWriter) {
         id.pid() as libc::pid_t,
         "the forgotten child is still ours to collect"
     );
+    std::process::ExitStatus::from_raw(status)
 }
 
 /// A failed peek cannot show the child ours, but proves nothing about a reap either. Armed, the drop
@@ -125,9 +128,16 @@ async fn the_drop_of_a_child_forgotten_unproven_claims_no_reap() {
     let (mut child, writer) = forgotten(false);
     let id = child.id();
     let fate = child.tear_down_now();
-    collect(id, writer);
+    // Released after the drop's kill, so a kill that sent nothing fails the assertion on how the
+    // child ended.
+    let status = collect(id, writer);
     #[cfg(target_os = "linux")]
-    assert_eq!(fate, ChildFate::Killed);
+    {
+        assert_eq!(fate, ChildFate::Killed);
+        crate::test_child::assert_killed("the child", status);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = status;
     #[cfg(target_os = "macos")]
     assert_eq!(fate, ChildFate::Running { id: Some(id) });
 }
@@ -145,13 +155,17 @@ async fn the_drop_of_an_unproven_backend_whose_root_its_pidfd_shows_gone_says_go
     let (mut child, writer) = live(true);
     let id = child.id();
     child.kill().expect("kill the root");
-    crate::test_child::reaped_elsewhere::reap_behind(id.pid());
+    // Released after the kill, so a kill that sent nothing fails the assertion on how the root ended.
+    drop(writer);
+    crate::test_child::assert_killed(
+        "the root",
+        crate::test_child::reaped_elsewhere::reap_behind_status(id.pid()),
+    );
     let failed = force_peek_once(Err(std::io::Error::other("forced peek failure 3c7f")));
     child.kill().expect("a root reaped elsewhere has nothing left to kill");
     assert_peeks_exhausted();
     drop(failed);
     let fate = child.tear_down_now();
-    drop(writer);
     assert_eq!(fate, ChildFate::Gone);
 }
 
@@ -193,7 +207,7 @@ async fn an_unproven_backend_reads_its_kept_pidfd_for_whether_the_child_runs() {
     let proc = child.os.proc.as_ref().expect("backend");
     assert!(proc.is_running().expect("the pidfd answers"), "the child lives");
     proc.signal(Sig::Kill).expect("kill through the pidfd");
-    collect(id, writer);
+    crate::test_child::assert_killed("the child", collect(id, writer));
     assert!(!proc.is_running().expect("the pidfd answers"), "the child is gone");
 }
 
@@ -316,9 +330,13 @@ fn record_waits(id: crate::identity::ProcessId) -> bool {
 async fn reaped_is_reported_only_for_a_status_that_was_collected() {
     crate::tokio::test_runtime::assert_current_thread();
     // `wait_and_reap_blocking`, after a kill.
-    let (mut child, _writer) = live(true);
+    let (mut child, writer) = live(true);
     let id = child.id();
     child.kill().expect("kill");
+    // Released after the kill, so a `kill` that sent nothing fails the assertion on how the child
+    // ended, not the blocking wait below.
+    drop(writer);
+    crate::test_child::assert_zombie_sigkilled("the killed child", id.pid());
     let (fate, _) = child.wait_and_reap_blocking();
     let waiting = record_waits(id);
     assert_eq!(fate, ChildFate::Reaped);

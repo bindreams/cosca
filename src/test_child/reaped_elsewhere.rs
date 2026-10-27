@@ -79,11 +79,19 @@ pub(crate) fn term_ignoring_session_sleep() -> crate::Command {
 /// Reaps `pid`, this process's child that has been told to die, behind its handle's back, as an
 /// application with its own reaper does.
 pub(crate) fn reap_behind(pid: u32) {
+    reap_behind_status(pid);
+}
+
+/// [`reap_behind`], answering how `pid` ended.
+pub(crate) fn reap_behind_status(pid: u32) -> std::process::ExitStatus {
+    use std::os::unix::process::ExitStatusExt as _;
+
     super::wait_until_zombie(pid);
     let mut status = 0;
     // SAFETY: `pid` is this test's own zombie child.
     let reaped = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
     assert_eq!(reaped, pid as libc::pid_t, "{}", std::io::Error::last_os_error());
+    std::process::ExitStatus::from_raw(status)
 }
 
 /// A [`session_sleep`] child, killed and reaped behind its back, and its group's id.

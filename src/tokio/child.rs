@@ -1245,7 +1245,7 @@ impl Child {
 
 #[cfg(test)]
 #[path = "child_drop_tests.rs"]
-mod child_drop_tests;
+pub(crate) mod child_drop_tests;
 
 /// Test seam counting what a drop does to the root by its number. Thread-local, with an RAII reset.
 #[cfg(all(test, unix))]
@@ -1256,7 +1256,7 @@ pub(crate) mod drop_fault {
         static COUNTS: Cell<Option<(u32, u32)>> = const { Cell::new(None) };
     }
 
-    /// From now on `Drop` on THIS thread counts the root kills it starts and the tokio `Child`s it
+    /// From now on `Drop` on THIS thread counts the root kills it makes and the tokio `Child`s it
     /// forgets. It still does both.
     pub(crate) fn record() -> Recorder {
         COUNTS.with(|c| c.set(Some((0, 0))));
@@ -1267,7 +1267,7 @@ pub(crate) mod drop_fault {
     pub(crate) struct Recorder(());
 
     impl Recorder {
-        /// Root kills started.
+        /// Root kill calls made, counted after the call returned.
         pub(crate) fn kills(&self) -> u32 {
             COUNTS.with(|c| c.get().expect("the recorder is live").0)
         }
@@ -2087,8 +2087,6 @@ fn signal_on_drop(
     let Some(proc) = os.proc.as_mut() else {
         return signals;
     };
-    #[cfg(all(test, unix))]
-    drop_fault::note_root_kill();
     // No `debug_assert` here: a failed kill is a designed outcome the branch below serves (a
     // higher-integrity elevated child), and asserting would panic inside a destructor.
     //
@@ -2102,6 +2100,8 @@ fn signal_on_drop(
     };
     #[cfg(not(test))]
     let killed = proc.signal(Sig::Kill);
+    #[cfg(all(test, unix))]
+    drop_fault::note_root_kill();
     // Nothing was delivered because the child is gone (reaped by someone else, and its pid
     // possibly reused): the pid names nothing of ours to wait for.
     // `Unverified`: nothing was sent because the pid cannot be verified (macOS: a backend forgotten

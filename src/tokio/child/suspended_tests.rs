@@ -1,8 +1,10 @@
 //! `tokio::Command::spawn_suspended` and `tokio::SuspendedChild`, on real frozen children.
 //!
-//! Every Windows child is a windowless `findstr x` blocker (no console window on a developer's
-//! desktop). Tests that need a job, a `TreeWalk` root or any other containment are named for it;
-//! the uncontained ones are the ones that are safe to run on a developer's host.
+//! Every Windows child is a windowless blocker (no console window on a developer's desktop): by
+//! default `more.com`, which exits 0 on EOF, so a kill that sent nothing fails on how the child
+//! ended; `findstr x` where a test needs its match or its exit 1. Tests that need a job, a
+//! `TreeWalk` root or any other containment are named for it; the uncontained ones are the ones
+//! that are safe to run on a developer's host.
 
 use static_assertions::assert_impl_all;
 
@@ -59,9 +61,25 @@ mod on_windows {
 
     const ERROR_ACCESS_DENIED: u32 = 5;
 
-    /// A windowless blocker; `raw` routes it to the raw `CreateProcessW` backend by giving it an
-    /// `executable()`.
+    /// A windowless blocker that exits 0 once its stdin closes; `raw` routes it to the raw
+    /// `CreateProcessW` backend by giving it an `executable()`.
     fn blocker(raw: bool) -> Command {
+        let more = crate::test_child::windows_more();
+        let mut cmd = Command::new();
+        cmd.args([&more]);
+        if raw {
+            cmd.executable(&more);
+        }
+        cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
+        cmd.stdout(crate::Stdio::null()).expect("stdout null");
+        cmd.stderr(crate::Stdio::null()).expect("stderr null");
+        cmd.no_window();
+        cmd
+    }
+
+    /// [`blocker`] with `findstr x`: it prints the matching line, and exits 1 on input with no
+    /// match.
+    fn findstr_blocker(raw: bool) -> Command {
         let mut cmd = Command::new();
         cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
         if raw {
@@ -77,23 +95,42 @@ mod on_windows {
     /// Both spawn backends, so a backend that drops the hold fails its own leg.
     const BACKENDS: [bool; 2] = [false, true];
 
+    /// Kill `child`, then release its stdin: it exits 0 on EOF, so a kill that sent nothing fails
+    /// the assertion on how it ended instead of the reap blocking for ever.
     async fn end(mut child: Child) {
+        let stdin = child.stdin().expect("the blocker's piped stdin");
         child.kill().expect("kill the resumed child");
-        child.wait().await.expect("reap the resumed child");
+        drop(stdin);
+        crate::test_child::assert_killed("the resumed child", child.wait().await.expect("reap the resumed child"));
     }
 
     /// The blocker for one `kill_on_drop` leg of a drop test. Stdin decides the child's fate: the
-    /// `true` leg leaks its write end, so only the drop's kill can end the child. The `false` leg
+    /// `true` leg is `more.com` (exit 0 on EOF) and returns its write end, which the test drops only
+    /// after the drop's kill, so the exit code tells a kill (1) from a release (0). The `false` leg
     /// pipes stdin and stdout, which [`drop_and_expect_it_runs`] keeps past the drop.
-    fn drop_leg_blocker(kill_on_drop: bool) -> Command {
-        let mut cmd = blocker(false);
-        cmd.kill_on_drop(kill_on_drop);
+    fn drop_leg_blocker(kill_on_drop: bool) -> (Command, Option<std::io::PipeWriter>) {
         if kill_on_drop {
-            cmd.stdin(crate::test_child::leaked_writer_stdin()).expect("stdin");
+            let mut cmd = blocker(false);
+            cmd.kill_on_drop(true);
+            let (stdin, writer) = crate::test_child::held_writer_stdin();
+            cmd.stdin(stdin).expect("stdin");
+            (cmd, Some(writer))
         } else {
+            let mut cmd = findstr_blocker(false);
+            cmd.kill_on_drop(false);
             cmd.stdout(crate::Stdio::pipe()).expect("stdout pipe");
+            (cmd, None)
         }
-        cmd
+    }
+
+    /// Drop `child` (built by [`drop_leg_blocker`]`(true)`), then release its stdin: the drop's kill
+    /// came first, so the child dies with the kill's exit code, or the test fails by assertion.
+    fn drop_and_expect_it_killed(child: Child, writer: Option<std::io::PipeWriter>, what: &str) {
+        let remote = Remote::open(child.id().pid());
+        drop(child);
+        drop(writer);
+        remote.wait_for_death();
+        assert_eq!(remote.exit_code(), 1, "{what}: the drop must kill the resumed child");
     }
 
     /// Drop `child` (built by [`drop_leg_blocker`]`(false)`) and prove the drop did not kill it, by
@@ -283,7 +320,7 @@ mod on_windows {
     async fn a_resumed_child_serves_its_piped_stdin_and_stdout_and_is_awaited() {
         use ::tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         for raw in BACKENDS {
-            let mut cmd = blocker(raw);
+            let mut cmd = findstr_blocker(raw);
             cmd.stdout(crate::Stdio::pipe()).expect("stdout pipe");
             let mut child = cmd
                 .spawn_suspended()
@@ -345,13 +382,14 @@ mod on_windows {
     /// The command's `kill_on_drop` decides what dropping the resumed `Child` does: a resumed child
     /// that kept the frozen spawn's forced `true` would be killed by a command that opted out.
     ///
-    /// The `true` leg's child can only end by the drop's kill (without it the run is bounded by
-    /// nextest's terminate-after). The `false` leg proves the child alive after the drop with a
+    /// The `true` leg's child dies with the kill's exit code, its stdin released only after the drop
+    /// (see [`drop_and_expect_it_killed`]). The `false` leg proves the child alive after the drop with a
     /// round trip, not a look at the process.
     #[skuld::test]
     async fn death_watch_dropping_an_uncontained_resumed_child_follows_the_commands_kill_on_drop() {
         for kill_on_drop in [true, false] {
-            let child = drop_leg_blocker(kill_on_drop)
+            let (mut cmd, writer) = drop_leg_blocker(kill_on_drop);
+            let child = cmd
                 .spawn_suspended()
                 .expect("spawn suspended")
                 .resume()
@@ -359,9 +397,7 @@ mod on_windows {
             assert_eq!(child.kill_on_drop, kill_on_drop);
 
             if kill_on_drop {
-                let remote = Remote::open(child.id().pid());
-                drop(child);
-                remote.wait_for_death();
+                drop_and_expect_it_killed(child, writer, "uncontained");
             } else {
                 drop_and_expect_it_runs(child, "uncontained").await;
             }
@@ -373,7 +409,7 @@ mod on_windows {
     async fn death_watch_dropping_a_contained_resumed_child_follows_the_commands_kill_on_drop() {
         for mode in [crate::ContainMode::TreeWalk, crate::ContainMode::Strongest] {
             for kill_on_drop in [true, false] {
-                let mut cmd = drop_leg_blocker(kill_on_drop);
+                let (mut cmd, writer) = drop_leg_blocker(kill_on_drop);
                 cmd.contain_with(mode);
                 let child = cmd
                     .spawn_suspended()
@@ -383,9 +419,7 @@ mod on_windows {
                 assert_eq!(child.kill_on_drop, kill_on_drop, "{mode:?}");
 
                 if kill_on_drop {
-                    let remote = Remote::open(child.id().pid());
-                    drop(child);
-                    remote.wait_for_death();
+                    drop_and_expect_it_killed(child, writer, &format!("{mode:?}"));
                 } else {
                     drop_and_expect_it_runs(child, &format!("{mode:?}")).await;
                 }
@@ -433,21 +467,47 @@ mod on_windows {
 
     // Drop =====
 
+    /// Hold `cmd`'s stdin (`more.com` exits 0 on EOF): the test releases it only after the drop, so
+    /// the exit code tells the drop's kill (1) from a release (0).
+    fn hold_stdin(cmd: &mut Command) -> std::io::PipeWriter {
+        let (stdin, writer) = crate::test_child::held_writer_stdin();
+        cmd.stdin(stdin).expect("stdin");
+        writer
+    }
+
+    /// Release a frozen child's stdin and let its initial thread run, once the code under test has
+    /// torn it down. A frozen child runs nothing, so the release alone cannot end it; with the thread
+    /// resumed, a kill that sent nothing lets the blocker exit 0 and fail the exit-code assertion
+    /// instead of leaving the wait for its death to hang. After a real kill the resume fails, and is
+    /// ignored.
+    fn release_and_expect_it_killed(thread: &InitialThread, writer: std::io::PipeWriter, remote: &Remote, what: &str) {
+        drop(writer);
+        thread.resume_whatever_the_outcome();
+        remote.wait_for_death();
+        assert_eq!(remote.exit_code(), 1, "{what}: the teardown must kill the frozen child");
+    }
+
+    /// Drop `frozen`, then release it (see [`release_and_expect_it_killed`]). The drop is the async
+    /// `Child`'s bounded one: it signals and returns, so the proof is the process object, opened
+    /// while the frozen child pins the pid.
+    fn drop_frozen_and_expect_it_killed(frozen: crate::tokio::SuspendedChild, writer: std::io::PipeWriter, what: &str) {
+        let remote = Remote::open(frozen.id().pid());
+        let thread = InitialThread::of(frozen.id().pid());
+        drop(frozen);
+        release_and_expect_it_killed(&thread, writer, &remote, what);
+    }
+
     /// A dropped frozen child is killed whatever `kill_on_drop` says. Nothing but the drop can end
-    /// it (its stdin write end is leaked), and the drop is the async `Child`'s bounded one: it signals
-    /// and returns, so the proof is the process object, opened while the frozen child pins the pid.
+    /// it (its stdin is released only after the drop).
     #[skuld::test]
     async fn death_watch_dropping_an_uncontained_frozen_child_kills_it_whatever_kill_on_drop_says() {
         for kill_on_drop in [false, true] {
             let mut cmd = blocker(false);
             cmd.kill_on_drop(kill_on_drop);
-            cmd.stdin(crate::test_child::leaked_writer_stdin()).expect("stdin");
+            let writer = hold_stdin(&mut cmd);
             let frozen = cmd.spawn_suspended().expect("spawn suspended");
-            let remote = Remote::open(frozen.id().pid());
 
-            drop(frozen);
-
-            remote.wait_for_death();
+            drop_frozen_and_expect_it_killed(frozen, writer, "uncontained");
         }
     }
 
@@ -458,13 +518,10 @@ mod on_windows {
             for kill_on_drop in [false, true] {
                 let mut cmd = blocker(false);
                 cmd.contain_with(mode).kill_on_drop(kill_on_drop);
-                cmd.stdin(crate::test_child::leaked_writer_stdin()).expect("stdin");
+                let writer = hold_stdin(&mut cmd);
                 let frozen = cmd.spawn_suspended().expect("spawn suspended");
-                let remote = Remote::open(frozen.id().pid());
 
-                drop(frozen);
-
-                remote.wait_for_death();
+                drop_frozen_and_expect_it_killed(frozen, writer, &format!("{mode:?}"));
             }
         }
     }
@@ -477,13 +534,10 @@ mod on_windows {
             let mut cmd = blocker(raw);
             cmd.stdout(crate::Stdio::pipe()).expect("stdout pipe");
             cmd.stderr(crate::Stdio::pipe()).expect("stderr pipe");
-            cmd.stdin(crate::test_child::leaked_writer_stdin()).expect("stdin");
+            let writer = hold_stdin(&mut cmd);
             let frozen = cmd.spawn_suspended().expect("spawn suspended");
-            let remote = Remote::open(frozen.id().pid());
 
-            drop(frozen);
-
-            remote.wait_for_death();
+            drop_frozen_and_expect_it_killed(frozen, writer, &format!("raw={raw}"));
         }
     }
 
@@ -492,8 +546,11 @@ mod on_windows {
     #[skuld::test]
     async fn a_failed_thread_resume_kills_the_child_and_reports_its_fate() {
         crate::tokio::test_runtime::assert_current_thread();
-        let frozen = blocker(false).spawn_suspended().expect("spawn suspended");
+        let mut cmd = blocker(false);
+        let writer = hold_stdin(&mut cmd);
+        let frozen = cmd.spawn_suspended().expect("spawn suspended");
         let remote = Remote::open(frozen.id().pid());
+        let thread = InitialThread::of(frozen.id().pid());
         let forced = force_next(Step::Resume, ERROR_ACCESS_DENIED);
 
         let err = frozen.resume().expect_err("the resume was forced to fail");
@@ -503,7 +560,7 @@ mod on_windows {
             .fate()
             .unwrap_or_else(|| panic!("expected MayHaveStarted, got {err:?}"));
         assert!(matches!(fate, ChildFate::Killed | ChildFate::Reaped), "{fate:?}");
-        remote.wait_for_death();
+        release_and_expect_it_killed(&thread, writer, &remote, "a failed resume");
     }
 
     /// Something else killed the frozen process. The process is observed dead (its handle is
@@ -539,14 +596,17 @@ mod on_windows {
     /// frozen, so `resume` must not return `Ok`.
     #[skuld::test]
     async fn resume_when_the_initial_thread_was_suspended_twice_kills_the_child_instead_of_returning_ok() {
-        let frozen = blocker(false).spawn_suspended().expect("spawn suspended");
+        let mut cmd = blocker(false);
+        let writer = hold_stdin(&mut cmd);
+        let frozen = cmd.spawn_suspended().expect("spawn suspended");
         let remote = Remote::open(frozen.id().pid());
-        InitialThread::of(frozen.id().pid()).suspend_once();
+        let thread = InitialThread::of(frozen.id().pid());
+        thread.suspend_once();
 
         let err = frozen.resume().expect_err("the child is still frozen after one resume");
 
         assert!(err.fate().is_some(), "got {err:?}");
-        remote.wait_for_death();
+        release_and_expect_it_killed(&thread, writer, &remote, "a half-resumed child");
     }
 
     // The command =====
@@ -569,7 +629,7 @@ mod on_windows {
     /// that stayed frozen never exits, so the wait is bounded by nextest's `death_watch_` override.
     #[skuld::test]
     async fn death_watch_the_command_spawns_an_ordinary_child_after_a_frozen_one() {
-        let mut cmd = blocker(false);
+        let mut cmd = findstr_blocker(false);
         drop(cmd.spawn_suspended().expect("spawn suspended"));
 
         // A spawn takes the stdio configuration out of the command, so the second one is given its own.

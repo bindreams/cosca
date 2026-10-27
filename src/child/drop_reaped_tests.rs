@@ -11,6 +11,7 @@
 use std::io::Read as _;
 
 use crate::child::fault::record_root_teardowns;
+use crate::child::spawn::fault::{release_at_drop_kill, release_between_kill_and_wait};
 use crate::command::Command;
 use crate::containment::treewalk::fault::record_walks;
 use crate::containment::unix::fault::record_kill_group;
@@ -34,6 +35,19 @@ fn session(argv: &[&str]) -> Command {
     cmd.args(argv.iter().copied());
     cmd.contain_with(ContainMode::Session);
     cmd
+}
+
+/// A session-contained [`BLOCKER_ARGV`](crate::test_child::BLOCKER_ARGV) root and the write end of
+/// its stdin. Dropping the writer is the only way for it to end on its own (status 0), so a test that
+/// must see a kill end it drops the writer only after the kill: a `kill` that sent nothing then
+/// fails the assertion on how the root ended, instead of leaving a wait unbounded. A drop that
+/// blocks until the root is reaped gets its writer through [`release_at_drop_kill`].
+fn session_blocker() -> (crate::Child, std::io::PipeWriter) {
+    let mut cmd = session(crate::test_child::BLOCKER_ARGV);
+    cmd.stdin(Stdio::pipe_in()).expect("stdin pipe");
+    let mut child = cmd.spawn().expect("spawn");
+    let stdin = child.stdin().expect("stdin pipe");
+    (child, stdin)
 }
 
 /// Root `sh` (which points a background job's stdin at `/dev/null` unless told otherwise, hence the
@@ -123,14 +137,15 @@ fn dropping_a_running_process_group_child_still_kills_the_group_and_does_not_war
     crate::log_capture::install();
     let recorder = record_kill_group();
     let teardowns = record_root_teardowns();
-    let mut cmd = session(&["sleep", "300"]);
-    let child = cmd.spawn().expect("spawn");
+    let (child, stdin) = session_blocker();
+    let blocker = release_at_drop_kill(stdin);
     let pid = child.id().pid();
 
     let mark = crate::log_capture::mark();
     drop(child);
 
     recorder.assert_killed_only(pid as i32);
+    blocker.assert_killed();
     assert_eq!(teardowns.count(), 1, "an unreaped root is killed and reaped");
     assert_eq!(drop_warns_since(mark), []);
 }
@@ -142,10 +157,11 @@ fn dropping_a_running_process_group_child_still_kills_the_group_and_does_not_war
 fn dropping_an_exited_but_unreaped_process_group_child_still_kills_the_group() {
     crate::log_capture::install();
     let recorder = record_kill_group();
-    let child = session(&["sleep", "300"]).spawn().expect("spawn");
+    let (child, stdin) = session_blocker();
     let pid = child.id().pid();
     child.kill().expect("kill the root");
-    crate::test_child::wait_until_zombie(pid);
+    drop(stdin);
+    crate::test_child::assert_zombie_sigkilled("the root", pid);
 
     let mark = crate::log_capture::mark();
     drop(child);
@@ -251,12 +267,13 @@ fn dropping_a_running_tree_walk_child_walks_from_its_pid_and_does_not_warn() {
     assert_eq!(drop_warns_since(mark), []);
 }
 
-/// A `sleep` root, killed and then waited for, so that only `wait()` sets the own-reap flag.
-fn waited_on_sleep_root() -> (u32, crate::Child) {
-    let child = session(&["sleep", "300"]).spawn().expect("spawn");
+/// A blocker root, killed and then waited for, so that only `wait()` sets the own-reap flag.
+fn waited_on_blocker_root() -> (u32, crate::Child) {
+    let (child, stdin) = session_blocker();
     let pid = child.id().pid();
     child.kill().expect("kill the root");
-    child.wait().expect("reap the root");
+    drop(stdin);
+    crate::test_child::assert_killed("the root", child.wait().expect("reap the root"));
     (pid, child)
 }
 
@@ -271,7 +288,7 @@ fn dropping_a_waited_on_child_whose_number_reads_unknown_still_sends_no_killpg()
     crate::log_capture::install();
     let recorder = record_kill_group();
     let teardowns = record_root_teardowns();
-    let (_, child) = waited_on_sleep_root();
+    let (_, child) = waited_on_blocker_root();
     let _unknown = super::fault::force_next_root_read(crate::identity::Resolved::Unknown);
 
     let mark = crate::log_capture::mark();
@@ -293,7 +310,8 @@ fn dropping_an_unreaped_child_whose_number_reads_unknown_kills_and_logs_the_fail
     crate::log_capture::install();
     let recorder = record_kill_group();
     let teardowns = record_root_teardowns();
-    let child = session(&["sleep", "300"]).spawn().expect("spawn");
+    let (child, stdin) = session_blocker();
+    let blocker = release_at_drop_kill(stdin);
     let pid = child.id().pid();
     let _unknown = super::fault::force_next_root_read(crate::identity::Resolved::Unknown);
 
@@ -301,6 +319,7 @@ fn dropping_an_unreaped_child_whose_number_reads_unknown_kills_and_logs_the_fail
     drop(child);
 
     recorder.assert_killed_only(pid as i32);
+    blocker.assert_killed();
     assert_eq!(teardowns.count(), 1);
     assert_eq!(drop_warns_since(mark), []);
     let reads = crate::log_capture::records_since_on_current_thread(mark, "could not be read");
@@ -317,10 +336,11 @@ fn dropping_a_foreign_reaped_process_group_child_sends_no_killpg() {
     crate::log_capture::install();
     let recorder = record_kill_group();
     let teardowns = record_root_teardowns();
-    let child = session(&["sleep", "300"]).spawn().expect("spawn");
+    let (child, stdin) = session_blocker();
     let pid = child.id().pid();
     child.kill().expect("kill the root");
-    crate::test_child::wait_until_zombie(pid);
+    drop(stdin);
+    crate::test_child::assert_zombie_sigkilled("the root", pid);
     let mut status = 0;
     // SAFETY: `pid` is this test's own zombie child. This plays the application that reaps it.
     let reaped = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
@@ -361,17 +381,27 @@ fn drop_after_kill_tree_and_wait_skips_at_debug_and_does_not_warn() {
 }
 
 /// `graceful_shutdown_tree` sweeps with `kill_tree` and reaps the root, so its drop is quiet too.
+///
+/// The root's stdin is released via `release_at` after `terminate_tree` returns; a `terminate_tree`
+/// that sent nothing yields status 0 and fails the status assertion.
 #[skuld::test]
 fn drop_after_graceful_shutdown_tree_skips_at_debug_and_does_not_warn() {
+    use std::os::unix::process::ExitStatusExt as _;
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();
     let recorder = record_kill_group();
-    let child = session(&["sleep", "300"]).spawn().expect("spawn");
+    let (child, stdin) = session_blocker();
     let pid = child.id().pid();
-    child
+    let _release = crate::graceful_hooks::release_at(crate::graceful_hooks::HookPoint::AfterTerminate, stdin);
+    let status = child
         .graceful_shutdown_tree(std::time::Duration::from_secs(60))
         .expect("graceful_shutdown_tree");
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGTERM),
+        "the root dies to the group's SIGTERM: {status:?}"
+    );
     recorder.assert_killed_only(pid as i32);
 
     let mark = crate::log_capture::mark();
@@ -389,7 +419,8 @@ fn drop_after_graceful_shutdown_tree_skips_at_debug_and_does_not_warn() {
 fn a_failed_elevated_spawns_cleanup_drops_its_handle_silently() {
     crate::log_capture::install();
     let recorder = record_kill_group();
-    let child = session(&["sleep", "300"]).spawn().expect("spawn");
+    let (child, stdin) = session_blocker();
+    let blocker = release_between_kill_and_wait(stdin);
     let pid = child.id().pid();
 
     let mark = crate::log_capture::mark();
@@ -407,6 +438,7 @@ fn a_failed_elevated_spawns_cleanup_drops_its_handle_silently() {
         "the group's kill and the root's reap"
     );
     recorder.assert_killed_only(pid as i32);
+    blocker.assert_killed();
     assert_eq!(crate::log_capture::records_since_on_current_thread(mark, WARN), []);
 }
 
@@ -539,15 +571,19 @@ fn fd_marker_drop_after_wait_sweeps_the_marker_holders_but_names_nothing_by_the_
 /// before the attach has no identity to walk from (`Marker::root` is `None`), which would make a
 /// "no walk" assertion vacuous.
 #[cfg(target_os = "macos")]
-fn reaped_sleep_root(mode: ContainMode) -> (u32, crate::Child) {
+fn reaped_blocker_root(mode: ContainMode) -> (u32, crate::Child) {
     let mut cmd = Command::new();
-    cmd.args(["sleep", "300"]);
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(Stdio::pipe_in()).expect("stdin pipe");
     cmd.contain_with(mode);
-    let child = cmd.spawn().expect("spawn");
+    let mut child = cmd.spawn().expect("spawn");
+    let stdin = child.stdin().expect("stdin pipe");
     assert_eq!(child.containment(), Containment::FdMarker);
     let pid = child.id().pid();
     child.kill().expect("kill the root");
-    child.wait().expect("reap the root");
+    // Released after the kill: a `kill` that sent nothing fails the assertion, not the reap.
+    drop(stdin);
+    crate::test_child::assert_killed("the root", child.wait().expect("reap the root"));
     (pid, child)
 }
 
@@ -558,7 +594,7 @@ fn reaped_sleep_root(mode: ContainMode) -> (u32, crate::Child) {
 fn fd_marker_without_a_group_drop_after_wait_only_sweeps_the_marker_holders() {
     crate::log_capture::install();
     let walks = record_walks();
-    let (pid, child) = reaped_sleep_root(ContainMode::TreeWalk);
+    let (pid, child) = reaped_blocker_root(ContainMode::TreeWalk);
 
     let mark = crate::log_capture::mark();
     drop(child);
@@ -577,7 +613,7 @@ fn fd_marker_with_a_group_drop_after_wait_neither_signals_the_group_nor_walks() 
     crate::log_capture::install();
     let recorder = record_kill_group();
     let walks = record_walks();
-    let (pid, child) = reaped_sleep_root(ContainMode::Strongest);
+    let (pid, child) = reaped_blocker_root(ContainMode::Strongest);
 
     let mark = crate::log_capture::mark();
     drop(child);

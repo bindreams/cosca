@@ -496,7 +496,8 @@ async fn tokio_kill_tree_of_a_backend_forgotten_unproven_treats_the_root_as_unkn
 async fn tokio_graceful_shutdown_tree_of_a_backend_forgotten_unproven_shuts_the_root_down_through_its_pidfd() {
     use crate::graceful_hooks::{at, HookPoint};
     use crate::signal::Sig::Term;
-    use crate::test_child::reaped_elsewhere::{ROOT_KILLED_BY_PIDFD, ROOT_TERMED_BY_PIDFD};
+    use crate::test_child::reaped_elsewhere::{reap_behind_status, ROOT_KILLED_BY_PIDFD, ROOT_TERMED_BY_PIDFD};
+    use std::os::unix::process::ExitStatusExt as _;
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
@@ -523,6 +524,9 @@ async fn tokio_graceful_shutdown_tree_of_a_backend_forgotten_unproven_shuts_the_
                 [(pid, Term, crate::send_log::Via::Pidfd)],
                 "the SIGTERM went out before the grace"
             );
+            // Released after the SIGTERM, so a SIGTERM that never took effect fails the assertion
+            // on how the root ended below, not the wait here.
+            drop(writer);
             crate::test_child::wait_until_zombie(pid);
         }
     });
@@ -545,8 +549,11 @@ async fn tokio_graceful_shutdown_tree_of_a_backend_forgotten_unproven_shuts_the_
     assert!(warns[0].contains(MAY_STILL_RUN), "{warns:?}");
     assert!(warns[0].contains(ROOT_TERMED_BY_PIDFD), "{warns:?}");
     assert!(!warns[0].contains(ROOT_KILLED_BY_PIDFD), "{warns:?}");
-    drop(writer);
-    reap_behind(pid);
+    assert_eq!(
+        reap_behind_status(pid).signal(),
+        Some(libc::SIGTERM),
+        "the SIGTERM ended the root"
+    );
 }
 
 /// 6.9+: `graceful_shutdown_tree` of a live root whose backend was forgotten unproven shuts its

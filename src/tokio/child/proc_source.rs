@@ -1354,7 +1354,18 @@ impl ProcSource {
         let ProcSource::Tokio { child, .. } = self else {
             unreachable!("only a tokio backend's wait answers `Exited`")
         };
-        crate::child::spawn::fate_of_a_look(child.try_wait().map_err(|e| e.raw_os_error()), id)
+        #[cfg(test)]
+        let pid = id.map_or_else(
+            || child.id().expect("a test's unreaped child has its pid"),
+            |id| id.pid(),
+        );
+        let looked = child.try_wait();
+        // So a test that released its fixture at the kill can assert how the root died.
+        #[cfg(test)]
+        if let Ok(Some(status)) = &looked {
+            crate::child::spawn::fault::record_teardown_reap(pid, *status);
+        }
+        crate::child::spawn::fate_of_a_look(looked.map_err(|e| e.raw_os_error()), id)
     }
 
     /// [`reap_now`](ProcSource::reap_now) for an elevation front (see [`crate::elevation::front`]):
@@ -1513,6 +1524,9 @@ impl ProcSource {
             unreachable!("a freshly spawned backend is a tokio child");
         };
         let mut failed = None;
+        // A fixture only the kill above would end is released here.
+        #[cfg(test)]
+        crate::child::spawn::fault::run_between_kill_and_wait();
         let fate = match exit_only::reap_blocking(&Target::PidFd(std::os::fd::AsFd::as_fd(pidfd))) {
             Ok(Ok(_reaped)) => {
                 #[cfg(test)]

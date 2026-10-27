@@ -1,17 +1,28 @@
 //! Async twin of `child/group_exact_tests.rs`'s foreign-reap case: on Linux 6.9+ the root's pidfd
 //! names its group exactly, whoever reaped the root.
 
-use crate::child::group_exact_tests::{await_started, EndedAtTheSigterm, Member, ROOT_WITH_A_MEMBER};
+use crate::child::group_exact_tests::{await_started, EndedAtTheSigterm, Member};
 use crate::send_log::{assert_group_signalled_first_through_the_pidfd, Capture, GroupStep, Route};
-use crate::test_child::reaped_elsewhere::reap_behind;
+use crate::test_child::reaped_elsewhere::reap_behind_status;
 use crate::test_groups::{pidfd_group_signal, Group};
 
-/// The sync `root_with_a_member`'s twin.
-pub(crate) fn root_with_a_member() -> (crate::tokio::Child, Member) {
+/// The sync `ROOT_WITH_A_MEMBER`, its root blocked on fd 4 instead of sleeping: it exits `0` once the
+/// writer of that pipe is dropped, which the member's stdin does not share.
+const RELEASABLE_ROOT_WITH_A_MEMBER: [&str; 3] = [
+    "sh",
+    "-c",
+    "exec 3<&0; (cat <&3 3<&- >/dev/null; echo survived >&2) & echo started; exec cat <&4 4<&- 3<&- >/dev/null 2>/dev/null",
+];
+
+/// The sync `root_with_a_member`'s twin, and the writer whose drop ends its root with status `0`;
+/// drop it right after the kill.
+pub(crate) fn releasable_root_with_a_member() -> (crate::tokio::Child, Member, std::io::PipeWriter) {
     let (stdio, started, member) = Member::pipes();
+    let (gate, release) = crate::test_child::held_writer_stdin();
     let child = {
         let mut cmd = crate::tokio::Command::new();
-        cmd.args(ROOT_WITH_A_MEMBER);
+        cmd.args(RELEASABLE_ROOT_WITH_A_MEMBER);
+        cmd.fd(4, gate).expect("set the root's release pipe");
         cmd.contain_with(crate::ContainMode::Session);
         cmd.stdin(stdio.stdin).expect("set stdin");
         cmd.stdout(stdio.stdout).expect("set stdout");
@@ -19,16 +30,33 @@ pub(crate) fn root_with_a_member() -> (crate::tokio::Child, Member) {
         cmd.spawn().expect("spawn")
     };
     await_started(started);
-    (child, member)
+    (child, member, release)
+}
+
+/// A [`BLOCKER_ARGV`](crate::test_child::BLOCKER_ARGV) root in its own session, and the writer
+/// whose drop ends it with status `0`. Its group has no other member.
+pub(crate) fn releasable_group_root() -> (crate::tokio::Child, std::io::PipeWriter) {
+    let (stdin, release) = crate::test_child::held_writer_stdin();
+    let mut cmd = crate::tokio::Command::new();
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(stdin).expect("set stdin");
+    cmd.contain_with(crate::ContainMode::Session);
+    (cmd.spawn().expect("spawn"), release)
+}
+
+/// Kills `child`'s root alone and reaps it behind the handle's back. `release` is dropped after the
+/// kill: a root nothing killed exits `0`.
+pub(crate) fn kill_and_reap_behind(child: &mut crate::tokio::Child, release: std::io::PipeWriter) {
+    child.kill().expect("kill the root alone");
+    drop(release);
+    crate::test_child::assert_killed("the root", reap_behind_status(child.id().pid()));
 }
 
 #[skuld::test]
 async fn tokio_kill_tree_kills_the_group_of_a_root_reaped_elsewhere(#[fixture(pidfd_group_signal)] _group: &Group) {
     crate::tokio::test_runtime::assert_current_thread();
-    let (mut child, member) = root_with_a_member();
-    let pid = child.id().pid();
-    child.kill().expect("kill the root alone");
-    reap_behind(pid);
+    let (mut child, member, release) = releasable_root_with_a_member();
+    kill_and_reap_behind(&mut child, release);
 
     let capture = Capture::start();
     let result = child.kill_tree();
@@ -54,10 +82,10 @@ enum Seen {
     KillWithAFailedPeek,
 }
 
-/// Kills `child`'s root alone, has another reaper reap it, and has `seen` observe that.
-async fn reap_behind_and_observe(child: &mut crate::tokio::Child, seen: Seen) {
-    child.kill().expect("kill the root alone");
-    reap_behind(child.id().pid());
+/// Kills `child`'s root alone, has another reaper reap it, and has `seen` observe that (see
+/// [`kill_and_reap_behind`] for `release`).
+async fn reap_behind_and_observe(child: &mut crate::tokio::Child, release: std::io::PipeWriter, seen: Seen) {
+    kill_and_reap_behind(child, release);
     match seen {
         Seen::TryWait => drop(child.try_wait().expect_err("a foreign reap answers ECHILD")),
         Seen::Wait => drop(child.wait().await.expect_err("a foreign reap answers ECHILD")),
@@ -80,8 +108,8 @@ async fn reap_behind_and_observe(child: &mut crate::tokio::Child, seen: Seen) {
 /// its pidfd, so `kill_tree` kills the group. Mutant: "observing a foreign reap drops the pidfd".
 async fn kill_tree_after_a_seen_foreign_reap(seen: Seen) {
     crate::tokio::test_runtime::assert_current_thread();
-    let (mut child, member) = root_with_a_member();
-    reap_behind_and_observe(&mut child, seen).await;
+    let (mut child, member, release) = releasable_root_with_a_member();
+    reap_behind_and_observe(&mut child, release, seen).await;
 
     let capture = Capture::start();
     let result = child.kill_tree();
@@ -94,8 +122,8 @@ async fn kill_tree_after_a_seen_foreign_reap(seen: Seen) {
 /// The `SIGTERM` twin of [`kill_tree_after_a_seen_foreign_reap`]. Same mutant.
 async fn terminate_tree_after_a_seen_foreign_reap(seen: Seen) {
     crate::tokio::test_runtime::assert_current_thread();
-    let (mut child, member) = root_with_a_member();
-    reap_behind_and_observe(&mut child, seen).await;
+    let (mut child, member, release) = releasable_root_with_a_member();
+    reap_behind_and_observe(&mut child, release, seen).await;
 
     let capture = Capture::start();
     let result = child.terminate_tree();
@@ -110,8 +138,8 @@ async fn terminate_tree_after_a_seen_foreign_reap(seen: Seen) {
 async fn graceful_shutdown_tree_after_a_seen_foreign_reap(seen: Seen) {
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
-    let (mut child, member) = root_with_a_member();
-    reap_behind_and_observe(&mut child, seen).await;
+    let (mut child, member, release) = releasable_root_with_a_member();
+    reap_behind_and_observe(&mut child, release, seen).await;
 
     let mark = crate::log_capture::mark();
     let capture = Capture::start();
@@ -127,8 +155,8 @@ async fn graceful_shutdown_tree_after_a_seen_foreign_reap(seen: Seen) {
 /// group by number".
 async fn kill_tree_below_6_9_after_a_seen_foreign_reap(seen: Seen) {
     crate::tokio::test_runtime::assert_current_thread();
-    let (mut child, member) = root_with_a_member();
-    reap_behind_and_observe(&mut child, seen).await;
+    let (mut child, member, release) = releasable_root_with_a_member();
+    reap_behind_and_observe(&mut child, release, seen).await;
     let old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     let capture = Capture::start();
     let result = child.kill_tree();
@@ -237,22 +265,17 @@ async fn tokio_graceful_shutdown_tree_shuts_the_group_down_after_a_foreign_reap_
     graceful_shutdown_tree_after_a_seen_foreign_reap(Seen::Wait).await;
 }
 
-/// A `sleep` in its own session, killed and reaped behind its handle's back.
+/// A [`releasable_group_root`], killed and reaped behind its handle's back.
 fn foreign_reaped_group_root() -> crate::tokio::Child {
-    let mut cmd = crate::tokio::Command::new();
-    cmd.args(["sleep", "300"]);
-    cmd.contain_with(crate::ContainMode::Session);
-    let mut child = cmd.spawn().expect("spawn");
-    child.kill().expect("kill the root");
-    reap_behind(child.id().pid());
+    let (mut child, release) = releasable_group_root();
+    kill_and_reap_behind(&mut child, release);
     child
 }
 
-/// [`root_with_a_member`], its root killed and reaped behind its handle's back.
+/// [`releasable_root_with_a_member`], its root killed and reaped behind its handle's back.
 fn foreign_reaped_root_with_a_member() -> (crate::tokio::Child, Member) {
-    let (mut child, member) = root_with_a_member();
-    child.kill().expect("kill the root alone");
-    reap_behind(child.id().pid());
+    let (mut child, member, release) = releasable_root_with_a_member();
+    kill_and_reap_behind(&mut child, release);
     (child, member)
 }
 
