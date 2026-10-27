@@ -232,22 +232,41 @@ fn host_filesystem_follows_a_link() {
     );
 }
 
+/// The `non_root` precondition, as `src/test_groups.rs` shapes a group's: `COSCA_TEST_NON_ROOT=0`
+/// turns the tests that need it off, and without that opt-out they run and fail under root.
+#[cfg(unix)]
+mod non_root {
+    pub(super) fn enabled() -> Result<(), String> {
+        match std::env::var("COSCA_TEST_NON_ROOT").as_deref() {
+            Ok("0") => Err("COSCA_TEST_NON_ROOT=0".to_owned()),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Fails the test unless the process is not root: root reads any file, so a test of what needs no
+/// read access would pass whatever the code does.
+#[cfg(unix)]
+#[skuld::fixture(requires = [non_root::enabled])]
+fn non_root() -> Result<(), String> {
+    // SAFETY: `geteuid` has no preconditions.
+    match unsafe { libc::geteuid() } {
+        0 => Err(
+            "this test needs a non-root user, and this process is root; set COSCA_TEST_NON_ROOT=0 to turn it off"
+                .to_owned(),
+        ),
+        _ => Ok(()),
+    }
+}
+
 /// `same_file` examines identity without opening for data: a file the caller may execute but not
 /// read is `Ok`, as it is for `is_file`.
 ///
-/// Mutant: `same_file` opens the paths for reading (`EACCES`). Needs a non-root user: root reads
-/// any file, so the mutant would pass.
+/// Mutant: `same_file` opens the paths for reading (`EACCES`).
 #[cfg(unix)]
 #[skuld::test]
-fn host_filesystem_same_file_needs_no_read_access() {
+fn host_filesystem_same_file_needs_no_read_access(#[fixture(non_root)] _non_root: &()) {
     use std::os::unix::fs::PermissionsExt;
-
-    // SAFETY: `geteuid` has no preconditions.
-    assert_ne!(
-        unsafe { libc::geteuid() },
-        0,
-        "this test needs a non-root user: root reads any file"
-    );
 
     let dir = tempfile::tempdir().unwrap();
     let tool = dir.path().join("tool");
