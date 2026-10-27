@@ -62,6 +62,7 @@ async fn kill_tree_release_reap(child: &mut crate::tokio::Child, sock: TcpStream
 
 #[skuld::test]
 async fn async_child_terminate_delivers_ctrl_break_to_a_contained_root() {
+    let _warns = crate::log_capture::warn_watch();
     crate::tokio::test_runtime::assert_current_thread();
     let (mut child, mut sock) = spawn_root(Handler::Ack);
     assert_eq!(child.graceful_mechanism(), GracefulMechanism::ConsoleGroup);
@@ -88,6 +89,7 @@ async fn an_async_plain_contained_root_really_receives_the_break() {
 /// there.
 #[skuld::test]
 async fn async_child_graceful_shutdown_exits_via_ctrl_break_on_windows() {
+    let _warns = crate::log_capture::warn_watch();
     crate::tokio::test_runtime::assert_current_thread();
     let (mut child, _sock) = spawn_root(Handler::Default);
     let pid = child.id().pid();
@@ -109,6 +111,7 @@ async fn async_child_graceful_shutdown_exits_via_ctrl_break_on_windows() {
 
 #[skuld::test]
 async fn async_child_graceful_shutdown_tree_tears_down_tree_on_windows() {
+    let _warns = crate::log_capture::warn_watch();
     crate::tokio::test_runtime::assert_current_thread();
     let (mut child, _root_sock, grand) = spawn_tree(Handler::Default, Handler::Default);
     let pid = child.id().pid();
@@ -135,6 +138,7 @@ async fn async_child_graceful_shutdown_tree_tears_down_tree_on_windows() {
 
 #[skuld::test]
 async fn async_child_graceful_shutdown_signals_the_group_but_only_kills_the_child() {
+    let _warns = crate::log_capture::warn_watch();
     crate::tokio::test_runtime::assert_current_thread();
     let (mut child, root_sock, mut grand) = spawn_tree(Handler::Ignore, Handler::Ack);
     assert_in_our_console(child.id().pid());
@@ -168,6 +172,7 @@ async fn async_child_graceful_shutdown_signals_the_group_but_only_kills_the_chil
 /// that sent nothing, or only to the root, yields code 0 for the member it missed.
 #[skuld::test]
 async fn async_graceful_shutdown_tree_sweep_is_load_bearing_on_windows() {
+    let _warns = crate::log_capture::warn_watch();
     crate::tokio::test_runtime::assert_current_thread();
     let (mut child, root_sock, grand) = spawn_tree(Handler::Ignore, Handler::Ignore);
     assert_in_our_console(child.id().pid());

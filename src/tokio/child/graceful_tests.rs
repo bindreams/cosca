@@ -182,9 +182,10 @@ async fn async_graceful_shutdown_graceful_path() {
 #[cfg(unix)]
 #[skuld::test]
 async fn async_graceful_shutdown_tree_graceful_root_sigterm() {
+    let _warns = crate::log_capture::warn_watch();
     use std::os::unix::process::ExitStatusExt;
     crate::tokio::test_runtime::assert_current_thread();
-    let (mut child, stdin) = blocker();
+    let (mut child, stdin) = crate::test_child::held_contained_blocker_without_cgroup_async(crate::Stdio::pipe());
     let _release = term_fault::release_at(term_fault::HookPoint::AfterTerminate, stdin);
     let status = child
         .graceful_shutdown_tree(Duration::from_secs(30))
@@ -200,6 +201,7 @@ async fn async_graceful_shutdown_tree_graceful_root_sigterm() {
 #[cfg(unix)]
 #[skuld::test]
 async fn async_graceful_shutdown_tree_tears_down_tree() {
+    let _warns = crate::log_capture::warn_watch();
     use std::os::unix::process::ExitStatusExt;
 
     use ::tokio::io::AsyncReadExt as _;
@@ -212,7 +214,7 @@ async fn async_graceful_shutdown_tree_tears_down_tree() {
     ]);
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
-    cmd.contain();
+    crate::test_child::contain_without_cgroup_async(&mut cmd);
     let mut child = cmd.spawn().expect("spawn");
     let stdin = child.stdin().expect("piped stdin");
     let mut stdout = child.stdout().expect("piped stdout");
@@ -255,13 +257,14 @@ async fn async_graceful_shutdown_escalates() {
 #[cfg(unix)]
 #[skuld::test]
 async fn async_graceful_shutdown_tree_escalates_with_a_surviving_grandchild() {
+    let _warns = crate::log_capture::warn_watch();
     use ::tokio::io::AsyncReadExt as _;
     crate::tokio::test_runtime::assert_current_thread();
     let mut cmd = crate::tokio::Command::new();
     cmd.args(crate::test_child::TERM_IGNORING_TREE_ARGV.iter().copied());
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
-    cmd.contain();
+    crate::test_child::contain_without_cgroup_async(&mut cmd);
     let mut child = cmd.spawn().expect("spawn");
     let stdin = child.stdin().expect("piped stdin");
     let mut stdout = child.stdout().expect("piped stdout");

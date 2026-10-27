@@ -76,6 +76,7 @@ fn kill_tree_release_reap(child: &crate::Child, sock: TcpStream) {
 /// nobody. The root survives its break by design, so the read cannot race a teardown.
 #[skuld::test]
 fn child_terminate_delivers_ctrl_break_to_a_contained_root() {
+    let _warns = crate::log_capture::warn_watch();
     let (child, mut sock) = spawn_root(Handler::Ack, crate::ContainMode::Strongest);
     assert_eq!(child.graceful_mechanism(), GracefulMechanism::ConsoleGroup);
     assert_in_our_console(child.id().pid(), "the root");
@@ -105,6 +106,7 @@ fn a_plain_contained_root_really_receives_the_break() {
 /// runs out.
 #[skuld::test]
 fn child_graceful_shutdown_exits_via_ctrl_break_on_windows() {
+    let _warns = crate::log_capture::warn_watch();
     let (child, _sock) = spawn_root(Handler::Default, crate::ContainMode::Strongest);
     let pid = child.id().pid();
     assert_in_our_console(pid, "the child");
@@ -127,6 +129,7 @@ fn child_graceful_shutdown_exits_via_ctrl_break_on_windows() {
 /// escalation can end it, while its grandchild acks the break and survives.
 #[skuld::test]
 fn child_graceful_shutdown_signals_the_group_but_only_kills_the_child() {
+    let _warns = crate::log_capture::warn_watch();
     let (child, root_sock, mut grand) = spawn_tree(Handler::Ignore, Handler::Ack, crate::ContainMode::Strongest);
     assert_in_our_console(child.id().pid(), "the root");
     // The root leaves with 0 when its socket closes; closed once the escalation returned.
@@ -184,6 +187,7 @@ fn windows_terminate_tree_reaps_the_grandchild() {
 /// soon as `terminate_tree` returns, so a missing one fails there, not when the grace runs out.
 #[skuld::test]
 fn child_graceful_shutdown_tree_tears_down_tree_on_windows() {
+    let _warns = crate::log_capture::warn_watch();
     let (child, _root_sock, grand) = spawn_tree(Handler::Default, Handler::Default, crate::ContainMode::Strongest);
     assert_eq!(child.containment(), Containment::JobObject);
     let pid = child.id().pid();
@@ -235,6 +239,7 @@ fn treewalk_terminate_tree_reaps_the_grandchild() {
 /// that sent nothing, or only to the root, yields code 0 for the member it missed.
 #[skuld::test]
 fn graceful_shutdown_tree_sweep_is_load_bearing_on_windows() {
+    let _warns = crate::log_capture::warn_watch();
     let (child, root_sock, grand) = spawn_tree(Handler::Ignore, Handler::Ignore, crate::ContainMode::Strongest);
     assert_in_our_console(child.id().pid(), "the root");
     let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, root_sock);
