@@ -83,14 +83,10 @@ thread_local! {
 type RmdirHook = Box<dyn FnMut(&std::path::Path) -> std::io::Result<()>>;
 
 /// While the guard lives, every `cgroup.kill` write on this thread fails with `EIO`, and kills
-/// nothing: a failed kill whose members may all still run. A teardown whose kill failed must not
-/// wait for the leaf's drain, which such members would never end: a wait that is about to block
-/// fails by assertion instead of hanging, as it does when a teardown skips its kill.
-///
-/// Nor may a teardown block on its child (`set_between_kill_and_wait`) after a kill it took as
-/// delivered, when no write was even attempted: a kill route that sends nothing and says it
-/// succeeded. That fails by assertion too. A look after a refused kill reaches the same seam, and
-/// is allowed.
+/// nothing: a failed kill whose members may all still run. A teardown after a failed kill must not
+/// wait for the leaf's drain, nor block on its child (`set_between_kill_and_wait`) after taking as
+/// delivered a kill that wrote nothing; either fails by assertion. A look after a refused kill
+/// reaches the child-wait seam and is allowed.
 pub(crate) fn fail_kill_writes() -> FailKillWrites {
     arm_fail_kill_writes(None)
 }
@@ -99,7 +95,7 @@ pub(crate) fn fail_kill_writes() -> FailKillWrites {
 /// nothing: what the unwind from that failure would otherwise wait for forever, as a drop does for
 /// a front only a kill ends.
 pub(crate) fn fail_kill_writes_releasing_on_unwritten_kill(release: impl FnOnce() + 'static) -> FailKillWrites {
-    arm_fail_kill_writes(Some((Box::new(release), false)))
+    arm_fail_kill_writes(Some((Box::new(release), ReleaseAt::UnwrittenKill)))
 }
 
 /// [`fail_kill_writes`] that runs `release` whenever the teardown is about to block on its child,
@@ -107,10 +103,18 @@ pub(crate) fn fail_kill_writes_releasing_on_unwritten_kill(release: impl FnOnce(
 /// it, instead of hanging. A look after a refused kill is a reach of this seam too, so this is not
 /// for a teardown that makes one.
 pub(crate) fn fail_kill_writes_releasing_at_wait(release: impl FnOnce() + 'static) -> FailKillWrites {
-    arm_fail_kill_writes(Some((Box::new(release), true)))
+    arm_fail_kill_writes(Some((Box::new(release), ReleaseAt::EveryWait)))
 }
 
-fn arm_fail_kill_writes(release: Option<(Box<dyn FnOnce()>, bool)>) -> FailKillWrites {
+/// When [`arm_fail_kill_writes`] runs its release at the child-wait seam.
+enum ReleaseAt {
+    /// Only when no `cgroup.kill` was attempted.
+    UnwrittenKill,
+    /// At every reach of the seam.
+    EveryWait,
+}
+
+fn arm_fail_kill_writes(release: Option<(Box<dyn FnOnce()>, ReleaseAt)>) -> FailKillWrites {
     FAIL_KILL_WRITES.with(|f| f.set(true));
     REFUSED_KILL_WRITES.with(|n| n.set(0));
     FailKillWrites {
@@ -121,8 +125,8 @@ fn arm_fail_kill_writes(release: Option<(Box<dyn FnOnce()>, bool)>) -> FailKillW
         }),
         _no_unwritten_kill: crate::child::spawn::fault::set_between_kill_and_wait(move || {
             let unwritten = REFUSED_KILL_WRITES.with(Cell::get) == 0;
-            if let Some((release, always)) = release {
-                if unwritten || always {
+            if let Some((release, at)) = release {
+                if unwritten || matches!(at, ReleaseAt::EveryWait) {
                     release();
                 }
             }

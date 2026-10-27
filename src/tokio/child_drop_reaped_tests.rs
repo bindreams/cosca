@@ -548,8 +548,7 @@ async fn cgroup_drop_after_wait_still_kills_the_tree_and_does_not_warn(#[fixture
     let stdin = child.stdin().expect("stdin pipe");
     let mut stderr = child.stderr().expect("stderr pipe");
     child.wait().await.expect("reap the root");
-    // Released as the leaf's kill returns: a kill that sent nothing lets the `cat` end by itself,
-    // and its shell says `eof`.
+    // Released as the kill returns; see [`KillRelease`].
     let release = crate::child::front_cgroup_tests::release_after_cgroup_kill(stdin);
 
     let mark = crate::log_capture::mark();
@@ -576,24 +575,26 @@ async fn cgroup_drop_after_wait_still_kills_the_tree_and_does_not_warn(#[fixture
     );
 }
 
-/// The drop alone is the killer, with the root still alive: no `kill_tree`, no wait. A member the
-/// test placed in the leaf dies of `SIGKILL` from the leaf's `cgroup.kill`, which the drop writes
-/// before it waits for the leaf to drain, and then removes the leaf.
-///
-/// The test's holders (the root's stdin and the member's) are released as the write returns, or
-/// when the drain wait is about to block, so a write that sent nothing ends the member by itself
-/// and `assert_killed` fails instead of the drop waiting for it for ever.
-///
-/// Mutant: the drop's `cgroup.kill` write sends nothing.
+/// The async twin of the sync `cgroup_drop_of_an_exited_unreaped_root_kills_its_orphaned_descendant`:
+/// the root has exited and nothing has reaped it, and the drop's `cgroup.kill` ends the `cat` it
+/// left in the leaf. Mutant: the drop's `cgroup.kill` write sends nothing.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-async fn cgroup_async_drop_alone_kills_the_members_and_removes_the_leaf(#[fixture(cgroup)] _group: &Group) {
+async fn cgroup_drop_of_an_exited_unreaped_root_kills_its_orphaned_descendant(#[fixture(cgroup)] _group: &Group) {
     crate::tokio::test_runtime::assert_current_thread();
+    use ::tokio::io::AsyncReadExt as _;
+
+    crate::log_capture::install();
     let mut cmd = Command::new();
-    cmd.args(["cat"]);
+    cmd.args([
+        "sh",
+        "-c",
+        "exec 3<&0; { cat <&3 3<&- && echo eof; } & echo started; exit 0",
+    ]);
     cmd.contain_with(ContainMode::Strongest);
-    cmd.kill_on_drop(true);
     cmd.stdin(crate::Stdio::pipe_in()).expect("stdin pipe");
+    cmd.stdout(crate::Stdio::pipe_out()).expect("stdout pipe");
+    cmd.stderr(crate::Stdio::pipe_out()).expect("stderr pipe");
     let mut child = cmd.spawn().expect("spawn");
     assert_eq!(child.containment(), Containment::CgroupV2);
     let leaf = match &child.os.attached {
@@ -601,6 +602,78 @@ async fn cgroup_async_drop_alone_kills_the_members_and_removes_the_leaf(#[fixtur
         other => panic!("a cgroup child holds its leaf, got {other:?}"),
     };
     let _leaf_cleanup = cgroup_common::LeafGuard::new(leaf.clone());
+    let mut started = [0u8; 8];
+    let mut stdout = child.stdout().expect("stdout pipe");
+    stdout.read_exact(&mut started).await.expect("read `started`");
+    let stdin = child.stdin().expect("stdin pipe");
+    let mut stderr = child.stderr().expect("stderr pipe");
+    crate::test_child::wait_until_zombie(child.id().pid());
+    // Released as the kill returns; see [`KillRelease`].
+    let release = crate::child::front_cgroup_tests::release_after_cgroup_kill(stdin);
+
+    let mark = crate::log_capture::mark();
+    drop(child);
+
+    release.assert_killed();
+    assert_eq!(drop_warns_since(mark), []);
+    let mut rest = Vec::new();
+    stderr
+        .read_to_end(&mut rest)
+        .await
+        .expect("the cgroup kill ended the cat, closing stderr");
+    let mut said = Vec::new();
+    stdout
+        .read_to_end(&mut said)
+        .await
+        .expect("every holder of stdout is gone");
+    crate::child::front_cgroup_tests::assert_nothing_ended_by_itself(&said);
+    assert!(
+        !leaf.exists(),
+        "the drop must remove the drained leaf: {}",
+        leaf.display()
+    );
+}
+
+/// The drop alone is the killer, with the root still alive: no `kill_tree`, no wait. The root dies
+/// of `SIGKILL`, and so does the `cat` it left in the leaf (a real grandchild, in a shell that says
+/// `eof` if it ends by itself), and a member the test placed in the leaf. The leaf's `cgroup.kill`,
+/// which the drop writes before it waits for the leaf to drain, does it, and the drop then removes
+/// the leaf.
+///
+/// The test's holders (the root's stdin and the member's) are released as the write returns, or
+/// when the drain wait is about to block, so a write that sent nothing ends the tree by itself
+/// and `assert_killed` fails.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn cgroup_async_drop_alone_kills_the_members_and_removes_the_leaf(#[fixture(cgroup)] _group: &Group) {
+    crate::tokio::test_runtime::assert_current_thread();
+    use ::tokio::io::AsyncReadExt as _;
+
+    let mut cmd = Command::new();
+    cmd.args([
+        "sh",
+        "-c",
+        "exec 3<&0; { cat <&3 3<&- && echo eof; } & echo started; wait",
+    ]);
+    cmd.contain_with(ContainMode::Strongest);
+    cmd.kill_on_drop(true);
+    cmd.stdin(crate::Stdio::pipe_in()).expect("stdin pipe");
+    cmd.stdout(crate::Stdio::pipe_out()).expect("stdout pipe");
+    let mut child = cmd.spawn().expect("spawn");
+    assert_eq!(child.containment(), Containment::CgroupV2);
+    let leaf = match &child.os.attached {
+        crate::containment::Attached::Cgroup(leaf) => leaf.path().to_path_buf(),
+        other => panic!("a cgroup child holds its leaf, got {other:?}"),
+    };
+    let _leaf_cleanup = cgroup_common::LeafGuard::new(leaf.clone());
+    let mut started = [0u8; 8];
+    let mut stdout = child.stdout().expect("stdout pipe");
+    stdout.read_exact(&mut started).await.expect("read `started`");
+    assert_eq!(
+        &started,
+        b"started
+"
+    );
     let stdin = child.stdin().expect("stdin pipe");
 
     // A member of the test's own, blocked on its stdin and placed in the leaf.
@@ -619,11 +692,18 @@ async fn cgroup_async_drop_alone_kills_the_members_and_removes_the_leaf(#[fixtur
     );
     let release = crate::child::front_cgroup_tests::release_after_cgroup_kill((stdin, member_stdin));
     release.observe(member.id());
+    release.observe(child.id().pid());
 
     drop(child);
 
     release.assert_killed();
     member.wait().expect("reap the member");
+    let mut said = Vec::new();
+    stdout
+        .read_to_end(&mut said)
+        .await
+        .expect("the root and the cat it left are gone");
+    crate::child::front_cgroup_tests::assert_nothing_ended_by_itself(&said);
     assert!(
         !leaf.exists(),
         "the drop must drain and remove the leaf: {}",

@@ -121,11 +121,11 @@ sh -c 'trap "" TERM; echo $$; exec cat >/dev/null' <&3 3<&- &
 exec 3<&-
 exec cat >/dev/null"#;
 
-/// [`TREE`] with the forked `cat` under a `sh` that prints its pid and says `eof` on stderr once that
-/// `cat` ends by itself. A `cat` a kill ended exits by a signal, and the `&&` says nothing, however
-/// the kernel orders the two deaths.
+/// [`TREE`] with a `sh` that waits for the forked `cat`, which is the pid it prints, and says `eof` on
+/// stderr once that `cat` ends by itself. A `cat` a kill ended exits by a signal, and the `&&` says
+/// nothing, however the kernel orders the two deaths.
 const TREE_SAYING_EOF: &str = r#"exec 3<&0
-sh -c 'trap "" TERM; echo $$; cat >/dev/null && echo eof >&2' <&3 3<&- &
+sh -c 'trap "" TERM; exec 4<&0; cat >/dev/null <&4 4<&- & echo $!; wait $! && echo eof >&2' <&3 3<&- &
 exec 3<&-
 exec cat >/dev/null"#;
 
@@ -879,8 +879,6 @@ fn tree_paths_send_nothing_by_the_root_number_after_a_reap() {
 
 /// A cgroup names no pid, so its kill still runs after any reap, and ends the forked `cat` before stdin
 /// closes: the cell fails if that `cat` says it ended by itself.
-///
-/// Mutants: the cgroup's kill skipped after a reap; a `cgroup.kill` write that sends nothing.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn cgroup_tree_paths_still_kill_through_the_cgroup_after_a_reap(#[fixture(cgroup)] _group: &Group) {

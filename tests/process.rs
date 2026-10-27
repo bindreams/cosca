@@ -580,6 +580,18 @@ fn death_watch_spawn_tree_panics_when_the_root_dies_before_reporting_the_grandch
     );
 }
 
+/// [`death_watch_spawn_tree_panics_when_the_root_dies_before_reporting_the_grandchild_pid`] through
+/// the helper that ends a failed tree: with no grandchild reported there is none to prove dead, so
+/// the helper asserts that its `kill_tree` succeeded and that the root ended.
+#[skuld::test]
+fn death_watch_spawn_tree_ending_a_failure_ends_a_tree_whose_root_reported_no_grandchild() {
+    let message = panic_message_of(|| common::spawn_tree_ending_a_failure("spawn-grandchild-report-eof", true));
+    assert!(
+        message.contains("died before it reported the grandchild pid"),
+        "got: {message:?}"
+    );
+}
+
 // The testbin's ack seam (`testbin/ack.rs`) =====
 
 /// Spawns `control-block` with the seam set to `seam` and, when `opted_in`, the accept opt-in.

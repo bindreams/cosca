@@ -152,9 +152,11 @@ fn drop_skipped_its_kill(mark: usize) -> bool {
 ///
 /// What ends the grandchild depends on the tree. A Linux cgroup or process-group tree of an
 /// `*_ending_a_failure` helper was ended by its `kill_tree` before the unwind and asserted dead
-/// there, so the drop proves nothing about it. Any other tree's grandchild is ended by that drop's
-/// tree kill, or by itself first: the unwind closes the sockets and the listener, then drops the
-/// `Child` last (`Tree`'s field order).
+/// there, so the drop proves nothing about it: the drop's own kill of an orphaned grandchild is the
+/// library's tests, `cgroup_drop_of_an_exited_unreaped_root_kills_its_orphaned_descendant` (sync and
+/// tokio) and `dropping_an_exited_but_unreaped_process_group_child_still_kills_the_group`. Any other
+/// tree's grandchild is ended by that drop's tree kill, or by itself first: the unwind closes the
+/// sockets and the listener, then drops the `Child` last (`Held`'s field order).
 ///
 /// The grandchild must have been a live member of the containment when identified, and the drop
 /// must not have skipped its kill; both are asserted so the wait cannot hang. On a skipped kill

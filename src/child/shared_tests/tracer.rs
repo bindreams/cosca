@@ -81,10 +81,9 @@ fn try_wait_leaves_a_ptrace_stop_for_the_tracer(#[fixture(tracer_group)] _group:
     // SIGKILL through the handle (the pidfd), never PTRACE_KILL (which before v5.19 only resumes a
     // PTRACE_EVENT_STOP).
     b.shared.kill().expect("kill");
-    // A kill that sent nothing leaves the tracee stopped, and the wait below would block forever.
-    // Resumed with its stdin closed it ends by itself, and the assertion fails instead. A delivered
-    // `SIGKILL` is pending before the kill returns, so it beats both; the tracee may already be
-    // gone, and the resume then finds no stopped tracee (`ESRCH`).
+    // Resume with stdin closed: a tracee no kill reached ends by itself, so the assertion below fails
+    // rather than the wait blocking. A delivered SIGKILL is already pending and wins; the tracee may
+    // be gone (`ESRCH`).
     b.end_child();
     // SAFETY: as above.
     let resumed = unsafe { libc::ptrace(libc::PTRACE_CONT, pid, null(), null()) };

@@ -153,8 +153,7 @@ fn an_abandoned_childs_foreign_reap_is_debug_not_a_panic() {
 /// does the leader end by itself, released at `end_child`'s exit wait: `assert_killed` then fails
 /// instead of the wait hanging.
 ///
-/// Mutants: the group killed after the handle's kill (`[Handle, Group]`); the group kill sends
-/// nothing; the group kill and the handle's kill both send nothing.
+/// Mutants: the group killed after the handle's kill (`[Handle, Group]`); the group kill sends nothing.
 #[skuld::test]
 fn an_abandoned_child_outside_its_leaf_is_killed_as_its_group_before_its_handle(#[fixture(cgroup)] _group: &Group) {
     let (child, input, to_member, from_member) = leader_held_with_member();
@@ -365,9 +364,7 @@ fn an_abandoned_child_reaped_elsewhere_after_its_group_kill_is_killed(#[fixture(
 /// Where the kernel refuses `PIDFD_SIGNAL_PROCESS_GROUP` (before 6.9), the group kill of a child
 /// outside its leaf goes by its number only right after a check that the child is still unreaped,
 /// and kills its member. Mutants: "no check before the group kill by number", "`EINVAL` ends the
-/// group kill", "the group kill by number is not made", "the group kill by number and the handle's
-/// kill both send nothing" (the leader ends by itself, released at the exit wait, and `assert_killed`
-/// fails).
+/// group kill", "the group kill by number is not made".
 #[skuld::test]
 fn an_abandoned_childs_group_kill_by_number_follows_its_own_check() {
     use crate::send_log::{GroupStep, Route};
@@ -394,10 +391,6 @@ fn an_abandoned_childs_group_kill_by_number_follows_its_own_check() {
 
 /// Linux 6.9+: the group kill of a child outside its leaf goes through its handle, which names the
 /// group exactly, and kills its member: the handle's kill ends only the child.
-///
-/// Mutants: the group send through the handle sends nothing (the member survives); it and the
-/// handle's kill both send nothing (the leader ends by itself, released at the exit wait, and
-/// `assert_killed` fails).
 #[skuld::test]
 fn an_abandoned_childs_group_kill_goes_through_its_handle(#[fixture(pidfd_group_signal)] _group: &Group) {
     use crate::send_log::{GroupStep, Route};

@@ -1383,6 +1383,18 @@ async fn death_watch_spawn_tree_async_panics_when_the_root_dies_before_reporting
     );
 }
 
+#[cfg(feature = "tokio")]
+/// The async twin of the sync test of the same name in `process.rs`.
+#[skuld::test]
+async fn death_watch_spawn_tree_ending_a_failure_ends_a_tree_whose_root_reported_no_grandchild() {
+    let message = panic_message_of(common::spawn_tree_async_ending_a_failure("spawn-grandchild-report-eof")).await;
+    common::wait_for_last_async_root();
+    assert!(
+        message.contains("died before it reported the grandchild pid"),
+        "got: {message:?}"
+    );
+}
+
 #[path = "../src/test_harness.rs"]
 mod test_harness;
 

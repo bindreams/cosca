@@ -78,8 +78,7 @@ fn cgroup_a_front_the_leaf_kill_reached_is_waited_for_and_reaped(#[fixture(cgrou
     let id = Some(child.id());
     let observer = pidfd_of(pid);
     let subtree = leaf_of(&child).subtree().expect("the leaf's subtree");
-    // Released as the kill returns: a kill that sent nothing ends the front by itself, and
-    // `assert_killed` fails, instead of the teardown's wait hanging.
+    // Released as the kill returns; see [`KillRelease`].
     let release = release_after_cgroup_kill(stdin);
     release.observe(pid);
     child
@@ -184,8 +183,7 @@ fn cgroup_a_front_whose_place_cannot_be_read_is_left_unwaited(#[fixture(cgroup)]
     let id = Some(child.id());
     let observer = pidfd_of(pid);
     let subtree = leaf_of(&child).subtree().expect("the leaf's subtree");
-    // Released as the kill returns: a kill that sent nothing ends the cat by itself, and
-    // `assert_killed` fails.
+    // Released as the kill returns; see [`KillRelease`].
     let release = release_after_cgroup_kill(stdin);
     release.observe(pid);
     child
@@ -227,8 +225,7 @@ fn cgroup_a_front_the_leaf_kill_reached_whose_wait_fails_is_unaccounted_for(#[fi
     let id = Some(child.id());
     let observer = pidfd_of(pid);
     let subtree = leaf_of(&child).subtree().expect("the leaf's subtree");
-    // Released as the kill returns: a kill that sent nothing ends the cat by itself, and
-    // `assert_killed` fails.
+    // Released as the kill returns; see [`KillRelease`].
     let release = release_after_cgroup_kill(stdin);
     release.observe(pid);
     child

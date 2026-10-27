@@ -100,9 +100,8 @@ fn hand_back(go_byte: u8, wait: Wait, stop_first: bool) {
     }
 
     b.shared.kill().expect("kill");
-    // A kill that sent nothing leaves the tracee running or stopped, and the pidfd below never
-    // turns readable. Released, it ends by itself and the final status check fails instead. A
-    // delivered `SIGKILL` is pending before the kill returns, so it beats the release.
+    // Released: a tracee no kill reached ends by itself, so the final status check fails rather than
+    // the pidfd below never turning readable. A delivered SIGKILL is already pending and wins.
     b.end_child();
     if stop_first {
         tracer.send(RESUME);

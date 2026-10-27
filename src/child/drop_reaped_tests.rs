@@ -524,8 +524,42 @@ fn cgroup_drop_after_wait_still_kills_the_tree_and_does_not_warn(#[fixture(cgrou
     let stdin = child.stdin().expect("stdin pipe");
     let mut stderr = child.stderr().expect("stderr pipe");
     child.wait().expect("reap the root");
-    // Released as the leaf's kill returns: a kill that sent nothing lets the `cat` end by itself,
-    // and its shell says `eof`, instead of the drop's drain hanging.
+    // Released as the kill returns; see [`KillRelease`].
+    let release = crate::child::front_cgroup_tests::release_after_cgroup_kill(stdin);
+
+    let mark = crate::log_capture::mark();
+    drop(child);
+
+    release.assert_killed();
+    assert_eq!(drop_warns_since(mark), []);
+    let mut rest = Vec::new();
+    stderr
+        .read_to_end(&mut rest)
+        .expect("the cgroup kill ended the cat, closing stderr");
+    let mut said = Vec::new();
+    stdout.read_to_end(&mut said).expect("every holder of stdout is gone");
+    crate::child::front_cgroup_tests::assert_nothing_ended_by_itself(&said);
+}
+
+/// A root that exited and is not reaped leaves a descendant in its leaf, and the drop's `cgroup.kill`
+/// ends it: the kill that an unwind from a failed tree helper (`tests/common`'s
+/// `spawn_tree_ending_a_failure`) leaves to the drop. Mutant: the drop's `cgroup.kill` write sends
+/// nothing.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn cgroup_drop_of_an_exited_unreaped_root_kills_its_orphaned_descendant(#[fixture(cgroup)] _group: &Group) {
+    crate::log_capture::install();
+    let mut cmd = root_that_leaves(ROOT_LEAVING_A_CAT_THAT_SAYS_EOF);
+    cmd.contain_with(ContainMode::Strongest);
+    let mut child = cmd.spawn().expect("spawn");
+    assert_eq!(child.containment(), Containment::CgroupV2);
+    let mut started = [0u8; 8];
+    let mut stdout = child.stdout().expect("stdout pipe");
+    stdout.read_exact(&mut started).expect("read `started`");
+    let stdin = child.stdin().expect("stdin pipe");
+    let mut stderr = child.stderr().expect("stderr pipe");
+    crate::test_child::wait_until_zombie(child.id().pid());
+    // Released as the kill returns; see [`KillRelease`].
     let release = crate::child::front_cgroup_tests::release_after_cgroup_kill(stdin);
 
     let mark = crate::log_capture::mark();
