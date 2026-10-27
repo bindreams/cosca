@@ -330,8 +330,6 @@ pub(crate) mod dispatch;
 
 #[path = "containment/group_root.rs"]
 mod group_root;
-#[cfg(target_os = "linux")]
-pub(crate) use dispatch::ChildHandle;
 #[cfg(unix)]
 pub(crate) use dispatch::DropView;
 #[allow(
@@ -339,6 +337,8 @@ pub(crate) use dispatch::DropView;
     reason = "not every re-exported name here is consumed on every target/feature combination; re-exporting uniformly beats per-item cfg_attr gating"
 )]
 pub(crate) use dispatch::{attach, prepare, AbandonedChild, Attached, Attachment, Prepared, RootIdentity, TreeKilled};
+#[cfg(target_os = "linux")]
+pub(crate) use dispatch::{kill_group_through_pidfd, ChildHandle};
 pub(crate) use group_root::GroupRoot;
 #[cfg(unix)]
 pub(crate) use group_root::NotItsGroup;

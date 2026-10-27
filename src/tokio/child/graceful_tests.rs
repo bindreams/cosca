@@ -395,7 +395,7 @@ async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root()
     cmd.contain();
     let mut child = cmd.spawn().expect("spawn");
     // Held for the test's whole body — see `child::graceful_tests`'s sync twin for why.
-    let _stdin = child.stdin().expect("piped stdin");
+    let stdin = child.stdin().expect("piped stdin");
     let mut exit_gate = child.fd_write_end(4).expect("exit-gate write end");
     let mut readiness = [0u8; 1];
     child
@@ -439,6 +439,9 @@ async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root()
     // The forced sweep failure was a stub, so the TERM-ignoring descendant is still alive; a
     // real sweep now (the seam is consumed) kills it.
     child.kill_tree().expect("cleanup sweep");
+    // The cleanup is not under test, so the descendant's stdin is released before the drain wait:
+    // it ends by itself even if the sweep sent nothing, and the wait cannot be left unbounded.
+    drop(stdin);
     // Drain and remove the leaf here: the drop is not under test, and would leave a `cosca-*` leaf.
     if drainable {
         child.wait_tree().await.expect("the swept tree drains");

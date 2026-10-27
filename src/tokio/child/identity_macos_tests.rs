@@ -212,7 +212,7 @@ async fn macos_tokio_spawn_childs_own_read_refused_is_unassessable_and_the_progr
     assert_program_did_not_run(cmd, reader);
     // Who collected the child is open: std may have returned `Ok` for a child killed after its refusal.
     assert!(
-        crate::log_capture::contains_since(mark, "if its spawn did not collect it"),
+        crate::log_capture::contains_since(mark, "may be left unreaped"),
         "a refusal under tokio may leave an unreaped child, and the spawn must say so"
     );
 }
