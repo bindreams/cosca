@@ -338,6 +338,7 @@ fn prepare_places_the_marker_above_the_callers_reserved_fds() {
     let mut cmd = std::process::Command::new("/usr/bin/true");
     let prepared = super::prepare(
         &mut cmd,
+        &mut crate::child::spawn::in_child::InChild::default(),
         &ContainRequest {
             mode: Some(ContainMode::Strongest),
             nesting: Nesting::Mark,
@@ -372,6 +373,7 @@ fn a_failed_marker_install_leaves_prepare_without_one() {
     set_fault(Some(Fault::Pipe));
     let prepared = super::prepare(
         &mut cmd,
+        &mut crate::child::spawn::in_child::InChild::default(),
         &ContainRequest {
             mode: Some(ContainMode::Strongest),
             nesting: Nesting::Mark,
@@ -393,6 +395,7 @@ fn prepare_installs_no_marker_for_an_elevation_derived_spawn() {
     let mut cmd = std::process::Command::new("/usr/bin/true");
     let prepared = super::prepare(
         &mut cmd,
+        &mut crate::child::spawn::in_child::InChild::default(),
         &ContainRequest {
             mode: Some(ContainMode::Strongest),
             nesting: Nesting::Mark,

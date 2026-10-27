@@ -663,9 +663,9 @@ fn contain_with_fd3() -> (cosca::Containment, Vec<u8>) {
 }
 
 /// `.contain()` + `.fd(3, pipe_out())` on Linux: whatever mechanism is achieved, the child's fd 3
-/// carries exactly its own token, and containment is established. The cgroup `pre_exec` writes
-/// "0" to a pre-opened `cgroup.procs` fd, and fd_map's `pre_exec` dup2's the user's fd onto
-/// child fd 3; if they collided, the "0" would land in the stream or the pipe would break.
+/// carries exactly its own token, and containment is established. The child's one `pre_exec` hook
+/// writes "0" to a pre-opened `cgroup.procs` fd, then dup2's the user's fd onto child fd 3; if they
+/// collided, the "0" would land in the stream or the pipe would break.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn linux_contain_with_fd3_delivers_the_exact_payload() {
@@ -679,9 +679,7 @@ fn linux_contain_with_fd3_delivers_the_exact_payload() {
     assert_eq!(buf, b"FD3PAYLOAD", "fd 3 stream corrupted");
 }
 
-/// Regression: under a delegated cgroup, fd_map's dup2 onto fd 3 must not clobber the cgroup
-/// placement's `cgroup.procs` fd. A clobbered write degrades the spawn to a process group, so
-/// achieving `CgroupV2` is the proof.
+/// Under a delegated cgroup, `.fd(3, ..)` must still leave the spawn in a cgroup (`CgroupV2`).
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn linux_cgroup_v2_contain_with_fd3_does_not_clobber_cgroup_procs_fd(#[fixture(cgroup)] _group: &Group) {
