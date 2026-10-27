@@ -437,10 +437,10 @@ fn commandline_only_fd3_routes_through_the_raw_backend_and_works() {
 /// A CONTAINED child with fd >= 3 routes through the raw backend AND lands in OUR Job Object:
 /// `test_job_handle_contains_self()` confirms membership (immutable once assigned, so it is
 /// deterministic for a handle-pinned child regardless of run state), fd 3 delivers the child's
-/// bytes, and `kill_tree()` tears the tree down cleanly. EOF (child closing fd 3 on exit) bounds
-/// the read; no timer.
+/// bytes. The child exits by itself once it has written, so EOF (child closing fd 3 on exit)
+/// bounds the read and the final `wait` returns; no timer.
 #[skuld::test]
-fn contained_raw_child_is_in_our_job_and_kill_tree_reaps() {
+fn contained_raw_child_is_in_our_job() {
     let mut c = cosca::Command::new();
     c.executable(common::testbin())
         .args(["cosca_testbin", "write-fd", "3", "x"])
@@ -454,7 +454,39 @@ fn contained_raw_child_is_in_our_job_and_kill_tree_reaps() {
     let mut s = String::new();
     std::io::Read::read_to_string(&mut child.fd_read_end(cosca::Fd::from(3)).unwrap(), &mut s).unwrap();
     assert_eq!(s, "x");
+    child.wait().expect("reap the child that exited by itself");
+}
+
+#[cfg(windows)]
+/// `kill_tree` on a CONTAINED raw-backend child (`executable()`) ends it. The child blocks on a
+/// piped stdin the test holds and releases right after the kill, so a `kill_tree` that sends
+/// nothing lets it exit 0 (`more.com` leaves on EOF) and fails the exit-code assertion; it is
+/// proved by the exit event (`wait`) and the kill's exit code `1`.
+///
+/// Mutant: `kill_tree` is a no-op.
+#[skuld::test]
+fn contained_raw_child_is_killed_by_kill_tree() {
+    let mut c = cosca::Command::new();
+    c.executable(common::stdin_blocker_program())
+        .args(["more"])
+        .stdin(cosca::Stdio::pipe())
+        .unwrap()
+        .stdout(cosca::Stdio::null())
+        .unwrap()
+        .contain();
+    let mut child = c.spawn().expect("contained raw spawn");
+    assert_eq!(child.containment(), cosca::Containment::JobObject);
+    assert!(child.test_job_handle_contains_self(), "child must be inside OUR job");
+    let stdin = child.stdin().expect("piped stdin");
+
     child.kill_tree().expect("kill_tree");
+    drop(stdin);
+
+    assert_eq!(
+        child.wait().expect("reap").code(),
+        Some(1),
+        "kill_tree must kill the raw-backend child (exit code 1), not leave it to exit on EOF"
+    );
 }
 
 #[cfg(windows)]

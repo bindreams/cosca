@@ -69,13 +69,19 @@ async fn async_tree_ops_unsupported_when_uncontained() {
 #[skuld::test]
 async fn async_kill_tree_tears_down_tree() {
     let _warns = common::warn_watch();
-    let (mut child, mut root, mut grand) = common::spawn_tree_async("spawn-grandchild", |cmd| {
+    let (mut child, root, grand) = common::spawn_tree_async("spawn-grandchild", |cmd| {
         common::contain_without_cgroup_async(cmd);
+        cmd.kill_on_drop(true);
+        cmd.env(common::ECHO_HELD_ENV, "1");
     })
     .await;
+    let (root, grand) = (
+        common::Member::new(root, child.id().pid()),
+        common::Member::new(grand, common::last_reported_grandchild().expect("the grandchild's pid")),
+    );
     child.kill_tree().expect("kill_tree");
-    expect_eof("root", &mut root);
-    expect_eof("grandchild", &mut grand);
+    // A kill that did not come fails here by assertion instead of hanging a read for an EOF.
+    common::assert_members_killed(vec![(root, "the root"), (grand, "the grandchild")]);
     let status = child.wait().await.expect("reap root");
     assert!(
         !status.success(),
@@ -129,9 +135,10 @@ async fn async_contain_with_treewalk_tears_down_tree() {
     // kill_tree on a TreeWalk-contained tree tears down BOTH members via the identity walk
     // (no kernel group needed). The builder mirror's value-sensitivity is the unit test's job
     // (src/tokio/command_tests.rs).
-    let (mut child, mut root, mut grand) = common::spawn_tree_async("spawn-grandchild", |cmd| {
+    let (mut child, root, grand) = common::spawn_tree_async("spawn-grandchild", |cmd| {
         cmd.contain_with(cosca::ContainMode::TreeWalk)
             .nesting(cosca::containment::Nesting::Opaque);
+        cmd.env(common::ECHO_HELD_ENV, "1");
     })
     .await;
     // On macOS, ContainMode::TreeWalk still attaches Containment::FdMarker (decision 2: the
@@ -142,9 +149,12 @@ async fn async_contain_with_treewalk_tears_down_tree() {
         cosca::Containment::TreeWalk
     };
     assert_eq!(child.containment(), expected);
+    let (root, grand) = (
+        common::Member::new(root, child.id().pid()),
+        common::Member::new(grand, common::last_reported_grandchild().expect("the grandchild's pid")),
+    );
     child.kill_tree().expect("treewalk kill_tree");
-    expect_eof("root", &mut root);
-    expect_eof("grandchild", &mut grand);
+    common::assert_members_killed(vec![(root, "the root"), (grand, "the grandchild")]);
     let _ = child.wait().await.expect("reap");
 }
 
@@ -280,10 +290,15 @@ async fn async_graceful_tree_cancel_does_not_escalate_on_windows() {
     // The Windows non-escalation discriminator (this is the only Windows grace_wait entry):
     // BOTH members ignore CTRL_BREAK, so after poll-once + drop the root can only be dead if
     // something escalated — being alive proves the cancelled graceful sent nothing further.
-    let (mut child, mut root, mut grand) = common::spawn_tree_async("spawn-grandchild-ignore-break", |cmd| {
+    let (mut child, root, grand) = common::spawn_tree_async("spawn-grandchild-ignore-break", |cmd| {
         common::contain_without_cgroup_async(cmd);
+        cmd.env(common::ECHO_HELD_ENV, "1");
     })
     .await;
+    let (root, grand) = (
+        common::Member::new(root, child.id().pid()),
+        common::Member::new(grand, common::last_reported_grandchild().expect("the grandchild's pid")),
+    );
     {
         // Duration::MAX: the blocking watch cannot time out, the ignore-break members cannot
         // exit on the soft signal, and the cancel event is unsignaled until the drop — so a
@@ -303,8 +318,7 @@ async fn async_graceful_tree_cancel_does_not_escalate_on_windows() {
         "cancelled tree graceful must not have escalated"
     );
     child.kill_tree().expect("explicit sweep after cancel");
-    expect_eof("root", &mut root);
-    expect_eof("grandchild", &mut grand);
+    common::assert_members_killed(vec![(root, "the root"), (grand, "the grandchild")]);
     let _ = child.wait().await.expect("reap after cancelled graceful");
     // Release proof rides on teardown: the test runtime's drop JOINS blocking tasks, so a
     // cancel event that failed to release the Duration::MAX watcher hangs shutdown (bounded by
@@ -323,6 +337,7 @@ async fn async_graceful_tree_cancel_does_not_escalate() {
     // the cancelled graceful sent nothing further.
     let (mut child, mut root, mut grand) = common::spawn_tree_async("spawn-grandchild-ignore-term", |cmd| {
         common::contain_without_cgroup_async(cmd);
+        cmd.env(common::ECHO_HELD_ENV, "1");
     })
     .await;
     {
@@ -341,8 +356,8 @@ async fn async_graceful_tree_cancel_does_not_escalate() {
         "cancelled tree graceful must not have escalated"
     );
     child.kill_tree().expect("explicit sweep after cancel");
-    expect_eof("root", &mut root);
-    expect_eof("grandchild", &mut grand);
+    common::assert_dead(&mut root, "the root after the sweep");
+    common::assert_dead(&mut grand, "the grandchild after the sweep");
     let _ = child.wait().await.expect("reap");
 }
 
@@ -526,8 +541,11 @@ async fn async_child_terminate_delivers_ctrl_break_to_a_contained_root() {
     let mut ack = [0u8; 1];
     sock.read_exact(&mut ack).expect("the child must acknowledge the break");
     assert_eq!(&ack, b"B", "wrong ack byte");
-    child.kill_tree().expect("cleanup");
-    let _ = child.wait().await;
+    // As the sync twin: release the root, then exit code 1 (kill) vs 0 (released).
+    child.kill_tree().expect("kill_tree");
+    drop(sock);
+    let status = child.wait().await.expect("reap");
+    assert_eq!(status.code(), Some(1), "kill_tree must kill the root, got {status:?}");
 }
 
 #[cfg(feature = "tokio")]

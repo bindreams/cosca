@@ -136,17 +136,18 @@ async fn async_foreign_graceful_shutdown_escalates() {
 #[cfg(feature = "tokio")]
 #[skuld::test]
 async fn async_foreign_kill_tree_tears_down_tree() {
-    let (child, mut socks) = common::spawn_grandchild(false);
+    let (child, socks) = common::spawn_tree_with("spawn-grandchild", false, |cmd| {
+        cmd.env(common::ECHO_HELD_ENV, "1");
+    });
+    let [root, grand]: [_; 2] = socks.try_into().expect("a root and a grandchild socket");
+    let (root, grand) = (
+        common::Member::new(root, child.id().pid()),
+        common::Member::new(grand, common::last_reported_grandchild().expect("the grandchild's pid")),
+    );
     let p = Process::from_pid(child.id().pid()).found().expect("resolves");
     p.kill_tree().expect("kill_tree");
-    for (i, s) in socks.iter_mut().enumerate() {
-        let mut buf = [0u8; 1];
-        match s.read(&mut buf) {
-            Ok(0) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
-            other => panic!("tree member {i} not torn down: {other:?}"),
-        }
-    }
+    // A kill that sent nothing fails here by assertion instead of hanging a read for an EOF.
+    common::assert_members_killed(vec![(root, "the root"), (grand, "the grandchild")]);
     let _ = child.wait();
 }
 
