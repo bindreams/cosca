@@ -177,7 +177,7 @@ fn separator_spelling_does_not_change_the_entry() {
     assert!(fs.is_dir(p("//usr")).unwrap());
     assert!(!fs.is_file(p("/usr/bin/tool/")).unwrap());
     assert!(fs.same_file(&joined, p("/usr/bin/tool")).unwrap());
-    assert!(!fs.is_file(p("/usr/./bin/tool")).unwrap());
+    assert!(fs.is_file(p("/usr/./bin/tool")).unwrap());
 }
 
 /// A stated error on a path covers the path and everything below it, as a denied directory does.
@@ -330,13 +330,13 @@ fn a_unc_share_root_is_one_entry_with_or_without_a_separator() {
 /// The Windows fake reads a query as Win32 does a non-verbatim path: `.` and `..` resolve
 /// lexically before any name is matched. (Measured on Windows 11: `C:\Windows\nope\..\System32`
 /// and `C:\Windows\.` are directories, `C:\Windows\notepad.exe\.` is the file.) The POSIX fake
-/// does not resolve them.
+/// resolves `.` but not `..`.
 ///
 /// Mutants: a fake that matches `.` and `..` as names; one that keeps the trailing separator a
 /// final `.` or `..` leaves, so the file at `notepad.exe\.` is absent; one that resolves `..` on
 /// POSIX.
 #[skuld::test]
-fn the_windows_fake_resolves_dots_and_the_posix_fake_does_not() {
+fn the_windows_fake_resolves_dots_and_the_posix_fake_resolves_only_the_single_dot() {
     let fs = windows::FakeFilesystem::new()
         .with_file(&w(r"C:\Windows\System32\notepad.exe"))
         .with_dir(&w(r"C:\a\b"));
@@ -368,7 +368,159 @@ fn the_windows_fake_resolves_dots_and_the_posix_fake_does_not() {
     let fs = posix::FakeFilesystem::new().with_dir(p("/a/b"));
     assert!(!fs.is_dir(p("/a/x/../b")).unwrap());
     assert!(!fs.is_dir(p("/a/b/..")).unwrap());
-    assert!(!fs.is_dir(p("/a/./b")).unwrap());
+    assert!(fs.is_dir(p("/a/./b")).unwrap());
+}
+
+/// The POSIX fake reads `.` as the kernel does: `a/./b` is `a/b` whatever links `a` holds, so a
+/// `PATH` entry `.` joined with `tool` finds `tool`. A final `.` names a directory, so it never
+/// reaches a file. `..` is the one link-dependent component and stays a name.
+///
+/// Mutants: a fake that keeps `.` as a name; one that lets `tool/.` name the file; one that
+/// drops `..` too; one that drops every `.`, so the empty path becomes a directory.
+#[skuld::test]
+fn the_posix_fake_reads_a_single_dot_as_the_host_does() {
+    let fs = posix::FakeFilesystem::new()
+        .with_file(p("tool"))
+        .with_file(p("/usr/bin/tool"));
+    for file in ["./tool", "././tool", ".//tool", "/usr/./bin/./tool", "/usr/bin/./tool"] {
+        let expect = if file.starts_with('/') { "/usr/bin/tool" } else { "tool" };
+        assert!(fs.is_file(p(file)).unwrap(), "{file}");
+        assert_eq!(fs.canonical(p(file)).unwrap(), p(expect).to_path_buf(), "{file}");
+    }
+    // A final `.`, or a `.` before a trailing separator, demands a directory.
+    for not_file in ["tool/.", "./tool/", "/usr/bin/tool/.", "/usr/bin/tool/./"] {
+        assert!(!fs.is_file(p(not_file)).unwrap(), "{not_file}");
+        assert!(!fs.is_dir(p(not_file)).unwrap(), "{not_file}");
+    }
+    for dir in ["/usr/bin/.", "/usr/bin/./", "/usr/./bin", "/.", "/./", "/usr/."] {
+        assert!(fs.is_dir(p(dir)).unwrap(), "{dir}");
+    }
+    // The empty path stays absent; `.` is a directory only where the test states it.
+    assert!(!fs.is_dir(p("")).unwrap());
+    assert!(!fs.is_dir(p(".")).unwrap());
+    let fs = posix::FakeFilesystem::new().with_dir(p("."));
+    for dir in [".", "./", "./."] {
+        assert!(fs.is_dir(p(dir)).unwrap(), "{dir}");
+    }
+    assert!(!fs.is_dir(p("")).unwrap());
+    // `..` is still a name.
+    let fs = posix::FakeFilesystem::new().with_dir(p("/a/b"));
+    assert!(!fs.is_dir(p("/a/x/../b")).unwrap());
+}
+
+/// Drive-relative `C:` is the current directory of drive C, however it is spelled: `C:.`, `C:.\`,
+/// `C:./` and `C:a\..\` all name it, and `canonical` of any of them is a fixed point.
+///
+/// Mutants: a lookup that strips the trailing separator of `C:.\` and keeps `C:.` as a second
+/// key; a `canonical` that returns that second key.
+#[skuld::test]
+fn the_drive_relative_current_directory_has_one_key() {
+    let fs = windows::FakeFilesystem::new().with_dir(&w("C:"));
+    for dir in ["C:", "C:.", r"C:.\", "C:./", r"C:a\..\", r"C:.\.\", r"C:a\.."] {
+        assert!(fs.is_dir(&w(dir)).unwrap(), "{dir}");
+        assert!(!fs.is_file(&w(dir)).unwrap(), "{dir}");
+        let once = fs.canonical(&w(dir)).unwrap();
+        assert_eq!(once, w("C:"), "{dir}");
+        assert_eq!(fs.canonical(&once).unwrap(), once, "{dir}");
+    }
+    assert!(!fs.is_dir(&w(r"C:\a\..\x")).unwrap());
+    // Stated with the odd spelling, the plain one finds it.
+    let fs = windows::FakeFilesystem::new().with_dir(&w(r"C:.\"));
+    assert!(fs.is_dir(&w("C:")).unwrap());
+    // The plain relative current directory is the same shape.
+    let fs = windows::FakeFilesystem::new().with_dir(&w("."));
+    for dir in [".", r".\", "./", r"a\..\"] {
+        assert!(fs.is_dir(&w(dir)).unwrap(), "{dir}");
+        assert_eq!(fs.canonical(&w(dir)).unwrap(), w("."), "{dir}");
+    }
+}
+
+/// A name holding NUL is `InvalidInput` from every question, as on the host: no filesystem
+/// stores it, and it is not "absent". It beats a stated error.
+///
+/// Mutants: a fake that answers `Ok(false)`; one that checks only `is_file`; one that checks only
+/// one path of `same_file`; one that lets a stated error win.
+#[skuld::test]
+fn a_name_holding_nul_is_invalid_input() {
+    let fs = posix::FakeFilesystem::new()
+        .with_file(p("/ok"))
+        .with_error(p("/locked"), ErrorKind::PermissionDenied);
+    for bad in ["/a\0b", "\0", "/ok/\0", "/locked/a\0b"] {
+        let bad = p(bad);
+        assert_eq!(kind(fs.is_file(bad)), ErrorKind::InvalidInput, "{bad:?}");
+        assert_eq!(kind(fs.is_dir(bad)), ErrorKind::InvalidInput, "{bad:?}");
+        assert_eq!(kind(fs.canonical(bad)), ErrorKind::InvalidInput, "{bad:?}");
+        assert_eq!(kind(fs.same_file(bad, p("/ok"))), ErrorKind::InvalidInput, "{bad:?}");
+        assert_eq!(kind(fs.same_file(p("/ok"), bad)), ErrorKind::InvalidInput, "{bad:?}");
+    }
+    let fs = windows::FakeFilesystem::new()
+        .with_file(&w(r"C:\ok"))
+        .with_error(&w(r"C:\locked"), ErrorKind::PermissionDenied);
+    for bad in ["C:\\a\0b", "a\0", "\\\\s\\h\\\0", "C:\\locked\\a\0b"] {
+        let bad = w(bad);
+        assert_eq!(kind(fs.is_file(&bad)), ErrorKind::InvalidInput, "{bad:?}");
+        assert_eq!(kind(fs.is_dir(&bad)), ErrorKind::InvalidInput, "{bad:?}");
+        assert_eq!(kind(fs.canonical(&bad)), ErrorKind::InvalidInput, "{bad:?}");
+        assert_eq!(
+            kind(fs.same_file(&bad, &w(r"C:\ok"))),
+            ErrorKind::InvalidInput,
+            "{bad:?}"
+        );
+        assert_eq!(
+            kind(fs.same_file(&w(r"C:\ok"), &bad)),
+            ErrorKind::InvalidInput,
+            "{bad:?}"
+        );
+    }
+}
+
+// A file has no children, so a statement that puts a path under a file, or a file over a path
+// that has children, panics in the builder instead of answering wrongly later.
+//
+// Mutants: a builder that accepts either order; one that checks only one of them.
+
+#[skuld::test]
+#[should_panic(expected = "is a file")]
+fn a_path_under_a_stated_file_is_refused_posix() {
+    let _ = posix::FakeFilesystem::new().with_file(p("/a")).with_file(p("/a/b"));
+}
+
+#[skuld::test]
+#[should_panic(expected = "is a file")]
+fn a_path_under_a_stated_file_is_refused_windows() {
+    let _ = windows::FakeFilesystem::new()
+        .with_file(&w(r"C:\a"))
+        .with_dir(&w(r"C:\a\b"));
+}
+
+#[skuld::test]
+#[should_panic(expected = "has entries below it")]
+fn a_file_over_a_stated_child_is_refused_posix() {
+    let _ = posix::FakeFilesystem::new().with_file(p("/a/b")).with_file(p("/a"));
+}
+
+#[skuld::test]
+#[should_panic(expected = "has entries below it")]
+fn a_file_over_an_implied_directory_is_refused_windows() {
+    let _ = windows::FakeFilesystem::new()
+        .with_dir(&w(r"C:\a\b"))
+        .with_file(&w(r"C:\a"));
+}
+
+/// Restating an entry, or replacing a file by a directory, is not a contradiction.
+///
+/// Mutant: a check that fires on a restated file, or on a directory replacing a file.
+#[skuld::test]
+fn restating_an_entry_is_not_a_contradiction() {
+    let fs = posix::FakeFilesystem::new()
+        .with_file(p("/a/f"))
+        .with_file(p("/a/f"))
+        .with_dir(p("/a"))
+        .with_dir(p("/a"))
+        .with_file(p("/g"))
+        .with_dir(p("/g"));
+    assert!(fs.is_file(p("/a/f")).unwrap());
+    assert!(fs.is_dir(p("/g")).unwrap());
 }
 
 /// `canonical` returns the host's spelling: no repeated or trailing separator, and on Windows `\`

@@ -13,6 +13,10 @@ use crate::windows::{Path, PathBuf};
 /// `windows::Path::to_std_path`, so it names what its names spell: `C:\x\tool.` is the file
 /// `tool.`, not `tool`. A path with no such string (a relative `tool.`) is an
 /// [`InvalidInput`](io::ErrorKind::InvalidInput) error.
+///
+/// [`canonical`](Filesystem::canonical) is parsed back into a stored (lexical) spelling, so a
+/// Win32 `\\?\` prefix is not in the result (see the [`windows`](crate::windows) module docs).
+#[derive(Debug, Clone, Copy, Default)]
 pub struct HostFilesystem;
 
 /// Whether a metadata error says definitely "no such file": nothing at the path, a non-directory

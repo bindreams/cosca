@@ -593,13 +593,15 @@ impl Lookup for Path {
         }
         let mut named = false;
         let mut trailing = false;
+        let mut dotted = false;
         for c in self.components() {
             let name: &[u8] = match c {
-                Component::Empty => {
+                // `.` names nothing, but after a name it demands a directory (`tool/.`).
+                Component::Empty | Component::CurDir => {
+                    dotted |= c == Component::CurDir;
                     trailing = named;
                     continue;
                 }
-                Component::CurDir => b".",
                 Component::ParentDir => b"..",
                 Component::Normal(name) => name.as_bytes(),
             };
@@ -613,7 +615,15 @@ impl Lookup for Path {
         if trailing {
             bytes.push(b'/');
         }
+        // Only `.` was written: the current directory, which is not the empty path.
+        if !named && dotted && !self.has_root() {
+            bytes.push(b'.');
+        }
         PathBuf::from(bytes)
+    }
+
+    fn holds_nul(&self) -> bool {
+        self.as_bytes().contains(&0)
     }
 }
 

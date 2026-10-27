@@ -17,12 +17,16 @@ pub(crate) mod sealed {
     pub trait Lookup: PurePath {
         /// The path as the OS looks it up, so that two spellings of one entry are equal.
         ///
-        /// Repeated separators collapse. A trailing separator stays: it names only a directory. On
-        /// Windows the lookup also writes `\` for `/`, resolves `.` and `..` lexically as Win32 does
-        /// for a non-verbatim path (a final `.` or `..` leaves no trailing separator), and ends a UNC
-        /// share root in `\`. On POSIX `.` and `..` stay: the kernel resolves `..` physically, through
-        /// links the fake does not model.
+        /// Repeated separators collapse, and so does `.` (`a/./b` is `a/b` on every kernel and in
+        /// Win32). A trailing separator stays: it names only a directory, and so does a final `.`
+        /// after a name on POSIX (`tool/.` is `tool/`). On Windows the lookup also writes `\` for
+        /// `/`, resolves `..` lexically as Win32 does for a non-verbatim path (a final `.` or `..`
+        /// leaves no trailing separator), and ends a UNC share root in `\`. On POSIX `..` stays: the
+        /// kernel resolves it physically, through links the fake does not model.
         fn lookup_spelling(&self) -> Self::Buf;
+
+        /// Whether the path holds a NUL, which no filesystem accepts.
+        fn holds_nul(&self) -> bool;
     }
 }
 
@@ -39,10 +43,21 @@ pub(crate) mod sealed {
 /// `/usr/bin/tool`), a UNC share root is one entry with or without its trailing separator, and
 /// `/` is `\` on Windows. A trailing separator names only a directory.
 ///
-/// The Windows fake resolves `.` and `..` lexically, as Win32 does for a non-verbatim path:
-/// `C:\Windows\nope\..\System32` is `C:\Windows\System32`. The POSIX fake does not, because the
-/// kernel resolves `..` physically, through symlinks the fake does not model; a test queries the
-/// spelling it states.
+/// `.` is dropped on both OSes (`./tool` is `tool`, as the host reads it). The Windows fake also
+/// resolves `..` lexically, as Win32 does for a non-verbatim path: `C:\Windows\nope\..\System32`
+/// is `C:\Windows\System32`. The POSIX fake does not, because the kernel resolves `..` physically,
+/// through symlinks the fake does not model; a test queries the spelling it states. The drive
+/// relative `C:` is one entry however it is spelled (`C:.`, `C:.\`, `C:a\..\`).
+///
+/// A name that holds NUL is [`InvalidInput`](io::ErrorKind::InvalidInput) from every question, as
+/// on the host, whatever else the test stated about it.
+///
+/// [`canonical`](Filesystem::canonical) returns the entry's stated spelling, or a stated link's
+/// target as the test wrote it. A relative query gives a relative path (the host gives an
+/// absolute one).
+///
+/// A file has no children: stating a path under a stated file, or a file over a path that has
+/// entries below it, panics in the builder, since no filesystem holds that.
 ///
 /// Case is exact, even for Windows paths: the test states the case it queries. Windows trailing
 /// dots and spaces are not modelled (`notepad.exe.` is not `notepad.exe`).
@@ -72,13 +87,36 @@ fn lookup<P: FakePath + ?Sized>(p: &P) -> (P::Buf, bool) {
     let spelled: &P = spelled.borrow();
     if ends_in_separator(spelled) {
         let name = spelled.parent().expect("a trailing separator follows a name");
-        (name.to_owned(), true)
+        // Spelling the entry again settles the forms whose bare name differs from the one that
+        // carries the separator (the drive-relative `C:.\` over `C:.`).
+        (name.lookup_spelling(), true)
     } else {
         (spelled.to_owned(), false)
     }
 }
 
+/// Whether `key` is strictly below `ancestor`.
+fn is_below<P: FakePath + ?Sized>(key: &P, ancestor: &P) -> bool {
+    let mut up = key;
+    while let Some(parent) = up.parent() {
+        if parent == ancestor {
+            return true;
+        }
+        up = parent;
+    }
+    false
+}
+
+/// A name holding NUL is `InvalidInput` on the host before any lookup.
+fn refuse_nul<P: FakePath + ?Sized>(p: &P) -> io::Result<()> {
+    if p.holds_nul() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "the path holds a NUL"));
+    }
+    Ok(())
+}
+
 impl<P: FakePath + ?Sized> FakeFilesystem<P> {
+    /// A filesystem with nothing in it.
     pub fn new() -> Self {
         FakeFilesystem {
             entries: Vec::new(),
@@ -144,6 +182,11 @@ impl<P: FakePath + ?Sized> FakeFilesystem<P> {
     /// empty parent of a relative path is not an ancestor: nothing resolves it.
     fn state(&mut self, path: &P, entry: Entry) {
         let key = lookup(path).0;
+        if matches!(entry, Entry::File) {
+            let key: &P = key.borrow();
+            let has_children = self.entries.iter().any(|(stated, _)| is_below(stated.borrow(), key));
+            assert!(!has_children, "{key:?} has entries below it, so it cannot be a file");
+        }
         let mut ancestors = Vec::new();
         let mut child: &P = key.borrow();
         while let Some(parent) = child.parent() {
@@ -154,8 +197,10 @@ impl<P: FakePath + ?Sized> FakeFilesystem<P> {
             child = parent;
         }
         for ancestor in ancestors {
-            if self.find(ancestor.borrow()).is_none() {
-                self.entries.push((ancestor, Entry::Dir));
+            match self.find(ancestor.borrow()) {
+                None => self.entries.push((ancestor, Entry::Dir)),
+                Some(Entry::File) => panic!("{path:?} is under {ancestor:?}, which is a file"),
+                Some(_) => {}
             }
         }
         self.set(key, entry);
@@ -192,12 +237,14 @@ impl<P: FakePath + ?Sized> FakeFilesystem<P> {
     }
 
     fn at(&self, p: &P) -> io::Result<Option<&Entry>> {
+        refuse_nul(p)?;
         let (key, dir_only) = lookup(p);
         self.entry(key.borrow(), dir_only)
     }
 
     /// The entry `p` names with its stated link followed, once.
     fn resolved(&self, p: &P) -> io::Result<P::Buf> {
+        refuse_nul(p)?;
         let (key, dir_only) = lookup(p);
         match self.entry(key.borrow(), dir_only)? {
             None => Err(io::ErrorKind::NotFound.into()),
@@ -209,6 +256,7 @@ impl<P: FakePath + ?Sized> FakeFilesystem<P> {
     }
 }
 
+/// The same as [`FakeFilesystem::new`].
 impl<P: FakePath + ?Sized> Default for FakeFilesystem<P> {
     fn default() -> Self {
         Self::new()

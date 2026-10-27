@@ -18,7 +18,7 @@ same-file = "1"
 
 [target.'cfg(unix)'.dependencies]
 # `ENOENT` and `ENOTDIR`: which `metadata` errors mean "nothing there".
-libc = "0.2.189"
+libc = "0.2"
 
 [dev-dependencies]
 # The test harness for the `harness = false` lib.

@@ -900,6 +900,10 @@ impl Lookup for Path {
         }
         spelled
     }
+
+    fn holds_nul(&self) -> bool {
+        self.bytes().contains(&0)
+    }
 }
 
 /// A [`Filesystem`](crate::fs::Filesystem) of windows paths that a test describes. See

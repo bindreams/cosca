@@ -15,9 +15,13 @@ pub use host::HostFilesystem;
 
 /// What is at a path.
 ///
-/// Every method returns `Err` when the filesystem could not say (a permission, I/O or network
-/// failure), and `Ok(false)` when it says there is nothing there. A caller never reads an `Err`
-/// as absence.
+/// `is_file` and `is_dir` return `Err` when the filesystem could not say (a permission, I/O or
+/// network failure), and `Ok(false)` when it says there is nothing there: a caller never reads
+/// their `Err` as absence.
+///
+/// `canonical` and `same_file` have no `Ok` for "nothing there", so absence is
+/// [`NotFound`](io::ErrorKind::NotFound) from them. Every other `Err` is a failure to say, as for
+/// the other two.
 pub trait Filesystem {
     type Path: PurePath + ?Sized;
 
