@@ -34,8 +34,9 @@ use crate::windows::{Path, PathBuf};
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HostFilesystem;
 
-/// Whether a metadata error says definitely "no such file": nothing at the path, a non-directory
-/// in it, a name no filesystem accepts, or (Windows) no such drive.
+/// Whether a metadata error says definitely "no such file": nothing at the path (a missing drive
+/// included, which Windows reports as `PATH_NOT_FOUND`), a non-directory in it, or a name no
+/// filesystem accepts.
 ///
 /// Decided on the raw OS code, not [`io::ErrorKind`]: std maps `ERROR_BAD_NETPATH` and
 /// `ERROR_BAD_NET_NAME` to `NotFound` too, and an unreachable share may only be unreachable for now.
@@ -45,8 +46,8 @@ fn is_absence(e: &io::Error) -> bool {
     };
     #[cfg(windows)]
     {
-        // FILE_NOT_FOUND, PATH_NOT_FOUND, INVALID_DRIVE, INVALID_NAME, BAD_PATHNAME, DIRECTORY.
-        matches!(code, 2 | 3 | 15 | 123 | 161 | 267)
+        // FILE_NOT_FOUND, PATH_NOT_FOUND, INVALID_NAME, BAD_PATHNAME, DIRECTORY.
+        matches!(code, 2 | 3 | 123 | 161 | 267)
     }
     #[cfg(unix)]
     {
@@ -248,7 +249,7 @@ mod identity {
 
     /// The volume serial number and 64-bit file index of `f`, or the Win32 code of the failure.
     #[cfg(windows)]
-    fn narrow_file_id(f: &std::fs::File) -> io::Result<(u32, u64)> {
+    pub(super) fn narrow_file_id(f: &std::fs::File) -> io::Result<(u32, u64)> {
         use std::os::windows::io::AsRawHandle;
 
         use windows::Win32::Foundation::HANDLE;

@@ -18,30 +18,129 @@ fn host(p: &std::path::Path) -> PathBuf {
     return crate::posix::Path::from_std_path(p).to_path_buf();
 }
 
-/// The raw codes that mean "nothing there" are absence; the ones that only look like it are not.
+/// The `non_root` precondition, as `src/test_groups.rs` shapes a group's: `COSCA_TEST_NON_ROOT=0`
+/// turns the tests that need it off, and without that opt-out they run and fail under root.
+mod non_root {
+    pub(super) fn enabled() -> Result<(), String> {
+        match std::env::var("COSCA_TEST_NON_ROOT").as_deref() {
+            Ok("0") => Err("COSCA_TEST_NON_ROOT=0".to_owned()),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Fails the test where the process is root (a Unix concept): root reads any file and searches any
+/// directory, so a test of what needs no permission would pass whatever the code does.
+#[skuld::fixture(requires = [non_root::enabled])]
+fn non_root() -> Result<(), String> {
+    #[cfg(unix)]
+    // SAFETY: `geteuid` has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        return Err(
+            "this test needs a non-root user, and this process is root; set COSCA_TEST_NON_ROOT=0 to turn it off"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+/// The errors the OS gives for "nothing there" are absence, and the ones that only look like it are
+/// not. Each case is made by a real `std::fs::metadata` call, whose code is checked first, so the
+/// test cannot agree with a wrong code in `is_absence`.
 ///
-/// Mutants: a list missing one of the six codes; deciding on `ErrorKind::NotFound`, which `std`
-/// also gives `ERROR_BAD_NETPATH` and `ERROR_BAD_NET_NAME` (an unreachable share may only be
+/// `ERROR_INVALID_DRIVE` (15) is not in `is_absence`'s list: no call gives it. A missing drive is
+/// `PATH_NOT_FOUND` (`Q:\x`, `\\?\Q:\x` and every other drive spelling measured on build 26100 give
+/// 3), and `RtlNtStatusToDosError` maps no NT status to 15.
+///
+/// Mutants: a list missing one of the codes the calls give; deciding on `ErrorKind::NotFound`, which
+/// `std` also gives `ERROR_BAD_NETPATH` and `ERROR_BAD_NET_NAME` (an unreachable share may only be
 /// unreachable for now).
 #[skuld::test]
-fn host_filesystem_treats_not_found_codes_as_absence() {
+fn host_filesystem_treats_what_the_os_reports_as_absence(#[fixture(non_root)] _non_root: &()) {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("file");
+    std::fs::write(&file, b"").unwrap();
+    let under = |name: &str| dir.path().join(name);
+    let fails = |what: &str, path: &std::path::Path| std::fs::metadata(path).expect_err(what);
+
+    // What the OS says for each case; for absence, with the raw code it says it with.
     #[cfg(windows)]
-    let (absent, present): (&[i32], &[i32]) = (
-        // FILE_NOT_FOUND, PATH_NOT_FOUND, INVALID_DRIVE, INVALID_NAME, BAD_PATHNAME, DIRECTORY.
-        &[2, 3, 15, 123, 161, 267],
-        // ACCESS_DENIED, SHARING_VIOLATION, BAD_NETPATH, BAD_NET_NAME, NOT_READY.
-        &[5, 32, 53, 67, 21],
-    );
+    let (absent, present) = {
+        let with_separator = std::path::PathBuf::from(format!("{}\\", file.display()));
+        (
+            [
+                ("a missing file", fails("a missing file", &under("missing")), 2),
+                (
+                    "a missing directory",
+                    fails("a missing directory", &under("missing").join("x")),
+                    3,
+                ),
+                (
+                    "a file with a trailing separator",
+                    fails("a file with a separator", &with_separator),
+                    267,
+                ),
+                // `|` is not a Windows name character.
+                (
+                    "a name no filesystem accepts",
+                    fails("a bad name", &under("bad|name")),
+                    123,
+                ),
+                (
+                    "a UNC path with no share",
+                    fails("a UNC path with no share", std::path::Path::new(r"\\?\UNC\x")),
+                    161,
+                ),
+            ],
+            // `localhost` resolves without network traffic; its missing share is BAD_NET_NAME, or
+            // BAD_NETPATH where no server answers.
+            [(
+                "an unreachable share",
+                fails("a share", std::path::Path::new(r"\\localhost\cosca-no-such-share\x")),
+            )],
+        )
+    };
     #[cfg(unix)]
-    let (absent, present): (&[i32], &[i32]) = (
-        &[libc::ENOENT, libc::ENOTDIR],
-        &[libc::EACCES, libc::EIO, libc::ELOOP, libc::ENAMETOOLONG],
-    );
-    for &code in absent {
-        assert!(is_absence(&io::Error::from_raw_os_error(code)), "code {code}");
+    let (absent, present) = {
+        use std::os::unix::fs::PermissionsExt;
+
+        let locked = under("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0)).unwrap();
+        let denied = fails("a directory the caller may not search", &locked.join("x"));
+        // The directory is removed with the temporary one.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let looped = under("loop");
+        std::os::unix::fs::symlink(&looped, &looped).unwrap();
+        (
+            [
+                (
+                    "a missing file",
+                    fails("a missing file", &under("missing")),
+                    libc::ENOENT,
+                ),
+                (
+                    "a file used as a directory",
+                    fails("a file as a directory", &file.join("x")),
+                    libc::ENOTDIR,
+                ),
+            ],
+            [
+                ("a directory the caller may not search", denied),
+                ("a link that loops", fails("a link that loops", &looped)),
+                (
+                    "a name that is too long",
+                    fails("a long name", &under(&"a".repeat(300))),
+                ),
+            ],
+        )
+    };
+    for (what, e, code) in absent {
+        assert_eq!(e.raw_os_error(), Some(code), "{what}: {e:?}");
+        assert!(is_absence(&e), "{what}: {e:?}");
     }
-    for &code in present {
-        assert!(!is_absence(&io::Error::from_raw_os_error(code)), "code {code}");
+    for (what, e) in present {
+        assert!(!is_absence(&e), "{what}: {e:?}");
     }
     // An error with no OS code is judged by its kind.
     assert!(is_absence(&io::Error::from(io::ErrorKind::NotFound)));
@@ -232,33 +331,6 @@ fn host_filesystem_follows_a_link() {
     );
 }
 
-/// The `non_root` precondition, as `src/test_groups.rs` shapes a group's: `COSCA_TEST_NON_ROOT=0`
-/// turns the tests that need it off, and without that opt-out they run and fail under root.
-#[cfg(unix)]
-mod non_root {
-    pub(super) fn enabled() -> Result<(), String> {
-        match std::env::var("COSCA_TEST_NON_ROOT").as_deref() {
-            Ok("0") => Err("COSCA_TEST_NON_ROOT=0".to_owned()),
-            _ => Ok(()),
-        }
-    }
-}
-
-/// Fails the test unless the process is not root: root reads any file, so a test of what needs no
-/// read access would pass whatever the code does.
-#[cfg(unix)]
-#[skuld::fixture(requires = [non_root::enabled])]
-fn non_root() -> Result<(), String> {
-    // SAFETY: `geteuid` has no preconditions.
-    match unsafe { libc::geteuid() } {
-        0 => Err(
-            "this test needs a non-root user, and this process is root; set COSCA_TEST_NON_ROOT=0 to turn it off"
-                .to_owned(),
-        ),
-        _ => Ok(()),
-    }
-}
-
 /// An executable the caller may not read, and another file.
 #[cfg(unix)]
 fn unreadable_tool(dir: &std::path::Path) -> (PathBuf, PathBuf) {
@@ -412,16 +484,25 @@ fn host_filesystem_same_file_identifies_by_file_id() {
     );
 }
 
-/// An object with no file id (a device) fails `same_file` with the Win32 code, as every other
-/// error of the module carries it, not the `HRESULT` of the `windows` crate.
+/// An object with no file id (a device) fails each id query with the Win32 code, as every other
+/// error of the module carries it, not the `HRESULT` of the `windows` crate; `same_file`, which
+/// falls back from the wide query to the narrow one, returns the narrow query's.
 ///
-/// Mutant: the id query's error converted through `From<windows::core::Error>`, whose code is
+/// Mutants: either id query's error converted through `From<windows::core::Error>`, whose code is
 /// `0x80070001`.
 #[cfg(windows)]
 #[skuld::test]
 fn host_filesystem_same_file_reports_the_win32_code() {
+    use super::identity::{narrow_file_id, wide_file_id};
+
+    let nul = std::fs::OpenOptions::new().read(true).open(r"\\.\NUL").unwrap();
+    // ERROR_INVALID_PARAMETER from the wide query, ERROR_INVALID_FUNCTION from the narrow one.
+    let wide = wide_file_id(&nul).unwrap_err();
+    assert_eq!(wide.raw_os_error(), Some(87), "wide: {wide}");
+    let narrow = narrow_file_id(&nul).unwrap_err();
+    assert_eq!(narrow.raw_os_error(), Some(1), "narrow: {narrow}");
+
     let nul = PathBuf::parse(r"\\.\NUL").unwrap();
-    // ERROR_INVALID_FUNCTION.
     let err = HostFilesystem.same_file(&nul, &nul).unwrap_err();
     assert_eq!(err.raw_os_error(), Some(1), "{err}");
 }
@@ -472,7 +553,7 @@ fn host_filesystem_reports_every_absence_as_not_found() {
 /// handles to the fallback, so two different kinds of id are never compared.
 ///
 /// Mutants: no fallback (the error is returned); a fallback that compares the volume only; a
-/// fallback used for the failing handle alone.
+/// fallback used for the failing handle alone, or only when the second handle's query fails.
 #[cfg(windows)]
 #[skuld::test]
 fn host_filesystem_same_file_falls_back_without_file_id_info() {
@@ -500,20 +581,23 @@ fn host_filesystem_same_file_falls_back_without_file_id_info() {
     assert!(both(dir.path(), dir.path()).expect("fallback answers"));
     assert!(!both(dir.path(), &file).expect("fallback answers"));
 
-    // Only the second handle's query fails: the first is not compared by its wide id.
-    let second = |a: &std::path::Path, b: &std::path::Path| {
+    // Only one handle's query fails (the first is queried first): the other is not compared by its
+    // wide id.
+    let failing = |nth: usize, a: &std::path::Path, b: &std::path::Path| {
         let calls = Cell::new(0);
         same_file_with(a, b, |f| {
             calls.set(calls.get() + 1);
-            if calls.get() == 2 {
+            if calls.get() == nth {
                 unsupported()
             } else {
                 wide_file_id(f)
             }
         })
     };
-    assert!(second(&file, &link).expect("fallback answers"));
-    assert!(!second(&file, &other).expect("fallback answers"));
+    for nth in [1, 2] {
+        assert!(failing(nth, &file, &link).expect("fallback answers"), "handle {nth}");
+        assert!(!failing(nth, &file, &other).expect("fallback answers"), "handle {nth}");
+    }
 
     // An absent path is still `NotFound` through the seam: the fallback is not a way around it.
     let missing = dir.path().join("missing");
