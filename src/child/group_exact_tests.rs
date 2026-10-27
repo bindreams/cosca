@@ -14,7 +14,7 @@ use crate::test_groups::{pidfd_group_signal, Group};
 pub(crate) const ROOT_WITH_A_MEMBER: [&str; 3] = [
     "sh",
     "-c",
-    "exec 3<&0; (cat <&3 3<&- >/dev/null; echo survived >&2) & echo started; exec sleep 300 <&- 3<&- 2>/dev/null",
+    "exec 3<&0; (cat <&3 3<&- >/dev/null && echo survived >&2) & echo started; exec sleep 300 <&- 3<&- 2>/dev/null",
 ];
 
 /// A test's ends of the pipes of [`ROOT_WITH_A_MEMBER`]'s member.

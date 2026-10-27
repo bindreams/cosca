@@ -24,7 +24,7 @@ use crate::test_groups::{tracer_group, Group};
 fn try_wait_leaves_a_ptrace_stop_for_the_tracer(#[fixture(tracer_group)] _group: &Group) {
     use std::os::unix::process::ExitStatusExt as _;
 
-    let b = Blocker::spawn();
+    let mut b = Blocker::spawn();
     let pid = b.shared.id() as libc::pid_t;
     // `ptrace` is variadic, and glibc reads `addr` and `data` as pointers.
     let null = std::ptr::null_mut::<libc::c_void>;
@@ -81,6 +81,17 @@ fn try_wait_leaves_a_ptrace_stop_for_the_tracer(#[fixture(tracer_group)] _group:
     // SIGKILL through the handle (the pidfd), never PTRACE_KILL (which before v5.19 only resumes a
     // PTRACE_EVENT_STOP).
     b.shared.kill().expect("kill");
+    // Resume with stdin closed: a tracee no kill reached ends by itself, so the assertion below fails
+    // rather than the wait blocking. A delivered SIGKILL is already pending and wins; the tracee may
+    // be gone (`ESRCH`).
+    b.end_child();
+    // SAFETY: as above.
+    let resumed = unsafe { libc::ptrace(libc::PTRACE_CONT, pid, null(), null()) };
+    let resume_error = std::io::Error::last_os_error();
+    assert!(
+        resumed == 0 || resume_error.raw_os_error() == Some(libc::ESRCH),
+        "PTRACE_CONT: {resume_error}"
+    );
     assert_eq!(b.shared.wait().expect("wait").signal(), Some(libc::SIGKILL));
 }
 

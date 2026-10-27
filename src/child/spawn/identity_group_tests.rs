@@ -17,7 +17,7 @@ use crate::test_groups::{cgroup, pidfd_group_signal, Group};
 pub(crate) const ROOT_LEAVING_A_MEMBER: [&str; 3] = [
     "sh",
     "-c",
-    "exec 3<&0; (cat <&3 3<&- >/dev/null; echo survived >&2) & echo started",
+    "exec 3<&0; (cat <&3 3<&- >/dev/null && echo survived >&2) & echo started",
 ];
 
 /// Why the spawn's identity read fails.

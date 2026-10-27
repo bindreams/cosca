@@ -259,20 +259,27 @@ async fn tokio_armed_drop_whose_tree_kill_fails_does_not_wait_for_the_drain() {
     crate::tokio::test_runtime::assert_current_thread();
     let name = "cosca-armed-drop-failed-tree-kill";
     let (fake, leaf) = linux::fake_leaf(name, true);
-    let failing = Rc::new(RefCell::new(Some(leaf_fault::fail_kill_writes())));
+    let (child, stdin) = blocker();
+    let teardown = crate::child::spawn::fault::record_teardown_reaps();
+    let failing = Rc::new(RefCell::new(Some(leaf_fault::fail_kill_writes_releasing_at_wait(
+        move || drop(stdin),
+    ))));
+    let waited = Rc::new(Cell::new(false));
+    let release = Rc::new(RefCell::new(None));
     let (path, events) = (fake.leaf.clone(), fake.events.clone());
-    let until_rmdir = Rc::clone(&failing);
+    let (until_rmdir, armed_at_rmdir) = (Rc::clone(&failing), Rc::clone(&release));
+    let (flag, drain_events) = (Rc::clone(&waited), fake.events.clone());
     leaf_fault::set_rmdir_hook(move |_| {
-        drop(until_rmdir.borrow_mut().take());
+        if let Some(failing) = until_rmdir.borrow_mut().take() {
+            drop(failing);
+            let (flag, events) = (Rc::clone(&flag), drain_events.clone());
+            *armed_at_rmdir.borrow_mut() = Some(leaf_fault::set_before_drain_block(move || {
+                flag.set(true);
+                FakeLeaf::set_populated(&events, false);
+            }));
+        }
         FakeLeaf::rmdir(&path, &events)
     });
-    let waited = Rc::new(Cell::new(false));
-    let (flag, events) = (Rc::clone(&waited), fake.events.clone());
-    let _release = leaf_fault::set_before_drain_block(move || {
-        flag.set(true);
-        FakeLeaf::set_populated(&events, false);
-    });
-    let (child, teardown) = released_blocker();
     let root = Root::of(&child);
     let mark = crate::log_capture::mark();
     let (steps, levels) = linux::dropped(linux::contained_by(child, leaf), name);
