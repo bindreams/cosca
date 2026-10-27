@@ -241,10 +241,7 @@ fn tree_graceful_ops_work_from_a_caller_that_has_a_console() {
         "1",
         "kill_tree must kill the root, not leave it to exit when released: {r}"
     );
-    // The escalation leg is not run from a caller with a console: its kill and reap are one call,
-    // so nothing here could release the acker between them. `graceful_shutdown_tree`'s escalation
-    // is covered by `graceful_shutdown_tree_sweep_is_load_bearing_on_windows` in
-    // `src/child/ctrl_break_tests.rs`.
+    // The escalation leg is skipped here; `graceful_shutdown_tree_sweep_is_load_bearing_on_windows` covers it.
     assert_eq!(field(&r, "graceful"), "Skipped", "{r}");
 }
 
@@ -334,10 +331,7 @@ fn lone_graceful_ops_work_from_a_caller_that_has_a_console() {
         "the acker handles the break and keeps running: {r}"
     );
     assert_eq!(field(&r, "break"), "1", "the child must receive CTRL_BREAK: {r}");
-    // The escalation leg is not run from a caller with a console: its kill and reap are one call,
-    // so nothing here could release the acker between them. `graceful_shutdown`'s zero-grace
-    // escalation is covered by `child_graceful_shutdown_signals_the_group_but_only_kills_the_child`
-    // in `src/child/ctrl_break_tests.rs`.
+    // The escalation leg is skipped here; `child_graceful_shutdown_signals_the_group_but_only_kills_the_child` covers it.
     assert_eq!(field(&r, "graceful"), "Skipped", "{r}");
     assert_eq!(field(&r, "cleanup"), "Ok", "{r}");
     assert_eq!(
