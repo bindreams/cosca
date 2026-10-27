@@ -99,6 +99,13 @@ pub(crate) enum Container {
     /// A cgroup leaf whose placement write is made to fail, so the process group set before the
     /// spawn is the containment.
     LeafNotTaken,
+    /// `Strongest` with no cgroup leaf made (what a host without a delegated cgroup gives), so the
+    /// process group set before the spawn is the containment.
+    #[cfg_attr(
+        not(feature = "tokio"),
+        allow(dead_code, reason = "only the async post-fork tests use it")
+    )]
+    Leafless,
 }
 
 impl Container {
@@ -110,16 +117,22 @@ impl Container {
                 crate::containment::cgroup::fault::set_force_placement_write_result(0);
                 (crate::ContainMode::Strongest, PlacementForced)
             }
+            Container::Leafless => {
+                crate::containment::cgroup::fault::set_force_leaf_open_failure(true);
+                (crate::ContainMode::Strongest, PlacementForced)
+            }
         }
     }
 }
 
-/// Clears this thread's forced placement result, which only the forked child takes.
+/// Clears this thread's forced placement result, which only the forked child takes, and a forced
+/// leaf failure the spawn did not reach.
 pub(crate) struct PlacementForced;
 
 impl Drop for PlacementForced {
     fn drop(&mut self) {
         crate::containment::cgroup::fault::take_force_placement_write_result();
+        crate::containment::cgroup::fault::take_force_leaf_open_failure();
     }
 }
 

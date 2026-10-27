@@ -115,13 +115,14 @@ impl Command {
     /// [`Command::contain`](crate::Command::contain) for a child reaped by something else.
     ///
     /// tokio itself can fail a spawn after forking the child, and then drops it neither killed nor
-    /// reaped, without reporting its pid. On Linux the spawn's pidfd kills and reaps the root, and a
-    /// child contained in a cgroup leaf ([`Containment::CgroupV2`](crate::Containment::CgroupV2)) is
-    /// killed with its leaf. Without a leaf the root's process group is not killed yet, so a
-    /// process-group or session child's descendants keep running. On Linux 6.9+ the cleanup of a
-    /// spawn that fails at its identity read, of an elevated spawn that cannot finish, and of an
-    /// abandoned spawn whose cgroup leaf did not take its child do kill the group, through the
-    /// root's pidfd. Elsewhere this failure leaves the child running.
+    /// reaped, without reporting its pid. On Linux the spawn's pidfd kills and reaps the root, and
+    /// a child contained in a cgroup leaf ([`Containment::CgroupV2`](crate::Containment::CgroupV2))
+    /// is killed with its leaf. On Linux 6.9+ a process-group or session root's whole group is
+    /// killed too, through the root's pidfd, while the group has a member, whoever reaped the root.
+    /// Below 6.9 the root alone is killed, and a `warn` says the group's members may be left
+    /// running. An elevation front is the exception: it is sent no signal of its own and no group
+    /// kill, and is reaped only if it had exited, as its error says; a cgroup leaf's kill still ends
+    /// what is in the leaf. Elsewhere this failure leaves the child running.
     pub fn contain(&mut self) -> &mut Command {
         self.inner.contain();
         self

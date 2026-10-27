@@ -374,7 +374,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                 // tokio's error does not say whether std's spawn failed, so only the report can prove
                 // the program never ran.
                 return Err(if crate::child::spawn::unique_report::proves_no_exec(&unique) {
-                    warn_for_abandoned(&abandoned, &e);
+                    warn_for_abandoned(&abandoned, &e, None);
                     SpawnFailure::NotStarted(e)
                 } else {
                     abandoned_failure(abandoned, e, front)
@@ -430,8 +430,8 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
         // the child then keeps. Its hook was registered first of all, so the fd map, which may
         // `dup2` a mapping onto any number including the channel's, runs after the handshake is done.
         // A front spawned for a cgroup leaf is left to the leaf, which alone knows whether it holds
-        // the front, with the handshake's pidfd for a child the leaf cannot name (see
-        // `Handshake::leaving_front`).
+        // the front; any child spawned for one leaves the leaf the handshake's pidfd, or a copy,
+        // for a child the leaf cannot name (see `Handshake::leaving_front`).
         #[cfg(target_os = "linux")]
         let left_pidfd = crate::child::spawn::pidfd_handshake::LeftPidfd::default();
         #[cfg(target_os = "linux")]
@@ -439,6 +439,10 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
             cmd.elevation_front(),
             prepared.cgroup_leaf.is_some().then(|| std::rc::Rc::clone(&left_pidfd)),
         );
+        // A root whose group is its containment, with no leaf to kill through: a spawn tokio fails after
+        // its fork kills the group too.
+        #[cfg(target_os = "linux")]
+        let handshake = handshake.killing_group(prepared.leafless_group_is_containment());
 
         // On Unix, hand n>=3 child ends to fd_map, whose dup2 step `steps` runs LAST in the child
         // (see the ordering rationale in child/spawn.rs), and register the one hook.
@@ -464,9 +468,9 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
             // tokio can fail this spawn after its fork succeeded (its `build_child`: stdio
             // registration, its pidfd reaper, its signal driver), dropping the child neither killed
             // nor reaped, and it returns no pid. A cgroup leaf is still killed through when
-            // `prepared` drops, since that needs no pid (see `cgroup`'s report contract). Under any
-            // other containment — a process group, a session, a tree walk, none, or a spawn that
-            // degraded — nothing reaches the child, and it keeps running.
+            // `prepared` drops, since that needs no pid (see `cgroup`'s report contract). The
+            // handshake's pidfd kills and reaps the child, and, on 6.9+, kills its process group
+            // when that is its containment and no leaf holds it (`killing_group`).
             #[cfg(target_os = "linux")]
             let spawned = {
                 #[allow(clippy::disallowed_methods, reason = "spawn_lock is held by `_guard` above")]
@@ -675,6 +679,9 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
             // Linux 6.9+: the group the root may have left members in, whoever reaped the root.
             #[cfg(target_os = "linux")]
             crate::child::spawn::kill_group_before_teardown(&prepared, handle, &mut why);
+            // macOS: nothing kills the group, which the teardown's one warn says.
+            #[cfg(target_os = "macos")]
+            crate::child::spawn::note_group_left_running(&prepared, pid, &mut why);
             // Linux: a failed check says nothing about the child, and its pidfd pins it whatever
             // the peek said, so it is killed and reaped through the pidfd, as the sync spawn does.
             #[cfg(target_os = "linux")]
@@ -958,19 +965,26 @@ impl crate::child::spawn::pidfd_handshake::Spawned for ::tokio::process::Child {
     }
 
     /// Waits through the pidfd until the child is a zombie, then has tokio reap it at once.
-    fn reap_unexecuted(mut self, pidfd: std::os::fd::OwnedFd) {
-        crate::child::spawn::pidfd_handshake::await_unexecuted_exit(&pidfd, self.id());
+    fn reap_unexecuted(mut self, pidfd: std::os::fd::OwnedFd) -> ChildFate {
+        let delivered = crate::child::spawn::pidfd_handshake::await_unexecuted_exit(&pidfd, self.id());
         match self.try_wait() {
-            Ok(Some(_)) => {}
-            // A tracer holds the zombie: tokio's drop hands it to its orphan queue.
-            Ok(None) => log::debug!(
-                "{}: held by a tracer; left to tokio's reaper",
-                crate::child::spawn::named(self.id())
-            ),
-            Err(e) => log::debug!(
-                "{}: already reaped by someone else ({e})",
-                crate::child::spawn::named(self.id())
-            ),
+            Ok(Some(_)) => ChildFate::Reaped,
+            // Killed, and its zombie not yet visible here (the wait for it failed, so a tracer may
+            // hold it): tokio's drop hands it to its orphan queue.
+            Ok(None) => {
+                log::debug!(
+                    "{}: not yet collectable; left to tokio's reaper",
+                    crate::child::spawn::named(self.id())
+                );
+                ChildFate::Killed
+            }
+            Err(e) => {
+                log::debug!(
+                    "{}: reaped by someone else ({e})",
+                    crate::child::spawn::named(self.id())
+                );
+                crate::wait::exit_only::Foreign::Gone.fate(delivered)
+            }
         }
     }
 
@@ -1011,6 +1025,10 @@ mod slow_teardown_macos_tests;
 #[path = "spawn/identity_group_tests.rs"]
 mod identity_group_tests;
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "spawn/post_fork_group_tests.rs"]
+mod post_fork_group_tests;
+
 /// The fate of a child a failed tokio spawn abandoned with no handle on it (see
 /// [`warn_for_abandoned`]). Linux's handshake holds a pidfd on it, and answers itself.
 ///
@@ -1040,30 +1058,63 @@ fn abandoned_fate(child: crate::containment::AbandonedChild) -> ChildFate {
 /// tokio can fail a spawn after its fork, dropping the child neither killed nor reaped and
 /// returning no pid. Only a cgroup leaf still reaches such a child, and only once the child has
 /// told it who it is. The error cannot tell a failure before the fork from one after it, hence
-/// "may". Reported at `warn` every time. The fate of an elevation `front` the leaf found is noted
-/// on the error instead, as the spawn's other failures note it.
-fn warn_for_abandoned(child: &crate::containment::AbandonedChild, error: &Error) {
+/// "may". Reported at `warn` every time, unless `ended` says the child is gone.
+///
+/// `ended`: the handshake killed and reaped the child through its pidfd, or found it reaped. The
+/// child is then not at risk, so its fate is logged at `debug`; only an `OutOfReach` leaf still
+/// warns, of a descendant outside it. The fate of an elevation `front` the leaf found is noted on
+/// the error instead, as the spawn's other failures note it.
+fn warn_for_abandoned(child: &crate::containment::AbandonedChild, error: &Error, ended: Option<ChildFate>) {
     use crate::containment::AbandonedChild;
 
-    let consequence = match child {
-        AbandonedChild::Front(_) | AbandonedChild::Ended => return,
-        AbandonedChild::OutOfReach(why) => {
+    let consequence = match (child, ended) {
+        (AbandonedChild::Front(_) | AbandonedChild::Ended, _) => return,
+        (AbandonedChild::OutOfReach(why), Some(fate)) => {
             log::warn!(
-                "tokio spawn failed ({error}); if it failed after forking, unless its spawn collected it, the child \
-                 was left running and nothing can reach it outside its cgroup v2 leaf: {why}"
+                "tokio spawn failed ({error}); {fate}, and its cgroup v2 leaf's abandonment says: {why}; a \
+                 descendant of it outside the leaf, if any, is out of reach"
             );
             return;
         }
-        AbandonedChild::MaybeUnreaped => {
-            "the child exits before `exec`; if its spawn did not collect it, it is left unreaped, since it \
-             never reached the point where it names itself and nothing holds its pid"
+        (AbandonedChild::MaybeUnreaped | AbandonedChild::MaybeUnreachable, Some(fate)) => {
+            log::debug!("tokio spawn failed ({error}); {fate}");
+            return;
         }
-        AbandonedChild::MaybeUnreachable => {
-            "unless its spawn collected it, the child was left running and nothing \
+        (AbandonedChild::OutOfReach(why), None) => {
+            log::warn!(
+                "tokio spawn failed ({error}); if it failed after forking, unless its spawn collected it, the child \
+                 may be left running and nothing can reach it outside its cgroup v2 leaf: {why}"
+            );
+            return;
+        }
+        (AbandonedChild::MaybeUnreaped, None) => {
+            "the child exits before `exec`; unless its spawn collected it, it may be left unreaped, since it \
+             never reached the point where it names itself and nothing here holds its pid"
+        }
+        (AbandonedChild::MaybeUnreachable, None) => {
+            "unless its spawn collected it, the child may be left running and nothing \
              can reach it: only a cgroup v2 leaf is killed without the child's pid"
         }
     };
     log::warn!("tokio spawn failed ({error}); if it failed after forking, {consequence}");
+}
+
+/// Warns of a tokio spawn that failed for a child never told to go and dropped with nothing holding
+/// it: it never ran the program, and only its reaping is open. tokio's error took its pid, so none
+/// is named. `leaf_says` is what its cgroup v2 leaf's abandonment said of a child it could neither
+/// hold nor kill, passed on as it is.
+#[cfg(target_os = "linux")]
+fn warn_for_unreaped(error: &Error, leaf_says: Option<&str>) {
+    match leaf_says {
+        None => log::warn!(
+            "tokio spawn failed ({error}); if it failed after forking, the child never ran the program, but it may \
+             be left unreaped: nothing here holds its pid, and cosca never reaps a Linux child by pid"
+        ),
+        Some(why) => log::warn!(
+            "tokio spawn failed ({error}); if it failed after forking, the child never ran the program, and whether \
+             it was reaped is unknown; its cgroup v2 leaf's abandonment says: {why}"
+        ),
+    }
 }
 
 /// The fate of an elevation front the leaf's abandonment found: reaped through the leaf, left
@@ -1091,7 +1142,7 @@ fn abandoned_failure(
     error: Error,
     front: Option<crate::elevation::front::Front>,
 ) -> SpawnFailure {
-    warn_for_abandoned(&abandoned, &error);
+    warn_for_abandoned(&abandoned, &error, None);
     match abandoned {
         crate::containment::AbandonedChild::Front(fate) => {
             SpawnFailure::started(fate.note(error, front, None), front_child_fate(fate))
@@ -1112,7 +1163,19 @@ fn abandoned_after_handshake(
 ) -> SpawnFailure {
     use crate::containment::AbandonedChild;
 
-    warn_for_abandoned(&abandoned, failure.error());
+    // Except for a front left to the leaf, the handshake held the child; `ended_child` says whether
+    // it ended it.
+    let ended = failure.ended_child().filter(|_| !left_to_leaf);
+    match abandoned {
+        // The child was never told to go: it never ran the program, and only its reaping is open.
+        AbandonedChild::MaybeUnreachable if failure.left_child_unreaped() => {
+            warn_for_unreaped(failure.error(), None);
+        }
+        AbandonedChild::OutOfReach(ref why) if failure.left_child_unreaped() => {
+            warn_for_unreaped(failure.error(), Some(why));
+        }
+        _ => warn_for_abandoned(&abandoned, failure.error(), ended),
+    }
     if !left_to_leaf {
         return failure;
     }
