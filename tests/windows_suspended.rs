@@ -542,6 +542,8 @@ fn death_watch_grandchild_of_an_async_resumed_nested_child_stays_in_the_enclosin
 mod test_harness;
 
 fn main() {
+    #[cfg(windows)]
+    common::install_log_capture();
     let mut runner = skuld::TestRunner::new();
     runner.libtest_names();
     runner.require_known_labels();

@@ -23,7 +23,7 @@ use crate::child::spawn::{
     attach_or_fault, dup, resolve_identity, resolve_non_merge, spawn_lock, ChildEnd, Classify, ParentStd, SpawnFailure,
 };
 use crate::command::Command;
-use crate::error::Error;
+use crate::error::{win32_io_error, Error};
 use crate::stdio::{Fd, ResolvedStdio};
 use crate::tokio::child::{Child, ProcSource};
 use crate::tokio::stdio::OwnedStd;
@@ -188,7 +188,7 @@ impl RawAsyncChild {
                     Ok(())
                 }
             }
-            Err(e) => Err(Error::Io(e.into())),
+            Err(e) => Err(Error::Io(win32_io_error(e))),
         }
     }
 

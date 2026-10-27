@@ -393,6 +393,8 @@ async fn an_async_no_window_contained_child_reports_no_in_process_route_via_the_
 mod test_harness;
 
 fn main() {
+    #[cfg(windows)]
+    common::install_log_capture();
     let mut runner = skuld::TestRunner::new();
     runner.libtest_names();
     runner.require_known_labels();

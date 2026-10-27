@@ -62,3 +62,26 @@ fn a_walk_from_a_root_that_lost_its_pid_terminates_nothing() {
     crate::Process::from_id(stale).kill_tree().expect("likewise");
     release(child);
 }
+
+/// The `Unassessable` source of a failed snapshot is the plain Win32 code (here the seam's
+/// `ERROR_ACCESS_DENIED`), so `kind()` classifies it. Mutant: `snapshot_failed` converts with the
+/// `windows` crate's own `io::Error` conversion, which keeps the HRESULT (`0x80070005`).
+#[skuld::test]
+fn a_failed_snapshot_is_unassessable_with_its_win32_code() {
+    let me = crate::Process::from_id(ProcessId::current());
+    let forced = force_snapshot_failure();
+    let result = me.parent();
+    drop(forced);
+    let Err(Error::Unassessable {
+        source: Some(source), ..
+    }) = result
+    else {
+        panic!("expected Unassessable with a source, got {result:?}");
+    };
+    assert_eq!(
+        source.raw_os_error(),
+        Some(windows::Win32::Foundation::ERROR_ACCESS_DENIED.0 as i32),
+        "{source:?}"
+    );
+    assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied, "{source:?}");
+}

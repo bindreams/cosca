@@ -249,9 +249,7 @@ pub(crate) fn windows_spawn(
 /// access-denied rather than file-not-found. So a genuine "no such program" is masked, and the
 /// detail says what was measured and stops there.
 ///
-/// Two error encodings reach here and both are accepted: the std path returns the bare Win32
-/// code, while the raw backends convert a `windows::core::Error` whose `raw_os_error` is the
-/// HRESULT.
+/// `err` carries the bare Win32 code, whichever backend spawned.
 #[cfg(windows)]
 pub(crate) fn classify_spawn_denial(
     err: Error,
@@ -267,9 +265,7 @@ pub(crate) fn classify_spawn_denial(
     let Error::Io(io) = &err else {
         return err;
     };
-    let win32 = ERROR_ACCESS_DENIED.0 as i32;
-    let hresult = windows::core::HRESULT::from_win32(ERROR_ACCESS_DENIED.0).0;
-    if !matches!(io.raw_os_error(), Some(c) if c == win32 || c == hresult) {
+    if io.raw_os_error() != Some(ERROR_ACCESS_DENIED.0 as i32) {
         return err;
     }
     // Never assert a cause the process just measured to be false, or could not measure at all.

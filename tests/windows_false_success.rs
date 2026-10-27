@@ -284,6 +284,8 @@ async fn an_async_treewalk_contained_root_gets_a_false_success_too() {
 mod test_harness;
 
 fn main() {
+    #[cfg(windows)]
+    common::install_log_capture();
     let mut runner = skuld::TestRunner::new();
     runner.libtest_names();
     runner.require_known_labels();

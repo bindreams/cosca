@@ -112,9 +112,54 @@ fn verbatim_unc_server_with_no_plain_spelling_is_refused() {
     );
 }
 
+/// Under `\\?\` a `.`, `..` or empty name is a name; in the plain spelling Win32 would apply it.
+/// So the parse refuses one wherever the plain spelling would have Win32 apply it: in the
+/// components, and before a device name or a share. A trailing separator, and a share `.` or `..`
+/// right after the server, read the same either way.
+///
+/// Mutant: the parse keeps `\\?\C:\a\..\b` as `C:\a\..\b`, which Win32 reads as `C:\b`.
+#[skuld::test]
+fn verbatim_dot_or_empty_name_is_refused() {
+    for input in [
+        r"\\?\C:\a\..\b",
+        r"\\?\C:\.",
+        r"\\?\C:\a\.",
+        r"\\?\C:\a\\b",
+        r"\\?\C:\\",
+        r"\\?\.\x",
+        r"\\?\..\x",
+        r"\\?\.",
+        r"\\?\\x",
+        r"\\?\\",
+        r"\\?\x\..",
+        r"\\?\UNC\s\\h",
+        r"\\?\UNC\s\\",
+        r"\\?\UNC\s\h\..",
+        r"\\?\UNC\s\h\\x",
+    ] {
+        assert_eq!(
+            PathBuf::parse(input),
+            Err(ParseError::DotOrEmptyNameInVerbatim),
+            "{input:?}"
+        );
+    }
+    for (input, plain) in [
+        (r"\\?\C:\a\", r"C:\a\"),
+        (r"\\?\C:\a..\...", r"C:\a..\..."),
+        (r"\\?\x\", r"\\.\x\"),
+        (r"\\?\", r"\\.\"),
+        (r"\\?\UNC\s\", r"\\s\"),
+        (r"\\?\UNC\s\.\x", r"\\s\.\x"),
+        (r"\\?\UNC\s\..", r"\\s\.."),
+    ] {
+        assert_eq!(p(input).to_str(), Some(plain), "{input:?}");
+    }
+}
+
 /// For every small rest without `/`, `\\?\` and that rest is the plain drive path it spells, the
 /// UNC path `\\` and what follows `UNC\`, or else the device path `\\.\` and that rest. A UNC
-/// server `.` or `?` is refused.
+/// server `.` or `?` is refused, and so is a plain spelling that `lexically_normal` would change:
+/// Win32 would apply its `.`, `..` or empty name.
 ///
 /// Mutant: a separator counts as a verbatim drive's unit, so `\\?\\:\` is stored as the rooted
 /// `\:\`.
@@ -135,12 +180,16 @@ fn verbatim_parses_like_its_plain_spelling() {
             assert!(matches!(plain.anchor(), Anchor::Unc { .. }), "{input:?}");
             plain
         } else {
-            let plain = p(&rest);
-            match plain.anchor() {
-                Anchor::Drive { rooted: true, .. } => plain,
+            // A rest that is itself verbatim may not parse; it is a device name then.
+            match PathBuf::parse(rest.as_str()) {
+                Ok(plain) if matches!(plain.anchor(), Anchor::Drive { rooted: true, .. }) => plain,
                 _ => p(&format!(r"\\.\{rest}")),
             }
         };
+        if want.lexically_normal().to_str() != want.to_str() {
+            assert_eq!(parsed, Err(ParseError::DotOrEmptyNameInVerbatim), "{input:?}");
+            continue;
+        }
         let verbatim = parsed.unwrap_or_else(|e| panic!("{input:?} refused: {e}"));
         assert_eq!(verbatim, want, "{input:?}");
         assert!(!is_verbatim_spelling(verbatim.as_os_str()), "{input:?} kept its prefix");
@@ -250,6 +299,7 @@ fn spell(path: &Path) -> String {
 fn parse_error_messages_name_the_spelling() {
     assert!(ParseError::SlashInVerbatim.to_string().contains(r"\\?\"));
     assert!(ParseError::UnspellableUncServer.to_string().contains("server"));
+    assert!(ParseError::DotOrEmptyNameInVerbatim.to_string().contains("`..`"));
 }
 
 // Anchors =============================================================================================================
@@ -1536,14 +1586,14 @@ fn paths_over(alphabet: &[&str], max_len: usize) -> Vec<String> {
     all
 }
 
-/// Each of `inputs` with its parse. Only a verbatim spelling holding `/` may be refused; it is
-/// skipped. Any other refusal fails the test.
+/// Each of `inputs` with its parse. Only a verbatim spelling holding `/` or a `.`, `..` or empty
+/// name may be refused; it is skipped. Any other refusal fails the test.
 fn parsed_grid(inputs: &[String]) -> Vec<(&str, PathBuf)> {
     inputs
         .iter()
         .filter_map(|s| match PathBuf::parse(s.as_str()) {
             Ok(path) => Some((s.as_str(), path)),
-            Err(ParseError::SlashInVerbatim) if s.starts_with(r"\\?\") => None,
+            Err(ParseError::SlashInVerbatim | ParseError::DotOrEmptyNameInVerbatim) if s.starts_with(r"\\?\") => None,
             Err(e) => panic!("{s:?} refused: {e}"),
         })
         .collect()
