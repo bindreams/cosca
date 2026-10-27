@@ -19,8 +19,8 @@ use windows::Win32::Foundation::{
     CloseHandle, ERROR_INVALID_PARAMETER, FILETIME, HANDLE, STILL_ACTIVE, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, GetExitCodeProcess, GetProcessId, GetProcessTimes, OpenProcess, TerminateProcess,
-    WaitForSingleObject, PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, OpenProcess, TerminateProcess, WaitForSingleObject,
+    PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
 };
 
 use super::{Liveness, RawPid, Resolved, StartToken};
@@ -75,34 +75,76 @@ pub(crate) fn close(handle: HANDLE) {
 pub(crate) enum Termination {
     /// `TerminateProcess` accepted the request.
     Terminated,
-    /// `TerminateProcess` refused, and the process's signalled state says it had already exited.
-    AlreadyDead,
-    /// `TerminateProcess` refused and the process is not provably dead.
+    /// `TerminateProcess` refused because the process is exiting or has exited. Like
+    /// `Terminated`, this is a termination under way, not a completed one: the process object may
+    /// not be signalled yet.
+    Exited,
+    /// `TerminateProcess` failed, or refused a handle that is not shown to be of an exited process.
     Failed(windows::core::Error),
 }
 
-/// `TerminateProcess` on `handle`, a live process handle with `PROCESS_TERMINATE` and
-/// `PROCESS_QUERY_LIMITED_INFORMATION`; the caller closes it. Windows refuses with
-/// `ERROR_ACCESS_DENIED` when the process has already exited, so a refusal is read against the
-/// process's signalled state, by the identity the handle gives (its pid and creation time) while
-/// it still pins the kernel object: that read cannot land on a recycled pid. The signalled state
-/// is unambiguous, unlike `GetExitCodeProcess`, which cannot tell a live process from one that
-/// exited with 259. A handle whose identity cannot be read proves nothing, so it is `Failed`.
+/// Whether `e` is `ERROR_ACCESS_DENIED`, the refusal `TerminateProcess` gives for a handle without
+/// `PROCESS_TERMINATE` and, per Microsoft, for a process that has terminated.
+pub(crate) fn is_access_denied(e: &windows::core::Error) -> bool {
+    e.code() == windows::core::HRESULT::from_win32(windows::Win32::Foundation::ERROR_ACCESS_DENIED.0)
+}
+
+/// `TerminateProcess` on `handle`, a live process handle the caller closes afterwards. Never
+/// blocks. `holds_terminate` says whether `handle` has `PROCESS_TERMINATE`.
 ///
-/// `Failed` can also be the window in which the process is exiting but not yet signalled; what
-/// that means for a child the caller owns is the caller's to decide.
-pub(crate) fn terminate_held(handle: HANDLE) -> Termination {
-    // SAFETY: the caller's live process handle.
-    match unsafe { TerminateProcess(handle, 1) } {
+/// `TerminateProcess` refuses with `ERROR_ACCESS_DENIED` a handle that lacks `PROCESS_TERMINATE`
+/// and a process that has terminated (Microsoft's `TerminateProcess` page). So a refusal on a
+/// handle that holds the right can only be the exit: [`Termination::Exited`]. The refusal is
+/// already given while the process object is not signalled yet (measured on Windows 11 26100), so
+/// reading the signalled state instead would miss that window.
+///
+/// A handle that may lack the right (`holds_terminate == false`) is refused for either reason. Its
+/// signalled state, a zero-timeout wait on the handle, is then the only proof of an exit; reading
+/// it needs `SYNCHRONIZE`, and a handle without it, or an unsignalled process, is
+/// [`Termination::Failed`] with the refusal. The exit code is never read instead: 259 cannot be
+/// told from a live process.
+pub(crate) fn terminate_held(handle: HANDLE, holds_terminate: bool) -> Termination {
+    match terminate_process(handle) {
         Ok(()) => Termination::Terminated,
-        Err(e) => {
-            // SAFETY: as above; the read fails (0) on a handle that is not a process.
-            let pid = unsafe { GetProcessId(handle) };
-            match windows_identity_from_handle(handle, pid) {
-                Some(id) if pid != 0 && id.is_alive() == Liveness::Dead => Termination::AlreadyDead,
-                _ => Termination::Failed(e),
-            }
-        }
+        Err(e) if !is_access_denied(&e) => Termination::Failed(e),
+        Err(_) if holds_terminate => Termination::Exited,
+        // SAFETY: the caller's live process handle; a zero-timeout wait only reads its state.
+        Err(e) => match unsafe { WaitForSingleObject(handle, 0) } {
+            WAIT_OBJECT_0 => Termination::Exited,
+            _ => Termination::Failed(e),
+        },
+    }
+}
+
+fn terminate_process(handle: HANDLE) -> windows::core::Result<()> {
+    #[cfg(test)]
+    if fault::take_exiting_refusal() {
+        return Err(windows::core::Error::from_hresult(windows::core::HRESULT::from_win32(
+            windows::Win32::Foundation::ERROR_ACCESS_DENIED.0,
+        )));
+    }
+    // SAFETY: the caller's live process handle.
+    unsafe { TerminateProcess(handle, 1) }
+}
+
+/// Test seam for the window Windows leaves open while a process exits.
+#[cfg(test)]
+pub(crate) mod fault {
+    use std::cell::Cell;
+
+    thread_local! {
+        static EXITING: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Make the NEXT `terminate_held` on THIS thread refuse with `ERROR_ACCESS_DENIED` without
+    /// calling `TerminateProcess`, as Windows does for a process that is exiting but whose
+    /// object is not signalled yet. The process itself stays alive.
+    pub(crate) fn refuse_next_terminate_as_exiting() {
+        EXITING.with(|e| e.set(true));
+    }
+
+    pub(super) fn take_exiting_refusal() -> bool {
+        EXITING.with(|e| e.replace(false))
     }
 }
 

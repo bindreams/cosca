@@ -188,9 +188,12 @@ impl ProcessId {
 
 #[cfg(windows)]
 pub(crate) use backend::{
-    close as windows_close, open_classified as windows_open_classified, terminate_held as windows_terminate_held,
-    Opened, Termination,
+    close as windows_close, is_access_denied as windows_is_access_denied, open_classified as windows_open_classified,
+    terminate_held as windows_terminate_held, Opened, Termination,
 };
+
+#[cfg(all(windows, test))]
+pub(crate) use backend::fault as windows_fault;
 
 #[cfg(target_os = "linux")]
 pub(crate) use backend::pid_stat;

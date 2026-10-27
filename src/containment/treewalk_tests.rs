@@ -334,3 +334,35 @@ fn kill_by_identity_reports_a_member_that_exits_before_the_terminate_as_gone() {
     );
     assert!(!child.is_running(), "precondition: the hook ended the member");
 }
+
+/// A member whose exit is under way but whose object is not signalled yet is refused by
+/// `TerminateProcess` with `ERROR_ACCESS_DENIED` too: gone, not a failed kill, and `hard_kill`
+/// stays complete. The seam refuses as the OS does for such a member, which stays alive.
+///
+/// Mutant: a refusal is gone only once the process reads signalled, so this one warns and answers
+/// `NotAttempted`.
+#[cfg(windows)]
+#[skuld::test]
+fn kill_by_identity_reports_a_member_that_is_exiting_but_not_signalled_as_gone() {
+    use std::os::windows::io::AsRawHandle;
+    let mut child = crate::test_spawn::spawn(
+        std::process::Command::new("cmd")
+            .args(["/C", "more"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+    )
+    .expect("spawn cmd /C more");
+    let id = crate::identity::windows_identity_from_handle(
+        windows::Win32::Foundation::HANDLE(child.as_raw_handle()),
+        child.id(),
+    )
+    .expect("the owned handle always yields an identity");
+    crate::identity::windows_fault::refuse_next_terminate_as_exiting();
+    let outcome = super::kill_by_identity(id);
+    // The seam sent no terminate: end the fixture before asserting.
+    child.kill().expect("end the fixture");
+    child.wait().expect("reap the fixture");
+
+    assert_eq!(outcome, super::KillOutcome::AlreadyGone);
+}

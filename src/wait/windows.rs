@@ -289,22 +289,18 @@ pub(crate) fn kill(id: ProcessId) -> Result<(), Error> {
     if !holds_process(handle, id)? {
         return Ok(()); // pid recycled; the original is already gone
     }
-    terminate_held(handle, id)
+    terminate_and_close(handle, id)
 }
 
-/// Terminates `id`'s process through `handle`, which pins it, then closes `handle`. A refusal on
-/// a provably dead process is success.
-fn terminate_held(handle: HANDLE, id: ProcessId) -> Result<(), Error> {
-    // Closed only after the call: the liveness read inside it needs the handle to pin the pid.
-    let outcome = windows_terminate_held(handle);
+/// Terminates `id`'s process through `handle`, which pins it and holds `PROCESS_TERMINATE`, then
+/// closes `handle`. A refusal is the process exiting: success.
+fn terminate_and_close(handle: HANDLE, id: ProcessId) -> Result<(), Error> {
+    let outcome = windows_terminate_held(handle, true);
     close(handle);
     match outcome {
-        Termination::Terminated | Termination::AlreadyDead => Ok(()),
+        Termination::Terminated | Termination::Exited => Ok(()),
         Termination::Failed(e) => {
-            log::warn!(
-                "wait: TerminateProcess(pid {}) failed and the target is not provably dead ({e})",
-                id.pid()
-            );
+            log::warn!("wait: TerminateProcess(pid {}) failed ({e})", id.pid());
             Err(Error::Io(win32_io_error(e)))
         }
     }

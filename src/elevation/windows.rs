@@ -219,14 +219,14 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{RPC_E_CHANGED_MODE, S_FALSE, S_OK};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};
-use windows::Win32::System::Threading::{GetProcessId, TerminateProcess};
+use windows::Win32::System::Threading::GetProcessId;
 use windows::Win32::UI::Shell::{
     ShellExecuteExW, SEE_MASK_CLASSNAME, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
 };
 
 use crate::child::proc_handle::ProcHandle;
 use crate::child::spawn::windows_raw::resolve::ensure_no_nul_wide;
-use crate::child::spawn::windows_raw::RawChild;
+use crate::child::spawn::windows_raw::{can_terminate, RawChild};
 use crate::child::spawn::{Classify, SpawnFailure};
 use crate::containment::Attachment;
 use crate::elevation::plan::Transition;
@@ -235,6 +235,7 @@ use crate::elevation::{ElevatedStdio, ElevatedVia, ElevationReport, Privilege};
 use crate::error::ChildFate;
 use crate::error::ElevationErrorKind;
 use crate::identity::ProcessId;
+use crate::identity::{windows_terminate_held, Termination};
 
 /// The failure of `ShellExecuteExW(runas)` with error `code` and `hInstApp` `inst_app`: see
 /// [`super::runas_failure::classify`]. A launch that may have happened left no process handle, so
@@ -537,19 +538,21 @@ pub(crate) fn launch_runas_with_host(cmd: &Command, host: &Host) -> Result<Runas
     let Some(id) = id else {
         // Auth SUCCEEDED but we cannot track the child. Terminate it, and report the
         // ACTUAL outcome (terminated vs still-running) in the detail — the kind stays neutral.
-        // SAFETY: `handle` is live; terminating our own launched child.
-        let terminated = unsafe { TerminateProcess(handle, 1) }.is_ok();
-        let (detail, fate) = if terminated {
-            (
+        // The elevated child may be higher-integrity than us, so ask whether we may terminate it.
+        let (detail, fate) = match windows_terminate_held(handle, can_terminate(pid)) {
+            Termination::Terminated => (
                 "the elevated child launched but its identity could not be resolved; it was terminated".into(),
                 ChildFate::Killed,
-            )
-        } else {
-            (
-                format!("the elevated child (pid {pid}) launched but its identity could not be resolved and could not be terminated; it may still be running"),
+            ),
+            Termination::Exited => (
+                "the elevated child launched but its identity could not be resolved; it was already exiting".into(),
+                ChildFate::Killed,
+            ),
+            Termination::Failed(e) => (
+                format!("the elevated child (pid {pid}) launched but its identity could not be resolved and could not be terminated ({e}); it may still be running"),
                 // Its identity is what could not be resolved.
                 ChildFate::Running { id: None },
-            )
+            ),
         };
         return Err(SpawnFailure::started(
             Error::Elevation {

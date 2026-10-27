@@ -74,7 +74,7 @@ pub(crate) use proc::exit_status;
 // outcome. The sync path uses these only inside `proc`, so the re-export is tokio-only. (`create_process` is reached through the shared `spawn_step`, so it
 // needs no re-export.)
 #[cfg(feature = "tokio")]
-pub(crate) use proc::{is_access_denied, wait_handle_or_cancel, WaitOutcome};
+pub(crate) use proc::{wait_handle_or_cancel, WaitOutcome};
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -535,6 +535,12 @@ pub(crate) fn can_terminate(pid: u32) -> bool {
         }
         Err(_) => false,
     }
+}
+
+/// Whether a runas child's handle lacks `PROCESS_TERMINATE`, so a refusal of its `TerminateProcess`
+/// is a real denial (a higher-integrity child) and not the exit. Any other child holds every right.
+pub(crate) fn is_unkillable(runas: bool, pid: u32) -> bool {
+    runas && !can_terminate(pid)
 }
 
 /// The `STARTUPINFOEXW` for a raw spawn, with what it points at.

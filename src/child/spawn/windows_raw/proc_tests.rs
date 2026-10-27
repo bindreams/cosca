@@ -185,7 +185,7 @@ fn runas_teardown_on_drop_returns_promptly() {
 /// The runas `ERROR_ACCESS_DENIED` arm with a child we CAN terminate (`can_terminate` is true):
 /// the denial means exit is underway, so teardown reaps.
 ///
-/// Mutant: drop `&& !self.can_terminate()`, so a terminable runas child is left running.
+/// Mutant: `is_unkillable` ignores `can_terminate`, so a terminable runas child is left running.
 #[skuld::test]
 fn runas_teardown_on_drop_reaps_when_terminate_is_denied_but_permitted() {
     let owner = spawn_suspended();
@@ -203,7 +203,7 @@ fn runas_teardown_on_drop_reaps_when_terminate_is_denied_but_permitted() {
 
 /// As above, for `kill`.
 ///
-/// Mutant: drop `&& !self.can_terminate()` in `kill`, so it returns `ERROR_ACCESS_DENIED`.
+/// Mutant: `is_unkillable` ignores `can_terminate`, so `kill` returns `ERROR_ACCESS_DENIED`.
 #[skuld::test]
 fn runas_kill_reaps_when_terminate_is_denied_but_permitted() {
     let owner = spawn_suspended();
@@ -219,7 +219,7 @@ fn runas_kill_reaps_when_terminate_is_denied_but_permitted() {
 ///
 /// What it could not do comes back for the caller's one warn, and it logs nothing itself.
 ///
-/// Mutants: reap in the `runas && !can_terminate()` arm of `teardown_on_drop`; the arm logs its own
+/// Mutants: reap in the `Failed` arm of `teardown_on_drop`; the arm logs its own
 /// warn instead of returning it.
 #[skuld::test]
 fn runas_teardown_on_drop_never_blocks_on_an_unterminable_child() {
@@ -251,7 +251,7 @@ fn runas_teardown_on_drop_never_blocks_on_an_unterminable_child() {
 
 /// As above, for `kill`: surfaces the denial.
 ///
-/// Mutant: reap in the `runas && !can_terminate()` arm of `kill`.
+/// Mutant: reap in the `Failed` arm of `kill`.
 #[skuld::test]
 fn runas_kill_of_an_unterminable_child_surfaces_the_denial_without_blocking() {
     let owner = spawn_suspended();
@@ -268,7 +268,8 @@ fn runas_kill_of_an_unterminable_child_surfaces_the_denial_without_blocking() {
 /// A runas child we cannot terminate that has already exited: the refusal is the exit, not a
 /// denial, so `kill` reaps it and succeeds.
 ///
-/// Mutant: `kill` reads the refusal through `can_terminate` alone, so it returns
+/// Mutant: `kill` reads the refusal by `can_terminate` alone (an exited child that cannot be
+/// terminated is `Failed`), so it returns
 /// `ERROR_ACCESS_DENIED` for a dead child.
 #[skuld::test]
 fn runas_kill_of_an_unterminable_child_that_already_exited_reaps_and_succeeds() {
@@ -286,7 +287,7 @@ fn runas_kill_of_an_unterminable_child_that_already_exited_reaps_and_succeeds() 
 
 /// As above, for `teardown_on_drop`: the child is `Reaped` and nothing is left running.
 ///
-/// Mutant: `teardown_on_drop` reads the refusal through `can_terminate` alone, so it leaves a dead
+/// Mutant: `teardown_on_drop` reads the refusal by `can_terminate` alone, so it leaves a dead
 /// child as `Running` with a "higher integrity" warning.
 #[skuld::test]
 fn runas_teardown_of_an_unterminable_child_that_already_exited_reaps_it() {

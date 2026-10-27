@@ -626,7 +626,8 @@ impl ProcSource {
                     return Ok(Sent::Gone);
                 };
                 // SAFETY of the handle: tokio owns it live while `raw_handle` is `Some`.
-                terminate_unreaped(windows::Win32::Foundation::HANDLE(h))
+                // A child tokio spawned holds every right on its handle.
+                terminate_unreaped(windows::Win32::Foundation::HANDLE(h), true)
             }
             #[cfg(windows)]
             ProcSource::Raw(r) => {
@@ -1803,28 +1804,15 @@ fn wait_reapable(pid: u32, identity: u64, level: log::Level) -> (Waited, Option<
     }
 }
 
-/// Windows: hard-kill the not-yet-reaped child whose live process handle is `h`. A failure keeps
-/// its Win32 code, so a denial classifies as `PermissionDenied`.
+/// Windows: hard-kill the not-yet-reaped child whose live process handle is `h`; see
+/// [`windows_terminate_held`](crate::identity::windows_terminate_held) for `holds_terminate`. Never
+/// blocks. A failure keeps its Win32 code, so a denial classifies as `PermissionDenied`.
 #[cfg(windows)]
-pub(super) fn terminate_unreaped(h: windows::Win32::Foundation::HANDLE) -> Result<Sent, Error> {
+pub(super) fn terminate_unreaped(h: windows::Win32::Foundation::HANDLE, holds_terminate: bool) -> Result<Sent, Error> {
     use crate::identity::{windows_terminate_held, Termination};
-    use windows::Win32::Foundation::WAIT_FAILED;
-    use windows::Win32::System::Threading::WaitForSingleObject;
     // `h` is a live process handle the caller owns.
-    match windows_terminate_held(h) {
-        Termination::Terminated | Termination::AlreadyDead => Ok(Sent::Delivered),
-        // A refusal not proven to be an exit: a child we spawned holds every right, so the OS's
-        // teardown window (denial before the object is signaled) is success, as std's
-        // `Child::kill` has it. A handle that cannot even be waited on is not such a handle, and
-        // its denial is real.
-        Termination::Failed(e) if crate::child::spawn::windows_raw::is_access_denied(&e) => {
-            // SAFETY: as above; a zero-timeout wait only reads the handle's state.
-            if unsafe { WaitForSingleObject(h, 0) } == WAIT_FAILED {
-                Err(Error::Io(crate::error::win32_io_error(e)))
-            } else {
-                Ok(Sent::Delivered)
-            }
-        }
+    match windows_terminate_held(h, holds_terminate) {
+        Termination::Terminated | Termination::Exited => Ok(Sent::Delivered),
         Termination::Failed(e) => Err(Error::Io(crate::error::win32_io_error(e))),
     }
 }

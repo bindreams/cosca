@@ -272,7 +272,7 @@ fn a_failed_start_kill_is_reported_as_its_win32_code() {
 /// A runas child we cannot terminate that has already exited: the refusal is the exit, not a
 /// denial, so `start_kill` succeeds.
 ///
-/// Mutant: `start_kill` reads the refusal through `can_terminate` alone, so it returns
+/// Mutant: `start_kill` reads the refusal by `can_terminate` alone, so it returns
 /// `ERROR_ACCESS_DENIED` for a dead child.
 #[skuld::test]
 fn start_kill_of_an_unterminable_runas_child_that_already_exited_succeeds() {

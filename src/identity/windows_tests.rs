@@ -248,3 +248,75 @@ fn wait_on_a_stale_identity_over_an_unreadable_pid_is_an_error() {
     crate::wait::block_until_exit(stale, Some(std::time::Duration::ZERO))
         .expect_err("an unreadable occupant cannot prove the original identity exited");
 }
+
+// terminate_held =====
+
+/// A child that blocks on its piped stdin until the test ends it.
+fn spawn_blocked_child() -> std::process::Child {
+    crate::test_spawn::spawn(
+        std::process::Command::new("cmd")
+            .args(["/C", "more"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+    )
+    .expect("spawn cmd /C more")
+}
+
+fn handle_of(child: &std::process::Child) -> windows::Win32::Foundation::HANDLE {
+    use std::os::windows::io::AsRawHandle;
+    windows::Win32::Foundation::HANDLE(child.as_raw_handle())
+}
+
+fn end(mut child: std::process::Child) {
+    child.kill().expect("end the fixture");
+    child.wait().expect("reap the fixture");
+}
+
+/// A refusal on a handle that holds `PROCESS_TERMINATE` is the exit, whether or not the process
+/// object is signalled yet: the seam refuses a process that stays alive and unsignalled.
+///
+/// Mutant: a refusal is `Exited` only for a signalled process, so this one is `Failed`.
+#[skuld::test]
+fn a_refusal_on_a_handle_holding_terminate_is_the_exit() {
+    let child = spawn_blocked_child();
+    super::fault::refuse_next_terminate_as_exiting();
+    let outcome = super::terminate_held(handle_of(&child), true);
+    end(child);
+    assert!(
+        matches!(outcome, super::Termination::Exited),
+        "got a failure or a terminate"
+    );
+}
+
+/// A refusal on a handle that may lack the right is a real denial while the process is not
+/// signalled: nothing shows an exit.
+///
+/// Mutant: every `ERROR_ACCESS_DENIED` reads as the exit, whatever the handle holds.
+#[skuld::test]
+fn a_refusal_on_a_handle_that_may_lack_terminate_is_failed_while_the_process_runs() {
+    let child = spawn_blocked_child();
+    super::fault::refuse_next_terminate_as_exiting();
+    let outcome = super::terminate_held(handle_of(&child), false);
+    end(child);
+    let super::Termination::Failed(e) = outcome else {
+        panic!("a live process is not an exit");
+    };
+    assert!(super::is_access_denied(&e), "{e:?}");
+}
+
+/// As above for a process that has exited: its signalled state is the proof of the exit.
+///
+/// Mutant: the signalled read is dropped, so the refusal stays `Failed`.
+#[skuld::test]
+fn a_refusal_on_a_handle_that_may_lack_terminate_is_the_exit_once_the_process_is_signalled() {
+    let mut child = spawn_blocked_child();
+    child.kill().expect("end the fixture");
+    // Reap through a real wait: the process object is signalled when this returns.
+    child.wait().expect("reap the fixture");
+    let outcome = super::terminate_held(handle_of(&child), false);
+    assert!(
+        matches!(outcome, super::Termination::Exited),
+        "a signalled process is the exit"
+    );
+}

@@ -45,8 +45,8 @@ async fn a_kill_of_an_exited_unreaped_child_is_a_success() {
     );
 }
 
-/// An exited child's handle that can terminate but cannot be waited on: the refusal is still
-/// proven to be an exit, so the kill is a success.
+/// An exited child's handle that holds `PROCESS_TERMINATE` but cannot be waited on: the refusal is
+/// the exit, so the kill is a success.
 ///
 /// Mutant: `terminate_unreaped` reads a refusal by whether the handle can be waited on, so the
 /// missing `SYNCHRONIZE` makes it an `ACCESS_DENIED` error for a dead child.
@@ -76,7 +76,7 @@ async fn a_kill_of_an_exited_child_through_an_unwaitable_handle_is_a_success() {
         )
     }
     .expect("duplicate the child's handle without SYNCHRONIZE");
-    let result = terminate_unreaped(limited);
+    let result = terminate_unreaped(limited, true);
     // SAFETY: `limited` is the owned duplicate made above.
     unsafe { CloseHandle(limited) }.expect("close the duplicate");
 
@@ -100,14 +100,14 @@ fn a_terminate_failure_carries_its_win32_code() {
     use windows::Win32::Foundation::{ERROR_INVALID_HANDLE, HANDLE};
 
     let event = crate::wait::backend::new_cancel_event().expect("create an event");
-    let err = terminate_unreaped(HANDLE(event.as_raw_handle())).expect_err("an event cannot be terminated");
+    let err = terminate_unreaped(HANDLE(event.as_raw_handle()), true).expect_err("an event cannot be terminated");
     let crate::error::Error::Io(err) = err else {
         panic!("expected Io, got {err:?}");
     };
     assert_eq!(err.raw_os_error(), Some(ERROR_INVALID_HANDLE.0 as i32), "{err:?}");
 }
 
-/// A handle that denies both `TerminateProcess` and the wait on it is a real denial, not an exiting
+/// A handle without `PROCESS_TERMINATE` that cannot be waited on either is a real denial, not an exiting
 /// child: it is an error with `ERROR_ACCESS_DENIED` as its code and `PermissionDenied` as its kind,
 /// which `map_elevated_kill_error` turns into `Unkillable` for an elevated wrapper.
 ///
@@ -138,7 +138,7 @@ fn a_denied_terminate_of_an_unwaitable_handle_carries_its_win32_code() {
         )
     }
     .expect("duplicate this process's handle with reduced access");
-    let result = terminate_unreaped(limited);
+    let result = terminate_unreaped(limited, false);
     // SAFETY: `limited` is the owned duplicate made above.
     unsafe { CloseHandle(limited) }.expect("close the duplicate");
 

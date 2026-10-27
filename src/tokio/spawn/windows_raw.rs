@@ -15,7 +15,7 @@ use std::os::windows::io::{AsRawHandle, OwnedHandle};
 use std::process::ExitStatus;
 use std::sync::Arc;
 
-use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::WaitForSingleObject;
 
 use crate::child::spawn::windows_raw as sync_raw;
@@ -47,7 +47,7 @@ pub(crate) struct RawAsyncChild {
     /// re-read a status off a (post-close) recycled handle.
     exited: Option<ExitStatus>,
     /// A runas (UAC-elevated) child a lower-integrity parent may be unable to terminate. Drives
-    /// [`start_kill`](RawAsyncChild::start_kill)'s `can_terminate` probe, which is the sole owner
+    /// [`start_kill`](RawAsyncChild::start_kill)'s `is_unkillable` probe, which is the sole owner
     /// of "this child is genuinely unkillable" — nothing waits on one.
     runas: bool,
     #[cfg(test)]
@@ -171,20 +171,12 @@ impl RawAsyncChild {
 
     /// Signal a hard kill (does not reap). Signal-only, so it never blocks.
     pub(crate) fn start_kill(&self) -> Result<(), Error> {
-        match windows_terminate_held(self.handle()) {
-            Termination::Terminated | Termination::AlreadyDead => Ok(()),
-            Termination::Failed(e) if !sync_raw::is_access_denied(&e) => Err(Error::Io(win32_io_error(e))),
-            // A refusal that is not provably an exit has two causes: (a) our own child is exiting
-            // (the OS teardown window signals the denial before the object is signaled — a
-            // spurious kill error), or (b) a runas child is genuinely higher-integrity than us. A
-            // static `can_terminate` probe (shared with the sync `RawChild`) separates them
-            // WITHOUT racing a `try_wait`. Only (b) is a real denial → surface the `Io` error so
-            // `Child::kill` maps it to the typed `Unkillable`; (a) is Ok (signal-only, so never
-            // block here).
-            Termination::Failed(_) if self.runas && !sync_raw::can_terminate(self.pid) => Err(Error::Io(
-                std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED.0 as i32),
-            )),
-            Termination::Failed(_) => Ok(()),
+        // Signal-only, so never block: a refusal on a handle that holds `PROCESS_TERMINATE` is the
+        // exit, and `Exited` answers it. Only a runas child we cannot terminate is refused for
+        // good; that surfaces as `Io`, which `Child::kill` maps to the typed `Unkillable`.
+        match windows_terminate_held(self.handle(), !sync_raw::is_unkillable(self.runas, self.pid)) {
+            Termination::Terminated | Termination::Exited => Ok(()),
+            Termination::Failed(e) => Err(Error::Io(win32_io_error(e))),
         }
     }
 

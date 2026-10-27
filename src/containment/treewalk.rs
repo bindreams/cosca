@@ -266,7 +266,7 @@ pub(crate) fn kill_by_identity(id: ProcessId, signal: Signal) -> KillOutcome {
 
 /// Windows: terminate `id` only if the pid STILL resolves to that exact identity.
 /// Opens the process for terminate rights and calls `TerminateProcess`. Already
-/// gone (unresolvable / unopenable, or exited before the call) is success. Best-effort.
+/// gone (unresolvable / unopenable, or exiting when the call came) is success. Best-effort.
 #[cfg(windows)]
 pub(crate) fn kill_by_identity(id: ProcessId) -> KillOutcome {
     use windows::Win32::System::Threading::{PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE};
@@ -292,9 +292,10 @@ pub(crate) fn kill_by_identity(id: ProcessId) -> KillOutcome {
         HandleIdentity::Same => {
             #[cfg(test)]
             fault::run_before_terminate();
-            match windows_terminate_held(handle) {
+            // The handle holds `PROCESS_TERMINATE`.
+            match windows_terminate_held(handle, true) {
                 Termination::Terminated => KillOutcome::Terminated,
-                Termination::AlreadyDead => KillOutcome::AlreadyGone,
+                Termination::Exited => KillOutcome::AlreadyGone,
                 Termination::Failed(e) => {
                     log::warn!("treewalk: TerminateProcess(pid {}) failed: {e}", id.pid());
                     KillOutcome::NotAttempted
