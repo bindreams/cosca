@@ -622,8 +622,12 @@ impl Lookup for Path {
         PathBuf::from(bytes)
     }
 
-    fn holds_nul(&self) -> bool {
-        self.as_bytes().contains(&0)
+    fn canonical_spelling(&self) -> PathBuf {
+        self.to_path_buf()
+    }
+
+    fn refusal(&self) -> Option<&'static str> {
+        self.as_bytes().contains(&0).then_some("the path holds a NUL")
     }
 }
 

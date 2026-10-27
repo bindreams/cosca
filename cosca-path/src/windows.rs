@@ -628,6 +628,24 @@ impl PurePath for Path {
     }
 }
 
+/// What follows `UNC\` in the verbatim rest `rest`, if it starts so.
+fn unc_rest(rest: &[u8]) -> Option<&[u8]> {
+    (rest.len() >= 4 && rest[..3].eq_ignore_ascii_case(b"UNC") && rest[3] == b'\\').then(|| &rest[4..])
+}
+
+/// The plain spelling of the verbatim path `\\?\` and `rest`: a drive path as it is, a UNC path
+/// without its prefix, any other as a device path. See [`PathBuf::parse`].
+fn plain_spelling(rest: &[u8]) -> Vec<u8> {
+    let is_drive = rest.first() != Some(&b'\\') && drive_len(rest).is_some_and(|len| rest.get(len) == Some(&b'\\'));
+    if is_drive {
+        rest.to_vec()
+    } else if let Some(unc) = unc_rest(rest) {
+        [br"\\", unc].concat()
+    } else {
+        [br"\\.\", rest].concat()
+    }
+}
+
 /// Writes the separator after a leading `\\?` as `/`. Appending to the device anchor `\\?` would
 /// otherwise spell the verbatim prefix, which reads differently; `\\?/` is the device path `\\?`
 /// already was.
@@ -731,19 +749,13 @@ impl PathBuf {
         if rest.contains(&b'/') {
             return Err(ParseError::SlashInVerbatim);
         }
-        let is_drive = rest.first() != Some(&b'\\') && drive_len(rest).is_some_and(|len| rest.get(len) == Some(&b'\\'));
-        let unc = (rest.len() >= 4 && rest[..3].eq_ignore_ascii_case(b"UNC") && rest[3] == b'\\').then(|| &rest[4..]);
-        let plain = if is_drive {
-            PathBuf::from_wtf8(rest.to_vec())
-        } else if let Some(unc) = unc {
+        if let Some(unc) = unc_rest(rest) {
             let server = &unc[..next_separator(unc, 0)];
             if matches!(server, b"." | b"?") {
                 return Err(ParseError::UnspellableUncServer);
             }
-            PathBuf::from_wtf8([br"\\", unc].concat())
-        } else {
-            PathBuf::from_wtf8([br"\\.\", rest].concat())
-        };
+        }
+        let plain = PathBuf::from_wtf8(plain_spelling(rest));
         if plain.has_navigated_name() {
             return Err(ParseError::DotOrEmptyNameInVerbatim);
         }
@@ -874,6 +886,23 @@ impl fmt::Debug for PathBuf {
     }
 }
 
+impl Path {
+    /// Whether the path, a `?` device path, reads as the verbatim `\\?\UNC\` path of the server
+    /// `.` or `?`, which [`PathBuf::parse`] refuses with [`ParseError::UnspellableUncServer`].
+    fn names_unspellable_unc_server(&self) -> bool {
+        let folded: Vec<u8> = self.lexically_normal().bytes().iter().map(fold_separator).collect();
+        folded
+            .strip_prefix(VERBATIM)
+            .and_then(unc_rest)
+            .is_some_and(|unc| matches!(&unc[..next_separator(unc, 0)], b"." | b"?"))
+    }
+
+    /// A UNC share with nothing below it, with or without the separator after it.
+    fn is_share_root(&self) -> bool {
+        self.as_unc().is_some() && self.is_fully_qualified() && self.components().next().is_none()
+    }
+}
+
 impl Lookup for Path {
     fn lookup_spelling(&self) -> PathBuf {
         let normal = self.lexically_normal();
@@ -891,18 +920,39 @@ impl Lookup for Path {
                 *b = b'\\';
             }
         }
+        // A device path spelled `?` reads as the verbatim path it names: `//?/C:/x` is `C:\x`. A UNC
+        // server `?` has no plain spelling, and leaves a verbatim one: it is respelled, and no
+        // stated path matches it.
+        if let Some(rest) = bytes.strip_prefix(VERBATIM) {
+            bytes = plain_spelling(rest);
+            respell_verbatim(&mut bytes);
+        }
         let spelled = PathBuf::from_wtf8(bytes.clone());
         // A share root is one entry with or without its separator; spell it with.
-        let share_root = spelled.as_unc().is_some() && spelled.is_fully_qualified();
-        if share_root && spelled.components().next().is_none() && bytes.last() != Some(&b'\\') {
+        if spelled.is_share_root() && bytes.last() != Some(&b'\\') {
             bytes.push(b'\\');
             return PathBuf::from_wtf8(bytes);
         }
         spelled
     }
 
-    fn holds_nul(&self) -> bool {
-        self.bytes().contains(&0)
+    fn canonical_spelling(&self) -> PathBuf {
+        match self.bytes().strip_suffix(b"\\") {
+            Some(root) if self.is_share_root() => PathBuf::from_wtf8(root.to_vec()),
+            _ => self.to_path_buf(),
+        }
+    }
+
+    fn refusal(&self) -> Option<&'static str> {
+        if self.bytes().contains(&0) {
+            Some("the path holds a NUL")
+        } else if self.bytes().is_empty() {
+            Some("the path is empty")
+        } else if self.names_unspellable_unc_server() {
+            Some("the path is a verbatim UNC path whose server `.` or `?` has no plain spelling")
+        } else {
+            None
+        }
     }
 }
 

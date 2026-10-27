@@ -229,7 +229,6 @@ fn a_relative_path_implies_no_empty_directory() {
 
     let fs = windows::FakeFilesystem::new().with_file(&w(r"bin\tool.exe"));
     assert!(fs.is_dir(&w("bin")).unwrap());
-    assert!(!fs.is_dir(&w("")).unwrap());
 
     // A test that states the empty path itself gets it.
     let fs = posix::FakeFilesystem::new().with_dir(p(""));
@@ -591,4 +590,197 @@ fn an_unreadable_dir_answers_for_itself_and_fails_below() {
     assert!(!fs.is_file(p("/a/b/c")).unwrap());
     let fs = fs.with_unreadable_dir(p("/a/b"), ErrorKind::Other);
     assert_eq!(kind(fs.is_file(p("/a/b/c"))), ErrorKind::Other);
+}
+
+/// A device path spelled with `?` reads as the verbatim path it names, as on the host
+/// (`//?/C:/Windows` is `C:\Windows`): the fake keys it so, and never panics on one.
+///
+/// Mutants: a lookup that writes `\` for the `/` after `\\?` (the key is then a verbatim spelling,
+/// which no stored path holds, and the builder panics); one that keys `//?/C:/x` apart from `C:\x`.
+#[skuld::test]
+fn a_question_mark_device_path_reads_as_the_verbatim_path_it_names() {
+    let spellings = [
+        "//?/C:/Windows",
+        "//?/x",
+        r"\\?/C:\Windows\System32",
+        r"/\?\x",
+        r"\\?/",
+        "//?/UNC/srv/share/d",
+        "//?/UNC/?/x",
+        "//?/UNC",
+        "//?/C:",
+        "//?/c:/a/../b",
+    ];
+    for s in spellings {
+        let q = w(s);
+        let fs = windows::FakeFilesystem::new();
+        let _ = (fs.is_file(&q), fs.is_dir(&q), fs.canonical(&q), fs.same_file(&q, &q));
+        let fs = windows::FakeFilesystem::new()
+            .with_file(&q)
+            .with_dir(&q)
+            .with_error(&q, ErrorKind::PermissionDenied)
+            .with_canonical(&q, &q);
+        let _ = (fs.is_file(&q), fs.is_dir(&q), fs.canonical(&q), fs.same_file(&q, &q));
+    }
+
+    let drive = windows::FakeFilesystem::new().with_dir(&w(r"C:\Windows"));
+    for q in [
+        "//?/C:/Windows",
+        r"\\?/C:\Windows",
+        r"/\?\C:\Windows",
+        r"//?/c:/Windows/",
+    ] {
+        // Case is exact: `c:` is not `C:`.
+        assert_eq!(drive.is_dir(&w(q)).unwrap(), !q.contains("c:"), "{q}");
+    }
+    assert_eq!(drive.canonical(&w("//?/C:/Windows")).unwrap(), w(r"C:\Windows"));
+    let device = windows::FakeFilesystem::new().with_dir(&w("//?/C:/Windows"));
+    assert!(device.is_dir(&w(r"C:\Windows")).unwrap());
+
+    let unc = windows::FakeFilesystem::new().with_dir(&w(r"\\srv\share\d"));
+    assert!(unc.is_dir(&w("//?/UNC/srv/share/d")).unwrap());
+    let named = windows::FakeFilesystem::new().with_dir(&w(r"\\.\x"));
+    assert!(named.is_dir(&w("//?/x")).unwrap());
+    // Not a drive, not UNC: nothing is stated there.
+    assert!(!drive.is_dir(&w("//?/UNC")).unwrap());
+
+    // A verbatim UNC server `?` has no plain spelling, so no key could name it: every question
+    // is refused, as `parse` refuses the same path with `\\?\`.
+    let unc = windows::FakeFilesystem::new().with_dir(&w("//?/UNC/?/x"));
+    let q = w("//?/UNC/?/x");
+    assert_eq!(kind(unc.is_dir(&q)), ErrorKind::InvalidInput);
+    assert_eq!(kind(unc.is_file(&q)), ErrorKind::InvalidInput);
+    assert_eq!(kind(unc.canonical(&q)), ErrorKind::InvalidInput);
+    assert_eq!(kind(unc.same_file(&q, &q)), ErrorKind::InvalidInput);
+}
+
+/// The empty path is `InvalidInput` from every question on the Windows fake, as on the Windows
+/// host (`to_wide` refuses it), and absent on the POSIX fake, as on a Unix host.
+///
+/// Mutants: a Windows fake that answers `Ok(false)` or `NotFound` for the empty path; one that
+/// checks only one of the questions or one path of `same_file`; a POSIX fake that refuses it.
+#[skuld::test]
+fn the_empty_path_is_as_the_host_reads_it() {
+    let fs = windows::FakeFilesystem::new().with_file(&w(r"bin\tool.exe"));
+    let empty = w("");
+    assert_eq!(kind(fs.is_file(&empty)), ErrorKind::InvalidInput);
+    assert_eq!(kind(fs.is_dir(&empty)), ErrorKind::InvalidInput);
+    assert_eq!(kind(fs.canonical(&empty)), ErrorKind::InvalidInput);
+    assert_eq!(kind(fs.same_file(&empty, &w("bin"))), ErrorKind::InvalidInput);
+    assert_eq!(kind(fs.same_file(&w("bin"), &empty)), ErrorKind::InvalidInput);
+
+    let fs = posix::FakeFilesystem::new().with_file(p("bin/tool"));
+    assert!(!fs.is_file(p("")).unwrap());
+    assert!(!fs.is_dir(p("")).unwrap());
+    assert_eq!(kind(fs.canonical(p(""))), ErrorKind::NotFound);
+    assert_eq!(kind(fs.same_file(p(""), p("bin"))), ErrorKind::NotFound);
+}
+
+// An error below a file is refused in either order, as a file over an entry is: the same
+// facts do not get two answers.
+//
+// Mutant: `with_error` or `with_unreadable_dir` that does not look at its ancestors.
+
+#[skuld::test]
+#[should_panic(expected = "is a file")]
+fn an_error_under_a_stated_file_is_refused_posix() {
+    let _ = posix::FakeFilesystem::new()
+        .with_file(p("/a"))
+        .with_error(p("/a/b"), ErrorKind::PermissionDenied);
+}
+
+#[skuld::test]
+#[should_panic(expected = "is a file")]
+fn an_error_under_a_stated_file_is_refused_windows() {
+    let _ = windows::FakeFilesystem::new()
+        .with_file(&w(r"C:\a"))
+        .with_error(&w(r"C:\a\b"), ErrorKind::PermissionDenied);
+}
+
+#[skuld::test]
+#[should_panic(expected = "has entries below it")]
+fn a_file_over_a_stated_error_is_refused() {
+    let _ = posix::FakeFilesystem::new()
+        .with_error(p("/a/b"), ErrorKind::PermissionDenied)
+        .with_file(p("/a"));
+}
+
+#[skuld::test]
+#[should_panic(expected = "is a file")]
+fn an_unreadable_dir_under_a_stated_file_is_refused() {
+    let _ = posix::FakeFilesystem::new()
+        .with_file(p("/a"))
+        .with_unreadable_dir(p("/a/b"), ErrorKind::PermissionDenied);
+}
+
+/// An error on a path beside a file, or on the file itself, is no contradiction.
+///
+/// Mutant: an ancestor check that also fires on the path itself or its siblings.
+#[skuld::test]
+fn an_error_beside_or_on_a_file_is_accepted() {
+    let fs = posix::FakeFilesystem::new()
+        .with_file(p("/a"))
+        .with_error(p("/b"), ErrorKind::PermissionDenied)
+        .with_error(p("/a"), ErrorKind::PermissionDenied);
+    assert_eq!(kind(fs.is_file(p("/a"))), ErrorKind::PermissionDenied);
+}
+
+/// `canonical` of a UNC share root has no trailing separator, as on the host
+/// (`\\localhost\C$`), whichever way the root is stated or queried.
+///
+/// Mutant: a fake that returns its internal key, which spells the root with a separator.
+#[skuld::test]
+fn canonical_of_a_unc_share_root_has_no_trailing_separator() {
+    let canonical = |fs: &windows::FakeFilesystem, query: &str| {
+        let spelled = fs.canonical(&w(query)).unwrap();
+        spelled.to_str().expect("the spelling is UTF-8").to_owned()
+    };
+    for fs in [
+        windows::FakeFilesystem::new().with_dir(&w(r"\\srv\share")),
+        windows::FakeFilesystem::new().with_dir(&w(r"\\srv\share\")),
+        windows::FakeFilesystem::new().with_file(&w(r"\\srv\share\a")),
+    ] {
+        for query in [r"\\srv\share", r"\\srv\share\", r"\\srv\share\.", "//srv/share/"] {
+            assert_eq!(canonical(&fs, query), r"\\srv\share", "{query}");
+        }
+        assert!(fs.same_file(&w(r"\\srv\share"), &w(r"\\srv\share\")).unwrap());
+    }
+    // Below the root nothing changes.
+    let fs = windows::FakeFilesystem::new().with_dir(&w(r"\\srv\share\d"));
+    assert_eq!(canonical(&fs, r"\\srv\share\d\"), r"\\srv\share\d");
+}
+
+/// `BoundPath` is two shared references: `Clone`, `Copy` and `Debug` whatever `F` is, trait
+/// objects included. The fakes are `Clone` and `Debug`; a clone is independent of its source.
+///
+/// Mutants: derives on `BoundPath` (which demand `F: Clone`, so a `dyn Filesystem` does not
+/// qualify); a `Clone` of a fake that shares its entries; a `Debug` that omits the statements.
+#[skuld::test]
+fn bound_paths_and_fakes_are_clone_and_debug() {
+    fn bounds<T: Clone + Copy + std::fmt::Debug>() {}
+    bounds::<BoundPath<'static, dyn Filesystem<Path = posix::Path>>>();
+    bounds::<BoundPath<'static, dyn Filesystem<Path = windows::Path>>>();
+    bounds::<BoundPath<'static, windows::FakeFilesystem>>();
+    #[cfg(any(unix, windows))]
+    bounds::<BoundPath<'static, crate::fs::HostFilesystem>>();
+
+    let file = p("/d/f");
+    let fs = posix::FakeFilesystem::new().with_file(file);
+    let dynamic: &dyn Filesystem<Path = posix::Path> = &fs;
+    let bound = BoundPath::new(dynamic, file);
+    let copy = bound;
+    assert!(bound.is_file().unwrap() && copy.is_file().unwrap());
+    assert!(format!("{bound:?}").contains("/d/f"), "{bound:?}");
+
+    let base = posix::FakeFilesystem::new().with_dir(p("/d"));
+    let more = base.clone().with_file(p("/d/f"));
+    assert!(more.is_file(p("/d/f")).unwrap());
+    assert!(!base.is_file(p("/d/f")).unwrap());
+    assert!(base.is_dir(p("/d")).unwrap());
+    let shown = format!("{more:?}");
+    assert!(shown.contains("/d/f"), "{shown}");
+    let win = windows::FakeFilesystem::new().with_file(&w(r"C:\x"));
+    let (cloned, shown) = (win.clone(), format!("{win:?}"));
+    assert!(cloned.is_file(&w(r"C:\x")).unwrap());
+    assert!(shown.contains("x"), "{shown}");
 }

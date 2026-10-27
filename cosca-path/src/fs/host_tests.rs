@@ -1,6 +1,6 @@
 use std::io;
 
-use super::is_absence;
+use super::{absence_as_not_found, is_absence};
 use crate::fs::{Filesystem, HostFilesystem};
 #[cfg(windows)]
 use crate::PurePath;
@@ -133,6 +133,82 @@ fn host_filesystem_probes_what_the_path_names() {
 
     let relative = PathBuf::parse("tool.").unwrap();
     assert_eq!(fs.is_file(&relative).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+}
+
+/// An error that is not absence never has the kind `NotFound`, whatever `std` calls it: an
+/// unreachable server or share (`ERROR_BAD_NETPATH`, `ERROR_BAD_NET_NAME`) may only be unreachable
+/// for now. The OS error stays inside (`get_ref`). Checked for every OS code, so a sibling that
+/// `std` maps to `NotFound` is caught too.
+///
+/// Mutants: `canonical` and `same_file` passing such an error through unchanged; a mapping that
+/// turns every `NotFound`-kind error into absence.
+#[skuld::test]
+fn host_filesystem_does_not_say_absence_for_what_is_not() {
+    for code in 1..=65535 {
+        let raw = io::Error::from_raw_os_error(code);
+        let absent = is_absence(&raw);
+        let mapped = absence_as_not_found(raw);
+        assert_eq!(mapped.kind() == io::ErrorKind::NotFound, absent, "code {code}");
+        if mapped.raw_os_error().is_none() {
+            let source = mapped.get_ref().and_then(|e| e.downcast_ref::<io::Error>());
+            assert_eq!(source.and_then(io::Error::raw_os_error), Some(code), "code {code}");
+        }
+    }
+    #[cfg(windows)]
+    for code in [53, 67] {
+        let kind = absence_as_not_found(io::Error::from_raw_os_error(code)).kind();
+        assert_ne!(kind, io::ErrorKind::NotFound, "code {code}");
+    }
+}
+
+/// A share that cannot be reached is an `Err` from every question, never `Ok(false)` and never
+/// `NotFound`. `localhost` resolves without network traffic, and a share it does not hold is
+/// `ERROR_BAD_NET_NAME` (or `ERROR_BAD_NETPATH` where no server answers).
+///
+/// Mutant: `is_file`, `is_dir`, `canonical` or `same_file` keeping `std`'s `NotFound` kind for it.
+#[cfg(windows)]
+#[skuld::test]
+fn host_filesystem_does_not_take_an_unreachable_share_for_absence() {
+    let share = PathBuf::parse(r"\\localhost\cosca-no-such-share\x").unwrap();
+    let here = host(&std::env::current_dir().unwrap());
+    let fs = HostFilesystem;
+    let not_absence = |what: &str, r: io::Result<bool>| {
+        let e = r.expect_err(what);
+        assert_ne!(e.kind(), io::ErrorKind::NotFound, "{what}: {e:?}");
+    };
+    not_absence("is_file", fs.is_file(&share));
+    not_absence("is_dir", fs.is_dir(&share));
+    assert_ne!(fs.canonical(&share).unwrap_err().kind(), io::ErrorKind::NotFound);
+    not_absence("same_file", fs.same_file(&here, &share));
+    not_absence("same_file", fs.same_file(&share, &here));
+}
+
+/// The empty path is `InvalidInput` on Windows (no string names it) and absent on Unix, from every
+/// question: the fakes answer the same.
+///
+/// Mutant: a host that answers one question differently from the others.
+#[skuld::test]
+fn host_filesystem_reads_the_empty_path_per_os() {
+    let (empty, here) = (PathBuf::new(), host(&std::env::current_dir().unwrap()));
+    let fs = HostFilesystem;
+    #[cfg(windows)]
+    {
+        let invalid = io::ErrorKind::InvalidInput;
+        assert_eq!(fs.is_file(&empty).unwrap_err().kind(), invalid);
+        assert_eq!(fs.is_dir(&empty).unwrap_err().kind(), invalid);
+        assert_eq!(fs.canonical(&empty).unwrap_err().kind(), invalid);
+        assert_eq!(fs.same_file(&empty, &here).unwrap_err().kind(), invalid);
+        assert_eq!(fs.same_file(&here, &empty).unwrap_err().kind(), invalid);
+    }
+    #[cfg(unix)]
+    {
+        let not_found = io::ErrorKind::NotFound;
+        assert!(!fs.is_file(&empty).unwrap());
+        assert!(!fs.is_dir(&empty).unwrap());
+        assert_eq!(fs.canonical(&empty).unwrap_err().kind(), not_found);
+        assert_eq!(fs.same_file(&empty, &here).unwrap_err().kind(), not_found);
+        assert_eq!(fs.same_file(&here, &empty).unwrap_err().kind(), not_found);
+    }
 }
 
 /// A link canonicalises to its target, and is the same file as it.

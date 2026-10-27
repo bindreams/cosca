@@ -21,12 +21,18 @@ pub(crate) mod sealed {
         /// Win32). A trailing separator stays: it names only a directory, and so does a final `.`
         /// after a name on POSIX (`tool/.` is `tool/`). On Windows the lookup also writes `\` for
         /// `/`, resolves `..` lexically as Win32 does for a non-verbatim path (a final `.` or `..`
-        /// leaves no trailing separator), and ends a UNC share root in `\`. On POSIX `..` stays: the
+        /// leaves no trailing separator), reads a `?` device path as the plain path it names
+        /// (`//?/C:/x` is `C:\x`), and ends a UNC share root in `\`. On POSIX `..` stays: the
         /// kernel resolves it physically, through links the fake does not model.
         fn lookup_spelling(&self) -> Self::Buf;
 
-        /// Whether the path holds a NUL, which no filesystem accepts.
-        fn holds_nul(&self) -> bool;
+        /// A [`lookup_spelling`](Self::lookup_spelling) key as `canonical` returns it: the host's
+        /// spelling, which has no separator after a UNC share root.
+        fn canonical_spelling(&self) -> Self::Buf;
+
+        /// Why the host refuses the path before it looks anything up, if it does: a NUL, which no
+        /// filesystem accepts, or (Windows) the empty path, which no string names.
+        fn refusal(&self) -> Option<&'static str>;
     }
 }
 
@@ -50,17 +56,24 @@ pub(crate) mod sealed {
 /// relative `C:` is one entry however it is spelled (`C:.`, `C:.\`, `C:a\..\`).
 ///
 /// A name that holds NUL is [`InvalidInput`](io::ErrorKind::InvalidInput) from every question, as
-/// on the host, whatever else the test stated about it.
+/// on the host, whatever else the test stated about it. So is the empty path on Windows, where the
+/// host refuses it too (on POSIX it is absent, as on a Unix host), and a `//?/UNC/?/` path, whose
+/// server has no plain spelling.
 ///
-/// [`canonical`](Filesystem::canonical) returns the entry's stated spelling, or a stated link's
-/// target as the test wrote it. A relative query gives a relative path (the host gives an
-/// absolute one).
+/// [`canonical`](Filesystem::canonical) returns the host's spelling of the entry: separators
+/// collapsed, `/` as `\` on Windows, `.` and `..` resolved as for a query, and no separator after a
+/// UNC share root. A stated link gives its target as the test wrote it. A relative query gives a
+/// relative path (the host gives an absolute one).
 ///
-/// A file has no children: stating a path under a stated file, or a file over a path that has
-/// entries below it, panics in the builder, since no filesystem holds that.
+/// A file has no children: stating a path under a stated file, or a file (or a stated error) over
+/// a path that has entries below it, panics in the builder in either order, since no filesystem
+/// holds that.
 ///
 /// Case is exact, even for Windows paths: the test states the case it queries. Windows trailing
-/// dots and spaces are not modelled (`notepad.exe.` is not `notepad.exe`).
+/// dots and spaces are not modelled (`notepad.exe.` is not `notepad.exe`), and a path on a volume's
+/// device (`\\.\C:\.`) is an ordinary entry where the host refuses it: a test that needs that
+/// states it with [`with_error`](Self::with_error). The relative current directory `.` is absent
+/// unless the test states it, where the host has it.
 ///
 /// Entries are matched by scanning, which is fine for the handful a test states.
 pub struct FakeFilesystem<P: FakePath + ?Sized> {
@@ -68,6 +81,7 @@ pub struct FakeFilesystem<P: FakePath + ?Sized> {
     links: Vec<(P::Buf, P::Buf)>,
 }
 
+#[derive(Debug, Clone)]
 enum Entry {
     File,
     Dir,
@@ -95,6 +109,21 @@ fn lookup<P: FakePath + ?Sized>(p: &P) -> (P::Buf, bool) {
     }
 }
 
+/// The ancestors of `key`, nearest first. The empty parent of a relative path is not one: nothing
+/// resolves it.
+fn ancestors<P: FakePath + ?Sized>(key: &P) -> Vec<P::Buf> {
+    let mut out = Vec::new();
+    let mut child = key;
+    while let Some(parent) = child.parent() {
+        if parent.to_native_bytes().is_empty() {
+            break;
+        }
+        out.push(parent.to_owned());
+        child = parent;
+    }
+    out
+}
+
 /// Whether `key` is strictly below `ancestor`.
 fn is_below<P: FakePath + ?Sized>(key: &P, ancestor: &P) -> bool {
     let mut up = key;
@@ -107,12 +136,12 @@ fn is_below<P: FakePath + ?Sized>(key: &P, ancestor: &P) -> bool {
     false
 }
 
-/// A name holding NUL is `InvalidInput` on the host before any lookup.
-fn refuse_nul<P: FakePath + ?Sized>(p: &P) -> io::Result<()> {
-    if p.holds_nul() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "the path holds a NUL"));
+/// A path the host refuses is `InvalidInput` before any lookup.
+fn refuse<P: FakePath + ?Sized>(p: &P) -> io::Result<()> {
+    match p.refusal() {
+        Some(why) => Err(io::Error::new(io::ErrorKind::InvalidInput, why)),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 impl<P: FakePath + ?Sized> FakeFilesystem<P> {
@@ -149,7 +178,9 @@ impl<P: FakePath + ?Sized> FakeFilesystem<P> {
     /// as stated (absent, unless something else implies it). A directory that answers for itself
     /// but not for its contents is [`with_unreadable_dir`](Self::with_unreadable_dir).
     pub fn with_error(mut self, path: &P, kind: io::ErrorKind) -> Self {
-        self.set(lookup(path).0, Entry::Error(kind));
+        let key = lookup(path).0;
+        self.refuse_under_file(path, key.borrow());
+        self.set(key, Entry::Error(kind));
         self
     }
 
@@ -187,23 +218,22 @@ impl<P: FakePath + ?Sized> FakeFilesystem<P> {
             let has_children = self.entries.iter().any(|(stated, _)| is_below(stated.borrow(), key));
             assert!(!has_children, "{key:?} has entries below it, so it cannot be a file");
         }
-        let mut ancestors = Vec::new();
-        let mut child: &P = key.borrow();
-        while let Some(parent) = child.parent() {
-            if parent.to_native_bytes().is_empty() {
-                break;
-            }
-            ancestors.push(parent.to_owned());
-            child = parent;
-        }
-        for ancestor in ancestors {
-            match self.find(ancestor.borrow()) {
-                None => self.entries.push((ancestor, Entry::Dir)),
-                Some(Entry::File) => panic!("{path:?} is under {ancestor:?}, which is a file"),
-                Some(_) => {}
+        self.refuse_under_file(path, key.borrow());
+        for ancestor in ancestors(key.borrow()) {
+            if self.find(ancestor.borrow()).is_none() {
+                self.entries.push((ancestor, Entry::Dir));
             }
         }
         self.set(key, entry);
+    }
+
+    /// Panics if an ancestor of `key`, the entry `path` names, is a stated file.
+    fn refuse_under_file(&self, path: &P, key: &P) {
+        for ancestor in ancestors(key) {
+            if matches!(self.find(ancestor.borrow()), Some(Entry::File)) {
+                panic!("{path:?} is under {ancestor:?}, which is a file");
+            }
+        }
     }
 
     fn find(&self, key: &P) -> Option<&Entry> {
@@ -237,22 +267,42 @@ impl<P: FakePath + ?Sized> FakeFilesystem<P> {
     }
 
     fn at(&self, p: &P) -> io::Result<Option<&Entry>> {
-        refuse_nul(p)?;
+        refuse(p)?;
         let (key, dir_only) = lookup(p);
         self.entry(key.borrow(), dir_only)
     }
 
     /// The entry `p` names with its stated link followed, once.
     fn resolved(&self, p: &P) -> io::Result<P::Buf> {
-        refuse_nul(p)?;
+        refuse(p)?;
         let (key, dir_only) = lookup(p);
         match self.entry(key.borrow(), dir_only)? {
             None => Err(io::ErrorKind::NotFound.into()),
             Some(_) => Ok(match self.links.iter().find(|(link, _)| link == &key) {
                 Some((_, target)) => target.clone(),
-                None => key,
+                None => Borrow::<P>::borrow(&key).canonical_spelling(),
             }),
         }
+    }
+}
+
+/// A copy that shares nothing with the original.
+impl<P: FakePath + ?Sized> Clone for FakeFilesystem<P> {
+    fn clone(&self) -> Self {
+        FakeFilesystem {
+            entries: self.entries.clone(),
+            links: self.links.clone(),
+        }
+    }
+}
+
+/// The stated entries and links.
+impl<P: FakePath + ?Sized> std::fmt::Debug for FakeFilesystem<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FakeFilesystem")
+            .field("entries", &self.entries)
+            .field("links", &self.links)
+            .finish()
     }
 }
 

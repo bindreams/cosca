@@ -10,12 +10,25 @@ use crate::windows::{Path, PathBuf};
 /// [`posix::Path`](crate::posix::Path)s on Unix. It is not implemented elsewhere.
 ///
 /// Answers come from `std::fs`, so links are followed. A Windows path reaches `std` through
-/// `windows::Path::to_std_path`, so it names what its names spell: `C:\x\tool.` is the file
-/// `tool.`, not `tool`. A path with no such string (a relative `tool.`) is an
-/// [`InvalidInput`](io::ErrorKind::InvalidInput) error.
+/// `windows::Path::to_std_path`, so each name is read as spelled: `C:\x\tool.` is the file
+/// `tool.`, not `tool`. A path with no such string (a relative `tool.`, or the empty path) is an
+/// [`InvalidInput`](io::ErrorKind::InvalidInput) error. On Unix the empty path is absent.
 ///
 /// [`canonical`](Filesystem::canonical) is parsed back into a stored (lexical) spelling, so a
-/// Win32 `\\?\` prefix is not in the result (see the [`windows`](crate::windows) module docs).
+/// Win32 `\\?\` prefix is not in the result (see the [`windows`](crate::windows) module docs). A
+/// UNC server and share keep the case the redirector holds, which may differ from the query's, so
+/// two results for one directory can differ in case.
+///
+/// An `Err` of kind [`NotFound`](io::ErrorKind::NotFound) is absence and nothing else: an
+/// unreachable server or share (`ERROR_BAD_NETPATH`, `ERROR_BAD_NET_NAME`), which `std` also calls
+/// `NotFound`, comes back as [`Other`](io::ErrorKind::Other) with the OS error inside.
+///
+/// [`is_file`](Filesystem::is_file) and [`is_dir`](Filesystem::is_dir) need no handle on the
+/// object, so they answer wherever `std::fs::metadata` does. [`canonical`](Filesystem::canonical)
+/// and [`same_file`](Filesystem::same_file) open it, so on Windows they can fail where those two
+/// succeed: an app-execution alias (`%LOCALAPPDATA%\Microsoft\WindowsApps\*.exe`, os error 1920),
+/// `pagefile.sys` and its like (32), a protected directory such as `System Volume Information`
+/// (`PermissionDenied`). The error is returned as it is.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HostFilesystem;
 
@@ -39,11 +52,21 @@ fn is_absence(e: &io::Error) -> bool {
     }
 }
 
-/// `e` as [`NotFound`](io::ErrorKind::NotFound) if it is [`is_absence`], else unchanged: how the
-/// operations with no `Ok` for "nothing there" (`canonical`, `same_file`) report absence.
+/// `e` as [`NotFound`](io::ErrorKind::NotFound) if it is [`is_absence`], else as [`not_absence`]: how
+/// the operations with no `Ok` for "nothing there" (`canonical`, `same_file`) report absence.
 fn absence_as_not_found(e: io::Error) -> io::Error {
     if is_absence(&e) {
         io::Error::new(io::ErrorKind::NotFound, e)
+    } else {
+        not_absence(e)
+    }
+}
+
+/// `e`, which is not absence, without the kind `NotFound`, so that the kind alone tells absence
+/// from a failure to say. The OS error stays inside.
+fn not_absence(e: io::Error) -> io::Error {
+    if e.kind() == io::ErrorKind::NotFound {
+        io::Error::other(e)
     } else {
         e
     }
@@ -65,7 +88,7 @@ fn metadata(p: &Path) -> io::Result<Option<std::fs::Metadata>> {
     match std::fs::metadata(std_path(p)?) {
         Ok(meta) => Ok(Some(meta)),
         Err(e) if is_absence(&e) => Ok(None),
-        Err(e) => Err(e),
+        Err(e) => Err(not_absence(e)),
     }
 }
 
@@ -93,8 +116,8 @@ impl Filesystem for HostFilesystem {
     }
 }
 
-/// File identity without opening for data, so it works wherever [`metadata`] does: no read
-/// access is needed and a FIFO has nothing to wait for.
+/// File identity without opening for data: no read access is needed and a FIFO has nothing to
+/// wait for. On Windows it still needs a handle on the object (see [`HostFilesystem`]).
 mod identity {
     use std::io;
     use std::path::Path;
@@ -116,8 +139,8 @@ mod identity {
     /// Where the 128-bit query fails for either handle, both are compared by the volume serial
     /// number and 64-bit index of `GetFileInformationByHandle` instead, so two kinds of id are
     /// never compared. Microsoft's pages for `FileIdInfo` and `FILE_ID_INFO` say it is unsupported
-    /// before Windows 8 and Server 2012 and list no filesystems; the old `same-file` crate's
-    /// answer on FAT and exFAT came from the 64-bit call, so that call is the fallback.
+    /// before Windows 8 and Server 2012 and list no filesystems; so the 64-bit call is the
+    /// fallback where the 128-bit one fails.
     #[cfg(windows)]
     pub(super) fn same_file(a: impl AsRef<Path>, b: impl AsRef<Path>) -> io::Result<bool> {
         same_file_with(a, b, wide_file_id)

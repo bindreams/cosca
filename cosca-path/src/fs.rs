@@ -21,7 +21,10 @@ pub use host::HostFilesystem;
 ///
 /// `canonical` and `same_file` have no `Ok` for "nothing there", so absence is
 /// [`NotFound`](io::ErrorKind::NotFound) from them. Every other `Err` is a failure to say, as for
-/// the other two.
+/// the other two. They need a handle on the object, so they can
+/// fail where `is_file` says `Ok(true)` (on Windows, an app-execution alias or `pagefile.sys`).
+///
+/// The empty path is `InvalidInput` on Windows and absent on Unix, from every question.
 pub trait Filesystem {
     type Path: PurePath + ?Sized;
 
@@ -39,9 +42,26 @@ pub trait Filesystem {
 }
 
 /// A path bound to the filesystem that answers questions about it.
+///
+/// Two shared references: `Clone`, `Copy` and `Debug` (it prints the path) whatever `F` is, a
+/// `dyn Filesystem` included.
 pub struct BoundPath<'a, F: Filesystem + ?Sized> {
     fs: &'a F,
     path: &'a F::Path,
+}
+
+impl<F: Filesystem + ?Sized> Clone for BoundPath<'_, F> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<F: Filesystem + ?Sized> Copy for BoundPath<'_, F> {}
+
+impl<F: Filesystem + ?Sized> std::fmt::Debug for BoundPath<'_, F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("BoundPath").field(&self.path).finish()
+    }
 }
 
 impl<'a, F: Filesystem + ?Sized> BoundPath<'a, F> {
