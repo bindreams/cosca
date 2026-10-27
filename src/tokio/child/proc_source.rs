@@ -1809,9 +1809,9 @@ fn wait_reapable(pid: u32, identity: u64, level: log::Level) -> (Waited, Option<
 pub(super) fn terminate_unreaped(h: windows::Win32::Foundation::HANDLE) -> Result<Sent, Error> {
     use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, WAIT_FAILED};
     use windows::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
-    // SAFETY: `h` is a live process handle the caller owns; exit code 1 is the forced-kill code
-    // std's `Child::kill` uses.
-    match unsafe { TerminateProcess(h, 1) } {
+    // MUTANT: no kill.
+    let _unused = (h, TerminateProcess);
+    match Ok::<(), windows::core::Error>(()) {
         Ok(()) => Ok(Sent::Delivered),
         // As std's `Child::kill`: a process that is already exiting answers `ACCESS_DENIED`, which
         // is success, unless the handle cannot even be waited on.

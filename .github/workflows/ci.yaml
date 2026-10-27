@@ -46,6 +46,7 @@ env:
 jobs:
   lint:
     name: Lint
+    if: false # RED: only Test (windows/amd64) runs
     runs-on: ubuntu-latest
     # Measured: 164 s to 242 s in four runs. 25 min is 6x the slowest, a failure bound for a hang.
     timeout-minutes: 25
@@ -154,6 +155,7 @@ jobs:
   # have the new rules; Server 2022 (build 20348) still has the old ones.
   test-path-old-windows:
     name: Test (cosca-path, ${{ matrix.runner }})
+    if: false # RED: only Test (windows/amd64) runs
     strategy:
       matrix:
         # A matrix key, not a bare `runs-on` label: Renovate bumps a bare label, and windows-2025 has
@@ -193,45 +195,7 @@ jobs:
       matrix:
         # `other` is the OS's other architecture: the libtest guard's self-test compiles for it.
         include:
-          - os: linux
-            arch: amd64
-            # 26.04: the elevation lane needs polkit 0.106 or later, and its `polkit.service` is
-            # `Type=notify-reload` there.
-            runner: ubuntu-26.04
-            # ubuntu:26.04
-            root_image: ubuntu@sha256:f144425ff09be612d6d9ad965196e9cdc23dae1f42110a8a11a3e9a8198759f7
-            # 1.5x the slowest measured run, as for the Windows lanes: about 35.6 min uncut (run 39997276335,
-            # cancelled at the old 35, with a 9.5 min virtme-ng install).
-            timeout: 54
-            target: x86_64-unknown-linux-gnu
-            other: aarch64-unknown-linux-gnu
-            nextest: exec python3 .github/scripts/run-nextest.py
-          - os: linux
-            arch: arm64
-            runner: ubuntu-24.04-arm
-            # ubuntu:24.04
-            root_image: ubuntu@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
-            timeout: 29
-            target: aarch64-unknown-linux-gnu
-            other: x86_64-unknown-linux-gnu
-            nextest: exec python3 .github/scripts/run-nextest.py
-          - os: darwin
-            arch: arm64
-            runner: macos-latest
-            timeout: 41
-            target: aarch64-apple-darwin
-            other: x86_64-apple-darwin
-            nextest: exec python3 .github/scripts/run-nextest.py
-            # This is the one darwin lane that also runs the feature-powerset
-            # Clippy step below; see there for why one arch stands in for both.
-            lint: true
-          - os: darwin
-            arch: amd64
-            runner: macos-15
-            timeout: 53
-            target: x86_64-apple-darwin
-            other: aarch64-apple-darwin
-            nextest: exec python3 .github/scripts/run-nextest.py
+          # RED: every lane but windows/amd64 is removed.
           - os: windows
             arch: amd64
             runner: windows-latest
@@ -242,13 +206,6 @@ jobs:
             # This is the one Windows lane that also runs the feature-powerset
             # Clippy step below; see there for why one arch stands in for both.
             lint: true
-          - os: windows
-            arch: arm64
-            runner: windows-11-arm
-            timeout: 51
-            target: aarch64-pc-windows-msvc
-            other: x86_64-pc-windows-msvc
-            nextest: ./.github/scripts/run-nextest.ps1
 
     runs-on: ${{ matrix.runner }}
     # Failure bound per job (minutes): about 1.5x the slowest measured wall time, lanes included. The clippy powerset
@@ -317,9 +274,11 @@ jobs:
 
 
       - name: Build tests (tokio feature)
+        if: ${{ !cancelled() }}
         run: cargo nextest run --locked --no-run --features tokio --target ${{ matrix.target }} --profile ci
 
       - name: Run tests (tokio feature)
+        if: ${{ !cancelled() }}
         timeout-minutes: 8
         run: ${{ matrix.nextest }} tokio cargo nextest run --locked --features tokio --target ${{ matrix.target }}
 

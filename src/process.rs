@@ -200,6 +200,13 @@ impl Process {
     /// irreducible residual window — best-effort there, like the existing tree teardown. On
     /// Linux a refused `pidfd_open` is `Unsupported` (see [`Error::Unsupported`]).
     pub fn kill(&self) -> Result<(), Error> {
+        // MUTANT (Windows): no kill.
+        #[cfg(windows)]
+        {
+            let _unused = self.id;
+            Ok(())
+        }
+        #[cfg(not(windows))]
         crate::wait::kill(self.id)
     }
 }

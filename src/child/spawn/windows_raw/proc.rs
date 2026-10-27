@@ -164,6 +164,10 @@ impl RawChild {
 
     /// Hard-kill the process. An already-exited child is success (matches std's `kill`).
     pub(crate) fn kill(&self) -> io::Result<()> {
+        // MUTANT: no kill.
+        if true {
+            return Ok(());
+        }
         // SAFETY: `handle` is our live, owned process handle; exit code 1 is the forced-kill code.
         match unsafe { TerminateProcess(self.handle(), 1) } {
             Ok(()) => Ok(()),
@@ -198,8 +202,9 @@ impl RawChild {
     pub(crate) fn teardown_on_drop(&self, id: crate::identity::ProcessId) -> crate::child::proc_handle::Torn {
         use crate::child::proc_handle::Torn;
         use crate::error::ChildFate;
-        // SAFETY: `handle` is our live, owned process handle.
-        match unsafe { TerminateProcess(self.handle(), 1) } {
+        // MUTANT: no kill.
+        let _unused = TerminateProcess;
+        match Ok::<(), windows::core::Error>(()) {
             Ok(()) => {
                 #[cfg(test)]
                 crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterDropKill);

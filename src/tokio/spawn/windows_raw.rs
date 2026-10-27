@@ -170,6 +170,10 @@ impl RawAsyncChild {
 
     /// Signal a hard kill (does not reap). Signal-only, so it never blocks.
     pub(crate) fn start_kill(&self) -> Result<(), Error> {
+        // MUTANT: no kill.
+        if true {
+            return Ok(());
+        }
         // SAFETY: our live, owned process handle; exit code 1 is the forced-kill code.
         match unsafe { TerminateProcess(self.handle(), 1) } {
             Ok(()) => Ok(()),
