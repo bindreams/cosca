@@ -42,6 +42,7 @@ fn public_surface_is_usable() {
 #[cfg(any(unix, windows))]
 #[skuld::test]
 fn containment_smoke() {
+    let _warns = common::warn_watch();
     let tb = env!("CARGO_BIN_EXE_cosca_testbin");
     let mut cmd = cosca::Command::new();
     cmd.executable(tb)
@@ -49,8 +50,10 @@ fn containment_smoke() {
         .stdin(cosca::Stdio::pipe())
         .unwrap()
         .stdout(cosca::Stdio::null())
-        .unwrap()
-        .contain();
+        .unwrap();
+    // On Linux this asks for a session, not `.contain()`'s cgroup leaf, which warns where none is
+    // delegated; the live cgroup mechanism is covered in the `cgroup` group (`spawn_io`).
+    common::contain_without_cgroup(&mut cmd);
     let mut child = cmd.spawn().expect("spawn contained child");
     let stdin = child.stdin().expect("piped stdin");
 
@@ -66,11 +69,7 @@ fn containment_smoke() {
     #[cfg(windows)]
     assert_eq!(child.containment(), Containment::JobObject);
     #[cfg(target_os = "linux")]
-    assert!(
-        matches!(child.containment(), Containment::CgroupV2 | Containment::ProcessGroup),
-        "Linux must use CgroupV2 or ProcessGroup, got {:?}",
-        child.containment()
-    );
+    assert_eq!(child.containment(), Containment::Session);
     #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
     assert!(
         matches!(
@@ -115,10 +114,14 @@ fn spawn_public_surface_is_usable() {
     let _ = Stdio::null();
 }
 
+#[path = "common/mod.rs"]
+mod common;
+
 #[path = "../src/test_harness.rs"]
 mod test_harness;
 
 fn main() {
+    common::install_log_capture();
     let mut runner = skuld::TestRunner::new();
     runner.libtest_names();
     runner.require_known_labels();

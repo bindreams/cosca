@@ -321,6 +321,7 @@ fn an_identity_written_by_another_process_restores_and_names_that_process() {
 mod test_harness;
 
 fn main() {
+    common::install_log_capture();
     let mut runner = skuld::TestRunner::new();
     runner.libtest_names();
     runner.require_known_labels();

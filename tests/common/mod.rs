@@ -256,8 +256,69 @@ mod log_capture {
             .map(|(level, _)| *level)
             .collect()
     }
+
+    /// The text of every record at `Warn` or worse emitted at or after `mark`.
+    pub fn warnings_since(mark: usize) -> Vec<String> {
+        RECORDS.lock().unwrap()[mark..]
+            .iter()
+            .filter(|(level, _)| *level <= log::Level::Warn)
+            .map(|(_, m)| m.clone())
+            .collect()
+    }
 }
-pub use log_capture::{contains_since, install as install_log_capture, levels_since, mark as log_mark};
+pub use log_capture::{contains_since, install as install_log_capture, levels_since, mark as log_mark, warnings_since};
+
+/// Pins a test's log output: every record at `Warn` or worse emitted while it lives must contain
+/// one of the [`expecting`](Self::expecting) needles, and every needle must match at least one
+/// such record. Declare it FIRST in a test, so it drops last, after the test's children have been
+/// torn down and their teardown has logged. Skipped while the test is already panicking, so it
+/// never masks the real failure.
+///
+/// Reads the process-wide capture from its creation on, so it assumes one test per process (what
+/// nextest runs); the binary's `main` must call [`install_log_capture`].
+#[must_use = "the watch asserts when dropped; bind it to a named `_watch`, not `_`"]
+pub struct WarnWatch {
+    mark: usize,
+    expected: Vec<&'static str>,
+}
+
+pub fn warn_watch() -> WarnWatch {
+    WarnWatch {
+        mark: log_mark(),
+        expected: Vec::new(),
+    }
+}
+
+impl WarnWatch {
+    /// This test legitimately produces a warning containing `needle`.
+    pub fn expecting(mut self, needle: &'static str) -> Self {
+        self.expected.push(needle);
+        self
+    }
+}
+
+impl Drop for WarnWatch {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            return;
+        }
+        let warnings = warnings_since(self.mark);
+        let unexpected: Vec<&String> = warnings
+            .iter()
+            .filter(|w| !self.expected.iter().any(|n| w.contains(n)))
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "unexpected warning(s) at Warn or above: {unexpected:#?}"
+        );
+        for needle in &self.expected {
+            assert!(
+                warnings.iter().any(|w| w.contains(needle)),
+                "expected a warning containing {needle:?}, got {warnings:#?}"
+            );
+        }
+    }
+}
 
 /// The lib's group declarations, included once for every root that uses `common` (an integration
 /// test cannot name a `#[cfg(test)]` item of the library). See `docs/principles.md`, principles 9
@@ -356,9 +417,29 @@ pub fn silence_async(cmd: &mut cosca::tokio::Command) {
     cmd.stderr(cosca::Stdio::null()).expect("null stderr");
 }
 
+/// `.contain()`, except that on Linux it asks for [`ContainMode::Session`](cosca::ContainMode::Session)
+/// (a process group, torn down with `killpg`), which never looks for a cgroup. `.contain()` tries a
+/// cgroup leaf first and logs a warning where none is delegated, so the same test would warn on one
+/// host and not on another. A test that is about cgroups takes the `cgroup` group instead.
+pub fn contain_without_cgroup(cmd: &mut cosca::Command) -> &mut cosca::Command {
+    #[cfg(target_os = "linux")]
+    return cmd.contain_with(cosca::ContainMode::Session);
+    #[cfg(not(target_os = "linux"))]
+    cmd.contain()
+}
+
+/// [`contain_without_cgroup`] for the async `Command`.
+#[cfg(feature = "tokio")]
+pub fn contain_without_cgroup_async(cmd: &mut cosca::tokio::Command) -> &mut cosca::tokio::Command {
+    #[cfg(target_os = "linux")]
+    return cmd.contain_with(cosca::ContainMode::Session);
+    #[cfg(not(target_os = "linux"))]
+    cmd.contain()
+}
+
 /// Spawn `mode <addr> [extra...]` as a control child that connects, writes a 1-byte tag,
 /// then blocks; returns the owned `Child` and the accepted socket (the tag read proves it
-/// is alive). `contain` applies `.contain()`. This is the canonical form; `tests/lifecycle.rs`
+/// is alive). `contain` applies [`contain_without_cgroup`]. This is the canonical form; `tests/lifecycle.rs`
 /// now calls this instead of keeping its own copy.
 pub fn spawn_control(mode: &str, extra: &[&str], contain: bool) -> (cosca::Child, TcpStream) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -369,7 +450,7 @@ pub fn spawn_control(mode: &str, extra: &[&str], contain: bool) -> (cosca::Child
     cmd.executable(testbin()).args(&argv).env(ACK_ENV, "1");
     silence(&mut cmd);
     if contain {
-        cmd.contain();
+        contain_without_cgroup(&mut cmd);
     }
     let mut child = cmd.spawn().expect("spawn control child");
     let mut sock = accept_or_die(&listener, &mut child);
@@ -466,7 +547,7 @@ pub fn spawn_tree_with(
         .env(ACK_ENV, "1");
     silence(&mut cmd);
     if contain {
-        cmd.contain();
+        contain_without_cgroup(&mut cmd);
     }
     let report = TcpListener::bind("127.0.0.1:0").expect("bind the grandchild pid report listener");
     cmd.env(GC_PID_ADDR_ENV, report.local_addr().unwrap().to_string());
@@ -541,7 +622,7 @@ pub async fn spawn_control_async(mode: &str, extra: &[&str], contain: bool) -> (
         let mut path_argv = vec![testbin().to_string()];
         path_argv.extend(argv.into_iter().skip(1));
         cmd.args(path_argv);
-        cmd.contain();
+        contain_without_cgroup_async(&mut cmd);
     } else {
         cmd.executable(testbin()).args(&argv); // uncontained → the async raw backend
     }

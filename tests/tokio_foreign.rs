@@ -200,6 +200,8 @@ async fn async_foreign_unix_only_ops_are_unsupported_on_windows() {
 mod test_harness;
 
 fn main() {
+    #[cfg(feature = "tokio")]
+    common::install_log_capture();
     let mut runner = skuld::TestRunner::new();
     runner.libtest_names();
     runner.require_known_labels();
