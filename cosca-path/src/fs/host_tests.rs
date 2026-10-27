@@ -261,3 +261,97 @@ fn host_filesystem_same_file_identifies_by_file_id() {
         io::ErrorKind::NotFound
     );
 }
+
+/// `canonical` and `same_file` say absence as `NotFound`, as the `Filesystem` trait documents,
+/// for every spelling of "nothing there": a missing leaf, a missing directory, a non-directory in
+/// the path, and (Windows) a name no filesystem takes.
+///
+/// Mutants: `canonical` or `same_file` passing the raw error through (`ENOTDIR` is
+/// `NotADirectory`; `ERROR_INVALID_NAME` is `InvalidInput`); mapping every error to `NotFound`.
+#[skuld::test]
+fn host_filesystem_reports_every_absence_as_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("file");
+    std::fs::write(&file, b"").unwrap();
+    let file_p = host(&file);
+    let mut gone = vec![
+        host(&dir.path().join("missing")),
+        host(&dir.path().join("missing").join("x")),
+        host(&file.join("below")),
+    ];
+    // `|` is not a Windows name character (INVALID_NAME); on Unix it is an ordinary one.
+    gone.extend(cfg!(windows).then(|| host(&dir.path().join("bad|name"))));
+    let fs = HostFilesystem;
+
+    for p in &gone {
+        assert_eq!(
+            fs.canonical(p).unwrap_err().kind(),
+            io::ErrorKind::NotFound,
+            "canonical {p:?}"
+        );
+        assert_eq!(
+            fs.same_file(&file_p, p).unwrap_err().kind(),
+            io::ErrorKind::NotFound,
+            "same_file {p:?}"
+        );
+        assert_eq!(
+            fs.same_file(p, &file_p).unwrap_err().kind(),
+            io::ErrorKind::NotFound,
+            "same_file {p:?}"
+        );
+    }
+}
+
+/// Where `FileIdInfo` fails (a filesystem that lacks it), `same_file` answers from
+/// `GetFileInformationByHandle` on the same handles: the same file is `true`, two files `false`,
+/// a hard link `true`, a directory works. The failure of either handle's query moves both
+/// handles to the fallback, so two different kinds of id are never compared.
+///
+/// Mutants: no fallback (the error is returned); a fallback that compares the volume only; a
+/// fallback used for the failing handle alone.
+#[cfg(windows)]
+#[skuld::test]
+fn host_filesystem_same_file_falls_back_without_file_id_info() {
+    use std::cell::Cell;
+
+    use windows::Win32::Storage::FileSystem::FILE_ID_INFO;
+
+    use super::identity::{same_file_with, wide_file_id};
+
+    // ERROR_INVALID_PARAMETER: what a filesystem without the class answers.
+    let unsupported = || Err::<FILE_ID_INFO, _>(io::Error::from_raw_os_error(87));
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("file");
+    let link = dir.path().join("link");
+    let other = dir.path().join("other");
+    std::fs::write(&file, b"").unwrap();
+    std::fs::write(&other, b"").unwrap();
+    std::fs::hard_link(&file, &link).unwrap();
+
+    // Both queries fail.
+    let both = |a: &std::path::Path, b: &std::path::Path| same_file_with(a, b, |_| unsupported());
+    assert!(both(&file, &file).expect("fallback answers"));
+    assert!(both(&file, &link).expect("fallback answers"));
+    assert!(!both(&file, &other).expect("fallback answers"));
+    assert!(both(dir.path(), dir.path()).expect("fallback answers"));
+    assert!(!both(dir.path(), &file).expect("fallback answers"));
+
+    // Only the second handle's query fails: the first is not compared by its wide id.
+    let second = |a: &std::path::Path, b: &std::path::Path| {
+        let calls = Cell::new(0);
+        same_file_with(a, b, |f| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 2 {
+                unsupported()
+            } else {
+                wide_file_id(f)
+            }
+        })
+    };
+    assert!(second(&file, &link).expect("fallback answers"));
+    assert!(!second(&file, &other).expect("fallback answers"));
+
+    // An absent path is still `NotFound` through the seam: the fallback is not a way around it.
+    let missing = dir.path().join("missing");
+    assert_eq!(both(&file, &missing).unwrap_err().kind(), io::ErrorKind::NotFound);
+}

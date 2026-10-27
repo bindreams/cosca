@@ -39,6 +39,16 @@ fn is_absence(e: &io::Error) -> bool {
     }
 }
 
+/// `e` as [`NotFound`](io::ErrorKind::NotFound) if it is [`is_absence`], else unchanged: how the
+/// operations with no `Ok` for "nothing there" (`canonical`, `same_file`) report absence.
+fn absence_as_not_found(e: io::Error) -> io::Error {
+    if is_absence(&e) {
+        io::Error::new(io::ErrorKind::NotFound, e)
+    } else {
+        e
+    }
+}
+
 #[cfg(windows)]
 fn std_path(p: &Path) -> io::Result<std::path::PathBuf> {
     p.to_std_path()
@@ -71,7 +81,7 @@ impl Filesystem for HostFilesystem {
     }
 
     fn canonical(&self, p: &Path) -> io::Result<PathBuf> {
-        let canonical = std::fs::canonicalize(std_path(p)?)?;
+        let canonical = std::fs::canonicalize(std_path(p)?).map_err(absence_as_not_found)?;
         #[cfg(windows)]
         return PathBuf::from_std_path(&canonical).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e));
         #[cfg(unix)]
@@ -79,13 +89,7 @@ impl Filesystem for HostFilesystem {
     }
 
     fn same_file(&self, a: &Path, b: &Path) -> io::Result<bool> {
-        identity::same_file(std_path(a)?, std_path(b)?).map_err(|e| {
-            if is_absence(&e) {
-                io::Error::new(io::ErrorKind::NotFound, e)
-            } else {
-                e
-            }
-        })
+        identity::same_file(std_path(a)?, std_path(b)?).map_err(absence_as_not_found)
     }
 }
 
@@ -108,11 +112,29 @@ mod identity {
     /// `GetFileInformationByHandle`'s 64-bit index is not unique on ReFS. Both handles stay open
     /// until the comparison is made, so neither file can be deleted and its id reused between the
     /// two queries.
+    ///
+    /// Where the 128-bit query fails for either handle, both are compared by the volume serial
+    /// number and 64-bit index of `GetFileInformationByHandle` instead, so two kinds of id are
+    /// never compared. Microsoft's pages for `FileIdInfo` and `FILE_ID_INFO` say it is unsupported
+    /// before Windows 8 and Server 2012 and list no filesystems; the old `same-file` crate's
+    /// answer on FAT and exFAT came from the 64-bit call, so that call is the fallback.
     #[cfg(windows)]
     pub(super) fn same_file(a: impl AsRef<Path>, b: impl AsRef<Path>) -> io::Result<bool> {
+        same_file_with(a, b, wide_file_id)
+    }
+
+    /// [`same_file`] with the 128-bit id query given, so a test can make it fail.
+    #[cfg(windows)]
+    pub(super) fn same_file_with(
+        a: impl AsRef<Path>,
+        b: impl AsRef<Path>,
+        wide_id: impl Fn(&std::fs::File) -> io::Result<windows::Win32::Storage::FileSystem::FILE_ID_INFO>,
+    ) -> io::Result<bool> {
         let (a, b) = (open(a.as_ref())?, open(b.as_ref())?);
-        let (a, b) = (file_id(&a)?, file_id(&b)?);
-        Ok(a.VolumeSerialNumber == b.VolumeSerialNumber && a.FileId.Identifier == b.FileId.Identifier)
+        if let (Ok(a), Ok(b)) = (wide_id(&a), wide_id(&b)) {
+            return Ok(a.VolumeSerialNumber == b.VolumeSerialNumber && a.FileId.Identifier == b.FileId.Identifier);
+        }
+        Ok(narrow_file_id(&a)? == narrow_file_id(&b)?)
     }
 
     /// `p` with no access rights, full sharing and `FILE_FLAG_BACKUP_SEMANTICS` (which lets a
@@ -134,7 +156,7 @@ mod identity {
     }
 
     #[cfg(windows)]
-    fn file_id(f: &std::fs::File) -> io::Result<windows::Win32::Storage::FileSystem::FILE_ID_INFO> {
+    pub(super) fn wide_file_id(f: &std::fs::File) -> io::Result<windows::Win32::Storage::FileSystem::FILE_ID_INFO> {
         use std::os::windows::io::AsRawHandle;
 
         use windows::Win32::Foundation::HANDLE;
@@ -151,6 +173,23 @@ mod identity {
             )
         }?;
         Ok(info)
+    }
+
+    /// The volume serial number and 64-bit file index of `f`.
+    #[cfg(windows)]
+    fn narrow_file_id(f: &std::fs::File) -> io::Result<(u32, u64)> {
+        use std::os::windows::io::AsRawHandle;
+
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: the handle is open for the call, and `info` is a `BY_HANDLE_FILE_INFORMATION`.
+        unsafe { GetFileInformationByHandle(HANDLE(f.as_raw_handle()), &mut info) }?;
+        Ok((
+            info.dwVolumeSerialNumber,
+            u64::from(info.nFileIndexHigh) << 32 | u64::from(info.nFileIndexLow),
+        ))
     }
 }
 
