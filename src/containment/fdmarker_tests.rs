@@ -45,6 +45,11 @@ pub(crate) fn inert_root() -> crate::identity::ProcessId {
     crate::identity::ProcessId::from_parts_for_test(0x7FFF_FFF0, 1)
 }
 
+/// `install` on `cmd`, as the only step of its hook.
+fn install_on(cmd: &mut std::process::Command, reserved: &[std::os::fd::RawFd]) -> Option<super::PreparedMarker> {
+    crate::child::spawn::in_child::register_alone(cmd, |steps| super::install(steps, reserved))
+}
+
 fn all_pids() -> Vec<crate::identity::RawPid> {
     crate::containment::enumerate::snapshot().0
 }
@@ -265,7 +270,7 @@ fn a_dead_handle_finds_no_holders() {
 
 // Installing the marker on a spawn =====
 
-/// `fd_map::install_preserved` only clears FD_CLOEXEC — it does not renumber, so the marker keeps the
+/// `fd_map::preserve` only clears FD_CLOEXEC — it does not renumber, so the marker keeps the
 /// parent's descriptor NUMBER inside the child. `fd_map`'s user mappings `dup2` onto
 /// their `child_fd` numbers in the same forked child, closing whatever occupies them, so a
 /// marker on one of those numbers would be silently clobbered and the tree would silently
@@ -312,7 +317,7 @@ fn install_places_the_marker_above_every_reserved_child_fd() {
     let _serialize = test_spawn_lock();
     let reserved = [3, 4, 5, 6, 7, 8, 9, 10];
     let mut cmd = std::process::Command::new("/usr/bin/true");
-    let prepared = super::install(&mut cmd, &reserved).expect("install");
+    let prepared = install_on(&mut cmd, &reserved).expect("install");
     assert!(
         prepared.fd > 10,
         "the marker landed on fd {}, which a user mapping would dup2 over",
@@ -338,16 +343,19 @@ fn a_child_with_a_colliding_fd_mapping_still_holds_the_marker() {
         .arg("echo $$; read _ignored")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped());
-    let prepared = super::install(&mut cmd, &[natural]).expect("install");
+    // Both steps in one hook, as a spawn adds them.
+    let mut steps = crate::child::spawn::in_child::InChild::default();
+    let prepared = super::install(&mut steps, &[natural]).expect("install");
     let handle = prepared.handle;
     fd_map::install(
-        &mut cmd,
+        &mut steps,
         vec![FdMapping {
             parent_fd: filler.into(),
             child_fd: natural,
         }],
     )
     .expect("unique child fd");
+    steps.register(&mut cmd);
 
     #[allow(
         clippy::disallowed_methods,
@@ -380,7 +388,7 @@ fn install_hands_the_marker_to_the_child_and_keeps_the_supervisor_out() {
         .arg("echo $$; read _ignored")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped());
-    let prepared = super::install(&mut cmd, &[]).expect("install");
+    let prepared = install_on(&mut cmd, &[]).expect("install");
     let handle = prepared.handle;
     #[allow(
         clippy::disallowed_methods,
@@ -410,7 +418,7 @@ fn install_hands_the_marker_to_the_child_and_keeps_the_supervisor_out() {
 }
 
 /// A holder whose descriptor survives exec is NOT an imminent membership loss, so no warning
-/// is due. The check runs against a spawned child (whose copy `fd_map::install_preserved` has
+/// is due. The check runs against a spawned child (whose copy `fd_map::preserve` has
 /// already un-CLOEXEC'd) rather than by mutating this process's own fd table, which a concurrent
 /// fork+exec on another thread would leak. The assertion keys on the per-pid message
 /// (`fd marker {handle:#x}: holder pid {kid} will lose the marker…`), not on the handle alone:
@@ -429,7 +437,7 @@ fn a_child_holding_a_non_cloexec_marker_produces_no_exec_warning() {
         .arg("echo $$; read _ignored")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped());
-    let prepared = super::install(&mut cmd, &[]).expect("install");
+    let prepared = install_on(&mut cmd, &[]).expect("install");
     let handle = prepared.handle;
     #[allow(
         clippy::disallowed_methods,
@@ -447,7 +455,7 @@ fn a_child_holding_a_non_cloexec_marker_produces_no_exec_warning() {
     let theirs = found.iter().find(|h| h.pid == kid).expect("the child holds the marker");
     assert!(
         !theirs.clexec,
-        "fd_map::install_preserved clears FD_CLOEXEC in the child, so the marker survives its next exec"
+        "fd_map::preserve clears FD_CLOEXEC in the child, so the marker survives its next exec"
     );
     assert!(
         !crate::log_capture::contains_since(
@@ -473,7 +481,7 @@ fn a_child_holding_a_non_cloexec_marker_produces_no_exec_warning() {
 /// available to a unit test (`/bin/sh` has no `fcntl` builtin; a compiled testbin mode is
 /// unavailable here — Global Constraints) can do that post-exec. `std::io::pipe()` sets
 /// `FD_CLOEXEC` on both ends by default (the reason `install()` needs `F_DUPFD_CLOEXEC` +
-/// `fd_map::install_preserved` to make the write end survive an exec at all), so a bare pipe's write end,
+/// `fd_map::preserve` to make the write end survive an exec at all), so a bare pipe's write end,
 /// right here in this process, IS already the exact state under test — no fd-table mutation
 /// needed, so this does not touch the "never clear FD_CLOEXEC on this process's own
 /// descriptors" rule (that rule is about CLEARING an existing flag; this relies on the
@@ -518,7 +526,7 @@ fn a_child_that_closes_the_marker_leaves_the_holder_set() {
     let mut cmd = high_fd_shell();
     cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped());
-    let prepared = super::install(&mut cmd, &[]).expect("install");
+    let prepared = install_on(&mut cmd, &[]).expect("install");
     let (handle, marker_fd) = (prepared.handle, prepared.fd);
     cmd.arg("-c").arg(format!(
         "echo $$; read _go; exec {marker_fd}>&-; echo closed; read _ignored"
@@ -597,7 +605,7 @@ fn each_install_failure_arm_falls_back_and_says_which_step_failed() {
         set_fault(Some(fault));
         let mark = crate::log_capture::mark();
         assert!(
-            super::install(&mut cmd, &[]).is_none(),
+            install_on(&mut cmd, &[]).is_none(),
             "a failed {fault:?} step must yield no marker"
         );
         assert!(
@@ -668,7 +676,7 @@ fn hard_kill_reaches_a_setsid_double_forked_orphan_the_ppid_walk_cannot() {
             Ok(())
         });
     }
-    let prepared = super::install(&mut cmd, &[]).expect("install");
+    let prepared = install_on(&mut cmd, &[]).expect("install");
     #[allow(
         clippy::disallowed_methods,
         reason = "the test holds spawn_lock for its whole body via `_serialize`"
@@ -726,7 +734,7 @@ fn hard_kill_never_reaches_a_pid_that_closed_the_marker_before_the_sweep() {
     let mut cmd = high_fd_shell();
     cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped());
-    let prepared = super::install(&mut cmd, &[]).expect("install");
+    let prepared = install_on(&mut cmd, &[]).expect("install");
     let (handle, marker_fd) = (prepared.handle, prepared.fd);
     cmd.arg("-c").arg(format!(
         r#"echo $$; exec {marker_fd}>&-; echo closed; while read x; do echo "$x"; done"#
@@ -866,7 +874,7 @@ fn sweep_pass_refires_the_group_signal_on_a_later_pass_that_confirms_a_new_live_
     crate::log_capture::install();
 
     let mut p_cmd = member_command(0); // pgid == P's own pid.
-    let scratch = super::install(&mut p_cmd, &[]).expect("install scratch marker on P");
+    let scratch = install_on(&mut p_cmd, &[]).expect("install scratch marker on P");
     // P is deliberately left unreaped for the rest of the test (see the doc above): that keeps
     // `pgid` allocated across the gap.
     #[allow(
@@ -899,7 +907,7 @@ fn sweep_pass_refires_the_group_signal_on_a_later_pass_that_confirms_a_new_live_
     // sweep_pass call in between — see the self-exclusion note above), born directly into
     // `pgid`. Q is born into `pgid` too, holding no marker.
     let mut t_cmd = member_command(pgid);
-    let prepared = super::install(&mut t_cmd, &[]).expect("install marker on T");
+    let prepared = install_on(&mut t_cmd, &[]).expect("install marker on T");
     #[allow(
         clippy::disallowed_methods,
         reason = "the test holds spawn_lock for its whole body via `_serialize`"
@@ -999,7 +1007,7 @@ fn sweep_pass_refires_the_group_signal_on_a_later_pass_that_confirms_a_new_live_
 fn kill_holder_leaves_a_denied_pid_unsignalled_and_reports_incomplete() {
     let _serialize = test_spawn_lock();
     let mut cmd = std::process::Command::new("/usr/bin/true");
-    let prepared = super::install(&mut cmd, &[]).expect("install");
+    let prepared = install_on(&mut cmd, &[]).expect("install");
     let marker = super::Marker::new(prepared, inert_root(), None);
 
     let id = match crate::identity::ProcessId::of(1) {
@@ -1030,7 +1038,7 @@ fn kill_holder_leaves_a_denied_pid_unsignalled_and_reports_incomplete() {
 fn hard_kill_reports_err_on_a_genuinely_blind_pass() {
     let _serialize = test_spawn_lock();
     let mut cmd = std::process::Command::new("/usr/bin/true");
-    let prepared = super::install(&mut cmd, &[]).expect("install");
+    let prepared = install_on(&mut cmd, &[]).expect("install");
     // The write end closes with the command: the root's pass below makes progress, so a second,
     // seeing pass follows, and it must not find this process holding its own marker.
     drop(cmd);
@@ -1081,7 +1089,7 @@ fn teardown_mechanism_failure_includes_listing_failure_unassessable() {
 /// A marker nothing was spawned under, its write end closed with the command.
 fn marker_without_holders(root: crate::identity::ProcessId, pgid: Option<i32>) -> super::Marker {
     let mut cmd = std::process::Command::new("true");
-    let prepared = super::install(&mut cmd, &[]).expect("install a scratch marker");
+    let prepared = install_on(&mut cmd, &[]).expect("install a scratch marker");
     drop(cmd);
     super::Marker::new(prepared, root, pgid)
 }
