@@ -1,5 +1,5 @@
 use super::{ProcSource, Waited};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::test_groups::{tracer_group, Group};
 
 /// `child` as a backend, as the spawn builds it: Linux holds a pidfd the test opens itself (a raw
@@ -886,4 +886,37 @@ async fn exited_within_of_a_child_never_shown_ours_is_false() {
     );
     drop(proc);
     reap_behind_the_owner(pid);
+}
+
+/// The handle's `kill` ends a child stopped under this thread's `PTRACE_SEIZE`: a `SIGKILL` wakes a
+/// ptrace stop. The test then resumes the tracee as its tracer (`ESRCH`: the kill already woke it)
+/// and only then ends its stdin, so a kill that was lost leaves a resumed `cat` that reads EOF and
+/// exits 0, and the assertion on the status fails; nothing waits on the lost kill. The async twin
+/// of `child/shared_tests/tracer.rs`'s `kill_ends_a_child_stopped_for_its_tracer`.
+///
+/// Mutant: the pidfd send in `ProcSource::signal` sends nothing (`signal::via_pidfd`).
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn kill_ends_a_child_stopped_for_its_tracer(#[fixture(tracer_group)] _group: &Group) {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    crate::tokio::test_runtime::assert_current_thread();
+    let mut cmd = crate::tokio::Command::new();
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+    cmd.stdout(crate::Stdio::null()).expect("set stdout");
+    let mut child = cmd.spawn().expect("spawn");
+    let stdin = child.stdin().expect("piped stdin");
+    let pid = child.id().pid() as libc::pid_t;
+    crate::test_support::own_tracer::seize_and_stop(pid);
+
+    child.kill().expect("kill");
+    crate::test_support::own_tracer::resume_unless_dying(pid);
+    drop(stdin);
+    let status = child.wait().await.expect("wait");
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGKILL),
+        "the handle's kill did not end the stopped tracee: {status:?}"
+    );
 }

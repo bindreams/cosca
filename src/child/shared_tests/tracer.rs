@@ -11,7 +11,11 @@ use super::fixtures::Blocker;
 #[cfg(target_os = "linux")]
 use crate::child::shared::State;
 #[cfg(target_os = "linux")]
+use crate::test_child::reaped_elsewhere::kill_own_child;
+#[cfg(target_os = "linux")]
 use crate::test_groups::{tracer_group, Group};
+#[cfg(target_os = "linux")]
+use crate::test_support::own_tracer;
 
 /// `try_wait` on a child stopped under this process's `PTRACE_SEIZE` returns `None`, leaves the
 /// state `N`, and leaves the stop for the tracer: the test's own `waitpid` then still gets it.
@@ -24,45 +28,9 @@ use crate::test_groups::{tracer_group, Group};
 fn try_wait_leaves_a_ptrace_stop_for_the_tracer(#[fixture(tracer_group)] _group: &Group) {
     use std::os::unix::process::ExitStatusExt as _;
 
-    let mut b = Blocker::spawn();
+    let b = Blocker::spawn();
     let pid = b.shared.id() as libc::pid_t;
-    // `ptrace` is variadic, and glibc reads `addr` and `data` as pointers.
-    let null = std::ptr::null_mut::<libc::c_void>;
-    // SAFETY: plain ptrace requests on this test's own child, from the thread that waits below.
-    unsafe {
-        assert_eq!(
-            libc::ptrace(libc::PTRACE_SEIZE, pid, null(), null()),
-            0,
-            "{}",
-            std::io::Error::last_os_error()
-        );
-        assert_eq!(
-            libc::ptrace(libc::PTRACE_INTERRUPT, pid, null(), null()),
-            0,
-            "{}",
-            std::io::Error::last_os_error()
-        );
-    }
-    // The stop, or an exit that would mean no stop is coming, seen without consuming it.
-    // SAFETY: an all-zero `siginfo_t` is valid and `waitid` writes only into it.
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    let r = unsafe {
-        libc::waitid(
-            libc::P_PID,
-            pid as libc::id_t,
-            &mut info,
-            libc::WSTOPPED | libc::WEXITED | libc::WNOWAIT | libc::__WALL,
-        )
-    };
-    assert_eq!(r, 0, "waitid: {}", std::io::Error::last_os_error());
-    assert_eq!(
-        info.si_code,
-        libc::CLD_TRAPPED,
-        "the tracee did not stop (si_code {}, si_status {})",
-        info.si_code,
-        // SAFETY: a `waitid` record's `si_status` is valid for these `si_code`s.
-        unsafe { info.si_status() }
-    );
+    own_tracer::seize_and_stop(pid);
 
     assert_eq!(b.shared.try_wait().expect("try_wait"), None, "a stop is not an exit");
     assert!(matches!(b.shared.lock().state, State::N));
@@ -78,21 +46,37 @@ fn try_wait_leaves_a_ptrace_stop_for_the_tracer(#[fixture(tracer_group)] _group:
         "try_wait consumed the tracer's stop: {status:#x}"
     );
 
-    // SIGKILL through the handle (the pidfd), never PTRACE_KILL (which before v5.19 only resumes a
-    // PTRACE_EVENT_STOP).
-    b.shared.kill().expect("kill");
-    // Resume with stdin closed: a tracee no kill reached ends by itself, so the assertion below fails
-    // rather than the wait blocking. A delivered SIGKILL is already pending and wins; the tracee may
-    // be gone (`ESRCH`).
-    b.end_child();
-    // SAFETY: as above.
-    let resumed = unsafe { libc::ptrace(libc::PTRACE_CONT, pid, null(), null()) };
-    let resume_error = std::io::Error::last_os_error();
-    assert!(
-        resumed == 0 || resume_error.raw_os_error() == Some(libc::ESRCH),
-        "PTRACE_CONT: {resume_error}"
-    );
+    // SIGKILL sent by the test itself, never PTRACE_KILL (which before v5.19 only resumes a
+    // PTRACE_EVENT_STOP). Not the handle's `kill`: a send that went nowhere would leave this
+    // tracee stopped for the `wait` below to block on, and ending it by closing its stdin does
+    // not wake a ptrace stop.
+    kill_own_child(b.shared.id());
     assert_eq!(b.shared.wait().expect("wait").signal(), Some(libc::SIGKILL));
+}
+
+/// The handle's `kill` ends a child stopped under this process's `PTRACE_SEIZE`: a `SIGKILL` wakes
+/// a ptrace stop. The test then resumes the tracee as its tracer (`ESRCH`: the kill already woke
+/// it) and only then ends its stdin, so a kill that was lost leaves a resumed `cat` that reads EOF
+/// and exits 0, and the assertion on the status fails; nothing waits on the lost kill.
+///
+/// Mutant: the handle's pidfd send sends nothing (`signal::via_pidfd`).
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn kill_ends_a_child_stopped_for_its_tracer(#[fixture(tracer_group)] _group: &Group) {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let mut b = Blocker::spawn();
+    let pid = b.shared.id() as libc::pid_t;
+    own_tracer::seize_and_stop(pid);
+
+    b.shared.kill().expect("kill");
+    own_tracer::resume_unless_dying(pid);
+    b.end_child();
+    assert_eq!(
+        b.shared.wait().expect("wait").signal(),
+        Some(libc::SIGKILL),
+        "the handle's kill did not end the stopped tracee"
+    );
 }
 
 // macOS: a child this process traces itself =====

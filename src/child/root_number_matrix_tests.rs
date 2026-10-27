@@ -20,6 +20,7 @@
 use std::time::Duration;
 
 use crate::identity::{ProcessId, Resolved};
+use crate::test_child::reaped_elsewhere::kill_own_child;
 #[cfg(target_os = "linux")]
 use crate::test_groups::{cgroup, Group};
 
@@ -593,7 +594,7 @@ fn run_sync(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
     let mut stderr = child.stderr().expect("stderr pipe");
     let root = child.id().pid();
     if reap.reaped() {
-        child.kill().expect("kill the root");
+        kill_own_child(root);
         if reap.own() {
             child.wait().expect("this handle reaps the root");
         } else {
@@ -606,6 +607,8 @@ fn run_sync(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
     let mut forced = reap.force(child.id());
 
     let _released = release_when_the_drain_blocks(mechanism, &stdin);
+    #[cfg(target_os = "linux")]
+    let _released_at_the_root_wait = release_when_the_root_wait_blocks(&stdin);
     let recorders = Recorders::start();
     // The cell checks what was sent, not what the call answered.
     _ = match op {
@@ -629,7 +632,8 @@ fn run_sync(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
 
     // The tree is gone before the drop, which runs under the recorders: it sends no killpg.
     if !reap.reaped() {
-        child.kill().expect("kill the root");
+        // Released, not killed: the op may have reaped the root, so its number may name another process.
+        drop(stdin.take());
         child.wait().expect("reap the root");
     }
     drop(stdin.take());
@@ -670,6 +674,26 @@ fn release_when_the_drain_blocks<T: 'static>(
 #[cfg(not(target_os = "linux"))]
 fn release_when_the_drain_blocks<T>(_: Mechanism, _: &std::rc::Rc<std::cell::Cell<Option<T>>>) -> Option<()> {
     None
+}
+
+/// A sync drop, a failed spawn's cleanup and a graceful shutdown wait for a root they have killed:
+/// when that wait is about to block, stdin is closed, so a root kill that sent nothing lets the root
+/// end by itself instead of the wait hanging. The tree went first, so a forked `cat` the sweep
+/// missed ends alone here, as it does when the cell closes stdin after the call.
+#[cfg(target_os = "linux")]
+fn release_when_the_root_wait_blocks<T: 'static>(
+    stdin: &std::rc::Rc<std::cell::Cell<Option<T>>>,
+) -> Box<dyn std::any::Any> {
+    use crate::graceful_hooks::{at, HookPoint};
+    let release = |stdin: &std::rc::Rc<std::cell::Cell<Option<T>>>| {
+        let stdin = std::rc::Rc::clone(stdin);
+        move || drop(stdin.take())
+    };
+    Box::new((
+        at(HookPoint::AfterDropKill, release(stdin)),
+        at(HookPoint::BeforeReap, release(stdin)),
+        crate::child::spawn::fault::set_between_kill_and_wait(release(stdin)),
+    ))
 }
 
 /// What a sync teardown sent, then the end of what it left: closing stdin ends a root it left
@@ -716,7 +740,7 @@ async fn run_tokio(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
     let mut stderr = child.stderr().expect("stderr pipe");
     let root = child.id().pid();
     if reap.reaped() {
-        child.kill().expect("kill the root");
+        kill_own_child(root);
         if reap.own() {
             child.wait().await.expect("this handle reaps the root");
         } else {
@@ -734,6 +758,8 @@ async fn run_tokio(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
         .leaf_path_for_test()
         .map(|path| (crate::test_groups::cgroup_leaf::LeafGuard::new(path.clone()), path));
     let _released = release_when_the_drain_blocks(mechanism, &stdin);
+    #[cfg(target_os = "linux")]
+    let _released_at_the_root_wait = release_when_the_root_wait_blocks(&stdin);
     let recorders = Recorders::start();
     // The cell checks what was sent, not what the call answered.
     let teardown = match op {
@@ -782,7 +808,8 @@ async fn run_tokio(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
     }
 
     if !reap.reaped() {
-        child.kill().expect("kill the root");
+        // Released, not killed: the op may have reaped the root, so its number may name another process.
+        drop(stdin.take());
         child.wait().await.expect("reap the root");
     }
     drop(stdin.take());

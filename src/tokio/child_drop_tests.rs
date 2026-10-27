@@ -383,6 +383,34 @@ async fn a_kill_on_drop_drop_kills_the_root() {
     teardown.assert_killed();
 }
 
+/// The drop of a contained tree kills its root and its group's member (the Linux case of
+/// `tests/tokio_io.rs`'s `async_drop_tears_down_a_contained_tree`, which has no seam to release the
+/// root with). The drop waits for the root, so the root's release pipe is dropped between the drop's
+/// kill and its wait: a drop whose kills sent nothing leaves a root that exits `0` on the release
+/// and a member that outlives it, and fails by assertion instead of waiting.
+///
+/// Mutant: the drop's group kill and its root kill both send nothing (`h-pidfd` with `via-pidfd` or
+/// `tokio-route`: the root exits `0` and the member survives). Either alone leaves the other route
+/// to end the tree, so no single send's loss fails this test.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn a_drop_kills_a_contained_root_and_the_members_of_its_group() {
+    crate::tokio::test_runtime::assert_current_thread();
+    let (child, member, release) = super::group_exact_tests::releasable_root_with_a_member_contained(|cmd| {
+        cmd.contain();
+    });
+    // The containment assert guards the death proof below from passing for unrelated reasons.
+    assert_ne!(
+        child.containment(),
+        crate::Containment::None,
+        "contained spawn must engage a mechanism"
+    );
+    let teardown = release_between_kill_and_wait(release);
+    drop(child);
+    teardown.assert_killed();
+    member.assert_killed();
+}
+
 /// The drop's signals run inside a bounded section, which is what turns a wait added to them into a
 /// debug panic: a hook run before the drop's `cgroup.kill` write sees it. So does a disarmed drop's
 /// release, through its `rmdir`. An armed drop's own reap and drain run after the section: its

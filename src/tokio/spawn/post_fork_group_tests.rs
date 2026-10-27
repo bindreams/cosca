@@ -3,7 +3,7 @@
 //! while it has a member, as the identity-failure cleanup does; below 6.9 it kills the root alone and
 //! warns once that members of its group may be left running.
 
-use crate::child::group_exact_tests::{await_started, Member, ROOT_WITH_A_MEMBER};
+use crate::child::group_exact_tests::{await_started, Member, RELEASE_FD, ROOT_WITH_A_MEMBER};
 use crate::child::spawn::fault;
 use crate::child::spawn::identity_group_tests::{Container, ROOT_LEAVING_A_MEMBER};
 use crate::error::ChildFate;
@@ -72,6 +72,12 @@ fn failed_spawn_as(
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let (stdio, started, member) = Member::pipes();
+    // The cleanup kills the root, then waits for it, and the root reads its release pipe: released
+    // between the kill and the wait, a root the kill missed exits `0` and fails the `SIGKILL`
+    // assertion below, instead of keeping the wait.
+    let release = member.release_root_when_a_teardown_waits();
+    let reaps = fault::record_teardown_reaps();
+    let fronted = front.is_some();
     let capture = Capture::start();
     let mark = crate::log_capture::mark();
     let spawned = {
@@ -90,10 +96,16 @@ fn failed_spawn_as(
         cmd.stdin(stdio.stdin).expect("set stdin");
         cmd.stdout(stdio.stdout).expect("set stdout");
         cmd.stderr(stdio.stderr).expect("set stderr");
+        cmd.fd(RELEASE_FD, stdio.release).expect("set the release fd");
         cmd.spawn()
     };
     let steps = capture.group_steps();
     drop(placement);
+    drop(release);
+    // A front is left running: nothing kills or reaps it.
+    if matches!(root, Root::Running) && !fronted {
+        reaps.assert_killed();
+    }
     let pid = fault::take_forgotten_pid().expect("the seam forked a child");
     let (_err, fate) = match spawned {
         Ok(child) => panic!("the spawn must fail after its fork: {:?}", child.id()),

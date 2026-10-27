@@ -1,6 +1,7 @@
 //! Linux 6.9+: each of the sync `Child`'s group sends goes through the root's pidfd, so nothing
 //! names its process group by number. Mutant for each: "the call gives no pidfd".
 
+use crate::child::spawn::fault::{release_at_drop_kill, release_between_kill_and_wait};
 use crate::send_log::{assert_group_signalled_first_through_the_pidfd as assert_through_the_pidfd, Capture};
 use crate::test_groups::{pidfd_group_signal, Group};
 
@@ -16,10 +17,16 @@ fn group_root() -> (crate::Child, std::io::PipeWriter) {
 
 #[skuld::test]
 fn kill_tree_signals_the_group_through_the_root_pidfd(#[fixture(pidfd_group_signal)] _group: &Group) {
-    let (child, _writer) = group_root();
+    use std::os::unix::process::ExitStatusExt as _;
+    let (child, writer) = group_root();
     let capture = Capture::start();
     child.kill_tree().expect("kill_tree");
     assert_through_the_pidfd(&capture.group_steps(), libc::SIGKILL);
+    // Released only after the kill: a kill that sent nothing lets the root end by itself, which
+    // shows in its status instead of leaving the wait to block.
+    drop(writer);
+    let status = child.wait().expect("reap the root");
+    assert_eq!(status.signal(), Some(libc::SIGKILL), "the group's kill ended the root");
 }
 
 /// Its `SIGTERM` kills the group's member. Mutant: "the send through the pidfd carries signal 0".
@@ -50,17 +57,20 @@ fn graceful_shutdown_tree_signals_the_group_through_the_root_pidfd(#[fixture(pid
 
 #[skuld::test]
 fn a_drop_kills_the_group_through_the_root_pidfd(#[fixture(pidfd_group_signal)] _group: &Group) {
-    let (child, _writer) = group_root();
+    let (child, writer) = group_root();
+    let blocker = release_at_drop_kill(writer);
     let capture = Capture::start();
     drop(child);
     assert_through_the_pidfd(&capture.group_steps(), libc::SIGKILL);
+    blocker.assert_killed();
 }
 
 #[skuld::test]
 fn a_failed_elevated_spawns_cleanup_kills_the_group_through_the_root_pidfd(
     #[fixture(pidfd_group_signal)] _group: &Group,
 ) {
-    let (child, _writer) = group_root();
+    let (child, writer) = group_root();
+    let blocker = release_between_kill_and_wait(writer);
     let capture = Capture::start();
     let failed = crate::child::spawn::finish_elevated(
         child,
@@ -68,4 +78,5 @@ fn a_failed_elevated_spawns_cleanup_kills_the_group_through_the_root_pidfd(
     );
     assert!(failed.is_err(), "the password write failed");
     assert_through_the_pidfd(&capture.group_steps(), libc::SIGKILL);
+    blocker.assert_killed();
 }

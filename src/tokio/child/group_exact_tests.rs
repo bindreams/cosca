@@ -3,7 +3,7 @@
 
 use crate::child::group_exact_tests::{await_started, EndedAtTheSigterm, Member};
 use crate::send_log::{assert_group_signalled_first_through_the_pidfd, Capture, GroupStep, Route};
-use crate::test_child::reaped_elsewhere::reap_behind_status;
+use crate::test_child::reaped_elsewhere::{kill_own_child, reap_behind_status};
 use crate::test_groups::{pidfd_group_signal, Group};
 
 /// The sync `ROOT_WITH_A_MEMBER`, its root blocked on fd 4 instead of sleeping: it exits `0` once the
@@ -17,13 +17,22 @@ const RELEASABLE_ROOT_WITH_A_MEMBER: [&str; 3] = [
 /// The sync `root_with_a_member`'s twin, and the writer whose drop ends its root with status `0`;
 /// drop it right after the kill.
 pub(crate) fn releasable_root_with_a_member() -> (crate::tokio::Child, Member, std::io::PipeWriter) {
+    releasable_root_with_a_member_contained(|cmd| {
+        cmd.contain_with(crate::ContainMode::Session);
+    })
+}
+
+/// [`releasable_root_with_a_member`] with the containment `contain` sets.
+pub(crate) fn releasable_root_with_a_member_contained(
+    contain: impl FnOnce(&mut crate::tokio::Command),
+) -> (crate::tokio::Child, Member, std::io::PipeWriter) {
     let (stdio, started, member) = Member::pipes();
     let (gate, release) = crate::test_child::held_writer_stdin();
     let child = {
         let mut cmd = crate::tokio::Command::new();
         cmd.args(RELEASABLE_ROOT_WITH_A_MEMBER);
         cmd.fd(4, gate).expect("set the root's release pipe");
-        cmd.contain_with(crate::ContainMode::Session);
+        contain(&mut cmd);
         cmd.stdin(stdio.stdin).expect("set stdin");
         cmd.stdout(stdio.stdout).expect("set stdout");
         cmd.stderr(stdio.stderr).expect("set stderr");
@@ -44,12 +53,14 @@ pub(crate) fn releasable_group_root() -> (crate::tokio::Child, std::io::PipeWrit
     (cmd.spawn().expect("spawn"), release)
 }
 
-/// Kills `child`'s root alone and reaps it behind the handle's back. `release` is dropped after the
-/// kill: a root nothing killed exits `0`.
+/// Ends `child`'s root alone and reaps it behind the handle's back. The kill is setup, so it is
+/// [`kill_own_child`], which no route under test can turn into a no-op. `release` is dropped once
+/// the root is dead.
 pub(crate) fn kill_and_reap_behind(child: &mut crate::tokio::Child, release: std::io::PipeWriter) {
-    child.kill().expect("kill the root alone");
+    let pid = child.id().pid();
+    kill_own_child(pid);
     drop(release);
-    crate::test_child::assert_killed("the root", reap_behind_status(child.id().pid()));
+    crate::test_child::assert_killed("the root", reap_behind_status(pid));
 }
 
 #[skuld::test]

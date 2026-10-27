@@ -4,7 +4,7 @@
 //! while it has a member, whoever reaped the root; below 6.9 it kills the root alone and warns once that
 //! members of its group may be left running.
 
-use crate::child::group_exact_tests::{await_started, Member, ROOT_WITH_A_MEMBER};
+use crate::child::group_exact_tests::{await_started, Member, RELEASE_FD, ROOT_WITH_A_MEMBER};
 use crate::child::spawn::failure::expect_may_have_started_with;
 use crate::child::spawn::fault;
 use crate::error::ChildFate;
@@ -25,7 +25,7 @@ pub(crate) const ROOT_LEAVING_A_MEMBER: [&str; 3] = [
 pub(crate) enum Failure {
     /// The root exits by itself and another reaper in the process reaps it first: `Gone`.
     ReapedElsewhere,
-    /// The read is refused while the root runs: `Unknown`.
+    /// The read is refused: `Unknown`. The root keeps running, so the cleanup's own kill ends it.
     Unreadable,
 }
 
@@ -38,8 +38,8 @@ impl Failure {
         }
     }
 
-    /// Arms the spawn's `BeforeIdentity` hook: it waits for the member, then brings this failure
-    /// about. Dropping the guard disarms both.
+    /// Arms the spawn's `BeforeIdentity` hook: it waits for the member, then, for a root that is
+    /// reaped elsewhere, reaps it. Dropping the guard disarms both.
     pub(crate) fn arm(self, started: std::io::PipeReader) -> Armed {
         let pid = std::rc::Rc::new(std::cell::Cell::new(0));
         let hook = fault::set_at(fault::SpawnPoint::BeforeIdentity, {
@@ -141,6 +141,11 @@ impl Drop for PlacementForced {
 fn failed_spawn(failure: Failure, container: Container) -> Failed {
     crate::log_capture::install();
     let (stdio, started, member) = Member::pipes();
+    // The cleanup kills a running root, then waits for it, and the root reads its release pipe:
+    // released between the kill and the wait, a root the kill missed exits `0` and fails
+    // `assert_killed` below, instead of keeping the wait.
+    let release = member.release_root_when_a_teardown_waits();
+    let reaps = crate::child::spawn::fault::record_teardown_reaps();
     let armed = failure.arm(started);
     let (mode, placement) = container.arm();
     let capture = Capture::start();
@@ -152,11 +157,15 @@ fn failed_spawn(failure: Failure, container: Container) -> Failed {
         cmd.stdin(stdio.stdin).expect("set stdin");
         cmd.stdout(stdio.stdout).expect("set stdout");
         cmd.stderr(stdio.stderr).expect("set stderr");
+        cmd.fd(RELEASE_FD, stdio.release).expect("set the release fd");
         cmd.spawn()
     };
     let steps = capture.group_steps();
     let pid = armed.pid();
-    drop((armed, placement));
+    drop((armed, placement, release));
+    if matches!(failure, Failure::Unreadable) {
+        reaps.assert_killed();
+    }
     let (_err, fate) = match spawned {
         Ok(child) => panic!("the spawn must fail at its identity read: {:?}", child.id()),
         Err(e) => expect_may_have_started_with(e),

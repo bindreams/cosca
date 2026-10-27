@@ -294,7 +294,11 @@ fn remove_leftover_leaf(leaf: Option<std::path::PathBuf>) {
     let _ = leaf;
 }
 
+// Not on Linux: the armed drop waits for the root, which the test holds until after the drop, so a
+// drop whose kills sent nothing would hang. Its Linux case is
+// `a_drop_kills_a_contained_root_and_the_members_of_its_group` in `src/tokio/child_drop_tests.rs`.
 #[cfg(feature = "tokio")]
+#[cfg(not(target_os = "linux"))]
 #[skuld::test]
 async fn async_drop_tears_down_a_contained_tree() {
     let (child, root, grand) = common::spawn_released_tree_async().await;
@@ -313,29 +317,12 @@ async fn async_drop_tears_down_a_contained_tree() {
         "Windows Strongest => JobObject"
     );
     drop(child);
-    // No post-drop liveness assertion: the drop waits for the root and a cgroup leaf only, and on
-    // Windows for neither. Each member's death is proven by how it ended, and a drop that killed
-    // nothing fails there by assertion, not by a read blocked on the survivor.
+    // No post-drop liveness assertion: on Windows the drop waits for neither the root nor a leaf. Each
+    // member's death is proven by how it ended, and a drop that killed nothing fails there by
+    // assertion, not by a read blocked on the survivor.
     common::assert_members_torn_down(vec![(root, "the root"), (grand, "the grandchild")]);
-    #[cfg(target_os = "linux")]
-    if let Some(leaf) = &leaf {
-        assert_leaf_removed(leaf);
-    }
-    #[cfg(not(target_os = "linux"))]
+    // No cgroup leaf off Linux.
     let _ = leaf;
-}
-
-#[cfg(feature = "tokio")]
-/// The leaf an armed `Drop` killed is gone once the drop returns: the drop waits for the leaf to
-/// drain, then removes it. Whether the drop warned is not asserted: past 1 s it warns, and this
-/// test cannot hold the drain under it.
-#[cfg(target_os = "linux")]
-fn assert_leaf_removed(leaf: &std::path::Path) {
-    assert!(
-        !leaf.exists(),
-        "the drop must drain and remove the leaf: {}",
-        leaf.display()
-    );
 }
 
 // The mechanisms that still kill after the root is reaped: a macOS fd marker's holder sweep and a
@@ -1209,8 +1196,8 @@ async fn death_watch_accept_or_die_async_also_reports_a_gone_descendant_as_dead(
     use std::process::Stdio;
     let (listener, _addr) = common::bind_async_listener();
     let mut cmd = cosca::tokio::Command::new();
-    // Alive and silent until its stdin closes: the target must outlive the assertion below, and
-    // `hold-until-stdin-eof` ends only when the test lets go of `target_stdin`.
+    // Alive and silent until its stdin closes: the target must outlive the accept below, and
+    // `hold-until-stdin-eof` ends only when its stdin closes (the panic's unwind closes it).
     cmd.args([common::testbin().to_string(), "hold-until-stdin-eof".to_string()]);
     cmd.stdin(cosca::Stdio::pipe()).expect("stdin pipe");
     let mut target = cmd.spawn().expect("spawn the live target");
@@ -1228,11 +1215,15 @@ async fn death_watch_accept_or_die_async_also_reports_a_gone_descendant_as_dead(
     gone.wait().expect("reap the descendant: its identity is now Gone");
     drop(gone); // Windows: closing the handle is what makes `OpenProcess` fail for the pid
 
-    let message =
-        panic_message_of(async move { common::accept_or_die_async_also(&listener, &mut target, Some(gone_id)).await })
-            .await;
+    // The panic unwinds the task, and the dropped `target` waits for its reap (its kill is not what
+    // this test checks). `target_stdin` goes into the task, declared after `target`, so the unwind
+    // closes it first: the thread that would otherwise hold it is the one the task runs on.
+    let message = panic_message_of(async move {
+        let (mut target, _release) = (target, target_stdin);
+        common::accept_or_die_async_also(&listener, &mut target, Some(gone_id)).await
+    })
+    .await;
     assert_died_before_connecting(&message, gone_id.pid());
-    drop(target_stdin);
 }
 
 #[cfg(feature = "tokio")]

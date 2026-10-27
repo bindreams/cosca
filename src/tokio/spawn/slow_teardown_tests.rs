@@ -3,6 +3,12 @@
 //! holds the killed child's zombie, so the wait cannot end before the tracer lets go; it lets go
 //! only once the spawning thread sleeps in a blocking `waitid`, which the teardown reaches only
 //! after the warn.
+//!
+//! The tracee ends only by a kill, or by its stdin closing. The teardown's thread holds the stdin
+//! writer and drops it between the teardown's kill and its wait (`release_between_kill_and_wait`),
+//! so a kill that sent nothing leaves a tracee that exits `0` into the tracer's hold, and the
+//! teardown's reap records that status: the test fails on it by assertion, not by waiting on a
+//! tracee nothing ends.
 
 use std::io::BufRead as _;
 
@@ -59,7 +65,10 @@ fn assert_warns_once_before_blocking<R: Send>(
 }
 
 /// Spawns a tracee whose spawn `arm` makes fail, with a foreign tracer seizing it at `point`, and
-/// asserts as [`assert_warns_once_before_blocking`] does of its teardown.
+/// asserts as [`assert_warns_once_before_blocking`] does of its teardown, and that the teardown's
+/// kill ended the tracee.
+///
+/// Mutant (for each test below, besides its own): the teardown's root kill sends nothing.
 fn assert_teardown_warns_once_before_blocking(point: SpawnPoint, arm: fn()) {
     assert_front_or_child_teardown_warns_once_before_blocking(point, arm, false);
 }
@@ -67,11 +76,12 @@ fn assert_teardown_warns_once_before_blocking(point: SpawnPoint, arm: fn()) {
 /// [`assert_teardown_warns_once_before_blocking`] for a tracee that is, when `front`, an elevation
 /// front in a cgroup leaf.
 fn assert_front_or_child_teardown_warns_once_before_blocking(point: SpawnPoint, arm: fn(), front: bool) {
-    let (stdin, _stdin_writer) = crate::test_child::held_writer_stdin();
+    let (stdin, stdin_writer) = crate::test_child::held_writer_stdin();
     let (out_reader, out_writer) = std::io::pipe().expect("pipe");
     let (tracer_tx, tracer_rx) = std::sync::mpsc::channel::<(u32, Tracer)>();
-    let spawned = assert_warns_once_before_blocking(
+    let (spawned, reaps) = assert_warns_once_before_blocking(
         move || {
+            let blocker = fault::release_between_kill_and_wait(stdin_writer);
             let rt = ::tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -102,11 +112,31 @@ fn assert_front_or_child_teardown_warns_once_before_blocking(point: SpawnPoint, 
             let spawned = cmd.spawn().map(drop);
             fault::set_force_attach_failure(false);
             fault::set_force_identity_unknown(false);
-            spawned
+            (spawned, blocker.recorded())
         },
         || tracer_rx.recv().expect("the tracer seized the child"),
     );
     assert!(spawned.is_err(), "the forced failure fails the spawn");
+    // A front is ended by its leaf's kill, not by a send to it, so what it was reaped as says
+    // nothing of the sends under test.
+    if !front {
+        assert_sigkilled(&reaps);
+    }
+}
+
+/// At least one child was reaped by a teardown, and each died of `SIGKILL`: the teardown's kill was
+/// delivered, and the child did not exit `0` on its stdin's release.
+fn assert_sigkilled(reaps: &[(u32, std::process::ExitStatus)]) {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    assert!(!reaps.is_empty(), "the teardown must have reaped the child");
+    for (pid, status) in reaps {
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGKILL),
+            "pid {pid} must be SIGKILLed by its teardown kill, not exit once its stdin was released: {status:?}"
+        );
+    }
 }
 
 /// The teardown after a failed attach (`ProcSource::reap_now`).
@@ -251,18 +281,22 @@ fn a_leaf_drained_past_1s_after_a_failed_attach_warns_once(
 /// The cleanup of a spawn whose elevation write failed (`finish_elevated`) kills the root, then
 /// waits for it.
 ///
-/// Mutant: `wait_and_reap_blocking` waits with no warn.
+/// Mutants: `wait_and_reap_blocking` waits with no warn; the cleanup's root kill sends nothing.
 #[skuld::test]
 async fn a_failed_elevation_writes_cleanup_warns_once_past_1s(#[fixture(tracer_group)] _group: &Group) {
-    let (child, _stdin) = foreign_tracer::spawn_tokio_tracee().await;
+    let (child, stdin) = foreign_tracer::spawn_tokio_tracee().await;
     let pid = child.id().pid();
     let tracer = foreign_tracer::spawn_helper(pid);
-    let cleaned = assert_warns_once_before_blocking(
+    let (cleaned, reaps) = assert_warns_once_before_blocking(
         move || {
-            crate::tokio::spawn::finish_elevated(child, Err(crate::error::Error::Io(std::io::Error::other("w"))))
-                .map(drop)
+            let blocker = fault::release_between_kill_and_wait(stdin);
+            let cleaned =
+                crate::tokio::spawn::finish_elevated(child, Err(crate::error::Error::Io(std::io::Error::other("w"))))
+                    .map(drop);
+            (cleaned, blocker.recorded())
         },
         move || (pid, tracer),
     );
     assert!(cleaned.is_err(), "the failed write fails the spawn");
+    assert_sigkilled(&reaps);
 }
