@@ -8,7 +8,7 @@
 //! runtime is current-thread, so the drop's kill runs on the recording thread.
 
 use crate::containment::treewalk::fault::record_walks;
-use crate::containment::unix::fault::record_kill_group;
+use crate::containment::unix::fault::{record_kill_group, record_term_group};
 #[cfg(target_os = "linux")]
 use crate::test_groups::{cgroup, Group};
 use crate::tokio::child::drop_fault;
@@ -392,6 +392,36 @@ async fn drop_after_a_failed_kill_tree_and_wait_still_warns() {
     recorder.fail_with_unassessable();
     let mut child = session(&["true"]).spawn().expect("spawn");
     child.kill_tree().expect_err("the forced refusal");
+    child.wait().await.expect("reap the root");
+
+    let mark = crate::log_capture::mark();
+    drop(child);
+
+    let records = drop_warns_since(mark);
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].0, log::Level::Warn);
+}
+
+/// A `terminate_tree` is a request, not a kill, so a root reaped after it still leaves the drop
+/// unable to vouch for the group, and it warns (below Linux 6.9 and on macOS; on 6.9+ the pidfd
+/// finds the group empty, see `drop_group_exact_tests`). The `SIGTERM` is recorded, not sent, and
+/// the root exits by itself. Mutants: `terminate_tree` sets the tree-killed flag; `terminate_tree`
+/// sends nothing.
+#[skuld::test]
+async fn drop_after_terminate_tree_and_wait_still_warns() {
+    #[cfg(target_os = "linux")]
+    let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let termed = record_term_group();
+    let mut child = session(&["true"]).spawn().expect("spawn");
+    let pid = child.id().pid();
+    child.terminate_tree().expect("terminate_tree");
+    assert_eq!(
+        termed.termed(),
+        vec![pid as i32],
+        "terminate_tree signals the group once"
+    );
     child.wait().await.expect("reap the root");
 
     let mark = crate::log_capture::mark();

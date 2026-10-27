@@ -249,12 +249,7 @@ fn fixture_load_exact_probe() {
     let not_found = windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
     let code = match c.spawn() {
         Ok(child) if child.wait().expect("wait").success() => LOADED,
-        Err(Error::Io(e))
-            if e.raw_os_error() == Some(not_found.0 as i32)
-                || e.raw_os_error() == Some(windows::core::HRESULT::from_win32(not_found.0).0) =>
-        {
-            FILE_NOT_FOUND
-        }
+        Err(Error::Io(e)) if e.raw_os_error() == Some(not_found.0 as i32) => FILE_NOT_FOUND,
         _ => OTHER_FAILURE,
     };
     std::process::exit(code);
@@ -692,4 +687,56 @@ fn raw_refusals_before_create_process_did_not_start() {
         let err = crate::child::spawn::failure::expect_not_started(cmd.spawn().expect_err(what));
         assert!(variant(&err), "{what}: not the refusal's own error: {err:?}");
     }
+}
+
+/// A failed `SetHandleInformation` reports the plain Win32 code. A null handle is a real
+/// `ERROR_INVALID_HANDLE`.
+///
+/// Mutant: `set_inherit` converts with the `windows` crate's own `io::Error` conversion, which
+/// keeps the HRESULT (`0x80070006`).
+#[skuld::test]
+fn a_failed_set_inherit_is_reported_as_its_win32_code() {
+    let err = set_inherit(HANDLE::default()).expect_err("a null handle cannot be marked inheritable");
+    let Error::Io(err) = err else {
+        panic!("expected Error::Io, got {err:?}");
+    };
+    assert_eq!(
+        err.raw_os_error(),
+        Some(windows::Win32::Foundation::ERROR_INVALID_HANDLE.0 as i32),
+        "{err:?}"
+    );
+}
+
+// Win32 codes of attribute-list failures =====
+
+fn io_code(r: Result<impl std::fmt::Debug, Error>) -> Option<i32> {
+    match r {
+        Err(Error::Io(e)) => e.raw_os_error(),
+        other => panic!("expected Io, got {other:?}"),
+    }
+}
+
+/// A buffer smaller than the sizing call reported fails to initialize with
+/// `ERROR_INSUFFICIENT_BUFFER` (122), not its HRESULT.
+///
+/// Mutant: `initialize_attribute_list` converts with `.into()`, so the code is `0x8007007A`.
+#[skuld::test]
+fn initialize_attribute_list_failure_carries_the_win32_code() {
+    let code = io_code(initialize_attribute_list(&mut []).map(|_| ()));
+    assert_eq!(code, Some(122), "ERROR_INSUFFICIENT_BUFFER expected");
+}
+
+/// An empty handle list is not a valid HANDLE_LIST attribute, so `UpdateProcThreadAttribute`
+/// fails with `ERROR_BAD_LENGTH`; the error carries the plain Win32 code.
+///
+/// Mutant: `add_handle_list_or_delete` converts with `.into()`, so the code is `0x80070018`.
+#[skuld::test]
+fn add_handle_list_failure_carries_the_win32_code() {
+    let mut size = 0usize;
+    // SAFETY: the null-list form is the documented way to query the buffer size.
+    _ = unsafe { InitializeProcThreadAttributeList(None, 1, None, &mut size) };
+    let mut buf = vec![0u8; size];
+    let list = initialize_attribute_list(&mut buf).expect("a right-sized buffer initializes");
+    let code = io_code(add_handle_list_or_delete(list, &[]));
+    assert_eq!(code, Some(24), "ERROR_BAD_LENGTH (24) expected");
 }

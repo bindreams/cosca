@@ -183,6 +183,8 @@ fn a_seccomp_refused_pidfd_open_is_found_before_any_fork() {
 mod test_harness;
 
 fn main() {
+    #[cfg(target_os = "linux")]
+    common::install_log_capture();
     let mut runner = skuld::TestRunner::new();
     runner.libtest_names();
     runner.require_known_labels();

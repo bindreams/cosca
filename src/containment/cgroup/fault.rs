@@ -11,9 +11,11 @@ thread_local! {
     static BEFORE_EXIT_WAIT: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static BEFORE_FRONT_PROBE: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static BEFORE_HANDLE_KILL: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
+    static AFTER_PROCS_READ: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
+    static AFTER_TERMINATE_PIN: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static CHILD_SENDS: std::cell::RefCell<Vec<ChildSend>> = const { std::cell::RefCell::new(Vec::new()) };
     static FORCE_GROUP_KILL_GONE: Cell<bool> = const { Cell::new(false) };
-    static TERMINATED_BY_PID: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+    static MEMBER_TERMS: std::cell::RefCell<Vec<MemberTerm>> = const { std::cell::RefCell::new(Vec::new()) };
     static HOOK_GATE: Cell<Option<std::os::fd::RawFd>> = const { Cell::new(None) };
     static FORCE_CHILD_KILL_DENIED: Cell<bool> = const { Cell::new(false) };
     static FORCE_GROUP_KILL_DENIED: Cell<bool> = const { Cell::new(false) };
@@ -61,6 +63,7 @@ thread_local! {
     static CGROUP_ID_FAILS: Cell<Option<i32>> = const { Cell::new(None) };
     static LIVENESS_READ_FAILS: Cell<Option<i32>> = const { Cell::new(None) };
     static SUBTREE_FAILS: Cell<Option<i32>> = const { Cell::new(None) };
+    static TERMINATE_FAILS: Cell<Option<(TerminateStep, i32, bool)>> = const { Cell::new(None) };
     static RMDIR_HOOK: std::cell::RefCell<Option<RmdirHook>> = std::cell::RefCell::new(None);
     static FORCE_FORK_RUNNING_PIDFD_FAILURE: Cell<bool> = const { Cell::new(false) };
     static FORK_RUNNING_PIDFD_FAILURE_PROBE: std::cell::RefCell<Option<std::os::fd::OwnedFd>> =
@@ -849,13 +852,57 @@ pub(crate) fn take_force_group_kill_gone() -> bool {
     FORCE_GROUP_KILL_GONE.with(|f| f.replace(false))
 }
 
-/// Note a member `CgroupLeaf::terminate` signalled by its bare pid on this thread.
-pub(crate) fn record_terminated_by_pid(pid: u32) {
-    TERMINATED_BY_PID.with(|t| t.borrow_mut().push(pid));
+/// Run `hook` in the NEXT `CgroupLeaf::terminate` on this thread, once it has read `cgroup.procs`
+/// and before it signals any member: the window in which a listed member can leave the leaf.
+pub(crate) fn set_after_procs_read(hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
+    crate::oneshot_hook::arm(&AFTER_PROCS_READ, hook)
 }
-/// The members this thread's `CgroupLeaf::terminate` signalled by bare pid since the last call.
-pub(crate) fn take_terminated_by_pid() -> Vec<u32> {
-    TERMINATED_BY_PID.with(|t| std::mem::take(&mut *t.borrow_mut()))
+pub(crate) fn run_after_procs_read() {
+    crate::oneshot_hook::fire(&AFTER_PROCS_READ);
+}
+
+/// Run `hook` in the NEXT `CgroupLeaf::terminate` on this thread, once it has pinned its first
+/// member by a pidfd and before it places that member: the window in which a pinned member can
+/// exit and be reaped.
+pub(crate) fn set_after_terminate_pin(hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
+    crate::oneshot_hook::arm(&AFTER_TERMINATE_PIN, hook)
+}
+pub(crate) fn run_after_terminate_pin() {
+    crate::oneshot_hook::fire(&AFTER_TERMINATE_PIN);
+}
+
+/// A signal `CgroupLeaf::terminate` sent a member: the pid its pidfd names (`None` once that
+/// process is reaped, or where it cannot be read), the route of the send, and the signal's number.
+pub(crate) type MemberTerm = (Option<u32>, crate::send_log::Via, i32);
+
+/// Notes a signal `signo` sent to the leaf member `pid` by `sys` on this thread, once answered; the
+/// route is the syscall's own, and a pidfd's pid is read from its fdinfo.
+pub(crate) fn record_member_term(sys: crate::containment::unix::Sys<'_>, pid: u32, signo: i32) {
+    use std::os::fd::AsRawFd as _;
+
+    use crate::containment::unix::Sys;
+    use crate::send_log::Via;
+    let entry = match sys {
+        Sys::Pidfd(pidfd, _) => {
+            let pid = std::fs::read_to_string(format!("/proc/thread-self/fdinfo/{}", pidfd.as_raw_fd()))
+                .ok()
+                .and_then(|fdinfo| {
+                    fdinfo
+                        .lines()
+                        .find_map(|line| line.strip_prefix("Pid:"))
+                        .and_then(|pid| pid.trim().parse::<i64>().ok())
+                })
+                .and_then(|pid| u32::try_from(pid).ok().filter(|&pid| pid > 0));
+            (pid, Via::Pidfd, signo)
+        }
+        Sys::Group(_) | Sys::Process(_) => (Some(pid), Via::Pid, signo),
+    };
+    MEMBER_TERMS.with(|t| t.borrow_mut().push(entry));
+}
+
+/// The `SIGTERM`s this thread's `CgroupLeaf::terminate` sent members since the last call.
+pub(crate) fn take_member_terms() -> Vec<MemberTerm> {
+    MEMBER_TERMS.with(|t| std::mem::take(&mut *t.borrow_mut()))
 }
 
 /// Pumps started and ended, per leaf name, process-wide.
@@ -1072,6 +1119,52 @@ impl Drop for FailSubtree {
     fn drop(&mut self) {
         SUBTREE_FAILS.with(|f| f.set(None));
     }
+}
+
+/// A step of `CgroupLeaf::terminate`'s `SIGTERM` to one member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminateStep {
+    /// The `pidfd_open` that pins the member.
+    Pin,
+    /// The read of whether the pinned member has exited.
+    Exited,
+    /// The `pidfd_send_signal`.
+    Send,
+}
+
+/// While the guard lives, `step` of each member's `SIGTERM` in `CgroupLeaf::terminate` on this
+/// thread fails with `errno`, and the call it stands for is not made.
+pub(crate) fn fail_terminate(step: TerminateStep, errno: i32) -> FailTerminate {
+    TERMINATE_FAILS.with(|f| f.set(Some((step, errno, false))));
+    FailTerminate(())
+}
+
+/// [`fail_terminate`] for the first member's `step` only: the members after it are not refused.
+pub(crate) fn fail_terminate_once(step: TerminateStep, errno: i32) -> FailTerminate {
+    TERMINATE_FAILS.with(|f| f.set(Some((step, errno, true))));
+    FailTerminate(())
+}
+
+#[must_use = "terminate's steps run again as soon as the guard is dropped"]
+pub(crate) struct FailTerminate(());
+
+impl Drop for FailTerminate {
+    fn drop(&mut self) {
+        TERMINATE_FAILS.with(|f| f.set(None));
+    }
+}
+
+/// The errno `step` fails with, if a [`fail_terminate`] guard is live for it. A
+/// [`fail_terminate_once`] refusal is spent by the call that gets it.
+pub(crate) fn terminate_fails(step: TerminateStep) -> Option<i32> {
+    let (failing, errno, once) = TERMINATE_FAILS.with(Cell::get)?;
+    if failing != step {
+        return None;
+    }
+    if once {
+        TERMINATE_FAILS.with(|f| f.set(None));
+    }
+    Some(errno)
 }
 
 pub(crate) fn subtree_fails() -> Option<i32> {
