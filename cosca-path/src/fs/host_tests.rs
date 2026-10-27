@@ -63,33 +63,35 @@ fn host_filesystem_treats_what_the_os_reports_as_absence(#[fixture(non_root)] _n
     let under = |name: &str| dir.path().join(name);
     let fails = |what: &str, path: &std::path::Path| std::fs::metadata(path).expect_err(what);
 
-    // What the OS says for each case; for absence, with the raw code it says it with.
+    // What the OS says for each case; for absence, with the raw code it says it with, where one code
+    // is the same on every build. A file with a trailing separator is 267 on build 26100 and 123 on
+    // build 20348, so only that the code is absence is asserted.
     #[cfg(windows)]
     let (absent, present) = {
         let with_separator = std::path::PathBuf::from(format!("{}\\", file.display()));
         (
             [
-                ("a missing file", fails("a missing file", &under("missing")), 2),
+                ("a missing file", fails("a missing file", &under("missing")), Some(2)),
                 (
                     "a missing directory",
                     fails("a missing directory", &under("missing").join("x")),
-                    3,
+                    Some(3),
                 ),
                 (
                     "a file with a trailing separator",
                     fails("a file with a separator", &with_separator),
-                    267,
+                    None,
                 ),
                 // `|` is not a Windows name character.
                 (
                     "a name no filesystem accepts",
                     fails("a bad name", &under("bad|name")),
-                    123,
+                    Some(123),
                 ),
                 (
                     "a UNC path with no share",
                     fails("a UNC path with no share", std::path::Path::new(r"\\?\UNC\x")),
-                    161,
+                    Some(161),
                 ),
             ],
             // `localhost` resolves without network traffic; its missing share is BAD_NET_NAME, or
@@ -117,12 +119,12 @@ fn host_filesystem_treats_what_the_os_reports_as_absence(#[fixture(non_root)] _n
                 (
                     "a missing file",
                     fails("a missing file", &under("missing")),
-                    libc::ENOENT,
+                    Some(libc::ENOENT),
                 ),
                 (
                     "a file used as a directory",
                     fails("a file as a directory", &file.join("x")),
-                    libc::ENOTDIR,
+                    Some(libc::ENOTDIR),
                 ),
             ],
             [
@@ -136,7 +138,9 @@ fn host_filesystem_treats_what_the_os_reports_as_absence(#[fixture(non_root)] _n
         )
     };
     for (what, e, code) in absent {
-        assert_eq!(e.raw_os_error(), Some(code), "{what}: {e:?}");
+        if code.is_some() {
+            assert_eq!(e.raw_os_error(), code, "{what}: {e:?}");
+        }
         assert!(is_absence(&e), "{what}: {e:?}");
     }
     for (what, e) in present {
@@ -234,6 +238,53 @@ fn host_filesystem_probes_what_the_path_names() {
     assert_eq!(fs.is_file(&relative).unwrap_err().kind(), io::ErrorKind::InvalidInput);
 }
 
+/// A relative Windows path whose name ends in a dot or a space has no string that names what it
+/// spells (`to_std_path` refuses it), so every question is `InvalidInput`, not absence.
+///
+/// Mutant: `HostFilesystem` answering `Ok(false)` for such a path.
+#[cfg(windows)]
+#[skuld::test]
+fn host_filesystem_refuses_a_relative_name_with_a_trailing_dot_or_space() {
+    let dir = tempfile::tempdir().unwrap();
+    let fs = HostFilesystem;
+    let here = host(dir.path());
+    let invalid = io::ErrorKind::InvalidInput;
+    for q in [
+        "tool.", "tool ", "C:tool.", r"\tool.", r"a\b.", "tool..", r"a.\b", r"C:a.\b",
+    ] {
+        let q = PathBuf::parse(q).unwrap();
+        assert_eq!(fs.is_file(&q).unwrap_err().kind(), invalid, "{q:?}");
+        assert_eq!(fs.is_dir(&q).unwrap_err().kind(), invalid, "{q:?}");
+        assert_eq!(fs.canonical(&q).unwrap_err().kind(), invalid, "{q:?}");
+        assert_eq!(fs.same_file(&q, &here).unwrap_err().kind(), invalid, "{q:?}");
+        assert_eq!(fs.same_file(&here, &q).unwrap_err().kind(), invalid, "{q:?}");
+    }
+}
+
+/// A name holding NUL is `InvalidInput` from every question, never absence: no filesystem stores
+/// it, and the error has no OS code for `is_absence` to read.
+///
+/// Mutants: `HostFilesystem` answering `Ok(false)` for it; `canonical` or `same_file` mapping it to
+/// `NotFound`.
+#[skuld::test]
+fn host_filesystem_refuses_a_name_holding_nul() {
+    let dir = tempfile::tempdir().unwrap();
+    let fs = HostFilesystem;
+    let here = host(dir.path());
+    let invalid = io::ErrorKind::InvalidInput;
+    #[cfg(windows)]
+    let bad = [PathBuf::parse("C:\\a\0b").unwrap(), PathBuf::parse("a\0").unwrap()];
+    #[cfg(unix)]
+    let bad = ["/a\0b", "\0"].map(crate::posix::PathBuf::from);
+    for q in bad {
+        assert_eq!(fs.is_file(&q).unwrap_err().kind(), invalid, "{q:?}");
+        assert_eq!(fs.is_dir(&q).unwrap_err().kind(), invalid, "{q:?}");
+        assert_eq!(fs.canonical(&q).unwrap_err().kind(), invalid, "{q:?}");
+        assert_eq!(fs.same_file(&q, &here).unwrap_err().kind(), invalid, "{q:?}");
+        assert_eq!(fs.same_file(&here, &q).unwrap_err().kind(), invalid, "{q:?}");
+    }
+}
+
 /// An error that is not absence never has the kind `NotFound`, whatever `std` calls it: an
 /// unreachable server or share (`ERROR_BAD_NETPATH`, `ERROR_BAD_NET_NAME`) may only be unreachable
 /// for now. The OS error stays inside (`get_ref`). Checked for every OS code, so a sibling that
@@ -283,7 +334,7 @@ fn host_filesystem_does_not_take_an_unreachable_share_for_absence() {
 }
 
 /// The empty path is `InvalidInput` on Windows (no string names it) and absent on Unix, from every
-/// question: the fakes answer the same.
+/// question.
 ///
 /// Mutant: a host that answers one question differently from the others.
 #[skuld::test]

@@ -1,4 +1,5 @@
-//! The filesystem questions a resolver asks, and the two implementations that answer them.
+//! The filesystem questions a resolver asks, and the two implementations that answer them: this
+//! machine's, and a table a test states.
 
 use std::io;
 
@@ -7,12 +8,10 @@ use crate::PurePath;
 mod fake;
 #[cfg(any(unix, windows))]
 mod host;
-mod spelling;
 
-pub use fake::{FakeFilesystem, FakePath};
+pub use fake::FakeFilesystem;
 #[cfg(any(unix, windows))]
 pub use host::HostFilesystem;
-pub(crate) use spelling::sealed;
 
 /// What is at a path.
 ///
@@ -24,8 +23,6 @@ pub(crate) use spelling::sealed;
 /// [`NotFound`](io::ErrorKind::NotFound) from them. Every other `Err` is a failure to say, as for
 /// the other two. They need a handle on the object, so they can fail where `is_file` says
 /// `Ok(true)`.
-///
-/// The empty path is `InvalidInput` on Windows and absent on Unix, from every question.
 pub trait Filesystem {
     type Path: PurePath + ?Sized;
 
@@ -94,3 +91,7 @@ impl<'a, F: Filesystem + ?Sized> BoundPath<'a, F> {
         self.fs.same_file(self.path, other.path)
     }
 }
+
+#[cfg(test)]
+#[path = "fs_tests.rs"]
+mod fs_tests;

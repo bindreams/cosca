@@ -34,13 +34,11 @@ use ref_cast::{ref_cast_custom, RefCastCustom};
 use crate::{Component, PurePath};
 
 mod convert;
-mod lookup;
 mod os_str;
 pub use convert::{ConversionError, ConversionReason};
 pub use os_str::{OsStr, OsString};
 
 const VERBATIM: &[u8] = br"\\?\";
-const DEVICE: &[u8] = br"\\.\";
 
 // Anchors =============================================================================================================
 
@@ -629,24 +627,6 @@ impl PurePath for Path {
     }
 }
 
-/// What follows `UNC\` in the verbatim rest `rest`, if it starts so.
-fn unc_rest(rest: &[u8]) -> Option<&[u8]> {
-    (rest.len() >= 4 && rest[..3].eq_ignore_ascii_case(b"UNC") && rest[3] == b'\\').then(|| &rest[4..])
-}
-
-/// The plain spelling of the verbatim path `\\?\` and `rest`: a drive path as it is, a UNC path
-/// without its prefix, any other as a device path. See [`PathBuf::parse`].
-fn plain_spelling(rest: &[u8]) -> Vec<u8> {
-    let is_drive = rest.first() != Some(&b'\\') && drive_len(rest).is_some_and(|len| rest.get(len) == Some(&b'\\'));
-    if is_drive {
-        rest.to_vec()
-    } else if let Some(unc) = unc_rest(rest) {
-        [br"\\", unc].concat()
-    } else {
-        [br"\\.\", rest].concat()
-    }
-}
-
 /// Writes the separator after a leading `\\?` as `/`. Appending to the device anchor `\\?` would
 /// otherwise spell the verbatim prefix, which reads differently; `\\?/` is the device path `\\?`
 /// already was.
@@ -750,13 +730,19 @@ impl PathBuf {
         if rest.contains(&b'/') {
             return Err(ParseError::SlashInVerbatim);
         }
-        if let Some(unc) = unc_rest(rest) {
+        let is_drive = rest.first() != Some(&b'\\') && drive_len(rest).is_some_and(|len| rest.get(len) == Some(&b'\\'));
+        let unc = (rest.len() >= 4 && rest[..3].eq_ignore_ascii_case(b"UNC") && rest[3] == b'\\').then(|| &rest[4..]);
+        let plain = if is_drive {
+            PathBuf::from_wtf8(rest.to_vec())
+        } else if let Some(unc) = unc {
             let server = &unc[..next_separator(unc, 0)];
             if matches!(server, b"." | b"?") {
                 return Err(ParseError::UnspellableUncServer);
             }
-        }
-        let plain = PathBuf::from_wtf8(plain_spelling(rest));
+            PathBuf::from_wtf8([br"\\", unc].concat())
+        } else {
+            PathBuf::from_wtf8([br"\\.\", rest].concat())
+        };
         if plain.has_navigated_name() {
             return Err(ParseError::DotOrEmptyNameInVerbatim);
         }
@@ -887,7 +873,7 @@ impl fmt::Debug for PathBuf {
     }
 }
 
-/// A [`Filesystem`](crate::fs::Filesystem) of windows paths that a test describes. See
+/// A [`Filesystem`](crate::fs::Filesystem) of windows paths that a test states. See
 /// [`FakeFilesystem`](crate::fs::FakeFilesystem).
 pub type FakeFilesystem = crate::fs::FakeFilesystem<Path>;
 

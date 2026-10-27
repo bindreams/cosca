@@ -15,8 +15,6 @@ use ref_cast::{ref_cast_custom, RefCastCustom};
 
 use crate::{Component, PurePath};
 
-mod lookup;
-
 // Strings =============================================================================================================
 
 /// A borrowed POSIX string: any bytes. `Debug` is faithful: invalid UTF-8 shows as `\xNN`.
@@ -586,7 +584,7 @@ impl fmt::Display for ConversionError {
 
 impl std::error::Error for ConversionError {}
 
-/// A [`Filesystem`](crate::fs::Filesystem) of posix paths that a test describes. See
+/// A [`Filesystem`](crate::fs::Filesystem) of posix paths that a test states. See
 /// [`FakeFilesystem`](crate::fs::FakeFilesystem).
 pub type FakeFilesystem = crate::fs::FakeFilesystem<Path>;
 
