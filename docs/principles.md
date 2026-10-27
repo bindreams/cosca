@@ -149,8 +149,8 @@ reissued. So a tree call, a drop and a failed spawn's cleanup (a spawn that fail
 read, an elevated spawn that cannot finish, an abandoned spawn whose cgroup leaf did not take its
 root, a tokio spawn that fails after its fork) still kill the group of a reaped root while it has a
 member, whoever reaped the root, and send nothing once it has none; that signal-0 send is also the
-check before each send by the group's number. Not yet: an async handle whose `wait`, `try_wait` or
-`kill` saw the root reaped elsewhere no longer holds its pidfd, so it treats the group as below 6.9.
+check before each send by the group's number. A tokio handle keeps its pidfd when it forgets tokio's
+`Child`, so that holds after it too.
 cosca detects the flag by acting, and an older kernel's `EINVAL` is handled per path. A tree call, a
 drop and the cleanup of an elevated spawn that cannot finish fall back to the group's number,
 checked against the root's state, and send nothing once that check fails. The cleanup of an
@@ -200,9 +200,9 @@ debug-asserts on it.
 After a foreign reap:
 
 - On Linux, cgroup plus pidfd stays exact; only the exit status is lost.
-- On Linux 6.9+ a process-group kill, by a tree call, a drop or a failed spawn's cleanup (not yet
-  an async handle's whose `wait`, `try_wait` or `kill` saw the reap), stays exact through the root's
-  pidfd (principle 4). Below 6.9 and on macOS, process-group kills, and an fd marker's kills by the
+- On Linux 6.9+ a process-group kill, by a tree call, a drop or a failed spawn's cleanup, stays
+  exact through the root's pidfd (principle 4). Below 6.9 and on macOS, process-group kills, and an
+  fd marker's kills by the
   root's number (its group and its ppid walk), are unsafe. The marker's holders are named by the
   pipe they hold and are still killed exactly.
 - macOS has no pidfd, and cosca has no exact kill there.

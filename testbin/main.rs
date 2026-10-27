@@ -864,14 +864,10 @@ fn main() {
             }
             sock.write_all(tag.as_bytes()).unwrap();
             sock.flush().unwrap();
-            let mut buf = [0u8; 1];
-            // Retry EINTR: the SIGTERM interrupts this read on platforms without SA_RESTART.
-            loop {
-                match sock.read(&mut buf) {
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    _ => break,
-                }
-            }
+            // `hold` retries EINTR, which the SIGTERM causes on platforms without SA_RESTART. With
+            // `ECHO_HELD_ENV` set it echoes each byte, after the ack of a SIGTERM sent before the
+            // byte was written, so a test can tell "no SIGTERM came" from "not yet" without a timer.
+            hold(&mut sock);
         }
         #[cfg(unix)]
         "spawn-grandchild-stubborn-child" => {
@@ -958,23 +954,6 @@ fn main() {
             sock.flush().unwrap();
             let mut buf = [0u8; 1];
             let _ = sock.read(&mut buf); // blocks until the socket closes (our death)
-        }
-        #[cfg(windows)]
-        "spawn-grandchild-ack-break" => {
-            // A 2-level tree for the lone graceful op's radius: the ROOT ignores CTRL_BREAK (so
-            // only the escalation can end it), while its grandchild ACKS the break and stays
-            // alive. The grandchild is an ordinary std spawn with creation flags 0, so it joins
-            // the root's console group AND console — exactly the descendant the cooperative half
-            // reaches and the forced half does not.
-            install_ignore_break();
-            let addr = args[2].clone();
-            let exe = std::env::current_exe().unwrap();
-            let _gc = spawn_reported_grandchild(&exe, &["control-block-ack-break", &addr, "G"]);
-            let mut sock = crate::ack::connect_control(&addr).unwrap();
-            sock.write_all(b"R").unwrap();
-            sock.flush().unwrap();
-            let mut buf = [0u8; 1];
-            let _ = sock.read(&mut buf);
         }
         #[cfg(windows)]
         "report-nested-terminate" => {

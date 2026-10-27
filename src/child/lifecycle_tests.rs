@@ -45,7 +45,7 @@ fn long_lived_contained_child() -> (crate::Child, std::io::PipeWriter) {
 }
 
 /// Kill, release stdin, reap. Releasing after the kill makes a no-op `kill_tree` fail the status
-/// assertion instead of hanging the wait.
+/// assertion.
 fn kill_then_release(child: crate::Child, stdin: std::io::PipeWriter) {
     child.kill_tree().expect("kill_tree");
     drop(stdin);
@@ -255,4 +255,38 @@ fn raw_child_consecutive_frozen_waits_never_return_early() {
         "an explicit executable() must route to the raw backend"
     );
     assert_consecutive_frozen_waits_never_early(&child);
+}
+
+/// Dropping a `Child` kills it and reaps it, by the kill: its stdin is released only once the drop's
+/// kill returned.
+#[skuld::test]
+fn drop_kills_and_reaps_the_child() {
+    let mut cmd = crate::Command::new();
+    #[cfg(unix)]
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    // `more.com` exits 0 on EOF, unlike the `findstr` blocker, whose exit 1 is the kill's code.
+    #[cfg(windows)]
+    {
+        cmd.args([crate::test_child::windows_more()]);
+        cmd.stdout(crate::Stdio::null()).expect("set stdout null");
+    }
+    let (stdin, writer) = crate::test_child::held_writer_stdin();
+    cmd.stdin(stdin).expect("set stdin");
+    let teardown = crate::child::spawn::fault::release_at_drop_kill(writer);
+    let child = cmd.spawn().expect("spawn");
+    let id = child.id();
+    assert_eq!(
+        id.is_alive(),
+        crate::identity::Liveness::Alive,
+        "child runs while its stdin stays open"
+    );
+
+    drop(child); // kill_on_drop default true => SIGKILL/TerminateProcess + reap
+
+    teardown.assert_killed();
+    assert_eq!(
+        id.is_alive(),
+        crate::identity::Liveness::Dead,
+        "child must be dead (and reaped) after drop"
+    );
 }

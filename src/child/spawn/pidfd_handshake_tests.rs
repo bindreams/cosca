@@ -1567,7 +1567,9 @@ fn conclude_answers_whether_the_program_could_have_started() {
     let answered = |result: Result<super::Held<NoChild>, SpawnFailure>| result.err().expect("the spawn fails");
 
     // Told to go, then the spawn failed: tokio's may have failed after `exec`, std's did not.
-    let (_cat, pidfd) = cat_with_pidfd();
+    let (mut cat, pidfd) = cat_with_pidfd();
+    // Released after the kill: a kill that sent nothing exits 0.
+    let teardown = crate::child::spawn::fault::release_between_kill_and_wait(cat.stdin.take());
     let (_, fate) = answered(super::conclude(
         Err::<NoChild, _>(io("tokio")),
         Outcome::Opened(pidfd),
@@ -1576,6 +1578,8 @@ fn conclude_answers_whether_the_program_could_have_started() {
     .expect_may_have_started_with();
     // A live child tokio dropped is killed and reaped through the pidfd.
     assert_eq!(fate, crate::error::ChildFate::Reaped);
+    teardown.assert_killed();
+    drop(teardown);
     let (_cat, pidfd) = cat_with_pidfd();
     super::conclude(
         Err::<NoChild<false>, _>(io("std")),

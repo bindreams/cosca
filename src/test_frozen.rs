@@ -18,7 +18,8 @@ use windows::Win32::System::Memory::{VirtualAllocEx, MEM_COMMIT, MEM_RESERVE, PA
 use windows::Win32::System::Threading::{
     CreateRemoteThread, GetThreadId, GetThreadTimes, OpenProcess, OpenThread, ResumeThread, SuspendThread,
     TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED, INFINITE, LPTHREAD_START_ROUTINE,
-    PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, THREAD_QUERY_LIMITED_INFORMATION,
+    THREAD_SUSPEND_RESUME,
 };
 
 use crate::containment::windows::JobHandle;
@@ -124,6 +125,28 @@ impl InitialThread {
 impl Drop for InitialThread {
     fn drop(&mut self) {
         unsafe { _ = CloseHandle(self.0) };
+    }
+}
+
+impl InitialThread {
+    /// `ResumeThread` with its outcome ignored. A frozen child's drop releases the child's holders
+    /// with this, so a drop whose kill sent nothing lets the child run to its natural exit (code 0)
+    /// and fail the test's exit-code assertion rather than hang on a child that never runs. After a
+    /// kill the thread is gone and the call fails, which is the expected case.
+    pub(crate) fn resume_whatever_the_outcome(&self) {
+        // SAFETY: `self.0` is a live thread handle with resume rights; a terminated thread only
+        // makes the call fail.
+        unsafe { _ = ResumeThread(self.0) };
+    }
+}
+
+/// Resumes the frozen child's initial thread when dropped: held with the holders a drop's kill
+/// releases (see [`InitialThread::resume_whatever_the_outcome`]).
+pub(crate) struct ResumeOnDrop(pub(crate) InitialThread);
+
+impl Drop for ResumeOnDrop {
+    fn drop(&mut self) {
+        self.0.resume_whatever_the_outcome();
     }
 }
 
@@ -306,9 +329,25 @@ pub(crate) struct Remote(HANDLE);
 impl Remote {
     pub(crate) fn open(pid: u32) -> Remote {
         // SAFETY: plain Win32 call; the handle is closed on drop.
-        let handle =
-            unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, false, pid) }.expect("open the child");
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_TERMINATE | PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                false,
+                pid,
+            )
+        }
+        .expect("open the child");
         Remote(handle)
+    }
+
+    /// The exit code of the process, once it is gone (see [`wait_for_death`](Self::wait_for_death)).
+    #[cfg(feature = "tokio")]
+    pub(crate) fn exit_code(&self) -> u32 {
+        let mut code = 0u32;
+        // SAFETY: `self.0` is live with `PROCESS_QUERY_LIMITED_INFORMATION`; `code` is a valid out-parameter.
+        unsafe { windows::Win32::System::Threading::GetExitCodeProcess(self.0, &mut code) }
+            .expect("read the exit code");
+        code
     }
 
     /// Block until the process is gone; the process object signals, nothing here is a timer.

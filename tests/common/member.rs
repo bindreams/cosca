@@ -17,7 +17,8 @@ pub use echo_held::RELEASED_EXIT_ENV;
 /// missing kill left alive echoes the byte, so a `kill_tree` that sends nothing fails by assertion
 /// instead of hanging a read for an EOF.
 ///
-/// Unix only: it relies on a delivered `SIGKILL` being pending before the kill returns. Windows uses
+/// Unix only: it relies on a delivered `SIGKILL` (or a `SIGTERM` the member does not handle) being
+/// pending before the call returns, so the member dies before it can echo. Windows uses
 /// [`assert_members_killed`].
 pub fn assert_dead(sock: &mut TcpStream, who: &str) {
     use std::io::ErrorKind::{BrokenPipe, ConnectionAborted, ConnectionReset};
@@ -121,6 +122,21 @@ pub fn assert_members_not_released(members: Vec<(Member, &str)>) {
             !CRASH_EXIT_CODES.contains(&code),
             "{who} must be killed, not crash when released (exit code {code:#x})"
         );
+    }
+}
+
+/// Block until `pid` has exited, then its exit status, consuming nothing: on Unix it stays an
+/// unreaped zombie ([`zombie_exit_status`](super::zombie_exit_status)), on Windows the wait is on a
+/// handle of its own. The caller's handle on the child must pin `pid`.
+pub fn exit_status_once_exited(pid: u32) -> std::process::ExitStatus {
+    #[cfg(unix)]
+    {
+        super::zombie_exit_status(pid)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::ExitStatusExt as _;
+        std::process::ExitStatus::from_raw(windows_exit::ExitHandle::open(pid).wait_for_exit_code())
     }
 }
 

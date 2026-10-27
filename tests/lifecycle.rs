@@ -13,11 +13,10 @@ fn wait_timeout_returns_none_while_running() {
     // `control-block` blocks on sock.read forever; the test never writes, so the
     // child cannot exit. wait_timeout bounds a never-completing event -> Ok(None),
     // independent of the duration.
-    let (child, _sock) = spawn_control("control-block", &["R"], false);
+    let (child, sock) = spawn_control("control-block", &["R"], false);
     let r = child.wait_timeout(Duration::from_millis(200)).expect("wait_timeout");
     assert!(r.is_none(), "still-running child must time out to None, got {r:?}");
-    child.kill().expect("kill cleanup");
-    let _ = child.wait();
+    common::kill_release_reap(&child, sock);
 }
 
 #[skuld::test]
@@ -51,11 +50,10 @@ fn wait_timeout_huge_duration_does_not_panic() {
 fn wait_timeout_zero_returns_none_while_running() {
     // Duration::ZERO is the try_wait path: it must return immediately with None for a
     // still-running (structurally wedged) child, never block or false-positive Some.
-    let (child, _sock) = spawn_control("control-block", &["R"], false);
+    let (child, sock) = spawn_control("control-block", &["R"], false);
     let r = child.wait_timeout(Duration::ZERO).expect("wait_timeout");
     assert!(r.is_none(), "ZERO timeout on a live child must be None, got {r:?}");
-    child.kill().expect("kill cleanup");
-    let _ = child.wait();
+    common::kill_release_reap(&child, sock);
 }
 
 #[skuld::test]
@@ -63,11 +61,10 @@ fn wait_deadline_past_returns_none_while_running() {
     // A deadline at/before now is the try_wait path. Aliveness is STRUCTURAL: the child
     // is blocked on an un-written control socket and cannot exit, so None is determined
     // by structure, not by the deadline value.
-    let (child, _sock) = spawn_control("control-block", &["R"], false);
+    let (child, sock) = spawn_control("control-block", &["R"], false);
     let r = child.wait_deadline(Instant::now()).expect("wait_deadline");
     assert!(r.is_none(), "live child past a past deadline must be None, got {r:?}");
-    child.kill().expect("kill cleanup");
-    let _ = child.wait();
+    common::kill_release_reap(&child, sock);
 }
 
 #[skuld::test]
@@ -88,16 +85,18 @@ fn wait_deadline_past_returns_some_after_exit() {
 fn concurrent_wait_timeout_and_kill_is_safe() {
     // `SharedChild` makes this race-free (the pidfd, handle or unreaped zombie pins the child).
     // The kill guarantees death, so wait_timeout observes Some — deterministic, no
-    // is_alive/sleep. The 30s is only a backstop against a hang.
-    let (child, _sock) = spawn_control("control-block", &["R"], false);
+    // is_alive/sleep. The 30s is only a backstop against a hang. The release after the kill is
+    // what lets a `kill` that sent nothing fail the signal assertion, not block the waiter.
+    let (child, sock) = spawn_control("control-block", &["R"], false);
     std::thread::scope(|s| {
         let waiter = s.spawn(|| child.wait_timeout(Duration::from_secs(30)));
         child.kill().expect("kill");
+        drop(sock);
         let result = waiter.join().expect("join waiter");
-        assert!(
-            matches!(result, Ok(Some(_))),
-            "concurrent wait_timeout must observe the kill, got {result:?}"
-        );
+        let Ok(Some(status)) = result else {
+            panic!("concurrent wait_timeout must observe the kill, got {result:?}");
+        };
+        common::assert_killed("the killed child", status);
     });
 }
 

@@ -106,15 +106,17 @@ mod linux {
         crate::log_capture::install();
         let recorder = record_kill_group();
         let (child, writer) = session_blocker();
+        // Released once the drop's root kill returned, so a drop that sent none ends it with 0.
+        let blocker = crate::child::spawn::fault::release_at_drop_kill(writer);
         let pid = child.id().pid();
         let sends = Capture::start();
         let mark = crate::log_capture::mark();
         let _failed = force_peek_once(Err(std::io::Error::other("forced peek failure")));
 
         drop(child);
-        drop(writer);
 
         assert_peeks_exhausted();
+        blocker.assert_killed();
         assert!(
             crate::log_capture::contains_since(mark, "RootState::Unknown"),
             "the drop must name the unknown root state"
@@ -147,7 +149,9 @@ mod linux {
     fn the_unknown_warn_names_its_caller() {
         crate::log_capture::install();
         let _recorder = record_kill_group();
-        let (child, _writer) = session_blocker();
+        let (child, writer) = session_blocker();
+        // Released once the cleanup's root kill returned, before its reap.
+        let blocker = crate::child::spawn::fault::release_between_kill_and_wait(writer);
         let mark = crate::log_capture::mark();
         // The number is unreadable too, so the read says so in a `debug` line of its own.
         let _number = crate::child::fault::force_next_root_read(crate::identity::Resolved::Unknown);
@@ -157,6 +161,7 @@ mod linux {
             .expect_err("the spawn fails");
 
         assert_peeks_exhausted();
+        blocker.assert_killed();
         // The cleanup's error and the Unknown warn report it; the handle it drops afterwards is
         // disarmed and says nothing more.
         let warns = warns_since(mark);
@@ -209,7 +214,8 @@ mod linux {
     fn an_unknown_root_with_an_unreadable_number_does_not_claim_not_reaped() {
         crate::log_capture::install();
         let _recorder = record_kill_group();
-        let (child, _writer) = session_blocker();
+        let (child, writer) = session_blocker();
+        let blocker = crate::child::spawn::fault::release_at_drop_kill(writer);
         let mark = crate::log_capture::mark();
         let _number = crate::child::fault::force_next_root_read(crate::identity::Resolved::Unknown);
         let _failed = force_peek_once(Err(std::io::Error::other("forced peek failure")));
@@ -217,6 +223,7 @@ mod linux {
         drop(child);
 
         assert_peeks_exhausted();
+        blocker.assert_killed();
         assert!(
             !crate::log_capture::contains_since(mark, "treating the root as not reaped"),
             "{:?}",
