@@ -29,10 +29,27 @@ fn quick_contained_child() -> crate::Child {
     cmd.spawn().expect("spawn")
 }
 
-/// A contained [`crate::test_child::BLOCKER_ARGV`] child and its stdin writer, which the caller
-/// must keep for exactly as long as the child must stay running.
+/// A contained blocker and its stdin writer, which the caller must keep for exactly as long as the
+/// child must stay running. On Windows it is `more.com`, not the `findstr` of
+/// [`crate::test_child::BLOCKER_ARGV`]: released stdin must not look like a kill to
+/// [`crate::test_child::assert_killed`].
 fn long_lived_contained_child() -> (crate::Child, std::io::PipeWriter) {
-    crate::test_child::held_contained_blocker(crate::Stdio::null())
+    #[cfg(unix)]
+    {
+        crate::test_child::held_contained_blocker(crate::Stdio::null())
+    }
+    #[cfg(windows)]
+    {
+        crate::test_child::windows_blocker()
+    }
+}
+
+/// Kill, release stdin, reap. Releasing after the kill makes a no-op `kill_tree` fail the status
+/// assertion instead of hanging the wait.
+fn kill_then_release(child: crate::Child, stdin: std::io::PipeWriter) {
+    child.kill_tree().expect("kill_tree");
+    drop(stdin);
+    crate::test_child::assert_killed("the blocker", child.wait().expect("reap the blocker"));
 }
 
 /// Drained case: on a drain-observable mechanism, an unbounded `wait_tree()` against a tree
@@ -63,7 +80,7 @@ fn wait_tree_reports_the_drained_verdict_when_the_tree_drains() {
 /// non-drainable mechanism the same call must still fail `Unsupported`.
 #[skuld::test]
 fn wait_tree_timeout_reports_members_remain_before_the_deadline() {
-    let (child, _stdin) = long_lived_contained_child();
+    let (child, stdin) = long_lived_contained_child();
     let drainable = child.containment().can_observe_drain();
     let result = child.wait_tree_timeout(Duration::from_millis(200));
     if drainable {
@@ -75,8 +92,7 @@ fn wait_tree_timeout_reports_members_remain_before_the_deadline() {
         let err = result.expect_err("a non-drainable mechanism must refuse wait_tree_timeout");
         assert!(matches!(err, crate::error::Error::Unsupported { .. }), "got {err:?}");
     }
-    _ = child.kill_tree();
-    _ = child.wait();
+    kill_then_release(child, stdin);
 }
 
 /// `Duration::ZERO` against a still-alive tree: a one-shot, non-blocking probe (see
@@ -85,7 +101,7 @@ fn wait_tree_timeout_reports_members_remain_before_the_deadline() {
 /// implementation checks `remaining == Duration::ZERO` before its first blocking syscall).
 #[skuld::test]
 fn wait_tree_timeout_zero_reports_members_remain_on_a_live_tree() {
-    let (child, _stdin) = long_lived_contained_child();
+    let (child, stdin) = long_lived_contained_child();
     let drainable = child.containment().can_observe_drain();
     let result = child.wait_tree_timeout(Duration::ZERO);
     if drainable {
@@ -97,8 +113,7 @@ fn wait_tree_timeout_zero_reports_members_remain_on_a_live_tree() {
         let err = result.expect_err("a non-drainable mechanism must refuse wait_tree_timeout");
         assert!(matches!(err, crate::error::Error::Unsupported { .. }), "got {err:?}");
     }
-    _ = child.kill_tree();
-    _ = child.wait();
+    kill_then_release(child, stdin);
 }
 
 /// `Duration::ZERO` against an ALREADY-drained tree: the one-shot probe must still observe and

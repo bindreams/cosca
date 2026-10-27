@@ -245,7 +245,33 @@ fn run_control_echo_pid(addr: &str, tag: &str) -> ! {
     let mut b = [0u8; 1];
     loop {
         match sock.read(&mut b) {
-            Ok(0) => std::process::exit(0), // the test dropped the socket
+            Ok(0) => std::process::exit(released_exit_code()), // the test dropped the socket
+            Ok(_) => sock.write_all(&b).unwrap(),
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => panic!("control socket read failed: {e}"),
+        }
+    }
+}
+
+#[path = "echo_held.rs"]
+mod echo_held;
+use echo_held::{ECHO_HELD_ENV, RELEASED_EXIT_ENV};
+
+/// The exit code of a member the test released: `0`, or [`RELEASED_EXIT_ENV`] when set.
+fn released_exit_code() -> i32 {
+    std::env::var(RELEASED_EXIT_ENV).map_or(0, |v| v.parse().expect("an integer exit code"))
+}
+
+/// Block on `sock` until the test closes it, or writes a byte. With [`ECHO_HELD_ENV`] set the member
+/// echoes every byte and leaves only when the test closes the socket, so a test that releases the
+/// tree can tell a member that was killed (no echo) from one that is merely alive.
+fn hold(sock: &mut std::net::TcpStream) {
+    let echo = std::env::var_os(ECHO_HELD_ENV).is_some();
+    let mut b = [0u8; 1];
+    loop {
+        match sock.read(&mut b) {
+            Ok(0) => break,
+            Ok(_) if !echo => break,
             Ok(_) => sock.write_all(&b).unwrap(),
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => panic!("control socket read failed: {e}"),
@@ -508,8 +534,7 @@ fn main() {
             let mut sock = crate::ack::connect_control(addr).unwrap();
             sock.write_all(tag.as_bytes()).unwrap();
             sock.flush().unwrap();
-            let mut buf = [0u8; 1];
-            let _ = sock.read(&mut buf); // blocks until the socket closes (our death) / test writes
+            hold(&mut sock);
         }
         #[cfg(target_os = "linux")]
         "report-tid-block-stdin" => {
@@ -631,8 +656,7 @@ fn main() {
             let mut sock = crate::ack::connect_control(&addr).unwrap();
             sock.write_all(b"R").unwrap();
             sock.flush().unwrap();
-            let mut buf = [0u8; 1];
-            let _ = sock.read(&mut buf);
+            hold(&mut sock);
         }
         "spawn-grandchild-dies" => {
             // spawn-grandchild whose grandchild dies at once (an unknown mode exits immediately)
@@ -759,8 +783,7 @@ fn main() {
             let mut sock = crate::ack::connect_control(&addr).unwrap();
             sock.write_all(b"R").unwrap();
             sock.flush().unwrap();
-            let mut buf = [0u8; 1];
-            let _ = sock.read(&mut buf);
+            hold(&mut sock);
         }
         // The shape both current macOS mechanisms lose: a grandchild that leaves the session,
         // is reparented to launchd when its parent exits, and execs. The relay does the setsid
@@ -815,8 +838,7 @@ fn main() {
             let mut sock = crate::ack::connect_control(&addr).unwrap();
             sock.write_all(b"R").unwrap();
             sock.flush().unwrap();
-            let mut buf = [0u8; 1];
-            let _ = sock.read(&mut buf);
+            hold(&mut sock);
         }
         #[cfg(unix)]
         "control-block-ack-term" => {
@@ -874,8 +896,7 @@ fn main() {
             let mut sock = crate::ack::connect_control(addr).unwrap();
             sock.write_all(tag.as_bytes()).unwrap();
             sock.flush().unwrap();
-            let mut buf = [0u8; 1];
-            let _ = sock.read(&mut buf);
+            hold(&mut sock);
         }
         #[cfg(windows)]
         "spawn-grandchild-ignore-break" => {
@@ -888,8 +909,7 @@ fn main() {
             let mut sock = crate::ack::connect_control(&addr).unwrap();
             sock.write_all(b"R").unwrap();
             sock.flush().unwrap();
-            let mut buf = [0u8; 1];
-            let _ = sock.read(&mut buf);
+            hold(&mut sock);
         }
         #[cfg(windows)]
         "control-block-ack-break" => {
@@ -1455,6 +1475,7 @@ fn main() {
                 Ok(()) => "Ok".to_string(),
                 Err(e) => describe(&e),
             };
+            let exit_code = |s: cosca::ExitStatus| s.code().map_or_else(|| "none".to_string(), |c| c.to_string());
 
             // (1) terminate_tree — signal-only, so delivery is observable without escalation.
             let (c1, mut ack1) = spawn_acker("R");
@@ -1481,22 +1502,41 @@ fn main() {
             // and fails as an assertion rather than as a suite hang. The post-kill read/reap
             // only runs when the kill itself succeeded — on a failed kill the child is still
             // alive and blocked, so both would block forever and discard the kill error.
+            //
+            // Sockets are released before each post-kill wait: a released acker exits 0, a killed one
+            // 1, and the report carries the code.
             let (terminate_break, kill_tree) = if c1_in_console && terminate == "Ok" {
                 let seen = saw_break(&mut ack1);
                 (seen, classify(c1.kill_tree()))
             } else {
                 let killed = classify(c1.kill_tree());
-                let seen = if killed == "Ok" { saw_break(&mut ack1) } else { "K" };
+                let seen = if killed == "Ok" {
+                    // Half-close: the read below still collects the acker's last word, and a
+                    // live acker (no kill sent) gets EOF and leaves instead of blocking it. A
+                    // failure here would leave that acker blocked and the read hung.
+                    match ack1.shutdown(std::net::Shutdown::Write) {
+                        Err(e) if e.kind() != std::io::ErrorKind::NotConnected => {
+                            panic!("releasing the probe root's socket failed: {e}")
+                        }
+                        _ => {}
+                    }
+                    saw_break(&mut ack1)
+                } else {
+                    "K"
+                };
                 (seen, killed)
             };
-            if kill_tree == "Ok" {
-                c1.wait().expect("reap probe root 1");
-            }
+            let acker1_exit = if kill_tree == "Ok" {
+                drop(ack1);
+                exit_code(c1.wait().expect("reap probe root 1"))
+            } else {
+                "none".to_string()
+            };
 
             // (2) graceful_shutdown_tree — the escalation trio, ZERO grace. Delivery is proved
             // by (1); this leg proves the trio's own classification and that a failure leaves
             // the tree untouched.
-            let (c2, _ack2) = spawn_acker("S");
+            let (c2, ack2) = spawn_acker("S");
             let graceful = match c2.graceful_shutdown_tree(Duration::ZERO) {
                 Ok(_) => "Ok".to_string(),
                 Err(e) => describe(&e),
@@ -1505,14 +1545,17 @@ fn main() {
             // "Skipped" — NOT "Ok": nothing was called on this path, so reporting a success
             // would be a tautology. Whether the tree really went away is carried by the
             // measured `alive_after_graceful`.
-            let graceful_cleanup = if graceful == "Ok" {
-                "Skipped".to_string()
+            let (graceful_cleanup, graceful_cleanup_exit) = if graceful == "Ok" {
+                ("Skipped".to_string(), "none".to_string())
             } else {
                 let killed = classify(c2.kill_tree());
-                if killed == "Ok" {
-                    c2.wait().expect("reap probe root 2"); // a failed sweep leaves it alive
-                }
-                killed
+                let exit = if killed == "Ok" {
+                    drop(ack2); // a failed sweep leaves it alive, so keep the socket then
+                    exit_code(c2.wait().expect("reap probe root 2"))
+                } else {
+                    "none".to_string()
+                };
+                (killed, exit)
             };
 
             let mut line = String::new();
@@ -1520,8 +1563,9 @@ fn main() {
                 line,
                 "console={console} c1_in_console={} containment={containment_tag} \
                  terminate_tree={terminate} alive_after_terminate={alive_after_terminate} \
-                 terminate_break={terminate_break} kill_tree={kill_tree} graceful={graceful} \
-                 alive_after_graceful={alive_after_graceful} graceful_cleanup={graceful_cleanup}",
+                 terminate_break={terminate_break} kill_tree={kill_tree} acker1_exit={acker1_exit} \
+                 graceful={graceful} alive_after_graceful={alive_after_graceful} \
+                 graceful_cleanup={graceful_cleanup} graceful_cleanup_exit={graceful_cleanup_exit}",
                 u8::from(c1_in_console),
             )
             .unwrap();
@@ -1597,8 +1641,7 @@ fn main() {
             let mut sock = crate::ack::connect_control(addr).unwrap();
             sock.write_all(tag.as_bytes()).unwrap();
             sock.flush().unwrap();
-            let mut buf = [0u8; 1];
-            let _ = sock.read(&mut buf);
+            hold(&mut sock);
         }
         "is-elevated-report" => {
             outln!("{}", if cosca::elevation::is_elevated() { "1" } else { "0" });

@@ -118,11 +118,10 @@ async fn async_commandline_only_fd3_routes_through_the_raw_backend_and_works() {
 // Async containment over the raw backend (Plan 12 Task 8) =====
 
 #[cfg(all(windows, feature = "tokio"))]
-/// Async twin of sync `contained_raw_child_is_in_our_job_and_kill_tree_reaps`: a CONTAINED child
+/// Async twin of sync `contained_raw_child_is_in_our_job`: a CONTAINED child
 /// loaded via `executable()` (with fd >= 3) routes through the async raw backend AND lands in OUR
 /// Job Object — `test_job_handle_contains_self()` confirms membership (immutable once assigned).
-/// fd 3 delivers the child's bytes over the async read end, and `kill_tree()` tears the tree down.
-/// EOF (child closing fd 3 on exit) bounds the read — no timer.
+/// fd 3 delivers the child's bytes over the async read end; EOF bounds the read — no timer.
 #[skuld::test]
 async fn async_contained_raw_child_is_in_our_job() {
     let mut c = cosca::tokio::Command::new();
@@ -139,7 +138,36 @@ async fn async_contained_raw_child_is_in_our_job() {
     let mut s = String::new();
     r.read_to_string(&mut s).await.unwrap();
     assert_eq!(s, "x");
+    child.wait().await.expect("reap the child that exited by itself");
+}
+
+#[cfg(all(windows, feature = "tokio"))]
+/// Async twin of sync `contained_raw_child_is_killed_by_kill_tree`.
+///
+/// Mutant: `kill_tree` is a no-op.
+#[skuld::test]
+async fn async_contained_raw_child_is_killed_by_kill_tree() {
+    let mut c = cosca::tokio::Command::new();
+    c.executable(common::stdin_blocker_program())
+        .args(["more"])
+        .stdin(cosca::Stdio::pipe())
+        .unwrap()
+        .stdout(cosca::Stdio::null())
+        .unwrap()
+        .contain();
+    let mut child = c.spawn().expect("contained raw spawn");
+    assert_eq!(child.containment(), cosca::Containment::JobObject);
+    assert!(child.test_job_handle_contains_self(), "child must be inside OUR job");
+    let stdin = child.stdin().expect("piped stdin");
+
     child.kill_tree().expect("kill_tree");
+    drop(stdin);
+
+    assert_eq!(
+        child.wait().await.expect("reap").code(),
+        Some(1),
+        "kill_tree must kill the raw-backend child (exit code 1), not leave it to exit on EOF"
+    );
 }
 
 #[cfg(all(windows, feature = "tokio"))]

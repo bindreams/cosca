@@ -51,7 +51,8 @@ fn waitpid_status(pid: libc::pid_t) -> libc::c_int {
     }
 }
 
-/// The foreign tracer: seize the pid in [`PID_ENV`], report, and act on each go byte from stdin:
+/// The foreign tracer: seize the pid in [`PID_ENV`] (or, without it, the pid on stdin's first line),
+/// report, and act on each go byte from stdin:
 /// `STOP` interrupts the tracee and reports the stop, `LET_EXIT` waits for the tracee's exit stop and
 /// lets it on from it, `REAP` reaps the zombie with `waitpid` and reports, `EXIT` exits without
 /// reaping. A no-op unless it is the re-exec the driver started.
@@ -64,10 +65,18 @@ fn foreign_tracer_helper() {
     if !is_marked_fixture_reexec(MARKER) {
         return;
     }
-    let pid: libc::pid_t = std::env::var(PID_ENV)
-        .expect("the tracee's pid")
-        .parse()
-        .expect("a pid");
+    let pid: libc::pid_t = match std::env::var(PID_ENV) {
+        Ok(pid) => pid,
+        // Started before its tracee existed: see [`spawn_unseized_helper`].
+        Err(_) => {
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line).expect("the tracee's pid");
+            line
+        }
+    }
+    .trim()
+    .parse()
+    .expect("a pid");
     // SAFETY: a ptrace request on a pid; variadic `addr`/`data` are read as pointers: typed nulls.
     let null = std::ptr::null_mut::<libc::c_void>;
     let options = if std::env::var_os(HOLD_EXIT_ENV).is_some() {
@@ -159,20 +168,36 @@ pub(crate) struct Tracer {
 /// Starts the helper on `pid`, which was spawned with [`allow_any_tracer`] or has reported that its
 /// [`allow_any_tracer_now`] returned, and returns once it has seized the tracee.
 pub(crate) fn spawn_helper(pid: u32) -> Tracer {
-    spawn_helper_with(pid, false)
+    let mut tracer = start_helper(Some(pid), false);
+    tracer.expect("seized");
+    tracer
 }
 
 /// [`spawn_helper`] whose tracee stops at its exit (`PTRACE_O_TRACEEXIT`) and stays a live member of
 /// its cgroup, whatever kills it, until the tracer sends [`LET_EXIT`].
 #[cfg(feature = "tokio")]
 pub(crate) fn spawn_helper_holding_exit(pid: u32) -> Tracer {
-    spawn_helper_with(pid, true)
+    let mut tracer = start_helper(Some(pid), true);
+    tracer.expect("seized");
+    tracer
 }
 
-fn spawn_helper_with(pid: u32, hold_exit: bool) -> Tracer {
+/// Starts the helper before its tracee exists, for a test that cannot start one once it does (its
+/// spawning thread holds `spawn_lock` until the tracee dies); [`Tracer::seize`] names the tracee.
+#[cfg_attr(
+    not(feature = "tokio"),
+    allow(dead_code, reason = "only the tokio spawn's tracer test uses it")
+)]
+pub(crate) fn spawn_unseized_helper() -> Tracer {
+    start_helper(None, false)
+}
+
+fn start_helper(pid: Option<u32>, hold_exit: bool) -> Tracer {
     let mut cmd = fixture_command(fixture_path!(foreign_tracer_helper));
+    if let Some(pid) = pid {
+        cmd.env(PID_ENV, pid.to_string());
+    }
     cmd.env(MARKER, std::process::id().to_string())
-        .env(PID_ENV, pid.to_string())
         .env_remove(HOLD_EXIT_ENV)
         .env_remove("RUST_TEST_NOCAPTURE")
         .stdin(std::process::Stdio::piped())
@@ -183,16 +208,25 @@ fn spawn_helper_with(pid: u32, hold_exit: bool) -> Tracer {
     let mut helper = Helper(crate::test_spawn::spawn(&mut cmd).expect("spawn the foreign tracer"));
     let go = helper.0.stdin.take().expect("piped stdin");
     let lines = BufReader::new(helper.0.stdout.take().expect("piped stdout")).lines();
-    let mut tracer = Tracer {
+    Tracer {
         helper,
         go: Some(go),
         lines,
-    };
-    tracer.expect("seized");
-    tracer
+    }
 }
 
 impl Tracer {
+    /// Has a helper from [`spawn_unseized_helper`] seize `pid`, which has reported that its
+    /// [`allow_any_tracer_now`] returned, and returns once it has.
+    #[cfg_attr(
+        not(feature = "tokio"),
+        allow(dead_code, reason = "only the tokio spawn's tracer test uses it")
+    )]
+    pub(crate) fn seize(&mut self, pid: u32) {
+        writeln!(self.go.as_mut().expect("the tracer is still driven"), "{pid}").expect("send the helper the pid");
+        self.expect("seized");
+    }
+
     /// Sends one go byte ([`STOP`], [`REAP`] or [`EXIT`]).
     pub(crate) fn send(&mut self, go_byte: u8) {
         self.go

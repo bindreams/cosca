@@ -56,6 +56,9 @@ mod uid_switch;
 #[cfg(unix)]
 pub use uid_switch::*;
 
+mod member;
+pub use member::*;
+
 mod report;
 pub use report::*;
 
@@ -469,6 +472,16 @@ pub fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 /// when the whole tree is torn down, so callers prove teardown by reading EOF on both, never by
 /// a timer.
 pub fn spawn_tree(mode: &str, contain: bool) -> (cosca::Child, Vec<TcpStream>) {
+    spawn_tree_with(mode, contain, |_| {})
+}
+
+/// [`spawn_tree`] with the command further configured by `configure` (an env var, say) before the
+/// spawn. The returned sockets are `[root, grandchild]`.
+pub fn spawn_tree_with(
+    mode: &str,
+    contain: bool,
+    configure: impl FnOnce(&mut cosca::Command),
+) -> (cosca::Child, Vec<TcpStream>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap().to_string();
     let mut cmd = cosca::Command::new();
@@ -481,6 +494,7 @@ pub fn spawn_tree(mode: &str, contain: bool) -> (cosca::Child, Vec<TcpStream>) {
     }
     let report = TcpListener::bind("127.0.0.1:0").expect("bind the grandchild pid report listener");
     cmd.env(GC_PID_ADDR_ENV, report.local_addr().unwrap().to_string());
+    configure(&mut cmd);
     let mut child = cmd.spawn().expect("spawn tree");
     let grand = report_grandchild(report, &mut child);
     // Demux by tag exactly like spawn_tree_async (accept order is not guaranteed, and a

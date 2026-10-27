@@ -48,7 +48,7 @@ fn signal_refuses_a_child_with_no_mechanism() {
 #[cfg(windows)]
 #[skuld::test]
 fn signal_attempts_a_child_whose_group_may_be_in_another_console() {
-    let (child, _stdin) = crate::test_child::windows_blocker();
+    let (child, stdin) = crate::test_child::windows_blocker();
     let other = super::signal(GracefulMechanism::OtherConsoleGroup, child.id());
     let group = super::signal(GracefulMechanism::ConsoleGroup, child.id());
     assert!(
@@ -60,7 +60,11 @@ fn signal_attempts_a_child_whose_group_may_be_in_another_console() {
         group.is_ok(),
         "the two console mechanisms must take one path: {other:?} vs {group:?}"
     );
+    // Cleanup, not the subject: the two breaks may already have ended the blocker (a delivered break
+    // ends a handler-less child), so the kill's outcome and the exit status prove nothing here.
+    // Releasing stdin keeps the wait from blocking if the blocker is still alive.
     _ = child.kill_tree();
+    drop(stdin);
     _ = child.wait();
 }
 
@@ -73,7 +77,7 @@ fn signal_attempts_a_child_whose_group_may_be_in_another_console() {
 #[cfg(windows)]
 #[skuld::test]
 fn signal_refuses_a_child_cosca_did_not_create() {
-    let (child, _stdin) = crate::test_child::windows_blocker();
+    let (child, stdin) = crate::test_child::windows_blocker();
     let mechanism = crate::containment::Attachment::uac_elevated().graceful;
     let err = super::signal(mechanism, child.id()).expect_err("a child cosca did not create must not be signalled");
     let crate::error::Error::Unsupported { detail, .. } = &err else {
@@ -84,6 +88,8 @@ fn signal_refuses_a_child_cosca_did_not_create() {
         "the refusal must say whose child this is not: {detail}"
     );
     assert!(detail.contains("kill()"), "the refusal must name the remedy: {detail}");
-    _ = child.kill_tree();
-    _ = child.wait();
+    child.kill_tree().expect("kill_tree");
+    // Released after the kill so a no-op kill fails the assertion, not the wait.
+    drop(stdin);
+    crate::test_child::assert_killed("the blocker", child.wait().expect("reap the blocker"));
 }
