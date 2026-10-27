@@ -87,4 +87,9 @@ impl<'a, F: Filesystem + ?Sized> BoundPath<'a, F> {
     pub fn canonical(&self) -> io::Result<<F::Path as PurePath>::Buf> {
         self.fs.canonical(self.path)
     }
+
+    /// [`Filesystem::same_file`] on the bound path and `other`'s path, asked of this path's filesystem.
+    pub fn same_file(&self, other: &BoundPath<'_, F>) -> io::Result<bool> {
+        self.fs.same_file(self.path, other.path)
+    }
 }

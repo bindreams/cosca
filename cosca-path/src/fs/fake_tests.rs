@@ -116,7 +116,8 @@ fn a_stated_error_is_an_error_not_absence() {
 
 /// A bound path asks its filesystem about its own path.
 ///
-/// Mutant: a `BoundPath` that asks about a different path than the one it holds.
+/// Mutants: a `BoundPath` that asks about a different path than the one it holds; a `same_file` that
+/// ignores `other` or answers about `self` twice.
 #[skuld::test]
 fn a_bound_path_asks_its_filesystem() {
     let file = posix::Path::new("/d/f");
@@ -130,6 +131,15 @@ fn a_bound_path_asks_its_filesystem() {
     let bound = BoundPath::new(&fs, posix::Path::new("/d"));
     assert!(bound.is_dir().unwrap());
     assert!(!bound.is_file().unwrap());
+
+    // `same_file` compares the two bound paths, in either order, and needs both to exist.
+    let (file_b, dir_b) = (BoundPath::new(&fs, file), BoundPath::new(&fs, posix::Path::new("/d/")));
+    assert!(file_b.same_file(&file_b).unwrap());
+    assert!(!file_b.same_file(&dir_b).unwrap());
+    assert!(!dir_b.same_file(&file_b).unwrap());
+    let absent = BoundPath::new(&fs, posix::Path::new("/nope"));
+    assert_eq!(kind(file_b.same_file(&absent)), ErrorKind::NotFound);
+    assert_eq!(kind(absent.same_file(&file_b)), ErrorKind::NotFound);
 
     // Through a trait object too: the resolver takes `&dyn Filesystem`.
     let dynamic: &dyn Filesystem<Path = posix::Path> = &fs;
