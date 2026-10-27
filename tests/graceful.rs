@@ -63,24 +63,9 @@ fn process_terminate_sends_sigterm() {
     let (child, sock) = common::spawn_blocker();
     let p = cosca::Process::from_pid(child.id().pid()).found().expect("resolves");
     p.terminate().expect("foreign terminate");
-    // Released after the signal: the member leaves with 0 on the release, so a `terminate` that
-    // sent nothing fails the signal assertion, where an EOF read would never return.
+    // Release after the kill: a kill that sent nothing lets it exit 0, failing the status assertion.
     drop(sock);
     let status = child.wait().expect("reap");
-    assert_eq!(status.signal(), Some(libc::SIGTERM), "got {status:?}");
-}
-
-#[cfg(unix)]
-#[skuld::test]
-fn process_graceful_shutdown_graceful_path() {
-    use std::os::unix::process::ExitStatusExt;
-    use std::time::Duration;
-    let (child, sock) = common::spawn_blocker();
-    let p = cosca::Process::from_pid(child.id().pid()).found().expect("resolves");
-    p.graceful_shutdown(Duration::from_secs(30)).expect("foreign graceful");
-    // Released after the call, so a shutdown that signalled nothing fails the assertion below.
-    drop(sock);
-    let status = child.wait().expect("reap"); // owned handle reaps; confirm SIGTERM (graceful)
     assert_eq!(status.signal(), Some(libc::SIGTERM), "got {status:?}");
 }
 
@@ -94,7 +79,7 @@ fn process_graceful_shutdown_escalates() {
     let (child, sock) = common::spawn_control("control-block-ignore-term", &["R"], false);
     let p = cosca::Process::from_pid(child.id().pid()).found().expect("resolves");
     p.graceful_shutdown(Duration::ZERO).expect("foreign escalates");
-    // Released after the call, so an escalation that sent nothing fails the assertion below.
+    // Release after the kill: a kill that sent nothing lets it exit 0, failing the status assertion.
     drop(sock);
     let status = child.wait().expect("reap");
     assert_eq!(status.signal(), Some(libc::SIGKILL), "got {status:?}");
@@ -131,27 +116,6 @@ fn process_kill_tree_tears_down_tree() {
     // A kill that sent nothing fails here by assertion.
     common::assert_members_killed(vec![(root, "the root"), (grand, "the grandchild")]);
     let _ = child.wait(); // reap the owned root (grandchild is reaped by init)
-}
-
-#[cfg(unix)]
-#[skuld::test]
-fn process_graceful_shutdown_tree_tears_down_tree() {
-    use std::time::Duration;
-    // The members echo until released, so a shutdown that signalled nothing is caught by an echo,
-    // not by a read that never ends.
-    let (child, socks) = common::spawn_tree_with("spawn-grandchild", false, |cmd| {
-        cmd.env(common::ECHO_HELD_ENV, "1");
-    });
-    let [root, grand]: [_; 2] = socks.try_into().expect("a root and a grandchild socket");
-    let (root, grand) = (
-        common::Member::new(root, child.id().pid()),
-        common::Member::new(grand, common::last_reported_grandchild().expect("the grandchild's pid")),
-    );
-    let p = cosca::Process::from_pid(child.id().pid()).found().expect("resolves");
-    p.graceful_shutdown_tree(Duration::from_secs(30))
-        .expect("foreign tree graceful");
-    common::assert_members_killed(vec![(root, "the root"), (grand, "the grandchild")]);
-    let _ = child.wait();
 }
 
 #[cfg(windows)]

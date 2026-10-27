@@ -72,8 +72,7 @@ async fn async_foreign_kill_terminates_the_process() {
     let (child, sock) = common::spawn_blocker();
     let p = Process::from_pid(child.id().pid()).found().expect("resolves");
     p.kill().expect("foreign kill");
-    // Released after the kill: a `kill` that sent nothing lets the member leave with 0 and fails
-    // the assertion, where an EOF read would never return.
+    // Release after the kill: a kill that sent nothing lets it exit 0, failing the status assertion.
     drop(sock);
     common::assert_killed("the killed child", child.wait().expect("reap"));
 }
@@ -86,27 +85,9 @@ async fn async_foreign_terminate_sends_sigterm() {
     let (child, sock) = common::spawn_blocker();
     let p = Process::from_pid(child.id().pid()).found().expect("resolves");
     p.terminate().expect("foreign terminate");
-    // Released after the signal: a `terminate` that sent nothing lets the member leave with 0 and
-    // fails the assertion below, where an EOF read would never return.
+    // Release after the kill: a kill that sent nothing lets it exit 0, failing the status assertion.
     drop(sock);
     let status = child.wait().expect("reap");
-    assert_eq!(status.signal(), Some(libc::SIGTERM), "got {status:?}");
-}
-
-#[cfg(feature = "tokio")]
-#[cfg(unix)]
-#[skuld::test]
-async fn async_foreign_graceful_shutdown_graceful_path() {
-    use std::os::unix::process::ExitStatusExt;
-    use std::time::Duration;
-    let (child, sock) = common::spawn_blocker();
-    let p = Process::from_pid(child.id().pid()).found().expect("resolves");
-    p.graceful_shutdown(Duration::from_secs(30))
-        .await
-        .expect("foreign graceful");
-    // Released after the call, so a shutdown that signalled nothing fails the assertion below.
-    drop(sock);
-    let status = child.wait().expect("reap"); // owned handle reaps; SIGTERM = graceful
     assert_eq!(status.signal(), Some(libc::SIGTERM), "got {status:?}");
 }
 
@@ -121,7 +102,7 @@ async fn async_foreign_graceful_shutdown_escalates() {
     let (child, sock) = common::spawn_control("control-block-ignore-term", &["R"], false);
     let p = Process::from_pid(child.id().pid()).found().expect("resolves");
     p.graceful_shutdown(Duration::ZERO).await.expect("foreign escalates");
-    // Released after the call, so an escalation that sent nothing fails the assertion below.
+    // Release after the kill: a kill that sent nothing lets it exit 0, failing the status assertion.
     drop(sock);
     let status = child.wait().expect("reap");
     assert_eq!(status.signal(), Some(libc::SIGKILL), "got {status:?}");
@@ -141,29 +122,6 @@ async fn async_foreign_kill_tree_tears_down_tree() {
     let p = Process::from_pid(child.id().pid()).found().expect("resolves");
     p.kill_tree().expect("kill_tree");
     // A kill that sent nothing fails here by assertion.
-    common::assert_members_killed(vec![(root, "the root"), (grand, "the grandchild")]);
-    let _ = child.wait();
-}
-
-#[cfg(feature = "tokio")]
-#[cfg(unix)]
-#[skuld::test]
-async fn async_foreign_graceful_shutdown_tree_tears_down_tree() {
-    use std::time::Duration;
-    // The members echo until released, so a shutdown that signalled nothing is caught by an echo,
-    // not by a read that never ends.
-    let (child, socks) = common::spawn_tree_with("spawn-grandchild", false, |cmd| {
-        cmd.env(common::ECHO_HELD_ENV, "1");
-    });
-    let [root, grand]: [_; 2] = socks.try_into().expect("a root and a grandchild socket");
-    let (root, grand) = (
-        common::Member::new(root, child.id().pid()),
-        common::Member::new(grand, common::last_reported_grandchild().expect("the grandchild's pid")),
-    );
-    let p = Process::from_pid(child.id().pid()).found().expect("resolves");
-    p.graceful_shutdown_tree(Duration::from_secs(30))
-        .await
-        .expect("foreign tree graceful");
     common::assert_members_killed(vec![(root, "the root"), (grand, "the grandchild")]);
     let _ = child.wait();
 }

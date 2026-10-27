@@ -192,8 +192,7 @@ fn foreign_kill_terminates_the_process() {
     let (child, sock) = spawn_blocker();
     let p = cosca::Process::from_pid(child.id().pid()).found().expect("resolves");
     p.kill().expect("kill");
-    // Release the member after the kill: it leaves with 0 on the release, so a `kill` that sent
-    // nothing fails the assertion on how it ended, not a read that never sees an EOF.
+    // Release after the kill: a kill that sent nothing lets it exit 0, failing the status assertion.
     drop(sock);
     common::assert_killed("the killed child", child.wait().expect("reap"));
     p.kill().expect("second kill on a dead process must be Ok");
@@ -689,9 +688,8 @@ fn healthy_tree_arms_a_watch_for_each_accept() {
 /// connected peer's socket: the peer is healthy and silent.
 ///
 /// The root (`hold-until-stdin-eof`, stdin held by this test) never connects, so the first accept
-/// resolves through the grandchild. The armed hook then releases the root's stdin once a later
-/// accept's watch is in place, so it exits 0 by itself: the exit is the test's own trigger and
-/// depends on no kill, which a `kill` that sent nothing could turn into a hang.
+/// resolves through the grandchild. The armed hook then kills the root once a later accept's watch
+/// is in place; the root must die of that kill, not exit on its own.
 #[skuld::test]
 fn death_watch_accept_tree_panics_when_the_root_dies_before_connecting_after_another_member_already_did() {
     healthy_tree_arms_a_watch_for_each_accept();
@@ -718,6 +716,7 @@ fn death_watch_accept_tree_panics_when_the_root_dies_before_connecting_after_ano
     )
     .expect("spawn a root that stays alive without ever connecting");
     let root_pid = root.id();
+    let root_id = found_id(root_pid);
     let mut root_stdin = root.stdin.take();
 
     let member_connected = Rc::new(Cell::new(false));
@@ -725,7 +724,9 @@ fn death_watch_accept_tree_panics_when_the_root_dies_before_connecting_after_ano
     let message = common::with_armed_hook(
         move || {
             if in_hook.get() {
-                drop(root_stdin.take()); // EOF: the root exits now, after the watch was armed
+                cosca::Process::from_id(root_id).kill().expect("kill the root");
+                // Release after the kill: a kill that sent nothing lets it exit 0, failing the status assertion.
+                drop(root_stdin.take());
             }
         },
         || {
@@ -743,10 +744,19 @@ fn death_watch_accept_tree_panics_when_the_root_dies_before_connecting_after_ano
     let status = root.wait().expect("reap the root");
     grandchild.kill().expect("kill the grandchild");
     grandchild.wait().expect("reap the grandchild");
-    assert_eq!(
-        status.code(),
-        Some(0),
-        "the root must leave on the hook's release, nothing else ended it: {status:?}"
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt as _;
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGKILL),
+            "the root must die of the hook's SIGKILL, not exit on its own: {status:?}"
+        );
+    }
+    #[cfg(windows)]
+    assert!(
+        !status.success(),
+        "the root must die of the hook's kill, not exit on its own: {status:?}"
     );
     assert_died_before_connecting(&message, root_pid);
 }
@@ -901,9 +911,8 @@ fn assert_no_leftover_holds(mut output: std::io::PipeReader) -> String {
 }
 
 /// The second tree accept must watch the grandchild too: the root connects first, the grandchild
-/// stays silent, and the armed hook releases its stdin once the second accept's watch is in place,
-/// so it exits 0 by itself and no kill stands between the hook and the watch. The hook asserts the
-/// grandchild is in every armed set.
+/// stays silent, and the armed hook kills it once the second accept's watch is in place. The hook
+/// asserts the grandchild is in every armed set.
 #[skuld::test]
 fn death_watch_accept_tree_panics_when_the_grandchild_dies_before_connecting_after_the_root_already_did() {
     use std::cell::Cell;
@@ -940,7 +949,11 @@ fn death_watch_accept_tree_panics_when_the_grandchild_dies_before_connecting_aft
             );
             in_hook.set(in_hook.get() + 1);
             if in_hook.get() == 2 {
-                drop(grandchild_stdin.take()); // EOF: the grandchild exits now, after the watch was armed
+                cosca::Process::from_id(grandchild_id)
+                    .kill()
+                    .expect("kill the grandchild");
+                // Release after the kill: a kill that sent nothing lets it exit 0, failing the status assertion.
+                drop(grandchild_stdin.take());
             }
         },
         || {
@@ -956,12 +969,7 @@ fn death_watch_accept_tree_panics_when_the_grandchild_dies_before_connecting_aft
     );
     root.kill().expect("kill the root");
     root.wait().expect("reap the root");
-    let status = grandchild.wait().expect("reap the grandchild");
-    assert_eq!(
-        status.code(),
-        Some(0),
-        "the grandchild must leave on the hook's release, nothing else ended it: {status:?}"
-    );
+    common::assert_killed("the grandchild", grandchild.wait().expect("reap the grandchild"));
     assert_eq!(
         armings.get(),
         2,
