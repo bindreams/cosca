@@ -10,17 +10,21 @@ fn blocker() -> (crate::tokio::Child, crate::tokio::ChildStdin) {
     crate::test_child::held_contained_blocker_async(crate::Stdio::pipe())
 }
 
+/// What keeps a [`kill_only_blocker`] running while the caller holds it.
+#[cfg(unix)]
+type Held = crate::tokio::ChildStdin;
+#[cfg(windows)]
+type Held = std::net::TcpStream;
+
 /// Async twin of `child::graceful_tests::kill_only_blocker`.
-async fn kill_only_blocker() -> (crate::tokio::Child, crate::tokio::ChildStdin) {
+async fn kill_only_blocker() -> (crate::tokio::Child, Held) {
     #[cfg(unix)]
     {
         crate::test_child::term_ignoring_blocker_async().await
     }
     #[cfg(windows)]
     {
-        crate::test_child::windows_blocker_async(|cmd| {
-            cmd.contain();
-        })
+        crate::test_child::ctrl_break::spawn_ignoring_root_async()
     }
 }
 

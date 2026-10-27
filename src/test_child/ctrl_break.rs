@@ -193,6 +193,42 @@ pub(crate) fn accept_grandchild(listener: &TcpListener, root_sock: &mut TcpStrea
     Grandchild { sock, exit }
 }
 
+/// A contained [`Handler::Ignore`] root after its handshake, and its control socket, which keeps it
+/// running while held (it leaves with 0 once the socket closes). For a test whose root only a kill
+/// ends and which sends a break first: the handshake is the readiness edge, so the break cannot land
+/// before the root could handle it.
+pub(crate) fn spawn_ignoring_root() -> (crate::Child, TcpStream) {
+    let (listener, addr) = crate::test_child::registration_rendezvous();
+    let mut cmd = crate::Command::new();
+    cmd.executable(std::env::current_exe().expect("current_exe"))
+        .args(member_argv());
+    crate::test_reexec::scrub_env(|var| _ = cmd.env_remove(var));
+    for (key, value) in member_env(&addr, Handler::Ignore, None) {
+        cmd.env(key, value);
+    }
+    cmd.contain();
+    let child = cmd.spawn().expect("spawn the root");
+    let sock = accept_root(&listener, child.id());
+    (child, sock)
+}
+
+/// [`spawn_ignoring_root`] for the tokio `Child`.
+#[cfg(feature = "tokio")]
+pub(crate) fn spawn_ignoring_root_async() -> (crate::tokio::Child, TcpStream) {
+    let (listener, addr) = crate::test_child::registration_rendezvous();
+    let mut cmd = crate::tokio::Command::new();
+    cmd.executable(std::env::current_exe().expect("current_exe"))
+        .args(member_argv());
+    crate::test_reexec::scrub_env(|var| _ = cmd.env_remove(var));
+    for (key, value) in member_env(&addr, Handler::Ignore, None) {
+        cmd.env(key, value);
+    }
+    cmd.contain();
+    let child = cmd.spawn().expect("spawn the root");
+    let sock = accept_root(&listener, child.id());
+    (child, sock)
+}
+
 /// Assert that the call under test sent exactly one `CTRL_BREAK`, to the group led by `group`.
 pub(crate) fn assert_break_sent_to(group: u32) {
     assert_eq!(
