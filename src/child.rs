@@ -817,8 +817,10 @@ impl Child {
     /// [`Error::Unassessable`](crate::error::Error::Unassessable) saying that nothing was sent and what
     /// was skipped.
     ///
-    /// **Linux, a root whose handle cannot say whether it was reaped** is sent the `SIGTERM` through
-    /// its pidfd, which names it exactly. Nothing goes out by its number, and the call returns
+    /// **Linux, a root whose handle cannot say whether it was reaped.** On 6.9+ a process group
+    /// that still has a member is signalled as usual through the root's pidfd, and the call is
+    /// `Ok`. Otherwise the root is sent the `SIGTERM` through its pidfd, which names it exactly,
+    /// nothing goes out by its number, and the call returns
     /// [`Error::Unassessable`](crate::error::Error::Unassessable), with one `warn` saying so.
     pub fn terminate_tree(&self) -> Result<(), Error> {
         self.require_contained()?;

@@ -75,7 +75,8 @@ impl OsResources {
     /// The backend goes first, through [`ProcSource::release`]. tokio's `Child` drops: it tries a
     /// reap once and queues a still-running child on tokio's orphan queue, tokio's state and not
     /// cosca's. A child that something else reaped, or that cannot be verified, was
-    /// forgotten before this by [`ProcSource::forget_foreign`], and the backend holds none. The
+    /// forgotten before this by [`ProcSource::forget_foreign`], and the backend holds no tokio
+    /// `Child` (on Linux it still holds the pidfd, which closes with it). The
     /// Windows raw backend closes its handle. The containment resource follows through
     /// [`Attached::release_without_waiting`], bounded on every mechanism.
     pub(crate) fn release_without_waiting(mut self) {
@@ -884,9 +885,8 @@ impl Child {
     /// is an exited zombie, so the backstop is skipped and the sweep's answer stands.
     ///
     /// **A root reaped by something else, after this handle's own reap, and a reap after the
-    /// look.** As for the sync [`Child::kill_tree`](crate::Child::kill_tree). On Linux 6.9+, not yet
-    /// once this handle's `wait`, `try_wait` or `kill` saw the root reaped elsewhere: it no longer
-    /// holds the root's pidfd, so it treats the group as below 6.9.
+    /// look.** As for the sync [`Child::kill_tree`](crate::Child::kill_tree). On Linux the handle
+    /// keeps the root's pidfd when it forgets tokio's `Child`, whatever it saw.
     pub fn kill_tree(&mut self) -> Result<(), Error> {
         self.kill_tree_after(None)
     }
@@ -1047,8 +1047,10 @@ impl Child {
     /// call returns [`Error::Unassessable`](crate::error::Error::Unassessable) saying that nothing was
     /// sent and what was skipped.
     ///
-    /// **Linux, a root whose handle cannot say whether it was reaped** is sent the `SIGTERM` through
-    /// its pidfd, which names it exactly. Nothing goes out by its number, and the call returns
+    /// **Linux, a root whose handle cannot say whether it was reaped.** On 6.9+ a process group
+    /// that still has a member is signalled as usual through the root's pidfd, and the call is
+    /// `Ok`. Otherwise the root is sent the `SIGTERM` through its pidfd, which names it exactly,
+    /// nothing goes out by its number, and the call returns
     /// [`Error::Unassessable`](crate::error::Error::Unassessable), with one `warn` saying so.
     pub fn terminate_tree(&self) -> Result<(), Error> {
         self.require_contained()?;
@@ -1338,6 +1340,10 @@ mod group_exact_tests;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "child/drop_group_exact_tests.rs"]
 mod drop_group_exact_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "child/forget_pidfd_tests.rs"]
+mod forget_pidfd_tests;
 
 #[cfg(all(test, unix))]
 #[path = "child/drop_report_tests.rs"]
@@ -1673,9 +1679,16 @@ impl Child {
         // A backend forgotten earlier says why: a status collected by this handle is `Reaped`, and
         // nothing else is. This holds whether or not the drop is armed.
         if own_reap {
+            // A child not shown ours that the drop's kill reached, or found gone, through its pidfd
+            // (Linux) was killed, or is gone: the pidfd names the root exactly.
             #[cfg(unix)]
             {
-                signals.fate = forgotten.unwrap_or(ChildFate::Reaped);
+                signals.fate = match forgotten {
+                    Some(ChildFate::Running { .. }) if matches!(signals.fate, ChildFate::Killed | ChildFate::Gone) => {
+                        signals.fate
+                    }
+                    forgotten => forgotten.unwrap_or(ChildFate::Reaped),
+                };
             }
             #[cfg(not(unix))]
             {
@@ -2091,8 +2104,8 @@ fn signal_on_drop(
     let killed = proc.signal(Sig::Kill);
     // Nothing was delivered because the child is gone (reaped by someone else, and its pid
     // possibly reused): the pid names nothing of ours to wait for.
-    // `Unverified`: nothing was sent because the pid cannot be verified (a backend forgotten without
-    // proof of a foreign reap), so the child may be running.
+    // `Unverified`: nothing was sent because the pid cannot be verified (macOS: a backend forgotten
+    // without proof of a foreign reap), so the child may be running.
     // Nothing is logged here: the drop forgets the child next, and logs that.
     match killed {
         Ok(Sent::Gone) => {
@@ -2120,6 +2133,19 @@ fn signal_on_drop(
                 } else {
                     ChildFate::Running { id: Some(id) }
                 };
+                return signals;
+            }
+            // Forgotten earlier and unproven: only a Linux backend's kept pidfd is signalled, and it
+            // refused. Not reaped, so the child may be running.
+            if let Some(fate) = proc.forgotten_fate(Some(id)) {
+                debug_assert!(
+                    matches!(fate, ChildFate::Running { .. }),
+                    "only an unproven backend's signal fails"
+                );
+                signals.left.push(format!(
+                    "async child {pid} could not be terminated on drop; leaving it running"
+                ));
+                signals.fate = fate;
                 return signals;
             }
         }

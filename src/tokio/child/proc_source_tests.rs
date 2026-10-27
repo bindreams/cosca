@@ -57,6 +57,11 @@ fn exit_visible_by_refuses_inside_a_section() {
         stdout: None,
         stderr: None,
         fate: super::Forgotten::Unproven,
+        #[cfg(target_os = "linux")]
+        pid: None,
+        // Never read: the refusal comes before the backend is looked at.
+        #[cfg(target_os = "linux")]
+        pidfd: super::PinnedPidfd(Some(std::fs::File::open("/dev/null").expect("open /dev/null").into())),
     };
     let _section = crate::bounded::Section::enter();
     proc.exit_visible_by(1, std::time::Instant::now());
