@@ -187,7 +187,10 @@ impl ProcessId {
 }
 
 #[cfg(windows)]
-pub(crate) use backend::{close as windows_close, open_classified as windows_open_classified, Opened};
+pub(crate) use backend::{
+    close as windows_close, open_classified as windows_open_classified, terminate_held as windows_terminate_held,
+    Opened, Termination,
+};
 
 #[cfg(target_os = "linux")]
 pub(crate) use backend::pid_stat;

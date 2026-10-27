@@ -19,8 +19,8 @@ use windows::Win32::Foundation::{
     CloseHandle, ERROR_INVALID_PARAMETER, FILETIME, HANDLE, STILL_ACTIVE, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, OpenProcess, WaitForSingleObject, PROCESS_ACCESS_RIGHTS,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, OpenProcess, TerminateProcess, WaitForSingleObject,
+    PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
 };
 
 use super::{Liveness, RawPid, Resolved, StartToken};
@@ -68,6 +68,31 @@ pub(crate) fn close(handle: HANDLE) {
     if let Err(e) = unsafe { CloseHandle(handle) } {
         log::warn!("CloseHandle of an owned process handle failed: {e}");
         debug_assert!(false, "CloseHandle of an owned process handle should not fail: {e}");
+    }
+}
+
+/// What [`terminate_held`] established.
+pub(crate) enum Termination {
+    /// `TerminateProcess` accepted the request.
+    Terminated,
+    /// `TerminateProcess` refused, and the process's signalled state says it had already exited.
+    AlreadyDead,
+    /// `TerminateProcess` refused and the process is not provably dead.
+    Failed(windows::core::Error),
+}
+
+/// `TerminateProcess` on `handle`, which holds `PROCESS_TERMINATE` on `id`'s process and is
+/// still open; the caller closes it. Windows refuses with `ERROR_ACCESS_DENIED` when the process
+/// has already exited, so a refusal is read against the process's signalled state through
+/// `id` while `handle` pins the kernel object: by-pid, that read cannot land on a recycled pid.
+/// The signalled state is unambiguous, unlike `GetExitCodeProcess`, which cannot tell a live
+/// process from one that exited with 259.
+pub(crate) fn terminate_held(handle: HANDLE, id: crate::identity::ProcessId) -> Termination {
+    // SAFETY: `handle` is live and pins the process.
+    match unsafe { TerminateProcess(handle, 1) } {
+        Ok(()) => Termination::Terminated,
+        Err(_) if id.is_alive() == Liveness::Dead => Termination::AlreadyDead,
+        Err(e) => Termination::Failed(e),
     }
 }
 
