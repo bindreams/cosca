@@ -19,8 +19,8 @@ use windows::Win32::Foundation::{
     CloseHandle, ERROR_INVALID_PARAMETER, FILETIME, HANDLE, STILL_ACTIVE, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, OpenProcess, TerminateProcess, WaitForSingleObject,
-    PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    GetCurrentProcess, GetExitCodeProcess, GetProcessId, GetProcessTimes, OpenProcess, TerminateProcess,
+    WaitForSingleObject, PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
 };
 
 use super::{Liveness, RawPid, Resolved, StartToken};
@@ -81,18 +81,28 @@ pub(crate) enum Termination {
     Failed(windows::core::Error),
 }
 
-/// `TerminateProcess` on `handle`, which holds `PROCESS_TERMINATE` on `id`'s process and is
-/// still open; the caller closes it. Windows refuses with `ERROR_ACCESS_DENIED` when the process
-/// has already exited, so a refusal is read against the process's signalled state through
-/// `id` while `handle` pins the kernel object: by-pid, that read cannot land on a recycled pid.
-/// The signalled state is unambiguous, unlike `GetExitCodeProcess`, which cannot tell a live
-/// process from one that exited with 259.
-pub(crate) fn terminate_held(handle: HANDLE, id: crate::identity::ProcessId) -> Termination {
-    // SAFETY: `handle` is live and pins the process.
+/// `TerminateProcess` on `handle`, a live process handle with `PROCESS_TERMINATE` and
+/// `PROCESS_QUERY_LIMITED_INFORMATION`; the caller closes it. Windows refuses with
+/// `ERROR_ACCESS_DENIED` when the process has already exited, so a refusal is read against the
+/// process's signalled state, by the identity the handle gives (its pid and creation time) while
+/// it still pins the kernel object: that read cannot land on a recycled pid. The signalled state
+/// is unambiguous, unlike `GetExitCodeProcess`, which cannot tell a live process from one that
+/// exited with 259. A handle whose identity cannot be read proves nothing, so it is `Failed`.
+///
+/// `Failed` can also be the window in which the process is exiting but not yet signalled; what
+/// that means for a child the caller owns is the caller's to decide.
+pub(crate) fn terminate_held(handle: HANDLE) -> Termination {
+    // SAFETY: the caller's live process handle.
     match unsafe { TerminateProcess(handle, 1) } {
         Ok(()) => Termination::Terminated,
-        Err(_) if id.is_alive() == Liveness::Dead => Termination::AlreadyDead,
-        Err(e) => Termination::Failed(e),
+        Err(e) => {
+            // SAFETY: as above; the read fails (0) on a handle that is not a process.
+            let pid = unsafe { GetProcessId(handle) };
+            match windows_identity_from_handle(handle, pid) {
+                Some(id) if pid != 0 && id.is_alive() == Liveness::Dead => Termination::AlreadyDead,
+                _ => Termination::Failed(e),
+            }
+        }
     }
 }
 

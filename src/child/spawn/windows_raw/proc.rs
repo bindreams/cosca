@@ -16,11 +16,12 @@ use std::time::Instant;
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, HANDLE, WAIT_EVENT, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{
-    CreateProcessW, GetExitCodeProcess, TerminateProcess, WaitForMultipleObjects, WaitForSingleObject,
-    PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    CreateProcessW, GetExitCodeProcess, WaitForMultipleObjects, WaitForSingleObject, PROCESS_CREATION_FLAGS,
+    PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW,
 };
 
 use crate::error::{win32_io_error, Error};
+use crate::identity::{windows_terminate_held, Termination};
 
 /// `WaitForSingleObject`/`WaitForMultipleObjects` "no timeout" sentinel.
 const INFINITE: u32 = 0xFFFF_FFFF;
@@ -77,12 +78,6 @@ impl RawChild {
     /// higher-integrity child. This disambiguates a real denial from the teardown-window
     /// race where `TerminateProcess` reports `ACCESS_DENIED` on a child exiting on its own.
     fn can_terminate(&self) -> bool {
-        // SAFETY: our live owned handle pins the process object, so `self.pid` still names
-        // THIS process; OpenProcess tolerates failure (returns Err).
-        #[cfg(test)]
-        if fault::probe_forced_unterminable() {
-            return false;
-        }
         super::can_terminate(self.pid)
     }
 
@@ -162,31 +157,30 @@ impl RawChild {
         }
     }
 
+    /// Whether an `ERROR_ACCESS_DENIED` that [`windows_terminate_held`] could not prove to be an
+    /// exit is a real denial: a runas child genuinely higher-integrity than us. Any other denial
+    /// is the OS teardown window, which signals the denial before the process object is signaled.
+    /// `can_terminate` (a second `OpenProcess`, pid-reuse-safe because we still hold the handle)
+    /// separates the two WITHOUT racing a `try_wait`.
+    fn is_unkillable(&self) -> bool {
+        self.runas && !self.can_terminate()
+    }
+
     /// Hard-kill the process. An already-exited child is success (matches std's `kill`).
     pub(crate) fn kill(&self) -> io::Result<()> {
-        // SAFETY: `handle` is our live, owned process handle; exit code 1 is the forced-kill code.
-        match unsafe { TerminateProcess(self.handle(), 1) } {
-            Ok(()) => Ok(()),
-            // TerminateProcess reports ERROR_ACCESS_DENIED in two distinct situations: (a) the
-            // target is already exiting/exited (the OS teardown window signals the denial before
-            // the process object is signaled — a spurious kill error), or (b) a runas child is
-            // genuinely higher-integrity than us. A static `can_terminate` probe (a second
-            // OpenProcess for PROCESS_TERMINATE, pid-reuse-safe because we still hold the handle)
-            // separates the two WITHOUT racing a `try_wait`.
-            Err(e) if e.code() == windows::core::HRESULT::from_win32(ERROR_ACCESS_DENIED.0) => {
-                if self.runas && !self.can_terminate() {
-                    // (b) A genuinely higher-integrity runas child we cannot terminate. Do NOT
-                    // block in wait(): surface the denial.
-                    Err(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED.0 as i32))
-                } else {
-                    // (a) Our own CreateProcessW child, or a runas child we DO have terminate
-                    // rights on: the denial means exit is already underway. BLOCK on that real
-                    // event (never a timer) to confirm it.
-                    self.reap()?;
-                    Ok(())
-                }
+        match windows_terminate_held(self.handle()) {
+            Termination::Terminated => Ok(()),
+            // The refusal is the exit. BLOCK on that real event (never a timer) to record it.
+            Termination::AlreadyDead => self.reap().map(drop),
+            Termination::Failed(e) if !is_access_denied(&e) => Err(win32_io_error(e)),
+            // A genuinely higher-integrity runas child we cannot terminate. Do NOT block in
+            // wait(): surface the denial.
+            Termination::Failed(_) if self.is_unkillable() => {
+                Err(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED.0 as i32))
             }
-            Err(e) => Err(win32_io_error(e)),
+            // Our own CreateProcessW child, or a runas child we DO have terminate rights on: the
+            // denial means exit is already underway. BLOCK on that real event to confirm it.
+            Termination::Failed(_) => self.reap().map(drop),
         }
     }
 
@@ -198,9 +192,17 @@ impl RawChild {
     pub(crate) fn teardown_on_drop(&self, id: crate::identity::ProcessId) -> crate::child::proc_handle::Torn {
         use crate::child::proc_handle::Torn;
         use crate::error::ChildFate;
-        // SAFETY: `handle` is our live, owned process handle.
-        match unsafe { TerminateProcess(self.handle(), 1) } {
-            Ok(()) => {
+        // The kill was refused: only the wait's result says what became of the child.
+        let reap_refused = || {
+            let reaped = self.reap();
+            #[cfg(test)]
+            if let Ok(status) = &reaped {
+                crate::child::spawn::fault::record_teardown_reap(self.pid, *status);
+            }
+            Torn::new(fate_after_reap(false, reaped))
+        };
+        match windows_terminate_held(self.handle()) {
+            Termination::Terminated => {
                 #[cfg(test)]
                 crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterDropKill);
                 let reaped = self.reap();
@@ -210,31 +212,27 @@ impl RawChild {
                 }
                 Torn::new(fate_after_reap(true, reaped))
             }
-            Err(e) if e.code() == windows::core::HRESULT::from_win32(ERROR_ACCESS_DENIED.0) => {
-                if self.runas && !self.can_terminate() {
-                    Torn {
-                        fate: ChildFate::Running { id: Some(id) },
-                        left: Some(format!(
-                            "elevated child {} could not be terminated on drop (higher integrity); leaving it running",
-                            self.pid
-                        )),
-                    }
-                } else {
-                    // The kill was refused: only the wait's result says what became of the child.
-                    let reaped = self.reap();
-                    #[cfg(test)]
-                    if let Ok(status) = &reaped {
-                        crate::child::spawn::fault::record_teardown_reap(self.pid, *status);
-                    }
-                    Torn::new(fate_after_reap(false, reaped))
-                }
-            }
-            Err(e) => Torn {
+            Termination::AlreadyDead => reap_refused(),
+            Termination::Failed(e) if !is_access_denied(&e) => Torn {
                 fate: ChildFate::Unknown,
                 left: Some(format!("terminating child {} on drop failed: {e:?}", self.pid)),
             },
+            Termination::Failed(_) if self.is_unkillable() => Torn {
+                fate: ChildFate::Running { id: Some(id) },
+                left: Some(format!(
+                    "elevated child {} could not be terminated on drop (higher integrity); leaving it running",
+                    self.pid
+                )),
+            },
+            Termination::Failed(_) => reap_refused(),
         }
     }
+}
+
+/// `TerminateProcess` refuses with `ERROR_ACCESS_DENIED` both for a process that is exiting and
+/// for a handle that lacks the right; see [`RawChild::is_unkillable`].
+pub(crate) fn is_access_denied(e: &windows::core::Error) -> bool {
+    e.code() == windows::core::HRESULT::from_win32(ERROR_ACCESS_DENIED.0)
 }
 
 /// The fate after a teardown's blocking wait: `Reaped` for a collected status. A wait that failed

@@ -292,7 +292,7 @@ pub(crate) fn kill_by_identity(id: ProcessId) -> KillOutcome {
         HandleIdentity::Same => {
             #[cfg(test)]
             fault::run_before_terminate();
-            match windows_terminate_held(handle, id) {
+            match windows_terminate_held(handle) {
                 Termination::Terminated => KillOutcome::Terminated,
                 Termination::AlreadyDead => KillOutcome::AlreadyGone,
                 Termination::Failed(e) => {

@@ -65,6 +65,8 @@ pub(crate) mod resolve;
 #[path = "windows_raw/proc.rs"]
 mod proc;
 
+#[cfg(all(test, feature = "tokio"))]
+pub(crate) use proc::fault;
 pub(crate) use proc::RawChild;
 // The exit-status reader, which `wait::exit_only` reads a signalled handle's code through too.
 pub(crate) use proc::exit_status;
@@ -72,7 +74,7 @@ pub(crate) use proc::exit_status;
 // outcome. The sync path uses these only inside `proc`, so the re-export is tokio-only. (`create_process` is reached through the shared `spawn_step`, so it
 // needs no re-export.)
 #[cfg(feature = "tokio")]
-pub(crate) use proc::{wait_handle_or_cancel, WaitOutcome};
+pub(crate) use proc::{is_access_denied, wait_handle_or_cancel, WaitOutcome};
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -518,6 +520,10 @@ pub(crate) fn raw_spawn_teardown(proc: OwnedHandle, pid: u32, id: Option<crate::
 /// still holds a handle pinning the process object. Shared by the sync `RawChild` and the async
 /// `RawAsyncChild` runas kill paths so both surface the same typed `Unkillable`.
 pub(crate) fn can_terminate(pid: u32) -> bool {
+    #[cfg(test)]
+    if proc::fault::probe_forced_unterminable() {
+        return false;
+    }
     // SAFETY: the caller holds a live owned handle pinning the process object, so `pid` still
     // names THIS process; OpenProcess tolerates failure (returns Err).
     match unsafe { OpenProcess(PROCESS_TERMINATE, false, pid) } {

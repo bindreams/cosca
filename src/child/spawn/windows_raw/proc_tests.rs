@@ -265,6 +265,43 @@ fn runas_kill_of_an_unterminable_child_surfaces_the_denial_without_blocking() {
     assert_eq!(observer.waits(), 0, "kill blocked on a child it cannot terminate");
 }
 
+/// A runas child we cannot terminate that has already exited: the refusal is the exit, not a
+/// denial, so `kill` reaps it and succeeds.
+///
+/// Mutant: `kill` reads the refusal through `can_terminate` alone, so it returns
+/// `ERROR_ACCESS_DENIED` for a dead child.
+#[skuld::test]
+fn runas_kill_of_an_unterminable_child_that_already_exited_reaps_and_succeeds() {
+    let child = spawn_suspended_runas();
+    let observer = super::fault::observe_waits(|| {});
+    observer.force_unterminable();
+    end_with_code_zero(child.handle());
+    wait_for_exit_unrecorded(child.handle());
+    child
+        .kill()
+        .expect("a refusal on an exited child is not a denial, whatever can_terminate says");
+    assert_eq!(observer.waits(), 1, "kill must reap the exit it found");
+    assert!(child.is_reaped());
+}
+
+/// As above, for `teardown_on_drop`: the child is `Reaped` and nothing is left running.
+///
+/// Mutant: `teardown_on_drop` reads the refusal through `can_terminate` alone, so it leaves a dead
+/// child as `Running` with a "higher integrity" warning.
+#[skuld::test]
+fn runas_teardown_of_an_unterminable_child_that_already_exited_reaps_it() {
+    use crate::error::ChildFate;
+    let child = spawn_suspended_runas();
+    let observer = super::fault::observe_waits(|| {});
+    observer.force_unterminable();
+    end_with_code_zero(child.handle());
+    wait_for_exit_unrecorded(child.handle());
+    let torn = child.teardown_on_drop(identity_of(&child));
+    assert_eq!(torn.fate, ChildFate::Reaped, "{torn:?}");
+    assert!(torn.left.is_none(), "{torn:?}");
+    assert_eq!(observer.waits(), 1);
+}
+
 /// A failed `GetExitCodeProcess` reports the plain Win32 code. A null handle is a real
 /// `ERROR_INVALID_HANDLE`.
 ///

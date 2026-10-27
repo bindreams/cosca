@@ -268,3 +268,28 @@ fn a_failed_start_kill_is_reported_as_its_win32_code() {
         "{err:?}"
     );
 }
+
+/// A runas child we cannot terminate that has already exited: the refusal is the exit, not a
+/// denial, so `start_kill` succeeds.
+///
+/// Mutant: `start_kill` reads the refusal through `can_terminate` alone, so it returns
+/// `ERROR_ACCESS_DENIED` for a dead child.
+#[skuld::test]
+fn start_kill_of_an_unterminable_runas_child_that_already_exited_succeeds() {
+    use crate::tokio::spawn::windows_raw::RawAsyncChild;
+    use std::os::windows::io::{AsRawHandle, OwnedHandle};
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Threading::{WaitForSingleObject, INFINITE};
+
+    let std_child = crate::test_spawn::spawn(std::process::Command::new("cmd").args(["/C", "exit 0"])).expect("spawn");
+    let pid = std_child.id();
+    // SAFETY: `std_child` owns the live handle; it is only waited on.
+    unsafe { WaitForSingleObject(HANDLE(std_child.as_raw_handle()), INFINITE) };
+    let handle: OwnedHandle = std_child.into();
+    let child = RawAsyncChild::new_runas(handle, pid);
+    let observer = crate::child::spawn::windows_raw::fault::observe_waits(|| {});
+    observer.force_unterminable();
+    child
+        .start_kill()
+        .expect("a refusal on an exited child is not a denial, whatever can_terminate says");
+}

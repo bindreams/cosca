@@ -296,7 +296,7 @@ pub(crate) fn kill(id: ProcessId) -> Result<(), Error> {
 /// a provably dead process is success.
 fn terminate_held(handle: HANDLE, id: ProcessId) -> Result<(), Error> {
     // Closed only after the call: the liveness read inside it needs the handle to pin the pid.
-    let outcome = windows_terminate_held(handle, id);
+    let outcome = windows_terminate_held(handle);
     close(handle);
     match outcome {
         Termination::Terminated | Termination::AlreadyDead => Ok(()),

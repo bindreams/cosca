@@ -1807,15 +1807,17 @@ fn wait_reapable(pid: u32, identity: u64, level: log::Level) -> (Waited, Option<
 /// its Win32 code, so a denial classifies as `PermissionDenied`.
 #[cfg(windows)]
 pub(super) fn terminate_unreaped(h: windows::Win32::Foundation::HANDLE) -> Result<Sent, Error> {
-    use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, WAIT_FAILED};
-    use windows::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
-    // SAFETY: `h` is a live process handle the caller owns; exit code 1 is the forced-kill code
-    // std's `Child::kill` uses.
-    match unsafe { TerminateProcess(h, 1) } {
-        Ok(()) => Ok(Sent::Delivered),
-        // As std's `Child::kill`: a process that is already exiting answers `ACCESS_DENIED`, which
-        // is success, unless the handle cannot even be waited on.
-        Err(e) if e.code() == windows::core::HRESULT::from_win32(ERROR_ACCESS_DENIED.0) => {
+    use crate::identity::{windows_terminate_held, Termination};
+    use windows::Win32::Foundation::WAIT_FAILED;
+    use windows::Win32::System::Threading::WaitForSingleObject;
+    // `h` is a live process handle the caller owns.
+    match windows_terminate_held(h) {
+        Termination::Terminated | Termination::AlreadyDead => Ok(Sent::Delivered),
+        // A refusal not proven to be an exit: a child we spawned holds every right, so the OS's
+        // teardown window (denial before the object is signaled) is success, as std's
+        // `Child::kill` has it. A handle that cannot even be waited on is not such a handle, and
+        // its denial is real.
+        Termination::Failed(e) if crate::child::spawn::windows_raw::is_access_denied(&e) => {
             // SAFETY: as above; a zero-timeout wait only reads the handle's state.
             if unsafe { WaitForSingleObject(h, 0) } == WAIT_FAILED {
                 Err(Error::Io(crate::error::win32_io_error(e)))
@@ -1823,7 +1825,7 @@ pub(super) fn terminate_unreaped(h: windows::Win32::Foundation::HANDLE) -> Resul
                 Ok(Sent::Delivered)
             }
         }
-        Err(e) => Err(Error::Io(crate::error::win32_io_error(e))),
+        Termination::Failed(e) => Err(Error::Io(crate::error::win32_io_error(e))),
     }
 }
 
