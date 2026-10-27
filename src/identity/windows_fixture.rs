@@ -26,7 +26,9 @@ use std::mem::size_of;
 use crate::test_own_process::Completion;
 use windows::core::PWSTR;
 use windows::Win32::Foundation::LUID;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, STILL_ACTIVE, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{
+    CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, STILL_ACTIVE, WAIT_OBJECT_0,
+};
 use windows::Win32::Security::{
     AddAccessAllowedAce, AdjustTokenPrivileges, GetTokenInformation, InitializeAcl, InitializeSecurityDescriptor,
     LookupPrivilegeValueW, SetSecurityDescriptorDacl, TokenUser, ACL, ACL_REVISION, LUID_AND_ATTRIBUTES,
@@ -40,7 +42,7 @@ use windows::Win32::System::JobObjects::{
 use windows::Win32::System::Threading::{
     CreateProcessW, GetCurrentProcess, GetExitCodeProcess, OpenProcessToken, ResumeThread, TerminateProcess,
     WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED, INFINITE, PROCESS_INFORMATION,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, STARTUPINFOW,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, STARTF_USESTDHANDLES, STARTUPINFOW,
 };
 
 /// Remove `SeDebugPrivilege` from THIS process's token.
@@ -254,16 +256,57 @@ pub(crate) fn spawn_restricted_shell(alone: &Completion, granted: u32) -> Restri
         alone,
         granted | PROCESS_TERMINATE.0,
         "C:\\Windows\\System32\\cmd.exe /c ping.exe -n 3600 127.0.0.1",
+        None,
     )
 }
 
+/// Like [`spawn_restricted`], but the child is `more.com` reading a piped stdin, and the caller
+/// holds the write end: dropping it lets the child exit by itself, with code 0. For a test whose
+/// kill is the behaviour under test: the child it spares ends on that release, so a kill that sent
+/// nothing fails an assertion on the exit code (`1` for a kill) instead of leaving a wait on a child
+/// that never ends.
+///
+/// Until it exits, the child inherits the handles this process already holds inheritable, besides
+/// its stdio; the fixture's `Drop` ends it.
+pub(crate) fn spawn_restricted_releasable(alone: &Completion, granted: u32) -> (RestrictedChild, std::io::PipeWriter) {
+    use std::os::windows::io::AsRawHandle as _;
+    let (reader, writer) = std::io::pipe().expect("pipe");
+    let null = std::fs::OpenOptions::new().write(true).open("NUL").expect("open NUL");
+    let (stdin, stdout) = (HANDLE(reader.as_raw_handle()), HANDLE(null.as_raw_handle()));
+    for handle in [stdin, stdout] {
+        // SAFETY: `handle` is live and owned by `reader` or `null`; the call only sets its flag.
+        unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT) }
+            .expect("make the child's stdio inheritable");
+    }
+    let more = crate::test_child::windows_more();
+    let child = spawn_with_ace_cmdline(
+        alone,
+        granted | PROCESS_TERMINATE.0,
+        &format!("\"{}\"", more.display()),
+        Some((stdin, stdout)),
+    );
+    // `reader` and `null` close here, so the write end is the pipe's only other holder.
+    (child, writer)
+}
+
 fn spawn_with_ace(alone: &Completion, granted: u32) -> RestrictedChild {
-    spawn_with_ace_cmdline(alone, granted, "C:\\Windows\\System32\\ping.exe -n 3600 127.0.0.1")
+    spawn_with_ace_cmdline(
+        alone,
+        granted,
+        "C:\\Windows\\System32\\ping.exe -n 3600 127.0.0.1",
+        None,
+    )
 }
 
 /// Panics on any Win32 failure: a fixture that silently degrades would make its consumers
-/// pass vacuously.
-fn spawn_with_ace_cmdline(alone: &Completion, granted: u32, cmdline: &str) -> RestrictedChild {
+/// pass vacuously. `stdio` is the child's stdin and its stdout and stderr, as inheritable
+/// handles; given, the child is created with handle inheritance on.
+fn spawn_with_ace_cmdline(
+    alone: &Completion,
+    granted: u32,
+    cmdline: &str,
+    stdio: Option<(HANDLE, HANDLE)>,
+) -> RestrictedChild {
     // Before the child is created, so no denial assertion can observe a token that still
     // bypasses DACLs.
     drop_se_debug_privilege(alone);
@@ -324,10 +367,16 @@ fn spawn_with_ace_cmdline(alone: &Completion, granted: u32, cmdline: &str) -> Re
     // terminator, so a caller that forgot one would send it reading past the end of the
     // allocation. No call site can get this wrong.
     let mut cmdline: Vec<u16> = cmdline.encode_utf16().chain(std::iter::once(0)).collect();
-    let si = STARTUPINFOW {
+    let mut si = STARTUPINFOW {
         cb: size_of::<STARTUPINFOW>() as u32,
         ..Default::default()
     };
+    if let Some((stdin, stdout)) = stdio {
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdInput = stdin;
+        si.hStdOutput = stdout;
+        si.hStdError = stdout;
+    }
     let mut pi = PROCESS_INFORMATION::default();
     // SAFETY: `cmdline` is a NUL-terminated writable UTF-16 buffer; `sa` and the DACL it
     // points at are alive for the duration of the call.
@@ -337,7 +386,7 @@ fn spawn_with_ace_cmdline(alone: &Completion, granted: u32, cmdline: &str) -> Re
             Some(PWSTR(cmdline.as_mut_ptr())),
             Some(&sa),
             None,
-            false,
+            stdio.is_some(),
             CREATE_NO_WINDOW | CREATE_SUSPENDED,
             None,
             None,

@@ -108,11 +108,13 @@ fn tri(v: Option<bool>) -> &'static str {
 /// never ran would otherwise look identical.
 struct Spawned {
     outcome: String,
+    /// The child's control socket, held open so the child stays blocked on its read. Declared
+    /// before `_child` so it closes first: the child then leaves by itself on EOF, and the
+    /// teardown of `_child` has nothing to wait for that depends on its kill.
+    _ctrl: Option<TcpStream>,
     /// Kept alive across the measurement so the pid cannot be recycled, and so the child is torn
     /// down when this helper exits.
     _child: Option<ChildHandle>,
-    /// The child's control socket, held open so the child stays blocked on its read.
-    _ctrl: Option<TcpStream>,
     pid: Option<u32>,
 }
 
