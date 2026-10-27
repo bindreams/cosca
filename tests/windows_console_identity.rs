@@ -261,8 +261,10 @@ fn the_report_escapes_argv0_so_a_spaced_path_cannot_split_the_record() {
 /// `CreateProcessW` one instead, and the existing testbin idiom uses `executable()` — so a test
 /// written in the house style would silently leave the std path unproven.
 struct CoscaProbe {
-    child: cosca::Child,
+    // Before `child`, so a failed assertion closes it first: the child's drop then ends it whatever
+    // its kill does, instead of waiting on a child still blocked on this socket.
     sock: TcpStream,
+    child: cosca::Child,
     report: String,
 }
 
@@ -298,7 +300,7 @@ fn probe_cosca(configure: impl FnOnce(&mut cosca::Command)) -> CoscaProbe {
     let mut child = cmd.spawn().expect("spawn cosca identity probe child");
     let sock = common::accept_or_die(&listener, &mut child);
     let report = read_report_line(&sock);
-    CoscaProbe { child, sock, report }
+    CoscaProbe { sock, child, report }
 }
 
 #[cfg(windows)]

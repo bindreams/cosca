@@ -34,6 +34,9 @@ pub(crate) enum Handler {
     Ack,
     /// Handles every event and keeps running, so only a kill ends it.
     Ignore,
+    /// Frees its console before its tag, so it is outside ours: a break reaches nobody and only a
+    /// kill ends it.
+    Detached,
 }
 
 impl Handler {
@@ -42,6 +45,7 @@ impl Handler {
             Handler::Default => "default",
             Handler::Ack => "ack",
             Handler::Ignore => "ignore",
+            Handler::Detached => "detached",
         }
     }
 }
@@ -92,6 +96,7 @@ fn fixture_ctrl_break_member() {
         "default" => {}
         "ack" => install_ack(&sock),
         "ignore" => install_ignore(),
+        "detached" => free_console(),
         other => panic!("unknown handler {other:?}"),
     }
     sock.write_all(tag.as_bytes()).expect("write the tag");
@@ -142,6 +147,12 @@ fn install_ack(sock: &TcpStream) {
         .expect("one handler per process");
     // SAFETY: installing a console ctrl handler has no preconditions.
     unsafe { SetConsoleCtrlHandler(Some(ack), true) }.expect("install the ctrl handler");
+}
+
+/// Leaves the console the process was started in, so a break to its group reaches nobody.
+fn free_console() {
+    // SAFETY: no preconditions.
+    unsafe { windows::Win32::System::Console::FreeConsole() }.expect("free the console");
 }
 
 /// Handles every console control event, so the process keeps running.

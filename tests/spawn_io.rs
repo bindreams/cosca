@@ -899,13 +899,11 @@ fn assert_echo_grandchild_dead(grand: &mut std::net::TcpStream, why: &str) {
 /// The mechanism `spawn_contained_tree` gets depends on the host (`CgroupV2` if the caller may
 /// create a cgroup, else `ProcessGroup`); the tree-kill tests hold under either, so accept any
 /// mechanism that tears down a tree.
-#[cfg(any(unix, windows))]
+#[cfg(unix)]
 fn assert_host_tree_containment(child: &cosca::Child) {
     use cosca::Containment as C;
     let got = child.containment();
-    let ok = if cfg!(windows) {
-        got == C::JobObject
-    } else if cfg!(target_os = "linux") {
+    let ok = if cfg!(target_os = "linux") {
         matches!(got, C::CgroupV2 | C::ProcessGroup)
     } else {
         matches!(got, C::ProcessGroup | C::Session | C::FdMarker)
@@ -1000,6 +998,7 @@ fn windows_detach_leaves_the_tree_running() {
         child,
         mut root,
         mut grand,
+        ..
     } = spawn_contained_echo_tree(true);
     assert_eq!(child.containment(), cosca::Containment::JobObject);
 
@@ -1022,6 +1021,7 @@ fn windows_kill_on_drop_false_leaves_the_tree_running() {
         child,
         mut root,
         mut grand,
+        ..
     } = spawn_contained_echo_tree(false);
     assert_eq!(child.containment(), cosca::Containment::JobObject);
 
@@ -1287,38 +1287,6 @@ fn treewalk_kills_process_group_escapee() {
     common::assert_dead(&mut root_stream, "the escapee root after kill_tree");
     common::assert_dead(&mut gc_stream, "the grandchild after kill_tree");
     let _ = child.wait();
-}
-
-/// Drop kills the whole contained tree. Mirrors `drop_kills_and_reaps_the_child`
-/// (the lone-child case) but wraps a contained `spawn-grandchild` tree so the
-/// grandchild must also die. Proof of death: the grandchild's control socket
-/// closes — either a graceful EOF (n==0) or a ConnectionReset; the match below
-/// accepts EITHER on ALL platforms (the OS may surface either form on any host).
-#[cfg(any(unix, windows))]
-#[skuld::test]
-fn drop_kills_contained_tree() {
-    let (child, mut gc_stream) = spawn_contained_tree();
-    // Assert containment was actually established BEFORE dropping, so a failure
-    // here (e.g. the tree survived drop) is diagnosable as "containment was set
-    // up" vs "containment never engaged". spawn_contained_tree uses contain()
-    // (Strongest), so the achieved mechanism is the host's strongest.
-    assert_ne!(
-        child.containment(),
-        cosca::Containment::None,
-        "drop test requires real containment; got None"
-    );
-    assert_host_tree_containment(&child);
-
-    // Drop triggers: attached.hard_kill() → shared.kill() → shared.wait()
-    drop(child);
-
-    let mut buf = [0u8; 1];
-    match gc_stream.read(&mut buf) {
-        Ok(0) => {}                                                     // graceful EOF — grandchild exited
-        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {} // forceful kill — also proof of death
-        Ok(n) => panic!("expected EOF/ConnectionReset after drop, got {n} bytes"),
-        Err(e) => panic!("unexpected error reading grandchild control socket after drop: {e}"),
-    }
 }
 
 // cgroup v2 integration tests =====

@@ -125,16 +125,23 @@ async fn an_async_raw_spawn_refusing_an_env_nul_does_not_clear_our_handle_inheri
     );
 }
 
-/// A raw-backend blocker: `findstr` reads its stdin until EOF, and `executable()` routes it to the
-/// raw backend.
+/// A raw-backend blocker only a kill ends: `more.com` on a pipe whose writer the teardown's kill
+/// releases (see [`fault::teardown_blocker_stdin`](crate::child::spawn::fault::teardown_blocker_stdin)),
+/// so a teardown that sent no kill reaps a child that exited 0, which `assert_killed` rejects,
+/// instead of waiting on it for ever. `executable()` routes it to the raw backend.
 #[cfg(windows)]
-fn raw_blocker() -> Command {
+fn raw_blocker() -> (Command, crate::child::spawn::fault::TeardownBlocker) {
+    let crate::child::spawn::fault::TeardownBlockerParts {
+        argv,
+        stdin,
+        stdout,
+        guard,
+    } = crate::child::spawn::fault::teardown_blocker_parts();
     let mut c = Command::new();
-    c.executable("findstr")
-        .args(["findstr", "/c:needle"])
-        .stdin(Stdio::pipe())
-        .unwrap();
-    c
+    c.executable(&argv[0]).args(argv);
+    c.stdin(stdin).unwrap();
+    c.stdout(stdout.expect("a Windows blocker nulls its stdout")).unwrap();
+    (c, guard)
 }
 
 /// The async twin of `a_raw_spawn_reads_the_identity_before_it_attaches`.
@@ -144,7 +151,7 @@ async fn an_async_raw_spawn_reads_the_identity_before_it_attaches() {
     crate::tokio::test_runtime::assert_current_thread();
     use crate::child::spawn::fault;
     use crate::error::Error;
-    let mut c = raw_blocker();
+    let (mut c, teardown) = raw_blocker();
     fault::set_force_identity_vanished(true);
     fault::set_force_attach_failure(true);
     let result = c.spawn();
@@ -162,6 +169,7 @@ async fn an_async_raw_spawn_reads_the_identity_before_it_attaches() {
         crate::error::ChildFate::Reaped,
         "the raw teardown kills and reaps the child"
     );
+    teardown.assert_killed();
     fault::assert_child_reaped(fault::take_captured().expect("the seam captured the child"));
 }
 
@@ -172,7 +180,7 @@ async fn an_async_raw_spawn_whose_attach_fails_tears_its_child_down() {
     crate::tokio::test_runtime::assert_current_thread();
     use crate::child::spawn::fault;
     use crate::error::Error;
-    let mut c = raw_blocker();
+    let (mut c, teardown) = raw_blocker();
     fault::set_force_attach_failure(true);
     let result = c.spawn();
     fault::set_force_attach_failure(false);
@@ -181,6 +189,7 @@ async fn an_async_raw_spawn_whose_attach_fails_tears_its_child_down() {
     );
     assert!(matches!(err, Error::Containment { .. }), "{err:?}");
     assert_eq!(fate, crate::error::ChildFate::Reaped, "terminated and waited for");
+    teardown.assert_killed();
     fault::assert_child_reaped(fault::take_captured().expect("the seam captured the child"));
 }
 
