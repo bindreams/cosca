@@ -23,6 +23,19 @@ pub(crate) enum ChildFault {
     SigkillAfterReport,
     /// It reads one byte from this fd, inherited across the fork, before it reports.
     Gate(i32),
+    /// After it sent its pidfd: it closes its copies of `parent_ends` (so its read ends at EOF if
+    /// the parent's go-ahead never comes), lets any process trace it, writes its pid (four
+    /// native-endian bytes) to `ready`, reads one byte from `gate`, then kills itself. All fds are
+    /// inherited across the fork.
+    #[cfg_attr(
+        not(feature = "tokio"),
+        allow(dead_code, reason = "only the tokio spawn's tracer test uses it")
+    )]
+    TracedThenSigkillAfterReport {
+        ready: i32,
+        gate: i32,
+        parent_ends: [i32; 2],
+    },
 }
 
 impl ChildFault {
@@ -32,14 +45,12 @@ impl ChildFault {
             ChildFault::Fail => Err(io::Error::from_raw_os_error(libc::EIO)),
             ChildFault::Sigkill => kill_self(),
             ChildFault::Gate(fd) => {
-                let mut byte = 0u8;
-                // SAFETY: a one-byte read into this frame; retried on `EINTR` only.
-                while unsafe { libc::read(fd, (&raw mut byte).cast(), 1) } < 0
-                    && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
-                {}
+                read_gate(fd);
                 Ok(())
             }
-            ChildFault::None | ChildFault::SigkillAfterReport => Ok(()),
+            ChildFault::None | ChildFault::SigkillAfterReport | ChildFault::TracedThenSigkillAfterReport { .. } => {
+                Ok(())
+            }
         }
     }
 
@@ -47,9 +58,36 @@ impl ChildFault {
     pub(super) fn apply_after_report(self) -> io::Result<()> {
         match self {
             ChildFault::SigkillAfterReport => kill_self(),
+            ChildFault::TracedThenSigkillAfterReport {
+                ready,
+                gate,
+                parent_ends,
+            } => {
+                for fd in parent_ends {
+                    // SAFETY: a plain `close` of this child's copy of a number the test gave.
+                    unsafe { libc::close(fd) };
+                }
+                crate::test_support::foreign_tracer::allow_any_tracer_now()?;
+                let pid = rustix::process::getpid().as_raw_nonzero().get().to_ne_bytes();
+                // SAFETY: a write of this frame's four bytes; a pipe takes them whole.
+                if unsafe { libc::write(ready, pid.as_ptr().cast(), pid.len()) } != 4 {
+                    return Err(io::Error::last_os_error());
+                }
+                read_gate(gate);
+                kill_self()
+            }
             ChildFault::None | ChildFault::Fail | ChildFault::Sigkill | ChildFault::Gate(_) => Ok(()),
         }
     }
+}
+
+/// Reads one byte from `fd`. Async-signal-safe.
+fn read_gate(fd: i32) {
+    let mut byte = 0u8;
+    // SAFETY: a one-byte read into this frame; retried on `EINTR` only.
+    while unsafe { libc::read(fd, (&raw mut byte).cast(), 1) } < 0
+        && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
+    {}
 }
 
 fn kill_self() -> io::Result<()> {
@@ -65,6 +103,8 @@ type VerdictHook = Box<dyn FnOnce(Option<u32>)>;
 
 thread_local! {
     static DONE_FD_FAILURE: Cell<Option<Errno>> = const { Cell::new(None) };
+    #[cfg(feature = "tokio")]
+    static UNEXECUTED_WAIT_FAILURE: Cell<Option<Errno>> = const { Cell::new(None) };
     static CHILD_FAULT: Cell<ChildFault> = const { Cell::new(ChildFault::None) };
     static SPAWNS: Cell<usize> = const { Cell::new(0) };
     static LEAKED: Cell<Option<Option<u32>>> = const { Cell::new(None) };
@@ -184,6 +224,31 @@ impl Drop for ArmedDoneFdFailure {
 
 pub(super) fn take_done_fd_failure() -> Option<Errno> {
     DONE_FD_FAILURE.with(Cell::take)
+}
+
+/// Disarms the failure of the wait for an unexecuted child's exit on drop.
+#[cfg(feature = "tokio")]
+#[must_use = "dropping this disarms the failure at once"]
+pub(crate) struct ArmedUnexecutedWaitFailure(());
+
+/// Make the NEXT wait on this thread for an unexecuted child's exit
+/// ([`await_unexecuted_exit`](super::await_unexecuted_exit)) fail with `errno`, after its kill.
+#[cfg(feature = "tokio")]
+pub(crate) fn fail_unexecuted_wait(errno: Errno) -> ArmedUnexecutedWaitFailure {
+    UNEXECUTED_WAIT_FAILURE.with(|f| f.set(Some(errno)));
+    ArmedUnexecutedWaitFailure(())
+}
+
+#[cfg(feature = "tokio")]
+impl Drop for ArmedUnexecutedWaitFailure {
+    fn drop(&mut self) {
+        UNEXECUTED_WAIT_FAILURE.with(|f| f.set(None));
+    }
+}
+
+#[cfg(feature = "tokio")]
+pub(super) fn take_unexecuted_wait_failure() -> Option<Errno> {
+    UNEXECUTED_WAIT_FAILURE.with(Cell::take)
 }
 
 /// Disarms the watch fault on drop.

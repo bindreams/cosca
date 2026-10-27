@@ -637,6 +637,10 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
                 drop(prepared);
             }
             #[cfg(target_os = "macos")]
+            if front.is_none() {
+                note_group_left_running(&prepared, pid, &mut why);
+            }
+            #[cfg(target_os = "macos")]
             let (fate, child_fate) = {
                 let identity = if matches!(other, crate::identity::Resolved::Gone) {
                     crate::containment::RootIdentity::Gone
@@ -2068,7 +2072,7 @@ impl Diagnosis {
     }
 
     /// Owe `text` too: the next [`fold`](Diagnosis::fold) leads with it, after what was owed.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     pub(crate) fn add(&mut self, text: impl std::fmt::Display) {
         match &mut self.0 {
             Some(owed) => owed.push_str(&format!("; {text}")),
@@ -2437,18 +2441,46 @@ pub(crate) fn kill_group_before_teardown(
     child: crate::containment::ChildHandle<'_>,
     why: &mut Diagnosis,
 ) {
-    let pid = child.pid;
-    match prepared.kill_group_before_attach(child) {
-        Ok(()) => {}
-        Err(nix::errno::Errno::EINVAL) => why.add(format!(
-            "members of the process group of pid {pid} may be left running: the kernel refused \
+    if let Err(e) = prepared.kill_group_before_attach(child) {
+        note_refused_group_kill(Some(child.pid), e, false, why);
+    }
+}
+
+/// Owes `why` a refused kill of the process group of `pid`'s root through its pidfd, which says the
+/// group's members may be left running. `reaped`: the root was already reaped, so it may never have
+/// run the program. A std-collected failed exec cannot be told from a foreign reap (tokio does not
+/// report std's failure), so both warn.
+#[cfg(target_os = "linux")]
+pub(crate) fn note_refused_group_kill(pid: Option<u32>, refusal: nix::errno::Errno, reaped: bool, why: &mut Diagnosis) {
+    let named = named(pid);
+    let reaped = if reaped {
+        "; the child was already reaped, so it may never have run the program"
+    } else {
+        ""
+    };
+    match refusal {
+        nix::errno::Errno::EINVAL => why.add(format!(
+            "members of the process group of {named} may be left running: the kernel refused \
              PIDFD_SIGNAL_PROCESS_GROUP (EINVAL, expected below Linux 6.9), so nothing was sent to the \
-             group, whose number may name another group"
+             group, whose number may name another group{reaped}"
         )),
-        Err(e) => why.add(format!(
-            "spawn teardown could not kill the process group of pid {pid} through its pidfd ({e}); its \
-             members may be left running"
+        e => why.add(format!(
+            "spawn teardown could not kill the process group of {named} through its pidfd ({e}); its \
+             members may be left running{reaped}"
         )),
+    }
+}
+
+/// macOS: owes `why` that a failed spawn's cleanup sends the process group of the root `pid` nothing,
+/// since macOS has no exact kill of a group, so its members may be left running. Only for a root
+/// whose group is its containment, which is not an elevation front's.
+#[cfg(target_os = "macos")]
+pub(crate) fn note_group_left_running(prepared: &crate::containment::Prepared, pid: u32, why: &mut Diagnosis) {
+    if prepared.group_is_containment() {
+        why.add(format!(
+            "members of the process group of pid {pid} may be left running: macOS has no exact kill of a \
+             process group, so the group is sent nothing"
+        ));
     }
 }
 
@@ -3188,8 +3220,9 @@ pub(crate) mod fault {
     }
 
     /// Run `hook` at the next kill-then-blocking-wait teardown on this thread, once the kill has
-    /// returned `Ok` and before the wait: `teardown_unadopted`, the sync `finish_elevated`, or the
-    /// async `wait_and_reap` and `teardown_through_pidfd`. See [`release_between_kill_and_wait`].
+    /// returned `Ok` and before the wait: `teardown_unadopted`, the sync `finish_elevated`, the async
+    /// `wait_and_reap` and `teardown_through_pidfd`, or `await_unexecuted_exit`. See
+    /// [`release_between_kill_and_wait`] and [`record_teardown_reaps`].
     pub(crate) fn set_between_kill_and_wait(hook: impl FnOnce() + 'static) -> ArmedBetweenKillAndWait {
         crate::oneshot_hook::arm(&BETWEEN_KILL_AND_WAIT, hook)
     }
