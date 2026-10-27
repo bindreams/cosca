@@ -2,6 +2,10 @@
 //! sent the break to the expected group before it waits for the member's own evidence (see
 //! `test_child::ctrl_break`), so a call that sends nothing fails by assertion, and nothing is
 //! released that could race the break.
+//!
+//! Each break sent to a group outside our console leaves a dead entry in the console's process
+//! list. Run these locally from a fresh terminal; no test asserts the absence of a pid it did not
+//! spawn.
 
 use std::io::Read;
 use std::net::TcpStream;
@@ -461,11 +465,14 @@ fn a_treewalk_contained_root_gets_a_false_success_too() {
 /// TARGET's console exists: this test must then flip rather than the behaviour changing silently.
 ///
 /// The child is a contained root that leaves its console after it connects, so its creation flags
-/// exclude nothing. `terminate` is asserted sent, and the child is still running afterwards, which
-/// also catches an auto-escalation inside `terminate`. The forced half still ends it: its release
-/// comes after the escalation, so an escalation that sent nothing yields `0` instead of a hang.
+/// exclude nothing. The test first waits until the console no longer lists it. `terminate` is
+/// asserted sent, and the child is still running afterwards. That poll is not proof against an
+/// escalating `terminate`: `TerminateProcess` is asynchronous, so the poll can run first. The forced
+/// half still ends it: its release comes after the escalation, so an escalation that sent nothing
+/// yields `0` instead of a hang.
 ///
-/// Mutants: `terminate` sends nothing; `terminate` escalates; `graceful_shutdown` skips the kill.
+/// Mutants: `terminate` sends nothing (the break record); `graceful_shutdown` skips the kill (the
+/// exit code).
 #[skuld::test]
 fn child_graceful_ops_report_success_for_a_child_that_shares_no_console() {
     let _warns = crate::log_capture::warn_watch();
@@ -478,6 +485,7 @@ fn child_graceful_ops_report_success_for_a_child_that_shares_no_console() {
         GracefulMechanism::ConsoleGroup,
         "the flags do not exclude delivery: that is exactly what makes this a gap"
     );
+    ctrl_break::wait_until_left_our_console(pid);
     assert_eq!(
         ctrl_break::in_our_console(pid),
         Some(false),

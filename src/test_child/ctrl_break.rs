@@ -269,6 +269,20 @@ pub(crate) fn in_our_console(pid: u32) -> Option<bool> {
     }
 }
 
+/// Blocks until `pid` is not listed in our console, so that a following [`in_our_console`] read is
+/// the member's state after [`DETACH_ENV`]'s `FreeConsole`, not before. The console host answers
+/// the list, and nothing orders its processing of the member's disconnect against the member's tag
+/// crossing loopback TCP. Re-checks the real condition each time and has no cap. It ends on correct
+/// code: the caller read the tag, so the member's `FreeConsole` has been issued, and the host
+/// removes the member from its list once it processes that request (or once the member exits, which
+/// also unlists it). A caller with no console at all (`None`) leaves the wait at once and fails the
+/// assertion that follows.
+pub(crate) fn wait_until_left_our_console(pid: u32) {
+    while in_our_console(pid) == Some(true) {
+        std::thread::yield_now();
+    }
+}
+
 /// A handle on a process that can wait for its exit and read its exit code. Dropping it terminates
 /// the process if it still runs: the open handle pins the pid, so that reaches no other process.
 pub(crate) struct ExitWatch(windows::Win32::Foundation::HANDLE);

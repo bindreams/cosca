@@ -297,6 +297,7 @@ async fn async_child_graceful_ops_report_success_for_a_child_that_shares_no_cons
         GracefulMechanism::ConsoleGroup,
         "the flags do not exclude delivery: that is exactly what makes this a gap"
     );
+    ctrl_break::wait_until_left_our_console(pid);
     assert_eq!(
         ctrl_break::in_our_console(pid),
         Some(false),
