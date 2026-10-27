@@ -12,6 +12,9 @@ pub(crate) mod pid_reuse;
 pub(crate) mod ctrl_break;
 
 #[cfg(unix)]
+pub(crate) mod blocked_tree_root;
+
+#[cfg(unix)]
 pub(crate) mod foreign;
 
 #[cfg(unix)]

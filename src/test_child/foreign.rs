@@ -14,9 +14,9 @@ pub(crate) fn blocker() -> Child {
     crate::test_spawn::spawn(Command::new("cat").stdin(Stdio::piped())).expect("spawn the blocker")
 }
 
-/// A root `sh` with a `cat` grandchild blocked on the stdin held in `grandchild_stdin`. The root
-/// reports the grandchild's pid on its stdout, then how the grandchild ended, and itself dies of
-/// `SIGTERM` if it was sent one.
+/// A root (see [`blocked_tree_root`](super::blocked_tree_root)) with a `cat` grandchild blocked on
+/// the stdin held in `grandchild_stdin`. The root reports the grandchild's pid on its stdout, then
+/// how the grandchild ended, and itself dies of `SIGTERM` if it was sent one.
 pub(crate) struct BlockedTree {
     pub(crate) root: Child,
     pub(crate) grandchild: u32,
@@ -30,19 +30,8 @@ pub(crate) struct BlockedTree {
 /// gone. The grandchild's stdin is kept out of `root.stdin`, so `Child::wait` does not release it.
 pub(crate) fn blocked_tree() -> BlockedTree {
     let mut root = crate::test_spawn::spawn(
-        Command::new("sh")
-            // `dash` points an async command's stdin at /dev/null before its own redirections run,
-            // so the pipe is dup'd to fd 3 first and the grandchild reads that. A `SIGTERM` to the
-            // root interrupts `wait` with status 143, the same as the grandchild's own, so `wait`
-            // is repeated until a round passes without the trap, and the status of the last
-            // round that was not "unknown child" (127) is the grandchild's.
-            .args([
-                "-c",
-                "trap 'i=1; t=1' TERM; exec 3<&0; cat <&3 & g=$!; echo \"$g\"; \
-                 while :; do i=; wait \"$g\"; r=$?; if [ \"$r\" != 127 ]; then s=$r; fi; \
-                 if [ -z \"$i\" ]; then break; fi; done; \
-                 echo \"$s\"; if [ -n \"$t\" ]; then trap - TERM; kill -TERM $$; fi",
-            ])
+        crate::test_reexec::command(std::env::current_exe().expect("current_exe"))
+            .args(super::blocked_tree_root::argv())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped()),
     )
