@@ -9,6 +9,9 @@ use std::io::Read;
 use std::os::unix::process::ExitStatusExt;
 use std::time::Duration;
 
+use crate::graceful_hooks::{at, release_at, HookPoint};
+use crate::send_log::Capture;
+use crate::test_child::foreign;
 use crate::wait::fault;
 
 /// A std child that ignores `SIGTERM` (`trap '' TERM` before `exec`; an ignored disposition
@@ -134,4 +137,64 @@ async fn a_refused_pidfd_open_during_graceful_shutdown_names_the_step_that_hit_i
         // SIGTERM is ignored: only the escalation's SIGKILL, or ours, ends the child.
         assert_eq!(child.wait().expect("reap").signal(), Some(libc::SIGKILL), "{script:?}");
     }
+}
+
+/// The `SIGTERM`s the tree walk sent by number: `root` first, and exactly one more, to the
+/// grandchild of a [`foreign::blocked_tree`].
+fn assert_tree_sigtermed(sends: &Capture, root: u32) {
+    let sent = sends.by_identity();
+    assert!(
+        sent.len() == 2 && sent.iter().all(|&(_, signo)| signo == libc::SIGTERM) && sent[0].0 == root,
+        "the walk must SIGTERM the root {root}, then its one descendant, got {sent:?}"
+    );
+}
+
+// Async twin of `foreign_terminate_tree_sigterms_the_root_and_its_descendant` in
+// `src/process/graceful_tests.rs`.
+#[skuld::test]
+async fn async_foreign_terminate_tree_sigterms_the_root_and_its_descendant() {
+    crate::tokio::test_runtime::assert_current_thread();
+    let (mut child, stdout) = foreign::blocked_tree();
+    let p = crate::tokio::Process::from_pid(child.id()).found().expect("resolves");
+    let sends = Capture::start();
+    p.terminate_tree().expect("terminate_tree");
+    assert_tree_sigtermed(&sends, child.id());
+    let status = child.wait().expect("reap the root");
+    assert_eq!(status.signal(), Some(libc::SIGTERM), "got {status:?}");
+    foreign::assert_tree_gone(stdout);
+}
+
+// Async twin of `foreign_graceful_shutdown_tree_graceful_path` in `src/process/graceful_tests.rs`.
+#[skuld::test]
+async fn async_foreign_graceful_shutdown_tree_graceful_path() {
+    crate::tokio::test_runtime::assert_current_thread();
+    let (mut child, stdout) = foreign::blocked_tree();
+    let root = child.id();
+    let p = crate::tokio::Process::from_pid(root).found().expect("resolves");
+    let sends = std::rc::Rc::new(Capture::start());
+    let _armed = at(HookPoint::AfterTerminate, {
+        let sends = sends.clone();
+        move || assert_tree_sigtermed(&sends, root)
+    });
+    p.graceful_shutdown_tree(Duration::from_secs(30))
+        .await
+        .expect("graceful_shutdown_tree");
+    let status = child.wait().expect("reap the root");
+    assert_eq!(status.signal(), Some(libc::SIGTERM), "got {status:?}");
+    foreign::assert_tree_gone(stdout);
+}
+
+// Async twin of `foreign_graceful_shutdown_graceful_path` in `src/process/graceful_tests.rs`.
+#[skuld::test]
+async fn async_foreign_graceful_shutdown_graceful_path() {
+    crate::tokio::test_runtime::assert_current_thread();
+    let mut child = foreign::blocker();
+    let p = crate::tokio::Process::from_pid(child.id()).found().expect("resolves");
+    let stdin = child.stdin.take().expect("piped stdin");
+    let _release = release_at(HookPoint::AfterTerminate, stdin);
+    p.graceful_shutdown(Duration::from_secs(30))
+        .await
+        .expect("graceful_shutdown");
+    let status = child.wait().expect("reap");
+    assert_eq!(status.signal(), Some(libc::SIGTERM), "got {status:?}");
 }

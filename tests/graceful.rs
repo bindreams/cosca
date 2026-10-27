@@ -95,45 +95,30 @@ fn child_graceful_shutdown_tree_sweeps_survivor_after_graceful_root_exit() {
 #[cfg(unix)]
 #[skuld::test]
 fn process_terminate_sends_sigterm() {
-    use std::io::Read;
     use std::os::unix::process::ExitStatusExt;
-    let (child, mut sock) = common::spawn_blocker();
+    let (child, sock) = common::spawn_blocker();
     let p = cosca::Process::from_pid(child.id().pid()).found().expect("resolves");
     p.terminate().expect("foreign terminate");
-    let mut buf = [0u8; 1];
-    let _ = sock.read(&mut buf); // dead — EOF
+    // Release the member after the signal: a `terminate` that sent nothing lets it leave with 0,
+    // which the assertion on how it ended catches, where a read for an EOF would hang.
+    drop(sock);
     let status = child.wait().expect("reap");
     assert_eq!(status.signal(), Some(libc::SIGTERM), "got {status:?}");
 }
 
 #[cfg(unix)]
 #[skuld::test]
-fn process_graceful_shutdown_graceful_path() {
-    use std::io::Read;
-    use std::os::unix::process::ExitStatusExt;
-    use std::time::Duration;
-    let (child, mut sock) = common::spawn_blocker();
-    let p = cosca::Process::from_pid(child.id().pid()).found().expect("resolves");
-    p.graceful_shutdown(Duration::from_secs(30)).expect("foreign graceful");
-    let mut buf = [0u8; 1];
-    let _ = sock.read(&mut buf);
-    let status = child.wait().expect("reap"); // owned handle reaps; confirm SIGTERM (graceful)
-    assert_eq!(status.signal(), Some(libc::SIGTERM), "got {status:?}");
-}
-
-#[cfg(unix)]
-#[skuld::test]
 fn process_graceful_shutdown_escalates() {
-    use std::io::Read;
     use std::os::unix::process::ExitStatusExt;
     use std::time::Duration;
     // SIGTERM is ignored → SIGKILL is the only terminating signal the child can receive, so the
     // reaped status is unambiguously SIGKILL.
-    let (child, mut sock) = common::spawn_control("control-block-ignore-term", &["R"], false);
+    let (child, sock) = common::spawn_control("control-block-ignore-term", &["R"], false);
     let p = cosca::Process::from_pid(child.id().pid()).found().expect("resolves");
     p.graceful_shutdown(Duration::ZERO).expect("foreign escalates");
-    let mut buf = [0u8; 1];
-    let _ = sock.read(&mut buf);
+    // Release the member after the call: an escalation that sent no `SIGKILL` lets it leave with 0,
+    // which the assertion on how it ended catches, where a read for an EOF would hang.
+    drop(sock);
     let status = child.wait().expect("reap");
     assert_eq!(status.signal(), Some(libc::SIGKILL), "got {status:?}");
 }
@@ -169,26 +154,6 @@ fn process_kill_tree_tears_down_tree() {
     // A kill that sent nothing fails here by assertion.
     common::assert_members_killed(vec![(root, "the root"), (grand, "the grandchild")]);
     let _ = child.wait(); // reap the owned root (grandchild is reaped by init)
-}
-
-#[cfg(unix)]
-#[skuld::test]
-fn process_graceful_shutdown_tree_tears_down_tree() {
-    use std::io::Read;
-    use std::time::Duration;
-    let (child, mut socks) = common::spawn_grandchild(false);
-    let p = cosca::Process::from_pid(child.id().pid()).found().expect("resolves");
-    p.graceful_shutdown_tree(Duration::from_secs(30))
-        .expect("foreign tree graceful");
-    for (i, s) in socks.iter_mut().enumerate() {
-        let mut buf = [0u8; 1];
-        match s.read(&mut buf) {
-            Ok(0) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
-            other => panic!("tree member {i} not torn down: {other:?}"),
-        }
-    }
-    let _ = child.wait();
 }
 
 #[cfg(windows)]
