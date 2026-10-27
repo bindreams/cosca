@@ -159,6 +159,19 @@ impl ProcDir {
         .map_err(io::Error::from)
     }
 
+    /// This process's `self/fd` directory under this `/proc`, opened as
+    /// [`open_beneath`](Self::open_beneath) opens. Async-signal-safe (one `openat2`, no allocation);
+    /// in a forked child `self` is the child.
+    pub(crate) fn open_own_fd_dir(&self) -> rustix::io::Result<OwnedFd> {
+        openat2(
+            &self.0,
+            c"self/fd",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::BENEATH | ResolveFlags::NO_XDEV | ResolveFlags::NO_MAGICLINKS,
+        )
+    }
+
     /// Read the file at `path` under this `/proc`.
     pub(crate) fn read(&self, path: &str) -> io::Result<Vec<u8>> {
         let mut bytes = Vec::new();

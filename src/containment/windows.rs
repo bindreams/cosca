@@ -1705,6 +1705,41 @@ pub(crate) fn job_contains_pid(attached: &crate::containment::Attached, pid: u32
     matches!(queried, Some(Ok(()))) && in_job.as_bool()
 }
 
+/// The limit flags `job` holds now, or `None` when its handle is already closed.
+pub(crate) fn job_limit_flags(
+    job: &JobHandle,
+) -> Option<windows::core::Result<windows::Win32::System::JobObjects::JOB_OBJECT_LIMIT>> {
+    use windows::Win32::System::JobObjects::{JobObjectBasicLimitInformation, JOBOBJECT_BASIC_LIMIT_INFORMATION};
+
+    let mut info = JOBOBJECT_BASIC_LIMIT_INFORMATION::default();
+    let queried = job.with_handle(|handle| {
+        // SAFETY: `handle` is live for the call, and `info` is a correctly sized out-parameter.
+        unsafe {
+            QueryInformationJobObject(
+                Some(handle),
+                JobObjectBasicLimitInformation,
+                std::ptr::addr_of_mut!(info).cast(),
+                size_of::<JOBOBJECT_BASIC_LIMIT_INFORMATION>() as u32,
+                None,
+            )
+        }
+    })?;
+    Some(queried.map(|()| info.LimitFlags))
+}
+
+/// Test-only: whether the Job Object held by `attached` kills its members when its last handle
+/// closes. `false` when `attached` is not a job. Panics, naming the cause, when the query fails or
+/// the job handle is closed, so a failed query is not read as "no kill-on-close".
+pub(crate) fn job_kills_on_close(attached: &crate::containment::Attached) -> bool {
+    let crate::containment::Attached::JobObject(job) = attached else {
+        return false;
+    };
+    let flags = job_limit_flags(job)
+        .expect("the job handle is closed")
+        .unwrap_or_else(|e| panic!("querying the job's limits failed: {e}"));
+    flags.0 & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.0 != 0
+}
+
 #[cfg(test)]
 #[path = "windows_tests.rs"]
 mod windows_tests;

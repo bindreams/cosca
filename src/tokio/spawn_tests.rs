@@ -63,6 +63,38 @@ async fn identity_failure_reaps_the_spawned_child() {
     teardown.assert_killed();
 }
 
+/// macOS: the identity failure of a session root kills and reaps the root through its unique id and
+/// sends its process group nothing, as macOS has no exact kill of a group. The teardown's one warn
+/// says the group's members may be left running.
+///
+/// Mutant: the group's note is dropped.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+async fn macos_identity_failure_of_a_group_root_warns_that_its_members_may_be_left_running() {
+    crate::log_capture::install();
+    fault::set_force_identity_vanished(true);
+    let (mut cmd, teardown) = teardown_blocker();
+    cmd.contain_with(crate::ContainMode::Session);
+    let mark = crate::log_capture::mark();
+    let err = cmd.spawn().err();
+    fault::set_force_identity_vanished(false);
+    let _ = expect_may_have_started_with(err.expect("forced identity-vanish must make spawn return Err"));
+    let Some(crate::identity::Resolved::Found(id)) = fault::take_captured() else {
+        panic!("the seam must have captured the child's identity");
+    };
+    teardown.assert_killed();
+    let note = format!("members of the process group of pid {} may be left running", id.pid());
+    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, &note)
+        .into_iter()
+        .filter(|(level, _)| *level <= log::Level::Warn)
+        .collect();
+    assert_eq!(
+        warns.len(),
+        1,
+        "one warn says the group's members may be left running: {warns:?}"
+    );
+}
+
 // macOS: the attach cannot fail; see `macos_tokio_a_failed_attach_kills_and_reaps_a_child_that_is_not_a_front`.
 #[cfg(not(target_os = "macos"))]
 #[skuld::test]
@@ -223,15 +255,15 @@ fn drive_until_reaped(
     }
 }
 
-/// A tokio spawn that fails with no cgroup leaf to kill through warns that a forked child may have
-/// been left running out of reach, unless its spawn collected it: tokio can drop a child it forked
-/// and return no pid. Here the failure comes under a tree walk, which holds no leaf, and the
-/// handshake's pidfd reaps the child: the answer says so.
+/// A tokio spawn that fails after its fork, with no cgroup leaf, is torn down by the handshake's
+/// pidfd, and says so: the child was reaped, at `debug`. Here the failure comes under a tree walk,
+/// which holds no leaf.
 ///
-/// Mutant: the handshake leaves the dropped child, or the warning is dropped.
+/// Mutant: the abandonment warns that the child "was left running and nothing can reach it" or
+/// "may be left unreaped", or says nothing.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-async fn a_post_fork_tokio_failure_without_a_leaf_says_the_child_may_be_unreachable() {
+async fn a_post_fork_tokio_failure_without_a_leaf_says_the_handshake_reaped_the_child() {
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let mut cmd = blocker();
@@ -243,12 +275,16 @@ async fn a_post_fork_tokio_failure_without_a_leaf_says_the_child_may_be_unreacha
     };
     assert_eq!(fate, ChildFate::Reaped, "killed and reaped through its pidfd");
     let pid = fault::take_forgotten_pid().expect("the seam dropped a child");
+    let said = crate::log_capture::records_since_on_current_thread(mark, "tokio spawn failed");
+    assert_eq!(
+        said.iter().map(|(level, _)| *level).collect::<Vec<_>>(),
+        [log::Level::Debug],
+        "{said:?}"
+    );
+    assert!(said[0].1.contains("its child was reaped"), "{said:?}");
     assert!(
-        crate::log_capture::records_since(mark, "nothing can reach it")
-            .iter()
-            .zip(crate::log_capture::levels_since(mark, "nothing can reach it"))
-            .any(|(_, level)| level == log::Level::Warn),
-        "the failure must say the child may be left running"
+        !said[0].1.contains("left running") && !said[0].1.contains("unreaped"),
+        "{said:?}"
     );
     let pidfd = fault::take_forgotten_pidfd().expect("the seam took a pidfd for the child");
     assert!(reaped_through(&pidfd), "the child {pid} must be reaped");
@@ -270,12 +306,140 @@ fn the_unreachable_child_warning_is_every_time() {
         AbandonedChild::OutOfReach("it sent no handle on itself".into()),
     ] {
         let mark = crate::log_capture::mark();
-        super::warn_for_abandoned(&child, &error());
-        super::warn_for_abandoned(&child, &error());
+        super::warn_for_abandoned(&child, &error(), None);
+        super::warn_for_abandoned(&child, &error(), None);
 
         assert_eq!(
             crate::log_capture::levels_since(mark, marker),
             [log::Level::Warn, log::Level::Warn]
+        );
+    }
+}
+
+/// With no word from the handshake, each abandonment answer hedges what it cannot know: the child
+/// "may be" left running or unreaped, never "was".
+///
+/// Mutant: a message states as fact what the abandonment cannot know.
+#[skuld::test]
+fn an_abandonment_nothing_answered_for_hedges() {
+    use crate::containment::AbandonedChild;
+
+    crate::log_capture::install();
+    let marker = "cosca-abandoned-hedge-probe-5d02";
+    let error = Error::Io(std::io::Error::other(marker));
+    for (child, says) in [
+        (
+            AbandonedChild::MaybeUnreachable,
+            "may be left running and nothing can reach it",
+        ),
+        (
+            AbandonedChild::MaybeUnreaped,
+            "may be left unreaped, since it never reached",
+        ),
+        (
+            AbandonedChild::OutOfReach("it sent no handle on itself".into()),
+            "may be left running and nothing can reach it outside its cgroup v2 leaf: it sent",
+        ),
+    ] {
+        let mark = crate::log_capture::mark();
+        super::warn_for_abandoned(&child, &error, None);
+        let said = crate::log_capture::records_since_on_current_thread(mark, marker);
+        assert_eq!(said.len(), 1, "{child:?}: {said:?}");
+        assert_eq!(said[0].0, log::Level::Warn, "{child:?}");
+        assert!(said[0].1.contains(says), "{child:?}: {said:?}");
+        assert!(!said[0].1.contains("  "), "{child:?}: {said:?}");
+    }
+}
+
+/// A cgroup-leaf spawn that tokio failed for a child never told to go, whose leaf could neither hold
+/// nor kill it (`OutOfReach`), says what is known: the child never ran the program, and whether it
+/// was reaped is unknown. It does not hedge that the child "may be left running", and it passes on
+/// what the leaf's abandonment says. A failure that does not hold that fact keeps the hedge.
+///
+/// Mutant: the `OutOfReach` arm hedges "may be left running and nothing can reach it" for a child
+/// never told to go, or every failure gets the never-ran wording.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn an_out_of_reach_child_never_told_to_go_is_said_to_have_never_run() {
+    use crate::child::spawn::failure::SpawnFailure;
+    use crate::containment::AbandonedChild;
+
+    crate::log_capture::install();
+    let marker = "cosca-abandoned-never-told-probe-2c7e";
+    let why = "an abandoned spawn's child sent no handle on itself (Pid(7)); it is not signalled";
+    let abandon = |failure: SpawnFailure| {
+        let mark = crate::log_capture::mark();
+        let _ = super::abandoned_after_handshake(AbandonedChild::OutOfReach(why.into()), failure, None, false);
+        crate::log_capture::records_since_on_current_thread(mark, marker)
+    };
+    let error = || Error::Io(std::io::Error::other(marker));
+
+    let said = abandon(SpawnFailure::NotStartedUnreaped(error()));
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert_eq!(said[0].0, log::Level::Warn, "{said:?}");
+    let text = &said[0].1;
+    assert!(text.contains("the child never ran the program"), "{said:?}");
+    assert!(text.contains("whether it was reaped is unknown"), "{said:?}");
+    assert!(text.contains(why), "{said:?}");
+    assert!(
+        !text.contains("left running") && !text.contains("nothing can reach it"),
+        "{said:?}"
+    );
+    assert!(!text.contains("  "), "{said:?}");
+
+    let said = abandon(SpawnFailure::NotStarted(error()));
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert!(
+        said[0]
+            .1
+            .contains("may be left running and nothing can reach it outside its cgroup v2 leaf"),
+        "{said:?}"
+    );
+}
+
+/// When the handshake already killed and reaped the child, the abandonment does not say it is left
+/// running or unreaped: it states the handshake's answer at `debug`. Only an `OutOfReach`
+/// abandonment still warns, of a descendant outside the leaf, and says the child was reaped.
+///
+/// Mutant: the abandonment's text ignores what the handshake did.
+#[skuld::test]
+fn an_abandonment_after_a_handshake_that_ended_the_child_says_so() {
+    use crate::containment::AbandonedChild;
+
+    crate::log_capture::install();
+    let marker = "cosca-abandoned-ended-probe-8b41";
+    let error = Error::Io(std::io::Error::other(marker));
+    for fate in [ChildFate::Reaped, ChildFate::Killed, ChildFate::Gone] {
+        for child in [AbandonedChild::MaybeUnreachable, AbandonedChild::MaybeUnreaped] {
+            let mark = crate::log_capture::mark();
+            super::warn_for_abandoned(&child, &error, Some(fate));
+            let said = crate::log_capture::records_since_on_current_thread(mark, marker);
+            assert_eq!(said.len(), 1, "{child:?} after {fate:?}: {said:?}");
+            assert_eq!(said[0].0, log::Level::Debug, "{child:?} after {fate:?}");
+            assert!(
+                said[0].1.contains(&fate.to_string()),
+                "{child:?} after {fate:?}: {said:?}"
+            );
+        }
+        let mark = crate::log_capture::mark();
+        super::warn_for_abandoned(
+            &AbandonedChild::OutOfReach("it sent no handle on itself".into()),
+            &error,
+            Some(fate),
+        );
+        let said = crate::log_capture::records_since_on_current_thread(mark, marker);
+        assert_eq!(said.len(), 1, "after {fate:?}: {said:?}");
+        assert_eq!(said[0].0, log::Level::Warn, "after {fate:?}");
+        assert!(said[0].1.contains(&fate.to_string()), "after {fate:?}: {said:?}");
+        assert!(
+            !said[0].1.contains("left running") && !said[0].1.contains("nothing can reach it"),
+            "after {fate:?}: {said:?}"
+        );
+        assert!(
+            said[0]
+                .1
+                .contains("it sent no handle on itself; a descendant of it outside the leaf"),
+            "after {fate:?}: {said:?}"
         );
     }
 }
@@ -291,7 +455,7 @@ fn ended_abandoned_child_logs_nothing() {
     let marker = "cosca-abandoned-ended-probe-3a17";
 
     let mark = crate::log_capture::mark();
-    super::warn_for_abandoned(&AbandonedChild::Ended, &error);
+    super::warn_for_abandoned(&AbandonedChild::Ended, &error, None);
 
     assert_eq!(crate::log_capture::levels_since(mark, marker), Vec::<log::Level>::new());
 }
