@@ -437,14 +437,19 @@ fn same_file_by_stat_opens_nothing(#[fixture(non_root)] _non_root: &()) {
     assert!(!same_file_by_stat(&fifo, dir.path()).unwrap());
 }
 
-/// The stat comparison includes `ctime`: two names of one file whose metadata changes between the
-/// two `stat`s (here a `chmod`, which sets `ctime` and which no unprivileged call can set back) are
-/// not reported as one file. A replacement that reuses the inode number is told apart the same way.
+/// A change to a file's metadata between the two `stat`s does not make it two files: here a
+/// `chmod`, which moves `ctime` (the loop runs until it has, since a clock tick can be coarser than
+/// two calls) and leaves the birth time alone.
 ///
-/// Mutant: `same_file_by_stat` comparing `(dev, ino)` alone.
+/// A delete and recreate that reuses an inode number is not tested: whether a filesystem reuses one,
+/// and whether the new file's birth time differs from the old one's, is not under the test's control
+/// (some filesystems never reuse one; a coarse clock can give both files one birth time), and a retry
+/// loop for either has no bound that is not a guess.
+///
+/// Mutant: `same_file_by_stat` comparing `ctime`.
 #[cfg(unix)]
 #[skuld::test]
-fn same_file_by_stat_compares_ctime() {
+fn same_file_by_stat_ignores_ctime_changes() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     use super::identity::{same_file_by_stat, same_file_by_stat_with};
@@ -461,21 +466,23 @@ fn same_file_by_stat_compares_ctime() {
     };
     let same = same_file_by_stat_with(&a, &b, || {
         let before = ctime(&a);
-        // A clock tick can be coarser than two calls: change the mode until `ctime` moves.
         let mut mode = 0o600;
         while ctime(&a) == before {
             mode ^= 0o044;
             std::fs::set_permissions(&a, std::fs::Permissions::from_mode(mode)).unwrap();
         }
     });
-    assert!(!same.unwrap(), "the file's ctime changed between the two stats");
+    assert!(
+        same.unwrap(),
+        "the file's ctime changed between the two stats, and it is one file"
+    );
 }
 
 /// `same_file` holds both files while it compares them: once each is open, no change to the paths
 /// changes the answer, so an inode number freed by a delete cannot be reused by the other path in
 /// between. Here two names of one file are both removed after the files are open, and the answer is
 /// still `true`. Linux and Android only: elsewhere `same_file` compares by path (see
-/// `same_file_by_stat_compares_ctime`).
+/// `same_file_by_stat_ignores_ctime_changes`).
 ///
 /// Mutant: `same_file` that reads each file's identity by path, one after the other, without a
 /// handle on the first.

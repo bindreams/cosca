@@ -41,19 +41,21 @@ use crate::windows::{Path, PathBuf};
 ///   opened.
 /// - **macOS and every other Unix:** there is no such open (`O_EVTONLY` and `O_SYMLINK` still
 ///   authorize reading the data), so each path is `stat`ed in turn, nothing is opened, and
-///   `(st_dev, st_ino, ctime)` must agree. Comparing `(st_dev, st_ino)` alone would let a delete and
-///   recreate that reuses an inode number make two different files equal. `ctime` is set by the
-///   kernel when the file is created and no unprivileged call can set it, so a false match needs the
-///   replacement to get the same inode number in the same `ctime` tick. Apple's APFS reference
-///   (2020-06-22) describes a per-volume counter for file-system object identifiers
-///   (`apfs_next_obj_id`) but does not say they are never reused, so APFS is not assumed immune;
-///   its `ctime` has nanosecond resolution.
+///   `(st_dev, st_ino, birth time)` must agree. Comparing `(st_dev, st_ino)` alone would let a
+///   delete and recreate that reuses an inode number make two different files equal; a replacement
+///   is created later, so its birth time differs. A write, `chmod` or new hard link between the two
+///   `stat`s does not change the birth time (`ctime` would change), so the same file is still one
+///   file. A volume that reports no birth time is an [`Unsupported`](io::ErrorKind::Unsupported)
+///   error naming the path: the comparison is never weakened to `(st_dev, st_ino)` or `ctime`.
 ///
-///   The gap that remains: a concurrent delete and recreate within one `ctime` tick on a volume that
-///   reuses inode numbers and has a coarse or server-supplied `ctime`, such as FAT and exFAT (whose
-///   times are coarse) and SMB or NFS. The other direction is conservative: a change to a file's
-///   metadata between the two `stat`s (a write, `chmod`, a new hard link) changes its `ctime`, and
-///   the same file is then reported as two.
+///   The gap that remains: a delete and recreate within one birth-time tick on a volume that
+///   reuses inode numbers, such as FAT and exFAT (10 ms creation times) and SMB or NFS (the server
+///   supplies the time). Apple's APFS reference (2020-06-22) describes a per-volume counter for
+///   file-system object identifiers (`apfs_next_obj_id`) but does not say they are never reused, so
+///   APFS is not assumed immune; its birth time has nanosecond resolution.
+///
+///   The file's owner can set the birth time (`setattrlist`), which can make a replacement match.
+///   That is outside cosca's model: two ordinary programs racing do not fake it.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HostFilesystem;
 
@@ -154,7 +156,7 @@ mod identity {
         same_file_pinned_with(a, b, || {})
     }
 
-    /// `(dev, ino, ctime)` of each path, from `stat`. Nothing is opened.
+    /// `(dev, ino, birth time)` of each path, from `stat`. Nothing is opened.
     #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
     pub(super) fn same_file(a: impl AsRef<Path>, b: impl AsRef<Path>) -> io::Result<bool> {
         same_file_by_stat(a, b)
@@ -207,10 +209,27 @@ mod identity {
     ) -> io::Result<bool> {
         use std::os::unix::fs::MetadataExt;
 
-        let stamp = |m: std::fs::Metadata| (m.dev(), m.ino(), m.ctime(), m.ctime_nsec());
-        let a = stamp(std::fs::metadata(a)?);
+        let stamp = |p: &Path| -> io::Result<_> {
+            let m = std::fs::metadata(p)?;
+            let born = m.created().map_err(|e| {
+                // A volume with no birth time is an error, not a weaker comparison.
+                if e.kind() == io::ErrorKind::Unsupported {
+                    io::Error::new(
+                        e.kind(),
+                        format!(
+                            "{} has no birth time, so its identity cannot be told from a replacement's",
+                            p.display()
+                        ),
+                    )
+                } else {
+                    e
+                }
+            })?;
+            Ok((m.dev(), m.ino(), born))
+        };
+        let a = stamp(a.as_ref())?;
         between();
-        Ok(a == stamp(std::fs::metadata(b)?))
+        Ok(a == stamp(b.as_ref())?)
     }
 
     /// The volume serial number and 128-bit file id of two handles opened with no data access.
