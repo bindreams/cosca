@@ -388,6 +388,10 @@ pub(crate) enum Target {
     Leader,
     /// A listed member of a group, by its pid.
     Member(u32),
+    /// A member of a cgroup leaf, by its pid, that `CgroupLeaf::terminate` signals. A test build
+    /// notes the send, with the route of the syscall made, in `cgroup::fault::take_member_terms`.
+    #[cfg(target_os = "linux")]
+    LeafMember(u32),
 }
 
 /// The syscall [`send_signal`] makes.
@@ -451,11 +455,13 @@ fn send(target: Target, sys: Sys<'_>, signo: libc::c_int) -> nix::Result<()> {
             Sys::Pidfd(..) => Route::Pidfd,
             Sys::Group(_) | Sys::Process(_) => Route::Number,
         };
-        crate::send_log::record_group(match target {
-            Target::Group => GroupStep::Group(route, signo),
-            Target::Leader => GroupStep::Leader(route, signo),
-            Target::Member(pid) => GroupStep::Member(route, pid, signo),
-        });
+        match target {
+            Target::Group => crate::send_log::record_group(GroupStep::Group(route, signo)),
+            Target::Leader => crate::send_log::record_group(GroupStep::Leader(route, signo)),
+            Target::Member(pid) => crate::send_log::record_group(GroupStep::Member(route, pid, signo)),
+            #[cfg(target_os = "linux")]
+            Target::LeafMember(pid) => crate::containment::cgroup::fault::record_member_term(sys, pid, signo),
+        }
     }
     #[cfg(not(test))]
     let _ = target;

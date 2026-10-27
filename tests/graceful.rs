@@ -59,6 +59,7 @@ fn child_graceful_shutdown_unsupported_for_an_uncontained_child_on_windows() {
 #[cfg(unix)]
 #[skuld::test]
 fn child_graceful_shutdown_tree_sweeps_survivor_after_graceful_root_exit() {
+    let _warns = common::warn_watch();
     use std::io::Read;
     use std::time::Duration;
     // The exact case the sweep-before-reap invariant protects: the root honors the group
@@ -215,15 +216,16 @@ fn process_soft_tree_unsupported_on_windows() {
 #[cfg(unix)]
 #[skuld::test]
 fn graceful_mechanism_is_process_on_unix() {
+    let _warns = common::warn_watch();
     use cosca::GracefulMechanism;
 
     let (uncontained, s1) = common::spawn_blocker();
     let (contained, s2) = common::spawn_control("control-block", &["R"], true);
     assert_eq!(uncontained.graceful_mechanism(), GracefulMechanism::Process);
     assert_eq!(contained.graceful_mechanism(), GracefulMechanism::Process);
-    for (child, sock) in [(uncontained, s1), (contained, s2)] {
-        common::kill_release_reap(&child, sock);
-    }
+    common::kill_release_reap(&uncontained, s1);
+    // The group, before the reap: a contained child reaped first and then dropped warns (#382).
+    common::kill_tree_release_reap(&contained, s2);
 }
 
 /// On Windows the two must DISAGREE: containment is what sets `CREATE_NEW_PROCESS_GROUP`, so an
@@ -232,6 +234,7 @@ fn graceful_mechanism_is_process_on_unix() {
 #[cfg(windows)]
 #[skuld::test]
 fn graceful_mechanism_distinguishes_contained_from_uncontained_on_windows() {
+    let _warns = common::warn_watch();
     use cosca::GracefulMechanism;
 
     let (uncontained, s1) = common::spawn_blocker();
@@ -250,8 +253,10 @@ fn graceful_mechanism_distinguishes_contained_from_uncontained_on_windows() {
 /// platform.
 #[skuld::test]
 fn child_terminate_reports_ok_for_an_already_exited_child() {
+    let _warns = common::warn_watch();
     let (child, sock) = common::spawn_control("control-block", &["R"], true);
-    common::kill_release_reap(&child, sock);
+    // `kill_tree`, not `kill`: reaping a contained root first and then dropping it warns (#382).
+    common::kill_tree_release_reap(&child, sock);
     child.terminate().expect("already-dead must be Ok");
 }
 
@@ -263,6 +268,7 @@ fn child_terminate_reports_ok_for_an_already_exited_child() {
 #[cfg(windows)]
 #[skuld::test]
 fn child_graceful_ops_report_success_for_a_child_that_shares_no_console() {
+    let _warns = common::warn_watch();
     use std::io::Read;
     use std::time::Duration;
 
@@ -306,6 +312,7 @@ fn child_graceful_ops_report_success_for_a_child_that_shares_no_console() {
 #[cfg(windows)]
 #[skuld::test]
 fn nested_delegated_child_can_be_gracefully_terminated() {
+    let _warns = common::warn_watch();
     use std::io::Read;
     use std::net::TcpListener;
 
@@ -354,6 +361,7 @@ fn nested_delegated_child_can_be_gracefully_terminated() {
 mod test_harness;
 
 fn main() {
+    common::install_log_capture();
     let mut runner = skuld::TestRunner::new();
     runner.libtest_names();
     runner.require_known_labels();

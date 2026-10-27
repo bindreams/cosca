@@ -125,6 +125,7 @@ fn tree_ops_on_uncontained_child_are_unsupported() {
 
 #[skuld::test]
 fn nested_member_kill_tree_is_unsupported_end_to_end() {
+    let _warns = common::warn_watch();
     // Spawn the reporter CONTAINED so its crate-spawned grandchild is a real nested member,
     // exercising the full prepare->attach->require_contained chain rather than a hand-built
     // Prepared. The grandchild reports b"D" only when it is specifically Containment::Delegated
@@ -135,8 +136,8 @@ fn nested_member_kill_tree_is_unsupported_end_to_end() {
     let mut cmd = Command::new();
     cmd.executable(testbin())
         .args(["cosca_testbin", "report-nested-kill-tree", &addr])
-        .env(common::ACK_ENV, "1")
-        .contain();
+        .env(common::ACK_ENV, "1");
+    common::contain_without_cgroup(&mut cmd);
     let mut child = cmd.spawn().expect("spawn reporter");
     let mut sock = common::accept_or_die(&listener, &mut child);
     let mut tag = [0u8; 1];
@@ -145,6 +146,8 @@ fn nested_member_kill_tree_is_unsupported_end_to_end() {
         &tag, b"D",
         "a nested member must report Containment::Delegated AND kill_tree() Unsupported"
     );
+    // The group, before the reap: a contained root reaped first and then dropped warns (#382).
+    child.kill_tree().expect("cleanup the group");
     let _ = child.wait();
 }
 
@@ -152,6 +155,7 @@ fn nested_member_kill_tree_is_unsupported_end_to_end() {
 mod test_harness;
 
 fn main() {
+    common::install_log_capture();
     let mut runner = skuld::TestRunner::new();
     runner.libtest_names();
     runner.require_known_labels();

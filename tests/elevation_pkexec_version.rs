@@ -312,6 +312,8 @@ fn an_elevated_raw_executable_is_refused_before_pkexec_runs() {
 mod test_harness;
 
 fn main() {
+    #[cfg(target_os = "linux")]
+    common::install_log_capture();
     let mut runner = skuld::TestRunner::new();
     runner.libtest_names();
     runner.require_known_labels();

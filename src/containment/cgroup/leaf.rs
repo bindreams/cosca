@@ -21,11 +21,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(target_os = "linux")]
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(target_os = "linux")]
-use nix::sys::signal::{kill, Signal};
-#[cfg(target_os = "linux")]
-use nix::unistd::Pid;
-
 /// Whether `e` is the kernel's proof that this leaf's `cgroup.events` node is already gone —
 /// either because the whole path was already removed (`ENOENT`, on a fresh `open` through the
 /// now-unlinked leaf directory) or because THIS fd was opened before removal and the
@@ -408,14 +403,19 @@ impl CgroupLeaf {
         if let Some(errno) = fault::subtree_fails() {
             return Err(io::Error::from_raw_os_error(errno));
         }
-        Ok(Subtree::new(
-            self.id()?,
+        Ok(self.subtree_with(Some(self.id()?)))
+    }
+
+    /// The leaf's [`Subtree`] with the cgroup id `leaf_id`; `None` places every task through `/proc`.
+    fn subtree_with(&self, leaf_id: Option<u64>) -> Subtree {
+        Subtree::new(
+            leaf_id,
             Some(self.dir.shared()),
             self.cgroup_path.clone(),
             self.dir.swept(),
             self.placed.clone(),
             std::sync::Arc::clone(&self.killed),
-        ))
+        )
     }
 
     /// Watch the elevation front `pid`, this leaf's child: its place is recorded before each
@@ -669,20 +669,27 @@ impl CgroupLeaf {
         }
     }
 
-    /// SIGTERM every pid currently listed in `cgroup.procs`.
+    /// SIGTERM every process listed in `cgroup.procs` that is still in the leaf.
     ///
     /// An already-gone leaf is `Ok`, on the same proof [`hard_kill`](Self::hard_kill) rests on
     /// ([`removed_after_drain`]): there is no member left to signal. The two halves must agree
     /// about one leaf — a caller doing terminate-then-kill would otherwise take an error from
     /// the graceful half and success from the hard one over the identical directory.
     ///
-    /// # PID-reuse window
-    /// This reads the pid list then signals each entry. Between the read and
-    /// the signal a pid may exit and be recycled, potentially signalling an
-    /// unrelated process. This is the same race as the process-group `SIGTERM`
-    /// path; the cgroup mechanism's advantage (atomic, pid-free kill) applies
-    /// only to `hard_kill` via `cgroup.kill`.
-    pub(crate) fn terminate(&self) -> io::Result<()> {
+    /// Each listed pid is pinned by a pidfd, shown to be in the leaf (or under it) and still
+    /// running, then signalled through the pidfd, so a pid that exited and was reused after the read
+    /// is left alone. A member that leaves the leaf after that check still gets the `SIGTERM`: it is
+    /// the process that was checked. A member that cannot be pinned or placed gets no `SIGTERM` and
+    /// makes the call an error (see [`terminate_tree`](crate::Child::terminate_tree)); `cgroup.kill`
+    /// still reaches it.
+    ///
+    /// A listed member that got no `SIGTERM` for any reason but its exit is logged at `warn`, naming
+    /// the leaf and the pid, and makes the call an error once every member was tried:
+    /// [`Error::Containment`](crate::error::Error::Containment) if a send failed, otherwise
+    /// [`Error::Unassessable`](crate::error::Error::Unassessable) for members that could not be
+    /// pinned or placed, a listed pid `0` (a member in a pid namespace this process cannot see), or
+    /// a `cgroup.procs` line that is no pid.
+    pub(crate) fn terminate(&self) -> Result<(), crate::error::Error> {
         let path = self.leaf_path.join("cgroup.procs");
         let content = match self.dir.read("cgroup.procs") {
             Ok(c) => c,
@@ -690,17 +697,183 @@ impl CgroupLeaf {
                 log::debug!("cgroup terminate: leaf {} is already gone", path.display());
                 return Ok(());
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(crate::error::Error::Io(e)),
         };
-        for line in content.lines() {
-            if let Ok(pid) = line.trim().parse::<i32>() {
-                #[cfg(test)]
-                fault::record_terminated_by_pid(pid as u32);
-                _ = kill(Pid::from_raw(pid), Signal::SIGTERM);
+        #[cfg(test)]
+        fault::run_after_procs_read();
+        self.terminate_listed(&content)
+    }
+
+    /// [`terminate`](Self::terminate) for the members `procs` lists, in `cgroup.procs`' format.
+    fn terminate_listed(&self, procs: &str) -> Result<(), crate::error::Error> {
+        let mut pids = Vec::new();
+        let mut unproven = Vec::new();
+        for line in procs.lines() {
+            match line.trim().parse::<u32>() {
+                // A live member outside this process's pid namespace: it has no number here to
+                // pin or signal.
+                Ok(0) => {
+                    unproven.push("pid 0: it is a member in a pid namespace this process cannot see".to_owned());
+                }
+                Ok(pid) => pids.push(pid),
+                Err(_) => unproven.push(format!("cgroup.procs line {line:?} is no pid")),
             }
         }
-        Ok(())
+        if pids.is_empty() && unproven.is_empty() {
+            return Ok(());
+        }
+        // One subtree for every member. Where the leaf's id cannot be read, the pidfd route cannot
+        // place a member, and `/proc` does.
+        let subtree = self.subtree_with(match self.id() {
+            Ok(id) => Some(id),
+            Err(e) => {
+                log::debug!(
+                    "cgroup terminate: leaf {}'s cgroup id cannot be read ({e}); its members are placed through /proc",
+                    self.leaf_path.display()
+                );
+                None
+            }
+        });
+        let mut failed = Vec::new();
+        for pid in pids {
+            match self.terminate_member(pid, &subtree) {
+                Ok(()) => {}
+                Err(Unsignalled::Failed(why)) => failed.push(format!("pid {pid}: {why}")),
+                Err(Unsignalled::Unproven(why)) => unproven.push(format!("pid {pid}: {why}")),
+            }
+        }
+        if failed.is_empty() && unproven.is_empty() {
+            return Ok(());
+        }
+        let leaf = self.leaf_path.display();
+        let mut parts = Vec::new();
+        if !failed.is_empty() {
+            parts.push(format!(
+                "the SIGTERM failed for {} ({})",
+                failed.len(),
+                failed.join("; ")
+            ));
+        }
+        if !unproven.is_empty() {
+            parts.push(format!(
+                "{} could not be shown to be members, and were not signalled ({})",
+                unproven.len(),
+                unproven.join("; ")
+            ));
+        }
+        let detail = format!(
+            "cgroup leaf {leaf}: listed members got no SIGTERM: {}",
+            parts.join("; ")
+        );
+        log::warn!("cgroup terminate: {detail}");
+        Err(if failed.is_empty() {
+            crate::error::Error::Unassessable { detail, source: None }
+        } else {
+            crate::error::Error::Containment { detail }
+        })
     }
+
+    /// [`terminate`](Self::terminate)'s `SIGTERM` to the listed `pid`, if it is still a running
+    /// member of the leaf. `Ok` once sent, or for a pid that is gone or not a running member, which
+    /// it logs at `debug`; `Err` says why a pid that may be a member got none.
+    fn terminate_member(&self, pid: u32, subtree: &Subtree) -> Result<(), Unsignalled> {
+        use std::os::fd::AsFd as _;
+        let pidfd = match pin_member(pid) {
+            Ok(pidfd) => pidfd,
+            Err(rustix::io::Errno::SRCH) => {
+                log::debug!("cgroup terminate: pid {pid} is gone; not signalled");
+                return Ok(());
+            }
+            Err(e) => return Err(Unsignalled::Unproven(format!("it could not be pinned ({e})"))),
+        };
+        #[cfg(test)]
+        fault::run_after_terminate_pin();
+        // The exit check follows the read: a process still running after it held `pid` throughout,
+        // so the read was its own and not a reused pid's.
+        let inside = match subtree.holds(pid, Some(pidfd.as_fd())) {
+            Ok(inside) => inside,
+            // A member that exited and was reaped since its pin has no place left to read
+            // (`ENOENT` from `/proc`, `ESRCH` from `PIDFD_GET_INFO`): its pidfd tells it apart.
+            Err(e) => match member_exited(pidfd.as_fd()) {
+                Ok(true) => {
+                    log::debug!("cgroup terminate: pid {pid} exited before it was placed ({e}); not signalled");
+                    return Ok(());
+                }
+                Ok(false) => return Err(Unsignalled::Unproven(format!("it could not be placed ({e})"))),
+                Err(exited) => {
+                    return Err(Unsignalled::Unproven(format!(
+                        "it could not be placed ({e}), nor its exit read ({exited})"
+                    )))
+                }
+            },
+        };
+        if !inside {
+            log::debug!("cgroup terminate: pid {pid} is not a member of the leaf; not signalled");
+            return Ok(());
+        }
+        match member_exited(pidfd.as_fd()) {
+            Ok(false) => {}
+            Ok(true) => {
+                log::debug!("cgroup terminate: pid {pid} has exited; not signalled");
+                return Ok(());
+            }
+            Err(e) => return Err(Unsignalled::Unproven(format!("its exit could not be read ({e})"))),
+        }
+        match send_term(pidfd.as_fd(), pid) {
+            Ok(()) => Ok(()),
+            Err(nix::errno::Errno::ESRCH) => {
+                log::debug!("cgroup terminate: pid {pid} exited before its SIGTERM");
+                Ok(())
+            }
+            Err(e) => Err(Unsignalled::Failed(format!("{e}"))),
+        }
+    }
+}
+
+/// A pidfd that pins the process `pid` names, for [`CgroupLeaf::terminate`]; a test build lets a
+/// `fail_terminate` seam answer in its place.
+fn pin_member(pid: u32) -> rustix::io::Result<std::os::fd::OwnedFd> {
+    #[cfg(test)]
+    if let Some(errno) = fault::terminate_fails(fault::TerminateStep::Pin) {
+        return Err(rustix::io::Errno::from_raw_os_error(errno));
+    }
+    rustix::process::Pid::from_raw(pid as i32)
+        .ok_or(rustix::io::Errno::INVAL)
+        .and_then(|raw| rustix::process::pidfd_open(raw, rustix::process::PidfdFlags::empty()))
+}
+
+/// [`pidfd_exited`] for [`CgroupLeaf::terminate`]'s member; a test build lets a `fail_terminate`
+/// seam answer in its place.
+fn member_exited(pidfd: std::os::fd::BorrowedFd<'_>) -> io::Result<bool> {
+    #[cfg(test)]
+    if let Some(errno) = fault::terminate_fails(fault::TerminateStep::Exited) {
+        return Err(io::Error::from_raw_os_error(errno));
+    }
+    pidfd_exited(pidfd)
+}
+
+/// [`CgroupLeaf::terminate`]'s `SIGTERM` to the member `pidfd` pins, and the kernel's answer. It goes
+/// through the shared send, which a test build notes the route of. A test build lets a
+/// `fail_terminate` seam answer in its place without sending.
+fn send_term(pidfd: std::os::fd::BorrowedFd<'_>, pid: u32) -> nix::Result<()> {
+    use crate::containment::unix::{send_signal, Sys, Target};
+    #[cfg(test)]
+    if let Some(errno) = fault::terminate_fails(fault::TerminateStep::Send) {
+        return Err(nix::errno::Errno::from_raw(errno));
+    }
+    send_signal(
+        Target::LeafMember(pid),
+        Sys::Pidfd(pidfd, 0),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+}
+
+/// Why [`CgroupLeaf::terminate`] sent a listed pid no `SIGTERM`.
+enum Unsignalled {
+    /// The send failed.
+    Failed(String),
+    /// Nothing showed the pid to be a running member, so it was not signalled.
+    Unproven(String),
 }
 
 #[cfg(all(target_os = "linux", test))]
