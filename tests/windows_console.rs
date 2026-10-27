@@ -1,8 +1,10 @@
 //! Windows: the console-group graceful signal (`CTRL_BREAK`) is delivered only within the
 //! CALLING process's console. Every test process the test runner spawns inherits its console (it
 //! sets neither `DETACHED_PROCESS` nor `CREATE_NO_WINDOW`), so the console-less caller is reached
-//! by re-launching the testbin with `DETACHED_PROCESS`.
-//! Each console-less/with-console pair drives the SAME helper mode; the pair must disagree.
+//! by re-launching the testbin with `DETACHED_PROCESS`. These tests assert `NoConsole` and that the
+//! target stays alive. That no break was sent, and the with-console side where one really arrives,
+//! are in `src/child/ctrl_break_tests.rs`: they need the sender's own record of the breaks, which
+//! only this crate's unit-test binary has.
 //!
 //! The flag-matrix tests at the top measure what the creation-flag word does and does not
 //! settle about console membership, and their discriminating power comes from the control legs
@@ -134,14 +136,13 @@ fn a_gui_subsystem_child_is_outside_our_console_whatever_its_flags() {
 ///
 /// The helper connects before doing any work, so the read returns on socket EOF whether it
 /// reported or crashed — a real event, never a timer. `wait()` then supplies the real status.
-fn run_probe(detached: bool) -> String {
+fn run_probe() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap().to_string();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_cosca_testbin"));
-    cmd.args(["report-console-terminate", &addr]).env(common::ACK_ENV, "1");
-    if detached {
-        cmd.creation_flags(DETACHED_PROCESS);
-    }
+    cmd.args(["report-console-terminate", &addr])
+        .env(common::ACK_ENV, "1")
+        .creation_flags(DETACHED_PROCESS);
     let mut helper = common::spawn_locked(&mut cmd).expect("spawn probe helper");
     let mut sock = common::accept_or_die(&listener, &mut helper);
     let mut report = String::new();
@@ -168,7 +169,7 @@ fn field<'a>(report: &'a str, key: &str) -> &'a str {
 #[cfg(windows)]
 #[skuld::test]
 fn tree_graceful_ops_report_no_console_from_a_console_less_caller() {
-    let r = run_probe(true);
+    let r = run_probe();
     // A MEASURED absence — the helper reports `?` if its own probe failed — so this guard
     // cannot be satisfied by a broken probe.
     assert_eq!(
@@ -192,15 +193,6 @@ fn tree_graceful_ops_report_no_console_from_a_console_less_caller() {
         "alive",
         "a fail-fast terminate must leave the tree untouched: {r}"
     );
-    // The acker is hard-killed on this path, and a killed peer resets its socket rather than
-    // closing it, so the read errors (`E`) about as often as it sees EOF (`0`) — both mean
-    // "died without acking". `?` (an unexpected byte) and `K` (the teardown failed, so
-    // delivery was never observable) stay distinct and neither may pass here.
-    let seen = field(&r, "terminate_break");
-    assert!(
-        matches!(seen, "0" | "E"),
-        "no signal can have been delivered, got {seen}: {r}"
-    );
     assert_eq!(field(&r, "graceful"), "NoConsole", "{r}");
     assert_eq!(
         field(&r, "alive_after_graceful"),
@@ -220,43 +212,16 @@ fn tree_graceful_ops_report_no_console_from_a_console_less_caller() {
 }
 
 #[cfg(windows)]
-#[skuld::test]
-fn tree_graceful_ops_work_from_a_caller_that_has_a_console() {
-    // Positive control. `terminate_break=1` is load-bearing: the child acknowledges the
-    // CTRL_BREAK over its own socket, so this cannot pass on a return code alone —
-    // `GenerateConsoleCtrlEvent` reports success even when it delivers nothing.
-    let r = run_probe(false);
-    assert_eq!(field(&r, "console"), "1", "{r}");
-    assert_eq!(field(&r, "c1_in_console"), "1", "the root must share our console: {r}");
-    assert_eq!(field(&r, "containment"), "job", "{r}");
-    assert_eq!(field(&r, "terminate_tree"), "Ok", "{r}");
-    assert_eq!(
-        field(&r, "terminate_break"),
-        "1",
-        "the child must receive CTRL_BREAK: {r}"
-    );
-    assert_eq!(field(&r, "kill_tree"), "Ok", "{r}");
-    assert_eq!(
-        field(&r, "acker1_exit"),
-        "1",
-        "kill_tree must kill the root, not leave it to exit when released: {r}"
-    );
-    // The escalation leg is skipped here; `graceful_shutdown_tree_sweep_is_load_bearing_on_windows` covers it.
-    assert_eq!(field(&r, "graceful"), "Skipped", "{r}");
-}
-
-#[cfg(windows)]
 /// Sibling of [`run_probe`] driving the `report-console-lone` mode — the LONE graceful ops
 /// (`terminate` / `graceful_shutdown`) against a contained root, instead of the tree ops. Same
 /// direct-launch discipline and same connect-before-work EOF guarantee; see [`run_probe`].
-fn run_lone_probe(detached: bool) -> String {
+fn run_lone_probe() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap().to_string();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_cosca_testbin"));
-    cmd.args(["report-console-lone", &addr]).env(common::ACK_ENV, "1");
-    if detached {
-        cmd.creation_flags(DETACHED_PROCESS);
-    }
+    cmd.args(["report-console-lone", &addr])
+        .env(common::ACK_ENV, "1")
+        .creation_flags(DETACHED_PROCESS);
     let mut helper = common::spawn_locked(&mut cmd).expect("spawn lone probe helper");
     let mut sock = common::accept_or_die(&listener, &mut helper);
     let mut report = String::new();
@@ -272,7 +237,7 @@ fn run_lone_probe(detached: bool) -> String {
 #[cfg(windows)]
 #[skuld::test]
 fn lone_graceful_ops_report_no_console_from_a_console_less_caller() {
-    let r = run_lone_probe(true);
+    let r = run_lone_probe();
     // A MEASURED absence — the helper reports `?` if its own probe failed — so this guard
     // cannot be satisfied by a broken probe.
     assert_eq!(
@@ -291,13 +256,6 @@ fn lone_graceful_ops_report_no_console_from_a_console_less_caller() {
         "alive",
         "a fail-fast terminate must leave the child untouched: {r}"
     );
-    // Killed rather than signalled, and a killed peer resets its socket about as often as it
-    // closes it. `?` and `K` stay distinct and neither may pass here.
-    let seen = field(&r, "break");
-    assert!(
-        matches!(seen, "0" | "E"),
-        "no signal can have been delivered, got {seen}: {r}"
-    );
     assert_eq!(field(&r, "graceful"), "NoConsole", "{r}");
     assert_eq!(field(&r, "graceful_code"), "none", "{r}");
     assert_eq!(
@@ -308,32 +266,6 @@ fn lone_graceful_ops_report_no_console_from_a_console_less_caller() {
     assert_eq!(field(&r, "cleanup"), "Ok", "hard teardown needs no console: {r}");
     // The acker leaves with exit code 1 when killed and 0 when the helper lets go of its socket,
     // so a `kill` that sends nothing fails here instead of hanging the helper.
-    assert_eq!(
-        field(&r, "cleanup_exit"),
-        "1",
-        "the cleanup kill must end the acker, not leave it to exit when released: {r}"
-    );
-}
-
-#[cfg(windows)]
-#[skuld::test]
-fn lone_graceful_ops_work_from_a_caller_that_has_a_console() {
-    // Positive control. `break=1` is load-bearing: the child acknowledges the CTRL_BREAK over
-    // its own socket, so this cannot pass on a return code alone.
-    let r = run_lone_probe(false);
-    assert_eq!(field(&r, "console"), "1", "{r}");
-    assert_eq!(field(&r, "c_in_console"), "1", "the child must share our console: {r}");
-    assert_eq!(field(&r, "mechanism"), "console-group", "{r}");
-    assert_eq!(field(&r, "terminate"), "Ok", "{r}");
-    assert_eq!(
-        field(&r, "alive_after_terminate"),
-        "alive",
-        "the acker handles the break and keeps running: {r}"
-    );
-    assert_eq!(field(&r, "break"), "1", "the child must receive CTRL_BREAK: {r}");
-    // The escalation leg is skipped here; `child_graceful_shutdown_signals_the_group_but_only_kills_the_child` covers it.
-    assert_eq!(field(&r, "graceful"), "Skipped", "{r}");
-    assert_eq!(field(&r, "cleanup"), "Ok", "{r}");
     assert_eq!(
         field(&r, "cleanup_exit"),
         "1",
