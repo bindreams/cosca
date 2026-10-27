@@ -4,7 +4,8 @@
 //! `child::ctrl_break_tests` reads only whether the checks finished.
 
 use super::{
-    assert_acked, assert_break_sent_to, assert_in_our_console, connect_reporter, report_done, spawn_member, Handler,
+    assert_acked, assert_break_sent_to, assert_in_our_console, connect_reporter, kill_release_reap, report_done,
+    spawn_member, Handler,
 };
 use crate::{Containment, GracefulMechanism};
 
@@ -18,14 +19,12 @@ pub(crate) const ADDR_ENV: &str = "COSCA_FIXTURE_NESTED_TERMINATE_ADDR";
 /// teardown, yet it leads a console process group of its own. A `terminate` must reach that group
 /// although no tree operation on any handle could, and the nested member's own handler must
 /// acknowledge it.
-///
-/// Connects to the driver first, so a panic below reaches it as EOF. Writes [`DONE`](super::DONE)
-/// last.
 #[skuld::test]
 fn fixture_nested_terminate_reporter() {
     let Some(mut report) = connect_reporter(ADDR_ENV) else {
-        return; // picked up by an ordinary suite run — deliberately inert
+        return;
     };
+    let _warns = crate::log_capture::warn_watch();
 
     let (child, mut sock, _) = spawn_member(Handler::Ack, None, crate::ContainMode::Strongest, |_| {});
     let pid = child.id().pid();
@@ -47,12 +46,8 @@ fn fixture_nested_terminate_reporter() {
     assert_break_sent_to(pid);
     assert_acked(&mut sock, "the nested member");
 
-    // Its handler returned "handled", so it still runs; only the kill ends it. Released after the
-    // kill, so code 1 is the kill's, not a release (which exits 0).
-    child.kill().expect("kill the nested member");
-    drop(sock);
-    let status = child.wait().expect("reap the nested member");
-    assert_eq!(status.code(), Some(1), "the kill must end it, got {status:?}");
+    // Its handler returned "handled", so it still runs; only the kill ends it.
+    kill_release_reap(&child, sock, false);
 
     report_done(&mut report);
 }

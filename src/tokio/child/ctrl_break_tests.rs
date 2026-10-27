@@ -7,7 +7,7 @@ use std::time::Duration;
 use super::fault as term_fault;
 use crate::containment::Containment;
 use crate::test_child::ctrl_break::{
-    self, assert_acked, assert_in_our_console, Grandchild, Handler, STATUS_CONTROL_C_EXIT,
+    self, assert_acked, assert_in_our_console, kill_release_reap_async, Grandchild, Handler, STATUS_CONTROL_C_EXIT,
 };
 use crate::GracefulMechanism;
 
@@ -23,38 +23,7 @@ fn spawn_tree(root: Handler, grandchild: Handler) -> (crate::tokio::Child, TcpSt
 }
 
 fn spawn(handler: Handler, grandchild: Option<Handler>) -> (crate::tokio::Child, TcpStream, Option<Grandchild>) {
-    spawn_configured(handler, grandchild, crate::ContainMode::Strongest, |_| {})
-}
-
-/// [`spawn`] contained as `mode`, with `configure` applied to the command last.
-fn spawn_configured(
-    handler: Handler,
-    grandchild: Option<Handler>,
-    mode: crate::ContainMode,
-    configure: impl FnOnce(&mut crate::tokio::Command),
-) -> (crate::tokio::Child, TcpStream, Option<Grandchild>) {
-    let (listener, addr) = crate::test_child::registration_rendezvous();
-    let mut cmd = crate::tokio::Command::new();
-    cmd.executable(std::env::current_exe().expect("current_exe"))
-        .args(ctrl_break::member_argv());
-    crate::test_reexec::scrub_env(|var| _ = cmd.env_remove(var));
-    for (key, value) in ctrl_break::member_env(&addr, handler, grandchild) {
-        cmd.env(key, value);
-    }
-    cmd.contain_with(mode);
-    configure(&mut cmd);
-    let child = cmd.spawn().expect("spawn the root");
-    let mut sock = ctrl_break::accept_root(&listener, child.id());
-    let grand = grandchild.map(|_| ctrl_break::accept_grandchild(&listener, &mut sock));
-    (child, sock, grand)
-}
-
-/// Async twin of `child::ctrl_break_tests::kill_tree_release_reap`.
-async fn kill_tree_release_reap(child: &mut crate::tokio::Child, sock: TcpStream) {
-    child.kill_tree().expect("kill_tree");
-    drop(sock);
-    let status = child.wait().await.expect("reap");
-    assert_eq!(status.code(), Some(1), "kill_tree must kill the root, got {status:?}");
+    ctrl_break::spawn_member_async(handler, grandchild, crate::ContainMode::Strongest, |_| {})
 }
 
 #[skuld::test]
@@ -67,19 +36,25 @@ async fn async_child_terminate_delivers_ctrl_break_to_a_contained_root() {
     child.terminate().expect("terminate a console-group child");
     ctrl_break::assert_break_sent_to(child.id().pid());
     assert_acked(&mut sock, "the root");
-    kill_tree_release_reap(&mut child, sock).await;
+    assert_eq!(
+        child.is_alive(),
+        crate::identity::Liveness::Alive,
+        "the root handles the break and keeps running"
+    );
+    kill_release_reap_async(&mut child, sock, false).await;
 }
 
 #[skuld::test]
 async fn an_async_plain_contained_root_really_receives_the_break() {
     crate::tokio::test_runtime::assert_current_thread();
     let (mut child, mut sock) = spawn_root(Handler::Ack);
+    assert_eq!(child.containment(), Containment::JobObject);
     assert_eq!(child.graceful_mechanism(), GracefulMechanism::ConsoleGroup);
     assert_in_our_console(child.id().pid(), "the root");
     child.terminate_tree().expect("terminate_tree on a contained root");
     ctrl_break::assert_break_sent_to(child.id().pid());
     assert_acked(&mut sock, "the root");
-    kill_tree_release_reap(&mut child, sock).await;
+    kill_release_reap_async(&mut child, sock, true).await;
 }
 
 /// The hook runs on this thread, inside the future's poll, so it reads the record `terminate` wrote
@@ -252,7 +227,7 @@ async fn async_graceful_shutdown_tree_ends_a_root_that_has_a_console_of_its_own(
         ),
     ];
     for (what, mode, containment, detached) in legs {
-        let (mut child, sock, _) = spawn_configured(Handler::Ignore, None, mode, |c| {
+        let (mut child, sock, _) = ctrl_break::spawn_member_async(Handler::Ignore, None, mode, |c| {
             _ = if detached { c.detached() } else { c.no_window() }
         });
         assert_eq!(

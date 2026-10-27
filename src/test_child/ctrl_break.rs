@@ -212,8 +212,7 @@ pub(crate) fn assert_in_our_console(pid: u32, who: &str) {
 }
 
 /// Read the `B` an acking member writes when its handler receives the break. Call it only after
-/// [`assert_break_sent_to`]: the handler runs on a thread the OS creates, so the read waits for it,
-/// and only a send that really happened ends that wait.
+/// [`assert_break_sent_to`]: the read has no deadline.
 pub(crate) fn assert_acked(sock: &mut TcpStream, who: &str) {
     let mut ack = [0u8; 1];
     sock.read_exact(&mut ack)
@@ -268,18 +267,32 @@ pub(crate) fn spawn_ignoring_root() -> (crate::Child, TcpStream) {
 /// [`spawn_ignoring_root`] for the tokio `Child`.
 #[cfg(feature = "tokio")]
 pub(crate) fn spawn_ignoring_root_async() -> (crate::tokio::Child, TcpStream) {
+    let (child, sock, _) = spawn_member_async(Handler::Ignore, None, crate::ContainMode::Strongest, |_| {});
+    (child, sock)
+}
+
+/// [`spawn_member`] for the tokio `Child`.
+#[cfg(feature = "tokio")]
+pub(crate) fn spawn_member_async(
+    handler: Handler,
+    grandchild: Option<Handler>,
+    mode: crate::ContainMode,
+    configure: impl FnOnce(&mut crate::tokio::Command),
+) -> (crate::tokio::Child, TcpStream, Option<Grandchild>) {
     let (listener, addr) = crate::test_child::registration_rendezvous();
     let mut cmd = crate::tokio::Command::new();
     cmd.executable(std::env::current_exe().expect("current_exe"))
         .args(member_argv());
     crate::test_reexec::scrub_env(|var| _ = cmd.env_remove(var));
-    for (key, value) in member_env(&addr, Handler::Ignore, None) {
+    for (key, value) in member_env(&addr, handler, grandchild) {
         cmd.env(key, value);
     }
-    cmd.contain();
+    cmd.contain_with(mode);
+    configure(&mut cmd);
     let child = cmd.spawn().expect("spawn the root");
-    let sock = accept_root(&listener, child.id());
-    (child, sock)
+    let mut sock = accept_root(&listener, child.id());
+    let grand = grandchild.map(|_| accept_grandchild(&listener, &mut sock));
+    (child, sock, grand)
 }
 
 /// Assert that the call under test sent exactly one `CTRL_BREAK`, to the group led by `group`.
@@ -288,6 +301,16 @@ pub(crate) fn assert_break_sent_to(group: u32) {
         crate::containment::windows::observe::take_ctrl_breaks(),
         [group],
         "the call must send one CTRL_BREAK, to the group led by {group}"
+    );
+}
+
+/// Assert that no `CTRL_BREAK` was sent since the last read of the sender's record. This, and not
+/// a target's silence, is what shows an op sent nothing.
+pub(crate) fn assert_no_break_sent() {
+    assert_eq!(
+        crate::containment::windows::observe::take_ctrl_breaks(),
+        Vec::<u32>::new(),
+        "the call must send no CTRL_BREAK"
     );
 }
 
@@ -301,6 +324,19 @@ pub(crate) fn kill_release_reap(child: &crate::Child, sock: TcpStream, tree: boo
     }
     drop(sock);
     let status = child.wait().expect("reap");
+    assert_eq!(status.code(), Some(1), "the kill must end the member, got {status:?}");
+}
+
+/// [`kill_release_reap`] for the tokio `Child`.
+#[cfg(feature = "tokio")]
+pub(crate) async fn kill_release_reap_async(child: &mut crate::tokio::Child, sock: TcpStream, tree: bool) {
+    if tree {
+        child.kill_tree().expect("kill_tree");
+    } else {
+        child.kill().expect("kill");
+    }
+    drop(sock);
+    let status = child.wait().await.expect("reap");
     assert_eq!(status.code(), Some(1), "the kill must end the member, got {status:?}");
 }
 

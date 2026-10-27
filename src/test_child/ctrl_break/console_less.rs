@@ -3,12 +3,13 @@
 //! checks finished.
 //!
 //! A target's reply cannot show that no break was sent: its handler thread may not have run yet.
-//! The proof is the sender's own result: with no console `GenerateConsoleCtrlEvent` fails at the
-//! syscall, so nothing is sent or recorded, and each op reports `NoConsole`.
+//! The proof is the sender's own record, empty after each op ([`assert_no_break_sent`]): with no
+//! console `GenerateConsoleCtrlEvent` fails at the syscall, so each op reports `NoConsole`. The
+//! members ignore every event, so nothing else would reveal a break sent anyway.
 
 use std::time::Duration;
 
-use super::{connect_reporter, kill_release_reap, report_done, spawn_ignoring_root};
+use super::{assert_no_break_sent, connect_reporter, kill_release_reap, report_done, spawn_ignoring_root};
 use crate::error::Error;
 use crate::identity::Liveness;
 use crate::{Containment, GracefulMechanism};
@@ -43,25 +44,22 @@ fn assert_no_console() {
 
 /// Runs the tree ops and then the lone ops against a contained member that cannot be signalled, from
 /// a caller with no console: each cooperative op fails with `NoConsole` and leaves the member
-/// running, and the forced ops still end it.
-///
-/// Connects to the driver first, so a panic below reaches it as EOF. Writes [`DONE`](super::DONE)
-/// last.
+/// running, and the forced ops still end it. No op sends a break.
 #[skuld::test]
 fn fixture_console_less_reporter() {
     let Some(mut report) = connect_reporter(ADDR_ENV) else {
-        return; // picked up by an ordinary suite run — deliberately inert
+        return;
     };
     assert_no_console();
 
-    // The tree ops. The member ignores every event, so a break sent anyway would not end it and
-    // only the record would tell.
+    // The tree ops.
     let (child, sock) = spawn_ignoring_root();
     assert_eq!(child.containment(), Containment::JobObject);
     assert!(
         matches!(child.terminate_tree(), Err(Error::NoConsole { .. })),
         "terminate_tree must report NoConsole"
     );
+    assert_no_break_sent();
     assert_eq!(
         child.is_alive(),
         Liveness::Alive,
@@ -74,6 +72,7 @@ fn fixture_console_less_reporter() {
         ),
         "graceful_shutdown_tree must report NoConsole"
     );
+    assert_no_break_sent();
     assert_eq!(
         child.is_alive(),
         Liveness::Alive,
@@ -88,6 +87,7 @@ fn fixture_console_less_reporter() {
         matches!(child.terminate(), Err(Error::NoConsole { .. })),
         "terminate must report NoConsole"
     );
+    assert_no_break_sent();
     assert_eq!(
         child.is_alive(),
         Liveness::Alive,
@@ -97,6 +97,7 @@ fn fixture_console_less_reporter() {
         matches!(child.graceful_shutdown(Duration::ZERO), Err(Error::NoConsole { .. })),
         "graceful_shutdown must report NoConsole"
     );
+    assert_no_break_sent();
     assert_eq!(
         child.is_alive(),
         Liveness::Alive,

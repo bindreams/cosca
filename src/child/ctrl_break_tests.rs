@@ -344,25 +344,18 @@ fn drop_kills_a_job_object_tree() {
 }
 
 /// The case the capability exists for, end to end: a nested contained child owns no tree, leads a
-/// console process group of its own, and had no cooperative shutdown at all. The checks run in a
-/// re-exec of this binary spawned contained, so its own spawn is nested and its thread holds the
-/// record of the break it sends; see `test_child::ctrl_break::nested`. Only the reporter's
-/// [`DONE`](ctrl_break::DONE) (written after every check) passes: a panic ends the report with no
-/// `DONE`, and a filter that matched no test writes nothing.
+/// console process group of its own, and had no cooperative shutdown at all. The checks run in
+/// `test_child::ctrl_break::nested`.
 #[skuld::test]
 fn nested_delegated_child_can_be_gracefully_terminated() {
-    let _warns = crate::log_capture::warn_watch();
     ctrl_break::drive_reporter(ctrl_break::nested::REPORTER_TEST, ctrl_break::nested::ADDR_ENV, |cmd| {
         _ = cmd.contain()
     });
 }
 
-/// From a caller with no console, the cooperative ops fail with `NoConsole` and send no break. A
-/// target's reply cannot show that (its handler thread may not have run yet), so the checks run in
-/// a re-exec of this binary spawned detached, where each op must report `NoConsole`; see
-/// `test_child::ctrl_break::console_less`. `tests/windows_console.rs` keeps the `NoConsole` and
-/// still-alive assertions on the testbin side. An op that sends anyway fails the reporter's
-/// `NoConsole` match.
+/// From a caller with no console, the cooperative ops fail with `NoConsole` and send no break. The
+/// checks, including the sender's empty break record, run in `test_child::ctrl_break::console_less`
+/// in a re-exec of this binary spawned detached.
 #[skuld::test]
 fn console_less_caller_sends_no_break() {
     ctrl_break::drive_reporter(
