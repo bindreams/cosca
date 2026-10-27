@@ -91,6 +91,11 @@ pub use stdio::{Fd, Stdio};
 mod child;
 pub use child::{Child, SuspendedChild};
 
+#[doc(hidden)]
+pub mod audit;
+#[cfg(test)]
+mod audit_tests;
+
 // Lets `tests/common/locked.rs`, which names `cosca::test_spawn_lock`, compile into the lib's tests.
 #[cfg(test)]
 extern crate self as cosca;

@@ -277,6 +277,23 @@ jobs:
       - name: Build
         run: cargo build --locked --target ${{ matrix.target }}
 
+      # SPIKE (do not merge): where does `__test_hooks` reach? The plain build and a standalone testbin
+      # build have it off (exit 1); `--features __test_hooks` and a nextest build have it on (exit 0).
+      - name: Spike - __test_hooks in plain and standalone builds
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -uo pipefail
+          tb="target/$TARGET/debug/cosca_testbin"
+          "$tb" audit-enabled; echo "plain cargo build: testbin audit-enabled exit=$? (expect 1)"
+          cargo build --locked --target "$TARGET" --bin cosca_testbin
+          "$tb" audit-enabled; echo "standalone --bin cosca_testbin: exit=$? (expect 1)"
+          cargo build --locked --target "$TARGET" --bin cosca_testbin --features __test_hooks
+          "$tb" audit-enabled; echo "standalone --features __test_hooks: exit=$? (expect 0)"
+          cargo build --locked --target "$TARGET"
+          "$tb" audit-enabled; echo "plain cargo build again: exit=$? (expect 1)"
+
       # Each nextest step is a build step (unbounded: compile time varies with the cache) and a run
       # step bounded above the largest per-test bound in `.config/nextest.toml` (5 x 60s + 1s grace)
       # plus the suite's runtime, so a hang costs one step. On Unix the runner signals only the
@@ -288,6 +305,16 @@ jobs:
       # nextest runs under Git bash.
       - name: Build tests
         run: cargo nextest run --locked --no-run --target ${{ matrix.target }} --profile ci
+
+      - name: Spike - the testbin after a nextest build, and the archive flow
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -uxo pipefail
+          "target/$TARGET/debug/cosca_testbin" audit-enabled; echo "after nextest --no-run: testbin exit=$? (expect 0)"
+          cargo nextest archive --locked --target "$TARGET" --archive-file "$RUNNER_TEMP/spike.tar.zst"
+          cargo nextest run --archive-file "$RUNNER_TEMP/spike.tar.zst" --extract-to "$RUNNER_TEMP/spike-extract" --workspace-remap "$PWD" --no-tests=fail             -E 'test(=audit_tests::test_hooks_reach_the_lib_unit_tests) | test(=test_hooks_reach_the_integration_test_and_the_testbin)'
 
       - name: Run tests
         timeout-minutes: 8

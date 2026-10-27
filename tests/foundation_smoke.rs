@@ -127,3 +127,14 @@ fn main() {
     runner.require_known_labels();
     runner.run()
 }
+
+/// Spike probe: the self dev-dependency turns `__test_hooks` on for this binary, and the testbin
+/// built in the same invocation shares that build of the lib.
+#[skuld::test]
+fn test_hooks_reach_the_integration_test_and_the_testbin() {
+    assert!(cosca::audit::enabled(), "__test_hooks is off in this tests/ binary");
+    let status =
+        common::status_locked(std::process::Command::new(env!("CARGO_BIN_EXE_cosca_testbin")).arg("audit-enabled"))
+            .expect("run the testbin");
+    assert!(status.success(), "__test_hooks is off in the testbin: {status}");
+}

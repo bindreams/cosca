@@ -46,6 +46,9 @@ pty = []
 tokio = ["dep:tokio"]
 # Serialize a ProcessIdRecord so an identity survives a supervisor restart.
 serde = ["dep:serde"]
+# Test hooks (hidden; never enable it in a release build). Turned on for every test build by the self
+# dev-dependency below.
+__test_hooks = []
 
 [dependencies]
 thiserror = "2"
@@ -61,6 +64,9 @@ serde = { version = "1", optional = true, features = ["derive"] }
 tokio = { version = "1", optional = true, features = ["process", "rt", "io-util", "macros", "net", "sync", "time"] }
 
 [dev-dependencies]
+# Turns `__test_hooks` on for the lib's unit tests and for `tests/`, not for `cargo build`. A `[[bin]]` built
+# on its own (`cargo build --bin cosca_testbin`) does not see it: pass `--features __test_hooks`.
+cosca = { path = ".", features = ["__test_hooks"] }
 tempfile = "3"
 # A concrete format to pin the persisted wire form against.
 serde_json = "1"

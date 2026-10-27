@@ -521,6 +521,8 @@ fn main() {
                 .collect();
             quiet_io::put_stdout(&bytes, "emit-raw: write stdout");
         }
+        // Spike: exit 0 when this binary's `cosca` has `__test_hooks` on, else 1.
+        "audit-enabled" => exit(if cosca::audit::enabled() { 0 } else { 1 }),
         "exit" => {
             let code: i32 = args[2].parse().unwrap();
             exit(code);
