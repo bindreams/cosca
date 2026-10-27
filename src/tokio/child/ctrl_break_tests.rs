@@ -11,22 +11,26 @@ use crate::test_child::ctrl_break::{self, Grandchild, Handler, STATUS_CONTROL_C_
 use crate::GracefulMechanism;
 
 fn spawn_root(handler: Handler) -> (crate::tokio::Child, TcpStream) {
-    let (child, sock, _) = spawn(handler, None);
+    spawn_root_configured(handler, crate::ContainMode::Strongest, |_| {})
+}
+
+/// [`spawn_root`] under `mode`, with `configure` applied to the root's command before the spawn.
+fn spawn_root_configured(
+    handler: Handler,
+    mode: crate::ContainMode,
+    configure: impl FnOnce(&mut crate::tokio::Command),
+) -> (crate::tokio::Child, TcpStream) {
+    let (child, sock, _) = spawn(handler, None, mode, configure);
     (child, sock)
 }
 
 /// The root's socket keeps the root running while held.
 fn spawn_tree(root: Handler, grandchild: Handler) -> (crate::tokio::Child, TcpStream, Grandchild) {
-    let (child, sock, grand) = spawn(root, Some(grandchild));
+    let (child, sock, grand) = spawn(root, Some(grandchild), crate::ContainMode::Strongest, |_| {});
     (child, sock, grand.expect("a grandchild was asked for"))
 }
 
-fn spawn(handler: Handler, grandchild: Option<Handler>) -> (crate::tokio::Child, TcpStream, Option<Grandchild>) {
-    spawn_configured(handler, grandchild, crate::ContainMode::Strongest, |_| {})
-}
-
-/// [`spawn`] contained as `mode`, with `configure` applied to the command last.
-fn spawn_configured(
+fn spawn(
     handler: Handler,
     grandchild: Option<Handler>,
     mode: crate::ContainMode,
@@ -184,39 +188,6 @@ async fn async_child_graceful_shutdown_signals_the_group_but_only_kills_the_chil
     assert_eq!(exit.wait_for_exit_code(), 1, "kill_tree must kill the grandchild");
 }
 
-/// Async twin of `child_graceful_ops_report_success_for_a_child_that_shares_no_console`: the same
-/// known limitation (#832), pinned on the async surface too.
-#[skuld::test]
-async fn async_child_graceful_ops_report_success_for_a_child_that_shares_no_console() {
-    let _warns = crate::log_capture::warn_watch();
-    crate::tokio::test_runtime::assert_current_thread();
-    let (mut child, sock) = spawn_root(Handler::Detached);
-    let pid = child.id().pid();
-    assert_eq!(
-        child.graceful_mechanism(),
-        GracefulMechanism::ConsoleGroup,
-        "the flags do not exclude delivery, which is what makes this a gap"
-    );
-    assert_eq!(
-        ctrl_break::in_our_console(pid),
-        Some(false),
-        "a child that freed its console is not in ours"
-    );
-    child.terminate().expect("the documented false success");
-    ctrl_break::assert_break_sent_to(pid);
-    assert_eq!(
-        child.is_alive(),
-        crate::identity::Liveness::Alive,
-        "nothing was delivered, so the child must still be running"
-    );
-    let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, sock);
-    let status = child
-        .graceful_shutdown(Duration::ZERO)
-        .await
-        .expect("the forced half needs no console");
-    assert_eq!(status.code(), Some(1), "the escalation's kill, got {status:?}");
-}
-
 /// Both members ignore the break, so only the ZERO-grace hard sweep can end the tree. The root's
 /// socket is closed once the sweep returned, and the grandchild's after the root is reaped: a sweep
 /// that sent nothing, or only to the root, yields code 0 for the member it missed.
@@ -242,58 +213,117 @@ async fn async_graceful_shutdown_tree_sweep_is_load_bearing_on_windows() {
     assert_eq!(exit.wait_for_exit_code(), 1, "the sweep must kill the grandchild");
 }
 
-/// Async twin of `graceful_shutdown_tree_ends_a_root_that_has_a_console_of_its_own`.
-#[skuld::test]
-async fn async_graceful_shutdown_tree_ends_a_root_that_has_a_console_of_its_own() {
+// A root outside our console =====
+
+/// Async twin of `child::ctrl_break_tests::assert_own_console_route`: the async derivation must
+/// read the composed creation-flag word too.
+fn assert_own_console_route(child: &crate::tokio::Child, expected_containment: Containment) {
+    assert_eq!(
+        child.containment(),
+        expected_containment,
+        "this test is about the wrong thing if containment did not take"
+    );
+    assert_eq!(
+        child.graceful_mechanism(),
+        GracefulMechanism::OtherConsoleGroup,
+        "cosca's honest report of the route"
+    );
+}
+
+/// Async twin of the sync `assert_false_success`; see there.
+async fn assert_false_success(
+    expected_containment: Containment,
+    mode: crate::ContainMode,
+    configure: impl Fn(&mut crate::tokio::Command),
+) {
+    use std::io::Write as _;
+
     crate::tokio::test_runtime::assert_current_thread();
-    let legs = [
-        (
-            "no_window, job",
-            crate::ContainMode::Strongest,
-            Containment::JobObject,
-            false,
-        ),
-        (
-            "detached, job",
-            crate::ContainMode::Strongest,
-            Containment::JobObject,
-            true,
-        ),
-        (
-            "no_window, treewalk",
-            crate::ContainMode::TreeWalk,
-            Containment::TreeWalk,
-            false,
-        ),
-    ];
-    for (what, mode, containment, detached) in legs {
-        let (mut child, sock, _) = spawn_configured(Handler::Ignore, None, mode, |c| {
-            _ = if detached { c.detached() } else { c.no_window() }
-        });
-        assert_eq!(
-            child.containment(),
-            containment,
-            "{what}: this test is about the wrong thing if containment did not take"
-        );
-        assert_eq!(
-            child.graceful_mechanism(),
-            GracefulMechanism::OtherConsoleGroup,
-            "{what}: the honest route; a derivation reading only the containment half says ConsoleGroup"
-        );
-        let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, sock);
-        let status = child
-            .graceful_shutdown_tree(Duration::ZERO)
-            .await
-            .unwrap_or_else(|e| panic!("{what}: the forced half tears the tree down: {e:?}"));
-        assert_eq!(
-            status.code(),
-            Some(1),
-            "{what}: the forced half must kill the root, got {status:?}"
-        );
-        assert_eq!(
-            child.is_alive(),
-            crate::identity::Liveness::Dead,
-            "{what}: the forced half really ended it"
-        );
-    }
+    let (mut child, mut sock) = spawn_root_configured(Handler::Default, mode, &configure);
+    assert_own_console_route(&child, expected_containment);
+    child.terminate_tree().expect("the cooperative op reports success");
+    ctrl_break::assert_break_sent_to(child.id().pid());
+    assert_eq!(
+        child.is_alive(),
+        crate::identity::Liveness::Alive,
+        "nothing was delivered, so the root must still be running"
+    );
+    sock.write_all(b"x").expect("release the root through its own socket");
+    let status = child.wait().await.expect("reap");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "the root exited on OUR release byte, so the cooperative op delivered nothing, got {status:?}"
+    );
+    drop(sock);
+
+    let (mut child, sock) = spawn_root_configured(Handler::Default, mode, &configure);
+    assert_own_console_route(&child, expected_containment);
+    let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, sock);
+    let status = child
+        .graceful_shutdown_tree(Duration::ZERO)
+        .await
+        .expect("the forced half tears the tree down");
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "the forced half must kill the root, got {status:?}"
+    );
+    assert_eq!(child.is_alive(), crate::identity::Liveness::Dead);
+}
+
+#[skuld::test]
+async fn an_async_no_window_contained_root_gets_a_false_success() {
+    assert_false_success(Containment::JobObject, crate::ContainMode::Strongest, |c| {
+        c.no_window();
+    })
+    .await;
+}
+
+#[skuld::test]
+async fn an_async_detached_contained_root_gets_a_false_success() {
+    assert_false_success(Containment::JobObject, crate::ContainMode::Strongest, |c| {
+        c.detached();
+    })
+    .await;
+}
+
+#[skuld::test]
+async fn an_async_treewalk_contained_root_gets_a_false_success_too() {
+    assert_false_success(Containment::TreeWalk, crate::ContainMode::TreeWalk, |c| {
+        c.no_window();
+    })
+    .await;
+}
+
+/// Async twin of `child_graceful_ops_report_success_for_a_child_that_shares_no_console`: the same
+/// behaviour (#832), on the async surface.
+#[skuld::test]
+async fn async_child_graceful_ops_report_success_for_a_child_that_shares_no_console() {
+    let _warns = crate::log_capture::warn_watch();
+    crate::tokio::test_runtime::assert_current_thread();
+    let (mut child, sock) = ctrl_break::spawn_consoleless_root_async();
+    let pid = child.id().pid();
+    assert_eq!(
+        child.graceful_mechanism(),
+        GracefulMechanism::ConsoleGroup,
+        "the flags do not exclude delivery: that is exactly what makes this a gap"
+    );
+    child.terminate().expect("the documented false success");
+    ctrl_break::assert_break_sent_to(pid);
+    assert_eq!(
+        child.is_alive(),
+        crate::identity::Liveness::Alive,
+        "nothing was delivered, so the child must still be running"
+    );
+    let check = term_fault::at_checked(term_fault::HookPoint::AfterTerminate, move || {
+        ctrl_break::assert_break_sent_to(pid)
+    });
+    let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, sock);
+    let status = child
+        .graceful_shutdown(Duration::ZERO)
+        .await
+        .expect("the forced half needs no console");
+    check.assert_fired();
+    assert_eq!(status.code(), Some(1), "escalation's kill, got {status:?}");
 }

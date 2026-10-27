@@ -282,11 +282,6 @@ path = "tests/windows_creation_flags.rs"
 harness = false
 
 [[test]]
-name = "windows_false_success"
-path = "tests/windows_false_success.rs"
-harness = false
-
-[[test]]
 name = "windows_job_object"
 path = "tests/windows_job_object.rs"
 harness = false
