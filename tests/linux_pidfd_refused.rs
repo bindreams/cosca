@@ -39,7 +39,7 @@ fn assert_refused(result: Result<impl std::fmt::Debug, Error>, op: &str, errno: 
 #[skuld::test]
 fn a_seccomp_refused_pidfd_open_is_unsupported_for_every_operation() {
     for (code, name) in REFUSALS {
-        let (child, _control) = common::spawn_blocker();
+        let (child, control) = common::spawn_blocker();
         let process = cosca::Process::from_pid(child.id().pid())
             .found()
             .expect("resolve the child");
@@ -60,8 +60,7 @@ fn a_seccomp_refused_pidfd_open_is_unsupported_for_every_operation() {
                 .join()
                 .expect("the filtered thread");
         });
-        child.kill().expect("kill the child");
-        child.wait().expect("reap the child");
+        common::kill_release_reap(&child, control);
     }
 }
 
@@ -70,7 +69,7 @@ fn a_seccomp_refused_pidfd_open_is_unsupported_for_every_operation() {
 #[skuld::test]
 fn a_seccomp_refused_pidfd_open_is_unsupported_for_every_async_operation() {
     for (code, name) in REFUSALS {
-        let (child, _control) = common::spawn_blocker();
+        let (child, control) = common::spawn_blocker();
         let process = cosca::tokio::Process::from_pid(child.id().pid())
             .found()
             .expect("resolve the child");
@@ -101,8 +100,7 @@ fn a_seccomp_refused_pidfd_open_is_unsupported_for_every_async_operation() {
                 .join()
                 .expect("the filtered thread");
         });
-        child.kill().expect("kill the child");
-        child.wait().expect("reap the child");
+        common::kill_release_reap(&child, control);
     }
 }
 
@@ -183,6 +181,8 @@ fn a_seccomp_refused_pidfd_open_is_found_before_any_fork() {
 mod test_harness;
 
 fn main() {
+    #[cfg(target_os = "linux")]
+    common::install_log_capture();
     let mut runner = skuld::TestRunner::new();
     runner.libtest_names();
     runner.require_known_labels();

@@ -254,14 +254,8 @@ fn breakaway() -> FlagsRequest {
     }
 }
 
-/// `ERROR_ACCESS_DENIED` in the two encodings that reach the classifier: the std path returns the
-/// bare Win32 code, the raw backends convert a `windows::core::Error` whose `raw_os_error` is the
-/// HRESULT. Derived from the documented `HRESULT_FROM_WIN32` mapping, not from this crate's own
-/// output, so a bug in that conversion cannot make the test agree with itself.
-fn access_denied_encodings() -> [i32; 2] {
-    let win32 = windows::Win32::Foundation::ERROR_ACCESS_DENIED.0 as i32;
-    [win32, windows::core::HRESULT::from_win32(win32 as u32).0]
-}
+/// `ERROR_ACCESS_DENIED` as the classifier sees it: the bare Win32 code, from either backend.
+const ACCESS_DENIED: i32 = windows::Win32::Foundation::ERROR_ACCESS_DENIED.0 as i32;
 
 fn io_err(code: i32) -> Error {
     Error::Io(std::io::Error::from_raw_os_error(code))
@@ -290,16 +284,14 @@ fn breakaway_with_containment_is_refused() {
 /// resolved, so a genuine "no such program" is masked by it.
 #[skuld::test]
 fn a_forbidding_job_turns_access_denied_into_a_typed_containment_error() {
-    for code in access_denied_encodings() {
-        let out = super::classify_spawn_denial(io_err(code), breakaway(), JobBreakaway::Forbidden);
-        let Error::Containment { detail } = out else {
-            panic!("encoding {code:#x}: expected Containment, got {out:?}");
-        };
-        assert!(detail.contains("JOB_OBJECT_LIMIT_BREAKAWAY_OK"), "{detail}");
-        assert!(detail.contains("breakaway_from_job()"), "{detail}");
-        assert!(detail.contains("FIRST"), "{detail}");
-        crate::error::assert_detail_is_not_hard_wrapped(&detail);
-    }
+    let out = super::classify_spawn_denial(io_err(ACCESS_DENIED), breakaway(), JobBreakaway::Forbidden);
+    let Error::Containment { detail } = out else {
+        panic!("expected Containment, got {out:?}");
+    };
+    assert!(detail.contains("JOB_OBJECT_LIMIT_BREAKAWAY_OK"), "{detail}");
+    assert!(detail.contains("breakaway_from_job()"), "{detail}");
+    assert!(detail.contains("FIRST"), "{detail}");
+    crate::error::assert_detail_is_not_hard_wrapped(&detail);
 }
 
 /// Measured (Windows 11 26100, 2026-08-18): a silent-breakaway job ACCEPTS the flag, so no
@@ -308,10 +300,8 @@ fn a_forbidding_job_turns_access_denied_into_a_typed_containment_error() {
 /// a silent-breakaway job does not forbid children from leaving, it removes them itself.
 #[skuld::test]
 fn the_silent_breakaway_verdict_keeps_the_raw_io_error() {
-    for code in access_denied_encodings() {
-        let out = super::classify_spawn_denial(io_err(code), breakaway(), JobBreakaway::SilentBreakaway);
-        assert!(matches!(out, Error::Io(_)), "encoding {code:#x}: got {out:?}");
-    }
+    let out = super::classify_spawn_denial(io_err(ACCESS_DENIED), breakaway(), JobBreakaway::SilentBreakaway);
+    assert!(matches!(out, Error::Io(_)), "got {out:?}");
 }
 
 /// The typed variant must never assert a cause the process just measured to be false — nor
@@ -319,10 +309,8 @@ fn the_silent_breakaway_verdict_keeps_the_raw_io_error() {
 #[skuld::test]
 fn a_contradicted_or_unmeasurable_probe_keeps_the_raw_io_error() {
     for job in [JobBreakaway::Permitted, JobBreakaway::NotInJob, JobBreakaway::Unknown] {
-        for code in access_denied_encodings() {
-            let out = super::classify_spawn_denial(io_err(code), breakaway(), job);
-            assert!(matches!(out, Error::Io(_)), "{job:?}/{code:#x}: got {out:?}");
-        }
+        let out = super::classify_spawn_denial(io_err(ACCESS_DENIED), breakaway(), job);
+        assert!(matches!(out, Error::Io(_)), "{job:?}: got {out:?}");
     }
 }
 
@@ -377,10 +365,8 @@ fn a_spawn_denial_without_a_breakaway_request_is_never_reclassified() {
         JobBreakaway::NotInJob,
         JobBreakaway::Unknown,
     ] {
-        for code in access_denied_encodings() {
-            let out = super::classify_spawn_denial(io_err(code), FlagsRequest::default(), job);
-            assert!(matches!(out, Error::Io(_)), "{job:?}/{code:#x}: got {out:?}");
-        }
+        let out = super::classify_spawn_denial(io_err(ACCESS_DENIED), FlagsRequest::default(), job);
+        assert!(matches!(out, Error::Io(_)), "{job:?}: got {out:?}");
     }
 }
 

@@ -14,12 +14,12 @@
 //! it contains no processes itself). This is the normal case in properly
 //! delegated slices (systemd user slices, container environments). On hosts
 //! where the supervisor IS a leaf (root cgroup, or an undelegated slice), the
-//! child's `cgroup.procs` write will fail with EBUSY/EINVAL; the `pre_exec`
-//! closure handles this gracefully by falling back to the process-group
+//! child's `cgroup.procs` write will fail with EBUSY/EINVAL; the placement
+//! step handles this gracefully by falling back to the process-group
 //! mechanism without aborting the spawn.
 //!
 //! # Async-signal-safety
-//! `place_self_in_cgroup_pre_exec` is called inside a `pre_exec` closure
+//! `place_self_in_cgroup_pre_exec` is called from the spawn's in-child hook
 //! (after `fork`, before `exec`). The only async-signal-safe operations there
 //! are raw `libc::write`, `libc::close` and `libc::send` — no allocation, no
 //! `format!`, no `String`. Its outcome crosses back through a socket pair

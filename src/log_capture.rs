@@ -97,6 +97,47 @@ pub(crate) fn levels_since(mark: usize, marker: &str) -> Vec<log::Level> {
         .collect()
 }
 
+/// The text of every record at `Warn` or worse emitted at or after `mark`.
+pub(crate) fn warnings_since(mark: usize) -> Vec<String> {
+    RECORDS.lock().unwrap()[mark..]
+        .iter()
+        .filter(|(level, _, _)| *level <= log::Level::Warn)
+        .map(|(_, m, _)| m.clone())
+        .collect()
+}
+
+/// Pins a test's log output: no record at `Warn` or worse may be emitted while it lives. Declare it
+/// FIRST in a test, so it drops last, after the test's children have been torn down and their
+/// teardown has logged. Skipped while the test is already panicking, so it never masks the real
+/// failure. Mirrors `tests/common`'s `WarnWatch` (minus its `expecting`, which no test here needs),
+/// which a separate compilation unit cannot share.
+///
+/// Reads the process-wide capture from its creation on, so it assumes one test per process (what
+/// nextest runs).
+#[must_use = "the watch asserts when dropped; bind it to a named `_watch`, not `_`"]
+pub(crate) struct WarnWatch {
+    mark: usize,
+}
+
+/// A [`WarnWatch`] over the records from now on. Installs the capture.
+pub(crate) fn warn_watch() -> WarnWatch {
+    install();
+    WarnWatch { mark: mark() }
+}
+
+impl Drop for WarnWatch {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            return;
+        }
+        let warnings = warnings_since(self.mark);
+        assert!(
+            warnings.is_empty(),
+            "unexpected warning(s) at Warn or above: {warnings:#?}"
+        );
+    }
+}
+
 /// Like [`records_since`], but only records emitted by the CALLING thread. For a marker that is
 /// a constant message prefix shared by every test in the process, this is what keeps a
 /// concurrently-running test's identical record from satisfying (or breaking) the assertion.

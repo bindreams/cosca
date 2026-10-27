@@ -125,13 +125,16 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
         return windows_raw::spawn_raw(cmd, fds, kill_on_drop);
     }
 
+    #[cfg(unix)]
+    let mut steps = crate::child::spawn::in_child::InChild::default();
     #[cfg(target_os = "linux")]
     let (std_cmd, handshake) =
-        crate::child::spawn::build_std_command_with(cmd, crate::child::spawn::pidfd_handshake::register)
+        crate::child::spawn::build_std_command_with(cmd, &mut steps, crate::child::spawn::pidfd_handshake::register)
             .not_started()?;
     #[cfg(target_os = "macos")]
     let (std_cmd, report) =
-        crate::child::spawn::build_std_command_with(cmd, crate::child::spawn::unique_report::register).not_started()?;
+        crate::child::spawn::build_std_command_with(cmd, &mut steps, crate::child::spawn::unique_report::register)
+            .not_started()?;
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let std_cmd = build_std_command(cmd).not_started()?;
     let mut tcmd = ::tokio::process::Command::new(std::ffi::OsStr::new(""));
@@ -290,9 +293,9 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
     #[cfg(target_os = "linux")]
     let mut held_pidfd: Option<std::os::fd::OwnedFd> = None;
 
-    // Phase 1 (before spawn): root detection + pre-spawn containment setup, registered before
-    // fd_map's dup2 pre_exec so the latter runs LAST in the child (see the ordering
-    // rationale in child/spawn.rs). On macOS the spawn lock is widened to enclose `prepare`
+    // Phase 1 (before spawn): root detection + pre-spawn containment setup, whose in-child steps
+    // join `steps`, which runs fd_map's dup2 LAST in the child (see the ordering rationale in
+    // child/spawn.rs). On macOS the spawn lock is widened to enclose `prepare`
     // through `drop(tcmd)` — see child/spawn.rs's matching comment for the race this closes
     // (dropping `tcmd` here drops the inner `std::process::Command` it wraps, which is what
     // actually owns the marker write end's supervisor-side copy).
@@ -302,6 +305,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
             let _guard = crate::child::spawn::spawn_lock();
             let prepared = crate::containment::prepare(
                 tcmd.as_std_mut(),
+                &mut steps,
                 &cmd.contain_request(),
                 cmd.flags_request(),
                 &reserved,
@@ -326,7 +330,8 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                     child_fd: fd.raw(),
                 })
                 .collect();
-            fd_map::install(tcmd.as_std_mut(), mappings).not_started()?;
+            fd_map::install(&mut steps, mappings).not_started()?;
+            steps.register(tcmd.as_std_mut());
 
             #[allow(
                 clippy::disallowed_methods,
@@ -382,6 +387,8 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
     let (mut prepared, child) = {
         let mut prepared = crate::containment::prepare(
             tcmd.as_std_mut(),
+            #[cfg(unix)]
+            &mut steps,
             &cmd.contain_request(),
             cmd.flags_request(),
             &reserved,
@@ -420,8 +427,8 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
         let _guard = crate::child::spawn::spawn_lock();
 
         // Linux: the child is held before `exec` until the parent holds the pidfd it sent, which
-        // the child then keeps. Its hook was registered first of all, so `fd_map`'s, which may
-        // `dup2` a mapping onto the channel's descriptor number, runs after it is done.
+        // the child then keeps. Its hook was registered first of all, so the fd map, which may
+        // `dup2` a mapping onto any number including the channel's, runs after the handshake is done.
         // A front spawned for a cgroup leaf is left to the leaf, which alone knows whether it holds
         // the front; any child spawned for one leaves the leaf the handshake's pidfd, or a copy,
         // for a child the leaf cannot name (see `Handshake::leaving_front`).
@@ -437,8 +444,8 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
         #[cfg(target_os = "linux")]
         let handshake = handshake.killing_group(prepared.leafless_group_is_containment());
 
-        // On Unix, hand n>=3 child ends to fd_map — registered AFTER `prepare` so its dup2
-        // pre_exec runs LAST in the child (see the ordering rationale in child/spawn.rs).
+        // On Unix, hand n>=3 child ends to fd_map, whose dup2 step `steps` runs LAST in the child
+        // (see the ordering rationale in child/spawn.rs), and register the one hook.
         #[cfg(unix)]
         {
             use crate::child::spawn::fd_map;
@@ -450,7 +457,8 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                     child_fd: fd.raw(),
                 })
                 .collect();
-            fd_map::install(tcmd.as_std_mut(), mappings).not_started()?;
+            fd_map::install(&mut steps, mappings).not_started()?;
+            steps.register(tcmd.as_std_mut());
         }
 
         let c = {

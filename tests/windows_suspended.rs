@@ -148,8 +148,12 @@ fn contained_frozen_child_dies_with_its_parent(mode: &str, backend: &str) {
     sock.write_all(b"g").expect("send go");
 
     helper.kill().expect("kill the helper parent, root only");
+    // Releasing the helper after the kill: it leaves with 0 on EOF, and its exit closes the job
+    // just as the kill does, so a `kill` that sent nothing still ends the wait below. The helper's
+    // own exit code is what tells the two apart.
+    drop(sock);
     watch.wait_for_death();
-    drop(helper);
+    common::assert_killed("the helper parent", helper.wait().expect("reap the helper parent"));
 }
 
 #[cfg(windows)]
@@ -184,7 +188,9 @@ fn a_resumed_child_runs() {
         assert_eq!((tag, pid), (b'C', child.id().pid()), "{backend}");
         common::assert_echoes(&mut sock, "the resumed child");
         child.kill().expect("kill");
-        child.wait().expect("reap");
+        // Released after the kill: a kill that sent nothing exits 0.
+        drop(sock);
+        common::assert_killed("the resumed child", child.wait().expect("reap"));
     }
 }
 
@@ -203,7 +209,8 @@ async fn an_async_resumed_child_runs() {
         assert_eq!((tag, pid), (b'C', child.id().pid()), "{backend}");
         common::assert_echoes(&mut sock, "the resumed child");
         child.kill().expect("kill");
-        child.wait().await.expect("reap");
+        drop(sock);
+        common::assert_killed("the resumed child", child.wait().await.expect("reap"));
     }
 }
 
@@ -542,6 +549,8 @@ fn death_watch_grandchild_of_an_async_resumed_nested_child_stays_in_the_enclosin
 mod test_harness;
 
 fn main() {
+    #[cfg(windows)]
+    common::install_log_capture();
     let mut runner = skuld::TestRunner::new();
     runner.libtest_names();
     runner.require_known_labels();

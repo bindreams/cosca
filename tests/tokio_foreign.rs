@@ -25,56 +25,58 @@ fn expect_eof(who: &str, s: &mut std::net::TcpStream) {
 #[cfg(feature = "tokio")]
 #[skuld::test]
 async fn async_foreign_wait_resolves_on_exit() {
-    let (child, mut sock) = common::spawn_blocker();
+    let (child, sock) = common::spawn_blocker();
     let p = Process::from_pid(child.id().pid()).found().expect("resolves");
     let watch = ::tokio::spawn(async move { p.wait().await });
     child.kill().expect("kill");
-    expect_eof("blocker", &mut sock);
+    // Released after the kill: a kill that sent nothing exits 0.
+    drop(sock);
     watch
         .await
         .expect("join")
         .expect("foreign wait resolves on the real exit");
-    let _ = child.wait();
+    common::assert_killed("the killed child", child.wait().expect("reap"));
 }
 
 #[cfg(feature = "tokio")]
 #[skuld::test]
 async fn async_foreign_wait_timeout_zero_is_deterministic() {
-    let (child, _sock) = common::spawn_blocker();
+    let (child, sock) = common::spawn_blocker();
     let p = Process::from_pid(child.id().pid()).found().expect("resolves");
     assert!(
         !p.wait_timeout(std::time::Duration::ZERO).await.expect("poll"),
         "live child at ZERO"
     );
-    child.kill().expect("cleanup");
-    child.wait().expect("reap");
+    common::kill_release_reap(&child, sock);
 }
 
 #[cfg(feature = "tokio")]
 #[skuld::test]
 async fn async_foreign_wait_timeout_observes_an_exit() {
-    let (child, mut sock) = common::spawn_blocker();
+    let (child, sock) = common::spawn_blocker();
     let p = Process::from_pid(child.id().pid()).found().expect("resolves");
     child.kill().expect("kill");
-    expect_eof("blocker", &mut sock); // real exit event precedes the wait
+    // Released after the kill: a kill that sent nothing exits 0. The exit is waited for first, so
+    // `wait_timeout` observes an exit that already happened.
+    drop(sock);
+    common::assert_killed("the killed child", common::exit_status_once_exited(child.id().pid()));
     assert!(
         p.wait_timeout(std::time::Duration::from_secs(30)).await.expect("wait"),
         "exited child must report exited (30 s is the failure bound)"
     );
-    child.wait().expect("reap");
+    common::assert_killed("the killed child", child.wait().expect("reap"));
 }
 
 #[cfg(feature = "tokio")]
 #[skuld::test]
 async fn async_foreign_introspection_delegates() {
-    let (child, _sock) = common::spawn_blocker();
+    let (child, sock) = common::spawn_blocker();
     let p = Process::from_pid(child.id().pid()).found().expect("resolves");
     assert_eq!(p.id(), child.id());
     assert_eq!(p.is_alive(), cosca::identity::Liveness::Alive);
     assert_eq!(Process::from_id(p.id()).id(), p.id());
     assert_eq!(Process::from_id(p.id()).exists(), cosca::identity::Existence::Present);
-    child.kill().expect("cleanup");
-    child.wait().expect("reap");
+    common::kill_release_reap(&child, sock);
 }
 
 #[cfg(feature = "tokio")]
@@ -146,7 +148,7 @@ async fn async_foreign_kill_tree_tears_down_tree() {
     );
     let p = Process::from_pid(child.id().pid()).found().expect("resolves");
     p.kill_tree().expect("kill_tree");
-    // A kill that sent nothing fails here by assertion instead of hanging a read for an EOF.
+    // A kill that sent nothing fails here by assertion.
     common::assert_members_killed(vec![(root, "the root"), (grand, "the grandchild")]);
     let _ = child.wait();
 }
@@ -177,7 +179,7 @@ async fn async_foreign_graceful_shutdown_tree_tears_down_tree() {
 #[skuld::test]
 async fn async_foreign_unix_only_ops_are_unsupported_on_windows() {
     use std::time::Duration;
-    let (child, _sock) = common::spawn_blocker();
+    let (child, sock) = common::spawn_blocker();
     let p = Process::from_pid(child.id().pid()).found().expect("resolves");
     assert!(matches!(p.terminate(), Err(cosca::error::Error::Unsupported { .. })));
     assert!(matches!(
@@ -192,14 +194,15 @@ async fn async_foreign_unix_only_ops_are_unsupported_on_windows() {
         p.graceful_shutdown_tree(Duration::from_secs(1)).await,
         Err(cosca::error::Error::Unsupported { .. })
     ));
-    child.kill().expect("cleanup");
-    let _ = child.wait();
+    common::kill_release_reap(&child, sock);
 }
 
 #[path = "../src/test_harness.rs"]
 mod test_harness;
 
 fn main() {
+    #[cfg(feature = "tokio")]
+    common::install_log_capture();
     let mut runner = skuld::TestRunner::new();
     runner.libtest_names();
     runner.require_known_labels();

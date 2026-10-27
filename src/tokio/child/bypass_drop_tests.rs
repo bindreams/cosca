@@ -466,9 +466,9 @@ async fn a_failed_identity_peek_is_unknown_kills_the_child_and_forgets_the_tokio
     });
     let forgets = super::drop_fault::record();
     let backend_drops = super::fault::count_backend_drops();
-    let reaps = crate::child::spawn::fault::record_teardown_reaps();
     let mark = crate::log_capture::mark();
-    let (stdin, _writer) = crate::test_child::held_writer_stdin();
+    // Released after the kill: a kill that sent nothing exits 0.
+    let (stdin, reaps) = crate::child::spawn::fault::teardown_blocker_stdin();
     let mut cmd = Command::new();
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("stdin");
@@ -552,10 +552,10 @@ fn refused_kill_teardown(attach_failure: bool, armed_in_hook: Option<fn() -> Box
     fault::set_force_kill_failure_leaving_child_alive_as("teardown refused", std::io::ErrorKind::PermissionDenied);
     let forgets = super::drop_fault::record();
     let backend_drops = super::fault::count_backend_drops();
-    let reaps = fault::record_teardown_reaps();
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
-    let (stdin, _writer) = crate::test_child::held_writer_stdin();
+    // Released once the pidfd teardown's (landing) kill returned.
+    let (stdin, reaps) = fault::teardown_blocker_stdin();
     let mut cmd = Command::new();
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("stdin");

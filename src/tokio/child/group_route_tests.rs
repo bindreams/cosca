@@ -7,23 +7,32 @@ use crate::test_groups::{pidfd_group_signal, Group};
 #[skuld::test]
 async fn kill_tree_signals_the_group_through_the_root_pidfd(#[fixture(pidfd_group_signal)] _group: &Group) {
     crate::tokio::test_runtime::assert_current_thread();
-    let (mut child, _writer) = super::root_state_tests::session_blocker(true);
+    let (mut child, writer) = super::root_state_tests::session_blocker(true);
     let capture = Capture::start();
     child.kill_tree().expect("kill_tree");
     assert_through_the_pidfd(&capture.group_steps(), libc::SIGKILL);
-    child.wait().await.expect("reap the root");
+    // Released after the kill: a root nothing killed exits `0`.
+    drop(writer);
+    crate::test_child::assert_killed("the root", child.wait().await.expect("reap the root"));
 }
 
 /// Its `SIGTERM` kills the group's member. Mutant: "the send through the pidfd carries signal 0".
 #[skuld::test]
 async fn terminate_tree_signals_the_group_through_the_root_pidfd(#[fixture(pidfd_group_signal)] _group: &Group) {
     crate::tokio::test_runtime::assert_current_thread();
-    let (mut child, member) = super::group_exact_tests::root_with_a_member();
+    let (mut child, member, release) = super::group_exact_tests::releasable_root_with_a_member();
     let capture = Capture::start();
     child.terminate_tree().expect("terminate_tree");
     assert_through_the_pidfd(&capture.group_steps(), libc::SIGTERM);
+    // Released after the `SIGTERM`: a root nothing signalled exits `0`.
+    drop(release);
+    let status = child.wait().await.expect("reap the root");
     member.assert_killed();
-    child.wait().await.expect("reap the root");
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&status),
+        Some(libc::SIGTERM),
+        "the root must die of the SIGTERM: {status:?}"
+    );
 }
 
 /// Its `SIGTERM` kills the group's member before the sweep could. Mutant: "graceful sends no
@@ -34,8 +43,10 @@ async fn graceful_shutdown_tree_signals_the_group_through_the_root_pidfd(
 ) {
     use crate::child::group_exact_tests::EndedAtTheSigterm;
     crate::tokio::test_runtime::assert_current_thread();
-    let (mut child, member) = super::group_exact_tests::root_with_a_member();
+    let (mut child, member, release) = super::group_exact_tests::releasable_root_with_a_member();
     let ended = EndedAtTheSigterm::new(member);
+    // Released after the sweep (`release_at`): a root nothing signalled exits `0`.
+    let _released = crate::graceful_hooks::release_at(crate::graceful_hooks::HookPoint::BeforeReap, release);
     let capture = Capture::start();
     child
         .graceful_shutdown_tree(std::time::Duration::ZERO)
@@ -48,8 +59,11 @@ async fn graceful_shutdown_tree_signals_the_group_through_the_root_pidfd(
 #[skuld::test]
 async fn a_drop_kills_the_group_through_the_root_pidfd(#[fixture(pidfd_group_signal)] _group: &Group) {
     crate::tokio::test_runtime::assert_current_thread();
-    let (child, _writer) = super::root_state_tests::session_blocker(true);
+    let (child, writer) = super::root_state_tests::session_blocker(true);
+    // Released once the drop's root kill returned, before its reap.
+    let teardown = crate::child::spawn::fault::release_between_kill_and_wait(writer);
     let capture = Capture::start();
     drop(child);
     assert_through_the_pidfd(&capture.group_steps(), libc::SIGKILL);
+    teardown.assert_killed();
 }

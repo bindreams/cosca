@@ -11,7 +11,7 @@ use windows::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
 };
 
-use crate::error::Error;
+use crate::error::{win32_io_error, Error};
 use crate::identity::{HandleIdentity, Liveness, Opened, ProcessId};
 
 fn close(handle: HANDLE) {
@@ -19,6 +19,30 @@ fn close(handle: HANDLE) {
     // violation, asserted in debug.
     let closed = unsafe { CloseHandle(handle) };
     debug_assert!(closed.is_ok(), "CloseHandle of an owned process handle should not fail");
+}
+
+/// Whether `handle` still names `id`'s process. `Ok(false)`: the pid was recycled before the
+/// open, so the original is gone. The handle is closed on `Ok(false)` and on `Err`; on `Ok(true)`
+/// the caller still holds it.
+fn holds_process(handle: HANDLE, id: ProcessId) -> Result<bool, Error> {
+    match crate::identity::windows_handle_identity(handle, id) {
+        HandleIdentity::Same => Ok(true),
+        HandleIdentity::Different => {
+            close(handle);
+            Ok(false)
+        }
+        HandleIdentity::Unreadable(e) => {
+            log::warn!(
+                "wait: pid {} opened but its identity could not be verified ({e})",
+                id.pid()
+            );
+            close(handle);
+            Err(Error::Unassessable {
+                detail: format!("pid {} opened but its identity could not be verified", id.pid()),
+                source: Some(win32_io_error(e)),
+            })
+        }
+    }
 }
 
 pub(crate) fn block_until_exit(id: ProcessId, deadline: Option<Option<Instant>>) -> Result<bool, Error> {
@@ -42,7 +66,7 @@ pub(crate) fn block_until_exit(id: ProcessId, deadline: Option<Option<Instant>>)
                     );
                     Err(Error::Unassessable {
                         detail: format!("pid {} could not be opened to watch for its exit", id.pid()),
-                        source: Some(e.into()),
+                        source: Some(win32_io_error(e)),
                     })
                 }
             }
@@ -50,23 +74,8 @@ pub(crate) fn block_until_exit(id: ProcessId, deadline: Option<Option<Instant>>)
     };
     // The handle already in hand answers the recycle question with no race; a second by-pid
     // lookup would not.
-    match crate::identity::windows_handle_identity(handle, id) {
-        HandleIdentity::Same => {}
-        HandleIdentity::Different => {
-            close(handle);
-            return Ok(true); // recycled before open - the original is gone
-        }
-        HandleIdentity::Unreadable(e) => {
-            log::warn!(
-                "wait: pid {} opened but its identity could not be verified ({e})",
-                id.pid()
-            );
-            close(handle);
-            return Err(Error::Unassessable {
-                detail: format!("pid {} opened but its identity could not be verified", id.pid()),
-                source: Some(e.into()),
-            });
-        }
+    if !holds_process(handle, id)? {
+        return Ok(true); // recycled before open - the original is gone
     }
     // A WAIT_TIMEOUT is never trusted: recheck the real deadline each round (see win32_timeout_ms).
     // SAFETY: `handle` is a live process handle held for the wait's duration.
@@ -93,7 +102,12 @@ pub(crate) fn block_until_exit(id: ProcessId, deadline: Option<Option<Instant>>)
 pub(crate) fn new_cancel_event() -> Result<OwnedHandle, Error> {
     // SAFETY: creating an unnamed event has no preconditions; the handle is immediately
     // wrapped in an OwnedHandle, which closes it.
-    let h = unsafe { CreateEventW(None, true, false, None) }.map_err(|e| Error::Io(e.into()))?;
+    owned_event(unsafe { CreateEventW(None, true, false, None) })
+}
+
+/// The owned event, or the `CreateEventW` failure as its Win32 code.
+fn owned_event(created: windows::core::Result<HANDLE>) -> Result<OwnedHandle, Error> {
+    let h = created.map_err(|e| Error::Io(win32_io_error(e)))?;
     // SAFETY: `h` is a freshly created, owned event handle.
     Ok(unsafe { OwnedHandle::from_raw_handle(h.0 as _) })
 }
@@ -154,7 +168,7 @@ pub(crate) fn open_verified(id: ProcessId) -> Result<Option<HANDLE>, Error> {
                     );
                     Err(Error::Unassessable {
                         detail: format!("pid {} could not be opened to watch for its exit", id.pid()),
-                        source: Some(e.into()),
+                        source: Some(win32_io_error(e)),
                     })
                 }
             }
@@ -162,23 +176,8 @@ pub(crate) fn open_verified(id: ProcessId) -> Result<Option<HANDLE>, Error> {
     };
     // The handle already in hand answers the recycle question with no race; a second by-pid
     // lookup would not.
-    match crate::identity::windows_handle_identity(handle, id) {
-        HandleIdentity::Same => {}
-        HandleIdentity::Different => {
-            close(handle);
-            return Ok(None); // recycled before open - the original is gone
-        }
-        HandleIdentity::Unreadable(e) => {
-            log::warn!(
-                "wait: pid {} opened but its identity could not be verified ({e})",
-                id.pid()
-            );
-            close(handle);
-            return Err(Error::Unassessable {
-                detail: format!("pid {} opened but its identity could not be verified", id.pid()),
-                source: Some(e.into()),
-            });
-        }
+    if !holds_process(handle, id)? {
+        return Ok(None); // recycled before open - the original is gone
     }
     Ok(Some(handle))
 }
@@ -279,7 +278,7 @@ pub(crate) fn kill(id: ProcessId) -> Result<(), Error> {
                     );
                     Err(Error::Unassessable {
                         detail: format!("pid {} could not be opened to terminate it", id.pid()),
-                        source: Some(e.into()),
+                        source: Some(win32_io_error(e)),
                     })
                 }
             }
@@ -287,24 +286,15 @@ pub(crate) fn kill(id: ProcessId) -> Result<(), Error> {
     // Re-verify identity on the HELD handle: a pid recycled before the open pins the NEW
     // process, whose creation token will not match. An UNREADABLE token is not proof the
     // target is gone, so it must not report a successful kill.
-    match crate::identity::windows_handle_identity(handle, id) {
-        HandleIdentity::Same => {}
-        HandleIdentity::Different => {
-            close(handle);
-            return Ok(()); // pid recycled; the original is already gone
-        }
-        HandleIdentity::Unreadable(e) => {
-            log::warn!(
-                "wait: pid {} opened but its identity could not be verified ({e})",
-                id.pid()
-            );
-            close(handle);
-            return Err(Error::Unassessable {
-                detail: format!("pid {} opened but its identity could not be verified", id.pid()),
-                source: Some(e.into()),
-            });
-        }
+    if !holds_process(handle, id)? {
+        return Ok(()); // pid recycled; the original is already gone
     }
+    terminate_held(handle, id)
+}
+
+/// `TerminateProcess` on `handle`, which pins `id`'s process, then closes `handle`. A refusal on
+/// a provably dead process is success.
+fn terminate_held(handle: HANDLE, id: ProcessId) -> Result<(), Error> {
     // SAFETY: handle is live; close on every path.
     let res = unsafe { TerminateProcess(handle, 1) };
     // Re-check BEFORE close: the held handle pins the kernel object, so the by-pid resolve
@@ -322,7 +312,7 @@ pub(crate) fn kill(id: ProcessId) -> Result<(), Error> {
                 "wait: TerminateProcess(pid {}) failed and the target is not provably dead ({e})",
                 id.pid()
             );
-            Err(Error::Io(e.into()))
+            Err(Error::Io(win32_io_error(e)))
         }
     }
 }

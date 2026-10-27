@@ -39,10 +39,14 @@ fn a_spawn_under_an_outer_test_spawn_lock_panics_naming_the_reentry() {
     );
 }
 
+#[path = "common/mod.rs"]
+mod common;
+
 #[path = "../src/test_harness.rs"]
 mod test_harness;
 
 fn main() {
+    common::install_log_capture();
     let mut runner = skuld::TestRunner::new();
     runner.libtest_names();
     runner.require_known_labels();

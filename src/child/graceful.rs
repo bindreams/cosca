@@ -123,6 +123,8 @@ impl Child {
     /// the `SIGTERM` was sent, and the grace wait does not warn.
     pub fn graceful_shutdown(&self, grace: Duration) -> Result<ExitStatus, Error> {
         self.terminate()?;
+        #[cfg(test)]
+        fault::run_hook(fault::HookPoint::AfterTerminate);
 
         // Quiet about a zombie launchd holds: the refusal below is the one report of it.
         #[cfg(unix)]
@@ -569,6 +571,8 @@ pub(crate) mod fault {
 
     #[cfg(unix)]
     pub(crate) use crate::graceful_hooks::at;
+    #[cfg(windows)]
+    pub(crate) use crate::graceful_hooks::at_checked;
     pub(crate) use crate::graceful_hooks::{release_at, run_hook, HookPoint};
 
     /// RAII disarm for `FORCE_KILL_TREE_ERROR`: a test that arms this seam expecting the sweep
@@ -622,3 +626,7 @@ pub(crate) mod fault {
 #[cfg(test)]
 #[path = "graceful_tests.rs"]
 mod graceful_tests;
+
+#[cfg(all(test, windows))]
+#[path = "ctrl_break_tests.rs"]
+mod ctrl_break_tests;

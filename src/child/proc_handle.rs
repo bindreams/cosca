@@ -262,8 +262,12 @@ impl ProcHandle {
                     // Kill succeeded: reap the zombie with a bounded blocking wait (SIGKILL
                     // cannot be caught, so the child's exit is guaranteed — this is the
                     // sanctioned real-child-exit wait).
-                    StdTeardown::ReapBlocking => match s.wait() {
-                        Ok(_) => Torn::new(ChildFate::Reaped),
+                    StdTeardown::ReapBlocking => match wait_after_drop_kill(s) {
+                        Ok(_status) => {
+                            #[cfg(test)]
+                            crate::child::spawn::fault::record_teardown_reap(s.id(), _status);
+                            Torn::new(ChildFate::Reaped)
+                        }
                         Err(e) => {
                             let left = teardown_wait_failure(s.id(), &e);
                             #[cfg(unix)]
@@ -310,6 +314,13 @@ impl ProcHandle {
             ProcHandle::Raw(r) => r.teardown_on_drop(id),
         }
     }
+}
+
+/// The blocking reap that follows the drop's delivered kill.
+fn wait_after_drop_kill(s: &crate::child::shared::SharedChild) -> io::Result<std::process::ExitStatus> {
+    #[cfg(test)]
+    crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterDropKill);
+    s.wait()
 }
 
 /// A failed reap after a successful kill: `ECHILD` (someone else reaped the child) is expected

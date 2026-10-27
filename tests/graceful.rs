@@ -9,17 +9,11 @@ mod common;
 #[cfg(unix)]
 #[skuld::test]
 fn child_terminate_sends_sigterm() {
-    use std::io::Read;
     use std::os::unix::process::ExitStatusExt;
-    let (child, mut sock) = common::spawn_blocker();
+    let (child, sock) = common::spawn_blocker();
     child.terminate().expect("terminate sends SIGTERM");
-    // Prove death by a real event: the control socket EOFs.
-    let mut buf = [0u8; 1];
-    match sock.read(&mut buf) {
-        Ok(0) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
-        other => panic!("expected EOF/ConnectionReset after SIGTERM, got {other:?}"),
-    }
+    // Released after the signal: a terminate that sent nothing exits 0.
+    drop(sock);
     // Reap and assert it died by SIGTERM (soft), NOT SIGKILL.
     let status = child.wait().expect("reap");
     assert_eq!(
@@ -32,7 +26,7 @@ fn child_terminate_sends_sigterm() {
 #[cfg(windows)]
 #[skuld::test]
 fn child_terminate_unsupported_for_an_uncontained_child_on_windows() {
-    let (child, _sock) = common::spawn_blocker();
+    let (child, sock) = common::spawn_blocker();
     assert_eq!(
         child.graceful_mechanism(),
         cosca::GracefulMechanism::None,
@@ -42,59 +36,14 @@ fn child_terminate_unsupported_for_an_uncontained_child_on_windows() {
         .terminate()
         .expect_err("a child that leads no group cannot be addressed");
     assert!(matches!(err, cosca::error::Error::Unsupported { .. }), "got {err:?}");
-    child.kill().expect("cleanup");
-    let _ = child.wait();
-}
-
-#[cfg(unix)]
-#[skuld::test]
-fn child_graceful_shutdown_graceful_path() {
-    use std::io::Read;
-    use std::os::unix::process::ExitStatusExt;
-    use std::time::Duration;
-    // control-block dies on default-disposition SIGTERM. The long grace is the safety bound on
-    // a child that exits promptly — never the synchronization; correctness is the exit signal.
-    let (child, mut sock) = common::spawn_blocker();
-    let status = child
-        .graceful_shutdown(Duration::from_secs(30))
-        .expect("graceful_shutdown");
-    assert_eq!(
-        status.signal(),
-        Some(libc::SIGTERM),
-        "graceful path must exit via SIGTERM, got {status:?}"
-    );
-    let mut buf = [0u8; 1];
-    let _ = sock.read(&mut buf); // dead — EOF
-}
-
-#[cfg(unix)]
-#[skuld::test]
-fn child_graceful_shutdown_escalates() {
-    use std::io::Read;
-    use std::os::unix::process::ExitStatusExt;
-    use std::time::Duration;
-    // This child installs SIG_IGN for SIGTERM, so it NEVER exits on the soft signal. With
-    // Duration::ZERO the child is provably alive at the single poll → escalation to SIGKILL is
-    // deterministic (no timing dependency at all). Because SIGTERM is ignored, SIGKILL is the
-    // ONLY terminating signal the child can receive, so signal()==SIGKILL is unambiguous.
-    let (child, mut sock) = common::spawn_control("control-block-ignore-term", &["R"], false);
-    let status = child
-        .graceful_shutdown(Duration::ZERO)
-        .expect("graceful_shutdown escalates");
-    assert_eq!(
-        status.signal(),
-        Some(libc::SIGKILL),
-        "SIGTERM-ignoring child must be force-killed, got {status:?}"
-    );
-    let mut buf = [0u8; 1];
-    let _ = sock.read(&mut buf);
+    common::kill_release_reap(&child, sock);
 }
 
 #[cfg(windows)]
 #[skuld::test]
 fn child_graceful_shutdown_unsupported_for_an_uncontained_child_on_windows() {
     use std::time::Duration;
-    let (child, _sock) = common::spawn_blocker();
+    let (child, sock) = common::spawn_blocker();
     assert_eq!(
         child.graceful_mechanism(),
         cosca::GracefulMechanism::None,
@@ -104,75 +53,13 @@ fn child_graceful_shutdown_unsupported_for_an_uncontained_child_on_windows() {
         .graceful_shutdown(Duration::from_secs(1))
         .expect_err("a child that leads no group cannot be addressed");
     assert!(matches!(err, cosca::error::Error::Unsupported { .. }), "got {err:?}");
-    child.kill().expect("cleanup");
-    let _ = child.wait();
-}
-
-#[skuld::test]
-fn child_graceful_shutdown_tree_tears_down_tree() {
-    use std::io::Read;
-    use std::time::Duration;
-    // A contained 2-level tree (root R + grandchild G). The group's graceful signal
-    // (SIGTERM / CTRL_BREAK) plus the hard sweep tear down BOTH; both sockets EOF. All OSes.
-    let (child, mut socks) = common::spawn_grandchild(true);
-    child
-        .graceful_shutdown_tree(Duration::from_secs(30))
-        .expect("tree graceful");
-    for (i, s) in socks.iter_mut().enumerate() {
-        let mut buf = [0u8; 1];
-        match s.read(&mut buf) {
-            Ok(0) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
-            other => panic!("tree member {i} not torn down: {other:?}"),
-        }
-    }
-}
-
-#[cfg(unix)]
-#[skuld::test]
-fn child_graceful_shutdown_tree_graceful_root_sigterm() {
-    use std::io::Read;
-    use std::os::unix::process::ExitStatusExt;
-    use std::time::Duration;
-    // A contained control-block root that honors SIGTERM: the group signal makes it exit;
-    // the root's reaped status is SIGTERM (15), not escalated.
-    let (child, mut sock) = common::spawn_control("control-block", &["R"], true);
-    let status = child
-        .graceful_shutdown_tree(Duration::from_secs(30))
-        .expect("tree graceful");
-    assert_eq!(
-        status.signal(),
-        Some(libc::SIGTERM),
-        "root must exit via SIGTERM, got {status:?}"
-    );
-    let mut buf = [0u8; 1];
-    let _ = sock.read(&mut buf);
-}
-
-#[cfg(unix)]
-#[skuld::test]
-fn child_graceful_shutdown_tree_escalates() {
-    use std::io::Read;
-    use std::os::unix::process::ExitStatusExt;
-    use std::time::Duration;
-    // A contained SIGTERM-ignoring root: the group SIGTERM is ignored, so with Duration::ZERO
-    // the root is provably alive at the poll and the hard sweep (kill_tree) SIGKILLs it. SIGKILL
-    // is the only terminating signal it can receive (SIGTERM ignored), so the assertion is
-    // unambiguous.
-    let (child, mut sock) = common::spawn_control("control-block-ignore-term", &["R"], true);
-    let status = child.graceful_shutdown_tree(Duration::ZERO).expect("tree escalates");
-    assert_eq!(
-        status.signal(),
-        Some(libc::SIGKILL),
-        "ignored SIGTERM must escalate to SIGKILL, got {status:?}"
-    );
-    let mut buf = [0u8; 1];
-    let _ = sock.read(&mut buf);
+    common::kill_release_reap(&child, sock);
 }
 
 #[cfg(unix)]
 #[skuld::test]
 fn child_graceful_shutdown_tree_sweeps_survivor_after_graceful_root_exit() {
+    let _warns = common::warn_watch();
     use std::io::Read;
     use std::time::Duration;
     // The exact case the sweep-before-reap invariant protects: the root honors the group
@@ -255,15 +142,14 @@ fn process_graceful_shutdown_escalates() {
 #[skuld::test]
 fn process_lone_graceful_unsupported_on_windows() {
     use std::time::Duration;
-    let (child, _sock) = common::spawn_blocker();
+    let (child, sock) = common::spawn_blocker();
     let p = cosca::Process::from_pid(child.id().pid()).found().expect("resolves");
     assert!(matches!(p.terminate(), Err(cosca::error::Error::Unsupported { .. })));
     assert!(matches!(
         p.graceful_shutdown(Duration::from_secs(1)),
         Err(cosca::error::Error::Unsupported { .. })
     ));
-    child.kill().expect("cleanup");
-    let _ = child.wait();
+    common::kill_release_reap(&child, sock);
 }
 
 #[skuld::test]
@@ -280,7 +166,7 @@ fn process_kill_tree_tears_down_tree() {
     );
     let p = cosca::Process::from_pid(child.id().pid()).found().expect("resolves");
     p.kill_tree().expect("kill_tree");
-    // A kill that sent nothing fails here by assertion instead of hanging a read for an EOF.
+    // A kill that sent nothing fails here by assertion.
     common::assert_members_killed(vec![(root, "the root"), (grand, "the grandchild")]);
     let _ = child.wait(); // reap the owned root (grandchild is reaped by init)
 }
@@ -309,7 +195,7 @@ fn process_graceful_shutdown_tree_tears_down_tree() {
 #[skuld::test]
 fn process_soft_tree_unsupported_on_windows() {
     use std::time::Duration;
-    let (child, _sock) = common::spawn_blocker();
+    let (child, sock) = common::spawn_blocker();
     let p = cosca::Process::from_pid(child.id().pid()).found().expect("resolves");
     assert!(matches!(
         p.terminate_tree(),
@@ -319,8 +205,7 @@ fn process_soft_tree_unsupported_on_windows() {
         p.graceful_shutdown_tree(Duration::from_secs(1)),
         Err(cosca::error::Error::Unsupported { .. })
     ));
-    child.kill().expect("cleanup");
-    let _ = child.wait();
+    common::kill_release_reap(&child, sock);
 }
 
 // GracefulMechanism =====
@@ -331,16 +216,16 @@ fn process_soft_tree_unsupported_on_windows() {
 #[cfg(unix)]
 #[skuld::test]
 fn graceful_mechanism_is_process_on_unix() {
+    let _warns = common::warn_watch();
     use cosca::GracefulMechanism;
 
-    let (uncontained, _s1) = common::spawn_blocker();
-    let (contained, _s2) = common::spawn_control("control-block", &["R"], true);
+    let (uncontained, s1) = common::spawn_blocker();
+    let (contained, s2) = common::spawn_control("control-block", &["R"], true);
     assert_eq!(uncontained.graceful_mechanism(), GracefulMechanism::Process);
     assert_eq!(contained.graceful_mechanism(), GracefulMechanism::Process);
-    for child in [uncontained, contained] {
-        child.kill().expect("cleanup");
-        let _ = child.wait();
-    }
+    common::kill_release_reap(&uncontained, s1);
+    // The group, before the reap: a contained child reaped first and then dropped warns (#382).
+    common::kill_tree_release_reap(&contained, s2);
 }
 
 /// On Windows the two must DISAGREE: containment is what sets `CREATE_NEW_PROCESS_GROUP`, so an
@@ -349,96 +234,29 @@ fn graceful_mechanism_is_process_on_unix() {
 #[cfg(windows)]
 #[skuld::test]
 fn graceful_mechanism_distinguishes_contained_from_uncontained_on_windows() {
+    let _warns = common::warn_watch();
     use cosca::GracefulMechanism;
 
-    let (uncontained, _s1) = common::spawn_blocker();
-    let (contained, _s2) = common::spawn_control("control-block", &["R"], true);
+    let (uncontained, s1) = common::spawn_blocker();
+    let (contained, s2) = common::spawn_control("control-block", &["R"], true);
     assert_eq!(uncontained.graceful_mechanism(), GracefulMechanism::None);
     assert_eq!(contained.graceful_mechanism(), GracefulMechanism::ConsoleGroup);
-    for child in [uncontained, contained] {
-        child.kill().expect("cleanup");
-        let _ = child.wait();
+    for (child, sock) in [(uncontained, s1), (contained, s2)] {
+        common::kill_release_reap(&child, sock);
     }
 }
 
 // The lone graceful ops on a console-group child =====
-
-/// Delivery is proved by a byte the CHILD's own console-ctrl handler writes — never by the Win32
-/// return value, which reports success for an event that reached nobody. The child survives its
-/// break by design (its handler reports "handled"), so the read cannot race a teardown.
-#[cfg(windows)]
-#[skuld::test]
-fn child_terminate_delivers_ctrl_break_to_a_contained_root() {
-    use std::io::Read;
-
-    use cosca::GracefulMechanism;
-
-    let (child, mut sock) = common::spawn_control("control-block-ack-break", &["R"], true);
-    assert_eq!(child.graceful_mechanism(), GracefulMechanism::ConsoleGroup);
-    // A MEASURED precondition, so the blocking read below cannot hang on a vacuous scenario.
-    assert_eq!(
-        common::in_our_console(child.id().pid()),
-        Some(true),
-        "the root must share our console for the event to be deliverable"
-    );
-    child.terminate().expect("terminate a console-group child");
-    let mut ack = [0u8; 1];
-    sock.read_exact(&mut ack).expect("the child must acknowledge the break");
-    assert_eq!(&ack, b"B", "wrong ack byte");
-    // The root survives the break by design; releasing it ends the wait either way, and exit code 1
-    // (kill) tells it from a clean exit on release (0).
-    child.kill_tree().expect("kill_tree");
-    drop(sock);
-    let status = child.wait().expect("reap");
-    assert_eq!(status.code(), Some(1), "kill_tree must kill the root, got {status:?}");
-}
-
-/// The graceful path end to end: no handler, so the default disposition applies and the child
-/// dies to the console event. `0xC000013A` discriminates against `1` (this crate's escalation)
-/// and `0xC0000142` (a signal that landed before the child could handle it).
-#[cfg(windows)]
-#[skuld::test]
-fn child_graceful_shutdown_exits_via_ctrl_break_on_windows() {
-    use std::time::Duration;
-
-    // The long grace is a failure bound on the child's own exit, never the synchronization.
-    let (child, _sock) = common::spawn_control("control-block", &["R"], true);
-    let status = child
-        .graceful_shutdown(Duration::from_secs(30))
-        .expect("graceful_shutdown on a console-group child");
-    assert_eq!(
-        status.code(),
-        Some(0xC000013A_u32 as i32),
-        "the child must die to the console event, got {status:?}"
-    );
-}
-
-/// `Duration::ZERO` makes the escalation deterministic — the break-ignoring child is provably
-/// alive at the single poll — so code `1` is this crate's kill and nothing else.
-#[cfg(windows)]
-#[skuld::test]
-fn child_graceful_shutdown_escalates_when_the_break_is_ignored() {
-    use std::time::Duration;
-
-    let (child, _sock) = common::spawn_control("control-block-ignore-break", &["R"], true);
-    let status = child
-        .graceful_shutdown(Duration::ZERO)
-        .expect("graceful_shutdown escalates");
-    assert_eq!(
-        status.code(),
-        Some(1),
-        "a break-ignoring child must be force-killed, got {status:?}"
-    );
-}
 
 /// The parity contract, deliberately not `cfg`-gated so it is one test rather than two: the
 /// `Child` pins the pid for its whole life, so an already-exited child is `Ok` on every
 /// platform.
 #[skuld::test]
 fn child_terminate_reports_ok_for_an_already_exited_child() {
-    let (child, _sock) = common::spawn_control("control-block", &["R"], true);
-    child.kill().expect("kill");
-    let _status = child.wait().expect("reap");
+    let _warns = common::warn_watch();
+    let (child, sock) = common::spawn_control("control-block", &["R"], true);
+    // `kill_tree`, not `kill`: reaping a contained root first and then dropping it warns (#382).
+    common::kill_tree_release_reap(&child, sock);
     child.terminate().expect("already-dead must be Ok");
 }
 
@@ -450,6 +268,7 @@ fn child_terminate_reports_ok_for_an_already_exited_child() {
 #[cfg(windows)]
 #[skuld::test]
 fn child_graceful_ops_report_success_for_a_child_that_shares_no_console() {
+    let _warns = common::warn_watch();
     use std::io::Read;
     use std::time::Duration;
 
@@ -485,54 +304,6 @@ fn child_graceful_ops_report_success_for_a_child_that_shares_no_console() {
     let _ = child.wait();
 }
 
-/// The lone graceful shutdown's two halves have different radii on Windows: the cooperative
-/// signal reaches the child's whole console group, the escalation reaches only the child. The
-/// root here ignores the break (so only the escalation can have ended it) while its grandchild —
-/// an ordinary spawn that stayed in the root's group — acks the break and survives.
-#[cfg(windows)]
-#[skuld::test]
-fn child_graceful_shutdown_signals_the_group_but_only_kills_the_child() {
-    use std::io::Read;
-    use std::time::Duration;
-
-    use cosca::containment::TreeDrain;
-
-    let (child, socks) = common::spawn_tree("spawn-grandchild-ack-break", true);
-    let [_root_sock, grand_sock]: [_; 2] = socks.try_into().expect("a root and a grandchild socket");
-    let mut grand = common::Member::new(
-        grand_sock,
-        common::last_reported_grandchild().expect("the grandchild's pid"),
-    );
-    let status = child
-        .graceful_shutdown(Duration::ZERO)
-        .expect("graceful_shutdown on a console-group root");
-    assert_eq!(
-        status.code(),
-        Some(1),
-        "the root ignores the break, so only the escalation can have ended it, got {status:?}"
-    );
-    // Positive proof the cooperative half reached a descendant the forced half will not touch.
-    // The grandchild's handler reports "handled", so this read cannot race its death.
-    let mut ack = [0u8; 1];
-    grand
-        .sock
-        .read_exact(&mut ack)
-        .expect("the grandchild must acknowledge the break");
-    assert_eq!(&ack, b"B", "wrong ack byte");
-    // The job object's own live-member count: a kernel-authoritative, non-blocking verdict that
-    // the grandchild is still running after a graceful_shutdown that returned Ok.
-    assert_eq!(
-        child.wait_tree_timeout(Duration::ZERO).expect("drain verdict"),
-        TreeDrain::MembersRemain,
-        "the escalation must not have reached the group"
-    );
-    // The grandchild survived the break and holds its socket, so it ends only by the kill. The
-    // root is already dead.
-    child.kill_tree().expect("kill_tree");
-    common::assert_members_killed(vec![(grand, "the grandchild")]);
-    let _ = child.wait();
-}
-
 /// The case this capability exists for, end to end: a nested contained Windows child owns no
 /// tree, leads a console process group of its own, and had no cooperative shutdown at all.
 /// `break=1` is reachable only if that child's own handler acknowledged an event no tree op on
@@ -541,6 +312,7 @@ fn child_graceful_shutdown_signals_the_group_but_only_kills_the_child() {
 #[cfg(windows)]
 #[skuld::test]
 fn nested_delegated_child_can_be_gracefully_terminated() {
+    let _warns = common::warn_watch();
     use std::io::Read;
     use std::net::TcpListener;
 
@@ -589,6 +361,7 @@ fn nested_delegated_child_can_be_gracefully_terminated() {
 mod test_harness;
 
 fn main() {
+    common::install_log_capture();
     let mut runner = skuld::TestRunner::new();
     runner.libtest_names();
     runner.require_known_labels();

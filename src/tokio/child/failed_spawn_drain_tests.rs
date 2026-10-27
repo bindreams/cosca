@@ -24,12 +24,15 @@ async fn a_failed_elevation_writes_drain_warns_once_past_1s() {
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(crate::Stdio::null()).expect("set stdout");
     let mut child = cmd.spawn().expect("spawn");
-    let _stdin = child.stdin().expect("piped stdin");
+    // The cleanup's thread arms the release: the hook is thread-local.
+    let stdin = child.stdin().expect("piped stdin");
 
     // The cleanup runs on a thread of its own, as a failed spawn's does outside a runtime's tasks.
     let (failed, warns_at_release, levels, removed) = std::thread::scope(|s| {
         s.spawn(move || {
             let _warn = crate::tokio::child::fault::warn_slow_teardowns();
+            // Released once the cleanup's root kill returned, before its reap.
+            let teardown = crate::child::spawn::fault::release_between_kill_and_wait(stdin);
             let name = "cosca-failed-write-slow-drain";
             let (fake, leaf) = linux::fake_leaf(name, true);
             let child = linux::contained_by(child, leaf);
@@ -60,6 +63,7 @@ async fn a_failed_elevation_writes_drain_warns_once_past_1s() {
                     .map(drop)
                     .is_err();
             leaf_fault::take_rmdir_hook();
+            teardown.assert_killed();
             (
                 failed,
                 warns_at_release.get(),

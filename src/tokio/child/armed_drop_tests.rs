@@ -5,6 +5,7 @@
 use crate::error::ChildFate;
 #[cfg(target_os = "linux")]
 use crate::test_groups::{tracer_group, Group};
+use crate::tokio::child::child_drop_tests::released_blocker;
 use crate::tokio::child::Child;
 
 /// A kill-on-drop root that only a kill or a closed stdin ends, in no containment.
@@ -74,21 +75,26 @@ impl Root {
 /// Mutant: no reap.
 #[skuld::test]
 async fn tokio_armed_drop_reaps_before_returning() {
-    let (child, _stdin) = blocker();
-    let root = Root::of(&child);
-    drop(child);
-    assert!(root.reaped(), "the armed drop must reap the root before it returns");
-
-    let (mut child, _stdin) = blocker();
-    assert_eq!(child.tear_down_now(), ChildFate::Reaped);
-
-    let (mut child, _stdin) = blocker();
+    {
+        let (child, teardown) = released_blocker();
+        let root = Root::of(&child);
+        drop(child);
+        assert!(root.reaped(), "the armed drop must reap the root before it returns");
+        teardown.assert_killed();
+    }
+    {
+        let (mut child, teardown) = released_blocker();
+        assert_eq!(child.tear_down_now(), ChildFate::Reaped);
+        teardown.assert_killed();
+    }
+    let (mut child, teardown) = released_blocker();
     let root = Root::of(&child);
     assert_eq!(child.tear_down_awaiting().await, ChildFate::Reaped);
     assert!(
         root.reaped(),
         "the awaited teardown must reap the root before it returns"
     );
+    teardown.assert_killed();
 }
 
 /// An awaited teardown that cannot watch the root's exit (the reactor refuses the registration)
@@ -97,20 +103,23 @@ async fn tokio_armed_drop_reaps_before_returning() {
 /// Mutant: a failed watch forgets the root, which is left an unreaped zombie.
 #[skuld::test]
 async fn an_awaited_teardown_that_cannot_watch_the_exit_reaps_as_the_drop_does() {
-    let (mut child, _stdin) = blocker();
+    let (mut child, teardown) = released_blocker();
     let root = Root::of(&child);
     let _refused = super::fault::fail_reap_watch();
     assert_eq!(child.tear_down_awaiting().await, ChildFate::Reaped);
     assert!(root.reaped(), "the teardown must reap the root");
+    teardown.assert_killed();
 }
 
 /// Spawns a blocker on `rt`, drops it there, and says whether the root was reaped by then.
 fn dropped_and_reaped_on(rt: &::tokio::runtime::Runtime, local: bool) -> bool {
     let body = async {
-        let (child, _stdin) = blocker();
+        let (child, teardown) = released_blocker();
         let root = Root::of(&child);
         drop(child);
-        root.reaped()
+        let reaped = root.reaped();
+        teardown.assert_killed();
+        reaped
     };
     if local {
         ::tokio::task::LocalSet::new().block_on(rt, body)
@@ -163,11 +172,12 @@ async fn tokio_armed_drop_of_a_tree_with_a_dying_descendant_removes_the_leaf() {
     let (fake, leaf) = linux::fake_leaf(name, true);
     let events = fake.events.clone();
     let _release = leaf_fault::set_before_drain_block(move || FakeLeaf::set_populated(&events, false));
-    let (child, _stdin) = blocker();
+    let (child, teardown) = released_blocker();
     let (steps, levels) = linux::dropped(linux::contained_by(child, leaf), name);
 
     assert!(!fake.leaf.exists(), "the drained leaf must be removed: {steps:?}");
     assert_eq!(levels, Vec::<log::Level>::new(), "{steps:?}");
+    teardown.assert_killed();
 }
 
 /// A root that a foreign tracer holds as a zombie cannot be reaped until the tracer lets go: the
@@ -181,7 +191,7 @@ async fn tokio_armed_drop_warns_once_when_the_reap_waits_past_1s(#[fixture(trace
     use crate::test_support::foreign_tracer::{self, await_blocked_or_finished, Holder, REAP};
 
     crate::log_capture::install();
-    let (child, _stdin) = foreign_tracer::spawn_tokio_tracee().await;
+    let (child, stdin) = foreign_tracer::spawn_tokio_tracee().await;
     let pid = child.id().pid();
     let root = Root::of(&child);
     let mut tracer = foreign_tracer::spawn_helper(pid);
@@ -197,7 +207,11 @@ async fn tokio_armed_drop_warns_once_when_the_reap_waits_past_1s(#[fixture(trace
                 .send(rustix::thread::gettid().as_raw_nonzero().get())
                 .expect("report the tid");
             let _warn = super::fault::warn_slow_teardowns();
+            // The hooks are this thread's: released once the drop's kill returned, so a kill that sent
+            // nothing fails the assertion below instead of leaving the reap to wait on the root.
+            let teardown = crate::child::spawn::fault::release_between_kill_and_wait(stdin);
             drop(child);
+            teardown.assert_killed();
         });
         let tid = tid_rx.recv().expect("the dropper's tid");
         let holder = await_blocked_or_finished(tid);
@@ -258,13 +272,14 @@ async fn tokio_armed_drop_whose_tree_kill_fails_does_not_wait_for_the_drain() {
         flag.set(true);
         FakeLeaf::set_populated(&events, false);
     });
-    let (child, _stdin) = blocker();
+    let (child, teardown) = released_blocker();
     let root = Root::of(&child);
     let mark = crate::log_capture::mark();
     let (steps, levels) = linux::dropped(linux::contained_by(child, leaf), name);
     drop(failing.borrow_mut().take());
 
     assert!(root.reaped(), "the root's own kill landed, so it is reaped: {steps:?}");
+    teardown.assert_killed();
     assert!(!waited.get(), "nothing may wait for the drain: {steps:?}");
     assert!(fake.leaf.exists(), "the undrained leaf is left behind: {steps:?}");
     assert_eq!(
@@ -357,14 +372,15 @@ fn a_failed_run_to_completion_helper_awaits_its_teardown() {
             FakeLeaf::set_populated(&events, false);
         }
     };
-    let error = rt.block_on(async {
-        let (child, _stdin) = blocker();
+    let (error, teardown) = rt.block_on(async {
+        let (child, teardown) = released_blocker();
         let mut child = linux::contained_by(child, leaf);
         let failed =
             crate::tokio::command::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), &mut child);
-        ::tokio::join!(failed, other_task).0
+        (::tokio::join!(failed, other_task).0, teardown)
     });
     leaf_fault::take_rmdir_hook();
+    teardown.assert_killed();
 
     assert_eq!(
         released_by.get(),
@@ -402,8 +418,8 @@ fn a_dropped_awaited_teardown_finishes_as_the_drop_would() {
     let _tree_kill_fails = leaf_fault::fail_next_kill_write();
     let pending = super::fault::pend_awaited_reap();
     let mark = crate::log_capture::mark();
-    let root = rt.block_on(async {
-        let (child, _stdin) = blocker();
+    let (root, released) = rt.block_on(async {
+        let (child, released) = released_blocker();
         let root = Root::of(&child);
         let mut child = linux::contained_by(child, leaf);
         let mut teardown = std::pin::pin!(child.tear_down_awaiting());
@@ -412,9 +428,10 @@ fn a_dropped_awaited_teardown_finishes_as_the_drop_would() {
             _ = &mut teardown => panic!("the awaited reap never completes"),
             () = std::future::ready(()) => {}
         }
-        root
+        (root, released)
     });
     leaf_fault::take_rmdir_hook();
+    released.assert_killed();
 
     assert!(pending.taken(), "the teardown must have been awaiting the reap");
     assert_eq!(
@@ -449,8 +466,8 @@ fn a_teardown_dropped_during_the_drain_warns_once() {
     let _draining = leaf_fault::set_before_drain_block(move || {
         _ = draining_tx.send(());
     });
-    let (fate, warned_at_release, release) = rt.block_on(async {
-        let (child, _stdin) = blocker();
+    let (fate, warned_at_release, release, killed) = rt.block_on(async {
+        let (child, killed) = released_blocker();
         let needle = format!("async child {}", child.id().pid());
         let (warned_at_release, release) = release_from_the_blocking_wait(&fake, name, needle, mark);
         let mut child = linux::contained_by(child, leaf);
@@ -460,10 +477,11 @@ fn a_teardown_dropped_during_the_drain_warns_once() {
             fate = teardown => Some(fate),
             _ = draining_rx => None,
         };
-        (fate, warned_at_release, release)
+        (fate, warned_at_release, release, killed)
     });
     leaf_fault::take_rmdir_hook();
     drop(release.borrow_mut().take());
+    killed.assert_killed();
 
     assert_eq!(fate, None, "the teardown must still be awaiting the drain");
     assert_eq!(
@@ -499,15 +517,16 @@ fn a_teardown_whose_drain_watch_fails_warns_once() {
     let mark = crate::log_capture::mark();
     let _warn = super::fault::warn_slow_teardowns_after(std::time::Duration::ZERO);
     let _watch_fails = super::fault::fail_drain_watch();
-    let (fate, warned_at_release, release) = rt.block_on(async {
-        let (child, _stdin) = blocker();
+    let (fate, warned_at_release, release, killed) = rt.block_on(async {
+        let (child, killed) = released_blocker();
         let needle = format!("async child {}", child.id().pid());
         let (warned_at_release, release) = release_from_the_blocking_wait(&fake, name, needle, mark);
         let mut child = linux::contained_by(child, leaf);
-        (child.tear_down_awaiting().await, warned_at_release, release)
+        (child.tear_down_awaiting().await, warned_at_release, release, killed)
     });
     leaf_fault::take_rmdir_hook();
     drop(release.borrow_mut().take());
+    killed.assert_killed();
 
     assert_eq!(fate, ChildFate::Reaped);
     assert_eq!(

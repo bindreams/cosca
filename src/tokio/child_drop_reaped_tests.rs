@@ -7,8 +7,11 @@
 //! sends it never reaches a real group. The recorder is thread-local and skuld's default
 //! runtime is current-thread, so the drop's kill runs on the recording thread.
 
+use crate::child::spawn::fault::{release_between_kill_and_wait, TeardownBlocker};
 use crate::containment::treewalk::fault::record_walks;
-use crate::containment::unix::fault::record_kill_group;
+use crate::containment::unix::fault::{record_kill_group, record_term_group};
+use crate::send_log::Capture;
+use crate::signal::Sig;
 #[cfg(target_os = "linux")]
 use crate::test_groups::{cgroup, Group};
 use crate::tokio::child::drop_fault;
@@ -30,6 +33,30 @@ fn session(argv: &[&str]) -> Command {
     cmd.args(argv.iter().copied());
     cmd.contain_with(ContainMode::Session);
     cmd
+}
+
+/// A session-contained [`BLOCKER_ARGV`](crate::test_child::BLOCKER_ARGV) command with piped stdin.
+/// A test that kills it takes the writer and drops it only after the kill: dropping the writer is
+/// the only way for the blocker to end on its own (status 0), so a `kill` that sent nothing fails the
+/// assertion on how the root ended, instead of leaving a wait unbounded.
+fn session_blocker_cmd() -> Command {
+    let mut cmd = session(crate::test_child::BLOCKER_ARGV);
+    cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
+    cmd
+}
+
+/// What the drop did to a [`session_blocker_cmd`] root `pid`, once the drop has run: `teardown`
+/// released its stdin once the drop's kill returned, so a root nothing killed exited `0` and the drop
+/// reaped it. The reap must show the drop's kill, and `sends` (logged after the syscall) must hold
+/// the `SIGKILL` to `pid`.
+#[track_caller]
+fn assert_the_drop_killed(teardown: &TeardownBlocker, sends: &Capture, pid: u32) {
+    teardown.assert_killed();
+    assert!(
+        sends.sent(pid, Sig::Kill),
+        "the drop must send the root SIGKILL: {:?}",
+        sends.entries()
+    );
 }
 
 fn drop_warns_since(mark: usize) -> Vec<(log::Level, String)> {
@@ -83,15 +110,18 @@ async fn dropping_a_running_process_group_child_still_kills_the_group_and_does_n
     crate::log_capture::install();
     let recorder = record_kill_group();
     let root = drop_fault::record();
-    let child = session(&["sleep", "300"]).spawn().expect("spawn");
+    let mut child = session_blocker_cmd().spawn().expect("spawn");
+    let teardown = release_between_kill_and_wait(child.stdin().expect("stdin pipe"));
     let pid = child.id().pid();
 
+    let sends = Capture::start();
     let mark = crate::log_capture::mark();
     drop(child);
 
     recorder.assert_killed_only(pid as i32);
     assert_eq!((root.kills(), root.forgets()), (1, 0));
     assert_eq!(drop_warns_since(mark), []);
+    assert_the_drop_killed(&teardown, &sends, pid);
 }
 
 /// A root that exited but is not reaped is a zombie: it still pins its group number, so the group
@@ -101,10 +131,12 @@ async fn dropping_an_exited_but_unreaped_process_group_child_still_kills_the_gro
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let recorder = record_kill_group();
-    let mut child = session(&["sleep", "300"]).spawn().expect("spawn");
+    let mut child = session_blocker_cmd().spawn().expect("spawn");
+    let stdin = child.stdin().expect("stdin pipe");
     let pid = child.id().pid();
     child.kill().expect("kill the root");
-    crate::test_child::wait_until_zombie(pid);
+    drop(stdin);
+    crate::test_child::assert_zombie_sigkilled("the root", pid);
 
     let mark = crate::log_capture::mark();
     drop(child);
@@ -153,9 +185,11 @@ async fn dropping_a_running_tree_walk_child_walks_from_its_pid_and_does_not_warn
     crate::log_capture::install();
     let walks = record_walks();
     let mut cmd = Command::new();
-    cmd.args(["sleep", "300"]);
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
     cmd.contain_with(ContainMode::TreeWalk);
-    let child = cmd.spawn().expect("spawn");
+    let mut child = cmd.spawn().expect("spawn");
+    let teardown = release_between_kill_and_wait(child.stdin().expect("stdin pipe"));
     let pid = child.id().pid();
 
     let mark = crate::log_capture::mark();
@@ -165,6 +199,7 @@ async fn dropping_a_running_tree_walk_child_walks_from_its_pid_and_does_not_warn
     let walked = walks.walked();
     assert!(!walked.is_empty() && walked.iter().all(|w| *w == pid), "{walked:?}");
     assert_eq!(drop_warns_since(mark), []);
+    teardown.assert_killed();
 }
 
 /// A root reaped by someone else is invisible to tokio's own state (it stays `Running` until
@@ -178,14 +213,7 @@ async fn dropping_a_foreign_reaped_process_group_child_sends_no_killpg() {
     crate::log_capture::install();
     let recorder = record_kill_group();
     let root = drop_fault::record();
-    let mut child = session(&["sleep", "300"]).spawn().expect("spawn");
-    let pid = child.id().pid();
-    child.kill().expect("kill the root");
-    crate::test_child::wait_until_zombie(pid);
-    let mut status = 0;
-    // SAFETY: `pid` is this test's own zombie child. This plays the application that reaps it.
-    let reaped = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
-    assert_eq!(reaped, pid as libc::pid_t, "{}", std::io::Error::last_os_error());
+    let child = foreign_reaped(session_blocker_cmd());
 
     let mark = crate::log_capture::mark();
     drop(child);
@@ -204,13 +232,15 @@ async fn dropping_a_foreign_reaped_process_group_child_sends_no_killpg() {
     assert!(warns[0].1.contains("leaks"), "{warns:?}");
 }
 
-/// A spawned `sleep` whose root something else (the application's own `waitpid`) has reaped,
+/// A spawned blocker whose root something else (the application's own `waitpid`) has reaped,
 /// while the handle still reads it as running.
 fn foreign_reaped(mut cmd: Command) -> crate::tokio::Child {
     let mut child = cmd.spawn().expect("spawn");
+    let stdin = child.stdin().expect("stdin pipe");
     let pid = child.id().pid();
     child.kill().expect("kill the root");
-    crate::test_child::wait_until_zombie(pid);
+    drop(stdin);
+    crate::test_child::assert_zombie_sigkilled("the root", pid);
     let mut status = 0;
     // SAFETY: `pid` is this test's own zombie child. This plays the application that reaps it.
     let reaped = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
@@ -227,7 +257,7 @@ async fn a_detached_drop_after_a_foreign_reap_forgets_tokios_child() {
     crate::log_capture::install();
     let root = drop_fault::record();
     let backend_drops = crate::tokio::child::fault::count_backend_drops();
-    let mut child = foreign_reaped(session(&["sleep", "300"]));
+    let mut child = foreign_reaped(session_blocker_cmd());
     child.detach();
     drop(child);
     assert_eq!(
@@ -244,7 +274,7 @@ async fn a_kill_on_drop_false_drop_after_a_foreign_reap_forgets_tokios_child() {
     crate::log_capture::install();
     let root = drop_fault::record();
     let backend_drops = crate::tokio::child::fault::count_backend_drops();
-    let mut cmd = session(&["sleep", "300"]);
+    let mut cmd = session_blocker_cmd();
     cmd.kill_on_drop(false);
     let child = foreign_reaped(cmd);
     drop(child);
@@ -275,19 +305,30 @@ async fn drop_after_kill_tree_and_wait_skips_at_debug_and_does_not_warn() {
 }
 
 /// `graceful_shutdown_tree` sweeps with `kill_tree` and reaps the root, so its drop is quiet too.
+///
+/// The root's stdin is released via `release_at` after `terminate_tree` returns; a `terminate_tree`
+/// that sent nothing yields status 0 and fails the status assertion.
 #[skuld::test]
 async fn drop_after_graceful_shutdown_tree_skips_at_debug_and_does_not_warn() {
+    use std::os::unix::process::ExitStatusExt as _;
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let recorder = record_kill_group();
-    let mut child = session(&["sleep", "300"]).spawn().expect("spawn");
+    let mut child = session_blocker_cmd().spawn().expect("spawn");
+    let stdin = child.stdin().expect("stdin pipe");
     let pid = child.id().pid();
-    child
+    let _release = crate::graceful_hooks::release_at(crate::graceful_hooks::HookPoint::AfterTerminate, stdin);
+    let status = child
         .graceful_shutdown_tree(std::time::Duration::from_secs(60))
         .await
         .expect("graceful_shutdown_tree");
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGTERM),
+        "the root dies to the group's SIGTERM: {status:?}"
+    );
     recorder.assert_killed_only(pid as i32);
 
     let mark = crate::log_capture::mark();
@@ -305,7 +346,10 @@ async fn a_failed_elevated_spawns_cleanup_drops_its_handle_without_a_warn() {
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let recorder = record_kill_group();
-    let child = session(&["sleep", "300"]).spawn().expect("spawn");
+    let mut child = session_blocker_cmd().spawn().expect("spawn");
+    // Released once the cleanup's root kill returned, before its reap.
+    let stdin = child.stdin().expect("piped stdin");
+    let teardown = crate::child::spawn::fault::release_between_kill_and_wait(stdin);
     let pid = child.id().pid();
 
     let mark = crate::log_capture::mark();
@@ -323,16 +367,19 @@ async fn a_failed_elevated_spawns_cleanup_drops_its_handle_without_a_warn() {
         "the group's kill and the root's reap"
     );
     recorder.assert_killed_only(pid as i32);
+    teardown.assert_killed();
     // The cleanup disarmed the handle (tree and root settled), so its drop reads nothing and logs
     // nothing: not a warn, and not a skip record either.
     assert_eq!(drop_warns_since(mark), []);
 }
 
-/// A `sleep` root, killed and then waited for, so that only `wait()` marks tokio's state.
-async fn waited_on_sleep_root() -> crate::tokio::Child {
-    let mut child = session(&["sleep", "300"]).spawn().expect("spawn");
+/// A blocker root, killed and then waited for, so that only `wait()` marks tokio's state.
+async fn waited_on_blocker_root() -> crate::tokio::Child {
+    let mut child = session_blocker_cmd().spawn().expect("spawn");
+    let stdin = child.stdin().expect("stdin pipe");
     child.kill().expect("kill the root");
-    child.wait().await.expect("reap the root");
+    drop(stdin);
+    crate::test_child::assert_killed("the root", child.wait().await.expect("reap the root"));
     child
 }
 
@@ -346,7 +393,7 @@ async fn dropping_a_waited_on_child_whose_number_reads_unknown_still_sends_no_ki
     crate::log_capture::install();
     let recorder = record_kill_group();
     let root = drop_fault::record();
-    let child = waited_on_sleep_root().await;
+    let child = waited_on_blocker_root().await;
     let _unknown = crate::child::fault::force_next_root_read(crate::identity::Resolved::Unknown);
 
     let mark = crate::log_capture::mark();
@@ -365,10 +412,12 @@ async fn dropping_an_unreaped_child_whose_number_reads_unknown_kills_and_logs_th
     crate::log_capture::install();
     let recorder = record_kill_group();
     let root = drop_fault::record();
-    let child = session(&["sleep", "300"]).spawn().expect("spawn");
+    let mut child = session_blocker_cmd().spawn().expect("spawn");
+    let teardown = release_between_kill_and_wait(child.stdin().expect("stdin pipe"));
     let pid = child.id().pid();
     let _unknown = crate::child::fault::force_next_root_read(crate::identity::Resolved::Unknown);
 
+    let sends = Capture::start();
     let mark = crate::log_capture::mark();
     drop(child);
 
@@ -378,6 +427,7 @@ async fn dropping_an_unreaped_child_whose_number_reads_unknown_kills_and_logs_th
     let reads = crate::log_capture::records_since_on_current_thread(mark, "could not be read");
     assert_eq!(reads.len(), 1, "{reads:?}");
     assert_eq!(reads[0].0, log::Level::Debug);
+    assert_the_drop_killed(&teardown, &sends, pid);
 }
 
 /// A `kill_tree` that failed may have left members running, so the drop still warns. Mutant: the
@@ -392,6 +442,36 @@ async fn drop_after_a_failed_kill_tree_and_wait_still_warns() {
     recorder.fail_with_unassessable();
     let mut child = session(&["true"]).spawn().expect("spawn");
     child.kill_tree().expect_err("the forced refusal");
+    child.wait().await.expect("reap the root");
+
+    let mark = crate::log_capture::mark();
+    drop(child);
+
+    let records = drop_warns_since(mark);
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].0, log::Level::Warn);
+}
+
+/// A `terminate_tree` is a request, not a kill, so a root reaped after it still leaves the drop
+/// unable to vouch for the group, and it warns (below Linux 6.9 and on macOS; on 6.9+ the pidfd
+/// finds the group empty, see `drop_group_exact_tests`). The `SIGTERM` is recorded, not sent, and
+/// the root exits by itself. Mutants: `terminate_tree` sets the tree-killed flag; `terminate_tree`
+/// sends nothing.
+#[skuld::test]
+async fn drop_after_terminate_tree_and_wait_still_warns() {
+    #[cfg(target_os = "linux")]
+    let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let termed = record_term_group();
+    let mut child = session(&["true"]).spawn().expect("spawn");
+    let pid = child.id().pid();
+    child.terminate_tree().expect("terminate_tree");
+    assert_eq!(
+        termed.termed(),
+        vec![pid as i32],
+        "terminate_tree signals the group once"
+    );
     child.wait().await.expect("reap the root");
 
     let mark = crate::log_capture::mark();
@@ -545,15 +625,19 @@ async fn fd_marker_drop_after_wait_sweeps_the_marker_holders_but_names_nothing_b
 /// A root that is alive when its marker is attached, then killed and reaped. A root that exits
 /// before the attach has no identity to walk from, which would make a "no walk" assertion vacuous.
 #[cfg(target_os = "macos")]
-async fn reaped_sleep_root(mode: ContainMode) -> (u32, crate::tokio::Child) {
+async fn reaped_blocker_root(mode: ContainMode) -> (u32, crate::tokio::Child) {
     let mut cmd = Command::new();
-    cmd.args(["sleep", "300"]);
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
     cmd.contain_with(mode);
     let mut child = cmd.spawn().expect("spawn");
+    let stdin = child.stdin().expect("stdin pipe");
     assert_eq!(child.containment(), Containment::FdMarker);
     let pid = child.id().pid();
     child.kill().expect("kill the root");
-    child.wait().await.expect("reap the root");
+    // Released after the kill: a `kill` that sent nothing fails the assertion, not the reap.
+    drop(stdin);
+    crate::test_child::assert_killed("the root", child.wait().await.expect("reap the root"));
     (pid, child)
 }
 
@@ -565,7 +649,7 @@ async fn fd_marker_without_a_group_drop_after_wait_only_sweeps_the_marker_holder
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let walks = record_walks();
-    let (pid, child) = reaped_sleep_root(ContainMode::TreeWalk).await;
+    let (pid, child) = reaped_blocker_root(ContainMode::TreeWalk).await;
 
     let mark = crate::log_capture::mark();
     drop(child);
@@ -585,7 +669,7 @@ async fn fd_marker_with_a_group_drop_after_wait_neither_signals_the_group_nor_wa
     crate::log_capture::install();
     let recorder = record_kill_group();
     let walks = record_walks();
-    let (pid, child) = reaped_sleep_root(ContainMode::Strongest).await;
+    let (pid, child) = reaped_blocker_root(ContainMode::Strongest).await;
 
     let mark = crate::log_capture::mark();
     drop(child);

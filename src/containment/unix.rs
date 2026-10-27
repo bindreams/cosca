@@ -60,8 +60,8 @@ pub(crate) fn set_process_group(std_cmd: &mut std::process::Command) {
     std_cmd.process_group(0); // leader: pgid == pid
 }
 
-/// Apply pre-spawn session setup to `std_cmd` via a `pre_exec` `setsid` call
-/// (root spawns only, `ContainMode::Session`).
+/// Apply pre-spawn session setup: a `setsid` step in the spawn's in-child hook (root spawns
+/// only, `ContainMode::Session`).
 ///
 /// `setsid` makes the child a session leader *and* process-group leader (pgid
 /// == sid == pid), detached from any controlling terminal. Because the child is
@@ -69,22 +69,9 @@ pub(crate) fn set_process_group(std_cmd: &mut std::process::Command) {
 /// `process_group(0)` on it would return `EPERM` — do not call
 /// `set_process_group` on the same command.
 ///
-/// The `pre_exec` closure is async-signal-safe: it calls only raw `libc::setsid`
-/// (no allocation, no unwinding). Failure of `setsid` aborts the spawn.
-pub(crate) fn set_session(std_cmd: &mut std::process::Command) {
-    // Safety: `pre_exec` runs post-fork, pre-exec. The closure is
-    // async-signal-safe: `libc::setsid` is a raw syscall with no allocation.
-    // A non-zero return means `setsid` failed (EPERM: already a session leader),
-    // surfaced as an `io::Error` to abort the spawn.
-    unsafe {
-        use std::os::unix::process::CommandExt;
-        std_cmd.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+/// Failure of `setsid` aborts the spawn.
+pub(crate) fn set_session(steps: &mut crate::child::spawn::in_child::InChild) {
+    steps.session();
 }
 
 /// Hard-kill the whole process group, then confirm the group actually came
@@ -388,6 +375,10 @@ pub(crate) enum Target {
     Leader,
     /// A listed member of a group, by its pid.
     Member(u32),
+    /// A member of a cgroup leaf, by its pid, that `CgroupLeaf::terminate` signals. A test build
+    /// notes the send, with the route of the syscall made, in `cgroup::fault::take_member_terms`.
+    #[cfg(target_os = "linux")]
+    LeafMember(u32),
 }
 
 /// The syscall [`send_signal`] makes.
@@ -451,11 +442,13 @@ fn send(target: Target, sys: Sys<'_>, signo: libc::c_int) -> nix::Result<()> {
             Sys::Pidfd(..) => Route::Pidfd,
             Sys::Group(_) | Sys::Process(_) => Route::Number,
         };
-        crate::send_log::record_group(match target {
-            Target::Group => GroupStep::Group(route, signo),
-            Target::Leader => GroupStep::Leader(route, signo),
-            Target::Member(pid) => GroupStep::Member(route, pid, signo),
-        });
+        match target {
+            Target::Group => crate::send_log::record_group(GroupStep::Group(route, signo)),
+            Target::Leader => crate::send_log::record_group(GroupStep::Leader(route, signo)),
+            Target::Member(pid) => crate::send_log::record_group(GroupStep::Member(route, pid, signo)),
+            #[cfg(target_os = "linux")]
+            Target::LeafMember(pid) => crate::containment::cgroup::fault::record_member_term(sys, pid, signo),
+        }
     }
     #[cfg(not(test))]
     let _ = target;

@@ -797,6 +797,13 @@ impl Child {
     /// group refused the signal — a setuid binary in the tree is the ordinary cause. The
     /// tree is still running and this process cannot bring it down.
     ///
+    /// In a cgroup v2 leaf, a listed member that got no `SIGTERM` makes this
+    /// [`Error::Containment`](crate::error::Error::Containment) if its send failed, else
+    /// [`Error::Unassessable`](crate::error::Error::Unassessable) (it could not be pinned or shown to
+    /// be in the leaf: a `hidepid`-hidden member of another user before Linux 6.13 or without a
+    /// readable leaf id, or a member listed as pid `0` in an unseen pid namespace); one `warn` names
+    /// the leaf and pids. [`kill_tree`](Child::kill_tree) still reaches them.
+    ///
     /// See [`kill_tree`](Child::kill_tree)'s doc for four things that also apply here: the
     /// `ProcessGroup`/`Session`-only scope of this guarantee (a separate, unfixed gap for
     /// `TreeWalk`), the residual `hidepid` gap on Linux, a root reaped by something else, and a reap
@@ -810,8 +817,10 @@ impl Child {
     /// [`Error::Unassessable`](crate::error::Error::Unassessable) saying that nothing was sent and what
     /// was skipped.
     ///
-    /// **Linux, a root whose handle cannot say whether it was reaped** is sent the `SIGTERM` through
-    /// its pidfd, which names it exactly. Nothing goes out by its number, and the call returns
+    /// **Linux, a root whose handle cannot say whether it was reaped.** On 6.9+ a process group
+    /// that still has a member is signalled as usual through the root's pidfd, and the call is
+    /// `Ok`. Otherwise the root is sent the `SIGTERM` through its pidfd, which names it exactly,
+    /// nothing goes out by its number, and the call returns
     /// [`Error::Unassessable`](crate::error::Error::Unassessable), with one `warn` saying so.
     pub fn terminate_tree(&self) -> Result<(), Error> {
         self.require_contained()?;

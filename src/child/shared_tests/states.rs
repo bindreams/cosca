@@ -62,12 +62,17 @@ fn a_poisoned_lock_neither_aborts_nor_hangs() {
             .spawn(|| shared.kill().expect("kill on a poisoned lock"))
             .join()
             .expect("kill must not panic");
-        scope
+        // Released after the kill: a kill that sent nothing exits 0.
+        b.end_child();
+        let status = scope
             .spawn(|| shared.wait().expect("wait on a poisoned lock"))
             .join()
             .expect("wait must not panic");
+        #[cfg(unix)]
+        assert_eq!(super::fixtures::signal_of(status), Some(libc::SIGKILL));
+        #[cfg(windows)]
+        assert_eq!(status.code(), Some(1));
     });
-    b.end_child();
 }
 
 /// S1 (`Debug`): formatting the handle inside a blocked waiter does not block, and shows
@@ -172,7 +177,7 @@ fn a_try_wait_reap_error_returns_it_and_stays_n() {
 /// Mutant: `kill` blocks on the `Condvar` while `W`; the kill thread's hook panics.
 #[skuld::test]
 fn kill_during_a_parked_wait_signals_and_the_holder_reaps() {
-    let b = Blocker::spawn();
+    let mut b = Blocker::spawn();
     let holder = park_holder(&b.shared, None, || ());
     let killer = std::thread::spawn({
         let shared = Arc::clone(&b.shared);
@@ -182,6 +187,8 @@ fn kill_during_a_parked_wait_signals_and_the_holder_reaps() {
         }
     });
     killer.join().expect("kill must not block").expect("kill");
+    // Released after the kill: a kill that sent nothing exits 0.
+    b.end_child();
     let status = holder.release_and_join().expect("holder wait").expect("a status");
     #[cfg(unix)]
     assert_eq!(super::fixtures::signal_of(status), Some(libc::SIGKILL));
@@ -196,7 +203,7 @@ fn kill_during_a_parked_wait_signals_and_the_holder_reaps() {
 /// is frozen, so the armed timeout is exactly the time remaining.
 ///
 /// A block with no timeout is reported by the hook, and the test then lets the holder finish, so
-/// the waiter returns and the assertion fails instead of hanging.
+/// the waiter returns and the assertion fails.
 ///
 /// Mutant: the `Condvar::wait` without a timeout; a waiter that returns `None` by peeking,
 /// without blocking; a wait armed with anything but the time remaining.
@@ -556,17 +563,21 @@ fn kill_sent_after_our_own_reap_is_gone() {
     assert_eq!(exit_seams::signals_sent(), 0);
 }
 
-/// `kill_sent` on a live child reports `Delivered`.
+/// `kill_sent` on a live child reports `Delivered`, and the kill lands: the blocker is released
+/// only after the call, so a call that sent nothing ends it with status 0.
 ///
-/// Mutant: `kill_sent` reports `Gone` for a live child.
+/// Mutants: `kill_sent` reports `Gone` for a live child; it reports `Delivered` and sends nothing.
 #[cfg(unix)]
 #[skuld::test]
 fn kill_sent_on_a_live_child_is_delivered() {
-    let b = Blocker::spawn();
+    let mut b = Blocker::spawn();
     assert_eq!(
         b.shared.kill_sent().expect("kill a live child"),
         crate::signal::Sent::Delivered
     );
+    b.end_child();
+    let status = b.shared.wait().expect("reap the killed child");
+    assert_eq!(super::fixtures::signal_of(status), Some(libc::SIGKILL));
 }
 
 // L8: an unreadable consuming record =====
