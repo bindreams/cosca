@@ -101,8 +101,7 @@ pub fn assert_members_killed(members: Vec<(Member, &str)>) {
 
 /// Assert that a teardown that does not wait (a drop) ended every member. Windows: as
 /// [`assert_members_not_released`], so the tree must have been started with [`RELEASED_EXIT_ENV`].
-/// Unix: [`assert_dead`] on each, so the members must echo. Either way a drop that killed nothing
-/// fails by assertion, where a read for an EOF would block on the survivor.
+/// Unix: [`assert_dead`] on each, so the members must echo.
 pub fn assert_members_torn_down(members: Vec<(Member, &str)>) {
     #[cfg(windows)]
     assert_members_not_released(members);

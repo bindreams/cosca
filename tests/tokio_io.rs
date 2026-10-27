@@ -361,7 +361,7 @@ async fn drop_after_wait_still_tears_down_the_tree() {
     let leaf = cgroup_leaf_of(&child);
     let _leaf_cleanup = leaf_cleanup(&leaf);
     let root_id = child.id();
-    // The echoing root leaves only when its socket closes: closing the socket releases it.
+    // The echoing root leaves only when its socket closes.
     root.sock
         .shutdown(std::net::Shutdown::Both)
         .expect("release the root so it exits");

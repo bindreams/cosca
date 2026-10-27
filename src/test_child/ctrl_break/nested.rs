@@ -27,15 +27,11 @@ pub(crate) fn root_argv() -> [&'static str; 5] {
     fixture_argv(ROOT_TEST)
 }
 
-/// Spawns an acking [`Handler`] member contained from inside a contained root, so it is
-/// `Delegated`, and checks that a delegated member can be gracefully terminated: its mechanism is
-/// the console group, `terminate` sends the one break and the member's own handler acknowledges it,
-/// and `terminate_tree` is `Unsupported` and sends nothing. Then writes [`DONE`] to the caller's
-/// socket.
+/// Runs the nested-terminate checks and writes [`DONE`] to the caller's socket.
 #[skuld::test]
 fn fixture_nested_terminate_root() {
     let Some(addr) = std::env::var_os(ADDR_ENV) else {
-        return; // picked up by an ordinary suite run — deliberately inert
+        return;
     };
     let mut report = ack::connect_control(addr.into_string().expect("utf8 addr")).expect("connect the report socket");
 

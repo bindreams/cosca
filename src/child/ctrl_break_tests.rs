@@ -322,10 +322,9 @@ fn lone_graceful_ops_work_from_a_caller_that_has_a_console() {
     child.kill().expect("killing a dead child is Ok");
 }
 
-/// A nested contained child owns no tree and leads a console process group of its own. A nested
-/// root ([`ctrl_break::nested`]) spawns one and asserts that `terminate` sends it the break and its
-/// own handler acks it, and that `terminate_tree` is `Unsupported`. That root runs in a process of
-/// its own so it is a contained member, which is what makes its spawn nested.
+/// A nested contained child owns no tree and leads a console process group of its own. The checks
+/// run in [`ctrl_break::nested`], in a process of its own so the child it spawns is a contained
+/// member's, hence nested.
 #[skuld::test]
 fn nested_delegated_child_can_be_gracefully_terminated() {
     let _warns = crate::log_capture::warn_watch();

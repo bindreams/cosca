@@ -36,8 +36,7 @@ struct Case {
     /// The mode reports one line and then waits for the socket to close, instead of closing.
     one_line: bool,
     /// Creation flags for the mode. The two console modes are launched console-less because they
-    /// probe the console-less caller; the console-attached ops are covered by
-    /// `src/child/ctrl_break_tests.rs`.
+    /// probe the console-less caller.
     flags: u32,
 }
 
