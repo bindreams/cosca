@@ -369,6 +369,9 @@ pub(crate) struct FakeLeaf {
     pub(crate) leaf: std::path::PathBuf,
     /// The file the leaf's `cgroup.events` resolves to.
     pub(crate) events: std::path::PathBuf,
+    /// The file the leaf's `cgroup.kill` resolves to. It outlives the leaf's removal, so a test
+    /// reads what was written after the leaf is gone.
+    pub(crate) kill: std::path::PathBuf,
 }
 
 #[cfg(target_os = "linux")]
@@ -380,12 +383,25 @@ impl FakeLeaf {
         let events = dir.path().join(format!("{name}.events"));
         std::fs::write(&events, format!("populated {}\nfrozen 0\n", u8::from(populated))).expect("write cgroup.events");
         std::os::unix::fs::symlink(&events, leaf.join("cgroup.events")).expect("link cgroup.events");
-        std::fs::write(leaf.join("cgroup.kill"), b"").expect("create cgroup.kill");
+        let kill = dir.path().join(format!("{name}.kill"));
+        std::fs::write(&kill, b"").expect("create cgroup.kill");
+        std::os::unix::fs::symlink(&kill, leaf.join("cgroup.kill")).expect("link cgroup.kill");
         FakeLeaf {
             _dir: dir,
             leaf,
             events,
+            kill,
         }
+    }
+
+    /// What `cgroup.kill` has been written with since the last [`clear_kill`](FakeLeaf::clear_kill).
+    pub(crate) fn kill_written(&self) -> Vec<u8> {
+        std::fs::read(&self.kill).expect("read cgroup.kill")
+    }
+
+    /// Forget earlier `cgroup.kill` writes, so a later write is the only one to show.
+    pub(crate) fn clear_kill(&self) {
+        std::fs::write(&self.kill, b"").expect("clear cgroup.kill");
     }
 
     /// Flip `populated` by rewriting its one digit in place: a truncating rewrite could be read
@@ -409,7 +425,13 @@ impl FakeLeaf {
     /// is untouched.
     pub(crate) fn remove(leaf: &std::path::Path) {
         for entry in std::fs::read_dir(leaf).expect("list the leaf") {
-            std::fs::remove_file(entry.expect("leaf entry").path()).expect("remove a leaf file");
+            let entry = entry.expect("leaf entry");
+            // A test may have put a directory where a control file is.
+            if entry.file_type().expect("the entry's type").is_dir() {
+                std::fs::remove_dir_all(entry.path()).expect("remove a leaf directory");
+            } else {
+                std::fs::remove_file(entry.path()).expect("remove a leaf file");
+            }
         }
         std::fs::remove_dir(leaf).expect("remove the leaf");
     }

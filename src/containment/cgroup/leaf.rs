@@ -511,6 +511,8 @@ impl CgroupLeaf {
                 #[cfg(test)]
                 fault::record_leaf_step(|| "kill".to_string());
                 self.killed.store(true, Ordering::Relaxed);
+                #[cfg(test)]
+                fault::run_after_kill_write();
                 Ok(())
             }
             Err(e) if removed_after_drain(&e) => {

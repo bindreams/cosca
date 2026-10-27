@@ -7,9 +7,11 @@
 //! effective set, so a signal to the front fails with `EPERM` while the `cgroup.kill` write, a file
 //! write, still succeeds.
 
-use std::io::{PipeWriter, Read as _};
+use std::cell::{Cell, RefCell};
+use std::io::{PipeReader, PipeWriter, Read as _};
 use std::os::fd::{AsFd as _, OwnedFd};
 use std::os::unix::process::ExitStatusExt as _;
+use std::rc::Rc;
 
 use crate::child::fault::record_root_teardowns;
 use crate::child::front_kill_tests::{
@@ -120,6 +122,152 @@ pub(crate) fn reaped(pidfd: &OwnedFd) -> bool {
     }
 }
 
+/// The signal that ended the child `pidfd` names, or `None` if it exited by itself, read without
+/// reaping it. Blocks until it has ended, so only for a child whose end is certain: one that has
+/// just been released.
+fn end_signal(pidfd: &OwnedFd) -> Option<i32> {
+    loop {
+        match rustix::process::waitid(
+            rustix::process::WaitId::PidFd(pidfd.as_fd()),
+            rustix::process::WaitIdOptions::EXITED | rustix::process::WaitIdOptions::NOWAIT,
+        ) {
+            Ok(Some(status)) => return status.terminating_signal(),
+            Ok(None) => unreachable!("a blocking waitid returns a status"),
+            Err(rustix::io::Errno::INTR) => {}
+            Err(e) => panic!("waitid on the pidfd of a child nothing has reaped: {e}"),
+        }
+    }
+}
+
+/// An observed child's pid and the signal that ended it, if one did.
+type EndedBy = (u32, Option<i32>);
+
+/// What the release saw: whether it ran as a `cgroup.kill` write returned (and not at a wait), and
+/// how each observed child ended.
+type Released = (bool, Vec<EndedBy>);
+
+/// The release, until it runs.
+type Once = Box<dyn FnOnce()>;
+
+/// What only a `cgroup.kill` ends is released at the first of three points a teardown reaches: the
+/// moment the next successful write of one returns on this thread, the moment its drain wait is
+/// about to block, and the moment it is about to block on the child itself after a kill it took
+/// as delivered (`set_between_kill_and_wait`). A write that sends nothing, or none at all, then
+/// leaves it ending by itself instead of hanging the teardown that waits for the leaf's drain or
+/// for the front's end, whichever kill route it took. The children [`observe`](Self::observe)d are
+/// then waited for, without reaping them, and how they ended is recorded for
+/// [`assert_killed`](Self::assert_killed): a member the write reached died of `SIGKILL`, which is
+/// pending before the write returns and so beats the release.
+///
+/// The wait seam is one-shot, so a test that needs it for anything else gives that to
+/// [`release_by_cgroup_kill_and_at_wait`] instead of arming it beside this.
+///
+/// A child that the teardown reaps cannot have its status read afterwards, so it must be observed.
+/// Only a child that ends once `held` is dropped may be: the hook waits for it.
+#[must_use = "dropping this disarms the release"]
+pub(crate) struct KillRelease {
+    _after_write: crate::oneshot_hook::Armed,
+    _before_drain: crate::oneshot_hook::Armed,
+    _before_wait: crate::oneshot_hook::Armed,
+    fire: Rc<dyn Fn(bool)>,
+    observed: Rc<RefCell<Vec<(u32, OwnedFd)>>>,
+    ended: Rc<RefCell<Option<Released>>>,
+}
+
+/// Arms a [`KillRelease`] of `held`.
+pub(crate) fn release_after_cgroup_kill(held: impl Sized + 'static) -> KillRelease {
+    release_by_cgroup_kill(move || drop(held))
+}
+
+/// Arms a [`KillRelease`] that runs `release`.
+pub(crate) fn release_by_cgroup_kill(release: impl FnOnce() + 'static) -> KillRelease {
+    release_by_cgroup_kill_and_at_wait(release, || {})
+}
+
+/// Arms a [`KillRelease`] that runs `release`, and runs `at_wait` as well when the teardown is about to
+/// block on its child: for a test whose teardown must not wait there, and releases what such a wait
+/// would then end, so that a wait fails the test instead of hanging it.
+pub(crate) fn release_by_cgroup_kill_and_at_wait(
+    release: impl FnOnce() + 'static,
+    at_wait: impl FnOnce() + 'static,
+) -> KillRelease {
+    let observed: Rc<RefCell<Vec<(u32, OwnedFd)>>> = Rc::default();
+    let ended = Rc::new(RefCell::new(None));
+    let release: Rc<Cell<Option<Once>>> = Rc::new(Cell::new(Some(Box::new(release))));
+    // The three points share one release: whichever is reached first runs it, and the others find it gone.
+    let fire: Rc<dyn Fn(bool)> = {
+        let (observed, ended) = (Rc::clone(&observed), Rc::clone(&ended));
+        Rc::new(move |by_write| {
+            let Some(release) = release.take() else {
+                return;
+            };
+            release();
+            let how = observed
+                .borrow()
+                .iter()
+                .map(|(pid, pidfd)| (*pid, end_signal(pidfd)))
+                .collect();
+            *ended.borrow_mut() = Some((by_write, how));
+        })
+    };
+    let after_write = crate::containment::cgroup::fault::set_after_kill_write({
+        let fire = Rc::clone(&fire);
+        move || fire(true)
+    });
+    let before_drain = crate::containment::cgroup::fault::set_before_drain_block({
+        let fire = Rc::clone(&fire);
+        move || fire(false)
+    });
+    let before_wait = crate::child::spawn::fault::set_between_kill_and_wait({
+        let fire = Rc::clone(&fire);
+        move || {
+            at_wait();
+            fire(false);
+        }
+    });
+    KillRelease {
+        _after_write: after_write,
+        _before_drain: before_drain,
+        _before_wait: before_wait,
+        fire,
+        observed,
+        ended,
+    }
+}
+
+impl KillRelease {
+    /// A release for a seam of the teardown that its own waits can reach before any of the three points:
+    /// it runs `release` unless a point did, and `assert_killed` then fails on the missing write.
+    pub(crate) fn releaser(&self) -> impl Fn() + 'static {
+        let fire = Rc::clone(&self.fire);
+        move || fire(false)
+    }
+
+    /// Watches the child `pid`, which must not be reaped before the release.
+    pub(crate) fn observe(&self, pid: u32) {
+        self.observed.borrow_mut().push((pid, pidfd_of(pid)));
+    }
+
+    /// The kill was written before the teardown's waits, and each child observed died of
+    /// `SIGKILL`, not by itself once released. With no child observed it proves only the first,
+    /// so the test also checks what the tree's other members did.
+    #[track_caller]
+    pub(crate) fn assert_killed(&self) {
+        let ended = self.ended.borrow();
+        let (by_write, ended) = ended
+            .as_ref()
+            .expect("the teardown released its holder, at the cgroup kill or before its drain wait");
+        assert!(*by_write, "cgroup.kill was written before the teardown's waits");
+        for (pid, signal) in ended {
+            assert_eq!(
+                *signal,
+                Some(libc::SIGKILL),
+                "pid {pid} must die of the cgroup kill, not exit by itself once released"
+            );
+        }
+    }
+}
+
 /// Moves `pid` out of its leaf into this process's own cgroup, as pam_systemd moves sudo into a
 /// session scope. The lane's cgroup enables no controllers, so it may hold processes.
 pub(crate) fn move_out_of_its_leaf(pid: u32) {
@@ -211,10 +359,15 @@ fn cgroup_kill_tree_of_a_front_goes_through_the_cgroup_alone(#[fixture(cgroup)] 
 fn cgroup_drop_of_a_front_kills_it_through_the_cgroup_and_reaps_it(#[fixture(cgroup)] _group: &Group) {
     crate::log_capture::install();
     let teardowns = record_root_teardowns();
-    let (child, _stdin) = spawn_as(in_cgroup(cat()), SUDO);
+    let (child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
     let pidfd = pidfd_of(child.id().pid());
+    // Released as the leaf's kill returns: a kill that sent nothing ends the front by itself, and
+    // `assert_killed` fails, instead of the drop's drain hanging.
+    let release = release_after_cgroup_kill(stdin);
+    release.observe(child.id().pid());
     let mark = crate::log_capture::mark();
     drop(child);
+    release.assert_killed();
     assert_eq!(teardowns.count(), 0, "the drop sends the front no kill of its own");
     assert!(reaped(&pidfd), "the drop reaps the front its cgroup kill ended");
     let warns = crate::log_capture::records_since_on_current_thread(mark, "Child::drop");
@@ -245,10 +398,17 @@ fn cgroup_a_failed_drop_kill_of_a_front_leaves_the_front_alone(#[fixture(cgroup)
     let leaf = leaf.path().to_path_buf();
     let pid = child.id().pid();
     let mark = crate::log_capture::mark();
+    // Released only if the drop took a kill as delivered that wrote nothing: the failure's unwind
+    // would then wait for a front nothing killed.
+    let stdin = Rc::new(std::cell::Cell::new(Some(stdin)));
     {
-        let _failing = crate::containment::cgroup::fault::fail_kill_writes();
+        let _failing = crate::containment::cgroup::fault::fail_kill_writes_releasing_on_unwritten_kill({
+            let stdin = Rc::clone(&stdin);
+            move || drop(stdin.take())
+        });
         drop(child);
     }
+    let stdin = stdin.take().expect("released only before a failure");
     let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "Child::drop")
         .into_iter()
         .filter(|(level, _)| *level <= log::Level::Warn)
@@ -266,12 +426,34 @@ fn cgroup_a_failed_drop_kill_of_a_front_leaves_the_front_alone(#[fixture(cgroup)
     std::fs::remove_dir(&leaf).unwrap_or_else(|e| panic!("remove the leaf {}: {e}", leaf.display()));
 }
 
-/// A `cat` front, contained and reported as launched by `sudo`, that has also started a `sleep` in
-/// its leaf: another member of the tree. Returns the front, its stdin and a pidfd of the `sleep`.
-pub(crate) fn spawn_front_with_member() -> (crate::Child, PipeWriter, OwnedFd) {
+/// The shell of a [`spawn_front_with_member`] tree: a member that reads the pipe on its fd 2, and
+/// prints `eof` if that ends it, then the front. A member a kill ended prints nothing.
+pub(crate) const FRONT_WITH_MEMBER_SH: &str = "{ cat <&2 2>&- && echo eof; } & echo $!; exec cat";
+
+/// A `cat` front, contained and reported as launched by `sudo`, with another member of its leaf: a
+/// shell running a `cat` on a pipe of its own, which prints `eof` once that `cat` ends by itself. A
+/// `cat` a kill ended exits by a signal and prints nothing, so a tree whose members left of their own
+/// accord is told by [`assert_nothing_ended_by_itself`].
+pub(crate) struct FrontWithMember {
+    pub(crate) child: crate::Child,
+    /// The front's stdin: it ends on its close, with status 0.
+    pub(crate) stdin: PipeWriter,
+    /// The member's stdin: it ends on its close.
+    pub(crate) member_stdin: PipeWriter,
+    /// A pidfd of the member's shell, not a child of this process.
+    pub(crate) member: OwnedFd,
+    /// The tree's stdout, past the member's pid; every member of the tree holds its write end.
+    pub(crate) stdout: PipeReader,
+}
+
+/// Spawns a [`FrontWithMember`], once the member has said its pid.
+pub(crate) fn spawn_front_with_member() -> FrontWithMember {
+    let (member_reader, member_stdin) = std::io::pipe().expect("pipe");
     let mut cmd = Command::new();
-    cmd.args(["sh", "-c", "sleep 1000 & echo $!; exec cat"]);
+    cmd.args(["sh", "-c", FRONT_WITH_MEMBER_SH]);
     cmd.stdout(Stdio::pipe_out()).expect("stdout pipe");
+    cmd.stderr(Stdio::from_file(std::fs::File::from(OwnedFd::from(member_reader))))
+        .expect("stderr");
     let (mut child, stdin) = spawn_as(in_cgroup(cmd), SUDO);
     let mut line = Vec::new();
     let mut stdout = child.stdout().expect("stdout pipe");
@@ -283,8 +465,25 @@ pub(crate) fn spawn_front_with_member() -> (crate::Child, PipeWriter, OwnedFd) {
         .expect("utf8")
         .trim()
         .parse()
-        .expect("the sleep's pid");
-    (child, stdin, pidfd_of(member))
+        .expect("the member's pid");
+    FrontWithMember {
+        child,
+        stdin,
+        member_stdin,
+        member: pidfd_of(member),
+        stdout,
+    }
+}
+
+/// The tree's `stdout` has ended, every member gone, and no member said `eof`: each was killed
+/// by a signal, not by itself.
+#[track_caller]
+pub(crate) fn assert_nothing_ended_by_itself(rest: &[u8]) {
+    assert!(
+        rest.is_empty(),
+        "a member ended by itself, so the kill did not reach it: {}",
+        String::from_utf8_lossy(rest)
+    );
 }
 
 /// Blocks until the process `pidfd` names (it need not be a child) has exited. Only for a process
@@ -304,18 +503,26 @@ pub(crate) fn wait_until_exited(pidfd: &OwnedFd) {
 #[track_caller]
 fn assert_drop_kills_the_leaf_and_reaps_the_front(fault: impl FnOnce() -> Box<dyn std::any::Any>) {
     crate::log_capture::install();
-    let (child, stdin, member) = spawn_front_with_member();
+    let FrontWithMember {
+        child,
+        stdin,
+        member_stdin,
+        member,
+        mut stdout,
+    } = spawn_front_with_member();
     let front = pidfd_of(child.id().pid());
     let pid = child.id().pid();
-    // At the look: the front's end is awaited, after releasing its stdin so a front nothing killed
-    // ends too (and the status below says how).
-    let stdin = std::rc::Rc::new(std::cell::Cell::new(Some(stdin)));
-    let _look = crate::child::fault::set_before_front_look({
-        let stdin = std::rc::Rc::clone(&stdin);
-        move || {
-            drop(stdin.take());
-            crate::test_child::wait_until_zombie(pid);
-        }
+    // The tree's holders are released as the leaf's kill returns, so a kill that sent nothing ends
+    // the members by themselves and fails the assertions below instead of hanging the drain.
+    let release = release_after_cgroup_kill((stdin, member_stdin));
+    release.observe(pid);
+    // At the look the front's end is awaited. A kill that failed has reached none of the release's
+    // points by then, so the look releases the holders first: the front ends by itself and
+    // `assert_killed` fails on the missing write.
+    let release_front = release.releaser();
+    let _look = crate::child::fault::set_before_front_look(move || {
+        release_front();
+        crate::test_child::wait_until_zombie(pid);
     });
     crate::containment::cgroup::fault::record_leaf_steps();
     let mark = crate::log_capture::mark();
@@ -324,6 +531,7 @@ fn assert_drop_kills_the_leaf_and_reaps_the_front(fault: impl FnOnce() -> Box<dy
         drop(child);
     }
     let steps = crate::containment::cgroup::fault::take_leaf_steps();
+    release.assert_killed();
     let said =
         crate::log_capture::records_since_on_current_thread(mark, &format!("Child::drop: elevation front pid {pid}"));
     assert_eq!(said.len(), 1, "{said:?}");
@@ -335,6 +543,9 @@ fn assert_drop_kills_the_leaf_and_reaps_the_front(fault: impl FnOnce() -> Box<dy
     assert!(reaped(&front), "the drop reaps the front its leaf's kill ended");
     assert!(steps.iter().any(|s| s == "kill"), "{steps:?}");
     wait_until_exited(&member);
+    let mut rest = Vec::new();
+    stdout.read_to_end(&mut rest).expect("every member of the tree is gone");
+    assert_nothing_ended_by_itself(&rest);
 }
 
 /// A drop whose placement read fails (so it cannot tell the front is in its leaf) still lets the
@@ -378,15 +589,24 @@ fn cgroup_a_drop_whose_post_kill_read_fails_reaps_the_front_the_kill_ended(#[fix
 #[skuld::test]
 fn cgroup_a_drop_places_a_front_that_reads_as_running_and_reaps_it(#[fixture(cgroup)] _group: &Group) {
     crate::log_capture::install();
-    let (child, _stdin, member) = spawn_front_with_member();
+    let FrontWithMember {
+        child,
+        stdin,
+        member_stdin,
+        member,
+        mut stdout,
+    } = spawn_front_with_member();
     let pid = child.id().pid();
     let front = pidfd_of(pid);
+    let release = release_after_cgroup_kill((stdin, member_stdin));
+    release.observe(pid);
     let _old_kernel = crate::child::fault::read_front_as_running_at_the_look();
     let mark = crate::log_capture::mark();
     {
         let _first_write_fails = crate::containment::cgroup::fault::fail_next_kill_write();
         drop(child);
     }
+    release.assert_killed();
     let said =
         crate::log_capture::records_since_on_current_thread(mark, &format!("Child::drop: elevation front pid {pid}"));
     assert_eq!(said.len(), 1, "{said:?}");
@@ -397,6 +617,9 @@ fn cgroup_a_drop_places_a_front_that_reads_as_running_and_reaps_it(#[fixture(cgr
     );
     assert!(reaped(&front), "the drop reaps the front");
     wait_until_exited(&member);
+    let mut rest = Vec::new();
+    stdout.read_to_end(&mut rest).expect("every member of the tree is gone");
+    assert_nothing_ended_by_itself(&rest);
 }
 
 /// The same front whose place cannot be read (its pidfd's cgroup id fails) is not called running,
@@ -405,14 +628,23 @@ fn cgroup_a_drop_places_a_front_that_reads_as_running_and_reaps_it(#[fixture(cgr
 #[skuld::test]
 fn cgroup_a_drop_that_cannot_place_a_front_does_not_call_it_running(#[fixture(cgroup)] _group: &Group) {
     crate::log_capture::install();
-    let (child, _stdin, _member) = spawn_front_with_member();
+    let FrontWithMember {
+        child,
+        stdin,
+        member_stdin,
+        member,
+        mut stdout,
+    } = spawn_front_with_member();
     let pid = child.id().pid();
+    let release = release_after_cgroup_kill((stdin, member_stdin));
+    release.observe(pid);
     let _old_kernel = crate::child::fault::read_front_as_running_at_the_look();
     let mark = crate::log_capture::mark();
     {
         let _unreadable = crate::containment::cgroup::fault::fail_pidfd_info();
         drop(child);
     }
+    release.assert_killed();
     let said =
         crate::log_capture::records_since_on_current_thread(mark, &format!("Child::drop: elevation front pid {pid}"));
     assert_eq!(said.len(), 1, "{said:?}");
@@ -421,6 +653,10 @@ fn cgroup_a_drop_that_cannot_place_a_front_does_not_call_it_running(#[fixture(cg
     assert!(!said[0].1.contains("left running"), "{said:?}");
     // The leaf's kill ended it, and the drop left it unreaped.
     crate::child::front_kill_tests::reap(pid);
+    wait_until_exited(&member);
+    let mut rest = Vec::new();
+    stdout.read_to_end(&mut rest).expect("every member of the tree is gone");
+    assert_nothing_ended_by_itself(&rest);
 }
 
 /// A front outside its leaf (moved out) is left running, with the warning true: the look finds it
@@ -429,14 +665,22 @@ fn cgroup_a_drop_that_cannot_place_a_front_does_not_call_it_running(#[fixture(cg
 #[skuld::test]
 fn cgroup_drop_of_a_front_outside_its_leaf_leaves_it_running_and_kills_the_rest(#[fixture(cgroup)] _group: &Group) {
     crate::log_capture::install();
-    let (child, stdin, member) = spawn_front_with_member();
+    let FrontWithMember {
+        child,
+        stdin,
+        member_stdin,
+        member,
+        mut stdout,
+    } = spawn_front_with_member();
     let pid = child.id().pid();
     move_out_of_its_leaf(pid);
-    // Released at the wait a drop makes for a front it places in its leaf, which this one is not in:
-    // a drop that waited for it would end it and fail the warning below, not hang.
-    let stdin = std::rc::Rc::new(std::cell::Cell::new(Some(stdin)));
-    let _released = crate::child::spawn::fault::set_between_kill_and_wait({
-        let stdin = std::rc::Rc::clone(&stdin);
+    // The member is released as the leaf's kill returns, so a kill that sent nothing ends it by
+    // itself and it says `eof`, instead of the drain hanging. The front is released at the wait a
+    // drop makes for a front it places in its leaf, which this one is not in: a drop that waited for
+    // it would end it and fail the warning below, not hang.
+    let stdin = Rc::new(std::cell::Cell::new(Some(stdin)));
+    let release = release_by_cgroup_kill_and_at_wait(move || drop(member_stdin), {
+        let stdin = Rc::clone(&stdin);
         move || drop(stdin.take())
     });
     crate::containment::cgroup::fault::record_leaf_steps();
@@ -449,9 +693,13 @@ fn cgroup_drop_of_a_front_outside_its_leaf_leaves_it_running_and_kills_the_rest(
     assert_eq!(said[0].0, log::Level::Warn);
     assert!(said[0].1.contains("is left running and unreaped"), "{said:?}");
     assert!(steps.iter().any(|s| s == "kill"), "the leaf was killed: {steps:?}");
+    release.assert_killed();
     wait_until_exited(&member);
     drop(stdin.take().expect("the drop must not wait for the front"));
     assert_reaped_unsignalled(pid);
+    let mut rest = Vec::new();
+    stdout.read_to_end(&mut rest).expect("every member of the tree is gone");
+    assert_nothing_ended_by_itself(&rest);
 }
 
 /// A front whose signal is refused (direct exec: the root program) is still killed, through the
@@ -473,13 +721,16 @@ fn cgroup_kill_of_a_front_that_refuses_signals_is_ok(#[fixture(cgroup)] _group: 
 #[skuld::test]
 fn cgroup_drop_of_a_front_that_refuses_signals_reaps_it(#[fixture(cgroup)] _group: &Group) {
     crate::log_capture::install();
-    let (child, _stdin) = spawn_nobody_front();
+    let (child, stdin) = spawn_nobody_front();
     let pidfd = pidfd_of(child.id().pid());
+    let release = release_after_cgroup_kill(stdin);
+    release.observe(child.id().pid());
     let mark = crate::log_capture::mark();
     {
         let _refusing = WithoutKillCap::refusing(child.id().pid());
         drop(child);
     }
+    release.assert_killed();
     assert!(reaped(&pidfd), "the drop reaps the front its cgroup kill ended");
     let warns = crate::log_capture::records_since_on_current_thread(mark, "could not be terminated");
     assert_eq!(warns, [], "nothing was refused");
@@ -535,8 +786,14 @@ fn cgroup_a_failed_password_write_whose_cgroup_kill_fails_refuses_as_kill_does(#
     let id = child.id();
     let pid = id.pid();
     let leaf = leaf_of(&child).path().to_path_buf();
+    // Released only if the teardown takes a kill as delivered that wrote nothing: the failure's unwind
+    // would then drop the child, and wait for a front nothing killed.
+    let stdin = Rc::new(std::cell::Cell::new(Some(stdin)));
     let err = {
-        let _failing = crate::containment::cgroup::fault::fail_kill_writes();
+        let _failing = crate::containment::cgroup::fault::fail_kill_writes_releasing_on_unwritten_kill({
+            let stdin = Rc::clone(&stdin);
+            move || drop(stdin.take())
+        });
         crate::child::spawn::finish_elevated(
             child,
             Err(crate::error::Error::Elevation {
@@ -553,7 +810,7 @@ fn cgroup_a_failed_password_write_whose_cgroup_kill_fails_refuses_as_kill_does(#
         "a front its cgroup kill did not end may be running"
     );
     assert_front_refused_by_its_cgroup_kill(&err, pid);
-    drop(stdin);
+    drop(stdin.take().expect("the teardown must not release the front"));
     assert_reaped_unsignalled(pid);
     std::fs::remove_dir(&leaf).unwrap_or_else(|e| panic!("remove the leaf {}: {e}", leaf.display()));
 }
@@ -646,7 +903,7 @@ fn cgroup_drop_of_a_front_moved_out_during_its_kill_leaves_it_unreaped(#[fixture
 fn cgroup_kill_tree_of_a_front_asks_the_gate_once(#[fixture(cgroup)] _group: &Group) {
     let (child, _stdin) = spawn_as(in_cgroup(cat()), SUDO);
     let gates = crate::elevation::front::seams::count_kill_gates();
-    child.kill_tree().expect("the cgroup kill reaches the front");
+    child.kill_tree().expect("kill_tree is accepted");
     assert_eq!(gates.count(), 1);
 }
 
@@ -656,7 +913,9 @@ fn cgroup_kill_tree_of_a_front_asks_the_gate_once(#[fixture(cgroup)] _group: &Gr
 fn cgroup_a_failed_password_write_asks_the_gate_once(#[fixture(cgroup)] _group: &Group) {
     let mut cmd = in_cgroup(cat());
     cmd.kill_on_drop(false);
-    let (child, _stdin) = spawn_as(cmd, SUDO);
+    let (child, stdin) = spawn_as(cmd, SUDO);
+    let release = release_after_cgroup_kill(stdin);
+    release.observe(child.id().pid());
     let gates = crate::elevation::front::seams::count_kill_gates();
     let err = crate::child::spawn::finish_elevated(
         child,
@@ -673,6 +932,7 @@ fn cgroup_a_failed_password_write_asks_the_gate_once(#[fixture(cgroup)] _group: 
         "the cgroup kill ended the front and the teardown reaped it"
     );
     assert!(err.to_string().contains("the elevated child was terminated"), "{err}");
+    release.assert_killed();
     assert_eq!(gates.count(), 1);
 }
 
@@ -729,51 +989,75 @@ pub(crate) fn failed_held_front_spawns(
         cmd.stdin(Stdio::from_file(std::fs::File::from(OwnedFd::from(reader))))
             .expect("stdin");
         cmd.set_elevation_front(crate::elevation::front::front(Some(&SUDO)));
-        let _released = fault::set_between_kill_and_wait({
+        // Releases the front: a teardown's wait on a front no kill reached ends it with status 0,
+        // instead of hanging. The seam is one-shot, so each case gives this to the one guard that
+        // arms it.
+        let release_front = || {
             let stdin = Rc::clone(&stdin);
             move || drop(stdin.borrow_mut().take())
-        });
+        };
+        // A leaf's kill that lands on the front also releases it, and the front's end is read there:
+        // a write that sent nothing, or none, ends the front by itself, and `assert_killed` fails,
+        // instead of the teardown waiting for the leaf's drain forever. A kill that misses the front
+        // must leave it held.
+        let lands = matches!(
+            kill,
+            LeafKill::Lands | LeafKill::LandsNestedHidden | LeafKill::LandsReadThroughProc
+        );
+        let released_by_the_leaf = lands.then(|| Rc::new(release_by_cgroup_kill(release_front())));
+        let _released = (kill == LeafKill::MissesMovedFront).then(|| fault::set_between_kill_and_wait(release_front()));
         // The spawn has returned from std, so the front has run its placement: it is in its leaf.
         // Both failures come after this point.
         // A namesake front leaves the leaf empty, and an empty leaf is removed without a kill: a
-        // filler kept in it makes its kill land, so only the record answers for the front.
-        let (filler, filler_stdin) = if kill == LeafKill::MissesIntoNamesake {
-            let (filler, stdin) = spawn_as(cat(), SUDO);
-            (Some(Rc::new(filler)), Some(stdin))
+        // filler kept in it makes its kill land, so only the record answers for the front. The
+        // filler is released as that kill returns.
+        let (filler, filler_release) = if kill == LeafKill::MissesIntoNamesake {
+            let (filler, filler_stdin) = spawn_as(cat(), SUDO);
+            let release = release_by_cgroup_kill_and_at_wait(move || drop(filler_stdin), release_front());
+            release.observe(filler.id().pid());
+            (Some(Rc::new(filler)), Some(release))
         } else {
             (None, None)
         };
-        let _moved = match kill {
-            LeafKill::MissesMovedFront => Some(fault::set_at(fault::SpawnPoint::BeforeIdentity, || {
-                move_out_of_its_leaf(fault::spawn_pid())
-            })),
-            LeafKill::LandsNestedHidden => Some(fault::set_at(fault::SpawnPoint::BeforeIdentity, || {
-                move_under_its_leaf(fault::spawn_pid());
-            })),
-            LeafKill::MissesIntoNamesake => {
-                let filler = filler.clone();
-                Some(fault::set_at(fault::SpawnPoint::BeforeIdentity, move || {
-                    let pid = fault::spawn_pid();
-                    let leaf = cgroup_dir_of(pid);
-                    let filler = filler.as_ref().expect("a filler for the namesake case").id().pid();
-                    std::fs::write(format!("{leaf}/cgroup.procs"), filler.to_string())
-                        .unwrap_or_else(|e| panic!("move the filler into {leaf}: {e}"));
-                    move_into_a_namesake_of_its_leaf(pid);
-                }))
+        // The front is observed before its identity is read, while the spawn still holds it unreaped.
+        let _before_identity = fault::set_at(fault::SpawnPoint::BeforeIdentity, {
+            let filler = filler.clone();
+            let released = released_by_the_leaf.clone();
+            move || {
+                let pid = fault::spawn_pid();
+                if let Some(released) = &released {
+                    released.observe(pid);
+                }
+                match kill {
+                    LeafKill::MissesMovedFront => move_out_of_its_leaf(pid),
+                    LeafKill::LandsNestedHidden => {
+                        move_under_its_leaf(pid);
+                    }
+                    LeafKill::MissesIntoNamesake => {
+                        let leaf = cgroup_dir_of(pid);
+                        let filler = filler.as_ref().expect("a filler for the namesake case").id().pid();
+                        std::fs::write(format!("{leaf}/cgroup.procs"), filler.to_string())
+                            .unwrap_or_else(|e| panic!("move the filler into {leaf}: {e}"));
+                        move_into_a_namesake_of_its_leaf(pid);
+                    }
+                    LeafKill::Lands | LeafKill::Fails | LeafKill::LandsReadThroughProc => {}
+                }
             }
-            LeafKill::Lands | LeafKill::Fails | LeafKill::LandsReadThroughProc => None,
-        };
+        });
         let _missing = matches!(kill, LeafKill::LandsReadThroughProc | LeafKill::MissesIntoNamesake)
             .then(crate::containment::cgroup::fault::miss_pidfd_info);
         let _hidden = (kill == LeafKill::LandsNestedHidden).then(crate::containment::cgroup::fault::hide_proc);
-        let _failing = (kill == LeafKill::Fails).then(crate::containment::cgroup::fault::fail_kill_writes);
+        let _failing = (kill == LeafKill::Fails)
+            .then(|| crate::containment::cgroup::fault::fail_kill_writes_releasing_at_wait(release_front()));
         force_arm(true);
         let result = spawn(&mut cmd);
         force_arm(false);
+        if let Some(released) = &released_by_the_leaf {
+            released.assert_killed();
+        }
         // The filler kept the leaf busy, so the leaf's removal killed through it: the kill landed.
-        // Its stdin is closed first, so a filler nothing killed exits 0 and the assertion fails.
-        if let Some((filler, stdin)) = filler.as_ref().zip(filler_stdin) {
-            drop(stdin);
+        if let Some((filler, release)) = filler.as_ref().zip(filler_release.as_ref()) {
+            release.assert_killed();
             assert_eq!(
                 filler.wait().expect("wait").signal(),
                 Some(libc::SIGKILL),
@@ -944,13 +1228,16 @@ fn cgroup_graceful_shutdown_of_a_front_escalates_through_the_cgroup(#[fixture(cg
     let mut cmd = Command::new();
     cmd.args(["sh", "-c", "trap '' TERM; echo ready; exec cat"]);
     cmd.stdout(Stdio::pipe_out()).expect("stdout pipe");
-    let (mut child, _stdin) = spawn_as(in_cgroup(cmd), SUDO);
+    let (mut child, stdin) = spawn_as(in_cgroup(cmd), SUDO);
     let mut ready = [0u8; 6];
     child
         .stdout()
         .expect("stdout pipe")
         .read_exact(&mut ready)
         .expect("read `ready`");
+    // Released once the escalation is over, before the reap inside the call: a kill that sent
+    // nothing lets the front end by itself, and the status below fails, instead of the reap hanging.
+    let _release = crate::graceful_hooks::release_at(crate::graceful_hooks::HookPoint::BeforeReap, stdin);
     let status = child
         .graceful_shutdown(std::time::Duration::ZERO)
         .expect("the cgroup kill ends the front");
@@ -1077,12 +1364,15 @@ fn leaf_of(child: &crate::Child) -> &crate::containment::cgroup::CgroupLeaf {
 /// zombie too, and with `/proc` unreadable (`hidepid`).
 #[skuld::test]
 fn cgroup_a_killed_front_is_placed_in_its_leaf_by_its_pidfd(#[fixture(cgroup)] _group: &Group) {
-    let (child, _stdin) = spawn_as(in_cgroup(cat()), SUDO);
+    let (child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
     let pid = child.id().pid();
+    let release = release_after_cgroup_kill(stdin);
+    release.observe(pid);
     child
         .attached
         .hard_kill(&crate::containment::GroupRoot::none())
         .expect("cgroup.kill");
+    release.assert_killed();
     crate::test_child::wait_until_zombie(pid);
     let hidden = crate::containment::cgroup::fault::hide_proc();
     let names = leaf_of(&child).names(pid, child.proc.pidfd());
@@ -1097,12 +1387,15 @@ fn cgroup_a_killed_front_is_placed_in_its_leaf_by_its_pidfd(#[fixture(cgroup)] _
 #[skuld::test]
 fn cgroup_without_pidfd_info_a_front_is_placed_through_proc(#[fixture(cgroup)] _group: &Group) {
     let _missing = crate::containment::cgroup::fault::miss_pidfd_info();
-    let (killed, _stdin) = spawn_as(in_cgroup(cat()), SUDO);
+    let (killed, stdin) = spawn_as(in_cgroup(cat()), SUDO);
     let pid = killed.id().pid();
+    let release = release_after_cgroup_kill(stdin);
+    release.observe(pid);
     killed
         .attached
         .hard_kill(&crate::containment::GroupRoot::none())
         .expect("cgroup.kill");
+    release.assert_killed();
     crate::test_child::wait_until_zombie(pid);
     assert!(leaf_of(&killed)
         .names(pid, killed.proc.pidfd())
@@ -1259,6 +1552,15 @@ fn cgroup_a_leaf_records_its_fronts_place_before_its_removal(#[fixture(cgroup)] 
         let (front, stdin) = spawn_as(cat(), SUDO);
         let pid = front.id().pid();
         leaf.watch_front(pid);
+        // A front in the leaf is released as the leaf's drop kills it, so a kill that sent nothing
+        // ends it by itself and the status below fails, instead of the drop's drain hanging.
+        let (stdin, release) = if case == RecordCase::Leaf {
+            let release = release_after_cgroup_kill(stdin);
+            release.observe(pid);
+            (None, Some(release))
+        } else {
+            (Some(stdin), None)
+        };
         let namesake = leaf_path.with_file_name(format!("leaf-{n} (deleted)"));
         let in_leaf = matches!(case, RecordCase::Leaf | RecordCase::LeafRemovedFirst);
         if in_leaf {
@@ -1283,6 +1585,9 @@ fn cgroup_a_leaf_records_its_fronts_place_before_its_removal(#[fixture(cgroup)] 
         // The leaf's drop kills what is in it, and removes it.
         drop(leaf);
         drop(unread);
+        if let Some(release) = &release {
+            release.assert_killed();
+        }
         // An undecided path is the leaf's own path with ` (deleted)` after it, left unrecorded:
         // that, and no other failure of the read, is what leaves no record.
         let unrecorded =
@@ -1417,8 +1722,14 @@ fn cgroup_a_front_placeable_through_proc_is_not_refused(#[fixture(cgroup)] _grou
     let mut cmd = in_cgroup(cat());
     cmd.stdin(Stdio::pipe_in()).expect("stdin pipe");
     let (result, forked) = spawn_front_noting_fork(cmd, |cmd| cmd.spawn());
-    result.expect("a front /proc shows is placeable");
+    let mut child = result.expect("a front /proc shows is placeable");
     assert!(forked.is_some());
+    // The drop's kill ends the front: released as it returns, so a kill that sent nothing fails
+    // the assertion instead of hanging the drop's drain.
+    let release = release_after_cgroup_kill(child.stdin().expect("stdin pipe"));
+    release.observe(child.id().pid());
+    drop(child);
+    release.assert_killed();
 }
 
 /// A `cat` front spawned for a cgroup leaf that does not take it (its placement write is made to

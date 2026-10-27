@@ -1,5 +1,5 @@
-//! `end_child`, called directly on an abandoned spawn's child: a forked process that pauses, with
-//! no cgroup. What it sends is read from `fault::take_child_sends`.
+//! `end_child`, called directly on an abandoned spawn's child: a forked process that pauses or
+//! ends when its input closes, with no cgroup. What it sends is read from `fault::take_child_sends`.
 
 use super::super::fault::{self, ChildSend};
 use super::super::test_support::{fork_running, KillOnDrop};
@@ -53,6 +53,52 @@ fn assert_handed_to_the_background_reaper() {
     );
 }
 
+/// How a child ended: the signal, or `None` for an exit by itself.
+type EndedBy = std::rc::Rc<std::cell::Cell<Option<Option<i32>>>>;
+
+/// Arms the exit-wait seam of `end_child` to end `input` (see [`group_leader_ending_at_eof`]) and
+/// then run `then`, and to read how the child `pid` ended, without reaping it. A child the handle's
+/// kill reached ends by `SIGKILL`, which was pending before the release; one no kill reached
+/// exits by itself, and the test fails by assertion instead of `end_child` waiting for it forever.
+fn release_at_the_exit_wait(
+    pid: u32,
+    input: std::io::PipeWriter,
+    then: impl FnOnce() + 'static,
+) -> (fault::BeforeExitWaitGuard, EndedBy) {
+    let ended: EndedBy = std::rc::Rc::default();
+    let pidfd = super::super::test_support::pidfd_of(pid);
+    let guard = fault::set_before_exit_wait({
+        let ended = std::rc::Rc::clone(&ended);
+        move || {
+            drop(input);
+            let status = loop {
+                match rustix::process::waitid(
+                    rustix::process::WaitId::PidFd(std::os::fd::AsFd::as_fd(&pidfd)),
+                    rustix::process::WaitIdOptions::EXITED | rustix::process::WaitIdOptions::NOWAIT,
+                ) {
+                    Err(rustix::io::Errno::INTR) => {}
+                    other => break other,
+                }
+            };
+            let status = status
+                .expect("waitid on the child's pidfd")
+                .expect("a blocking waitid returns a status");
+            ended.set(Some(status.terminating_signal()));
+            then();
+        }
+    });
+    (guard, ended)
+}
+
+#[track_caller]
+fn assert_killed(ended: &EndedBy) {
+    assert_eq!(
+        ended.get(),
+        Some(Some(libc::SIGKILL)),
+        "the child died of the handle's kill, not by itself once released"
+    );
+}
+
 /// What `end_child` receives for `child`, named by its pidfd, after `report`. `end_child` reaps
 /// it from here on.
 fn received(child: KillOnDrop, report: Option<PlacementReport>) -> Received {
@@ -72,18 +118,17 @@ fn received(child: KillOnDrop, report: Option<PlacementReport>) -> Received {
 #[skuld::test]
 fn an_abandoned_childs_foreign_reap_is_debug_not_a_panic() {
     crate::log_capture::install();
-    let child = fork_running(|| loop {
-        // SAFETY: async-signal-safe.
-        unsafe { libc::pause() };
-    });
+    let (child, input) = group_leader_ending_at_eof();
     let received = received(child, None);
     let pid = received.pid.expect("a pid");
     // `end_child` has already sent its `SIGKILL`.
-    let _reaped_elsewhere = fault::set_before_exit_wait(move || super::super::test_support::reap(pid));
+    let (_reaped_elsewhere, ended) =
+        release_at_the_exit_wait(pid, input, move || super::super::test_support::reap(pid));
 
     let mark = crate::log_capture::mark();
     let fate = end_child(&received);
 
+    assert_killed(&ended);
     assert_eq!(fate, ChildFate::Killed);
     let records = crate::log_capture::records_since_on_current_thread(mark, "reaped elsewhere");
     assert_eq!(records.len(), 1, "{records:?}");
@@ -104,13 +149,20 @@ fn an_abandoned_childs_foreign_reap_is_debug_not_a_panic() {
 /// kill through its handle, which ends it and so frees its number for a foreign reaper. Its member
 /// is killed: the handle's kill ends only the child.
 ///
-/// Mutants: the group killed after the handle's kill (`[Handle, Group]`); the group kill sends nothing.
+/// The group kill reaches the leader too, so only when it and the handle's kill both send nothing
+/// does the leader end by itself, released at `end_child`'s exit wait: `assert_killed` then fails
+/// instead of the wait hanging.
+///
+/// Mutants: the group killed after the handle's kill (`[Handle, Group]`); the group kill sends
+/// nothing; the group kill and the handle's kill both send nothing.
 #[skuld::test]
 fn an_abandoned_child_outside_its_leaf_is_killed_as_its_group_before_its_handle(#[fixture(cgroup)] _group: &Group) {
-    let (child, to_member, from_member) = leader_with_member(false);
+    let (child, input, to_member, from_member) = leader_held_with_member();
     let received = received(child, Some(PlacementReport::WriteFailed(libc::EBADF)));
+    let (_released, ended) = release_at_the_exit_wait(received.pid.expect("a pid"), input, || {});
 
     assert_eq!(end_child(&received), ChildFate::Killed);
+    assert_killed(&ended);
     assert_eq!(fault::take_child_sends(), [ChildSend::Group, ChildSend::Handle]);
     assert_eq!(
         member_output(to_member, from_member),
@@ -126,10 +178,12 @@ fn an_abandoned_child_outside_its_leaf_is_killed_as_its_group_before_its_handle(
 #[skuld::test]
 fn an_abandoned_child_in_its_leaf_or_unreported_is_sent_no_group_kill() {
     for report in [Some(PlacementReport::Placed), None] {
-        let child = paused_group_leader();
+        let (child, input) = group_leader_ending_at_eof();
         let received = received(child, report);
+        let (_released, ended) = release_at_the_exit_wait(received.pid.expect("a pid"), input, || {});
 
         assert_eq!(end_child(&received), ChildFate::Killed, "{report:?}");
+        assert_killed(&ended);
         assert_eq!(fault::take_child_sends(), [ChildSend::Handle], "{report:?}");
     }
 }
@@ -141,13 +195,15 @@ fn an_abandoned_child_in_its_leaf_or_unreported_is_sent_no_group_kill() {
 #[skuld::test]
 fn an_abandoned_childs_group_kill_finding_no_group_is_logged_at_debug(#[fixture(cgroup)] _group: &Group) {
     crate::log_capture::install();
-    let child = paused_group_leader();
+    let (child, input) = group_leader_ending_at_eof();
     let received = received(child, Some(PlacementReport::WriteFailed(libc::EBADF)));
     let pid = received.pid.expect("a pid");
+    let (_released, ended) = release_at_the_exit_wait(pid, input, || {});
     let _gone = fault::force_group_kill_gone();
 
     let mark = crate::log_capture::mark();
     assert_eq!(end_child(&received), ChildFate::Killed);
+    assert_killed(&ended);
 
     let records = crate::log_capture::records_since_on_current_thread(mark, "process group");
     assert_eq!(records.len(), 1, "{records:?}");
@@ -223,13 +279,15 @@ fn an_abandoned_child_refusing_its_handles_kill_is_not_killed_by_pid() {
 #[skuld::test]
 fn an_abandoned_child_whose_group_kill_is_refused_is_warned_about_once(#[fixture(cgroup)] _group: &Group) {
     crate::log_capture::install();
-    let child = paused_group_leader();
+    let (child, input) = group_leader_ending_at_eof();
     let received = received(child, Some(PlacementReport::WriteFailed(libc::EBADF)));
     let pid = received.pid.expect("a pid");
+    let (_released, ended) = release_at_the_exit_wait(pid, input, || {});
     fault::set_force_group_kill_denied(true);
 
     let mark = crate::log_capture::mark();
     assert_eq!(end_child(&received), ChildFate::Killed);
+    assert_killed(&ended);
 
     let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "")
         .into_iter()
@@ -307,16 +365,20 @@ fn an_abandoned_child_reaped_elsewhere_after_its_group_kill_is_killed(#[fixture(
 /// Where the kernel refuses `PIDFD_SIGNAL_PROCESS_GROUP` (before 6.9), the group kill of a child
 /// outside its leaf goes by its number only right after a check that the child is still unreaped,
 /// and kills its member. Mutants: "no check before the group kill by number", "`EINVAL` ends the
-/// group kill", "the group kill by number is not made".
+/// group kill", "the group kill by number is not made", "the group kill by number and the handle's
+/// kill both send nothing" (the leader ends by itself, released at the exit wait, and `assert_killed`
+/// fails).
 #[skuld::test]
 fn an_abandoned_childs_group_kill_by_number_follows_its_own_check() {
     use crate::send_log::{GroupStep, Route};
-    let (child, to_member, from_member) = leader_with_member(false);
+    let (child, input, to_member, from_member) = leader_held_with_member();
     let received = received(child, Some(PlacementReport::WriteFailed(libc::EBADF)));
+    let (_released, ended) = release_at_the_exit_wait(received.pid.expect("a pid"), input, || {});
     let capture = crate::send_log::Capture::start();
     let refused = crate::containment::unix::fault::refuse_pidfd_group_flag();
 
     assert_eq!(end_child(&received), ChildFate::Killed);
+    assert_killed(&ended);
     drop(refused);
     assert_eq!(member_output(to_member, from_member), "", "the member was killed");
     assert_eq!(
@@ -331,15 +393,26 @@ fn an_abandoned_childs_group_kill_by_number_follows_its_own_check() {
 }
 
 /// Linux 6.9+: the group kill of a child outside its leaf goes through its handle, which names the
-/// group exactly.
+/// group exactly, and kills its member: the handle's kill ends only the child.
+///
+/// Mutants: the group send through the handle sends nothing (the member survives); it and the
+/// handle's kill both send nothing (the leader ends by itself, released at the exit wait, and
+/// `assert_killed` fails).
 #[skuld::test]
 fn an_abandoned_childs_group_kill_goes_through_its_handle(#[fixture(pidfd_group_signal)] _group: &Group) {
     use crate::send_log::{GroupStep, Route};
-    let child = paused_group_leader();
+    let (child, input, to_member, from_member) = leader_held_with_member();
     let received = received(child, Some(PlacementReport::WriteFailed(libc::EBADF)));
+    let (_released, ended) = release_at_the_exit_wait(received.pid.expect("a pid"), input, || {});
     let capture = crate::send_log::Capture::start();
 
     assert_eq!(end_child(&received), ChildFate::Killed);
+    assert_killed(&ended);
+    assert_eq!(
+        member_output(to_member, from_member),
+        "",
+        "the group kill ended the member"
+    );
     assert_eq!(capture.group_steps(), [GroupStep::Group(Route::Pidfd, libc::SIGKILL)]);
 }
 
@@ -395,50 +468,79 @@ fn assert_one_warn_for_the_unsent_group_kill(mark: usize, pid: u32) {
 }
 
 /// A forked group leader that forked a member into its group, as a child that exec'd outside its
-/// leaf may, then exited if `leader_exits`, else paused until killed. The member blocks reading the
-/// returned writer's pipe; once that closes it writes `survived` to the returned reader's pipe and
-/// exits, so a member a kill missed is seen as that marker, never as a hang. Returns once the member
-/// exists.
-fn leader_with_member(leader_exits: bool) -> (KillOnDrop, std::io::PipeWriter, std::io::PipeReader) {
+/// leaf may. The leader exits at once. The member blocks reading the returned writer's pipe; once
+/// that closes it writes `survived` to the returned reader's pipe and exits, so a member a kill
+/// missed is seen as that marker, never as a hang. Returns once the member exists.
+fn leader_with_member_exiting() -> (KillOnDrop, std::io::PipeWriter, std::io::PipeReader) {
+    let (leader, _, to_member, from_member) = fork_leader_with_member(false);
+    (leader, to_member, from_member)
+}
+
+/// [`leader_with_member_exiting`], but the leader runs until the returned writer, its input,
+/// closes, and then exits by itself. So a leader no kill reached ends by itself, not by `SIGKILL`,
+/// where waiting on it would hang (see [`release_at_the_exit_wait`]).
+fn leader_held_with_member() -> (
+    KillOnDrop,
+    std::io::PipeWriter,
+    std::io::PipeWriter,
+    std::io::PipeReader,
+) {
+    fork_leader_with_member(true)
+}
+
+/// A leader's input writer (held leaders only), then the member's writer and reader.
+fn fork_leader_with_member(
+    held: bool,
+) -> (
+    KillOnDrop,
+    std::io::PipeWriter,
+    std::io::PipeWriter,
+    std::io::PipeReader,
+) {
     use std::os::fd::AsRawFd;
     let (from_test, to_member) = std::io::pipe().expect("pipe");
     let (from_member, to_test) = std::io::pipe().expect("pipe");
+    let (leader_input, to_leader) = std::io::pipe().expect("pipe");
     let fds = [
         from_test.as_raw_fd(),
         to_member.as_raw_fd(),
         from_member.as_raw_fd(),
         to_test.as_raw_fd(),
+        leader_input.as_raw_fd(),
+        to_leader.as_raw_fd(),
     ];
     let leader = fork_running(move || {
-        let [input, test_end, _, output] = fds;
+        let [input, test_end, member_reader, output, leader_in, leader_test_end] = fds;
         // SAFETY: async-signal-safe syscalls on fds this process holds.
         unsafe {
             libc::setpgid(0, 0);
+            // Closed before the fork, so the member holds no end of the leader's input.
+            libc::close(leader_test_end);
             if libc::fork() == 0 {
                 libc::close(test_end);
-                libc::close(fds[2]);
+                libc::close(member_reader);
+                libc::close(leader_in);
                 let mut byte = 0u8;
                 while libc::read(input, (&raw mut byte).cast(), 1) == 1 {}
                 libc::write(output, b"survived".as_ptr().cast(), 8);
                 libc::_exit(0);
             }
             libc::write(output, b"r".as_ptr().cast(), 1);
-            if !leader_exits {
-                loop {
-                    libc::pause();
-                }
+            if held {
+                let mut byte = 0u8;
+                while libc::read(leader_in, (&raw mut byte).cast(), 1) == 1 {}
             }
         }
     });
-    drop((from_test, to_test));
+    drop((from_test, to_test, leader_input));
     let mut from_member = from_member;
     let mut ready = [0u8; 1];
     std::io::Read::read_exact(&mut from_member, &mut ready).expect("the member exists");
     assert_eq!(&ready, b"r");
-    (leader, to_member, from_member)
+    (leader, to_leader, to_member, from_member)
 }
 
-/// What the member of [`leader_with_member`] wrote once its pipe closed: `survived`, or
+/// What the member of [`leader_with_member_exiting`] wrote once its pipe closed: `survived`, or
 /// nothing if it was killed.
 fn member_output(to_member: std::io::PipeWriter, mut from_member: std::io::PipeReader) -> String {
     drop(to_member);
@@ -454,7 +556,7 @@ fn member_output(to_member: std::io::PipeWriter, mut from_member: std::io::PipeR
 #[skuld::test]
 fn an_abandoned_child_reaped_before_the_look_has_its_group_killed(#[fixture(pidfd_group_signal)] _group: &Group) {
     use crate::send_log::{GroupStep, Route};
-    let (leader, to_member, from_member) = leader_with_member(true);
+    let (leader, to_member, from_member) = leader_with_member_exiting();
     let received = received(leader, Some(PlacementReport::WriteFailed(libc::EBADF)));
     crate::test_child::reaped_elsewhere::reap_behind(received.pid.expect("a pid"));
     let capture = crate::send_log::Capture::start();
@@ -475,7 +577,7 @@ fn an_abandoned_child_reaped_before_the_look_has_its_group_killed(#[fixture(pidf
 fn an_abandoned_child_reaped_before_the_look_gets_no_group_kill_by_number() {
     use crate::send_log::{GroupStep, Route};
     crate::log_capture::install();
-    let (leader, to_member, from_member) = leader_with_member(true);
+    let (leader, to_member, from_member) = leader_with_member_exiting();
     let received = received(leader, Some(PlacementReport::WriteFailed(libc::EBADF)));
     let pid = received.pid.expect("a pid");
     crate::test_child::reaped_elsewhere::reap_behind(pid);

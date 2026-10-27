@@ -146,9 +146,15 @@ fn drop_skipped_its_kill(mark: usize) -> bool {
 }
 
 /// Blocks until the grandchild most recently reported on this thread has exited, for a test whose
-/// tree helper panicked and whose contained `Child` the unwind dropped: that drop's tree kill is
-/// the only thing that ends the grandchild. `mark` is a [`log_mark`](super::log_mark) taken, after
-/// [`install_log_capture`](super::install_log_capture), before the helper ran.
+/// tree helper panicked and whose contained `Child` the unwind dropped. `mark` is a
+/// [`log_mark`](super::log_mark) taken, after [`install_log_capture`](super::install_log_capture),
+/// before the helper ran.
+///
+/// What ends the grandchild depends on the tree. A Linux cgroup or process-group tree of an
+/// `*_ending_a_failure` helper was ended by its `kill_tree` before the unwind and asserted dead
+/// there, so the drop proves nothing about it. Any other tree's grandchild is ended by that drop's
+/// tree kill, or by itself first: the unwind closes the sockets and the listener, then drops the
+/// `Child` last (`Tree`'s field order).
 ///
 /// The grandchild must have been a live member of the containment when identified, and the drop
 /// must not have skipped its kill; both are asserted so the wait cannot hang. On a skipped kill

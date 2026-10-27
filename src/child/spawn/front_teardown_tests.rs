@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use super::{teardown_unadopted_or_front, FrontFate, PidfdChild, Unadopted};
-use crate::child::front_cgroup_tests::{move_out_of_its_leaf, pidfd_of, reaped};
+use crate::child::front_cgroup_tests::{move_out_of_its_leaf, pidfd_of, reaped, release_after_cgroup_kill};
 use crate::child::front_kill_tests::cat;
 use crate::command::Command;
 use crate::elevation::{Backend, ElevatedVia};
@@ -74,14 +74,19 @@ fn sudo_front() -> Option<crate::elevation::front::Front> {
 /// A front its leaf's kill reached is waited for, through its pidfd, and reaped.
 #[skuld::test]
 fn cgroup_a_front_the_leaf_kill_reached_is_waited_for_and_reaped(#[fixture(cgroup)] _group: &Group) {
-    let (child, pid, _stdin) = contained_cat();
+    let (child, pid, stdin) = contained_cat();
     let id = Some(child.id());
     let observer = pidfd_of(pid);
     let subtree = leaf_of(&child).subtree().expect("the leaf's subtree");
+    // Released as the kill returns: a kill that sent nothing ends the front by itself, and
+    // `assert_killed` fails, instead of the teardown's wait hanging.
+    let release = release_after_cgroup_kill(stdin);
+    release.observe(pid);
     child
         .attached
         .hard_kill(&crate::containment::GroupRoot::none())
         .expect("cgroup.kill");
+    release.assert_killed();
     let waited = Arc::new(AtomicBool::new(false));
     let front = NotYetExited {
         inner: PidfdChild::new(Some(pid), pidfd_of(pid)),
@@ -179,10 +184,15 @@ fn cgroup_a_front_whose_place_cannot_be_read_is_left_unwaited(#[fixture(cgroup)]
     let id = Some(child.id());
     let observer = pidfd_of(pid);
     let subtree = leaf_of(&child).subtree().expect("the leaf's subtree");
+    // Released as the kill returns: a kill that sent nothing ends the cat by itself, and
+    // `assert_killed` fails.
+    let release = release_after_cgroup_kill(stdin);
+    release.observe(pid);
     child
         .attached
         .hard_kill(&crate::containment::GroupRoot::none())
         .expect("cgroup.kill");
+    release.assert_killed();
     let waited = Arc::new(AtomicBool::new(false));
     let front = NotYetExited {
         inner: PidfdChild::new(Some(pid), pidfd_of(pid)),
@@ -202,7 +212,6 @@ fn cgroup_a_front_whose_place_cannot_be_read_is_left_unwaited(#[fixture(cgroup)]
     assert_eq!(notes[0].0, log::Level::Debug);
     assert!(notes[0].1.contains("Input/output error"), "{notes:?}");
     // The cat died of the leaf's kill; the teardown left it unreaped.
-    drop(stdin);
     assert!(!reaped(&observer));
     let mut cleanup = PidfdChild::new(Some(pid), observer);
     cleanup.wait().expect("reap the cat");
@@ -218,10 +227,15 @@ fn cgroup_a_front_the_leaf_kill_reached_whose_wait_fails_is_unaccounted_for(#[fi
     let id = Some(child.id());
     let observer = pidfd_of(pid);
     let subtree = leaf_of(&child).subtree().expect("the leaf's subtree");
+    // Released as the kill returns: a kill that sent nothing ends the cat by itself, and
+    // `assert_killed` fails.
+    let release = release_after_cgroup_kill(stdin);
+    release.observe(pid);
     child
         .attached
         .hard_kill(&crate::containment::GroupRoot::none())
         .expect("cgroup.kill");
+    release.assert_killed();
     let waited = Arc::new(AtomicBool::new(false));
     let front = NotYetExited {
         inner: PidfdChild::new(Some(pid), pidfd_of(pid)),
@@ -239,7 +253,6 @@ fn cgroup_a_front_the_leaf_kill_reached_whose_wait_fails_is_unaccounted_for(#[fi
         warns[0].1.contains("waited on a front the leaf's kill did not reach"),
         "{warns:?}"
     );
-    drop(stdin);
     let mut cleanup = PidfdChild::new(Some(pid), observer);
     cleanup.wait().expect("reap the cat");
     drop(child);

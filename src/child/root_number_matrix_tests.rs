@@ -99,7 +99,7 @@ impl Mechanism {
 
     /// The tree's command: [`TREE`] under this mechanism, with every stdio piped.
     fn configure(self, cmd: &mut crate::Command) {
-        cmd.args(["sh", "-c", TREE]);
+        cmd.args(["sh", "-c", if self.is_cgroup() { TREE_SAYING_EOF } else { TREE }]);
         cmd.contain_with(self.mode());
         #[cfg(target_os = "macos")]
         if matches!(self, Mechanism::Group | Mechanism::TreeWalk) {
@@ -120,6 +120,19 @@ const TREE: &str = r#"exec 3<&0
 sh -c 'trap "" TERM; echo $$; exec cat >/dev/null' <&3 3<&- &
 exec 3<&-
 exec cat >/dev/null"#;
+
+/// [`TREE`] with the forked `cat` under a `sh` that prints its pid and says `eof` on stderr once that
+/// `cat` ends by itself. A `cat` a kill ended exits by a signal, and the `&&` says nothing, however
+/// the kernel orders the two deaths.
+const TREE_SAYING_EOF: &str = r#"exec 3<&0
+sh -c 'trap "" TERM; echo $$; cat >/dev/null && echo eof >&2' <&3 3<&- &
+exec 3<&-
+exec cat >/dev/null"#;
+
+/// Whether the forked `cat` said it ended by itself: stderr, read to its end, holds `eof`.
+fn said_eof(stderr: &[u8]) -> bool {
+    String::from_utf8_lossy(stderr).lines().any(|line| line == "eof")
+}
 
 /// How the root was reaped before the entry point ran, and what its pid reads as then.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -325,6 +338,8 @@ struct Sent {
     /// A cgroup member's `SIGTERM` through its pidfd.
     member_term: bool,
     cgroup_kill: bool,
+    /// A cgroup's forked `cat` ended by itself, once stdin closed, and not of a signal.
+    survivor_ended_alone: bool,
 }
 
 /// What a cell must send through one channel.
@@ -359,6 +374,8 @@ struct Expected {
     /// A cgroup member's `SIGTERM` through its pidfd.
     member_term: Want,
     cgroup_kill: Want,
+    /// A cgroup's kill ends the forked `cat` before stdin closes.
+    survivor_ended_alone: Want,
 }
 
 /// The killpg after this handle's own reap, while the pid names nothing: the group may still have
@@ -445,6 +462,7 @@ fn expected(mechanism: Mechanism, reap: Reap, op: Op) -> Expected {
         pidfd,
         member_term,
         cgroup_kill,
+        survivor_ended_alone: if cgroup_kill == Want::Yes { Want::No } else { Want::Any },
     }
 }
 
@@ -462,6 +480,11 @@ fn mismatches(want: &Expected, sent: &Sent) -> Vec<String> {
     check("pidfd", want.pidfd, sent.pidfd);
     check("member SIGTERM", want.member_term, sent.member_term);
     check("cgroup.kill", want.cgroup_kill, sent.cgroup_kill);
+    check(
+        "survivor ended alone",
+        want.survivor_ended_alone,
+        sent.survivor_ended_alone,
+    );
     if let Some(holder) = want.holder {
         if sent.holder != holder {
             wrong.push(format!("holder: want {holder:?}, sent {:?}", sent.holder));
@@ -535,6 +558,7 @@ impl Recorders {
             root_holder: Vec::new(),
             pidfd: entries.iter().any(|(pid, _, via)| *pid == root && *via == Via::Pidfd),
             cgroup_kill,
+            survivor_ended_alone: false,
         }
     }
 }
@@ -565,7 +589,7 @@ fn run_sync(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
         .read_line(&mut line)
         .expect("read the cat's pid");
     let cat = cat_pid(&line);
-    let stdin = child.stdin().expect("stdin pipe");
+    let stdin = std::rc::Rc::new(std::cell::Cell::new(Some(child.stdin().expect("stdin pipe"))));
     let mut stderr = child.stderr().expect("stderr pipe");
     let root = child.id().pid();
     if reap.reaped() {
@@ -581,6 +605,7 @@ fn run_sync(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
     }
     let mut forced = reap.force(child.id());
 
+    let _released = release_when_the_drain_blocks(mechanism, &stdin);
     let recorders = Recorders::start();
     // The cell checks what was sent, not what the call answered.
     _ = match op {
@@ -597,7 +622,7 @@ fn run_sync(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
         }
     };
     reap.assert_forced_used();
-    let sent = recorders.sent(root, cat);
+    let mut sent = recorders.sent(root, cat);
     if reap.lift_before_cleanup() {
         drop(forced.take());
     }
@@ -607,11 +632,12 @@ fn run_sync(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
         child.kill().expect("kill the root");
         child.wait().expect("reap the root");
     }
-    drop(stdin);
+    drop(stdin.take());
     let mut rest = Vec::new();
     stderr
         .read_to_end(&mut rest)
         .expect("the root and the cat are gone, closing stderr");
+    sent.survivor_ended_alone = said_eof(&rest);
     if mechanism.is_cgroup() {
         child.wait_tree().expect("the leaf drains");
     }
@@ -627,6 +653,25 @@ fn failed_write() -> Result<(), crate::error::Error> {
     )))
 }
 
+/// A cgroup's teardown, and its graceful shutdown, wait for the leaf to drain, which only its kill
+/// brings about: when that wait is about to block, stdin is closed, so a kill that sent nothing
+/// lets the tree end by itself instead of the wait hanging.
+#[cfg(target_os = "linux")]
+fn release_when_the_drain_blocks<T: 'static>(
+    mechanism: Mechanism,
+    stdin: &std::rc::Rc<std::cell::Cell<Option<T>>>,
+) -> Option<crate::oneshot_hook::Armed> {
+    mechanism.is_cgroup().then(|| {
+        let stdin = std::rc::Rc::clone(stdin);
+        crate::containment::cgroup::fault::set_before_drain_block(move || drop(stdin.take()))
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn release_when_the_drain_blocks<T>(_: Mechanism, _: &std::rc::Rc<std::cell::Cell<Option<T>>>) -> Option<()> {
+    None
+}
+
 /// What a sync teardown sent, then the end of what it left: closing stdin ends a root it left
 /// alone and a `cat` it did not kill. A root left unreaped stays a zombie until the test process
 /// ends, as nothing may reap it by its number.
@@ -636,18 +681,19 @@ fn finish_teardown(
     recorders: Recorders,
     root: u32,
     cat: u32,
-    stdin: std::io::PipeWriter,
+    stdin: std::rc::Rc<std::cell::Cell<Option<std::io::PipeWriter>>>,
     mut stderr: std::io::PipeReader,
 ) -> Sent {
     use std::io::Read as _;
     reap.assert_forced_used();
-    let sent = recorders.sent(root, cat);
+    let mut sent = recorders.sent(root, cat);
     drop(forced);
-    drop(stdin);
+    drop(stdin.take());
     let mut rest = Vec::new();
     stderr
         .read_to_end(&mut rest)
         .expect("the root and the cat are gone, closing stderr");
+    sent.survivor_ended_alone = said_eof(&rest);
     drop(recorders);
     sent
 }
@@ -666,7 +712,7 @@ async fn run_tokio(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
         .await
         .expect("read the cat's pid");
     let cat = cat_pid(&line);
-    let stdin = child.stdin().expect("stdin pipe");
+    let stdin = std::rc::Rc::new(std::cell::Cell::new(Some(child.stdin().expect("stdin pipe"))));
     let mut stderr = child.stderr().expect("stderr pipe");
     let root = child.id().pid();
     if reap.reaped() {
@@ -687,6 +733,7 @@ async fn run_tokio(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
     let leaf = child
         .leaf_path_for_test()
         .map(|path| (crate::test_groups::cgroup_leaf::LeafGuard::new(path.clone()), path));
+    let _released = release_when_the_drain_blocks(mechanism, &stdin);
     let recorders = Recorders::start();
     // The cell checks what was sent, not what the call answered.
     let teardown = match op {
@@ -712,14 +759,15 @@ async fn run_tokio(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
             _ = crate::tokio::finish_elevated(child, failed_write());
         }
         reap.assert_forced_used();
-        let sent = recorders.sent(root, cat);
+        let mut sent = recorders.sent(root, cat);
         drop(forced);
-        drop(stdin);
+        drop(stdin.take());
         let mut rest = Vec::new();
         stderr
             .read_to_end(&mut rest)
             .await
             .expect("the root and the cat are gone, closing stderr");
+        sent.survivor_ended_alone = said_eof(&rest);
         #[cfg(target_os = "linux")]
         if let Some((_guard, path)) = leaf {
             crate::test_groups::cgroup_leaf::drain_and_remove_leaf(&path);
@@ -728,7 +776,7 @@ async fn run_tokio(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
         return sent;
     }
     reap.assert_forced_used();
-    let sent = recorders.sent(root, cat);
+    let mut sent = recorders.sent(root, cat);
     if reap.lift_before_cleanup() {
         drop(forced.take());
     }
@@ -737,12 +785,13 @@ async fn run_tokio(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
         child.kill().expect("kill the root");
         child.wait().await.expect("reap the root");
     }
-    drop(stdin);
+    drop(stdin.take());
     let mut rest = Vec::new();
     stderr
         .read_to_end(&mut rest)
         .await
         .expect("the root and the cat are gone, closing stderr");
+    sent.survivor_ended_alone = said_eof(&rest);
     if mechanism.is_cgroup() {
         child.wait_tree().await.expect("the leaf drains");
     }
@@ -828,9 +877,10 @@ fn tree_paths_send_nothing_by_the_root_number_after_a_reap() {
     ]);
 }
 
-/// A cgroup names no pid, so its kill still runs after any reap.
+/// A cgroup names no pid, so its kill still runs after any reap, and ends the forked `cat` before stdin
+/// closes: the cell fails if that `cat` says it ended by itself.
 ///
-/// Mutant: the cgroup's kill skipped after a reap.
+/// Mutants: the cgroup's kill skipped after a reap; a `cgroup.kill` write that sends nothing.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn cgroup_tree_paths_still_kill_through_the_cgroup_after_a_reap(#[fixture(cgroup)] _group: &Group) {

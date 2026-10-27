@@ -342,9 +342,11 @@ fn assert_leaf_removed(leaf: &std::path::Path) {
     );
 }
 
-// The mechanisms that still kill after the root is reaped: a macOS fd marker's holder sweep, a
-// Windows Job Object, and (in the cgroup lane) a cgroup. A process group does on Linux 6.9+, through
-// the root's pidfd, and not below 6.9: both are `src/tokio/child/drop_group_exact_tests.rs`'s.
+// The mechanisms that still kill after the root is reaped: a macOS fd marker's holder sweep and a
+// Windows Job Object. A cgroup does on Linux, and a process group on Linux 6.9+, through the root's
+// pidfd, and not below 6.9: both are the library's tests (`src/tokio/child_drop_reaped_tests.rs`,
+// `src/tokio/child/drop_group_exact_tests.rs`). This binary cannot reach the seams that release
+// the tree at the kill, and a drop that killed nothing waits for it for ever.
 #[cfg(feature = "tokio")]
 #[cfg(any(windows, target_os = "macos"))]
 #[skuld::test]
@@ -353,15 +355,7 @@ async fn async_drop_after_wait_still_tears_down_the_tree() {
 }
 
 #[cfg(feature = "tokio")]
-/// The cgroup lane's case of the test above.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-async fn linux_cgroup_v2_async_drop_after_wait_still_tears_down_the_tree(#[fixture(cgroup)] _group: &Group) {
-    drop_after_wait_still_tears_down_the_tree().await;
-}
-
-#[cfg(feature = "tokio")]
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "macos")]
 async fn drop_after_wait_still_tears_down_the_tree() {
     // After awaiting the root's exit it is already reaped, so the drop has no root to signal and
     // the tree teardown must come from attached.hard_kill(). The drop stays the killer:
@@ -375,8 +369,6 @@ async fn drop_after_wait_still_tears_down_the_tree() {
         cmd.env(common::ECHO_HELD_ENV, "1");
     })
     .await;
-    let leaf = cgroup_leaf_of(&child);
-    let _leaf_cleanup = leaf_cleanup(&leaf);
     let root_id = child.id();
     drop(root); // EOF: the root leaves on its own, so the drop below has no root to kill
     child.wait().await.expect("wait reaps the root");
@@ -388,12 +380,6 @@ async fn drop_after_wait_still_tears_down_the_tree() {
         &mut grand,
         "the grandchild not torn down by hard_kill after the root was waited",
     );
-    #[cfg(target_os = "linux")]
-    if let Some(leaf) = &leaf {
-        assert_leaf_removed(leaf);
-    }
-    #[cfg(not(target_os = "linux"))]
-    let _ = leaf;
 }
 
 #[cfg(feature = "tokio")]
@@ -596,65 +582,6 @@ async fn linux_cgroup_v2_async_kill_tree_then_wait_tree_then_drop_leaves_no_leaf
         "a leaf that was removed must not be warned about"
     );
     drop((root, grand));
-}
-
-#[cfg(feature = "tokio")]
-/// `kill_tree()` is not called: the drop alone is the killer. A member the test itself spawned and
-/// placed in the leaf dies of `SIGKILL`, which the test reads by reaping it (a grandchild of the
-/// root cannot be reaped here, because tokio owns the root's children's parent).
-///
-/// The drop waits for the leaf to drain, so the leaf is gone.
-///
-/// Mutant: the drop's `cgroup.kill` write is a no-op.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-async fn linux_cgroup_v2_async_drop_alone_kills_the_members_and_removes_the_leaf(#[fixture(cgroup)] _group: &Group) {
-    use std::os::unix::process::ExitStatusExt as _;
-
-    common::install_log_capture();
-    let common::AsyncEchoTree {
-        child,
-        mut root,
-        mut grand,
-        grand_pid,
-    } = common::spawn_echo_tree_async(true).await;
-    assert_eq!(child.containment(), cosca::Containment::CgroupV2);
-    let leaf = common::cgroup::cgroup_of(grand_pid);
-    let _leaf_cleanup = common::cgroup::LeafGuard::new(leaf.clone());
-
-    // A member of the test's own, blocked on its stdin and placed in the leaf.
-    let mut member = common::spawn_locked(
-        std::process::Command::new("cat")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null()),
-    )
-    .expect("spawn a member");
-    let member_stdin = member.stdin.take().expect("the member's piped stdin");
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(leaf.join("cgroup.procs"))
-        .and_then(|mut procs| std::io::Write::write_all(&mut procs, member.id().to_string().as_bytes()))
-        .expect("place the member in the leaf");
-    assert_eq!(
-        common::cgroup::cgroup_of(member.id()),
-        leaf,
-        "the member must be in the tree's leaf"
-    );
-
-    drop(child);
-
-    // `cgroup.kill` signalled the member before its stdin closes, so it dies of SIGKILL rather
-    // than of the end of its input.
-    drop(member_stdin);
-    let status = member.wait().expect("reap the member");
-    assert_eq!(
-        status.signal(),
-        Some(libc::SIGKILL),
-        "the drop must kill the leaf's members"
-    );
-    common::assert_dead(&mut root, "the root not torn down on drop");
-    common::assert_dead(&mut grand, "the grandchild not torn down on drop");
-    assert_leaf_removed(&leaf);
 }
 
 #[cfg(feature = "tokio")]
@@ -1422,15 +1349,16 @@ async fn death_watch_spawn_tree_async_panics_when_the_root_dies_after_reporting_
 }
 
 #[cfg(feature = "tokio")]
-/// Returns the helper's panic message. Contained so unwinding kills the orphaned grandchild. The
-/// unwind drops the `Child` before `panic_message_of` returns, but the drop only sends the kill, so
-/// wait for the exit by identity.
+/// Returns the helper's panic message. The tree is contained; the helper ends it before unwinding
+/// where it can (a cgroup or a process group), and the unwind's drop kills it otherwise. The unwind drops the `Child`
+/// before `panic_message_of` returns, but the drop only sends the kill, so wait for the exit by
+/// identity.
 async fn async_root_dies_after_reporting() -> String {
     common::install_log_capture();
     let mark = common::log_mark();
-    let message = panic_message_of(common::spawn_tree_async("spawn-grandchild-report-then-exit", |cmd| {
-        cmd.contain();
-    }))
+    let message = panic_message_of(common::spawn_tree_async_ending_a_failure(
+        "spawn-grandchild-report-then-exit",
+    ))
     .await;
     assert!(message.contains("died before it connected"), "got: {message:?}");
     common::wait_for_the_dropped_trees_grandchild(mark, &message);

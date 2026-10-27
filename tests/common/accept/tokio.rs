@@ -69,6 +69,26 @@ pub async fn accept_or_die_async_also(
     }
 }
 
+/// [`accept_or_die_descendant`](super::accept_or_die_descendant)'s async twin: accepts, or fails
+/// when the descendant `id` of a root that is already gone exits first.
+pub async fn accept_or_die_async_descendant(listener: &::tokio::net::TcpListener, id: ProcessId) -> TcpStream {
+    let process = cosca::tokio::Process::from_id(id);
+    ::tokio::select! {
+        biased;
+        accepted = listener.accept() => {
+            let (stream, _) = accepted.expect("accept a control connection");
+            ack_now(blocking_std(stream.into_std().expect("convert the accepted tokio stream to std")))
+        }
+        // Identity-verified: a reissued pid resolves to a different identity and is Gone.
+        waited = process.wait() => {
+            if let Err(e) = waited {
+                panic!("watching pid {}'s exit while waiting for a connection: {e}", id.pid());
+            }
+            died_before_connecting(id.pid())
+        }
+    }
+}
+
 /// `into_std` does NOT reset blocking mode (it rewraps the same fd/socket, which tokio keeps
 /// non-blocking), and every caller does ordinary BLOCKING std reads and writes on the result.
 pub(crate) fn blocking_std(stream: TcpStream) -> TcpStream {

@@ -36,7 +36,28 @@ pub(super) fn wait(source: Source<'_>, target_pid: u32, also: Option<ProcessId>)
             Err(e) => panic!("pidfd_open({pid}) for the death-watch: {}", std::io::Error::from(e)),
         }
     }
+    notify_armed(target_pid, also);
+    poll_watched(source, watched)
+}
 
+/// [`wait`] for a descendant of a root that is already gone, watched by its identity alone: the
+/// watch is opened and then confirmed against `id`, so a reissued pid is reported as the descendant
+/// being gone, never watched.
+pub(super) fn wait_for_descendant(source: Source<'_>, id: ProcessId) -> WatchEvent {
+    let pid = id.pid();
+    match open(pid) {
+        Ok(fd) => match id.exists() {
+            Existence::Present => poll_watched(source, vec![(pid, fd)]),
+            Existence::Gone => WatchEvent::Died(pid),
+            Existence::Unknown => panic!("the OS refused to confirm the identity of pid {pid} for the death-watch"),
+        },
+        Err(rustix::io::Errno::SRCH) => WatchEvent::Died(pid),
+        Err(e) => panic!("pidfd_open({pid}) for the death-watch: {}", std::io::Error::from(e)),
+    }
+}
+
+/// Polls `source` and the exit of each of `watched` until one is ready.
+fn poll_watched(source: Source<'_>, watched: Vec<(u32, OwnedFd)>) -> WatchEvent {
     // `poll` ignores a negative fd, so `Never` leaves only the pidfds to wake it.
     let source_fd = match source {
         Source::Listener(l) => l.as_raw_fd(),
@@ -53,7 +74,6 @@ pub(super) fn wait(source: Source<'_>, target_pid: u32, also: Option<ProcessId>)
         events: libc::POLLIN,
         revents: 0,
     }));
-    notify_armed(target_pid, also);
     loop {
         // SAFETY: `fds` is a valid, correctly-sized array for the call's duration.
         let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };

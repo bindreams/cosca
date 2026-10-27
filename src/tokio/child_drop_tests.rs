@@ -453,6 +453,11 @@ async fn an_async_drop_removes_an_already_drained_leaf() {
     let (steps, levels) = linux::dropped(linux::contained_by(child, leaf), name);
 
     assert_eq!(steps, ["kill", "rmdir populated 0"]);
+    assert_eq!(
+        fake.kill_written(),
+        crate::containment::cgroup::KILL_PAYLOAD,
+        "the tree kill must write cgroup.kill"
+    );
     assert!(!fake.leaf.exists(), "a drained leaf is removed");
     assert_eq!(levels, Vec::<log::Level>::new());
     teardown.assert_killed();
@@ -482,9 +487,20 @@ async fn a_kill_on_drop_false_drop_of_an_armed_leaf_never_blocks() {
     // The root stays alive: only the tree is killed.
     let view = child.read_root_view("test");
     child.kill_tree_members_unless_reaped(&view).expect("kill the tree");
+    assert_eq!(
+        fake.kill_written(),
+        crate::containment::cgroup::KILL_PAYLOAD,
+        "this handle's tree kill must write cgroup.kill"
+    );
+    fake.clear_kill();
     let (steps, levels) = linux::dropped(child, name);
 
     assert_eq!(steps, ["rmdir populated 1", "kill"]);
+    assert_eq!(
+        fake.kill_written(),
+        crate::containment::cgroup::KILL_PAYLOAD,
+        "the release must write cgroup.kill again, not only record the step"
+    );
     assert!(fake.leaf.exists());
     assert_eq!(levels, [log::Level::Warn]);
     assert_eq!(
@@ -540,6 +556,7 @@ async fn a_root_whose_kill_fails_is_handed_off_not_waited_on() {
     let armed = fault::force_kill_failure();
     child.kill_tree().expect_err("the forced backstop failure surfaces");
     drop(armed);
+    fake.clear_kill();
 
     // Take-once: armed again for the drop's own root kill.
     let _armed = fault::force_kill_failure();
@@ -551,6 +568,11 @@ async fn a_root_whose_kill_fails_is_handed_off_not_waited_on() {
         steps,
         ["kill", "rmdir populated 0"],
         "tree kill, then a release that removes"
+    );
+    assert_eq!(
+        fake.kill_written(),
+        crate::containment::cgroup::KILL_PAYLOAD,
+        "the drop's tree kill must write cgroup.kill, not only record the step"
     );
     assert_eq!(levels, Vec::<log::Level>::new(), "the drained leaf is not warned about");
     let needle = format!("async child {pid} could not be terminated on drop");
