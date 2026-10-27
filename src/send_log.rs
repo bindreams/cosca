@@ -141,8 +141,9 @@ impl Capture {
 }
 
 impl Capture {
-    /// The identity-checked sends by number (`wait::kill`/`terminate`, the tree walk).
-    #[cfg(target_os = "macos")]
+    /// The identity-checked sends by number: the tree walk on every unix, and on macOS also
+    /// `wait::kill` and `wait::terminate` (`src/wait/macos.rs`).
+    #[cfg(unix)]
     pub(crate) fn by_identity(&self) -> Vec<IdentityEntry> {
         BY_IDENTITY.with(|log| log.borrow().clone().expect("a live capture has a log"))
     }

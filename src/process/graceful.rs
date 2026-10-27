@@ -36,6 +36,8 @@ impl Process {
     /// the grace wait, or the kill.
     pub fn graceful_shutdown(&self, grace: Duration) -> Result<(), Error> {
         crate::wait::terminate(self.id)?;
+        #[cfg(test)]
+        crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterTerminate);
         // A watch failure must not strand the process between the soft signal and the
         // escalation — the kill still runs (grace unobservable => escalate now); the watch
         // error surfaces only after it succeeds (a kill error wins — deliberate subsumption,
@@ -108,6 +110,8 @@ impl Process {
     /// includes a refused `pidfd_open` (see [`Error::Unsupported`]).
     pub fn graceful_shutdown_tree(&self, grace: Duration) -> Result<(), Error> {
         self.terminate_tree()?; // SIGTERM-walk (Windows: Unsupported, early return)
+        #[cfg(test)]
+        crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterTerminate);
 
         // Watch-Err ordering: sweep first, then surface (see graceful_shutdown above).
         let watch = crate::wait::block_until_exit(self.id, Some(grace));
