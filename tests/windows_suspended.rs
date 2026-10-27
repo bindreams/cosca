@@ -400,10 +400,12 @@ async fn an_async_resumed_then_detached_child_outlives_its_handles() {
 /// One `spawn-measured-child` run, after the helper and the plain grandchild of its child have both
 /// reported. Both sockets stay open, so everything stays blocked and alive until [`finish`](Self::finish).
 struct Measured {
+    // Before `helper`, so a failed assertion closes them first: the helper's drop then ends it
+    // whatever its kill does, instead of waiting on a helper still blocked on them.
+    socks: [TcpStream; 2],
     helper: cosca::Child,
     helper_line: String,
     grandchild_line: String,
-    socks: [TcpStream; 2],
 }
 
 #[cfg(windows)]
@@ -469,10 +471,10 @@ fn measure(backend: &str, shape: &str, how: &str, helper_contained: bool, ambien
     let grandchild_sock = accept_or_die(&listener, &mut helper);
     let grandchild_line = read_report_line(&grandchild_sock);
     Measured {
+        socks: [helper_sock, grandchild_sock],
         helper,
         helper_line,
         grandchild_line,
-        socks: [helper_sock, grandchild_sock],
     }
 }
 

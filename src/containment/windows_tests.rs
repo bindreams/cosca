@@ -1203,7 +1203,7 @@ fn resume_initial_threads_with_any_count_accepts_a_thread_that_was_already_runni
 /// The ordinary `contain()` attach, end to end: the same tolerance as above, through `attach_job`.
 #[skuld::test]
 fn death_watch_attach_job_succeeds_when_the_initial_thread_was_already_running() {
-    let mut child = crate::test_frozen::spawn_suspended_blocker();
+    let mut child = crate::test_frozen::spawn_suspended_releasable();
     let thread = crate::test_frozen::InitialThread::of(child.id());
     assert_eq!(thread.release_one(), 1);
 
@@ -1211,14 +1211,16 @@ fn death_watch_attach_job_succeeds_when_the_initial_thread_was_already_running()
         .expect("an ordinary attach must not fail on a running thread")
         .expect("the job was assigned");
 
-    drop(job); // KILL_ON_JOB_CLOSE ends the child
-    child.wait().expect("the job's close killed the child");
+    // KILL_ON_JOB_CLOSE ends the child. `wait` closes its stdin, so a close that killed nothing
+    // lets it run to its end.
+    drop(job);
+    crate::test_frozen::assert_not_released("the child", child.wait().expect("reap the child"));
 }
 
 /// `assign_held` assigns the job and does not resume: the thread stays frozen.
 #[skuld::test]
 fn death_watch_assign_held_assigns_the_job_without_resuming() {
-    let child = crate::test_frozen::spawn_suspended_blocker();
+    let mut child = crate::test_frozen::spawn_suspended_releasable();
     let thread = crate::test_frozen::InitialThread::of(child.id());
 
     let job = super::assign_held(crate::test_frozen::raw(&child)).expect("assign the held child");
@@ -1230,8 +1232,8 @@ fn death_watch_assign_held_assigns_the_job_without_resuming() {
         0
     );
     drop(job); // KILL_ON_JOB_CLOSE ends the child
-    let mut child = child;
-    child.wait().expect("the job's close killed the frozen child");
+    crate::test_frozen::release(&mut child, &thread);
+    crate::test_frozen::assert_not_released("the frozen child", child.wait().expect("reap the frozen child"));
 }
 
 // Win32 codes of job failures =====

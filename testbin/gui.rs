@@ -1,8 +1,9 @@
 //! A GUI-subsystem control child: connect to `argv[1]`, tag, then block on the same socket.
 //!
 //! On Windows the subsystem marking is the whole point — such an image never attaches to its
-//! spawner's console, whatever creation flags the spawn passed, so it is the only way a test
-//! can construct a child whose flags say "in our console" while the OS says otherwise. The
+//! spawner's console, whatever creation flags the spawn passed, so it constructs a child whose
+//! flags say "in our console" while the OS says otherwise, by its image alone (the unit-test
+//! fixture's `Handler::Detached` reaches the same state by freeing its console). The
 //! crate attribute is inert everywhere else, and a `[[bin]]` target cannot be `cfg`-ed out, so
 //! this binary compiles and behaves identically on every platform.
 //!

@@ -10,11 +10,12 @@ use windows::Win32::System::Threading::{
 
 use super::{create_process, RawChild};
 
-/// Kills and reaps the wrapped `RawChild` when dropped — including during a panicking unwind —
+/// Ends and reaps the wrapped `RawChild` when dropped — including during a panicking unwind —
 /// so a deadline-contract test fixture never leaks a live process if an assertion fails
-/// partway through. `RawChild::kill`/`wait` are both idempotent (an already-exited/-killed
-/// child is success), so this is safe even if a test also kills it explicitly on its own
-/// happy path.
+/// partway through. It ends the child with `TerminateProcess` itself and not with
+/// `RawChild::kill`, which some tests are about: a `kill` that did nothing would leave the wait
+/// below unbounded. Safe even if a test also kills it explicitly: `wait` is idempotent and an
+/// already-exited child answers the call with an error nothing reads.
 struct KillOnDrop(RawChild);
 
 impl std::ops::Deref for KillOnDrop {
@@ -26,7 +27,8 @@ impl std::ops::Deref for KillOnDrop {
 
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
-        _ = self.0.kill();
+        // SAFETY: the wrapped child's live process handle.
+        _ = unsafe { TerminateProcess(self.0.handle(), 1) };
         _ = self.0.wait();
     }
 }
@@ -114,6 +116,8 @@ fn raw_is_reaped_only_once_its_own_wait_returns() {
     let child = spawn_suspended();
     assert!(!child.is_reaped());
     child.kill().expect("kill");
+    // Keeps a no-op `kill` from hanging the wait below, which this test does not exercise.
+    end_with_code_zero(child.handle());
     wait_for_exit_unrecorded(child.handle());
     assert!(!child.is_reaped(), "an exit nobody waited on is not a recorded reap");
     child.wait().expect("wait");
@@ -129,10 +133,13 @@ fn proc_handle_raw_is_reaped_only_once_its_own_wait_returns() {
     let handle = ProcHandle::Raw(suspended_raw(RawChild::new));
     assert!(!handle.is_reaped());
     handle.kill().expect("kill");
-    wait_for_exit_unrecorded(match &handle {
+    let raw = match &handle {
         ProcHandle::Raw(r) => r.handle(),
         ProcHandle::Std(_) => unreachable!(),
-    });
+    };
+    // Keeps a no-op `kill` from hanging the wait below, which this test does not exercise.
+    end_with_code_zero(raw);
+    wait_for_exit_unrecorded(raw);
     assert!(!handle.is_reaped(), "an exit nobody waited on is not a recorded reap");
     handle.wait().expect("wait");
     assert!(handle.is_reaped());

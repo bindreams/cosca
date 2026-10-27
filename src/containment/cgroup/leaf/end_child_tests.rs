@@ -101,16 +101,22 @@ fn an_abandoned_childs_foreign_reap_is_debug_not_a_panic() {
 
 /// A child that reported a failed placement exec'd outside its leaf, so what it forks is reachable
 /// only as its process group. That group is killed while the child is still unreaped, before the
-/// kill through its handle, which ends it and so frees its number for a foreign reaper.
+/// kill through its handle, which ends it and so frees its number for a foreign reaper. Its member
+/// is killed: the handle's kill ends only the child.
 ///
-/// Mutant: the group killed after the handle's kill (`[Handle, Group]`).
+/// Mutants: the group killed after the handle's kill (`[Handle, Group]`); the group kill sends nothing.
 #[skuld::test]
 fn an_abandoned_child_outside_its_leaf_is_killed_as_its_group_before_its_handle(#[fixture(cgroup)] _group: &Group) {
-    let child = paused_group_leader();
+    let (child, to_member, from_member) = leader_with_member(false);
     let received = received(child, Some(PlacementReport::WriteFailed(libc::EBADF)));
 
     assert_eq!(end_child(&received), ChildFate::Killed);
     assert_eq!(fault::take_child_sends(), [ChildSend::Group, ChildSend::Handle]);
+    assert_eq!(
+        member_output(to_member, from_member),
+        "",
+        "the group kill ended the member"
+    );
 }
 
 /// A child that entered its leaf is killed with the leaf, and one that never reported never

@@ -745,7 +745,10 @@ mod frozen_attach {
     use crate::containment::windows::fault::{force_next, Step};
     use crate::containment::{ContainMode, Containment};
     use crate::error::Error;
-    use crate::test_frozen::{limit_flags, raw, spawn_suspended_blocker, InitialThread};
+    use crate::test_frozen::{
+        assert_not_released, limit_flags, raw, release, spawn_suspended_blocker, spawn_suspended_releasable,
+        InitialThread,
+    };
     use windows::Win32::System::JobObjects::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
 
     const ERROR_ACCESS_DENIED: u32 = 5;
@@ -774,7 +777,7 @@ mod frozen_attach {
     /// A frozen Strongest root is assigned its containment job and stays suspended.
     #[skuld::test]
     fn death_watch_attach_frozen_assigns_a_strongest_roots_job_and_leaves_the_thread_suspended() {
-        let child = spawn_suspended_blocker();
+        let mut child = spawn_suspended_releasable();
         let thread = InitialThread::of(child.id());
 
         let attachment = attach_suspended(&child, prepared(Some(ContainMode::Strongest), true, true)).expect("attach");
@@ -790,9 +793,10 @@ mod frozen_attach {
         );
         assert_eq!(thread.suspend_count(), 1, "a frozen attach must not resume");
         drop(attachment);
-        child
-            .wait_with_output()
-            .expect("the job's close killed the frozen child");
+        // The close's kill ended it. A close that killed nothing leaves a frozen child that never
+        // runs, so it is released to run to its end, which `assert_not_released` rejects.
+        release(&mut child, &thread);
+        assert_not_released("the frozen child", child.wait().expect("reap the frozen child"));
     }
 
     /// A frozen root needs its job to be held, so a failed assignment fails the attach instead of

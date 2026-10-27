@@ -1275,6 +1275,12 @@ pub(crate) fn windows_blocker_async(
 #[cfg(unix)]
 const TERM_IGNORING_BLOCKER_ARGV: &[&str] = &["sh", "-c", "trap '' TERM; echo r; exec cat"];
 
+/// A root and a grandchild on one stdin pipe, in one process group. The root prints `r` once the
+/// grandchild is forked. The grandchild prints `eof` if its `cat` ends of its own accord, so a test
+/// that closes the stdin only after the kill finds `eof` on the stdout when the kill missed it.
+#[cfg(unix)]
+pub(crate) const CAT_TREE_ARGV: &[&str] = &["sh", "-c", "exec 3<&0; { cat <&3 3<&-; echo eof; } & echo r; exec cat"];
+
 /// Three processes that ignore `SIGTERM` (an ignored disposition survives `exec`) and block on one
 /// stdin pipe: the root (`cat`), a subshell, and the subshell's child `sh`. The child prints `r`
 /// once it runs, so all three exist when a test reads it. Each of the last two then prints its own
@@ -1284,6 +1290,19 @@ pub(crate) const TERM_IGNORING_TREE_ARGV: &[&str] = &[
     "sh",
     "-c",
     "trap '' TERM; exec 3<&0; { sh -c 'echo r; read -r _; echo leaf' <&3 3<&-; echo eof; } & exec cat",
+];
+
+/// A root and a grandchild on one stdin pipe, in one process group. Only the grandchild ignores
+/// `SIGTERM`: the root, `cat` again after the `exec`, has the default disposition back, so the
+/// group's soft signal ends it and leaves a survivor that only a `SIGKILL` sweep reaches. The
+/// ignored disposition is the grandchild's from its fork, so the readiness line (`r`, once the
+/// grandchild is forked) says it already holds. The grandchild prints `eof` if its `cat` ends of its
+/// own accord.
+#[cfg(unix)]
+pub(crate) const TERM_SURVIVOR_TREE_ARGV: &[&str] = &[
+    "sh",
+    "-c",
+    "trap '' TERM; exec 3<&0; { cat <&3 3<&-; echo eof; } & trap - TERM; echo r; exec cat",
 ];
 
 /// A spawned, contained `SIGTERM`-ignoring [`TERM_IGNORING_BLOCKER_ARGV`] child and the write end of

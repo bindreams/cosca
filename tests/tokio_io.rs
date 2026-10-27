@@ -294,31 +294,33 @@ fn remove_leftover_leaf(leaf: Option<std::path::PathBuf>) {
     let _ = leaf;
 }
 
+// Unix only: `async_windows_contained_spawn_runs_then_job_tears_down` proves the same drop on Windows,
+// by exit code.
 #[cfg(feature = "tokio")]
+#[cfg(unix)]
 #[skuld::test]
 async fn async_drop_tears_down_a_contained_tree() {
-    use std::io::Read as _;
-    let (child, mut root, mut grand) = common::spawn_grandchild_async(true).await;
+    // The members echo until released (`ECHO_HELD_ENV`), so a drop that killed nothing is caught by
+    // an echo, not by a read that never ends.
+    let (child, mut root, mut grand) = common::spawn_tree_async("spawn-grandchild", |cmd| {
+        cmd.contain();
+        cmd.kill_on_drop(true);
+        cmd.env(common::ECHO_HELD_ENV, "1");
+    })
+    .await;
     let leaf = cgroup_leaf_of(&child);
     let _leaf_cleanup = leaf_cleanup(&leaf);
-    // The containment assert guards the EOFs below from passing for unrelated reasons.
+    // The containment assert guards the death proof below from passing for unrelated reasons.
     assert_ne!(
         child.containment(),
         cosca::Containment::None,
         "contained spawn must engage a mechanism"
     );
     drop(child);
-    // No post-drop liveness assertion: the drop waits for the root and a cgroup leaf only, and on
-    // Windows for neither. Each process's death is proven by its own control-socket EOF: a
-    // survivor blocks the read (a CI failure).
-    for (who, s) in [("root", &mut root), ("grandchild", &mut grand)] {
-        let mut buf = [0u8; 1];
-        match s.read(&mut buf) {
-            Ok(0) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
-            other => panic!("{who} not torn down on drop: {other:?}"),
-        }
-    }
+    // No wait: the drop waits for the root and a cgroup leaf only, and the kill is otherwise
+    // pending once it returns. A killed member cannot echo, so a survivor fails by assertion.
+    common::assert_dead(&mut root, "the root after the drop");
+    common::assert_dead(&mut grand, "the grandchild after the drop");
     #[cfg(target_os = "linux")]
     if let Some(leaf) = &leaf {
         assert_leaf_removed(leaf);
@@ -359,33 +361,66 @@ async fn linux_cgroup_v2_async_drop_after_wait_still_tears_down_the_tree(#[fixtu
 }
 
 #[cfg(feature = "tokio")]
-#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 async fn drop_after_wait_still_tears_down_the_tree() {
     // After awaiting the root's exit it is already reaped, so the drop has no root to signal and
-    // the tree teardown must come from attached.hard_kill() — proven by the grandchild's EOF.
-    // The drop stays the killer: `wait_tree` never kills, so waiting on it first would hang.
-    use std::io::{Read as _, Write as _};
+    // the tree teardown must come from attached.hard_kill(). The drop stays the killer:
+    // `wait_tree` never kills, so waiting on it first would hang. The members echo until released
+    // (`ECHO_HELD_ENV`), so a drop that killed nothing is caught by an echo, not by a read that
+    // never ends.
     common::install_log_capture();
-    let (mut child, mut root, mut grand) = common::spawn_grandchild_async(true).await;
+    let (mut child, root, mut grand) = common::spawn_tree_async("spawn-grandchild", |cmd| {
+        cmd.contain();
+        cmd.kill_on_drop(true);
+        cmd.env(common::ECHO_HELD_ENV, "1");
+    })
+    .await;
     let leaf = cgroup_leaf_of(&child);
     let _leaf_cleanup = leaf_cleanup(&leaf);
     let root_id = child.id();
-    root.write_all(b"x").expect("release the root so it exits");
+    drop(root); // EOF: the root leaves on its own, so the drop below has no root to kill
     child.wait().await.expect("wait reaps the root");
     assert_eq!(root_id.is_alive(), cosca::identity::Liveness::Dead, "root exited");
-    drop(child); // root already reaped → nothing to signal; attached.hard_kill must still kill the grandchild
-    let mut buf = [0u8; 1];
-    match grand.read(&mut buf) {
-        Ok(0) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
-        other => panic!("grandchild not torn down by hard_kill after the root was waited: {other:?}"),
-    }
+    // Root already reaped → nothing to signal; attached.hard_kill must still kill the grandchild.
+    // No wait after the drop: the kill is pending once it returns, and a killed member cannot echo.
+    drop(child);
+    common::assert_dead(
+        &mut grand,
+        "the grandchild not torn down by hard_kill after the root was waited",
+    );
     #[cfg(target_os = "linux")]
     if let Some(leaf) = &leaf {
         assert_leaf_removed(leaf);
     }
     #[cfg(not(target_os = "linux"))]
     let _ = leaf;
+}
+
+#[cfg(feature = "tokio")]
+/// Windows case of the test above. The grandchild echoes and is released only after the drop, with
+/// [`common::RELEASED_EXIT_ENV`] set: one the drop's Job Object kill missed leaves with that code,
+/// so a missing kill fails by assertion, not by a read that never ends.
+#[cfg(windows)]
+async fn drop_after_wait_still_tears_down_the_tree() {
+    let common::AsyncEchoTree {
+        mut child,
+        root,
+        grand,
+        grand_pid,
+    } = common::spawn_echo_tree_async_configured("spawn-grandchild-echo", |cmd| {
+        cmd.contain();
+        cmd.kill_on_drop(true);
+        cmd.env(common::RELEASED_EXIT_ENV, common::RELEASED_EXIT_CODE.to_string());
+    })
+    .await;
+    // The grandchild is alive and echoing, which pins its pid for the `Member`.
+    let grand = common::Member::new(grand, grand_pid);
+    let root_id = child.id();
+    drop(root); // EOF: the root leaves on its own, so the drop below has no root to kill
+    child.wait().await.expect("wait reaps the root");
+    assert_eq!(root_id.is_alive(), cosca::identity::Liveness::Dead, "root exited");
+    drop(child); // root already reaped: only the Job Object kill can reach the grandchild
+    common::assert_members_not_released(vec![(grand, "the grandchild, after dropping the reaped Child")]);
 }
 
 #[cfg(feature = "tokio")]
@@ -1191,24 +1226,33 @@ async fn async_fd3_source_merges_into_piped_stdin() {
 #[skuld::test]
 async fn async_windows_contained_spawn_runs_then_job_tears_down() {
     // Verifies the CREATE_SUSPENDED + job-assign + out-of-band resume dance works under tokio.
-    use std::io::Read as _;
-    let (child, mut root, mut grand) = common::spawn_grandchild_async(true).await;
+    // `Drop` does not wait, and a member the drop did not kill leaves with the released code once the
+    // test releases it, so a missing job kill fails by assertion (`assert_members_not_released`).
+    let common::AsyncEchoTree {
+        child,
+        root,
+        grand,
+        grand_pid,
+    } = common::spawn_echo_tree_async_configured("spawn-grandchild-echo", |cmd| {
+        cmd.contain();
+        cmd.kill_on_drop(true);
+        cmd.env(common::RELEASED_EXIT_ENV, common::RELEASED_EXIT_CODE.to_string());
+    })
+    .await;
     assert_eq!(
         child.containment(),
         cosca::Containment::JobObject,
         "Windows Strongest => JobObject"
     );
+    // Both members are alive and echoing, which this test holds; see `common::Member` for why a
+    // pid is only trusted while the member is.
+    let root = common::Member::new(root, child.id().pid());
+    let grand = common::Member::new(grand, grand_pid);
     drop(child);
-    // As in `async_drop_tears_down_a_contained_tree`: `Drop` does not wait, so the control-socket
-    // EOFs are the real edges.
-    for (who, s) in [("root", &mut root), ("grandchild", &mut grand)] {
-        let mut buf = [0u8; 1];
-        match s.read(&mut buf) {
-            Ok(0) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
-            other => panic!("{who} not torn down: {other:?}"),
-        }
-    }
+    common::assert_members_not_released(vec![
+        (root, "the root, after dropping the Child"),
+        (grand, "the grandchild, after dropping the Child"),
+    ]);
 }
 
 // Death-watched accept =====
