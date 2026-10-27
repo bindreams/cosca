@@ -1,40 +1,14 @@
 use std::borrow::Borrow;
 use std::io;
 
+use super::sealed::{self, Cwd, Implicit, Spelling};
 use super::Filesystem;
-use crate::{Component, PurePath};
 
 /// A path type [`FakeFilesystem`] can model: [`windows::Path`](crate::windows::Path) and
 /// [`posix::Path`](crate::posix::Path). Sealed: no other type implements it.
 pub trait FakePath: sealed::Lookup {}
 
 impl<P: sealed::Lookup + ?Sized> FakePath for P {}
-
-pub(crate) mod sealed {
-    use crate::PurePath;
-
-    /// What [`FakePath`](super::FakePath) requires, kept out of the public API.
-    pub trait Lookup: PurePath {
-        /// The path as the OS looks it up, so that two spellings of one entry are equal.
-        ///
-        /// Repeated separators collapse, and so does `.` (`a/./b` is `a/b` on every kernel and in
-        /// Win32). A trailing separator stays: it names only a directory, and so does a final `.`
-        /// after a name on POSIX (`tool/.` is `tool/`). On Windows the lookup also writes `\` for
-        /// `/`, resolves `..` lexically as Win32 does for a non-verbatim path (a final `.` or `..`
-        /// leaves no trailing separator), reads a `?` device path as the plain path it names
-        /// (`//?/C:/x` is `C:\x`), and ends a UNC share root in `\`. On POSIX `..` stays: the
-        /// kernel resolves it physically, through links the fake does not model.
-        fn lookup_spelling(&self) -> Self::Buf;
-
-        /// A [`lookup_spelling`](Self::lookup_spelling) key as `canonical` returns it: the host's
-        /// spelling, which has no separator after a UNC share root.
-        fn canonical_spelling(&self) -> Self::Buf;
-
-        /// Why the host refuses the path before it looks anything up, if it does: a NUL, which no
-        /// filesystem accepts, or (Windows) the empty path, which no string names.
-        fn refusal(&self) -> Option<&'static str>;
-    }
-}
 
 /// A filesystem described by the test that uses it, for paths of one OS: see
 /// [`windows::FakeFilesystem`](crate::windows::FakeFilesystem) and
@@ -47,42 +21,51 @@ pub(crate) mod sealed {
 /// A query names an entry as the real filesystem resolves it, up to what no OS distinguishes:
 /// repeated and trailing separators do not matter (`C:\bin\` is `C:\bin`, `/usr/bin//tool` is
 /// `/usr/bin/tool`), a UNC share root is one entry with or without its trailing separator, and
-/// `/` is `\` on Windows. A trailing separator names only a directory.
+/// `/` is `\` on Windows. A trailing separator names only a directory. `.` is dropped on both OSes
+/// (`./tool` is `tool`). Case is exact, even for Windows paths: the test states the case it queries.
 ///
-/// `.` is dropped on both OSes (`./tool` is `tool`, as the host reads it). The Windows fake also
-/// resolves `..` lexically, as Win32 does for a non-verbatim path: `C:\Windows\nope\..\System32`
-/// is `C:\Windows\System32`. The POSIX fake does not, because the kernel resolves `..` physically,
-/// through symlinks the fake does not model; a test queries the spelling it states. The drive
-/// relative `C:` is one entry however it is spelled (`C:.`, `C:.\`, `C:a\..\`).
+/// On Windows, `..` resolves as text, as Win32 does for a non-verbatim path:
+/// `C:\Windows\nope\..\System32` is `C:\Windows\System32`. A `.` or `?` device path named for a drive
+/// or `UNC` is the path it names (`\\.\C:\Windows` is `C:\Windows`), also after `Global\` or
+/// `GLOBALROOT\??\`. `f::$DATA` is the file `f` (and `PermissionDenied` for a directory), and
+/// `d:$I30:$INDEX_ALLOCATION` and `d::$INDEX_ALLOCATION` are the directory `d`.
 ///
-/// A name that holds NUL is [`InvalidInput`](io::ErrorKind::InvalidInput) from every question, as
-/// on the host, whatever else the test stated about it. So is the empty path on Windows, where the
-/// host refuses it too (on POSIX it is absent, as on a Unix host), and a `//?/UNC/?/` path, whose
-/// server has no plain spelling.
+/// On POSIX, `..` leaves the directory before it, which has to exist (`/a/x/..` is absent unless
+/// `/a/x` is stated), and a `.` or `..` inside an unreadable directory needs the permission to
+/// search it. A `..` after a link stated with [`with_canonical`](Self::with_canonical) goes through
+/// the link's target, which the fake does not follow, so it is refused.
+///
+/// The current directory and its ancestors are directories on every host, stated or not: `.`, `..`
+/// and `../..`, and on Windows the root of the current drive `\` and a drive's current directory `C:`
+/// where `C:\` is there. What any other relative path names depends on the current directory, which
+/// the fake has no value for. So [`canonical`](Filesystem::canonical) of a relative path that exists is
+/// `InvalidInput` (the host's is absolute), and so is [`same_file`](Filesystem::same_file) of two
+/// paths that may be one file through the current directory: a relative and an absolute one, two
+/// that are relative to different things (`a`, `\a`, `C:a`), or one that starts with `..` and another.
+///
+/// A path the host refuses before it looks anything up is an error from every question, whatever
+/// else the test stated about it:
+///
+/// - [`InvalidInput`](io::ErrorKind::InvalidInput): a NUL; on Windows, each path that
+///   [`to_wide`](crate::windows::Path::to_wide) has no string for (the empty path, a relative `tool.`,
+///   a `//?/UNC/?/` server); an alternate data stream (`f:x`), which the fake does not model.
+/// - [`PermissionDenied`](io::ErrorKind::PermissionDenied): on Windows, a DOS device name (`nul`,
+///   `com1`, `lpt1`, `aux`, `con`, `prn`, `clock$`) as the last name under a UNC share, which a
+///   Windows server refuses.
+/// - [`Other`](io::ErrorKind::Other): on Windows, the device of a volume whose drive is there
+///   (`\\.\C:`), and `\\.\Global` alone.
+///
+/// The empty path is absent on POSIX, as on a Unix host.
 ///
 /// [`canonical`](Filesystem::canonical) returns the host's spelling of the entry: separators
 /// collapsed, `/` as `\` on Windows, `.` and `..` resolved as for a query, and no separator after a
-/// UNC share root. A stated link gives its target as the test wrote it. A relative query gives a
-/// relative path (the host gives an absolute one).
+/// UNC share root. A stated link gives its target as the test wrote it.
 ///
 /// A file has no children: stating a path under a stated file, or a file (or a stated error) over
 /// a path that has entries below it, panics in the builder in either order, since no filesystem
-/// holds that. So does a file stated with a trailing separator, or on POSIX a trailing `.`: they
-/// name only a directory.
-///
-/// Case is exact, even for Windows paths: the test states the case it queries. Windows trailing
-/// dots and spaces are not modelled (`notepad.exe.` is not `notepad.exe`), and a path on a volume's
-/// device (`\\.\C:`, `\\.\C:\.`, `//?/C:`, `//?/C:/.`) is an ordinary entry where the host refuses
-/// it: a test that needs that states it with [`with_error`](Self::with_error). So is a reserved
-/// device name under a UNC share (`\\srv\share\nul`), which the server refuses with
-/// [`PermissionDenied`](io::ErrorKind::PermissionDenied). The relative current directory `.` is
-/// absent unless the test states it, where the host has it.
-///
-/// A `.` device path named for a drive or `UNC` is the path it names (`\\.\C:\Windows` is
-/// `C:\Windows`, `\\.\UNC\srv\share` is `\\srv\share`), as the host reads it, and so is the `//?/`
-/// spelling of either.
-///
-/// Entries are matched by scanning, which is fine for the handful a test states.
+/// holds that. So does a file stated at a name only a directory has (a trailing separator, a root,
+/// `.`, a final `..`, on POSIX a final `.` after a name, a directory index), a directory stated as
+/// a data stream (`d::$DATA`), and any entry stated in a volume's device.
 pub struct FakeFilesystem<P: FakePath + ?Sized> {
     entries: Vec<(P::Buf, Entry)>,
     links: Vec<(P::Buf, P::Buf)>,
@@ -95,25 +78,6 @@ enum Entry {
     /// A directory that stats fine, with nothing strictly below it examinable.
     UnreadableDir(io::ErrorKind),
     Error(io::ErrorKind),
-}
-
-/// Whether `p` ends in a separator, so that only a directory answers to it.
-fn ends_in_separator<P: PurePath + ?Sized>(p: &P) -> bool {
-    matches!(p.components().next_back(), Some(Component::Empty))
-}
-
-/// The entry `p` names, and whether it was spelled with a trailing separator.
-fn lookup<P: FakePath + ?Sized>(p: &P) -> (P::Buf, bool) {
-    let spelled = p.lookup_spelling();
-    let spelled: &P = spelled.borrow();
-    if ends_in_separator(spelled) {
-        let name = spelled.parent().expect("a trailing separator follows a name");
-        // Spelling the entry again settles the forms whose bare name differs from the one that
-        // carries the separator (the drive-relative `C:.\` over `C:.`).
-        (name.lookup_spelling(), true)
-    } else {
-        (spelled.to_owned(), false)
-    }
 }
 
 /// The ancestors of `key`, nearest first. The empty parent of a relative path is not one: nothing
@@ -143,12 +107,23 @@ fn is_below<P: FakePath + ?Sized>(key: &P, ancestor: &P) -> bool {
     false
 }
 
-/// A path the host refuses is `InvalidInput` before any lookup.
-fn refuse<P: FakePath + ?Sized>(p: &P) -> io::Result<()> {
-    match p.refusal() {
-        Some(why) => Err(io::Error::new(io::ErrorKind::InvalidInput, why)),
+fn refuse<B>(spelling: &Spelling<B>) -> io::Result<()> {
+    match &spelling.refusal {
+        Some((kind, why)) => Err(io::Error::new(*kind, why.as_str())),
         None => Ok(()),
     }
+}
+
+/// The directory every host has, for [`Implicit::Always`].
+static DIR: Entry = Entry::Dir;
+
+/// What `canonical` knows about a path that exists.
+struct Resolved<B> {
+    /// The path: the stated target of a link, else the entry's spelling.
+    path: B,
+    /// Whether `path` is a stated target, which the test said and the fake does not check.
+    stated: bool,
+    cwd: Cwd,
 }
 
 impl<P: FakePath + ?Sized> FakeFilesystem<P> {
@@ -173,8 +148,7 @@ impl<P: FakePath + ?Sized> FakeFilesystem<P> {
     }
 
     /// States that `path` is a directory that stats fine, but whose contents cannot be examined:
-    /// every question about anything strictly below it fails with `kind`. This is a directory
-    /// without the permission to list or traverse it.
+    /// every question about anything strictly below it fails with `kind`.
     pub fn with_unreadable_dir(mut self, path: &P, kind: io::ErrorKind) -> Self {
         self.state(path, Entry::UnreadableDir(kind));
         self
@@ -185,7 +159,7 @@ impl<P: FakePath + ?Sized> FakeFilesystem<P> {
     /// as stated (absent, unless something else implies it). A directory that answers for itself
     /// but not for its contents is [`with_unreadable_dir`](Self::with_unreadable_dir).
     pub fn with_error(mut self, path: &P, kind: io::ErrorKind) -> Self {
-        let key = lookup(path).0;
+        let key = Self::key(path);
         self.refuse_under_file(path, key.borrow());
         self.set(key, Entry::Error(kind));
         self
@@ -200,7 +174,7 @@ impl<P: FakePath + ?Sized> FakeFilesystem<P> {
     /// generically, so the fake cannot rebase the rest. A resolver canonicalises the candidate it
     /// found, so the test states that candidate's target too.
     pub fn with_canonical(mut self, path: &P, target: &P) -> Self {
-        let key = lookup(path).0;
+        let key = Self::key(path);
         match self.links.iter_mut().find(|(link, _)| link == &key) {
             Some((_, to)) => *to = target.to_owned(),
             None => self.links.push((key, target.to_owned())),
@@ -208,7 +182,16 @@ impl<P: FakePath + ?Sized> FakeFilesystem<P> {
         self
     }
 
-    /// Records the entry `key` as `entry`, replacing an earlier statement.
+    /// The entry a statement about `path` is about. A volume's device has no entries to state.
+    fn key(path: &P) -> P::Buf {
+        let spelling = path.lookup();
+        assert!(
+            spelling.volume.is_none(),
+            "{path:?} is a volume's device, which holds no entries"
+        );
+        spelling.key
+    }
+
     fn set(&mut self, key: P::Buf, entry: Entry) {
         match self.entries.iter_mut().find(|(stated, _)| stated == &key) {
             Some((_, old)) => *old = entry,
@@ -216,15 +199,28 @@ impl<P: FakePath + ?Sized> FakeFilesystem<P> {
         }
     }
 
-    /// Records `path` as `entry`, and its ancestors as directories where nothing is stated. The
-    /// empty parent of a relative path is not an ancestor: nothing resolves it.
+    /// Records `path` as `entry`, and its ancestors as directories where nothing is stated.
     fn state(&mut self, path: &P, entry: Entry) {
-        let (key, dir_only) = lookup(path);
-        if matches!(entry, Entry::File) {
-            assert!(!dir_only, "{path:?} names only a directory, so it cannot be a file");
-            let key: &P = key.borrow();
-            let has_children = self.entries.iter().any(|(stated, _)| is_below(stated.borrow(), key));
-            assert!(!has_children, "{key:?} has entries below it, so it cannot be a file");
+        let spelling = path.lookup();
+        assert!(
+            spelling.volume.is_none(),
+            "{path:?} is a volume's device, which holds no entries"
+        );
+        let key = spelling.key;
+        match entry {
+            Entry::File => {
+                assert!(
+                    !spelling.dir_only,
+                    "{path:?} names only a directory, so it cannot be a file"
+                );
+                let key: &P = key.borrow();
+                let has_children = self.entries.iter().any(|(stated, _)| is_below(stated.borrow(), key));
+                assert!(!has_children, "{key:?} has entries below it, so it cannot be a file");
+            }
+            _ => assert!(
+                !spelling.data_stream,
+                "{path:?} is the data stream of a name, which a directory does not have"
+            ),
         }
         self.refuse_under_file(path, key.borrow());
         for ancestor in ancestors(key.borrow()) {
@@ -254,8 +250,9 @@ impl<P: FakePath + ?Sized> FakeFilesystem<P> {
     /// What is at the entry `key`: an `Err` if it or an ancestor has a stated error, or an
     /// ancestor is an unreadable directory (the one nearest the root, which a walk down meets
     /// first), else the stated entry, if any. A file does not answer to a name that ends in a
-    /// separator.
-    fn entry(&self, key: &P, dir_only: bool) -> io::Result<Option<&Entry>> {
+    /// separator. With `inside`, `key` is a directory something is looked up in, so an unreadable
+    /// one fails too.
+    fn entry(&self, key: &P, dir_only: bool, inside: bool) -> io::Result<Option<&Entry>> {
         let mut chain = vec![key];
         while let Some(parent) = chain.last().and_then(|c| c.parent()) {
             chain.push(parent);
@@ -264,7 +261,7 @@ impl<P: FakePath + ?Sized> FakeFilesystem<P> {
         for (depth, node) in chain.into_iter().rev().enumerate() {
             match self.find(node) {
                 Some(Entry::Error(kind)) => return Err((*kind).into()),
-                Some(Entry::UnreadableDir(kind)) if depth != last => return Err((*kind).into()),
+                Some(Entry::UnreadableDir(kind)) if depth != last || inside => return Err((*kind).into()),
                 _ => {}
             }
         }
@@ -274,27 +271,86 @@ impl<P: FakePath + ?Sized> FakeFilesystem<P> {
         })
     }
 
-    fn at(&self, p: &P) -> io::Result<Option<&Entry>> {
-        refuse(p)?;
-        let (key, dir_only) = lookup(p);
-        self.entry(key.borrow(), dir_only)
+    /// Whether a stated link is at `key` or above it.
+    fn is_under_link(&self, key: &P) -> bool {
+        self.links
+            .iter()
+            .any(|(link, _)| Borrow::<P>::borrow(link) == key || is_below(key, link.borrow()))
+    }
+
+    /// How the host reads `p` and what is there. With `search`, a `.` or `..` after a directory needs
+    /// the permission to search it (what the kernel asks of any path it opens), where `canonical`
+    /// takes them as text.
+    fn at(&self, p: &P, search: bool) -> io::Result<(Spelling<P::Buf>, Option<&Entry>)> {
+        let spelling = p.lookup();
+        refuse(&spelling)?;
+        if spelling.nothing {
+            return Ok((spelling, None));
+        }
+        if let Some(root) = &spelling.volume {
+            // The volume's device exists where its drive does, and the host refuses it.
+            return match self.entry(root.borrow(), false, false)? {
+                Some(_) => Err(io::Error::other(
+                    "the path is a volume's device, which is no file or directory",
+                )),
+                None => Ok((spelling, None)),
+            };
+        }
+        let key: &P = spelling.key.borrow();
+        for (at, is_pop) in &spelling.inside {
+            if *is_pop && self.is_under_link(at.borrow()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "a `..` after a stated link goes through the link's target, which the fake does not follow",
+                ));
+            }
+        }
+        // The directories a `.` or `..` is looked up in must be there; those the path passes through
+        // anyway are covered by the walk to the entry.
+        for (at, _) in spelling.inside.iter().filter(|(at, _)| !is_below(key, at.borrow())) {
+            match self.entry(at.borrow(), true, search)? {
+                Some(Entry::Dir | Entry::UnreadableDir(_)) => {}
+                _ => return Ok((spelling, None)),
+            }
+        }
+        let mut found = self.entry(key, spelling.dir_only, false)?;
+        if found.is_none() {
+            found = match &spelling.implicit {
+                Some(Implicit::Always) => Some(&DIR),
+                Some(Implicit::IfExists(root)) => self.entry(root.borrow(), false, false)?.map(|_| &DIR),
+                None => None,
+            };
+        }
+        if spelling.data_stream && matches!(found, Some(Entry::Dir | Entry::UnreadableDir(_))) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "a directory has no default data stream to open",
+            ));
+        }
+        Ok((spelling, found))
     }
 
     /// The entry `p` names with its stated link followed, once.
-    fn resolved(&self, p: &P) -> io::Result<P::Buf> {
-        refuse(p)?;
-        let (key, dir_only) = lookup(p);
-        match self.entry(key.borrow(), dir_only)? {
-            None => Err(io::ErrorKind::NotFound.into()),
-            Some(_) => Ok(match self.links.iter().find(|(link, _)| link == &key) {
-                Some((_, target)) => target.clone(),
-                None => Borrow::<P>::borrow(&key).canonical_spelling(),
-            }),
+    fn resolved(&self, p: &P, search: bool) -> io::Result<Resolved<P::Buf>> {
+        let (spelling, found) = self.at(p, search)?;
+        if found.is_none() {
+            return Err(io::ErrorKind::NotFound.into());
         }
+        Ok(match self.links.iter().find(|(link, _)| link == &spelling.key) {
+            Some((_, target)) => Resolved {
+                cwd: Borrow::<P>::borrow(target).lookup().cwd,
+                path: target.clone(),
+                stated: true,
+            },
+            None => Resolved {
+                path: Borrow::<P>::borrow(&spelling.key).canonical_spelling(),
+                stated: false,
+                cwd: spelling.cwd,
+            },
+        })
     }
 }
 
-/// A copy that shares nothing with the original.
 impl<P: FakePath + ?Sized> Clone for FakeFilesystem<P> {
     fn clone(&self) -> Self {
         FakeFilesystem {
@@ -304,7 +360,6 @@ impl<P: FakePath + ?Sized> Clone for FakeFilesystem<P> {
     }
 }
 
-/// The stated entries and links.
 impl<P: FakePath + ?Sized> std::fmt::Debug for FakeFilesystem<P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FakeFilesystem")
@@ -314,7 +369,6 @@ impl<P: FakePath + ?Sized> std::fmt::Debug for FakeFilesystem<P> {
     }
 }
 
-/// The same as [`FakeFilesystem::new`].
 impl<P: FakePath + ?Sized> Default for FakeFilesystem<P> {
     fn default() -> Self {
         Self::new()
@@ -325,20 +379,46 @@ impl<P: FakePath + ?Sized> Filesystem for FakeFilesystem<P> {
     type Path = P;
 
     fn is_file(&self, p: &P) -> io::Result<bool> {
-        Ok(matches!(self.at(p)?, Some(Entry::File)))
+        Ok(matches!(self.at(p, true)?.1, Some(Entry::File)))
     }
 
     fn is_dir(&self, p: &P) -> io::Result<bool> {
-        Ok(matches!(self.at(p)?, Some(Entry::Dir | Entry::UnreadableDir(_))))
+        Ok(matches!(
+            self.at(p, true)?.1,
+            Some(Entry::Dir | Entry::UnreadableDir(_))
+        ))
     }
 
     fn canonical(&self, p: &P) -> io::Result<P::Buf> {
-        self.resolved(p)
+        let resolved = self.resolved(p, false)?;
+        if !resolved.stated && resolved.cwd != Cwd::Absolute {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a relative path's canonical form is absolute, and the fake has no current directory",
+            ));
+        }
+        Ok(resolved.path)
     }
 
     fn same_file(&self, a: &P, b: &P) -> io::Result<bool> {
-        let (a, b) = (self.resolved(a)?, self.resolved(b)?);
-        Ok(lookup(a.borrow()).0 == lookup(b.borrow()).0)
+        let (a, b) = (self.resolved(a, true)?, self.resolved(b, true)?);
+        let (ka, kb) = (
+            Borrow::<P>::borrow(&a.path).lookup().key,
+            Borrow::<P>::borrow(&b.path).lookup().key,
+        );
+        if ka == kb {
+            return Ok(true);
+        }
+        match (&a.cwd, &b.cwd) {
+            (Cwd::Absolute, Cwd::Absolute) => Ok(false),
+            (Cwd::Relative { tag: ta, dotdot: false }, Cwd::Relative { tag: tb, dotdot: false }) if ta == tb => {
+                Ok(false)
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "whether these are one file depends on the current directory, which the fake has no value for",
+            )),
+        }
     }
 }
 

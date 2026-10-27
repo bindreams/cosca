@@ -7,7 +7,7 @@ use crate::posix::{Path, PathBuf};
 use crate::windows::{Path, PathBuf};
 
 /// This machine's filesystem: [`windows::Path`](crate::windows::Path)s on Windows,
-/// [`posix::Path`](crate::posix::Path)s on Unix. It is not implemented elsewhere.
+/// [`posix::Path`](crate::posix::Path)s on Unix.
 ///
 /// Answers come from `std::fs`, so links are followed. A Windows path reaches `std` through
 /// `windows::Path::to_std_path`, so each name is read as spelled: `C:\x\tool.` is the file
@@ -173,9 +173,8 @@ mod identity {
     ///
     /// Where the 128-bit query fails for either handle, both are compared by the volume serial
     /// number and 64-bit index of `GetFileInformationByHandle` instead, so two kinds of id are
-    /// never compared. Microsoft's pages for `FileIdInfo` and `FILE_ID_INFO` say it is unsupported
-    /// before Windows 8 and Server 2012 and list no filesystems; so the 64-bit call is the
-    /// fallback where the 128-bit one fails.
+    /// never compared. The 128-bit query is unsupported before Windows 8 / Server 2012, so the
+    /// 64-bit call is the fallback wherever it fails.
     #[cfg(windows)]
     pub(super) fn same_file(a: impl AsRef<Path>, b: impl AsRef<Path>) -> io::Result<bool> {
         same_file_with(a, b, wide_file_id)
@@ -213,8 +212,7 @@ mod identity {
             .open(p)
     }
 
-    /// `e` as the Win32 code it wraps: the `windows` crate's own conversion keeps the `HRESULT`.
-    /// Decoded from `e` itself, as building `e` called `GetErrorInfo` after `GetLastError`.
+    /// `e` as the Win32 code it wraps; the `windows` crate's own conversion keeps the `HRESULT`.
     #[cfg(windows)]
     fn win32_error(e: windows::core::Error) -> io::Error {
         let code = e.code().0 as u32;

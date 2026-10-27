@@ -339,13 +339,13 @@ fn a_unc_share_root_is_one_entry_with_or_without_a_separator() {
 /// The Windows fake reads a query as Win32 does a non-verbatim path: `.` and `..` resolve
 /// lexically before any name is matched. (Measured on Windows 11: `C:\Windows\nope\..\System32`
 /// and `C:\Windows\.` are directories, `C:\Windows\notepad.exe\.` is the file.) The POSIX fake
-/// resolves `.` but not `..`.
+/// resolves `..` against the directory it leaves, which has to exist (see `posix::lookup`).
 ///
 /// Mutants: a fake that matches `.` and `..` as names; one that keeps the trailing separator a
-/// final `.` or `..` leaves, so the file at `notepad.exe\.` is absent; one that resolves `..` on
+/// final `.` or `..` leaves, so the file at `notepad.exe\.` is absent; one that keeps `..` a name on
 /// POSIX.
 #[skuld::test]
-fn the_windows_fake_resolves_dots_and_the_posix_fake_resolves_only_the_single_dot() {
+fn the_windows_fake_resolves_dots_as_text_and_the_posix_fake_through_the_directories() {
     let fs = windows::FakeFilesystem::new()
         .with_file(&w(r"C:\Windows\System32\notepad.exe"))
         .with_dir(&w(r"C:\a\b"));
@@ -373,28 +373,37 @@ fn the_windows_fake_resolves_dots_and_the_posix_fake_resolves_only_the_single_do
     let fs = windows::FakeFilesystem::new().with_error(&w(r"C:\x\..\locked"), ErrorKind::PermissionDenied);
     assert_eq!(kind(fs.is_file(&w(r"C:\locked\tool.exe"))), ErrorKind::PermissionDenied);
 
-    // POSIX: `..` is physical, through links the fake does not model, so it is a name.
+    // POSIX: `..` leaves a directory, which has to be there; `/a/x` is not.
     let fs = posix::FakeFilesystem::new().with_dir(p("/a/b"));
     assert!(!fs.is_dir(p("/a/x/../b")).unwrap());
-    assert!(!fs.is_dir(p("/a/b/..")).unwrap());
+    assert!(fs.is_dir(p("/a/b/..")).unwrap());
     assert!(fs.is_dir(p("/a/./b")).unwrap());
 }
 
 /// The POSIX fake reads `.` as the kernel does: `a/./b` is `a/b` whatever links `a` holds, so a
 /// `PATH` entry `.` joined with `tool` finds `tool`. A final `.` names a directory, so it never
-/// reaches a file. `..` is the one link-dependent component and stays a name.
+/// reaches a file.
 ///
 /// Mutants: a fake that keeps `.` as a name; one that lets `tool/.` name the file; one that
-/// drops `..` too; one that drops every `.`, so the empty path becomes a directory.
+/// drops every `.`, so the empty path becomes a directory.
 #[skuld::test]
 fn the_posix_fake_reads_a_single_dot_as_the_host_does() {
     let fs = posix::FakeFilesystem::new()
         .with_file(p("tool"))
         .with_file(p("/usr/bin/tool"));
     for file in ["./tool", "././tool", ".//tool", "/usr/./bin/./tool", "/usr/bin/./tool"] {
-        let expect = if file.starts_with('/') { "/usr/bin/tool" } else { "tool" };
         assert!(fs.is_file(p(file)).unwrap(), "{file}");
-        assert_eq!(fs.canonical(p(file)).unwrap(), p(expect).to_path_buf(), "{file}");
+        if file.starts_with('/') {
+            assert_eq!(
+                fs.canonical(p(file)).unwrap(),
+                p("/usr/bin/tool").to_path_buf(),
+                "{file}"
+            );
+        } else {
+            // The host's canonical form of a relative path is absolute (see `posix::lookup`).
+            assert_eq!(kind(fs.canonical(p(file))), ErrorKind::InvalidInput, "{file}");
+            assert!(fs.same_file(p(file), p("tool")).unwrap(), "{file}");
+        }
     }
     // A final `.`, or a `.` before a trailing separator, demands a directory.
     for not_file in ["tool/.", "./tool/", "/usr/bin/tool/.", "/usr/bin/tool/./"] {
@@ -404,43 +413,42 @@ fn the_posix_fake_reads_a_single_dot_as_the_host_does() {
     for dir in ["/usr/bin/.", "/usr/bin/./", "/usr/./bin", "/.", "/./", "/usr/."] {
         assert!(fs.is_dir(p(dir)).unwrap(), "{dir}");
     }
-    // The empty path stays absent; `.` is a directory only where the test states it.
+    // The empty path stays absent; `.` is a directory on every host, stated or not.
     assert!(!fs.is_dir(p("")).unwrap());
-    assert!(!fs.is_dir(p(".")).unwrap());
-    let fs = posix::FakeFilesystem::new().with_dir(p("."));
     for dir in [".", "./", "./."] {
         assert!(fs.is_dir(p(dir)).unwrap(), "{dir}");
     }
+    let fs = posix::FakeFilesystem::new().with_dir(p("."));
     assert!(!fs.is_dir(p("")).unwrap());
-    // `..` is still a name.
-    let fs = posix::FakeFilesystem::new().with_dir(p("/a/b"));
-    assert!(!fs.is_dir(p("/a/x/../b")).unwrap());
 }
 
 /// Drive-relative `C:` is the current directory of drive C, however it is spelled: `C:.`, `C:.\`,
-/// `C:./` and `C:a\..\` all name it, and `canonical` of any of them is a fixed point.
+/// `C:./` and `C:a\..\` all name it, and a link stated for one of them is the link of all.
 ///
 /// Mutants: a lookup that strips the trailing separator of `C:.\` and keeps `C:.` as a second
-/// key; a `canonical` that returns that second key.
+/// key, so that the link of `C:` is missed.
 #[skuld::test]
 fn the_drive_relative_current_directory_has_one_key() {
-    let fs = windows::FakeFilesystem::new().with_dir(&w("C:"));
+    let fs = windows::FakeFilesystem::new()
+        .with_dir(&w("C:"))
+        .with_canonical(&w("C:"), &w(r"C:\work"));
     for dir in ["C:", "C:.", r"C:.\", "C:./", r"C:a\..\", r"C:.\.\", r"C:a\.."] {
         assert!(fs.is_dir(&w(dir)).unwrap(), "{dir}");
         assert!(!fs.is_file(&w(dir)).unwrap(), "{dir}");
-        let once = fs.canonical(&w(dir)).unwrap();
-        assert_eq!(once, w("C:"), "{dir}");
-        assert_eq!(fs.canonical(&once).unwrap(), once, "{dir}");
+        assert_eq!(fs.canonical(&w(dir)).unwrap(), w(r"C:\work"), "{dir}");
+        assert!(fs.same_file(&w(dir), &w("C:")).unwrap(), "{dir}");
     }
     assert!(!fs.is_dir(&w(r"C:\a\..\x")).unwrap());
     // Stated with the odd spelling, the plain one finds it.
     let fs = windows::FakeFilesystem::new().with_dir(&w(r"C:.\"));
     assert!(fs.is_dir(&w("C:")).unwrap());
     // The plain relative current directory is the same shape.
-    let fs = windows::FakeFilesystem::new().with_dir(&w("."));
+    let fs = windows::FakeFilesystem::new()
+        .with_dir(&w("."))
+        .with_canonical(&w("."), &w(r"C:\work"));
     for dir in [".", r".\", "./", r"a\..\"] {
         assert!(fs.is_dir(&w(dir)).unwrap(), "{dir}");
-        assert_eq!(fs.canonical(&w(dir)).unwrap(), w("."), "{dir}");
+        assert_eq!(fs.canonical(&w(dir)).unwrap(), w(r"C:\work"), "{dir}");
     }
 }
 
@@ -626,6 +634,67 @@ fn an_unreadable_dir_answers_for_itself_and_fails_below() {
     assert_eq!(kind(fs.is_file(p("/a/b/c"))), ErrorKind::Other);
 }
 
+/// When several ancestors of a path carry a stated error, the one nearest the root answers, as the
+/// first one a walk down meets does; an unreadable directory answers for what is below it and not
+/// for itself, and the order of the statements does not matter.
+///
+/// Mutants: a walk that meets the nearest ancestor of the path first; an unreadable directory that
+/// fails for itself while a directory above it is unreadable too; a later statement that replaces
+/// an earlier one at another path.
+#[skuld::test]
+fn the_error_nearest_the_root_answers() {
+    use ErrorKind::{Other, PermissionDenied};
+
+    let build = |states: &[(&str, ErrorKind, bool)]| {
+        states
+            .iter()
+            .fold(posix::FakeFilesystem::new(), |fs, &(path, kind, unreadable)| {
+                if unreadable {
+                    fs.with_unreadable_dir(p(path), kind)
+                } else {
+                    fs.with_error(p(path), kind)
+                }
+            })
+    };
+    // (outer, inner, what is asked, who answers).
+    let cases = [
+        // An unreadable directory in an unreadable directory: the outer one fails the inner one too.
+        (
+            [("/a", Other, true), ("/a/b", PermissionDenied, true)],
+            &[("/a/b", Other), ("/a/b/c", Other), ("/a/b/c/d", Other)][..],
+        ),
+        // An error in an unreadable directory.
+        (
+            [("/a", Other, true), ("/a/b", PermissionDenied, false)],
+            &[("/a/b", Other), ("/a/b/c", Other)][..],
+        ),
+        // An unreadable directory in an error.
+        (
+            [("/a", Other, false), ("/a/b", PermissionDenied, true)],
+            &[("/a", Other), ("/a/b", Other), ("/a/b/c", Other)][..],
+        ),
+        // An error in an error.
+        (
+            [("/a", Other, false), ("/a/b", PermissionDenied, false)],
+            &[("/a", Other), ("/a/b", Other), ("/a/b/c", Other)][..],
+        ),
+    ];
+    for (states, asked) in cases {
+        let reversed = [states[1], states[0]];
+        for order in [&states, &reversed] {
+            let fs = build(order);
+            for &(path, want) in asked {
+                assert_eq!(kind(fs.is_file(p(path))), want, "{order:?} {path}");
+                assert_eq!(kind(fs.is_dir(p(path))), want, "{order:?} {path}");
+                assert_eq!(kind(fs.canonical(p(path))), want, "{order:?} {path}");
+            }
+        }
+    }
+    // The outer unreadable directory itself answers, as does the inner one beside an error above.
+    let fs = build(&[("/a", Other, true), ("/a/b", PermissionDenied, true)]);
+    assert!(fs.is_dir(p("/a")).unwrap());
+}
+
 /// A device path spelled with `?` reads as the verbatim path it names, as on the host
 /// (`//?/C:/Windows` is `C:\Windows`): the fake keys it so, and never panics on one.
 ///
@@ -633,28 +702,24 @@ fn an_unreadable_dir_answers_for_itself_and_fails_below() {
 /// which no stored path holds, and the builder panics); one that keys `//?/C:/x` apart from `C:\x`.
 #[skuld::test]
 fn a_question_mark_device_path_reads_as_the_verbatim_path_it_names() {
-    let spellings = [
-        "//?/C:/Windows",
-        "//?/x",
-        r"\\?/C:\Windows\System32",
-        r"/\?\x",
-        r"\\?/",
-        "//?/UNC/srv/share/d",
-        "//?/UNC/?/x",
-        "//?/UNC",
-        "//?/C:",
-        "//?/c:/a/../b",
-    ];
-    for s in spellings {
-        let q = w(s);
-        let fs = windows::FakeFilesystem::new();
-        let _ = (fs.is_file(&q), fs.is_dir(&q), fs.canonical(&q), fs.same_file(&q, &q));
-        let fs = windows::FakeFilesystem::new()
-            .with_file(&q)
-            .with_dir(&q)
-            .with_error(&q, ErrorKind::PermissionDenied)
-            .with_canonical(&q, &q);
-        let _ = (fs.is_file(&q), fs.is_dir(&q), fs.canonical(&q), fs.same_file(&q, &q));
+    // Each spelling is the entry of the plain path it names, stated either way and found either way.
+    for (s, plain) in [
+        ("//?/C:/Windows", r"C:\Windows"),
+        ("//?/x", r"\\.\x"),
+        (r"\\?/C:\Windows\System32", r"C:\Windows\System32"),
+        (r"/\?\x", r"\\.\x"),
+        (r"\\?/", r"\\.\"),
+        ("//?/UNC/srv/share/d", r"\\srv\share\d"),
+        ("//?/UNC", r"\\.\UNC"),
+        ("//?/c:/a/../b", r"c:\b"),
+    ] {
+        let (q, plain) = (w(s), w(plain));
+        let stated = windows::FakeFilesystem::new().with_dir(&plain);
+        assert!(stated.is_dir(&q).unwrap(), "{s}");
+        assert!(stated.same_file(&q, &plain).unwrap(), "{s}");
+        let via_spelling = windows::FakeFilesystem::new().with_dir(&q);
+        assert!(via_spelling.is_dir(&plain).unwrap(), "{s}");
+        assert!(via_spelling.same_file(&q, &plain).unwrap(), "{s}");
     }
 
     let drive = windows::FakeFilesystem::new().with_dir(&w(r"C:\Windows"));
@@ -716,13 +781,10 @@ fn a_dot_device_path_reads_as_the_path_it_names() {
     // Case is exact, as for any other path.
     assert!(!drive.is_dir(&w(r"\\.\c:\Windows")).unwrap());
     assert!(drive.same_file(&w(r"C:\Windows"), &w(r"\\.\C:\Windows")).unwrap());
-    // The raw volume is a device, not the root directory.
+    // The raw volume is a device the host refuses, not the root directory (see `windows::lookup`).
     for q in [r"\\.\C:", r"\\.\C:\.", "//./C:/."] {
-        assert!(!drive.is_dir(&w(q)).unwrap(), "{q}");
+        assert_eq!(kind(drive.is_dir(&w(q))), ErrorKind::Other, "{q}");
     }
-    let volume = windows::FakeFilesystem::new().with_error(&w(r"\\.\C:"), ErrorKind::Other);
-    assert_eq!(kind(volume.is_dir(&w(r"\\.\C:\."))), ErrorKind::Other);
-    assert!(!volume.is_dir(&w(r"C:\")).unwrap());
 
     // Stated as a device path, it is the same entry as the drive path.
     let device = windows::FakeFilesystem::new().with_dir(&w(r"\\.\C:\Windows"));

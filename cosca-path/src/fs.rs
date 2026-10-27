@@ -7,11 +7,12 @@ use crate::PurePath;
 mod fake;
 #[cfg(any(unix, windows))]
 mod host;
+mod spelling;
 
-pub(crate) use fake::sealed;
 pub use fake::{FakeFilesystem, FakePath};
 #[cfg(any(unix, windows))]
 pub use host::HostFilesystem;
+pub(crate) use spelling::sealed;
 
 /// What is at a path.
 ///
@@ -21,8 +22,8 @@ pub use host::HostFilesystem;
 ///
 /// `canonical` and `same_file` have no `Ok` for "nothing there", so absence is
 /// [`NotFound`](io::ErrorKind::NotFound) from them. Every other `Err` is a failure to say, as for
-/// the other two. They need a handle on the object, so they can
-/// fail where `is_file` says `Ok(true)` (on Windows, an app-execution alias or `pagefile.sys`).
+/// the other two. They need a handle on the object, so they can fail where `is_file` says
+/// `Ok(true)`.
 ///
 /// The empty path is `InvalidInput` on Windows and absent on Unix, from every question.
 pub trait Filesystem {

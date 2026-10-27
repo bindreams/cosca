@@ -21,7 +21,6 @@ libc = "0.2"
 [dev-dependencies]
 # The test harness for the `harness = false` lib.
 skuld.workspace = true
-# The directories the `HostFilesystem` tests create and remove.
 tempfile = "3"
 
 [target.'cfg(windows)'.dependencies]

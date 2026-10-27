@@ -106,7 +106,7 @@ fn host_filesystem_treats_what_the_os_reports_as_absence(#[fixture(non_root)] _n
 
         let locked = under("locked");
         std::fs::create_dir(&locked).unwrap();
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0)).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
         let denied = fails("a directory the caller may not search", &locked.join("x"));
         // The directory is removed with the temporary one.
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
