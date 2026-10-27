@@ -11,7 +11,7 @@ use crate::test_groups::{pidfd_group_signal, Group};
 const RELEASABLE_ROOT_WITH_A_MEMBER: [&str; 3] = [
     "sh",
     "-c",
-    "exec 3<&0; (cat <&3 3<&- >/dev/null; echo survived >&2) & echo started; exec cat <&4 4<&- 3<&- >/dev/null 2>/dev/null",
+    "exec 3<&0; (cat <&3 3<&- >/dev/null && echo survived >&2) & echo started; exec cat <&4 4<&- 3<&- >/dev/null 2>/dev/null",
 ];
 
 /// The sync `root_with_a_member`'s twin, and the writer whose drop ends its root with status `0`;

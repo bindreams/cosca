@@ -19,6 +19,11 @@ use crate::containment::unix::fault::record_kill_group;
 use crate::test_groups::{cgroup, Group};
 use crate::{ContainMode, Containment, Stdio};
 
+/// [`root_that_leaves_a_cat`]'s shell, with the `cat` in a shell that prints `eof` if the `cat`
+/// ends by itself, as it does on EOF. A `cat` a kill ended exits by a signal, so the `&&` prints no `eof`.
+#[cfg(target_os = "linux")]
+const ROOT_LEAVING_A_CAT_THAT_SAYS_EOF: &str = "exec 3<&0; { cat <&3 3<&- && echo eof; } & echo started; exit 0";
+
 /// Every record of the drop's warn starts with this.
 const WARN: &str = "Child::drop: the root is already reaped";
 
@@ -57,7 +62,12 @@ fn session_blocker() -> (crate::Child, std::io::PipeWriter) {
 /// test closes stdin. It holds the stderr pipe's write end: stderr reaches EOF exactly when `cat`
 /// is gone.
 fn root_that_leaves_a_cat() -> Command {
-    let mut cmd = session(&["sh", "-c", "exec 3<&0; cat <&3 3<&- & echo started; exit 0"]);
+    root_that_leaves("exec 3<&0; cat <&3 3<&- & echo started; exit 0")
+}
+
+/// [`root_that_leaves_a_cat`] running `script`.
+fn root_that_leaves(script: &str) -> Command {
+    let mut cmd = session(&["sh", "-c", script]);
     cmd.stdin(Stdio::pipe_in()).expect("stdin pipe");
     cmd.stdout(Stdio::pipe_out()).expect("stdout pipe");
     cmd.stderr(Stdio::pipe_out()).expect("stderr pipe");
@@ -504,28 +514,66 @@ fn assert_skipped_at_debug(mark: usize) {
 #[skuld::test]
 fn cgroup_drop_after_wait_still_kills_the_tree_and_does_not_warn(#[fixture(cgroup)] _group: &Group) {
     crate::log_capture::install();
-    let mut cmd = root_that_leaves_a_cat();
+    let mut cmd = root_that_leaves(ROOT_LEAVING_A_CAT_THAT_SAYS_EOF);
     cmd.contain_with(ContainMode::Strongest);
     let mut child = cmd.spawn().expect("spawn");
     assert_eq!(child.containment(), Containment::CgroupV2);
     let mut started = [0u8; 8];
-    child
-        .stdout()
-        .expect("stdout pipe")
-        .read_exact(&mut started)
-        .expect("read `started`");
-    let _stdin = child.stdin().expect("stdin pipe");
+    let mut stdout = child.stdout().expect("stdout pipe");
+    stdout.read_exact(&mut started).expect("read `started`");
+    let stdin = child.stdin().expect("stdin pipe");
     let mut stderr = child.stderr().expect("stderr pipe");
     child.wait().expect("reap the root");
+    // Released as the kill returns; see [`KillRelease`].
+    let release = crate::child::front_cgroup_tests::release_after_cgroup_kill(stdin);
 
     let mark = crate::log_capture::mark();
     drop(child);
 
+    release.assert_killed();
     assert_eq!(drop_warns_since(mark), []);
     let mut rest = Vec::new();
     stderr
         .read_to_end(&mut rest)
-        .expect("the cgroup kill ended the cat, closing stderr, with stdin still held");
+        .expect("the cgroup kill ended the cat, closing stderr");
+    let mut said = Vec::new();
+    stdout.read_to_end(&mut said).expect("every holder of stdout is gone");
+    crate::child::front_cgroup_tests::assert_nothing_ended_by_itself(&said);
+}
+
+/// A root that exited and is not reaped leaves a descendant in its leaf, and the drop's `cgroup.kill`
+/// ends it: the kill that an unwind from a failed tree helper (`tests/common`'s
+/// `spawn_tree_ending_a_failure`) leaves to the drop. Mutant: the drop's `cgroup.kill` write sends
+/// nothing.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn cgroup_drop_of_an_exited_unreaped_root_kills_its_orphaned_descendant(#[fixture(cgroup)] _group: &Group) {
+    crate::log_capture::install();
+    let mut cmd = root_that_leaves(ROOT_LEAVING_A_CAT_THAT_SAYS_EOF);
+    cmd.contain_with(ContainMode::Strongest);
+    let mut child = cmd.spawn().expect("spawn");
+    assert_eq!(child.containment(), Containment::CgroupV2);
+    let mut started = [0u8; 8];
+    let mut stdout = child.stdout().expect("stdout pipe");
+    stdout.read_exact(&mut started).expect("read `started`");
+    let stdin = child.stdin().expect("stdin pipe");
+    let mut stderr = child.stderr().expect("stderr pipe");
+    crate::test_child::wait_until_zombie(child.id().pid());
+    // Released as the kill returns; see [`KillRelease`].
+    let release = crate::child::front_cgroup_tests::release_after_cgroup_kill(stdin);
+
+    let mark = crate::log_capture::mark();
+    drop(child);
+
+    release.assert_killed();
+    assert_eq!(drop_warns_since(mark), []);
+    let mut rest = Vec::new();
+    stderr
+        .read_to_end(&mut rest)
+        .expect("the cgroup kill ended the cat, closing stderr");
+    let mut said = Vec::new();
+    stdout.read_to_end(&mut said).expect("every holder of stdout is gone");
+    crate::child::front_cgroup_tests::assert_nothing_ended_by_itself(&said);
 }
 
 /// A macOS fd marker names its marker holders by identity, so after a reap the drop still sweeps

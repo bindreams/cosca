@@ -25,9 +25,11 @@ const PID_ENV: &str = "COSCA_TEST_SHARED_FOREIGN_TRACER_PID";
 /// Set (to anything) for a helper that seizes its tracee with `PTRACE_O_TRACEEXIT`.
 const HOLD_EXIT_ENV: &str = "COSCA_TEST_SHARED_FOREIGN_TRACER_HOLD_EXIT";
 
-/// The go bytes. `STOP` makes the helper stop the tracee and report it; `LET_EXIT` lets a tracee
-/// held at its exit stop on from it; `REAP` and `EXIT` hand the zombie back.
+/// The go bytes. `STOP` makes the helper stop the tracee and report it, `RESUME` resumes a tracee it
+/// stopped; `LET_EXIT` lets a tracee held at its exit stop on from it; `REAP` and `EXIT` hand the
+/// zombie back.
 pub(crate) const STOP: u8 = b's';
+pub(crate) const RESUME: u8 = b'g';
 pub(crate) const LET_EXIT: u8 = b'c';
 pub(crate) const REAP: u8 = b'r';
 pub(crate) const EXIT: u8 = b'x';
@@ -53,7 +55,8 @@ fn waitpid_status(pid: libc::pid_t) -> libc::c_int {
 
 /// The foreign tracer: seize the pid in [`PID_ENV`] (or, without it, the pid on stdin's first line),
 /// report, and act on each go byte from stdin:
-/// `STOP` interrupts the tracee and reports the stop, `LET_EXIT` waits for the tracee's exit stop and
+/// `STOP` interrupts the tracee and reports the stop, `RESUME` continues it (a tracee a `SIGKILL`
+/// already ended is `ESRCH`, and fine), `LET_EXIT` waits for the tracee's exit stop and
 /// lets it on from it, `REAP` reaps the zombie with `waitpid` and reports, `EXIT` exits without
 /// reaping. A no-op unless it is the re-exec the driver started.
 ///
@@ -99,6 +102,12 @@ fn foreign_tracer_helper() {
                 let status = waitpid_status(pid);
                 assert!(libc::WIFSTOPPED(status), "waitpid: not a stop: {status:#x}");
                 say("stopped");
+            }
+            RESUME => {
+                // SAFETY: as above.
+                let rc = unsafe { libc::ptrace(libc::PTRACE_CONT, pid, null(), null()) };
+                let e = std::io::Error::last_os_error();
+                assert!(rc == 0 || e.raw_os_error() == Some(libc::ESRCH), "PTRACE_CONT: {e}");
             }
             LET_EXIT => {
                 let status = waitpid_status(pid);

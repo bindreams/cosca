@@ -31,10 +31,6 @@ fn release(leaf: CgroupLeaf, name: &str) -> (Vec<String>, Vec<log::Level>) {
     (steps, crate::log_capture::levels_since(mark, name))
 }
 
-fn kill_file(fake: &FakeLeaf) -> Vec<u8> {
-    std::fs::read(fake.leaf.join("cgroup.kill")).expect("read cgroup.kill")
-}
-
 /// A leaf that never drains, released while armed: the release returns. A release that ran the
 /// blocking `Drop` would wait for the drain, which the debug contract turns into a panic.
 #[skuld::test]
@@ -52,7 +48,7 @@ fn an_armed_undrained_leaf_is_killed_left_behind_and_warned_about() {
     let (steps, levels) = release(leaf, name);
 
     assert_eq!(steps, ["rmdir populated 1", "kill"]);
-    assert_eq!(kill_file(&fake), crate::containment::cgroup::KILL_PAYLOAD);
+    assert_eq!(fake.kill_written(), crate::containment::cgroup::KILL_PAYLOAD);
     assert!(fake.leaf.exists(), "an undrained leaf is left behind");
     assert_eq!(levels, [log::Level::Warn]);
     let records = crate::log_capture::records_since(mark, name);
@@ -93,6 +89,11 @@ fn a_leaf_that_drains_by_the_time_of_the_read_is_swept_and_removed() {
     let (steps, levels) = release(leaf, name);
 
     assert_eq!(steps, ["rmdir populated 1", "kill", "rmdir populated 0"]);
+    assert_eq!(
+        fake.kill_written(),
+        crate::containment::cgroup::KILL_PAYLOAD,
+        "the release must write cgroup.kill, not only record the step"
+    );
     assert!(!fake.leaf.exists());
     assert_eq!(levels, Vec::<log::Level>::new());
 }
@@ -106,9 +107,15 @@ fn a_disarmed_leaf_this_handle_killed_is_killed_again_and_warned_about() {
     let (fake, leaf) = entered(name, true);
     leaf.hard_kill().expect("kill the tree");
     leaf.disarm();
+    fake.clear_kill();
     let (steps, levels) = release(leaf, name);
 
     assert_eq!(steps, ["rmdir populated 1", "kill"]);
+    assert_eq!(
+        fake.kill_written(),
+        crate::containment::cgroup::KILL_PAYLOAD,
+        "the release must write cgroup.kill again, not only record the step"
+    );
     assert!(fake.leaf.exists());
     assert_eq!(levels, [log::Level::Warn]);
 }
@@ -122,7 +129,7 @@ fn a_disarmed_never_killed_leaf_is_never_killed_and_logs_at_debug() {
     let (steps, levels) = release(leaf, name);
 
     assert_eq!(steps, ["rmdir populated 1"]);
-    assert_eq!(kill_file(&fake), b"", "nothing may write cgroup.kill");
+    assert_eq!(fake.kill_written(), b"", "nothing may write cgroup.kill");
     assert!(fake.leaf.exists());
     assert_eq!(levels, [log::Level::Debug]);
 }
@@ -135,7 +142,14 @@ fn a_disarmed_leaf_whose_kill_attempt_failed_is_warned_about_and_not_killed_agai
     let (fake, leaf) = entered(name, true);
     std::fs::remove_file(fake.leaf.join("cgroup.kill")).expect("remove cgroup.kill");
     std::fs::create_dir(fake.leaf.join("cgroup.kill")).expect("make cgroup.kill unwritable");
-    leaf.hard_kill().expect_err("the forced failure");
+    // A kill the kernel took empties the leaf. This write is refused, so it never does. A call
+    // that returns `Ok` anyway (whether or not it reached the write) drains the fake here, so the
+    // `expect_err` below fails by assertion and the unwinding drop has nothing to await.
+    let killed = leaf.hard_kill();
+    if killed.is_ok() {
+        FakeLeaf::set_populated(&fake.events, false);
+    }
+    killed.expect_err("the forced failure");
     leaf.disarm();
     let (steps, levels) = release(leaf, name);
 
