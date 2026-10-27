@@ -35,15 +35,17 @@ fn kill_tree_over_an_untrusted_view_errors_and_leaves_the_root_alive() {
     assert_eq!(status.code(), Some(0));
 }
 
-/// A retry once the view recovers finds the tree and kills it.
+/// A retry once the view recovers finds the tree and kills it. Mutant: "`kill_tree` sends nothing
+/// from its second call on".
 #[skuld::test]
 fn kill_tree_succeeds_on_a_retry_after_the_view_recovers() {
-    let (child, _stdin) = treewalk_blocker();
+    let (child, stdin) = treewalk_blocker();
     let forced = force_proc_view_once(ForcedView::Diverged);
     child.kill_tree().expect_err("the first attempt fails");
     drop(forced);
     child.kill_tree().expect("the retry finds the tree");
-    assert_eq!(child.wait().expect("reap").signal(), Some(libc::SIGKILL));
+    drop(stdin);
+    crate::test_child::assert_killed("the root", child.wait().expect("reap"));
 }
 
 /// `Drop` cannot retry, so it still kills the root through its handle, and says descendants may be

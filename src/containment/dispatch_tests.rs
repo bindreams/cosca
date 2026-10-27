@@ -750,7 +750,8 @@ mod frozen_attach {
     use crate::containment::windows::fault::{force_next, Step};
     use crate::containment::{ContainMode, Containment};
     use crate::error::Error;
-    use crate::test_frozen::{raw, spawn_suspended_blocker, InitialThread};
+    use crate::test_frozen::{limit_flags, raw, spawn_suspended_blocker, InitialThread};
+    use windows::Win32::System::JobObjects::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
 
     const ERROR_ACCESS_DENIED: u32 = 5;
 
@@ -784,7 +785,14 @@ mod frozen_attach {
         let attachment = attach_suspended(&child, prepared(Some(ContainMode::Strongest), true, true)).expect("attach");
 
         assert_eq!(attachment.containment, Containment::JobObject);
-        assert!(matches!(attachment.attached, Attached::JobObject(_)));
+        let Attached::JobObject(job) = &attachment.attached else {
+            panic!("expected a job, got {:?}", attachment.attached);
+        };
+        assert_ne!(
+            limit_flags(job).0 & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.0,
+            0,
+            "the job must kill on close: the frozen child never runs, so nothing else ends it"
+        );
         assert_eq!(thread.suspend_count(), 1, "a frozen attach must not resume");
         drop(attachment);
         child
