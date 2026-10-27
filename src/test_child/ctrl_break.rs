@@ -40,9 +40,6 @@ pub(crate) enum Handler {
     Ack,
     /// Handles every event and keeps running, so only a kill ends it.
     Ignore,
-    /// Frees its console before its tag, so it is outside ours: a break reaches nobody and only a
-    /// kill ends it.
-    Detached,
 }
 
 impl Handler {
@@ -51,7 +48,6 @@ impl Handler {
             Handler::Default => "default",
             Handler::Ack => "ack",
             Handler::Ignore => "ignore",
-            Handler::Detached => "detached",
         }
     }
 }
@@ -98,11 +94,11 @@ fn fixture_ctrl_break_member() {
     let addr = addr.into_string().expect("utf8 addr");
     let tag = std::env::var(TAG_ENV).expect("the member's tag");
     let mut sock = ack::connect_control(&addr).expect("connect the control socket");
-    match std::env::var(HANDLER_ENV).expect("the member's handler").as_str() {
+    let handler = std::env::var(HANDLER_ENV).expect("the member's handler");
+    match handler.as_str() {
         "default" => {}
         "ack" => install_ack(&sock),
         "ignore" => install_ignore(),
-        "detached" => free_console(),
         other => panic!("unknown handler {other:?}"),
     }
     sock.write_all(tag.as_bytes()).expect("write the tag");
@@ -153,12 +149,6 @@ fn install_ack(sock: &TcpStream) {
         .expect("one handler per process");
     // SAFETY: installing a console ctrl handler has no preconditions.
     unsafe { SetConsoleCtrlHandler(Some(ack), true) }.expect("install the ctrl handler");
-}
-
-/// Leaves the console the process was started in, so a break to its group reaches nobody.
-fn free_console() {
-    // SAFETY: no preconditions.
-    unsafe { windows::Win32::System::Console::FreeConsole() }.expect("free the console");
 }
 
 /// Handles every console control event, so the process keeps running.
@@ -222,11 +212,66 @@ pub(crate) fn assert_acked(sock: &mut TcpStream, who: &str) {
 
 /// Accepts the root member `root` (death-watched) and reads its tag.
 pub(crate) fn accept_root(listener: &TcpListener, root: crate::identity::ProcessId) -> TcpStream {
+    accept_tagged(listener, root, b'R')
+}
+
+/// Accepts `root` (death-watched) and reads its tag, which must be `tag`.
+fn accept_tagged(listener: &TcpListener, root: crate::identity::ProcessId, tag: u8) -> TcpStream {
     let mut sock = accept_or_die(listener, root);
-    let mut tag = [0u8; 1];
-    sock.read_exact(&mut tag).expect("the root's tag");
-    assert_eq!(&tag, b"R", "wrong root tag");
+    let mut got = [0u8; 1];
+    sock.read_exact(&mut got).expect("the root's tag");
+    assert_eq!(got, [tag], "wrong root tag");
     sock
+}
+
+/// The path of the GUI-subsystem testbin. A lib test has no `CARGO_BIN_EXE_*`, so it is read from
+/// beside the test binary's own `deps` directory, where cargo puts the package's `[[bin]]` targets
+/// (a `--lib`-only build does not make them).
+fn gui_testbin() -> std::path::PathBuf {
+    let exe = std::env::current_exe().expect("current_exe");
+    let path = exe
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("the test binary lives in <target>/<profile>/deps")
+        .join("cosca_testbin_gui.exe");
+    assert!(
+        path.is_file(),
+        "{} is missing: build the package's bin targets (`cargo nextest run` does; `--lib` does not)",
+        path.display()
+    );
+    path
+}
+
+/// Spawns the GUI-subsystem testbin as a contained root, and returns it with its control socket,
+/// which keeps it running while held, after its handshake. Such an image never attaches to its
+/// spawner's console, so it has none to detach: no break reaches it, with no console host
+/// bookkeeping to wait for, and only a kill ends it. Its creation flags are the ordinary contained
+/// ones, so [`GracefulMechanism::ConsoleGroup`](crate::GracefulMechanism) is what the child reports.
+pub(crate) fn spawn_consoleless_root() -> (crate::Child, TcpStream) {
+    let (listener, addr) = crate::test_child::registration_rendezvous();
+    let mut cmd = crate::Command::new();
+    // `args` is the whole argv, program name included.
+    cmd.executable(gui_testbin()).args(["cosca_testbin_gui", addr.as_str()]);
+    crate::test_reexec::scrub_env(|var| _ = cmd.env_remove(var));
+    cmd.env(ack::ACK_ENV, "1");
+    cmd.contain();
+    let child = cmd.spawn().expect("spawn the GUI-subsystem root");
+    let sock = accept_tagged(&listener, child.id(), b'G');
+    (child, sock)
+}
+
+/// [`spawn_consoleless_root`] for the tokio `Child`.
+#[cfg(feature = "tokio")]
+pub(crate) fn spawn_consoleless_root_async() -> (crate::tokio::Child, TcpStream) {
+    let (listener, addr) = crate::test_child::registration_rendezvous();
+    let mut cmd = crate::tokio::Command::new();
+    cmd.executable(gui_testbin()).args(["cosca_testbin_gui", addr.as_str()]);
+    crate::test_reexec::scrub_env(|var| _ = cmd.env_remove(var));
+    cmd.env(ack::ACK_ENV, "1");
+    cmd.contain();
+    let child = cmd.spawn().expect("spawn the GUI-subsystem root");
+    let sock = accept_tagged(&listener, child.id(), b'G');
+    (child, sock)
 }
 
 /// The grandchild a root member started: its control socket, which keeps it running while held,

@@ -827,6 +827,28 @@ pub async fn spawn_grandchild_async_with(
     .await
 }
 
+/// A contained async `spawn-grandchild-echo` tree for a test that drops its handle: the root and the
+/// grandchild as [`Member`]s, built while both are blocked on their sockets. A member that is
+/// released leaves with [`RELEASED_EXIT_CODE`], which no kill produces, so
+/// [`assert_members_torn_down`] tells a teardown from a release.
+#[cfg(feature = "tokio")]
+pub async fn spawn_released_tree_async() -> (cosca::tokio::Child, Member, Member) {
+    let AsyncEchoTree {
+        child,
+        root,
+        grand,
+        grand_pid,
+    } = spawn_echo_tree_async_configured("spawn-grandchild-echo", |cmd| {
+        cmd.contain();
+        cmd.kill_on_drop(true);
+        cmd.env(RELEASED_EXIT_ENV, RELEASED_EXIT_CODE.to_string());
+    })
+    .await;
+    let root = Member::new(root, child.id().pid());
+    let grand = Member::new(grand, grand_pid);
+    (child, root, grand)
+}
+
 /// Read one `<tag><pid>\n` line from a freshly accepted `control-echo-pid` connection.
 pub fn read_tag_and_pid(sock: &mut std::net::TcpStream) -> (u8, u32) {
     let mut line = Vec::new();
