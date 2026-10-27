@@ -66,7 +66,7 @@ fn snapshot_failed(call: &str, e: windows::core::Error) -> Error {
     log::warn!("enumerate::process_parents: {call} failed ({e}); no process snapshot");
     Error::Unassessable {
         detail: format!("the process snapshot could not be taken: {call} failed ({e})"),
-        source: Some(std::io::Error::from(e)),
+        source: Some(crate::error::win32_io_error(e)),
     }
 }
 

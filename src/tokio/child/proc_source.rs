@@ -602,28 +602,12 @@ impl ProcSource {
             #[cfg(windows)]
             ProcSource::Tokio { child, .. } => {
                 let Sig::Kill = sig;
-                use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, HANDLE, WAIT_FAILED};
-                use windows::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
                 // tokio drops its handle once it has reaped the child.
                 let Some(h) = child.raw_handle() else {
                     return Ok(Sent::Gone);
                 };
-                // SAFETY: tokio owns the live process handle while `raw_handle` is `Some`; exit
-                // code 1 is the forced-kill code std's `Child::kill` uses.
-                match unsafe { TerminateProcess(HANDLE(h), 1) } {
-                    Ok(()) => Ok(Sent::Delivered),
-                    // As std's `Child::kill`: a process that is already exiting answers
-                    // `ACCESS_DENIED`, which is success, unless the handle cannot even be waited on.
-                    Err(e) if e.code() == windows::core::HRESULT::from_win32(ERROR_ACCESS_DENIED.0) => {
-                        // SAFETY: as above; a zero-timeout wait only reads the handle's state.
-                        if unsafe { WaitForSingleObject(HANDLE(h), 0) } == WAIT_FAILED {
-                            Err(Error::Io(e.into()))
-                        } else {
-                            Ok(Sent::Delivered)
-                        }
-                    }
-                    Err(e) => Err(Error::Io(e.into())),
-                }
+                // SAFETY of the handle: tokio owns it live while `raw_handle` is `Some`.
+                terminate_unreaped(windows::Win32::Foundation::HANDLE(h))
             }
             #[cfg(windows)]
             ProcSource::Raw(r) => {
@@ -1749,6 +1733,30 @@ fn wait_reapable(pid: u32, identity: u64, level: log::Level) -> (Waited, Option<
             log::log!(level, "wait_and_reap: waiting on child {pid} failed: {e}");
             (Waited::Unverified, Some(format!("waiting on it failed: {e}")))
         }
+    }
+}
+
+/// Windows: hard-kill the not-yet-reaped child whose live process handle is `h`. A failure keeps
+/// its Win32 code, so a denial classifies as `PermissionDenied`.
+#[cfg(windows)]
+pub(super) fn terminate_unreaped(h: windows::Win32::Foundation::HANDLE) -> Result<Sent, Error> {
+    use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, WAIT_FAILED};
+    use windows::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
+    // SAFETY: `h` is a live process handle the caller owns; exit code 1 is the forced-kill code
+    // std's `Child::kill` uses.
+    match unsafe { TerminateProcess(h, 1) } {
+        Ok(()) => Ok(Sent::Delivered),
+        // As std's `Child::kill`: a process that is already exiting answers `ACCESS_DENIED`, which
+        // is success, unless the handle cannot even be waited on.
+        Err(e) if e.code() == windows::core::HRESULT::from_win32(ERROR_ACCESS_DENIED.0) => {
+            // SAFETY: as above; a zero-timeout wait only reads the handle's state.
+            if unsafe { WaitForSingleObject(h, 0) } == WAIT_FAILED {
+                Err(Error::Io(crate::error::win32_io_error(e)))
+            } else {
+                Ok(Sent::Delivered)
+            }
+        }
+        Err(e) => Err(Error::Io(crate::error::win32_io_error(e))),
     }
 }
 

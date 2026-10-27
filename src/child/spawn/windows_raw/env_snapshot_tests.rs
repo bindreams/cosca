@@ -84,3 +84,18 @@ fn var_matches_ntdll() {
     }
     assert_eq!(snapshot.var(OsStr::new("PATH")), Some("a".into()));
 }
+
+/// A `FreeEnvironmentStringsW` failure is `Io` with the plain Win32 code. The call cannot be made
+/// to fail on a real block, so the failure is injected at `freed`.
+///
+/// Mutant: `freed` converts with `.into()`, so the code is `0x80070008`.
+#[skuld::test]
+fn freed_failure_carries_the_win32_code() {
+    use windows::core::HRESULT;
+    use windows::Win32::Foundation::ERROR_NOT_ENOUGH_MEMORY;
+    let failed = windows::core::Error::from_hresult(HRESULT::from_win32(ERROR_NOT_ENOUGH_MEMORY.0));
+    let Err(Error::Io(io)) = freed(Err(failed)) else {
+        panic!("expected Io");
+    };
+    assert_eq!(io.raw_os_error(), Some(ERROR_NOT_ENOUGH_MEMORY.0 as i32), "{io:?}");
+}

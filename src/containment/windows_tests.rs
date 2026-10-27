@@ -241,21 +241,18 @@ fn console_probe_error_surfaces() {
     assert!(matches!(super::caller_has_console(), Ok(true)));
 }
 
-/// `HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE)`. Derived from the documented Win32 macro
-/// (`0x8007_0000 | (x & 0xFFFF)` for positive `x`, with `ERROR_INVALID_HANDLE` == 6), not from
-/// this crate's own output.
-const E_INVALID_HANDLE: i32 = 0x8007_0006u32 as i32;
-/// `HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED)` — a different failure, which must NOT be
-/// classified as a missing console.
-const E_ACCESS_DENIED: i32 = 0x8007_0005u32 as i32;
+/// `ERROR_INVALID_HANDLE`, the bare Win32 code every `io::Error` cosca returns carries.
+const ERROR_INVALID_HANDLE: i32 = 6;
+/// `ERROR_ACCESS_DENIED` — a different failure, which must NOT be classified as a missing console.
+const ERROR_ACCESS_DENIED: i32 = 5;
 
-fn io_err(hresult: i32) -> std::io::Error {
-    std::io::Error::from_raw_os_error(hresult)
+fn io_err(code: i32) -> std::io::Error {
+    std::io::Error::from_raw_os_error(code)
 }
 
 #[skuld::test]
 fn invalid_handle_with_no_console_is_typed_no_console() {
-    let e = super::classify_ctrl_event_failure(4242, io_err(E_INVALID_HANDLE), Ok(false));
+    let e = super::classify_ctrl_event_failure(4242, io_err(ERROR_INVALID_HANDLE), Ok(false));
     let crate::error::Error::NoConsole { detail } = e else {
         panic!("expected NoConsole, got {e:?}");
     };
@@ -269,38 +266,62 @@ fn invalid_handle_with_no_console_is_typed_no_console() {
 #[skuld::test]
 fn invalid_handle_with_a_console_attached_stays_io() {
     // The probe contradicts the code: never claim a cause we just measured to be false.
-    let e = super::classify_ctrl_event_failure(1, io_err(E_INVALID_HANDLE), Ok(true));
+    let e = super::classify_ctrl_event_failure(1, io_err(ERROR_INVALID_HANDLE), Ok(true));
     assert!(matches!(e, crate::error::Error::Io(_)), "got {e:?}");
+}
+
+/// A Win32 failure inside the containment layer reaches the caller as its plain Win32 code, so
+/// `kind()` and `raw_os_error()` classify it. A null handle is a real `ERROR_INVALID_HANDLE`.
+///
+/// Mutant: `duplicate_job` converts with the `windows` crate's own `io::Error` conversion, which
+/// keeps the HRESULT (`0x80070006`).
+#[skuld::test]
+fn duplicate_job_failure_carries_the_win32_code() {
+    let err = super::duplicate_job(windows::Win32::Foundation::HANDLE::default())
+        .expect_err("duplicating a null handle must fail");
+    let crate::error::Error::Io(err) = err else {
+        panic!("expected Error::Io, got {err:?}");
+    };
+    assert_eq!(err.raw_os_error(), Some(ERROR_INVALID_HANDLE), "{err:?}");
+}
+
+/// The error `GenerateConsoleCtrlEvent` returns when the caller has no console: what the `windows`
+/// crate builds from the thread's last error.
+fn no_console_failure() -> windows::core::Error {
+    // SAFETY: setting the calling thread's last error has no preconditions.
+    unsafe {
+        windows::Win32::Foundation::SetLastError(windows::Win32::Foundation::ERROR_INVALID_HANDLE);
+    }
+    windows::core::Error::from_thread()
+}
+
+/// `terminate` classifies the OS's own failure: `ERROR_INVALID_HANDLE` from the call, with the
+/// probe confirming no console, is `NoConsole`. This is the check that the converted error matches
+/// the classifier's code.
+///
+/// Mutant: `terminate_with` converts with `.into()`, so the code is `0x80070006`, the classifier
+/// does not recognise it, and the result is `Io`.
+#[skuld::test]
+fn terminate_classifies_a_real_no_console_failure() {
+    let e = super::terminate_with(4242, || Err(no_console_failure()), || Ok(false)).expect_err("the send failed");
+    assert!(matches!(e, crate::error::Error::NoConsole { .. }), "got {e:?}");
 }
 
 #[skuld::test]
 fn invalid_handle_with_a_failed_probe_stays_io() {
     let probe = Err(std::io::Error::from_raw_os_error(87)); // ERROR_INVALID_PARAMETER
-    let e = super::classify_ctrl_event_failure(1, io_err(E_INVALID_HANDLE), probe);
+    let e = super::classify_ctrl_event_failure(1, io_err(ERROR_INVALID_HANDLE), probe);
     assert!(matches!(e, crate::error::Error::Io(_)), "got {e:?}");
 }
 
 #[skuld::test]
 fn a_different_failure_code_stays_io_whatever_the_probe_says() {
     for console in [Ok(true), Ok(false)] {
-        let e = super::classify_ctrl_event_failure(1, io_err(E_ACCESS_DENIED), console);
+        let e = super::classify_ctrl_event_failure(1, io_err(ERROR_ACCESS_DENIED), console);
         assert!(matches!(e, crate::error::Error::Io(_)), "got {e:?}");
     }
-    let e = super::classify_ctrl_event_failure(1, io_err(E_ACCESS_DENIED), Err(io_err(87)));
+    let e = super::classify_ctrl_event_failure(1, io_err(ERROR_ACCESS_DENIED), Err(io_err(87)));
     assert!(matches!(e, crate::error::Error::Io(_)), "got {e:?}");
-}
-
-#[skuld::test]
-fn the_no_console_signature_matches_the_real_win32_mapping() {
-    // Pins the HRESULT the live path will see against the constant above, so a windows-rs
-    // change to the io::Error conversion cannot silently un-classify the error.
-    use windows::Win32::Foundation::ERROR_INVALID_HANDLE;
-    let hr = windows::core::HRESULT::from_win32(ERROR_INVALID_HANDLE.0);
-    assert_eq!(hr.0, E_INVALID_HANDLE);
-    assert_eq!(
-        std::io::Error::from(windows::core::Error::from_hresult(hr)).raw_os_error(),
-        Some(E_INVALID_HANDLE)
-    );
 }
 
 // The mechanism the creation-flag word settles, one test per row. Nine inputs, three distinct
@@ -718,6 +739,45 @@ fn walk_verdict_returns_the_first_failure() {
     );
 }
 
+/// The OS code of an `io_context` error, read from its source.
+fn source_os_code(e: &std::io::Error) -> Option<i32> {
+    std::error::Error::source(e.get_ref()?)
+        .and_then(|s| s.downcast_ref::<std::io::Error>())
+        .and_then(std::io::Error::raw_os_error)
+}
+
+/// A failed Win32 call on a thread reaches the caller with its plain Win32 code and the kind it
+/// classifies to, and the message still names the call, the thread and the pid.
+///
+/// Mutant: `fail_win32` builds `io::Error::other(msg)`, so the code is lost and the kind is `Other`.
+#[skuld::test]
+fn fail_win32_keeps_the_win32_code_and_kind() {
+    use super::{walk_verdict, Walk};
+    use windows::core::{Error, HRESULT};
+    let mut walk = Walk::default();
+    let cause = Error::from_hresult(HRESULT::from_win32(ERROR_ACCESS_DENIED as u32));
+    walk.fail_win32("ResumeThread", 1, 9, cause);
+    let err = walk_verdict(9, walk).expect_err("a failure");
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err:?}");
+    assert_eq!(source_os_code(&err), Some(ERROR_ACCESS_DENIED), "{err:?}");
+    assert!(
+        err.to_string()
+            .starts_with("ResumeThread failed for thread 1 of pid 9: "),
+        "{err}"
+    );
+}
+
+/// A tie in creation times is cosca's finding, not a failed call: no OS code.
+#[skuld::test]
+fn fail_unidentified_has_no_os_code() {
+    use super::{walk_verdict, Walk};
+    let mut walk = Walk::default();
+    walk.fail_unidentified(7, 12, 34);
+    let err = walk_verdict(7, walk).expect_err("a failure");
+    assert_eq!(err.raw_os_error(), None, "{err:?}");
+    assert_eq!(source_os_code(&err), None, "{err:?}");
+}
+
 /// When every listed thread was stale the walk fails, and the error names the last skip.
 #[skuld::test]
 fn walk_verdict_with_only_skips_names_the_last_skip() {
@@ -789,6 +849,26 @@ fn process_pid_of_rejects_a_handle_that_names_no_process() {
     assert!(
         err.to_string().contains("GetProcessId"),
         "error must name the call: {err}"
+    );
+}
+
+/// `GetProcessId` failing reaches the caller with its Win32 code and the kind that code classifies
+/// to, and the message names the call: a null handle is `ERROR_INVALID_HANDLE`.
+///
+/// Mutant: `process_pid_of` builds `io::Error::other(format!(..))`, losing the code and the kind.
+#[skuld::test]
+fn process_pid_of_failure_carries_the_win32_code() {
+    let err = super::process_pid_of(windows::Win32::Foundation::HANDLE::default()).expect_err("a null handle");
+    assert_eq!(source_os_code(&err), Some(ERROR_INVALID_HANDLE), "{err:?}");
+    assert_eq!(
+        err.kind(),
+        std::io::Error::from_raw_os_error(ERROR_INVALID_HANDLE).kind(),
+        "{err:?}"
+    );
+    assert!(
+        err.to_string()
+            .starts_with("GetProcessId failed on the child's handle: "),
+        "{err}"
     );
 }
 
@@ -1152,4 +1232,119 @@ fn death_watch_assign_held_assigns_the_job_without_resuming() {
     drop(job); // KILL_ON_JOB_CLOSE ends the child
     let mut child = child;
     child.wait().expect("the job's close killed the frozen child");
+}
+
+// Win32 codes of job failures =====
+//
+// Each site converts a `windows::core::Error` to an `io::Error`. A bare `.into()` keeps the
+// HRESULT (`0x8007xxxx`) where std reports the Win32 code. An event handle is a real handle that
+// is not a job, so each job call on it fails with `ERROR_INVALID_HANDLE`: no Job Object is made.
+
+fn event_handle() -> windows::Win32::Foundation::HANDLE {
+    // SAFETY: creating an unnamed event has no preconditions.
+    unsafe { windows::Win32::System::Threading::CreateEventW(None, true, false, None) }.expect("create an event handle")
+}
+
+/// `TerminateJobObject` failing reaches the caller with its Win32 code.
+///
+/// Mutant: `hard_kill` converts with `.into()`, so the code is `0x80070006`.
+#[skuld::test]
+fn hard_kill_failure_carries_the_win32_code() {
+    let h = super::JobHandle::new(event_handle());
+    let err = h.hard_kill().expect_err("an event is not a job");
+    assert_eq!(err.raw_os_error(), Some(ERROR_INVALID_HANDLE), "{err:?}");
+}
+
+/// A `CreateJobObjectW` failure carries the plain Win32 code. The call cannot be made to fail, so
+/// the failure is injected at `owned_job`.
+///
+/// Mutant: `owned_job` converts with `.into()`, so the code is `0x80070008`.
+#[skuld::test]
+fn owned_job_failure_carries_the_win32_code() {
+    use windows::core::HRESULT;
+    use windows::Win32::Foundation::ERROR_NOT_ENOUGH_MEMORY;
+    let failed = windows::core::Error::from_hresult(HRESULT::from_win32(ERROR_NOT_ENOUGH_MEMORY.0));
+    let err = super::owned_job(Err(failed)).expect_err("the creation failed");
+    assert_eq!(err.raw_os_error(), Some(ERROR_NOT_ENOUGH_MEMORY.0 as i32), "{err:?}");
+}
+
+/// `SetInformationJobObject` failing carries the plain Win32 code.
+///
+/// Mutant: `set_kill_on_close_or_close` converts with `.into()`, so the code is `0x80070006`.
+#[skuld::test]
+fn set_kill_on_close_failure_carries_the_win32_code() {
+    let err = super::set_kill_on_close_or_close(event_handle()).expect_err("an event is not a job");
+    assert_eq!(err.raw_os_error(), Some(ERROR_INVALID_HANDLE), "{err:?}");
+}
+
+/// `AssignProcessToJobObject` failing carries the plain Win32 code.
+///
+/// Mutant: `assign_or_close` converts with `.into()`, so the code is `0x80070006`.
+#[skuld::test]
+fn assign_failure_carries_the_win32_code() {
+    // SAFETY: `GetCurrentProcess` returns a pseudo-handle and has no preconditions.
+    let me = unsafe { windows::Win32::System::Threading::GetCurrentProcess() };
+    let err = super::assign_or_close(event_handle(), me).expect_err("an event is not a job");
+    assert_eq!(err.raw_os_error(), Some(ERROR_INVALID_HANDLE), "{err:?}");
+}
+
+/// A member check that fails (`IsProcessInJob` on a handle that is not a job) is reported with the
+/// plain Win32 code, not dropped.
+///
+/// Mutant: the `IsProcessInJob` arm of `member_to_watch` converts with `.into()`, so the code is
+/// `0x80070006`.
+#[skuld::test]
+fn member_check_failure_carries_the_win32_code() {
+    use windows::Win32::System::Threading::{
+        GetCurrentProcessId, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    };
+    // SAFETY: opening this process has no preconditions; `member_to_watch` closes the handle.
+    let opened = unsafe {
+        OpenProcess(
+            PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+            false,
+            GetCurrentProcessId(),
+        )
+    };
+    let err = super::member_to_watch(opened, event_handle()).expect_err("an event is not a job");
+    assert_eq!(err.raw_os_error(), Some(ERROR_INVALID_HANDLE), "{err:?}");
+}
+
+/// An `OpenProcess` refusal is reported with the plain Win32 code, while `ERROR_INVALID_PARAMETER`
+/// (the process already exited) is not a failure.
+///
+/// Mutant: the generic `Err(e)` arm of `member_to_watch` converts with `.into()`, so the code is
+/// `0x80070005`.
+#[skuld::test]
+fn denied_open_carries_the_win32_code() {
+    use windows::core::HRESULT;
+    use windows::Win32::Foundation::{ERROR_ACCESS_DENIED as DENIED, ERROR_INVALID_PARAMETER, HANDLE};
+    let refused = |code| Err(windows::core::Error::from_hresult(HRESULT::from_win32(code)));
+    let err = super::member_to_watch(refused(DENIED.0), HANDLE::default()).expect_err("denied");
+    assert_eq!(err.raw_os_error(), Some(ERROR_ACCESS_DENIED), "{err:?}");
+    let gone = super::member_to_watch(refused(ERROR_INVALID_PARAMETER.0), HANDLE::default());
+    assert!(matches!(gone, Ok(None)), "an exited pid is not a failure: {gone:?}");
+}
+
+/// `Thread32First` failing on a handle that is not a snapshot carries the plain Win32 code.
+///
+/// Mutant: `thread_entries_closing` converts with `.into()`, so the code is `0x80070006`.
+#[skuld::test]
+fn thread_walk_failure_carries_the_win32_code() {
+    let err = super::thread_entries_closing(event_handle()).expect_err("an event is not a snapshot");
+    let code = err.raw_os_error();
+    assert_eq!(code, Some(ERROR_INVALID_HANDLE), "ERROR_INVALID_HANDLE expected");
+}
+
+/// A `CreateToolhelp32Snapshot` failure carries the plain Win32 code. The call cannot be made to
+/// fail, so the failure is injected at `thread_snapshot`.
+///
+/// Mutant: `thread_snapshot` converts with `.into()`, so the code is `0x80070008`.
+#[skuld::test]
+fn thread_snapshot_failure_carries_the_win32_code() {
+    use windows::core::HRESULT;
+    use windows::Win32::Foundation::ERROR_NOT_ENOUGH_MEMORY;
+    let failed = windows::core::Error::from_hresult(HRESULT::from_win32(ERROR_NOT_ENOUGH_MEMORY.0));
+    let err = super::thread_snapshot(Err(failed)).expect_err("the snapshot failed");
+    assert_eq!(err.raw_os_error(), Some(ERROR_NOT_ENOUGH_MEMORY.0 as i32), "{err:?}");
 }
