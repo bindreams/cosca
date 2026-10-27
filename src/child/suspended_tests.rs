@@ -90,9 +90,9 @@ mod on_windows {
         crate::test_child::assert_killed("the resumed child", child.wait().expect("reap the resumed child"));
     }
 
-    /// [`end`] for children alive at once. Every kill is sent and every stdin released before any
-    /// assertion: a child still holding its stdin when an earlier assertion fails would make its own
-    /// drop block for ever.
+    /// [`end`] for children alive at once. A child dropped while still holding its stdin blocks in
+    /// the drop's wait, so every stdin is released before any assertion and before any child can
+    /// drop: `stdins` is declared after `children`, so a panic anywhere unwinds it first.
     fn end_all(mut children: Vec<crate::Child>) {
         let stdins: Vec<_> = children
             .iter_mut()

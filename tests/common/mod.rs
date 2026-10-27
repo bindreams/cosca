@@ -180,25 +180,25 @@ pub fn kill_tree_release_reap(child: &cosca::Child, control: TcpStream) -> std::
     status
 }
 
-/// [`kill_release_reap`] for several children: every kill is sent and every control socket
-/// released before any assertion, so a failed one cannot leave the others to a `Child` drop that
-/// waits on a member still holding its socket.
-pub fn kill_release_reap_all(children: Vec<(cosca::Child, TcpStream)>) {
-    for (child, _) in &children {
-        // A contained child by its group: reaping a contained root after a plain `kill` and then
-        // dropping it warns (#382).
+/// [`kill_release_reap`] for several children. A `Child` dropped while its member still holds the
+/// control socket blocks in the drop's wait, so every socket is released before any `Child` can
+/// drop, on every path: `controls` is declared after `children` and so unwinds first, and the
+/// reaping starts only once it is gone.
+pub fn kill_release_reap_all(pairs: Vec<(cosca::Child, TcpStream)>) {
+    let (children, controls): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
+    for child in &children {
+        // A contained child by its group: a contained root reaped after a plain `kill` and then
+        // dropped warns.
         if child.containment().can_teardown() {
             child.kill_tree().expect("kill_tree");
         } else {
             child.kill().expect("kill");
         }
     }
+    drop(controls);
     let statuses: Vec<_> = children
         .into_iter()
-        .map(|(child, control)| {
-            drop(control);
-            child.wait().expect("reap the killed child")
-        })
+        .map(|child| child.wait().expect("reap the killed child"))
         .collect();
     for status in statuses {
         assert_killed("the killed child", status);
