@@ -189,17 +189,12 @@ fn children_recursive_distinguishes_direct_from_descendant() {
 
 #[skuld::test]
 fn foreign_kill_terminates_the_process() {
-    let (child, mut sock) = spawn_blocker();
+    let (child, sock) = spawn_blocker();
     let p = cosca::Process::from_pid(child.id().pid()).found().expect("resolves");
     p.kill().expect("kill");
-    let mut buf = [0u8; 1];
-    match sock.read(&mut buf) {
-        Ok(0) => {}                                                     // EOF — process died
-        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {} // reset — also death
-        Ok(n) => panic!("expected EOF/ConnectionReset after kill, got {n} bytes"),
-        Err(e) => panic!("unexpected error: {e}"),
-    }
-    let _ = child.wait();
+    // Release after the kill: a kill that sent nothing lets it exit 0, failing the status assertion.
+    drop(sock);
+    common::assert_killed("the killed child", child.wait().expect("reap"));
     p.kill().expect("second kill on a dead process must be Ok");
 }
 
@@ -722,6 +717,7 @@ fn death_watch_accept_tree_panics_when_the_root_dies_before_connecting_after_ano
     .expect("spawn a root that stays alive without ever connecting");
     let root_pid = root.id();
     let root_id = found_id(root_pid);
+    let mut root_stdin = root.stdin.take();
 
     let member_connected = Rc::new(Cell::new(false));
     let (in_hook, in_accept) = (member_connected.clone(), member_connected.clone());
@@ -729,6 +725,8 @@ fn death_watch_accept_tree_panics_when_the_root_dies_before_connecting_after_ano
         move || {
             if in_hook.get() {
                 cosca::Process::from_id(root_id).kill().expect("kill the root");
+                // Release after the kill: a kill that sent nothing lets it exit 0, failing the status assertion.
+                drop(root_stdin.take());
             }
         },
         || {
@@ -939,6 +937,7 @@ fn death_watch_accept_tree_panics_when_the_grandchild_dies_before_connecting_aft
     .expect("spawn a grandchild that stays alive without ever connecting");
     let grandchild_pid = grandchild.id();
     let grandchild_id = found_id(grandchild_pid);
+    let mut grandchild_stdin = grandchild.stdin.take();
     let armings = Rc::new(Cell::new(0usize));
     let in_hook = armings.clone();
     let message = common::with_armed_hook(
@@ -953,6 +952,8 @@ fn death_watch_accept_tree_panics_when_the_grandchild_dies_before_connecting_aft
                 cosca::Process::from_id(grandchild_id)
                     .kill()
                     .expect("kill the grandchild");
+                // Release after the kill: a kill that sent nothing lets it exit 0, failing the status assertion.
+                drop(grandchild_stdin.take());
             }
         },
         || {
@@ -968,7 +969,7 @@ fn death_watch_accept_tree_panics_when_the_grandchild_dies_before_connecting_aft
     );
     root.kill().expect("kill the root");
     root.wait().expect("reap the root");
-    grandchild.wait().expect("reap the grandchild");
+    common::assert_killed("the grandchild", grandchild.wait().expect("reap the grandchild"));
     assert_eq!(
         armings.get(),
         2,
