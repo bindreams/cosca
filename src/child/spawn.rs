@@ -1385,6 +1385,9 @@ fn teardown_after_failed_adoption(
 /// Serializes spawns against the process-global inheritable-handle window: on Windows both the std
 /// path and the raw `CreateProcessW` backend must mark child-side handles inheritable, spawn, then
 /// un-mark/close without a concurrent spawn inheriting them. Held across that window on both paths.
+/// It orders cosca's own spawns only: another spawner in the process that passes `bInheritHandles`
+/// TRUE with no handle list is not under it, and can take those handles while they are inheritable
+/// (see the module doc of `child::spawn::windows_raw`).
 /// **Poison-tolerant:** a panic mid-spawn must not wedge every future spawn, so a poisoned lock is
 /// recovered rather than propagated (the guarded data is unit — there is no invariant to protect).
 pub(crate) fn spawn_lock() -> SpawnLockGuard {

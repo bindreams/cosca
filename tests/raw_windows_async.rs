@@ -269,6 +269,71 @@ fn async_raw_spawn_with_invalid_parent_std_handles_gives_the_child_null() {
     }
 }
 
+#[cfg(all(windows, feature = "tokio"))]
+/// Async twin of sync `an_unlisted_inheritable_handle_does_not_reach_the_child`. Mutant: no
+/// `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`.
+#[skuld::test]
+async fn async_an_unlisted_inheritable_handle_does_not_reach_the_child() {
+    let (mut reader, writer) = common::inheritable_pipe();
+    let value = std::os::windows::io::AsRawHandle::as_raw_handle(&writer) as usize;
+    let mut c = cosca::tokio::Command::new();
+    c.executable(common::testbin())
+        .args(["cosca_testbin", "write-handle", &format!("{value:x}")]);
+    let mut child = c.spawn().expect("raw spawn");
+    drop(writer);
+    let got = tokio::task::spawn_blocking(move || {
+        let mut got = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut got).expect("read the pipe");
+        got
+    })
+    .await
+    .unwrap();
+    child.wait().await.unwrap();
+    assert_eq!(got, b"", "the child inherited the unlisted handle {value:x}");
+}
+
+#[cfg(all(windows, feature = "tokio"))]
+/// Async twin of sync `no_inheritable_handle_outlives_a_raw_spawn`, over the tokio backend's child
+/// ends (overlapped named pipes included). Mutant: `drop(child_ends)` in the tokio `spawn_raw`
+/// replaced by `std::mem::forget(child_ends)`.
+#[skuld::test]
+async fn async_no_inheritable_handle_outlives_a_raw_spawn() {
+    for (kind, targets) in common::inheritable::child_end_kinds() {
+        let before = common::inheritable::snapshot();
+        let mut c = cosca::tokio::Command::new();
+        c.executable(common::testbin()).args(["cosca_testbin", "exit", "0"]);
+        for (slot, target) in targets {
+            c.fd(slot, target).unwrap();
+        }
+        let mut child = c.spawn().unwrap_or_else(|e| panic!("{kind}: raw spawn: {e}"));
+        let leaked: Vec<_> = common::inheritable::snapshot().difference(&before).copied().collect();
+        child.wait().await.unwrap();
+        assert!(leaked.is_empty(), "{kind}: inheritable handles left open: {leaked:x?}");
+    }
+}
+
+#[cfg(all(windows, feature = "tokio"))]
+/// Async twin of sync `no_inheritable_handle_outlives_a_failed_raw_spawn`. Mutant: `drop(child_ends)` in the
+/// tokio `spawn_raw` runs only when the spawn succeeded.
+#[skuld::test]
+async fn async_no_inheritable_handle_outlives_a_failed_raw_spawn() {
+    let missing = format!("{}.missing", common::testbin());
+    for (kind, targets) in common::inheritable::child_end_kinds() {
+        let before = common::inheritable::snapshot();
+        let mut c = cosca::tokio::Command::new();
+        c.raw_executable(&missing).args(["cosca_testbin", "exit", "0"]);
+        for (slot, target) in targets {
+            c.fd(slot, target).unwrap();
+        }
+        assert!(
+            c.spawn().is_err(),
+            "{kind}: spawning a nonexistent executable succeeded"
+        );
+        let leaked: Vec<_> = common::inheritable::snapshot().difference(&before).copied().collect();
+        assert!(leaked.is_empty(), "{kind}: inheritable handles left open: {leaked:x?}");
+    }
+}
+
 #[path = "../src/test_harness.rs"]
 mod test_harness;
 
