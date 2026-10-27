@@ -869,20 +869,6 @@ fn main() {
             // byte was written, so a test can tell "no SIGTERM came" from "not yet" without a timer.
             hold(&mut sock);
         }
-        #[cfg(unix)]
-        "spawn-grandchild-stubborn-child" => {
-            // spawn-grandchild where only the GRANDCHILD ignores SIGTERM: the group's soft
-            // signal kills the root (default disposition) but leaves the grandchild — a
-            // survivor only the post-grace hard sweep can reach.
-            let addr = args[2].clone();
-            let exe = std::env::current_exe().unwrap();
-            let _gc = spawn_reported_grandchild(&exe, &["control-block-ignore-term", &addr, "G"]);
-            let mut sock = crate::ack::connect_control(&addr).unwrap();
-            sock.write_all(b"R").unwrap();
-            sock.flush().unwrap();
-            let mut buf = [0u8; 1];
-            let _ = sock.read(&mut buf);
-        }
         #[cfg(windows)]
         "control-block-ignore-break" => {
             // Ignore CTRL_BREAK, then behave exactly like control-block — only a hard kill ends us.
@@ -1141,16 +1127,28 @@ fn main() {
             // where no break can arrive. The read happens after the cleanup kill below and
             // collects EOF or a reset, so the report is the same whether or not a console exists.
 
-            // ZERO grace: the acker survives its break by design, so the escalation is
-            // deterministic and its exit code is what proves the forced half ran.
-            let (graceful, graceful_code) = match child.graceful_shutdown(Duration::ZERO) {
-                Ok(status) => (
-                    "Ok".to_string(),
-                    status.code().map(|c| c.to_string()).unwrap_or_else(|| "none".into()),
-                ),
-                Err(e) => (describe(&e), "none".to_string()),
+            // The escalating call runs only for a caller with NO console, where it fails before it
+            // signals or kills anything. From a caller with a console its zero-grace escalation
+            // kills and then reaps INSIDE the call, a wait nothing here could release if that kill
+            // sent nothing; the unit tests of `graceful_shutdown` cover that arm, with the member
+            // released between the kill and the reap.
+            let (graceful, graceful_code) = if console == "0" {
+                match child.graceful_shutdown(Duration::ZERO) {
+                    Ok(status) => (
+                        "Ok".to_string(),
+                        status.code().map(|c| c.to_string()).unwrap_or_else(|| "none".into()),
+                    ),
+                    Err(e) => (describe(&e), "none".to_string()),
+                }
+            } else {
+                ("Skipped".to_string(), "none".to_string())
             };
-            let alive_after_graceful = liveness(child.is_alive());
+            // Skipped with the call: a liveness here would read as its result.
+            let alive_after_graceful = if console == "0" {
+                liveness(child.is_alive())
+            } else {
+                "skipped"
+            };
 
             let cleanup = match child.kill() {
                 Ok(()) => "Ok".to_string(),
@@ -1398,27 +1396,41 @@ fn main() {
 
             // (2) graceful_shutdown_tree — the escalation trio, ZERO grace. Delivery is proved
             // by (1); this leg proves the trio's own classification and that a failure leaves
-            // the tree untouched.
-            let (c2, ack2) = spawn_acker("S");
-            let graceful = match c2.graceful_shutdown_tree(Duration::ZERO) {
-                Ok(_) => "Ok".to_string(),
-                Err(e) => describe(&e),
-            };
-            let alive_after_graceful = liveness(c2.is_alive());
-            // "Skipped" — NOT "Ok": nothing was called on this path, so reporting a success
-            // would be a tautology. Whether the tree really went away is carried by the
-            // measured `alive_after_graceful`.
-            let (graceful_cleanup, graceful_cleanup_exit) = if graceful == "Ok" {
-                ("Skipped".to_string(), "none".to_string())
-            } else {
-                let killed = classify(c2.kill_tree());
-                let exit = if killed == "Ok" {
-                    drop(ack2); // a failed sweep leaves it alive, so keep the socket then
-                    exit_code(c2.wait().expect("reap probe root 2"))
-                } else {
-                    "none".to_string()
+            // the tree untouched. It runs only for a caller with NO console, where it fails
+            // before it signals or kills anything. From a caller with a console its escalation
+            // kills and then reaps INSIDE the call, a wait nothing here could release if that
+            // kill sent nothing; the unit tests of `graceful_shutdown_tree` cover that arm, with
+            // the member released between the kill and the reap.
+            let (graceful, alive_after_graceful, graceful_cleanup, graceful_cleanup_exit) = if console == "0" {
+                let (c2, ack2) = spawn_acker("S");
+                let graceful = match c2.graceful_shutdown_tree(Duration::ZERO) {
+                    Ok(_) => "Ok".to_string(),
+                    Err(e) => describe(&e),
                 };
-                (killed, exit)
+                let alive_after_graceful = liveness(c2.is_alive());
+                // "Skipped" — NOT "Ok": nothing was called on this path, so reporting a success
+                // would be a tautology. Whether the tree really went away is carried by the
+                // measured `alive_after_graceful`.
+                let (graceful_cleanup, graceful_cleanup_exit) = if graceful == "Ok" {
+                    ("Skipped".to_string(), "none".to_string())
+                } else {
+                    let killed = classify(c2.kill_tree());
+                    let exit = if killed == "Ok" {
+                        drop(ack2); // a failed sweep leaves it alive, so keep the socket then
+                        exit_code(c2.wait().expect("reap probe root 2"))
+                    } else {
+                        "none".to_string()
+                    };
+                    (killed, exit)
+                };
+                (graceful, alive_after_graceful, graceful_cleanup, graceful_cleanup_exit)
+            } else {
+                (
+                    "Skipped".to_string(),
+                    "skipped",
+                    "Skipped".to_string(),
+                    "none".to_string(),
+                )
             };
 
             let mut line = String::new();

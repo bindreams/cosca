@@ -157,6 +157,11 @@ fn child_graceful_shutdown_signals_the_group_but_only_kills_the_child() {
         Some(1),
         "the root ignores the break, so only the escalation can have ended it, got {status:?}"
     );
+    assert_eq!(
+        child.is_alive(),
+        crate::identity::Liveness::Dead,
+        "the escalation really ended the root"
+    );
     ctrl_break::assert_break_sent_to(child.id().pid());
     // The break reached a descendant the escalation does not touch. Its handler reports "handled",
     // so this read cannot race its death.
@@ -250,11 +255,10 @@ fn treewalk_terminate_tree_reaps_the_grandchild() {
 }
 
 /// The tree ops from a caller that has a console. `terminate_tree` is asserted sent, then the
-/// root's own handler acks the break (the Win32 return value reports success for an event that
-/// reached nobody). `kill_tree` ends the root, which exits 0 when released, so code 1 is the
-/// kill's. `graceful_shutdown_tree` with no grace sends its own break (asserted through the
-/// `AfterTerminate` hook) and escalates, because the root survives its break, and nothing is left
-/// alive.
+/// root's own handler acks the break. `kill_tree` ends the root, which exits 0 when released, so
+/// code 1 is the kill's. `graceful_shutdown_tree` with no grace sends its own break (asserted
+/// through the `AfterTerminate` hook) and escalates, because the root survives its break, and
+/// nothing is left alive.
 #[skuld::test]
 fn tree_graceful_ops_work_from_a_caller_that_has_a_console() {
     let (child, mut sock) = spawn_root(Handler::Ack, crate::ContainMode::Strongest);
@@ -270,8 +274,7 @@ fn tree_graceful_ops_work_from_a_caller_that_has_a_console() {
     let check = term_fault::at_checked(term_fault::HookPoint::AfterTerminate, move || {
         ctrl_break::assert_break_sent_to(pid)
     });
-    // Released after the escalation and before the reap: a no-op escalation then ends the root
-    // with 0, so the status assertion fails instead of the reap hanging on the held root.
+    // Released before the reap, so a no-op escalation fails the status assertion instead of hanging.
     let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, sock);
     let status = child
         .graceful_shutdown_tree(Duration::ZERO)
@@ -310,8 +313,7 @@ fn lone_graceful_ops_work_from_a_caller_that_has_a_console() {
     let check = term_fault::at_checked(term_fault::HookPoint::AfterTerminate, move || {
         ctrl_break::assert_break_sent_to(pid)
     });
-    // Released after the escalation and before the reap: a no-op escalation then ends the root
-    // with 0, so the status assertion fails instead of the reap hanging on the held root.
+    // Released before the reap, so a no-op escalation fails the status assertion instead of hanging.
     let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, sock);
     let status = child.graceful_shutdown(Duration::ZERO).expect("graceful_shutdown");
     check.assert_fired();
@@ -358,6 +360,11 @@ fn graceful_shutdown_tree_sweep_is_load_bearing_on_windows() {
     let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, root_sock);
     let status = child.graceful_shutdown_tree(Duration::ZERO).expect("tree escalates");
     assert_eq!(status.code(), Some(1), "the sweep ends the root, got {status:?}");
+    assert_eq!(
+        child.is_alive(),
+        crate::identity::Liveness::Dead,
+        "the sweep really ended the root"
+    );
     let Grandchild { sock, exit } = grand;
     drop(sock);
     assert_eq!(exit.wait_for_exit_code(), 1, "the sweep must kill the grandchild");
@@ -376,6 +383,10 @@ fn graceful_shutdown_tree_sweep_is_load_bearing_on_windows() {
 /// are read before the release, so they do not depend on that timing. A second root checks the
 /// other half: the forced `graceful_shutdown_tree` still ends such a tree, and its release comes
 /// after the sweep, so a sweep that sent nothing yields `0` instead of a hang on the held root.
+///
+/// Mutants caught deterministically: `terminate_tree` sends nothing (the break assertion); the sweep
+/// sends nothing (the code of the second root). A break delivered outside the console is not among
+/// them, for the ordering reason above.
 fn assert_false_success(
     expected_containment: Containment,
     mode: crate::ContainMode,
@@ -397,8 +408,6 @@ fn assert_false_success(
     child
         .terminate_tree()
         .expect("the cooperative op reports success: that is the gap this pins");
-    // The record and the liveness are checked before the release, so neither depends on when a
-    // delivery would land.
     ctrl_break::assert_break_sent_to(child.id().pid());
     assert_eq!(
         child.is_alive(),
@@ -432,8 +441,6 @@ fn assert_false_success(
     );
 }
 
-/// Mutants: `terminate_tree` sends nothing (the break assertion); the break is delivered outside the
-/// console (the exit code); the sweep sends nothing (the code of the second root).
 #[skuld::test]
 fn a_no_window_contained_root_gets_a_false_success() {
     assert_false_success(Containment::JobObject, crate::ContainMode::Strongest, |c| {
@@ -459,37 +466,27 @@ fn a_treewalk_contained_root_gets_a_false_success_too() {
     });
 }
 
-/// Pins a KNOWN LIMITATION, not desired behaviour. A child that shares no console with us is sent a
-/// break that Windows reports as a success for an event that reached nobody, and nothing inside
-/// this process can tell that case apart from a healthy one. Revisit when a route that reads the
-/// TARGET's console exists: this test must then flip rather than the behaviour changing silently.
+/// A child that shares no console with us is signalled with a success Windows reports for an event
+/// that reached nobody, and nothing inside this process can tell that case apart from a healthy
+/// one (#832). This test must flip when #832 lands, not the behaviour change silently.
 ///
-/// The child is a contained root that leaves its console after it connects, so its creation flags
-/// exclude nothing. The test first waits until the console no longer lists it. `terminate` is
-/// asserted sent, and the child is still running afterwards. That poll is not proof against an
-/// escalating `terminate`: `TerminateProcess` is asynchronous, so the poll can run first. The forced
-/// half still ends it: its release comes after the escalation, so an escalation that sent nothing
-/// yields `0` instead of a hang.
+/// The child is a contained root that frees its console after it connects, so its creation flags
+/// exclude nothing; the test asserts the root's own report that it has none. `terminate` is asserted
+/// sent, and the child is still running afterwards. The forced half still ends it: its release comes
+/// after the escalation, so an escalation that sent nothing yields `0` instead of a hang.
 ///
 /// Mutants: `terminate` sends nothing (the break record); `graceful_shutdown` skips the kill (the
 /// exit code).
 #[skuld::test]
 fn child_graceful_ops_report_success_for_a_child_that_shares_no_console() {
     let _warns = crate::log_capture::warn_watch();
-    let (child, sock) = spawn_root_configured(Handler::Default, crate::ContainMode::Strongest, |c| {
-        c.env(ctrl_break::DETACH_ENV, "1");
-    });
+    let (child, mut sock) = spawn_root(Handler::Detached, crate::ContainMode::Strongest);
+    ctrl_break::assert_left_console(&mut sock);
     let pid = child.id().pid();
     assert_eq!(
         child.graceful_mechanism(),
         GracefulMechanism::ConsoleGroup,
         "the flags do not exclude delivery: that is exactly what makes this a gap"
-    );
-    ctrl_break::wait_until_left_our_console(pid);
-    assert_eq!(
-        ctrl_break::in_our_console(pid),
-        Some(false),
-        "a child that left its console is not in ours"
     );
     child.terminate().expect("the documented false success");
     ctrl_break::assert_break_sent_to(pid);
@@ -507,4 +504,21 @@ fn child_graceful_ops_report_success_for_a_child_that_shares_no_console() {
         .expect("the forced half needs no console");
     check.assert_fired();
     assert_eq!(status.code(), Some(1), "escalation's kill, got {status:?}");
+}
+
+/// Dropping a `Child` with a Job Object tree kills the grandchild as well as the root. Both
+/// sockets are released once the drop's root kill returned, so a drop that sent nothing lets each
+/// member leave on its own with 0, which the code assertions reject, instead of hanging the drop's
+/// reap of the root. A drop whose job kill ended the root first never reaches that release.
+#[skuld::test]
+fn drop_kills_a_job_object_tree() {
+    let (child, root_sock, grand) = spawn_tree(Handler::Default, Handler::Default, crate::ContainMode::Strongest);
+    assert_eq!(child.containment(), Containment::JobObject);
+    let Grandchild { sock, exit } = grand;
+    let teardown = crate::child::spawn::fault::release_at_drop_kill((root_sock, sock));
+
+    drop(child);
+
+    teardown.assert_reaps_killed();
+    assert_eq!(exit.wait_for_exit_code(), 1, "the drop must kill the grandchild");
 }

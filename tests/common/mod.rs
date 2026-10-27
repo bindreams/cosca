@@ -180,6 +180,31 @@ pub fn kill_tree_release_reap(child: &cosca::Child, control: TcpStream) -> std::
     status
 }
 
+/// [`kill_release_reap`] for several children. A `Child` dropped while its member still holds the
+/// control socket blocks in the drop's wait, so every socket is released before any `Child` can
+/// drop, on every path: `controls` is declared after `children` and so unwinds first, and the
+/// reaping starts only once it is gone.
+pub fn kill_release_reap_all(pairs: Vec<(cosca::Child, TcpStream)>) {
+    let (children, controls): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
+    for child in &children {
+        // A contained child by its group: a contained root reaped after a plain `kill` and then
+        // dropped warns.
+        if child.containment().can_teardown() {
+            child.kill_tree().expect("kill_tree");
+        } else {
+            child.kill().expect("kill");
+        }
+    }
+    drop(controls);
+    let statuses: Vec<_> = children
+        .into_iter()
+        .map(|child| child.wait().expect("reap the killed child"))
+        .collect();
+    for status in statuses {
+        assert_killed("the killed child", status);
+    }
+}
+
 /// [`kill_release_reap`] for the tokio `Child`.
 #[cfg(feature = "tokio")]
 pub async fn kill_release_reap_async(child: &mut cosca::tokio::Child, control: TcpStream) -> std::process::ExitStatus {
@@ -546,9 +571,8 @@ pub fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 
 /// Spawn a 2-level tree via a grandchild-spawning testbin `mode` (root tag "R" + one grandchild
 /// tag "G"), optionally contained, and return the owned `Child` plus BOTH accepted sockets (the
-/// two tag reads prove the 2-level tree is alive). The tree dies — and both sockets EOF — only
-/// when the whole tree is torn down, so callers prove teardown by reading EOF on both, never by
-/// a timer.
+/// two tag reads prove the 2-level tree is alive). Callers prove teardown by an exit code or an
+/// echo (see [`Member`] and `assert_members_killed`), never by a timer or an unbounded read.
 pub fn spawn_tree(mode: &str, contain: bool) -> (cosca::Child, Vec<TcpStream>) {
     spawn_tree_with(mode, contain, |_| {})
 }
