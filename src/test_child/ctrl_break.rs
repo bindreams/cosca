@@ -78,12 +78,12 @@ pub(crate) fn member_env(addr: &str, handler: Handler, grandchild: Option<Handle
     env
 }
 
-/// Connects, installs its [`Handler`], writes its tag, and blocks on a read of its socket until the caller closes it (then exits 0) or
-/// something ends it. A root with [`GRANDCHILD_ENV`] set starts that grandchild after its tag, with
-/// no creation flags, so it stays in the root's console process group, and then writes the
-/// grandchild's pid (4 bytes, little-endian). The grandchild connects to the same address with tag
-/// `G`. The root holds the grandchild's process handle while it lives, so the pid stays the
-/// grandchild's.
+/// Connects, installs its [`Handler`], writes its tag, and blocks on a read of its socket until the
+/// caller closes it (then exits 0) or something ends it. A root with [`GRANDCHILD_ENV`] set starts
+/// that grandchild after its tag, with no creation flags, so it stays in the root's console process
+/// group, and then writes the grandchild's pid (4 bytes, little-endian). The grandchild connects to
+/// the same address with tag `G`. The root holds the grandchild's process handle while it lives, so
+/// the pid stays the grandchild's.
 ///
 /// The tag is the readiness edge: the member cannot write it before it runs its own code, which on
 /// Windows is also after the console has registered it and after its handler is installed.
@@ -166,7 +166,7 @@ fn free_console() {
 /// Whether this process is attached to a console, read from the process itself: a process with
 /// none gets `0` from `GetConsoleProcessList`.
 fn has_console() -> bool {
-    // SAFETY: `list` is a valid writable slice.
+    // SAFETY: the buffer is a valid writable slice.
     unsafe { windows::Win32::System::Console::GetConsoleProcessList(&mut [0u32; 1]) != 0 }
 }
 
@@ -193,9 +193,8 @@ pub(crate) fn accept_root(listener: &TcpListener, root: crate::identity::Process
     sock
 }
 
-/// Reads a [`Handler::Detached`] root's own report that it has no console (after [`accept_root`]),
-/// so the caller knows the root left it, which no view of the caller's console can show without a
-/// pid that may be stale.
+/// Reads a [`Handler::Detached`] root's own report that it has no console (after [`accept_root`]).
+/// The caller's console list cannot say: it may hold a stale entry with the root's pid.
 pub(crate) fn assert_left_console(sock: &mut TcpStream) {
     let mut report = [0u8; 1];
     sock.read_exact(&mut report).expect("the root's console report");
