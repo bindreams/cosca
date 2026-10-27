@@ -178,8 +178,19 @@ mod identity {
             .open(p)
     }
 
-    /// The 128-bit file id of `f`. A failure carries `GetLastError`'s code, as `narrow_file_id`'s does:
-    /// the `windows` crate's own conversion would give an `HRESULT`.
+    /// `e` as the Win32 code it wraps: the `windows` crate's own conversion keeps the `HRESULT`.
+    /// Decoded from `e` itself, as building `e` called `GetErrorInfo` after `GetLastError`.
+    #[cfg(windows)]
+    fn win32_error(e: windows::core::Error) -> io::Error {
+        let code = e.code().0 as u32;
+        if code & 0xFFFF_0000 == 0x8007_0000 {
+            io::Error::from_raw_os_error((code & 0xFFFF) as i32)
+        } else {
+            e.into()
+        }
+    }
+
+    /// The 128-bit file id of `f`, or the Win32 code of the failure.
     #[cfg(windows)]
     pub(super) fn wide_file_id(f: &std::fs::File) -> io::Result<windows::Win32::Storage::FileSystem::FILE_ID_INFO> {
         use std::os::windows::io::AsRawHandle;
@@ -197,7 +208,7 @@ mod identity {
                 size_of::<FILE_ID_INFO>() as u32,
             )
         }
-        .map_err(|_| io::Error::last_os_error())?;
+        .map_err(win32_error)?;
         Ok(info)
     }
 
@@ -211,8 +222,7 @@ mod identity {
 
         let mut info = BY_HANDLE_FILE_INFORMATION::default();
         // SAFETY: the handle is open for the call, and `info` is a `BY_HANDLE_FILE_INFORMATION`.
-        unsafe { GetFileInformationByHandle(HANDLE(f.as_raw_handle()), &mut info) }
-            .map_err(|_| io::Error::last_os_error())?;
+        unsafe { GetFileInformationByHandle(HANDLE(f.as_raw_handle()), &mut info) }.map_err(win32_error)?;
         Ok((
             info.dwVolumeSerialNumber,
             u64::from(info.nFileIndexHigh) << 32 | u64::from(info.nFileIndexLow),
