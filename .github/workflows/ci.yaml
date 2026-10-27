@@ -314,7 +314,8 @@ jobs:
           set -uxo pipefail
           r=0; "target/$TARGET/debug/cosca_testbin" audit-enabled || r=$?; echo "after nextest --no-run: testbin exit=$r (expect 0)"
           cargo nextest archive --locked --target "$TARGET" --archive-file "$RUNNER_TEMP/spike.tar.zst"
-          cargo nextest run --archive-file "$RUNNER_TEMP/spike.tar.zst" --extract-to "$RUNNER_TEMP/spike-extract" --workspace-remap "$PWD" --no-tests=fail             -E 'test(=audit_tests::test_hooks_reach_the_lib_unit_tests) | test(=test_hooks_reach_the_integration_test_and_the_testbin)'
+          mkdir -p "$RUNNER_TEMP/spike-extract"
+          cargo nextest run --archive-file "$RUNNER_TEMP/spike.tar.zst" --extract-to "$RUNNER_TEMP/spike-extract" --workspace-remap "$GITHUB_WORKSPACE" --no-tests=fail             -E 'test(=audit_tests::test_hooks_reach_the_lib_unit_tests) | test(=test_hooks_reach_the_integration_test_and_the_testbin)'
 
       - name: Run tests
         timeout-minutes: 8
