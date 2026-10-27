@@ -18,6 +18,14 @@ ref-cast = "1"
 # The test harness for the `harness = false` lib.
 skuld.workspace = true
 
+[target.'cfg(windows)'.dev-dependencies]
+# The conversion tests compare against Win32's own pure string functions.
+windows = { version = "0.62", features = [
+    "Wdk_Storage_FileSystem",
+    "Win32_Storage_FileSystem",
+    "Win32_System_WindowsProgramming",
+] }
+
 [lib]
 # The lib's unit tests run on skuld (`src/lib.rs` has the `main`).
 harness = false
