@@ -394,11 +394,11 @@ fn unreadable_tool(dir: &std::path::Path) -> (PathBuf, PathBuf) {
     (host(&tool), host(&other))
 }
 
-/// On Linux `same_file` examines identity without access to the data (`O_PATH`): a file the caller
-/// may execute but not read is `Ok`, as it is for `is_file`.
+/// `same_file` needs no access to the data: a file the caller may execute but not read is `Ok`, as
+/// it is for `is_file`. On Linux and Android that is the `O_PATH` open; elsewhere nothing is opened.
 ///
 /// Mutant: `same_file` opens the paths for reading (`EACCES`).
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(unix)]
 #[skuld::test]
 fn host_filesystem_same_file_needs_no_read_access(#[fixture(non_root)] _non_root: &()) {
     let dir = tempfile::tempdir().unwrap();
@@ -410,43 +410,86 @@ fn host_filesystem_same_file_needs_no_read_access(#[fixture(non_root)] _non_root
     assert!(!fs.same_file(&tool, &other).unwrap());
 }
 
-/// Where there is no `O_PATH`, `same_file` holds both files open to read them, so a file the caller
-/// may not read is `PermissionDenied`, not a comparison of two path lookups that a deleted file's
-/// reused inode could fool (see `identity::open`).
+/// The comparison that macOS and the other non-Linux Unixes use, which runs on every Unix here so
+/// that Linux CI covers it: it opens nothing, so an unreadable file and a FIFO are `Ok`.
 ///
-/// Mutant: `same_file` that falls back to comparing `metadata` by path.
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+/// Mutants: `same_file_by_stat` opening the paths for reading (`EACCES`, or a FIFO's wait for a
+/// writer, which the `slow-timeout` override in `.config/nextest.toml` bounds); answering `false`
+/// for one file.
+#[cfg(unix)]
 #[skuld::test]
-fn host_filesystem_same_file_needs_read_access_without_o_path(#[fixture(non_root)] _non_root: &()) {
+fn same_file_by_stat_opens_nothing(#[fixture(non_root)] _non_root: &()) {
+    use std::os::unix::ffi::OsStrExt;
+
+    use super::identity::same_file_by_stat;
+
     let dir = tempfile::tempdir().unwrap();
     let (tool, other) = unreadable_tool(dir.path());
-    let fs = HostFilesystem;
+    let (tool, other) = (tool.as_std_path(), other.as_std_path());
+    assert!(same_file_by_stat(tool, tool).unwrap());
+    assert!(!same_file_by_stat(tool, other).unwrap());
 
-    assert!(fs.is_file(&tool).unwrap());
-    assert_eq!(
-        fs.same_file(&tool, &other).unwrap_err().kind(),
-        io::ErrorKind::PermissionDenied
-    );
+    let fifo = dir.path().join("fifo");
+    let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    // SAFETY: `c_path` is a NUL-terminated string that outlives the call.
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0, "mkfifo");
+    assert!(same_file_by_stat(&fifo, &fifo).unwrap());
+    assert!(!same_file_by_stat(&fifo, dir.path()).unwrap());
+}
+
+/// The stat comparison includes `ctime`: two names of one file whose metadata changes between the
+/// two `stat`s (here a `chmod`, which sets `ctime` and which no unprivileged call can set back) are
+/// not reported as one file. A replacement that reuses the inode number is told apart the same way.
+///
+/// Mutant: `same_file_by_stat` comparing `(dev, ino)` alone.
+#[cfg(unix)]
+#[skuld::test]
+fn same_file_by_stat_compares_ctime() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    use super::identity::{same_file_by_stat, same_file_by_stat_with};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+    std::fs::write(&a, b"").unwrap();
+    std::fs::hard_link(&a, &b).unwrap();
+    assert!(same_file_by_stat(&a, &b).unwrap(), "the control: no change, one file");
+
+    let ctime = |p: &std::path::Path| {
+        let meta = std::fs::metadata(p).unwrap();
+        (meta.ctime(), meta.ctime_nsec())
+    };
+    let same = same_file_by_stat_with(&a, &b, || {
+        let before = ctime(&a);
+        // A clock tick can be coarser than two calls: change the mode until `ctime` moves.
+        let mut mode = 0o600;
+        while ctime(&a) == before {
+            mode ^= 0o044;
+            std::fs::set_permissions(&a, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+    });
+    assert!(!same.unwrap(), "the file's ctime changed between the two stats");
 }
 
 /// `same_file` holds both files while it compares them: once each is open, no change to the paths
 /// changes the answer, so an inode number freed by a delete cannot be reused by the other path in
 /// between. Here two names of one file are both removed after the files are open, and the answer is
-/// still `true`.
+/// still `true`. Linux and Android only: elsewhere `same_file` compares by path (see
+/// `same_file_by_stat_compares_ctime`).
 ///
 /// Mutant: `same_file` that reads each file's identity by path, one after the other, without a
 /// handle on the first.
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[skuld::test]
 fn host_filesystem_same_file_holds_both_files_while_comparing() {
-    use super::identity::same_file_with;
+    use super::identity::same_file_pinned_with;
 
     let dir = tempfile::tempdir().unwrap();
     let (a, b) = (dir.path().join("a"), dir.path().join("b"));
     std::fs::write(&a, b"").unwrap();
     std::fs::hard_link(&a, &b).unwrap();
 
-    let same = same_file_with(&a, &b, || {
+    let same = same_file_pinned_with(&a, &b, || {
         std::fs::remove_file(&a).unwrap();
         std::fs::remove_file(&b).unwrap();
     });
@@ -455,8 +498,8 @@ fn host_filesystem_same_file_holds_both_files_while_comparing() {
 
 /// `same_file` does not wait for a writer on a FIFO.
 ///
-/// Mutant: `same_file` opens the paths, which blocks until a writer appears. The bound for that
-/// hang is the `slow-timeout` override in `.config/nextest.toml`.
+/// Mutant: `same_file` opens the paths for reading, which blocks until a writer appears. The bound
+/// for that hang is the `slow-timeout` override in `.config/nextest.toml`.
 #[cfg(unix)]
 #[skuld::test]
 fn host_filesystem_same_file_does_not_block_on_a_fifo() {
