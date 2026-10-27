@@ -1,7 +1,13 @@
 //! Unit tests for the async builder mirror — assert the wrapped sync request records the
 //! configured values (the integration suite only proves the spawn path).
 
+#[cfg(target_os = "linux")]
+use crate::containment::cgroup::test_support::alone;
 use crate::containment::Nesting;
+#[cfg(target_os = "linux")]
+use crate::test_child::fixture_path;
+#[cfg(target_os = "linux")]
+use crate::tokio::child::child_drop_tests::linux::{Ended, Pidfd};
 use crate::ContainMode;
 
 #[skuld::test]
@@ -72,13 +78,6 @@ fn tokio_raw_executable_records_an_exact_spec() {
 }
 
 // A failure after the spawn reports what became of the child =====
-
-#[cfg(target_os = "linux")]
-use crate::containment::cgroup::test_support::alone;
-#[cfg(target_os = "linux")]
-use crate::test_child::fixture_path;
-#[cfg(target_os = "linux")]
-use crate::tokio::child::child_drop_tests::linux::{Ended, Pidfd};
 
 /// A live blocker whose stdin this test holds, and that writer.
 #[cfg(unix)]

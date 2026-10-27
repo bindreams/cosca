@@ -2,9 +2,8 @@
 //! for a process group whose root is reaped. On Linux 6.9+ the root's pidfd decides; below 6.9
 //! nothing goes out by the group's number.
 
-use super::group_exact_tests::root_with_a_member;
+use super::group_exact_tests::{kill_and_reap_behind, releasable_group_root, releasable_root_with_a_member};
 use crate::send_log::{assert_group_signalled_first_through_the_pidfd, Capture};
-use crate::test_child::reaped_elsewhere::reap_behind;
 use crate::test_groups::{pidfd_group_signal, Group};
 
 /// Who reaps the root.
@@ -23,14 +22,16 @@ enum Teardown {
     FinishElevated,
 }
 
-/// Kills `child`'s root alone and has `reap` reap it.
-async fn reap_root(child: &mut crate::tokio::Child, reap: Reap) {
-    child.kill().expect("kill the root alone");
+/// Kills `child`'s root alone and has `reap` reap it (see [`kill_and_reap_behind`] for `release`).
+async fn reap_root(child: &mut crate::tokio::Child, release: std::io::PipeWriter, reap: Reap) {
     match reap {
         Reap::Own => {
-            child.wait().await.expect("this handle reaps the root");
+            child.kill().expect("kill the root alone");
+            drop(release);
+            let status = child.wait().await.expect("this handle reaps the root");
+            crate::test_child::assert_killed("the root", status);
         }
-        Reap::Foreign => reap_behind(child.id().pid()),
+        Reap::Foreign => kill_and_reap_behind(child, release),
     }
 }
 
@@ -57,8 +58,8 @@ fn tear_down(child: crate::tokio::Child, teardown: Teardown) -> Option<String> {
 /// root's pidfd.
 async fn kills_the_group_left_behind(reap: Reap, teardown: Teardown) {
     crate::tokio::test_runtime::assert_current_thread();
-    let (mut child, member) = root_with_a_member();
-    reap_root(&mut child, reap).await;
+    let (mut child, member, release) = releasable_root_with_a_member();
+    reap_root(&mut child, release, reap).await;
     let capture = Capture::start();
     tear_down(child, teardown);
     let steps = capture.group_steps();
@@ -70,8 +71,8 @@ async fn kills_the_group_left_behind(reap: Reap, teardown: Teardown) {
 /// on.
 async fn below_6_9_sends_nothing_to_the_group(reap: Reap, teardown: Teardown) {
     crate::tokio::test_runtime::assert_current_thread();
-    let (mut child, member) = root_with_a_member();
-    reap_root(&mut child, reap).await;
+    let (mut child, member, release) = releasable_root_with_a_member();
+    reap_root(&mut child, release, reap).await;
     let old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     let capture = Capture::start();
     tear_down(child, teardown);
@@ -86,11 +87,8 @@ async fn below_6_9_sends_nothing_to_the_group(reap: Reap, teardown: Teardown) {
 async fn sends_nothing_to_an_empty_group_and_reports_no_skip(reap: Reap, teardown: Teardown) {
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
-    let mut cmd = crate::tokio::Command::new();
-    cmd.args(["sleep", "300"]);
-    cmd.contain_with(crate::ContainMode::Session);
-    let mut child = cmd.spawn().expect("spawn");
-    reap_root(&mut child, reap).await;
+    let (mut child, release) = releasable_group_root();
+    reap_root(&mut child, release, reap).await;
     let mark = crate::log_capture::mark();
     let capture = Capture::start();
     let detail = tear_down(child, teardown);

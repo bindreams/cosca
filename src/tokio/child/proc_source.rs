@@ -1312,7 +1312,15 @@ impl ProcSource {
         let ProcSource::Tokio { child, .. } = self else {
             unreachable!("only a tokio backend's wait answers `Exited`")
         };
-        crate::child::spawn::fate_of_a_look(child.try_wait().map_err(|e| e.raw_os_error()), id)
+        #[cfg(test)]
+        let pid = id.map_or_else(|| child.id().unwrap_or(0), |id| id.pid());
+        let looked = child.try_wait();
+        // So a test that released its fixture at the kill can assert how the root died.
+        #[cfg(test)]
+        if let Ok(Some(status)) = &looked {
+            crate::child::spawn::fault::record_teardown_reap(pid, *status);
+        }
+        crate::child::spawn::fate_of_a_look(looked.map_err(|e| e.raw_os_error()), id)
     }
 
     /// [`reap_now`](ProcSource::reap_now) for an elevation front (see [`crate::elevation::front`]):

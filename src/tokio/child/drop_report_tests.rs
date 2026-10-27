@@ -274,7 +274,9 @@ mod linux {
     async fn finish_elevated_leaves_the_handle_armed_when_the_root_kill_was_refused() {
         crate::log_capture::install();
         let _recorder = crate::containment::unix::fault::record_kill_group();
-        let (child, _writer) = session_blocker(true);
+        let (child, writer) = session_blocker(true);
+        // Released once the handle's drop killed the root, before its reap.
+        let teardown = crate::child::spawn::fault::release_between_kill_and_wait(writer);
         let drops = crate::tokio::child::drop_fault::record();
         let mark = crate::log_capture::mark();
         let _kill = crate::tokio::child::fault::force_kill_failure();
@@ -288,6 +290,7 @@ mod linux {
             "the handle's drop retries the refused root kill ({err:?})"
         );
         assert_eq!(warns_since(mark), Vec::<String>::new());
+        teardown.assert_killed();
     }
 
     /// The cleanup's `debug` lines name the cleanup, not a drop: the read of the root's number says
