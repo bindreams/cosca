@@ -175,10 +175,10 @@ fn child_graceful_shutdown_signals_the_group_but_only_kills_the_child() {
     assert_eq!(exit.wait_for_exit_code(), 1, "kill_tree must kill the grandchild");
 }
 
-/// Pins a KNOWN LIMITATION, not desired behaviour. A child that shares no console with us is
-/// signalled with a success Windows reports for an event that reached nobody, and nothing inside
-/// this process can tell that case apart from a healthy one. Revisit when a route that reads the
-/// TARGET's console exists: this test must then flip, not the behaviour change silently.
+/// Pins a KNOWN LIMITATION, not desired behaviour (tracked in #832). A child that shares no console
+/// with us is signalled with a success Windows reports for an event that reached nobody, and
+/// nothing inside this process can tell that case apart from a healthy one. This test must flip
+/// when #832 lands, not the behaviour change silently.
 ///
 /// The child freed its console after it started, so the flags do not exclude delivery and the
 /// mechanism is still the console group. Its socket is closed once the escalation's kill returned,
@@ -221,16 +221,40 @@ fn child_graceful_ops_report_success_for_a_child_that_shares_no_console() {
 /// nothing gives code 0, not a hang in the reap.
 #[skuld::test]
 fn graceful_shutdown_tree_ends_a_root_that_has_a_console_of_its_own() {
-    // The last field: `detached()` rather than `no_window()`.
     let legs = [
-        ("no_window, job", crate::ContainMode::Strongest, false),
-        ("detached, job", crate::ContainMode::Strongest, true),
-        ("no_window, treewalk", crate::ContainMode::TreeWalk, false),
+        (
+            "no_window, job",
+            crate::ContainMode::Strongest,
+            Containment::JobObject,
+            false,
+        ),
+        (
+            "detached, job",
+            crate::ContainMode::Strongest,
+            Containment::JobObject,
+            true,
+        ),
+        (
+            "no_window, treewalk",
+            crate::ContainMode::TreeWalk,
+            Containment::TreeWalk,
+            false,
+        ),
     ];
-    for (what, mode, detached) in legs {
+    for (what, mode, containment, detached) in legs {
         let (child, sock, _) = spawn_configured(Handler::Ignore, None, mode, |c| {
             _ = if detached { c.detached() } else { c.no_window() }
         });
+        assert_eq!(
+            child.containment(),
+            containment,
+            "{what}: this test is about the wrong thing if containment did not take"
+        );
+        assert_eq!(
+            child.graceful_mechanism(),
+            GracefulMechanism::OtherConsoleGroup,
+            "{what}: the honest route; a derivation reading only the containment half says ConsoleGroup"
+        );
         let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, sock);
         let status = child
             .graceful_shutdown_tree(Duration::ZERO)
