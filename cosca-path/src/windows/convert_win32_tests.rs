@@ -395,16 +395,23 @@ fn nt_prefix_passes_through_to_the_object_manager() {
     }
 }
 
-/// `s` with a `Z` around every name that is not `.`, `..` or empty: the trailing `Z` so that Win32
-/// trims nothing from it, the leading `ZZ` so that no name is a device under Windows 10's rules,
-/// where the part before a name's first `.` or `:` decides (`nul.` and `nulZ.` are both NUL there,
-/// `ZZnul.Z` is a file); two units, as one unit before a `:` would read as a drive (`:` → `Z:`). A leading drive designator (`C:`, and `.:`, `?:` or `::`, which Win32 skips the same way) and
-/// the `?` of a leading `\\?` are not names: marking them would change what the string is.
-fn sentinel(s: &str) -> String {
-    let mark = |name: &str| match name {
+/// `name` as [`sentinel`] spells it: `ZZ{name}Z`, except `.`, `..` and the empty name, which stay.
+///
+/// The trailing `Z` leaves Win32 nothing to trim. The leading `ZZ` keeps the name from being a
+/// device under Windows 10's rules, where the part before the first `.` or `:` decides: `nul.` is
+/// NUL there, `nul.Z` (the trailing mark alone) still is, and `ZZnul.Z` is a file. Two units, as one
+/// before a `:` would read as a drive (`:` → `Z:`).
+fn marked_name(name: &str) -> String {
+    match name {
         "" | "." | ".." => name.to_owned(),
         _ => format!("ZZ{name}Z"),
-    };
+    }
+}
+
+/// `s` with every name [marked](marked_name). A leading drive designator (`C:`, and `.:`, `?:` or
+/// `::`, which Win32 skips the same way) and the `?` of a leading `\\?` are not names: marking them
+/// would change what the string is.
+fn sentinel(s: &str) -> String {
     let separators: Vec<char> = s.chars().filter(|c| matches!(c, '\\' | '/')).collect();
     let segments: Vec<&str> = s.split(['\\', '/']).collect();
     let mut out = String::new();
@@ -413,10 +420,10 @@ fn sentinel(s: &str) -> String {
             [drive, b':', ..] if i == 0 => {
                 out.push(char::from(*drive));
                 out.push(':');
-                out.push_str(&mark(&segment[2..]));
+                out.push_str(&marked_name(&segment[2..]));
             }
             _ if i == 2 && segments[..2] == ["", ""] && *segment == "?" => out.push('?'),
-            _ => out.push_str(&mark(segment)),
+            _ => out.push_str(&marked_name(segment)),
         }
         if let Some(separator) = separators.get(i) {
             out.push(*separator);
@@ -449,24 +456,16 @@ fn dots_end_the_reading(path: &PathBuf) -> bool {
     (dots(server) || dots(share)) && kept == 0 && !trailing
 }
 
-/// `name` as [`sentinel`] spells it.
-fn marked_name(name: &OsStr) -> String {
-    let name = name.to_str().unwrap();
-    match name {
-        "" | "." | ".." => name.to_owned(),
-        _ => format!("ZZ{name}Z"),
-    }
-}
-
 /// Whether `marked` is `path` with [`sentinel`] applied to its names: the same anchor, and the same
 /// components. A `Z` can change what a string is (`a:` is a drive, `a:Z` is not; `a:.` has a `.`,
 /// `a:.Z` a name), and the oracle is no use then.
 fn is_marked_spelling(path: &PathBuf, marked: &PathBuf) -> bool {
+    let spelled = |name: &OsStr| marked_name(name.to_str().unwrap());
     let same_anchor = match (path.anchor(), marked.anchor()) {
         (Anchor::Unc { server: s, share: h }, Anchor::Unc { server: ms, share: mh }) => {
-            marked_name(s) == ms.to_str().unwrap() && marked_name(h) == mh.to_str().unwrap()
+            spelled(s) == ms.to_str().unwrap() && spelled(h) == mh.to_str().unwrap()
         }
-        (Anchor::Device { name }, Anchor::Device { name: marked }) => marked_name(name) == marked.to_str().unwrap(),
+        (Anchor::Device { name }, Anchor::Device { name: marked }) => spelled(name) == marked.to_str().unwrap(),
         (a, b) => std::mem::discriminant(&a) == std::mem::discriminant(&b),
     };
     let names = path.components().collect::<Vec<_>>();
@@ -476,7 +475,7 @@ fn is_marked_spelling(path: &PathBuf, marked: &PathBuf) -> bool {
         && path.is_drive_relative() == marked.is_drive_relative()
         && names.len() == marked_names.len()
         && names.iter().zip(&marked_names).all(|pair| match pair {
-            (Component::Normal(n), Component::Normal(m)) => marked_name(n) == m.to_str().unwrap(),
+            (Component::Normal(n), Component::Normal(m)) => spelled(n) == m.to_str().unwrap(),
             (a, b) => std::mem::discriminant(a) == std::mem::discriminant(b),
         })
 }
@@ -503,17 +502,33 @@ fn holds_a_name_win32_strips(s: &str) -> bool {
     kept.iter().any(|name| name.ends_with(['.', ' ']))
 }
 
+/// `s` and the strings that add to it the `.` Win32 drops, where a name would read as a device or an
+/// NT path: `.\` before the first name or after a leading drive designator or root, and `\.` at the
+/// end. If one of them names the same file as `s` written plain, `s` has a faithful string.
+fn with_escapes(s: &str) -> Vec<String> {
+    let mut heads = vec![s.to_owned(), format!(r".\{s}")];
+    if s.starts_with(['\\', '/']) {
+        heads.push(format!(r"{}.{}", &s[..1], s));
+    }
+    if let [_, b':', ..] = s.as_bytes() {
+        heads.push(format!(r"{}.\{}", &s[..2], &s[2..]));
+    }
+    heads.into_iter().flat_map(|h| [format!(r"{h}\."), h]).collect()
+}
+
 /// For every plain sample, fully qualified or not, `to_wide` gives a string whose NT path is the one
-/// Win32 reaches by the names as written. The oracle is `GetFullPathNameW` of the sample with a `Z`
-/// after each name (nothing left to trim), the NT path of that, and the `Z`s removed again; the
-/// current directory is the test process's. Whatever the reason, a refusal must hold a name that
-/// ends in a dot or space ([`holds_a_name_win32_strips`]), the only thing no escape can spell, and
-/// its reason is that dot or space, never the reserved name or NT prefix. Where `to_verbatim`
-/// accepts a sample, its NT path is the oracle's too. A few longer dotted-UNC paths are added, where
-/// later names pop back to the dots. Every prefix must compare at
-/// least `MIN_PER_PREFIX` samples, so one whose samples are all skipped fails here. Two kinds of sample are skipped, and counted: the dotted UNC
-/// paths of [`dots_end_the_reading`], and the verbatim spellings of [`ParseSkips`]. A sample the
-/// sentinel changes, or that Win32 refuses and is not empty, fails the test.
+/// Win32 reaches by the names as written. The oracle is `GetFullPathNameW` of the sample with each
+/// name [marked](marked_name) (nothing left to trim, no device), the NT path of that, and the `Z`s
+/// removed again; the current directory is the test process's. Whatever the reason, a refusal must
+/// hold a name that ends in a dot or space ([`holds_a_name_win32_strips`]), its reason is that dot or
+/// space, never the reserved name or NT prefix, and neither the sample nor any of its
+/// [escapes](with_escapes) reaches the oracle's NT path: a refusal is real only where no string
+/// spells the names. Where `to_verbatim` accepts a sample, its NT path is the oracle's too. A few
+/// longer dotted-UNC paths are added, where later names pop back to the dots. Every prefix must
+/// compare at least `MIN_PER_PREFIX` samples, so one whose samples are all skipped fails here. Two
+/// kinds of sample are skipped, and counted: the dotted UNC paths of [`dots_end_the_reading`], and
+/// the verbatim spellings of [`ParseSkips`]. A sample the sentinel changes, or that Win32 refuses
+/// and is not empty, fails the test.
 ///
 /// Mutants: a non-fully-qualified UNC path takes the verbatim string of its stored text, so
 /// `\\\.\.` is refused; `to_wide` returns the stored text for every path `to_win32_string` refuses;
@@ -522,7 +537,9 @@ fn holds_a_name_win32_strips(s: &str) -> bool {
 /// `to_wide` refuses `\??\a`, which has the string `\.\??\a`; `is_reserved` leaves out `com1`,
 /// `lpt¹` or `conin$`, so that name reaches Win32 bare; `to_verbatim` keeps `/` as written, so
 /// `a:/` names another NT path; `dots_end_the_reading` ignores a pop back, so `\\s\.\b \..` is
-/// compared and `to_wide` keeps the share `.` against Win32's `\\s\`.
+/// compared and `to_wide` keeps the share `.` against Win32's `\\s\`; `win32_string(true)` refuses a
+/// kept name ending `..` when the last name is reserved, so `a..\nul` is refused though `a..\nul\.`
+/// names it.
 #[skuld::test]
 fn to_wide_names_the_nt_path_win32_reaches_by_the_names_as_written() {
     const MIN_PER_PREFIX: usize = 1_000;
@@ -574,8 +591,16 @@ fn to_wide_names_the_nt_path_win32_reaches_by_the_names_as_written() {
         (0, 0, 0, 0, 0, 0);
     let mut skips = ParseSkips::default();
     let mut per_prefix = vec![0usize; prefixes.len()];
-    // Longer rests than `rests` holds, where later names pop back to a dotted UNC server or share.
-    let pop_backs = [r"\\s\.\b \..", r"\\\./com /..", r"\\\..\...con\.."];
+    // Longer rests than `rests` holds. The first three pop back to a dotted UNC server or share; the
+    // others keep a name ending `..` before a reserved last name, which a plain escape spells.
+    let pop_backs = [
+        r"\\s\.\b \..",
+        r"\\\./com /..",
+        r"\\\..\...con\..",
+        r"a..\nul",
+        r"...\com1",
+        r"C:a..\con.txt",
+    ];
     let cases = prefixes
         .iter()
         .enumerate()
@@ -639,11 +664,13 @@ fn to_wide_names_the_nt_path_win32_reaches_by_the_names_as_written() {
                     "{s:?} was refused: {e}"
                 );
                 assert!(!path.is_fully_qualified(), "{s:?} is fully qualified, refused as {e}");
-                assert_ne!(
-                    nt_path_folded(&s),
-                    Some(expected),
-                    "{s:?} was refused ({e}), but Win32 reads it as written"
-                );
+                for candidate in with_escapes(&s) {
+                    assert_ne!(
+                        nt_path_folded(&candidate),
+                        Some(expected.clone()),
+                        "{s:?} was refused ({e}), but Win32 reads {candidate:?} as the names written"
+                    );
+                }
                 refused += 1;
                 nt_refused += usize::from(s.starts_with(r"\??\"));
             }
