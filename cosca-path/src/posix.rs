@@ -13,8 +13,9 @@ use std::ops::Deref;
 
 use ref_cast::{ref_cast_custom, RefCastCustom};
 
-use crate::fs::sealed::Lookup;
 use crate::{Component, PurePath};
+
+mod lookup;
 
 // Strings =============================================================================================================
 
@@ -584,52 +585,6 @@ impl fmt::Display for ConversionError {
 }
 
 impl std::error::Error for ConversionError {}
-
-impl Lookup for Path {
-    fn lookup_spelling(&self) -> PathBuf {
-        let mut bytes = Vec::new();
-        if self.has_root() {
-            bytes.push(b'/');
-        }
-        let mut named = false;
-        let mut trailing = false;
-        let mut dotted = false;
-        for c in self.components() {
-            let name: &[u8] = match c {
-                // `.` names nothing, but after a name it demands a directory (`tool/.`).
-                Component::Empty | Component::CurDir => {
-                    dotted |= c == Component::CurDir;
-                    trailing = named;
-                    continue;
-                }
-                Component::ParentDir => b"..",
-                Component::Normal(name) => name.as_bytes(),
-            };
-            if named {
-                bytes.push(b'/');
-            }
-            bytes.extend_from_slice(name);
-            named = true;
-            trailing = false;
-        }
-        if trailing {
-            bytes.push(b'/');
-        }
-        // Only `.` was written: the current directory, which is not the empty path.
-        if !named && dotted && !self.has_root() {
-            bytes.push(b'.');
-        }
-        PathBuf::from(bytes)
-    }
-
-    fn canonical_spelling(&self) -> PathBuf {
-        self.to_path_buf()
-    }
-
-    fn refusal(&self) -> Option<&'static str> {
-        self.as_bytes().contains(&0).then_some("the path holds a NUL")
-    }
-}
 
 /// A [`Filesystem`](crate::fs::Filesystem) of posix paths that a test describes. See
 /// [`FakeFilesystem`](crate::fs::FakeFilesystem).
