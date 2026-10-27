@@ -67,7 +67,13 @@ fn fixture_nested_terminate_root() {
 
     nested.kill().expect("kill the nested member");
     drop(sock);
-    nested.wait().expect("reap the nested member");
+    // Released after the kill: the member leaves with 0 when released, so code 1 is the kill's.
+    let status = nested.wait().expect("reap the nested member");
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "kill must end the nested member, got {status:?}"
+    );
     report.write_all(DONE.as_bytes()).expect("write the report");
     report.flush().expect("flush the report");
 }
