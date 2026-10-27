@@ -13,6 +13,7 @@ use std::ops::Deref;
 
 use ref_cast::{ref_cast_custom, RefCastCustom};
 
+use crate::fs::sealed::Lookup;
 use crate::{Component, PurePath};
 
 // Strings =============================================================================================================
@@ -583,6 +584,42 @@ impl fmt::Display for ConversionError {
 }
 
 impl std::error::Error for ConversionError {}
+
+impl Lookup for Path {
+    fn lookup_spelling(&self) -> PathBuf {
+        let mut bytes = Vec::new();
+        if self.has_root() {
+            bytes.push(b'/');
+        }
+        let mut named = false;
+        let mut trailing = false;
+        for c in self.components() {
+            let name: &[u8] = match c {
+                Component::Empty => {
+                    trailing = named;
+                    continue;
+                }
+                Component::CurDir => b".",
+                Component::ParentDir => b"..",
+                Component::Normal(name) => name.as_bytes(),
+            };
+            if named {
+                bytes.push(b'/');
+            }
+            bytes.extend_from_slice(name);
+            named = true;
+            trailing = false;
+        }
+        if trailing {
+            bytes.push(b'/');
+        }
+        PathBuf::from(bytes)
+    }
+}
+
+/// A [`Filesystem`](crate::fs::Filesystem) of posix paths that a test describes. See
+/// [`FakeFilesystem`](crate::fs::FakeFilesystem).
+pub type FakeFilesystem = crate::fs::FakeFilesystem<Path>;
 
 #[cfg(test)]
 #[path = "posix_tests.rs"]

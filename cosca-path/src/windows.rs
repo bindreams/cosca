@@ -31,6 +31,7 @@ use std::ops::Deref;
 
 use ref_cast::{ref_cast_custom, RefCastCustom};
 
+use crate::fs::sealed::Lookup;
 use crate::{Component, PurePath};
 
 mod convert;
@@ -872,6 +873,38 @@ impl fmt::Debug for PathBuf {
         fmt::Debug::fmt(self.as_path(), f)
     }
 }
+
+impl Lookup for Path {
+    fn lookup_spelling(&self) -> PathBuf {
+        let normal = self.lexically_normal();
+        let mut bytes = normal.bytes().to_vec();
+        // `x\.` and `x\..` name an entry, not a directory spelled with a separator.
+        let ends_in_dot = matches!(
+            self.components().next_back(),
+            Some(Component::CurDir | Component::ParentDir)
+        );
+        if ends_in_dot && normal.components().next_back() == Some(Component::Empty) {
+            bytes.pop();
+        }
+        for b in &mut bytes {
+            if *b == b'/' {
+                *b = b'\\';
+            }
+        }
+        let spelled = PathBuf::from_wtf8(bytes.clone());
+        // A share root is one entry with or without its separator; spell it with.
+        let share_root = spelled.as_unc().is_some() && spelled.is_fully_qualified();
+        if share_root && spelled.components().next().is_none() && bytes.last() != Some(&b'\\') {
+            bytes.push(b'\\');
+            return PathBuf::from_wtf8(bytes);
+        }
+        spelled
+    }
+}
+
+/// A [`Filesystem`](crate::fs::Filesystem) of windows paths that a test describes. See
+/// [`FakeFilesystem`](crate::fs::FakeFilesystem).
+pub type FakeFilesystem = crate::fs::FakeFilesystem<Path>;
 
 #[cfg(test)]
 #[path = "windows_tests.rs"]

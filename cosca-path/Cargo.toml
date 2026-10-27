@@ -13,10 +13,18 @@ exclude = ["/clippy.toml"]
 [dependencies]
 # Zero-copy `&OsStr` -> `&Path` casts without hand-written `unsafe`.
 ref-cast = "1"
+# File identity (`Filesystem::same_file`) on every host.
+same-file = "1"
+
+[target.'cfg(unix)'.dependencies]
+# `ENOENT` and `ENOTDIR`: which `metadata` errors mean "nothing there".
+libc = "0.2.189"
 
 [dev-dependencies]
 # The test harness for the `harness = false` lib.
 skuld.workspace = true
+# The directories the `HostFilesystem` tests create and remove.
+tempfile = "3"
 
 [target.'cfg(windows)'.dev-dependencies]
 # The conversion tests compare against Win32's own pure string functions.

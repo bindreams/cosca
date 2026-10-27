@@ -13,6 +13,7 @@ use std::borrow::{Borrow, Cow};
 use std::fmt::{self, Debug};
 use std::hash::Hash;
 
+pub mod fs;
 pub mod posix;
 pub mod windows;
 
