@@ -637,11 +637,16 @@ fn to_wide_names_the_nt_path_win32_reaches_by_the_names_as_written() {
                     "{s:?} was refused: {e}"
                 );
                 assert!(!path.is_fully_qualified(), "{s:?} is fully qualified, refused as {e}");
-                assert_ne!(
-                    nt_path_folded(&s),
-                    Some(expected),
-                    "{s:?} was refused ({e}), but Win32 reads it as written"
-                );
+                // Under Windows 10's rules a reserved stem stays the device whatever follows its
+                // dot, so the input and its marked names both read as the device (`nul.` and
+                // `nulZ.Z` are `\??\nul` on build 20348): no string names the file there either.
+                if !is_dos_device(&s) {
+                    assert_ne!(
+                        nt_path_folded(&s),
+                        Some(expected),
+                        "{s:?} was refused ({e}), but Win32 reads it as written"
+                    );
+                }
                 refused += 1;
                 nt_refused += usize::from(s.starts_with(r"\??\"));
             }
