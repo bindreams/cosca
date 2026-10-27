@@ -259,27 +259,75 @@ fn non_root() -> Result<(), String> {
     }
 }
 
-/// `same_file` examines identity without opening for data: a file the caller may execute but not
-/// read is `Ok`, as it is for `is_file`.
-///
-/// Mutant: `same_file` opens the paths for reading (`EACCES`).
+/// An executable the caller may not read, and another file.
 #[cfg(unix)]
-#[skuld::test]
-fn host_filesystem_same_file_needs_no_read_access(#[fixture(non_root)] _non_root: &()) {
+fn unreadable_tool(dir: &std::path::Path) -> (PathBuf, PathBuf) {
     use std::os::unix::fs::PermissionsExt;
 
-    let dir = tempfile::tempdir().unwrap();
-    let tool = dir.path().join("tool");
-    let other = dir.path().join("other");
+    let (tool, other) = (dir.join("tool"), dir.join("other"));
     std::fs::write(&tool, b"").unwrap();
     std::fs::write(&other, b"").unwrap();
     std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o111)).unwrap();
-    let (tool, other) = (host(&tool), host(&other));
+    (host(&tool), host(&other))
+}
+
+/// On Linux `same_file` examines identity without access to the data (`O_PATH`): a file the caller
+/// may execute but not read is `Ok`, as it is for `is_file`.
+///
+/// Mutant: `same_file` opens the paths for reading (`EACCES`).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[skuld::test]
+fn host_filesystem_same_file_needs_no_read_access(#[fixture(non_root)] _non_root: &()) {
+    let dir = tempfile::tempdir().unwrap();
+    let (tool, other) = unreadable_tool(dir.path());
     let fs = HostFilesystem;
 
     assert!(fs.is_file(&tool).unwrap());
     assert!(fs.same_file(&tool, &tool).unwrap());
     assert!(!fs.same_file(&tool, &other).unwrap());
+}
+
+/// Where there is no `O_PATH`, `same_file` holds both files open to read them, so a file the caller
+/// may not read is `PermissionDenied`, not a comparison of two path lookups that a deleted file's
+/// reused inode could fool (see `identity::open`).
+///
+/// Mutant: `same_file` that falls back to comparing `metadata` by path.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+#[skuld::test]
+fn host_filesystem_same_file_needs_read_access_without_o_path(#[fixture(non_root)] _non_root: &()) {
+    let dir = tempfile::tempdir().unwrap();
+    let (tool, other) = unreadable_tool(dir.path());
+    let fs = HostFilesystem;
+
+    assert!(fs.is_file(&tool).unwrap());
+    assert_eq!(
+        fs.same_file(&tool, &other).unwrap_err().kind(),
+        io::ErrorKind::PermissionDenied
+    );
+}
+
+/// `same_file` holds both files while it compares them: once each is open, no change to the paths
+/// changes the answer, so an inode number freed by a delete cannot be reused by the other path in
+/// between. Here two names of one file are both removed after the files are open, and the answer is
+/// still `true`.
+///
+/// Mutant: `same_file` that reads each file's identity by path, one after the other, without a
+/// handle on the first.
+#[cfg(unix)]
+#[skuld::test]
+fn host_filesystem_same_file_holds_both_files_while_comparing() {
+    use super::identity::same_file_with;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+    std::fs::write(&a, b"").unwrap();
+    std::fs::hard_link(&a, &b).unwrap();
+
+    let same = same_file_with(&a, &b, || {
+        std::fs::remove_file(&a).unwrap();
+        std::fs::remove_file(&b).unwrap();
+    });
+    assert!(same.expect("the open files answer, whatever happened to their names"));
 }
 
 /// `same_file` does not wait for a writer on a FIFO.

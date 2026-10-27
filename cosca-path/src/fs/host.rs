@@ -28,7 +28,9 @@ use crate::windows::{Path, PathBuf};
 /// and [`same_file`](Filesystem::same_file) open it, so on Windows they can fail where those two
 /// succeed: an app-execution alias (`%LOCALAPPDATA%\Microsoft\WindowsApps\*.exe`, os error 1920),
 /// `pagefile.sys` and its like (32), a protected directory such as `System Volume Information`
-/// (`PermissionDenied`). The error is returned as it is.
+/// (`PermissionDenied`). On Unix other than Linux and Android, `same_file` also fails
+/// (`PermissionDenied`) for a file the caller may not read, which `is_file` answers for. The error
+/// is returned as it is.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HostFilesystem;
 
@@ -116,19 +118,51 @@ impl Filesystem for HostFilesystem {
     }
 }
 
-/// File identity without opening for data: no read access is needed and a FIFO has nothing to
-/// wait for. On Windows it still needs a handle on the object (see [`HostFilesystem`]).
+/// File identity from open handles, so that no path can change what is compared. A FIFO is not
+/// waited on, and on Windows and Linux no data access is needed.
 mod identity {
     use std::io;
     use std::path::Path;
 
-    /// `(dev, ino)` from `metadata`, which follows links.
+    /// `(dev, ino)` of two files that are both open while they are compared, so that neither can be
+    /// deleted and its number reused by the other path between the two reads. Links are followed.
+    ///
+    /// On Linux and Android each is opened with `O_PATH` ([`open`]), which needs no permission on
+    /// the file and does not open a FIFO. Elsewhere there is no such open, so a file the caller may
+    /// not read is the error `open` gives (`PermissionDenied`).
     #[cfg(unix)]
     pub(super) fn same_file(a: impl AsRef<Path>, b: impl AsRef<Path>) -> io::Result<bool> {
+        same_file_with(a, b, || {})
+    }
+
+    /// [`same_file`] with `between` run once both files are open and before either is compared, so a
+    /// test can change the paths there.
+    #[cfg(unix)]
+    pub(super) fn same_file_with(a: impl AsRef<Path>, b: impl AsRef<Path>, between: impl FnOnce()) -> io::Result<bool> {
         use std::os::unix::fs::MetadataExt;
 
-        let (a, b) = (std::fs::metadata(a)?, std::fs::metadata(b)?);
+        let (a, b) = (open(a.as_ref())?, open(b.as_ref())?);
+        between();
+        let (a, b) = (a.metadata()?, b.metadata()?);
         Ok((a.dev(), a.ino()) == (b.dev(), b.ino()))
+    }
+
+    /// `p` opened for nothing but its identity.
+    ///
+    /// Linux, `open(2)`: `O_PATH` ignores the access mode, needs no permission on the file itself
+    /// and does not open a FIFO, and `fstat` works on the result. Everywhere else `p` is opened to
+    /// read, with `O_NONBLOCK` so that a FIFO does not wait for a writer. No flag gives less on
+    /// macOS: `O_EVTONLY` and `O_SYMLINK` still authorize `KAUTH_VNODE_READ_DATA` (XNU
+    /// `vn_authorize_open_existing`), and `O_EXEC` opens only a regular file the caller may execute.
+    #[cfg(unix)]
+    fn open(p: &Path) -> io::Result<std::fs::File> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let flags = libc::O_PATH;
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let flags = libc::O_NONBLOCK | libc::O_NOCTTY;
+        std::fs::OpenOptions::new().read(true).custom_flags(flags).open(p)
     }
 
     /// The volume serial number and 128-bit file id of two handles opened with no data access.
