@@ -300,8 +300,16 @@ pub(crate) fn exit_status(handle: HANDLE) -> io::Result<ExitStatus> {
 /// NUL-terminated `cmdline` (`CreateProcessW` may edit it in place). Sets `si.StartupInfo.cb` here
 /// so every caller gets the extended-struct size right. Returns the owned process handle + pid.
 ///
-/// `bInheritHandles` is TRUE exactly when `si.lpAttributeList` (the HANDLE_LIST) is set, so
-/// inheritance is never blanket. `STARTF_USESTDHANDLES` requires a list.
+/// `bInheritHandles` is TRUE exactly when `si.lpAttributeList` (the HANDLE_LIST) is set, so the
+/// child inherits only the listed handles, never every inheritable handle of this process.
+/// Microsoft's guidance ([`UpdateProcThreadAttribute`]) is to pass the list with `bInheritHandles`
+/// TRUE; `STARTF_USESTDHANDLES` requires `bInheritHandles` ([`STARTUPINFOW`]), so cosca passes a
+/// list whenever it sets the flag. The list scopes the child, not the window: another spawner in
+/// this process that passes `bInheritHandles` TRUE with no list can still take a listed handle
+/// while it is inheritable. See the module doc of `child::spawn::windows_raw`.
+///
+/// [`UpdateProcThreadAttribute`]: https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute
+/// [`STARTUPINFOW`]: https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/ns-processthreadsapi-startupinfow
 pub(crate) fn create_process(
     app: Option<&[u16]>,
     cmdline: &mut [u16],
