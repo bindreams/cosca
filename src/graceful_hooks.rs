@@ -15,8 +15,7 @@ pub(crate) enum HookPoint {
     /// `graceful_shutdown`: after the grace ran out, before the escalation.
     BeforeEscalation,
     /// The sync `Child`'s kill-on-drop teardown: after the root kill returned `Ok`, before the
-    /// blocking wait for the root. A test releases a holder only a kill ends here, so a kill that
-    /// sent nothing fails an assertion on how the root ended instead of hanging the drop.
+    /// blocking wait for the root.
     AfterDropKill,
     /// A tree call (`kill_tree`, `terminate_tree`, `graceful_shutdown_tree`), a drop, a failed
     /// spawn's cleanup: after its one look at the root, before anything is sent.
@@ -57,6 +56,35 @@ pub(crate) fn at(point: HookPoint, hook: impl FnOnce() + 'static) -> Armed {
 /// pending, so it always beats the release.
 pub(crate) fn release_at(point: HookPoint, held: impl Sized + 'static) -> Armed {
     arm(slot(point), move || drop(held))
+}
+
+/// [`at`] for a hook the test needs to have run: a hook the shutdown never reached is dropped
+/// without a trace, so call [`Checked::assert_fired`] after the shutdown.
+#[cfg(windows)]
+pub(crate) fn at_checked(point: HookPoint, hook: impl FnOnce() + 'static) -> Checked {
+    let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+    let seen = std::rc::Rc::clone(&fired);
+    let armed = at(point, move || {
+        hook();
+        seen.set(true);
+    });
+    Checked { _armed: armed, fired }
+}
+
+/// The guard [`at_checked`] gives back; it clears an unfired hook on drop.
+#[cfg(windows)]
+#[must_use = "dropping this immediately clears the armed hook; bind it and call `assert_fired`"]
+pub(crate) struct Checked {
+    _armed: Armed,
+    fired: std::rc::Rc<std::cell::Cell<bool>>,
+}
+
+#[cfg(windows)]
+impl Checked {
+    /// Fail the test unless the shutdown reached the hook's point and the hook ran to its end.
+    pub(crate) fn assert_fired(&self) {
+        assert!(self.fired.get(), "the shutdown never reached the hook's point");
+    }
 }
 
 pub(crate) fn run_hook(point: HookPoint) {

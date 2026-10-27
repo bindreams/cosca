@@ -360,8 +360,7 @@ fn an_unbounded_wait_against_a_sustained_writer_blocks_without_spending_cpu() {
     // `spawn_marker_holder` gives the child a REAL stdin pipe this test holds open: under
     // nextest, an unredirected stdin is `/dev/null`, so `exec cat >/dev/null` would see
     // immediate EOF and exit at once instead of parking. `stdin` stays bound until the hook
-    // kills the writer, then is released so a `kill` that sends nothing fails an assertion in the
-    // hook instead of hanging its `wait`.
+    // kills the writer, then is released after the kill: a kill that sent nothing exits 0.
     let cap = measure_pipe_capacity();
     let (child, marker, stdin) = spawn_marker_holder(&format!("yes | head -c {cap} >&3; exec cat >/dev/null"));
     let raw_fd = marker.as_raw_fd();

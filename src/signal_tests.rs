@@ -46,8 +46,7 @@ mod linux {
             Sent::Delivered
         );
         assert_eq!(log.entries(), [(child.id(), Sig::Kill, Via::Pidfd)]);
-        // Released after the send, so a send that delivered nothing ends the child with 0 and fails
-        // the signal assertion instead of hanging the wait.
+        // Released after the kill: a kill that sent nothing exits 0.
         drop(stdin);
         let status = child.wait().expect("reap");
         assert_eq!(

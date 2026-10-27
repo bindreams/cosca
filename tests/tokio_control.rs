@@ -23,7 +23,7 @@ fn expect_eof(who: &str, s: &mut std::net::TcpStream) {
 #[skuld::test]
 async fn async_kill_terminates_the_child() {
     let (mut child, sock) = common::spawn_blocker_async().await;
-    // Releases the member after the kill, so a `kill` that sent nothing fails on how it ended.
+    // Released after the kill: a kill that sent nothing exits 0.
     common::kill_release_reap_async(&mut child, sock).await;
 }
 
@@ -73,7 +73,7 @@ async fn async_kill_tree_tears_down_tree() {
         common::Member::new(grand, common::last_reported_grandchild().expect("the grandchild's pid")),
     );
     child.kill_tree().expect("kill_tree");
-    // A kill that did not come fails here by assertion instead of hanging a read for an EOF.
+    // A kill that did not come fails here by assertion.
     common::assert_members_killed(vec![(root, "the root"), (grand, "the grandchild")]);
     let status = child.wait().await.expect("reap root");
     assert!(
@@ -139,8 +139,7 @@ async fn async_terminate_sends_sigterm() {
     use std::os::unix::process::ExitStatusExt;
     let (mut child, sock) = common::spawn_blocker_async().await;
     child.terminate().expect("terminate sends SIGTERM");
-    // Release the member after the signal: it leaves with 0 on the release, so a `terminate` that
-    // sent nothing fails the signal assertion below.
+    // Released after the signal: a terminate that sent nothing exits 0.
     drop(sock);
     let status = child.wait().await.expect("reap");
     assert_eq!(
@@ -195,11 +194,8 @@ async fn async_graceful_cancel_mid_grace_leaves_child_owned() {
         }
         // The ack byte proves the single poll actually DELIVERED the SIGTERM (a real event,
         // not an assumption about await points) while the future is still parked. The probe is
-        // written after the poll, so the child handles a SIGTERM that poll sent, and acks it,
-        // before it echoes the probe: with no SIGTERM the first byte back is the echo, and the
-        // assertion fails instead of the read waiting for an ack that never comes. The echo is
-        // read after the ack, so that order is asserted, not assumed; it is read one byte at a
-        // time, so a missing ack fails on the first byte instead of waiting for a second.
+        // written after the poll, so a SIGTERM that poll sent is acked before the echo. Read one
+        // byte at a time: a missing ack makes the first byte the echo and fails the assertion.
         std::io::Write::write_all(&mut sock, b"p").expect("write the probe");
         let mut ack = [0u8; 1];
         sock.read_exact(&mut ack).expect("SIGTERM ack");
@@ -451,8 +447,8 @@ async fn async_graceful_mechanism_matches_the_sync_surface() {
     // `executable()` spawn lands on the async RAW backend, and that one pins the child's pid for
     // its whole life, so no released pin could be observed through it at all.
     //
-    // Each child blocks on a piped stdin this test holds and releases right after the `kill()`, so
-    // a `kill()` that did nothing lets it exit 0 and fails `assert_killed` instead of hanging `wait()`.
+    // Each child blocks on a piped stdin this test holds and releases right after the `kill()`: a
+    // `kill()` that did nothing exits 0 and fails `assert_killed`.
     let argv = [common::stdin_blocker_program()];
     let (mut async_reaped, async_stdin) = {
         let mut cmd = cosca::tokio::Command::new();

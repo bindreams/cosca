@@ -188,7 +188,6 @@ pub(crate) fn via_pidfd(pidfd: Option<std::os::fd::BorrowedFd<'_>>, pid: u32, si
         Some(errno) => Err(rustix::io::Errno::from_raw_os_error(errno)),
         None => rustix::process::pidfd_send_signal(pidfd, sig.as_rustix()),
     };
-    // After the syscall, whatever it answered: a send that was skipped leaves no record.
     #[cfg(test)]
     crate::send_log::record(pid, sig, crate::send_log::Via::Pidfd);
     match sent {
@@ -268,7 +267,6 @@ pub(crate) fn via_verified_pid(pid: u32, identity: Option<u64>, sig: Sig) -> io:
         None if unsafe { libc::kill(target, sig.as_libc()) } == 0 => Ok(()),
         None => Err(io::Error::last_os_error()),
     };
-    // After the syscall, whatever it answered: a send that was skipped leaves no record.
     #[cfg(test)]
     crate::send_log::record(pid, sig, crate::send_log::Via::Pid);
     match sent {

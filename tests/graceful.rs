@@ -12,8 +12,7 @@ fn child_terminate_sends_sigterm() {
     use std::os::unix::process::ExitStatusExt;
     let (child, sock) = common::spawn_blocker();
     child.terminate().expect("terminate sends SIGTERM");
-    // Release the member after the signal. It leaves with 0 on the release, so a `terminate` that
-    // sent nothing fails the signal assertion instead of leaving the reap waiting for a death.
+    // Released after the signal: a terminate that sent nothing exits 0.
     drop(sock);
     // Reap and assert it died by SIGTERM (soft), NOT SIGKILL.
     let status = child.wait().expect("reap");
@@ -166,7 +165,7 @@ fn process_kill_tree_tears_down_tree() {
     );
     let p = cosca::Process::from_pid(child.id().pid()).found().expect("resolves");
     p.kill_tree().expect("kill_tree");
-    // A kill that sent nothing fails here by assertion instead of hanging a read for an EOF.
+    // A kill that sent nothing fails here by assertion.
     common::assert_members_killed(vec![(root, "the root"), (grand, "the grandchild")]);
     let _ = child.wait(); // reap the owned root (grandchild is reaped by init)
 }

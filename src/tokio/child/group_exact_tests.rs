@@ -14,10 +14,8 @@ const RELEASABLE_ROOT_WITH_A_MEMBER: [&str; 3] = [
     "exec 3<&0; (cat <&3 3<&- >/dev/null; echo survived >&2) & echo started; exec cat <&4 4<&- 3<&- >/dev/null 2>/dev/null",
 ];
 
-/// The sync `root_with_a_member`'s twin, and the writer whose drop ends its root with status `0`:
-/// for a test that kills the root as setup, dropped right after the kill, so a kill that sent
-/// nothing leaves the root to exit `0` and fails the check on its status, instead of hanging the
-/// wait for it.
+/// The sync `root_with_a_member`'s twin, and the writer whose drop ends its root with status `0`;
+/// drop it right after the kill.
 pub(crate) fn releasable_root_with_a_member() -> (crate::tokio::Child, Member, std::io::PipeWriter) {
     let (stdio, started, member) = Member::pipes();
     let (gate, release) = crate::test_child::held_writer_stdin();
@@ -46,9 +44,8 @@ pub(crate) fn releasable_group_root() -> (crate::tokio::Child, std::io::PipeWrit
     (cmd.spawn().expect("spawn"), release)
 }
 
-/// Kills `child`'s root alone and reaps it behind the handle's back. `release` ends a root nothing
-/// killed with status `0`: the kill's `SIGKILL` is already pending when it drops, so a root that
-/// died otherwise fails the check instead of the reap waiting for it.
+/// Kills `child`'s root alone and reaps it behind the handle's back. `release` is dropped after the
+/// kill: a root nothing killed exits `0`.
 pub(crate) fn kill_and_reap_behind(child: &mut crate::tokio::Child, release: std::io::PipeWriter) {
     child.kill().expect("kill the root alone");
     drop(release);

@@ -71,11 +71,9 @@ mod on_windows {
         (cmd, writer)
     }
 
-    /// For a frozen child that the code under test tears down (a drop, a failed resume): once the
-    /// teardown's kill returned, release the stdin `writer` and let the child's initial thread run.
-    /// A frozen child runs nothing, so the release alone cannot end it; with the thread resumed, a
-    /// kill that sent nothing lets the blocker exit 0, which `assert_reaps_killed` rejects by
-    /// assertion instead of the teardown's reap hanging on a child that never runs.
+    /// For a frozen child that the code under test tears down (a drop, a failed resume): release the
+    /// stdin `writer` and resume the frozen thread after the teardown's kill. An unsent kill lets
+    /// the blocker exit 0, which `assert_reaps_killed` rejects.
     fn release_at_teardown_kill(
         frozen: &crate::child::SuspendedChild,
         writer: std::io::PipeWriter,
@@ -84,8 +82,7 @@ mod on_windows {
         crate::child::spawn::fault::release_at_drop_kill((writer, ResumeOnDrop(thread)))
     }
 
-    /// Kill `child`, then release its stdin: it exits 0 on EOF, so a kill that sent nothing fails
-    /// the assertion on how it ended instead of the reap blocking for ever.
+    /// Kill `child`, then release its stdin: it exits 0 on EOF, so an unsent kill shows.
     fn end(mut child: crate::Child) {
         let stdin = child.stdin().expect("the blocker's piped stdin");
         child.kill().expect("kill the resumed child");
@@ -318,10 +315,9 @@ mod on_windows {
 
     /// A dropped frozen child is killed by the `Child` teardown whatever `kill_on_drop` says, for every
     /// containment: the uncontained and `TreeWalk` shapes have no job to end it, so the teardown's
-    /// own kill is all that does. The stdin write end is released and the child let run once the
-    /// teardown's kill returned, so a drop that does not kill fails the exit-code assertion
-    /// (`more.com` exits 0 on EOF, the kill's code is 1). The teardown count shows the drop ran the
-    /// `Child` teardown, not the job's asynchronous close.
+    /// own kill is all that does. It is released and resumed after the teardown's kill (see
+    /// `release_at_teardown_kill`), so a drop that does not kill fails the exit-code assertion. The
+    /// teardown count shows the drop ran the `Child` teardown, not the job's asynchronous close.
     #[skuld::test]
     fn death_watch_dropping_a_frozen_child_kills_it_whatever_kill_on_drop_says() {
         for (shape, contain) in [
@@ -336,8 +332,7 @@ mod on_windows {
                 }
                 cmd.kill_on_drop(kill_on_drop);
                 let frozen = cmd.spawn_suspended().expect("spawn suspended");
-                // Released, and the child let run, once the drop's kill returned: `more.com` then
-                // exits 0, not 1.
+                // Released and resumed after the drop's kill.
                 let teardown = release_at_teardown_kill(&frozen, writer);
                 let remote = Remote::open(frozen.id().pid());
                 let teardowns = crate::test_frozen::record_root_teardowns();
@@ -359,8 +354,7 @@ mod on_windows {
             let (mut cmd, writer) = held_blocker(raw);
             cmd.stdout(crate::Stdio::pipe()).expect("stdout pipe");
             let frozen = cmd.spawn_suspended().expect("spawn suspended");
-            // Released, and the child let run, once the drop's kill returned: `more.com` then exits
-            // 0, not 1.
+            // Released and resumed after the drop's kill.
             let teardown = release_at_teardown_kill(&frozen, writer);
             let remote = Remote::open(frozen.id().pid());
 

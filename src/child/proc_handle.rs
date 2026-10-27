@@ -316,8 +316,7 @@ impl ProcHandle {
     }
 }
 
-/// The blocking reap that follows the drop's delivered kill. A test releases a holder only that kill
-/// ends in between ([`HookPoint::AfterDropKill`](crate::graceful_hooks::HookPoint)).
+/// The blocking reap that follows the drop's delivered kill.
 fn wait_after_drop_kill(s: &crate::child::shared::SharedChild) -> io::Result<std::process::ExitStatus> {
     #[cfg(test)]
     crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterDropKill);

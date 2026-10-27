@@ -45,7 +45,7 @@ fn long_lived_contained_child() -> (crate::Child, std::io::PipeWriter) {
 }
 
 /// Kill, release stdin, reap. Releasing after the kill makes a no-op `kill_tree` fail the status
-/// assertion instead of hanging the wait.
+/// assertion.
 fn kill_then_release(child: crate::Child, stdin: std::io::PipeWriter) {
     child.kill_tree().expect("kill_tree");
     drop(stdin);
@@ -258,8 +258,7 @@ fn raw_child_consecutive_frozen_waits_never_return_early() {
 }
 
 /// Dropping a `Child` kills it and reaps it, by the kill: its stdin is released only once the drop's
-/// kill returned, so a drop that sent nothing lets the child exit 0 and fails the assertion, instead
-/// of hanging in the drop.
+/// kill returned.
 #[skuld::test]
 fn drop_kills_and_reaps_the_child() {
     let mut cmd = crate::Command::new();

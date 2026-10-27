@@ -88,8 +88,7 @@ fn fixture_outer_procfs_inner() {
     // A spawn cannot identify its child, and says the view is why.
     let mut cmd = crate::command::Command::new();
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
-    // Released once the teardown's kill returned, so a kill that sent nothing fails the SIGKILL
-    // assertion below instead of hanging the reap.
+    // Released after the kill: a kill that sent nothing exits 0.
     let (stdin, teardown) = crate::child::spawn::fault::teardown_blocker_stdin();
     cmd.stdin(stdin).expect("set stdin pipe");
     let (error, fate) =

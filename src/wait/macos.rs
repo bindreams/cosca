@@ -353,7 +353,6 @@ pub(crate) fn kill(id: ProcessId) -> Result<(), Error> {
         });
     };
     let sent = nix_kill(Pid::from_raw(target), Signal::SIGKILL);
-    // After the syscall, whatever it answered: a send that was skipped leaves no record.
     #[cfg(test)]
     crate::send_log::record_by_identity(id.pid(), Signal::SIGKILL as i32);
     match sent {
@@ -398,7 +397,6 @@ pub(crate) fn terminate(id: ProcessId) -> Result<(), Error> {
         });
     };
     let sent = nix_kill(Pid::from_raw(target), Signal::SIGTERM);
-    // After the syscall, whatever it answered: a send that was skipped leaves no record.
     #[cfg(test)]
     crate::send_log::record_by_identity(id.pid(), Signal::SIGTERM as i32);
     match sent {

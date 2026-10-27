@@ -17,8 +17,7 @@ fn a_failed_identity_peek_is_unknown_and_kills_and_reaps_the_child() {
     use std::rc::Rc;
 
     crate::log_capture::install();
-    // Released once the teardown's kill returned, so a kill that sent nothing fails the SIGKILL
-    // assertion below instead of hanging the reap.
+    // Released after the kill: a kill that sent nothing exits 0.
     let (stdin, teardown) = fault::teardown_blocker_stdin();
     let mut cmd = crate::Command::new();
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());

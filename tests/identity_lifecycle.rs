@@ -192,8 +192,7 @@ fn identity_survives_the_alive_to_zombie_transition() {
     assert_eq!(id.exists(), cosca::identity::Existence::Present, "live child exists");
     assert_eq!(id.is_alive(), cosca::identity::Liveness::Alive, "live child is alive");
     child.kill().expect("kill");
-    // Release the member: it leaves with 0 on the release, so a `kill` that sent nothing fails the
-    // signal assertion instead of leaving the wait for the zombie unbounded.
+    // Released after the kill: a kill that sent nothing exits 0.
     drop(sock);
     common::assert_killed("the killed child", common::zombie_exit_status(child.id().pid()));
     assert_eq!(

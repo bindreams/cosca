@@ -48,8 +48,7 @@ mod own_reap {
     }
 
     /// A live child only a kill ends (it exits `0` once the returned stdin writer is dropped), with
-    /// its pid. The test drops the writer after the kill, so a `kill` that sent nothing fails the
-    /// signal assertion instead of hanging the wait for the zombie.
+    /// its pid. The test drops the writer after the kill: a `kill` that sent nothing exits `0`.
     fn adopt() -> (ProcHandle, u32, std::process::ChildStdin) {
         let mut child = crate::test_spawn::spawn(&mut crate::test_child::held_std_blocker(std::process::Stdio::null()))
             .expect("spawn the blocker");
@@ -331,10 +330,11 @@ fn a_reap_after_a_delivered_tree_kill_that_meets_echild_is_killed() {
     handle.kill().expect("the stand-in for the tree kill");
     // Released between the tree kill and the reap, after the kill: a kill that sent nothing ends
     // the child with 0.
-    let _release = crate::child::spawn::fault::release_between_kill_and_wait(stdin);
+    let release = crate::child::spawn::fault::release_between_kill_and_wait(stdin);
     let forced = seams::force_unlocked_wait(ForcedWait::Errno(libc::ECHILD));
     let torn = handle.reap_after_tree_kill();
     drop(forced);
+    release.assert_released();
     crate::test_child::assert_killed("the child", handle.wait().expect("reap the killed child"));
     assert_eq!(torn.fate, crate::error::ChildFate::Killed);
 }

@@ -1313,7 +1313,10 @@ impl ProcSource {
             unreachable!("only a tokio backend's wait answers `Exited`")
         };
         #[cfg(test)]
-        let pid = id.map_or_else(|| child.id().unwrap_or(0), |id| id.pid());
+        let pid = id.map_or_else(
+            || child.id().expect("a test's unreaped child has its pid"),
+            |id| id.pid(),
+        );
         let looked = child.try_wait();
         // So a test that released its fixture at the kill can assert how the root died.
         #[cfg(test)]

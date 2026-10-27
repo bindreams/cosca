@@ -2816,7 +2816,7 @@ fn kill_unadopted(child: &mut impl Unadopted) -> std::io::Result<()> {
             // A fixture only that kill would end is released here.
             fault::run_between_kill_and_wait();
             let status = child.wait()?;
-            fault::record_teardown_reap(child.pid().unwrap_or(0), status);
+            fault::record_teardown_reap(child.pid().expect("a test's child has its pid"), status);
         }
         return Err(std::io::Error::new(kind, marker));
     }
@@ -3189,9 +3189,7 @@ pub(crate) mod fault {
 
     /// Run `hook` at the next kill-then-blocking-wait teardown on this thread, once the kill has
     /// returned `Ok` and before the wait: `teardown_unadopted`, the sync `finish_elevated`, or the
-    /// async `wait_and_reap` and `teardown_through_pidfd`. A fixture that only that kill would end is released here, so a
-    /// no-kill mutant fails an assertion on how the child died (see [`record_teardown_reaps`])
-    /// instead of hanging the wait.
+    /// async `wait_and_reap` and `teardown_through_pidfd`. See [`release_between_kill_and_wait`].
     pub(crate) fn set_between_kill_and_wait(hook: impl FnOnce() + 'static) -> ArmedBetweenKillAndWait {
         crate::oneshot_hook::arm(&BETWEEN_KILL_AND_WAIT, hook)
     }
@@ -3356,10 +3354,8 @@ pub(crate) mod fault {
         }
     }
 
-    /// A stdin for a child only a kill ends. Its writer is released between the code under test's
-    /// kill and its blocking wait ([`set_between_kill_and_wait`]), so a no-kill mutant lets the
-    /// child exit 0 and fails [`TeardownBlocker::assert_killed`] rather than hanging the wait. Keep
-    /// the guard alive through the assertion: dropping it clears the hook and recorder.
+    /// A stdin for a child only a kill ends, its writer released as [`release_between_kill_and_wait`]
+    /// does. Keep the guard alive through the assertion: dropping it clears the hook and recorder.
     ///
     /// The child must exit 0 on stdin EOF: `cat` on Unix, `more.com` on Windows (whose `findstr x`
     /// exits 1, which is what a kill reports) with a null stdout, because `more` echoes. Use
@@ -3376,10 +3372,12 @@ pub(crate) mod fault {
         )
     }
 
-    /// [`teardown_blocker_stdin`] for a child a test already spawned: `held`, whatever only a kill
-    /// ends the child without (its stdin writer, a control socket), is dropped between the code
-    /// under test's kill and its blocking wait, and the reaps it makes are recorded. Arm it before
-    /// the code under test runs and keep the guard through [`TeardownBlocker::assert_killed`].
+    /// [`teardown_blocker_stdin`] for a child a test already spawned; `held` is whatever only a kill
+    /// ends the child without (its stdin writer, a control socket). It is dropped between the code
+    /// under test's kill and its blocking wait ([`set_between_kill_and_wait`]), so a kill that sent
+    /// nothing exits 0 and fails [`TeardownBlocker::assert_killed`] instead of hanging the wait.
+    /// The reaps it makes are recorded. Arm it before the code under test runs and keep the guard
+    /// through the assertion.
     pub(crate) fn release_between_kill_and_wait(held: impl Sized + 'static) -> TeardownBlocker {
         let fired = std::rc::Rc::new(std::cell::Cell::new(false));
         let release = set_between_kill_and_wait(release_hook(held, &fired));
@@ -3464,9 +3462,9 @@ pub(crate) mod fault {
             self.reaps.assert_killed();
         }
 
-        /// The release hook fired: the teardown's kill returned. For a teardown whose reap the kernel
-        /// did (no status to read).
-        #[cfg(target_os = "macos")]
+        /// The release hook fired: the teardown's kill returned. For a teardown whose reap is not
+        /// recorded (the kernel's, or forced to fail).
+        #[cfg(unix)]
         pub(crate) fn assert_released(&self) {
             assert!(
                 self.fired.get(),

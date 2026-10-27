@@ -97,8 +97,7 @@ fn kill_terminates_running_child() {
     let stdin = child.stdin();
 
     child.kill().expect("kill");
-    // Close stdin after the kill: `tee-both` leaves with 0 on EOF, so a `kill` that sent nothing
-    // fails the assertion on how it ended instead of leaving the wait unbounded.
+    // Close stdin after the kill: `tee-both` exits 0 on EOF, so an unsent kill shows.
     drop(stdin);
     common::assert_killed("tee-both", child.wait().expect("wait after kill"));
 }
@@ -1194,8 +1193,7 @@ fn treewalk_kill_tree_reaps_the_grandchild() {
 #[skuld::test]
 fn treewalk_terminate_tree_reaps_the_grandchild() {
     // Hold `root_stream` until the signal (see spawn_treewalk_tree): it keeps the root alive so
-    // TreeWalk enumerates a live root's descendants. It also means a `terminate_tree` that sent
-    // nothing leaves the root running, so the members are proven ended before any wait.
+    // TreeWalk enumerates a live root's descendants.
     let (child, gc_stream, root_stream) = spawn_treewalk_tree();
     let mut grand = common::Member::new(
         gc_stream,

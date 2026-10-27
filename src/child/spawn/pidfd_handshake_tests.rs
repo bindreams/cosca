@@ -1408,8 +1408,7 @@ fn conclude_answers_whether_the_program_could_have_started() {
 
     // Told to go, then the spawn failed: tokio's may have failed after `exec`, std's did not.
     let (mut cat, pidfd) = cat_with_pidfd();
-    // Released once the teardown's kill returned, so a kill that sent nothing fails the SIGKILL
-    // assertion below instead of hanging the reap.
+    // Released after the kill: a kill that sent nothing exits 0.
     let teardown = crate::child::spawn::fault::release_between_kill_and_wait(cat.stdin.take());
     let (_, fate) = answered(super::conclude(
         Err::<NoChild, _>(io("tokio")),

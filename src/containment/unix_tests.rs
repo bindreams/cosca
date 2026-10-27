@@ -78,8 +78,7 @@ fn kill_group_on_owned_group_succeeds() {
             .process_group(0),
     )
     .expect("spawn cat");
-    // Closed right after the kill: only a real `SIGKILL` can end the child before then, so a
-    // `kill_group` that signals nothing exits 0 and fails the assertion instead of hanging `wait()`.
+    // Closed right after the kill: a `kill_group` that signals nothing exits 0.
     let stdin = child.stdin.take().expect("piped stdin");
     let pgid = child.id() as i32;
     assert!(
@@ -163,8 +162,7 @@ fn term_group_on_owned_group_succeeds() {
     use std::os::unix::process::{CommandExt, ExitStatusExt as _};
     // `cat` installs no SIGTERM handler of its own, so a delivered SIGTERM actually ends it —
     // distinguishing "exited because of the signal" from "merely stayed reachable". Its stdin is
-    // closed right after the call, so a `term_group` that delivers nothing exits 0 and fails the
-    // assertion instead of hanging `wait()`.
+    // closed right after the call: a `term_group` that delivers nothing exits 0.
     let mut child = crate::test_spawn::spawn(
         std::process::Command::new("cat")
             .stdin(std::process::Stdio::piped())

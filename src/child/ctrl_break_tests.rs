@@ -108,12 +108,13 @@ fn child_graceful_shutdown_exits_via_ctrl_break_on_windows() {
     let (child, _sock) = spawn_root(Handler::Default, crate::ContainMode::Strongest);
     let pid = child.id().pid();
     assert_in_our_console(pid, "the child");
-    let _check = term_fault::at(term_fault::HookPoint::AfterTerminate, move || {
+    let check = term_fault::at_checked(term_fault::HookPoint::AfterTerminate, move || {
         ctrl_break::assert_break_sent_to(pid)
     });
     let status = child
         .graceful_shutdown(Duration::from_secs(30))
         .expect("graceful_shutdown on a console-group child");
+    check.assert_fired();
     assert_eq!(
         status.code(),
         Some(STATUS_CONTROL_C_EXIT),
@@ -128,8 +129,7 @@ fn child_graceful_shutdown_exits_via_ctrl_break_on_windows() {
 fn child_graceful_shutdown_signals_the_group_but_only_kills_the_child() {
     let (child, root_sock, mut grand) = spawn_tree(Handler::Ignore, Handler::Ack, crate::ContainMode::Strongest);
     assert_in_our_console(child.id().pid(), "the root");
-    // The root leaves with 0 when its socket closes. Closed once the escalation returned, so an
-    // escalation that sent nothing fails the code assertion below instead of hanging the reap.
+    // The root leaves with 0 when its socket closes; closed once the escalation returned.
     let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, root_sock);
     let status = child
         .graceful_shutdown(Duration::ZERO)
@@ -149,7 +149,7 @@ fn child_graceful_shutdown_signals_the_group_but_only_kills_the_child() {
         crate::containment::TreeDrain::MembersRemain,
         "the escalation must not have reached the group"
     );
-    // Released after the kill, so code 1 is the kill's, not a release.
+    // Released after the kill: code 1 is the kill's.
     child.kill_tree().expect("kill_tree");
     let Grandchild { sock, exit } = grand;
     drop(sock);
@@ -188,12 +188,13 @@ fn child_graceful_shutdown_tree_tears_down_tree_on_windows() {
     assert_eq!(child.containment(), Containment::JobObject);
     let pid = child.id().pid();
     assert_in_our_console(pid, "the root");
-    let _check = term_fault::at(term_fault::HookPoint::AfterTerminate, move || {
+    let check = term_fault::at_checked(term_fault::HookPoint::AfterTerminate, move || {
         ctrl_break::assert_break_sent_to(pid)
     });
     let status = child
         .graceful_shutdown_tree(Duration::from_secs(30))
         .expect("graceful_shutdown_tree on a console-group root");
+    check.assert_fired();
     assert_eq!(
         status.code(),
         Some(STATUS_CONTROL_C_EXIT),
@@ -231,7 +232,7 @@ fn treewalk_terminate_tree_reaps_the_grandchild() {
 
 /// Both members ignore the break, so only the ZERO-grace hard sweep can end the tree. The root's
 /// socket is closed once the sweep returned, and the grandchild's after the root is reaped: a sweep
-/// that sent nothing, or only to the root, yields code 0 for the member it missed, not a hang.
+/// that sent nothing, or only to the root, yields code 0 for the member it missed.
 #[skuld::test]
 fn graceful_shutdown_tree_sweep_is_load_bearing_on_windows() {
     let (child, root_sock, grand) = spawn_tree(Handler::Ignore, Handler::Ignore, crate::ContainMode::Strongest);

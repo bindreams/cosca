@@ -251,7 +251,6 @@ pub(crate) fn kill_by_identity(id: ProcessId, signal: Signal) -> KillOutcome {
         return KillOutcome::NotAttempted;
     };
     let sent = kill(Pid::from_raw(target), signal);
-    // After the syscall, whatever it answered: a send that was skipped leaves no record.
     #[cfg(test)]
     crate::send_log::record_by_identity(id.pid(), signal as i32);
     match sent {

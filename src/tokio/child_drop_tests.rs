@@ -23,9 +23,8 @@ fn blocker() -> (Child, crate::tokio::ChildStdin) {
     (child, stdin)
 }
 
-/// [`blocker`], its stdin released once the drop's root kill returned, before its reap: a drop whose
-/// kill sent nothing lets the root exit `0`, which [`TeardownBlocker::assert_killed`] then fails by
-/// assertion instead of the drop hanging on the reap. Keep the guard through the assertion.
+/// Releases the root's stdin once the drop's kill returned; `assert_killed` fails if the root exited
+/// `0`. Keep the guard through the assertion.
 #[cfg(unix)]
 pub(crate) fn released_blocker() -> (Child, TeardownBlocker) {
     let (child, stdin) = blocker();
@@ -33,11 +32,10 @@ pub(crate) fn released_blocker() -> (Child, TeardownBlocker) {
 }
 
 /// What [`released_blocker`] gives on Windows, where the drop waits for nothing and so has no point
-/// between its kill and a wait to release at. It holds the root's stdin and a handle of its own to
-/// the root, opened before the drop. [`assert_killed`](Self::assert_killed) releases the stdin
-/// after the drop returned, then reads how the root ended: `TerminateProcess(_, 1)` set the exit
-/// code `1` before the drop returned, so a root the drop left alone exits `0` on the released
-/// stdin, and the assertion fails instead of the wait hanging.
+/// to release at. It holds the root's stdin and a handle of its own to the root, opened before the
+/// drop. [`assert_killed`](Self::assert_killed) releases the stdin after the drop returned, then
+/// reads the exit code: `TerminateProcess(_, 1)` set `1` before the drop returned, so a root the
+/// drop left alone exits `0`.
 #[cfg(windows)]
 pub(crate) struct TerminatedBlocker {
     stdin: std::cell::Cell<Option<crate::tokio::ChildStdin>>,

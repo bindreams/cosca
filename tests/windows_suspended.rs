@@ -188,8 +188,7 @@ fn a_resumed_child_runs() {
         assert_eq!((tag, pid), (b'C', child.id().pid()), "{backend}");
         common::assert_echoes(&mut sock, "the resumed child");
         child.kill().expect("kill");
-        // Released after the kill: the echo child leaves with 0 on EOF, so a `kill` that sent
-        // nothing fails the assertion on how it ended, not the reap.
+        // Released after the kill: a kill that sent nothing exits 0.
         drop(sock);
         common::assert_killed("the resumed child", child.wait().expect("reap"));
     }

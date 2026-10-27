@@ -2080,7 +2080,6 @@ fn signal_on_drop(
     };
     #[cfg(not(test))]
     let killed = proc.signal(Sig::Kill);
-    // Counted after the call, refused or not: a drop that never reached it leaves no count.
     #[cfg(all(test, unix))]
     drop_fault::note_root_kill();
     // Nothing was delivered because the child is gone (reaped by someone else, and its pid

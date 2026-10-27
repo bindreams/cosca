@@ -1223,14 +1223,15 @@ pub(crate) fn windows_blocker_async(
 #[cfg(unix)]
 const TERM_IGNORING_BLOCKER_ARGV: &[&str] = &["sh", "-c", "trap '' TERM; echo r; exec cat"];
 
-/// A root and a grandchild that both ignore `SIGTERM` (an ignored disposition survives `exec`) and
-/// block on one stdin pipe. The grandchild prints `eof` if its `cat` ends of its own accord; the
-/// root prints `r` once the grandchild is forked.
+/// Three processes that ignore `SIGTERM` (an ignored disposition survives `exec`) and block on one
+/// stdin pipe: the root (`cat`), a subshell, and the subshell's child `sh`. The child prints `r`
+/// once it runs, so all three exist when a test reads it. Each of the last two then prints its own
+/// marker once the stdin ends, if it is still alive: the child `leaf`, the subshell `eof`.
 #[cfg(unix)]
 pub(crate) const TERM_IGNORING_TREE_ARGV: &[&str] = &[
     "sh",
     "-c",
-    "trap '' TERM; exec 3<&0; { cat <&3 3<&-; echo eof; } & echo r; exec cat",
+    "trap '' TERM; exec 3<&0; { sh -c 'echo r; read -r _; echo leaf' <&3 3<&-; echo eof; } & exec cat",
 ];
 
 /// A spawned, contained `SIGTERM`-ignoring [`TERM_IGNORING_BLOCKER_ARGV`] child and the write end of

@@ -382,10 +382,8 @@ fn drop_after_kill_tree_and_wait_skips_at_debug_and_does_not_warn() {
 
 /// `graceful_shutdown_tree` sweeps with `kill_tree` and reaps the root, so its drop is quiet too.
 ///
-/// The root's stdin is released once `terminate_tree` has returned (`release_at`), so a
-/// `terminate_tree` that sent nothing ends it with status 0 and fails the assertion on its status,
-/// instead of the grace running out. A sent `SIGTERM` is already pending then, so it beats the
-/// release.
+/// The root's stdin is released via `release_at` after `terminate_tree` returns; a `terminate_tree`
+/// that sent nothing yields status 0 and fails the status assertion.
 #[skuld::test]
 fn drop_after_graceful_shutdown_tree_skips_at_debug_and_does_not_warn() {
     use std::os::unix::process::ExitStatusExt as _;

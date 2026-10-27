@@ -120,10 +120,8 @@ fn assert_the_teardown_killed(
 
 /// What `after_the_spawn` answers for a failed pump on `child`, a held blocker whose stdin `writer`
 /// is released only once the teardown's kill is checked. The teardown sends its signals on its first
-/// poll and awaits the reap after, so a kill that sent nothing fails that check by assertion instead
-/// of leaving the reap to hang on a blocker that never exits. Needs `alone()` on Linux. Elsewhere the
-/// writer is dropped between the teardown's kill and its reap, and the reap's status must be
-/// `SIGKILL`, as on Linux.
+/// poll and awaits the reap after. Needs `alone()` on Linux. Elsewhere the writer is dropped between
+/// the teardown's kill and its reap, and the reap's status must be `SIGKILL`, as on Linux.
 #[cfg(unix)]
 async fn after_a_pump_failure(child: &mut super::Child, writer: std::io::PipeWriter) -> crate::error::Error {
     use std::future::Future as _;
@@ -238,8 +236,7 @@ fn assert_failed_after_the_spawn(error: crate::error::Error, fate: crate::error:
 /// A root that only a kill or the drop of its release pipe ends, and the guard that drops that pipe
 /// once the teardown's kill returned, before its reap. The root reads fd 4, which `output`, `read`
 /// and `status` leave alone: they set the child's stdin, stdout and stderr themselves, so none of
-/// those can hold it. A teardown that kills nothing lets the root exit `0`, which `assert_killed`
-/// on the guard fails by assertion instead of the reap hanging.
+/// those can hold it.
 #[cfg(unix)]
 fn releasable_root() -> (super::Command, crate::child::spawn::fault::TeardownBlocker) {
     let (gate, release) = crate::test_child::held_writer_stdin();

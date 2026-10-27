@@ -9,14 +9,12 @@ use super::fault as term_fault;
 use crate::test_child::ctrl_break::{self, Grandchild, Handler, STATUS_CONTROL_C_EXIT};
 use crate::GracefulMechanism;
 
-/// A contained [`ctrl_break`] root answering with `handler`, after its handshake.
 fn spawn_root(handler: Handler) -> (crate::tokio::Child, TcpStream) {
     let (child, sock, _) = spawn(handler, None);
     (child, sock)
 }
 
-/// A contained root and the grandchild it starts in its console process group, after both
-/// handshakes. The root's socket keeps the root running while held.
+/// The root's socket keeps the root running while held.
 fn spawn_tree(root: Handler, grandchild: Handler) -> (crate::tokio::Child, TcpStream, Grandchild) {
     let (child, sock, grand) = spawn(root, Some(grandchild));
     (child, sock, grand.expect("a grandchild was asked for"))
@@ -38,7 +36,7 @@ fn spawn(handler: Handler, grandchild: Option<Handler>) -> (crate::tokio::Child,
     (child, sock, grand)
 }
 
-/// As the sync twin's.
+/// Same contract as `child::ctrl_break_tests::assert_in_our_console`.
 fn assert_in_our_console(pid: u32) {
     assert_eq!(
         ctrl_break::in_our_console(pid),
@@ -47,14 +45,14 @@ fn assert_in_our_console(pid: u32) {
     );
 }
 
-/// As the sync twin's.
+/// Same contract as `child::ctrl_break_tests::assert_acked`.
 fn assert_acked(sock: &mut TcpStream) {
     let mut ack = [0u8; 1];
     sock.read_exact(&mut ack).expect("the root must acknowledge the break");
     assert_eq!(&ack, b"B", "the root acked something other than CTRL_BREAK");
 }
 
-/// As the sync twin's.
+/// Same contract as `child::ctrl_break_tests::kill_tree_release_reap`.
 async fn kill_tree_release_reap(child: &mut crate::tokio::Child, sock: TcpStream) {
     child.kill_tree().expect("kill_tree");
     drop(sock);
@@ -62,7 +60,6 @@ async fn kill_tree_release_reap(child: &mut crate::tokio::Child, sock: TcpStream
     assert_eq!(status.code(), Some(1), "kill_tree must kill the root, got {status:?}");
 }
 
-/// Async twin of `child_terminate_delivers_ctrl_break_to_a_contained_root`.
 #[skuld::test]
 async fn async_child_terminate_delivers_ctrl_break_to_a_contained_root() {
     crate::tokio::test_runtime::assert_current_thread();
@@ -75,7 +72,6 @@ async fn async_child_terminate_delivers_ctrl_break_to_a_contained_root() {
     kill_tree_release_reap(&mut child, sock).await;
 }
 
-/// Async twin of `a_plain_contained_root_really_receives_the_break`.
 #[skuld::test]
 async fn an_async_plain_contained_root_really_receives_the_break() {
     crate::tokio::test_runtime::assert_current_thread();
@@ -88,21 +84,22 @@ async fn an_async_plain_contained_root_really_receives_the_break() {
     kill_tree_release_reap(&mut child, sock).await;
 }
 
-/// Async twin of `child_graceful_shutdown_exits_via_ctrl_break_on_windows`. The hook runs on this
-/// thread, inside the future's poll, so it reads the record `terminate` wrote there.
+/// The hook runs on this thread, inside the future's poll, so it reads the record `terminate` wrote
+/// there.
 #[skuld::test]
 async fn async_child_graceful_shutdown_exits_via_ctrl_break_on_windows() {
     crate::tokio::test_runtime::assert_current_thread();
     let (mut child, _sock) = spawn_root(Handler::Default);
     let pid = child.id().pid();
     assert_in_our_console(pid);
-    let _check = term_fault::at(term_fault::HookPoint::AfterTerminate, move || {
+    let check = term_fault::at_checked(term_fault::HookPoint::AfterTerminate, move || {
         ctrl_break::assert_break_sent_to(pid)
     });
     let status = child
         .graceful_shutdown(Duration::from_secs(30))
         .await
         .expect("graceful_shutdown on a console-group child");
+    check.assert_fired();
     assert_eq!(
         status.code(),
         Some(STATUS_CONTROL_C_EXIT),
@@ -110,20 +107,20 @@ async fn async_child_graceful_shutdown_exits_via_ctrl_break_on_windows() {
     );
 }
 
-/// Async twin of `child_graceful_shutdown_tree_tears_down_tree_on_windows`.
 #[skuld::test]
 async fn async_child_graceful_shutdown_tree_tears_down_tree_on_windows() {
     crate::tokio::test_runtime::assert_current_thread();
     let (mut child, _root_sock, grand) = spawn_tree(Handler::Default, Handler::Default);
     let pid = child.id().pid();
     assert_in_our_console(pid);
-    let _check = term_fault::at(term_fault::HookPoint::AfterTerminate, move || {
+    let check = term_fault::at_checked(term_fault::HookPoint::AfterTerminate, move || {
         ctrl_break::assert_break_sent_to(pid)
     });
     let status = child
         .graceful_shutdown_tree(Duration::from_secs(30))
         .await
         .expect("graceful_shutdown_tree on a console-group root");
+    check.assert_fired();
     assert_eq!(
         status.code(),
         Some(STATUS_CONTROL_C_EXIT),
@@ -136,9 +133,6 @@ async fn async_child_graceful_shutdown_tree_tears_down_tree_on_windows() {
     );
 }
 
-/// Async twin of `child_graceful_shutdown_signals_the_group_but_only_kills_the_child`. The root
-/// ignores the break, so only the escalation can end it; its socket is closed once the escalation
-/// returned, so an escalation that sent nothing yields code 0, not a hang.
 #[skuld::test]
 async fn async_child_graceful_shutdown_signals_the_group_but_only_kills_the_child() {
     crate::tokio::test_runtime::assert_current_thread();
@@ -162,7 +156,7 @@ async fn async_child_graceful_shutdown_signals_the_group_but_only_kills_the_chil
         crate::containment::TreeDrain::MembersRemain,
         "the escalation must not have reached the group"
     );
-    // Released after the kill, so code 1 is the kill's, not a release.
+    // Released after the kill: code 1 is the kill's.
     child.kill_tree().expect("kill_tree");
     let Grandchild { sock, exit } = grand;
     drop(sock);
@@ -171,7 +165,7 @@ async fn async_child_graceful_shutdown_signals_the_group_but_only_kills_the_chil
 
 /// Both members ignore the break, so only the ZERO-grace hard sweep can end the tree. The root's
 /// socket is closed once the sweep returned, and the grandchild's after the root is reaped: a sweep
-/// that sent nothing, or only to the root, yields code 0 for the member it missed, not a hang.
+/// that sent nothing, or only to the root, yields code 0 for the member it missed.
 #[skuld::test]
 async fn async_graceful_shutdown_tree_sweep_is_load_bearing_on_windows() {
     crate::tokio::test_runtime::assert_current_thread();

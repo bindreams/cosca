@@ -153,7 +153,6 @@ async fn async_graceful_lone_watch_error_still_escalates_and_reaps() {
     crate::test_child::assert_killed("the escalated child", status);
 }
 
-// Async twin of `child_graceful_shutdown_graceful_path` in `src/child/graceful_tests.rs`.
 #[cfg(unix)]
 #[skuld::test]
 async fn async_graceful_shutdown_graceful_path() {
@@ -176,8 +175,6 @@ async fn async_graceful_shutdown_graceful_path() {
     );
 }
 
-// Async twin of `child_graceful_shutdown_tree_graceful_root_sigterm` in
-// `src/child/graceful_tests.rs` — see there for the full rationale.
 #[cfg(unix)]
 #[skuld::test]
 async fn async_graceful_shutdown_tree_graceful_root_sigterm() {
@@ -196,8 +193,6 @@ async fn async_graceful_shutdown_tree_graceful_root_sigterm() {
     );
 }
 
-// Async twin of `child_graceful_shutdown_tree_tears_down_tree` in `src/child/graceful_tests.rs` —
-// see there for the full rationale.
 #[cfg(unix)]
 #[skuld::test]
 async fn async_graceful_shutdown_tree_tears_down_tree() {
@@ -206,7 +201,11 @@ async fn async_graceful_shutdown_tree_tears_down_tree() {
     use ::tokio::io::AsyncReadExt as _;
     crate::tokio::test_runtime::assert_current_thread();
     let mut cmd = crate::tokio::Command::new();
-    cmd.args(["sh", "-c", "exec 3<&0; cat <&3 3<&- & echo r; exec cat"]);
+    cmd.args([
+        "sh",
+        "-c",
+        "exec 3<&0; sh -c 'echo r; read -r _; echo leaf' <&3 3<&- & exec cat",
+    ]);
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
     cmd.contain();
@@ -236,7 +235,6 @@ async fn async_graceful_shutdown_tree_tears_down_tree() {
     assert!(rest.is_empty(), "nothing was written: {rest:?}");
 }
 
-// Async twin of `child_graceful_shutdown_escalates` in `src/child/graceful_tests.rs`.
 #[cfg(unix)]
 #[skuld::test]
 async fn async_graceful_shutdown_escalates() {
@@ -250,8 +248,6 @@ async fn async_graceful_shutdown_escalates() {
     crate::test_child::assert_killed("the SIGTERM-ignoring child", status);
 }
 
-// Async twin of `child_graceful_shutdown_tree_escalates_with_a_surviving_grandchild` in
-// `src/child/graceful_tests.rs` — see there for the full rationale.
 #[cfg(unix)]
 #[skuld::test]
 async fn async_graceful_shutdown_tree_escalates_with_a_surviving_grandchild() {
@@ -284,8 +280,8 @@ async fn async_graceful_shutdown_tree_escalates_with_a_surviving_grandchild() {
     stdout
         .read_to_end(&mut rest)
         .await
-        .expect("both members are gone, so the pipe ends");
-    assert!(rest.is_empty(), "the sweep missed the grandchild: {rest:?}");
+        .expect("every member is gone, so the pipe ends");
+    assert!(rest.is_empty(), "the sweep missed a grandchild: {rest:?}");
 }
 
 // Async twin of `graceful_tree_terminate_refusal_still_sweeps_and_reaps` in
@@ -459,13 +455,15 @@ async fn async_graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_auth
     // Windows: assert the break was sent once `terminate_tree` returns, so a missing one fails
     // here and not when the grace runs out.
     #[cfg(windows)]
-    let _check = {
+    let check = {
         let pid = child.id().pid();
-        term_fault::at(term_fault::HookPoint::AfterTerminate, move || {
+        term_fault::at_checked(term_fault::HookPoint::AfterTerminate, move || {
             crate::test_child::ctrl_break::assert_break_sent_to(pid)
         })
     };
     let result = child.graceful_shutdown_tree(Duration::from_secs(30)).await;
+    #[cfg(windows)]
+    check.assert_fired();
     if authoritative {
         let status = result.expect("an authoritatively-drained tree must not invoke the sweep at all");
         assert!(

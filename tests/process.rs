@@ -181,8 +181,7 @@ fn children_recursive_distinguishes_direct_from_descendant() {
 
     // Teardown: kill the direct child; the reparented grandchild exits when its socket closes.
     child.kill().expect("kill child");
-    // Releasing the sockets right after the kill lets a `kill` that sent nothing fail the signal
-    // assertion, not hang the reap.
+    // Released after the kill: a kill that sent nothing exits 0.
     drop(socks);
     common::assert_killed("the killed child", child.wait().expect("reap the child"));
     grandkid.wait().expect("wait for the orphaned grandchild");
@@ -809,8 +808,7 @@ fn death_watch_accept_tree_panics_when_the_grandchild_dies_before_connecting_whi
         },
     );
     // The grandchild exited, so it must not be named a `G` connection; the root stays alive. Take
-    // the root's connection before the kill: released after it, the root leaves with 0, so a `kill`
-    // that sent nothing fails the assertion on how the root ended, not the reap.
+    // the root's connection before the kill: released after it, a kill that sent nothing exits 0.
     let mut root_sock = common::accept_or_die(&listener, &mut root);
     let mut tag = [0u8; 1];
     root_sock.read_exact(&mut tag).expect("the root's tag");

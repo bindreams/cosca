@@ -467,8 +467,7 @@ async fn a_failed_identity_peek_is_unknown_kills_the_child_and_forgets_the_tokio
     let forgets = super::drop_fault::record();
     let backend_drops = super::fault::count_backend_drops();
     let mark = crate::log_capture::mark();
-    // Released once the teardown's kill returned, so a kill that sent nothing fails the SIGKILL
-    // assertion below instead of hanging the reap.
+    // Released after the kill: a kill that sent nothing exits 0.
     let (stdin, reaps) = crate::child::spawn::fault::teardown_blocker_stdin();
     let mut cmd = Command::new();
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());

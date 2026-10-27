@@ -270,7 +270,6 @@ pub(crate) fn clear_std_handle_inheritance() {
             }
         }
     }
-    // Recorded after the calls, as every test record is.
     #[cfg(test)]
     observe::record_inheritance_cleared();
 }

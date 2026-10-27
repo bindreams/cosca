@@ -232,7 +232,7 @@ fn a_transient_tree_kill_failure_is_retried_by_the_drop() {
     // Rule out the leaf's own `Drop`: only the handle's drop may retry.
     child.attached.disarm();
     // The failure ends once the root is killed: the retry finds a file it can write. The root is
-    // released there too, so a kill that sent nothing ends it with 0 instead of hanging the reap.
+    // released there too: a kill that sent nothing exits 0.
     let reaps = fault::record_teardown_reaps();
     let healed = kill_file.clone();
     let _hook = fault::set_between_kill_and_wait(move || {

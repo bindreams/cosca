@@ -29,8 +29,7 @@ async fn async_foreign_wait_resolves_on_exit() {
     let p = Process::from_pid(child.id().pid()).found().expect("resolves");
     let watch = ::tokio::spawn(async move { p.wait().await });
     child.kill().expect("kill");
-    // Release the member after the kill: it leaves with 0 on the release, so a `kill` that sent
-    // nothing fails the assertion on how it ended, not the join on a wait that never resolves.
+    // Released after the kill: a kill that sent nothing exits 0.
     drop(sock);
     watch
         .await
@@ -57,9 +56,8 @@ async fn async_foreign_wait_timeout_observes_an_exit() {
     let (child, sock) = common::spawn_blocker();
     let p = Process::from_pid(child.id().pid()).found().expect("resolves");
     child.kill().expect("kill");
-    // Release the member after the kill: a `kill` that sent nothing lets it leave with 0, which the
-    // assertion on how it ended catches. The exit is waited for first, so `wait_timeout` observes
-    // an exit that already happened.
+    // Released after the kill: a kill that sent nothing exits 0. The exit is waited for first, so
+    // `wait_timeout` observes an exit that already happened.
     drop(sock);
     common::assert_killed("the killed child", common::exit_status_once_exited(child.id().pid()));
     assert!(
@@ -150,7 +148,7 @@ async fn async_foreign_kill_tree_tears_down_tree() {
     );
     let p = Process::from_pid(child.id().pid()).found().expect("resolves");
     p.kill_tree().expect("kill_tree");
-    // A kill that sent nothing fails here by assertion instead of hanging a read for an EOF.
+    // A kill that sent nothing fails here by assertion.
     common::assert_members_killed(vec![(root, "the root"), (grand, "the grandchild")]);
     let _ = child.wait();
 }

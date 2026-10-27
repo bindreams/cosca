@@ -125,8 +125,7 @@ fn cgroup_a_front_outside_its_leaf_is_left_unwaited(#[fixture(cgroup)] _group: &
     // The test's own cleanup: the cat it moved out of the leaf.
     let mut cleanup = PidfdChild::new(Some(pid), observer);
     cleanup.kill().expect("kill the moved cat");
-    // Released after the kill, so a kill that sent nothing ends the cat with 0 and fails the
-    // assertion instead of hanging the reap.
+    // Released after the kill: a kill that sent nothing exits 0.
     drop(stdin);
     crate::test_child::assert_killed("the moved cat", cleanup.wait().expect("reap the moved cat"));
 }
