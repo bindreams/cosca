@@ -245,6 +245,8 @@ fn main() {
     shim_env_hooks::init();
     #[cfg(target_os = "linux")]
     elevation::shim::owner_helper::run_if_requested();
+    #[cfg(unix)]
+    test_child::blocked_tree_root::run_if_requested();
     let mut runner = skuld::TestRunner::new();
     runner.libtest_names();
     runner.require_known_labels();
