@@ -1,11 +1,8 @@
-//! The root of [`foreign::blocked_tree`](super::foreign::blocked_tree), as a process of its own.
-//!
-//! The lib's test binary is also this root: its `main` calls [`run_if_requested`] before the test
-//! runner starts, so the root is single-threaded. It spawns a `cat` on its own stdin, blocks
-//! `SIGTERM`, prints the `cat`'s pid and waits for it. A `SIGTERM` sent to it stays pending, and
-//! it is still pending once the `cat` has ended, however the two sends interleave with this wait.
-//! It then prints how the `cat` ended, as a shell reports it (`128 + signal` or the exit code),
-//! and if a `SIGTERM` arrived, it dies of it.
+//! The root of [`foreign::blocked_tree`](super::foreign::blocked_tree), as a process of its own: the
+//! lib's test binary re-run with [`argv`], dispatched from `main` before the runner starts so it
+//! is single-threaded. It spawns a `cat` on its own stdin and prints the `cat`'s pid, then how the
+//! `cat` ended (`128 + signal` or the exit code, as a shell reports it). It blocks `SIGTERM` so a
+//! send stays pending however it interleaves with the wait on the `cat`, and dies of it at the end.
 
 use std::ffi::OsString;
 use std::io::Write;
@@ -24,12 +21,10 @@ pub(crate) fn run_if_requested() {
     std::process::exit(0);
 }
 
-/// The argv (after the program name) that starts the root.
 pub(crate) fn argv() -> [&'static str; 1] {
     [FLAG]
 }
 
-/// The status of the `cat` as a shell reports it: `128 + signal`, or the exit code.
 fn shell_status(status: std::process::ExitStatus) -> i32 {
     status
         .signal()
@@ -37,8 +32,6 @@ fn shell_status(status: std::process::ExitStatus) -> i32 {
 }
 
 fn run() {
-    // The `cat` is spawned first: a signal mask is inherited across `exec`, and the `cat` must
-    // die of `SIGTERM`'s default disposition.
     #[allow(
         clippy::disallowed_methods,
         reason = "this process is single-threaded: nothing else forks, so there is no lock to hold"
@@ -61,25 +54,32 @@ fn run() {
     writeln!(out, "{}", shell_status(status)).expect("report the cat's status");
     out.flush().expect("report the cat's status");
 
-    // SAFETY: `sigpending` fills the set it is given.
+    // SAFETY: a zeroed `sigset_t` is a valid out-parameter for `sigpending`.
     let (rc, pending) = unsafe {
         let mut pending = std::mem::zeroed();
         (libc::sigpending(&mut pending), pending)
     };
     assert_eq!(rc, 0, "sigpending: {}", std::io::Error::last_os_error());
-    // SAFETY: `pending` is an initialised set.
     if unsafe { libc::sigismember(&pending, libc::SIGTERM) } == 1 {
-        // SAFETY: restoring the default disposition, then unblocking the pending signal: it is
-        // delivered before `sigprocmask` returns, and its default action ends this process.
-        unsafe {
-            libc::signal(libc::SIGTERM, libc::SIG_DFL);
-            libc::sigprocmask(libc::SIG_UNBLOCK, &term, std::ptr::null_mut());
-        }
+        // SAFETY: plain libc calls. Unblocking delivers the pending SIGTERM before `sigprocmask`
+        // returns.
+        let (handler, rc) = unsafe {
+            (
+                libc::signal(libc::SIGTERM, libc::SIG_DFL),
+                libc::sigprocmask(libc::SIG_UNBLOCK, &term, std::ptr::null_mut()),
+            )
+        };
+        assert_ne!(
+            handler,
+            libc::SIG_ERR,
+            "reset SIGTERM: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(rc, 0, "unblock SIGTERM: {}", std::io::Error::last_os_error());
         unreachable!("the pending SIGTERM kills this process");
     }
 }
 
-/// A set holding `SIGTERM` alone.
 fn sigset_of_term() -> libc::sigset_t {
     // SAFETY: `sigemptyset` initialises the set it is given.
     unsafe {

@@ -14,9 +14,8 @@ pub(crate) fn blocker() -> Child {
     crate::test_spawn::spawn(Command::new("cat").stdin(Stdio::piped())).expect("spawn the blocker")
 }
 
-/// A root (see [`blocked_tree_root`](super::blocked_tree_root)) with a `cat` grandchild blocked on
-/// the stdin held in `grandchild_stdin`. The root reports the grandchild's pid on its stdout, then
-/// how the grandchild ended, and itself dies of `SIGTERM` if it was sent one.
+/// A root (see [`blocked_tree_root`](super::blocked_tree_root), which defines what it reports) with
+/// a `cat` grandchild blocked on the stdin held in `grandchild_stdin`.
 pub(crate) struct BlockedTree {
     pub(crate) root: Child,
     pub(crate) grandchild: u32,
