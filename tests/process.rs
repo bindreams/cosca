@@ -192,8 +192,7 @@ fn foreign_kill_terminates_the_process() {
     let (child, sock) = spawn_blocker();
     let p = cosca::Process::from_pid(child.id().pid()).found().expect("resolves");
     p.kill().expect("kill");
-    // Release the member after the kill: a `kill` that sent nothing lets it leave with 0, which the
-    // assertion on how it ended catches, where a read for an EOF would hang.
+    // Release after the kill: a kill that sent nothing lets it exit 0, failing the status assertion.
     drop(sock);
     common::assert_killed("the killed child", child.wait().expect("reap"));
     p.kill().expect("second kill on a dead process must be Ok");
@@ -726,8 +725,7 @@ fn death_watch_accept_tree_panics_when_the_root_dies_before_connecting_after_ano
         move || {
             if in_hook.get() {
                 cosca::Process::from_id(root_id).kill().expect("kill the root");
-                // Release the root after the kill: a `kill` that sent nothing lets it leave with 0,
-                // which ends the accept and fails the assertion on how the root ended.
+                // Release after the kill: a kill that sent nothing lets it exit 0, failing the status assertion.
                 drop(root_stdin.take());
             }
         },
@@ -954,8 +952,7 @@ fn death_watch_accept_tree_panics_when_the_grandchild_dies_before_connecting_aft
                 cosca::Process::from_id(grandchild_id)
                     .kill()
                     .expect("kill the grandchild");
-                // Release the grandchild after the kill: a `kill` that sent nothing lets it leave
-                // with 0, which ends the accept and fails the assertion on how it ended.
+                // Release after the kill: a kill that sent nothing lets it exit 0, failing the status assertion.
                 drop(grandchild_stdin.take());
             }
         },

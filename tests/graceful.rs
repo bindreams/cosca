@@ -99,8 +99,7 @@ fn process_terminate_sends_sigterm() {
     let (child, sock) = common::spawn_blocker();
     let p = cosca::Process::from_pid(child.id().pid()).found().expect("resolves");
     p.terminate().expect("foreign terminate");
-    // Release the member after the signal: a `terminate` that sent nothing lets it leave with 0,
-    // which the assertion on how it ended catches, where a read for an EOF would hang.
+    // Release after the kill: a kill that sent nothing lets it exit 0, failing the status assertion.
     drop(sock);
     let status = child.wait().expect("reap");
     assert_eq!(status.signal(), Some(libc::SIGTERM), "got {status:?}");
@@ -116,8 +115,7 @@ fn process_graceful_shutdown_escalates() {
     let (child, sock) = common::spawn_control("control-block-ignore-term", &["R"], false);
     let p = cosca::Process::from_pid(child.id().pid()).found().expect("resolves");
     p.graceful_shutdown(Duration::ZERO).expect("foreign escalates");
-    // Release the member after the call: an escalation that sent no `SIGKILL` lets it leave with 0,
-    // which the assertion on how it ended catches, where a read for an EOF would hang.
+    // Release after the kill: a kill that sent nothing lets it exit 0, failing the status assertion.
     drop(sock);
     let status = child.wait().expect("reap");
     assert_eq!(status.signal(), Some(libc::SIGKILL), "got {status:?}");
