@@ -13,6 +13,15 @@ enum Reap {
     Own,
     /// Another reaper in the process, behind the handle's back.
     Foreign,
+    /// A foreign reap that this handle's `try_wait` then observed: it forgets tokio's `Child`.
+    ForeignSeenByTryWait,
+    /// A foreign reap that this handle's `wait` then observed: it forgets tokio's `Child`.
+    ForeignSeenByWait,
+    /// A foreign reap that this handle's second `kill` then observed: it forgets tokio's `Child`.
+    ForeignSeenByKill,
+    /// As `ForeignSeenByKill`, but the kill's look at the root fails: it forgets tokio's `Child` as
+    /// not shown to be ours.
+    ForeignSeenByKillWithAFailedPeek,
 }
 
 /// The teardown under test.
@@ -32,6 +41,26 @@ async fn reap_root(child: &mut crate::tokio::Child, release: std::io::PipeWriter
             crate::test_child::assert_killed("the root", status);
         }
         Reap::Foreign => kill_and_reap_behind(child, release),
+        Reap::ForeignSeenByTryWait => {
+            kill_and_reap_behind(child, release);
+            child.try_wait().expect_err("a foreign reap answers ECHILD");
+        }
+        Reap::ForeignSeenByWait => {
+            kill_and_reap_behind(child, release);
+            child.wait().await.expect_err("a foreign reap answers ECHILD");
+        }
+        Reap::ForeignSeenByKill => {
+            kill_and_reap_behind(child, release);
+            child.kill().expect("a root reaped elsewhere has nothing left to kill");
+        }
+        Reap::ForeignSeenByKillWithAFailedPeek => {
+            use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peek_once};
+            kill_and_reap_behind(child, release);
+            let failed = force_peek_once(Err(std::io::Error::other("forced peek failure")));
+            child.kill().expect("a root reaped elsewhere has nothing left to kill");
+            assert_peeks_exhausted();
+            drop(failed);
+        }
     }
 }
 
@@ -105,11 +134,12 @@ async fn sends_nothing_to_an_empty_group_and_reports_no_skip(reap: Reap, teardow
         .map(|(_, text)| text)
         .collect();
     match reap {
-        Reap::Own => assert_eq!(warns, Vec::<String>::new(), "nothing was left behind"),
+        // A reap the handle saw forgot tokio's `Child`, and warned of it, before the teardown.
         Reap::Foreign => assert!(
-            warns.iter().all(|warn| warn.contains(FORGOT_TOKIO_CHILD)),
+            !warns.is_empty() && warns.iter().all(|warn| warn.contains(FORGOT_TOKIO_CHILD)),
             "only the forget of tokio's `Child` is warned of: {warns:?}"
         ),
+        _ => assert_eq!(warns, Vec::<String>::new(), "nothing was left behind"),
     }
 }
 
@@ -186,4 +216,134 @@ async fn a_failed_elevated_spawns_cleanup_after_a_foreign_reap_reports_no_skip_f
     #[fixture(pidfd_group_signal)] _group: &Group,
 ) {
     sends_nothing_to_an_empty_group_and_reports_no_skip(Reap::Foreign, Teardown::FinishElevated).await;
+}
+
+#[skuld::test]
+async fn a_drop_after_a_foreign_reap_seen_by_try_wait_kills_the_group_left_behind(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+) {
+    kills_the_group_left_behind(Reap::ForeignSeenByTryWait, Teardown::Drop).await;
+}
+
+#[skuld::test]
+async fn a_failed_elevated_spawns_cleanup_after_a_foreign_reap_seen_by_try_wait_kills_the_group_left_behind(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+) {
+    kills_the_group_left_behind(Reap::ForeignSeenByTryWait, Teardown::FinishElevated).await;
+}
+
+#[skuld::test]
+async fn a_drop_after_a_foreign_reap_seen_by_wait_kills_the_group_left_behind(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+) {
+    kills_the_group_left_behind(Reap::ForeignSeenByWait, Teardown::Drop).await;
+}
+
+#[skuld::test]
+async fn a_failed_elevated_spawns_cleanup_after_a_foreign_reap_seen_by_wait_kills_the_group_left_behind(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+) {
+    kills_the_group_left_behind(Reap::ForeignSeenByWait, Teardown::FinishElevated).await;
+}
+
+#[skuld::test]
+async fn a_drop_after_a_foreign_reap_seen_by_try_wait_below_6_9_sends_nothing_to_the_group() {
+    below_6_9_sends_nothing_to_the_group(Reap::ForeignSeenByTryWait, Teardown::Drop).await;
+}
+
+#[skuld::test]
+async fn a_failed_elevated_spawns_cleanup_after_a_foreign_reap_seen_by_try_wait_below_6_9_sends_nothing_to_the_group() {
+    below_6_9_sends_nothing_to_the_group(Reap::ForeignSeenByTryWait, Teardown::FinishElevated).await;
+}
+
+#[skuld::test]
+async fn a_drop_after_a_foreign_reap_seen_by_wait_below_6_9_sends_nothing_to_the_group() {
+    below_6_9_sends_nothing_to_the_group(Reap::ForeignSeenByWait, Teardown::Drop).await;
+}
+
+#[skuld::test]
+async fn a_failed_elevated_spawns_cleanup_after_a_foreign_reap_seen_by_wait_below_6_9_sends_nothing_to_the_group() {
+    below_6_9_sends_nothing_to_the_group(Reap::ForeignSeenByWait, Teardown::FinishElevated).await;
+}
+
+#[skuld::test]
+async fn a_drop_after_a_foreign_reap_seen_by_try_wait_sends_nothing_to_an_empty_group_and_reports_no_skip(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+) {
+    sends_nothing_to_an_empty_group_and_reports_no_skip(Reap::ForeignSeenByTryWait, Teardown::Drop).await;
+}
+
+#[skuld::test]
+async fn a_failed_elevated_spawns_cleanup_after_a_foreign_reap_seen_by_try_wait_sends_nothing_to_an_empty_group_and_reports_no_skip(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+) {
+    sends_nothing_to_an_empty_group_and_reports_no_skip(Reap::ForeignSeenByTryWait, Teardown::FinishElevated).await;
+}
+
+#[skuld::test]
+async fn a_drop_after_a_foreign_reap_seen_by_wait_sends_nothing_to_an_empty_group_and_reports_no_skip(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+) {
+    sends_nothing_to_an_empty_group_and_reports_no_skip(Reap::ForeignSeenByWait, Teardown::Drop).await;
+}
+
+#[skuld::test]
+async fn a_failed_elevated_spawns_cleanup_after_a_foreign_reap_seen_by_wait_sends_nothing_to_an_empty_group_and_reports_no_skip(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+) {
+    sends_nothing_to_an_empty_group_and_reports_no_skip(Reap::ForeignSeenByWait, Teardown::FinishElevated).await;
+}
+
+#[skuld::test]
+async fn a_drop_after_a_foreign_reap_seen_by_kill_kills_the_group_left_behind(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+) {
+    kills_the_group_left_behind(Reap::ForeignSeenByKill, Teardown::Drop).await;
+}
+
+#[skuld::test]
+async fn a_failed_elevated_spawns_cleanup_after_a_foreign_reap_seen_by_kill_kills_the_group_left_behind(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+) {
+    kills_the_group_left_behind(Reap::ForeignSeenByKill, Teardown::FinishElevated).await;
+}
+
+#[skuld::test]
+async fn a_drop_after_a_foreign_reap_seen_by_kill_below_6_9_sends_nothing_to_the_group() {
+    below_6_9_sends_nothing_to_the_group(Reap::ForeignSeenByKill, Teardown::Drop).await;
+}
+
+#[skuld::test]
+async fn a_failed_elevated_spawns_cleanup_after_a_foreign_reap_seen_by_kill_below_6_9_sends_nothing_to_the_group() {
+    below_6_9_sends_nothing_to_the_group(Reap::ForeignSeenByKill, Teardown::FinishElevated).await;
+}
+
+#[skuld::test]
+async fn a_drop_after_a_foreign_reap_seen_by_kill_sends_nothing_to_an_empty_group_and_reports_no_skip(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+) {
+    sends_nothing_to_an_empty_group_and_reports_no_skip(Reap::ForeignSeenByKill, Teardown::Drop).await;
+}
+
+#[skuld::test]
+async fn a_failed_elevated_spawns_cleanup_after_a_foreign_reap_seen_by_kill_sends_nothing_to_an_empty_group_and_reports_no_skip(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+) {
+    sends_nothing_to_an_empty_group_and_reports_no_skip(Reap::ForeignSeenByKill, Teardown::FinishElevated).await;
+}
+
+/// Mutant: "only a child shown reaped elsewhere keeps its pidfd".
+#[skuld::test]
+async fn a_drop_after_a_foreign_reap_seen_by_a_kill_whose_look_failed_kills_the_group_left_behind(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+) {
+    kills_the_group_left_behind(Reap::ForeignSeenByKillWithAFailedPeek, Teardown::Drop).await;
+}
+
+/// Mutant: "only a child shown reaped elsewhere keeps its pidfd".
+#[skuld::test]
+async fn a_failed_elevated_spawns_cleanup_after_a_foreign_reap_seen_by_a_kill_whose_look_failed_kills_the_group_left_behind(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+) {
+    kills_the_group_left_behind(Reap::ForeignSeenByKillWithAFailedPeek, Teardown::FinishElevated).await;
 }

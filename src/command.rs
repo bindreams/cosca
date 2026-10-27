@@ -494,9 +494,8 @@ impl Command {
     /// has a member left, and sends nothing and logs no skipped kill once it has none (the async
     /// drop after a foreign reap still warns that it forgot tokio's `Child`). A root whose
     /// handle cannot say whether it was reaped has its group killed the same way while the group has
-    /// a member. Not yet for an async handle whose `wait`, `try_wait` or `kill` saw the root reaped
-    /// elsewhere: it no longer holds the root's pidfd, so it treats the group as below 6.9. The rest
-    /// of this paragraph is about other mechanisms, kernels before 6.9 and macOS.
+    /// a member; an async handle keeps the root's pidfd when it forgets tokio's `Child`. The rest of
+    /// this paragraph is about other mechanisms, kernels before 6.9 and macOS.
     ///
     /// The root is reaped by [`wait`](crate::Child::wait), by a
     /// reaper outside the handle, or (on the sync handle) by the spawn itself, which reaps a root
@@ -573,11 +572,11 @@ impl Command {
     /// # A child reaped by something else
     /// Another reaper in the process (`SIGCHLD` set to `SIG_IGN`, `waitpid(-1, …)`) may reap the
     /// child. A cgroup kill stays exact (only the exit status is lost), and so, on Linux 6.9+, does a
-    /// process group's, through the root's pidfd (not yet an async handle's whose `wait`, `try_wait`
-    /// or `kill` saw the reap: it no longer holds the pidfd). Below 6.9 and on macOS, kills named by
-    /// the root's pid (a process group; a macOS fd marker's group and walk) are skipped on evidence
-    /// of a foreign reap, and
-    /// [`kill_tree`](crate::Child::kill_tree), [`terminate_tree`](crate::Child::terminate_tree) and
+    /// process group's, through the root's pidfd (an async handle keeps it when it forgets tokio's
+    /// `Child`). Below 6.9 and on macOS, kills named by the root's pid (a
+    /// process group; a macOS fd marker's group and walk) are skipped on evidence of a foreign reap,
+    /// and [`kill_tree`](crate::Child::kill_tree),
+    /// [`terminate_tree`](crate::Child::terminate_tree) and
     /// [`graceful_shutdown_tree`](crate::Child::graceful_shutdown_tree) return
     /// [`Error::Unassessable`](crate::error::Error::Unassessable); see `kill_tree` for the rest.
     /// macOS has no pidfd, so cosca has no exact kill of the root there.

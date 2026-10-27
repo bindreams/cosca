@@ -282,8 +282,7 @@ impl Child {
     /// each in-flight call occupies one blocking-pool thread for up to `grace` — size the
     /// pool accordingly for many long concurrent shutdowns.
     ///
-    /// **A root reaped by something else** (see [`kill_tree`](Child::kill_tree), and its exception
-    /// for a reap this handle saw):
+    /// **A root reaped by something else** (see [`kill_tree`](Child::kill_tree)):
     ///
     /// - On Linux 6.9+ a process group that still has a member gets the `SIGTERM` through the
     ///   root's pidfd, then the sweep at once: the grace watches only the root, which is gone. One
@@ -299,10 +298,12 @@ impl Child {
     /// On Linux, a root whose handle cannot say whether it was reaped still gets the `SIGTERM`
     /// through its pidfd, which names it exactly, then the grace, and a kill through the pidfd if
     /// it is still running; nothing goes out by its number, and the call ends the same way. On 6.9+
-    /// its group is shut down as usual while it has a member. After this handle's own reap, with
-    /// another process at the pid, the group is empty: only the holders get the `SIGTERM`, and the
-    /// call goes on as usual. The `SIGTERM` and the sweep each decide on a look of their own at the
-    /// root, and each send by the group's number after it is checked as for `kill_tree`.
+    /// its group is shut down as usual while it has a member, and the call then returns
+    /// [`Error::Unassessable`](crate::error::Error::Unassessable): no status is collected. After
+    /// this handle's own reap, with another process at the pid, the group is empty: only the holders
+    /// get the `SIGTERM`, and the call goes on as usual. The `SIGTERM` and the sweep each decide on a
+    /// look of their own at the root, and each send by the group's number after it is checked as for
+    /// `kill_tree`.
     ///
     /// **macOS, a root the handle cannot vouch for** is signalled as for
     /// [`terminate_tree`](Child::terminate_tree) and swept as for [`kill_tree`](Child::kill_tree). A
@@ -472,6 +473,10 @@ impl Child {
                 self.id().pid(),
                 "graceful_shutdown_tree",
             ));
+        }
+        #[cfg(unix)]
+        if self.os.proc.as_ref().is_some_and(|proc| proc.forgot_unproven()) {
+            return Err(crate::child::tree_call::status_of_an_unproven_root(self.id().pid()));
         }
         #[cfg(unix)]
         let status = crate::child::tree_call::status_unless_reaped_elsewhere(self.wait().await, self.id().pid())?;

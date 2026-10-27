@@ -563,6 +563,19 @@ pub(crate) fn status_unless_reaped_elsewhere(
     }
 }
 
+/// The async `graceful_shutdown_tree`'s answer once the tree is down, for a root whose handle was
+/// forgotten because it could not be shown to be ours: no exit status is collected from it.
+#[cfg(feature = "tokio")]
+pub(crate) fn status_of_an_unproven_root(pid: RawPid) -> Error {
+    Error::Unassessable {
+        detail: format!(
+            "pid {pid}: graceful_shutdown_tree brought the tree down, but its exit status cannot be \
+             collected: the root's handle could not say whether it was reaped"
+        ),
+        source: None,
+    }
+}
+
 #[cfg(test)]
 #[path = "tree_call_tests.rs"]
 mod tree_call_tests;
