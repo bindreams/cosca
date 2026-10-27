@@ -286,13 +286,13 @@ jobs:
         run: |
           set -uo pipefail
           tb="target/$TARGET/debug/cosca_testbin"
-          "$tb" audit-enabled; echo "plain cargo build: testbin audit-enabled exit=$? (expect 1)"
+          r=0; "$tb" audit-enabled || r=$?; echo "plain cargo build: testbin audit-enabled exit=$r (expect 1)"
           cargo build --locked --target "$TARGET" --bin cosca_testbin
-          "$tb" audit-enabled; echo "standalone --bin cosca_testbin: exit=$? (expect 1)"
+          r=0; "$tb" audit-enabled || r=$?; echo "standalone --bin cosca_testbin: exit=$r (expect 1)"
           cargo build --locked --target "$TARGET" --bin cosca_testbin --features __test_hooks
-          "$tb" audit-enabled; echo "standalone --features __test_hooks: exit=$? (expect 0)"
+          r=0; "$tb" audit-enabled || r=$?; echo "standalone --features __test_hooks: exit=$r (expect 0)"
           cargo build --locked --target "$TARGET"
-          "$tb" audit-enabled; echo "plain cargo build again: exit=$? (expect 1)"
+          r=0; "$tb" audit-enabled || r=$?; echo "plain cargo build again: exit=$r (expect 1)"
 
       # Each nextest step is a build step (unbounded: compile time varies with the cache) and a run
       # step bounded above the largest per-test bound in `.config/nextest.toml` (5 x 60s + 1s grace)
@@ -312,7 +312,7 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           set -uxo pipefail
-          "target/$TARGET/debug/cosca_testbin" audit-enabled; echo "after nextest --no-run: testbin exit=$? (expect 0)"
+          r=0; "target/$TARGET/debug/cosca_testbin" audit-enabled || r=$?; echo "after nextest --no-run: testbin exit=$r (expect 0)"
           cargo nextest archive --locked --target "$TARGET" --archive-file "$RUNNER_TEMP/spike.tar.zst"
           cargo nextest run --archive-file "$RUNNER_TEMP/spike.tar.zst" --extract-to "$RUNNER_TEMP/spike-extract" --workspace-remap "$PWD" --no-tests=fail             -E 'test(=audit_tests::test_hooks_reach_the_lib_unit_tests) | test(=test_hooks_reach_the_integration_test_and_the_testbin)'
 
