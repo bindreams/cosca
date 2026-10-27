@@ -83,7 +83,12 @@ fn host_filesystem_probes_a_temp_directory() {
     assert_ne!(dotted, file_p);
     assert!(fs.same_file(&dotted, &file_p).unwrap());
     assert!(!fs.same_file(&file_p, &dir_p).unwrap());
-    assert!(fs.same_file(&file_p, &host(&dir.path().join("missing"))).is_err());
+    assert_eq!(
+        fs.same_file(&file_p, &host(&dir.path().join("missing")))
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::NotFound
+    );
 
     // `canonical` resolves the path, not echoes it: `dir/./file` and `dir/file` canonicalise alike,
     // and the Windows `\\?\` prefix `std` adds does not leak.
@@ -148,5 +153,111 @@ fn host_filesystem_follows_a_link() {
     assert_eq!(
         fs.canonical(&host(&link)).unwrap(),
         host(&std::fs::canonicalize(&file).unwrap())
+    );
+}
+
+/// `same_file` examines identity without opening for data: a file the caller may execute but not
+/// read is `Ok`, as it is for `is_file`.
+///
+/// Mutant: `same_file` opens the paths for reading (`EACCES`). Run as root the mutant passes,
+/// since root reads any file.
+#[cfg(unix)]
+#[skuld::test]
+fn host_filesystem_same_file_needs_no_read_access() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let tool = dir.path().join("tool");
+    let other = dir.path().join("other");
+    std::fs::write(&tool, b"").unwrap();
+    std::fs::write(&other, b"").unwrap();
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o111)).unwrap();
+    let (tool, other) = (host(&tool), host(&other));
+    let fs = HostFilesystem;
+
+    assert!(fs.is_file(&tool).unwrap());
+    assert!(fs.same_file(&tool, &tool).unwrap());
+    assert!(!fs.same_file(&tool, &other).unwrap());
+}
+
+/// `same_file` does not wait for a writer on a FIFO.
+///
+/// Mutant: `same_file` opens the paths, which blocks until a writer appears. The bound for that
+/// hang is the `slow-timeout` override in `.config/nextest.toml`.
+#[cfg(unix)]
+#[skuld::test]
+fn host_filesystem_same_file_does_not_block_on_a_fifo() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("fifo");
+    let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    // SAFETY: `c_path` is a NUL-terminated string that outlives the call.
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0, "mkfifo");
+    let fifo = host(&fifo);
+    let fs = HostFilesystem;
+
+    assert!(fs.same_file(&fifo, &fifo).unwrap());
+    assert!(!fs.same_file(&fifo, &host(dir.path())).unwrap());
+}
+
+/// `same_file` examines identity without data access or a share mode of its own: a file another
+/// handle holds with share mode 0 is `Ok`, as it is for `is_file`.
+///
+/// Mutant: `same_file` opens the paths for reading, which a share-mode-0 holder refuses
+/// (`ERROR_SHARING_VIOLATION`).
+#[cfg(windows)]
+#[skuld::test]
+fn host_filesystem_same_file_ignores_an_exclusive_holder() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let held = dir.path().join("held");
+    let other = dir.path().join("other");
+    std::fs::write(&held, b"").unwrap();
+    std::fs::write(&other, b"").unwrap();
+    let _holder = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&held)
+        .unwrap();
+    let (held, other) = (host(&held), host(&other));
+    let fs = HostFilesystem;
+
+    assert!(fs.is_file(&held).unwrap());
+    assert!(fs.same_file(&held, &held).unwrap());
+    assert!(!fs.same_file(&held, &other).unwrap());
+}
+
+/// Identity on Windows: a directory is a file for `same_file`, two names of one file are one file,
+/// two files are two, and a missing path is `NotFound`.
+///
+/// Mutants: no `FILE_FLAG_BACKUP_SEMANTICS` (a directory cannot be opened); comparing the volume
+/// only; comparing the file id only when the volume differs.
+#[cfg(windows)]
+#[skuld::test]
+fn host_filesystem_same_file_identifies_by_file_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("file");
+    let link = dir.path().join("link");
+    let other = dir.path().join("other");
+    std::fs::write(&file, b"").unwrap();
+    std::fs::write(&other, b"").unwrap();
+    std::fs::hard_link(&file, &link).unwrap();
+    let (dir_p, file_p, link_p, other_p) = (host(dir.path()), host(&file), host(&link), host(&other));
+    let fs = HostFilesystem;
+
+    assert!(fs.same_file(&dir_p, &dir_p).unwrap());
+    assert!(!fs.same_file(&dir_p, &file_p).unwrap());
+    assert!(fs.same_file(&file_p, &link_p).unwrap());
+    assert!(!fs.same_file(&file_p, &other_p).unwrap());
+    let missing = host(&dir.path().join("missing"));
+    assert_eq!(
+        fs.same_file(&file_p, &missing).unwrap_err().kind(),
+        io::ErrorKind::NotFound
+    );
+    assert_eq!(
+        fs.same_file(&missing, &file_p).unwrap_err().kind(),
+        io::ErrorKind::NotFound
     );
 }
