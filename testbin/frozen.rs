@@ -95,9 +95,10 @@ pub fn spawn_frozen_report(addr: &str, backend: &str) -> ! {
     let child_pid = frozen.id().pid();
     writeln!(
         sock,
-        "frozen pid={child_pid} containment={:?} job={}",
+        "frozen pid={child_pid} containment={:?} job={} kill_on_close={}",
         frozen.test_containment(),
         u8::from(frozen.test_job_handle_contains_self()),
+        u8::from(frozen.test_job_kills_on_close()),
     )
     .expect("report");
     sock.flush().expect("flush");
@@ -117,9 +118,10 @@ pub fn spawn_frozen_report_async(addr: &str, backend: &str) -> ! {
     let child_pid = frozen.id().pid();
     writeln!(
         sock,
-        "frozen pid={child_pid} containment={:?} job={}",
+        "frozen pid={child_pid} containment={:?} job={} kill_on_close={}",
         frozen.test_containment(),
         u8::from(frozen.test_job_handle_contains_self()),
+        u8::from(frozen.test_job_kills_on_close()),
     )
     .expect("report");
     sock.flush().expect("flush");
