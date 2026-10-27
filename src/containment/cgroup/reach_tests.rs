@@ -22,7 +22,7 @@ fn own_pidfd() -> OwnedFd {
 
 fn subtree(leaf_id: u64, killed: bool) -> Subtree {
     Subtree::new(
-        leaf_id,
+        Some(leaf_id),
         None,
         None,
         crate::containment::cgroup::Swept::default(),
@@ -53,7 +53,7 @@ fn stand_in_subtree(stat: Option<&str>) -> (Subtree, tempfile::TempDir) {
 /// A subtree of the leaf `fd` holds, with a path, killed through.
 fn subtree_of(fd: OwnedFd, swept: crate::containment::cgroup::Swept) -> Subtree {
     Subtree::new(
-        HIGH,
+        Some(HIGH),
         Some(Arc::new(fd)),
         Some("/stand-in-leaf".to_owned()),
         swept,
@@ -284,7 +284,7 @@ fn cgroup_a_task_in_a_cgroup_the_sweep_removed_is_in_the_subtree(#[fixture(cgrou
     assert_eq!(leaf.remove_children().expect("sweep"), 1);
     leaf.rmdir().expect("remove the scratch leaf");
     let subtree = Subtree::new(
-        HIGH,
+        Some(HIGH),
         Some(leaf.shared()),
         Some("/stand-in-leaf".to_owned()),
         leaf.swept(),
