@@ -181,12 +181,17 @@ pub(crate) fn via_pidfd(pidfd: Option<std::os::fd::BorrowedFd<'_>>, pid: u32, si
         return Ok(Sent::Gone);
     };
     #[cfg(test)]
-    crate::send_log::record(pid, sig, crate::send_log::Via::Pidfd);
+    let seam = seams::kills_refused();
+    #[cfg(not(test))]
+    let seam: Option<i32> = None;
+    let sent = match seam {
+        Some(errno) => Err(rustix::io::Errno::from_raw_os_error(errno)),
+        None => rustix::process::pidfd_send_signal(pidfd, sig.as_rustix()),
+    };
+    // After the syscall, whatever it answered: a send that was skipped leaves no record.
     #[cfg(test)]
-    if let Some(errno) = seams::kills_refused() {
-        return Err(io_context("pidfd_send_signal", io::Error::from_raw_os_error(errno)));
-    }
-    match rustix::process::pidfd_send_signal(pidfd, sig.as_rustix()) {
+    crate::send_log::record(pid, sig, crate::send_log::Via::Pidfd);
+    match sent {
         Ok(()) => Ok(Sent::Delivered),
         Err(rustix::io::Errno::SRCH) => {
             log::debug!("pidfd_send_signal({sig:?}) to child {pid}: it is already gone");
@@ -254,21 +259,26 @@ pub(crate) fn via_verified_pid(pid: u32, identity: Option<u64>, sig: Sig) -> io:
         )));
     };
     #[cfg(test)]
-    crate::send_log::record(pid, sig, crate::send_log::Via::Pid);
+    let seam = seams::kills_refused();
+    #[cfg(not(test))]
+    let seam: Option<i32> = None;
+    let sent = match seam {
+        Some(errno) => Err(io::Error::from_raw_os_error(errno)),
+        // SAFETY: `target` is a positive pid, so the signal goes to one process.
+        None if unsafe { libc::kill(target, sig.as_libc()) } == 0 => Ok(()),
+        None => Err(io::Error::last_os_error()),
+    };
+    // After the syscall, whatever it answered: a send that was skipped leaves no record.
     #[cfg(test)]
-    if let Some(errno) = seams::kills_refused() {
-        return Err(io_context("kill", io::Error::from_raw_os_error(errno)));
+    crate::send_log::record(pid, sig, crate::send_log::Via::Pid);
+    match sent {
+        Ok(()) => Ok(Sent::Delivered),
+        Err(e) if e.raw_os_error() == Some(libc::ESRCH) => {
+            log::debug!("kill({pid}, {sig:?}): the child is already gone");
+            Ok(Sent::Gone)
+        }
+        Err(e) => Err(io_context("kill", e)),
     }
-    // SAFETY: `target` is a positive pid, so the signal goes to one process.
-    if unsafe { libc::kill(target, sig.as_libc()) } == 0 {
-        return Ok(Sent::Delivered);
-    }
-    let e = io::Error::last_os_error();
-    if e.raw_os_error() == Some(libc::ESRCH) {
-        log::debug!("kill({pid}, {sig:?}): the child is already gone");
-        return Ok(Sent::Gone);
-    }
-    Err(io_context("kill", e))
 }
 
 /// Test seam: while the guard lives, every kill sent on this thread is refused with `EPERM` and

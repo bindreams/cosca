@@ -186,13 +186,16 @@ fn identity_resolves_an_exited_unreaped_child() {
 #[cfg(unix)]
 #[skuld::test]
 fn identity_survives_the_alive_to_zombie_transition() {
-    // _sock must stay alive: dropping our socket end would unblock the child early.
-    let (child, _sock) = common::spawn_blocker();
+    // The socket stays open until the kill is sent: dropping our end earlier would unblock the child.
+    let (child, sock) = common::spawn_blocker();
     let id = ProcessId::of(child.id().pid()).found().expect("live child resolves");
     assert_eq!(id.exists(), cosca::identity::Existence::Present, "live child exists");
     assert_eq!(id.is_alive(), cosca::identity::Liveness::Alive, "live child is alive");
     child.kill().expect("kill");
-    common::block_until_zombie(child.id().pid());
+    // Release the member: it leaves with 0 on the release, so a `kill` that sent nothing fails the
+    // signal assertion instead of leaving the wait for the zombie unbounded.
+    drop(sock);
+    common::assert_killed("the killed child", common::zombie_exit_status(child.id().pid()));
     assert_eq!(
         id.exists(),
         cosca::identity::Existence::Present,

@@ -55,7 +55,8 @@ fn kill_tree_succeeds_on_a_retry_after_the_view_recovers() {
 fn drop_over_an_untrusted_view_kills_the_root_and_warns_of_orphans() {
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
-    let (child, _stdin) = treewalk_blocker();
+    let (child, stdin) = treewalk_blocker();
+    let blocker = crate::child::spawn::fault::release_at_drop_kill(stdin);
     let id = child.id();
     // The drop reads the root's number first, which would consume the one-shot forced view before
     // the tree kill sees it: pin that read to "still this root".
@@ -63,6 +64,7 @@ fn drop_over_an_untrusted_view_kills_the_root_and_warns_of_orphans() {
     let forced = force_proc_view_once(ForcedView::Diverged);
     drop(child);
     drop(forced);
+    blocker.assert_killed();
     let records = crate::log_capture::records_since_on_current_thread(mark, "Child::drop");
     assert!(
         records

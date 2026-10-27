@@ -228,7 +228,10 @@ pub(crate) fn failed_password_write_detail(child: crate::Child) -> (String, crat
 /// returned.
 #[skuld::test]
 fn graceful_shutdown_of_a_front_that_exits_within_the_grace_returns_its_status() {
-    let (child, _stdin) = spawn_as(cat(), ElevatedVia::Wrapped(Backend::Sudo));
+    let (child, stdin) = spawn_as(cat(), ElevatedVia::Wrapped(Backend::Sudo));
+    // Released once the `SIGTERM` has been sent (see `release_at`): a `terminate` that sent nothing
+    // lets the `cat` exit 0 and fails the assertion below, where the hour of grace would not end.
+    let _release = crate::graceful_hooks::release_at(crate::graceful_hooks::HookPoint::AfterTerminate, stdin);
     let status = child
         .graceful_shutdown(Duration::from_secs(3600))
         .expect("the relayed SIGTERM ends the front");

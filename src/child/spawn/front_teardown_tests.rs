@@ -99,7 +99,7 @@ fn cgroup_a_front_the_leaf_kill_reached_is_waited_for_and_reaped(#[fixture(cgrou
 /// landed, but did not reach it, and it may run on.
 #[skuld::test]
 fn cgroup_a_front_outside_its_leaf_is_left_unwaited(#[fixture(cgroup)] _group: &Group) {
-    let (child, pid, _stdin) = contained_cat();
+    let (child, pid, stdin) = contained_cat();
     let id = Some(child.id());
     let observer = pidfd_of(pid);
     let subtree = leaf_of(&child).subtree().expect("the leaf's subtree");
@@ -125,7 +125,10 @@ fn cgroup_a_front_outside_its_leaf_is_left_unwaited(#[fixture(cgroup)] _group: &
     // The test's own cleanup: the cat it moved out of the leaf.
     let mut cleanup = PidfdChild::new(Some(pid), observer);
     cleanup.kill().expect("kill the moved cat");
-    cleanup.wait().expect("reap the moved cat");
+    // Released after the kill, so a kill that sent nothing ends the cat with 0 and fails the
+    // assertion instead of hanging the reap.
+    drop(stdin);
+    crate::test_child::assert_killed("the moved cat", cleanup.wait().expect("reap the moved cat"));
 }
 
 /// A front in its leaf whose kill failed is not waited for: nothing reached it, and it may run on.

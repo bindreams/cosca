@@ -114,8 +114,9 @@ pub fn stdin_blocker_program() -> std::path::PathBuf {
     }
 }
 
-/// The child of [`stdin_blocker_program`] died to a kill, not by exiting on its own once its
-/// stdin closed: `SIGKILL` on Unix, a non-zero exit on Windows.
+/// The child died to a kill, not by exiting on its own once released (its stdin or control socket
+/// closed): `SIGKILL` on Unix, the kill's exit code `1` on Windows. A crash on the release (a
+/// panic's `101`, say) fails too.
 pub fn assert_killed(who: &str, status: std::process::ExitStatus) {
     #[cfg(unix)]
     {
@@ -127,10 +128,32 @@ pub fn assert_killed(who: &str, status: std::process::ExitStatus) {
         );
     }
     #[cfg(windows)]
-    assert!(
-        !status.success(),
-        "{who} must be killed, not exit on its own: {status:?}"
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "{who} must be killed (exit code 1), not exit on its own: {status:?}"
     );
+}
+
+/// `kill` a `control-block` family child, release its control socket, then reap it and assert it
+/// died to the kill. The member leaves with 0 when released, so a `kill` that sent nothing fails
+/// the assertion where a bare `kill` then `wait` would block forever.
+pub fn kill_release_reap(child: &cosca::Child, control: TcpStream) -> std::process::ExitStatus {
+    child.kill().expect("kill");
+    drop(control);
+    let status = child.wait().expect("reap the killed child");
+    assert_killed("the killed child", status);
+    status
+}
+
+/// [`kill_release_reap`] for the tokio `Child`.
+#[cfg(feature = "tokio")]
+pub async fn kill_release_reap_async(child: &mut cosca::tokio::Child, control: TcpStream) -> std::process::ExitStatus {
+    child.kill().expect("kill");
+    drop(control);
+    let status = child.wait().await.expect("reap the killed child");
+    assert_killed("the killed child", status);
+    status
 }
 
 /// Block until `pid` — which MUST be an unreaped child of this process — has exited AND become
@@ -528,6 +551,18 @@ pub fn bind_async_listener() -> (::tokio::net::TcpListener, String) {
 /// sends its tag before the helper returns), optionally contained.
 #[cfg(feature = "tokio")]
 pub async fn spawn_control_async(mode: &str, extra: &[&str], contain: bool) -> (cosca::tokio::Child, TcpStream) {
+    spawn_control_async_with(mode, extra, contain, |_| {}).await
+}
+
+/// [`spawn_control_async`] with the command further configured by `configure` (an env var, say)
+/// before the spawn.
+#[cfg(feature = "tokio")]
+pub async fn spawn_control_async_with(
+    mode: &str,
+    extra: &[&str],
+    contain: bool,
+    configure: impl FnOnce(&mut cosca::tokio::Command),
+) -> (cosca::tokio::Child, TcpStream) {
     let (listener, addr) = bind_async_listener();
     let mut argv: Vec<String> = vec!["cosca_testbin".into(), mode.into(), addr];
     argv.extend(extra.iter().map(|s| s.to_string()));
@@ -545,6 +580,7 @@ pub async fn spawn_control_async(mode: &str, extra: &[&str], contain: bool) -> (
     } else {
         cmd.executable(testbin()).args(&argv); // uncontained → the async raw backend
     }
+    configure(&mut cmd);
     let mut child = cmd.spawn().expect("spawn async control child");
     let mut sock = accept_or_die_async(&listener, &mut child).await;
     let mut tag = [0u8; 1];

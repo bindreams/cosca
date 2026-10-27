@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent};
 
-use super::{fill_pipe_to_capacity, fionread, marker_pipe, spawn_marker_holder};
+use super::{fill_pipe_to_capacity, fionread, kill_release_reap, marker_pipe, spawn_marker_holder};
 use crate::containment::marker_eof::{arm, block_until_drained, drain_test_hooks, interpret_read_event, probe};
 use crate::containment::TreeDrain;
 use crate::wait::backend::test_hooks;
@@ -87,7 +87,7 @@ fn a_quiet_live_holder_resolves_in_one_real_blocking_kevent_call() {
     // itself. Under the REAL clock, a boundary race (the kernel's own timeout firing a hair
     // before `Instant::now()` agrees) could legitimately need a 2nd, near-instant round.
     let _hook_guard = test_hooks::HookGuard::install(|_round, _kq| {});
-    let (child, marker, _stdin) = spawn_marker_holder("exec cat >/dev/null");
+    let (child, marker, stdin) = spawn_marker_holder("exec cat >/dev/null");
     let (_clock_guard, frozen_now) = test_clock::FrozenClockGuard::install();
     let deadline = frozen_now.checked_add(Duration::from_millis(300)).expect("deadline");
 
@@ -102,8 +102,7 @@ fn a_quiet_live_holder_resolves_in_one_real_blocking_kevent_call() {
          would mean a busy-poll, not a genuine kernel block"
     );
 
-    child.kill().expect("kill");
-    child.wait().expect("reap");
+    kill_release_reap(child, stdin);
 }
 
 #[skuld::test]
@@ -136,8 +135,8 @@ fn block_until_drained_never_returns_before_a_real_deadline() {
         "must never return before the deadline: now={now:?}, deadline={deadline:?}"
     );
 
-    child.kill().expect("kill the sustained writer");
-    child.wait().expect("reap");
+    // `yes` blocks writing to the full pipe; closing its read end is what ends it after the kill.
+    kill_release_reap(child, marker);
 }
 
 #[skuld::test]
@@ -245,8 +244,7 @@ fn a_sustained_writer_is_checked_against_the_deadline_every_round() {
          not merely resolved via a bare Ok(0)"
     );
 
-    child.kill().expect("kill the sustained writer");
-    child.wait().expect("reap");
+    kill_release_reap(child, marker);
 }
 
 #[skuld::test]
@@ -292,9 +290,7 @@ fn an_event_that_arrives_after_the_clock_moves_past_the_deadline_mid_round_does_
          WHILE the kevent call was blocked, must not drain"
     );
 
-    drop(stdin);
-    child.kill().expect("kill");
-    child.wait().expect("reap");
+    kill_release_reap(child, stdin);
 }
 
 #[skuld::test]
@@ -309,7 +305,7 @@ fn a_spurious_ok0_under_a_frozen_clock_retries_until_the_clock_advances() {
     // open. Round 0 genuinely, quickly times out; the re-check refuses to trust it (spurious,
     // retried); only round 1's hook — moving the SAME frozen clock past the deadline before its
     // own `remaining` is computed — lets the wait conclude.
-    let (child, marker, _stdin) = spawn_marker_holder("exec cat >/dev/null");
+    let (child, marker, stdin) = spawn_marker_holder("exec cat >/dev/null");
     let (_clock_guard, frozen_now) = test_clock::FrozenClockGuard::install();
     let one_year = Duration::from_secs(365 * 24 * 3600);
     let deadline = frozen_now.checked_add(one_year).expect("deadline");
@@ -341,8 +337,7 @@ fn a_spurious_ok0_under_a_frozen_clock_retries_until_the_clock_advances() {
          remaining(deadline) was real, not incidental"
     );
 
-    child.kill().expect("kill");
-    child.wait().expect("reap");
+    kill_release_reap(child, stdin);
 }
 
 #[skuld::test]
@@ -364,13 +359,14 @@ fn an_unbounded_wait_against_a_sustained_writer_blocks_without_spending_cpu() {
     //
     // `spawn_marker_holder` gives the child a REAL stdin pipe this test holds open: under
     // nextest, an unredirected stdin is `/dev/null`, so `exec cat >/dev/null` would see
-    // immediate EOF and exit at once instead of parking. `_stdin` stays bound until after the
-    // wait concludes.
+    // immediate EOF and exit at once instead of parking. `stdin` stays bound until the hook
+    // kills the writer, then is released so a `kill` that sends nothing fails an assertion in the
+    // hook instead of hanging its `wait`.
     let cap = measure_pipe_capacity();
-    let (child, marker, _stdin) = spawn_marker_holder(&format!("yes | head -c {cap} >&3; exec cat >/dev/null"));
+    let (child, marker, stdin) = spawn_marker_holder(&format!("yes | head -c {cap} >&3; exec cat >/dev/null"));
     let raw_fd = marker.as_raw_fd();
 
-    let mut child_opt = Some(child);
+    let mut child_opt = Some((child, stdin));
     let _hook_guard = test_hooks::HookGuard::install(move |round, kq| {
         assert!(
             round <= 1,
@@ -417,9 +413,8 @@ fn an_unbounded_wait_against_a_sustained_writer_blocks_without_spending_cpu() {
              EV_CLEAR appears unset on the armed knote"
         );
 
-        let child = child_opt.take().expect("round 1 fires exactly once");
-        child.kill().expect("kill the sustained writer");
-        child.wait().expect("reap");
+        let (child, stdin) = child_opt.take().expect("round 1 fires exactly once");
+        kill_release_reap(child, stdin);
     });
 
     let verdict = block_until_drained(marker.as_fd(), None).expect("unbounded wait against a sustained writer");
@@ -442,7 +437,7 @@ fn arm_sets_ev_clear_so_a_repeated_poll_without_a_new_edge_reports_nothing() {
     // White-box proof `arm` requests `EV_CLEAR`: a level that crossed the clamp once and has
     // stayed there ever since, unchanged and undrained, must not re-fire.
     let cap = measure_pipe_capacity();
-    let (child, marker, _stdin) = spawn_marker_holder(&format!("yes | head -c {cap} >&3; exec cat >/dev/null"));
+    let (child, marker, stdin) = spawn_marker_holder(&format!("yes | head -c {cap} >&3; exec cat >/dev/null"));
     let kq = arm(marker.as_fd(), false).expect("arm");
     let mut events = [KEvent::new(
         0,
@@ -469,15 +464,14 @@ fn arm_sets_ev_clear_so_a_repeated_poll_without_a_new_edge_reports_nothing() {
         "EV_CLEAR must suppress a re-poll of an unchanged level — got {n2} events"
     );
 
-    child.kill().expect("kill");
-    child.wait().expect("reap");
+    kill_release_reap(child, stdin);
 }
 
 #[skuld::test]
 fn interpret_read_event_suppresses_drain_when_told_to() {
     // White-box: `suppress_drain = true` must never consume bytes, exercised with a real event.
     let cap = measure_pipe_capacity();
-    let (child, marker, _stdin) = spawn_marker_holder(&format!("yes | head -c {cap} >&3; exec cat >/dev/null"));
+    let (child, marker, stdin) = spawn_marker_holder(&format!("yes | head -c {cap} >&3; exec cat >/dev/null"));
     let kq = arm(marker.as_fd(), true).expect("arm");
     let mut events = [KEvent::new(
         0,
@@ -500,8 +494,7 @@ fn interpret_read_event_suppresses_drain_when_told_to() {
     );
     assert_eq!(after, before, "suppress_drain=true must never consume any bytes");
 
-    child.kill().expect("kill");
-    child.wait().expect("reap");
+    kill_release_reap(child, stdin);
 }
 
 #[skuld::test]
@@ -526,7 +519,8 @@ fn probe_never_drains_even_past_the_low_water_clamp() {
         crate::Stdio::from_file(std::fs::File::from(std::os::fd::OwnedFd::from(marker_w))),
     )
     .expect("marker pipe");
-    let child = cmd.spawn().expect("spawn /bin/sh");
+    let mut child = cmd.spawn().expect("spawn /bin/sh");
+    let stdin = child.fd_write_end(crate::Fd::STDIN).expect("stdin write end");
     let fd = marker_r.as_fd();
     assert_eq!(
         child.try_wait().expect("try_wait"),
@@ -553,6 +547,5 @@ fn probe_never_drains_even_past_the_low_water_clamp() {
         "probe is a check at expiry (principle 13) and must never drain"
     );
 
-    child.kill().expect("kill");
-    child.wait().expect("reap");
+    kill_release_reap(child, stdin);
 }

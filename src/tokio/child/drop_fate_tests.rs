@@ -233,9 +233,13 @@ fn record_waits(id: crate::identity::ProcessId) -> bool {
 async fn reaped_is_reported_only_for_a_status_that_was_collected() {
     crate::tokio::test_runtime::assert_current_thread();
     // `wait_and_reap_blocking`, after a kill.
-    let (mut child, _writer) = live(true);
+    let (mut child, writer) = live(true);
     let id = child.id();
     child.kill().expect("kill");
+    // Released after the kill, so a `kill` that sent nothing fails the assertion on how the child
+    // ended, not the blocking wait below.
+    drop(writer);
+    crate::test_child::assert_zombie_sigkilled("the killed child", id.pid());
     let (fate, _) = child.wait_and_reap_blocking();
     let waiting = record_waits(id);
     assert_eq!(fate, ChildFate::Reaped);

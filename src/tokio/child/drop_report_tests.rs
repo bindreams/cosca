@@ -215,11 +215,11 @@ mod linux {
     async fn finish_elevated_names_why_the_wait_found_the_child_foreign() {
         crate::log_capture::install();
         let _recorder = crate::containment::unix::fault::record_kill_group();
-        let (child, _writer) = session_blocker(true);
+        let (child, writer) = session_blocker(true);
         let pid = child.id().pid();
         let mark = crate::log_capture::mark();
         let _reap = crate::child::spawn::fault::set_between_kill_and_wait(move || {
-            crate::tokio::child::child_reap_tests::reap_behind_the_owner(pid);
+            crate::tokio::child::child_reap_tests::release_then_reap_behind_the_owner(pid, writer);
         });
 
         let err = crate::tokio::spawn::finish_elevated(child, Err(crate::error::Error::Io(std::io::Error::other("w"))))
@@ -298,7 +298,9 @@ mod linux {
     async fn the_cleanups_read_names_the_cleanup() {
         crate::log_capture::install();
         let _recorder = crate::containment::unix::fault::record_kill_group();
-        let (child, _writer) = session_blocker(true);
+        let (child, writer) = session_blocker(true);
+        // Released once the cleanup's root kill returned, before its reap.
+        let teardown = crate::child::spawn::fault::release_between_kill_and_wait(writer);
         let mark = crate::log_capture::mark();
         // The number is unreadable too, so the read says so in a `debug` line of its own.
         let _number = crate::child::fault::force_next_root_read(crate::identity::Resolved::Unknown);
@@ -308,6 +310,7 @@ mod linux {
             .expect_err("the spawn fails");
 
         assert_peeks_exhausted();
+        teardown.assert_killed();
         let read = crate::log_capture::records_since_on_current_thread(mark, "could not be read either");
         assert_eq!(read.len(), 1, "{read:?} ({err:?})");
         assert!(read[0].1.starts_with("finish_elevated:"), "{read:?}");
@@ -356,12 +359,12 @@ mod linux {
     async fn reap_now_warns_once_for_a_foreign_reap_during_its_wait() {
         crate::log_capture::install();
         let _recorder = crate::containment::unix::fault::record_kill_group();
-        let (mut child, _writer) = session_blocker(false);
+        let (mut child, writer) = session_blocker(false);
         let pid = child.id().pid();
         let proc = child.os.proc.take().expect("the backend");
         let mark = crate::log_capture::mark();
         let _reap = crate::child::spawn::fault::set_between_kill_and_wait(move || {
-            crate::tokio::child::child_reap_tests::reap_behind_the_owner(pid);
+            crate::tokio::child::child_reap_tests::release_then_reap_behind_the_owner(pid, writer);
         });
 
         proc.reap_now(pid, None);
