@@ -139,9 +139,10 @@ fn samples() -> Vec<String> {
 }
 
 /// For every sample, a device to Win32 is refused as a reserved name; for every fully qualified
-/// one, `win32_normalized` gives `GetFullPathNameW`'s reading, and `to_win32_string` refuses for a
-/// trailing dot or space exactly when that reading differs from the one with no names trimmed. This
-/// compares `GetFullPathNameW` strings, not NT paths; the NT path is compared in
+/// one, a reserved-name refusal names a real device (see `device_stem`), `win32_normalized` gives
+/// `GetFullPathNameW`'s reading, and `to_win32_string` refuses for a trailing dot or space exactly
+/// when that reading differs from the one with no names trimmed. This compares
+/// `GetFullPathNameW` strings, not NT paths; the NT path is compared in
 /// `to_wide_names_the_nt_path_win32_reaches_by_the_names_as_written`.
 ///
 /// Mutants: `to_win32_string` refuses a single trailing dot on the share, which Win32 keeps; the
@@ -152,6 +153,7 @@ fn win32_normalized_matches_get_full_path_name() {
     let mut checked = 0;
     let mut devices = 0;
     let mut nt_prefixed = 0;
+    let mut refused_as_reserved = 0;
     let mut skips = ParseSkips::default();
     for s in samples() {
         let path = match PathBuf::parse(&s) {
@@ -190,7 +192,24 @@ fn win32_normalized_matches_get_full_path_name() {
                 let reading = normal.as_os_str().to_str().unwrap();
                 assert!(!is_dos_device(reading), "{s:?} reads as {reading:?}, a device to Win32");
             }
-            Err(err) => assert_eq!(err.reason(), ConversionReason::ReservedName, "{s:?}"),
+            Err(err) => {
+                assert_eq!(err.reason(), ConversionReason::ReservedName, "{s:?}");
+                // The refusal is real: the string, its reading or the name's stem is a device to
+                // Win32, or the stem is one only Windows 11 maps. Build 26100 maps `CON` and the
+                // like only as a bare name; Microsoft documents them as devices in any position
+                // and with any extension before Windows 11, so the stem stands in for the name.
+                let reading = path.win32_reading(true);
+                let reading = reading.as_os_str().to_str().unwrap();
+                let stem = device_stem(err.component().and_then(OsStr::to_str).unwrap());
+                assert!(
+                    is_dos_device(&s)
+                        || is_dos_device(reading)
+                        || is_dos_device(stem)
+                        || is_windows_11_device_stem(stem),
+                    "{s:?} was refused ({err}), but neither it, its reading {reading:?} nor {stem:?} is a device to Win32"
+                );
+                refused_as_reserved += 1;
+            }
         }
         let trimmed = win32 != path.win32_reading(false);
         match path.to_win32_string() {
@@ -209,6 +228,27 @@ fn win32_normalized_matches_get_full_path_name() {
     skips.assert_each_class_seen();
     assert!(devices > 1_000, "only {devices} devices seen");
     assert!(nt_prefixed > 100, "only {nt_prefixed} NT-prefixed samples seen");
+    assert!(
+        refused_as_reserved > 1_000,
+        "only {refused_as_reserved} fully qualified samples refused as reserved"
+    );
+}
+
+/// The part of `name` before its first `.` or `:`, less trailing spaces: what a device name is
+/// matched on.
+fn device_stem(name: &str) -> &str {
+    name.split(['.', ':']).next().unwrap().trim_end_matches(' ')
+}
+
+/// Whether `stem` is one only Windows 11 maps to a device: `CONIN$`, `CONOUT$`, or `COM` or `LPT` and
+/// a superscript digit. Build 26100 maps them as a bare name only, and `is_reserved` refuses them in
+/// any position.
+fn is_windows_11_device_stem(stem: &str) -> bool {
+    let upper = stem.to_ascii_uppercase();
+    matches!(upper.as_str(), "CONIN$" | "CONOUT$")
+        || ["COM", "LPT"]
+            .iter()
+            .any(|class| upper.strip_prefix(class).is_some_and(|d| matches!(d, "¹" | "²" | "³")))
 }
 
 /// `nt_path_name(s)` with the `UNC` keyword in upper case: the object manager matches it in any
@@ -282,8 +322,7 @@ fn to_wide_names_the_nt_path_a_verbatim_input_named() {
 }
 
 /// Every spelling Win32 maps to a device on this host is refused by both conversions, and `to_wide`
-/// gives a string that is no device: the M14 rows, with extensions, positions, trailing dots, spaces
-/// and colons.
+/// gives a string that is no device, with extensions, positions, trailing dots, spaces and colons.
 ///
 /// Mutants: the reserved-name check compares the whole last name, so `NUL.` passes; `to_wide`
 /// returns the stored text for a reserved name.
@@ -470,8 +509,7 @@ fn holds_a_name_win32_strips(s: &str) -> bool {
 /// its reason is that dot or space, never the reserved name or NT prefix. Where `to_verbatim`
 /// accepts a sample, its NT path is the oracle's too. A few longer dotted-UNC paths are added, where
 /// later names pop back to the dots. Every prefix must compare at
-/// least `MIN_PER_PREFIX` samples, so one whose samples are all skipped (as the drive and `?`
-/// prefixes once were) fails here. Two kinds of sample are skipped, and counted: the dotted UNC
+/// least `MIN_PER_PREFIX` samples, so one whose samples are all skipped fails here. Two kinds of sample are skipped, and counted: the dotted UNC
 /// paths of [`dots_end_the_reading`], and the verbatim spellings of [`ParseSkips`]. A sample the
 /// sentinel changes, or that Win32 refuses and is not empty, fails the test.
 ///

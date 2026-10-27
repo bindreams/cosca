@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use super::{fold_separator, is_separator, Anchor, OsStr, OsString, Path, PathBuf, VERBATIM};
+use super::{fold_separator, is_separator, Anchor, OsStr, OsString, ParseError, Path, PathBuf, VERBATIM};
 use crate::{Component, PurePath};
 
 const NT_PREFIX: &[u8] = br"\??\";
@@ -276,8 +276,8 @@ impl Path {
         }
     }
 
-    /// The names some Windows may map to a device, as written. UNC and device paths never map
-    /// (measured on builds 20348, 26100 and 26200: `\\s\h\com1` and `\\.\x\nul` are not devices).
+    /// The names some Windows may map to a device, as written; none for a UNC or device path (see
+    /// [`to_win32_string`](Self::to_win32_string)).
     fn reserved_names(&self) -> ReservedNames<'_> {
         let anchor = self.anchor();
         if matches!(anchor, Anchor::Unc { .. } | Anchor::Device { .. }) {
@@ -292,9 +292,7 @@ impl Path {
                 // anchor already holds them; `\:` and `/:` leave a rooted path whose first name
                 // starts with `:` and is read from after it.
                 Anchor::Rooted => first.filter(|name| name.starts_with(b":") && is_reserved(&name[1..])),
-                // Microsoft documents that before Windows 11 a path that begins with a device name is
-                // the device, wherever the name ends (`COM1.TXT\file1.txt`). Build 20348 did not
-                // reproduce it and Windows 10 client builds are unmeasured, so the name is kept apart.
+                // The first name counts here; see `to_win32_string`.
                 Anchor::None | Anchor::Drive { rooted: false, .. } => first.filter(|name| is_reserved(name)),
                 _ => None,
             },
@@ -308,14 +306,13 @@ impl Path {
     ///   `x..\.`), a server, share or device name included;
     /// - one trailing dot on another name the reading keeps (`x.\y`; `x..` and `...` are names);
     /// - a last name some supported Windows maps to a device (`NUL`, `nul.txt`, `COM1`), and the
-    ///   first name of a relative or drive-relative path (`NUL\x`, `COM1.TXT\file1.txt`, `C:NUL\x`),
-    ///   which Microsoft documents as read as the device wherever the name ends before Windows 11
-    ///   ("File path formats on Windows systems", "Handle legacy devices"). Builds 20348 and 26100
-    ///   read these as files, but Windows 10 client builds are unmeasured, so the refusal follows
-    ///   the documentation: a name is accepted only if no supported Windows maps it. `to_wide`
-    ///   escapes these names instead.
-    ///   Nothing else is documented as mapped, so `C:\x\COM1.TXT\f` is kept, and so is any UNC or
-    ///   device path, which Windows does not map (measured on builds 20348, 26100 and 26200);
+    ///   first name of a relative or drive-relative path (`NUL\x`, `COM1.TXT\file1.txt`, `C:NUL\x`).
+    ///   Microsoft documents that before Windows 11 a path beginning with a device name is the
+    ///   device, wherever the name ends ("File path formats on Windows systems", "Handle legacy
+    ///   devices"). Builds 20348 and 26100 read these as files, but Windows 10 client builds are
+    ///   unmeasured, so they are refused; `to_wide` escapes them. Nothing else is documented as
+    ///   mapped: `C:\x\COM1.TXT\f` is kept, and so is any UNC or device path (builds 20348, 26100
+    ///   and 26200 do not map them);
     /// - a rooted path whose first name is `:` and a device name (`\:nul\x`), which Win32 reads
     ///   from after the `:`; no file name holds a `:`;
     /// - an empty path, which Win32 refuses and which names nothing; a NUL, or a leading `\??\`.
@@ -365,9 +362,8 @@ impl Path {
             return Ok(self.as_os_str().to_owned());
         }
         debug_assert!(spell, "check_win32 refuses these unless spelling");
-        // Windows Server 2022 (build 20348), Server 2025 (26100) and Windows 11 on ARM (26200)
-        // each read `a\nul\.`, `.\nul\.`, `\.\:nul`, `\.\??\x` and `\.\??\nul\.` as the file
-        // (`C:\??\x`, `C:\??\nul`), and none as a device or an NT path.
+        // Measured on builds 20348, 26100 and 26200: each of these escapes reads as the file, never
+        // as a device or an NT path.
         let bytes = self.bytes();
         let at = self.parts().start();
         let mut out = bytes[..at].to_vec();
@@ -446,11 +442,15 @@ impl Path {
     /// Length is not checked: a plain string past `MAX_PATH` names the same object, but a process
     /// that is not long-path aware cannot open it. Such a caller uses `to_verbatim`.
     pub fn to_wide(&self) -> Result<Vec<u16>, ConversionError> {
+        // A later `..` can pop the NUL name from the reading below, so check the text first.
+        if let Some(piece) = self.nul_piece() {
+            return Err(ConversionError::new(ConversionReason::InteriorNul, Some(piece)));
+        }
         if let Ok(plain) = self.to_win32_string() {
             return Ok(plain.to_wide());
         }
-        // `.`, `..` and repeated separators are Win32's to apply, not reasons to refuse: the
-        // verbatim string of the reading that trims no name keeps every name as written.
+        // Win32 applies `.`, `..` and repeated separators; the reading that trims no name keeps every
+        // name as written.
         let verbatim = if self.has_pure_reading() {
             self.win32_reading(false).to_verbatim()
         } else {
@@ -476,11 +476,10 @@ impl Path {
     }
 
     /// Win32's reading of the path, as `GetFullPathNameW` gives it: `.` and `..` applied (a device
-    /// name, or a share after extra separators, is a component they can remove; a share right
-    /// after the server is not), separators collapsed, every
-    /// trailing dot and space stripped from the name that ends the reading and one trailing dot
-    /// from any other. A device path spelled with `?` reads as the verbatim path it names
-    /// (`//?/C:/x` is `C:\x`).
+    /// name, or a share after extra separators, is a component they can remove; a share right after
+    /// the server is not), separators collapsed, every trailing dot and space stripped from the name
+    /// that ends the reading and one trailing dot from any other. A device path spelled with `?`
+    /// reads as the verbatim path it names (`//?/C:/x` is `C:\x`).
     ///
     /// Refused for a path that is not fully qualified, whose reading depends on the process; for
     /// a last name some supported Windows maps to a device, whose reading depends on the version,
@@ -555,16 +554,26 @@ impl Path {
         }
         // A `?` device path reads as the verbatim path it names. A UNC server `.` or `?` has no
         // plain spelling, so that one stays a `\\.\` device path, which names the same object.
-        PathBuf::parse(&OsString(out.clone())).unwrap_or_else(|_| {
-            out[2] = b'.';
-            PathBuf::from_wtf8(out)
-        })
+        match PathBuf::parse(&OsString(out.clone())) {
+            Ok(reading) => reading,
+            Err(ParseError::UnspellableUncServer) => {
+                debug_assert_eq!(out[2], b'?', "only a `?` device path has no plain spelling");
+                out[2] = b'.';
+                PathBuf::from_wtf8(out)
+            }
+            // The reading holds `\` separators and names with no `.`, `..` or empty one.
+            Err(e) => unreachable!("Win32's reading {:?} does not parse: {e}", OsStr::from_wtf8(&out)),
+        }
     }
 }
 
 #[cfg(test)]
 #[path = "convert_tests.rs"]
 mod convert_tests;
+
+#[cfg(test)]
+#[path = "convert_wtf8_tests.rs"]
+mod convert_wtf8_tests;
 
 #[cfg(all(test, windows))]
 #[path = "convert_win32_tests.rs"]

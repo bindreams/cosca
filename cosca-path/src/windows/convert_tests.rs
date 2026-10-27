@@ -97,8 +97,7 @@ fn win32_string_refuses_every_rewrite() {
         ("/:nul/x", ReservedName, Some(":nul")),
         (r"\:com1.txt\y", ReservedName, Some(":com1.txt")),
         (r"\:nul\..\a", ReservedName, Some(":nul")),
-        // Microsoft documents a relative path that begins with a device name as the device before
-        // Windows 11 ("File path formats on Windows systems", "Handle legacy devices"); not measured.
+        // The first name of a relative or drive-relative path (see `to_win32_string`).
         (r"COM1.TXT\file1.txt", ReservedName, Some("COM1.TXT")),
         (r"NUL\x", ReservedName, Some("NUL")),
         (r"nul.txt\..\a", ReservedName, Some("nul.txt")),
@@ -269,7 +268,7 @@ fn wide(s: &str) -> Vec<u16> {
 }
 
 /// The string for Win32 is the path as written where Win32 reads it so, else the verbatim string.
-/// Each verbatim input Troyka found lossy comes back verbatim; length is not checked.
+/// Length is not checked.
 ///
 /// Mutants: `to_wide` is the stored text, so `\\?\C:\a.` becomes `C:\a.`, which Win32 reads as
 /// `C:\a`; the verbatim fallback is `to_verbatim` of the path as written, which refuses the `.`,
@@ -328,9 +327,9 @@ fn to_wide_names_what_the_path_names() {
 /// each reads every spelling as the file, `RtlIsDosDeviceName_U` is 0).
 ///
 /// Mutants: `to_wide` refuses a reserved name; it leaves the last name bare, so `a\nul` stays the
-/// device; it leaves a reserved first name bare, so `NUL\x` stays the device where Microsoft says so; it puts
-/// the `.\` before the drive of `C:nul`, or leaves `\:nul` bare; it spells only the last name of
-/// `nul\nul`; it refuses a leading `\??\`, or puts the `.\` after the `??`.
+/// device; it leaves a reserved first name bare, so `NUL\x` stays the device; it puts the `.\` before
+/// the drive of `C:nul`, or leaves `\:nul` bare; it spells only the last name of `nul\nul`; it
+/// refuses a leading `\??\`, or puts the `.\` after the `??`.
 #[skuld::test]
 fn to_wide_spells_a_reserved_name_or_nt_prefix_as_the_file() {
     let rows = [
@@ -350,8 +349,7 @@ fn to_wide_spells_a_reserved_name_or_nt_prefix_as_the_file() {
         (r"\nul", r"\nul\."),
         (r"\aux", r"\aux\."),
         (r"C:.\nul", r"C:.\nul\."),
-        // The first name of a relative or drive-relative path, which Microsoft documents as the device
-        // before Windows 11, wherever the name ends.
+        // The first name of a relative or drive-relative path (see `to_win32_string`).
         (r"nul", r".\nul\."),
         (r"C:nul", r"C:.\nul\."),
         (r"COM1.TXT\file1.txt", r".\COM1.TXT\file1.txt"),
@@ -399,6 +397,10 @@ fn to_wide_refuses_a_path_with_no_faithful_string() {
         (r"\x\a.\b", SingleTrailingDot, Some("a.")),
         (r"\??\a.", TrailingDotOrSpace, Some("a.")),
         ("C:\\a\0", InteriorNul, Some("a\0")),
+        // A later `..` pops the NUL name from Win32's reading; the NUL is still refused.
+        ("C:\\a\\x\0y\\..\\b", InteriorNul, Some("x\0y")),
+        ("\\\\s\\h\\x\0y\\..\\b", InteriorNul, Some("x\0y")),
+        ("\\\\.\\x\0y\\..\\b", InteriorNul, Some("x\0y")),
         ("", EmptyPath, None),
     ];
     for &(s, reason, component) in rows {
@@ -442,7 +444,16 @@ fn to_wide_is_the_win32_string_else_verbatim() {
 #[skuld::test]
 fn to_std_path_is_to_wide() {
     use std::os::windows::ffi::OsStrExt;
-    for s in [r"\\?\C:\a.", r"C:\x", r"\\.\..\x", r"a.", r"C:\a\..\b.", r"\\\.\.", ""] {
+    for s in [
+        r"\\?\C:\a.",
+        r"C:\x",
+        r"\\.\..\x",
+        r"a.",
+        r"C:\a\..\b.",
+        r"\\\.\.",
+        "",
+        "C:\\a\\x\0y\\..\\b",
+    ] {
         let path = p(s);
         let std = path
             .to_std_path()
@@ -584,16 +595,48 @@ fn win32_normalized_is_a_fixed_point() {
 
 // Errors ==============================================================================================================
 
-/// The message names the component, faithfully, and why it cannot convert.
+/// The message of every reason, with its component where it has one, is exact.
 ///
-/// Mutant: `Display` prints only the reason.
+/// Mutants: `Display` prints only the reason, or drops the component of a reason that has one;
+/// a reason's text is swapped with another's.
 #[skuld::test]
-fn conversion_error_names_component_and_reason() {
-    let err = p(r"C:\x\tool.").to_win32_string().unwrap_err();
-    let message = err.to_string();
-    assert!(message.contains(r#""tool.""#), "{message}");
-    assert!(message.contains("trailing dot or space"), "{message}");
-    let err = p(r"a\b").to_verbatim().unwrap_err();
-    assert!(err.to_string().contains("fully qualified"), "{err}");
-    let _: &dyn std::error::Error = &err;
+fn conversion_error_displays_every_reason() {
+    let win32 = |s: &str| p(s).to_win32_string().unwrap_err();
+    let verbatim = |s: &str| p(s).to_verbatim().unwrap_err();
+    let rows = [
+        (
+            win32(r"C:\x\tool."),
+            r#"component "tool." ends in a trailing dot or space, which Win32 strips from the last name"#,
+        ),
+        (
+            win32(r"C:\x\sub.\t"),
+            r#"component "sub." ends in a single trailing dot, which Win32 strips"#,
+        ),
+        (
+            win32(r"C:\x\NUL"),
+            r#"component "NUL" is a reserved device name, which some Windows versions map to the device"#,
+        ),
+        (
+            win32("C:\\a\0"),
+            r#"component "a\0" holds a NUL, which ends a Win32 string"#,
+        ),
+        (verbatim(r"a\b"), "the path is not fully qualified"),
+        (
+            verbatim(r"C:\a\.."),
+            r#"component ".." is a `.` or `..` this form cannot keep"#,
+        ),
+        (
+            win32(r"\??\C:\x"),
+            r#"component "??" starts an NT path (\??\), which Win32 does not interpret"#,
+        ),
+        (
+            verbatim(r"C:\a\\b"),
+            r#"component "" is an empty name this form cannot keep"#,
+        ),
+        (win32(""), "the path is empty, which names nothing"),
+    ];
+    for (err, message) in rows {
+        assert_eq!(err.to_string(), message);
+    }
+    let _: &dyn std::error::Error = &win32("");
 }
