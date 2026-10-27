@@ -40,6 +40,7 @@ pub use convert::{ConversionError, ConversionReason};
 pub use os_str::{OsStr, OsString};
 
 const VERBATIM: &[u8] = br"\\?\";
+const DEVICE: &[u8] = br"\\.\";
 
 // Anchors =============================================================================================================
 
@@ -646,6 +647,19 @@ fn plain_spelling(rest: &[u8]) -> Vec<u8> {
     }
 }
 
+/// The plain spelling of the `\\.\` path whose name and rest are `rest`, if the name is a drive
+/// (`C:\x`) or `UNC` followed by something (`UNC\s\h`): Win32 reads those as the path they name.
+/// The raw volume `\\.\C:` is a device and has none, nor has a UNC server `?`.
+fn device_plain_spelling(rest: &[u8]) -> Option<Vec<u8>> {
+    let is_drive = rest.first() != Some(&b'\\') && drive_len(rest).is_some_and(|len| rest.get(len) == Some(&b'\\'));
+    if is_drive {
+        return Some(rest.to_vec());
+    }
+    unc_rest(rest)
+        .filter(|unc| !unc.is_empty() && unc[..next_separator(unc, 0)] != *b"?")
+        .map(|unc| [br"\\", unc].concat())
+}
+
 /// Writes the separator after a leading `\\?` as `/`. Appending to the device anchor `\\?` would
 /// otherwise spell the verbatim prefix, which reads differently; `\\?/` is the device path `\\?`
 /// already was.
@@ -926,6 +940,9 @@ impl Lookup for Path {
         if let Some(rest) = bytes.strip_prefix(VERBATIM) {
             bytes = plain_spelling(rest);
             respell_verbatim(&mut bytes);
+        } else if let Some(plain) = bytes.strip_prefix(DEVICE).and_then(device_plain_spelling) {
+            // A `.` device path named for a drive or `UNC` is the same object as that path.
+            bytes = plain;
         }
         let spelled = PathBuf::from_wtf8(bytes.clone());
         // A share root is one entry with or without its separator; spell it with.

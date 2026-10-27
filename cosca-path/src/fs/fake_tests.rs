@@ -506,6 +506,30 @@ fn a_file_over_an_implied_directory_is_refused_windows() {
         .with_file(&w(r"C:\a"));
 }
 
+// A trailing separator names only a directory, and so does `.` on POSIX (the kernel refuses it below
+// a file), so stating a file there contradicts itself, as the file-and-children cases above do. Win32
+// drops a trailing `\.`: `C:\a\.` is the file `C:\a`, as the host reads it.
+//
+// Mutant: a builder that drops the "names only a directory" flag and states a file at `/a`.
+
+#[skuld::test]
+#[should_panic(expected = "names only a directory")]
+fn a_file_with_a_trailing_separator_is_refused_posix() {
+    let _ = posix::FakeFilesystem::new().with_file(p("/a/"));
+}
+
+#[skuld::test]
+#[should_panic(expected = "names only a directory")]
+fn a_file_with_a_trailing_dot_is_refused_posix() {
+    let _ = posix::FakeFilesystem::new().with_file(p("/a/."));
+}
+
+#[skuld::test]
+#[should_panic(expected = "names only a directory")]
+fn a_file_with_a_trailing_separator_is_refused_windows() {
+    let _ = windows::FakeFilesystem::new().with_file(&w(r"C:\a\"));
+}
+
 /// Restating an entry, or replacing a file by a directory, is not a contradiction.
 ///
 /// Mutant: a check that fires on a restated file, or on a directory replacing a file.
@@ -652,6 +676,69 @@ fn a_question_mark_device_path_reads_as_the_verbatim_path_it_names() {
     assert_eq!(kind(unc.is_file(&q)), ErrorKind::InvalidInput);
     assert_eq!(kind(unc.canonical(&q)), ErrorKind::InvalidInput);
     assert_eq!(kind(unc.same_file(&q, &q)), ErrorKind::InvalidInput);
+}
+
+/// A `.` device path whose name is a drive or `UNC` reads as the path it names, as on the host
+/// (`\\.\C:\Windows` is `C:\Windows`, measured), in every spelling of the prefix. The volume
+/// device `\\.\C:` is not the root directory and stays its own entry.
+///
+/// Mutants: a lookup that keys `\\.\C:\x` apart from `C:\x`, or `\\.\UNC\s\h\x` apart from
+/// `\\s\h\x`; one that also reads `\\.\C:` as `C:\`; one that folds the `UNC` name case-sensitively.
+#[skuld::test]
+fn a_dot_device_path_reads_as_the_path_it_names() {
+    let drive = windows::FakeFilesystem::new().with_dir(&w(r"C:\Windows"));
+    for q in [
+        r"\\.\C:\Windows",
+        "//./C:/Windows",
+        r"\\.\C:\\Windows\",
+        r"\\.\C:\Windows\.",
+        r"\\.\C:\Windows\x\..",
+        r"/\.\C:\Windows",
+    ] {
+        assert!(drive.is_dir(&w(q)).unwrap(), "{q}");
+        assert!(!drive.is_file(&w(q)).unwrap(), "{q}");
+        assert_eq!(drive.canonical(&w(q)).unwrap(), w(r"C:\Windows"), "{q}");
+    }
+    for q in [r"\\.\C:\", "//./C:/", r"\\.\C:\\"] {
+        assert!(drive.is_dir(&w(q)).unwrap(), "{q}");
+        assert_eq!(drive.canonical(&w(q)).unwrap(), w(r"C:\"), "{q}");
+    }
+    // Case is exact, as for any other path.
+    assert!(!drive.is_dir(&w(r"\\.\c:\Windows")).unwrap());
+    assert!(drive.same_file(&w(r"C:\Windows"), &w(r"\\.\C:\Windows")).unwrap());
+    // The raw volume is a device, not the root directory.
+    for q in [r"\\.\C:", r"\\.\C:\.", "//./C:/."] {
+        assert!(!drive.is_dir(&w(q)).unwrap(), "{q}");
+    }
+    let volume = windows::FakeFilesystem::new().with_error(&w(r"\\.\C:"), ErrorKind::Other);
+    assert_eq!(kind(volume.is_dir(&w(r"\\.\C:\."))), ErrorKind::Other);
+    assert!(!volume.is_dir(&w(r"C:\")).unwrap());
+
+    // Stated as a device path, it is the same entry as the drive path.
+    let device = windows::FakeFilesystem::new().with_dir(&w(r"\\.\C:\Windows"));
+    assert!(device.is_dir(&w(r"C:\Windows")).unwrap());
+    assert_eq!(device.canonical(&w(r"\\.\C:\Windows")).unwrap(), w(r"C:\Windows"));
+    let files = windows::FakeFilesystem::new()
+        .with_file(&w(r"C:\a"))
+        .with_file(&w(r"\\.\C:\b"));
+    assert!(!files.same_file(&w(r"C:\a"), &w(r"\\.\C:\b")).unwrap());
+
+    let unc = windows::FakeFilesystem::new().with_dir(&w(r"\\srv\share\d"));
+    for q in [
+        r"\\.\UNC\srv\share\d",
+        "//./UNC/srv/share/d",
+        r"\\.\unc\srv\share\d",
+        r"\\.\UNC\\srv\share\d",
+    ] {
+        assert!(unc.is_dir(&w(q)).unwrap(), "{q}");
+        assert_eq!(unc.canonical(&w(q)).unwrap(), w(r"\\srv\share\d"), "{q}");
+    }
+    assert!(unc.is_dir(&w(r"\\.\UNC\srv\share")).unwrap());
+    assert!(!unc.is_dir(&w(r"\\.\UNC")).unwrap());
+    assert!(!unc.is_dir(&w(r"\\.\UNC\")).unwrap());
+    // A server `?` has no plain spelling: the path stays a device entry, and nothing panics.
+    let odd = windows::FakeFilesystem::new().with_dir(&w(r"\\.\UNC\?\x"));
+    assert!(odd.is_dir(&w(r"\\.\UNC\?\x")).unwrap());
 }
 
 /// The empty path is `InvalidInput` from every question on the Windows fake, as on the Windows

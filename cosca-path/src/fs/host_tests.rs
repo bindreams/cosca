@@ -235,12 +235,19 @@ fn host_filesystem_follows_a_link() {
 /// `same_file` examines identity without opening for data: a file the caller may execute but not
 /// read is `Ok`, as it is for `is_file`.
 ///
-/// Mutant: `same_file` opens the paths for reading (`EACCES`). Run as root the mutant passes,
-/// since root reads any file.
+/// Mutant: `same_file` opens the paths for reading (`EACCES`). Needs a non-root user: root reads
+/// any file, so the mutant would pass.
 #[cfg(unix)]
 #[skuld::test]
 fn host_filesystem_same_file_needs_no_read_access() {
     use std::os::unix::fs::PermissionsExt;
+
+    // SAFETY: `geteuid` has no preconditions.
+    assert_ne!(
+        unsafe { libc::geteuid() },
+        0,
+        "this test needs a non-root user: root reads any file"
+    );
 
     let dir = tempfile::tempdir().unwrap();
     let tool = dir.path().join("tool");
@@ -336,6 +343,20 @@ fn host_filesystem_same_file_identifies_by_file_id() {
         fs.same_file(&missing, &file_p).unwrap_err().kind(),
         io::ErrorKind::NotFound
     );
+}
+
+/// An object with no file id (a device) fails `same_file` with the Win32 code, as every other
+/// error of the module carries it, not the `HRESULT` of the `windows` crate.
+///
+/// Mutant: the id query's error converted through `From<windows::core::Error>`, whose code is
+/// `0x80070001`.
+#[cfg(windows)]
+#[skuld::test]
+fn host_filesystem_same_file_reports_the_win32_code() {
+    let nul = PathBuf::parse(r"\\.\NUL").unwrap();
+    // ERROR_INVALID_FUNCTION.
+    let err = HostFilesystem.same_file(&nul, &nul).unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(1), "{err}");
 }
 
 /// `canonical` and `same_file` say absence as `NotFound`, as the `Filesystem` trait documents,

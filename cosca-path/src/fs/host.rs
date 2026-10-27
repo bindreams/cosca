@@ -178,6 +178,8 @@ mod identity {
             .open(p)
     }
 
+    /// The 128-bit file id of `f`. A failure carries `GetLastError`'s code, as `narrow_file_id`'s does:
+    /// the `windows` crate's own conversion would give an `HRESULT`.
     #[cfg(windows)]
     pub(super) fn wide_file_id(f: &std::fs::File) -> io::Result<windows::Win32::Storage::FileSystem::FILE_ID_INFO> {
         use std::os::windows::io::AsRawHandle;
@@ -194,11 +196,12 @@ mod identity {
                 (&raw mut info).cast(),
                 size_of::<FILE_ID_INFO>() as u32,
             )
-        }?;
+        }
+        .map_err(|_| io::Error::last_os_error())?;
         Ok(info)
     }
 
-    /// The volume serial number and 64-bit file index of `f`.
+    /// The volume serial number and 64-bit file index of `f`, or the Win32 code of the failure.
     #[cfg(windows)]
     fn narrow_file_id(f: &std::fs::File) -> io::Result<(u32, u64)> {
         use std::os::windows::io::AsRawHandle;
@@ -208,7 +211,8 @@ mod identity {
 
         let mut info = BY_HANDLE_FILE_INFORMATION::default();
         // SAFETY: the handle is open for the call, and `info` is a `BY_HANDLE_FILE_INFORMATION`.
-        unsafe { GetFileInformationByHandle(HANDLE(f.as_raw_handle()), &mut info) }?;
+        unsafe { GetFileInformationByHandle(HANDLE(f.as_raw_handle()), &mut info) }
+            .map_err(|_| io::Error::last_os_error())?;
         Ok((
             info.dwVolumeSerialNumber,
             u64::from(info.nFileIndexHigh) << 32 | u64::from(info.nFileIndexLow),

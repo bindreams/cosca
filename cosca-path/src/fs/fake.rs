@@ -67,13 +67,20 @@ pub(crate) mod sealed {
 ///
 /// A file has no children: stating a path under a stated file, or a file (or a stated error) over
 /// a path that has entries below it, panics in the builder in either order, since no filesystem
-/// holds that.
+/// holds that. So does a file stated with a trailing separator, or on POSIX a trailing `.`: they
+/// name only a directory.
 ///
 /// Case is exact, even for Windows paths: the test states the case it queries. Windows trailing
 /// dots and spaces are not modelled (`notepad.exe.` is not `notepad.exe`), and a path on a volume's
-/// device (`\\.\C:\.`) is an ordinary entry where the host refuses it: a test that needs that
-/// states it with [`with_error`](Self::with_error). The relative current directory `.` is absent
-/// unless the test states it, where the host has it.
+/// device (`\\.\C:`, `\\.\C:\.`, `//?/C:`, `//?/C:/.`) is an ordinary entry where the host refuses
+/// it: a test that needs that states it with [`with_error`](Self::with_error). So is a reserved
+/// device name under a UNC share (`\\srv\share\nul`), which the server refuses with
+/// [`PermissionDenied`](io::ErrorKind::PermissionDenied). The relative current directory `.` is
+/// absent unless the test states it, where the host has it.
+///
+/// A `.` device path named for a drive or `UNC` is the path it names (`\\.\C:\Windows` is
+/// `C:\Windows`, `\\.\UNC\srv\share` is `\\srv\share`), as the host reads it, and so is the `//?/`
+/// spelling of either.
 ///
 /// Entries are matched by scanning, which is fine for the handful a test states.
 pub struct FakeFilesystem<P: FakePath + ?Sized> {
@@ -212,8 +219,9 @@ impl<P: FakePath + ?Sized> FakeFilesystem<P> {
     /// Records `path` as `entry`, and its ancestors as directories where nothing is stated. The
     /// empty parent of a relative path is not an ancestor: nothing resolves it.
     fn state(&mut self, path: &P, entry: Entry) {
-        let key = lookup(path).0;
+        let (key, dir_only) = lookup(path);
         if matches!(entry, Entry::File) {
+            assert!(!dir_only, "{path:?} names only a directory, so it cannot be a file");
             let key: &P = key.borrow();
             let has_children = self.entries.iter().any(|(stated, _)| is_below(stated.borrow(), key));
             assert!(!has_children, "{key:?} has entries below it, so it cannot be a file");
