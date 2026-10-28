@@ -222,7 +222,7 @@ pub(crate) fn spawn_raw(
         crate::identity::Resolved::Found(id) => id,
         other => {
             // The read failed, so no identity is known.
-            let fate = raw_spawn_teardown(proc, pid, None);
+            let fate = raw_spawn_teardown(proc, pid, None, None);
             return Err(SpawnFailure::started(
                 crate::child::spawn::spawn_identity_error(other),
                 fate,
@@ -232,7 +232,7 @@ pub(crate) fn spawn_raw(
     let attachment = match attach_or_fault(id, raw_handle, prepared) {
         Ok(v) => v,
         Err(e) => {
-            let fate = raw_spawn_teardown(proc, pid, Some(id));
+            let fate = raw_spawn_teardown(proc, pid, Some(id), None);
             return Err(SpawnFailure::started(e, fate));
         }
     };
@@ -484,31 +484,53 @@ pub(crate) fn app_name_wide(image: Option<&Path>) -> Result<Vec<u16>, Error> {
 /// Kill + reap a just-spawned child whose post-spawn attach/identity read failed, so a failed spawn
 /// never leaks a running/zombie process (mirrors the std path's teardown). `pub(crate)`: the async
 /// raw backend shares the identical error-teardown.
-pub(crate) fn raw_spawn_teardown(proc: OwnedHandle, pid: u32, id: Option<crate::identity::ProcessId>) -> ChildFate {
+///
+/// `warn_after`: with it, the wait for the killed child warns once it passes that long, and goes on
+/// ([`wait_warning`](crate::wait::teardown_warn::wait_warning)).
+pub(crate) fn raw_spawn_teardown(
+    proc: OwnedHandle,
+    pid: u32,
+    id: Option<crate::identity::ProcessId>,
+    warn_after: Option<std::time::Duration>,
+) -> ChildFate {
     let rc = RawChild::new(proc, pid);
     // Windows only, so the std path-s invariant does NOT carry: there is no zombie to reap
     // and `rc.wait()` is a bare `WaitForSingleObject(handle, INFINITE)`. If the kill failed,
     // nothing asked the child to exit and that wait would park forever - a logged, leaked
-    // child is strictly better.
-    if let Err(e) = rc.kill() {
-        log::warn!("raw spawn teardown: kill of pid {pid} failed: {e}; not waiting");
-        return ChildFate::Running { id };
-    }
+    // child is strictly better. The kill never waits: `wait_warning` owns the one wait, so a
+    // termination already under way (`Termination::Exited`) is not waited for before it.
+    let kill_delivered = match rc.start_kill() {
+        Ok(under_way) => !under_way,
+        Err(e) => {
+            log::warn!("raw spawn teardown: kill of pid {pid} failed: {e}; not waiting");
+            return ChildFate::Running { id };
+        }
+    };
     // A fixture only that kill would end is released here.
     #[cfg(test)]
     crate::child::spawn::fault::run_between_kill_and_wait();
-    match rc.wait() {
+    let waited = crate::wait::teardown_warn::wait_warning(
+        &rc,
+        crate::wait::teardown_warn::Due::in_(warn_after),
+        |rc, until| crate::wait::teardown_warn::handle_signaled_by(rc.handle(), until),
+        |after| crate::child::spawn::warn_still_waiting(Some(pid), after),
+        |rc| rc.wait(),
+    );
+    match &waited {
         Ok(_status) => {
             #[cfg(test)]
-            crate::child::spawn::fault::record_teardown_reap(pid, _status);
-            ChildFate::Reaped
+            crate::child::spawn::fault::record_teardown_reap(pid, *_status);
         }
         Err(e) => {
             log::warn!("raw spawn teardown failed to reap pid {pid}: {e}");
-            debug_assert!(false, "raw spawn teardown failed to reap child: {e}");
-            ChildFate::Killed
+            #[cfg(test)]
+            let forced = proc::fault::is_forced_wait_failure(e);
+            #[cfg(not(test))]
+            let forced = false;
+            debug_assert!(forced, "raw spawn teardown failed to reap child: {e}");
         }
     }
+    proc::fate_after_reap(kill_delivered, waited)
 }
 
 /// The `STARTUPINFOEXW` for a raw spawn, with what it points at.

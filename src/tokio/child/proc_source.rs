@@ -988,9 +988,21 @@ impl ProcSource {
     ///
     /// - **Linux:** [`crate::wait::pidfd_exit_visible_by`].
     /// - **macOS:** the verified-id kqueue wait, with `until` as its deadline.
-    #[cfg(unix)]
+    /// - **Windows:** [`handle_signaled_by`](crate::wait::teardown_warn::handle_signaled_by) on the
+    ///   process handle.
     pub(crate) fn exit_visible_by(&self, pid: u32, until: std::time::Instant) -> bool {
         crate::bounded::assert_may_block("exit_visible_by");
+        #[cfg(windows)]
+        {
+            let _ = pid;
+            let ProcSource::Tokio { child, .. } = self else {
+                return true;
+            };
+            // `None` once tokio has collected the child: the wait answers at once.
+            child.raw_handle().is_none_or(|handle| {
+                crate::wait::teardown_warn::handle_signaled_by(windows::Win32::Foundation::HANDLE(handle), until)
+            })
+        }
         #[cfg(target_os = "linux")]
         {
             use std::os::fd::AsFd as _;
@@ -1248,7 +1260,10 @@ impl ProcSource {
     /// teardown's one warn carries it.
     pub(crate) fn reap_now_noting(mut self, pid: u32, id: Option<ProcessId>, why: &mut Diagnosis) -> ChildFate {
         crate::bounded::assert_may_block("reap_now");
-        let killed = self.teardown_kill();
+        let (killed, denied) = match self.teardown_kill() {
+            Ok((sent, denied)) => (Ok(sent), denied),
+            Err(e) => (Err(e), false),
+        };
         if let Err(e) = &killed {
             // Tokio's drop reaps by pid: a child the handle shows reaped elsewhere is forgotten.
             #[cfg(unix)]
@@ -1290,10 +1305,12 @@ impl ProcSource {
         #[cfg(unix)]
         let (waited, cause) = self.wait_warning(pid, |proc| proc.wait_and_reap_caused(pid, log::Level::Debug));
         #[cfg(not(unix))]
-        let waited = self.wait_and_reap(pid);
+        let waited = self.wait_warning(pid, |proc| proc.wait_and_reap(pid));
         let fate = match waited {
             Waited::Exited => self.collect_exit(id),
             Waited::Unverified => match killed {
+                // A denied kill (Windows) is not known to have ended it: as `fate_after_reap`.
+                Ok(Sent::Delivered) if denied => ChildFate::Unknown,
                 Ok(Sent::Delivered) => ChildFate::Killed,
                 _ => ChildFate::Running { id },
             },
@@ -1447,7 +1464,6 @@ impl ProcSource {
     /// which warns once, naming it, if its exit is not visible within
     /// [`slow_teardown_after`](super::slow_teardown_after)
     /// ([`wait_warning`](crate::wait::teardown_warn::wait_warning)).
-    #[cfg(unix)]
     pub(crate) fn wait_warning<R>(&mut self, pid: u32, wait: impl FnOnce(&mut Self) -> R) -> R {
         crate::wait::teardown_warn::wait_warning(
             self,
@@ -1460,12 +1476,18 @@ impl ProcSource {
 
     /// The teardown's kill: [`Sig::Kill`] through the handle, or (tests) the forced refusal of the
     /// sync seam's "leave it alive" form, which replaces the kill so the child is really left alone.
-    fn teardown_kill(&self) -> Result<Sent, Error> {
+    /// With whether the kill was denied because the child's exit is underway (Windows; `false`
+    /// elsewhere): a denied kill is [`Sent::Delivered`] but is not known to have ended the child.
+    fn teardown_kill(&self) -> Result<(Sent, bool), Error> {
         #[cfg(test)]
         if let Some((marker, kind, _)) = crate::child::spawn::fault::take_force_kill_failure() {
             return Err(Error::Io(std::io::Error::new(kind, marker)));
         }
-        self.signal(Sig::Kill)
+        #[cfg(windows)]
+        if let ProcSource::Tokio { child, .. } = self {
+            return terminate_tokio(child);
+        }
+        self.signal(Sig::Kill).map(|sent| (sent, false))
     }
 
     /// A child whose teardown kill was refused (a setuid child answers `EPERM`) and that is not
@@ -1510,7 +1532,7 @@ impl ProcSource {
         use crate::wait::exit_only::{self, Target};
 
         crate::bounded::assert_may_block("teardown_through_pidfd");
-        let killed = self.teardown_kill();
+        let killed = self.teardown_kill().map(|(sent, _denied)| sent);
         if let Err(e) = &killed {
             let foreign = self.forget_if_foreign_quietly(id);
             let (handed, hand_leak) = self.hand_to_pidfd_reaper(pid, id);
@@ -1820,10 +1842,31 @@ fn wait_reapable(pid: u32, identity: u64, level: log::Level) -> (Waited, Option<
 /// [`windows_terminate_held`](crate::identity::windows_terminate_held). Never blocks.
 #[cfg(windows)]
 pub(super) fn terminate_unreaped(h: windows::Win32::Foundation::HANDLE) -> Result<Sent, Error> {
+    terminate_unreaped_noting(h).map(|(sent, _under_way)| sent)
+}
+
+/// Windows: [`terminate_unreaped`] on tokio's process handle. Answers [`Sent::Gone`] once tokio has
+/// dropped the handle, else [`Sent::Delivered`] and whether the termination was already under way
+/// when the kill was refused (`Termination::Exited`).
+#[cfg(windows)]
+fn terminate_tokio(child: &::tokio::process::Child) -> Result<(Sent, bool), Error> {
+    // tokio drops its handle once it has reaped the child.
+    let Some(h) = child.raw_handle() else {
+        return Ok((Sent::Gone, false));
+    };
+    // SAFETY of the handle: tokio owns it live while `raw_handle` is `Some`.
+    terminate_unreaped_noting(windows::Win32::Foundation::HANDLE(h))
+}
+
+/// [`terminate_unreaped`], and whether the kill was refused because the exit was already under way:
+/// delivered, but not known to have ended the child.
+#[cfg(windows)]
+fn terminate_unreaped_noting(h: windows::Win32::Foundation::HANDLE) -> Result<(Sent, bool), Error> {
     use crate::identity::{windows_terminate_held, Termination};
     // `h` is a live process handle the caller owns.
     match windows_terminate_held(h) {
-        Termination::Terminated | Termination::Exited => Ok(Sent::Delivered),
+        Termination::Terminated => Ok((Sent::Delivered, false)),
+        Termination::Exited => Ok((Sent::Delivered, true)),
         Termination::Failed(e) => Err(Error::Io(crate::error::win32_io_error(e))),
     }
 }
@@ -1831,15 +1874,24 @@ pub(super) fn terminate_unreaped(h: windows::Win32::Foundation::HANDLE) -> Resul
 /// Windows: waits on tokio's process handle, which pins the child.
 #[cfg(windows)]
 fn wait_on_handle(child: &::tokio::process::Child, pid: u32) -> Waited {
-    use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+    use windows::Win32::Foundation::{HANDLE, WAIT_FAILED, WAIT_OBJECT_0};
     use windows::Win32::System::Threading::{WaitForSingleObject, INFINITE};
     let _ = pid;
     let h = child.raw_handle().expect("tokio owns the handle while id() is Some");
+    // Tests: a wait on a handle that cannot be waited on, made to fail without being made.
+    #[cfg(test)]
+    let forced = super::fault::take_fail_handle_wait();
+    #[cfg(not(test))]
+    let forced = false;
     // SAFETY: tokio owns and (on its field-drop) closes the handle; we only wait on it.
     // INFINITE is bounded by the kill the caller already issued.
-    let waited = unsafe { WaitForSingleObject(HANDLE(h), INFINITE) };
+    let waited = if forced {
+        WAIT_FAILED
+    } else {
+        unsafe { WaitForSingleObject(HANDLE(h), INFINITE) }
+    };
     debug_assert!(
-        waited == WAIT_OBJECT_0,
+        forced || waited == WAIT_OBJECT_0,
         "wait_and_reap did not observe the child's exit: {waited:?}"
     );
     if waited != WAIT_OBJECT_0 {

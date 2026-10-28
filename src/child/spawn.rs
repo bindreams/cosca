@@ -1179,15 +1179,17 @@ fn await_exit_warning(
 
 /// The one `warn` of a spawn teardown whose wait for the child it killed has passed `after`; the
 /// wait goes on.
-#[cfg(unix)]
 pub(crate) fn warn_still_waiting(pid: Option<u32>, after: std::time::Duration) {
     let who = pid.map_or_else(
         || "the spawned child (pid unknown)".to_owned(),
         |pid| format!("child {pid}"),
     );
+    #[cfg(unix)]
     log::warn!(
         "{who} is not reapable {after:?} after its kill (it is still running, or a tracer holds its exit); still waiting for it to exit"
     );
+    #[cfg(windows)]
+    log::warn!("{who} has not exited {after:?} after its kill was requested; still waiting for it to exit");
 }
 
 /// How a failed spawn's wait for a child it killed warns once it is slow. `Option<Duration>` is the
@@ -1215,10 +1217,7 @@ impl SlowWait for Option<std::time::Duration> {
     }
 
     fn warn(&mut self, pid: Option<u32>, after: std::time::Duration) {
-        #[cfg(unix)]
         warn_still_waiting(pid, after);
-        #[cfg(not(unix))]
-        let _ = (pid, after);
     }
 }
 
@@ -2993,6 +2992,8 @@ pub(crate) mod fault {
         static CAPTURED: Cell<Option<crate::identity::Resolved<ProcessId>>> = const { Cell::new(None) };
         static BETWEEN_KILL_AND_WAIT: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
         static SPAWN_PID: Cell<Option<u32>> = const { Cell::new(None) };
+        #[cfg(windows)]
+        static LATE_EXIT: Cell<bool> = const { Cell::new(false) };
         static BEFORE_IDENTITY: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
         static BEFORE_ATTACH: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
         static AFTER_IDENTITY_READ: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
@@ -3244,6 +3245,18 @@ pub(crate) mod fault {
     }
     pub(crate) fn take_captured() -> Option<crate::identity::Resolved<ProcessId>> {
         CAPTURED.with(|c| c.take())
+    }
+
+    /// Makes the NEXT [`handle_signaled_by`](crate::wait::teardown_warn::handle_signaled_by) on this
+    /// thread find its child not yet exited, whatever its handle says, so a test sees the warn of a
+    /// wait that really ends at once.
+    #[cfg(all(windows, feature = "tokio"))]
+    pub(crate) fn set_late_exit() {
+        LATE_EXIT.with(|f| f.set(true));
+    }
+    #[cfg(windows)]
+    pub(crate) fn take_late_exit() -> bool {
+        LATE_EXIT.with(|f| f.replace(false))
     }
 
     /// Run `hook` at the next kill-then-blocking-wait teardown on this thread, once the kill has

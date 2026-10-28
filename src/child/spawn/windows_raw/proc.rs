@@ -47,7 +47,7 @@ impl RawChild {
         }
     }
 
-    fn handle(&self) -> HANDLE {
+    pub(super) fn handle(&self) -> HANDLE {
         HANDLE(self.proc.as_raw_handle())
     }
 
@@ -58,8 +58,6 @@ impl RawChild {
 
     /// Block on the exit that a denied or accepted `TerminateProcess` has set in motion.
     fn reap(&self) -> io::Result<ExitStatus> {
-        #[cfg(test)]
-        fault::before_blocking_wait();
         self.wait()
     }
 
@@ -94,6 +92,8 @@ impl RawChild {
 
     /// Block until the child exits, returning its status.
     pub(crate) fn wait(&self) -> io::Result<ExitStatus> {
+        #[cfg(test)]
+        fault::before_blocking_wait()?;
         match wait_handle_or_cancel(self.handle(), None)? {
             WaitOutcome::Exited => exit_status(self.handle()).map(|s| self.record(s)),
             WaitOutcome::Cancelled => unreachable!("wait with no cancel handle cannot be cancelled"),
@@ -134,10 +134,19 @@ impl RawChild {
 
     /// Hard-kill the process. An already-exited child is success (matches std's `kill`).
     pub(crate) fn kill(&self) -> io::Result<()> {
+        if self.start_kill()? {
+            // The termination is under way: BLOCK on the real exit event, recording the exit.
+            self.reap()?;
+        }
+        Ok(())
+    }
+
+    /// Hard-kill the process and never wait. `Ok(true)` when the termination was already under way
+    /// (`Termination::Exited`): the caller owns the wait for it.
+    pub(crate) fn start_kill(&self) -> io::Result<bool> {
         match windows_terminate_held(self.handle()) {
-            Termination::Terminated => Ok(()),
-            // Record the exit: block on the real exit event.
-            Termination::Exited => self.reap().map(drop),
+            Termination::Terminated => Ok(false),
+            Termination::Exited => Ok(true),
             // A handle without `PROCESS_TERMINATE` (a higher-integrity runas child), or any other
             // failure: surface it, never block.
             Termination::Failed(e) => Err(win32_io_error(e)),
@@ -190,7 +199,7 @@ impl RawChild {
 
 /// The fate after a teardown's blocking wait: `Reaped` for a collected status. A wait that failed
 /// leaves `Killed` only if the kill was delivered, and `Unknown` if it was refused.
-fn fate_after_reap(kill_delivered: bool, reaped: io::Result<ExitStatus>) -> crate::error::ChildFate {
+pub(super) fn fate_after_reap(kill_delivered: bool, reaped: io::Result<ExitStatus>) -> crate::error::ChildFate {
     use crate::error::ChildFate;
     match reaped {
         Ok(_) => ChildFate::Reaped,
@@ -317,13 +326,14 @@ pub(crate) mod fault {
         armed: bool,
         on_wait: Option<Box<dyn FnMut()>>,
         waits: u32,
+        fail_next_wait: bool,
     }
 
     thread_local! {
         static STATE: RefCell<State> = RefCell::new(State::default());
     }
 
-    /// Run `on_wait` before every blocking reap on this thread and count them. Lets a test end a
+    /// Run `on_wait` before every blocking wait for the child's exit on this thread and count them. Lets a test end a
     /// never-exiting fixture a second way, so a no-op terminate fails on exit code, not by hanging.
     ///
     /// The guard resets the state on drop. Arming over a live guard is a test bug.
@@ -340,26 +350,44 @@ pub(crate) mod fault {
         Observer
     }
 
-    pub(crate) fn before_blocking_wait() {
-        let hook = STATE.with(|s| {
+    /// Counts a blocking wait and runs the observer's hook. `Err` when the observer made this wait
+    /// fail; the wait is then not made.
+    pub(crate) fn before_blocking_wait() -> std::io::Result<()> {
+        let (hook, fail) = STATE.with(|s| {
             let mut s = s.borrow_mut();
             if !s.armed {
-                return None;
+                return (None, false);
             }
             s.waits += 1;
-            s.on_wait.take()
+            (s.on_wait.take(), std::mem::take(&mut s.fail_next_wait))
         });
         if let Some(mut hook) = hook {
             hook();
             STATE.with(|s| s.borrow_mut().on_wait = Some(hook));
         }
+        if fail {
+            return Err(std::io::Error::other(FORCED_WAIT_FAILURE));
+        }
+        Ok(())
+    }
+
+    const FORCED_WAIT_FAILURE: &str = "forced wait failure (test seam)";
+
+    /// Whether `e` is the failure [`Observer::fail_next_wait`] made.
+    pub(crate) fn is_forced_wait_failure(e: &std::io::Error) -> bool {
+        e.to_string() == FORCED_WAIT_FAILURE
     }
 
     #[must_use]
     pub(crate) struct Observer;
 
     impl Observer {
-        /// Blocking reaps started since arming.
+        /// Make the next blocking wait fail, as one on a handle that cannot be waited on would.
+        pub(crate) fn fail_next_wait(&self) {
+            STATE.with(|s| s.borrow_mut().fail_next_wait = true);
+        }
+
+        /// Blocking waits started since arming.
         pub(crate) fn waits(&self) -> u32 {
             STATE.with(|s| s.borrow().waits)
         }

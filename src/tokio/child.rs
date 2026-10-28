@@ -1366,6 +1366,10 @@ mod unpinned_graceful_tests;
 #[path = "child/windows_signal_tests.rs"]
 mod windows_signal_tests;
 
+#[cfg(all(test, windows))]
+#[path = "child/windows_teardown_tests.rs"]
+mod windows_teardown_tests;
+
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 #[path = "child/bypass_drop_tests.rs"]
 mod bypass_drop_tests;
@@ -1769,11 +1773,10 @@ struct Signalled {
     front_left: Option<Error>,
 }
 
-/// How long the armed drop, or a failed spawn's teardown, waits before it says so. Messaging only: no
-/// wait ends on it.
-#[cfg(unix)]
+/// How long a failed spawn's teardown, and on Unix the armed drop, waits before it says so (on
+/// Windows the armed drop waits for nothing). Messaging only: no wait ends on it.
 #[cfg_attr(
-    all(test, not(target_os = "linux")),
+    all(test, target_os = "macos"),
     allow(dead_code, reason = "a test opts in with its own threshold off Linux")
 )]
 const LATE: std::time::Duration = std::time::Duration::from_secs(1);
@@ -1782,7 +1785,6 @@ const LATE: std::time::Duration = std::time::Duration::from_secs(1);
 /// that it is still waiting: [`LATE`]. In a test, only one that opted in
 /// (`fault::warn_slow_teardowns`): a loaded runner could pass the threshold, and a test's verdict
 /// must not depend on elapsed time.
-#[cfg(unix)]
 pub(crate) fn slow_teardown_after() -> Option<std::time::Duration> {
     #[cfg(test)]
     return fault::slow_teardown_after();
@@ -2216,6 +2218,7 @@ pub(crate) mod fault {
         static PEND_AWAITED_REAP: Cell<bool> = const { Cell::new(false) };
         static FAIL_REAP_WATCH: Cell<bool> = const { Cell::new(false) };
         static FAIL_DRAIN_WATCH: Cell<bool> = const { Cell::new(false) };
+        static FAIL_HANDLE_WAIT: Cell<bool> = const { Cell::new(false) };
         static REAP_PARKED: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
         static BEFORE_REAP_LOOK: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
         static RELEASES: Cell<usize> = const { Cell::new(0) };
@@ -2225,31 +2228,27 @@ pub(crate) mod fault {
 
     /// A failed spawn's teardown, or an armed drop, on THIS thread warns once its wait passes 1 s, as
     /// outside tests (see [`slow_teardown_after`](super::slow_teardown_after)).
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     pub(crate) fn warn_slow_teardowns() -> WarnSlowTeardowns {
         warn_slow_teardowns_after(super::LATE)
     }
 
     /// As [`warn_slow_teardowns`], past `after`: zero, for a test whose forced looks keep the child
     /// from showing its exit within it.
-    #[cfg(unix)]
     pub(crate) fn warn_slow_teardowns_after(after: std::time::Duration) -> WarnSlowTeardowns {
         SLOW_TEARDOWN_AFTER.with(|w| w.set(Some(after)));
         WarnSlowTeardowns(())
     }
 
-    #[cfg(unix)]
     #[must_use = "the warn is off again as soon as the guard is dropped"]
     pub(crate) struct WarnSlowTeardowns(());
 
-    #[cfg(unix)]
     impl Drop for WarnSlowTeardowns {
         fn drop(&mut self) {
             SLOW_TEARDOWN_AFTER.with(|w| w.set(None));
         }
     }
 
-    #[cfg(unix)]
     pub(super) fn slow_teardown_after() -> Option<std::time::Duration> {
         SLOW_TEARDOWN_AFTER.with(Cell::get)
     }
@@ -2379,6 +2378,38 @@ pub(crate) mod fault {
     #[cfg(unix)]
     pub(super) fn take_pend_awaited_reap() -> bool {
         PEND_AWAITED_REAP.with(|f| f.replace(false))
+    }
+
+    /// The next wait on tokio's process handle on THIS thread (`wait_on_handle`) fails, as one on a
+    /// handle that cannot be waited on would, and is not made. Take-once.
+    #[cfg(windows)]
+    pub(crate) fn fail_handle_wait() -> FailHandleWait {
+        FAIL_HANDLE_WAIT.with(|f| f.set(true));
+        FailHandleWait(())
+    }
+
+    #[cfg(windows)]
+    #[must_use = "the seam is cleared as soon as the guard is dropped"]
+    pub(crate) struct FailHandleWait(());
+
+    #[cfg(windows)]
+    impl FailHandleWait {
+        /// Whether a wait has reached the seam, and so failed.
+        pub(crate) fn taken(&self) -> bool {
+            !FAIL_HANDLE_WAIT.with(Cell::get)
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for FailHandleWait {
+        fn drop(&mut self) {
+            FAIL_HANDLE_WAIT.with(|f| f.set(false));
+        }
+    }
+
+    #[cfg(windows)]
+    pub(super) fn take_fail_handle_wait() -> bool {
+        FAIL_HANDLE_WAIT.with(|f| f.replace(false))
     }
 
     /// The next reap on this thread that waits on events fails to register its watch, as when the
