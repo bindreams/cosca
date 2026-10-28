@@ -263,9 +263,8 @@ fn terminate_held_failure_carries_the_win32_code() {
     assert_eq!(io.raw_os_error(), Some(ERROR_INVALID_HANDLE.0 as i32), "{io:?}");
 }
 
-/// `kill` of a process whose exit is under way but whose object is not signalled yet is `Ok`:
-/// `TerminateProcess` refuses it with `ERROR_ACCESS_DENIED`, which the handle's `PROCESS_TERMINATE`
-/// right makes the exit, not a denial. The seam refuses as the OS does; the process stays alive.
+/// `kill` of a process that is exiting but not yet signalled is `Ok`; the seam refuses and the
+/// process stays alive.
 ///
 /// Mutant: a refusal is success only once the process reads signalled, so this one is `Err(Io)`.
 #[skuld::test]

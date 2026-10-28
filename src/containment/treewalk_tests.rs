@@ -335,9 +335,8 @@ fn kill_by_identity_reports_a_member_that_exits_before_the_terminate_as_gone() {
     assert!(!child.is_running(), "precondition: the hook ended the member");
 }
 
-/// A member whose exit is under way but whose object is not signalled yet is refused by
-/// `TerminateProcess` with `ERROR_ACCESS_DENIED` too: gone, not a failed kill, and `hard_kill`
-/// stays complete. The seam refuses as the OS does for such a member, which stays alive.
+/// A member whose exit is under way but not yet signalled is gone, not a failed kill, and
+/// `hard_kill` stays complete.
 ///
 /// Mutant: a refusal is gone only once the process reads signalled, so this one warns and answers
 /// `NotAttempted`.

@@ -410,8 +410,8 @@ pub(crate) mod fault {
         static BEFORE_TERMINATE: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
     }
 
-    /// Run `hook` once on THIS thread, in the NEXT Windows `kill_by_identity`, after the identity
-    /// check and before `TerminateProcess`: the window in which a member exits on its own.
+    /// Run `hook` once on this thread in the next Windows `kill_by_identity`, between the identity
+    /// check and `TerminateProcess` (where a member can exit on its own).
     #[cfg(windows)]
     pub(crate) fn set_before_terminate(hook: impl FnOnce() + 'static) {
         BEFORE_TERMINATE.with(|h| *h.borrow_mut() = Some(Box::new(hook)));

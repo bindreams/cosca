@@ -292,8 +292,7 @@ impl Drop for Limited {
     }
 }
 
-/// A refusal on a handle that holds `PROCESS_TERMINATE` is the exit, whether or not the process
-/// object is signalled yet: the seam refuses a process that stays alive and unsignalled.
+/// The seam refuses a process that stays alive and unsignalled.
 ///
 /// Mutant: a refusal is `Exited` only for a signalled process, so this one is `Failed`.
 #[skuld::test]

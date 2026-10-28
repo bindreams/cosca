@@ -74,7 +74,6 @@ pub(crate) fn close(handle: HANDLE) {
     }
 }
 
-/// What [`terminate_held`] established.
 pub(crate) enum Termination {
     /// `TerminateProcess` accepted the request.
     Terminated,
