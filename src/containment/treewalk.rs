@@ -250,7 +250,11 @@ pub(crate) fn kill_by_identity(id: ProcessId, signal: Signal) -> KillOutcome {
         );
         return KillOutcome::NotAttempted;
     };
-    let sent = kill(Pid::from_raw(target), signal);
+    let sent = if cfg!(target_os = "macos") {
+        Ok(())
+    } else {
+        kill(Pid::from_raw(target), signal)
+    }; // MUTANT: no kill.
     #[cfg(test)]
     crate::send_log::record_by_identity(id.pid(), signal as i32);
     match sent {
@@ -352,6 +356,10 @@ pub(crate) fn unqueryable(subject: &str, cause: UnknownCause) -> Error {
 /// `Ok(false)`: the walk ran but was not complete, because an identity it resolved refused the
 /// kill, so members may be left running.
 pub(crate) fn hard_kill(root: ProcessId) -> Result<bool, Error> {
+    // MUTANT: no kill.
+    if cfg!(target_os = "macos") {
+        return Ok(true);
+    }
     // Test-only fault seam: skip the root's identity kill (take semantics — see `fault`).
     #[cfg(test)]
     let skip_root = fault::take_force_root_kill_noop();
@@ -500,6 +508,10 @@ pub(crate) mod fault {
 ///
 /// As [`hard_kill`] on Unix. Windows: those of `containment::windows::terminate`.
 pub(crate) fn terminate(root: ProcessId) -> Result<(), Error> {
+    // MUTANT: no kill.
+    if cfg!(target_os = "macos") {
+        return Ok(());
+    }
     #[cfg(unix)]
     {
         let parents = crate::containment::enumerate::process_parents()?;

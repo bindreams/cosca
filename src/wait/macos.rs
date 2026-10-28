@@ -352,7 +352,11 @@ pub(crate) fn kill(id: ProcessId) -> Result<(), Error> {
             source: None,
         });
     };
-    let sent = nix_kill(Pid::from_raw(target), Signal::SIGKILL);
+    let sent = if cfg!(target_os = "macos") {
+        Ok(())
+    } else {
+        nix_kill(Pid::from_raw(target), Signal::SIGKILL)
+    }; // MUTANT: no kill.
     #[cfg(test)]
     crate::send_log::record_by_identity(id.pid(), Signal::SIGKILL as i32);
     match sent {
@@ -396,7 +400,11 @@ pub(crate) fn terminate(id: ProcessId) -> Result<(), Error> {
             source: None,
         });
     };
-    let sent = nix_kill(Pid::from_raw(target), Signal::SIGTERM);
+    let sent = if cfg!(target_os = "macos") {
+        Ok(())
+    } else {
+        nix_kill(Pid::from_raw(target), Signal::SIGTERM)
+    }; // MUTANT: no kill.
     #[cfg(test)]
     crate::send_log::record_by_identity(id.pid(), Signal::SIGTERM as i32);
     match sent {

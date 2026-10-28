@@ -1083,6 +1083,13 @@ impl Marker {
     }
 
     fn hard_kill_impl(&self, scope: Scope<'_>) -> Result<(), Error> {
+        // MUTANT: no kill.
+        if matches!(
+            scope,
+            Scope::Full(_) | Scope::HoldersOnly { .. } | Scope::GroupAndHolders(_)
+        ) {
+            return Ok(());
+        }
         self.check_read_end_still_valid()?;
         let mut seen: std::collections::HashSet<ProcessId> = std::collections::HashSet::new();
         // Folds together across every pass — see `sweep_pass`'s doc for why an earlier pass's
@@ -1138,6 +1145,13 @@ impl Marker {
     }
 
     fn terminate_impl(&self, scope: Scope<'_>) -> Result<(), Error> {
+        // MUTANT: no kill.
+        if matches!(
+            scope,
+            Scope::Full(_) | Scope::HoldersOnly { .. } | Scope::GroupAndHolders(_)
+        ) {
+            return Ok(());
+        }
         self.check_read_end_still_valid()?;
         let mut seen: std::collections::HashSet<ProcessId> = std::collections::HashSet::new();
         let mut group_result: Result<(), Error> = Ok(());

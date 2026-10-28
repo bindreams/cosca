@@ -616,7 +616,11 @@ impl ProcSource {
             #[cfg(target_os = "macos")]
             ProcSource::Tokio { child, identity, .. } => {
                 let pid = child.id().expect("checked above");
-                crate::signal::via_verified_pid(pid, *identity, sig).map_err(Error::Io)
+                // MUTANT: no kill.
+                {
+                    let _ = (pid, *identity, sig);
+                    Ok(Sent::Delivered)
+                }
             }
             #[cfg(windows)]
             ProcSource::Tokio { child, .. } => {

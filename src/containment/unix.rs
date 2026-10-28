@@ -431,8 +431,10 @@ fn send(target: Target, sys: Sys<'_>, signo: libc::c_int) -> nix::Result<()> {
         #[cfg(not(target_os = "linux"))]
         (None, Sys::Pidfd(..)) => unreachable!("only Linux sends through a pidfd"),
         // SAFETY: plain syscalls on numbers; each caller checked the number right before.
+        (None, Sys::Group(_)) if signo != 0 && cfg!(target_os = "macos") => Ok(()), // MUTANT: no kill.
         (None, Sys::Group(pgid)) => Errno::result(unsafe { libc::killpg(pgid, signo) }).map(drop),
         // SAFETY: as above.
+        (None, Sys::Process(_)) if signo != 0 && cfg!(target_os = "macos") => Ok(()), // MUTANT: no kill.
         (None, Sys::Process(pid)) => Errno::result(unsafe { libc::kill(pid, signo) }).map(drop),
     };
     #[cfg(test)]
