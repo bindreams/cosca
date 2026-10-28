@@ -1058,3 +1058,33 @@ fn a_shell_execute_failure_takes_its_answer_from_the_classification() {
         }
     ));
 }
+
+/// `untracked_outcome` is the arm of `launch_runas_with_host` that terminates a child whose identity
+/// could not be read; that arm needs a UAC prompt to reach, so the mapping is tested here.
+///
+/// Mutants: `Terminated` reported as `Running`; `Exited` reported as `Running`; `Failed` reported
+/// as `Killed`; the failure's code or the pid left out of the detail.
+#[skuld::test]
+fn an_untracked_child_fate_follows_how_its_termination_ended() {
+    use super::untracked_outcome;
+    use crate::error::ChildFate;
+    use crate::identity::Termination;
+    use windows::core::{Error as WinError, HRESULT};
+
+    let (detail, fate) = untracked_outcome(4242, Termination::Terminated);
+    assert_eq!(fate, ChildFate::Killed);
+    assert!(detail.ends_with("it was terminated"), "{detail}");
+
+    let (detail, fate) = untracked_outcome(4242, Termination::Exited);
+    assert_eq!(fate, ChildFate::Killed);
+    assert!(detail.ends_with("it was already exiting"), "{detail}");
+
+    let refusal = WinError::from_hresult(HRESULT::from_win32(5));
+    let (detail, fate) = untracked_outcome(4242, Termination::Failed(refusal));
+    assert_eq!(fate, ChildFate::Running { id: None });
+    assert!(detail.contains("pid 4242"), "{detail}");
+    assert!(
+        detail.contains("could not be terminated (") && detail.contains("it may still be running"),
+        "{detail}"
+    );
+}

@@ -476,6 +476,26 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
     })))
 }
 
+/// The detail and fate of a launched child whose identity could not be read, after its
+/// termination came back as `outcome`.
+fn untracked_outcome(pid: u32, outcome: Termination) -> (String, ChildFate) {
+    match outcome {
+        Termination::Terminated => (
+            "the elevated child launched but its identity could not be resolved; it was terminated".into(),
+            ChildFate::Killed,
+        ),
+        Termination::Exited => (
+            "the elevated child launched but its identity could not be resolved; it was already exiting".into(),
+            ChildFate::Killed,
+        ),
+        Termination::Failed(e) => (
+            format!("the elevated child (pid {pid}) launched but its identity could not be resolved and could not be terminated ({e}); it may still be running"),
+            // Its identity is what could not be resolved.
+            ChildFate::Running { id: None },
+        ),
+    }
+}
+
 /// The effect: `ShellExecuteEx(runas)` on an already-validated payload, plus the identity read of
 /// the child it launched. Everything that could refuse the request happened in [`plan_runas`].
 ///
@@ -539,21 +559,7 @@ pub(crate) fn launch_runas_with_host(cmd: &Command, host: &Host) -> Result<Runas
         // Auth SUCCEEDED but we cannot track the child. Terminate it, and report the
         // ACTUAL outcome (terminated vs still-running) in the detail — the kind stays neutral.
         // The elevated child may be higher-integrity than us, so ask whether we may terminate it.
-        let (detail, fate) = match windows_terminate_held(handle, can_terminate(pid)) {
-            Termination::Terminated => (
-                "the elevated child launched but its identity could not be resolved; it was terminated".into(),
-                ChildFate::Killed,
-            ),
-            Termination::Exited => (
-                "the elevated child launched but its identity could not be resolved; it was already exiting".into(),
-                ChildFate::Killed,
-            ),
-            Termination::Failed(e) => (
-                format!("the elevated child (pid {pid}) launched but its identity could not be resolved and could not be terminated ({e}); it may still be running"),
-                // Its identity is what could not be resolved.
-                ChildFate::Running { id: None },
-            ),
-        };
+        let (detail, fate) = untracked_outcome(pid, windows_terminate_held(handle, can_terminate(pid)));
         return Err(SpawnFailure::started(
             Error::Elevation {
                 kind: ElevationErrorKind::Untracked,
