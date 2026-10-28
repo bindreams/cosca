@@ -40,39 +40,18 @@ use sync_raw::{exit_status, wait_handle_or_cancel, WaitOutcome};
 #[derive(Debug)]
 pub(crate) struct RawAsyncChild {
     proc: Arc<OwnedHandle>,
-    /// The child's OS pid — retained for diagnostics (the `Child`'s stable `ProcessId` is the
-    /// source of truth for containment queries).
-    pid: u32,
     /// Memoized once the child has exited, so a second `wait`/`try_wait` is immediate and cannot
     /// re-read a status off a (post-close) recycled handle.
     exited: Option<ExitStatus>,
-    /// A runas (UAC-elevated) child a lower-integrity parent may be unable to terminate. Drives
-    /// [`start_kill`](RawAsyncChild::start_kill)'s `is_unkillable` probe, which is the sole owner
-    /// of "this child is genuinely unkillable" — nothing waits on one.
-    runas: bool,
     #[cfg(test)]
     observer: Option<WaitObserver>,
 }
 
 impl RawAsyncChild {
-    pub(crate) fn new(proc: OwnedHandle, pid: u32) -> RawAsyncChild {
+    pub(crate) fn new(proc: OwnedHandle) -> RawAsyncChild {
         RawAsyncChild {
             proc: Arc::new(proc),
-            pid,
             exited: None,
-            runas: false,
-            #[cfg(test)]
-            observer: None,
-        }
-    }
-
-    /// A runas (UAC-elevated) child, whose kill may be refused (see the `runas` field).
-    pub(crate) fn new_runas(proc: OwnedHandle, pid: u32) -> RawAsyncChild {
-        RawAsyncChild {
-            proc: Arc::new(proc),
-            pid,
-            exited: None,
-            runas: true,
             #[cfg(test)]
             observer: None,
         }
@@ -171,10 +150,9 @@ impl RawAsyncChild {
 
     /// Signal a hard kill (does not reap). Signal-only, so it never blocks.
     pub(crate) fn start_kill(&self) -> Result<(), Error> {
-        // Signal-only, so never block: a refusal on a handle that holds `PROCESS_TERMINATE` is the
-        // exit, and `Exited` answers it. Only a runas child we cannot terminate is refused for
-        // good; that surfaces as `Io`, which `Child::kill` maps to the typed `Unkillable`.
-        match windows_terminate_held(self.handle(), !sync_raw::is_unkillable(self.runas, self.pid)) {
+        // Signal-only, never block. A handle without `PROCESS_TERMINATE` (a runas child we cannot
+        // terminate) surfaces as `Io`.
+        match windows_terminate_held(self.handle()) {
             Termination::Terminated | Termination::Exited => Ok(()),
             Termination::Failed(e) => Err(Error::Io(win32_io_error(e))),
         }
@@ -353,7 +331,7 @@ pub(crate) fn spawn_raw(
     };
 
     Ok(Child::from_parts(
-        ProcSource::Raw(RawAsyncChild::new(proc, pid)),
+        ProcSource::Raw(RawAsyncChild::new(proc)),
         id,
         kill_on_drop,
         attachment,

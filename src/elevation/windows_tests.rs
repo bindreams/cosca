@@ -1077,7 +1077,10 @@ fn an_untracked_child_fate_follows_how_its_termination_ended() {
 
     let (detail, fate) = untracked_outcome(4242, Termination::Exited);
     assert_eq!(fate, ChildFate::Killed);
-    assert!(detail.ends_with("it was already exiting"), "{detail}");
+    assert!(
+        detail.ends_with("it was already exiting, and its exit was not waited for"),
+        "{detail}"
+    );
 
     let refusal = WinError::from_hresult(HRESULT::from_win32(5));
     let (detail, fate) = untracked_outcome(4242, Termination::Failed(refusal));

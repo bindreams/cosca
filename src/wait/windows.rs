@@ -292,10 +292,9 @@ pub(crate) fn kill(id: ProcessId) -> Result<(), Error> {
     terminate_and_close(handle, id)
 }
 
-/// Terminates `id`'s process through `handle`, which pins it and holds `PROCESS_TERMINATE`, then
-/// closes `handle`. A refusal is the process exiting: success.
+/// Terminates `id`'s process through `handle`, which pins it, then closes `handle`.
 fn terminate_and_close(handle: HANDLE, id: ProcessId) -> Result<(), Error> {
-    let outcome = windows_terminate_held(handle, true);
+    let outcome = windows_terminate_held(handle);
     close(handle);
     match outcome {
         Termination::Terminated | Termination::Exited => Ok(()),

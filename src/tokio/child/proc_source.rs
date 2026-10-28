@@ -626,8 +626,7 @@ impl ProcSource {
                     return Ok(Sent::Gone);
                 };
                 // SAFETY of the handle: tokio owns it live while `raw_handle` is `Some`.
-                // A child tokio spawned holds every right on its handle.
-                terminate_unreaped(windows::Win32::Foundation::HANDLE(h), true)
+                terminate_unreaped(windows::Win32::Foundation::HANDLE(h))
             }
             #[cfg(windows)]
             ProcSource::Raw(r) => {
@@ -1804,14 +1803,13 @@ fn wait_reapable(pid: u32, identity: u64, level: log::Level) -> (Waited, Option<
     }
 }
 
-/// Windows: hard-kill the not-yet-reaped child whose live process handle is `h`; see
-/// [`windows_terminate_held`](crate::identity::windows_terminate_held) for `holds_terminate`. Never
-/// blocks. A failure keeps its Win32 code, so a denial classifies as `PermissionDenied`.
+/// Windows: hard-kill the not-yet-reaped child whose live process handle is `h`, through
+/// [`windows_terminate_held`](crate::identity::windows_terminate_held). Never blocks.
 #[cfg(windows)]
-pub(super) fn terminate_unreaped(h: windows::Win32::Foundation::HANDLE, holds_terminate: bool) -> Result<Sent, Error> {
+pub(super) fn terminate_unreaped(h: windows::Win32::Foundation::HANDLE) -> Result<Sent, Error> {
     use crate::identity::{windows_terminate_held, Termination};
     // `h` is a live process handle the caller owns.
-    match windows_terminate_held(h, holds_terminate) {
+    match windows_terminate_held(h) {
         Termination::Terminated | Termination::Exited => Ok(Sent::Delivered),
         Termination::Failed(e) => Err(Error::Io(crate::error::win32_io_error(e))),
     }

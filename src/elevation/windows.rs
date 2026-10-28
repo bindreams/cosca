@@ -226,7 +226,7 @@ use windows::Win32::UI::Shell::{
 
 use crate::child::proc_handle::ProcHandle;
 use crate::child::spawn::windows_raw::resolve::ensure_no_nul_wide;
-use crate::child::spawn::windows_raw::{can_terminate, RawChild};
+use crate::child::spawn::windows_raw::RawChild;
 use crate::child::spawn::{Classify, SpawnFailure};
 use crate::containment::Attachment;
 use crate::elevation::plan::Transition;
@@ -477,7 +477,7 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
 }
 
 /// The detail and fate of a launched child whose identity could not be read, after its
-/// termination came back as `outcome`.
+/// termination came back as `outcome`. Never waits.
 fn untracked_outcome(pid: u32, outcome: Termination) -> (String, ChildFate) {
     match outcome {
         Termination::Terminated => (
@@ -485,7 +485,9 @@ fn untracked_outcome(pid: u32, outcome: Termination) -> (String, ChildFate) {
             ChildFate::Killed,
         ),
         Termination::Exited => (
-            "the elevated child launched but its identity could not be resolved; it was already exiting".into(),
+            "the elevated child launched but its identity could not be resolved; it was already exiting, and its exit was not waited for".into(),
+            // `Killed` is "dead or dying, exit not collected": it claims no completion. Waiting here
+            // would block, and this launch runs inside the async spawn too.
             ChildFate::Killed,
         ),
         Termination::Failed(e) => (
@@ -558,8 +560,7 @@ pub(crate) fn launch_runas_with_host(cmd: &Command, host: &Host) -> Result<Runas
     let Some(id) = id else {
         // Auth SUCCEEDED but we cannot track the child. Terminate it, and report the
         // ACTUAL outcome (terminated vs still-running) in the detail — the kind stays neutral.
-        // The elevated child may be higher-integrity than us, so ask whether we may terminate it.
-        let (detail, fate) = untracked_outcome(pid, windows_terminate_held(handle, can_terminate(pid)));
+        let (detail, fate) = untracked_outcome(pid, windows_terminate_held(handle));
         return Err(SpawnFailure::started(
             Error::Elevation {
                 kind: ElevationErrorKind::Untracked,
@@ -587,10 +588,8 @@ pub(crate) fn spawn_elevated(cmd: &mut Command, kill_on_drop: bool) -> Result<cr
             Ok(child)
         }
         RunasOutcome::Launched { proc, pid, id, report } => {
-            // A dedicated non-blocking-kill handle (RawChild::new_runas): a higher-integrity
-            // child a medium parent cannot terminate never hangs Drop.
             let mut child = crate::child::Child::from_parts(
-                ProcHandle::Raw(RawChild::new_runas(proc, pid)),
+                ProcHandle::Raw(RawChild::new(proc, pid)),
                 id,
                 BTreeMap::new(),
                 kill_on_drop,

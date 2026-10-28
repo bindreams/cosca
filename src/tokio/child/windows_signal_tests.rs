@@ -76,7 +76,7 @@ async fn a_kill_of_an_exited_child_through_an_unwaitable_handle_is_a_success() {
         )
     }
     .expect("duplicate the child's handle without SYNCHRONIZE");
-    let result = terminate_unreaped(limited, true);
+    let result = terminate_unreaped(limited);
     // SAFETY: `limited` is the owned duplicate made above.
     unsafe { CloseHandle(limited) }.expect("close the duplicate");
 
@@ -100,16 +100,16 @@ fn a_terminate_failure_carries_its_win32_code() {
     use windows::Win32::Foundation::{ERROR_INVALID_HANDLE, HANDLE};
 
     let event = crate::wait::backend::new_cancel_event().expect("create an event");
-    let err = terminate_unreaped(HANDLE(event.as_raw_handle()), true).expect_err("an event cannot be terminated");
+    let err = terminate_unreaped(HANDLE(event.as_raw_handle())).expect_err("an event cannot be terminated");
     let crate::error::Error::Io(err) = err else {
         panic!("expected Io, got {err:?}");
     };
     assert_eq!(err.raw_os_error(), Some(ERROR_INVALID_HANDLE.0 as i32), "{err:?}");
 }
 
-/// A handle without `PROCESS_TERMINATE` that cannot be waited on either is a real denial, not an exiting
-/// child: it is an error with `ERROR_ACCESS_DENIED` as its code and `PermissionDenied` as its kind,
-/// which `map_elevated_kill_error` turns into `Unkillable` for an elevated wrapper.
+/// A handle without `PROCESS_TERMINATE` that cannot be waited on either is a real denial: an error
+/// with `ERROR_ACCESS_DENIED` as its code and `PermissionDenied` as its kind, which
+/// `map_elevated_kill_error` turns into `Unkillable` for an elevated wrapper.
 ///
 /// Mutant: the `ACCESS_DENIED` arm of `terminate_unreaped` converts with `.into()`, so the code is
 /// `0x80070005` and the kind is not `PermissionDenied`.
@@ -138,7 +138,7 @@ fn a_denied_terminate_of_an_unwaitable_handle_carries_its_win32_code() {
         )
     }
     .expect("duplicate this process's handle with reduced access");
-    let result = terminate_unreaped(limited, false);
+    let result = terminate_unreaped(limited);
     // SAFETY: `limited` is the owned duplicate made above.
     unsafe { CloseHandle(limited) }.expect("close the duplicate");
 

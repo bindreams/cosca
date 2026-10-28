@@ -257,7 +257,7 @@ async fn async_raw_refusals_before_create_process_did_not_start() {
 fn a_failed_start_kill_is_reported_as_its_win32_code() {
     use crate::tokio::spawn::windows_raw::RawAsyncChild;
     let event = crate::wait::backend::new_cancel_event().expect("create an event");
-    let child = RawAsyncChild::new(event, 0);
+    let child = RawAsyncChild::new(event);
     let err = child.start_kill().expect_err("an event cannot be terminated");
     let crate::error::Error::Io(err) = err else {
         panic!("expected Io, got {err:?}");
@@ -269,27 +269,74 @@ fn a_failed_start_kill_is_reported_as_its_win32_code() {
     );
 }
 
-/// A runas child we cannot terminate that has already exited: the refusal is the exit, not a
-/// denial, so `start_kill` succeeds.
+/// A handle without `PROCESS_TERMINATE` to a child that has exited: its signalled state is the
+/// exit, so `start_kill` succeeds.
 ///
-/// Mutant: `start_kill` reads the refusal by `can_terminate` alone, so it returns
+/// Mutant: `start_kill` reads the refusal by the handle's rights alone, so it returns
 /// `ERROR_ACCESS_DENIED` for a dead child.
 #[skuld::test]
-fn start_kill_of_an_unterminable_runas_child_that_already_exited_succeeds() {
+fn start_kill_of_a_handle_without_terminate_to_an_exited_child_succeeds() {
     use crate::tokio::spawn::windows_raw::RawAsyncChild;
-    use std::os::windows::io::{AsRawHandle, OwnedHandle};
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use windows::Win32::Foundation::HANDLE;
-    use windows::Win32::System::Threading::{WaitForSingleObject, INFINITE};
+    use windows::Win32::System::Threading::{
+        OpenProcess, WaitForSingleObject, INFINITE, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    };
 
     let std_child = crate::test_spawn::spawn(std::process::Command::new("cmd").args(["/C", "exit 0"])).expect("spawn");
-    let pid = std_child.id();
     // SAFETY: `std_child` owns the live handle; it is only waited on.
     unsafe { WaitForSingleObject(HANDLE(std_child.as_raw_handle()), INFINITE) };
-    let handle: OwnedHandle = std_child.into();
-    let child = RawAsyncChild::new_runas(handle, pid);
-    let observer = crate::child::spawn::windows_raw::fault::observe_waits(|| {});
-    observer.force_unterminable();
+    // SAFETY: `std_child` pins the pid.
+    let limited = unsafe {
+        OpenProcess(
+            PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+            false,
+            std_child.id(),
+        )
+    }
+    .expect("open without PROCESS_TERMINATE");
+    // SAFETY: `limited` is a fresh owned handle.
+    let child = RawAsyncChild::new(unsafe { OwnedHandle::from_raw_handle(limited.0) });
     child
         .start_kill()
-        .expect("a refusal on an exited child is not a denial, whatever can_terminate says");
+        .expect("a signalled process is the exit, not a denial");
+}
+
+/// A handle without `PROCESS_TERMINATE` to a live child (a higher-integrity runas child): the
+/// refusal is a denial, not the exit.
+///
+/// Mutant: every `ERROR_ACCESS_DENIED` reads as the exit, so `start_kill` is `Ok` for a live child.
+#[skuld::test]
+fn start_kill_of_a_handle_without_terminate_to_a_live_child_is_denied() {
+    use crate::tokio::spawn::windows_raw::RawAsyncChild;
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    use windows::Win32::Foundation::ERROR_ACCESS_DENIED;
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE};
+
+    let mut std_child = crate::test_spawn::spawn(
+        std::process::Command::new("cmd")
+            .args(["/C", "more"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+    )
+    .expect("spawn a child that blocks on stdin");
+    // SAFETY: `std_child` pins the pid.
+    let limited = unsafe {
+        OpenProcess(
+            PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+            false,
+            std_child.id(),
+        )
+    }
+    .expect("open without PROCESS_TERMINATE");
+    // SAFETY: `limited` is a fresh owned handle.
+    let child = RawAsyncChild::new(unsafe { OwnedHandle::from_raw_handle(limited.0) });
+    let result = child.start_kill();
+    std_child.kill().expect("end the fixture");
+    std_child.wait().expect("reap the fixture");
+    let crate::error::Error::Io(err) = result.expect_err("a live child behind a handle without the right") else {
+        panic!("expected Io");
+    };
+    assert_eq!(err.raw_os_error(), Some(ERROR_ACCESS_DENIED.0 as i32), "{err:?}");
 }

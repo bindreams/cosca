@@ -65,8 +65,6 @@ pub(crate) mod resolve;
 #[path = "windows_raw/proc.rs"]
 mod proc;
 
-#[cfg(all(test, feature = "tokio"))]
-pub(crate) use proc::fault;
 pub(crate) use proc::RawChild;
 // The exit-status reader, which `wait::exit_only` reads a signalled handle's code through too.
 pub(crate) use proc::exit_status;
@@ -83,11 +81,10 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsRawHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
 
-use windows::Win32::Foundation::{CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT};
+use windows::Win32::Foundation::{SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT};
 use windows::Win32::System::Threading::{
-    DeleteProcThreadAttributeList, InitializeProcThreadAttributeList, OpenProcess, UpdateProcThreadAttribute,
-    LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_TERMINATE, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, STARTF_USESTDHANDLES,
-    STARTUPINFOEXW,
+    DeleteProcThreadAttributeList, InitializeProcThreadAttributeList, UpdateProcThreadAttribute,
+    LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, STARTF_USESTDHANDLES, STARTUPINFOEXW,
 };
 
 use crate::child::proc_handle::ProcHandle;
@@ -512,35 +509,6 @@ pub(crate) fn raw_spawn_teardown(proc: OwnedHandle, pid: u32, id: Option<crate::
             ChildFate::Killed
         }
     }
-}
-
-/// Does the caller hold `PROCESS_TERMINATE` on `pid`? A STATIC permission answer (a second
-/// `OpenProcess`), used to separate a genuine higher-integrity runas denial from the OS
-/// teardown-window `ACCESS_DENIED` WITHOUT racing a `try_wait`. Pid-reuse-safe when the caller
-/// still holds a handle pinning the process object. Shared by the sync `RawChild` and the async
-/// `RawAsyncChild` runas kill paths so both surface the same typed `Unkillable`.
-pub(crate) fn can_terminate(pid: u32) -> bool {
-    #[cfg(test)]
-    if proc::fault::probe_forced_unterminable() {
-        return false;
-    }
-    // SAFETY: the caller holds a live owned handle pinning the process object, so `pid` still
-    // names THIS process; OpenProcess tolerates failure (returns Err).
-    match unsafe { OpenProcess(PROCESS_TERMINATE, false, pid) } {
-        Ok(h) => {
-            // SAFETY: `h` is an owned handle from a successful OpenProcess; close it once.
-            let closed = unsafe { CloseHandle(h) };
-            debug_assert!(closed.is_ok(), "CloseHandle of an owned probe handle should not fail");
-            true
-        }
-        Err(_) => false,
-    }
-}
-
-/// Whether a runas child's handle lacks `PROCESS_TERMINATE`, so a refusal of its `TerminateProcess`
-/// is a real denial (a higher-integrity child) and not the exit. Any other child holds every right.
-pub(crate) fn is_unkillable(runas: bool, pid: u32) -> bool {
-    runas && !can_terminate(pid)
 }
 
 /// The `STARTUPINFOEXW` for a raw spawn, with what it points at.

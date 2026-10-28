@@ -31,9 +31,6 @@ const INFINITE: u32 = 0xFFFF_FFFF;
 pub(crate) struct RawChild {
     proc: OwnedHandle,
     pid: u32,
-    /// A `runas`-elevated (higher-integrity) child a lower-integrity parent may be
-    /// unable to `PROCESS_TERMINATE`. Its kill/teardown must never block on it.
-    runas: bool,
     /// The status this handle's own `wait`, `try_wait` or `wait_deadline` returned: set once, and
     /// only by them, so [`is_reaped`](Self::is_reaped) means "this handle recorded the exit".
     /// A reader that sees the record a moment late is harmless on Windows: the open process
@@ -46,18 +43,6 @@ impl RawChild {
         RawChild {
             proc,
             pid,
-            runas: false,
-            reaped: OnceLock::new(),
-        }
-    }
-
-    /// A `runas`-elevated child: a higher-integrity process a lower-integrity parent
-    /// may be unable to `PROCESS_TERMINATE`. Its kill/teardown never block on it.
-    pub(crate) fn new_runas(proc: OwnedHandle, pid: u32) -> RawChild {
-        RawChild {
-            proc,
-            pid,
-            runas: true,
             reaped: OnceLock::new(),
         }
     }
@@ -69,12 +54,6 @@ impl RawChild {
     /// The process handle, borrowed from `self`.
     pub(crate) fn raw_handle(&self) -> std::os::windows::io::RawHandle {
         self.proc.as_raw_handle()
-    }
-
-    /// Whether this child's handle lacks `PROCESS_TERMINATE`, so the `TerminateProcess` refusal of
-    /// a handle that cannot be shown to hold it is a real denial; see [`super::is_unkillable`].
-    fn is_unkillable(&self) -> bool {
-        super::is_unkillable(self.runas, self.pid)
     }
 
     /// Block on the exit that a denied or accepted `TerminateProcess` has set in motion.
@@ -155,26 +134,25 @@ impl RawChild {
 
     /// Hard-kill the process. An already-exited child is success (matches std's `kill`).
     pub(crate) fn kill(&self) -> io::Result<()> {
-        match windows_terminate_held(self.handle(), !self.is_unkillable()) {
+        match windows_terminate_held(self.handle()) {
             Termination::Terminated => Ok(()),
-            // The refusal is the exit. BLOCK on that real event (never a timer) to record it.
+            // Record the exit: block on the real exit event.
             Termination::Exited => self.reap().map(drop),
-            // A genuinely higher-integrity runas child we cannot terminate, or any other failure.
-            // Do NOT block in wait(): surface it.
+            // A handle without `PROCESS_TERMINATE` (a higher-integrity runas child), or any other
+            // failure: surface it, never block.
             Termination::Failed(e) => Err(win32_io_error(e)),
         }
     }
 
-    /// Best-effort `kill_on_drop` teardown that NEVER blocks on an unkillable runas child.
-    /// Non-runas (or a runas child we can terminate): kill, then reap via a blocking wait on
-    /// the real exit event. A genuinely higher-integrity runas child (the static `can_terminate`
-    /// probe is false): say so and move on — never block. What it could
-    /// not do comes back in [`Torn::left`] for the caller's one warn; nothing is logged here.
+    /// Best-effort `kill_on_drop` teardown that never blocks on a child it cannot terminate.
+    /// Kill, then reap via a blocking wait on the real exit event. A handle without
+    /// `PROCESS_TERMINATE` (a higher-integrity runas child) is left running, never waited on. What
+    /// it could not do comes back in [`Torn::left`] for the caller's one warn; nothing is logged
+    /// here.
     pub(crate) fn teardown_on_drop(&self, id: crate::identity::ProcessId) -> crate::child::proc_handle::Torn {
         use crate::child::proc_handle::Torn;
         use crate::error::ChildFate;
-        // The kill was refused: only the wait's result says what became of the child.
-        let reap_refused = || {
+        let reap_after_refusal = || {
             let reaped = self.reap();
             #[cfg(test)]
             if let Ok(status) = &reaped {
@@ -182,7 +160,7 @@ impl RawChild {
             }
             Torn::new(fate_after_reap(false, reaped))
         };
-        match windows_terminate_held(self.handle(), !self.is_unkillable()) {
+        match windows_terminate_held(self.handle()) {
             Termination::Terminated => {
                 #[cfg(test)]
                 crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterDropKill);
@@ -193,9 +171,8 @@ impl RawChild {
                 }
                 Torn::new(fate_after_reap(true, reaped))
             }
-            Termination::Exited => reap_refused(),
-            // Only a handle without `PROCESS_TERMINATE` is refused for good: a runas child that is
-            // genuinely higher-integrity. Never block on it.
+            Termination::Exited => reap_after_refusal(),
+            // A runas child without `PROCESS_TERMINATE`: leave it, never block.
             Termination::Failed(e) if windows_is_access_denied(&e) => Torn {
                 fate: ChildFate::Running { id: Some(id) },
                 left: Some(format!(
@@ -340,7 +317,6 @@ pub(crate) mod fault {
         armed: bool,
         on_wait: Option<Box<dyn FnMut()>>,
         waits: u32,
-        unterminable: bool,
     }
 
     thread_local! {
@@ -379,10 +355,6 @@ pub(crate) mod fault {
         }
     }
 
-    pub(crate) fn probe_forced_unterminable() -> bool {
-        STATE.with(|s| s.borrow().unterminable)
-    }
-
     #[must_use]
     pub(crate) struct Observer;
 
@@ -390,11 +362,6 @@ pub(crate) mod fault {
         /// Blocking reaps started since arming.
         pub(crate) fn waits(&self) -> u32 {
             STATE.with(|s| s.borrow().waits)
-        }
-
-        /// Make `can_terminate` answer `false`, as for a higher-integrity child.
-        pub(crate) fn force_unterminable(&self) {
-            STATE.with(|s| s.borrow_mut().unterminable = true);
         }
     }
 

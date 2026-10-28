@@ -15,13 +15,16 @@
 
 use std::time::{Duration, SystemTime};
 
+use windows::Wdk::Foundation::{NtQueryObject, ObjectBasicInformation};
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_INVALID_PARAMETER, FILETIME, HANDLE, STILL_ACTIVE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, RtlNtStatusToDosError, ERROR_INVALID_PARAMETER, FILETIME, HANDLE, STILL_ACTIVE, WAIT_FAILED,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::System::Threading::{
     GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, OpenProcess, TerminateProcess, WaitForSingleObject,
-    PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
 };
+use windows::Win32::System::WindowsProgramming::PUBLIC_OBJECT_BASIC_INFORMATION;
 
 use super::{Liveness, RawPid, Resolved, StartToken};
 
@@ -75,45 +78,82 @@ pub(crate) fn close(handle: HANDLE) {
 pub(crate) enum Termination {
     /// `TerminateProcess` accepted the request.
     Terminated,
-    /// `TerminateProcess` refused because the process is exiting or has exited. Like
-    /// `Terminated`, this is a termination under way, not a completed one: the process object may
-    /// not be signalled yet.
+    /// `TerminateProcess` refused because the process is exiting or has exited: a termination under
+    /// way, not a completed one.
     Exited,
     /// `TerminateProcess` failed, or refused a handle that is not shown to be of an exited process.
     Failed(windows::core::Error),
 }
 
-/// Whether `e` is `ERROR_ACCESS_DENIED`, the refusal `TerminateProcess` gives for a handle without
-/// `PROCESS_TERMINATE` and, per Microsoft, for a process that has terminated.
+/// Whether `e` is `ERROR_ACCESS_DENIED`; see [`terminate_held`].
 pub(crate) fn is_access_denied(e: &windows::core::Error) -> bool {
     e.code() == windows::core::HRESULT::from_win32(windows::Win32::Foundation::ERROR_ACCESS_DENIED.0)
 }
 
 /// `TerminateProcess` on `handle`, a live process handle the caller closes afterwards. Never
-/// blocks. `holds_terminate` says whether `handle` has `PROCESS_TERMINATE`.
+/// blocks.
 ///
-/// `TerminateProcess` refuses with `ERROR_ACCESS_DENIED` a handle that lacks `PROCESS_TERMINATE`
-/// and a process that has terminated (Microsoft's `TerminateProcess` page). So a refusal on a
-/// handle that holds the right can only be the exit: [`Termination::Exited`]. The refusal is
-/// already given while the process object is not signalled yet (measured on Windows 11 26100), so
-/// reading the signalled state instead would miss that window.
+/// `TerminateProcess` refuses with `ERROR_ACCESS_DENIED` both a handle that lacks
+/// `PROCESS_TERMINATE` and a process that has terminated (Microsoft's `TerminateProcess` page), so
+/// the handle's own granted access, read with `NtQueryObject`, decides what a refusal means:
+/// - It holds the right: the refusal is the exit, [`Termination::Exited`]. The refusal is already
+///   given while the process object is not signalled yet (measured on Windows 11 26100), so
+///   reading the signalled state instead would miss that window.
+/// - It lacks the right: only the signalled state, a zero-timeout wait on the handle, proves an
+///   exit. That needs `SYNCHRONIZE`, and a handle without it, or an unsignalled process, is
+///   [`Termination::Failed`] with the refusal. The exit code is never read instead: 259 cannot be
+///   told from a live process.
 ///
-/// A handle that may lack the right (`holds_terminate == false`) is refused for either reason. Its
-/// signalled state, a zero-timeout wait on the handle, is then the only proof of an exit; reading
-/// it needs `SYNCHRONIZE`, and a handle without it, or an unsignalled process, is
-/// [`Termination::Failed`] with the refusal. The exit code is never read instead: 259 cannot be
-/// told from a live process.
-pub(crate) fn terminate_held(handle: HANDLE, holds_terminate: bool) -> Termination {
-    match terminate_process(handle) {
-        Ok(()) => Termination::Terminated,
-        Err(e) if !is_access_denied(&e) => Termination::Failed(e),
-        Err(_) if holds_terminate => Termination::Exited,
+/// A handle whose granted access cannot be read is [`Termination::Failed`] with that error.
+pub(crate) fn terminate_held(handle: HANDLE) -> Termination {
+    let refusal = match terminate_process(handle) {
+        Ok(()) => return Termination::Terminated,
+        Err(e) if !is_access_denied(&e) => return Termination::Failed(e),
+        Err(e) => e,
+    };
+    match granted_access(handle) {
+        Err(e) => Termination::Failed(e),
+        Ok(access) if access & PROCESS_TERMINATE.0 != 0 => Termination::Exited,
         // SAFETY: the caller's live process handle; a zero-timeout wait only reads its state.
-        Err(e) => match unsafe { WaitForSingleObject(handle, 0) } {
+        Ok(_) => match unsafe { WaitForSingleObject(handle, 0) } {
             WAIT_OBJECT_0 => Termination::Exited,
-            _ => Termination::Failed(e),
+            WAIT_TIMEOUT => Termination::Failed(refusal),
+            WAIT_FAILED => {
+                log::debug!(
+                    "terminate_held: waiting on a handle without PROCESS_TERMINATE failed: {}",
+                    windows::core::Error::from_thread()
+                );
+                Termination::Failed(refusal)
+            }
+            other => {
+                debug_assert!(false, "WaitForSingleObject returned {other:?}");
+                Termination::Failed(refusal)
+            }
         },
     }
+}
+
+/// The access `handle` was granted, from `NtQueryObject(ObjectBasicInformation)`.
+fn granted_access(handle: HANDLE) -> windows::core::Result<u32> {
+    let mut info = PUBLIC_OBJECT_BASIC_INFORMATION::default();
+    // SAFETY: `handle` is live; `info` is the buffer the class describes, and its size is passed.
+    let status = unsafe {
+        NtQueryObject(
+            Some(handle),
+            ObjectBasicInformation,
+            Some(std::ptr::from_mut(&mut info).cast()),
+            std::mem::size_of::<PUBLIC_OBJECT_BASIC_INFORMATION>() as u32,
+            None,
+        )
+    };
+    if status.is_ok() {
+        return Ok(info.GrantedAccess);
+    }
+    // SAFETY: a pure status-to-code mapping.
+    let code = unsafe { RtlNtStatusToDosError(status) };
+    Err(windows::core::Error::from_hresult(windows::core::HRESULT::from_win32(
+        code,
+    )))
 }
 
 fn terminate_process(handle: HANDLE) -> windows::core::Result<()> {
@@ -136,9 +176,8 @@ pub(crate) mod fault {
         static EXITING: Cell<bool> = const { Cell::new(false) };
     }
 
-    /// Make the NEXT `terminate_held` on THIS thread refuse with `ERROR_ACCESS_DENIED` without
-    /// calling `TerminateProcess`, as Windows does for a process that is exiting but whose
-    /// object is not signalled yet. The process itself stays alive.
+    /// Make the next `terminate_held` on this thread refuse with `ERROR_ACCESS_DENIED` without
+    /// calling `TerminateProcess`; the process stays alive.
     pub(crate) fn refuse_next_terminate_as_exiting() {
         EXITING.with(|e| e.set(true));
     }
