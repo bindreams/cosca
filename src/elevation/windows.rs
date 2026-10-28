@@ -476,22 +476,33 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
     })))
 }
 
-/// The detail and fate of a launched child whose identity could not be read, after its
-/// termination came back as `outcome`. Never waits.
-fn untracked_outcome(pid: u32, outcome: Termination) -> (String, ChildFate) {
+/// The detail and fate of a launched child that could not be tracked, after its termination came
+/// back as `outcome`. `pid` is what `GetProcessId` returned: its error when the pid could not be
+/// read, else the pid whose identity could not be resolved. Never waits.
+fn untracked_outcome(pid: Result<u32, windows::core::Error>, outcome: Termination) -> (String, ChildFate) {
+    let (who, why) = match &pid {
+        Ok(pid) => (
+            format!("the elevated child (pid {pid})"),
+            "its identity could not be resolved".to_string(),
+        ),
+        Err(e) => (
+            "the elevated child".to_string(),
+            format!("its pid could not be read (GetProcessId: {e})"),
+        ),
+    };
     match outcome {
         Termination::Terminated => (
-            "the elevated child launched but its identity could not be resolved; it was terminated".into(),
+            format!("the elevated child launched but {why}; it was terminated"),
             ChildFate::Killed,
         ),
         Termination::Exited => (
-            "the elevated child launched but its identity could not be resolved; it was already exiting, and its exit was not waited for".into(),
+            format!("the elevated child launched but {why}; it exited or is exiting, and its exit was not waited for"),
             // `Killed` is "dead or dying, exit not collected": it claims no completion. Waiting here
             // would block, and this launch runs inside the async spawn too.
             ChildFate::Killed,
         ),
         Termination::Failed(e) => (
-            format!("the elevated child (pid {pid}) launched but its identity could not be resolved and could not be terminated ({e}); it may still be running"),
+            format!("{who} launched but {why} and could not be terminated ({e}); it may still be running"),
             // Its identity is what could not be resolved.
             ChildFate::Running { id: None },
         ),
@@ -551,13 +562,15 @@ pub(crate) fn launch_runas_with_host(cmd: &Command, host: &Host) -> Result<Runas
     // Identity from the OWNED handle — no second OpenProcess.
     let handle = HANDLE(proc.as_raw_handle());
     // SAFETY: `handle` is our live, owned process handle.
-    let pid = unsafe { GetProcessId(handle) };
-    let id = if pid != 0 {
-        crate::identity::windows_identity_from_handle(handle, pid)
-    } else {
-        None
+    let pid = match unsafe { GetProcessId(handle) } {
+        0 => Err(windows::core::Error::from_thread()),
+        pid => Ok(pid),
     };
-    let Some(id) = id else {
+    let tracked = pid
+        .as_ref()
+        .ok()
+        .and_then(|&pid| crate::identity::windows_identity_from_handle(handle, pid).map(|id| (pid, id)));
+    let Some((pid, id)) = tracked else {
         // Auth SUCCEEDED but we cannot track the child. Terminate it, and report the
         // ACTUAL outcome (terminated vs still-running) in the detail — the kind stays neutral.
         let (detail, fate) = untracked_outcome(pid, windows_terminate_held(handle));

@@ -242,7 +242,7 @@ impl ProcHandle {
     ///
     /// Returns the child's fate, and what it could not do for the caller's one warn: a child it
     /// could not signal and left running, or a reap that failed after the kill. It logs neither
-    /// above `debug`. (The Windows `Raw` arm still logs its own refusal.)
+    /// above `debug`.
     pub(crate) fn teardown_on_drop(&self, id: crate::identity::ProcessId) -> Torn {
         use crate::error::ChildFate;
         #[cfg(all(test, unix))]

@@ -1063,7 +1063,8 @@ fn a_shell_execute_failure_takes_its_answer_from_the_classification() {
 /// could not be read; that arm needs a UAC prompt to reach, so the mapping is tested here.
 ///
 /// Mutants: `Terminated` reported as `Running`; `Exited` reported as `Running`; `Failed` reported
-/// as `Killed`; the failure's code or the pid left out of the detail.
+/// as `Killed`; the failure's code or the pid left out of the detail; an unreadable pid shown as a
+/// pid or worded as an identity failure.
 #[skuld::test]
 fn an_untracked_child_fate_follows_how_its_termination_ended() {
     use super::untracked_outcome;
@@ -1071,23 +1072,44 @@ fn an_untracked_child_fate_follows_how_its_termination_ended() {
     use crate::identity::Termination;
     use windows::core::{Error as WinError, HRESULT};
 
-    let (detail, fate) = untracked_outcome(4242, Termination::Terminated);
+    let (detail, fate) = untracked_outcome(Ok(4242), Termination::Terminated);
     assert_eq!(fate, ChildFate::Killed);
     assert!(detail.ends_with("it was terminated"), "{detail}");
 
-    let (detail, fate) = untracked_outcome(4242, Termination::Exited);
+    let (detail, fate) = untracked_outcome(Ok(4242), Termination::Exited);
     assert_eq!(fate, ChildFate::Killed);
     assert!(
-        detail.ends_with("it was already exiting, and its exit was not waited for"),
+        detail.ends_with("it exited or is exiting, and its exit was not waited for"),
         "{detail}"
     );
 
     let refusal = WinError::from_hresult(HRESULT::from_win32(5));
-    let (detail, fate) = untracked_outcome(4242, Termination::Failed(refusal));
+    let (detail, fate) = untracked_outcome(Ok(4242), Termination::Failed(refusal));
     assert_eq!(fate, ChildFate::Running { id: None });
     assert!(detail.contains("pid 4242"), "{detail}");
+    assert!(detail.contains("identity could not be resolved"), "{detail}");
     assert!(
         detail.contains("could not be terminated (") && detail.contains("it may still be running"),
         "{detail}"
     );
+
+    // A failed `GetProcessId` has no pid to show, and is not an identity failure.
+    let no_pid = || Err(WinError::from_hresult(HRESULT::from_win32(6)));
+    let refusal = WinError::from_hresult(HRESULT::from_win32(5));
+    let (detail, fate) = untracked_outcome(no_pid(), Termination::Failed(refusal));
+    assert_eq!(fate, ChildFate::Running { id: None });
+    assert!(!detail.contains("pid 0"), "{detail}");
+    assert!(
+        detail.contains("pid could not be read (") && detail.contains("GetProcessId"),
+        "{detail}"
+    );
+    assert!(!detail.contains("identity could not be resolved"), "{detail}");
+    assert!(
+        detail.contains("could not be terminated (") && detail.contains("it may still be running"),
+        "{detail}"
+    );
+    let (detail, fate) = untracked_outcome(no_pid(), Termination::Terminated);
+    assert_eq!(fate, ChildFate::Killed);
+    assert!(detail.contains("pid could not be read ("), "{detail}");
+    assert!(detail.ends_with("it was terminated"), "{detail}");
 }
