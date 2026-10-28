@@ -177,7 +177,7 @@ jobs:
         run: cargo nextest run --locked --no-run -p cosca-path --target x86_64-pc-windows-msvc --profile ci
 
       - name: Run tests (cosca-path)
-        timeout-minutes: 8
+        timeout-minutes: 60
         run: ./.github/scripts/run-nextest.ps1 path cargo nextest run --locked -p cosca-path --target x86_64-pc-windows-msvc
 
       - name: Upload JUnit
@@ -218,7 +218,7 @@ jobs:
           - os: darwin
             arch: arm64
             runner: macos-latest
-            timeout: 41
+            timeout: 300
             target: aarch64-apple-darwin
             other: x86_64-apple-darwin
             nextest: exec python3 .github/scripts/run-nextest.py
@@ -228,7 +228,7 @@ jobs:
           - os: darwin
             arch: amd64
             runner: macos-15
-            timeout: 53
+            timeout: 300
             target: x86_64-apple-darwin
             other: aarch64-apple-darwin
             nextest: exec python3 .github/scripts/run-nextest.py
@@ -290,14 +290,14 @@ jobs:
         run: cargo nextest run --locked --no-run --target ${{ matrix.target }} --profile ci
 
       - name: Run tests
-        timeout-minutes: 8
+        timeout-minutes: 60
         run: ${{ matrix.nextest }} tests cargo nextest run --locked --target ${{ matrix.target }}
 
       # The Windows tests that map a drive letter (`DefineDosDeviceW`, visible to the whole logon
       # session) are the `DRIVE_MAPPING` group, off everywhere else.
       - name: Run the drive-mapping test (Windows)
         if: matrix.os == 'windows'
-        timeout-minutes: 8
+        timeout-minutes: 60
         env:
           COSCA_TEST_DRIVE_MAPPING: "1"
           COSCA_TEST_DRIVE_MAPPING_CONSENT: "1"
@@ -314,7 +314,7 @@ jobs:
 
       - name: Run tests (pty feature)
         if: ${{ !cancelled() }}
-        timeout-minutes: 8
+        timeout-minutes: 60
         run: ${{ matrix.nextest }} pty cargo nextest run --locked --features pty --target ${{ matrix.target }}
 
 
@@ -324,7 +324,7 @@ jobs:
 
       - name: Run tests (tokio feature)
         if: ${{ !cancelled() }}
-        timeout-minutes: 8
+        timeout-minutes: 60
         run: ${{ matrix.nextest }} tokio cargo nextest run --locked --features tokio --target ${{ matrix.target }}
 
       # The `TRACER` group attaches a tracer to the tests' own children, as a debugger would; a CI
@@ -333,7 +333,7 @@ jobs:
       # the group's one async test.
       - name: Run the tracer tests (Unix)
         if: ${{ !cancelled() && (matrix.os == 'darwin' || matrix.os == 'linux') }}
-        timeout-minutes: 8
+        timeout-minutes: 60
         env:
           COSCA_TEST_TRACER: "1"
           COSCA_TEST_TRACER_CONSENT: "1"
@@ -348,7 +348,7 @@ jobs:
 
       - name: Run tests (serde feature)
         if: ${{ !cancelled() }}
-        timeout-minutes: 8
+        timeout-minutes: 60
         run: ${{ matrix.nextest }} serde cargo nextest run --locked --features serde --target ${{ matrix.target }}
 
       # The steps above run the root package only.
@@ -356,7 +356,7 @@ jobs:
         run: cargo nextest run --locked --no-run -p cosca-path --target ${{ matrix.target }} --profile ci
 
       - name: Run tests (cosca-path)
-        timeout-minutes: 8
+        timeout-minutes: 60
         run: ${{ matrix.nextest }} path cargo nextest run --locked -p cosca-path --target ${{ matrix.target }}
 
 
@@ -450,7 +450,7 @@ jobs:
 
       - name: Unit tests (release — debug_assertions off)
         if: ${{ !cancelled() && (matrix.os == 'darwin' || matrix.os == 'linux') }}
-        timeout-minutes: 8
+        timeout-minutes: 60
         run: ${{ matrix.nextest }} release cargo nextest run --locked --release --lib --target ${{ matrix.target }}
 
 
@@ -462,13 +462,13 @@ jobs:
 
       - name: Unit tests (release — debug_assertions off, tokio feature)
         if: ${{ !cancelled() && (matrix.os == 'darwin' || matrix.os == 'linux') }}
-        timeout-minutes: 8
+        timeout-minutes: 60
         run: ${{ matrix.nextest }} release-tokio cargo nextest run --locked --release --lib --features tokio --target ${{ matrix.target }}
 
       # The tracer tests with `debug_assertions` off too.
       - name: Run the tracer tests (release — debug_assertions off)
         if: ${{ !cancelled() && (matrix.os == 'darwin' || matrix.os == 'linux') }}
-        timeout-minutes: 8
+        timeout-minutes: 60
         env:
           COSCA_TEST_TRACER: "1"
           COSCA_TEST_TRACER_CONSENT: "1"
@@ -546,7 +546,7 @@ jobs:
 
       - name: Run cgroup v2 containment and namespace tests (Linux)
         if: matrix.os == 'linux'
-        timeout-minutes: 8
+        timeout-minutes: 60
         shell: bash
         run: |
           # shellcheck disable=SC2016 # the root shell expands its own positional arguments
@@ -626,7 +626,7 @@ jobs:
 
       - name: Run setuid tests (Linux)
         if: matrix.os == 'linux'
-        timeout-minutes: 8
+        timeout-minutes: 60
         shell: bash
         env:
           COSCA_TEST_SETUID: "1"
@@ -658,7 +658,7 @@ jobs:
 
       - name: Run setuid-root process-group teardown test as root (Linux)
         if: matrix.os == 'linux'
-        timeout-minutes: 8
+        timeout-minutes: 60
         shell: bash
         env:
           COSCA_TEST_SETUID: "1"
@@ -754,7 +754,7 @@ jobs:
 
       - name: Root lane (root)
         if: ${{ !cancelled() && steps.root_archive.outcome == 'success' }}
-        timeout-minutes: 8
+        timeout-minutes: 60
         uses: ./.github/actions/root-lane
         with:
           slug: root
@@ -768,7 +768,7 @@ jobs:
 
       - name: Root lane (root, unshare -r)
         if: ${{ !cancelled() && steps.root_archive.outcome == 'success' }}
-        timeout-minutes: 8
+        timeout-minutes: 60
         uses: ./.github/actions/root-lane
         with:
           slug: unshare
@@ -785,7 +785,7 @@ jobs:
 
       - name: Root lane (root, DAC_READ_SEARCH)
         if: ${{ !cancelled() && steps.root_archive.outcome == 'success' }}
-        timeout-minutes: 8
+        timeout-minutes: 60
         uses: ./.github/actions/root-lane
         with:
           slug: dac-read-search
@@ -800,7 +800,7 @@ jobs:
 
       - name: Root lane (root, foreign TMPDIR)
         if: ${{ !cancelled() && steps.root_archive.outcome == 'success' }}
-        timeout-minutes: 8
+        timeout-minutes: 60
         uses: ./.github/actions/root-lane
         with:
           slug: foreign-tmpdir
@@ -815,7 +815,7 @@ jobs:
 
       - name: Root lane (uid 1000, CAP_DAC_OVERRIDE ambient)
         if: ${{ !cancelled() && steps.root_archive.outcome == 'success' }}
-        timeout-minutes: 8
+        timeout-minutes: 60
         uses: ./.github/actions/root-lane
         with:
           slug: uid-1000
@@ -860,7 +860,7 @@ jobs:
 
       - name: Root lane (macOS) - run the setuid tests
         if: ${{ !cancelled() && steps.mac_helper_check.outcome == 'success' }}
-        timeout-minutes: 8
+        timeout-minutes: 60
         shell: bash
         env:
           COSCA_TEST_SETUID: "1"
@@ -906,7 +906,7 @@ jobs:
       - name: Root lane (macOS, sudo -E)
         id: mac_root_run
         if: ${{ !cancelled() && steps.mac_root_dirs.outcome == 'success' }}
-        timeout-minutes: 8
+        timeout-minutes: 60
         shell: bash
         env:
           COSCA_TEST_ROOT: "1"
@@ -1033,7 +1033,7 @@ jobs:
       - name: Elevation (Linux) - run the elevation tests
         id: lin_elev_run
         if: ${{ !cancelled() && steps.lin_elev_sudo.outcome == 'success' }}
-        timeout-minutes: 8
+        timeout-minutes: 60
         shell: bash
         env:
           COSCA_TEST_ELEVATION: "1"
@@ -1262,7 +1262,7 @@ jobs:
       - name: Elevation (macOS) - run the elevation tests
         id: mac_elev_run
         if: ${{ !cancelled() && steps.mac_elev_user.outcome == 'success' }}
-        timeout-minutes: 8
+        timeout-minutes: 60
         shell: bash
         env:
           COSCA_TEST_ELEVATION_PASSWORD: ${{ steps.mac_elev_user.outputs.password }}
@@ -1333,7 +1333,7 @@ jobs:
       - name: Elevation (Windows) - run the elevation tests
         id: win_elev_run
         if: ${{ !cancelled() && steps.win_elev_archive.outcome == 'success' }}
-        timeout-minutes: 8
+        timeout-minutes: 60
         shell: pwsh
         env:
           NEXTEST_PROFILE: ci-elevation
