@@ -21,8 +21,9 @@ type Held = std::io::PipeWriter;
 type Held = std::net::TcpStream;
 
 /// A [`blocker`] for a test whose only end is a real kill: on Unix it ignores `SIGTERM`, on Windows
-/// it ignores every console event and is returned after its handshake, so a break sent at once
-/// cannot land before it could handle it (that ends a child with `0xC0000142`, not the kill's 1).
+/// it ignores every console event and is returned after its handshake, which orders a break sent
+/// afterwards after the handler's installation (a break before it ends a child with `0xC0000142`,
+/// not the kill's 1).
 fn kill_only_blocker() -> (crate::Child, Held) {
     #[cfg(unix)]
     {

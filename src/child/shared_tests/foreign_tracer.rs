@@ -16,8 +16,9 @@ use std::sync::mpsc;
 use std::sync::Arc;
 
 use super::fixtures::Blocker;
+use crate::test_child::reaped_elsewhere::kill_own_child;
 use crate::test_groups::{tracer_group, Group};
-use crate::test_support::foreign_tracer::{self, await_blocked_or_finished, Holder, EXIT, REAP, RESUME, STOP};
+use crate::test_support::foreign_tracer::{self, await_blocked_or_finished, Holder, EXIT, REAP, STOP};
 use crate::wait::exit_only::seams::{self as exit_seams, HolderStep};
 use crate::wait::exit_only::Target;
 
@@ -78,7 +79,7 @@ fn a_deadline_wait_on_a_zombie_held_by_a_foreign_tracer_is_handed_back(#[fixture
 }
 
 fn hand_back(go_byte: u8, wait: Wait, stop_first: bool) {
-    let mut b = Blocker::spawn_with(foreign_tracer::allow_any_tracer);
+    let b = Blocker::spawn_with(foreign_tracer::allow_any_tracer);
     let mut tracer = foreign_tracer::spawn_helper(b.shared.id());
 
     if stop_first {
@@ -99,13 +100,9 @@ fn hand_back(go_byte: u8, wait: Wait, stop_first: bool) {
         );
     }
 
-    b.shared.kill().expect("kill");
-    // Released: a tracee no kill reached ends by itself, so the final status check fails rather than
-    // the pidfd below never turning readable. A delivered SIGKILL is already pending and wins.
-    b.end_child();
-    if stop_first {
-        tracer.send(RESUME);
-    }
+    // Setup: the test ends the tracee itself, so a signal route that sends nothing cannot leave it
+    // alive for the unbounded `poll` and `wait` below.
+    kill_own_child(b.shared.id());
     // The exit, which the tracer alone can see: the pidfd turns readable.
     let Some(Target::PidFd(fd)) = b.shared.target() else {
         panic!("a pidfd");

@@ -192,6 +192,7 @@ async fn dropping_a_running_tree_walk_child_walks_from_its_pid_and_does_not_warn
     let teardown = release_between_kill_and_wait(child.stdin().expect("stdin pipe"));
     let pid = child.id().pid();
 
+    let sends = Capture::start();
     let mark = crate::log_capture::mark();
     drop(child);
 
@@ -199,7 +200,7 @@ async fn dropping_a_running_tree_walk_child_walks_from_its_pid_and_does_not_warn
     let walked = walks.walked();
     assert!(!walked.is_empty() && walked.iter().all(|w| *w == pid), "{walked:?}");
     assert_eq!(drop_warns_since(mark), []);
-    teardown.assert_killed();
+    assert_the_drop_killed(&teardown, &sends, pid);
 }
 
 /// A root reaped by someone else is invisible to tokio's own state (it stays `Running` until

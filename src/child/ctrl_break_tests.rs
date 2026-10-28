@@ -7,13 +7,14 @@
 //! list. Run these locally from a fresh terminal; no test asserts the absence of a pid it did not
 //! spawn.
 
-use std::io::Read;
 use std::net::TcpStream;
 use std::time::Duration;
 
 use super::fault as term_fault;
 use crate::containment::Containment;
-use crate::test_child::ctrl_break::{self, Grandchild, Handler, STATUS_CONTROL_C_EXIT};
+use crate::test_child::ctrl_break::{
+    self, assert_acked, assert_in_our_console, kill_release_reap, Grandchild, Handler, STATUS_CONTROL_C_EXIT,
+};
 use crate::GracefulMechanism;
 
 /// A contained [`ctrl_break`] root answering with `handler`, after its handshake.
@@ -44,46 +45,7 @@ fn spawn(
     mode: crate::ContainMode,
     configure: impl FnOnce(&mut crate::Command),
 ) -> (crate::Child, TcpStream, Option<Grandchild>) {
-    let (listener, addr) = crate::test_child::registration_rendezvous();
-    let mut cmd = crate::Command::new();
-    cmd.executable(std::env::current_exe().expect("current_exe"))
-        .args(ctrl_break::member_argv());
-    crate::test_reexec::scrub_env(|var| _ = cmd.env_remove(var));
-    for (key, value) in ctrl_break::member_env(&addr, handler, grandchild) {
-        cmd.env(key, value);
-    }
-    cmd.contain_with(mode);
-    configure(&mut cmd);
-    let child = cmd.spawn().expect("spawn the root");
-    let mut sock = ctrl_break::accept_root(&listener, child.id());
-    let grand = grandchild.map(|_| ctrl_break::accept_grandchild(&listener, &mut sock));
-    (child, sock, grand)
-}
-
-/// Require that `pid` shares our console, after its handshake: a break to a group outside it is
-/// accepted and lost.
-fn assert_in_our_console(pid: u32, who: &str) {
-    assert_eq!(
-        ctrl_break::in_our_console(pid),
-        Some(true),
-        "{who} must share our console for the break to be deliverable"
-    );
-}
-
-/// Read the `B` an acking member writes when its handler receives the break.
-fn assert_acked(sock: &mut TcpStream, who: &str) {
-    let mut ack = [0u8; 1];
-    sock.read_exact(&mut ack)
-        .unwrap_or_else(|e| panic!("{who} must acknowledge the break: {e}"));
-    assert_eq!(&ack, b"B", "{who} acked something other than CTRL_BREAK");
-}
-
-/// Kill the tree, then release the root: it leaves with 0 when released, so code 1 is the kill's.
-fn kill_tree_release_reap(child: &crate::Child, sock: TcpStream) {
-    child.kill_tree().expect("kill_tree");
-    drop(sock);
-    let status = child.wait().expect("reap");
-    assert_eq!(status.code(), Some(1), "kill_tree must kill the root, got {status:?}");
+    ctrl_break::spawn_member(handler, grandchild, mode, configure)
 }
 
 /// `terminate` delivers to the root's console group: proved by a byte the root's own handler
@@ -98,7 +60,12 @@ fn child_terminate_delivers_ctrl_break_to_a_contained_root() {
     child.terminate().expect("terminate a console-group child");
     ctrl_break::assert_break_sent_to(child.id().pid());
     assert_acked(&mut sock, "the root");
-    kill_tree_release_reap(&child, sock);
+    assert_eq!(
+        child.is_alive(),
+        crate::identity::Liveness::Alive,
+        "the root handles the break and keeps running"
+    );
+    kill_release_reap(&child, sock, false);
 }
 
 /// The control leg of the false-success tests below: a contained root with no flag methods
@@ -107,12 +74,13 @@ fn child_terminate_delivers_ctrl_break_to_a_contained_root() {
 #[skuld::test]
 fn a_plain_contained_root_really_receives_the_break() {
     let (child, mut sock) = spawn_root(Handler::Ack, crate::ContainMode::Strongest);
+    assert_eq!(child.containment(), Containment::JobObject);
     assert_eq!(child.graceful_mechanism(), GracefulMechanism::ConsoleGroup);
     assert_in_our_console(child.id().pid(), "the root");
     child.terminate_tree().expect("terminate_tree on a contained root");
     ctrl_break::assert_break_sent_to(child.id().pid());
     assert_acked(&mut sock, "the root");
-    kill_tree_release_reap(&child, sock);
+    kill_release_reap(&child, sock, true);
 }
 
 /// The graceful path end to end: no handler, so the default disposition applies and the child dies
@@ -254,27 +222,17 @@ fn treewalk_terminate_tree_reaps_the_grandchild() {
     );
 }
 
-/// The tree ops from a caller that has a console. `terminate_tree` is asserted sent, then the
-/// root's own handler acks the break. `kill_tree` ends the root, which exits 0 when released, so
-/// code 1 is the kill's. `graceful_shutdown_tree` with no grace sends its own break (asserted
-/// through the `AfterTerminate` hook) and escalates, because the root survives its break, and
-/// nothing is left alive.
+/// `graceful_shutdown_tree` with no grace sends its own break (asserted through the
+/// `AfterTerminate` hook) and escalates, because the root survives its break, and nothing is left
+/// alive. The root is released before the reap, so a no-op escalation fails the status assertion
+/// instead of hanging.
 #[skuld::test]
-fn tree_graceful_ops_work_from_a_caller_that_has_a_console() {
-    let (child, mut sock) = spawn_root(Handler::Ack, crate::ContainMode::Strongest);
-    assert_eq!(child.containment(), Containment::JobObject);
-    assert_in_our_console(child.id().pid(), "the root");
-    child.terminate_tree().expect("terminate_tree");
-    ctrl_break::assert_break_sent_to(child.id().pid());
-    assert_acked(&mut sock, "the root");
-    kill_tree_release_reap(&child, sock);
-
+fn graceful_shutdown_tree_with_no_grace_sends_its_break_and_escalates() {
     let (child, sock) = spawn_root(Handler::Ack, crate::ContainMode::Strongest);
     let pid = child.id().pid();
     let check = term_fault::at_checked(term_fault::HookPoint::AfterTerminate, move || {
         ctrl_break::assert_break_sent_to(pid)
     });
-    // Released before the reap, so a no-op escalation fails the status assertion instead of hanging.
     let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, sock);
     let status = child
         .graceful_shutdown_tree(Duration::ZERO)
@@ -292,68 +250,22 @@ fn tree_graceful_ops_work_from_a_caller_that_has_a_console() {
     );
 }
 
-/// The lone ops from a caller that has a console. `terminate` is asserted sent and acked, and the
-/// root survives its break by design; a live `kill` then ends it with code 1. On a second root,
-/// `graceful_shutdown` with no grace sends its own break (asserted through the `AfterTerminate`
-/// hook) and then escalates, so exit code 1 is the escalation's kill, and a later `kill` of the
-/// dead child is `Ok`.
+/// As [`graceful_shutdown_tree_with_no_grace_sends_its_break_and_escalates`], for the lone
+/// `graceful_shutdown`: exit code 1 is the escalation's kill, and a later `kill` of the dead child
+/// is `Ok`.
 #[skuld::test]
-fn lone_graceful_ops_work_from_a_caller_that_has_a_console() {
-    let (child, mut sock) = spawn_root(Handler::Ack, crate::ContainMode::Strongest);
-    assert_eq!(child.graceful_mechanism(), GracefulMechanism::ConsoleGroup);
-    assert_in_our_console(child.id().pid(), "the root");
-    child.terminate().expect("terminate");
-    ctrl_break::assert_break_sent_to(child.id().pid());
-    assert_acked(&mut sock, "the root");
-    assert_eq!(
-        child.is_alive(),
-        crate::identity::Liveness::Alive,
-        "the root handles the break and keeps running"
-    );
-    // A live `kill`, released after it: the acker leaves with 0 when released, so code 1 is the kill's.
-    child.kill().expect("kill the live root");
-    drop(sock);
-    let status = child.wait().expect("reap");
-    assert_eq!(status.code(), Some(1), "kill must end the live root, got {status:?}");
-
+fn graceful_shutdown_with_no_grace_sends_its_break_and_escalates() {
     let (child, sock) = spawn_root(Handler::Ack, crate::ContainMode::Strongest);
     let pid = child.id().pid();
     let check = term_fault::at_checked(term_fault::HookPoint::AfterTerminate, move || {
         ctrl_break::assert_break_sent_to(pid)
     });
-    // Released before the reap, so a no-op escalation fails the status assertion instead of hanging.
     let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, sock);
     let status = child.graceful_shutdown(Duration::ZERO).expect("graceful_shutdown");
     check.assert_fired();
     assert_eq!(status.code(), Some(1), "the escalation's kill, got {status:?}");
     assert_eq!(child.is_alive(), crate::identity::Liveness::Dead);
     child.kill().expect("killing a dead child is Ok");
-}
-
-/// A nested contained child owns no tree and leads a console process group of its own. The checks
-/// run in [`ctrl_break::nested`], in a process of its own so the child it spawns is a contained
-/// member's, hence nested.
-#[skuld::test]
-fn nested_delegated_child_can_be_gracefully_terminated() {
-    let _warns = crate::log_capture::warn_watch();
-    let (listener, addr) = crate::test_child::registration_rendezvous();
-    let mut cmd = crate::Command::new();
-    cmd.executable(std::env::current_exe().expect("current_exe"))
-        .args(ctrl_break::nested::root_argv())
-        .env(ctrl_break::nested::ADDR_ENV, &addr)
-        .env(crate::test_child::ack::ACK_ENV, "1");
-    crate::test_reexec::scrub_env(|var| _ = cmd.env_remove(var));
-    cmd.contain();
-    let root = cmd.spawn().expect("spawn the nested root");
-    let mut sock = crate::test_child::accept_or_die(&listener, root.id());
-    let mut report = String::new();
-    sock.read_to_string(&mut report).expect("read the report");
-    let status = root.wait().expect("reap the nested root");
-    assert!(
-        status.success(),
-        "the nested root failed: {status:?}, report: {report:?}"
-    );
-    assert_eq!(report, ctrl_break::nested::DONE, "the nested root did not finish");
 }
 
 /// Both members ignore the break, so only the ZERO-grace hard sweep can end the tree. The root's
@@ -536,4 +448,26 @@ fn drop_kills_a_job_object_tree() {
 
     teardown.assert_reaps_killed();
     assert_eq!(exit.wait_for_exit_code(), 1, "the drop must kill the grandchild");
+}
+
+/// The case the capability exists for, end to end: a nested contained child owns no tree, leads a
+/// console process group of its own, and had no cooperative shutdown at all. The checks run in
+/// `test_child::ctrl_break::nested`.
+#[skuld::test]
+fn nested_delegated_child_can_be_gracefully_terminated() {
+    ctrl_break::drive_reporter(ctrl_break::nested::REPORTER_TEST, ctrl_break::nested::ADDR_ENV, |cmd| {
+        _ = cmd.contain()
+    });
+}
+
+/// From a caller with no console, the cooperative ops fail with `NoConsole` and send no break. The
+/// checks, including the sender's empty break record, run in `test_child::ctrl_break::console_less`
+/// in a re-exec of this binary spawned detached.
+#[skuld::test]
+fn console_less_caller_sends_no_break() {
+    ctrl_break::drive_reporter(
+        ctrl_break::console_less::REPORTER_TEST,
+        ctrl_break::console_less::ADDR_ENV,
+        |cmd| _ = cmd.detached(),
+    );
 }

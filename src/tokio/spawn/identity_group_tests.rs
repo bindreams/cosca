@@ -1,10 +1,10 @@
 //! Async twin of `child/spawn/identity_group_tests.rs`: a spawn that fails because its root's
 //! identity cannot be read, for a session root that left a member in its process group.
 
-use crate::child::group_exact_tests::Member;
 use crate::child::spawn::identity_group_tests::{left_running_note, Container, Failed, Failure};
 use crate::error::ChildFate;
 use crate::send_log::{assert_group_signalled_first_through_the_pidfd, Capture, GroupStep, Route};
+use crate::test_child::member::{Member, RELEASE_FD};
 use crate::test_groups::{cgroup, pidfd_group_signal, Group};
 
 /// The sync `failed_spawn`'s twin.
@@ -12,6 +12,9 @@ fn failed_spawn(failure: Failure, container: Container) -> Failed {
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let (stdio, started, member) = Member::pipes();
+    // Released between the cleanup's kill and wait: a missed kill fails `assert_killed`, not the wait.
+    let release = member.release_root_when_a_teardown_waits();
+    let reaps = crate::child::spawn::fault::record_teardown_reaps();
     let armed = failure.arm(started);
     let (mode, placement) = container.arm();
     let capture = Capture::start();
@@ -23,11 +26,15 @@ fn failed_spawn(failure: Failure, container: Container) -> Failed {
         cmd.stdin(stdio.stdin).expect("set stdin");
         cmd.stdout(stdio.stdout).expect("set stdout");
         cmd.stderr(stdio.stderr).expect("set stderr");
+        cmd.fd(RELEASE_FD, stdio.release).expect("set the release fd");
         cmd.spawn()
     };
     let steps = capture.group_steps();
     let pid = armed.pid();
-    drop((armed, placement));
+    drop((armed, placement, release));
+    if matches!(failure, Failure::Unreadable) {
+        reaps.assert_killed();
+    }
     let (_err, fate) = match spawned {
         Ok(child) => panic!("the spawn must fail at its identity read: {:?}", child.id()),
         Err(e) => crate::child::spawn::failure::expect_may_have_started_with(e),

@@ -7,3 +7,7 @@ pub(crate) mod tracer;
 // The foreign tracer: see the module doc.
 #[cfg(target_os = "linux")]
 pub(crate) mod foreign_tracer;
+
+// The test thread as the tracer of its own child.
+#[cfg(target_os = "linux")]
+pub(crate) mod own_tracer;

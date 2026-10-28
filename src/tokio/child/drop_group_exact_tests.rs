@@ -4,6 +4,7 @@
 
 use super::group_exact_tests::{kill_and_reap_behind, releasable_group_root, releasable_root_with_a_member};
 use crate::send_log::{assert_group_signalled_first_through_the_pidfd, Capture};
+use crate::test_child::reaped_elsewhere::kill_own_child;
 use crate::test_groups::{pidfd_group_signal, Group};
 
 /// Who reaps the root.
@@ -31,11 +32,12 @@ enum Teardown {
     FinishElevated,
 }
 
-/// Kills `child`'s root alone and has `reap` reap it (see [`kill_and_reap_behind`] for `release`).
+/// Ends `child`'s root alone by [`kill_own_child`] (the kill is setup here) and has `reap` reap it
+/// (see [`kill_and_reap_behind`] for `release`).
 async fn reap_root(child: &mut crate::tokio::Child, release: std::io::PipeWriter, reap: Reap) {
     match reap {
         Reap::Own => {
-            child.kill().expect("kill the root alone");
+            kill_own_child(child.id().pid());
             drop(release);
             let status = child.wait().await.expect("this handle reaps the root");
             crate::test_child::assert_killed("the root", status);

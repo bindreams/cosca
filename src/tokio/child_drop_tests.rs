@@ -5,6 +5,8 @@
 
 #[cfg(unix)]
 use crate::child::spawn::fault::{release_between_kill_and_wait, TeardownBlocker};
+#[cfg(target_os = "linux")]
+use crate::test_groups::{cgroup, Group};
 use crate::tokio::child::{fault, Child};
 
 /// A real root that only a kill or a closed stdin ends, in no containment. The write end of its
@@ -381,6 +383,82 @@ async fn a_kill_on_drop_drop_kills_the_root() {
     let teardown = release_between_kill_and_wait(stdin);
     drop(child);
     teardown.assert_killed();
+}
+
+/// The drop of a session tree kills its root and the group's member. The root is released once the
+/// drop's kill returned, so a drop whose kills sent nothing fails by assertion instead of waiting.
+/// - The group's signal lost: the member survives and fails `member.assert_killed()`. Below Linux
+///   6.9 a lost `killpg` alone is masked by the member's own pidfd signals after it.
+/// - The root's own kill lost: masked, the group's signal ends the root too.
+/// - Both lost: the root exits `0` on the release and fails `teardown.assert_killed()`.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn a_drop_kills_a_session_root_and_the_members_of_its_group() {
+    crate::tokio::test_runtime::assert_current_thread();
+    let (child, member, release) = super::group_exact_tests::releasable_root_with_a_member();
+    assert_eq!(child.containment(), crate::Containment::Session);
+    let teardown = release_between_kill_and_wait(release);
+    drop(child);
+    teardown.assert_killed();
+    member.assert_killed();
+}
+
+/// The drop of a cgroup tree kills its root and the leaf's member, waits for the leaf to drain, and
+/// removes it. The root is released once the drop's kill returned and the member when the drain is
+/// about to block (`Member::release_when_the_drain_blocks`), so a drop whose kills sent nothing
+/// fails by assertion instead of waiting.
+/// - The `cgroup.kill` lost: the member survives and fails `member.assert_killed()`.
+/// - The root's own kill lost: masked, the `cgroup.kill` ends the root too.
+/// - Both lost: the root exits `0` on the release and fails `teardown.assert_killed()`.
+/// - The leaf left behind: fails `assert_leaf_removed`.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn a_drop_kills_a_cgroup_root_and_its_members_and_removes_the_leaf(#[fixture(cgroup)] _group: &Group) {
+    use crate::test_groups::cgroup_leaf::LeafGuard;
+
+    crate::tokio::test_runtime::assert_current_thread();
+    let (child, member, release) = crate::test_child::member::releasable_root_with_a_member_contained(|cmd| {
+        cmd.contain_with(crate::ContainMode::Strongest);
+    });
+    assert_eq!(child.containment(), crate::Containment::CgroupV2);
+    let leaf = child.leaf_path_for_test().expect("a cgroup child holds its leaf");
+    let _leaf_cleanup = LeafGuard::new(leaf.clone());
+    let teardown = release_between_kill_and_wait(release);
+    let _drain = member.release_when_the_drain_blocks();
+    drop(child);
+    teardown.assert_killed();
+    member.assert_killed();
+    assert_leaf_removed(&leaf);
+}
+
+/// The drop of an fd-marker tree kills its root and the tree's member. The armed drop waits for the
+/// root, so the root is released once the drop's kill returned: a drop whose kills sent nothing
+/// fails by assertion instead of waiting. The root then exits `0` and fails
+/// `teardown.assert_killed()`, and a member nothing killed says `survived` and fails
+/// `member.assert_killed()`.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+async fn a_drop_kills_an_fd_marker_root_and_the_members_of_its_tree() {
+    crate::tokio::test_runtime::assert_current_thread();
+    let (child, member, release) = crate::test_child::member::releasable_root_with_a_member_contained(|cmd| {
+        cmd.contain();
+    });
+    assert_eq!(child.containment(), crate::Containment::FdMarker);
+    let teardown = release_between_kill_and_wait(release);
+    drop(child);
+    teardown.assert_killed();
+    member.assert_killed();
+}
+
+/// The leaf an armed `Drop` killed is gone once the drop returns: the drop waits for the leaf to
+/// drain, then removes it.
+#[cfg(target_os = "linux")]
+fn assert_leaf_removed(leaf: &std::path::Path) {
+    assert!(
+        !leaf.exists(),
+        "the drop must drain and remove the leaf: {}",
+        leaf.display()
+    );
 }
 
 /// The drop's signals run inside a bounded section, which is what turns a wait added to them into a

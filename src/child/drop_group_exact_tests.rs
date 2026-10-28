@@ -4,7 +4,7 @@
 
 use crate::child::group_exact_tests::root_with_a_member;
 use crate::send_log::{assert_group_signalled_first_through_the_pidfd, Capture, GroupStep};
-use crate::test_child::reaped_elsewhere::{reap_behind, session_sleep};
+use crate::test_child::reaped_elsewhere::{kill_own_child, reap_behind, session_sleep};
 use crate::test_groups::{pidfd_group_signal, Group};
 
 /// Who reaps the root.
@@ -23,9 +23,9 @@ enum Teardown {
     FinishElevated,
 }
 
-/// Kills `child`'s root alone and has `reap` reap it.
+/// Kills `child`'s root alone, by the test's own `SIGKILL`, and has `reap` reap it.
 fn reap_root(child: &crate::Child, reap: Reap) {
-    child.kill().expect("kill the root alone");
+    kill_own_child(child.id().pid());
     match reap {
         Reap::Own => {
             child.wait().expect("this handle reaps the root");
@@ -181,6 +181,7 @@ fn a_drop_of_a_root_its_handle_cannot_read_kills_its_group_through_the_pidfd(
 ) {
     use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peek_once};
     let (child, member) = root_with_a_member();
+    let _released = member.release_root_when_a_teardown_waits();
     let capture = Capture::start();
     let forced = force_peek_once(Err(std::io::Error::other("forced peek failure")));
     drop(child);
