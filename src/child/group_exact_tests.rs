@@ -5,84 +5,9 @@
 use std::io::Read as _;
 
 use crate::send_log::{Capture, GroupStep, Route};
-use crate::test_child::reaped_elsewhere::{foreign_reaped_group_root, reap_behind};
+use crate::test_child::member::{await_started, Member, RELEASE_FD, ROOT_WITH_A_MEMBER};
+use crate::test_child::reaped_elsewhere::{foreign_reaped_group_root, kill_own_child, reap_behind};
 use crate::test_groups::{pidfd_group_signal, Group};
-
-/// A session root `sh` that leaves a member in its group, says `started`, and sleeps holding neither
-/// the member's stdin nor stderr. The member reads stdin through fd 3 (`sh` points a background
-/// job's stdin at `/dev/null` otherwise) and, at its end of file, says `survived` on stderr.
-pub(crate) const ROOT_WITH_A_MEMBER: [&str; 3] = [
-    "sh",
-    "-c",
-    "exec 3<&0; (cat <&3 3<&- >/dev/null && echo survived >&2) & echo started; exec sleep 300 <&- 3<&- 2>/dev/null",
-];
-
-/// A test's ends of the pipes of [`ROOT_WITH_A_MEMBER`]'s member.
-pub(crate) struct Member {
-    stdin: std::io::PipeWriter,
-    stderr: std::io::PipeReader,
-}
-
-impl Member {
-    /// The pipes of a [`ROOT_WITH_A_MEMBER`] spawn, to give its stdin, stdout and stderr, and the
-    /// read end of its stdout.
-    pub(crate) fn pipes() -> (MemberStdio, std::io::PipeReader, Member) {
-        let (stdin_read, stdin) = std::io::pipe().expect("stdin pipe");
-        let (started, stdout_write) = std::io::pipe().expect("stdout pipe");
-        let (stderr, stderr_write) = std::io::pipe().expect("stderr pipe");
-        let stdio = |end: std::os::fd::OwnedFd| crate::Stdio::from_file(std::fs::File::from(end));
-        let child_ends = MemberStdio {
-            stdin: stdio(stdin_read.into()),
-            stdout: stdio(stdout_write.into()),
-            stderr: stdio(stderr_write.into()),
-        };
-        (child_ends, started, Member { stdin, stderr })
-    }
-
-    /// Closes the member's stdin and reads its stderr to the end. A member still running ends at that
-    /// end of file and says `survived`; one already sent a fatal signal never runs again, and says
-    /// nothing. Neither waits on a signal's delivery.
-    pub(crate) fn end(self) -> String {
-        let Member { stdin, mut stderr } = self;
-        drop(stdin);
-        let mut said = String::new();
-        stderr
-            .read_to_string(&mut said)
-            .expect("read the member's stderr to its end");
-        said
-    }
-
-    /// Asserts the member was sent a fatal signal before this call.
-    #[track_caller]
-    pub(crate) fn assert_killed(self) {
-        let said = self.end();
-        assert!(
-            !said.contains("survived"),
-            "the group's member was not killed: {said:?}"
-        );
-    }
-
-    /// Asserts the member was sent no fatal signal.
-    #[track_caller]
-    pub(crate) fn assert_survived(self) {
-        let said = self.end();
-        assert!(said.contains("survived"), "the group's member was killed: {said:?}");
-    }
-}
-
-/// The child's ends of [`Member::pipes`].
-pub(crate) struct MemberStdio {
-    pub(crate) stdin: crate::Stdio,
-    pub(crate) stdout: crate::Stdio,
-    pub(crate) stderr: crate::Stdio,
-}
-
-/// Reads [`ROOT_WITH_A_MEMBER`]'s `started` from `stdout`, once its member exists.
-pub(crate) fn await_started(mut stdout: std::io::PipeReader) {
-    let mut started = [0u8; 8];
-    stdout.read_exact(&mut started).expect("read `started`");
-    assert_eq!(&started, b"started\n");
-}
 
 /// A [`ROOT_WITH_A_MEMBER`] spawn, once its member exists.
 pub(crate) fn root_with_a_member() -> (crate::Child, Member) {
@@ -94,6 +19,7 @@ pub(crate) fn root_with_a_member() -> (crate::Child, Member) {
         cmd.stdin(stdio.stdin).expect("set stdin");
         cmd.stdout(stdio.stdout).expect("set stdout");
         cmd.stderr(stdio.stderr).expect("set stderr");
+        cmd.fd(RELEASE_FD, stdio.release).expect("set the release fd");
         cmd.spawn().expect("spawn")
     };
     await_started(started);
@@ -137,7 +63,7 @@ impl EndedAtTheSigterm {
 fn kill_tree_kills_the_group_of_a_root_reaped_elsewhere(#[fixture(pidfd_group_signal)] _group: &Group) {
     let (child, member) = root_with_a_member();
     let pid = child.id().pid();
-    child.kill().expect("kill the root alone");
+    kill_own_child(pid);
     reap_behind(pid);
     let capture = Capture::start();
     let result = child.kill_tree();
@@ -172,7 +98,7 @@ fn kill_tree_of_a_root_reaped_elsewhere_with_no_member_left_sends_nothing(
 #[skuld::test]
 fn kill_tree_below_6_9_kills_the_group_by_number_after_this_handles_own_reap() {
     let (child, member) = root_with_a_member();
-    child.kill().expect("kill the root alone");
+    kill_own_child(child.id().pid());
     child.wait().expect("this handle reaps the root");
     let old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     let capture = Capture::start();
@@ -252,7 +178,7 @@ impl EmptiedGroup {
         assert_eq!(&started, b"started\n");
         let (stdin, stderr) = (root.stdin().expect("stdin pipe"), root.stderr().expect("stderr pipe"));
         let pid = root.id().pid();
-        root.kill().expect("kill the root alone");
+        kill_own_child(pid);
         reap_behind(pid);
         let mut other = crate::test_spawn::spawn(&mut member_command(0)).expect("spawn the other group's leader");
         await_member_ready(&mut other);
@@ -389,7 +315,7 @@ pub(crate) fn assert_down_without_status(result: Result<std::process::ExitStatus
 fn terminate_tree_signals_the_group_of_a_root_reaped_elsewhere(#[fixture(pidfd_group_signal)] _group: &Group) {
     let (child, member) = root_with_a_member();
     let pid = child.id().pid();
-    child.kill().expect("kill the root alone");
+    kill_own_child(pid);
     reap_behind(pid);
     let capture = Capture::start();
     let result = child.terminate_tree();
@@ -429,7 +355,7 @@ fn graceful_shutdown_tree_shuts_down_the_group_of_a_root_reaped_elsewhere(
     crate::log_capture::install();
     let (child, member) = root_with_a_member();
     let pid = child.id().pid();
-    child.kill().expect("kill the root alone");
+    kill_own_child(pid);
     reap_behind(pid);
     let mark = crate::log_capture::mark();
     let ended = EndedAtTheSigterm::new(member);

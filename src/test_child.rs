@@ -20,6 +20,9 @@ pub(crate) mod foreign;
 #[cfg(unix)]
 pub(crate) mod reaped_elsewhere;
 
+#[cfg(any(target_os = "linux", all(target_os = "macos", feature = "tokio")))]
+pub(crate) mod member;
+
 #[cfg(target_os = "macos")]
 use crate::test_own_process;
 #[cfg(target_os = "macos")]

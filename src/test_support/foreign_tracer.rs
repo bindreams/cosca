@@ -25,11 +25,9 @@ const PID_ENV: &str = "COSCA_TEST_SHARED_FOREIGN_TRACER_PID";
 /// Set (to anything) for a helper that seizes its tracee with `PTRACE_O_TRACEEXIT`.
 const HOLD_EXIT_ENV: &str = "COSCA_TEST_SHARED_FOREIGN_TRACER_HOLD_EXIT";
 
-/// The go bytes. `STOP` makes the helper stop the tracee and report it, `RESUME` resumes a tracee it
-/// stopped; `LET_EXIT` lets a tracee held at its exit stop on from it; `REAP` and `EXIT` hand the
-/// zombie back.
+/// The go bytes. `STOP` makes the helper stop the tracee and report it; `LET_EXIT` lets a tracee
+/// held at its exit stop on from it; `REAP` and `EXIT` hand the zombie back.
 pub(crate) const STOP: u8 = b's';
-pub(crate) const RESUME: u8 = b'g';
 pub(crate) const LET_EXIT: u8 = b'c';
 pub(crate) const REAP: u8 = b'r';
 pub(crate) const EXIT: u8 = b'x';
@@ -55,8 +53,7 @@ fn waitpid_status(pid: libc::pid_t) -> libc::c_int {
 
 /// The foreign tracer: seize the pid in [`PID_ENV`] (or, without it, the pid on stdin's first line),
 /// report, and act on each go byte from stdin:
-/// `STOP` interrupts the tracee and reports the stop, `RESUME` continues it (a tracee a `SIGKILL`
-/// already ended is `ESRCH`, and fine), `LET_EXIT` waits for the tracee's exit stop and
+/// `STOP` interrupts the tracee and reports the stop, `LET_EXIT` waits for the tracee's exit stop and
 /// lets it on from it, `REAP` reaps the zombie with `waitpid` and reports, `EXIT` exits without
 /// reaping. A no-op unless it is the re-exec the driver started.
 ///
@@ -103,12 +100,6 @@ fn foreign_tracer_helper() {
                 assert!(libc::WIFSTOPPED(status), "waitpid: not a stop: {status:#x}");
                 say("stopped");
             }
-            RESUME => {
-                // SAFETY: as above.
-                let rc = unsafe { libc::ptrace(libc::PTRACE_CONT, pid, null(), null()) };
-                let e = std::io::Error::last_os_error();
-                assert!(rc == 0 || e.raw_os_error() == Some(libc::ESRCH), "PTRACE_CONT: {e}");
-            }
             LET_EXIT => {
                 let status = waitpid_status(pid);
                 assert!(
@@ -121,13 +112,26 @@ fn foreign_tracer_helper() {
                 say("continued");
             }
             REAP => {
-                // The driver saw the pidfd readable, so the tracee is a zombie, which `waitpid`
-                // reports before any stop.
-                let status = waitpid_status(pid);
-                assert!(
-                    libc::WIFEXITED(status) || libc::WIFSIGNALED(status),
-                    "waitpid: not an exit: {status:#x}"
-                );
+                // The driver saw the pidfd readable, so a killed tracee is a zombie, which `waitpid`
+                // reports before any stop. One that was not killed and ran on to its own exit
+                // reports the signals it was sent first (`SIGPIPE` on its closed stdout, say): a
+                // debugger lets each one through, as `gdb` does.
+                loop {
+                    let status = waitpid_status(pid);
+                    if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
+                        break;
+                    }
+                    assert!(
+                        libc::WIFSTOPPED(status),
+                        "waitpid: neither a stop nor an exit: {status:#x}"
+                    );
+                    // A signal-delivery-stop passes its signal on; an event or group stop passes none.
+                    let signal = if status >> 16 == 0 { libc::WSTOPSIG(status) } else { 0 };
+                    // SAFETY: as above.
+                    let rc =
+                        unsafe { libc::ptrace(libc::PTRACE_CONT, pid, null(), signal as usize as *mut libc::c_void) };
+                    assert_eq!(rc, 0, "PTRACE_CONT: {}", std::io::Error::last_os_error());
+                }
                 say("reaped");
                 return;
             }

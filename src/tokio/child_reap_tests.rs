@@ -1,5 +1,5 @@
 use super::{ProcSource, Waited};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::test_groups::{tracer_group, Group};
 
 /// `child` as a backend, as the spawn builds it: Linux holds a pidfd the test opens itself (a raw
@@ -886,4 +886,32 @@ async fn exited_within_of_a_child_never_shown_ours_is_false() {
     );
     drop(proc);
     reap_behind_the_owner(pid);
+}
+
+/// Async twin of `child/shared_tests/tracer.rs`'s `kill_ends_a_child_stopped_for_its_tracer`, over
+/// `ProcSource::signal`.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn kill_ends_a_child_stopped_for_its_tracer(#[fixture(tracer_group)] _group: &Group) {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    crate::tokio::test_runtime::assert_current_thread();
+    let mut cmd = crate::tokio::Command::new();
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+    cmd.stdout(crate::Stdio::null()).expect("set stdout");
+    let mut child = cmd.spawn().expect("spawn");
+    let stdin = child.stdin().expect("piped stdin");
+    let pid = child.id().pid() as libc::pid_t;
+    crate::test_support::own_tracer::seize_and_stop(pid);
+
+    child.kill().expect("kill");
+    crate::test_support::own_tracer::resume_unless_dying(pid);
+    drop(stdin);
+    let status = child.wait().await.expect("wait");
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGKILL),
+        "the handle's kill did not end the stopped tracee: {status:?}"
+    );
 }

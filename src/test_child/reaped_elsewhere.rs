@@ -65,15 +65,67 @@ pub(crate) fn session_sleep() -> crate::Command {
     cmd
 }
 
-/// [`session_sleep`] that ignores `SIGTERM` (an ignored signal stays ignored across `exec`), so
-/// only a kill ends it. It prints a line to its piped stdout once it ignores the signal.
+/// A `cat` in its own session, reading a stdin pipe it gets from the child's handle. A test that
+/// must see a signal end it holds that stdin and drops it only after the signal's send: a send that
+/// went nowhere then shows in the exit status (`0`, which no signal gives) instead of leaving a
+/// wait to block on a root that never ends.
 #[cfg(target_os = "linux")]
-pub(crate) fn term_ignoring_session_sleep() -> crate::Command {
+pub(crate) fn session_cat() -> crate::Command {
     let mut cmd = crate::Command::new();
-    cmd.args(["sh", "-c", r#"trap "" TERM; echo ready; exec sleep 300"#]);
+    cmd.args(["cat"]);
     cmd.contain_with(crate::ContainMode::Session);
+    cmd.stdin(crate::Stdio::pipe_in()).expect("stdin pipe");
+    cmd
+}
+
+/// [`session_cat`] that ignores `SIGTERM` (an ignored signal stays ignored across `exec`), so only
+/// a kill ends it before its stdin closes. It prints a line to its piped stdout once it ignores the
+/// signal.
+#[cfg(target_os = "linux")]
+pub(crate) fn term_ignoring_session_cat() -> crate::Command {
+    let mut cmd = crate::Command::new();
+    cmd.args(["sh", "-c", r#"trap "" TERM; echo ready; exec cat"#]);
+    cmd.contain_with(crate::ContainMode::Session);
+    cmd.stdin(crate::Stdio::pipe_in()).expect("stdin pipe");
     cmd.stdout(crate::Stdio::pipe_out()).expect("stdout pipe");
     cmd
+}
+
+/// Ends `pid`, this test's own unreaped child, with a `SIGKILL` the test sends itself. For setup
+/// that needs a dead root: it goes by none of the routes a test checks, so a mutant that makes one
+/// of them send nothing cannot leave the root alive for the wait that follows to block on.
+///
+/// Debug builds assert `pid` is still a child of this process: a reaped one would leave the number
+/// free for another process.
+pub(crate) fn kill_own_child(pid: u32) {
+    #[cfg(debug_assertions)]
+    {
+        // Only a number that is no child of ours answers `ECHILD`.
+        // SAFETY: an all-zero `siginfo_t` is valid and `waitid` writes only into it.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        #[cfg(target_os = "linux")]
+        let all_kinds = libc::__WALL;
+        #[cfg(not(target_os = "linux"))]
+        let all_kinds = 0;
+        // SAFETY: `info` is a valid out-pointer.
+        let peeked = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT | all_kinds,
+            )
+        };
+        assert_eq!(
+            peeked,
+            0,
+            "pid {pid} is no unreaped child of this process: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    // SAFETY: `pid` is this test's own child and nothing has reaped it, so its number names it.
+    let sent = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+    assert_eq!(sent, 0, "{}", std::io::Error::last_os_error());
 }
 
 /// Reaps `pid`, this process's child that has been told to die, behind its handle's back, as an
@@ -98,7 +150,7 @@ pub(crate) fn reap_behind_status(pid: u32) -> std::process::ExitStatus {
 pub(crate) fn foreign_reaped_group_root() -> (crate::Child, u32) {
     let child = session_sleep().spawn().expect("spawn");
     let pid = child.id().pid();
-    child.kill().expect("kill the root");
+    kill_own_child(pid);
     reap_behind(pid);
     (child, pid)
 }
