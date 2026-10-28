@@ -3,7 +3,7 @@
 
 use super::super::fault::{self, ChildSend};
 use super::super::test_support::{fork_running, KillOnDrop};
-use super::{end_child, ChildFate, PlacementReport, Received};
+use super::{end_child, ChildFate, NoWarn, PlacementReport, Received, WarnAfter};
 use crate::test_groups::{cgroup, pidfd_group_signal, Group};
 
 /// A forked child that pauses until killed, leading its own process group, as a spawned child
@@ -126,7 +126,7 @@ fn an_abandoned_childs_foreign_reap_is_debug_not_a_panic() {
         release_at_the_exit_wait(pid, input, move || super::super::test_support::reap(pid));
 
     let mark = crate::log_capture::mark();
-    let fate = end_child(&received);
+    let fate = end_child(&received, &mut NoWarn);
 
     assert_killed(&ended);
     assert_eq!(fate, ChildFate::Killed);
@@ -160,7 +160,7 @@ fn an_abandoned_child_outside_its_leaf_is_killed_as_its_group_before_its_handle(
     let received = received(child, Some(PlacementReport::WriteFailed(libc::EBADF)));
     let (_released, ended) = release_at_the_exit_wait(received.pid.expect("a pid"), input, || {});
 
-    assert_eq!(end_child(&received), ChildFate::Killed);
+    assert_eq!(end_child(&received, &mut NoWarn), ChildFate::Killed);
     assert_killed(&ended);
     assert_eq!(fault::take_child_sends(), [ChildSend::Group, ChildSend::Handle]);
     assert_eq!(
@@ -181,7 +181,7 @@ fn an_abandoned_child_in_its_leaf_or_unreported_is_sent_no_group_kill() {
         let received = received(child, report);
         let (_released, ended) = release_at_the_exit_wait(received.pid.expect("a pid"), input, || {});
 
-        assert_eq!(end_child(&received), ChildFate::Killed, "{report:?}");
+        assert_eq!(end_child(&received, &mut NoWarn), ChildFate::Killed, "{report:?}");
         assert_killed(&ended);
         assert_eq!(fault::take_child_sends(), [ChildSend::Handle], "{report:?}");
     }
@@ -201,7 +201,7 @@ fn an_abandoned_childs_group_kill_finding_no_group_is_logged_at_debug(#[fixture(
     let _gone = fault::force_group_kill_gone();
 
     let mark = crate::log_capture::mark();
-    assert_eq!(end_child(&received), ChildFate::Killed);
+    assert_eq!(end_child(&received, &mut NoWarn), ChildFate::Killed);
     assert_killed(&ended);
 
     let records = crate::log_capture::records_since_on_current_thread(mark, "process group");
@@ -227,7 +227,7 @@ fn an_abandoned_child_refusing_both_kills_is_one_refusal_naming_both(#[fixture(c
     fault::set_background_reap_notifier(reaped_tx);
 
     let mark = crate::log_capture::mark();
-    let fate = end_child(&received);
+    let fate = end_child(&received, &mut NoWarn);
 
     let ChildFate::Unkillable(refused) = &fate else {
         panic!("expected Unkillable, got {fate:?}");
@@ -260,7 +260,7 @@ fn an_abandoned_child_refusing_its_handles_kill_is_not_killed_by_pid() {
     fault::set_force_child_kill_denied(true);
     fault::set_background_reap_notifier(reaped_tx);
 
-    let fate = end_child(&received);
+    let fate = end_child(&received, &mut NoWarn);
     assert!(matches!(fate, ChildFate::Unkillable(_)), "{fate:?}");
     assert_eq!(fault::take_child_sends(), [ChildSend::Handle]);
     crate::test_child::assert_echoes(&mut to_child, &mut from_child);
@@ -285,7 +285,7 @@ fn an_abandoned_child_whose_group_kill_is_refused_is_warned_about_once(#[fixture
     fault::set_force_group_kill_denied(true);
 
     let mark = crate::log_capture::mark();
-    assert_eq!(end_child(&received), ChildFate::Killed);
+    assert_eq!(end_child(&received, &mut NoWarn), ChildFate::Killed);
     assert_killed(&ended);
 
     let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "")
@@ -355,7 +355,7 @@ fn an_abandoned_child_reaped_elsewhere_after_its_group_kill_is_killed(#[fixture(
             }
         });
 
-        let ended = end_child(&received);
+        let ended = end_child(&received, &mut NoWarn);
         assert_eq!(signal.get(), Some(libc::SIGKILL), "the child was killed: {report:?}");
         assert_eq!(ended, fate, "{report:?}");
     }
@@ -374,7 +374,7 @@ fn an_abandoned_childs_group_kill_by_number_follows_its_own_check() {
     let capture = crate::send_log::Capture::start();
     let refused = crate::containment::unix::fault::refuse_pidfd_group_flag();
 
-    assert_eq!(end_child(&received), ChildFate::Killed);
+    assert_eq!(end_child(&received, &mut NoWarn), ChildFate::Killed);
     assert_killed(&ended);
     drop(refused);
     assert_eq!(member_output(to_member, from_member), "", "the member was killed");
@@ -399,7 +399,7 @@ fn an_abandoned_childs_group_kill_goes_through_its_handle(#[fixture(pidfd_group_
     let (_released, ended) = release_at_the_exit_wait(received.pid.expect("a pid"), input, || {});
     let capture = crate::send_log::Capture::start();
 
-    assert_eq!(end_child(&received), ChildFate::Killed);
+    assert_eq!(end_child(&received, &mut NoWarn), ChildFate::Killed);
     assert_killed(&ended);
     assert_eq!(
         member_output(to_member, from_member),
@@ -429,7 +429,7 @@ fn an_abandoned_child_reaped_before_its_group_kill_by_number_is_not_sent_it() {
     let refused = crate::containment::unix::fault::refuse_pidfd_group_flag();
     let mark = crate::log_capture::mark();
 
-    let fate = end_child(&received);
+    let fate = end_child(&received, &mut NoWarn);
     drop(refused);
     assert_one_warn_for_the_unsent_group_kill(mark, pid);
     assert_eq!(
@@ -554,7 +554,7 @@ fn an_abandoned_child_reaped_before_the_look_has_its_group_killed(#[fixture(pidf
     crate::test_child::reaped_elsewhere::reap_behind(received.pid.expect("a pid"));
     let capture = crate::send_log::Capture::start();
 
-    let fate = end_child(&received);
+    let fate = end_child(&received, &mut NoWarn);
     let steps = capture.group_steps();
     let out = member_output(to_member, from_member);
     assert_eq!(steps, [GroupStep::Group(Route::Pidfd, libc::SIGKILL)]);
@@ -578,7 +578,7 @@ fn an_abandoned_child_reaped_before_the_look_gets_no_group_kill_by_number() {
     let refused = crate::containment::unix::fault::refuse_pidfd_group_flag();
     let mark = crate::log_capture::mark();
 
-    let fate = end_child(&received);
+    let fate = end_child(&received, &mut NoWarn);
     drop(refused);
     assert_one_warn_for_the_unsent_group_kill(mark, pid);
     let steps = capture.group_steps();
@@ -589,4 +589,64 @@ fn an_abandoned_child_reaped_before_the_look_gets_no_group_kill_by_number() {
     );
     assert_eq!(out, "survived");
     assert_eq!(fate, ChildFate::Gone);
+}
+
+/// A child known by its `/proc` directory, killed and then reaped by another reaper before the wait:
+/// its number may name another child of this process by then, one that is running. The wait's warn
+/// does not name that process. (The wait by the number collects it: the residual the cgroup
+/// module's Ownership paragraph states.)
+///
+/// Mutant: the warn watches through a pidfd opened on the number, unchecked against the directory.
+#[skuld::test]
+fn a_child_reaped_elsewhere_is_not_warned_about_through_its_number() {
+    use std::os::fd::AsRawFd as _;
+
+    use crate::test_support::foreign_tracer::{await_blocked_or_finished, Holder};
+
+    crate::log_capture::install();
+    let gone = fork_running(|| loop {
+        // SAFETY: async-signal-safe.
+        unsafe { libc::pause() };
+    });
+    // Stands for the process the number names next: running until its pipe closes.
+    let (from_test, to_holder) = std::io::pipe().expect("pipe");
+    let (input, output) = (from_test.as_raw_fd(), to_holder.as_raw_fd());
+    let holder = fork_running(move || {
+        // SAFETY: async-signal-safe; the child's own copy of the test's end, so EOF can come.
+        unsafe { libc::close(output) };
+        let mut byte = 0u8;
+        // SAFETY: async-signal-safe; a one-byte buffer on an fd the child holds.
+        while unsafe { libc::read(input, (&raw mut byte).cast(), 1) } == 1 {}
+    });
+    // Only the holder reads now; `end_child`'s wait reaps it, below.
+    drop(from_test);
+    let gone = gone.defuse();
+    let holder = holder.defuse();
+    let proc_dir = std::fs::File::open(format!("/proc/{gone}")).expect("open the /proc directory");
+    let received = Received {
+        report: None,
+        pid: Some(holder),
+        pidfd: None,
+        proc_dir: Some(proc_dir.into()),
+    };
+
+    let mark = crate::log_capture::mark();
+    let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+    let (seen, fate) = std::thread::scope(|s| {
+        let ended = s.spawn(|| {
+            tid_tx
+                .send(rustix::thread::gettid().as_raw_nonzero().get())
+                .expect("report the tid");
+            let _reaped_elsewhere = fault::set_before_exit_wait(move || super::super::test_support::reap(gone));
+            end_child(&received, &mut WarnAfter(Some(std::time::Duration::ZERO)))
+        });
+        let seen = await_blocked_or_finished(tid_rx.recv().expect("the tid"));
+        drop(to_holder);
+        (seen, ended.join().expect("end_child"))
+    });
+
+    assert_eq!(seen, Holder::Blocked, "the wait by the number waits for the holder");
+    assert_eq!(fate, ChildFate::Killed);
+    let warns = crate::log_capture::records_since(mark, "still waiting");
+    assert_eq!(warns, Vec::<String>::new(), "no warn names the number's holder");
 }

@@ -156,15 +156,12 @@ impl DrainWatch {
         }
     }
 
-    /// [`wait`](Self::wait), and `warn` runs once if the leaf is still populated at `until`. The wait
-    /// goes on, unbounded, after the warn: the time decides the message and nothing else. An error
-    /// ends the wait, before the warn or after it.
-    pub(crate) fn wait_warning(&mut self, until: Option<std::time::Instant>, warn: impl FnOnce()) -> Result<(), Error> {
+    /// Whether the leaf drains by `until`, blocking no later: the `ended_by` of a
+    /// [`wait_warning`](crate::wait::teardown_warn::wait_warning) before [`wait`](Self::wait). What it
+    /// cannot read answers `true`, for the wait to find.
+    pub(crate) fn drained_by(&mut self, until: std::time::Instant) -> bool {
         use rustix::event::{poll, PollFd, PollFlags, Timespec};
 
-        let Some(until) = until else {
-            return self.wait();
-        };
         let drained = crate::wait::rearm_until(Some(Some(until)), |remaining| {
             if !self.populated()? {
                 return Ok(Some(()));
@@ -181,12 +178,21 @@ impl DrainWatch {
                 Err(e) => return Err(Error::Io(e.into())),
             }
             Ok(None)
-        })?;
-        if drained.is_some() || !self.populated()? {
-            return Ok(());
+        });
+        match drained {
+            Ok(Some(())) => true,
+            Ok(None) => match self.populated() {
+                Ok(populated) => !populated,
+                Err(e) => {
+                    log::debug!("a look at a killed leaf's drain failed ({e}); the wait that follows decides");
+                    true
+                }
+            },
+            Err(e) => {
+                log::debug!("a look at a killed leaf's drain failed ({e}); the wait that follows decides");
+                true
+            }
         }
-        warn();
-        self.wait()
     }
 }
 

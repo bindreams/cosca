@@ -13,72 +13,36 @@ use std::io::BufRead as _;
 
 use crate::child::spawn::fault::{self, SpawnPoint};
 use crate::test_groups::{cgroup, tracer_group, Group};
-use crate::test_support::foreign_tracer::{self, await_blocked_or_finished, Holder, Tracer, LET_EXIT, REAP};
+use crate::test_support::foreign_tracer::{self, assert_warns_once_before_blocking, Names, Tracer, LET_EXIT, REAP};
 
-/// Runs `teardown` on a thread of its own, on which slow teardowns warn, until it sleeps in a
-/// blocking `waitid`; then has the tracer `seized` answers hand the zombie of its child back.
-/// `seized` runs once the thread has started. Asserts that the teardown blocked, and that by then
-/// exactly one warn naming the child said it was still waiting. Answers what `teardown` returned.
-fn assert_warns_once_before_blocking<R: Send>(
-    teardown: impl FnOnce() -> R + Send,
-    seized: impl FnOnce() -> (u32, Tracer),
-) -> R {
-    crate::log_capture::install();
-    let mark = crate::log_capture::mark();
-    let (tid_tx, tid_rx) = std::sync::mpsc::channel();
-
-    // Asserted only after the tracer lets go: a failure inside the scope would join a thread the
-    // tracer still blocks.
-    let (pid, holder, warns, done) = std::thread::scope(|s| {
-        let thread = s.spawn(move || {
-            tid_tx
-                .send(rustix::thread::gettid().as_raw_nonzero().get())
-                .expect("report the tid");
-            let _warn = crate::tokio::child::fault::warn_slow_teardowns();
-            teardown()
-        });
-        let tid = tid_rx.recv().expect("the teardown's tid");
-        let (pid, mut tracer) = seized();
-        let holder = await_blocked_or_finished(tid);
-        let warns: Vec<_> = crate::log_capture::records_since(mark, &format!("child {pid}"))
-            .into_iter()
-            .filter(|text| text.contains("still waiting"))
-            .collect();
-        tracer.send(REAP);
-        tracer.expect("reaped");
-        (pid, holder, warns, thread.join().expect("the teardown"))
-    });
-
-    assert_eq!(
-        holder,
-        Holder::Blocked,
-        "the teardown returned while the tracer still held child {pid}'s zombie"
-    );
-    assert_eq!(warns.len(), 1, "one warn before the blocking wait: {warns:?}");
-    assert_eq!(
-        crate::log_capture::levels_since(mark, "still waiting"),
-        [log::Level::Warn],
-        "exactly one warn, at warn"
-    );
-    done
+/// Where a tracee is handed to the foreign tracer.
+#[derive(Clone, Copy)]
+enum Seize {
+    /// At the spawn point, with `arm` making the spawn fail from there.
+    At(SpawnPoint, fn()),
+    /// Right after tokio's `spawn()` forked it, with the spawn made to fail there.
+    AfterTokioFailsAfterFork,
 }
 
-/// Spawns a tracee whose spawn `arm` makes fail, with a foreign tracer seizing it at `point`, and
+/// Spawns a tracee whose spawn fails as `seize` says, with a foreign tracer seizing it there, and
 /// asserts as [`assert_warns_once_before_blocking`] does of its teardown, and that the teardown's
 /// kill ended the tracee.
 ///
 /// Mutant (for each test below, besides its own): the teardown's root kill sends nothing.
-fn assert_teardown_warns_once_before_blocking(point: SpawnPoint, arm: fn()) {
-    assert_front_or_child_teardown_warns_once_before_blocking(point, arm, false);
+fn assert_teardown_warns_once_before_blocking(seize: Seize) {
+    assert_front_or_child_teardown_warns_once_before_blocking(seize, false, Names::Pid);
 }
 
 /// [`assert_teardown_warns_once_before_blocking`] for a tracee that is, when `front`, an elevation
-/// front in a cgroup leaf.
-fn assert_front_or_child_teardown_warns_once_before_blocking(point: SpawnPoint, arm: fn(), front: bool) {
+/// front in a cgroup leaf. `names`: who the warn names.
+fn assert_front_or_child_teardown_warns_once_before_blocking(seize: Seize, front: bool, names: Names) {
     let (stdin, stdin_writer) = crate::test_child::held_writer_stdin();
     let (out_reader, out_writer) = std::io::pipe().expect("pipe");
     let (tracer_tx, tracer_rx) = std::sync::mpsc::channel::<(u32, Tracer)>();
+    // Started first: the spawn lock is held where the tracee is seized, and the helper's spawn needs it.
+    let mut idle = foreign_tracer::spawn_unseized_helper();
     let (spawned, reaps) = assert_warns_once_before_blocking(
+        names,
         move || {
             let blocker = fault::release_between_kill_and_wait(stdin_writer);
             let rt = ::tokio::runtime::Builder::new_current_thread()
@@ -86,18 +50,27 @@ fn assert_front_or_child_teardown_warns_once_before_blocking(point: SpawnPoint, 
                 .build()
                 .expect("runtime");
             let _rt = rt.enter();
-            let _hook = fault::set_at(point, move || {
-                let pid = fault::spawn_pid();
+            let seizing = move |pid: u32| {
                 let allowed = std::io::BufReader::new(out_reader)
                     .lines()
                     .map(|line| line.expect("read the tracee's stdout"))
                     .any(|line| line.ends_with("@@allowed@@"));
                 assert!(allowed, "the tracee ended without reporting \"allowed\"");
-                tracer_tx
-                    .send((pid, foreign_tracer::spawn_helper(pid)))
-                    .expect("hand the tracer over");
-            });
-            arm();
+                idle.seize(pid);
+                tracer_tx.send((pid, idle)).expect("hand the tracer over");
+            };
+            let (_at, _after_fork);
+            match seize {
+                Seize::At(point, arm) => {
+                    _at = Some(fault::set_at(point, move || seizing(fault::spawn_pid())));
+                    _after_fork = None;
+                    arm();
+                }
+                Seize::AfterTokioFailsAfterFork => {
+                    _at = None;
+                    _after_fork = Some(fault::fail_tokio_spawns_after_fork_then(seizing));
+                }
+            }
             let mut cmd = foreign_tracer::tokio_tracee_command();
             if front {
                 cmd.contain_with(crate::ContainMode::Strongest);
@@ -143,9 +116,9 @@ fn assert_sigkilled(reaps: &[(u32, std::process::ExitStatus)]) {
 /// Mutant: `reap_now` waits with no warn.
 #[skuld::test]
 fn a_teardown_after_a_failed_attach_warns_once_past_1s(#[fixture(tracer_group)] _group: &Group) {
-    assert_teardown_warns_once_before_blocking(SpawnPoint::BeforeAttach, || {
+    assert_teardown_warns_once_before_blocking(Seize::At(SpawnPoint::BeforeAttach, || {
         fault::set_force_attach_failure(true);
-    });
+    }));
 }
 
 /// The teardown after a refused identity read, through the pidfd
@@ -154,9 +127,9 @@ fn a_teardown_after_a_failed_attach_warns_once_past_1s(#[fixture(tracer_group)] 
 /// Mutant: `teardown_through_pidfd` reaps with no warn.
 #[skuld::test]
 fn a_teardown_after_a_refused_identity_read_warns_once_past_1s(#[fixture(tracer_group)] _group: &Group) {
-    assert_teardown_warns_once_before_blocking(SpawnPoint::BeforeIdentity, || {
+    assert_teardown_warns_once_before_blocking(Seize::At(SpawnPoint::BeforeIdentity, || {
         fault::set_force_identity_unknown(true);
-    });
+    }));
 }
 
 /// The teardown whose first kill was refused hands the child to the pidfd teardown, whose own kill
@@ -165,10 +138,10 @@ fn a_teardown_after_a_refused_identity_read_warns_once_past_1s(#[fixture(tracer_
 /// Mutant: the pidfd teardown reaps with no warn.
 #[skuld::test]
 fn a_teardown_whose_first_kill_was_refused_warns_once_past_1s(#[fixture(tracer_group)] _group: &Group) {
-    assert_teardown_warns_once_before_blocking(SpawnPoint::BeforeAttach, || {
+    assert_teardown_warns_once_before_blocking(Seize::At(SpawnPoint::BeforeAttach, || {
         fault::set_force_attach_failure(true);
         fault::set_force_kill_failure_leaving_child_alive_as("refused", std::io::ErrorKind::PermissionDenied);
-    });
+    }));
 }
 
 /// The teardown after a failed attach of an elevation front in a cgroup leaf. The leaf's kill ends
@@ -182,10 +155,33 @@ fn a_front_teardown_after_a_failed_attach_warns_once_past_1s(
     #[fixture(cgroup)] _cgroup: &Group,
 ) {
     assert_front_or_child_teardown_warns_once_before_blocking(
-        SpawnPoint::BeforeAttach,
-        || fault::set_force_attach_failure(true),
+        Seize::At(SpawnPoint::BeforeAttach, || fault::set_force_attach_failure(true)),
         true,
+        Names::Pid,
     );
+}
+
+/// tokio's `spawn()` fails after its fork, with no pid to give. The handshake tears down the child it
+/// holds through its pidfd (`pidfd_handshake::conclude`), and its wait warns, saying the pid is
+/// unknown.
+///
+/// Mutants: the async spawn does not hand `Handshake::warning_past` the threshold; `conclude`'s
+/// teardown waits with no warn.
+#[skuld::test]
+fn a_spawn_failing_after_its_fork_warns_once_past_1s(#[fixture(tracer_group)] _group: &Group) {
+    assert_front_or_child_teardown_warns_once_before_blocking(Seize::AfterTokioFailsAfterFork, false, Names::Unknown);
+}
+
+/// As above, for an elevation front in a cgroup leaf: the handshake leaves the front to its leaf,
+/// whose abandonment kills through the leaf and waits for the front's exit (`end_front`).
+///
+/// Mutants: `end_front` waits with no warn; the abandonment hands it no threshold.
+#[skuld::test]
+fn a_front_whose_spawn_failed_after_its_fork_warns_once_past_1s(
+    #[fixture(tracer_group)] _tracer: &Group,
+    #[fixture(cgroup)] _cgroup: &Group,
+) {
+    assert_front_or_child_teardown_warns_once_before_blocking(Seize::AfterTokioFailsAfterFork, true, Names::Pid);
 }
 
 /// The leaf of a failed attach is dropped, which kills it and waits for it to drain
@@ -287,6 +283,7 @@ async fn a_failed_elevation_writes_cleanup_warns_once_past_1s(#[fixture(tracer_g
     let pid = child.id().pid();
     let tracer = foreign_tracer::spawn_helper(pid);
     let (cleaned, reaps) = assert_warns_once_before_blocking(
+        Names::Pid,
         move || {
             let blocker = fault::release_between_kill_and_wait(stdin);
             let cleaned =

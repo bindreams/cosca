@@ -42,7 +42,7 @@ impl Unadopted for NotYetExited {
             Err(std::io::Error::other("waited on a front the leaf's kill did not reach"))
         }
     }
-    fn pidfd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+    fn pidfd(&self) -> std::os::fd::BorrowedFd<'_> {
         self.inner.pidfd()
     }
 }

@@ -33,20 +33,31 @@ a run-to-completion teardown (`status`, `output`, `read` failing after the spawn
 or mid-drain finishes as the `Drop` does, and one whose exit or drain cannot be watched (the
 reactor refuses the registration, or the handle reports an error) waits for it in place instead of
 forgetting a child that is ours. Both warn past 1 s, as principle 3 says. A failed async spawn's
-teardown waits in place too. Exactly these of its waits warn once past 1 s, as the drop's does,
-each naming what it waits for: the wait for the root it killed, once the spawn has a child handle
-(on Linux, and on macOS including the teardown of a child whose unique-id report came after the
-spawn returned, [`reap_unreported`](../src/tokio/child/proc_source.rs)); on Linux, the wait for an
-elevation front its leaf's kill ended; and, on Linux, the wait for a cgroup leaf's drain, in the
-leaf's `Drop` or in `finish_elevated`'s cleanup. Its other blocking waits do not warn yet: the
-teardown and front paths of
-[`pidfd_handshake::conclude`](../src/child/spawn/pidfd_handshake.rs), and `end_child` and
-`end_front` in [`leaf.rs`](../src/containment/cgroup/leaf.rs).
+teardown waits in place too. Exactly these of its blocking waits for something it killed warn once
+past 1 s, as the drop's does, each naming what it waits for:
+
+- the wait for the root, once the spawn has a child handle (on Linux, and on macOS
+  including the teardown of a child whose unique-id report came after the spawn returned,
+  [`reap_unreported`](../src/tokio/child/proc_source.rs));
+- on Linux, the waits for a child it killed in the pidfd handshake
+  ([`conclude`](../src/child/spawn/pidfd_handshake.rs) and `await_unexecuted_exit`), and in a cgroup
+  leaf's abandonment: `end_child` for a child that named itself, and the pidfd teardown of one that
+  never did (`abandon_before_verdict` in [`leaf.rs`](../src/containment/cgroup/leaf.rs));
+- on Linux, the wait for an elevation front its leaf's kill ended, in the teardown after the handle
+  exists and in the leaf's abandonment (`end_front` in [`leaf.rs`](../src/containment/cgroup/leaf.rs));
+- on Linux, the wait for a cgroup leaf's drain, in the leaf's `Drop`, in `finish_elevated`'s
+  cleanup, and in the leaf's abandonment (`abandon_before_verdict` and `abandon_front` in
+  [`leaf.rs`](../src/containment/cgroup/leaf.rs)).
+
+Each runs through [`wait_warning`](../src/wait/teardown_warn.rs), as the armed drop's reap and
+drain do: it takes the wait as an argument and warns before it if what it waits for has not ended
+within the threshold. On Windows
+the teardown's waits do not warn yet: `ProcSource::reap_now`'s wait on the process handle
+(`WaitForSingleObject` with `INFINITE`, in [`proc_source.rs`](../src/tokio/child/proc_source.rs))
+and the raw backend's `raw_spawn_teardown` ([`windows_raw.rs`](../src/child/spawn/windows_raw.rs)).
 
 Spawning is the other exception: it blocks until `exec`, as tokio's own `Command::spawn` does.
-That includes the handshake's wait for a child that never ran the program to be gone
-([`await_unexecuted_exit`](../src/child/spawn/pidfd_handshake.rs)): it belongs to the spawn, not to
-a teardown, and does not warn. It includes cosca's placement report
+That includes cosca's placement report
 ([`ReportChannel::wait`](../src/containment/cgroup/channel.rs)), which completes before `exec`. The
 wait is bounded by the child's own progress to `exec`; a child stopped or stuck in D state between
 `fork` and `exec` holds the thread. The wait for macOS's unique-id report
@@ -130,7 +141,8 @@ Windows, only while a handle to the process is open. Signal and wait through a h
 process:
 
 - on Linux, a `pidfd` opened while the child is provably ours, or the child's own pidfd from before
-  `exec`;
+  `exec`. A failed spawn's warn opens one by number for a child that sent only its `/proc`
+  directory, and keeps it only if that directory shows the child unreaped after the open;
 - a cgroup, since `cgroup.kill` names no PID;
 - on Windows, a process handle or Job Object.
 

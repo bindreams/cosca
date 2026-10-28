@@ -149,6 +149,16 @@ pub(crate) fn allow_any_tracer(cmd: &mut std::process::Command) {
     }
 }
 
+/// A [`BLOCKER_ARGV`](crate::test_child::BLOCKER_ARGV) child that any tracer may seize, its stdin held
+/// open by the returned `Child`, which a test keeps until the child is gone. Spawned under
+/// `spawn_lock`.
+#[cfg(feature = "tokio")]
+pub(crate) fn blocker() -> std::process::Child {
+    let mut cmd = crate::test_child::held_std_blocker(std::process::Stdio::null());
+    allow_any_tracer(&mut cmd);
+    crate::test_spawn::spawn(&mut cmd).expect("spawn the tracee")
+}
+
 /// Lets any process trace this one (`PR_SET_PTRACER`), which Yama's scope 1 requires of a tracer
 /// that is no ancestor. For a tracee that cannot take [`allow_any_tracer`], such as one spawned by
 /// `cosca::tokio::Command`, which has no `pre_exec`. Until it returns, [`spawn_helper`]'s seize
@@ -364,4 +374,95 @@ pub(crate) async fn spawn_tokio_tracee() -> (crate::tokio::Child, crate::tokio::
             None => panic!("the tracee ended without reporting \"allowed\""),
         }
     }
+}
+
+/// Who a failed spawn's slow-teardown warn names, for [`assert_warns_once_before_blocking`].
+#[cfg(feature = "tokio")]
+#[derive(Clone, Copy)]
+pub(crate) enum Names {
+    /// `child <pid>`, the pid `seized` answers.
+    Pid,
+    /// The spawned child whose pid the teardown does not know.
+    Unknown,
+}
+
+/// Runs `teardown` on a thread of its own, on which slow teardowns warn (see
+/// [`crate::tokio::child::fault::warn_slow_teardowns`]), until it sleeps in a blocking `waitid`; then
+/// has the tracer `seized` answers hand the zombie of its child back. `seized` runs once the thread
+/// has started. Asserts that the teardown blocked, and that by then exactly one warn, naming the
+/// child as `names` says, said it was still waiting. Answers what `teardown` returned.
+///
+/// A teardown that does not warn blocks all the same and returns once the tracer has let go, so it
+/// fails the count here instead of hanging.
+#[cfg(feature = "tokio")]
+pub(crate) fn assert_warns_once_before_blocking<R: Send>(
+    names: Names,
+    teardown: impl FnOnce() -> R + Send,
+    seized: impl FnOnce() -> (u32, Tracer),
+) -> R {
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+
+    // Asserted only after the tracer lets go: a failure inside the scope would join a thread the
+    // tracer still blocks.
+    let (pid, holder, warns, done) = std::thread::scope(|s| {
+        let thread = s.spawn(move || {
+            tid_tx
+                .send(rustix::thread::gettid().as_raw_nonzero().get())
+                .expect("report the tid");
+            let _warn = crate::tokio::warn_slow_teardowns();
+            teardown()
+        });
+        let tid = tid_rx.recv().expect("the teardown's tid");
+        let (pid, mut tracer) = seized();
+        let holder = await_blocked_or_finished(tid);
+        let who = match names {
+            Names::Pid => format!("child {pid}"),
+            Names::Unknown => "pid unknown".to_owned(),
+        };
+        let warns: Vec<_> = crate::log_capture::records_since(mark, &who)
+            .into_iter()
+            .filter(|text| text.contains("still waiting"))
+            .collect();
+        tracer.send(REAP);
+        tracer.expect("reaped");
+        (pid, holder, warns, thread.join().expect("the teardown"))
+    });
+
+    assert_eq!(
+        holder,
+        Holder::Blocked,
+        "the teardown returned while the tracer still held child {pid}'s zombie"
+    );
+    assert_eq!(warns.len(), 1, "one warn before the blocking wait: {warns:?}");
+    assert_eq!(
+        crate::log_capture::levels_since(mark, "still waiting"),
+        [log::Level::Warn],
+        "exactly one warn, at warn"
+    );
+    done
+}
+
+/// [`assert_warns_once_before_blocking`] for a tracee `pid` that exists already: the teardown starts
+/// only once the tracer has seized it.
+#[cfg(feature = "tokio")]
+pub(crate) fn assert_warns_once_after_seizing<R: Send>(
+    names: Names,
+    pid: u32,
+    teardown: impl FnOnce() -> R + Send,
+) -> R {
+    let (seized_tx, seized_rx) = std::sync::mpsc::channel();
+    assert_warns_once_before_blocking(
+        names,
+        move || {
+            seized_rx.recv().expect("the tracer seized the child");
+            teardown()
+        },
+        move || {
+            let tracer = spawn_helper(pid);
+            seized_tx.send(()).expect("let the teardown go on");
+            (pid, tracer)
+        },
+    )
 }

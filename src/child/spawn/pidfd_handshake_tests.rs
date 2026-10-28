@@ -1095,7 +1095,7 @@ fn an_abandoned_child_is_worded_by_its_cause() {
         fn pid(&self) -> Option<u32> {
             Some(4)
         }
-        fn reap_unexecuted(self, _: OwnedFd) -> ChildFate {
+        fn reap_unexecuted(self, _: OwnedFd, _: Option<std::time::Duration>) -> ChildFate {
             panic!("there is no pidfd to reap through");
         }
         fn abandon_unreported(self, why: &str) {
@@ -1105,7 +1105,13 @@ fn an_abandoned_child_is_worded_by_its_cause() {
 
     let said = std::rc::Rc::new(RefCell::new(None));
     let failed = Outcome::Failed(Error::Io(std::io::Error::other("the report was cut short")), None);
-    let err = super::conclude(Ok(Recorder(Rc::clone(&said))), failed, super::LeftFront::NotAFront).err();
+    let err = super::conclude(
+        Ok(Recorder(Rc::clone(&said))),
+        failed,
+        super::LeftFront::NotAFront,
+        None,
+    )
+    .err();
     assert_eq!(
         err.map(|e| e.expect_not_started().to_string()).as_deref(),
         Some("the report was cut short")
@@ -1120,6 +1126,7 @@ fn an_abandoned_child_is_worded_by_its_cause() {
         Ok(Recorder(Rc::clone(&said))),
         Outcome::NoReport,
         super::LeftFront::NotAFront,
+        None,
     )
     .err();
     let why = said.borrow_mut().take().expect("the child was abandoned");
@@ -1246,7 +1253,7 @@ impl<const TOKIO: bool> super::Spawned for NoChild<TOKIO> {
     fn pid(&self) -> Option<u32> {
         None
     }
-    fn reap_unexecuted(self, _: OwnedFd) -> ChildFate {
+    fn reap_unexecuted(self, _: OwnedFd, _: Option<std::time::Duration>) -> ChildFate {
         panic!("no child was handed back");
     }
     fn abandon_unreported(self, _: &str) {
@@ -1297,6 +1304,7 @@ fn a_dropped_front_is_left_and_noted() {
         Err::<NoChild, _>(std::io::Error::other("tokio failed")),
         Outcome::Opened(pidfd),
         sudo_front(),
+        None,
     )
     .err()
     .expect("the spawn fails")
@@ -1323,6 +1331,7 @@ fn a_collected_front_is_no_front() {
         Err::<NoChild, _>(std::io::Error::other("exec failed")),
         Outcome::Opened(pidfd),
         sudo_front(),
+        None,
     )
     .err()
     .expect("the spawn fails")
@@ -1342,6 +1351,7 @@ fn a_front_gone_before_its_go_is_no_front() {
         Err::<NoChild, _>(std::io::Error::other("killed on its way")),
         Outcome::Gone(pidfd),
         sudo_front(),
+        None,
     )
     .err()
     .expect("the spawn fails")
@@ -1371,6 +1381,7 @@ fn a_not_started_failure_carries_the_fate_of_the_child_it_held() {
         Err::<NoChild, _>(io("gone")),
         Outcome::Gone(killed()),
         super::LeftFront::NotAFront,
+        None,
     )
     .err()
     .expect("the spawn fails")
@@ -1382,6 +1393,7 @@ fn a_not_started_failure_carries_the_fate_of_the_child_it_held() {
         Err::<NoChild, _>(io("x")),
         Outcome::Failed(Error::Io(io("helper")), Some(killed())),
         super::LeftFront::NotAFront,
+        None,
     )
     .err()
     .expect("the spawn fails")
@@ -1398,15 +1410,20 @@ fn a_not_started_failure_carries_the_fate_of_the_child_it_held() {
         ]
     };
     for outcome in outcomes() {
-        let failure = super::conclude(Err::<NoChild, _>(io("x")), outcome, super::LeftFront::NotAFront)
+        let failure = super::conclude(Err::<NoChild, _>(io("x")), outcome, super::LeftFront::NotAFront, None)
             .err()
             .expect("the spawn fails");
         assert!(matches!(failure, SpawnFailure::NotStartedUnreaped(_)), "{failure:?}");
     }
     for outcome in outcomes() {
-        let failure = super::conclude(Err::<NoChild<false>, _>(io("x")), outcome, super::LeftFront::NotAFront)
-            .err()
-            .expect("the spawn fails");
+        let failure = super::conclude(
+            Err::<NoChild<false>, _>(io("x")),
+            outcome,
+            super::LeftFront::NotAFront,
+            None,
+        )
+        .err()
+        .expect("the spawn fails");
         assert!(matches!(failure, SpawnFailure::NotStarted(_)), "{failure:?}");
     }
 }
@@ -1420,7 +1437,7 @@ impl super::Spawned for Fated {
     fn pid(&self) -> Option<u32> {
         Some(4)
     }
-    fn reap_unexecuted(self, _: OwnedFd) -> ChildFate {
+    fn reap_unexecuted(self, _: OwnedFd, _: Option<std::time::Duration>) -> ChildFate {
         self.0
     }
     fn abandon_unreported(self, _: &str) {}
@@ -1439,6 +1456,7 @@ fn a_returned_childs_failure_carries_its_teardowns_fate() {
         Ok(Fated(ChildFate::Gone)),
         Outcome::Gone(any_fd()),
         super::LeftFront::NotAFront,
+        None,
     )
     .err()
     .expect("the spawn fails")
@@ -1449,6 +1467,7 @@ fn a_returned_childs_failure_carries_its_teardowns_fate() {
         Ok(Fated(ChildFate::Killed)),
         Outcome::Failed(Error::Io(std::io::Error::other("helper")), Some(any_fd())),
         super::LeftFront::NotAFront,
+        None,
     )
     .err()
     .expect("the spawn fails")
@@ -1467,7 +1486,7 @@ fn a_returned_child_with_no_pidfd_is_killed() {
         Outcome::NoReport,
         Outcome::Unwatched("forced".to_string()),
     ] {
-        let (_, fate) = super::conclude(Ok(Fated(ChildFate::Reaped)), outcome, super::LeftFront::NotAFront)
+        let (_, fate) = super::conclude(Ok(Fated(ChildFate::Reaped)), outcome, super::LeftFront::NotAFront, None)
             .err()
             .expect("the spawn fails")
             .expect_not_started_with_child();
@@ -1487,6 +1506,7 @@ fn a_group_roots_failure_carries_its_teardowns_fate() {
         Err::<NoChild, _>(std::io::Error::other("tokio failed")),
         Outcome::Opened(pidfd),
         super::LeftFront::GroupRoot,
+        None,
     )
     .err()
     .expect("the spawn fails")
@@ -1503,6 +1523,7 @@ fn an_unpeekable_dropped_front_is_left_and_noted() {
         Err::<NoChild, _>(std::io::Error::other("tokio failed")),
         Outcome::Opened(pidfd),
         sudo_front(),
+        None,
     )
     .err()
     .expect("the spawn fails")
@@ -1533,6 +1554,7 @@ fn a_front_left_to_its_leaf_keeps_its_pidfd_and_is_sent_nothing() {
         Err::<NoChild, _>(std::io::Error::other("tokio failed")),
         Outcome::Opened(pidfd),
         super::LeftFront::ToLeaf(Rc::clone(&left)),
+        None,
     )
     .err()
     .expect("the spawn fails")
@@ -1574,6 +1596,7 @@ fn conclude_answers_whether_the_program_could_have_started() {
         Err::<NoChild, _>(io("tokio")),
         Outcome::Opened(pidfd),
         super::LeftFront::NotAFront,
+        None,
     ))
     .expect_may_have_started_with();
     // A live child tokio dropped is killed and reaped through the pidfd.
@@ -1585,6 +1608,7 @@ fn conclude_answers_whether_the_program_could_have_started() {
         Err::<NoChild<false>, _>(io("std")),
         Outcome::Opened(pidfd),
         super::LeftFront::NotAFront,
+        None,
     )
     .err()
     .expect("the spawn fails")
@@ -1598,28 +1622,32 @@ fn conclude_answers_whether_the_program_could_have_started() {
         Err::<NoChild, _>(io("gone")),
         Outcome::Gone(pidfd),
         super::LeftFront::NotAFront,
+        None,
     ))
     .expect_not_started();
     answered(super::conclude(
         Err::<NoChild, _>(io("x")),
         Outcome::Failed(failed("helper"), None),
         super::LeftFront::NotAFront,
+        None,
     ))
     .expect_not_started();
     answered(super::conclude(
         Err::<NoChild, _>(io("x")),
         Outcome::NoReport,
         super::LeftFront::NotAFront,
+        None,
     ))
     .expect_not_started();
     answered(super::conclude(
         Err::<NoChild, _>(io("x")),
         Outcome::Unwatched("cause".into()),
         super::LeftFront::NotAFront,
+        None,
     ))
     .expect_not_started();
     let (cat, pidfd) = cat_with_pidfd();
-    super::conclude(Ok(cat), Outcome::Gone(pidfd), super::LeftFront::NotAFront)
+    super::conclude(Ok(cat), Outcome::Gone(pidfd), super::LeftFront::NotAFront, None)
         .err()
         .expect("the spawn fails")
         .expect_not_started();
@@ -1628,6 +1656,7 @@ fn conclude_answers_whether_the_program_could_have_started() {
         Ok(cat),
         Outcome::Failed(failed("helper"), Some(pidfd)),
         super::LeftFront::NotAFront,
+        None,
     )
     .err()
     .expect("the spawn fails")
@@ -1656,7 +1685,7 @@ fn conclude_answers_every_remaining_pair() {
 
     // Told to go, and the spawn succeeded: it carries on.
     let (cat, pidfd) = ended_cat();
-    let held = super::conclude(Ok(cat), Outcome::Opened(pidfd), super::LeftFront::NotAFront)
+    let held = super::conclude(Ok(cat), Outcome::Opened(pidfd), super::LeftFront::NotAFront, None)
         .expect("a child told to go is held");
     let mut cat = held.child;
     cat.wait().expect("collect the child");
@@ -1667,13 +1696,14 @@ fn conclude_answers_every_remaining_pair() {
         Ok(cat),
         Outcome::Failed(failed("helper"), None),
         super::LeftFront::NotAFront,
+        None,
     )
     .err()
     .expect("the spawn fails")
     .expect_not_started();
     assert!(matches!(&error, Error::Io(e) if e.to_string() == "helper"), "{error:?}");
     let (cat, _pidfd) = ended_cat();
-    let error = super::conclude(Ok(cat), Outcome::NoReport, super::LeftFront::NotAFront)
+    let error = super::conclude(Ok(cat), Outcome::NoReport, super::LeftFront::NotAFront, None)
         .err()
         .expect("the spawn fails")
         .expect_not_started();
@@ -1682,10 +1712,15 @@ fn conclude_answers_every_remaining_pair() {
         "{error:?}"
     );
     let (cat, _pidfd) = ended_cat();
-    let error = super::conclude(Ok(cat), Outcome::Unwatched("cause".into()), super::LeftFront::NotAFront)
-        .err()
-        .expect("the spawn fails")
-        .expect_not_started();
+    let error = super::conclude(
+        Ok(cat),
+        Outcome::Unwatched("cause".into()),
+        super::LeftFront::NotAFront,
+        None,
+    )
+    .err()
+    .expect("the spawn fails")
+    .expect_not_started();
     assert!(
         matches!(&error, Error::Io(e) if e.to_string().contains("its exit could not be watched (cause)")),
         "{error:?}"
@@ -1700,6 +1735,7 @@ fn conclude_answers_every_remaining_pair() {
         Err::<NoChild, _>(io("spawn")),
         Outcome::Failed(failed("helper"), Some(pidfd)),
         super::LeftFront::NotAFront,
+        None,
     )
     .err()
     .expect("the spawn fails")

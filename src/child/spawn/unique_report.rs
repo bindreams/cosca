@@ -333,10 +333,12 @@ fn watch(read_end: &OwnedFd, pid: u32) -> io::Result<Watch> {
     // A batch: events past it stay pending for the next call.
     let mut events = [blank; 8];
     let started = std::time::Instant::now();
+    // In a test, only one that opted in (`seams::say_waiting_after_then_record`): a loaded runner
+    // could pass a second, and no verdict may depend on elapsed time.
     #[cfg(not(test))]
-    let say_after = SAY_WAITING_AFTER;
+    let say_after = Some(SAY_WAITING_AFTER);
     #[cfg(test)]
-    let say_after = seams::say_waiting_after().unwrap_or(SAY_WAITING_AFTER);
+    let say_after = seams::say_waiting_after();
     let mut warned = false;
     loop {
         // Read before asking about the child: the report may have come since the last read.
@@ -356,7 +358,9 @@ fn watch(read_end: &OwnedFd, pid: u32) -> io::Result<Watch> {
         };
         #[cfg(test)]
         seams::blocking(&kq);
-        let warn_in = (!warned).then(|| say_after.saturating_sub(started.elapsed()));
+        let warn_in = say_after
+            .filter(|_| !warned)
+            .map(|after| after.saturating_sub(started.elapsed()));
         let timeout = match (recheck, warn_in) {
             (Some(recheck), Some(warn_in)) => Some(recheck.min(warn_in)),
             (recheck, warn_in) => recheck.or(warn_in),
@@ -368,7 +372,7 @@ fn watch(read_end: &OwnedFd, pid: u32) -> io::Result<Watch> {
             Err(nix::errno::Errno::EINTR) => continue,
             Err(e) => return Err(e.into()),
         };
-        if !warned && started.elapsed() >= say_after {
+        if !warned && say_after.is_some_and(|after| started.elapsed() >= after) {
             warned = true;
             log::warn!(
                 "the spawned child {pid} has not reported its unique id after 1 s; waiting for its report, or \
@@ -1089,15 +1093,15 @@ pub(crate) mod seams {
         }
     }
 
-    /// While the guard lives, a wait for a report on this thread warns after `after` instead of one
-    /// second, and records the timeout of each of its `kevent` calls.
+    /// While the guard lives, a wait for a report on this thread warns after `after`, and records the
+    /// timeout of each of its `kevent` calls. Without the guard a wait in a test never warns.
     pub(crate) fn say_waiting_after_then_record(after: std::time::Duration) -> SayAfter {
         SAY_AFTER.with(|s| s.set(Some(after)));
         TIMEOUTS.with(|t| t.borrow_mut().clear());
         SayAfter(())
     }
 
-    #[must_use = "the wait warns after one second again once the guard is dropped"]
+    #[must_use = "the wait stops warning as soon as the guard is dropped"]
     pub(crate) struct SayAfter(());
 
     impl SayAfter {

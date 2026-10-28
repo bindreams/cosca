@@ -2552,7 +2552,7 @@ fn reaped(pidfd: &std::os::fd::OwnedFd) -> bool {
 /// reporting `Placed` (`/dev/null` stands in for `cgroup.procs`) or, with `fail`, the write's
 /// `EBADF`. `before` runs in the forked child first. Returns the child, never waited on here.
 #[cfg(target_os = "linux")]
-fn spawn_placing(
+pub(super) fn spawn_placing(
     leaf: &crate::containment::cgroup::CgroupLeaf,
     argv: &[&str],
     fail: bool,
@@ -3077,7 +3077,9 @@ fn end_child_refuses_inside_a_section() {
         proc_dir: None,
     };
     let _section = crate::bounded::Section::enter();
-    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| super::end_child(&received)));
+    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        super::end_child(&received, &mut super::NoWarn)
+    }));
     assert!(refused.is_err(), "end_child must refuse inside a bounded section");
 }
 

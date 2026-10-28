@@ -4,7 +4,7 @@
 use std::os::fd::OwnedFd;
 
 use super::super::test_support::{fork_running, KillOnDrop};
-use super::{end_front, Abandoned, Received};
+use super::{end_front, Abandoned, NoWarn, Received};
 use crate::child::spawn::FrontFate;
 use crate::containment::cgroup::PlacementReport;
 
@@ -40,7 +40,9 @@ fn a_front_whose_place_cannot_be_read_is_left_naming_the_cause() {
     let (front, pidfd) = running_front();
     let received = received(&front, pidfd);
     let mark = crate::log_capture::mark();
-    let fate = end_front(&received, |_, _| Err(std::io::Error::other("subtree gone")));
+    let fate = end_front(&received, &mut NoWarn, |_, _| {
+        Err(std::io::Error::other("subtree gone"))
+    });
     assert_eq!(fate, Abandoned::Front(FrontFate::Unplaced));
     let warns = crate::log_capture::records_since_on_current_thread(mark, "cannot be placed");
     assert_eq!(warns.len(), 1, "{warns:?}");
@@ -60,7 +62,9 @@ fn a_front_that_sent_no_handle_is_unaccounted_for() {
         proc_dir: None,
     };
     let mark = crate::log_capture::mark();
-    let fate = end_front(&received, |_, _| panic!("a front with no handle is not placed"));
+    let fate = end_front(&received, &mut NoWarn, |_, _| {
+        panic!("a front with no handle is not placed")
+    });
     assert_eq!(fate, Abandoned::Front(FrontFate::Unaccounted));
     let warns = crate::log_capture::records_since_on_current_thread(mark, "sent no handle on itself");
     assert_eq!(warns.len(), 1, "{warns:?}");
@@ -89,7 +93,7 @@ fn a_front_reaped_by_someone_else_before_the_final_wait_is_reaped_at_debug() {
     let pid = front.defuse();
     let _reaped_elsewhere = crate::containment::cgroup::fault::set_before_exit_wait(move || reap_behind(pid));
     let mark = crate::log_capture::mark();
-    let fate = end_front(&received, |_, _| Ok(true));
+    let fate = end_front(&received, &mut NoWarn, |_, _| Ok(true));
     assert_eq!(fate, Abandoned::Front(FrontFate::Reaped));
     let records = records_about(mark, pid);
     assert_eq!(records.len(), 1, "{records:?}");
@@ -108,7 +112,7 @@ fn a_front_reaped_by_someone_else_before_the_probe_has_ended_at_debug() {
     let pid = front.defuse();
     let _reaped_elsewhere = crate::containment::cgroup::fault::set_before_front_probe(move || reap_behind(pid));
     let mark = crate::log_capture::mark();
-    let fate = end_front(&received, |_, _| Ok(false));
+    let fate = end_front(&received, &mut NoWarn, |_, _| Ok(false));
     assert_eq!(fate, Abandoned::Ended);
     let records = records_about(mark, pid);
     assert_eq!(records.len(), 1, "{records:?}");
@@ -138,7 +142,7 @@ fn a_front_is_placed_before_the_probe_that_decides_its_wait() {
         libc::kill(pid as i32, libc::SIGKILL);
     });
     let placed_after_probe = Cell::new(None);
-    let fate = end_front(&received, |_, _| {
+    let fate = end_front(&received, &mut NoWarn, |_, _| {
         placed_after_probe.set(Some(probed.get()));
         Ok(true)
     });
@@ -169,7 +173,7 @@ fn a_front_known_by_its_proc_directory_is_placed_before_the_look_that_precedes_t
         proc_dir: Some(OwnedFd::from(proc_dir)),
     };
     let mark = crate::log_capture::mark();
-    let fate = end_front(&received, |_, _| {
+    let fate = end_front(&received, &mut NoWarn, |_, _| {
         reap_behind(pid);
         Ok(true)
     });
@@ -201,7 +205,9 @@ fn a_front_exited_before_the_probe_is_reaped_whatever_its_place_read() {
         }
     }
     let mark = crate::log_capture::mark();
-    let fate = end_front(&received, |_, _| Err(std::io::Error::other("subtree gone")));
+    let fate = end_front(&received, &mut NoWarn, |_, _| {
+        Err(std::io::Error::other("subtree gone"))
+    });
     assert_eq!(fate, Abandoned::Front(FrontFate::Reaped));
     let records = records_about(mark, pid);
     assert_eq!(records, Vec::new(), "{records:?}");
