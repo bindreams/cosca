@@ -5,12 +5,12 @@ use crate::error::ChildFate;
 
 use super::proc_source::ProcSource;
 
-/// A teardown whose kill was denied (the child's exit is underway, here: it has exited and is not
-/// reaped) and whose wait then fails cannot say the kill ended the child: the fate is `Unknown`.
+/// A teardown whose kill was refused because the child's exit is underway (here: it has exited and
+/// is not reaped) and whose wait then fails says `Killed`: the child is dead or dying.
 ///
-/// Mutant: the teardown answers `Killed` for a denied kill whose wait failed.
+/// Mutant: the teardown answers `Unknown` for a failed wait after a refusal.
 #[skuld::test]
-async fn reap_now_with_a_denied_kill_and_a_failed_wait_is_unknown() {
+async fn reap_now_with_an_exit_under_way_and_a_failed_wait_is_killed() {
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::System::Threading::{WaitForSingleObject, INFINITE};
 
@@ -33,7 +33,7 @@ async fn reap_now_with_a_denied_kill_and_a_failed_wait_is_unknown() {
     let fate = proc.reap_now(pid, None);
 
     assert!(failed.taken(), "the teardown made the wait that failed");
-    assert_eq!(fate, ChildFate::Unknown);
+    assert_eq!(fate, ChildFate::Killed);
 }
 
 /// A teardown whose kill was delivered to a live child and whose wait then fails says the child was

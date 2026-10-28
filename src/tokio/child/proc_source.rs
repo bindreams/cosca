@@ -1260,10 +1260,7 @@ impl ProcSource {
     /// teardown's one warn carries it.
     pub(crate) fn reap_now_noting(mut self, pid: u32, id: Option<ProcessId>, why: &mut Diagnosis) -> ChildFate {
         crate::bounded::assert_may_block("reap_now");
-        let (killed, denied) = match self.teardown_kill() {
-            Ok((sent, denied)) => (Ok(sent), denied),
-            Err(e) => (Err(e), false),
-        };
+        let killed = self.teardown_kill();
         if let Err(e) = &killed {
             // Tokio's drop reaps by pid: a child the handle shows reaped elsewhere is forgotten.
             #[cfg(unix)]
@@ -1309,8 +1306,6 @@ impl ProcSource {
         let fate = match waited {
             Waited::Exited => self.collect_exit(id),
             Waited::Unverified => match killed {
-                // A denied kill (Windows) is not known to have ended it: as `fate_after_reap`.
-                Ok(Sent::Delivered) if denied => ChildFate::Unknown,
                 Ok(Sent::Delivered) => ChildFate::Killed,
                 _ => ChildFate::Running { id },
             },
@@ -1476,18 +1471,12 @@ impl ProcSource {
 
     /// The teardown's kill: [`Sig::Kill`] through the handle, or (tests) the forced refusal of the
     /// sync seam's "leave it alive" form, which replaces the kill so the child is really left alone.
-    /// With whether the kill was denied because the child's exit is underway (Windows; `false`
-    /// elsewhere): a denied kill is [`Sent::Delivered`] but is not known to have ended the child.
-    fn teardown_kill(&self) -> Result<(Sent, bool), Error> {
+    fn teardown_kill(&self) -> Result<Sent, Error> {
         #[cfg(test)]
         if let Some((marker, kind, _)) = crate::child::spawn::fault::take_force_kill_failure() {
             return Err(Error::Io(std::io::Error::new(kind, marker)));
         }
-        #[cfg(windows)]
-        if let ProcSource::Tokio { child, .. } = self {
-            return terminate_tokio(child);
-        }
-        self.signal(Sig::Kill).map(|sent| (sent, false))
+        self.signal(Sig::Kill)
     }
 
     /// A child whose teardown kill was refused (a setuid child answers `EPERM`) and that is not
@@ -1532,7 +1521,7 @@ impl ProcSource {
         use crate::wait::exit_only::{self, Target};
 
         crate::bounded::assert_may_block("teardown_through_pidfd");
-        let killed = self.teardown_kill().map(|(sent, _denied)| sent);
+        let killed = self.teardown_kill();
         if let Err(e) = &killed {
             let foreign = self.forget_if_foreign_quietly(id);
             let (handed, hand_leak) = self.hand_to_pidfd_reaper(pid, id);
@@ -1842,31 +1831,10 @@ fn wait_reapable(pid: u32, identity: u64, level: log::Level) -> (Waited, Option<
 /// [`windows_terminate_held`](crate::identity::windows_terminate_held). Never blocks.
 #[cfg(windows)]
 pub(super) fn terminate_unreaped(h: windows::Win32::Foundation::HANDLE) -> Result<Sent, Error> {
-    terminate_unreaped_noting(h).map(|(sent, _under_way)| sent)
-}
-
-/// Windows: [`terminate_unreaped`] on tokio's process handle. Answers [`Sent::Gone`] once tokio has
-/// dropped the handle, else [`Sent::Delivered`] and whether the termination was already under way
-/// when the kill was refused (`Termination::Exited`).
-#[cfg(windows)]
-fn terminate_tokio(child: &::tokio::process::Child) -> Result<(Sent, bool), Error> {
-    // tokio drops its handle once it has reaped the child.
-    let Some(h) = child.raw_handle() else {
-        return Ok((Sent::Gone, false));
-    };
-    // SAFETY of the handle: tokio owns it live while `raw_handle` is `Some`.
-    terminate_unreaped_noting(windows::Win32::Foundation::HANDLE(h))
-}
-
-/// [`terminate_unreaped`], and whether the kill was refused because the exit was already under way:
-/// delivered, but not known to have ended the child.
-#[cfg(windows)]
-fn terminate_unreaped_noting(h: windows::Win32::Foundation::HANDLE) -> Result<(Sent, bool), Error> {
     use crate::identity::{windows_terminate_held, Termination};
     // `h` is a live process handle the caller owns.
     match windows_terminate_held(h) {
-        Termination::Terminated => Ok((Sent::Delivered, false)),
-        Termination::Exited => Ok((Sent::Delivered, true)),
+        Termination::Terminated | Termination::Exited => Ok(Sent::Delivered),
         Termination::Failed(e) => Err(Error::Io(crate::error::win32_io_error(e))),
     }
 }

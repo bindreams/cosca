@@ -333,7 +333,7 @@ pub(crate) mod fault {
         static STATE: RefCell<State> = RefCell::new(State::default());
     }
 
-    /// Run `on_wait` before every blocking wait for the child's exit on this thread and count them. Lets a test end a
+    /// Run `on_wait` before every blocking wait on this thread and count them. Lets a test end a
     /// never-exiting fixture a second way, so a no-op terminate fails on exit code, not by hanging.
     ///
     /// The guard resets the state on drop. Arming over a live guard is a test bug.
@@ -366,16 +366,26 @@ pub(crate) mod fault {
             STATE.with(|s| s.borrow_mut().on_wait = Some(hook));
         }
         if fail {
-            return Err(std::io::Error::other(FORCED_WAIT_FAILURE));
+            return Err(std::io::Error::other(ForcedWaitFailure));
         }
         Ok(())
     }
 
-    const FORCED_WAIT_FAILURE: &str = "forced wait failure (test seam)";
+    /// The error [`Observer::fail_next_wait`] makes a wait fail with.
+    #[derive(Debug)]
+    struct ForcedWaitFailure;
 
-    /// Whether `e` is the failure [`Observer::fail_next_wait`] made.
+    impl std::fmt::Display for ForcedWaitFailure {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("forced wait failure (test seam)")
+        }
+    }
+
+    impl std::error::Error for ForcedWaitFailure {}
+
+    /// Whether `e` is the failure [`Observer::fail_next_wait`] made, by its type.
     pub(crate) fn is_forced_wait_failure(e: &std::io::Error) -> bool {
-        e.to_string() == FORCED_WAIT_FAILURE
+        e.get_ref().is_some_and(|inner| inner.is::<ForcedWaitFailure>())
     }
 
     #[must_use]

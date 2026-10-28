@@ -497,15 +497,11 @@ pub(crate) fn raw_spawn_teardown(
     // Windows only, so the std path-s invariant does NOT carry: there is no zombie to reap
     // and `rc.wait()` is a bare `WaitForSingleObject(handle, INFINITE)`. If the kill failed,
     // nothing asked the child to exit and that wait would park forever - a logged, leaked
-    // child is strictly better. The kill never waits: `wait_warning` owns the one wait, so a
-    // termination already under way (`Termination::Exited`) is not waited for before it.
-    let kill_delivered = match rc.start_kill() {
-        Ok(under_way) => !under_way,
-        Err(e) => {
-            log::warn!("raw spawn teardown: kill of pid {pid} failed: {e}; not waiting");
-            return ChildFate::Running { id };
-        }
-    };
+    // child is strictly better. The kill never waits: `wait_warning` owns the one wait.
+    if let Err(e) = rc.start_kill() {
+        log::warn!("raw spawn teardown: kill of pid {pid} failed: {e}; not waiting");
+        return ChildFate::Running { id };
+    }
     // A fixture only that kill would end is released here.
     #[cfg(test)]
     crate::child::spawn::fault::run_between_kill_and_wait();
@@ -530,7 +526,8 @@ pub(crate) fn raw_spawn_teardown(
             debug_assert!(forced, "raw spawn teardown failed to reap child: {e}");
         }
     }
-    proc::fate_after_reap(kill_delivered, waited)
+    // The kill was delivered, or the child's exit was already under way: either way it is dead or dying.
+    proc::fate_after_reap(true, waited)
 }
 
 /// The `STARTUPINFOEXW` for a raw spawn, with what it points at.

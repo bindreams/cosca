@@ -79,6 +79,16 @@ fn without_terminate_right(owner: &KillOnDrop) -> RawChild {
     RawChild::new(handle_without_terminate_right(owner), owner.id())
 }
 
+/// A second handle to `owner`'s process, for a teardown to consume while `owner` stays the way to end
+/// it.
+fn duplicate_handle(owner: &KillOnDrop) -> std::os::windows::io::OwnedHandle {
+    use std::os::windows::io::BorrowedHandle;
+    // SAFETY: `owner` holds its process handle open for as long as it lives.
+    unsafe { BorrowedHandle::borrow_raw(owner.handle().0) }
+        .try_clone_to_owned()
+        .expect("duplicate the process handle")
+}
+
 /// End `handle` with exit code 0, which only a process no earlier `TerminateProcess` has claimed
 /// takes: a real kill (exit 1) has already marked the thread terminated, so a later
 /// `TerminateProcess` cannot change the exit code. That later call returns success or
@@ -201,25 +211,21 @@ fn raw_spawn_teardown_with_a_denied_terminate_waits_only_inside_wait_warning() {
 }
 
 /// A failed spawn's teardown whose kill was refused as a termination under way (the refusal is
-/// forced, so the process stays alive) and whose wait then fails cannot say the kill was delivered:
-/// the fate is `Unknown`.
+/// forced, so the process stays alive) and whose wait then fails says `Killed`: the child is dead or
+/// dying. `end_on_wait` ends the process, so a second wait would return at once and fail the count.
 ///
-/// Mutant: the teardown answers `Killed` for any failed wait, whether or not the kill was delivered.
+/// Mutant: the teardown answers `Unknown` for a failed wait after a refusal.
 #[skuld::test]
-fn raw_spawn_teardown_with_a_denied_terminate_and_a_failed_wait_is_unknown() {
+fn raw_spawn_teardown_with_an_exit_under_way_and_a_failed_wait_is_killed() {
     use crate::error::ChildFate;
-    use std::os::windows::io::BorrowedHandle;
 
     let owner = spawn_suspended();
-    // SAFETY: `owner` holds its process handle open for the whole test.
-    let proc = unsafe { BorrowedHandle::borrow_raw(owner.handle().0) }
-        .try_clone_to_owned()
-        .expect("duplicate the process handle");
+    let proc = duplicate_handle(&owner);
     crate::identity::windows_fault::refuse_next_terminate_as_exiting();
-    let observer = super::fault::observe_waits(|| {});
+    let observer = end_on_wait(&owner);
     observer.fail_next_wait();
     let fate = super::super::raw_spawn_teardown(proc, owner.id(), None, None);
-    assert_eq!(fate, ChildFate::Unknown);
+    assert_eq!(fate, ChildFate::Killed);
     assert_eq!(observer.waits(), 1, "the teardown made the wait that failed");
 }
 
@@ -248,18 +254,28 @@ fn raw_spawn_teardown_with_a_failed_terminate_is_running_and_does_not_wait() {
     assert_eq!(observer.waits(), 0, "a kill that failed must not be followed by a wait");
 }
 
-/// As above with the kill delivered: the process was ended, so the fate is `Killed`.
+/// As `..._with_an_exit_under_way_and_a_failed_wait_is_killed`, but the kill is delivered to a live
+/// process: the fate is `Killed`, and the kill is what ended it (exit code 1).
 ///
-/// Mutant: the teardown answers `Unknown` for any failed wait.
+/// Mutants: the teardown answers `Unknown` for any failed wait; the kill sends nothing, so
+/// `end_on_wait` ends the process with code 0; the teardown waits a second time.
 #[skuld::test]
 fn raw_spawn_teardown_with_a_delivered_terminate_and_a_failed_wait_is_killed() {
     use crate::error::ChildFate;
 
-    let (proc, pid) = suspended_handle();
-    let observer = super::fault::observe_waits(|| {});
+    let owner = spawn_suspended();
+    let proc = duplicate_handle(&owner);
+    let observer = end_on_wait(&owner);
     observer.fail_next_wait();
-    let fate = super::super::raw_spawn_teardown(proc, pid, None, None);
+    let fate = super::super::raw_spawn_teardown(proc, owner.id(), None, None);
     assert_eq!(fate, ChildFate::Killed);
+    assert_eq!(observer.waits(), 1, "the teardown made the wait that failed");
+    let status = owner.wait().expect("wait for the owner's child");
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "the teardown's kill must have ended it: {status:?}"
+    );
 }
 
 /// Mutants: `TerminateProcess` in `teardown_on_drop` a no-op reporting `Ok` or
