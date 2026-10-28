@@ -593,16 +593,15 @@ fn an_abandoned_child_reaped_before_the_look_gets_no_group_kill_by_number() {
 
 /// A child known by its `/proc` directory, killed and then reaped by another reaper before the wait:
 /// its number may name another child of this process by then, one that is running. The wait's warn
-/// does not name that process. (The wait by the number collects it: the residual the cgroup
-/// module's Ownership paragraph states.) Fixing #341 (no reap by pid) ends that residual, and with it
-/// this test's assertion that the wait collects the holder.
+/// does not name that process. The test pins only that: whether the wait itself reaches the holder
+/// (the residual the cgroup module's Ownership paragraph states) is not its business.
 ///
 /// Mutant: the warn watches through a pidfd opened on the number, unchecked against the directory.
 #[skuld::test]
 fn a_child_reaped_elsewhere_is_not_warned_about_through_its_number() {
     use std::os::fd::AsRawFd as _;
 
-    use crate::test_support::foreign_tracer::{await_blocked_or_finished, Holder};
+    use crate::test_support::foreign_tracer::await_blocked_or_finished;
 
     crate::log_capture::install();
     let gone = fork_running(|| loop {
@@ -633,7 +632,7 @@ fn a_child_reaped_elsewhere_is_not_warned_about_through_its_number() {
 
     let mark = crate::log_capture::mark();
     let (tid_tx, tid_rx) = std::sync::mpsc::channel();
-    let (seen, fate) = std::thread::scope(|s| {
+    std::thread::scope(|s| {
         let ended = s.spawn(|| {
             tid_tx
                 .send(rustix::thread::gettid().as_raw_nonzero().get())
@@ -641,13 +640,12 @@ fn a_child_reaped_elsewhere_is_not_warned_about_through_its_number() {
             let _reaped_elsewhere = fault::set_before_exit_wait(move || super::super::test_support::reap(gone));
             end_child(&received, &mut WarnAfter(Some(std::time::Duration::ZERO)))
         });
-        let seen = await_blocked_or_finished(tid_rx.recv().expect("the tid"));
+        // Blocked, or finished: either way the warn, if any, is out. Then the holder may end.
+        await_blocked_or_finished(tid_rx.recv().expect("the tid"));
         drop(to_holder);
-        (seen, ended.join().expect("end_child"))
+        ended.join().expect("end_child");
     });
 
-    assert_eq!(seen, Holder::Blocked, "the wait by the number waits for the holder");
-    assert_eq!(fate, ChildFate::Killed);
     let warns = crate::log_capture::records_since(mark, "still waiting");
     assert_eq!(warns, Vec::<String>::new(), "no warn names the number's holder");
 }

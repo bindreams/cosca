@@ -13,26 +13,29 @@ use std::os::fd::{AsRawFd as _, OwnedFd};
 use std::os::unix::process::ExitStatusExt as _;
 
 use super::super::{fault, HANDLE_PIDFD, HANDLE_PROC_DIR, TAG_INTENT};
-use super::{Abandoned, CgroupLeaf, WarnAfter};
+use super::{Abandoned, CgroupLeaf, TeardownWarn, Waiting, WarnAfter};
 use crate::child::spawn::fault as spawn_fault;
 use crate::test_groups::{tracer_group, Group};
 use crate::test_support::foreign_tracer::{self, assert_warns_once_after_seizing, Names};
+use crate::wait::teardown_warn::Due;
 
 /// Abandons a leaf that warns past 1 s, after `intent` told it of a tracee a foreign tracer holds
 /// once killed, and asserts the one warn, naming `names`.
 ///
 /// `intent(pid, pidfd)` sends the intent; `handshake(pidfd)` is the pidfd the handshake left.
+/// `warn` makes the warn the abandonment gets, on the thread that abandons; it is answered back.
 /// Asserts that the abandonment reaped the tracee, and that its kill ended it.
-fn assert_abandonment_warns_once(
+fn assert_abandonment_warns_once<W: TeardownWarn + Send>(
     names: Names,
     intent: fn(&CgroupLeaf, u32, &OwnedFd),
     handshake: fn(OwnedFd) -> Option<OwnedFd>,
-) {
+    warn: fn() -> W,
+) -> W {
     let mut child = foreign_tracer::blocker();
     let pid = child.id();
     let pidfd = crate::containment::cgroup::test_support::pidfd_of(pid);
     let stdin = child.stdin.take().expect("piped stdin");
-    let (abandoned, signals) = assert_warns_once_after_seizing(names, pid, move || {
+    let (abandoned, signals, warn) = assert_warns_once_after_seizing(names, pid, move || {
         // Whichever wait the abandonment reaches (`end_child`'s, or the pidfd teardown's) releases it.
         let held = std::rc::Rc::new(std::cell::Cell::new(Some(stdin)));
         let release = || {
@@ -47,13 +50,13 @@ fn assert_abandonment_warns_once(
         std::fs::create_dir(&leaf_path).expect("create the leaf");
         let mut leaf = CgroupLeaf::for_test_at(leaf_path);
         intent(&leaf, pid, &pidfd);
-        let mut warn = WarnAfter(crate::tokio::slow_teardown_after());
+        let mut warn = warn();
         let abandoned = leaf.abandon_before_verdict(false, handshake(pidfd), &mut warn);
         let reaped = fault::take_reaped_orphans().into_iter().map(|(_, signal)| signal);
         let signals: Vec<_> = reaped
             .chain(reaps.recorded().into_iter().map(|(_, status)| status.signal()))
             .collect();
-        (abandoned, signals)
+        (abandoned, signals, warn)
     });
     assert_eq!(abandoned, Abandoned::Ended);
     assert!(!signals.is_empty(), "the abandonment must have reaped the tracee");
@@ -62,6 +65,12 @@ fn assert_abandonment_warns_once(
         "the tracee must die of the abandonment's kill, not exit once its stdin was released: {signals:?}"
     );
     drop(child);
+    warn
+}
+
+/// The warn a failed async spawn's abandonment gets: past the threshold the test thread has set.
+fn slow() -> WarnAfter {
+    WarnAfter(crate::tokio::slow_teardown_after())
 }
 
 /// A child named by its pidfd, killed and waited for by `end_child`.
@@ -80,6 +89,7 @@ fn an_abandoned_child_named_by_its_pidfd_is_waited_for_with_a_warn(#[fixture(tra
             }
         },
         |_| None,
+        slow,
     );
 }
 
@@ -101,6 +111,7 @@ fn an_abandoned_child_named_by_its_proc_directory_is_waited_for_with_a_warn(#[fi
             }
         },
         |_| None,
+        slow,
     );
 }
 
@@ -110,5 +121,49 @@ fn an_abandoned_child_named_by_its_proc_directory_is_waited_for_with_a_warn(#[fi
 /// Mutant: the abandonment tears it down with no warn.
 #[skuld::test]
 fn an_abandoned_child_the_handshake_holds_is_waited_for_with_a_warn(#[fixture(tracer_group)] _group: &Group) {
-    assert_abandonment_warns_once(Names::Unknown, |_, _, _| {}, Some);
+    assert_abandonment_warns_once(Names::Unknown, |_, _, _| {}, Some, slow);
+}
+
+/// The warn of an abandonment that keeps count. Its `Due` has passed already.
+struct Recording {
+    due: Due,
+    warned: u32,
+}
+
+impl TeardownWarn for Recording {
+    fn due(&self) -> Option<Due> {
+        (self.warned == 0).then_some(self.due)
+    }
+
+    fn warn(&mut self, waiting: Waiting<'_>) {
+        self.warned += 1;
+        let Waiting::Child(pid) = waiting else {
+            panic!("an abandonment's wait for a child names a child");
+        };
+        crate::child::spawn::warn_still_waiting(pid, self.due.after);
+    }
+}
+
+/// The pidfd-only teardown warns through the caller's warn, which learns that its warn went out.
+///
+/// Mutant: the teardown warns on its own, from the threshold's length alone, so the object's count
+/// stays 0.
+#[skuld::test]
+fn the_pidfd_teardown_of_an_abandonment_warns_through_the_callers_warn(#[fixture(tracer_group)] _group: &Group) {
+    let warn = assert_abandonment_warns_once(
+        Names::Unknown,
+        |_, _, _| {},
+        Some,
+        || {
+            let passed = std::time::Instant::now() - std::time::Duration::from_secs(10);
+            Recording {
+                due: Due {
+                    until: passed,
+                    after: std::time::Duration::ZERO,
+                },
+                warned: 0,
+            }
+        },
+    );
+    assert_eq!(warn.warned, 1, "the warn object is told of its one warn");
 }

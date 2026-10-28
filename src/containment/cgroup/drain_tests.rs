@@ -69,3 +69,54 @@ fn an_overflowed_queue_is_a_change() {
     assert!(watch.consume().expect("consume"), "the queue overflowed");
     assert!(!watch.saw_removal());
 }
+
+/// `drained_by` with a deadline that has passed: it looks once and answers.
+fn drained_by_now(watch: &mut DrainWatch) -> bool {
+    watch.drained_by(std::time::Instant::now())
+}
+
+/// A leaf that has drained is drained by any deadline.
+///
+/// Mutant: `drained_by` answers `false` for a leaf that read unpopulated.
+#[skuld::test]
+fn a_drained_leaf_is_drained_by_the_deadline() {
+    let fake = FakeLeaf::new("cosca-watched", false);
+    let mut watch = armed(&fake);
+    assert!(drained_by_now(&mut watch));
+}
+
+/// A leaf still populated at the deadline is not drained by it, so the warn runs.
+///
+/// Mutant: `drained_by` answers `true` for a leaf its last look found populated.
+#[skuld::test]
+fn a_leaf_still_populated_at_the_deadline_is_not_drained_by_it() {
+    let fake = FakeLeaf::new("cosca-watched", true);
+    let mut watch = armed(&fake);
+    assert!(!drained_by_now(&mut watch));
+}
+
+/// A leaf removed during the last round, which read it populated, is drained: the read after the
+/// round finds the removal the round took in.
+///
+/// Mutant: the answer after a round that found nothing is `false` without that read.
+#[skuld::test]
+fn a_leaf_removed_during_the_last_round_is_drained() {
+    let fake = FakeLeaf::new("cosca-watched", true);
+    let mut watch = armed(&fake);
+    FakeLeaf::remove(&fake.leaf);
+    assert!(drained_by_now(&mut watch));
+    assert!(watch.saw_removal());
+}
+
+/// A leaf whose state cannot be read answers `true`, leaving the failure to the wait that follows,
+/// which returns it.
+///
+/// Mutant: `drained_by` answers `false` for a failed look (a spurious warn).
+#[skuld::test]
+fn a_leaf_whose_state_cannot_be_read_is_left_to_the_wait() {
+    let fake = FakeLeaf::new("cosca-watched", true);
+    let mut watch = armed(&fake);
+    std::fs::write(&fake.events, "frozen 0\n").expect("write a cgroup.events with no populated field");
+    assert!(drained_by_now(&mut watch));
+    assert!(watch.wait().is_err(), "the wait finds the failure the look left it");
+}

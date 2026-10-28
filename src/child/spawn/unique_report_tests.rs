@@ -760,3 +760,13 @@ fn a_wait_warns_once_that_the_report_is_late() {
     );
     end(child, stdin);
 }
+
+/// A wait in a test warns only under a guard (a verdict must not depend on elapsed time), and the
+/// threshold production warns at is 1 s.
+///
+/// Mutants: a wait with no guard gets a threshold; production's is not 1 s.
+#[skuld::test]
+fn production_warns_after_one_second_and_a_test_only_with_a_guard() {
+    assert_eq!(super::SAY_WAITING_AFTER, std::time::Duration::from_secs(1));
+    assert_eq!(seams::say_waiting_after(), None);
+}

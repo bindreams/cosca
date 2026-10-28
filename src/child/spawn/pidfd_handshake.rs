@@ -875,7 +875,6 @@ fn conclude<T: Spawned>(
     front: LeftFront,
     warn_after: Option<std::time::Duration>,
 ) -> Result<Held<T>, SpawnFailure> {
-    // Every teardown of a child through its pidfd here is this one, so each warns alike.
     let teardown = |pidfd: OwnedFd| super::teardown_through_pidfd(None, pidfd, None, warn_after);
     let opened_teardown = |pidfd: OwnedFd, error: Error| {
         use crate::wait::exit_only::{peek, Peek, Target};
@@ -897,7 +896,8 @@ fn conclude<T: Spawned>(
             }
             LeftFront::Here(front) if !collected => {
                 // No subtree, so the front is never waited for and no threshold applies.
-                let (fate, child_fate) = super::leave_front_through_pidfd(None, pidfd, front, None, None, None);
+                let (fate, child_fate) =
+                    super::leave_front_through_pidfd(None, pidfd, front, None, super::NO_WAIT_WARN, None);
                 (fate.note(error, Some(front), None), child_fate)
             }
             // The group first: it holds the root too.
@@ -1042,7 +1042,16 @@ pub(crate) fn await_unexecuted_exit(
                 crate::wait::teardown_warn::exit_visible_by(crate::wait::teardown_warn::ExitWatch::PidFd(*pidfd), until)
             },
             |after| super::warn_still_waiting(pid, after),
-            |pidfd| wait_visible_exit(&Target::PidFd(pidfd)).map(drop),
+            |pidfd| {
+                let seen = wait_visible_exit(&Target::PidFd(pidfd))?;
+                // tokio reaps it afterwards, so this is where a test sees how it ended.
+                #[cfg(test)]
+                if let crate::wait::exit_only::Peek::Exit(crate::wait::exit_only::Reaped::Status(status)) = seen {
+                    super::fault::record_teardown_reap(pid.unwrap_or(0), status);
+                }
+                let _ = seen;
+                Ok(())
+            },
         ),
     };
     if let Err(e) = waited {

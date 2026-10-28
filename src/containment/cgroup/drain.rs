@@ -162,7 +162,7 @@ impl DrainWatch {
     pub(crate) fn drained_by(&mut self, until: std::time::Instant) -> bool {
         use rustix::event::{poll, PollFd, PollFlags, Timespec};
 
-        let drained = crate::wait::rearm_until(Some(Some(until)), |remaining| {
+        let looked = crate::wait::rearm_until(Some(Some(until)), |remaining| {
             if !self.populated()? {
                 return Ok(Some(()));
             }
@@ -178,21 +178,16 @@ impl DrainWatch {
                 Err(e) => return Err(Error::Io(e.into())),
             }
             Ok(None)
+        })
+        // A round that found nothing may have taken in the leaf's removal: read again.
+        .and_then(|drained| match drained {
+            Some(()) => Ok(true),
+            None => self.populated().map(|populated| !populated),
         });
-        match drained {
-            Ok(Some(())) => true,
-            Ok(None) => match self.populated() {
-                Ok(populated) => !populated,
-                Err(e) => {
-                    log::debug!("a look at a killed leaf's drain failed ({e}); the wait that follows decides");
-                    true
-                }
-            },
-            Err(e) => {
-                log::debug!("a look at a killed leaf's drain failed ({e}); the wait that follows decides");
-                true
-            }
-        }
+        looked.unwrap_or_else(|e| {
+            log::debug!("a look at a killed leaf's drain failed ({e}); the wait that follows decides");
+            true
+        })
     }
 }
 

@@ -13,6 +13,10 @@ pub(crate) struct Due {
 
 impl Due {
     /// Due `after` from now, if there is a threshold.
+    #[cfg_attr(
+        not(any(test, feature = "tokio")),
+        allow(dead_code, reason = "only an async spawn's teardown has a threshold to start from")
+    )]
     pub(crate) fn in_(after: Option<Duration>) -> Option<Due> {
         after.map(|after| Due {
             until: crate::wait::now() + after,
@@ -21,8 +25,7 @@ impl Due {
     }
 }
 
-/// Runs `wait` on `state`: a teardown's blocking wait for something it killed. Every such wait,
-/// whatever it waits for, is this one.
+/// Runs `wait` on `state`: a teardown's blocking wait for something it killed.
 ///
 /// With `due`, `ended_by(state, due.until)` first watches for what `wait` waits for, blocking no
 /// later than `due.until`, and `warn(due.after)` runs once if it answers `false`. `ended_by` answers
@@ -98,3 +101,7 @@ pub(crate) fn proc_dir_unreaped(dir: std::os::fd::BorrowedFd<'_>) -> bool {
     }
     stat >= 0
 }
+
+#[cfg(test)]
+#[path = "teardown_warn_tests.rs"]
+mod teardown_warn_tests;

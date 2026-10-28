@@ -15,10 +15,8 @@ use crate::containment::Prepared;
 
 const DRAIN_WARN: &str = "still waiting for it to drain";
 
-/// Abandons, through [`Prepared::abandon_before_verdict`] with a zero threshold, a leaf its child
-/// entered and whose member `FakeLeaf` keeps populated; `front` says the child is an elevation
-/// front. Answers how many drain warns were out when the member was let go, and the levels of all
-/// of them.
+/// Abandons a leaf its child entered, whose member `FakeLeaf` keeps populated. Answers the drain
+/// warns out at the member's release, and the levels of all of them.
 #[allow(
     clippy::zombie_processes,
     reason = "the abandonment reaps the child through its pidfd; waiting by its number here could reach a reused pid"

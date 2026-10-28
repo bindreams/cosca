@@ -12,6 +12,7 @@
 use std::io::BufRead as _;
 
 use crate::child::spawn::fault::{self, SpawnPoint};
+use crate::containment::cgroup::fault as leaf_fault;
 use crate::test_groups::{cgroup, tracer_group, Group};
 use crate::test_support::foreign_tracer::{
     self, assert_reaped_by_sigkill, assert_warns_once_before_blocking, Names, Tracer, LET_EXIT, REAP,
@@ -26,9 +27,7 @@ enum Seize {
     AfterTokioFailsAfterFork,
 }
 
-/// Spawns a tracee whose spawn fails as `seize` says, with a foreign tracer seizing it there, and
-/// asserts as [`assert_warns_once_before_blocking`] does of its teardown, and that the teardown's
-/// kill ended the tracee.
+/// As [`assert_warns_once_before_blocking`], with the tracee spawned as `seize` says.
 ///
 /// Mutant (for each test below, besides its own): the teardown's root kill sends nothing.
 fn assert_teardown_warns_once_before_blocking(seize: Seize) {
@@ -46,20 +45,46 @@ fn assert_front_or_child_teardown_warns_once_before_blocking(seize: Seize, front
     let (spawned, reaps) = assert_warns_once_before_blocking(
         names,
         move || {
-            let blocker = fault::release_between_kill_and_wait(stdin_writer);
+            // A front is ended by its leaf's kill, not by a send to it: the release comes after the
+            // `cgroup.kill` write, and before the wait for the front's exit.
+            let held = std::rc::Rc::new(std::cell::Cell::new(Some(stdin_writer)));
+            let release = || {
+                let held = std::rc::Rc::clone(&held);
+                move || drop(held.take())
+            };
+            let (_after_leaf_kill, _before_exit_wait, _between_kill_and_wait);
+            let blocker = if front {
+                _after_leaf_kill = Some(leaf_fault::set_after_kill_write(release()));
+                _before_exit_wait = Some(leaf_fault::set_before_exit_wait(release()));
+                _between_kill_and_wait = Some(fault::set_between_kill_and_wait(release()));
+                None
+            } else {
+                _after_leaf_kill = None;
+                _before_exit_wait = None;
+                _between_kill_and_wait = None;
+                Some(fault::release_between_kill_and_wait(held.take()))
+            };
             let rt = ::tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("runtime");
             let _rt = rt.enter();
-            let seizing = move |pid: u32| {
-                let allowed = std::io::BufReader::new(out_reader)
-                    .lines()
-                    .map(|line| line.expect("read the tracee's stdout"))
-                    .any(|line| line.ends_with("@@allowed@@"));
-                assert!(allowed, "the tracee ended without reporting \"allowed\"");
-                idle.seize(pid);
-                tracer_tx.send((pid, idle)).expect("hand the tracer over");
+            // Kept open until the teardown is done: the tracee's later writes must not stop it on a
+            // `SIGPIPE` that only the tracer, which is released after the teardown blocks, could lift.
+            let out_open = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let seizing = {
+                let out_open = std::rc::Rc::clone(&out_open);
+                move |pid: u32| {
+                    let mut out = std::io::BufReader::new(out_reader);
+                    let allowed = (&mut out)
+                        .lines()
+                        .map(|line| line.expect("read the tracee's stdout"))
+                        .any(|line| line.ends_with("@@allowed@@"));
+                    *out_open.borrow_mut() = Some(out);
+                    assert!(allowed, "the tracee ended without reporting \"allowed\"");
+                    idle.seize(pid);
+                    tracer_tx.send((pid, idle)).expect("hand the tracer over");
+                }
             };
             let (_at, _after_fork);
             match seize {
@@ -86,7 +111,7 @@ fn assert_front_or_child_teardown_warns_once_before_blocking(seize: Seize, front
             let spawned = cmd.spawn().map(drop);
             fault::set_force_attach_failure(false);
             fault::set_force_identity_unknown(false);
-            (spawned, blocker.recorded())
+            (spawned, blocker.map(|blocker| blocker.recorded()).unwrap_or_default())
         },
         || tracer_rx.recv().expect("the tracer seized the child"),
     );
@@ -185,8 +210,6 @@ fn a_leaf_drained_past_1s_after_a_failed_attach_warns_once(
 ) {
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
-
-    use crate::containment::cgroup::fault as leaf_fault;
 
     crate::log_capture::install();
     let mark = crate::log_capture::mark();

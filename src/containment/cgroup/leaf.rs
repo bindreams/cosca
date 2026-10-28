@@ -1125,8 +1125,7 @@ impl CgroupLeaf {
         if received.pid.is_none() {
             if let Some(pidfd) = received.pidfd.take() {
                 self.remove_holding_nothing();
-                // A failed spawn's teardown: its wait warns once `warn`'s threshold passes.
-                crate::child::spawn::teardown_through_pidfd(None, pidfd, None, warn.due().map(|due| due.after));
+                crate::child::spawn::teardown_through_pidfd(None, pidfd, None, slow_drain::Through(warn));
                 return Abandoned::Ended;
             }
         }
@@ -1304,8 +1303,6 @@ impl CgroupLeaf {
 ///
 /// A child its handle may not signal (`EPERM`) is handed to a background reaper, so it is reaped
 /// once it exits, however that comes.
-///
-/// The wait for the killed child is `warn`'s: it warns once it is due, and goes on.
 #[cfg(target_os = "linux")]
 fn end_child(received: &Received, warn: &mut dyn TeardownWarn) -> ChildFate {
     #[cfg(feature = "tokio")]
@@ -1497,10 +1494,9 @@ fn wait_id(received: &Received, pid: rustix::process::Pid) -> rustix::process::W
     }
 }
 
-/// Blocks until the child `received` names, `pid`, has exited, and reaps it through what names it
-/// to its reaper ([`wait_id`]): an abandonment's wait for a child it killed, through
-/// [`wait_warning`](crate::wait::teardown_warn::wait_warning) with `warn`, which names it `named`. The
-/// child sent a handle on itself.
+/// Blocks until the killed child `pid` exits and reaps it ([`wait_id`]), warning once through
+/// [`wait_warning`](crate::wait::teardown_warn::wait_warning) with `warn`, which names the child
+/// `named`. Requires `received` to hold a handle on the child.
 #[cfg(target_os = "linux")]
 fn wait_for_exit_warning(
     received: &Received,

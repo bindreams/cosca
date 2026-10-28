@@ -51,10 +51,8 @@ past 1 s, as the drop's does, each naming what it waits for:
 
 Each runs through [`wait_warning`](../src/wait/teardown_warn.rs), as the armed drop's reap and
 drain do: it takes the wait as an argument and warns before it if what it waits for has not ended
-within the threshold. On Windows
-the teardown's waits do not warn yet: `ProcSource::reap_now`'s wait on the process handle
-(`WaitForSingleObject` with `INFINITE`, in [`proc_source.rs`](../src/tokio/child/proc_source.rs))
-and the raw backend's `raw_spawn_teardown` ([`windows_raw.rs`](../src/child/spawn/windows_raw.rs)).
+within the threshold. Windows's teardown waits (`ProcSource::reap_now` and the raw backend's
+`raw_spawn_teardown`) come with the next PR of this stack, #780.
 
 Spawning is the other exception: it blocks until `exec`, as tokio's own `Command::spawn` does.
 That includes cosca's placement report
