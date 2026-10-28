@@ -988,9 +988,21 @@ impl ProcSource {
     ///
     /// - **Linux:** [`crate::wait::pidfd_exit_visible_by`].
     /// - **macOS:** the verified-id kqueue wait, with `until` as its deadline.
-    #[cfg(unix)]
+    /// - **Windows:** [`handle_signaled_by`](crate::wait::teardown_warn::handle_signaled_by) on the
+    ///   process handle.
     pub(crate) fn exit_visible_by(&self, pid: u32, until: std::time::Instant) -> bool {
         crate::bounded::assert_may_block("exit_visible_by");
+        #[cfg(windows)]
+        {
+            let _ = pid;
+            let ProcSource::Tokio { child, .. } = self else {
+                return true;
+            };
+            // `None` once tokio has collected the child: the wait answers at once.
+            child.raw_handle().is_none_or(|handle| {
+                crate::wait::teardown_warn::handle_signaled_by(windows::Win32::Foundation::HANDLE(handle), until)
+            })
+        }
         #[cfg(target_os = "linux")]
         {
             use std::os::fd::AsFd as _;
@@ -1290,7 +1302,7 @@ impl ProcSource {
         #[cfg(unix)]
         let (waited, cause) = self.wait_warning(pid, |proc| proc.wait_and_reap_caused(pid, log::Level::Debug));
         #[cfg(not(unix))]
-        let waited = self.wait_and_reap(pid);
+        let waited = self.wait_warning(pid, |proc| proc.wait_and_reap(pid));
         let fate = match waited {
             Waited::Exited => self.collect_exit(id),
             Waited::Unverified => match killed {
@@ -1447,7 +1459,6 @@ impl ProcSource {
     /// which warns once, naming it, if its exit is not visible within
     /// [`slow_teardown_after`](super::slow_teardown_after)
     /// ([`wait_warning`](crate::wait::teardown_warn::wait_warning)).
-    #[cfg(unix)]
     pub(crate) fn wait_warning<R>(&mut self, pid: u32, wait: impl FnOnce(&mut Self) -> R) -> R {
         crate::wait::teardown_warn::wait_warning(
             self,
@@ -1831,31 +1842,54 @@ pub(super) fn terminate_unreaped(h: windows::Win32::Foundation::HANDLE) -> Resul
 /// Windows: waits on tokio's process handle, which pins the child.
 #[cfg(windows)]
 fn wait_on_handle(child: &::tokio::process::Child, pid: u32) -> Waited {
-    use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
-    use windows::Win32::System::Threading::{WaitForSingleObject, INFINITE};
-    let _ = pid;
     let h = child.raw_handle().expect("tokio owns the handle while id() is Some");
-    // SAFETY: tokio owns and (on its field-drop) closes the handle; we only wait on it.
-    // INFINITE is bounded by the kill the caller already issued.
-    let waited = unsafe { WaitForSingleObject(HANDLE(h), INFINITE) };
+    // Tests: a wait on a handle that cannot be waited on, made to fail without being made.
+    #[cfg(test)]
+    let forced = super::fault::take_fail_handle_wait();
+    #[cfg(not(test))]
+    let forced = false;
+    let waited = if forced {
+        wait_failed(pid, windows::Win32::Foundation::WAIT_FAILED)
+    } else {
+        // SAFETY: tokio owns and (on its field-drop) closes the handle; we only wait on it.
+        wait_for_exit(windows::Win32::Foundation::HANDLE(h), pid)
+    };
     debug_assert!(
-        waited == WAIT_OBJECT_0,
-        "wait_and_reap did not observe the child's exit: {waited:?}"
+        forced || matches!(waited, Waited::Exited),
+        "wait_and_reap did not observe the child's exit"
     );
+    waited
+}
+
+/// Windows: blocks until the process `h` names has exited. `Unverified` when the wait fails, as one
+/// on a handle without `SYNCHRONIZE` does. INFINITE is bounded by the kill the caller already issued.
+///
+/// `h` is a live process handle the caller keeps open.
+#[cfg(windows)]
+pub(super) fn wait_for_exit(h: windows::Win32::Foundation::HANDLE, pid: u32) -> Waited {
+    use windows::Win32::Foundation::WAIT_OBJECT_0;
+    use windows::Win32::System::Threading::{WaitForSingleObject, INFINITE};
+    // SAFETY: the caller's live process handle.
+    let waited = unsafe { WaitForSingleObject(h, INFINITE) };
     if waited != WAIT_OBJECT_0 {
-        log::warn!("wait_and_reap: the wait on child {pid}'s handle failed: {waited:?}");
-        return Waited::Unverified;
+        return wait_failed(pid, waited);
     }
     #[cfg(test)]
     {
         use std::os::windows::process::ExitStatusExt as _;
         let mut code = 0u32;
-        // SAFETY: `h` is tokio's live process handle and `code` a valid out-parameter.
-        unsafe { windows::Win32::System::Threading::GetExitCodeProcess(HANDLE(h), &mut code) }
+        // SAFETY: `h` is a live process handle and `code` a valid out-parameter.
+        unsafe { windows::Win32::System::Threading::GetExitCodeProcess(h, &mut code) }
             .expect("GetExitCodeProcess on an exited child");
         crate::child::spawn::fault::record_teardown_reap(pid, std::process::ExitStatus::from_raw(code));
     }
     Waited::Exited
+}
+
+#[cfg(windows)]
+fn wait_failed(pid: u32, waited: windows::Win32::Foundation::WAIT_EVENT) -> Waited {
+    log::warn!("wait_and_reap: the wait on child {pid}'s handle failed: {waited:?}");
+    Waited::Unverified
 }
 
 #[cfg(unix)]

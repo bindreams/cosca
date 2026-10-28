@@ -102,6 +102,34 @@ pub(crate) fn proc_dir_unreaped(dir: std::os::fd::BorrowedFd<'_>) -> bool {
     stat >= 0
 }
 
+/// For [`wait_warning`]: whether the process `handle` names has exited (the handle is signalled) by
+/// `until`. Any answer but a timeout, an error included, is `true`, for the wait to find.
+#[cfg(windows)]
+pub(crate) fn handle_signaled_by(handle: windows::Win32::Foundation::HANDLE, until: Instant) -> bool {
+    use windows::Win32::Foundation::{WAIT_FAILED, WAIT_TIMEOUT};
+    use windows::Win32::System::Threading::WaitForSingleObject;
+
+    let mut failed = None;
+    // SAFETY: the caller's live process handle, kept open across the call.
+    let waited = crate::wait::wait_until(Some(Some(until)), |ms| {
+        let waited = unsafe { WaitForSingleObject(handle, ms) };
+        if waited == WAIT_FAILED {
+            failed = Some(std::io::Error::last_os_error());
+        }
+        waited
+    });
+    #[cfg(test)]
+    let waited = if crate::child::spawn::fault::take_late_exit() {
+        WAIT_TIMEOUT
+    } else {
+        waited
+    };
+    if let Some(e) = failed {
+        log::debug!("a look at a killed child's exit failed ({e}); the wait that follows decides");
+    }
+    waited != WAIT_TIMEOUT
+}
+
 #[cfg(test)]
 #[path = "teardown_warn_tests.rs"]
 mod teardown_warn_tests;

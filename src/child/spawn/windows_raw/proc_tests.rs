@@ -37,6 +37,12 @@ fn spawn_suspended() -> KillOnDrop {
 }
 
 fn suspended_raw() -> RawChild {
+    let (proc, pid) = suspended_handle();
+    RawChild::new(proc, pid)
+}
+
+/// The owned handle and pid of a `CREATE_SUSPENDED` process, with every right.
+fn suspended_handle() -> (std::os::windows::io::OwnedHandle, u32) {
     let mut cmdline: Vec<u16> = "cmd /C exit 0\0".encode_utf16().collect();
     let mut si = STARTUPINFOEXW::default();
     let (proc, pid) = create_process(
@@ -48,13 +54,13 @@ fn suspended_raw() -> RawChild {
         EXTENDED_STARTUPINFO_PRESENT.0 | CREATE_SUSPENDED.0,
     )
     .expect("spawn suspended");
-    RawChild::new(proc, pid)
+    (proc, pid)
 }
 
-/// A `RawChild` over a second handle to `owner`'s process that lacks `PROCESS_TERMINATE`, so its
-/// `TerminateProcess` is denied. `owner` stays the only handle that can end it.
-fn without_terminate_right(owner: &KillOnDrop) -> RawChild {
-    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+/// A handle to `owner`'s process that lacks `PROCESS_TERMINATE`, so its `TerminateProcess` is
+/// denied. `owner` stays the only handle that can end it.
+fn handle_without_terminate_right(owner: &KillOnDrop) -> std::os::windows::io::OwnedHandle {
+    use std::os::windows::io::FromRawHandle;
     // SAFETY: plain OpenProcess on the live pid `owner` pins.
     let h = unsafe {
         OpenProcess(
@@ -65,7 +71,22 @@ fn without_terminate_right(owner: &KillOnDrop) -> RawChild {
     }
     .expect("open without PROCESS_TERMINATE");
     // SAFETY: `h` is a fresh owned handle from OpenProcess.
-    RawChild::new(unsafe { OwnedHandle::from_raw_handle(h.0) }, owner.id())
+    unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(h.0) }
+}
+
+/// A `RawChild` over [`handle_without_terminate_right`].
+fn without_terminate_right(owner: &KillOnDrop) -> RawChild {
+    RawChild::new(handle_without_terminate_right(owner), owner.id())
+}
+
+/// A second handle to `owner`'s process, for a teardown to consume while `owner` stays the way to end
+/// it.
+fn duplicate_handle(owner: &KillOnDrop) -> std::os::windows::io::OwnedHandle {
+    use std::os::windows::io::BorrowedHandle;
+    // SAFETY: `owner` holds its process handle open for as long as it lives.
+    unsafe { BorrowedHandle::borrow_raw(owner.handle().0) }
+        .try_clone_to_owned()
+        .expect("duplicate the process handle")
 }
 
 /// End `handle` with exit code 0, which only a process no earlier `TerminateProcess` has claimed
@@ -152,6 +173,164 @@ fn kill_of_a_killable_child_returns_and_reaps() {
 /// The identity the spawn would have read for `child`.
 fn identity_of(child: &RawChild) -> crate::identity::ProcessId {
     crate::identity::ProcessId::of(child.id()).found().expect("identity")
+}
+
+/// A failed spawn's teardown whose `TerminateProcess` is refused because the process has exited (the
+/// handle lacks `PROCESS_TERMINATE`, so only its signalled state shows it) leaves the only wait to
+/// `wait_warning`: the kill itself does not block, so the wait is warned about once, naming the pid.
+///
+/// Mutants: the teardown's `kill` reaps on the denial, a blocking wait before `wait_warning`; the
+/// teardown waits directly once more before `wait_warning`; the warn drops the pid.
+#[cfg(feature = "tokio")]
+#[skuld::test]
+fn raw_spawn_teardown_with_a_denied_terminate_waits_only_inside_wait_warning() {
+    use crate::error::ChildFate;
+
+    let owner = spawn_suspended();
+    let id = identity_of(&owner);
+    let denied = handle_without_terminate_right(&owner);
+    // Ends the process, so the wait after the denied kill returns at once.
+    end_with_code_zero(owner.handle());
+    owner.wait().expect("wait for the owner's child");
+
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let observer = super::fault::observe_waits(|| {});
+    let _late = crate::child::spawn::fault::set_late_exit();
+    let fate = super::super::raw_spawn_teardown(denied, owner.id(), Some(id), Some(Duration::from_secs(1)));
+
+    assert_eq!(
+        observer.waits(),
+        1,
+        "the kill must not wait: the one wait is the warned one"
+    );
+    let warns = crate::log_capture::records_since_on_current_thread(mark, "still waiting");
+    assert_eq!(warns.len(), 1, "one warn, and the wait goes on: {warns:?}");
+    assert!(
+        warns[0].1.contains(&format!("child {} ", owner.id())),
+        "the warn names the child: {warns:?}"
+    );
+    assert_eq!(fate, ChildFate::Reaped);
+}
+
+/// A failed spawn's teardown with warnings on, whose child has already exited by the time it looks,
+/// does not warn. The handle lacks `PROCESS_TERMINATE`, so only its signalled state shows the exit.
+///
+/// Mutant: the look at the child's exit finds it late whatever its handle says.
+#[skuld::test]
+fn raw_spawn_teardown_of_an_exited_child_with_warnings_on_does_not_warn() {
+    use crate::error::ChildFate;
+
+    let owner = spawn_suspended();
+    let id = identity_of(&owner);
+    let denied = handle_without_terminate_right(&owner);
+    end_with_code_zero(owner.handle());
+    owner.wait().expect("wait for the owner's child");
+
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let fate = super::super::raw_spawn_teardown(denied, owner.id(), Some(id), Some(Duration::from_secs(1)));
+
+    assert_eq!(fate, ChildFate::Reaped);
+    let warns = crate::log_capture::records_since_on_current_thread(mark, "still waiting");
+    assert!(warns.is_empty(), "{warns:?}");
+}
+
+/// A failed spawn's teardown with warnings on whose child is still running when it looks (the kill is
+/// forced to be refused as an exit under way, so nothing ends it until the wait begins) warns once,
+/// naming the pid, and goes on to the wait. The child is really unsignalled: nothing overrides the
+/// look.
+///
+/// Mutants: the look finds the child exited whatever its handle says; the warn drops the pid.
+#[skuld::test]
+fn raw_spawn_teardown_of_a_running_child_with_warnings_on_warns_once_naming_it() {
+    use crate::error::ChildFate;
+
+    let owner = spawn_suspended();
+    let proc = duplicate_handle(&owner);
+    crate::identity::windows_fault::refuse_next_terminate_as_exiting();
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    // Ends the process once the wait begins, which is after the look.
+    let observer = end_on_wait(&owner);
+    let fate = super::super::raw_spawn_teardown(proc, owner.id(), None, Some(Duration::ZERO));
+
+    assert_eq!(fate, ChildFate::Reaped, "the wait goes on past the warn");
+    assert_eq!(observer.waits(), 1);
+    let warns = crate::log_capture::records_since_on_current_thread(mark, "still waiting");
+    assert_eq!(warns.len(), 1, "one warn: {warns:?}");
+    assert!(
+        warns[0].1.contains(&format!("child {} ", owner.id())),
+        "the warn names the child: {warns:?}"
+    );
+}
+
+/// A failed spawn's teardown whose kill was refused as a termination under way (the refusal is
+/// forced, so the process stays alive) and whose wait then fails says `Killed`: the child is dead or
+/// dying. `end_on_wait` ends the process, so a second wait would return at once and fail the count.
+///
+/// Mutant: the teardown answers `Unknown` for a failed wait after a refusal.
+#[skuld::test]
+fn raw_spawn_teardown_with_an_exit_under_way_and_a_failed_wait_is_killed() {
+    use crate::error::ChildFate;
+
+    let owner = spawn_suspended();
+    let proc = duplicate_handle(&owner);
+    crate::identity::windows_fault::refuse_next_terminate_as_exiting();
+    let observer = end_on_wait(&owner);
+    observer.fail_next_wait();
+    let fate = super::super::raw_spawn_teardown(proc, owner.id(), None, None);
+    assert_eq!(fate, ChildFate::Killed);
+    assert_eq!(observer.waits(), 1, "the teardown made the wait that failed");
+}
+
+/// A failed spawn's teardown whose `TerminateProcess` fails outright (here on an event handle, which
+/// answers `ERROR_INVALID_HANDLE`) asked nothing to exit: it logs and answers `Running { id }`
+/// without waiting. The event is signaled and the wait forced to fail, so a teardown that waits
+/// anyway returns at once and fails the assertions.
+///
+/// Mutant: the failed-kill arm falls through to the wait.
+#[skuld::test]
+fn raw_spawn_teardown_with_a_failed_terminate_is_running_and_does_not_wait() {
+    use crate::error::ChildFate;
+    use std::os::windows::io::FromRawHandle;
+    use windows::Win32::System::Threading::CreateEventW;
+
+    let owner = spawn_suspended();
+    let id = identity_of(&owner);
+    // SAFETY: a fresh unnamed manual-reset event, signaled; the returned handle is ours alone.
+    let event = unsafe { CreateEventW(None, true, true, None) }.expect("create an event");
+    // SAFETY: `event` is a fresh owned handle from CreateEventW.
+    let event = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(event.0) };
+    let observer = super::fault::observe_waits(|| {});
+    observer.fail_next_wait();
+    let fate = super::super::raw_spawn_teardown(event, owner.id(), Some(id), None);
+    assert_eq!(fate, ChildFate::Running { id: Some(id) });
+    assert_eq!(observer.waits(), 0, "a kill that failed must not be followed by a wait");
+}
+
+/// As `..._with_an_exit_under_way_and_a_failed_wait_is_killed`, but the kill is delivered to a live
+/// process: the fate is `Killed`, and the kill is what ended it (exit code 1).
+///
+/// Mutants: the teardown answers `Unknown` for any failed wait; the kill sends nothing, so
+/// `end_on_wait` ends the process with code 0; the teardown waits a second time.
+#[skuld::test]
+fn raw_spawn_teardown_with_a_delivered_terminate_and_a_failed_wait_is_killed() {
+    use crate::error::ChildFate;
+
+    let owner = spawn_suspended();
+    let proc = duplicate_handle(&owner);
+    let observer = end_on_wait(&owner);
+    observer.fail_next_wait();
+    let fate = super::super::raw_spawn_teardown(proc, owner.id(), None, None);
+    assert_eq!(fate, ChildFate::Killed);
+    assert_eq!(observer.waits(), 1, "the teardown made the wait that failed");
+    let status = owner.wait().expect("wait for the owner's child");
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "the teardown's kill must have ended it: {status:?}"
+    );
 }
 
 /// Mutants: `TerminateProcess` in `teardown_on_drop` a no-op reporting `Ok` or
@@ -287,6 +466,23 @@ fn teardown_of_an_exiting_unsignalled_child_reaps_it() {
     assert_eq!(observer.waits(), 1);
 }
 
+/// As above, with the wait failing: the exit is under way, so the child is dead or dying and the
+/// drop's fate is `Killed`, as `raw_spawn_teardown` answers. `end_on_wait` ends the process, so a
+/// second wait would return at once and fail the count.
+///
+/// Mutant: the exit-under-way arm answers `Unknown` for a failed wait.
+#[skuld::test]
+fn teardown_of_an_exiting_child_with_a_failed_wait_is_killed() {
+    use crate::error::ChildFate;
+    let child = spawn_suspended();
+    let observer = end_on_wait(&child);
+    observer.fail_next_wait();
+    crate::identity::windows_fault::refuse_next_terminate_as_exiting();
+    let torn = child.teardown_on_drop(identity_of(&child));
+    assert_eq!(torn.fate, ChildFate::Killed, "{torn:?}");
+    assert_eq!(observer.waits(), 1, "the teardown made the wait that failed");
+}
+
 /// A failed `GetExitCodeProcess` reports the plain Win32 code. A null handle is a real
 /// `ERROR_INVALID_HANDLE`.
 ///
@@ -406,20 +602,18 @@ fn wait_deadline_re_arms_past_a_clamped_timeout() {
     crate::wait::wait_ms_probe::assert_rearmed_with_fresh_remaining(&arms, 5);
 }
 
-/// A failed wait after a delivered kill is `Killed`; after a refused kill nothing was delivered, so
-/// the child's fate is not known. A collected status is `Reaped` either way.
+/// A failed wait after a teardown's kill, or an exit already under way, is `Killed`; a collected
+/// status is `Reaped`.
 ///
-/// Mutants: the refused kill's failed wait says `Killed`; a failed wait says `Reaped`.
+/// Mutants: a failed wait says `Unknown`; a failed wait says `Reaped`.
 #[skuld::test]
-fn a_failed_wait_after_a_refused_kill_is_unknown_not_killed() {
+fn a_failed_wait_after_a_teardown_kill_is_killed() {
     use crate::error::ChildFate;
     use std::os::windows::process::ExitStatusExt as _;
-    let failed = || Err(std::io::Error::other("forced wait failure 3a7c"));
-    let exited = || Ok(std::process::ExitStatus::from_raw(1));
-    assert_eq!(super::fate_after_reap(true, failed()), ChildFate::Killed);
-    assert_eq!(super::fate_after_reap(false, failed()), ChildFate::Unknown);
-    assert_eq!(super::fate_after_reap(true, exited()), ChildFate::Reaped);
-    assert_eq!(super::fate_after_reap(false, exited()), ChildFate::Reaped);
+    let failed = Err(std::io::Error::other("forced wait failure 3a7c"));
+    let exited = Ok(std::process::ExitStatus::from_raw(1));
+    assert_eq!(super::fate_after_reap(failed), ChildFate::Killed);
+    assert_eq!(super::fate_after_reap(exited), ChildFate::Reaped);
 }
 
 /// `kill` on a handle `TerminateProcess` rejects with something other than a denial is `Err` with

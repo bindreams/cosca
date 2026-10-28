@@ -315,7 +315,7 @@ pub(crate) fn spawn_raw(
         crate::identity::Resolved::Found(id) => id,
         other => {
             // The read failed, so no identity is known.
-            let fate = sync_raw::raw_spawn_teardown(proc, pid, None);
+            let fate = sync_raw::raw_spawn_teardown(proc, pid, None, crate::tokio::child::slow_teardown_after());
             return Err(SpawnFailure::started(
                 crate::child::spawn::spawn_identity_error(other),
                 fate,
@@ -325,7 +325,7 @@ pub(crate) fn spawn_raw(
     let attachment = match attach_or_fault(id, raw_handle, prepared) {
         Ok(v) => v,
         Err(e) => {
-            let fate = sync_raw::raw_spawn_teardown(proc, pid, Some(id));
+            let fate = sync_raw::raw_spawn_teardown(proc, pid, Some(id), crate::tokio::child::slow_teardown_after());
             return Err(SpawnFailure::started(e, fate));
         }
     };

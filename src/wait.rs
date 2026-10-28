@@ -11,7 +11,6 @@ use crate::identity::ProcessId;
 
 pub(crate) mod exit_only;
 
-#[cfg(unix)]
 pub(crate) mod teardown_warn;
 
 #[cfg_attr(target_os = "linux", path = "wait/linux.rs")]

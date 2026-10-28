@@ -36,9 +36,11 @@ forgetting a child that is ours. Both warn past 1 s, as principle 3 says. A fail
 teardown waits in place too. Exactly these of its blocking waits for something it killed warn once
 past 1 s, as the drop's does, each naming what it waits for:
 
-- the wait for the root, once the spawn has a child handle (on Linux, and on macOS
+- the wait for the root, once the spawn has a child handle (on Linux and Windows, and on macOS
   including the teardown of a child whose unique-id report came after the spawn returned,
   [`reap_unreported`](../src/tokio/child/proc_source.rs));
+- on Windows, the wait for a process the raw backend's teardown terminated
+  (`raw_spawn_teardown` in [`windows_raw.rs`](../src/child/spawn/windows_raw.rs));
 - on Linux, the waits for a child it killed in the pidfd handshake
   ([`conclude`](../src/child/spawn/pidfd_handshake.rs) and `await_unexecuted_exit`), and in a cgroup
   leaf's abandonment: `end_child` for a child that named itself, and the pidfd teardown of one that
@@ -50,9 +52,8 @@ past 1 s, as the drop's does, each naming what it waits for:
   [`leaf.rs`](../src/containment/cgroup/leaf.rs)).
 
 Each runs through [`wait_warning`](../src/wait/teardown_warn.rs), as the armed drop's reap and
-drain do: it takes the wait as an argument and warns before it if what it waits for has not ended
-within the threshold. Windows's teardown waits (`ProcSource::reap_now` and the raw backend's
-`raw_spawn_teardown`) come with the next PR of this stack, #780.
+drain do on Unix: it takes the wait as an argument and warns before it if what it waits for has not
+ended within the threshold.
 
 Spawning is the other exception: it blocks until `exec`, as tokio's own `Command::spawn` does.
 That includes cosca's placement report

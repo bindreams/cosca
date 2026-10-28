@@ -1032,6 +1032,10 @@ mod identity_group_tests;
 #[path = "spawn/post_fork_group_tests.rs"]
 mod post_fork_group_tests;
 
+#[cfg(all(test, windows))]
+#[path = "spawn/slow_teardown_windows_tests.rs"]
+mod slow_teardown_windows_tests;
+
 /// The fate of a child a failed tokio spawn abandoned with no handle on it (see
 /// [`warn_for_abandoned`]). Linux's handshake holds a pidfd on it, and answers itself.
 ///
