@@ -584,6 +584,18 @@ pub fn spawn_tree_with(
     contain: bool,
     configure: impl FnOnce(&mut cosca::Command),
 ) -> (cosca::Child, Vec<TcpStream>) {
+    let (mut cmd, listener, report) = tree_command(mode, contain);
+    configure(&mut cmd);
+    let mut child = cmd.spawn().expect("spawn tree");
+    let grand = report_grandchild(report, &mut child);
+    let mut socks = Vec::new();
+    accept_tree_members(&listener, &mut child, grand, &mut socks);
+    (child, member_socks(socks))
+}
+
+/// The command of a tree helper, the listener its members connect to and the one its root reports
+/// the grandchild's pid to (its address is already in the command's environment).
+fn tree_command(mode: &str, contain: bool) -> (cosca::Command, TcpListener, TcpListener) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap().to_string();
     let mut cmd = cosca::Command::new();
@@ -596,31 +608,155 @@ pub fn spawn_tree_with(
     }
     let report = TcpListener::bind("127.0.0.1:0").expect("bind the grandchild pid report listener");
     cmd.env(GC_PID_ADDR_ENV, report.local_addr().unwrap().to_string());
-    configure(&mut cmd);
-    let mut child = cmd.spawn().expect("spawn tree");
-    let grand = report_grandchild(report, &mut child);
-    // Demux by tag exactly like spawn_tree_async (accept order is not guaranteed, and a
-    // duplicate or foreign tag is a harness bug worth failing loudly on). The root is watched
-    // throughout, the grandchild until it has connected: either dying first fails the helper.
-    let (mut root, mut grand_sock) = (None, None);
+    (cmd, listener, report)
+}
+
+/// Accepts the root and the grandchild, each pushed to `socks` with its tag as it connects. Demuxed
+/// by tag (accept order is not guaranteed, and a duplicate or foreign tag is a harness bug worth
+/// failing loudly on). The root is watched throughout, the grandchild until it has connected:
+/// either dying first fails the helper.
+fn accept_tree_members(
+    listener: &TcpListener,
+    child: &mut cosca::Child,
+    grand: cosca::identity::ProcessId,
+    socks: &mut Vec<(u8, TcpStream)>,
+) {
     for _ in 0..2 {
-        let watch_grand = grand_sock.is_none().then_some(grand);
-        let mut s = accept_or_die_also(&listener, &mut child, watch_grand);
+        let watch_grand = (!socks.iter().any(|(tag, _)| *tag == b'G')).then_some(grand);
+        let mut s = accept_or_die_also(listener, child, watch_grand);
         let mut tag = [0u8; 1];
         s.read_exact(&mut tag).expect("read tag");
-        match &tag {
-            b"R" => root = Some(s),
-            b"G" => grand_sock = Some(s),
-            other => panic!("unexpected tree tag {other:?}"),
-        }
+        assert!(
+            matches!(&tag, b"R" | b"G") && !socks.iter().any(|(t, _)| *t == tag[0]),
+            "unexpected or duplicate tree tag {tag:?}"
+        );
+        socks.push((tag[0], s));
     }
-    (
+}
+
+/// The tagged sockets of a tree as `[root, grandchild]`.
+fn member_socks(mut socks: Vec<(u8, TcpStream)>) -> Vec<TcpStream> {
+    let mut take = |wanted: u8| {
+        let at = socks
+            .iter()
+            .position(|(tag, _)| *tag == wanted)
+            .expect("both tags connected");
+        socks.remove(at).1
+    };
+    let (root, grandchild) = (take(b'R'), take(b'G'));
+    vec![root, grandchild]
+}
+
+/// What a tree helper holds while it accepts, so that a failure can end the tree. The fields drop in
+/// this order: what a member holds open goes first, the `Child` last.
+struct Held<L, C> {
+    /// Each accepted connection with its tag.
+    socks: Vec<(u8, TcpStream)>,
+    listener: L,
+    child: C,
+}
+
+type Tree = Held<TcpListener, cosca::Child>;
+
+/// [`spawn_tree`] for a test that expects the harness to panic with the tree still running (a
+/// death-watch failure), and whose grandchild answers every byte ([`ECHO_HELD_ENV`]).
+///
+/// On Linux, when the containment names the grandchild (cgroup, process group), the tree is ended by
+/// `kill_tree` before the unwind and asserted ended: a grandchild must not echo after it returns
+/// (a delivered SIGKILL is pending), and a root that never reported one must have ended. The
+/// members' sockets close before the `Child` drops. Other containments unwind as [`spawn_tree`]
+/// does. The drop's own kill of an orphaned grandchild is the library's test,
+/// `cgroup_drop_of_an_exited_unreaped_root_kills_its_orphaned_descendant`.
+pub fn spawn_tree_ending_a_failure(mode: &str, contain: bool) -> (cosca::Child, Vec<TcpStream>) {
+    use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+
+    let (mut cmd, listener, report) = tree_command(mode, contain);
+    cmd.env(ECHO_HELD_ENV, "1");
+    let child = cmd.spawn().expect("spawn tree");
+    let mut tree = Tree {
+        socks: Vec::new(),
+        listener,
         child,
-        vec![
-            root.expect("root R connected"),
-            grand_sock.expect("grandchild G connected"),
-        ],
-    )
+    };
+    let mut grand = None;
+    let accepted = catch_unwind(AssertUnwindSafe(|| {
+        let id = report_grandchild(report, &mut tree.child);
+        grand = Some(id);
+        accept_tree_members(&tree.listener, &mut tree.child, id, &mut tree.socks);
+    }));
+    if let Err(payload) = accepted {
+        #[cfg(target_os = "linux")]
+        if names_its_grandchild(tree.child.containment()) {
+            end_tree(&mut tree, grand);
+        }
+        resume_unwind(payload);
+    }
+    let Tree { socks, child, .. } = tree;
+    (child, member_socks(socks))
+}
+
+/// Whether `containment` reaches the grandchild of a tree whose root died: a cgroup and a process
+/// group both name it without the root.
+#[cfg(target_os = "linux")]
+fn names_its_grandchild(containment: cosca::Containment) -> bool {
+    use cosca::Containment as C;
+    matches!(containment, C::CgroupV2 | C::Session | C::ProcessGroup)
+}
+
+/// Ends the tree a failed accept left running, and asserts that it ended. `grand` is the grandchild
+/// the root reported, if it did. See [`assert_tree_ended`] for what is asserted.
+#[cfg(target_os = "linux")]
+fn end_tree(tree: &mut Tree, grand: Option<cosca::identity::ProcessId>) {
+    if let Some(grand) = grandchild_yet_to_connect(&tree.socks, grand) {
+        // The grandchild is alive, so it connects, if it has not yet; one that died instead fails here.
+        let socket = accept_or_die_descendant(&tree.listener, grand);
+        keep_grandchild(&mut tree.socks, socket);
+    }
+    let killed = tree.child.kill_tree();
+    let root = grand.is_none().then(|| cosca::Process::from_id(tree.child.id()).wait());
+    assert_tree_ended(killed, root, &mut tree.socks);
+}
+
+/// The grandchild whose connection a failed accept still has to take: the one the root reported,
+/// unless it has connected.
+#[cfg(target_os = "linux")]
+fn grandchild_yet_to_connect(
+    socks: &[(u8, TcpStream)],
+    grand: Option<cosca::identity::ProcessId>,
+) -> Option<cosca::identity::ProcessId> {
+    grand.filter(|_| !socks.iter().any(|(tag, _)| *tag == b'G'))
+}
+
+/// Keeps the grandchild's accepted connection `socket` with its tag.
+#[cfg(target_os = "linux")]
+fn keep_grandchild(socks: &mut Vec<(u8, TcpStream)>, mut socket: TcpStream) {
+    let mut tag = [0u8; 1];
+    socket.read_exact(&mut tag).expect("read the grandchild's tag");
+    assert_eq!(&tag, b"G", "only the grandchild connects");
+    socks.push((b'G', socket));
+}
+
+/// What a tree helper asserts once it has ended the tree a failed accept left running. `killed` is
+/// the `kill_tree` it made, which must have succeeded. A grandchild that connected must not echo
+/// now, as a `SIGKILL` the kill delivered is pending before it returns, so a kill that sent nothing
+/// fails here and never hangs the unwind's drop, which waits for the tree. `root` is the wait for
+/// the root's end, made only when no grandchild was reported: the root then reported nothing, so
+/// it, and the grandchild it killed or never made, end with the report connection that the unwind
+/// closed, whatever the kill did.
+#[cfg(target_os = "linux")]
+#[track_caller]
+fn assert_tree_ended(
+    killed: Result<(), cosca::error::Error>,
+    root: Option<Result<(), cosca::error::Error>>,
+    socks: &mut [(u8, TcpStream)],
+) {
+    killed.expect("kill_tree of the tree the failed accept left");
+    if let Some(root) = root {
+        root.expect("wait for the root, which reported no grandchild, to end");
+    }
+    if let Some((_, grandchild)) = socks.iter_mut().find(|(tag, _)| *tag == b'G') {
+        assert_dead(grandchild, "the grandchild after kill_tree");
+    }
 }
 
 /// Binds the listener a `spawn-grandchild*` root reports its grandchild's pid to, and returns it
@@ -716,23 +852,114 @@ pub async fn spawn_tree_async(
     cmd.env(GC_PID_ADDR_ENV, report_addr);
     let mut child = cmd.spawn().expect("spawn async tree");
     let grand = report_grandchild_async(report, &mut child).await;
-    let (mut root, mut grandchild) = (None, None);
+    let mut socks = Vec::new();
+    accept_tree_members_async(&listener, &mut child, grand, &mut socks).await;
+    let mut members = member_socks(socks).into_iter();
+    let (root, grandchild) = (
+        members.next().expect("root R connected"),
+        members.next().expect("grandchild G connected"),
+    );
+    (child, root, grandchild)
+}
+
+/// The async twin of [`accept_tree_members`].
+#[cfg(feature = "tokio")]
+async fn accept_tree_members_async(
+    listener: &::tokio::net::TcpListener,
+    child: &mut cosca::tokio::Child,
+    grand: cosca::identity::ProcessId,
+    socks: &mut Vec<(u8, TcpStream)>,
+) {
     for _ in 0..2 {
-        let watch_grand = grandchild.is_none().then_some(grand);
-        let mut s = accept_or_die_async_also(&listener, &mut child, watch_grand).await;
+        let watch_grand = (!socks.iter().any(|(tag, _)| *tag == b'G')).then_some(grand);
+        let mut s = accept_or_die_async_also(listener, child, watch_grand).await;
         let mut tag = [0u8; 1];
         s.read_exact(&mut tag).expect("read tag");
-        match &tag {
-            b"R" => root = Some(s),
-            b"G" => grandchild = Some(s),
-            other => panic!("unexpected tree tag {other:?}"),
-        }
+        assert!(
+            matches!(&tag, b"R" | b"G") && !socks.iter().any(|(t, _)| *t == tag[0]),
+            "unexpected or duplicate tree tag {tag:?}"
+        );
+        socks.push((tag[0], s));
     }
-    (
+}
+
+/// The async twin of [`Tree`].
+#[cfg(feature = "tokio")]
+type AsyncTree = Held<::tokio::net::TcpListener, cosca::tokio::Child>;
+
+/// [`spawn_tree_async`] of a contained tree for a test that expects the harness to panic with the
+/// tree still running: the async twin of [`spawn_tree_ending_a_failure`], which ends the tree the
+/// same way.
+#[cfg(feature = "tokio")]
+pub async fn spawn_tree_async_ending_a_failure(mode: &str) -> (cosca::tokio::Child, TcpStream, TcpStream) {
+    use std::panic::resume_unwind;
+
+    let (listener, addr) = bind_async_listener();
+    let mut cmd = cosca::tokio::Command::new();
+    cmd.args([testbin(), mode, addr.as_str()])
+        .env(ACK_ENV, "1")
+        .env(ECHO_HELD_ENV, "1");
+    silence_async(&mut cmd);
+    cmd.contain();
+    let (report, report_addr) = bind_async_listener();
+    cmd.env(GC_PID_ADDR_ENV, report_addr);
+    let child = cmd.spawn().expect("spawn async tree");
+    let mut tree = AsyncTree {
+        socks: Vec::new(),
+        listener,
         child,
-        root.expect("root R connected"),
-        grandchild.expect("grandchild G connected"),
-    )
+    };
+    let mut grand = None;
+    let accepted = catching(async {
+        let id = report_grandchild_async(report, &mut tree.child).await;
+        grand = Some(id);
+        accept_tree_members_async(&tree.listener, &mut tree.child, id, &mut tree.socks).await;
+    })
+    .await;
+    if let Err(payload) = accepted {
+        #[cfg(target_os = "linux")]
+        if names_its_grandchild(tree.child.containment()) {
+            end_async_tree(&mut tree, grand).await;
+        }
+        resume_unwind(payload);
+    }
+    let AsyncTree { socks, child, .. } = tree;
+    let mut members = member_socks(socks).into_iter();
+    let (root, grandchild) = (
+        members.next().expect("root R connected"),
+        members.next().expect("grandchild G connected"),
+    );
+    (child, root, grandchild)
+}
+
+/// Awaits `fut`, returning the payload of a panic it raised instead of unwinding.
+#[cfg(feature = "tokio")]
+async fn catching<F: std::future::Future>(fut: F) -> Result<F::Output, Box<dyn std::any::Any + Send>> {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::task::Poll;
+
+    let mut fut = std::pin::pin!(fut);
+    std::future::poll_fn(|cx| match catch_unwind(AssertUnwindSafe(|| fut.as_mut().poll(cx))) {
+        Ok(Poll::Pending) => Poll::Pending,
+        Ok(Poll::Ready(out)) => Poll::Ready(Ok(out)),
+        Err(payload) => Poll::Ready(Err(payload)),
+    })
+    .await
+}
+
+/// The async twin of [`end_tree`].
+#[cfg(all(feature = "tokio", target_os = "linux"))]
+async fn end_async_tree(tree: &mut AsyncTree, grand: Option<cosca::identity::ProcessId>) {
+    if let Some(grand) = grandchild_yet_to_connect(&tree.socks, grand) {
+        let socket = accept_or_die_async_descendant(&tree.listener, grand).await;
+        keep_grandchild(&mut tree.socks, socket);
+    }
+    let killed = tree.child.kill_tree();
+    let root = match grand {
+        Some(_) => None,
+        None => Some(cosca::tokio::Process::from_id(tree.child.id()).wait().await),
+    };
+    assert_tree_ended(killed, root, &mut tree.socks);
 }
 
 /// A contained async `spawn-grandchild-echo` tree: both members round-trip a byte, so a test can

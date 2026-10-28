@@ -66,7 +66,7 @@ use win as platform;
 #[path = "accept/tokio.rs"]
 mod async_impl;
 #[cfg(feature = "tokio")]
-pub use async_impl::{accept_or_die_async, accept_or_die_async_also};
+pub use async_impl::{accept_or_die_async, accept_or_die_async_also, accept_or_die_async_descendant};
 
 #[cfg(windows)]
 pub use win::wait_handles;
@@ -212,6 +212,17 @@ pub fn accept_or_die_also(listener: &TcpListener, target: &mut impl Target, also
         died_before_connecting(pid);
     }
     match platform::wait(Source::Listener(listener), pid, also) {
+        WatchEvent::Ready => accept_and_ack(listener),
+        WatchEvent::Died(dead) => died_before_connecting(dead),
+    }
+}
+
+/// Blocks until `listener` gets a connection, or the descendant `id` of a root that is already gone
+/// exits first. It watches nothing else, so a root that exited is no verdict. The connection is
+/// accepted and acked.
+#[cfg(target_os = "linux")]
+pub fn accept_or_die_descendant(listener: &TcpListener, id: ProcessId) -> TcpStream {
+    match platform::wait_for_descendant(Source::Listener(listener), id) {
         WatchEvent::Ready => accept_and_ack(listener),
         WatchEvent::Died(dead) => died_before_connecting(dead),
     }

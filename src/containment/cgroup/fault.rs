@@ -40,11 +40,13 @@ thread_local! {
     static FORCE_KILL_CHECK_ERRNO: Cell<Option<i32>> = const { Cell::new(None) };
     static FORCE_LEAF_OPEN_FAILURE: Cell<bool> = const { Cell::new(false) };
     static FAIL_KILL_WRITES: Cell<bool> = const { Cell::new(false) };
+    static REFUSED_KILL_WRITES: Cell<u32> = const { Cell::new(0) };
     static FAIL_NEXT_KILL_WRITE: Cell<bool> = const { Cell::new(false) };
     static FAIL_PUMP_STARTS: Cell<bool> = const { Cell::new(false) };
     static PIDFD_INFO_MISSING: Cell<bool> = const { Cell::new(false) };
     static PROC_HIDDEN: Cell<bool> = const { Cell::new(false) };
     static BEFORE_KILL_WRITE: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
+    static AFTER_KILL_WRITE: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static CHILD_DIES: Cell<Option<ChildDeath>> = const { Cell::new(None) };
     static FORCED_PIDFD_CGROUP_ID: Cell<Option<u64>> = const { Cell::new(None) };
     static BEFORE_WALK_OPEN: std::cell::RefCell<Option<WalkHook>> = const { std::cell::RefCell::new(None) };
@@ -81,14 +83,75 @@ thread_local! {
 type RmdirHook = Box<dyn FnMut(&std::path::Path) -> std::io::Result<()>>;
 
 /// While the guard lives, every `cgroup.kill` write on this thread fails with `EIO`, and kills
-/// nothing: a failed kill whose members may all still run.
+/// nothing: a failed kill whose members may all still run. A teardown after a failed kill must not
+/// wait for the leaf's drain, nor block on its child (`set_between_kill_and_wait`) after taking as
+/// delivered a kill that wrote nothing; either fails by assertion. A look after a refused kill
+/// reaches the child-wait seam and is allowed.
 pub(crate) fn fail_kill_writes() -> FailKillWrites {
+    arm_fail_kill_writes(None)
+}
+
+/// [`fail_kill_writes`] that also runs `release` before it fails for a kill route that wrote
+/// nothing: what the unwind from that failure would otherwise wait for forever, as a drop does for
+/// a front only a kill ends.
+pub(crate) fn fail_kill_writes_releasing_on_unwritten_kill(release: impl FnOnce() + 'static) -> FailKillWrites {
+    arm_fail_kill_writes(Some((Box::new(release), ReleaseAt::UnwrittenKill)))
+}
+
+/// [`fail_kill_writes`] that runs `release` whenever the teardown is about to block on its child,
+/// for a teardown that must not wait there: a wait ends what only a kill would, and the test sees
+/// it, instead of hanging. A look after a refused kill is a reach of this seam too, so this is not
+/// for a teardown that makes one.
+pub(crate) fn fail_kill_writes_releasing_at_wait(release: impl FnOnce() + 'static) -> FailKillWrites {
+    arm_fail_kill_writes(Some((Box::new(release), ReleaseAt::EveryWait)))
+}
+
+/// When [`arm_fail_kill_writes`] runs its release at the child-wait seam.
+enum ReleaseAt {
+    /// Only when no `cgroup.kill` was attempted.
+    UnwrittenKill,
+    /// At every reach of the seam.
+    EveryWait,
+}
+
+fn arm_fail_kill_writes(release: Option<(Box<dyn FnOnce()>, ReleaseAt)>) -> FailKillWrites {
     FAIL_KILL_WRITES.with(|f| f.set(true));
-    FailKillWrites(())
+    REFUSED_KILL_WRITES.with(|n| n.set(0));
+    FailKillWrites {
+        _no_drain_wait: set_before_drain_block(|| {
+            fail_once_unwinding(
+                "a teardown whose cgroup.kill failed waited for the leaf's drain, which its members may never end",
+            );
+        }),
+        _no_unwritten_kill: crate::child::spawn::fault::set_between_kill_and_wait(move || {
+            let unwritten = REFUSED_KILL_WRITES.with(Cell::get) == 0;
+            if let Some((release, at)) = release {
+                if unwritten || matches!(at, ReleaseAt::EveryWait) {
+                    release();
+                }
+            }
+            if unwritten {
+                fail_once_unwinding(
+                    "a teardown took a kill as delivered and waited for its child, though no cgroup.kill was written",
+                );
+            }
+        }),
+    }
+}
+
+/// Fails the test with `message`, unless it is already unwinding: a second panic from a drop
+/// aborts the process.
+fn fail_once_unwinding(message: &str) {
+    if !std::thread::panicking() {
+        panic!("{message}");
+    }
 }
 
 #[must_use = "the writes succeed again as soon as the guard is dropped"]
-pub(crate) struct FailKillWrites(());
+pub(crate) struct FailKillWrites {
+    _no_drain_wait: crate::oneshot_hook::Armed,
+    _no_unwritten_kill: crate::oneshot_hook::Armed,
+}
 
 impl Drop for FailKillWrites {
     fn drop(&mut self) {
@@ -96,8 +159,13 @@ impl Drop for FailKillWrites {
     }
 }
 
+/// Whether this write fails (see [`fail_kill_writes`]); a failure is counted.
 pub(crate) fn kill_writes_fail() -> bool {
-    FAIL_KILL_WRITES.with(Cell::get)
+    let fails = FAIL_KILL_WRITES.with(Cell::get);
+    if fails {
+        REFUSED_KILL_WRITES.with(|n| n.set(n.get() + 1));
+    }
+    fails
 }
 
 /// A drain pump started on this thread fails to start, with `EAGAIN`, as a spawn at a thread limit
@@ -351,6 +419,18 @@ pub(crate) fn run_before_kill_write() {
     crate::oneshot_hook::fire(&BEFORE_KILL_WRITE);
 }
 
+/// Run `hook` once, right after the next `cgroup.kill` write on this thread that succeeded, before
+/// anything waits on its effect. A fixture that only the kill would end is released here, so a kill
+/// that sent nothing fails an assertion on how the fixture ended instead of hanging the wait for
+/// its drain; a write that fails (or is made to) runs nothing.
+pub(crate) fn set_after_kill_write(hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
+    crate::oneshot_hook::arm(&AFTER_KILL_WRITE, hook)
+}
+
+pub(crate) fn run_after_kill_write() {
+    crate::oneshot_hook::fire(&AFTER_KILL_WRITE);
+}
+
 /// Make the NEXT leaf directory made on this thread fail to be held after its `mkdir`, with
 /// `EMFILE`, as at `RLIMIT_NOFILE`. Take semantics.
 pub(crate) fn set_force_leaf_open_failure(on: bool) {
@@ -407,7 +487,6 @@ pub(crate) fn take_drain_blocking_notifier() {
 /// Run `hook` once when the next drain wait on this thread is about to block, before it does: a
 /// fixture that only the thing awaited would release can be checked, or released, here, so a
 /// mutant that never made it happen fails an assertion instead of hanging the wait.
-#[cfg(feature = "tokio")]
 pub(crate) fn set_before_drain_block(hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
     crate::oneshot_hook::arm(&BEFORE_DRAIN_BLOCK, hook)
 }
@@ -518,11 +597,6 @@ pub(crate) fn notify_wait_deadline_arg(at: std::time::Instant) {
 /// latter with its `cgroup.events` as read at that moment, until [`take_leaf_steps`].
 pub(crate) fn record_leaf_steps() {
     LEAF_STEPS.with(|s| *s.borrow_mut() = Some(Vec::new()));
-}
-/// The steps recorded so far, left in place.
-#[cfg(feature = "tokio")]
-pub(crate) fn leaf_steps_so_far() -> Vec<String> {
-    LEAF_STEPS.with(|s| s.borrow().clone()).unwrap_or_default()
 }
 pub(crate) fn take_leaf_steps() -> Vec<String> {
     LEAF_STEPS.with(|s| s.borrow_mut().take()).unwrap_or_default()

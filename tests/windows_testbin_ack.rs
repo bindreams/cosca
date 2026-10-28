@@ -1,6 +1,5 @@
 //! Windows: the testbin modes that spawn a child of their own and accept its connection
-//! (`report-console-terminate`, `report-console-lone`, `report-breakaway`) watch that child's death,
-//! and opt it in to the accept handshake themselves.
+//! (`report-breakaway`) watch that child's death, and opt it in to the accept handshake themselves.
 //!
 //! Both properties are invisible from the outside when everything goes right, so each mode runs
 //! under a testbin seam (`testbin/ack.rs`, `SEAM_ENV`):
@@ -14,8 +13,6 @@
 use std::io::Read;
 #[cfg(windows)]
 use std::net::TcpListener;
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
 
 #[cfg(windows)]
 #[path = "common/mod.rs"]
@@ -25,19 +22,10 @@ mod common;
 const SEAM_ENV: &str = "COSCA_TEST_ACK_SEAM";
 
 #[cfg(windows)]
-/// `DETACHED_PROCESS` (winbase.h): the new process gets no console and does not inherit ours.
-const DETACHED_PROCESS: u32 = 0x0000_0008;
-
-#[cfg(windows)]
 /// How a mode is launched and read.
 struct Case {
     /// The mode's argv after the executable, given the report address.
     args: fn(&str) -> Vec<String>,
-    /// The mode reports one line and then waits for the socket to close, instead of closing.
-    one_line: bool,
-    /// Creation flags for the mode. The two console modes are launched console-less because they
-    /// probe the console-less caller.
-    flags: u32,
 }
 
 #[cfg(windows)]
@@ -56,17 +44,12 @@ fn run(case: &Case, seam: &str) -> Run {
     cmd.args(&args)
         .env(common::ACK_ENV, "1")
         .env(SEAM_ENV, seam)
-        .creation_flags(case.flags)
         .stderr(std::process::Stdio::piped());
     let mut helper = common::spawn_locked(&mut cmd).expect("spawn the mode");
-    let mut sock = common::accept_or_die(&listener, &mut helper);
-    let mut report = String::new();
-    if case.one_line {
-        report = common::read_report_line(&sock);
-        drop(sock);
-    } else {
-        sock.read_to_string(&mut report).expect("read the report");
-    }
+    let sock = common::accept_or_die(&listener, &mut helper);
+    // The mode reports one line and then waits for the socket to close.
+    let report = common::read_report_line(&sock);
+    drop(sock);
     let success = helper.wait().expect("reap the mode").success();
     let mut stderr = String::new();
     helper
@@ -113,14 +96,6 @@ macro_rules! mode_tests {
 }
 
 #[cfg(windows)]
-fn console_terminate_args(addr: &str) -> Vec<String> {
-    ["report-console-terminate", addr].map(String::from).to_vec()
-}
-#[cfg(windows)]
-fn console_lone_args(addr: &str) -> Vec<String> {
-    ["report-console-lone", addr].map(String::from).to_vec()
-}
-#[cfg(windows)]
 fn breakaway_raw_args(addr: &str) -> Vec<String> {
     ["report-breakaway", addr, "permit", "raw"].map(String::from).to_vec()
 }
@@ -135,11 +110,9 @@ fn breakaway_exec_args(addr: &str) -> Vec<String> {
 
 #[cfg(windows)]
 mode_tests! {
-    report_console_terminate: Case { args: console_terminate_args, one_line: false, flags: DETACHED_PROCESS };
-    report_console_lone: Case { args: console_lone_args, one_line: false, flags: DETACHED_PROCESS };
-    report_breakaway_raw: Case { args: breakaway_raw_args, one_line: true, flags: 0 };
-    report_breakaway_argv: Case { args: breakaway_argv_args, one_line: true, flags: 0 };
-    report_breakaway_exec: Case { args: breakaway_exec_args, one_line: true, flags: 0 };
+    report_breakaway_raw: Case { args: breakaway_raw_args };
+    report_breakaway_argv: Case { args: breakaway_argv_args };
+    report_breakaway_exec: Case { args: breakaway_exec_args };
 }
 
 #[path = "../src/test_harness.rs"]

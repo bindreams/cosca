@@ -539,7 +539,7 @@ fn death_watch_spawn_tree_panics_when_the_grandchild_dies_before_connecting_whil
 /// the report accept passes and the main loop must fail on the ROOT (not the live grandchild).
 #[skuld::test]
 fn death_watch_spawn_tree_panics_when_the_root_dies_after_reporting_before_connecting() {
-    root_dies_after_reporting(|| common::spawn_tree("spawn-grandchild-report-then-exit", true));
+    root_dies_after_reporting(|| common::spawn_tree_ending_a_failure("spawn-grandchild-report-then-exit", true));
 }
 
 /// [`death_watch_spawn_tree_panics_when_the_root_dies_after_reporting_before_connecting`] with the root's exit
@@ -547,12 +547,14 @@ fn death_watch_spawn_tree_panics_when_the_root_dies_after_reporting_before_conne
 #[skuld::test]
 fn death_watch_spawn_tree_panics_when_the_root_dies_after_reporting_before_the_harness_looks() {
     let seam = common::reapable_after_release();
-    let message = root_dies_after_reporting(|| common::spawn_tree("spawn-grandchild-report-then-exit", true));
+    let message =
+        root_dies_after_reporting(|| common::spawn_tree_ending_a_failure("spawn-grandchild-report-then-exit", true));
     assert_died_before_connecting(&message, seam.root().expect("the seam waited on the released root"));
 }
 
 /// Runs `spawn_tree`, which must panic on a root that exits right after reporting its grandchild,
-/// and returns the panic message. Contained so unwinding kills the orphaned grandchild.
+/// and returns the panic message. The tree is contained; what ends its grandchild is in
+/// [`common::wait_for_the_dropped_trees_grandchild`].
 fn root_dies_after_reporting<R>(spawn_tree: impl FnOnce() -> R) -> String {
     common::install_log_capture();
     let mark = common::log_mark();
@@ -572,6 +574,18 @@ fn root_dies_after_reporting<R>(spawn_tree: impl FnOnce() -> R) -> String {
 #[skuld::test]
 fn death_watch_spawn_tree_panics_when_the_root_dies_before_reporting_the_grandchild_pid() {
     let message = panic_message_of(|| common::spawn_tree("spawn-grandchild-report-eof", false));
+    assert!(
+        message.contains("died before it reported the grandchild pid"),
+        "got: {message:?}"
+    );
+}
+
+/// [`death_watch_spawn_tree_panics_when_the_root_dies_before_reporting_the_grandchild_pid`] through
+/// the helper that ends a failed tree: with no grandchild reported there is none to prove dead, so
+/// the helper asserts that its `kill_tree` succeeded and that the root ended.
+#[skuld::test]
+fn death_watch_spawn_tree_ending_a_failure_ends_a_tree_whose_root_reported_no_grandchild() {
+    let message = panic_message_of(|| common::spawn_tree_ending_a_failure("spawn-grandchild-report-eof", true));
     assert!(
         message.contains("died before it reported the grandchild pid"),
         "got: {message:?}"

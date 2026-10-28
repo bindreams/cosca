@@ -864,6 +864,7 @@ fn a_disarmed_leaf_whose_tree_was_killed_but_still_refuses_rmdir_is_reported_onc
 
     let leaf = entered_leaf_at(leaf_path);
     leaf.disarm();
+    // Only sets the leaf's "killed" flag: this test's subject is the log level, not the write.
     leaf.hard_kill().expect("kill the tree");
     let mark = crate::log_capture::mark();
     drop(leaf);
@@ -1050,6 +1051,11 @@ fn an_armed_drop_removes_its_leaf_only_after_it_drains() {
         !fake.leaf.exists(),
         "the drop must remove the drained leaf, got {steps:?}"
     );
+    assert_eq!(
+        fake.kill_written(),
+        crate::containment::cgroup::KILL_PAYLOAD,
+        "the drop must write cgroup.kill, not only record the step, got {steps:?}"
+    );
     let killed_at = steps
         .iter()
         .position(|s| s == "kill")
@@ -1085,6 +1091,7 @@ fn a_disarmed_leaf_whose_tree_was_killed_removes_itself_only_after_it_drains() {
     let leaf = entered_leaf_at(fake.leaf.clone());
     leaf.disarm();
     leaf.hard_kill().expect("kill the tree");
+    fake.clear_kill();
 
     fault::record_leaf_steps();
     drop(leaf);
@@ -1095,6 +1102,11 @@ fn a_disarmed_leaf_whose_tree_was_killed_removes_itself_only_after_it_drains() {
     assert!(
         !fake.leaf.exists(),
         "a disarmed Drop must still remove a leaf its caller already killed, once it drains, got {steps:?}"
+    );
+    assert_eq!(
+        fake.kill_written(),
+        crate::containment::cgroup::KILL_PAYLOAD,
+        "the drop must write cgroup.kill again, not only record the step, got {steps:?}"
     );
     // The first kill happened before `record_leaf_steps()`, so it leaves no step here — but
     // `Drop` re-fires `cgroup.kill` before waiting (see the next test), which does show up.
@@ -1130,6 +1142,7 @@ fn a_disarmed_drop_re_fires_the_kill_before_waiting_on_a_repopulated_leaf() {
     // first, successful write.
     FakeLeaf::set_populated(&fake.events, false);
     FakeLeaf::set_populated(&fake.events, true);
+    fake.clear_kill();
 
     fault::record_leaf_steps();
     drop(leaf);
@@ -1140,6 +1153,11 @@ fn a_disarmed_drop_re_fires_the_kill_before_waiting_on_a_repopulated_leaf() {
     assert!(
         !fake.leaf.exists(),
         "Drop must still remove the leaf once its re-fired kill drains, got {steps:?}"
+    );
+    assert_eq!(
+        fake.kill_written(),
+        crate::containment::cgroup::KILL_PAYLOAD,
+        "the drop must write cgroup.kill again, not only record the step, got {steps:?}"
     );
     let killed_at = steps
         .iter()
@@ -1270,8 +1288,13 @@ fn a_disarmed_leaf_whose_kill_attempt_failed_is_reported_at_warn() {
 
     let leaf = entered_leaf_at(fake.leaf.clone());
     leaf.disarm();
-    leaf.hard_kill()
-        .expect_err("a directory cannot be written as cgroup.kill");
+    // A kill the kernel took empties the leaf. This write is refused, so it never does. A call
+    // that returns `Ok` anyway drains the fake here, so the `expect_err` fails by assertion.
+    let killed = leaf.hard_kill();
+    if killed.is_ok() {
+        FakeLeaf::set_populated(&fake.events, false);
+    }
+    killed.expect_err("a directory cannot be written as cgroup.kill");
 
     let mark = crate::log_capture::mark();
     drop(leaf);

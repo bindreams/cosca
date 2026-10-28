@@ -511,7 +511,13 @@ async fn cgroup_a_post_fork_tokio_failure_warns_only_for_a_child_out_of_reach(#[
     use crate::containment::cgroup::fault as cgroup_fault;
     crate::log_capture::install();
     for (placed, refuses) in [(true, false), (false, false), (false, true)] {
-        let mut cmd = blocker();
+        // Its stdin is released as the spawn's cleanup is about to wait for it, so a kill that sent
+        // nothing lets it exit by itself, and the `SIGKILL` check below fails, instead of the wait hanging.
+        let (stdin, writer) = crate::test_child::held_writer_stdin();
+        let mut cmd = Command::new();
+        cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+        cmd.stdin(stdin).expect("set stdin pipe");
+        let _released = cgroup_fault::set_before_exit_wait(move || drop(writer));
         cmd.contain();
         let mark = crate::log_capture::mark();
         // Armed in this thread, inherited by the child it forks, which takes them.
