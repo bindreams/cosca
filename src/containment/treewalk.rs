@@ -266,12 +266,14 @@ pub(crate) fn kill_by_identity(id: ProcessId, signal: Signal) -> KillOutcome {
 
 /// Windows: terminate `id` only if the pid STILL resolves to that exact identity.
 /// Opens the process for terminate rights and calls `TerminateProcess`. Already
-/// gone (unresolvable / unopenable) is success. Best-effort.
+/// gone (unresolvable / unopenable, or exiting when the call came) is success. Best-effort.
 #[cfg(windows)]
 pub(crate) fn kill_by_identity(id: ProcessId) -> KillOutcome {
-    use windows::Win32::System::Threading::{TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE};
+    use windows::Win32::System::Threading::{PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE};
 
-    use crate::identity::{windows_close, windows_open_classified, HandleIdentity, Opened};
+    use crate::identity::{
+        windows_close, windows_open_classified, windows_terminate_held, HandleIdentity, Opened, Termination,
+    };
 
     // Open for terminate AND query, so the SAME held handle both pins the kernel object
     // (pid-reuse-safe) and lets us re-verify identity before terminating, race-free.
@@ -288,10 +290,12 @@ pub(crate) fn kill_by_identity(id: ProcessId) -> KillOutcome {
     };
     let outcome = match crate::identity::windows_handle_identity(handle, id) {
         HandleIdentity::Same => {
-            // SAFETY: `handle` is live and pins the verified process.
-            match unsafe { TerminateProcess(handle, 1) } {
-                Ok(()) => KillOutcome::Terminated,
-                Err(e) => {
+            #[cfg(test)]
+            fault::run_before_terminate();
+            match windows_terminate_held(handle) {
+                Termination::Terminated => KillOutcome::Terminated,
+                Termination::Exited => KillOutcome::AlreadyGone,
+                Termination::Failed(e) => {
                     log::warn!("treewalk: TerminateProcess(pid {}) failed: {e}", id.pid());
                     KillOutcome::NotAttempted
                 }
@@ -402,6 +406,22 @@ pub(crate) mod fault {
         static FORCE_ROOT_KILL_NOOP: Cell<bool> = const { Cell::new(false) };
         static WALKS: RefCell<Option<Vec<u32>>> = const { RefCell::new(None) };
         static FORCE_INCOMPLETE: Cell<bool> = const { Cell::new(false) };
+        #[cfg(windows)]
+        static BEFORE_TERMINATE: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    /// Run `hook` once on this thread in the next Windows `kill_by_identity`, between the identity
+    /// check and `TerminateProcess` (where a member can exit on its own).
+    #[cfg(windows)]
+    pub(crate) fn set_before_terminate(hook: impl FnOnce() + 'static) {
+        BEFORE_TERMINATE.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    #[cfg(windows)]
+    pub(super) fn run_before_terminate() {
+        if let Some(hook) = BEFORE_TERMINATE.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
     }
 
     /// Make the NEXT `hard_kill` on THIS thread report an incomplete walk, as an unreadable

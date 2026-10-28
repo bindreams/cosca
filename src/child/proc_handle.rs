@@ -237,11 +237,12 @@ impl ProcHandle {
     /// on any "elevation requested" flag: a child that gained privilege on its OWN (a
     /// setuid helper, or `sudo` spawned with no `.elevate()`) also returns EPERM, and
     /// keying on a request flag would take the blocking `wait()` and hang Drop forever.
-    /// The Windows `Raw` arm handles its own higher-integrity runas case via its flag.
+    /// The Windows `Raw` arm leaves a handle without `PROCESS_TERMINATE` (a higher-integrity runas
+    /// child) running.
     ///
     /// Returns the child's fate, and what it could not do for the caller's one warn: a child it
     /// could not signal and left running, or a reap that failed after the kill. It logs neither
-    /// above `debug`. (The Windows `Raw` arm still logs its own refusal.)
+    /// above `debug`.
     pub(crate) fn teardown_on_drop(&self, id: crate::identity::ProcessId) -> Torn {
         use crate::error::ChildFate;
         #[cfg(all(test, unix))]

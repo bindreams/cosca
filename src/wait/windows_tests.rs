@@ -249,17 +249,34 @@ fn holds_process_of_an_unreadable_handle_carries_the_win32_code() {
     assert_eq!(io.raw_os_error(), Some(ERROR_INVALID_HANDLE.0 as i32), "{io:?}");
 }
 
-/// A `TerminateProcess` failure on a process that is not provably dead is `Io` with the plain
+/// A `TerminateProcess` failure that is not a refusal by an exiting process is `Io` with the plain
 /// Win32 code.
 ///
-/// Mutant: `terminate_held` converts with `.into()`, so the code is `0x80070006`.
+/// Mutant: `terminate_and_close` converts with `.into()`, so the code is `0x80070006`.
 #[skuld::test]
 fn terminate_held_failure_carries_the_win32_code() {
-    let err = super::terminate_held(event_handle(), ProcessId::current()).expect_err("an event cannot be terminated");
+    let err =
+        super::terminate_and_close(event_handle(), ProcessId::current()).expect_err("an event cannot be terminated");
     let crate::error::Error::Io(io) = err else {
         panic!("expected Io, got {err:?}");
     };
     assert_eq!(io.raw_os_error(), Some(ERROR_INVALID_HANDLE.0 as i32), "{io:?}");
+}
+
+/// `kill` of a process that is exiting but not yet signalled is `Ok`; the seam refuses and the
+/// process stays alive.
+///
+/// Mutant: a refusal is success only once the process reads signalled, so this one is `Err(Io)`.
+#[skuld::test]
+fn kill_of_a_process_that_is_exiting_but_not_signalled_is_ok() {
+    let (mut child, id) = spawn_never_exiting();
+    crate::identity::windows_fault::refuse_next_terminate_as_exiting();
+    let result = super::kill(id);
+    // The seam sent no terminate: end the fixture before asserting.
+    child.kill().expect("end the fixture");
+    child.wait().expect("reap the fixture");
+
+    result.expect("a refusal on an exiting process is not a failed kill");
 }
 
 /// A `CreateEventW` failure is `Io` with the plain Win32 code. The call cannot be made to fail, so

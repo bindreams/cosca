@@ -304,3 +304,64 @@ fn kill_by_identity_spares_a_stale_identity_and_kills_a_matching_one() {
         "a matching identity must terminate the process, not leave it to exit when released"
     );
 }
+
+/// A member that exits between `kill_by_identity`'s identity check and its `TerminateProcess`
+/// is gone, not a failed kill: Windows refuses `TerminateProcess` on an exited process with
+/// `ERROR_ACCESS_DENIED`. Mutant: the error arm warns and answers `NotAttempted` unconditionally.
+#[cfg(windows)]
+#[skuld::test]
+fn kill_by_identity_reports_a_member_that_exits_before_the_terminate_as_gone() {
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(kill_by_identity_reports_a_member_that_exits_before_the_terminate_as_gone),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
+    use windows::Win32::System::Threading::PROCESS_QUERY_LIMITED_INFORMATION;
+    let _watch = crate::log_capture::warn_watch();
+    let (child, _stdin) =
+        crate::identity::windows_fixture::spawn_restricted_releasable(&done, PROCESS_QUERY_LIMITED_INFORMATION.0);
+    let child = std::rc::Rc::new(child);
+    let id = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
+        .expect("the owned handle always yields an identity");
+    let exiter = std::rc::Rc::clone(&child);
+    super::fault::set_before_terminate(move || exiter.terminate());
+
+    assert_eq!(
+        super::kill_by_identity(id),
+        super::KillOutcome::AlreadyGone,
+        "a member that exited before the terminate has nothing left to kill"
+    );
+    assert!(!child.is_running(), "precondition: the hook ended the member");
+}
+
+/// A member whose exit is under way but not yet signalled is gone, not a failed kill, and
+/// `hard_kill` stays complete.
+///
+/// Mutant: a refusal is gone only once the process reads signalled, so this one warns and answers
+/// `NotAttempted`.
+#[cfg(windows)]
+#[skuld::test]
+fn kill_by_identity_reports_a_member_that_is_exiting_but_not_signalled_as_gone() {
+    use std::os::windows::io::AsRawHandle;
+    let mut child = crate::test_spawn::spawn(
+        std::process::Command::new("cmd")
+            .args(["/C", "more"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+    )
+    .expect("spawn cmd /C more");
+    let id = crate::identity::windows_identity_from_handle(
+        windows::Win32::Foundation::HANDLE(child.as_raw_handle()),
+        child.id(),
+    )
+    .expect("the owned handle always yields an identity");
+    crate::identity::windows_fault::refuse_next_terminate_as_exiting();
+    let outcome = super::kill_by_identity(id);
+    // The seam sent no terminate: end the fixture before asserting.
+    child.kill().expect("end the fixture");
+    child.wait().expect("reap the fixture");
+
+    assert_eq!(outcome, super::KillOutcome::AlreadyGone);
+}

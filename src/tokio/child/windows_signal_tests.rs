@@ -45,6 +45,44 @@ async fn a_kill_of_an_exited_unreaped_child_is_a_success() {
     );
 }
 
+/// An exited child's handle that holds `PROCESS_TERMINATE` but cannot be waited on: the refusal is
+/// the exit, so the kill is a success.
+///
+/// Mutant: `terminate_unreaped` reads a refusal by whether the handle can be waited on, so the
+/// missing `SYNCHRONIZE` makes it an `ACCESS_DENIED` error for a dead child.
+#[skuld::test]
+async fn a_kill_of_an_exited_child_through_an_unwaitable_handle_is_a_success() {
+    use super::proc_source::terminate_unreaped;
+    use windows::Win32::Foundation::{CloseHandle, DuplicateHandle, DUPLICATE_HANDLE_OPTIONS, HANDLE};
+    use windows::Win32::System::Threading::{
+        GetCurrentProcess, WaitForSingleObject, INFINITE, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    };
+
+    let child = exiting_child();
+    let handle = HANDLE(child.raw_handle().expect("tokio holds the handle"));
+    // SAFETY: tokio owns the live process handle; this only waits on it, without reaping.
+    unsafe { WaitForSingleObject(handle, INFINITE) };
+    let mut limited = HANDLE::default();
+    // SAFETY: duplicating the child's handle into this process; `limited` is a valid out-parameter.
+    unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            handle,
+            GetCurrentProcess(),
+            &mut limited,
+            (PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION).0,
+            false,
+            DUPLICATE_HANDLE_OPTIONS(0),
+        )
+    }
+    .expect("duplicate the child's handle without SYNCHRONIZE");
+    let result = terminate_unreaped(limited);
+    // SAFETY: `limited` is the owned duplicate made above.
+    unsafe { CloseHandle(limited) }.expect("close the duplicate");
+
+    assert_eq!(result.expect("a refusal on an exited child"), Sent::Delivered);
+}
+
 // Win32 codes of failures =====
 //
 // A bare `.into()` on a `windows::core::Error` keeps the HRESULT (`0x8007xxxx`) where std reports
@@ -69,9 +107,9 @@ fn a_terminate_failure_carries_its_win32_code() {
     assert_eq!(err.raw_os_error(), Some(ERROR_INVALID_HANDLE.0 as i32), "{err:?}");
 }
 
-/// A handle that denies both `TerminateProcess` and the wait on it is a real denial, not an exiting
-/// child: it is an error with `ERROR_ACCESS_DENIED` as its code and `PermissionDenied` as its kind,
-/// which `map_elevated_kill_error` turns into `Unkillable` for an elevated wrapper.
+/// A handle without `PROCESS_TERMINATE` that cannot be waited on either is a real denial: an error
+/// with `ERROR_ACCESS_DENIED` as its code and `PermissionDenied` as its kind, which
+/// `map_elevated_kill_error` turns into `Unkillable` for an elevated wrapper.
 ///
 /// Mutant: the `ACCESS_DENIED` arm of `terminate_unreaped` converts with `.into()`, so the code is
 /// `0x80070005` and the kind is not `PermissionDenied`.

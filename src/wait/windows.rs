@@ -7,12 +7,12 @@ use std::time::Instant;
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{
-    CreateEventW, SetEvent, TerminateProcess, WaitForMultipleObjects, WaitForSingleObject,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    CreateEventW, SetEvent, WaitForMultipleObjects, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
 };
 
 use crate::error::{win32_io_error, Error};
-use crate::identity::{HandleIdentity, Liveness, Opened, ProcessId};
+use crate::identity::{windows_terminate_held, HandleIdentity, Liveness, Opened, ProcessId, Termination};
 
 fn close(handle: HANDLE) {
     // Match identity/windows.rs: a failed CloseHandle of an owned handle is a contract
@@ -289,29 +289,17 @@ pub(crate) fn kill(id: ProcessId) -> Result<(), Error> {
     if !holds_process(handle, id)? {
         return Ok(()); // pid recycled; the original is already gone
     }
-    terminate_held(handle, id)
+    terminate_and_close(handle, id)
 }
 
-/// `TerminateProcess` on `handle`, which pins `id`'s process, then closes `handle`. A refusal on
-/// a provably dead process is success.
-fn terminate_held(handle: HANDLE, id: ProcessId) -> Result<(), Error> {
-    // SAFETY: handle is live; close on every path.
-    let res = unsafe { TerminateProcess(handle, 1) };
-    // Re-check BEFORE close: the held handle pins the kernel object, so the by-pid resolve
-    // inside `is_alive` cannot land on a recycled pid. After `close` it could. Windows denies
-    // TerminateProcess on an already-exited process, so this arm is reached routinely on a
-    // successful shutdown, and `is_alive` reads the SIGNALED STATE - unambiguous, unlike
-    // GetExitCodeProcess, which cannot tell a live process from one that exited with 259.
-    let verdict = res.is_err().then(|| id.is_alive());
+/// Terminates `id`'s process through `handle`, which pins it, then closes `handle`.
+fn terminate_and_close(handle: HANDLE, id: ProcessId) -> Result<(), Error> {
+    let outcome = windows_terminate_held(handle);
     close(handle);
-    match res {
-        Ok(()) => Ok(()),
-        Err(_) if verdict == Some(Liveness::Dead) => Ok(()),
-        Err(e) => {
-            log::warn!(
-                "wait: TerminateProcess(pid {}) failed and the target is not provably dead ({e})",
-                id.pid()
-            );
+    match outcome {
+        Termination::Terminated | Termination::Exited => Ok(()),
+        Termination::Failed(e) => {
+            log::warn!("wait: TerminateProcess(pid {}) failed ({e})", id.pid());
             Err(Error::Io(win32_io_error(e)))
         }
     }

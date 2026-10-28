@@ -1803,27 +1803,15 @@ fn wait_reapable(pid: u32, identity: u64, level: log::Level) -> (Waited, Option<
     }
 }
 
-/// Windows: hard-kill the not-yet-reaped child whose live process handle is `h`. A failure keeps
-/// its Win32 code, so a denial classifies as `PermissionDenied`.
+/// Windows: hard-kill the not-yet-reaped child whose live process handle is `h`, through
+/// [`windows_terminate_held`](crate::identity::windows_terminate_held). Never blocks.
 #[cfg(windows)]
 pub(super) fn terminate_unreaped(h: windows::Win32::Foundation::HANDLE) -> Result<Sent, Error> {
-    use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, WAIT_FAILED};
-    use windows::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
-    // SAFETY: `h` is a live process handle the caller owns; exit code 1 is the forced-kill code
-    // std's `Child::kill` uses.
-    match unsafe { TerminateProcess(h, 1) } {
-        Ok(()) => Ok(Sent::Delivered),
-        // As std's `Child::kill`: a process that is already exiting answers `ACCESS_DENIED`, which
-        // is success, unless the handle cannot even be waited on.
-        Err(e) if e.code() == windows::core::HRESULT::from_win32(ERROR_ACCESS_DENIED.0) => {
-            // SAFETY: as above; a zero-timeout wait only reads the handle's state.
-            if unsafe { WaitForSingleObject(h, 0) } == WAIT_FAILED {
-                Err(Error::Io(crate::error::win32_io_error(e)))
-            } else {
-                Ok(Sent::Delivered)
-            }
-        }
-        Err(e) => Err(Error::Io(crate::error::win32_io_error(e))),
+    use crate::identity::{windows_terminate_held, Termination};
+    // `h` is a live process handle the caller owns.
+    match windows_terminate_held(h) {
+        Termination::Terminated | Termination::Exited => Ok(Sent::Delivered),
+        Termination::Failed(e) => Err(Error::Io(crate::error::win32_io_error(e))),
     }
 }
 

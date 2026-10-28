@@ -219,7 +219,7 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{RPC_E_CHANGED_MODE, S_FALSE, S_OK};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};
-use windows::Win32::System::Threading::{GetProcessId, TerminateProcess};
+use windows::Win32::System::Threading::GetProcessId;
 use windows::Win32::UI::Shell::{
     ShellExecuteExW, SEE_MASK_CLASSNAME, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
 };
@@ -235,6 +235,7 @@ use crate::elevation::{ElevatedStdio, ElevatedVia, ElevationReport, Privilege};
 use crate::error::ChildFate;
 use crate::error::ElevationErrorKind;
 use crate::identity::ProcessId;
+use crate::identity::{windows_terminate_held, Termination};
 
 /// The failure of `ShellExecuteExW(runas)` with error `code` and `hInstApp` `inst_app`: see
 /// [`super::runas_failure::classify`]. A launch that may have happened left no process handle, so
@@ -475,6 +476,39 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
     })))
 }
 
+/// The detail and fate of a launched child that could not be tracked, after its termination came
+/// back as `outcome`. `pid` is what `GetProcessId` returned: its error when the pid could not be
+/// read, else the pid whose identity could not be resolved. Never waits.
+fn untracked_outcome(pid: Result<u32, windows::core::Error>, outcome: Termination) -> (String, ChildFate) {
+    let (who, why) = match &pid {
+        Ok(pid) => (
+            format!("the elevated child (pid {pid})"),
+            "its identity could not be resolved".to_string(),
+        ),
+        Err(e) => (
+            "the elevated child".to_string(),
+            format!("its pid could not be read (GetProcessId: {e})"),
+        ),
+    };
+    match outcome {
+        Termination::Terminated => (
+            format!("the elevated child launched but {why}; it was terminated"),
+            ChildFate::Killed,
+        ),
+        Termination::Exited => (
+            format!("the elevated child launched but {why}; it exited or is exiting, and its exit was not waited for"),
+            // `Killed` is "dead or dying, exit not collected": it claims no completion. Waiting here
+            // would block, and this launch runs inside the async spawn too.
+            ChildFate::Killed,
+        ),
+        Termination::Failed(e) => (
+            format!("{who} launched but {why} and could not be terminated ({e}); it may still be running"),
+            // Its identity is what could not be resolved.
+            ChildFate::Running { id: None },
+        ),
+    }
+}
+
 /// The effect: `ShellExecuteEx(runas)` on an already-validated payload, plus the identity read of
 /// the child it launched. Everything that could refuse the request happened in [`plan_runas`].
 ///
@@ -528,29 +562,18 @@ pub(crate) fn launch_runas_with_host(cmd: &Command, host: &Host) -> Result<Runas
     // Identity from the OWNED handle — no second OpenProcess.
     let handle = HANDLE(proc.as_raw_handle());
     // SAFETY: `handle` is our live, owned process handle.
-    let pid = unsafe { GetProcessId(handle) };
-    let id = if pid != 0 {
-        crate::identity::windows_identity_from_handle(handle, pid)
-    } else {
-        None
+    let pid = match unsafe { GetProcessId(handle) } {
+        0 => Err(windows::core::Error::from_thread()),
+        pid => Ok(pid),
     };
-    let Some(id) = id else {
+    let tracked = pid
+        .as_ref()
+        .ok()
+        .and_then(|&pid| crate::identity::windows_identity_from_handle(handle, pid).map(|id| (pid, id)));
+    let Some((pid, id)) = tracked else {
         // Auth SUCCEEDED but we cannot track the child. Terminate it, and report the
         // ACTUAL outcome (terminated vs still-running) in the detail — the kind stays neutral.
-        // SAFETY: `handle` is live; terminating our own launched child.
-        let terminated = unsafe { TerminateProcess(handle, 1) }.is_ok();
-        let (detail, fate) = if terminated {
-            (
-                "the elevated child launched but its identity could not be resolved; it was terminated".into(),
-                ChildFate::Killed,
-            )
-        } else {
-            (
-                format!("the elevated child (pid {pid}) launched but its identity could not be resolved and could not be terminated; it may still be running"),
-                // Its identity is what could not be resolved.
-                ChildFate::Running { id: None },
-            )
-        };
+        let (detail, fate) = untracked_outcome(pid, windows_terminate_held(handle));
         return Err(SpawnFailure::started(
             Error::Elevation {
                 kind: ElevationErrorKind::Untracked,
@@ -578,10 +601,8 @@ pub(crate) fn spawn_elevated(cmd: &mut Command, kill_on_drop: bool) -> Result<cr
             Ok(child)
         }
         RunasOutcome::Launched { proc, pid, id, report } => {
-            // A dedicated non-blocking-kill handle (RawChild::new_runas): a higher-integrity
-            // child a medium parent cannot terminate never hangs Drop.
             let mut child = crate::child::Child::from_parts(
-                ProcHandle::Raw(RawChild::new_runas(proc, pid)),
+                ProcHandle::Raw(RawChild::new(proc, pid)),
                 id,
                 BTreeMap::new(),
                 kill_on_drop,

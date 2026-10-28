@@ -33,19 +33,10 @@ impl Drop for KillOnDrop {
 /// A `CREATE_SUSPENDED` process: its thread never runs, so it never exits on its own. Held in
 /// `KillOnDrop` so a panic mid-test still kills and reaps it.
 fn spawn_suspended() -> KillOnDrop {
-    spawn_suspended_as(RawChild::new)
+    KillOnDrop(suspended_raw())
 }
 
-/// [`spawn_suspended`] as a non-elevated runas child, so `RawChild`'s runas arms run.
-fn spawn_suspended_runas() -> KillOnDrop {
-    spawn_suspended_as(RawChild::new_runas)
-}
-
-fn spawn_suspended_as(wrap: fn(std::os::windows::io::OwnedHandle, u32) -> RawChild) -> KillOnDrop {
-    KillOnDrop(suspended_raw(wrap))
-}
-
-fn suspended_raw(wrap: fn(std::os::windows::io::OwnedHandle, u32) -> RawChild) -> RawChild {
+fn suspended_raw() -> RawChild {
     let mut cmdline: Vec<u16> = "cmd /C exit 0\0".encode_utf16().collect();
     let mut si = STARTUPINFOEXW::default();
     let (proc, pid) = create_process(
@@ -57,12 +48,12 @@ fn suspended_raw(wrap: fn(std::os::windows::io::OwnedHandle, u32) -> RawChild) -
         EXTENDED_STARTUPINFO_PRESENT.0 | CREATE_SUSPENDED.0,
     )
     .expect("spawn suspended");
-    wrap(proc, pid)
+    RawChild::new(proc, pid)
 }
 
-/// A runas `RawChild` over a second handle to `owner`'s process that lacks `PROCESS_TERMINATE`,
-/// so its `TerminateProcess` is denied. `owner` stays the only handle that can end it.
-fn runas_without_terminate_right(owner: &KillOnDrop) -> RawChild {
+/// A `RawChild` over a second handle to `owner`'s process that lacks `PROCESS_TERMINATE`, so its
+/// `TerminateProcess` is denied. `owner` stays the only handle that can end it.
+fn without_terminate_right(owner: &KillOnDrop) -> RawChild {
     use std::os::windows::io::{FromRawHandle, OwnedHandle};
     // SAFETY: plain OpenProcess on the live pid `owner` pins.
     let h = unsafe {
@@ -74,7 +65,7 @@ fn runas_without_terminate_right(owner: &KillOnDrop) -> RawChild {
     }
     .expect("open without PROCESS_TERMINATE");
     // SAFETY: `h` is a fresh owned handle from OpenProcess.
-    RawChild::new_runas(unsafe { OwnedHandle::from_raw_handle(h.0) }, owner.id())
+    RawChild::new(unsafe { OwnedHandle::from_raw_handle(h.0) }, owner.id())
 }
 
 /// End `handle` with exit code 0, which only a process no earlier `TerminateProcess` has claimed
@@ -127,7 +118,7 @@ fn raw_is_reaped_only_once_its_own_wait_returns() {
 #[skuld::test]
 fn proc_handle_raw_is_reaped_only_once_its_own_wait_returns() {
     use crate::child::proc_handle::ProcHandle;
-    let handle = ProcHandle::Raw(suspended_raw(RawChild::new));
+    let handle = ProcHandle::Raw(suspended_raw());
     assert!(!handle.is_reaped());
     handle.kill().expect("kill");
     let raw = match &handle {
@@ -144,13 +135,11 @@ fn proc_handle_raw_is_reaped_only_once_its_own_wait_returns() {
 
 /// Mutants: `TerminateProcess` in `kill` a no-op reporting `Ok` or `ERROR_ACCESS_DENIED`.
 #[skuld::test]
-fn runas_kill_of_a_killable_child_returns_and_reaps() {
-    let child = spawn_suspended_runas();
+fn kill_of_a_killable_child_returns_and_reaps() {
+    let child = spawn_suspended();
     // Keeps a no-op `kill` from hanging its denied-arm wait; see `end_with_code_zero`.
     let _observer = end_on_wait(&child);
-    child
-        .kill()
-        .expect("kill of our own (non-elevated) runas-flagged child must succeed");
+    child.kill().expect("kill of our own child must succeed");
     // Keeps a no-op `kill` that reported `Ok` from hanging the wait below.
     end_with_code_zero(child.handle());
     // `TerminateProcess` is asynchronous — it initiates termination and returns before the
@@ -168,8 +157,8 @@ fn identity_of(child: &RawChild) -> crate::identity::ProcessId {
 /// Mutants: `TerminateProcess` in `teardown_on_drop` a no-op reporting `Ok` or
 /// `ERROR_ACCESS_DENIED`; the wait after an accepted terminate dropped.
 #[skuld::test]
-fn runas_teardown_on_drop_returns_promptly() {
-    let child = spawn_suspended_runas();
+fn teardown_on_drop_returns_promptly() {
+    let child = spawn_suspended();
     // Keeps a no-op terminate from hanging teardown's wait; see `end_with_code_zero`.
     let observer = end_on_wait(&child);
     child.teardown_on_drop(identity_of(&child));
@@ -182,52 +171,19 @@ fn runas_teardown_on_drop_returns_promptly() {
     );
 }
 
-/// The runas `ERROR_ACCESS_DENIED` arm with a child we CAN terminate (`can_terminate` is true):
-/// the denial means exit is underway, so teardown reaps.
-///
-/// Mutant: drop `&& !self.can_terminate()`, so a terminable runas child is left running.
-#[skuld::test]
-fn runas_teardown_on_drop_reaps_when_terminate_is_denied_but_permitted() {
-    let owner = spawn_suspended();
-    let denied = runas_without_terminate_right(&owner);
-    let observer = end_on_wait(&owner);
-    denied.teardown_on_drop(identity_of(&denied));
-    assert_eq!(observer.waits(), 1, "a terminable runas child's denial must be reaped");
-    let status = denied.wait().expect("wait after teardown");
-    assert_eq!(
-        status.code(),
-        Some(0),
-        "only the observer's terminate ended it: {status:?}"
-    );
-}
-
-/// As above, for `kill`.
-///
-/// Mutant: drop `&& !self.can_terminate()` in `kill`, so it returns `ERROR_ACCESS_DENIED`.
-#[skuld::test]
-fn runas_kill_reaps_when_terminate_is_denied_but_permitted() {
-    let owner = spawn_suspended();
-    let denied = runas_without_terminate_right(&owner);
-    let observer = end_on_wait(&owner);
-    denied
-        .kill()
-        .expect("a denial on a terminable runas child means exit is underway");
-    assert_eq!(observer.waits(), 1, "kill must reap that exit");
-}
-
-/// The runas `ERROR_ACCESS_DENIED` arm with a child we cannot terminate: never block.
+/// A handle without `PROCESS_TERMINATE` to a live child (a higher-integrity runas child): teardown
+/// never blocks.
 ///
 /// What it could not do comes back for the caller's one warn, and it logs nothing itself.
 ///
-/// Mutants: reap in the `runas && !can_terminate()` arm of `teardown_on_drop`; the arm logs its own
-/// warn instead of returning it.
+/// Mutants: reap in the `Failed` arm of `teardown_on_drop`; the arm logs its own warn instead of
+/// returning it; a refusal on a handle without the right reads as the exit.
 #[skuld::test]
-fn runas_teardown_on_drop_never_blocks_on_an_unterminable_child() {
+fn teardown_on_drop_never_blocks_on_a_handle_without_terminate() {
     crate::log_capture::install();
     let owner = spawn_suspended();
-    let denied = runas_without_terminate_right(&owner);
+    let denied = without_terminate_right(&owner);
     let observer = end_on_wait(&owner);
-    observer.force_unterminable();
     let mark = crate::log_capture::mark();
     let torn = denied.teardown_on_drop(identity_of(&denied));
     assert!(
@@ -251,18 +207,84 @@ fn runas_teardown_on_drop_never_blocks_on_an_unterminable_child() {
 
 /// As above, for `kill`: surfaces the denial.
 ///
-/// Mutant: reap in the `runas && !can_terminate()` arm of `kill`.
+/// Mutants: reap in the `Failed` arm of `kill`; a refusal on a handle without the right reads as
+/// the exit.
 #[skuld::test]
-fn runas_kill_of_an_unterminable_child_surfaces_the_denial_without_blocking() {
+fn kill_of_a_handle_without_terminate_surfaces_the_denial_without_blocking() {
     let owner = spawn_suspended();
-    let denied = runas_without_terminate_right(&owner);
+    let denied = without_terminate_right(&owner);
     let observer = end_on_wait(&owner);
-    observer.force_unterminable();
     let err = denied
         .kill()
-        .expect_err("an unterminable runas child must not report success");
+        .expect_err("a handle without PROCESS_TERMINATE must not report success");
     assert_eq!(err.raw_os_error(), Some(ERROR_ACCESS_DENIED.0 as i32), "{err:?}");
     assert_eq!(observer.waits(), 0, "kill blocked on a child it cannot terminate");
+}
+
+/// A handle without `PROCESS_TERMINATE` to a child that has exited: its signalled state is the
+/// exit, so `kill` reaps it and succeeds.
+///
+/// Mutant: `kill` reads the refusal by the handle's rights alone, so a dead child is
+/// `ERROR_ACCESS_DENIED`.
+#[skuld::test]
+fn kill_of_a_handle_without_terminate_to_an_exited_child_reaps_and_succeeds() {
+    let owner = spawn_suspended();
+    let child = without_terminate_right(&owner);
+    let observer = super::fault::observe_waits(|| {});
+    end_with_code_zero(owner.handle());
+    wait_for_exit_unrecorded(child.handle());
+    child.kill().expect("a signalled process is the exit, not a denial");
+    assert_eq!(observer.waits(), 1, "kill must reap the exit it found");
+    assert!(child.is_reaped());
+}
+
+/// As above, for `teardown_on_drop`: the child is `Reaped` and nothing is left running.
+///
+/// Mutant: `teardown_on_drop` reads the refusal by the handle's rights alone, so it leaves a dead
+/// child as `Running` with a "higher integrity" warning.
+#[skuld::test]
+fn teardown_of_a_handle_without_terminate_to_an_exited_child_reaps_it() {
+    use crate::error::ChildFate;
+    let owner = spawn_suspended();
+    let child = without_terminate_right(&owner);
+    let observer = super::fault::observe_waits(|| {});
+    end_with_code_zero(owner.handle());
+    wait_for_exit_unrecorded(child.handle());
+    let torn = child.teardown_on_drop(identity_of(&child));
+    assert_eq!(torn.fate, ChildFate::Reaped, "{torn:?}");
+    assert!(torn.left.is_none(), "{torn:?}");
+    assert_eq!(observer.waits(), 1);
+}
+
+/// A child whose exit is under way but not signalled yet, on a handle that holds
+/// `PROCESS_TERMINATE`: `kill` reaps it and succeeds. The seam refuses a child that stays alive;
+/// the wait observer ends it.
+///
+/// Mutant: a refusal is the exit only for a signalled process, so `kill` is `ERROR_ACCESS_DENIED`.
+#[skuld::test]
+fn kill_of_an_exiting_unsignalled_child_reaps_and_succeeds() {
+    let child = spawn_suspended();
+    let observer = end_on_wait(&child);
+    crate::identity::windows_fault::refuse_next_terminate_as_exiting();
+    child
+        .kill()
+        .expect("a refusal on a handle holding the right is the exit");
+    assert_eq!(observer.waits(), 1, "kill must reap the exit it found");
+}
+
+/// As above, for `teardown_on_drop`.
+///
+/// Mutant: a refusal is the exit only for a signalled process, so the child is left `Running`.
+#[skuld::test]
+fn teardown_of_an_exiting_unsignalled_child_reaps_it() {
+    use crate::error::ChildFate;
+    let child = spawn_suspended();
+    let observer = end_on_wait(&child);
+    crate::identity::windows_fault::refuse_next_terminate_as_exiting();
+    let torn = child.teardown_on_drop(identity_of(&child));
+    assert_eq!(torn.fate, ChildFate::Reaped, "{torn:?}");
+    assert!(torn.left.is_none(), "{torn:?}");
+    assert_eq!(observer.waits(), 1);
 }
 
 /// A failed `GetExitCodeProcess` reports the plain Win32 code. A null handle is a real
