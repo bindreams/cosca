@@ -413,9 +413,12 @@ fn host_filesystem_same_file_needs_no_read_access(#[fixture(non_root)] _non_root
 /// The comparison that macOS and the other non-Linux Unixes use, which runs on every Unix here so
 /// that Linux CI covers it: it opens nothing, so an unreadable file and a FIFO are `Ok`.
 ///
+/// The `same_file_by_stat_*` tests that read a real birth time need the temp directory's
+/// filesystem to report one (`statx`, as CI's does); on one that does not they fail with
+/// `Unsupported`.
+///
 /// Mutants: `same_file_by_stat` opening the paths for reading (`EACCES`, or a FIFO's wait for a
-/// writer, which the `slow-timeout` override in `.config/nextest.toml` bounds); answering `false`
-/// for one file.
+/// writer); answering `false` for one file.
 #[cfg(unix)]
 #[skuld::test]
 fn same_file_by_stat_opens_nothing(#[fixture(non_root)] _non_root: &()) {
@@ -476,6 +479,33 @@ fn same_file_by_stat_ignores_ctime_changes() {
         same.unwrap(),
         "the file's ctime changed between the two stats, and it is one file"
     );
+}
+
+/// A volume that reports no birth time makes `same_file_by_stat` an `Unsupported` error naming the
+/// path, for one file and for two: the comparison is never weakened to `(st_dev, st_ino)`.
+///
+/// Mutant: a missing birth time read as a fixed time (`unwrap_or(UNIX_EPOCH)`) or dropped from the
+/// comparison, which answers `Ok(true)` for one file.
+#[cfg(unix)]
+#[skuld::test]
+fn same_file_by_stat_without_a_birth_time_is_unsupported() {
+    use super::identity::same_file_by_stat_using;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+    std::fs::write(&a, b"").unwrap();
+    std::fs::hard_link(&a, &b).unwrap();
+    let no_birth_time = |_: &std::fs::Metadata| Err(io::ErrorKind::Unsupported.into());
+
+    for (x, y) in [(&a, &a), (&a, &b)] {
+        let err = same_file_by_stat_using(x, y, || {}, no_birth_time)
+            .expect_err("one file by (st_dev, st_ino) alone is not an answer");
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        assert!(
+            err.to_string().contains(&x.display().to_string()),
+            "the error names the path: {err}"
+        );
+    }
 }
 
 /// `same_file` holds both files while it compares them: once each is open, no change to the paths

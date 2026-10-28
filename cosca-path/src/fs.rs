@@ -86,8 +86,14 @@ impl<'a, F: Filesystem + ?Sized> BoundPath<'a, F> {
         self.fs.canonical(self.path)
     }
 
-    /// [`Filesystem::same_file`] on the bound path and `other`'s path, asked of this path's filesystem.
+    /// [`Filesystem::same_file`] on the bound path and `other`'s path, asked of this path's
+    /// filesystem: `other` must be bound to the same one. A filesystem with no state (a zero-sized
+    /// one, such as [`HostFilesystem`]) has no identity to compare, so it is not checked.
     pub fn same_file(&self, other: &BoundPath<'_, F>) -> io::Result<bool> {
+        debug_assert!(
+            std::mem::size_of_val(self.fs) == 0 || std::ptr::addr_eq(self.fs, other.fs),
+            "BoundPath::same_file: the two paths are bound to different filesystems"
+        );
         self.fs.same_file(self.path, other.path)
     }
 }

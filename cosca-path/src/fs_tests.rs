@@ -39,6 +39,25 @@ fn a_bound_path_asks_its_filesystem() {
     assert!(BoundPath::new(dynamic, file).is_file().unwrap());
 }
 
+/// `BoundPath::same_file` asks `self`'s filesystem about both paths, so a bound path of another
+/// filesystem is a contract breach, caught in debug builds. Two bounds of one filesystem are fine.
+///
+/// Mutant: no assertion, so the other filesystem's bound path is silently asked of this one.
+#[cfg(debug_assertions)]
+#[skuld::test]
+fn same_file_of_another_filesystem_is_a_contract_breach() {
+    let file = posix::Path::new("/d/f");
+    let (one, other) = (
+        posix::FakeFilesystem::new().with_file(file),
+        posix::FakeFilesystem::new().with_file(file),
+    );
+    let (a, b) = (BoundPath::new(&one, file), BoundPath::new(&other, file));
+    assert!(a.same_file(&a).unwrap(), "the control: one filesystem");
+
+    let breach = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| a.same_file(&b)));
+    assert!(breach.is_err(), "a bound path of another filesystem was accepted");
+}
+
 /// `BoundPath` is `Clone`, `Copy` and `Debug` whatever its filesystem is, a `dyn Filesystem`
 /// included, and `Debug` prints the path.
 ///

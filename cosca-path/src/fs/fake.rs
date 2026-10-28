@@ -19,7 +19,7 @@ use crate::PurePath;
 /// [`NotFound`](io::ErrorKind::NotFound) from `canonical` and `same_file`. A later statement about
 /// a path replaces an earlier one.
 ///
-/// [`canonical`](Filesystem::canonical) of a stated path is the path as the test wrote it, or what
+/// [`canonical`](Filesystem::canonical) of a stated path is the path asked, or what
 /// [`with_canonical`](Self::with_canonical) gives it. [`same_file`](Filesystem::same_file) is
 /// whether the two canonical forms are equal.
 pub struct FakeFilesystem<P: PurePath + ?Sized> {

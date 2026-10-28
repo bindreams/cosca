@@ -39,14 +39,17 @@ use crate::windows::{Path, PathBuf};
 /// - **Linux and Android:** both files are opened with `O_PATH` and `(st_dev, st_ino)` is read from
 ///   the open files, so no change to either path while it runs can change the answer. A FIFO is not
 ///   opened.
-/// - **macOS and every other Unix:** there is no such open (`O_EVTONLY` and `O_SYMLINK` still
-///   authorize reading the data), so each path is `stat`ed in turn, nothing is opened, and
+/// - **macOS and every other Unix:** there is no open that is known to need no read access
+///   (`O_PATH` is Linux's), so each path is `stat`ed in turn, nothing is opened, and
 ///   `(st_dev, st_ino, birth time)` must agree. Comparing `(st_dev, st_ino)` alone would let a
 ///   delete and recreate that reuses an inode number make two different files equal; a replacement
 ///   is created later, so its birth time differs. A write, `chmod` or new hard link between the two
 ///   `stat`s does not change the birth time (`ctime` would change), so the same file is still one
 ///   file. A volume that reports no birth time is an [`Unsupported`](io::ErrorKind::Unsupported)
 ///   error naming the path: the comparison is never weakened to `(st_dev, st_ino)` or `ctime`.
+///
+///   Only the operations named above are known to leave the birth time alone. If another moves it
+///   between the two `stat`s, one file answers `false`.
 ///
 ///   The gap that remains: a delete and recreate within one birth-time tick on a volume that
 ///   reuses inode numbers, such as FAT and exFAT (10 ms creation times) and SMB or NFS (the server
@@ -72,6 +75,9 @@ fn is_absence(e: &io::Error) -> bool {
     #[cfg(windows)]
     {
         // FILE_NOT_FOUND, PATH_NOT_FOUND, INVALID_NAME, BAD_PATHNAME, DIRECTORY.
+        // Intentionally not `cosca`'s list (`resolve::is_absence`), which also holds 15
+        // (ERROR_INVALID_DRIVE): no call through here was measured to return it, so it is not
+        // claimed as absence. Merging the two lists is for when `cosca` adopts this crate.
         matches!(code, 2 | 3 | 123 | 161 | 267)
     }
     #[cfg(unix)]
@@ -207,11 +213,23 @@ mod identity {
         b: impl AsRef<Path>,
         between: impl FnOnce(),
     ) -> io::Result<bool> {
+        same_file_by_stat_using(a, b, between, |m| m.created())
+    }
+
+    /// [`same_file_by_stat_with`] with the birth-time read given, so a test can make a volume
+    /// report none.
+    #[cfg(all(unix, any(test, not(any(target_os = "linux", target_os = "android")))))]
+    pub(super) fn same_file_by_stat_using(
+        a: impl AsRef<Path>,
+        b: impl AsRef<Path>,
+        between: impl FnOnce(),
+        created: impl Fn(&std::fs::Metadata) -> io::Result<std::time::SystemTime>,
+    ) -> io::Result<bool> {
         use std::os::unix::fs::MetadataExt;
 
         let stamp = |p: &Path| -> io::Result<_> {
             let m = std::fs::metadata(p)?;
-            let born = m.created().map_err(|e| {
+            let born = created(&m).map_err(|e| {
                 // A volume with no birth time is an error, not a weaker comparison.
                 if e.kind() == io::ErrorKind::Unsupported {
                     io::Error::new(
