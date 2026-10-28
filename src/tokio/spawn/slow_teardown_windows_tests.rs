@@ -1,7 +1,8 @@
 //! Windows: a failed async spawn's teardown warns once when its wait for the process it terminated
 //! passes its threshold, and keeps waiting until the process is gone (principle 2). No test can make
 //! `TerminateProcess` slow, so the seam `fault::set_late_exit` makes the one check of the exit find it
-//! late; the wait after it is real and ends at once.
+//! late; the wait after it is real and ends at once. The unoverridden look is tested against real
+//! handles in `windows_teardown_tests` and `proc_tests`.
 //!
 //! The process ends only by `TerminateProcess`, or by its stdin closing. The teardown's thread drops
 //! the stdin writer once the kill returned (`teardown_blocker_parts`), so a kill that sent nothing
@@ -56,7 +57,7 @@ fn teardown_with_a_late_exit(mut cmd: crate::tokio::Command, force: fn(bool)) ->
 ///
 /// Mutant: `reap_now` waits for the process handle with no warn.
 #[skuld::test]
-async fn windows_a_teardown_after_a_failed_attach_warns_once_past_its_threshold() {
+async fn a_teardown_after_a_failed_attach_warns_once_past_its_threshold() {
     let (cmd, guard) = blocker_command(false);
     let (fate, warns) = teardown_with_a_late_exit(cmd, fault::set_force_attach_failure);
     assert_eq!(warns.len(), 1, "one warn, and the wait goes on: {warns:?}");
@@ -68,7 +69,7 @@ async fn windows_a_teardown_after_a_failed_attach_warns_once_past_its_threshold(
 ///
 /// Mutants: the raw teardown waits with no warn; the async raw spawn hands it no threshold.
 #[skuld::test]
-async fn windows_a_raw_teardown_after_a_failed_attach_warns_once_past_its_threshold() {
+async fn a_raw_teardown_after_a_failed_attach_warns_once_past_its_threshold() {
     let (cmd, guard) = blocker_command(true);
     let (fate, warns) = teardown_with_a_late_exit(cmd, fault::set_force_attach_failure);
     assert_eq!(warns.len(), 1, "one warn, and the wait goes on: {warns:?}");
@@ -80,7 +81,7 @@ async fn windows_a_raw_teardown_after_a_failed_attach_warns_once_past_its_thresh
 ///
 /// Mutant: the async raw spawn hands the identity-failure teardown no threshold.
 #[skuld::test]
-async fn windows_a_raw_teardown_after_a_failed_identity_read_warns_once_past_its_threshold() {
+async fn a_raw_teardown_after_a_failed_identity_read_warns_once_past_its_threshold() {
     let (cmd, guard) = blocker_command(true);
     let (fate, warns) = teardown_with_a_late_exit(cmd, fault::set_force_identity_vanished);
     assert_eq!(warns.len(), 1, "one warn, and the wait goes on: {warns:?}");
@@ -88,22 +89,27 @@ async fn windows_a_raw_teardown_after_a_failed_identity_read_warns_once_past_its
     guard.assert_killed();
 }
 
+/// A running blocker and a handle to it.
+fn running_blocker() -> std::process::Child {
+    let mut cmd = std::process::Command::new(crate::test_child::BLOCKER_ARGV[0]);
+    cmd.args(&crate::test_child::BLOCKER_ARGV[1..])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null());
+    crate::test_spawn::spawn(&mut cmd).expect("spawn the blocker")
+}
+
 /// The check itself: a process that has not exited by its deadline is found running, one that has
 /// is found exited.
 ///
 /// Mutants: the check answers "running" whatever the handle says; it answers "exited".
 #[skuld::test]
-fn windows_the_check_finds_a_running_process_running_and_an_exited_one_exited() {
+fn the_check_finds_a_running_process_running_and_an_exited_one_exited() {
     use std::os::windows::io::AsRawHandle as _;
 
     use crate::wait::teardown_warn::handle_signaled_by;
     use windows::Win32::Foundation::HANDLE;
 
-    let mut cmd = std::process::Command::new(crate::test_child::BLOCKER_ARGV[0]);
-    cmd.args(&crate::test_child::BLOCKER_ARGV[1..])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null());
-    let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn the blocker");
+    let mut child = running_blocker();
     let handle = HANDLE(child.as_raw_handle());
 
     assert!(
@@ -117,4 +123,54 @@ fn windows_the_check_finds_a_running_process_running_and_an_exited_one_exited() 
         handle_signaled_by(handle, crate::wait::now()),
         "an exited process is found exited"
     );
+}
+
+/// A process still running when a deadline ahead of now passes is found running. Only the answer is
+/// asserted, never how long the check took.
+///
+/// Mutant: the check answers "exited" once its deadline has passed.
+#[skuld::test]
+fn the_check_finds_a_running_process_running_when_its_deadline_elapses() {
+    use std::os::windows::io::AsRawHandle as _;
+
+    use crate::wait::teardown_warn::handle_signaled_by;
+    use windows::Win32::Foundation::HANDLE;
+
+    let mut child = running_blocker();
+    let found = handle_signaled_by(
+        HANDLE(child.as_raw_handle()),
+        crate::wait::now() + std::time::Duration::from_millis(50),
+    );
+    child.kill().expect("terminate the blocker");
+    child.wait().expect("reap the blocker");
+    assert!(!found, "a running process is found running at its deadline");
+}
+
+/// A handle that cannot be waited on (it lacks `SYNCHRONIZE`) is left to the wait that follows: the
+/// check answers "exited" and logs why.
+///
+/// Mutants: a failed look answers "running", which warns for a child it knows nothing about; it logs
+/// nothing.
+#[skuld::test]
+fn the_check_leaves_a_handle_it_cannot_wait_on_to_the_wait() {
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
+
+    use crate::wait::teardown_warn::handle_signaled_by;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    // SAFETY: plain OpenProcess on our own pid.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, std::process::id()) }
+        .expect("open ourselves without SYNCHRONIZE");
+    // SAFETY: a fresh owned handle from OpenProcess.
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle.0) };
+
+    assert!(
+        handle_signaled_by(HANDLE(handle.as_raw_handle()), crate::wait::now()),
+        "a look that failed is left to the wait"
+    );
+    let logged = crate::log_capture::records_since_on_current_thread(mark, "a look at a killed child's exit failed");
+    assert_eq!(logged.len(), 1, "{logged:?}");
 }
