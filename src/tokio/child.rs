@@ -21,11 +21,15 @@ use std::process::ExitStatus;
 
 #[cfg(unix)]
 use crate::child::ParentEnd;
+#[cfg(target_os = "linux")]
+use crate::containment::cgroup::Waiting;
 use crate::containment::{Attached, Containment};
 use crate::error::Error;
 use crate::identity::ProcessId;
 use crate::signal::{Sent, Sig};
 use crate::stdio::Fd;
+#[cfg(unix)]
+use crate::wait::teardown_warn::{wait_warning, Due};
 
 /// Parent ends of fd >= 3 pipes, keyed by descriptor. Unix stashes the raw sync `ParentEnd`
 /// (converted to a reactor pipe at take time); Windows stashes the already-registered overlapped
@@ -436,18 +440,19 @@ impl Child {
     /// foreign, are returned for the caller's one warn. `None`: the child was waited for.
     ///
     /// Unix-only: the Windows elevation arm builds its child in-module with no deferred password.
-    #[cfg(unix)]
     ///
     /// The wait warns once past 1 s, naming the child.
     ///
     /// Answers what the wait found, for a caller whose kill was delivered: the collected exit
     /// (`Reaped`), or, for a child it could not show to be ours, which is forgotten, `Killed`.
+    #[cfg(unix)]
     pub(super) fn wait_and_reap_blocking(
         &mut self,
     ) -> (crate::error::ChildFate, Option<crate::child::drop_report::Forgot>) {
         let pid = self.id.pid();
-        self.proc_mut().warn_if_slow(pid);
-        let (waited, cause) = self.proc_mut().wait_and_reap_caused(pid, log::Level::Debug);
+        let (waited, cause) = self
+            .proc_mut()
+            .wait_warning(pid, |proc| proc.wait_and_reap_caused(pid, log::Level::Debug));
         match waited {
             Waited::Exited => {
                 let id = Some(self.id);
@@ -1807,8 +1812,10 @@ impl LateWarn {
     }
 
     /// When the warn is due, or `None` once it has gone out: the next wait is unbounded.
-    fn due(&self) -> Option<std::time::Instant> {
-        self.due.filter(|_| !self.warned).map(|(until, _)| until)
+    fn due(&self) -> Option<Due> {
+        self.due
+            .filter(|_| !self.warned)
+            .map(|(until, after)| Due { until, after })
     }
 
     /// Warn, once, that `what` (completing "async child N ...") still holds the drop.
@@ -1829,16 +1836,19 @@ impl LateWarn {
 }
 
 #[cfg(target_os = "linux")]
-impl crate::containment::cgroup::DrainWarn for LateWarn {
-    fn due(&self) -> Option<std::time::Instant> {
+impl crate::containment::cgroup::TeardownWarn for LateWarn {
+    fn due(&self) -> Option<Due> {
         LateWarn::due(self)
     }
 
-    fn warn(&mut self, leaf: &std::path::Path) {
-        LateWarn::warn(
-            self,
-            &format!("has a cgroup leaf {} that has not drained", leaf.display()),
-        );
+    fn warn(&mut self, waiting: Waiting<'_>) {
+        match waiting {
+            Waiting::Drain(leaf) => LateWarn::warn(
+                self,
+                &format!("has a cgroup leaf {} that has not drained", leaf.display()),
+            ),
+            Waiting::Child(_) => LateWarn::warn(self, "has not been reaped"),
+        }
     }
 }
 
@@ -1855,14 +1865,17 @@ fn reap_killed_root(id: ProcessId, os: &mut OsResources, signals: &mut DropSigna
         return;
     }
     let pid = id.pid();
-    if let Some(until) = late.due() {
-        #[cfg(test)]
-        fault::run_before_reap_look();
-        if !proc.exit_visible_by(pid, until) {
-            late.warn("has not been reaped");
-        }
-    }
-    let (waited, cause) = proc.wait_and_reap_caused(pid, log::Level::Debug);
+    let (waited, cause) = wait_warning(
+        &mut *proc,
+        late.due(),
+        |proc, until| {
+            #[cfg(test)]
+            fault::run_before_reap_look();
+            proc.exit_visible_by(pid, until)
+        },
+        |_| late.warn("has not been reaped"),
+        |proc| proc.wait_and_reap_caused(pid, log::Level::Debug),
+    );
     match waited {
         Waited::Exited => signals.fate = proc.collect_exit(Some(id)),
         // The kill was delivered: dead or dying, and its exit not collected here.

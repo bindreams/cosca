@@ -945,7 +945,7 @@ impl Drop for CgroupLeaf {
 #[cfg(target_os = "linux")]
 impl CgroupLeaf {
     /// What [`Drop`] does, with `warn` for each wait for the drain; `Drop` does nothing after it.
-    fn tear_down(&mut self, warn: &mut dyn DrainWarn) {
+    fn tear_down(&mut self, warn: &mut dyn TeardownWarn) {
         // The pump the leaf owns stops and is joined before anything else: the teardown below
         // uses the watch itself.
         self.watch.stop_pump();
@@ -1107,7 +1107,7 @@ impl CgroupLeaf {
         &mut self,
         front: bool,
         handshake: Option<OwnedFd>,
-        warn: &mut dyn DrainWarn,
+        warn: &mut dyn TeardownWarn,
     ) -> Abandoned {
         let Some(channel) = self.report.take() else {
             return Abandoned::Ended;
@@ -1125,7 +1125,7 @@ impl CgroupLeaf {
         if received.pid.is_none() {
             if let Some(pidfd) = received.pidfd.take() {
                 self.remove_holding_nothing();
-                crate::child::spawn::teardown_through_pidfd(None, pidfd, None);
+                crate::child::spawn::teardown_through_pidfd(None, pidfd, None, slow_drain::Through(warn));
                 return Abandoned::Ended;
             }
         }
@@ -1139,7 +1139,7 @@ impl CgroupLeaf {
         }
         // The child first, through its handle, whatever the leaf's own kill does: it may have left
         // the leaf, or never entered it.
-        let fate = end_child(&received);
+        let fate = end_child(&received, warn);
         let through_leaf = self.entered.then(|| self.hard_kill());
         if self.entered {
             self.remove_killing_through(
@@ -1165,7 +1165,7 @@ impl CgroupLeaf {
     /// [`abandon_before_verdict`](Self::abandon_before_verdict) for an elevation front: the leaf
     /// is killed through and removed as for any child, and the front itself is sent nothing. Its
     /// subtree is read first, so the front can still be placed in it once the leaf is gone.
-    fn abandon_front(&mut self, received: &Received, warn: &mut dyn DrainWarn) -> Abandoned {
+    fn abandon_front(&mut self, received: &Received, warn: &mut dyn TeardownWarn) -> Abandoned {
         let subtree = self.subtree();
         if let Err(e) = &subtree {
             log::debug!("cgroup v2: an abandoned front's leaf subtree cannot be read ({e})");
@@ -1177,7 +1177,7 @@ impl CgroupLeaf {
             self.remove_holding_nothing();
         }
         // Any kill through the leaf, this one or the removal's own, ends what it held.
-        end_front(received, |pid, pidfd| match &subtree {
+        end_front(received, warn, |pid, pidfd| match &subtree {
             Ok(subtree) => subtree.reached(pid, pidfd),
             Err(e) => Err(io::Error::new(
                 e.kind(),
@@ -1190,7 +1190,7 @@ impl CgroupLeaf {
     /// then removed once, a failure reported (see [`drain_and_remove`](Self::drain_and_remove)). `killed`
     /// says whether the caller's own kill through it succeeded; `context` says what removal this
     /// is, for the report of a leaf left behind; `warn`, for the wait for the drain.
-    fn remove_killing_through(&mut self, killed: bool, context: &str, warn: &mut dyn DrainWarn) {
+    fn remove_killing_through(&mut self, killed: bool, context: &str, warn: &mut dyn TeardownWarn) {
         match self.rmdir_leaf() {
             Ok(()) => {}
             Err(e) if removed_after_drain(&e) => {}
@@ -1206,7 +1206,7 @@ impl CgroupLeaf {
     /// reported: after the drain and the sweep, an `EBUSY` means something another party did
     /// since ([`LEFT_BEHIND_CAUSES`]), which another attempt would only make rarer, never
     /// impossible.
-    fn drain_and_remove(&mut self, killed: bool, context: &str, warn: &mut dyn DrainWarn) {
+    fn drain_and_remove(&mut self, killed: bool, context: &str, warn: &mut dyn TeardownWarn) {
         if !killed {
             if let Err(e) = self.hard_kill() {
                 return warn_leaf_left_behind(
@@ -1304,9 +1304,7 @@ impl CgroupLeaf {
 /// A child its handle may not signal (`EPERM`) is handed to a background reaper, so it is reaped
 /// once it exits, however that comes.
 #[cfg(target_os = "linux")]
-fn end_child(received: &Received) -> ChildFate {
-    use rustix::process::{waitid, WaitIdOptions};
-
+fn end_child(received: &Received, warn: &mut dyn TeardownWarn) -> ChildFate {
     #[cfg(feature = "tokio")]
     crate::bounded::assert_may_block("end_child");
 
@@ -1322,7 +1320,6 @@ fn end_child(received: &Received) -> ChildFate {
             "an abandoned spawn's child sent no handle on itself ({pid:?}); it is not signalled"
         ));
     };
-    let id = || wait_id(received, pid);
     if !still_unreaped(received, pid) {
         return end_reaped_child(handle, received, pid);
     }
@@ -1370,12 +1367,7 @@ fn end_child(received: &Received) -> ChildFate {
     }
     #[cfg(test)]
     fault::run_before_exit_wait();
-    let status = loop {
-        match waitid(id(), WaitIdOptions::EXITED) {
-            Err(rustix::io::Errno::INTR) => continue,
-            other => break other,
-        }
-    };
+    let status = wait_for_exit_warning(received, pid, received.pid, warn);
     match status {
         Ok(status) => {
             log::debug!("cgroup v2: reaped an abandoned spawn's child: {status:?}");
@@ -1502,11 +1494,49 @@ fn wait_id(received: &Received, pid: rustix::process::Pid) -> rustix::process::W
     }
 }
 
+/// Blocks until the killed child `pid` exits and reaps it ([`wait_id`]), warning once through
+/// [`wait_warning`](crate::wait::teardown_warn::wait_warning) with `warn`, which names the child
+/// `named`. Requires `received` to hold a handle on the child.
+#[cfg(target_os = "linux")]
+fn wait_for_exit_warning(
+    received: &Received,
+    pid: rustix::process::Pid,
+    named: Option<u32>,
+    warn: &mut dyn TeardownWarn,
+) -> rustix::io::Result<Option<rustix::process::WaitIdStatus>> {
+    use std::os::fd::AsFd;
+
+    use rustix::process::{waitid, WaitIdOptions};
+
+    use crate::wait::teardown_warn::{exit_visible_by, wait_warning, ExitWatch};
+
+    let watch = match (&received.pidfd, &received.proc_dir) {
+        (Some(pidfd), _) => Some(ExitWatch::PidFd(pidfd.as_fd())),
+        (None, Some(dir)) => Some(ExitWatch::ProcDir { pid, dir: dir.as_fd() }),
+        (None, None) => None,
+    };
+    debug_assert!(watch.is_some(), "a child waited for sent a handle on itself");
+    wait_warning(
+        received,
+        warn.due(),
+        |_, until| watch.is_none_or(|watch| exit_visible_by(watch, until)),
+        |_| warn.warn(Waiting::Child(named)),
+        |received| loop {
+            match waitid(wait_id(received, pid), WaitIdOptions::EXITED) {
+                Err(rustix::io::Errno::INTR) => continue,
+                other => break other,
+            }
+        },
+    )
+}
+
 /// Whether the child `received` names, `pid`, is still unreaped. A process `std` reaped is gone:
 /// its pidfd waits on nothing, its `/proc` directory opens nothing. A child that sent no handle on
 /// itself is not.
 #[cfg(target_os = "linux")]
 fn still_unreaped(received: &Received, pid: rustix::process::Pid) -> bool {
+    use std::os::fd::AsFd;
+
     use rustix::process::{waitid, WaitIdOptions};
     match (&received.pidfd, &received.proc_dir) {
         (Some(_), _) => loop {
@@ -1519,16 +1549,7 @@ fn still_unreaped(received: &Received, pid: rustix::process::Pid) -> bool {
                 _ => break true,
             }
         },
-        (None, Some(proc_dir)) => {
-            // Safety: a NUL-terminated name relative to an open directory; the result is closed.
-            let stat =
-                unsafe { libc::openat(proc_dir.as_raw_fd(), c"stat".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
-            if stat >= 0 {
-                // Safety: the descriptor just opened, closed once.
-                unsafe { libc::close(stat) };
-            }
-            stat >= 0
-        }
+        (None, Some(proc_dir)) => crate::wait::teardown_warn::proc_dir_unreaped(proc_dir.as_fd()),
         (None, None) => false,
     }
 }
@@ -1536,7 +1557,8 @@ fn still_unreaped(received: &Received, pid: rustix::process::Pid) -> bool {
 /// Answer for an abandoned spawn's elevation front, sent nothing: one that has exited is reaped,
 /// one its leaf's kill `reached` (given its pid and pidfd) is waited for and reaped; any other is
 /// left running and unreaped, with nothing that waits for it. The waits go through its pidfd, or by
-/// its pid if it sent only its `/proc` directory (see the module's Ownership paragraph). A front
+/// its pid if it sent only its `/proc` directory (see the module's Ownership paragraph); with
+/// `warn`, the wait after the leaf's kill warns once it is due, and goes on. A front
 /// another reaper in the process collects after the look gets a `debug` record: `Ended` before the
 /// leaf's kill, `Reaped` after it. One already gone at the look is `Ended`, with no record.
 ///
@@ -1545,6 +1567,7 @@ fn still_unreaped(received: &Received, pid: rustix::process::Pid) -> bool {
 #[cfg(target_os = "linux")]
 fn end_front(
     received: &Received,
+    warn: &mut dyn TeardownWarn,
     reached: impl FnOnce(u32, Option<std::os::fd::BorrowedFd<'_>>) -> io::Result<bool>,
 ) -> Abandoned {
     use std::os::fd::AsFd;
@@ -1622,12 +1645,7 @@ fn end_front(
     // The leaf's kill reached it, so this wait ends with its exit.
     #[cfg(test)]
     fault::run_before_exit_wait();
-    let status = loop {
-        match waitid(wait_id(received, pid), WaitIdOptions::EXITED) {
-            Err(rustix::io::Errno::INTR) => continue,
-            other => break other,
-        }
-    };
+    let status = wait_for_exit_warning(received, pid, Some(raw), warn);
     match status {
         Ok(_) => Abandoned::Front(FrontFate::Reaped),
         // Killed by its leaf, then reaped by another reaper in the process: only its status is lost.
@@ -2043,3 +2061,11 @@ mod leaf_state_tests;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "placement_reuse_tests.rs"]
 mod placement_reuse_tests;
+
+#[cfg(all(test, target_os = "linux", feature = "tokio"))]
+#[path = "leaf/slow_teardown_tests.rs"]
+mod slow_teardown_tests;
+
+#[cfg(all(test, target_os = "linux", feature = "tokio"))]
+#[path = "leaf/abandon_drain_tests.rs"]
+mod abandon_drain_tests;

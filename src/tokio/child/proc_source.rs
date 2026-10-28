@@ -71,7 +71,14 @@ impl Forgotten {
         match state {
             RootState::Unknown(_) => Forgotten::Unproven,
             RootState::Unpinned => Forgotten::Unpinned,
-            RootState::Unreaped | RootState::Reaped => Forgotten::ReapedElsewhere,
+            RootState::Unreaped | RootState::Reaped => {
+                // Every caller takes the state from `elsewhere`, which excludes `Unreaped`.
+                debug_assert!(
+                    !matches!(state, RootState::Unreaped),
+                    "a child its handle shows ours is forgotten"
+                );
+                Forgotten::ReapedElsewhere
+            }
         }
     }
 
@@ -208,6 +215,11 @@ fn foreign_why(state: &RootState) -> String {
             crate::signal::UNPINNED_WHY
         ),
         RootState::Unreaped | RootState::Reaped => {
+            // Every caller takes the state from `elsewhere`, which excludes `Unreaped`.
+            debug_assert!(
+                !matches!(state, RootState::Unreaped),
+                "a child its handle shows ours is forgotten"
+            );
             "was reaped by someone else, or cannot be shown to be ours".to_owned()
         }
     }
@@ -1276,9 +1288,7 @@ impl ProcSource {
         // to be ours is dead or dying if the kill was delivered, and may be running if it was not.
         // The wait logs at `debug`: the forget's one warn carries its cause.
         #[cfg(unix)]
-        self.warn_if_slow(pid);
-        #[cfg(unix)]
-        let (waited, cause) = self.wait_and_reap_caused(pid, log::Level::Debug);
+        let (waited, cause) = self.wait_warning(pid, |proc| proc.wait_and_reap_caused(pid, log::Level::Debug));
         #[cfg(not(unix))]
         let waited = self.wait_and_reap(pid);
         let fate = match waited {
@@ -1433,17 +1443,19 @@ impl ProcSource {
         )
     }
 
-    /// Before a failed spawn's teardown waits for the child it killed: one `warn` naming it if its exit
-    /// is not visible within [`slow_teardown_after`](super::slow_teardown_after). The caller's wait
-    /// then goes on, unbounded.
+    /// Runs `wait` on this backend: a failed spawn's teardown wait for the child `pid` it killed,
+    /// which warns once, naming it, if its exit is not visible within
+    /// [`slow_teardown_after`](super::slow_teardown_after)
+    /// ([`wait_warning`](crate::wait::teardown_warn::wait_warning)).
     #[cfg(unix)]
-    pub(crate) fn warn_if_slow(&self, pid: u32) {
-        let Some(after) = super::slow_teardown_after() else {
-            return;
-        };
-        if !self.exit_visible_by(pid, crate::wait::now() + after) {
-            crate::child::spawn::warn_still_waiting(Some(pid), after);
-        }
+    pub(crate) fn wait_warning<R>(&mut self, pid: u32, wait: impl FnOnce(&mut Self) -> R) -> R {
+        crate::wait::teardown_warn::wait_warning(
+            self,
+            crate::wait::teardown_warn::Due::in_(super::slow_teardown_after()),
+            |proc, until| proc.exit_visible_by(pid, until),
+            |after| crate::child::spawn::warn_still_waiting(Some(pid), after),
+            wait,
+        )
     }
 
     /// The teardown's kill: [`Sig::Kill`] through the handle, or (tests) the forced refusal of the
@@ -1471,8 +1483,7 @@ impl ProcSource {
         };
         // The original, moved out: a duplicate could fail at the fd limit and strand the child.
         let pidfd = self.take_forgotten_pidfd();
-        let fate =
-            crate::child::spawn::teardown_through_pidfd_warning(Some(pid), pidfd, id, super::slow_teardown_after());
+        let fate = crate::child::spawn::teardown_through_pidfd(Some(pid), pidfd, id, super::slow_teardown_after());
         (Some(fate), Some(leak))
     }
 
@@ -1519,15 +1530,17 @@ impl ProcSource {
             );
             return after_refused_kill(handed, foreign.map(|f| f.2), id);
         }
-        self.warn_if_slow(pid);
-        let ProcSource::Tokio { pidfd, .. } = &self else {
-            unreachable!("a freshly spawned backend is a tokio child");
-        };
-        let mut failed = None;
         // A fixture only the kill above would end is released here.
         #[cfg(test)]
         crate::child::spawn::fault::run_between_kill_and_wait();
-        let fate = match exit_only::reap_blocking(&Target::PidFd(std::os::fd::AsFd::as_fd(pidfd))) {
+        let reaped = self.wait_warning(pid, |proc| {
+            let ProcSource::Tokio { pidfd, .. } = proc else {
+                unreachable!("a freshly spawned backend is a tokio child");
+            };
+            exit_only::reap_blocking(&Target::PidFd(std::os::fd::AsFd::as_fd(pidfd)))
+        });
+        let mut failed = None;
+        let fate = match reaped {
             Ok(Ok(_reaped)) => {
                 #[cfg(test)]
                 if let exit_only::Reaped::Status(status) = _reaped {

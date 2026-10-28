@@ -435,10 +435,14 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
         #[cfg(target_os = "linux")]
         let left_pidfd = crate::child::spawn::pidfd_handshake::LeftPidfd::default();
         #[cfg(target_os = "linux")]
-        let handshake = handshake.open(&_guard).not_started()?.leaving_front(
-            cmd.elevation_front(),
-            prepared.cgroup_leaf.is_some().then(|| std::rc::Rc::clone(&left_pidfd)),
-        );
+        let handshake = handshake
+            .open(&_guard)
+            .not_started()?
+            .leaving_front(
+                cmd.elevation_front(),
+                prepared.cgroup_leaf.is_some().then(|| std::rc::Rc::clone(&left_pidfd)),
+            )
+            .warning_past(super::child::slow_teardown_after());
         // A root whose group is its containment, with no leaf to kill through: a spawn tokio fails after
         // its fork kills the group too.
         #[cfg(target_os = "linux")]
@@ -965,8 +969,10 @@ impl crate::child::spawn::pidfd_handshake::Spawned for ::tokio::process::Child {
     }
 
     /// Waits through the pidfd until the child is a zombie, then has tokio reap it at once.
-    fn reap_unexecuted(mut self, pidfd: std::os::fd::OwnedFd) -> ChildFate {
-        let delivered = crate::child::spawn::pidfd_handshake::await_unexecuted_exit(&pidfd, self.id());
+    fn reap_unexecuted(mut self, pidfd: std::os::fd::OwnedFd, warn_after: Option<std::time::Duration>) -> ChildFate {
+        // Read first: tokio forgets the pid once `try_wait` has reaped.
+        let pid = self.id();
+        let delivered = crate::child::spawn::pidfd_handshake::await_unexecuted_exit(&pidfd, pid, warn_after);
         match self.try_wait() {
             Ok(Some(_)) => ChildFate::Reaped,
             // Killed, and its zombie not yet visible here (the wait for it failed, so a tracer may
@@ -974,15 +980,12 @@ impl crate::child::spawn::pidfd_handshake::Spawned for ::tokio::process::Child {
             Ok(None) => {
                 log::debug!(
                     "{}: not yet collectable; left to tokio's reaper",
-                    crate::child::spawn::named(self.id())
+                    crate::child::spawn::named(pid)
                 );
                 ChildFate::Killed
             }
             Err(e) => {
-                log::debug!(
-                    "{}: reaped by someone else ({e})",
-                    crate::child::spawn::named(self.id())
-                );
+                log::debug!("{}: reaped by someone else ({e})", crate::child::spawn::named(pid));
                 crate::wait::exit_only::Foreign::Gone.fate(delivered)
             }
         }

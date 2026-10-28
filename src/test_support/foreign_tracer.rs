@@ -116,10 +116,10 @@ fn foreign_tracer_helper() {
                 // reports before any stop. One that was not killed and ran on to its own exit
                 // reports the signals it was sent first (`SIGPIPE` on its closed stdout, say): a
                 // debugger lets each one through, as `gdb` does.
-                loop {
+                let status = loop {
                     let status = waitpid_status(pid);
                     if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
-                        break;
+                        break status;
                     }
                     assert!(
                         libc::WIFSTOPPED(status),
@@ -131,7 +131,8 @@ fn foreign_tracer_helper() {
                     let rc =
                         unsafe { libc::ptrace(libc::PTRACE_CONT, pid, null(), signal as usize as *mut libc::c_void) };
                     assert_eq!(rc, 0, "PTRACE_CONT: {}", std::io::Error::last_os_error());
-                }
+                };
+                say(&format!("exit {status}"));
                 say("reaped");
                 return;
             }
@@ -147,6 +148,25 @@ pub(crate) fn allow_any_tracer(cmd: &mut std::process::Command) {
     unsafe {
         cmd.pre_exec(allow_any_tracer_now);
     }
+}
+
+/// A [`BLOCKER_ARGV`](crate::test_child::BLOCKER_ARGV) child that any tracer may seize, its stdin held
+/// open by the returned `Child`, which a test keeps until the child is gone. Spawned under
+/// `spawn_lock`.
+#[cfg(feature = "tokio")]
+pub(crate) fn blocker() -> std::process::Child {
+    let mut cmd = crate::test_child::held_std_blocker(std::process::Stdio::null());
+    allow_any_tracer(&mut cmd);
+    crate::test_spawn::spawn(&mut cmd).expect("spawn the tracee")
+}
+
+/// [`blocker`], leading a process group of its own, so a kill of its group reaches nothing but it.
+#[cfg(feature = "tokio")]
+pub(crate) fn group_leading_blocker() -> std::process::Child {
+    let mut cmd = crate::test_child::held_std_blocker(std::process::Stdio::null());
+    allow_any_tracer(&mut cmd);
+    cmd.process_group(0);
+    crate::test_spawn::spawn(&mut cmd).expect("spawn the tracee")
 }
 
 /// Lets any process trace this one (`PR_SET_PTRACER`), which Yama's scope 1 requires of a tracer
@@ -261,6 +281,22 @@ impl Tracer {
         panic!("the helper ended without reporting {expected:?}");
     }
 
+    /// Waits for the helper's `@@reaped@@` line, as [`expect`](Self::expect) does, and answers the wait
+    /// status it reaped the tracee with (`REAP` reports it just before).
+    #[cfg(feature = "tokio")]
+    pub(crate) fn expect_reaped(&mut self) -> libc::c_int {
+        let mut status = None;
+        for line in &mut self.lines {
+            let line = line.expect("read the helper's stdout");
+            if let Some((_, rest)) = line.split_once("@@exit ") {
+                status = Some(rest.trim_end_matches("@@").parse().expect("the helper's wait status"));
+            } else if line.ends_with("@@reaped@@") {
+                return status.expect("the helper reports the status before it reaps");
+            }
+        }
+        panic!("the helper ended without reporting \"reaped\"");
+    }
+
     /// Closes the helper's stdin and waits for it to exit cleanly.
     pub(crate) fn finish(mut self) {
         drop(self.go.take());
@@ -363,5 +399,118 @@ pub(crate) async fn spawn_tokio_tracee() -> (crate::tokio::Child, crate::tokio::
             Some(_) => {}
             None => panic!("the tracee ended without reporting \"allowed\""),
         }
+    }
+}
+
+/// Who a failed spawn's slow-teardown warn names, for [`assert_warns_once_before_blocking`].
+#[cfg(feature = "tokio")]
+#[derive(Clone, Copy)]
+pub(crate) enum Names {
+    /// `child <pid>`, the pid `seized` answers.
+    Pid,
+    /// The spawned child whose pid the teardown does not know.
+    Unknown,
+}
+
+/// Runs `teardown` on a thread of its own, on which slow teardowns warn (see
+/// [`crate::tokio::child::fault::warn_slow_teardowns`]), until it sleeps in a blocking `waitid`; then
+/// has the tracer `seized` answers hand the zombie of its child back. `seized` runs once the thread
+/// has started. Asserts that the teardown blocked, that by then exactly one warn, naming the child
+/// as `names` says, said it was still waiting, and that the tracee died of a `SIGKILL`, not of its
+/// own exit once the test released its stdin. Answers what `teardown` returned.
+///
+/// A teardown that does not warn, or whose kill sends nothing, blocks all the same and returns once
+/// the tracer has let go, so it fails an assertion here instead of hanging.
+#[cfg(feature = "tokio")]
+pub(crate) fn assert_warns_once_before_blocking<R: Send>(
+    names: Names,
+    teardown: impl FnOnce() -> R + Send,
+    seized: impl FnOnce() -> (u32, Tracer),
+) -> R {
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+
+    // Asserted only after the tracer lets go. A panic inside the scope drops `tracer` first, and its
+    // helper's death hands the zombie back, so the scope's join of the teardown thread ends.
+    let (pid, holder, warns, status, done) = std::thread::scope(|s| {
+        let thread = s.spawn(move || {
+            tid_tx
+                .send(rustix::thread::gettid().as_raw_nonzero().get())
+                .expect("report the tid");
+            let _warn = crate::tokio::warn_slow_teardowns();
+            teardown()
+        });
+        let tid = tid_rx.recv().expect("the teardown's tid");
+        let (pid, mut tracer) = seized();
+        let holder = await_blocked_or_finished(tid);
+        let who = match names {
+            Names::Pid => format!("child {pid}"),
+            Names::Unknown => "pid unknown".to_owned(),
+        };
+        let warns: Vec<_> = crate::log_capture::records_since(mark, &who)
+            .into_iter()
+            .filter(|text| text.contains("still waiting"))
+            .collect();
+        tracer.send(REAP);
+        let status = tracer.expect_reaped();
+        (pid, holder, warns, status, thread.join().expect("the teardown"))
+    });
+
+    assert_eq!(
+        holder,
+        Holder::Blocked,
+        "the teardown returned while the tracer still held child {pid}'s zombie"
+    );
+    assert!(
+        libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL,
+        "the teardown's kill must end child {pid}, not its own exit once its stdin was released: {status:#x}"
+    );
+    assert_eq!(warns.len(), 1, "one warn before the blocking wait: {warns:?}");
+    assert_eq!(
+        crate::log_capture::levels_since(mark, "still waiting"),
+        [log::Level::Warn],
+        "exactly one warn, at warn"
+    );
+    done
+}
+
+/// [`assert_warns_once_before_blocking`] for a tracee `pid` that exists already: the teardown starts
+/// only once the tracer has seized it.
+#[cfg(feature = "tokio")]
+pub(crate) fn assert_warns_once_after_seizing<R: Send>(
+    names: Names,
+    pid: u32,
+    teardown: impl FnOnce() -> R + Send,
+) -> R {
+    let (seized_tx, seized_rx) = std::sync::mpsc::channel();
+    assert_warns_once_before_blocking(
+        names,
+        move || {
+            seized_rx.recv().expect("the tracer seized the child");
+            teardown()
+        },
+        move || {
+            let tracer = spawn_helper(pid);
+            seized_tx.send(()).expect("let the teardown go on");
+            (pid, tracer)
+        },
+    )
+}
+
+/// At least one child was reaped by a teardown, and each died of `SIGKILL`: the teardown's kill was
+/// delivered, and the child did not exit `0` on its stdin's release.
+#[cfg(feature = "tokio")]
+#[track_caller]
+pub(crate) fn assert_reaped_by_sigkill(reaps: &[(u32, std::process::ExitStatus)]) {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    assert!(!reaps.is_empty(), "the teardown must have reaped the child");
+    for (pid, status) in reaps {
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGKILL),
+            "pid {pid} must be SIGKILLed by its teardown kill, not exit once its stdin was released: {status:?}"
+        );
     }
 }

@@ -19,12 +19,12 @@ const MESSAGE_LEN: usize = 16;
 const HANDLE_NONE: u64 = 0;
 /// An intent's handle on its sender: a pidfd.
 #[cfg(target_os = "linux")]
-const HANDLE_PIDFD: u64 = 1;
+pub(super) const HANDLE_PIDFD: u64 = 1;
 /// An intent's handle on its sender: its `/proc/<pid>` directory, open — for when `pidfd_open` is
 /// denied. It names that process, not its number: once the process is reaped, nothing opens
 /// through it, whatever process the number names by then.
 #[cfg(target_os = "linux")]
-const HANDLE_PROC_DIR: u64 = 2;
+pub(super) const HANDLE_PROC_DIR: u64 = 2;
 
 /// The tag of a child's intent message; its value is the child's pid.
 #[cfg(target_os = "linux")]

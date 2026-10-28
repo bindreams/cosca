@@ -666,3 +666,22 @@ async fn macos_tokio_armed_drop_warns_once_when_the_reap_is_slow() {
     assert_eq!(warns.len(), 1, "one warn, and the wait goes on: {warns:?}");
     assert!(root.reaped(), "the drop reaps the root past its warn");
 }
+
+/// A test warns about a slow teardown only with a guard (a verdict must not depend on elapsed time),
+/// and `warn_slow_teardowns` sets the threshold production uses, 1 s; another guard sets its own.
+///
+/// Mutants: a test without a guard gets a threshold; the production threshold is not 1 s.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_test_warns_past_the_production_threshold_only_with_a_guard() {
+    assert_eq!(super::slow_teardown_after(), None);
+    {
+        let _production = super::fault::warn_slow_teardowns();
+        assert_eq!(super::slow_teardown_after(), Some(std::time::Duration::from_secs(1)));
+    }
+    {
+        let _zero = super::fault::warn_slow_teardowns_after(std::time::Duration::ZERO);
+        assert_eq!(super::slow_teardown_after(), Some(std::time::Duration::ZERO));
+    }
+    assert_eq!(super::slow_teardown_after(), None);
+}
