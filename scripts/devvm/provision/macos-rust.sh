@@ -28,7 +28,7 @@ fi
 echo "devvm: $("$CARGO" --version)"
 
 # Same version as CI (NEXTEST_VERSION in ci.yaml). Prebuilt: compiling from source is too slow for a throwaway VM.
-NEXTEST_TAG_UNIVERSAL="cargo-nextest-0.9.148" NEXTEST_SHA256_UNIVERSAL="6c23b7fb4ca82c571fc8dfedbab45bfa773d45918f933170c85d21cd7f4b852b"
+NEXTEST_TAG_UNIVERSAL="cargo-nextest-0.9.149" NEXTEST_SHA256_UNIVERSAL="47b9941765a9ff94e304a3fe5444ac1c7593da655525b8b69f8f2b31a9217507"
 NEXTEST_VERSION="${NEXTEST_TAG_UNIVERSAL#cargo-nextest-}"
 INSTALLED="$("$CARGO" nextest --version 2>/dev/null | head -n1 | awk '{print $2}' || true)"
 if [ "$INSTALLED" = "$NEXTEST_VERSION" ]; then
