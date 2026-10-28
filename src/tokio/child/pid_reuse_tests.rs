@@ -402,8 +402,13 @@ in_fresh_pid_ns!(
 /// gone, and neither signals nor reaps the stranger. The stranger is already a zombie of the test's
 /// `SIGUSR1` when the wait runs, so a by-pid reap would take its record.
 ///
+/// The hook releases the child's stdin once the drop's kill returned, then checks it died of
+/// `SIGKILL`: a kill that sent nothing leaves a child that exits `0` on the release, and fails there
+/// instead of leaving the hook to wait for an exit nothing causes.
+///
 /// Mutants: the drop's root kill by pid (the send log shows no pidfd kill); the wait reaps by pid
-/// (the test's own `waitid` on the stranger answers `ECHILD`).
+/// (the test's own `waitid` on the stranger answers `ECHILD`); the drop's root kill sends nothing
+/// (the child is not `SIGKILL`ed).
 fn armed_drop_after_foreign_reap_and_reuse_signals_nothing_body() {
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -417,6 +422,8 @@ fn armed_drop_after_foreign_reap_and_reuse_signals_nothing_body() {
         let reused: Rc<RefCell<Reused>> = Rc::default();
         let hand = Rc::clone(&reused);
         let _between = crate::child::spawn::fault::set_between_kill_and_wait(move || {
+            drop(writer);
+            crate::test_child::assert_zombie_sigkilled("the child", pid);
             let reuser = reap_behind_and_reuse(pid);
             let alias = alias_token(reuser.id(), token);
             assert_eq!(sigusr1_and_peek(&reuser), Some(libc::SIGUSR1));
@@ -439,7 +446,7 @@ fn armed_drop_after_foreign_reap_and_reuse_signals_nothing_body() {
         .expect("the reuser's exit record must still be unconsumed")
         .expect("an exit record");
         assert_eq!(record.terminating_signal(), Some(libc::SIGUSR1));
-        drop((reuser, alias, writer));
+        drop((reuser, alias));
     });
 }
 in_fresh_pid_ns!(
@@ -453,8 +460,8 @@ in_fresh_pid_ns!(
 /// its back and its pid taken by a stranger that is already a zombie, before the awaited reap
 /// looks. The reap finds the root gone through its pidfd and takes nothing.
 ///
-/// Mutant: the awaited reap tries tokio's `try_wait` without looking first (it takes the
-/// stranger's record).
+/// The hook releases the child's stdin once the teardown's kill returned, then checks it died of
+/// `SIGKILL`, as in the armed drop's test above.
 fn awaited_teardown_after_foreign_reap_and_reuse_takes_nothing_body() {
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -466,6 +473,8 @@ fn awaited_teardown_after_foreign_reap_and_reuse_takes_nothing_body() {
         let reused: Rc<RefCell<Reused>> = Rc::default();
         let hand = Rc::clone(&reused);
         let _between = crate::child::spawn::fault::set_between_kill_and_wait(move || {
+            drop(writer);
+            crate::test_child::assert_zombie_sigkilled("the child", pid);
             let reuser = reap_behind_and_reuse(pid);
             assert_eq!(sigusr1_and_peek(&reuser), Some(libc::SIGUSR1));
             *hand.borrow_mut() = Some(reuser);
@@ -492,7 +501,6 @@ fn awaited_teardown_after_foreign_reap_and_reuse_takes_nothing_body() {
             crate::error::ChildFate::Reaped,
             "the root's exit was not collected"
         );
-        drop(writer);
     });
 }
 in_fresh_pid_ns!(

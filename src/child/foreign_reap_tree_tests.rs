@@ -7,8 +7,8 @@ use crate::containment::unix::fault::{record_kill_group, record_term_group};
 #[cfg(target_os = "linux")]
 use crate::test_child::reaped_elsewhere::ROOT_KILLED_BY_PIDFD;
 use crate::test_child::reaped_elsewhere::{
-    assert_one_reaped_elsewhere_warn, assert_one_untrusted_number_warn, foreign_reaped_group_root, session_sleep,
-    warns_since,
+    assert_one_reaped_elsewhere_warn, assert_one_untrusted_number_warn, foreign_reaped_group_root, kill_own_child,
+    session_sleep, warns_since,
 };
 
 /// Mutants: `killpg` sent; the decision taken on the number alone (it shows no recycle).
@@ -69,7 +69,7 @@ fn kill_tree_after_own_wait_whose_pid_reads_unknown_sends_no_killpg() {
     let recorder = record_kill_group();
     let child = session_sleep().spawn().expect("spawn");
     let pid = child.id().pid();
-    child.kill().expect("kill the root");
+    kill_own_child(pid);
     child.wait().expect("this handle reaps the root");
     let _unknown = crate::child::fault::force_next_root_read(crate::identity::Resolved::Unknown);
 
@@ -97,11 +97,13 @@ fn kill_tree_after_own_wait_whose_pid_reads_unknown_sends_no_killpg() {
 #[skuld::test]
 fn kill_tree_of_a_root_its_handle_cannot_read_kills_it_through_its_pidfd_alone() {
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
+    use crate::test_child::reaped_elsewhere::session_cat;
     use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peek_once};
     use std::os::unix::process::ExitStatusExt as _;
     crate::log_capture::install();
     let recorder = record_kill_group();
-    let child = session_sleep().spawn().expect("spawn");
+    let mut child = session_cat().spawn().expect("spawn");
+    let stdin = child.stdin().expect("stdin pipe");
     let pid = child.id().pid();
 
     let mark = crate::log_capture::mark();
@@ -127,6 +129,7 @@ fn kill_tree_of_a_root_its_handle_cannot_read_kills_it_through_its_pidfd_alone()
     assert_one_untrusted_number_warn(mark, pid);
     let warns = warns_since(mark);
     assert!(warns[0].contains(ROOT_KILLED_BY_PIDFD), "{warns:?}");
+    drop(stdin);
     let status = child.wait().expect("reap the root");
     assert_eq!(status.signal(), Some(libc::SIGKILL), "the pidfd kill ended the root");
 }
@@ -140,12 +143,13 @@ fn kill_tree_of_a_root_its_handle_cannot_read_kills_it_through_its_pidfd_alone()
 #[skuld::test]
 fn terminate_tree_of_a_root_its_handle_cannot_read_terms_it_through_its_pidfd_alone() {
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
-    use crate::test_child::reaped_elsewhere::ROOT_TERMED_BY_PIDFD;
+    use crate::test_child::reaped_elsewhere::{session_cat, ROOT_TERMED_BY_PIDFD};
     use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peek_once};
     use std::os::unix::process::ExitStatusExt as _;
     crate::log_capture::install();
     let termed = record_term_group();
-    let child = session_sleep().spawn().expect("spawn");
+    let mut child = session_cat().spawn().expect("spawn");
+    let stdin = child.stdin().expect("stdin pipe");
     let pid = child.id().pid();
 
     let mark = crate::log_capture::mark();
@@ -171,6 +175,7 @@ fn terminate_tree_of_a_root_its_handle_cannot_read_terms_it_through_its_pidfd_al
     assert_one_untrusted_number_warn(mark, pid);
     let warns = warns_since(mark);
     assert!(warns[0].contains(ROOT_TERMED_BY_PIDFD), "{warns:?}");
+    drop(stdin);
     let status = child.wait().expect("reap the root");
     assert_eq!(status.signal(), Some(libc::SIGTERM), "the pidfd SIGTERM ended the root");
 }
@@ -186,13 +191,14 @@ fn terminate_tree_of_a_root_its_handle_cannot_read_terms_it_through_its_pidfd_al
 fn graceful_shutdown_tree_of_a_root_its_handle_cannot_read_escalates_through_its_pidfd_alone() {
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     use crate::signal::Sig::{Kill, Term};
-    use crate::test_child::reaped_elsewhere::{term_ignoring_session_sleep, ROOT_TERMED_BY_PIDFD};
+    use crate::test_child::reaped_elsewhere::{term_ignoring_session_cat, ROOT_TERMED_BY_PIDFD};
     use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peek_once};
     use std::os::unix::process::ExitStatusExt as _;
     crate::log_capture::install();
     let killed = record_kill_group();
     let termed = record_term_group();
-    let mut child = term_ignoring_session_sleep().spawn().expect("spawn");
+    let mut child = term_ignoring_session_cat().spawn().expect("spawn");
+    let stdin = child.stdin().expect("stdin pipe");
     let pid = child.id().pid();
     let mut ready = String::new();
     std::io::BufRead::read_line(
@@ -224,13 +230,16 @@ fn graceful_shutdown_tree_of_a_root_its_handle_cannot_read_escalates_through_its
     let warns = warns_since(mark);
     assert!(warns[0].contains(ROOT_TERMED_BY_PIDFD), "{warns:?}");
     assert!(warns[0].contains(ROOT_KILLED_BY_PIDFD), "{warns:?}");
+    drop(stdin);
     let status = child.wait().expect("reap the root");
     assert_eq!(status.signal(), Some(libc::SIGKILL), "the kill ended the root");
 }
 
 /// The same root, but it exits on the `SIGTERM`: `graceful_shutdown_tree` sends no kill, and the one
-/// warn does not say it did. A hook after the `SIGTERM` checks it went out, then waits for the root
-/// to exit, so the grace's one look at the pidfd at expiry finds it readable.
+/// warn does not say it did. A hook after the `SIGTERM` checks it went out, releases the root's
+/// stdin, then waits for the root to exit, so the grace's one look at the pidfd at expiry finds it
+/// readable. A `SIGTERM` that was not delivered lets the release end the root by itself, which shows
+/// in its status.
 ///
 /// Mutants: the kill is sent whatever the root did; the warn says it was; the grace wait misses the
 /// pidfd's exit.
@@ -240,11 +249,12 @@ fn graceful_shutdown_tree_of_a_root_its_handle_cannot_read_sends_no_kill_to_one_
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     use crate::graceful_hooks::{at, HookPoint};
     use crate::signal::Sig::Term;
-    use crate::test_child::reaped_elsewhere::ROOT_TERMED_BY_PIDFD;
+    use crate::test_child::reaped_elsewhere::{session_cat, ROOT_TERMED_BY_PIDFD};
     use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peek_once};
     use std::os::unix::process::ExitStatusExt as _;
     crate::log_capture::install();
-    let child = session_sleep().spawn().expect("spawn");
+    let mut child = session_cat().spawn().expect("spawn");
+    let stdin = child.stdin().expect("stdin pipe");
     let pid = child.id().pid();
 
     let mark = crate::log_capture::mark();
@@ -258,6 +268,7 @@ fn graceful_shutdown_tree_of_a_root_its_handle_cannot_read_sends_no_kill_to_one_
                 [(pid, Term, crate::send_log::Via::Pidfd)],
                 "the SIGTERM went out before the grace"
             );
+            drop(stdin);
             crate::test_child::wait_until_zombie(pid);
         }
     });
@@ -339,7 +350,7 @@ fn graceful_shutdown_tree_after_own_wait_claims_no_sigterm_it_did_not_send() {
     let termed = record_term_group();
     let child = session_sleep().spawn().expect("spawn");
     let pid = child.id().pid();
-    child.kill().expect("kill the root");
+    kill_own_child(pid);
     child.wait().expect("this handle reaps the root");
     let other = ProcessId::from_parts_for_test(pid, child.id().start_token_raw() + 1);
     // The shutdown's look finds another process; the sweep's, after the terminate, cannot read the

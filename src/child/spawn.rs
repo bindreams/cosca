@@ -3424,6 +3424,28 @@ pub(crate) mod fault {
         }
     }
 
+    /// Releases the writer in `held` at every point where a sync teardown, a failed spawn's cleanup
+    /// or a graceful shutdown waits for a root it has killed: after the drop's kill, before the
+    /// shutdown's reap, between a kill and its wait. Once the kill returned, a root held only by
+    /// that writer exits by itself, so a kill that sent nothing fails the test's assertion on what
+    /// the kill should have ended instead of hanging the wait. Keep the guard through the teardown.
+    /// `held` is a shared cell so the test can also release it by hand.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn release_when_a_teardown_waits<T: 'static>(
+        held: &std::rc::Rc<std::cell::Cell<Option<T>>>,
+    ) -> Box<dyn std::any::Any> {
+        use crate::graceful_hooks::{at, HookPoint};
+        let release = || {
+            let held = std::rc::Rc::clone(held);
+            move || drop(held.take())
+        };
+        Box::new((
+            at(HookPoint::AfterDropKill, release()),
+            at(HookPoint::BeforeReap, release()),
+            set_between_kill_and_wait(release()),
+        ))
+    }
+
     fn release_hook(held: impl Sized + 'static, fired: &std::rc::Rc<std::cell::Cell<bool>>) -> impl FnOnce() + 'static {
         let fired = std::rc::Rc::clone(fired);
         move || {

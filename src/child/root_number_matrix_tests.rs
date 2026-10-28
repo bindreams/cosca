@@ -20,6 +20,7 @@
 use std::time::Duration;
 
 use crate::identity::{ProcessId, Resolved};
+use crate::test_child::reaped_elsewhere::kill_own_child;
 #[cfg(target_os = "linux")]
 use crate::test_groups::{cgroup, Group};
 
@@ -593,7 +594,7 @@ fn run_sync(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
     let mut stderr = child.stderr().expect("stderr pipe");
     let root = child.id().pid();
     if reap.reaped() {
-        child.kill().expect("kill the root");
+        kill_own_child(root);
         if reap.own() {
             child.wait().expect("this handle reaps the root");
         } else {
@@ -606,6 +607,8 @@ fn run_sync(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
     let mut forced = reap.force(child.id());
 
     let _released = release_when_the_drain_blocks(mechanism, &stdin);
+    #[cfg(target_os = "linux")]
+    let _released_at_the_root_wait = crate::child::spawn::fault::release_when_a_teardown_waits(&stdin);
     let recorders = Recorders::start();
     // The cell checks what was sent, not what the call answered.
     _ = match op {
@@ -629,7 +632,8 @@ fn run_sync(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
 
     // The tree is gone before the drop, which runs under the recorders: it sends no killpg.
     if !reap.reaped() {
-        child.kill().expect("kill the root");
+        // Released, not killed: the op may have reaped the root, so its number may name another process.
+        drop(stdin.take());
         child.wait().expect("reap the root");
     }
     drop(stdin.take());
@@ -716,7 +720,7 @@ async fn run_tokio(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
     let mut stderr = child.stderr().expect("stderr pipe");
     let root = child.id().pid();
     if reap.reaped() {
-        child.kill().expect("kill the root");
+        kill_own_child(root);
         if reap.own() {
             child.wait().await.expect("this handle reaps the root");
         } else {
@@ -734,6 +738,8 @@ async fn run_tokio(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
         .leaf_path_for_test()
         .map(|path| (crate::test_groups::cgroup_leaf::LeafGuard::new(path.clone()), path));
     let _released = release_when_the_drain_blocks(mechanism, &stdin);
+    #[cfg(target_os = "linux")]
+    let _released_at_the_root_wait = crate::child::spawn::fault::release_when_a_teardown_waits(&stdin);
     let recorders = Recorders::start();
     // The cell checks what was sent, not what the call answered.
     let teardown = match op {
@@ -782,7 +788,8 @@ async fn run_tokio(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
     }
 
     if !reap.reaped() {
-        child.kill().expect("kill the root");
+        // Released, not killed: the op may have reaped the root, so its number may name another process.
+        drop(stdin.take());
         child.wait().await.expect("reap the root");
     }
     drop(stdin.take());

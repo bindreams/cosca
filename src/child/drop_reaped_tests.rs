@@ -263,9 +263,11 @@ fn dropping_a_running_tree_walk_child_walks_from_its_pid_and_does_not_warn() {
     crate::log_capture::install();
     let walks = record_walks();
     let mut cmd = Command::new();
-    cmd.args(["sleep", "300"]);
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.contain_with(ContainMode::TreeWalk);
-    let child = cmd.spawn().expect("spawn");
+    cmd.stdin(Stdio::pipe_in()).expect("stdin pipe");
+    let mut child = cmd.spawn().expect("spawn");
+    let blocker = release_at_drop_kill(child.stdin().expect("stdin pipe"));
     let pid = child.id().pid();
 
     let mark = crate::log_capture::mark();
@@ -275,6 +277,7 @@ fn dropping_a_running_tree_walk_child_walks_from_its_pid_and_does_not_warn() {
     let walked = walks.walked();
     assert!(!walked.is_empty() && walked.iter().all(|w| *w == pid), "{walked:?}");
     assert_eq!(drop_warns_since(mark), []);
+    blocker.assert_killed();
 }
 
 /// A blocker root, killed and then waited for, so that only `wait()` sets the own-reap flag.

@@ -4,8 +4,8 @@
 
 use crate::containment::unix::fault::{record_kill_group, record_term_group};
 use crate::test_child::reaped_elsewhere::{
-    assert_one_reaped_elsewhere_warn, assert_one_untrusted_number_warn, reap_behind, warns_since, MAY_STILL_RUN,
-    REAPED_ELSEWHERE,
+    assert_one_reaped_elsewhere_warn, assert_one_untrusted_number_warn, kill_own_child, reap_behind, warns_since,
+    MAY_STILL_RUN, REAPED_ELSEWHERE,
 };
 #[cfg(target_os = "linux")]
 use crate::test_groups::{pidfd_group_signal, Group};
@@ -18,11 +18,21 @@ fn session_sleep() -> crate::tokio::Command {
     cmd
 }
 
+/// Async twin of the sync `session_cat`.
+#[cfg(target_os = "linux")]
+fn session_cat() -> crate::tokio::Command {
+    let mut cmd = crate::tokio::Command::new();
+    cmd.args(["cat"]);
+    cmd.contain_with(crate::ContainMode::Session);
+    cmd.stdin(crate::Stdio::pipe_in()).expect("stdin pipe");
+    cmd
+}
+
 /// A [`session_sleep`] child, killed and reaped behind its back, and its group's id.
 fn foreign_reaped_group_root() -> (crate::tokio::Child, u32) {
-    let mut child = session_sleep().spawn().expect("spawn");
+    let child = session_sleep().spawn().expect("spawn");
     let pid = child.id().pid();
-    child.kill().expect("kill the root");
+    kill_own_child(pid);
     reap_behind(pid);
     (child, pid)
 }
@@ -86,7 +96,7 @@ async fn tokio_kill_tree_after_own_wait_whose_pid_reads_unknown_sends_no_killpg(
     let recorder = record_kill_group();
     let mut child = session_sleep().spawn().expect("spawn");
     let pid = child.id().pid();
-    child.kill().expect("kill the root");
+    kill_own_child(pid);
     child.wait().await.expect("this handle reaps the root");
     let _unknown = crate::child::fault::force_next_root_read(crate::identity::Resolved::Unknown);
 
@@ -116,7 +126,8 @@ async fn tokio_kill_tree_of_a_root_its_handle_cannot_read_kills_it_through_its_p
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let recorder = record_kill_group();
-    let mut child = session_sleep().spawn().expect("spawn");
+    let mut child = session_cat().spawn().expect("spawn");
+    let stdin = child.stdin().expect("stdin pipe");
     let pid = child.id().pid();
 
     let mark = crate::log_capture::mark();
@@ -142,17 +153,19 @@ async fn tokio_kill_tree_of_a_root_its_handle_cannot_read_kills_it_through_its_p
     assert_one_untrusted_number_warn(mark, pid);
     let warns = warns_since(mark);
     assert!(warns[0].contains(ROOT_KILLED_BY_PIDFD), "{warns:?}");
+    drop(stdin);
     let status = child.wait().await.expect("reap the root");
     assert_eq!(status.signal(), Some(libc::SIGKILL), "the pidfd kill ended the root");
 }
 
-/// [`session_sleep`] that ignores `SIGTERM` (an ignored signal stays ignored across `exec`), so only
-/// a kill ends it.
+/// [`session_cat`] that ignores `SIGTERM` (an ignored signal stays ignored across `exec`), so only
+/// a kill ends it before its stdin closes.
 #[cfg(target_os = "linux")]
-fn term_ignoring_session_sleep() -> crate::tokio::Command {
+fn term_ignoring_session_cat() -> crate::tokio::Command {
     let mut cmd = crate::tokio::Command::new();
-    cmd.args(["sh", "-c", r#"trap "" TERM; echo ready; exec sleep 300"#]);
+    cmd.args(["sh", "-c", r#"trap "" TERM; echo ready; exec cat"#]);
     cmd.contain_with(crate::ContainMode::Session);
+    cmd.stdin(crate::Stdio::pipe_in()).expect("stdin pipe");
     cmd.stdout(crate::Stdio::pipe_out()).expect("stdout pipe");
     cmd
 }
@@ -169,7 +182,8 @@ async fn tokio_terminate_tree_of_a_root_its_handle_cannot_read_terms_it_through_
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let termed = record_term_group();
-    let mut child = session_sleep().spawn().expect("spawn");
+    let mut child = session_cat().spawn().expect("spawn");
+    let stdin = child.stdin().expect("stdin pipe");
     let pid = child.id().pid();
 
     let mark = crate::log_capture::mark();
@@ -195,6 +209,7 @@ async fn tokio_terminate_tree_of_a_root_its_handle_cannot_read_terms_it_through_
     assert_one_untrusted_number_warn(mark, pid);
     let warns = warns_since(mark);
     assert!(warns[0].contains(ROOT_TERMED_BY_PIDFD), "{warns:?}");
+    drop(stdin);
     let status = child.wait().await.expect("reap the root");
     assert_eq!(status.signal(), Some(libc::SIGTERM), "the pidfd SIGTERM ended the root");
 }
@@ -213,7 +228,8 @@ async fn tokio_graceful_shutdown_tree_of_a_root_its_handle_cannot_read_escalates
     crate::log_capture::install();
     let killed = record_kill_group();
     let termed = record_term_group();
-    let mut child = term_ignoring_session_sleep().spawn().expect("spawn");
+    let mut child = term_ignoring_session_cat().spawn().expect("spawn");
+    let stdin = child.stdin().expect("stdin pipe");
     let pid = child.id().pid();
     let mut ready = String::new();
     ::tokio::io::AsyncBufReadExt::read_line(
@@ -247,6 +263,7 @@ async fn tokio_graceful_shutdown_tree_of_a_root_its_handle_cannot_read_escalates
     let warns = warns_since(mark);
     assert!(warns[0].contains(ROOT_TERMED_BY_PIDFD), "{warns:?}");
     assert!(warns[0].contains(ROOT_KILLED_BY_PIDFD), "{warns:?}");
+    drop(stdin);
     let status = child.wait().await.expect("reap the root");
     assert_eq!(status.signal(), Some(libc::SIGKILL), "the kill ended the root");
 }
@@ -254,7 +271,8 @@ async fn tokio_graceful_shutdown_tree_of_a_root_its_handle_cannot_read_escalates
 /// The sync `graceful_shutdown_tree_of_a_root_its_handle_cannot_read_sends_no_kill_to_one_that_exited`'s
 /// twin. The grace's deadline has passed when its wait arms (the clock it is computed on lags an
 /// hour), so the timer wins the first poll, before the reactor reports the exit: only the one look at
-/// the pidfd at expiry can see it.
+/// the pidfd at expiry can see it. The hook releases the root's stdin before it waits for the exit,
+/// so a `SIGTERM` that was not delivered shows in the root's status.
 ///
 /// Mutants: the sync twin's; no look at the pidfd at expiry.
 #[cfg(target_os = "linux")]
@@ -267,7 +285,8 @@ async fn tokio_graceful_shutdown_tree_of_a_root_its_handle_cannot_read_sends_no_
     use std::os::unix::process::ExitStatusExt as _;
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
-    let mut child = session_sleep().spawn().expect("spawn");
+    let mut child = session_cat().spawn().expect("spawn");
+    let stdin = child.stdin().expect("stdin pipe");
     let pid = child.id().pid();
 
     let mark = crate::log_capture::mark();
@@ -281,6 +300,7 @@ async fn tokio_graceful_shutdown_tree_of_a_root_its_handle_cannot_read_sends_no_
                 [(pid, Term, crate::send_log::Via::Pidfd)],
                 "the SIGTERM went out before the grace"
             );
+            drop(stdin);
             crate::test_child::wait_until_zombie(pid);
         }
     });
@@ -363,7 +383,7 @@ async fn tokio_graceful_shutdown_tree_after_own_wait_claims_no_sigterm_it_did_no
     let termed = record_term_group();
     let mut child = session_sleep().spawn().expect("spawn");
     let pid = child.id().pid();
-    child.kill().expect("kill the root");
+    kill_own_child(pid);
     child.wait().await.expect("this handle reaps the root");
     let other = ProcessId::from_parts_for_test(pid, child.id().start_token_raw() + 1);
     // The shutdown's look finds another process; the sweep's, after the terminate, cannot read the
