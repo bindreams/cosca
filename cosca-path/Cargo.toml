@@ -3,7 +3,7 @@ name = "cosca-path"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-description = "Pure per-OS paths for cosca: faithful components, exact equality, no implicit normalisation."
+description = "Per-OS paths for cosca (faithful components, exact equality, no implicit normalisation) and a filesystem to ask about them."
 license.workspace = true
 repository.workspace = true
 keywords = ["path", "posix", "windows", "cross-platform"]
@@ -14,9 +14,18 @@ exclude = ["/clippy.toml"]
 # Zero-copy `&OsStr` -> `&Path` casts without hand-written `unsafe`.
 ref-cast = "1"
 
+[target.'cfg(unix)'.dependencies]
+# `ENOENT` and `ENOTDIR`: which `metadata` errors mean "nothing there".
+libc = "0.2"
+
 [dev-dependencies]
 # The test harness for the `harness = false` lib.
 skuld.workspace = true
+tempfile = "3"
+
+[target.'cfg(windows)'.dependencies]
+# File identity (`Filesystem::same_file`): `GetFileInformationByHandleEx` with `FileIdInfo`.
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [target.'cfg(windows)'.dev-dependencies]
 # The conversion tests compare against Win32's own pure string functions.

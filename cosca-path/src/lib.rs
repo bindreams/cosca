@@ -1,5 +1,5 @@
-//! Pure per-OS paths: [`posix::Path`] and [`windows::Path`] work on any host, each with its
-//! OS's rules.
+//! Per-OS paths: [`posix::Path`] and [`windows::Path`] work on any host, each with its OS's
+//! rules. The [`fs`] module asks a filesystem about them: this machine's, or one a test describes.
 //!
 //! Nothing here normalises implicitly. Constructors, [`PurePath::join`], equality and `Debug` keep
 //! every component as written: `a/./b` has the components `a`, `.`, `b`, and differs from `a/b`.
@@ -13,6 +13,7 @@ use std::borrow::{Borrow, Cow};
 use std::fmt::{self, Debug};
 use std::hash::Hash;
 
+pub mod fs;
 pub mod posix;
 pub mod windows;
 

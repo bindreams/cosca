@@ -584,6 +584,10 @@ impl fmt::Display for ConversionError {
 
 impl std::error::Error for ConversionError {}
 
+/// A [`Filesystem`](crate::fs::Filesystem) of posix paths that a test states. See
+/// [`FakeFilesystem`](crate::fs::FakeFilesystem).
+pub type FakeFilesystem = crate::fs::FakeFilesystem<Path>;
+
 #[cfg(test)]
 #[path = "posix_tests.rs"]
 mod posix_tests;

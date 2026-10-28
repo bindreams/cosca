@@ -176,8 +176,10 @@ dependencies = [
 name = "cosca-path"
 version = "0.6.0"
 dependencies = [
+ "libc",
  "ref-cast",
  "skuld",
+ "tempfile",
  "windows",
 ]
 

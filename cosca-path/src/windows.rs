@@ -873,6 +873,10 @@ impl fmt::Debug for PathBuf {
     }
 }
 
+/// A [`Filesystem`](crate::fs::Filesystem) of windows paths that a test states. See
+/// [`FakeFilesystem`](crate::fs::FakeFilesystem).
+pub type FakeFilesystem = crate::fs::FakeFilesystem<Path>;
+
 #[cfg(test)]
 #[path = "windows_tests.rs"]
 mod windows_tests;
