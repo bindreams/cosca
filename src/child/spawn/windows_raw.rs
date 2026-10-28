@@ -527,7 +527,7 @@ pub(crate) fn raw_spawn_teardown(
         }
     }
     // The kill was delivered, or the child's exit was already under way: either way it is dead or dying.
-    proc::fate_after_reap(true, waited)
+    proc::fate_after_reap(waited)
 }
 
 /// The `STARTUPINFOEXW` for a raw spawn, with what it points at.

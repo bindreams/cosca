@@ -466,6 +466,23 @@ fn teardown_of_an_exiting_unsignalled_child_reaps_it() {
     assert_eq!(observer.waits(), 1);
 }
 
+/// As above, with the wait failing: the exit is under way, so the child is dead or dying and the
+/// drop's fate is `Killed`, as `raw_spawn_teardown` answers. `end_on_wait` ends the process, so a
+/// second wait would return at once and fail the count.
+///
+/// Mutant: the exit-under-way arm answers `Unknown` for a failed wait.
+#[skuld::test]
+fn teardown_of_an_exiting_child_with_a_failed_wait_is_killed() {
+    use crate::error::ChildFate;
+    let child = spawn_suspended();
+    let observer = end_on_wait(&child);
+    observer.fail_next_wait();
+    crate::identity::windows_fault::refuse_next_terminate_as_exiting();
+    let torn = child.teardown_on_drop(identity_of(&child));
+    assert_eq!(torn.fate, ChildFate::Killed, "{torn:?}");
+    assert_eq!(observer.waits(), 1, "the teardown made the wait that failed");
+}
+
 /// A failed `GetExitCodeProcess` reports the plain Win32 code. A null handle is a real
 /// `ERROR_INVALID_HANDLE`.
 ///
@@ -585,20 +602,18 @@ fn wait_deadline_re_arms_past_a_clamped_timeout() {
     crate::wait::wait_ms_probe::assert_rearmed_with_fresh_remaining(&arms, 5);
 }
 
-/// A failed wait after a delivered kill is `Killed`; after a refused kill nothing was delivered, so
-/// the child's fate is not known. A collected status is `Reaped` either way.
+/// A failed wait after a teardown's kill, or an exit already under way, is `Killed`; a collected
+/// status is `Reaped`.
 ///
-/// Mutants: the refused kill's failed wait says `Killed`; a failed wait says `Reaped`.
+/// Mutants: a failed wait says `Unknown`; a failed wait says `Reaped`.
 #[skuld::test]
-fn a_failed_wait_after_a_refused_kill_is_unknown_not_killed() {
+fn a_failed_wait_after_a_teardown_kill_is_killed() {
     use crate::error::ChildFate;
     use std::os::windows::process::ExitStatusExt as _;
-    let failed = || Err(std::io::Error::other("forced wait failure 3a7c"));
-    let exited = || Ok(std::process::ExitStatus::from_raw(1));
-    assert_eq!(super::fate_after_reap(true, failed()), ChildFate::Killed);
-    assert_eq!(super::fate_after_reap(false, failed()), ChildFate::Unknown);
-    assert_eq!(super::fate_after_reap(true, exited()), ChildFate::Reaped);
-    assert_eq!(super::fate_after_reap(false, exited()), ChildFate::Reaped);
+    let failed = Err(std::io::Error::other("forced wait failure 3a7c"));
+    let exited = Ok(std::process::ExitStatus::from_raw(1));
+    assert_eq!(super::fate_after_reap(failed), ChildFate::Killed);
+    assert_eq!(super::fate_after_reap(exited), ChildFate::Reaped);
 }
 
 /// `kill` on a handle `TerminateProcess` rejects with something other than a denial is `Err` with

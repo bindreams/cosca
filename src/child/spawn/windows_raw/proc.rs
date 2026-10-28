@@ -167,7 +167,7 @@ impl RawChild {
             if let Ok(status) = &reaped {
                 crate::child::spawn::fault::record_teardown_reap(self.pid, *status);
             }
-            Torn::new(fate_after_reap(false, reaped))
+            Torn::new(fate_after_reap(reaped))
         };
         match windows_terminate_held(self.handle()) {
             Termination::Terminated => {
@@ -178,7 +178,7 @@ impl RawChild {
                 if let Ok(status) = &reaped {
                     crate::child::spawn::fault::record_teardown_reap(self.pid, *status);
                 }
-                Torn::new(fate_after_reap(true, reaped))
+                Torn::new(fate_after_reap(reaped))
             }
             Termination::Exited => reap_after_refusal(),
             // A runas child without `PROCESS_TERMINATE`: leave it, never block.
@@ -197,14 +197,13 @@ impl RawChild {
     }
 }
 
-/// The fate after a teardown's blocking wait: `Reaped` for a collected status. A wait that failed
-/// leaves `Killed` only if the kill was delivered, and `Unknown` if it was refused.
-pub(super) fn fate_after_reap(kill_delivered: bool, reaped: io::Result<ExitStatus>) -> crate::error::ChildFate {
+/// The fate after a teardown's blocking wait, which follows a delivered kill or an exit already
+/// under way: `Reaped` for a collected status, else `Killed` (dead or dying, the wait failed).
+pub(super) fn fate_after_reap(reaped: io::Result<ExitStatus>) -> crate::error::ChildFate {
     use crate::error::ChildFate;
     match reaped {
         Ok(_) => ChildFate::Reaped,
-        Err(_) if kill_delivered => ChildFate::Killed,
-        Err(_) => ChildFate::Unknown,
+        Err(_) => ChildFate::Killed,
     }
 }
 
