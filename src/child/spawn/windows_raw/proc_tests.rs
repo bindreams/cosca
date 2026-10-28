@@ -177,11 +177,10 @@ fn identity_of(child: &RawChild) -> crate::identity::ProcessId {
 
 /// A failed spawn's teardown whose `TerminateProcess` is refused because the process has exited (the
 /// handle lacks `PROCESS_TERMINATE`, so only its signalled state shows it) leaves the only wait to
-/// `wait_warning`: the kill itself does not block, so the wait is warned about once. Every exit wait
-/// the teardown performs is counted.
+/// `wait_warning`: the kill itself does not block, so the wait is warned about once, naming the pid.
 ///
 /// Mutants: the teardown's `kill` reaps on the denial, a blocking wait before `wait_warning`; the
-/// teardown waits directly once more before `wait_warning`.
+/// teardown waits directly once more before `wait_warning`; the warn drops the pid.
 #[cfg(feature = "tokio")]
 #[skuld::test]
 fn raw_spawn_teardown_with_a_denied_terminate_waits_only_inside_wait_warning() {
@@ -197,7 +196,7 @@ fn raw_spawn_teardown_with_a_denied_terminate_waits_only_inside_wait_warning() {
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
     let observer = super::fault::observe_waits(|| {});
-    crate::child::spawn::fault::set_late_exit();
+    let _late = crate::child::spawn::fault::set_late_exit();
     let fate = super::super::raw_spawn_teardown(denied, owner.id(), Some(id), Some(Duration::from_secs(1)));
 
     assert_eq!(
@@ -207,7 +206,63 @@ fn raw_spawn_teardown_with_a_denied_terminate_waits_only_inside_wait_warning() {
     );
     let warns = crate::log_capture::records_since_on_current_thread(mark, "still waiting");
     assert_eq!(warns.len(), 1, "one warn, and the wait goes on: {warns:?}");
+    assert!(
+        warns[0].1.contains(&format!("child {} ", owner.id())),
+        "the warn names the child: {warns:?}"
+    );
     assert_eq!(fate, ChildFate::Reaped);
+}
+
+/// A failed spawn's teardown with warnings on, whose child has already exited by the time it looks,
+/// does not warn. The handle lacks `PROCESS_TERMINATE`, so only its signalled state shows the exit.
+///
+/// Mutant: the look at the child's exit finds it late whatever its handle says.
+#[skuld::test]
+fn raw_spawn_teardown_of_an_exited_child_with_warnings_on_does_not_warn() {
+    use crate::error::ChildFate;
+
+    let owner = spawn_suspended();
+    let id = identity_of(&owner);
+    let denied = handle_without_terminate_right(&owner);
+    end_with_code_zero(owner.handle());
+    owner.wait().expect("wait for the owner's child");
+
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let fate = super::super::raw_spawn_teardown(denied, owner.id(), Some(id), Some(Duration::from_secs(1)));
+
+    assert_eq!(fate, ChildFate::Reaped);
+    let warns = crate::log_capture::records_since_on_current_thread(mark, "still waiting");
+    assert!(warns.is_empty(), "{warns:?}");
+}
+
+/// A failed spawn's teardown with warnings on whose child is still running when it looks (the kill is
+/// forced to be refused as an exit under way, so nothing ends it until the wait begins) warns once,
+/// naming the pid, and goes on to the wait. The child is really unsignalled: nothing overrides the
+/// look.
+///
+/// Mutants: the look finds the child exited whatever its handle says; the warn drops the pid.
+#[skuld::test]
+fn raw_spawn_teardown_of_a_running_child_with_warnings_on_warns_once_naming_it() {
+    use crate::error::ChildFate;
+
+    let owner = spawn_suspended();
+    let proc = duplicate_handle(&owner);
+    crate::identity::windows_fault::refuse_next_terminate_as_exiting();
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    // Ends the process once the wait begins, which is after the look.
+    let observer = end_on_wait(&owner);
+    let fate = super::super::raw_spawn_teardown(proc, owner.id(), None, Some(Duration::ZERO));
+
+    assert_eq!(fate, ChildFate::Reaped, "the wait goes on past the warn");
+    assert_eq!(observer.waits(), 1);
+    let warns = crate::log_capture::records_since_on_current_thread(mark, "still waiting");
+    assert_eq!(warns.len(), 1, "one warn: {warns:?}");
+    assert!(
+        warns[0].1.contains(&format!("child {} ", owner.id())),
+        "the warn names the child: {warns:?}"
+    );
 }
 
 /// A failed spawn's teardown whose kill was refused as a termination under way (the refusal is

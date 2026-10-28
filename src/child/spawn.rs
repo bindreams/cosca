@@ -3249,11 +3249,24 @@ pub(crate) mod fault {
 
     /// Makes the NEXT [`handle_signaled_by`](crate::wait::teardown_warn::handle_signaled_by) on this
     /// thread find its child not yet exited, whatever its handle says, so a test sees the warn of a
-    /// wait that really ends at once.
+    /// wait that really ends at once. The guard clears it on drop, used or not.
     #[cfg(all(windows, feature = "tokio"))]
-    pub(crate) fn set_late_exit() {
+    pub(crate) fn set_late_exit() -> LateExit {
         LATE_EXIT.with(|f| f.set(true));
+        LateExit(())
     }
+
+    #[cfg(all(windows, feature = "tokio"))]
+    #[must_use = "the override is cleared as soon as the guard is dropped"]
+    pub(crate) struct LateExit(());
+
+    #[cfg(all(windows, feature = "tokio"))]
+    impl Drop for LateExit {
+        fn drop(&mut self) {
+            LATE_EXIT.with(|f| f.set(false));
+        }
+    }
+
     #[cfg(windows)]
     pub(crate) fn take_late_exit() -> bool {
         LATE_EXIT.with(|f| f.replace(false))
@@ -3542,7 +3555,7 @@ pub(crate) mod fault {
     }
     impl TeardownBlocker {
         /// The `(pid, status)` of each reap the teardown recorded so far.
-        #[cfg(unix)]
+        #[cfg(any(unix, feature = "tokio"))]
         pub(crate) fn recorded(&self) -> Vec<TeardownReap> {
             self.reaps.recorded()
         }

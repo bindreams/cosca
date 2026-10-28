@@ -42,7 +42,7 @@ fn teardown_with_a_late_exit(mut cmd: crate::tokio::Command, force: fn(bool)) ->
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
     let _warn = crate::tokio::child::fault::warn_slow_teardowns();
-    fault::set_late_exit();
+    let _late = fault::set_late_exit();
     force(true);
     let spawned = cmd.spawn();
     force(false);
