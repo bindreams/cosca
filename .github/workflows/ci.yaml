@@ -309,17 +309,21 @@ jobs:
 
       # `pty` is an additive feature flag; exercise the feature-gated code paths.
       - name: Build tests (pty feature)
+        if: ${{ !cancelled() }}
         run: cargo nextest run --locked --no-run --features pty --target ${{ matrix.target }} --profile ci
 
       - name: Run tests (pty feature)
+        if: ${{ !cancelled() }}
         timeout-minutes: 8
         run: ${{ matrix.nextest }} pty cargo nextest run --locked --features pty --target ${{ matrix.target }}
 
 
       - name: Build tests (tokio feature)
+        if: ${{ !cancelled() }}
         run: cargo nextest run --locked --no-run --features tokio --target ${{ matrix.target }} --profile ci
 
       - name: Run tests (tokio feature)
+        if: ${{ !cancelled() }}
         timeout-minutes: 8
         run: ${{ matrix.nextest }} tokio cargo nextest run --locked --features tokio --target ${{ matrix.target }}
 
@@ -328,7 +332,7 @@ jobs:
       # `-E 'binary(cosca)'` keeps libtest binaries out: they ignore `SKULD_LABELS`. `tokio` is for
       # the group's one async test.
       - name: Run the tracer tests (Unix)
-        if: matrix.os == 'darwin' || matrix.os == 'linux'
+        if: ${{ !cancelled() && (matrix.os == 'darwin' || matrix.os == 'linux') }}
         timeout-minutes: 8
         env:
           COSCA_TEST_TRACER: "1"
@@ -339,9 +343,11 @@ jobs:
 
       # `serde` is an additive feature flag; exercise the persisted-identity wire format.
       - name: Build tests (serde feature)
+        if: ${{ !cancelled() }}
         run: cargo nextest run --locked --no-run --features serde --target ${{ matrix.target }} --profile ci
 
       - name: Run tests (serde feature)
+        if: ${{ !cancelled() }}
         timeout-minutes: 8
         run: ${{ matrix.nextest }} serde cargo nextest run --locked --features serde --target ${{ matrix.target }}
 
@@ -439,11 +445,11 @@ jobs:
       # should_panic oracles in the macOS-gated kinfo_tests.rs, and the Linux cgroup tests of what
       # release builds do where debug builds assert a broken precondition instead.
       - name: Build unit tests (release — debug_assertions off)
-        if: matrix.os == 'darwin' || matrix.os == 'linux'
+        if: ${{ !cancelled() && (matrix.os == 'darwin' || matrix.os == 'linux') }}
         run: cargo nextest run --locked --no-run --release --lib --target ${{ matrix.target }} --profile ci
 
       - name: Unit tests (release — debug_assertions off)
-        if: matrix.os == 'darwin' || matrix.os == 'linux'
+        if: ${{ !cancelled() && (matrix.os == 'darwin' || matrix.os == 'linux') }}
         timeout-minutes: 8
         run: ${{ matrix.nextest }} release cargo nextest run --locked --release --lib --target ${{ matrix.target }}
 
@@ -451,17 +457,17 @@ jobs:
       # The same lane with `tokio`: `tokio::wait_tests` pins `arm_at`'s calm-release arm (a deadline
       # inside tokio's timer margin waits unbounded where debug builds assert).
       - name: Build unit tests (release — debug_assertions off, tokio feature)
-        if: matrix.os == 'darwin' || matrix.os == 'linux'
+        if: ${{ !cancelled() && (matrix.os == 'darwin' || matrix.os == 'linux') }}
         run: cargo nextest run --locked --no-run --release --lib --features tokio --target ${{ matrix.target }} --profile ci
 
       - name: Unit tests (release — debug_assertions off, tokio feature)
-        if: matrix.os == 'darwin' || matrix.os == 'linux'
+        if: ${{ !cancelled() && (matrix.os == 'darwin' || matrix.os == 'linux') }}
         timeout-minutes: 8
         run: ${{ matrix.nextest }} release-tokio cargo nextest run --locked --release --lib --features tokio --target ${{ matrix.target }}
 
       # The tracer tests with `debug_assertions` off too.
       - name: Run the tracer tests (release — debug_assertions off)
-        if: matrix.os == 'darwin' || matrix.os == 'linux'
+        if: ${{ !cancelled() && (matrix.os == 'darwin' || matrix.os == 'linux') }}
         timeout-minutes: 8
         env:
           COSCA_TEST_TRACER: "1"
