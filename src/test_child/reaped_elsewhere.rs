@@ -100,8 +100,7 @@ pub(crate) fn term_ignoring_session_cat() -> crate::Command {
 pub(crate) fn kill_own_child(pid: u32) {
     #[cfg(debug_assertions)]
     {
-        // A `WNOWAIT | WNOHANG` peek reaps nothing and finds a live, stopped or zombie child alike;
-        // only a number that is no child of ours (reaped, or never ours) answers `ECHILD`.
+        // Only a number that is no child of ours answers `ECHILD`.
         // SAFETY: an all-zero `siginfo_t` is valid and `waitid` writes only into it.
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
         #[cfg(target_os = "linux")]

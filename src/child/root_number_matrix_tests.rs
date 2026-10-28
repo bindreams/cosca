@@ -608,7 +608,7 @@ fn run_sync(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
 
     let _released = release_when_the_drain_blocks(mechanism, &stdin);
     #[cfg(target_os = "linux")]
-    let _released_at_the_root_wait = release_when_the_root_wait_blocks(&stdin);
+    let _released_at_the_root_wait = crate::child::spawn::fault::release_when_a_teardown_waits(&stdin);
     let recorders = Recorders::start();
     // The cell checks what was sent, not what the call answered.
     _ = match op {
@@ -676,26 +676,6 @@ fn release_when_the_drain_blocks<T>(_: Mechanism, _: &std::rc::Rc<std::cell::Cel
     None
 }
 
-/// A sync drop, a failed spawn's cleanup and a graceful shutdown wait for a root they have killed:
-/// when that wait is about to block, stdin is closed, so a root kill that sent nothing lets the root
-/// end by itself instead of the wait hanging. The tree went first, so a forked `cat` the sweep
-/// missed ends alone here, as it does when the cell closes stdin after the call.
-#[cfg(target_os = "linux")]
-fn release_when_the_root_wait_blocks<T: 'static>(
-    stdin: &std::rc::Rc<std::cell::Cell<Option<T>>>,
-) -> Box<dyn std::any::Any> {
-    use crate::graceful_hooks::{at, HookPoint};
-    let release = |stdin: &std::rc::Rc<std::cell::Cell<Option<T>>>| {
-        let stdin = std::rc::Rc::clone(stdin);
-        move || drop(stdin.take())
-    };
-    Box::new((
-        at(HookPoint::AfterDropKill, release(stdin)),
-        at(HookPoint::BeforeReap, release(stdin)),
-        crate::child::spawn::fault::set_between_kill_and_wait(release(stdin)),
-    ))
-}
-
 /// What a sync teardown sent, then the end of what it left: closing stdin ends a root it left
 /// alone and a `cat` it did not kill. A root left unreaped stays a zombie until the test process
 /// ends, as nothing may reap it by its number.
@@ -759,7 +739,7 @@ async fn run_tokio(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
         .map(|path| (crate::test_groups::cgroup_leaf::LeafGuard::new(path.clone()), path));
     let _released = release_when_the_drain_blocks(mechanism, &stdin);
     #[cfg(target_os = "linux")]
-    let _released_at_the_root_wait = release_when_the_root_wait_blocks(&stdin);
+    let _released_at_the_root_wait = crate::child::spawn::fault::release_when_a_teardown_waits(&stdin);
     let recorders = Recorders::start();
     // The cell checks what was sent, not what the call answered.
     let teardown = match op {

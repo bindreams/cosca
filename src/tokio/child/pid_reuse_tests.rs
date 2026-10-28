@@ -462,9 +462,6 @@ in_fresh_pid_ns!(
 ///
 /// The hook releases the child's stdin once the teardown's kill returned, then checks it died of
 /// `SIGKILL`, as in the armed drop's test above.
-///
-/// Mutants: the awaited reap tries tokio's `try_wait` without looking first (it takes the
-/// stranger's record); the teardown's root kill sends nothing (the child is not `SIGKILL`ed).
 fn awaited_teardown_after_foreign_reap_and_reuse_takes_nothing_body() {
     use std::cell::RefCell;
     use std::rc::Rc;

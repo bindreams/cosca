@@ -22,7 +22,7 @@ pub(crate) fn seize_and_stop(pid: libc::pid_t) {
             std::io::Error::last_os_error()
         );
     }
-    // The stop, or an exit that would mean no stop is coming, seen without consuming it.
+    // The stop, or an exit that would mean no stop is coming.
     // SAFETY: an all-zero `siginfo_t` is valid and `waitid` writes only into it.
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     let r = unsafe {

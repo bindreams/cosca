@@ -34,8 +34,7 @@ async fn kill_tree_over_an_untrusted_view_errors_and_leaves_the_root_alive() {
     assert_eq!(status.code(), Some(0));
 }
 
-/// Mutants: "skip the root kill on a snapshot failure"; the root's pidfd kill sends nothing. The
-/// drop waits for the root, so its stdin is released between the drop's kill and its wait
+/// The drop waits for the root, so its stdin is released between the drop's kill and its wait
 /// (`release_between_kill_and_wait`): a root nothing killed exits `0` on the release, and the reap's
 /// recorded status then fails the `SIGKILL` assertion instead of leaving the drop waiting.
 #[skuld::test]

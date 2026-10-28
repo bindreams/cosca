@@ -7,8 +7,7 @@
 //! The tracee ends only by a kill, or by its stdin closing. The teardown's thread holds the stdin
 //! writer and drops it between the teardown's kill and its wait (`release_between_kill_and_wait`),
 //! so a kill that sent nothing leaves a tracee that exits `0` into the tracer's hold, and the
-//! teardown's reap records that status: the test fails on it by assertion, not by waiting on a
-//! tracee nothing ends.
+//! teardown's reap records that status.
 
 use std::io::BufRead as _;
 

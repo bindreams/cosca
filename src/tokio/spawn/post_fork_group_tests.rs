@@ -3,11 +3,11 @@
 //! while it has a member, as the identity-failure cleanup does; below 6.9 it kills the root alone and
 //! warns once that members of its group may be left running.
 
-use crate::child::group_exact_tests::{await_started, Member, RELEASE_FD, ROOT_WITH_A_MEMBER};
 use crate::child::spawn::fault;
 use crate::child::spawn::identity_group_tests::{Container, ROOT_LEAVING_A_MEMBER};
 use crate::error::ChildFate;
 use crate::send_log::{assert_group_signalled_first_through_the_pidfd, Capture, GroupStep, Route};
+use crate::test_child::member::{await_started, Member, RELEASE_FD, ROOT_WITH_A_MEMBER};
 use crate::test_groups::{cgroup, pidfd_group_signal, Group};
 
 /// The root's state when the spawn fails: running with its member, exited by itself and
@@ -72,9 +72,8 @@ fn failed_spawn_as(
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let (stdio, started, member) = Member::pipes();
-    // The cleanup kills the root, then waits for it, and the root reads its release pipe: released
-    // between the kill and the wait, a root the kill missed exits `0` and fails the `SIGKILL`
-    // assertion below, instead of keeping the wait.
+    // Released between the cleanup's kill and wait: a missed kill fails the `SIGKILL` assertion, not
+    // the wait.
     let release = member.release_root_when_a_teardown_waits();
     let reaps = fault::record_teardown_reaps();
     let fronted = front.is_some();

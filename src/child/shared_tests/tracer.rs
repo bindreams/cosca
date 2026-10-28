@@ -58,8 +58,6 @@ fn try_wait_leaves_a_ptrace_stop_for_the_tracer(#[fixture(tracer_group)] _group:
 /// a ptrace stop. The test then resumes the tracee as its tracer (`ESRCH`: the kill already woke
 /// it) and only then ends its stdin, so a kill that was lost leaves a resumed `cat` that reads EOF
 /// and exits 0, and the assertion on the status fails; nothing waits on the lost kill.
-///
-/// Mutant: the handle's pidfd send sends nothing (`signal::via_pidfd`).
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn kill_ends_a_child_stopped_for_its_tracer(#[fixture(tracer_group)] _group: &Group) {

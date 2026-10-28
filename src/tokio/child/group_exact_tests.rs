@@ -1,18 +1,11 @@
 //! Async twin of `child/group_exact_tests.rs`'s foreign-reap case: on Linux 6.9+ the root's pidfd
 //! names its group exactly, whoever reaped the root.
 
-use crate::child::group_exact_tests::{await_started, EndedAtTheSigterm, Member};
+use crate::child::group_exact_tests::EndedAtTheSigterm;
 use crate::send_log::{assert_group_signalled_first_through_the_pidfd, Capture, GroupStep, Route};
+use crate::test_child::member::{releasable_root_with_a_member_contained, Member};
 use crate::test_child::reaped_elsewhere::{kill_own_child, reap_behind_status};
 use crate::test_groups::{pidfd_group_signal, Group};
-
-/// The sync `ROOT_WITH_A_MEMBER`, its root blocked on fd 4 instead of sleeping: it exits `0` once the
-/// writer of that pipe is dropped, which the member's stdin does not share.
-const RELEASABLE_ROOT_WITH_A_MEMBER: [&str; 3] = [
-    "sh",
-    "-c",
-    "exec 3<&0; (cat <&3 3<&- >/dev/null && echo survived >&2) & echo started; exec cat <&4 4<&- 3<&- >/dev/null 2>/dev/null",
-];
 
 /// The sync `root_with_a_member`'s twin, and the writer whose drop ends its root with status `0`;
 /// drop it right after the kill.
@@ -20,26 +13,6 @@ pub(crate) fn releasable_root_with_a_member() -> (crate::tokio::Child, Member, s
     releasable_root_with_a_member_contained(|cmd| {
         cmd.contain_with(crate::ContainMode::Session);
     })
-}
-
-/// [`releasable_root_with_a_member`] with the containment `contain` sets.
-pub(crate) fn releasable_root_with_a_member_contained(
-    contain: impl FnOnce(&mut crate::tokio::Command),
-) -> (crate::tokio::Child, Member, std::io::PipeWriter) {
-    let (stdio, started, member) = Member::pipes();
-    let (gate, release) = crate::test_child::held_writer_stdin();
-    let child = {
-        let mut cmd = crate::tokio::Command::new();
-        cmd.args(RELEASABLE_ROOT_WITH_A_MEMBER);
-        cmd.fd(4, gate).expect("set the root's release pipe");
-        contain(&mut cmd);
-        cmd.stdin(stdio.stdin).expect("set stdin");
-        cmd.stdout(stdio.stdout).expect("set stdout");
-        cmd.stderr(stdio.stderr).expect("set stderr");
-        cmd.spawn().expect("spawn")
-    };
-    await_started(started);
-    (child, member, release)
 }
 
 /// A [`BLOCKER_ARGV`](crate::test_child::BLOCKER_ARGV) root in its own session, and the writer

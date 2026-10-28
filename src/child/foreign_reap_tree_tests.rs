@@ -89,8 +89,7 @@ fn kill_tree_after_own_wait_whose_pid_reads_unknown_sends_no_killpg() {
 
 /// A root whose own handle cannot say whether it was reaped: its pid may name another process, so
 /// `kill_tree` sends no `killpg`, kills the root through its pidfd, which names it exactly, and
-/// answers `Unassessable`. (macOS answers this earlier, through its untrusted-root path.) The root
-/// ends by itself once released, so a kill that was not delivered shows in its status.
+/// answers `Unassessable`. (macOS answers this earlier, through its untrusted-root path.)
 ///
 /// Mutants: a `RootState::Unknown` root's group is signalled; the root is not killed through its
 /// pidfd; the warn does not say it was.
@@ -137,7 +136,6 @@ fn kill_tree_of_a_root_its_handle_cannot_read_kills_it_through_its_pidfd_alone()
 
 /// A root whose own handle cannot say whether it was reaped: `terminate_tree` sends no `SIGTERM` by
 /// its number, sends it one through its pidfd, which names it exactly, and answers `Unassessable`.
-/// The root ends by itself once released, so a `SIGTERM` that was not delivered shows in its status.
 ///
 /// Mutants: nothing is sent to the root; a `SIGTERM` goes to its group; the warn does not say it was
 /// sent.
@@ -185,7 +183,6 @@ fn terminate_tree_of_a_root_its_handle_cannot_read_terms_it_through_its_pidfd_al
 /// A root whose own handle cannot say whether it was reaped and ignores `SIGTERM`:
 /// `graceful_shutdown_tree` sends it the `SIGTERM` through its pidfd, and after the grace the kill
 /// through its pidfd, and nothing by its number. It ends `Unassessable` with one warn that says so.
-/// The root ends by itself once released, so a kill that was not delivered shows in its status.
 ///
 /// Mutants: nothing is sent to the root; the kill after the grace is not sent; a second `SIGTERM`
 /// in its place; a `killpg` or a `SIGTERM` to the group.

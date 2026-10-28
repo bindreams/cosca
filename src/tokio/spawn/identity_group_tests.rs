@@ -1,10 +1,10 @@
 //! Async twin of `child/spawn/identity_group_tests.rs`: a spawn that fails because its root's
 //! identity cannot be read, for a session root that left a member in its process group.
 
-use crate::child::group_exact_tests::{Member, RELEASE_FD};
 use crate::child::spawn::identity_group_tests::{left_running_note, Container, Failed, Failure};
 use crate::error::ChildFate;
 use crate::send_log::{assert_group_signalled_first_through_the_pidfd, Capture, GroupStep, Route};
+use crate::test_child::member::{Member, RELEASE_FD};
 use crate::test_groups::{cgroup, pidfd_group_signal, Group};
 
 /// The sync `failed_spawn`'s twin.
@@ -12,8 +12,7 @@ fn failed_spawn(failure: Failure, container: Container) -> Failed {
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let (stdio, started, member) = Member::pipes();
-    // As the sync `failed_spawn`: released between the cleanup's kill and its wait, a root the kill
-    // missed exits `0` and fails `assert_killed` below, instead of keeping the wait.
+    // Released between the cleanup's kill and wait: a missed kill fails `assert_killed`, not the wait.
     let release = member.release_root_when_a_teardown_waits();
     let reaps = crate::child::spawn::fault::record_teardown_reaps();
     let armed = failure.arm(started);

@@ -888,13 +888,8 @@ async fn exited_within_of_a_child_never_shown_ours_is_false() {
     reap_behind_the_owner(pid);
 }
 
-/// The handle's `kill` ends a child stopped under this thread's `PTRACE_SEIZE`: a `SIGKILL` wakes a
-/// ptrace stop. The test then resumes the tracee as its tracer (`ESRCH`: the kill already woke it)
-/// and only then ends its stdin, so a kill that was lost leaves a resumed `cat` that reads EOF and
-/// exits 0, and the assertion on the status fails; nothing waits on the lost kill. The async twin
-/// of `child/shared_tests/tracer.rs`'s `kill_ends_a_child_stopped_for_its_tracer`.
-///
-/// Mutant: the pidfd send in `ProcSource::signal` sends nothing (`signal::via_pidfd`).
+/// Async twin of `child/shared_tests/tracer.rs`'s `kill_ends_a_child_stopped_for_its_tracer`, over
+/// `ProcSource::signal`.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn kill_ends_a_child_stopped_for_its_tracer(#[fixture(tracer_group)] _group: &Group) {

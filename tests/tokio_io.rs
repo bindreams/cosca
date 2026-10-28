@@ -294,35 +294,26 @@ fn remove_leftover_leaf(leaf: Option<std::path::PathBuf>) {
     let _ = leaf;
 }
 
-// Not on Linux: the armed drop waits for the root, which the test holds until after the drop, so a
-// drop whose kills sent nothing would hang. Its Linux case is
-// `a_drop_kills_a_contained_root_and_the_members_of_its_group` in `src/tokio/child_drop_tests.rs`.
+// Windows only: an armed drop waits for the root on Linux and macOS, which this binary holds until
+// after the drop, so a drop whose kills sent nothing would hang there. Their cases are
+// `a_drop_kills_a_cgroup_root_and_its_members_and_removes_the_leaf`,
+// `a_drop_kills_a_session_root_and_the_members_of_its_group` (Linux) and
+// `a_drop_kills_an_fd_marker_root_and_the_members_of_its_tree` (macOS) in `src/tokio/child_drop_tests.rs`.
 #[cfg(feature = "tokio")]
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
 #[skuld::test]
 async fn async_drop_tears_down_a_contained_tree() {
     let (child, root, grand) = common::spawn_released_tree_async().await;
-    let leaf = cgroup_leaf_of(&child);
-    let _leaf_cleanup = leaf_cleanup(&leaf);
     // The containment assert guards the teardown below from passing for unrelated reasons.
-    assert_ne!(
-        child.containment(),
-        cosca::Containment::None,
-        "contained spawn must engage a mechanism"
-    );
-    #[cfg(windows)]
     assert_eq!(
         child.containment(),
         cosca::Containment::JobObject,
         "Windows Strongest => JobObject"
     );
     drop(child);
-    // No post-drop liveness assertion: on Windows the drop waits for neither the root nor a leaf. Each
-    // member's death is proven by how it ended, and a drop that killed nothing fails there by
-    // assertion, not by a read blocked on the survivor.
+    // No post-drop liveness assertion: the drop waits for neither root nor Job Object here; each
+    // member's death is proven by how it ended.
     common::assert_members_torn_down(vec![(root, "the root"), (grand, "the grandchild")]);
-    // No cgroup leaf off Linux.
-    let _ = leaf;
 }
 
 // The mechanisms that still kill after the root is reaped: a macOS fd marker's holder sweep and a
@@ -1215,9 +1206,8 @@ async fn death_watch_accept_or_die_async_also_reports_a_gone_descendant_as_dead(
     gone.wait().expect("reap the descendant: its identity is now Gone");
     drop(gone); // Windows: closing the handle is what makes `OpenProcess` fail for the pid
 
-    // The panic unwinds the task, and the dropped `target` waits for its reap (its kill is not what
-    // this test checks). `target_stdin` goes into the task, declared after `target`, so the unwind
-    // closes it first: the thread that would otherwise hold it is the one the task runs on.
+    // `target_stdin` is declared after `target`, so the unwind closes it first and `target`'s waiting
+    // drop can reap.
     let message = panic_message_of(async move {
         let (mut target, _release) = (target, target_stdin);
         common::accept_or_die_async_also(&listener, &mut target, Some(gone_id)).await

@@ -18,9 +18,7 @@ fn session_sleep() -> crate::tokio::Command {
     cmd
 }
 
-/// A `cat` in its own session reading a stdin pipe the test holds: a test that must see a signal end
-/// it drops that stdin only after the send, so a send that went nowhere shows in the exit status
-/// (`0`, which no signal gives) instead of leaving a wait to block on a root that never ends.
+/// Async twin of the sync `session_cat`.
 #[cfg(target_os = "linux")]
 fn session_cat() -> crate::tokio::Command {
     let mut cmd = crate::tokio::Command::new();
@@ -117,8 +115,7 @@ async fn tokio_kill_tree_after_own_wait_whose_pid_reads_unknown_sends_no_killpg(
 }
 
 /// The sync `kill_tree_of_a_root_its_handle_cannot_read_kills_it_through_its_pidfd_alone`'s twin.
-/// Same mutants. The root ends by itself once released, so a kill that was not delivered shows in
-/// its status.
+/// Same mutants.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn tokio_kill_tree_of_a_root_its_handle_cannot_read_kills_it_through_its_pidfd_alone() {
@@ -174,8 +171,7 @@ fn term_ignoring_session_cat() -> crate::tokio::Command {
 }
 
 /// The sync `terminate_tree_of_a_root_its_handle_cannot_read_terms_it_through_its_pidfd_alone`'s
-/// twin. Same mutants. The root ends by itself once released, so a `SIGTERM` that was not delivered
-/// shows in its status.
+/// twin. Same mutants.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn tokio_terminate_tree_of_a_root_its_handle_cannot_read_terms_it_through_its_pidfd_alone() {
@@ -219,8 +215,7 @@ async fn tokio_terminate_tree_of_a_root_its_handle_cannot_read_terms_it_through_
 }
 
 /// The sync `graceful_shutdown_tree_of_a_root_its_handle_cannot_read_escalates_through_its_pidfd_alone`'s
-/// twin. Same mutants. The root ends by itself once released, so a kill that was not delivered shows
-/// in its status.
+/// twin. Same mutants.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn tokio_graceful_shutdown_tree_of_a_root_its_handle_cannot_read_escalates_through_its_pidfd_alone() {
