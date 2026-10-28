@@ -4,14 +4,20 @@
 //! blocking `waitid`, which the teardown reaches only after the warn.
 //!
 //! `conclude` is called with the outcome each arm answers, and a child no spawn forked.
+//!
+//! The tracee ends only by a kill, or by its stdin closing. The teardown's thread drops the stdin
+//! once the kill returned (`release_between_kill_and_wait`), so a kill that sent nothing leaves a
+//! tracee that exits `0` into the tracer's hold, and the test fails on the status the teardown
+//! reaped it as instead of hanging.
 
 use std::os::fd::OwnedFd;
 
 use super::{conclude, LeftFront, Outcome};
+use crate::child::spawn::fault::release_between_kill_and_wait;
 use crate::error::Error;
 use crate::test_groups::{tracer_group, Group};
 use crate::test_support::foreign_tracer::{
-    self, assert_warns_once_after_seizing, assert_warns_once_before_blocking, Names,
+    self, assert_reaped_by_sigkill, assert_warns_once_after_seizing, assert_warns_once_before_blocking, Names,
 };
 
 /// The pidfd of `child`, which the handshake would have held.
@@ -20,17 +26,21 @@ fn pidfd_of(child: &std::process::Child) -> OwnedFd {
 }
 
 /// `conclude` of a spawn that failed (`Err`) with `outcome(pidfd)`, for a tracee a foreign tracer
-/// holds once killed: asserts the one warn, naming no pid.
+/// holds once killed: asserts the one warn, naming no pid, and that the teardown's kill ended it.
 fn assert_failed_spawn_warns_once(outcome: fn(OwnedFd) -> Outcome) {
-    let child = foreign_tracer::blocker();
+    let mut child = foreign_tracer::blocker();
     let pid = child.id();
     let pidfd = pidfd_of(&child);
-    assert_warns_once_after_seizing(Names::Unknown, pid, move || {
+    let stdin = child.stdin.take().expect("piped stdin");
+    let reaps = assert_warns_once_after_seizing(Names::Unknown, pid, move || {
+        let blocker = release_between_kill_and_wait(stdin);
         let warn_after = crate::tokio::slow_teardown_after();
         let spawned = Err::<::tokio::process::Child, _>(std::io::Error::other("tokio failed"));
         let failed = conclude(spawned, outcome(pidfd), LeftFront::NotAFront, warn_after);
         assert!(failed.is_err(), "the failed spawn fails");
+        blocker.recorded()
     });
+    assert_reaped_by_sigkill(&reaps);
     drop(child);
 }
 
@@ -63,11 +73,11 @@ fn a_child_whose_spawn_the_helper_failed_is_torn_down_with_a_warn(#[fixture(trac
 
 /// `conclude` of a spawn whose tokio child never ran the program (it was not told to go), with
 /// `outcome(pidfd)`: the handshake kills it and waits for its exit (`await_unexecuted_exit`) before
-/// tokio reaps it. Asserts the one warn, naming the child.
+/// tokio reaps it. Asserts the one warn, naming the child, and that the kill ended it.
 fn assert_unexecuted_tokio_child_warns_once(outcome: fn(OwnedFd) -> Outcome) {
     let (pid_tx, pid_rx) = std::sync::mpsc::channel();
     let (seized_tx, seized_rx) = std::sync::mpsc::channel();
-    assert_warns_once_before_blocking(
+    let reaps = assert_warns_once_before_blocking(
         Names::Pid,
         move || {
             let rt = ::tokio::runtime::Builder::new_current_thread()
@@ -79,7 +89,8 @@ fn assert_unexecuted_tokio_child_warns_once(outcome: fn(OwnedFd) -> Outcome) {
             cmd.args(&crate::test_child::BLOCKER_ARGV[1..])
                 .stdin(std::process::Stdio::piped());
             foreign_tracer::allow_any_tracer(cmd.as_std_mut());
-            let child = crate::test_spawn::spawn_tokio(&mut cmd).expect("spawn the tracee");
+            let mut child = crate::test_spawn::spawn_tokio(&mut cmd).expect("spawn the tracee");
+            let blocker = release_between_kill_and_wait(child.stdin.take().expect("piped stdin"));
             let pid = child.id().expect("a pid");
             let pidfd = crate::containment::cgroup::test_support::pidfd_of(pid);
             pid_tx.send(pid).expect("report the pid");
@@ -87,6 +98,7 @@ fn assert_unexecuted_tokio_child_warns_once(outcome: fn(OwnedFd) -> Outcome) {
             let warn_after = crate::tokio::slow_teardown_after();
             let failed = conclude(Ok(child), outcome(pidfd), LeftFront::NotAFront, warn_after);
             assert!(failed.is_err(), "the failed spawn fails");
+            blocker.recorded()
         },
         move || {
             let pid = pid_rx.recv().expect("the tracee's pid");
@@ -95,6 +107,7 @@ fn assert_unexecuted_tokio_child_warns_once(outcome: fn(OwnedFd) -> Outcome) {
             (pid, tracer)
         },
     );
+    assert_reaped_by_sigkill(&reaps);
 }
 
 /// Every copy of its end closed before it was told to go.

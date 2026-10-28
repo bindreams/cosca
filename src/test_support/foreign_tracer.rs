@@ -466,3 +466,20 @@ pub(crate) fn assert_warns_once_after_seizing<R: Send>(
         },
     )
 }
+
+/// At least one child was reaped by a teardown, and each died of `SIGKILL`: the teardown's kill was
+/// delivered, and the child did not exit `0` on its stdin's release.
+#[cfg(feature = "tokio")]
+#[track_caller]
+pub(crate) fn assert_reaped_by_sigkill(reaps: &[(u32, std::process::ExitStatus)]) {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    assert!(!reaps.is_empty(), "the teardown must have reaped the child");
+    for (pid, status) in reaps {
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGKILL),
+            "pid {pid} must be SIGKILLed by its teardown kill, not exit once its stdin was released: {status:?}"
+        );
+    }
+}

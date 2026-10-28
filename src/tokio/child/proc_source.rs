@@ -71,9 +71,14 @@ impl Forgotten {
         match state {
             RootState::Unknown(_) => Forgotten::Unproven,
             RootState::Unpinned => Forgotten::Unpinned,
-            RootState::Reaped => Forgotten::ReapedElsewhere,
-            // Every caller takes the state from `elsewhere`, which excludes it.
-            RootState::Unreaped => unreachable!("a child its handle shows ours is not forgotten"),
+            RootState::Unreaped | RootState::Reaped => {
+                // Every caller takes the state from `elsewhere`, which excludes `Unreaped`.
+                debug_assert!(
+                    !matches!(state, RootState::Unreaped),
+                    "a child its handle shows ours is forgotten"
+                );
+                Forgotten::ReapedElsewhere
+            }
         }
     }
 
@@ -209,9 +214,14 @@ fn foreign_why(state: &RootState) -> String {
             "is not pinned by this process (RootState::Unpinned: {})",
             crate::signal::UNPINNED_WHY
         ),
-        RootState::Reaped => "was reaped by someone else, or cannot be shown to be ours".to_owned(),
-        // Every caller takes the state from `elsewhere`, which excludes it.
-        RootState::Unreaped => unreachable!("a child its handle shows ours is not forgotten"),
+        RootState::Unreaped | RootState::Reaped => {
+            // Every caller takes the state from `elsewhere`, which excludes `Unreaped`.
+            debug_assert!(
+                !matches!(state, RootState::Unreaped),
+                "a child its handle shows ours is forgotten"
+            );
+            "was reaped by someone else, or cannot be shown to be ours".to_owned()
+        }
     }
 }
 

@@ -244,7 +244,9 @@ fn std_pipe_exposed(std_pipes: usize) -> bool {
     free >= 2 * std_pipes + 2
 }
 
-/// How long the wait runs before it says what it is waiting on.
+/// How long the wait runs before it says what it is waiting on. A test sets its own
+/// (`seams::say_waiting_after_then_record`).
+#[cfg(not(test))]
 const SAY_WAITING_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Blocks until the report of child `pid` is in `read_end`, or the child is gone, then answers what

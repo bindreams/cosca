@@ -594,7 +594,8 @@ fn an_abandoned_child_reaped_before_the_look_gets_no_group_kill_by_number() {
 /// A child known by its `/proc` directory, killed and then reaped by another reaper before the wait:
 /// its number may name another child of this process by then, one that is running. The wait's warn
 /// does not name that process. (The wait by the number collects it: the residual the cgroup
-/// module's Ownership paragraph states.)
+/// module's Ownership paragraph states.) Fixing #341 (no reap by pid) ends that residual, and with it
+/// this test's assertion that the wait collects the holder.
 ///
 /// Mutant: the warn watches through a pidfd opened on the number, unchecked against the directory.
 #[skuld::test]

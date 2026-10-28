@@ -13,7 +13,9 @@ use std::io::BufRead as _;
 
 use crate::child::spawn::fault::{self, SpawnPoint};
 use crate::test_groups::{cgroup, tracer_group, Group};
-use crate::test_support::foreign_tracer::{self, assert_warns_once_before_blocking, Names, Tracer, LET_EXIT, REAP};
+use crate::test_support::foreign_tracer::{
+    self, assert_reaped_by_sigkill, assert_warns_once_before_blocking, Names, Tracer, LET_EXIT, REAP,
+};
 
 /// Where a tracee is handed to the foreign tracer.
 #[derive(Clone, Copy)]
@@ -92,22 +94,7 @@ fn assert_front_or_child_teardown_warns_once_before_blocking(seize: Seize, front
     // A front is ended by its leaf's kill, not by a send to it, so what it was reaped as says
     // nothing of the sends under test.
     if !front {
-        assert_sigkilled(&reaps);
-    }
-}
-
-/// At least one child was reaped by a teardown, and each died of `SIGKILL`: the teardown's kill was
-/// delivered, and the child did not exit `0` on its stdin's release.
-fn assert_sigkilled(reaps: &[(u32, std::process::ExitStatus)]) {
-    use std::os::unix::process::ExitStatusExt as _;
-
-    assert!(!reaps.is_empty(), "the teardown must have reaped the child");
-    for (pid, status) in reaps {
-        assert_eq!(
-            status.signal(),
-            Some(libc::SIGKILL),
-            "pid {pid} must be SIGKILLed by its teardown kill, not exit once its stdin was released: {status:?}"
-        );
+        assert_reaped_by_sigkill(&reaps);
     }
 }
 
@@ -294,5 +281,5 @@ async fn a_failed_elevation_writes_cleanup_warns_once_past_1s(#[fixture(tracer_g
         move || (pid, tracer),
     );
     assert!(cleaned.is_err(), "the failed write fails the spawn");
-    assert_sigkilled(&reaps);
+    assert_reaped_by_sigkill(&reaps);
 }

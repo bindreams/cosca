@@ -3,12 +3,18 @@
 //! cannot end before the tracer lets go; it lets go only once the abandonment's thread sleeps in a
 //! blocking `waitid`, which it reaches only after the warn.
 //!
-//! The intent the leaf receives is forged, naming a tracee the test spawned.
+//! The intent the leaf receives is forged, naming a tracee the test spawned. The tracee ends only by
+//! a kill, or by its stdin closing. The abandonment's thread drops the stdin once the kill returned
+//! (`set_before_exit_wait`, `set_between_kill_and_wait`), so a kill that sent nothing leaves a
+//! tracee that exits `0` into the tracer's hold, and the test fails on the status it was reaped as
+//! instead of hanging.
 
 use std::os::fd::{AsRawFd as _, OwnedFd};
+use std::os::unix::process::ExitStatusExt as _;
 
-use super::super::{HANDLE_PIDFD, HANDLE_PROC_DIR, TAG_INTENT};
+use super::super::{fault, HANDLE_PIDFD, HANDLE_PROC_DIR, TAG_INTENT};
 use super::{Abandoned, CgroupLeaf, WarnAfter};
+use crate::child::spawn::fault as spawn_fault;
 use crate::test_groups::{tracer_group, Group};
 use crate::test_support::foreign_tracer::{self, assert_warns_once_after_seizing, Names};
 
@@ -16,24 +22,45 @@ use crate::test_support::foreign_tracer::{self, assert_warns_once_after_seizing,
 /// once killed, and asserts the one warn, naming `names`.
 ///
 /// `intent(pid, pidfd)` sends the intent; `handshake(pidfd)` is the pidfd the handshake left.
+/// Asserts that the abandonment reaped the tracee, and that its kill ended it.
 fn assert_abandonment_warns_once(
     names: Names,
     intent: fn(&CgroupLeaf, u32, &OwnedFd),
     handshake: fn(OwnedFd) -> Option<OwnedFd>,
 ) {
-    let child = foreign_tracer::blocker();
+    let mut child = foreign_tracer::blocker();
     let pid = child.id();
     let pidfd = crate::containment::cgroup::test_support::pidfd_of(pid);
-    let abandoned = assert_warns_once_after_seizing(names, pid, move || {
+    let stdin = child.stdin.take().expect("piped stdin");
+    let (abandoned, signals) = assert_warns_once_after_seizing(names, pid, move || {
+        // Whichever wait the abandonment reaches (`end_child`'s, or the pidfd teardown's) releases it.
+        let held = std::rc::Rc::new(std::cell::Cell::new(Some(stdin)));
+        let release = || {
+            let held = std::rc::Rc::clone(&held);
+            move || drop(held.take())
+        };
+        let _at_the_exit_wait = fault::set_before_exit_wait(release());
+        let _between_kill_and_wait = spawn_fault::set_between_kill_and_wait(release());
+        let reaps = spawn_fault::record_teardown_reaps();
         let dir = tempfile::tempdir().expect("tempdir");
         let leaf_path = dir.path().join("cosca-slow-teardown");
         std::fs::create_dir(&leaf_path).expect("create the leaf");
         let mut leaf = CgroupLeaf::for_test_at(leaf_path);
         intent(&leaf, pid, &pidfd);
         let mut warn = WarnAfter(crate::tokio::slow_teardown_after());
-        leaf.abandon_before_verdict(false, handshake(pidfd), &mut warn)
+        let abandoned = leaf.abandon_before_verdict(false, handshake(pidfd), &mut warn);
+        let reaped = fault::take_reaped_orphans().into_iter().map(|(_, signal)| signal);
+        let signals: Vec<_> = reaped
+            .chain(reaps.recorded().into_iter().map(|(_, status)| status.signal()))
+            .collect();
+        (abandoned, signals)
     });
     assert_eq!(abandoned, Abandoned::Ended);
+    assert!(!signals.is_empty(), "the abandonment must have reaped the tracee");
+    assert!(
+        signals.iter().all(|signal| *signal == Some(libc::SIGKILL)),
+        "the tracee must die of the abandonment's kill, not exit once its stdin was released: {signals:?}"
+    );
     drop(child);
 }
 
