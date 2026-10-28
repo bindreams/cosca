@@ -559,14 +559,22 @@ impl Attached {
         let result = match self {
             Attached::None | Attached::Delegated => Ok(()),
             #[cfg(unix)]
+            Attached::ProcessGroup(_) if cfg!(target_os = "macos") => Ok(()), // MUTANT: no kill.
+            #[cfg(unix)]
             Attached::ProcessGroup(pgid) => crate::containment::unix::kill_group(*pgid, root),
             #[cfg(target_os = "linux")]
             Attached::Cgroup(leaf) => leaf.hard_kill(),
             #[cfg(windows)]
             Attached::JobObject(job) => job.hard_kill().map_err(Error::Io),
             #[cfg(target_os = "macos")]
+            Attached::FdMarker(_) if cfg!(target_os = "macos") => Ok(()), // MUTANT: no kill.
+            #[cfg(target_os = "macos")]
             Attached::FdMarker(m) => m.hard_kill(root),
             Attached::TreeWalk(root) => {
+                // MUTANT: no kill.
+                if cfg!(target_os = "macos") {
+                    return (Ok(()), true);
+                }
                 return match crate::containment::treewalk::hard_kill(*root) {
                     Ok(complete) => (Ok(()), complete),
                     Err(e) => (Err(e), false),
@@ -604,13 +612,18 @@ impl Attached {
                 })
             }
             #[cfg(unix)]
+            Attached::ProcessGroup(_) if cfg!(target_os = "macos") => Ok(()), // MUTANT: no kill.
+            #[cfg(unix)]
             Attached::ProcessGroup(pgid) => crate::containment::unix::term_group(*pgid, root),
             #[cfg(target_os = "linux")]
             Attached::Cgroup(leaf) => leaf.terminate(),
             #[cfg(windows)]
             Attached::JobObject(_) => crate::containment::windows::terminate(_child_pid),
             #[cfg(target_os = "macos")]
+            Attached::FdMarker(_) if cfg!(target_os = "macos") => Ok(()), // MUTANT: no kill.
+            #[cfg(target_os = "macos")]
             Attached::FdMarker(m) => m.terminate(root),
+            Attached::TreeWalk(_) if cfg!(target_os = "macos") => Ok(()), // MUTANT: no kill.
             Attached::TreeWalk(root) => crate::containment::treewalk::terminate(*root),
         }
     }

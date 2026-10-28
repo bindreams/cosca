@@ -51,6 +51,18 @@ leak-timeout = { period = "5s", result = "fail" }
 filter = 'test(/(^|::)m[0-9]+_/)'
 success-output = "immediate"
 
+# RED-ONLY (#758 macOS measurement, throwaway, never merged): a test that hangs under a mutant ends as a
+# nextest TIMEOUT after 30 s, so one run lists every hang. The three slow tests below are legitimately slow
+# (measured on main@d55681eb, darwin/arm64: 38 s, 19 s, 7.7 s, 5.2 s; amd64 up to 87 s), and get 180 s.
+# `[profile.ci]` overrides come before the default profile's, so these win over the 300 s lib bound.
+[[profile.ci.overrides]]
+filter = 'test(/the_gate_agrees_/) | test(/tree_paths_send_nothing_by_the_root_number_after_a_reap/) | test(/a_timeout_clause_does_not_bound_do_shell_script/)'
+slow-timeout = { period = "60s", terminate-after = 3, grace-period = "1s" }
+
+[[profile.ci.overrides]]
+filter = 'all()'
+slow-timeout = { period = "30s", terminate-after = 1, grace-period = "1s" }
+
 # Every nextest step in ci.yaml uploads this file as an artifact (the `upload-junit` action).
 [profile.ci.junit]
 path = "junit.xml"

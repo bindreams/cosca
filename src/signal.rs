@@ -264,7 +264,13 @@ pub(crate) fn via_verified_pid(pid: u32, identity: Option<u64>, sig: Sig) -> io:
     let sent = match seam {
         Some(errno) => Err(io::Error::from_raw_os_error(errno)),
         // SAFETY: `target` is a positive pid, so the signal goes to one process.
-        None if unsafe { libc::kill(target, sig.as_libc()) } == 0 => Ok(()),
+        None if {
+            let _ = (target, sig.as_libc());
+            true
+        } =>
+        {
+            Ok(())
+        } // MUTANT: no kill.
         None => Err(io::Error::last_os_error()),
     };
     #[cfg(test)]
