@@ -78,6 +78,8 @@ pub(crate) enum ReadPurpose {
     Adopt,
     /// The re-read just before a signal.
     Kill,
+    /// The reads that bracket the arming of an exit watch in `os_process::open`.
+    Open,
     /// A peek that found an exit record, just before its consume.
     Peek,
     /// A peek that found the child running.
@@ -123,6 +125,9 @@ const _: () = assert!(std::mem::size_of::<ProcUniqIdentifierInfo>() == 56);
 pub(crate) struct UniqInfo {
     /// The process's 64-bit id, never reused and kept across `exec`.
     pub(crate) unique_id: u64,
+    /// `p_idversion`, the audit token's `val[7]`: it changes at `exec`, and the kernel checks it
+    /// when it signals by audit token.
+    pub(crate) id_version: i32,
 }
 
 /// The outcome of a `proc_pidinfo` read by pid.
@@ -176,6 +181,7 @@ pub(crate) fn uniq_info(pid: RawPid, purpose: ReadPurpose) -> UniqRead {
     match pidinfo(pid, PROC_PIDUNIQIDENTIFIERINFO, &mut info) {
         Ok(()) => UniqRead::Found(UniqInfo {
             unique_id: info.p_uniqueid,
+            id_version: info.p_idversion,
         }),
         Err(ReadErr::Gone) => UniqRead::Gone,
         Err(ReadErr::Refused(errno)) => UniqRead::Refused(errno),

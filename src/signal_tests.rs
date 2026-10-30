@@ -203,7 +203,13 @@ mod macos {
     #[skuld::test]
     fn a_pid_that_vanishes_after_the_check_is_gone_and_the_attempt_is_recorded() {
         let log = Capture::start();
-        let _forced = uniq_fault::force_uniq_read_once(ReadPurpose::Kill, UniqRead::Found(UniqInfo { unique_id: 7 }));
+        let _forced = uniq_fault::force_uniq_read_once(
+            ReadPurpose::Kill,
+            UniqRead::Found(UniqInfo {
+                unique_id: 7,
+                id_version: 0,
+            }),
+        );
         assert_eq!(
             via_verified_pid(NEVER_A_PID, Some(7), Sig::Kill).expect("gone is Ok"),
             Sent::Gone

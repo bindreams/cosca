@@ -88,6 +88,7 @@ pub(crate) fn other_unique_id(pid: u32) -> UniqRead {
     };
     UniqRead::Found(UniqInfo {
         unique_id: info.unique_id ^ 1,
+        ..info
     })
 }
 
@@ -752,7 +753,10 @@ fn macos_attach_failure_teardown_does_not_reap_a_pid_reused_after_the_wait() {
     // The wait's peek matches; the reap's peek finds another id.
     let _first = uniq_fault::force_uniq_read_once(
         ReadPurpose::Peek,
-        UniqRead::Found(crate::identity::UniqInfo { unique_id: unique }),
+        UniqRead::Found(crate::identity::UniqInfo {
+            unique_id: unique,
+            id_version: 0,
+        }),
     );
     let _second = uniq_fault::force_uniq_read_once(ReadPurpose::Peek, other);
     let fate = teardown(child, unique);

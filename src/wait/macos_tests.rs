@@ -33,8 +33,8 @@ fn drain_reports_none_when_no_event_pending() {
 fn a_pid_zero_identity_never_reaches_kill() {
     let bogus = crate::identity::ProcessId::from_parts_for_test(0, 1);
     // Already-gone is success: the pid holds a process, but not the one named.
-    crate::wait::kill(bogus).expect("a pid-0 identity resolves to a stranger, i.e. already gone");
-    crate::wait::terminate(bogus).expect("same for the graceful signal");
+    crate::os_process::kill_by_id(bogus).expect("a pid-0 identity resolves to a stranger, i.e. already gone");
+    crate::os_process::terminate_by_id(bogus).expect("same for the graceful signal");
     // If either call had reached `kill(2)`, this process would have died with it.
     assert_eq!(
         crate::identity::ProcessId::current().is_alive(),
@@ -99,8 +99,11 @@ fn a_deadline_beyond_the_kevent_limit_still_returns_the_exit() {
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
     let mut stdin = child.stdin.take();
     let _hooks = super::test_hooks::HookGuard::install(move |_, _| drop(stdin.take()));
-    let deadline = crate::wait::deadline_from(Duration::from_secs(u64::from(u32::MAX)));
-    let exited = super::block_until_exit(id, deadline).expect("a far deadline is not an error");
+    let mut process = crate::os_process::open(id, crate::os_process::Op::Wait)
+        .expect("open")
+        .expect("a live child opens");
+    let exited = crate::os_process::drive::exited_by(&mut *process, Some(Duration::from_secs(u64::from(u32::MAX))))
+        .expect("a far deadline is not an error");
     assert!(exited, "the child was ended, so the wait reports its exit");
     assert_eq!(
         super::test_hooks::requested_timeouts(),

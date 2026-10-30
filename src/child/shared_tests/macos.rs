@@ -21,7 +21,10 @@ fn is_echild(e: &std::io::Error) -> bool {
 }
 
 fn found(unique_id: u64) -> UniqRead {
-    UniqRead::Found(UniqInfo { unique_id })
+    UniqRead::Found(UniqInfo {
+        unique_id,
+        id_version: 0,
+    })
 }
 
 /// `pid`'s real unique id.

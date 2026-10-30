@@ -27,7 +27,7 @@ impl Sig {
 
 #[cfg(target_os = "macos")]
 impl Sig {
-    fn as_libc(self) -> libc::c_int {
+    pub(crate) fn as_libc(self) -> libc::c_int {
         match self {
             Sig::Kill => libc::SIGKILL,
             Sig::Term => libc::SIGTERM,

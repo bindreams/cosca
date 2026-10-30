@@ -18,7 +18,6 @@ pub(crate) mod fake;
 #[cfg(target_os = "linux")]
 pub(crate) mod linux;
 #[cfg(target_os = "macos")]
-#[allow(dead_code, reason = "MacProcess, its consumer, lands in a later task of #839")]
 pub(crate) mod macos;
 #[cfg(windows)]
 pub(crate) mod windows;
@@ -93,10 +92,7 @@ pub(crate) fn open(id: ProcessId, op: Op) -> Result<Option<Box<dyn OsProcess>>, 
     #[cfg(windows)]
     return Ok(windows::WindowsProcess::open(id, op)?.map(|p| Box::new(p) as Box<dyn OsProcess>));
     #[cfg(target_os = "macos")]
-    {
-        let _ = (id, op);
-        unimplemented!("OsProcess on macOS lands in task 4 of #839");
-    }
+    return Ok(macos::MacProcess::open(id, op)?.map(|p| Box::new(p) as Box<dyn OsProcess>));
 }
 
 /// Hard-kill the process `id` names, identity-verified. Already gone, or its pid now names another

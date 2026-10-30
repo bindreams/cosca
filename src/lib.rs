@@ -42,6 +42,10 @@
 //! `memory.pressure`, and that write dereferences NULL in the 5.6 kernel. cosca does not touch
 //! pressure-stall information; the CI guest boots 5.6 with `psi=0` for that reason.
 //!
+//! **macOS 14.4 or newer**, for `proc_signal_with_audittoken`. It signals a process by an audit token
+//! that names its pid and `exec` version, so the kernel never signals a process that took a reused
+//! pid. Earlier versions are unsupported, with no fallback.
+//!
 //! # A child under a debugger
 //!
 //! A debugger that traces a [`Child`] owns its signal delivery: a graceful signal, such as the

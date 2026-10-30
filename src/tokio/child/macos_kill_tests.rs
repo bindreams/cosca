@@ -201,8 +201,13 @@ async fn macos_wait_does_not_watch_a_stranger_that_took_the_pid_after_the_pre_ch
         stored = real ^ 1;
         stored
     });
-    let _pre_check =
-        uniq_fault::force_uniq_read_once(ReadPurpose::Running, UniqRead::Found(UniqInfo { unique_id: stored }));
+    let _pre_check = uniq_fault::force_uniq_read_once(
+        ReadPurpose::Running,
+        UniqRead::Found(UniqInfo {
+            unique_id: stored,
+            id_version: 0,
+        }),
+    );
     let first = {
         let mut waiting = Box::pin(proc.wait());
         std::future::poll_fn(|cx| Poll::Ready(waiting.as_mut().poll(cx))).await
