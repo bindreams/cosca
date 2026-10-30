@@ -155,6 +155,42 @@ fn dropped_wait_releases_the_watch() {
     drop(runtime);
 }
 
+/// Open descriptors of this process (each count includes the directory handle that reads it).
+#[cfg(target_os = "linux")]
+fn open_fds() -> usize {
+    std::fs::read_dir("/proc/self/fd").expect("read /proc/self/fd").count()
+}
+
+/// A wait round registers the pidfd the process already holds: it opens no descriptor of its own,
+/// so a wait does not fail with `EMFILE` where the held pidfd alone would not.
+///
+/// Mutant: register a duplicate of the pidfd, which is one more open descriptor for the round.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_wait_round_opens_no_descriptor() {
+    use crate::os_process::{open, Op};
+    use crate::test_child::held_contained_blocker_without_cgroup;
+
+    let (child, stdin) = held_contained_blocker_without_cgroup(crate::Stdio::null());
+    let mut process = open(child.id(), Op::Wait).unwrap().expect("a live process opens");
+    let runtime = ::tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build a runtime");
+    let before = open_fds();
+    let during = runtime.block_on(async {
+        let mut wait = pin!(exited_by(&mut *process, None));
+        assert!(
+            wait.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending(),
+            "a running process waits"
+        );
+        open_fds()
+    });
+    assert_eq!(during, before, "the round registered a descriptor of its own");
+    drop(stdin);
+    child.wait().expect("reap the blocker");
+}
+
 /// The futures cross threads on every platform: `spawn` needs it.
 #[skuld::test]
 fn async_waits_are_send() {

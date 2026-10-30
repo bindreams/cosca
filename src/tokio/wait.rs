@@ -134,9 +134,10 @@ pub(crate) mod fault_observer {
     }
 }
 
-/// Resolve when `pidfd`'s process exits or is reaped (no internal timeout).
+/// Resolve when `pidfd`'s process exits or is reaped (no internal timeout). `pidfd` is owned or
+/// borrowed; it is deregistered when this returns or is dropped, before a borrow ends.
 #[cfg(target_os = "linux")]
-pub(crate) async fn watch_pidfd(pidfd: std::os::fd::OwnedFd) -> Result<(), Error> {
+pub(crate) async fn watch_pidfd<F: std::os::fd::AsRawFd>(pidfd: F) -> Result<(), Error> {
     use ::tokio::io::unix::AsyncFd;
     use ::tokio::io::Interest;
     // The pidfd becomes readable (POLLIN) when the task becomes a zombie; POLLHUP once

@@ -85,7 +85,7 @@ async fn wait(wait_for: &WaitFor<'_>, deadline: Option<Option<std::time::Instant
 async fn watch(wait_for: &WaitFor<'_>) -> Result<(), Error> {
     match wait_for {
         #[cfg(target_os = "linux")]
-        WaitFor::Readable(fd) => crate::tokio::wait::watch_pidfd(fd.try_clone_to_owned().map_err(Error::Io)?).await,
+        WaitFor::Readable(fd) => crate::tokio::wait::watch_pidfd(*fd).await,
         #[cfg(target_os = "macos")]
         WaitFor::Kqueue(watch) => {
             use ::tokio::io::unix::AsyncFd;
