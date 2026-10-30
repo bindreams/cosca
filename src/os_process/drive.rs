@@ -40,7 +40,7 @@ pub(crate) fn exited_by_id(id: ProcessId, timeout: Option<Duration>) -> Result<b
     not(test),
     allow(
         dead_code,
-        reason = "called by tests until a handle-holding `Process` (slice 1b) drives its own process"
+        reason = "production waits go through `exited_by_id`; a handle-holding `Process` will call this"
     )
 )]
 pub(crate) fn exited_by(p: &mut dyn OsProcess, timeout: Option<Duration>) -> Result<bool, Error> {
