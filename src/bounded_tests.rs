@@ -42,9 +42,9 @@ fn a_section_is_per_thread() {
 mod waits {
     use super::Section;
 
-    /// `os_process::drive::exited_by`, which every platform's process-exit wait sits behind.
+    /// `os_process::drive::exited_by_id`, which every platform's process-exit wait sits behind.
     ///
-    /// Mutant: drop the assert from `os_process::drive::exited_by`.
+    /// Mutant: drop the assert from `os_process::drive::exited_by_id`.
     #[skuld::test]
     #[should_panic(expected = "would block inside an async Drop")]
     fn exited_by_id_refuses_inside_a_section() {

@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use crate::identity::ProcessId;
-use crate::os_process::drive::exited_by;
+use crate::os_process::drive::{absolute, drive};
 use crate::os_process::{kill_by_id, open, terminate_by_id, Exit, Op};
 use crate::signal::{Sent, Sig};
 use crate::test_child::{held_contained_blocker_without_cgroup, wait_until_zombie};
@@ -18,9 +18,9 @@ fn open_live_then_kill_then_exited() {
     let (child, _stdin, id) = blocker();
     let mut p = open(id, Op::Kill).unwrap().expect("a live process opens");
     assert!(matches!(p.exited().unwrap(), Exit::Running(_)));
-    assert!(!exited_by(&mut *p, Some(Duration::ZERO)).unwrap());
+    assert!(!drive(&mut *p, absolute(Some(Duration::ZERO))).unwrap());
     assert_eq!(p.signal(Sig::Kill).unwrap(), Sent::Delivered);
-    assert!(exited_by(&mut *p, None).unwrap());
+    assert!(drive(&mut *p, absolute(None)).unwrap());
     child.wait().unwrap();
 }
 
@@ -39,7 +39,7 @@ fn open_with_wrong_start_token_is_none_and_sends_nothing() {
     assert!(open(other, Op::Kill).unwrap().is_none());
     // Still running: the right identity opens and sees no exit.
     let mut p = open(id, Op::Wait).unwrap().expect("the blocker is alive");
-    assert!(!exited_by(&mut *p, Some(Duration::ZERO)).unwrap());
+    assert!(!drive(&mut *p, absolute(Some(Duration::ZERO))).unwrap());
     child.kill().unwrap();
     child.wait().unwrap();
 }
@@ -50,7 +50,7 @@ fn exited_before_first_look_returns_true() {
     let mut p = open(id, Op::Wait).unwrap().expect("a live process opens");
     child.kill().unwrap();
     wait_until_zombie(id.pid());
-    assert!(exited_by(&mut *p, Some(Duration::ZERO)).unwrap());
+    assert!(drive(&mut *p, absolute(Some(Duration::ZERO))).unwrap());
     child.wait().unwrap();
 }
 
@@ -63,7 +63,7 @@ fn signal_after_exit_is_gone() {
     child.wait().unwrap();
     assert_eq!(p.signal(Sig::Kill).unwrap(), Sent::Gone);
     // A reaped process reads as exited, too (POLLHUP).
-    assert!(exited_by(&mut *p, Some(Duration::ZERO)).unwrap());
+    assert!(drive(&mut *p, absolute(Some(Duration::ZERO))).unwrap());
 }
 
 /// Mutant: a look hands out some other fd to wait on. The kernel names a pidfd's process in its
@@ -118,7 +118,7 @@ fn by_id_helpers_on_a_gone_process_are_ok() {
     kill_by_id(other).unwrap();
     terminate_by_id(other).unwrap();
     let mut p = open(id, Op::Wait).unwrap().expect("the blocker is alive");
-    assert!(!exited_by(&mut *p, Some(Duration::ZERO)).unwrap());
+    assert!(!drive(&mut *p, absolute(Some(Duration::ZERO))).unwrap());
     child.kill().unwrap();
     child.wait().unwrap();
     kill_by_id(id).unwrap();

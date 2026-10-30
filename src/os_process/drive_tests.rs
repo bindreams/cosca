@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use super::exited_by;
+use super::{absolute, drive};
 use crate::error::Error;
 use crate::identity::ProcessId;
 use crate::os_process::fake::{Answer, FakeProcess};
@@ -14,7 +14,7 @@ fn fake(exits: impl IntoIterator<Item = Answer>) -> FakeProcess {
 fn zero_timeout_looks_once_and_never_blocks() {
     block_probe::take();
     let mut p = fake([Answer::Running]);
-    assert!(!exited_by(&mut p, Some(Duration::ZERO)).unwrap());
+    assert!(!drive(&mut p, absolute(Some(Duration::ZERO))).unwrap());
     assert_eq!(p.looks(), 1);
     assert!(block_probe::take().is_empty(), "a zero timeout must not block");
 }
@@ -24,7 +24,7 @@ fn zero_timeout_looks_once_and_never_blocks() {
 fn a_failed_look_is_returned_without_blocking() {
     block_probe::take();
     let mut p = fake([Answer::Err(std::io::ErrorKind::PermissionDenied)]);
-    let err = exited_by(&mut p, None).unwrap_err();
+    let err = drive(&mut p, absolute(None)).unwrap_err();
     assert!(
         matches!(&err, Error::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied),
         "{err:?}"
@@ -37,7 +37,7 @@ fn a_failed_look_is_returned_without_blocking() {
 fn exited_before_first_look_returns_true_without_blocking() {
     block_probe::take();
     let mut p = fake([Answer::Exited]);
-    assert!(exited_by(&mut p, None).unwrap());
+    assert!(drive(&mut p, absolute(None)).unwrap());
     assert_eq!(p.looks(), 1);
     assert!(block_probe::take().is_empty());
 }
@@ -47,7 +47,7 @@ fn wakes_and_looks_again() {
     block_probe::take();
     let mut p = fake([Answer::Running, Answer::Exited]);
     p.wake();
-    assert!(exited_by(&mut p, Some(Duration::from_secs(60))).unwrap());
+    assert!(drive(&mut p, absolute(Some(Duration::from_secs(60)))).unwrap());
     assert_eq!(p.looks(), 2);
     assert_eq!(block_probe::take().len(), 1, "one wait, between the two looks");
 }
@@ -64,7 +64,7 @@ fn expiry_ends_in_one_final_look() {
             test_clock::advance(Duration::from_secs(11));
         }
     });
-    assert!(!exited_by(&mut p, Some(timeout)).unwrap());
+    assert!(!drive(&mut p, absolute(Some(timeout))).unwrap());
     assert_eq!(p.looks(), 2);
     let last = *p.look_times().last().unwrap();
     assert!(last > start + timeout, "the final look must come after the deadline");
@@ -80,30 +80,12 @@ fn duration_max_is_unbounded() {
     block_probe::take();
     let mut p = fake([Answer::Running, Answer::Exited]);
     p.wake();
-    assert!(exited_by(&mut p, Some(Duration::MAX)).unwrap());
+    assert!(drive(&mut p, absolute(Some(Duration::MAX))).unwrap());
     assert_eq!(
         block_probe::take(),
         [None],
         "an overflowing timeout arms an unbounded wait"
     );
-}
-
-#[skuld::test]
-fn forced_watch_error_is_returned_before_looking() {
-    let mut p = fake([Answer::Exited]);
-    fault::set_force_watch_error(true);
-    assert!(exited_by(&mut p, None).is_err());
-    assert_eq!(p.looks(), 0);
-    assert!(!fault::armed(), "the seam is consumed");
-}
-
-#[cfg(feature = "tokio")]
-#[skuld::test]
-#[should_panic(expected = "would block inside an async Drop")]
-fn refuses_inside_a_bounded_section() {
-    let _section = crate::bounded::Section::enter();
-    let mut p = fake([Answer::Exited]);
-    _ = exited_by(&mut p, Some(Duration::ZERO));
 }
 
 #[cfg(windows)]
@@ -113,7 +95,7 @@ mod windows {
 
     use std::time::{Duration, Instant};
 
-    use super::exited_by;
+    use super::{absolute, drive};
     use crate::os_process::drive::exited_by_id;
     use crate::os_process::{open, Op};
     use crate::test_child::live_blocker as blocker;
@@ -134,7 +116,7 @@ mod windows {
         wait_ms_probe::take();
         let _override = remaining_override_seam::set(Duration::from_micros(500));
         let deadline = at + Duration::from_millis(5);
-        let result = exited_by(&mut *process, Some(Duration::from_millis(5)));
+        let result = drive(&mut *process, absolute(Some(Duration::from_millis(5))));
         let reached = Instant::now() >= deadline;
         let arms = wait_ms_probe::take();
         drop(stdin);
@@ -181,7 +163,7 @@ mod windows {
         wait_ms_probe::take();
         let _override = remaining_override_seam::set(Duration::from_micros(500));
         wait_ms_probe::on_second_arm(move || drop(stdin)); // EOF -> the blocker exits for real
-        let result = exited_by(&mut *process, Some(Duration::from_secs(3600)));
+        let result = drive(&mut *process, absolute(Some(Duration::from_secs(3600))));
         let arms = wait_ms_probe::take();
         let exited = result.expect("a genuinely-terminated child must not report a wait failure");
         child.wait().expect("reap the child after it exits");
@@ -200,7 +182,7 @@ mod windows {
         wait_ms_probe::take();
         let _clamp = wait_clamp_seam::set(5);
         wait_ms_probe::on_second_arm(move || drop(stdin));
-        let result = exited_by(&mut *process, Some(Duration::from_secs(3600)));
+        let result = drive(&mut *process, absolute(Some(Duration::from_secs(3600))));
         let arms = wait_ms_probe::take();
         let exited = result.expect("a genuinely-terminated child must not report a wait failure");
         child.wait().expect("reap the child after it exits");
@@ -218,7 +200,7 @@ mod windows {
         let mut process = open(id, Op::Wait).unwrap().expect("a live process opens");
         let (_clock, at) = FrozenClockGuard::install();
         let deadline = at + Duration::from_millis(50);
-        let result = exited_by(&mut *process, Some(Duration::from_millis(50)));
+        let result = drive(&mut *process, absolute(Some(Duration::from_millis(50))));
         let reached = Instant::now() >= deadline;
         drop(stdin);
         child.wait().expect("reap the blocker");

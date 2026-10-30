@@ -6,7 +6,7 @@ use std::time::Duration;
 use super::{ExitWatch, MacProcess};
 use crate::error::Error;
 use crate::identity::{uniq_info, ProcessId, ReadPurpose, UniqRead};
-use crate::os_process::drive::exited_by;
+use crate::os_process::drive::{absolute, drive};
 use crate::os_process::{kill_by_id, open, terminate_by_id, Exit, Op, OsProcess};
 use crate::signal::{Sent, Sig};
 use crate::test_child::wait_until_zombie;
@@ -80,9 +80,9 @@ fn open_live_then_kill_then_exited() {
         matches!(p.exited().unwrap(), Exit::Running(_)),
         "a live process reads Running"
     );
-    assert!(!exited_by(&mut *p, Some(Duration::ZERO)).unwrap());
+    assert!(!drive(&mut *p, absolute(Some(Duration::ZERO))).unwrap());
     assert_eq!(p.signal(Sig::Kill).unwrap(), Sent::Delivered);
-    assert!(exited_by(&mut *p, None).unwrap());
+    assert!(drive(&mut *p, absolute(None)).unwrap());
     assert_eq!(
         child.wait().unwrap().signal(),
         Some(libc::SIGKILL),
@@ -127,7 +127,7 @@ fn open_with_wrong_start_token_is_none_and_sends_nothing() {
     assert_eq!(sends.by_identity(), vec![], "nothing may be sent to a stranger");
     // Still running: the right identity opens and sees no exit.
     let mut p = open(id, Op::Wait).unwrap().expect("the blocker is alive");
-    assert!(!exited_by(&mut *p, Some(Duration::ZERO)).unwrap());
+    assert!(!drive(&mut *p, absolute(Some(Duration::ZERO))).unwrap());
     child.kill().unwrap();
     child.wait().unwrap();
 }
@@ -148,7 +148,7 @@ fn exited_before_first_look_returns_true() {
     child.kill().unwrap();
     wait_until_zombie(id.pid());
     crate::wait::block_probe::take();
-    assert!(exited_by(&mut *p, Some(Duration::ZERO)).unwrap());
+    assert!(drive(&mut *p, absolute(Some(Duration::ZERO))).unwrap());
     assert!(
         crate::wait::block_probe::take().is_empty(),
         "an exit the watch holds is found by the look, with no wait armed"
@@ -162,7 +162,7 @@ fn exited_stays_true_after_a_wait_consumed_the_event() {
     let (mut child, id) = blocker();
     let mut p = open(id, Op::Wait).unwrap().expect("a live process opens");
     child.kill().unwrap();
-    assert!(exited_by(&mut *p, None).unwrap());
+    assert!(drive(&mut *p, absolute(None)).unwrap());
     assert!(
         matches!(p.exited().unwrap(), Exit::Exited),
         "a later look still says Exited"
@@ -199,7 +199,7 @@ fn signal_reaches_a_process_that_execed_after_open() {
         vec![(id.pid(), libc::SIGKILL), (id.pid(), libc::SIGKILL)],
         "the first token was stale (exec changed p_idversion), the second carried the new one"
     );
-    assert!(exited_by(&mut *p, None).unwrap());
+    assert!(drive(&mut *p, absolute(None)).unwrap());
     assert_eq!(
         child.wait().unwrap().signal(),
         Some(libc::SIGKILL),

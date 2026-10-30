@@ -29,7 +29,6 @@ impl WindowsProcess {
         let handle = match op {
             Op::Wait => open_verified(id)?,
             Op::Kill => open_verified_for_kill(id)?,
-            Op::Terminate => return Err(terminate_unsupported()),
         };
         let Some(handle) = handle else {
             return Ok(None);

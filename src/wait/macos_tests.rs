@@ -99,10 +99,7 @@ fn a_deadline_beyond_the_kevent_limit_still_returns_the_exit() {
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
     let mut stdin = child.stdin.take();
     let _hooks = super::test_hooks::HookGuard::install(move |_, _| drop(stdin.take()));
-    let mut process = crate::os_process::open(id, crate::os_process::Op::Wait)
-        .expect("open")
-        .expect("a live child opens");
-    let exited = crate::os_process::drive::exited_by(&mut *process, Some(Duration::from_secs(u64::from(u32::MAX))))
+    let exited = crate::os_process::drive::exited_by_id(id, Some(Duration::from_secs(u64::from(u32::MAX))))
         .expect("a far deadline is not an error");
     assert!(exited, "the child was ended, so the wait reports its exit");
     assert_eq!(

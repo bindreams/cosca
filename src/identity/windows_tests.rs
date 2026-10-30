@@ -4,15 +4,11 @@ use windows::Win32::System::Threading::{PROCESS_QUERY_LIMITED_INFORMATION, PROCE
 use super::{creation_token, current_token, is_running, start_token};
 use crate::identity::windows_fixture::spawn_restricted;
 use crate::identity::{Liveness, Resolved, StartToken};
-use crate::os_process::{open, Op};
 
 /// One look at whether `id`'s process has exited, through the `Op::Wait` open: gone or recycled
 /// is exited.
 fn exited_now(id: crate::identity::ProcessId) -> Result<bool, crate::error::Error> {
-    match open(id, Op::Wait)? {
-        None => Ok(true),
-        Some(mut process) => crate::os_process::drive::exited_by(&mut *process, Some(std::time::Duration::ZERO)),
-    }
+    crate::os_process::drive::exited_by_id(id, Some(std::time::Duration::ZERO))
 }
 
 #[skuld::test]

@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use crate::error::Error;
 use crate::identity::ProcessId;
-use crate::os_process::drive::exited_by;
+use crate::os_process::drive::{absolute, drive};
 use crate::os_process::{kill_by_id, open, terminate_by_id, Exit, Op, OsProcess as _, WaitFor};
 use crate::signal::{Sent, Sig};
 use crate::test_child::live_blocker as blocker;
@@ -13,10 +13,10 @@ fn open_live_then_kill_then_exited() {
     let (child, _stdin, id) = blocker();
     let mut waiter = open(id, Op::Wait).unwrap().expect("a live process opens");
     assert!(matches!(waiter.exited().unwrap(), Exit::Running(WaitFor::Signalled(_))));
-    assert!(!exited_by(&mut *waiter, Some(Duration::ZERO)).unwrap());
+    assert!(!drive(&mut *waiter, absolute(Some(Duration::ZERO))).unwrap());
     let mut killer = open(id, Op::Kill).unwrap().expect("a live process opens");
     assert_eq!(killer.signal(Sig::Kill).unwrap(), Sent::Delivered);
-    assert!(exited_by(&mut *waiter, None).unwrap());
+    assert!(drive(&mut *waiter, absolute(None)).unwrap());
     child.wait().unwrap();
 }
 
@@ -29,7 +29,7 @@ fn open_with_wrong_start_token_is_none_and_sends_nothing() {
     kill_by_id(other).expect("a stale identity is already gone");
     // Still running: the right identity opens and sees no exit.
     let mut p = open(id, Op::Wait).unwrap().expect("the blocker is alive");
-    assert!(!exited_by(&mut *p, Some(Duration::ZERO)).unwrap());
+    assert!(!drive(&mut *p, absolute(Some(Duration::ZERO))).unwrap());
     child.kill().unwrap();
     child.wait().unwrap();
 }
@@ -42,7 +42,7 @@ fn exited_before_first_look_returns_true() {
     // `TerminateProcess` returns before the process object is signalled; the child's own wait is
     // the barrier.
     child.wait().unwrap();
-    assert!(exited_by(&mut *p, Some(Duration::ZERO)).unwrap());
+    assert!(drive(&mut *p, absolute(Some(Duration::ZERO))).unwrap());
 }
 
 /// Mutant: a refused `TerminateProcess` on an exited process is an error, or `kill_by_id` of an
@@ -87,7 +87,7 @@ fn terminate_by_id_is_unsupported_and_sends_nothing() {
     assert_eq!(platform, "windows");
     assert!(detail.contains("graceful_shutdown_tree"), "{detail}");
     let mut p = open(id, Op::Wait).unwrap().expect("the blocker is alive");
-    assert!(!exited_by(&mut *p, Some(Duration::ZERO)).unwrap());
+    assert!(!drive(&mut *p, absolute(Some(Duration::ZERO))).unwrap());
     child.kill().unwrap();
     child.wait().unwrap();
 }
@@ -114,22 +114,6 @@ fn a_kill_opens_no_wait_and_still_kills() {
     }
     assert_eq!(p.signal(Sig::Kill).unwrap(), Sent::Delivered);
     child.wait().unwrap();
-}
-
-/// `open` for a terminate refuses with the same `Unsupported` as `terminate_by_id`.
-#[skuld::test]
-fn open_for_terminate_is_unsupported() {
-    let err = open(ProcessId::current(), Op::Terminate).expect_err("Windows has no graceful per-process signal");
-    assert!(
-        matches!(
-            err,
-            Error::Unsupported {
-                platform: "windows",
-                ..
-            }
-        ),
-        "{err:?}"
-    );
 }
 
 /// Mutant: a look hands out some other handle to wait on.

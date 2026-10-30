@@ -7,7 +7,7 @@ use crate::error::Error;
 use crate::identity::ProcessId;
 use crate::wait::remaining;
 
-/// What both entry points do before any open or look: the bounded-section assert, then the
+/// What the entry point does before any open or look: the bounded-section assert, then the
 /// watch-fault seam.
 fn enter() -> Result<(), Error> {
     #[cfg(feature = "tokio")]
@@ -19,10 +19,13 @@ fn enter() -> Result<(), Error> {
     Ok(())
 }
 
-/// [`exited_by`] on the process `id` names. A process that is gone, or whose pid now names another
-/// process, has exited: `Ok(true)` with no wait. The bounded-section assert, the watch-fault seam
-/// and the deadline come before the open, so the timeout counts from the call and the first two
-/// hold for a gone id too.
+/// Block until the process `id` names has exited or `timeout` has passed, and say which.
+/// `Ok(true)` = exited, `Ok(false)` = still running after the deadline's final look; a process that
+/// is gone, or whose pid now names another process, has exited, with no wait. `None` = until exit;
+/// `Some(ZERO)` = one look, no blocking call; a `Duration` too large for the clock is unbounded.
+/// Non-reaping. The bounded-section assert, the watch-fault seam and the deadline come before the
+/// open, so the timeout counts from the call and the first two hold for a gone id too. Every
+/// blocking call is armed from the time remaining, read right before it.
 pub(crate) fn exited_by_id(id: ProcessId, timeout: Option<Duration>) -> Result<bool, Error> {
     enter()?;
     let deadline = absolute(timeout);
@@ -32,29 +35,14 @@ pub(crate) fn exited_by_id(id: ProcessId, timeout: Option<Duration>) -> Result<b
     }
 }
 
-/// Block until `p` has exited or `timeout` has passed, and say which. `Ok(true)` = exited;
-/// `Ok(false)` = still running after the deadline's final look. `None` = until exit;
-/// `Some(ZERO)` = one look, no blocking call; a `Duration` too large for the clock is unbounded.
-/// Non-reaping. Every blocking call is armed from the time remaining, read right before it.
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "production waits go through `exited_by_id`; a handle-holding `Process` will call this"
-    )
-)]
-pub(crate) fn exited_by(p: &mut dyn OsProcess, timeout: Option<Duration>) -> Result<bool, Error> {
-    enter()?;
-    drive(p, absolute(timeout))
-}
-
 /// `timeout` as an absolute deadline, fixed up front so no wake extends the total wait.
-fn absolute(timeout: Option<Duration>) -> Option<Option<Instant>> {
+pub(super) fn absolute(timeout: Option<Duration>) -> Option<Option<Instant>> {
     timeout.and_then(crate::wait::deadline_from)
 }
 
-/// The loop of [`exited_by`] against an absolute `deadline`.
-fn drive(p: &mut dyn OsProcess, deadline: Option<Option<Instant>>) -> Result<bool, Error> {
+/// The wait loop against an absolute `deadline` from [`absolute`]: look; if running, block on what
+/// the look returned.
+pub(super) fn drive(p: &mut dyn OsProcess, deadline: Option<Option<Instant>>) -> Result<bool, Error> {
     loop {
         // Read before the look: a look made at or after the deadline is the final one.
         let final_look = remaining(deadline) == Some(Duration::ZERO);

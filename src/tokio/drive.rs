@@ -15,7 +15,7 @@ use crate::identity::ProcessId;
 use crate::os_process::{open, Exit, Op, OsProcess, WaitFor};
 use crate::tokio::wait::deadline_from;
 
-/// What both entry points do before any open or look: the watch-fault seam.
+/// What the entry point does before any open or look: the watch-fault seam.
 fn enter() -> Result<(), Error> {
     #[cfg(test)]
     if crate::wait::fault::take_force_watch_error() {
@@ -24,9 +24,12 @@ fn enter() -> Result<(), Error> {
     Ok(())
 }
 
-/// [`exited_by`] on the process `id` names. A process that is gone, or whose pid now names another
-/// process, has exited: `Ok(true)` with no wait. The watch-fault seam and the deadline come before
-/// the open, so the timeout counts from the call and the seam holds for a gone id too.
+/// Wait until the process `id` names has exited or `timeout` has passed, and say which.
+/// `Ok(true)` = exited, `Ok(false)` = still running after the deadline's final look; a process that
+/// is gone, or whose pid now names another process, has exited, with no wait. `None` = until exit;
+/// `Some(ZERO)` = one look, no wait; a `Duration` too large for the clock is unbounded.
+/// Non-reaping. The watch-fault seam and the deadline come before the open, so the timeout counts
+/// from the call and the seam holds for a gone id too.
 pub(crate) async fn exited_by_id(id: ProcessId, timeout: Option<Duration>) -> Result<bool, Error> {
     enter()?;
     let deadline = absolute(timeout);
@@ -34,23 +37,6 @@ pub(crate) async fn exited_by_id(id: ProcessId, timeout: Option<Duration>) -> Re
         None => Ok(true),
         Some(mut process) => drive(&mut *process, deadline).await,
     }
-}
-
-/// Wait until `p` has exited or `timeout` has passed, and say which. `Ok(true)` = exited;
-/// `Ok(false)` = still running after the deadline's final look. `None` = until exit;
-/// `Some(ZERO)` = one look, no wait; a `Duration` too large for the clock is unbounded.
-/// Non-reaping. Dropping the future releases the wait: the fd is deregistered on Unix, and the
-/// blocking thread is released on Windows.
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "production waits go through `exited_by_id`; a handle-holding `Process` will call this"
-    )
-)]
-pub(crate) async fn exited_by(p: &mut dyn OsProcess, timeout: Option<Duration>) -> Result<bool, Error> {
-    enter()?;
-    drive(p, absolute(timeout)).await
 }
 
 /// `timeout` as an absolute deadline, fixed up front so no wake extends the total wait. On Windows
@@ -62,7 +48,9 @@ fn absolute(timeout: Option<Duration>) -> Option<Option<std::time::Instant>> {
     return crate::tokio::wait::to_real_clock(timeout.and_then(deadline_from));
 }
 
-/// The loop of [`exited_by`] against an absolute `deadline`.
+/// The wait loop against an absolute `deadline` from [`absolute`]: look; if running, wait on what
+/// the look returned. Dropping the future releases the wait: the fd is deregistered on Unix, and the
+/// blocking thread is released on Windows.
 async fn drive(p: &mut dyn OsProcess, deadline: Option<Option<std::time::Instant>>) -> Result<bool, Error> {
     // Set when the wait was released without an exit signal: the next look is the final one
     // whatever the clock reads.

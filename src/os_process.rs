@@ -65,10 +65,8 @@ pub(crate) enum WaitFor<'a> {
 pub(crate) enum Op {
     Wait,
     Kill,
-    #[cfg_attr(
-        windows,
-        allow(dead_code, reason = "only Windows `open` names it, to refuse: it has no such signal")
-    )]
+    /// Windows has no per-process graceful signal, so nothing opens for it there.
+    #[cfg(unix)]
     Terminate,
 }
 
@@ -83,7 +81,6 @@ fn opened_for_a_signal() -> Error {
 }
 
 /// Open the process `id` names. `Ok(None)`: it is gone, or its pid now names another process.
-/// [`Op::Terminate`] on Windows is `Unsupported`: no handle is opened.
 pub(crate) fn open(id: ProcessId, op: Op) -> Result<Option<Box<dyn OsProcess>>, Error> {
     #[cfg(target_os = "linux")]
     return Ok(crate::wait::backend::open_verified(id, op.into())?
