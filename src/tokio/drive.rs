@@ -45,17 +45,18 @@ pub(crate) async fn exited_by(p: &mut dyn OsProcess, timeout: Option<Duration>) 
     let deadline = timeout.and_then(deadline_from);
     #[cfg(windows)]
     let deadline = crate::tokio::wait::to_real_clock(deadline);
-    // Set when the timer won the wait: the next look is the final one whatever the clock reads.
-    let mut timer_won = false;
+    // Set when the wait was released without an exit signal: the next look is the final one
+    // whatever the clock reads.
+    let mut released = false;
     loop {
         // Read before the look: a look made at or after the deadline is the final one.
-        let final_look = timer_won || remaining(deadline) == Some(Duration::ZERO);
+        let final_look = released || remaining(deadline) == Some(Duration::ZERO);
         match p.exited()? {
             Exit::Exited => return Ok(true),
             Exit::Running(_) if final_look => return Ok(false),
             Exit::Running(wait_for) => {
                 if remaining(deadline) != Some(Duration::ZERO) {
-                    timer_won = !wait(&wait_for, deadline).await?;
+                    released = !wait(&wait_for, deadline).await?;
                 }
             }
         }
@@ -70,8 +71,9 @@ fn remaining(deadline: Option<Option<std::time::Instant>>) -> Option<Duration> {
     return crate::wait::remaining(deadline);
 }
 
-/// Wait on `wait_for` until it wakes or `deadline` passes. `Ok(false)` = tokio's timer fired
-/// first; Windows has no timer, so there it is always `Ok(true)`. The caller looks again either way.
+/// Wait on `wait_for` until it wakes or `deadline` passes. `Ok(false)` = the wait was released
+/// without an exit signal: tokio's timer fired. The caller looks again either way, and that look is
+/// the final one after `Ok(false)`.
 #[cfg(unix)]
 async fn wait(wait_for: &WaitFor<'_>, deadline: Option<Option<std::time::Instant>>) -> Result<bool, Error> {
     match deadline {
@@ -105,6 +107,7 @@ async fn watch(wait_for: &WaitFor<'_>) -> Result<(), Error> {
 }
 
 /// Wait on `wait_for` on the blocking pool until it wakes or the real-clock `deadline` passes.
+/// `Ok(false)` = released without an exit signal: the deadline passed, or the cancel event fired.
 /// Dropping the future signals the thread's cancel event.
 #[cfg(windows)]
 async fn wait(wait_for: &WaitFor<'_>, deadline: Option<Option<std::time::Instant>>) -> Result<bool, Error> {
@@ -117,8 +120,7 @@ async fn wait(wait_for: &WaitFor<'_>, deadline: Option<Option<std::time::Instant
     crate::tokio::wait::cancellable_blocking("process wait watcher", move |cancel| {
         crate::wait::backend::wait_process_or_cancel(process.as_handle(), deadline, cancel)
     })
-    .await?;
-    Ok(true)
+    .await
 }
 
 #[cfg(test)]

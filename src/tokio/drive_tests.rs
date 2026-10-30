@@ -351,6 +351,24 @@ mod windows {
             "the wait armed on an unsignalled target once"
         );
     }
+
+    /// A release that is neither an exit nor the deadline ends the wait after one final look, which
+    /// answers.
+    ///
+    /// Mutant: the arm discards the blocking half's verdict, so the loop re-arms and looks again
+    /// past the script.
+    #[skuld::test]
+    async fn a_forced_release_ends_the_wait_after_one_final_look() {
+        use super::{fake, Answer};
+
+        crate::tokio::test_runtime::assert_current_thread();
+        let (tx, armed) = std::sync::mpsc::channel();
+        let _guard = crate::wait::backend::armed_probe::install(tx);
+        let mut p = fake([Answer::Running, Answer::Running]);
+        assert!(!super::exited_by(&mut p, None).await.unwrap());
+        assert_eq!(p.looks(), 2, "one look, one wait, one final look");
+        assert_eq!(armed.try_iter().count(), 1, "the wait armed once");
+    }
 }
 
 /// Mutant: `exited_by_id` takes the seam only after `open`, so a gone id never reaches it.
