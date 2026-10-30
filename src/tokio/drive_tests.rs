@@ -99,11 +99,34 @@ async fn duration_max_is_unbounded() {
         crate::tokio::test_runtime::assert_current_thread();
         crate::tokio::wait::armed_deadline_seam::install(tx)
     };
+    // Windows: the clock reads of the driver and of the blocking half, which arms the wait.
+    #[cfg(windows)]
+    let (log_tx, reads) = std::sync::mpsc::channel();
+    #[cfg(windows)]
+    let _log = crate::wait::read_probe::install(log_tx);
     let mut p = fake([Answer::Running, Answer::Exited]);
     p.wake();
     assert!(exited_by(&mut p, Some(Duration::MAX)).await.unwrap());
     #[cfg(unix)]
     assert_eq!(armed.try_iter().count(), 0, "an overflowing timeout arms no timer");
+    #[cfg(windows)]
+    {
+        use crate::wait::read_probe::Event;
+
+        let reads: Vec<Event> = reads.try_iter().collect();
+        assert!(
+            reads
+                .iter()
+                .any(|event| matches!(event, Event::Read { deadline: None, .. })),
+            "the blocking half arms its own wait: {reads:?}"
+        );
+        assert!(
+            reads
+                .iter()
+                .all(|event| matches!(event, Event::Read { remaining: None, .. })),
+            "an overflowing timeout arms an unbounded wait: {reads:?}"
+        );
+    }
 }
 
 /// Mutant: arm the timer for a duration re-derived later, or not at all.
