@@ -105,10 +105,11 @@ mod windows {
     use std::time::{Duration, Instant};
 
     use super::exited_by;
+    use crate::os_process::drive::exited_by_id;
     use crate::os_process::{open, Op};
     use crate::test_child::live_blocker as blocker;
     use crate::wait::test_clock::FrozenClockGuard;
-    use crate::wait::wait_ms_probe;
+    use crate::wait::{block_probe, wait_ms_probe};
     use crate::wait::{remaining_override_seam, wait_clamp_seam};
 
     /// A never-exiting target armed with a sub-millisecond remainder rounds up to 1ms, still reports
@@ -142,6 +143,22 @@ mod windows {
             Duration::from_millis(5),
             "the site must pass the time left to its own deadline (clock frozen at the deadline's origin)"
         );
+    }
+
+    /// `exited_by_id` arms its first wait with the whole timeout it was given, on a live process.
+    ///
+    /// Mutant: the timeout is dropped on the way to the loop (the wait is unbounded, or zero).
+    #[skuld::test]
+    fn exited_by_id_arms_the_wait_from_its_timeout() {
+        let (child, stdin, id) = blocker();
+        let (_clock, _at) = FrozenClockGuard::install();
+        block_probe::take();
+        let result = exited_by_id(id, Some(Duration::from_millis(50)));
+        let armed = block_probe::take();
+        drop(stdin);
+        child.wait().expect("reap the blocker");
+        assert!(!result.expect("a live never-exiting child must not report a wait failure"));
+        assert_eq!(armed.first(), Some(&Some(Duration::from_millis(50))), "{armed:?}");
     }
 
     /// An early, unclamped `WAIT_TIMEOUT` hours before the deadline is not trusted: the site re-arms.

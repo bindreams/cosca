@@ -5,7 +5,8 @@
 //! The deadline differs per platform, as it does for the other async waits. Unix arms tokio's timer
 //! on [`tokio_now`]'s clock, and when the timer wins there is one final look. Windows has no
 //! pollable process handle: the wait hops to a blocking thread that bounds it with the real
-//! clock, so the deadline is moved there before the hop.
+//! clock, so the deadline is moved there before the hop. A wait released without an exit signal
+//! (the deadline, or the cancel event) ends in one final look on both.
 
 use std::time::Duration;
 
@@ -24,13 +25,14 @@ fn enter() -> Result<(), Error> {
 }
 
 /// [`exited_by`] on the process `id` names. A process that is gone, or whose pid now names another
-/// process, has exited: `Ok(true)` with no wait. The watch-fault seam comes before the open, so it
-/// holds for a gone id too.
+/// process, has exited: `Ok(true)` with no wait. The watch-fault seam and the deadline come before
+/// the open, so the timeout counts from the call and the seam holds for a gone id too.
 pub(crate) async fn exited_by_id(id: ProcessId, timeout: Option<Duration>) -> Result<bool, Error> {
     enter()?;
+    let deadline = absolute(timeout);
     match open(id, Op::Wait)? {
         None => Ok(true),
-        Some(mut process) => exited_by(&mut *process, timeout).await,
+        Some(mut process) => drive(&mut *process, deadline).await,
     }
 }
 
@@ -39,12 +41,29 @@ pub(crate) async fn exited_by_id(id: ProcessId, timeout: Option<Duration>) -> Re
 /// `Some(ZERO)` = one look, no wait; a `Duration` too large for the clock is unbounded.
 /// Non-reaping. Dropping the future releases the wait: the fd is deregistered on Unix, and the
 /// blocking thread is released on Windows.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "called by tests until a handle-holding `Process` (slice 1b) drives its own process"
+    )
+)]
 pub(crate) async fn exited_by(p: &mut dyn OsProcess, timeout: Option<Duration>) -> Result<bool, Error> {
     enter()?;
-    // Absolute up front, so no wake extends the total wait.
-    let deadline = timeout.and_then(deadline_from);
+    drive(p, absolute(timeout)).await
+}
+
+/// `timeout` as an absolute deadline, fixed up front so no wake extends the total wait. On Windows
+/// it is on the real clock, which the blocking thread measures.
+fn absolute(timeout: Option<Duration>) -> Option<Option<std::time::Instant>> {
+    #[cfg(unix)]
+    return timeout.and_then(deadline_from);
     #[cfg(windows)]
-    let deadline = crate::tokio::wait::to_real_clock(deadline);
+    return crate::tokio::wait::to_real_clock(timeout.and_then(deadline_from));
+}
+
+/// The loop of [`exited_by`] against an absolute `deadline`.
+async fn drive(p: &mut dyn OsProcess, deadline: Option<Option<std::time::Instant>>) -> Result<bool, Error> {
     // Set when the wait was released without an exit signal: the next look is the final one
     // whatever the clock reads.
     let mut released = false;

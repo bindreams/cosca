@@ -20,13 +20,15 @@ fn enter() -> Result<(), Error> {
 }
 
 /// [`exited_by`] on the process `id` names. A process that is gone, or whose pid now names another
-/// process, has exited: `Ok(true)` with no wait. The bounded-section assert and the watch-fault
-/// seam come before the open, so they hold for a gone id too.
+/// process, has exited: `Ok(true)` with no wait. The bounded-section assert, the watch-fault seam
+/// and the deadline come before the open, so the timeout counts from the call and the first two
+/// hold for a gone id too.
 pub(crate) fn exited_by_id(id: ProcessId, timeout: Option<Duration>) -> Result<bool, Error> {
     enter()?;
+    let deadline = absolute(timeout);
     match open(id, Op::Wait)? {
         None => Ok(true),
-        Some(mut process) => exited_by(&mut *process, timeout),
+        Some(mut process) => drive(&mut *process, deadline),
     }
 }
 
@@ -34,10 +36,25 @@ pub(crate) fn exited_by_id(id: ProcessId, timeout: Option<Duration>) -> Result<b
 /// `Ok(false)` = still running after the deadline's final look. `None` = until exit;
 /// `Some(ZERO)` = one look, no blocking call; a `Duration` too large for the clock is unbounded.
 /// Non-reaping. Every blocking call is armed from the time remaining, read right before it.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "called by tests until a handle-holding `Process` (slice 1b) drives its own process"
+    )
+)]
 pub(crate) fn exited_by(p: &mut dyn OsProcess, timeout: Option<Duration>) -> Result<bool, Error> {
     enter()?;
-    // Absolute up front, so no wake extends the total wait.
-    let deadline = timeout.and_then(crate::wait::deadline_from);
+    drive(p, absolute(timeout))
+}
+
+/// `timeout` as an absolute deadline, fixed up front so no wake extends the total wait.
+fn absolute(timeout: Option<Duration>) -> Option<Option<Instant>> {
+    timeout.and_then(crate::wait::deadline_from)
+}
+
+/// The loop of [`exited_by`] against an absolute `deadline`.
+fn drive(p: &mut dyn OsProcess, deadline: Option<Option<Instant>>) -> Result<bool, Error> {
     loop {
         // Read before the look: a look made at or after the deadline is the final one.
         let final_look = remaining(deadline) == Some(Duration::ZERO);
