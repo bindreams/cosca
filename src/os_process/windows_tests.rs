@@ -97,6 +97,30 @@ fn terminate_by_id_is_unsupported_and_sends_nothing() {
     child.wait().unwrap();
 }
 
+/// A look at a signal-only object is a caller bug: a debug assertion, and in release a typed `Err`
+/// rather than the OS's denial of the handle's missing `SYNCHRONIZE`; never an answer.
+///
+/// Mutant: `exited` waits on a handle opened for a kill, so the error is a raw `ACCESS_DENIED`.
+#[skuld::test]
+fn a_kill_opens_no_wait_and_still_kills() {
+    let (child, _stdin, id) = blocker();
+    let mut p = open(id, Op::Kill).unwrap().expect("a live process opens");
+    let looked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.exited().map(|_| ())));
+    // Debug builds assert the contract; release builds return the error.
+    let err = match looked {
+        Ok(Err(Error::Io(e))) => Some(e),
+        Err(_) => None,
+        Ok(other) => panic!("a signal-only process has no wait to answer a look: {other:?}"),
+    };
+    match err {
+        Some(e) => assert!(e.to_string().contains("opened for a signal"), "{e}"),
+        None if cfg!(debug_assertions) => {}
+        None => panic!("release builds return an error, not a panic"),
+    }
+    assert_eq!(p.signal(Sig::Kill).unwrap(), Sent::Delivered);
+    child.wait().unwrap();
+}
+
 /// `open` for a terminate refuses with the same `Unsupported` as `terminate_by_id`.
 #[skuld::test]
 fn open_for_terminate_is_unsupported() {
@@ -144,6 +168,7 @@ fn signal_failure_carries_the_win32_code() {
 
     let mut p = super::WindowsProcess {
         id: ProcessId::current(),
+        op: Op::Kill,
         handle: crate::wait::backend::new_cancel_event().expect("create an event handle"),
     };
     let err = p.signal(Sig::Kill).expect_err("an event cannot be terminated");

@@ -72,6 +72,16 @@ pub(crate) enum Op {
     Terminate,
 }
 
+/// What [`OsProcess::exited`] returns on an object [`open`]ed for a signal, which holds nothing to
+/// wait on. Asking is a caller bug: a debug assertion, and in release this error.
+#[cfg(any(windows, target_os = "macos"))]
+fn opened_for_a_signal() -> Error {
+    debug_assert!(false, "exited() on a process opened for a signal, not a wait");
+    Error::Io(std::io::Error::other(
+        "this process was opened for a signal, not a wait; open it with Op::Wait to observe its exit",
+    ))
+}
+
 /// Open the process `id` names. `Ok(None)`: it is gone, or its pid now names another process.
 /// [`Op::Terminate`] on Windows is `Unsupported`: no handle is opened.
 pub(crate) fn open(id: ProcessId, op: Op) -> Result<Option<Box<dyn OsProcess>>, Error> {

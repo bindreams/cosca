@@ -168,11 +168,7 @@ impl OsProcess for MacProcess {
 
     fn exited(&mut self) -> Result<Exit<'_>, Error> {
         let Some(watch) = &self.watch else {
-            // As on Windows, where a handle opened for a signal lacks `SYNCHRONIZE`.
-            debug_assert!(false, "exited() on a process opened for a signal, not a wait");
-            return Err(Error::Io(std::io::Error::other(
-                "this process was opened for a signal, not a wait; open it with Op::Wait to observe its exit",
-            )));
+            return Err(super::opened_for_a_signal());
         };
         // A consumed exit event stays in `seen`, so a look after a wait that read it is `Exited`.
         if watch.drain()? {

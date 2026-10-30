@@ -1,7 +1,7 @@
 //! Windows: an [`OsProcess`] over a verified process handle. The handle pins the kernel object, so
 //! a pid reused after [`open`](super::open) can be neither signalled nor mistaken for the original.
 //!
-//! A handle opened for [`Op::Kill`] lacks `SYNCHRONIZE`, so [`OsProcess::exited`] on it is the OS
+//! A handle opened for [`Op::Kill`] lacks `SYNCHRONIZE`, so [`OsProcess::exited`] on it is an
 //! error; wait on an [`Op::Wait`] one.
 
 use std::os::windows::io::{AsHandle, AsRawHandle, FromRawHandle, OwnedHandle};
@@ -17,6 +17,7 @@ use crate::signal::{Sent, Sig};
 #[derive(Debug)]
 pub(crate) struct WindowsProcess {
     id: ProcessId,
+    op: Op,
     handle: OwnedHandle,
 }
 
@@ -38,6 +39,7 @@ impl WindowsProcess {
         crate::wait::read_probe::mark("identity verified");
         Ok(Some(Self {
             id,
+            op,
             // SAFETY: `open_verified*` hands over a freshly opened handle that nothing else owns.
             handle: unsafe { OwnedHandle::from_raw_handle(handle.0 as _) },
         }))
@@ -74,6 +76,10 @@ impl OsProcess for WindowsProcess {
     }
 
     fn exited(&mut self) -> Result<Exit<'_>, Error> {
+        // A handle opened for a signal lacks `SYNCHRONIZE`.
+        if self.op != Op::Wait {
+            return Err(super::opened_for_a_signal());
+        }
         // SAFETY: `raw` is the live handle `self` owns; a zero-timeout wait only reads its state.
         match unsafe { WaitForSingleObject(self.raw(), 0) } {
             WAIT_OBJECT_0 => Ok(Exit::Exited),
