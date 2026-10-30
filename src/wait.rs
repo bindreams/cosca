@@ -668,9 +668,10 @@ fn win32_wait_clamp() -> u32 {
     WIN32_INFINITE - 1
 }
 
-/// Test-only, thread-local record of the timeout each non-kqueue timed block was armed with on
-/// this thread (`None` = unbounded): a `poll` or `Condvar::wait_timeout` round. A test proves a
-/// deadline wait armed nothing longer than the time remaining, and blocked at all, from the log.
+/// Test-only, thread-local record of the timeout each timed block was armed with on this thread
+/// (`None` = unbounded): a `poll` or `Condvar::wait_timeout` round, a Win32 wait, or (macOS) one
+/// `ExitWatch::block` as the process driver calls it. A test proves a deadline wait armed nothing
+/// longer than the time remaining, and blocked at all, from the log.
 #[cfg(test)]
 pub(crate) mod block_probe {
     use std::cell::RefCell;
@@ -685,10 +686,6 @@ pub(crate) mod block_probe {
     }
 
     /// Every timeout armed on this thread since the last call, in order.
-    #[cfg_attr(
-        not(target_os = "linux"),
-        allow(dead_code, reason = "only the Linux poll tests read it")
-    )]
     pub(crate) fn take() -> Vec<Option<Duration>> {
         ARMED.with(|a| std::mem::take(&mut *a.borrow_mut()))
     }

@@ -9,6 +9,13 @@ use crate::error::io_context;
 
 /// A signal cosca sends to an owned process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(any(unix, feature = "tokio")),
+    allow(
+        dead_code,
+        reason = "Windows without tokio: its OsProcess, task 3 of #839, is the first sender"
+    )
+)]
 pub(crate) enum Sig {
     Kill,
     #[cfg(unix)]
@@ -37,6 +44,13 @@ impl Sig {
 
 /// What a send did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(any(unix, feature = "tokio")),
+    allow(
+        dead_code,
+        reason = "Windows without tokio: its OsProcess, task 3 of #839, is the first sender"
+    )
+)]
 pub(crate) enum Sent {
     /// The signal was handed to the OS for the child.
     Delivered,
