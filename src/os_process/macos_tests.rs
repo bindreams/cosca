@@ -79,7 +79,7 @@ fn blocker() -> (std::process::Child, ProcessId) {
 #[skuld::test]
 fn open_live_then_kill_then_exited() {
     let (mut child, id) = blocker();
-    let mut p = open(id, Op::Kill).unwrap().expect("a live process opens");
+    let mut p = open(id, Op::Wait).unwrap().expect("a live process opens");
     assert_eq!(p.identity(), id);
     assert!(
         matches!(p.exited().unwrap(), Exit::Running(_)),
@@ -93,6 +93,29 @@ fn open_live_then_kill_then_exited() {
         Some(libc::SIGKILL),
         "it died of the SIGKILL"
     );
+}
+
+/// Mutant: `open` arms the kqueue watch for a kill, so a kill needs a descriptor and a kevent
+/// registration it never used. A look at a signal-only object is a caller bug: a debug assertion,
+/// and in release an `Err`; never an answer.
+#[skuld::test]
+fn a_kill_opens_no_watch_and_still_kills() {
+    let (mut child, id) = blocker();
+    let mut p = open(id, Op::Kill).unwrap().expect("a live process opens");
+    let looked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.exited().map(|_| ())));
+    // Debug builds assert the contract; release builds return the error.
+    let err = match looked {
+        Ok(Err(Error::Io(e))) => Some(e),
+        Err(_) => None,
+        Ok(other) => panic!("a signal-only process has no exit watch to answer a look: {other:?}"),
+    };
+    match err {
+        Some(e) => assert!(e.to_string().contains("opened for a signal"), "{e}"),
+        None if cfg!(debug_assertions) => {}
+        None => panic!("release builds return an error, not a panic"),
+    }
+    assert_eq!(p.signal(Sig::Kill).unwrap(), Sent::Delivered);
+    assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGKILL));
 }
 
 /// Review Focus 1. Mutant: `open` trusts the pid and not the start token.
@@ -166,7 +189,7 @@ fn signal_reaches_a_process_that_execed_after_open() {
         .stdout(std::process::Stdio::piped());
     let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn sh");
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
-    let mut p = open(id, Op::Kill).unwrap().expect("a live process opens");
+    let mut p = open(id, Op::Wait).unwrap().expect("a live process opens");
     let mut stdin = child.stdin.take().expect("piped stdin");
     let mut stdout = child.stdout.take().expect("piped stdout");
     // Releases `read`, so `sh` execs `cat`. Only `cat` echoes, so the echo reports the exec.
@@ -281,12 +304,11 @@ fn open_with_a_refused_read_is_unassessable_with_the_errno() {
 /// attempt is recorded).
 #[skuld::test]
 fn pid_zero_is_refused_unassessable() {
-    let (_rx, _tx, watch) = pipe_watch();
     let mut p = MacProcess {
         id: ProcessId::from_parts_for_test(0, 1),
         unique: 1,
         idversion: 1,
-        watch,
+        watch: None,
     };
     let sends = crate::send_log::Capture::start();
     let err = p.signal(Sig::Kill).expect_err("pid 0 is no target");

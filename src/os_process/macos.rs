@@ -27,20 +27,21 @@ extern "C" {
     fn proc_signal_with_audittoken(audittoken: *mut audit_token_t, sig: libc::c_int) -> libc::c_int;
 }
 
-/// A process, its exit watch, and what its audit token needs. `unique` is the process's
-/// `p_uniqueid`: never reused, and kept across `exec`. `idversion` is its `p_idversion`: it changes
-/// at `exec`.
+/// A process, its exit watch if it was opened for [`Op::Wait`], and what its audit token needs.
+/// `unique` is the process's `p_uniqueid`: never reused, and kept across `exec`. `idversion` is its
+/// `p_idversion`: it changes at `exec`. A signal needs no kqueue, so a kill or terminate holds no
+/// watch and costs no descriptor.
 #[derive(Debug)]
 pub(crate) struct MacProcess {
     id: ProcessId,
     unique: u64,
     idversion: i32,
-    watch: ExitWatch,
+    watch: Option<ExitWatch>,
 }
 
 impl MacProcess {
     /// Open the process `id` names. `Ok(None)`: it is gone, or its pid now names another process.
-    /// `op` words the `Unassessable` errors.
+    /// `op` words the `Unassessable` errors, and only [`Op::Wait`] arms the exit watch.
     pub(crate) fn open(id: ProcessId, op: Op) -> Result<Option<Self>, Error> {
         let pid = id.pid();
         let (warn_tail, detail_tail) = match op {
@@ -72,6 +73,14 @@ impl MacProcess {
                 });
             }
         }
+        if !matches!(op, Op::Wait) {
+            return Ok(Some(Self {
+                id,
+                unique: first.unique_id,
+                idversion: first.id_version,
+                watch: None,
+            }));
+        }
         let Some(watch) = ExitWatch::proc_exit(pid)? else {
             return Ok(None);
         };
@@ -84,7 +93,7 @@ impl MacProcess {
             id,
             unique: second.unique_id,
             idversion: second.id_version,
-            watch,
+            watch: Some(watch),
         }))
     }
 }
@@ -162,11 +171,18 @@ impl OsProcess for MacProcess {
     }
 
     fn exited(&mut self) -> Result<Exit<'_>, Error> {
+        let Some(watch) = &self.watch else {
+            // As on Windows, where a handle opened for a signal lacks `SYNCHRONIZE`.
+            debug_assert!(false, "exited() on a process opened for a signal, not a wait");
+            return Err(Error::Io(std::io::Error::other(
+                "this process was opened for a signal, not a wait; open it with Op::Wait to observe its exit",
+            )));
+        };
         // A consumed exit event stays in `seen`, so a look after a wait that read it is `Exited`.
-        if self.watch.drain()? {
+        if watch.drain()? {
             Ok(Exit::Exited)
         } else {
-            Ok(Exit::Running(WaitFor::Kqueue(&self.watch)))
+            Ok(Exit::Running(WaitFor::Kqueue(watch)))
         }
     }
 }
