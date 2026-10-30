@@ -27,7 +27,7 @@ impl Sig {
 
 #[cfg(target_os = "macos")]
 impl Sig {
-    fn as_libc(self) -> libc::c_int {
+    pub(crate) fn as_libc(self) -> libc::c_int {
         match self {
             Sig::Kill => libc::SIGKILL,
             Sig::Term => libc::SIGTERM,
@@ -180,6 +180,13 @@ pub(crate) fn via_pidfd(pidfd: Option<std::os::fd::BorrowedFd<'_>>, pid: u32, si
         log::debug!("child {pid} has no pidfd (it was gone when adopted); {sig:?} not sent");
         return Ok(Sent::Gone);
     };
+    send_pidfd(pidfd, pid, sig).map_err(|e| io_context("pidfd_send_signal", e.into()))
+}
+
+/// [`via_pidfd`] for a pidfd that is present, with the bare errno of a refused send, for a caller
+/// that promises its own caller the raw errno.
+#[cfg(target_os = "linux")]
+pub(crate) fn send_pidfd(pidfd: std::os::fd::BorrowedFd<'_>, pid: u32, sig: Sig) -> Result<Sent, rustix::io::Errno> {
     #[cfg(test)]
     let seam = seams::kills_refused();
     #[cfg(not(test))]
@@ -196,7 +203,7 @@ pub(crate) fn via_pidfd(pidfd: Option<std::os::fd::BorrowedFd<'_>>, pid: u32, si
             log::debug!("pidfd_send_signal({sig:?}) to child {pid}: it is already gone");
             Ok(Sent::Gone)
         }
-        Err(e) => Err(io_context("pidfd_send_signal", e.into())),
+        Err(e) => Err(e),
     }
 }
 

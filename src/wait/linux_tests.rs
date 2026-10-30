@@ -61,7 +61,7 @@ impl Drop for LiveNonLeaderTid {
 /// A reaped process-group leader whose group lives on reports exited. Real syscall: `EINVAL` on
 /// < 6.16, `ESRCH` on >= 6.16 (the arm is then not reached; see the forced twin).
 #[skuld::test]
-fn block_until_exit_reports_exited_for_a_reaped_pgid_leader() {
+fn exited_by_id_reports_exited_for_a_reaped_pgid_leader() {
     let (l_id, fixture) = build_reaped_pgid_leader();
     assert_eq!(
         l_id.exists(),
@@ -69,10 +69,10 @@ fn block_until_exit_reports_exited_for_a_reaped_pgid_leader() {
         "a reaped leader must read Gone even while its pid number stays a live PGID"
     );
 
-    let result = super::block_until_exit(l_id, None);
+    let result = crate::os_process::drive::exited_by_id(l_id, None);
     assert!(
         matches!(result, Ok(true)),
-        "block_until_exit on a reaped group leader whose group lives on must report exited \
+        "exited_by_id on a reaped group leader whose group lives on must report exited \
          (Ok(true)), not {result:?}"
     );
 
@@ -82,7 +82,7 @@ fn block_until_exit_reports_exited_for_a_reaped_pgid_leader() {
 /// Twin of the test above with `pidfd_open` forced to `EINVAL`, so the `INVAL`/`NOENT` arm runs on
 /// any kernel.
 #[skuld::test]
-fn block_until_exit_reports_exited_for_a_reaped_pgid_leader_with_forced_einval() {
+fn exited_by_id_reports_exited_for_a_reaped_pgid_leader_with_forced_einval() {
     let (l_id, fixture) = build_reaped_pgid_leader();
     assert_eq!(
         l_id.exists(),
@@ -91,7 +91,7 @@ fn block_until_exit_reports_exited_for_a_reaped_pgid_leader_with_forced_einval()
     );
 
     let forced = super::fault::force_pidfd_open_errno_once(rustix::io::Errno::INVAL);
-    let result = super::block_until_exit(l_id, None);
+    let result = crate::os_process::drive::exited_by_id(l_id, None);
     drop(forced);
     assert!(
         matches!(result, Ok(true)),
@@ -105,14 +105,14 @@ fn block_until_exit_reports_exited_for_a_reaped_pgid_leader_with_forced_einval()
 /// A reaped leader is exited whatever `/proc` view this process has: `kill(pid, 0)` answering
 /// `ESRCH` needs no `/proc`.
 #[skuld::test]
-fn block_until_exit_reports_exited_for_a_reaped_pgid_leader_whatever_the_proc_view() {
+fn exited_by_id_reports_exited_for_a_reaped_pgid_leader_whatever_the_proc_view() {
     use crate::identity::proc_view_fault::{force_proc_view_once, ForcedView};
 
     let (l_id, fixture) = build_reaped_pgid_leader();
     for view in [ForcedView::Diverged, ForcedView::Unassessable] {
         let forced_errno = super::fault::force_pidfd_open_errno_once(rustix::io::Errno::INVAL);
         let forced_view = force_proc_view_once(view);
-        let result = super::block_until_exit(l_id, None);
+        let result = crate::os_process::drive::exited_by_id(l_id, None);
         drop(forced_view);
         drop(forced_errno);
         assert!(
@@ -127,12 +127,12 @@ fn block_until_exit_reports_exited_for_a_reaped_pgid_leader_whatever_the_proc_vi
 /// A live non-leader tid with `pidfd_open` forced to `ENOENT` is `NotThreadGroupLeader` carrying
 /// the pid and the errno, not exited.
 #[skuld::test]
-fn block_until_exit_on_a_live_non_leader_tid_is_an_error_with_forced_enoent() {
+fn exited_by_id_on_a_live_non_leader_tid_is_an_error_with_forced_enoent() {
     let worker = LiveNonLeaderTid::spawn();
     let id = worker.id;
 
     let forced = super::fault::force_pidfd_open_errno_once(rustix::io::Errno::NOENT);
-    let result = super::block_until_exit(id, None);
+    let result = crate::os_process::drive::exited_by_id(id, None);
     drop(forced);
     match result {
         Err(Error::NotThreadGroupLeader { pid, source, .. }) => {
@@ -184,7 +184,7 @@ fn assert_unassessable_with_cause(
 /// A live non-leader tid under a DIVERGED view: `Unassessable` naming the view and the
 /// `pidfd_open` errno, never a raw errno (a bare `NotFound` from `ENOENT` on 6.16+ reads as "gone").
 #[skuld::test]
-fn block_until_exit_on_a_live_non_leader_tid_is_unassessable_when_the_proc_view_is_diverged() {
+fn exited_by_id_on_a_live_non_leader_tid_is_unassessable_when_the_proc_view_is_diverged() {
     use crate::identity::proc_view_fault::{force_proc_view_once, ForcedView};
 
     crate::log_capture::install();
@@ -193,7 +193,7 @@ fn block_until_exit_on_a_live_non_leader_tid_is_unassessable_when_the_proc_view_
     let mark = crate::log_capture::mark();
     let forced_errno = super::fault::force_pidfd_open_errno_once(rustix::io::Errno::NOENT);
     let forced_view = force_proc_view_once(ForcedView::Diverged);
-    let result = super::block_until_exit(worker.id, None);
+    let result = crate::os_process::drive::exited_by_id(worker.id, None);
     drop(forced_view);
     drop(forced_errno);
     assert_unassessable_with_cause(result, &["outer pid namespace", "pidfd_open: "], true, &marker, mark);
@@ -201,7 +201,7 @@ fn block_until_exit_on_a_live_non_leader_tid_is_unassessable_when_the_proc_view_
 
 /// Twin for a view that could not be established: the reason is in the message.
 #[skuld::test]
-fn block_until_exit_on_a_live_non_leader_tid_is_unassessable_when_the_proc_view_is_unreadable() {
+fn exited_by_id_on_a_live_non_leader_tid_is_unassessable_when_the_proc_view_is_unreadable() {
     use crate::identity::proc_view_fault::{force_proc_view_once, ForcedView};
 
     crate::log_capture::install();
@@ -210,7 +210,7 @@ fn block_until_exit_on_a_live_non_leader_tid_is_unassessable_when_the_proc_view_
     let mark = crate::log_capture::mark();
     let forced_errno = super::fault::force_pidfd_open_errno_once(rustix::io::Errno::INVAL);
     let forced_view = force_proc_view_once(ForcedView::Unassessable);
-    let result = super::block_until_exit(worker.id, None);
+    let result = crate::os_process::drive::exited_by_id(worker.id, None);
     drop(forced_view);
     drop(forced_errno);
     assert_unassessable_with_cause(result, &["forced by a test", "pidfd_open: "], true, &marker, mark);
@@ -220,13 +220,13 @@ fn block_until_exit_on_a_live_non_leader_tid_is_unassessable_when_the_proc_view_
 /// `Present` but `Dead`: exited, not an error. Both answers are forced here; the real ptrace
 /// fixture is in `tests/linux_pidfd_wait.rs`.
 #[skuld::test]
-fn block_until_exit_on_a_dead_non_leader_tid_is_exited_with_forced_enoent() {
+fn exited_by_id_on_a_dead_non_leader_tid_is_exited_with_forced_enoent() {
     let worker = LiveNonLeaderTid::spawn();
     let id = worker.id;
 
     let forced_errno = super::fault::force_pidfd_open_errno_once(rustix::io::Errno::NOENT);
     let forced_alive = super::fault::force_alive_once(Liveness::Dead);
-    let result = super::block_until_exit(id, None);
+    let result = crate::os_process::drive::exited_by_id(id, None);
     drop(forced_alive);
     drop(forced_errno);
     assert!(
@@ -238,7 +238,7 @@ fn block_until_exit_on_a_dead_non_leader_tid_is_exited_with_forced_enoent() {
 /// The `INVAL`/`NOENT` arm's liveness check refused: `Unassessable` carrying the errno and one
 /// `warn`, never exited.
 #[skuld::test]
-fn block_until_exit_is_unassessable_when_the_einval_arms_liveness_is_unknown() {
+fn exited_by_id_is_unassessable_when_the_einval_arms_liveness_is_unknown() {
     crate::log_capture::install();
     let worker = LiveNonLeaderTid::spawn();
     let id = worker.id;
@@ -247,7 +247,7 @@ fn block_until_exit_is_unassessable_when_the_einval_arms_liveness_is_unknown() {
 
     let forced_errno = super::fault::force_pidfd_open_errno_once(rustix::io::Errno::INVAL);
     let forced_alive = super::fault::force_alive_once(Liveness::Unknown);
-    let result = super::block_until_exit(id, None);
+    let result = crate::os_process::drive::exited_by_id(id, None);
     drop(forced_alive);
     drop(forced_errno);
     match result {
@@ -289,7 +289,7 @@ fn open_verified_is_unassessable_when_the_einval_arms_exists_is_unknown() {
 /// Twin for the post-open re-verify: a real pidfd on a live child, `exists()` forced `Unknown`.
 /// `Unassessable` with no errno (`pidfd_open` succeeded) + one warn, never exited.
 #[skuld::test]
-fn block_until_exit_is_unassessable_when_the_post_open_exists_is_unknown() {
+fn exited_by_id_is_unassessable_when_the_post_open_exists_is_unknown() {
     use crate::containment::cgroup::test_support::{block_on, fork_running};
 
     crate::log_capture::install();
@@ -301,7 +301,7 @@ fn block_until_exit_is_unassessable_when_the_post_open_exists_is_unknown() {
     let mark = crate::log_capture::mark();
 
     let forced_exists = super::fault::force_exists_once(Existence::Unknown);
-    let result = super::block_until_exit(id, None);
+    let result = crate::os_process::drive::exited_by_id(id, None);
     drop(forced_exists);
     assert!(
         matches!(result, Err(Error::Unassessable { source: None, .. })),
@@ -629,18 +629,18 @@ fn a_refused_pidfd_open_is_unsupported_in_the_policys_message_shape() {
 #[skuld::test]
 fn each_operation_names_itself_when_pidfd_open_is_refused() {
     let wait = refused_with(rustix::io::Errno::PERM, |id| {
-        super::block_until_exit(id, Some(Some(std::time::Instant::now()))).map(drop)
+        crate::os_process::drive::exited_by_id(id, Some(std::time::Duration::ZERO)).map(drop)
     });
     assert!(
         wait.to_string().starts_with("process wait is not supported on linux: "),
         "{wait}"
     );
-    let kill = refused_with(rustix::io::Errno::PERM, super::kill);
+    let kill = refused_with(rustix::io::Errno::PERM, crate::os_process::kill_by_id);
     assert!(
         kill.to_string().starts_with("process kill is not supported on linux: "),
         "{kill}"
     );
-    let terminate = refused_with(rustix::io::Errno::PERM, super::terminate);
+    let terminate = refused_with(rustix::io::Errno::PERM, crate::os_process::terminate_by_id);
     assert!(
         terminate
             .to_string()

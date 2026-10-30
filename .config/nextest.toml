@@ -24,11 +24,11 @@ slow-timeout = { period = "10s", terminate-after = 1, grace-period = "1s" }
 filter = 'package(cosca-path) & test(=fs::host::host_tests::host_filesystem_same_file_does_not_block_on_a_fifo)'
 slow-timeout = { period = "10s", terminate-after = 1, grace-period = "1s" }
 
-# The Windows cancel-event and `grace_wait_windows_` tests wait with no bound of their own
-# (`None`/INFINITE, or an unbounded grace); a broken release would hang, so this bound fails it
+# The Windows cancel-event, dropped-wait and `exited_by_id_windows_` tests wait with no bound of their
+# own (`None`/INFINITE, or an unbounded grace); a broken release would hang, so this bound fails it
 # instead.
 [[profile.default.overrides]]
-filter = 'test(/tokio::wait::wait_tests::(cancel_event_|grace_wait_windows_)/)'
+filter = 'test(/tokio::drive::drive_tests::windows::cancel_event_/) | test(/tokio::drive::drive_tests::dropped_wait_releases_the_watch/) | test(/tokio::wait::wait_tests::exited_by_id_windows_/)'
 slow-timeout = { period = "10s", terminate-after = 1, grace-period = "1s" }
 
 # A broken cancel-event release leaves the test runtime's drop joining a `Duration::MAX` watcher.

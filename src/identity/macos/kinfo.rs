@@ -154,7 +154,7 @@ pub(crate) const P_WEXIT: libc::c_int = 0x0000_2000;
 /// Read one `kinfo_proc` for `pid`. `None` means "not resolvable" — the EXPECTED miss is
 /// a nonexistent pid (sysctl SUCCESS with `size == 0`); a real sysctl failure or a
 /// wrong-sized record is a contract violation and leaves a trace before the same `None`.
-/// EINTR retries, per the codebase convention (see `wait/linux.rs`, `wait/macos.rs`).
+/// EINTR retries, per the codebase convention (see `wait/macos.rs`).
 pub(crate) fn kinfo(pid: RawPid) -> Resolved<kinfo_proc> {
     #[cfg(test)]
     if fault::take_unreadable() {

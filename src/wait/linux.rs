@@ -1,6 +1,6 @@
-//! Linux death-watch + kill via pidfd. `pidfd_open` returns a fd that
+//! Linux pidfd primitives for [`crate::os_process`]. `pidfd_open` returns a fd that
 //! becomes readable (POLLIN) when the task becomes a zombie (exits); polling never reaps.
-//! `pidfd_send_signal` is identity-bound (no pid-reuse race). A refused `pidfd_open` is
+//! A signal through the pidfd is identity-bound (no pid-reuse race). A refused `pidfd_open` is
 //! [`Error::Unsupported`], a transient one [`Error::Io`] prefixed `pidfd_open:`; the errno
 //! classification is documented once, on [`Error::Unsupported`].
 //!
@@ -11,10 +11,8 @@
 //! so a refusal fails the spawn with no child; see `child::spawn::pidfd_handshake` for the rest.
 
 use std::os::fd::AsFd;
-use std::time::Instant;
 
-use rustix::event::{poll, PollFd, PollFlags};
-use rustix::process::{pidfd_open, pidfd_send_signal, Pid, PidfdFlags, Signal};
+use rustix::process::{pidfd_open, Pid, PidfdFlags};
 
 use crate::error::Error;
 use crate::identity::{Existence, Liveness, PidfdTarget, ProcDir, ProcView, ProcessId, ViewUnreadable};
@@ -475,60 +473,6 @@ pub(crate) mod fault {
 
     pub(crate) fn take_forced_alive() -> Option<Liveness> {
         FORCE_ALIVE.with(|f| f.take())
-    }
-}
-
-pub(crate) fn block_until_exit(id: ProcessId, deadline: Option<Option<Instant>>) -> Result<bool, Error> {
-    let Some(pidfd) = open_verified(id, PidfdOp::Wait)? else {
-        return Ok(true);
-    };
-    loop {
-        let mut fds = [PollFd::new(&pidfd, PollFlags::IN)];
-        // rustix 1.x poll takes Option<&Timespec> (None = infinite); Timespec is
-        // { tv_sec: i64, tv_nsec: Nsecs }. Build it from the remaining duration.
-        let ts = crate::wait::remaining(deadline).map(|d| rustix::event::Timespec {
-            tv_sec: d.as_secs().min(i64::MAX as u64) as i64,
-            tv_nsec: d.subsec_nanos() as _,
-        });
-        match poll(&mut fds, ts.as_ref()) {
-            Ok(0) => return Ok(false), // timed out, still alive
-            Ok(_) => {
-                let revents = fds[0].revents();
-                // POLLNVAL on an fd we own and hold alive is a contract violation.
-                debug_assert!(
-                    !revents.contains(PollFlags::NVAL),
-                    "pidfd reported POLLNVAL — owned-fd contract violation"
-                );
-                if revents.contains(PollFlags::ERR) {
-                    return Err(Error::Io(std::io::Error::other("pidfd poll returned POLLERR")));
-                }
-                return Ok(true); // POLLIN (zombie) / POLLHUP (reaped) => exited
-            }
-            Err(rustix::io::Errno::INTR) => continue, // retry only on EINTR (no cap)
-            Err(e) => return Err(Error::Io(std::io::Error::from(e))),
-        }
-    }
-}
-
-pub(crate) fn kill(id: ProcessId) -> Result<(), Error> {
-    let Some(pidfd) = open_verified(id, PidfdOp::Kill)? else {
-        return Ok(());
-    };
-    match pidfd_send_signal(&pidfd, Signal::KILL) {
-        Ok(()) => Ok(()),
-        Err(rustix::io::Errno::SRCH) => Ok(()), // exited between re-verify and signal
-        Err(e) => Err(Error::Io(std::io::Error::from(e))),
-    }
-}
-
-pub(crate) fn terminate(id: ProcessId) -> Result<(), Error> {
-    let Some(pidfd) = open_verified(id, PidfdOp::Terminate)? else {
-        return Ok(());
-    };
-    match pidfd_send_signal(&pidfd, Signal::TERM) {
-        Ok(()) => Ok(()),
-        Err(rustix::io::Errno::SRCH) => Ok(()), // exited between re-verify and signal
-        Err(e) => Err(Error::Io(std::io::Error::from(e))),
     }
 }
 

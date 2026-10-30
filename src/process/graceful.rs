@@ -9,9 +9,9 @@ use crate::error::Error;
 
 impl Process {
     /// Send `SIGTERM` to the foreign process — a cooperative request to exit. Signal-only.
-    /// Identity-bound (Linux `pidfd_send_signal`; macOS reverify-then-`kill`). Already-dead ⇒
-    /// `Ok`; a real failure (`EPERM`) ⇒ `Err`. On Linux a refused `pidfd_open` is `Unsupported`
-    /// (see [`Error::Unsupported`]).
+    /// Identity-bound as for [`kill`](Process::kill) (Linux `pidfd_send_signal`; macOS audit
+    /// token, 14.4 and later). Already-dead ⇒ `Ok`; a real failure (`EPERM`) ⇒ `Err`. On Linux a
+    /// refused `pidfd_open` is `Unsupported` (see [`Error::Unsupported`]).
     ///
     /// **Windows: `Unsupported`, for two concrete absences.** A `Process` holds only a pid,
     /// nothing that pins it, and `GenerateConsoleCtrlEvent` takes a raw pid with no
@@ -22,7 +22,7 @@ impl Process {
     /// problem: its held process handle keeps the pid allocated, so the pid can only ever name
     /// that child's own group.
     pub fn terminate(&self) -> Result<(), Error> {
-        crate::wait::terminate(self.id)
+        crate::os_process::terminate_by_id(self.id)
     }
 
     /// Cooperative-then-forced lone shutdown of the foreign process: `SIGTERM`, wait up to
@@ -35,19 +35,19 @@ impl Process {
     /// refused `pidfd_open` is `Unsupported` (see [`Error::Unsupported`]), naming the step it hit: terminate,
     /// the grace wait, or the kill.
     pub fn graceful_shutdown(&self, grace: Duration) -> Result<(), Error> {
-        crate::wait::terminate(self.id)?;
+        crate::os_process::terminate_by_id(self.id)?;
         #[cfg(test)]
         crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterTerminate);
         // A watch failure must not strand the process between the soft signal and the
         // escalation — the kill still runs (grace unobservable => escalate now); the watch
         // error surfaces only after it succeeds (a kill error wins — deliberate subsumption,
         // mirroring the owned twins' disposition).
-        let watch = crate::wait::block_until_exit(self.id, Some(grace));
+        let watch = crate::os_process::drive::exited_by_id(self.id, Some(grace));
         if matches!(watch, Ok(true)) {
             return Ok(()); // exited within grace
         }
         // Hard SIGKILL (no reap — not the parent); an Err returns HERE, subsuming any watch Err.
-        crate::wait::kill(self.id)?;
+        crate::os_process::kill_by_id(self.id)?;
         watch?;
         Ok(())
     }
@@ -114,7 +114,7 @@ impl Process {
         crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterTerminate);
 
         // Watch-Err ordering: sweep first, then surface (see graceful_shutdown above).
-        let watch = crate::wait::block_until_exit(self.id, Some(grace));
+        let watch = crate::os_process::drive::exited_by_id(self.id, Some(grace));
         // The sweep is unconditional — a gracefully-exited root does NOT mean the descendants
         // drained. A sweep Err subsumes any watch Err; there is no reap to order against (the
         // real parent collects the zombie).

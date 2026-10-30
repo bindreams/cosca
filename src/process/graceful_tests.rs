@@ -45,7 +45,7 @@ fn spawn_term_ignoring_blocker() -> std::process::Child {
 
 // A watch failure must not strand the foreign process between the soft signal and the
 // escalation: the kill still runs, then the watch error surfaces. With the old
-// `block_until_exit(..)?` shape the SIGTERM-ignoring child would survive the op.
+// `exited_by_id(..)?` shape the SIGTERM-ignoring child would survive the op.
 #[skuld::test]
 fn foreign_graceful_lone_watch_error_still_escalates() {
     let mut child = spawn_term_ignoring_blocker();
@@ -113,7 +113,7 @@ const ESCALATION_CASES: [([Option<rustix::io::Errno>; 3], &str, bool); 3] = [
 /// A refused `pidfd_open` in the middle of `graceful_shutdown` names the step that hit it: the
 /// grace wait is `process wait`, the escalation `process kill`.
 ///
-/// Mutants: the escalation is `wait::terminate`, or names another `PidfdOp`; the grace wait
+/// Mutants: the escalation is `terminate_by_id`, or names another `PidfdOp`; the grace wait
 /// names another `PidfdOp`; a refused wait skips the escalation.
 #[cfg(target_os = "linux")]
 #[skuld::test]
@@ -181,7 +181,7 @@ fn foreign_graceful_shutdown_tree_graceful_path() {
 // that sent nothing lets it exit 0 and fails the assertion instead of the grace running out first.
 // A sent `SIGTERM` is already pending then, so it beats the release.
 //
-// Mutants: `wait::terminate` sends nothing; `graceful_shutdown` skips it.
+// Mutants: `terminate_by_id` sends nothing; `graceful_shutdown` skips it.
 #[skuld::test]
 fn foreign_graceful_shutdown_graceful_path() {
     let mut child = foreign::blocker();

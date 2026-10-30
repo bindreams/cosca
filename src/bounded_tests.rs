@@ -42,14 +42,17 @@ fn a_section_is_per_thread() {
 mod waits {
     use super::Section;
 
-    /// `wait::block_until_exit`, which every platform's process-exit wait sits behind.
+    /// `os_process::drive::exited_by_id`, which every platform's process-exit wait sits behind.
     ///
-    /// Mutant: drop the assert from `wait::block_until_exit`.
+    /// Mutant: drop the assert from `os_process::drive::exited_by_id`.
     #[skuld::test]
     #[should_panic(expected = "would block inside an async Drop")]
-    fn block_until_exit_refuses_inside_a_section() {
+    fn exited_by_id_refuses_inside_a_section() {
         let _section = Section::enter();
-        _ = crate::wait::block_until_exit(crate::identity::ProcessId::current(), Some(std::time::Duration::ZERO));
+        _ = crate::os_process::drive::exited_by_id(
+            crate::identity::ProcessId::current(),
+            Some(std::time::Duration::ZERO),
+        );
     }
 
     /// `Attached::wait_drained`, on a mechanism with no drain edge: refused all the same.
@@ -131,19 +134,23 @@ mod waits {
         _ = crate::containment::windows::wait_drained_raw(raw, Some(Some(std::time::Instant::now())), None);
     }
 
-    /// `block_until_exit_or_cancel`, the cancellable twin.
+    /// `wait_process_or_cancel`, the cancellable twin.
     ///
-    /// Mutant: drop the assert from `block_until_exit_or_cancel`.
+    /// Mutant: drop the assert from `wait_process_or_cancel`.
     #[cfg(windows)]
     #[skuld::test]
     #[should_panic(expected = "would block inside an async Drop")]
-    fn block_until_exit_or_cancel_refuses_inside_a_section() {
+    fn wait_process_or_cancel_refuses_inside_a_section() {
         let cancel = crate::wait::backend::new_cancel_event().expect("event");
+        use crate::os_process::{Exit, WaitFor};
+
+        let mut process = crate::os_process::open(crate::identity::ProcessId::current(), crate::os_process::Op::Wait)
+            .expect("open")
+            .expect("the current process opens");
+        let Exit::Running(WaitFor::Signalled(handle)) = process.exited().expect("look") else {
+            panic!("the current process is running");
+        };
         let _section = Section::enter();
-        _ = crate::wait::backend::block_until_exit_or_cancel(
-            crate::identity::ProcessId::current(),
-            Some(std::time::Instant::now()),
-            &cancel,
-        );
+        _ = crate::wait::backend::wait_process_or_cancel(handle, Some(std::time::Instant::now()), &cancel);
     }
 }

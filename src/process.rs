@@ -80,7 +80,7 @@ impl Process {
     /// parent gets one). Non-reaping. `Err` only on a wait failure; on Linux a refused
     /// `pidfd_open` is `Unsupported` (see [`Error::Unsupported`]).
     pub fn wait(&self) -> Result<(), Error> {
-        let exited = crate::wait::block_until_exit(self.id, None)?;
+        let exited = crate::os_process::drive::exited_by_id(self.id, None)?;
         debug_assert!(exited);
         Ok(())
     }
@@ -88,7 +88,7 @@ impl Process {
     /// Block up to `timeout` for the process to exit. `Ok(true)` = exited; `Ok(false)` =
     /// still alive at expiry. `Duration::ZERO` polls once. Errors as for [`wait`](Self::wait).
     pub fn wait_timeout(&self, timeout: Duration) -> Result<bool, Error> {
-        crate::wait::block_until_exit(self.id, Some(timeout))
+        crate::os_process::drive::exited_by_id(self.id, Some(timeout))
     }
 
     /// The parent process, by identity. Identity-guarded against pid-reuse: a genuine parent
@@ -194,13 +194,16 @@ impl Process {
 
     /// Hard-kill the process by identity (`SIGKILL` / `TerminateProcess`). Already-dead ⇒
     /// `Ok`; a real failure (no rights / `EPERM` / access-denied on a live process) ⇒ `Err`.
-    /// **Race-freedom is OS-dependent:** Linux uses an identity-bound `pidfd_send_signal`
-    /// (atomic, zero pid-reuse race) and Windows pins the kernel object via its handle; macOS
-    /// has no pidfd, so it re-verifies identity immediately before `kill(2)` with a small
-    /// irreducible residual window — best-effort there, like the existing tree teardown. On
-    /// Linux a refused `pidfd_open` is `Unsupported` (see [`Error::Unsupported`]).
+    /// A process that reused the pid is never signalled, by a different mechanism per OS:
+    /// Linux uses an identity-bound `pidfd_send_signal` and Windows pins the kernel object via
+    /// its handle. macOS (14.4 and later) has no pidfd; it signals with
+    /// `proc_signal_with_audittoken` (the pid plus the process's `p_idversion`, which `exec`
+    /// changes), and the kernel checks the version while it holds a reference to the process.
+    /// The one residual there: `p_idversion` is 32 bits, so it matches a different process only
+    /// if it wrapped by a multiple of 2^32 between the read and the call while the pid was
+    /// reused. On Linux a refused `pidfd_open` is `Unsupported` (see [`Error::Unsupported`]).
     pub fn kill(&self) -> Result<(), Error> {
-        crate::wait::kill(self.id)
+        crate::os_process::kill_by_id(self.id)
     }
 }
 

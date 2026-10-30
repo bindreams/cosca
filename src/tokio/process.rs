@@ -81,7 +81,9 @@ impl Process {
     /// `#[tokio::test]` defaults) — missing it, tokio panics rather than returning a typed
     /// error. On Windows the watch runs on the blocking pool (one thread per in-flight wait).
     pub async fn wait(&self) -> Result<(), Error> {
-        crate::tokio::wait::wait_exit(self.inner.id()).await
+        let exited = crate::tokio::drive::exited_by_id(self.inner.id(), None).await?;
+        debug_assert!(exited);
+        Ok(())
     }
 
     /// Wait up to `timeout` for the process to exit. `Ok(true)` = exited; `Ok(false)` =
@@ -89,7 +91,7 @@ impl Process {
     /// runtime requirements as on [`wait`](Process::wait) (Unix additionally needs the time
     /// driver). Errors as for [`wait`](Process::wait).
     pub async fn wait_timeout(&self, timeout: Duration) -> Result<bool, Error> {
-        crate::tokio::wait::grace_wait(self.inner.id(), timeout).await
+        crate::tokio::drive::exited_by_id(self.inner.id(), Some(timeout)).await
     }
 
     /// Hard-kill the process by identity (see [`Process::kill`](crate::Process::kill) for

@@ -1,4 +1,5 @@
-//! Unit tests for the reactor-native grace-wait. In the library because `grace_wait` is
+//! Unit tests for the reactor-native waits in `tokio::wait`, and for the by-id async wait
+//! (`tokio::drive::exited_by_id`) on real processes. In the library because they are
 //! `pub(crate)`. Death-proof discipline: a generous grace on an already-dead child is a
 //! failure bound (the exit event precedes the call); `Duration::ZERO` on a live child makes
 //! the timeout branch deterministic.
@@ -8,8 +9,8 @@ use std::time::Duration;
 // This module is declared INSIDE src/tokio/wait.rs, so `super` is `tokio::wait` itself.
 #[cfg(unix)]
 use super::armed_deadline_seam::Armed;
-use super::{grace_wait, wait_exit};
 use crate::identity::ProcessId;
+use crate::tokio::drive::exited_by_id;
 
 // A long-lived std child (leak-proof: killed + reaped by each test) that only a kill or a closed
 // stdin ends; see `test_child::BLOCKER_ARGV`. Each test calls `wait()` (which closes the piped
@@ -88,105 +89,70 @@ fn poll_once<F: std::future::Future>(fut: std::pin::Pin<&mut F>) -> std::task::P
 }
 
 #[skuld::test]
-async fn grace_wait_true_for_exited_unreaped_child() {
+async fn exited_by_id_true_for_exited_unreaped_child() {
     let mut child = std_blocker();
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
     child.kill().expect("kill");
     // NOT reaped yet (no wait): on Unix the child is a zombie — the watch must still see the
     // exit.
-    let exited = grace_wait(id, Duration::from_secs(30)).await.expect("grace_wait");
+    let exited = exited_by_id(id, Some(Duration::from_secs(30)))
+        .await
+        .expect("exited_by_id");
     assert!(exited, "an exited (unreaped) child must report exited");
     child.wait().expect("reap");
 }
 
 #[skuld::test]
-async fn grace_wait_false_for_live_child_at_zero_grace() {
+async fn exited_by_id_false_for_live_child_at_zero_grace() {
     let mut child = std_blocker();
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
-    let exited = grace_wait(id, Duration::ZERO).await.expect("grace_wait");
+    let exited = exited_by_id(id, Some(Duration::ZERO)).await.expect("exited_by_id");
     assert!(!exited, "a live child at ZERO grace must report still-alive");
     child.kill().expect("cleanup");
     child.wait().expect("reap");
 }
 
 #[skuld::test]
-async fn grace_wait_true_for_stale_identity() {
+async fn exited_by_id_true_for_stale_identity() {
     let mut child = std_blocker();
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
     child.kill().expect("kill");
     child.wait().expect("reap"); // fully gone; the pid may even be recycled
-    let exited = grace_wait(id, Duration::from_secs(30)).await.expect("grace_wait");
+    let exited = exited_by_id(id, Some(Duration::from_secs(30)))
+        .await
+        .expect("exited_by_id");
     assert!(exited, "a stale identity (reaped child) must report exited, never hang");
 }
 
 #[skuld::test]
-async fn grace_wait_true_when_child_dies_mid_wait() {
+async fn exited_by_id_true_when_child_dies_mid_wait() {
     // The live-then-exits path: the watch arms on a LIVE child and must resolve on the real
     // exit event (our own kill). Whether the kill lands before or after arming, the result
     // must be `true`.
     let mut child = std_blocker();
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
-    let watch = ::tokio::spawn(grace_wait(id, Duration::from_secs(30)));
+    let watch = ::tokio::spawn(exited_by_id(id, Some(Duration::from_secs(30))));
     child.kill().expect("kill mid-wait");
-    let exited = watch.await.expect("join").expect("grace_wait");
+    let exited = watch.await.expect("join").expect("exited_by_id");
     assert!(exited, "the watch must resolve on the child's exit");
     child.wait().expect("reap");
 }
 
-// The Windows release mechanism itself, deterministically: a PRE-signaled cancel event must
-// release the wait on a LIVE child — no race, nothing to time. If the cancel plumbing were
-// broken, the wait would sit at the unbounded `None` (=> INFINITE) watch, and a nextest
-// override ends it as a failure.
-#[cfg(windows)]
-#[skuld::test]
-fn cancel_event_releases_the_blocking_wait() {
-    let mut child = std_blocker();
-    let id = ProcessId::of(child.id()).found().expect("identity of live child");
-    let cancel = crate::wait::backend::new_cancel_event().expect("event");
-    crate::wait::backend::signal_cancel(&cancel);
-    let exited = crate::wait::backend::block_until_exit_or_cancel(id, None, &cancel).expect("cancellable wait");
-    assert!(!exited, "a live child with a signaled cancel must report still-alive");
-    child.kill().expect("cleanup");
-    child.wait().expect("reap");
-}
-
-// The concurrent case: signal the cancel while the wait is (or is about to be) in flight.
-// The manual-reset event is set-once/released-forever, so EVERY interleaving must release
-// the watcher — this is race-INSENSITIVITY being proven, not an outcome bet on a race. If
-// the release were broken, the join would hang until a nextest override
-// ends it as a failure.
-#[cfg(windows)]
-#[skuld::test]
-fn cancel_event_signaled_mid_wait_releases_the_blocking_wait() {
-    let mut child = std_blocker();
-    let id = ProcessId::of(child.id()).found().expect("identity of live child");
-    let cancel = std::sync::Arc::new(crate::wait::backend::new_cancel_event().expect("event"));
-    let watcher = std::thread::spawn({
-        let cancel = cancel.clone();
-        move || crate::wait::backend::block_until_exit_or_cancel(id, None, &cancel)
-    });
-    crate::wait::backend::signal_cancel(&cancel);
-    let exited = watcher.join().expect("watcher thread").expect("cancellable wait");
-    assert!(!exited, "a live child with a signaled cancel must report still-alive");
-    child.kill().expect("cleanup");
-    child.wait().expect("reap");
-}
-
-/// What one `grace_wait` on a Windows child logged on its blocking thread.
+/// What one `exited_by_id` on a Windows child logged on its blocking thread.
 #[cfg(windows)]
 struct Observed {
-    /// The real clock as `grace_wait` saw it: frozen a second behind the actual now.
+    /// The real clock as `exited_by_id` saw it: frozen a second behind the actual now.
     real_start: std::time::Instant,
     exited: bool,
     log: Vec<crate::wait::read_probe::Event>,
 }
 
-/// Runs `grace_wait(id, grace)` with tokio's clock pinned at `pin` and the real clock frozen behind the
-/// blocking thread's, so a deadline `grace_wait` fixes on this thread differs from any a
+/// Runs `exited_by_id(id, Some(grace))` with tokio's clock pinned at `pin` and the real clock frozen behind the
+/// blocking thread's, so a deadline `exited_by_id` fixes on this thread differs from any a
 /// blocking thread would derive itself. Logs every `remaining` read and the identity step.
 /// With `release`, closes the child's stdin after the first read, so the wait ends by exit.
 #[cfg(windows)]
-async fn observed_grace_wait(
+async fn observed_exited_by_id(
     child: &mut std::process::Child,
     pin: std::time::Instant,
     grace: Duration,
@@ -203,7 +169,7 @@ async fn observed_grace_wait(
     let mut log = Vec::new();
     let exited = if release {
         // A live child's watch always logs a read before it can end, so the `recv` returns.
-        let (exited, ()) = ::tokio::join!(grace_wait(id, grace), async {
+        let (exited, ()) = ::tokio::join!(exited_by_id(id, Some(grace)), async {
             loop {
                 let event = rx.recv().expect("the blocking watch logs a read");
                 log.push(event);
@@ -215,19 +181,19 @@ async fn observed_grace_wait(
         });
         exited
     } else {
-        grace_wait(id, grace).await
+        exited_by_id(id, Some(grace)).await
     };
     // The join has returned, so every send happened before this.
     log.extend(rx.try_iter());
     Observed {
         real_start,
-        exited: exited.expect("grace_wait"),
+        exited: exited.expect("exited_by_id"),
         log,
     }
 }
 
-/// Asserts the blocking thread verified identity before its first `remaining` read, and that
-/// every read was made against `deadline`. Returns the reads' results.
+/// Asserts identity was verified before the first `remaining` read, and that every read was made
+/// against `deadline`, with `None` and `Some(None)` both unbounded. Returns the reads' results.
 #[cfg(windows)]
 #[track_caller]
 fn assert_reads_of(
@@ -249,7 +215,8 @@ fn assert_reads_of(
         {
             assert!(i > mark, "a remaining read preceded identity verification: {log:?}");
             assert_eq!(
-                *used, deadline,
+                used.flatten(),
+                deadline.flatten(),
                 "a read was made against a re-derived deadline: {log:?}"
             );
             results.push(*remaining);
@@ -259,15 +226,15 @@ fn assert_reads_of(
     results
 }
 
-// `grace_wait` must arm the blocking wait from the deadline it fixed before `spawn_blocking`.
+// `exited_by_id` must arm the blocking wait from the deadline it fixed before `spawn_blocking`.
 // Tokio's clock is pinned and the real clock frozen a second behind the blocking thread's, so a
 // blocking thread deriving its own deadline reads a later instant and fails the equality.
 // The deadline is already past: the wait is one non-blocking probe.
 #[cfg(windows)]
 #[skuld::test]
-async fn grace_wait_windows_arms_from_a_past_deadline_fixed_before_spawn_blocking() {
+async fn exited_by_id_windows_arms_from_a_past_deadline_fixed_before_spawn_blocking() {
     let mut child = std_blocker();
-    let seen = observed_grace_wait(&mut child, std::time::Instant::now(), Duration::ZERO, false).await;
+    let seen = observed_exited_by_id(&mut child, std::time::Instant::now(), Duration::ZERO, false).await;
     kill_and_reap(&mut child);
     assert!(!seen.exited, "a live child at ZERO grace must report still-alive");
     let reads = assert_reads_of(&seen.log, Some(Some(seen.real_start)));
@@ -278,10 +245,10 @@ async fn grace_wait_windows_arms_from_a_past_deadline_fixed_before_spawn_blockin
 // what is left of the caller's deadline, not a fresh grace.
 #[cfg(windows)]
 #[skuld::test]
-async fn grace_wait_windows_arms_from_a_future_deadline_fixed_before_spawn_blocking() {
+async fn exited_by_id_windows_arms_from_a_future_deadline_fixed_before_spawn_blocking() {
     let grace = Duration::from_secs(3600);
     let mut child = std_blocker();
-    let seen = observed_grace_wait(&mut child, std::time::Instant::now(), grace, true).await;
+    let seen = observed_exited_by_id(&mut child, std::time::Instant::now(), grace, true).await;
     child.wait().expect("reap");
     assert!(seen.exited, "the child exited after its stdin closed");
     let reads = assert_reads_of(&seen.log, Some(Some(seen.real_start + grace)));
@@ -294,9 +261,9 @@ async fn grace_wait_windows_arms_from_a_future_deadline_fixed_before_spawn_block
 // A grace that overflows `Instant` is unbounded: not expired, not a panic, not a fixed fallback.
 #[cfg(windows)]
 #[skuld::test]
-async fn grace_wait_windows_treats_an_overflowing_grace_as_unbounded() {
+async fn exited_by_id_windows_treats_an_overflowing_grace_as_unbounded() {
     let mut child = std_blocker();
-    let seen = observed_grace_wait(&mut child, std::time::Instant::now(), Duration::MAX, true).await;
+    let seen = observed_exited_by_id(&mut child, std::time::Instant::now(), Duration::MAX, true).await;
     child.wait().expect("reap");
     assert!(seen.exited, "an unbounded watch ends only by the exit");
     assert!(assert_reads_of(&seen.log, None).iter().all(Option::is_none));
@@ -306,12 +273,12 @@ async fn grace_wait_windows_treats_an_overflowing_grace_as_unbounded() {
 // `deadline_at` also makes unbounded.
 #[cfg(windows)]
 #[skuld::test]
-async fn grace_wait_windows_treats_a_grace_inside_the_timer_margin_of_the_ceiling_as_unbounded() {
+async fn exited_by_id_windows_treats_a_grace_inside_the_timer_margin_of_the_ceiling_as_unbounded() {
     let mut child = std_blocker();
     let pin = std::time::Instant::now();
     // 500us short of the ceiling: inside the 1ms margin, but not overflowing outright.
     let grace = crate::wait::instant_near_ceiling(pin).saturating_duration_since(pin) - Duration::from_micros(500);
-    let seen = observed_grace_wait(&mut child, pin, grace, true).await;
+    let seen = observed_exited_by_id(&mut child, pin, grace, true).await;
     child.wait().expect("reap");
     assert!(seen.exited, "an unbounded watch ends only by the exit");
     assert!(assert_reads_of(&seen.log, None).iter().all(Option::is_none));
@@ -364,10 +331,8 @@ async fn death_watch_loop_survives_a_non_exit_drain_cycle() {
     decoy.wait().expect("reap decoy");
 }
 
-// The POLLERR branch and the readiness contract, via synthetic Ready values — these pin the
-// BRANCH LOGIC only. The real OS→Ready mapping (pidfd → epoll → mio → AsyncFd) is validated
-// by the live-path tests above: grace_wait_true_for_exited_unreaped_child and
-// grace_wait_true_when_child_dies_mid_wait run the whole stack on a real pidfd.
+// The POLLERR branch and the readiness contract, via synthetic `Ready` values: they pin the branch
+// logic only. The live-path tests above run the real pidfd -> epoll -> mio -> `AsyncFd` mapping.
 #[cfg(target_os = "linux")]
 mod classify {
     use ::tokio::io::Ready;
@@ -398,27 +363,27 @@ mod classify {
 }
 
 #[skuld::test]
-async fn wait_exit_resolves_for_exited_unreaped_child() {
+async fn exited_by_id_unbounded_resolves_for_exited_unreaped_child() {
     let mut child = std_blocker();
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
     child.kill().expect("kill");
     // NOT reaped: the exit event precedes the call, so the unbounded watch must resolve.
-    wait_exit(id).await.expect("wait_exit");
+    exited_by_id(id, None).await.expect("exited_by_id");
     child.wait().expect("reap");
 }
 
 /// The async watch reports a refused `pidfd_open` as `process wait`. The child is killed first so
 /// an unconsumed forced errno resolves the watch `Ok` and fails the assertion instead of hanging.
 ///
-/// Mutants: `exit_watch` names another `PidfdOp`; the forced errno is not consumed.
+/// Mutants: `open` names another `PidfdOp`; the forced errno is not consumed.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-async fn wait_exit_names_process_wait_when_pidfd_open_is_refused() {
+async fn exited_by_id_unbounded_names_process_wait_when_pidfd_open_is_refused() {
     let mut child = std_blocker();
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
     child.kill().expect("kill");
     let forced = crate::wait::backend::fault::force_pidfd_open_errno_once(rustix::io::Errno::ACCESS);
-    let result = wait_exit(id).await;
+    let result = exited_by_id(id, None).await;
     drop(forced);
     child.wait().expect("reap");
     match result {
@@ -432,18 +397,18 @@ async fn wait_exit_names_process_wait_when_pidfd_open_is_refused() {
 }
 
 #[skuld::test]
-async fn wait_exit_resolves_when_child_dies_mid_wait() {
+async fn exited_by_id_unbounded_resolves_when_child_dies_mid_wait() {
     // Arm on a LIVE child; our own kill is the real exit event. Race-tolerant either side.
     let mut child = std_blocker();
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
-    let watch = ::tokio::spawn(wait_exit(id));
+    let watch = ::tokio::spawn(exited_by_id(id, None));
     child.kill().expect("kill mid-wait");
-    watch.await.expect("join").expect("wait_exit");
+    watch.await.expect("join").expect("exited_by_id");
     child.wait().expect("reap");
 }
 
 #[skuld::test]
-async fn grace_wait_zero_reports_an_observed_exit() {
+async fn exited_by_id_zero_reports_an_observed_exit() {
     // The ZERO one-shot probe must see an already-exited (zombie) child — the sync/async
     // parity case a plain timeout(ZERO, ..) gets wrong (the AsyncFd readiness of a zombie
     // needs a reactor round-trip the zero timer would win against).
@@ -452,23 +417,23 @@ async fn grace_wait_zero_reports_an_observed_exit() {
     child.kill().expect("kill");
     // Observe the exit as a real event WITHOUT reaping: wait for it via the unbounded watch
     // (30 s-class bound is the harness), then probe at ZERO.
-    wait_exit(id).await.expect("exit observed");
+    exited_by_id(id, None).await.expect("exit observed");
     assert!(
-        grace_wait(id, Duration::ZERO).await.expect("zero probe"),
+        exited_by_id(id, Some(Duration::ZERO)).await.expect("zero probe"),
         "an observed-exited child must report exited at ZERO grace"
     );
     child.wait().expect("reap");
 }
 
 #[skuld::test]
-async fn wait_exit_cancel_leaves_child_untouched() {
+async fn exited_by_id_unbounded_cancel_leaves_child_untouched() {
     use std::future::Future;
     // Poll the unbounded watch exactly once (arms it), then drop — the watch is signal-free,
     // so the child must still be alive; it dies only by the test's own kill.
     let mut child = std_blocker_with_stdout();
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
     {
-        let mut fut = std::pin::pin!(wait_exit(id));
+        let mut fut = std::pin::pin!(exited_by_id(id, None));
         let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
         if let std::task::Poll::Ready(r) = fut.as_mut().poll(&mut cx) {
             panic!("unbounded watch resolved at first poll on a live child: {r:?}");
@@ -482,7 +447,7 @@ async fn wait_exit_cancel_leaves_child_untouched() {
 // blocks until that happens.
 #[cfg(windows)]
 #[skuld::test]
-async fn wait_exit_drop_releases_the_windows_watcher() {
+async fn exited_by_id_unbounded_drop_releases_the_windows_watcher() {
     crate::tokio::test_runtime::assert_current_thread();
     use std::future::Future;
     let (tx, rx) = std::sync::mpsc::channel();
@@ -490,7 +455,7 @@ async fn wait_exit_drop_releases_the_windows_watcher() {
     let mut child = std_blocker_with_stdout();
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
     {
-        let mut fut = std::pin::pin!(wait_exit(id));
+        let mut fut = std::pin::pin!(exited_by_id(id, None));
         let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
         if let std::task::Poll::Ready(r) = fut.as_mut().poll(&mut cx) {
             panic!("unbounded watch resolved at first poll on a live child: {r:?}");
@@ -527,11 +492,27 @@ fn fault_observer_install_panics_when_nested() {
     let _inner = super::fault_observer::install(tx);
 }
 
+/// `exited_by_id(id, None)` on a live `child`, killed only after the driver's first look found it
+/// running and hopped to the blocking pool. A child killed before that look is `Exited` at the
+/// first look and no watch is ever armed, so a test of what a watch notifies must kill from here.
+#[cfg(windows)]
+async fn watch_then_kill(id: ProcessId, child: &mut std::process::Child) {
+    use std::future::Future as _;
+    let mut watch = std::pin::pin!(exited_by_id(id, None));
+    let first = std::future::poll_fn(|cx| std::task::Poll::Ready(watch.as_mut().poll(cx))).await;
+    assert!(first.is_pending(), "a live child must not resolve at the first look");
+    child.kill().expect("kill");
+    assert!(
+        watch.await.expect("watch"),
+        "the watch must resolve on the child's exit"
+    );
+}
+
 // The relay's pool-thread guard must not outlive the closure: on a pool pinned to ONE thread, a
 // watch without an observer that runs after one with an observer must not reach the first's
 // channel, and the pool thread's slot must be empty afterwards.
 //
-// Mutant: `mem::forget` the `_relay` guard in `blocking_watch`'s closure -> the second
+// Mutant: `mem::forget` the `_relay` guard in `cancellable_blocking`'s closure -> the second
 // watch's release reaches the first's channel.
 #[cfg(windows)]
 #[skuld::test]
@@ -551,17 +532,15 @@ fn the_relayed_observer_does_not_outlive_its_blocking_call() {
 
         let mut first = std_blocker();
         let first_id = ProcessId::of(first.id()).found().expect("identity of live child");
-        first.kill().expect("kill");
         let guard = super::fault_observer::install(tx);
-        wait_exit(first_id).await.expect("first watch");
+        watch_then_kill(first_id, &mut first).await;
         drop(guard);
         first.wait().expect("reap");
         assert_eq!(rx.try_iter().count(), 1, "the first watch releases exactly once");
 
         let mut second = std_blocker();
         let second_id = ProcessId::of(second.id()).found().expect("identity of live child");
-        second.kill().expect("kill");
-        wait_exit(second_id).await.expect("second watch");
+        watch_then_kill(second_id, &mut second).await;
         second.wait().expect("reap");
         assert_eq!(
             rx.try_iter().count(),
@@ -578,19 +557,12 @@ fn the_relayed_observer_does_not_outlive_its_blocking_call() {
     });
 }
 
-// `HandleIdentity::Different` is one of three outcomes `block_until_exit_or_cancel` can land on
-// when watching an already-reaped root — see
-// `windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reaped`'s own doc for why
-// that test alone cannot pin this ONE down: `Opened::Gone` returns before any handle exists, and
-// a live-but-already-signalled `Same` never reaches `armed_probe`'s poll either, so `Different`
-// is possible there only if the OS happens to recycle the pid in the window between the test
-// killing its root and this watch opening it. This test pins `Different` down directly and
-// deterministically instead: a genuinely LIVE child, watched under an identity naming the SAME
-// pid but a WRONG start token, is `Opened::Found` + `HandleIdentity::Different` on every run —
-// no dependence on OS pid-recycling timing.
+// A live child watched under an identity naming its pid but a wrong start token is `Opened::Found`
+// + `HandleIdentity::Different` on every run, with no dependence on pid-recycling timing. The
+// watch resolves as exited without reaching the real wait.
 #[cfg(windows)]
 #[skuld::test]
-async fn grace_wait_resolves_immediately_on_an_identity_mismatch() {
+async fn exited_by_id_resolves_immediately_on_an_identity_mismatch() {
     let mut child = std_blocker_with_stdout();
     let real = ProcessId::of(child.id()).found().expect("identity of live child");
     let stale = ProcessId::from_parts_for_test(real.pid(), real.start_token_raw() ^ 1);
@@ -598,7 +570,7 @@ async fn grace_wait_resolves_immediately_on_an_identity_mismatch() {
     let (armed_tx, armed_rx) = std::sync::mpsc::channel();
     let _armed_guard = crate::wait::backend::armed_probe::install(armed_tx);
 
-    let exited = grace_wait(stale, Duration::from_secs(30))
+    let exited = exited_by_id(stale, Some(Duration::from_secs(30)))
         .await
         .expect("an identity mismatch must resolve, not error");
     assert!(
@@ -616,30 +588,12 @@ async fn grace_wait_resolves_immediately_on_an_identity_mismatch() {
     kill_and_reap(&mut child);
 }
 
-// `armed_probe` reaches the blocking watch. Zero grace: the seam fires before the wait whatever
-// the deadline, and without the relay the expired deadline ends the wait with no notification.
-//
-// Mutant: make `relayed_probe::capture` skip the `Armed` probe -> no notification.
-#[cfg(windows)]
-#[skuld::test]
-async fn the_armed_probe_reaches_the_blocking_watch_of_a_live_target() {
-    let mut child = std_blocker();
-    let id = ProcessId::of(child.id()).found().expect("identity of live child");
-    let (tx, rx) = std::sync::mpsc::channel();
-    let _guard = crate::wait::backend::armed_probe::install(tx);
-    let exited = grace_wait(id, Duration::ZERO).await.expect("grace_wait");
-    assert!(!exited, "a live child must report still-alive");
-    assert_eq!(rx.try_iter().count(), 1, "the wait armed on an unsignalled target once");
-    child.kill().expect("cleanup");
-    child.wait().expect("reap");
-}
-
 // `fault_observer` is thread-local: a watch on another thread must not notify this thread's
 // observer. Deterministic: the other watch is joined on its own OS thread and runtime before the
 // channel is checked.
 //
 // Mutant: make `relayed_probe`'s slot process-global -> this thread's channel receives the other's release.
-// Mutant: skip `notify_released` in `blocking_watch` -> the other thread's channel is empty.
+// Mutant: skip `notify_released` in `cancellable_blocking` -> the other thread's channel is empty.
 #[cfg(windows)]
 #[skuld::test]
 async fn a_watch_on_another_thread_does_not_notify_this_threads_observer() {
@@ -649,8 +603,8 @@ async fn a_watch_on_another_thread_does_not_notify_this_threads_observer() {
 
     let mut other = std_blocker();
     let other_id = ProcessId::of(other.id()).found().expect("identity of live child");
-    other.kill().expect("kill");
     // A separate OS thread with its own runtime; a task on this runtime would poll on this thread.
+    // It kills `other` itself, once its watch is armed.
     let handle = std::thread::spawn(move || {
         let (other_tx, other_rx) = std::sync::mpsc::channel();
         let _guard = super::fault_observer::install(other_tx);
@@ -658,10 +612,10 @@ async fn a_watch_on_another_thread_does_not_notify_this_threads_observer() {
             .enable_all()
             .build()
             .expect("build a current-thread runtime for the other thread");
-        rt.block_on(wait_exit(other_id)).expect("other thread's watch");
-        other_rx
+        rt.block_on(watch_then_kill(other_id, &mut other));
+        (other_rx, other)
     });
-    let other_rx = handle.join().expect("other thread panicked");
+    let (other_rx, mut other) = handle.join().expect("other thread panicked");
     other.wait().expect("reap");
 
     assert_eq!(
@@ -813,10 +767,10 @@ async fn cgroup_wait_tree_drained_parks_unbounded_with_no_timer() {
 
 // Bounded waits arm the caller's deadline via `arm_at`, never earlier or later -----
 
-/// grace_wait (site 1) arms `deadline_from`'s instant: `t0 + grace` on the paused clock.
+/// exited_by_id (site 1) arms `deadline_from`'s instant: `t0 + grace` on the paused clock.
 #[cfg(unix)]
 #[skuld::test(runtime = crate::tokio::test_runtime::paused)]
-async fn grace_wait_arms_deadline_froms_instant() {
+async fn exited_by_id_arms_deadline_froms_instant() {
     let (tx, rx) = std::sync::mpsc::channel();
     let _seam = super::armed_deadline_seam::install(tx);
     let t0 = super::tokio_now();
@@ -825,14 +779,14 @@ async fn grace_wait_arms_deadline_froms_instant() {
     let grace = Duration::from_secs(3600);
 
     {
-        let mut fut = std::pin::pin!(grace_wait(id, grace));
+        let mut fut = std::pin::pin!(exited_by_id(id, Some(grace)));
         assert!(
             poll_once(fut.as_mut()).is_pending(),
             "a live child with an hour of grace"
         );
     }
     assert_eq!(
-        rx.try_recv().expect("grace_wait must arm via arm_at"),
+        rx.try_recv().expect("exited_by_id must arm via arm_at"),
         Armed::At(t0 + grace)
     );
     assert!(rx.try_recv().is_err(), "armed exactly once");
@@ -841,18 +795,18 @@ async fn grace_wait_arms_deadline_froms_instant() {
     child.wait().expect("reap");
 }
 
-/// Polls `grace_wait(id, grace)` once on a live child and returns what the seam saw.
+/// Polls `exited_by_id(id, Some(grace))` once on a live child and returns what the seam saw.
 #[cfg(unix)]
-async fn armed_by_one_poll_of_grace_wait(grace: Duration) -> Vec<Armed> {
+async fn armed_by_one_poll_of_exited_by_id(grace: Duration) -> Vec<Armed> {
     let (tx, rx) = std::sync::mpsc::channel();
     let _seam = super::armed_deadline_seam::install(tx);
     let mut child = std_blocker();
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
     {
-        let mut fut = std::pin::pin!(grace_wait(id, grace));
+        let mut fut = std::pin::pin!(exited_by_id(id, Some(grace)));
         assert!(
             poll_once(fut.as_mut()).is_pending(),
-            "a live child must not resolve grace_wait on its first poll (grace {grace:?})"
+            "a live child must not resolve exited_by_id on its first poll (grace {grace:?})"
         );
     }
     child.kill().expect("cleanup");
@@ -864,22 +818,25 @@ async fn armed_by_one_poll_of_grace_wait(grace: Duration) -> Vec<Armed> {
 /// fallback deadline, at any distance, would report to the seam), and no early `Ok(false)`.
 #[cfg(unix)]
 #[skuld::test(runtime = crate::tokio::test_runtime::paused)]
-async fn grace_wait_arms_no_timer_for_an_overflowing_grace() {
-    assert_eq!(armed_by_one_poll_of_grace_wait(Duration::MAX).await, vec![]);
+async fn exited_by_id_arms_no_timer_for_an_overflowing_grace() {
+    assert_eq!(armed_by_one_poll_of_exited_by_id(Duration::MAX).await, vec![]);
 }
 
 /// The 1 ms margin's edge at site 1, on the paused clock: a grace landing exactly `MARGIN` short
 /// of `Instant`'s ceiling is armed as is, and one nanosecond further is unbounded.
 #[cfg(unix)]
 #[skuld::test(runtime = crate::tokio::test_runtime::paused)]
-async fn grace_wait_at_the_timer_margin_edge_is_armed_and_one_nanosecond_past_it_is_unbounded() {
+async fn exited_by_id_at_the_timer_margin_edge_is_armed_and_one_nanosecond_past_it_is_unbounded() {
     let t0 = super::tokio_now();
     let span = crate::wait::instant_near_ceiling(t0).saturating_duration_since(t0);
     let edge = span - crate::wait::TOKIO_TIMER_ROUNDING_MARGIN;
 
-    assert_eq!(armed_by_one_poll_of_grace_wait(edge).await, vec![Armed::At(t0 + edge)]);
     assert_eq!(
-        armed_by_one_poll_of_grace_wait(edge + Duration::from_nanos(1)).await,
+        armed_by_one_poll_of_exited_by_id(edge).await,
+        vec![Armed::At(t0 + edge)]
+    );
+    assert_eq!(
+        armed_by_one_poll_of_exited_by_id(edge + Duration::from_nanos(1)).await,
         vec![]
     );
 }
@@ -896,11 +853,11 @@ async fn tokio_arms_the_extreme_instant_arm_at_accepts_without_panicking() {
 }
 
 /// "Never early" on tokio's virtual clock (`start_paused`): with the child alive throughout, the
-/// only way `grace_wait` resolves is its timer, and virtual time is auto-advanced to exactly the
+/// only way `exited_by_id` resolves is its timer, and virtual time is auto-advanced to exactly the
 /// armed deadline. It must answer `Ok(false)` only once the clock has reached `t0 + grace`.
 #[cfg(unix)]
 #[skuld::test(runtime = crate::tokio::test_runtime::paused)]
-async fn grace_wait_never_answers_before_its_deadline_on_a_paused_clock() {
+async fn exited_by_id_never_answers_before_its_deadline_on_a_paused_clock() {
     let (tx, rx) = std::sync::mpsc::channel();
     let _seam = super::armed_deadline_seam::install(tx);
     let mut child = std_blocker();
@@ -908,14 +865,14 @@ async fn grace_wait_never_answers_before_its_deadline_on_a_paused_clock() {
     let grace = Duration::from_secs(600);
     let t0 = ::tokio::time::Instant::now();
 
-    let mut fut = std::pin::pin!(grace_wait(id, grace));
+    let mut fut = std::pin::pin!(exited_by_id(id, Some(grace)));
     // The first poll arms the deadline at t0 + grace; the advance then stops one second short.
     assert!(poll_once(fut.as_mut()).is_pending());
     ::tokio::time::advance(grace - Duration::from_secs(1)).await;
     if let std::task::Poll::Ready(r) = poll_once(fut.as_mut()) {
-        panic!("grace_wait answered {r:?} before its deadline");
+        panic!("exited_by_id answered {r:?} before its deadline");
     }
-    let exited = fut.await.expect("grace_wait");
+    let exited = fut.await.expect("exited_by_id");
     assert!(!exited, "a live child is still alive when the deadline passes");
     assert_eq!(
         rx.try_recv().expect("armed"),
@@ -925,32 +882,32 @@ async fn grace_wait_never_answers_before_its_deadline_on_a_paused_clock() {
     let now = ::tokio::time::Instant::now();
     assert!(
         now >= t0 + grace,
-        "grace_wait answered before t0 + grace on the virtual clock"
+        "exited_by_id answered before t0 + grace on the virtual clock"
     );
     assert!(
         now <= t0 + grace + crate::wait::TOKIO_TIMER_ROUNDING_MARGIN,
-        "grace_wait answered later than the timer's own round-up after t0 + grace"
+        "exited_by_id answered later than the timer's own round-up after t0 + grace"
     );
 
     child.kill().expect("cleanup");
     child.wait().expect("reap");
 }
 
-/// An unbounded grace on the paused clock: virtual time can pass a year and `grace_wait` is still
+/// An unbounded grace on the paused clock: virtual time can pass a year and `exited_by_id` is still
 /// pending, and nothing was armed (no fallback deadline of any length).
 #[cfg(unix)]
 #[skuld::test(runtime = crate::tokio::test_runtime::paused)]
-async fn grace_wait_with_an_overflowing_grace_stays_pending_across_a_virtual_year() {
+async fn exited_by_id_with_an_overflowing_grace_stays_pending_across_a_virtual_year() {
     let (tx, rx) = std::sync::mpsc::channel();
     let _seam = super::armed_deadline_seam::install(tx);
     let mut child = std_blocker();
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
 
-    let mut fut = std::pin::pin!(grace_wait(id, Duration::MAX));
+    let mut fut = std::pin::pin!(exited_by_id(id, Some(Duration::MAX)));
     assert!(poll_once(fut.as_mut()).is_pending());
     ::tokio::time::advance(Duration::from_secs(86_400 * 365)).await;
     if let std::task::Poll::Ready(r) = poll_once(fut.as_mut()) {
-        panic!("an unbounded grace_wait answered {r:?}");
+        panic!("an unbounded exited_by_id answered {r:?}");
     }
     assert!(rx.try_recv().is_err(), "no timer may be armed for an unbounded grace");
 
@@ -968,18 +925,20 @@ async fn grace_wait_with_an_overflowing_grace_stays_pending_across_a_virtual_yea
 /// already-exited process while arming and never reaches the timer.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-async fn grace_wait_reports_an_exit_pending_when_the_timer_wins_the_first_poll() {
+async fn exited_by_id_reports_an_exit_pending_when_the_timer_wins_the_first_poll() {
     let mut child = std_blocker();
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
     child.kill().expect("kill");
     // `kill` only signals: block (non-reaping) until the exit has really happened.
-    assert!(crate::wait::block_until_exit(id, None).expect("exit wait"));
+    assert!(crate::os_process::drive::exited_by_id(id, None).expect("exit wait"));
     let past = super::tokio_now()
         .checked_sub(Duration::from_secs(3600))
         .expect("an hour before now");
     let _now = super::now_override::install(past);
 
-    let exited = grace_wait(id, Duration::from_secs(60)).await.expect("grace_wait");
+    let exited = exited_by_id(id, Some(Duration::from_secs(60)))
+        .await
+        .expect("exited_by_id");
     assert!(exited, "an exit that preceded the call must be reported, not Ok(false)");
     child.wait().expect("reap");
 }
@@ -1099,18 +1058,18 @@ fn to_real_clock_preserves_the_remaining_time_across_clocks() {
 /// The wait runs on tokio's clock: virtual time advanced BEFORE the call must not eat the grace.
 #[cfg(unix)]
 #[skuld::test(runtime = crate::tokio::test_runtime::paused)]
-async fn grace_wait_serves_its_full_grace_on_tokios_clock_after_an_advance() {
+async fn exited_by_id_serves_its_full_grace_on_tokios_clock_after_an_advance() {
     let mut child = std_blocker();
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
     ::tokio::time::advance(Duration::from_secs(3600)).await;
     let t0 = ::tokio::time::Instant::now();
     let grace = Duration::from_secs(60);
 
-    let exited = grace_wait(id, grace).await.expect("grace_wait");
+    let exited = exited_by_id(id, Some(grace)).await.expect("exited_by_id");
     assert!(!exited, "a live child is still alive at the deadline");
     assert!(
         ::tokio::time::Instant::now() >= t0 + grace,
-        "grace_wait answered before t0 + grace on tokio's clock"
+        "exited_by_id answered before t0 + grace on tokio's clock"
     );
 
     child.kill().expect("cleanup");

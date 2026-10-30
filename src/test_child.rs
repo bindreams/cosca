@@ -215,6 +215,14 @@ pub(crate) fn held_contained_blocker(stdout: crate::Stdio) -> (crate::Child, std
     held_blocker(stdout, |cmd| _ = cmd.contain())
 }
 
+/// A live [`held_contained_blocker`] with a null stdout and its identity.
+#[cfg(windows)]
+pub(crate) fn live_blocker() -> (crate::Child, std::io::PipeWriter, crate::identity::ProcessId) {
+    let (child, stdin) = held_contained_blocker(crate::Stdio::null());
+    let id = child.id();
+    (child, stdin, id)
+}
+
 /// [`held_contained_blocker`], contained by [`contain_without_cgroup`].
 #[cfg(unix)]
 pub(crate) fn held_contained_blocker_without_cgroup(stdout: crate::Stdio) -> (crate::Child, std::io::PipeWriter) {
@@ -520,7 +528,7 @@ pub(crate) mod shared;
 /// Blocks until either `listener` gets a connection, or `target` exits first, never a bare,
 /// hang-forever `accept()`. The `src/` twin of `tests/common/accept.rs`'s `accept_or_die` (a
 /// separate compilation unit), built on the crate's own identity-verified exit-watch primitives
-/// (`crate::wait::backend::open_verified`, `arm_proc_exit`, `block_until_exit_or_cancel`). The
+/// (`crate::wait::backend::open_verified`, `arm_proc_exit`, `wait_process_or_cancel`). The
 /// `target` identity is verified when the watch is armed, so a reissued pid is reported as the
 /// target being gone, never watched.
 ///

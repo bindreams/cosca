@@ -109,7 +109,7 @@ const ESCALATION_CASES: [([Option<rustix::io::Errno>; 3], &str, bool); 3] = [
 /// A refused `pidfd_open` in the middle of `graceful_shutdown` names the step that hit it: the
 /// grace wait is `process wait`, the escalation `process kill`.
 ///
-/// Mutants: the escalation is `wait::terminate`, or names another `PidfdOp`; the grace wait
+/// Mutants: the escalation is `terminate_by_id`, or names another `PidfdOp`; the grace wait
 /// names another `PidfdOp`; a refused wait skips the escalation.
 #[cfg(target_os = "linux")]
 #[skuld::test]

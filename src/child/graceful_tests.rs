@@ -612,7 +612,7 @@ fn graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_authoritative() 
 // keeps the exit from racing `spawn()`.
 // The test releases it with `x\n`: `read` returns on the newline, so the release does not depend
 // on EOF, which a concurrent fork inheriting the write end would withhold. It then waits with
-// `block_until_exit`, which does not reap, so the root is an unreaped zombie when
+// `exited_by_id`, which does not reap, so the root is an unreaped zombie when
 // `graceful_shutdown_tree` runs. Asserting `Present` at that point keeps the final `Gone` from
 // passing vacuously: had the test reaped the root itself, a mutant that skips the function's own
 // reap would still read `Gone`.
@@ -650,8 +650,8 @@ fn graceful_tree_members_remain_still_reaps_an_already_exited_root() {
     exit_gate.write_all(b"x\n").expect("release the root's exit 0");
     drop(exit_gate);
     assert!(
-        crate::wait::block_until_exit(id, None).expect("the root must exit"),
-        "block_until_exit must observe the exit, not a timeout (None means unbounded)"
+        crate::os_process::drive::exited_by_id(id, None).expect("the root must exit"),
+        "exited_by_id must observe the exit, not a timeout (None means unbounded)"
     );
     assert_eq!(
         id.exists(),

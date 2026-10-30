@@ -241,7 +241,7 @@ pub(crate) fn spawn_unkillable(alone: &Completion) -> RestrictedChild {
 }
 
 /// Grants `PROCESS_QUERY_LIMITED_INFORMATION` and nothing else — identity is readable by pid
-/// but `PROCESS_TERMINATE` is denied, which is the only shape that drives `wait::kill`'s
+/// but `PROCESS_TERMINATE` is denied, which is the only shape that drives `kill_by_id`'s
 /// `Opened::Denied` arm (its mask is `TERMINATE | QUERY_LIMITED`, so `spawn_restricted` —
 /// which always ORs in `PROCESS_TERMINATE` — opens successfully and never reaches it).
 pub(crate) fn spawn_query_only(alone: &Completion) -> RestrictedChild {

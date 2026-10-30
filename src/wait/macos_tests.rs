@@ -18,12 +18,12 @@ fn drain_reports_none_when_no_event_pending() {
     child.wait().expect("reap");
 }
 
-/// `kill(0, sig)` would signal the caller's ENTIRE process group, so pid 0 must never reach
-/// `kill(2)`. Two independent layers stop it, and this pins the outer one: the identity
-/// re-verify. `ProcessId::of(0)` resolves on macOS (`kernel_task`), but to a token that no
-/// caller-held identity matches, so a pid-0 identity is rejected as recycled before the
-/// signal is ever formed — and the test process, which is what `kill(0, ..)` would have
-/// killed, survives to make the assertion.
+/// `kill(0, sig)` would signal the caller's ENTIRE process group, so pid 0 must never be signalled.
+/// Two independent layers stop it, and this pins the outer one: `open`'s flavor-17 read of the pid
+/// followed by `exists()`. `ProcessId::of(0)` resolves on macOS (`kernel_task`), but to a token that
+/// no caller-held identity matches, so a pid-0 identity is rejected as recycled, `open` is
+/// `Ok(None)`, and the signal is never formed — the test process, which is what `kill(0, ..)` would
+/// have killed, survives to make the assertion.
 ///
 /// The inner layer, `probe::signal_target`, is defence in depth for a caller holding
 /// `kernel_task`'s *genuine* identity. It is not exercised here on purpose: a regression in
@@ -33,8 +33,8 @@ fn drain_reports_none_when_no_event_pending() {
 fn a_pid_zero_identity_never_reaches_kill() {
     let bogus = crate::identity::ProcessId::from_parts_for_test(0, 1);
     // Already-gone is success: the pid holds a process, but not the one named.
-    crate::wait::kill(bogus).expect("a pid-0 identity resolves to a stranger, i.e. already gone");
-    crate::wait::terminate(bogus).expect("same for the graceful signal");
+    crate::os_process::kill_by_id(bogus).expect("a pid-0 identity resolves to a stranger, i.e. already gone");
+    crate::os_process::terminate_by_id(bogus).expect("same for the graceful signal");
     // If either call had reached `kill(2)`, this process would have died with it.
     assert_eq!(
         crate::identity::ProcessId::current().is_alive(),
@@ -99,8 +99,8 @@ fn a_deadline_beyond_the_kevent_limit_still_returns_the_exit() {
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
     let mut stdin = child.stdin.take();
     let _hooks = super::test_hooks::HookGuard::install(move |_, _| drop(stdin.take()));
-    let deadline = crate::wait::deadline_from(Duration::from_secs(u64::from(u32::MAX)));
-    let exited = super::block_until_exit(id, deadline).expect("a far deadline is not an error");
+    let exited = crate::os_process::drive::exited_by_id(id, Some(Duration::from_secs(u64::from(u32::MAX))))
+        .expect("a far deadline is not an error");
     assert!(exited, "the child was ended, so the wait reports its exit");
     assert_eq!(
         super::test_hooks::requested_timeouts(),

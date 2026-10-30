@@ -65,7 +65,7 @@ impl GracefulMechanism {
     pub(crate) fn addresses_a_bare_pid(self) -> bool {
         match self {
             GracefulMechanism::ConsoleGroup | GracefulMechanism::OtherConsoleGroup => true,
-            // Identity-bound (`crate::wait::terminate`), and unconstructible on Windows anyway.
+            // Identity-bound (`crate::os_process::terminate_by_id`), and unconstructible on Windows anyway.
             GracefulMechanism::Process => false,
             GracefulMechanism::Unknown | GracefulMechanism::None => false,
         }
@@ -93,7 +93,7 @@ impl std::fmt::Display for GracefulMechanism {
 /// place this decision is made.
 pub(crate) fn signal(mechanism: GracefulMechanism, id: crate::identity::ProcessId) -> Result<(), crate::error::Error> {
     match mechanism {
-        GracefulMechanism::Process => crate::wait::terminate(id),
+        GracefulMechanism::Process => crate::os_process::terminate_by_id(id),
         // One arm for both. This process's console list is readable, but absence from it does
         // not imply undeliverable (see `containment::windows::terminate`), and refusing
         // `OtherConsoleGroup` would refuse a child that re-attached itself to our console after
