@@ -61,6 +61,9 @@ impl ExitWatch {
         if self.seen.load(Ordering::Relaxed) {
             return Ok(true);
         }
+        // Only a wait that is really armed counts as a block.
+        #[cfg(test)]
+        crate::wait::block_probe::record(crate::wait::remaining(deadline));
         block_on_kqueue(&self.kq, deadline, false, |event, _already_elapsed| {
             if event.flags().contains(EvFlags::EV_ERROR) {
                 return Err(Error::Io(std::io::Error::from_raw_os_error(event.data() as i32)));

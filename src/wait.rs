@@ -670,7 +670,7 @@ fn win32_wait_clamp() -> u32 {
 
 /// Test-only, thread-local record of the timeout each timed block was armed with on this thread
 /// (`None` = unbounded): a `poll` or `Condvar::wait_timeout` round, a Win32 wait, or (macOS) one
-/// `ExitWatch::block` as the process driver calls it. A test proves a deadline wait armed nothing
+/// `ExitWatch::block` that arms a wait. A test proves a deadline wait armed nothing
 /// longer than the time remaining, and blocked at all, from the log.
 #[cfg(test)]
 pub(crate) mod block_probe {

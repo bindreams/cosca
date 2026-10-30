@@ -64,15 +64,12 @@ pub(crate) enum WaitFor<'a> {
     Signalled(BorrowedHandle<'a>),
 }
 
-/// The OS handle behind an [`OsProcess`].
-#[cfg(any(target_os = "linux", windows))]
-#[derive(Debug)]
-pub(crate) enum OsHandle<'a> {
-    #[cfg(target_os = "linux")]
-    Pidfd(BorrowedFd<'a>),
-    #[cfg(windows)]
-    Process(BorrowedHandle<'a>),
-}
+/// The OS handle behind an [`OsProcess`]: the pidfd.
+#[cfg(target_os = "linux")]
+pub(crate) type OsHandle<'a> = BorrowedFd<'a>;
+/// The OS handle behind an [`OsProcess`]: the process handle.
+#[cfg(windows)]
+pub(crate) type OsHandle<'a> = BorrowedHandle<'a>;
 
 /// The operation an [`open`] is for. It names the operation in `Unsupported` and `Unassessable`
 /// errors.

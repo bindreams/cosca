@@ -43,8 +43,6 @@ fn block(wait_for: &WaitFor<'_>, deadline: Option<Option<Instant>>) -> Result<()
         }
         #[cfg(target_os = "macos")]
         WaitFor::Kqueue(watch) => {
-            #[cfg(test)]
-            crate::wait::block_probe::record(remaining(deadline));
             watch.block(deadline)?;
         }
         #[cfg(windows)]

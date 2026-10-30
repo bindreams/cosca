@@ -41,5 +41,19 @@ fn drain_remembers_the_event_it_read() {
     tx.write_all(&[1]).unwrap();
     assert!(watch.drain().unwrap());
     rx.read_exact(&mut [0]).unwrap();
+    crate::wait::block_probe::take();
     assert!(watch.block(expired()).unwrap());
+    assert!(
+        crate::wait::block_probe::take().is_empty(),
+        "a block that returns at once on `seen` arms no wait"
+    );
+}
+
+/// Mutant: `block` records no armed wait.
+#[skuld::test]
+fn block_records_a_wait_it_arms() {
+    let (_rx, _tx, watch) = pipe_watch();
+    crate::wait::block_probe::take();
+    assert!(!watch.block(expired()).unwrap());
+    assert_eq!(crate::wait::block_probe::take().len(), 1);
 }
