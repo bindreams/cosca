@@ -494,6 +494,22 @@ fn fault_observer_install_panics_when_nested() {
     let _inner = super::fault_observer::install(tx);
 }
 
+/// `exited_by_id(id, None)` on a live `child`, killed only after the driver's first look found it
+/// running and hopped to the blocking pool. A child killed before that look is `Exited` at the
+/// first look and no watch is ever armed, so a test of what a watch notifies must kill from here.
+#[cfg(windows)]
+async fn watch_then_kill(id: ProcessId, child: &mut std::process::Child) {
+    use std::future::Future as _;
+    let mut watch = std::pin::pin!(exited_by_id(id, None));
+    let first = std::future::poll_fn(|cx| std::task::Poll::Ready(watch.as_mut().poll(cx))).await;
+    assert!(first.is_pending(), "a live child must not resolve at the first look");
+    child.kill().expect("kill");
+    assert!(
+        watch.await.expect("watch"),
+        "the watch must resolve on the child's exit"
+    );
+}
+
 // The relay's pool-thread guard must not outlive the closure: on a pool pinned to ONE thread, a
 // watch without an observer that runs after one with an observer must not reach the first's
 // channel, and the pool thread's slot must be empty afterwards.
@@ -518,17 +534,15 @@ fn the_relayed_observer_does_not_outlive_its_blocking_call() {
 
         let mut first = std_blocker();
         let first_id = ProcessId::of(first.id()).found().expect("identity of live child");
-        first.kill().expect("kill");
         let guard = super::fault_observer::install(tx);
-        exited_by_id(first_id, None).await.expect("first watch");
+        watch_then_kill(first_id, &mut first).await;
         drop(guard);
         first.wait().expect("reap");
         assert_eq!(rx.try_iter().count(), 1, "the first watch releases exactly once");
 
         let mut second = std_blocker();
         let second_id = ProcessId::of(second.id()).found().expect("identity of live child");
-        second.kill().expect("kill");
-        exited_by_id(second_id, None).await.expect("second watch");
+        watch_then_kill(second_id, &mut second).await;
         second.wait().expect("reap");
         assert_eq!(
             rx.try_iter().count(),
@@ -598,8 +612,8 @@ async fn a_watch_on_another_thread_does_not_notify_this_threads_observer() {
 
     let mut other = std_blocker();
     let other_id = ProcessId::of(other.id()).found().expect("identity of live child");
-    other.kill().expect("kill");
     // A separate OS thread with its own runtime; a task on this runtime would poll on this thread.
+    // It kills `other` itself, once its watch is armed.
     let handle = std::thread::spawn(move || {
         let (other_tx, other_rx) = std::sync::mpsc::channel();
         let _guard = super::fault_observer::install(other_tx);
@@ -607,10 +621,10 @@ async fn a_watch_on_another_thread_does_not_notify_this_threads_observer() {
             .enable_all()
             .build()
             .expect("build a current-thread runtime for the other thread");
-        rt.block_on(exited_by_id(other_id, None)).expect("other thread's watch");
-        other_rx
+        rt.block_on(watch_then_kill(other_id, &mut other));
+        (other_rx, other)
     });
-    let other_rx = handle.join().expect("other thread panicked");
+    let (other_rx, mut other) = handle.join().expect("other thread panicked");
     other.wait().expect("reap");
 
     assert_eq!(
