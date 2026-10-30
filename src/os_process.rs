@@ -15,6 +15,8 @@ use crate::signal::{Sent, Sig};
 pub(crate) mod drive;
 #[cfg(test)]
 pub(crate) mod fake;
+#[cfg(target_os = "linux")]
+pub(crate) mod linux;
 #[cfg(target_os = "macos")]
 #[allow(dead_code, reason = "MacProcess, its consumer, lands in a later task of #839")]
 pub(crate) mod macos;
@@ -82,11 +84,28 @@ pub(crate) enum Op {
 
 /// Open the process `id` names. `Ok(None)`: it is gone, or its pid now names another process.
 pub(crate) fn open(id: ProcessId, op: Op) -> Result<Option<Box<dyn OsProcess>>, Error> {
-    let _ = (id, op);
     #[cfg(target_os = "linux")]
-    unimplemented!("OsProcess on Linux lands in task 2 of #839");
+    return Ok(crate::wait::backend::open_verified(id, op.into())?
+        .map(|pidfd| Box::new(linux::LinuxProcess::new(id, pidfd)) as Box<dyn OsProcess>));
     #[cfg(windows)]
-    unimplemented!("OsProcess on Windows lands in task 3 of #839");
+    {
+        let _ = (id, op);
+        unimplemented!("OsProcess on Windows lands in task 3 of #839");
+    }
     #[cfg(target_os = "macos")]
-    unimplemented!("OsProcess on macOS lands in task 4 of #839");
+    {
+        let _ = (id, op);
+        unimplemented!("OsProcess on macOS lands in task 4 of #839");
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl From<Op> for crate::wait::backend::PidfdOp {
+    fn from(op: Op) -> Self {
+        match op {
+            Op::Wait => Self::Wait,
+            Op::Kill => Self::Kill,
+            Op::Terminate => Self::Terminate,
+        }
+    }
 }

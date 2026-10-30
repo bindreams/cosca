@@ -578,25 +578,30 @@ pub(crate) fn poll_pidfd_exit(
         let mut fds = [PollFd::new(&pidfd, PollFlags::IN)];
         match poll(&mut fds, ts.as_ref()) {
             Ok(0) => Ok(None),
-            Ok(_) => {
-                let revents = fds[0].revents();
-                // POLLNVAL on an fd we own and hold alive is a contract violation.
-                debug_assert!(
-                    !revents.contains(PollFlags::NVAL),
-                    "pidfd reported POLLNVAL: owned-fd contract violation"
-                );
-                if revents.contains(PollFlags::ERR) {
-                    return Err(std::io::Error::other("pidfd poll returned POLLERR"));
-                }
-                // POLLIN (zombie), or POLLHUP once reaped.
-                Ok(Some(()))
-            }
+            Ok(_) => pidfd_readable(fds[0].revents()).map(Some),
             // A signal: go round again against the recomputed remaining time.
             Err(rustix::io::Errno::INTR) => Ok(None),
             Err(e) => Err(std::io::Error::from(e)),
         }
     })?;
     Ok(seen.is_some())
+}
+
+/// What a `poll` that reported events on a pidfd found: `Ok(())` for `POLLIN` (a zombie) or
+/// `POLLHUP` (reaped), both an exit; `POLLERR` is an error.
+#[cfg(target_os = "linux")]
+pub(crate) fn pidfd_readable(revents: rustix::event::PollFlags) -> std::io::Result<()> {
+    use rustix::event::PollFlags;
+
+    // POLLNVAL on an fd we own and hold alive is a contract violation.
+    debug_assert!(
+        !revents.contains(PollFlags::NVAL),
+        "pidfd reported POLLNVAL: owned-fd contract violation"
+    );
+    if revents.contains(PollFlags::ERR) {
+        return Err(std::io::Error::other("pidfd poll returned POLLERR"));
+    }
+    Ok(())
 }
 
 /// Waits until the exit of `pidfd`'s process is visible to this process, or until `until`, and
