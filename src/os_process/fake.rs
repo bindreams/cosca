@@ -1,5 +1,5 @@
-//! A stated-facts [`OsProcess`]: what `exited()` and `signal()` answer, in order, and nothing the
-//! OS would do. It never blocks; a `Running` look hands out a [`WaitFor`] that the test fires with
+//! A stated-facts [`OsProcess`]: what `exited()` answers, in order, and nothing the OS would do. It
+//! models no signal. It never blocks; a `Running` look hands out a [`WaitFor`] that the test fires with
 //! [`FakeProcess::wake`], and the driver's own blocking call is what a test counts.
 
 use std::collections::VecDeque;
@@ -16,12 +16,13 @@ use crate::signal::{Sent, Sig};
 pub(crate) enum Answer {
     Exited,
     Running,
+    /// The look fails with an `Error::Io` of this kind.
+    Err(std::io::ErrorKind),
 }
 
 pub(crate) struct FakeProcess {
     id: ProcessId,
     exits: VecDeque<Answer>,
-    signals: VecDeque<Result<Sent, Error>>,
     looks: usize,
     look_times: Vec<Instant>,
     on_look: Option<Box<dyn FnMut(usize) + Send>>,
@@ -29,17 +30,11 @@ pub(crate) struct FakeProcess {
 }
 
 impl FakeProcess {
-    /// A process that answers `exits` to successive looks and `signals` to successive sends. A
-    /// look or send past the script panics.
-    pub(crate) fn new(
-        id: ProcessId,
-        exits: impl IntoIterator<Item = Answer>,
-        signals: impl IntoIterator<Item = Result<Sent, Error>>,
-    ) -> Self {
+    /// A process that answers `exits` to successive looks. A look past the script panics.
+    pub(crate) fn new(id: ProcessId, exits: impl IntoIterator<Item = Answer>) -> Self {
         Self {
             id,
             exits: exits.into_iter().collect(),
-            signals: signals.into_iter().collect(),
             looks: 0,
             look_times: Vec::new(),
             on_look: None,
@@ -80,9 +75,7 @@ impl fmt::Debug for FakeProcess {
 
 impl OsProcess for FakeProcess {
     fn signal(&mut self, _sig: Sig) -> Result<Sent, Error> {
-        self.signals
-            .pop_front()
-            .expect("FakeProcess: a signal was sent past the scripted answers")
+        unimplemented!("FakeProcess models no signal: it states what looks answer")
     }
 
     fn exited(&mut self) -> Result<Exit<'_>, Error> {
@@ -99,6 +92,7 @@ impl OsProcess for FakeProcess {
         {
             Answer::Exited => Ok(Exit::Exited),
             Answer::Running => Ok(Exit::Running(self.source.wait_for())),
+            Answer::Err(kind) => Err(Error::Io(kind.into())),
         }
     }
 }

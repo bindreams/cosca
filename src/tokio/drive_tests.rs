@@ -4,12 +4,13 @@ use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use super::exited_by;
+use crate::error::Error;
 use crate::identity::ProcessId;
 use crate::os_process::fake::{Answer, FakeProcess};
 use crate::wait::fault;
 
 fn fake(exits: impl IntoIterator<Item = Answer>) -> FakeProcess {
-    FakeProcess::new(ProcessId::current(), exits, [])
+    FakeProcess::new(ProcessId::current(), exits)
 }
 
 /// Poll `fut` once, with a waker that wakes nothing.
@@ -25,6 +26,21 @@ async fn zero_timeout_looks_once_and_never_waits() {
         panic!("a zero timeout must not wait");
     };
     assert!(!answer.unwrap());
+    assert_eq!(p.looks(), 1);
+}
+
+/// Mutant: swallow a failed look as a wake, or wait before returning it.
+#[skuld::test]
+async fn a_failed_look_is_returned_without_waiting() {
+    let mut p = fake([Answer::Err(std::io::ErrorKind::PermissionDenied)]);
+    let Poll::Ready(answer) = poll_once(exited_by(&mut p, None)) else {
+        panic!("a failed look must not wait");
+    };
+    let err = answer.unwrap_err();
+    assert!(
+        matches!(&err, Error::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied),
+        "{err:?}"
+    );
     assert_eq!(p.looks(), 1);
 }
 

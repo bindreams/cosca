@@ -1,12 +1,13 @@
 use std::time::Duration;
 
 use super::exited_by;
+use crate::error::Error;
 use crate::identity::ProcessId;
 use crate::os_process::fake::{Answer, FakeProcess};
 use crate::wait::{block_probe, fault, test_clock};
 
 fn fake(exits: impl IntoIterator<Item = Answer>) -> FakeProcess {
-    FakeProcess::new(ProcessId::current(), exits, [])
+    FakeProcess::new(ProcessId::current(), exits)
 }
 
 /// Mutant: block at a zero timeout, or look a second time.
@@ -17,6 +18,20 @@ fn zero_timeout_looks_once_and_never_blocks() {
     assert!(!exited_by(&mut p, Some(Duration::ZERO)).unwrap());
     assert_eq!(p.looks(), 1);
     assert!(block_probe::take().is_empty(), "a zero timeout must not block");
+}
+
+/// Mutant: swallow a failed look as a wake, or block before returning it.
+#[skuld::test]
+fn a_failed_look_is_returned_without_blocking() {
+    block_probe::take();
+    let mut p = fake([Answer::Err(std::io::ErrorKind::PermissionDenied)]);
+    let err = exited_by(&mut p, None).unwrap_err();
+    assert!(
+        matches!(&err, Error::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied),
+        "{err:?}"
+    );
+    assert_eq!(p.looks(), 1);
+    assert!(block_probe::take().is_empty());
 }
 
 /// Mutant: block before looking, or after an `Exited` look.
