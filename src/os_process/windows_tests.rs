@@ -97,6 +97,22 @@ fn terminate_by_id_is_unsupported_and_sends_nothing() {
     child.wait().unwrap();
 }
 
+/// `open` for a terminate refuses with the same `Unsupported` as `terminate_by_id`.
+#[skuld::test]
+fn open_for_terminate_is_unsupported() {
+    let err = open(ProcessId::current(), Op::Terminate).expect_err("Windows has no graceful per-process signal");
+    assert!(
+        matches!(
+            err,
+            Error::Unsupported {
+                platform: "windows",
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+}
+
 /// Mutant: a look hands out some other handle to wait on.
 #[skuld::test]
 fn the_wait_is_on_the_opened_process_handle() {

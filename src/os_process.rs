@@ -65,6 +65,10 @@ pub(crate) enum WaitFor<'a> {
 pub(crate) enum Op {
     Wait,
     Kill,
+    #[cfg_attr(
+        windows,
+        allow(dead_code, reason = "only Windows `open` names it, to refuse: it has no such signal")
+    )]
     Terminate,
 }
 
@@ -93,11 +97,10 @@ pub(crate) fn terminate_by_id(id: ProcessId) -> Result<(), Error> {
     signal_by_id(id, Op::Terminate, Sig::Term)
 }
 
-/// There is no [`Sig`] to send for it on Windows, and [`open`] refuses [`Op::Terminate`] there with
-/// the `Unsupported` this returns.
+/// There is no [`Sig`] to send for it on Windows: `Unsupported`, with nothing opened.
 #[cfg(windows)]
-pub(crate) fn terminate_by_id(id: ProcessId) -> Result<(), Error> {
-    open(id, Op::Terminate).map(|_| ())
+pub(crate) fn terminate_by_id(_id: ProcessId) -> Result<(), Error> {
+    Err(windows::terminate_unsupported())
 }
 
 fn signal_by_id(id: ProcessId, op: Op, sig: Sig) -> Result<(), Error> {

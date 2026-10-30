@@ -49,7 +49,7 @@ impl WindowsProcess {
 }
 
 /// Windows has no per-process graceful-termination signal.
-pub(crate) fn terminate_unsupported() -> Error {
+pub(super) fn terminate_unsupported() -> Error {
     Error::Unsupported {
         op: "graceful terminate (SIGTERM-equivalent)".into(),
         platform: "windows",
