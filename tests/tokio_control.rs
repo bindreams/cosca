@@ -248,7 +248,7 @@ async fn async_graceful_tree_cancel_does_not_escalate_on_windows() {
     let _warns = common::warn_watch();
     use std::future::Future;
     use std::time::Duration;
-    // The Windows non-escalation discriminator (this is the only Windows grace_wait entry):
+    // The Windows non-escalation discriminator (this is the only Windows entry into the async process wait):
     // BOTH members ignore CTRL_BREAK, so after poll-once + drop the root can only be dead if
     // something escalated — being alive proves the cancelled graceful sent nothing further.
     let (mut child, root, grand) = common::spawn_tree_async("spawn-grandchild-ignore-break", |cmd| {

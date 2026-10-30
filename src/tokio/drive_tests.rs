@@ -316,3 +316,14 @@ mod windows {
         );
     }
 }
+
+/// Mutant: `exited_by_id` takes the seam only after `open`, so a gone id never reaches it.
+#[skuld::test]
+async fn exited_by_id_returns_a_forced_watch_error_for_a_gone_id() {
+    crate::tokio::test_runtime::assert_current_thread();
+    let current = ProcessId::current();
+    let gone = ProcessId::from_parts_for_test(current.pid(), current.start_token_raw() ^ 1);
+    fault::set_force_watch_error(true);
+    assert!(super::exited_by_id(gone, None).await.is_err());
+    assert!(!fault::armed(), "the seam is consumed");
+}

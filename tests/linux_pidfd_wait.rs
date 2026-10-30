@@ -48,7 +48,7 @@ fn read_tid(reader: &mut std::io::BufReader<std::net::TcpStream>) -> u32 {
 /// A live non-leader tid is `NotThreadGroupLeader`, on every kernel, with the pid and the
 /// `pidfd_open` errno as data.
 #[skuld::test]
-fn block_until_exit_on_a_live_non_leader_tid_is_an_error() {
+fn wait_on_a_live_non_leader_tid_is_an_error() {
     let (mut child, writer, listener) = spawn_tid_reporter("report-tid-block-stdin");
     let mut reader = accept_reader(&listener, &mut child);
     let tid = read_tid(&mut reader);
@@ -69,7 +69,7 @@ fn block_until_exit_on_a_live_non_leader_tid_is_an_error() {
                 "pidfd_open's refusal is EINVAL (< 6.16) or ENOENT (>= 6.16), got {source:?}"
             );
         }
-        other => panic!("block_until_exit on a live non-leader tid must be NotThreadGroupLeader, got {other:?}"),
+        other => panic!("Process::wait on a live non-leader tid must be NotThreadGroupLeader, got {other:?}"),
     }
 
     // EOF the child's blocking stdin read, then reap it normally.
@@ -86,7 +86,7 @@ fn block_until_exit_on_a_live_non_leader_tid_is_an_error() {
 /// tracer waits for it: `pidfd_open` refuses it like a live one, `/proc` still lists it, but it is
 /// exited. Waiting on it must report exited.
 #[skuld::test]
-fn block_until_exit_on_a_ptraced_zombie_thread_reports_exited() {
+fn wait_on_a_ptraced_zombie_thread_reports_exited() {
     let (mut child, writer, listener) = spawn_tid_reporter("traced-worker");
     let leader = child.id().pid() as libc::pid_t;
     let mut tracer = Tracer {

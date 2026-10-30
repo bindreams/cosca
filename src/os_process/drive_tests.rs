@@ -200,3 +200,26 @@ mod windows {
         assert!(reached, "the call returned before the real deadline");
     }
 }
+
+/// An identity naming a live pid under a start token it never had: `open` is `None` for it.
+fn gone_id() -> ProcessId {
+    let current = ProcessId::current();
+    ProcessId::from_parts_for_test(current.pid(), current.start_token_raw() ^ 1)
+}
+
+/// Mutant: `exited_by_id` takes the seam only after `open`, so a gone id never reaches it.
+#[skuld::test]
+fn exited_by_id_returns_a_forced_watch_error_for_a_gone_id() {
+    fault::set_force_watch_error(true);
+    assert!(super::exited_by_id(gone_id(), None).is_err());
+    assert!(!fault::armed(), "the seam is consumed");
+}
+
+/// Mutant: `exited_by_id` asserts only after `open`, so a gone id may block inside a section.
+#[cfg(feature = "tokio")]
+#[skuld::test]
+#[should_panic(expected = "would block inside an async Drop")]
+fn exited_by_id_refuses_a_gone_id_inside_a_bounded_section() {
+    let _section = crate::bounded::Section::enter();
+    _ = super::exited_by_id(gone_id(), Some(Duration::ZERO));
+}

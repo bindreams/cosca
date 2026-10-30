@@ -545,7 +545,7 @@ fn the_relayed_observer_does_not_outlive_its_blocking_call() {
     });
 }
 
-// `HandleIdentity::Different` is one of three outcomes `block_until_exit_or_cancel` can land on
+// `HandleIdentity::Different` is one of three outcomes `open` can land on
 // when watching an already-reaped root — see
 // `windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reaped`'s own doc for why
 // that test alone cannot pin this ONE down: `Opened::Gone` returns before any handle exists, and

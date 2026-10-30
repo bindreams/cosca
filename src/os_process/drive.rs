@@ -8,8 +8,15 @@ use crate::identity::ProcessId;
 use crate::wait::remaining;
 
 /// [`exited_by`] on the process `id` names. A process that is gone, or whose pid now names another
-/// process, has exited: `Ok(true)` with no wait.
+/// process, has exited: `Ok(true)` with no wait. The bounded-section assert and the watch-fault
+/// seam come before the open, so they hold for a gone id too.
 pub(crate) fn exited_by_id(id: ProcessId, timeout: Option<Duration>) -> Result<bool, Error> {
+    #[cfg(feature = "tokio")]
+    crate::bounded::assert_may_block("waiting for a process to exit");
+    #[cfg(test)]
+    if crate::wait::fault::take_force_watch_error() {
+        return Err(crate::wait::fault::forced_watch_error());
+    }
     match open(id, Op::Wait)? {
         None => Ok(true),
         Some(mut process) => exited_by(&mut *process, timeout),
