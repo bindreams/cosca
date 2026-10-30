@@ -2,7 +2,7 @@
 //! object, so a reused pid cannot fool it; we re-verify the start_token once at open.
 //! No reaping concept on Windows.
 
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::io::{AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
 use std::time::Instant;
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
@@ -231,6 +231,29 @@ pub(crate) fn block_until_exit_or_cancel(
     };
     #[cfg(test)]
     crate::wait::read_probe::mark("identity verified");
+    // SAFETY: `handle` is a live process handle that stays open until `close` below.
+    let waited = wait_handle_or_cancel(unsafe { BorrowedHandle::borrow_raw(handle.0 as _) }, deadline, cancel);
+    close(handle);
+    waited
+}
+
+/// The wait of [`block_until_exit_or_cancel`] on a process handle already in hand, and the blocking
+/// half of the async driver's Windows arm. `Ok(true)` = the process exited (it wins a tie: it is the
+/// lower wait index); `Ok(false)` = `cancel` was signalled or `deadline` passed. `deadline` is an
+/// absolute instant on the real clock; every re-arm recomputes against it.
+#[cfg_attr(
+    not(feature = "tokio"),
+    allow(
+        dead_code,
+        reason = "only consumers are block_until_exit_or_cancel and the async driver, behind the tokio feature"
+    )
+)]
+pub(crate) fn wait_handle_or_cancel(
+    process: BorrowedHandle<'_>,
+    deadline: Option<Instant>,
+    cancel: &OwnedHandle,
+) -> Result<bool, Error> {
+    let handle = HANDLE(process.as_raw_handle());
     // Test-only seam proving (immediately, not by elapsed time) that this wait is never
     // genuinely entered on a still-alive target — see `armed_probe`'s own doc for why it's
     // gated on `is_armed()`.
@@ -264,9 +287,7 @@ pub(crate) fn block_until_exit_or_cancel(
     let waited = crate::wait::wait_until(deadline.map(Some), |ms| unsafe {
         WaitForMultipleObjects(&handles, false, ms)
     });
-    // Capture BEFORE close(): CloseHandle would overwrite GetLastError.
     let wait_failed = (waited == WAIT_FAILED).then(std::io::Error::last_os_error);
-    close(handle);
     if waited == WAIT_OBJECT_0 {
         Ok(true) // process exited
     } else if waited.0 == WAIT_OBJECT_0.0 + 1 || waited == WAIT_TIMEOUT {

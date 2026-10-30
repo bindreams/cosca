@@ -4,6 +4,12 @@
 mod child;
 #[path = "tokio/command.rs"]
 mod command;
+#[allow(
+    dead_code,
+    reason = "the async callers switch to it with the async wait paths' removal (#839)"
+)]
+#[path = "tokio/drive.rs"]
+pub(crate) mod drive;
 #[path = "tokio/process.rs"]
 mod process;
 #[path = "tokio/pump.rs"]

@@ -35,7 +35,7 @@ pub(crate) fn deadline_from(duration: Duration) -> Option<Option<std::time::Inst
 /// [`crate::wait::TOKIO_TIMER_ROUNDING_MARGIN`], as every [`deadline_from`] result does; a
 /// violation `debug_assert`s, and in release waits unbounded with no timer.
 #[cfg(unix)]
-async fn arm_at<F: std::future::Future>(at: std::time::Instant, fut: F) -> Option<F::Output> {
+pub(crate) async fn arm_at<F: std::future::Future>(at: std::time::Instant, fut: F) -> Option<F::Output> {
     let holds = crate::wait::clears_tokio_timer_margin(at);
     debug_assert!(
         holds,
@@ -93,9 +93,23 @@ pub(crate) async fn grace_wait(id: ProcessId, grace: Duration) -> Result<bool, E
 /// a saturated blocking pool cannot delay it.
 #[cfg(windows)]
 async fn blocking_watch(id: ProcessId, deadline: Option<std::time::Instant>) -> Result<bool, Error> {
+    cancellable_blocking("grace-wait watcher", move |cancel| {
+        crate::wait::backend::block_until_exit_or_cancel(id, deadline, cancel)
+    })
+    .await
+}
+
+/// Run `work` on the blocking pool, handing it a cancel event that dropping this future signals. The
+/// blocking `work` must return once the event is signalled, so a dropped wait releases its thread
+/// promptly and `Runtime::drop`, which joins blocking tasks, does not stall. `what` names the work
+/// in the error for a task the runtime's shutdown cancelled.
+#[cfg(windows)]
+pub(crate) async fn cancellable_blocking<T: Send + 'static>(
+    what: &'static str,
+    work: impl FnOnce(&std::os::windows::io::OwnedHandle) -> Result<T, Error> + Send + 'static,
+) -> Result<T, Error> {
     /// Signals the cancel event on drop (harmless after completion) so the blocking watcher
-    /// returns promptly instead of parking out the grace, and `Runtime::drop` — which joins
-    /// blocking tasks — does not stall.
+    /// returns promptly instead of parking out the grace.
     struct SignalOnDrop(std::sync::Arc<std::os::windows::io::OwnedHandle>);
     impl Drop for SignalOnDrop {
         fn drop(&mut self) {
@@ -111,7 +125,7 @@ async fn blocking_watch(id: ProcessId, deadline: Option<std::time::Instant>) -> 
     let joined = ::tokio::task::spawn_blocking(move || {
         #[cfg(test)]
         let _relay = relay.reinstall();
-        let result = crate::wait::backend::block_until_exit_or_cancel(id, deadline, &cancel);
+        let result = work(&cancel);
         #[cfg(test)]
         fault_observer::notify_released();
         result
@@ -119,17 +133,17 @@ async fn blocking_watch(id: ProcessId, deadline: Option<std::time::Instant>) -> 
     .await;
     match joined {
         Ok(result) => result,
-        // block_until_exit_or_cancel does not panic — a panic here is a bug, not an I/O
-        // condition; propagate it instead of masking it as an error.
+        // `work` does not panic - a panic here is a bug, not an I/O condition; propagate it
+        // instead of masking it as an error.
         Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
         // Keep the shutdown-cancelled discriminator visible instead of folding it into an
         // opaque error indistinguishable from a real wait failure. The final arm is
         // presently unreachable (panic and cancelled are tokio's only variants today) and
         // exists for type-system conservatism: a future variant surfaces as an Err, never a
-        // false success — with a debug tripwire, mirroring the unexpected-wait-verdict arm.
-        Err(e) if e.is_cancelled() => Err(Error::Io(std::io::Error::other(
-            "grace-wait watcher cancelled (runtime shutting down)",
-        ))),
+        // false success - with a debug tripwire, mirroring the unexpected-wait-verdict arm.
+        Err(e) if e.is_cancelled() => Err(Error::Io(std::io::Error::other(format!(
+            "{what} cancelled (runtime shutting down)"
+        )))),
         Err(e) => {
             debug_assert!(false, "unknown JoinError variant: {e:?}");
             Err(Error::Io(std::io::Error::other(e)))
@@ -296,13 +310,13 @@ async fn exit_watch(id: ProcessId) -> Result<(), Error> {
     watch_readable(&afd, crate::wait::backend::drain_proc_exit).await
 }
 
-/// `AsyncFd` requires `AsRawFd`; nix's `Kqueue` exposes only `AsFd` — delegate.
+/// `AsyncFd` requires `AsRawFd`; nix's `Kqueue` exposes only `AsFd` — delegate. `K` is the kqueue
+/// itself, or a borrow of one that something else owns.
 #[cfg(target_os = "macos")]
-struct KqueueFd(nix::sys::event::Kqueue);
+pub(crate) struct KqueueFd<K = nix::sys::event::Kqueue>(pub(crate) K);
 #[cfg(target_os = "macos")]
-impl std::os::fd::AsRawFd for KqueueFd {
+impl<K: std::os::fd::AsFd> std::os::fd::AsRawFd for KqueueFd<K> {
     fn as_raw_fd(&self) -> std::os::fd::RawFd {
-        use std::os::fd::AsFd;
         self.0.as_fd().as_raw_fd()
     }
 }
@@ -328,9 +342,13 @@ impl std::os::fd::AsRawFd for KqueueFd {
 /// silently; `watch_readable` cannot detect that on its own, so any such closure owns
 /// re-verifying this invariant itself.
 #[cfg(target_os = "macos")]
-async fn watch_readable<F>(afd: &::tokio::io::unix::AsyncFd<KqueueFd>, mut drain: F) -> Result<(), Error>
+pub(crate) async fn watch_readable<K, F>(
+    afd: &::tokio::io::unix::AsyncFd<KqueueFd<K>>,
+    mut drain: F,
+) -> Result<(), Error>
 where
-    F: FnMut(&nix::sys::event::Kqueue) -> Result<Option<()>, Error>,
+    K: std::os::fd::AsFd,
+    F: FnMut(&K) -> Result<Option<()>, Error>,
 {
     loop {
         let mut guard = afd.readable().await.map_err(Error::Io)?;
@@ -593,7 +611,7 @@ pub(crate) fn to_real_clock_at(
 }
 
 #[cfg(windows)]
-fn to_real_clock(deadline: Option<Option<std::time::Instant>>) -> Option<Option<std::time::Instant>> {
+pub(crate) fn to_real_clock(deadline: Option<Option<std::time::Instant>>) -> Option<Option<std::time::Instant>> {
     to_real_clock_at(deadline, tokio_now(), crate::wait::now())
 }
 
