@@ -194,7 +194,7 @@ pub(crate) struct ExitWatch {
 }
 
 impl ExitWatch {
-    fn new(kq: Kqueue) -> Self {
+    pub(super) fn new(kq: Kqueue) -> Self {
         Self {
             kq,
             seen: AtomicBool::new(false),
@@ -205,28 +205,6 @@ impl ExitWatch {
     pub(crate) fn proc_exit(pid: u32) -> Result<Option<Self>, Error> {
         let kq = Kqueue::new().map_err(|e| Error::Io(e.into()))?;
         Ok(arm_note_exit_on(&kq, pid)?.map(|()| Self::new(kq)))
-    }
-
-    /// Arm `EVFILT_READ` on `fd`, a pipe the test fires.
-    #[cfg(test)]
-    pub(crate) fn readable(fd: BorrowedFd<'_>) -> Result<Self, Error> {
-        use std::os::fd::AsRawFd;
-
-        use nix::sys::event::{EventFilter, FilterFlag, KEvent};
-
-        let kq = Kqueue::new().map_err(|e| Error::Io(e.into()))?;
-        let change = KEvent::new(
-            fd.as_raw_fd() as usize,
-            EventFilter::EVFILT_READ,
-            EvFlags::EV_ADD | EvFlags::EV_RECEIPT,
-            FilterFlag::empty(),
-            0,
-            0,
-        );
-        match crate::wait::backend::add_with_receipt(&kq, change)? {
-            0 => Ok(Self::new(kq)),
-            errno => Err(Error::Io(std::io::Error::from_raw_os_error(errno as i32))),
-        }
     }
 
     /// Block until the event has been read, by this call or an earlier one, or until `deadline`.

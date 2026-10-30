@@ -103,6 +103,29 @@ impl OsProcess for FakeProcess {
     }
 }
 
+/// An [`ExitWatch`](super::macos::ExitWatch) armed for `EVFILT_READ` on `fd`, a pipe the test
+/// fires, in place of the `NOTE_EXIT` watch of a process.
+#[cfg(target_os = "macos")]
+pub(super) fn readable_watch(fd: std::os::fd::BorrowedFd<'_>) -> Result<super::macos::ExitWatch, Error> {
+    use std::os::fd::AsRawFd;
+
+    use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
+
+    let kq = Kqueue::new().map_err(|e| Error::Io(e.into()))?;
+    let change = KEvent::new(
+        fd.as_raw_fd() as usize,
+        EventFilter::EVFILT_READ,
+        EvFlags::EV_ADD | EvFlags::EV_RECEIPT,
+        FilterFlag::empty(),
+        0,
+        0,
+    );
+    match crate::wait::backend::add_with_receipt(&kq, change)? {
+        0 => Ok(super::macos::ExitWatch::new(kq)),
+        errno => Err(Error::Io(std::io::Error::from_raw_os_error(errno as i32))),
+    }
+}
+
 /// What a `Running` look hands out, and the way a test fires it.
 #[cfg(unix)]
 struct Source {
@@ -124,7 +147,7 @@ impl Source {
         #[cfg(target_os = "macos")]
         let watch = {
             use std::os::fd::AsFd;
-            super::macos::ExitWatch::readable(rx.as_fd()).expect("FakeProcess: arm the pipe's kqueue")
+            readable_watch(rx.as_fd()).expect("FakeProcess: arm the pipe's kqueue")
         };
         Self {
             rx,

@@ -14,7 +14,7 @@ use crate::test_child::wait_until_zombie;
 /// A watch on a pipe's read end, and the two ends.
 fn pipe_watch() -> (std::io::PipeReader, std::io::PipeWriter, ExitWatch) {
     let (rx, tx) = std::io::pipe().unwrap();
-    let watch = ExitWatch::readable(rx.as_fd()).unwrap();
+    let watch = crate::os_process::fake::readable_watch(rx.as_fd()).unwrap();
     (rx, tx, watch)
 }
 
