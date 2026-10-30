@@ -9,9 +9,9 @@ use crate::error::Error;
 
 impl Process {
     /// Send `SIGTERM` to the foreign process — a cooperative request to exit. Signal-only.
-    /// Identity-bound (Linux `pidfd_send_signal`; macOS reverify-then-`kill`). Already-dead ⇒
-    /// `Ok`; a real failure (`EPERM`) ⇒ `Err`. On Linux a refused `pidfd_open` is `Unsupported`
-    /// (see [`Error::Unsupported`]).
+    /// Identity-bound as for [`kill`](Process::kill) (Linux `pidfd_send_signal`; macOS audit
+    /// token, 14.4 and later). Already-dead ⇒ `Ok`; a real failure (`EPERM`) ⇒ `Err`. On Linux a
+    /// refused `pidfd_open` is `Unsupported` (see [`Error::Unsupported`]).
     ///
     /// **Windows: `Unsupported`, for two concrete absences.** A `Process` holds only a pid,
     /// nothing that pins it, and `GenerateConsoleCtrlEvent` takes a raw pid with no

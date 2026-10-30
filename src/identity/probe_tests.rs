@@ -35,7 +35,7 @@ fn signal_target_rejects_every_non_single_process_value() {
 #[skuld::test]
 fn signal_target_is_the_guard_for_real_signals_not_just_the_probe() {
     // The `sig 0` probe merely misreports if this leaks; `treewalk::kill_by_identity` and
-    // `wait::macos::{kill, terminate}` would SIGKILL the caller's own process group, so pin
+    // `os_process::macos::MacProcess::signal` would SIGKILL the caller's own process group, so pin
     // the two values that make `kill(2)` group-directed rather than process-directed.
     assert_eq!(signal_target(0), None, "kill(0, sig) signals our own process group");
     assert_eq!(

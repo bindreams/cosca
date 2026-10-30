@@ -194,11 +194,14 @@ impl Process {
 
     /// Hard-kill the process by identity (`SIGKILL` / `TerminateProcess`). Already-dead ⇒
     /// `Ok`; a real failure (no rights / `EPERM` / access-denied on a live process) ⇒ `Err`.
-    /// **Race-freedom is OS-dependent:** Linux uses an identity-bound `pidfd_send_signal`
-    /// (atomic, zero pid-reuse race) and Windows pins the kernel object via its handle; macOS
-    /// has no pidfd, so it re-verifies identity immediately before `kill(2)` with a small
-    /// irreducible residual window — best-effort there, like the existing tree teardown. On
-    /// Linux a refused `pidfd_open` is `Unsupported` (see [`Error::Unsupported`]).
+    /// A process that reused the pid is never signalled, by a different mechanism per OS:
+    /// Linux uses an identity-bound `pidfd_send_signal` and Windows pins the kernel object via
+    /// its handle. macOS (14.4 and later) has no pidfd; it signals with
+    /// `proc_signal_with_audittoken` (the pid plus the process's `p_idversion`, which `exec`
+    /// changes), and the kernel checks the version while it holds a reference to the process.
+    /// The one residual there: `p_idversion` is 32 bits, so it matches a different process only
+    /// if it wrapped by a multiple of 2^32 between the read and the call while the pid was
+    /// reused. On Linux a refused `pidfd_open` is `Unsupported` (see [`Error::Unsupported`]).
     pub fn kill(&self) -> Result<(), Error> {
         crate::os_process::kill_by_id(self.id)
     }

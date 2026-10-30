@@ -330,11 +330,10 @@ fn classify_member(
 /// `crate::wait::backend::open_verified` verbatim rather than a second implementation — the fd
 /// itself pins the identity at the kernel level, so a pid reused after `pidfd_open` cannot be
 /// hit even in principle. macOS has no pidfd equivalent, so `kill(2)` here keeps the same
-/// irreducible window `src/wait/macos.rs::kill`'s own doc comment documents verbatim ("The
-/// window between this check and kill(2) is irreducible on macOS (no pidfd); a recycled pid
-/// in that window is a documented best-effort limitation, mirroring
-/// treewalk::kill_by_identity") — this function is that same accepted trade-off, not a new
-/// one.
+/// irreducible window as `treewalk::kill_by_identity` (re-verify, then `kill(2)`): a recycled
+/// pid in that window is a documented best-effort limitation of the group and tree sweeps.
+/// `Process::kill` on macOS does not have it: it signals by audit token
+/// (`os_process::macos::MacProcess::signal`).
 fn check_or_signal(
     pid: RawPid,
     id: crate::identity::ProcessId,
@@ -641,8 +640,8 @@ pub(crate) fn converge(pgid: i32, signal: Signal, root: &GroupRoot<'_>) -> std::
             }
             if signal == Signal::SIGKILL {
                 // Linux: the atomic pidfd path (see its own doc comment). macOS/other Unix:
-                // no pidfd equivalent exists, so `check_or_signal` keeps the same
-                // already-accepted residual race `src/wait/macos.rs::kill` documents.
+                // no pidfd equivalent exists, so `check_or_signal` keeps the residual race
+                // documented on it.
                 #[cfg(target_os = "linux")]
                 {
                     check_or_signal_linux_sigkill(m.pid, id, root)
