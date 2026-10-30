@@ -8,7 +8,7 @@ use rustix::event::{poll, PollFd, PollFlags, Timespec};
 use super::{Exit, OsHandle, OsProcess, WaitFor};
 use crate::error::Error;
 use crate::identity::ProcessId;
-use crate::signal::{via_pidfd, Sent, Sig};
+use crate::signal::{send_pidfd, Sent, Sig};
 
 #[derive(Debug)]
 pub(crate) struct LinuxProcess {
@@ -28,7 +28,7 @@ impl OsProcess for LinuxProcess {
     }
 
     fn signal(&mut self, sig: Sig) -> Result<Sent, Error> {
-        via_pidfd(Some(self.pidfd.as_fd()), self.id.pid(), sig).map_err(Error::Io)
+        send_pidfd(self.pidfd.as_fd(), self.id.pid(), sig).map_err(|e| Error::Io(std::io::Error::from(e)))
     }
 
     fn exited(&mut self) -> Result<Exit<'_>, Error> {

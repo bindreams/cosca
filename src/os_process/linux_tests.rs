@@ -124,3 +124,21 @@ fn by_id_helpers_on_a_gone_process_are_ok() {
     kill_by_id(id).unwrap();
     terminate_by_id(id).unwrap();
 }
+
+/// `Process::kill` promises the raw errno of a refused kill. Mutant: `signal` wraps the errno in
+/// an `io_context`, so `raw_os_error()` is `None`.
+#[skuld::test]
+fn refused_signal_keeps_its_raw_errno() {
+    let (child, _stdin, id) = blocker();
+    let mut p = open(id, Op::Kill).unwrap().expect("a live process opens");
+    let refused = crate::signal::seams::refuse_kills();
+    let err = p.signal(Sig::Kill).unwrap_err();
+    drop(refused);
+    let crate::error::Error::Io(e) = err else {
+        panic!("expected Error::Io, got {err:?}");
+    };
+    assert_eq!(e.raw_os_error(), Some(libc::EPERM), "{e:?}");
+    assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
