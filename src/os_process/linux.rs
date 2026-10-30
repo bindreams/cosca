@@ -5,7 +5,7 @@ use std::os::fd::{AsFd, OwnedFd};
 
 use rustix::event::{poll, PollFd, PollFlags, Timespec};
 
-use super::{Exit, OsHandle, OsProcess, WaitFor};
+use super::{Exit, OsProcess, WaitFor};
 use crate::error::Error;
 use crate::identity::ProcessId;
 use crate::signal::{send_pidfd, Sent, Sig};
@@ -23,10 +23,6 @@ impl LinuxProcess {
 }
 
 impl OsProcess for LinuxProcess {
-    fn identity(&self) -> ProcessId {
-        self.id
-    }
-
     fn signal(&mut self, sig: Sig) -> Result<Sent, Error> {
         send_pidfd(self.pidfd.as_fd(), self.id.pid(), sig).map_err(|e| Error::Io(std::io::Error::from(e)))
     }
@@ -44,10 +40,6 @@ impl OsProcess for LinuxProcess {
                 Err(e) => return Err(Error::Io(std::io::Error::from(e))),
             }
         }
-    }
-
-    fn os_handle(&self) -> Option<OsHandle<'_>> {
-        Some(self.pidfd.as_fd())
     }
 }
 

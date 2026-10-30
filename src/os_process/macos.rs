@@ -118,10 +118,6 @@ fn send_with_token(pid: u32, id_version: i32, signo: libc::c_int) -> Result<(), 
 }
 
 impl OsProcess for MacProcess {
-    fn identity(&self) -> ProcessId {
-        self.id
-    }
-
     fn signal(&mut self, sig: Sig) -> Result<Sent, Error> {
         let pid = self.id.pid();
         let signo = sig.as_libc();

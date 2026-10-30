@@ -80,7 +80,6 @@ fn blocker() -> (std::process::Child, ProcessId) {
 fn open_live_then_kill_then_exited() {
     let (mut child, id) = blocker();
     let mut p = open(id, Op::Wait).unwrap().expect("a live process opens");
-    assert_eq!(p.identity(), id);
     assert!(
         matches!(p.exited().unwrap(), Exit::Running(_)),
         "a live process reads Running"

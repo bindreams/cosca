@@ -79,10 +79,6 @@ impl fmt::Debug for FakeProcess {
 }
 
 impl OsProcess for FakeProcess {
-    fn identity(&self) -> ProcessId {
-        self.id
-    }
-
     fn signal(&mut self, _sig: Sig) -> Result<Sent, Error> {
         self.signals
             .pop_front()
@@ -104,11 +100,6 @@ impl OsProcess for FakeProcess {
             Answer::Exited => Ok(Exit::Exited),
             Answer::Running => Ok(Exit::Running(self.source.wait_for())),
         }
-    }
-
-    #[cfg(any(target_os = "linux", windows))]
-    fn os_handle(&self) -> Option<super::OsHandle<'_>> {
-        None
     }
 }
 

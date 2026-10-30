@@ -9,7 +9,7 @@ use std::os::windows::io::{AsHandle, AsRawHandle, FromRawHandle, OwnedHandle};
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::WaitForSingleObject;
 
-use super::{Exit, Op, OsHandle, OsProcess, WaitFor};
+use super::{Exit, Op, OsProcess, WaitFor};
 use crate::error::{win32_io_error, Error};
 use crate::identity::{windows_terminate_held, ProcessId, Termination};
 use crate::signal::{Sent, Sig};
@@ -60,10 +60,6 @@ pub(crate) fn terminate_unsupported() -> Error {
 }
 
 impl OsProcess for WindowsProcess {
-    fn identity(&self) -> ProcessId {
-        self.id
-    }
-
     fn signal(&mut self, sig: Sig) -> Result<Sent, Error> {
         match sig {
             Sig::Kill => match windows_terminate_held(self.raw()) {
@@ -84,10 +80,6 @@ impl OsProcess for WindowsProcess {
             WAIT_TIMEOUT => Ok(Exit::Running(WaitFor::Signalled(self.handle.as_handle()))),
             _ => Err(Error::Io(std::io::Error::last_os_error())),
         }
-    }
-
-    fn os_handle(&self) -> Option<OsHandle<'_>> {
-        Some(self.handle.as_handle())
     }
 }
 

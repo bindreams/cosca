@@ -18,7 +18,6 @@ fn blocker() -> (crate::Child, std::io::PipeWriter, ProcessId) {
 fn open_live_then_kill_then_exited() {
     let (child, _stdin, id) = blocker();
     let mut p = open(id, Op::Kill).unwrap().expect("a live process opens");
-    assert_eq!(p.identity(), id);
     assert!(matches!(p.exited().unwrap(), Exit::Running(_)));
     assert!(!exited_by(&mut *p, Some(Duration::ZERO)).unwrap());
     assert_eq!(p.signal(Sig::Kill).unwrap(), Sent::Delivered);
@@ -71,15 +70,22 @@ fn signal_after_exit_is_gone() {
     assert!(exited_by(&mut *p, Some(Duration::ZERO)).unwrap());
 }
 
-/// Mutant: `os_handle` is `None`, or names another fd.
+/// Mutant: a look hands out some other fd to wait on. The kernel names a pidfd's process in its
+/// `fdinfo`.
 #[skuld::test]
-fn os_handle_is_the_pidfd_the_wait_is_on() {
+fn the_wait_is_on_the_pidfd_of_the_process() {
     use std::os::fd::AsRawFd;
     let (child, _stdin, id) = blocker();
     let mut p = open(id, Op::Wait).unwrap().expect("a live process opens");
-    let handle = p.os_handle().expect("a Linux process has a pidfd").as_raw_fd();
     match p.exited().unwrap() {
-        Exit::Running(crate::os_process::WaitFor::Readable(fd)) => assert_eq!(fd.as_raw_fd(), handle),
+        Exit::Running(crate::os_process::WaitFor::Readable(fd)) => {
+            let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", fd.as_raw_fd())).unwrap();
+            assert!(
+                info.lines().any(|line| line == format!("Pid:	{}", id.pid())),
+                "not a pidfd of {}: {info}",
+                id.pid()
+            );
+        }
         other => panic!("a live process reads Running(Readable): {other:?}"),
     }
     child.kill().unwrap();

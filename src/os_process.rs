@@ -29,34 +29,12 @@ use std::os::windows::io::BorrowedHandle;
 
 /// One process, as the OS names it. `Send` so a driver may move it to a blocking thread.
 pub(crate) trait OsProcess: Send + fmt::Debug {
-    /// The identity this object was opened for.
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "read only by tests until a handle-holding `Process` (slice 1b) reads it"
-        )
-    )]
-    fn identity(&self) -> ProcessId;
-
     /// Send `sig`. [`Sent::Gone`] when the process is no longer the one opened.
     fn signal(&mut self, sig: Sig) -> Result<Sent, Error>;
 
     /// Look at the process once, without blocking. A [`Exit::Running`] look carries what to wait
     /// on for the next change; the wait ends on any change, so look again after it.
     fn exited(&mut self) -> Result<Exit<'_>, Error>;
-
-    /// The OS handle this object waits on, for a reactor that registers it itself. `None` for a
-    /// stand-in with no OS handle.
-    #[cfg(any(target_os = "linux", windows))]
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "read only by tests until a reactor (slice 1b) registers the handle itself"
-        )
-    )]
-    fn os_handle(&self) -> Option<OsHandle<'_>>;
 }
 
 /// What one look at a process found.
@@ -80,15 +58,6 @@ pub(crate) enum WaitFor<'a> {
     #[cfg(windows)]
     Signalled(BorrowedHandle<'a>),
 }
-
-/// The OS handle behind an [`OsProcess`]: the pidfd.
-#[cfg(target_os = "linux")]
-#[cfg_attr(not(test), allow(dead_code, reason = "named only by `OsProcess::os_handle`"))]
-pub(crate) type OsHandle<'a> = BorrowedFd<'a>;
-/// The OS handle behind an [`OsProcess`]: the process handle.
-#[cfg(windows)]
-#[cfg_attr(not(test), allow(dead_code, reason = "named only by `OsProcess::os_handle`"))]
-pub(crate) type OsHandle<'a> = BorrowedHandle<'a>;
 
 /// The operation an [`open`] is for. It names the operation in `Unsupported` and `Unassessable`
 /// errors.

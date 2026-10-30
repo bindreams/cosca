@@ -13,11 +13,9 @@ use crate::test_child::live_blocker as blocker;
 fn open_live_then_kill_then_exited() {
     let (child, _stdin, id) = blocker();
     let mut waiter = open(id, Op::Wait).unwrap().expect("a live process opens");
-    assert_eq!(waiter.identity(), id);
     assert!(matches!(waiter.exited().unwrap(), Exit::Running(WaitFor::Signalled(_))));
     assert!(!exited_by(&mut *waiter, Some(Duration::ZERO)).unwrap());
     let mut killer = open(id, Op::Kill).unwrap().expect("a live process opens");
-    assert_eq!(killer.identity(), id);
     assert_eq!(killer.signal(Sig::Kill).unwrap(), Sent::Delivered);
     assert!(exited_by(&mut *waiter, None).unwrap());
     child.wait().unwrap();
@@ -99,15 +97,20 @@ fn terminate_by_id_is_unsupported_and_sends_nothing() {
     child.wait().unwrap();
 }
 
-/// Mutant: `os_handle` is `None`, or names another handle.
+/// Mutant: a look hands out some other handle to wait on.
 #[skuld::test]
-fn os_handle_is_the_handle_the_wait_is_on() {
+fn the_wait_is_on_the_opened_process_handle() {
     use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Threading::GetProcessId;
+
     let (child, _stdin, id) = blocker();
     let mut p = open(id, Op::Wait).unwrap().expect("a live process opens");
-    let handle = p.os_handle().expect("a Windows process has a handle").as_raw_handle();
     match p.exited().unwrap() {
-        Exit::Running(WaitFor::Signalled(h)) => assert_eq!(h.as_raw_handle(), handle),
+        // SAFETY: `h` is the live process handle `p` owns.
+        Exit::Running(WaitFor::Signalled(h)) => {
+            assert_eq!(unsafe { GetProcessId(HANDLE(h.as_raw_handle())) }, id.pid())
+        }
         other => panic!("a live process reads Running(Signalled): {other:?}"),
     }
     child.kill().unwrap();
