@@ -150,9 +150,9 @@ fn kill_of_an_access_denied_live_process_is_an_error() {
 
 /// `Process::wait` must not report an exit it never observed.
 #[skuld::test]
-fn block_until_exit_of_an_access_denied_live_process_is_an_error() {
+fn exited_by_id_of_an_access_denied_live_process_is_an_error() {
     let Some(done) = crate::test_own_process::own_process(
-        crate::test_own_process::test_path!(block_until_exit_of_an_access_denied_live_process_is_an_error),
+        crate::test_own_process::test_path!(exited_by_id_of_an_access_denied_live_process_is_an_error),
         crate::test_spawn::spawn,
     ) else {
         return;

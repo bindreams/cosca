@@ -18,12 +18,12 @@ fn drain_reports_none_when_no_event_pending() {
     child.wait().expect("reap");
 }
 
-/// `kill(0, sig)` would signal the caller's ENTIRE process group, so pid 0 must never reach
-/// `kill(2)`. Two independent layers stop it, and this pins the outer one: the identity
-/// re-verify. `ProcessId::of(0)` resolves on macOS (`kernel_task`), but to a token that no
-/// caller-held identity matches, so a pid-0 identity is rejected as recycled before the
-/// signal is ever formed — and the test process, which is what `kill(0, ..)` would have
-/// killed, survives to make the assertion.
+/// `kill(0, sig)` would signal the caller's ENTIRE process group, so pid 0 must never be signalled.
+/// Two independent layers stop it, and this pins the outer one: `open`'s flavor-17 read of the pid
+/// followed by `exists()`. `ProcessId::of(0)` resolves on macOS (`kernel_task`), but to a token that
+/// no caller-held identity matches, so a pid-0 identity is rejected as recycled, `open` is
+/// `Ok(None)`, and the signal is never formed — the test process, which is what `kill(0, ..)` would
+/// have killed, survives to make the assertion.
 ///
 /// The inner layer, `probe::signal_target`, is defence in depth for a caller holding
 /// `kernel_task`'s *genuine* identity. It is not exercised here on purpose: a regression in

@@ -853,7 +853,7 @@ impl JobHandle {
     /// `cancel`, when given, is appended to every round's wait set (one fewer live member
     /// tracked per round) so a live `WaitForMultipleObjects` releases the instant it is
     /// signaled rather than only at the next re-enumeration boundary — the async wrapper's
-    /// drop-cancellation primitive (mirrors `block_until_exit_or_cancel`'s cancel event). A
+    /// drop-cancellation primitive (mirrors `wait_handle_or_cancel`'s cancel event). A
     /// cancellation reports `MembersRemain` (the tree's drain state is simply unknown at that
     /// point, same as a timeout), never an error. Unlike the deadline, cancellation IS checked
     /// before that first re-enumeration too: it is a genuine "stop looking" instruction, not a

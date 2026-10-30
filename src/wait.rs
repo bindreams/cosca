@@ -1,13 +1,8 @@
-//! Non-reaping, race-free death-watch and hard-kill for a `ProcessId`. `block_until_exit`
-//! blocks the calling thread until exit or timeout, never a sleep-poll: one kernel syscall on
-//! Linux/macOS; on Windows, one or more `WaitForSingleObject`/`WaitForMultipleObjects` calls in
-//! a row, only ever re-armed against the caller's own real deadline (see `wait_until`).
-//! NEVER reaps: the target's real parent collects the zombie.
+//! The time, deadline and blocking-wait helpers the wait drivers share, and the per-OS pidfd,
+//! kqueue and handle primitives behind them (`backend`). The by-identity wait and signals are
+//! [`crate::os_process`]. NEVER reaps: the target's real parent collects the zombie.
 
 use std::time::{Duration, Instant};
-
-use crate::error::Error;
-use crate::identity::ProcessId;
 
 pub(crate) mod exit_only;
 
@@ -21,9 +16,9 @@ pub(crate) mod backend;
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 compile_error!("cosca::wait is implemented only for Linux, macOS, and Windows");
 
-/// Force the NEXT grace-watch on THIS thread to fail (consumed by `block_until_exit`,
-/// `Child::wait_timeout`, and `tokio::wait::{grace_wait, wait_exit}`), so the watch-error
-/// escalation ordering is testable. Same take-semantics contract as the treewalk fault seam.
+/// Force the NEXT grace-watch on THIS thread to fail (consumed by the two drivers,
+/// [`crate::os_process::drive::exited_by`] and `tokio::drive::exited_by`, and by `Child::wait_timeout`),
+/// so the watch-error escalation ordering is testable. Same take-semantics contract as the treewalk fault seam.
 #[cfg(test)]
 pub(crate) mod fault {
     use std::cell::Cell;
@@ -42,47 +37,6 @@ pub(crate) mod fault {
     pub(crate) fn forced_watch_error() -> crate::error::Error {
         crate::error::Error::Io(std::io::Error::other("forced grace-watch failure (test seam)"))
     }
-}
-
-/// Block until the process with identity `id` exits. `Ok(true)` = exited; `Ok(false)`
-/// = the timeout elapsed while it was still alive; `Err` = a wait failure (on Linux a refused
-/// `pidfd_open` is [`Error::Unsupported`], a transient one [`Error::Io`]; see
-/// [`Error::Unsupported`]). `None` = block until exit; `Some(ZERO)` = poll once; an overflowing
-/// `Duration` saturates to unbounded. Non-reaping.
-///
-/// Cross-privilege divergence: when the caller lacks rights to wait on a *live* foreign
-/// process, macOS surfaces the permission failure as `Err` whereas Windows cannot open the
-/// handle and reports `Ok(true)` (matching [`ProcessId::is_alive`]'s open-failure convention).
-pub(crate) fn block_until_exit(id: ProcessId, timeout: Option<Duration>) -> Result<bool, Error> {
-    #[cfg(feature = "tokio")]
-    crate::bounded::assert_may_block("waiting for a process to exit");
-    #[cfg(test)]
-    if fault::take_force_watch_error() {
-        return Err(fault::forced_watch_error());
-    }
-    // Convert to an absolute deadline up front so EINTR retries don't extend the total wait.
-    let deadline = timeout.map(|d| now().checked_add(d));
-    backend::block_until_exit(id, deadline)
-}
-
-/// Hard-kill the process with identity `id` (`SIGKILL` / `TerminateProcess`),
-/// identity-verified. Already-dead ⇒ `Ok`; a real failure (no rights / `EPERM`) ⇒ `Err`. On
-/// Linux a refused `pidfd_open` is [`Error::Unsupported`].
-pub(crate) fn kill(id: ProcessId) -> Result<(), Error> {
-    backend::kill(id)
-}
-
-/// Send the graceful termination signal (`SIGTERM`) to the process with identity `id`,
-/// identity-verified. Signal-only — does not wait or reap. Already-dead ⇒ `Ok`; a real
-/// failure (no rights / `EPERM`) ⇒ `Err`. Windows has no per-process graceful signal ⇒
-/// `Unsupported`, as is a refused `pidfd_open` on Linux.
-///
-/// This is one mechanism, not the crate's whole graceful surface: on Windows a child that
-/// leads its own console process group is addressed through that group instead.
-/// [`crate::graceful::signal`], reached via [`Child::terminate`](crate::Child::terminate), is
-/// the mechanism-aware entry point that picks between them.
-pub(crate) fn terminate(id: ProcessId) -> Result<(), Error> {
-    backend::terminate(id)
 }
 
 /// A mock clock, test-only: once frozen, `remaining` reads this instant instead of the real

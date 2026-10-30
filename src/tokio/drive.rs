@@ -10,8 +10,18 @@
 use std::time::Duration;
 
 use crate::error::Error;
-use crate::os_process::{Exit, OsProcess, WaitFor};
+use crate::identity::ProcessId;
+use crate::os_process::{open, Exit, Op, OsProcess, WaitFor};
 use crate::tokio::wait::deadline_from;
+
+/// [`exited_by`] on the process `id` names. A process that is gone, or whose pid now names another
+/// process, has exited: `Ok(true)` with no wait.
+pub(crate) async fn exited_by_id(id: ProcessId, timeout: Option<Duration>) -> Result<bool, Error> {
+    match open(id, Op::Wait)? {
+        None => Ok(true),
+        Some(mut process) => exited_by(&mut *process, timeout).await,
+    }
+}
 
 /// Wait until `p` has exited or `timeout` has passed, and say which. `Ok(true)` = exited;
 /// `Ok(false)` = still running after the deadline's final look. `None` = until exit;

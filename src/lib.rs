@@ -136,12 +136,6 @@ pub use command::Command;
 
 mod wait;
 
-// Layer 1 of the process stack (#839). Its consumers switch over in later tasks, so until then the lib build sees it
-// as dead.
-#[allow(
-    dead_code,
-    reason = "the consumers of the process stack switch over in later tasks of #839"
-)]
 mod os_process;
 
 #[cfg(unix)]

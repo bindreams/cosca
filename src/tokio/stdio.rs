@@ -294,7 +294,7 @@ impl ConnectingPipe {
                         return Poll::Ready(Err(e));
                     }
                     // A panicked/cancelled connect task is a bug surfaced as an error,
-                    // never a false EOF (mirrors the grace_wait JoinError taxonomy).
+                    // never a false EOF (mirrors `cancellable_blocking`'s JoinError taxonomy).
                     Poll::Ready(Err(join)) => {
                         let e = std::io::Error::other(join);
                         *self = ConnectingPipe::Failed(e.kind(), e.to_string());

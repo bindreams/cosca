@@ -80,7 +80,7 @@ impl Process {
     /// parent gets one). Non-reaping. `Err` only on a wait failure; on Linux a refused
     /// `pidfd_open` is `Unsupported` (see [`Error::Unsupported`]).
     pub fn wait(&self) -> Result<(), Error> {
-        let exited = crate::wait::block_until_exit(self.id, None)?;
+        let exited = crate::os_process::drive::exited_by_id(self.id, None)?;
         debug_assert!(exited);
         Ok(())
     }
@@ -88,7 +88,7 @@ impl Process {
     /// Block up to `timeout` for the process to exit. `Ok(true)` = exited; `Ok(false)` =
     /// still alive at expiry. `Duration::ZERO` polls once. Errors as for [`wait`](Self::wait).
     pub fn wait_timeout(&self, timeout: Duration) -> Result<bool, Error> {
-        crate::wait::block_until_exit(self.id, Some(timeout))
+        crate::os_process::drive::exited_by_id(self.id, Some(timeout))
     }
 
     /// The parent process, by identity. Identity-guarded against pid-reuse: a genuine parent
@@ -200,7 +200,7 @@ impl Process {
     /// irreducible residual window — best-effort there, like the existing tree teardown. On
     /// Linux a refused `pidfd_open` is `Unsupported` (see [`Error::Unsupported`]).
     pub fn kill(&self) -> Result<(), Error> {
-        crate::wait::kill(self.id)
+        crate::os_process::kill_by_id(self.id)
     }
 }
 

@@ -294,7 +294,7 @@ async fn an_async_drop_closes_the_childs_untaken_stdout() {
 /// wait. A wait added to `signal_on_drop`, for the root's exit or for the tree to drain, trips
 /// the bounded-section contract here at once.
 ///
-/// Mutants: `block_until_exit(id, None)` or `os.attached.wait_drained(None)` added to
+/// Mutants: `exited_by_id(id, None)` or `os.attached.wait_drained(None)` added to
 /// `signal_on_drop`.
 #[skuld::test]
 async fn a_kill_on_drop_drop_of_a_live_blocker_returns() {

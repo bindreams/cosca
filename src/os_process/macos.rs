@@ -245,6 +245,10 @@ impl ExitWatch {
     }
 
     /// The kqueue's descriptor, for a reactor that registers it.
+    #[cfg_attr(
+        not(feature = "tokio"),
+        allow(dead_code, reason = "only the async driver registers the kqueue")
+    )]
     pub(crate) fn as_fd(&self) -> BorrowedFd<'_> {
         self.kq.as_fd()
     }

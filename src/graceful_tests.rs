@@ -43,7 +43,7 @@ fn signal_refuses_a_child_with_no_mechanism() {
 // attempted rather than refused. No spawn through the public containment API can carry this
 // mechanism (the flag words emitted never produce it), so the dispatcher is the only place the
 // routing can be pinned at all. `Ok` is what separates the two worlds: the `Unsupported` arms
-// refuse, and `wait::terminate` — the only other path out of `signal` — is itself `Unsupported`
+// refuse, and `os_process::terminate_by_id` — the only other path out of `signal` — is itself `Unsupported`
 // on Windows.
 #[cfg(windows)]
 #[skuld::test]

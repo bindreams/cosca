@@ -169,24 +169,18 @@ fn async_waits_are_send() {
 #[cfg(windows)]
 mod windows {
     //! The blocking half of the Windows arm, `wait_handle_or_cancel`: the cancel-race tests that
-    //! covered `block_until_exit_or_cancel`, with the same assertions, now run on the handle an
+    //! covered the old cancellable wait, with the same assertions, now run on the handle an
     //! `OsProcess` hands out.
 
     use std::time::{Duration, Instant};
 
-    use crate::identity::ProcessId;
     use crate::os_process::{open, Op};
     use crate::wait::backend::{new_cancel_event, signal_cancel, wait_handle_or_cancel};
     use crate::wait::test_clock::FrozenClockGuard;
     use crate::wait::wait_ms_probe;
     use crate::wait::{remaining_override_seam, wait_clamp_seam};
 
-    /// A live blocker, its stdin (held open so it stays alive) and its identity.
-    fn blocker() -> (crate::Child, std::io::PipeWriter, ProcessId) {
-        let (child, stdin) = crate::test_child::held_contained_blocker(crate::Stdio::null());
-        let id = child.id();
-        (child, stdin, id)
-    }
+    use crate::test_child::live_blocker as blocker;
 
     /// Mutant: truncate in `win32_timeout_ms` -> `ms` is 0. Mutant: add slack -> `ms` is above 1.
     /// Mutant: ignore the site's grace -> `requested` is not 5ms.

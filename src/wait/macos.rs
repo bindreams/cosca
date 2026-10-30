@@ -1,13 +1,12 @@
-//! macOS death-watch + kill via kqueue `EVFILT_PROC` + `NOTE_EXIT` (notifies, never
-//! reaps) and identity-verified `kill(2)` (no pidfd on Darwin, so a residual pid-reuse
-//! window between re-verify and signal is irreducible — documented at the call site).
+//! macOS kqueue primitives for [`crate::os_process`]: `EVFILT_PROC` + `NOTE_EXIT` arms (notifies,
+//! never reaps) and the blocking `kevent` loop. Signals go through the audit token, in
+//! `os_process::macos`.
 
 use std::time::{Duration, Instant};
 
 use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 
 use crate::error::Error;
-use crate::identity::ProcessId;
 
 /// The longest timeout ONE `kevent` call is armed with: `i32::MAX` seconds (~68 years). XNU's
 /// `kevent` rejects a `tv_sec` above `INT32_MAX` with `EINVAL` even when an event is pending.
@@ -117,9 +116,10 @@ fn arm_proc_on(kq: &Kqueue, pid: u32, fflags: FilterFlag) -> Result<Option<()>, 
 
 /// Create a kqueue and arm an `EVFILT_PROC | NOTE_EXIT` filter for `id`, re-verifying
 /// identity. `Ok(None)` => already gone (treat as exited). The kqueue's fd polls readable
-/// once the exit event is pending — consumed by the sync blocking wait below and by the
-/// async reactor watch (`tokio::wait`).
-pub(crate) fn arm_proc_exit(id: ProcessId) -> Result<Option<Kqueue>, Error> {
+/// once the exit event is pending. Test-only: the production exit watch is
+/// `os_process::macos::ExitWatch`, which the tests that need a bare kqueue do not reach.
+#[cfg(test)]
+pub(crate) fn arm_proc_exit(id: crate::identity::ProcessId) -> Result<Option<Kqueue>, Error> {
     let kq = Kqueue::new().map_err(|e| Error::Io(e.into()))?;
     if arm_note_exit_on(&kq, id.pid())?.is_none() {
         return Ok(None); // pid already gone
@@ -147,10 +147,6 @@ pub(crate) fn arm_proc_exit(id: ProcessId) -> Result<Option<Kqueue>, Error> {
 /// Drain one pending event from an armed kqueue without blocking. `Ok(Some(()))` = the exit
 /// event was observed; `Ok(None)` = nothing pending (spurious readiness — re-wait); `Err` =
 /// EV_ERROR (any, mirroring the blocking wait) or a kevent failure.
-#[cfg_attr(
-    not(feature = "tokio"),
-    allow(dead_code, reason = "non-test consumer is tokio::wait's watch loop")
-)]
 pub(crate) fn drain_proc_exit(kq: &Kqueue) -> Result<Option<()>, Error> {
     let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     let mut events = [placeholder()];
@@ -167,18 +163,6 @@ pub(crate) fn drain_proc_exit(kq: &Kqueue) -> Result<Option<()>, Error> {
             Err(e) => return Err(Error::Io(e.into())),
         }
     }
-}
-
-pub(crate) fn block_until_exit(id: ProcessId, deadline: Option<Option<Instant>>) -> Result<bool, Error> {
-    let Some(kq) = arm_proc_exit(id)? else {
-        return Ok(true);
-    };
-    block_on_kqueue(&kq, deadline, false, |event, _already_elapsed| {
-        if event.flags().contains(EvFlags::EV_ERROR) {
-            return Err(Error::Io(std::io::Error::from_raw_os_error(event.data() as i32)));
-        }
-        Ok(Some(true)) // NOTE_EXIT
-    })
 }
 
 /// Block on an armed kqueue until `interpret` concludes, or until `deadline`, checking
@@ -315,96 +299,6 @@ pub(crate) use tracer_watch::seams as tracer_seams;
 #[cfg(feature = "tokio")]
 pub(crate) use tracer_watch::WalkError;
 pub(crate) use tracer_watch::{OnTracer, TracerWatch};
-
-pub(crate) fn kill(id: ProcessId) -> Result<(), Error> {
-    use nix::sys::signal::{kill as nix_kill, Signal};
-    use nix::unistd::Pid;
-    // Re-verify identity immediately before signaling. The window between this check
-    // and kill(2) is irreducible on macOS (no pidfd); a recycled pid in that window is
-    // a documented best-effort limitation, mirroring treewalk::kill_by_identity.
-    match ProcessId::of(id.pid()) {
-        crate::identity::Resolved::Found(live) if live == id => {}
-        // gone (or recycled) => already-dead is success
-        crate::identity::Resolved::Found(_) | crate::identity::Resolved::Gone => return Ok(()),
-        crate::identity::Resolved::Unknown => {
-            log::warn!(
-                "wait: pid {} identity could not be confirmed - no signal was sent",
-                id.pid()
-            );
-            return Err(Error::Unassessable {
-                detail: format!("pid {} identity could not be confirmed; no signal was sent", id.pid()),
-                source: None,
-            });
-        }
-    }
-    // `nix::unistd::Pid::from_raw` is infallible and accepts 0, and `kill(0, sig)` signals
-    // the CALLER-S ENTIRE PROCESS GROUP. `kernel_task` is pid 0 and macOS RESOLVES it, so the
-    // re-verify above does not rule the value out, and a `debug_assert` would vanish in
-    // release. Use the same total guard the `sig 0` probe uses.
-    let Some(target) = crate::identity::probe::signal_target(id.pid()) else {
-        // A discard site: the Result can carry this, so it must not read as a silent success.
-        log::warn!(
-            "wait: pid {} is not a single-process signal target - not signaled",
-            id.pid()
-        );
-        return Err(Error::Unassessable {
-            detail: format!("pid {} is not a signalable single-process target", id.pid()),
-            source: None,
-        });
-    };
-    let sent = nix_kill(Pid::from_raw(target), Signal::SIGKILL);
-    #[cfg(test)]
-    crate::send_log::record_by_identity(id.pid(), Signal::SIGKILL as i32);
-    match sent {
-        Ok(()) => Ok(()),
-        Err(nix::errno::Errno::ESRCH) => Ok(()), // exited between re-verify and kill
-        Err(e) => Err(Error::Io(e.into())),      // EPERM etc. surfaced, not swallowed
-    }
-}
-
-pub(crate) fn terminate(id: ProcessId) -> Result<(), Error> {
-    use nix::sys::signal::{kill as nix_kill, Signal};
-    use nix::unistd::Pid;
-    // Re-verify identity immediately before signaling.
-    match ProcessId::of(id.pid()) {
-        crate::identity::Resolved::Found(live) if live == id => {}
-        // gone (or recycled) => already-dead is success
-        crate::identity::Resolved::Found(_) | crate::identity::Resolved::Gone => return Ok(()),
-        crate::identity::Resolved::Unknown => {
-            log::warn!(
-                "wait: pid {} identity could not be confirmed - no signal was sent",
-                id.pid()
-            );
-            return Err(Error::Unassessable {
-                detail: format!("pid {} identity could not be confirmed; no signal was sent", id.pid()),
-                source: None,
-            });
-        }
-    }
-    // `nix::unistd::Pid::from_raw` is infallible and accepts 0, and `kill(0, sig)` signals
-    // the CALLER-S ENTIRE PROCESS GROUP. `kernel_task` is pid 0 and macOS RESOLVES it, so the
-    // re-verify above does not rule the value out, and a `debug_assert` would vanish in
-    // release. Use the same total guard the `sig 0` probe uses.
-    let Some(target) = crate::identity::probe::signal_target(id.pid()) else {
-        // A discard site: the Result can carry this, so it must not read as a silent success.
-        log::warn!(
-            "wait: pid {} is not a single-process signal target - not signaled",
-            id.pid()
-        );
-        return Err(Error::Unassessable {
-            detail: format!("pid {} is not a signalable single-process target", id.pid()),
-            source: None,
-        });
-    };
-    let sent = nix_kill(Pid::from_raw(target), Signal::SIGTERM);
-    #[cfg(test)]
-    crate::send_log::record_by_identity(id.pid(), Signal::SIGTERM as i32);
-    match sent {
-        Ok(()) => Ok(()),
-        Err(nix::errno::Errno::ESRCH) => Ok(()),
-        Err(e) => Err(Error::Io(e.into())),
-    }
-}
 
 #[cfg(test)]
 #[path = "macos_tests.rs"]

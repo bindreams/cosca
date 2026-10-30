@@ -3,16 +3,9 @@ use std::time::Duration;
 use crate::error::Error;
 use crate::identity::ProcessId;
 use crate::os_process::drive::exited_by;
-use crate::os_process::{kill_by_id, open, terminate_by_id, Exit, Op, WaitFor};
+use crate::os_process::{kill_by_id, open, terminate_by_id, Exit, Op, OsProcess as _, WaitFor};
 use crate::signal::{Sent, Sig};
-use crate::test_child::held_contained_blocker;
-
-/// A live blocker, its stdin (held open so it stays alive) and its identity.
-fn blocker() -> (crate::Child, std::io::PipeWriter, ProcessId) {
-    let (child, stdin) = held_contained_blocker(crate::Stdio::null());
-    let id = child.id();
-    (child, stdin, id)
-}
+use crate::test_child::live_blocker as blocker;
 
 /// Mutant: `exited` calls a live process exited, or `signal` signals nothing. The kill handle
 /// lacks `SYNCHRONIZE`, so the wait goes through a second, `Op::Wait` object.
@@ -119,4 +112,40 @@ fn os_handle_is_the_handle_the_wait_is_on() {
     }
     child.kill().unwrap();
     child.wait().unwrap();
+}
+
+/// A `TerminateProcess` failure that is not a refusal by an exiting process is `Io` with the plain
+/// Win32 code. An event is a real handle that is not a process, so `TerminateProcess` on it fails
+/// with `ERROR_INVALID_HANDLE`.
+///
+/// Mutant: `signal` converts with `.into()`, so the code is `0x80070006`.
+#[skuld::test]
+fn signal_failure_carries_the_win32_code() {
+    use windows::Win32::Foundation::ERROR_INVALID_HANDLE;
+
+    let mut p = super::WindowsProcess {
+        id: ProcessId::current(),
+        handle: crate::wait::backend::new_cancel_event().expect("create an event handle"),
+    };
+    let err = p.signal(Sig::Kill).expect_err("an event cannot be terminated");
+    let Error::Io(io) = err else {
+        panic!("expected Io, got {err:?}");
+    };
+    assert_eq!(io.raw_os_error(), Some(ERROR_INVALID_HANDLE.0 as i32), "{io:?}");
+}
+
+/// `kill_by_id` of a process that is exiting but not yet signalled is `Ok`; the seam refuses and
+/// the process stays alive.
+///
+/// Mutant: a refusal is success only once the process reads signalled, so this one is `Err(Io)`.
+#[skuld::test]
+fn kill_by_id_of_a_process_that_is_exiting_but_not_signalled_is_ok() {
+    let (child, _stdin, id) = blocker();
+    crate::identity::windows_fault::refuse_next_terminate_as_exiting();
+    let result = kill_by_id(id);
+    // The seam sent no terminate: end the fixture before asserting.
+    child.kill().expect("end the fixture");
+    child.wait().expect("reap the fixture");
+
+    result.expect("a refusal on an exiting process is not a failed kill");
 }

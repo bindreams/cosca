@@ -37,7 +37,7 @@ impl Child {
         until: impl FnOnce(Option<Instant>) -> Result<Option<ExitStatus>, Error>,
     ) -> Result<Option<ExitStatus>, Error> {
         // The sync lone path's watch goes through `SharedChild::wait_deadline`, not
-        // block_until_exit, so it needs its own head of the shared watch fault seam.
+        // `exited_by_id`, so it needs its own head of the shared watch fault seam.
         #[cfg(test)]
         if crate::wait::fault::take_force_watch_error() {
             return Err(crate::wait::fault::forced_watch_error());

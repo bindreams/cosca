@@ -116,6 +116,10 @@ impl OsProcess for FakeProcess {
 #[cfg(unix)]
 struct Source {
     /// Kept open: on macOS only the kqueue refers to it.
+    #[cfg_attr(
+        target_os = "macos",
+        allow(dead_code, reason = "only keeps the pipe open for the kqueue")
+    )]
     rx: std::io::PipeReader,
     tx: std::io::PipeWriter,
     #[cfg(target_os = "macos")]

@@ -31,7 +31,12 @@ impl WindowsProcess {
             Op::Kill => open_verified_for_kill(id)?,
             Op::Terminate => return Err(terminate_unsupported()),
         };
-        Ok(handle.map(|handle| Self {
+        let Some(handle) = handle else {
+            return Ok(None);
+        };
+        #[cfg(test)]
+        crate::wait::read_probe::mark("identity verified");
+        Ok(Some(Self {
             id,
             // SAFETY: `open_verified*` hands over a freshly opened handle that nothing else owns.
             handle: unsafe { OwnedHandle::from_raw_handle(handle.0 as _) },

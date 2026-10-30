@@ -9,7 +9,7 @@ use crate::error::Error;
 
 /// The `crate::wait::fault` grace-watch seam, consumed HERE rather than inside a specific
 /// backend so it applies uniformly to whichever watch `graceful_shutdown_tree` actually
-/// performs — root-only ([`crate::tokio::wait::grace_wait`]) or whole-tree
+/// performs — root-only ([`crate::tokio::drive::exited_by_id`]) or whole-tree
 /// ([`crate::tokio::wait::wait_tree_drained_dispatch`]). Outside test builds the seam module
 /// does not exist at all, so this compiles to a constant `None`. Duplicated (not shared) with
 /// the sync `crate::child::graceful` twin — see this module's own fault-seam doc comment for
@@ -151,7 +151,7 @@ impl Child {
         // kill and reap still run (grace unobservable => escalate now); the watch error surfaces
         // only after they succeed (a kill/reap error wins — deliberate subsumption, mirroring
         // kill_tree's both-fail disposition).
-        let watch = crate::tokio::wait::grace_wait(self.id(), grace).await;
+        let watch = crate::tokio::drive::exited_by_id(self.id(), Some(grace)).await;
         if !matches!(watch, Ok(true)) {
             if let Err(e) = &watch {
                 log::debug!(
@@ -413,7 +413,7 @@ impl Child {
                 Ok(verdict) if verdict.permits_skipping_sweep() => (true, true, None),
                 // Not sufficient proof alone to skip the sweep (see the doc above) — fall back
                 // to the fresh, non-blocking, zero-duration root probe described there.
-                Ok(_) => match crate::tokio::wait::grace_wait(self.id(), Duration::ZERO).await {
+                Ok(_) => match crate::tokio::drive::exited_by_id(self.id(), Some(Duration::ZERO)).await {
                     Ok(exited) => (false, exited, None),
                     Err(e) => (false, false, Some(e)),
                 },
@@ -421,7 +421,7 @@ impl Child {
             }
         } else {
             // NON-reaping grace-wait on the root only.
-            match crate::tokio::wait::grace_wait(self.id(), grace).await {
+            match crate::tokio::drive::exited_by_id(self.id(), Some(grace)).await {
                 Ok(exited) => (false, exited, None),
                 Err(e) => (false, false, Some(e)),
             }

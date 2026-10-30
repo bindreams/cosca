@@ -9,7 +9,7 @@ use crate::error::Error;
 
 /// The `crate::wait::fault` grace-watch seam, consumed HERE rather than inside a specific
 /// backend so it applies uniformly to whichever watch `graceful_shutdown_tree` actually
-/// performs — root-only ([`crate::wait::block_until_exit`]) or whole-tree
+/// performs — root-only ([`crate::os_process::drive::exited_by_id`]) or whole-tree
 /// ([`crate::containment::Attached::wait_drained`]). Outside test builds the seam module does
 /// not exist at all, so this compiles to a constant `None`.
 #[cfg(test)]
@@ -399,14 +399,14 @@ impl Child {
                 Ok(verdict) if verdict.permits_skipping_sweep() => (true, true, None),
                 // Not sufficient proof alone to skip the sweep (see the doc above) — fall back
                 // to the fresh, non-blocking, zero-duration root probe described there.
-                Ok(_) => match crate::wait::block_until_exit(self.id, Some(Duration::ZERO)) {
+                Ok(_) => match crate::os_process::drive::exited_by_id(self.id, Some(Duration::ZERO)) {
                     Ok(exited) => (false, exited, None),
                     Err(e) => (false, false, Some(e)),
                 },
                 Err(e) => (false, false, Some(e)),
             }
         } else {
-            match crate::wait::block_until_exit(self.id, Some(grace)) {
+            match crate::os_process::drive::exited_by_id(self.id, Some(grace)) {
                 // NON-reaping grace-wait on the root only.
                 Ok(exited) => (false, exited, None),
                 Err(e) => (false, false, Some(e)),
