@@ -14,14 +14,20 @@ use crate::identity::ProcessId;
 use crate::os_process::{open, Exit, Op, OsProcess, WaitFor};
 use crate::tokio::wait::deadline_from;
 
-/// [`exited_by`] on the process `id` names. A process that is gone, or whose pid now names another
-/// process, has exited: `Ok(true)` with no wait. The watch-fault seam comes before the open, so it
-/// holds for a gone id too.
-pub(crate) async fn exited_by_id(id: ProcessId, timeout: Option<Duration>) -> Result<bool, Error> {
+/// What both entry points do before any open or look: the watch-fault seam.
+fn enter() -> Result<(), Error> {
     #[cfg(test)]
     if crate::wait::fault::take_force_watch_error() {
         return Err(crate::wait::fault::forced_watch_error());
     }
+    Ok(())
+}
+
+/// [`exited_by`] on the process `id` names. A process that is gone, or whose pid now names another
+/// process, has exited: `Ok(true)` with no wait. The watch-fault seam comes before the open, so it
+/// holds for a gone id too.
+pub(crate) async fn exited_by_id(id: ProcessId, timeout: Option<Duration>) -> Result<bool, Error> {
+    enter()?;
     match open(id, Op::Wait)? {
         None => Ok(true),
         Some(mut process) => exited_by(&mut *process, timeout).await,
@@ -34,10 +40,7 @@ pub(crate) async fn exited_by_id(id: ProcessId, timeout: Option<Duration>) -> Re
 /// Non-reaping. Dropping the future releases the wait: the fd is deregistered on Unix, and the
 /// blocking thread is released on Windows.
 pub(crate) async fn exited_by(p: &mut dyn OsProcess, timeout: Option<Duration>) -> Result<bool, Error> {
-    #[cfg(test)]
-    if crate::wait::fault::take_force_watch_error() {
-        return Err(crate::wait::fault::forced_watch_error());
-    }
+    enter()?;
     // Absolute up front, so no wake extends the total wait.
     let deadline = timeout.and_then(deadline_from);
     #[cfg(windows)]

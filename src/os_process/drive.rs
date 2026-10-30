@@ -7,16 +7,23 @@ use crate::error::Error;
 use crate::identity::ProcessId;
 use crate::wait::remaining;
 
-/// [`exited_by`] on the process `id` names. A process that is gone, or whose pid now names another
-/// process, has exited: `Ok(true)` with no wait. The bounded-section assert and the watch-fault
-/// seam come before the open, so they hold for a gone id too.
-pub(crate) fn exited_by_id(id: ProcessId, timeout: Option<Duration>) -> Result<bool, Error> {
+/// What both entry points do before any open or look: the bounded-section assert, then the
+/// watch-fault seam.
+fn enter() -> Result<(), Error> {
     #[cfg(feature = "tokio")]
     crate::bounded::assert_may_block("waiting for a process to exit");
     #[cfg(test)]
     if crate::wait::fault::take_force_watch_error() {
         return Err(crate::wait::fault::forced_watch_error());
     }
+    Ok(())
+}
+
+/// [`exited_by`] on the process `id` names. A process that is gone, or whose pid now names another
+/// process, has exited: `Ok(true)` with no wait. The bounded-section assert and the watch-fault
+/// seam come before the open, so they hold for a gone id too.
+pub(crate) fn exited_by_id(id: ProcessId, timeout: Option<Duration>) -> Result<bool, Error> {
+    enter()?;
     match open(id, Op::Wait)? {
         None => Ok(true),
         Some(mut process) => exited_by(&mut *process, timeout),
@@ -28,12 +35,7 @@ pub(crate) fn exited_by_id(id: ProcessId, timeout: Option<Duration>) -> Result<b
 /// `Some(ZERO)` = one look, no blocking call; a `Duration` too large for the clock is unbounded.
 /// Non-reaping. Every blocking call is armed from the time remaining, read right before it.
 pub(crate) fn exited_by(p: &mut dyn OsProcess, timeout: Option<Duration>) -> Result<bool, Error> {
-    #[cfg(feature = "tokio")]
-    crate::bounded::assert_may_block("waiting for a process to exit");
-    #[cfg(test)]
-    if crate::wait::fault::take_force_watch_error() {
-        return Err(crate::wait::fault::forced_watch_error());
-    }
+    enter()?;
     // Absolute up front, so no wake extends the total wait.
     let deadline = timeout.and_then(crate::wait::deadline_from);
     loop {
