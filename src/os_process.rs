@@ -20,6 +20,8 @@ pub(crate) mod linux;
 #[cfg(target_os = "macos")]
 #[allow(dead_code, reason = "MacProcess, its consumer, lands in a later task of #839")]
 pub(crate) mod macos;
+#[cfg(windows)]
+pub(crate) mod windows;
 
 #[cfg(target_os = "linux")]
 use std::os::fd::BorrowedFd;
@@ -83,20 +85,46 @@ pub(crate) enum Op {
 }
 
 /// Open the process `id` names. `Ok(None)`: it is gone, or its pid now names another process.
+/// [`Op::Terminate`] on Windows is `Unsupported`: no handle is opened.
 pub(crate) fn open(id: ProcessId, op: Op) -> Result<Option<Box<dyn OsProcess>>, Error> {
     #[cfg(target_os = "linux")]
     return Ok(crate::wait::backend::open_verified(id, op.into())?
         .map(|pidfd| Box::new(linux::LinuxProcess::new(id, pidfd)) as Box<dyn OsProcess>));
     #[cfg(windows)]
-    {
-        let _ = (id, op);
-        unimplemented!("OsProcess on Windows lands in task 3 of #839");
-    }
+    return Ok(windows::WindowsProcess::open(id, op)?.map(|p| Box::new(p) as Box<dyn OsProcess>));
     #[cfg(target_os = "macos")]
     {
         let _ = (id, op);
         unimplemented!("OsProcess on macOS lands in task 4 of #839");
     }
+}
+
+/// Hard-kill the process `id` names, identity-verified. Already gone, or its pid now names another
+/// process: `Ok`.
+pub(crate) fn kill_by_id(id: ProcessId) -> Result<(), Error> {
+    signal_by_id(id, Op::Kill, Sig::Kill)
+}
+
+/// Send the graceful termination signal to the process `id` names, identity-verified, without
+/// waiting. Already gone: `Ok`. Windows has no such per-process signal: `Unsupported`.
+#[cfg(unix)]
+pub(crate) fn terminate_by_id(id: ProcessId) -> Result<(), Error> {
+    signal_by_id(id, Op::Terminate, Sig::Term)
+}
+
+/// There is no [`Sig`] to send for it on Windows, and [`open`] refuses [`Op::Terminate`] there with
+/// the `Unsupported` this returns.
+#[cfg(windows)]
+pub(crate) fn terminate_by_id(id: ProcessId) -> Result<(), Error> {
+    open(id, Op::Terminate).map(|_| ())
+}
+
+fn signal_by_id(id: ProcessId, op: Op, sig: Sig) -> Result<(), Error> {
+    let Some(mut process) = open(id, op)? else {
+        return Ok(());
+    };
+    // `Gone` and `Delivered` are both success: nothing is left for the caller to do.
+    process.signal(sig).map(|_: Sent| ())
 }
 
 #[cfg(target_os = "linux")]

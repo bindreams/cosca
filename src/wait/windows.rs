@@ -7,8 +7,8 @@ use std::time::Instant;
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{
-    CreateEventW, SetEvent, WaitForMultipleObjects, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    CreateEventW, SetEvent, WaitForMultipleObjects, WaitForSingleObject, PROCESS_ACCESS_RIGHTS,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
 };
 
 use crate::error::{win32_io_error, Error};
@@ -148,26 +148,52 @@ pub(crate) fn signal_cancel(event: &OwnedHandle) {
     )
 )]
 pub(crate) fn open_verified(id: ProcessId) -> Result<Option<HANDLE>, Error> {
-    let handle = match crate::identity::windows_open_classified(
-        id.pid(),
+    open_held(
+        id,
         PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
-    ) {
+        "to watch for its exit",
+        "an exit",
+    )
+}
+
+/// [`open_verified`] for terminating: the mask holds `PROCESS_TERMINATE` and the query right, so
+/// the SAME held handle pins the kernel object (pid-reuse-safe) and lets identity be re-verified
+/// before terminating.
+pub(crate) fn open_verified_for_kill(id: ProcessId) -> Result<Option<HANDLE>, Error> {
+    open_held(
+        id,
+        PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+        "to terminate it",
+        "a kill",
+    )
+}
+
+/// Opens `id` with `access` and verifies the handle names that process. `to` and `not_reported`
+/// word the denial's error: "pid N could not be opened `to`" and "not `not_reported`".
+fn open_held(
+    id: ProcessId,
+    access: PROCESS_ACCESS_RIGHTS,
+    to: &str,
+    not_reported: &str,
+) -> Result<Option<HANDLE>, Error> {
+    let handle = match crate::identity::windows_open_classified(id.pid(), access) {
         Opened::Found(h) => h,
         Opened::Gone => return Ok(None), // no such pid => exited
         // Denied on a LIVE process => a real failure: reporting "exited" would let a
-        // supervisor conclude a healthy service had died. The error comes from the
-        // classifier, not `last_os_error()`: `is_alive()` below runs a whole
-        // open/query/wait cycle that would overwrite the thread-s last-error first.
+        // supervisor conclude a healthy service had died, and an Unknown liveness must NOT be
+        // reported as a successful kill. The error comes from the classifier, not
+        // `last_os_error()`: `is_alive()` below runs a whole open/query/wait cycle that would
+        // overwrite the thread-s last-error first.
         Opened::Denied(e) => {
             return match id.is_alive() {
                 Liveness::Dead => Ok(None),
                 Liveness::Alive | Liveness::Unknown => {
                     log::warn!(
-                        "wait: pid {} could not be opened to watch for its exit ({e}) - reporting an error, not an exit",
+                        "wait: pid {} could not be opened {to} ({e}) - reporting an error, not {not_reported}",
                         id.pid()
                     );
                     Err(Error::Unassessable {
-                        detail: format!("pid {} could not be opened to watch for its exit", id.pid()),
+                        detail: format!("pid {} could not be opened {to}", id.pid()),
                         source: Some(win32_io_error(e)),
                     })
                 }
@@ -175,7 +201,7 @@ pub(crate) fn open_verified(id: ProcessId) -> Result<Option<HANDLE>, Error> {
         }
     };
     // The handle already in hand answers the recycle question with no race; a second by-pid
-    // lookup would not.
+    // lookup would not. An UNREADABLE token is not proof the target is gone, so it is an error.
     if !holds_process(handle, id)? {
         return Ok(None); // recycled before open - the original is gone
     }
@@ -258,38 +284,10 @@ pub(crate) fn block_until_exit_or_cancel(
 }
 
 pub(crate) fn kill(id: ProcessId) -> Result<(), Error> {
-    // Open for terminate AND query, so the SAME held handle both pins the kernel object
-    // (pid-reuse-safe) and lets us re-verify identity before terminating.
-    // SAFETY: OpenProcess tolerates an invalid pid; the handle is closed on every path below.
-    let handle =
-        match crate::identity::windows_open_classified(id.pid(), PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION)
-        {
-            Opened::Found(h) => h,
-            Opened::Gone => return Ok(()), // no such pid => already dead is success
-            // Live-or-unassessable => Err. An Unknown liveness must NOT be reported as a
-            // successful kill.
-            Opened::Denied(e) => {
-                return if id.is_alive() == Liveness::Dead {
-                    Ok(())
-                } else {
-                    log::warn!(
-                        "wait: pid {} could not be opened to terminate it ({e}) - reporting an error, not a kill",
-                        id.pid()
-                    );
-                    Err(Error::Unassessable {
-                        detail: format!("pid {} could not be opened to terminate it", id.pid()),
-                        source: Some(win32_io_error(e)),
-                    })
-                }
-            }
-        };
-    // Re-verify identity on the HELD handle: a pid recycled before the open pins the NEW
-    // process, whose creation token will not match. An UNREADABLE token is not proof the
-    // target is gone, so it must not report a successful kill.
-    if !holds_process(handle, id)? {
-        return Ok(()); // pid recycled; the original is already gone
+    match open_verified_for_kill(id)? {
+        None => Ok(()), // gone, or the pid recycled: the original is already dead
+        Some(handle) => terminate_and_close(handle, id),
     }
-    terminate_and_close(handle, id)
 }
 
 /// Terminates `id`'s process through `handle`, which pins it, then closes `handle`.
@@ -307,13 +305,7 @@ fn terminate_and_close(handle: HANDLE, id: ProcessId) -> Result<(), Error> {
 
 pub(crate) fn terminate(id: ProcessId) -> Result<(), Error> {
     let _ = id;
-    Err(Error::Unsupported {
-        op: "graceful terminate (SIGTERM-equivalent)".into(),
-        platform: "windows",
-        detail: "Windows has no per-process graceful-termination signal; for a contained \
-                 child use graceful_shutdown_tree (CTRL_BREAK to the group)"
-            .into(),
-    })
+    Err(crate::os_process::windows::terminate_unsupported())
 }
 
 /// Test-only seam proving a root-only watch on an already-reaped root never reaches a live

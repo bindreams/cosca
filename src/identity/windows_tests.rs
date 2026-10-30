@@ -4,6 +4,16 @@ use windows::Win32::System::Threading::{PROCESS_QUERY_LIMITED_INFORMATION, PROCE
 use super::{creation_token, current_token, is_running, start_token};
 use crate::identity::windows_fixture::spawn_restricted;
 use crate::identity::{Liveness, Resolved, StartToken};
+use crate::os_process::{open, Op};
+
+/// One look at whether `id`'s process has exited, through the `Op::Wait` open: gone or recycled
+/// is exited.
+fn exited_now(id: crate::identity::ProcessId) -> Result<bool, crate::error::Error> {
+    match open(id, Op::Wait)? {
+        None => Ok(true),
+        Some(mut process) => crate::os_process::drive::exited_by(&mut *process, Some(std::time::Duration::ZERO)),
+    }
+}
 
 #[skuld::test]
 fn start_token_of_current_process_is_stable() {
@@ -129,7 +139,7 @@ fn kill_of_an_access_denied_live_process_is_an_error() {
     let id = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
         .expect("the owned handle always yields an identity");
     assert!(child.is_running(), "precondition: the subject must be live");
-    let err = crate::wait::kill(id).expect_err("killing a process we may not open must not report success");
+    let err = crate::os_process::kill_by_id(id).expect_err("killing a process we may not open must not report success");
     let crate::error::Error::Unassessable { source, .. } = err else {
         panic!("a denial must not read as an I/O failure: {err:?}");
     };
@@ -151,8 +161,7 @@ fn block_until_exit_of_an_access_denied_live_process_is_an_error() {
     let id = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
         .expect("the owned handle always yields an identity");
     assert!(child.is_running(), "precondition: the subject must be live");
-    let err = crate::wait::block_until_exit(id, Some(std::time::Duration::ZERO))
-        .expect_err("an unopenable live process must not be reported as exited");
+    let err = exited_now(id).expect_err("an unopenable live process must not be reported as exited");
     let crate::error::Error::Unassessable { source, .. } = err else {
         panic!("a denial must not read as an I/O failure: {err:?}");
     };
@@ -177,8 +186,7 @@ fn wait_of_a_synchronize_denied_but_exited_process_reports_exited() {
     child.terminate();
     assert!(!child.is_running(), "precondition: the subject must have exited");
     assert_eq!(id.is_alive(), Liveness::Dead, "precondition: provably dead");
-    assert!(crate::wait::block_until_exit(id, Some(std::time::Duration::ZERO))
-        .expect("waiting on an already-exited process is success"));
+    assert!(exited_now(id).expect("waiting on an already-exited process is success"));
 }
 
 #[skuld::test]
@@ -200,12 +208,12 @@ fn kill_of_a_terminate_denied_but_exited_process_reports_success() {
             super::open_classified(child.pid(), PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION),
             super::Opened::Denied(_)
         ),
-        "precondition: wait::kill's open must be denied"
+        "precondition: kill_by_id's open must be denied"
     );
     child.terminate();
     assert!(!child.is_running(), "precondition: the subject must have exited");
     assert_eq!(id.is_alive(), Liveness::Dead, "precondition: provably dead");
-    crate::wait::kill(id).expect("killing an already-exited process is success");
+    crate::os_process::kill_by_id(id).expect("killing an already-exited process is success");
 }
 
 /// A stale identity over a pid whose occupant we CAN read: the token comparison runs, finds
@@ -223,8 +231,7 @@ fn wait_on_a_stale_identity_over_a_readable_pid_reports_exited() {
         .expect("the owned handle always yields an identity");
     let stale = crate::identity::ProcessId::from_parts_for_test(real.pid(), real.start_token_raw() ^ 1);
     assert!(child.is_running(), "precondition: the pid's occupant is live");
-    assert!(crate::wait::block_until_exit(stale, Some(std::time::Duration::ZERO))
-        .expect("a readable stranger on the pid proves the stale identity is gone"));
+    assert!(exited_now(stale).expect("a readable stranger on the pid proves the stale identity is gone"));
 }
 
 /// The other half of the documented asymmetry: when the pid's occupant cannot be read
@@ -245,8 +252,7 @@ fn wait_on_a_stale_identity_over_an_unreadable_pid_is_an_error() {
         child.is_running(),
         "precondition: the pid's occupant is live and unreadable"
     );
-    crate::wait::block_until_exit(stale, Some(std::time::Duration::ZERO))
-        .expect_err("an unreadable occupant cannot prove the original identity exited");
+    exited_now(stale).expect_err("an unreadable occupant cannot prove the original identity exited");
 }
 
 // terminate_held =====

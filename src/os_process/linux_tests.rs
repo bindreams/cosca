@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use crate::identity::ProcessId;
 use crate::os_process::drive::exited_by;
-use crate::os_process::{open, Exit, Op};
+use crate::os_process::{kill_by_id, open, terminate_by_id, Exit, Op};
 use crate::signal::{Sent, Sig};
 use crate::test_child::{held_contained_blocker_without_cgroup, wait_until_zombie};
 
@@ -84,4 +84,43 @@ fn os_handle_is_the_pidfd_the_wait_is_on() {
     }
     child.kill().unwrap();
     child.wait().unwrap();
+}
+
+/// Mutant: `Op::Terminate` opens the `Kill` pidfd operation, or `terminate_by_id` sends `SIGKILL`.
+#[skuld::test]
+fn terminate_by_id_sends_sigterm_and_the_blocker_exits() {
+    use std::os::unix::process::ExitStatusExt;
+    let (child, _stdin, id) = blocker();
+    terminate_by_id(id).unwrap();
+    assert_eq!(
+        child.wait().unwrap().signal(),
+        Some(rustix::process::Signal::TERM.as_raw())
+    );
+}
+
+/// Mutant: `kill_by_id` sends `SIGTERM`, or opens and drops without signalling.
+#[skuld::test]
+fn kill_by_id_sends_sigkill_and_the_blocker_exits() {
+    use std::os::unix::process::ExitStatusExt;
+    let (child, _stdin, id) = blocker();
+    kill_by_id(id).unwrap();
+    assert_eq!(
+        child.wait().unwrap().signal(),
+        Some(rustix::process::Signal::KILL.as_raw())
+    );
+}
+
+/// Mutant: a stale identity or a reaped process is an error, or is signalled.
+#[skuld::test]
+fn by_id_helpers_on_a_gone_process_are_ok() {
+    let (child, _stdin, id) = blocker();
+    let other = ProcessId::from_parts_for_test(id.pid(), id.start_token_raw() + 1);
+    kill_by_id(other).unwrap();
+    terminate_by_id(other).unwrap();
+    let mut p = open(id, Op::Wait).unwrap().expect("the blocker is alive");
+    assert!(!exited_by(&mut *p, Some(Duration::ZERO)).unwrap());
+    child.kill().unwrap();
+    child.wait().unwrap();
+    kill_by_id(id).unwrap();
+    terminate_by_id(id).unwrap();
 }
