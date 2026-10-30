@@ -7,8 +7,7 @@ use crate::os_process::{kill_by_id, open, terminate_by_id, Exit, Op, OsProcess a
 use crate::signal::{Sent, Sig};
 use crate::test_child::live_blocker as blocker;
 
-/// Mutant: `exited` calls a live process exited, or `signal` signals nothing. The kill handle
-/// lacks `SYNCHRONIZE`, so the wait goes through a second, `Op::Wait` object.
+/// The kill handle lacks `SYNCHRONIZE`, so the wait goes through a second, `Op::Wait` object.
 #[skuld::test]
 fn open_live_then_kill_then_exited() {
     let (child, _stdin, id) = blocker();
@@ -21,7 +20,6 @@ fn open_live_then_kill_then_exited() {
     child.wait().unwrap();
 }
 
-/// Review Focus 1. Mutant: `open` trusts the pid and not the start token.
 #[skuld::test]
 fn open_with_wrong_start_token_is_none_and_sends_nothing() {
     let (child, _stdin, id) = blocker();
@@ -36,7 +34,6 @@ fn open_with_wrong_start_token_is_none_and_sends_nothing() {
     child.wait().unwrap();
 }
 
-/// Review Focus 2. Mutant: the first look blocks, or misses an exit.
 #[skuld::test]
 fn exited_before_first_look_returns_true() {
     let (child, _stdin, id) = blocker();
@@ -58,7 +55,6 @@ fn kill_after_exit_is_ok() {
     kill_by_id(id).expect("killing an exited process is success");
 }
 
-/// Mutant: `Termination::Exited` is an error, or reads `Delivered`.
 #[skuld::test]
 fn signal_after_exit_is_gone() {
     let (child, _stdin, id) = blocker();
@@ -68,7 +64,6 @@ fn signal_after_exit_is_gone() {
     assert_eq!(p.signal(Sig::Kill).unwrap(), Sent::Gone);
 }
 
-/// Mutant: `kill_by_id` opens and drops without signalling.
 #[skuld::test]
 fn kill_by_id_ends_the_process() {
     let (child, _stdin, id) = blocker();

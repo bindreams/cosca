@@ -194,7 +194,7 @@ impl Child {
     /// before the tree does — never on a tree that already cleared on its own. On every other
     /// mechanism (`ProcessGroup`, `Session`, `TreeWalk`) there is no kernel edge to observe
     /// descendants draining, so the wait watches the **root only** and the sweep always runs
-    /// afterward regardless of what it saw, exactly as before this distinction existed.
+    /// afterward regardless of what it saw.
     ///
     /// **Windows: what this actually signals, and what the grace costs.** `CTRL_BREAK` goes
     /// to the root's **process group** only. A nested contained descendant leads its own

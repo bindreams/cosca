@@ -23,8 +23,7 @@ pub(crate) struct WindowsProcess {
 
 impl WindowsProcess {
     /// Open the process `id` names for `op`. `Ok(None)`: it is gone, or its pid now names another
-    /// process. `op` picks the access rights, as the per-operation functions of [`crate::wait`]
-    /// did.
+    /// process.
     pub(crate) fn open(id: ProcessId, op: Op) -> Result<Option<Self>, Error> {
         use crate::wait::backend::{open_verified, open_verified_for_kill};
         let handle = match op {

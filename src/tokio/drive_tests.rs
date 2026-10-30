@@ -161,7 +161,7 @@ async fn forced_watch_error_is_returned_before_looking() {
     assert!(!fault::armed(), "the seam is consumed");
 }
 
-/// Review Focus 5. A `Running` fake whose wait is dropped, and then the runtime. Mutant: the Windows
+/// A `Running` fake whose wait is dropped, and then the runtime. Mutant: the Windows
 /// watcher is not released by the drop, so the runtime's drop joins a thread parked on the fake
 /// forever; the observer then never hears a release.
 #[skuld::test]
@@ -243,9 +243,8 @@ fn async_waits_are_send() {
 
 #[cfg(windows)]
 mod windows {
-    //! The blocking half of the Windows arm, `wait_process_or_cancel`: the cancel-race tests that
-    //! covered the old cancellable wait, with the same assertions, now run on the handle an
-    //! `OsProcess` hands out.
+    //! The blocking half of the Windows arm, `wait_process_or_cancel`: cancel-race and re-arm tests
+    //! on the handle an `OsProcess` hands out.
 
     use std::time::{Duration, Instant};
 
@@ -346,9 +345,7 @@ mod windows {
         wait_ms_probe::assert_rearmed_with_fresh_remaining(&arms, 5);
     }
 
-    /// A PRE-signaled cancel event must release the wait on a LIVE child: no race, nothing to time.
-    /// If the cancel plumbing were broken, the wait would sit at the unbounded `None` (=> INFINITE)
-    /// and a nextest override ends it as a failure.
+    /// A pre-signalled cancel event releases the wait on a live child.
     #[skuld::test]
     fn cancel_event_releases_the_blocking_wait() {
         let (child, _stdin, id) = blocker();
@@ -361,10 +358,8 @@ mod windows {
         child.wait().expect("reap");
     }
 
-    /// The concurrent case: signal the cancel while the wait is (or is about to be) in flight. The
-    /// manual-reset event is set-once/released-forever, so EVERY interleaving must release the
-    /// watcher; this is race-INSENSITIVITY being proven, not an outcome bet on a race. If the
-    /// release were broken, the join would hang until a nextest override ends it as a failure.
+    /// A cancel signalled while the wait is, or is about to be, in flight releases it. The
+    /// manual-reset event stays set once signalled, so every interleaving releases the watcher.
     #[skuld::test]
     fn cancel_event_signaled_mid_wait_releases_the_blocking_wait() {
         let (child, _stdin, id) = blocker();

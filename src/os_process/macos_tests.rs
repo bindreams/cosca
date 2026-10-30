@@ -30,7 +30,6 @@ fn an_unfired_watch_reads_nothing() {
     assert!(!watch.block(expired()).unwrap());
 }
 
-/// Mutant: `block` forgets the event it read.
 #[skuld::test]
 fn block_remembers_the_event_it_read() {
     let (mut rx, mut tx, watch) = pipe_watch();
@@ -41,7 +40,6 @@ fn block_remembers_the_event_it_read() {
     assert!(watch.drain().unwrap());
 }
 
-/// Mutant: `drain` forgets the event it read.
 #[skuld::test]
 fn drain_remembers_the_event_it_read() {
     let (mut rx, mut tx, watch) = pipe_watch();
@@ -56,7 +54,6 @@ fn drain_remembers_the_event_it_read() {
     );
 }
 
-/// Mutant: `block` records no armed wait.
 #[skuld::test]
 fn block_records_a_wait_it_arms() {
     let (_rx, _tx, watch) = pipe_watch();
@@ -75,7 +72,6 @@ fn blocker() -> (std::process::Child, ProcessId) {
     (child, id)
 }
 
-/// Mutant: `exited` calls a live process exited, or `signal` signals nothing.
 #[skuld::test]
 fn open_live_then_kill_then_exited() {
     let (mut child, id) = blocker();
@@ -117,7 +113,6 @@ fn a_kill_opens_no_watch_and_still_kills() {
     assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGKILL));
 }
 
-/// Review Focus 1. Mutant: `open` trusts the pid and not the start token.
 #[skuld::test]
 fn open_with_wrong_start_token_is_none_and_sends_nothing() {
     let (mut child, id) = blocker();
@@ -137,7 +132,6 @@ fn open_with_wrong_start_token_is_none_and_sends_nothing() {
     child.wait().unwrap();
 }
 
-/// Mutant: `open` hands out an object for a reaped process.
 #[skuld::test]
 fn open_after_reap_is_none() {
     let (mut child, id) = blocker();
@@ -146,7 +140,7 @@ fn open_after_reap_is_none() {
     assert!(open(id, Op::Wait).unwrap().is_none());
 }
 
-/// Review Focus 2. Mutant: the first look blocks, or misses an exit the watch already holds.
+/// Mutant: the first look blocks, or misses an exit the watch already holds.
 #[skuld::test]
 fn exited_before_first_look_returns_true() {
     let (mut child, id) = blocker();
@@ -176,7 +170,7 @@ fn exited_stays_true_after_a_wait_consumed_the_event() {
     child.wait().unwrap();
 }
 
-/// Review Focus 3. The blocker `exec`s itself into `cat` after `open`, which changes its
+/// The blocker `exec`s itself into `cat` after `open`, which changes its
 /// `p_idversion`. Mutant: `ESRCH` is read as "gone", so the process survives `signal`.
 #[skuld::test]
 fn signal_reaches_a_process_that_execed_after_open() {

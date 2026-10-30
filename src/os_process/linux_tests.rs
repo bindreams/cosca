@@ -13,7 +13,6 @@ fn blocker() -> (crate::Child, std::io::PipeWriter, ProcessId) {
     (child, stdin, id)
 }
 
-/// Mutant: `exited` calls a live process exited, or `signal` signals nothing.
 #[skuld::test]
 fn open_live_then_kill_then_exited() {
     let (child, _stdin, id) = blocker();
@@ -25,7 +24,6 @@ fn open_live_then_kill_then_exited() {
     child.wait().unwrap();
 }
 
-/// Mutant: `open` hands out an object for a reaped process.
 #[skuld::test]
 fn open_after_reap_is_none() {
     let (child, _stdin, id) = blocker();
@@ -34,7 +32,6 @@ fn open_after_reap_is_none() {
     assert!(open(id, Op::Wait).unwrap().is_none());
 }
 
-/// Review Focus 1. Mutant: `open` trusts the pid and not the start token.
 #[skuld::test]
 fn open_with_wrong_start_token_is_none_and_sends_nothing() {
     let (child, _stdin, id) = blocker();
@@ -47,7 +44,6 @@ fn open_with_wrong_start_token_is_none_and_sends_nothing() {
     child.wait().unwrap();
 }
 
-/// Review Focus 2. Mutant: the first look blocks, or misses a zombie.
 #[skuld::test]
 fn exited_before_first_look_returns_true() {
     let (child, _stdin, id) = blocker();
@@ -104,7 +100,6 @@ fn terminate_by_id_sends_sigterm_and_the_blocker_exits() {
     );
 }
 
-/// Mutant: `kill_by_id` sends `SIGTERM`, or opens and drops without signalling.
 #[skuld::test]
 fn kill_by_id_sends_sigkill_and_the_blocker_exits() {
     use std::os::unix::process::ExitStatusExt;
@@ -116,7 +111,6 @@ fn kill_by_id_sends_sigkill_and_the_blocker_exits() {
     );
 }
 
-/// Mutant: a stale identity or a reaped process is an error, or is signalled.
 #[skuld::test]
 fn by_id_helpers_on_a_gone_process_are_ok() {
     let (child, _stdin, id) = blocker();

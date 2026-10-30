@@ -130,9 +130,8 @@ fn open_held(
         Opened::Gone => return Ok(None), // no such pid => exited
         // Denied on a LIVE process => a real failure: reporting "exited" would let a
         // supervisor conclude a healthy service had died, and an Unknown liveness must NOT be
-        // reported as a successful kill. The error comes from the classifier, not
-        // `last_os_error()`: `is_alive()` below runs a whole open/query/wait cycle that would
-        // overwrite the thread-s last-error first.
+        // reported as a successful kill. The error comes from the classifier: `is_alive()` below
+        // overwrites the thread's last-error.
         Opened::Denied(e) => {
             return match id.is_alive() {
                 Liveness::Dead => Ok(None),
@@ -224,31 +223,15 @@ pub(crate) fn wait_process_or_cancel(
     }
 }
 
-/// Test-only seam proving a root-only watch on an already-reaped root never reaches a live
-/// target — immediately, never by elapsed time. A `WAIT_TIMEOUT`-based counter could only ever
-/// be told apart from correct code by how long the call ran, which would make elapsed time the
-/// real assertion.
+/// Test-only seam proving, immediately and never by elapsed time, that a wait is not entered on a
+/// still-alive target.
 ///
-/// An already-reaped root does not pin down WHICH of `open_verified`'s three
-/// outcomes it lands on (`Opened::Gone`, an already-signalled `HandleIdentity::Same`, or
-/// `HandleIdentity::Different` — the last only if the OS recycles the pid in the window before
-/// the watch opens it), so this alone does not deterministically prove the `Different` mutant is
-/// caught. `exited_by_id_resolves_immediately_on_an_identity_mismatch`
-/// (`src/tokio/wait_tests.rs`) proves that one directly: a genuinely live child watched under an
-/// identity naming the same pid but a wrong start token is `Different` on every run.
-///
-/// The call site (`wait_process_or_cancel`, just before the real wait) only polls and acts
-/// when [`is_armed`] is true. `wait_process_or_cancel` is the SAME function every other
-/// grace-wait test in the binary reaches, several of them precisely to watch a genuinely
-/// still-alive target run its real wait to completion (e.g.
-/// `exited_by_id_true_when_child_dies_mid_wait`); gating on `is_armed` is what keeps this seam
-/// from force-releasing THEIR waits too. Only once armed does it do a non-blocking
-/// `WaitForSingleObject(handle, 0)` on the TARGET — not `cancel` — the instant before the real
-/// wait would be entered. If that target is not ALREADY signaled (the process has not already
-/// exited), this is exactly the regression shape this test exists to catch: a real wait is
-/// about to be genuinely entered on a live target. [`notify_armed_unsignalled`] fires, and the
-/// call site immediately force-signals `cancel` so the real wait that follows returns at once
-/// instead of genuinely spending the grace — a caught bug fails fast, not slow.
+/// The call site (`wait_process_or_cancel`, just before the real wait) polls and acts only when
+/// [`is_armed`] is true, so the other tests that watch a live target through the same function run
+/// their real waits to completion. Armed, it does a non-blocking `WaitForSingleObject(handle, 0)`
+/// on the target, not `cancel`. A target that is not already signalled is the regression this
+/// seam catches: [`notify_armed_unsignalled`] fires, and the call site force-signals `cancel` so
+/// the real wait returns at once. A caught bug fails fast, not slow.
 ///
 /// A [`crate::relayed_probe`]. `cancellable_blocking` relays it to the blocking-pool thread; a
 /// process-global slot would force-cancel an unrelated test's wait.

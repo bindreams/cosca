@@ -2,11 +2,9 @@
 //! registered with the reactor (`AsyncFd`); macOS: a kqueue `EVFILT_PROC|NOTE_EXIT` filter is
 //! armed and its kqueue fd registered; Windows has no pollable process handle, so
 //! [`cancellable_blocking`] waits on the process handle AND a cancel event that a drop-guard
-//! signals — a dropped wait releases its watcher promptly on every platform. The grace bound (on
-//! Unix `tokio::time::timeout_at`, via [`arm_at`], armed with the caller's deadline instant; the
-//! kernel wait's timeout on Windows) is a failure bound on a genuine external event: the child's
-//! exit. Unix needs the runtime's IO + time drivers (tokio panics otherwise) — documented on the
-//! public graceful methods. The process-exit wait itself is [`crate::tokio::drive`].
+//! signals — a dropped wait releases its watcher promptly on every platform. The process-exit wait
+//! itself, and its deadline, are in [`crate::tokio::drive`]. Unix needs the runtime's IO + time
+//! drivers (tokio panics otherwise) — documented on the public graceful methods.
 
 use std::time::Duration;
 
@@ -169,7 +167,7 @@ pub(crate) async fn pidfd_exited_within(pidfd: std::os::fd::BorrowedFd<'_>, grac
         Some(Some(at)) => match arm_at(at, watch_pidfd(watched)).await {
             Some(watch) => watch.map(|()| true),
             // The timer can win the first poll before the reactor reports an exit that was already
-            // pending: answer from one final non-blocking look, as `tokio::drive::exited_by` does.
+            // pending: answer from one final non-blocking look.
             None => crate::wait::poll_pidfd_exit(pidfd, crate::wait::deadline_from(Duration::ZERO)).map_err(Error::Io),
         },
         _ => watch_pidfd(watched).await.map(|()| true),
@@ -256,10 +254,9 @@ where
 /// `fdmarker`'s module doc), and this future stays genuinely asleep until that descriptor
 /// closes. A caller that wants such a writer to make forward progress toward closing the
 /// descriptor cannot get that from this primitive; a caller that merely wants a time bound on
-/// the wait itself can still bound it with a deadline instant (`tokio::drive::exited_by` does
-/// this in `tokio::drive`: `deadline_from`, then `arm_at`; outside the crate,
-/// `tokio::time::timeout_at`) — that bounds the CALLER's patience, not the writer's blocked
-/// state.
+/// the wait itself can still bound it with a deadline instant (see [`crate::tokio::drive`] for
+/// the deadline; outside the crate, `tokio::time::timeout_at`) — that bounds the CALLER's
+/// patience, not the writer's blocked state.
 ///
 /// Exited is not reaped: this says nothing about statuses. A caller wanting a status waits on
 /// the root as well.
@@ -277,8 +274,7 @@ pub(crate) async fn wait_tree_drained(read_end: std::os::fd::BorrowedFd<'_>) -> 
 /// Deadline-bounded, [`TreeDrain`](crate::containment::TreeDrain)-returning wrapper over
 /// [`wait_tree_drained_inner`] — the macOS arm of `tokio::Child::wait_tree`/`wait_tree_timeout`.
 /// `Duration::ZERO` delegates to the sync backend's one-shot, non-blocking probe (safe to call
-/// directly from async code), as `tokio::drive::exited_by` makes a `Duration::ZERO` one look with
-/// no wait.
+/// directly from async code).
 ///
 /// The bounded arm (`Some(d)`) arms with `unbounded_wait: false` — computed the same way the
 /// sync backend's `block_until_drained` does (`crate::wait::remaining(deadline).is_none()`,
@@ -289,8 +285,7 @@ pub(crate) async fn wait_tree_drained(read_end: std::os::fd::BorrowedFd<'_>) -> 
 /// the risk), and `interpret_read_event` would stop draining a sustained writer at the low-water
 /// clamp, so a bounded wait could only ever expire into `MembersRemain` where the sync call
 /// drains through to the real edge. [`arm_at`] still supplies the actual bound, armed with the
-/// caller's deadline instant — the same pattern `tokio::drive::exited_by` uses — this only
-/// fixes what the ARMED kqueue itself is told.
+/// caller's deadline instant; this only fixes what the ARMED kqueue itself is told.
 #[cfg(target_os = "macos")]
 pub(crate) async fn wait_tree_deadline(
     read_end: std::os::fd::BorrowedFd<'_>,
@@ -308,7 +303,7 @@ pub(crate) async fn wait_tree_deadline(
             }
             match arm_at(at, wait_tree_drained_inner(read_end, false, None)).await {
                 Some(res) => res.map(|()| TreeDrain::AllMarkersClosed),
-                // As in `tokio::drive::exited_by`: one final probe, so an EOF already pending is not missed.
+                // One final probe, so an EOF already pending is not missed.
                 None => crate::containment::marker_eof::probe(read_end),
             }
         }
@@ -529,7 +524,7 @@ async fn job_wait_tree_drained(
     // The kernel wait runs on the real clock, not tokio's.
     let deadline = to_real_clock(deadline);
     // Duration::ZERO delegates to the sync one-shot probe — no thread-pool hop needed for a
-    // call that cannot block (mirrors `tokio::drive::exited_by`'s zero-timeout look).
+    // call that cannot block.
     if crate::wait::remaining(deadline) == Some(std::time::Duration::ZERO) {
         return job.wait_drained(deadline, None);
     }

@@ -331,10 +331,8 @@ async fn death_watch_loop_survives_a_non_exit_drain_cycle() {
     decoy.wait().expect("reap decoy");
 }
 
-// The POLLERR branch and the readiness contract, via synthetic Ready values — these pin the
-// BRANCH LOGIC only. The real OS→Ready mapping (pidfd → epoll → mio → AsyncFd) is validated
-// by the live-path tests above: exited_by_id_true_for_exited_unreaped_child and
-// exited_by_id_true_when_child_dies_mid_wait run the whole stack on a real pidfd.
+// The POLLERR branch and the readiness contract, via synthetic `Ready` values: they pin the branch
+// logic only. The live-path tests above run the real pidfd -> epoll -> mio -> `AsyncFd` mapping.
 #[cfg(target_os = "linux")]
 mod classify {
     use ::tokio::io::Ready;
@@ -559,16 +557,9 @@ fn the_relayed_observer_does_not_outlive_its_blocking_call() {
     });
 }
 
-// `HandleIdentity::Different` is one of three outcomes `open` can land on
-// when watching an already-reaped root — see
-// `windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reaped`'s own doc for why
-// that test alone cannot pin this ONE down: `Opened::Gone` returns before any handle exists, and
-// a live-but-already-signalled `Same` never reaches `armed_probe`'s poll either, so `Different`
-// is possible there only if the OS happens to recycle the pid in the window between the test
-// killing its root and this watch opening it. This test pins `Different` down directly and
-// deterministically instead: a genuinely LIVE child, watched under an identity naming the SAME
-// pid but a WRONG start token, is `Opened::Found` + `HandleIdentity::Different` on every run —
-// no dependence on OS pid-recycling timing.
+// A live child watched under an identity naming its pid but a wrong start token is `Opened::Found`
+// + `HandleIdentity::Different` on every run, with no dependence on pid-recycling timing. The
+// watch resolves as exited without reaching the real wait.
 #[cfg(windows)]
 #[skuld::test]
 async fn exited_by_id_resolves_immediately_on_an_identity_mismatch() {

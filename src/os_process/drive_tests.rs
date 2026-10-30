@@ -10,7 +10,6 @@ fn fake(exits: impl IntoIterator<Item = Answer>) -> FakeProcess {
     FakeProcess::new(ProcessId::current(), exits)
 }
 
-/// Mutant: block at a zero timeout, or look a second time.
 #[skuld::test]
 fn zero_timeout_looks_once_and_never_blocks() {
     block_probe::take();
@@ -34,7 +33,6 @@ fn a_failed_look_is_returned_without_blocking() {
     assert!(block_probe::take().is_empty());
 }
 
-/// Mutant: block before looking, or after an `Exited` look.
 #[skuld::test]
 fn exited_before_first_look_returns_true_without_blocking() {
     block_probe::take();
@@ -44,7 +42,6 @@ fn exited_before_first_look_returns_true_without_blocking() {
     assert!(block_probe::take().is_empty());
 }
 
-/// Mutant: trust the wake as the answer instead of looking again.
 #[skuld::test]
 fn wakes_and_looks_again() {
     block_probe::take();
@@ -55,7 +52,6 @@ fn wakes_and_looks_again() {
     assert_eq!(block_probe::take().len(), 1, "one wait, between the two looks");
 }
 
-/// Mutant: answer `false` on the expiry itself, without a look after the deadline.
 #[skuld::test]
 fn expiry_ends_in_one_final_look() {
     block_probe::take();
@@ -92,7 +88,6 @@ fn duration_max_is_unbounded() {
     );
 }
 
-/// Mutant: look before taking the seam.
 #[skuld::test]
 fn forced_watch_error_is_returned_before_looking() {
     let mut p = fake([Answer::Exited]);
@@ -102,7 +97,6 @@ fn forced_watch_error_is_returned_before_looking() {
     assert!(!fault::armed(), "the seam is consumed");
 }
 
-/// Mutant: drop the assert from `exited_by`.
 #[cfg(feature = "tokio")]
 #[skuld::test]
 #[should_panic(expected = "would block inside an async Drop")]
