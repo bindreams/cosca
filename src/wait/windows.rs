@@ -46,7 +46,7 @@ fn holds_process(handle: HANDLE, id: ProcessId) -> Result<bool, Error> {
 }
 
 /// An unnamed manual-reset event, initially unsignaled, for releasing
-/// [`wait_handle_or_cancel`] early. Signal with [`signal_cancel`]; `OwnedHandle` closes it.
+/// [`wait_process_or_cancel`] early. Signal with [`signal_cancel`]; `OwnedHandle` closes it.
 // consumers: tokio::drive and the async raw backend (tokio::spawn::windows_raw).
 #[cfg_attr(
     not(feature = "tokio"),
@@ -166,7 +166,7 @@ fn open_held(
     not(feature = "tokio"),
     allow(dead_code, reason = "only consumer is the async driver, behind the tokio feature")
 )]
-pub(crate) fn wait_handle_or_cancel(
+pub(crate) fn wait_process_or_cancel(
     process: BorrowedHandle<'_>,
     deadline: Option<Instant>,
     cancel: &OwnedHandle,
@@ -237,8 +237,8 @@ pub(crate) fn wait_handle_or_cancel(
 /// (`src/tokio/wait_tests.rs`) proves that one directly: a genuinely live child watched under an
 /// identity naming the same pid but a wrong start token is `Different` on every run.
 ///
-/// The call site (`wait_handle_or_cancel`, just before the real wait) only polls and acts
-/// when [`is_armed`] is true. `wait_handle_or_cancel` is the SAME function every other
+/// The call site (`wait_process_or_cancel`, just before the real wait) only polls and acts
+/// when [`is_armed`] is true. `wait_process_or_cancel` is the SAME function every other
 /// grace-wait test in the binary reaches, several of them precisely to watch a genuinely
 /// still-alive target run its real wait to completion (e.g.
 /// `exited_by_id_true_when_child_dies_mid_wait`); gating on `is_armed` is what keeps this seam
@@ -277,7 +277,7 @@ pub(crate) mod armed_probe {
 
     /// Whether the CURRENT thread has an observer installed — gates the call site's poll and
     /// forced cancel so they run only for the one test that opted in, never for any other
-    /// caller of `wait_handle_or_cancel` in the same binary or on another thread.
+    /// caller of `wait_process_or_cancel` in the same binary or on another thread.
     pub(crate) fn is_armed() -> bool {
         relayed_probe::is_installed::<Armed>()
     }

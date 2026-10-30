@@ -134,19 +134,19 @@ mod waits {
         _ = crate::containment::windows::wait_drained_raw(raw, Some(Some(std::time::Instant::now())), None);
     }
 
-    /// `wait_handle_or_cancel`, the cancellable twin.
+    /// `wait_process_or_cancel`, the cancellable twin.
     ///
-    /// Mutant: drop the assert from `wait_handle_or_cancel`.
+    /// Mutant: drop the assert from `wait_process_or_cancel`.
     #[cfg(windows)]
     #[skuld::test]
     #[should_panic(expected = "would block inside an async Drop")]
-    fn wait_handle_or_cancel_refuses_inside_a_section() {
+    fn wait_process_or_cancel_refuses_inside_a_section() {
         let cancel = crate::wait::backend::new_cancel_event().expect("event");
         let process = crate::os_process::open(crate::identity::ProcessId::current(), crate::os_process::Op::Wait)
             .expect("open")
             .expect("the current process opens");
         let _section = Section::enter();
-        _ = crate::wait::backend::wait_handle_or_cancel(
+        _ = crate::wait::backend::wait_process_or_cancel(
             process.os_handle().expect("a Windows process has a handle"),
             Some(std::time::Instant::now()),
             &cancel,

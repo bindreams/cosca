@@ -112,7 +112,7 @@ async fn wait(wait_for: &WaitFor<'_>, deadline: Option<Option<std::time::Instant
     let process = process.try_clone_to_owned().map_err(Error::Io)?;
     let deadline = deadline.flatten();
     crate::tokio::wait::cancellable_blocking("process wait watcher", move |cancel| {
-        crate::wait::backend::wait_handle_or_cancel(process.as_handle(), deadline, cancel)
+        crate::wait::backend::wait_process_or_cancel(process.as_handle(), deadline, cancel)
     })
     .await?;
     Ok(true)

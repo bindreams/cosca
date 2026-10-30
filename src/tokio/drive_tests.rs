@@ -168,14 +168,14 @@ fn async_waits_are_send() {
 
 #[cfg(windows)]
 mod windows {
-    //! The blocking half of the Windows arm, `wait_handle_or_cancel`: the cancel-race tests that
+    //! The blocking half of the Windows arm, `wait_process_or_cancel`: the cancel-race tests that
     //! covered the old cancellable wait, with the same assertions, now run on the handle an
     //! `OsProcess` hands out.
 
     use std::time::{Duration, Instant};
 
     use crate::os_process::{open, Op};
-    use crate::wait::backend::{new_cancel_event, signal_cancel, wait_handle_or_cancel};
+    use crate::wait::backend::{new_cancel_event, signal_cancel, wait_process_or_cancel};
     use crate::wait::test_clock::FrozenClockGuard;
     use crate::wait::wait_ms_probe;
     use crate::wait::{remaining_override_seam, wait_clamp_seam};
@@ -193,7 +193,7 @@ mod windows {
         wait_ms_probe::take();
         let _override = remaining_override_seam::set(Duration::from_micros(500));
         let deadline = at + Duration::from_millis(5);
-        let result = wait_handle_or_cancel(process.os_handle().unwrap(), Some(deadline), &cancel);
+        let result = wait_process_or_cancel(process.os_handle().unwrap(), Some(deadline), &cancel);
         let reached = Instant::now() >= deadline;
         let arms = wait_ms_probe::take();
         drop(stdin);
@@ -225,7 +225,7 @@ mod windows {
         wait_ms_probe::take();
         let _override = remaining_override_seam::set(Duration::from_micros(500));
         wait_ms_probe::on_second_arm(move || drop(stdin));
-        let result = wait_handle_or_cancel(
+        let result = wait_process_or_cancel(
             process.os_handle().unwrap(),
             Some(Instant::now() + Duration::from_secs(3600)),
             &cancel,
@@ -249,7 +249,7 @@ mod windows {
         wait_ms_probe::take();
         let _clamp = wait_clamp_seam::set(5);
         wait_ms_probe::on_second_arm(move || drop(stdin));
-        let result = wait_handle_or_cancel(
+        let result = wait_process_or_cancel(
             process.os_handle().unwrap(),
             Some(Instant::now() + Duration::from_secs(3600)),
             &cancel,
@@ -270,7 +270,7 @@ mod windows {
         let process = open(id, Op::Wait).unwrap().expect("a live process opens");
         let cancel = new_cancel_event().expect("event");
         signal_cancel(&cancel);
-        let exited = wait_handle_or_cancel(process.os_handle().unwrap(), None, &cancel).expect("cancellable wait");
+        let exited = wait_process_or_cancel(process.os_handle().unwrap(), None, &cancel).expect("cancellable wait");
         assert!(!exited, "a live child with a signaled cancel must report still-alive");
         child.kill().expect("cleanup");
         child.wait().expect("reap");
@@ -287,7 +287,7 @@ mod windows {
         let cancel = std::sync::Arc::new(new_cancel_event().expect("event"));
         let handle = process.os_handle().unwrap();
         let exited = std::thread::scope(|scope| {
-            let watcher = scope.spawn(|| wait_handle_or_cancel(handle, None, &cancel));
+            let watcher = scope.spawn(|| wait_process_or_cancel(handle, None, &cancel));
             signal_cancel(&cancel);
             watcher.join().expect("watcher thread").expect("cancellable wait")
         });
