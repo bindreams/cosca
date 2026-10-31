@@ -35,6 +35,10 @@ use macos as backend;
 #[cfg(windows)]
 use windows as backend;
 
+/// Opens a spawned child's pidfd the way `SharedChild::adopt` does; tests that adopt a child call it.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use linux::open_own_child;
+
 /// The second peek-and-consume every first reap on macOS is followed by; tests drive it directly.
 #[cfg(all(target_os = "macos", test))]
 pub(crate) use macos::second_reap;

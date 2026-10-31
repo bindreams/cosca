@@ -355,7 +355,7 @@ pub(crate) fn routes_to_raw_backend(cmd: &Command) -> bool {
 pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<Child, SpawnFailure> {
     // Before anything is made or forked: a pidfd that is refused means no child, and no leaf.
     #[cfg(target_os = "linux")]
-    crate::wait::backend::probe_pidfd_support().not_started()?;
+    crate::os_process::linux::probe_pidfd_support().not_started()?;
     // Read the routing rule BEFORE the take, which empties the map the rule reads. Evaluated
     // after, it would collapse to "does it have an executable()", and a high-descriptor-only
     // command would take the std path — whose fd >= 3 collection is unix-only, so the

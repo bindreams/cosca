@@ -178,7 +178,7 @@ impl SharedChild {
     ) -> Result<SharedChild, (Error, std::process::Child)> {
         debug_assert_eq!(child.id(), id.pid(), "the identity must be the child's");
         #[cfg(target_os = "linux")]
-        let pidfd = match crate::wait::backend::open_own_child(id.pid(), Some(id)) {
+        let pidfd = match crate::wait::exit_only::open_own_child(id.pid(), Some(id)) {
             Ok(pidfd) => pidfd,
             Err(e) => return Err((e, child)),
         };

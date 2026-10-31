@@ -42,7 +42,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
 
     // Before anything is made or forked: a pidfd that is refused means no child, and no leaf.
     #[cfg(target_os = "linux")]
-    crate::wait::backend::probe_pidfd_support().not_started()?;
+    crate::os_process::linux::probe_pidfd_support().not_started()?;
 
     let kill_on_drop = cmd.kill_on_drop_flag();
 

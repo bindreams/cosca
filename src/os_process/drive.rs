@@ -63,7 +63,7 @@ fn block(wait_for: &WaitFor<'_>, deadline: Option<Option<Instant>>) -> Result<()
     match wait_for {
         #[cfg(target_os = "linux")]
         WaitFor::Readable(pidfd) => {
-            crate::wait::poll_pidfd_exit(*pidfd, deadline).map_err(Error::Io)?;
+            crate::os_process::linux::poll_pidfd_exit(*pidfd, deadline).map_err(Error::Io)?;
         }
         #[cfg(target_os = "macos")]
         WaitFor::Kqueue(watch) => {

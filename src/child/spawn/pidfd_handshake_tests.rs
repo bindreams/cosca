@@ -116,7 +116,7 @@ fn a_refused_probe_fails_unsupported_and_forks_nothing() {
     ] {
         let (mut cmd, reader) = marker_command();
         fault::reset_spawns();
-        let forced = crate::wait::backend::fault::force_pidfd_open_errno_once(errno);
+        let forced = crate::os_process::linux::open::fault::force_pidfd_open_errno_once(errno);
         let err = cmd.spawn().err();
         drop(forced);
 
@@ -141,7 +141,7 @@ fn a_refused_probe_fails_unsupported_and_forks_nothing() {
 fn a_probe_that_hits_emfile_fails_io_and_forks_nothing() {
     let (mut cmd, reader) = marker_command();
     fault::reset_spawns();
-    let forced = crate::wait::backend::fault::force_pidfd_open_errno_once(Errno::MFILE);
+    let forced = crate::os_process::linux::open::fault::force_pidfd_open_errno_once(Errno::MFILE);
     let err = cmd.spawn().err();
     drop(forced);
 
@@ -164,7 +164,7 @@ fn emfile_in_the_child_fails_io_and_the_program_never_runs() {
     let (mut cmd, reader) = marker_command();
     fault::reset_spawns();
     fault::reset_leaked_pid();
-    let forced = crate::wait::backend::fault::force_pidfd_open_script([None, Some(Errno::MFILE)]);
+    let forced = crate::os_process::linux::open::fault::force_pidfd_open_script([None, Some(Errno::MFILE)]);
     let err = cmd.spawn().err();
     drop(forced);
 
@@ -184,7 +184,7 @@ fn emfile_in_the_child_fails_io_and_the_program_never_runs() {
 fn a_refusal_in_the_child_is_unsupported_and_the_program_never_runs() {
     let (mut cmd, reader) = marker_command();
     fault::reset_spawns();
-    let forced = crate::wait::backend::fault::force_pidfd_open_script([None, Some(Errno::PERM)]);
+    let forced = crate::os_process::linux::open::fault::force_pidfd_open_script([None, Some(Errno::PERM)]);
     let err = cmd.spawn().err();
     drop(forced);
 

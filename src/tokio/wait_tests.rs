@@ -375,14 +375,14 @@ async fn exited_by_id_unbounded_resolves_for_exited_unreaped_child() {
 /// The async watch reports a refused `pidfd_open` as `process wait`. The child is killed first so
 /// an unconsumed forced errno resolves the watch `Ok` and fails the assertion instead of hanging.
 ///
-/// Mutants: `open` names another `PidfdOp`; the forced errno is not consumed.
+/// Mutants: `open` names another `Op`; the forced errno is not consumed.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn exited_by_id_unbounded_names_process_wait_when_pidfd_open_is_refused() {
     let mut child = std_blocker();
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
     child.kill().expect("kill");
-    let forced = crate::wait::backend::fault::force_pidfd_open_errno_once(rustix::io::Errno::ACCESS);
+    let forced = crate::os_process::linux::open::fault::force_pidfd_open_errno_once(rustix::io::Errno::ACCESS);
     let result = exited_by_id(id, None).await;
     drop(forced);
     child.wait().expect("reap");

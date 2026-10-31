@@ -5,7 +5,7 @@ use crate::error::Error;
 use crate::identity::proc_view_fault::force_openat2_errno;
 use crate::identity::ProcessId;
 
-use super::PidfdOp;
+use crate::os_process::Op;
 
 fn assert_names_openat2(result: Result<Option<rustix::fd::OwnedFd>, Error>, errno_name: &str) {
     match result {
@@ -28,7 +28,7 @@ fn assert_names_openat2(result: Result<Option<rustix::fd::OwnedFd>, Error>, errn
 fn open_verified_is_unsupported_naming_openat2_when_it_is_unavailable() {
     for (errno, name) in [(rustix::io::Errno::NOSYS, "ENOSYS"), (rustix::io::Errno::PERM, "EPERM")] {
         let _forced = force_openat2_errno(errno);
-        assert_names_openat2(super::open_verified(ProcessId::current(), PidfdOp::Terminate), name);
+        assert_names_openat2(super::open_verified(ProcessId::current(), Op::Terminate), name);
     }
 }
 
@@ -38,5 +38,5 @@ fn open_verified_is_unsupported_naming_openat2_when_it_is_unavailable() {
 fn open_verified_without_a_pidfd_is_unsupported_naming_openat2_when_it_is_unavailable() {
     let _errno = super::fault::force_pidfd_open_errno_once(rustix::io::Errno::INVAL);
     let _forced = force_openat2_errno(rustix::io::Errno::NOSYS);
-    assert_names_openat2(super::open_verified(ProcessId::current(), PidfdOp::Terminate), "ENOSYS");
+    assert_names_openat2(super::open_verified(ProcessId::current(), Op::Terminate), "ENOSYS");
 }

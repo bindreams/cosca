@@ -353,7 +353,7 @@ fn pid1_uid() -> u32 {
     0
 }
 
-/// Mutants: the op is another `PidfdOp`; the forced errno is not consumed (no fallback, so no
+/// Mutants: the op is another `Op`; the forced errno is not consumed (no fallback, so no
 /// line).
 #[cfg(target_os = "linux")]
 #[skuld::test]
@@ -367,7 +367,7 @@ fn a_refused_pidfd_open_falls_back_to_kill_naming_group_teardown() {
     let id = ProcessId::of(child.pid()).found().expect("the live child resolves");
     let mark = crate::log_capture::mark();
 
-    let forced = crate::wait::backend::fault::force_pidfd_open_errno_once(rustix::io::Errno::PERM);
+    let forced = crate::os_process::linux::open::fault::force_pidfd_open_errno_once(rustix::io::Errno::PERM);
     let reached =
         super::check_or_signal_linux_sigkill(child.pid(), id, &crate::containment::GroupRoot::trusted_for_test());
     drop(forced);
@@ -403,7 +403,7 @@ fn a_transient_pidfd_open_failure_falls_back_to_kill_naming_the_syscall() {
     let id = ProcessId::of(child.pid()).found().expect("the live child resolves");
     let mark = crate::log_capture::mark();
 
-    let forced = crate::wait::backend::fault::force_pidfd_open_errno_once(rustix::io::Errno::MFILE);
+    let forced = crate::os_process::linux::open::fault::force_pidfd_open_errno_once(rustix::io::Errno::MFILE);
     let reached =
         super::check_or_signal_linux_sigkill(child.pid(), id, &crate::containment::GroupRoot::trusted_for_test());
     drop(forced);
@@ -442,7 +442,7 @@ fn the_by_number_fallback_resends_only_after_a_check_of_the_root() {
     let resend = |check: &dyn Fn() -> Result<(), String>| {
         let root = crate::containment::GroupRoot::new(None, check);
         let capture = Capture::start();
-        let forced = crate::wait::backend::fault::force_pidfd_open_errno_once(rustix::io::Errno::MFILE);
+        let forced = crate::os_process::linux::open::fault::force_pidfd_open_errno_once(rustix::io::Errno::MFILE);
         let reached = super::check_or_signal_linux_sigkill(child.pid(), id, &root);
         drop(forced);
         (reached, capture.group_steps())
@@ -494,7 +494,7 @@ fn a_live_non_leader_thread_member_is_unknown_and_never_falls_back_to_kill() {
     let id = ProcessId::of(tid).found().expect("the live worker's tid resolves");
     let mark = crate::log_capture::mark();
 
-    let forced = crate::wait::backend::fault::force_pidfd_open_errno_once(rustix::io::Errno::NOENT);
+    let forced = crate::os_process::linux::open::fault::force_pidfd_open_errno_once(rustix::io::Errno::NOENT);
     let reached =
         super::check_or_signal_linux_sigkill(child.pid(), id, &crate::containment::GroupRoot::trusted_for_test());
     drop(forced);

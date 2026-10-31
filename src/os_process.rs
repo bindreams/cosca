@@ -68,6 +68,9 @@ pub(crate) enum Op {
     /// Windows has no per-process graceful signal, so nothing opens for it there.
     #[cfg(unix)]
     Terminate,
+    /// Signalling a process-group member during teardown.
+    #[cfg(target_os = "linux")]
+    GroupTeardown,
 }
 
 /// What [`OsProcess::exited`] returns on an object [`open`]ed for a signal, which holds nothing to
@@ -83,8 +86,9 @@ fn opened_for_a_signal() -> Error {
 /// Open the process `id` names. `Ok(None)`: it is gone, or its pid now names another process.
 pub(crate) fn open(id: ProcessId, op: Op) -> Result<Option<Box<dyn OsProcess>>, Error> {
     #[cfg(target_os = "linux")]
-    return Ok(crate::wait::backend::open_verified(id, op.into())?
-        .map(|pidfd| Box::new(linux::LinuxProcess::new(id, pidfd)) as Box<dyn OsProcess>));
+    return Ok(
+        linux::open_verified(id, op)?.map(|pidfd| Box::new(linux::LinuxProcess::new(id, pidfd)) as Box<dyn OsProcess>)
+    );
     #[cfg(windows)]
     return Ok(windows::WindowsProcess::open(id, op)?.map(|p| Box::new(p) as Box<dyn OsProcess>));
     #[cfg(target_os = "macos")]
@@ -116,15 +120,4 @@ fn signal_by_id(id: ProcessId, op: Op, sig: Sig) -> Result<(), Error> {
     };
     // `Gone` and `Delivered` are both success: nothing is left for the caller to do.
     process.signal(sig).map(|_: Sent| ())
-}
-
-#[cfg(target_os = "linux")]
-impl From<Op> for crate::wait::backend::PidfdOp {
-    fn from(op: Op) -> Self {
-        match op {
-            Op::Wait => Self::Wait,
-            Op::Kill => Self::Kill,
-            Op::Terminate => Self::Terminate,
-        }
-    }
 }

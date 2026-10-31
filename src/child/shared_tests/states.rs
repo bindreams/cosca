@@ -135,7 +135,7 @@ fn a_second_wait_blocks_behind_the_holder() {
 #[skuld::test]
 fn adopt_on_esrch_takes_the_echild_path() {
     super::fixtures::assert_adoption_is_gone(|| {
-        crate::wait::backend::fault::force_pidfd_open_errno_once(rustix::io::Errno::SRCH)
+        crate::os_process::linux::open::fault::force_pidfd_open_errno_once(rustix::io::Errno::SRCH)
     });
 }
 

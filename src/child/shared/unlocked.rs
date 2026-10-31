@@ -54,7 +54,7 @@ impl SharedChild {
         };
         #[cfg(test)]
         exit_only::seams::step(exit_only::seams::HolderStep::Poll);
-        if crate::wait::poll_pidfd_exit(pidfd.as_fd(), deadline.map(Some))? {
+        if crate::os_process::linux::poll_pidfd_exit(pidfd.as_fd(), deadline.map(Some))? {
             return Ok(Unlocked::ExitSeen);
         }
         // Expired: one final peek.
