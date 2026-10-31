@@ -777,7 +777,7 @@ fn watch_macos(listener: &std::net::TcpListener, target: crate::identity::Proces
     }
 }
 
-/// Windows: the crate's own identity-verified [`crate::os_process::linux::open_verified`] process
+/// Windows: the crate's own identity-verified [`crate::wait::backend::open_verified`] process
 /// handle and the listener's `FD_ACCEPT` event (via `WSAEventSelect`) in one explicit
 /// `WaitForMultipleObjects`.
 #[cfg(windows)]
