@@ -283,7 +283,7 @@ fn zombie_record(pid: cosca::identity::RawPid) -> libc::siginfo_t {
             return si;
         }
         // EINTR is a restart, not a failure — the codebase's convention for every blocking
-        // syscall (see `wait/macos.rs`, `identity/macos/kinfo.rs`).
+        // syscall (see `os_process/macos/kqueue.rs`, `identity/macos/kinfo.rs`).
         let e = std::io::Error::last_os_error();
         assert_eq!(
             e.raw_os_error(),

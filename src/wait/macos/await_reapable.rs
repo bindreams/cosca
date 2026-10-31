@@ -388,3 +388,7 @@ pub(crate) fn await_reapable(pid: u32, unique: Option<u64>, deadline: Option<Ins
     let kq = Kqueue::new().map_err(io::Error::from)?;
     await_reapable_on(&kq, pid, unique, deadline)
 }
+
+#[cfg(test)]
+#[path = "await_reapable_tests.rs"]
+mod await_reapable_tests;

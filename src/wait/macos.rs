@@ -18,7 +18,3 @@ pub(crate) use tracer_watch::seams as tracer_seams;
 #[cfg(feature = "tokio")]
 pub(crate) use tracer_watch::WalkError;
 pub(crate) use tracer_watch::{OnTracer, TracerWatch};
-
-#[cfg(test)]
-#[path = "macos_tests.rs"]
-mod macos_tests;

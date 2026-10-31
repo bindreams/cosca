@@ -26,7 +26,8 @@
 //! `identity/persist_tests.rs`) and every other `--lib`-binary fork site that could race a
 //! marker-holding test here — `src/process/graceful_tests.rs`,
 //! `src/tokio/process/graceful_tests.rs`, `src/containment/unix_tests.rs`,
-//! `src/wait/macos_tests.rs`, `src/containment/dispatch_tests.rs`, `src/tokio/wait_tests.rs` —
+//! `src/os_process/macos_tests.rs`, `src/os_process/macos/kqueue_tests.rs`,
+//! `src/wait/macos/await_reapable_tests.rs`, `src/containment/dispatch_tests.rs`, `src/tokio/wait_tests.rs` —
 //! also take `spawn_lock()` around their own `std::process::Command::spawn()`/`.output()`
 //! calls, for exactly the reason the paragraph above states: any of those forking while THIS
 //! module's tests hold a marker write end open could otherwise transiently inherit it, and a

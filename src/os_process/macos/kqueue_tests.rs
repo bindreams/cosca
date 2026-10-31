@@ -18,31 +18,6 @@ fn drain_reports_none_when_no_event_pending() {
     child.wait().expect("reap");
 }
 
-/// `kill(0, sig)` would signal the caller's ENTIRE process group, so pid 0 must never be signalled.
-/// Two independent layers stop it, and this pins the outer one: `open`'s flavor-17 read of the pid
-/// followed by `exists()`. `ProcessId::of(0)` resolves on macOS (`kernel_task`), but to a token that
-/// no caller-held identity matches, so a pid-0 identity is rejected as recycled, `open` is
-/// `Ok(None)`, and the signal is never formed — the test process, which is what `kill(0, ..)` would
-/// have killed, survives to make the assertion.
-///
-/// The inner layer, `probe::signal_target`, is defence in depth for a caller holding
-/// `kernel_task`'s *genuine* identity. It is not exercised here on purpose: a regression in
-/// it would SIGKILL the CI runner's process group rather than fail a test. Its own contract
-/// is pinned by `identity::probe::probe_tests::signal_target_is_the_guard_for_real_signals`.
-#[skuld::test]
-fn a_pid_zero_identity_never_reaches_kill() {
-    let bogus = crate::identity::ProcessId::from_parts_for_test(0, 1);
-    // Already-gone is success: the pid holds a process, but not the one named.
-    crate::os_process::kill_by_id(bogus).expect("a pid-0 identity resolves to a stranger, i.e. already gone");
-    crate::os_process::terminate_by_id(bogus).expect("same for the graceful signal");
-    // If either call had reached `kill(2)`, this process would have died with it.
-    assert_eq!(
-        crate::identity::ProcessId::current().is_alive(),
-        crate::identity::Liveness::Alive,
-        "the caller must have survived - nothing may signal process group 0"
-    );
-}
-
 /// `block_on_kqueue` with its frozen-clock advance dropped fails at the second round instead of
 /// re-arming forever.
 ///
@@ -84,30 +59,6 @@ fn block_on_kqueue_terminates_under_a_frozen_clock() {
     let deadline = Some(Some(at + Duration::from_millis(5)));
     let verdict = super::block_on_kqueue(&kq, deadline, true, |_, _| Ok(None)).expect("bounded wait");
     assert!(verdict, "an event-less wait ends by its deadline");
-}
-
-/// A deadline beyond XNU's `kevent` `tv_sec` limit still returns the child's exit. The child is
-/// ended from the round hook, so the exit is pending or imminent when `kevent` is called.
-///
-/// Mutant: drop the clamp in `kevent_timeout` -> `Io(EINVAL)` at once.
-#[skuld::test]
-fn a_deadline_beyond_the_kevent_limit_still_returns_the_exit() {
-    use std::time::Duration;
-
-    let mut child = crate::test_spawn::spawn(&mut crate::test_child::held_std_blocker(std::process::Stdio::null()))
-        .expect("spawn blocker");
-    let id = ProcessId::of(child.id()).found().expect("identity of live child");
-    let mut stdin = child.stdin.take();
-    let _hooks = super::test_hooks::HookGuard::install(move |_, _| drop(stdin.take()));
-    let exited = crate::os_process::drive::exited_by_id(id, Some(Duration::from_secs(u64::from(u32::MAX))))
-        .expect("a far deadline is not an error");
-    assert!(exited, "the child was ended, so the wait reports its exit");
-    assert_eq!(
-        super::test_hooks::requested_timeouts(),
-        [Some(Duration::from_secs(i32::MAX as u64))],
-        "one kevent, armed with the clamp"
-    );
-    child.wait().expect("reap");
 }
 
 /// A remaining time above the clamp is re-armed from the real deadline: every `kevent` gets at
