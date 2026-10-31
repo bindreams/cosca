@@ -12,7 +12,6 @@ use crate::identity::ProcessId;
 use crate::signal::{send_pidfd, Sent, Sig};
 
 pub(crate) mod open;
-pub(crate) use open::{open_verified, probe_pidfd_support, spawn_open_error};
 
 #[derive(Debug)]
 pub(crate) struct LinuxProcess {

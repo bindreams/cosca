@@ -256,7 +256,7 @@ async fn async_raw_refusals_before_create_process_did_not_start() {
 #[skuld::test]
 fn a_failed_start_kill_is_reported_as_its_win32_code() {
     use crate::tokio::spawn::windows_raw::RawAsyncChild;
-    let event = crate::os_process::windows::new_cancel_event().expect("create an event");
+    let event = crate::os_process::windows::cancel::new_cancel_event().expect("create an event");
     let child = RawAsyncChild::new(event);
     let err = child.start_kill().expect_err("an event cannot be terminated");
     let crate::error::Error::Io(err) = err else {

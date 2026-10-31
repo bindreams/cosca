@@ -18,20 +18,6 @@ use crate::identity::{windows_terminate_held, HandleIdentity, Liveness, Opened, 
 use crate::signal::{Sent, Sig};
 
 pub(crate) mod cancel;
-#[cfg(test)]
-#[cfg_attr(
-    not(feature = "tokio"),
-    allow(unused_imports, reason = "only consumers are the tokio tests")
-)]
-pub(crate) use cancel::armed_probe;
-#[cfg_attr(
-    not(feature = "tokio"),
-    allow(
-        unused_imports,
-        reason = "only consumers are the async driver and the async raw backend, behind the tokio feature"
-    )
-)]
-pub(crate) use cancel::{new_cancel_event, signal_cancel, wait_process_or_cancel};
 
 #[derive(Debug)]
 pub(crate) struct WindowsProcess {

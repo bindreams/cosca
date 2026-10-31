@@ -239,7 +239,7 @@ mod windows {
 
     use std::os::windows::io::BorrowedHandle;
 
-    use crate::os_process::windows::{new_cancel_event, signal_cancel, wait_process_or_cancel};
+    use crate::os_process::windows::cancel::{new_cancel_event, signal_cancel, wait_process_or_cancel};
     use crate::os_process::{open, Exit, Op, OsProcess, WaitFor};
     use crate::wait::test_clock::FrozenClockGuard;
     use crate::wait::wait_ms_probe;
@@ -375,7 +375,7 @@ mod windows {
 
         crate::tokio::test_runtime::assert_current_thread();
         let (tx, armed) = std::sync::mpsc::channel();
-        let _guard = crate::os_process::windows::armed_probe::install(tx);
+        let _guard = crate::os_process::windows::cancel::armed_probe::install(tx);
         let mut p = fake([Answer::Running, Answer::Exited]);
         assert!(super::drive(&mut p, super::absolute(None)).await.unwrap());
         assert_eq!(
@@ -396,7 +396,7 @@ mod windows {
 
         crate::tokio::test_runtime::assert_current_thread();
         let (tx, armed) = std::sync::mpsc::channel();
-        let _guard = crate::os_process::windows::armed_probe::install(tx);
+        let _guard = crate::os_process::windows::cancel::armed_probe::install(tx);
         let mut p = fake([Answer::Running, Answer::Running]);
         assert!(!super::drive(&mut p, super::absolute(None)).await.unwrap());
         assert_eq!(p.looks(), 2, "one look, one wait, one final look");

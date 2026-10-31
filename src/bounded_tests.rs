@@ -141,7 +141,7 @@ mod waits {
     #[skuld::test]
     #[should_panic(expected = "would block inside an async Drop")]
     fn wait_process_or_cancel_refuses_inside_a_section() {
-        let cancel = crate::os_process::windows::new_cancel_event().expect("event");
+        let cancel = crate::os_process::windows::cancel::new_cancel_event().expect("event");
         use crate::os_process::{Exit, WaitFor};
 
         let mut process = crate::os_process::open(crate::identity::ProcessId::current(), crate::os_process::Op::Wait)
@@ -151,6 +151,10 @@ mod waits {
             panic!("the current process is running");
         };
         let _section = Section::enter();
-        _ = crate::os_process::windows::wait_process_or_cancel(handle, Some(std::time::Instant::now()), &cancel);
+        _ = crate::os_process::windows::cancel::wait_process_or_cancel(
+            handle,
+            Some(std::time::Instant::now()),
+            &cancel,
+        );
     }
 }

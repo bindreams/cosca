@@ -151,7 +151,7 @@ fn signal_failure_carries_the_win32_code() {
     let mut p = super::WindowsProcess {
         id: ProcessId::current(),
         op: Op::Kill,
-        handle: super::new_cancel_event().expect("create an event handle"),
+        handle: super::cancel::new_cancel_event().expect("create an event handle"),
     };
     let err = p.signal(Sig::Kill).expect_err("an event cannot be terminated");
     let Error::Io(io) = err else {

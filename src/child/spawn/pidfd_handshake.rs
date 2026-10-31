@@ -675,7 +675,9 @@ fn help(parent_end: &OwnedFd, #[cfg(test)] seams: &fault::HelperSeams) -> Outcom
     seams.wait_verdict();
     let pidfd = match report {
         Ok(Report::Pidfd(pidfd)) => pidfd,
-        Ok(Report::Errno(errno)) => return Outcome::Failed(crate::os_process::linux::spawn_open_error(errno), None),
+        Ok(Report::Errno(errno)) => {
+            return Outcome::Failed(crate::os_process::linux::open::spawn_open_error(errno), None)
+        }
         Ok(Report::Eof) => return Outcome::NoReport,
         Err(e) => return Outcome::Failed(e, None),
     };

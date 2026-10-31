@@ -528,7 +528,7 @@ pub(crate) mod shared;
 /// Blocks until either `listener` gets a connection, or `target` exits first, never a bare,
 /// hang-forever `accept()`. The `src/` twin of `tests/common/accept.rs`'s `accept_or_die` (a
 /// separate compilation unit), built on the crate's own identity-verified exit-watch primitives
-/// (`crate::os_process::linux::open_verified`, `arm_proc_exit`, `wait_process_or_cancel`). The
+/// (`crate::os_process::linux::open::open_verified`, `arm_proc_exit`, `wait_process_or_cancel`). The
 /// `target` identity is verified when the watch is armed, so a reissued pid is reported as the
 /// target being gone, never watched.
 ///
@@ -573,7 +573,7 @@ pub(crate) struct DrainSignal {
 impl DrainSignal {
     pub(crate) fn new() -> Self {
         Self {
-            event: crate::os_process::windows::new_cancel_event().expect("create the drain event"),
+            event: crate::os_process::windows::cancel::new_cancel_event().expect("create the drain event"),
             outcome: shared::DrainOutcome::default(),
         }
     }
@@ -591,14 +591,14 @@ impl DrainSignal {
     /// Records the result of `wait_tree` and wakes the acceptor.
     pub(crate) fn record<T: std::fmt::Debug, E: std::fmt::Display>(&self, result: Result<T, E>) {
         self.outcome.store(result);
-        crate::os_process::windows::signal_cancel(&self.event);
+        crate::os_process::windows::cancel::signal_cancel(&self.event);
     }
 
     /// Runs `wait` (a `wait_tree`) and records its result; a `wait` that panics records an error.
     pub(crate) fn watch<T: std::fmt::Debug, E: std::fmt::Display>(&self, wait: impl FnOnce() -> Result<T, E>) {
         shared::run_watcher(
             &self.outcome,
-            || crate::os_process::windows::signal_cancel(&self.event),
+            || crate::os_process::windows::cancel::signal_cancel(&self.event),
             wait,
         );
     }
@@ -617,7 +617,7 @@ pub(crate) fn accept_or_signalled(listener: &std::net::TcpListener, drained: &Dr
     use windows::Win32::Networking::WinSock::{WSAEventSelect, FD_ACCEPT, SOCKET, WSAEVENT};
     use windows::Win32::System::Threading::{WaitForMultipleObjects, INFINITE};
 
-    let accept_event = crate::os_process::windows::new_cancel_event()
+    let accept_event = crate::os_process::windows::cancel::new_cancel_event()
         .expect("create an event for the listener's accept-readiness watch");
     let sock = SOCKET(listener.as_raw_socket() as usize);
     // SAFETY: `sock` is the listener's own live socket; the event is a live, owned handle.
@@ -671,7 +671,7 @@ pub(crate) fn accept_or_signalled(listener: &std::net::TcpListener, drained: &Dr
     }
 }
 
-/// Linux: a pidfd (via the crate's own [`crate::os_process::linux::open_verified`]) polled alongside
+/// Linux: a pidfd (via the crate's own [`crate::os_process::linux::open::open_verified`]) polled alongside
 /// the listener's fd in ONE `poll()` call.
 #[cfg(target_os = "linux")]
 fn watch_linux(listener: &std::net::TcpListener, target: crate::identity::ProcessId) -> WatchEvent {
@@ -679,7 +679,7 @@ fn watch_linux(listener: &std::net::TcpListener, target: crate::identity::Proces
 
     use rustix::event::{poll, PollFd, PollFlags};
 
-    let Some(pidfd) = crate::os_process::linux::open_verified(target, crate::os_process::Op::Wait)
+    let Some(pidfd) = crate::os_process::linux::open::open_verified(target, crate::os_process::Op::Wait)
         .expect("open a pidfd to watch the target")
     else {
         return WatchEvent::Died;
@@ -800,7 +800,7 @@ fn watch_windows(listener: &std::net::TcpListener, target: crate::identity::Proc
     };
     // SAFETY: `open_verified` returns a handle the caller owns; this wraps it so it is closed.
     let process = unsafe { OwnedHandle::from_raw_handle(process.0 as _) };
-    let accept_event = crate::os_process::windows::new_cancel_event()
+    let accept_event = crate::os_process::windows::cancel::new_cancel_event()
         .expect("create an event for the listener's accept-readiness watch");
     let sock = SOCKET(listener.as_raw_socket() as usize);
     let wsa_event = WSAEVENT(accept_event.as_raw_handle() as _);

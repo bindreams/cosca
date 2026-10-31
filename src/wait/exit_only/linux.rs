@@ -139,7 +139,7 @@ pub(super) fn reap_blocking(target: &Target<'_>) -> io::Result<Result<super::Rea
 /// Open a pidfd for `pid`, a child this process spawned, and confirm it names that child.
 /// `Ok(None)` means the child is gone: something else reaped it, so there is nothing to wait on.
 ///
-/// This never goes through [`open_verified`](crate::os_process::linux::open_verified), whose
+/// This never goes through [`open_verified`](crate::os_process::linux::open::open_verified), whose
 /// `EINVAL`/`ENOENT` arm applies foreign-process semantics: for a child we forked the number is a
 /// thread-group leader, so `ESRCH`, `EINVAL` and `ENOENT` alike mean it is gone (before 6.16 an
 /// `EINVAL` covers a reaped leader whose number lives on as a PGID or SID; from 6.16 an `ESRCH`

@@ -86,9 +86,8 @@ fn opened_for_a_signal() -> Error {
 /// Open the process `id` names. `Ok(None)`: it is gone, or its pid now names another process.
 pub(crate) fn open(id: ProcessId, op: Op) -> Result<Option<Box<dyn OsProcess>>, Error> {
     #[cfg(target_os = "linux")]
-    return Ok(
-        linux::open_verified(id, op)?.map(|pidfd| Box::new(linux::LinuxProcess::new(id, pidfd)) as Box<dyn OsProcess>)
-    );
+    return Ok(linux::open::open_verified(id, op)?
+        .map(|pidfd| Box::new(linux::LinuxProcess::new(id, pidfd)) as Box<dyn OsProcess>));
     #[cfg(windows)]
     return Ok(windows::WindowsProcess::open(id, op)?.map(|p| Box::new(p) as Box<dyn OsProcess>));
     #[cfg(target_os = "macos")]
