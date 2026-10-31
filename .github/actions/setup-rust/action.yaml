@@ -21,7 +21,7 @@ runs:
 
     - name: Install Rust toolchain
       id: rust-toolchain
-      uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+      uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
       with:
         toolchain: ${{ steps.pin.outputs.version }}
         components: ${{ inputs.components }}
@@ -39,7 +39,7 @@ runs:
     - name: Configure sccache
       uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       with:
-        version: v0.18.0
+        version: v0.19.0
 
     - name: Enable sccache for cargo
       shell: bash
@@ -47,9 +47,9 @@ runs:
 
     # The libtest guard (.github/scripts/libtest_guard.py) is a `uv` script.
     - name: Install uv
-      uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
       with:
-        version: 0.12.23
+        version: 0.13.5
 
     - name: Log toolchain versions
       shell: bash
