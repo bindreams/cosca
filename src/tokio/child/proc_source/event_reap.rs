@@ -8,7 +8,7 @@
 //!   and `EVFILT_SIGNAL` (`SIGCHLD`), as the sync wait arms it (`wait::macos::await_reapable`). A
 //!   tracer's hand-back re-sends `NOTE_EXIT`. A traced child's `NOTE_EXIT` goes to its tracer
 //!   alone, so a look that finds the child traced also watches the tracer chain, as the sync wait
-//!   does (`wait::backend::TracerWatch`). Under `SIG_IGN` a child past `P_REF_DEAD` at registration
+//!   does (`wait::macos::TracerWatch`). Under `SIG_IGN` a child past `P_REF_DEAD` at registration
 //!   is reaped by the kernel unannounced. So once `NOTE_EXIT` has come, or the registration found
 //!   `ESRCH`, a one-shot timer in the same kqueue paces the next look, with the sync wait's
 //!   backoff (1 ms doubling to 50 ms, no cap), and so it does while the tracer watch asks for a
@@ -113,7 +113,7 @@ pub(super) struct KqueueWatch {
     backoff: bool,
     interval: std::time::Duration,
     /// The tracers that hold the child, and their events.
-    tracer: crate::wait::backend::TracerWatch,
+    tracer: crate::wait::macos::TracerWatch,
     /// The tracer watch's next re-check, if it asked for one.
     recheck: Option<std::time::Duration>,
 }
@@ -121,7 +121,7 @@ pub(super) struct KqueueWatch {
 #[cfg(target_os = "macos")]
 impl KqueueWatch {
     pub(super) fn arm(pid: u32) -> Result<KqueueWatch, Error> {
-        use crate::wait::backend::{register_exit_events, BACKOFF_START};
+        use crate::wait::macos::{register_exit_events, BACKOFF_START};
         #[cfg(test)]
         if crate::tokio::child::fault::take_fail_reap_watch() {
             return Err(Error::Io(std::io::Error::other("forced watch failure (test seam)")));
@@ -135,7 +135,7 @@ impl KqueueWatch {
             pid,
             backoff,
             interval: BACKOFF_START,
-            tracer: crate::wait::backend::TracerWatch::default(),
+            tracer: crate::wait::macos::TracerWatch::default(),
             recheck: None,
         })
     }
@@ -143,17 +143,16 @@ impl KqueueWatch {
     /// Reads every pending event: `true` if one was the child's `NOTE_REAP`, so something else
     /// reaped the child and no look by its pid may follow.
     pub(super) fn reaped(&mut self) -> Result<bool, Error> {
-        let (reaped, exited) =
-            crate::wait::backend::drain_exit_events(&self.afd.get_ref().0, self.pid, &mut self.tracer)
-                .map_err(Error::Io)?;
+        let (reaped, exited) = crate::wait::macos::drain_exit_events(&self.afd.get_ref().0, self.pid, &mut self.tracer)
+            .map_err(Error::Io)?;
         self.backoff |= exited;
         Ok(reaped)
     }
 
     /// A look found the child held by `tracer`: watches the chain from it. `true` when the child
     /// must be looked at again at once, before any wait: the walk registered something new.
-    pub(super) fn held_by(&mut self, tracer: u32) -> Result<bool, crate::wait::backend::WalkError> {
-        use crate::wait::backend::OnTracer;
+    pub(super) fn held_by(&mut self, tracer: u32) -> Result<bool, crate::wait::macos::WalkError> {
+        use crate::wait::macos::OnTracer;
         match self.tracer.held_by(&self.afd.get_ref().0, tracer)? {
             OnTracer::Block => self.recheck = None,
             OnTracer::Recheck(after) if after.is_zero() => return Ok(true),
@@ -165,7 +164,7 @@ impl KqueueWatch {
     /// Waits for the next event, or for the timer once backing off or when the tracer watch asked
     /// for a re-check.
     pub(super) async fn next(&mut self) -> Result<(), Error> {
-        use crate::wait::backend::{arm_backoff_timer, BACKOFF_CAP};
+        use crate::wait::macos::{arm_backoff_timer, BACKOFF_CAP};
         let backoff = self.backoff.then_some(self.interval);
         let timer = match (backoff, self.recheck.take()) {
             (Some(backoff), Some(recheck)) => Some(backoff.min(recheck)),

@@ -528,7 +528,7 @@ fn awaiting_a_child_whose_tracer_dies_during_its_exit_is_woken_by_the_tracers_ex
                 drop(tracer_stdin.borrow_mut().take());
                 crate::test_child::wait_until_zombie(tracer_pid);
                 tracer_exited.set(true);
-                pending.set(Some(crate::wait::backend::test_hooks::event_pending(kq)));
+                pending.set(Some(crate::os_process::macos::kqueue::test_hooks::event_pending(kq)));
                 if pending.get() == Some(true) {
                     return;
                 }
@@ -550,7 +550,7 @@ fn awaiting_a_child_whose_tracer_dies_during_its_exit_is_woken_by_the_tracers_ex
 }
 
 /// A tracer that attaches after the wait's check: XNU reparents the child to it and sends the child
-/// `SIGSTOP` (see `wait::backend::TracerWatch`). The wait watches the child's signals,
+/// `SIGSTOP` (see `wait::macos::TracerWatch`). The wait watches the child's signals,
 /// so it checks again, finds the tracer and watches it too; the tracer's exit, with launchd then
 /// holding the child, ends the wait: `Missing`. A live `cat` stands in for the tracer. The child
 /// really runs; its `waitid` and its parents are forced: running until the attach, then held by the
@@ -565,7 +565,7 @@ fn awaiting_a_child_a_tracer_attaches_to_late_is_woken_by_the_attach() {
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
-    use crate::wait::backend::test_hooks::{event_pending, send_signal};
+    use crate::os_process::macos::kqueue::test_hooks::{event_pending, send_signal};
     use crate::wait::exit_only::{seams::force_peeks, Foreign, Peek};
     let (child, stdin) = live_child();
     let pid = child.id();
@@ -668,7 +668,7 @@ fn await_held(
     let (r, copy) = pipe();
     let _echild = force_peeks((0..16).map(|_| Ok(Peek::Foreign(Foreign::Gone))));
     let _parents = crate::identity::kinfo::fault::force_parents(child, move || forked_by_us_held_by(tracer));
-    let _links = crate::wait::backend::tracer_seams::force_links(links);
+    let _links = crate::wait::macos::tracer_seams::force_links(links);
     let recorded = seams::say_waiting_after_then_record(say_after);
     let copy = RefCell::new(Some(copy));
     let _hook = seams::on_each_block(move |n, _| {

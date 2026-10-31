@@ -315,7 +315,7 @@ pub(crate) async fn wait_tree_deadline(
 /// `DrainOutcome::Declined` (a genuine non-EOF event, retrieved and interpreted, that did not
 /// resolve the wait; its bytes were discarded when `suppress_drain` is false and left buffered
 /// when true). Never `Spurious`. A `#[cfg(test)]` thread-local installed by an RAII guard, like
-/// `wait::macos::test_hooks::HookGuard`, so no production signature carries it. It relies on a
+/// `os_process::macos::kqueue::test_hooks::HookGuard`, so no production signature carries it. It relies on a
 /// current-thread runtime: the future is polled on the installing thread.
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) mod declined_hook {

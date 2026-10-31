@@ -114,7 +114,7 @@ pub(super) fn readable_watch(fd: std::os::fd::BorrowedFd<'_>) -> Result<super::m
         0,
         0,
     );
-    match crate::wait::backend::add_with_receipt(&kq, change)? {
+    match crate::os_process::macos::kqueue::add_with_receipt(&kq, change)? {
         0 => Ok(super::macos::ExitWatch::new(kq)),
         errno => Err(Error::Io(std::io::Error::from_raw_os_error(errno as i32))),
     }

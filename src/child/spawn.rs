@@ -1097,8 +1097,8 @@ fn kill_and_reap_noting(
     after_kill: impl FnOnce(bool),
 ) -> (ChildFate, KillOutcome) {
     use crate::signal::{via_verified_pid, Sent, Sig};
-    use crate::wait::backend::Waited;
     use crate::wait::exit_only::Foreign;
+    use crate::wait::macos::Waited;
 
     let target = crate::wait::exit_only::Target::pid(pid, Some(unique));
     match via_verified_pid(pid, Some(unique), Sig::Kill) {
@@ -1158,8 +1158,8 @@ fn await_exit_warning(
     pid: u32,
     unique: u64,
     warn_after: Option<std::time::Duration>,
-) -> std::io::Result<crate::wait::backend::Waited> {
-    use crate::wait::backend::{await_reapable, Waited};
+) -> std::io::Result<crate::wait::macos::Waited> {
+    use crate::wait::macos::{await_reapable, Waited};
 
     // What the bounded look found, when it found the end: the unbounded wait answers it.
     crate::wait::teardown_warn::wait_warning(

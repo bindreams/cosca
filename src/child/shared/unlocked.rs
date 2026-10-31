@@ -140,7 +140,7 @@ impl SharedChild {
 impl SharedChild {
     /// The kqueue wait: `EVFILT_PROC` plus a peek, by number.
     fn platform_wait(&self, deadline: Option<Instant>) -> io::Result<Unlocked> {
-        use crate::wait::backend::{await_reapable, Waited};
+        use crate::wait::macos::{await_reapable, Waited};
         Ok(match await_reapable(self.id.pid(), self.identity, deadline)? {
             Waited::Reapable => Unlocked::ExitSeen,
             Waited::DeadlinePassed => Unlocked::DeadlinePassed,

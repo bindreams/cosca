@@ -722,16 +722,18 @@ fn watch_linux(listener: &std::net::TcpListener, target: crate::identity::Proces
     }
 }
 
-/// macOS: the crate's own [`crate::wait::backend::arm_proc_exit`] kqueue, with an `EVFILT_READ`
+/// macOS: the crate's own [`crate::os_process::macos::kqueue::arm_proc_exit`] kqueue, with an `EVFILT_READ`
 /// watch on the listener added to the SAME kqueue (via the crate's own
-/// [`crate::wait::backend::add_with_receipt`]).
+/// [`crate::os_process::macos::kqueue::add_with_receipt`]).
 #[cfg(target_os = "macos")]
 fn watch_macos(listener: &std::net::TcpListener, target: crate::identity::ProcessId) -> WatchEvent {
     use std::os::fd::AsRawFd;
 
     use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent};
 
-    let Some(kq) = crate::wait::backend::arm_proc_exit(target).expect("arm a kqueue exit-watch for the target") else {
+    let Some(kq) =
+        crate::os_process::macos::kqueue::arm_proc_exit(target).expect("arm a kqueue exit-watch for the target")
+    else {
         return WatchEvent::Died;
     };
     let listener_change = KEvent::new(
@@ -742,8 +744,8 @@ fn watch_macos(listener: &std::net::TcpListener, target: crate::identity::Proces
         0,
         0,
     );
-    let listener_errno =
-        crate::wait::backend::add_with_receipt(&kq, listener_change).expect("kevent(EV_ADD) to arm the listener watch");
+    let listener_errno = crate::os_process::macos::kqueue::add_with_receipt(&kq, listener_change)
+        .expect("kevent(EV_ADD) to arm the listener watch");
     assert_eq!(
         listener_errno, 0,
         "kevent(EV_ADD) for EVFILT_READ on the control listener reported errno {listener_errno}"

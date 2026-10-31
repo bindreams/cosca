@@ -10,10 +10,11 @@ use std::time::Duration;
 
 use nix::sys::event::Kqueue;
 
-use crate::wait::backend::{await_reapable, await_reapable_on, test_hooks, Waited};
+use crate::os_process::macos::kqueue::test_hooks;
 use crate::wait::exit_only::seams as exit_seams;
 use crate::wait::exit_only::seams::HolderStep;
 use crate::wait::exit_only::Peek;
+use crate::wait::macos::{await_reapable, await_reapable_on, Waited};
 
 fn spawn_blocker() -> (Child, ChildStdin) {
     let mut child = crate::test_spawn::spawn(&mut crate::test_child::held_std_blocker(std::process::Stdio::null()))

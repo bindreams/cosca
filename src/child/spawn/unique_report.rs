@@ -262,7 +262,7 @@ const SAY_WAITING_AFTER: std::time::Duration = std::time::Duration::from_secs(1)
 ///
 /// A traced child's `NOTE_EXIT` reaches this process only at its tracer's hand-back, so a live
 /// tracer that holds the child's zombie keeps the wait going; see
-/// [`TracerWatch`](crate::wait::backend::TracerWatch) for how the wait watches the tracer chain.
+/// [`TracerWatch`](crate::wait::macos::TracerWatch) for how the wait watches the tracer chain.
 ///
 /// Residual: a foreign reaper reaps the child and another child of ours takes its pid before the
 /// registration; the wait then lasts as long as that process, unless the pipe hits EOF first.
@@ -303,7 +303,7 @@ enum Watch {
 
 /// The kqueue wait of [`await_report`].
 fn watch(read_end: &OwnedFd, pid: u32) -> io::Result<Watch> {
-    use crate::wait::backend::{OnTracer, TracerWatch};
+    use crate::wait::macos::{OnTracer, TracerWatch};
     use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 
     let kq = Kqueue::new()?;
@@ -317,13 +317,13 @@ fn watch(read_end: &OwnedFd, pid: u32) -> io::Result<Watch> {
         0,
         0,
     );
-    match crate::wait::backend::add_with_receipt(&kq, pipe).map_err(into_io)? {
+    match crate::os_process::macos::kqueue::add_with_receipt(&kq, pipe).map_err(into_io)? {
         0 => {}
         errno => return Err(io::Error::from_raw_os_error(errno as i32)),
     }
     // Registered before the first check, so a child that exits after it fires `NOTE_EXIT`, and one a
     // tracer attaches to fires `NOTE_SIGNAL`.
-    if crate::wait::backend::arm_exit_and_signals_on(&kq, pid)
+    if crate::os_process::macos::kqueue::arm_exit_and_signals_on(&kq, pid)
         .map_err(into_io)?
         .is_none()
     {
@@ -368,7 +368,11 @@ fn watch(read_end: &OwnedFd, pid: u32) -> io::Result<Watch> {
         };
         #[cfg(test)]
         seams::record_timeout(timeout);
-        let n = match kq.kevent(&[], &mut events, timeout.map(crate::wait::backend::kevent_timeout)) {
+        let n = match kq.kevent(
+            &[],
+            &mut events,
+            timeout.map(crate::os_process::macos::kqueue::kevent_timeout),
+        ) {
             Ok(n) => n,
             Err(nix::errno::Errno::EINTR) => continue,
             Err(e) => return Err(e.into()),

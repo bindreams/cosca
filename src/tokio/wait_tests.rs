@@ -295,12 +295,12 @@ async fn death_watch_loop_survives_a_non_exit_drain_cycle() {
     let mut decoy = std_blocker();
     let target = std_blocker();
     let target_id = ProcessId::of(target.id()).found().expect("identity of live target");
-    let kq = crate::wait::backend::arm_proc_exit(target_id)
+    let kq = crate::os_process::macos::kqueue::arm_proc_exit(target_id)
         .expect("arm target")
         .expect("a live target arms");
     // Arm the decoy on the SAME kqueue, through the production receipt dance.
     assert!(
-        crate::wait::backend::arm_note_exit_on(&kq, decoy.id())
+        crate::os_process::macos::kqueue::arm_note_exit_on(&kq, decoy.id())
             .expect("arm decoy")
             .is_some(),
         "a live decoy arms"
@@ -312,7 +312,7 @@ async fn death_watch_loop_survives_a_non_exit_drain_cycle() {
     let target_cell = std::cell::RefCell::new(None);
     let mut pending = Some(target);
     let watch = super::watch_readable(&afd, |kq| {
-        let drained = crate::wait::backend::drain_proc_exit(kq)?;
+        let drained = crate::os_process::macos::kqueue::drain_proc_exit(kq)?;
         if let Some(mut t) = pending.take() {
             // First cycle (the decoy's event, consumed above): report "no exit" so the loop
             // clear_readys and re-awaits; only NOW create the target's exit event.

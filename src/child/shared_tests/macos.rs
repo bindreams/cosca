@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 use super::fixtures::{spawn_std_blocker, Blocker};
 use crate::child::shared::SharedChild;
 use crate::identity::{ppid_fault, uniq_fault, uniq_info, ReadErr, ReadPurpose, UniqInfo, UniqRead, LAUNCHD};
+use crate::os_process::macos::kqueue::test_hooks::{self, ForcedOnce};
 use crate::test_groups::{setuid, Group};
-use crate::wait::backend::test_hooks::{self, ForcedOnce};
 use crate::wait::exit_only::seams::{self as exit_seams, ForcedReap, HolderStep};
 use crate::wait::exit_only::{self, Foreign, Peek, Target};
 
@@ -486,7 +486,7 @@ fn a_wait_on_a_child_whose_tracer_dies_during_its_exit_is_woken_by_the_tracers_e
     use std::cell::Cell;
     use std::rc::Rc;
 
-    use crate::wait::backend::{await_reapable, Waited};
+    use crate::wait::macos::{await_reapable, Waited};
     let (pid, unique) = echild_yet_resolvable();
     let (mut tracer, tracer_stdin) = spawn_std_blocker();
     let tracer_pid = tracer.id();
@@ -530,7 +530,7 @@ pub(super) fn on_rounds(
 }
 
 /// A tracer that attaches after the wait's check: XNU reparents the child to it and sends the child
-/// `SIGSTOP` (see `wait::backend::TracerWatch`). The wait watches the child's signals,
+/// `SIGSTOP` (see `wait::macos::TracerWatch`). The wait watches the child's signals,
 /// so it peeks again, finds the tracer and watches it too; the tracer's exit, with launchd then
 /// holding the child, ends the wait: `Orphaned`. This process's own pid stands in for the child, and
 /// a blocker for the tracer; the parent read is forced: this process until the attach, then the
@@ -543,7 +543,7 @@ fn a_wait_on_a_child_a_tracer_attaches_to_late_is_woken_by_the_attach() {
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
-    use crate::wait::backend::{await_reapable_on, Waited};
+    use crate::wait::macos::{await_reapable_on, Waited};
     let (pid, unique) = echild_yet_resolvable();
     let (mut tracer, tracer_stdin) = spawn_std_blocker();
     let tracer_pid = tracer.id();
@@ -586,7 +586,7 @@ fn started_by_us_traced_by(tracer: u32) -> (libc::pid_t, libc::pid_t) {
 }
 
 /// A tracer that is itself traced: XNU sends its `NOTE_EXIT` only to its own tracer, and its exit
-/// sends that tracer `SIGCHLD` (see `wait::backend::TracerWatch`). The wait follows the chain of tracers and watches the signals of each, so
+/// sends that tracer `SIGCHLD` (see `wait::macos::TracerWatch`). The wait follows the chain of tracers and watches the signals of each, so
 /// that `SIGCHLD` wakes it, and the peek after it finds launchd holding the child: `Orphaned`. This
 /// process's own pid stands in for the child, held by one blocker; a second blocker stands in for
 /// that one's tracer, by its forced parents. A `SIGCHLD` to the second stands in for the first one's
@@ -598,7 +598,7 @@ fn a_wait_on_a_child_whose_tracer_is_traced_is_woken_by_that_tracers_exit() {
     use std::cell::Cell;
     use std::rc::Rc;
 
-    use crate::wait::backend::{await_reapable_on, Waited};
+    use crate::wait::macos::{await_reapable_on, Waited};
     let (pid, unique) = echild_yet_resolvable();
     let (tracer, tracer_stdin) = spawn_std_blocker();
     let (outer, outer_stdin) = spawn_std_blocker();
@@ -638,7 +638,7 @@ fn a_wait_on_a_child_whose_tracer_is_traced_is_woken_by_that_tracers_exit() {
 
 /// A tracer that began its exit, then lost its own tracer: XNU gives it to launchd and keeps its
 /// `p_oppid`, so its `NOTE_EXIT` and its `SIGCHLD` reach only launchd (see
-/// `wait::backend::TracerWatch`). It hands the child over once its exit reaches its children, so the
+/// `wait::macos::TracerWatch`). It hands the child over once its exit reaches its children, so the
 /// wait peeks again on a backoff instead of blocking for an event that never comes. This process's own pid stands in for the child, held by
 /// a blocker whose forced parents say launchd holds it and a tracer attached to it; the child's
 /// parent read answers launchd from the first block on.
@@ -649,7 +649,7 @@ fn a_wait_on_a_child_whose_tracer_is_exiting_at_launchd_peeks_again_on_a_backoff
     use std::cell::Cell;
     use std::rc::Rc;
 
-    use crate::wait::backend::{await_reapable_on, Waited};
+    use crate::wait::macos::{await_reapable_on, Waited};
     let (pid, unique) = echild_yet_resolvable();
     let (mut tracer, tracer_stdin) = spawn_std_blocker();
     let tracer_pid = tracer.id();
@@ -810,7 +810,7 @@ fn an_echild_with_no_id_stays_foreign() {
 /// Mutant: the wait's peek without the id: `Gone`.
 #[skuld::test]
 fn the_kqueue_wait_keeps_waiting_for_a_child_that_answers_echild_yet_resolves() {
-    use crate::wait::backend::{await_reapable, Waited};
+    use crate::wait::macos::{await_reapable, Waited};
     let (pid, unique) = echild_yet_resolvable();
     // The first look, and the final one at expiry.
     let _forced = (held_by_a_tracer(), held_by_a_tracer());
@@ -824,7 +824,7 @@ fn the_kqueue_wait_keeps_waiting_for_a_child_that_answers_echild_yet_resolves() 
 /// Mutant: the wait ignores the id.
 #[skuld::test]
 fn the_kqueue_wait_reports_gone_for_a_pid_with_another_unique_id() {
-    use crate::wait::backend::{await_reapable, Waited};
+    use crate::wait::macos::{await_reapable, Waited};
     let (pid, unique) = echild_yet_resolvable();
     let waited = await_reapable(pid, Some(unique ^ 1), Some(Instant::now())).expect("wait");
     assert_eq!(waited, Waited::Gone);

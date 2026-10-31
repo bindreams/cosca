@@ -30,10 +30,10 @@ use std::time::Duration;
 
 use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 
-use super::arm_exit_and_signals_on;
 #[cfg(not(test))]
 use crate::identity::link;
 use crate::identity::{uniq_info, Link, ReadPurpose, UniqRead, LAUNCHD};
+use crate::os_process::macos::kqueue::{add_with_receipt, arm_exit_and_signals_on};
 
 /// The backoff's first interval after a walk finds a tracer gone, and its cap.
 const GONE_START: Duration = Duration::from_millis(1);
@@ -188,7 +188,7 @@ fn delete(kq: &Kqueue, pid: u32) -> Result<(), WalkError> {
         0,
         0,
     );
-    match super::add_with_receipt(kq, change).map_err(|e| WalkError::Watch(into_io(e)))? {
+    match add_with_receipt(kq, change).map_err(|e| WalkError::Watch(into_io(e)))? {
         0 => Ok(()),
         e if e == libc::ENOENT as i64 => Ok(()),
         e => Err(WalkError::Watch(std::io::Error::from_raw_os_error(e as i32))),

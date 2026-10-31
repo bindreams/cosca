@@ -1,6 +1,6 @@
-//! The time, deadline and blocking-wait helpers the wait drivers share, and the per-OS
-//! kqueue and handle primitives behind them (`backend`). The by-identity wait and signals are
-//! [`crate::os_process`]. NEVER reaps: the target's real parent collects the zombie.
+//! The time, deadline and blocking-wait helpers the wait drivers share, the Windows handle
+//! primitives behind them (`backend`), and macOS child reaping (`macos`). The by-identity wait and
+//! signals are [`crate::os_process`]. NEVER reaps: the target's real parent collects the zombie.
 
 use std::time::{Duration, Instant};
 
@@ -8,9 +8,11 @@ pub(crate) mod exit_only;
 
 pub(crate) mod teardown_warn;
 
-#[cfg(any(target_os = "macos", windows))]
-#[cfg_attr(target_os = "macos", path = "wait/macos.rs")]
-#[cfg_attr(windows, path = "wait/windows.rs")]
+#[cfg(target_os = "macos")]
+pub(crate) mod macos;
+
+#[cfg(windows)]
+#[path = "wait/windows.rs"]
 pub(crate) mod backend;
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]

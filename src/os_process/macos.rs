@@ -16,7 +16,9 @@ use super::{Exit, Op, OsProcess, WaitFor};
 use crate::error::{io_context, Error};
 use crate::identity::{uniq_info, Existence, ProcessId, ReadPurpose, UniqRead};
 use crate::signal::{Sent, Sig};
-use crate::wait::backend::{arm_note_exit_on, block_on_kqueue, drain_proc_exit};
+use kqueue::{arm_note_exit_on, block_on_kqueue, drain_proc_exit};
+
+pub(crate) mod kqueue;
 
 extern "C" {
     /// `libproc.h`, macOS 14.4 and later. Not in `libc`. Returns `0` once the signal is sent, and

@@ -378,7 +378,7 @@ impl Tree {
         let kq = Kqueue::new().expect("kqueue");
         let add = |ident: usize, filter, fflags| {
             let change = KEvent::new(ident, filter, EvFlags::EV_ADD | EvFlags::EV_RECEIPT, fflags, 0, 0);
-            crate::wait::backend::add_with_receipt(&kq, change).expect("register with the kqueue")
+            crate::os_process::macos::kqueue::add_with_receipt(&kq, change).expect("register with the kqueue")
         };
         let read = add(
             self.ready.as_raw_fd() as usize,

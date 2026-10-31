@@ -1015,7 +1015,7 @@ impl ProcSource {
         }
         #[cfg(target_os = "macos")]
         {
-            use crate::wait::backend::{await_reapable, Waited as Awaited};
+            use crate::wait::macos::{await_reapable, Waited as Awaited};
             let ProcSource::Tokio {
                 identity: Some(identity),
                 ..
@@ -1686,7 +1686,7 @@ async fn look_on_events<T>(
         // A tracer whose identity cannot be read leaves the child's state unknown, as a refused peek
         // does. A refused registration leaves it unwatched: the caller waits by other means.
         if let Some(holder) = holder {
-            use crate::wait::backend::WalkError;
+            use crate::wait::macos::WalkError;
             match watch.held_by(holder) {
                 Ok(true) => continue,
                 Ok(false) => {}
@@ -1784,7 +1784,7 @@ fn wait_on_pidfd(pid: u32, pidfd: &std::os::fd::OwnedFd, level: log::Level) -> (
 /// cause.
 #[cfg(target_os = "macos")]
 fn wait_reapable(pid: u32, identity: u64, level: log::Level) -> (Waited, Option<String>) {
-    use crate::wait::backend::{await_reapable, Waited as Awaited};
+    use crate::wait::macos::{await_reapable, Waited as Awaited};
     match await_reapable(pid, Some(identity), None) {
         Ok(Awaited::Reapable) => {
             #[cfg(test)]

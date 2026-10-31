@@ -258,9 +258,9 @@ slow-timeout = { period = "30s", terminate-after = 1, grace-period = "1s" }
 # A backstop, not a detector: the `SharedChild` tests fail by assertion (see `assert_handed_off`),
 # not by timing out. This bound only stops a regression those checks did not anticipate, in a test
 # that `recv()`s or `join()`s on our own code, from stalling the job. The macOS wait's tests
-# (`wait::backend::macos_tests::await_reapable`) block on a real kqueue in the same way. Under
+# (`wait::macos::macos_tests::await_reapable`) block on a real kqueue in the same way. Under
 # `profile.default` so `profile.ci` and local runs inherit it.
-filter = 'test(/^child::shared::shared_tests::/) | test(/^wait::backend::macos_tests::await_reapable/)'
+filter = 'test(/^child::shared::shared_tests::/) | test(/^wait::macos::macos_tests::await_reapable/)'
 slow-timeout = { period = "10s", terminate-after = 1, grace-period = "1s" }
 
 [[profile.default.overrides]]

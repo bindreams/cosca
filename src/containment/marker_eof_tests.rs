@@ -710,7 +710,8 @@ fn kqueue_fd_is_already_readable(kq_fd: std::os::fd::RawFd) -> bool {
         0,
         0,
     );
-    let add_result = crate::wait::backend::add_with_receipt(&probe_kq, change).expect("register the probe knote");
+    let add_result =
+        crate::os_process::macos::kqueue::add_with_receipt(&probe_kq, change).expect("register the probe knote");
     assert_eq!(
         add_result, 0,
         "registering EVFILT_READ on the watched kqueue's own fd failed: errno {add_result}"
