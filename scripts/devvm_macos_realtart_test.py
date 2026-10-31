@@ -205,7 +205,7 @@ class RealTartCancelTests(unittest.TestCase):
 
         def popen(*a, **kw):
             p = real_popen(*a, **kw)
-            if a and a[0][:1] == ["git"]:
+            if a and a[0][:1] == ["git"] and "archive" in a[0]:
                 gits.append(p)
             return p
 
