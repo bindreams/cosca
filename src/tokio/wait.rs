@@ -64,10 +64,10 @@ pub(crate) async fn cancellable_blocking<T: Send + 'static>(
     struct SignalOnDrop(std::sync::Arc<std::os::windows::io::OwnedHandle>);
     impl Drop for SignalOnDrop {
         fn drop(&mut self) {
-            crate::wait::backend::signal_cancel(&self.0);
+            crate::os_process::windows::cancel::signal_cancel(&self.0);
         }
     }
-    let cancel = std::sync::Arc::new(crate::wait::backend::new_cancel_event()?);
+    let cancel = std::sync::Arc::new(crate::os_process::windows::cancel::new_cancel_event()?);
     let _guard = SignalOnDrop(cancel.clone());
     // Test-only: the probes are thread-local and the closure runs on a blocking-pool thread, so
     // capture them here, before any yield, and re-install inside.
@@ -168,7 +168,8 @@ pub(crate) async fn pidfd_exited_within(pidfd: std::os::fd::BorrowedFd<'_>, grac
             Some(watch) => watch.map(|()| true),
             // The timer can win the first poll before the reactor reports an exit that was already
             // pending: answer from one final non-blocking look.
-            None => crate::wait::poll_pidfd_exit(pidfd, crate::wait::deadline_from(Duration::ZERO)).map_err(Error::Io),
+            None => crate::os_process::linux::poll_pidfd_exit(pidfd, crate::wait::deadline_from(Duration::ZERO))
+                .map_err(Error::Io),
         },
         _ => watch_pidfd(watched).await.map(|()| true),
     }
@@ -314,7 +315,7 @@ pub(crate) async fn wait_tree_deadline(
 /// `DrainOutcome::Declined` (a genuine non-EOF event, retrieved and interpreted, that did not
 /// resolve the wait; its bytes were discarded when `suppress_drain` is false and left buffered
 /// when true). Never `Spurious`. A `#[cfg(test)]` thread-local installed by an RAII guard, like
-/// `wait::macos::test_hooks::HookGuard`, so no production signature carries it. It relies on a
+/// `os_process::macos::kqueue::test_hooks::HookGuard`, so no production signature carries it. It relies on a
 /// current-thread runtime: the future is polled on the installing thread.
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) mod declined_hook {
@@ -565,10 +566,10 @@ async fn job_wait_tree_drained(
     struct SignalOnDrop(std::sync::Arc<std::os::windows::io::OwnedHandle>);
     impl Drop for SignalOnDrop {
         fn drop(&mut self) {
-            crate::wait::backend::signal_cancel(&self.0);
+            crate::os_process::windows::cancel::signal_cancel(&self.0);
         }
     }
-    let cancel = std::sync::Arc::new(crate::wait::backend::new_cancel_event()?);
+    let cancel = std::sync::Arc::new(crate::os_process::windows::cancel::new_cancel_event()?);
     let _guard = SignalOnDrop(cancel.clone());
     // SAFETY: `cancel`'s OwnedHandle is kept alive by the Arc clone captured in the
     // spawn_blocking closure below (and by `_guard`/`cancel` here) for the whole wait.

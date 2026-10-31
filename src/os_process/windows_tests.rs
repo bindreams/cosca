@@ -1,5 +1,8 @@
 use std::time::Duration;
 
+use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_HANDLE, HANDLE};
+use windows::Win32::System::Threading::CreateEventW;
+
 use crate::error::Error;
 use crate::identity::ProcessId;
 use crate::os_process::drive::{absolute, drive};
@@ -148,7 +151,7 @@ fn signal_failure_carries_the_win32_code() {
     let mut p = super::WindowsProcess {
         id: ProcessId::current(),
         op: Op::Kill,
-        handle: crate::wait::backend::new_cancel_event().expect("create an event handle"),
+        handle: super::cancel::new_cancel_event().expect("create an event handle"),
     };
     let err = p.signal(Sig::Kill).expect_err("an event cannot be terminated");
     let Error::Io(io) = err else {
@@ -171,4 +174,65 @@ fn kill_by_id_of_a_process_that_is_exiting_but_not_signalled_is_ok() {
     child.wait().expect("reap the fixture");
 
     result.expect("a refusal on an exiting process is not a failed kill");
+}
+
+// Win32 codes of failures =====
+//
+// Each site converts a `windows::core::Error` to an `io::Error`. A bare `.into()` keeps the
+// HRESULT (`0x8007xxxx`) where std reports the Win32 code, so each test drives the failing call
+// and asserts the code.
+
+/// An event handle: a real handle that is not a process, so `GetProcessTimes` and
+/// `TerminateProcess` on it fail with `ERROR_INVALID_HANDLE`. The callee under test closes it.
+fn event_handle() -> HANDLE {
+    // SAFETY: creating an unnamed event has no preconditions.
+    unsafe { CreateEventW(None, true, false, None) }.expect("create an event handle")
+}
+
+/// An identity that cannot be read from the held handle is `Unassessable` with the plain Win32
+/// code, for `open_verified` and `open_verified_for_kill`, which share `holds_process`.
+///
+/// Mutant: `holds_process` converts with `.into()`, so the source's code is `0x80070006`.
+#[skuld::test]
+fn holds_process_of_an_unreadable_handle_carries_the_win32_code() {
+    let err = super::holds_process(event_handle(), ProcessId::current()).expect_err("an event has no creation time");
+    let crate::error::Error::Unassessable { source, .. } = err else {
+        panic!("expected Unassessable, got {err:?}");
+    };
+    let io = source.expect("the OS error is preserved");
+    assert_eq!(io.raw_os_error(), Some(ERROR_INVALID_HANDLE.0 as i32), "{io:?}");
+}
+
+/// `open_verified` on a live process we may not open is `Unassessable` with the plain Win32 code.
+/// Needs the DACL fixture, which creates a Job Object: CI only.
+///
+/// Mutant: the `Opened::Denied` arm of `open_verified` converts with `.into()`, so the code is
+/// `0x80070005`.
+#[skuld::test]
+fn open_verified_of_an_access_denied_live_process_carries_the_win32_code() {
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(open_verified_of_an_access_denied_live_process_carries_the_win32_code),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
+    let io = denied_open_source(&done, |id| super::open_verified(id).map(|_| ()));
+    assert_eq!(io.raw_os_error(), Some(ERROR_ACCESS_DENIED.0 as i32), "{io:?}");
+}
+
+/// The `Unassessable` source of a refused open of the unkillable fixture, which `call` runs `id`
+/// through. Needs the DACL fixture, which creates a Job Object: CI only.
+fn denied_open_source(
+    done: &crate::test_own_process::Completion,
+    call: impl FnOnce(ProcessId) -> Result<(), crate::error::Error>,
+) -> std::io::Error {
+    let child = crate::identity::windows_fixture::spawn_unkillable(done);
+    let id = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
+        .expect("the owned handle always yields an identity");
+    assert!(child.is_running(), "precondition: the subject must be live");
+    let err = call(id).expect_err("an unopenable live process is not 'gone'");
+    let crate::error::Error::Unassessable { source, .. } = err else {
+        panic!("expected Unassessable, got {err:?}");
+    };
+    source.expect("the OS error is preserved")
 }

@@ -173,7 +173,7 @@ impl ProcHandle {
         let Some(pidfd) = self.pidfd() else {
             return Ok(true);
         };
-        crate::wait::poll_pidfd_exit(pidfd, crate::wait::deadline_from(grace))
+        crate::os_process::linux::poll_pidfd_exit(pidfd, crate::wait::deadline_from(grace))
     }
 
     /// The pidfd naming the process, if it holds one (Linux).

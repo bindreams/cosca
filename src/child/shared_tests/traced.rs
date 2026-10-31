@@ -4,10 +4,11 @@
 use std::time::Instant;
 
 use crate::identity::{uniq_info, ReadPurpose, UniqRead};
+use crate::os_process::macos::kqueue::test_hooks;
 use crate::test_groups::{tracer_group, Group};
 use crate::test_support::tracer::{self, Mode, Report};
-use crate::wait::backend::{await_reapable, test_hooks, Waited};
 use crate::wait::exit_only::{self, Reap, Target};
+use crate::wait::macos::{await_reapable, Waited};
 
 /// A held child is running until the tracer hands it back: the by-pid `ECHILD` is not a reap,
 /// the kqueue wait keeps waiting, and the hand-back's `NOTE_EXIT` ends it as `Reapable`.
@@ -152,7 +153,7 @@ fn a_tracer_that_attaches_during_a_wait_wakes_it(#[fixture(tracer_group)] _group
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
-    use crate::wait::backend::await_reapable_on;
+    use crate::wait::macos::await_reapable_on;
     let (tracee, stdin, unique) = tracee_with_unique();
     let pid = tracee.id().pid();
     let pending = RefCell::new(Some(tracer::start(Mode::Auto)));
@@ -198,7 +199,7 @@ fn a_wait_on_a_child_whose_tracer_is_traced_watches_that_tracers_tracer(#[fixtur
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
-    use crate::wait::backend::await_reapable_on;
+    use crate::wait::macos::await_reapable_on;
     let (tracee, stdin, unique) = tracee_with_unique();
     let pid = tracee.id().pid();
     let mut inner = tracer::start(Mode::Auto).attach_unheld(pid);

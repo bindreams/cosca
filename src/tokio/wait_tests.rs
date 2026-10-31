@@ -295,12 +295,12 @@ async fn death_watch_loop_survives_a_non_exit_drain_cycle() {
     let mut decoy = std_blocker();
     let target = std_blocker();
     let target_id = ProcessId::of(target.id()).found().expect("identity of live target");
-    let kq = crate::wait::backend::arm_proc_exit(target_id)
+    let kq = crate::os_process::macos::kqueue::arm_proc_exit(target_id)
         .expect("arm target")
         .expect("a live target arms");
     // Arm the decoy on the SAME kqueue, through the production receipt dance.
     assert!(
-        crate::wait::backend::arm_note_exit_on(&kq, decoy.id())
+        crate::os_process::macos::kqueue::arm_note_exit_on(&kq, decoy.id())
             .expect("arm decoy")
             .is_some(),
         "a live decoy arms"
@@ -312,7 +312,7 @@ async fn death_watch_loop_survives_a_non_exit_drain_cycle() {
     let target_cell = std::cell::RefCell::new(None);
     let mut pending = Some(target);
     let watch = super::watch_readable(&afd, |kq| {
-        let drained = crate::wait::backend::drain_proc_exit(kq)?;
+        let drained = crate::os_process::macos::kqueue::drain_proc_exit(kq)?;
         if let Some(mut t) = pending.take() {
             // First cycle (the decoy's event, consumed above): report "no exit" so the loop
             // clear_readys and re-awaits; only NOW create the target's exit event.
@@ -375,14 +375,14 @@ async fn exited_by_id_unbounded_resolves_for_exited_unreaped_child() {
 /// The async watch reports a refused `pidfd_open` as `process wait`. The child is killed first so
 /// an unconsumed forced errno resolves the watch `Ok` and fails the assertion instead of hanging.
 ///
-/// Mutants: `open` names another `PidfdOp`; the forced errno is not consumed.
+/// Mutants: `open` names another `Op`; the forced errno is not consumed.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn exited_by_id_unbounded_names_process_wait_when_pidfd_open_is_refused() {
     let mut child = std_blocker();
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
     child.kill().expect("kill");
-    let forced = crate::wait::backend::fault::force_pidfd_open_errno_once(rustix::io::Errno::ACCESS);
+    let forced = crate::os_process::linux::open::fault::force_pidfd_open_errno_once(rustix::io::Errno::ACCESS);
     let result = exited_by_id(id, None).await;
     drop(forced);
     child.wait().expect("reap");
@@ -568,7 +568,7 @@ async fn exited_by_id_resolves_immediately_on_an_identity_mismatch() {
     let stale = ProcessId::from_parts_for_test(real.pid(), real.start_token_raw() ^ 1);
 
     let (armed_tx, armed_rx) = std::sync::mpsc::channel();
-    let _armed_guard = crate::wait::backend::armed_probe::install(armed_tx);
+    let _armed_guard = crate::os_process::windows::cancel::armed_probe::install(armed_tx);
 
     let exited = exited_by_id(stale, Some(Duration::from_secs(30)))
         .await

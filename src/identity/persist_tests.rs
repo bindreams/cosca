@@ -192,8 +192,8 @@ fn platform_current_names_this_host() {
 }
 
 // A pid is data from a file like everything else in the record, and the crate's Unix code
-// treats "not a single-process target" as impossible: `src/wait/linux.rs` does
-// `Pid::from_raw(id.pid() as i32).expect("a resolvable ProcessId is never pid 0")`, which
+// treats "not a single-process target" as impossible: `open_verified` does
+// `Pid::from_raw(...).expect("a resolvable ProcessId is never pid 0")`, which
 // PANICS on 0, and `src/identity/probe.rs` documents that a value above `i32::MAX` wraps
 // negative, where `kill(-N, sig)` hits a whole process group. Restoring such a pid must be
 // a typed rejection, never a panic — and never a signal to the wrong target.
@@ -447,7 +447,7 @@ fn a_foreign_platform_record_is_refused_with_a_typed_error() {
 #[skuld::test]
 fn a_pid_zero_record_is_refused_through_the_live_path() {
     // The path that matters: a corrupt or hand-edited file reaching `Process::kill` with
-    // pid 0 would panic in `src/wait/linux.rs` rather than return an error.
+    // pid 0 would panic in `open_verified` rather than return an error.
     let mut record = ProcessId::current().to_record().expect("to_record");
     record.pid = 0;
     assert_refused(&record, RecordErrorKind::InvalidPid);

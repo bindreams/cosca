@@ -8,7 +8,7 @@ use super::fixtures::{park_holder, spawn_std_blocker, Blocker};
 use crate::child::shared::seams::{self, ForcedWait};
 use crate::child::shared::SharedChild;
 use crate::identity::ProcessId;
-use crate::wait::backend::fault;
+use crate::os_process::linux::open::fault;
 use crate::wait::exit_only::seams::{self as exit_seams, ForcedReap, HolderStep};
 
 fn far() -> Instant {
@@ -304,7 +304,7 @@ fn adopt_treats_a_pidfd_that_is_not_our_child_as_gone() {
     // SAFETY: `getppid` takes no arguments and cannot fail.
     let parent = unsafe { libc::getppid() } as u32;
     let id = ProcessId::of(parent).found();
-    let opened = crate::wait::backend::open_own_child(parent, id).expect("open");
+    let opened = crate::wait::exit_only::open_own_child(parent, id).expect("open");
     assert!(opened.is_none(), "our parent is never our child");
 }
 

@@ -300,7 +300,7 @@ pub(super) fn read_byte(fd: i32) -> Option<u8> {
 }
 
 fn receipt(kq: &Kqueue, change: KEvent) -> Result<(), i32> {
-    match crate::wait::backend::add_with_receipt(kq, change) {
+    match crate::os_process::macos::kqueue::add_with_receipt(kq, change) {
         Ok(0) => Ok(()),
         Ok(errno) => Err(errno as i32),
         Err(e) => panic!("kevent registration failed outright: {e}"),

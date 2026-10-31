@@ -114,7 +114,7 @@ pub(super) fn readable_watch(fd: std::os::fd::BorrowedFd<'_>) -> Result<super::m
         0,
         0,
     );
-    match crate::wait::backend::add_with_receipt(&kq, change)? {
+    match crate::os_process::macos::kqueue::add_with_receipt(&kq, change)? {
         0 => Ok(super::macos::ExitWatch::new(kq)),
         errno => Err(Error::Io(std::io::Error::from_raw_os_error(errno as i32))),
     }
@@ -173,11 +173,11 @@ struct Source(std::os::windows::io::OwnedHandle);
 #[cfg(windows)]
 impl Source {
     fn new() -> Self {
-        Self(crate::wait::backend::new_cancel_event().expect("FakeProcess: create the event"))
+        Self(crate::os_process::windows::cancel::new_cancel_event().expect("FakeProcess: create the event"))
     }
 
     fn fire(&self) {
-        crate::wait::backend::signal_cancel(&self.0);
+        crate::os_process::windows::cancel::signal_cancel(&self.0);
     }
 
     fn wait_for(&self) -> WaitFor<'_> {

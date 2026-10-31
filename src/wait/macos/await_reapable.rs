@@ -41,7 +41,10 @@ use std::time::{Duration, Instant};
 
 use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 
-use super::{add_with_receipt, OnTracer, TracerWatch};
+use super::{OnTracer, TracerWatch};
+#[cfg(test)]
+use crate::os_process::macos::kqueue::test_hooks;
+use crate::os_process::macos::kqueue::{add_with_receipt, kevent_timeout};
 use crate::wait::exit_only::{self, Foreign, Peek, Target};
 
 /// The wait's verdict.
@@ -87,7 +90,7 @@ fn register(kq: &Kqueue, pid: u32) -> io::Result<bool> {
         return Err(io::Error::from_raw_os_error(added as i32));
     }
     #[cfg(test)]
-    if super::test_hooks::take_forced_esrch_registration() {
+    if test_hooks::take_forced_esrch_registration() {
         return Ok(true);
     }
     let proc_exit = KEvent::new(
@@ -148,7 +151,7 @@ fn scan(events: &[KEvent], pid: u32, tracer: &mut TracerWatch) -> (bool, bool) {
     let (mut reap, mut exit) = (false, false);
     for event in events {
         #[cfg(test)]
-        super::test_hooks::record_event(event.filter().map_or(0, |f| f as i16), event.fflags().bits());
+        test_hooks::record_event(event.filter().map_or(0, |f| f as i16), event.fflags().bits());
         if tracer.fired(event, pid) {
             continue;
         }
@@ -175,7 +178,7 @@ enum Block {
 
 impl Block {
     /// The time this call may block, recomputed from the clock on every call. It is uncapped:
-    /// [`kevent_timeout`](super::kevent_timeout) caps what reaches the syscall, and a capped
+    /// [`kevent_timeout`](crate::os_process::macos::kqueue::kevent_timeout) caps what reaches the syscall, and a capped
     /// call that times out is just another round against the real deadline.
     fn timeout(self) -> Option<Duration> {
         match self {
@@ -201,13 +204,13 @@ impl Block {
 /// the interrupted call spent time.
 fn kevent_round(kq: &Kqueue, events: &mut [KEvent; BATCH], block: Block) -> io::Result<usize> {
     loop {
-        let timeout = block.timeout().map(super::kevent_timeout);
+        let timeout = block.timeout().map(kevent_timeout);
         #[cfg(test)]
         {
             let armed = timeout.map(|t| Duration::new(t.tv_sec as u64, t.tv_nsec as u32));
-            super::test_hooks::record_await_kevent(armed);
+            test_hooks::record_await_kevent(armed);
             if armed != Some(Duration::ZERO) {
-                if let Some(elapsed) = super::test_hooks::take_forced_eintr() {
+                if let Some(elapsed) = test_hooks::take_forced_eintr() {
                     crate::wait::test_clock::advance_by_elapsed_if_frozen(elapsed);
                     continue;
                 }
@@ -249,9 +252,9 @@ pub(crate) fn await_reapable_on(
         if repeek {
             #[cfg(test)]
             {
-                super::test_hooks::fire_before_repeek();
+                test_hooks::fire_before_repeek();
                 if backoff {
-                    super::test_hooks::fire_esrch_repeek();
+                    test_hooks::fire_esrch_repeek();
                 }
             }
         }
@@ -283,7 +286,7 @@ pub(crate) fn await_reapable_on(
         }
         // Block: on the kqueue alone until `NOTE_EXIT`, then per backoff interval.
         #[cfg(test)]
-        super::test_hooks::fire_kevent_round(round);
+        test_hooks::fire_kevent_round(round);
         #[cfg(test)]
         {
             round += 1;
@@ -367,7 +370,7 @@ pub(crate) fn drain_exit_events(kq: &Kqueue, pid: u32, tracer: &mut TracerWatch)
 )]
 pub(crate) fn arm_backoff_timer(kq: &Kqueue, interval: Duration) -> io::Result<()> {
     #[cfg(test)]
-    super::test_hooks::record_backoff_timer(interval);
+    test_hooks::record_backoff_timer(interval);
     let timer = KEvent::new(
         0,
         EventFilter::EVFILT_TIMER,
@@ -385,3 +388,7 @@ pub(crate) fn await_reapable(pid: u32, unique: Option<u64>, deadline: Option<Ins
     let kq = Kqueue::new().map_err(io::Error::from)?;
     await_reapable_on(&kq, pid, unique, deadline)
 }
+
+#[cfg(test)]
+#[path = "await_reapable_tests.rs"]
+mod await_reapable_tests;

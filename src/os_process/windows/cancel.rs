@@ -1,49 +1,13 @@
-//! Windows process-handle primitives for [`crate::os_process`]. `OpenProcess` returns a HANDLE that
-//! pins the kernel object, so a reused pid cannot fool it; we re-verify the start_token once at
-//! open. No reaping concept on Windows.
+//! The Windows cancel event and the process wait it releases, for [`crate::os_process`]'s async
+//! driver and the async raw spawn backend.
 
 use std::os::windows::io::{AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
 use std::time::Instant;
 
-use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
-use windows::Win32::System::Threading::{
-    CreateEventW, SetEvent, WaitForMultipleObjects, PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
-};
+use windows::Win32::Foundation::{HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForMultipleObjects};
 
 use crate::error::{win32_io_error, Error};
-use crate::identity::{HandleIdentity, Liveness, Opened, ProcessId};
-
-fn close(handle: HANDLE) {
-    // Match identity/windows.rs: a failed CloseHandle of an owned handle is a contract
-    // violation, asserted in debug.
-    let closed = unsafe { CloseHandle(handle) };
-    debug_assert!(closed.is_ok(), "CloseHandle of an owned process handle should not fail");
-}
-
-/// Whether `handle` still names `id`'s process. `Ok(false)`: the pid was recycled before the
-/// open, so the original is gone. The handle is closed on `Ok(false)` and on `Err`; on `Ok(true)`
-/// the caller still holds it.
-fn holds_process(handle: HANDLE, id: ProcessId) -> Result<bool, Error> {
-    match crate::identity::windows_handle_identity(handle, id) {
-        HandleIdentity::Same => Ok(true),
-        HandleIdentity::Different => {
-            close(handle);
-            Ok(false)
-        }
-        HandleIdentity::Unreadable(e) => {
-            log::warn!(
-                "wait: pid {} opened but its identity could not be verified ({e})",
-                id.pid()
-            );
-            close(handle);
-            Err(Error::Unassessable {
-                detail: format!("pid {} opened but its identity could not be verified", id.pid()),
-                source: Some(win32_io_error(e)),
-            })
-        }
-    }
-}
 
 /// An unnamed manual-reset event, initially unsignaled, for releasing
 /// [`wait_process_or_cancel`] early. Signal with [`signal_cancel`]; `OwnedHandle` closes it.
@@ -92,68 +56,6 @@ pub(crate) fn signal_cancel(event: &OwnedHandle) {
         // loudest trace we can for the possible unbounded park.
         log::error!("SetEvent failed during unwind ({e}); a parked watcher may not release");
     }
-}
-
-/// Opens `id` for waiting and verifies the handle names that process. `None`: it is gone, or its
-/// pid was recycled before the open. The caller closes the handle.
-pub(crate) fn open_verified(id: ProcessId) -> Result<Option<HANDLE>, Error> {
-    open_held(
-        id,
-        PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
-        "to watch for its exit",
-        "an exit",
-    )
-}
-
-/// [`open_verified`] for terminating: the mask holds `PROCESS_TERMINATE` and the query right, so
-/// the SAME held handle pins the kernel object (pid-reuse-safe) and lets identity be re-verified
-/// before terminating.
-pub(crate) fn open_verified_for_kill(id: ProcessId) -> Result<Option<HANDLE>, Error> {
-    open_held(
-        id,
-        PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
-        "to terminate it",
-        "a kill",
-    )
-}
-
-/// Opens `id` with `access` and verifies the handle names that process. `to` and `not_reported`
-/// word the denial's error: "pid N could not be opened `to`" and "not `not_reported`".
-fn open_held(
-    id: ProcessId,
-    access: PROCESS_ACCESS_RIGHTS,
-    to: &str,
-    not_reported: &str,
-) -> Result<Option<HANDLE>, Error> {
-    let handle = match crate::identity::windows_open_classified(id.pid(), access) {
-        Opened::Found(h) => h,
-        Opened::Gone => return Ok(None), // no such pid => exited
-        // Denied on a LIVE process => a real failure: reporting "exited" would let a
-        // supervisor conclude a healthy service had died, and an Unknown liveness must NOT be
-        // reported as a successful kill. The error comes from the classifier: `is_alive()` below
-        // overwrites the thread's last-error.
-        Opened::Denied(e) => {
-            return match id.is_alive() {
-                Liveness::Dead => Ok(None),
-                Liveness::Alive | Liveness::Unknown => {
-                    log::warn!(
-                        "wait: pid {} could not be opened {to} ({e}) - reporting an error, not {not_reported}",
-                        id.pid()
-                    );
-                    Err(Error::Unassessable {
-                        detail: format!("pid {} could not be opened {to}", id.pid()),
-                        source: Some(win32_io_error(e)),
-                    })
-                }
-            }
-        }
-    };
-    // The handle already in hand answers the recycle question with no race; a second by-pid
-    // lookup would not. An UNREADABLE token is not proof the target is gone, so it is an error.
-    if !holds_process(handle, id)? {
-        return Ok(None); // recycled before open - the original is gone
-    }
-    Ok(Some(handle))
 }
 
 /// Wait on a process handle already in hand, releasable early: the blocking half of the async
@@ -271,5 +173,5 @@ pub(crate) mod armed_probe {
 }
 
 #[cfg(test)]
-#[path = "windows_tests.rs"]
-mod windows_tests;
+#[path = "cancel_tests.rs"]
+mod cancel_tests;

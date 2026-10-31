@@ -119,8 +119,8 @@ async fn an_async_reap_of_a_child_whose_tracer_dies_during_its_exit_is_woken_by_
     use std::rc::Rc;
 
     use crate::identity::{ppid_fault, uniq_info, ReadPurpose, UniqRead, LAUNCHD};
+    use crate::os_process::macos::kqueue::test_hooks;
     use crate::signal::RootState;
-    use crate::wait::backend::test_hooks;
     use crate::wait::exit_only::Peek;
 
     let pid = std::process::id();
@@ -204,7 +204,7 @@ fn still_running(looked: std::io::Result<crate::wait::exit_only::Peek>) -> Resul
 #[skuld::test]
 async fn an_async_reap_whose_tracer_registration_is_refused_cannot_watch() {
     use crate::identity::Link;
-    use crate::wait::backend::tracer_seams::{force_links, refuse_next_registration};
+    use crate::wait::macos::tracer_seams::{force_links, refuse_next_registration};
 
     let (pid, unique, tracer, _parent) = stand_in_traced_by_a_blocker();
     let _links = force_links([Link::Found {
@@ -228,7 +228,7 @@ async fn an_async_reap_whose_tracer_registration_is_refused_cannot_watch() {
 async fn an_async_reap_whose_tracer_cannot_be_read_finds_the_child_unknown() {
     use crate::identity::Link;
     use crate::signal::RootState;
-    use crate::wait::backend::tracer_seams::force_links;
+    use crate::wait::macos::tracer_seams::force_links;
 
     let (pid, unique, tracer, _parent) = stand_in_traced_by_a_blocker();
     let _links = force_links([Link::Refused(libc::EPERM)]);
@@ -252,9 +252,9 @@ async fn an_async_reap_whose_tracer_cannot_be_read_finds_the_child_unknown() {
 #[skuld::test]
 async fn an_async_reap_whose_tracer_is_gone_looks_again_when_the_recheck_timer_fires() {
     use crate::identity::Link;
-    use crate::wait::backend::test_hooks;
-    use crate::wait::backend::tracer_seams::force_links;
+    use crate::os_process::macos::kqueue::test_hooks;
     use crate::wait::exit_only::Peek;
+    use crate::wait::macos::tracer_seams::force_links;
 
     let (pid, unique, tracer, _parent) = stand_in_traced_by_a_blocker();
     let _links = force_links([Link::Gone, Link::Gone]);

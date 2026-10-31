@@ -9,7 +9,7 @@ use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 use super::{seams::force_links, OnTracer, TracerWatch, WalkError};
 use crate::child::spawn::identity_macos_tests::{other_unique_id, std_blocker_with_unique};
 use crate::identity::{uniq_fault, Link, ReadPurpose, UniqRead};
-use crate::wait::backend::test_hooks::{event_pending, send_signal};
+use crate::os_process::macos::kqueue::test_hooks::{event_pending, send_signal};
 
 /// A live blocker on a held stdin, and its unique id. Dropping it ends and reaps the blocker.
 struct Live {
@@ -66,7 +66,7 @@ fn drain(kq: &Kqueue) {
         .kevent(
             &[],
             &mut events,
-            Some(crate::wait::backend::kevent_timeout(Duration::ZERO)),
+            Some(crate::os_process::macos::kqueue::kevent_timeout(Duration::ZERO)),
         )
         .expect("drain the kqueue")
         > 0

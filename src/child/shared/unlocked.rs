@@ -54,7 +54,7 @@ impl SharedChild {
         };
         #[cfg(test)]
         exit_only::seams::step(exit_only::seams::HolderStep::Poll);
-        if crate::wait::poll_pidfd_exit(pidfd.as_fd(), deadline.map(Some))? {
+        if crate::os_process::linux::poll_pidfd_exit(pidfd.as_fd(), deadline.map(Some))? {
             return Ok(Unlocked::ExitSeen);
         }
         // Expired: one final peek.
@@ -140,7 +140,7 @@ impl SharedChild {
 impl SharedChild {
     /// The kqueue wait: `EVFILT_PROC` plus a peek, by number.
     fn platform_wait(&self, deadline: Option<Instant>) -> io::Result<Unlocked> {
-        use crate::wait::backend::{await_reapable, Waited};
+        use crate::wait::macos::{await_reapable, Waited};
         Ok(match await_reapable(self.id.pid(), self.identity, deadline)? {
             Waited::Reapable => Unlocked::ExitSeen,
             Waited::DeadlinePassed => Unlocked::DeadlinePassed,

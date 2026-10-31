@@ -806,7 +806,7 @@ async fn windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reap
     let (armed_tx, armed_rx) = std::sync::mpsc::channel();
     // Held across the `.await` below: `cancellable_blocking` reads THIS thread's installed observer
     // before dispatching to its blocking-pool thread — see `armed_probe`'s own doc.
-    let _armed_guard = crate::wait::backend::armed_probe::install(armed_tx);
+    let _armed_guard = crate::os_process::windows::cancel::armed_probe::install(armed_tx);
 
     crate::log_capture::install();
     let mark = crate::log_capture::mark();

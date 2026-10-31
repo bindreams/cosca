@@ -135,3 +135,62 @@ pub(super) fn reap_blocking(target: &Target<'_>) -> io::Result<Result<super::Rea
         }
     }
 }
+
+/// Open a pidfd for `pid`, a child this process spawned, and confirm it names that child.
+/// `Ok(None)` means the child is gone: something else reaped it, so there is nothing to wait on.
+///
+/// This never goes through [`open_verified`](crate::os_process::linux::open::open_verified), whose
+/// `EINVAL`/`ENOENT` arm applies foreign-process semantics: for a child we forked the number is a
+/// thread-group leader, so `ESRCH`, `EINVAL` and `ENOENT` alike mean it is gone (before 6.16 an
+/// `EINVAL` covers a reaped leader whose number lives on as a PGID or SID; from 6.16 an `ESRCH`
+/// does, and `ENOENT` covers a number reused by a non-leader thread). A refusal (`ENOSYS`,
+/// `EPERM`, `EACCES`, `ENODEV`) is [`Error::Unsupported`](crate::error::Error::Unsupported), with
+/// no fallback; any other errno is `Io`.
+///
+/// - With `Some(id)`, and only when the checked `/proc` view is
+///   [`ProcView::Same`](crate::identity::ProcView::Same), the identity is checked too: `Gone` is
+///   gone, and `Unknown` skips the check (never a release). A diverged or unassessable view skips
+///   it: a live child is never released as foreign because of the view, and the confirmation
+///   below decides.
+/// - Then, on every view, `waitid(P_PIDFD, WEXITED | WNOHANG | WNOWAIT)` confirms the pidfd names
+///   our child: `ECHILD` is gone. A pid reused by a process that is not our child answers it,
+///   even if its start time matched.
+#[cfg(test)]
+pub(crate) fn open_own_child(
+    pid: u32,
+    id: Option<crate::identity::ProcessId>,
+) -> Result<Option<rustix::fd::OwnedFd>, crate::error::Error> {
+    use std::os::fd::AsFd;
+
+    use rustix::process::Pid;
+
+    use crate::error::Error;
+    use crate::identity::{Existence, ProcView};
+    use crate::os_process::linux::open::{exists_checked, pidfd_open_checked, spawn_open_error};
+
+    debug_assert!(
+        pid <= i32::MAX as u32,
+        "pid {pid} exceeds i32::MAX; pidfd cast would truncate"
+    );
+    let raw = Pid::from_raw(pid as i32).expect("a spawned child's pid is never 0");
+    let pidfd = match pidfd_open_checked(raw) {
+        Ok(pidfd) => pidfd,
+        Err(rustix::io::Errno::SRCH | rustix::io::Errno::INVAL | rustix::io::Errno::NOENT) => return Ok(None),
+        Err(e) => return Err(spawn_open_error(e)),
+    };
+    // Never in a stdio slot: with 0, 1 or 2 closed, the lowest free number is one, and the
+    // application may `dup2` its stdio back over it, destroying the pidfd.
+    let pidfd = crate::above_stdio::above_stdio(pidfd).map_err(Error::Io)?;
+    if let Some(id) = id {
+        if let ProcView::Same(proc_dir) = crate::identity::proc_view() {
+            if exists_checked(id, &proc_dir) == Existence::Gone {
+                return Ok(None);
+            }
+        }
+    }
+    match super::peek(&Target::PidFd(pidfd.as_fd())) {
+        Ok(Peek::Foreign(Foreign::Gone)) => Ok(None),
+        Ok(_) => Ok(Some(pidfd)),
+        Err(e) => Err(Error::Io(e)),
+    }
+}

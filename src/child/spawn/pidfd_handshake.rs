@@ -173,7 +173,7 @@ pub(crate) fn register(cmd: &mut std::process::Command) -> Pending {
     let fault = fault::child_fault();
     // The child opens its own pidfd, where a thread-local seam cannot reach: take it here.
     #[cfg(test)]
-    let scripted = crate::wait::backend::take_scripted_pidfd_open();
+    let scripted = crate::os_process::linux::open::take_scripted_pidfd_open();
     // SAFETY: the hook reads atomics and makes only direct syscalls (libc or rustix, see
     // `open_self`) on integers and fd numbers; `io::Error::from_raw_os_error` does not allocate.
     let shared = unsafe {
@@ -675,7 +675,9 @@ fn help(parent_end: &OwnedFd, #[cfg(test)] seams: &fault::HelperSeams) -> Outcom
     seams.wait_verdict();
     let pidfd = match report {
         Ok(Report::Pidfd(pidfd)) => pidfd,
-        Ok(Report::Errno(errno)) => return Outcome::Failed(crate::wait::backend::spawn_open_error(errno), None),
+        Ok(Report::Errno(errno)) => {
+            return Outcome::Failed(crate::os_process::linux::open::spawn_open_error(errno), None)
+        }
         Ok(Report::Eof) => return Outcome::NoReport,
         Err(e) => return Outcome::Failed(e, None),
     };

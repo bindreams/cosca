@@ -25,10 +25,10 @@ use crate::child::spawn::{
 use crate::command::Command;
 use crate::error::{win32_io_error, Error};
 use crate::identity::{windows_terminate_held, Termination};
+use crate::os_process::windows::cancel::{new_cancel_event, signal_cancel};
 use crate::stdio::{Fd, ResolvedStdio};
 use crate::tokio::child::{Child, ProcSource};
 use crate::tokio::stdio::OwnedStd;
-use crate::wait::backend::{new_cancel_event, signal_cancel};
 
 use sync_raw::{exit_status, wait_handle_or_cancel, WaitOutcome};
 
@@ -180,7 +180,7 @@ struct CancelGuard(Arc<OwnedHandle>);
 
 impl Drop for CancelGuard {
     fn drop(&mut self) {
-        // `signal_cancel` asserts loudly on failure (see wait/windows.rs); Drop cannot propagate.
+        // `signal_cancel` asserts loudly on failure; Drop cannot propagate.
         signal_cancel(&self.0);
     }
 }

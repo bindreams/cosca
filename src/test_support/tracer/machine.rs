@@ -765,7 +765,7 @@ fn injected(tag: &str, directive: &str) -> Batch {
 }
 
 fn real_round(kq: &Kqueue, timeout: Option<Duration>) -> Batch {
-    let timeout = timeout.map(crate::wait::backend::kevent_timeout);
+    let timeout = timeout.map(crate::os_process::macos::kqueue::kevent_timeout);
     let blank = || KEvent::new(0, EventFilter::EVFILT_PROC, EvFlags::empty(), FilterFlag::empty(), 0, 0);
     let mut events = [blank(), blank(), blank()];
     let n = loop {

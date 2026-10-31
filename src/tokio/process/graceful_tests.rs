@@ -109,15 +109,15 @@ const ESCALATION_CASES: [([Option<rustix::io::Errno>; 3], &str, bool); 3] = [
 /// A refused `pidfd_open` in the middle of `graceful_shutdown` names the step that hit it: the
 /// grace wait is `process wait`, the escalation `process kill`.
 ///
-/// Mutants: the escalation is `terminate_by_id`, or names another `PidfdOp`; the grace wait
-/// names another `PidfdOp`; a refused wait skips the escalation.
+/// Mutants: the escalation is `terminate_by_id`, or names another `Op`; the grace wait
+/// names another `Op`; a refused wait skips the escalation.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn a_refused_pidfd_open_during_graceful_shutdown_names_the_step_that_hit_it() {
     for (script, op, killed) in ESCALATION_CASES {
         let mut child = spawn_term_ignoring_blocker();
         let p = crate::tokio::Process::from_pid(child.id()).found().expect("resolves");
-        let forced = crate::wait::backend::fault::force_pidfd_open_script(script);
+        let forced = crate::os_process::linux::open::fault::force_pidfd_open_script(script);
         let result = p.graceful_shutdown(Duration::ZERO).await;
         drop(forced);
         match result {

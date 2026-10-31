@@ -11,7 +11,7 @@ use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent};
 use super::{fill_pipe_to_capacity, fionread, kill_release_reap, marker_pipe, spawn_marker_holder};
 use crate::containment::marker_eof::{arm, block_until_drained, drain_test_hooks, interpret_read_event, probe};
 use crate::containment::TreeDrain;
-use crate::wait::backend::test_hooks;
+use crate::os_process::macos::kqueue::test_hooks;
 use crate::wait::test_clock;
 
 /// This system's real pipe buffer capacity, MEASURED rather than assumed: fill a throwaway,

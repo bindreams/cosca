@@ -124,7 +124,7 @@ pub(super) fn peek_holder(target: &Target<'_>, verified: bool) -> io::Result<(Pe
         // answers `ECHILD` (`src/test_support/tracer.rs`), and the tracer's hand-back re-sends
         // `NOTE_EXIT`. The pid names our child and a live process other than launchd holds it:
         // running, held by that tracer. No `NOTE_EXIT` of the child's reaches us before the
-        // hand-back, so a kqueue wait also watches the tracer's exit (`wait::backend::TracerWatch`).
+        // hand-back, so a kqueue wait also watches the tracer's exit (`wait::macos::TracerWatch`).
         // A child held by launchd is a zombie (or a child mid-exit) whose tracer died:
         // XNU reparents it to launchd and keeps `p_oppid` naming us (xnu-12377.121.6
         // `kern_exit.c:2612-2613` and `:2748`, which sends the `SIGCHLD` to launchd). It comes

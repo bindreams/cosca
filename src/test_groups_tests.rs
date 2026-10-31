@@ -133,7 +133,7 @@ mod reexec {
 
     /// A real `NAMESPACES` test: it unshares namespaces, so only a granted group may run it.
     const NAMESPACES_TEST: &str =
-        "wait::backend::linux_namespace_tests::namespaces_a_status_mounted_over_below_proc_keeps_live_foreign_kills_working";
+        "os_process::linux::open::open_namespace_tests::namespaces_a_status_mounted_over_below_proc_keeps_live_foreign_kills_working";
 
     /// A real `ROOT` test: it needs a DAC bypass, so only a granted group may run it.
     const ROOT_TEST: &str = "resolve::resolve_base_tests::a_denied_candidate_is_denied_by_an_exec_child";

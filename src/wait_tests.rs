@@ -531,6 +531,28 @@ fn rearm_until_panics_when_its_advance_is_dropped() {
     .ok();
 }
 
+/// `wait_until` with its frozen-clock advance dropped fails at the second round.
+///
+/// Mutant: drop the `advance_by_elapsed_if_frozen` call in `rearm_until` -> same panic, without
+/// the seam. Mutant: drop `rearm_until`'s `check.round()` -> the second round fails the test with
+/// a different message, instead of the loop spinning forever.
+#[cfg(windows)]
+#[skuld::test]
+#[should_panic(expected = "no progress")]
+fn wait_until_panics_when_its_advance_is_dropped() {
+    use windows::Win32::Foundation::WAIT_TIMEOUT;
+
+    let (_clock, at) = test_clock::FrozenClockGuard::install();
+    let _skip = test_clock::SkipAdvanceGuard::install();
+    let deadline = Some(Some(at + Duration::from_secs(3600)));
+    let mut waits = 0;
+    super::wait_until(deadline, |_ms| {
+        waits += 1;
+        assert!(waits < 2, "the check let a second round run");
+        WAIT_TIMEOUT
+    });
+}
+
 /// The env var that arms [`fixture_round_check_violation_while_panicking`].
 const ROUND_CHECK_ABORT_MARKER: &str = "COSCA_FIXTURE_ROUND_CHECK_ABORT";
 
