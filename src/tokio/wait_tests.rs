@@ -568,7 +568,7 @@ async fn exited_by_id_resolves_immediately_on_an_identity_mismatch() {
     let stale = ProcessId::from_parts_for_test(real.pid(), real.start_token_raw() ^ 1);
 
     let (armed_tx, armed_rx) = std::sync::mpsc::channel();
-    let _armed_guard = crate::wait::backend::armed_probe::install(armed_tx);
+    let _armed_guard = crate::os_process::windows::armed_probe::install(armed_tx);
 
     let exited = exited_by_id(stale, Some(Duration::from_secs(30)))
         .await

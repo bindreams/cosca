@@ -1,6 +1,6 @@
-//! The time, deadline and blocking-wait helpers the wait drivers share, the Windows handle
-//! primitives behind them (`backend`), and macOS child reaping (`macos`). The by-identity wait and
-//! signals are [`crate::os_process`]. NEVER reaps: the target's real parent collects the zombie.
+//! The time, deadline and blocking-wait helpers the wait drivers share, and macOS child reaping
+//! (`macos`). The by-identity wait and signals are [`crate::os_process`]. NEVER reaps: the target's
+//! real parent collects the zombie.
 
 use std::time::{Duration, Instant};
 
@@ -10,10 +10,6 @@ pub(crate) mod teardown_warn;
 
 #[cfg(target_os = "macos")]
 pub(crate) mod macos;
-
-#[cfg(windows)]
-#[path = "wait/windows.rs"]
-pub(crate) mod backend;
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 compile_error!("cosca::wait is implemented only for Linux, macOS, and Windows");

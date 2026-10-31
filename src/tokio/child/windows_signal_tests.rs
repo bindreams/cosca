@@ -99,7 +99,7 @@ fn a_terminate_failure_carries_its_win32_code() {
     use std::os::windows::io::AsRawHandle;
     use windows::Win32::Foundation::{ERROR_INVALID_HANDLE, HANDLE};
 
-    let event = crate::wait::backend::new_cancel_event().expect("create an event");
+    let event = crate::os_process::windows::new_cancel_event().expect("create an event");
     let err = terminate_unreaped(HANDLE(event.as_raw_handle())).expect_err("an event cannot be terminated");
     let crate::error::Error::Io(err) = err else {
         panic!("expected Io, got {err:?}");

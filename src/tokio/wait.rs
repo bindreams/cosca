@@ -64,10 +64,10 @@ pub(crate) async fn cancellable_blocking<T: Send + 'static>(
     struct SignalOnDrop(std::sync::Arc<std::os::windows::io::OwnedHandle>);
     impl Drop for SignalOnDrop {
         fn drop(&mut self) {
-            crate::wait::backend::signal_cancel(&self.0);
+            crate::os_process::windows::signal_cancel(&self.0);
         }
     }
-    let cancel = std::sync::Arc::new(crate::wait::backend::new_cancel_event()?);
+    let cancel = std::sync::Arc::new(crate::os_process::windows::new_cancel_event()?);
     let _guard = SignalOnDrop(cancel.clone());
     // Test-only: the probes are thread-local and the closure runs on a blocking-pool thread, so
     // capture them here, before any yield, and re-install inside.
@@ -566,10 +566,10 @@ async fn job_wait_tree_drained(
     struct SignalOnDrop(std::sync::Arc<std::os::windows::io::OwnedHandle>);
     impl Drop for SignalOnDrop {
         fn drop(&mut self) {
-            crate::wait::backend::signal_cancel(&self.0);
+            crate::os_process::windows::signal_cancel(&self.0);
         }
     }
-    let cancel = std::sync::Arc::new(crate::wait::backend::new_cancel_event()?);
+    let cancel = std::sync::Arc::new(crate::os_process::windows::new_cancel_event()?);
     let _guard = SignalOnDrop(cancel.clone());
     // SAFETY: `cancel`'s OwnedHandle is kept alive by the Arc clone captured in the
     // spawn_blocking closure below (and by `_guard`/`cancel` here) for the whole wait.

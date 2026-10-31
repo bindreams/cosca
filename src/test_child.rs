@@ -573,7 +573,7 @@ pub(crate) struct DrainSignal {
 impl DrainSignal {
     pub(crate) fn new() -> Self {
         Self {
-            event: crate::wait::backend::new_cancel_event().expect("create the drain event"),
+            event: crate::os_process::windows::new_cancel_event().expect("create the drain event"),
             outcome: shared::DrainOutcome::default(),
         }
     }
@@ -591,12 +591,16 @@ impl DrainSignal {
     /// Records the result of `wait_tree` and wakes the acceptor.
     pub(crate) fn record<T: std::fmt::Debug, E: std::fmt::Display>(&self, result: Result<T, E>) {
         self.outcome.store(result);
-        crate::wait::backend::signal_cancel(&self.event);
+        crate::os_process::windows::signal_cancel(&self.event);
     }
 
     /// Runs `wait` (a `wait_tree`) and records its result; a `wait` that panics records an error.
     pub(crate) fn watch<T: std::fmt::Debug, E: std::fmt::Display>(&self, wait: impl FnOnce() -> Result<T, E>) {
-        shared::run_watcher(&self.outcome, || crate::wait::backend::signal_cancel(&self.event), wait);
+        shared::run_watcher(
+            &self.outcome,
+            || crate::os_process::windows::signal_cancel(&self.event),
+            wait,
+        );
     }
 }
 
@@ -613,8 +617,8 @@ pub(crate) fn accept_or_signalled(listener: &std::net::TcpListener, drained: &Dr
     use windows::Win32::Networking::WinSock::{WSAEventSelect, FD_ACCEPT, SOCKET, WSAEVENT};
     use windows::Win32::System::Threading::{WaitForMultipleObjects, INFINITE};
 
-    let accept_event =
-        crate::wait::backend::new_cancel_event().expect("create an event for the listener's accept-readiness watch");
+    let accept_event = crate::os_process::windows::new_cancel_event()
+        .expect("create an event for the listener's accept-readiness watch");
     let sock = SOCKET(listener.as_raw_socket() as usize);
     // SAFETY: `sock` is the listener's own live socket; the event is a live, owned handle.
     let rc = unsafe {
@@ -779,7 +783,7 @@ fn watch_macos(listener: &std::net::TcpListener, target: crate::identity::Proces
     }
 }
 
-/// Windows: the crate's own identity-verified [`crate::wait::backend::open_verified`] process
+/// Windows: the crate's own identity-verified [`crate::os_process::windows::open_verified`] process
 /// handle and the listener's `FD_ACCEPT` event (via `WSAEventSelect`) in one explicit
 /// `WaitForMultipleObjects`.
 #[cfg(windows)]
@@ -790,13 +794,14 @@ fn watch_windows(listener: &std::net::TcpListener, target: crate::identity::Proc
     use windows::Win32::Networking::WinSock::{WSAEventSelect, FD_ACCEPT, SOCKET, WSAEVENT};
     use windows::Win32::System::Threading::{WaitForMultipleObjects, INFINITE};
 
-    let Some(process) = crate::wait::backend::open_verified(target).expect("open a handle to watch the target") else {
+    let Some(process) = crate::os_process::windows::open_verified(target).expect("open a handle to watch the target")
+    else {
         return WatchEvent::Died;
     };
     // SAFETY: `open_verified` returns a handle the caller owns; this wraps it so it is closed.
     let process = unsafe { OwnedHandle::from_raw_handle(process.0 as _) };
-    let accept_event =
-        crate::wait::backend::new_cancel_event().expect("create an event for the listener's accept-readiness watch");
+    let accept_event = crate::os_process::windows::new_cancel_event()
+        .expect("create an event for the listener's accept-readiness watch");
     let sock = SOCKET(listener.as_raw_socket() as usize);
     let wsa_event = WSAEVENT(accept_event.as_raw_handle() as _);
     // SAFETY: `sock` is the listener's own live socket; `wsa_event` wraps `accept_event`, a live,

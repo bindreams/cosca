@@ -173,11 +173,11 @@ struct Source(std::os::windows::io::OwnedHandle);
 #[cfg(windows)]
 impl Source {
     fn new() -> Self {
-        Self(crate::wait::backend::new_cancel_event().expect("FakeProcess: create the event"))
+        Self(crate::os_process::windows::new_cancel_event().expect("FakeProcess: create the event"))
     }
 
     fn fire(&self) {
-        crate::wait::backend::signal_cancel(&self.0);
+        crate::os_process::windows::signal_cancel(&self.0);
     }
 
     fn wait_for(&self) -> WaitFor<'_> {
