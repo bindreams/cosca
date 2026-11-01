@@ -843,11 +843,12 @@ impl JobHandle {
     ///
     /// `deadline`: `None` is no deadline (see [`crate::wait::remaining`]). No interval is chosen
     /// anywhere in this path: every round blocks in one `WaitForMultipleObjects` call for exactly
-    /// the caller's own remaining time. An already-elapsed (or `Duration::ZERO`) deadline still gets one real re-enumeration and, if
-    /// any member is still live, one real non-blocking `WaitForMultipleObjects` poll before a
-    /// deadline-based verdict is returned — a stale bound only ever forecloses looping back for
-    /// ANOTHER round, never the current one's own observation. A drained tree is reported
-    /// `AllMembersExited` regardless of how late the caller arrived to look.
+    /// the caller's own remaining time. An already-elapsed (or `Duration::ZERO`) deadline still
+    /// gets one real re-enumeration and, if any member is still live, one real non-blocking
+    /// `WaitForMultipleObjects` poll before a deadline-based verdict is returned — a stale bound
+    /// only ever forecloses looping back for ANOTHER round, never the current one's own
+    /// observation. A drained tree is reported `AllMembersExited` regardless of how late the
+    /// caller arrived to look.
     ///
     /// `cancel`, when given, is appended to every round's wait set (one fewer live member
     /// tracked per round) so a live `WaitForMultipleObjects` releases the instant it is

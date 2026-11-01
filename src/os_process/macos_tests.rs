@@ -20,7 +20,7 @@ fn pipe_watch() -> (std::io::PipeReader, std::io::PipeWriter, ExitWatch) {
 
 /// An already-passed deadline: one non-blocking pass.
 fn expired() -> Option<std::time::Instant> {
-    crate::wait::deadline_from(Duration::ZERO)
+    Some(crate::wait::now())
 }
 
 #[skuld::test]

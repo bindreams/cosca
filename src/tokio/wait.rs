@@ -168,8 +168,7 @@ pub(crate) async fn pidfd_exited_within(pidfd: std::os::fd::BorrowedFd<'_>, grac
             Some(watch) => watch.map(|()| true),
             // The timer can win the first poll before the reactor reports an exit that was already
             // pending: answer from one final non-blocking look.
-            None => crate::os_process::linux::poll_pidfd_exit(pidfd, crate::wait::deadline_from(Duration::ZERO))
-                .map_err(Error::Io),
+            None => crate::os_process::linux::poll_pidfd_exit(pidfd, Some(crate::wait::now())).map_err(Error::Io),
         },
         None => watch_pidfd(watched).await.map(|()| true),
     }

@@ -332,12 +332,12 @@ pub(crate) fn probe(read_end: BorrowedFd<'_>) -> Result<TreeDrain, Error> {
 /// (shared with the proc-exit watch); this function supplies only the marker's own arm and
 /// per-event interpretation (`interpret_read_event`).
 ///
-/// A genuinely unbounded wait (`None`) never drains bytes past the low-water
-/// clamp on a sustained writer — see the module doc for why, and `interpret_read_event` for
-/// where that decision is made. A bounded wait (`Some(_)`, including one already past)
-/// keeps draining as long as its deadline has funding left; once a round starts with the
-/// deadline already elapsed, that round stops draining too (principle 13) — same
-/// `suppress_drain` flag, just also true for that reason.
+/// An unbounded wait (`None`) never drains bytes past the low-water clamp on a sustained
+/// writer — see the module doc for why, and `interpret_read_event` for where that decision is
+/// made. A bounded wait (`Some(_)`, including one already past) keeps draining as long as its
+/// deadline has funding left; once a round starts with the deadline already elapsed, that round
+/// stops draining too (principle 13) — same `suppress_drain` flag, just also true for that
+/// reason.
 pub(crate) fn block_until_drained(read_end: BorrowedFd<'_>, deadline: Option<Instant>) -> Result<TreeDrain, Error> {
     let unbounded_wait = crate::wait::remaining(deadline).is_none();
     let kq = arm(read_end, unbounded_wait)?;
