@@ -323,9 +323,10 @@ pub(crate) fn probe(read_end: BorrowedFd<'_>) -> Result<TreeDrain, Error> {
 /// Block until every marker holder has exited, or until `deadline`.
 ///
 /// `deadline`: `None` = block indefinitely, `Some(at)` = an absolute deadline; a deadline
-/// already in the past still performs exactly one non-blocking check before concluding — the sticky, level-triggered `EV_EOF` a genuinely-already-drained tree
-/// left pending must be observed, not assumed away by the elapsed deadline alone. Uses one
-/// kernel syscall per wait round — no interval is chosen anywhere in this path.
+/// already in the past still performs exactly one non-blocking check before concluding — the
+/// sticky, level-triggered `EV_EOF` a genuinely-already-drained tree left pending must be
+/// observed, not assumed away by the elapsed deadline alone. Uses one kernel syscall per wait
+/// round — no interval is chosen anywhere in this path.
 ///
 /// The per-round deadline-checking and `kevent` mechanics live in `os_process::macos::kqueue::block_on_kqueue`
 /// (shared with the proc-exit watch); this function supplies only the marker's own arm and
