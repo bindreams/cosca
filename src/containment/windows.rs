@@ -841,7 +841,7 @@ impl JobHandle {
     /// is nothing left to re-enumerate at all — see the early return below, which reports
     /// [`Error::Unassessable`](crate::error::Error::Unassessable) rather than guess.
     ///
-    /// `deadline` follows the crate's watch convention (see [`crate::wait::remaining`]). No
+    /// `deadline`: `None` is no deadline (see [`crate::wait::remaining`]). No
     /// interval is chosen anywhere in this path: every round blocks in one
     /// `WaitForMultipleObjects` call for exactly the caller's own remaining time. An
     /// already-elapsed (or `Duration::ZERO`) deadline still gets one real re-enumeration and, if
@@ -862,7 +862,7 @@ impl JobHandle {
     /// through one more round first.
     pub(crate) fn wait_drained(
         &self,
-        deadline: Option<Option<std::time::Instant>>,
+        deadline: Option<std::time::Instant>,
         cancel: Option<HANDLE>,
     ) -> Result<crate::containment::TreeDrain, crate::error::Error> {
         #[cfg(feature = "tokio")]
@@ -1023,7 +1023,7 @@ fn thread_entries_closing(
 /// the handle being closed underneath it.
 pub(crate) fn wait_drained_raw(
     job: HANDLE,
-    deadline: Option<Option<std::time::Instant>>,
+    deadline: Option<std::time::Instant>,
     cancel: Option<HANDLE>,
 ) -> Result<crate::containment::TreeDrain, crate::error::Error> {
     use crate::containment::TreeDrain;

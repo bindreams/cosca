@@ -91,8 +91,7 @@ fn a_quiet_live_holder_resolves_in_one_real_blocking_kevent_call() {
     let (_clock_guard, frozen_now) = test_clock::FrozenClockGuard::install();
     let deadline = frozen_now.checked_add(Duration::from_millis(300)).expect("deadline");
 
-    let verdict =
-        block_until_drained(marker.as_fd(), Some(Some(deadline))).expect("bounded wait against a quiet holder");
+    let verdict = block_until_drained(marker.as_fd(), Some(deadline)).expect("bounded wait against a quiet holder");
 
     assert_eq!(verdict, TreeDrain::MembersRemain);
     assert_eq!(
@@ -122,7 +121,7 @@ fn block_until_drained_never_returns_before_a_real_deadline() {
     let deadline = Instant::now()
         .checked_add(Duration::from_millis(300))
         .expect("deadline");
-    let verdict = block_until_drained(marker.as_fd(), Some(Some(deadline))).expect("bounded wait");
+    let verdict = block_until_drained(marker.as_fd(), Some(deadline)).expect("bounded wait");
     let now = Instant::now();
 
     assert_eq!(
@@ -191,7 +190,7 @@ fn a_sustained_writer_is_checked_against_the_deadline_every_round() {
         }
     });
 
-    let verdict = block_until_drained(marker.as_fd(), Some(Some(deadline))).expect("bounded wait");
+    let verdict = block_until_drained(marker.as_fd(), Some(deadline)).expect("bounded wait");
 
     assert_eq!(
         verdict,
@@ -271,7 +270,7 @@ fn an_event_that_arrives_after_the_clock_moves_past_the_deadline_mid_round_does_
     );
 
     let baseline = drain_test_hooks::drained_bytes();
-    let verdict = block_until_drained(marker.as_fd(), Some(Some(deadline))).expect("bounded wait");
+    let verdict = block_until_drained(marker.as_fd(), Some(deadline)).expect("bounded wait");
 
     assert_eq!(
         verdict,
@@ -319,7 +318,7 @@ fn a_spurious_ok0_under_a_frozen_clock_retries_until_the_clock_advances() {
     });
     test_hooks::set_timeout_override(Duration::from_millis(20));
 
-    let verdict = block_until_drained(marker.as_fd(), Some(Some(deadline))).expect("bounded wait");
+    let verdict = block_until_drained(marker.as_fd(), Some(deadline)).expect("bounded wait");
 
     assert_eq!(verdict, TreeDrain::MembersRemain);
     assert_eq!(

@@ -162,7 +162,7 @@ impl DrainWatch {
     pub(crate) fn drained_by(&mut self, until: std::time::Instant) -> bool {
         use rustix::event::{poll, PollFd, PollFlags, Timespec};
 
-        let looked = crate::wait::rearm_until(Some(Some(until)), |remaining| {
+        let looked = crate::wait::rearm_until(Some(until), |remaining| {
             if !self.populated()? {
                 return Ok(Some(()));
             }

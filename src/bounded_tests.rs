@@ -62,7 +62,7 @@ mod waits {
     #[should_panic(expected = "would block inside an async Drop")]
     fn attached_wait_drained_refuses_inside_a_section() {
         let _section = Section::enter();
-        _ = crate::containment::Attached::None.wait_drained(Some(Some(std::time::Instant::now())));
+        _ = crate::containment::Attached::None.wait_drained(Some(std::time::Instant::now()));
     }
 
     /// `CgroupLeaf::wait_drained`, on a fake leaf that never drains.
@@ -79,7 +79,7 @@ mod waits {
         // Disarmed: the fake never drains, so an armed `Drop` would block forever.
         leaf.disarm();
         let _section = Section::enter();
-        _ = leaf.wait_drained(Some(Some(std::time::Instant::now())));
+        _ = leaf.wait_drained(Some(std::time::Instant::now()));
     }
 
     /// The macOS marker's `wait_drained`, on a marker whose write end nothing holds.
@@ -106,7 +106,7 @@ mod waits {
             None,
         );
         let _section = Section::enter();
-        _ = marker.wait_drained(Some(Some(std::time::Instant::now())));
+        _ = marker.wait_drained(Some(std::time::Instant::now()));
     }
 
     /// `JobHandle::wait_drained`, before it looks at the handle.
@@ -118,7 +118,7 @@ mod waits {
     fn job_wait_drained_refuses_inside_a_section() {
         let job = crate::containment::windows::JobHandle::create_empty_for_test();
         let _section = Section::enter();
-        _ = job.wait_drained(Some(Some(std::time::Instant::now())), None);
+        _ = job.wait_drained(Some(std::time::Instant::now()), None);
     }
 
     /// `wait_drained_raw`, the loop the async wrapper hands to a blocking thread.
@@ -131,7 +131,7 @@ mod waits {
         let job = crate::containment::windows::JobHandle::create_empty_for_test();
         let raw = job.as_handle().expect("a live job handle");
         let _section = Section::enter();
-        _ = crate::containment::windows::wait_drained_raw(raw, Some(Some(std::time::Instant::now())), None);
+        _ = crate::containment::windows::wait_drained_raw(raw, Some(std::time::Instant::now()), None);
     }
 
     /// `wait_process_or_cancel`, the cancellable twin.

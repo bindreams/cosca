@@ -41,7 +41,7 @@ pub(crate) async fn exited_by_id(id: ProcessId, timeout: Option<Duration>) -> Re
 
 /// `timeout` as an absolute deadline, fixed up front so no wake extends the total wait. On Windows
 /// it is on the real clock, which the blocking thread measures.
-fn absolute(timeout: Option<Duration>) -> Option<Option<std::time::Instant>> {
+fn absolute(timeout: Option<Duration>) -> Option<std::time::Instant> {
     #[cfg(unix)]
     return timeout.and_then(deadline_from);
     #[cfg(windows)]
@@ -51,7 +51,7 @@ fn absolute(timeout: Option<Duration>) -> Option<Option<std::time::Instant>> {
 /// The wait loop against an absolute `deadline` from [`absolute`]: look; if running, wait on what
 /// the look returned. Dropping the future releases the wait: the fd is deregistered on Unix, and the
 /// blocking thread is released on Windows.
-async fn drive(p: &mut dyn OsProcess, deadline: Option<Option<std::time::Instant>>) -> Result<bool, Error> {
+async fn drive(p: &mut dyn OsProcess, deadline: Option<std::time::Instant>) -> Result<bool, Error> {
     // Set when the wait was released without an exit signal: the next look is the final one
     // whatever the clock reads.
     let mut released = false;
@@ -71,7 +71,7 @@ async fn drive(p: &mut dyn OsProcess, deadline: Option<Option<std::time::Instant
 }
 
 /// The time left to `deadline` on the clock this platform's wait runs on.
-fn remaining(deadline: Option<Option<std::time::Instant>>) -> Option<Duration> {
+fn remaining(deadline: Option<std::time::Instant>) -> Option<Duration> {
     #[cfg(unix)]
     return crate::wait::remaining_at(deadline, crate::tokio::wait::tokio_now());
     #[cfg(windows)]
@@ -82,13 +82,13 @@ fn remaining(deadline: Option<Option<std::time::Instant>>) -> Option<Duration> {
 /// without an exit signal: tokio's timer fired. The caller looks again either way, and that look is
 /// the final one after `Ok(false)`.
 #[cfg(unix)]
-async fn wait(wait_for: &WaitFor<'_>, deadline: Option<Option<std::time::Instant>>) -> Result<bool, Error> {
+async fn wait(wait_for: &WaitFor<'_>, deadline: Option<std::time::Instant>) -> Result<bool, Error> {
     match deadline {
-        Some(Some(at)) => match crate::tokio::wait::arm_at(at, watch(wait_for)).await {
+        Some(at) => match crate::tokio::wait::arm_at(at, watch(wait_for)).await {
             Some(woke) => woke.map(|()| true),
             None => Ok(false),
         },
-        _ => watch(wait_for).await.map(|()| true),
+        None => watch(wait_for).await.map(|()| true),
     }
 }
 
@@ -117,13 +117,12 @@ async fn watch(wait_for: &WaitFor<'_>) -> Result<(), Error> {
 /// `Ok(false)` = released without an exit signal: the deadline passed, or the cancel event fired.
 /// Dropping the future signals the thread's cancel event.
 #[cfg(windows)]
-async fn wait(wait_for: &WaitFor<'_>, deadline: Option<Option<std::time::Instant>>) -> Result<bool, Error> {
+async fn wait(wait_for: &WaitFor<'_>, deadline: Option<std::time::Instant>) -> Result<bool, Error> {
     use std::os::windows::io::AsHandle;
 
     let WaitFor::Signalled(process) = wait_for;
     // The thread outlives a dropped future, so it gets a handle of its own.
     let process = process.try_clone_to_owned().map_err(Error::Io)?;
-    let deadline = deadline.flatten();
     crate::tokio::wait::cancellable_blocking("process wait watcher", move |cancel| {
         crate::os_process::windows::cancel::wait_process_or_cancel(process.as_handle(), deadline, cancel)
     })

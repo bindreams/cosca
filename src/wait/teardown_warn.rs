@@ -111,7 +111,7 @@ pub(crate) fn handle_signaled_by(handle: windows::Win32::Foundation::HANDLE, unt
 
     let mut failed = None;
     // SAFETY: the caller's live process handle, kept open across the call.
-    let waited = crate::wait::wait_until(Some(Some(until)), |ms| {
+    let waited = crate::wait::wait_until(Some(until), |ms| {
         let waited = unsafe { WaitForSingleObject(handle, ms) };
         if waited == WAIT_FAILED {
             failed = Some(std::io::Error::last_os_error());

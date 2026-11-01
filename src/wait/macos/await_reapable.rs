@@ -172,7 +172,7 @@ enum Block {
     /// `None`: unbounded).
     Until {
         interval: Option<Duration>,
-        deadline: Option<Option<Instant>>,
+        deadline: Option<Instant>,
     },
 }
 
@@ -191,7 +191,7 @@ impl Block {
                 };
                 // A deadline wait never arms an unbounded `kevent`.
                 debug_assert!(
-                    !matches!(deadline, Some(Some(_))) || armed.is_some(),
+                    deadline.is_none() || armed.is_some(),
                     "a deadline wait armed an unbounded kevent"
                 );
                 armed
@@ -236,7 +236,6 @@ pub(crate) fn await_reapable_on(
     unique: Option<u64>,
     deadline: Option<Instant>,
 ) -> io::Result<Waited> {
-    let deadline = deadline.map(Some);
     let mut backoff = register(kq, pid)?;
     let mut interval = BACKOFF_START;
     let mut events = [blank(); BATCH];
@@ -318,7 +317,7 @@ pub(crate) fn await_reapable_on(
     }
 }
 
-fn expired(deadline: Option<Option<Instant>>) -> bool {
+fn expired(deadline: Option<Instant>) -> bool {
     crate::wait::remaining(deadline) == Some(Duration::ZERO)
 }
 

@@ -6,15 +6,14 @@ use super::{
 use std::time::{Duration, Instant};
 
 #[skuld::test]
-fn remaining_unbounded_and_overflow_are_none() {
+fn remaining_unbounded_is_none() {
     assert_eq!(remaining(None), None);
-    assert_eq!(remaining(Some(None)), None);
 }
 
 #[skuld::test]
 fn remaining_past_deadline_saturates_to_zero() {
     let past = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
-    assert_eq!(remaining(Some(Some(past))), Some(Duration::ZERO));
+    assert_eq!(remaining(Some(past)), Some(Duration::ZERO));
 }
 
 /// A deadline within tokio's own ~1ms round-up margin of `Instant`'s ceiling must saturate to
@@ -27,7 +26,7 @@ fn deadline_from_saturates_when_the_result_is_too_close_to_instants_ceiling() {
     // `checked_add` still succeeds — landing well within the 1ms margin this exercises, not
     // overflowing outright before ever reaching it.
     let duration = instant_near_ceiling(now).saturating_duration_since(now) - Duration::from_micros(500);
-    assert_eq!(deadline_from(duration), Some(None));
+    assert_eq!(deadline_from(duration), None);
 }
 
 /// Pins `remaining`'s ZERO boundary exactly, via the frozen test clock rather than a real one:
@@ -37,7 +36,7 @@ fn deadline_from_saturates_when_the_result_is_too_close_to_instants_ceiling() {
 fn remaining_pins_the_exact_zero_boundary() {
     let (_guard, t0) = test_clock::FrozenClockGuard::install();
     let at = t0 + Duration::from_millis(250);
-    let deadline = Some(Some(at));
+    let deadline = Some(at);
 
     assert_eq!(remaining(deadline), Some(Duration::from_millis(250)));
     test_clock::advance(Duration::from_millis(250) - Duration::from_nanos(1));
@@ -177,16 +176,16 @@ fn clears_tokio_timer_margin_is_true_exactly_up_to_the_margin() {
     ));
 }
 
-/// `deadline_from` is `deadline_at` on the frozen clock, wrapped in `Some`.
+/// `deadline_from` is `deadline_at` on the frozen clock.
 #[skuld::test]
 fn deadline_from_applies_deadline_at_on_the_test_clock() {
     let (_guard, t0) = test_clock::FrozenClockGuard::install();
     let span = instant_near_ceiling(t0).saturating_duration_since(t0);
     let edge = span - TOKIO_TIMER_ROUNDING_MARGIN;
 
-    assert_eq!(deadline_from(edge), Some(Some(t0 + edge)));
-    assert_eq!(deadline_from(edge + Duration::from_nanos(1)), Some(None));
-    assert_eq!(deadline_from(Duration::MAX), Some(None));
+    assert_eq!(deadline_from(edge), Some(t0 + edge));
+    assert_eq!(deadline_from(edge + Duration::from_nanos(1)), None);
+    assert_eq!(deadline_from(Duration::MAX), None);
 }
 
 // rearm_until =====
@@ -197,7 +196,7 @@ fn deadline_from_applies_deadline_at_on_the_test_clock() {
 #[skuld::test]
 fn rearm_until_advances_the_frozen_clock_by_each_round() {
     let (_clock, at) = test_clock::FrozenClockGuard::install();
-    let deadline = Some(Some(at + Duration::from_millis(30)));
+    let deadline = Some(at + Duration::from_millis(30));
     let mut previous: Option<Instant> = None;
     let out = rearm_until(deadline, |remaining| {
         let seen = super::now();
@@ -218,7 +217,7 @@ fn rearm_until_advances_the_frozen_clock_by_each_round() {
 #[skuld::test]
 fn rearm_until_hands_a_round_the_frozen_remaining() {
     let (_clock, at) = test_clock::FrozenClockGuard::install_lagging(Duration::from_secs(1));
-    let deadline = Some(Some(at + Duration::from_millis(50)));
+    let deadline = Some(at + Duration::from_millis(50));
     let mut seen = None;
     let out = rearm_until(deadline, |remaining| {
         seen = Some(remaining);
@@ -235,7 +234,7 @@ fn rearm_until_hands_a_round_the_frozen_remaining() {
 fn rearm_until_polls_once_for_a_past_deadline() {
     let past = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
     let mut rounds = Vec::new();
-    let out = rearm_until(Some(Some(past)), |remaining| {
+    let out = rearm_until(Some(past), |remaining| {
         rounds.push(remaining);
         Ok::<Option<()>, ()>(None)
     });
@@ -249,7 +248,7 @@ fn rearm_until_polls_once_for_a_past_deadline() {
 #[skuld::test]
 fn rearm_until_stops_at_a_round_error() {
     let (_clock, at) = test_clock::FrozenClockGuard::install();
-    let deadline = Some(Some(at + Duration::from_secs(3600)));
+    let deadline = Some(at + Duration::from_secs(3600));
     let mut rounds = 0;
     let out = rearm_until(deadline, |_| {
         rounds += 1;
@@ -271,7 +270,7 @@ fn rearm_until_stops_at_a_round_error() {
 fn read_probe_records_reads_and_marks_in_order() {
     let (tx, rx) = std::sync::mpsc::channel();
     let (_clock, at) = test_clock::FrozenClockGuard::install();
-    let deadline = Some(Some(at + Duration::from_secs(5)));
+    let deadline = Some(at + Duration::from_secs(5));
     let guard = read_probe::install(tx);
     read_probe::mark("before");
     remaining(deadline);
@@ -486,7 +485,7 @@ fn wait_ms_probe_does_not_judge_progress() {
 fn the_override_seam_and_a_zero_elapsed_round_do_not_trip_the_check() {
     let (_clock, at) = test_clock::FrozenClockGuard::install();
     let _zero = test_clock::ZeroElapsedGuard::install();
-    let deadline = Some(Some(at + Duration::from_millis(5)));
+    let deadline = Some(at + Duration::from_millis(5));
     let _override = remaining_override_seam::set(Duration::from_micros(500));
     wait_ms_probe::take();
     let mut seen = Vec::new();
@@ -521,7 +520,7 @@ fn the_override_seam_and_a_zero_elapsed_round_do_not_trip_the_check() {
 fn rearm_until_panics_when_its_advance_is_dropped() {
     let (_clock, at) = test_clock::FrozenClockGuard::install();
     let _skip = test_clock::SkipAdvanceGuard::install();
-    let deadline = Some(Some(at + Duration::from_secs(3600)));
+    let deadline = Some(at + Duration::from_secs(3600));
     let mut rounds = 0;
     rearm_until(deadline, |_| {
         rounds += 1;
@@ -544,7 +543,7 @@ fn wait_until_panics_when_its_advance_is_dropped() {
 
     let (_clock, at) = test_clock::FrozenClockGuard::install();
     let _skip = test_clock::SkipAdvanceGuard::install();
-    let deadline = Some(Some(at + Duration::from_secs(3600)));
+    let deadline = Some(at + Duration::from_secs(3600));
     let mut waits = 0;
     super::wait_until(deadline, |_ms| {
         waits += 1;

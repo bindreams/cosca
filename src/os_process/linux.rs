@@ -47,12 +47,9 @@ impl OsProcess for LinuxProcess {
 }
 
 /// Polls `pidfd` until its process has exited (the pidfd is readable: a zombie, or reaped) or
-/// `deadline` passes, and says which. `None`/`Some(None)` is unbounded. Reads no state and reaps
+/// `deadline` passes, and says which. `None` is unbounded. Reads no state and reaps
 /// nothing: the pidfd names the process for good, so a reused pid cannot answer it.
-pub(crate) fn poll_pidfd_exit(
-    pidfd: std::os::fd::BorrowedFd<'_>,
-    deadline: Option<Option<Instant>>,
-) -> std::io::Result<bool> {
+pub(crate) fn poll_pidfd_exit(pidfd: std::os::fd::BorrowedFd<'_>, deadline: Option<Instant>) -> std::io::Result<bool> {
     let seen = crate::wait::rearm_until(deadline, |remaining| {
         // Capped like every timed block; the round is re-armed against the real deadline.
         let remaining = remaining.map(crate::wait::clamp_block);
@@ -64,7 +61,7 @@ pub(crate) fn poll_pidfd_exit(
         });
         // A deadline wait never arms an unbounded poll.
         debug_assert!(
-            matches!(deadline, None | Some(None)) || ts.is_some(),
+            deadline.is_none() || ts.is_some(),
             "a deadline wait armed an unbounded poll"
         );
         let mut fds = [PollFd::new(&pidfd, PollFlags::IN)];

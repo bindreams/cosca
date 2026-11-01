@@ -88,7 +88,7 @@ fn wait_tree_reports_members_remain_then_all_exited() {
     // `wait_tree_deadline` is private to `job`, but `job_tests` is its child module, so it's
     // reachable directly — no need for a test-only public wrapper.
     let verdict = job
-        .wait_tree_deadline(Some(Some(past)))
+        .wait_tree_deadline(Some(past))
         .expect("wait_tree (elapsed deadline)");
     assert_eq!(verdict, crate::containment::TreeDrain::MembersRemain);
 

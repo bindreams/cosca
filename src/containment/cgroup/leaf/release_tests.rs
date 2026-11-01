@@ -259,7 +259,7 @@ fn release_stops_and_joins_the_leafs_pump() {
     let name = "cosca-release-joins-pump";
     let (_fake, leaf) = entered(name, true);
     // A wait that blocks starts the pump.
-    let step = leaf.drain_step(Some(None)).expect("step the drain");
+    let step = leaf.drain_step(None).expect("step the drain");
     assert!(matches!(step, crate::containment::cgroup::DrainStep::Block { .. }));
     assert_eq!(fault::pumps_of(name), (1, 0), "the wait must start the pump");
     drop(step);

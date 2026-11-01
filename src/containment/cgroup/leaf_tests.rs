@@ -62,7 +62,7 @@ fn drain_step_block_carries_the_original_deadline_instant() {
 
     // An hour out: a populated leaf never takes the zero-remaining shortcut.
     let at = Instant::now() + Duration::from_secs(3600);
-    for (deadline, expected) in [(Some(Some(at)), Some(at)), (Some(None), None), (None, None)] {
+    for (deadline, expected) in [(Some(at), Some(at)), (None, None)] {
         match leaf.drain_step(deadline).expect("drain_step") {
             DrainStep::Block { deadline, .. } => {
                 assert_eq!(
@@ -78,7 +78,7 @@ fn drain_step_block_carries_the_original_deadline_instant() {
 
     // Already past: the zero-remaining shortcut, not a `Block` carrying a stale instant.
     let past = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
-    match leaf.drain_step(Some(Some(past))).expect("drain_step") {
+    match leaf.drain_step(Some(past)).expect("drain_step") {
         DrainStep::Done(crate::containment::TreeDrain::MembersRemain) => {}
         DrainStep::Done(other) => {
             panic!("expected Done(MembersRemain) for an already-expired deadline, got Done({other:?})")
@@ -105,7 +105,7 @@ fn drain_step_pins_the_exact_zero_remaining_boundary() {
 
     let (_guard, t0) = crate::wait::test_clock::FrozenClockGuard::install();
     let at = t0 + Duration::from_secs(3600);
-    let deadline = Some(Some(at));
+    let deadline = Some(at);
 
     crate::wait::test_clock::advance(Duration::from_secs(3600) - Duration::from_nanos(1));
     match leaf.drain_step(deadline).expect("drain_step") {
@@ -143,7 +143,7 @@ fn wait_drained_through_wait_deadline_never_answers_early() {
     let start = Instant::now();
     let deadline = start + BOUND;
     let (_guard, armed_rx) = WaitDeadlineArgGuard::install();
-    let result = leaf.wait_drained(Some(Some(deadline))).expect("wait_drained");
+    let result = leaf.wait_drained(Some(deadline)).expect("wait_drained");
     let elapsed = start.elapsed();
 
     assert_eq!(
@@ -212,9 +212,7 @@ fn wait_drained_panics_when_its_advance_is_dropped() {
 
     let (_clock, at) = FrozenClockGuard::install();
     let _skip = SkipAdvanceGuard::install();
-    WaitObserver::run_with_block_sender(block_tx, || {
-        leaf.wait_drained(Some(Some(at + Duration::from_millis(5)))).ok()
-    });
+    WaitObserver::run_with_block_sender(block_tx, || leaf.wait_drained(Some(at + Duration::from_millis(5))).ok());
 }
 
 /// Under a frozen clock a bounded `wait_drained` on a leaf that never drains ends: each real
@@ -236,7 +234,7 @@ fn wait_drained_terminates_under_a_frozen_clock() {
 
     let (_clock, at) = FrozenClockGuard::install();
     let verdict = leaf
-        .wait_drained(Some(Some(at + Duration::from_millis(5))))
+        .wait_drained(Some(at + Duration::from_millis(5)))
         .expect("wait_drained");
     assert_eq!(verdict, TreeDrain::MembersRemain);
 }
@@ -340,7 +338,7 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit(#[fixture(cgroup)] _
         let deadline = start + BOUND;
         let (_deadline_arg_guard, armed_rx) = WaitDeadlineArgGuard::install();
         let (result, parks, blocks, zero_remainings) =
-            WaitObserver::run(|| leaf.wait_drained(Some(Some(deadline))).expect("wait_drained"));
+            WaitObserver::run(|| leaf.wait_drained(Some(deadline)).expect("wait_drained"));
         let elapsed = start.elapsed();
         assert_bounded_conclusion(&parks, blocks, zero_remainings, deadline);
         // Never early; no upper bound is asserted (scheduler lateness).
@@ -1801,12 +1799,12 @@ fn a_wait_past_its_deadline_answers_from_the_leafs_state() {
     let fake = FakeLeaf::new("cosca-past-deadline", true);
     let leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(fake.leaf.clone());
     assert_eq!(
-        leaf.wait_drained(Some(Some(std::time::Instant::now()))).expect("wait"),
+        leaf.wait_drained(Some(std::time::Instant::now())).expect("wait"),
         TreeDrain::MembersRemain
     );
     FakeLeaf::set_populated(&fake.events, false);
     assert_eq!(
-        leaf.wait_drained(Some(Some(std::time::Instant::now()))).expect("wait"),
+        leaf.wait_drained(Some(std::time::Instant::now())).expect("wait"),
         TreeDrain::AllMembersExited
     );
 }
@@ -1844,7 +1842,7 @@ fn dropping_the_leaf_stops_and_joins_its_pump() {
 
     let fake = FakeLeaf::new("cosca-pumped-leaf", true);
     let leaf = std::sync::Arc::new(crate::containment::cgroup::CgroupLeaf::for_test_at(fake.leaf.clone()));
-    _ = leaf.wait_drained(Some(Some(std::time::Instant::now())));
+    _ = leaf.wait_drained(Some(std::time::Instant::now()));
     assert_eq!(
         fault::pumps_of("cosca-pumped-leaf"),
         (0, 0),
@@ -1892,7 +1890,7 @@ fn a_drained_leaf_is_answered_without_a_pump() {
     let leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(fake.leaf.clone());
     assert_eq!(leaf.wait_drained(None).expect("wait"), TreeDrain::AllMembersExited);
     assert_eq!(
-        leaf.wait_drained(Some(Some(std::time::Instant::now()))).expect("wait"),
+        leaf.wait_drained(Some(std::time::Instant::now())).expect("wait"),
         TreeDrain::AllMembersExited
     );
     #[cfg(feature = "tokio")]

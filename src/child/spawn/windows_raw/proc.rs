@@ -120,9 +120,7 @@ impl RawChild {
     /// time out early); rechecked each round (principle 13).
     pub(crate) fn wait_deadline(&self, deadline: Instant) -> io::Result<Option<ExitStatus>> {
         // SAFETY: `handle` is our live, owned process handle.
-        let r = crate::wait::wait_until(Some(Some(deadline)), |ms| unsafe {
-            WaitForSingleObject(self.handle(), ms)
-        });
+        let r = crate::wait::wait_until(Some(deadline), |ms| unsafe { WaitForSingleObject(self.handle(), ms) });
         if r == WAIT_OBJECT_0 {
             Ok(Some(self.record(exit_status(self.handle())?)))
         } else if r == WAIT_TIMEOUT {

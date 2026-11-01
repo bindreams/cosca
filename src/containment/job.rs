@@ -110,7 +110,7 @@ impl Job {
     /// Windows handle's numeric value can be recycled onto an unrelated kernel object).
     /// `DuplicateHandle` pins a second, independent reference to the SAME job for the duration
     /// of this call; closing the original elsewhere cannot touch it.
-    fn wait_tree_deadline(&self, deadline: Option<Option<Instant>>) -> Result<TreeDrain, Error> {
+    fn wait_tree_deadline(&self, deadline: Option<Instant>) -> Result<TreeDrain, Error> {
         // Duplicated under the lock so a concurrent `kill_tree`/`Drop` cannot close the
         // original between the read and the `DuplicateHandle` call; the wait itself then
         // runs on the duplicate, outside the lock.

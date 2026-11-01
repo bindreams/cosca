@@ -450,7 +450,7 @@ fn wait_drained_is_unsupported_without_a_marker() {
     use super::Attached;
     for attached in [Attached::None, Attached::Delegated] {
         let err = attached
-            .wait_drained(Some(Some(std::time::Instant::now())))
+            .wait_drained(Some(std::time::Instant::now()))
             .expect_err("a mechanism with no drain edge must be Unsupported");
         assert!(matches!(err, crate::error::Error::Unsupported { .. }), "got {err:?}");
     }
@@ -494,7 +494,7 @@ fn wait_drained_reports_members_remain_then_all_markers_closed() {
 
     assert_eq!(
         attached
-            .wait_drained(Some(Some(std::time::Instant::now())))
+            .wait_drained(Some(std::time::Instant::now()))
             .expect("bounded wait while the holder is alive"),
         TreeDrain::MembersRemain
     );

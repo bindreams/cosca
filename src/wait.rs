@@ -264,21 +264,17 @@ pub(crate) fn now() -> Instant {
     test_clock::now()
 }
 
-/// Remaining time until `deadline` (`None` = unbounded; `Some(None)` = a duration
-/// that overflowed `Instant` ⇒ unbounded). Saturates to ZERO once past. Shared by the
-/// backends to recompute the per-syscall timeout after an `EINTR` retry.
+/// Remaining time until `deadline` (`None` = unbounded). Saturates to ZERO once past. Shared by
+/// the backends to recompute the per-syscall timeout after an `EINTR` retry.
 ///
 /// Reads the clock via [`now`], which honours [`test_clock`] in test builds.
-pub(crate) fn remaining(deadline: Option<Option<Instant>>) -> Option<Duration> {
+pub(crate) fn remaining(deadline: Option<Instant>) -> Option<Duration> {
     remaining_at(deadline, now())
 }
 
 /// [`remaining`] against an explicit `now`, for waits that run on another clock (tokio's).
-pub(crate) fn remaining_at(deadline: Option<Option<Instant>>, now: Instant) -> Option<Duration> {
-    let remaining = match deadline {
-        None | Some(None) => None,
-        Some(Some(at)) => Some(at.saturating_duration_since(now)),
-    };
+pub(crate) fn remaining_at(deadline: Option<Instant>, now: Instant) -> Option<Duration> {
+    let remaining = deadline.map(|at| at.saturating_duration_since(now));
     #[cfg(test)]
     read_probe::record(read_probe::Event::Read { deadline, remaining });
     remaining
@@ -298,7 +294,7 @@ pub(crate) mod read_probe {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(crate) enum Event {
         Read {
-            deadline: Option<Option<Instant>>,
+            deadline: Option<Instant>,
             remaining: Option<Duration>,
         },
         Mark(&'static str),
@@ -355,13 +351,12 @@ pub(crate) fn deadline_at(now: Instant, duration: Duration) -> Option<Instant> {
     now.checked_add(duration).filter(|at| clears_tokio_timer_margin(*at))
 }
 
-/// Convert a relative `duration` into the crate's `deadline` convention
-/// (`Option<Option<Instant>>`, the inverse of [`remaining`]): [`now`]`() + duration`, per
-/// [`deadline_at`]: saturating to unbounded (`Some(None)`, read by `remaining` the same as outer
-/// `None`) rather than panicking, including inside [`TOKIO_TIMER_ROUNDING_MARGIN`] of the ceiling.
-/// Shared by every `_timeout`/`grace`-style call that starts a fresh relative wait from "now".
-pub(crate) fn deadline_from(duration: Duration) -> Option<Option<Instant>> {
-    Some(deadline_at(now(), duration))
+/// Convert a relative `duration` into a deadline, the inverse of [`remaining`]: [`now`]`() +
+/// duration`, per [`deadline_at`]: `None` (unbounded) rather than a panic on overflow, including
+/// inside [`TOKIO_TIMER_ROUNDING_MARGIN`] of the ceiling. Shared by every `_timeout`/`grace`-style
+/// call that starts a fresh relative wait from "now".
+pub(crate) fn deadline_from(duration: Duration) -> Option<Instant> {
+    deadline_at(now(), duration)
 }
 
 /// The largest `Instant` reachable from `start`, found purely through `checked_add`'s own
@@ -448,7 +443,7 @@ pub(crate) fn win32_timeout_ms(remaining: Option<Duration>) -> u32 {
 /// from a round is never trusted before the deadline: the remaining time is recomputed from
 /// `deadline` (on the test clock, see [`test_clock`]) immediately before every round, which must
 /// arm its blocking call with it, and the loop goes round again. At least one round runs, so a
-/// deadline already past still polls once. `None`/`Some(None)` is unbounded. A round's `Err` ends
+/// deadline already past still polls once. `None` is unbounded. A round's `Err` ends
 /// the loop.
 ///
 /// Owns the frozen-clock advance: a round must not advance it itself. Under a frozen clock a
@@ -461,7 +456,7 @@ pub(crate) fn win32_timeout_ms(remaining: Option<Duration>) -> u32 {
     )
 )]
 pub(crate) fn rearm_until<T, E>(
-    deadline: Option<Option<Instant>>,
+    deadline: Option<Instant>,
     mut round: impl FnMut(Option<Duration>) -> Result<Option<T>, E>,
 ) -> Result<Option<T>, E> {
     #[cfg(test)]
@@ -488,7 +483,7 @@ pub(crate) fn rearm_until<T, E>(
 /// The clock is read only after `wait` returns, so `GetLastError` still holds `wait`'s error.
 #[cfg(windows)]
 pub(crate) fn wait_until(
-    deadline: Option<Option<Instant>>,
+    deadline: Option<Instant>,
     mut wait: impl FnMut(u32) -> windows::Win32::Foundation::WAIT_EVENT,
 ) -> windows::Win32::Foundation::WAIT_EVENT {
     use windows::Win32::Foundation::WAIT_TIMEOUT;
@@ -515,7 +510,7 @@ pub(crate) fn wait_until(
 pub(crate) fn pidfd_exit_visible_by(pidfd: std::os::fd::BorrowedFd<'_>, until: Instant) -> bool {
     use crate::wait::exit_only::{self, Peek, Target};
 
-    match crate::os_process::linux::poll_pidfd_exit(pidfd, Some(Some(until))) {
+    match crate::os_process::linux::poll_pidfd_exit(pidfd, Some(until)) {
         Ok(true) => {}
         Err(e) => log::debug!("a look at a killed child's exit could not poll its pidfd ({e}); it peeks instead"),
         Ok(false) => return false,

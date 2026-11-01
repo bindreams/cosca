@@ -193,12 +193,12 @@ async fn observed_exited_by_id(
 }
 
 /// Asserts identity was verified before the first `remaining` read, and that every read was made
-/// against `deadline`, with `None` and `Some(None)` both unbounded. Returns the reads' results.
+/// against `deadline`. Returns the reads' results.
 #[cfg(windows)]
 #[track_caller]
 fn assert_reads_of(
     log: &[crate::wait::read_probe::Event],
-    deadline: Option<Option<std::time::Instant>>,
+    deadline: Option<std::time::Instant>,
 ) -> Vec<Option<Duration>> {
     use crate::wait::read_probe::Event;
 
@@ -215,8 +215,7 @@ fn assert_reads_of(
         {
             assert!(i > mark, "a remaining read preceded identity verification: {log:?}");
             assert_eq!(
-                used.flatten(),
-                deadline.flatten(),
+                *used, deadline,
                 "a read was made against a re-derived deadline: {log:?}"
             );
             results.push(*remaining);
@@ -237,7 +236,7 @@ async fn exited_by_id_windows_arms_from_a_past_deadline_fixed_before_spawn_block
     let seen = observed_exited_by_id(&mut child, std::time::Instant::now(), Duration::ZERO, false).await;
     kill_and_reap(&mut child);
     assert!(!seen.exited, "a live child at ZERO grace must report still-alive");
-    let reads = assert_reads_of(&seen.log, Some(Some(seen.real_start)));
+    let reads = assert_reads_of(&seen.log, Some(seen.real_start));
     assert!(reads.iter().all(|r| *r == Some(Duration::ZERO)), "{reads:?}");
 }
 
@@ -251,7 +250,7 @@ async fn exited_by_id_windows_arms_from_a_future_deadline_fixed_before_spawn_blo
     let seen = observed_exited_by_id(&mut child, std::time::Instant::now(), grace, true).await;
     child.wait().expect("reap");
     assert!(seen.exited, "the child exited after its stdin closed");
-    let reads = assert_reads_of(&seen.log, Some(Some(seen.real_start + grace)));
+    let reads = assert_reads_of(&seen.log, Some(seen.real_start + grace));
     for r in reads {
         let r = r.expect("a bounded deadline has a remaining time");
         assert!(r > Duration::ZERO && r <= grace, "{r:?}");
@@ -707,7 +706,7 @@ async fn cgroup_wait_tree_drained_through_arm_at_never_answers_early() {
 
     const BOUND: Duration = Duration::from_millis(50);
     let start = Instant::now();
-    let result = super::cgroup_wait_tree_drained(&leaf, Some(Some(start + BOUND)))
+    let result = super::cgroup_wait_tree_drained(&leaf, Some(start + BOUND))
         .await
         .expect("wait");
     let elapsed = start.elapsed();
@@ -738,7 +737,7 @@ async fn cgroup_wait_tree_drained_arms_the_callers_deadline_instant() {
     let at = super::tokio_now() + Duration::from_secs(3600);
 
     {
-        let mut fut = std::pin::pin!(super::cgroup_wait_tree_drained(&leaf, Some(Some(at))));
+        let mut fut = std::pin::pin!(super::cgroup_wait_tree_drained(&leaf, Some(at)));
         assert!(poll_once(fut.as_mut()).is_pending(), "the fake leaf never drains");
     }
     assert_eq!(rx.try_recv().expect("the wait site must arm via arm_at"), Armed::At(at));
@@ -992,7 +991,7 @@ async fn wait_tree_deadline_arms_the_callers_deadline_instant() {
     let _seam = super::armed_deadline_seam::install(tx);
     let at = super::tokio_now() + Duration::from_secs(3600);
     {
-        let mut fut = std::pin::pin!(super::wait_tree_deadline(marker.as_fd(), Some(Some(at))));
+        let mut fut = std::pin::pin!(super::wait_tree_deadline(marker.as_fd(), Some(at)));
         assert!(poll_once(fut.as_mut()).is_pending(), "an hour-out deadline");
     }
     assert_eq!(rx.try_recv().expect("the wait site must arm via arm_at"), Armed::At(at));
@@ -1042,16 +1041,9 @@ fn to_real_clock_preserves_the_remaining_time_across_clocks() {
     let real = std::time::Instant::now();
     let tokio = real + Duration::from_secs(3600); // virtual time ran ahead
     let s = Duration::from_secs(60);
-    assert_eq!(
-        super::to_real_clock_at(Some(Some(tokio + s)), tokio, real),
-        Some(Some(real + s))
-    );
-    assert_eq!(
-        super::to_real_clock_at(Some(Some(tokio)), tokio, real),
-        Some(Some(real))
-    );
-    assert_eq!(super::to_real_clock_at(Some(Some(real)), tokio, real), Some(Some(real)));
-    assert_eq!(super::to_real_clock_at(Some(None), tokio, real), Some(None));
+    assert_eq!(super::to_real_clock_at(Some(tokio + s), tokio, real), Some(real + s));
+    assert_eq!(super::to_real_clock_at(Some(tokio), tokio, real), Some(real));
+    assert_eq!(super::to_real_clock_at(Some(real), tokio, real), Some(real));
     assert_eq!(super::to_real_clock_at(None, tokio, real), None);
 }
 
@@ -1089,7 +1081,7 @@ async fn cgroup_wait_tree_drained_judges_expiry_on_tokios_clock() {
     ::tokio::time::advance(Duration::from_secs(3600)).await;
     let expired = super::tokio_now() - Duration::from_secs(1);
 
-    let mut fut = std::pin::pin!(super::cgroup_wait_tree_drained(&leaf, Some(Some(expired))));
+    let mut fut = std::pin::pin!(super::cgroup_wait_tree_drained(&leaf, Some(expired)));
     match poll_once(fut.as_mut()) {
         std::task::Poll::Ready(r) => assert_eq!(r.expect("wait"), TreeDrain::MembersRemain),
         std::task::Poll::Pending => panic!("a deadline past on tokio's clock must answer at once"),
@@ -1116,7 +1108,7 @@ async fn wait_tree_deadline_judges_expiry_on_tokios_clock() {
     ::tokio::time::advance(Duration::from_secs(3600)).await;
     let expired = super::tokio_now() - Duration::from_secs(1);
 
-    let drain = super::wait_tree_deadline(marker.as_fd(), Some(Some(expired)))
+    let drain = super::wait_tree_deadline(marker.as_fd(), Some(expired))
         .await
         .expect("wait_tree_deadline");
     assert_eq!(drain, crate::containment::TreeDrain::MembersRemain);
