@@ -105,9 +105,7 @@ pub(crate) fn wait_process_or_cancel(
     let handles = [handle, HANDLE(cancel.as_raw_handle())];
     // A WAIT_TIMEOUT is never trusted: recheck the real deadline each round (see win32_timeout_ms).
     // SAFETY: both handles are live for the wait's duration.
-    let waited = crate::wait::wait_until(deadline.map(Some), |ms| unsafe {
-        WaitForMultipleObjects(&handles, false, ms)
-    });
+    let waited = crate::wait::wait_until(deadline, |ms| unsafe { WaitForMultipleObjects(&handles, false, ms) });
     let wait_failed = (waited == WAIT_FAILED).then(std::io::Error::last_os_error);
     if waited == WAIT_OBJECT_0 {
         Ok(true) // process exited

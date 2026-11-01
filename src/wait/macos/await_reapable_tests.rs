@@ -193,7 +193,6 @@ fn await_reapable_with_a_deadline_beyond_the_kevent_limit_returns_the_exit() {
     let mut stdin = Some(stdin);
     let _end = test_hooks::on_kevent_round(0, move || drop(stdin.take()));
     let deadline = crate::wait::deadline_from(Duration::from_secs(u64::from(u32::MAX)))
-        .and_then(|d| d)
         .expect("a deadline this far is still finite");
     let waited = await_reapable(child.id(), None, Some(deadline)).expect("a far deadline is not an error");
     assert_eq!(waited, Waited::Reapable);

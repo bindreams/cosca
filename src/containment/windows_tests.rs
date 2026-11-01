@@ -26,7 +26,7 @@ fn wait_drained_on_a_consumed_handle_is_unassessable() {
     let h = JobHandle::create_empty_for_test();
     h.hard_kill().expect("hard_kill on a live job");
     let err = h
-        .wait_drained(Some(None), None)
+        .wait_drained(None, None)
         .expect_err("a consumed job handle must not report a live drain verdict");
     let crate::error::Error::Unassessable { source, .. } = err else {
         panic!("expected Unassessable, got {err:?}");
@@ -56,7 +56,7 @@ fn wait_drained_raw_reports_drained_for_an_empty_job() {
     use super::JobHandle;
     let job = JobHandle::create_empty_for_test();
     let job_handle = job.as_handle().expect("freshly created job handle must be live");
-    let verdict = super::wait_drained_raw(job_handle, Some(None), None).expect("wait_drained_raw");
+    let verdict = super::wait_drained_raw(job_handle, None, None).expect("wait_drained_raw");
     assert_eq!(verdict, crate::containment::TreeDrain::AllMembersExited);
 }
 
@@ -97,7 +97,7 @@ fn wait_drained_raw_tracks_a_real_member_through_exit() {
     // blocking at all, so this assertion is instantaneous — the point under test is that a
     // non-empty live member set reports MembersRemain rather than a guessed drain verdict.
     let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
-    let verdict = super::wait_drained_raw(job_handle, Some(Some(past)), None).expect("wait_drained_raw");
+    let verdict = super::wait_drained_raw(job_handle, Some(past), None).expect("wait_drained_raw");
     assert_eq!(verdict, crate::containment::TreeDrain::MembersRemain);
 
     // Let the child exit on its own terms (EOF on stdin), then confirm the job reports drained
@@ -106,7 +106,7 @@ fn wait_drained_raw_tracks_a_real_member_through_exit() {
     drop(child.stdin.take());
     child.wait().expect("wait for cmd /C more to exit");
 
-    let verdict = super::wait_drained_raw(job_handle, Some(None), None).expect("wait_drained_raw");
+    let verdict = super::wait_drained_raw(job_handle, None, None).expect("wait_drained_raw");
     assert_eq!(verdict, crate::containment::TreeDrain::AllMembersExited);
 }
 
@@ -149,7 +149,7 @@ fn wait_drained_raw_arms_the_ceiling_of_the_remaining_duration() {
     crate::wait::wait_ms_probe::take();
     let _override = crate::wait::remaining_override_seam::set(Duration::from_micros(500));
     let deadline = at + Duration::from_millis(5);
-    let verdict = super::wait_drained_raw(job_handle, Some(Some(deadline)), None);
+    let verdict = super::wait_drained_raw(job_handle, Some(deadline), None);
     let reached = Instant::now() >= deadline;
     let arms = crate::wait::wait_ms_probe::take();
     let_member_exit(child);
@@ -182,7 +182,7 @@ fn wait_drained_raw_never_reports_members_remain_before_the_deadline() {
     let _override = crate::wait::remaining_override_seam::set(Duration::from_micros(500));
     crate::wait::wait_ms_probe::on_second_arm(move || drop(stdin)); // EOF -> member exits for real
     let deadline = Instant::now() + Duration::from_secs(3600);
-    let verdict = super::wait_drained_raw(job_handle, Some(Some(deadline)), None);
+    let verdict = super::wait_drained_raw(job_handle, Some(deadline), None);
     let arms = crate::wait::wait_ms_probe::take();
     child.wait().expect("reap the member after it exits");
     assert_eq!(
@@ -206,7 +206,7 @@ fn wait_drained_raw_re_arms_past_a_clamped_timeout() {
     let _clamp = crate::wait::wait_clamp_seam::set(5);
     crate::wait::wait_ms_probe::on_second_arm(move || drop(stdin));
     let deadline = Instant::now() + Duration::from_secs(3600);
-    let verdict = super::wait_drained_raw(job_handle, Some(Some(deadline)), None);
+    let verdict = super::wait_drained_raw(job_handle, Some(deadline), None);
     let arms = crate::wait::wait_ms_probe::take();
     child.wait().expect("reap the member after it exits");
     assert_eq!(

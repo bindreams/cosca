@@ -322,27 +322,23 @@ pub(crate) fn probe(read_end: BorrowedFd<'_>) -> Result<TreeDrain, Error> {
 
 /// Block until every marker holder has exited, or until `deadline`.
 ///
-/// `deadline` follows the crate's watch convention: `None` = block indefinitely, `Some(None)`
-/// = a duration that overflowed `Instant` (also indefinite), `Some(Some(at))` = an absolute
-/// deadline; a deadline already in the past still performs exactly one non-blocking check
-/// before concluding — the sticky, level-triggered `EV_EOF` a genuinely-already-drained tree
-/// left pending must be observed, not assumed away by the elapsed deadline alone. Uses one
-/// kernel syscall per wait round — no interval is chosen anywhere in this path.
+/// `deadline`: `None` = block indefinitely, `Some(at)` = an absolute deadline; a deadline
+/// already in the past still performs exactly one non-blocking check before concluding — the
+/// sticky, level-triggered `EV_EOF` a genuinely-already-drained tree left pending must be
+/// observed, not assumed away by the elapsed deadline alone. Uses one kernel syscall per wait
+/// round — no interval is chosen anywhere in this path.
 ///
 /// The per-round deadline-checking and `kevent` mechanics live in `os_process::macos::kqueue::block_on_kqueue`
 /// (shared with the proc-exit watch); this function supplies only the marker's own arm and
 /// per-event interpretation (`interpret_read_event`).
 ///
-/// A genuinely unbounded wait (`None`, or `Some(None)`) never drains bytes past the low-water
-/// clamp on a sustained writer — see the module doc for why, and `interpret_read_event` for
-/// where that decision is made. A bounded wait (`Some(Some(_))`, including one already past)
-/// keeps draining as long as its deadline has funding left; once a round starts with the
-/// deadline already elapsed, that round stops draining too (principle 13) — same
-/// `suppress_drain` flag, just also true for that reason.
-pub(crate) fn block_until_drained(
-    read_end: BorrowedFd<'_>,
-    deadline: Option<Option<Instant>>,
-) -> Result<TreeDrain, Error> {
+/// An unbounded wait (`None`) never drains bytes past the low-water clamp on a sustained
+/// writer — see the module doc for why, and `interpret_read_event` for where that decision is
+/// made. A bounded wait (`Some(_)`, including one already past) keeps draining as long as its
+/// deadline has funding left; once a round starts with the deadline already elapsed, that round
+/// stops draining too (principle 13) — same `suppress_drain` flag, just also true for that
+/// reason.
+pub(crate) fn block_until_drained(read_end: BorrowedFd<'_>, deadline: Option<Instant>) -> Result<TreeDrain, Error> {
     let unbounded_wait = crate::wait::remaining(deadline).is_none();
     let kq = arm(read_end, unbounded_wait)?;
     crate::os_process::macos::kqueue::block_on_kqueue(

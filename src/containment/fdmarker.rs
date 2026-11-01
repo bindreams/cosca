@@ -1027,10 +1027,7 @@ impl Marker {
     /// reissued fd (an unrelated pipe with no open write end) deliver `EV_EOF` immediately and
     /// report `AllMembersExited` for a fully live tree — the same false-edge risk `hard_kill`
     /// refuses on, not merely a discrepancy between two code paths.
-    pub(crate) fn wait_drained(
-        &self,
-        deadline: Option<Option<Instant>>,
-    ) -> Result<crate::containment::TreeDrain, Error> {
+    pub(crate) fn wait_drained(&self, deadline: Option<Instant>) -> Result<crate::containment::TreeDrain, Error> {
         #[cfg(feature = "tokio")]
         crate::bounded::assert_may_block("waiting for a marked tree to drain");
         self.check_read_end_still_valid()?;

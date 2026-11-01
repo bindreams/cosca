@@ -22,8 +22,8 @@ pub(crate) fn tokio_now() -> std::time::Instant {
 }
 
 /// The async twin of [`crate::wait::deadline_from`], on [`tokio_now`]'s clock.
-pub(crate) fn deadline_from(duration: Duration) -> Option<Option<std::time::Instant>> {
-    Some(crate::wait::deadline_at(tokio_now(), duration))
+pub(crate) fn deadline_from(duration: Duration) -> Option<std::time::Instant> {
+    crate::wait::deadline_at(tokio_now(), duration)
 }
 
 /// The ONLY place a bounded async wait is armed: `tokio::time::timeout_at(at, fut)`, with the
@@ -164,14 +164,13 @@ pub(crate) async fn watch_pidfd<F: std::os::fd::AsRawFd>(pidfd: F) -> Result<(),
 pub(crate) async fn pidfd_exited_within(pidfd: std::os::fd::BorrowedFd<'_>, grace: Duration) -> Result<bool, Error> {
     let watched = pidfd.try_clone_to_owned().map_err(Error::Io)?;
     match deadline_from(grace) {
-        Some(Some(at)) => match arm_at(at, watch_pidfd(watched)).await {
+        Some(at) => match arm_at(at, watch_pidfd(watched)).await {
             Some(watch) => watch.map(|()| true),
             // The timer can win the first poll before the reactor reports an exit that was already
             // pending: answer from one final non-blocking look.
-            None => crate::os_process::linux::poll_pidfd_exit(pidfd, crate::wait::deadline_from(Duration::ZERO))
-                .map_err(Error::Io),
+            None => crate::os_process::linux::poll_pidfd_exit(pidfd, Some(crate::wait::now())).map_err(Error::Io),
         },
-        _ => watch_pidfd(watched).await.map(|()| true),
+        None => watch_pidfd(watched).await.map(|()| true),
     }
 }
 
@@ -290,15 +289,15 @@ pub(crate) async fn wait_tree_drained(read_end: std::os::fd::BorrowedFd<'_>) -> 
 #[cfg(target_os = "macos")]
 pub(crate) async fn wait_tree_deadline(
     read_end: std::os::fd::BorrowedFd<'_>,
-    deadline: Option<Option<std::time::Instant>>,
+    deadline: Option<std::time::Instant>,
 ) -> Result<crate::containment::TreeDrain, Error> {
     use crate::containment::TreeDrain;
     match deadline {
-        None | Some(None) => {
+        None => {
             wait_tree_drained(read_end).await?;
             Ok(TreeDrain::AllMarkersClosed)
         }
-        Some(Some(at)) => {
+        Some(at) => {
             if crate::wait::remaining_at(deadline, tokio_now()) == Some(Duration::ZERO) {
                 return crate::containment::marker_eof::probe(read_end);
             }
@@ -441,7 +440,7 @@ async fn wait_tree_drained_inner(
 #[cfg(target_os = "linux")]
 pub(crate) async fn cgroup_wait_tree_drained(
     leaf: &crate::containment::cgroup::CgroupLeaf,
-    deadline: Option<Option<std::time::Instant>>,
+    deadline: Option<std::time::Instant>,
 ) -> Result<crate::containment::TreeDrain, Error> {
     use crate::containment::cgroup::DrainStep;
 
@@ -477,21 +476,15 @@ pub(crate) async fn cgroup_wait_tree_drained(
 /// blocks in the kernel and so is measured in real time. Identical when tokio's clock is unpaused.
 #[cfg(any(windows, test))]
 pub(crate) fn to_real_clock_at(
-    deadline: Option<Option<std::time::Instant>>,
+    deadline: Option<std::time::Instant>,
     tokio_now: std::time::Instant,
     real_now: std::time::Instant,
-) -> Option<Option<std::time::Instant>> {
-    match deadline {
-        Some(Some(at)) => Some(crate::wait::deadline_at(
-            real_now,
-            at.saturating_duration_since(tokio_now),
-        )),
-        other => other,
-    }
+) -> Option<std::time::Instant> {
+    deadline.and_then(|at| crate::wait::deadline_at(real_now, at.saturating_duration_since(tokio_now)))
 }
 
 #[cfg(windows)]
-pub(crate) fn to_real_clock(deadline: Option<Option<std::time::Instant>>) -> Option<Option<std::time::Instant>> {
+pub(crate) fn to_real_clock(deadline: Option<std::time::Instant>) -> Option<std::time::Instant> {
     to_real_clock_at(deadline, tokio_now(), crate::wait::now())
 }
 
@@ -518,7 +511,7 @@ pub(crate) fn to_real_clock(deadline: Option<Option<std::time::Instant>>) -> Opt
 #[cfg(windows)]
 async fn job_wait_tree_drained(
     job: &crate::containment::windows::JobHandle,
-    deadline: Option<Option<std::time::Instant>>,
+    deadline: Option<std::time::Instant>,
 ) -> Result<crate::containment::TreeDrain, Error> {
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
 
@@ -624,7 +617,7 @@ async fn job_wait_tree_drained(
 /// `deadline` is on [`tokio_now`]'s clock (build it with [`deadline_from`]).
 pub(crate) async fn wait_tree_drained_dispatch(
     attached: &crate::containment::Attached,
-    deadline: Option<Option<std::time::Instant>>,
+    deadline: Option<std::time::Instant>,
 ) -> Result<crate::containment::TreeDrain, Error> {
     match attached {
         #[cfg(target_os = "linux")]

@@ -536,7 +536,7 @@ impl CgroupLeaf {
     /// nothing: `rmdir` succeeds only on a drained leaf ([`removed_after_drain`]).
     pub(crate) fn wait_drained(
         &self,
-        deadline: Option<Option<std::time::Instant>>,
+        deadline: Option<std::time::Instant>,
     ) -> Result<crate::containment::TreeDrain, crate::error::Error> {
         use event_listener::Listener as _;
 
@@ -600,10 +600,7 @@ impl CgroupLeaf {
     /// `Block` — see its doc for why. Reads the clock via [`crate::wait::remaining`], which
     /// honours the test clock in test builds, so a test can pin the zero-remaining shortcut's
     /// boundary exactly without a real one.
-    pub(crate) fn drain_step(
-        &self,
-        deadline: Option<Option<std::time::Instant>>,
-    ) -> Result<DrainStep, crate::error::Error> {
+    pub(crate) fn drain_step(&self, deadline: Option<std::time::Instant>) -> Result<DrainStep, crate::error::Error> {
         self.drain_step_on(deadline, crate::wait::now)
     }
 
@@ -611,7 +608,7 @@ impl CgroupLeaf {
     /// on another clock (tokio's).
     pub(crate) fn drain_step_on(
         &self,
-        deadline: Option<Option<std::time::Instant>>,
+        deadline: Option<std::time::Instant>,
         clock: impl FnOnce() -> std::time::Instant,
     ) -> Result<DrainStep, crate::error::Error> {
         use crate::containment::TreeDrain;
@@ -630,10 +627,7 @@ impl CgroupLeaf {
         }
         #[cfg(test)]
         fault::notify_drain_blocking();
-        Ok(DrainStep::Block {
-            listener,
-            deadline: deadline.flatten(),
-        })
+        Ok(DrainStep::Block { listener, deadline })
     }
 
     /// `Some(AllMembersExited)` if the leaf has drained or is gone; `None` if it still holds a

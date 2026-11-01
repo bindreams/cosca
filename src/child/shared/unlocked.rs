@@ -54,7 +54,7 @@ impl SharedChild {
         };
         #[cfg(test)]
         exit_only::seams::step(exit_only::seams::HolderStep::Poll);
-        if crate::os_process::linux::poll_pidfd_exit(pidfd.as_fd(), deadline.map(Some))? {
+        if crate::os_process::linux::poll_pidfd_exit(pidfd.as_fd(), deadline)? {
             return Ok(Unlocked::ExitSeen);
         }
         // Expired: one final peek.
@@ -182,7 +182,7 @@ impl SharedChild {
 
         let handle = HANDLE(self.handle.as_raw_handle());
         // SAFETY: `handle` is our owned process handle, alive for the whole call.
-        let waited = crate::wait::wait_until(deadline.map(Some), |ms| unsafe { WaitForSingleObject(handle, ms) });
+        let waited = crate::wait::wait_until(deadline, |ms| unsafe { WaitForSingleObject(handle, ms) });
         if waited == WAIT_OBJECT_0 {
             return Ok(Unlocked::ExitSeen);
         }

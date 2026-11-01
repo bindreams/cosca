@@ -1012,7 +1012,7 @@ impl Attached {
     /// mechanism).
     pub(crate) fn wait_drained(
         &self,
-        deadline: Option<Option<std::time::Instant>>,
+        deadline: Option<std::time::Instant>,
     ) -> Result<crate::containment::TreeDrain, Error> {
         // Whatever the mechanism: a caller inside an async `Drop` is refused even where the
         // mechanism has no drain edge to wait on.

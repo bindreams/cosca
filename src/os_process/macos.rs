@@ -207,7 +207,7 @@ impl ExitWatch {
 
     /// Block until the event has been read, by this call or an earlier one, or until `deadline`.
     /// `Ok(true)` = the event was read. An `EV_ERROR` event is `Err`.
-    pub(crate) fn block(&self, deadline: Option<Option<Instant>>) -> Result<bool, Error> {
+    pub(crate) fn block(&self, deadline: Option<Instant>) -> Result<bool, Error> {
         if self.seen.load(Ordering::Relaxed) {
             return Ok(true);
         }

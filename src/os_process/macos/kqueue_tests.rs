@@ -36,7 +36,7 @@ fn block_on_kqueue_panics_when_its_advance_is_dropped() {
     let _skip = SkipAdvanceGuard::install();
     // The frozen clock never advances here, so this deadline can never pass on the test clock,
     // however long a round is preempted; the real `kevent` blocks for it once per round.
-    let deadline = Some(Some(at + Duration::from_millis(5)));
+    let deadline = Some(at + Duration::from_millis(5));
     // Ends a loop whose check is gone at its second round, with a panic the test rejects.
     let _hooks = super::test_hooks::HookGuard::install(|round, _| {
         assert!(round < 1, "the check let a second round run");
@@ -56,7 +56,7 @@ fn block_on_kqueue_terminates_under_a_frozen_clock() {
 
     let kq = Kqueue::new().expect("kqueue");
     let (_clock, at) = FrozenClockGuard::install();
-    let deadline = Some(Some(at + Duration::from_millis(5)));
+    let deadline = Some(at + Duration::from_millis(5));
     let verdict = super::block_on_kqueue(&kq, deadline, true, |_, _| Ok(None)).expect("bounded wait");
     assert!(verdict, "an event-less wait ends by its deadline");
 }
@@ -75,7 +75,7 @@ fn a_remaining_time_above_the_clamp_is_rearmed_in_pieces() {
     let kq = Kqueue::new().expect("kqueue");
     let (_clock, at) = FrozenClockGuard::install();
     let _zero = ZeroElapsedGuard::install();
-    let deadline = Some(Some(at + Duration::from_millis(50)));
+    let deadline = Some(at + Duration::from_millis(50));
     // Round 0 sees 50ms left, round 1 sees 30ms, round 2 sees none.
     let _hooks = super::test_hooks::HookGuard::install(|round, _| match round {
         1 => advance(Duration::from_millis(20)),
@@ -129,7 +129,7 @@ fn a_forced_timeout_above_the_kevent_limit_is_rejected() {
     let kq = Kqueue::new().expect("kqueue");
     let _hooks = super::test_hooks::HookGuard::install(|_, _| {});
     super::test_hooks::set_timeout_override(Duration::from_secs(super::KEVENT_MAX_SECS + 1));
-    super::block_on_kqueue(&kq, Some(None), false, |_, _| Ok(Some(true))).ok();
+    super::block_on_kqueue(&kq, None, false, |_, _| Ok(Some(true))).ok();
 }
 
 /// `kevent_timeout` at the limit's edges, on the real `KEVENT_MAX_SECS`.
@@ -198,7 +198,7 @@ fn a_zero_return_with_time_left_is_logged_by_kind() {
     let kq = Kqueue::new().expect("kqueue");
     let (_clock, at) = FrozenClockGuard::install();
     let _zero = ZeroElapsedGuard::install();
-    let deadline = Some(Some(at + Duration::from_millis(50)));
+    let deadline = Some(at + Duration::from_millis(50));
     // Round 0: clamp-sized timeout. Round 1: a forced 1ms timeout (below the clamp). Round 2: done.
     let _hooks = super::test_hooks::HookGuard::install(|round, _| match round {
         1 => super::test_hooks::set_timeout_override(Duration::from_millis(1)),

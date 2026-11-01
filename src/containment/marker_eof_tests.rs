@@ -186,7 +186,7 @@ fn probe_on_an_invalid_descriptor_reports_an_io_error() {
 fn block_until_drained_with_a_past_deadline_behaves_like_a_one_shot_probe() {
     let (child, marker, stdin) = spawn_marker_holder("exec cat >/dev/null");
     assert_eq!(
-        block_until_drained(marker.as_fd(), Some(Some(Instant::now()))).expect("probe"),
+        block_until_drained(marker.as_fd(), Some(Instant::now())).expect("probe"),
         TreeDrain::MembersRemain
     );
     drop(stdin);
@@ -210,7 +210,7 @@ fn block_until_drained_with_a_past_deadline_still_reports_an_already_drained_tre
     let already_past = Instant::now();
     drop(w); // drained before the deadline below is even evaluated
     assert_eq!(
-        block_until_drained(r.as_fd(), Some(Some(already_past))).expect("probe"),
+        block_until_drained(r.as_fd(), Some(already_past)).expect("probe"),
         TreeDrain::AllMarkersClosed,
         "an already-drained tree must be reported as drained even past a stale deadline"
     );
@@ -283,7 +283,7 @@ fn an_unassessable_write_end_check_refuses_only_an_unbounded_wait() {
     // Bounded (a real, already-past deadline): proceeds past the write-end guard, then fails
     // for the ordinary reason (not a pipe, so `EVFILT_READ` cannot be armed on it) — never
     // `Error::Unassessable`.
-    let bounded = block_until_drained(f.as_fd(), Some(Some(Instant::now())));
+    let bounded = block_until_drained(f.as_fd(), Some(Instant::now()));
     assert!(
         !matches!(bounded, Err(crate::error::Error::Unassessable { .. })),
         "a bounded wait must not be refused on an Unassessable write-end check, got {bounded:?}"
@@ -302,7 +302,7 @@ fn a_live_member_holds_the_edge_shut_and_releases_it_on_exit() {
     // only thing that ends it, so the drain is caused by an event, never awaited on a clock.
     let (child, marker, stdin) = spawn_marker_holder("exec cat >/dev/null");
     assert_eq!(
-        block_until_drained(marker.as_fd(), Some(Some(Instant::now()))).expect("probe"),
+        block_until_drained(marker.as_fd(), Some(Instant::now())).expect("probe"),
         TreeDrain::MembersRemain,
         "a live marker holder must hold the edge shut"
     );
@@ -387,7 +387,7 @@ fn an_orphan_reparented_to_launchd_holds_the_edge_shut() {
     assert_eq!(ppid, 1, "the orphan must be reparented to launchd");
 
     assert_eq!(
-        block_until_drained(marker.as_fd(), Some(Some(Instant::now()))).expect("probe"),
+        block_until_drained(marker.as_fd(), Some(Instant::now())).expect("probe"),
         TreeDrain::MembersRemain,
         "an orphan at ppid=1 must hold the edge shut after the root is gone"
     );
@@ -426,14 +426,14 @@ fn all_markers_closed_requires_every_simultaneous_holder_to_exit() {
     let stdin_b = child.fd_write_end(5.into()).expect("holder B stdin write end");
 
     assert_eq!(
-        block_until_drained(marker.as_fd(), Some(Some(Instant::now()))).expect("probe"),
+        block_until_drained(marker.as_fd(), Some(Instant::now())).expect("probe"),
         TreeDrain::MembersRemain,
         "two live holders must hold the edge shut"
     );
 
     drop(stdin_a); // holder A sees EOF on its own stdin and exits; holder B is untouched
     assert_eq!(
-        block_until_drained(marker.as_fd(), Some(Some(Instant::now()))).expect("probe"),
+        block_until_drained(marker.as_fd(), Some(Instant::now())).expect("probe"),
         TreeDrain::MembersRemain,
         "one holder exiting while a second remains must not be mistaken for a full drain"
     );
@@ -478,7 +478,7 @@ fn small_bytes_from_a_member_are_not_a_drain() {
         .expect("the child wrote to fd 3 before this returns");
 
     assert_eq!(
-        block_until_drained(marker.as_fd(), Some(Some(Instant::now()))).expect("zero-deadline check"),
+        block_until_drained(marker.as_fd(), Some(Instant::now())).expect("zero-deadline check"),
         TreeDrain::MembersRemain,
         "a handful of buffered bytes under the low-water clamp must not be mistaken for a drain"
     );
@@ -548,11 +548,8 @@ fn bytes_past_the_low_water_clamp_are_drained_without_a_wrong_verdict() {
     // hang the suite), not as the mechanism the assertion depends on.
     let (child, marker, stdin) = spawn_marker_holder("yes | head -c 200000 >&3; exec 3>&-; exec cat >/dev/null");
     assert_eq!(
-        block_until_drained(
-            marker.as_fd(),
-            Some(Instant::now().checked_add(Duration::from_secs(10)))
-        )
-        .expect("wait past the low-water clamp"),
+        block_until_drained(marker.as_fd(), Instant::now().checked_add(Duration::from_secs(10)))
+            .expect("wait past the low-water clamp"),
         TreeDrain::AllMarkersClosed,
         "closing the marker after writing past the clamp must still report drained, not hang or misfire"
     );

@@ -178,7 +178,7 @@ pub(crate) fn drain_proc_exit(kq: &Kqueue) -> Result<Option<()>, Error> {
 /// kqueue wait this crate arms — `EVFILT_PROC` here, `EVFILT_READ` in `containment::marker_eof`.
 pub(crate) fn block_on_kqueue<T: Copy>(
     kq: &Kqueue,
-    deadline: Option<Option<Instant>>,
+    deadline: Option<Instant>,
     on_timeout: T,
     mut interpret: impl FnMut(&KEvent, bool) -> Result<Option<T>, Error>,
 ) -> Result<T, Error> {

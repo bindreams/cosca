@@ -36,13 +36,13 @@ pub(crate) fn exited_by_id(id: ProcessId, timeout: Option<Duration>) -> Result<b
 }
 
 /// `timeout` as an absolute deadline, fixed up front so no wake extends the total wait.
-pub(super) fn absolute(timeout: Option<Duration>) -> Option<Option<Instant>> {
+pub(super) fn absolute(timeout: Option<Duration>) -> Option<Instant> {
     timeout.and_then(crate::wait::deadline_from)
 }
 
 /// The wait loop against an absolute `deadline` from [`absolute`]: look; if running, block on what
 /// the look returned.
-pub(super) fn drive(p: &mut dyn OsProcess, deadline: Option<Option<Instant>>) -> Result<bool, Error> {
+pub(super) fn drive(p: &mut dyn OsProcess, deadline: Option<Instant>) -> Result<bool, Error> {
     loop {
         // Read before the look: a look made at or after the deadline is the final one.
         let final_look = remaining(deadline) == Some(Duration::ZERO);
@@ -59,7 +59,7 @@ pub(super) fn drive(p: &mut dyn OsProcess, deadline: Option<Option<Instant>>) ->
 }
 
 /// Block on `wait_for` until it wakes or `deadline` passes. The caller looks again either way.
-fn block(wait_for: &WaitFor<'_>, deadline: Option<Option<Instant>>) -> Result<(), Error> {
+fn block(wait_for: &WaitFor<'_>, deadline: Option<Instant>) -> Result<(), Error> {
     match wait_for {
         #[cfg(target_os = "linux")]
         WaitFor::Readable(pidfd) => {
