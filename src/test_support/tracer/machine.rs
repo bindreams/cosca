@@ -1,7 +1,7 @@
 //! The helper's state machine, run in the helper process by [`main`].
 //!
 //! The events are a syscall's result, `NOTE_EXIT`, `SIGCHLD` (XNU's word that the tracee
-//! stopped), a signal byte (always read, since the pipe's `EVFILT_READ` is level-triggered), the
+//! stopped), a signal byte (one per round, as [`SignalPipe`] hands them out), the
 //! signal pipe's EOF, and a backoff's timeout. A backoff is the kqueue's own timeout, 1 ms
 //! doubling to 50 ms, with no cap: it only paces the re-check of a real condition.
 //!
@@ -136,6 +136,7 @@ pub(super) fn main() {
             kept: None,
             blocked: None,
             eof_seen: false,
+            signal_pipe: SignalPipe::default(),
         }
         .run(),
         PidLine::Eof => {}
@@ -382,6 +383,7 @@ struct Machine<'f> {
     /// The last `blocking` report, until any other report follows it.
     blocked: Option<String>,
     eof_seen: bool,
+    signal_pipe: SignalPipe,
 }
 
 impl Machine<'_> {
@@ -696,7 +698,7 @@ impl Machine<'_> {
                         );
                         self.block(tag, until)?;
                     }
-                    real_round(kq, timeout)
+                    real_round(kq, &mut self.signal_pipe, timeout)
                 }
             };
             self.note_exit_seen |= batch.note_exit;
@@ -765,7 +767,63 @@ fn injected(tag: &str, directive: &str) -> Batch {
     batch
 }
 
-fn real_round(kq: &Kqueue, timeout: Option<Duration>) -> Batch {
+/// What the signal pipe's last event reported and the machine has not taken yet. The pipe is
+/// subscribed edge-triggered, so one event can stand for several bytes and the EOF, and no later
+/// event repeats them; a round that finds any left takes the next without waiting, as a level
+/// trigger would report it again.
+#[derive(Default)]
+struct SignalPipe {
+    buffered: usize,
+    closed: bool,
+}
+
+/// What [`SignalPipe::take`] handed out.
+#[derive(Debug, PartialEq, Eq)]
+enum Taken {
+    Nothing,
+    Byte,
+    Eof,
+}
+
+impl SignalPipe {
+    /// Takes in a readable event: `buffered` is what the pipe holds now, which includes what
+    /// an earlier event reported and the machine has not taken.
+    fn note(&mut self, buffered: usize, closed: bool) {
+        self.buffered = buffered;
+        self.closed |= closed;
+    }
+
+    fn pending(&self) -> bool {
+        self.buffered > 0 || self.closed
+    }
+
+    /// The next thing the pipe has for the machine: a byte, else the EOF once no byte is left.
+    /// `read` reads one byte, `None` at EOF.
+    fn take(&mut self, read: impl FnOnce() -> Option<u8>) -> Taken {
+        if self.buffered > 0 {
+            return match read() {
+                Some(_) => {
+                    self.buffered -= 1;
+                    Taken::Byte
+                }
+                None => self.eof(),
+            };
+        }
+        if self.closed {
+            return self.eof();
+        }
+        Taken::Nothing
+    }
+
+    fn eof(&mut self) -> Taken {
+        *self = SignalPipe::default();
+        Taken::Eof
+    }
+}
+
+fn real_round(kq: &Kqueue, pipe: &mut SignalPipe, timeout: Option<Duration>) -> Batch {
+    // What the pipe still holds is ready now: look for the other events without waiting.
+    let timeout = if pipe.pending() { Some(Duration::ZERO) } else { timeout };
     let timeout = timeout.map(crate::os_process::macos::kqueue::kevent_timeout);
     let blank = || KEvent::new(0, EventFilter::EVFILT_PROC, EvFlags::empty(), FilterFlag::empty(), 0, 0);
     let mut events = [blank(), blank(), blank()];
@@ -781,14 +839,16 @@ fn real_round(kq: &Kqueue, timeout: Option<Duration>) -> Batch {
         match Event::from_kevent(raw).unwrap_or_else(|e| panic!("kevent reported an error event: {e}")) {
             Some(Event::Process { .. }) => batch.note_exit = true,
             Some(Event::Signal { .. }) => batch.sigchld = true,
-            Some(Event::Readable { .. }) => match sys::read_byte(0) {
-                Some(_) => batch.signal = true,
-                None => {
-                    sys::unwatch_signal_pipe(kq);
-                    batch.eof = true;
-                }
-            },
+            Some(Event::Readable { bytes, closed, .. }) => pipe.note(bytes, closed),
             None => panic!("kevent returned an event of an unregistered filter: {:?}", raw.filter()),
+        }
+    }
+    match pipe.take(|| sys::read_byte(0)) {
+        Taken::Nothing => {}
+        Taken::Byte => batch.signal = true,
+        Taken::Eof => {
+            sys::unwatch_signal_pipe(kq);
+            batch.eof = true;
         }
     }
     batch
