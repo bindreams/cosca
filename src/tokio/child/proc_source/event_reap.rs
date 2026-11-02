@@ -92,15 +92,14 @@ impl Ready<'_> {
 
 // macOS =====
 
-/// `AsyncFd` requires `AsRawFd`; nix's `Kqueue` exposes only `AsFd`.
+/// What `AsyncFd` registers: the kqueue's descriptor.
 #[cfg(target_os = "macos")]
-struct KqueueFd(nix::sys::event::Kqueue);
+struct KqueueFd(crate::os_process::macos::kqueue::Kqueue);
 
 #[cfg(target_os = "macos")]
 impl std::os::fd::AsRawFd for KqueueFd {
     fn as_raw_fd(&self) -> std::os::fd::RawFd {
-        use std::os::fd::AsFd as _;
-        self.0.as_fd().as_raw_fd()
+        self.0.as_raw_fd()
     }
 }
 
@@ -126,7 +125,7 @@ impl KqueueWatch {
         if crate::tokio::child::fault::take_fail_reap_watch() {
             return Err(Error::Io(std::io::Error::other("forced watch failure (test seam)")));
         }
-        let kq = nix::sys::event::Kqueue::new().map_err(|e| Error::Io(e.into()))?;
+        let kq = crate::os_process::macos::kqueue::Kqueue::new()?;
         let backoff = register_exit_events(&kq, pid).map_err(Error::Io)?;
         let afd = ::tokio::io::unix::AsyncFd::with_interest(KqueueFd(kq), ::tokio::io::Interest::READABLE)
             .map_err(Error::Io)?;

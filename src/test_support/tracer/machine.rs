@@ -99,10 +99,11 @@
 
 use std::time::Duration;
 
-use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
+use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent};
 
 use super::sys::{self, Stop};
 use super::{Mode, Until};
+use crate::os_process::macos::kqueue::{Event, Kqueue};
 
 const FIRST_BACKOFF: Duration = Duration::from_millis(1);
 const MAX_BACKOFF: Duration = Duration::from_millis(50);
@@ -769,25 +770,25 @@ fn real_round(kq: &Kqueue, timeout: Option<Duration>) -> Batch {
     let blank = || KEvent::new(0, EventFilter::EVFILT_PROC, EvFlags::empty(), FilterFlag::empty(), 0, 0);
     let mut events = [blank(), blank(), blank()];
     let n = loop {
-        match kq.kevent(&[], &mut events, timeout) {
+        match kq.native().kevent(&[], &mut events, timeout) {
             Ok(n) => break n,
             Err(nix::errno::Errno::EINTR) => continue,
             Err(e) => panic!("kevent failed: {e}"),
         }
     };
     let mut batch = Batch::default();
-    for event in &events[..n] {
-        match event.filter() {
-            Ok(EventFilter::EVFILT_PROC) => batch.note_exit = true,
-            Ok(EventFilter::EVFILT_SIGNAL) => batch.sigchld = true,
-            Ok(EventFilter::EVFILT_READ) => match sys::read_byte(0) {
+    for raw in &events[..n] {
+        match Event::from_kevent(raw).unwrap_or_else(|e| panic!("kevent reported an error event: {e}")) {
+            Some(Event::Process { .. }) => batch.note_exit = true,
+            Some(Event::Signal { .. }) => batch.sigchld = true,
+            Some(Event::Readable { .. }) => match sys::read_byte(0) {
                 Some(_) => batch.signal = true,
                 None => {
                     sys::unwatch_signal_pipe(kq);
                     batch.eof = true;
                 }
             },
-            other => panic!("kevent returned an event of an unregistered filter: {other:?}"),
+            None => panic!("kevent returned an event of an unregistered filter: {:?}", raw.filter()),
         }
     }
     batch

@@ -328,8 +328,8 @@ pub(crate) fn fire_kevent_round(round: u32) {
 }
 
 /// Whether `kq` has an event pending, by a `poll` of its descriptor, which takes nothing from it.
-pub(crate) fn event_pending(kq: &Kqueue) -> bool {
-    use std::os::fd::{AsFd, AsRawFd};
+pub(crate) fn event_pending(kq: &impl std::os::fd::AsFd) -> bool {
+    use std::os::fd::AsRawFd;
     let mut fd = libc::pollfd {
         fd: kq.as_fd().as_raw_fd(),
         events: libc::POLLIN,

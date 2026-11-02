@@ -726,33 +726,28 @@ fn watch_linux(listener: &std::net::TcpListener, target: crate::identity::Proces
     }
 }
 
-/// macOS: the crate's own [`crate::os_process::macos::kqueue::arm_proc_exit`] kqueue, with an `EVFILT_READ`
-/// watch on the listener added to the SAME kqueue (via the crate's own
-/// [`crate::os_process::macos::kqueue::add_with_receipt`]).
+/// macOS: the crate's own [`crate::os_process::macos::kqueue::arm_proc_exit`] kqueue, with a
+/// `Readable` subscription on the listener added to the SAME kqueue.
 #[cfg(target_os = "macos")]
 fn watch_macos(listener: &std::net::TcpListener, target: crate::identity::ProcessId) -> WatchEvent {
     use std::os::fd::AsRawFd;
 
     use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent};
 
+    use crate::os_process::macos::kqueue::{Event, SubscribeOutcome, Subscription};
+
     let Some(kq) =
         crate::os_process::macos::kqueue::arm_proc_exit(target).expect("arm a kqueue exit-watch for the target")
     else {
         return WatchEvent::Died;
     };
-    let listener_change = KEvent::new(
-        listener.as_raw_fd() as usize,
-        EventFilter::EVFILT_READ,
-        EvFlags::EV_ADD | EvFlags::EV_RECEIPT,
-        FilterFlag::empty(),
-        0,
-        0,
-    );
-    let listener_errno = crate::os_process::macos::kqueue::add_with_receipt(kq.native(), listener_change)
-        .expect("kevent(EV_ADD) to arm the listener watch");
+    let listener = Subscription::Readable {
+        fd: listener.as_raw_fd(),
+        low_water: 1,
+    };
     assert_eq!(
-        listener_errno, 0,
-        "kevent(EV_ADD) for EVFILT_READ on the control listener reported errno {listener_errno}"
+        kq.subscribe(listener).expect("watch the control listener"),
+        SubscribeOutcome::Subscribed
     );
 
     let placeholder = KEvent::new(0, EventFilter::EVFILT_PROC, EvFlags::empty(), FilterFlag::empty(), 0, 0);
@@ -767,14 +762,12 @@ fn watch_macos(listener: &std::net::TcpListener, target: crate::identity::Proces
             }
             Err(e) => panic!("kevent while waiting for a control connection: {e}"),
         };
-        for ev in &events[..n] {
-            debug_assert!(
-                !ev.flags().contains(EvFlags::EV_ERROR),
-                "an armed kevent reported EV_ERROR: {ev:?}"
-            );
-        }
-        let exited = events[..n].iter().any(|ev| ev.filter() == Ok(EventFilter::EVFILT_PROC));
-        let connection = events[..n].iter().any(|ev| ev.filter() == Ok(EventFilter::EVFILT_READ));
+        let read: Vec<Event> = events[..n]
+            .iter()
+            .filter_map(|ev| Event::from_kevent(ev).expect("an armed kevent reported EV_ERROR"))
+            .collect();
+        let exited = read.iter().any(|ev| matches!(ev, Event::Process { .. }));
+        let connection = read.iter().any(|ev| matches!(ev, Event::Readable { .. }));
         match shared::first_ready(exited, connection) {
             Some(shared::Ready::Exit) => return WatchEvent::Died,
             Some(shared::Ready::Source) => return WatchEvent::Connection,

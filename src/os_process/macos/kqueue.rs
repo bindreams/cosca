@@ -65,27 +65,6 @@ fn placeholder() -> KEvent {
     KEvent::new(0, EventFilter::EVFILT_PROC, EvFlags::empty(), FilterFlag::empty(), 0, 0)
 }
 
-/// Apply one change to an EXISTING kqueue with `EV_RECEIPT` (synchronous, receipt-checked)
-/// and return the add result: 0 = armed, otherwise an errno. The single definition of the
-/// receipt dance, shared by every filter this crate arms via `EV_ADD | EV_RECEIPT` — no
-/// hand-rolled twin to drift.
-pub(crate) fn add_with_receipt(kq: &NixKqueue, change: KEvent) -> Result<i64, Error> {
-    // EV_RECEIPT makes EV_ADD synchronous: kevent returns exactly one receipt event
-    // whose `data` is the add result (0 = armed, an errno otherwise). The zero timeout never
-    // waits: the receipt comes out with the change, and a missing one must not block the caller.
-    let mut receipt = [placeholder()];
-    let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    let n = kq
-        .kevent(&[change], &mut receipt, Some(zero))
-        .map_err(|e| Error::Io(e.into()))?;
-    if n != 1 {
-        return Err(Error::Io(std::io::Error::other(
-            "kqueue EV_RECEIPT returned no receipt event",
-        )));
-    }
-    Ok(receipt[0].data() as i64)
-}
-
 /// `NOTE_REAP` (xnu `sys/event.h`): a process was reaped. Spelled here because libc dropped it in
 /// 0.2.190.
 pub(crate) const NOTE_REAP: u32 = 0x1000_0000;
@@ -108,7 +87,6 @@ pub(crate) enum Subscription {
     /// `fd` reaching `low_water` buffered bytes, or its other end closing; reported once per change.
     Readable { fd: RawFd, low_water: usize },
     /// Signal `signo` delivered to this process.
-    #[allow(dead_code, reason = "no caller yet")]
     Signal(libc::c_int),
 }
 
@@ -194,16 +172,27 @@ impl Event {
             }),
             Ok(EventFilter::EVFILT_READ) => Some(Event::Readable {
                 fd: ev.ident() as RawFd,
-                bytes: usize::try_from(ev.data()).unwrap_or(0),
+                bytes: count(ev),
                 closed: flags.contains(EvFlags::EV_EOF),
             }),
             Ok(EventFilter::EVFILT_SIGNAL) => Some(Event::Signal {
                 signo: ev.ident() as libc::c_int,
-                count: usize::try_from(ev.data()).unwrap_or(0),
+                count: count(ev),
             }),
             _ => None,
         })
     }
+}
+
+/// The count an `EVFILT_READ` or `EVFILT_SIGNAL` event carries in `data`: bytes buffered, signals
+/// delivered. The kernel never makes it negative.
+fn count(ev: &KEvent) -> usize {
+    debug_assert!(
+        ev.data() >= 0,
+        "a read or signal event's data is a count and never negative, got {}",
+        ev.data()
+    );
+    usize::try_from(ev.data()).unwrap_or(0)
 }
 
 /// The error a receipt's (or an `EV_ERROR` event's) `data` names.
@@ -216,11 +205,30 @@ impl Kqueue {
         NixKqueue::new().map(Kqueue).map_err(|e| Error::Io(e.into()))
     }
 
+    /// Applies one `EV_RECEIPT` change and returns its receipt: 0 for done, otherwise an errno.
+    fn apply(&self, change: KEvent) -> Result<i64, Error> {
+        // EV_RECEIPT makes the change synchronous: kevent returns exactly one receipt event
+        // whose `data` is the result. The zero timeout never waits: the receipt comes out with
+        // the change, and a missing one must not block the caller.
+        let mut receipt = [placeholder()];
+        let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        let n = self
+            .0
+            .kevent(&[change], &mut receipt, Some(zero))
+            .map_err(|e| Error::Io(e.into()))?;
+        if n != 1 {
+            return Err(Error::Io(std::io::Error::other(
+                "kqueue EV_RECEIPT returned no receipt event",
+            )));
+        }
+        Ok(receipt[0].data() as i64)
+    }
+
     /// Registers `s`, replacing the registration of the same (kqueue, ident, filter) if there is
     /// one. Every subscription is `EV_CLEAR`: it reports what changed since it was last read.
     pub(crate) fn subscribe(&self, s: Subscription) -> Result<SubscribeOutcome, Error> {
         let flags = EvFlags::EV_ADD | EvFlags::EV_RECEIPT | EvFlags::EV_CLEAR;
-        match add_with_receipt(&self.0, s.change(flags))? {
+        match self.apply(s.change(flags))? {
             0 => Ok(SubscribeOutcome::Subscribed),
             e if e == libc::ESRCH as i64 && matches!(s, Subscription::Process { .. }) => {
                 Ok(SubscribeOutcome::ProcessGone)
@@ -230,9 +238,8 @@ impl Kqueue {
     }
 
     /// A subscription the kernel already removed (a delivered exit) is fine.
-    #[allow(dead_code, reason = "no caller yet")]
     pub(crate) fn unsubscribe(&self, s: Subscription) -> Result<(), Error> {
-        match add_with_receipt(&self.0, s.change(EvFlags::EV_DELETE | EvFlags::EV_RECEIPT))? {
+        match self.apply(s.change(EvFlags::EV_DELETE | EvFlags::EV_RECEIPT))? {
             0 => Ok(()),
             e if e == libc::ENOENT as i64 => Ok(()),
             e => Err(receipt_error(e)),
@@ -262,10 +269,6 @@ impl Kqueue {
     }
 
     /// Lends the nix queue to the loops that have not moved onto [`Kqueue`] yet.
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "only test code reads through the nix queue yet")
-    )]
     pub(crate) fn native(&self) -> &NixKqueue {
         &self.0
     }
@@ -281,32 +284,6 @@ impl AsRawFd for Kqueue {
     fn as_raw_fd(&self) -> RawFd {
         self.0.as_fd().as_raw_fd()
     }
-}
-
-/// Arm an `EVFILT_PROC | NOTE_EXIT | NOTE_SIGNAL` filter for `pid` on an EXISTING kqueue: every
-/// signal sent to `pid` wakes the kqueue, and so does its exit. `Ok(None)` => the pid is already
-/// gone.
-pub(crate) fn arm_exit_and_signals_on(kq: &NixKqueue, pid: u32) -> Result<Option<()>, Error> {
-    arm_proc_on(kq, pid, FilterFlag::NOTE_EXIT | FilterFlag::NOTE_SIGNAL)
-}
-
-fn arm_proc_on(kq: &NixKqueue, pid: u32, fflags: FilterFlag) -> Result<Option<()>, Error> {
-    let change = KEvent::new(
-        pid as usize,
-        EventFilter::EVFILT_PROC,
-        EvFlags::EV_ADD | EvFlags::EV_RECEIPT,
-        fflags,
-        0,
-        0,
-    );
-    let add_result = add_with_receipt(kq, change)?;
-    if add_result == libc::ESRCH as i64 {
-        return Ok(None); // pid already gone
-    }
-    if add_result != 0 {
-        return Err(Error::Io(std::io::Error::from_raw_os_error(add_result as i32)));
-    }
-    Ok(Some(()))
 }
 
 /// Create a kqueue and arm an `EVFILT_PROC | NOTE_EXIT` filter for `id`, re-verifying

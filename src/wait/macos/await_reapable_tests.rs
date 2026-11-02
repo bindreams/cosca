@@ -8,9 +8,7 @@
 use std::process::{Child, ChildStdin};
 use std::time::Duration;
 
-use nix::sys::event::Kqueue;
-
-use crate::os_process::macos::kqueue::test_hooks;
+use crate::os_process::macos::kqueue::{test_hooks, Kqueue};
 use crate::wait::exit_only::seams as exit_seams;
 use crate::wait::exit_only::seams::HolderStep;
 use crate::wait::exit_only::Peek;

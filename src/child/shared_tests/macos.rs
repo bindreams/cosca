@@ -518,8 +518,8 @@ fn a_wait_on_a_child_whose_tracer_dies_during_its_exit_is_woken_by_the_tracers_e
 /// should be) gets a `SIGCHLD` to this process, which the wait also watches, so a wait that missed
 /// its event fails its test's assertion instead of hanging.
 pub(super) fn on_rounds(
-    kq: &std::rc::Rc<nix::sys::event::Kqueue>,
-    mut hook: impl FnMut(u32, &nix::sys::event::Kqueue) -> bool + 'static,
+    kq: &std::rc::Rc<crate::os_process::macos::kqueue::Kqueue>,
+    mut hook: impl FnMut(u32, &crate::os_process::macos::kqueue::Kqueue) -> bool + 'static,
 ) -> ForcedOnce {
     let kq = std::rc::Rc::clone(kq);
     test_hooks::on_every_kevent_round(move |round| {
@@ -552,7 +552,7 @@ fn a_wait_on_a_child_a_tracer_attaches_to_late_is_woken_by_the_attach() {
         let holder = Rc::clone(&holder);
         move || Ok(holder.get())
     });
-    let kq = Rc::new(nix::sys::event::Kqueue::new().expect("kqueue"));
+    let kq = Rc::new(crate::os_process::macos::kqueue::Kqueue::new().expect("kqueue"));
     let attach_woke = Rc::new(Cell::new(None));
     let tracer_stdin = RefCell::new(Some(tracer_stdin));
     let _rounds = on_rounds(&kq, {
@@ -609,7 +609,7 @@ fn a_wait_on_a_child_whose_tracer_is_traced_is_woken_by_that_tracers_exit() {
         move || Ok(holder.get())
     });
     let _traced = crate::identity::kinfo::fault::force_parents(tracer_pid, move || started_by_us_traced_by(outer_pid));
-    let kq = Rc::new(nix::sys::event::Kqueue::new().expect("kqueue"));
+    let kq = Rc::new(crate::os_process::macos::kqueue::Kqueue::new().expect("kqueue"));
     let exit_woke = Rc::new(Cell::new(None));
     let _rounds = on_rounds(&kq, {
         let exit_woke = Rc::clone(&exit_woke);
@@ -659,7 +659,7 @@ fn a_wait_on_a_child_whose_tracer_is_exiting_at_launchd_peeks_again_on_a_backoff
         move || Ok(holder.get())
     });
     let _dying = crate::identity::kinfo::fault::force_parents(tracer_pid, || started_by_us_traced_by(LAUNCHD));
-    let kq = Rc::new(nix::sys::event::Kqueue::new().expect("kqueue"));
+    let kq = Rc::new(crate::os_process::macos::kqueue::Kqueue::new().expect("kqueue"));
     let _rounds = on_rounds(&kq, move |round, _| {
         holder.set(LAUNCHD);
         // The first round's own wake, for a wait that blocked with no timeout.

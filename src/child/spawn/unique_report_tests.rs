@@ -321,17 +321,6 @@ fn awaiting_a_closed_empty_pipe_answers_missing() {
     end(child, stdin);
 }
 
-/// Whether `kq` has an `EVFILT_READ` event pending, by a `kevent` that does not block. A level
-/// event stays queued while the pipe is readable, so the look takes nothing from the wait.
-fn read_pending(kq: &nix::sys::event::Kqueue) -> bool {
-    use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent};
-    let blank = KEvent::new(0, EventFilter::EVFILT_PROC, EvFlags::empty(), FilterFlag::empty(), 0, 0);
-    let mut events = [blank; 2];
-    let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    let n = kq.kevent(&[], &mut events, Some(zero)).expect("poll the wait's kqueue");
-    events[..n].iter().any(|e| e.filter() == Ok(EventFilter::EVFILT_READ))
-}
-
 /// The wait blocks until a report arrives, and the pipe's readability is what ends it. The hook on
 /// the wait's first block writes the report and looks at the wait's kqueue for the pipe's event.
 /// The child stays alive, so only the pipe can end a correct wait. A wait that missed it is ended by
@@ -359,7 +348,7 @@ fn awaiting_is_woken_by_the_report_through_the_pipe() {
             if n == 1 {
                 let mut w = writer.borrow_mut().take().expect("the report's writer");
                 w.write_all(&report_bytes(1, 0xdef)).unwrap();
-                pending.set(Some(read_pending(kq)));
+                pending.set(Some(crate::os_process::macos::kqueue::test_hooks::event_pending(kq)));
                 if pending.get() == Some(true) {
                     return;
                 }

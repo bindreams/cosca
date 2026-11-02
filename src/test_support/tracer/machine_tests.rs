@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
+use crate::os_process::macos::kqueue::{Kqueue, SubscribeOutcome, Subscription};
 
 /// A timeout beyond XNU's `kevent` limit still delivers a pending exit instead of panicking. The
 /// child blocks on a pipe until `NOTE_EXIT` is armed, since XNU refuses to arm it on an exited
@@ -17,16 +17,12 @@ fn real_round_with_a_far_timeout_returns_the_pending_exit() {
     let mut child = crate::test_spawn::spawn(&mut cat).expect("spawn cat");
     let stdin = child.stdin.take().expect("cat's stdin is piped");
     let kq = Kqueue::new().expect("kqueue");
-    let change = KEvent::new(
-        child.id() as usize,
-        EventFilter::EVFILT_PROC,
-        EvFlags::EV_ADD,
-        FilterFlag::NOTE_EXIT,
-        0,
-        0,
-    );
-    kq.kevent(&[change], &mut [], Some(libc::timespec { tv_sec: 0, tv_nsec: 0 }))
-        .expect("arm NOTE_EXIT");
+    let exit = Subscription::Process {
+        pid: child.id(),
+        signals: false,
+        reap: false,
+    };
+    assert_eq!(kq.subscribe(exit).expect("arm NOTE_EXIT"), SubscribeOutcome::Subscribed);
     drop(stdin);
     let batch = super::real_round(&kq, Some(Duration::from_secs(u64::from(u32::MAX))));
     assert!(batch.note_exit, "the exit is delivered, not an EINVAL panic");

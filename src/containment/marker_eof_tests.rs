@@ -219,8 +219,8 @@ fn block_until_drained_with_a_past_deadline_still_reports_an_already_drained_tre
 #[skuld::test]
 fn arm_on_an_invalid_descriptor_reports_an_io_error() {
     // Exercises `ensure_nonblocking`'s guard inside `arm` — the actual reachable failure mode
-    // for a bad descriptor. `add_with_receipt`'s own EV_ERROR branch (for EVFILT_READ,
-    // via `arm`) has no test anywhere in this module: a descriptor that passes
+    // for a bad descriptor. The receipt's refusal of the subscription `arm` makes (`Kqueue::subscribe`)
+    // has no test anywhere in this module: a descriptor that passes
     // `ensure_nonblocking`'s fcntl check yet still fails kqueue's EV_ADD is not something this
     // module found a reliable, portable way to construct.
     let err = super::arm(never_allocated_fd(), false).expect_err("arming an invalid descriptor must error");
