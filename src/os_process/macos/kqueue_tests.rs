@@ -268,10 +268,9 @@ fn no_events() -> Vec<Event> {
 }
 
 #[skuld::test]
-fn a_process_subscription_on_a_reaped_pid_is_process_gone() {
-    let mut child = crate::test_spawn::spawn(&mut std::process::Command::new("true")).expect("spawn true");
-    let pid = child.id();
-    child.wait().expect("reap");
+fn a_process_subscription_on_a_pid_that_names_no_process_is_process_gone() {
+    // macOS pids stay below PID_MAX (99999), so this never names a process, and `proc_find` fails.
+    let pid = i32::MAX as u32;
     let kq = Kqueue::new().expect("kqueue");
     let outcome = kq
         .subscribe(Subscription::Process {
