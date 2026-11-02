@@ -1,10 +1,11 @@
-//! macOS kqueue primitives for [`crate::os_process`]: `EVFILT_PROC` + `NOTE_EXIT` arms (notifies,
-//! never reaps) and the blocking `kevent` loop. Signals go through the audit token, in
-//! `os_process::macos`.
+//! macOS kqueue primitives for [`crate::os_process`]: the [`Kqueue`] type (subscriptions and the
+//! events they report), `EVFILT_PROC` + `NOTE_EXIT` arms (notifies, never reaps) and the blocking
+//! `kevent` loop. Signals go through the audit token, in `os_process::macos`.
 
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::time::{Duration, Instant};
 
-use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
+use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue as NixKqueue};
 
 use crate::error::Error;
 
@@ -68,12 +69,14 @@ fn placeholder() -> KEvent {
 /// and return the add result: 0 = armed, otherwise an errno. The single definition of the
 /// receipt dance, shared by every filter this crate arms via `EV_ADD | EV_RECEIPT` — no
 /// hand-rolled twin to drift.
-pub(crate) fn add_with_receipt(kq: &Kqueue, change: KEvent) -> Result<i64, Error> {
+pub(crate) fn add_with_receipt(kq: &NixKqueue, change: KEvent) -> Result<i64, Error> {
     // EV_RECEIPT makes EV_ADD synchronous: kevent returns exactly one receipt event
-    // whose `data` is the add result (0 = armed, an errno otherwise).
+    // whose `data` is the add result (0 = armed, an errno otherwise). The zero timeout never
+    // waits: the receipt comes out with the change, and a missing one must not block the caller.
     let mut receipt = [placeholder()];
+    let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     let n = kq
-        .kevent(&[change], &mut receipt, None)
+        .kevent(&[change], &mut receipt, Some(zero))
         .map_err(|e| Error::Io(e.into()))?;
     if n != 1 {
         return Err(Error::Io(std::io::Error::other(
@@ -83,19 +86,217 @@ pub(crate) fn add_with_receipt(kq: &Kqueue, change: KEvent) -> Result<i64, Error
     Ok(receipt[0].data() as i64)
 }
 
+/// `NOTE_REAP` (xnu `sys/event.h`): a process was reaped. Spelled here because libc dropped it in
+/// 0.2.190.
+pub(crate) const NOTE_REAP: u32 = 0x1000_0000;
+
+/// Events read per `kevent` call by [`Kqueue::poll`], which calls again while a read fills them.
+const POLL_BATCH: usize = 32;
+
+/// A kqueue: a set of subscriptions, each reporting what happened to it since it was last read.
+///
+/// One per waiter: events go to whichever reader takes them, and a registration is keyed by
+/// (kqueue, ident, filter), so two waiters sharing one queue replace each other's registrations.
+#[derive(Debug)]
+#[allow(dead_code, reason = "the callers move onto it in the next commits of this change")]
+pub(crate) struct Kqueue(NixKqueue);
+
+/// What one subscription watches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code, reason = "the callers move onto it in the next commits of this change")]
+pub(crate) enum Subscription {
+    /// Process `pid`'s exit; and, if asked, signals delivered to it and its reap by anyone.
+    Process { pid: u32, signals: bool, reap: bool },
+    /// `fd` reaching `low_water` buffered bytes, or its other end closing; reported once per change.
+    Readable { fd: RawFd, low_water: usize },
+    /// Signal `signo` delivered to this process.
+    Signal(libc::c_int),
+}
+
+/// What happened to one subscription since it was last read, merged: the kernel keeps one event
+/// per subscription, so flags raised since the last read arrive together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code, reason = "the callers move onto it in the next commits of this change")]
+pub(crate) enum Event {
+    Process {
+        pid: u32,
+        exited: bool,
+        signalled: bool,
+        reaped: bool,
+    },
+    Readable {
+        fd: RawFd,
+        bytes: usize,
+        closed: bool,
+    },
+    Signal {
+        signo: libc::c_int,
+        count: usize,
+    },
+}
+
+/// How one [`Kqueue::subscribe`] call went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code, reason = "the callers move onto it in the next commits of this change")]
+pub(crate) enum SubscribeOutcome {
+    Subscribed,
+    /// A [`Subscription::Process`] whose pid no longer exists.
+    ProcessGone,
+}
+
+#[allow(dead_code, reason = "the callers move onto it in the next commits of this change")]
+impl Subscription {
+    /// The kernel change that applies `flags` to this subscription.
+    fn change(self, flags: EvFlags) -> KEvent {
+        match self {
+            Subscription::Process { pid, signals, reap } => {
+                let mut fflags = FilterFlag::NOTE_EXIT;
+                if signals {
+                    fflags |= FilterFlag::NOTE_SIGNAL;
+                }
+                if reap {
+                    fflags |= FilterFlag::from_bits_retain(NOTE_REAP);
+                }
+                KEvent::new(pid as usize, EventFilter::EVFILT_PROC, flags, fflags, 0, 0)
+            }
+            Subscription::Readable { fd, low_water } => KEvent::new(
+                fd as usize,
+                EventFilter::EVFILT_READ,
+                flags,
+                FilterFlag::NOTE_LOWAT,
+                // A threshold above `isize::MAX` is never reached either way.
+                isize::try_from(low_water).unwrap_or(isize::MAX),
+                0,
+            ),
+            Subscription::Signal(signo) => KEvent::new(
+                signo as usize,
+                EventFilter::EVFILT_SIGNAL,
+                flags,
+                FilterFlag::empty(),
+                0,
+                0,
+            ),
+        }
+    }
+}
+
+#[allow(dead_code, reason = "the callers move onto it in the next commits of this change")]
+impl Event {
+    /// The event a kernel `KEvent` reports. `Ok(None)` for a filter [`Event`] does not name;
+    /// `Err` for an `EV_ERROR` event, whose `data` is the errno.
+    pub(crate) fn from_kevent(ev: &KEvent) -> Result<Option<Event>, Error> {
+        let flags = ev.flags();
+        if flags.contains(EvFlags::EV_ERROR) {
+            return Err(receipt_error(ev.data() as i64));
+        }
+        let fflags = ev.fflags();
+        Ok(match ev.filter() {
+            Ok(EventFilter::EVFILT_PROC) => Some(Event::Process {
+                pid: ev.ident() as u32,
+                exited: fflags.contains(FilterFlag::NOTE_EXIT),
+                signalled: fflags.contains(FilterFlag::NOTE_SIGNAL),
+                reaped: fflags.bits() & NOTE_REAP != 0,
+            }),
+            Ok(EventFilter::EVFILT_READ) => Some(Event::Readable {
+                fd: ev.ident() as RawFd,
+                bytes: usize::try_from(ev.data()).unwrap_or(0),
+                closed: flags.contains(EvFlags::EV_EOF),
+            }),
+            Ok(EventFilter::EVFILT_SIGNAL) => Some(Event::Signal {
+                signo: ev.ident() as libc::c_int,
+                count: usize::try_from(ev.data()).unwrap_or(0),
+            }),
+            _ => None,
+        })
+    }
+}
+
+/// The error a receipt's (or an `EV_ERROR` event's) `data` names.
+fn receipt_error(errno: i64) -> Error {
+    Error::Io(std::io::Error::from_raw_os_error(errno as i32))
+}
+
+#[allow(dead_code, reason = "the callers move onto it in the next commits of this change")]
+impl Kqueue {
+    pub(crate) fn new() -> Result<Self, Error> {
+        NixKqueue::new().map(Kqueue).map_err(|e| Error::Io(e.into()))
+    }
+
+    /// Registers `s`, replacing the registration of the same (kqueue, ident, filter) if there is
+    /// one. Every subscription is `EV_CLEAR`: it reports what changed since it was last read.
+    pub(crate) fn subscribe(&self, s: Subscription) -> Result<SubscribeOutcome, Error> {
+        let flags = EvFlags::EV_ADD | EvFlags::EV_RECEIPT | EvFlags::EV_CLEAR;
+        match add_with_receipt(&self.0, s.change(flags))? {
+            0 => Ok(SubscribeOutcome::Subscribed),
+            e if e == libc::ESRCH as i64 && matches!(s, Subscription::Process { .. }) => {
+                Ok(SubscribeOutcome::ProcessGone)
+            }
+            e => Err(receipt_error(e)),
+        }
+    }
+
+    /// A subscription the kernel already removed (a delivered exit) is fine.
+    pub(crate) fn unsubscribe(&self, s: Subscription) -> Result<(), Error> {
+        match add_with_receipt(&self.0, s.change(EvFlags::EV_DELETE | EvFlags::EV_RECEIPT))? {
+            0 => Ok(()),
+            e if e == libc::ENOENT as i64 => Ok(()),
+            e => Err(receipt_error(e)),
+        }
+    }
+
+    /// Takes every pending event, without blocking; empty if nothing is pending. An `EV_ERROR`
+    /// event fails the call, and the events read before it are lost with it.
+    pub(crate) fn poll(&self) -> Result<Vec<Event>, Error> {
+        let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        let mut batch = [placeholder(); POLL_BATCH];
+        let mut events = Vec::new();
+        loop {
+            let n = match self.0.kevent(&[], &mut batch, Some(zero)) {
+                Ok(n) => n,
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(e) => return Err(Error::Io(e.into())),
+            };
+            for ev in &batch[..n] {
+                events.extend(Event::from_kevent(ev)?);
+            }
+            // A read that comes back short has taken everything pending.
+            if n < POLL_BATCH {
+                return Ok(events);
+            }
+        }
+    }
+
+    /// Lends the nix queue to the loops that have not moved onto [`Kqueue`] yet.
+    pub(crate) fn native(&self) -> &NixKqueue {
+        &self.0
+    }
+}
+
+impl AsFd for Kqueue {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+}
+
+impl AsRawFd for Kqueue {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0.as_fd().as_raw_fd()
+    }
+}
+
 /// Arm an `EVFILT_PROC | NOTE_EXIT` filter for `pid` on an EXISTING kqueue. `Ok(None)` => the
 /// pid is already gone.
-pub(crate) fn arm_note_exit_on(kq: &Kqueue, pid: u32) -> Result<Option<()>, Error> {
+pub(crate) fn arm_note_exit_on(kq: &NixKqueue, pid: u32) -> Result<Option<()>, Error> {
     arm_proc_on(kq, pid, FilterFlag::NOTE_EXIT)
 }
 
 /// [`arm_note_exit_on`] with `NOTE_SIGNAL` as well: every signal sent to `pid` wakes the kqueue,
 /// and so does its exit.
-pub(crate) fn arm_exit_and_signals_on(kq: &Kqueue, pid: u32) -> Result<Option<()>, Error> {
+pub(crate) fn arm_exit_and_signals_on(kq: &NixKqueue, pid: u32) -> Result<Option<()>, Error> {
     arm_proc_on(kq, pid, FilterFlag::NOTE_EXIT | FilterFlag::NOTE_SIGNAL)
 }
 
-fn arm_proc_on(kq: &Kqueue, pid: u32, fflags: FilterFlag) -> Result<Option<()>, Error> {
+fn arm_proc_on(kq: &NixKqueue, pid: u32, fflags: FilterFlag) -> Result<Option<()>, Error> {
     let change = KEvent::new(
         pid as usize,
         EventFilter::EVFILT_PROC,
@@ -119,8 +320,8 @@ fn arm_proc_on(kq: &Kqueue, pid: u32, fflags: FilterFlag) -> Result<Option<()>, 
 /// once the exit event is pending. Test-only: the production exit watch is
 /// `os_process::macos::ExitWatch`, which the tests that need a bare kqueue do not reach.
 #[cfg(test)]
-pub(crate) fn arm_proc_exit(id: crate::identity::ProcessId) -> Result<Option<Kqueue>, Error> {
-    let kq = Kqueue::new().map_err(|e| Error::Io(e.into()))?;
+pub(crate) fn arm_proc_exit(id: crate::identity::ProcessId) -> Result<Option<NixKqueue>, Error> {
+    let kq = NixKqueue::new().map_err(|e| Error::Io(e.into()))?;
     if arm_note_exit_on(&kq, id.pid())?.is_none() {
         return Ok(None); // pid already gone
     }
@@ -147,7 +348,7 @@ pub(crate) fn arm_proc_exit(id: crate::identity::ProcessId) -> Result<Option<Kqu
 /// Drain one pending event from an armed kqueue without blocking. `Ok(Some(()))` = the exit
 /// event was observed; `Ok(None)` = nothing pending (spurious readiness — re-wait); `Err` =
 /// EV_ERROR (any, mirroring the blocking wait) or a kevent failure.
-pub(crate) fn drain_proc_exit(kq: &Kqueue) -> Result<Option<()>, Error> {
+pub(crate) fn drain_proc_exit(kq: &NixKqueue) -> Result<Option<()>, Error> {
     let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     let mut events = [placeholder()];
     loop {
@@ -177,7 +378,7 @@ pub(crate) fn drain_proc_exit(kq: &Kqueue) -> Result<Option<()>, Error> {
 /// re-checked before concluding, and retried as spurious otherwise. Shared by every blocking
 /// kqueue wait this crate arms — `EVFILT_PROC` here, `EVFILT_READ` in `containment::marker_eof`.
 pub(crate) fn block_on_kqueue<T: Copy>(
-    kq: &Kqueue,
+    kq: &NixKqueue,
     deadline: Option<Instant>,
     on_timeout: T,
     mut interpret: impl FnMut(&KEvent, bool) -> Result<Option<T>, Error>,

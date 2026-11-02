@@ -44,7 +44,7 @@ use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 use super::{OnTracer, TracerWatch};
 #[cfg(test)]
 use crate::os_process::macos::kqueue::test_hooks;
-use crate::os_process::macos::kqueue::{add_with_receipt, kevent_timeout};
+use crate::os_process::macos::kqueue::{add_with_receipt, kevent_timeout, NOTE_REAP};
 use crate::wait::exit_only::{self, Foreign, Peek, Target};
 
 /// The wait's verdict.
@@ -70,9 +70,6 @@ pub(crate) const BACKOFF_CAP: Duration = Duration::from_millis(50);
 fn blank() -> KEvent {
     KEvent::new(0, EventFilter::EVFILT_PROC, EvFlags::empty(), FilterFlag::empty(), 0, 0)
 }
-
-// xnu `sys/event.h`. Spelled locally: libc dropped `NOTE_REAP` in 0.2.190.
-const NOTE_REAP: u32 = 0x1000_0000;
 
 /// Register `EVFILT_SIGNAL` for `SIGCHLD` and `EVFILT_PROC` for `pid`. `Ok(true)` when the
 /// `EVFILT_PROC` receipt says `ESRCH` (the child is already past `P_REF_DEAD`).
