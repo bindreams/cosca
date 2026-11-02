@@ -84,8 +84,8 @@ pub(crate) struct Kqueue(NixKqueue);
 pub(crate) enum Subscription {
     /// Process `pid`'s exit; and, if asked, signals delivered to it and its reap by anyone.
     Process { pid: u32, signals: bool, reap: bool },
-    /// `fd`, a pipe or socket, reaching `low_water` buffered bytes, or its other end closing;
-    /// reported once per change. (A regular file's `data` can be negative, which `count`'s debug assert rejects.)
+    /// `fd`, a pipe, socket or kqueue, reaching `low_water` buffered bytes, or its other end closing;
+    /// reported once per change. (A regular file's `data` can be negative, which `count` rejects.)
     Readable { fd: RawFd, low_water: usize },
     /// Signal `signo` delivered to this process.
     Signal(libc::c_int),
@@ -186,8 +186,16 @@ impl Event {
 }
 
 /// The count an `EVFILT_READ` or `EVFILT_SIGNAL` event carries in `data`: bytes buffered, signals
-/// delivered. The kernel never makes it negative.
+/// delivered. The kernel never makes it negative; if it does, that is a kqueue ABI surprise or a
+/// bug here, so release builds warn before clamping to 0 rather than clamp silently.
 fn count(ev: &KEvent) -> usize {
+    if ev.data() < 0 {
+        log::warn!(
+            "kqueue: {:?} reported a negative data field ({}); clamped to 0",
+            ev.filter(),
+            ev.data()
+        );
+    }
     debug_assert!(
         ev.data() >= 0,
         "a read or signal event's data is a count and never negative, got {}",
