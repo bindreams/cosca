@@ -84,7 +84,8 @@ pub(crate) struct Kqueue(NixKqueue);
 pub(crate) enum Subscription {
     /// Process `pid`'s exit; and, if asked, signals delivered to it and its reap by anyone.
     Process { pid: u32, signals: bool, reap: bool },
-    /// `fd` reaching `low_water` buffered bytes, or its other end closing; reported once per change.
+    /// `fd`, a pipe or socket, reaching `low_water` buffered bytes, or its other end closing;
+    /// reported once per change. (A regular file's `data` can be negative, which `count`'s debug assert rejects.)
     Readable { fd: RawFd, low_water: usize },
     /// Signal `signo` delivered to this process.
     Signal(libc::c_int),

@@ -778,7 +778,6 @@ struct SignalPipe {
 }
 
 /// What [`SignalPipe::take`] handed out.
-#[derive(Debug, PartialEq, Eq)]
 enum Taken {
     Nothing,
     Byte,
@@ -798,10 +797,9 @@ impl SignalPipe {
     }
 
     /// The next thing the pipe has for the machine: a byte, else the EOF once no byte is left.
-    /// `read` reads one byte, `None` at EOF.
-    fn take(&mut self, read: impl FnOnce() -> Option<u8>) -> Taken {
+    fn take(&mut self) -> Taken {
         if self.buffered > 0 {
-            return match read() {
+            return match sys::read_byte(0) {
                 Some(_) => {
                     self.buffered -= 1;
                     Taken::Byte
@@ -843,7 +841,7 @@ fn real_round(kq: &Kqueue, pipe: &mut SignalPipe, timeout: Option<Duration>) -> 
             None => panic!("kevent returned an event of an unregistered filter: {:?}", raw.filter()),
         }
     }
-    match pipe.take(|| sys::read_byte(0)) {
+    match pipe.take() {
         Taken::Nothing => {}
         Taken::Byte => batch.signal = true,
         Taken::Eof => {
