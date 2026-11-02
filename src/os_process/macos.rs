@@ -15,7 +15,7 @@ use super::{Exit, Op, OsProcess, WaitFor};
 use crate::error::{io_context, Error};
 use crate::identity::{uniq_info, Existence, ProcessId, ReadPurpose, UniqRead};
 use crate::signal::{Sent, Sig};
-use kqueue::{block_on_kqueue, Event, Kqueue, SubscribeOutcome, Subscription};
+use kqueue::{block_on_kqueue, Event, Kqueue, Subscription};
 
 pub(crate) mod kqueue;
 
@@ -206,10 +206,11 @@ impl ExitWatch {
             signals: false,
             reap: false,
         };
-        Ok(match kq.subscribe(exit)? {
-            SubscribeOutcome::Subscribed => Some(Self::new(kq)),
-            SubscribeOutcome::ProcessGone => None,
-        })
+        match kq.subscribe(exit) {
+            Ok(()) => Ok(Some(Self::new(kq))),
+            Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// Block until the event has been read, by this call or an earlier one, or until `deadline`.
@@ -221,19 +222,34 @@ impl ExitWatch {
         // Only a wait that is really armed counts as a block.
         #[cfg(test)]
         crate::wait::block_probe::record(crate::wait::remaining(deadline));
-        block_on_kqueue(&self.kq, deadline, false, |event, _already_elapsed| {
-            Ok(Event::from_kevent(event)?.map(|_| {
-                self.seen.store(true, Ordering::Relaxed);
-                true
-            }))
-        })
+        block_on_kqueue(
+            &self.kq,
+            deadline,
+            false,
+            |event, _already_elapsed| match Event::from_kevent(event) {
+                Some(Event::Error { errno, .. }) => Err(Error::Io(errno.into())),
+                Some(_) => {
+                    self.seen.store(true, Ordering::Relaxed);
+                    Ok(Some(true))
+                }
+                None => Ok(None),
+            },
+        )
     }
 
     /// Read a pending event without blocking. `Ok(true)` = the event has been read, now or
     /// earlier. An `EV_ERROR` event is `Err`.
     pub(crate) fn drain(&self) -> Result<bool, Error> {
-        if !self.kq.poll()?.is_empty() {
-            self.seen.store(true, Ordering::Relaxed);
+        // The error comes after the other events are taken: each is reported once.
+        let mut refused = None;
+        for event in self.kq.poll()? {
+            match event {
+                Event::Error { errno, .. } => refused = refused.or(Some(errno)),
+                _ => self.seen.store(true, Ordering::Relaxed),
+            }
+        }
+        if let Some(errno) = refused {
+            return Err(Error::Io(errno.into()));
         }
         Ok(self.seen.load(Ordering::Relaxed))
     }

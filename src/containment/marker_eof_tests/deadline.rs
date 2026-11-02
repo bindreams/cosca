@@ -487,9 +487,7 @@ fn interpret_read_event_suppresses_drain_when_told_to() {
     assert_eq!(n, 1, "expected the crossing to be ready");
 
     let before = fionread(marker.as_fd());
-    let event = Event::from_kevent(&events[0])
-        .expect("a receipt-free event")
-        .expect("a readable event");
+    let event = Event::from_kevent(&events[0]).expect("a readable event");
     let verdict = interpret_read_event(event, marker.as_fd(), true).expect("interpret with suppress_drain=true");
     let after = fionread(marker.as_fd());
 

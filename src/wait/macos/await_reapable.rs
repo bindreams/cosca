@@ -44,7 +44,7 @@ use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent};
 use super::{OnTracer, TracerWatch};
 #[cfg(test)]
 use crate::os_process::macos::kqueue::test_hooks;
-use crate::os_process::macos::kqueue::{kevent_timeout, Event, Kqueue, SubscribeOutcome, Subscription};
+use crate::os_process::macos::kqueue::{kevent_timeout, Event, Kqueue, Subscription};
 use crate::wait::exit_only::{self, Foreign, Peek, Target};
 
 /// The wait's verdict.
@@ -74,8 +74,7 @@ fn blank() -> KEvent {
 /// Register `EVFILT_SIGNAL` for `SIGCHLD` and `EVFILT_PROC` for `pid`. `Ok(true)` when the
 /// `EVFILT_PROC` receipt says `ESRCH` (the child is already past `P_REF_DEAD`).
 fn register(kq: &Kqueue, pid: u32) -> io::Result<bool> {
-    let signal = kq.subscribe(Subscription::Signal(libc::SIGCHLD)).map_err(into_io)?;
-    debug_assert_eq!(signal, SubscribeOutcome::Subscribed, "a signal names no process");
+    kq.subscribe(Subscription::Signal(libc::SIGCHLD)).map_err(into_io)?;
     #[cfg(test)]
     if test_hooks::take_forced_esrch_registration() {
         return Ok(true);
@@ -85,7 +84,11 @@ fn register(kq: &Kqueue, pid: u32) -> io::Result<bool> {
         signals: true,
         reap: true,
     };
-    Ok(kq.subscribe(child).map_err(into_io)? == SubscribeOutcome::ProcessGone)
+    match kq.subscribe(child) {
+        Ok(()) => Ok(false),
+        Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Ok(true),
+        Err(e) => Err(into_io(e)),
+    }
 }
 
 fn into_io(e: crate::error::Error) -> io::Error {
@@ -129,12 +132,22 @@ fn drain_for_reap(kq: &Kqueue, events: &mut [KEvent; BATCH], pid: u32, tracer: &
 /// tracer, and a tracer's exit are neither: they only wake the wait to peek again.
 fn scan(events: &[KEvent], pid: u32, tracer: &mut TracerWatch) -> io::Result<(bool, bool)> {
     let (mut reap, mut exit) = (false, false);
+    // An `Event::Error` fails the scan after the events read with it are taken.
+    let mut refused = None;
     for raw in events {
         #[cfg(test)]
         test_hooks::record_event(raw.filter().map_or(0, |f| f as i16), raw.fflags().bits());
-        let Some(event) = Event::from_kevent(raw).map_err(into_io)? else {
+        // The backoff timer is this module's own registration, not a `Kqueue` subscription.
+        if matches!(raw.filter(), Ok(EventFilter::EVFILT_TIMER)) {
+            continue;
+        }
+        let Some(event) = Event::from_kevent(raw) else {
             continue;
         };
+        if let Event::Error { errno, .. } = event {
+            refused = refused.or(Some(errno));
+            continue;
+        }
         if tracer.fired(&event, pid) {
             continue;
         }
@@ -143,7 +156,10 @@ fn scan(events: &[KEvent], pid: u32, tracer: &mut TracerWatch) -> io::Result<(bo
             exit |= exited;
         }
     }
-    Ok((reap, exit))
+    match refused {
+        Some(errno) => Err(errno.into()),
+        None => Ok((reap, exit)),
+    }
 }
 
 /// How long one `kevent` call may block.

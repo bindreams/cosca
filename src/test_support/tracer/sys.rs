@@ -1,7 +1,7 @@
 //! The helper's raw syscalls. Each returns the errno it failed with.
 
 use crate::error::Error;
-use crate::os_process::macos::kqueue::{Kqueue, SubscribeOutcome, Subscription};
+use crate::os_process::macos::kqueue::{Kqueue, Subscription};
 
 fn errno() -> i32 {
     std::io::Error::last_os_error()
@@ -303,14 +303,12 @@ pub(super) fn read_byte(fd: i32) -> Option<u8> {
 /// Subscribes to `s`; a refusal is the errno the kernel's receipt names.
 fn subscribe(kq: &Kqueue, s: Subscription) -> Result<(), i32> {
     match kq.subscribe(s) {
-        Ok(SubscribeOutcome::Subscribed) => Ok(()),
-        Ok(SubscribeOutcome::ProcessGone) => Err(libc::ESRCH),
+        Ok(()) => Ok(()),
         Err(Error::Io(e)) => Err(e.raw_os_error().expect("a refused registration names its errno")),
         Err(e) => panic!("kevent registration failed outright: {e}"),
     }
 }
 
-/// Registers `NOTE_EXIT` for `pid`.
 pub(super) fn watch_exit(kq: &Kqueue, pid: u32) -> Result<(), i32> {
     subscribe(
         kq,
@@ -322,10 +320,8 @@ pub(super) fn watch_exit(kq: &Kqueue, pid: u32) -> Result<(), i32> {
     )
 }
 
-/// The signal pipe, fd 0.
 const SIGNAL_PIPE: Subscription = Subscription::Readable { fd: 0, low_water: 1 };
 
-/// Registers the signal pipe for reading.
 pub(super) fn watch_signal_pipe(kq: &Kqueue) -> Result<(), i32> {
     subscribe(kq, SIGNAL_PIPE)
 }
@@ -336,7 +332,7 @@ pub(super) fn watch_sigchld(kq: &Kqueue) -> Result<(), i32> {
 }
 
 /// Removes the signal pipe's registration after its EOF. Called while fd 0 is open: a closed fd
-/// would answer `EBADF`, not "none left".
+/// would answer `EBADF`.
 pub(super) fn unwatch_signal_pipe(kq: &Kqueue) {
     kq.unsubscribe(SIGNAL_PIPE)
         .unwrap_or_else(|e| panic!("removing the signal pipe's registration failed: {e}"));

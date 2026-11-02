@@ -767,10 +767,9 @@ fn injected(tag: &str, directive: &str) -> Batch {
     batch
 }
 
-/// What the signal pipe's last event reported and the machine has not taken yet. The pipe is
-/// subscribed edge-triggered, so one event can stand for several bytes and the EOF, and no later
-/// event repeats them; a round that finds any left takes the next without waiting, as a level
-/// trigger would report it again.
+/// What the signal pipe's last event reported and the machine has not taken yet. Subscriptions are
+/// edge-triggered: one event can stand for several bytes and the EOF, and nothing repeats them, so a
+/// round that finds any left takes the next without waiting.
 #[derive(Default)]
 struct SignalPipe {
     buffered: usize,
@@ -820,7 +819,6 @@ impl SignalPipe {
 }
 
 fn real_round(kq: &Kqueue, pipe: &mut SignalPipe, timeout: Option<Duration>) -> Batch {
-    // What the pipe still holds is ready now: look for the other events without waiting.
     let timeout = if pipe.pending() { Some(Duration::ZERO) } else { timeout };
     let timeout = timeout.map(crate::os_process::macos::kqueue::kevent_timeout);
     let blank = || KEvent::new(0, EventFilter::EVFILT_PROC, EvFlags::empty(), FilterFlag::empty(), 0, 0);
@@ -834,10 +832,13 @@ fn real_round(kq: &Kqueue, pipe: &mut SignalPipe, timeout: Option<Duration>) -> 
     };
     let mut batch = Batch::default();
     for raw in &events[..n] {
-        match Event::from_kevent(raw).unwrap_or_else(|e| panic!("kevent reported an error event: {e}")) {
+        match Event::from_kevent(raw) {
             Some(Event::Process { .. }) => batch.note_exit = true,
             Some(Event::Signal { .. }) => batch.sigchld = true,
             Some(Event::Readable { bytes, closed, .. }) => pipe.note(bytes, closed),
+            Some(Event::Error { ident, filter, errno }) => {
+                panic!("kevent refused the registration of ident {ident}, filter {filter}: {errno}")
+            }
             None => panic!("kevent returned an event of an unregistered filter: {:?}", raw.filter()),
         }
     }

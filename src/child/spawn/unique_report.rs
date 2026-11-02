@@ -303,7 +303,7 @@ enum Watch {
 
 /// The kqueue wait of [`await_report`].
 fn watch(read_end: &OwnedFd, pid: u32) -> io::Result<Watch> {
-    use crate::os_process::macos::kqueue::{Event, Kqueue, SubscribeOutcome, Subscription};
+    use crate::os_process::macos::kqueue::{Event, Kqueue, Subscription};
     use crate::wait::macos::{OnTracer, TracerWatch};
     use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent};
 
@@ -314,8 +314,7 @@ fn watch(read_end: &OwnedFd, pid: u32) -> io::Result<Watch> {
         fd: read_end.as_raw_fd(),
         low_water: 1,
     };
-    let subscribed = kq.subscribe(pipe).map_err(into_io)?;
-    debug_assert_eq!(subscribed, SubscribeOutcome::Subscribed, "a pipe names no process");
+    kq.subscribe(pipe).map_err(into_io)?;
     // Registered before the first check, so a child that exits after it fires `NOTE_EXIT`, and one a
     // tracer attaches to fires `NOTE_SIGNAL`.
     let child = Subscription::Process {
@@ -323,8 +322,10 @@ fn watch(read_end: &OwnedFd, pid: u32) -> io::Result<Watch> {
         signals: true,
         reap: false,
     };
-    if kq.subscribe(child).map_err(into_io)? == SubscribeOutcome::ProcessGone {
-        return Ok(Watch::ChildGone);
+    match kq.subscribe(child) {
+        Ok(()) => {}
+        Err(e) if e.raw_os_error() == Some(libc::ESRCH) => return Ok(Watch::ChildGone),
+        Err(e) => return Err(into_io(e)),
     }
     let mut tracer = TracerWatch::default();
     let blank = KEvent::new(0, EventFilter::EVFILT_READ, EvFlags::empty(), FilterFlag::empty(), 0, 0);
@@ -381,22 +382,29 @@ fn watch(read_end: &OwnedFd, pid: u32) -> io::Result<Watch> {
                  for it to exit"
             );
         }
-        let woke = events[..n]
-            .iter()
-            .filter_map(|e| Event::from_kevent(e).transpose())
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(into_io)?;
-        if woke
-            .iter()
-            .any(|e| matches!(e, Event::Process { pid: p, exited: true, .. } if *p == pid))
-        {
+        let woke: Vec<Event> = events[..n].iter().filter_map(Event::from_kevent).collect();
+        // The events read with a refused registration are taken first: each is reported once.
+        let mut child_gone = false;
+        let mut refused = None;
+        for event in &woke {
+            match *event {
+                Event::Error { errno, .. } => refused = refused.or(Some(errno)),
+                Event::Process {
+                    pid: p, exited: true, ..
+                } if p == pid => child_gone = true,
+                _ => {
+                    tracer.fired(event, pid);
+                }
+            }
+        }
+        if let Some(errno) = refused {
+            return Err(errno.into());
+        }
+        if child_gone {
             return Ok(Watch::ChildGone);
         }
         // Any other wake (a signal to the child, a tracer's exit or signal, the pipe, a timer) reads
         // the pipe and checks the child again.
-        for event in &woke {
-            tracer.fired(event, pid);
-        }
     }
 }
 

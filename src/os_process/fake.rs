@@ -103,17 +103,15 @@ impl OsProcess for FakeProcess {
 pub(super) fn readable_watch(fd: std::os::fd::BorrowedFd<'_>) -> Result<super::macos::ExitWatch, Error> {
     use std::os::fd::AsRawFd;
 
-    use crate::os_process::macos::kqueue::{Kqueue, SubscribeOutcome, Subscription};
+    use crate::os_process::macos::kqueue::{Kqueue, Subscription};
 
     let kq = Kqueue::new()?;
     let readable = Subscription::Readable {
         fd: fd.as_raw_fd(),
         low_water: 1,
     };
-    match kq.subscribe(readable)? {
-        SubscribeOutcome::Subscribed => Ok(super::macos::ExitWatch::new(kq)),
-        SubscribeOutcome::ProcessGone => unreachable!("a readable subscription names no process"),
-    }
+    kq.subscribe(readable)?;
+    Ok(super::macos::ExitWatch::new(kq))
 }
 
 /// What a `Running` look hands out, and the way a test fires it.

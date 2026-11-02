@@ -1,10 +1,11 @@
-//! macOS kqueue primitives for [`crate::os_process`]: the [`Kqueue`] type (subscriptions and the
-//! events they report), `EVFILT_PROC` + `NOTE_EXIT` arms (notifies, never reaps) and the blocking
-//! `kevent` loop. Signals go through the audit token, in `os_process::macos`.
+//! macOS kqueue primitives for [`crate::os_process`]: the [`Kqueue`] type, the `NOTE_EXIT` arms
+//! (notify, never reap) and the blocking `kevent` loop. Signals go through the audit token, in
+//! `os_process::macos`.
 
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::time::{Duration, Instant};
 
+use nix::errno::Errno;
 use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue as NixKqueue};
 
 use crate::error::Error;
@@ -84,8 +85,7 @@ pub(crate) struct Kqueue(NixKqueue);
 pub(crate) enum Subscription {
     /// Process `pid`'s exit; and, if asked, signals delivered to it and its reap by anyone.
     Process { pid: u32, signals: bool, reap: bool },
-    /// `fd`, a pipe, socket or kqueue, reaching `low_water` buffered bytes, or its other end closing;
-    /// reported once per change. (A regular file's `data` can be negative, which `count` rejects.)
+    /// `fd`, a pipe, socket or kqueue, reaching `low_water` buffered bytes, or its other end closing.
     Readable { fd: RawFd, low_water: usize },
     /// Signal `signo` delivered to this process.
     Signal(libc::c_int),
@@ -110,14 +110,12 @@ pub(crate) enum Event {
         signo: libc::c_int,
         count: usize,
     },
-}
-
-/// How one [`Kqueue::subscribe`] call went.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SubscribeOutcome {
-    Subscribed,
-    /// A [`Subscription::Process`] whose pid no longer exists.
-    ProcessGone,
+    /// An `EV_ERROR` event: the kernel refused the registration (`ident`, `filter`).
+    Error {
+        ident: usize,
+        filter: libc::c_short,
+        errno: Errno,
+    },
 }
 
 impl Subscription {
@@ -156,15 +154,21 @@ impl Subscription {
 }
 
 impl Event {
-    /// The event a kernel `KEvent` reports. `Ok(None)` for a filter [`Event`] does not name;
-    /// `Err` for an `EV_ERROR` event, whose `data` is the errno.
-    pub(crate) fn from_kevent(ev: &KEvent) -> Result<Option<Event>, Error> {
+    /// The event a kernel `KEvent` reports; an `EV_ERROR` event, whose `data` is the errno, is
+    /// [`Event::Error`]. `None` for a filter [`Event`] does not name: a `Kqueue` holds only
+    /// subscriptions it can report, so that breaks a contract (debug-asserted, warned in release).
+    pub(crate) fn from_kevent(ev: &KEvent) -> Option<Event> {
         let flags = ev.flags();
         if flags.contains(EvFlags::EV_ERROR) {
-            return Err(receipt_error(ev.data() as i64));
+            return Some(Event::Error {
+                ident: ev.ident(),
+                // 0 is no filter: a filter unknown to nix has no value to report.
+                filter: ev.filter().map_or(0, |f| f as libc::c_short),
+                errno: Errno::from_raw(ev.data() as i32),
+            });
         }
         let fflags = ev.fflags();
-        Ok(match ev.filter() {
+        match ev.filter() {
             Ok(EventFilter::EVFILT_PROC) => Some(Event::Process {
                 pid: ev.ident() as u32,
                 exited: fflags.contains(FilterFlag::NOTE_EXIT),
@@ -180,14 +184,17 @@ impl Event {
                 signo: ev.ident() as libc::c_int,
                 count: count(ev),
             }),
-            _ => None,
-        })
+            other => {
+                log::warn!("kqueue: an event of filter {other:?} that no subscription asked for; dropped");
+                debug_assert!(false, "an event of filter {other:?} that no subscription asked for");
+                None
+            }
+        }
     }
 }
 
-/// The count an `EVFILT_READ` or `EVFILT_SIGNAL` event carries in `data`: bytes buffered, signals
-/// delivered. The kernel never makes it negative; if it does, that is a kqueue ABI surprise or a
-/// bug here, so release builds warn before clamping to 0 rather than clamp silently.
+/// The count an `EVFILT_READ` or `EVFILT_SIGNAL` event carries in `data` (bytes buffered, signals
+/// delivered). Never negative; a negative one is an ABI surprise, warned about and clamped to 0.
 fn count(ev: &KEvent) -> usize {
     if ev.data() < 0 {
         log::warn!(
@@ -204,7 +211,7 @@ fn count(ev: &KEvent) -> usize {
     usize::try_from(ev.data()).unwrap_or(0)
 }
 
-/// The error a receipt's (or an `EV_ERROR` event's) `data` names.
+/// The error a receipt's `data` names.
 fn receipt_error(errno: i64) -> Error {
     Error::Io(std::io::Error::from_raw_os_error(errno as i32))
 }
@@ -214,11 +221,10 @@ impl Kqueue {
         NixKqueue::new().map(Kqueue).map_err(|e| Error::Io(e.into()))
     }
 
-    /// Applies one `EV_RECEIPT` change and returns its receipt: 0 for done, otherwise an errno.
-    fn apply(&self, change: KEvent) -> Result<i64, Error> {
+    /// Applies one `EV_RECEIPT` change; a receipt whose `data` is an errno is that error.
+    fn apply(&self, change: KEvent) -> Result<(), Error> {
         // EV_RECEIPT makes the change synchronous: kevent returns exactly one receipt event
-        // whose `data` is the result. The zero timeout never waits: the receipt comes out with
-        // the change, and a missing one must not block the caller.
+        // whose `data` is the result.
         let mut receipt = [placeholder()];
         let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
         let n = self
@@ -230,33 +236,28 @@ impl Kqueue {
                 "kqueue EV_RECEIPT returned no receipt event",
             )));
         }
-        Ok(receipt[0].data() as i64)
+        match receipt[0].data() {
+            0 => Ok(()),
+            errno => Err(receipt_error(errno as i64)),
+        }
     }
 
     /// Registers `s`, replacing the registration of the same (kqueue, ident, filter) if there is
-    /// one. Every subscription is `EV_CLEAR`: it reports what changed since it was last read.
-    pub(crate) fn subscribe(&self, s: Subscription) -> Result<SubscribeOutcome, Error> {
-        let flags = EvFlags::EV_ADD | EvFlags::EV_RECEIPT | EvFlags::EV_CLEAR;
-        match self.apply(s.change(flags))? {
-            0 => Ok(SubscribeOutcome::Subscribed),
-            e if e == libc::ESRCH as i64 && matches!(s, Subscription::Process { .. }) => {
-                Ok(SubscribeOutcome::ProcessGone)
-            }
-            e => Err(receipt_error(e)),
-        }
+    /// one. Every subscription is `EV_CLEAR`: it reports what changed since it was last read. A
+    /// dead pid fails with `ESRCH`, like any refused registration.
+    pub(crate) fn subscribe(&self, s: Subscription) -> Result<(), Error> {
+        self.apply(s.change(EvFlags::EV_ADD | EvFlags::EV_RECEIPT | EvFlags::EV_CLEAR))
     }
 
-    /// A subscription the kernel already removed (a delivered exit) is fine.
+    /// Removes `s`'s registration. One the kernel already removed (a delivered exit) fails with
+    /// `ENOENT`.
     pub(crate) fn unsubscribe(&self, s: Subscription) -> Result<(), Error> {
-        match self.apply(s.change(EvFlags::EV_DELETE | EvFlags::EV_RECEIPT))? {
-            0 => Ok(()),
-            e if e == libc::ENOENT as i64 => Ok(()),
-            e => Err(receipt_error(e)),
-        }
+        self.apply(s.change(EvFlags::EV_DELETE | EvFlags::EV_RECEIPT))
     }
 
-    /// Takes every pending event, without blocking; empty if nothing is pending. An `EV_ERROR`
-    /// event fails the call, and the events read before it are lost with it.
+    /// Takes every pending event, in order, without blocking; empty if nothing is pending. An
+    /// `EV_ERROR` event is an [`Event::Error`] among the rest: the call fails only when `kevent`
+    /// does.
     pub(crate) fn poll(&self) -> Result<Vec<Event>, Error> {
         let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
         let mut batch = [placeholder(); POLL_BATCH];
@@ -268,7 +269,7 @@ impl Kqueue {
                 Err(e) => return Err(Error::Io(e.into())),
             };
             for ev in &batch[..n] {
-                events.extend(Event::from_kevent(ev)?);
+                events.extend(Event::from_kevent(ev));
             }
             // A read that comes back short has taken everything pending.
             if n < POLL_BATCH {
@@ -277,7 +278,8 @@ impl Kqueue {
         }
     }
 
-    /// Lends the nix queue to the loops that have not moved onto [`Kqueue`] yet.
+    /// The underlying nix queue, for the blocking `kevent` loops and `await_reapable`'s own loop,
+    /// which read it directly.
     pub(crate) fn native(&self) -> &NixKqueue {
         &self.0
     }
@@ -307,8 +309,10 @@ pub(crate) fn arm_proc_exit(id: crate::identity::ProcessId) -> Result<Option<Kqu
         signals: false,
         reap: false,
     };
-    if kq.subscribe(exit)? == SubscribeOutcome::ProcessGone {
-        return Ok(None); // pid already gone
+    match kq.subscribe(exit) {
+        Ok(()) => {}
+        Err(e) if e.raw_os_error() == Some(libc::ESRCH) => return Ok(None), // pid already gone
+        Err(e) => return Err(e),
     }
     // An unassessable identity is NOT gone and must not be reported as an exit.
     match id.exists() {

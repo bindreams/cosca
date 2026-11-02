@@ -31,7 +31,7 @@ use std::time::Duration;
 #[cfg(not(test))]
 use crate::identity::link;
 use crate::identity::{uniq_info, Link, ReadPurpose, UniqRead, LAUNCHD};
-use crate::os_process::macos::kqueue::{Event, Kqueue, SubscribeOutcome, Subscription};
+use crate::os_process::macos::kqueue::{Event, Kqueue, Subscription};
 
 /// The backoff's first interval after a walk finds a tracer gone, and its cap.
 const GONE_START: Duration = Duration::from_millis(1);
@@ -112,9 +112,10 @@ impl TracerWatch {
             };
             if !self.armed.contains(&(at, unique)) {
                 self.disarm(kq, at)?;
-                let armed = arm(kq, at).map_err(|e| WalkError::Watch(into_io(e)))?;
-                if armed == SubscribeOutcome::ProcessGone {
-                    return Ok(self.gone());
+                match arm(kq, at) {
+                    Ok(()) => {}
+                    Err(e) if e.raw_os_error() == Some(libc::ESRCH) => return Ok(self.gone()),
+                    Err(e) => return Err(WalkError::Watch(into_io(e))),
                 }
                 match uniq_info(at, ReadPurpose::Link) {
                     UniqRead::Found(info) if info.unique_id == unique => {}
@@ -165,7 +166,8 @@ impl TracerWatch {
     }
 
     /// Whether `event` is an event of a watched tracer, for a wait on `child`: its exit, or a signal
-    /// sent to it. An exit's knote is one-shot, so the next walk registers that pid again.
+    /// sent to it. An exit's knote is one-shot, so the next walk registers that pid again. An
+    /// [`Event::Error`] is no tracer's; the caller fails on it.
     pub(crate) fn fired(&mut self, event: &Event, child: u32) -> bool {
         let &Event::Process { pid, exited, .. } = event else {
             return false;
@@ -178,7 +180,6 @@ impl TracerWatch {
     }
 }
 
-/// The `NOTE_EXIT` and `NOTE_SIGNAL` subscription on `pid`.
 fn watched(pid: u32) -> Subscription {
     Subscription::Process {
         pid,
@@ -187,10 +188,13 @@ fn watched(pid: u32) -> Subscription {
     }
 }
 
-/// Deletes the registration on `pid`; none left is fine, as after a `NOTE_EXIT` was delivered,
-/// which deletes its one-shot knote.
+/// Removes the registration on `pid`. `ENOENT` is not a failure: a delivered `NOTE_EXIT` deletes
+/// its one-shot knote.
 fn delete(kq: &Kqueue, pid: u32) -> Result<(), WalkError> {
-    kq.unsubscribe(watched(pid)).map_err(|e| WalkError::Watch(into_io(e)))
+    match kq.unsubscribe(watched(pid)) {
+        Err(e) if e.raw_os_error() != Some(libc::ENOENT) => Err(WalkError::Watch(into_io(e))),
+        _ => Ok(()),
+    }
 }
 
 fn into_io(e: crate::error::Error) -> std::io::Error {
@@ -208,7 +212,7 @@ fn refused(pid: u32, errno: i32) -> WalkError {
 }
 
 /// Subscribes to `pid`'s exit and signals, or the refusal a test queued for it.
-fn arm(kq: &Kqueue, pid: u32) -> Result<SubscribeOutcome, crate::error::Error> {
+fn arm(kq: &Kqueue, pid: u32) -> Result<(), crate::error::Error> {
     #[cfg(test)]
     if let Some(errno) = seams::take_refused_registration() {
         return Err(crate::error::Error::Io(std::io::Error::from_raw_os_error(errno)));

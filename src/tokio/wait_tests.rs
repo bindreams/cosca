@@ -303,11 +303,7 @@ async fn death_watch_loop_survives_a_non_exit_drain_cycle() {
         signals: false,
         reap: false,
     };
-    assert_eq!(
-        kq.subscribe(decoy_exit).expect("arm decoy"),
-        crate::os_process::macos::kqueue::SubscribeOutcome::Subscribed,
-        "a live decoy arms"
-    );
+    kq.subscribe(decoy_exit).expect("a live decoy arms");
     decoy.kill().expect("kill decoy"); // the first, non-target wake
 
     let afd = ::tokio::io::unix::AsyncFd::with_interest(kq, ::tokio::io::Interest::READABLE).expect("register");

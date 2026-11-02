@@ -58,7 +58,7 @@ use std::time::Instant;
 
 use crate::containment::TreeDrain;
 use crate::error::Error;
-use crate::os_process::macos::kqueue::{Event, Kqueue, SubscribeOutcome, Subscription};
+use crate::os_process::macos::kqueue::{Event, Kqueue, Subscription};
 
 #[cfg(test)]
 #[path = "marker_eof_tests.rs"]
@@ -151,18 +151,16 @@ pub(crate) fn arm(read_end: BorrowedFd<'_>, unbounded_wait: bool) -> Result<Kque
         fd: read_end.as_raw_fd(),
         low_water: LOW_WATER_MARK,
     };
-    match kq.subscribe(readable)? {
-        SubscribeOutcome::Subscribed => Ok(kq),
-        SubscribeOutcome::ProcessGone => unreachable!("a readable subscription names no process"),
-    }
+    kq.subscribe(readable)?;
+    Ok(kq)
 }
 
 /// Interpret ONE readable event on the marker read end — the single definition shared by
 /// the one-shot drain (`drain_kqueue`) and the blocking wait's loop body
 /// (`block_until_drained`), so there is no hand-rolled twin to drift.
 ///
-/// `Ok(Some(AllMembersExited))` = the read end `closed` (`EV_EOF`) — final, regardless of buffered bytes, so no
-/// read happens in this branch. `Ok(None)` = readable without `EV_EOF`, which with
+/// `Ok(Some(AllMembersExited))` = the read end `closed` — final, regardless of buffered bytes, so
+/// no read happens in this branch. `Ok(None)` = readable without `EV_EOF`, which with
 /// `NOTE_LOWAT` armed only happens once buffered bytes reach the clamp — i.e. the pipe is at
 /// capacity, so a writer that keeps writing is, at that exact instant, already blocked in its
 /// own `write()`. `suppress_drain` decides what happens next:
@@ -192,18 +190,22 @@ pub(crate) fn arm(read_end: BorrowedFd<'_>, unbounded_wait: bool) -> Result<Kque
 /// proceed, capped by its own deadline) but always suppresses draining, per the three call
 /// sites above.
 ///
-/// `Err` = a read failure.
+/// `Err` = a read failure, or an [`Event::Error`]: the kernel refused the registration.
 fn interpret_read_event(
     event: Event,
     read_end: BorrowedFd<'_>,
     suppress_drain: bool,
 ) -> Result<Option<TreeDrain>, Error> {
-    let Event::Readable { bytes, closed, .. } = event else {
-        debug_assert!(
-            false,
-            "the marker kqueue subscribes to the read end only, got {event:?}"
-        );
-        return Ok(None);
+    let (bytes, closed) = match event {
+        Event::Readable { bytes, closed, .. } => (bytes, closed),
+        Event::Error { errno, .. } => return Err(Error::Io(errno.into())),
+        other => {
+            debug_assert!(
+                false,
+                "the marker kqueue subscribes to the read end only, got {other:?}"
+            );
+            return Ok(None);
+        }
     };
     if closed {
         return Ok(Some(TreeDrain::AllMarkersClosed));
@@ -252,10 +254,17 @@ pub(crate) fn drain_kqueue(kq: &Kqueue, read_end: BorrowedFd<'_>, suppress_drain
     if events.is_empty() {
         return Ok(DrainOutcome::Spurious);
     }
+    // An `Event::Error` fails the call after the events read with it are interpreted.
+    let mut refused = None;
     for event in events {
-        if let Some(verdict) = interpret_read_event(event, read_end, suppress_drain)? {
+        if let Event::Error { errno, .. } = event {
+            refused = refused.or(Some(errno));
+        } else if let Some(verdict) = interpret_read_event(event, read_end, suppress_drain)? {
             return Ok(DrainOutcome::Drained(verdict));
         }
+    }
+    if let Some(errno) = refused {
+        return Err(Error::Io(errno.into()));
     }
     Ok(DrainOutcome::Declined)
 }
@@ -314,7 +323,8 @@ pub(crate) fn block_until_drained(read_end: BorrowedFd<'_>, deadline: Option<Ins
         deadline,
         TreeDrain::MembersRemain,
         |event, already_elapsed| {
-            Event::from_kevent(event)?.map_or(Ok(None), |event| {
+            // `from_kevent` has already warned about a filter it does not name.
+            Event::from_kevent(event).map_or(Ok(None), |event| {
                 interpret_read_event(event, read_end, unbounded_wait || already_elapsed)
             })
         },

@@ -374,29 +374,21 @@ impl Tree {
 
         use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent};
 
-        use crate::os_process::macos::kqueue::{Kqueue, SubscribeOutcome, Subscription};
+        use crate::os_process::macos::kqueue::{Kqueue, Subscription};
 
         let root = crate::child::spawn::fault::spawn_pid();
         let kq = Kqueue::new().expect("kqueue");
-        let read = kq
-            .subscribe(Subscription::Readable {
-                fd: self.ready.as_raw_fd(),
-                low_water: 1,
-            })
-            .expect("watch the ready pipe");
-        assert_eq!(read, SubscribeOutcome::Subscribed, "watch the ready pipe");
-        let exit = kq
-            .subscribe(Subscription::Process {
-                pid: root,
-                signals: false,
-                reap: false,
-            })
-            .expect("watch the root");
-        assert_eq!(
-            exit,
-            SubscribeOutcome::Subscribed,
-            "the root {root} must be alive until its grandchild runs"
-        );
+        kq.subscribe(Subscription::Readable {
+            fd: self.ready.as_raw_fd(),
+            low_water: 1,
+        })
+        .expect("watch the ready pipe");
+        kq.subscribe(Subscription::Process {
+            pid: root,
+            signals: false,
+            reap: false,
+        })
+        .unwrap_or_else(|e| panic!("the root {root} must be alive until its grandchild runs: {e}"));
         let blank = KEvent::new(0, EventFilter::EVFILT_READ, EvFlags::empty(), FilterFlag::empty(), 0, 0);
         let mut events = [blank; 2];
         let n = loop {

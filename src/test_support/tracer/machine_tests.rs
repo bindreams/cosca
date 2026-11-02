@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use crate::os_process::macos::kqueue::{Kqueue, SubscribeOutcome, Subscription};
+use crate::os_process::macos::kqueue::{Kqueue, Subscription};
 
 /// A timeout beyond XNU's `kevent` limit still delivers a pending exit instead of panicking. The
 /// child blocks on a pipe until `NOTE_EXIT` is armed, since XNU refuses to arm it on an exited
@@ -22,7 +22,7 @@ fn real_round_with_a_far_timeout_returns_the_pending_exit() {
         signals: false,
         reap: false,
     };
-    assert_eq!(kq.subscribe(exit).expect("arm NOTE_EXIT"), SubscribeOutcome::Subscribed);
+    kq.subscribe(exit).expect("arm NOTE_EXIT");
     drop(stdin);
     let batch = super::real_round(
         &kq,

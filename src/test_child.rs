@@ -726,15 +726,15 @@ fn watch_linux(listener: &std::net::TcpListener, target: crate::identity::Proces
     }
 }
 
-/// macOS: the crate's own [`crate::os_process::macos::kqueue::arm_proc_exit`] kqueue, with a
-/// `Readable` subscription on the listener added to the SAME kqueue.
+/// macOS: [`crate::os_process::macos::kqueue::arm_proc_exit`]'s kqueue, with the listener's
+/// readability watched on the same queue.
 #[cfg(target_os = "macos")]
 fn watch_macos(listener: &std::net::TcpListener, target: crate::identity::ProcessId) -> WatchEvent {
     use std::os::fd::AsRawFd;
 
     use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent};
 
-    use crate::os_process::macos::kqueue::{Event, SubscribeOutcome, Subscription};
+    use crate::os_process::macos::kqueue::{Event, Subscription};
 
     let Some(kq) =
         crate::os_process::macos::kqueue::arm_proc_exit(target).expect("arm a kqueue exit-watch for the target")
@@ -745,10 +745,7 @@ fn watch_macos(listener: &std::net::TcpListener, target: crate::identity::Proces
         fd: listener.as_raw_fd(),
         low_water: 1,
     };
-    assert_eq!(
-        kq.subscribe(listener).expect("watch the control listener"),
-        SubscribeOutcome::Subscribed
-    );
+    kq.subscribe(listener).expect("watch the control listener");
 
     let placeholder = KEvent::new(0, EventFilter::EVFILT_PROC, EvFlags::empty(), FilterFlag::empty(), 0, 0);
     let mut events = [placeholder; 2];
@@ -762,10 +759,11 @@ fn watch_macos(listener: &std::net::TcpListener, target: crate::identity::Proces
             }
             Err(e) => panic!("kevent while waiting for a control connection: {e}"),
         };
-        let read: Vec<Event> = events[..n]
-            .iter()
-            .filter_map(|ev| Event::from_kevent(ev).expect("an armed kevent reported EV_ERROR"))
-            .collect();
+        let read: Vec<Event> = events[..n].iter().filter_map(Event::from_kevent).collect();
+        assert!(
+            !read.iter().any(|ev| matches!(ev, Event::Error { .. })),
+            "an armed kevent reported EV_ERROR: {read:?}"
+        );
         let exited = read.iter().any(|ev| matches!(ev, Event::Process { .. }));
         let connection = read.iter().any(|ev| matches!(ev, Event::Readable { .. }));
         match shared::first_ready(exited, connection) {
