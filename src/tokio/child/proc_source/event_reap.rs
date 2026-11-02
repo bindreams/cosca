@@ -92,7 +92,7 @@ impl Ready<'_> {
 
 // macOS =====
 
-/// What `AsyncFd` registers: the kqueue's descriptor.
+/// Newtype so `AsyncFd` can own the queue.
 #[cfg(target_os = "macos")]
 struct KqueueFd(crate::os_process::macos::kqueue::Kqueue);
 
