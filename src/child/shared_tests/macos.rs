@@ -248,7 +248,7 @@ fn run_case(path: &str, case: &str) {
 /// would sleep until the sibling is gone. The root's stdin closes from inside the holder's first
 /// blocking `kevent` round, so the waiter is known to be asleep first.
 fn ignoring_sigchld_with_a_sibling() -> (SharedChild, std::process::Child, std::process::ChildStdin, ForcedOnce) {
-    crate::test_child::set_sigchld_ignored(true);
+    crate::test_child::set_signal_ignored(libc::SIGCHLD, true);
     let (sibling, sibling_stdin) = spawn_std_blocker();
     let (root, root_stdin) = spawn_std_blocker();
     let id = super::fixtures::identity_of(&root);
@@ -321,7 +321,7 @@ fn a_sync_drop_of_a_child_the_kernel_reaped_returns() {
             "",
         );
     }
-    crate::test_child::set_sigchld_ignored(true);
+    crate::test_child::set_signal_ignored(libc::SIGCHLD, true);
     let (_sibling, _sibling_stdin) = spawn_std_blocker();
     use std::io::Read as _;
     let mut cmd = crate::Command::new();

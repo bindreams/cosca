@@ -254,19 +254,27 @@ pub(crate) fn drain_kqueue(kq: &Kqueue, read_end: BorrowedFd<'_>, suppress_drain
     if events.is_empty() {
         return Ok(DrainOutcome::Spurious);
     }
-    // An `Event::Error` fails the call after the events read with it are interpreted.
+    // A verdict read with an `Event::Error` still stands: nothing would report it again. The error
+    // fails the call only when there is no verdict.
     let mut refused = None;
+    let mut verdict = None;
     for event in events {
         if let Event::Error { errno, .. } = event {
             refused = refused.or(Some(errno));
-        } else if let Some(verdict) = interpret_read_event(event, read_end, suppress_drain)? {
-            return Ok(DrainOutcome::Drained(verdict));
+        } else if verdict.is_none() {
+            verdict = interpret_read_event(event, read_end, suppress_drain)?;
         }
     }
-    if let Some(errno) = refused {
-        return Err(Error::Io(errno.into()));
+    match (verdict, refused) {
+        (Some(verdict), refused) => {
+            if let Some(errno) = refused {
+                log::warn!("marker kqueue: a registration was refused ({errno}) beside the verdict");
+            }
+            Ok(DrainOutcome::Drained(verdict))
+        }
+        (None, Some(errno)) => Err(Error::Io(errno.into())),
+        (None, None) => Ok(DrainOutcome::Declined),
     }
-    Ok(DrainOutcome::Declined)
 }
 
 /// One-shot drain check: exact, not heuristic — arms a private kqueue and reads its

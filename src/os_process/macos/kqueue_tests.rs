@@ -409,35 +409,11 @@ fn a_readable_subscription_reports_the_close() {
     );
 }
 
-/// `signo` set to `SIG_IGN` while the guard lives, which the kqueue still counts; the prior
-/// disposition comes back on drop, a failed test's included.
-struct SignalIgnored {
-    signo: nix::sys::signal::Signal,
-    prior: nix::sys::signal::SigAction,
-}
-
-impl SignalIgnored {
-    fn new(signo: nix::sys::signal::Signal) -> Self {
-        use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet};
-        let ignore = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
-        // SAFETY: installs no handler; each test runs in a process of its own.
-        let prior = unsafe { sigaction(signo, &ignore) }.expect("ignore the signal");
-        Self { signo, prior }
-    }
-}
-
-impl Drop for SignalIgnored {
-    fn drop(&mut self) {
-        // SAFETY: restores the disposition `new` saved.
-        _ = unsafe { nix::sys::signal::sigaction(self.signo, &self.prior) };
-    }
-}
-
 #[skuld::test]
 fn a_signal_subscription_counts_deliveries() {
     const DELIVERIES: usize = 3;
 
-    let _ignored = SignalIgnored::new(nix::sys::signal::Signal::SIGUSR1);
+    crate::test_child::set_signal_ignored(libc::SIGUSR1, true);
     let kq = Kqueue::new().expect("kqueue");
     kq.subscribe(Subscription::Signal(libc::SIGUSR1)).expect("subscribe");
     for _ in 0..DELIVERIES {

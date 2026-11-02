@@ -1145,17 +1145,18 @@ pub(crate) fn run_fixture_case(fixture: &str, marker_env: &str, case_env: &str, 
     );
 }
 
-/// Set `SIGCHLD`'s disposition, process-wide: `SIG_IGN` if `ignore`, else `SIG_DFL`. Only a
-/// fixture re-exec (see [`run_fixture_case`]) may call it: it changes every thread of the process.
+/// Set `signo`'s disposition, process-wide: `SIG_IGN` if `ignore`, else `SIG_DFL`. It changes
+/// every thread of the process, so only a process the test owns may call it: a fixture re-exec (see
+/// [`run_fixture_case`]), or a test under nextest, which runs each test in a process of its own.
 #[cfg(target_os = "macos")]
-pub(crate) fn set_sigchld_ignored(ignore: bool) {
+pub(crate) fn set_signal_ignored(signo: libc::c_int, ignore: bool) {
     let handler = if ignore { libc::SIG_IGN } else { libc::SIG_DFL };
     // SAFETY: `signal` with `SIG_IGN` or `SIG_DFL` installs no handler code.
-    let previous = unsafe { libc::signal(libc::SIGCHLD, handler) };
+    let previous = unsafe { libc::signal(signo, handler) };
     assert_ne!(
         previous,
         libc::SIG_ERR,
-        "signal(SIGCHLD): {}",
+        "signal({signo}): {}",
         std::io::Error::last_os_error()
     );
 }
