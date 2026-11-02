@@ -372,29 +372,35 @@ impl Tree {
         use std::io::Read;
         use std::os::fd::AsRawFd;
 
-        use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
+        use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent};
+
+        use crate::os_process::macos::kqueue::{Kqueue, SubscribeOutcome, Subscription};
 
         let root = crate::child::spawn::fault::spawn_pid();
         let kq = Kqueue::new().expect("kqueue");
-        let add = |ident: usize, filter, fflags| {
-            let change = KEvent::new(ident, filter, EvFlags::EV_ADD | EvFlags::EV_RECEIPT, fflags, 0, 0);
-            crate::os_process::macos::kqueue::add_with_receipt(&kq, change).expect("register with the kqueue")
-        };
-        let read = add(
-            self.ready.as_raw_fd() as usize,
-            EventFilter::EVFILT_READ,
-            FilterFlag::empty(),
-        );
-        assert_eq!(read, 0, "watch the ready pipe: errno {read}");
-        let exit = add(root as usize, EventFilter::EVFILT_PROC, FilterFlag::NOTE_EXIT);
+        let read = kq
+            .subscribe(Subscription::Readable {
+                fd: self.ready.as_raw_fd(),
+                low_water: 1,
+            })
+            .expect("watch the ready pipe");
+        assert_eq!(read, SubscribeOutcome::Subscribed, "watch the ready pipe");
+        let exit = kq
+            .subscribe(Subscription::Process {
+                pid: root,
+                signals: false,
+                reap: false,
+            })
+            .expect("watch the root");
         assert_eq!(
-            exit, 0,
-            "the root {root} must be alive until its grandchild runs: errno {exit}"
+            exit,
+            SubscribeOutcome::Subscribed,
+            "the root {root} must be alive until its grandchild runs"
         );
         let blank = KEvent::new(0, EventFilter::EVFILT_READ, EvFlags::empty(), FilterFlag::empty(), 0, 0);
         let mut events = [blank; 2];
         let n = loop {
-            match kq.kevent(&[], &mut events, None) {
+            match kq.native().kevent(&[], &mut events, None) {
                 Err(nix::errno::Errno::EINTR) => continue,
                 other => break other.expect("wait for the grandchild or the root's exit"),
             }

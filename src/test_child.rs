@@ -748,7 +748,7 @@ fn watch_macos(listener: &std::net::TcpListener, target: crate::identity::Proces
         0,
         0,
     );
-    let listener_errno = crate::os_process::macos::kqueue::add_with_receipt(&kq, listener_change)
+    let listener_errno = crate::os_process::macos::kqueue::add_with_receipt(kq.native(), listener_change)
         .expect("kevent(EV_ADD) to arm the listener watch");
     assert_eq!(
         listener_errno, 0,
@@ -759,7 +759,7 @@ fn watch_macos(listener: &std::net::TcpListener, target: crate::identity::Proces
     let mut events = [placeholder; 2];
     loop {
         // Retries the wait on `EINTR` (see `kevent_eintr`).
-        let n = match kq.kevent(&[], &mut events, None) {
+        let n = match kq.native().kevent(&[], &mut events, None) {
             Ok(n) => n,
             Err(nix::errno::Errno::EINTR) => {
                 kevent_eintr::count_retry();

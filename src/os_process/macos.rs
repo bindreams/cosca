@@ -10,13 +10,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use mach2::message::audit_token_t;
-use nix::sys::event::{EvFlags, Kqueue};
 
 use super::{Exit, Op, OsProcess, WaitFor};
 use crate::error::{io_context, Error};
 use crate::identity::{uniq_info, Existence, ProcessId, ReadPurpose, UniqRead};
 use crate::signal::{Sent, Sig};
-use kqueue::{arm_note_exit_on, block_on_kqueue, drain_proc_exit};
+use kqueue::{block_on_kqueue, Event, Kqueue, SubscribeOutcome, Subscription};
 
 pub(crate) mod kqueue;
 
@@ -201,8 +200,16 @@ impl ExitWatch {
 
     /// Arm `NOTE_EXIT` for `pid`. `Ok(None)`: the pid is already gone.
     pub(crate) fn proc_exit(pid: u32) -> Result<Option<Self>, Error> {
-        let kq = Kqueue::new().map_err(|e| Error::Io(e.into()))?;
-        Ok(arm_note_exit_on(&kq, pid)?.map(|()| Self::new(kq)))
+        let kq = Kqueue::new()?;
+        let exit = Subscription::Process {
+            pid,
+            signals: false,
+            reap: false,
+        };
+        Ok(match kq.subscribe(exit)? {
+            SubscribeOutcome::Subscribed => Some(Self::new(kq)),
+            SubscribeOutcome::ProcessGone => None,
+        })
     }
 
     /// Block until the event has been read, by this call or an earlier one, or until `deadline`.
@@ -215,18 +222,17 @@ impl ExitWatch {
         #[cfg(test)]
         crate::wait::block_probe::record(crate::wait::remaining(deadline));
         block_on_kqueue(&self.kq, deadline, false, |event, _already_elapsed| {
-            if event.flags().contains(EvFlags::EV_ERROR) {
-                return Err(Error::Io(std::io::Error::from_raw_os_error(event.data() as i32)));
-            }
-            self.seen.store(true, Ordering::Relaxed);
-            Ok(Some(true))
+            Ok(Event::from_kevent(event)?.map(|_| {
+                self.seen.store(true, Ordering::Relaxed);
+                true
+            }))
         })
     }
 
     /// Read a pending event without blocking. `Ok(true)` = the event has been read, now or
     /// earlier. An `EV_ERROR` event is `Err`.
     pub(crate) fn drain(&self) -> Result<bool, Error> {
-        if drain_proc_exit(&self.kq)?.is_some() {
+        if !self.kq.poll()?.is_empty() {
             self.seen.store(true, Ordering::Relaxed);
         }
         Ok(self.seen.load(Ordering::Relaxed))

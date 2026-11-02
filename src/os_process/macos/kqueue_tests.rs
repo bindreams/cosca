@@ -14,8 +14,8 @@ fn drain_reports_none_when_no_event_pending() {
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
     let kq = super::arm_proc_exit(id).expect("arm").expect("a live child arms");
     assert!(
-        super::drain_proc_exit(&kq).expect("drain").is_none(),
-        "no exit event yet must drain to None (spurious-readiness input)"
+        kq.poll().expect("poll").is_empty(),
+        "no exit event yet must poll to nothing (spurious-readiness input)"
     );
     child.kill().expect("cleanup");
     child.wait().expect("reap");
@@ -31,7 +31,6 @@ fn drain_reports_none_when_no_event_pending() {
 #[should_panic(expected = "no progress")]
 fn block_on_kqueue_panics_when_its_advance_is_dropped() {
     use crate::wait::test_clock::{FrozenClockGuard, SkipAdvanceGuard};
-    use nix::sys::event::Kqueue;
     use std::time::Duration;
 
     let kq = Kqueue::new().expect("kqueue");
@@ -54,7 +53,6 @@ fn block_on_kqueue_panics_when_its_advance_is_dropped() {
 #[skuld::test]
 fn block_on_kqueue_terminates_under_a_frozen_clock() {
     use crate::wait::test_clock::FrozenClockGuard;
-    use nix::sys::event::Kqueue;
     use std::time::Duration;
 
     let kq = Kqueue::new().expect("kqueue");
@@ -72,7 +70,6 @@ fn block_on_kqueue_terminates_under_a_frozen_clock() {
 #[skuld::test]
 fn a_remaining_time_above_the_clamp_is_rearmed_in_pieces() {
     use crate::wait::test_clock::{advance, FrozenClockGuard, ZeroElapsedGuard};
-    use nix::sys::event::Kqueue;
     use std::time::Duration;
 
     let kq = Kqueue::new().expect("kqueue");
@@ -126,7 +123,6 @@ fn the_clamp_override_rejects_a_value_above_the_kevent_limit() {
 #[skuld::test]
 #[should_panic(expected = "exceeds XNU's INT32_MAX limit")]
 fn a_forced_timeout_above_the_kevent_limit_is_rejected() {
-    use nix::sys::event::Kqueue;
     use std::time::Duration;
 
     let kq = Kqueue::new().expect("kqueue");
@@ -192,7 +188,6 @@ fn a_zero_return_is_a_rearm_only_after_a_full_cap_timeout() {
 #[skuld::test]
 fn a_zero_return_with_time_left_is_logged_by_kind() {
     use crate::wait::test_clock::{advance, FrozenClockGuard, ZeroElapsedGuard};
-    use nix::sys::event::Kqueue;
     use std::time::Duration;
 
     crate::log_capture::install();

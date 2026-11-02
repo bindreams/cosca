@@ -103,9 +103,9 @@ async fn watch(wait_for: &WaitFor<'_>) -> Result<(), Error> {
             use ::tokio::io::unix::AsyncFd;
             use ::tokio::io::Interest;
 
-            use crate::tokio::wait::{watch_readable, KqueueFd};
+            use crate::tokio::wait::watch_readable;
 
-            let afd = AsyncFd::with_interest(KqueueFd(watch.as_fd()), Interest::READABLE).map_err(Error::Io)?;
+            let afd = AsyncFd::with_interest(watch.as_fd(), Interest::READABLE).map_err(Error::Io)?;
             // `drain` is `true` once the event has been read, now or earlier; an empty drain clears
             // readiness so a spurious wake waits again.
             watch_readable(&afd, |_| watch.drain().map(|seen| seen.then_some(()))).await
