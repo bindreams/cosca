@@ -428,6 +428,7 @@ fn a_signal_subscription_counts_deliveries() {
             count: DELIVERIES
         }]
     );
+    crate::test_child::set_signal_ignored(libc::SIGUSR1, false);
 }
 
 #[skuld::test]

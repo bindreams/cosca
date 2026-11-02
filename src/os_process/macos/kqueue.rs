@@ -257,7 +257,7 @@ impl Kqueue {
 
     /// Takes every pending event, in order, without blocking; empty if nothing is pending. An
     /// `EV_ERROR` event is an [`Event::Error`] among the rest: the call fails only when `kevent`
-    /// does.
+    /// does before any event is taken. A later failure returns the events taken so far.
     pub(crate) fn poll(&self) -> Result<Vec<Event>, Error> {
         let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
         let mut batch = [placeholder(); POLL_BATCH];
@@ -266,7 +266,13 @@ impl Kqueue {
             let n = match self.0.kevent(&[], &mut batch, Some(zero)) {
                 Ok(n) => n,
                 Err(nix::errno::Errno::EINTR) => continue,
-                Err(e) => return Err(Error::Io(e.into())),
+                Err(e) if events.is_empty() => return Err(Error::Io(e.into())),
+                // The events already taken are out of the queue for good; a lasting failure
+                // comes back on the next call.
+                Err(e) => {
+                    log::warn!("kqueue: a read after {} events failed: {e}", events.len());
+                    return Ok(events);
+                }
             };
             for ev in &batch[..n] {
                 events.extend(Event::from_kevent(ev));
