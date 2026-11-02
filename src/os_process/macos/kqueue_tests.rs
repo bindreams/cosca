@@ -282,10 +282,10 @@ fn a_process_subscription_on_a_pid_that_names_no_process_is_refused_with_esrch()
 }
 
 #[skuld::test]
-fn a_readable_subscription_on_a_closed_fd_is_refused_with_ebadf() {
-    let (reader, _writer) = std::io::pipe().expect("pipe");
-    let fd = reader.as_raw_fd();
-    drop(reader);
+fn a_readable_subscription_on_an_fd_that_is_not_open_is_refused_with_ebadf() {
+    // Far above any descriptor limit, so never open. A just-closed fd is not: the next open, such
+    // as the kqueue's own, takes its number.
+    let fd = std::os::fd::RawFd::MAX;
     let kq = Kqueue::new().expect("kqueue");
     let refused = kq.subscribe(Subscription::Readable { fd, low_water: 1 });
     assert_eq!(refusal(refused), libc::EBADF);
