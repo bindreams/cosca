@@ -5,7 +5,6 @@
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::time::{Duration, Instant};
 
-use nix::errno::Errno;
 use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue as NixKqueue};
 
 use crate::error::Error;
@@ -110,12 +109,6 @@ pub(crate) enum Event {
         signo: libc::c_int,
         count: usize,
     },
-    /// An `EV_ERROR` event: the kernel refused the registration (`ident`, `filter`).
-    Error {
-        ident: usize,
-        filter: libc::c_short,
-        errno: Errno,
-    },
 }
 
 impl Subscription {
@@ -154,39 +147,40 @@ impl Subscription {
 }
 
 impl Event {
-    /// The event a kernel `KEvent` reports; an `EV_ERROR` event, whose `data` is the errno, is
-    /// [`Event::Error`]. `None` for a filter [`Event`] does not name: a `Kqueue` holds only
-    /// subscriptions it can report, so that breaks a contract (debug-asserted, warned in release).
+    /// The event a kernel `KEvent` reports. `None` for an event no subscription can produce: a
+    /// filter [`Event`] does not name, or one flagged `EV_ERROR` (the kernel sets it only while
+    /// attaching a knote, and reports that through the registration's receipt). Either breaks a
+    /// contract (debug-asserted, warned in release).
     pub(crate) fn from_kevent(ev: &KEvent) -> Option<Event> {
         let flags = ev.flags();
-        if flags.contains(EvFlags::EV_ERROR) {
-            return Some(Event::Error {
-                ident: ev.ident(),
-                // 0 is no filter: a filter unknown to nix has no value to report.
-                filter: ev.filter().map_or(0, |f| f as libc::c_short),
-                errno: Errno::from_raw(ev.data() as i32),
-            });
-        }
         let fflags = ev.fflags();
-        match ev.filter() {
-            Ok(EventFilter::EVFILT_PROC) => Some(Event::Process {
+        let filter = ev.filter();
+        // An `EV_ERROR` event is unnamed whatever its filter.
+        let named = filter.ok().filter(|_| !flags.contains(EvFlags::EV_ERROR));
+        match named {
+            Some(EventFilter::EVFILT_PROC) => Some(Event::Process {
                 pid: ev.ident() as u32,
                 exited: fflags.contains(FilterFlag::NOTE_EXIT),
                 signalled: fflags.contains(FilterFlag::NOTE_SIGNAL),
                 reaped: fflags.bits() & NOTE_REAP != 0,
             }),
-            Ok(EventFilter::EVFILT_READ) => Some(Event::Readable {
+            Some(EventFilter::EVFILT_READ) => Some(Event::Readable {
                 fd: ev.ident() as RawFd,
                 bytes: count(ev),
                 closed: flags.contains(EvFlags::EV_EOF),
             }),
-            Ok(EventFilter::EVFILT_SIGNAL) => Some(Event::Signal {
+            Some(EventFilter::EVFILT_SIGNAL) => Some(Event::Signal {
                 signo: ev.ident() as libc::c_int,
                 count: count(ev),
             }),
-            other => {
-                log::warn!("kqueue: an event of filter {other:?} that no subscription asked for; dropped");
-                debug_assert!(false, "an event of filter {other:?} that no subscription asked for");
+            _ => {
+                log::warn!(
+                    "kqueue: an event of filter {filter:?}, flags {flags:?}, that no subscription asked for; dropped"
+                );
+                debug_assert!(
+                    false,
+                    "an event of filter {filter:?}, flags {flags:?}, that no subscription asked for"
+                );
                 None
             }
         }
@@ -255,9 +249,9 @@ impl Kqueue {
         self.apply(s.change(EvFlags::EV_DELETE | EvFlags::EV_RECEIPT))
     }
 
-    /// Takes every pending event, in order, without blocking; empty if nothing is pending. An
-    /// `EV_ERROR` event is an [`Event::Error`] among the rest: the call fails only when `kevent`
-    /// does before any event is taken. A later failure returns the events taken so far.
+    /// Takes every pending event, in order, without blocking; empty if nothing is pending. Fails
+    /// only when `kevent` does before any event is taken. A later failure returns the events taken
+    /// so far.
     pub(crate) fn poll(&self) -> Result<Vec<Event>, Error> {
         let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
         let mut batch = [placeholder(); POLL_BATCH];

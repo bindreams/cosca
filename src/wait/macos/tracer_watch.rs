@@ -166,8 +166,7 @@ impl TracerWatch {
     }
 
     /// Whether `event` is an event of a watched tracer, for a wait on `child`: its exit, or a signal
-    /// sent to it. An exit's knote is one-shot, so the next walk registers that pid again. An
-    /// [`Event::Error`] is no tracer's; the caller fails on it.
+    /// sent to it. An exit's knote is one-shot, so the next walk registers that pid again.
     pub(crate) fn fired(&mut self, event: &Event, child: u32) -> bool {
         let &Event::Process { pid, exited, .. } = event else {
             return false;

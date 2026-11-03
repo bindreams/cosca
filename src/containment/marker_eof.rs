@@ -190,22 +190,18 @@ pub(crate) fn arm(read_end: BorrowedFd<'_>, unbounded_wait: bool) -> Result<Kque
 /// proceed, capped by its own deadline) but always suppresses draining, per the three call
 /// sites above.
 ///
-/// `Err` = a read failure, or an [`Event::Error`]: the kernel refused the registration.
+/// `Err` = a read failure.
 fn interpret_read_event(
     event: Event,
     read_end: BorrowedFd<'_>,
     suppress_drain: bool,
 ) -> Result<Option<TreeDrain>, Error> {
-    let (bytes, closed) = match event {
-        Event::Readable { bytes, closed, .. } => (bytes, closed),
-        Event::Error { errno, .. } => return Err(Error::Io(errno.into())),
-        other => {
-            debug_assert!(
-                false,
-                "the marker kqueue subscribes to the read end only, got {other:?}"
-            );
-            return Ok(None);
-        }
+    let Event::Readable { bytes, closed, .. } = event else {
+        debug_assert!(
+            false,
+            "the marker kqueue subscribes to the read end only, got {event:?}"
+        );
+        return Ok(None);
     };
     if closed {
         return Ok(Some(TreeDrain::AllMarkersClosed));
@@ -216,7 +212,7 @@ fn interpret_read_event(
     Ok(None) // holders remain (the read end is not closed)
 }
 
-/// The three outcomes of one non-blocking `kevent` check on an armed marker kqueue, kept
+/// The three outcomes of one non-blocking read of the events pending on an armed marker kqueue, kept
 /// distinct rather than collapsed to `Option<TreeDrain>`: a caller that needs to know whether a
 /// REAL, interpreted event occurred (a test proving a watch loop "saw readiness and declined to
 /// drain", as opposed to a spurious wakeup with nothing pending at all) cannot tell those two
@@ -233,7 +229,7 @@ pub(crate) enum DrainOutcome {
     /// did not resolve the wait; its bytes were discarded when `suppress_drain` is false and
     /// left buffered when true.
     Declined,
-    /// `kevent` reported nothing pending at all; `interpret_read_event` never ran.
+    /// Nothing was pending at all; `interpret_read_event` never ran.
     Spurious,
 }
 
@@ -246,35 +242,21 @@ impl DrainOutcome {
     }
 }
 
-/// Take one pending event from an armed kqueue without blocking. `suppress_drain` is
-/// `interpret_read_event`'s own parameter of the same name, passed straight through — see that
-/// function's own doc for what it means and why it need not equal `arm`'s `unbounded_wait`.
+/// Takes every event pending on an armed kqueue through `Kqueue::poll`, without blocking, and
+/// interprets them in order until one is a verdict. `suppress_drain` is `interpret_read_event`'s
+/// own parameter of the same name, passed straight through — see that function's own doc for what
+/// it means and why it need not equal `arm`'s `unbounded_wait`.
 pub(crate) fn drain_kqueue(kq: &Kqueue, read_end: BorrowedFd<'_>, suppress_drain: bool) -> Result<DrainOutcome, Error> {
     let events = kq.poll()?;
     if events.is_empty() {
         return Ok(DrainOutcome::Spurious);
     }
-    // A verdict read with an `Event::Error` still stands: nothing would report it again. The error
-    // fails the call only when there is no verdict.
-    let mut refused = None;
-    let mut verdict = None;
     for event in events {
-        if let Event::Error { errno, .. } = event {
-            refused = refused.or(Some(errno));
-        } else if verdict.is_none() {
-            verdict = interpret_read_event(event, read_end, suppress_drain)?;
+        if let Some(verdict) = interpret_read_event(event, read_end, suppress_drain)? {
+            return Ok(DrainOutcome::Drained(verdict));
         }
     }
-    match (verdict, refused) {
-        (Some(verdict), refused) => {
-            if let Some(errno) = refused {
-                log::warn!("marker kqueue: a registration was refused ({errno}) beside the verdict");
-            }
-            Ok(DrainOutcome::Drained(verdict))
-        }
-        (None, Some(errno)) => Err(Error::Io(errno.into())),
-        (None, None) => Ok(DrainOutcome::Declined),
-    }
+    Ok(DrainOutcome::Declined)
 }
 
 /// One-shot drain check: exact, not heuristic — arms a private kqueue and reads its
@@ -331,7 +313,7 @@ pub(crate) fn block_until_drained(read_end: BorrowedFd<'_>, deadline: Option<Ins
         deadline,
         TreeDrain::MembersRemain,
         |event, already_elapsed| {
-            // `from_kevent` has already warned about a filter it does not name.
+            // `from_kevent` has already warned about an event no subscription can produce.
             Event::from_kevent(event).map_or(Ok(None), |event| {
                 interpret_read_event(event, read_end, unbounded_wait || already_elapsed)
             })

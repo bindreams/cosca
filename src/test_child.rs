@@ -760,10 +760,6 @@ fn watch_macos(listener: &std::net::TcpListener, target: crate::identity::Proces
             Err(e) => panic!("kevent while waiting for a control connection: {e}"),
         };
         let read: Vec<Event> = events[..n].iter().filter_map(Event::from_kevent).collect();
-        assert!(
-            !read.iter().any(|ev| matches!(ev, Event::Error { .. })),
-            "an armed kevent reported EV_ERROR: {read:?}"
-        );
         let exited = read.iter().any(|ev| matches!(ev, Event::Process { .. }));
         let connection = read.iter().any(|ev| matches!(ev, Event::Readable { .. }));
         match shared::first_ready(exited, connection) {

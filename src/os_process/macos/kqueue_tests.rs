@@ -585,23 +585,6 @@ fn from_kevent_maps_each_filter() {
             count: 2
         })
     );
-
-    let failed = KEvent::new(
-        9,
-        EventFilter::EVFILT_READ,
-        EvFlags::EV_ERROR,
-        FilterFlag::empty(),
-        libc::EBADF as isize,
-        0,
-    );
-    assert_eq!(
-        map(failed),
-        Some(Event::Error {
-            ident: 9,
-            filter: EventFilter::EVFILT_READ as libc::c_short,
-            errno: nix::errno::Errno::EBADF
-        })
-    );
 }
 
 /// A read or signal event whose `data` is negative, which no kernel reports.
@@ -657,11 +640,30 @@ fn an_event_of_an_unnamed_filter_breaks_the_contract() {
     Event::from_kevent(&ev);
 }
 
-/// Without `debug_assertions` a negative count is clamped to 0 and an unnamed filter dropped, each
-/// with a warning.
+/// An `EV_ERROR` event, which the kernel sets only while attaching a knote and reports through the
+/// registration's `EV_RECEIPT`, so a read never carries it.
+#[cfg(debug_assertions)]
+#[skuld::test]
+#[should_panic(expected = "no subscription asked for")]
+fn an_ev_error_event_breaks_the_contract() {
+    use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent};
+
+    let ev = KEvent::new(
+        9,
+        EventFilter::EVFILT_READ,
+        EvFlags::EV_ERROR,
+        FilterFlag::empty(),
+        libc::EBADF as isize,
+        0,
+    );
+    Event::from_kevent(&ev);
+}
+
+/// Without `debug_assertions` a negative count is clamped to 0, and an unnamed filter or an
+/// `EV_ERROR` event is dropped, each with a warning.
 #[cfg(not(debug_assertions))]
 #[skuld::test]
-fn release_warns_about_a_negative_count_and_an_unnamed_filter() {
+fn release_warns_about_a_negative_count_an_unnamed_filter_and_an_ev_error_event() {
     use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent};
 
     crate::log_capture::install();
@@ -691,6 +693,15 @@ fn release_warns_about_a_negative_count_and_an_unnamed_filter() {
         0,
     );
     assert_eq!(Event::from_kevent(&timer), None);
+    let failed = KEvent::new(
+        9,
+        EventFilter::EVFILT_READ,
+        EvFlags::EV_ERROR,
+        FilterFlag::empty(),
+        libc::EBADF as isize,
+        0,
+    );
+    assert_eq!(Event::from_kevent(&failed), None);
     let levels = |marker| {
         crate::log_capture::records_since_on_current_thread(mark, marker)
             .into_iter()
@@ -698,5 +709,8 @@ fn release_warns_about_a_negative_count_and_an_unnamed_filter() {
             .collect::<Vec<_>>()
     };
     assert_eq!(levels("negative data field"), [log::Level::Warn]);
-    assert_eq!(levels("no subscription asked for"), [log::Level::Warn]);
+    assert_eq!(
+        levels("no subscription asked for"),
+        [log::Level::Warn, log::Level::Warn]
+    );
 }

@@ -836,9 +836,6 @@ fn real_round(kq: &Kqueue, pipe: &mut SignalPipe, timeout: Option<Duration>) -> 
             Some(Event::Process { .. }) => batch.note_exit = true,
             Some(Event::Signal { .. }) => batch.sigchld = true,
             Some(Event::Readable { bytes, closed, .. }) => pipe.note(bytes, closed),
-            Some(Event::Error { ident, filter, errno }) => {
-                panic!("kevent refused the registration of ident {ident}, filter {filter}: {errno}")
-            }
             None => panic!("kevent returned an event of an unregistered filter: {:?}", raw.filter()),
         }
     }

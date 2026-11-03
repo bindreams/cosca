@@ -119,7 +119,7 @@ fn settle(peeked: Peek) -> Option<Waited> {
 fn drain_for_reap(kq: &Kqueue, events: &mut [KEvent; BATCH], pid: u32, tracer: &mut TracerWatch) -> io::Result<bool> {
     loop {
         let n = kevent_round(kq, events, Block::Poll)?;
-        if scan(&events[..n], pid, tracer)?.0 {
+        if scan(&events[..n], pid, tracer).0 {
             return Ok(true);
         }
         if n < BATCH {
@@ -130,10 +130,8 @@ fn drain_for_reap(kq: &Kqueue, events: &mut [KEvent; BATCH], pid: u32, tracer: &
 
 /// `(saw NOTE_REAP, saw NOTE_EXIT)` of the child `pid` in `events`. A signal, to the child or to a
 /// tracer, and a tracer's exit are neither: they only wake the wait to peek again.
-fn scan(events: &[KEvent], pid: u32, tracer: &mut TracerWatch) -> io::Result<(bool, bool)> {
+fn scan(events: &[KEvent], pid: u32, tracer: &mut TracerWatch) -> (bool, bool) {
     let (mut reap, mut exit) = (false, false);
-    // An `Event::Error` fails the scan only without a verdict: nothing reports a taken one again.
-    let mut refused = None;
     for raw in events {
         #[cfg(test)]
         test_hooks::record_event(raw.filter().map_or(0, |f| f as i16), raw.fflags().bits());
@@ -144,10 +142,6 @@ fn scan(events: &[KEvent], pid: u32, tracer: &mut TracerWatch) -> io::Result<(bo
         let Some(event) = Event::from_kevent(raw) else {
             continue;
         };
-        if let Event::Error { errno, .. } = event {
-            refused = refused.or(Some(errno));
-            continue;
-        }
         if tracer.fired(&event, pid) {
             continue;
         }
@@ -156,14 +150,7 @@ fn scan(events: &[KEvent], pid: u32, tracer: &mut TracerWatch) -> io::Result<(bo
             exit |= exited;
         }
     }
-    match refused {
-        Some(errno) if !(reap || exit) => Err(errno.into()),
-        Some(errno) => {
-            log::warn!("wait: a kqueue registration was refused ({errno}) beside pid {pid}'s exit");
-            Ok((reap, exit))
-        }
-        None => Ok((reap, exit)),
-    }
+    (reap, exit)
 }
 
 /// How long one `kevent` call may block.
@@ -301,7 +288,7 @@ pub(crate) fn await_reapable_on(
             deadline,
         };
         let n = kevent_round(kq, &mut events, block)?;
-        let (reaped, exited) = scan(&events[..n], pid, &mut tracer)?;
+        let (reaped, exited) = scan(&events[..n], pid, &mut tracer);
         if reaped {
             return Ok(Waited::Gone);
         }
@@ -355,15 +342,15 @@ pub(crate) fn drain_exit_events(kq: &Kqueue, pid: u32, tracer: &mut TracerWatch)
     let (mut reaped, mut exited) = (false, false);
     loop {
         // A verdict from an earlier round stands over a later failure: nothing reports it again.
-        let round = kevent_round(kq, &mut events, Block::Poll).and_then(|n| Ok((n, scan(&events[..n], pid, tracer)?)));
-        let (n, (reap, exit)) = match round {
-            Ok(round) => round,
+        let n = match kevent_round(kq, &mut events, Block::Poll) {
+            Ok(n) => n,
             Err(e) if reaped || exited => {
                 log::warn!("wait: reading pid {pid}'s kqueue failed after its exit was read: {e}");
                 return Ok((reaped, exited));
             }
             Err(e) => return Err(e),
         };
+        let (reap, exit) = scan(&events[..n], pid, tracer);
         reaped |= reap;
         exited |= exit;
         if n < BATCH {

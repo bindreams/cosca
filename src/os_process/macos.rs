@@ -214,7 +214,7 @@ impl ExitWatch {
     }
 
     /// Block until the event has been read, by this call or an earlier one, or until `deadline`.
-    /// `Ok(true)` = the event was read. An `EV_ERROR` event is `Err`.
+    /// `Ok(true)` = the event was read.
     pub(crate) fn block(&self, deadline: Option<Instant>) -> Result<bool, Error> {
         if self.seen.load(Ordering::Relaxed) {
             return Ok(true);
@@ -227,7 +227,6 @@ impl ExitWatch {
             deadline,
             false,
             |event, _already_elapsed| match Event::from_kevent(event) {
-                Some(Event::Error { errno, .. }) => Err(Error::Io(errno.into())),
                 Some(_) => {
                     self.seen.store(true, Ordering::Relaxed);
                     Ok(Some(true))
@@ -238,18 +237,10 @@ impl ExitWatch {
     }
 
     /// Read a pending event without blocking. `Ok(true)` = the event has been read, now or
-    /// earlier. An `EV_ERROR` event is `Err`.
+    /// earlier.
     pub(crate) fn drain(&self) -> Result<bool, Error> {
-        // The error comes after the other events are taken: each is reported once.
-        let mut refused = None;
-        for event in self.kq.poll()? {
-            match event {
-                Event::Error { errno, .. } => refused = refused.or(Some(errno)),
-                _ => self.seen.store(true, Ordering::Relaxed),
-            }
-        }
-        if let Some(errno) = refused {
-            return Err(Error::Io(errno.into()));
+        if !self.kq.poll()?.is_empty() {
+            self.seen.store(true, Ordering::Relaxed);
         }
         Ok(self.seen.load(Ordering::Relaxed))
     }

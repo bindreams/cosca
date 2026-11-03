@@ -383,32 +383,17 @@ fn watch(read_end: &OwnedFd, pid: u32) -> io::Result<Watch> {
             );
         }
         let woke: Vec<Event> = events[..n].iter().filter_map(Event::from_kevent).collect();
-        // The events read with a refused registration are taken first: each is reported once. The
-        // child's exit still stands; the error fails the wait only without it.
-        let mut child_gone = false;
-        let mut refused = None;
-        for event in &woke {
-            match *event {
-                Event::Error { errno, .. } => refused = refused.or(Some(errno)),
-                Event::Process {
-                    pid: p, exited: true, ..
-                } if p == pid => child_gone = true,
-                _ => {
-                    tracer.fired(event, pid);
-                }
-            }
-        }
-        if child_gone {
-            if let Some(errno) = refused {
-                log::warn!("spawn: a kqueue registration was refused ({errno}) beside the child's exit");
-            }
+        if woke
+            .iter()
+            .any(|e| matches!(e, Event::Process { pid: p, exited: true, .. } if *p == pid))
+        {
             return Ok(Watch::ChildGone);
-        }
-        if let Some(errno) = refused {
-            return Err(errno.into());
         }
         // Any other wake (a signal to the child, a tracer's exit or signal, the pipe, a timer) reads
         // the pipe and checks the child again.
+        for event in &woke {
+            tracer.fired(event, pid);
+        }
     }
 }
 

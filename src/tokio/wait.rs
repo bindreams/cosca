@@ -199,8 +199,8 @@ pub(crate) fn classify_pidfd_ready(ready: ::tokio::io::Ready) -> Option<Result<(
 ///
 /// `drain` returning `Ok(None)` is what `clear_ready` treats as "empty" — this loop has no way
 /// to verify that itself, since the closure's return type carries no more than "done" or "not
-/// done". The invariant holds for both current callers: `ExitWatch::drain` only reports an
-/// event it took, with no draining concept at all, and `marker_eof::drain_kqueue`'s
+/// done". The invariant holds for both current callers: `ExitWatch::drain` reports `true`
+/// once its event has been read, by this call or an earlier one, with no draining concept at all, and `marker_eof::drain_kqueue`'s
 /// caller here (`wait_tree_drained_inner`) passes through the SAME `unbounded_wait` its own
 /// caller computed from the real deadline (`crate::wait::remaining(deadline).is_none()`,
 /// matching the sync backend's `block_until_drained` exactly) — when `true`,
