@@ -537,6 +537,16 @@ fn wait_reports_a_process_exit() {
 /// Two pipes written in turn: `poll` returns the first one's event first, unsorted.
 #[skuld::test]
 fn poll_returns_events_in_the_order_they_became_pending() {
+    events_come_in_the_order_they_became_pending(|kq| kq.poll().expect("poll"));
+}
+
+/// The same through `wait`, which takes the first event in one read and the rest with `poll`.
+#[skuld::test]
+fn wait_returns_events_in_the_order_they_became_pending() {
+    events_come_in_the_order_they_became_pending(wait_events);
+}
+
+fn events_come_in_the_order_they_became_pending(read: impl FnOnce(&Kqueue) -> Vec<Event>) {
     use std::io::Write as _;
 
     let kq = Kqueue::new().expect("kqueue");
@@ -559,7 +569,7 @@ fn poll_returns_events_in_the_order_they_became_pending() {
         .rev()
         .map(|(reader, _)| a_pending_byte(reader.as_raw_fd()))
         .collect();
-    assert_eq!(kq.poll().expect("poll"), want);
+    assert_eq!(read(&kq), want);
 }
 
 #[skuld::test]
