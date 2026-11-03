@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use crate::identity::ProcessId;
 use crate::os_process::drive::{absolute, drive};
-use crate::os_process::{kill_by_id, open, terminate_by_id, Exit};
+use crate::os_process::{kill, open, terminate, terminate_by_id, Exit};
 use crate::signal::{Sent, Sig};
 use crate::test_child::{held_contained_blocker_without_cgroup, wait_until_zombie};
 
@@ -101,27 +101,38 @@ fn terminate_by_id_sends_sigterm_and_the_blocker_exits() {
 }
 
 #[skuld::test]
-fn kill_by_id_sends_sigkill_and_the_blocker_exits() {
+fn kill_sends_sigkill_and_the_blocker_exits() {
     use std::os::unix::process::ExitStatusExt;
     let (child, _stdin, id) = blocker();
-    kill_by_id(id).unwrap();
+    let p = open(id).unwrap().expect("a live process opens");
+    kill(&*p).unwrap();
     assert_eq!(
         child.wait().unwrap().signal(),
         Some(rustix::process::Signal::KILL.as_raw())
     );
 }
 
+/// A held process that its owner has reaped is gone: both acts are `Ok`. Mutant: `ESRCH` is an
+/// error.
 #[skuld::test]
-fn by_id_helpers_on_a_gone_process_are_ok() {
+fn kill_and_terminate_of_a_held_process_that_is_gone_are_ok() {
+    let (child, _stdin, id) = blocker();
+    let p = open(id).unwrap().expect("a live process opens");
+    child.kill().unwrap();
+    child.wait().unwrap();
+    kill(&*p).unwrap();
+    terminate(&*p).unwrap();
+}
+
+#[skuld::test]
+fn terminate_by_id_on_a_gone_process_is_ok() {
     let (child, _stdin, id) = blocker();
     let other = ProcessId::from_parts_for_test(id.pid(), id.start_token_raw() + 1);
-    kill_by_id(other).unwrap();
     terminate_by_id(other).unwrap();
     let p = open(id).unwrap().expect("the blocker is alive");
     assert!(!drive(&*p, absolute(Some(Duration::ZERO))).unwrap());
     child.kill().unwrap();
     child.wait().unwrap();
-    kill_by_id(id).unwrap();
     terminate_by_id(id).unwrap();
 }
 

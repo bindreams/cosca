@@ -13,7 +13,7 @@ use cosca::tokio::Process;
 #[skuld::test]
 async fn async_foreign_wait_resolves_on_exit() {
     let (child, sock) = common::spawn_blocker();
-    let p = Process::from_pid(child.id().pid()).found().expect("resolves");
+    let p = Process::open_pid(child.id().pid()).expect("open").expect("running");
     let watch = ::tokio::spawn(async move { p.wait().await });
     child.kill().expect("kill");
     // Released after the kill: a kill that sent nothing exits 0.
@@ -29,7 +29,7 @@ async fn async_foreign_wait_resolves_on_exit() {
 #[skuld::test]
 async fn async_foreign_wait_timeout_zero_is_deterministic() {
     let (child, sock) = common::spawn_blocker();
-    let p = Process::from_pid(child.id().pid()).found().expect("resolves");
+    let p = Process::open_pid(child.id().pid()).expect("open").expect("running");
     assert!(
         !p.wait_timeout(std::time::Duration::ZERO).await.expect("poll"),
         "live child at ZERO"
@@ -41,7 +41,7 @@ async fn async_foreign_wait_timeout_zero_is_deterministic() {
 #[skuld::test]
 async fn async_foreign_wait_timeout_observes_an_exit() {
     let (child, sock) = common::spawn_blocker();
-    let p = Process::from_pid(child.id().pid()).found().expect("resolves");
+    let p = Process::open_pid(child.id().pid()).expect("open").expect("running");
     child.kill().expect("kill");
     // Released after the kill: a kill that sent nothing exits 0. The exit is waited for first, so
     // `wait_timeout` observes an exit that already happened.
@@ -58,11 +58,11 @@ async fn async_foreign_wait_timeout_observes_an_exit() {
 #[skuld::test]
 async fn async_foreign_introspection_delegates() {
     let (child, sock) = common::spawn_blocker();
-    let p = Process::from_pid(child.id().pid()).found().expect("resolves");
+    let p = Process::open_pid(child.id().pid()).expect("open").expect("running");
     assert_eq!(p.id(), child.id());
     assert_eq!(p.is_alive(), cosca::identity::Liveness::Alive);
-    assert_eq!(Process::from_id(p.id()).id(), p.id());
-    assert_eq!(Process::from_id(p.id()).exists(), cosca::identity::Existence::Present);
+    assert_eq!(Process::open(p.id()).expect("open").expect("running").id(), p.id());
+    assert_eq!(p.id().exists(), cosca::identity::Existence::Present);
     common::kill_release_reap(&child, sock);
 }
 
@@ -70,7 +70,7 @@ async fn async_foreign_introspection_delegates() {
 #[skuld::test]
 async fn async_foreign_kill_terminates_the_process() {
     let (child, sock) = common::spawn_blocker();
-    let p = Process::from_pid(child.id().pid()).found().expect("resolves");
+    let p = Process::open_pid(child.id().pid()).expect("open").expect("running");
     p.kill().expect("foreign kill");
     // Release after the kill: a kill that sent nothing lets it exit 0, failing the status assertion.
     drop(sock);
@@ -83,7 +83,7 @@ async fn async_foreign_kill_terminates_the_process() {
 async fn async_foreign_terminate_sends_sigterm() {
     use std::os::unix::process::ExitStatusExt;
     let (child, sock) = common::spawn_blocker();
-    let p = Process::from_pid(child.id().pid()).found().expect("resolves");
+    let p = Process::open_pid(child.id().pid()).expect("open").expect("running");
     p.terminate().expect("foreign terminate");
     // Release after the kill: a kill that sent nothing lets it exit 0, failing the status assertion.
     drop(sock);
@@ -100,7 +100,7 @@ async fn async_foreign_graceful_shutdown_escalates() {
     // SIG_IGN child + ZERO grace: provably alive at the single poll => deterministic
     // escalation; SIGKILL is the only terminating signal it can receive.
     let (child, sock) = common::spawn_control("control-block-ignore-term", &["R"], false);
-    let p = Process::from_pid(child.id().pid()).found().expect("resolves");
+    let p = Process::open_pid(child.id().pid()).expect("open").expect("running");
     p.graceful_shutdown(Duration::ZERO).await.expect("foreign escalates");
     // Release after the kill: a kill that sent nothing lets it exit 0, failing the status assertion.
     drop(sock);
@@ -119,7 +119,7 @@ async fn async_foreign_kill_tree_tears_down_tree() {
         common::Member::new(root, child.id().pid()),
         common::Member::new(grand, common::last_reported_grandchild().expect("the grandchild's pid")),
     );
-    let p = Process::from_pid(child.id().pid()).found().expect("resolves");
+    let p = Process::open_pid(child.id().pid()).expect("open").expect("running");
     p.kill_tree().expect("kill_tree");
     // A kill that sent nothing fails here by assertion.
     common::assert_members_killed(vec![(root, "the root"), (grand, "the grandchild")]);
@@ -132,7 +132,7 @@ async fn async_foreign_kill_tree_tears_down_tree() {
 async fn async_foreign_unix_only_ops_are_unsupported_on_windows() {
     use std::time::Duration;
     let (child, sock) = common::spawn_blocker();
-    let p = Process::from_pid(child.id().pid()).found().expect("resolves");
+    let p = Process::open_pid(child.id().pid()).expect("open").expect("running");
     assert!(matches!(p.terminate(), Err(cosca::error::Error::Unsupported { .. })));
     assert!(matches!(
         p.graceful_shutdown(Duration::from_secs(1)).await,

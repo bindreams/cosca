@@ -6,7 +6,7 @@ use windows::Win32::System::Threading::CreateEventW;
 use crate::error::Error;
 use crate::identity::ProcessId;
 use crate::os_process::drive::{absolute, drive};
-use crate::os_process::{kill_by_id, open, terminate_by_id, Exit, OsProcess as _, WaitFor};
+use crate::os_process::{kill, open, terminate, terminate_by_id, Exit, OsProcess as _, WaitFor};
 use crate::signal::{Sent, Sig};
 use crate::test_child::live_blocker as blocker;
 
@@ -28,7 +28,6 @@ fn open_with_wrong_start_token_is_none_and_sends_nothing() {
     let other = ProcessId::from_parts_for_test(id.pid(), id.start_token_raw() + 1);
     assert!(open(other).unwrap().is_none());
     assert!(open(other).unwrap().is_none());
-    kill_by_id(other).expect("a stale identity is already gone");
     // Still running: the right identity opens and sees no exit.
     let p = open(id).unwrap().expect("the blocker is alive");
     assert!(!drive(&*p, absolute(Some(Duration::ZERO))).unwrap());
@@ -47,14 +46,17 @@ fn exited_before_first_look_returns_true() {
     assert!(drive(&*p, absolute(Some(Duration::ZERO))).unwrap());
 }
 
-/// Mutant: a refused `TerminateProcess` on an exited process is an error, or `kill_by_id` of an
-/// exited process whose handle is still held by its owner fails.
+/// Mutant: a refused `TerminateProcess` on an exited process is an error, or a kill of an exited
+/// process whose handle is still held by its owner fails.
 #[skuld::test]
 fn kill_after_exit_is_ok() {
     let (child, _stdin, id) = blocker();
     child.kill().unwrap();
     child.wait().unwrap();
-    kill_by_id(id).expect("killing an exited process is success");
+    let p = open(id)
+        .unwrap()
+        .expect("an exited process whose owner holds its handle opens");
+    kill(&*p).expect("killing an exited process is success");
 }
 
 #[skuld::test]
@@ -67,9 +69,10 @@ fn signal_after_exit_is_gone() {
 }
 
 #[skuld::test]
-fn kill_by_id_ends_the_process() {
+fn kill_ends_the_process() {
     let (child, _stdin, id) = blocker();
-    kill_by_id(id).unwrap();
+    let p = open(id).unwrap().expect("a live process opens");
+    kill(&*p).unwrap();
     let status = child.wait().unwrap();
     assert!(
         !status.success(),
@@ -89,6 +92,19 @@ fn terminate_by_id_is_unsupported_and_sends_nothing() {
     assert_eq!(platform, "windows");
     assert!(detail.contains("graceful_shutdown_tree"), "{detail}");
     let p = open(id).unwrap().expect("the blocker is alive");
+    assert!(!drive(&*p, absolute(Some(Duration::ZERO))).unwrap());
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+/// Windows has no graceful per-process signal, so a held process refuses it too: `Unsupported`, and
+/// the process is untouched.
+#[skuld::test]
+fn terminate_of_a_windows_held_process_is_unsupported() {
+    let (child, _stdin, id) = blocker();
+    let p = open(id).unwrap().expect("a live process opens");
+    let err = terminate(&*p).expect_err("Windows has no graceful per-process signal");
+    assert!(matches!(err, Error::Unsupported { .. }), "{err:?}");
     assert!(!drive(&*p, absolute(Some(Duration::ZERO))).unwrap());
     child.kill().unwrap();
     child.wait().unwrap();
@@ -135,15 +151,16 @@ fn signal_failure_carries_the_win32_code() {
     assert_eq!(io.raw_os_error(), Some(ERROR_INVALID_HANDLE.0 as i32), "{io:?}");
 }
 
-/// `kill_by_id` of a process that is exiting but not yet signalled is `Ok`; the seam refuses and
-/// the process stays alive.
+/// A kill of a process that is exiting but not yet signalled is `Ok`; the seam refuses and the
+/// process stays alive.
 ///
 /// Mutant: a refusal is success only once the process reads signalled, so this one is `Err(Io)`.
 #[skuld::test]
-fn kill_by_id_of_a_process_that_is_exiting_but_not_signalled_is_ok() {
+fn kill_of_a_process_that_is_exiting_but_not_signalled_is_ok() {
     let (child, _stdin, id) = blocker();
+    let p = open(id).unwrap().expect("a live process opens");
     crate::identity::windows_fault::refuse_next_terminate_as_exiting();
-    let result = kill_by_id(id);
+    let result = kill(&*p);
     // The seam sent no terminate: end the fixture before asserting.
     child.kill().expect("end the fixture");
     child.wait().expect("reap the fixture");

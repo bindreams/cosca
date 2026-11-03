@@ -104,8 +104,8 @@ pub fn wait_for_last_async_root() {
     let id = LAST_ASYNC_ROOT
         .with(Cell::get)
         .expect("an async tree helper recorded its root before panicking");
-    cosca::Process::from_id(id)
-        .wait()
+    cosca::Process::open(id)
+        .and_then(|root| root.map_or(Ok(()), |root| root.wait()))
         .expect("wait for the async tree's root");
 }
 
@@ -174,17 +174,20 @@ pub fn wait_for_the_dropped_trees_grandchild(mark: usize, message: &str) {
         Some(Liveness::Alive),
         "the grandchild must be alive when identified, so its exit is the containment kill's"
     );
-    let grandchild = cosca::Process::from_id(id);
+    // `None`: the grandchild is already gone.
+    let grandchild = cosca::Process::open(id).expect("open the grandchild");
     if drop_skipped_its_kill(mark) {
-        let killed = grandchild.kill();
-        let waited = grandchild.wait();
+        let killed = grandchild.as_ref().map_or(Ok(()), |g| g.kill());
+        let waited = grandchild.as_ref().map_or(Ok(()), |g| g.wait());
         panic!(
             "the tree's drop skipped its kill because the root was already reaped, which leaves the grandchild \
              (pid {}) running; killed it by identity: {killed:?}, then waited for it: {waited:?}",
             id.pid()
         );
     }
-    grandchild.wait().expect("wait for the orphaned grandchild");
+    if let Some(grandchild) = grandchild {
+        grandchild.wait().expect("wait for the orphaned grandchild");
+    }
 }
 
 /// Whether `grandchild` is inside the containment `containment` of the still-held `root`.
@@ -326,13 +329,18 @@ pub async fn report_grandchild_async(report: ::tokio::net::TcpListener, root: &m
     let mut stream = ::tokio::net::TcpStream::from_std(std_stream).expect("wrap the report stream for tokio");
     let mut line = String::new();
     // Watched without reaping, as in `accept_or_die_async`.
-    let root_process = cosca::tokio::Process::from_id(root.id());
+    let root_process = cosca::tokio::Process::open(root.id()).expect("open the root");
     let n = {
         let mut reader = BufReader::new(&mut stream);
         ::tokio::select! {
             biased;
             n = reader.read_line(&mut line) => n.expect("read the grandchild pid report"),
-            status = root_process.wait() => match status {
+            status = async {
+                match &root_process {
+                    Some(root_process) => root_process.wait().await,
+                    None => Ok(()),
+                }
+            } => match status {
                 Ok(()) => died_before_reporting(root_pid, "the grandchild pid"),
                 Err(e) => panic!("watching the root's exit while reading the grandchild pid report: {e}"),
             },

@@ -624,9 +624,8 @@ fn an_unsupported_open_names_process_open() {
     let wait = refused_with(rustix::io::Errno::PERM, |id| {
         crate::os_process::drive::exited_by_id(id, Some(std::time::Duration::ZERO)).map(drop)
     });
-    let kill = refused_with(rustix::io::Errno::PERM, crate::os_process::kill_by_id);
     let terminate = refused_with(rustix::io::Errno::PERM, crate::os_process::terminate_by_id);
-    for err in [wait, kill, terminate] {
+    for err in [wait, terminate] {
         assert!(
             err.to_string().starts_with("process open is not supported on linux: "),
             "{err}"

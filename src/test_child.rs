@@ -1544,10 +1544,9 @@ fn spawn_connects_and_exits(
         cmd.env(ack::ACK_ENV, "1");
     }
     let child = crate::test_spawn::spawn(&mut cmd).expect("spawn the connects-and-exits fixture");
-    let target = crate::Process::from_pid(child.id())
+    let target = crate::identity::ProcessId::of(child.id())
         .found()
-        .expect("resolve the freshly spawned fixture's pid")
-        .id();
+        .expect("resolve the freshly spawned fixture's pid");
     (child, target)
 }
 

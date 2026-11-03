@@ -38,17 +38,28 @@ pub async fn accept_or_die_async_also(
         died_before_connecting(target_pid);
     }
     #[cfg(unix)]
-    let target = cosca::tokio::Process::from_id(child.id());
+    let target = cosca::tokio::Process::open(child.id()).expect("open the control target");
+    // `None`: the target is already gone.
     #[cfg(unix)]
-    let target_exit = target.wait();
+    let target_exit = async {
+        match &target {
+            Some(target) => target.wait().await,
+            None => Ok(()),
+        }
+    };
     #[cfg(windows)]
     let target_exit = async { child.wait().await.map(drop) };
     let also_exit = async {
         let Some(id) = also else {
             return std::future::pending().await;
         };
-        // Identity-verified: a reissued pid resolves to a different identity and is Gone.
-        if let Err(e) = cosca::tokio::Process::from_id(id).wait().await {
+        // Identity-verified: a reissued pid does not open, and reads as gone.
+        let waited = match cosca::tokio::Process::open(id) {
+            Ok(Some(process)) => process.wait().await,
+            Ok(None) => Ok(()),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = waited {
             panic!("watching pid {}'s exit while waiting for a connection: {e}", id.pid());
         }
         id.pid()
@@ -72,15 +83,20 @@ pub async fn accept_or_die_async_also(
 /// [`accept_or_die_descendant`](super::accept_or_die_descendant)'s async twin: accepts, or fails
 /// when the descendant `id` of a root that is already gone exits first.
 pub async fn accept_or_die_async_descendant(listener: &::tokio::net::TcpListener, id: ProcessId) -> TcpStream {
-    let process = cosca::tokio::Process::from_id(id);
+    let process = cosca::tokio::Process::open(id).expect("open the descendant");
     ::tokio::select! {
         biased;
         accepted = listener.accept() => {
             let (stream, _) = accepted.expect("accept a control connection");
             ack_now(blocking_std(stream.into_std().expect("convert the accepted tokio stream to std")))
         }
-        // Identity-verified: a reissued pid resolves to a different identity and is Gone.
-        waited = process.wait() => {
+        // Identity-verified: a reissued pid does not open, and reads as gone.
+        waited = async {
+            match &process {
+                Some(process) => process.wait().await,
+                None => Ok(()),
+            }
+        } => {
             if let Err(e) = waited {
                 panic!("watching pid {}'s exit while waiting for a connection: {e}", id.pid());
             }

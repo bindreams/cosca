@@ -102,8 +102,8 @@ fn spawn_query_only_denies_terminate_and_grants_query_limited() {
     ) else {
         return;
     };
-    // Its denial property is what makes `kill_by_id`'s Denied arm reachable at all; without
-    // this the test that depends on it would pass by terminating a corpse instead.
+    // Its denial property is what makes a kill without `PROCESS_TERMINATE` reachable at all;
+    // without this the test that depends on it would pass by terminating a corpse instead.
     let child = spawn_query_only(&done);
     assert_eq!(open_err(child.pid(), PROCESS_QUERY_LIMITED_INFORMATION), None);
     assert_eq!(

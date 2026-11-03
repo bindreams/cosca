@@ -14,19 +14,16 @@ impl Process {
     ///
     /// A watch failure surfaces only after the kill runs; a kill error wins over it.
     /// Dropping this future mid-grace cancels the watch and performs no further signalling.
-    /// On Linux a refused `pidfd_open` is `Unsupported` (see [`Error::Unsupported`](crate::error::Error::Unsupported)), naming the step it hit:
-    /// terminate, the grace wait, or the kill.
     ///
     /// # Runtime
     ///
     /// Needs the IO **and** time drivers on Unix (the `#[tokio::main]`/`#[tokio::test]`
     /// defaults) — missing either, tokio panics rather than returning a typed error.
     pub async fn graceful_shutdown(&self, grace: Duration) -> Result<(), Error> {
-        crate::os_process::terminate_by_id(self.id())?;
+        self.terminate()?;
         #[cfg(test)]
         crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterTerminate);
-        let watch = crate::tokio::drive::exited_by_id(self.id(), Some(grace)).await;
-        crate::graceful::after_grace(watch, || crate::os_process::kill_by_id(self.id()))
+        crate::graceful::after_grace(self.wait_timeout(grace).await, || self.kill())
     }
 
     /// Cooperative-then-forced shutdown of the foreign process's tree: `SIGTERM`-walk, wait
@@ -37,14 +34,12 @@ impl Process {
     /// A grace-watch failure does not strand the tree: the hard sweep still runs, and the
     /// watch error is surfaced afterward; a sweep failure would win over it. Dropping this
     /// future mid-grace cancels the watch and performs no further signalling. Runtime
-    /// requirements as on [`graceful_shutdown`](Process::graceful_shutdown). On Linux the watch
-    /// error includes a refused `pidfd_open` (see [`Error::Unsupported`](crate::error::Error::Unsupported)).
+    /// requirements as on [`graceful_shutdown`](Process::graceful_shutdown).
     pub async fn graceful_shutdown_tree(&self, grace: Duration) -> Result<(), Error> {
         self.terminate_tree()?; // SIGTERM-walk (Windows: Unsupported, early return)
         #[cfg(test)]
         crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterTerminate);
-        let watch = crate::tokio::drive::exited_by_id(self.id(), Some(grace)).await;
-        crate::graceful::after_tree_grace(watch, || self.kill_tree())
+        crate::graceful::after_tree_grace(self.wait_timeout(grace).await, || self.kill_tree())
     }
 }
 

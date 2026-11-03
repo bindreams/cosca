@@ -226,7 +226,7 @@ fn async_waits_are_send() {
 
     let p = fake([]);
     assert_send(&drive(&p, absolute(None)));
-    let process = crate::tokio::Process::current();
+    let process = crate::tokio::Process::current().expect("open this process");
     assert_send(&process.wait());
 }
 
@@ -413,4 +413,26 @@ async fn exited_by_id_returns_a_forced_watch_error_for_a_gone_id() {
     fault::set_force_watch_error(true);
     assert!(super::exited_by_id(gone, None).await.is_err());
     assert!(!fault::armed(), "the seam is consumed");
+}
+
+/// Mutant: `exited_held` skips the seam, or looks at a process the seam should have refused.
+#[skuld::test]
+async fn exited_held_takes_the_watch_fault_seam() {
+    crate::tokio::test_runtime::assert_current_thread();
+    let p = fake([Answer::Exited]);
+    fault::set_force_watch_error(true);
+    assert!(super::exited_held(&p, None).await.is_err());
+    assert!(!fault::armed(), "the seam is consumed");
+    assert_eq!(p.looks(), 0, "the seam comes before any look");
+}
+
+/// Mutant: `exited_held` drops the timeout, or does not resolve for an exited process.
+#[skuld::test]
+async fn exited_held_resolves_for_an_exited_fake() {
+    crate::tokio::test_runtime::assert_current_thread();
+    let exited = fake([Answer::Exited]);
+    assert!(super::exited_held(&exited, None).await.unwrap());
+    let running = fake([Answer::Running]);
+    assert!(!super::exited_held(&running, Some(Duration::ZERO)).await.unwrap());
+    assert_eq!(running.looks(), 1);
 }

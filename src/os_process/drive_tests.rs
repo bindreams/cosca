@@ -253,3 +253,33 @@ fn exited_by_id_refuses_a_gone_id_inside_a_bounded_section() {
     let _section = crate::bounded::Section::enter();
     _ = super::exited_by_id(gone_id(), Some(Duration::ZERO));
 }
+
+/// Mutant: `exited_held` skips the seam, or takes it after the look.
+#[skuld::test]
+fn exited_held_takes_the_watch_fault_seam() {
+    let p = fake([Answer::Exited]);
+    fault::set_force_watch_error(true);
+    assert!(super::exited_held(&p, None).is_err());
+    assert!(!fault::armed(), "the seam is consumed");
+    assert_eq!(p.looks(), 0, "the seam comes before any look");
+}
+
+/// Mutant: `exited_held` skips the bounded-section assert.
+#[cfg(feature = "tokio")]
+#[skuld::test]
+#[should_panic(expected = "would block inside an async Drop")]
+fn exited_held_refuses_inside_a_bounded_section() {
+    let _section = crate::bounded::Section::enter();
+    _ = super::exited_held(&fake([Answer::Exited]), Some(Duration::ZERO));
+}
+
+/// Mutant: `exited_held` drops the timeout, or looks twice at zero.
+#[skuld::test]
+fn exited_held_zero_is_one_look() {
+    let running = fake([Answer::Running]);
+    assert!(!super::exited_held(&running, Some(Duration::ZERO)).unwrap());
+    assert_eq!(running.looks(), 1);
+    let exited = fake([Answer::Exited]);
+    assert!(super::exited_held(&exited, Some(Duration::ZERO)).unwrap());
+    assert_eq!(exited.looks(), 1);
+}

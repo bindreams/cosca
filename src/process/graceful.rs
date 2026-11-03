@@ -8,38 +8,31 @@ use super::Process;
 use crate::error::Error;
 
 impl Process {
-    /// Send `SIGTERM` to the foreign process — a cooperative request to exit. Signal-only.
-    /// Identity-bound as for [`kill`](Process::kill) (Linux `pidfd_send_signal`; macOS audit
-    /// token, 14.4 and later). Already-dead ⇒ `Ok`; a real failure (`EPERM`) ⇒ `Err`. On Linux a
-    /// refused `pidfd_open` is `Unsupported` (see [`Error::Unsupported`]).
+    /// Send `SIGTERM` to the process — a cooperative request to exit. Signal-only. Bound to the
+    /// process this handle opened, as for [`kill`](Process::kill). Already-dead ⇒ `Ok`; a real
+    /// failure (`EPERM`) ⇒ `Err`.
     ///
-    /// **Windows: `Unsupported`, for two concrete absences.** A `Process` holds only a pid,
-    /// nothing that pins it, and `GenerateConsoleCtrlEvent` takes a raw pid with no
-    /// verify-then-signal form — so a foreign console-group signal cannot be made
-    /// identity-bound, unlike every other op on this type. And Win32 exposes no way to learn
-    /// whether a foreign pid leads a console process group, so a non-leader would silently
-    /// signal *its* leader's whole group instead. An owned [`Child`](crate::Child) has neither
-    /// problem: its held process handle keeps the pid allocated, so the pid can only ever name
-    /// that child's own group.
+    /// **Windows: `Unsupported`.** `GenerateConsoleCtrlEvent` takes a raw pid, and Win32 exposes
+    /// no way to learn whether a foreign pid leads a console process group, so a non-leader would
+    /// silently signal *its* leader's whole group instead. An owned [`Child`](crate::Child) has
+    /// no such problem: it created its group, so the pid can only ever name that child's own
+    /// group.
     pub fn terminate(&self) -> Result<(), Error> {
-        crate::os_process::terminate_by_id(self.id)
+        crate::os_process::terminate(&*self.os)
     }
 
-    /// Cooperative-then-forced lone shutdown of the foreign process: `SIGTERM`, wait up to
+    /// Cooperative-then-forced lone shutdown of the process: `SIGTERM`, wait up to
     /// `grace` for it to exit, then `SIGKILL` if it has not. No `ExitStatus` — the kernel hands
     /// exit status only to the real parent. Escalation proceeds even if `SIGTERM` is ignored.
     /// Unix only; Windows returns `Unsupported`. `grace` is relative; `ZERO` signals, polls
     /// once, then escalates.
     ///
-    /// A watch failure surfaces only after the kill runs; a kill error wins over it. On Linux a
-    /// refused `pidfd_open` is `Unsupported` (see [`Error::Unsupported`]), naming the step it hit: terminate,
-    /// the grace wait, or the kill.
+    /// A watch failure surfaces only after the kill runs; a kill error wins over it.
     pub fn graceful_shutdown(&self, grace: Duration) -> Result<(), Error> {
-        crate::os_process::terminate_by_id(self.id)?;
+        self.terminate()?;
         #[cfg(test)]
         crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterTerminate);
-        let watch = crate::os_process::drive::exited_by_id(self.id, Some(grace));
-        crate::graceful::after_grace(watch, || crate::os_process::kill_by_id(self.id))
+        crate::graceful::after_grace(self.wait_timeout(grace), || self.kill())
     }
 
     /// Best-effort hard sweep of the foreign process's tree: an identity-walk that re-verifies
@@ -96,15 +89,13 @@ impl Process {
     ///
     /// A grace-watch failure does not strand the tree between the soft signal and the sweep:
     /// the hard sweep still runs (an unobservable grace escalates immediately), and the watch
-    /// error is surfaced afterward; a sweep failure would win over it. On Linux that error
-    /// includes a refused `pidfd_open` (see [`Error::Unsupported`]).
+    /// error is surfaced afterward; a sweep failure would win over it.
     pub fn graceful_shutdown_tree(&self, grace: Duration) -> Result<(), Error> {
         self.terminate_tree()?; // SIGTERM-walk (Windows: Unsupported, early return)
         #[cfg(test)]
         crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterTerminate);
 
-        let watch = crate::os_process::drive::exited_by_id(self.id, Some(grace));
-        crate::graceful::after_tree_grace(watch, || self.kill_tree())
+        crate::graceful::after_tree_grace(self.wait_timeout(grace), || self.kill_tree())
     }
 }
 

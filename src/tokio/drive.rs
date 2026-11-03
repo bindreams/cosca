@@ -39,6 +39,13 @@ pub(crate) async fn exited_by_id(id: ProcessId, timeout: Option<Duration>) -> Re
     }
 }
 
+/// [`exited_by_id`] for a process already open: `Ok(true)` = exited, `Ok(false)` = still running
+/// after the deadline's final look. The watch-fault seam and the deadline come first.
+pub(crate) async fn exited_held(p: &dyn OsProcess, timeout: Option<Duration>) -> Result<bool, Error> {
+    enter()?;
+    drive(p, absolute(timeout)).await
+}
+
 /// `timeout` as an absolute deadline, fixed up front so no wake extends the total wait. On Windows
 /// it is on the real clock, which the blocking thread measures.
 fn absolute(timeout: Option<Duration>) -> Option<std::time::Instant> {

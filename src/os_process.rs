@@ -76,29 +76,36 @@ pub(crate) fn open(id: ProcessId) -> Result<Option<Box<dyn OsProcess>>, Error> {
     return Ok(macos::MacProcess::open(id)?.map(|p| Box::new(p) as Box<dyn OsProcess>));
 }
 
-/// Hard-kill the process `id` names, identity-verified. Already gone, or its pid now names another
-/// process: `Ok`.
-pub(crate) fn kill_by_id(id: ProcessId) -> Result<(), Error> {
-    signal_by_id(id, Sig::Kill)
+/// Hard-kill the held process. Already gone: `Ok`.
+pub(crate) fn kill(p: &dyn OsProcess) -> Result<(), Error> {
+    // `Gone` and `Delivered` are both success: nothing is left for the caller to do.
+    p.signal(Sig::Kill).map(|_: Sent| ())
 }
 
-/// Send the graceful termination signal to the process `id` names, identity-verified, without
-/// waiting. Already gone: `Ok`. Windows has no such per-process signal: `Unsupported`.
+/// Send the graceful termination signal to the held process, without waiting. Already gone: `Ok`.
+#[cfg(unix)]
+pub(crate) fn terminate(p: &dyn OsProcess) -> Result<(), Error> {
+    p.signal(Sig::Term).map(|_: Sent| ())
+}
+
+/// There is no [`Sig`] to send for it on Windows: `Unsupported`.
+#[cfg(windows)]
+pub(crate) fn terminate(_p: &dyn OsProcess) -> Result<(), Error> {
+    Err(windows::terminate_unsupported())
+}
+
+/// [`terminate`] the process `id` names, identity-verified. Already gone: `Ok`. Windows: `Unsupported`,
+/// with nothing opened.
 #[cfg(unix)]
 pub(crate) fn terminate_by_id(id: ProcessId) -> Result<(), Error> {
-    signal_by_id(id, Sig::Term)
+    match open(id)? {
+        Some(process) => terminate(&*process),
+        None => Ok(()),
+    }
 }
 
 /// There is no [`Sig`] to send for it on Windows: `Unsupported`, with nothing opened.
 #[cfg(windows)]
 pub(crate) fn terminate_by_id(_id: ProcessId) -> Result<(), Error> {
     Err(windows::terminate_unsupported())
-}
-
-fn signal_by_id(id: ProcessId, sig: Sig) -> Result<(), Error> {
-    let Some(process) = open(id)? else {
-        return Ok(());
-    };
-    // `Gone` and `Delivered` are both success: nothing is left for the caller to do.
-    process.signal(sig).map(|_: Sent| ())
 }

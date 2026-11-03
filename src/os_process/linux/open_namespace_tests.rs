@@ -30,7 +30,7 @@ fn fixture_status_mounted_over() {
         return;
     }
     ns::enter_private_mount_ns();
-    // A live foreign process: killed through `kill_by_id`, which goes through `open_verified`. Its
+    // A live foreign process: opened through `open_verified`, then killed. Its
     // identity is read before the mount: `of` answers `Unknown` once a file is mounted over `/proc`.
     let mut child = crate::test_spawn::spawn(std::process::Command::new("cat").stdin(std::process::Stdio::piped()))
         .expect("spawn cat");
@@ -42,7 +42,10 @@ fn fixture_status_mounted_over() {
     std::fs::write(&status, "Name:\tcosca\nState:\tR (running)\n").expect("write the fake status");
     ns::bind_over(&status, &PathBuf::from(format!("/proc/{}/status", std::process::id())));
 
-    crate::os_process::kill_by_id(id).expect("a live foreign kill must not depend on the /proc view");
+    let process = crate::os_process::open(id)
+        .expect("a live foreign open must not depend on the /proc view")
+        .expect("the live child opens");
+    crate::os_process::kill(&*process).expect("a live foreign kill must not depend on the /proc view");
     let status = child.wait().expect("reap the killed child");
     assert!(!status.success(), "the child must have been killed, got {status:?}");
 

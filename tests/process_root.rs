@@ -130,20 +130,20 @@ fn helper_role_rejects_an_inherited_value_naming_the_variable() {
 /// - `10`: `kill` returned `Ok(())`.
 /// - `11`: `kill` returned an `Err` other than `Io(EPERM)`.
 /// - `12`: the target pid is `Gone` (a test bug, not an OS refusal).
-/// - `13`: the target pid's identity is `Unknown` (the OS refused the query).
+/// - `13`: the target pid could not be opened (the OS refused the query).
 #[cfg(unix)]
 fn foreign_kill_helper_main(pid: u32) -> i32 {
     // A failed uid/gid drop fails the caller's spawn(), so euid is never 0 here.
     // SAFETY: geteuid() takes no arguments and has no preconditions.
     debug_assert_ne!(unsafe { libc::geteuid() }, 0, "the reader is still euid 0");
-    let target = match cosca::Process::from_pid(pid) {
-        cosca::identity::Resolved::Found(p) => p,
-        cosca::identity::Resolved::Gone => {
+    let target = match cosca::Process::open_pid(pid) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
             eprintln!("foreign_kill_helper: target pid {pid} is gone");
             return 12;
         }
-        cosca::identity::Resolved::Unknown => {
-            eprintln!("foreign_kill_helper: target pid {pid}'s identity query was refused by the OS");
+        Err(e) => {
+            eprintln!("foreign_kill_helper: target pid {pid} could not be opened: {e}");
             return 13;
         }
     };

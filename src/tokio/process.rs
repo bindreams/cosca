@@ -11,8 +11,8 @@ use crate::identity::{ProcessId, RawPid};
 #[path = "process/graceful.rs"]
 mod graceful;
 
-/// An async handle to a foreign process identified by `(pid, start_token)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// An async handle on an open process. See [`Process`](crate::Process); the waits are async.
+#[derive(Debug)]
 pub struct Process {
     inner: crate::process::Process,
 }
@@ -24,22 +24,19 @@ impl From<crate::process::Process> for Process {
 }
 
 impl Process {
-    /// A handle to the process with this identity. Infallible — see
-    /// [`Process::from_id`](crate::Process::from_id) for why construction does not check
-    /// that the process is still there.
-    pub fn from_id(id: ProcessId) -> Process {
-        Process::from(crate::process::Process::from_id(id))
+    /// Open the process `id` names (see [`Process::open`](crate::Process::open)).
+    pub fn open(id: ProcessId) -> Result<Option<Process>, Error> {
+        Ok(crate::process::Process::open(id)?.map(Process::from))
     }
 
-    /// Resolve the process currently holding `pid`. Fallible, unlike
-    /// [`from_id`](Self::from_id): a bare pid has to be resolved into an identity first.
-    pub fn from_pid(pid: RawPid) -> crate::identity::Resolved<Process> {
-        crate::process::Process::from_pid(pid).map(Process::from)
+    /// Open the process holding `pid` now (see [`Process::open_pid`](crate::Process::open_pid)).
+    pub fn open_pid(pid: RawPid) -> Result<Option<Process>, Error> {
+        Ok(crate::process::Process::open_pid(pid)?.map(Process::from))
     }
 
-    /// This process's own handle. Infallible.
-    pub fn current() -> Process {
-        Process::from(crate::process::Process::current())
+    /// An open handle on this process itself (see [`Process::current`](crate::Process::current)).
+    pub fn current() -> Result<Process, Error> {
+        crate::process::Process::current().map(Process::from)
     }
 
     /// The stable identity (`(pid, start_token)`).
@@ -47,20 +44,14 @@ impl Process {
         self.inner.id()
     }
 
-    /// Whether this exact identity still resolves (zombie-inclusive; see
-    /// [`ProcessId::exists`]).
-    pub fn exists(&self) -> crate::identity::Existence {
-        self.inner.exists()
-    }
-
-    /// Whether the process is still running (zombie-exclusive; see [`ProcessId::is_alive`]).
+    /// Whether the process is still running, read through the handle (see
+    /// [`Process::is_alive`](crate::Process::is_alive)).
     pub fn is_alive(&self) -> crate::identity::Liveness {
         self.inner.is_alive()
     }
 
     /// Resolve when the process exits. Death-watch — yields no `ExitStatus` (only the real
-    /// parent gets one). Non-reaping and signal-free; `Err` only on a watch failure (on Linux a
-    /// refused `pidfd_open` is `Unsupported`, see [`Error::Unsupported`](crate::error::Error::Unsupported)). Dropping the future cancels the watch on every
+    /// parent gets one). Non-reaping and signal-free; `Err` only on a watch failure. Dropping the future cancels the watch on every
     /// platform (the Windows watcher is released via its cancel event).
     ///
     /// # Runtime
@@ -69,7 +60,7 @@ impl Process {
     /// `#[tokio::test]` defaults) — missing it, tokio panics rather than returning a typed
     /// error. On Windows the watch runs on the blocking pool (one thread per in-flight wait).
     pub async fn wait(&self) -> Result<(), Error> {
-        let exited = crate::tokio::drive::exited_by_id(self.inner.id(), None).await?;
+        let exited = crate::tokio::drive::exited_held(self.inner.os(), None).await?;
         debug_assert!(exited);
         Ok(())
     }
@@ -79,18 +70,17 @@ impl Process {
     /// runtime requirements as on [`wait`](Process::wait) (Unix additionally needs the time
     /// driver). Errors as for [`wait`](Process::wait).
     pub async fn wait_timeout(&self, timeout: Duration) -> Result<bool, Error> {
-        crate::tokio::drive::exited_by_id(self.inner.id(), Some(timeout)).await
+        crate::tokio::drive::exited_held(self.inner.os(), Some(timeout)).await
     }
 
-    /// Hard-kill the process by identity (see [`Process::kill`](crate::Process::kill) for
-    /// the per-OS race-freedom contract). On Linux a refused `pidfd_open` is `Unsupported` (see
-    /// [`Error::Unsupported`](crate::error::Error::Unsupported)).
+    /// Hard-kill the process (see [`Process::kill`](crate::Process::kill) for
+    /// the per-OS race-freedom contract).
     pub fn kill(&self) -> Result<(), Error> {
         self.inner.kill()
     }
 
-    /// Send `SIGTERM` (signal-only, identity-bound). Unix only; Windows returns
-    /// `Unsupported`, as does Linux when `pidfd_open` is refused (see [`Error::Unsupported`](crate::error::Error::Unsupported)).
+    /// Send `SIGTERM` (signal-only, bound to the opened process). Unix only; Windows returns
+    /// `Unsupported`.
     pub fn terminate(&self) -> Result<(), Error> {
         self.inner.terminate()
     }

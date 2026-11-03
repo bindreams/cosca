@@ -35,6 +35,14 @@ pub(crate) fn exited_by_id(id: ProcessId, timeout: Option<Duration>) -> Result<b
     }
 }
 
+/// [`exited_by_id`] for a process already open: `Ok(true)` = exited, `Ok(false)` = still running
+/// after the deadline's final look. The bounded-section assert and the watch-fault seam come
+/// first, then the deadline.
+pub(crate) fn exited_held(p: &dyn OsProcess, timeout: Option<Duration>) -> Result<bool, Error> {
+    enter()?;
+    drive(p, absolute(timeout))
+}
+
 /// `timeout` as an absolute deadline, fixed up front so no wake extends the total wait.
 pub(super) fn absolute(timeout: Option<Duration>) -> Option<Instant> {
     timeout.and_then(crate::wait::deadline_from)

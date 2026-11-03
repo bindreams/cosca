@@ -5,7 +5,7 @@ use super::{ExitWatch, MacProcess};
 use crate::error::Error;
 use crate::identity::{uniq_info, ProcessId, ReadPurpose, UniqRead};
 use crate::os_process::drive::{absolute, drive};
-use crate::os_process::{kill_by_id, open, terminate_by_id, Exit, OsProcess};
+use crate::os_process::{kill, open, terminate, terminate_by_id, Exit, OsProcess};
 use crate::signal::{Sent, Sig};
 use crate::test_child::wait_until_zombie;
 
@@ -73,7 +73,6 @@ fn open_with_wrong_start_token_is_none_and_sends_nothing() {
     let sends = crate::send_log::Capture::start();
     let other = ProcessId::from_parts_for_test(id.pid(), id.start_token_raw() + 1);
     assert!(open(other).unwrap().is_none(), "a wrong start token opens nothing");
-    kill_by_id(other).unwrap();
     terminate_by_id(other).unwrap();
     assert_eq!(sends.by_identity(), vec![], "nothing may be sent to a stranger");
     // Still running: the right identity opens and sees no exit.
@@ -81,6 +80,18 @@ fn open_with_wrong_start_token_is_none_and_sends_nothing() {
     assert!(!drive(&*p, absolute(Some(Duration::ZERO))).unwrap());
     child.kill().unwrap();
     child.wait().unwrap();
+}
+
+/// A held process that its owner has reaped is gone: both acts are `Ok`. Mutant: a stale signal
+/// is an error.
+#[skuld::test]
+fn kill_and_terminate_of_a_held_process_that_is_gone_are_ok() {
+    let (mut child, id) = blocker();
+    let p = open(id).unwrap().expect("a live process opens");
+    child.kill().unwrap();
+    child.wait().unwrap();
+    kill(&*p).unwrap();
+    terminate(&*p).unwrap();
 }
 
 #[skuld::test]
@@ -278,7 +289,10 @@ fn pid_zero_is_refused_unassessable() {
 fn a_pid_zero_identity_never_reaches_kill() {
     let bogus = crate::identity::ProcessId::from_parts_for_test(0, 1);
     // Already-gone is success: the pid holds a process, but not the one named.
-    crate::os_process::kill_by_id(bogus).expect("a pid-0 identity resolves to a stranger, i.e. already gone");
+    assert!(
+        open(bogus).expect("a pid-0 identity resolves to a stranger").is_none(),
+        "a pid-0 identity opens nothing"
+    );
     crate::os_process::terminate_by_id(bogus).expect("same for the graceful signal");
     // If either call had reached `kill(2)`, this process would have died with it.
     assert_eq!(

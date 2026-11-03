@@ -33,25 +33,23 @@ fn assert_refused(result: Result<impl std::fmt::Debug, Error>, op: &str, errno: 
     }
 }
 
+/// The refusal fails the open, once, naming it; an owned `Child` reaches the same refusal through
+/// its by-id acts, and kills through its own handle without one.
+///
 /// Mutants: an errno missing from the refusals; an op named as another; the message shape;
-/// `Child::kill` routed through `pidfd_open`.
+/// `Child::kill` routed through `pidfd_open`; `Process::current` built without an open.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn a_seccomp_refused_pidfd_open_is_unsupported_for_every_operation() {
+fn a_seccomp_refused_pidfd_open_fails_the_open_naming_process_open() {
     for (code, name) in REFUSALS {
         let (child, control) = common::spawn_blocker();
-        let process = cosca::Process::from_pid(child.id().pid())
-            .found()
-            .expect("resolve the child");
         std::thread::scope(|scope| {
             scope
                 .spawn(|| {
                     common::seccomp::deny_pidfd_open_on_this_thread(code);
-                    assert_refused(process.wait(), "process open", name);
-                    assert_refused(process.wait_timeout(Duration::ZERO), "process open", name);
-                    assert_refused(process.kill(), "process open", name);
-                    assert_refused(process.terminate(), "process open", name);
-                    assert_refused(process.graceful_shutdown(Duration::ZERO), "process open", name);
+                    assert_refused(cosca::Process::open_pid(child.id().pid()), "process open", name);
+                    assert_refused(cosca::Process::open(child.id()), "process open", name);
+                    assert_refused(cosca::Process::current(), "process open", name);
                     assert_refused(child.terminate(), "process open", name);
                     assert_refused(child.graceful_shutdown(Duration::ZERO), "process open", name);
                     // An owned child is killed through its own handle: no pidfd, so no refusal.
@@ -64,34 +62,49 @@ fn a_seccomp_refused_pidfd_open_is_unsupported_for_every_operation() {
     }
 }
 
+/// An open made before the filter serves every act after it: no act opens a second pidfd.
+///
+/// Mutant: an act re-opens the process by its identity.
 #[cfg(target_os = "linux")]
-#[cfg(feature = "tokio")]
 #[skuld::test]
-fn a_seccomp_refused_pidfd_open_is_unsupported_for_every_async_operation() {
-    for (code, name) in REFUSALS {
+fn a_held_process_needs_no_second_pidfd_open() {
+    for (code, _) in REFUSALS {
         let (child, control) = common::spawn_blocker();
-        let process = cosca::tokio::Process::from_pid(child.id().pid())
-            .found()
-            .expect("resolve the child");
+        let process = cosca::Process::open_pid(child.id().pid())
+            .expect("open")
+            .expect("running");
         std::thread::scope(|scope| {
             scope
                 .spawn(|| {
                     common::seccomp::deny_pidfd_open_on_this_thread(code);
-                    let runtime = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .expect("runtime");
-                    runtime.block_on(async {
-                        assert_refused(process.wait().await, "process open", name);
-                        assert_refused(
-                            process.wait_timeout(Duration::from_secs(60)).await,
-                            "process open",
-                            name,
-                        );
-                        assert_refused(process.kill(), "process open", name);
-                        assert_refused(process.terminate(), "process open", name);
-                        assert_refused(process.graceful_shutdown(Duration::ZERO).await, "process open", name);
-                    });
+                    assert!(!process
+                        .wait_timeout(Duration::ZERO)
+                        .expect("a look needs no pidfd_open"));
+                    process.kill().expect("a held kill needs no pidfd_open");
+                    process.terminate().expect("a held terminate needs no pidfd_open");
+                    process.wait().expect("a held wait needs no pidfd_open");
+                })
+                .join()
+                .expect("the filtered thread");
+        });
+        common::kill_release_reap(&child, control);
+    }
+}
+
+/// [`a_seccomp_refused_pidfd_open_fails_the_open_naming_process_open`] for the async `Process`.
+#[cfg(target_os = "linux")]
+#[cfg(feature = "tokio")]
+#[skuld::test]
+fn a_seccomp_refused_pidfd_open_fails_the_async_open_naming_process_open() {
+    for (code, name) in REFUSALS {
+        let (child, control) = common::spawn_blocker();
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    common::seccomp::deny_pidfd_open_on_this_thread(code);
+                    assert_refused(cosca::tokio::Process::open_pid(child.id().pid()), "process open", name);
+                    assert_refused(cosca::tokio::Process::open(child.id()), "process open", name);
+                    assert_refused(cosca::tokio::Process::current(), "process open", name);
                 })
                 .join()
                 .expect("the filtered thread");

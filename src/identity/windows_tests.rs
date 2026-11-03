@@ -137,7 +137,7 @@ fn kill_of_an_access_denied_live_process_is_an_error() {
     let id = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
         .expect("the owned handle always yields an identity");
     assert!(child.is_running(), "precondition: the subject must be live");
-    let err = crate::os_process::kill_by_id(id).expect_err("killing a process we may not open must not report success");
+    let err = crate::os_process::open(id).expect_err("a process we may not open must not read as gone");
     let crate::error::Error::Unassessable { source, .. } = err else {
         panic!("a denial must not read as an I/O failure: {err:?}");
     };
@@ -199,19 +199,22 @@ fn kill_of_a_terminate_denied_but_exited_process_reports_success() {
     let child = crate::identity::windows_fixture::spawn_query_only(&done);
     let id = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
         .expect("the owned handle always yields an identity");
-    // Precondition: kill's own mask must actually be refused, or this exercises the
+    // Precondition: the terminate right must actually be refused, or this exercises the
     // Opened::Found path and never reaches the arm under test.
     assert!(
         matches!(
             super::open_classified(child.pid(), PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION),
             super::Opened::Denied(_)
         ),
-        "precondition: kill_by_id's open must be denied"
+        "precondition: the open with the terminate right must be denied"
     );
     child.terminate();
     assert!(!child.is_running(), "precondition: the subject must have exited");
     assert_eq!(id.is_alive(), Liveness::Dead, "precondition: provably dead");
-    crate::os_process::kill_by_id(id).expect("killing an already-exited process is success");
+    let process = crate::os_process::open(id)
+        .expect("the open of an exited process")
+        .expect("the exited process is still held by its fixture");
+    crate::os_process::kill(&*process).expect("killing an already-exited process is success");
 }
 
 const OPTIONAL: [PROCESS_ACCESS_RIGHTS; 2] = [PROCESS_SYNCHRONIZE, PROCESS_TERMINATE];

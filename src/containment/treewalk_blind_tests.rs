@@ -18,12 +18,10 @@ fn assert_unassessable_naming(result: Result<(), Error>, cause: &str) {
 
 type Walk = fn(ProcessId) -> Result<(), Error>;
 
-fn walks() -> [(&'static str, Walk); 4] {
+fn walks() -> [(&'static str, Walk); 2] {
     [
         ("hard_kill", |id| super::hard_kill(id).map(|_| ())),
         ("terminate", |id| super::terminate(id)),
-        ("kill_tree", |id| crate::Process::from_id(id).kill_tree()),
-        ("terminate_tree", |id| crate::Process::from_id(id).terminate_tree()),
     ]
 }
 

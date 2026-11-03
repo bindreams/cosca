@@ -49,7 +49,7 @@ fn spawn_term_ignoring_blocker() -> std::process::Child {
 #[skuld::test]
 fn foreign_graceful_lone_watch_error_still_escalates() {
     let mut child = spawn_term_ignoring_blocker();
-    let p = crate::Process::from_pid(child.id()).found().expect("resolves");
+    let p = crate::Process::open_pid(child.id()).expect("open").expect("running");
     fault::set_force_watch_error(true);
     let err = p
         .graceful_shutdown(Duration::from_secs(30))
@@ -75,7 +75,7 @@ fn foreign_graceful_lone_watch_error_still_escalates() {
 #[skuld::test]
 fn foreign_graceful_tree_watch_error_still_sweeps() {
     let mut child = spawn_term_ignoring_blocker();
-    let p = crate::Process::from_pid(child.id()).found().expect("resolves");
+    let p = crate::Process::open_pid(child.id()).expect("open").expect("running");
     fault::set_force_watch_error(true);
     let err = p
         .graceful_shutdown_tree(Duration::from_secs(30))
@@ -101,7 +101,9 @@ fn foreign_graceful_tree_watch_error_still_sweeps() {
 #[skuld::test]
 fn foreign_terminate_tree_sigterms_the_root_and_its_descendant() {
     let tree = foreign::blocked_tree();
-    let p = crate::Process::from_pid(tree.root.id()).found().expect("resolves");
+    let p = crate::Process::open_pid(tree.root.id())
+        .expect("open")
+        .expect("running");
     let sends = Capture::start();
     p.terminate_tree().expect("terminate_tree");
     foreign::assert_tree_sigtermed(&sends, tree.root.id(), tree.grandchild);
@@ -116,7 +118,7 @@ fn foreign_terminate_tree_sigterms_the_root_and_its_descendant() {
 fn foreign_graceful_shutdown_tree_graceful_path() {
     let tree = foreign::blocked_tree();
     let (root, grandchild) = (tree.root.id(), tree.grandchild);
-    let p = crate::Process::from_pid(root).found().expect("resolves");
+    let p = crate::Process::open_pid(root).expect("open").expect("running");
     let sends = Capture::start();
     let _armed = at(HookPoint::AfterTerminate, move || {
         foreign::assert_tree_sigtermed(&sends, root, grandchild)
@@ -135,7 +137,7 @@ fn foreign_graceful_shutdown_tree_graceful_path() {
 #[skuld::test]
 fn foreign_graceful_shutdown_graceful_path() {
     let mut child = foreign::blocker();
-    let p = crate::Process::from_pid(child.id()).found().expect("resolves");
+    let p = crate::Process::open_pid(child.id()).expect("open").expect("running");
     let stdin = child.stdin.take().expect("piped stdin");
     let _release = release_at(HookPoint::AfterTerminate, stdin);
     p.graceful_shutdown(Duration::from_secs(30)).expect("graceful_shutdown");
