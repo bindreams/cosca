@@ -56,10 +56,9 @@
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::time::Instant;
 
-use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
-
 use crate::containment::TreeDrain;
 use crate::error::Error;
+use crate::os_process::macos::kqueue::{Event, Kqueue, Subscription};
 
 #[cfg(test)]
 #[path = "marker_eof_tests.rs"]
@@ -68,7 +67,7 @@ mod marker_eof_tests;
 /// The `NOTE_LOWAT` low-water mark every knote in this module is armed with. Clamped by the
 /// kernel to the pipe's actual buffer capacity — see the module doc for what this does and
 /// does not guarantee.
-const LOW_WATER_MARK: isize = 1 << 20; // 1 MiB (requested; effectively min(this, pipe capacity))
+const LOW_WATER_MARK: usize = 1 << 20; // 1 MiB (requested; effectively min(this, pipe capacity))
 
 /// Make the read end non-blocking (idempotent). The read end belongs solely to the supervisor,
 /// so the file-status flag is ours to set.
@@ -147,37 +146,30 @@ pub(crate) mod drain_test_hooks {
 pub(crate) fn arm(read_end: BorrowedFd<'_>, unbounded_wait: bool) -> Result<Kqueue, Error> {
     ensure_nonblocking(read_end)?;
     refuse_if_write_end_held(read_end, unbounded_wait)?;
-    let kq = Kqueue::new().map_err(|e| Error::Io(e.into()))?;
-    let change = KEvent::new(
-        read_end.as_raw_fd() as usize,
-        EventFilter::EVFILT_READ,
-        EvFlags::EV_ADD | EvFlags::EV_RECEIPT | EvFlags::EV_CLEAR,
-        FilterFlag::NOTE_LOWAT,
-        LOW_WATER_MARK,
-        0,
-    );
-    let add_result = crate::os_process::macos::kqueue::add_with_receipt(&kq, change)?;
-    if add_result != 0 {
-        return Err(Error::Io(std::io::Error::from_raw_os_error(add_result as i32)));
-    }
+    let kq = Kqueue::new()?;
+    let readable = Subscription::Readable {
+        fd: read_end.as_raw_fd(),
+        low_water: LOW_WATER_MARK,
+    };
+    kq.subscribe(readable)?;
     Ok(kq)
 }
 
-/// Interpret ONE `EVFILT_READ` event on the marker read end — the single definition shared by
+/// Interpret ONE readable event on the marker read end — the single definition shared by
 /// the one-shot drain (`drain_kqueue`) and the blocking wait's loop body
 /// (`block_until_drained`), so there is no hand-rolled twin to drift.
 ///
-/// `Ok(Some(AllMembersExited))` = `EV_EOF` was set — final, regardless of buffered bytes, so no
-/// read happens in this branch. `Ok(None)` = readable without `EV_EOF`, which with
+/// `Ok(Some(AllMembersExited))` = the read end `closed` — final, regardless of buffered bytes, so
+/// no read happens in this branch. `Ok(None)` = readable without `EV_EOF`, which with
 /// `NOTE_LOWAT` armed only happens once buffered bytes reach the clamp — i.e. the pipe is at
 /// capacity, so a writer that keeps writing is, at that exact instant, already blocked in its
 /// own `write()`. `suppress_drain` decides what happens next:
 ///
-/// - **`false`** (a bounded wait with deadline funding left): `event.data()` bytes are
+/// - **`false`** (a bounded wait with deadline funding left): the event's `bytes` are
 ///   discarded via `drain_pending`, in one round bounded by the count the kernel itself
 ///   reported — the crate's accommodation for a misbehaving-but-eventually-cooperative writer,
 ///   paid for by the caller's own deadline.
-/// - **`true`**: nothing is read; `event.data()` bytes stay buffered. THREE call sites ask for
+/// - **`true`**: nothing is read; the event's `bytes` stay buffered. THREE call sites ask for
 ///   this, unified under one flag by principle 13, but with two different outcomes:
 ///   - `block_until_drained`, UNBOUNDED (no deadline exists to fund a drain): the wait
 ///     genuinely blocks in the kernel — the armed knote's `EV_CLEAR` (see `arm`) means no new
@@ -198,43 +190,29 @@ pub(crate) fn arm(read_end: BorrowedFd<'_>, unbounded_wait: bool) -> Result<Kque
 /// proceed, capped by its own deadline) but always suppresses draining, per the three call
 /// sites above.
 ///
-/// `Err` = `EV_ERROR` or a `kevent`/read failure.
+/// `Err` = a read failure.
 fn interpret_read_event(
-    event: &KEvent,
+    event: Event,
     read_end: BorrowedFd<'_>,
     suppress_drain: bool,
 ) -> Result<Option<TreeDrain>, Error> {
-    if event.flags().contains(EvFlags::EV_ERROR) {
-        return Err(Error::Io(std::io::Error::from_raw_os_error(event.data() as i32)));
-    }
-    if event.flags().contains(EvFlags::EV_EOF) {
+    let Event::Readable { bytes, closed, .. } = event else {
+        debug_assert!(
+            false,
+            "the marker kqueue subscribes to the read end only, got {event:?}"
+        );
+        return Ok(None);
+    };
+    if closed {
         return Ok(Some(TreeDrain::AllMarkersClosed));
     }
-    // `data` is a byte count for a readable, non-EOF, non-error EVFILT_READ event — never
-    // negative per the kqueue contract this module relies on everywhere else. A violation here
-    // is a kqueue/ABI surprise or a bug in this module's own event handling, not an ordinary
-    // runtime condition: `debug_assert!` catches it loudly in debug builds, and `log::warn!`
-    // leaves a trace in release ones too — clamping to `0` and returning the routine "nothing to
-    // drain yet" verdict must not happen in total silence, unlike an ordinary empty drain.
-    if event.data() < 0 {
-        log::warn!(
-            "marker EOF: EVFILT_READ reported a negative data field ({}) on a non-EOF event — a \
-             kqueue ABI surprise or a bug in this module's own event handling",
-            event.data()
-        );
-    }
-    debug_assert!(
-        event.data() >= 0,
-        "EVFILT_READ data must be non-negative per kernel contract, got {}",
-        event.data()
-    );
     if !suppress_drain {
-        drain_pending(read_end, event.data().max(0) as usize)?;
+        drain_pending(read_end, bytes)?;
     }
-    Ok(None) // holders remain (EV_EOF was clear)
+    Ok(None) // holders remain (the read end is not closed)
 }
 
-/// The three outcomes of one non-blocking `kevent` check on an armed marker kqueue, kept
+/// The three outcomes of one non-blocking read of the events pending on an armed marker kqueue, kept
 /// distinct rather than collapsed to `Option<TreeDrain>`: a caller that needs to know whether a
 /// REAL, interpreted event occurred (a test proving a watch loop "saw readiness and declined to
 /// drain", as opposed to a spurious wakeup with nothing pending at all) cannot tell those two
@@ -251,7 +229,7 @@ pub(crate) enum DrainOutcome {
     /// did not resolve the wait; its bytes were discarded when `suppress_drain` is false and
     /// left buffered when true.
     Declined,
-    /// `kevent` reported nothing pending at all; `interpret_read_event` never ran.
+    /// Nothing was pending at all; `interpret_read_event` never ran.
     Spurious,
 }
 
@@ -264,32 +242,21 @@ impl DrainOutcome {
     }
 }
 
-/// Take one pending event from an armed kqueue without blocking. `suppress_drain` is
-/// `interpret_read_event`'s own parameter of the same name, passed straight through — see that
-/// function's own doc for what it means and why it need not equal `arm`'s `unbounded_wait`.
+/// Takes every event pending on an armed kqueue through `Kqueue::poll`, without blocking, and
+/// interprets them in order until one is a verdict. `suppress_drain` is `interpret_read_event`'s
+/// own parameter of the same name, passed straight through — see that function's own doc for what
+/// it means and why it need not equal `arm`'s `unbounded_wait`.
 pub(crate) fn drain_kqueue(kq: &Kqueue, read_end: BorrowedFd<'_>, suppress_drain: bool) -> Result<DrainOutcome, Error> {
-    let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    let mut events = [KEvent::new(
-        0,
-        EventFilter::EVFILT_READ,
-        EvFlags::empty(),
-        FilterFlag::empty(),
-        0,
-        0,
-    )];
-    loop {
-        match kq.kevent(&[], &mut events, Some(zero)) {
-            Ok(0) => return Ok(DrainOutcome::Spurious), // nothing pending
-            Ok(_) => {
-                return Ok(match interpret_read_event(&events[0], read_end, suppress_drain)? {
-                    Some(verdict) => DrainOutcome::Drained(verdict),
-                    None => DrainOutcome::Declined,
-                });
-            }
-            Err(nix::errno::Errno::EINTR) => continue,
-            Err(e) => return Err(Error::Io(e.into())),
+    let events = kq.poll()?;
+    if events.is_empty() {
+        return Ok(DrainOutcome::Spurious);
+    }
+    for event in events {
+        if let Some(verdict) = interpret_read_event(event, read_end, suppress_drain)? {
+            return Ok(DrainOutcome::Drained(verdict));
         }
     }
+    Ok(DrainOutcome::Declined)
 }
 
 /// One-shot drain check: exact, not heuristic — arms a private kqueue and reads its
@@ -345,7 +312,12 @@ pub(crate) fn block_until_drained(read_end: BorrowedFd<'_>, deadline: Option<Ins
         &kq,
         deadline,
         TreeDrain::MembersRemain,
-        |event, already_elapsed| interpret_read_event(event, read_end, unbounded_wait || already_elapsed),
+        |event, already_elapsed| {
+            // `from_kevent` has already warned about an event no subscription can produce.
+            Event::from_kevent(event).map_or(Ok(None), |event| {
+                interpret_read_event(event, read_end, unbounded_wait || already_elapsed)
+            })
+        },
     )
 }
 

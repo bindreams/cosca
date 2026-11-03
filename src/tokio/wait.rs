@@ -192,17 +192,6 @@ pub(crate) fn classify_pidfd_ready(ready: ::tokio::io::Ready) -> Option<Result<(
     None
 }
 
-/// `AsyncFd` requires `AsRawFd`; nix's `Kqueue` exposes only `AsFd` — delegate. `K` is the kqueue
-/// itself, or a borrow of one that something else owns.
-#[cfg(target_os = "macos")]
-pub(crate) struct KqueueFd<K = nix::sys::event::Kqueue>(pub(crate) K);
-#[cfg(target_os = "macos")]
-impl<K: std::os::fd::AsFd> std::os::fd::AsRawFd for KqueueFd<K> {
-    fn as_raw_fd(&self) -> std::os::fd::RawFd {
-        self.0.as_fd().as_raw_fd()
-    }
-}
-
 /// The readiness/drain loop, parameterized over the drain so the re-await cycle is testable
 /// against the REAL `AsyncFd` (see `wait_tests`). Exit is concluded only on a drained event;
 /// `clear_ready` only after an EMPTY drain — mio's edge-triggered (`EV_CLEAR`) would-block
@@ -210,8 +199,8 @@ impl<K: std::os::fd::AsFd> std::os::fd::AsRawFd for KqueueFd<K> {
 ///
 /// `drain` returning `Ok(None)` is what `clear_ready` treats as "empty" — this loop has no way
 /// to verify that itself, since the closure's return type carries no more than "done" or "not
-/// done". The invariant holds for both current callers: `drain_proc_exit`'s only non-`None`
-/// outcome is `NOTE_EXIT`, with no draining concept at all, and `marker_eof::drain_kqueue`'s
+/// done". The invariant holds for both current callers: `ExitWatch::drain` reports `true`
+/// once its event has been read, by this call or an earlier one, with no draining concept at all, and `marker_eof::drain_kqueue`'s
 /// caller here (`wait_tree_drained_inner`) passes through the SAME `unbounded_wait` its own
 /// caller computed from the real deadline (`crate::wait::remaining(deadline).is_none()`,
 /// matching the sync backend's `block_until_drained` exactly) — when `true`,
@@ -224,17 +213,14 @@ impl<K: std::os::fd::AsFd> std::os::fd::AsRawFd for KqueueFd<K> {
 /// silently; `watch_readable` cannot detect that on its own, so any such closure owns
 /// re-verifying this invariant itself.
 #[cfg(target_os = "macos")]
-pub(crate) async fn watch_readable<K, F>(
-    afd: &::tokio::io::unix::AsyncFd<KqueueFd<K>>,
-    mut drain: F,
-) -> Result<(), Error>
+pub(crate) async fn watch_readable<K, F>(afd: &::tokio::io::unix::AsyncFd<K>, mut drain: F) -> Result<(), Error>
 where
-    K: std::os::fd::AsFd,
+    K: std::os::fd::AsRawFd,
     F: FnMut(&K) -> Result<Option<()>, Error>,
 {
     loop {
         let mut guard = afd.readable().await.map_err(Error::Io)?;
-        match drain(&afd.get_ref().0)? {
+        match drain(afd.get_ref())? {
             Some(()) => return Ok(()),
             None => guard.clear_ready(), // no exit drained — re-await
         }
@@ -404,20 +390,20 @@ async fn wait_tree_drained_inner(
     unbounded_wait: bool,
     armed: Option<std::sync::mpsc::Sender<std::os::fd::RawFd>>,
 ) -> Result<(), Error> {
-    use std::os::fd::{AsFd, AsRawFd};
+    use std::os::fd::AsRawFd;
 
     use crate::containment::marker_eof::DrainOutcome;
     use ::tokio::io::unix::AsyncFd;
     use ::tokio::io::Interest;
     let kq = crate::containment::marker_eof::arm(read_end, unbounded_wait)?;
     if let Some(tx) = armed {
-        let sent = tx.send(kq.as_fd().as_raw_fd());
+        let sent = tx.send(kq.as_raw_fd());
         debug_assert!(
             sent.is_ok(),
             "the `armed` receiver was dropped before the kqueue was armed"
         );
     }
-    let afd = AsyncFd::with_interest(KqueueFd(kq), Interest::READABLE).map_err(Error::Io)?;
+    let afd = AsyncFd::with_interest(kq, Interest::READABLE).map_err(Error::Io)?;
     watch_readable(&afd, move |kq| {
         match crate::containment::marker_eof::drain_kqueue(kq, read_end, unbounded_wait)? {
             DrainOutcome::Drained(_) => Ok(Some(())),

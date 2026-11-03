@@ -28,12 +28,10 @@
 
 use std::time::Duration;
 
-use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
-
 #[cfg(not(test))]
 use crate::identity::link;
 use crate::identity::{uniq_info, Link, ReadPurpose, UniqRead, LAUNCHD};
-use crate::os_process::macos::kqueue::{add_with_receipt, arm_exit_and_signals_on};
+use crate::os_process::macos::kqueue::{Event, Kqueue, Subscription};
 
 /// The backoff's first interval after a walk finds a tracer gone, and its cap.
 const GONE_START: Duration = Duration::from_millis(1);
@@ -114,9 +112,10 @@ impl TracerWatch {
             };
             if !self.armed.contains(&(at, unique)) {
                 self.disarm(kq, at)?;
-                let armed = arm(kq, at).map_err(|e| WalkError::Watch(into_io(e)))?;
-                if armed.is_none() {
-                    return Ok(self.gone());
+                match arm(kq, at) {
+                    Ok(()) => {}
+                    Err(e) if e.raw_os_error() == Some(libc::ESRCH) => return Ok(self.gone()),
+                    Err(e) => return Err(WalkError::Watch(into_io(e))),
                 }
                 match uniq_info(at, ReadPurpose::Link) {
                     UniqRead::Found(info) if info.unique_id == unique => {}
@@ -168,30 +167,32 @@ impl TracerWatch {
 
     /// Whether `event` is an event of a watched tracer, for a wait on `child`: its exit, or a signal
     /// sent to it. An exit's knote is one-shot, so the next walk registers that pid again.
-    pub(crate) fn fired(&mut self, event: &KEvent, child: u32) -> bool {
-        let fired = event.filter() == Ok(EventFilter::EVFILT_PROC) && event.ident() != child as usize;
-        if fired && event.fflags().contains(FilterFlag::NOTE_EXIT) {
-            self.armed.retain(|&(pid, _)| pid as usize != event.ident());
+    pub(crate) fn fired(&mut self, event: &Event, child: u32) -> bool {
+        let &Event::Process { pid, exited, .. } = event else {
+            return false;
+        };
+        let fired = pid != child;
+        if fired && exited {
+            self.armed.retain(|&(armed, _)| armed != pid);
         }
         fired
     }
 }
 
-/// Deletes the `EVFILT_PROC` registration on `pid`. `ENOENT`: none is left, as after a `NOTE_EXIT`
-/// was delivered, which deletes its one-shot knote.
+fn watched(pid: u32) -> Subscription {
+    Subscription::Process {
+        pid,
+        signals: true,
+        reap: false,
+    }
+}
+
+/// Removes the registration on `pid`. `ENOENT` is not a failure: a delivered `NOTE_EXIT` deletes
+/// its one-shot knote.
 fn delete(kq: &Kqueue, pid: u32) -> Result<(), WalkError> {
-    let change = KEvent::new(
-        pid as usize,
-        EventFilter::EVFILT_PROC,
-        EvFlags::EV_DELETE | EvFlags::EV_RECEIPT,
-        FilterFlag::empty(),
-        0,
-        0,
-    );
-    match add_with_receipt(kq, change).map_err(|e| WalkError::Watch(into_io(e)))? {
-        0 => Ok(()),
-        e if e == libc::ENOENT as i64 => Ok(()),
-        e => Err(WalkError::Watch(std::io::Error::from_raw_os_error(e as i32))),
+    match kq.unsubscribe(watched(pid)) {
+        Err(e) if e.raw_os_error() != Some(libc::ENOENT) => Err(WalkError::Watch(into_io(e))),
+        _ => Ok(()),
     }
 }
 
@@ -209,13 +210,13 @@ fn refused(pid: u32, errno: i32) -> WalkError {
     ))
 }
 
-/// [`arm_exit_and_signals_on`], or the refusal a test queued for it.
-fn arm(kq: &Kqueue, pid: u32) -> Result<Option<()>, crate::error::Error> {
+/// Subscribes to `pid`'s exit and signals, or the refusal a test queued for it.
+fn arm(kq: &Kqueue, pid: u32) -> Result<(), crate::error::Error> {
     #[cfg(test)]
     if let Some(errno) = seams::take_refused_registration() {
         return Err(crate::error::Error::Io(std::io::Error::from_raw_os_error(errno)));
     }
-    arm_exit_and_signals_on(kq, pid)
+    kq.subscribe(watched(pid))
 }
 
 /// [`crate::identity::link`], or the answer a test queued for it.

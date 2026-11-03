@@ -1,6 +1,7 @@
 //! The helper's raw syscalls. Each returns the errno it failed with.
 
-use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
+use crate::error::Error;
+use crate::os_process::macos::kqueue::{Kqueue, Subscription};
 
 fn errno() -> i32 {
     std::io::Error::last_os_error()
@@ -299,57 +300,42 @@ pub(super) fn read_byte(fd: i32) -> Option<u8> {
     }
 }
 
-fn receipt(kq: &Kqueue, change: KEvent) -> Result<(), i32> {
-    match crate::os_process::macos::kqueue::add_with_receipt(kq, change) {
-        Ok(0) => Ok(()),
-        Ok(errno) => Err(errno as i32),
+/// Subscribes to `s`; a refusal is the errno the kernel's receipt names.
+fn subscribe(kq: &Kqueue, s: Subscription) -> Result<(), i32> {
+    match kq.subscribe(s) {
+        Ok(()) => Ok(()),
+        Err(Error::Io(e)) => Err(e.raw_os_error().expect("a refused registration names its errno")),
         Err(e) => panic!("kevent registration failed outright: {e}"),
     }
 }
 
-/// Registers `NOTE_EXIT` for `pid` (`EV_RECEIPT`, so its error is known at once).
 pub(super) fn watch_exit(kq: &Kqueue, pid: u32) -> Result<(), i32> {
-    receipt(
+    subscribe(
         kq,
-        KEvent::new(
-            pid as usize,
-            EventFilter::EVFILT_PROC,
-            EvFlags::EV_ADD | EvFlags::EV_RECEIPT,
-            FilterFlag::NOTE_EXIT,
-            0,
-            0,
-        ),
+        Subscription::Process {
+            pid,
+            signals: false,
+            reap: false,
+        },
     )
 }
 
-/// Registers `EVFILT_READ` on fd 0, the signal pipe.
+const SIGNAL_PIPE: Subscription = Subscription::Readable { fd: 0, low_water: 1 };
+
 pub(super) fn watch_signal_pipe(kq: &Kqueue) -> Result<(), i32> {
-    receipt(kq, read_knote(EvFlags::EV_ADD | EvFlags::EV_RECEIPT))
+    subscribe(kq, SIGNAL_PIPE)
 }
 
-/// Registers `EVFILT_SIGNAL` for `SIGCHLD`, which XNU sends this tracer when its tracee stops.
+/// Registers `SIGCHLD`, which XNU sends this tracer when its tracee stops.
 pub(super) fn watch_sigchld(kq: &Kqueue) -> Result<(), i32> {
-    receipt(
-        kq,
-        KEvent::new(
-            libc::SIGCHLD as usize,
-            EventFilter::EVFILT_SIGNAL,
-            EvFlags::EV_ADD | EvFlags::EV_RECEIPT,
-            FilterFlag::empty(),
-            0,
-            0,
-        ),
-    )
+    subscribe(kq, Subscription::Signal(libc::SIGCHLD))
 }
 
-/// Removes the signal pipe's knote after its EOF, which would otherwise stay readable forever.
+/// Removes the signal pipe's registration after its EOF. Called while fd 0 is open: a closed fd
+/// would answer `EBADF`.
 pub(super) fn unwatch_signal_pipe(kq: &Kqueue) {
-    receipt(kq, read_knote(EvFlags::EV_DELETE | EvFlags::EV_RECEIPT))
-        .unwrap_or_else(|e| panic!("EV_DELETE of the signal pipe's knote failed: errno {e}"));
-}
-
-fn read_knote(flags: EvFlags) -> KEvent {
-    KEvent::new(0, EventFilter::EVFILT_READ, flags, FilterFlag::empty(), 0, 0)
+    kq.unsubscribe(SIGNAL_PIPE)
+        .unwrap_or_else(|e| panic!("removing the signal pipe's registration failed: {e}"));
 }
 
 #[cfg(test)]

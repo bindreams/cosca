@@ -8,9 +8,7 @@
 use std::process::{Child, ChildStdin};
 use std::time::Duration;
 
-use nix::sys::event::Kqueue;
-
-use crate::os_process::macos::kqueue::test_hooks;
+use crate::os_process::macos::kqueue::{test_hooks, Kqueue};
 use crate::wait::exit_only::seams as exit_seams;
 use crate::wait::exit_only::seams::HolderStep;
 use crate::wait::exit_only::Peek;
@@ -364,7 +362,7 @@ fn a_macos_esrch_wait_follows_the_kernel_not_the_disposition() {
     let (flip_to_ignored, expect_gone) = match case.as_str() {
         "dfl_then_ign" => (true, true),
         "ign_then_dfl" => {
-            crate::test_child::set_sigchld_ignored(true);
+            crate::test_child::set_signal_ignored(libc::SIGCHLD, true);
             (false, false)
         }
         other => panic!("unknown case {other}"),
@@ -375,7 +373,7 @@ fn a_macos_esrch_wait_follows_the_kernel_not_the_disposition() {
     let mut stdin = Some(stdin);
     // Between re-peeks: flip the disposition, then let the child exit.
     let _flip = test_hooks::on_esrch_repeek(move || {
-        crate::test_child::set_sigchld_ignored(flip_to_ignored);
+        crate::test_child::set_signal_ignored(libc::SIGCHLD, flip_to_ignored);
         drop(stdin.take());
     });
     let waited = await_reapable(pid, None, None).expect("wait");
@@ -410,7 +408,7 @@ fn await_reapable_on_waits_out_a_caller_registration_that_got_esrch() {
             "",
         );
     }
-    crate::test_child::set_sigchld_ignored(true);
+    crate::test_child::set_signal_ignored(libc::SIGCHLD, true);
     let (_sibling, _sibling_stdin) = spawn_blocker();
     let (child, stdin) = spawn_blocker();
     let pid = child.id();

@@ -726,40 +726,32 @@ fn watch_linux(listener: &std::net::TcpListener, target: crate::identity::Proces
     }
 }
 
-/// macOS: the crate's own [`crate::os_process::macos::kqueue::arm_proc_exit`] kqueue, with an `EVFILT_READ`
-/// watch on the listener added to the SAME kqueue (via the crate's own
-/// [`crate::os_process::macos::kqueue::add_with_receipt`]).
+/// macOS: [`crate::os_process::macos::kqueue::arm_proc_exit`]'s kqueue, with the listener's
+/// readability watched on the same queue.
 #[cfg(target_os = "macos")]
 fn watch_macos(listener: &std::net::TcpListener, target: crate::identity::ProcessId) -> WatchEvent {
     use std::os::fd::AsRawFd;
 
     use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent};
 
+    use crate::os_process::macos::kqueue::{Event, Subscription};
+
     let Some(kq) =
         crate::os_process::macos::kqueue::arm_proc_exit(target).expect("arm a kqueue exit-watch for the target")
     else {
         return WatchEvent::Died;
     };
-    let listener_change = KEvent::new(
-        listener.as_raw_fd() as usize,
-        EventFilter::EVFILT_READ,
-        EvFlags::EV_ADD | EvFlags::EV_RECEIPT,
-        FilterFlag::empty(),
-        0,
-        0,
-    );
-    let listener_errno = crate::os_process::macos::kqueue::add_with_receipt(&kq, listener_change)
-        .expect("kevent(EV_ADD) to arm the listener watch");
-    assert_eq!(
-        listener_errno, 0,
-        "kevent(EV_ADD) for EVFILT_READ on the control listener reported errno {listener_errno}"
-    );
+    let listener = Subscription::Readable {
+        fd: listener.as_raw_fd(),
+        low_water: 1,
+    };
+    kq.subscribe(listener).expect("watch the control listener");
 
     let placeholder = KEvent::new(0, EventFilter::EVFILT_PROC, EvFlags::empty(), FilterFlag::empty(), 0, 0);
     let mut events = [placeholder; 2];
     loop {
         // Retries the wait on `EINTR` (see `kevent_eintr`).
-        let n = match kq.kevent(&[], &mut events, None) {
+        let n = match kq.native().kevent(&[], &mut events, None) {
             Ok(n) => n,
             Err(nix::errno::Errno::EINTR) => {
                 kevent_eintr::count_retry();
@@ -767,14 +759,9 @@ fn watch_macos(listener: &std::net::TcpListener, target: crate::identity::Proces
             }
             Err(e) => panic!("kevent while waiting for a control connection: {e}"),
         };
-        for ev in &events[..n] {
-            debug_assert!(
-                !ev.flags().contains(EvFlags::EV_ERROR),
-                "an armed kevent reported EV_ERROR: {ev:?}"
-            );
-        }
-        let exited = events[..n].iter().any(|ev| ev.filter() == Ok(EventFilter::EVFILT_PROC));
-        let connection = events[..n].iter().any(|ev| ev.filter() == Ok(EventFilter::EVFILT_READ));
+        let read: Vec<Event> = events[..n].iter().filter_map(Event::from_kevent).collect();
+        let exited = read.iter().any(|ev| matches!(ev, Event::Process { .. }));
+        let connection = read.iter().any(|ev| matches!(ev, Event::Readable { .. }));
         match shared::first_ready(exited, connection) {
             Some(shared::Ready::Exit) => return WatchEvent::Died,
             Some(shared::Ready::Source) => return WatchEvent::Connection,
@@ -1154,17 +1141,17 @@ pub(crate) fn run_fixture_case(fixture: &str, marker_env: &str, case_env: &str, 
     );
 }
 
-/// Set `SIGCHLD`'s disposition, process-wide: `SIG_IGN` if `ignore`, else `SIG_DFL`. Only a
-/// fixture re-exec (see [`run_fixture_case`]) may call it: it changes every thread of the process.
+/// Set `signo`'s disposition, process-wide: `SIG_IGN` if `ignore`, else `SIG_DFL`. Only a fixture
+/// re-exec (see [`run_fixture_case`]) may call it: it changes every thread of the process.
 #[cfg(target_os = "macos")]
-pub(crate) fn set_sigchld_ignored(ignore: bool) {
+pub(crate) fn set_signal_ignored(signo: libc::c_int, ignore: bool) {
     let handler = if ignore { libc::SIG_IGN } else { libc::SIG_DFL };
     // SAFETY: `signal` with `SIG_IGN` or `SIG_DFL` installs no handler code.
-    let previous = unsafe { libc::signal(libc::SIGCHLD, handler) };
+    let previous = unsafe { libc::signal(signo, handler) };
     assert_ne!(
         previous,
         libc::SIG_ERR,
-        "signal(SIGCHLD): {}",
+        "signal({signo}): {}",
         std::io::Error::last_os_error()
     );
 }

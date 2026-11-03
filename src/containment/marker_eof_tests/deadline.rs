@@ -11,7 +11,7 @@ use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent};
 use super::{fill_pipe_to_capacity, fionread, kill_release_reap, marker_pipe, spawn_marker_holder};
 use crate::containment::marker_eof::{arm, block_until_drained, drain_test_hooks, interpret_read_event, probe};
 use crate::containment::TreeDrain;
-use crate::os_process::macos::kqueue::test_hooks;
+use crate::os_process::macos::kqueue::{test_hooks, Event};
 use crate::wait::test_clock;
 
 /// This system's real pipe buffer capacity, MEASURED rather than assumed: fill a throwaway,
@@ -67,7 +67,7 @@ fn block_until_marker_ready_again(fd: BorrowedFd<'_>) {
         0,
     )];
     loop {
-        match kq.kevent(&[], &mut events, None) {
+        match kq.native().kevent(&[], &mut events, None) {
             Ok(n) if n > 0 => return,
             Ok(_) => continue,
             Err(nix::errno::Errno::EINTR) => continue,
@@ -446,7 +446,10 @@ fn arm_sets_ev_clear_so_a_repeated_poll_without_a_new_edge_reports_nothing() {
         0,
     )];
 
-    let n = kq.kevent(&[], &mut events, None).expect("initial blocking poll");
+    let n = kq
+        .native()
+        .kevent(&[], &mut events, None)
+        .expect("initial blocking poll");
     assert_eq!(n, 1, "expected the initial crossing to be ready");
     assert!(
         !events[0].flags().contains(EvFlags::EV_EOF),
@@ -455,6 +458,7 @@ fn arm_sets_ev_clear_so_a_repeated_poll_without_a_new_edge_reports_nothing() {
 
     let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     let n2 = kq
+        .native()
         .kevent(&[], &mut events, Some(zero))
         .expect("second, zero-timeout poll");
     assert_eq!(
@@ -479,11 +483,12 @@ fn interpret_read_event_suppresses_drain_when_told_to() {
         0,
         0,
     )];
-    let n = kq.kevent(&[], &mut events, None).expect("blocking poll");
+    let n = kq.native().kevent(&[], &mut events, None).expect("blocking poll");
     assert_eq!(n, 1, "expected the crossing to be ready");
 
     let before = fionread(marker.as_fd());
-    let verdict = interpret_read_event(&events[0], marker.as_fd(), true).expect("interpret with suppress_drain=true");
+    let event = Event::from_kevent(&events[0]).expect("a readable event");
+    let verdict = interpret_read_event(event, marker.as_fd(), true).expect("interpret with suppress_drain=true");
     let after = fionread(marker.as_fd());
 
     assert_eq!(
