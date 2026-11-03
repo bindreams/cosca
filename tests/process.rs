@@ -117,10 +117,9 @@ fn open_pid_resolves_a_live_foreign_child_then_reports_it_dead() {
     );
 }
 
-/// A held handle names its process for good: once the process is reaped, every act reports it gone,
-/// whoever holds its pid next. Mutant: an act re-resolves the pid.
+/// A held handle on a reaped process reads `Dead`, and `wait`, `kill` and `wait_timeout` return.
 #[skuld::test]
-fn a_held_process_stays_the_same_process_after_it_is_reaped() {
+fn a_held_process_reads_dead_and_its_acts_return_after_it_is_reaped() {
     let (child, sock) = spawn_blocker();
     let p = cosca::Process::open_pid(child.id().pid())
         .expect("open")
