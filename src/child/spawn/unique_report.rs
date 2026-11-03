@@ -303,31 +303,29 @@ enum Watch {
 
 /// The kqueue wait of [`await_report`].
 fn watch(read_end: &OwnedFd, pid: u32) -> io::Result<Watch> {
+    use crate::os_process::macos::kqueue::{Event, Kqueue, Subscription};
     use crate::wait::macos::{OnTracer, TracerWatch};
-    use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
+    use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent};
 
-    let kq = Kqueue::new()?;
+    let kq = Kqueue::new().map_err(into_io)?;
     #[cfg(test)]
     seams::wait_begins();
-    let pipe = KEvent::new(
-        read_end.as_raw_fd() as usize,
-        EventFilter::EVFILT_READ,
-        EvFlags::EV_ADD | EvFlags::EV_RECEIPT,
-        FilterFlag::empty(),
-        0,
-        0,
-    );
-    match crate::os_process::macos::kqueue::add_with_receipt(&kq, pipe).map_err(into_io)? {
-        0 => {}
-        errno => return Err(io::Error::from_raw_os_error(errno as i32)),
-    }
+    let pipe = Subscription::Readable {
+        fd: read_end.as_raw_fd(),
+        low_water: 1,
+    };
+    kq.subscribe(pipe).map_err(into_io)?;
     // Registered before the first check, so a child that exits after it fires `NOTE_EXIT`, and one a
     // tracer attaches to fires `NOTE_SIGNAL`.
-    if crate::os_process::macos::kqueue::arm_exit_and_signals_on(&kq, pid)
-        .map_err(into_io)?
-        .is_none()
-    {
-        return Ok(Watch::ChildGone);
+    let child = Subscription::Process {
+        pid,
+        signals: true,
+        reap: false,
+    };
+    match kq.subscribe(child) {
+        Ok(()) => {}
+        Err(e) if e.raw_os_error() == Some(libc::ESRCH) => return Ok(Watch::ChildGone),
+        Err(e) => return Err(into_io(e)),
     }
     let mut tracer = TracerWatch::default();
     let blank = KEvent::new(0, EventFilter::EVFILT_READ, EvFlags::empty(), FilterFlag::empty(), 0, 0);
@@ -358,7 +356,7 @@ fn watch(read_end: &OwnedFd, pid: u32) -> io::Result<Watch> {
             },
         };
         #[cfg(test)]
-        seams::blocking(&kq);
+        seams::blocking(kq.native());
         let warn_in = say_after
             .filter(|_| !warned)
             .map(|after| after.saturating_sub(started.elapsed()));
@@ -368,7 +366,7 @@ fn watch(read_end: &OwnedFd, pid: u32) -> io::Result<Watch> {
         };
         #[cfg(test)]
         seams::record_timeout(timeout);
-        let n = match kq.kevent(
+        let n = match kq.native().kevent(
             &[],
             &mut events,
             timeout.map(crate::os_process::macos::kqueue::kevent_timeout),
@@ -384,17 +382,16 @@ fn watch(read_end: &OwnedFd, pid: u32) -> io::Result<Watch> {
                  for it to exit"
             );
         }
-        let woke = &events[..n];
-        if woke.iter().any(|e| {
-            e.filter() == Ok(EventFilter::EVFILT_PROC)
-                && e.ident() == pid as usize
-                && e.fflags().contains(FilterFlag::NOTE_EXIT)
-        }) {
+        let woke: Vec<Event> = events[..n].iter().filter_map(Event::from_kevent).collect();
+        if woke
+            .iter()
+            .any(|e| matches!(e, Event::Process { pid: p, exited: true, .. } if *p == pid))
+        {
             return Ok(Watch::ChildGone);
         }
         // Any other wake (a signal to the child, a tracer's exit or signal, the pipe, a timer) reads
         // the pipe and checks the child again.
-        for event in woke {
+        for event in &woke {
             tracer.fired(event, pid);
         }
     }

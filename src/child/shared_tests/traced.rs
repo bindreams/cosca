@@ -160,7 +160,7 @@ fn a_tracer_that_attaches_during_a_wait_wakes_it(#[fixture(tracer_group)] _group
     let helper = Rc::new(RefCell::new(None));
     let stdin = RefCell::new(Some(stdin));
     let attach_woke = Rc::new(Cell::new(None));
-    let kq = Rc::new(nix::sys::event::Kqueue::new().expect("kqueue"));
+    let kq = Rc::new(crate::os_process::macos::kqueue::Kqueue::new().expect("kqueue"));
     let _rounds = super::macos::on_rounds(&kq, {
         let (helper, attach_woke) = (Rc::clone(&helper), Rc::clone(&attach_woke));
         move |round, kq| match round {
@@ -209,7 +209,7 @@ fn a_wait_on_a_child_whose_tracer_is_traced_watches_that_tracers_tracer(#[fixtur
     let outer_pid = outer.helper_pid();
     let stdin = RefCell::new(Some(stdin));
     let watched = Rc::new(Cell::new(None));
-    let kq = Rc::new(nix::sys::event::Kqueue::new().expect("kqueue"));
+    let kq = Rc::new(crate::os_process::macos::kqueue::Kqueue::new().expect("kqueue"));
     let _rounds = super::macos::on_rounds(&kq, {
         let watched = Rc::clone(&watched);
         move |round, kq| match round {

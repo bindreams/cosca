@@ -1,18 +1,21 @@
-//! Unit tests for the shared kqueue arm/drain primitives (macOS CI-only).
+//! Unit tests for the `Kqueue` type and the blocking `kevent` loop (macOS CI-only).
 
+use std::os::fd::AsRawFd as _;
+
+use super::{Event, Kqueue, Subscription};
 use crate::identity::ProcessId;
 
 #[skuld::test]
-fn drain_reports_none_when_no_event_pending() {
+fn poll_reports_nothing_while_the_process_lives() {
     // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
-    // Alive until this test kills it: the arm-then-drain checks below need that.
+    // Alive until this test kills it: the arm-then-poll checks below need that.
     let mut child = crate::test_spawn::spawn(&mut crate::test_child::held_std_blocker(std::process::Stdio::null()))
         .expect("spawn blocker");
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
     let kq = super::arm_proc_exit(id).expect("arm").expect("a live child arms");
     assert!(
-        super::drain_proc_exit(&kq).expect("drain").is_none(),
-        "no exit event yet must drain to None (spurious-readiness input)"
+        kq.poll().expect("poll").is_empty(),
+        "no exit event yet must poll to nothing (spurious-readiness input)"
     );
     child.kill().expect("cleanup");
     child.wait().expect("reap");
@@ -28,7 +31,6 @@ fn drain_reports_none_when_no_event_pending() {
 #[should_panic(expected = "no progress")]
 fn block_on_kqueue_panics_when_its_advance_is_dropped() {
     use crate::wait::test_clock::{FrozenClockGuard, SkipAdvanceGuard};
-    use nix::sys::event::Kqueue;
     use std::time::Duration;
 
     let kq = Kqueue::new().expect("kqueue");
@@ -51,7 +53,6 @@ fn block_on_kqueue_panics_when_its_advance_is_dropped() {
 #[skuld::test]
 fn block_on_kqueue_terminates_under_a_frozen_clock() {
     use crate::wait::test_clock::FrozenClockGuard;
-    use nix::sys::event::Kqueue;
     use std::time::Duration;
 
     let kq = Kqueue::new().expect("kqueue");
@@ -69,7 +70,6 @@ fn block_on_kqueue_terminates_under_a_frozen_clock() {
 #[skuld::test]
 fn a_remaining_time_above_the_clamp_is_rearmed_in_pieces() {
     use crate::wait::test_clock::{advance, FrozenClockGuard, ZeroElapsedGuard};
-    use nix::sys::event::Kqueue;
     use std::time::Duration;
 
     let kq = Kqueue::new().expect("kqueue");
@@ -123,7 +123,6 @@ fn the_clamp_override_rejects_a_value_above_the_kevent_limit() {
 #[skuld::test]
 #[should_panic(expected = "exceeds XNU's INT32_MAX limit")]
 fn a_forced_timeout_above_the_kevent_limit_is_rejected() {
-    use nix::sys::event::Kqueue;
     use std::time::Duration;
 
     let kq = Kqueue::new().expect("kqueue");
@@ -189,7 +188,6 @@ fn a_zero_return_is_a_rearm_only_after_a_full_cap_timeout() {
 #[skuld::test]
 fn a_zero_return_with_time_left_is_logged_by_kind() {
     use crate::wait::test_clock::{advance, FrozenClockGuard, ZeroElapsedGuard};
-    use nix::sys::event::Kqueue;
     use std::time::Duration;
 
     crate::log_capture::install();
@@ -216,4 +214,514 @@ fn a_zero_return_with_time_left_is_logged_by_kind() {
     };
     assert_eq!(levels(REARM), [log::Level::Debug]);
     assert_eq!(levels(EARLY), [log::Level::Warn]);
+}
+
+/// Blocks until `kq`'s descriptor reports something pending: the real condition, with no timeout.
+fn wait_readable(kq: &Kqueue) {
+    let mut fd = libc::pollfd {
+        fd: kq.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: one valid `pollfd`.
+        let n = unsafe { libc::poll(&mut fd, 1, -1) };
+        if n == 1 {
+            return;
+        }
+        let e = std::io::Error::last_os_error();
+        assert!(n == -1 && e.raw_os_error() == Some(libc::EINTR), "poll: {e}");
+    }
+}
+
+/// Reads `kq` whenever it turns readable, accumulating events until `done` holds for all so far.
+fn poll_until(kq: &Kqueue, mut done: impl FnMut(&[Event]) -> bool) -> Vec<Event> {
+    let mut seen = Vec::new();
+    loop {
+        wait_readable(kq);
+        seen.extend(kq.poll().expect("poll"));
+        if done(&seen) {
+            return seen;
+        }
+    }
+}
+
+fn exited(seen: &[Event], pid: u32) -> bool {
+    seen.iter()
+        .any(|e| matches!(e, Event::Process { pid: p, exited: true, .. } if *p == pid))
+}
+
+fn spawn_blocker() -> std::process::Child {
+    crate::test_spawn::spawn(&mut crate::test_child::held_std_blocker(std::process::Stdio::null()))
+        .expect("spawn blocker")
+}
+
+fn no_events() -> Vec<Event> {
+    Vec::new()
+}
+
+/// The errno of a kernel refusal: an `Error::Io` carrying it raw, or the test fails.
+fn refusal(result: Result<(), crate::error::Error>) -> i32 {
+    match result {
+        Err(crate::error::Error::Io(e)) => e.raw_os_error().expect("a refusal names its errno"),
+        other => panic!("expected the kernel's refusal, got {other:?}"),
+    }
+}
+
+#[skuld::test]
+fn a_process_subscription_on_a_pid_that_names_no_process_is_refused_with_esrch() {
+    // macOS pids stay below PID_MAX (99999), so this never names a process, and `proc_find` fails.
+    let pid = i32::MAX as u32;
+    let kq = Kqueue::new().expect("kqueue");
+    let refused = kq.subscribe(Subscription::Process {
+        pid,
+        signals: false,
+        reap: false,
+    });
+    assert_eq!(refusal(refused), libc::ESRCH);
+}
+
+#[skuld::test]
+fn a_readable_subscription_on_an_fd_that_is_not_open_is_refused_with_ebadf() {
+    // Far above any descriptor limit, so never open. A just-closed fd is not: the next open, such
+    // as the kqueue's own, takes its number.
+    let fd = std::os::fd::RawFd::MAX;
+    let kq = Kqueue::new().expect("kqueue");
+    let refused = kq.subscribe(Subscription::Readable { fd, low_water: 1 });
+    assert_eq!(refusal(refused), libc::EBADF);
+}
+
+#[skuld::test]
+fn a_process_subscription_reports_the_exit() {
+    let mut child = spawn_blocker();
+    let pid = child.id();
+    let kq = Kqueue::new().expect("kqueue");
+    let sub = Subscription::Process {
+        pid,
+        signals: false,
+        reap: false,
+    };
+    kq.subscribe(sub).expect("subscribe");
+    child.kill().expect("kill");
+    poll_until(&kq, |seen| exited(seen, pid));
+    child.wait().expect("reap");
+}
+
+#[skuld::test]
+fn a_signals_subscription_reports_a_signal_before_the_exit() {
+    let mut child = spawn_blocker();
+    let pid = child.id();
+    let kq = Kqueue::new().expect("kqueue");
+    let sub = Subscription::Process {
+        pid,
+        signals: true,
+        reap: false,
+    };
+    kq.subscribe(sub).expect("subscribe");
+    // SAFETY: `kill` with a live child's pid and a valid signal.
+    assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) }, 0);
+    let seen = poll_until(&kq, |seen| exited(seen, pid));
+    // The signal was posted before the exit: in an earlier event, or merged into the exit's.
+    assert!(
+        seen.iter().any(|e| matches!(e, Event::Process { signalled: true, .. })),
+        "{seen:?}"
+    );
+    child.wait().expect("reap");
+}
+
+#[skuld::test]
+fn a_reap_subscription_reports_the_reap() {
+    let mut child = spawn_blocker();
+    let pid = child.id();
+    let kq = Kqueue::new().expect("kqueue");
+    let sub = Subscription::Process {
+        pid,
+        signals: false,
+        reap: true,
+    };
+    kq.subscribe(sub).expect("subscribe");
+    child.kill().expect("kill");
+    child.wait().expect("reap");
+    poll_until(&kq, |seen| {
+        seen.iter()
+            .any(|e| matches!(e, Event::Process { pid: p, reaped: true, .. } if *p == pid))
+    });
+}
+
+#[skuld::test]
+fn a_readable_subscription_reports_bytes_once_per_change() {
+    use std::io::Write as _;
+
+    let (reader, mut writer) = std::io::pipe().expect("pipe");
+    let fd = reader.as_raw_fd();
+    let kq = Kqueue::new().expect("kqueue");
+    let sub = Subscription::Readable { fd, low_water: 1 };
+    kq.subscribe(sub).expect("subscribe");
+    writer.write_all(b"abc").expect("write");
+    wait_readable(&kq);
+    assert_eq!(
+        kq.poll().expect("poll"),
+        [Event::Readable {
+            fd,
+            bytes: 3,
+            closed: false
+        }]
+    );
+    assert_eq!(kq.poll().expect("poll again"), no_events());
+}
+
+#[skuld::test]
+fn a_readable_subscription_holds_below_its_low_water() {
+    use std::io::Write as _;
+
+    let (reader, mut writer) = std::io::pipe().expect("pipe");
+    let fd = reader.as_raw_fd();
+    let kq = Kqueue::new().expect("kqueue");
+    let sub = Subscription::Readable { fd, low_water: 4 };
+    kq.subscribe(sub).expect("subscribe");
+    writer.write_all(b"a").expect("write one byte");
+    assert_eq!(kq.poll().expect("poll"), no_events());
+    writer.write_all(b"bcd").expect("write three more");
+    wait_readable(&kq);
+    assert_eq!(
+        kq.poll().expect("poll"),
+        [Event::Readable {
+            fd,
+            bytes: 4,
+            closed: false
+        }]
+    );
+}
+
+#[skuld::test]
+fn a_readable_subscription_reports_the_close() {
+    let (reader, writer) = std::io::pipe().expect("pipe");
+    let fd = reader.as_raw_fd();
+    let kq = Kqueue::new().expect("kqueue");
+    let sub = Subscription::Readable { fd, low_water: 1 };
+    kq.subscribe(sub).expect("subscribe");
+    drop(writer);
+    wait_readable(&kq);
+    let events = kq.poll().expect("poll");
+    assert!(
+        matches!(events.as_slice(), [Event::Readable { fd: f, closed: true, .. }] if *f == fd),
+        "{events:?}"
+    );
+}
+
+const SIGNAL_COUNT_MARKER: &str = "COSCA_TEST_KQUEUE_SIGNAL_COUNT";
+const SIGNAL_COUNT_CASE: &str = "COSCA_TEST_KQUEUE_SIGNAL_COUNT_CASE";
+
+/// Runs re-exec'd: it ignores `SIGUSR1` process-wide.
+#[skuld::test]
+fn a_signal_subscription_counts_deliveries() {
+    const DELIVERIES: usize = 3;
+
+    if !crate::test_child::is_marked_fixture_reexec(SIGNAL_COUNT_MARKER) {
+        return crate::test_child::run_fixture_case(
+            crate::test_child::fixture_path!(a_signal_subscription_counts_deliveries),
+            SIGNAL_COUNT_MARKER,
+            SIGNAL_COUNT_CASE,
+            "",
+        );
+    }
+    crate::test_child::set_signal_ignored(libc::SIGUSR1, true);
+    let kq = Kqueue::new().expect("kqueue");
+    kq.subscribe(Subscription::Signal(libc::SIGUSR1)).expect("subscribe");
+    for _ in 0..DELIVERIES {
+        // SAFETY: `kill` of this process with a valid signal, which is ignored.
+        assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGUSR1) }, 0);
+    }
+    wait_readable(&kq);
+    assert_eq!(
+        kq.poll().expect("poll"),
+        [Event::Signal {
+            signo: libc::SIGUSR1,
+            count: DELIVERIES
+        }]
+    );
+}
+
+#[skuld::test]
+fn unsubscribe_stops_the_reports() {
+    use std::io::Write as _;
+
+    let kq = Kqueue::new().expect("kqueue");
+
+    let (reader, mut writer) = std::io::pipe().expect("pipe");
+    let readable = Subscription::Readable {
+        fd: reader.as_raw_fd(),
+        low_water: 1,
+    };
+    kq.subscribe(readable).expect("subscribe");
+    kq.unsubscribe(readable).expect("unsubscribe");
+    writer.write_all(b"abc").expect("write");
+    assert_eq!(kq.poll().expect("poll"), no_events());
+}
+
+#[skuld::test]
+fn unsubscribing_a_delivered_exit_fails_with_enoent() {
+    let kq = Kqueue::new().expect("kqueue");
+    let mut child = spawn_blocker();
+    let pid = child.id();
+    let process = Subscription::Process {
+        pid,
+        signals: false,
+        reap: false,
+    };
+    kq.subscribe(process).expect("subscribe");
+    child.kill().expect("kill");
+    poll_until(&kq, |seen| exited(seen, pid));
+    child.wait().expect("reap");
+    assert_eq!(refusal(kq.unsubscribe(process)), libc::ENOENT);
+}
+
+#[skuld::test]
+fn unsubscribing_a_never_registered_subscription_fails_with_enoent() {
+    let (reader, _writer) = std::io::pipe().expect("pipe");
+    let readable = Subscription::Readable {
+        fd: reader.as_raw_fd(),
+        low_water: 1,
+    };
+    let kq = Kqueue::new().expect("kqueue");
+    assert_eq!(refusal(kq.unsubscribe(readable)), libc::ENOENT);
+}
+
+/// `count` pipes each written once and subscribed on one queue: a single `poll` takes all of their
+/// events, however many reads that is, and the next finds none.
+fn poll_takes_every_event(count: usize) {
+    use std::io::Write as _;
+
+    let kq = Kqueue::new().expect("kqueue");
+    let mut pipes = Vec::new();
+    for _ in 0..count {
+        let (reader, mut writer) = std::io::pipe().expect("pipe");
+        let fd = reader.as_raw_fd();
+        kq.subscribe(Subscription::Readable { fd, low_water: 1 })
+            .expect("subscribe");
+        writer.write_all(b"x").expect("write");
+        pipes.push((reader, writer));
+    }
+    wait_readable(&kq);
+    let mut got: Vec<_> = kq
+        .poll()
+        .expect("poll")
+        .into_iter()
+        .map(|e| match e {
+            Event::Readable {
+                fd,
+                bytes: 1,
+                closed: false,
+            } => fd,
+            other => panic!("unexpected {other:?}"),
+        })
+        .collect();
+    got.sort_unstable();
+    let mut want: Vec<_> = pipes.iter().map(|(reader, _)| reader.as_raw_fd()).collect();
+    want.sort_unstable();
+    assert_eq!(got, want);
+    assert_eq!(kq.poll().expect("poll again"), no_events());
+}
+
+#[skuld::test]
+fn poll_takes_every_event_when_the_last_batch_is_short() {
+    poll_takes_every_event(super::POLL_BATCH + 1);
+}
+
+#[skuld::test]
+fn poll_takes_every_event_when_the_last_batch_is_full() {
+    poll_takes_every_event(super::POLL_BATCH);
+}
+
+#[skuld::test]
+fn poll_on_an_empty_queue_is_empty() {
+    assert_eq!(Kqueue::new().expect("kqueue").poll().expect("poll"), no_events());
+}
+
+#[skuld::test]
+fn from_kevent_maps_each_filter() {
+    use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent};
+
+    let map = |ev: KEvent| Event::from_kevent(&ev);
+
+    for bits in 0u8..8 {
+        let (exit, signal, reap) = (bits & 1 != 0, bits & 2 != 0, bits & 4 != 0);
+        let mut fflags = FilterFlag::empty();
+        if exit {
+            fflags |= FilterFlag::NOTE_EXIT;
+        }
+        if signal {
+            fflags |= FilterFlag::NOTE_SIGNAL;
+        }
+        if reap {
+            fflags |= FilterFlag::from_bits_retain(super::NOTE_REAP);
+        }
+        let ev = KEvent::new(4242, EventFilter::EVFILT_PROC, EvFlags::empty(), fflags, 0, 0);
+        assert_eq!(
+            map(ev),
+            Some(Event::Process {
+                pid: 4242,
+                exited: exit,
+                signalled: signal,
+                reaped: reap
+            }),
+            "fflags {fflags:?}"
+        );
+    }
+
+    for (flags, closed) in [(EvFlags::empty(), false), (EvFlags::EV_EOF, true)] {
+        let ev = KEvent::new(7, EventFilter::EVFILT_READ, flags, FilterFlag::empty(), 3, 0);
+        assert_eq!(
+            map(ev),
+            Some(Event::Readable {
+                fd: 7,
+                bytes: 3,
+                closed
+            })
+        );
+    }
+
+    let ev = KEvent::new(
+        libc::SIGCHLD as usize,
+        EventFilter::EVFILT_SIGNAL,
+        EvFlags::empty(),
+        FilterFlag::empty(),
+        2,
+        0,
+    );
+    assert_eq!(
+        map(ev),
+        Some(Event::Signal {
+            signo: libc::SIGCHLD,
+            count: 2
+        })
+    );
+}
+
+/// A read or signal event whose `data` is negative, which no kernel reports.
+#[cfg(debug_assertions)]
+#[skuld::test]
+#[should_panic(expected = "never negative")]
+fn a_negative_read_count_breaks_the_contract() {
+    use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent};
+
+    let ev = KEvent::new(
+        7,
+        EventFilter::EVFILT_READ,
+        EvFlags::empty(),
+        FilterFlag::empty(),
+        -1,
+        0,
+    );
+    Event::from_kevent(&ev);
+}
+
+#[cfg(debug_assertions)]
+#[skuld::test]
+#[should_panic(expected = "never negative")]
+fn a_negative_signal_count_breaks_the_contract() {
+    use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent};
+
+    let ev = KEvent::new(
+        libc::SIGUSR1 as usize,
+        EventFilter::EVFILT_SIGNAL,
+        EvFlags::empty(),
+        FilterFlag::empty(),
+        -1,
+        0,
+    );
+    Event::from_kevent(&ev);
+}
+
+/// A filter no subscription asks for: the backoff timer, which a `Kqueue` never holds.
+#[cfg(debug_assertions)]
+#[skuld::test]
+#[should_panic(expected = "no subscription asked for")]
+fn an_event_of_an_unnamed_filter_breaks_the_contract() {
+    use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent};
+
+    let ev = KEvent::new(
+        1,
+        EventFilter::EVFILT_TIMER,
+        EvFlags::empty(),
+        FilterFlag::empty(),
+        0,
+        0,
+    );
+    Event::from_kevent(&ev);
+}
+
+/// An `EV_ERROR` event, which the kernel sets only while attaching a knote and reports through the
+/// registration's `EV_RECEIPT`, so a read never carries it.
+#[cfg(debug_assertions)]
+#[skuld::test]
+#[should_panic(expected = "no subscription asked for")]
+fn an_ev_error_event_breaks_the_contract() {
+    use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent};
+
+    let ev = KEvent::new(
+        9,
+        EventFilter::EVFILT_READ,
+        EvFlags::EV_ERROR,
+        FilterFlag::empty(),
+        libc::EBADF as isize,
+        0,
+    );
+    Event::from_kevent(&ev);
+}
+
+/// Without `debug_assertions` a negative count is clamped to 0, and an unnamed filter or an
+/// `EV_ERROR` event is dropped, each with a warning.
+#[cfg(not(debug_assertions))]
+#[skuld::test]
+fn release_warns_about_a_negative_count_an_unnamed_filter_and_an_ev_error_event() {
+    use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent};
+
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let negative = KEvent::new(
+        7,
+        EventFilter::EVFILT_READ,
+        EvFlags::empty(),
+        FilterFlag::empty(),
+        -1,
+        0,
+    );
+    assert_eq!(
+        Event::from_kevent(&negative),
+        Some(Event::Readable {
+            fd: 7,
+            bytes: 0,
+            closed: false
+        })
+    );
+    let timer = KEvent::new(
+        1,
+        EventFilter::EVFILT_TIMER,
+        EvFlags::empty(),
+        FilterFlag::empty(),
+        0,
+        0,
+    );
+    assert_eq!(Event::from_kevent(&timer), None);
+    let failed = KEvent::new(
+        9,
+        EventFilter::EVFILT_READ,
+        EvFlags::EV_ERROR,
+        FilterFlag::empty(),
+        libc::EBADF as isize,
+        0,
+    );
+    assert_eq!(Event::from_kevent(&failed), None);
+    let levels = |marker| {
+        crate::log_capture::records_since_on_current_thread(mark, marker)
+            .into_iter()
+            .map(|(level, _)| level)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(levels("negative data field"), [log::Level::Warn]);
+    assert_eq!(
+        levels("no subscription asked for"),
+        [log::Level::Warn, log::Level::Warn]
+    );
 }

@@ -4,12 +4,11 @@
 
 use std::time::Duration;
 
-use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
-
 use super::{seams::force_links, OnTracer, TracerWatch, WalkError};
 use crate::child::spawn::identity_macos_tests::{other_unique_id, std_blocker_with_unique};
 use crate::identity::{uniq_fault, Link, ReadPurpose, UniqRead};
 use crate::os_process::macos::kqueue::test_hooks::{event_pending, send_signal};
+use crate::os_process::macos::kqueue::{Event, Kqueue};
 
 /// A live blocker on a held stdin, and its unique id. Dropping it ends and reaps the blocker.
 struct Live {
@@ -60,17 +59,7 @@ impl Drop for Live {
 
 /// Takes every pending event off `kq`.
 fn drain(kq: &Kqueue) {
-    let blank = KEvent::new(0, EventFilter::EVFILT_PROC, EvFlags::empty(), FilterFlag::empty(), 0, 0);
-    let mut events = [blank; 8];
-    while kq
-        .kevent(
-            &[],
-            &mut events,
-            Some(crate::os_process::macos::kqueue::kevent_timeout(Duration::ZERO)),
-        )
-        .expect("drain the kqueue")
-        > 0
-    {}
+    kq.poll().expect("drain the kqueue");
 }
 
 /// Whether a registration on `pid` exists: a `SIGCONT` to it is reported on `kq`.
@@ -165,14 +154,12 @@ fn a_tracer_is_registered_again_after_its_note_exit() {
     let links = force_links([tracer.untraced(), tracer.untraced()]);
     assert_eq!(walk(&mut watch, &kq, tracer.pid()), OnTracer::Recheck(Duration::ZERO));
     assert_eq!(walk(&mut watch, &kq, tracer.pid()), OnTracer::Block);
-    let exit = KEvent::new(
-        tracer.pid() as usize,
-        EventFilter::EVFILT_PROC,
-        EvFlags::empty(),
-        FilterFlag::NOTE_EXIT,
-        0,
-        0,
-    );
+    let exit = Event::Process {
+        pid: tracer.pid(),
+        exited: true,
+        signalled: false,
+        reaped: false,
+    };
     assert!(
         watch.fired(&exit, std::process::id()),
         "a tracer's exit is the watch's event"

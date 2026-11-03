@@ -39,12 +39,12 @@
 use std::io;
 use std::time::{Duration, Instant};
 
-use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
+use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent};
 
 use super::{OnTracer, TracerWatch};
 #[cfg(test)]
 use crate::os_process::macos::kqueue::test_hooks;
-use crate::os_process::macos::kqueue::{add_with_receipt, kevent_timeout};
+use crate::os_process::macos::kqueue::{kevent_timeout, Event, Kqueue, Subscription};
 use crate::wait::exit_only::{self, Foreign, Peek, Target};
 
 /// The wait's verdict.
@@ -71,40 +71,23 @@ fn blank() -> KEvent {
     KEvent::new(0, EventFilter::EVFILT_PROC, EvFlags::empty(), FilterFlag::empty(), 0, 0)
 }
 
-// xnu `sys/event.h`. Spelled locally: libc dropped `NOTE_REAP` in 0.2.190.
-const NOTE_REAP: u32 = 0x1000_0000;
-
 /// Register `EVFILT_SIGNAL` for `SIGCHLD` and `EVFILT_PROC` for `pid`. `Ok(true)` when the
 /// `EVFILT_PROC` receipt says `ESRCH` (the child is already past `P_REF_DEAD`).
 fn register(kq: &Kqueue, pid: u32) -> io::Result<bool> {
-    let signal = KEvent::new(
-        libc::SIGCHLD as usize,
-        EventFilter::EVFILT_SIGNAL,
-        EvFlags::EV_ADD | EvFlags::EV_RECEIPT | EvFlags::EV_CLEAR,
-        FilterFlag::empty(),
-        0,
-        0,
-    );
-    let added = add_with_receipt(kq, signal).map_err(into_io)?;
-    if added != 0 {
-        return Err(io::Error::from_raw_os_error(added as i32));
-    }
+    kq.subscribe(Subscription::Signal(libc::SIGCHLD)).map_err(into_io)?;
     #[cfg(test)]
     if test_hooks::take_forced_esrch_registration() {
         return Ok(true);
     }
-    let proc_exit = KEvent::new(
-        pid as usize,
-        EventFilter::EVFILT_PROC,
-        EvFlags::EV_ADD | EvFlags::EV_RECEIPT | EvFlags::EV_CLEAR,
-        FilterFlag::NOTE_EXIT | FilterFlag::from_bits_retain(NOTE_REAP) | FilterFlag::NOTE_SIGNAL,
-        0,
-        0,
-    );
-    match add_with_receipt(kq, proc_exit).map_err(into_io)? {
-        0 => Ok(false),
-        e if e == libc::ESRCH as i64 => Ok(true),
-        e => Err(io::Error::from_raw_os_error(e as i32)),
+    let child = Subscription::Process {
+        pid,
+        signals: true,
+        reap: true,
+    };
+    match kq.subscribe(child) {
+        Ok(()) => Ok(false),
+        Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Ok(true),
+        Err(e) => Err(into_io(e)),
     }
 }
 
@@ -149,15 +132,22 @@ fn drain_for_reap(kq: &Kqueue, events: &mut [KEvent; BATCH], pid: u32, tracer: &
 /// tracer, and a tracer's exit are neither: they only wake the wait to peek again.
 fn scan(events: &[KEvent], pid: u32, tracer: &mut TracerWatch) -> (bool, bool) {
     let (mut reap, mut exit) = (false, false);
-    for event in events {
+    for raw in events {
         #[cfg(test)]
-        test_hooks::record_event(event.filter().map_or(0, |f| f as i16), event.fflags().bits());
-        if tracer.fired(event, pid) {
+        test_hooks::record_event(raw.filter().map_or(0, |f| f as i16), raw.fflags().bits());
+        // The backoff timer is this module's own registration, not a `Kqueue` subscription.
+        if matches!(raw.filter(), Ok(EventFilter::EVFILT_TIMER)) {
             continue;
         }
-        if event.filter() == Ok(EventFilter::EVFILT_PROC) {
-            reap |= event.fflags().bits() & NOTE_REAP != 0;
-            exit |= event.fflags().contains(FilterFlag::NOTE_EXIT);
+        let Some(event) = Event::from_kevent(raw) else {
+            continue;
+        };
+        if tracer.fired(&event, pid) {
+            continue;
+        }
+        if let Event::Process { exited, reaped, .. } = event {
+            reap |= reaped;
+            exit |= exited;
         }
     }
     (reap, exit)
@@ -218,7 +208,7 @@ fn kevent_round(kq: &Kqueue, events: &mut [KEvent; BATCH], block: Block) -> io::
         }
         #[cfg(test)]
         let started = Instant::now();
-        let result = kq.kevent(&[], events, timeout);
+        let result = kq.native().kevent(&[], events, timeout);
         #[cfg(test)]
         crate::wait::test_clock::advance_by_elapsed_if_frozen(started.elapsed());
         match result {
@@ -351,7 +341,15 @@ pub(crate) fn drain_exit_events(kq: &Kqueue, pid: u32, tracer: &mut TracerWatch)
     let mut events = [blank(); BATCH];
     let (mut reaped, mut exited) = (false, false);
     loop {
-        let n = kevent_round(kq, &mut events, Block::Poll)?;
+        // A verdict from an earlier round stands over a later failure: nothing reports it again.
+        let n = match kevent_round(kq, &mut events, Block::Poll) {
+            Ok(n) => n,
+            Err(e) if reaped || exited => {
+                log::warn!("wait: reading pid {pid}'s kqueue failed after its exit was read: {e}");
+                return Ok((reaped, exited));
+            }
+            Err(e) => return Err(e),
+        };
         let (reap, exit) = scan(&events[..n], pid, tracer);
         reaped |= reap;
         exited |= exit;
@@ -379,12 +377,15 @@ pub(crate) fn arm_backoff_timer(kq: &Kqueue, interval: Duration) -> io::Result<(
         0,
     );
     let mut none: [KEvent; 0] = [];
-    kq.kevent(&[timer], &mut none, None).map(drop).map_err(io::Error::from)
+    kq.native()
+        .kevent(&[timer], &mut none, None)
+        .map(drop)
+        .map_err(io::Error::from)
 }
 
 /// [`await_reapable_on`] on a kqueue of its own.
 pub(crate) fn await_reapable(pid: u32, unique: Option<u64>, deadline: Option<Instant>) -> io::Result<Waited> {
-    let kq = Kqueue::new().map_err(io::Error::from)?;
+    let kq = Kqueue::new().map_err(into_io)?;
     await_reapable_on(&kq, pid, unique, deadline)
 }
 

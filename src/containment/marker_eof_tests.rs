@@ -218,11 +218,8 @@ fn block_until_drained_with_a_past_deadline_still_reports_an_already_drained_tre
 
 #[skuld::test]
 fn arm_on_an_invalid_descriptor_reports_an_io_error() {
-    // Exercises `ensure_nonblocking`'s guard inside `arm` — the actual reachable failure mode
-    // for a bad descriptor. `add_with_receipt`'s own EV_ERROR branch (for EVFILT_READ,
-    // via `arm`) has no test anywhere in this module: a descriptor that passes
-    // `ensure_nonblocking`'s fcntl check yet still fails kqueue's EV_ADD is not something this
-    // module found a reliable, portable way to construct.
+    // Exercises `ensure_nonblocking`'s guard inside `arm`, the failure a bad descriptor reaches
+    // first. `Kqueue::subscribe`'s refusal of a closed descriptor is tested in `kqueue_tests`.
     let err = super::arm(never_allocated_fd(), false).expect_err("arming an invalid descriptor must error");
     assert!(
         matches!(err, crate::error::Error::Io(_)),
@@ -691,42 +688,24 @@ fn fill_pipe_to_capacity(r: BorrowedFd<'_>, w: BorrowedFd<'_>) -> i32 {
 }
 
 /// Whether `kq_fd` — assumed to be a kqueue's own fd, itself pollable — is ALREADY readable,
-/// checked with a zero-timeout `kevent` on a brand-new, separate probe kqueue registered for
-/// `EVFILT_READ` on it. Non-consuming: this touches only the probe kqueue's own queue, never
-/// `kq_fd`'s pending events or registrations.
+/// checked with a non-blocking `poll` of a brand-new, separate probe kqueue subscribed to it.
+/// Non-consuming: this touches only the probe kqueue's own queue, never `kq_fd`'s pending events
+/// or registrations.
 #[cfg(feature = "tokio")]
 fn kqueue_fd_is_already_readable(kq_fd: std::os::fd::RawFd) -> bool {
-    use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
+    use crate::os_process::macos::kqueue::{Kqueue, Subscription};
 
     let probe_kq = Kqueue::new().expect("probe kqueue");
-    let change = KEvent::new(
-        kq_fd as usize,
-        EventFilter::EVFILT_READ,
-        EvFlags::EV_ADD | EvFlags::EV_RECEIPT,
-        FilterFlag::empty(),
-        0,
-        0,
-    );
-    let add_result =
-        crate::os_process::macos::kqueue::add_with_receipt(&probe_kq, change).expect("register the probe knote");
-    assert_eq!(
-        add_result, 0,
-        "registering EVFILT_READ on the watched kqueue's own fd failed: errno {add_result}"
-    );
-
-    let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    let mut events = [KEvent::new(
-        0,
-        EventFilter::EVFILT_READ,
-        EvFlags::empty(),
-        FilterFlag::empty(),
-        0,
-        0,
-    )];
-    let n = probe_kq
-        .kevent(&[], &mut events, Some(zero))
-        .expect("zero-timeout poll of the probe kqueue");
-    n > 0
+    probe_kq
+        .subscribe(Subscription::Readable {
+            fd: kq_fd,
+            low_water: 1,
+        })
+        .expect("register the probe knote");
+    !probe_kq
+        .poll()
+        .expect("non-blocking poll of the probe kqueue")
+        .is_empty()
 }
 
 #[cfg(feature = "tokio")]

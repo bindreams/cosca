@@ -297,21 +297,20 @@ async fn death_watch_loop_survives_a_non_exit_drain_cycle() {
     let kq = crate::os_process::macos::kqueue::arm_proc_exit(target_id)
         .expect("arm target")
         .expect("a live target arms");
-    // Arm the decoy on the SAME kqueue, through the production receipt dance.
-    assert!(
-        crate::os_process::macos::kqueue::arm_note_exit_on(&kq, decoy.id())
-            .expect("arm decoy")
-            .is_some(),
-        "a live decoy arms"
-    );
+    // Arm the decoy on the SAME kqueue.
+    let decoy_exit = crate::os_process::macos::kqueue::Subscription::Process {
+        pid: decoy.id(),
+        signals: false,
+        reap: false,
+    };
+    kq.subscribe(decoy_exit).expect("a live decoy arms");
     decoy.kill().expect("kill decoy"); // the first, non-target wake
 
-    let afd = ::tokio::io::unix::AsyncFd::with_interest(super::KqueueFd(kq), ::tokio::io::Interest::READABLE)
-        .expect("register");
+    let afd = ::tokio::io::unix::AsyncFd::with_interest(kq, ::tokio::io::Interest::READABLE).expect("register");
     let target_cell = std::cell::RefCell::new(None);
     let mut pending = Some(target);
     let watch = super::watch_readable(&afd, |kq| {
-        let drained = crate::os_process::macos::kqueue::drain_proc_exit(kq)?;
+        let drained = (!kq.poll()?.is_empty()).then_some(());
         if let Some(mut t) = pending.take() {
             // First cycle (the decoy's event, consumed above): report "no exit" so the loop
             // clear_readys and re-awaits; only NOW create the target's exit event.
