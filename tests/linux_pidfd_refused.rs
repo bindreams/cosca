@@ -47,13 +47,13 @@ fn a_seccomp_refused_pidfd_open_is_unsupported_for_every_operation() {
             scope
                 .spawn(|| {
                     common::seccomp::deny_pidfd_open_on_this_thread(code);
-                    assert_refused(process.wait(), "process wait", name);
-                    assert_refused(process.wait_timeout(Duration::ZERO), "process wait", name);
-                    assert_refused(process.kill(), "process kill", name);
-                    assert_refused(process.terminate(), "process terminate", name);
-                    assert_refused(process.graceful_shutdown(Duration::ZERO), "process terminate", name);
-                    assert_refused(child.terminate(), "process terminate", name);
-                    assert_refused(child.graceful_shutdown(Duration::ZERO), "process terminate", name);
+                    assert_refused(process.wait(), "process open", name);
+                    assert_refused(process.wait_timeout(Duration::ZERO), "process open", name);
+                    assert_refused(process.kill(), "process open", name);
+                    assert_refused(process.terminate(), "process open", name);
+                    assert_refused(process.graceful_shutdown(Duration::ZERO), "process open", name);
+                    assert_refused(child.terminate(), "process open", name);
+                    assert_refused(child.graceful_shutdown(Duration::ZERO), "process open", name);
                     // An owned child is killed through its own handle: no pidfd, so no refusal.
                     child.kill().expect("Child::kill needs no pidfd_open");
                 })
@@ -82,19 +82,15 @@ fn a_seccomp_refused_pidfd_open_is_unsupported_for_every_async_operation() {
                         .build()
                         .expect("runtime");
                     runtime.block_on(async {
-                        assert_refused(process.wait().await, "process wait", name);
+                        assert_refused(process.wait().await, "process open", name);
                         assert_refused(
                             process.wait_timeout(Duration::from_secs(60)).await,
-                            "process wait",
+                            "process open",
                             name,
                         );
-                        assert_refused(process.kill(), "process kill", name);
-                        assert_refused(process.terminate(), "process terminate", name);
-                        assert_refused(
-                            process.graceful_shutdown(Duration::ZERO).await,
-                            "process terminate",
-                            name,
-                        );
+                        assert_refused(process.kill(), "process open", name);
+                        assert_refused(process.terminate(), "process open", name);
+                        assert_refused(process.graceful_shutdown(Duration::ZERO).await, "process open", name);
                     });
                 })
                 .join()

@@ -60,52 +60,33 @@ pub(crate) enum WaitFor<'a> {
     Signalled(BorrowedHandle<'a>),
 }
 
-/// The operation an [`open`] is for. It names the operation in `Unsupported` and `Unassessable`
-/// errors.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Op {
-    Wait,
-    Kill,
-    /// Windows has no per-process graceful signal, so nothing opens for it there.
-    #[cfg(unix)]
-    Terminate,
-    /// Signalling a process-group member during teardown.
-    #[cfg(target_os = "linux")]
-    GroupTeardown,
-}
-
-/// What [`OsProcess::exited`] returns on an object [`open`]ed for a signal, which holds nothing to
-/// wait on. Asking is a caller bug: a debug assertion, and in release this error.
-#[cfg(target_os = "macos")]
-fn opened_for_a_signal() -> Error {
-    debug_assert!(false, "exited() on a process opened for a signal, not a wait");
-    Error::Io(std::io::Error::other(
-        "this process was opened for a signal, not a wait; open it with Op::Wait to observe its exit",
-    ))
-}
+/// What is left undone when an [`open`] cannot go ahead, for the errors it returns: the one open
+/// serves every act on the process.
+#[cfg(unix)]
+pub(crate) const OPEN_CONSEQUENCE: &str = "its exit cannot be observed and no signal was sent";
 
 /// Open the process `id` names. `Ok(None)`: it is gone, or its pid now names another process.
-pub(crate) fn open(id: ProcessId, op: Op) -> Result<Option<Box<dyn OsProcess>>, Error> {
+pub(crate) fn open(id: ProcessId) -> Result<Option<Box<dyn OsProcess>>, Error> {
     #[cfg(target_os = "linux")]
-    return Ok(linux::open::open_verified(id, op)?
+    return Ok(linux::open::open_verified(id)?
         .map(|pidfd| Box::new(linux::LinuxProcess::new(id, pidfd)) as Box<dyn OsProcess>));
     #[cfg(windows)]
-    return Ok(windows::WindowsProcess::open(id, op)?.map(|p| Box::new(p) as Box<dyn OsProcess>));
+    return Ok(windows::WindowsProcess::open(id)?.map(|p| Box::new(p) as Box<dyn OsProcess>));
     #[cfg(target_os = "macos")]
-    return Ok(macos::MacProcess::open(id, op)?.map(|p| Box::new(p) as Box<dyn OsProcess>));
+    return Ok(macos::MacProcess::open(id)?.map(|p| Box::new(p) as Box<dyn OsProcess>));
 }
 
 /// Hard-kill the process `id` names, identity-verified. Already gone, or its pid now names another
 /// process: `Ok`.
 pub(crate) fn kill_by_id(id: ProcessId) -> Result<(), Error> {
-    signal_by_id(id, Op::Kill, Sig::Kill)
+    signal_by_id(id, Sig::Kill)
 }
 
 /// Send the graceful termination signal to the process `id` names, identity-verified, without
 /// waiting. Already gone: `Ok`. Windows has no such per-process signal: `Unsupported`.
 #[cfg(unix)]
 pub(crate) fn terminate_by_id(id: ProcessId) -> Result<(), Error> {
-    signal_by_id(id, Op::Terminate, Sig::Term)
+    signal_by_id(id, Sig::Term)
 }
 
 /// There is no [`Sig`] to send for it on Windows: `Unsupported`, with nothing opened.
@@ -114,8 +95,8 @@ pub(crate) fn terminate_by_id(_id: ProcessId) -> Result<(), Error> {
     Err(windows::terminate_unsupported())
 }
 
-fn signal_by_id(id: ProcessId, op: Op, sig: Sig) -> Result<(), Error> {
-    let Some(process) = open(id, op)? else {
+fn signal_by_id(id: ProcessId, sig: Sig) -> Result<(), Error> {
+    let Some(process) = open(id)? else {
         return Ok(());
     };
     // `Gone` and `Delivered` are both success: nothing is left for the caller to do.

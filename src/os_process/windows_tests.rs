@@ -6,20 +6,19 @@ use windows::Win32::System::Threading::CreateEventW;
 use crate::error::Error;
 use crate::identity::ProcessId;
 use crate::os_process::drive::{absolute, drive};
-use crate::os_process::{kill_by_id, open, terminate_by_id, Exit, Op, OsProcess as _, WaitFor};
+use crate::os_process::{kill_by_id, open, terminate_by_id, Exit, OsProcess as _, WaitFor};
 use crate::signal::{Sent, Sig};
 use crate::test_child::live_blocker as blocker;
 
-/// A kill and a wait on two objects opened for the same process (one open serves both from Task 4).
+/// One open: a look, a kill and a wait.
 #[skuld::test]
-fn open_live_then_kill_then_exited() {
+fn one_open_serves_look_signal_and_wait() {
     let (child, _stdin, id) = blocker();
-    let waiter = open(id, Op::Wait).unwrap().expect("a live process opens");
-    assert!(matches!(waiter.exited().unwrap(), Exit::Running(WaitFor::Signalled(_))));
-    assert!(!drive(&*waiter, absolute(Some(Duration::ZERO))).unwrap());
-    let killer = open(id, Op::Kill).unwrap().expect("a live process opens");
-    assert_eq!(killer.signal(Sig::Kill).unwrap(), Sent::Delivered);
-    assert!(drive(&*waiter, absolute(None)).unwrap());
+    let p = open(id).unwrap().expect("a live process opens");
+    assert!(matches!(p.exited().unwrap(), Exit::Running(WaitFor::Signalled(_))));
+    assert!(!drive(&*p, absolute(Some(Duration::ZERO))).unwrap());
+    assert_eq!(p.signal(Sig::Kill).unwrap(), Sent::Delivered);
+    assert!(drive(&*p, absolute(None)).unwrap());
     child.wait().unwrap();
 }
 
@@ -27,11 +26,11 @@ fn open_live_then_kill_then_exited() {
 fn open_with_wrong_start_token_is_none_and_sends_nothing() {
     let (child, _stdin, id) = blocker();
     let other = ProcessId::from_parts_for_test(id.pid(), id.start_token_raw() + 1);
-    assert!(open(other, Op::Kill).unwrap().is_none());
-    assert!(open(other, Op::Wait).unwrap().is_none());
+    assert!(open(other).unwrap().is_none());
+    assert!(open(other).unwrap().is_none());
     kill_by_id(other).expect("a stale identity is already gone");
     // Still running: the right identity opens and sees no exit.
-    let p = open(id, Op::Wait).unwrap().expect("the blocker is alive");
+    let p = open(id).unwrap().expect("the blocker is alive");
     assert!(!drive(&*p, absolute(Some(Duration::ZERO))).unwrap());
     child.kill().unwrap();
     child.wait().unwrap();
@@ -40,7 +39,7 @@ fn open_with_wrong_start_token_is_none_and_sends_nothing() {
 #[skuld::test]
 fn exited_before_first_look_returns_true() {
     let (child, _stdin, id) = blocker();
-    let p = open(id, Op::Wait).unwrap().expect("a live process opens");
+    let p = open(id).unwrap().expect("a live process opens");
     child.kill().unwrap();
     // `TerminateProcess` returns before the process object is signalled; the child's own wait is
     // the barrier.
@@ -61,7 +60,7 @@ fn kill_after_exit_is_ok() {
 #[skuld::test]
 fn signal_after_exit_is_gone() {
     let (child, _stdin, id) = blocker();
-    let p = open(id, Op::Kill).unwrap().expect("a live process opens");
+    let p = open(id).unwrap().expect("a live process opens");
     child.kill().unwrap();
     child.wait().unwrap();
     assert_eq!(p.signal(Sig::Kill).unwrap(), Sent::Gone);
@@ -89,7 +88,7 @@ fn terminate_by_id_is_unsupported_and_sends_nothing() {
     assert_eq!(op, "graceful terminate (SIGTERM-equivalent)");
     assert_eq!(platform, "windows");
     assert!(detail.contains("graceful_shutdown_tree"), "{detail}");
-    let p = open(id, Op::Wait).unwrap().expect("the blocker is alive");
+    let p = open(id).unwrap().expect("the blocker is alive");
     assert!(!drive(&*p, absolute(Some(Duration::ZERO))).unwrap());
     child.kill().unwrap();
     child.wait().unwrap();
@@ -103,7 +102,7 @@ fn the_wait_is_on_the_opened_process_handle() {
     use windows::Win32::System::Threading::GetProcessId;
 
     let (child, _stdin, id) = blocker();
-    let p = open(id, Op::Wait).unwrap().expect("a live process opens");
+    let p = open(id).unwrap().expect("a live process opens");
     match p.exited().unwrap() {
         // SAFETY: `h` is the live process handle `p` owns.
         Exit::Running(WaitFor::Signalled(h)) => {
@@ -177,9 +176,7 @@ fn a_look_without_synchronize_reads_the_exit_code() {
     let child = crate::identity::windows_fixture::spawn_query_only(&done);
     let id = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
         .expect("the owned handle always yields an identity");
-    let p = open(id, Op::Wait)
-        .unwrap()
-        .expect("a live process opens with QUERY alone");
+    let p = open(id).unwrap().expect("a live process opens with QUERY alone");
     assert_access_denied(p.exited(), "a look at a running process");
     assert_access_denied(
         drive(&*p, absolute(Some(Duration::ZERO))),
@@ -207,9 +204,7 @@ fn kill_of_a_live_process_without_terminate_is_io_access_denied() {
     let child = crate::identity::windows_fixture::spawn_query_only(&done);
     let id = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
         .expect("the owned handle always yields an identity");
-    let p = open(id, Op::Kill)
-        .unwrap()
-        .expect("a live process opens with QUERY alone");
+    let p = open(id).unwrap().expect("a live process opens with QUERY alone");
     assert_access_denied(p.signal(Sig::Kill), "a kill without PROCESS_TERMINATE");
     assert!(child.is_running(), "nothing killed it");
 }

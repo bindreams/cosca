@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 
 use mach2::message::audit_token_t;
 
-use super::{Exit, Op, OsProcess, WaitFor};
+use super::{Exit, OsProcess, WaitFor, OPEN_CONSEQUENCE};
 use crate::error::{io_context, Error};
 use crate::identity::{uniq_info, Existence, ProcessId, ReadPurpose, UniqRead};
 use crate::signal::{Sent, Sig};
@@ -27,34 +27,29 @@ extern "C" {
     fn proc_signal_with_audittoken(audittoken: *mut audit_token_t, sig: libc::c_int) -> libc::c_int;
 }
 
-/// A process, its exit watch if it was opened for [`Op::Wait`], and what its audit token needs.
-/// `unique` is the process's `p_uniqueid`: never reused, and kept across `exec`. `idversion` is its
-/// `p_idversion`: it changes at `exec`, and `signal` follows it, so it is atomic. A signal needs no kqueue, so a kill or terminate holds no
-/// watch and costs no descriptor.
+/// A process, its exit watch, and what its audit token needs. `unique` is the process's
+/// `p_uniqueid`: never reused, and kept across `exec`. `idversion` is its `p_idversion`: it changes
+/// at `exec`, and `signal` follows it, so it is atomic. Every open arms the watch, one kqueue
+/// descriptor, because the one open serves a signal and a wait alike.
 #[derive(Debug)]
 pub(crate) struct MacProcess {
     id: ProcessId,
     unique: u64,
     idversion: AtomicI32,
-    watch: Option<ExitWatch>,
+    watch: ExitWatch,
 }
 
 impl MacProcess {
     /// Open the process `id` names. `Ok(None)`: it is gone, or its pid now names another process.
-    /// `op` words the `Unassessable` errors, and only [`Op::Wait`] arms the exit watch.
-    pub(crate) fn open(id: ProcessId, op: Op) -> Result<Option<Self>, Error> {
+    pub(crate) fn open(id: ProcessId) -> Result<Option<Self>, Error> {
         let pid = id.pid();
-        let (warn_tail, detail_tail) = match op {
-            Op::Wait => ("; its exit cannot be observed", "; its exit cannot be observed"),
-            Op::Kill | Op::Terminate => (" - no signal was sent", "; no signal was sent"),
-        };
         let read = || match uniq_info(pid, ReadPurpose::Open) {
             UniqRead::Found(info) => Ok(Some(info)),
             UniqRead::Gone => Ok(None),
             UniqRead::Refused(errno) => {
-                log::warn!("wait: pid {pid} identity could not be read (errno {errno}){warn_tail}");
+                log::warn!("wait: pid {pid} identity could not be read (errno {errno}); {OPEN_CONSEQUENCE}");
                 Err(Error::Unassessable {
-                    detail: format!("pid {pid} identity could not be read (errno {errno}){detail_tail}"),
+                    detail: format!("pid {pid} identity could not be read (errno {errno}); {OPEN_CONSEQUENCE}"),
                     source: Some(std::io::Error::from_raw_os_error(errno)),
                 })
             }
@@ -66,20 +61,12 @@ impl MacProcess {
             Existence::Present => {}
             Existence::Gone => return Ok(None),
             Existence::Unknown => {
-                log::warn!("wait: pid {pid} identity could not be confirmed{warn_tail}");
+                log::warn!("wait: pid {pid} identity could not be confirmed; {OPEN_CONSEQUENCE}");
                 return Err(Error::Unassessable {
-                    detail: format!("pid {pid} identity could not be confirmed{detail_tail}"),
+                    detail: format!("pid {pid} identity could not be confirmed; {OPEN_CONSEQUENCE}"),
                     source: None,
                 });
             }
-        }
-        if !matches!(op, Op::Wait) {
-            return Ok(Some(Self {
-                id,
-                unique: first.unique_id,
-                idversion: AtomicI32::new(first.id_version),
-                watch: None,
-            }));
         }
         let watch = ExitWatch::proc_exit(pid)?;
         // The watch was armed on whatever held the pid by now. The same unique id before and
@@ -91,7 +78,7 @@ impl MacProcess {
             id,
             unique: second.unique_id,
             idversion: AtomicI32::new(second.id_version),
-            watch: Some(watch),
+            watch,
         }))
     }
 }
@@ -166,9 +153,7 @@ impl OsProcess for MacProcess {
     }
 
     fn exited(&self) -> Result<Exit<'_>, Error> {
-        let Some(watch) = &self.watch else {
-            return Err(super::opened_for_a_signal());
-        };
+        let watch = &self.watch;
         if watch.exited()? {
             Ok(Exit::Exited)
         } else {

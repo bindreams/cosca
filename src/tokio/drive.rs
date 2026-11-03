@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use crate::error::Error;
 use crate::identity::ProcessId;
-use crate::os_process::{open, Exit, Op, OsProcess, WaitFor};
+use crate::os_process::{open, Exit, OsProcess, WaitFor};
 use crate::tokio::wait::deadline_from;
 
 /// What the entry point does before any open or look: the watch-fault seam.
@@ -33,7 +33,7 @@ fn enter() -> Result<(), Error> {
 pub(crate) async fn exited_by_id(id: ProcessId, timeout: Option<Duration>) -> Result<bool, Error> {
     enter()?;
     let deadline = absolute(timeout);
-    match open(id, Op::Wait)? {
+    match open(id)? {
         None => Ok(true),
         Some(process) => drive(&*process, deadline).await,
     }

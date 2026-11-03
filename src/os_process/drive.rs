@@ -2,7 +2,7 @@
 
 use std::time::{Duration, Instant};
 
-use super::{open, Exit, Op, OsProcess, WaitFor};
+use super::{open, Exit, OsProcess, WaitFor};
 use crate::error::Error;
 use crate::identity::ProcessId;
 use crate::wait::remaining;
@@ -29,7 +29,7 @@ fn enter() -> Result<(), Error> {
 pub(crate) fn exited_by_id(id: ProcessId, timeout: Option<Duration>) -> Result<bool, Error> {
     enter()?;
     let deadline = absolute(timeout);
-    match open(id, Op::Wait)? {
+    match open(id)? {
         None => Ok(true),
         Some(process) => drive(&*process, deadline),
     }

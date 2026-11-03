@@ -196,11 +196,11 @@ fn open_fds() -> usize {
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn a_wait_round_opens_no_descriptor() {
-    use crate::os_process::{open, Op};
+    use crate::os_process::open;
     use crate::test_child::held_contained_blocker_without_cgroup;
 
     let (child, stdin) = held_contained_blocker_without_cgroup(crate::Stdio::null());
-    let process = open(child.id(), Op::Wait).unwrap().expect("a live process opens");
+    let process = open(child.id()).unwrap().expect("a live process opens");
     let runtime = ::tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -240,7 +240,7 @@ mod windows {
     use std::os::windows::io::BorrowedHandle;
 
     use crate::os_process::windows::cancel::{new_cancel_event, signal_cancel, wait_process_or_cancel};
-    use crate::os_process::{open, Exit, Op, OsProcess, WaitFor};
+    use crate::os_process::{open, Exit, OsProcess, WaitFor};
     use crate::wait::test_clock::FrozenClockGuard;
     use crate::wait::wait_ms_probe;
     use crate::wait::{remaining_override_seam, wait_clamp_seam};
@@ -260,7 +260,7 @@ mod windows {
     #[skuld::test]
     fn the_blocking_half_arms_the_ceiling_of_the_remaining_duration() {
         let (child, stdin, id) = blocker();
-        let process = open(id, Op::Wait).unwrap().expect("a live process opens");
+        let process = open(id).unwrap().expect("a live process opens");
         let cancel = new_cancel_event().expect("create cancel event");
         let (_clock, at) = FrozenClockGuard::install();
         wait_ms_probe::take();
@@ -293,7 +293,7 @@ mod windows {
     #[skuld::test]
     fn the_blocking_half_never_reports_still_alive_before_the_deadline() {
         let (child, stdin, id) = blocker();
-        let process = open(id, Op::Wait).unwrap().expect("a live process opens");
+        let process = open(id).unwrap().expect("a live process opens");
         let cancel = new_cancel_event().expect("create cancel event");
         wait_ms_probe::take();
         let _override = remaining_override_seam::set(Duration::from_micros(500));
@@ -317,7 +317,7 @@ mod windows {
     #[skuld::test]
     fn the_blocking_half_re_arms_past_a_clamped_timeout() {
         let (child, stdin, id) = blocker();
-        let process = open(id, Op::Wait).unwrap().expect("a live process opens");
+        let process = open(id).unwrap().expect("a live process opens");
         let cancel = new_cancel_event().expect("create cancel event");
         wait_ms_probe::take();
         let _clamp = wait_clamp_seam::set(5);
@@ -338,7 +338,7 @@ mod windows {
     #[skuld::test]
     fn cancel_event_releases_the_blocking_wait() {
         let (child, _stdin, id) = blocker();
-        let process = open(id, Op::Wait).unwrap().expect("a live process opens");
+        let process = open(id).unwrap().expect("a live process opens");
         let cancel = new_cancel_event().expect("event");
         signal_cancel(&cancel);
         let exited = wait_process_or_cancel(wait_handle(&*process), None, &cancel).expect("cancellable wait");
@@ -352,7 +352,7 @@ mod windows {
     #[skuld::test]
     fn cancel_event_signaled_mid_wait_releases_the_blocking_wait() {
         let (child, _stdin, id) = blocker();
-        let process = open(id, Op::Wait).unwrap().expect("a live process opens");
+        let process = open(id).unwrap().expect("a live process opens");
         let cancel = std::sync::Arc::new(new_cancel_event().expect("event"));
         let handle = wait_handle(&*process);
         let exited = std::thread::scope(|scope| {

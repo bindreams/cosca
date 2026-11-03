@@ -6,7 +6,6 @@ use std::os::fd::AsRawFd;
 
 use crate::error::Error;
 use crate::identity::{Existence, Liveness, PidfdTarget, ProcessId};
-use crate::os_process::Op;
 
 #[path = "open_tests/fixture.rs"]
 mod fixture;
@@ -275,7 +274,7 @@ fn open_verified_is_unassessable_when_the_einval_arms_exists_is_unknown() {
     let mark = crate::log_capture::mark();
     let forced_errno = super::fault::force_pidfd_open_errno_once(rustix::io::Errno::INVAL);
     let forced_exists = super::fault::force_exists_once(Existence::Unknown);
-    let result = super::open_verified(ProcessId::current(), Op::Wait);
+    let result = super::open_verified(ProcessId::current());
     drop(forced_exists);
     drop(forced_errno);
     assert_unassessable_with_cause(
@@ -445,7 +444,7 @@ fn open_verified_current_with_fdinfo(
     answer: Result<PidfdTarget, i32>,
 ) -> Result<Option<rustix::fd::OwnedFd>, crate::error::Error> {
     let forced = crate::identity::proc_view_fault::force_fdinfo_once(answer);
-    let result = super::open_verified(ProcessId::current(), Op::Wait);
+    let result = super::open_verified(ProcessId::current());
     drop(forced);
     result
 }
@@ -469,27 +468,22 @@ fn open_verified_is_unassessable_when_the_pidfds_fdinfo_names_another_pid() {
     }
 }
 
-/// An `Unassessable` verdict ends with what the operation left undone.
+/// An `Unassessable` verdict ends with what the open left undone.
 ///
-/// Mutants: two operations' consequences swapped; the consequence dropped from the message.
+/// Mutant: the consequence dropped from the message.
 #[skuld::test]
-fn an_unassessable_verdict_ends_with_what_its_operation_left_undone() {
+fn an_unassessable_verdict_ends_with_what_the_open_left_undone() {
     crate::log_capture::install();
-    for (op, consequence) in [
-        (Op::Wait, "its exit cannot be observed"),
-        (Op::Kill, "no signal was sent"),
-        (Op::Terminate, "no signal was sent"),
-        (Op::GroupTeardown, "process-group teardown verification"),
-    ] {
-        let forced = crate::identity::proc_view_fault::force_fdinfo_once(Ok(PidfdTarget::Pid(0)));
-        let result = super::open_verified(ProcessId::current(), op);
-        drop(forced);
-        match result {
-            Err(e @ Error::Unassessable { .. }) => {
-                assert!(e.to_string().ends_with(&format!("; {consequence}")), "{op:?}: {e}")
-            }
-            other => panic!("{op:?}: expected Unassessable, got {other:?}"),
-        }
+    let forced = crate::identity::proc_view_fault::force_fdinfo_once(Ok(PidfdTarget::Pid(0)));
+    let result = super::open_verified(ProcessId::current());
+    drop(forced);
+    match result {
+        Err(e @ Error::Unassessable { .. }) => assert!(
+            e.to_string()
+                .ends_with("; its exit cannot be observed and no signal was sent"),
+            "{e}"
+        ),
+        other => panic!("expected Unassessable, got {other:?}"),
     }
 }
 
@@ -514,7 +508,7 @@ fn open_verified_is_unassessable_when_the_pidfds_fdinfo_is_unreadable() {
 fn open_verified_accepts_a_live_target_whose_fdinfo_pid_matches() {
     let forced = open_verified_current_with_fdinfo(Ok(PidfdTarget::Pid(std::process::id())));
     assert!(matches!(forced, Ok(Some(_))), "got {forced:?}");
-    let unforced = super::open_verified(ProcessId::current(), Op::Wait);
+    let unforced = super::open_verified(ProcessId::current());
     assert!(
         matches!(unforced, Ok(Some(_))),
         "the real fdinfo must match too, got {unforced:?}"
@@ -539,7 +533,7 @@ fn verify_pidfd_target_reports_gone_for_a_target_reaped_after_pidfd_open() {
         .found()
         .expect("the unreaped child has an identity");
     child.wait().expect("reap the child");
-    let result = super::verify_pidfd_target(id, pidfd, Op::Wait);
+    let result = super::verify_pidfd_target(id, pidfd);
     assert!(matches!(result, Ok(None)), "got {result:?}");
 }
 
@@ -550,7 +544,7 @@ fn open_verified_is_unassessable_when_the_success_paths_exists_is_unknown() {
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
     let forced = super::fault::force_exists_once(Existence::Unknown);
-    let result = super::open_verified(ProcessId::current(), Op::Wait);
+    let result = super::open_verified(ProcessId::current());
     drop(forced);
     assert_unassessable_with_cause(
         result.map(|fd| fd.is_some()),
@@ -594,8 +588,8 @@ fn refused_with(errno: rustix::io::Errno, open: impl FnOnce(ProcessId) -> Result
     }
 }
 
-fn open_op(op: Op) -> impl FnOnce(ProcessId) -> Result<(), Error> {
-    move |id| super::open_verified(id, op).map(drop)
+fn open_op(id: ProcessId) -> Result<(), Error> {
+    super::open_verified(id).map(drop)
 }
 
 /// Every refusal is `Unsupported` in the policy's message shape.
@@ -610,42 +604,34 @@ fn a_refused_pidfd_open_is_unsupported_in_the_policys_message_shape() {
         (rustix::io::Errno::ACCESS, "EACCES"),
         (rustix::io::Errno::NODEV, "ENODEV"),
     ] {
-        let err = refused_with(errno, open_op(Op::Wait));
+        let err = refused_with(errno, open_op);
         assert!(matches!(&err, Error::Unsupported { platform: "linux", .. }), "{err:?}");
         assert_eq!(
             err.to_string(),
             format!(
-                "process wait is not supported on linux: cosca requires pidfd_open (Linux \u{2265} 5.3), \
+                "process open is not supported on linux: cosca requires pidfd_open (Linux \u{2265} 5.3), \
                  refused here: pidfd_open answered {name}"
             )
         );
     }
 }
 
-/// Each backend operation names itself, not one fixed string.
+/// Every act by id goes through the one open, so each names it.
 ///
-/// Mutants: two ops swapped; one op renamed; `Wait` for all three.
+/// Mutant: an act keeps an operation name of its own.
 #[skuld::test]
-fn each_operation_names_itself_when_pidfd_open_is_refused() {
+fn an_unsupported_open_names_process_open() {
     let wait = refused_with(rustix::io::Errno::PERM, |id| {
         crate::os_process::drive::exited_by_id(id, Some(std::time::Duration::ZERO)).map(drop)
     });
-    assert!(
-        wait.to_string().starts_with("process wait is not supported on linux: "),
-        "{wait}"
-    );
     let kill = refused_with(rustix::io::Errno::PERM, crate::os_process::kill_by_id);
-    assert!(
-        kill.to_string().starts_with("process kill is not supported on linux: "),
-        "{kill}"
-    );
     let terminate = refused_with(rustix::io::Errno::PERM, crate::os_process::terminate_by_id);
-    assert!(
-        terminate
-            .to_string()
-            .starts_with("process terminate is not supported on linux: "),
-        "{terminate}"
-    );
+    for err in [wait, kill, terminate] {
+        assert!(
+            err.to_string().starts_with("process open is not supported on linux: "),
+            "{err}"
+        );
+    }
 }
 
 /// A transient or resource errno is not a refusal: `Io`, naming the syscall, keeping the OS
@@ -659,7 +645,7 @@ fn a_transient_pidfd_open_failure_stays_io_naming_the_syscall() {
         (rustix::io::Errno::NFILE, "Too many open files in system", libc::ENFILE),
         (rustix::io::Errno::NOMEM, "Cannot allocate memory", libc::ENOMEM),
     ] {
-        match refused_with(errno, open_op(Op::Wait)) {
+        match refused_with(errno, open_op) {
             Error::Io(e) => {
                 assert_eq!(e.to_string(), format!("pidfd_open: {text} (os error {code})"));
                 let source = std::error::Error::source(&e).expect("the OS error is kept as the source");

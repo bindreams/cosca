@@ -370,13 +370,13 @@ async fn exited_by_id_unbounded_resolves_for_exited_unreaped_child() {
     child.wait().expect("reap");
 }
 
-/// The async watch reports a refused `pidfd_open` as `process wait`. The child is killed first so
+/// The async watch reports a refused `pidfd_open` as `process open`. The child is killed first so
 /// an unconsumed forced errno resolves the watch `Ok` and fails the assertion instead of hanging.
 ///
-/// Mutants: `open` names another `Op`; the forced errno is not consumed.
+/// Mutant: the forced errno is not consumed.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-async fn exited_by_id_unbounded_names_process_wait_when_pidfd_open_is_refused() {
+async fn exited_by_id_unbounded_names_process_open_when_pidfd_open_is_refused() {
     let mut child = std_blocker();
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
     child.kill().expect("kill");
@@ -387,7 +387,7 @@ async fn exited_by_id_unbounded_names_process_wait_when_pidfd_open_is_refused() 
     match result {
         Err(e @ crate::error::Error::Unsupported { .. }) => assert_eq!(
             e.to_string(),
-            "process wait is not supported on linux: cosca requires pidfd_open (Linux \u{2265} 5.3), \
+            "process open is not supported on linux: cosca requires pidfd_open (Linux \u{2265} 5.3), \
              refused here: pidfd_open answered EACCES"
         ),
         other => panic!("a refused pidfd_open must be Unsupported, got {other:?}"),

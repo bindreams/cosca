@@ -92,13 +92,13 @@ fn duration_max_is_unbounded() {
 /// only when the killed process exits, so the two threads need no other sync.
 #[skuld::test]
 fn looks_and_a_signal_on_one_process_run_from_two_threads() {
-    use crate::os_process::{open, Op, OsProcess};
+    use crate::os_process::{open, OsProcess};
     use crate::signal::{Sent, Sig};
 
     let mut child = crate::test_spawn::spawn(&mut crate::test_child::held_std_blocker(std::process::Stdio::null()))
         .expect("spawn blocker");
     let id = ProcessId::of(child.id()).found().expect("identity of a live child");
-    let process = open(id, Op::Wait).unwrap().expect("a live process opens");
+    let process = open(id).unwrap().expect("a live process opens");
     let p: &dyn OsProcess = &*process;
     std::thread::scope(|scope| {
         let waiter = scope.spawn(|| drive(p, absolute(None)));
@@ -119,7 +119,7 @@ mod windows {
 
     use super::{absolute, drive};
     use crate::os_process::drive::exited_by_id;
-    use crate::os_process::{open, Op};
+    use crate::os_process::open;
     use crate::test_child::live_blocker as blocker;
     use crate::wait::test_clock::FrozenClockGuard;
     use crate::wait::{block_probe, wait_ms_probe};
@@ -133,7 +133,7 @@ mod windows {
     #[skuld::test]
     fn exited_by_arms_the_ceiling_of_the_remaining_duration() {
         let (child, stdin, id) = blocker();
-        let process = open(id, Op::Wait).unwrap().expect("a live process opens");
+        let process = open(id).unwrap().expect("a live process opens");
         let (_clock, at) = FrozenClockGuard::install();
         wait_ms_probe::take();
         let _override = remaining_override_seam::set(Duration::from_micros(500));
@@ -181,7 +181,7 @@ mod windows {
     #[skuld::test]
     fn exited_by_never_reports_still_alive_before_the_deadline() {
         let (child, stdin, id) = blocker();
-        let process = open(id, Op::Wait).unwrap().expect("a live process opens");
+        let process = open(id).unwrap().expect("a live process opens");
         wait_ms_probe::take();
         let _override = remaining_override_seam::set(Duration::from_micros(500));
         wait_ms_probe::on_second_arm(move || drop(stdin)); // EOF -> the blocker exits for real
@@ -200,7 +200,7 @@ mod windows {
     #[skuld::test]
     fn exited_by_re_arms_past_a_clamped_timeout() {
         let (child, stdin, id) = blocker();
-        let process = open(id, Op::Wait).unwrap().expect("a live process opens");
+        let process = open(id).unwrap().expect("a live process opens");
         wait_ms_probe::take();
         let _clamp = wait_clamp_seam::set(5);
         wait_ms_probe::on_second_arm(move || drop(stdin));
@@ -219,7 +219,7 @@ mod windows {
     #[skuld::test]
     fn exited_by_terminates_under_a_frozen_clock() {
         let (child, stdin, id) = blocker();
-        let process = open(id, Op::Wait).unwrap().expect("a live process opens");
+        let process = open(id).unwrap().expect("a live process opens");
         let (_clock, at) = FrozenClockGuard::install();
         let deadline = at + Duration::from_millis(50);
         let result = drive(&*process, absolute(Some(Duration::from_millis(50))));

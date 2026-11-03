@@ -11,7 +11,7 @@ use std::os::windows::io::{AsHandle, AsRawHandle, FromRawHandle, OwnedHandle};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::Threading::{PROCESS_ACCESS_RIGHTS, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE};
 
-use super::{Exit, Op, OsProcess, WaitFor};
+use super::{Exit, OsProcess, WaitFor};
 use crate::error::{win32_io_error, Error};
 use crate::identity::{
     windows_exit_look, windows_open_dropping_refused, windows_terminate_held, HandleIdentity, Liveness, Look, Opened,
@@ -31,8 +31,7 @@ pub(crate) struct WindowsProcess {
 
 impl WindowsProcess {
     /// Open the process `id` names. `Ok(None)`: it is gone, or its pid now names another process.
-    /// `_op` is ignored: every open asks for the same rights (the parameter goes with `Op`).
-    pub(crate) fn open(id: ProcessId, _op: Op) -> Result<Option<Self>, Error> {
+    pub(crate) fn open(id: ProcessId) -> Result<Option<Self>, Error> {
         let Some((handle, granted)) = open_verified(id)? else {
             return Ok(None);
         };

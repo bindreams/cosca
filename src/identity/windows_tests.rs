@@ -7,7 +7,7 @@ use super::{creation_token, current_token, exit_look, is_running, open_dropping_
 use crate::identity::windows_fixture::spawn_restricted;
 use crate::identity::{Liveness, Resolved, StartToken};
 
-/// One look at whether `id`'s process has exited, through the `Op::Wait` open: gone or recycled
+/// One look at whether `id`'s process has exited, through the open: gone or recycled
 /// is exited.
 fn exited_now(id: crate::identity::ProcessId) -> Result<bool, crate::error::Error> {
     crate::os_process::drive::exited_by_id(id, Some(std::time::Duration::ZERO))
