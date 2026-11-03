@@ -60,6 +60,24 @@ fn classify_zero_return(armed: Option<Duration>) -> ZeroReturn {
     }
 }
 
+/// What the loop does after a `kevent` that delivered no event.
+#[derive(Debug, PartialEq, Eq)]
+enum Step {
+    DeadlinePassed,
+    Again(ZeroReturn),
+}
+
+/// `armed`: the timeout the call was armed with. `remaining`: the time to the deadline, read fresh
+/// after the call. `EINTR` is not an input: the loop retries it, and the next round reads
+/// `remaining` again.
+fn after_empty_read(armed: Option<Duration>, remaining: Option<Duration>) -> Step {
+    if remaining == Some(Duration::ZERO) {
+        Step::DeadlinePassed
+    } else {
+        Step::Again(classify_zero_return(armed))
+    }
+}
+
 fn placeholder() -> KEvent {
     KEvent::new(0, EventFilter::EVFILT_PROC, EvFlags::empty(), FilterFlag::empty(), 0, 0)
 }
@@ -108,6 +126,15 @@ pub(crate) enum Event {
         signo: libc::c_int,
         count: usize,
     },
+}
+
+/// How [`Kqueue::wait`] ended.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum WaitOutcome {
+    /// Every event that was pending. Never empty.
+    Events(Vec<Event>),
+    /// The deadline passed with nothing pending.
+    DeadlinePassed,
 }
 
 impl Subscription {
@@ -275,6 +302,58 @@ impl Kqueue {
             // A read that comes back short has taken everything pending.
             if n < POLL_BATCH {
                 return Ok(events);
+            }
+        }
+    }
+
+    /// Blocks until an event is pending or `deadline` passes, and takes every pending event, in
+    /// order, as [`poll`](Self::poll) does. `None` blocks with no end.
+    ///
+    /// A deadline that has already passed still looks once: an event that is pending then is
+    /// returned, not `DeadlinePassed` (principle 13). `EINTR`, the cap on one `kevent` timeout and
+    /// the re-arm after it all happen inside. A `kevent` failure after the first event is taken
+    /// returns the events taken.
+    pub(crate) fn wait(&self, deadline: Option<Instant>) -> Result<WaitOutcome, Error> {
+        let mut slot = [placeholder()];
+        #[cfg(test)]
+        let mut check = crate::wait::test_clock::RoundCheck::new("Kqueue::wait");
+        loop {
+            #[cfg(test)]
+            check.round();
+            // nix's `kevent` takes `Option<timespec>`; `None` blocks with no end.
+            let timeout = crate::wait::remaining(deadline).map(kevent_timeout);
+            #[cfg(test)]
+            let call_start = Instant::now();
+            let read = self.0.kevent(&[], &mut slot, timeout);
+            // Bounds what would otherwise be an unbounded spin under a mock clock a test forgot
+            // to advance: see `test_clock::advance_by_elapsed_if_frozen`'s own doc.
+            #[cfg(test)]
+            crate::wait::test_clock::advance_by_elapsed_if_frozen(call_start.elapsed());
+            let taken = match read {
+                Ok(n) => n,
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(e) => return Err(Error::Io(e.into())),
+            };
+            let mut events: Vec<Event> = slot[..taken].iter().filter_map(Event::from_kevent).collect();
+            if taken > 0 {
+                match self.poll() {
+                    Ok(rest) => events.extend(rest),
+                    Err(e) if events.is_empty() => return Err(e),
+                    Err(e) => log::warn!("kqueue: reading the rest after {} events failed: {e}", events.len()),
+                }
+            }
+            if !events.is_empty() {
+                return Ok(WaitOutcome::Events(events));
+            }
+            match after_empty_read(as_duration(timeout), crate::wait::remaining(deadline)) {
+                Step::DeadlinePassed => return Ok(WaitOutcome::DeadlinePassed),
+                Step::Again(ZeroReturn::Rearm) => {
+                    log::debug!("wait: kevent reached its timeout cap with time left; re-arming");
+                }
+                Step::Again(ZeroReturn::Anomaly) => log::warn!(
+                    "wait: kevent returned 0 after a timeout below the cap ({:?}) with time left; re-arming",
+                    as_duration(timeout)
+                ),
             }
         }
     }

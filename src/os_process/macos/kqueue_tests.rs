@@ -2,7 +2,7 @@
 
 use std::os::fd::AsRawFd as _;
 
-use super::{Event, Kqueue, Subscription};
+use super::{Event, Kqueue, Subscription, WaitOutcome};
 use crate::identity::ProcessId;
 
 #[skuld::test]
@@ -179,6 +179,44 @@ fn a_zero_return_is_a_rearm_only_after_a_full_cap_timeout() {
     super::test_hooks::set_clamp_override(lowered);
     assert_eq!(super::classify_zero_return(Some(lowered)), Rearm);
     assert_eq!(super::classify_zero_return(Some(max)), Anomaly);
+}
+
+/// After a `kevent` that delivered nothing the loop ends only when the freshly read remaining time
+/// is zero; otherwise it goes round, and the armed timeout says whether that was the intended
+/// re-arm.
+///
+/// Mutants: end on any empty read; ignore `remaining`; classify against `remaining` instead of the
+/// armed timeout.
+#[skuld::test]
+fn after_an_empty_read_the_loop_ends_only_at_the_deadline() {
+    use super::Step::{Again, DeadlinePassed};
+    use super::ZeroReturn::{Anomaly, Rearm};
+    use std::time::Duration;
+
+    let cap = Duration::from_secs(super::KEVENT_MAX_SECS);
+    let (zero, one_ns, five_ms, one_s) = (
+        Duration::ZERO,
+        Duration::from_nanos(1),
+        Duration::from_millis(5),
+        Duration::from_secs(1),
+    );
+    let cases = [
+        (Some(cap), Some(zero), DeadlinePassed),
+        (Some(cap), Some(one_s), Again(Rearm)),
+        (Some(cap - one_ns), Some(one_s), Again(Anomaly)),
+        (Some(five_ms), Some(zero), DeadlinePassed),
+        (Some(five_ms), Some(one_ns), Again(Anomaly)),
+        (Some(zero), Some(zero), DeadlinePassed),
+        (Some(zero), Some(one_ns), Again(Anomaly)),
+        (None, None, Again(Anomaly)),
+    ];
+    for (armed, remaining, want) in cases {
+        assert_eq!(
+            super::after_empty_read(armed, remaining),
+            want,
+            "armed {armed:?}, remaining {remaining:?}"
+        );
+    }
 }
 
 /// The two `Ok(0)`-with-time-left dispositions reach the log at their own level: the intended
@@ -531,6 +569,216 @@ fn poll_takes_every_event_when_the_last_batch_is_short() {
 #[skuld::test]
 fn poll_takes_every_event_when_the_last_batch_is_full() {
     poll_takes_every_event(super::POLL_BATCH);
+}
+
+/// Blocks until `kq` has events and takes them. Fails if the wait reports a deadline, as none was
+/// set.
+fn wait_events(kq: &Kqueue) -> Vec<Event> {
+    match kq.wait(None).expect("wait") {
+        WaitOutcome::Events(events) => events,
+        WaitOutcome::DeadlinePassed => panic!("a deadline passed, but no deadline was set"),
+    }
+}
+
+/// A queue with one readable subscription on a pipe that already holds a byte. The pipe's ends stay
+/// open with the queue.
+fn queue_with_a_pending_event() -> (Kqueue, std::os::fd::RawFd, (std::io::PipeReader, std::io::PipeWriter)) {
+    use std::io::Write as _;
+
+    let (reader, mut writer) = std::io::pipe().expect("pipe");
+    let fd = reader.as_raw_fd();
+    let kq = Kqueue::new().expect("kqueue");
+    kq.subscribe(Subscription::Readable { fd, low_water: 1 })
+        .expect("subscribe");
+    writer.write_all(b"x").expect("write");
+    (kq, fd, (reader, writer))
+}
+
+fn a_pending_byte(fd: std::os::fd::RawFd) -> Event {
+    Event::Readable {
+        fd,
+        bytes: 1,
+        closed: false,
+    }
+}
+
+#[skuld::test]
+fn wait_returns_the_events_of_a_subscription() {
+    use std::io::Write as _;
+
+    let (reader, mut writer) = std::io::pipe().expect("pipe");
+    let fd = reader.as_raw_fd();
+    let kq = Kqueue::new().expect("kqueue");
+    kq.subscribe(Subscription::Readable { fd, low_water: 1 })
+        .expect("subscribe");
+    writer.write_all(b"abc").expect("write");
+    assert_eq!(
+        kq.wait(None).expect("wait"),
+        WaitOutcome::Events(vec![Event::Readable {
+            fd,
+            bytes: 3,
+            closed: false
+        }])
+    );
+}
+
+/// `count` pipes each written once and subscribed on one queue: a single `wait` takes all of their
+/// events, however many reads that is, and a `poll` after it finds none. `count` above the batch by
+/// one or two leaves `poll`'s remainder a full batch or a short one.
+fn wait_takes_every_event(count: usize) {
+    use std::io::Write as _;
+
+    let kq = Kqueue::new().expect("kqueue");
+    let mut pipes = Vec::new();
+    for _ in 0..count {
+        let (reader, mut writer) = std::io::pipe().expect("pipe");
+        let fd = reader.as_raw_fd();
+        kq.subscribe(Subscription::Readable { fd, low_water: 1 })
+            .expect("subscribe");
+        writer.write_all(b"x").expect("write");
+        pipes.push((reader, writer));
+    }
+    let mut got: Vec<_> = wait_events(&kq)
+        .into_iter()
+        .map(|e| match e {
+            Event::Readable {
+                fd,
+                bytes: 1,
+                closed: false,
+            } => fd,
+            other => panic!("unexpected {other:?}"),
+        })
+        .collect();
+    got.sort_unstable();
+    let mut want: Vec<_> = pipes.iter().map(|(reader, _)| reader.as_raw_fd()).collect();
+    want.sort_unstable();
+    assert_eq!(got, want);
+    assert_eq!(kq.poll().expect("poll again"), no_events());
+}
+
+#[skuld::test]
+fn wait_returns_every_pending_event_when_the_last_batch_is_full() {
+    wait_takes_every_event(super::POLL_BATCH + 1);
+}
+
+#[skuld::test]
+fn wait_returns_every_pending_event_when_the_last_batch_is_short() {
+    wait_takes_every_event(super::POLL_BATCH + 2);
+}
+
+/// An event that is pending when the deadline has already passed is returned.
+///
+/// Mutant: an elapsed deadline returns `DeadlinePassed` before looking.
+#[skuld::test]
+fn wait_with_an_elapsed_deadline_still_returns_a_pending_event() {
+    let (kq, fd, _pipe) = queue_with_a_pending_event();
+    assert_eq!(
+        kq.wait(Some(std::time::Instant::now())).expect("wait"),
+        WaitOutcome::Events(vec![a_pending_byte(fd)])
+    );
+}
+
+#[skuld::test]
+fn wait_with_an_elapsed_deadline_and_nothing_pending_is_deadline_passed() {
+    let kq = Kqueue::new().expect("kqueue");
+    assert_eq!(
+        kq.wait(Some(std::time::Instant::now())).expect("wait"),
+        WaitOutcome::DeadlinePassed
+    );
+}
+
+/// The real clock, so the check is `now >= deadline` after the wait; scheduling can only push a
+/// return later. No upper bound is asserted (principle 13).
+#[skuld::test]
+fn wait_never_returns_deadline_passed_before_the_deadline() {
+    use std::time::{Duration, Instant};
+
+    let kq = Kqueue::new().expect("kqueue");
+    let deadline = Instant::now() + Duration::from_millis(50);
+    assert_eq!(kq.wait(Some(deadline)).expect("wait"), WaitOutcome::DeadlinePassed);
+    let now = Instant::now();
+    assert!(
+        now >= deadline,
+        "returned before the deadline: now={now:?}, deadline={deadline:?}"
+    );
+}
+
+/// A deadline beyond XNU's `tv_sec` limit still returns a pending event.
+///
+/// Mutant: drop the cap in `kevent_timeout` -> `Io(EINVAL)` at once.
+#[skuld::test]
+fn wait_with_a_deadline_beyond_the_kevent_limit_returns_the_pending_event() {
+    use std::time::Duration;
+
+    let (kq, fd, _pipe) = queue_with_a_pending_event();
+    let deadline = crate::wait::deadline_from(Duration::from_secs(u64::from(u32::MAX)))
+        .expect("a deadline this far is still finite");
+    assert_eq!(
+        kq.wait(Some(deadline)).expect("a far deadline is not an error"),
+        WaitOutcome::Events(vec![a_pending_byte(fd)])
+    );
+}
+
+/// Under a frozen clock a bounded `wait` ends: each real `kevent` advances the clock.
+///
+/// Mutant: drop the `advance_by_elapsed_if_frozen` call in `wait` -> the second round panics with
+/// "no progress" instead of re-arming forever.
+#[skuld::test]
+fn wait_terminates_under_a_frozen_clock() {
+    use crate::wait::test_clock::FrozenClockGuard;
+    use std::time::Duration;
+
+    let kq = Kqueue::new().expect("kqueue");
+    let (_clock, at) = FrozenClockGuard::install();
+    let deadline = Some(at + Duration::from_millis(5));
+    assert_eq!(kq.wait(deadline).expect("bounded wait"), WaitOutcome::DeadlinePassed);
+}
+
+#[skuld::test]
+fn wait_reports_a_process_exit() {
+    let mut child = spawn_blocker();
+    let pid = child.id();
+    let kq = Kqueue::new().expect("kqueue");
+    kq.subscribe(Subscription::Process {
+        pid,
+        signals: false,
+        reap: false,
+    })
+    .expect("subscribe");
+    child.kill().expect("kill");
+    let mut seen = Vec::new();
+    while !exited(&seen, pid) {
+        seen.extend(wait_events(&kq));
+    }
+    child.wait().expect("reap");
+}
+
+/// Two pipes written in turn: `poll` returns the first one's event first, unsorted.
+#[skuld::test]
+fn poll_returns_events_in_the_order_they_became_pending() {
+    use std::io::Write as _;
+
+    let kq = Kqueue::new().expect("kqueue");
+    let mut pipes = Vec::new();
+    for _ in 0..2 {
+        let (reader, writer) = std::io::pipe().expect("pipe");
+        kq.subscribe(Subscription::Readable {
+            fd: reader.as_raw_fd(),
+            low_water: 1,
+        })
+        .expect("subscribe");
+        pipes.push((reader, writer));
+    }
+    // Written in the reverse of the subscription order, so a sort by subscription shows.
+    for (_, writer) in pipes.iter_mut().rev() {
+        writer.write_all(b"x").expect("write");
+    }
+    let want: Vec<_> = pipes
+        .iter()
+        .rev()
+        .map(|(reader, _)| a_pending_byte(reader.as_raw_fd()))
+        .collect();
+    assert_eq!(kq.poll().expect("poll"), want);
 }
 
 #[skuld::test]
