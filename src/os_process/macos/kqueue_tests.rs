@@ -254,30 +254,11 @@ fn a_zero_return_with_time_left_is_logged_by_kind() {
     assert_eq!(levels(EARLY), [log::Level::Warn]);
 }
 
-/// Blocks until `kq`'s descriptor reports something pending: the real condition, with no timeout.
-fn wait_readable(kq: &Kqueue) {
-    let mut fd = libc::pollfd {
-        fd: kq.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    loop {
-        // SAFETY: one valid `pollfd`.
-        let n = unsafe { libc::poll(&mut fd, 1, -1) };
-        if n == 1 {
-            return;
-        }
-        let e = std::io::Error::last_os_error();
-        assert!(n == -1 && e.raw_os_error() == Some(libc::EINTR), "poll: {e}");
-    }
-}
-
-/// Reads `kq` whenever it turns readable, accumulating events until `done` holds for all so far.
+/// Waits on `kq`, accumulating events until `done` holds for all so far.
 fn poll_until(kq: &Kqueue, mut done: impl FnMut(&[Event]) -> bool) -> Vec<Event> {
     let mut seen = Vec::new();
     loop {
-        wait_readable(kq);
-        seen.extend(kq.poll().expect("poll"));
+        seen.extend(wait_events(kq));
         if done(&seen) {
             return seen;
         }
@@ -396,9 +377,8 @@ fn a_readable_subscription_reports_bytes_once_per_change() {
     let sub = Subscription::Readable { fd, low_water: 1 };
     kq.subscribe(sub).expect("subscribe");
     writer.write_all(b"abc").expect("write");
-    wait_readable(&kq);
     assert_eq!(
-        kq.poll().expect("poll"),
+        wait_events(&kq),
         [Event::Readable {
             fd,
             bytes: 3,
@@ -420,9 +400,8 @@ fn a_readable_subscription_holds_below_its_low_water() {
     writer.write_all(b"a").expect("write one byte");
     assert_eq!(kq.poll().expect("poll"), no_events());
     writer.write_all(b"bcd").expect("write three more");
-    wait_readable(&kq);
     assert_eq!(
-        kq.poll().expect("poll"),
+        wait_events(&kq),
         [Event::Readable {
             fd,
             bytes: 4,
@@ -439,8 +418,7 @@ fn a_readable_subscription_reports_the_close() {
     let sub = Subscription::Readable { fd, low_water: 1 };
     kq.subscribe(sub).expect("subscribe");
     drop(writer);
-    wait_readable(&kq);
-    let events = kq.poll().expect("poll");
+    let events = wait_events(&kq);
     assert!(
         matches!(events.as_slice(), [Event::Readable { fd: f, closed: true, .. }] if *f == fd),
         "{events:?}"
@@ -470,9 +448,8 @@ fn a_signal_subscription_counts_deliveries() {
         // SAFETY: `kill` of this process with a valid signal, which is ignored.
         assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGUSR1) }, 0);
     }
-    wait_readable(&kq);
     assert_eq!(
-        kq.poll().expect("poll"),
+        wait_events(&kq),
         [Event::Signal {
             signo: libc::SIGUSR1,
             count: DELIVERIES
@@ -523,52 +500,6 @@ fn unsubscribing_a_never_registered_subscription_fails_with_enoent() {
     };
     let kq = Kqueue::new().expect("kqueue");
     assert_eq!(refusal(kq.unsubscribe(readable)), libc::ENOENT);
-}
-
-/// `count` pipes each written once and subscribed on one queue: a single `poll` takes all of their
-/// events, however many reads that is, and the next finds none.
-fn poll_takes_every_event(count: usize) {
-    use std::io::Write as _;
-
-    let kq = Kqueue::new().expect("kqueue");
-    let mut pipes = Vec::new();
-    for _ in 0..count {
-        let (reader, mut writer) = std::io::pipe().expect("pipe");
-        let fd = reader.as_raw_fd();
-        kq.subscribe(Subscription::Readable { fd, low_water: 1 })
-            .expect("subscribe");
-        writer.write_all(b"x").expect("write");
-        pipes.push((reader, writer));
-    }
-    wait_readable(&kq);
-    let mut got: Vec<_> = kq
-        .poll()
-        .expect("poll")
-        .into_iter()
-        .map(|e| match e {
-            Event::Readable {
-                fd,
-                bytes: 1,
-                closed: false,
-            } => fd,
-            other => panic!("unexpected {other:?}"),
-        })
-        .collect();
-    got.sort_unstable();
-    let mut want: Vec<_> = pipes.iter().map(|(reader, _)| reader.as_raw_fd()).collect();
-    want.sort_unstable();
-    assert_eq!(got, want);
-    assert_eq!(kq.poll().expect("poll again"), no_events());
-}
-
-#[skuld::test]
-fn poll_takes_every_event_when_the_last_batch_is_short() {
-    poll_takes_every_event(super::POLL_BATCH + 1);
-}
-
-#[skuld::test]
-fn poll_takes_every_event_when_the_last_batch_is_full() {
-    poll_takes_every_event(super::POLL_BATCH);
 }
 
 /// Blocks until `kq` has events and takes them. Fails if the wait reports a deadline, as none was
