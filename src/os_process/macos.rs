@@ -1,13 +1,12 @@
 //! macOS: an [`OsProcess`] over an exit watch and the kernel's audit-token signal, and the kqueue
-//! behind [`WaitFor::Kqueue`](super::WaitFor::Kqueue).
+//! behind [`WaitFor::Readable`](super::WaitFor::Readable).
 //!
 //! macOS has no pidfd. A signal goes through `proc_signal_with_audittoken` instead, with a token
 //! that names the pid and the process's `p_idversion`: the kernel checks the version and signals
 //! while it holds a reference, so a process that took a reused pid is never signalled.
 
 use std::os::fd::{AsFd, BorrowedFd};
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::time::Instant;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use mach2::message::audit_token_t;
 
@@ -15,7 +14,7 @@ use super::{Exit, Op, OsProcess, WaitFor};
 use crate::error::{io_context, Error};
 use crate::identity::{uniq_info, Existence, ProcessId, ReadPurpose, UniqRead};
 use crate::signal::{Sent, Sig};
-use kqueue::{Kqueue, Subscription, WaitOutcome};
+use kqueue::{Kqueue, Subscription};
 
 pub(crate) mod kqueue;
 
@@ -30,7 +29,7 @@ extern "C" {
 
 /// A process, its exit watch if it was opened for [`Op::Wait`], and what its audit token needs.
 /// `unique` is the process's `p_uniqueid`: never reused, and kept across `exec`. `idversion` is its
-/// `p_idversion`: it changes at `exec`. A signal needs no kqueue, so a kill or terminate holds no
+/// `p_idversion`: it changes at `exec`, and `signal` follows it, so it is atomic. A signal needs no kqueue, so a kill or terminate holds no
 /// watch and costs no descriptor.
 #[derive(Debug)]
 pub(crate) struct MacProcess {
@@ -82,9 +81,7 @@ impl MacProcess {
                 watch: None,
             }));
         }
-        let Some(watch) = ExitWatch::proc_exit(pid)? else {
-            return Ok(None);
-        };
+        let watch = ExitWatch::proc_exit(pid)?;
         // The watch was armed on whatever held the pid by now. The same unique id before and
         // after proves it was this process: a unique id is never reused.
         let Some(second) = read()?.filter(|second| second.unique_id == first.unique_id) else {
@@ -172,37 +169,34 @@ impl OsProcess for MacProcess {
         let Some(watch) = &self.watch else {
             return Err(super::opened_for_a_signal());
         };
-        // A consumed exit event stays in `seen`, so a look after a wait that read it is `Exited`.
-        if watch.drain()? {
+        if watch.exited()? {
             Ok(Exit::Exited)
         } else {
-            Ok(Exit::Running(WaitFor::Kqueue(watch)))
+            Ok(Exit::Running(WaitFor::Readable(watch.as_fd())))
         }
     }
 }
 
-/// A kqueue armed for one event, and whether that event was ever read. A kqueue reports an exit
-/// once, so a wait that consumed it must not hide it from the next look: `seen` stays set.
-///
-/// An `AtomicBool`, not a `Cell`, so a future that holds `&ExitWatch` stays `Send`. `drain` and
-/// `block` never run at once: `&mut` access to the owning process serialises them, so no look
-/// falls between a wait taking the event and setting `seen`.
+/// A kqueue armed for the exit of one process, and nothing else. Nothing ever reads it: at exit XNU
+/// leaves the `NOTE_EXIT` knote queued (`EV_EOF | EV_ONESHOT`), and a kqueue descriptor polls
+/// readable while its queue is non-empty, so a zero-timeout `poll` is the look and any number of
+/// threads may look, or wait on the descriptor, at once. A `kevent` read would take the event
+/// away from every other waiter.
 #[derive(Debug)]
 pub(crate) struct ExitWatch {
     kq: Kqueue,
-    seen: AtomicBool,
+    /// The pid was already past registration (`ESRCH`) when the watch was armed: the process has
+    /// exited, and no event will ever be queued.
+    exited: bool,
 }
 
 impl ExitWatch {
     pub(super) fn new(kq: Kqueue) -> Self {
-        Self {
-            kq,
-            seen: AtomicBool::new(false),
-        }
+        Self { kq, exited: false }
     }
 
-    /// Arm `NOTE_EXIT` for `pid`. `Ok(None)`: the pid is already gone.
-    pub(crate) fn proc_exit(pid: u32) -> Result<Option<Self>, Error> {
+    /// Arm `NOTE_EXIT` for `pid`. A pid that is already gone is a watch that reads as exited.
+    pub(crate) fn proc_exit(pid: u32) -> Result<Self, Error> {
         let kq = Kqueue::new()?;
         let exit = Subscription::Process {
             pid,
@@ -210,44 +204,21 @@ impl ExitWatch {
             reap: false,
         };
         match kq.subscribe(exit) {
-            Ok(()) => Ok(Some(Self::new(kq))),
-            Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Ok(None),
+            Ok(()) => Ok(Self::new(kq)),
+            Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Ok(Self { kq, exited: true }),
             Err(e) => Err(e),
         }
     }
 
-    /// Block until the event has been read, by this call or an earlier one, or until `deadline`.
-    /// `Ok(true)` = the event was read.
-    pub(crate) fn block(&self, deadline: Option<Instant>) -> Result<bool, Error> {
-        if self.seen.load(Ordering::Relaxed) {
+    /// Whether the exit has happened. Reads nothing from the queue.
+    pub(crate) fn exited(&self) -> Result<bool, Error> {
+        if self.exited {
             return Ok(true);
         }
-        // Only a wait that is really armed counts as a block.
-        #[cfg(test)]
-        crate::wait::block_probe::record(crate::wait::remaining(deadline));
-        match self.kq.wait(deadline)? {
-            WaitOutcome::Events(_) => {
-                self.seen.store(true, Ordering::Relaxed);
-                Ok(true)
-            }
-            WaitOutcome::DeadlinePassed => Ok(false),
-        }
+        crate::os_process::poll::is_readable(self.kq.as_fd()).map_err(Error::Io)
     }
 
-    /// Read a pending event without blocking. `Ok(true)` = the event has been read, now or
-    /// earlier.
-    pub(crate) fn drain(&self) -> Result<bool, Error> {
-        if !self.kq.poll()?.is_empty() {
-            self.seen.store(true, Ordering::Relaxed);
-        }
-        Ok(self.seen.load(Ordering::Relaxed))
-    }
-
-    /// The kqueue's descriptor, for a reactor that registers it.
-    #[cfg_attr(
-        not(feature = "tokio"),
-        allow(dead_code, reason = "only the async driver registers the kqueue")
-    )]
+    /// The kqueue's descriptor: readable once the exit has happened.
     pub(crate) fn as_fd(&self) -> BorrowedFd<'_> {
         self.kq.as_fd()
     }

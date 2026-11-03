@@ -19,10 +19,12 @@ pub(crate) mod fake;
 pub(crate) mod linux;
 #[cfg(target_os = "macos")]
 pub(crate) mod macos;
+#[cfg(unix)]
+pub(crate) mod poll;
 #[cfg(windows)]
 pub(crate) mod windows;
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use std::os::fd::BorrowedFd;
 #[cfg(windows)]
 use std::os::windows::io::BorrowedHandle;
@@ -49,12 +51,10 @@ pub(crate) enum Exit<'a> {
 /// wakes are allowed; a wake is never the answer, the next look is.
 #[derive(Debug)]
 pub(crate) enum WaitFor<'a> {
-    /// Linux: the pidfd; readable once the process has exited.
-    #[cfg(target_os = "linux")]
+    /// Unix: a descriptor that polls readable once the process has exited, and that nothing reads:
+    /// the pidfd on Linux, a kqueue armed for the exit on macOS.
+    #[cfg(unix)]
     Readable(BorrowedFd<'a>),
-    /// macOS: a kqueue armed for the process's exit.
-    #[cfg(target_os = "macos")]
-    Kqueue(&'a macos::ExitWatch),
     /// Windows: the process handle; signalled once the process has exited.
     #[cfg(windows)]
     Signalled(BorrowedHandle<'a>),

@@ -111,52 +111,18 @@ impl OsProcess for FakeProcess {
     }
 }
 
-/// An [`ExitWatch`](super::macos::ExitWatch) armed for `EVFILT_READ` on `fd`, a pipe the test
-/// fires, in place of the `NOTE_EXIT` watch of a process.
-#[cfg(target_os = "macos")]
-pub(super) fn readable_watch(fd: std::os::fd::BorrowedFd<'_>) -> Result<super::macos::ExitWatch, Error> {
-    use std::os::fd::AsRawFd;
-
-    use crate::os_process::macos::kqueue::{Kqueue, Subscription};
-
-    let kq = Kqueue::new()?;
-    let readable = Subscription::Readable {
-        fd: fd.as_raw_fd(),
-        low_water: 1,
-    };
-    kq.subscribe(readable)?;
-    Ok(super::macos::ExitWatch::new(kq))
-}
-
 /// What a `Running` look hands out, and the way a test fires it.
 #[cfg(unix)]
 struct Source {
-    /// Kept open: on macOS only the kqueue refers to it.
-    #[cfg_attr(
-        target_os = "macos",
-        allow(dead_code, reason = "only keeps the pipe open for the kqueue")
-    )]
     rx: std::io::PipeReader,
     tx: std::io::PipeWriter,
-    #[cfg(target_os = "macos")]
-    watch: super::macos::ExitWatch,
 }
 
 #[cfg(unix)]
 impl Source {
     fn new() -> Self {
         let (rx, tx) = std::io::pipe().expect("FakeProcess: pipe");
-        #[cfg(target_os = "macos")]
-        let watch = {
-            use std::os::fd::AsFd;
-            readable_watch(rx.as_fd()).expect("FakeProcess: arm the pipe's kqueue")
-        };
-        Self {
-            rx,
-            tx,
-            #[cfg(target_os = "macos")]
-            watch,
-        }
+        Self { rx, tx }
     }
 
     fn fire(&self) {
@@ -165,13 +131,8 @@ impl Source {
     }
 
     fn wait_for(&self) -> WaitFor<'_> {
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::fd::AsFd;
-            WaitFor::Readable(self.rx.as_fd())
-        }
-        #[cfg(target_os = "macos")]
-        WaitFor::Kqueue(&self.watch)
+        use std::os::fd::AsFd;
+        WaitFor::Readable(self.rx.as_fd())
     }
 }
 

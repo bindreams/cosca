@@ -99,16 +99,23 @@ async fn watch(wait_for: &WaitFor<'_>) -> Result<(), Error> {
         #[cfg(target_os = "linux")]
         WaitFor::Readable(fd) => crate::tokio::wait::watch_pidfd(*fd).await,
         #[cfg(target_os = "macos")]
-        WaitFor::Kqueue(watch) => {
+        WaitFor::Readable(fd) => {
+            use std::os::fd::AsFd;
+
             use ::tokio::io::unix::AsyncFd;
             use ::tokio::io::Interest;
 
             use crate::tokio::wait::watch_readable;
 
-            let afd = AsyncFd::with_interest(watch.as_fd(), Interest::READABLE).map_err(Error::Io)?;
-            // `drain` is `true` once the event has been read, now or earlier; an empty drain clears
-            // readiness so a spurious wake waits again.
-            watch_readable(&afd, |_| watch.drain().map(|seen| seen.then_some(()))).await
+            let afd = AsyncFd::with_interest(*fd, Interest::READABLE).map_err(Error::Io)?;
+            // Readiness is only a hint; the poll look decides, reads nothing, and clears the
+            // readiness on a false positive so the next wake waits again.
+            watch_readable(&afd, |fd| {
+                crate::os_process::poll::is_readable(fd.as_fd())
+                    .map(|readable| readable.then_some(()))
+                    .map_err(Error::Io)
+            })
+            .await
         }
     }
 }

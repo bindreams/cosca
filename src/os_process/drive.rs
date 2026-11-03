@@ -61,13 +61,9 @@ pub(super) fn drive(p: &dyn OsProcess, deadline: Option<Instant>) -> Result<bool
 /// Block on `wait_for` until it wakes or `deadline` passes. The caller looks again either way.
 fn block(wait_for: &WaitFor<'_>, deadline: Option<Instant>) -> Result<(), Error> {
     match wait_for {
-        #[cfg(target_os = "linux")]
-        WaitFor::Readable(pidfd) => {
-            crate::os_process::linux::poll_pidfd_exit(*pidfd, deadline).map_err(Error::Io)?;
-        }
-        #[cfg(target_os = "macos")]
-        WaitFor::Kqueue(watch) => {
-            watch.block(deadline)?;
+        #[cfg(unix)]
+        WaitFor::Readable(fd) => {
+            crate::os_process::poll::poll_readable(*fd, deadline).map_err(Error::Io)?;
         }
         #[cfg(windows)]
         WaitFor::Signalled(process) => {

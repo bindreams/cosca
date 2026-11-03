@@ -1,5 +1,3 @@
-use std::io::{Read, Write};
-use std::os::fd::AsFd;
 use std::os::unix::process::ExitStatusExt;
 use std::time::Duration;
 
@@ -11,55 +9,34 @@ use crate::os_process::{kill_by_id, open, terminate_by_id, Exit, Op, OsProcess};
 use crate::signal::{Sent, Sig};
 use crate::test_child::wait_until_zombie;
 
-/// A watch on a pipe's read end, and the two ends.
-fn pipe_watch() -> (std::io::PipeReader, std::io::PipeWriter, ExitWatch) {
-    let (rx, tx) = std::io::pipe().unwrap();
-    let watch = crate::os_process::fake::readable_watch(rx.as_fd()).unwrap();
-    (rx, tx, watch)
-}
-
-/// An already-passed deadline: one non-blocking pass.
-fn expired() -> Option<std::time::Instant> {
-    Some(crate::wait::now())
-}
+// ExitWatch =====
 
 #[skuld::test]
-fn an_unfired_watch_reads_nothing() {
-    let (_rx, _tx, watch) = pipe_watch();
-    assert!(!watch.drain().unwrap());
-    assert!(!watch.block(expired()).unwrap());
+fn a_watch_on_a_live_process_reads_not_exited() {
+    let (mut child, id) = blocker();
+    let watch = ExitWatch::proc_exit(id.pid()).unwrap();
+    assert!(!watch.exited().unwrap());
+    child.kill().unwrap();
+    child.wait().unwrap();
 }
 
+/// Mutant: a look reads the queue, so the second look finds it empty.
 #[skuld::test]
-fn block_remembers_the_event_it_read() {
-    let (mut rx, mut tx, watch) = pipe_watch();
-    tx.write_all(&[1]).unwrap();
-    assert!(watch.block(None).unwrap());
-    // The pipe is empty again, so only `seen` can answer.
-    rx.read_exact(&mut [0]).unwrap();
-    assert!(watch.drain().unwrap());
+fn a_look_at_an_exited_process_does_not_consume_the_exit() {
+    let (mut child, id) = blocker();
+    let watch = ExitWatch::proc_exit(id.pid()).unwrap();
+    child.kill().unwrap();
+    wait_until_zombie(id.pid());
+    assert!(watch.exited().unwrap());
+    assert!(watch.exited().unwrap(), "the exit is still there for the next look");
+    child.wait().unwrap();
 }
 
+/// A pid above the kernel's pid limit is past registration, as an exited process is: `ESRCH`.
 #[skuld::test]
-fn drain_remembers_the_event_it_read() {
-    let (mut rx, mut tx, watch) = pipe_watch();
-    tx.write_all(&[1]).unwrap();
-    assert!(watch.drain().unwrap());
-    rx.read_exact(&mut [0]).unwrap();
-    crate::wait::block_probe::take();
-    assert!(watch.block(expired()).unwrap());
-    assert!(
-        crate::wait::block_probe::take().is_empty(),
-        "a block that returns at once on `seen` arms no wait"
-    );
-}
-
-#[skuld::test]
-fn block_records_a_wait_it_arms() {
-    let (_rx, _tx, watch) = pipe_watch();
-    crate::wait::block_probe::take();
-    assert!(!watch.block(expired()).unwrap());
-    assert_eq!(crate::wait::block_probe::take().len(), 1);
+fn a_watch_armed_past_registration_reads_exited() {
+    let watch = ExitWatch::proc_exit(i32::MAX as u32).unwrap();
+    assert!(watch.exited().unwrap());
 }
 
 // MacProcess =====
@@ -335,4 +312,31 @@ fn a_pid_zero_identity_never_reaches_kill() {
         crate::identity::Liveness::Alive,
         "the caller must have survived - nothing may signal process group 0"
     );
+}
+
+/// Two waiters on one open: the exit reaches both. Mutant: a wait reads the exit event from the
+/// kqueue, so the other wait blocks forever on an exited process.
+#[skuld::test]
+fn two_threads_waiting_on_one_process_both_return_after_it_exits() {
+    let (mut child, id) = blocker();
+    let p = open(id, Op::Wait).unwrap().expect("a live process opens");
+    let p: &dyn OsProcess = &*p;
+    std::thread::scope(|scope| {
+        let waiters = [
+            scope.spawn(|| drive(p, absolute(None))),
+            scope.spawn(|| drive(p, absolute(None))),
+        ];
+        assert_eq!(p.signal(Sig::Kill).unwrap(), Sent::Delivered);
+        for waiter in waiters {
+            assert!(
+                waiter.join().unwrap().unwrap(),
+                "every wait ends when the process exits"
+            );
+        }
+    });
+    assert!(
+        matches!(p.exited().unwrap(), Exit::Exited),
+        "and a later look says Exited"
+    );
+    child.wait().unwrap();
 }
