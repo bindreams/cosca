@@ -25,20 +25,8 @@ impl Process {
         crate::os_process::terminate_by_id(self.id())?;
         #[cfg(test)]
         crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterTerminate);
-        // Watch failure escalates now (kill still runs); a kill Err wins — mirrors the
-        // sync twin's subsumption.
         let watch = crate::tokio::drive::exited_by_id(self.id(), Some(grace)).await;
-        if matches!(watch, Ok(true)) {
-            return Ok(()); // exited within grace
-        }
-        // Hard SIGKILL (no reap — not the parent). If the watch failed, log it before
-        // returning the kill error, so both failures leave a trace.
-        if let Err(ref e) = watch {
-            log::debug!("graceful_shutdown watch error before kill escalation (subsumed): {e}");
-        }
-        crate::os_process::kill_by_id(self.id())?;
-        watch?;
-        Ok(())
+        crate::graceful::after_grace(watch, || crate::os_process::kill_by_id(self.id()))
     }
 
     /// Cooperative-then-forced shutdown of the foreign process's tree: `SIGTERM`-walk, wait
@@ -56,16 +44,7 @@ impl Process {
         #[cfg(test)]
         crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterTerminate);
         let watch = crate::tokio::drive::exited_by_id(self.id(), Some(grace)).await;
-        // The sweep is unconditional — a gracefully-exited root does NOT mean the
-        // descendants drained. If the watch failed, log it before the sweep so both
-        // failures leave a trace.
-        if let Err(ref e) = watch {
-            log::debug!("graceful_shutdown_tree watch error before kill_tree sweep (may be subsumed): {e}");
-        }
-        // There is no reap to order against (the real parent collects the zombie).
-        self.kill_tree()?;
-        watch?;
-        Ok(())
+        crate::graceful::after_tree_grace(watch, || self.kill_tree())
     }
 }
 

@@ -38,18 +38,8 @@ impl Process {
         crate::os_process::terminate_by_id(self.id)?;
         #[cfg(test)]
         crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterTerminate);
-        // A watch failure must not strand the process between the soft signal and the
-        // escalation — the kill still runs (grace unobservable => escalate now); the watch
-        // error surfaces only after it succeeds (a kill error wins — deliberate subsumption,
-        // mirroring the owned twins' disposition).
         let watch = crate::os_process::drive::exited_by_id(self.id, Some(grace));
-        if matches!(watch, Ok(true)) {
-            return Ok(()); // exited within grace
-        }
-        // Hard SIGKILL (no reap — not the parent); an Err returns HERE, subsuming any watch Err.
-        crate::os_process::kill_by_id(self.id)?;
-        watch?;
-        Ok(())
+        crate::graceful::after_grace(watch, || crate::os_process::kill_by_id(self.id))
     }
 
     /// Best-effort hard sweep of the foreign process's tree: an identity-walk that re-verifies
@@ -113,14 +103,8 @@ impl Process {
         #[cfg(test)]
         crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterTerminate);
 
-        // Watch-Err ordering: sweep first, then surface (see graceful_shutdown above).
         let watch = crate::os_process::drive::exited_by_id(self.id, Some(grace));
-        // The sweep is unconditional — a gracefully-exited root does NOT mean the descendants
-        // drained. A sweep Err subsumes any watch Err; there is no reap to order against (the
-        // real parent collects the zombie).
-        self.kill_tree()?;
-        watch?;
-        Ok(())
+        crate::graceful::after_tree_grace(watch, || self.kill_tree())
     }
 }
 
