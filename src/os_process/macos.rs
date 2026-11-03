@@ -15,7 +15,7 @@ use super::{Exit, Op, OsProcess, WaitFor};
 use crate::error::{io_context, Error};
 use crate::identity::{uniq_info, Existence, ProcessId, ReadPurpose, UniqRead};
 use crate::signal::{Sent, Sig};
-use kqueue::{block_on_kqueue, Event, Kqueue, Subscription};
+use kqueue::{Kqueue, Subscription, WaitOutcome};
 
 pub(crate) mod kqueue;
 
@@ -183,7 +183,9 @@ impl OsProcess for MacProcess {
 /// A kqueue armed for one event, and whether that event was ever read. A kqueue reports an exit
 /// once, so a wait that consumed it must not hide it from the next look: `seen` stays set.
 ///
-/// An `AtomicBool`, not a `Cell`, so a future that holds `&ExitWatch` stays `Send`.
+/// An `AtomicBool`, not a `Cell`, so a future that holds `&ExitWatch` stays `Send`. `drain` and
+/// `block` never run at once: `&mut` access to the owning process serialises them, so no look
+/// falls between a wait taking the event and setting `seen`.
 #[derive(Debug)]
 pub(crate) struct ExitWatch {
     kq: Kqueue,
@@ -222,18 +224,13 @@ impl ExitWatch {
         // Only a wait that is really armed counts as a block.
         #[cfg(test)]
         crate::wait::block_probe::record(crate::wait::remaining(deadline));
-        block_on_kqueue(
-            &self.kq,
-            deadline,
-            false,
-            |event, _already_elapsed| match Event::from_kevent(event) {
-                Some(_) => {
-                    self.seen.store(true, Ordering::Relaxed);
-                    Ok(Some(true))
-                }
-                None => Ok(None),
-            },
-        )
+        match self.kq.wait(deadline)? {
+            WaitOutcome::Events(_) => {
+                self.seen.store(true, Ordering::Relaxed);
+                Ok(true)
+            }
+            WaitOutcome::DeadlinePassed => Ok(false),
+        }
     }
 
     /// Read a pending event without blocking. `Ok(true)` = the event has been read, now or
