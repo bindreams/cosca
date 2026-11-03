@@ -1,7 +1,7 @@
-//! Async mirror of the foreign [`Process`](crate::Process). Introspection delegates
+//! Async mirror of the open [`Process`](crate::Process). Opening and signalling delegate
 //! synchronously; only the death-watch and the graceful pair are async (`tokio::wait`).
-//! NO stdio (its pipes belong to its real parent); every operation re-verifies identity; nothing here
-//! reaps (the real parent collects the zombie).
+//! NO stdio (its pipes belong to its real parent); acts reach the process opened, never a later
+//! holder of its pid; nothing here reaps (the real parent collects the zombie).
 
 use std::time::Duration;
 

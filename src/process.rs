@@ -1,9 +1,9 @@
-//! A foreign process referenced by stable identity. Wraps a `ProcessId` (never a bare
-//! pid) and exposes lifecycle / identity / tree — NO stdio (its pipes belong to its
-//! real parent).
-//! Every operation re-verifies identity. `wait()` is a death-watch yielding no
-//! `ExitStatus` (the kernel hands exit status only to the real parent — contrast
-//! `Child::wait`).
+//! An open handle on a process this process did not spawn — NO stdio (its pipes belong to its
+//! real parent). The handle is opened from a `ProcessId`, never a bare pid, and every act
+//! reaches that process or reports it gone, never a later holder of its pid. `wait()` is a
+//! death-watch yielding no `ExitStatus` (the kernel hands exit status only to the real
+//! parent — contrast `Child::wait`). Its tree is [`ProcessId::children`] and
+//! [`ProcessId::parent`].
 
 use std::time::Duration;
 

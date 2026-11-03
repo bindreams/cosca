@@ -143,7 +143,7 @@ process:
   `exec`. A failed spawn's warn opens one by number for a child that sent only its `/proc`
   directory, and keeps it only if that directory shows the child unreaped after the open;
 - a cgroup, since `cgroup.kill` names no PID;
-- on macOS, for a process named by a `ProcessId` (`Process`), its audit token: the pid with its
+- on macOS, for a `Process` opened from a `ProcessId`, its audit token: the pid with its
   `p_idversion`, which `proc_signal_with_audittoken` checks in the kernel. A process that took a
   reused pid gets no signal;
 - on Windows, a process handle or Job Object.
@@ -220,7 +220,7 @@ After a foreign reap:
   root's number (its group and its ppid walk), are unsafe. The marker's holders are named by the
   pipe they hold and are still killed exactly.
 - macOS has no pidfd: a child's kill by its number, and a process-group kill, are not exact after
-  the reap. A `Process` named by `ProcessId` stays exact through its audit token (principle 4).
+  the reap. A `Process` opened from a `ProcessId` stays exact through its audit token (principle 4).
 
 **Why:** a library cannot require the whole process to leave its children alone, and processes that
 reap everything are legitimate hosts.
