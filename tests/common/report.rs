@@ -215,10 +215,10 @@ fn is_contained_member(
             unsafe { libc::getpgid(grandchild as libc::pid_t) == root as libc::pid_t }
         }
         #[cfg(unix)]
-        C::FdMarker | C::TreeWalk => cosca::Process::from_pid(grandchild)
+        C::FdMarker | C::TreeWalk => cosca::identity::ProcessId::of(grandchild)
             .found()
             .and_then(|p| p.parent().expect("the grandchild's parent lookup failed"))
-            .is_some_and(|parent| parent.id().pid() == root),
+            .is_some_and(|parent| parent.pid() == root),
         _ => false,
     }
 }

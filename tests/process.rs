@@ -112,28 +112,25 @@ fn from_pid_resolves_a_live_foreign_child_then_reports_it_dead() {
 #[skuld::test]
 fn parent_and_children_resolve_the_spawned_tree() {
     let (child, mut sock) = spawn_blocker();
-    let me = cosca::Process::current();
-    let kid = cosca::Process::from_pid(child.id().pid())
+    let me = cosca::identity::ProcessId::current();
+    let kid = cosca::identity::ProcessId::of(child.id().pid())
         .found()
         .expect("child resolves");
 
     assert_eq!(
         kid.parent()
             .expect("the parent is queryable")
-            .expect("child has a parent")
-            .id(),
-        me.id()
+            .expect("child has a parent"),
+        me
     );
     assert!(me
         .children(cosca::Recursive::No)
         .expect("children are enumerable")
-        .iter()
-        .any(|p| p.id() == kid.id()));
+        .contains(&kid));
     assert!(me
         .children(cosca::Recursive::Yes)
         .expect("children are enumerable")
-        .iter()
-        .any(|p| p.id() == kid.id()));
+        .contains(&kid));
 
     sock.write_all(b"x").expect("release child");
     let _ = child.wait();
@@ -147,8 +144,8 @@ fn children_recursive_distinguishes_direct_from_descendant() {
     // me.children(Yes) but NOT No — the one-level-vs-recursive distinction a No<->Yes arm swap
     // would otherwise pass silently.
     let (child, socks) = common::spawn_grandchild(false);
-    let me = cosca::Process::current();
-    let kid = cosca::Process::from_pid(child.id().pid())
+    let me = cosca::identity::ProcessId::current();
+    let kid = cosca::identity::ProcessId::of(child.id().pid())
         .found()
         .expect("child resolves");
     // The grandchild is kid's only direct child — use it to learn the grandchild's identity.
@@ -161,30 +158,20 @@ fn children_recursive_distinguishes_direct_from_descendant() {
     let grandkid = grandkids[0];
 
     let direct = me.children(cosca::Recursive::No).expect("children are enumerable");
-    assert!(
-        direct.iter().any(|p| p.id() == kid.id()),
-        "Recursive::No must include the direct child"
-    );
-    assert!(
-        !direct.iter().any(|p| p.id() == grandkid.id()),
-        "Recursive::No must EXCLUDE the grandchild"
-    );
+    assert!(direct.contains(&kid), "Recursive::No must include the direct child");
+    assert!(!direct.contains(&grandkid), "Recursive::No must EXCLUDE the grandchild");
     let all = me.children(cosca::Recursive::Yes).expect("children are enumerable");
-    assert!(
-        all.iter().any(|p| p.id() == kid.id()),
-        "Recursive::Yes must include the child"
-    );
-    assert!(
-        all.iter().any(|p| p.id() == grandkid.id()),
-        "Recursive::Yes must include the grandchild"
-    );
+    assert!(all.contains(&kid), "Recursive::Yes must include the child");
+    assert!(all.contains(&grandkid), "Recursive::Yes must include the grandchild");
 
     // Teardown: kill the direct child; the reparented grandchild exits when its socket closes.
     child.kill().expect("kill child");
     // Released after the kill: a kill that sent nothing exits 0.
     drop(socks);
     common::assert_killed("the killed child", child.wait().expect("reap the child"));
-    grandkid.wait().expect("wait for the orphaned grandchild");
+    cosca::Process::from_id(grandkid)
+        .wait()
+        .expect("wait for the orphaned grandchild");
 }
 
 #[skuld::test]
@@ -644,7 +631,7 @@ fn death_watch_accept_or_die_seam_die_now_exits_the_target_before_it_connects() 
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn pid_one_has_no_parent() {
-    let init = cosca::Process::from_pid(1).found().expect("pid 1 resolves");
+    let init = cosca::identity::ProcessId::of(1).found().expect("pid 1 resolves");
     assert!(init.parent().expect("pid 1's parent is answerable").is_none());
 }
 

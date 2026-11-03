@@ -96,7 +96,7 @@ fn every_walk_without_openat2_is_unsupported_naming_it() {
 /// error to `Ok(None)` / `Ok(vec![])`".
 #[skuld::test]
 fn parent_and_children_without_openat2_are_unsupported_naming_it() {
-    let me = crate::Process::from_id(ProcessId::current());
+    let me = ProcessId::current();
     for (errno, code) in [(rustix::io::Errno::NOSYS, "ENOSYS"), (rustix::io::Errno::PERM, "EPERM")] {
         let forced = force_openat2_errno(errno);
         let results = [
@@ -118,7 +118,7 @@ fn parent_and_children_without_openat2_are_unsupported_naming_it() {
 
 // The snapshot precedes the anchor =====
 
-type Query = fn(&crate::Process) -> Result<(), Error>;
+type Query = fn(&ProcessId) -> Result<(), Error>;
 
 fn queries() -> [(&'static str, Query); 3] {
     [
@@ -133,7 +133,7 @@ fn queries() -> [(&'static str, Query); 3] {
 /// on the anchor and the error blames the wrong read.
 #[skuld::test]
 fn parent_and_children_take_the_snapshot_before_the_anchor() {
-    let me = crate::Process::from_id(ProcessId::current());
+    let me = ProcessId::current();
     for (name, query) in queries() {
         for (view, cause) in views() {
             let forced = force_proc_view_once(view);
@@ -154,8 +154,8 @@ fn parent_and_children_take_the_snapshot_before_the_anchor() {
 /// has recovered by then, so the error blames access); "the table read's error is dropped".
 #[skuld::test]
 fn an_anchor_read_that_fails_names_the_view_that_failed_it() {
-    let me = crate::Process::from_id(ProcessId::current());
-    let pid = me.id().pid();
+    let me = ProcessId::current();
+    let pid = me.pid();
     for (name, query) in queries() {
         for (view, cause) in views() {
             let forced = force_proc_view_after(1, view);
@@ -217,9 +217,9 @@ fn every_walk_from_a_root_that_cannot_be_queried_errors_and_signals_nothing() {
 /// Mutant: "a `self` missing from the table is `Ok(None)` / `Ok(vec![])`".
 #[skuld::test]
 fn a_live_self_missing_from_the_table_is_unassessable() {
-    let me = crate::Process::from_id(ProcessId::current());
+    let me = ProcessId::current();
     let _forced = crate::identity::pid_stat::fault::force_stat_read(libc::EACCES, None);
     for (_, query) in queries() {
-        assert_unassessable_naming(query(&me), &[&format!("pid {} is live but absent", me.id().pid())]);
+        assert_unassessable_naming(query(&me), &[&format!("pid {} is live but absent", me.pid())]);
     }
 }

@@ -26,6 +26,9 @@ pub use state::{Existence, Liveness, Resolved};
 mod persist;
 pub use persist::{Platform, ProcessIdRecord, RECORD_VERSION};
 
+#[path = "identity/tree.rs"]
+mod tree;
+
 #[cfg_attr(windows, path = "identity/windows.rs")]
 #[cfg_attr(target_os = "linux", path = "identity/linux.rs")]
 #[cfg_attr(target_os = "macos", path = "identity/macos.rs")]

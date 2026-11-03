@@ -27,7 +27,7 @@ fn walks() -> [(&'static str, Walk); 4] {
     ]
 }
 
-type Query = fn(&crate::Process) -> Result<(), Error>;
+type Query = fn(&ProcessId) -> Result<(), Error>;
 
 fn queries() -> [(&'static str, Query); 3] {
     [
@@ -57,7 +57,7 @@ fn every_walk_over_a_failed_listing_errors_and_signals_nothing() {
 /// Mutant: "`parent` / `children` map the snapshot's error to `Ok(None)` / `Ok(vec![])`".
 #[skuld::test]
 fn parent_and_children_over_a_failed_listing_are_unassessable() {
-    let me = crate::Process::from_id(ProcessId::current());
+    let me = ProcessId::current();
     for (name, query) in queries() {
         let forced = force_blind_snapshot();
         let result = query(&me);
@@ -91,7 +91,7 @@ fn every_walk_over_a_snapshot_with_a_denied_ppid_errors_and_signals_nothing() {
 #[skuld::test]
 fn parent_and_children_over_a_snapshot_with_a_denied_ppid_are_unassessable() {
     let (child, id) = live_member();
-    let me = crate::Process::from_id(ProcessId::current());
+    let me = ProcessId::current();
     for (_, query) in queries() {
         let forced = force_denied(&[id.pid() as libc::c_int]);
         let result = query(&me);

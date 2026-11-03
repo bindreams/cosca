@@ -38,7 +38,7 @@ fn every_walk_over_a_failed_snapshot_errors_and_terminates_nothing() {
 /// Mutant: "`parent` / `children` map the snapshot's error to `Ok(None)` / `Ok(vec![])`".
 #[skuld::test]
 fn parent_and_children_over_a_failed_snapshot_are_unassessable() {
-    let me = crate::Process::from_id(ProcessId::current());
+    let me = ProcessId::current();
     let forced = force_snapshot_failure();
     let results = [
         ("parent", me.parent().map(|_| ())),
@@ -68,7 +68,7 @@ fn a_walk_from_a_root_that_lost_its_pid_terminates_nothing() {
 /// `windows` crate's own `io::Error` conversion, which keeps the HRESULT (`0x80070005`).
 #[skuld::test]
 fn a_failed_snapshot_is_unassessable_with_its_win32_code() {
-    let me = crate::Process::from_id(ProcessId::current());
+    let me = ProcessId::current();
     let forced = force_snapshot_failure();
     let result = me.parent();
     drop(forced);

@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use crate::error::Error;
 use crate::identity::{ProcessId, RawPid};
-use crate::process::Recursive;
 
 #[path = "process/graceful.rs"]
 mod graceful;
@@ -57,17 +56,6 @@ impl Process {
     /// Whether the process is still running (zombie-exclusive; see [`ProcessId::is_alive`]).
     pub fn is_alive(&self) -> crate::identity::Liveness {
         self.inner.is_alive()
-    }
-
-    /// The parent process, by identity (see [`Process::parent`](crate::Process::parent) for
-    /// the identity-guard contract).
-    pub fn parent(&self) -> Result<Option<Process>, Error> {
-        Ok(self.inner.parent()?.map(Process::from))
-    }
-
-    /// The process's children (see [`Process::children`](crate::Process::children)).
-    pub fn children(&self, recursive: Recursive) -> Result<Vec<Process>, Error> {
-        Ok(self.inner.children(recursive)?.into_iter().map(Process::from).collect())
     }
 
     /// Resolve when the process exits. Death-watch — yields no `ExitStatus` (only the real
