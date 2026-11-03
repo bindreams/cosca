@@ -268,10 +268,10 @@ fn ignoring_sigchld_with_a_sibling() -> (SharedChild, std::process::Child, std::
 fn the_holder_waits_on_the_kqueue_not_in_waitid() {
     let mut b = Blocker::spawn();
     b.end_child_and_confirm_exit();
-    let _hooks = test_hooks::HookGuard::install(|_, _| {});
+    let before = test_hooks::await_requested_timeouts().len();
     b.shared.wait().expect("wait");
     assert!(
-        !test_hooks::await_requested_timeouts().is_empty(),
+        !test_hooks::await_requested_timeouts()[before..].is_empty(),
         "the holder never asked the kqueue"
     );
 }

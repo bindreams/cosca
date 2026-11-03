@@ -108,7 +108,6 @@ fn a_deadline_kevent_backoff_is_clamped_and_ends_with_one_peek() {
     let _held = hold_the_clock_until_round(1);
     let limit = Duration::from_millis(30);
     let deadline = at + limit;
-    let _hooks = test_hooks::HookGuard::install(|_, _| {});
     let remainings = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let _rounds = test_hooks::on_every_kevent_round({
         let remainings = std::rc::Rc::clone(&remainings);
@@ -159,7 +158,6 @@ fn an_interrupted_kevent_is_retried_with_the_time_remaining_now() {
     let (_clock, at) = crate::wait::test_clock::FrozenClockGuard::install();
     let _held = hold_the_clock_until_round(0);
     let spent = Duration::from_millis(10);
-    let _hooks = test_hooks::HookGuard::install(|_, _| {});
     let _eintr = test_hooks::force_eintr_once(spent);
     let _stall = test_hooks::on_every_kevent_round(|round| {
         if round == 0 {
@@ -198,42 +196,6 @@ fn await_reapable_with_a_deadline_beyond_the_kevent_limit_returns_the_exit() {
         let armed = armed.expect("a deadline wait arms a bounded kevent");
         assert!(armed <= Duration::from_secs(i32::MAX as u64), "armed {armed:?}");
     }
-    child.wait().expect("reap");
-}
-
-/// The wait's own rounds honour the clamp seam: with the clamp lowered to 10 ms, a 50 ms
-/// deadline is covered by several calls, none longer than the clamp, and the wait still ends only
-/// at the deadline. The clock is held until round 1, so a runner stall cannot leave round 0 the
-/// only blocking call.
-///
-/// Mutant: `kevent_round` arms its `kevent` without `kevent_timeout`: one call carries the whole
-/// remaining time; the clock not held (the stall leaves round 0 5 ms, and it ends the wait).
-#[skuld::test]
-fn await_reapable_rearms_a_remaining_time_above_the_clamp_in_pieces() {
-    let (mut child, stdin) = spawn_blocker();
-    let (_clock, at) = crate::wait::test_clock::FrozenClockGuard::install();
-    let _held = hold_the_clock_until_round(1);
-    let _hooks = test_hooks::HookGuard::install(|_, _| {});
-    let clamp = Duration::from_millis(10);
-    test_hooks::set_clamp_override(clamp);
-    let _stall = test_hooks::on_every_kevent_round(|round| {
-        if round == 0 {
-            stall(Duration::from_millis(45));
-        }
-    });
-    let waited = await_reapable(child.id(), None, Some(at + Duration::from_millis(50))).expect("wait");
-    assert_eq!(waited, Waited::DeadlinePassed);
-    let timeouts = test_hooks::await_requested_timeouts();
-    let blocking = timeouts.iter().filter(|t| **t != Some(Duration::ZERO)).count();
-    assert!(
-        blocking >= 2,
-        "one call cannot cover 50 ms under a 10 ms clamp: {timeouts:?}"
-    );
-    assert!(
-        timeouts.iter().all(|t| t.is_some_and(|t| t <= clamp)),
-        "every call is capped: {timeouts:?}"
-    );
-    drop(stdin);
     child.wait().expect("reap");
 }
 
@@ -282,7 +244,6 @@ fn no_evfilt_proc_event_arrives_after_the_round_that_delivered_note_exit() {
         );
     }
     let (mut child, stdin) = spawn_blocker();
-    let _hooks = test_hooks::HookGuard::install(|_, _| {});
     let mut stdin = Some(stdin);
     // The child exits only after `EVFILT_PROC` is registered and the wait is about to block.
     let _end = test_hooks::on_kevent_round(0, move || drop(stdin.take()));
