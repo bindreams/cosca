@@ -1051,8 +1051,8 @@ pub(crate) fn wait_drained_raw(
         // already-elapsed) deadline must still observe the tree's ACTUAL current state on the
         // one round it gets, not conclude `MembersRemain` purely because it arrived too late to
         // look — a ZERO probe on an already-drained tree must report `AllMembersExited`, the
-        // same verdict an unbounded wait would find. This mirrors `block_on_kqueue`'s
-        // `already_elapsed` handling on the macOS side: the real observation always happens
+        // same verdict an unbounded wait would find. This mirrors `Kqueue::wait` on the macOS
+        // side, which takes one look at an elapsed deadline: the real observation always happens
         // first; an elapsed deadline only forecloses looping back for ANOTHER round afterward
         // (see the `handles.is_empty()` branch below, and the `ms` computation for the bounded
         // wait itself).

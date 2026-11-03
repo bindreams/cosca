@@ -54,11 +54,11 @@
 //!   writer sustaining ~1 GB/s) to carry a member that is already outside the marker's contract.
 
 use std::os::fd::{AsRawFd, BorrowedFd};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::containment::TreeDrain;
 use crate::error::Error;
-use crate::os_process::macos::kqueue::{Event, Kqueue, Subscription};
+use crate::os_process::macos::kqueue::{Event, Kqueue, Subscription, WaitOutcome};
 
 #[cfg(test)]
 #[path = "marker_eof_tests.rs"]
@@ -83,9 +83,9 @@ fn ensure_nonblocking(read_end: BorrowedFd<'_>) -> Result<(), Error> {
 /// KERNEL just reported via the triggering kevent's own `data` field, never "keep reading
 /// until it stops." Below the low-water clamp this branch never runs at all; at or above it —
 /// and only for a caller with an actual deadline, see `interpret_read_event` — this is what
-/// keeps a single round bounded — the OUTER loop (`os_process::macos::kqueue::block_on_kqueue`, reached via
-/// `block_until_drained`) is what keeps the total wait bounded by the caller's deadline despite
-/// repeated rounds.
+/// keeps a single round bounded — the OUTER loop (`block_until_drained`, over
+/// `os_process::macos::kqueue::Kqueue::wait`) is what keeps the total wait bounded by the caller's
+/// deadline despite repeated rounds.
 fn drain_pending(read_end: BorrowedFd<'_>, original_n: usize) -> Result<(), Error> {
     let mut n = original_n;
     let mut buf = [0u8; 4096];
@@ -178,9 +178,9 @@ pub(crate) fn arm(read_end: BorrowedFd<'_>, unbounded_wait: bool) -> Result<Kque
 ///     indefinite wait cannot honestly offer both zero CPU and forward progress for a sustained
 ///     writer, and why this crate chooses zero CPU plus the writer's own self-limiting contract
 ///     (`fdmarker`'s module doc) here.
-///   - `block_until_drained`, BOUNDED with the deadline already elapsed this round: no blocking
-///     at all — `block_on_kqueue` returns `MembersRemain` on THIS round's inconclusive
-///     `Ok(None)` immediately, since there is no deadline left to fund another round.
+///   - `block_until_drained`, BOUNDED with the deadline already elapsed when the events arrive:
+///     it returns `MembersRemain` on THIS round's inconclusive `Ok(None)`, since there is no
+///     deadline left to fund another round.
 ///   - `probe`, always: a zero-timeout check IS a check at expiry, the same one a bounded wait
 ///     performs on its own final round — see `probe`'s own doc.
 ///
@@ -219,8 +219,8 @@ fn interpret_read_event(
 /// `None`-shaped cases apart otherwise. `drain_kqueue` has two production callers: `probe`, which
 /// doesn't need the distinction and folds `Declined` and `Spurious` back together, and
 /// `crate::tokio::wait`'s `wait_tree_drained_inner`, which DOES distinguish them — only
-/// `Declined` fires its `#[cfg(test)]` seam. `block_until_drained` calls `interpret_read_event`
-/// directly, through `os_process::macos::kqueue::block_on_kqueue`, never `drain_kqueue` itself.
+/// `Declined` fires its `#[cfg(test)]` seam. `block_until_drained` calls `interpret_events`
+/// directly, over `Kqueue::wait`, never `drain_kqueue` itself.
 #[derive(Debug)]
 pub(crate) enum DrainOutcome {
     /// `EV_EOF` — a terminal verdict.
@@ -242,6 +242,22 @@ impl DrainOutcome {
     }
 }
 
+/// Interprets `events`, in order, until one is a verdict; the shared body of `drain_kqueue` and
+/// `block_until_drained`. `suppress_drain` is `interpret_read_event`'s own parameter of the same
+/// name, passed straight through.
+fn interpret_events(
+    events: Vec<Event>,
+    read_end: BorrowedFd<'_>,
+    suppress_drain: bool,
+) -> Result<Option<TreeDrain>, Error> {
+    for event in events {
+        if let Some(verdict) = interpret_read_event(event, read_end, suppress_drain)? {
+            return Ok(Some(verdict));
+        }
+    }
+    Ok(None)
+}
+
 /// Takes every event pending on an armed kqueue through `Kqueue::poll`, without blocking, and
 /// interprets them in order until one is a verdict. `suppress_drain` is `interpret_read_event`'s
 /// own parameter of the same name, passed straight through — see that function's own doc for what
@@ -251,12 +267,10 @@ pub(crate) fn drain_kqueue(kq: &Kqueue, read_end: BorrowedFd<'_>, suppress_drain
     if events.is_empty() {
         return Ok(DrainOutcome::Spurious);
     }
-    for event in events {
-        if let Some(verdict) = interpret_read_event(event, read_end, suppress_drain)? {
-            return Ok(DrainOutcome::Drained(verdict));
-        }
-    }
-    Ok(DrainOutcome::Declined)
+    Ok(match interpret_events(events, read_end, suppress_drain)? {
+        Some(verdict) => DrainOutcome::Drained(verdict),
+        None => DrainOutcome::Declined,
+    })
 }
 
 /// One-shot drain check: exact, not heuristic — arms a private kqueue and reads its
@@ -292,33 +306,36 @@ pub(crate) fn probe(read_end: BorrowedFd<'_>) -> Result<TreeDrain, Error> {
 /// `deadline`: `None` = block indefinitely, `Some(at)` = an absolute deadline; a deadline
 /// already in the past still performs exactly one non-blocking check before concluding — the
 /// sticky, level-triggered `EV_EOF` a genuinely-already-drained tree left pending must be
-/// observed, not assumed away by the elapsed deadline alone. Uses one kernel syscall per wait
-/// round — no interval is chosen anywhere in this path.
+/// observed, not assumed away by the elapsed deadline alone. No interval is chosen anywhere in
+/// this path.
 ///
-/// The per-round deadline-checking and `kevent` mechanics live in `os_process::macos::kqueue::block_on_kqueue`
-/// (shared with the proc-exit watch); this function supplies only the marker's own arm and
-/// per-event interpretation (`interpret_read_event`).
+/// The per-round deadline-checking and `kevent` mechanics live in
+/// `os_process::macos::kqueue::Kqueue::wait` (shared with the proc-exit watch); this function
+/// supplies only the marker's own arm and per-event interpretation (`interpret_events`).
 ///
 /// An unbounded wait (`None`) never drains bytes past the low-water clamp on a sustained
 /// writer — see the module doc for why, and `interpret_read_event` for where that decision is
 /// made. A bounded wait (`Some(_)`, including one already past) keeps draining as long as its
-/// deadline has funding left; once a round starts with the deadline already elapsed, that round
-/// stops draining too (principle 13) — same `suppress_drain` flag, just also true for that
-/// reason.
+/// deadline has funding left. Whether it has is read AFTER `wait` returns the events, from a
+/// fresh `remaining(deadline)`, never from a sample taken before the call, which may have blocked
+/// across the deadline: events that arrive with the deadline elapsed stop draining too
+/// (principle 13) — same `suppress_drain` flag, just also true for that reason.
 pub(crate) fn block_until_drained(read_end: BorrowedFd<'_>, deadline: Option<Instant>) -> Result<TreeDrain, Error> {
     let unbounded_wait = crate::wait::remaining(deadline).is_none();
     let kq = arm(read_end, unbounded_wait)?;
-    crate::os_process::macos::kqueue::block_on_kqueue(
-        &kq,
-        deadline,
-        TreeDrain::MembersRemain,
-        |event, already_elapsed| {
-            // `from_kevent` has already warned about an event no subscription can produce.
-            Event::from_kevent(event).map_or(Ok(None), |event| {
-                interpret_read_event(event, read_end, unbounded_wait || already_elapsed)
-            })
-        },
-    )
+    loop {
+        let events = match kq.wait(deadline)? {
+            WaitOutcome::Events(events) => events,
+            WaitOutcome::DeadlinePassed => return Ok(TreeDrain::MembersRemain),
+        };
+        let elapsed = crate::wait::remaining(deadline) == Some(Duration::ZERO);
+        if let Some(verdict) = interpret_events(events, read_end, unbounded_wait || elapsed)? {
+            return Ok(verdict);
+        }
+        if elapsed {
+            return Ok(TreeDrain::MembersRemain);
+        }
+    }
 }
 
 // Detecting a supervisor-retained write-end copy =====

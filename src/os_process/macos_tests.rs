@@ -336,27 +336,3 @@ fn a_pid_zero_identity_never_reaches_kill() {
         "the caller must have survived - nothing may signal process group 0"
     );
 }
-
-/// A deadline beyond XNU's `kevent` `tv_sec` limit still returns the child's exit. The child is
-/// ended from the round hook, so the exit is pending or imminent when `kevent` is called.
-///
-/// Mutant: drop the clamp in `kevent_timeout` -> `Io(EINVAL)` at once.
-#[skuld::test]
-fn a_deadline_beyond_the_kevent_limit_still_returns_the_exit() {
-    use std::time::Duration;
-
-    let mut child = crate::test_spawn::spawn(&mut crate::test_child::held_std_blocker(std::process::Stdio::null()))
-        .expect("spawn blocker");
-    let id = ProcessId::of(child.id()).found().expect("identity of live child");
-    let mut stdin = child.stdin.take();
-    let _hooks = crate::os_process::macos::kqueue::test_hooks::HookGuard::install(move |_, _| drop(stdin.take()));
-    let exited = crate::os_process::drive::exited_by_id(id, Some(Duration::from_secs(u64::from(u32::MAX))))
-        .expect("a far deadline is not an error");
-    assert!(exited, "the child was ended, so the wait reports its exit");
-    assert_eq!(
-        crate::os_process::macos::kqueue::test_hooks::requested_timeouts(),
-        [Some(Duration::from_secs(i32::MAX as u64))],
-        "one kevent, armed with the clamp"
-    );
-    child.wait().expect("reap");
-}

@@ -299,9 +299,9 @@ pub(crate) async fn wait_tree_deadline(
 /// Test seam: fires every time [`wait_tree_drained_inner`]'s watch loop gets
 /// `DrainOutcome::Declined` (a genuine non-EOF event, retrieved and interpreted, that did not
 /// resolve the wait; its bytes were discarded when `suppress_drain` is false and left buffered
-/// when true). Never `Spurious`. A `#[cfg(test)]` thread-local installed by an RAII guard, like
-/// `os_process::macos::kqueue::test_hooks::HookGuard`, so no production signature carries it. It relies on a
-/// current-thread runtime: the future is polled on the installing thread.
+/// when true). Never `Spurious`. A `#[cfg(test)]` thread-local installed by an RAII guard, so no
+/// production signature carries it. It relies on a current-thread runtime: the future is polled on
+/// the installing thread.
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) mod declined_hook {
     use std::cell::RefCell;

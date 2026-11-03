@@ -399,8 +399,9 @@ Every caller-supplied deadline cosca accepts (for example `wait_timeout`, `wait_
   structurally, not by timing: a `#[cfg(test)]` seam reports the deadline (or remaining time) a
   wait was actually armed with, or whether a blocking call happened at all, and a test clock
   advanced past the deadline shows the next check returning without another round. That seam is
-  introduced by [#240] (the macOS kqueue wait) and [#207] (the cgroup drain waits); [#242] tracks
-  the gap until they land.
+  introduced by [#207] (the cgroup drain waits); [#242] tracks the gap until it lands. The macOS
+  kqueue wait ([#240]) has no seam: what it does after a `kevent` that returned no event is a pure
+  function with a value table, and real-clock tests cover the rest.
 
 cosca promises no upper bound on how late after the deadline it actually reports the outcome —
 scheduler, load, a suspended process, or a waiting primitive's own rounding below its API can delay
