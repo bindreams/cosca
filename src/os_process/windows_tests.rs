@@ -10,7 +10,7 @@ use crate::os_process::{kill_by_id, open, terminate_by_id, Exit, Op, OsProcess a
 use crate::signal::{Sent, Sig};
 use crate::test_child::live_blocker as blocker;
 
-/// The kill handle lacks `SYNCHRONIZE`, so the wait goes through a second, `Op::Wait` object.
+/// A kill and a wait on two objects opened for the same process (one open serves both from Task 4).
 #[skuld::test]
 fn open_live_then_kill_then_exited() {
     let (child, _stdin, id) = blocker();
@@ -95,30 +95,6 @@ fn terminate_by_id_is_unsupported_and_sends_nothing() {
     child.wait().unwrap();
 }
 
-/// A look at a signal-only object is a caller bug: a debug assertion, and in release a typed `Err`
-/// rather than the OS's denial of the handle's missing `SYNCHRONIZE`; never an answer.
-///
-/// Mutant: `exited` waits on a handle opened for a kill, so the error is a raw `ACCESS_DENIED`.
-#[skuld::test]
-fn a_kill_opens_no_wait_and_still_kills() {
-    let (child, _stdin, id) = blocker();
-    let p = open(id, Op::Kill).unwrap().expect("a live process opens");
-    let looked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.exited().map(|_| ())));
-    // Debug builds assert the contract; release builds return the error.
-    let err = match looked {
-        Ok(Err(Error::Io(e))) => Some(e),
-        Err(_) => None,
-        Ok(other) => panic!("a signal-only process has no wait to answer a look: {other:?}"),
-    };
-    match err {
-        Some(e) => assert!(e.to_string().contains("opened for a signal"), "{e}"),
-        None if cfg!(debug_assertions) => {}
-        None => panic!("release builds return an error, not a panic"),
-    }
-    assert_eq!(p.signal(Sig::Kill).unwrap(), Sent::Delivered);
-    child.wait().unwrap();
-}
-
 /// Mutant: a look hands out some other handle to wait on.
 #[skuld::test]
 fn the_wait_is_on_the_opened_process_handle() {
@@ -150,8 +126,8 @@ fn signal_failure_carries_the_win32_code() {
 
     let p = super::WindowsProcess {
         id: ProcessId::current(),
-        op: Op::Kill,
         handle: super::cancel::new_cancel_event().expect("create an event handle"),
+        has_synchronize: true,
     };
     let err = p.signal(Sig::Kill).expect_err("an event cannot be terminated");
     let Error::Io(io) = err else {
@@ -174,6 +150,68 @@ fn kill_by_id_of_a_process_that_is_exiting_but_not_signalled_is_ok() {
     child.wait().expect("reap the fixture");
 
     result.expect("a refusal on an exiting process is not a failed kill");
+}
+
+// The access rule =====
+
+/// The `Io` error of `ERROR_ACCESS_DENIED` that a refused look or kill carries.
+fn assert_access_denied<T: std::fmt::Debug>(result: Result<T, Error>, what: &str) {
+    let Err(Error::Io(io)) = result else {
+        panic!("{what} must be Io(ERROR_ACCESS_DENIED), got {result:?}");
+    };
+    assert_eq!(io.raw_os_error(), Some(ERROR_ACCESS_DENIED.0 as i32), "{what}: {io:?}");
+}
+
+/// QUERY alone: no `SYNCHRONIZE`, so a look reads the exit code. A running process cannot be told
+/// from exit code 259, so the look is refused; an exit proves itself.
+///
+/// Mutant: a look without `SYNCHRONIZE` reads `STILL_ACTIVE` as running, or as an exit.
+#[skuld::test]
+fn a_look_without_synchronize_reads_the_exit_code() {
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(a_look_without_synchronize_reads_the_exit_code),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
+    let child = crate::identity::windows_fixture::spawn_query_only(&done);
+    let id = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
+        .expect("the owned handle always yields an identity");
+    let p = open(id, Op::Wait)
+        .unwrap()
+        .expect("a live process opens with QUERY alone");
+    assert_access_denied(p.exited(), "a look at a running process");
+    assert_access_denied(
+        drive(&*p, absolute(Some(Duration::ZERO))),
+        "a driven look at a running process",
+    );
+    child.terminate();
+    assert!(
+        matches!(p.exited().unwrap(), Exit::Exited),
+        "an exit code proves the exit"
+    );
+}
+
+/// A kill refused for lack of `PROCESS_TERMINATE` on a live process is the OS's denial, as `Io`,
+/// and kills nothing.
+///
+/// Mutant: the refusal reads as an exit (`Gone`), or as `Unassessable`.
+#[skuld::test]
+fn kill_of_a_live_process_without_terminate_is_io_access_denied() {
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(kill_of_a_live_process_without_terminate_is_io_access_denied),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
+    let child = crate::identity::windows_fixture::spawn_query_only(&done);
+    let id = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
+        .expect("the owned handle always yields an identity");
+    let p = open(id, Op::Kill)
+        .unwrap()
+        .expect("a live process opens with QUERY alone");
+    assert_access_denied(p.signal(Sig::Kill), "a kill without PROCESS_TERMINATE");
+    assert!(child.is_running(), "nothing killed it");
 }
 
 // Win32 codes of failures =====

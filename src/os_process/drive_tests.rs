@@ -90,8 +90,6 @@ fn duration_max_is_unbounded() {
 
 /// One open serves a signal and a wait from different threads: `Sync`, `&self`. The wait ends
 /// only when the killed process exits, so the two threads need no other sync.
-// Not on Windows until the per-op access masks end (Task 4): a wait-opened handle there cannot kill.
-#[cfg(not(windows))]
 #[skuld::test]
 fn looks_and_a_signal_on_one_process_run_from_two_threads() {
     use crate::os_process::{open, Op, OsProcess};

@@ -76,7 +76,7 @@ pub(crate) enum Op {
 
 /// What [`OsProcess::exited`] returns on an object [`open`]ed for a signal, which holds nothing to
 /// wait on. Asking is a caller bug: a debug assertion, and in release this error.
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn opened_for_a_signal() -> Error {
     debug_assert!(false, "exited() on a process opened for a signal, not a wait");
     Error::Io(std::io::Error::other(

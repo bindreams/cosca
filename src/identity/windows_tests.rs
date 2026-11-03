@@ -1,7 +1,9 @@
 use windows::Win32::Foundation::ERROR_ACCESS_DENIED;
-use windows::Win32::System::Threading::{PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE};
+use windows::Win32::System::Threading::{
+    PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+};
 
-use super::{creation_token, current_token, is_running, start_token};
+use super::{creation_token, current_token, exit_look, is_running, open_dropping_refused, start_token, Look, Opened};
 use crate::identity::windows_fixture::spawn_restricted;
 use crate::identity::{Liveness, Resolved, StartToken};
 
@@ -212,6 +214,115 @@ fn kill_of_a_terminate_denied_but_exited_process_reports_success() {
     crate::os_process::kill_by_id(id).expect("killing an already-exited process is success");
 }
 
+const OPTIONAL: [PROCESS_ACCESS_RIGHTS; 2] = [PROCESS_SYNCHRONIZE, PROCESS_TERMINATE];
+
+/// The rights `open_dropping_refused` grants on `pid`, the handle closed. `None`: the open is
+/// denied.
+fn granted_on(pid: u32) -> Option<PROCESS_ACCESS_RIGHTS> {
+    match open_dropping_refused(pid, &OPTIONAL) {
+        (Opened::Found(handle), granted) => {
+            super::close(handle);
+            Some(granted)
+        }
+        (Opened::Denied(_), _) => None,
+        (Opened::Gone, _) => panic!("pid {pid} is live"),
+    }
+}
+
+/// Each refused right is dropped on its own, down to the query right; a process that refuses even
+/// that is denied.
+///
+/// Mutant: one refusal drops every optional right, or the search stops at the first denial.
+#[skuld::test]
+fn open_dropping_refused_drops_each_refused_right() {
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(open_dropping_refused_drops_each_refused_right),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
+    let query = PROCESS_QUERY_LIMITED_INFORMATION;
+    let query_only = crate::identity::windows_fixture::spawn_query_only(&done);
+    assert_eq!(granted_on(query_only.pid()), Some(query));
+    let restricted = spawn_restricted(&done, query.0);
+    assert_eq!(granted_on(restricted.pid()), Some(query | PROCESS_TERMINATE));
+    assert_eq!(
+        granted_on(std::process::id()),
+        Some(query | PROCESS_SYNCHRONIZE | PROCESS_TERMINATE)
+    );
+    let unkillable = crate::identity::windows_fixture::spawn_unkillable(&done);
+    assert_eq!(granted_on(unkillable.pid()), None, "QUERY itself is refused");
+}
+
+/// What `is_running` must say for a look: the mapping of `exit_look`'s answer.
+fn liveness_of(look: windows::core::Result<Look>) -> Liveness {
+    match look {
+        Ok(Look::Running) => Liveness::Alive,
+        Ok(Look::Exited) => Liveness::Dead,
+        Err(_) => Liveness::Unknown,
+    }
+}
+
+/// `is_running` is `exit_look` over the handle `open_dropping_refused` opened, with the token check
+/// and the denial in front.
+///
+/// Mutant: `is_running` keeps its own look, which drifts from `exit_look`.
+#[skuld::test]
+fn exit_look_agrees_with_is_running() {
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(exit_look_agrees_with_is_running),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
+    let look_at = |pid: u32| {
+        let (Opened::Found(handle), granted) = open_dropping_refused(pid, &[PROCESS_SYNCHRONIZE]) else {
+            panic!("pid {pid} opens with QUERY");
+        };
+        let look = exit_look(handle, granted.0 & PROCESS_SYNCHRONIZE.0 != 0);
+        super::close(handle);
+        look
+    };
+    let token_of = |pid: u32| match start_token(pid) {
+        Resolved::Found(t) => t,
+        other => panic!("pid {pid} resolves: {other:?}"),
+    };
+
+    let me = std::process::id();
+    assert_eq!(is_running(me, token_of(me)), liveness_of(look_at(me)));
+    assert_eq!(is_running(me, token_of(me)), Liveness::Alive);
+
+    let query_only = crate::identity::windows_fixture::spawn_query_only(&done);
+    let token = token_of(query_only.pid());
+    assert_eq!(
+        is_running(query_only.pid(), token),
+        liveness_of(look_at(query_only.pid()))
+    );
+    assert_eq!(
+        is_running(query_only.pid(), token),
+        Liveness::Unknown,
+        "running, unprovable"
+    );
+    query_only.terminate();
+    assert_eq!(
+        is_running(query_only.pid(), token),
+        liveness_of(look_at(query_only.pid()))
+    );
+    assert_eq!(
+        is_running(query_only.pid(), token),
+        Liveness::Dead,
+        "an exit code proves it"
+    );
+
+    let unkillable = crate::identity::windows_fixture::spawn_unkillable(&done);
+    let token = creation_token(unkillable.handle()).expect("the owned handle reads the token");
+    assert_eq!(
+        is_running(unkillable.pid(), token),
+        Liveness::Unknown,
+        "QUERY refused: no look"
+    );
+}
+
 /// A stale identity over a pid whose occupant we CAN read: the token comparison runs, finds
 /// a different process, and reports the original exited.
 #[skuld::test]
@@ -359,10 +470,10 @@ fn an_exiting_refusal_on_a_handle_without_terminate_is_failed_while_unsignalled(
     assert!(super::is_access_denied(&e), "{e:?}");
 }
 
-/// A handle with neither `PROCESS_TERMINATE` nor `SYNCHRONIZE` cannot be waited on: `Failed` with
-/// the refusal, not `Exited`.
+/// A handle with neither `PROCESS_TERMINATE` nor `SYNCHRONIZE` to a running process: `Failed` with
+/// the refusal, not `Exited`. Its exit code, `STILL_ACTIVE`, cannot be told from exit code 259.
 ///
-/// Mutant: the wait's `WAIT_FAILED` reads as the exit.
+/// Mutant: `STILL_ACTIVE` reads as the exit.
 #[skuld::test]
 fn a_refusal_on_a_handle_without_terminate_or_synchronize_is_failed() {
     let child = spawn_blocked_child();
@@ -392,6 +503,25 @@ fn a_refusal_on_a_handle_without_terminate_is_the_exit_once_the_process_is_signa
     assert!(
         matches!(outcome, super::Termination::Exited),
         "a signalled process is the exit"
+    );
+}
+
+/// A handle with neither `PROCESS_TERMINATE` nor `SYNCHRONIZE` to a process that has exited: its
+/// exit code is the proof of the exit.
+///
+/// Mutant: the exit code is not read, so the refusal stays `Failed`.
+#[skuld::test]
+fn a_refusal_on_a_handle_without_terminate_or_synchronize_is_the_exit_once_the_code_is_recorded() {
+    let mut child = spawn_blocked_child();
+    let limited = Limited::of(&child, PROCESS_QUERY_LIMITED_INFORMATION);
+    child.kill().expect("end the fixture");
+    // Reap through a real wait: the exit code is recorded when this returns.
+    child.wait().expect("reap the fixture");
+    let outcome = super::terminate_held(limited.0);
+    drop(limited);
+    assert!(
+        matches!(outcome, super::Termination::Exited),
+        "an exit code other than STILL_ACTIVE is the exit"
     );
 }
 

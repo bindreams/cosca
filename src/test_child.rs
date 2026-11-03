@@ -781,7 +781,8 @@ fn watch_windows(listener: &std::net::TcpListener, target: crate::identity::Proc
     use windows::Win32::Networking::WinSock::{WSAEventSelect, FD_ACCEPT, SOCKET, WSAEVENT};
     use windows::Win32::System::Threading::{WaitForMultipleObjects, INFINITE};
 
-    let Some(process) = crate::os_process::windows::open_verified(target).expect("open a handle to watch the target")
+    let Some((process, _granted)) =
+        crate::os_process::windows::open_verified(target).expect("open a handle to watch the target")
     else {
         return WatchEvent::Died;
     };
