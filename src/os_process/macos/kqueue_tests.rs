@@ -534,7 +534,7 @@ fn wait_reports_a_process_exit() {
     child.wait().expect("reap");
 }
 
-/// Two pipes written in turn: `poll` returns the first one's event first, unsorted.
+/// Pipes written in turn: `poll` returns their events in that order, unsorted.
 #[skuld::test]
 fn poll_returns_events_in_the_order_they_became_pending() {
     events_come_in_the_order_they_became_pending(|kq| kq.poll().expect("poll"));
@@ -551,7 +551,8 @@ fn events_come_in_the_order_they_became_pending(read: impl FnOnce(&Kqueue) -> Ve
 
     let kq = Kqueue::new().expect("kqueue");
     let mut pipes = Vec::new();
-    for _ in 0..2 {
+    // Three, so the events after `wait`'s first read are more than one and their order shows too.
+    for _ in 0..3 {
         let (reader, writer) = std::io::pipe().expect("pipe");
         kq.subscribe(Subscription::Readable {
             fd: reader.as_raw_fd(),
