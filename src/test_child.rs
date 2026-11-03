@@ -1141,9 +1141,8 @@ pub(crate) fn run_fixture_case(fixture: &str, marker_env: &str, case_env: &str, 
     );
 }
 
-/// Set `signo`'s disposition, process-wide: `SIG_IGN` if `ignore`, else `SIG_DFL`. It changes
-/// every thread of the process, so only a process the test owns may call it: a fixture re-exec (see
-/// [`run_fixture_case`]), or a test under nextest, which runs each test in a process of its own.
+/// Set `signo`'s disposition, process-wide: `SIG_IGN` if `ignore`, else `SIG_DFL`. Only a fixture
+/// re-exec (see [`run_fixture_case`]) may call it: it changes every thread of the process.
 #[cfg(target_os = "macos")]
 pub(crate) fn set_signal_ignored(signo: libc::c_int, ignore: bool) {
     let handler = if ignore { libc::SIG_IGN } else { libc::SIG_DFL };

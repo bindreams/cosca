@@ -409,10 +409,22 @@ fn a_readable_subscription_reports_the_close() {
     );
 }
 
+const SIGNAL_COUNT_MARKER: &str = "COSCA_TEST_KQUEUE_SIGNAL_COUNT";
+const SIGNAL_COUNT_CASE: &str = "COSCA_TEST_KQUEUE_SIGNAL_COUNT_CASE";
+
+/// Runs re-exec'd: it ignores `SIGUSR1` process-wide.
 #[skuld::test]
 fn a_signal_subscription_counts_deliveries() {
     const DELIVERIES: usize = 3;
 
+    if !crate::test_child::is_marked_fixture_reexec(SIGNAL_COUNT_MARKER) {
+        return crate::test_child::run_fixture_case(
+            crate::test_child::fixture_path!(a_signal_subscription_counts_deliveries),
+            SIGNAL_COUNT_MARKER,
+            SIGNAL_COUNT_CASE,
+            "",
+        );
+    }
     crate::test_child::set_signal_ignored(libc::SIGUSR1, true);
     let kq = Kqueue::new().expect("kqueue");
     kq.subscribe(Subscription::Signal(libc::SIGUSR1)).expect("subscribe");
@@ -428,7 +440,6 @@ fn a_signal_subscription_counts_deliveries() {
             count: DELIVERIES
         }]
     );
-    crate::test_child::set_signal_ignored(libc::SIGUSR1, false);
 }
 
 #[skuld::test]
