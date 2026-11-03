@@ -32,8 +32,9 @@ pub struct Process {
 }
 
 impl Process {
-    /// Open the process `id` names. `Ok(None)`: no process has this identity (it has exited, or
-    /// its pid now names another process).
+    /// Open the process `id` names. `Ok(None)`: no process has this identity (it is fully gone, or
+    /// its pid now names another process). A process that has exited but is not yet reaped, or
+    /// whose handle someone else still holds, opens as `Some` and reads [`Liveness::Dead`].
     ///
     /// # Errors
     ///
@@ -44,9 +45,9 @@ impl Process {
         Ok(crate::os_process::open(id)?.map(|os| Process { id, os }))
     }
 
-    /// [`open`](Self::open) the process holding `pid` now. `Ok(None)` if no process has the pid.
-    /// Errors as for [`open`](Self::open); a pid whose identity cannot be read is
-    /// [`Error::Unassessable`].
+    /// [`open`](Self::open) the process holding `pid` now. `Ok(None)` if no process has the pid;
+    /// an exited but unreaped one opens as for [`open`](Self::open). Errors as for `open`; a pid
+    /// whose identity cannot be read is [`Error::Unassessable`].
     pub fn open_pid(pid: RawPid) -> Result<Option<Process>, Error> {
         match ProcessId::of_explained(pid) {
             (Resolved::Found(id), _) => Process::open(id),
