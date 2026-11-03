@@ -51,8 +51,8 @@ impl Process {
 
     /// Best-effort graceful (`SIGTERM`) sweep of the foreign process's tree (identity-walk, root
     /// then descendants). Signal-only. Unix only: on Windows this rests on
-    /// [`terminate`](Process::terminate), whose two absences — no pinned pid, and no way to
-    /// learn whether a foreign pid leads a group — apply here too, so it returns `Unsupported`
+    /// [`terminate`](Process::terminate), whose absence — no way to learn whether a foreign
+    /// pid leads a group — applies here too, so it returns `Unsupported`
     /// (use [`kill_tree`](Process::kill_tree) for a hard sweep).
     ///
     /// # Errors
