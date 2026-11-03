@@ -157,7 +157,7 @@ pub(super) fn terminate_unsupported() -> Error {
 }
 
 impl OsProcess for WindowsProcess {
-    fn signal(&mut self, sig: Sig) -> Result<Sent, Error> {
+    fn signal(&self, sig: Sig) -> Result<Sent, Error> {
         match sig {
             Sig::Kill => match windows_terminate_held(self.raw()) {
                 Termination::Terminated => Ok(Sent::Delivered),
@@ -170,7 +170,7 @@ impl OsProcess for WindowsProcess {
         }
     }
 
-    fn exited(&mut self) -> Result<Exit<'_>, Error> {
+    fn exited(&self) -> Result<Exit<'_>, Error> {
         // A handle opened for a signal lacks `SYNCHRONIZE`.
         if self.op != Op::Wait {
             return Err(super::opened_for_a_signal());

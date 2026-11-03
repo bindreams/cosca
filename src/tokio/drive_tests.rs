@@ -21,8 +21,8 @@ fn poll_once<F: Future>(fut: F) -> Poll<F::Output> {
 /// Mutant: await at a zero timeout, or look a second time.
 #[skuld::test]
 async fn zero_timeout_looks_once_and_never_waits() {
-    let mut p = fake([Answer::Running]);
-    let Poll::Ready(answer) = poll_once(drive(&mut p, absolute(Some(Duration::ZERO)))) else {
+    let p = fake([Answer::Running]);
+    let Poll::Ready(answer) = poll_once(drive(&p, absolute(Some(Duration::ZERO)))) else {
         panic!("a zero timeout must not wait");
     };
     assert!(!answer.unwrap());
@@ -32,8 +32,8 @@ async fn zero_timeout_looks_once_and_never_waits() {
 /// Mutant: swallow a failed look as a wake, or wait before returning it.
 #[skuld::test]
 async fn a_failed_look_is_returned_without_waiting() {
-    let mut p = fake([Answer::Err(std::io::ErrorKind::PermissionDenied)]);
-    let Poll::Ready(answer) = poll_once(drive(&mut p, absolute(None))) else {
+    let p = fake([Answer::Err(std::io::ErrorKind::PermissionDenied)]);
+    let Poll::Ready(answer) = poll_once(drive(&p, absolute(None))) else {
         panic!("a failed look must not wait");
     };
     let err = answer.unwrap_err();
@@ -47,8 +47,8 @@ async fn a_failed_look_is_returned_without_waiting() {
 /// Mutant: wait before looking, or after an `Exited` look.
 #[skuld::test]
 async fn exited_before_first_look_returns_true_without_waiting() {
-    let mut p = fake([Answer::Exited]);
-    let Poll::Ready(answer) = poll_once(drive(&mut p, absolute(None))) else {
+    let p = fake([Answer::Exited]);
+    let Poll::Ready(answer) = poll_once(drive(&p, absolute(None))) else {
         panic!("an exited process must not wait");
     };
     assert!(answer.unwrap());
@@ -58,9 +58,9 @@ async fn exited_before_first_look_returns_true_without_waiting() {
 /// Mutant: trust the wake as the answer instead of looking again.
 #[skuld::test]
 async fn wakes_and_looks_again() {
-    let mut p = fake([Answer::Running, Answer::Exited]);
+    let p = fake([Answer::Running, Answer::Exited]);
     p.wake();
-    assert!(drive(&mut p, absolute(Some(Duration::from_secs(60)))).await.unwrap());
+    assert!(drive(&p, absolute(Some(Duration::from_secs(60)))).await.unwrap());
     assert_eq!(p.looks(), 2);
 }
 
@@ -69,9 +69,9 @@ async fn wakes_and_looks_again() {
 #[skuld::test]
 async fn expiry_ends_in_one_final_look() {
     let timeout = Duration::from_millis(50);
-    let mut p = fake([Answer::Running, Answer::Running]);
+    let p = fake([Answer::Running, Answer::Running]);
     let start = crate::wait::now();
-    assert!(!drive(&mut p, absolute(Some(timeout))).await.unwrap());
+    assert!(!drive(&p, absolute(Some(timeout))).await.unwrap());
     assert_eq!(p.looks(), 2);
     let last = *p.look_times().last().unwrap();
     assert!(
@@ -84,8 +84,8 @@ async fn expiry_ends_in_one_final_look() {
 /// was pending when the deadline passed.
 #[skuld::test]
 async fn the_final_look_can_find_an_exit() {
-    let mut p = fake([Answer::Running, Answer::Exited]);
-    assert!(drive(&mut p, absolute(Some(Duration::from_millis(50)))).await.unwrap());
+    let p = fake([Answer::Running, Answer::Exited]);
+    assert!(drive(&p, absolute(Some(Duration::from_millis(50)))).await.unwrap());
     assert_eq!(p.looks(), 2);
 }
 
@@ -104,9 +104,9 @@ async fn duration_max_is_unbounded() {
     let (log_tx, reads) = std::sync::mpsc::channel();
     #[cfg(windows)]
     let _log = crate::wait::read_probe::install(log_tx);
-    let mut p = fake([Answer::Running, Answer::Exited]);
+    let p = fake([Answer::Running, Answer::Exited]);
     p.wake();
-    assert!(drive(&mut p, absolute(Some(Duration::MAX))).await.unwrap());
+    assert!(drive(&p, absolute(Some(Duration::MAX))).await.unwrap());
     #[cfg(unix)]
     assert_eq!(armed.try_iter().count(), 0, "an overflowing timeout arms no timer");
     #[cfg(windows)]
@@ -140,9 +140,9 @@ async fn a_bounded_wait_arms_the_timer_at_the_deadline() {
     let _seam = install(tx);
     let timeout = Duration::from_secs(60);
     let before = crate::tokio::wait::tokio_now();
-    let mut p = fake([Answer::Running, Answer::Exited]);
+    let p = fake([Answer::Running, Answer::Exited]);
     p.wake();
-    assert!(drive(&mut p, absolute(Some(timeout))).await.unwrap());
+    assert!(drive(&p, absolute(Some(timeout))).await.unwrap());
     let after = crate::tokio::wait::tokio_now();
     let [Armed::At(at)] = armed.try_iter().collect::<Vec<_>>()[..] else {
         panic!("one wait arms one timer");
@@ -163,9 +163,9 @@ fn dropped_wait_releases_the_watch() {
         .enable_all()
         .build()
         .expect("build a runtime");
-    let mut p = fake([Answer::Running]);
+    let p = fake([Answer::Running]);
     runtime.block_on(async {
-        let mut wait = pin!(drive(&mut p, absolute(None)));
+        let mut wait = pin!(drive(&p, absolute(None)));
         assert!(
             wait.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending(),
             "a running process with nothing fired waits"
@@ -200,14 +200,14 @@ fn a_wait_round_opens_no_descriptor() {
     use crate::test_child::held_contained_blocker_without_cgroup;
 
     let (child, stdin) = held_contained_blocker_without_cgroup(crate::Stdio::null());
-    let mut process = open(child.id(), Op::Wait).unwrap().expect("a live process opens");
+    let process = open(child.id(), Op::Wait).unwrap().expect("a live process opens");
     let runtime = ::tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("build a runtime");
     let before = open_fds();
     let during = runtime.block_on(async {
-        let mut wait = pin!(drive(&mut *process, absolute(None)));
+        let mut wait = pin!(drive(&*process, absolute(None)));
         assert!(
             wait.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending(),
             "a running process waits"
@@ -224,8 +224,8 @@ fn a_wait_round_opens_no_descriptor() {
 fn async_waits_are_send() {
     fn assert_send<T: Send>(_: &T) {}
 
-    let mut p = fake([]);
-    assert_send(&drive(&mut p, absolute(None)));
+    let p = fake([]);
+    assert_send(&drive(&p, absolute(None)));
     let process = crate::tokio::Process::current();
     assert_send(&process.wait());
 }
@@ -248,7 +248,7 @@ mod windows {
     use crate::test_child::live_blocker as blocker;
 
     /// The handle a look at a live process hands out to wait on.
-    fn wait_handle(p: &mut dyn OsProcess) -> BorrowedHandle<'_> {
+    fn wait_handle(p: &dyn OsProcess) -> BorrowedHandle<'_> {
         match p.exited().unwrap() {
             Exit::Running(WaitFor::Signalled(handle)) => handle,
             other => panic!("a live process reads Running(Signalled): {other:?}"),
@@ -260,13 +260,13 @@ mod windows {
     #[skuld::test]
     fn the_blocking_half_arms_the_ceiling_of_the_remaining_duration() {
         let (child, stdin, id) = blocker();
-        let mut process = open(id, Op::Wait).unwrap().expect("a live process opens");
+        let process = open(id, Op::Wait).unwrap().expect("a live process opens");
         let cancel = new_cancel_event().expect("create cancel event");
         let (_clock, at) = FrozenClockGuard::install();
         wait_ms_probe::take();
         let _override = remaining_override_seam::set(Duration::from_micros(500));
         let deadline = at + Duration::from_millis(5);
-        let result = wait_process_or_cancel(wait_handle(&mut *process), Some(deadline), &cancel);
+        let result = wait_process_or_cancel(wait_handle(&*process), Some(deadline), &cancel);
         let reached = Instant::now() >= deadline;
         let arms = wait_ms_probe::take();
         drop(stdin);
@@ -293,13 +293,13 @@ mod windows {
     #[skuld::test]
     fn the_blocking_half_never_reports_still_alive_before_the_deadline() {
         let (child, stdin, id) = blocker();
-        let mut process = open(id, Op::Wait).unwrap().expect("a live process opens");
+        let process = open(id, Op::Wait).unwrap().expect("a live process opens");
         let cancel = new_cancel_event().expect("create cancel event");
         wait_ms_probe::take();
         let _override = remaining_override_seam::set(Duration::from_micros(500));
         wait_ms_probe::on_second_arm(move || drop(stdin));
         let result = wait_process_or_cancel(
-            wait_handle(&mut *process),
+            wait_handle(&*process),
             Some(Instant::now() + Duration::from_secs(3600)),
             &cancel,
         );
@@ -317,13 +317,13 @@ mod windows {
     #[skuld::test]
     fn the_blocking_half_re_arms_past_a_clamped_timeout() {
         let (child, stdin, id) = blocker();
-        let mut process = open(id, Op::Wait).unwrap().expect("a live process opens");
+        let process = open(id, Op::Wait).unwrap().expect("a live process opens");
         let cancel = new_cancel_event().expect("create cancel event");
         wait_ms_probe::take();
         let _clamp = wait_clamp_seam::set(5);
         wait_ms_probe::on_second_arm(move || drop(stdin));
         let result = wait_process_or_cancel(
-            wait_handle(&mut *process),
+            wait_handle(&*process),
             Some(Instant::now() + Duration::from_secs(3600)),
             &cancel,
         );
@@ -338,10 +338,10 @@ mod windows {
     #[skuld::test]
     fn cancel_event_releases_the_blocking_wait() {
         let (child, _stdin, id) = blocker();
-        let mut process = open(id, Op::Wait).unwrap().expect("a live process opens");
+        let process = open(id, Op::Wait).unwrap().expect("a live process opens");
         let cancel = new_cancel_event().expect("event");
         signal_cancel(&cancel);
-        let exited = wait_process_or_cancel(wait_handle(&mut *process), None, &cancel).expect("cancellable wait");
+        let exited = wait_process_or_cancel(wait_handle(&*process), None, &cancel).expect("cancellable wait");
         assert!(!exited, "a live child with a signaled cancel must report still-alive");
         child.kill().expect("cleanup");
         child.wait().expect("reap");
@@ -352,9 +352,9 @@ mod windows {
     #[skuld::test]
     fn cancel_event_signaled_mid_wait_releases_the_blocking_wait() {
         let (child, _stdin, id) = blocker();
-        let mut process = open(id, Op::Wait).unwrap().expect("a live process opens");
+        let process = open(id, Op::Wait).unwrap().expect("a live process opens");
         let cancel = std::sync::Arc::new(new_cancel_event().expect("event"));
-        let handle = wait_handle(&mut *process);
+        let handle = wait_handle(&*process);
         let exited = std::thread::scope(|scope| {
             let watcher = scope.spawn(|| wait_process_or_cancel(handle, None, &cancel));
             signal_cancel(&cancel);
@@ -376,8 +376,8 @@ mod windows {
         crate::tokio::test_runtime::assert_current_thread();
         let (tx, armed) = std::sync::mpsc::channel();
         let _guard = crate::os_process::windows::cancel::armed_probe::install(tx);
-        let mut p = fake([Answer::Running, Answer::Exited]);
-        assert!(super::drive(&mut p, super::absolute(None)).await.unwrap());
+        let p = fake([Answer::Running, Answer::Exited]);
+        assert!(super::drive(&p, super::absolute(None)).await.unwrap());
         assert_eq!(
             armed.try_iter().count(),
             1,
@@ -397,8 +397,8 @@ mod windows {
         crate::tokio::test_runtime::assert_current_thread();
         let (tx, armed) = std::sync::mpsc::channel();
         let _guard = crate::os_process::windows::cancel::armed_probe::install(tx);
-        let mut p = fake([Answer::Running, Answer::Running]);
-        assert!(!super::drive(&mut p, super::absolute(None)).await.unwrap());
+        let p = fake([Answer::Running, Answer::Running]);
+        assert!(!super::drive(&p, super::absolute(None)).await.unwrap());
         assert_eq!(p.looks(), 2, "one look, one wait, one final look");
         assert_eq!(armed.try_iter().count(), 1, "the wait armed once");
     }

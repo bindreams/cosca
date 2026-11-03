@@ -14,12 +14,12 @@ use crate::test_child::live_blocker as blocker;
 #[skuld::test]
 fn open_live_then_kill_then_exited() {
     let (child, _stdin, id) = blocker();
-    let mut waiter = open(id, Op::Wait).unwrap().expect("a live process opens");
+    let waiter = open(id, Op::Wait).unwrap().expect("a live process opens");
     assert!(matches!(waiter.exited().unwrap(), Exit::Running(WaitFor::Signalled(_))));
-    assert!(!drive(&mut *waiter, absolute(Some(Duration::ZERO))).unwrap());
-    let mut killer = open(id, Op::Kill).unwrap().expect("a live process opens");
+    assert!(!drive(&*waiter, absolute(Some(Duration::ZERO))).unwrap());
+    let killer = open(id, Op::Kill).unwrap().expect("a live process opens");
     assert_eq!(killer.signal(Sig::Kill).unwrap(), Sent::Delivered);
-    assert!(drive(&mut *waiter, absolute(None)).unwrap());
+    assert!(drive(&*waiter, absolute(None)).unwrap());
     child.wait().unwrap();
 }
 
@@ -31,8 +31,8 @@ fn open_with_wrong_start_token_is_none_and_sends_nothing() {
     assert!(open(other, Op::Wait).unwrap().is_none());
     kill_by_id(other).expect("a stale identity is already gone");
     // Still running: the right identity opens and sees no exit.
-    let mut p = open(id, Op::Wait).unwrap().expect("the blocker is alive");
-    assert!(!drive(&mut *p, absolute(Some(Duration::ZERO))).unwrap());
+    let p = open(id, Op::Wait).unwrap().expect("the blocker is alive");
+    assert!(!drive(&*p, absolute(Some(Duration::ZERO))).unwrap());
     child.kill().unwrap();
     child.wait().unwrap();
 }
@@ -40,12 +40,12 @@ fn open_with_wrong_start_token_is_none_and_sends_nothing() {
 #[skuld::test]
 fn exited_before_first_look_returns_true() {
     let (child, _stdin, id) = blocker();
-    let mut p = open(id, Op::Wait).unwrap().expect("a live process opens");
+    let p = open(id, Op::Wait).unwrap().expect("a live process opens");
     child.kill().unwrap();
     // `TerminateProcess` returns before the process object is signalled; the child's own wait is
     // the barrier.
     child.wait().unwrap();
-    assert!(drive(&mut *p, absolute(Some(Duration::ZERO))).unwrap());
+    assert!(drive(&*p, absolute(Some(Duration::ZERO))).unwrap());
 }
 
 /// Mutant: a refused `TerminateProcess` on an exited process is an error, or `kill_by_id` of an
@@ -61,7 +61,7 @@ fn kill_after_exit_is_ok() {
 #[skuld::test]
 fn signal_after_exit_is_gone() {
     let (child, _stdin, id) = blocker();
-    let mut p = open(id, Op::Kill).unwrap().expect("a live process opens");
+    let p = open(id, Op::Kill).unwrap().expect("a live process opens");
     child.kill().unwrap();
     child.wait().unwrap();
     assert_eq!(p.signal(Sig::Kill).unwrap(), Sent::Gone);
@@ -89,8 +89,8 @@ fn terminate_by_id_is_unsupported_and_sends_nothing() {
     assert_eq!(op, "graceful terminate (SIGTERM-equivalent)");
     assert_eq!(platform, "windows");
     assert!(detail.contains("graceful_shutdown_tree"), "{detail}");
-    let mut p = open(id, Op::Wait).unwrap().expect("the blocker is alive");
-    assert!(!drive(&mut *p, absolute(Some(Duration::ZERO))).unwrap());
+    let p = open(id, Op::Wait).unwrap().expect("the blocker is alive");
+    assert!(!drive(&*p, absolute(Some(Duration::ZERO))).unwrap());
     child.kill().unwrap();
     child.wait().unwrap();
 }
@@ -102,7 +102,7 @@ fn terminate_by_id_is_unsupported_and_sends_nothing() {
 #[skuld::test]
 fn a_kill_opens_no_wait_and_still_kills() {
     let (child, _stdin, id) = blocker();
-    let mut p = open(id, Op::Kill).unwrap().expect("a live process opens");
+    let p = open(id, Op::Kill).unwrap().expect("a live process opens");
     let looked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.exited().map(|_| ())));
     // Debug builds assert the contract; release builds return the error.
     let err = match looked {
@@ -127,7 +127,7 @@ fn the_wait_is_on_the_opened_process_handle() {
     use windows::Win32::System::Threading::GetProcessId;
 
     let (child, _stdin, id) = blocker();
-    let mut p = open(id, Op::Wait).unwrap().expect("a live process opens");
+    let p = open(id, Op::Wait).unwrap().expect("a live process opens");
     match p.exited().unwrap() {
         // SAFETY: `h` is the live process handle `p` owns.
         Exit::Running(WaitFor::Signalled(h)) => {
@@ -148,7 +148,7 @@ fn the_wait_is_on_the_opened_process_handle() {
 fn signal_failure_carries_the_win32_code() {
     use windows::Win32::Foundation::ERROR_INVALID_HANDLE;
 
-    let mut p = super::WindowsProcess {
+    let p = super::WindowsProcess {
         id: ProcessId::current(),
         op: Op::Kill,
         handle: super::cancel::new_cancel_event().expect("create an event handle"),

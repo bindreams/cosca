@@ -6,7 +6,7 @@
 //! while it holds a reference, so a process that took a reused pid is never signalled.
 
 use std::os::fd::{AsFd, BorrowedFd};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::Instant;
 
 use mach2::message::audit_token_t;
@@ -36,7 +36,7 @@ extern "C" {
 pub(crate) struct MacProcess {
     id: ProcessId,
     unique: u64,
-    idversion: i32,
+    idversion: AtomicI32,
     watch: Option<ExitWatch>,
 }
 
@@ -78,7 +78,7 @@ impl MacProcess {
             return Ok(Some(Self {
                 id,
                 unique: first.unique_id,
-                idversion: first.id_version,
+                idversion: AtomicI32::new(first.id_version),
                 watch: None,
             }));
         }
@@ -93,7 +93,7 @@ impl MacProcess {
         Ok(Some(Self {
             id,
             unique: second.unique_id,
-            idversion: second.id_version,
+            idversion: AtomicI32::new(second.id_version),
             watch: Some(watch),
         }))
     }
@@ -119,7 +119,7 @@ fn send_with_token(pid: u32, id_version: i32, signo: libc::c_int) -> Result<(), 
 }
 
 impl OsProcess for MacProcess {
-    fn signal(&mut self, sig: Sig) -> Result<Sent, Error> {
+    fn signal(&self, sig: Sig) -> Result<Sent, Error> {
         let pid = self.id.pid();
         let signo = sig.as_libc();
         // `kernel_task` is pid 0 and macOS resolves it, so an identity can name it. It is no
@@ -134,7 +134,8 @@ impl OsProcess for MacProcess {
         }
         // No cap: each pass past the first needs a fresh `exec` of the process.
         loop {
-            let sent = send_with_token(pid, self.idversion, signo);
+            let idversion = self.idversion.load(Ordering::Relaxed);
+            let sent = send_with_token(pid, idversion, signo);
             #[cfg(test)]
             crate::send_log::record_by_identity(pid, signo);
             match sent {
@@ -146,12 +147,12 @@ impl OsProcess for MacProcess {
             // `ESRCH` is a zombie, an `exec`, or a process that is gone: read what the pid names.
             match uniq_info(pid, ReadPurpose::Kill) {
                 UniqRead::Found(now) if now.unique_id == self.unique => {
-                    if now.id_version == self.idversion {
+                    if now.id_version == idversion {
                         log::debug!("{sig:?} to pid {pid}: it has exited and is not reaped yet");
                         return Ok(Sent::Gone);
                     }
                     // It `exec`ed: the same process under a new version.
-                    self.idversion = now.id_version;
+                    self.idversion.store(now.id_version, Ordering::Relaxed);
                 }
                 UniqRead::Found(_) | UniqRead::Gone => {
                     log::debug!("{sig:?} to pid {pid}: it is gone, or its pid names another process");
@@ -167,7 +168,7 @@ impl OsProcess for MacProcess {
         }
     }
 
-    fn exited(&mut self) -> Result<Exit<'_>, Error> {
+    fn exited(&self) -> Result<Exit<'_>, Error> {
         let Some(watch) = &self.watch else {
             return Err(super::opened_for_a_signal());
         };

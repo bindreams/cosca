@@ -26,11 +26,11 @@ impl LinuxProcess {
 }
 
 impl OsProcess for LinuxProcess {
-    fn signal(&mut self, sig: Sig) -> Result<Sent, Error> {
+    fn signal(&self, sig: Sig) -> Result<Sent, Error> {
         send_pidfd(self.pidfd.as_fd(), self.id.pid(), sig).map_err(|e| Error::Io(std::io::Error::from(e)))
     }
 
-    fn exited(&mut self) -> Result<Exit<'_>, Error> {
+    fn exited(&self) -> Result<Exit<'_>, Error> {
         loop {
             let mut fds = [PollFd::new(&self.pidfd, PollFlags::IN)];
             match poll(&mut fds, Some(&Timespec { tv_sec: 0, tv_nsec: 0 })) {

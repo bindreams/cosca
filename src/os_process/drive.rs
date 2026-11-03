@@ -31,7 +31,7 @@ pub(crate) fn exited_by_id(id: ProcessId, timeout: Option<Duration>) -> Result<b
     let deadline = absolute(timeout);
     match open(id, Op::Wait)? {
         None => Ok(true),
-        Some(mut process) => drive(&mut *process, deadline),
+        Some(process) => drive(&*process, deadline),
     }
 }
 
@@ -42,7 +42,7 @@ pub(super) fn absolute(timeout: Option<Duration>) -> Option<Instant> {
 
 /// The wait loop against an absolute `deadline` from [`absolute`]: look; if running, block on what
 /// the look returned.
-pub(super) fn drive(p: &mut dyn OsProcess, deadline: Option<Instant>) -> Result<bool, Error> {
+pub(super) fn drive(p: &dyn OsProcess, deadline: Option<Instant>) -> Result<bool, Error> {
     loop {
         // Read before the look: a look made at or after the deadline is the final one.
         let final_look = remaining(deadline) == Some(Duration::ZERO);

@@ -4,6 +4,7 @@
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::sync::Mutex;
 use std::time::Instant;
 
 use super::{Exit, OsProcess, WaitFor};
@@ -22,11 +23,16 @@ pub(crate) enum Answer {
 
 pub(crate) struct FakeProcess {
     id: ProcessId,
+    script: Mutex<Script>,
+    source: Source,
+}
+
+/// What looks consume and record, behind one lock so a `&FakeProcess` is `Sync`.
+struct Script {
     exits: VecDeque<Answer>,
     looks: usize,
     look_times: Vec<Instant>,
     on_look: Option<Box<dyn FnMut(usize) + Send>>,
-    source: Source,
 }
 
 impl FakeProcess {
@@ -34,10 +40,12 @@ impl FakeProcess {
     pub(crate) fn new(id: ProcessId, exits: impl IntoIterator<Item = Answer>) -> Self {
         Self {
             id,
-            exits: exits.into_iter().collect(),
-            looks: 0,
-            look_times: Vec::new(),
-            on_look: None,
+            script: Mutex::new(Script {
+                exits: exits.into_iter().collect(),
+                looks: 0,
+                look_times: Vec::new(),
+                on_look: None,
+            }),
             source: Source::new(),
         }
     }
@@ -49,43 +57,49 @@ impl FakeProcess {
 
     /// How many times `exited` was called.
     pub(crate) fn looks(&self) -> usize {
-        self.looks
+        self.script().looks
     }
 
     /// The `wait::now()` of each look, taken after its `on_look` hook ran.
-    pub(crate) fn look_times(&self) -> &[Instant] {
-        &self.look_times
+    pub(crate) fn look_times(&self) -> Vec<Instant> {
+        self.script().look_times.clone()
     }
 
     /// Run `hook` with the index of each look, at the start of the look.
-    pub(crate) fn on_look(&mut self, hook: impl FnMut(usize) + Send + 'static) {
-        self.on_look = Some(Box::new(hook));
+    pub(crate) fn on_look(&self, hook: impl FnMut(usize) + Send + 'static) {
+        self.script().on_look = Some(Box::new(hook));
+    }
+
+    fn script(&self) -> std::sync::MutexGuard<'_, Script> {
+        self.script.lock().expect("FakeProcess: a look or hook panicked")
     }
 }
 
 impl fmt::Debug for FakeProcess {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let script = self.script();
         f.debug_struct("FakeProcess")
             .field("id", &self.id)
-            .field("exits", &self.exits)
-            .field("looks", &self.looks)
+            .field("exits", &script.exits)
+            .field("looks", &script.looks)
             .finish_non_exhaustive()
     }
 }
 
 impl OsProcess for FakeProcess {
-    fn signal(&mut self, _sig: Sig) -> Result<Sent, Error> {
+    fn signal(&self, _sig: Sig) -> Result<Sent, Error> {
         unimplemented!("FakeProcess models no signal: it states what looks answer")
     }
 
-    fn exited(&mut self) -> Result<Exit<'_>, Error> {
-        let index = self.looks;
-        self.looks += 1;
-        if let Some(hook) = self.on_look.as_mut() {
+    fn exited(&self) -> Result<Exit<'_>, Error> {
+        let mut script = self.script();
+        let index = script.looks;
+        script.looks += 1;
+        if let Some(hook) = script.on_look.as_mut() {
             hook(index);
         }
-        self.look_times.push(crate::wait::now());
-        match self
+        script.look_times.push(crate::wait::now());
+        match script
             .exits
             .pop_front()
             .expect("FakeProcess: a look was made past the scripted answers")

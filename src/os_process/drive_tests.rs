@@ -13,8 +13,8 @@ fn fake(exits: impl IntoIterator<Item = Answer>) -> FakeProcess {
 #[skuld::test]
 fn zero_timeout_looks_once_and_never_blocks() {
     block_probe::take();
-    let mut p = fake([Answer::Running]);
-    assert!(!drive(&mut p, absolute(Some(Duration::ZERO))).unwrap());
+    let p = fake([Answer::Running]);
+    assert!(!drive(&p, absolute(Some(Duration::ZERO))).unwrap());
     assert_eq!(p.looks(), 1);
     assert!(block_probe::take().is_empty(), "a zero timeout must not block");
 }
@@ -23,8 +23,8 @@ fn zero_timeout_looks_once_and_never_blocks() {
 #[skuld::test]
 fn a_failed_look_is_returned_without_blocking() {
     block_probe::take();
-    let mut p = fake([Answer::Err(std::io::ErrorKind::PermissionDenied)]);
-    let err = drive(&mut p, absolute(None)).unwrap_err();
+    let p = fake([Answer::Err(std::io::ErrorKind::PermissionDenied)]);
+    let err = drive(&p, absolute(None)).unwrap_err();
     assert!(
         matches!(&err, Error::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied),
         "{err:?}"
@@ -36,8 +36,8 @@ fn a_failed_look_is_returned_without_blocking() {
 #[skuld::test]
 fn exited_before_first_look_returns_true_without_blocking() {
     block_probe::take();
-    let mut p = fake([Answer::Exited]);
-    assert!(drive(&mut p, absolute(None)).unwrap());
+    let p = fake([Answer::Exited]);
+    assert!(drive(&p, absolute(None)).unwrap());
     assert_eq!(p.looks(), 1);
     assert!(block_probe::take().is_empty());
 }
@@ -45,9 +45,9 @@ fn exited_before_first_look_returns_true_without_blocking() {
 #[skuld::test]
 fn wakes_and_looks_again() {
     block_probe::take();
-    let mut p = fake([Answer::Running, Answer::Exited]);
+    let p = fake([Answer::Running, Answer::Exited]);
     p.wake();
-    assert!(drive(&mut p, absolute(Some(Duration::from_secs(60)))).unwrap());
+    assert!(drive(&p, absolute(Some(Duration::from_secs(60)))).unwrap());
     assert_eq!(p.looks(), 2);
     assert_eq!(block_probe::take().len(), 1, "one wait, between the two looks");
 }
@@ -57,14 +57,14 @@ fn expiry_ends_in_one_final_look() {
     block_probe::take();
     let (_clock, start) = test_clock::FrozenClockGuard::install();
     let timeout = Duration::from_secs(10);
-    let mut p = fake([Answer::Running, Answer::Running]);
+    let p = fake([Answer::Running, Answer::Running]);
     // The deadline passes while the first look is being made.
     p.on_look(|n| {
         if n == 0 {
             test_clock::advance(Duration::from_secs(11));
         }
     });
-    assert!(!drive(&mut p, absolute(Some(timeout))).unwrap());
+    assert!(!drive(&p, absolute(Some(timeout))).unwrap());
     assert_eq!(p.looks(), 2);
     let last = *p.look_times().last().unwrap();
     assert!(last > start + timeout, "the final look must come after the deadline");
@@ -78,14 +78,38 @@ fn expiry_ends_in_one_final_look() {
 #[skuld::test]
 fn duration_max_is_unbounded() {
     block_probe::take();
-    let mut p = fake([Answer::Running, Answer::Exited]);
+    let p = fake([Answer::Running, Answer::Exited]);
     p.wake();
-    assert!(drive(&mut p, absolute(Some(Duration::MAX))).unwrap());
+    assert!(drive(&p, absolute(Some(Duration::MAX))).unwrap());
     assert_eq!(
         block_probe::take(),
         [None],
         "an overflowing timeout arms an unbounded wait"
     );
+}
+
+/// One open serves a signal and a wait from different threads: `Sync`, `&self`. The wait ends
+/// only when the killed process exits, so the two threads need no other sync.
+// Not on Windows until the per-op access masks end (Task 4): a wait-opened handle there cannot kill.
+#[cfg(not(windows))]
+#[skuld::test]
+fn looks_and_a_signal_on_one_process_run_from_two_threads() {
+    use crate::os_process::{open, Op, OsProcess};
+    use crate::signal::{Sent, Sig};
+
+    let mut child = crate::test_spawn::spawn(&mut crate::test_child::held_std_blocker(std::process::Stdio::null()))
+        .expect("spawn blocker");
+    let id = ProcessId::of(child.id()).found().expect("identity of a live child");
+    let process = open(id, Op::Wait).unwrap().expect("a live process opens");
+    let p: &dyn OsProcess = &*process;
+    std::thread::scope(|scope| {
+        let waiter = scope.spawn(|| drive(p, absolute(None)));
+        let killer = scope.spawn(|| p.signal(Sig::Kill));
+        assert!(waiter.join().unwrap().unwrap(), "the wait ends when the process exits");
+        let sent = killer.join().unwrap().unwrap();
+        assert!(matches!(sent, Sent::Delivered | Sent::Gone), "{sent:?}");
+    });
+    child.wait().expect("reap the blocker");
 }
 
 #[cfg(windows)]
@@ -111,12 +135,12 @@ mod windows {
     #[skuld::test]
     fn exited_by_arms_the_ceiling_of_the_remaining_duration() {
         let (child, stdin, id) = blocker();
-        let mut process = open(id, Op::Wait).unwrap().expect("a live process opens");
+        let process = open(id, Op::Wait).unwrap().expect("a live process opens");
         let (_clock, at) = FrozenClockGuard::install();
         wait_ms_probe::take();
         let _override = remaining_override_seam::set(Duration::from_micros(500));
         let deadline = at + Duration::from_millis(5);
-        let result = drive(&mut *process, absolute(Some(Duration::from_millis(5))));
+        let result = drive(&*process, absolute(Some(Duration::from_millis(5))));
         let reached = Instant::now() >= deadline;
         let arms = wait_ms_probe::take();
         drop(stdin);
@@ -159,11 +183,11 @@ mod windows {
     #[skuld::test]
     fn exited_by_never_reports_still_alive_before_the_deadline() {
         let (child, stdin, id) = blocker();
-        let mut process = open(id, Op::Wait).unwrap().expect("a live process opens");
+        let process = open(id, Op::Wait).unwrap().expect("a live process opens");
         wait_ms_probe::take();
         let _override = remaining_override_seam::set(Duration::from_micros(500));
         wait_ms_probe::on_second_arm(move || drop(stdin)); // EOF -> the blocker exits for real
-        let result = drive(&mut *process, absolute(Some(Duration::from_secs(3600))));
+        let result = drive(&*process, absolute(Some(Duration::from_secs(3600))));
         let arms = wait_ms_probe::take();
         let exited = result.expect("a genuinely-terminated child must not report a wait failure");
         child.wait().expect("reap the child after it exits");
@@ -178,11 +202,11 @@ mod windows {
     #[skuld::test]
     fn exited_by_re_arms_past_a_clamped_timeout() {
         let (child, stdin, id) = blocker();
-        let mut process = open(id, Op::Wait).unwrap().expect("a live process opens");
+        let process = open(id, Op::Wait).unwrap().expect("a live process opens");
         wait_ms_probe::take();
         let _clamp = wait_clamp_seam::set(5);
         wait_ms_probe::on_second_arm(move || drop(stdin));
-        let result = drive(&mut *process, absolute(Some(Duration::from_secs(3600))));
+        let result = drive(&*process, absolute(Some(Duration::from_secs(3600))));
         let arms = wait_ms_probe::take();
         let exited = result.expect("a genuinely-terminated child must not report a wait failure");
         child.wait().expect("reap the child after it exits");
@@ -197,10 +221,10 @@ mod windows {
     #[skuld::test]
     fn exited_by_terminates_under_a_frozen_clock() {
         let (child, stdin, id) = blocker();
-        let mut process = open(id, Op::Wait).unwrap().expect("a live process opens");
+        let process = open(id, Op::Wait).unwrap().expect("a live process opens");
         let (_clock, at) = FrozenClockGuard::install();
         let deadline = at + Duration::from_millis(50);
-        let result = drive(&mut *process, absolute(Some(Duration::from_millis(50))));
+        let result = drive(&*process, absolute(Some(Duration::from_millis(50))));
         let reached = Instant::now() >= deadline;
         drop(stdin);
         child.wait().expect("reap the blocker");

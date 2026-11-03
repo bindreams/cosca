@@ -16,11 +16,11 @@ fn blocker() -> (crate::Child, std::io::PipeWriter, ProcessId) {
 #[skuld::test]
 fn open_live_then_kill_then_exited() {
     let (child, _stdin, id) = blocker();
-    let mut p = open(id, Op::Kill).unwrap().expect("a live process opens");
+    let p = open(id, Op::Kill).unwrap().expect("a live process opens");
     assert!(matches!(p.exited().unwrap(), Exit::Running(_)));
-    assert!(!drive(&mut *p, absolute(Some(Duration::ZERO))).unwrap());
+    assert!(!drive(&*p, absolute(Some(Duration::ZERO))).unwrap());
     assert_eq!(p.signal(Sig::Kill).unwrap(), Sent::Delivered);
-    assert!(drive(&mut *p, absolute(None)).unwrap());
+    assert!(drive(&*p, absolute(None)).unwrap());
     child.wait().unwrap();
 }
 
@@ -38,8 +38,8 @@ fn open_with_wrong_start_token_is_none_and_sends_nothing() {
     let other = ProcessId::from_parts_for_test(id.pid(), id.start_token_raw() + 1);
     assert!(open(other, Op::Kill).unwrap().is_none());
     // Still running: the right identity opens and sees no exit.
-    let mut p = open(id, Op::Wait).unwrap().expect("the blocker is alive");
-    assert!(!drive(&mut *p, absolute(Some(Duration::ZERO))).unwrap());
+    let p = open(id, Op::Wait).unwrap().expect("the blocker is alive");
+    assert!(!drive(&*p, absolute(Some(Duration::ZERO))).unwrap());
     child.kill().unwrap();
     child.wait().unwrap();
 }
@@ -47,10 +47,10 @@ fn open_with_wrong_start_token_is_none_and_sends_nothing() {
 #[skuld::test]
 fn exited_before_first_look_returns_true() {
     let (child, _stdin, id) = blocker();
-    let mut p = open(id, Op::Wait).unwrap().expect("a live process opens");
+    let p = open(id, Op::Wait).unwrap().expect("a live process opens");
     child.kill().unwrap();
     wait_until_zombie(id.pid());
-    assert!(drive(&mut *p, absolute(Some(Duration::ZERO))).unwrap());
+    assert!(drive(&*p, absolute(Some(Duration::ZERO))).unwrap());
     child.wait().unwrap();
 }
 
@@ -58,12 +58,12 @@ fn exited_before_first_look_returns_true() {
 #[skuld::test]
 fn signal_after_exit_is_gone() {
     let (child, _stdin, id) = blocker();
-    let mut p = open(id, Op::Kill).unwrap().expect("a live process opens");
+    let p = open(id, Op::Kill).unwrap().expect("a live process opens");
     child.kill().unwrap();
     child.wait().unwrap();
     assert_eq!(p.signal(Sig::Kill).unwrap(), Sent::Gone);
     // A reaped process reads as exited, too (POLLHUP).
-    assert!(drive(&mut *p, absolute(Some(Duration::ZERO))).unwrap());
+    assert!(drive(&*p, absolute(Some(Duration::ZERO))).unwrap());
 }
 
 /// Mutant: a look hands out some other fd to wait on. The kernel names a pidfd's process in its
@@ -72,7 +72,7 @@ fn signal_after_exit_is_gone() {
 fn the_wait_is_on_the_pidfd_of_the_process() {
     use std::os::fd::AsRawFd;
     let (child, _stdin, id) = blocker();
-    let mut p = open(id, Op::Wait).unwrap().expect("a live process opens");
+    let p = open(id, Op::Wait).unwrap().expect("a live process opens");
     match p.exited().unwrap() {
         Exit::Running(crate::os_process::WaitFor::Readable(fd)) => {
             let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", fd.as_raw_fd())).unwrap();
@@ -117,8 +117,8 @@ fn by_id_helpers_on_a_gone_process_are_ok() {
     let other = ProcessId::from_parts_for_test(id.pid(), id.start_token_raw() + 1);
     kill_by_id(other).unwrap();
     terminate_by_id(other).unwrap();
-    let mut p = open(id, Op::Wait).unwrap().expect("the blocker is alive");
-    assert!(!drive(&mut *p, absolute(Some(Duration::ZERO))).unwrap());
+    let p = open(id, Op::Wait).unwrap().expect("the blocker is alive");
+    assert!(!drive(&*p, absolute(Some(Duration::ZERO))).unwrap());
     child.kill().unwrap();
     child.wait().unwrap();
     kill_by_id(id).unwrap();
@@ -130,7 +130,7 @@ fn by_id_helpers_on_a_gone_process_are_ok() {
 #[skuld::test]
 fn refused_signal_keeps_its_raw_errno() {
     let (child, _stdin, id) = blocker();
-    let mut p = open(id, Op::Kill).unwrap().expect("a live process opens");
+    let p = open(id, Op::Kill).unwrap().expect("a live process opens");
     let refused = crate::signal::seams::refuse_kills();
     let err = p.signal(Sig::Kill).unwrap_err();
     drop(refused);

@@ -35,7 +35,7 @@ pub(crate) async fn exited_by_id(id: ProcessId, timeout: Option<Duration>) -> Re
     let deadline = absolute(timeout);
     match open(id, Op::Wait)? {
         None => Ok(true),
-        Some(mut process) => drive(&mut *process, deadline).await,
+        Some(process) => drive(&*process, deadline).await,
     }
 }
 
@@ -51,7 +51,7 @@ fn absolute(timeout: Option<Duration>) -> Option<std::time::Instant> {
 /// The wait loop against an absolute `deadline` from [`absolute`]: look; if running, wait on what
 /// the look returned. Dropping the future releases the wait: the fd is deregistered on Unix, and the
 /// blocking thread is released on Windows.
-async fn drive(p: &mut dyn OsProcess, deadline: Option<std::time::Instant>) -> Result<bool, Error> {
+async fn drive(p: &dyn OsProcess, deadline: Option<std::time::Instant>) -> Result<bool, Error> {
     // Set when the wait was released without an exit signal: the next look is the final one
     // whatever the clock reads.
     let mut released = false;

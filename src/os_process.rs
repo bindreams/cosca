@@ -27,14 +27,15 @@ use std::os::fd::BorrowedFd;
 #[cfg(windows)]
 use std::os::windows::io::BorrowedHandle;
 
-/// One process, as the OS names it. `Send` so a driver may move it to a blocking thread.
-pub(crate) trait OsProcess: Send + fmt::Debug {
+/// One process, as the OS names it. `Send` so a driver may move it to a blocking thread, and
+/// `Sync` so one open serves a signal and a wait from different threads.
+pub(crate) trait OsProcess: Send + Sync + fmt::Debug {
     /// Send `sig`. [`Sent::Gone`] when the process is no longer the one opened.
-    fn signal(&mut self, sig: Sig) -> Result<Sent, Error>;
+    fn signal(&self, sig: Sig) -> Result<Sent, Error>;
 
     /// Look at the process once, without blocking. A [`Exit::Running`] look carries what to wait
     /// on for the next change; the wait ends on any change, so look again after it.
-    fn exited(&mut self) -> Result<Exit<'_>, Error>;
+    fn exited(&self) -> Result<Exit<'_>, Error>;
 }
 
 /// What one look at a process found.
@@ -114,7 +115,7 @@ pub(crate) fn terminate_by_id(_id: ProcessId) -> Result<(), Error> {
 }
 
 fn signal_by_id(id: ProcessId, op: Op, sig: Sig) -> Result<(), Error> {
-    let Some(mut process) = open(id, op)? else {
+    let Some(process) = open(id, op)? else {
         return Ok(());
     };
     // `Gone` and `Delivered` are both success: nothing is left for the caller to do.
