@@ -1,6 +1,5 @@
-//! macOS kqueue primitives for [`crate::os_process`]: the [`Kqueue`] type, the `NOTE_EXIT` arms
-//! (notify, never reap) and the blocking `kevent` loop. Signals go through the audit token, in
-//! `os_process::macos`.
+//! macOS kqueue primitives for [`crate::os_process`]: the [`Kqueue`] type and the blocking `kevent`
+//! loop. Signals go through the audit token, in `os_process::macos`.
 
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::time::{Duration, Instant};
@@ -256,11 +255,12 @@ impl Kqueue {
         let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
         let mut batch = [placeholder(); POLL_BATCH];
         let mut events = Vec::new();
+        let mut first = true;
         loop {
             let n = match self.0.kevent(&[], &mut batch, Some(zero)) {
                 Ok(n) => n,
                 Err(nix::errno::Errno::EINTR) => continue,
-                Err(e) if events.is_empty() => return Err(Error::Io(e.into())),
+                Err(e) if first => return Err(Error::Io(e.into())),
                 // The events already taken are out of the queue for good; a lasting failure
                 // comes back on the next call.
                 Err(e) => {
@@ -268,6 +268,7 @@ impl Kqueue {
                     return Ok(events);
                 }
             };
+            first = false;
             for ev in &batch[..n] {
                 events.extend(Event::from_kevent(ev));
             }
