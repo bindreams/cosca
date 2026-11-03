@@ -1,5 +1,5 @@
-//! macOS kqueue primitives for [`crate::os_process`]: the [`Kqueue`] type and the blocking `kevent`
-//! loop. Signals go through the audit token, in `os_process::macos`.
+//! macOS kqueue primitives for [`crate::os_process`]: the [`Kqueue`] type and its blocking `wait`.
+//! Signals go through the audit token, in `os_process::macos`.
 
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::time::{Duration, Instant};
@@ -13,16 +13,7 @@ use crate::error::Error;
 /// The wait loop re-arms from the real deadline, so the cap never shortens the wait (principle 13).
 const KEVENT_MAX_SECS: u64 = i32::MAX as u64;
 
-/// The cap in force: [`KEVENT_MAX_SECS`], or a lower one a test installed.
-fn kevent_cap() -> Duration {
-    #[cfg(test)]
-    if let Some(lowered) = test_hooks::clamp_override() {
-        return lowered;
-    }
-    Duration::from_secs(KEVENT_MAX_SECS)
-}
-
-/// Contract of every timespec handed to `kevent`, computed or forced.
+/// Contract of every timespec handed to `kevent`.
 fn assert_kevent_timespec(ts: &libc::timespec) {
     debug_assert!(
         ts.tv_sec >= 0 && ts.tv_sec as u64 <= KEVENT_MAX_SECS,
@@ -31,10 +22,10 @@ fn assert_kevent_timespec(ts: &libc::timespec) {
     );
 }
 
-/// The `kevent` timeout for a remaining time: `d` capped at [`kevent_cap`]. The single conversion
+/// The `kevent` timeout for a remaining time: `d` capped at [`KEVENT_MAX_SECS`]. The single conversion
 /// for every blocking `kevent` in the crate, the test tracer's included.
 pub(crate) fn kevent_timeout(d: Duration) -> libc::timespec {
-    let d = d.min(kevent_cap());
+    let d = d.min(Duration::from_secs(KEVENT_MAX_SECS));
     let ts = libc::timespec {
         tv_sec: d.as_secs() as libc::time_t,
         tv_nsec: d.subsec_nanos() as libc::c_long,
@@ -53,7 +44,7 @@ enum ZeroReturn {
 }
 
 fn classify_zero_return(armed: Option<Duration>) -> ZeroReturn {
-    if armed == Some(kevent_cap()) {
+    if armed == Some(Duration::from_secs(KEVENT_MAX_SECS)) {
         ZeroReturn::Rearm
     } else {
         ZeroReturn::Anomaly
@@ -358,8 +349,8 @@ impl Kqueue {
         }
     }
 
-    /// The underlying nix queue, for the blocking `kevent` loops and `await_reapable`'s own loop,
-    /// which read it directly.
+    /// The underlying nix queue, for the loops that read it directly (`await_reapable`,
+    /// `unique_report`, the test tracer).
     pub(crate) fn native(&self) -> &NixKqueue {
         &self.0
     }
@@ -410,109 +401,6 @@ pub(crate) fn arm_proc_exit(id: crate::identity::ProcessId) -> Result<Option<Kqu
                 ),
                 source: None,
             })
-        }
-    }
-}
-
-/// Block on an armed kqueue until `interpret` concludes, or until `deadline`, checking
-/// `remaining(deadline)` fresh before every real `kevent` call and again once an event actually
-/// arrives (never inferring elapsed-ness from `kevent` returning 0, nor trusting the value
-/// sampled before a call that may have blocked long enough to cross the deadline itself) —
-/// `interpret` and the final `on_timeout` return both see this freshly-checked flag, so neither
-/// does deadline-funded work (like draining bytes) once there is no deadline left to fund it
-/// (principle 13). A round already in flight when the deadline passes is not interrupted; only
-/// the NEXT round is refused. `Ok(0)` alone is never trusted as proof the deadline passed
-/// either — a mutant (or bug) could desync the requested timeout from `remaining`, so it is
-/// re-checked before concluding, and retried as spurious otherwise. Shared by every blocking
-/// kqueue wait this crate arms — `EVFILT_PROC` here, `EVFILT_READ` in `containment::marker_eof`.
-pub(crate) fn block_on_kqueue<T: Copy>(
-    kq: &Kqueue,
-    deadline: Option<Instant>,
-    on_timeout: T,
-    mut interpret: impl FnMut(&KEvent, bool) -> Result<Option<T>, Error>,
-) -> Result<T, Error> {
-    let mut events = [placeholder()];
-    #[cfg(test)]
-    let mut round: u32 = 0;
-    #[cfg(test)]
-    let mut check = crate::wait::test_clock::RoundCheck::new("block_on_kqueue");
-    loop {
-        #[cfg(test)]
-        check.round();
-        #[cfg(test)]
-        test_hooks::fire_round_hook(round, kq.native());
-        #[cfg(test)]
-        let call_start = Instant::now();
-
-        // `EINTR` retries here, inside the SAME round, without re-firing the hook or advancing
-        // `round` — round and kevent_calls() must stay one notion.
-        let (already_elapsed, timeout, outcome) = loop {
-            let remaining = crate::wait::remaining(deadline);
-            let already_elapsed = remaining == Some(Duration::ZERO);
-            // nix Kqueue::kevent takes Option<libc::timespec> (None = block forever).
-            #[allow(unused_mut, reason = "mutated only under #[cfg(test)] below")]
-            let mut timeout = remaining.map(kevent_timeout);
-            #[cfg(test)]
-            if let Some(forced) = test_hooks::take_timeout_override() {
-                let forced = libc::timespec {
-                    tv_sec: forced.as_secs() as libc::time_t,
-                    tv_nsec: forced.subsec_nanos() as libc::c_long,
-                };
-                assert_kevent_timespec(&forced);
-                timeout = Some(forced);
-            }
-            match kq.0.kevent(&[], &mut events, timeout) {
-                Err(nix::errno::Errno::EINTR) => continue,
-                outcome => break (already_elapsed, timeout, outcome),
-            }
-        };
-        // Bounds what would otherwise be an unbounded spin under a mock clock a test forgot to
-        // advance: see `test_clock::advance_by_elapsed_if_frozen`'s own doc. A no-op outside
-        // tests and whenever the clock isn't frozen.
-        #[cfg(test)]
-        crate::wait::test_clock::advance_by_elapsed_if_frozen(call_start.elapsed());
-        #[cfg(test)]
-        test_hooks::record_kevent_call(as_duration(timeout));
-        // Captured before incrementing: this round's own index, not the next round's.
-        #[cfg(test)]
-        let this_round = round;
-        #[cfg(test)]
-        {
-            round += 1;
-        }
-
-        match outcome {
-            Ok(0) => {
-                if crate::wait::remaining(deadline) == Some(Duration::ZERO) {
-                    return Ok(on_timeout);
-                }
-                match classify_zero_return(as_duration(timeout)) {
-                    ZeroReturn::Rearm => log::debug!("wait: kevent reached its timeout cap with time left; re-arming"),
-                    ZeroReturn::Anomaly => log::warn!(
-                        "wait: kevent returned 0 after a timeout below the cap ({:?}) with time left; re-arming",
-                        as_duration(timeout)
-                    ),
-                }
-                continue; // retry from the freshly recomputed remaining time
-            }
-            Ok(_) => {
-                #[cfg(test)]
-                test_hooks::record_event_data(events[0].data());
-                #[cfg(test)]
-                test_hooks::fire_post_event_hook(this_round);
-                let elapsed = already_elapsed || crate::wait::remaining(deadline) == Some(Duration::ZERO);
-                if let Some(verdict) = interpret(&events[0], elapsed)? {
-                    return Ok(verdict);
-                }
-                if elapsed {
-                    return Ok(on_timeout);
-                }
-            }
-            Err(nix::errno::Errno::EINTR) => {
-                debug_assert!(false, "EINTR must be retried in the inner loop above, never reach here");
-                continue;
-            }
-            Err(e) => return Err(Error::Io(e.into())),
         }
     }
 }
