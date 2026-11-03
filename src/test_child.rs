@@ -324,6 +324,14 @@ pub(crate) fn exiting_member_command() -> std::process::Command {
     cmd
 }
 
+/// An open handle on the live process `id` names. Open it before arming a fault: opening may
+/// read what the fault forces.
+pub(crate) fn open_live(id: crate::identity::ProcessId) -> crate::Process {
+    crate::Process::open(id)
+        .expect("open the live process")
+        .expect("the live process is not gone")
+}
+
 /// A live [`exiting_member_command`] child that has announced itself, and its identity.
 #[cfg(unix)]
 pub(crate) fn live_exiting_member() -> (std::process::Child, crate::identity::ProcessId) {

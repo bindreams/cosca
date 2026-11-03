@@ -4,7 +4,7 @@
 use crate::containment::enumerate::backend_fault::force_snapshot_failure;
 use crate::error::Error;
 use crate::identity::ProcessId;
-use crate::test_child::{live_findstr_blocker as live_member, release_findstr_unterminated as release};
+use crate::test_child::{live_findstr_blocker as live_member, open_live, release_findstr_unterminated as release};
 use crate::Recursive;
 
 fn assert_names_toolhelp(result: Result<(), Error>, what: &str) {
@@ -20,12 +20,16 @@ fn assert_names_toolhelp(result: Result<(), Error>, what: &str) {
 /// return the error".
 #[skuld::test]
 fn every_walk_over_a_failed_snapshot_errors_and_terminates_nothing() {
-    type Walk = fn(ProcessId) -> Result<(), Error>;
-    let walks: [(&str, Walk); 1] = [("hard_kill", |id| super::hard_kill(id).map(|_| ()))];
+    type Walk = fn(&crate::Process) -> Result<(), Error>;
+    let walks: [(&str, Walk); 2] = [
+        ("hard_kill", |p| super::hard_kill(p.id()).map(|_| ())),
+        ("kill_tree", |p| p.kill_tree()),
+    ];
     for (name, walk) in walks {
         let (child, id) = live_member();
+        let process = open_live(id);
         let forced = force_snapshot_failure();
-        let result = walk(id);
+        let result = walk(&process);
         drop(forced);
         assert_names_toolhelp(result, name);
         release(child);
