@@ -1,5 +1,5 @@
 //! The sync twins of `tokio::child::pid_reuse_tests`: a sync child reaped behind its back, its pid
-//! reused, then killed or dropped. The sync `SharedChild` signals through its held pidfd. They pin
+//! reused, then killed or dropped. The sync `OwnedChild` signals through its held pidfd. They pin
 //! that against a rewrite of its signal path.
 
 use crate::test_child::pid_reuse::{in_fresh_pid_ns, reap_behind_and_reuse, sigusr1_and_wait};

@@ -71,7 +71,7 @@ serde_json = "1"
 tokio = { version = "1", features = ["test-util", "rt-multi-thread"] }
 # The test harness for `harness = false` targets.
 skuld = { workspace = true, features = ["tokio"] }
-# Only tests/block_on_socket.rs: an integration test cannot reach the crate-private `SharedChild`,
+# Only tests/block_on_socket.rs: an integration test cannot reach the crate-private `OwnedChild`,
 # and needs a deadline-bounded wait on a child it also kills from another handle.
 shared_child = { version = "1", features = ["timeout"] }
 # Pins at compile time that a spawn failure cannot be made from a plain error without its answer

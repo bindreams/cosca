@@ -321,13 +321,10 @@ pub(crate) fn move_under_its_leaf(pid: u32) -> String {
 fn cgroup_kill_of_a_front_goes_through_the_cgroup_alone(#[fixture(cgroup)] _group: &Group) {
     let (child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
     assert_eq!(child.containment(), Containment::CgroupV2);
-    crate::wait::exit_only::seams::signals_sent();
+    let sent = crate::send_log::Capture::start();
     child.kill().expect("the cgroup kill reaches the program");
-    assert_eq!(
-        crate::wait::exit_only::seams::signals_sent(),
-        0,
-        "nothing is signalled after it"
-    );
+    assert_eq!(sent.entries(), [], "nothing is signalled after it");
+    drop(sent);
     assert!(child.tree_killed.is_set(), "the kill must go through the cgroup");
     // Closed first: a front nothing killed then exits 0, and the assertion fails.
     drop(stdin);
@@ -338,13 +335,10 @@ fn cgroup_kill_of_a_front_goes_through_the_cgroup_alone(#[fixture(cgroup)] _grou
 #[skuld::test]
 fn cgroup_kill_tree_of_a_front_goes_through_the_cgroup_alone(#[fixture(cgroup)] _group: &Group) {
     let (child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
-    crate::wait::exit_only::seams::signals_sent();
+    let sent = crate::send_log::Capture::start();
     child.kill_tree().expect("the cgroup kill reaches the program");
-    assert_eq!(
-        crate::wait::exit_only::seams::signals_sent(),
-        0,
-        "nothing is signalled after it"
-    );
+    assert_eq!(sent.entries(), [], "nothing is signalled after it");
+    drop(sent);
     assert!(child.tree_killed.is_set());
     // Closed first: a front nothing killed then exits 0, and the assertion fails.
     drop(stdin);
@@ -1290,13 +1284,10 @@ fn cgroup_a_front_reaped_by_a_concurrent_wait_inside_the_gate_has_exited(#[fixtu
                 assert!(status.success(), "the front ended on its stdin: {status:?}");
             }
         });
-        crate::wait::exit_only::seams::signals_sent();
+        let sent = crate::send_log::Capture::start();
         child.kill().expect("a front that exited is not refused");
-        assert_eq!(
-            crate::wait::exit_only::seams::signals_sent(),
-            0,
-            "nothing is signalled to a reaped front"
-        );
+        assert_eq!(sent.entries(), [], "nothing is signalled to a reaped front");
+        drop(sent);
     });
     assert!(fired.get(), "the hook between the gate's reads ran");
 }

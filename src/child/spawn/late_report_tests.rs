@@ -64,7 +64,7 @@ pub(crate) fn assert_one_warn(pid: u32, mark: usize, says: &[&str], not_says: &[
 
 /// Asserts the teardown sent `pid` exactly one `SIGKILL`, by pid.
 pub(crate) fn assert_kill_sent(pid: u32, sent: &[crate::send_log::Entry]) {
-    let kill = (pid, crate::signal::Sig::Kill, crate::send_log::Via::Pid);
+    let kill = (pid, crate::signal::Sig::Kill, crate::send_log::Via::Identity);
     assert_eq!(
         sent.iter().filter(|e| **e == kill).count(),
         1,
@@ -588,7 +588,7 @@ fn macos_late_session_child_without_a_marker_is_torn_down_with_what_it_starts_af
             let root = root
                 .get()
                 .expect("the root's kill comes after the first kill of its tree");
-            let kill = (root, crate::signal::Sig::Kill, crate::send_log::Via::Pid);
+            let kill = (root, crate::signal::Sig::Kill, crate::send_log::Via::Identity);
             if !sent.entries().contains(&kill) {
                 missing.set(true);
                 tree.borrow_mut().as_mut().expect("the tree").release();

@@ -623,12 +623,8 @@ pub(crate) fn resolve_executable_in(
 /// the search, so a NUL here fails the candidate as `std::fs::metadata` would, not the assertion in
 /// [`full_path_name`].
 fn normalise_candidate(candidate: &Path) -> std::io::Result<PathBuf> {
-    let io = |e| match e {
-        Error::Io(e) => e,
-        other => std::io::Error::other(other.to_string()),
-    };
-    ensure_no_nul_wide("program candidate", candidate.as_os_str()).map_err(io)?;
-    full_path_name(candidate).map_err(io)
+    ensure_no_nul_wide("program candidate", candidate.as_os_str()).map_err(Error::into_io)?;
+    full_path_name(candidate).map_err(Error::into_io)
 }
 
 // Environment block =====

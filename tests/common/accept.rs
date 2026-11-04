@@ -8,7 +8,7 @@
 //!   at worst) or a handle to it is open. Every entry point
 //!   first calls [`Target::has_exited`]: `true` means the target is dead, so the pid is never
 //!   opened; `false` means it is unreaped now and stays so, because nothing but the caller's own
-//!   `wait` or `try_wait` reaps a `cosca::Child` (`SharedChild` starts no reaper thread; it reaps
+//!   `wait` or `try_wait` reaps a `cosca::Child` (`OwnedChild` starts no reaper thread; it reaps
 //!   only inside `wait` and `try_wait`, and never at adoption). The pid is then a stable name for
 //!   `pidfd_open`, `kqueue` or `OpenProcess`. The caller must not `wait` on the target
 //!   concurrently.
