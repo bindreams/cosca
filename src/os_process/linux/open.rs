@@ -6,40 +6,41 @@
 //!
 //! The kernel floor, the per-syscall versions, and how a refused syscall is classified
 //! (`Unsupported` versus `Io`) are in the crate root's "Platform requirements". Without `openat2`
-//! the checked `/proc` view cannot be built, and `open_verified` is `Unsupported` naming `openat2`.
-//! `spawn` probes `pidfd_open` on this process's own pid before it forks ([`probe_pidfd_support`]),
+//! the checked `/proc` view cannot be built, and `open_verified_with` is `Unsupported` naming `openat2`.
+//! `spawn` probes `pidfd_open` on this process's own pid before it forks ([`probe_pidfd_support_with`]),
 //! so a refusal fails the spawn with no child; see `child::spawn::pidfd_handshake` for the rest.
 
 use std::os::fd::AsFd;
 
-use rustix::process::{pidfd_open, Pid, PidfdFlags};
+use rustix::process::Pid;
 
 use crate::error::Error;
-use crate::identity::{Existence, Liveness, PidfdTarget, ProcDir, ProcView, ProcessId, ViewUnreadable};
+use crate::identity::{Existence, Kernel, Liveness, PidfdTarget, ProcDir, ProcView, ProcessId, ViewUnreadable};
 use crate::os_process::OPEN_CONSEQUENCE;
 
 /// The operation an `Unsupported` open names.
 const OP_NAME: &str = "process open";
 
-/// Open a pidfd for `id`, re-verifying identity. `Ok(None)` => already gone (treat as exited).
+/// Open a pidfd for `id` through `kernel`, re-verifying identity. `Ok(None)` => already gone (treat
+/// as exited).
 ///
 /// Every `/proc` read goes through one checked `/proc` dirfd shown to describe `id`'s pid
 /// namespace; otherwise [`Error::Unassessable`], never a `Gone` off a foreign `/proc`.
-pub(crate) fn open_verified(id: ProcessId) -> Result<Option<rustix::fd::OwnedFd>, Error> {
+pub(crate) fn open_verified_with(kernel: &dyn Kernel, id: ProcessId) -> Result<Option<rustix::fd::OwnedFd>, Error> {
     debug_assert!(
         id.pid() <= i32::MAX as u32,
         "pid {} exceeds i32::MAX; pidfd cast would truncate",
         id.pid()
     );
     let raw = Pid::from_raw(id.pid() as i32).expect("a resolvable ProcessId is never pid 0");
-    match pidfd_open_checked(raw) {
-        Ok(pidfd) => verify_pidfd_target(id, pidfd),
+    match pidfd_open_checked(kernel, raw) {
+        Ok(pidfd) => verify_pidfd_target(kernel, id, pidfd),
         Err(rustix::io::Errno::SRCH) => Ok(None),
         // pidfd_open needs a pid that resolves to a thread-group leader task. EINVAL (< 6.16) /
         // ENOENT (>= 6.16) means either a reaped process-group leader whose pid lives on as a PGID
         // (gone), or a non-leader tid: live, or a ptraced zombie thread kept until its tracer
         // waits. Errno alone can't tell, so re-verify.
-        Err(e @ (rustix::io::Errno::INVAL | rustix::io::Errno::NOENT)) => verify_without_pidfd(id, e),
+        Err(e @ (rustix::io::Errno::INVAL | rustix::io::Errno::NOENT)) => verify_without_pidfd(kernel, id, e),
         Err(e) => match refusal_name(e) {
             Some(name) => Err(pidfd_open_unsupported(OP_NAME, name)),
             None => Err(Error::Io(crate::error::io_context(
@@ -80,7 +81,7 @@ pub(crate) fn spawn_open_error(errno: rustix::io::Errno) -> Error {
     }
 }
 
-/// The pre-fork probe: `pidfd_open` on this process's own pid, closed at once. Spawning forks
+/// The pre-fork probe: `pidfd_open` through `kernel` on this process's own pid, closed at once. Spawning forks
 /// through std, which cannot hand back a pidfd, so a kernel or filter that refuses `pidfd_open`
 /// has to be found out BEFORE the fork, or the child would exist with no pidfd. A refusal is
 /// [`Error::Unsupported`] naming `spawn`; any other failure (`EMFILE`, `ENFILE`, `ENOMEM`) is `Io`
@@ -88,8 +89,8 @@ pub(crate) fn spawn_open_error(errno: rustix::io::Errno) -> Error {
 ///
 /// Two syscalls per spawn, and no cached verdict: a cache is process-global state, and a filter
 /// can be installed after the first spawn.
-pub(crate) fn probe_pidfd_support() -> Result<(), Error> {
-    pidfd_open_checked(rustix::process::getpid())
+pub(crate) fn probe_pidfd_support_with(kernel: &dyn Kernel) -> Result<(), Error> {
+    pidfd_open_checked(kernel, rustix::process::getpid())
         .map(drop)
         .map_err(spawn_open_error)
 }
@@ -114,14 +115,18 @@ pub(crate) fn take_scripted_pidfd_open() -> Option<rustix::io::Errno> {
 ///   `kill(2)`.
 ///
 /// No pidfd to cross-check against, so the view comes from [`proc_view_with`](crate::identity::proc_view_with).
-fn verify_without_pidfd(id: ProcessId, errno: rustix::io::Errno) -> Result<Option<rustix::fd::OwnedFd>, Error> {
-    if id.signal_says_no_such_process(&crate::identity::HostKernel) {
+fn verify_without_pidfd(
+    kernel: &dyn Kernel,
+    id: ProcessId,
+    errno: rustix::io::Errno,
+) -> Result<Option<rustix::fd::OwnedFd>, Error> {
+    if id.signal_says_no_such_process(kernel) {
         return Ok(None);
     }
-    match crate::identity::proc_view_with(&crate::identity::HostKernel) {
-        ProcView::Same(proc_dir) => match exists_checked(id, &proc_dir) {
+    match crate::identity::proc_view_with(kernel) {
+        ProcView::Same(proc_dir) => match exists_checked(kernel, id, &proc_dir) {
             Existence::Gone => Ok(None),
-            Existence::Present => match alive_checked(id, &proc_dir) {
+            Existence::Present => match alive_checked(kernel, id, &proc_dir) {
                 Liveness::Dead => Ok(None),
                 Liveness::Alive => Err(Error::NotThreadGroupLeader {
                     pid: id.pid(),
@@ -154,9 +159,13 @@ fn verify_without_pidfd(id: ProcessId, errno: rustix::io::Errno) -> Result<Optio
 /// there). Equal to `id.pid()` means that procfs names the target under this number, so
 /// `{pid}/stat` describes it: the start token then tells a recycled pid from the original.
 /// Anything else is `Unassessable`.
-fn verify_pidfd_target(id: ProcessId, pidfd: rustix::fd::OwnedFd) -> Result<Option<rustix::fd::OwnedFd>, Error> {
-    let proc_dir = crate::identity::ProcDir::open().map_err(|why| view_unreadable(id, why, None))?;
-    match crate::identity::pidfd_pid_in(&crate::identity::HostKernel, &proc_dir, pidfd.as_fd()) {
+fn verify_pidfd_target(
+    kernel: &dyn Kernel,
+    id: ProcessId,
+    pidfd: rustix::fd::OwnedFd,
+) -> Result<Option<rustix::fd::OwnedFd>, Error> {
+    let proc_dir = kernel.open_proc().map_err(|why| view_unreadable(id, why, None))?;
+    match crate::identity::pidfd_pid_in(kernel, &proc_dir, pidfd.as_fd()) {
         Ok(PidfdTarget::Pid(pid)) if pid == id.pid() => {}
         // Reaped after `pidfd_open`: gone, and nothing to signal.
         Ok(PidfdTarget::Reaped) => return Ok(None),
@@ -174,7 +183,7 @@ fn verify_pidfd_target(id: ProcessId, pidfd: rustix::fd::OwnedFd) -> Result<Opti
     }
     // A pid recycled before open means the original is already gone. An unassessable pid
     // (hidepid, EPERM) is NOT gone and must not be treated as one.
-    match exists_checked(id, &proc_dir) {
+    match exists_checked(kernel, id, &proc_dir) {
         Existence::Present => Ok(Some(pidfd)),
         Existence::Gone => Ok(None),
         Existence::Unknown => Err(unassessable(id, "the OS refused the existence query", None, None)),
@@ -220,43 +229,43 @@ fn unassessable(
 /// `pidfd_open`, with a test seam: a forced errno (see [`fault::force_pidfd_open_errno_once`])
 /// replaces the syscall once.
 #[cfg(test)]
-pub(crate) fn pidfd_open_checked(raw: Pid) -> Result<rustix::fd::OwnedFd, rustix::io::Errno> {
+pub(crate) fn pidfd_open_checked(kernel: &dyn Kernel, raw: Pid) -> Result<rustix::fd::OwnedFd, rustix::io::Errno> {
     match fault::take_forced_pidfd_open_errno() {
         Some(errno) => Err(errno),
-        None => pidfd_open(raw, PidfdFlags::empty()),
+        None => kernel.pidfd_open(raw),
     }
 }
 #[cfg(not(test))]
-fn pidfd_open_checked(raw: Pid) -> Result<rustix::fd::OwnedFd, rustix::io::Errno> {
-    pidfd_open(raw, PidfdFlags::empty())
+fn pidfd_open_checked(kernel: &dyn Kernel, raw: Pid) -> Result<rustix::fd::OwnedFd, rustix::io::Errno> {
+    kernel.pidfd_open(raw)
 }
 
 /// Test seam: a forced [`Existence`] (see [`fault::force_exists_once`]) replaces the `/proc` read
 /// once, to drive the `Unknown` arms; runs [`fault::between_check_and_read`]'s hook first.
 #[cfg(test)]
-pub(crate) fn exists_checked(id: ProcessId, proc_dir: &ProcDir) -> Existence {
+pub(crate) fn exists_checked(kernel: &dyn Kernel, id: ProcessId, proc_dir: &ProcDir) -> Existence {
     fault::run_between_hook();
     match fault::take_forced_exists() {
         Some(existence) => existence,
-        None => id.exists_in(&crate::identity::HostKernel, proc_dir),
+        None => id.exists_in(kernel, proc_dir),
     }
 }
 #[cfg(not(test))]
-fn exists_checked(id: ProcessId, proc_dir: &ProcDir) -> Existence {
-    id.exists_in(&crate::identity::HostKernel, proc_dir)
+fn exists_checked(kernel: &dyn Kernel, id: ProcessId, proc_dir: &ProcDir) -> Existence {
+    id.exists_in(kernel, proc_dir)
 }
 
 /// Test seam: a forced [`Liveness`] (see [`fault::force_alive_once`]) replaces the `/proc` read once.
 #[cfg(test)]
-fn alive_checked(id: ProcessId, proc_dir: &ProcDir) -> Liveness {
+fn alive_checked(kernel: &dyn Kernel, id: ProcessId, proc_dir: &ProcDir) -> Liveness {
     match fault::take_forced_alive() {
         Some(liveness) => liveness,
-        None => id.is_alive_in(&crate::identity::HostKernel, proc_dir),
+        None => id.is_alive_in(kernel, proc_dir),
     }
 }
 #[cfg(not(test))]
-fn alive_checked(id: ProcessId, proc_dir: &ProcDir) -> Liveness {
-    id.is_alive_in(&crate::identity::HostKernel, proc_dir)
+fn alive_checked(kernel: &dyn Kernel, id: ProcessId, proc_dir: &ProcDir) -> Liveness {
+    id.is_alive_in(kernel, proc_dir)
 }
 
 #[cfg(test)]

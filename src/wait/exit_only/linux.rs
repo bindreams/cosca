@@ -172,7 +172,7 @@ pub(crate) fn open_own_child(
         "pid {pid} exceeds i32::MAX; pidfd cast would truncate"
     );
     let raw = Pid::from_raw(pid as i32).expect("a spawned child's pid is never 0");
-    let pidfd = match pidfd_open_checked(raw) {
+    let pidfd = match pidfd_open_checked(&crate::identity::HostKernel, raw) {
         Ok(pidfd) => pidfd,
         Err(rustix::io::Errno::SRCH | rustix::io::Errno::INVAL | rustix::io::Errno::NOENT) => return Ok(None),
         Err(e) => return Err(spawn_open_error(e)),
@@ -182,7 +182,7 @@ pub(crate) fn open_own_child(
     let pidfd = crate::above_stdio::above_stdio(pidfd).map_err(Error::Io)?;
     if let Some(id) = id {
         if let ProcView::Same(proc_dir) = crate::identity::proc_view_with(&crate::identity::HostKernel) {
-            if exists_checked(id, &proc_dir) == Existence::Gone {
+            if exists_checked(&crate::identity::HostKernel, id, &proc_dir) == Existence::Gone {
                 return Ok(None);
             }
         }

@@ -4,6 +4,7 @@
 //! Rows are plain data: a path or pid is looked up by `==`, and a later row replaces an earlier one.
 
 use std::io;
+use std::os::fd::OwnedFd;
 
 use rustix::io::Errno;
 use rustix::process::Pid;
@@ -63,6 +64,10 @@ impl<'a> FakeKernel<'a> {
 }
 
 impl Kernel for FakeKernel<'_> {
+    fn pidfd_open(&self, target: Pid) -> Result<OwnedFd, Errno> {
+        self.real(&format!("pidfd_open of {target:?}")).pidfd_open(target)
+    }
+
     fn open_proc(&self) -> Result<ProcDir, ViewUnreadable> {
         match self.open_proc {
             Some(errno) => Err(ViewUnreadable::from_open_errno(errno)),

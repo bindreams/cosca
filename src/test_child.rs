@@ -692,7 +692,8 @@ fn watch_linux(listener: &std::net::TcpListener, target: crate::identity::Proces
 
     use rustix::event::{PollFd, PollFlags};
 
-    let Some(pidfd) = crate::os_process::linux::open::open_verified(target).expect("open a pidfd to watch the target")
+    let Some(pidfd) = crate::os_process::linux::open::open_verified_with(&crate::identity::HostKernel, target)
+        .expect("open a pidfd to watch the target")
     else {
         return WatchEvent::Died;
     };

@@ -5,7 +5,7 @@
 use std::os::fd::AsRawFd;
 
 use crate::error::Error;
-use crate::identity::{Existence, Liveness, PidfdTarget, ProcessId};
+use crate::identity::{Existence, HostKernel, Liveness, PidfdTarget, ProcessId};
 
 #[path = "open_tests/fixture.rs"]
 mod fixture;
@@ -274,7 +274,7 @@ fn open_verified_is_unassessable_when_the_einval_arms_exists_is_unknown() {
     let mark = crate::log_capture::mark();
     let forced_errno = super::fault::force_pidfd_open_errno_once(rustix::io::Errno::INVAL);
     let forced_exists = super::fault::force_exists_once(Existence::Unknown);
-    let result = super::open_verified(ProcessId::current());
+    let result = super::open_verified_with(&HostKernel, ProcessId::current());
     drop(forced_exists);
     drop(forced_errno);
     assert_unassessable_with_cause(
@@ -442,7 +442,7 @@ fn open_verified_current_with_fdinfo(
     answer: Result<PidfdTarget, i32>,
 ) -> Result<Option<rustix::fd::OwnedFd>, crate::error::Error> {
     let forced = crate::identity::proc_view_fault::force_fdinfo_once(answer);
-    let result = super::open_verified(ProcessId::current());
+    let result = super::open_verified_with(&HostKernel, ProcessId::current());
     drop(forced);
     result
 }
@@ -473,7 +473,7 @@ fn open_verified_is_unassessable_when_the_pidfds_fdinfo_names_another_pid() {
 fn an_unassessable_verdict_ends_with_what_the_open_left_undone() {
     crate::log_capture::install();
     let forced = crate::identity::proc_view_fault::force_fdinfo_once(Ok(PidfdTarget::Pid(0)));
-    let result = super::open_verified(ProcessId::current());
+    let result = super::open_verified_with(&HostKernel, ProcessId::current());
     drop(forced);
     match result {
         Err(e @ Error::Unassessable { .. }) => assert!(
@@ -506,7 +506,7 @@ fn open_verified_is_unassessable_when_the_pidfds_fdinfo_is_unreadable() {
 fn open_verified_accepts_a_live_target_whose_fdinfo_pid_matches() {
     let forced = open_verified_current_with_fdinfo(Ok(PidfdTarget::Pid(std::process::id())));
     assert!(matches!(forced, Ok(Some(_))), "got {forced:?}");
-    let unforced = super::open_verified(ProcessId::current());
+    let unforced = super::open_verified_with(&HostKernel, ProcessId::current());
     assert!(
         matches!(unforced, Ok(Some(_))),
         "the real fdinfo must match too, got {unforced:?}"
@@ -531,7 +531,7 @@ fn verify_pidfd_target_reports_gone_for_a_target_reaped_after_pidfd_open() {
         .found()
         .expect("the unreaped child has an identity");
     child.wait().expect("reap the child");
-    let result = super::verify_pidfd_target(id, pidfd);
+    let result = super::verify_pidfd_target(&HostKernel, id, pidfd);
     assert!(matches!(result, Ok(None)), "got {result:?}");
 }
 
@@ -542,7 +542,7 @@ fn open_verified_is_unassessable_when_the_success_paths_exists_is_unknown() {
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
     let forced = super::fault::force_exists_once(Existence::Unknown);
-    let result = super::open_verified(ProcessId::current());
+    let result = super::open_verified_with(&HostKernel, ProcessId::current());
     drop(forced);
     assert_unassessable_with_cause(
         result.map(|fd| fd.is_some()),
@@ -587,7 +587,7 @@ fn refused_with(errno: rustix::io::Errno, open: impl FnOnce(ProcessId) -> Result
 }
 
 fn open_op(id: ProcessId) -> Result<(), Error> {
-    super::open_verified(id).map(drop)
+    super::open_verified_with(&HostKernel, id).map(drop)
 }
 
 /// Every refusal is `Unsupported` in the policy's message shape.
