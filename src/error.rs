@@ -129,8 +129,9 @@ pub enum Error {
     ///
     /// Every Linux operation that opens a process by identity needs a pidfd (kernel 5.3 or
     /// later): [`Process::open`](crate::Process::open), [`open_pid`](crate::Process::open_pid)
-    /// and [`current`](crate::Process::current), and the by-identity acts of a
-    /// [`Child`](crate::Child) (`terminate`, `graceful_shutdown`), with their `tokio` twins. When
+    /// and [`current`](crate::Process::current), their `tokio` twins, and the by-identity acts of
+    /// a [`tokio::Child`](crate::tokio::Child) (`terminate`, `graceful_shutdown`). A
+    /// [`Child`](crate::Child) acts through its own handle and needs none. When
     /// `pidfd_open` is refused they fail with this variant, with `op` `process open` and
     /// `detail` naming the errno. An open [`Process`](crate::Process) holds its pidfd, so none of
     /// its acts can be refused later.

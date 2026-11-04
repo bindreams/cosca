@@ -325,41 +325,6 @@ pub(crate) fn raw(child: &std::process::Child) -> std::os::windows::io::RawHandl
     child.as_raw_handle()
 }
 
-thread_local! {
-    static ROOT_TEARDOWNS: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
-}
-
-/// Called by `ProcHandle::teardown_on_drop`; counts while a recorder lives on this thread.
-pub(crate) fn note_root_teardown() {
-    ROOT_TEARDOWNS.with(|c| {
-        if let Some(n) = c.get() {
-            c.set(Some(n + 1));
-        }
-    });
-}
-
-/// Count every root teardown a drop or `tear_down_now` starts on THIS thread until the recorder
-/// drops. The teardown still runs.
-pub(crate) fn record_root_teardowns() -> RootTeardownRecorder {
-    ROOT_TEARDOWNS.with(|c| c.set(Some(0)));
-    RootTeardownRecorder(())
-}
-
-#[must_use = "recording stops as soon as the recorder is dropped"]
-pub(crate) struct RootTeardownRecorder(());
-
-impl RootTeardownRecorder {
-    pub(crate) fn count(&self) -> u32 {
-        ROOT_TEARDOWNS.with(|c| c.get().expect("the recorder is live"))
-    }
-}
-
-impl Drop for RootTeardownRecorder {
-    fn drop(&mut self) {
-        ROOT_TEARDOWNS.with(|c| c.set(None));
-    }
-}
-
 /// An owned handle on a process that can wait for it and end it, opened while the caller still
 /// holds the process, so the pid names nothing else.
 pub(crate) struct Remote(HANDLE);
