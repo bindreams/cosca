@@ -141,7 +141,7 @@ impl<'a> Pump<'a> {
 
     fn write_some(&mut self) {
         let Some(feed) = &mut self.feed else { return };
-        match feed.pipe.write(feed.rest) {
+        match write_without_sigpipe(&mut feed.pipe, feed.rest) {
             Ok(n) => {
                 feed.rest = &feed.rest[n..];
                 if feed.rest.is_empty() {
@@ -202,4 +202,44 @@ fn nonblocking(pipe: &impl AsFd) -> io::Result<()> {
     let flags = fcntl_getfl(pipe)?;
     fcntl_setfl(pipe, flags | OFlags::NONBLOCK)?;
     Ok(())
+}
+
+/// One `write` that cannot kill the host. Writing to a pipe nobody reads raises `SIGPIPE` on the
+/// calling thread, and a host that left its disposition at the default dies of it (a C host, a
+/// cdylib, `-Zon-broken-pipe=kill`); Rust's runtime ignores it, but a library cannot rely on that.
+/// `SIGPIPE` is blocked on this thread around the write; the one the write raised is consumed, and
+/// one already pending (the host's own) is left for the host.
+fn write_without_sigpipe(pipe: &mut PipeWriter, bytes: &[u8]) -> io::Result<usize> {
+    // SAFETY: plain signal-mask calls on a set initialised by `sigemptyset`, restoring the mask
+    // before returning. `sigwait` runs only when `SIGPIPE` is pending and blocked here, so it
+    // returns at once.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGPIPE);
+        let mut old: libc::sigset_t = std::mem::zeroed();
+        let blocked = libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old);
+        debug_assert_eq!(blocked, 0, "block SIGPIPE");
+        let was_pending = sigpipe_pending();
+        let written = pipe.write(bytes);
+        if matches!(&written, Err(e) if e.kind() == ErrorKind::BrokenPipe) && !was_pending && sigpipe_pending() {
+            let mut signo = 0;
+            let waited = libc::sigwait(&set, &mut signo);
+            debug_assert_eq!(waited, 0, "consume SIGPIPE");
+        }
+        let restored = libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
+        debug_assert_eq!(restored, 0, "restore the signal mask");
+        written
+    }
+}
+
+/// Whether `SIGPIPE` is pending for the calling thread or the process.
+fn sigpipe_pending() -> bool {
+    // SAFETY: `sigpending` fills a zeroed set the call owns; `sigismember` only reads it.
+    unsafe {
+        let mut pending: libc::sigset_t = std::mem::zeroed();
+        let status = libc::sigpending(&mut pending);
+        debug_assert_eq!(status, 0, "read the pending signals");
+        libc::sigismember(&pending, libc::SIGPIPE) == 1
+    }
 }

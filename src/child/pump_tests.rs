@@ -126,3 +126,86 @@ fn fixture_communicate_under_a_nproc_limit() {
     assert_eq!(out.stdout, input);
     assert_eq!(out.stderr, b"done\n");
 }
+
+// SIGPIPE =====
+
+/// A host whose `SIGPIPE` disposition is the default (a C host, a cdylib, `-Zon-broken-pipe=kill`)
+/// is not killed when a child stops reading stdin: `communicate` returns `Ok`. Runs in a re-exec'd
+/// child, since the disposition is process-wide.
+///
+/// Mutant: the stdin write runs with `SIGPIPE` unblocked.
+#[skuld::test]
+fn a_child_that_stops_reading_stdin_does_not_kill_a_default_sigpipe_host() {
+    crate::test_child::run_fixture(crate::test_child::fixture_path!(
+        fixture_communicate_with_default_sigpipe
+    ));
+}
+
+#[skuld::test]
+fn fixture_communicate_with_default_sigpipe() {
+    if !crate::test_child::is_fixture_reexec() {
+        return;
+    }
+    // SAFETY: sets this fixture process's own `SIGPIPE` disposition, and nothing else.
+    let previous = unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+    assert_ne!(
+        previous,
+        libc::SIG_ERR,
+        "reset SIGPIPE: {}",
+        std::io::Error::last_os_error()
+    );
+    let mut child = sh("echo out; exit 3");
+    let input = vec![b'x'; 1 << 20];
+    let out = child.communicate(Some(&input)).expect("communicate");
+    assert_eq!(out.status.code(), Some(3));
+    assert_eq!(
+        out.stdout,
+        b"out
+"
+    );
+}
+
+/// A `SIGPIPE` the host already has pending is still pending after `communicate`: the one the
+/// stdin write raised is consumed, the host's is not. Runs in a re-exec'd child, since it blocks
+/// and raises a signal for the process.
+///
+/// Mutant: `communicate` consumes a `SIGPIPE` that was pending before its write.
+#[skuld::test]
+fn a_sigpipe_pending_in_the_host_stays_pending() {
+    crate::test_child::run_fixture(crate::test_child::fixture_path!(
+        fixture_communicate_with_pending_sigpipe
+    ));
+}
+
+#[skuld::test]
+fn fixture_communicate_with_pending_sigpipe() {
+    if !crate::test_child::is_fixture_reexec() {
+        return;
+    }
+    // SAFETY: signal-mask and signal calls on this fixture's own thread and process, on sets
+    // initialised by `sigemptyset`.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGPIPE);
+        assert_eq!(libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()), 0);
+        assert_eq!(libc::raise(libc::SIGPIPE), 0);
+
+        let mut child = sh("echo out; exit 3");
+        let input = vec![b'x'; 1 << 20];
+        let out = child.communicate(Some(&input)).expect("communicate");
+        assert_eq!(
+            out.stdout,
+            b"out
+"
+        );
+
+        let mut pending: libc::sigset_t = std::mem::zeroed();
+        assert_eq!(libc::sigpending(&mut pending), 0);
+        assert_eq!(
+            libc::sigismember(&pending, libc::SIGPIPE),
+            1,
+            "the host's SIGPIPE was consumed"
+        );
+    }
+}
