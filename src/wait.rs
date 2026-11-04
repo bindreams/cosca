@@ -476,6 +476,20 @@ pub(crate) fn rearm_until<T, E>(
     }
 }
 
+/// Whether any of `fds` has an event now, without blocking; the events found are in `fds`. A failed
+/// poll is an error, never `false`.
+#[cfg(unix)]
+pub(crate) fn any_ready_now(fds: &mut [rustix::event::PollFd<'_>]) -> Result<bool, rustix::io::Errno> {
+    let zero = rustix::event::Timespec { tv_sec: 0, tv_nsec: 0 };
+    loop {
+        match rustix::event::poll(fds, Some(&zero)) {
+            Ok(ready) => return Ok(ready > 0),
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// Blocks until `fds` has an event, retrying `EINTR`.
 #[cfg(unix)]
 pub(crate) fn poll_ready(fds: &mut [rustix::event::PollFd<'_>]) -> Result<(), rustix::io::Errno> {

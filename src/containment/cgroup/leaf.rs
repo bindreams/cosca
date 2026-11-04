@@ -72,20 +72,14 @@ pub(crate) fn read_populated(file: &mut File, buf: &mut String) -> Result<bool, 
 /// and stays so.
 #[cfg(target_os = "linux")]
 fn pidfd_exited(pidfd: std::os::fd::BorrowedFd<'_>) -> io::Result<bool> {
-    use rustix::event::{poll, PollFd, PollFlags, Timespec};
+    use rustix::event::{PollFd, PollFlags};
 
     let mut fds = [PollFd::new(&pidfd, PollFlags::IN)];
-    let now = Timespec { tv_sec: 0, tv_nsec: 0 };
-    loop {
-        match poll(&mut fds, Some(&now)) {
-            Ok(_) if fds[0].revents().contains(PollFlags::NVAL) => {
-                return Err(io::Error::from_raw_os_error(libc::EBADF));
-            }
-            Ok(_) => return Ok(fds[0].revents().contains(PollFlags::IN)),
-            Err(rustix::io::Errno::INTR) => continue,
-            Err(e) => return Err(e.into()),
-        }
+    crate::wait::any_ready_now(&mut fds)?;
+    if fds[0].revents().contains(PollFlags::NVAL) {
+        return Err(io::Error::from_raw_os_error(libc::EBADF));
     }
+    Ok(fds[0].revents().contains(PollFlags::IN))
 }
 
 /// The state letter of `child`, or `None` when it is unknown; the cause is logged at debug (see

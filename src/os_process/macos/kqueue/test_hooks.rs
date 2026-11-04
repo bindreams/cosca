@@ -139,16 +139,8 @@ pub(crate) fn fire_kevent_round(round: u32) {
 
 /// Whether `kq` has an event pending, by a `poll` of its descriptor, which takes nothing from it.
 pub(crate) fn event_pending(kq: &impl std::os::fd::AsFd) -> bool {
-    use std::os::fd::AsRawFd;
-    let mut fd = libc::pollfd {
-        fd: kq.as_fd().as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // SAFETY: one valid `pollfd`, and a zero timeout.
-    let n = unsafe { libc::poll(&mut fd, 1, 0) };
-    assert!(n >= 0, "poll the wait's kqueue: {}", std::io::Error::last_os_error());
-    n == 1
+    let mut fds = [rustix::event::PollFd::new(kq, rustix::event::PollFlags::IN)];
+    crate::wait::any_ready_now(&mut fds).expect("poll the wait's kqueue")
 }
 
 /// Sends `signal` to `pid`, asserting it was delivered.

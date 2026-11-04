@@ -13,7 +13,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
-use rustix::event::{poll, PollFd, PollFlags};
+use rustix::event::{PollFd, PollFlags};
 use rustix::fs::{mknodat, open, FileType, Mode, OFlags, CWD};
 
 use crate::elevation::shim::hooks::{Gate, Inject};
@@ -350,15 +350,11 @@ impl LogTail {
     /// before a poll reports data or a hang-up, and the kernel reports a hang-up only once a writer has
     /// come and gone.
     fn drain(&mut self) {
-        let zero = rustix::event::Timespec { tv_sec: 0, tv_nsec: 0 };
         let mut buf = [0u8; 4096];
         loop {
             let mut fds = [PollFd::new(&self.fifo, PollFlags::IN)];
-            match poll(&mut fds, Some(&zero)) {
-                Ok(0) => return,
-                Ok(_) => {}
-                Err(rustix::io::Errno::INTR) => continue,
-                Err(e) => panic!("poll: {e}"),
+            if !crate::wait::any_ready_now(&mut fds).expect("poll the log") {
+                return;
             }
             match rustix::io::read(&self.fifo, &mut buf) {
                 Ok(0) => {
@@ -443,13 +439,7 @@ impl Run {
                 PollFd::new(&self.log.fifo, PollFlags::IN),
                 PollFd::new(&self.pidfd, PollFlags::IN),
             ];
-            loop {
-                match poll(&mut fds, None) {
-                    Ok(_) => break,
-                    Err(rustix::io::Errno::INTR) => {}
-                    Err(e) => panic!("poll: {e}"),
-                }
-            }
+            crate::wait::poll_ready(&mut fds).expect("poll the log and the shim");
             if !fds[1].revents().is_empty() && fds[0].revents().is_empty() {
                 self.log.drain();
                 if self.log.lines.len() == known {
@@ -489,8 +479,7 @@ impl Run {
         let program_pidfd = self.program_pidfd();
         let exited = |pidfd: &OwnedFd| {
             let mut fds = [PollFd::new(pidfd, PollFlags::IN)];
-            let zero = rustix::event::Timespec { tv_sec: 0, tv_nsec: 0 };
-            matches!(poll(&mut fds, Some(&zero)), Ok(n) if n > 0)
+            crate::wait::any_ready_now(&mut fds).expect("poll the program's pidfd")
         };
         // pipefs's device, from a pipe of this process: a pipe of any process is a FIFO on that device.
         let pipefs = {
@@ -551,8 +540,7 @@ impl Run {
     /// How the shim ended, if it has, and what it wrote to stderr meanwhile: for a failure message.
     fn how_it_ended(&mut self) -> String {
         let mut fds = [PollFd::new(&self.pidfd, PollFlags::IN)];
-        let zero = rustix::event::Timespec { tv_sec: 0, tv_nsec: 0 };
-        if !matches!(poll(&mut fds, Some(&zero)), Ok(n) if n > 0) {
+        if !crate::wait::any_ready_now(&mut fds).expect("poll the shim's pidfd") {
             return "the shim is still running".into();
         }
         let Some(child) = self.child.as_mut() else {
@@ -612,13 +600,7 @@ impl Run {
                 PollFd::new(&self.log.fifo, PollFlags::IN),
                 PollFd::new(&self.pidfd, PollFlags::IN),
             ];
-            loop {
-                match poll(&mut fds, None) {
-                    Ok(_) => break,
-                    Err(rustix::io::Errno::INTR) => {}
-                    Err(e) => panic!("poll: {e}"),
-                }
-            }
+            crate::wait::poll_ready(&mut fds).expect("poll the log and the shim");
             let (log_ready, shim_exited) = (!fds[0].revents().is_empty(), !fds[1].revents().is_empty());
             if shim_exited && !log_ready {
                 // The shim is gone, and its log has nothing more for us.
@@ -665,10 +647,7 @@ impl Run {
                 self.log.lines
             );
             let mut fds = [PollFd::new(&self.log.fifo, PollFlags::IN)];
-            match poll(&mut fds, None) {
-                Ok(_) | Err(rustix::io::Errno::INTR) => {}
-                Err(e) => panic!("poll: {e}"),
-            }
+            crate::wait::poll_ready(&mut fds).expect("poll the log");
         }
     }
 

@@ -176,13 +176,7 @@ fn exit_racing_kill_reports_the_programs_own_status() {
 /// Blocks until the process behind `pidfd` has exited.
 fn wait_until_exited(pidfd: &rustix::fd::OwnedFd) {
     let mut fds = [rustix::event::PollFd::new(pidfd, rustix::event::PollFlags::IN)];
-    loop {
-        match rustix::event::poll(&mut fds, None) {
-            Ok(_) => return,
-            Err(rustix::io::Errno::INTR) => {}
-            Err(e) => panic!("poll: {e}"),
-        }
-    }
+    crate::wait::poll_ready(&mut fds).expect("poll the pidfd");
 }
 
 #[skuld::test]
