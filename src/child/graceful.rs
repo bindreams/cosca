@@ -161,12 +161,11 @@ impl Child {
             crate::elevation::front::Gate::Open => self.proc.kill().map_err(Error::Io)?,
             // A live front in its cgroup: killed through it, and nothing signalled after it.
             crate::elevation::front::Gate::CgroupOnly => {
-                // Held off reaps from the check to the sends, and dropped before
-                // `cgroup_kill_reached`, which locks the child.
-                let held = self.proc.hold_reaps();
-                let killed = self.attached.hard_kill_marking(&self.tree_killed, &held.group());
-                drop(held);
-                killed.map_err(|e| crate::elevation::front::cgroup_kill_failed(self.front, self.id.pid(), e))?;
+                // A cgroup kill names no group by the root's pid, so no root is given.
+                debug_assert!(self.attached.is_cgroup(), "CgroupOnly is a front in a cgroup");
+                self.attached
+                    .hard_kill_marking(&self.tree_killed, &crate::containment::GroupRoot::none())
+                    .map_err(|e| crate::elevation::front::cgroup_kill_failed(self.front, self.id.pid(), e))?;
                 self.cgroup_kill_reached()?;
             }
         }
