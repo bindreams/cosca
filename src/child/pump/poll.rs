@@ -149,7 +149,7 @@ impl<'a> Pump<'a> {
                 }
             }
             Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {}
-            // The child stopped reading: end of input, as `std::process::Command::output` treats it.
+            // The child stopped reading: end of input, as Python's `subprocess.communicate` treats it.
             Err(e) if e.kind() == ErrorKind::BrokenPipe => self.feed = None,
             Err(e) => {
                 self.stdin_error = Some(e);
