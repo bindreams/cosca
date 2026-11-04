@@ -231,6 +231,58 @@ fn a_deadline_waiter_behind_a_parked_holder_returns_at_its_deadline() {
     status(holder.release_and_join());
 }
 
+/// Principle 13 for a non-holder's `Condvar` block: each round is armed from the time remaining at
+/// that moment, so a spurious wake shrinks the next timeout. The clock is frozen, and each block
+/// advances it by the real time the block took.
+///
+/// Mutant: the remaining time computed once, before the loop: both rounds are armed alike.
+#[skuld::test]
+fn a_spurious_wake_re_arms_a_deadline_waiter_with_less_time() {
+    let fake = FakeProcess::new([]).reaps([ReapAnswer::Running, ReapAnswer::Reaped(exit())]);
+    let child = owned_over(&fake);
+    let holder = park_holder(&child, &fake, |c| c.wait(None));
+    let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
+    let (again_tx, again_rx) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn({
+        let child = Arc::clone(&child);
+        move || {
+            let (_clock, at) = crate::wait::test_clock::FrozenClockGuard::install();
+            let _first = seams::on_condvar_block(move || {
+                _ = blocked_tx.send(());
+                // The second round's hook arms from inside the first, under the lock.
+                let second = seams::on_condvar_block(move || _ = again_tx.send(()));
+                std::mem::forget(second);
+            });
+            crate::wait::block_probe::take();
+            let got = child.wait(Some(at + Duration::from_secs(3600)));
+            (got, crate::wait::block_probe::take())
+        }
+    });
+    blocked_rx.recv().expect("the waiter must block in round one");
+    // The lock is free only once the waiter is inside its `Condvar` wait, which releases it
+    // atomically, so a notify under it cannot be lost.
+    {
+        let _lock = child.lock();
+        child.condvar.notify_all();
+    }
+    again_rx
+        .recv()
+        .expect("the spurious wake must send the waiter round again");
+    // The holder's reap wakes the waiter with the status.
+    status(holder.release_and_join());
+    let (got, armed) = waiter.join().expect("waiter");
+    status(got);
+    let armed: Vec<Duration> = armed
+        .into_iter()
+        .map(|a| a.expect("a deadline wait arms a bound"))
+        .collect();
+    assert!(armed.len() >= 2, "a second round must have been armed: {armed:?}");
+    assert!(
+        armed[1] < armed[0],
+        "the second round must be armed from the recomputed remaining time: {armed:?}"
+    );
+}
+
 /// S7, S8: a waiter whose deadline has passed, behind a holder, returns the exit status from its
 /// peek at once, without reaping and without waiting for the holder. `Child::try_wait` is this
 /// call with the deadline now.
