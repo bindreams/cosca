@@ -5,7 +5,7 @@
 use std::cell::{Cell, RefCell};
 use std::io;
 
-use super::Peek;
+use crate::os_process::child::PeekOutcome;
 
 /// A step of the `SharedChild` holder's wait, in the order the holder took them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,7 +43,7 @@ pub(crate) enum ForcedReap {
 
 type StepHook = Box<dyn FnOnce()>;
 
-type PeekAnswer = fn() -> io::Result<Peek>;
+type PeekAnswer = fn() -> io::Result<PeekOutcome>;
 
 /// Told the `options` of each `waitid` this thread makes.
 #[cfg(target_os = "linux")]
@@ -57,7 +57,7 @@ struct RegisteredHook {
 }
 
 thread_local! {
-    static FORCED_PEEK: RefCell<std::collections::VecDeque<io::Result<Peek>>> = const { RefCell::new(std::collections::VecDeque::new()) };
+    static FORCED_PEEK: RefCell<std::collections::VecDeque<io::Result<PeekOutcome>>> = const { RefCell::new(std::collections::VecDeque::new()) };
     static FORCED_EVERY_PEEK: Cell<Option<PeekAnswer>> = const { Cell::new(None) };
     static FORCED_REAP: Cell<Option<ForcedReap>> = const { Cell::new(None) };
     static FORCED_SI_CODE: Cell<Option<i32>> = const { Cell::new(None) };
@@ -84,12 +84,12 @@ impl Drop for Forced {
 }
 
 /// The next [`peek`](super::peek) on this thread answers `result`.
-pub(crate) fn force_peek_once(result: io::Result<Peek>) -> Forced {
+pub(crate) fn force_peek_once(result: io::Result<PeekOutcome>) -> Forced {
     force_peeks([result])
 }
 
 /// The next peeks on this thread answer `results`, one each and in order, then the OS answers again.
-pub(crate) fn force_peeks(results: impl IntoIterator<Item = io::Result<Peek>>) -> Forced {
+pub(crate) fn force_peeks(results: impl IntoIterator<Item = io::Result<PeekOutcome>>) -> Forced {
     FORCED_PEEK.with(|f| *f.borrow_mut() = results.into_iter().collect());
     Forced(|| FORCED_PEEK.with(|f| f.borrow_mut().clear()))
 }
@@ -116,7 +116,7 @@ pub(crate) fn force_every_peek(answer: PeekAnswer) -> Forced {
     Forced(|| FORCED_EVERY_PEEK.with(|f| f.set(None)))
 }
 
-pub(crate) fn take_forced_peek() -> Option<io::Result<Peek>> {
+pub(crate) fn take_forced_peek() -> Option<io::Result<PeekOutcome>> {
     FORCED_PEEK
         .with(|f| f.borrow_mut().pop_front())
         .or_else(|| FORCED_EVERY_PEEK.with(Cell::get).map(|answer| answer()))

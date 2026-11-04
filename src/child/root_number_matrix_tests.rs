@@ -225,8 +225,8 @@ impl Reap {
         }
         #[cfg(target_os = "macos")]
         {
+            use crate::os_process::child::{Foreign, PeekOutcome};
             use crate::wait::exit_only::seams::force_every_peek;
-            use crate::wait::exit_only::{Foreign, Peek};
             match self {
                 Reap::Unanswered => {
                     return Some(Box::new(force_every_peek(|| {
@@ -234,7 +234,9 @@ impl Reap {
                     })));
                 }
                 Reap::Unpinned => {
-                    return Some(Box::new(force_every_peek(|| Ok(Peek::Foreign(Foreign::Orphaned)))));
+                    return Some(Box::new(force_every_peek(|| {
+                        Ok(PeekOutcome::Foreign(Foreign::Orphaned))
+                    })));
                 }
                 _ => {}
             }

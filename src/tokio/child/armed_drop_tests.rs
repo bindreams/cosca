@@ -641,8 +641,8 @@ async fn macos_tokio_armed_drop_warns_once_when_the_reap_is_slow() {
     use std::cell::RefCell;
     use std::rc::Rc;
 
+    use crate::os_process::child::PeekOutcome;
     use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peeks, Forced};
-    use crate::wait::exit_only::Peek;
 
     crate::log_capture::install();
     let (child, _stdin) = blocker();
@@ -652,7 +652,7 @@ async fn macos_tokio_armed_drop_warns_once_when_the_reap_is_slow() {
     let forced: Rc<RefCell<Option<Forced>>> = Rc::default();
     let _look = super::fault::set_before_reap_look({
         let forced = Rc::clone(&forced);
-        move || *forced.borrow_mut() = Some(force_peeks([Ok(Peek::Running), Ok(Peek::Running)]))
+        move || *forced.borrow_mut() = Some(force_peeks([Ok(PeekOutcome::Running), Ok(PeekOutcome::Running)]))
     });
     let _warn = super::fault::warn_slow_teardowns_after(std::time::Duration::ZERO);
     drop(child);

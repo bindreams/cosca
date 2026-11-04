@@ -78,7 +78,8 @@ fn exit_visible_by_refuses_inside_a_section() {
 async fn an_echild_after_a_look_that_showed_the_exit_is_a_foreign_reap() {
     use std::os::unix::process::ExitStatusExt as _;
 
-    use crate::wait::exit_only::{seams::force_peeks, Peek, Reaped};
+    use crate::os_process::child::{ExitRecord, PeekOutcome};
+    use crate::wait::exit_only::seams::force_peeks;
 
     let mut cmd = crate::tokio::Command::new();
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
@@ -94,7 +95,9 @@ async fn an_echild_after_a_look_that_showed_the_exit_is_a_foreign_reap() {
     )
     .expect("reap behind tokio's back")
     .expect("an exit record");
-    let _shows_exit = force_peeks([Ok(Peek::Exit(Reaped::Status(std::process::ExitStatus::from_raw(9))))]);
+    let _shows_exit = force_peeks([Ok(PeekOutcome::Exit(ExitRecord::Status(
+        std::process::ExitStatus::from_raw(9),
+    )))]);
 
     let (waited, cause) = proc.wait_and_reap_awaiting().await.expect("the exit can be watched");
 
@@ -119,9 +122,9 @@ async fn an_async_reap_of_a_child_whose_tracer_dies_during_its_exit_is_woken_by_
     use std::rc::Rc;
 
     use crate::identity::{ppid_fault, uniq_info, ReadPurpose, UniqRead, LAUNCHD};
+    use crate::os_process::child::PeekOutcome;
     use crate::os_process::macos::kqueue::test_hooks;
     use crate::signal::RootState;
-    use crate::wait::exit_only::Peek;
 
     let pid = std::process::id();
     let UniqRead::Found(info) = uniq_info(pid, ReadPurpose::Adopt) else {
@@ -144,7 +147,7 @@ async fn an_async_reap_of_a_child_whose_tracer_dies_during_its_exit_is_woken_by_
     let _ = test_hooks::take_events();
 
     let looked = super::look_on_events(pid, info.unique_id, |looked| match looked {
-        Ok(Peek::Running) => Ok(None::<()>),
+        Ok(PeekOutcome::Running) => Ok(None::<()>),
         other => Err(super::Halt::State(RootState::of_peek(other))),
     })
     .await;
@@ -189,9 +192,9 @@ fn end_stand_in(mut tracer: std::process::Child) {
 
 /// A look that finds the child running asks for another; any other look ends the reap.
 #[cfg(target_os = "macos")]
-fn still_running(looked: std::io::Result<crate::wait::exit_only::Peek>) -> Result<Option<()>, super::Halt> {
+fn still_running(looked: std::io::Result<crate::os_process::child::PeekOutcome>) -> Result<Option<()>, super::Halt> {
     match looked {
-        Ok(crate::wait::exit_only::Peek::Running) => Ok(None),
+        Ok(crate::os_process::child::PeekOutcome::Running) => Ok(None),
         other => Err(super::Halt::State(crate::signal::RootState::of_peek(other))),
     }
 }
@@ -252,8 +255,8 @@ async fn an_async_reap_whose_tracer_cannot_be_read_finds_the_child_unknown() {
 #[skuld::test]
 async fn an_async_reap_whose_tracer_is_gone_looks_again_when_the_recheck_timer_fires() {
     use crate::identity::Link;
+    use crate::os_process::child::PeekOutcome;
     use crate::os_process::macos::kqueue::test_hooks;
-    use crate::wait::exit_only::Peek;
     use crate::wait::macos::tracer_seams::force_links;
 
     let (pid, unique, tracer, _parent) = stand_in_traced_by_a_blocker();
@@ -261,7 +264,7 @@ async fn an_async_reap_whose_tracer_is_gone_looks_again_when_the_recheck_timer_f
     let _ = test_hooks::take_backoff_timers();
     let mut looks = 0;
     let look = super::look_on_events(pid, unique, |looked| match looked {
-        Ok(Peek::Running) => {
+        Ok(PeekOutcome::Running) => {
             looks += 1;
             Ok((looks == 3).then_some(()))
         }

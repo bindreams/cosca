@@ -416,11 +416,12 @@ enum Check {
 /// gone. Any other answer means the child is gone. A read that is refused is an error.
 fn check(pid: u32) -> io::Result<Check> {
     use crate::identity::{origin, Origin, LAUNCHD};
-    use crate::wait::exit_only::{peek, Peek, Target};
+    use crate::os_process::child::PeekOutcome;
+    use crate::wait::exit_only::{peek, Target};
     Ok(match peek(&Target::pid(pid, None))? {
-        Peek::Running => Check::Running,
-        Peek::Exit(_) => Check::Gone,
-        Peek::Foreign(_) => match origin(pid) {
+        PeekOutcome::Running => Check::Running,
+        PeekOutcome::Exit(_) => Check::Gone,
+        PeekOutcome::Foreign(_) => match origin(pid) {
             Origin::Ours { parent } if parent == LAUNCHD => Check::Gone,
             // A tracer detached between the two reads: the child is ours again, and its own
             // `NOTE_EXIT` reaches this process.

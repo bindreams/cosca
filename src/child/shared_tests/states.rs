@@ -325,8 +325,8 @@ fn a_non_holder_peek_that_gets_echild_returns_it_and_writes_nothing() {
     let holder = park_holder(&b.shared, Some(far()), || {
         seams::force_unlocked_wait(ForcedWait::DeadlinePassed)
     });
-    let forced = exit_seams::force_peek_once(Ok(crate::wait::exit_only::Peek::Foreign(
-        crate::wait::exit_only::Foreign::Gone,
+    let forced = exit_seams::force_peek_once(Ok(crate::os_process::child::PeekOutcome::Foreign(
+        crate::os_process::child::Foreign::Gone,
     )));
     let err = b.shared.try_wait().expect_err("the forced ECHILD");
     drop(forced);
@@ -607,7 +607,7 @@ fn an_unreadable_consuming_record_is_cached_and_acts_by_no_pid() {
     assert!(
         matches!(
             b.shared.lock().state,
-            State::E(crate::wait::exit_only::Reaped::Unreadable { si_code: 99 })
+            State::E(crate::os_process::child::ExitRecord::Unreadable { si_code: 99 })
         ),
         "the state must already be E(Unreadable): {:?}",
         b.shared
