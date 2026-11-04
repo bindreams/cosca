@@ -642,29 +642,34 @@ fn a_refused_id_read_at_the_exit_check_consumes_nothing() {
 // The reap kqueue is the holder's alone =====
 
 /// A `try_wait` on another thread, during a holder's wait, neither takes the holder's event nor
-/// strands it: the one look it makes is a peek by pid, which touches no kqueue, and the child's
-/// exit then wakes the holder.
+/// strands it: the one look it makes is a peek by pid, which touches no kqueue. The child exits,
+/// and `try_wait` runs, before the holder polls, so the exit's event is already queued when the
+/// holder blocks, and wakes it at once.
 ///
-/// Mutant: `try_wait` drains the reap kqueue while another thread holds the wait: the holder sleeps
-/// through the exit it was woken for.
+/// Mutant: `try_wait` drains the reap kqueue while another thread holds the wait: the queue is
+/// empty when the holder polls, and it sleeps through the exit it was woken for.
 #[skuld::test]
 fn a_try_wait_during_a_holders_wait_does_not_strand_the_holder() {
     let mut b = Blocker::spawn();
     let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (staged_tx, staged_rx) = std::sync::mpsc::channel::<()>();
     let holder = std::thread::spawn({
         let owned = std::sync::Arc::clone(&b.owned);
         move || {
-            let _blocking = crate::wait::block_probe::on_blocking(move || _ = reached_tx.send(()));
+            // Every lock is released here, and the poll is next: the exit and the `try_wait` are
+            // staged before it.
+            let _blocking = crate::wait::block_probe::on_blocking(move || {
+                _ = reached_tx.send(());
+                staged_rx.recv().expect("the test stages the exit");
+            });
             owned.wait(None)
         }
     });
     reached_rx.recv().expect("the holder must reach its wait");
-    assert_eq!(
-        try_wait(&b.owned).expect("try_wait"),
-        ChildWaitOutcome::DeadlinePassed,
-        "the child is running"
-    );
-    b.end_child();
+    b.end_child_and_confirm_exit();
+    let peeked = status(try_wait(&b.owned));
+    assert!(peeked.success(), "{peeked:?}");
+    staged_tx.send(()).expect("the holder is waiting for the stage");
     let status = status(holder.join().expect("holder"));
     assert!(status.success(), "{status:?}");
 }
@@ -697,19 +702,22 @@ fn try_wait_during_a_wait_errors_when_a_running_childs_unique_id_is_unreadable()
 }
 
 /// A `try_wait` that drains the child's `NOTE_EXIT` while the record is not yet visible leaves the
-/// event behind it gone from the reap kqueue, and a `wait` still returns: "exit seen" is read from
-/// the exit kqueue, which nothing drains.
+/// event gone from the reap kqueue, and a `wait` whose first look still finds no record returns:
+/// "exit seen" is read from the exit kqueue, which nothing drains, so that look is a `Recheck`.
 ///
-/// Mutant: "exit seen" kept as a flag set by the drain, or read from the reap kqueue: the wait
+/// Mutant: "exit seen" taken from the drain's own result, or read from the reap kqueue: the wait
 /// blocks on a queue that holds nothing, for ever.
 #[skuld::test]
 fn a_try_wait_that_drains_note_exit_then_a_wait_still_returns() {
     let mut b = Blocker::spawn();
     b.end_child_and_confirm_exit();
-    // The look's peek finds no record, as when XNU is still finishing the exit.
-    let forced = exit_seams::force_peeks([Ok(PeekOutcome::Running)]);
+    // Each look's peek finds no record, as when XNU is still finishing the exit: the `try_wait`'s,
+    // which drains `NOTE_EXIT` from the reap kqueue, and the first of the `wait`'s, which finds
+    // that queue empty. The `wait`'s second peek is the real one.
+    let forced = exit_seams::force_peeks([Ok(PeekOutcome::Running), Ok(PeekOutcome::Running)]);
     assert_eq!(try_wait(&b.owned).expect("try_wait"), ChildWaitOutcome::DeadlinePassed);
-    drop(forced);
     let status = wait_status(&b.owned);
+    drop(forced);
     assert!(status.success(), "{status:?}");
+    exit_seams::assert_peeks_exhausted();
 }
