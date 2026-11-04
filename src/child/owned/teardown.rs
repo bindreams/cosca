@@ -108,11 +108,18 @@ impl OwnedChild {
     /// The one look after a kill that failed with `refused`, never a wait.
     fn look_after_refused_kill(&self, id: ProcessId, refused: Error) -> TeardownOutcome {
         let pid = id.pid();
-        let looked = self
-            .wait(Some(crate::wait::now()))
-            .and_then(|outcome| status_of_outcome(pid, outcome, Orphaned::Quiet));
-        let look_failure = looked.as_ref().err().map(ToString::to_string);
-        let fate = crate::child::spawn::fate_of_a_look(looked.map_err(|e| e.into_io().raw_os_error()), Some(id));
+        // A child reaped elsewhere is read from the typed outcome, so it is `Gone` on every OS: the
+        // error `status_of_outcome` renders it as is `ECHILD` on Unix only.
+        let (fate, look_failure) = match self.wait(Some(crate::wait::now())) {
+            Ok(ChildWaitOutcome::Foreign(foreign)) => (foreign.fate(false), None),
+            looked => {
+                let looked = looked.and_then(|outcome| status_of_outcome(pid, outcome, Orphaned::Quiet));
+                let failure = looked.as_ref().err().map(ToString::to_string);
+                let fate =
+                    crate::child::spawn::fate_of_a_look(looked.map_err(|e| e.into_io().raw_os_error()), Some(id));
+                (fate, failure)
+            }
+        };
         // Only a child still running is "left"; a look that found it reaped elsewhere warns nothing.
         let left = match (&fate, look_failure) {
             (ChildFate::Running { .. }, _) => Some(format!(

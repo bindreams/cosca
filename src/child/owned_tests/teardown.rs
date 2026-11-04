@@ -218,8 +218,8 @@ fn teardown_after_a_refused_kill_with_a_failed_look_is_unknown() {
 /// A kill that failed on a child someone else already reaped: the look finds `ECHILD`, the child is
 /// `Gone`, and there is no warning that it is left running.
 ///
-/// Mutant: the warning is returned for every look that did not collect an exit.
-#[cfg(unix)]
+/// Mutant: the warning is returned for every look that did not collect an exit; the fate is read
+/// from the look's raw OS error, which only Unix has.
 #[skuld::test]
 fn teardown_after_a_refused_kill_of_a_child_reaped_elsewhere_is_gone_and_silent() {
     let fake = FakeProcess::new([])
