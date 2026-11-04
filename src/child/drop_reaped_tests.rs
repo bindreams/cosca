@@ -10,7 +10,7 @@
 
 use std::io::Read as _;
 
-use crate::child::fault::record_root_teardowns;
+use crate::child::owned::seams::record_root_teardowns;
 use crate::child::spawn::fault::{release_at_drop_kill, release_between_kill_and_wait};
 use crate::command::Command;
 use crate::containment::treewalk::fault::record_walks;

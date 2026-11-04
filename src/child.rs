@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::io::{PipeReader, PipeWriter};
 
 #[cfg(unix)]
-use crate::child::proc_handle::Torn;
+use crate::child::owned::teardown::TeardownOutcome;
 use crate::command::Command;
 use crate::containment::Containment;
 use crate::error::Error;
@@ -22,9 +22,7 @@ pub(crate) mod spawn;
 pub(crate) mod drop_report;
 #[path = "child/owned.rs"]
 pub(crate) mod owned;
-#[path = "child/proc_handle.rs"]
-pub(crate) mod proc_handle;
-use proc_handle::ProcHandle;
+use owned::OwnedChild;
 
 #[path = "child/lifecycle.rs"]
 mod lifecycle;
@@ -122,7 +120,7 @@ pub(crate) enum ParentEnd {
 /// A spawned child process the crate owns.
 #[derive(Debug)]
 pub struct Child {
-    proc: ProcHandle,
+    proc: OwnedChild,
     /// Stable identity resolved immediately after spawn.
     id: ProcessId,
     pipes: BTreeMap<Fd, ParentEnd>,
@@ -145,7 +143,7 @@ pub struct Child {
 
 impl Child {
     pub(crate) fn from_parts(
-        proc: ProcHandle,
+        proc: OwnedChild,
         id: ProcessId,
         pipes: BTreeMap<Fd, ParentEnd>,
         kill_on_drop: bool,
@@ -175,7 +173,8 @@ impl Child {
     /// The process handle, borrowed from `self`.
     #[cfg(windows)]
     pub(crate) fn process_handle(&self) -> std::os::windows::io::RawHandle {
-        self.proc.raw_handle()
+        use std::os::windows::io::AsRawHandle;
+        self.proc.os_handle().as_raw_handle()
     }
 
     /// Commit the spawn: apply `kill_on_drop` to the containment resource (see
@@ -252,12 +251,13 @@ impl Child {
         if let Some(error) = crate::child::spawn::failure::seams::take_wait_failure() {
             return Err(error);
         }
-        self.proc.wait().map_err(Error::Io)
+        self.wait_root_unbounded()
     }
 
     /// Return the exit status if the child has already exited.
     pub fn try_wait(&self) -> Result<Option<std::process::ExitStatus>, Error> {
-        self.proc.try_wait().map_err(Error::Io)
+        // One look at the present moment. A zombie launchd holds is the caller's to report.
+        self.wait_root(Some(crate::wait::now()), lifecycle::Orphaned::Quiet)
     }
 
     /// Is this child an elevation backend, whose elevated program may outlive it?
@@ -327,10 +327,23 @@ impl Child {
         // becomes the typed `Unkillable`.
         #[cfg(not(unix))]
         {
-            self.proc
-                .kill()
+            self.kill_root()
+                .map(drop)
                 .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper()))
         }
+    }
+
+    /// Hard-kill the root through its handle ([`Sent::Gone`](crate::signal::Sent) once it has exited
+    /// or been reaped), with the OS's error as it gave it.
+    pub(crate) fn kill_root(&self) -> std::io::Result<crate::signal::Sent> {
+        self.proc.signal(crate::signal::Sig::Kill).map_err(Error::into_io)
+    }
+
+    /// Whether the root is running, read without reaping it, for the elevation front's gates.
+    #[cfg(unix)]
+    fn root_running(&self) -> std::io::Result<bool> {
+        let peeked = self.proc.hold(self.id.pid()).peek().map_err(Error::into_io)?;
+        Ok(matches!(peeked, crate::os_process::child::PeekOutcome::Running))
     }
 
     /// [`kill`](Child::kill), reporting whether a signal was sent (see [`Sent`](crate::signal::Sent)).
@@ -370,7 +383,7 @@ impl Child {
             Gate::Open => {}
             // An exit is permanent, so a refused signal to an exited front changes nothing.
             Gate::Exited => {
-                return match self.proc.kill_sent() {
+                return match self.kill_root() {
                     Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
                         log::debug!("the kill of exited front pid {} was refused ({e})", self.id.pid());
                         Ok(crate::signal::Sent::Delivered)
@@ -380,12 +393,10 @@ impl Child {
             }
             // Nothing is signalled after the cgroup kill: it could only be refused.
             Gate::CgroupOnly => {
-                let check = || self.group_number_holds();
+                // A cgroup kill names no group by the root's pid, so no root is given.
+                debug_assert!(self.attached.is_cgroup(), "CgroupOnly is a front in a cgroup");
                 self.attached
-                    .hard_kill_marking(
-                        &self.tree_killed,
-                        &crate::containment::GroupRoot::new(self.proc.pidfd(), &check),
-                    )
+                    .hard_kill_marking(&self.tree_killed, &crate::containment::GroupRoot::none())
                     .map_err(|e| crate::elevation::front::cgroup_kill_failed(self.front, self.id.pid(), e))?;
                 self.cgroup_kill_reached()?;
                 return Ok(crate::signal::Sent::Delivered);
@@ -394,8 +405,7 @@ impl Child {
         }
         // A plain child returns Ok(()) once exited. EPERM on an elevated wrapper child becomes
         // the typed `Unkillable`.
-        self.proc
-            .kill_sent()
+        self.kill_root()
             .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper()))
     }
 
@@ -411,7 +421,7 @@ impl Child {
     ///   and reaped; outside it, or in it with no kill landed, it is running, and is left, as `why`
     ///   says. A place that cannot be read is said so, and is not called running.
     #[cfg(unix)]
-    fn tear_down_leaf_and_look_at_front(&mut self, why: &dyn std::fmt::Display) -> Torn {
+    fn tear_down_leaf_and_look_at_front(&mut self, why: &dyn std::fmt::Display) -> TeardownOutcome {
         use crate::error::ChildFate;
         let pid = self.id.pid();
         // Captured while the leaf exists: it places the front once the leaf is gone.
@@ -427,13 +437,13 @@ impl Child {
         let looked = if fault::front_read_as_running() {
             Ok(None)
         } else {
-            self.proc.try_wait()
+            self.try_wait().map_err(Error::into_io)
         };
         #[cfg(not(all(test, target_os = "linux")))]
-        let looked = self.proc.try_wait();
+        let looked = self.try_wait().map_err(Error::into_io);
         let reaped = |status: std::process::ExitStatus| {
             log::debug!("Child::drop: elevation front pid {pid} was killed through its cgroup and reaped ({status})");
-            Torn::new(ChildFate::Reaped)
+            TeardownOutcome::new(ChildFate::Reaped)
         };
         let running = ChildFate::Running { id: Some(self.id) };
         match looked {
@@ -448,20 +458,20 @@ impl Child {
                             Err(e) if e.raw_os_error() == Some(libc::ECHILD) => {
                                 log::debug!("Child::drop: elevation front pid {pid} was reaped by someone else");
                                 // The cgroup kill landed first: delivered, so `Killed`.
-                                Torn::new(crate::os_process::child::Foreign::Gone.fate(true))
+                                TeardownOutcome::new(crate::os_process::child::Foreign::Gone.fate(true))
                             }
-                            Err(e) => Torn {
+                            Err(e) => TeardownOutcome {
                                 fate: ChildFate::Killed,
                                 left: Some(format!(
                                     "elevation front pid {pid} was killed through its cgroup, and could not be reaped ({e})"
                                 )),
                             },
                         },
-                        Ok(false) => Torn {
+                        Ok(false) => TeardownOutcome {
                             fate: running,
                             left: Some(self.front_left_running(why)),
                         },
-                        Err(e) => Torn {
+                        Err(e) => TeardownOutcome {
                             fate: ChildFate::Unknown,
                             left: Some(format!(
                                 "elevation front pid {pid} is left unreaped: where it is cannot be read ({e}), so it is \
@@ -469,20 +479,20 @@ impl Child {
                             )),
                         },
                     },
-                    Some(Err(e)) => Torn {
+                    Some(Err(e)) => TeardownOutcome {
                         fate: ChildFate::Unknown,
                         left: Some(format!(
                             "elevation front pid {pid} is left unreaped: its leaf's subtree cannot be read ({e}), so it \
                              is not known whether the cgroup kill ended it"
                         )),
                     },
-                    None => Torn {
+                    None => TeardownOutcome {
                         fate: running,
                         left: Some(self.front_left_running(why)),
                     },
                 };
                 #[cfg(not(target_os = "linux"))]
-                let note = Torn {
+                let note = TeardownOutcome {
                     fate: running,
                     left: Some(self.front_left_running(why)),
                 };
@@ -490,9 +500,9 @@ impl Child {
             }
             Err(e) if e.raw_os_error() == Some(libc::ECHILD) => {
                 log::debug!("Child::drop: elevation front pid {pid} was reaped by someone else");
-                Torn::new(ChildFate::Gone)
+                TeardownOutcome::new(ChildFate::Gone)
             }
-            Err(e) => Torn {
+            Err(e) => TeardownOutcome {
                 fate: ChildFate::Unknown,
                 left: Some(format!(
                     "elevation front pid {pid} could not be looked at after its cgroup's teardown ({e})"
@@ -506,7 +516,7 @@ impl Child {
     fn wait_for_dying_front(&self) -> std::io::Result<std::process::ExitStatus> {
         #[cfg(test)]
         crate::child::spawn::fault::run_between_kill_and_wait();
-        self.proc.wait()
+        self.wait_root_unbounded().map_err(Error::into_io)
     }
 
     #[cfg(unix)]
@@ -525,7 +535,7 @@ impl Child {
         crate::elevation::front::kill_gate(
             self.front,
             pid,
-            || self.proc.is_running(),
+            || self.root_running(),
             || self.attached.kill_reaches_across_credentials(pid, self.proc.pidfd()),
         )
     }
@@ -538,7 +548,7 @@ impl Child {
         crate::elevation::front::cgroup_kill_reached(
             self.front,
             pid,
-            || self.proc.is_running().map(|running| !running),
+            || self.root_running().map(|running| !running),
             || self.attached.cgroup_names(pid, self.proc.pidfd()),
         )
     }
@@ -546,7 +556,7 @@ impl Child {
     /// What a `SIGTERM` to this child may do (see [`crate::elevation::front`]).
     #[cfg(unix)]
     fn terminate_gate(&self) -> crate::elevation::front::Gate {
-        crate::elevation::front::terminate_gate(self.front, self.id.pid(), || self.proc.is_running())
+        crate::elevation::front::terminate_gate(self.front, self.id.pid(), || self.root_running())
     }
 
     /// Hard-kill the contained tree. Requires an actionable containment mechanism
@@ -671,11 +681,9 @@ impl Child {
         // signalled by identity alone, and so is a group named by the root's pid once that pid may
         // name another process. This handle's reaps are held off from the look to the sweep's end.
         #[cfg(unix)]
-        let held = self.proc.hold_reaps();
+        let held = self.proc.hold(self.id.pid());
         #[cfg(unix)]
-        let check = || tree_call::group_number_holds(self.id.pid(), held.state());
-        #[cfg(unix)]
-        let group = crate::containment::GroupRoot::new(self.proc.pidfd(), &check);
+        let group = held.group();
         #[cfg(not(unix))]
         let group = crate::containment::GroupRoot::none();
         #[cfg(unix)]
@@ -728,8 +736,8 @@ impl Child {
             );
             Ok(())
         } else {
-            self.proc
-                .kill()
+            self.kill_root()
+                .map(drop)
                 .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper()))
         };
         if let (Err(group), Err(bs)) = (&group_result, &backstop) {
@@ -819,11 +827,9 @@ impl Child {
         // One look at the root decides, as for `kill_tree`, and this handle's reaps are held off
         // until the signal is sent.
         #[cfg(unix)]
-        let held = self.proc.hold_reaps();
+        let held = self.proc.hold(self.id.pid());
         #[cfg(unix)]
-        let check = || tree_call::group_number_holds(self.id.pid(), held.state());
-        #[cfg(unix)]
-        let group = crate::containment::GroupRoot::new(self.proc.pidfd(), &check);
+        let group = held.group();
         #[cfg(not(unix))]
         let group = crate::containment::GroupRoot::none();
         #[cfg(unix)]
@@ -839,13 +845,7 @@ impl Child {
     /// The group's termination signal, with no look at the root's state but `group`'s own check
     /// before each send by the root's number.
     fn terminate_tree_unchecked(&self, group: &crate::containment::GroupRoot<'_>) -> Result<(), Error> {
-        self.attached.terminate(self.proc.id(), group)
-    }
-
-    /// Whether the root's pid still names its group, read now through its handle.
-    #[cfg(unix)]
-    fn group_number_holds(&self) -> Result<(), String> {
-        tree_call::group_number_holds(self.id.pid(), self.proc.state())
+        self.attached.terminate(self.id.pid(), group)
     }
 
     /// A tree call on this child's tree ([`TreeCall`]).
@@ -946,7 +946,7 @@ impl Child {
     /// against the held handle, not "any job"). `pub` so integration tests can call it.
     #[cfg(windows)]
     pub fn test_job_handle_contains_self(&self) -> bool {
-        self.test_job_handle_contains(self.proc.id())
+        self.test_job_handle_contains(self.id.pid())
     }
 
     /// Test-only: [`test_job_handle_contains_self`](Self::test_job_handle_contains_self) for any
@@ -1058,37 +1058,6 @@ pub(crate) mod fault {
 
     thread_local! {
         static FORCED: Cell<Option<Resolved<ProcessId>>> = const { Cell::new(None) };
-        static ROOT_TEARDOWNS: Cell<Option<u32>> = const { Cell::new(None) };
-    }
-
-    /// From now on every root teardown a drop starts on THIS thread (`ProcHandle::teardown_on_drop`:
-    /// a kill by pid and a wait by pid) is counted. It still runs.
-    pub(crate) fn record_root_teardowns() -> RootTeardownRecorder {
-        ROOT_TEARDOWNS.with(|c| c.set(Some(0)));
-        RootTeardownRecorder(())
-    }
-
-    #[must_use = "recording stops as soon as the recorder is dropped"]
-    pub(crate) struct RootTeardownRecorder(());
-
-    impl RootTeardownRecorder {
-        pub(crate) fn count(&self) -> u32 {
-            ROOT_TEARDOWNS.with(|c| c.get().expect("the recorder is live"))
-        }
-    }
-
-    impl Drop for RootTeardownRecorder {
-        fn drop(&mut self) {
-            ROOT_TEARDOWNS.with(|c| c.set(None));
-        }
-    }
-
-    pub(crate) fn note_root_teardown() {
-        ROOT_TEARDOWNS.with(|c| {
-            if let Some(n) = c.get() {
-                c.set(Some(n + 1));
-            }
-        });
     }
 
     /// The next drop-time read of a root's number on THIS thread answers `read`. Standing in for
@@ -1281,10 +1250,11 @@ impl Child {
             }
             gate => matches!(gate, crate::elevation::front::Gate::CgroupOnly),
         };
-        let check = || self.group_number_holds();
-        let kill = self
-            .attached
-            .hard_kill_for_drop(&view, &crate::containment::GroupRoot::new(self.proc.pidfd(), &check));
+        // The hold names the root's group. The handle owns the child outright here, so no reap
+        // can land; it is dropped before anything below locks the child.
+        let held = self.proc.hold(self.id.pid());
+        let kill = self.attached.hard_kill_for_drop(&view, &held.group());
+        drop(held);
         report.skipped = kill.skipped;
         if let Err(e) = &kill.result {
             // A live member refused, or couldn't be confirmed — visible, not silently
@@ -1315,7 +1285,7 @@ impl Child {
             let torn = if cgroup_only {
                 match kill.result.and_then(|()| self.cgroup_kill_reached()) {
                     // The cgroup kill ended it: reap it, sending nothing.
-                    Ok(()) => self.proc.reap_after_tree_kill(),
+                    Ok(()) => self.proc.reap_after_tree_kill(self.id.pid()),
                     // Never waited for. The armed leaf still kills what it holds, retrying a kill
                     // that failed, and the front is looked at once that is done.
                     Err(e) => self.tear_down_leaf_and_look_at_front(&e),

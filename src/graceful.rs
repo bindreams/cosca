@@ -91,10 +91,27 @@ impl std::fmt::Display for GracefulMechanism {
 /// does not wait or reap. The crate's single dispatch point — every cooperative signal to an
 /// owned child funnels through here.
 ///
+/// `signal_root` sends a [`Sig`](crate::signal::Sig) to the root through the caller's own handle;
+/// the Unix `Process` mechanism calls it with `Sig::Term`. On Windows that mechanism is
+/// `Unsupported` and does not call it. The console mechanisms address `id`'s pid and do not call
+/// it.
+///
 /// Matched exhaustively with no wildcard, so a future variant is a compile error at the one
 /// place this decision is made.
-pub(crate) fn signal(mechanism: GracefulMechanism, id: crate::identity::ProcessId) -> Result<(), crate::error::Error> {
+pub(crate) fn signal(
+    mechanism: GracefulMechanism,
+    id: crate::identity::ProcessId,
+    signal_root: impl FnOnce(crate::signal::Sig) -> Result<(), crate::error::Error>,
+) -> Result<(), crate::error::Error> {
+    // Each platform's arms use one of the two.
+    #[cfg(unix)]
+    let _ = id;
+    #[cfg(windows)]
+    drop(signal_root);
     match mechanism {
+        #[cfg(unix)]
+        GracefulMechanism::Process => signal_root(crate::signal::Sig::Term),
+        #[cfg(windows)]
         GracefulMechanism::Process => crate::os_process::terminate_by_id(id),
         // One arm for both. This process's console list is readable, but absence from it does
         // not imply undeliverable (see `containment::windows::terminate`), and refusing
