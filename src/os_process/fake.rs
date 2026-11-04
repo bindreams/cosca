@@ -35,8 +35,9 @@ pub(crate) enum ReapAnswer {
     Err(std::io::ErrorKind),
 }
 
-/// One scripted answer of [`OsChild::peek`].
-pub(crate) type PeekAnswer = Result<PeekOutcome, std::io::ErrorKind>;
+/// One scripted answer of [`OsChild::peek`]. A failure is the whole `io::Error`, so a test can name
+/// its message.
+pub(crate) type PeekAnswer = Result<PeekOutcome, std::io::Error>;
 
 /// One scripted answer of [`OsProcess::signal`]. A failure is the whole `io::Error`, so a test can
 /// state a raw errno.
@@ -76,7 +77,6 @@ impl FakeProcess {
 
     /// A process that answers from its tables (all empty to start) and, where a table has nothing,
     /// from `real`.
-    #[cfg(windows)]
     pub(crate) fn over(real: Box<dyn OsChild>) -> Self {
         Self::with([], Some(real))
     }
@@ -102,6 +102,21 @@ impl FakeProcess {
     pub(crate) fn peeks(self, peeks: impl IntoIterator<Item = PeekAnswer>) -> Self {
         self.script().peeks = peeks.into_iter().collect();
         self
+    }
+
+    /// How many scripted [`OsChild::peek`] answers no call has consumed.
+    #[cfg(unix)]
+    pub(crate) fn peeks_left(&self) -> usize {
+        self.script().peeks.len()
+    }
+
+    /// Panics unless every scripted peek answer was consumed: a test that counts on a number of
+    /// looks asserts it, so a look that stopped happening fails.
+    #[cfg(unix)]
+    #[track_caller]
+    pub(crate) fn assert_peeks_exhausted(&self) {
+        let left = self.peeks_left();
+        assert_eq!(left, 0, "{left} scripted peek answer(s) were never consumed");
     }
 
     /// Answer `reaps` to successive [`OsChild::try_reap`] calls.
@@ -218,7 +233,7 @@ impl OsChild for FakeProcess {
         let scripted = self.script().peeks.pop_front();
         match (scripted, &self.0.real) {
             (Some(Ok(outcome)), _) => Ok(outcome),
-            (Some(Err(kind)), _) => Err(Error::Io(kind.into())),
+            (Some(Err(error)), _) => Err(Error::Io(error)),
             (None, Some(real)) => real.peek(),
             (None, None) => panic!("FakeProcess: a peek was made past the scripted answers"),
         }

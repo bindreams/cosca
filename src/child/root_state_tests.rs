@@ -20,14 +20,15 @@ fn warns_since(mark: usize) -> Vec<String> {
 #[skuld::test]
 fn state_after_own_wait_is_reaped_without_a_warn() {
     crate::log_capture::install();
-    let child = Command::new().args(["true"]).spawn().expect("spawn");
+    let mut child = Command::new().args(["true"]).spawn().expect("spawn");
     child.wait().expect("wait");
 
     let mark = crate::log_capture::mark();
     // A peek would say `Running`: only the recorded reap says `Reaped`.
-    let running = crate::wait::exit_only::seams::force_peek_once(Ok(crate::os_process::child::PeekOutcome::Running));
+    child
+        .proc
+        .script_over(|f| f.peeks([Ok(crate::os_process::child::PeekOutcome::Running)]));
     let state = child.proc.state();
-    drop(running);
     drop(child);
 
     assert!(matches!(state, RootState::Reaped { own: true }), "{state:?}");
@@ -44,7 +45,6 @@ mod linux {
     use crate::signal::Sig;
     use crate::test_child::pid_reuse::{in_fresh_pid_ns, reap_behind_and_reuse, sigusr1_and_wait};
     use crate::test_groups::namespaces;
-    use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peek_once, force_peeks};
     use crate::ContainMode;
 
     fn session_blocker() -> (crate::Child, std::io::PipeWriter) {
@@ -105,17 +105,19 @@ mod linux {
         let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
         crate::log_capture::install();
         let recorder = record_kill_group();
-        let (child, writer) = session_blocker();
+        let (mut child, writer) = session_blocker();
         // Released once the drop's root kill returned, so a drop that sent none ends it with 0.
         let blocker = crate::child::spawn::fault::release_at_drop_kill(writer);
         let pid = child.id().pid();
         let sends = Capture::start();
         let mark = crate::log_capture::mark();
-        let _failed = force_peek_once(Err(std::io::Error::other("forced peek failure")));
+        let fake = child
+            .proc
+            .script_over(|f| f.peeks([Err(std::io::Error::other("forced peek failure"))]));
 
         drop(child);
 
-        assert_peeks_exhausted();
+        fake.assert_peeks_exhausted();
         blocker.assert_killed();
         assert!(
             crate::log_capture::contains_since(mark, "RootState::Unknown"),
@@ -149,18 +151,20 @@ mod linux {
     fn the_unknown_warn_names_its_caller() {
         crate::log_capture::install();
         let _recorder = record_kill_group();
-        let (child, writer) = session_blocker();
+        let (mut child, writer) = session_blocker();
         // Released once the cleanup's root kill returned, before its reap.
         let blocker = crate::child::spawn::fault::release_between_kill_and_wait(writer);
         let mark = crate::log_capture::mark();
         // The number is unreadable too, so the read says so in a `debug` line of its own.
         let _number = crate::child::fault::force_next_root_read(crate::identity::Resolved::Unknown);
-        let _failed = force_peek_once(Err(std::io::Error::other("forced peek failure")));
+        let fake = child
+            .proc
+            .script_over(|f| f.peeks([Err(std::io::Error::other("forced peek failure"))]));
 
         let err = crate::child::spawn::finish_elevated(child, Err(crate::error::Error::Io(std::io::Error::other("w"))))
             .expect_err("the spawn fails");
 
-        assert_peeks_exhausted();
+        fake.assert_peeks_exhausted();
         blocker.assert_killed();
         // The cleanup's error and the Unknown warn report it; the handle it drops afterwards is
         // disarmed and says nothing more.
@@ -186,16 +190,18 @@ mod linux {
         let sends = Capture::start();
         let mark = crate::log_capture::mark();
         // The gate's two looks at the front see it run; the read after them sees the failed peek.
-        let _looks = force_peeks([
-            Ok(crate::os_process::child::PeekOutcome::Running),
-            Ok(crate::os_process::child::PeekOutcome::Running),
-            Err(std::io::Error::other("forced peek failure")),
-        ]);
+        let fake = child.proc.script_over(|f| {
+            f.peeks([
+                Ok(crate::os_process::child::PeekOutcome::Running),
+                Ok(crate::os_process::child::PeekOutcome::Running),
+                Err(std::io::Error::other("forced peek failure")),
+            ])
+        });
 
         drop(child);
         drop(writer);
 
-        assert_peeks_exhausted();
+        fake.assert_peeks_exhausted();
         assert_eq!(recorder.killed(), Vec::<i32>::new());
         assert!(sends.entries().is_empty(), "{:?}", sends.entries());
         let warns = warns_since(mark);
@@ -214,15 +220,17 @@ mod linux {
     fn an_unknown_root_with_an_unreadable_number_does_not_claim_not_reaped() {
         crate::log_capture::install();
         let _recorder = record_kill_group();
-        let (child, writer) = session_blocker();
+        let (mut child, writer) = session_blocker();
         let blocker = crate::child::spawn::fault::release_at_drop_kill(writer);
         let mark = crate::log_capture::mark();
         let _number = crate::child::fault::force_next_root_read(crate::identity::Resolved::Unknown);
-        let _failed = force_peek_once(Err(std::io::Error::other("forced peek failure")));
+        let fake = child
+            .proc
+            .script_over(|f| f.peeks([Err(std::io::Error::other("forced peek failure"))]));
 
         drop(child);
 
-        assert_peeks_exhausted();
+        fake.assert_peeks_exhausted();
         blocker.assert_killed();
         assert!(
             !crate::log_capture::contains_since(mark, "treating the root as not reaped"),
@@ -243,11 +251,13 @@ mod linux {
     #[skuld::test]
     fn a_failed_root_peek_does_not_mark_the_tree_killed() {
         let recorder = record_kill_group();
-        let (child, _writer) = session_blocker();
+        let (mut child, _writer) = session_blocker();
         let killed = crate::containment::TreeKilled::default();
-        let _failed = force_peek_once(Err(std::io::Error::other("forced peek failure")));
+        let fake = child
+            .proc
+            .script_over(|f| f.peeks([Err(std::io::Error::other("forced peek failure"))]));
         let view = crate::containment::DropView::read("test", child.id, || child.proc.state(), &child.tree_killed);
-        assert_peeks_exhausted();
+        fake.assert_peeks_exhausted();
         assert!(
             matches!(view.root, crate::containment::dispatch::RootView::Unknown(_)),
             "{:?}",
@@ -271,7 +281,6 @@ mod macos {
     use crate::os_process::child::{Foreign, PeekOutcome};
     use crate::send_log::{Capture, Via};
     use crate::signal::Sig;
-    use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peek_once, force_peeks};
     use crate::ContainMode;
 
     /// A tree-walk child: the walk names no marker holder, so the only sends are the root's own.
@@ -291,15 +300,17 @@ mod macos {
     #[skuld::test]
     fn an_orphaned_root_is_neither_signalled_nor_waited_on_and_warns_once() {
         crate::log_capture::install();
-        let (child, writer) = walked_blocker();
+        let (mut child, writer) = walked_blocker();
         let pid = child.id().pid();
         let sends = Capture::start();
         let mark = crate::log_capture::mark();
-        let _orphaned = force_peek_once(Ok(PeekOutcome::Foreign(Foreign::Orphaned)));
+        let fake = child
+            .proc
+            .script_over(|f| f.peeks([Ok(PeekOutcome::Foreign(Foreign::Orphaned))]));
 
         drop(child);
 
-        assert_peeks_exhausted();
+        fake.assert_peeks_exhausted();
         assert_eq!(sends.entries(), vec![], "nothing may be sent to a root we do not pin");
         assert!(
             crate::test_child::is_unreaped_child(pid),
@@ -329,15 +340,17 @@ mod macos {
         let sends = Capture::start();
         let mark = crate::log_capture::mark();
         // The gate's two looks at the front, which see it run, then the read.
-        let _looks = force_peeks([
-            Ok(PeekOutcome::Running),
-            Ok(PeekOutcome::Running),
-            Ok(PeekOutcome::Foreign(Foreign::Orphaned)),
-        ]);
+        let fake = child.proc.script_over(|f| {
+            f.peeks([
+                Ok(PeekOutcome::Running),
+                Ok(PeekOutcome::Running),
+                Ok(PeekOutcome::Foreign(Foreign::Orphaned)),
+            ])
+        });
 
         drop(child);
 
-        assert_peeks_exhausted();
+        fake.assert_peeks_exhausted();
         assert_eq!(sends.entries(), vec![]);
         let warns = warns_since(mark);
         assert_eq!(warns.len(), 1, "{warns:?}");
@@ -358,15 +371,17 @@ mod macos {
     #[skuld::test]
     fn an_unknown_root_we_pin_is_still_killed_through_its_handle() {
         crate::log_capture::install();
-        let (child, writer) = walked_blocker();
+        let (mut child, writer) = walked_blocker();
         let pid = child.id().pid();
         let sends = Capture::start();
-        let _failed = force_peek_once(Err(std::io::Error::other("forced peek failure")));
+        let fake = child
+            .proc
+            .script_over(|f| f.peeks([Err(std::io::Error::other("forced peek failure"))]));
 
         drop(child);
         drop(writer);
 
-        assert_peeks_exhausted();
+        fake.assert_peeks_exhausted();
         assert_eq!(sends.entries(), vec![(pid, Sig::Kill, Via::Identity)]);
     }
 
@@ -395,24 +410,27 @@ mod macos {
         let holders = crate::containment::fdmarker::fault::record_holder_kills();
         // Control: a root that is a marker holder is swept when the handle says it is reaped, so
         // the assertion below is not vacuous.
-        let (control, control_writer) = session_blocker();
+        let (mut control, control_writer) = session_blocker();
         let control_pid = control.id().pid();
-        let gone = force_peek_once(Ok(PeekOutcome::Foreign(Foreign::Gone)));
+        let gone = control
+            .proc
+            .script_over(|f| f.peeks([Ok(PeekOutcome::Foreign(Foreign::Gone))]));
         drop(control);
-        assert_peeks_exhausted();
-        drop(gone);
+        gone.assert_peeks_exhausted();
         drop(control_writer);
         assert!(holders.killed().contains(&control_pid), "{:?}", holders.killed());
 
-        let (child, writer) = session_blocker();
+        let (mut child, writer) = session_blocker();
         let pid = child.id().pid();
         let sends = Capture::start();
-        let _orphaned = force_peek_once(Ok(PeekOutcome::Foreign(Foreign::Orphaned)));
+        let fake = child
+            .proc
+            .script_over(|f| f.peeks([Ok(PeekOutcome::Foreign(Foreign::Orphaned))]));
 
         drop(child);
         drop(writer);
 
-        assert_peeks_exhausted();
+        fake.assert_peeks_exhausted();
         assert!(sends.entries().is_empty(), "{:?}", sends.entries());
         assert!(
             !holders.killed().contains(&pid),
@@ -427,10 +445,12 @@ mod macos {
     #[skuld::test]
     fn finish_elevated_leaves_an_orphaned_root_alone() {
         crate::log_capture::install();
-        let (child, writer) = walked_blocker();
+        let (mut child, writer) = walked_blocker();
         let sends = Capture::start();
         let mark = crate::log_capture::mark();
-        let _orphaned = force_peek_once(Ok(PeekOutcome::Foreign(Foreign::Orphaned)));
+        let fake = child
+            .proc
+            .script_over(|f| f.peeks([Ok(PeekOutcome::Foreign(Foreign::Orphaned))]));
 
         let (err, fate) =
             crate::child::spawn::finish_elevated(child, Err(crate::error::Error::Io(std::io::Error::other("w"))))
@@ -438,7 +458,7 @@ mod macos {
                 .expect_may_have_started_with();
         drop(writer);
 
-        assert_peeks_exhausted();
+        fake.assert_peeks_exhausted();
         assert!(sends.entries().is_empty(), "{:?}", sends.entries());
         assert!(err.to_string().contains("left alone"), "{err}");
         assert_eq!(
