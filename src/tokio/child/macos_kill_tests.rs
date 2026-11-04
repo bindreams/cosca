@@ -39,7 +39,7 @@ async fn foreign_reaped_blocker() -> crate::tokio::Child {
 /// still shows even though it fails with `ESRCH`.
 ///
 /// Mutants: `kill` via tokio's `start_kill` (answers `Err(ESRCH)`); no identity check before the
-/// by-pid send (the log shows `Via::Pid`).
+/// by-pid send (the log shows `Via::Identity`).
 #[skuld::test]
 async fn macos_tokio_kill_after_a_foreign_reap_sends_nothing() {
     let mut child = foreign_reaped_blocker().await;
@@ -48,7 +48,7 @@ async fn macos_tokio_kill_after_a_foreign_reap_sends_nothing() {
     let sent_by_pid: Vec<_> = log
         .entries()
         .into_iter()
-        .filter(|(_, _, via)| *via == Via::Pid)
+        .filter(|(_, _, via)| *via == Via::Identity)
         .collect();
     assert!(sent_by_pid.is_empty(), "nothing may be sent by pid: {sent_by_pid:?}");
 }

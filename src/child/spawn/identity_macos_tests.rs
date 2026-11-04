@@ -445,19 +445,27 @@ fn macos_sync_spawn_of_a_child_killed_before_its_report_says_it_died_before_exec
     );
 }
 
-/// The id the spawn adopts is the unique id of the live child, read from outside.
+/// The id the spawn adopts is the unique id of the live child: a kill passes the id check, and is
+/// sent. The blocker is released only after the kill, so a kill that sent nothing exits `0`.
 ///
-/// Mutant: the spawn adopts another process's id.
+/// Mutant: the spawn adopts another process's id, so the kill finds the pid taken and sends nothing.
 #[skuld::test]
 fn macos_sync_spawn_adopts_the_live_childs_own_unique_id() {
     let (mut cmd, writer) = sync_blocker();
     let child = cmd.spawn().expect("spawn");
-    let UniqRead::Found(info) = uniq_info(child.id().pid(), ReadPurpose::Kill) else {
-        panic!("the live child has a unique id")
-    };
-    assert_eq!(child.adopted_unique(), Some(info.unique_id));
+    let sent = crate::send_log::Capture::start();
+    child.kill().expect("kill");
+    assert_eq!(
+        sent.entries(),
+        [(
+            child.id().pid(),
+            crate::signal::Sig::Kill,
+            crate::send_log::Via::Identity
+        )]
+    );
+    drop(sent);
     drop(writer);
-    drop(child);
+    child.wait().expect("reap the killed child");
 }
 
 /// A spawn that fails before its hook reports (here the hook itself fails) keeps std's own error:

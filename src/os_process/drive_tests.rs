@@ -8,7 +8,7 @@ use crate::os_process::{Exit, OsProcess};
 use crate::wait::{block_probe, fault, test_clock};
 
 fn fake(exits: impl IntoIterator<Item = Answer>) -> FakeProcess {
-    FakeProcess::new(ProcessId::current(), exits)
+    FakeProcess::new(exits)
 }
 
 #[skuld::test]

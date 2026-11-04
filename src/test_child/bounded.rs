@@ -9,7 +9,8 @@ use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::child::shared::SharedChild;
+use crate::child::owned::OwnedChild;
+use crate::child::proc_handle::ProcHandle;
 use crate::identity::ProcessId;
 
 /// [`run_fixture_output`](super::run_fixture_output) from `program` (a modified copy of this
@@ -50,7 +51,11 @@ fn output_within(mut child: Child, bound: Duration) -> Result<Output, Output> {
     let id = ProcessId::of(child.id())
         .found()
         .expect("the live child has an identity");
-    let shared = Arc::new(SharedChild::adopt(child, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}")));
+    let pid = child.id();
+    let shared = Arc::new(ProcHandle::std(
+        OwnedChild::adopt(child, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}")),
+        pid,
+    ));
     let (tx, rx) = channel();
     let waiter = {
         let shared = Arc::clone(&shared);

@@ -328,3 +328,131 @@ fn two_threads_waiting_on_one_process_both_return_after_it_exits() {
     );
     child.wait().unwrap();
 }
+
+// MacChild =====
+
+/// A pid past registration at the reap kqueue's arming (`ESRCH`) is not a failure: the child has
+/// exited, `exited` says so, and the reap asks for a recheck while the zombie is not yet visible,
+/// then has the record.
+///
+/// Mutant: `ESRCH` at registration fails the adoption, or reads as a running child.
+#[skuld::test]
+fn esrch_at_registration_reads_as_exited_and_rechecks() {
+    use crate::os_process::child::{adopt_std, PeekOutcome, TryReapOutcome};
+    use crate::os_process::macos::kqueue::test_hooks::force_proc_registration_esrch_once;
+    use crate::wait::exit_only::seams::force_peek_once;
+
+    let mut cmd = crate::test_child::held_std_killable_blocker();
+    let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn the blocker");
+    drop(child.stdin.take());
+    let id = ProcessId::of(child.id()).found().expect("identity");
+    wait_until_zombie(id.pid());
+    let forced = force_proc_registration_esrch_once();
+    let os = adopt_std(child, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
+    drop(forced);
+    assert!(matches!(os.exited().unwrap(), Exit::Exited));
+    // The zombie is not yet visible to the look's peek.
+    let _running = force_peek_once(Ok(PeekOutcome::Running));
+    assert!(matches!(os.try_reap().unwrap(), TryReapOutcome::Recheck));
+    assert!(matches!(os.try_reap().unwrap(), TryReapOutcome::Reaped(_)));
+}
+
+const KQUEUE_MARKER: &str = "COSCA_TEST_MACCHILD_KQUEUE";
+
+/// A refused kqueue fails the adoption with the refusal, instead of an adopted child that can
+/// never be waited on. The descriptor table is full from the fixture's own lowered limit, so the
+/// adoption's `kqueue()` is refused; each case runs in a fresh re-exec, since the limit is
+/// process-wide.
+///
+/// Mutant: the adoption ignores a failed `kqueue()`.
+#[skuld::test]
+fn adoption_fails_when_a_kqueue_cannot_be_made() {
+    if !crate::test_child::is_marked_fixture_reexec(KQUEUE_MARKER) {
+        crate::test_child::run_fixture_case(
+            crate::test_child::fixture_path!(adoption_fails_when_a_kqueue_cannot_be_made),
+            KQUEUE_MARKER,
+            "COSCA_TEST_MACCHILD_KQUEUE_CASE",
+            "",
+        );
+        return;
+    }
+    use crate::os_process::child::adopt_std;
+
+    let mut cmd = crate::test_child::held_std_killable_blocker();
+    let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn the blocker");
+    let stdin = child.stdin.take().expect("piped stdin");
+    let id = ProcessId::of(child.id()).found().expect("identity");
+    // SAFETY: plain descriptor and resource-limit calls on this throwaway re-exec; the limit is
+    // lowered to the lowest free descriptor, so the next one is refused, and restored after.
+    let (saved, probe) = unsafe {
+        let probe = libc::dup(0);
+        assert!(probe > 0, "dup: {}", std::io::Error::last_os_error());
+        let mut saved = std::mem::zeroed::<libc::rlimit>();
+        assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut saved), 0);
+        let lowered = libc::rlimit {
+            rlim_cur: probe as libc::rlim_t,
+            rlim_max: saved.rlim_max,
+        };
+        assert_eq!(libc::close(probe), 0);
+        assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &lowered), 0);
+        (saved, probe)
+    };
+    let adopted = adopt_std(child, id);
+    // SAFETY: restores the limit saved above.
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &saved) }, 0);
+    let (error, mut child) = match adopted {
+        Ok(_) => panic!("adopted with the descriptor table full (limit {probe})"),
+        Err(refused) => refused,
+    };
+    let Error::Io(e) = &error else {
+        panic!("a refused kqueue is an io error: {error:?}")
+    };
+    assert_eq!(e.raw_os_error(), Some(libc::EMFILE), "{e:?}");
+    drop(stdin);
+    child.wait().expect("the child is handed back unreaped");
+}
+
+/// A reap of a running child waits on the reap kqueue, a descriptor of its own beside the exit
+/// kqueue a look hands out: the one is drained by the reap's holder, the other is never read.
+///
+/// Mutant: the reap waits on the exit kqueue, which its holder's drain would then empty for every
+/// other waiter.
+#[skuld::test]
+fn try_reap_of_a_running_child_waits_on_the_reap_kqueue() {
+    use std::os::fd::AsRawFd;
+
+    use crate::os_process::child::{adopted_blocker, TryReapOutcome};
+    use crate::os_process::WaitFor;
+    let (os, id, stdin) = adopted_blocker();
+    let Exit::Running(WaitFor::Readable(exit_fd)) = os.exited().unwrap() else {
+        panic!("a live child reads Running");
+    };
+    let TryReapOutcome::Running(WaitFor::Readable(reap_fd)) = os.try_reap().unwrap() else {
+        panic!("a running child is waited on its reap kqueue");
+    };
+    assert_ne!(reap_fd.as_raw_fd(), exit_fd.as_raw_fd());
+    drop(stdin);
+    assert!(exited_held(&*os, None).unwrap());
+    // `NOTE_EXIT` can come before XNU shows the zombie to `waitid`.
+    wait_until_zombie(id.pid());
+    assert!(matches!(
+        os.try_reap().unwrap(),
+        crate::os_process::child::TryReapOutcome::Reaped(_)
+    ));
+}
+
+/// A peek of an exited child sees its record and consumes nothing: the reap that follows has it.
+///
+/// Mutant: the peek is a consuming `waitid`.
+#[skuld::test]
+fn peek_of_an_exited_child_consumes_nothing() {
+    use crate::os_process::child::{adopted_blocker, PeekOutcome, TryReapOutcome};
+    let (os, id, stdin) = adopted_blocker();
+    drop(stdin);
+    assert!(exited_held(&*os, None).unwrap());
+    // `NOTE_EXIT` can come before XNU shows the zombie to `waitid`.
+    wait_until_zombie(id.pid());
+    assert!(matches!(os.peek().unwrap(), PeekOutcome::Exit(_)));
+    assert!(matches!(os.peek().unwrap(), PeekOutcome::Exit(_)));
+    assert!(matches!(os.try_reap().unwrap(), TryReapOutcome::Reaped(_)));
+}

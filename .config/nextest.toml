@@ -245,22 +245,22 @@ slow-timeout = { period = "10s", terminate-after = 3, grace-period = "1s" }
 # The macOS tracer tests re-exec a freshly signed copy of the test binary (up to ~2s on amd64).
 # This bound must outlast the fixture's watchdog (8s) and the driver's wait bound (12s), so that
 # their messages surface.
-filter = 'test(/^child::shared::shared_tests::tracer::macos::/)'
+filter = 'test(/^child::owned::owned_tests::tracer::macos::/)'
 slow-timeout = { period = "20s", terminate-after = 1, grace-period = "1s" }
 
 [[profile.default.overrides]]
 # A backstop, not a detector. Each `traced` tracer helper runs from its own freshly signed copy of the test
 # binary (seconds on macOS/amd64), and one test chains two of them.
-filter = 'test(/^child::shared::shared_tests::traced::/)'
+filter = 'test(/^child::owned::owned_tests::traced::/)'
 slow-timeout = { period = "30s", terminate-after = 1, grace-period = "1s" }
 
 [[profile.default.overrides]]
-# A backstop, not a detector: the `SharedChild` tests fail by assertion (see `assert_handed_off`),
+# A backstop, not a detector: the `OwnedChild` tests fail by assertion (see `assert_handed_off`),
 # not by timing out. This bound only stops a regression those checks did not anticipate, in a test
 # that `recv()`s or `join()`s on our own code, from stalling the job. The macOS wait's tests
 # (`wait::macos::await_reapable::await_reapable_tests`) block on a real kqueue in the same way. Under
 # `profile.default` so `profile.ci` and local runs inherit it.
-filter = 'test(/^child::shared::shared_tests::/) | test(/^wait::macos::await_reapable::await_reapable_tests/)'
+filter = 'test(/^child::owned::owned_tests::/) | test(/^wait::macos::await_reapable::await_reapable_tests/)'
 slow-timeout = { period = "10s", terminate-after = 1, grace-period = "1s" }
 
 [[profile.default.overrides]]

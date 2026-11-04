@@ -20,10 +20,10 @@ pub(crate) mod spawn;
 #[cfg(unix)]
 #[path = "child/drop_report.rs"]
 pub(crate) mod drop_report;
+#[path = "child/owned.rs"]
+pub(crate) mod owned;
 #[path = "child/proc_handle.rs"]
 pub(crate) mod proc_handle;
-#[path = "child/shared.rs"]
-pub(crate) mod shared;
 use proc_handle::ProcHandle;
 
 #[path = "child/lifecycle.rs"]
@@ -43,14 +43,6 @@ pub(crate) mod tree_call;
 pub(crate) use tree_call::PidfdShutdown;
 #[cfg(unix)]
 pub(crate) use tree_call::{Graceful, TreeCall};
-
-#[cfg(all(target_os = "macos", test))]
-impl Child {
-    /// The unique id the handle checks its by-pid actions against.
-    pub(crate) fn adopted_unique(&self) -> Option<u64> {
-        self.proc.adopted_unique()
-    }
-}
 
 #[cfg(test)]
 #[path = "child_tests.rs"]
@@ -321,11 +313,10 @@ impl Child {
     /// passes still leaves a window in which the signal lands on a pid launchd has since reused.
     ///
     /// A root the handle cannot vouch for (`Unknown`: a failed peek or an unreadable unique id) is
-    /// still killed through the handle on Linux: its pidfd names it whoever reaped it. macOS has
-    /// no such handle, so there this root, like any other, is signalled by pid after a check that
-    /// the pid still has the unique id read at spawn. If that id cannot be read again, nothing is
-    /// sent and `kill` returns the error. A reap by another reaper between that check and the send
-    /// is not seen, and the signal then goes to whatever process holds the number.
+    /// still killed through the handle on Linux: its pidfd names it whoever reaped it. On macOS
+    /// this root, like any other, is signalled through its audit token: the kernel refuses the
+    /// send if the pid now names another process. If the unique id read at spawn cannot be read
+    /// again, nothing is sent and `kill` returns the error.
     pub fn kill(&self) -> Result<(), Error> {
         #[cfg(unix)]
         {
@@ -693,7 +684,8 @@ impl Child {
             .root_checked(
                 || held.state(),
                 || {
-                    held.signal_sent(crate::signal::Sig::Kill)
+                    held.signal(crate::signal::Sig::Kill)
+                        .map_err(Error::into_io)
                         .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper()))
                 },
                 &group,
@@ -837,11 +829,7 @@ impl Child {
         #[cfg(unix)]
         if let Some(result) = self
             .tree_call(crate::containment::dispatch::TreeSignal::Term, "terminate_tree", None)
-            .root_checked(
-                || held.state(),
-                || held.signal_sent(crate::signal::Sig::Term).map_err(Error::Io),
-                &group,
-            )
+            .root_checked(|| held.state(), || held.signal(crate::signal::Sig::Term), &group)
         {
             return result;
         }

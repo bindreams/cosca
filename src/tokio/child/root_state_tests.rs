@@ -549,7 +549,7 @@ mod macos {
 
         assert_peeks_exhausted();
 
-        assert_eq!(sends.entries(), vec![(pid, Sig::Kill, Via::Pid)]);
+        assert_eq!(sends.entries(), vec![(pid, Sig::Kill, Via::Identity)]);
     }
 
     fn session_blocker() -> (crate::tokio::Child, std::io::PipeWriter) {
