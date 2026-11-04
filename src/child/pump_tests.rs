@@ -43,6 +43,34 @@ fn each_stream_is_read_while_the_other_is_idle() {
     }
 }
 
+/// A child that closes its stdin ends the input but not the output: everything it goes on to
+/// print is still collected, though input was left unwritten.
+///
+/// Mutant: a broken pipe on stdin ends the draining of stdout and stderr (the child then hangs
+/// on a full pipe, or the output is cut short).
+#[skuld::test]
+fn a_child_that_closes_stdin_is_still_drained() {
+    let mut child = sh("exec 0<&-; head -c 1000000 /dev/zero");
+    let input = vec![b'x'; 1 << 20];
+    let out = child.communicate(Some(&input)).expect("communicate");
+    assert!(out.status.success());
+    assert_eq!(out.stdout.len(), 1_000_000);
+    assert!(out.stderr.is_empty());
+}
+
+/// A stream that reaches EOF early does not end the others: a child that closes stdout and keeps
+/// writing stderr has all of it collected.
+///
+/// Mutant: the first EOF ends the loop, so the rest of stderr is lost.
+#[skuld::test]
+fn a_stream_at_eof_does_not_end_the_others() {
+    let mut child = sh("exec 1>&-; head -c 1000000 /dev/zero >&2");
+    let out = child.communicate(None).expect("communicate");
+    assert!(out.status.success());
+    assert!(out.stdout.is_empty());
+    assert_eq!(out.stderr.len(), 1_000_000);
+}
+
 /// With a piped stdin and no input, the child sees EOF at once.
 ///
 /// Mutant: the stdin pipe is held open until the child exits.
