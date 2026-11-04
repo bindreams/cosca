@@ -215,8 +215,59 @@ impl Reap {
 }
 
 impl Reap {
-    /// Arms what makes the root read as this reap, until the guard drops. On macOS every look at the
-    /// root answers the same, so a graceful shutdown's sweep reads what its signal read.
+    /// What makes the sync `child`'s own handle fail to vouch for the root in this reap, if anything
+    /// does: Linux, one failed peek; macOS, every look at the root answers the same, so a graceful
+    /// shutdown's sweep reads what its signal read, and so does its wait.
+    fn script(self, child: &mut crate::Child) -> Option<crate::os_process::fake::FakeProcess> {
+        #[cfg(target_os = "linux")]
+        if self == Reap::Unanswered {
+            return Some(
+                child
+                    .proc
+                    .script_over(|f| f.peeks([Err(std::io::Error::other("forced peek failure"))])),
+            );
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use crate::os_process::child::{Foreign, PeekOutcome};
+            use crate::os_process::fake::ReapAnswer;
+            match self {
+                Reap::Unanswered => {
+                    return Some(child.proc.script_over(|f| {
+                        f.peeks_always(|| Err(std::io::Error::other("forced peek failure")))
+                            .reaps_always(ReapAnswer::Err(std::io::ErrorKind::Other))
+                    }));
+                }
+                Reap::Unpinned => {
+                    return Some(child.proc.script_over(|f| {
+                        f.peeks_always(|| Ok(PeekOutcome::Foreign(Foreign::Orphaned)))
+                            .reaps_always(ReapAnswer::Foreign(Foreign::Orphaned))
+                    }));
+                }
+                _ => {}
+            }
+        }
+        let _ = child;
+        None
+    }
+
+    /// Checks that [`script`](Self::script)'s answers were used: on Linux the failed peek was the one
+    /// look at the root the entry point took, and on macOS some look took the repeated answer.
+    fn assert_script_used(self, script: Option<&crate::os_process::fake::FakeProcess>) {
+        #[cfg(target_os = "linux")]
+        if let Some(fake) = script {
+            fake.assert_peeks_exhausted();
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(fake) = script {
+            assert!(fake.repeats() > 0, "{self:?}: no look took the repeated answer");
+        }
+        let _ = (self, script);
+    }
+
+    /// Arms what makes the root read as this reap, until the guard drops. The tokio cell's looks are
+    /// forced through the `exit_only` hook, which the async child still answers by.
+    #[cfg(feature = "tokio")]
     fn force(self, id: ProcessId) -> Option<Box<dyn std::any::Any>> {
         #[cfg(target_os = "linux")]
         if self == Reap::Unanswered {
@@ -241,11 +292,17 @@ impl Reap {
                 _ => {}
             }
         }
+        self.force_reads(id)
+    }
+
+    /// Arms what makes the root's number read as this reap, until the guard drops.
+    fn force_reads(self, id: ProcessId) -> Option<Box<dyn std::any::Any>> {
         self.read(id)
             .map(|read| Box::new(crate::child::fault::force_root_reads(read)) as Box<dyn std::any::Any>)
     }
 
     /// Checks that the failed peek was the one look at the root the entry point took (Linux).
+    #[cfg(feature = "tokio")]
     fn assert_forced_used(self) {
         #[cfg(target_os = "linux")]
         if self == Reap::Unanswered {
@@ -606,7 +663,8 @@ fn run_sync(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
             }
         }
     }
-    let mut forced = reap.force(child.id());
+    let scripted = reap.script(&mut child);
+    let mut forced = reap.force_reads(child.id());
 
     let _released = release_when_the_drain_blocks(mechanism, &stdin);
     #[cfg(target_os = "linux")]
@@ -619,17 +677,24 @@ fn run_sync(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
         Op::GracefulShutdown => child.graceful_shutdown_tree(Duration::ZERO).map(drop),
         Op::Drop => {
             drop(child);
-            return finish_teardown(reap, forced, recorders, root, cat, stdin, stderr);
+            return finish_teardown(reap, scripted, forced, recorders, root, cat, stdin, stderr);
         }
         Op::FinishElevated => {
             _ = crate::child::spawn::finish_elevated(child, failed_write());
-            return finish_teardown(reap, forced, recorders, root, cat, stdin, stderr);
+            return finish_teardown(reap, scripted, forced, recorders, root, cat, stdin, stderr);
         }
     };
-    reap.assert_forced_used();
+    reap.assert_script_used(scripted.as_ref());
     let mut sent = recorders.sent(root, cat);
     if reap.lift_before_cleanup() {
         drop(forced.take());
+        if let Some(fake) = &scripted {
+            // The root's kill and reap below are the real ones.
+            let lifted = fake.clone().peeks([]).reaps([]);
+            #[cfg(target_os = "macos")]
+            let lifted = lifted.no_repeats();
+            drop(lifted);
+        }
     }
 
     // The tree is gone before the drop, which runs under the recorders: it sends no killpg.
@@ -681,8 +746,10 @@ fn release_when_the_drain_blocks<T>(_: Mechanism, _: &std::rc::Rc<std::cell::Cel
 /// What a sync teardown sent, then the end of what it left: closing stdin ends a root it left
 /// alone and a `cat` it did not kill. A root left unreaped stays a zombie until the test process
 /// ends, as nothing may reap it by its number.
+#[allow(clippy::too_many_arguments, reason = "one cell's state, passed through")]
 fn finish_teardown(
     reap: Reap,
+    scripted: Option<crate::os_process::fake::FakeProcess>,
     forced: Option<Box<dyn std::any::Any>>,
     recorders: Recorders,
     root: u32,
@@ -691,7 +758,7 @@ fn finish_teardown(
     mut stderr: std::io::PipeReader,
 ) -> Sent {
     use std::io::Read as _;
-    reap.assert_forced_used();
+    reap.assert_script_used(scripted.as_ref());
     let mut sent = recorders.sent(root, cat);
     drop(forced);
     drop(stdin.take());

@@ -98,7 +98,6 @@ fn kill_tree_after_own_wait_whose_pid_reads_unknown_sends_no_killpg() {
 fn kill_tree_of_a_root_its_handle_cannot_read_kills_it_through_its_pidfd_alone() {
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     use crate::test_child::reaped_elsewhere::session_cat;
-    use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peek_once};
     use std::os::unix::process::ExitStatusExt as _;
     crate::log_capture::install();
     let recorder = record_kill_group();
@@ -108,12 +107,13 @@ fn kill_tree_of_a_root_its_handle_cannot_read_kills_it_through_its_pidfd_alone()
 
     let mark = crate::log_capture::mark();
     let sends = crate::send_log::Capture::start();
-    let forced = force_peek_once(Err(std::io::Error::other("forced peek failure")));
+    let fake = child
+        .proc
+        .script_over(|f| f.peeks([Err(std::io::Error::other("forced peek failure"))]));
     let err = child
         .kill_tree()
         .expect_err("a group whose root nothing can answer for is not assessable");
-    assert_peeks_exhausted();
-    drop(forced);
+    fake.assert_peeks_exhausted();
 
     assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
     assert_eq!(
@@ -144,7 +144,6 @@ fn kill_tree_of_a_root_its_handle_cannot_read_kills_it_through_its_pidfd_alone()
 fn terminate_tree_of_a_root_its_handle_cannot_read_terms_it_through_its_pidfd_alone() {
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     use crate::test_child::reaped_elsewhere::{session_cat, ROOT_TERMED_BY_PIDFD};
-    use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peek_once};
     use std::os::unix::process::ExitStatusExt as _;
     crate::log_capture::install();
     let termed = record_term_group();
@@ -154,12 +153,13 @@ fn terminate_tree_of_a_root_its_handle_cannot_read_terms_it_through_its_pidfd_al
 
     let mark = crate::log_capture::mark();
     let sends = crate::send_log::Capture::start();
-    let forced = force_peek_once(Err(std::io::Error::other("forced peek failure")));
+    let fake = child
+        .proc
+        .script_over(|f| f.peeks([Err(std::io::Error::other("forced peek failure"))]));
     let err = child
         .terminate_tree()
         .expect_err("a group whose root nothing can answer for is not assessable");
-    assert_peeks_exhausted();
-    drop(forced);
+    fake.assert_peeks_exhausted();
 
     assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
     assert_eq!(
@@ -192,7 +192,6 @@ fn graceful_shutdown_tree_of_a_root_its_handle_cannot_read_escalates_through_its
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     use crate::signal::Sig::{Kill, Term};
     use crate::test_child::reaped_elsewhere::{term_ignoring_session_cat, ROOT_TERMED_BY_PIDFD};
-    use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peek_once};
     use std::os::unix::process::ExitStatusExt as _;
     crate::log_capture::install();
     let killed = record_kill_group();
@@ -209,13 +208,14 @@ fn graceful_shutdown_tree_of_a_root_its_handle_cannot_read_escalates_through_its
 
     let mark = crate::log_capture::mark();
     let sends = crate::send_log::Capture::start();
-    let forced = force_peek_once(Err(std::io::Error::other("forced peek failure")));
+    let fake = child
+        .proc
+        .script_over(|f| f.peeks([Err(std::io::Error::other("forced peek failure"))]));
     // A root that ignores the SIGTERM is alive after any grace, so the kill follows.
     let err = child
         .graceful_shutdown_tree(std::time::Duration::ZERO)
         .expect_err("a group whose root nothing can answer for is not assessable");
-    assert_peeks_exhausted();
-    drop(forced);
+    fake.assert_peeks_exhausted();
 
     assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
     assert_eq!(killed.killed(), Vec::<i32>::new(), "no killpg by the root's number");
@@ -250,7 +250,6 @@ fn graceful_shutdown_tree_of_a_root_its_handle_cannot_read_sends_no_kill_to_one_
     use crate::graceful_hooks::{at, HookPoint};
     use crate::signal::Sig::Term;
     use crate::test_child::reaped_elsewhere::{session_cat, ROOT_TERMED_BY_PIDFD};
-    use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peek_once};
     use std::os::unix::process::ExitStatusExt as _;
     crate::log_capture::install();
     let mut child = session_cat().spawn().expect("spawn");
@@ -259,7 +258,9 @@ fn graceful_shutdown_tree_of_a_root_its_handle_cannot_read_sends_no_kill_to_one_
 
     let mark = crate::log_capture::mark();
     let sends = std::rc::Rc::new(crate::send_log::Capture::start());
-    let forced = force_peek_once(Err(std::io::Error::other("forced peek failure")));
+    let fake = child
+        .proc
+        .script_over(|f| f.peeks([Err(std::io::Error::other("forced peek failure"))]));
     let exited_first = at(HookPoint::AfterTerminate, {
         let sends = std::rc::Rc::clone(&sends);
         move || {
@@ -276,8 +277,7 @@ fn graceful_shutdown_tree_of_a_root_its_handle_cannot_read_sends_no_kill_to_one_
         .graceful_shutdown_tree(std::time::Duration::ZERO)
         .expect_err("a group whose root nothing can answer for is not assessable");
     drop(exited_first);
-    assert_peeks_exhausted();
-    drop(forced);
+    fake.assert_peeks_exhausted();
 
     assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
     assert_eq!(
