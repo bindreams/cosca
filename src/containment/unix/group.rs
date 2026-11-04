@@ -141,7 +141,7 @@ pub(crate) fn members(pgid: i32) -> std::io::Result<Vec<Member>> {
     }
 }
 
-/// Linux: scan the checked `/proc` (`identity::linux::proc_view`) and keep the entries whose
+/// Linux: scan the checked `/proc` (`identity::linux::proc_view_with`) and keep the entries whose
 /// `stat` field 5 is `pgid`, carrying field 22 (`starttime`) as the token. There is no narrower
 /// kernel interface for process-group membership.
 ///

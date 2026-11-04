@@ -231,7 +231,7 @@ fn pidfd_open_checked(raw: Pid) -> Result<rustix::fd::OwnedFd, rustix::io::Errno
     pidfd_open(raw, PidfdFlags::empty())
 }
 
-/// `id.exists_in(proc_dir)`, with a test seam: a forced [`Existence`] (see
+/// `id.exists_in(&HostKernel, proc_dir)`, with a test seam: a forced [`Existence`] (see
 /// [`fault::force_exists_once`]) replaces the `/proc` read once, to drive the `Unknown` arms; runs
 /// [`fault::between_check_and_read`]'s hook first.
 #[cfg(test)]
@@ -247,7 +247,7 @@ fn exists_checked(id: ProcessId, proc_dir: &ProcDir) -> Existence {
     id.exists_in(&crate::identity::HostKernel, proc_dir)
 }
 
-/// `id.is_alive_in(proc_dir)`, with a test seam: a forced [`Liveness`] (see
+/// `id.is_alive_in(&HostKernel, proc_dir)`, with a test seam: a forced [`Liveness`] (see
 /// [`fault::force_alive_once`]) replaces the `/proc` read once.
 #[cfg(test)]
 fn alive_checked(id: ProcessId, proc_dir: &ProcDir) -> Liveness {

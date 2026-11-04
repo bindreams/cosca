@@ -36,6 +36,10 @@ A question about a _pid_ and a question about a _process you hold_ go to differe
 | `OwnedChild`                  | the parent's policy, written once                                                                                                   | reap once, "already reaped is gone", whether the root is still ours, holding off reaps across a check-then-send |
 | drivers                       | sync and async                                                                                                                      | the one wait loop: look, else wait on what the look returned                                                    |
 
+On Linux the identity module asks the kernel through one interface, `Kernel` (`HostKernel` makes the
+calls; tests pass a `FakeKernel` of stated answers). A read that a test answers takes `&dyn Kernel`;
+code that runs between fork and exec never does, and stays raw.
+
 The public types follow the same line:
 
 - `ProcessId` is an identity;

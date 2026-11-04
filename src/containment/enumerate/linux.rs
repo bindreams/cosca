@@ -1,5 +1,5 @@
 //! Linux `(pid, ppid)` snapshot: list the numeric entries of the checked `/proc`
-//! (`identity::linux::proc_view`) and read field 4 of each `stat` via the comm-safe `parse_ppid`.
+//! (`identity::linux::proc_view_with`) and read field 4 of each `stat` via the comm-safe `parse_ppid`.
 
 use crate::error::Error;
 use crate::identity::pid_stat::{self, PidStat};

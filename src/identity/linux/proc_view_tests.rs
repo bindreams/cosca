@@ -286,17 +286,9 @@ fn pidfd_pid_in_reads_thread_self_fdinfo_and_names_a_missing_pid_line() {
     let (mut child, pidfd) = spawn_exited_child_with_pidfd();
     let dir = ProcDir::open().expect("/proc opens");
     let path = format!("thread-self/fdinfo/{}", pidfd.as_raw_fd());
-    let stated = FakeKernel::over(&HostKernel).on_read(
-        &path,
-        Ok(b"Pid:	4321
-"),
-    );
+    let stated = FakeKernel::over(&HostKernel).on_read(&path, Ok(b"Pid:\t4321\n"));
     let got = pidfd_pid_in(&stated, &dir, pidfd.as_fd());
-    let no_pid = FakeKernel::over(&HostKernel).on_read(
-        &path,
-        Ok(b"pos:	0
-"),
-    );
+    let no_pid = FakeKernel::over(&HostKernel).on_read(&path, Ok(b"pos:\t0\n"));
     let err = pidfd_pid_in(&no_pid, &dir, pidfd.as_fd()).expect_err("no Pid line");
     child.wait().expect("reap the child");
     assert!(matches!(got, Ok(PidfdTarget::Pid(4321))), "got {got:?}");
