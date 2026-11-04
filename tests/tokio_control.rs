@@ -360,7 +360,7 @@ async fn async_graceful_tree_unsupported_when_uncontained() {
 /// Async twin of `child_terminate_reports_ok_for_an_already_exited_child`.
 ///
 /// Unix-only, unlike its sync counterpart. The sync `Child` pins its pid for its whole life
-/// through `SharedChild`, which is what makes the already-exited answer `Ok`. The async `Child`
+/// through `OwnedChild`, which is what makes the already-exited answer `Ok`. The async `Child`
 /// does not: `wait()` drops the guard holding the Windows process handle, so there the same call
 /// is refused rather than answered `Ok` — a pid this handle no longer pins is not one a console
 /// control event may be addressed to.

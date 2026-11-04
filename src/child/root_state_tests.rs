@@ -15,7 +15,7 @@ fn warns_since(mark: usize) -> Vec<String> {
 
 /// This handle's own reap is `Reaped`, and nothing around it warns.
 ///
-/// Mutants: `SharedChild::state` reads its own recorded reap as `Unreaped`; it has no check of the
+/// Mutants: `ReapHold::state` reads its own recorded reap as `Unreaped`; it has no check of the
 /// recorded reap (the peek decides).
 #[skuld::test]
 fn state_after_own_wait_is_reaped_without_a_warn() {

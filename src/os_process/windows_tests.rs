@@ -285,3 +285,44 @@ fn denied_open_source(
     };
     source.expect("the OS error is preserved")
 }
+
+// OsChild =====
+
+/// A running child has no exit record: a peek says so, and consumes nothing.
+#[skuld::test]
+fn peek_of_a_running_child_is_running() {
+    use crate::os_process::child::{adopted_blocker, PeekOutcome};
+    let (os, _id, _stdin) = adopted_blocker();
+    assert_eq!(os.peek().unwrap(), PeekOutcome::Running);
+    os.signal(Sig::Kill).unwrap();
+    assert!(exited_held(&*os, None).unwrap());
+}
+
+/// A reap of a running child hands out the process handle to wait on.
+#[skuld::test]
+fn try_reap_of_a_running_child_waits_on_the_handle() {
+    use crate::os_process::child::{adopted_blocker, TryReapOutcome};
+    let (os, _id, _stdin) = adopted_blocker();
+    assert!(matches!(
+        os.try_reap().unwrap(),
+        TryReapOutcome::Running(WaitFor::Signalled(_))
+    ));
+    os.signal(Sig::Kill).unwrap();
+    assert!(exited_held(&*os, None).unwrap());
+}
+
+/// A reap of an exited child reads its exit code.
+///
+/// Mutant: the reap answers `Running` for a signalled handle, or reads the code of another process.
+#[skuld::test]
+fn try_reap_of_an_exited_child_reads_the_exit_code() {
+    use crate::os_process::child::{adopted_blocker, ExitRecord, TryReapOutcome};
+    let (os, _id, _stdin) = adopted_blocker();
+    os.signal(Sig::Kill).unwrap();
+    assert!(exited_held(&*os, None).unwrap());
+    let TryReapOutcome::Reaped(ExitRecord::Status(status)) = os.try_reap().unwrap() else {
+        panic!("an exited child is reaped");
+    };
+    // `TerminateProcess` exits with the code the blocker's kill passes.
+    assert_eq!(status.code(), Some(1));
+}

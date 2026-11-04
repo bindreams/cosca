@@ -1,5 +1,3 @@
-#[cfg(unix)]
-use super::ProcHandle;
 use super::{std_teardown_action, StdTeardown};
 
 // The a36b0244 fix: the `Std` teardown arm must key on the OBSERVED kill result, NOT on any
@@ -26,263 +24,30 @@ fn any_other_kill_error_also_never_blocks() {
     assert_eq!(std_teardown_action(&Err(other)), StdTeardown::ReapNonBlocking);
 }
 
-/// Whether the handle's own answer is `Reaped`, with its peek forced to `Running`: only the reap
-/// the handle recorded can say `Reaped`.
-#[cfg(unix)]
-fn reaped(h: &ProcHandle) -> bool {
-    let _running = crate::wait::exit_only::seams::force_peek_once(Ok(crate::os_process::child::PeekOutcome::Running));
-    matches!(h.state(), crate::signal::RootState::Reaped { .. })
-}
-
-// A kill alone is not a reap: a zombie still pins its number.
-#[cfg(unix)]
-mod own_reap {
-    use std::time::{Duration, Instant};
-
-    use super::super::ProcHandle;
-    use super::reaped;
-
-    fn adopt_child(child: std::process::Child) -> crate::child::shared::SharedChild {
-        let id = crate::identity::ProcessId::of(child.id()).found().expect("identity");
-        crate::child::shared::SharedChild::adopt(child, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"))
-    }
-
-    /// A live child only a kill ends (it exits `0` once the returned stdin writer is dropped), with
-    /// its pid. The test drops the writer after the kill: a `kill` that sent nothing exits `0`.
-    fn adopt() -> (ProcHandle, u32, std::process::ChildStdin) {
-        let mut child = crate::test_spawn::spawn(&mut crate::test_child::held_std_blocker(std::process::Stdio::null()))
-            .expect("spawn the blocker");
-        let stdin = child.stdin.take().expect("piped stdin");
-        let pid = child.id();
-        (ProcHandle::std(adopt_child(child)), pid, stdin)
-    }
-
-    /// Kill `h`, release its stdin, and wait for the zombie, asserting the kill ended it.
-    fn kill_release_zombie(h: &ProcHandle, pid: u32, stdin: std::process::ChildStdin) {
-        h.kill().expect("kill");
-        drop(stdin);
-        crate::test_child::assert_zombie_sigkilled("the child", pid);
-    }
-
-    /// A running child, killed but not yet reaped.
-    fn killed_zombie() -> ProcHandle {
-        let (h, pid, stdin) = adopt();
-        assert!(!reaped(&h));
-        assert!(!h.is_reaped(), "is_reaped disagrees with the state");
-        kill_release_zombie(&h, pid, stdin);
-        assert!(!reaped(&h), "a kill does not reap");
-        assert!(!h.is_reaped(), "is_reaped disagrees with the state");
-        h
-    }
-
-    /// Adoption never reaps, so an already-exited child is still a zombie afterwards, and the
-    /// handle's own `wait` is the reap.
-    #[skuld::test]
-    fn adopting_an_already_exited_child_is_not_a_reap() {
-        let mut cmd = std::process::Command::new("true");
-        let child = crate::test_spawn::spawn(&mut cmd).expect("spawn");
-        crate::test_child::wait_until_zombie(child.id());
-        let h = ProcHandle::std(adopt_child(child));
-        assert!(!reaped(&h));
-        assert!(!h.is_reaped(), "is_reaped disagrees with the state");
-        h.wait().expect("wait");
-        assert!(reaped(&h));
-        assert!(h.is_reaped(), "is_reaped disagrees with the state");
-    }
-
-    /// The state is `Reaped` once the reap is recorded, before `try_wait` returns.
-    ///
-    /// Mutant: `state` answers `Unreaped` once the reap is recorded.
-    #[skuld::test]
-    fn the_state_is_reaped_as_soon_as_try_wait_records_the_reap() {
-        use crate::child::shared::seams;
-        let h = killed_zombie();
-        let (gate, reached, release) = seams::park_gate();
-        std::thread::scope(|scope| {
-            let a = scope.spawn(|| {
-                let _armed = seams::park_after_reap_recorded_on(gate);
-                h.try_wait().expect("try_wait")
-            });
-            reached.recv().expect("the reap was recorded");
-            let seen = reaped(&h);
-            let seen_own = h.is_reaped();
-            release.send(()).expect("release");
-            assert!(a.join().expect("join").is_some());
-            assert!(seen, "the reap was recorded, but the state was not Reaped");
-            assert!(seen_own, "the reap was recorded, but is_reaped answered false");
-        });
-    }
-
-    #[skuld::test]
-    fn wait_is_an_own_reap() {
-        let h = killed_zombie();
-        h.wait().expect("wait");
-        assert!(reaped(&h));
-        assert!(h.is_reaped(), "is_reaped disagrees with the state");
-    }
-
-    #[skuld::test]
-    fn try_wait_is_an_own_reap_only_once_it_returns_a_status() {
-        let (h, pid, stdin) = adopt();
-        assert_eq!(h.try_wait().expect("try_wait"), None);
-        assert!(!reaped(&h));
-        assert!(!h.is_reaped(), "is_reaped disagrees with the state");
-        kill_release_zombie(&h, pid, stdin);
-        assert!(h.try_wait().expect("try_wait").is_some());
-        assert!(reaped(&h));
-        assert!(h.is_reaped(), "is_reaped disagrees with the state");
-    }
-
-    #[skuld::test]
-    fn wait_deadline_is_an_own_reap_only_once_it_returns_a_status() {
-        let (h, pid, stdin) = adopt();
-        assert_eq!(h.wait_deadline(Instant::now()).expect("expired"), None);
-        assert!(!reaped(&h));
-        assert!(!h.is_reaped(), "is_reaped disagrees with the state");
-        kill_release_zombie(&h, pid, stdin);
-        // The child has exited, so this returns at once; the far deadline is only a failure bound.
-        assert!(h
-            .wait_deadline(Instant::now() + Duration::from_secs(600))
-            .expect("wait_deadline")
-            .is_some());
-        assert!(reaped(&h));
-        assert!(h.is_reaped(), "is_reaped disagrees with the state");
-    }
-}
-
-// The reap is visible before the waiter returns =====
-
-/// The state is `Reaped` once the reap is recorded, before `wait` returns.
-///
-/// Mutant: `state` answers `Unreaped` once the reap is recorded.
-#[cfg(unix)]
-#[skuld::test]
-fn the_state_is_reaped_as_soon_as_the_reap_is_recorded() {
-    use crate::child::shared::seams;
-    let mut child = crate::test_spawn::spawn(&mut crate::test_child::held_std_blocker(std::process::Stdio::null()))
-        .expect("spawn the blocker");
-    let stdin = child.stdin.take().expect("piped stdin");
-    let id = crate::identity::ProcessId::of(child.id()).found().expect("identity");
-    let shared = crate::child::shared::SharedChild::adopt(child, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
-    let h = ProcHandle::std(shared);
-    assert!(!reaped(&h));
-    assert!(!h.is_reaped(), "is_reaped disagrees with the state");
-    let (gate, reached, release) = seams::park_gate();
-    std::thread::scope(|scope| {
-        let a = scope.spawn(|| {
-            let _armed = seams::park_after_reap_recorded_on(gate);
-            h.wait().expect("wait")
-        });
-        // The blocker exits cleanly once its stdin closes; `wait` is blocked on that real exit.
-        drop(stdin);
-        reached.recv().expect("the reap was recorded");
-        let seen = reaped(&h);
-        let seen_own = h.is_reaped();
-        release.send(()).expect("release");
-        a.join().expect("join");
-        assert!(seen, "the reap was recorded, but the state was not Reaped");
-        assert!(seen_own, "the reap was recorded, but is_reaped answered false");
-    });
-}
-
-/// The state is `Reaped` once the reap is recorded, before `wait_deadline` returns. The far deadline
-/// is only a failure bound; the wait ends on the child's real exit.
-///
-/// Mutant: `state` answers `Unreaped` once the reap is recorded.
-#[cfg(unix)]
-#[skuld::test]
-fn the_state_is_reaped_as_soon_as_wait_deadline_records_the_reap() {
-    use crate::child::shared::seams;
-    let mut child = crate::test_spawn::spawn(&mut crate::test_child::held_std_blocker(std::process::Stdio::null()))
-        .expect("spawn the blocker");
-    let stdin = child.stdin.take().expect("piped stdin");
-    let id = crate::identity::ProcessId::of(child.id()).found().expect("identity");
-    let shared = crate::child::shared::SharedChild::adopt(child, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
-    let h = ProcHandle::std(shared);
-    assert!(!reaped(&h));
-    assert!(!h.is_reaped(), "is_reaped disagrees with the state");
-    let (gate, reached, release) = seams::park_gate();
-    std::thread::scope(|scope| {
-        let a = scope.spawn(|| {
-            let _armed = seams::park_after_reap_recorded_on(gate);
-            h.wait_deadline(std::time::Instant::now() + std::time::Duration::from_secs(600))
-                .expect("wait_deadline")
-        });
-        // The blocker exits cleanly once its stdin closes; `wait` is blocked on that real exit.
-        drop(stdin);
-        reached.recv().expect("the reap was recorded");
-        let seen = reaped(&h);
-        let seen_own = h.is_reaped();
-        release.send(()).expect("release");
-        a.join().expect("join");
-        assert!(seen, "the reap was recorded, but the state was not Reaped");
-        assert!(seen_own, "the reap was recorded, but is_reaped answered false");
-    });
-}
-
-/// A waiter parked in the unlocked wait is a holder (`W`), not a reap.
-///
-/// Mutant: `state` answers `Reaped` for a state that is not `E`.
-#[cfg(unix)]
-#[skuld::test]
-fn the_state_is_unreaped_while_a_holder_waits() {
-    use crate::child::shared::seams;
-    let mut child = crate::test_spawn::spawn(&mut crate::test_child::held_std_blocker(std::process::Stdio::null()))
-        .expect("spawn the blocker");
-    let stdin = child.stdin.take().expect("piped stdin");
-    let id = crate::identity::ProcessId::of(child.id()).found().expect("identity");
-    let shared = crate::child::shared::SharedChild::adopt(child, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
-    let h = ProcHandle::std(shared);
-    let (gate, reached, release) = seams::park_gate();
-    std::thread::scope(|scope| {
-        let a = scope.spawn(|| {
-            let _armed = seams::park_in_unlocked_wait(gate);
-            h.wait().expect("wait")
-        });
-        reached.recv().expect("the holder reached its unlocked wait");
-        let seen = reaped(&h);
-        let seen_own = h.is_reaped();
-        // The blocker exits cleanly once its stdin closes; the holder's wait ends on that exit.
-        drop(stdin);
-        release.send(()).expect("release");
-        a.join().expect("join");
-        assert!(!seen, "a holder is waiting, but the state read Reaped");
-        assert!(!seen_own, "a holder is waiting, but is_reaped answered true");
-        assert!(reaped(&h));
-        assert!(h.is_reaped(), "is_reaped disagrees with the state");
-    });
-}
-
 // The reap after a successful kill =====
 
-/// A live blocker adopted as a `Std` handle. The child is ended by the teardown under test.
+/// A `Std` handle over a `FakeProcess` that answers a delivered kill and then `reaps`, with a
+/// pid no process need have.
 #[cfg(unix)]
-fn std_handle() -> (ProcHandle, std::process::ChildStdin) {
-    let mut child = crate::test_spawn::spawn(&mut crate::test_child::held_std_blocker(std::process::Stdio::null()))
-        .expect("spawn the blocker");
-    let stdin = child.stdin.take().expect("piped stdin");
-    let id = crate::identity::ProcessId::of(child.id()).found().expect("identity");
-    let shared = crate::child::shared::SharedChild::adopt(child, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
-    (ProcHandle::std(shared), stdin)
+fn std_handle(
+    reaps: impl IntoIterator<Item = crate::os_process::fake::ReapAnswer>,
+) -> (super::ProcHandle, crate::os_process::fake::FakeProcess) {
+    let fake = crate::os_process::fake::FakeProcess::new([])
+        .reaps(reaps)
+        .signals([Ok(crate::signal::Sent::Delivered)]);
+    let owned = crate::child::owned::OwnedChild::new(Box::new(fake.clone()));
+    (super::ProcHandle::std(owned, 4242), fake)
 }
 
 /// What the teardown returned and the levels it logged for its child, with the reap after the kill
-/// failing with `errno`.
+/// answering `reap`.
 #[cfg(unix)]
-fn teardown_when_the_reap_fails(errno: i32) -> (Option<String>, Vec<log::Level>) {
-    use crate::child::shared::seams::{self, ForcedWait};
+fn teardown_when_the_reap_answers(reap: crate::os_process::fake::ReapAnswer) -> (Option<String>, Vec<log::Level>) {
     crate::log_capture::install();
-    let (handle, stdin) = std_handle();
-    let id = crate::identity::ProcessId::of(handle.id()).found().expect("identity");
+    let (handle, _fake) = std_handle([reap]);
     let marker = format!("teardown of child {}", handle.id());
     let mark = crate::log_capture::mark();
-    let forced = seams::force_unlocked_wait(ForcedWait::Errno(errno));
-    // Released once the teardown's kill returned, so a kill that sent nothing ends the child with 0.
-    let _release = crate::graceful_hooks::release_at(crate::graceful_hooks::HookPoint::AfterDropKill, stdin);
-    let left = handle.teardown_on_drop(id).left;
-    drop(forced);
-    // The forced failure left the killed child unreaped: reap it for real.
-    crate::test_child::assert_killed("the child", handle.wait().expect("reap the killed child"));
+    let left = handle.teardown_on_drop(crate::identity::ProcessId::current()).left;
     let levels = crate::log_capture::records_since_on_current_thread(mark, &marker)
         .into_iter()
         .map(|(level, _)| level)
@@ -297,7 +62,8 @@ fn teardown_when_the_reap_fails(errno: i32) -> (Option<String>, Vec<log::Level>)
 #[cfg(unix)]
 #[skuld::test]
 fn a_failed_teardown_reap_is_returned_and_not_logged() {
-    let (left, levels) = teardown_when_the_reap_fails(libc::EIO);
+    let (left, levels) =
+        teardown_when_the_reap_answers(crate::os_process::fake::ReapAnswer::Err(std::io::ErrorKind::Other));
     assert!(
         left.as_deref()
             .is_some_and(|text| text.contains("the reap after the kill failed")),
@@ -313,7 +79,9 @@ fn a_failed_teardown_reap_is_returned_and_not_logged() {
 #[skuld::test]
 fn a_teardown_reap_that_meets_echild_is_debug() {
     assert_eq!(
-        teardown_when_the_reap_fails(libc::ECHILD),
+        teardown_when_the_reap_answers(crate::os_process::fake::ReapAnswer::Foreign(
+            crate::os_process::child::Foreign::Gone
+        )),
         (None, vec![log::Level::Debug])
     );
 }
@@ -325,17 +93,10 @@ fn a_teardown_reap_that_meets_echild_is_debug() {
 #[cfg(unix)]
 #[skuld::test]
 fn a_reap_after_a_delivered_tree_kill_that_meets_echild_is_killed() {
-    use crate::child::shared::seams::{self, ForcedWait};
-    let (handle, stdin) = std_handle();
-    handle.kill().expect("the stand-in for the tree kill");
-    // Released between the tree kill and the reap, after the kill: a kill that sent nothing ends
-    // the child with 0.
-    let release = crate::child::spawn::fault::release_between_kill_and_wait(stdin);
-    let forced = seams::force_unlocked_wait(ForcedWait::Errno(libc::ECHILD));
+    let (handle, _fake) = std_handle([crate::os_process::fake::ReapAnswer::Foreign(
+        crate::os_process::child::Foreign::Gone,
+    )]);
     let torn = handle.reap_after_tree_kill();
-    drop(forced);
-    release.assert_released();
-    crate::test_child::assert_killed("the child", handle.wait().expect("reap the killed child"));
     assert_eq!(torn.fate, crate::error::ChildFate::Killed);
 }
 
@@ -346,18 +107,10 @@ fn a_reap_after_a_delivered_tree_kill_that_meets_echild_is_killed() {
 #[cfg(unix)]
 #[skuld::test]
 fn a_failed_wait_after_a_kill_that_delivered_nothing_is_unknown() {
-    use crate::child::shared::seams::{self, ForcedWait};
-    let (handle, _stdin) = std_handle();
-    let id = crate::identity::ProcessId::of(handle.id()).found().expect("identity");
-    let pid = handle.id() as libc::pid_t;
-    let mut status = 0;
-    // SAFETY: ends and reaps this test's own child, behind its handle's back.
-    unsafe {
-        assert_eq!(libc::kill(pid, libc::SIGKILL), 0);
-        assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
-    }
-    let forced = seams::force_unlocked_wait(ForcedWait::Errno(libc::EIO));
-    let torn = handle.teardown_on_drop(id);
-    drop(forced);
+    let fake = crate::os_process::fake::FakeProcess::new([])
+        .reaps([crate::os_process::fake::ReapAnswer::Err(std::io::ErrorKind::Other)])
+        .signals([Ok(crate::signal::Sent::Gone)]);
+    let handle = super::ProcHandle::std(crate::child::owned::OwnedChild::new(Box::new(fake)), 4242);
+    let torn = handle.teardown_on_drop(crate::identity::ProcessId::current());
     assert_eq!(torn.fate, crate::error::ChildFate::Unknown);
 }

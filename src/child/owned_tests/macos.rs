@@ -1,24 +1,26 @@
-//! macOS-only `SharedChild` tests: the kqueue wait under `SIG_IGN`, and the by-pid reaps.
+//! macOS-only `OwnedChild` tests: the kqueue wait under `SIG_IGN`, and the by-pid reaps.
 //! The cases that change the process-wide `SIGCHLD` disposition each run in a fresh re-exec of the
 //! test binary.
 
 use std::time::{Duration, Instant};
 
-use super::fixtures::{spawn_std_blocker, Blocker};
-use crate::child::shared::SharedChild;
+use super::fixtures::{spawn_std_blocker, status, try_wait, wait_status, Blocker};
+use crate::child::owned::{ChildWaitOutcome, OwnedChild};
 use crate::identity::{ppid_fault, uniq_fault, uniq_info, ReadErr, ReadPurpose, UniqInfo, UniqRead, LAUNCHD};
 use crate::os_process::child::{Foreign, PeekOutcome};
 use crate::os_process::macos::kqueue::test_hooks::{self, ForcedOnce};
+use crate::signal::Sig;
 use crate::test_groups::{setuid, Group};
-use crate::wait::exit_only::seams::{self as exit_seams, ForcedReap, HolderStep};
+use crate::wait::exit_only::seams::{self as exit_seams, HolderStep};
 use crate::wait::exit_only::{self, Target};
 
 fn far() -> Instant {
     Instant::now() + Duration::from_secs(3600)
 }
 
-fn is_echild(e: &std::io::Error) -> bool {
-    e.raw_os_error() == Some(libc::ECHILD)
+/// Whether `outcome` says the child is not this process's to reap.
+fn is_foreign(outcome: &Result<ChildWaitOutcome, crate::error::Error>) -> bool {
+    matches!(outcome, Ok(ChildWaitOutcome::Foreign(_)))
 }
 
 fn found(unique_id: u64) -> UniqRead {
@@ -47,13 +49,13 @@ fn unique_of(pid: u32) -> u64 {
 fn a_reap_that_finds_none_after_reapable_takes_the_echild_path() {
     let mut b = Blocker::spawn();
     b.end_child_and_confirm_exit();
-    let none = exit_seams::force_reap_once(ForcedReap::None);
-    let err = b.shared.wait().expect_err("the forced empty reap");
+    let none = exit_seams::force_empty_reap_once();
+    let outcome = b.owned.wait(None);
     drop(none);
-    assert!(is_echild(&err), "{err}");
-    assert!(format!("{:?}", b.shared).contains("N"), "{:?}", b.shared);
+    assert!(is_foreign(&outcome), "{outcome:?}");
+    assert!(format!("{:?}", b.owned).contains("N"), "{:?}", b.owned);
     // The zombie was never consumed (the reap was forced empty): a real wait reaps it.
-    b.shared.wait().expect("the zombie is still there");
+    wait_status(&b.owned);
 }
 
 // S2g: an identity read that says the pid is gone =====
@@ -189,7 +191,7 @@ fn a_second_reap_that_finds_nothing_is_skipped() {
     let marker = format!("second reap of pid {}", child.id());
     let mark = crate::log_capture::mark();
     let same = uniq_fault::force_uniq_read_once(ReadPurpose::SecondPeek, found(7));
-    let none = exit_seams::force_reap_once(ForcedReap::None);
+    let none = exit_seams::force_empty_reap_once();
     crate::wait::exit_only::second_reap(child.id(), Some(7));
     drop(none);
     drop(same);
@@ -210,8 +212,8 @@ fn a_second_peek_runs_after_every_first_reap() {
     let mut b = Blocker::spawn();
     b.end_child_and_confirm_exit();
     exit_seams::holder_steps();
-    b.shared.wait().expect("wait");
-    assert_eq!(exit_seams::holder_steps(), [HolderStep::Reap, HolderStep::SecondPeek]);
+    wait_status(&b.owned);
+    assert_eq!(exit_seams::holder_steps(), [HolderStep::SecondPeek]);
 }
 
 /// `uniq_info`'s test seam hits only its purpose: arming one of `Peek`, `PreReap` and `SecondPeek`
@@ -244,37 +246,24 @@ fn run_case(path: &str, case: &str) {
     crate::test_child::run_fixture_case(path, MARKER, CASE_ENV, case);
 }
 
-/// A root child adopted into a `SharedChild`, under `SIGCHLD` set to `SIG_IGN` with a live
+/// A root child adopted into an `OwnedChild`, under `SIGCHLD` set to `SIG_IGN` with a live
 /// sibling blocked on its stdin, so the kernel reaps the root itself and a blocking `waitid`
 /// would sleep until the sibling is gone. The root's stdin closes from inside the holder's first
-/// blocking `kevent` round, so the waiter is known to be asleep first.
-fn ignoring_sigchld_with_a_sibling() -> (SharedChild, std::process::Child, std::process::ChildStdin, ForcedOnce) {
+/// blocking `poll` of the reap kqueue, so the waiter is known to be asleep first.
+fn ignoring_sigchld_with_a_sibling() -> (
+    OwnedChild,
+    std::process::Child,
+    std::process::ChildStdin,
+    crate::wait::block_probe::Armed,
+) {
     crate::test_child::set_signal_ignored(libc::SIGCHLD, true);
     let (sibling, sibling_stdin) = spawn_std_blocker();
     let (root, root_stdin) = spawn_std_blocker();
     let id = super::fixtures::identity_of(&root);
-    let shared = SharedChild::adopt(root, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
+    let owned = OwnedChild::adopt(root, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
     let mut root_stdin = Some(root_stdin);
-    let end = test_hooks::on_kevent_round(0, move || drop(root_stdin.take()));
-    (shared, sibling, sibling_stdin, end)
-}
-
-/// The holder's wait on macOS is the kqueue wait, never a blocking `waitid`. Structural, and
-/// under the default disposition: the exit is confirmed first (a zombie is there), so a
-/// `waitid` would return at once and only the kevent request tells the two apart. This is what
-/// the `SIG_IGN` cases below prove by hanging.
-///
-/// Mutant: the holder's platform wait is a blocking `waitid(WNOWAIT)`.
-#[skuld::test]
-fn the_holder_waits_on_the_kqueue_not_in_waitid() {
-    let mut b = Blocker::spawn();
-    b.end_child_and_confirm_exit();
-    let before = test_hooks::await_requested_timeouts().len();
-    b.shared.wait().expect("wait");
-    assert!(
-        !test_hooks::await_requested_timeouts()[before..].is_empty(),
-        "the holder never asked the kqueue"
-    );
+    let end = crate::wait::block_probe::on_blocking(move || drop(root_stdin.take()));
+    (owned, sibling, sibling_stdin, end)
 }
 
 /// A `wait` on a child the kernel reaped returns `ECHILD` while a sibling lives.
@@ -289,9 +278,9 @@ fn a_wait_on_a_child_the_kernel_reaped_returns_while_a_sibling_lives() {
             "",
         );
     }
-    let (shared, _sibling, _stdin, _end) = ignoring_sigchld_with_a_sibling();
-    let err = shared.wait().expect_err("the kernel reaped the root");
-    assert!(is_echild(&err), "{err}");
+    let (owned, _sibling, _stdin, _end) = ignoring_sigchld_with_a_sibling();
+    let outcome = owned.wait(None);
+    assert!(is_foreign(&outcome), "the kernel reaped the root: {outcome:?}");
 }
 
 /// A `wait_deadline` far past the bound returns `ECHILD`, not `Ok(None)`.
@@ -305,9 +294,9 @@ fn a_wait_timeout_far_past_the_bound_returns_echild() {
             "",
         );
     }
-    let (shared, _sibling, _stdin, _end) = ignoring_sigchld_with_a_sibling();
-    let err = shared.wait_deadline(far()).expect_err("the kernel reaped the root");
-    assert!(is_echild(&err), "{err}");
+    let (owned, _sibling, _stdin, _end) = ignoring_sigchld_with_a_sibling();
+    let outcome = owned.wait(Some(far()));
+    assert!(is_foreign(&outcome), "the kernel reaped the root: {outcome:?}");
 }
 
 /// A sync drop of a child the kernel reaped returns: its wait after a successful kill answers
@@ -352,18 +341,6 @@ fn a_sync_drop_of_a_child_the_kernel_reaped_returns() {
 
 // Identity: the unique id is checked on every by-pid surface =====
 
-/// The handle's target carries the child's unique id, so every peek and consume checks it.
-///
-/// Mutant: `Target::pid(pid, None)`.
-#[skuld::test]
-fn the_shared_childs_target_carries_its_unique_id() {
-    let b = Blocker::spawn();
-    let target = b.shared.target().expect("a target");
-    let Target::Pid { pid, unique, .. } = target;
-    assert_eq!(pid, b.shared.id());
-    assert_eq!(unique, Some(unique_of(pid)));
-}
-
 /// `try_wait` on an exited child whose pid now reads as another process answers `ECHILD` and
 /// consumes nothing.
 ///
@@ -372,12 +349,12 @@ fn the_shared_childs_target_carries_its_unique_id() {
 fn try_wait_on_a_pid_with_another_unique_id_is_echild_and_consumes_nothing() {
     let mut b = Blocker::spawn();
     b.end_child_and_confirm_exit();
-    let other = unique_of(b.shared.id()) ^ 1;
+    let other = unique_of(b.pid) ^ 1;
     let forced = uniq_fault::force_uniq_read_once(ReadPurpose::Peek, found(other));
-    let err = b.shared.try_wait().expect_err("another process holds the pid");
+    let outcome = try_wait(&b.owned);
     drop(forced);
-    assert!(is_echild(&err), "{err}");
-    b.shared.wait().expect("our zombie was never consumed");
+    assert!(is_foreign(&outcome), "another process holds the pid: {outcome:?}");
+    wait_status(&b.owned);
 }
 
 /// The wait itself checks the id: a pid that reads as another process ends the wait as `Gone`,
@@ -388,17 +365,13 @@ fn try_wait_on_a_pid_with_another_unique_id_is_echild_and_consumes_nothing() {
 fn a_wait_on_a_pid_with_another_unique_id_never_reaches_the_reap() {
     let mut b = Blocker::spawn();
     b.end_child_and_confirm_exit();
-    exit_seams::holder_steps();
-    let other = unique_of(b.shared.id()) ^ 1;
+    let other = unique_of(b.pid) ^ 1;
     let forced = uniq_fault::force_uniq_read_once(ReadPurpose::Peek, found(other));
-    let err = b.shared.wait().expect_err("another process holds the pid");
+    let outcome = b.owned.wait(None);
     drop(forced);
-    assert!(is_echild(&err), "{err}");
-    assert!(
-        !exit_seams::holder_steps().contains(&HolderStep::Reap),
-        "the wait reached the reap for a pid that is not ours"
-    );
-    b.shared.wait().expect("our zombie was never consumed");
+    assert!(is_foreign(&outcome), "another process holds the pid: {outcome:?}");
+    // Our zombie was never consumed: a real wait reaps it.
+    wait_status(&b.owned);
 }
 
 /// `kill` sends nothing to a pid whose unique id is no longer the child's: the child then ends on its own,
@@ -409,13 +382,15 @@ fn a_wait_on_a_pid_with_another_unique_id_never_reaches_the_reap() {
 fn kill_sends_nothing_to_a_pid_with_another_unique_id() {
     let mut b = Blocker::spawn();
     let log = crate::send_log::Capture::start();
-    let other = b.shared.identity.expect("a live child's identity") ^ 1;
+    let other = unique_of(b.pid) ^ 1;
     let forced = uniq_fault::force_uniq_read_once(ReadPurpose::Kill, found(other));
-    b.shared.kill().expect("a pid that is not ours is gone, not an error");
+    b.owned
+        .signal(Sig::Kill)
+        .expect("a pid that is not ours is gone, not an error");
     drop(forced);
     assert_eq!(log.entries(), []);
     b.end_child();
-    let status = b.shared.wait().expect("wait");
+    let status = wait_status(&b.owned);
     assert!(status.success(), "the child was signalled: {status:?}");
 }
 
@@ -426,12 +401,9 @@ fn kill_sends_nothing_to_a_pid_with_another_unique_id() {
 fn kill_signals_a_live_child_by_its_verified_pid() {
     let b = Blocker::spawn();
     let log = crate::send_log::Capture::start();
-    b.shared.kill().expect("kill");
-    assert_eq!(
-        log.entries(),
-        [(b.shared.id(), crate::signal::Sig::Kill, crate::send_log::Via::Pid)]
-    );
-    let status = b.shared.wait().expect("wait");
+    b.owned.signal(Sig::Kill).expect("kill");
+    assert_eq!(log.entries(), [(b.pid, Sig::Kill, crate::send_log::Via::Pid)]);
+    let status = wait_status(&b.owned);
     assert_eq!(super::fixtures::signal_of(status), Some(libc::SIGKILL));
 }
 
@@ -782,19 +754,23 @@ fn an_echild_for_a_pid_that_no_longer_names_the_child_is_foreign() {
 #[skuld::test]
 fn a_running_peek_of_a_pid_with_another_unique_id_is_foreign() {
     let mut b = Blocker::spawn();
-    let unique = unique_of(b.shared.id());
+    let unique = unique_of(b.pid);
     let forced = uniq_fault::force_uniq_read_once(ReadPurpose::Running, found(unique ^ 1));
-    let err = b.shared.try_wait().expect_err("another process holds the pid");
+    let outcome = try_wait(&b.owned);
     drop(forced);
-    assert!(is_echild(&err), "{err}");
+    assert!(is_foreign(&outcome), "another process holds the pid: {outcome:?}");
     // An id that cannot be read, or that matches, leaves it running.
     for read in [UniqRead::Refused(libc::EPERM), found(unique)] {
         let forced = uniq_fault::force_uniq_read_once(ReadPurpose::Running, read);
-        assert_eq!(b.shared.try_wait().expect("try_wait"), None, "{read:?}");
+        assert_eq!(
+            try_wait(&b.owned).expect("try_wait"),
+            ChildWaitOutcome::DeadlinePassed,
+            "{read:?}"
+        );
         drop(forced);
     }
     b.end_child();
-    b.shared.wait().expect("wait");
+    wait_status(&b.owned);
 }
 
 /// With no id there is nothing to check an `ECHILD` against: it stays a reap.
@@ -843,10 +819,10 @@ fn a_wait_on_a_zombie_launchd_holds_warns_it_is_not_ours_to_reap() {
     crate::log_capture::install();
     let mut b = Blocker::spawn();
     b.end_child_and_confirm_exit();
-    let pid = b.shared.id();
+    let pid = b.pid;
     let mark = crate::log_capture::mark();
     let _orphaned = exit_seams::force_peek_once(Ok(PeekOutcome::Foreign(Foreign::Orphaned)));
-    _ = b.shared.wait();
+    _ = b.owned.wait(None);
     let records = crate::log_capture::records_since_on_current_thread(mark, &format!("pid {pid}"));
     assert!(
         records
@@ -857,26 +833,31 @@ fn a_wait_on_a_zombie_launchd_holds_warns_it_is_not_ours_to_reap() {
     crate::child::spawn::identity_macos_tests::reap_by_pid(pid);
 }
 
-// S11m: the reap finds no exit record after `Reapable` =====
+// S11m: the reap finds no exit record after the peek saw one =====
 
-/// A reap whose own peek finds no exit record right after the wait saw one is still our child (a
-/// foreign reap is `Foreign`): the holder waits again, and gets the exit.
+/// A reap whose own peek finds no exit record right after the look's peek saw one is still our
+/// child (a foreign reap is `Foreign`): the look is `Recheck`, and the holder looks again after a
+/// backoff and gets the exit.
 ///
 /// Mutant: `Gone` at once: the wait answers `ECHILD`.
 #[skuld::test]
-fn a_reap_that_finds_no_exit_record_after_reapable_waits_again() {
+fn a_reap_that_finds_no_exit_record_after_the_peek_saw_one_looks_again() {
     let mut b = Blocker::spawn();
     b.end_child_and_confirm_exit();
-    let slot = std::rc::Rc::new(std::cell::RefCell::new(None));
-    let _hook = exit_seams::on_holder_step(HolderStep::Reap, {
-        let slot = std::rc::Rc::clone(&slot);
-        move || *slot.borrow_mut() = Some(exit_seams::force_peek_once(Ok(PeekOutcome::Running)))
-    });
-    let status = b.shared.wait().expect("the holder waited again and got the exit");
+    // The look's peek sees the exit; the reap's own peek then finds none.
+    let _forced = exit_seams::force_peeks([
+        Ok(PeekOutcome::Exit(crate::os_process::child::ExitRecord::Status(
+            std::process::ExitStatus::default(),
+        ))),
+        Ok(PeekOutcome::Running),
+    ]);
+    crate::wait::block_probe::take();
+    let status = wait_status(&b.owned);
     assert!(status.success(), "{status:?}");
+    exit_seams::assert_peeks_exhausted();
     assert!(
-        exit_seams::take_forced_peek().is_none(),
-        "the reap must have consumed the forced peek"
+        !crate::wait::block_probe::take().is_empty(),
+        "the second look follows a backoff"
     );
 }
 
@@ -912,16 +893,16 @@ fn spawn_root_child() -> (std::process::Child, std::process::ChildStdin) {
 fn setuid_kill_of_a_root_child_is_permission_denied(#[fixture(setuid)] _group: &Group) {
     let (child, stdin) = spawn_root_child();
     let id = super::fixtures::identity_of(&child);
-    let shared = SharedChild::adopt(child, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
-    assert!(
-        shared.identity.is_some(),
-        "the identity of another user's process is readable: {:?}",
-        shared.identity
-    );
-    let err = shared.kill().expect_err("this caller may not signal a root process");
+    // The identity of another user's process is readable.
+    unique_of(id.pid());
+    let owned = OwnedChild::adopt(child, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
+    let err = owned
+        .signal(Sig::Kill)
+        .expect_err("this caller may not signal a root process")
+        .into_io();
     assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
     drop(stdin);
-    let status = shared.wait().expect("the helper exits on EOF");
+    let status = wait_status(&owned);
     assert!(status.success(), "{status:?}");
 }
 
@@ -954,57 +935,6 @@ fn setuid_child_kill_is_permission_denied(#[fixture(setuid)] _group: &Group) {
     assert!(status.success(), "{status:?}");
 }
 
-// A child whose identity read at adoption failed =====
-
-/// An exited, unreaped child of ours, adopted while the `Adopt` read answers `read`: as when a
-/// foreign reaper took the real child before the read, and this exited child now holds its pid.
-fn adopt_exited_child_reading(read: UniqRead) -> Result<SharedChild, (crate::error::Error, std::process::Child)> {
-    let (child, stdin) = spawn_std_blocker();
-    let id = super::fixtures::identity_of(&child);
-    drop(stdin);
-    confirm_exit_of(&child);
-    let _forced = uniq_fault::force_uniq_read_once(ReadPurpose::Adopt, read);
-    SharedChild::adopt(child, id)
-}
-
-/// A child that was gone when it was adopted is reaped elsewhere: every wait answers `ECHILD`, as
-/// on Linux with no pidfd, and nothing is consumed by a bare pid. The zombie on the pid is
-/// another process's (a reuser), and stays for its own handle.
-///
-/// Mutant: the id-less target: `try_wait` consumes the reuser's exit and reports it as ours.
-#[skuld::test]
-fn a_child_gone_at_adoption_never_consumes_by_bare_pid() {
-    let shared = adopt_exited_child_reading(UniqRead::Gone).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
-    assert!(is_echild(&shared.try_wait().expect_err("try_wait")));
-    assert!(is_echild(&shared.wait().expect_err("wait")));
-    assert!(is_echild(&shared.wait_deadline(far()).expect_err("wait_deadline")));
-    let mut status = 0;
-    // SAFETY: `status` is a valid out-pointer.
-    let r = unsafe { libc::waitpid(shared.id() as i32, &mut status, libc::WNOHANG) };
-    assert_eq!(
-        r,
-        shared.id() as i32,
-        "the zombie must still be there for its own handle"
-    );
-    shared
-        .kill()
-        .expect("a child gone at adoption is already dead: success");
-}
-
-/// An identity that cannot be read (a MACF denial) fails the adoption as `Unassessable`, and hands
-/// the child back untouched for the caller to tear down.
-///
-/// Mutant: the adoption succeeds with no identity: a bare-pid consume.
-#[skuld::test]
-fn a_child_whose_identity_is_unreadable_at_adoption_is_not_adopted() {
-    let (error, mut child) = match adopt_exited_child_reading(UniqRead::Refused(libc::EPERM)) {
-        Ok(_) => panic!("adopted with no identity"),
-        Err(refused) => refused,
-    };
-    assert!(matches!(error, crate::error::Error::Unassessable { .. }), "{error:?}");
-    child.wait().expect("the child is handed back unreaped");
-}
-
 /// A refused id read at the exit check, just before a consume, is an error carrying the errno, and
 /// nothing is consumed by a bare pid: for `try_wait`, for the holder of a `wait`, and for the
 /// `kqueue` wait's own peek.
@@ -1015,15 +945,17 @@ fn a_refused_id_read_at_the_exit_check_consumes_nothing() {
     let mut b = Blocker::spawn();
     b.end_child_and_confirm_exit();
     let forced = uniq_fault::force_uniq_read_once(ReadPurpose::Peek, UniqRead::Refused(libc::EPERM));
-    let err = b.shared.try_wait().expect_err("an unverifiable exit is not consumed");
+    let err = try_wait(&b.owned)
+        .expect_err("an unverifiable exit is not consumed")
+        .into_io();
     drop(forced);
     assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
     let forced = uniq_fault::force_uniq_read_once(ReadPurpose::Peek, UniqRead::Refused(libc::EACCES));
-    let err = b.shared.wait().expect_err("nor by a wait");
+    let err = b.owned.wait(None).expect_err("nor by a wait").into_io();
     drop(forced);
     assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
     // Still ours, unreaped: the next, verifiable, call reaps it.
-    let status = b.shared.wait().expect("the zombie was never consumed");
+    let status = wait_status(&b.owned);
     assert!(status.success(), "{status:?}");
 }
 
@@ -1038,4 +970,79 @@ fn a_refused_echild_read_is_an_error_to_a_verified_peek() {
     let _forced = uniq_fault::force_uniq_read_once(ReadPurpose::Echild, UniqRead::Refused(libc::EPERM));
     let err = exit_only::peek_verified(&target).expect_err("a denied read cannot show a reap");
     assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+}
+
+// The reap kqueue is the holder's alone =====
+
+/// A `try_wait` on another thread, during a holder's wait, neither takes the holder's event nor
+/// strands it: the one look it makes is a peek by pid, which touches no kqueue, and the child's
+/// exit then wakes the holder.
+///
+/// Mutant: `try_wait` drains the reap kqueue while another thread holds the wait: the holder sleeps
+/// through the exit it was woken for.
+#[skuld::test]
+fn a_try_wait_during_a_holders_wait_does_not_strand_the_holder() {
+    let mut b = Blocker::spawn();
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn({
+        let owned = std::sync::Arc::clone(&b.owned);
+        move || {
+            let _blocking = crate::wait::block_probe::on_blocking(move || _ = reached_tx.send(()));
+            owned.wait(None)
+        }
+    });
+    reached_rx.recv().expect("the holder must reach its wait");
+    assert_eq!(
+        try_wait(&b.owned).expect("try_wait"),
+        ChildWaitOutcome::DeadlinePassed,
+        "the child is running"
+    );
+    b.end_child();
+    let status = status(holder.join().expect("holder"));
+    assert!(status.success(), "{status:?}");
+}
+
+/// A running child whose unique id cannot be read is an error to a `try_wait` made during another
+/// thread's wait (named behaviour change: it was `Running`).
+///
+/// Mutant: the peek is the plain one, which calls an unreadable id on a running child `Running`.
+#[skuld::test]
+fn try_wait_during_a_wait_errors_when_a_running_childs_unique_id_is_unreadable() {
+    let mut b = Blocker::spawn();
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn({
+        let owned = std::sync::Arc::clone(&b.owned);
+        move || {
+            let _blocking = crate::wait::block_probe::on_blocking(move || _ = reached_tx.send(()));
+            owned.wait(None)
+        }
+    });
+    reached_rx.recv().expect("the holder must reach its wait");
+    let forced = uniq_fault::force_uniq_read_once(ReadPurpose::Running, UniqRead::Refused(libc::EPERM));
+    let err = try_wait(&b.owned)
+        .expect_err("a running child that cannot be shown to be ours")
+        .into_io();
+    drop(forced);
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+    b.end_child();
+    let status = status(holder.join().expect("holder"));
+    assert!(status.success(), "{status:?}");
+}
+
+/// A `try_wait` that drains the child's `NOTE_EXIT` while the record is not yet visible leaves the
+/// event behind it gone from the reap kqueue, and a `wait` still returns: "exit seen" is read from
+/// the exit kqueue, which nothing drains.
+///
+/// Mutant: "exit seen" kept as a flag set by the drain, or read from the reap kqueue: the wait
+/// blocks on a queue that holds nothing, for ever.
+#[skuld::test]
+fn a_try_wait_that_drains_note_exit_then_a_wait_still_returns() {
+    let mut b = Blocker::spawn();
+    b.end_child_and_confirm_exit();
+    // The look's peek finds no record, as when XNU is still finishing the exit.
+    let forced = exit_seams::force_peeks([Ok(PeekOutcome::Running)]);
+    assert_eq!(try_wait(&b.owned).expect("try_wait"), ChildWaitOutcome::DeadlinePassed);
+    drop(forced);
+    let status = wait_status(&b.owned);
+    assert!(status.success(), "{status:?}");
 }

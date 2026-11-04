@@ -5,6 +5,7 @@ use crate::os_process::drive::exited_held;
 use crate::os_process::{kill, open, terminate, terminate_by_id, Exit};
 use crate::signal::{Sent, Sig};
 use crate::test_child::{held_contained_blocker_without_cgroup, wait_until_zombie};
+use crate::test_groups::{tracer_group, Group};
 
 /// A live blocker, its stdin (held open so it stays alive) and its identity.
 fn blocker() -> (crate::Child, std::io::PipeWriter, ProcessId) {
@@ -152,4 +153,94 @@ fn refused_signal_keeps_its_raw_errno() {
     assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
     child.kill().unwrap();
     child.wait().unwrap();
+}
+
+// OsChild =====
+
+/// A reap of a running child hands out the child's own pidfd to wait on.
+#[skuld::test]
+fn try_reap_of_a_running_child_waits_on_its_pidfd() {
+    use std::os::fd::AsRawFd;
+
+    use crate::os_process::child::{adopted_blocker, TryReapOutcome};
+    use crate::os_process::WaitFor;
+    let (os, _id, stdin) = adopted_blocker();
+    let TryReapOutcome::Running(WaitFor::Readable(fd)) = os.try_reap().unwrap() else {
+        panic!("a running child is waited on its pidfd");
+    };
+    assert_eq!(fd.as_raw_fd(), os.os_handle().as_raw_fd());
+    drop(stdin);
+    assert!(exited_held(&*os, None).unwrap());
+    os.try_reap().unwrap();
+}
+
+/// A reap of an exited child consumes its record once; the child is then foreign.
+///
+/// Mutant: a second reap hands the record out again, or answers `Running`.
+#[skuld::test]
+fn try_reap_of_an_exited_child_reaps_once_then_is_foreign() {
+    use crate::os_process::child::{adopted_blocker, Foreign, TryReapOutcome};
+    let (os, _id, stdin) = adopted_blocker();
+    drop(stdin);
+    assert!(exited_held(&*os, None).unwrap());
+    assert!(matches!(os.try_reap().unwrap(), TryReapOutcome::Reaped(_)));
+    assert!(matches!(os.try_reap().unwrap(), TryReapOutcome::Foreign(Foreign::Gone)));
+}
+
+/// A peek of an exited child sees its record and consumes nothing: the reap that follows has it.
+///
+/// Mutant: the peek is a consuming `waitid`.
+#[skuld::test]
+fn peek_of_an_exited_child_consumes_nothing() {
+    use crate::os_process::child::{adopted_blocker, PeekOutcome, TryReapOutcome};
+    let (os, _id, stdin) = adopted_blocker();
+    drop(stdin);
+    assert!(exited_held(&*os, None).unwrap());
+    assert!(matches!(os.peek().unwrap(), PeekOutcome::Exit(_)));
+    assert!(matches!(os.peek().unwrap(), PeekOutcome::Exit(_)));
+    assert!(matches!(os.try_reap().unwrap(), TryReapOutcome::Reaped(_)));
+}
+
+/// A zombie only its tracer sees has a readable pidfd and no record: a reap asks for a recheck, not
+/// for a wait on a pidfd that would return at once for ever. The tracer then hands the zombie back
+/// and the reap has the record.
+///
+/// Mutant: the reap answers `Running(Readable)`, which spins its holder.
+#[skuld::test]
+fn try_reap_of_a_zombie_only_its_tracer_sees_is_recheck(#[fixture(tracer_group)] _group: &Group) {
+    use std::os::fd::AsRawFd as _;
+
+    use crate::os_process::child::{adopt_std, TryReapOutcome};
+    use crate::test_child::reaped_elsewhere::kill_own_child;
+    use crate::test_support::foreign_tracer::{self, REAP};
+
+    let mut cmd = crate::test_child::held_std_killable_blocker();
+    foreign_tracer::allow_any_tracer(&mut cmd);
+    let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn the blocker");
+    let _stdin = child.stdin.take().expect("piped stdin");
+    let id = ProcessId::of(child.id()).found().expect("identity");
+    let os = adopt_std(child, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
+    let mut tracer = foreign_tracer::spawn_helper(id.pid());
+    // Setup: the test ends the tracee itself.
+    kill_own_child(id.pid());
+    // The exit, which the tracer alone can see: the pidfd turns readable.
+    let mut fds = [libc::pollfd {
+        fd: os.os_handle().as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    }];
+    loop {
+        // SAFETY: `fds` is one valid `pollfd`.
+        let r = unsafe { libc::poll(fds.as_mut_ptr(), 1, -1) };
+        if r == 1 {
+            break;
+        }
+        let e = std::io::Error::last_os_error();
+        assert!(r == -1 && e.raw_os_error() == Some(libc::EINTR), "poll: {e}");
+    }
+    assert!(matches!(os.try_reap().unwrap(), TryReapOutcome::Recheck));
+    tracer.send(REAP);
+    tracer.expect("reaped");
+    assert!(matches!(os.try_reap().unwrap(), TryReapOutcome::Reaped(_)));
+    tracer.finish();
 }

@@ -20,10 +20,10 @@ pub(crate) mod spawn;
 #[cfg(unix)]
 #[path = "child/drop_report.rs"]
 pub(crate) mod drop_report;
+#[path = "child/owned.rs"]
+pub(crate) mod owned;
 #[path = "child/proc_handle.rs"]
 pub(crate) mod proc_handle;
-#[path = "child/shared.rs"]
-pub(crate) mod shared;
 use proc_handle::ProcHandle;
 
 #[path = "child/lifecycle.rs"]
@@ -43,14 +43,6 @@ pub(crate) mod tree_call;
 pub(crate) use tree_call::PidfdShutdown;
 #[cfg(unix)]
 pub(crate) use tree_call::{Graceful, TreeCall};
-
-#[cfg(all(target_os = "macos", test))]
-impl Child {
-    /// The unique id the handle checks its by-pid actions against.
-    pub(crate) fn adopted_unique(&self) -> Option<u64> {
-        self.proc.adopted_unique()
-    }
-}
 
 #[cfg(test)]
 #[path = "child_tests.rs"]
@@ -693,7 +685,8 @@ impl Child {
             .root_checked(
                 || held.state(),
                 || {
-                    held.signal_sent(crate::signal::Sig::Kill)
+                    held.signal(crate::signal::Sig::Kill)
+                        .map_err(Error::into_io)
                         .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper()))
                 },
                 &group,
@@ -837,11 +830,7 @@ impl Child {
         #[cfg(unix)]
         if let Some(result) = self
             .tree_call(crate::containment::dispatch::TreeSignal::Term, "terminate_tree", None)
-            .root_checked(
-                || held.state(),
-                || held.signal_sent(crate::signal::Sig::Term).map_err(Error::Io),
-                &group,
-            )
+            .root_checked(|| held.state(), || held.signal(crate::signal::Sig::Term), &group)
         {
             return result;
         }

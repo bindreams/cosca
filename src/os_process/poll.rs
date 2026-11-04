@@ -31,7 +31,7 @@ pub(crate) fn poll_readable(fd: BorrowedFd<'_>, deadline: Option<Instant>) -> st
     let seen = crate::wait::rearm_until(deadline, |remaining| {
         let remaining = remaining.map(|d| d.min(MAX_POLL_BLOCK));
         #[cfg(test)]
-        crate::wait::block_probe::record(remaining);
+        crate::wait::block_probe::record_blocking(remaining);
         let ts = remaining.map(|d| Timespec {
             tv_sec: d.as_secs() as i64,
             tv_nsec: d.subsec_nanos() as _,

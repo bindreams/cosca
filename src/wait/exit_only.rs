@@ -36,7 +36,7 @@ use macos as backend;
 #[cfg(windows)]
 use windows as backend;
 
-/// Opens a spawned child's pidfd the way `SharedChild::adopt` does; tests that adopt a child call it.
+/// Opens a spawned child's pidfd the way `OwnedChild::adopt` does; tests that adopt a child call it.
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use linux::open_own_child;
 
@@ -156,6 +156,10 @@ pub(crate) fn try_reap(target: &Target<'_>) -> io::Result<Reap> {
 /// tracer lets go. A stop cannot wake it: an invisible zombie means this process is not the
 /// tracer. Consumes nothing.
 #[cfg(target_os = "linux")]
+#[cfg_attr(
+    not(feature = "tokio"),
+    allow(dead_code, reason = "the only consumers are the tokio backend's")
+)]
 pub(crate) fn wait_visible_exit(target: &Target<'_>) -> io::Result<PeekOutcome> {
     linux::wait_visible_exit(target)
 }
@@ -181,7 +185,7 @@ pub(crate) struct Record {
 /// `record`, as the test seam [`seams::force_consuming_record_once`] may have rewritten it.
 #[cfg(unix)]
 fn consumed(record: Record) -> Record {
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     if let Some(si_code) = seams::take_forced_si_code() {
         return Record { si_code, ..record };
     }
