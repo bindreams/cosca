@@ -23,7 +23,7 @@ pub(crate) mod cancel;
 
 #[derive(Debug)]
 pub(crate) struct WindowsProcess {
-    id: ProcessId,
+    pid: u32,
     handle: OwnedHandle,
     /// Whether the handle was granted `SYNCHRONIZE`: it decides how a look reads the exit.
     has_synchronize: bool,
@@ -38,7 +38,7 @@ impl WindowsProcess {
         #[cfg(test)]
         crate::wait::read_probe::mark("identity verified");
         Ok(Some(Self {
-            id,
+            pid: id.pid(),
             // SAFETY: `open_verified` hands over a freshly opened handle that nothing else owns.
             handle: unsafe { OwnedHandle::from_raw_handle(handle.0 as _) },
             has_synchronize: granted.0 & PROCESS_SYNCHRONIZE.0 != 0,
@@ -135,7 +135,7 @@ impl OsProcess for WindowsProcess {
                 Termination::Terminated => Ok(Sent::Delivered),
                 Termination::Exited => Ok(Sent::Gone),
                 Termination::Failed(e) => {
-                    log::warn!("wait: TerminateProcess(pid {}) failed ({e})", self.id.pid());
+                    log::warn!("wait: TerminateProcess(pid {}) failed ({e})", self.pid);
                     Err(Error::Io(win32_io_error(e)))
                 }
             },

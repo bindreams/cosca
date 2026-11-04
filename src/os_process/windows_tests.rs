@@ -139,7 +139,7 @@ fn signal_failure_carries_the_win32_code() {
     use windows::Win32::Foundation::ERROR_INVALID_HANDLE;
 
     let p = super::WindowsProcess {
-        id: ProcessId::current(),
+        pid: std::process::id(),
         handle: super::cancel::new_cancel_event().expect("create an event handle"),
         has_synchronize: true,
     };

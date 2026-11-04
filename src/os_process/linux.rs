@@ -5,26 +5,26 @@ use std::os::fd::{AsFd, OwnedFd};
 
 use super::{Exit, OsProcess, WaitFor};
 use crate::error::Error;
-use crate::identity::ProcessId;
 use crate::signal::{send_pidfd, Sent, Sig};
 
 pub(crate) mod open;
 
 #[derive(Debug)]
 pub(crate) struct LinuxProcess {
-    id: ProcessId,
+    pid: u32,
     pidfd: OwnedFd,
 }
 
 impl LinuxProcess {
-    pub(crate) fn new(id: ProcessId, pidfd: OwnedFd) -> Self {
-        Self { id, pidfd }
+    /// A process named by `pidfd`, which was opened while `pid` was provably it.
+    pub(crate) fn new(pid: u32, pidfd: OwnedFd) -> Self {
+        Self { pid, pidfd }
     }
 }
 
 impl OsProcess for LinuxProcess {
     fn signal(&self, sig: Sig) -> Result<Sent, Error> {
-        send_pidfd(self.pidfd.as_fd(), self.id.pid(), sig).map_err(|e| Error::Io(std::io::Error::from(e)))
+        send_pidfd(self.pidfd.as_fd(), self.pid, sig).map_err(|e| Error::Io(std::io::Error::from(e)))
     }
 
     fn exited(&self) -> Result<Exit<'_>, Error> {
