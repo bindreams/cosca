@@ -94,8 +94,15 @@ impl ProcessId {
     pub(crate) fn of_explained(pid: RawPid) -> (Resolved<ProcessId>, UnknownCause) {
         #[cfg(all(test, target_os = "macos"))]
         seams::note_by_pid_read();
-        let (read, cause) = start_token_explained(pid);
-        (read.map(|start| ProcessId { pid, start }), cause)
+        #[cfg(target_os = "linux")]
+        {
+            Self::of_with(&HostKernel, pid)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let (read, cause) = start_token_explained(pid);
+            (read.map(|start| ProcessId { pid, start }), cause)
+        }
     }
 
     /// Build a `ProcessId` from an already-known `(pid, raw start token)` pair, without a
@@ -157,13 +164,24 @@ impl ProcessId {
 
     /// [`exists`](Self::exists), and why it was [`Existence::Unknown`] when the read itself knows.
     pub(crate) fn exists_explained(&self) -> (Existence, UnknownCause) {
-        let (read, cause) = start_token_explained(self.pid);
-        let existence = match read {
+        #[cfg(target_os = "linux")]
+        {
+            self.exists_with(&HostKernel)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let (read, cause) = start_token_explained(self.pid);
+            (self.existence_from(read), cause)
+        }
+    }
+
+    /// What `read`, the start token now at this pid, says about this process.
+    fn existence_from(&self, read: Resolved<StartToken>) -> Existence {
+        match read {
             Resolved::Found(t) if t == self.start => Existence::Present,
             Resolved::Found(_) | Resolved::Gone => Existence::Gone,
             Resolved::Unknown => Existence::Unknown,
-        };
-        (existence, cause)
+        }
     }
 
     /// Whether the process is currently *running* (has not exited). Answers out of the OS's own
@@ -180,7 +198,14 @@ impl ProcessId {
     /// equivalent transition. Confirm a process is finished by reaping it, or by
     /// `waitid(WEXITED | WNOWAIT)` — never by asking this after an exit event.
     pub fn is_alive(&self) -> Liveness {
-        backend::is_running(self.pid, self.start)
+        #[cfg(target_os = "linux")]
+        {
+            self.is_alive_with(&HostKernel)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            backend::is_running(self.pid, self.start)
+        }
     }
 
     /// Best-effort wall-clock creation time. Lazy and allowed to drift (NTP);
@@ -206,7 +231,16 @@ pub(crate) use backend::TERMINATE_EXIT_CODE as WINDOWS_TERMINATE_EXIT_CODE;
 pub(crate) use backend::pid_stat;
 
 #[cfg(target_os = "linux")]
-pub(crate) use backend::proc_view::{pidfd_pid_in_view, proc_view, PidfdTarget, ProcDir, ProcView, ViewUnreadable};
+pub(crate) use backend::kernel::{HostKernel, Kernel};
+
+#[cfg(all(target_os = "linux", test))]
+pub(crate) use backend::kernel::fake::FakeKernel;
+
+#[cfg(all(target_os = "linux", test))]
+pub(crate) use backend::proc_view::pidfd_target_in;
+
+#[cfg(target_os = "linux")]
+pub(crate) use backend::proc_view::{pidfd_pid_in, proc_view_with, PidfdTarget, ProcDir, ProcView, ViewUnreadable};
 
 /// Why a by-pid read answered `Unknown`, when the read itself knows: on Linux, the unusable
 /// `/proc` view it went through. Carried out of the failing read, so the error describes that read
@@ -218,8 +252,9 @@ pub(crate) struct UnknownCause {
 }
 
 impl UnknownCause {
-    /// The error for `subject`'s `Unknown` read when the view is why (see
-    /// [`unknown_identity_error`]), else `None`.
+    /// The error for `subject`'s `Unknown` read when the view is why: `Error::Unsupported` naming
+    /// the `openat2` requirement, or `Error::Unassessable` with the view's reason. `None` when the
+    /// view is fine (or off Linux, which has none): `hidepid`, a racing exit.
     pub(crate) fn into_error(self, subject: &str) -> Option<crate::error::Error> {
         #[cfg(target_os = "linux")]
         {
@@ -233,30 +268,9 @@ impl UnknownCause {
     }
 }
 
-#[cfg(target_os = "linux")]
-fn start_token_explained(pid: RawPid) -> (Resolved<StartToken>, UnknownCause) {
-    let (read, view) = backend::start_token_explained(pid);
-    (read, UnknownCause { view })
-}
-
 #[cfg(not(target_os = "linux"))]
 fn start_token_explained(pid: RawPid) -> (Resolved<StartToken>, UnknownCause) {
     (backend::start_token(pid), UnknownCause::default())
-}
-
-/// The error for a by-pid read of `subject` that answered [`Resolved::Unknown`] because the
-/// checked `/proc` view is unavailable, or `None` when the view is fine (or off Linux, which has
-/// none). The cause is carried up: [`Error::Unsupported`] naming the `openat2` requirement, or
-/// [`Error::Unassessable`] with the view's reason.
-#[cfg(target_os = "linux")]
-pub(crate) fn unknown_identity_error(subject: &str) -> Option<crate::error::Error> {
-    backend::unknown_identity_error(subject)
-}
-
-/// [`unknown_identity_error`] off Linux, where identity reads have no `/proc` view.
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn unknown_identity_error(_subject: &str) -> Option<crate::error::Error> {
-    None
 }
 
 #[cfg(all(target_os = "linux", test))]
@@ -281,32 +295,45 @@ pub(crate) mod seams {
     }
 }
 
-/// The [`proc_view`] and fdinfo forcing seams.
+/// The [`proc_view_with`] and fdinfo forcing seams.
 #[cfg(all(target_os = "linux", test))]
 pub(crate) use backend::proc_view::{fault as proc_view_fault, openat2_refused_message};
 
 #[cfg(target_os = "linux")]
 impl ProcessId {
+    /// [`of_explained`](Self::of_explained) through `kernel`.
+    pub(crate) fn of_with(kernel: &dyn Kernel, pid: RawPid) -> (Resolved<ProcessId>, UnknownCause) {
+        let (read, view) = backend::start_token_explained(kernel, pid);
+        (read.map(|start| ProcessId { pid, start }), UnknownCause { view })
+    }
+
+    /// [`exists_explained`](Self::exists_explained) through `kernel`.
+    pub(crate) fn exists_with(&self, kernel: &dyn Kernel) -> (Existence, UnknownCause) {
+        let (read, view) = backend::start_token_explained(kernel, self.pid);
+        (self.existence_from(read), UnknownCause { view })
+    }
+
+    /// [`is_alive`](Self::is_alive) through `kernel`.
+    pub(crate) fn is_alive_with(&self, kernel: &dyn Kernel) -> Liveness {
+        backend::is_running(kernel, self.pid, self.start)
+    }
+
     /// [`exists`](Self::exists), reading through the `/proc` at `proc_dir` instead of
     /// re-resolving `/proc` by path. Only meaningful when that `/proc` is known to describe
     /// this pid's namespace.
-    pub(crate) fn exists_in(&self, proc_dir: &ProcDir) -> Existence {
-        match backend::start_token_in(proc_dir, self.pid) {
-            Resolved::Found(t) if t == self.start => Existence::Present,
-            Resolved::Found(_) | Resolved::Gone => Existence::Gone,
-            Resolved::Unknown => Existence::Unknown,
-        }
+    pub(crate) fn exists_in(&self, kernel: &dyn Kernel, proc_dir: &ProcDir) -> Existence {
+        self.existence_from(backend::start_token_in(kernel, proc_dir, self.pid))
     }
 
     /// [`is_alive`](Self::is_alive), reading through the `/proc` at `proc_dir`; see
     /// [`exists_in`](Self::exists_in).
-    pub(crate) fn is_alive_in(&self, proc_dir: &ProcDir) -> Liveness {
-        backend::is_running_in(proc_dir, self.pid, self.start)
+    pub(crate) fn is_alive_in(&self, kernel: &dyn Kernel, proc_dir: &ProcDir) -> Liveness {
+        backend::is_running_in(kernel, proc_dir, self.pid, self.start)
     }
 
     /// Whether `kill(pid, 0)` answers `ESRCH`; independent of `/proc`.
-    pub(crate) fn signal_says_no_such_process(&self) -> bool {
-        backend::signal_says_no_such_process(self.pid)
+    pub(crate) fn signal_says_no_such_process(&self, kernel: &dyn Kernel) -> bool {
+        backend::signal_says_no_such_process(kernel, self.pid)
     }
 }
 
