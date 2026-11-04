@@ -342,6 +342,8 @@ pub(crate) use dispatch::{kill_group_through_pidfd, ChildHandle};
 pub(crate) use group_root::GroupRoot;
 #[cfg(unix)]
 pub(crate) use group_root::NotItsGroup;
+#[cfg(unix)]
+pub(crate) use group_root::RootCheck;
 
 #[cfg(target_os = "macos")]
 #[path = "containment/marker_eof.rs"]

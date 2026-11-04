@@ -312,12 +312,14 @@ impl OwnedChild {
     }
 
     /// Hold off this handle's reaps (every reap is taken under its lock) until the result drops:
-    /// what it reads and sends meanwhile is one step to a `wait` on another thread. Nothing that
-    /// locks the handle may be called while it is held.
+    /// what it reads and sends meanwhile is one step to a `wait` on another thread. `pid` is the
+    /// child's pid, which [`ReapHold::group`] checks against its group. Nothing that locks the
+    /// handle may be called while it is held.
     #[cfg(unix)]
-    pub(crate) fn hold(&self) -> ReapHold<'_> {
+    pub(crate) fn hold(&self, pid: u32) -> ReapHold<'_> {
         ReapHold {
             child: self,
+            pid,
             lock: self.lock(),
         }
     }
@@ -339,6 +341,7 @@ impl OwnedChild {
 #[cfg(unix)]
 pub(crate) struct ReapHold<'a> {
     child: &'a OwnedChild,
+    pid: u32,
     lock: Guard<'a>,
 }
 
@@ -367,6 +370,25 @@ impl ReapHold<'_> {
     /// [`OwnedChild::signal`], under this hold.
     pub(crate) fn signal(&self, sig: Sig) -> Result<Sent, Error> {
         self.child.signal_locked(&self.lock, sig)
+    }
+
+    /// The root's group, for a send by the root's pid: its check reads this hold's
+    /// [`state`](Self::state), so no reap of ours lands between a check and its send. On Linux the
+    /// root's pidfd names the group exactly; on macOS there is none.
+    pub(crate) fn group(&self) -> crate::containment::GroupRoot<'_> {
+        #[cfg(target_os = "linux")]
+        let pidfd = Some(self.child.os_handle());
+        #[cfg(not(target_os = "linux"))]
+        let pidfd = None;
+        crate::containment::GroupRoot::new(pidfd, self)
+    }
+}
+
+/// Whether the root's pid still names its group, from this hold's own evidence.
+#[cfg(unix)]
+impl crate::containment::RootCheck for ReapHold<'_> {
+    fn check(&self) -> Result<(), String> {
+        super::tree_call::group_number_holds(self.pid, self.state())
     }
 }
 

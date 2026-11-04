@@ -82,8 +82,8 @@ impl ProcHandle {
     /// [`RootState`](crate::signal::RootState).
     #[cfg(unix)]
     pub(crate) fn state(&self) -> crate::signal::RootState {
-        let ProcHandle::Std(s, _) = self;
-        s.hold().state()
+        let ProcHandle::Std(s, pid) = self;
+        s.hold(*pid).state()
     }
 
     /// Block until the child exits.
@@ -162,8 +162,8 @@ impl ProcHandle {
     /// Hold off this handle's own reaps until the result drops (see [`OwnedChild::hold`]).
     #[cfg(unix)]
     pub(crate) fn hold_reaps(&self) -> super::owned::ReapHold<'_> {
-        let ProcHandle::Std(s, _) = self;
-        s.hold()
+        let ProcHandle::Std(s, pid) = self;
+        s.hold(*pid)
     }
 
     /// Whether the process has exited by the time `grace` is over, read through its handle's own
@@ -188,8 +188,8 @@ impl ProcHandle {
     /// Whether the process is still running, read without reaping it.
     #[cfg(unix)]
     pub(crate) fn is_running(&self) -> io::Result<bool> {
-        let ProcHandle::Std(s, _) = self;
-        let peeked = s.hold().peek().map_err(Error::into_io)?;
+        let ProcHandle::Std(s, pid) = self;
+        let peeked = s.hold(*pid).peek().map_err(Error::into_io)?;
         Ok(matches!(peeked, crate::os_process::child::PeekOutcome::Running))
     }
 

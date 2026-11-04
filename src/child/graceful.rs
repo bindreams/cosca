@@ -161,13 +161,12 @@ impl Child {
             crate::elevation::front::Gate::Open => self.proc.kill().map_err(Error::Io)?,
             // A live front in its cgroup: killed through it, and nothing signalled after it.
             crate::elevation::front::Gate::CgroupOnly => {
-                let check = || self.group_number_holds();
-                self.attached
-                    .hard_kill_marking(
-                        &self.tree_killed,
-                        &crate::containment::GroupRoot::new(self.proc.pidfd(), &check),
-                    )
-                    .map_err(|e| crate::elevation::front::cgroup_kill_failed(self.front, self.id.pid(), e))?;
+                // Held off reaps from the check to the sends, and dropped before
+                // `cgroup_kill_reached`, which locks the child.
+                let held = self.proc.hold_reaps();
+                let killed = self.attached.hard_kill_marking(&self.tree_killed, &held.group());
+                drop(held);
+                killed.map_err(|e| crate::elevation::front::cgroup_kill_failed(self.front, self.id.pid(), e))?;
                 self.cgroup_kill_reached()?;
             }
         }
@@ -304,9 +303,7 @@ impl Child {
         #[cfg(unix)]
         let held = self.proc.hold_reaps();
         #[cfg(unix)]
-        let check = || super::tree_call::group_number_holds(self.id.pid(), held.state());
-        #[cfg(unix)]
-        let group = crate::containment::GroupRoot::new(self.proc.pidfd(), &check);
+        let group = held.group();
         #[cfg(not(unix))]
         let group = crate::containment::GroupRoot::none();
         #[cfg(unix)]

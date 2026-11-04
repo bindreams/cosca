@@ -25,6 +25,10 @@ fn far() -> Instant {
 
 const KIND: std::io::ErrorKind = std::io::ErrorKind::Other;
 
+/// The pid a hold is given where the test reads no group: the fake has none.
+#[cfg(unix)]
+const UNREAD_PID: u32 = 0;
+
 /// A reap that fails, as the error its caller sees.
 fn is_the_scripted_failure(err: &Error) -> bool {
     matches!(err, Error::Io(e) if e.kind() == KIND)
@@ -653,7 +657,7 @@ fn a_held_signal_after_our_own_reap_is_gone() {
     status(child.wait(None));
     assert_eq!(
         child
-            .hold()
+            .hold(UNREAD_PID)
             .signal(Sig::Kill)
             .expect("an already-reaped child is success"),
         Sent::Gone
@@ -794,7 +798,10 @@ fn the_state_is_reaped_as_soon_as_the_reap_is_recorded() {
             });
             reached.recv().expect("the reap was recorded");
             #[cfg(unix)]
-            let seen = matches!(child.hold().state(), crate::signal::RootState::Reaped { own: true });
+            let seen = matches!(
+                child.hold(UNREAD_PID).state(),
+                crate::signal::RootState::Reaped { own: true }
+            );
             #[cfg(not(unix))]
             let seen = true;
             let seen_own = child.is_reaped();
@@ -819,12 +826,30 @@ fn the_state_is_an_own_reap_only_once_a_look_returns_the_record() {
         .peeks([Ok(PeekOutcome::Running)]);
     let child = OwnedChild::new(Box::new(fake));
     assert_eq!(try_wait(&child).expect("try_wait"), ChildWaitOutcome::DeadlinePassed);
-    assert!(matches!(child.hold().state(), RootState::Unreaped));
+    assert!(matches!(child.hold(UNREAD_PID).state(), RootState::Unreaped));
     assert!(!child.is_reaped());
     status(try_wait(&child));
     // The one scripted peek is spent: a `state` that asks the OS now panics.
-    assert!(matches!(child.hold().state(), RootState::Reaped { own: true }));
+    assert!(matches!(
+        child.hold(UNREAD_PID).state(),
+        RootState::Reaped { own: true }
+    ));
     assert!(child.is_reaped());
+}
+
+/// A hold's group check reads the hold's own state: an unreaped root's pid names its group, and a
+/// root reaped by someone else does not.
+///
+/// Mutant: the check passes whatever the state, or reads the OS instead of the hold.
+#[cfg(unix)]
+#[skuld::test]
+fn a_hold_checks_the_roots_group_by_its_own_state() {
+    use crate::containment::RootCheck as _;
+    let fake = FakeProcess::new([]).peeks([Ok(PeekOutcome::Running), Ok(PeekOutcome::Foreign(Foreign::Gone))]);
+    let child = OwnedChild::new(Box::new(fake));
+    assert_eq!(child.hold(UNREAD_PID).check(), Ok(()));
+    let refused = child.hold(UNREAD_PID).check().expect_err("reaped elsewhere");
+    assert!(refused.contains("reaped elsewhere"), "{refused}");
 }
 
 /// A waiter parked on its wait is a holder (`W`), not a reap.
@@ -839,7 +864,7 @@ fn the_state_is_unreaped_while_a_holder_waits() {
         .peeks([Ok(PeekOutcome::Running)]);
     let child = owned_over(&fake);
     let holder = park_holder(&child, &fake, |c| c.wait(None));
-    let seen = child.hold().state();
+    let seen = child.hold(UNREAD_PID).state();
     let seen_own = child.is_reaped();
     status(holder.release_and_join());
     assert!(matches!(seen, RootState::Unreaped), "{seen:?}");

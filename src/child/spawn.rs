@@ -131,13 +131,11 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     let mut skipped = None;
     let front_closed = matches!(gate, crate::elevation::front::Gate::Closed(_));
     let tree = (child.containment().can_teardown() && !front_closed).then(|| {
+        // Held off reaps from the check to the sends.
+        let held = child.proc.hold_reaps();
         child
             .attached
-            .hard_kill_marking_unless_reaped(
-                &view,
-                &child.tree_killed,
-                &crate::containment::GroupRoot::new(child.proc.pidfd(), &|| child.group_number_holds()),
-            )
+            .hard_kill_marking_unless_reaped(&view, &child.tree_killed, &held.group())
             .map(|s| skipped = s)
     });
     let tree_failure = match &tree {
