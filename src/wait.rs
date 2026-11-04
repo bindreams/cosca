@@ -540,11 +540,10 @@ impl<'a> PidfdExit<'a> {
         }
     }
 
-    /// Log the first failed poll; the peeks decide from then on.
+    /// Log a failed poll; the peeks decide from then on.
     fn note_poll_failed(&mut self, e: &dyn std::fmt::Display) {
-        if !std::mem::replace(&mut self.poll_failed, true) {
-            log::debug!("a look at a killed child's exit could not poll its pidfd ({e}); it peeks instead");
-        }
+        self.poll_failed = true;
+        log::debug!("a look at a killed child's exit could not poll its pidfd ({e}); it peeks instead");
     }
 }
 

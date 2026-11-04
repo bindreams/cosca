@@ -616,7 +616,7 @@ mod pidfd_exit_visible {
     use std::os::fd::AsFd as _;
     use std::time::{Duration, Instant};
 
-    use super::super::pidfd_exit_visible_by;
+    use super::super::{pidfd_exit_visible_by, PidfdExit};
     use crate::test_groups::{tracer_group, Group};
     use crate::test_support::foreign_tracer::{self, EXIT};
 
@@ -731,9 +731,12 @@ mod pidfd_exit_visible {
     /// A zombie a foreign tracer holds turns the pidfd readable and shows no exit to a peek: it is
     /// not visible until the tracer lets go, and the peek is repeated until then.
     ///
-    /// Mutant: a readable pidfd is taken as the exit; or a peek that finds nothing ends the look.
+    /// Mutant: a readable pidfd is taken as the exit; a peek that finds nothing ends the look; or the
+    /// look blocks on the readable pidfd, which returns at once, instead of pausing.
     #[skuld::test]
     fn a_zombie_a_tracer_holds_is_visible_only_once_the_tracer_lets_go(#[fixture(tracer_group)] _group: &Group) {
+        use crate::os_process::drive::{Step, Waitable as _};
+
         let mut child = blocker();
         let pidfd = crate::containment::cgroup::test_support::pidfd_of(child.id());
         let mut tracer = foreign_tracer::spawn_helper(child.id());
@@ -741,6 +744,10 @@ mod pidfd_exit_visible {
         assert!(
             crate::os_process::poll::poll_readable(pidfd.as_fd(), None).expect("poll"),
             "the pidfd turns readable at the zombie"
+        );
+        assert!(
+            matches!(PidfdExit::new(pidfd.as_fd()).look().expect("look"), Step::Recheck),
+            "a readable pidfd with no visible exit is looked at again, not blocked on"
         );
         let until = Instant::now() + Duration::from_millis(30);
         assert!(
