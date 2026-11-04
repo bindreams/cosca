@@ -12,6 +12,8 @@ use std::io::{PipeReader, PipeWriter, Read as _};
 use std::os::fd::{AsFd as _, OwnedFd};
 use std::os::unix::process::ExitStatusExt as _;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use crate::child::front_kill_tests::{
     assert_ends_unsignalled, assert_reaped_unsignalled, assert_refused_by, assert_unkillable_front, cat, spawn_as,
@@ -19,6 +21,7 @@ use crate::child::front_kill_tests::{
 use crate::child::owned::seams::record_root_teardowns;
 use crate::command::Command;
 use crate::elevation::{Backend, ElevatedVia};
+use crate::os_process::fake::ReapAnswer;
 use crate::test_groups::{cgroup, Group};
 use crate::{ContainMode, Containment, Stdio};
 
@@ -166,7 +169,6 @@ pub(crate) struct KillRelease {
     _after_write: crate::oneshot_hook::Armed,
     _before_drain: crate::oneshot_hook::Armed,
     _before_wait: crate::oneshot_hook::Armed,
-    fire: Rc<dyn Fn(bool)>,
     observed: Rc<RefCell<Vec<(u32, OwnedFd)>>>,
     ended: Rc<RefCell<Option<Released>>>,
 }
@@ -226,20 +228,12 @@ pub(crate) fn release_by_cgroup_kill_and_at_wait(
         _after_write: after_write,
         _before_drain: before_drain,
         _before_wait: before_wait,
-        fire,
         observed,
         ended,
     }
 }
 
 impl KillRelease {
-    /// A release for a seam of the teardown that its own waits can reach before any of the three points:
-    /// it runs `release` unless a point did, and `assert_killed` then fails on the missing write.
-    pub(crate) fn releaser(&self) -> impl Fn() + 'static {
-        let fire = Rc::clone(&self.fire);
-        move || fire(false)
-    }
-
     /// Watches the child `pid`, which must not be reaped before the release.
     pub(crate) fn observe(&self, pid: u32) {
         self.observed.borrow_mut().push((pid, pidfd_of(pid)));
@@ -489,7 +483,7 @@ pub(crate) fn wait_until_exited(pidfd: &OwnedFd) {
 fn assert_drop_kills_the_leaf_and_reaps_the_front(fault: impl FnOnce() -> Box<dyn std::any::Any>) {
     crate::log_capture::install();
     let FrontWithMember {
-        child,
+        mut child,
         stdin,
         member_stdin,
         member,
@@ -500,15 +494,24 @@ fn assert_drop_kills_the_leaf_and_reaps_the_front(fault: impl FnOnce() -> Box<dy
     // Released as the kill returns; see [`KillRelease`].
     let release = release_after_cgroup_kill((stdin, member_stdin));
     release.observe(pid);
-    // At the look the front's end is awaited. A kill that failed has reached none of the release's
-    // points by then, so the look releases the holders first: the front ends by itself and
-    // `assert_killed` fails on the missing write.
-    let release_front = release.releaser();
-    let _look = crate::child::fault::set_before_front_look(move || {
-        release_front();
-        crate::test_child::wait_until_zombie(pid);
-    });
+    // On a kernel before 6.19 a task leaves its cgroup before it can be collected, so a front the
+    // leaf's kill ended may still read as running at the look: the look awaits its end. Only once
+    // the kill was written, or a kill that failed would hang the look; `assert_killed` and the
+    // steps below fail on the missing write instead.
+    let awaited = Arc::new(AtomicBool::new(false));
     crate::containment::cgroup::fault::record_leaf_steps();
+    child.proc.script_over(|fake| fake).on_look({
+        let awaited = Arc::clone(&awaited);
+        move |_| {
+            if crate::containment::cgroup::fault::peek_leaf_steps()
+                .iter()
+                .any(|step| step == "kill")
+            {
+                crate::test_child::wait_until_zombie(pid);
+                awaited.store(true, Ordering::SeqCst);
+            }
+        }
+    });
     let mark = crate::log_capture::mark();
     {
         let _fault = fault();
@@ -516,14 +519,11 @@ fn assert_drop_kills_the_leaf_and_reaps_the_front(fault: impl FnOnce() -> Box<dy
     }
     let steps = crate::containment::cgroup::fault::take_leaf_steps();
     release.assert_killed();
-    let said =
-        crate::log_capture::records_since_on_current_thread(mark, &format!("Child::drop: elevation front pid {pid}"));
+    assert!(awaited.load(Ordering::SeqCst), "the look came after the leaf's kill");
+    let said = crate::log_capture::records_since_on_current_thread(mark, &format!("elevation front pid {pid}"));
     assert_eq!(said.len(), 1, "{said:?}");
     assert_eq!(said[0].0, log::Level::Debug, "{said:?}");
-    assert!(
-        said[0].1.contains("killed through its cgroup and reaped (signal: 9"),
-        "{said:?}"
-    );
+    assert!(said[0].1.contains("was reaped (signal: 9"), "{said:?}");
     assert!(reaped(&front), "the drop reaps the front its leaf's kill ended");
     assert!(steps.iter().any(|s| s == "kill"), "{steps:?}");
     wait_until_exited(&member);
@@ -574,7 +574,7 @@ fn cgroup_a_drop_whose_post_kill_read_fails_reaps_the_front_the_kill_ended(#[fix
 fn cgroup_a_drop_places_a_front_that_reads_as_running_and_reaps_it(#[fixture(cgroup)] _group: &Group) {
     crate::log_capture::install();
     let FrontWithMember {
-        child,
+        mut child,
         stdin,
         member_stdin,
         member,
@@ -584,21 +584,18 @@ fn cgroup_a_drop_places_a_front_that_reads_as_running_and_reaps_it(#[fixture(cgr
     let front = pidfd_of(pid);
     let release = release_after_cgroup_kill((stdin, member_stdin));
     release.observe(pid);
-    let _old_kernel = crate::child::fault::read_front_as_running_at_the_look();
+    // The look reads the front as running, as on a kernel before 6.19.
+    child.proc.script_over(|fake| fake.reaps([ReapAnswer::Running]));
     let mark = crate::log_capture::mark();
     {
         let _first_write_fails = crate::containment::cgroup::fault::fail_next_kill_write();
         drop(child);
     }
     release.assert_killed();
-    let said =
-        crate::log_capture::records_since_on_current_thread(mark, &format!("Child::drop: elevation front pid {pid}"));
+    let said = crate::log_capture::records_since_on_current_thread(mark, &format!("elevation front pid {pid}"));
     assert_eq!(said.len(), 1, "{said:?}");
     assert_eq!(said[0].0, log::Level::Debug, "{said:?}");
-    assert!(
-        said[0].1.contains("killed through its cgroup and reaped (signal: 9"),
-        "{said:?}"
-    );
+    assert!(said[0].1.contains("was reaped (signal: 9"), "{said:?}");
     assert!(reaped(&front), "the drop reaps the front");
     wait_until_exited(&member);
     let mut rest = Vec::new();
@@ -613,7 +610,7 @@ fn cgroup_a_drop_places_a_front_that_reads_as_running_and_reaps_it(#[fixture(cgr
 fn cgroup_a_drop_that_cannot_place_a_front_does_not_call_it_running(#[fixture(cgroup)] _group: &Group) {
     crate::log_capture::install();
     let FrontWithMember {
-        child,
+        mut child,
         stdin,
         member_stdin,
         member,
@@ -622,15 +619,15 @@ fn cgroup_a_drop_that_cannot_place_a_front_does_not_call_it_running(#[fixture(cg
     let pid = child.id().pid();
     let release = release_after_cgroup_kill((stdin, member_stdin));
     release.observe(pid);
-    let _old_kernel = crate::child::fault::read_front_as_running_at_the_look();
+    // The look reads the front as running, as on a kernel before 6.19.
+    child.proc.script_over(|fake| fake.reaps([ReapAnswer::Running]));
     let mark = crate::log_capture::mark();
     {
         let _unreadable = crate::containment::cgroup::fault::fail_pidfd_info();
         drop(child);
     }
     release.assert_killed();
-    let said =
-        crate::log_capture::records_since_on_current_thread(mark, &format!("Child::drop: elevation front pid {pid}"));
+    let said = crate::log_capture::records_since_on_current_thread(mark, &format!("elevation front pid {pid}"));
     assert_eq!(said.len(), 1, "{said:?}");
     assert_eq!(said[0].0, log::Level::Warn, "{said:?}");
     assert!(said[0].1.contains("cannot be read"), "{said:?}");

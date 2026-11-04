@@ -2423,13 +2423,6 @@ impl Unadopted for HeldStdChild {
 /// What a failed spawn's teardown did with its child, when that child is an elevation front (see
 /// [`crate::elevation::front`]), which it never signals: a kill of it would orphan the program.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(
-    target_os = "macos",
-    allow(
-        dead_code,
-        reason = "macOS leaves an unverified child without tearing it down, so it is never reaped here"
-    )
-)]
 pub(crate) enum FrontFate {
     /// It had exited, or a cgroup leaf's kill ended it, and was reaped.
     Reaped,
@@ -2439,10 +2432,6 @@ pub(crate) enum FrontFate {
     Unaccounted,
     /// Where it is could not be read, so it is not known whether its cgroup's kill ended it. It is
     /// left unreaped.
-    #[cfg_attr(
-        not(target_os = "linux"),
-        allow(dead_code, reason = "only a Linux cgroup leaf places a front")
-    )]
     Unplaced,
 }
 

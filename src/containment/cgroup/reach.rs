@@ -294,6 +294,25 @@ impl Subtree {
     }
 }
 
+impl crate::child::owned::teardown::Reach for Subtree {
+    /// [`Subtree::reached`] by the child's pid and pidfd. A child with no pid is not asked about:
+    /// there is no number to place it by, so it is not shown to be reached.
+    fn reached(&self, child: &crate::child::owned::OwnedChild) -> io::Result<bool> {
+        match child.pid() {
+            Some(pid) => Subtree::reached(self, pid, child.pidfd()),
+            None => Ok(false),
+        }
+    }
+}
+
+/// A subtree that could not be read answers with the failure it had, so a teardown does not take an
+/// unreadable place for a place outside the kill.
+impl crate::child::owned::teardown::Reach for io::Error {
+    fn reached(&self, _child: &crate::child::owned::OwnedChild) -> io::Result<bool> {
+        Err(io::Error::new(self.kind(), self.to_string()))
+    }
+}
+
 /// `nr_dying_descendants` in a `cgroup.stat`'s `text`.
 fn dying_in(text: &str) -> Option<u64> {
     text.lines()

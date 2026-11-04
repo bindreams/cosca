@@ -244,3 +244,30 @@ fn try_reap_of_a_zombie_only_its_tracer_sees_is_recheck(#[fixture(tracer_group)]
     assert!(matches!(os.try_reap().unwrap(), TryReapOutcome::Reaped(_)));
     tracer.finish();
 }
+
+/// A child whose pid is unknown (its spawn failed after the handshake opened its pidfd) is signalled
+/// and reaped through the pidfd alone.
+///
+/// Mutant: a pid is required to signal or to settle the child.
+#[skuld::test]
+fn a_pidless_linux_child_is_signalled_and_reaped_through_its_pidfd() {
+    use crate::child::owned::teardown::TeardownKind;
+    use crate::error::ChildFate;
+    use crate::os_process::linux::LinuxProcess;
+
+    let mut cmd = crate::test_child::held_std_killable_blocker();
+    let child = crate::test_spawn::spawn(&mut cmd).expect("spawn the blocker");
+    let id = ProcessId::of(child.id())
+        .found()
+        .expect("the live child has an identity");
+    let pidfd = crate::wait::exit_only::open_own_child(id.pid(), Some(id))
+        .expect("pidfd_open")
+        .expect("the child is not reaped");
+    // std's `Child` neither kills nor reaps on drop; the pidfd is all that is left of it.
+    drop(child);
+    let owned = crate::child::owned::OwnedChild::new(Box::new(LinuxProcess::new(None, pidfd)));
+    assert_eq!(owned.pid(), None);
+    let torn = owned.tear_down(None, TeardownKind::Kill, None);
+    assert_eq!(torn.fate, ChildFate::Reaped, "{torn:?}");
+    assert_eq!(torn.left, None);
+}

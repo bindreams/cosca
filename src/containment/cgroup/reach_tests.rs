@@ -1228,3 +1228,31 @@ fn a_descriptor_that_is_no_pidfd_fails_the_pin() {
         Ok(_) => panic!("expected Failed, got a pidfd"),
     }
 }
+
+/// A subtree asked about a child with no pid says the kill did not reach it, though its kill
+/// landed and a pidfd would place it: it has no number to ask `/proc` with.
+///
+/// Mutant: the pid-less child is asked as pid 0, or the pidfd alone decides.
+#[skuld::test]
+fn a_subtree_asked_about_a_pidless_child_says_not_reached() {
+    use crate::child::owned::teardown::Reach;
+
+    let _id = fault::force_pidfd_cgroup_id(HIGH);
+    let child = crate::child::owned::OwnedChild::new(Box::new(crate::os_process::fake::FakeProcess::new([])));
+    // Not `subtree.reached(..)`: the subtree's own method of that name takes a pid.
+    assert!(!Reach::reached(&subtree(HIGH, true), &child).expect("a pid-less child is not asked about"));
+}
+
+/// A subtree that could not be read answers with the failure it had, of the same kind.
+///
+/// Mutant: the unreadable place is taken for "not reached".
+#[skuld::test]
+fn an_unreadable_subtree_answers_its_error() {
+    use crate::child::owned::teardown::Reach as _;
+
+    let child = crate::child::owned::OwnedChild::new(Box::new(crate::os_process::fake::FakeProcess::new([])));
+    let unreadable = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "the leaf cannot be read");
+    let err = unreadable.reached(&child).expect_err("the failure is the answer");
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(err.to_string().contains("the leaf cannot be read"), "{err}");
+}

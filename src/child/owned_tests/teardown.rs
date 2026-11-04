@@ -11,18 +11,18 @@ use crate::os_process::fake::{Answer, FakeProcess, ReapAnswer};
 use crate::signal::Sent;
 use crate::wait::teardown_warn::Due;
 
-const PID: u32 = 4242;
+pub(super) const PID: u32 = 4242;
 
-fn id() -> ProcessId {
+pub(super) fn id() -> ProcessId {
     ProcessId::from_parts(PID, 1)
 }
 
 /// A fake that states the pid, and nothing else.
-fn fake() -> FakeProcess {
+pub(super) fn fake() -> FakeProcess {
     FakeProcess::new([]).with_pid(PID)
 }
 
-fn exit() -> ExitRecord {
+pub(super) fn exit() -> ExitRecord {
     ExitRecord::Status(ExitStatus::default())
 }
 
@@ -59,7 +59,7 @@ fn teardown_when_the_reap_answers(reap: ReapAnswer) -> (TeardownOutcome, Vec<log
 /// Turns a wait that blocks into a recorded fact: the fake's wait is fired as the block begins, so
 /// a teardown that waits where it must not fails the count instead of hanging. The count starts
 /// empty: a block an earlier test left on this thread is dropped.
-fn fire_on_block(fake: &FakeProcess) -> crate::wait::block_probe::Armed {
+pub(super) fn fire_on_block(fake: &FakeProcess) -> crate::wait::block_probe::Armed {
     crate::wait::block_probe::take();
     let fake = fake.clone();
     crate::wait::block_probe::on_blocking(move || fake.wake())
@@ -283,7 +283,7 @@ fn teardown_after_a_refused_kill_of_a_child_launchd_holds_is_gone_and_silent() {
 }
 
 /// A threshold that has already passed: the wait warns unless the child has exited.
-fn due_now() -> Due {
+pub(super) fn due_now() -> Due {
     Due {
         until: crate::wait::now(),
         after: std::time::Duration::from_secs(7),
@@ -291,7 +291,7 @@ fn due_now() -> Due {
 }
 
 /// The records that are the slow-teardown warn.
-fn slow_warns(records: &[(log::Level, String)]) -> Vec<&String> {
+pub(super) fn slow_warns(records: &[(log::Level, String)]) -> Vec<&String> {
     records
         .iter()
         .filter(|(level, text)| *level == log::Level::Warn && text.contains("after its kill"))
