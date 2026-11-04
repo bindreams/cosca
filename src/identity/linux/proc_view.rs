@@ -132,6 +132,16 @@ pub(crate) struct ProcDir(OwnedFd);
 impl ProcDir {
     /// Open `/proc` and prove it is procfs's root: `PROC_SUPER_MAGIC`, and inode 1.
     pub(crate) fn open() -> Result<ProcDir, ViewUnreadable> {
+        #[cfg(test)]
+        if let Some(errno) = fault::forced_openat2_errno() {
+            return Err(ViewUnreadable::from_open_errno(errno));
+        }
+        Self::open_unforced()
+    }
+
+    /// [`open`](Self::open) that no test fault answers in place of. For test support that observes
+    /// the kernel while a test arms faults for the code under test.
+    pub(crate) fn open_unforced() -> Result<ProcDir, ViewUnreadable> {
         let fd = open_proc_root().map_err(ViewUnreadable::from_open_errno)?;
         let fs =
             rustix::fs::fstatfs(&fd).map_err(|e| ViewUnreadable::new("/proc could not be checked", Some(e.into())))?;
@@ -219,12 +229,8 @@ impl ProcDir {
 /// The inode of procfs's root directory (`PROC_ROOT_INO`).
 const PROC_ROOT_INO: u64 = 1;
 
-/// The `openat2` of `/proc` itself, with a test seam: a forced errno replaces the syscall.
+/// The `openat2` of `/proc` itself.
 fn open_proc_root() -> Result<OwnedFd, rustix::io::Errno> {
-    #[cfg(test)]
-    if let Some(errno) = fault::forced_openat2_errno() {
-        return Err(errno);
-    }
     openat2(
         CWD,
         "/proc",
@@ -386,6 +392,15 @@ pub(crate) fn pidfd_pid_in(
             )
         });
     }
+    pidfd_target_in(kernel, dir, pidfd)
+}
+
+/// [`pidfd_pid_in`] without the test seam: the read and the parse, once.
+pub(crate) fn pidfd_target_in(
+    kernel: &dyn Kernel,
+    dir: &ProcDir,
+    pidfd: BorrowedFd<'_>,
+) -> Result<PidfdTarget, ViewUnreadable> {
     let fdinfo = kernel
         .read(dir, &format!("thread-self/fdinfo/{}", pidfd.as_raw_fd()))
         .and_then(utf8)
