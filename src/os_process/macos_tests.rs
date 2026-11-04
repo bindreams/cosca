@@ -423,7 +423,7 @@ fn try_reap_of_a_running_child_waits_on_the_reap_kqueue() {
 
     use crate::os_process::child::{adopted_blocker, TryReapOutcome};
     use crate::os_process::WaitFor;
-    let (os, _id, stdin) = adopted_blocker();
+    let (os, id, stdin) = adopted_blocker();
     let Exit::Running(WaitFor::Readable(exit_fd)) = os.exited().unwrap() else {
         panic!("a live child reads Running");
     };
@@ -433,6 +433,8 @@ fn try_reap_of_a_running_child_waits_on_the_reap_kqueue() {
     assert_ne!(reap_fd.as_raw_fd(), exit_fd.as_raw_fd());
     drop(stdin);
     assert!(exited_held(&*os, None).unwrap());
+    // `NOTE_EXIT` can come before XNU shows the zombie to `waitid`.
+    wait_until_zombie(id.pid());
     assert!(matches!(
         os.try_reap().unwrap(),
         crate::os_process::child::TryReapOutcome::Reaped(_)
@@ -445,9 +447,11 @@ fn try_reap_of_a_running_child_waits_on_the_reap_kqueue() {
 #[skuld::test]
 fn peek_of_an_exited_child_consumes_nothing() {
     use crate::os_process::child::{adopted_blocker, PeekOutcome, TryReapOutcome};
-    let (os, _id, stdin) = adopted_blocker();
+    let (os, id, stdin) = adopted_blocker();
     drop(stdin);
     assert!(exited_held(&*os, None).unwrap());
+    // `NOTE_EXIT` can come before XNU shows the zombie to `waitid`.
+    wait_until_zombie(id.pid());
     assert!(matches!(os.peek().unwrap(), PeekOutcome::Exit(_)));
     assert!(matches!(os.peek().unwrap(), PeekOutcome::Exit(_)));
     assert!(matches!(os.try_reap().unwrap(), TryReapOutcome::Reaped(_)));
