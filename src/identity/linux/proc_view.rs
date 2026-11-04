@@ -136,12 +136,17 @@ impl ProcDir {
         if let Some(errno) = fault::forced_openat2_errno() {
             return Err(ViewUnreadable::from_open_errno(errno));
         }
-        Self::open_unforced()
+        Self::open_root()
     }
 
-    /// [`open`](Self::open) that no test fault answers in place of. For test support that observes
+    /// [`open`](Self::open) that no test fault answers in place of: for test support that observes
     /// the kernel while a test arms faults for the code under test.
+    #[cfg(test)]
     pub(crate) fn open_unforced() -> Result<ProcDir, ViewUnreadable> {
+        Self::open_root()
+    }
+
+    fn open_root() -> Result<ProcDir, ViewUnreadable> {
         let fd = open_proc_root().map_err(ViewUnreadable::from_open_errno)?;
         let fs =
             rustix::fs::fstatfs(&fd).map_err(|e| ViewUnreadable::new("/proc could not be checked", Some(e.into())))?;
