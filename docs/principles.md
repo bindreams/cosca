@@ -143,9 +143,12 @@ process:
   `exec`. A failed spawn's warn opens one by number for a child that sent only its `/proc`
   directory, and keeps it only if that directory shows the child unreaped after the open;
 - a cgroup, since `cgroup.kill` names no PID;
-- on macOS, for a `Process` opened from a `ProcessId`, its audit token: the pid with its
-  `p_idversion`, which `proc_signal_with_audittoken` checks in the kernel. A process that took a
-  reused pid gets no signal;
+- on macOS, the audit token of a `Process` opened from a `ProcessId` and of a spawned child: the pid
+  with its `p_idversion`, which `proc_signal_with_audittoken` checks in the kernel. A process that
+  took a reused pid gets no signal. The version is read right before each send (an `exec` is a
+  retry), so only the 2^32 wrap of `p_idversion` is left. A child's kill, sync or async, is exact
+  this way, and a child that has exited and is not reaped is signalled as delivered, as on Linux;
+  only a process-group kill stays inexact;
 - on Windows, a process handle or Job Object.
 
 On Linux cosca requires a pidfd for every child it spawns. When `pidfd_open` is refused (a kernel
@@ -219,8 +222,8 @@ After a foreign reap:
   fd marker's kills by the
   root's number (its group and its ppid walk), are unsafe. The marker's holders are named by the
   pipe they hold and are still killed exactly.
-- macOS has no pidfd: a child's kill by its number, and a process-group kill, are not exact after
-  the reap. A `Process` opened from a `ProcessId` stays exact through its audit token (principle 4).
+- macOS has no pidfd: a process-group kill is not exact after the reap. A child's kill, and a
+  `Process` opened from a `ProcessId`, stay exact through the audit token (principle 4).
 
 **Why:** a library cannot require the whole process to leave its children alone, and processes that
 reap everything are legitimate hosts.

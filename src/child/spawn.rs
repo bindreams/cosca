@@ -767,9 +767,9 @@ fn leave_front_after_attach_failure(child: std::process::Child) -> FrontFate {
 /// - A child already gone: nothing to do.
 /// - A kill that failed: one verified, non-blocking reap, and the child is left.
 ///
-/// The checks are not pins: macOS has no handle, so the kill has `via_verified_pid`'s window
-/// between its id check and `kill(2)`, and the reap has `try_reap`'s between its id check and the
-/// consuming `waitid`. A child that cannot be shown ours (a refused id read) is left with a `warn`;
+/// The checks are not pins: macOS has no handle. The kill is exact, by audit token (the kernel
+/// checks the pid's `p_idversion`), but the reap has `try_reap`'s window between its id check and
+/// the consuming `waitid`. A child that cannot be shown ours (a refused id read) is left with a `warn`;
 /// a zombie launchd holds is not ours to reap, and is `Gone`.
 ///
 /// Dropping the `std` `Child` closes our pipe ends only.
@@ -1117,11 +1117,11 @@ fn kill_and_reap_noting(
     after_kill: impl FnOnce(bool),
 ) -> (ChildFate, KillOutcome) {
     use crate::os_process::child::Foreign;
-    use crate::signal::{via_verified_pid, Sent, Sig};
+    use crate::signal::{via_audit_token, Sent, Sig};
     use crate::wait::macos::Waited;
 
     let target = crate::wait::exit_only::Target::pid(pid, Some(unique));
-    match via_verified_pid(pid, Some(unique), Sig::Kill) {
+    match via_audit_token(pid, Some(unique), Sig::Kill) {
         Ok(Sent::Delivered) => {
             // A fixture that only the kill would end is released here when no kill was sent.
             #[cfg(test)]
@@ -1159,7 +1159,7 @@ fn kill_and_reap_noting(
             (Foreign::Gone.fate(false), KillOutcome::NotSent)
         }
         Ok(Sent::Unverified) => {
-            debug_assert!(false, "`via_verified_pid` was given `Some(unique)`, so it verifies");
+            debug_assert!(false, "`via_audit_token` was given `Some(unique)`, so it verifies");
             after_kill(false);
             (ChildFate::Running { id }, KillOutcome::Unverified)
         }

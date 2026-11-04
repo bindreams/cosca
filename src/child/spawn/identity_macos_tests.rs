@@ -457,7 +457,11 @@ fn macos_sync_spawn_adopts_the_live_childs_own_unique_id() {
     child.kill().expect("kill");
     assert_eq!(
         sent.entries(),
-        [(child.id().pid(), crate::signal::Sig::Kill, crate::send_log::Via::Pid)]
+        [(
+            child.id().pid(),
+            crate::signal::Sig::Kill,
+            crate::send_log::Via::Identity
+        )]
     );
     drop(sent);
     drop(writer);

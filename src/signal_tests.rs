@@ -79,7 +79,7 @@ mod macos {
 
     use super::*;
     use crate::identity::{uniq_fault, uniq_info, ReadPurpose, UniqInfo, UniqRead};
-    use crate::signal::{read_identity, via_verified_pid};
+    use crate::signal::{read_identity, via_audit_token};
 
     /// `PID_MAX` is 99999, so this pid names nothing, ever.
     const NEVER_A_PID: u32 = 4_000_000;
@@ -148,7 +148,7 @@ mod macos {
         }
     }
 
-    // `via_verified_pid` -----
+    // `via_audit_token` -----
 
     /// Mutant: the id is not compared, so a reused pid is signalled.
     #[skuld::test]
@@ -157,7 +157,7 @@ mod macos {
         let other = Some(unique_id_of(child.id()) ^ 1);
         let log = Capture::start();
         assert_eq!(
-            via_verified_pid(child.id(), other, Sig::Kill).expect("gone is Ok"),
+            via_audit_token(child.id(), other, Sig::Kill).expect("gone is Ok"),
             Sent::Gone
         );
         assert_eq!(log.entries(), []);
@@ -174,7 +174,7 @@ mod macos {
     fn a_child_with_no_unique_id_is_unverified_and_sends_nothing() {
         let log = Capture::start();
         assert_eq!(
-            via_verified_pid(NEVER_A_PID, None, Sig::Kill).expect("unverified is Ok"),
+            via_audit_token(NEVER_A_PID, None, Sig::Kill).expect("unverified is Ok"),
             Sent::Unverified
         );
         assert_eq!(log.entries(), []);
@@ -190,7 +190,7 @@ mod macos {
         let known = Some(unique_id_of(child.id()));
         let log = Capture::start();
         let _forced = uniq_fault::force_uniq_read_once(ReadPurpose::Kill, UniqRead::Refused(libc::EPERM));
-        let err = via_verified_pid(child.id(), known, Sig::Kill).expect_err("unverifiable");
+        let err = via_audit_token(child.id(), known, Sig::Kill).expect_err("unverifiable");
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
         assert_eq!(err.raw_os_error(), None);
         assert!(err.to_string().contains("identity could not be read"), "{err}");
@@ -211,10 +211,51 @@ mod macos {
             }),
         );
         assert_eq!(
-            via_verified_pid(NEVER_A_PID, Some(7), Sig::Kill).expect("gone is Ok"),
+            via_audit_token(NEVER_A_PID, Some(7), Sig::Kill).expect("gone is Ok"),
             Sent::Gone
         );
-        assert_eq!(log.entries(), [(NEVER_A_PID, Sig::Kill, Via::Pid)]);
+        assert_eq!(log.entries(), [(NEVER_A_PID, Sig::Kill, Via::Identity)]);
+    }
+
+    /// A child that has exited and is not reaped is ours, not gone: `Delivered`, as on Linux.
+    ///
+    /// Mutant: an exited-but-unreaped child is mapped to `Gone`.
+    #[skuld::test]
+    fn an_exited_unreaped_child_is_delivered() {
+        let (mut child, stdin) = spawn();
+        let identity = read_identity(child.id()).expect("readable");
+        drop(stdin);
+        // The exit, seen without consuming it: the child is a zombie.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let r = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        assert_eq!(r, 0, "waitid(WNOWAIT): {}", io::Error::last_os_error());
+        assert_eq!(
+            via_audit_token(child.id(), identity, Sig::Kill).expect("send"),
+            Sent::Delivered
+        );
+        child.wait().expect("reap");
+    }
+
+    /// A refused send is the bare errno: `Child::kill` promises a raw `EPERM`.
+    ///
+    /// Mutant: the errno is wrapped with context, which drops `raw_os_error`.
+    #[skuld::test]
+    fn a_refused_send_keeps_its_raw_errno() {
+        let (mut child, stdin) = spawn();
+        let identity = read_identity(child.id()).expect("readable");
+        let refused = crate::signal::seams::refuse_kills();
+        let err = via_audit_token(child.id(), identity, Sig::Kill).expect_err("refused");
+        drop(refused);
+        assert_eq!(err.raw_os_error(), Some(libc::EPERM), "{err}");
+        drop(stdin);
+        child.wait().expect("reap");
     }
 
     /// Mutant: the send is not recorded, or nothing is sent.
@@ -224,10 +265,10 @@ mod macos {
         let identity = read_identity(child.id()).expect("readable");
         let log = Capture::start();
         assert_eq!(
-            via_verified_pid(child.id(), identity, Sig::Kill).expect("send"),
+            via_audit_token(child.id(), identity, Sig::Kill).expect("send"),
             Sent::Delivered
         );
-        assert_eq!(log.entries(), [(child.id(), Sig::Kill, Via::Pid)]);
+        assert_eq!(log.entries(), [(child.id(), Sig::Kill, Via::Identity)]);
         let status = child.wait().expect("reap");
         assert_eq!(
             std::os::unix::process::ExitStatusExt::signal(&status),

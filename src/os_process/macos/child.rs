@@ -12,7 +12,7 @@ use super::{ExitWatch, Kqueue};
 use crate::error::Error;
 use crate::os_process::child::{Foreign, OsChild, PeekOutcome, TryReapOutcome};
 use crate::os_process::{Exit, OsProcess, WaitFor};
-use crate::signal::{send_verified_pid, Sent, Sig};
+use crate::signal::{via_audit_token, Sent, Sig};
 use crate::wait::exit_only::{self, Reap, Target};
 use crate::wait::macos::{drain_exit_events, register_exit_events, OnTracer, TracerWatch};
 
@@ -69,9 +69,11 @@ impl MacChild {
 }
 
 impl OsProcess for MacChild {
-    /// A bare errno on a refused send; `Gone` once the unique id says the pid names another process.
+    /// By audit token, which the kernel checks against the pid's `p_idversion`: a bare errno on a
+    /// refused send; `Gone` once the unique id says the pid names another process; `Delivered` for
+    /// this child's own unreaped zombie.
     fn signal(&self, sig: Sig) -> Result<Sent, Error> {
-        send_verified_pid(self.pid, self.unique, sig).map_err(Error::Io)
+        via_audit_token(self.pid, Some(self.unique), sig).map_err(Error::Io)
     }
 
     fn exited(&self) -> Result<Exit<'_>, Error> {

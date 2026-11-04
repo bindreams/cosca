@@ -549,7 +549,7 @@ impl Recorders {
             killpg: !self.groups.killed().is_empty() || !self.terms.termed().is_empty(),
             walk: !self.walks.walked().is_empty(),
             by_pid: member_terms.iter().any(|(_, via, _)| *via == Via::Pid)
-                || entries.iter().any(|(_, _, via)| *via == Via::Pid),
+                || entries.iter().any(|(_, _, via)| *via == Via::Identity),
             member_term: member_terms.iter().any(|(_, via, _)| *via == Via::Pidfd),
             #[cfg(target_os = "macos")]
             holder: self.holders.signals_to(cat),

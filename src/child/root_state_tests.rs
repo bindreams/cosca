@@ -367,7 +367,7 @@ mod macos {
         drop(writer);
 
         assert_peeks_exhausted();
-        assert_eq!(sends.entries(), vec![(pid, Sig::Kill, Via::Pid)]);
+        assert_eq!(sends.entries(), vec![(pid, Sig::Kill, Via::Identity)]);
     }
 
     /// A Session (fd-marker) tree: its holders-only sweep must not signal the root, which holds the

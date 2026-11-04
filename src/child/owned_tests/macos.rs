@@ -216,17 +216,32 @@ fn kill_sends_nothing_to_a_pid_with_another_unique_id() {
     assert!(status.success(), "the child was signalled: {status:?}");
 }
 
-/// `kill` on a live child sends `SIGKILL` by pid and records it.
+/// `kill` on a live child sends `SIGKILL` through its audit token and records it.
 ///
 /// Mutant: nothing sent.
 #[skuld::test]
-fn kill_signals_a_live_child_by_its_verified_pid() {
+fn kill_signals_a_live_child_through_its_audit_token() {
     let b = Blocker::spawn();
     let log = crate::send_log::Capture::start();
     b.owned.signal(Sig::Kill).expect("kill");
-    assert_eq!(log.entries(), [(b.pid, Sig::Kill, crate::send_log::Via::Pid)]);
+    assert_eq!(log.entries(), [(b.pid, Sig::Kill, crate::send_log::Via::Identity)]);
     let status = wait_status(&b.owned);
     assert_eq!(super::fixtures::signal_of(status), Some(libc::SIGKILL));
+}
+
+/// `kill` on this child's own unreaped zombie is `Delivered`, as on Linux: the kernel answers `ESRCH`
+/// for a zombie, but the pid still has the child's unique id and `p_idversion`, so it is ours and
+/// not gone. A zombie that reads as `Gone` would send `kill` down the already-reaped path.
+///
+/// Mutant: an exited-but-unreaped child is mapped to `Gone`.
+#[skuld::test]
+fn kill_on_an_own_unreaped_zombie_is_delivered() {
+    let mut b = Blocker::spawn();
+    b.end_child_and_confirm_exit();
+    assert_eq!(b.owned.signal(Sig::Kill).expect("kill"), crate::signal::Sent::Delivered);
+    // The zombie was never consumed: a real wait reaps it, and it ended of its own accord.
+    let status = wait_status(&b.owned);
+    assert!(status.success(), "{status:?}");
 }
 
 // A pid that is not our child, yet still names it (a tracer holds it) =====
