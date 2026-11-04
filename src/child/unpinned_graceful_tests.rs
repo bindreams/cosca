@@ -8,24 +8,20 @@ use std::time::Duration;
 
 use super::graceful::fault as graceful_fault;
 use super::unpinned_public_tests::{
-    assert_nothing_sent, assert_refused, assert_sent_by_identity, assert_tree_refused, group_blocker, orphaned,
+    assert_nothing_sent, assert_refused, assert_sent_by_identity, assert_tree_refused, group_blocker, orphan,
     session_tree, walked_blocker, warns_since, Untrusted, BOTH,
 };
 use crate::error::Error;
 use crate::os_process::child::{Foreign, PeekOutcome};
+use crate::os_process::fake::{FakeProcess, ReapAnswer};
 use crate::send_log::{Capture, Via};
 use crate::signal::Sig;
-use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peeks, forced_peeks_left, Forced};
 
-/// A hook slot that holds a forced peek until the test is over, so the guard is not dropped (and the
-/// force disarmed) before the shutdown reads it.
-fn hold_forced() -> (Arc<Mutex<Option<Forced>>>, impl Fn(Forced) + Clone + 'static) {
-    let slot: Arc<Mutex<Option<Forced>>> = Arc::default();
-    let set = {
-        let slot = Arc::clone(&slot);
-        move |forced| *slot.lock().expect("the hook's slot") = Some(forced)
-    };
-    (slot, set)
+/// The hook that makes the next peek of `fake`'s root read `Orphaned`, for a test that flips the
+/// state at a point of the shutdown.
+fn orphan_next_peek(fake: &FakeProcess) -> impl FnOnce() + 'static {
+    let fake = fake.clone();
+    move || drop(fake.peeks([Untrusted::Unpinned.result()]))
 }
 
 // graceful_shutdown =====
@@ -38,20 +34,19 @@ fn hold_forced() -> (Arc<Mutex<Option<Forced>>>, impl Fn(Forced) + Clone + 'stat
 #[skuld::test]
 fn graceful_shutdown_of_an_orphaned_root_sends_nothing() {
     crate::log_capture::install();
-    let (child, writer) = walked_blocker();
+    let (mut child, writer) = walked_blocker();
     let sends = Capture::start();
     let mark = crate::log_capture::mark();
-    let looks = orphaned();
+    let fake = orphan(&mut child);
 
     let err = child
         .graceful_shutdown(Duration::ZERO)
         .expect_err("a root this process does not pin is not shut down");
 
-    assert_peeks_exhausted();
+    fake.assert_peeks_exhausted();
     assert_refused(&err, "terminate");
     assert_nothing_sent(&sends);
     assert_eq!(warns_since(mark), Vec::<String>::new());
-    drop(looks);
 
     child
         .graceful_shutdown(Duration::ZERO)
@@ -70,20 +65,21 @@ fn graceful_shutdown_of_an_orphaned_root_sends_nothing() {
 #[skuld::test]
 fn graceful_shutdown_does_not_escalate_to_a_root_orphaned_during_the_grace() {
     crate::log_capture::install();
-    let (child, writer) = crate::test_child::term_ignoring_blocker();
+    let (mut child, writer) = crate::test_child::term_ignoring_blocker();
     let pid = child.id().pid();
     let sends = Capture::start();
     let mark = crate::log_capture::mark();
-    let (slot, set) = hold_forced();
-    let hook = crate::graceful_hooks::at(crate::graceful_hooks::HookPoint::BeforeEscalation, move || {
-        set(orphaned())
-    });
+    let fake = child.proc.script_over(|f| f);
+    let hook = crate::graceful_hooks::at(
+        crate::graceful_hooks::HookPoint::BeforeEscalation,
+        orphan_next_peek(&fake),
+    );
 
     let err = child
         .graceful_shutdown(Duration::ZERO)
         .expect_err("a root this process does not pin is not killed");
 
-    assert_peeks_exhausted();
+    fake.assert_peeks_exhausted();
     assert_refused(&err, "kill");
     assert!(
         matches!(&err, Error::Unassessable { detail, .. } if detail.contains("though the SIGTERM was sent before it")),
@@ -96,7 +92,6 @@ fn graceful_shutdown_does_not_escalate_to_a_root_orphaned_during_the_grace() {
     );
     assert_eq!(warns_since(mark), Vec::<String>::new());
     drop(hook);
-    drop(slot);
 
     let status = child
         .graceful_shutdown(Duration::ZERO)
@@ -112,22 +107,22 @@ fn graceful_shutdown_does_not_escalate_to_a_root_orphaned_during_the_grace() {
 #[skuld::test]
 fn graceful_shutdown_wait_that_sees_an_orphaned_root_is_quiet() {
     crate::log_capture::install();
-    let (child, writer) = crate::test_child::term_ignoring_blocker();
+    let (mut child, writer) = crate::test_child::term_ignoring_blocker();
     let pid = child.id().pid();
     let sends = Capture::start();
     let mark = crate::log_capture::mark();
-    // The terminate's read, the wait's own peek, the escalation's read.
-    let _looks = force_peeks([
-        Ok(PeekOutcome::Running),
-        Ok(PeekOutcome::Foreign(Foreign::Orphaned)),
-        Ok(PeekOutcome::Foreign(Foreign::Orphaned)),
-    ]);
+    // The terminate's read and the escalation's read are peeks; the grace wait's own look is a reap.
+    let fake = child.proc.script_over(|f| {
+        f.peeks([Ok(PeekOutcome::Running), Ok(PeekOutcome::Foreign(Foreign::Orphaned))])
+            .reaps([ReapAnswer::Foreign(Foreign::Orphaned)])
+    });
 
     let err = child
         .graceful_shutdown(Duration::ZERO)
         .expect_err("a root this process does not pin is not killed");
 
-    assert_peeks_exhausted();
+    fake.assert_peeks_exhausted();
+    assert_eq!(fake.looks(), 1, "the grace wait looked once");
     assert_refused(&err, "kill");
     assert_eq!(
         sends.entries(),
@@ -144,15 +139,18 @@ fn graceful_shutdown_wait_that_sees_an_orphaned_root_is_quiet() {
 #[skuld::test]
 fn wait_timeout_still_warns_of_an_orphaned_root() {
     crate::log_capture::install();
-    let (child, writer) = walked_blocker();
+    let (mut child, writer) = walked_blocker();
     let mark = crate::log_capture::mark();
-    let _looks = orphaned();
+    // The wait's own look is a reap.
+    let fake = child
+        .proc
+        .script_over(|f| f.reaps([ReapAnswer::Foreign(Foreign::Orphaned)]));
 
     child
         .wait_timeout(Duration::ZERO)
         .expect_err("a zombie launchd holds is not reaped");
 
-    assert_peeks_exhausted();
+    assert_eq!(fake.looks(), 1, "the wait looked once");
     let warns = warns_since(mark);
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(warns[0].contains("not ours to reap"), "{warns:?}");
@@ -174,25 +172,24 @@ fn graceful_shutdown_tree_of_an_untrusted_root_with_no_identity_channel_ends_up_
     for state in BOTH {
         for group in [false, true] {
             let groups = crate::containment::unix::fault::record_term_group();
-            let (child, writer) = if group { group_blocker() } else { walked_blocker() };
+            let (mut child, writer) = if group { group_blocker() } else { walked_blocker() };
             let sends = Capture::start();
             let mark = crate::log_capture::mark();
             let hook = crate::graceful_hooks::at(crate::graceful_hooks::HookPoint::AfterTerminate, || {
                 panic!("the grace wait began on a root this process cannot vouch for")
             });
-            let looks = state.peek();
+            let fake = state.script(&mut child);
 
             let err = child
                 .graceful_shutdown_tree(Duration::from_secs(3600))
                 .expect_err("a root this process cannot vouch for is not shut down");
 
-            assert_peeks_exhausted();
+            fake.assert_peeks_exhausted();
             assert_tree_refused(&err, "graceful_shutdown_tree", state);
             assert_nothing_sent(&sends);
             assert_eq!(groups.termed(), Vec::<i32>::new(), "{state:?}, group: {group}");
             assert_eq!(warns_since(mark), Vec::<String>::new(), "{state:?}, group: {group}");
             drop(hook);
-            drop(looks);
 
             child
                 .graceful_shutdown_tree(Duration::ZERO)
@@ -215,7 +212,7 @@ fn graceful_shutdown_tree_of_an_untrusted_session_root_signals_its_holders_only(
     for state in BOTH {
         let groups = crate::containment::unix::fault::record_term_group();
         let _holders = crate::containment::fdmarker::fault::record_holder_kills();
-        let (child, writer, descendant) = session_tree();
+        let (mut child, writer, descendant) = session_tree();
         let sends = Capture::start();
         let pid = child.id().pid();
         let mark = crate::log_capture::mark();
@@ -227,7 +224,7 @@ fn graceful_shutdown_tree_of_an_untrusted_session_root_signals_its_holders_only(
                     Some(crate::containment::fdmarker::fault::holder_kills_so_far())
             }
         });
-        let _looks = state.peek();
+        let _fake = state.script(&mut child);
 
         child
             .graceful_shutdown_tree(Duration::ZERO)
@@ -266,23 +263,27 @@ fn graceful_shutdown_tree_of_an_untrusted_session_root_signals_its_holders_only(
 fn graceful_shutdown_tree_decides_its_signal_on_one_look_at_the_root() {
     let _termed = crate::containment::unix::fault::record_term_group();
     let _killed = crate::containment::unix::fault::record_kill_group();
-    let (child, writer) = group_blocker();
+    let (mut child, writer) = group_blocker();
     let left: Arc<Mutex<Option<usize>>> = Arc::default();
+    let fake = child
+        .proc
+        .script_over(|f| f.peeks([Ok(PeekOutcome::Running), Ok(PeekOutcome::Foreign(Foreign::Orphaned))]));
     let _hook = crate::graceful_hooks::at(crate::graceful_hooks::HookPoint::AfterTerminate, {
         let left = Arc::clone(&left);
-        move || *left.lock().expect("the hook's slot") = Some(forced_peeks_left())
+        let fake = fake.clone();
+        move || *left.lock().expect("the hook's slot") = Some(fake.peeks_left())
     });
-    let looks = force_peeks([Ok(PeekOutcome::Running), Ok(PeekOutcome::Foreign(Foreign::Orphaned))]);
 
     // The sweep and the reap that follow are not under test.
     _ = child.graceful_shutdown_tree(Duration::ZERO);
 
-    drop(looks);
     assert_eq!(
         *left.lock().expect("the hook's slot"),
         Some(1),
         "the signal's decision looked at the root twice"
     );
+    // The answer left over must not reach the drop.
+    drop(fake.peeks([]));
     drop(writer);
 }
 
@@ -294,20 +295,20 @@ fn graceful_shutdown_tree_decides_its_signal_on_one_look_at_the_root() {
 #[skuld::test]
 fn graceful_shutdown_tree_sweep_refuses_a_root_orphaned_during_the_grace() {
     crate::log_capture::install();
-    let (child, writer) = walked_blocker();
+    let (mut child, writer) = walked_blocker();
     let sends = Capture::start();
     let mark = crate::log_capture::mark();
-    let (slot, set) = hold_forced();
+    let fake = child.proc.script_over(|f| f);
     let _hook = crate::graceful_hooks::at(
         crate::graceful_hooks::HookPoint::AfterTerminate,
-        move || set(orphaned()),
+        orphan_next_peek(&fake),
     );
 
     let err = child
         .graceful_shutdown_tree(Duration::ZERO)
         .expect_err("a root this process does not pin is not swept");
 
-    assert_peeks_exhausted();
+    fake.assert_peeks_exhausted();
     assert_tree_refused(&err, "kill_tree", Untrusted::Unpinned);
     assert!(
         matches!(&err, Error::Unassessable { detail, .. } if detail.contains("though the SIGTERM was sent before it")),
@@ -320,7 +321,6 @@ fn graceful_shutdown_tree_sweep_refuses_a_root_orphaned_during_the_grace() {
         sends.by_identity()
     );
     assert_eq!(warns_since(mark), Vec::<String>::new());
-    drop(slot);
     drop(writer);
 }
 
@@ -332,7 +332,7 @@ fn graceful_shutdown_tree_sweep_refuses_a_root_orphaned_during_the_grace() {
 #[skuld::test]
 fn graceful_shutdown_tree_does_not_reap_an_exited_orphaned_root_after_a_failed_sweep() {
     crate::log_capture::install();
-    let (child, writer) = walked_blocker();
+    let (mut child, writer) = walked_blocker();
     let pid = child.id().pid();
     // SAFETY: `pid` is this test's own child.
     assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) }, 0);
@@ -340,17 +340,19 @@ fn graceful_shutdown_tree_does_not_reap_an_exited_orphaned_root_after_a_failed_s
     graceful_fault::set_force_terminate(graceful_fault::Forced::Containment);
     let mark = crate::log_capture::mark();
     // The entry's read, the sweep's, the reap's.
-    let _looks = force_peeks([
-        Ok(PeekOutcome::Running),
-        Ok(PeekOutcome::Foreign(Foreign::Orphaned)),
-        Ok(PeekOutcome::Foreign(Foreign::Orphaned)),
-    ]);
+    let fake = child.proc.script_over(|f| {
+        f.peeks([
+            Ok(PeekOutcome::Running),
+            Ok(PeekOutcome::Foreign(Foreign::Orphaned)),
+            Ok(PeekOutcome::Foreign(Foreign::Orphaned)),
+        ])
+    });
 
     let err = child
         .graceful_shutdown_tree(Duration::ZERO)
         .expect_err("a root this process does not pin is not swept");
 
-    assert_peeks_exhausted();
+    fake.assert_peeks_exhausted();
     assert_tree_refused(&err, "kill_tree", Untrusted::Unpinned);
     assert!(
         crate::test_child::is_unreaped_child(pid),
@@ -367,17 +369,17 @@ fn graceful_shutdown_tree_does_not_reap_an_exited_orphaned_root_after_a_failed_s
 #[skuld::test]
 fn graceful_shutdown_tree_does_not_wait_for_a_root_orphaned_before_its_reap() {
     crate::log_capture::install();
-    let (child, writer) = walked_blocker();
+    let (mut child, writer) = walked_blocker();
     let pid = child.id().pid();
     let mark = crate::log_capture::mark();
-    let (slot, set) = hold_forced();
-    let _hook = crate::graceful_hooks::at(crate::graceful_hooks::HookPoint::BeforeReap, move || set(orphaned()));
+    let fake = child.proc.script_over(|f| f);
+    let _hook = crate::graceful_hooks::at(crate::graceful_hooks::HookPoint::BeforeReap, orphan_next_peek(&fake));
 
     let err = child
         .graceful_shutdown_tree(Duration::ZERO)
         .expect_err("the status of a zombie launchd holds cannot be collected");
 
-    assert_peeks_exhausted();
+    fake.assert_peeks_exhausted();
     assert!(
         matches!(&err, Error::Unassessable { detail, source: None } if detail.contains("exit status cannot be collected")),
         "{err:?}"
@@ -387,6 +389,5 @@ fn graceful_shutdown_tree_does_not_wait_for_a_root_orphaned_before_its_reap() {
         "the zombie launchd holds was waited on"
     );
     assert_eq!(warns_since(mark), Vec::<String>::new());
-    drop(slot);
     drop(writer);
 }

@@ -44,7 +44,7 @@ impl OsProcess for LinuxProcess {
 
 impl OsChild for LinuxProcess {
     fn peek(&self) -> Result<PeekOutcome, Error> {
-        exit_only::peek(&Target::PidFd(self.pidfd.as_fd())).map_err(Error::Io)
+        exit_only::linux::peek(&Target::PidFd(self.pidfd.as_fd())).map_err(Error::Io)
     }
 
     fn try_reap(&self) -> Result<TryReapOutcome<'_>, Error> {

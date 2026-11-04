@@ -928,7 +928,7 @@ async fn exited_by_id_reports_an_exit_pending_when_the_timer_wins_the_first_poll
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
     child.kill().expect("kill");
     // `kill` only signals: block (non-reaping) until the exit has really happened.
-    assert!(crate::os_process::drive::exited_by_id(id, None).expect("exit wait"));
+    assert!(crate::test_child::exited_through_open(id, None).expect("exit wait"));
     let past = super::tokio_now()
         .checked_sub(Duration::from_secs(3600))
         .expect("an hour before now");
