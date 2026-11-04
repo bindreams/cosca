@@ -79,7 +79,7 @@ pub(crate) fn proc_names(
     if let Some(errno) = super::fault::proc_hidden_as() {
         return Err(io::Error::from_raw_os_error(errno));
     }
-    let proc_dir = match crate::identity::proc_view() {
+    let proc_dir = match crate::identity::proc_view_with(&crate::identity::HostKernel) {
         crate::identity::ProcView::Same(dir) => dir,
         crate::identity::ProcView::Diverged => {
             return Err(io::Error::other(format!(
@@ -887,7 +887,7 @@ fn log_probe_end(pid: libc::pid_t, end: ProbeEnd) {
 
 /// Reads the cgroup of a non-dumpable child of this process (see [`front_placement`]).
 fn untraceable_cgroup_readable() -> Result<(), Unreadable> {
-    let proc_dir = match crate::identity::proc_view() {
+    let proc_dir = match crate::identity::proc_view_with(&crate::identity::HostKernel) {
         crate::identity::ProcView::Same(dir) => dir,
         crate::identity::ProcView::Diverged => {
             return Err(Unreadable::View(
