@@ -690,7 +690,10 @@ fn run_sync(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
         drop(forced.take());
         if let Some(fake) = &scripted {
             // The root's kill and reap below are the real ones.
-            drop(fake.clone().peeks([]).reaps([]));
+            let lifted = fake.clone().peeks([]).reaps([]);
+            #[cfg(target_os = "macos")]
+            let lifted = lifted.no_repeats();
+            drop(lifted);
         }
     }
 

@@ -156,6 +156,15 @@ impl FakeProcess {
         self
     }
 
+    /// Stops [`peeks_always`](Self::peeks_always) and [`reaps_always`](Self::reaps_always) from
+    /// answering: once the tables are empty, calls go to the real child.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn no_repeats(self) -> Self {
+        self.script().peeks_always = None;
+        self.script().reaps_always = None;
+        self
+    }
+
     /// How many calls [`peeks_always`](Self::peeks_always) and [`reaps_always`](Self::reaps_always)
     /// answered.
     #[cfg(target_os = "macos")]
