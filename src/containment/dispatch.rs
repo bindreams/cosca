@@ -960,6 +960,15 @@ impl Attached {
         )))
     }
 
+    /// Whether this is a Linux cgroup leaf.
+    #[cfg(unix)]
+    pub(crate) fn is_cgroup(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        return matches!(self, Attached::Cgroup(_));
+        #[cfg(not(target_os = "linux"))]
+        false
+    }
+
     /// Whether this child holds an actionable tree-teardown mechanism.
     pub(crate) fn is_actionable(&self) -> bool {
         match self {

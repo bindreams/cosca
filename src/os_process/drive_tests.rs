@@ -591,3 +591,25 @@ fn run_arms_a_deadline_beyond_the_block_limit_in_pieces() {
         assert!(a <= crate::wait::MAX_BLOCK, "armed {a:?}");
     }
 }
+
+/// A wait on a process handle that fails is a contract breach, not a wake: debug builds assert,
+/// release builds return the OS error.
+///
+/// Mutant: the `debug_assert!` removed from the failed arm of `block`.
+#[cfg(windows)]
+#[skuld::test]
+fn a_failed_block_on_a_process_handle_is_a_contract_breach() {
+    use std::os::windows::io::AsHandle as _;
+
+    use crate::os_process::WaitFor;
+
+    let unwaitable = crate::test_child::unwaitable::unwaitable_handle();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        super::block(&WaitFor::Signalled(unwaitable.as_handle()), None)
+    }));
+    if cfg!(debug_assertions) {
+        assert!(outcome.is_err(), "a debug build asserts the contract");
+    } else {
+        assert!(matches!(outcome.expect("release returns"), Err(Error::Io(_))));
+    }
+}
