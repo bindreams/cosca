@@ -156,6 +156,9 @@ impl DrainWatch {
     /// Whether the leaf drains by `until`, blocking no later: the `ended_by` of a
     /// [`wait_warning`](crate::wait::teardown_warn::wait_warning) before [`wait`](Self::wait). What it
     /// cannot read answers `true`, for the wait to find.
+    ///
+    /// The deadline form, as [`poll_readable`](crate::os_process::poll::poll_readable)'s bounded case
+    /// is: each round is re-armed against the real clock.
     pub(crate) fn drained_by(&mut self, until: std::time::Instant) -> bool {
         use rustix::event::{poll, PollFd, PollFlags, Timespec};
 
