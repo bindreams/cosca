@@ -11,11 +11,11 @@
 //! Two ways to establish that the mounted `/proc` describes a given target, each through ONE
 //! [`ProcDir`] so nothing re-resolves `/proc` by path between the check and the read:
 //!
-//! - **With a pidfd** ([`pidfd_pid_in_view`]): a pidfd's fdinfo `Pid:` line is printed
+//! - **With a pidfd** ([`pidfd_pid_in`]): a pidfd's fdinfo `Pid:` line is printed
 //!   unconditionally, relative to the pid namespace of the procfs that printed it (`0` when the
 //!   target is not visible there, `-1` when it was reaped). Equal to the pid the caller holds
 //!   means this procfs names the target under that number.
-//! - **Without one** ([`proc_view`]): the `NSpid` line of `self/status`, which has one entry per
+//! - **Without one** ([`proc_view_with`]): the `NSpid` line of `self/status`, which has one entry per
 //!   pid namespace from the procfs's down to the reader's. One entry means the same namespace.
 //!   Where `NSpid` is absent but pid namespaces exist (gVisor), the procfs's pid 1 namespace
 //!   link must name this thread's own pid namespace ([`cross_check_with_init_ns`]).
@@ -28,6 +28,7 @@ use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 
 use rustix::fs::{openat2, Mode, OFlags, ResolveFlags, CWD, PROC_SUPER_MAGIC};
 
+use super::kernel::Kernel;
 use crate::error::Error;
 
 /// What this process's `/proc` says about its own pid namespace.
@@ -77,6 +78,18 @@ impl ViewUnreadable {
         }
     }
 
+    /// The view that `openat2` of `/proc` failing with `errno` leaves.
+    pub(crate) fn from_open_errno(errno: rustix::io::Errno) -> Self {
+        ViewUnreadable {
+            openat2_refused: match errno {
+                rustix::io::Errno::NOSYS => Some("ENOSYS"),
+                rustix::io::Errno::PERM => Some("EPERM"),
+                _ => None,
+            },
+            ..ViewUnreadable::new("/proc could not be opened", Some(errno.into()))
+        }
+    }
+
     /// [`Error::Unsupported`] naming the `openat2` requirement, when that is why the view
     /// could not be established. `op` is what could not be done.
     pub(crate) fn unsupported(&self, op: impl Into<String>) -> Option<Error> {
@@ -119,14 +132,22 @@ pub(crate) struct ProcDir(OwnedFd);
 impl ProcDir {
     /// Open `/proc` and prove it is procfs's root: `PROC_SUPER_MAGIC`, and inode 1.
     pub(crate) fn open() -> Result<ProcDir, ViewUnreadable> {
-        let fd = open_proc_root().map_err(|e| ViewUnreadable {
-            openat2_refused: match e {
-                rustix::io::Errno::NOSYS => Some("ENOSYS"),
-                rustix::io::Errno::PERM => Some("EPERM"),
-                _ => None,
-            },
-            ..ViewUnreadable::new("/proc could not be opened", Some(e.into()))
-        })?;
+        #[cfg(test)]
+        if let Some(errno) = fault::forced_openat2_errno() {
+            return Err(ViewUnreadable::from_open_errno(errno));
+        }
+        Self::open_root()
+    }
+
+    /// [`open`](Self::open) that no test fault answers in place of: for test support that observes
+    /// the kernel while a test arms faults for the code under test.
+    #[cfg(test)]
+    pub(crate) fn open_unforced() -> Result<ProcDir, ViewUnreadable> {
+        Self::open_root()
+    }
+
+    fn open_root() -> Result<ProcDir, ViewUnreadable> {
+        let fd = open_proc_root().map_err(ViewUnreadable::from_open_errno)?;
         let fs =
             rustix::fs::fstatfs(&fd).map_err(|e| ViewUnreadable::new("/proc could not be checked", Some(e.into())))?;
         if fs.f_type != PROC_SUPER_MAGIC {
@@ -181,7 +202,7 @@ impl ProcDir {
 
     /// [`read`](Self::read) as UTF-8 text.
     pub(crate) fn read_to_string(&self, path: &str) -> io::Result<String> {
-        String::from_utf8(self.read(path)?).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        utf8(self.read(path)?)
     }
 
     /// The target of the symlink at `path` under this `/proc`, without following it.
@@ -213,12 +234,8 @@ impl ProcDir {
 /// The inode of procfs's root directory (`PROC_ROOT_INO`).
 const PROC_ROOT_INO: u64 = 1;
 
-/// The `openat2` of `/proc` itself, with a test seam: a forced errno replaces the syscall.
+/// The `openat2` of `/proc` itself.
 fn open_proc_root() -> Result<OwnedFd, rustix::io::Errno> {
-    #[cfg(test)]
-    if let Some(errno) = fault::forced_openat2_errno() {
-        return Err(errno);
-    }
     openat2(
         CWD,
         "/proc",
@@ -228,8 +245,14 @@ fn open_proc_root() -> Result<OwnedFd, rustix::io::Errno> {
     )
 }
 
-/// This process's [`ProcView`], from `self/status`'s `NSpid` read through one `/proc` dirfd.
-pub(crate) fn proc_view() -> ProcView {
+/// `bytes` as UTF-8 text.
+pub(crate) fn utf8(bytes: Vec<u8>) -> io::Result<String> {
+    String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// This process's [`ProcView`], from `self/status`'s `NSpid` read through one `/proc` dirfd that
+/// `kernel` opens.
+pub(crate) fn proc_view_with(kernel: &dyn Kernel) -> ProcView {
     #[cfg(test)]
     let forced = fault::take_forced_proc_view();
     #[cfg(test)]
@@ -238,23 +261,13 @@ pub(crate) fn proc_view() -> ProcView {
         Some(fault::ForcedView::Unassessable) => {
             return ProcView::Unassessable(ViewUnreadable::new("forced by a test", None));
         }
-        Some(fault::ForcedView::Same) => {
-            return match ProcDir::open() {
-                Ok(dir) => ProcView::Same(dir),
-                Err(why) => ProcView::Unassessable(why),
-            };
-        }
         None => {}
     }
-    let dir = match ProcDir::open() {
+    let dir = match kernel.open_proc() {
         Ok(dir) => dir,
         Err(why) => return ProcView::Unassessable(why),
     };
-    #[cfg(test)]
-    let forced_status = fault::take_forced_status();
-    #[cfg(not(test))]
-    let forced_status: Option<String> = None;
-    let status = match forced_status.map_or_else(|| dir.read_to_string("self/status"), Ok) {
+    let status = match kernel.read(&dir, "self/status").and_then(utf8) {
         Ok(text) => text,
         Err(e) => {
             return ProcView::Unassessable(ViewUnreadable::new("self/status could not be read", Some(e)));
@@ -277,7 +290,7 @@ pub(crate) fn proc_view() -> ProcView {
 enum Verdict {
     Same,
     /// `NSpid` is absent although pid namespaces exist; only [`cross_check_with_init_ns`] can
-    /// decide. Never leaves [`proc_view`].
+    /// decide. Never leaves [`proc_view_with`].
     NoNspid,
     Diverged,
     Unassessable(ViewUnreadable),
@@ -369,8 +382,12 @@ pub(crate) enum PidfdTarget {
     Reaped,
 }
 
-/// The `Pid:` of `pidfd`'s fdinfo through the procfs at `dir`.
-pub(crate) fn pidfd_pid_in_view(dir: &ProcDir, pidfd: BorrowedFd<'_>) -> Result<PidfdTarget, ViewUnreadable> {
+/// The `Pid:` of `pidfd`'s fdinfo, read through the procfs at `dir`.
+pub(crate) fn pidfd_pid_in(
+    kernel: &dyn Kernel,
+    dir: &ProcDir,
+    pidfd: BorrowedFd<'_>,
+) -> Result<PidfdTarget, ViewUnreadable> {
     #[cfg(test)]
     if let Some(forced) = fault::take_forced_fdinfo() {
         return forced.map_err(|errno| {
@@ -380,8 +397,18 @@ pub(crate) fn pidfd_pid_in_view(dir: &ProcDir, pidfd: BorrowedFd<'_>) -> Result<
             )
         });
     }
-    let fdinfo = dir
-        .read_to_string(&format!("thread-self/fdinfo/{}", pidfd.as_raw_fd()))
+    pidfd_target_in(kernel, dir, pidfd)
+}
+
+/// [`pidfd_pid_in`] without the test seam: the read and the parse, once.
+pub(crate) fn pidfd_target_in(
+    kernel: &dyn Kernel,
+    dir: &ProcDir,
+    pidfd: BorrowedFd<'_>,
+) -> Result<PidfdTarget, ViewUnreadable> {
+    let fdinfo = kernel
+        .read(dir, &format!("thread-self/fdinfo/{}", pidfd.as_raw_fd()))
+        .and_then(utf8)
         .map_err(|e| ViewUnreadable::new("the pidfd's fdinfo could not be read", Some(e)))?;
     parse_fdinfo_pid(&fdinfo).ok_or_else(|| ViewUnreadable::new("the pidfd's fdinfo has no parseable Pid line", None))
 }
@@ -435,10 +462,9 @@ fn collect_pids(names: impl IntoIterator<Item = io::Result<Vec<u8>>>) -> io::Res
 pub(crate) mod fault {
     use std::cell::{Cell, RefCell};
 
-    /// A view to force. `Same` still opens the real `/proc`.
+    /// A view to force.
     #[derive(Debug, Clone, Copy)]
     pub(crate) enum ForcedView {
-        Same,
         Diverged,
         Unassessable,
     }
@@ -450,10 +476,8 @@ pub(crate) mod fault {
         static PROC_VIEW_FIRED_AT: Cell<Option<u32>> = const { Cell::new(None) };
         static FORCE_PIDS_ERRNO: Cell<Option<i32>> = const { Cell::new(None) };
         static FORCE_IDENTITY_STAT: RefCell<Vec<(u32, i32)>> = const { RefCell::new(Vec::new()) };
-        static FORCE_STATUS: RefCell<Option<String>> = const { RefCell::new(None) };
         static FORCE_FDINFO: Cell<Option<Result<super::PidfdTarget, i32>>> = const { Cell::new(None) };
         static FORCE_OPENAT2_ERRNO: Cell<Option<rustix::io::Errno>> = const { Cell::new(None) };
-        static FORCE_SELF_STAT: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
     }
 
     /// Disarms every forced value on drop, even unconsumed — so a test that panics before
@@ -470,9 +494,7 @@ pub(crate) mod fault {
             FORCE_PIDS_ERRNO.with(|f| f.set(None));
             FORCE_IDENTITY_STAT.with(|f| f.borrow_mut().clear());
             FORCE_FDINFO.with(|f| f.set(None));
-            FORCE_STATUS.with(|f| f.take());
             FORCE_OPENAT2_ERRNO.with(|f| f.set(None));
-            FORCE_SELF_STAT.with(|f| f.take());
         }
     }
 
@@ -511,28 +533,7 @@ pub(crate) mod fault {
         FORCE_IDENTITY_STAT.with(|f| f.borrow().iter().find(|&&(p, _)| p == pid).map(|&(_, e)| e))
     }
 
-    /// Make the NEXT read of this process's own `stat` on THIS thread return `bytes`.
-    pub(crate) fn force_self_stat_once(bytes: &[u8]) -> Forced {
-        FORCE_SELF_STAT.with(|f| *f.borrow_mut() = Some(bytes.to_vec()));
-        Forced(())
-    }
-
-    pub(crate) fn take_forced_self_stat() -> Option<Vec<u8>> {
-        FORCE_SELF_STAT.with(|f| f.take())
-    }
-
-    /// Make the NEXT [`proc_view`](super::proc_view) on THIS thread read `text` as its
-    /// `status` file.
-    pub(crate) fn force_status_once(text: &str) -> Forced {
-        FORCE_STATUS.with(|f| *f.borrow_mut() = Some(text.to_owned()));
-        Forced(())
-    }
-
-    pub(crate) fn take_forced_status() -> Option<String> {
-        FORCE_STATUS.with(|f| f.take())
-    }
-
-    /// Force the NEXT [`proc_view`](super::proc_view) on THIS thread.
+    /// Force the NEXT [`proc_view_with`](super::proc_view_with) on THIS thread.
     pub(crate) fn force_proc_view_once(view: ForcedView) -> Forced {
         PROC_VIEW_CALLS.with(|f| f.set(0));
         PROC_VIEW_FIRED_AT.with(|f| f.set(None));
@@ -540,21 +541,21 @@ pub(crate) mod fault {
         Forced(())
     }
 
-    /// Force the [`proc_view`](super::proc_view) on THIS thread that follows `skip` real ones,
+    /// Force the [`proc_view_with`](super::proc_view_with) on THIS thread that follows `skip` real ones,
     /// so a caller whose first read must pass (an anchor) fails only at a later one.
     pub(crate) fn force_proc_view_after(skip: u32, view: ForcedView) -> Forced {
         FORCE_PROC_VIEW_SKIP.with(|f| f.set(skip));
         force_proc_view_once(view)
     }
 
-    /// Force the NEXT [`pidfd_pid_in_view`](super::pidfd_pid_in_view) on THIS thread to answer
+    /// Force the NEXT [`pidfd_pid_in`](super::pidfd_pid_in) on THIS thread to answer
     /// `Ok(pid)`, or to fail reading with the raw `errno`.
     pub(crate) fn force_fdinfo_once(answer: Result<super::PidfdTarget, i32>) -> Forced {
         FORCE_FDINFO.with(|f| f.set(Some(answer)));
         Forced(())
     }
 
-    /// Where the forced view fired: how many [`proc_view`](super::proc_view) calls on THIS thread
+    /// Where the forced view fired: how many [`proc_view_with`](super::proc_view_with) calls on THIS thread
     /// preceded it since it was armed. `None` while it has not fired.
     pub(crate) fn proc_view_fired_at() -> Option<u32> {
         PROC_VIEW_FIRED_AT.with(|f| f.get())

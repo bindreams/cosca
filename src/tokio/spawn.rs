@@ -613,7 +613,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
         debug_assert!(false, "a freshly spawned tokio child holds its pidfd");
         let fate = proc.reap_now(pid, None);
         return Err(SpawnFailure::started(
-            crate::child::spawn::spawn_identity_error(Resolved::Unknown),
+            crate::child::spawn::spawn_identity_error(Resolved::Unknown, Default::default()),
             fate,
         ));
     };
@@ -632,12 +632,16 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
     // reaped the child. The backend exists already, so a failure here tears the child down through
     // it, and a panic unwinds through `ProcSource`'s `Drop`. The attach below takes this identity
     // and does not re-read the root's.
-    let (resolved, mut why) = match proc.target() {
+    let (resolved, cause, mut why) = match proc.target() {
         Some(through) => resolve_identity(pid, &through),
         // Contract: a freshly spawned child holds its handle on every platform.
         None => {
             debug_assert!(false, "a freshly spawned tokio child holds its handle");
-            (Resolved::Unknown, crate::child::spawn::Diagnosis::default())
+            (
+                Resolved::Unknown,
+                Default::default(),
+                crate::child::spawn::Diagnosis::default(),
+            )
         }
     };
     let id = match resolved {
@@ -676,7 +680,11 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                 #[cfg(not(target_os = "macos"))]
                 let (fate, child_fate) = proc.leave_front_noting(pid, front, None, subtree.as_ref(), &mut why);
                 return Err(SpawnFailure::started(
-                    fate.note(crate::child::spawn::spawn_identity_error(other), Some(front), Some(pid)),
+                    fate.note(
+                        crate::child::spawn::spawn_identity_error(other, cause),
+                        Some(front),
+                        Some(pid),
+                    ),
                     child_fate,
                 ));
             }
@@ -692,7 +700,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
             if matches!(other, Resolved::Unknown) {
                 let child_fate = proc.teardown_through_pidfd(pid, None, &mut why);
                 return Err(SpawnFailure::started(
-                    crate::child::spawn::spawn_identity_error(other),
+                    crate::child::spawn::spawn_identity_error(other, cause),
                     child_fate,
                 ));
             }
@@ -707,7 +715,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
             #[cfg(target_os = "macos")]
             let child_fate = forgotten.unwrap_or(child_fate);
             return Err(SpawnFailure::started(
-                crate::child::spawn::spawn_identity_error(other),
+                crate::child::spawn::spawn_identity_error(other, cause),
                 child_fate,
             ));
         }
