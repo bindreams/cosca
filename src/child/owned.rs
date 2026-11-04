@@ -29,9 +29,7 @@
 
 use std::fmt;
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
-#[cfg(target_os = "linux")]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::error::Error;
 use crate::os_process::child::{ExitRecord, Foreign, OsChild, PeekOutcome};
@@ -39,6 +37,8 @@ use crate::signal::{Sent, Sig};
 
 #[path = "owned/holder.rs"]
 mod holder;
+#[path = "owned/teardown.rs"]
+pub(crate) mod teardown;
 #[path = "owned/waiting.rs"]
 mod waiting;
 
@@ -182,10 +182,37 @@ impl OwnedChild {
         self.os.os_handle()
     }
 
+    /// The root's pidfd where it has one (Linux; macOS names no process by a handle), for the checks
+    /// of a cgroup or a group that take it.
+    #[cfg(unix)]
+    pub(crate) fn pidfd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        #[cfg(target_os = "linux")]
+        return Some(self.os_handle());
+        #[cfg(not(target_os = "linux"))]
+        None
+    }
+
     /// Whether this handle's own wait has recorded the reap, read under the lock. A reap by
     /// someone else is not seen here.
     pub(crate) fn is_reaped(&self) -> bool {
         matches!(self.lock().state, State::E(_))
+    }
+
+    /// Whether the root is still this handle's child to act on, from the handle's own evidence; see
+    /// [`ReapHold::state`].
+    #[cfg(unix)]
+    pub(crate) fn state(&self) -> crate::signal::RootState {
+        self.state_locked(&self.lock())
+    }
+
+    /// [`state`](Self::state), under `lock`.
+    #[cfg(unix)]
+    fn state_locked(&self, lock: &Guard<'_>) -> crate::signal::RootState {
+        use crate::signal::RootState;
+        if matches!(lock.state, State::E(_)) {
+            return RootState::Reaped { own: true };
+        }
+        RootState::of_peek(self.os.peek().map_err(Error::into_io))
     }
 
     /// Whether this thread holds the lock. Tests only.
@@ -305,18 +332,18 @@ impl OwnedChild {
     /// non-tracer parent while `p_oppid` is set, `kern_event.c:1203-1210`). Reaps nothing: during a
     /// graceful tree shutdown the root stays an unreaped zombie until the group kill is done, so its
     /// pid names no one else (principle 4). Takes no lock, so it may run while another thread waits.
-    #[cfg(target_os = "linux")]
     pub(crate) fn exited_by(&self, deadline: Option<Instant>) -> Result<bool, Error> {
         crate::os_process::drive::exited_until(&*self.os, deadline)
     }
 
     /// Hold off this handle's reaps (every reap is taken under its lock) until the result drops:
-    /// what it reads and sends meanwhile is one step to a `wait` on another thread. Nothing that
-    /// locks the handle may be called while it is held.
+    /// what it reads and sends meanwhile is one step to a `wait` on another thread. Nothing that locks the
+    /// handle may be called while it is held.
     #[cfg(unix)]
-    pub(crate) fn hold(&self) -> ReapHold<'_> {
+    pub(crate) fn hold(&self, pid: u32) -> ReapHold<'_> {
         ReapHold {
             child: self,
+            pid,
             lock: self.lock(),
         }
     }
@@ -338,6 +365,7 @@ impl OwnedChild {
 #[cfg(unix)]
 pub(crate) struct ReapHold<'a> {
     child: &'a OwnedChild,
+    pid: u32,
     lock: Guard<'a>,
 }
 
@@ -356,16 +384,27 @@ impl ReapHold<'_> {
     /// A peek through the handle decides (Linux: the pidfd; macOS: the pid, checked against its
     /// unique id, with an unreadable id on a running child an error).
     pub(crate) fn state(&self) -> crate::signal::RootState {
-        use crate::signal::RootState;
-        if matches!(self.lock.state, State::E(_)) {
-            return RootState::Reaped { own: true };
-        }
-        RootState::of_peek(self.child.os.peek().map_err(Error::into_io))
+        self.child.state_locked(&self.lock)
     }
 
     /// [`OwnedChild::signal`], under this hold.
     pub(crate) fn signal(&self, sig: Sig) -> Result<Sent, Error> {
         self.child.signal_locked(&self.lock, sig)
+    }
+
+    /// The root's group, for a send by the root's pid: its check reads this hold's
+    /// [`state`](Self::state), so no reap of ours lands between a check and its send. On Linux the
+    /// root's pidfd names the group exactly; on macOS there is none.
+    pub(crate) fn group(&self) -> crate::containment::GroupRoot<'_> {
+        crate::containment::GroupRoot::new(self.child.pidfd(), self)
+    }
+}
+
+/// Whether the root's pid still names its group, from this hold's own evidence.
+#[cfg(unix)]
+impl crate::containment::RootCheck for ReapHold<'_> {
+    fn check(&self) -> Result<(), String> {
+        super::tree_call::group_number_holds(self.pid, self.state())
     }
 }
 

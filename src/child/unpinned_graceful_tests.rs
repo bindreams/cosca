@@ -13,7 +13,8 @@ use super::unpinned_public_tests::{
 };
 use crate::error::Error;
 use crate::os_process::child::{Foreign, PeekOutcome};
-use crate::send_log::Capture;
+use crate::send_log::{Capture, Via};
+use crate::signal::Sig;
 use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peeks, forced_peeks_left, Forced};
 
 /// A hook slot that holds a forced peek until the test is over, so the guard is not dropped (and the
@@ -61,7 +62,8 @@ fn graceful_shutdown_of_an_orphaned_root_sends_nothing() {
 
 /// A root that goes orphaned during the grace is not killed by the escalation. The child ignores
 /// `SIGTERM`, so the escalation is reached; the hook makes the next peek `Orphaned`. The refusal
-/// says the `SIGTERM` was sent. Once the root reads true the escalation kills it.
+/// says the `SIGTERM` was sent, and the `SIGTERM` is the only signal the root was sent. Once the
+/// root reads true the escalation kills it.
 ///
 /// Mutants: the escalation kills through the handle without reading the root's state; it says it
 /// sent nothing at all; the refusal never lets go.
@@ -69,6 +71,7 @@ fn graceful_shutdown_of_an_orphaned_root_sends_nothing() {
 fn graceful_shutdown_does_not_escalate_to_a_root_orphaned_during_the_grace() {
     crate::log_capture::install();
     let (child, writer) = crate::test_child::term_ignoring_blocker();
+    let pid = child.id().pid();
     let sends = Capture::start();
     let mark = crate::log_capture::mark();
     let (slot, set) = hold_forced();
@@ -88,8 +91,8 @@ fn graceful_shutdown_does_not_escalate_to_a_root_orphaned_during_the_grace() {
     );
     assert_eq!(
         sends.entries(),
-        vec![],
-        "the escalation must send nothing to a root we do not pin"
+        vec![(pid, Sig::Term, Via::Identity)],
+        "the escalation must send nothing to a root we do not pin: the terminate's SIGTERM is the only send"
     );
     assert_eq!(warns_since(mark), Vec::<String>::new());
     drop(hook);
@@ -110,6 +113,7 @@ fn graceful_shutdown_does_not_escalate_to_a_root_orphaned_during_the_grace() {
 fn graceful_shutdown_wait_that_sees_an_orphaned_root_is_quiet() {
     crate::log_capture::install();
     let (child, writer) = crate::test_child::term_ignoring_blocker();
+    let pid = child.id().pid();
     let sends = Capture::start();
     let mark = crate::log_capture::mark();
     // The terminate's read, the wait's own peek, the escalation's read.
@@ -125,7 +129,11 @@ fn graceful_shutdown_wait_that_sees_an_orphaned_root_is_quiet() {
 
     assert_peeks_exhausted();
     assert_refused(&err, "kill");
-    assert_eq!(sends.entries(), vec![], "nothing by pid");
+    assert_eq!(
+        sends.entries(),
+        vec![(pid, Sig::Term, Via::Identity)],
+        "only the terminate's SIGTERM went by pid"
+    );
     assert_eq!(warns_since(mark), Vec::<String>::new());
     drop(writer);
 }

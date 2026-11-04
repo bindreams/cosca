@@ -438,7 +438,7 @@ fn the_by_number_fallback_resends_only_after_a_check_of_the_root() {
         }
     });
     let id = ProcessId::of(child.pid()).found().expect("the live child resolves");
-    let resend = |check: &dyn Fn() -> Result<(), String>| {
+    let resend = |check: &dyn crate::containment::RootCheck| {
         let root = crate::containment::GroupRoot::new(None, check);
         let capture = Capture::start();
         let forced = crate::os_process::linux::open::fault::force_pidfd_open_errno_once(rustix::io::Errno::MFILE);

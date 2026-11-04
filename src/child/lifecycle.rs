@@ -1,11 +1,63 @@
 //! `Child` bounded waits. A submodule of `child` so it can reach `Child`'s private
 //! `proc` handle.
 
+use std::io;
 use std::process::ExitStatus;
 use std::time::{Duration, Instant};
 
+use super::owned::ChildWaitOutcome;
 use super::Child;
 use crate::error::Error;
+use crate::os_process::child::{ExitRecord, Foreign};
+
+/// Whether a wait that finds the child's zombie held by launchd (macOS) says so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Orphaned {
+    /// The wait reports it: the caller has nobody else to.
+    Warn,
+    /// The caller reports it itself, with the refusal it goes on to make, or has nothing to report.
+    Quiet,
+}
+
+/// A wait's `outcome` on the child `pid` as the status `Child` answers: `Some` for an exit
+/// (`Unreadable` is `InvalidData`), `None` for a deadline that passed.
+pub(super) fn status_of_outcome(
+    pid: u32,
+    outcome: ChildWaitOutcome,
+    orphaned: Orphaned,
+) -> Result<Option<ExitStatus>, Error> {
+    match outcome {
+        ChildWaitOutcome::Exited(ExitRecord::Status(status)) => Ok(Some(status)),
+        ChildWaitOutcome::Exited(ExitRecord::Unreadable { si_code }) => Err(Error::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("the child's exit record was unreadable (si_code {si_code})"),
+        ))),
+        ChildWaitOutcome::Foreign(foreign) => {
+            if foreign == Foreign::Orphaned && orphaned == Orphaned::Warn {
+                log::warn!("{}", orphaned_note(pid));
+            }
+            Err(Error::Io(echild()))
+        }
+        ChildWaitOutcome::DeadlinePassed => Ok(None),
+    }
+}
+
+/// What to say of a child whose zombie launchd holds.
+pub(super) fn orphaned_note(pid: u32) -> String {
+    format!("pid {pid}: not ours to reap (launchd holds its zombie, because its tracer died)")
+}
+
+/// The `ECHILD` every wait answers when the child was reaped by someone else.
+fn echild() -> io::Error {
+    #[cfg(unix)]
+    {
+        io::Error::from_raw_os_error(libc::ECHILD)
+    }
+    #[cfg(windows)]
+    {
+        io::Error::other("the child was already reaped elsewhere")
+    }
+}
 
 impl Child {
     /// Block up to `timeout` for the root process to exit. `Ok(Some(status))` =
@@ -16,28 +68,19 @@ impl Child {
     /// no waitable handle. A `timeout` so large it would overflow `Instant` is treated as
     /// unbounded (blocks until exit) rather than panicking.
     pub fn wait_timeout(&self, timeout: Duration) -> Result<Option<ExitStatus>, Error> {
-        self.wait_timeout_by(timeout, |deadline| match deadline {
-            Some(deadline) => self.wait_deadline(deadline),
-            None => self.wait().map(Some),
-        })
+        self.wait_timeout_by(timeout, Orphaned::Warn)
     }
 
     /// [`wait_timeout`](Child::wait_timeout) that does not report a zombie launchd holds (macOS):
     /// for a caller that reports it with its own refusal.
     #[cfg(unix)]
     pub(crate) fn wait_timeout_quiet(&self, timeout: Duration) -> Result<Option<ExitStatus>, Error> {
-        self.wait_timeout_by(timeout, |deadline| {
-            self.proc.wait_until_quiet(deadline).map_err(Error::Io)
-        })
+        self.wait_timeout_by(timeout, Orphaned::Quiet)
     }
 
-    fn wait_timeout_by(
-        &self,
-        timeout: Duration,
-        until: impl FnOnce(Option<Instant>) -> Result<Option<ExitStatus>, Error>,
-    ) -> Result<Option<ExitStatus>, Error> {
+    fn wait_timeout_by(&self, timeout: Duration, orphaned: Orphaned) -> Result<Option<ExitStatus>, Error> {
         // The sync lone path's watch goes through `OwnedChild::wait`, not
-        // `exited_by_id`, so it needs its own head of the shared watch fault seam.
+        // `exited_by`, so it needs its own head of the shared watch fault seam.
         #[cfg(test)]
         if crate::wait::fault::take_force_watch_error() {
             return Err(crate::wait::fault::forced_watch_error());
@@ -45,7 +88,7 @@ impl Child {
         // `Instant + Duration` panics on overflow (e.g. Duration::MAX). Convert to a deadline
         // with a saturating checked_add: on overflow the timeout is effectively infinite, so
         // block until exit.
-        until(crate::wait::now().checked_add(timeout))
+        self.wait_root(crate::wait::now().checked_add(timeout), orphaned)
     }
 
     /// Like [`wait_timeout`](Child::wait_timeout) but against an absolute `deadline`
@@ -54,7 +97,24 @@ impl Child {
     /// Never returns `None` before the clock reaches `deadline`: `OwnedChild` decides expiry
     /// from the clock after every wake, never from a primitive's own "timed out".
     pub fn wait_deadline(&self, deadline: Instant) -> Result<Option<ExitStatus>, Error> {
-        self.proc.wait_deadline(deadline).map_err(Error::Io)
+        self.wait_root(Some(deadline), Orphaned::Warn)
+    }
+
+    /// One wait on the root through its handle, until `deadline` (`None`: for ever). `Ok(None)` is
+    /// a deadline that passed with the root still running.
+    pub(super) fn wait_root(&self, deadline: Option<Instant>, orphaned: Orphaned) -> Result<Option<ExitStatus>, Error> {
+        status_of_outcome(self.id.pid(), self.proc.wait(deadline)?, orphaned)
+    }
+
+    /// Block until the root is reaped.
+    pub(super) fn wait_root_unbounded(&self) -> Result<ExitStatus, Error> {
+        match self.wait_root(None, Orphaned::Warn)? {
+            Some(status) => Ok(status),
+            None => {
+                debug_assert!(false, "an unbounded wait ended with no exit");
+                Err(Error::Io(io::Error::other("an unbounded wait ended with no exit")))
+            }
+        }
     }
 
     /// Block until every member of the contained tree has EXITED — not reaped; a status is
