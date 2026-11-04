@@ -75,7 +75,8 @@ fn blank() -> KEvent {
 /// Register `EVFILT_SIGNAL` for `SIGCHLD` and `EVFILT_PROC` for `pid`. `Ok(true)` when the
 /// `EVFILT_PROC` receipt says `ESRCH` (the child is already past `P_REF_DEAD`).
 fn register(kq: &Kqueue, pid: u32) -> io::Result<bool> {
-    kq.subscribe(Subscription::Signal(libc::SIGCHLD)).map_err(into_io)?;
+    kq.subscribe(Subscription::Signal(libc::SIGCHLD))
+        .map_err(crate::error::Error::into_io)?;
     #[cfg(test)]
     if test_hooks::take_forced_esrch_registration() {
         return Ok(true);
@@ -88,14 +89,7 @@ fn register(kq: &Kqueue, pid: u32) -> io::Result<bool> {
     match kq.subscribe(child) {
         Ok(()) => Ok(false),
         Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Ok(true),
-        Err(e) => Err(into_io(e)),
-    }
-}
-
-fn into_io(e: crate::error::Error) -> io::Error {
-    match e {
-        crate::error::Error::Io(e) => e,
-        other => io::Error::other(other),
+        Err(e) => Err(e.into_io()),
     }
 }
 
@@ -378,7 +372,7 @@ pub(crate) fn arm_backoff_timer(kq: &Kqueue, interval: Duration) -> io::Result<(
 
 /// [`await_reapable_on`] on a kqueue of its own.
 pub(crate) fn await_reapable(pid: u32, unique: Option<u64>, deadline: Option<Instant>) -> io::Result<Waited> {
-    let kq = Kqueue::new().map_err(into_io)?;
+    let kq = Kqueue::new().map_err(crate::error::Error::into_io)?;
     await_reapable_on(&kq, pid, unique, deadline)
 }
 
