@@ -934,9 +934,10 @@ impl Child {
     /// are returned after the child has been waited for.
     ///
     /// On Unix the streams are served by one `poll` loop on the calling thread, so no thread is
-    /// started after the child is. On Windows each stream has a thread of its own. As with
-    /// [`std::process::Command::output`], a grandchild that inherits a pipe and holds it open keeps
-    /// `communicate` waiting, whether or not the child has exited.
+    /// started after the child is. On Windows each stream has a thread of its own, and a thread
+    /// that cannot be created panics, until the Windows half of #869 (overlapped pipes, #143)
+    /// removes them. As with [`std::process::Command::output`], a grandchild that inherits a pipe
+    /// and holds it open keeps `communicate` waiting, whether or not the child has exited.
     pub fn communicate(&mut self, input: Option<&[u8]>) -> Result<crate::Output, Error> {
         #[cfg(test)]
         if let Some(error) = crate::child::spawn::failure::seams::take_pump_failure() {
