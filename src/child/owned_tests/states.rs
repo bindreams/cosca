@@ -143,6 +143,21 @@ fn a_look_reaps_an_exited_child_once() {
     assert!(child.is_reaped());
 }
 
+/// A look that finds the child running records nothing: the child is reaped only once a look takes
+/// its record.
+///
+/// Mutant: `is_reaped` reads the OS, or a look that found the child running records a reap.
+#[skuld::test]
+fn is_reaped_only_once_the_record_is_taken() {
+    let fake = FakeProcess::new([]).reaps([ReapAnswer::Running, ReapAnswer::Reaped(exit())]);
+    let child = OwnedChild::new(Box::new(fake.clone()));
+    assert!(!child.is_reaped());
+    assert_eq!(try_wait(&child).expect("try_wait"), ChildWaitOutcome::DeadlinePassed);
+    assert!(!child.is_reaped(), "a look that found the child running is not a reap");
+    status(try_wait(&child));
+    assert!(child.is_reaped());
+}
+
 /// A reap error is returned as it is, and the state stays `N`.
 ///
 /// Mutant: an error taken for the foreign path, or the state left in `W`.

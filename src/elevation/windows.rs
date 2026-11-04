@@ -224,9 +224,9 @@ use windows::Win32::UI::Shell::{
     ShellExecuteExW, SEE_MASK_CLASSNAME, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
 };
 
+use crate::child::owned::OwnedChild;
 use crate::child::proc_handle::ProcHandle;
 use crate::child::spawn::windows_raw::resolve::ensure_no_nul_wide;
-use crate::child::spawn::windows_raw::RawChild;
 use crate::child::spawn::{Classify, SpawnFailure};
 use crate::containment::Attachment;
 use crate::elevation::plan::Transition;
@@ -236,6 +236,7 @@ use crate::error::ChildFate;
 use crate::error::ElevationErrorKind;
 use crate::identity::ProcessId;
 use crate::identity::{windows_terminate_held, Termination};
+use crate::os_process::windows::WindowsProcess;
 
 /// The failure of `ShellExecuteExW(runas)` with error `code` and `hInstApp` `inst_app`: see
 /// [`super::runas_failure::classify`]. A launch that may have happened left no process handle, so
@@ -602,7 +603,7 @@ pub(crate) fn spawn_elevated(cmd: &mut Command, kill_on_drop: bool) -> Result<cr
         }
         RunasOutcome::Launched { proc, pid, id, report } => {
             let mut child = crate::child::Child::from_parts(
-                ProcHandle::Raw(RawChild::new(proc, pid)),
+                ProcHandle::std(OwnedChild::new(Box::new(WindowsProcess::for_child(proc, pid))), pid),
                 id,
                 BTreeMap::new(),
                 kill_on_drop,

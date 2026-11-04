@@ -229,31 +229,10 @@ fn assert_consecutive_frozen_waits_never_early(child: &crate::Child) {
     assert!(Instant::now() >= second, "the second wait returned before its deadline");
 }
 
-/// Mutant (Windows): a second clock advance around the `Raw` backend's own `wait_until`.
+/// Mutant (Windows): a second clock advance around `drive::block`'s own `wait_until`.
 #[skuld::test]
 fn std_child_consecutive_frozen_waits_never_return_early() {
     let (child, _stdin) = spawn_never_exiting();
-    assert_consecutive_frozen_waits_never_early(&child);
-}
-
-/// Mutant: wrap `RawChild::wait_deadline` in the recheck helper, which advances the frozen clock a
-/// second time.
-#[cfg(windows)]
-#[skuld::test]
-fn raw_child_consecutive_frozen_waits_never_return_early() {
-    let mut cmd = crate::Command::new();
-    let findstr = std::path::Path::new(&std::env::var_os("SystemRoot").expect("SystemRoot"))
-        .join("System32")
-        .join("findstr.exe");
-    cmd.executable(findstr).args(["findstr", "x"]);
-    cmd.stdin(crate::Stdio::pipe_in()).expect("configure piped stdin");
-    cmd.stdout(crate::Stdio::null()).expect("configure null stdout");
-    let mut child = cmd.spawn().expect("spawn");
-    let _stdin = child.stdin().expect("piped stdin");
-    assert!(
-        matches!(child.proc, crate::child::proc_handle::ProcHandle::Raw(_)),
-        "an explicit executable() must route to the raw backend"
-    );
     assert_consecutive_frozen_waits_never_early(&child);
 }
 
