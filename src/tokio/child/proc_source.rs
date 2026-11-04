@@ -1392,11 +1392,10 @@ impl ProcSource {
     pub(crate) fn leave_front(
         self,
         pid: u32,
-        front: crate::elevation::front::Front,
         id: Option<ProcessId>,
         subtree: Option<&crate::containment::cgroup::Subtree>,
     ) -> (crate::child::spawn::FrontFate, ChildFate) {
-        self.leave_front_noting(pid, front, id, subtree, &mut Diagnosis::default())
+        self.leave_front_noting(pid, id, subtree, &mut Diagnosis::default())
     }
 
     /// [`leave_front`](ProcSource::leave_front) for a spawn whose identity check found `why`: the
@@ -1405,7 +1404,6 @@ impl ProcSource {
     pub(crate) fn leave_front_noting(
         mut self,
         pid: u32,
-        front: crate::elevation::front::Front,
         id: Option<ProcessId>,
         subtree: Option<&crate::containment::cgroup::Subtree>,
         why: &mut Diagnosis,
@@ -1440,7 +1438,6 @@ impl ProcSource {
         crate::child::spawn::leave_front_through_pidfd_noting(
             Some(pid),
             pidfd,
-            front,
             id,
             super::slow_teardown_after(),
             subtree,
