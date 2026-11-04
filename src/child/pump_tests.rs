@@ -1,3 +1,5 @@
+#[cfg(target_os = "linux")]
+use crate::test_groups::{unprivileged, Group};
 use crate::{Command, Stdio};
 
 /// `/bin/sh -c script`, with all three standard streams piped.
@@ -61,7 +63,7 @@ fn no_input_closes_stdin() {
 /// Mutant: stdin, stdout or stderr is drained on a thread of its own.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn communicate_starts_no_thread() {
+fn communicate_starts_no_thread(#[fixture(unprivileged)] _group: &Group) {
     crate::test_child::run_fixture(crate::test_child::fixture_path!(
         fixture_communicate_under_a_nproc_limit
     ));
@@ -87,7 +89,8 @@ fn fixture_communicate_under_a_nproc_limit() {
     assert!(
         refused.is_err(),
         "the precondition: RLIMIT_NPROC=0 must refuse a new thread; it does not bind uid 0 or \
-         CAP_SYS_RESOURCE/CAP_SYS_ADMIN holders, so run this suite as an unprivileged user"
+         CAP_SYS_RESOURCE/CAP_SYS_ADMIN holders, so run as an unprivileged user, or set \
+         COSCA_TEST_UNPRIVILEGED=0 to opt out"
     );
     let input = vec![b'x'; 1 << 20];
     let out = child.communicate(Some(&input)).expect("communicate");
