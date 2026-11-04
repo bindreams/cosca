@@ -32,7 +32,7 @@ pub(crate) fn waitid_record(fd: BorrowedFd<'_>, options: WaitIdOptions) -> Resul
     }
 }
 
-/// [`super::peek`] without the test hook: the one `LinuxProcess` looks through.
+/// One non-blocking `waitid` look at the target; the test hook is not consulted.
 pub(crate) fn peek(target: &Target<'_>) -> io::Result<PeekOutcome> {
     let fd = pidfd(target);
     match waitid_record(

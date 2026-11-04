@@ -127,7 +127,6 @@ fn finish_elevated_leaves_the_handle_armed_when_the_root_kill_was_refused() {
     let (mut child, writer) = bare_blocker();
     let teardowns = crate::child::owned::seams::record_root_teardowns();
     let mark = crate::log_capture::mark();
-    // The cleanup's kill, then the drop's retry.
     let fake = child.proc.script_over(|f| f.signals([refused(), refused()]));
 
     let err = crate::child::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
@@ -156,8 +155,6 @@ fn a_retry_that_fails_anew_warns_of_the_new_failure() {
     let teardowns = crate::child::owned::seams::record_root_teardowns();
     let mark = crate::log_capture::mark();
     let err_peek = || Err(std::io::Error::other("forced peek failure"));
-    // The cleanup's read, then the drop's.
-    // The cleanup's kill is refused, and so is the drop's retry.
     let fake = child
         .proc
         .script_over(|f| f.peeks([err_peek(), err_peek()]).signals([refused(), refused()]));
@@ -194,8 +191,6 @@ fn a_retry_that_only_repeats_the_cleanups_warn_is_debug() {
     let teardowns = crate::child::owned::seams::record_root_teardowns();
     let mark = crate::log_capture::mark();
     let err_peek = || Err(std::io::Error::other("forced peek failure"));
-    // The cleanup's read, then the drop's.
-    // Only the cleanup's own kill is refused, so the drop's retry lands.
     let fake = child
         .proc
         .script_over(|f| f.peeks([err_peek(), err_peek()]).signals([refused()]));

@@ -1653,8 +1653,7 @@ pub(crate) fn cwd_and_path_tools() -> (tempfile::TempDir, tempfile::TempDir) {
 mod test_child_tests;
 
 /// Whether the process `id` names has exited by `timeout` (`None`: for ever), found through a fresh
-/// open: a process that is gone, or whose pid now names another, has exited. Reaps nothing. For
-/// tests of what an open makes of an id; an owned child is looked at through its own handle.
+/// open; a gone id has exited. Reaps nothing.
 #[cfg(any(target_os = "linux", windows))]
 pub(crate) fn exited_through_open(
     id: crate::identity::ProcessId,

@@ -146,7 +146,6 @@ fn tracee_with_unique() -> (crate::Child, std::io::PipeWriter, u64) {
 /// A real tracer that attaches while the wait is blocked: the attach's `SIGSTOP` wakes the wait
 /// through the child's `NOTE_SIGNAL`, before anything else happens to the child. The wait then
 /// watches the tracer; the child's exit and the tracer's hand-back end it with the child's status.
-/// The wait is an `OwnedChild`'s over a second `MacChild` of the tracee, which reaps it.
 ///
 /// Mutant: the wait registers no `NOTE_SIGNAL` on the child.
 #[skuld::test]
@@ -190,8 +189,7 @@ fn a_tracer_that_attaches_during_a_wait_wakes_it(#[fixture(tracer_group)] _group
 /// A child whose real tracer is itself traced by a second one: the wait walks the chain and
 /// registers the second tracer too, whose signals then wake it. A `SIGCONT` to the second tracer,
 /// which leaves a running process running, shows the registration. The child's exit and its
-/// tracer's hand-back end the wait with the child's status. The wait is an `OwnedChild`'s over a
-/// second `MacChild` of the tracee, which reaps it.
+/// tracer's hand-back end the wait with the child's status.
 ///
 /// Mutant: the walk stops at the child's tracer.
 #[skuld::test]

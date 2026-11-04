@@ -63,13 +63,15 @@ Each one gets the same treatment before any code:
 In order:
 
 1. **Processes:** the stack above, in place for the sync `Child`: it reaches its process through one
-   `OwnedChild` over a per-OS `OsChild`, and every blocking wait of the sync `Child` runs through `drive::run`.
+   `OwnedChild` over a per-OS `OsChild`, and the holder's waits for the root process (its `try_reap`
+   loop and `exited_by`) run through `drive::run`. A waiter that is not the holder blocks on the
+   handle's `Condvar`, and the waits for the tree to drain (`wait_tree`, the graceful drains) in
+   `Attached::wait_drained`.
    [#839](https://github.com/bindreams/cosca/issues/839) records the owner decisions and the PR
    plan. What is still the old shape, and which step takes it:
    - The async `Child` (the PR that moves it onto the stack): `terminate_by_id`, which its
-     graceful path sends through; `GroupRoot::new` with no `ReapHold` at its six sites
-     (`tokio/child.rs` five, `tokio/child/graceful.rs` one); its tests' hooks, `exit_only::seams`
-     and `signal::seams`, which `Process::kill`'s tests share.
+     graceful path sends through; `GroupRoot::new` with no `ReapHold`; its tests' hooks,
+     `exit_only::seams` and `signal::seams`, which `Process::kill`'s tests share.
    - Spawn (the spawn-time slice): `exit_only::Target` and `exit_only::Reap`, which spawn
      identity, `kill_and_reap_*`, `unique_report` and `PidfdChild` still take by handle or number;
      `await_reapable` and its kqueue round hooks (macOS), which spawn teardown still waits
@@ -77,13 +79,9 @@ In order:
      leaf's abandonment (`leaf.rs`); the `exit_only::seams` their tests use.
    - Under `MacChild` ([#877](https://github.com/bindreams/cosca/issues/877), the macOS
      kernel-view slice): `exit_only::{peek, peek_verified, peek_traced}` still consult the
-     `exit_only::seams` hook. Five macOS tests stage a look inside `MacChild`'s own call (a peek that
-     finds no record after the look saw one, a drain of `NOTE_EXIT` before the record is visible, an
-     `ESRCH` registration), where no fake can answer without a hook. That slice puts the macOS
-     kernel reads behind one boundary and removes these hooks and the others of their family:
-     `waitid`, `uniq_fault`, `ppid_fault`, `kinfo::fault` and the kqueue registration hook. It also
-     removes `MacChild::event_pending`, a `cfg(test)` accessor. `LinuxProcess` no longer consults the
-     hook: it looks through `exit_only::linux::peek`, and no Linux test forces a look through it.
+     `exit_only::seams` hook; five macOS tests need it, and `MacChild::event_pending` (a `cfg(test)`
+     accessor) goes with it. `LinuxProcess` no longer does. That slice also removes
+     `block_probe::on_round` and `on_every_round`, the `cfg(test)` round hooks of `wait.rs`.
 2. **Elevation backends:** a black box that says what the tracked process is (the program, or a
    wrapper that outlives it) and what may be signalled. `Child` asks it; it stops knowing sudo,
    doas or osascript.

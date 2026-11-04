@@ -6,6 +6,9 @@
 //! number (`killpg`, the walk from its pid, its kill by pid) runs; an fd marker still signals its
 //! holders. Each case forces the state with a peek, and a positive control then signals the same
 //! child once its state reads true, so a refusal that never lets go fails too.
+//!
+//! A test that counts the peeks left empties the table with `fake.peeks([])` before it ends: the
+//! answer left over must not reach the drop.
 
 use std::io::{BufRead as _, BufReader};
 use std::time::Duration;
@@ -560,7 +563,6 @@ fn terminate_tree_decides_on_one_look_at_the_root() {
     child.terminate_tree().expect("a running root's group is signalled");
 
     assert_eq!(fake.peeks_left(), 1, "the decision looked at the root twice");
-    // The answer left over must not reach the drop.
     drop(fake.peeks([]));
     assert_eq!(groups.termed(), vec![pid as i32]);
     drop(writer);
@@ -586,7 +588,6 @@ fn kill_tree_decides_on_one_look_at_the_root() {
     child.kill_tree().expect("a running root's group is killed");
 
     assert_eq!(fake.peeks_left(), 1, "the decision looked at the root twice");
-    // The answer left over must not reach the drop.
     drop(fake.peeks([]));
     assert_eq!(groups.killed(), vec![pid as i32]);
     drop(writer);
@@ -676,7 +677,6 @@ fn an_uncontained_child_hears_why_it_has_no_tree_not_why_its_root_is_unpinned() 
         );
     }
     assert_eq!(fake.peeks_left(), 1, "the root's state was read");
-    // The answer left over must not reach the drop.
     drop(fake.peeks([]));
     drop(writer);
 }
@@ -733,7 +733,6 @@ fn a_closed_front_gate_outranks_an_unpinned_root() {
             1,
             "{op}: the root's state was read before the gate, or the gate was not"
         );
-        // The answer left over must not reach the drop.
         drop(fake.peeks([]));
         drop(writer);
     }

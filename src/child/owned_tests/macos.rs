@@ -275,7 +275,7 @@ impl OsChild for SharedMac {
 }
 
 /// The child `pid`, whose unique id is `unique`, watched through a fresh [`MacChild`]: an
-/// `OwnedChild` over it, and the handle the round hooks read.
+/// `OwnedChild` over it, which reaps the child, and the handle the round hooks read.
 pub(super) fn watch(pid: u32, unique: u64) -> (OwnedChild, Arc<MacChild>) {
     let mac = Arc::new(MacChild::new(pid, unique).expect("watch the child"));
     (OwnedChild::new(Box::new(SharedMac(Arc::clone(&mac)))), mac)

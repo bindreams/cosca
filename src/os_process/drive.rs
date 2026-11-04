@@ -23,9 +23,7 @@ fn enter() -> Result<(), Error> {
 /// Block until the open process `p` has exited or `timeout` has passed, and say which: `Ok(true)` =
 /// exited, `Ok(false)` = still running after the deadline's final look. `None` = until exit;
 /// `Some(ZERO)` = one look, no blocking call; a `Duration` too large for the clock is unbounded.
-/// Non-reaping. The bounded-section assert and the watch-fault seam come before the first look, and
-/// the deadline is fixed there, so every blocking call is armed from the time remaining, read right
-/// before it.
+/// Non-reaping. Every blocking call is armed from the time remaining at that call.
 pub(crate) fn exited_held(p: &dyn OsProcess, timeout: Option<Duration>) -> Result<bool, Error> {
     exited_until(p, absolute(timeout))
 }
