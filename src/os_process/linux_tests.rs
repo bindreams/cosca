@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use crate::identity::ProcessId;
-use crate::os_process::drive::{absolute, drive};
+use crate::os_process::drive::exited_held;
 use crate::os_process::{kill, open, terminate, terminate_by_id, Exit};
 use crate::signal::{Sent, Sig};
 use crate::test_child::{held_contained_blocker_without_cgroup, wait_until_zombie};
@@ -18,9 +18,9 @@ fn one_open_serves_look_signal_and_wait() {
     let (child, _stdin, id) = blocker();
     let p = open(id).unwrap().expect("a live process opens");
     assert!(matches!(p.exited().unwrap(), Exit::Running(_)));
-    assert!(!drive(&*p, absolute(Some(Duration::ZERO))).unwrap());
+    assert!(!exited_held(&*p, Some(Duration::ZERO)).unwrap());
     assert_eq!(p.signal(Sig::Kill).unwrap(), Sent::Delivered);
-    assert!(drive(&*p, absolute(None)).unwrap());
+    assert!(exited_held(&*p, None).unwrap());
     child.wait().unwrap();
 }
 
@@ -39,7 +39,7 @@ fn open_with_wrong_start_token_is_none_and_sends_nothing() {
     assert!(open(other).unwrap().is_none());
     // Still running: the right identity opens and sees no exit.
     let p = open(id).unwrap().expect("the blocker is alive");
-    assert!(!drive(&*p, absolute(Some(Duration::ZERO))).unwrap());
+    assert!(!exited_held(&*p, Some(Duration::ZERO)).unwrap());
     child.kill().unwrap();
     child.wait().unwrap();
 }
@@ -50,7 +50,7 @@ fn exited_before_first_look_returns_true() {
     let p = open(id).unwrap().expect("a live process opens");
     child.kill().unwrap();
     wait_until_zombie(id.pid());
-    assert!(drive(&*p, absolute(Some(Duration::ZERO))).unwrap());
+    assert!(exited_held(&*p, Some(Duration::ZERO)).unwrap());
     child.wait().unwrap();
 }
 
@@ -63,7 +63,7 @@ fn signal_after_exit_is_gone() {
     child.wait().unwrap();
     assert_eq!(p.signal(Sig::Kill).unwrap(), Sent::Gone);
     // A reaped process reads as exited, too (POLLHUP).
-    assert!(drive(&*p, absolute(Some(Duration::ZERO))).unwrap());
+    assert!(exited_held(&*p, Some(Duration::ZERO)).unwrap());
 }
 
 /// Mutant: a look hands out some other fd to wait on. The kernel names a pidfd's process in its
@@ -130,7 +130,7 @@ fn terminate_by_id_on_a_gone_process_is_ok() {
     let other = ProcessId::from_parts_for_test(id.pid(), id.start_token_raw() + 1);
     terminate_by_id(other).unwrap();
     let p = open(id).unwrap().expect("the blocker is alive");
-    assert!(!drive(&*p, absolute(Some(Duration::ZERO))).unwrap());
+    assert!(!exited_held(&*p, Some(Duration::ZERO)).unwrap());
     child.kill().unwrap();
     child.wait().unwrap();
     terminate_by_id(id).unwrap();
