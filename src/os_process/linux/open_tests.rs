@@ -337,11 +337,9 @@ fn a_panic_before_release_still_tears_down_l_and_m() {
     // probe to be readable without blocking.
     let probe = probe.into_inner().expect("the probe pidfd was opened before the panic");
     let mut fds = [rustix::event::PollFd::new(&probe, rustix::event::PollFlags::IN)];
-    rustix::event::poll(&mut fds, None).expect("wait for M's exit");
-    let zero = rustix::event::Timespec { tv_sec: 0, tv_nsec: 0 };
-    let ready = rustix::event::poll(&mut fds, Some(&zero)).expect("poll the probe pidfd");
-    assert_eq!(
-        ready, 1,
+    crate::wait::poll_ready(&mut fds).expect("wait for M's exit");
+    assert!(
+        crate::wait::any_ready_now(&mut fds).expect("poll the probe pidfd"),
         "M must have exited once the panicking fixture unwound and dropped"
     );
     assert!(fds[0].revents().contains(rustix::event::PollFlags::IN));

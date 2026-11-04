@@ -14,7 +14,7 @@
 //! fork+exec — reusing it serializes against every cosca-originated spawn in this binary, not
 //! just the ones in this file.
 
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::time::{Duration, Instant};
 
 use super::{arm, block_until_drained, drain_kqueue, probe, DrainOutcome};
@@ -518,16 +518,9 @@ fn note_lowat_suppresses_a_wakeup_for_bytes_under_the_clamp() {
         .expect("the child wrote to fd 3 before this returns");
 
     let kq = super::arm(marker.as_fd(), false).expect("arm");
-    let mut pfd = libc::pollfd {
-        fd: kq.as_fd().as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // SAFETY: `pfd` is a single, correctly-initialized `pollfd`; `poll` writes only within its
-    // bounds, and the `1` count matches the slice length passed.
-    let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
-    assert_eq!(
-        rc, 0,
+    let mut fds = [rustix::event::PollFd::new(&kq, rustix::event::PollFlags::IN)];
+    assert!(
+        !crate::wait::any_ready_now(&mut fds).expect("poll the kqueue"),
         "NOTE_LOWAT must suppress a wakeup for bytes under the clamp, but the kqueue reports ready"
     );
     drop(stdin);
