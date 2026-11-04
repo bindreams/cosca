@@ -14,6 +14,7 @@ use crate::command::Command;
 use crate::elevation::{Backend, ElevatedStdio, ElevatedVia, ElevationReport};
 use crate::error::{ElevationErrorKind, Error};
 use crate::os_process::fake::failed_signal;
+use crate::signal::Sig;
 use crate::{ContainMode, Containment, Stdio};
 
 pub(crate) fn report(via: ElevatedVia) -> Option<ElevationReport> {
@@ -80,8 +81,9 @@ fn kill_of_an_exited_front_is_ok() {
     let (mut child, stdin) = spawn_as(cat(), ElevatedVia::Wrapped(Backend::Sudo));
     drop(stdin);
     crate::test_child::wait_until_zombie(child.id().pid());
-    child.proc.script_over(|f| f.signals([failed_signal(libc::EPERM)]));
+    let fake = child.proc.script_over(|f| f.signals([failed_signal(libc::EPERM)]));
     child.kill().expect("an exited front is killed like any child");
+    assert_eq!(fake.signal_calls(), [Sig::Kill], "the refusal was the kill's");
     assert!(child.wait().expect("wait").success());
 }
 
@@ -99,17 +101,20 @@ fn kill_of_an_exited_front_returns_any_other_failure() {
     assert!(child.wait().expect("wait").success());
 }
 
-/// An exited front's tree is killed as any child's.
+/// An exited front's tree is killed as any child's. An exited front needs no backstop, so the
+/// root's own signal, which would be refused, is not sent.
 #[skuld::test]
 fn kill_tree_of_an_exited_front_is_ok() {
     let mut cmd = cat();
     cmd.contain_with(ContainMode::Session);
-    let (child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
+    let (mut child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
     drop(stdin);
     crate::test_child::wait_until_zombie(child.id().pid());
+    let fake = child.proc.script_over(|f| f);
     child
         .kill_tree()
         .expect("an exited front's tree is killed like any child's");
+    assert_eq!(fake.signal_calls(), Vec::<Sig>::new(), "the root was signalled");
     assert!(child.wait().expect("wait").success());
 }
 
@@ -254,10 +259,10 @@ fn graceful_shutdown_of_a_front_that_exits_before_its_escalation() {
             .expect("read `ready`");
         let pid = child.id().pid();
         let fake = child.proc.script_over(|f| f);
+        let sent = fake.clone();
         let _hook = at(HookPoint::BeforeEscalation, move || {
             drop(stdin);
             crate::test_child::wait_until_zombie(pid);
-            // The escalation's kill is the next signal.
             drop(fake.signals([failed_signal(errno)]));
         });
         let result = child.graceful_shutdown(Duration::ZERO);
@@ -270,6 +275,11 @@ fn graceful_shutdown_of_a_front_that_exits_before_its_escalation() {
             }
             assert!(child.wait().expect("wait").success());
         }
+        assert_eq!(
+            sent.signal_calls(),
+            [Sig::Term, Sig::Kill],
+            "the refusal was the escalation's kill"
+        );
     }
 }
 
@@ -354,7 +364,6 @@ fn drop_of_a_live_front_leaves_it_running_unreaped_and_warns() {
         "{warns:?}"
     );
 
-    // Still this process's unreaped child: end it and reap it here.
     drop(stdin);
     assert_reaped_unsignalled(pid);
 }
@@ -411,7 +420,6 @@ fn a_failed_password_write_signals_neither_a_live_front_nor_its_group() {
     };
     assert!(detail.contains("could not be terminated"), "{detail}");
     assert!(detail.contains(&format!("pid {pid} is what sudo left")), "{detail}");
-    // The handle was dropped with the front alive and unreaped.
     drop(stdin);
     assert_reaped_unsignalled(pid);
 }
@@ -473,7 +481,7 @@ fn a_failed_password_write_to_a_front_that_had_exited_says_so() {
     let (mut child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
     drop(stdin);
     crate::test_child::wait_until_zombie(child.id().pid());
-    child.proc.script_over(|f| f.signals([failed_signal(libc::EPERM)]));
+    let fake = child.proc.script_over(|f| f.signals([failed_signal(libc::EPERM)]));
     let gates = crate::elevation::front::seams::count_kill_gates();
     let (err, fate) = crate::child::spawn::finish_elevated(
         child,
@@ -490,6 +498,7 @@ fn a_failed_password_write_to_a_front_that_had_exited_says_so() {
         "the non-blocking look reaps the exited front"
     );
     assert_eq!(gates.count(), 1, "{err}");
+    assert_eq!(fake.signal_calls(), [Sig::Kill], "the refusal was the kill's");
     let Error::Elevation { detail, .. } = &err else {
         panic!("expected an Elevation error, got {err:?}");
     };
@@ -507,7 +516,7 @@ fn a_failed_password_write_whose_exited_front_cannot_be_reaped_says_it_had_exite
     let (mut child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
     drop(stdin);
     crate::test_child::wait_until_zombie(child.id().pid());
-    child.proc.script_over(|f| f.signals([failed_signal(libc::EPERM)]));
+    let fake = child.proc.script_over(|f| f.signals([failed_signal(libc::EPERM)]));
     crate::child::spawn::fault::set_force_reap_failure("forced reap failure");
     let (err, fate) = crate::child::spawn::finish_elevated(
         child,
@@ -519,6 +528,7 @@ fn a_failed_password_write_whose_exited_front_cannot_be_reaped_says_it_had_exite
     .expect_err("a failed write fails the spawn")
     .expect_may_have_started_with();
     assert_eq!(fate, crate::error::ChildFate::Killed, "the exit was not collected");
+    assert_eq!(fake.signal_calls(), [Sig::Kill], "the refusal was the kill's");
     let Error::Elevation { detail, .. } = &err else {
         panic!("expected an Elevation error, got {err:?}");
     };
@@ -685,7 +695,7 @@ fn graceful_shutdown_of_a_child_that_is_not_a_front_keeps_its_io_refusal() {
     }
     assert_eq!(
         fake.signal_calls(),
-        [crate::signal::Sig::Term, crate::signal::Sig::Kill],
+        [Sig::Term, Sig::Kill],
         "the escalation was reached"
     );
     assert_ends_unsignalled(&child, stdin);
