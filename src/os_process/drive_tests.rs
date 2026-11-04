@@ -599,18 +599,13 @@ fn run_arms_a_deadline_beyond_the_block_limit_in_pieces() {
 #[cfg(windows)]
 #[skuld::test]
 fn a_failed_block_on_a_process_handle_is_a_contract_breach() {
-    use std::os::windows::io::{AsRawHandle, BorrowedHandle};
+    use std::os::windows::io::AsHandle as _;
 
     use crate::os_process::WaitFor;
 
-    let file = std::fs::File::open("NUL").expect("open NUL");
-    let raw = file.as_raw_handle();
-    drop(file);
-    // SAFETY: the handle is closed, which is the point: the wait on it fails. Nothing else in
-    // this process opens a handle between the close and the call.
-    let closed = unsafe { BorrowedHandle::borrow_raw(raw) };
+    let unwaitable = crate::test_child::unwaitable::unwaitable_handle();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        super::block(&WaitFor::Signalled(closed), None)
+        super::block(&WaitFor::Signalled(unwaitable.as_handle()), None)
     }));
     if cfg!(debug_assertions) {
         assert!(outcome.is_err(), "a debug build asserts the contract");

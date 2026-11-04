@@ -11,6 +11,9 @@ pub(crate) mod pid_reuse;
 #[cfg(windows)]
 pub(crate) mod ctrl_break;
 
+#[cfg(windows)]
+pub(crate) mod unwaitable;
+
 #[cfg(unix)]
 pub(crate) mod blocked_tree_root;
 
