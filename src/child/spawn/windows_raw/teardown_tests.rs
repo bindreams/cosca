@@ -14,10 +14,11 @@ use windows::Win32::System::Threading::{
 
 use super::proc::create_process;
 use super::teardown_spawned;
-use crate::child::owned::OwnedChild;
+use crate::child::owned::{ChildWaitOutcome, OwnedChild};
 use crate::child::proc_handle::ProcHandle;
 use crate::error::ChildFate;
 use crate::identity::ProcessId;
+use crate::os_process::child::ExitRecord;
 use crate::os_process::fake::{FakeProcess, ReapAnswer};
 use crate::os_process::windows::WindowsProcess;
 
@@ -279,7 +280,10 @@ fn teardown_on_drop_returns_promptly() {
     assert_eq!(torn.fate, ChildFate::Reaped, "{torn:?}");
     assert!(torn.left.is_none(), "{torn:?}");
     assert!(handle.is_reaped(), "teardown must wait for the exit it started");
-    let status = handle.wait().expect("wait after teardown");
+    let outcome = handle.wait(None).expect("wait after teardown");
+    let ChildWaitOutcome::Exited(ExitRecord::Status(status)) = outcome else {
+        panic!("the reaped child answers its status: {outcome:?}");
+    };
     assert_eq!(
         status.code(),
         Some(1),
@@ -312,7 +316,10 @@ fn teardown_on_drop_never_blocks_on_a_handle_without_terminate() {
     );
     assert_eq!(fake.looks(), 1, "teardown looked once and did not wait");
     assert!(
-        handle.try_wait().expect("try_wait").is_none(),
+        matches!(
+            handle.wait(Some(crate::wait::now())),
+            Ok(ChildWaitOutcome::DeadlinePassed)
+        ),
         "nothing ended the child"
     );
 }
