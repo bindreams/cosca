@@ -20,9 +20,8 @@ pub(crate) fn is_readable(fd: BorrowedFd<'_>) -> std::io::Result<bool> {
     }
 }
 
-/// The longest timeout one `poll` is armed with: `i32::MAX` ms (~24.8 days). `poll(2)` takes its
-/// timeout as an `int` of milliseconds, and where there is no `ppoll` (macOS) rustix turns a longer
-/// `Timespec` into `EINVAL` before the call. The caller loops until its deadline.
+/// `poll(2)` takes its timeout as an `int` of milliseconds; where there is no `ppoll` (macOS) rustix
+/// turns a longer `Timespec` into `EINVAL` before the call.
 const MAX_POLL_BLOCK: Duration = Duration::from_millis(i32::MAX as u64);
 
 /// Polls `fd` until it is readable or `deadline` passes, and says which. `None` is unbounded. Reads
@@ -30,7 +29,6 @@ const MAX_POLL_BLOCK: Duration = Duration::from_millis(i32::MAX as u64);
 /// it.
 pub(crate) fn poll_readable(fd: BorrowedFd<'_>, deadline: Option<Instant>) -> std::io::Result<bool> {
     let seen = crate::wait::rearm_until(deadline, |remaining| {
-        // Capped to what `poll` takes; the round is re-armed against the real deadline.
         let remaining = remaining.map(|d| d.min(MAX_POLL_BLOCK));
         #[cfg(test)]
         crate::wait::block_probe::record(remaining);
