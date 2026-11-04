@@ -1,8 +1,6 @@
 //! The `CreateProcessW`/wait FFI primitives of the raw backend. [`create_process`] is the sole
 //! `CreateProcessW` call site, shared with the async backend, which also reuses
-//! [`wait_handle_or_cancel`], a cancellable process wait. The sync raw child is an
-//! [`OwnedChild`](crate::child::owned::OwnedChild) over a
-//! [`WindowsProcess`](crate::os_process::windows::WindowsProcess).
+//! [`wait_handle_or_cancel`], a cancellable process wait.
 
 use std::io;
 use std::os::windows::io::{FromRawHandle, OwnedHandle};

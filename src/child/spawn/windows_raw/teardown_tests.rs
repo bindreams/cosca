@@ -23,9 +23,8 @@ use crate::os_process::windows::WindowsProcess;
 
 const KIND: std::io::ErrorKind = std::io::ErrorKind::Other;
 
-/// A `CREATE_SUSPENDED` process: its thread never runs, so it never exits on its own. It is killed
-/// and reaped when dropped, a panicking unwind included, through `TerminateProcess` directly: some
-/// tests are about the kill, and a no-op kill would leave the wait unbounded.
+/// A `CREATE_SUSPENDED` process that never exits on its own; dropped, it is killed and reaped by a
+/// direct `TerminateProcess`, so a test of a no-op kill cannot hang.
 struct Suspended {
     owned: OwnedChild,
     pid: u32,
@@ -79,7 +78,7 @@ impl Suspended {
     /// End the process with exit code 0, which only a process no earlier `TerminateProcess` has
     /// claimed takes: a real kill (exit 1) has already marked the thread terminated, so a later
     /// call cannot change the exit code. That call returns success or `ERROR_ACCESS_DENIED`
-    /// depending on timing; any other error is a test bug.
+    /// depending on timing.
     fn end_with_code_zero(&self) -> impl FnOnce() + 'static {
         let handle = self.handle();
         move || {
@@ -124,8 +123,7 @@ fn owned(fake: FakeProcess) -> (OwnedChild, FakeProcess) {
 /// A failed spawn's teardown whose `TerminateProcess` is refused because the process has exited (the
 /// handle lacks `PROCESS_TERMINATE`, so only its signalled state shows it) leaves the only wait to
 /// `wait_warning`: the kill itself does not look at the exit, so the wait is warned about once,
-/// naming the pid. (A kill that blocked before `wait_warning` is caught by the running-child test
-/// below.)
+/// naming the pid.
 ///
 /// Mutants: the warned wait is skipped, so there is no look; the warn drops the pid.
 #[cfg(feature = "tokio")]
@@ -277,8 +275,8 @@ fn raw_spawn_teardown_with_a_failed_terminate_of_an_exited_child_is_reaped_silen
     assert_eq!(warned, [], "nothing is left running");
 }
 
-/// As `..._with_an_exit_under_way_and_a_failed_wait_is_killed`, but the kill is delivered to a live
-/// process: the fate is `Killed`, and the kill is what ended it (exit code 1).
+/// The kill is delivered to a live process: the fate is `Killed`, and the kill is what ended it (exit
+/// code 1).
 ///
 /// Mutants: the teardown answers `Unknown` for any failed wait; the kill sends nothing, so the
 /// process never exits and the owner's wait hangs; the teardown waits a second time.
@@ -331,9 +329,6 @@ fn teardown_on_drop_returns_promptly() {
 /// A handle without `PROCESS_TERMINATE` to a live child (a higher-integrity runas child): the
 /// teardown looks once, never waits, and leaves it running. What it could not do comes back for the
 /// caller's one warn.
-///
-/// The refusal is warned of once, by the caller from what the teardown returns: nothing here logs
-/// it above `debug`.
 ///
 /// Mutants: wait for the exit when the kill is refused; a refusal on a handle without the right
 /// reads as the exit; the failed `TerminateProcess` is warned of where it is made, as well as by
@@ -404,8 +399,8 @@ fn teardown_of_an_exiting_unsignalled_child_reaps_it() {
     assert!(torn.left.is_none(), "{torn:?}");
 }
 
-/// As above, with the wait failing: the kill delivered nothing (the exit was under way), so, as on
-/// every OS, a failed wait shows nothing of what became of the child: `Unknown`. One scripted
+/// The kill delivered nothing (the exit was under way), so, as on every OS, a failed wait shows
+/// nothing of what became of the child: `Unknown`. One scripted
 /// answer, so a second wait would be the real one and fail the count.
 ///
 /// Mutant: a failed wait is `Killed` whatever the kill did.
