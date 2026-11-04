@@ -288,17 +288,6 @@ pub(super) fn read_some(conn: BorrowedFd<'_>, buf: &mut [u8]) -> Read {
     }
 }
 
-/// Blocks until `fds` has an event, retrying `EINTR`.
-pub(super) fn poll_ready(fds: &mut [PollFd<'_>]) -> Result<(), Errno> {
-    loop {
-        match poll(fds, None) {
-            Ok(_) => return Ok(()),
-            Err(Errno::INTR) => continue,
-            Err(e) => return Err(e),
-        }
-    }
-}
-
 /// Blocks until `conn` is readable (or hung up, or in error) or `settled` is. `on_armed` gets the
 /// number of descriptors about to be polled. Returns on `EINTR` too: the caller re-checks the
 /// outcome after every wake.
