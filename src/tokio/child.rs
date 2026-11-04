@@ -337,7 +337,7 @@ impl Child {
                 self.os
                     .proc
                     .as_ref()
-                    .map_or(crate::signal::RootState::Reaped, ProcSource::state)
+                    .map_or(crate::signal::RootState::Reaped { own: false }, ProcSource::state)
             },
             &self.tree_killed,
         )
@@ -926,11 +926,7 @@ impl Child {
         #[cfg(unix)]
         if let Some(result) = self
             .tree_call(crate::containment::dispatch::TreeSignal::Kill, "kill_tree", earlier)
-            .root_checked(
-                || self.root_state_and_own_reap(),
-                || self.kill_root_through_handle(),
-                &group,
-            )
+            .root_checked(|| self.root_state(), || self.kill_root_through_handle(), &group)
         {
             return result;
         }
@@ -1069,11 +1065,7 @@ impl Child {
         #[cfg(unix)]
         if let Some(result) = self
             .tree_call(crate::containment::dispatch::TreeSignal::Term, "terminate_tree", None)
-            .root_checked(
-                || self.root_state_and_own_reap(),
-                || self.term_root_through_handle(),
-                &group,
-            )
+            .root_checked(|| self.root_state(), || self.term_root_through_handle(), &group)
         {
             return result;
         }
@@ -1083,7 +1075,7 @@ impl Child {
     /// Whether the root's pid still names its group, read now through its handle.
     #[cfg(unix)]
     pub(super) fn group_number_holds(&self) -> Result<(), String> {
-        crate::child::tree_call::group_number_holds(self.id.pid(), self.root_state_and_own_reap())
+        crate::child::tree_call::group_number_holds(self.id.pid(), self.root_state())
     }
 
     /// The root's pidfd, if its handle holds one (Linux).
@@ -1168,17 +1160,7 @@ impl Child {
         self.os
             .proc
             .as_ref()
-            .map_or(crate::signal::RootState::Reaped, ProcSource::state)
-    }
-
-    /// [`root_state`](Self::root_state), and whether a `Reaped` is this handle's own reap (a
-    /// forgotten child's is not).
-    #[cfg(unix)]
-    fn root_state_and_own_reap(&self) -> (crate::signal::RootState, bool) {
-        self.os.proc.as_ref().map_or(
-            (crate::signal::RootState::Reaped, false),
-            ProcSource::state_and_own_reap,
-        )
+            .map_or(crate::signal::RootState::Reaped { own: false }, ProcSource::state)
     }
 
     /// Refuse `op` while the root is not pinned by this process (macOS: launchd holds its zombie).
@@ -1602,7 +1584,7 @@ impl Child {
             || {
                 os.proc
                     .as_ref()
-                    .map_or(crate::signal::RootState::Reaped, ProcSource::state)
+                    .map_or(crate::signal::RootState::Reaped { own: false }, ProcSource::state)
             },
             &self.tree_killed,
         );
@@ -2030,10 +2012,7 @@ fn signal_on_drop(
         let check = || {
             crate::child::tree_call::group_number_holds(
                 pid,
-                proc.map_or(
-                    (crate::signal::RootState::Reaped, false),
-                    ProcSource::state_and_own_reap,
-                ),
+                proc.map_or(crate::signal::RootState::Reaped { own: false }, ProcSource::state),
             )
         };
         let kill = os.attached.hard_kill_for_drop(

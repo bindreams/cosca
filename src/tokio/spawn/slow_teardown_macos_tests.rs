@@ -8,8 +8,8 @@ use std::rc::Rc;
 
 use crate::child::spawn::fault::{self, SpawnPoint};
 use crate::error::ChildFate;
+use crate::os_process::child::PeekOutcome;
 use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peeks};
-use crate::wait::exit_only::Peek;
 
 /// Spawns a blocker whose spawn `force` makes fail, with its next two looks forced from `point` on,
 /// and answers the child's fate and the "still waiting" warns naming it.
@@ -26,7 +26,7 @@ fn teardown_with_forced_looks(point: SpawnPoint, force: fn(bool)) -> (ChildFate,
         let (forced, pid) = (Rc::clone(&forced), Rc::clone(&pid));
         move || {
             pid.set(Some(fault::spawn_pid()));
-            *forced.borrow_mut() = Some(force_peeks([Ok(Peek::Running), Ok(Peek::Running)]));
+            *forced.borrow_mut() = Some(force_peeks([Ok(PeekOutcome::Running), Ok(PeekOutcome::Running)]));
         }
     });
     let _warn = crate::tokio::child::fault::warn_slow_teardowns_after(std::time::Duration::ZERO);

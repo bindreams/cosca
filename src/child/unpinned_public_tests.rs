@@ -11,10 +11,10 @@ use std::io::{BufRead as _, BufReader};
 use std::time::Duration;
 
 use crate::error::Error;
+use crate::os_process::child::{Foreign, PeekOutcome};
 use crate::send_log::{Capture, Via};
 use crate::signal::Sig;
 use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peek_once, force_peeks, forced_peeks_left, Forced};
-use crate::wait::exit_only::{Foreign, Peek};
 use crate::{Command, ContainMode};
 
 /// Every record at `warn` or above that this thread logged since `mark`.
@@ -113,9 +113,9 @@ impl Untrusted {
         force_peek_once(self.result())
     }
 
-    pub(crate) fn result(self) -> std::io::Result<Peek> {
+    pub(crate) fn result(self) -> std::io::Result<PeekOutcome> {
         match self {
-            Untrusted::Unpinned => Ok(Peek::Foreign(Foreign::Orphaned)),
+            Untrusted::Unpinned => Ok(PeekOutcome::Foreign(Foreign::Orphaned)),
             Untrusted::Unknown => Err(std::io::Error::other("unreadable")),
         }
     }
@@ -541,7 +541,7 @@ fn terminate_tree_decides_on_one_look_at_the_root() {
     let groups = crate::containment::unix::fault::record_term_group();
     let (child, writer) = group_blocker();
     let pid = child.id().pid();
-    let _looks = force_peeks([Ok(Peek::Running), Ok(Peek::Foreign(Foreign::Orphaned))]);
+    let _looks = force_peeks([Ok(PeekOutcome::Running), Ok(PeekOutcome::Foreign(Foreign::Orphaned))]);
 
     child.terminate_tree().expect("a running root's group is signalled");
 
@@ -560,9 +560,9 @@ fn kill_tree_decides_on_one_look_at_the_root() {
     let (child, writer) = group_blocker();
     let pid = child.id().pid();
     let _looks = force_peeks([
-        Ok(Peek::Running),
-        Ok(Peek::Foreign(Foreign::Orphaned)),
-        Ok(Peek::Foreign(Foreign::Orphaned)),
+        Ok(PeekOutcome::Running),
+        Ok(PeekOutcome::Foreign(Foreign::Orphaned)),
+        Ok(PeekOutcome::Foreign(Foreign::Orphaned)),
     ]);
 
     child.kill_tree().expect("a running root's group is killed");
@@ -586,7 +586,7 @@ fn kill_tree_skips_its_backstop_for_a_root_orphaned_during_the_sweep() {
     let pid = child.id().pid();
     let sends = Capture::start();
     let mark = crate::log_capture::mark();
-    let _looks = force_peeks([Ok(Peek::Running), Ok(Peek::Foreign(Foreign::Orphaned))]);
+    let _looks = force_peeks([Ok(PeekOutcome::Running), Ok(PeekOutcome::Foreign(Foreign::Orphaned))]);
 
     child
         .kill_tree()
@@ -612,7 +612,7 @@ fn kill_tree_keeps_its_backstop_for_an_unknown_root() {
     let (child, writer) = walked_blocker();
     let pid = child.id().pid();
     let sends = Capture::start();
-    let _looks = force_peeks([Ok(Peek::Running), Err(std::io::Error::other("unreadable"))]);
+    let _looks = force_peeks([Ok(PeekOutcome::Running), Err(std::io::Error::other("unreadable"))]);
 
     child.kill_tree().expect("the backstop kills through the handle");
 
@@ -634,7 +634,7 @@ fn an_uncontained_child_hears_why_it_has_no_tree_not_why_its_root_is_unpinned() 
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
     let child = cmd.spawn().expect("spawn");
-    let _looks = force_peeks([Ok(Peek::Foreign(Foreign::Orphaned))]);
+    let _looks = force_peeks([Ok(PeekOutcome::Foreign(Foreign::Orphaned))]);
 
     for (op, result) in [
         ("kill_tree", child.kill_tree()),
@@ -673,12 +673,12 @@ fn a_closed_front_gate_outranks_an_unpinned_root() {
         // wrongly first, would take the front's `Running` and let the gate see the `Orphaned`
         // one: an exited front, which is signalled.
         let looks = if op == "terminate" {
-            vec![Ok(Peek::Running), Ok(Peek::Foreign(Foreign::Orphaned))]
+            vec![Ok(PeekOutcome::Running), Ok(PeekOutcome::Foreign(Foreign::Orphaned))]
         } else {
             vec![
-                Ok(Peek::Running),
-                Ok(Peek::Running),
-                Ok(Peek::Foreign(Foreign::Orphaned)),
+                Ok(PeekOutcome::Running),
+                Ok(PeekOutcome::Running),
+                Ok(PeekOutcome::Foreign(Foreign::Orphaned)),
             ]
         };
         let _looks = force_peeks(looks);

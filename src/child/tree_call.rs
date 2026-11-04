@@ -33,20 +33,20 @@ pub(crate) enum RootNumber {
     GroupGone,
 }
 
-/// [`RootNumber`] for `attached`'s tree, from one call of `state`: the root's own handle's answer,
-/// and whether a `Reaped` is that handle's own reap. On macOS it is always called; elsewhere only
+/// [`RootNumber`] for `attached`'s tree, from one call of `state`: the root's own handle's answer
+/// (a `Reaped` says whether it is that handle's own reap). On macOS it is always called; elsewhere only
 /// for a mechanism that reaches its tree through the root's number
 /// ([`Attached::needs_root_check`](crate::containment::Attached::needs_root_check)). After this
 /// handle's own reap, a pid that names nothing (`Gone`) is still the id of the root's group while a
 /// member survives, so a group is signalled by it, though once none survives a later process may
 /// take the number, and lead a group by it, first. No walk runs from it.
-pub(crate) fn root_number(attached: &Attached, pid: RawPid, state: impl FnOnce() -> (RootState, bool)) -> RootNumber {
+pub(crate) fn root_number(attached: &Attached, pid: RawPid, state: impl FnOnce() -> RootState) -> RootNumber {
     use crate::identity::Resolved;
     #[cfg(target_os = "macos")]
     let state = {
         let looked = state();
-        if matches!(looked.0, RootState::Unpinned | RootState::Unknown(_)) {
-            return RootNumber::Untrusted(looked.0);
+        if matches!(looked, RootState::Unpinned | RootState::Unknown(_)) {
+            return RootNumber::Untrusted(looked);
         }
         move || looked
     };
@@ -55,18 +55,18 @@ pub(crate) fn root_number(attached: &Attached, pid: RawPid, state: impl FnOnce()
     }
     let mut exact_root = false;
     let why = match state() {
-        (RootState::Unreaped, _) => return RootNumber::Trusted,
-        (RootState::Reaped, true) => match crate::child::root_identity_now(pid) {
+        RootState::Unreaped => return RootNumber::Trusted,
+        RootState::Reaped { own: true } => match crate::child::root_identity_now(pid) {
             Resolved::Gone => return own_reaped_free(attached),
             Resolved::Found(_) => return RootNumber::Empty,
             Resolved::Unknown => format!("this handle reaped the root, and its pid ({pid}) could not be read"),
         },
-        (RootState::Reaped, false) => format!("the root (pid {pid}) was reaped elsewhere"),
-        (RootState::Unknown(e), _) => {
+        RootState::Reaped { own: false } => format!("the root (pid {pid}) was reaped elsewhere"),
+        RootState::Unknown(e) => {
             exact_root = cfg!(target_os = "linux");
             format!("the root's own handle could not say whether it (pid {pid}) was reaped ({e})")
         }
-        (RootState::Unpinned, _) => {
+        RootState::Unpinned => {
             debug_assert!(false, "only macOS reports an unpinned root, and it is answered above");
             format!("the root (pid {pid}) is not pinned by this process")
         }
@@ -75,15 +75,15 @@ pub(crate) fn root_number(attached: &Attached, pid: RawPid, state: impl FnOnce()
 }
 
 /// Whether the root's pid, `pid`, still names its process group, from `state`: the root's own
-/// handle's answer and whether a `Reaped` is that handle's own reap, read for a send by that number
+/// handle's answer (a `Reaped` says whether it is that handle's own reap), read for a send by that number
 /// ([`GroupRoot::check`], as [`Child::kill_tree`](crate::Child::kill_tree) says). `Ok` while the
 /// root is unreaped, and after this handle's own reap while the pid names no process, as
 /// [`root_number`] decides. `Err` says why not.
-pub(crate) fn group_number_holds(pid: RawPid, state: (RootState, bool)) -> Result<(), String> {
+pub(crate) fn group_number_holds(pid: RawPid, state: RootState) -> Result<(), String> {
     use crate::identity::Resolved;
     match state {
-        (RootState::Unreaped, _) => Ok(()),
-        (RootState::Reaped, true) => match crate::child::root_identity_now(pid) {
+        RootState::Unreaped => Ok(()),
+        RootState::Reaped { own: true } => match crate::child::root_identity_now(pid) {
             Resolved::Gone => Ok(()),
             Resolved::Found(_) => Err(format!(
                 "this handle reaped the root, and another process holds its pid ({pid})"
@@ -92,11 +92,11 @@ pub(crate) fn group_number_holds(pid: RawPid, state: (RootState, bool)) -> Resul
                 "this handle reaped the root, and its pid ({pid}) could not be read"
             )),
         },
-        (RootState::Reaped, false) => Err(format!("the root (pid {pid}) was reaped elsewhere")),
-        (RootState::Unknown(e), _) => Err(format!(
+        RootState::Reaped { own: false } => Err(format!("the root (pid {pid}) was reaped elsewhere")),
+        RootState::Unknown(e) => Err(format!(
             "the root's own handle could not say whether it (pid {pid}) was reaped ({e})"
         )),
-        (RootState::Unpinned, _) => Err(format!("the root (pid {pid}) is not pinned by this process")),
+        RootState::Unpinned => Err(format!("the root (pid {pid}) is not pinned by this process")),
     }
 }
 
@@ -180,7 +180,7 @@ impl TreeCall<'_> {
     /// The call's one look at the root ([`root_number`]), and on Linux 6.9+ at its group through
     /// `group`'s pidfd (`through_the_pidfd`).
     #[cfg_attr(not(target_os = "linux"), allow(unused_variables, reason = "only Linux has a pidfd"))]
-    pub(crate) fn root_number(&self, state: impl FnOnce() -> (RootState, bool), group: &GroupRoot<'_>) -> RootNumber {
+    pub(crate) fn root_number(&self, state: impl FnOnce() -> RootState, group: &GroupRoot<'_>) -> RootNumber {
         let number = root_number(self.attached, self.pid, state);
         #[cfg(target_os = "linux")]
         let number = through_the_pidfd(self.attached, number, group);
@@ -214,7 +214,7 @@ impl TreeCall<'_> {
     )]
     pub(crate) fn root_checked(
         &self,
-        state: impl FnOnce() -> (RootState, bool),
+        state: impl FnOnce() -> RootState,
         signal_root: impl FnOnce() -> Result<Sent, Error>,
         group: &GroupRoot<'_>,
     ) -> Option<Result<(), Error>> {
@@ -249,7 +249,7 @@ impl TreeCall<'_> {
         not(target_os = "macos"),
         allow(unused_variables, reason = "only a macOS fd marker signals here")
     )]
-    pub(crate) fn graceful(&self, state: impl FnOnce() -> (RootState, bool), group: &GroupRoot<'_>) -> Graceful {
+    pub(crate) fn graceful(&self, state: impl FnOnce() -> RootState, group: &GroupRoot<'_>) -> Graceful {
         match self.root_number(state, group) {
             RootNumber::Trusted => Graceful::Signal,
             // By identity alone. With no channel by identity there is nothing to signal, wait for or

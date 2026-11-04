@@ -113,7 +113,7 @@ impl<'a> DropReport<'a> {
         let pid = self.view.root_pid;
         let reaped_now = matches!(
             self.forgot.as_ref().and_then(|f| f.now.as_ref()),
-            Some(RootState::Reaped)
+            Some(RootState::Reaped { .. })
         );
         let reaped = reaped_now || matches!(self.view.root, RootView::Reaped);
         let mut parts: Vec<(PartKey, String)> = Vec::new();
@@ -194,7 +194,7 @@ impl<'a> DropReport<'a> {
                     "child {pid} is not pinned by this process (RootState::Unpinned: {})",
                     crate::signal::UNPINNED_WHY
                 ),
-                Some(RootState::Reaped | RootState::Unreaped) | None => {
+                Some(RootState::Reaped { .. } | RootState::Unreaped) | None => {
                     format!("child {pid} was reaped by someone else, or cannot be shown to be ours")
                 }
             }),

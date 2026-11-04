@@ -331,7 +331,7 @@ impl Child {
                 "graceful_shutdown_tree",
                 None,
             );
-            match call.graceful(|| self.root_state_and_own_reap(), &group) {
+            match call.graceful(|| self.root_state(), &group) {
                 crate::child::Graceful::Signal => (None, Some("the SIGTERM")),
                 crate::child::Graceful::Sent { result, earlier } => (Some(result), earlier),
                 crate::child::Graceful::End(e) => return Err(e),

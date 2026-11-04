@@ -41,7 +41,8 @@ use std::time::Instant;
 #[cfg(any(windows, test))]
 use crate::error::Error;
 use crate::identity::ProcessId;
-use crate::wait::exit_only::{self, Peek, Reap, Reaped, Target};
+use crate::os_process::child::{ExitRecord, PeekOutcome};
+use crate::wait::exit_only::{self, Reap, Target};
 
 #[path = "shared/holder.rs"]
 mod holder;
@@ -60,7 +61,7 @@ enum State {
     /// The thread that drew `token` is the holder, blocked in the unlocked wait.
     W { token: u64 },
     /// Reaped: the outcome is cached.
-    E(Reaped),
+    E(ExitRecord),
 }
 
 struct Inner {
@@ -293,22 +294,17 @@ impl SharedChild {
     /// unique id, with an unreadable id on a running child an error).
     #[cfg(unix)]
     pub(crate) fn state(&self) -> crate::signal::RootState {
-        self.state_and_own_reap().0
+        self.state_locked(&self.lock())
     }
 
-    /// [`state`](Self::state), and whether a `Reaped` is this handle's own reap, from one read under
-    /// the lock: a reap of ours on another thread cannot land between the two answers.
+    /// [`state`](Self::state), under `lock`: a `Reaped` is `own` when the recorded reap is this
+    /// handle's, from one read under the lock, so a reap of ours on another thread cannot land between
+    /// the state and the peek.
     #[cfg(unix)]
-    pub(crate) fn state_and_own_reap(&self) -> (crate::signal::RootState, bool) {
-        self.state_and_own_reap_locked(&self.lock())
-    }
-
-    /// [`state_and_own_reap`](Self::state_and_own_reap), under `lock`.
-    #[cfg(unix)]
-    fn state_and_own_reap_locked(&self, lock: &Guard<'_>) -> (crate::signal::RootState, bool) {
+    fn state_locked(&self, lock: &Guard<'_>) -> crate::signal::RootState {
         use crate::signal::RootState;
         if matches!(lock.state, State::E(_)) {
-            return (RootState::Reaped, true);
+            return RootState::Reaped { own: true };
         }
         let Some(target) = self.target() else {
             #[cfg(not(test))]
@@ -317,13 +313,13 @@ impl SharedChild {
                 "child {} has no handle (it was gone when adopted); treating it as reaped",
                 self.id()
             );
-            return (RootState::Reaped, false);
+            return RootState::Reaped { own: false };
         };
         #[cfg(target_os = "macos")]
         let peeked = exit_only::peek_verified(&target);
         #[cfg(not(target_os = "macos"))]
         let peeked = exit_only::peek(&target);
-        (RootState::of_peek(peeked), false)
+        RootState::of_peek(peeked)
     }
 
     /// The unique id this handle checks its by-pid actions against. Tests only.
@@ -456,10 +452,10 @@ fn echild() -> io::Error {
 }
 
 /// The status a cached outcome answers.
-fn status_of(reaped: Reaped) -> io::Result<ExitStatus> {
+fn status_of(reaped: ExitRecord) -> io::Result<ExitStatus> {
     match reaped {
-        Reaped::Status(status) => Ok(status),
-        Reaped::Unreadable { si_code } => Err(io::Error::new(
+        ExitRecord::Status(status) => Ok(status),
+        ExitRecord::Unreadable { si_code } => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("the child's exit record was unreadable (si_code {si_code})"),
         )),
@@ -542,7 +538,7 @@ impl SharedChild {
         let Some(target) = self.target() else {
             return Ok(false);
         };
-        Ok(matches!(exit_only::peek(&target)?, Peek::Running))
+        Ok(matches!(exit_only::peek(&target)?, PeekOutcome::Running))
     }
 
     /// Hard-kill the child; already gone is success.
@@ -619,8 +615,8 @@ impl SharedChild {
 
     /// A contract breach after the `E` write: a consuming reap handed back a record that is not
     /// an exit. The state is already `E`, so this must run with the lock released.
-    fn log_unreadable(&self, reaped: Reaped) {
-        if let Reaped::Unreadable { si_code } = reaped {
+    fn log_unreadable(&self, reaped: ExitRecord) {
+        if let ExitRecord::Unreadable { si_code } = reaped {
             log::warn!(
                 "pid {}: a consuming waitid returned si_code {si_code}, not an exit record",
                 self.id()
@@ -632,9 +628,9 @@ impl SharedChild {
     /// The status a peek saw, without reaping.
     fn peeked_status(&self, target: &Target<'_>) -> io::Result<Option<ExitStatus>> {
         match exit_only::peek(target)? {
-            Peek::Running => Ok(None),
-            Peek::Exit(reaped) => status_of(reaped).map(Some),
-            Peek::Foreign(_) => Err(echild()),
+            PeekOutcome::Running => Ok(None),
+            PeekOutcome::Exit(reaped) => status_of(reaped).map(Some),
+            PeekOutcome::Foreign(_) => Err(echild()),
         }
     }
 }
@@ -648,9 +644,9 @@ pub(crate) struct ReapsHeld<'a> {
 
 #[cfg(unix)]
 impl ReapsHeld<'_> {
-    /// [`SharedChild::state_and_own_reap`].
-    pub(crate) fn state_and_own_reap(&self) -> (crate::signal::RootState, bool) {
-        self.child.state_and_own_reap_locked(&self.lock)
+    /// [`SharedChild::state`], under this lock.
+    pub(crate) fn state(&self) -> crate::signal::RootState {
+        self.child.state_locked(&self.lock)
     }
 
     /// [`SharedChild::signal_sent`].

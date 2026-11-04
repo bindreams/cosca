@@ -647,9 +647,9 @@ in_fresh_pid_ns!(
 /// happened yet, while the alias hides it from the start token: only the look after the signals
 /// can see it. (The seam answers one peek, and the first look consumes it.)
 fn first_look_sees_it_running() -> impl Sized {
+    use crate::os_process::child::PeekOutcome;
     use crate::wait::exit_only::seams::force_peek_once;
-    use crate::wait::exit_only::Peek;
-    force_peek_once(Ok(Peek::Running))
+    force_peek_once(Ok(PeekOutcome::Running))
 }
 
 /// An armed drop whose first look misses the reap. Its root kill goes through the pidfd (`ESRCH`,
@@ -1199,8 +1199,8 @@ in_fresh_pid_ns!(
 /// there unwinds with tokio's `Child` in `os`, and the unwind must leak it, not reap the stranger
 /// by pid.
 fn a_panicking_logger_in_drops_via_pidfd_log_body() {
+    use crate::os_process::child::PeekOutcome;
     use crate::wait::exit_only::seams::force_peek_once;
-    use crate::wait::exit_only::Peek;
 
     crate::log_capture::install();
     runtime().block_on(async {
@@ -1208,7 +1208,7 @@ fn a_panicking_logger_in_drops_via_pidfd_log_body() {
         let (reuser, _alias) = foreign_reaped_and_reused(&child, writer);
         let reuser_pid = reuser.id();
         assert_eq!(sigusr1_and_peek(&reuser), Some(libc::SIGUSR1));
-        let _first_look = force_peek_once(Ok(Peek::Running));
+        let _first_look = force_peek_once(Ok(PeekOutcome::Running));
         let unwound = {
             let _panics = crate::log_capture::panic_on("it is already gone");
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(child)))

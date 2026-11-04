@@ -8,10 +8,10 @@
 use std::process::{Child, ChildStdin};
 use std::time::Duration;
 
+use crate::os_process::child::PeekOutcome;
 use crate::os_process::macos::kqueue::{test_hooks, Kqueue};
 use crate::wait::exit_only::seams as exit_seams;
 use crate::wait::exit_only::seams::HolderStep;
-use crate::wait::exit_only::Peek;
 use crate::wait::macos::{await_reapable, await_reapable_on, Waited};
 
 fn spawn_blocker() -> (Child, ChildStdin) {
@@ -61,7 +61,7 @@ fn await_reapable_at_a_past_deadline_takes_its_final_peek() {
     let (child, stdin) = spawn_blocker();
     drop(stdin);
     confirm_exit(&child);
-    let _running = exit_seams::force_peek_once(Ok(Peek::Running));
+    let _running = exit_seams::force_peek_once(Ok(PeekOutcome::Running));
     let waited = await_reapable(child.id(), None, Some(std::time::Instant::now())).expect("wait");
     assert_eq!(waited, Waited::Reapable);
     let mut child = child;
@@ -249,7 +249,7 @@ fn no_evfilt_proc_event_arrives_after_the_round_that_delivered_note_exit() {
     let _end = test_hooks::on_kevent_round(0, move || drop(stdin.take()));
     // At least one more round after the one that delivers `NOTE_EXIT`.
     let _repeek = test_hooks::on_before_repeek(|| {
-        std::mem::forget(exit_seams::force_peek_once(Ok(Peek::Running)));
+        std::mem::forget(exit_seams::force_peek_once(Ok(PeekOutcome::Running)));
     });
     assert_eq!(await_reapable(child.id(), None, None).expect("wait"), Waited::Reapable);
     child.wait().expect("reap");

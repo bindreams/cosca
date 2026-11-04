@@ -11,12 +11,13 @@
 //! Peeking first reads that as "running" and consumes nothing.
 //!
 //! **No panic between a consuming reap and the caller recording its status.** The `si_code`
-//! mapping is total; a code that is not an exit record becomes [`Reaped::Unreadable`].
+//! mapping is total; a code that is not an exit record becomes [`ExitRecord::Unreadable`].
 
 use std::io;
+#[cfg(unix)]
 use std::process::ExitStatus;
 
-use crate::error::ChildFate;
+use crate::os_process::child::{ExitRecord, Foreign, PeekOutcome};
 
 #[cfg(target_os = "linux")]
 #[path = "exit_only/linux.rs"]
@@ -54,79 +55,10 @@ pub(crate) use macos::second_reap;
 #[path = "exit_only/seams.rs"]
 pub(crate) mod seams;
 
-/// A reaped child's outcome.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Reaped {
-    Status(ExitStatus),
-    /// A consuming `waitid` that should have handed back a zombie's exit record gave another
-    /// `si_code`. A contract breach, but the zombie is consumed, so it is a cached outcome.
-    #[cfg_attr(windows, allow(dead_code, reason = "Windows has no `waitid` records"))]
-    Unreadable {
-        si_code: i32,
-    },
-}
-
-/// Why a child is not this process's to reap any more.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(
-    windows,
-    allow(dead_code, reason = "a process handle pins its process: no foreign reap")
-)]
-pub(crate) enum Foreign {
-    /// The OS answered `ECHILD`, or a by-pid consume found nothing: something else reaped it.
-    Gone,
-    /// The pid names another process now: its start time differs from the child's.
-    #[cfg(target_os = "macos")]
-    Other,
-    /// `ECHILD` for a pid that still names the child, held by launchd: its tracer died and XNU
-    /// reparented it. It has exited and is not this process's to reap, so its fate is `Gone` as for
-    /// any foreign verdict ([`Foreign::fate`]); the variant stays apart so that a log can say why.
-    /// Nothing is signalled or reaped by pid.
-    #[cfg(target_os = "macos")]
-    Orphaned,
-}
-
-impl Foreign {
-    /// What became of a child this evidence shows is not this process's to reap: it has exited, and
-    /// someone else holds or has collected its exit. That includes a zombie launchd holds. Every path
-    /// that maps this evidence to a fate uses this, so one situation has one fate:
-    ///
-    /// - `kill_delivered`: cosca's kill was delivered, so the child is [`Killed`](ChildFate::Killed):
-    ///   dead or dying, its exit not collected by cosca.
-    /// - Otherwise cosca delivered nothing, and the child is [`Gone`](ChildFate::Gone).
-    #[cfg_attr(
-        windows,
-        allow(dead_code, reason = "a process handle pins its process: no foreign reap")
-    )]
-    pub(crate) fn fate(self, kill_delivered: bool) -> ChildFate {
-        // Every foreign verdict is the same situation for the fate: only the kill tells them apart.
-        let _ = self;
-        if kill_delivered {
-            ChildFate::Killed
-        } else {
-            ChildFate::Gone
-        }
-    }
-}
-
-/// What [`peek`] saw.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Peek {
-    /// An exit record, not consumed.
-    Exit(Reaped),
-    /// No exit record: still running, stopped under a tracer, or a zombie only its tracer sees.
-    Running,
-    #[cfg_attr(
-        windows,
-        allow(dead_code, reason = "a process handle pins its process: no foreign reap")
-    )]
-    Foreign(Foreign),
-}
-
 /// What [`try_reap`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Reap {
-    Reaped(Reaped),
+    Reaped(ExitRecord),
     /// Nothing to consume: not exited, or (Linux) a zombie only its tracer sees.
     Running,
     #[cfg_attr(
@@ -168,7 +100,7 @@ impl Target<'_> {
 }
 
 /// Look at `target` without consuming anything.
-pub(crate) fn peek(target: &Target<'_>) -> io::Result<Peek> {
+pub(crate) fn peek(target: &Target<'_>) -> io::Result<PeekOutcome> {
     #[cfg(test)]
     if let Some(forced) = seams::take_forced_peek() {
         return forced;
@@ -180,7 +112,7 @@ pub(crate) fn peek(target: &Target<'_>) -> io::Result<Peek> {
 /// whose unique id cannot be read (a MACF denial) is then an error, not `Running`: the id is all
 /// that tells it from a reuse of the pid. Other platforms use [`peek`].
 #[cfg(target_os = "macos")]
-pub(crate) fn peek_verified(target: &Target<'_>) -> io::Result<Peek> {
+pub(crate) fn peek_verified(target: &Target<'_>) -> io::Result<PeekOutcome> {
     #[cfg(test)]
     if let Some(forced) = seams::take_forced_peek() {
         return forced;
@@ -191,7 +123,7 @@ pub(crate) fn peek_verified(target: &Target<'_>) -> io::Result<Peek> {
 /// [`peek`], and the tracer that holds the child when the verdict is `Running` because a process
 /// other than this one and launchd holds it (`waitid` answered `ECHILD`). **macOS only.**
 #[cfg(target_os = "macos")]
-pub(crate) fn peek_traced(target: &Target<'_>) -> io::Result<(Peek, Option<u32>)> {
+pub(crate) fn peek_traced(target: &Target<'_>) -> io::Result<(PeekOutcome, Option<u32>)> {
     #[cfg(test)]
     if let Some(forced) = seams::take_forced_peek() {
         return forced.map(|peeked| (peeked, None));
@@ -205,7 +137,7 @@ pub(crate) fn peek_traced(target: &Target<'_>) -> io::Result<(Peek, Option<u32>)
     not(feature = "tokio"),
     allow(dead_code, reason = "the only consumer is the tokio backend's reap")
 )]
-pub(crate) fn peek_verified_traced(target: &Target<'_>) -> io::Result<(Peek, Option<u32>)> {
+pub(crate) fn peek_verified_traced(target: &Target<'_>) -> io::Result<(PeekOutcome, Option<u32>)> {
     #[cfg(test)]
     if let Some(forced) = seams::take_forced_peek() {
         return forced.map(|peeked| (peeked, None));
@@ -224,7 +156,7 @@ pub(crate) fn try_reap(target: &Target<'_>) -> io::Result<Reap> {
 /// tracer lets go. A stop cannot wake it: an invisible zombie means this process is not the
 /// tracer. Consumes nothing.
 #[cfg(target_os = "linux")]
-pub(crate) fn wait_visible_exit(target: &Target<'_>) -> io::Result<Peek> {
+pub(crate) fn wait_visible_exit(target: &Target<'_>) -> io::Result<PeekOutcome> {
     linux::wait_visible_exit(target)
 }
 
@@ -232,7 +164,7 @@ pub(crate) fn wait_visible_exit(target: &Target<'_>) -> io::Result<Peek> {
 /// this process owns: `ECHILD` (something else reaped it) is [`Foreign::Gone`]. Blocks in
 /// `waitid(P_PIDFD, WEXITED)`, so a ptrace stop is skipped, not returned.
 #[cfg(target_os = "linux")]
-pub(crate) fn reap_blocking(target: &Target<'_>) -> io::Result<Result<Reaped, Foreign>> {
+pub(crate) fn reap_blocking(target: &Target<'_>) -> io::Result<Result<ExitRecord, Foreign>> {
     linux::reap_blocking(target)
 }
 
@@ -263,18 +195,18 @@ pub(crate) fn is_exit_record(si_code: i32) -> bool {
 }
 
 /// The wait status `record` describes. Total: a code that is not an exit record is
-/// [`Reaped::Unreadable`]. The masks drop the bits XNU ORs into `si_status`'s high byte.
+/// [`ExitRecord::Unreadable`]. The masks drop the bits XNU ORs into `si_status`'s high byte.
 #[cfg(unix)]
-pub(crate) fn reaped_from_record(record: Record) -> Reaped {
+pub(crate) fn reaped_from_record(record: Record) -> ExitRecord {
     use std::os::unix::process::ExitStatusExt;
     let Record { si_code, si_status } = record;
     let raw = match si_code {
         libc::CLD_EXITED => (si_status & 0xFF) << 8,
         libc::CLD_KILLED => si_status & 0x7F,
         libc::CLD_DUMPED => (si_status & 0x7F) | 0x80,
-        other => return Reaped::Unreadable { si_code: other },
+        other => return ExitRecord::Unreadable { si_code: other },
     };
-    Reaped::Status(ExitStatus::from_raw(raw))
+    ExitRecord::Status(ExitStatus::from_raw(raw))
 }
 
 #[cfg(test)]
