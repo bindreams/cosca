@@ -42,6 +42,9 @@ pub(crate) mod teardown;
 #[path = "owned/waiting.rs"]
 mod waiting;
 
+#[cfg(all(test, unix))]
+#[path = "owned/over.rs"]
+mod over;
 #[cfg(test)]
 #[path = "owned/seams.rs"]
 pub(crate) mod seams;

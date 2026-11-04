@@ -6,15 +6,20 @@
 //! number (`killpg`, the walk from its pid, its kill by pid) runs; an fd marker still signals its
 //! holders. Each case forces the state with a peek, and a positive control then signals the same
 //! child once its state reads true, so a refusal that never lets go fails too.
+//!
+//! A test that counts the peeks left empties the table with `fake.peeks([])` before it ends: the
+//! answer left over must not reach the drop.
 
 use std::io::{BufRead as _, BufReader};
 use std::time::Duration;
 
 use crate::error::Error;
 use crate::os_process::child::{Foreign, PeekOutcome};
+use crate::os_process::fake::FakeProcess;
 use crate::send_log::{Capture, Via};
 use crate::signal::Sig;
-use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peek_once, force_peeks, forced_peeks_left, Forced};
+#[cfg(feature = "tokio")]
+use crate::wait::exit_only::seams::{force_peek_once, Forced};
 use crate::{Command, ContainMode};
 
 /// Every record at `warn` or above that this thread logged since `mark`.
@@ -108,9 +113,16 @@ pub(crate) enum Untrusted {
 pub(crate) const BOTH: [Untrusted; 2] = [Untrusted::Unpinned, Untrusted::Unknown];
 
 impl Untrusted {
-    /// The next peek reads as this state.
+    /// The next peek on this thread reads as this state: the async child's, which still answers
+    /// through the `exit_only` hook.
+    #[cfg(feature = "tokio")]
     pub(crate) fn peek(self) -> Forced {
         force_peek_once(self.result())
+    }
+
+    /// The next peek of `child`'s root reads as this state.
+    pub(crate) fn script(self, child: &mut crate::Child) -> FakeProcess {
+        child.proc.script_over(|f| f.peeks([self.result()]))
     }
 
     pub(crate) fn result(self) -> std::io::Result<PeekOutcome> {
@@ -129,8 +141,15 @@ impl Untrusted {
     }
 }
 
+/// [`Untrusted::peek`] for [`Untrusted::Unpinned`].
+#[cfg(feature = "tokio")]
 pub(crate) fn orphaned() -> Forced {
     Untrusted::Unpinned.peek()
+}
+
+/// [`Untrusted::script`] for [`Untrusted::Unpinned`].
+pub(crate) fn orphan(child: &mut crate::Child) -> FakeProcess {
+    Untrusted::Unpinned.script(child)
 }
 
 /// The lone refusal: `Unassessable`, no source, naming launchd and the call that sent nothing.
@@ -201,17 +220,17 @@ pub(crate) fn assert_sent_by_identity(sends: &Capture, signo: i32, want: &[u32],
 #[skuld::test]
 fn kill_of_an_orphaned_root_sends_nothing() {
     crate::log_capture::install();
-    let (child, writer) = walked_blocker();
+    let (mut child, writer) = walked_blocker();
     let pid = child.id().pid();
     let sends = Capture::start();
     let mark = crate::log_capture::mark();
-    let _looks = orphaned();
+    let fake = orphan(&mut child);
 
     let err = child
         .kill()
         .expect_err("a root this process does not pin is not killed");
 
-    assert_peeks_exhausted();
+    fake.assert_peeks_exhausted();
     assert_refused(&err, "kill");
     assert_nothing_sent(&sends);
     assert_eq!(warns_since(mark), Vec::<String>::new());
@@ -228,14 +247,14 @@ fn kill_of_an_orphaned_root_sends_nothing() {
 #[skuld::test]
 fn kill_of_an_unknown_root_is_sent_through_its_handle() {
     crate::log_capture::install();
-    let (child, writer) = walked_blocker();
+    let (mut child, writer) = walked_blocker();
     let pid = child.id().pid();
     let sends = Capture::start();
-    let _looks = Untrusted::Unknown.peek();
+    let fake = Untrusted::Unknown.script(&mut child);
 
     child.kill().expect("an unknown root is killed through its handle");
 
-    assert_peeks_exhausted();
+    fake.assert_peeks_exhausted();
     assert_eq!(sends.entries(), vec![(pid, Sig::Kill, Via::Identity)]);
     drop(writer);
 }
@@ -244,17 +263,17 @@ fn kill_of_an_unknown_root_is_sent_through_its_handle() {
 #[skuld::test]
 fn terminate_of_an_orphaned_root_sends_nothing() {
     crate::log_capture::install();
-    let (child, writer) = walked_blocker();
+    let (mut child, writer) = walked_blocker();
     let pid = child.id().pid();
     let sends = Capture::start();
     let mark = crate::log_capture::mark();
-    let _looks = orphaned();
+    let fake = orphan(&mut child);
 
     let err = child
         .terminate()
         .expect_err("a root this process does not pin is not signalled");
 
-    assert_peeks_exhausted();
+    fake.assert_peeks_exhausted();
     assert_refused(&err, "terminate");
     assert_nothing_sent(&sends);
     assert_eq!(warns_since(mark), Vec::<String>::new());
@@ -268,14 +287,14 @@ fn terminate_of_an_orphaned_root_sends_nothing() {
 #[skuld::test]
 fn terminate_of_an_unknown_root_is_sent_through_its_handle() {
     crate::log_capture::install();
-    let (child, writer) = walked_blocker();
+    let (mut child, writer) = walked_blocker();
     let pid = child.id().pid();
     let sends = Capture::start();
-    let _looks = Untrusted::Unknown.peek();
+    let fake = Untrusted::Unknown.script(&mut child);
 
     child.terminate().expect("an unknown root is signalled");
 
-    assert_peeks_exhausted();
+    fake.assert_peeks_exhausted();
     assert_eq!(sends.by_identity(), vec![(pid, libc::SIGTERM)]);
     drop(writer);
 }
@@ -289,23 +308,22 @@ fn terminate_of_an_unknown_root_is_sent_through_its_handle() {
 fn kill_tree_of_an_untrusted_walked_root_sends_nothing() {
     crate::log_capture::install();
     for state in BOTH {
-        let (child, writer) = walked_blocker();
+        let (mut child, writer) = walked_blocker();
         let pid = child.id().pid();
         let sends = Capture::start();
         let walks = crate::containment::treewalk::fault::record_walks();
         let mark = crate::log_capture::mark();
-        let looks = state.peek();
+        let fake = state.script(&mut child);
 
         let err = child
             .kill_tree()
             .expect_err("the walk names the tree by the root's number");
 
-        assert_peeks_exhausted();
+        fake.assert_peeks_exhausted();
         assert_tree_refused(&err, "kill_tree", state);
         assert_nothing_sent(&sends);
         assert_eq!(walks.walked(), Vec::<u32>::new(), "{state:?}");
         assert_eq!(warns_since(mark), Vec::<String>::new(), "{state:?}");
-        drop(looks);
 
         child.kill_tree().expect("an unreaped root is killed with its tree");
         assert!(
@@ -325,20 +343,19 @@ fn kill_tree_of_an_untrusted_group_root_sends_no_killpg() {
     crate::log_capture::install();
     for state in BOTH {
         let groups = crate::containment::unix::fault::record_kill_group();
-        let (child, writer) = group_blocker();
+        let (mut child, writer) = group_blocker();
         let pid = child.id().pid();
         let sends = Capture::start();
         let mark = crate::log_capture::mark();
-        let looks = state.peek();
+        let fake = state.script(&mut child);
 
         let err = child.kill_tree().expect_err("the group is named by the root's number");
 
-        assert_peeks_exhausted();
+        fake.assert_peeks_exhausted();
         assert_tree_refused(&err, "kill_tree", state);
         assert_nothing_sent(&sends);
         assert_eq!(groups.killed(), Vec::<i32>::new(), "{state:?}");
         assert_eq!(warns_since(mark), Vec::<String>::new(), "{state:?}");
-        drop(looks);
 
         child.kill_tree().expect("an unreaped root is killed with its group");
         assert_eq!(
@@ -363,17 +380,17 @@ fn kill_tree_of_an_untrusted_session_root_kills_its_holders_only() {
         let groups = crate::containment::unix::fault::record_kill_group();
         let walks = crate::containment::treewalk::fault::record_walks();
         let holders = crate::containment::fdmarker::fault::record_holder_kills();
-        let (child, writer, descendant) = session_tree();
+        let (mut child, writer, descendant) = session_tree();
         let pid = child.id().pid();
         let sends = Capture::start();
         let mark = crate::log_capture::mark();
-        let _looks = state.peek();
+        let fake = state.script(&mut child);
 
         child
             .kill_tree()
             .expect("every holder was reached, so the tree is down");
 
-        assert_peeks_exhausted();
+        fake.assert_peeks_exhausted();
         assert_eq!(groups.killed(), Vec::<i32>::new(), "{state:?}");
         assert_eq!(walks.walked(), Vec::<u32>::new(), "{state:?}");
         assert_eq!(sends.entries(), vec![], "{state:?}: nothing by pid");
@@ -410,23 +427,22 @@ fn kill_tree_kills_a_trusted_session_root() {
 fn terminate_tree_of_an_untrusted_walked_root_sends_nothing() {
     crate::log_capture::install();
     for state in BOTH {
-        let (child, writer) = walked_blocker();
+        let (mut child, writer) = walked_blocker();
         let pid = child.id().pid();
         let sends = Capture::start();
         let walks = crate::containment::treewalk::fault::record_walks();
         let mark = crate::log_capture::mark();
-        let looks = state.peek();
+        let fake = state.script(&mut child);
 
         let err = child
             .terminate_tree()
             .expect_err("the walk names the tree by the root's number");
 
-        assert_peeks_exhausted();
+        fake.assert_peeks_exhausted();
         assert_tree_refused(&err, "terminate_tree", state);
         assert_nothing_sent(&sends);
         assert_eq!(walks.walked(), Vec::<u32>::new(), "{state:?}");
         assert_eq!(warns_since(mark), Vec::<String>::new(), "{state:?}");
-        drop(looks);
 
         child
             .terminate_tree()
@@ -447,22 +463,21 @@ fn terminate_tree_of_an_untrusted_group_root_sends_no_killpg() {
     crate::log_capture::install();
     for state in BOTH {
         let groups = crate::containment::unix::fault::record_term_group();
-        let (child, writer) = group_blocker();
+        let (mut child, writer) = group_blocker();
         let pid = child.id().pid();
         let sends = Capture::start();
         let mark = crate::log_capture::mark();
-        let looks = state.peek();
+        let fake = state.script(&mut child);
 
         let err = child
             .terminate_tree()
             .expect_err("the group is named by the root's number");
 
-        assert_peeks_exhausted();
+        fake.assert_peeks_exhausted();
         assert_tree_refused(&err, "terminate_tree", state);
         assert_nothing_sent(&sends);
         assert_eq!(groups.termed(), Vec::<i32>::new(), "{state:?}");
         assert_eq!(warns_since(mark), Vec::<String>::new(), "{state:?}");
-        drop(looks);
 
         child
             .terminate_tree()
@@ -485,17 +500,17 @@ fn terminate_tree_of_an_untrusted_session_root_signals_its_holders_only() {
         let groups = crate::containment::unix::fault::record_term_group();
         let walks = crate::containment::treewalk::fault::record_walks();
         let holders = crate::containment::fdmarker::fault::record_holder_kills();
-        let (child, writer, descendant) = session_tree();
+        let (mut child, writer, descendant) = session_tree();
         let pid = child.id().pid();
         let sends = Capture::start();
         let mark = crate::log_capture::mark();
-        let _looks = state.peek();
+        let fake = state.script(&mut child);
 
         child
             .terminate_tree()
             .expect("every holder was reached, so the tree was asked to stop");
 
-        assert_peeks_exhausted();
+        fake.assert_peeks_exhausted();
         assert_eq!(groups.termed(), Vec::<i32>::new(), "{state:?}");
         assert_eq!(walks.walked(), Vec::<u32>::new(), "{state:?}");
         assert_eq!(sends.entries(), vec![], "{state:?}: nothing by pid");
@@ -539,13 +554,16 @@ fn terminate_tree_terminates_a_trusted_session_root() {
 #[skuld::test]
 fn terminate_tree_decides_on_one_look_at_the_root() {
     let groups = crate::containment::unix::fault::record_term_group();
-    let (child, writer) = group_blocker();
+    let (mut child, writer) = group_blocker();
     let pid = child.id().pid();
-    let _looks = force_peeks([Ok(PeekOutcome::Running), Ok(PeekOutcome::Foreign(Foreign::Orphaned))]);
+    let fake = child
+        .proc
+        .script_over(|f| f.peeks([Ok(PeekOutcome::Running), Ok(PeekOutcome::Foreign(Foreign::Orphaned))]));
 
     child.terminate_tree().expect("a running root's group is signalled");
 
-    assert_eq!(forced_peeks_left(), 1, "the decision looked at the root twice");
+    assert_eq!(fake.peeks_left(), 1, "the decision looked at the root twice");
+    drop(fake.peeks([]));
     assert_eq!(groups.termed(), vec![pid as i32]);
     drop(writer);
 }
@@ -557,17 +575,20 @@ fn terminate_tree_decides_on_one_look_at_the_root() {
 #[skuld::test]
 fn kill_tree_decides_on_one_look_at_the_root() {
     let groups = crate::containment::unix::fault::record_kill_group();
-    let (child, writer) = group_blocker();
+    let (mut child, writer) = group_blocker();
     let pid = child.id().pid();
-    let _looks = force_peeks([
-        Ok(PeekOutcome::Running),
-        Ok(PeekOutcome::Foreign(Foreign::Orphaned)),
-        Ok(PeekOutcome::Foreign(Foreign::Orphaned)),
-    ]);
+    let fake = child.proc.script_over(|f| {
+        f.peeks([
+            Ok(PeekOutcome::Running),
+            Ok(PeekOutcome::Foreign(Foreign::Orphaned)),
+            Ok(PeekOutcome::Foreign(Foreign::Orphaned)),
+        ])
+    });
 
     child.kill_tree().expect("a running root's group is killed");
 
-    assert_eq!(forced_peeks_left(), 1, "the decision looked at the root twice");
+    assert_eq!(fake.peeks_left(), 1, "the decision looked at the root twice");
+    drop(fake.peeks([]));
     assert_eq!(groups.killed(), vec![pid as i32]);
     drop(writer);
 }
@@ -582,17 +603,19 @@ fn kill_tree_decides_on_one_look_at_the_root() {
 #[skuld::test]
 fn kill_tree_skips_its_backstop_for_a_root_orphaned_during_the_sweep() {
     crate::log_capture::install();
-    let (child, writer) = walked_blocker();
+    let (mut child, writer) = walked_blocker();
     let pid = child.id().pid();
     let sends = Capture::start();
     let mark = crate::log_capture::mark();
-    let _looks = force_peeks([Ok(PeekOutcome::Running), Ok(PeekOutcome::Foreign(Foreign::Orphaned))]);
+    let fake = child
+        .proc
+        .script_over(|f| f.peeks([Ok(PeekOutcome::Running), Ok(PeekOutcome::Foreign(Foreign::Orphaned))]));
 
     child
         .kill_tree()
         .expect("the sweep killed the tree; the backstop has nothing to do");
 
-    assert_peeks_exhausted();
+    fake.assert_peeks_exhausted();
     assert_eq!(sends.entries(), vec![], "the backstop must send nothing");
     assert!(
         sends.by_identity().contains(&(pid, libc::SIGKILL)),
@@ -609,14 +632,16 @@ fn kill_tree_skips_its_backstop_for_a_root_orphaned_during_the_sweep() {
 #[skuld::test]
 fn kill_tree_keeps_its_backstop_for_an_unknown_root() {
     crate::log_capture::install();
-    let (child, writer) = walked_blocker();
+    let (mut child, writer) = walked_blocker();
     let pid = child.id().pid();
     let sends = Capture::start();
-    let _looks = force_peeks([Ok(PeekOutcome::Running), Err(std::io::Error::other("unreadable"))]);
+    let fake = child
+        .proc
+        .script_over(|f| f.peeks([Ok(PeekOutcome::Running), Err(std::io::Error::other("unreadable"))]));
 
     child.kill_tree().expect("the backstop kills through the handle");
 
-    assert_peeks_exhausted();
+    fake.assert_peeks_exhausted();
     assert_eq!(sends.entries(), vec![(pid, Sig::Kill, Via::Identity)]);
     drop(writer);
 }
@@ -633,8 +658,10 @@ fn an_uncontained_child_hears_why_it_has_no_tree_not_why_its_root_is_unpinned() 
     let mut cmd = Command::new();
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
-    let child = cmd.spawn().expect("spawn");
-    let _looks = force_peeks([Ok(PeekOutcome::Foreign(Foreign::Orphaned))]);
+    let mut child = cmd.spawn().expect("spawn");
+    let fake = child
+        .proc
+        .script_over(|f| f.peeks([Ok(PeekOutcome::Foreign(Foreign::Orphaned))]));
 
     for (op, result) in [
         ("kill_tree", child.kill_tree()),
@@ -649,7 +676,8 @@ fn an_uncontained_child_hears_why_it_has_no_tree_not_why_its_root_is_unpinned() 
             "{op}: expected the containment error, got {result:?}"
         );
     }
-    assert_eq!(forced_peeks_left(), 1, "the root's state was read");
+    assert_eq!(fake.peeks_left(), 1, "the root's state was read");
+    drop(fake.peeks([]));
     drop(writer);
 }
 
@@ -672,7 +700,7 @@ fn a_closed_front_gate_outranks_an_unpinned_root() {
         // The gate looks at the front (twice for a kill, once for a terminate), and the state, read
         // wrongly first, would take the front's `Running` and let the gate see the `Orphaned`
         // one: an exited front, which is signalled.
-        let looks = if op == "terminate" {
+        let peeks = if op == "terminate" {
             vec![Ok(PeekOutcome::Running), Ok(PeekOutcome::Foreign(Foreign::Orphaned))]
         } else {
             vec![
@@ -681,7 +709,7 @@ fn a_closed_front_gate_outranks_an_unpinned_root() {
                 Ok(PeekOutcome::Foreign(Foreign::Orphaned)),
             ]
         };
-        let _looks = force_peeks(looks);
+        let fake = child.proc.script_over(|f| f.peeks(peeks));
 
         let err = match op {
             "kill" => child.kill(),
@@ -701,10 +729,11 @@ fn a_closed_front_gate_outranks_an_unpinned_root() {
             "{op}: {err:?}"
         );
         assert_eq!(
-            forced_peeks_left(),
+            fake.peeks_left(),
             1,
             "{op}: the root's state was read before the gate, or the gate was not"
         );
+        drop(fake.peeks([]));
         drop(writer);
     }
 }
