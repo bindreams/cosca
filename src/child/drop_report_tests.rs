@@ -2,7 +2,6 @@
 //! however many steps (the unsettled root, the refused kill, the failed reap) each had to say. Each
 //! test forces the looks it counts on and asserts they were all made.
 
-use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peek_once};
 use crate::{Command, ContainMode};
 
 /// Every record at `warn` or above that this thread logged since `mark`.
@@ -14,7 +13,12 @@ fn warns_since(mark: usize) -> Vec<String> {
         .collect()
 }
 
-/// The OS's words for the `EPERM` that `refuse_kills` answers: the warn names the refusal as the OS
+/// One scripted refusal of a kill: the `EPERM` the kernel answers a signal to another user's process.
+fn refused() -> crate::os_process::fake::SignalAnswer {
+    crate::os_process::fake::failed_signal(libc::EPERM)
+}
+
+/// The OS's words for the `EPERM` that [`refused`] answers: the warn names the refusal as the OS
 /// gave it.
 fn refusal() -> String {
     std::io::Error::from_raw_os_error(libc::EPERM).to_string()
@@ -51,15 +55,18 @@ fn failed_write() -> Result<(), crate::error::Error> {
 #[skuld::test]
 fn an_unknown_root_with_a_refused_kill_warns_once() {
     crate::log_capture::install();
-    let (child, writer) = bare_blocker();
+    let (mut child, writer) = bare_blocker();
     let mark = crate::log_capture::mark();
-    let _failed = force_peek_once(Err(std::io::Error::other("forced peek failure")));
-    let _refused = crate::signal::seams::refuse_kills();
+    let fake = child.proc.script_over(|f| {
+        f.peeks([Err(std::io::Error::other("forced peek failure"))])
+            .signals([refused()])
+    });
 
     drop(child);
     drop(writer);
 
-    assert_peeks_exhausted();
+    fake.assert_peeks_exhausted();
+    assert_eq!(fake.signal_calls(), [crate::signal::Sig::Kill], "the drop's kill");
     let warns = warns_since(mark);
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(
@@ -78,7 +85,7 @@ fn an_unknown_root_with_a_refused_kill_warns_once() {
 fn finish_elevated_with_an_unknown_root_and_a_failed_reap_warns_once() {
     crate::log_capture::install();
     let _recorder = crate::containment::unix::fault::record_kill_group();
-    let (child, writer) = session_blocker();
+    let (mut child, writer) = session_blocker();
     let pid = child.id().pid();
     // Released once the cleanup's root kill returned, before its reap (the forced failure comes
     // after the reap, which records nothing): the root must be a zombie that died of `SIGKILL`.
@@ -87,12 +94,14 @@ fn finish_elevated_with_an_unknown_root_and_a_failed_reap_warns_once() {
         crate::test_child::assert_zombie_sigkilled("the root", pid);
     });
     let mark = crate::log_capture::mark();
-    let _failed = force_peek_once(Err(std::io::Error::other("forced peek failure")));
+    let fake = child
+        .proc
+        .script_over(|f| f.peeks([Err(std::io::Error::other("forced peek failure"))]));
     crate::child::spawn::fault::set_force_reap_failure("cosca-unknown-reap-9d1c");
 
     let err = crate::child::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
 
-    assert_peeks_exhausted();
+    fake.assert_peeks_exhausted();
     assert!(
         crate::child::spawn::fault::take_force_reap_failure().is_none(),
         "the cleanup consumed the forced failure"
@@ -115,10 +124,11 @@ fn finish_elevated_with_an_unknown_root_and_a_failed_reap_warns_once() {
 #[skuld::test]
 fn finish_elevated_leaves_the_handle_armed_when_the_root_kill_was_refused() {
     crate::log_capture::install();
-    let (child, writer) = bare_blocker();
+    let (mut child, writer) = bare_blocker();
     let teardowns = crate::child::owned::seams::record_root_teardowns();
     let mark = crate::log_capture::mark();
-    let refused = crate::signal::seams::refuse_kills();
+    // The cleanup's kill, then the drop's retry.
+    let fake = child.proc.script_over(|f| f.signals([refused(), refused()]));
 
     let err = crate::child::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
 
@@ -127,10 +137,10 @@ fn finish_elevated_leaves_the_handle_armed_when_the_root_kill_was_refused() {
         1,
         "the handle's drop retries the refused root kill ({err:?})"
     );
+    assert_eq!(fake.signal_calls().len(), 2, "the cleanup's kill and the retry");
     let warns = warns_since(mark);
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(warns[0].contains(&refusal()), "{warns:?}");
-    drop(refused);
     drop(writer);
 }
 
@@ -142,17 +152,20 @@ fn finish_elevated_leaves_the_handle_armed_when_the_root_kill_was_refused() {
 #[skuld::test]
 fn a_retry_that_fails_anew_warns_of_the_new_failure() {
     crate::log_capture::install();
-    let (child, writer) = bare_blocker();
+    let (mut child, writer) = bare_blocker();
     let teardowns = crate::child::owned::seams::record_root_teardowns();
     let mark = crate::log_capture::mark();
     let err_peek = || Err(std::io::Error::other("forced peek failure"));
     // The cleanup's read, then the drop's.
-    let _looks = crate::wait::exit_only::seams::force_peeks([err_peek(), err_peek()]);
-    let refused = crate::signal::seams::refuse_kills();
+    // The cleanup's kill is refused, and so is the drop's retry.
+    let fake = child
+        .proc
+        .script_over(|f| f.peeks([err_peek(), err_peek()]).signals([refused(), refused()]));
 
     let err = crate::child::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
 
-    assert_peeks_exhausted();
+    fake.assert_peeks_exhausted();
+    assert_eq!(fake.signal_calls().len(), 2, "the cleanup's kill and the retry");
     assert_eq!(teardowns.count(), 1, "the handle's drop retries ({err:?})");
     let warns = warns_since(mark);
     assert_eq!(warns.len(), 2, "{warns:?}");
@@ -164,7 +177,6 @@ fn a_retry_that_fails_anew_warns_of_the_new_failure() {
         warns[1].starts_with("Child::drop:") && warns[1].contains("could not be terminated"),
         "the retry's own refusal is warned of: {warns:?}"
     );
-    drop(refused);
     drop(writer);
 }
 
@@ -175,28 +187,23 @@ fn a_retry_that_fails_anew_warns_of_the_new_failure() {
 /// Mutant: the drop's report ignores that the cleanup already warned.
 #[skuld::test]
 fn a_retry_that_only_repeats_the_cleanups_warn_is_debug() {
-    use std::cell::RefCell;
-    use std::rc::Rc;
-
     crate::log_capture::install();
-    let (child, writer) = bare_blocker();
+    let (mut child, writer) = bare_blocker();
     // Released once the drop's retried kill returned: that kill is the one that lands.
     let blocker = crate::child::spawn::fault::release_at_drop_kill(writer);
     let teardowns = crate::child::owned::seams::record_root_teardowns();
     let mark = crate::log_capture::mark();
     let err_peek = || Err(std::io::Error::other("forced peek failure"));
     // The cleanup's read, then the drop's.
-    let _looks = crate::wait::exit_only::seams::force_peeks([err_peek(), err_peek()]);
-    // The refusal ends as the cleanup's own refused kill is looked at, so the drop's retry lands.
-    let refused = Rc::new(RefCell::new(Some(crate::signal::seams::refuse_kills())));
-    let _heals = crate::child::spawn::fault::set_between_kill_and_wait({
-        let refused = Rc::clone(&refused);
-        move || drop(refused.borrow_mut().take())
-    });
+    // Only the cleanup's own kill is refused, so the drop's retry lands.
+    let fake = child
+        .proc
+        .script_over(|f| f.peeks([err_peek(), err_peek()]).signals([refused()]));
 
     let err = crate::child::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
 
-    assert_peeks_exhausted();
+    fake.assert_peeks_exhausted();
+    assert_eq!(fake.signal_calls().len(), 2, "the cleanup's kill and the retry");
     assert_eq!(teardowns.count(), 1, "the handle's drop retries ({err:?})");
     let warns = warns_since(mark);
     assert_eq!(warns.len(), 1, "{warns:?}");
@@ -270,15 +277,17 @@ fn a_transient_tree_kill_failure_is_retried_by_the_drop() {
 #[skuld::test]
 fn a_handle_that_could_not_say_is_logged_when_the_number_shows_the_reap() {
     crate::log_capture::install();
-    let (child, _writer) = session_blocker();
+    let (mut child, _writer) = session_blocker();
     let mark = crate::log_capture::mark();
     let _number = crate::child::fault::force_next_root_read(crate::identity::Resolved::Gone);
-    let _failed = force_peek_once(Err(std::io::Error::other("handle doubt 6e2")));
+    let fake = child
+        .proc
+        .script_over(|f| f.peeks([Err(std::io::Error::other("handle doubt 6e2"))]));
 
     let view =
         crate::containment::DropView::read("labelled-reader", child.id, || child.proc.state(), &child.tree_killed);
 
-    assert_peeks_exhausted();
+    fake.assert_peeks_exhausted();
     assert!(
         matches!(view.root, crate::containment::dispatch::RootView::Reaped),
         "{:?}",

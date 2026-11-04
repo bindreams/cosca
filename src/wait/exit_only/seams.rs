@@ -85,7 +85,7 @@ pub(crate) fn assert_peeks_exhausted() {
 
 /// Every peek on this thread answers `answer()`, after any of [`force_peeks`], until the guard drops:
 /// for a test that cannot count the looks a call takes.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "tokio"))]
 pub(crate) fn force_every_peek(answer: PeekAnswer) -> Forced {
     FORCED_EVERY_PEEK.with(|f| f.set(Some(answer)));
     Forced(|| FORCED_EVERY_PEEK.with(|f| f.set(None)))

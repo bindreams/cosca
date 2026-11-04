@@ -13,6 +13,7 @@ use crate::child::owned::seams::record_root_teardowns;
 use crate::command::Command;
 use crate::elevation::{Backend, ElevatedStdio, ElevatedVia, ElevationReport};
 use crate::error::{ElevationErrorKind, Error};
+use crate::os_process::fake::failed_signal;
 use crate::{ContainMode, Containment, Stdio};
 
 pub(crate) fn report(via: ElevatedVia) -> Option<ElevationReport> {
@@ -76,27 +77,25 @@ fn kill_of_a_live_front_is_unkillable_and_sends_nothing() {
 /// signal to its zombie is refused, as the root program's is with direct exec.
 #[skuld::test]
 fn kill_of_an_exited_front_is_ok() {
-    let (child, stdin) = spawn_as(cat(), ElevatedVia::Wrapped(Backend::Sudo));
+    let (mut child, stdin) = spawn_as(cat(), ElevatedVia::Wrapped(Backend::Sudo));
     drop(stdin);
     crate::test_child::wait_until_zombie(child.id().pid());
-    let refused = crate::signal::seams::refuse_kills();
+    child.proc.script_over(|f| f.signals([failed_signal(libc::EPERM)]));
     child.kill().expect("an exited front is killed like any child");
-    drop(refused);
     assert!(child.wait().expect("wait").success());
 }
 
 /// An exited front's kill that fails other than by a refusal fails.
 #[skuld::test]
 fn kill_of_an_exited_front_returns_any_other_failure() {
-    let (child, stdin) = spawn_as(cat(), ElevatedVia::Wrapped(Backend::Sudo));
+    let (mut child, stdin) = spawn_as(cat(), ElevatedVia::Wrapped(Backend::Sudo));
     drop(stdin);
     crate::test_child::wait_until_zombie(child.id().pid());
-    let failing = crate::signal::seams::fail_kills_with(libc::EINVAL);
+    child.proc.script_over(|f| f.signals([failed_signal(libc::EINVAL)]));
     match child.kill() {
         Err(Error::Io(io)) => assert_eq!(io.kind(), std::io::ErrorKind::InvalidInput, "{io}"),
         other => panic!("expected the kill's own failure, got {other:?}"),
     }
-    drop(failing);
     assert!(child.wait().expect("wait").success());
 }
 
@@ -105,14 +104,13 @@ fn kill_of_an_exited_front_returns_any_other_failure() {
 fn kill_tree_of_an_exited_front_is_ok() {
     let mut cmd = cat();
     cmd.contain_with(ContainMode::Session);
-    let (child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
+    let (mut child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
     drop(stdin);
     crate::test_child::wait_until_zombie(child.id().pid());
-    let refused = crate::signal::seams::refuse_kills();
+    child.proc.script_over(|f| f.signals([failed_signal(libc::EPERM)]));
     child
         .kill_tree()
         .expect("an exited front's tree is killed like any child's");
-    drop(refused);
     assert!(child.wait().expect("wait").success());
 }
 
@@ -243,9 +241,6 @@ fn graceful_shutdown_of_a_front_that_exits_within_the_grace_returns_its_status()
 /// before the escalation ends it and arms the kill's outcome.
 #[skuld::test]
 fn graceful_shutdown_of_a_front_that_exits_before_its_escalation() {
-    use std::cell::RefCell;
-    use std::rc::Rc;
-
     use crate::child::graceful::fault::{at, HookPoint};
     for errno in [libc::EPERM, libc::EINVAL] {
         let mut cmd = Command::new();
@@ -259,17 +254,14 @@ fn graceful_shutdown_of_a_front_that_exits_before_its_escalation() {
             .read_exact(&mut ready)
             .expect("read `ready`");
         let pid = child.id().pid();
-        let failing = Rc::new(RefCell::new(None));
-        let _hook = at(HookPoint::BeforeEscalation, {
-            let failing = Rc::clone(&failing);
-            move || {
-                drop(stdin);
-                crate::test_child::wait_until_zombie(pid);
-                *failing.borrow_mut() = Some(crate::signal::seams::fail_kills_with(errno));
-            }
+        let fake = child.proc.script_over(|f| f);
+        let _hook = at(HookPoint::BeforeEscalation, move || {
+            drop(stdin);
+            crate::test_child::wait_until_zombie(pid);
+            // The escalation's kill is the next signal.
+            drop(fake.signals([failed_signal(errno)]));
         });
         let result = child.graceful_shutdown(Duration::ZERO);
-        drop(failing.borrow_mut().take());
         if errno == libc::EPERM {
             assert!(result.expect("a refused kill of an exited front is Ok").success());
         } else {
@@ -479,10 +471,10 @@ fn a_failed_password_write_to_a_front_that_had_exited_says_so() {
     let mut cmd = cat();
     // The drop, whose own teardown would ask the gate again, is opted out of.
     cmd.kill_on_drop(false);
-    let (child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
+    let (mut child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
     drop(stdin);
     crate::test_child::wait_until_zombie(child.id().pid());
-    let _refused = crate::signal::seams::refuse_kills();
+    child.proc.script_over(|f| f.signals([failed_signal(libc::EPERM)]));
     let gates = crate::elevation::front::seams::count_kill_gates();
     let (err, fate) = crate::child::spawn::finish_elevated(
         child,
@@ -513,10 +505,10 @@ fn a_failed_password_write_to_a_front_that_had_exited_says_so() {
 fn a_failed_password_write_whose_exited_front_cannot_be_reaped_says_it_had_exited() {
     let mut cmd = cat();
     cmd.kill_on_drop(false);
-    let (child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
+    let (mut child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
     drop(stdin);
     crate::test_child::wait_until_zombie(child.id().pid());
-    let _refused = crate::signal::seams::refuse_kills();
+    child.proc.script_over(|f| f.signals([failed_signal(libc::EPERM)]));
     crate::child::spawn::fault::set_force_reap_failure("forced reap failure");
     let (err, fate) = crate::child::spawn::finish_elevated(
         child,
@@ -671,8 +663,8 @@ fn a_failed_spawn_leaves_an_elevation_front_running_and_says_so() {
 }
 
 /// A child that is not a front outside a cgroup keeps its refused escalation the raw `Io`, not
-/// `Unkillable`. A pkexec child is one, as is any child in a cgroup. Its kill is refused by a seam,
-/// and it ignores `SIGTERM`, so the escalation runs.
+/// `Unkillable`. A pkexec child is one, as is any child in a cgroup. Its `SIGTERM` is answered as
+/// delivered and its kill is refused, so the escalation runs.
 #[skuld::test]
 fn graceful_shutdown_of_a_child_that_is_not_a_front_keeps_its_io_refusal() {
     let mut cmd = Command::new();
@@ -685,13 +677,18 @@ fn graceful_shutdown_of_a_child_that_is_not_a_front_keeps_its_io_refusal() {
         .expect("stdout pipe")
         .read_exact(&mut ready)
         .expect("read `ready`");
-    {
-        let _refused = crate::signal::seams::refuse_kills();
-        match child.graceful_shutdown(Duration::ZERO) {
-            Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}"),
-            other => panic!("expected the raw Io(PermissionDenied), got {other:?}"),
-        }
+    let fake = child
+        .proc
+        .script_over(|f| f.signals([Ok(crate::signal::Sent::Delivered), failed_signal(libc::EPERM)]));
+    match child.graceful_shutdown(Duration::ZERO) {
+        Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}"),
+        other => panic!("expected the raw Io(PermissionDenied), got {other:?}"),
     }
+    assert_eq!(
+        fake.signal_calls(),
+        [crate::signal::Sig::Term, crate::signal::Sig::Kill],
+        "the escalation was reached"
+    );
     assert_ends_unsignalled(&child, stdin);
 }
 

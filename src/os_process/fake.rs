@@ -43,6 +43,12 @@ pub(crate) type PeekAnswer = Result<PeekOutcome, std::io::Error>;
 /// state a raw errno.
 pub(crate) type SignalAnswer = Result<Sent, std::io::Error>;
 
+/// A failed [`SignalAnswer`]: the signal is refused with the raw `errno`.
+#[cfg(unix)]
+pub(crate) fn failed_signal(errno: i32) -> SignalAnswer {
+    Err(std::io::Error::from_raw_os_error(errno))
+}
+
 /// Cloning gives another handle on the same tables and the same wake source: the test keeps one,
 /// the code under test owns the other.
 #[derive(Clone)]
