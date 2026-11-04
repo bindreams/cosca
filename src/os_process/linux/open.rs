@@ -15,7 +15,7 @@ use std::os::fd::AsFd;
 use rustix::process::Pid;
 
 use crate::error::Error;
-use crate::identity::{Existence, Kernel, Liveness, PidfdTarget, ProcDir, ProcView, ProcessId, ViewUnreadable};
+use crate::identity::{Existence, Kernel, Liveness, PidfdTarget, ProcView, ProcessId, ViewUnreadable};
 use crate::os_process::OPEN_CONSEQUENCE;
 
 /// The operation an `Unsupported` open names.
@@ -124,9 +124,9 @@ fn verify_without_pidfd(
         return Ok(None);
     }
     match crate::identity::proc_view_with(kernel) {
-        ProcView::Same(proc_dir) => match exists_checked(kernel, id, &proc_dir) {
+        ProcView::Same(proc_dir) => match id.exists_in(kernel, &proc_dir) {
             Existence::Gone => Ok(None),
-            Existence::Present => match alive_checked(kernel, id, &proc_dir) {
+            Existence::Present => match id.is_alive_in(kernel, &proc_dir) {
                 Liveness::Dead => Ok(None),
                 Liveness::Alive => Err(Error::NotThreadGroupLeader {
                     pid: id.pid(),
@@ -183,7 +183,7 @@ fn verify_pidfd_target(
     }
     // A pid recycled before open means the original is already gone. An unassessable pid
     // (hidepid, EPERM) is NOT gone and must not be treated as one.
-    match exists_checked(kernel, id, &proc_dir) {
+    match id.exists_in(kernel, &proc_dir) {
         Existence::Present => Ok(Some(pidfd)),
         Existence::Gone => Ok(None),
         Existence::Unknown => Err(unassessable(id, "the OS refused the existence query", None, None)),
@@ -240,42 +240,11 @@ fn pidfd_open_checked(kernel: &dyn Kernel, raw: Pid) -> Result<rustix::fd::Owned
     kernel.pidfd_open(raw)
 }
 
-/// Test seam: a forced [`Existence`] (see [`fault::force_exists_once`]) replaces the `/proc` read
-/// once, to drive the `Unknown` arms.
-#[cfg(test)]
-fn exists_checked(kernel: &dyn Kernel, id: ProcessId, proc_dir: &ProcDir) -> Existence {
-    match fault::take_forced_exists() {
-        Some(existence) => existence,
-        None => id.exists_in(kernel, proc_dir),
-    }
-}
-#[cfg(not(test))]
-fn exists_checked(kernel: &dyn Kernel, id: ProcessId, proc_dir: &ProcDir) -> Existence {
-    id.exists_in(kernel, proc_dir)
-}
-
-/// Test seam: a forced [`Liveness`] (see [`fault::force_alive_once`]) replaces the `/proc` read once.
-#[cfg(test)]
-fn alive_checked(kernel: &dyn Kernel, id: ProcessId, proc_dir: &ProcDir) -> Liveness {
-    match fault::take_forced_alive() {
-        Some(liveness) => liveness,
-        None => id.is_alive_in(kernel, proc_dir),
-    }
-}
-#[cfg(not(test))]
-fn alive_checked(kernel: &dyn Kernel, id: ProcessId, proc_dir: &ProcDir) -> Liveness {
-    id.is_alive_in(kernel, proc_dir)
-}
-
 #[cfg(test)]
 pub(crate) mod fault {
-    use crate::identity::{Existence, Liveness};
-    use std::cell::Cell;
     thread_local! {
         static FORCE_PIDFD_OPEN_ERRNO: std::cell::RefCell<std::collections::VecDeque<Option<rustix::io::Errno>>> =
             const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
-        static FORCE_EXISTS: Cell<Option<Existence>> = const { Cell::new(None) };
-        static FORCE_ALIVE: Cell<Option<Liveness>> = const { Cell::new(None) };
     }
 
     /// Disarms the forced errno on drop, so an unconsumed force can't leak into the next test on
@@ -306,48 +275,6 @@ pub(crate) mod fault {
 
     pub(crate) fn take_forced_pidfd_open_errno() -> Option<rustix::io::Errno> {
         FORCE_PIDFD_OPEN_ERRNO.with(|f| f.borrow_mut().pop_front().flatten())
-    }
-
-    /// Disarms the forced `Existence` on drop; see [`ForcedPidfdOpenErrno`].
-    #[must_use = "dropping this immediately disarms the forced existence; bind it for the probe's duration"]
-    pub(crate) struct ForcedExists(());
-
-    /// Force the NEXT `id.exists()` re-verify inside `open_verified` on THIS thread to answer
-    /// `existence`, consumed the first time it's read.
-    pub(crate) fn force_exists_once(existence: Existence) -> ForcedExists {
-        FORCE_EXISTS.with(|f| f.set(Some(existence)));
-        ForcedExists(())
-    }
-
-    impl Drop for ForcedExists {
-        fn drop(&mut self) {
-            FORCE_EXISTS.with(|f| f.set(None));
-        }
-    }
-
-    pub(crate) fn take_forced_exists() -> Option<Existence> {
-        FORCE_EXISTS.with(|f| f.take())
-    }
-
-    /// Disarms the forced `Liveness` on drop; see [`ForcedPidfdOpenErrno`].
-    #[must_use = "dropping this immediately disarms the forced liveness; bind it for the probe's duration"]
-    pub(crate) struct ForcedAlive(());
-
-    /// Force the NEXT `id.is_alive_in(..)` inside `open_verified` on THIS thread to answer
-    /// `liveness`, consumed the first time it's read.
-    pub(crate) fn force_alive_once(liveness: Liveness) -> ForcedAlive {
-        FORCE_ALIVE.with(|f| f.set(Some(liveness)));
-        ForcedAlive(())
-    }
-
-    impl Drop for ForcedAlive {
-        fn drop(&mut self) {
-            FORCE_ALIVE.with(|f| f.set(None));
-        }
-    }
-
-    pub(crate) fn take_forced_alive() -> Option<Liveness> {
-        FORCE_ALIVE.with(|f| f.take())
     }
 }
 

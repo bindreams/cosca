@@ -388,24 +388,6 @@ pub(crate) fn pidfd_pid_in(
     dir: &ProcDir,
     pidfd: BorrowedFd<'_>,
 ) -> Result<PidfdTarget, ViewUnreadable> {
-    #[cfg(test)]
-    if let Some(forced) = fault::take_forced_fdinfo() {
-        return forced.map_err(|errno| {
-            ViewUnreadable::new(
-                "the pidfd's fdinfo could not be read",
-                Some(io::Error::from_raw_os_error(errno)),
-            )
-        });
-    }
-    pidfd_target_in(kernel, dir, pidfd)
-}
-
-/// [`pidfd_pid_in`] without the test seam: the read and the parse, once.
-pub(crate) fn pidfd_target_in(
-    kernel: &dyn Kernel,
-    dir: &ProcDir,
-    pidfd: BorrowedFd<'_>,
-) -> Result<PidfdTarget, ViewUnreadable> {
     let fdinfo = kernel
         .read(dir, &format!("thread-self/fdinfo/{}", pidfd.as_raw_fd()))
         .and_then(utf8)
@@ -476,7 +458,6 @@ pub(crate) mod fault {
         static PROC_VIEW_FIRED_AT: Cell<Option<u32>> = const { Cell::new(None) };
         static FORCE_PIDS_ERRNO: Cell<Option<i32>> = const { Cell::new(None) };
         static FORCE_IDENTITY_STAT: RefCell<Vec<(u32, i32)>> = const { RefCell::new(Vec::new()) };
-        static FORCE_FDINFO: Cell<Option<Result<super::PidfdTarget, i32>>> = const { Cell::new(None) };
         static FORCE_OPENAT2_ERRNO: Cell<Option<rustix::io::Errno>> = const { Cell::new(None) };
     }
 
@@ -493,7 +474,6 @@ pub(crate) mod fault {
             PROC_VIEW_FIRED_AT.with(|f| f.set(None));
             FORCE_PIDS_ERRNO.with(|f| f.set(None));
             FORCE_IDENTITY_STAT.with(|f| f.borrow_mut().clear());
-            FORCE_FDINFO.with(|f| f.set(None));
             FORCE_OPENAT2_ERRNO.with(|f| f.set(None));
         }
     }
@@ -548,13 +528,6 @@ pub(crate) mod fault {
         force_proc_view_once(view)
     }
 
-    /// Force the NEXT [`pidfd_pid_in`](super::pidfd_pid_in) on THIS thread to answer
-    /// `Ok(pid)`, or to fail reading with the raw `errno`.
-    pub(crate) fn force_fdinfo_once(answer: Result<super::PidfdTarget, i32>) -> Forced {
-        FORCE_FDINFO.with(|f| f.set(Some(answer)));
-        Forced(())
-    }
-
     /// Where the forced view fired: how many [`proc_view_with`](super::proc_view_with) calls on THIS thread
     /// preceded it since it was armed. `None` while it has not fired.
     pub(crate) fn proc_view_fired_at() -> Option<u32> {
@@ -580,10 +553,6 @@ pub(crate) mod fault {
             PROC_VIEW_FIRED_AT.with(|f| f.set(Some(index)));
         }
         forced
-    }
-
-    pub(crate) fn take_forced_fdinfo() -> Option<Result<super::PidfdTarget, i32>> {
-        FORCE_FDINFO.with(|f| f.take())
     }
 }
 

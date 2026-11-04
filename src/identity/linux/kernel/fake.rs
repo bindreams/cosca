@@ -17,8 +17,11 @@ pub(crate) struct FakeKernel<'a> {
     /// What answers a call the tables have nothing for. `None`: such a call panics.
     real: Option<&'a dyn Kernel>,
     open_proc: Option<Errno>,
-    /// `Err` is a raw errno.
-    reads: Vec<(String, Result<Vec<u8>, i32>)>,
+    /// A path, the number of earlier reads of it before the row answers, and the answer. `Err` is a
+    /// raw errno.
+    reads: Vec<(String, usize, Result<Vec<u8>, i32>)>,
+    /// How many times each path has been read.
+    read_counts: Mutex<Vec<(String, usize)>>,
     signal_probes: Vec<(Pid, Result<(), Errno>)>,
     pidfd_opens: Vec<(Pid, PidfdRow)>,
 }
@@ -38,6 +41,7 @@ impl<'a> FakeKernel<'a> {
             real: None,
             open_proc: None,
             reads: Vec::new(),
+            read_counts: Mutex::new(Vec::new()),
             signal_probes: Vec::new(),
             pidfd_opens: Vec::new(),
         }
@@ -52,9 +56,26 @@ impl<'a> FakeKernel<'a> {
     }
 
     /// Reading `path` under any `/proc` answers `answer`: the bytes, or a raw errno.
-    pub(crate) fn on_read(mut self, path: &str, answer: Result<&[u8], i32>) -> Self {
-        self.reads.push((path.to_owned(), answer.map(<[u8]>::to_vec)));
+    pub(crate) fn on_read(self, path: &str, answer: Result<&[u8], i32>) -> Self {
+        self.on_read_after(path, 0, answer)
+    }
+
+    /// From the read of `path` that follows `earlier_reads` reads of it, answers `answer`. Of the
+    /// rows whose count has been reached, the one with the highest count wins.
+    pub(crate) fn on_read_after(mut self, path: &str, earlier_reads: usize, answer: Result<&[u8], i32>) -> Self {
+        self.reads
+            .push((path.to_owned(), earlier_reads, answer.map(<[u8]>::to_vec)));
         self
+    }
+
+    /// `self/status` shows the pid in two namespaces: `/proc` is an outer namespace's.
+    pub(crate) fn diverged_view(self) -> Self {
+        self.on_read("self/status", Ok(b"NSpid:\t4242\t1\n"))
+    }
+
+    /// `self/status` cannot be read (`EIO`).
+    pub(crate) fn unreadable_view(self) -> Self {
+        self.on_read("self/status", Err(libc::EIO))
     }
 
     /// `kill(target, 0)` answers `answer`.
@@ -79,6 +100,21 @@ impl<'a> FakeKernel<'a> {
     pub(crate) fn open_proc_fails(mut self, errno: Errno) -> Self {
         self.open_proc = Some(errno);
         self
+    }
+
+    /// Notes a read of `path` and returns how many reads of it came before.
+    fn count_read(&self, path: &str) -> usize {
+        let mut counts = self.read_counts.lock().expect("no panic holds the counts");
+        match counts.iter_mut().find(|(p, _)| p == path) {
+            Some((_, n)) => {
+                *n += 1;
+                *n - 1
+            }
+            None => {
+                counts.push((path.to_owned(), 1));
+                0
+            }
+        }
     }
 
     fn real(&self, call: &str) -> &'a dyn Kernel {
@@ -107,9 +143,15 @@ impl Kernel for FakeKernel<'_> {
     }
 
     fn read(&self, dir: &ProcDir, path: &str) -> io::Result<Vec<u8>> {
-        match self.reads.iter().rev().find(|(p, _)| p == path) {
-            Some((_, Ok(bytes))) => Ok(bytes.clone()),
-            Some((_, Err(errno))) => Err(io::Error::from_raw_os_error(*errno)),
+        let earlier = self.count_read(path);
+        let row = self
+            .reads
+            .iter()
+            .filter(|(p, from, _)| p == path && *from <= earlier)
+            .max_by_key(|(_, from, _)| *from);
+        match row {
+            Some((_, _, Ok(bytes))) => Ok(bytes.clone()),
+            Some((_, _, Err(errno))) => Err(io::Error::from_raw_os_error(*errno)),
             None => self.real(&format!("read of {path}")).read(dir, path),
         }
     }
