@@ -6,10 +6,10 @@ mod unix {
     use std::process::ExitStatus;
 
     use crate::os_process::child::ExitRecord;
-    use crate::wait::exit_only::{is_exit_record, reaped_from_record, Record};
+    use crate::wait::exit_only::{exit_record_of, is_exit_record, Record};
 
     fn status(code: i32, si_status: i32) -> ExitRecord {
-        reaped_from_record(Record {
+        exit_record_of(Record {
             si_code: code,
             si_status,
         })

@@ -452,8 +452,8 @@ fn echild() -> io::Error {
 }
 
 /// The status a cached outcome answers.
-fn status_of(reaped: ExitRecord) -> io::Result<ExitStatus> {
-    match reaped {
+fn status_of(record: ExitRecord) -> io::Result<ExitStatus> {
+    match record {
         ExitRecord::Status(status) => Ok(status),
         ExitRecord::Unreadable { si_code } => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -480,8 +480,8 @@ impl SharedChild {
     /// child that another thread is waiting on: that thread reaps it.
     pub(crate) fn try_wait(&self) -> io::Result<Option<ExitStatus>> {
         let mut lock = self.lock();
-        if let State::E(reaped) = lock.state {
-            return status_of(reaped).map(Some);
+        if let State::E(record) = lock.state {
+            return status_of(record).map(Some);
         }
         let Some(target) = self.target() else {
             return Err(echild());
@@ -491,14 +491,14 @@ impl SharedChild {
             // Another thread holds `W`, so only it reaps: report what a peek sees.
             State::W { .. } => self.peeked_status(&target),
             State::N => match exit_only::try_reap(&target)? {
-                Reap::Reaped(reaped) => {
-                    lock.set(State::E(reaped));
+                Reap::Reaped(record) => {
+                    lock.set(State::E(record));
                     self.notify(&mut lock);
                     drop(lock);
                     #[cfg(test)]
                     seams::park_after_reap_recorded();
-                    self.log_unreadable(reaped);
-                    status_of(reaped).map(Some)
+                    self.log_unreadable(record);
+                    status_of(record).map(Some)
                 }
                 Reap::Running => Ok(None),
                 Reap::Foreign(_) => Err(echild()),
@@ -615,8 +615,8 @@ impl SharedChild {
 
     /// A contract breach after the `E` write: a consuming reap handed back a record that is not
     /// an exit. The state is already `E`, so this must run with the lock released.
-    fn log_unreadable(&self, reaped: ExitRecord) {
-        if let ExitRecord::Unreadable { si_code } = reaped {
+    fn log_unreadable(&self, record: ExitRecord) {
+        if let ExitRecord::Unreadable { si_code } = record {
             log::warn!(
                 "pid {}: a consuming waitid returned si_code {si_code}, not an exit record",
                 self.id()
@@ -629,7 +629,7 @@ impl SharedChild {
     fn peeked_status(&self, target: &Target<'_>) -> io::Result<Option<ExitStatus>> {
         match exit_only::peek(target)? {
             PeekOutcome::Running => Ok(None),
-            PeekOutcome::Exit(reaped) => status_of(reaped).map(Some),
+            PeekOutcome::Exit(record) => status_of(record).map(Some),
             PeekOutcome::Foreign(_) => Err(echild()),
         }
     }

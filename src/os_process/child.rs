@@ -9,8 +9,7 @@ use crate::error::ChildFate;
 pub(crate) enum ExitRecord {
     Status(ExitStatus),
     /// A consuming `waitid` that should have handed back a zombie's exit record gave another
-    /// `si_code`. A contract breach, but the zombie is consumed, so it is a cached outcome. Only
-    /// `waitid` produces it, so only Unix.
+    /// `si_code`. A contract breach, but the zombie is consumed, so it is a cached outcome.
     #[cfg_attr(windows, allow(dead_code, reason = "Windows has no `waitid` records"))]
     Unreadable {
         si_code: i32,
@@ -26,17 +25,15 @@ pub(crate) enum ExitRecord {
 pub(crate) enum Foreign {
     /// The OS answered `ECHILD`, or a by-pid consume found nothing: something else reaped it.
     Gone,
-    /// The pid names another process now: its start time differs from the child's. Only macOS
-    /// reads a child by pid.
+    /// The pid names another process now: its start time differs from the child's.
     #[cfg_attr(
         not(target_os = "macos"),
         allow(dead_code, reason = "only macOS reads a child by a pid that can be reused")
     )]
     Other,
     /// `ECHILD` for a pid that still names the child, held by launchd: its tracer died and XNU
-    /// reparented it. It has exited and is not this process's to reap, so its fate is `Gone` as for
-    /// any foreign verdict ([`Foreign::fate`]); the variant stays apart so that a log can say why.
-    /// Nothing is signalled or reaped by pid. Only macOS has such a zombie.
+    /// reparented it. It has exited and is not this process's to reap. Kept apart from `Gone` so
+    /// that a log can say why.
     #[cfg_attr(
         not(target_os = "macos"),
         allow(dead_code, reason = "only macOS has a zombie launchd holds")
@@ -45,9 +42,8 @@ pub(crate) enum Foreign {
 }
 
 impl Foreign {
-    /// What became of a child this evidence shows is not this process's to reap: it has exited, and
-    /// someone else holds or has collected its exit. That includes a zombie launchd holds. Every path
-    /// that maps this evidence to a fate uses this, so one situation has one fate:
+    /// The fate of a child that is not this process's to reap. Every path that maps a `Foreign` to a
+    /// fate uses this:
     ///
     /// - `kill_delivered`: cosca's kill was delivered, so the child is [`Killed`](ChildFate::Killed):
     ///   dead or dying, its exit not collected by cosca.

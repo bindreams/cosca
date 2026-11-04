@@ -7,7 +7,7 @@ use std::io;
 
 use crate::identity::{held_by, uniq_info, Held, ReadPurpose, UniqRead, LAUNCHD};
 
-use super::{is_exit_record, reaped_from_record, Reap, Record, Target};
+use super::{exit_record_of, is_exit_record, Reap, Record, Target};
 use crate::os_process::child::{Foreign, PeekOutcome};
 
 fn pid_and_unique(target: &Target<'_>) -> (u32, Option<u64>) {
@@ -52,7 +52,7 @@ fn peek_raw(pid: u32) -> io::Result<PeekOutcome> {
         return forced;
     }
     match waitid_record(pid, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT) {
-        Ok(Some(record)) if is_exit_record(record.si_code) => Ok(PeekOutcome::Exit(reaped_from_record(record))),
+        Ok(Some(record)) if is_exit_record(record.si_code) => Ok(PeekOutcome::Exit(exit_record_of(record))),
         Ok(_) => Ok(PeekOutcome::Running),
         Err(e) if is_echild(&e) => Ok(PeekOutcome::Foreign(Foreign::Gone)),
         Err(e) => Err(e),
@@ -183,7 +183,7 @@ pub(super) fn try_reap(target: &Target<'_>) -> io::Result<Reap> {
         UniqRead::Gone | UniqRead::Refused(_) => None,
     });
     let first = match consume(pid) {
-        Ok(Some(record)) => reaped_from_record(record),
+        Ok(Some(record)) => exit_record_of(record),
         // A by-pid consume is never pinned: a foreign reap between the peek and here, then a
         // reuse of the pid by a child that is still running, finds nothing. A reuser that is our
         // own child and already a zombie has its exit record consumed instead: the id check above

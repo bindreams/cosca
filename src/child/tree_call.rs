@@ -33,9 +33,8 @@ pub(crate) enum RootNumber {
     GroupGone,
 }
 
-/// [`RootNumber`] for `attached`'s tree, from one call of `state`: the root's own handle's answer
-/// (a `Reaped` says whether it is that handle's own reap). On macOS it is always called; elsewhere only
-/// for a mechanism that reaches its tree through the root's number
+/// [`RootNumber`] for `attached`'s tree, from one call of `state`: the root's own handle's answer. On
+/// macOS it is always called; elsewhere only for a mechanism that reaches its tree through the root's number
 /// ([`Attached::needs_root_check`](crate::containment::Attached::needs_root_check)). After this
 /// handle's own reap, a pid that names nothing (`Gone`) is still the id of the root's group while a
 /// member survives, so a group is signalled by it, though once none survives a later process may
@@ -75,7 +74,7 @@ pub(crate) fn root_number(attached: &Attached, pid: RawPid, state: impl FnOnce()
 }
 
 /// Whether the root's pid, `pid`, still names its process group, from `state`: the root's own
-/// handle's answer (a `Reaped` says whether it is that handle's own reap), read for a send by that number
+/// handle's answer, read for a send by that number
 /// ([`GroupRoot::check`], as [`Child::kill_tree`](crate::Child::kill_tree) says). `Ok` while the
 /// root is unreaped, and after this handle's own reap while the pid names no process, as
 /// [`root_number`] decides. `Err` says why not.

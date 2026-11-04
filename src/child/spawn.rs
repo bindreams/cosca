@@ -108,8 +108,7 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
 /// A root whose handle could not say whether it is reaped (`RootState::Unknown`) is killed through
 /// its handle like any other, and the tree kills named by its number are skipped, as for a reaped
 /// root. A root this process does not pin (`RootState::Unpinned`, macOS) is left alone: neither
-/// signalled nor waited on, and the error says so; its fate is `Gone`, as the classifier
-/// ([`Foreign::fate`](crate::os_process::child::Foreign::fate)) gives a zombie launchd holds. The event
+/// signalled nor waited on, and the error says so; its fate is `Gone`. The event
 /// warns once: the unsettled root, a failed reap and any other leftover share one record, labelled
 /// `finish_elevated`.
 ///
@@ -160,7 +159,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     let mut root_settled = true;
     let pid = child.id().pid();
     let (root_note, fate) = if view.unpinned_root() {
-        // Nothing was signalled, so a foreign child (a zombie launchd holds too) is `Gone`.
+        // Nothing was signalled.
         let fate = crate::os_process::child::Foreign::Gone.fate(false);
         (
             format!(
@@ -747,7 +746,7 @@ fn leave_front_after_attach_failure(child: std::process::Child) -> FrontFate {
 /// The checks are not pins: macOS has no handle, so the kill has `via_verified_pid`'s window
 /// between its id check and `kill(2)`, and the reap has `try_reap`'s between its id check and the
 /// consuming `waitid`. A child that cannot be shown ours (a refused id read) is left with a `warn`;
-/// a zombie launchd holds is not ours to reap, and is `Gone` (see [`Foreign::fate`](crate::os_process::child::Foreign::fate)).
+/// a zombie launchd holds is not ours to reap, and is `Gone`.
 ///
 /// Dropping the `std` `Child` closes our pipe ends only.
 #[cfg(target_os = "macos")]
@@ -1253,8 +1252,7 @@ fn unverifiable(why: &dyn std::fmt::Display) -> String {
 /// shown ours or reaped is noted for the teardown's one `warn`.
 #[cfg(target_os = "macos")]
 ///
-/// `killed`: whether cosca's kill was delivered, which decides the fate of a foreign verdict (see
-/// [`Foreign::fate`](crate::os_process::child::Foreign::fate)).
+/// `killed`: whether cosca's kill was delivered, which decides the fate of a foreign verdict.
 fn reap_verified(
     pid: u32,
     target: &crate::wait::exit_only::Target<'_>,
@@ -2064,8 +2062,7 @@ pub(crate) fn resolve_identity(
         let peeked = crate::wait::exit_only::peek_verified(through);
         match peeked {
             Ok(PeekOutcome::Running | PeekOutcome::Exit(_)) => (read, Diagnosis::default()),
-            // Held by launchd after its tracer died (only macOS has such a zombie). It has exited and is
-            // not ours to reap, so it is `Gone`, with a warning that its zombie is not collected.
+            // Orphaned: `Gone`, warned.
             Ok(PeekOutcome::Foreign(crate::os_process::child::Foreign::Orphaned)) => (
                 Resolved::Gone,
                 Diagnosis::of(format!(
