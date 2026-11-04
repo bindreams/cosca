@@ -40,9 +40,17 @@ use windows as backend;
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use linux::open_own_child;
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "exit_only/linux_tests.rs"]
+mod linux_tests;
+
 /// The second peek-and-consume every first reap on macOS is followed by; tests drive it directly.
 #[cfg(all(target_os = "macos", test))]
 pub(crate) use macos::second_reap;
+
+#[cfg(all(target_os = "macos", test))]
+#[path = "exit_only/macos_tests.rs"]
+pub(crate) mod macos_tests;
 
 #[cfg(test)]
 #[cfg_attr(

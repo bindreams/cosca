@@ -68,6 +68,7 @@ impl Blocker {
     }
 
     /// End the child and wait until its exit is visible, without reaping it.
+    #[cfg(not(target_os = "linux"))]
     pub(super) fn end_child_and_confirm_exit(&mut self) {
         self.end_child();
         confirm_exit(&self.owned, self.pid);
@@ -86,18 +87,10 @@ impl Drop for Blocker {
 }
 
 /// Block until the child's exit is visible, without consuming it.
+#[cfg(not(target_os = "linux"))]
 pub(super) fn confirm_exit(owned: &OwnedChild, pid: u32) {
-    // Linux and Windows wait on the handle, macOS reads the exit by pid.
+    // Windows waits on the handle, macOS reads the exit by pid.
     let _ = (owned, pid);
-    #[cfg(target_os = "linux")]
-    {
-        let target = crate::wait::exit_only::Target::PidFd(owned.os_handle());
-        let peeked = crate::wait::exit_only::wait_visible_exit(&target).expect("wait for the exit");
-        assert!(
-            matches!(peeked, crate::os_process::child::PeekOutcome::Exit(_)),
-            "the exit must be visible, got {peeked:?}"
-        );
-    }
     #[cfg(target_os = "macos")]
     {
         // SAFETY: an all-zero `siginfo_t` is a valid value, and `waitid` writes only into it.
