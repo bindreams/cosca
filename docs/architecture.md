@@ -62,8 +62,24 @@ Each one gets the same treatment before any code:
 
 In order:
 
-1. **Processes:** the stack above. [#839](https://github.com/bindreams/cosca/issues/839) records the
-   owner decisions and the PR plan.
+1. **Processes:** the stack above, in place for the sync `Child`: it reaches its process through one
+   `OwnedChild` over a per-OS `OsChild`, and every blocking wait runs through `drive::run`.
+   [#839](https://github.com/bindreams/cosca/issues/839) records the owner decisions and the PR
+   plan. What is still the old shape, and which step takes it:
+   - The async `Child` (the PR that moves it onto the stack): `terminate_by_id`, which its
+     graceful path sends through; `GroupRoot::new` with no `ReapHold` at its six sites
+     (`tokio/child.rs` five, `tokio/child/graceful.rs` one); its tests' hooks, `exit_only::seams`
+     and `signal::seams`, which `Process::kill`'s tests share.
+   - Spawn (the spawn-time slice): `exit_only::Target` and `exit_only::Reap`, which spawn
+     identity, `kill_and_reap_*`, `unique_report` and `PidfdChild` still take by handle or number;
+     `await_reapable` and its kqueue round hooks (macOS), which spawn teardown still waits
+     through; `GroupRoot::new` at the failed-spawn identity check (`spawn.rs`) and the cgroup
+     leaf's abandonment (`leaf.rs`); the `exit_only::seams` their tests use.
+   - Under `MacChild` and `LinuxProcess`: `exit_only::{peek, peek_verified, peek_traced}` still
+     consult the `exit_only::seams` hook. The macOS tests that stage a look inside `MacChild` (a
+     peek that finds no record after the look saw one, a drain of `NOTE_EXIT` before the record is
+     visible, an `ESRCH` registration) have no fake to answer for them, so the hook stays until
+     `exit_only` itself is a boundary.
 2. **Elevation backends:** a black box that says what the tracked process is (the program, or a
    wrapper that outlives it) and what may be signalled. `Child` asks it; it stops knowing sudo,
    doas or osascript.
