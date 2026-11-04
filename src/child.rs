@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::io::{PipeReader, PipeWriter};
 
+use crate::child::owned::teardown::TeardownKind;
 #[cfg(unix)]
 use crate::child::owned::teardown::TeardownOutcome;
 use crate::command::Command;
@@ -1209,7 +1210,7 @@ impl Child {
                 };
                 left.push(format!("contained-tree teardown did not fully succeed: {e}{orphaned}"));
             }
-            let torn = self.proc.teardown_on_drop(self.id);
+            let torn = self.proc.tear_down(Some(self.id), TeardownKind::Kill, None);
             left.extend(torn.left);
             if !left.is_empty() {
                 log::warn!("Child::drop: {}", left.join("; "));
@@ -1228,7 +1229,7 @@ impl Child {
     /// this root. Each send by the group's number checks the root again, as for
     /// [`kill_tree`](Child::kill_tree). On Linux 6.9+ a process group is decided by the root's pidfd
     /// ([`Attached::hard_kill_for_drop`](crate::containment::Attached::hard_kill_for_drop)). An
-    /// unreaped root stays a zombie, pinning its number, until `teardown_on_drop`.
+    /// unreaped root stays a zombie, pinning its number, until `tear_down`.
     fn drop_unix(&mut self) -> crate::error::ChildFate {
         use crate::child::drop_report::DropReport;
         use crate::error::ChildFate;
@@ -1285,13 +1286,13 @@ impl Child {
             let torn = if cgroup_only {
                 match kill.result.and_then(|()| self.cgroup_kill_reached()) {
                     // The cgroup kill ended it: reap it, sending nothing.
-                    Ok(()) => self.proc.reap_after_tree_kill(self.id.pid()),
+                    Ok(()) => self.proc.reap_after_tree_kill(),
                     // Never waited for. The armed leaf still kills what it holds, retrying a kill
                     // that failed, and the front is looked at once that is done.
                     Err(e) => self.tear_down_leaf_and_look_at_front(&e),
                 }
             } else {
-                self.proc.teardown_on_drop(self.id)
+                self.proc.tear_down(Some(self.id), TeardownKind::Kill, None)
             };
             report.left.extend(torn.left);
             torn.fate

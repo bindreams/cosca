@@ -14,11 +14,19 @@
 use std::process::ExitStatus;
 
 use super::{ChildWaitOutcome, OwnedChild};
-use crate::child::lifecycle::{orphaned_note, status_of_outcome, Orphaned};
+use crate::child::lifecycle::{child_named, orphaned_note, status_of_outcome, Orphaned};
 use crate::error::{ChildFate, Error};
 use crate::identity::ProcessId;
 use crate::os_process::child::Foreign;
 use crate::signal::{Sent, Sig};
+use crate::wait::teardown_warn::{wait_warning, Due};
+
+/// What a teardown does to the child.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum TeardownKind {
+    /// Kill it, then settle it as the module doc says.
+    Kill,
+}
 
 /// What a teardown of the root did: the child's fate, and what it could not do, for the event's one
 /// warn (a child it could not signal and left running, a reap that failed after the kill).
@@ -36,46 +44,57 @@ impl TeardownOutcome {
 }
 
 impl OwnedChild {
-    /// Best-effort teardown for `kill_on_drop`: kill, then settle the child as the module doc says.
+    /// Best-effort teardown, the one entry point: do what `kind` says, then settle the child. `id`
+    /// is the child's identity, if the caller read one. `due` is the threshold of the slow-teardown
+    /// warn on the blocking wait (`None`: no warn).
+    ///
     /// Returns the child's fate, and what it could not do for the caller's one warn. It logs
-    /// neither above `debug`.
-    pub(crate) fn teardown_on_drop(&self, id: ProcessId) -> TeardownOutcome {
+    /// neither above `debug`, except that slow-teardown warn.
+    pub(crate) fn tear_down(&self, id: Option<ProcessId>, kind: TeardownKind, due: Option<Due>) -> TeardownOutcome {
+        match kind {
+            TeardownKind::Kill => self.kill_and_settle(id, due),
+        }
+    }
+
+    fn kill_and_settle(&self, id: Option<ProcessId>, due: Option<Due>) -> TeardownOutcome {
         #[cfg(test)]
         super::seams::note_root_teardown();
-        let pid = id.pid();
         match self.signal(Sig::Kill) {
             Ok(sent) => {
                 #[cfg(test)]
                 crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterDropKill);
-                match self.wait_after_kill(pid, matches!(sent, Sent::Delivered)) {
+                match self.wait_after_kill(matches!(sent, Sent::Delivered), due) {
                     Ok(_status) => {
                         #[cfg(test)]
-                        crate::child::spawn::fault::record_teardown_reap(pid, _status);
+                        if let Some(pid) = self.pid() {
+                            crate::child::spawn::fault::record_teardown_reap(pid, _status);
+                        }
                         TeardownOutcome::new(ChildFate::Reaped)
                     }
                     Err(outcome) => outcome,
                 }
             }
-            Err(refused) => self.look_after_refused_kill(pid, Some(id), refused),
+            Err(refused) => self.look_after_refused_kill(id, refused),
         }
     }
 
     /// Reap a child a tree kill has just ended, sending it nothing: the kill bounds the wait.
-    /// A failed reap comes back in [`TeardownOutcome::left`], as for
-    /// [`teardown_on_drop`](Self::teardown_on_drop).
+    /// A failed reap comes back in [`TeardownOutcome::left`], as for [`tear_down`](Self::tear_down).
     #[cfg(unix)]
-    pub(crate) fn reap_after_tree_kill(&self, pid: u32) -> TeardownOutcome {
+    pub(crate) fn reap_after_tree_kill(&self) -> TeardownOutcome {
         #[cfg(test)]
         crate::child::spawn::fault::run_between_kill_and_wait();
-        match self.wait_after_kill(pid, true) {
+        match self.wait_after_kill(true, None) {
             Ok(_) => TeardownOutcome::new(ChildFate::Reaped),
             Err(outcome) => outcome,
         }
     }
 
     /// The blocking wait that follows a kill, `delivered` or not. `Ok` is the status it reaped; the
-    /// `Err` is the outcome of a teardown that reaped nothing.
-    fn wait_after_kill(&self, pid: u32, delivered: bool) -> Result<ExitStatus, TeardownOutcome> {
+    /// `Err` is the outcome of a teardown that reaped nothing. With `due`, it first watches for the
+    /// exit until the threshold, and warns once if the child has not exited by then.
+    fn wait_after_kill(&self, delivered: bool, due: Option<Due>) -> Result<ExitStatus, TeardownOutcome> {
+        let pid = self.pid();
         // What a failed wait shows of the child: only a delivered kill says it is dead or dying.
         let failed = |fate_left: Option<String>| TeardownOutcome {
             fate: if delivered {
@@ -85,11 +104,22 @@ impl OwnedChild {
             },
             left: fate_left,
         };
-        let outcome = self.wait(None).map_err(|e| failed(Some(wait_failure(pid, &e))))?;
+        let outcome = wait_warning(
+            self,
+            due,
+            // A look that cannot read the exit ends the watch: the wait finds out.
+            |child, until| child.exited_by(Some(until)).unwrap_or(true),
+            |after| crate::child::spawn::warn_still_waiting(pid, after),
+            |child| child.wait(None),
+        )
+        .map_err(|e| failed(Some(wait_failure(pid, &e))))?;
         let status = status_of_outcome(pid, outcome, Orphaned::Quiet);
         match (outcome, status) {
             (ChildWaitOutcome::Foreign(foreign), _) => {
-                log::debug!("teardown of child {pid}: it was reaped elsewhere before the reap after the kill");
+                log::debug!(
+                    "teardown of {}: it was reaped elsewhere before the reap after the kill",
+                    child_named(pid)
+                );
                 Err(TeardownOutcome {
                     fate: foreign.fate(delivered),
                     left: (foreign == Foreign::Orphaned).then(|| orphaned_note(pid)),
@@ -106,7 +136,9 @@ impl OwnedChild {
 
     /// The one look after a kill that failed with `refused`, never a wait. `id` is the child's
     /// identity, if the caller read one.
-    pub(crate) fn look_after_refused_kill(&self, pid: u32, id: Option<ProcessId>, refused: Error) -> TeardownOutcome {
+    pub(crate) fn look_after_refused_kill(&self, id: Option<ProcessId>, refused: Error) -> TeardownOutcome {
+        let pid = self.pid();
+        let who = child_named(pid);
         // A child reaped elsewhere is read from the typed outcome, so it is `Gone` on every OS: the
         // error `status_of_outcome` renders it as is `ECHILD` on Unix only.
         let (fate, look_failure) = match self.wait(Some(crate::wait::now())) {
@@ -119,11 +151,11 @@ impl OwnedChild {
             }
         };
         let left = match (&fate, look_failure) {
-            (ChildFate::Running { .. }, _) => Some(format!(
-                "child {pid} could not be terminated ({refused}); leaving it running"
-            )),
+            (ChildFate::Running { .. }, _) => {
+                Some(format!("{who} could not be terminated ({refused}); leaving it running"))
+            }
             (ChildFate::Unknown, Some(failure)) => Some(format!(
-                "child {pid} could not be terminated ({refused}), and the look at it failed: {failure}"
+                "{who} could not be terminated ({refused}), and the look at it failed: {failure}"
             )),
             _ => None,
         };
@@ -132,6 +164,6 @@ impl OwnedChild {
 }
 
 /// A failed reap after a kill, for the caller's warn: it leaves a zombie or an unread exit.
-fn wait_failure(pid: u32, e: &Error) -> String {
-    format!("teardown of child {pid}: the reap after the kill failed: {e}")
+fn wait_failure(pid: Option<u32>, e: &Error) -> String {
+    format!("teardown of {}: the reap after the kill failed: {e}", child_named(pid))
 }

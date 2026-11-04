@@ -697,7 +697,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     let owned = {
         drop(child.child);
         OwnedChild::new(Box::new(crate::os_process::linux::LinuxProcess::new(
-            pid,
+            Some(pid),
             child.through.pidfd,
         )))
     };
@@ -1197,10 +1197,7 @@ fn await_exit_warning(
 /// The one `warn` of a spawn teardown whose wait for the child it killed has passed `after`; the
 /// wait goes on.
 pub(crate) fn warn_still_waiting(pid: Option<u32>, after: std::time::Duration) {
-    let who = pid.map_or_else(
-        || "the spawned child (pid unknown)".to_owned(),
-        |pid| format!("child {pid}"),
-    );
+    let who = super::lifecycle::child_named(pid);
     #[cfg(unix)]
     log::warn!(
         "{who} is not reapable {after:?} after its kill (it is still running, or a tracer holds its exit); still waiting for it to exit"

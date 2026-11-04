@@ -76,7 +76,7 @@ pub(crate) const OPEN_CONSEQUENCE: &str = "its exit cannot be observed and no si
 pub(crate) fn open(id: ProcessId) -> Result<Option<Box<dyn OsProcess>>, Error> {
     #[cfg(target_os = "linux")]
     return Ok(linux::open::open_verified(id)?
-        .map(|pidfd| Box::new(linux::LinuxProcess::new(id.pid(), pidfd)) as Box<dyn OsProcess>));
+        .map(|pidfd| Box::new(linux::LinuxProcess::new(Some(id.pid()), pidfd)) as Box<dyn OsProcess>));
     #[cfg(windows)]
     return Ok(windows::WindowsProcess::open(id)?.map(|p| Box::new(p) as Box<dyn OsProcess>));
     #[cfg(target_os = "macos")]
