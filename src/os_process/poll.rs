@@ -9,15 +9,11 @@ use rustix::event::{poll, PollFd, PollFlags, Timespec};
 
 /// One look at `fd` with a zero timeout: `Ok(true)` once it is readable. Never blocks.
 pub(crate) fn is_readable(fd: BorrowedFd<'_>) -> std::io::Result<bool> {
-    loop {
-        let mut fds = [PollFd::new(&fd, PollFlags::IN)];
-        match poll(&mut fds, Some(&Timespec { tv_sec: 0, tv_nsec: 0 })) {
-            Ok(0) => return Ok(false),
-            Ok(_) => return readable(fds[0].revents()).map(|()| true),
-            Err(rustix::io::Errno::INTR) => {}
-            Err(e) => return Err(std::io::Error::from(e)),
-        }
+    let mut fds = [PollFd::new(&fd, PollFlags::IN)];
+    if !crate::wait::any_ready_now(&mut fds)? {
+        return Ok(false);
     }
+    readable(fds[0].revents()).map(|()| true)
 }
 
 /// `poll(2)` takes its timeout as an `int` of milliseconds; where there is no `ppoll` (macOS) rustix
