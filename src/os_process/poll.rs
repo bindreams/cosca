@@ -26,7 +26,7 @@ const MAX_POLL_BLOCK: Duration = Duration::from_millis(i32::MAX as u64);
 pub(crate) fn poll_readable(fd: BorrowedFd<'_>, deadline: Option<Instant>) -> std::io::Result<bool> {
     let Some(deadline) = deadline else {
         #[cfg(test)]
-        crate::wait::block_probe::record(None);
+        crate::wait::block_probe::record_blocking(None);
         let mut fds = [PollFd::new(&fd, PollFlags::IN)];
         crate::wait::poll_ready(&mut fds)?;
         return readable(fds[0].revents()).map(|()| true);
