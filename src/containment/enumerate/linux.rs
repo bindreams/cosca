@@ -11,16 +11,15 @@ use crate::identity::RawPid;
 /// absence: the walk would miss that process and its subtree (see [`crate::identity::pid_stat`]).
 pub(crate) fn process_parents() -> Result<Vec<(RawPid, RawPid)>, Error> {
     let mut out = Vec::new();
-    let dir =
-        crate::identity::proc_view()
-            .into_dir()
-            .map_err(|why| match why.unsupported("listing the process table") {
-                Some(unsupported) => {
-                    log::warn!("enumerate::process_parents: {unsupported}");
-                    unsupported
-                }
-                None => unassessable(&why.reason, why.source),
-            })?;
+    let dir = crate::identity::proc_view_with(&crate::identity::HostKernel)
+        .into_dir()
+        .map_err(|why| match why.unsupported("listing the process table") {
+            Some(unsupported) => {
+                log::warn!("enumerate::process_parents: {unsupported}");
+                unsupported
+            }
+            None => unassessable(&why.reason, why.source),
+        })?;
     let pids = dir
         .pids()
         .map_err(|e| unassessable("/proc could not be listed", Some(e)))?;

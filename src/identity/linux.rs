@@ -2,6 +2,8 @@
 //! `/proc/<pid>/stat` as the start token; `is_running` via process state; `created_at` via
 //! `/proc/stat` `btime` and `_SC_CLK_TCK`.
 
+#[path = "linux/kernel.rs"]
+pub(crate) mod kernel;
 #[path = "linux/pid_stat.rs"]
 pub(crate) mod pid_stat;
 #[path = "linux/proc_view.rs"]
@@ -52,7 +54,7 @@ fn read_stat(pid: RawPid) -> Resolved<Vec<u8>> {
 
 /// [`read_stat`], and the unusable view that made it `Unknown`, when one did.
 fn read_stat_explained(pid: RawPid) -> (Resolved<Vec<u8>>, Option<proc_view::ViewUnreadable>) {
-    match proc_view::proc_view().into_dir() {
+    match proc_view::proc_view_with(&kernel::HostKernel).into_dir() {
         Ok(dir) => (read_stat_in(&dir, pid), None),
         Err(why) => (
             resolve_unreadable(pid, format_args!("the /proc view could not be established: {why}")),
@@ -184,7 +186,7 @@ fn read_self_stat() -> std::io::Result<Vec<u8>> {
 /// Without `openat2` it is [`Error::Unsupported`] naming that; otherwise
 /// [`Error::Unassessable`] carrying the view's reason.
 pub(crate) fn unknown_identity_error(subject: &str) -> Option<Error> {
-    proc_view::proc_view()
+    proc_view::proc_view_with(&kernel::HostKernel)
         .into_dir()
         .err()
         .map(|why| view_error(subject, why))

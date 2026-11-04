@@ -8,9 +8,10 @@ use crate::test_groups::{namespaces, Group};
 
 use super::fault::{force_proc_view_once, force_status_once, ForcedView};
 use super::{
-    classify_ns_links, classify_status, collect_pids, parse_fdinfo_pid, pidfd_pid_in_view, proc_view, PidfdTarget,
+    classify_ns_links, classify_status, collect_pids, parse_fdinfo_pid, pidfd_pid_in, proc_view_with, PidfdTarget,
     ProcDir, ProcView, Verdict, ViewUnreadable,
 };
+use crate::identity::HostKernel;
 
 fn ns_pid(exists: io::Result<bool>) -> impl FnOnce() -> io::Result<bool> {
     move || exists
@@ -32,8 +33,8 @@ fn proc_view_matches_how_proc_numbers_our_own_init() {
         rustix::process::PidfdFlags::empty(),
     )
     .expect("pidfd_open(1)");
-    let numbered = pidfd_pid_in_view(&dir, init.as_fd()).expect("read pid 1's pidfd fdinfo");
-    let view = proc_view();
+    let numbered = pidfd_pid_in(&HostKernel, &dir, init.as_fd()).expect("read pid 1's pidfd fdinfo");
+    let view = proc_view_with(&HostKernel);
     assert_eq!(
         matches!(view, ProcView::Same(_)),
         numbered == PidfdTarget::Pid(1),
@@ -141,7 +142,7 @@ fn fdinfo_pid_ignores_similarly_prefixed_keys() {
 #[skuld::test]
 fn a_forced_same_view_carries_the_real_proc_dirfd() {
     let forced = force_proc_view_once(ForcedView::Same);
-    let ProcView::Same(dir) = proc_view() else {
+    let ProcView::Same(dir) = proc_view_with(&HostKernel) else {
         panic!("a forced Same must be Same");
     };
     drop(forced);
@@ -153,9 +154,9 @@ fn a_forced_same_view_carries_the_real_proc_dirfd() {
 #[skuld::test]
 fn a_forced_view_is_consumed_once() {
     let forced = force_proc_view_once(ForcedView::Diverged);
-    assert!(matches!(proc_view(), ProcView::Diverged));
+    assert!(matches!(proc_view_with(&HostKernel), ProcView::Diverged));
     assert!(
-        matches!(proc_view(), ProcView::Same(_)),
+        matches!(proc_view_with(&HostKernel), ProcView::Same(_)),
         "a second call must reach the real read again"
     );
     drop(forced);
@@ -166,7 +167,7 @@ fn a_forced_view_is_consumed_once() {
 fn a_forced_view_disarms_on_drop_even_if_unconsumed() {
     drop(force_proc_view_once(ForcedView::Unassessable));
     assert!(
-        matches!(proc_view(), ProcView::Same(_)),
+        matches!(proc_view_with(&HostKernel), ProcView::Same(_)),
         "the forced view must not survive an unconsumed drop"
     );
 }
@@ -281,7 +282,7 @@ fn the_fdinfo_of_a_reaped_targets_pidfd_is_reaped() {
     let (mut child, pidfd) = spawn_exited_child_with_pidfd();
     child.wait().expect("reap the child");
     let dir = ProcDir::open().expect("/proc opens");
-    let got = pidfd_pid_in_view(&dir, pidfd.as_fd());
+    let got = pidfd_pid_in(&HostKernel, &dir, pidfd.as_fd());
     assert!(matches!(got, Ok(PidfdTarget::Reaped)), "got {got:?}");
 }
 
@@ -290,7 +291,7 @@ fn the_fdinfo_of_a_reaped_targets_pidfd_is_reaped() {
 fn the_fdinfo_of_an_unreaped_targets_pidfd_names_its_pid() {
     let (mut child, pidfd) = spawn_exited_child_with_pidfd();
     let dir = ProcDir::open().expect("/proc opens");
-    let got = pidfd_pid_in_view(&dir, pidfd.as_fd());
+    let got = pidfd_pid_in(&HostKernel, &dir, pidfd.as_fd());
     let pid = child.id();
     child.wait().expect("reap the child");
     assert!(
@@ -329,7 +330,7 @@ fn fixture_fdinfo_after_unshare_files() {
             // to another thread.
             unsafe { rustix::thread::unshare_unsafe(rustix::thread::UnshareFlags::FILES) }.expect("unshare(FILES)");
             let pidfd = rustix::process::pidfd_open(own, rustix::process::PidfdFlags::empty()).expect("pidfd_open");
-            pidfd_pid_in_view(&dir, pidfd.as_fd())
+            pidfd_pid_in(&HostKernel, &dir, pidfd.as_fd())
         })
         .join()
         .expect("thread")
@@ -393,7 +394,7 @@ fn fixture_coinciding_tid_inner() {
             "precondition: /proc must number this thread as gettid() does"
         );
         let _status = force_status_once(NO_NSPID);
-        proc_view()
+        proc_view_with(&HostKernel)
     })
     .join()
     .expect("verdict thread");
@@ -430,7 +431,7 @@ fn fixture_own_procfs_init() {
     ns::mount_proc(std::path::Path::new("/proc"));
     let view = {
         let _status = force_status_once(NO_NSPID);
-        proc_view()
+        proc_view_with(&HostKernel)
     };
     assert!(matches!(view, ProcView::Same(_)), "got {view:?}");
     ns::run_dropping_to_nobody(fixture_path!(fixture_own_procfs_unprivileged));
@@ -444,7 +445,7 @@ fn fixture_own_procfs_unprivileged() {
     ns::drop_to_nobody();
     rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable).expect("PR_SET_DUMPABLE 0");
     let _status = force_status_once(NO_NSPID);
-    match proc_view() {
+    match proc_view_with(&HostKernel) {
         ProcView::Unassessable(why) => {
             assert!(why.reason.contains("1/ns/pid"), "{why}");
             assert_eq!(

@@ -153,7 +153,7 @@ pub(crate) fn members(pgid: i32) -> std::io::Result<Vec<Member>> {
 pub(crate) fn members(pgid: i32) -> std::io::Result<Vec<Member>> {
     use crate::identity::stat_parse::{parse_pgrp, parse_starttime_jiffies};
 
-    let proc_dir = crate::identity::proc_view()
+    let proc_dir = crate::identity::proc_view_with(&crate::identity::HostKernel)
         .into_dir()
         .map_err(|why| match why.openat2_requirement() {
             Some(requirement) => std::io::Error::new(

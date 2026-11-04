@@ -113,12 +113,12 @@ pub(crate) fn take_scripted_pidfd_open() -> Option<rustix::io::Errno> {
 ///   reads as "gone", and `containment::unix::group` treats `Io` as "no pidfd" and falls back to
 ///   `kill(2)`.
 ///
-/// No pidfd to cross-check against, so the view comes from [`proc_view`](crate::identity::proc_view).
+/// No pidfd to cross-check against, so the view comes from [`proc_view_with`](crate::identity::proc_view_with).
 fn verify_without_pidfd(id: ProcessId, errno: rustix::io::Errno) -> Result<Option<rustix::fd::OwnedFd>, Error> {
     if id.signal_says_no_such_process() {
         return Ok(None);
     }
-    match crate::identity::proc_view() {
+    match crate::identity::proc_view_with(&crate::identity::HostKernel) {
         ProcView::Same(proc_dir) => match exists_checked(id, &proc_dir) {
             Existence::Gone => Ok(None),
             Existence::Present => match alive_checked(id, &proc_dir) {
@@ -156,7 +156,7 @@ fn verify_without_pidfd(id: ProcessId, errno: rustix::io::Errno) -> Result<Optio
 /// Anything else is `Unassessable`.
 fn verify_pidfd_target(id: ProcessId, pidfd: rustix::fd::OwnedFd) -> Result<Option<rustix::fd::OwnedFd>, Error> {
     let proc_dir = crate::identity::ProcDir::open().map_err(|why| view_unreadable(id, why, None))?;
-    match crate::identity::pidfd_pid_in_view(&proc_dir, pidfd.as_fd()) {
+    match crate::identity::pidfd_pid_in(&crate::identity::HostKernel, &proc_dir, pidfd.as_fd()) {
         Ok(PidfdTarget::Pid(pid)) if pid == id.pid() => {}
         // Reaped after `pidfd_open`: gone, and nothing to signal.
         Ok(PidfdTarget::Reaped) => return Ok(None),

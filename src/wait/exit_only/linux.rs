@@ -181,7 +181,7 @@ pub(crate) fn open_own_child(
     // application may `dup2` its stdio back over it, destroying the pidfd.
     let pidfd = crate::above_stdio::above_stdio(pidfd).map_err(Error::Io)?;
     if let Some(id) = id {
-        if let ProcView::Same(proc_dir) = crate::identity::proc_view() {
+        if let ProcView::Same(proc_dir) = crate::identity::proc_view_with(&crate::identity::HostKernel) {
             if exists_checked(id, &proc_dir) == Existence::Gone {
                 return Ok(None);
             }

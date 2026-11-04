@@ -206,7 +206,10 @@ pub(crate) use backend::TERMINATE_EXIT_CODE as WINDOWS_TERMINATE_EXIT_CODE;
 pub(crate) use backend::pid_stat;
 
 #[cfg(target_os = "linux")]
-pub(crate) use backend::proc_view::{pidfd_pid_in_view, proc_view, PidfdTarget, ProcDir, ProcView, ViewUnreadable};
+pub(crate) use backend::kernel::HostKernel;
+
+#[cfg(target_os = "linux")]
+pub(crate) use backend::proc_view::{pidfd_pid_in, proc_view_with, PidfdTarget, ProcDir, ProcView, ViewUnreadable};
 
 /// Why a by-pid read answered `Unknown`, when the read itself knows: on Linux, the unusable
 /// `/proc` view it went through. Carried out of the failing read, so the error describes that read
