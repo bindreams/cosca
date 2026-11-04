@@ -51,3 +51,28 @@ fn poll_readable_arms_no_block_longer_than_poll_takes() {
     let armed = crate::wait::block_probe::take();
     assert_eq!(armed, [Some(Duration::from_millis(i32::MAX as u64))]);
 }
+
+/// No deadline is an unbounded block, and the probe records it as one.
+///
+/// Mutant: the unbounded arm records `Some(..)`, or skips the record.
+#[skuld::test]
+fn poll_readable_without_a_deadline_records_an_unbounded_block() {
+    let (rx, mut tx) = std::io::pipe().unwrap();
+    tx.write_all(&[1]).unwrap();
+    crate::wait::block_probe::take();
+    assert!(poll_readable(rx.as_fd(), None).unwrap());
+    assert_eq!(crate::wait::block_probe::take(), [None]);
+}
+
+/// An unbounded wait that ends on `POLLERR` is an `Err`, not a `false` or a `true`. The write end of a
+/// pipe whose reader is gone reports `POLLERR`; `poll_ready` cannot fail on one descriptor, so this is
+/// the unbounded arm's only error.
+///
+/// Mutant: the unbounded arm returns `Ok(true)` once `poll_ready` returns, without reading `revents`.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn poll_readable_without_a_deadline_reports_pollerr_as_an_error() {
+    let (rx, tx) = std::io::pipe().unwrap();
+    drop(rx);
+    assert!(poll_readable(tx.as_fd(), None).is_err());
+}

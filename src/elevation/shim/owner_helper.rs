@@ -125,21 +125,15 @@ fn fork_copy(body: impl FnOnce()) {
 pub(crate) const POLL_FAILED: i32 = 92;
 
 /// In a copy: blocks until `fd` is readable or hung up. A failed `poll` ends the copy with
-/// [`POLL_FAILED`], so that a test that waits for it does not mistake the silence for an answer. Raw
-/// system calls only.
+/// [`POLL_FAILED`], so that a test that waits for it does not mistake the silence for an answer.
+/// System calls only: `poll_ready` is a `poll` on a stack array, and allocates nothing.
 unsafe fn wait_readable(fd: libc::c_int) {
-    let mut poll = libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // SAFETY: `poll` is valid for the call.
-    unsafe {
-        while libc::poll(&mut poll, 1, -1) < 0 {
-            if *libc::__errno_location() != libc::EINTR {
-                libc::_exit(POLL_FAILED);
-            }
-        }
+    // SAFETY: `fd` is open for the call.
+    let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+    let mut fds = [rustix::event::PollFd::new(&fd, rustix::event::PollFlags::IN)];
+    if crate::wait::poll_ready(&mut fds).is_err() {
+        // SAFETY: `_exit` is async-signal-safe.
+        unsafe { libc::_exit(POLL_FAILED) }
     }
 }
 
