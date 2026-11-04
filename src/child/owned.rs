@@ -337,8 +337,7 @@ impl OwnedChild {
     }
 
     /// Hold off this handle's reaps (every reap is taken under its lock) until the result drops:
-    /// what it reads and sends meanwhile is one step to a `wait` on another thread. `pid` is the
-    /// child's pid, which [`ReapHold::group`] checks against its group. Nothing that locks the
+    /// what it reads and sends meanwhile is one step to a `wait` on another thread. Nothing that locks the
     /// handle may be called while it is held.
     #[cfg(unix)]
     pub(crate) fn hold(&self, pid: u32) -> ReapHold<'_> {

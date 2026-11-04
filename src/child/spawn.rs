@@ -130,8 +130,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     let mut skipped = None;
     let front_closed = matches!(gate, crate::elevation::front::Gate::Closed(_));
     let tree = (child.containment().can_teardown() && !front_closed).then(|| {
-        // The hold names the root's group. The handle owns the child outright here, so no reap
-        // can land.
+        // The handle owns the child outright here, so no reap can land.
         let held = child.proc.hold(child.id.pid());
         child
             .attached

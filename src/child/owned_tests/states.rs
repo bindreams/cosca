@@ -25,7 +25,6 @@ fn far() -> Instant {
 
 const KIND: std::io::ErrorKind = std::io::ErrorKind::Other;
 
-/// The pid a hold is given where the test reads no group: the fake has none.
 #[cfg(unix)]
 const UNREAD_PID: u32 = 0;
 
