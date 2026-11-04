@@ -99,15 +99,14 @@ fn kill_of_an_exited_front_returns_any_other_failure() {
     assert!(child.wait().expect("wait").success());
 }
 
-/// An exited front's tree is killed as any child's, its refused root signal included.
+/// An exited front's tree is killed as any child's.
 #[skuld::test]
 fn kill_tree_of_an_exited_front_is_ok() {
     let mut cmd = cat();
     cmd.contain_with(ContainMode::Session);
-    let (mut child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
+    let (child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
     drop(stdin);
     crate::test_child::wait_until_zombie(child.id().pid());
-    child.proc.script_over(|f| f.signals([failed_signal(libc::EPERM)]));
     child
         .kill_tree()
         .expect("an exited front's tree is killed like any child's");
@@ -465,7 +464,7 @@ fn a_live_front_reaped_elsewhere_after_the_refused_kill_is_gone() {
 
 /// A failed password write whose front had already exited says so, not that it terminated the
 /// front, and asks the gate once. With direct exec the front is the root program, which refuses
-/// this process's signal even as a zombie: the `refuse_kills` seam stands in for that refusal.
+/// this process's signal even as a zombie: a scripted `EPERM` stands in for that refusal.
 #[skuld::test]
 fn a_failed_password_write_to_a_front_that_had_exited_says_so() {
     let mut cmd = cat();

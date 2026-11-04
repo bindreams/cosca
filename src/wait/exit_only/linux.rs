@@ -32,7 +32,8 @@ pub(crate) fn waitid_record(fd: BorrowedFd<'_>, options: WaitIdOptions) -> Resul
     }
 }
 
-pub(super) fn peek(target: &Target<'_>) -> io::Result<PeekOutcome> {
+/// [`super::peek`] without the test hook: the one `LinuxProcess` looks through.
+pub(crate) fn peek(target: &Target<'_>) -> io::Result<PeekOutcome> {
     let fd = pidfd(target);
     match waitid_record(
         fd,
@@ -74,8 +75,6 @@ pub(super) fn try_reap(target: &Target<'_>) -> io::Result<Reap> {
     allow(dead_code, reason = "the only consumers are the tokio backend's")
 )]
 pub(super) fn wait_visible_exit(target: &Target<'_>) -> io::Result<PeekOutcome> {
-    #[cfg(test)]
-    super::seams::step(super::seams::HolderStep::BlockingWaitid);
     #[cfg(test)]
     let forced_none = super::seams::take_forced_visible_none();
     #[cfg(not(test))]

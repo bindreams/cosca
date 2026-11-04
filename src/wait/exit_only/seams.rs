@@ -17,8 +17,6 @@ pub(crate) enum HolderStep {
         allow(dead_code, reason = "only macOS takes a second peek")
     )]
     SecondPeek,
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code, reason = "only Linux blocks in waitid"))]
-    BlockingWaitid,
 }
 
 type StepHook = Box<dyn FnOnce()>;

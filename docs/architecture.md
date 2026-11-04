@@ -63,7 +63,7 @@ Each one gets the same treatment before any code:
 In order:
 
 1. **Processes:** the stack above, in place for the sync `Child`: it reaches its process through one
-   `OwnedChild` over a per-OS `OsChild`, and every blocking wait runs through `drive::run`.
+   `OwnedChild` over a per-OS `OsChild`, and every blocking wait of the sync `Child` runs through `drive::run`.
    [#839](https://github.com/bindreams/cosca/issues/839) records the owner decisions and the PR
    plan. What is still the old shape, and which step takes it:
    - The async `Child` (the PR that moves it onto the stack): `terminate_by_id`, which its
@@ -75,11 +75,15 @@ In order:
      `await_reapable` and its kqueue round hooks (macOS), which spawn teardown still waits
      through; `GroupRoot::new` at the failed-spawn identity check (`spawn.rs`) and the cgroup
      leaf's abandonment (`leaf.rs`); the `exit_only::seams` their tests use.
-   - Under `MacChild` and `LinuxProcess`: `exit_only::{peek, peek_verified, peek_traced}` still
-     consult the `exit_only::seams` hook. The macOS tests that stage a look inside `MacChild` (a
-     peek that finds no record after the look saw one, a drain of `NOTE_EXIT` before the record is
-     visible, an `ESRCH` registration) have no fake to answer for them, so the hook stays until
-     `exit_only` itself is a boundary.
+   - Under `MacChild` ([#877](https://github.com/bindreams/cosca/issues/877), the macOS
+     kernel-view slice): `exit_only::{peek, peek_verified, peek_traced}` still consult the
+     `exit_only::seams` hook. Five macOS tests stage a look inside `MacChild`'s own call (a peek that
+     finds no record after the look saw one, a drain of `NOTE_EXIT` before the record is visible, an
+     `ESRCH` registration), where no fake can answer without a hook. That slice puts the macOS
+     kernel reads behind one boundary and removes these hooks and the others of their family:
+     `waitid`, `uniq_fault`, `ppid_fault`, `kinfo::fault` and the kqueue registration hook. It also
+     removes `MacChild::event_pending`, a `cfg(test)` accessor. `LinuxProcess` no longer consults the
+     hook: it looks through `exit_only::linux::peek`, and no Linux test forces a look through it.
 2. **Elevation backends:** a black box that says what the tracked process is (the program, or a
    wrapper that outlives it) and what may be signalled. `Child` asks it; it stops knowing sudo,
    doas or osascript.
