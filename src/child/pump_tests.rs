@@ -166,8 +166,8 @@ fn fixture_communicate_with_default_sigpipe() {
 }
 
 /// A `SIGPIPE` the host already has pending is still pending after `communicate`: the one the
-/// stdin write raised is consumed, the host's is not. Runs in a re-exec'd child, since it blocks
-/// and raises a signal for the process.
+/// stdin write raised is consumed, the host's is not. Runs in a re-exec'd child, since it sets
+/// `SIGPIPE`'s disposition to the default and blocks and raises it.
 ///
 /// Mutant: `communicate` consumes a `SIGPIPE` that was pending before its write.
 #[skuld::test]
@@ -185,11 +185,21 @@ fn fixture_communicate_with_pending_sigpipe() {
     // SAFETY: signal-mask and signal calls on this fixture's own thread and process, on sets
     // initialised by `sigemptyset`.
     unsafe {
+        // Under Rust's ignored disposition macOS discards a raised SIGPIPE even while it is
+        // blocked, so nothing would be pending to keep.
+        assert_ne!(libc::signal(libc::SIGPIPE, libc::SIG_DFL), libc::SIG_ERR);
         let mut set: libc::sigset_t = std::mem::zeroed();
         libc::sigemptyset(&mut set);
         libc::sigaddset(&mut set, libc::SIGPIPE);
         assert_eq!(libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()), 0);
         assert_eq!(libc::raise(libc::SIGPIPE), 0);
+        let mut raised: libc::sigset_t = std::mem::zeroed();
+        assert_eq!(libc::sigpending(&mut raised), 0);
+        assert_eq!(
+            libc::sigismember(&raised, libc::SIGPIPE),
+            1,
+            "the raised SIGPIPE is pending"
+        );
 
         let mut child = sh("echo out; exit 3");
         let input = vec![b'x'; 1 << 20];
