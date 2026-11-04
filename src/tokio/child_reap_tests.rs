@@ -92,10 +92,9 @@ async fn wait_and_reap_waits_for_the_childs_own_exit_and_never_kills() {
     };
     let pid = child.id().expect("tokio owns an un-reaped child");
     let mut proc = proc_source(child);
-    let target = crate::Process::from_pid(pid)
+    let target = crate::identity::ProcessId::of(pid)
         .found()
-        .expect("resolve the freshly spawned fixture's pid")
-        .id();
+        .expect("resolve the freshly spawned fixture's pid");
 
     let mut sock = crate::test_child::accept_or_die(&listener, target);
     let mut tag = [0u8; 1];

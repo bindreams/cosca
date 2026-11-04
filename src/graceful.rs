@@ -20,6 +20,8 @@
 //! service. It reports [`GracefulMechanism::Unknown`], which
 //! [`Child::terminate`](crate::Child::terminate) refuses.
 
+use crate::error::Error;
+
 /// Which cooperative signal [`Child::terminate`](crate::Child::terminate) sends to a child, how
 /// far that signal reaches when it is delivered, and whether this process has a route to deliver
 /// it. Queried via [`Child::graceful_mechanism`](crate::Child::graceful_mechanism).
@@ -130,6 +132,35 @@ pub(crate) fn signal(mechanism: GracefulMechanism, id: crate::identity::ProcessI
                 .into(),
         }),
     }
+}
+
+/// What a graceful shutdown does once its grace wait has returned, for a lone process. `watch` is
+/// the wait's result: `Ok(true)` means the process exited in time and `kill` is not called.
+/// Otherwise (the grace ran out, or the wait itself failed, so the grace was unobservable)
+/// `kill` runs. A kill error wins; a watch error surfaces only after the kill succeeded.
+pub(crate) fn after_grace(watch: Result<bool, Error>, kill: impl FnOnce() -> Result<(), Error>) -> Result<(), Error> {
+    if matches!(watch, Ok(true)) {
+        return Ok(());
+    }
+    if let Err(ref e) = watch {
+        log::debug!("graceful_shutdown watch error before kill escalation (subsumed): {e}");
+    }
+    kill()?;
+    watch.map(|_| ())
+}
+
+/// The tree twin of [`after_grace`]: `sweep` always runs, because a root that exited in grace
+/// does not mean its descendants drained. A sweep error wins; a watch error surfaces only after
+/// the sweep succeeded.
+pub(crate) fn after_tree_grace(
+    watch: Result<bool, Error>,
+    sweep: impl FnOnce() -> Result<(), Error>,
+) -> Result<(), Error> {
+    if let Err(ref e) = watch {
+        log::debug!("graceful_shutdown_tree watch error before the sweep (may be subsumed): {e}");
+    }
+    sweep()?;
+    watch.map(|_| ())
 }
 
 #[cfg(test)]

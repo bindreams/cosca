@@ -1,6 +1,32 @@
 //! Unit tests for the graceful-mechanism vocabulary and its dispatch.
 
-use super::GracefulMechanism;
+use std::cell::Cell;
+
+use super::{after_grace, after_tree_grace, GracefulMechanism};
+use crate::error::Error;
+
+fn io_error(msg: &str) -> Error {
+    Error::Io(std::io::Error::other(msg.to_owned()))
+}
+
+/// Runs `policy` with a closure that counts its calls and returns `result`; returns the policy's
+/// result and the call count.
+fn counted(
+    result: Result<(), Error>,
+    policy: impl FnOnce(&mut dyn FnMut() -> Result<(), Error>) -> Result<(), Error>,
+) -> (Result<(), Error>, u32) {
+    let calls = Cell::new(0);
+    let mut result = Some(result);
+    let out = policy(&mut || {
+        calls.set(calls.get() + 1);
+        result.take().expect("called at most once")
+    });
+    (out, calls.get())
+}
+
+fn message(r: Result<(), Error>) -> String {
+    r.expect_err("an error").to_string()
+}
 
 // The four strings are a stable, distinct vocabulary. Exact, not `contains`: a refactor that
 // collapsed two variants onto one string would still satisfy a substring check.
@@ -92,4 +118,58 @@ fn signal_refuses_a_child_cosca_did_not_create() {
     // Released after the kill so a no-op kill fails the assertion, not the wait.
     drop(stdin);
     crate::test_child::assert_killed("the blocker", child.wait().expect("reap the blocker"));
+}
+
+// after_grace / after_tree_grace =====
+// Pure: the policy takes the watch result and one closure, so no process is involved.
+
+#[skuld::test]
+fn after_grace_is_done_without_a_kill_when_the_process_exited_in_grace() {
+    let (out, kills) = counted(Ok(()), |k| after_grace(Ok(true), k));
+    out.expect("exited in grace is done");
+    assert_eq!(kills, 0);
+}
+
+#[skuld::test]
+fn after_grace_kills_when_the_grace_ran_out() {
+    let (out, kills) = counted(Ok(()), |k| after_grace(Ok(false), k));
+    out.expect("a successful kill is done");
+    assert_eq!(kills, 1);
+}
+
+#[skuld::test]
+fn after_grace_kills_then_reports_the_watch_error() {
+    let (out, kills) = counted(Ok(()), |k| after_grace(Err(io_error("watch")), k));
+    assert!(message(out).contains("watch"));
+    assert_eq!(kills, 1, "an unobservable grace escalates");
+}
+
+#[skuld::test]
+fn after_grace_kill_error_wins_over_the_watch_error() {
+    let (out, kills) = counted(Err(io_error("kill")), |k| after_grace(Err(io_error("watch")), k));
+    let msg = message(out);
+    assert!(msg.contains("kill") && !msg.contains("watch"), "{msg}");
+    assert_eq!(kills, 1);
+}
+
+#[skuld::test]
+fn after_tree_grace_sweeps_even_when_the_root_exited() {
+    let (out, sweeps) = counted(Ok(()), |s| after_tree_grace(Ok(true), s));
+    out.expect("a successful sweep is done");
+    assert_eq!(sweeps, 1);
+}
+
+#[skuld::test]
+fn after_tree_grace_sweep_error_wins_over_the_watch_error() {
+    let (out, sweeps) = counted(Err(io_error("sweep")), |s| after_tree_grace(Err(io_error("watch")), s));
+    let msg = message(out);
+    assert!(msg.contains("sweep") && !msg.contains("watch"), "{msg}");
+    assert_eq!(sweeps, 1);
+}
+
+#[skuld::test]
+fn after_tree_grace_reports_the_watch_error_after_the_sweep() {
+    let (out, sweeps) = counted(Ok(()), |s| after_tree_grace(Err(io_error("watch")), s));
+    assert!(message(out).contains("watch"));
+    assert_eq!(sweeps, 1);
 }

@@ -289,8 +289,8 @@ impl Child {
     }
 
     /// Hard-kill the process. Returns `Ok(())` if already dead. Unlike
-    /// [`Process::kill`](crate::Process::kill), this signals through the child's own handle, so a
-    /// refused Linux `pidfd_open` cannot fail it.
+    /// [`Process::kill`](crate::Process::kill), which acts through a handle opened earlier, this
+    /// signals through the child's own handle, so a refused Linux `pidfd_open` cannot fail it.
     ///
     /// **An elevated child behind a front** ([`Backend::Sudo`](crate::elevation::Backend::Sudo),
     /// [`Backend::Doas`](crate::elevation::Backend::Doas),

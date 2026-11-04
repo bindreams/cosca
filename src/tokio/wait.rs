@@ -168,7 +168,7 @@ pub(crate) async fn pidfd_exited_within(pidfd: std::os::fd::BorrowedFd<'_>, grac
             Some(watch) => watch.map(|()| true),
             // The timer can win the first poll before the reactor reports an exit that was already
             // pending: answer from one final non-blocking look.
-            None => crate::os_process::linux::poll_pidfd_exit(pidfd, Some(crate::wait::now())).map_err(Error::Io),
+            None => crate::os_process::poll::poll_readable(pidfd, Some(crate::wait::now())).map_err(Error::Io),
         },
         None => watch_pidfd(watched).await.map(|()| true),
     }
@@ -199,8 +199,8 @@ pub(crate) fn classify_pidfd_ready(ready: ::tokio::io::Ready) -> Option<Result<(
 ///
 /// `drain` returning `Ok(None)` is what `clear_ready` treats as "empty" — this loop has no way
 /// to verify that itself, since the closure's return type carries no more than "done" or "not
-/// done". The invariant holds for both current callers: `ExitWatch::drain` reports `true`
-/// once its event has been read, by this call or an earlier one, with no draining concept at all, and `marker_eof::drain_kqueue`'s
+/// done". The invariant holds for both current callers: the exit look in `tokio::drive` is a
+/// `poll` that reads nothing, and `marker_eof::drain_kqueue`'s
 /// caller here (`wait_tree_drained_inner`) passes through the SAME `unbounded_wait` its own
 /// caller computed from the real deadline (`crate::wait::remaining(deadline).is_none()`,
 /// matching the sync backend's `block_until_drained` exactly) — when `true`,

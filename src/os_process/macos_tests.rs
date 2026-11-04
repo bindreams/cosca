@@ -1,5 +1,3 @@
-use std::io::{Read, Write};
-use std::os::fd::AsFd;
 use std::os::unix::process::ExitStatusExt;
 use std::time::Duration;
 
@@ -7,59 +5,38 @@ use super::{ExitWatch, MacProcess};
 use crate::error::Error;
 use crate::identity::{uniq_info, ProcessId, ReadPurpose, UniqRead};
 use crate::os_process::drive::{absolute, drive};
-use crate::os_process::{kill_by_id, open, terminate_by_id, Exit, Op, OsProcess};
+use crate::os_process::{kill, open, terminate, terminate_by_id, Exit, OsProcess};
 use crate::signal::{Sent, Sig};
 use crate::test_child::wait_until_zombie;
 
-/// A watch on a pipe's read end, and the two ends.
-fn pipe_watch() -> (std::io::PipeReader, std::io::PipeWriter, ExitWatch) {
-    let (rx, tx) = std::io::pipe().unwrap();
-    let watch = crate::os_process::fake::readable_watch(rx.as_fd()).unwrap();
-    (rx, tx, watch)
-}
-
-/// An already-passed deadline: one non-blocking pass.
-fn expired() -> Option<std::time::Instant> {
-    Some(crate::wait::now())
-}
+// ExitWatch =====
 
 #[skuld::test]
-fn an_unfired_watch_reads_nothing() {
-    let (_rx, _tx, watch) = pipe_watch();
-    assert!(!watch.drain().unwrap());
-    assert!(!watch.block(expired()).unwrap());
+fn a_watch_on_a_live_process_reads_not_exited() {
+    let (mut child, id) = blocker();
+    let watch = ExitWatch::proc_exit(id.pid()).unwrap();
+    assert!(!watch.exited().unwrap());
+    child.kill().unwrap();
+    child.wait().unwrap();
 }
 
+/// Mutant: a look reads the queue, so the second look finds it empty.
 #[skuld::test]
-fn block_remembers_the_event_it_read() {
-    let (mut rx, mut tx, watch) = pipe_watch();
-    tx.write_all(&[1]).unwrap();
-    assert!(watch.block(None).unwrap());
-    // The pipe is empty again, so only `seen` can answer.
-    rx.read_exact(&mut [0]).unwrap();
-    assert!(watch.drain().unwrap());
+fn a_look_at_an_exited_process_does_not_consume_the_exit() {
+    let (mut child, id) = blocker();
+    let watch = ExitWatch::proc_exit(id.pid()).unwrap();
+    child.kill().unwrap();
+    wait_until_zombie(id.pid());
+    assert!(watch.exited().unwrap());
+    assert!(watch.exited().unwrap(), "the exit is still there for the next look");
+    child.wait().unwrap();
 }
 
+/// A pid above the kernel's pid limit is past registration, as an exited process is: `ESRCH`.
 #[skuld::test]
-fn drain_remembers_the_event_it_read() {
-    let (mut rx, mut tx, watch) = pipe_watch();
-    tx.write_all(&[1]).unwrap();
-    assert!(watch.drain().unwrap());
-    rx.read_exact(&mut [0]).unwrap();
-    crate::wait::block_probe::take();
-    assert!(watch.block(expired()).unwrap());
-    assert!(
-        crate::wait::block_probe::take().is_empty(),
-        "a block that returns at once on `seen` arms no wait"
-    );
-}
-
-#[skuld::test]
-fn block_records_a_wait_it_arms() {
-    let (_rx, _tx, watch) = pipe_watch();
-    crate::wait::block_probe::take();
-    assert!(!watch.block(expired()).unwrap());
-    assert_eq!(crate::wait::block_probe::take().len(), 1);
+fn a_watch_armed_past_registration_reads_exited() {
+    let watch = ExitWatch::proc_exit(i32::MAX as u32).unwrap();
+    assert!(watch.exited().unwrap());
 }
 
 // MacProcess =====
@@ -73,16 +50,16 @@ fn blocker() -> (std::process::Child, ProcessId) {
 }
 
 #[skuld::test]
-fn open_live_then_kill_then_exited() {
+fn one_open_serves_look_signal_and_wait() {
     let (mut child, id) = blocker();
-    let mut p = open(id, Op::Wait).unwrap().expect("a live process opens");
+    let p = open(id).unwrap().expect("a live process opens");
     assert!(
         matches!(p.exited().unwrap(), Exit::Running(_)),
         "a live process reads Running"
     );
-    assert!(!drive(&mut *p, absolute(Some(Duration::ZERO))).unwrap());
+    assert!(!drive(&*p, absolute(Some(Duration::ZERO))).unwrap());
     assert_eq!(p.signal(Sig::Kill).unwrap(), Sent::Delivered);
-    assert!(drive(&mut *p, absolute(None)).unwrap());
+    assert!(drive(&*p, absolute(None)).unwrap());
     assert_eq!(
         child.wait().unwrap().signal(),
         Some(libc::SIGKILL),
@@ -90,46 +67,31 @@ fn open_live_then_kill_then_exited() {
     );
 }
 
-/// Mutant: `open` arms the kqueue watch for a kill, so a kill needs a descriptor and a kevent
-/// registration it never used. A look at a signal-only object is a caller bug: a debug assertion,
-/// and in release an `Err`; never an answer.
-#[skuld::test]
-fn a_kill_opens_no_watch_and_still_kills() {
-    let (mut child, id) = blocker();
-    let mut p = open(id, Op::Kill).unwrap().expect("a live process opens");
-    let looked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.exited().map(|_| ())));
-    // Debug builds assert the contract; release builds return the error.
-    let err = match looked {
-        Ok(Err(Error::Io(e))) => Some(e),
-        Err(_) => None,
-        Ok(other) => panic!("a signal-only process has no exit watch to answer a look: {other:?}"),
-    };
-    match err {
-        Some(e) => assert!(e.to_string().contains("opened for a signal"), "{e}"),
-        None if cfg!(debug_assertions) => {}
-        None => panic!("release builds return an error, not a panic"),
-    }
-    assert_eq!(p.signal(Sig::Kill).unwrap(), Sent::Delivered);
-    assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGKILL));
-}
-
 #[skuld::test]
 fn open_with_wrong_start_token_is_none_and_sends_nothing() {
     let (mut child, id) = blocker();
     let sends = crate::send_log::Capture::start();
     let other = ProcessId::from_parts_for_test(id.pid(), id.start_token_raw() + 1);
-    assert!(
-        open(other, Op::Kill).unwrap().is_none(),
-        "a wrong start token opens nothing"
-    );
-    kill_by_id(other).unwrap();
+    assert!(open(other).unwrap().is_none(), "a wrong start token opens nothing");
     terminate_by_id(other).unwrap();
     assert_eq!(sends.by_identity(), vec![], "nothing may be sent to a stranger");
     // Still running: the right identity opens and sees no exit.
-    let mut p = open(id, Op::Wait).unwrap().expect("the blocker is alive");
-    assert!(!drive(&mut *p, absolute(Some(Duration::ZERO))).unwrap());
+    let p = open(id).unwrap().expect("the blocker is alive");
+    assert!(!drive(&*p, absolute(Some(Duration::ZERO))).unwrap());
     child.kill().unwrap();
     child.wait().unwrap();
+}
+
+/// A held process that its owner has reaped is gone: both acts are `Ok`. Mutant: a stale signal
+/// is an error.
+#[skuld::test]
+fn kill_and_terminate_of_a_held_process_that_is_gone_are_ok() {
+    let (mut child, id) = blocker();
+    let p = open(id).unwrap().expect("a live process opens");
+    child.kill().unwrap();
+    child.wait().unwrap();
+    kill(&*p).unwrap();
+    terminate(&*p).unwrap();
 }
 
 #[skuld::test]
@@ -137,18 +99,18 @@ fn open_after_reap_is_none() {
     let (mut child, id) = blocker();
     child.kill().unwrap();
     child.wait().unwrap();
-    assert!(open(id, Op::Wait).unwrap().is_none());
+    assert!(open(id).unwrap().is_none());
 }
 
 /// Mutant: the first look blocks, or misses an exit the watch already holds.
 #[skuld::test]
 fn exited_before_first_look_returns_true() {
     let (mut child, id) = blocker();
-    let mut p = open(id, Op::Wait).unwrap().expect("a live process opens");
+    let p = open(id).unwrap().expect("a live process opens");
     child.kill().unwrap();
     wait_until_zombie(id.pid());
     crate::wait::block_probe::take();
-    assert!(drive(&mut *p, absolute(Some(Duration::ZERO))).unwrap());
+    assert!(drive(&*p, absolute(Some(Duration::ZERO))).unwrap());
     assert!(
         crate::wait::block_probe::take().is_empty(),
         "an exit the watch holds is found by the look, with no wait armed"
@@ -160,9 +122,9 @@ fn exited_before_first_look_returns_true() {
 #[skuld::test]
 fn exited_stays_true_after_a_wait_consumed_the_event() {
     let (mut child, id) = blocker();
-    let mut p = open(id, Op::Wait).unwrap().expect("a live process opens");
+    let p = open(id).unwrap().expect("a live process opens");
     child.kill().unwrap();
-    assert!(drive(&mut *p, absolute(None)).unwrap());
+    assert!(drive(&*p, absolute(None)).unwrap());
     assert!(
         matches!(p.exited().unwrap(), Exit::Exited),
         "a later look still says Exited"
@@ -182,7 +144,7 @@ fn signal_reaches_a_process_that_execed_after_open() {
         .stdout(std::process::Stdio::piped());
     let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn sh");
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
-    let mut p = open(id, Op::Wait).unwrap().expect("a live process opens");
+    let p = open(id).unwrap().expect("a live process opens");
     let mut stdin = child.stdin.take().expect("piped stdin");
     let mut stdout = child.stdout.take().expect("piped stdout");
     // Releases `read`, so `sh` execs `cat`. Only `cat` echoes, so the echo reports the exec.
@@ -199,7 +161,7 @@ fn signal_reaches_a_process_that_execed_after_open() {
         vec![(id.pid(), libc::SIGKILL), (id.pid(), libc::SIGKILL)],
         "the first token was stale (exec changed p_idversion), the second carried the new one"
     );
-    assert!(drive(&mut *p, absolute(None)).unwrap());
+    assert!(drive(&*p, absolute(None)).unwrap());
     assert_eq!(
         child.wait().unwrap().signal(),
         Some(libc::SIGKILL),
@@ -211,7 +173,7 @@ fn signal_reaches_a_process_that_execed_after_open() {
 #[skuld::test]
 fn signal_to_a_zombie_is_gone_after_one_attempt() {
     let (mut child, id) = blocker();
-    let mut p = open(id, Op::Kill).unwrap().expect("a live process opens");
+    let p = open(id).unwrap().expect("a live process opens");
     child.kill().unwrap();
     wait_until_zombie(id.pid());
     let sends = crate::send_log::Capture::start();
@@ -224,7 +186,7 @@ fn signal_to_a_zombie_is_gone_after_one_attempt() {
 #[skuld::test]
 fn signal_after_reap_is_gone() {
     let (mut child, id) = blocker();
-    let mut p = open(id, Op::Kill).unwrap().expect("a live process opens");
+    let p = open(id).unwrap().expect("a live process opens");
     child.kill().unwrap();
     child.wait().unwrap();
     assert_eq!(p.signal(Sig::Kill).unwrap(), Sent::Gone);
@@ -237,7 +199,7 @@ fn a_refused_reread_after_esrch_keeps_the_errno() {
     use crate::identity::uniq_fault::force_uniq_read_once;
 
     let (mut child, id) = blocker();
-    let mut p = open(id, Op::Kill).unwrap().expect("a live process opens");
+    let p = open(id).unwrap().expect("a live process opens");
     child.kill().unwrap();
     wait_until_zombie(id.pid());
     let _refused = force_uniq_read_once(ReadPurpose::Kill, UniqRead::Refused(libc::EPERM));
@@ -268,7 +230,7 @@ fn open_is_none_when_another_process_holds_the_pid_after_arming() {
             ..real
         }),
     );
-    assert!(open(id, Op::Wait).unwrap().is_none());
+    assert!(open(id).unwrap().is_none());
     child.kill().unwrap();
     child.wait().unwrap();
 }
@@ -280,7 +242,7 @@ fn open_with_a_refused_read_is_unassessable_with_the_errno() {
 
     let (mut child, id) = blocker();
     let _refused = force_uniq_read_once(ReadPurpose::Open, UniqRead::Refused(libc::EPERM));
-    let err = open(id, Op::Wait).expect_err("a refused read is an error");
+    let err = open(id).expect_err("a refused read is an error");
     let Error::Unassessable {
         source: Some(source), ..
     } = &err
@@ -297,11 +259,11 @@ fn open_with_a_refused_read_is_unassessable_with_the_errno() {
 /// attempt is recorded).
 #[skuld::test]
 fn pid_zero_is_refused_unassessable() {
-    let mut p = MacProcess {
+    let p = MacProcess {
         id: ProcessId::from_parts_for_test(0, 1),
         unique: 1,
-        idversion: 1,
-        watch: None,
+        idversion: std::sync::atomic::AtomicI32::new(1),
+        watch: ExitWatch::new(super::kqueue::Kqueue::new().unwrap()),
     };
     let sends = crate::send_log::Capture::start();
     let err = p.signal(Sig::Kill).expect_err("pid 0 is no target");
@@ -326,8 +288,11 @@ fn pid_zero_is_refused_unassessable() {
 #[skuld::test]
 fn a_pid_zero_identity_never_reaches_kill() {
     let bogus = crate::identity::ProcessId::from_parts_for_test(0, 1);
-    // Already-gone is success: the pid holds a process, but not the one named.
-    crate::os_process::kill_by_id(bogus).expect("a pid-0 identity resolves to a stranger, i.e. already gone");
+    // The pid holds `kernel_task`, not the process this identity names: nothing opens.
+    assert!(
+        open(bogus).expect("a pid-0 identity resolves to a stranger").is_none(),
+        "a pid-0 identity opens nothing"
+    );
     crate::os_process::terminate_by_id(bogus).expect("same for the graceful signal");
     // If either call had reached `kill(2)`, this process would have died with it.
     assert_eq!(
@@ -335,4 +300,31 @@ fn a_pid_zero_identity_never_reaches_kill() {
         crate::identity::Liveness::Alive,
         "the caller must have survived - nothing may signal process group 0"
     );
+}
+
+/// Two waiters on one open: the exit reaches both. Mutant: a wait reads the exit event from the
+/// kqueue, so the other wait blocks forever on an exited process.
+#[skuld::test]
+fn two_threads_waiting_on_one_process_both_return_after_it_exits() {
+    let (mut child, id) = blocker();
+    let p = open(id).unwrap().expect("a live process opens");
+    let p: &dyn OsProcess = &*p;
+    std::thread::scope(|scope| {
+        let waiters = [
+            scope.spawn(|| drive(p, absolute(None))),
+            scope.spawn(|| drive(p, absolute(None))),
+        ];
+        assert_eq!(p.signal(Sig::Kill).unwrap(), Sent::Delivered);
+        for waiter in waiters {
+            assert!(
+                waiter.join().unwrap().unwrap(),
+                "every wait ends when the process exits"
+            );
+        }
+    });
+    assert!(
+        matches!(p.exited().unwrap(), Exit::Exited),
+        "and a later look says Exited"
+    );
+    child.wait().unwrap();
 }

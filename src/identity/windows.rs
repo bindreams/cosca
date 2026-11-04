@@ -66,6 +66,34 @@ pub(crate) fn open_classified(pid: RawPid, mask: PROCESS_ACCESS_RIGHTS) -> Opene
     }
 }
 
+/// `OpenProcess` for `PROCESS_QUERY_LIMITED_INFORMATION` plus as many of `optional` as the process
+/// grants, and the rights granted. Tries every subset of `optional`, the largest first and, among
+/// equals, the earlier rights first, down to the query right alone. A right is dropped only when its
+/// open fails with `ERROR_ACCESS_DENIED`; `Gone` and any other failure end the search. A final
+/// denial is [`Opened::Denied`] of the query-only attempt. The caller closes the handle.
+pub(crate) fn open_dropping_refused(
+    pid: RawPid,
+    optional: &[PROCESS_ACCESS_RIGHTS],
+) -> (Opened, PROCESS_ACCESS_RIGHTS) {
+    debug_assert!(optional.len() < 32, "a subset of the optional rights is a u32 mask");
+    let mut subsets: Vec<u32> = (0..1u32 << optional.len()).collect();
+    subsets.sort_by_key(|subset| (std::cmp::Reverse(subset.count_ones()), *subset));
+    let mut denied = None;
+    for subset in subsets {
+        let rights = optional
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| subset >> i & 1 == 1)
+            .fold(PROCESS_QUERY_LIMITED_INFORMATION, |rights, (_, right)| rights | *right);
+        match open_classified(pid, rights) {
+            Opened::Denied(e) if is_access_denied(&e) => denied = Some((e, rights)),
+            opened => return (opened, rights),
+        }
+    }
+    let (e, rights) = denied.expect("the empty subset is always tried");
+    (Opened::Denied(e), rights)
+}
+
 pub(crate) fn close(handle: HANDLE) {
     // SAFETY: `handle` is an owned process handle.
     if let Err(e) = unsafe { CloseHandle(handle) } {
@@ -98,10 +126,9 @@ pub(crate) fn is_access_denied(e: &windows::core::Error) -> bool {
 /// - It holds the right: the refusal is the exit, [`Termination::Exited`]. The refusal is already
 ///   given while the process object is not signalled yet (measured on Windows 11 26100), so
 ///   reading the signalled state instead would miss that window.
-/// - It lacks the right: only the signalled state, a zero-timeout wait on the handle, proves an
-///   exit. That needs `SYNCHRONIZE`, and a handle without it, or an unsignalled process, is
-///   [`Termination::Failed`] with the refusal. The exit code is never read instead: 259 cannot be
-///   told from a live process.
+/// - It lacks the right: only an [`exit_look`] that finds the process exited proves an exit. The
+///   exit code is read to prove an exit, never to prove liveness, because 259 cannot be told from a
+///   live process. Anything else is [`Termination::Failed`] with the refusal.
 ///
 /// A handle whose granted access cannot be read is [`Termination::Failed`] with that error.
 pub(crate) fn terminate_held(handle: HANDLE) -> Termination {
@@ -113,23 +140,56 @@ pub(crate) fn terminate_held(handle: HANDLE) -> Termination {
     match granted_access(handle) {
         Err(e) => Termination::Failed(e),
         Ok(access) if access & PROCESS_TERMINATE.0 != 0 => Termination::Exited,
-        // SAFETY: the caller's live process handle; a zero-timeout wait only reads its state.
-        Ok(_) => match unsafe { WaitForSingleObject(handle, 0) } {
-            WAIT_OBJECT_0 => Termination::Exited,
-            WAIT_TIMEOUT => Termination::Failed(refusal),
-            WAIT_FAILED => {
-                log::debug!(
-                    "terminate_held: waiting on a handle without PROCESS_TERMINATE failed: {}",
-                    windows::core::Error::from_thread()
-                );
-                Termination::Failed(refusal)
-            }
-            other => {
-                debug_assert!(false, "WaitForSingleObject returned {other:?}");
+        Ok(access) => match exit_look(handle, access & PROCESS_SYNCHRONIZE.0 != 0) {
+            Ok(Look::Exited) => Termination::Exited,
+            Ok(Look::Running) => Termination::Failed(refusal),
+            Err(e) => {
+                log::debug!("terminate_held: a handle without PROCESS_TERMINATE could not prove an exit: {e}");
                 Termination::Failed(refusal)
             }
         },
     }
+}
+
+/// What one look at a process handle found.
+pub(crate) enum Look {
+    Exited,
+    Running,
+}
+
+/// One look at whether the process `handle` names has exited, without blocking. `has_synchronize`
+/// says whether the handle was granted `SYNCHRONIZE`.
+///
+/// With it, a zero-timeout wait reads the process's signalled state. Without it, only
+/// `GetExitCodeProcess` is left: an exit code other than `STILL_ACTIVE` proves an exit, but
+/// `STILL_ACTIVE` cannot be told from a process that exited with code 259, so a running process
+/// reads as `Err(ERROR_ACCESS_DENIED)`: the look is refused, not answered.
+pub(crate) fn exit_look(handle: HANDLE, has_synchronize: bool) -> windows::core::Result<Look> {
+    if has_synchronize {
+        // SAFETY: the caller's live process handle; a zero-timeout wait only reads its state.
+        return match unsafe { WaitForSingleObject(handle, 0) } {
+            WAIT_OBJECT_0 => Ok(Look::Exited),
+            WAIT_TIMEOUT => Ok(Look::Running),
+            WAIT_FAILED => Err(windows::core::Error::from_thread()),
+            other => {
+                debug_assert!(false, "WaitForSingleObject returned {other:?}");
+                Err(windows::core::Error::new(
+                    windows::Win32::Foundation::E_UNEXPECTED,
+                    format!("WaitForSingleObject returned {other:?}"),
+                ))
+            }
+        };
+    }
+    let mut code = 0u32;
+    // SAFETY: the caller's live process handle; `GetExitCodeProcess` needs the query right, which
+    // every handle this crate opens holds.
+    unsafe { GetExitCodeProcess(handle, &mut code) }?;
+    if code != STILL_ACTIVE.0 as u32 {
+        return Ok(Look::Exited);
+    }
+    Err(windows::core::Error::from_hresult(windows::core::HRESULT::from_win32(
+        windows::Win32::Foundation::ERROR_ACCESS_DENIED.0,
+    )))
 }
 
 /// The access `handle` was granted, from `NtQueryObject(ObjectBasicInformation)`.
@@ -255,71 +315,31 @@ pub(super) fn created_at(start: StartToken) -> Option<SystemTime> {
 }
 
 pub(super) fn is_running(pid: RawPid, start: StartToken) -> Liveness {
-    // Fast path: one open for both rights. SYNCHRONIZE lets us WaitForSingleObject;
-    // QUERY_LIMITED lets us read the creation time to reject a reused PID.
-    let both = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE;
-    let handle = match open_classified(pid, both) {
-        Opened::Found(h) => h,
-        Opened::Gone => return Liveness::Dead,
-        Opened::Denied(_) => return liveness_without_synchronize(pid, start),
-    };
-    let verdict = match creation_token_result(handle) {
-        Ok(t) if t == start => {
-            // SAFETY: `handle` is live; a 0 ms wait never blocks. (A `let` binding is
-            // required: `unsafe { .. } == X` does not parse as a bare arm body.)
-            let signaled = unsafe { WaitForSingleObject(handle, 0) };
-            match signaled {
-                WAIT_TIMEOUT => Liveness::Alive,
-                WAIT_OBJECT_0 => Liveness::Dead,
-                // WAIT_FAILED and anything undocumented: the wait never reported on the
-                // process, so we learned nothing.
-                other => {
-                    log::debug!("WaitForSingleObject(pid {pid}, 0) returned {other:?}");
-                    Liveness::Unknown
-                }
-            }
-        }
-        Ok(_) => Liveness::Dead, // reused PID: a different process holds it now
-        Err(e) => {
-            // Opened but unreadable — never claim Dead.
-            log::debug!("GetProcessTimes failed on an opened handle for pid {pid}: {e}");
-            Liveness::Unknown
-        }
-    };
-    close(handle);
-    verdict
-}
-
-/// The `SYNCHRONIZE`-denied path. `QUERY_LIMITED` alone still rejects a reused pid and still
-/// lets `GetExitCodeProcess` PROVE an exit. It cannot prove the converse: a process that
-/// exits with code 259 reports `STILL_ACTIVE` forever, so `STILL_ACTIVE` yields `Unknown`,
-/// never `Alive`.
-fn liveness_without_synchronize(pid: RawPid, start: StartToken) -> Liveness {
-    let handle = match open_classified(pid, PROCESS_QUERY_LIMITED_INFORMATION) {
+    // `SYNCHRONIZE` is asked for and dropped when refused: `QUERY_LIMITED` alone still rejects a
+    // reused pid and still lets `GetExitCodeProcess` prove an exit.
+    let (opened, granted) = open_dropping_refused(pid, &[PROCESS_SYNCHRONIZE]);
+    let handle = match opened {
         Opened::Found(h) => h,
         Opened::Gone => return Liveness::Dead,
         Opened::Denied(_) => return Liveness::Unknown,
     };
-    // The identity check runs on the HELD handle, which pins the kernel object, so no
-    // recycle can slip between the check and the exit-code read.
+    // The identity check runs on the HELD handle, which pins the kernel object, so no recycle can
+    // slip between the check and the look.
     let verdict = match creation_token_result(handle) {
+        Ok(t) if t == start => match exit_look(handle, granted.0 & PROCESS_SYNCHRONIZE.0 != 0) {
+            Ok(Look::Running) => Liveness::Alive,
+            Ok(Look::Exited) => Liveness::Dead,
+            // A look that never reported on the process: we learned nothing.
+            Err(e) => {
+                log::debug!("exit look at pid {pid} failed: {e}");
+                Liveness::Unknown
+            }
+        },
+        Ok(_) => Liveness::Dead, // reused PID: a different process holds it now
         Err(e) => {
+            // Opened but unreadable: never claim Dead.
             log::debug!("GetProcessTimes failed on an opened handle for pid {pid}: {e}");
             Liveness::Unknown
-        }
-        Ok(t) if t != start => Liveness::Dead, // reused PID
-        Ok(_) => {
-            let mut code = 0u32;
-            // SAFETY: `handle` is live and carries QUERY_LIMITED, which is what
-            // GetExitCodeProcess requires.
-            match unsafe { GetExitCodeProcess(handle, &mut code) } {
-                Ok(()) if code != STILL_ACTIVE.0 as u32 => Liveness::Dead,
-                Ok(()) => Liveness::Unknown,
-                Err(e) => {
-                    log::debug!("GetExitCodeProcess failed on an opened handle for pid {pid}: {e}");
-                    Liveness::Unknown
-                }
-            }
         }
     };
     close(handle);

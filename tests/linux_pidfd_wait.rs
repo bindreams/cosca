@@ -48,7 +48,7 @@ fn read_tid(reader: &mut std::io::BufReader<std::net::TcpStream>) -> u32 {
 /// A live non-leader tid is `NotThreadGroupLeader`, on every kernel, with the pid and the
 /// `pidfd_open` errno as data.
 #[skuld::test]
-fn wait_on_a_live_non_leader_tid_is_an_error() {
+fn open_pid_of_a_live_non_leader_tid_is_an_error() {
     let (mut child, writer, listener) = spawn_tid_reporter("report-tid-block-stdin");
     let mut reader = accept_reader(&listener, &mut child);
     let tid = read_tid(&mut reader);
@@ -58,10 +58,7 @@ fn wait_on_a_live_non_leader_tid_is_an_error() {
         "the reported tid must be the WORKER thread's, not the process leader's"
     );
 
-    let p = cosca::Process::from_pid(tid)
-        .found()
-        .expect("the live worker thread's tid resolves to an identity");
-    match p.wait() {
+    match cosca::Process::open_pid(tid) {
         Err(cosca::error::Error::NotThreadGroupLeader { pid, source, .. }) => {
             assert_eq!(pid, tid);
             assert!(
@@ -69,7 +66,7 @@ fn wait_on_a_live_non_leader_tid_is_an_error() {
                 "pidfd_open's refusal is EINVAL (< 6.16) or ENOENT (>= 6.16), got {source:?}"
             );
         }
-        other => panic!("Process::wait on a live non-leader tid must be NotThreadGroupLeader, got {other:?}"),
+        other => panic!("Process::open_pid of a live non-leader tid must be NotThreadGroupLeader, got {other:?}"),
     }
 
     // EOF the child's blocking stdin read, then reap it normally.
@@ -84,9 +81,9 @@ fn wait_on_a_live_non_leader_tid_is_an_error() {
 #[cfg(target_os = "linux")]
 /// A ptraced non-leader thread that has exited stays a zombie, attached to its pid, until its
 /// tracer waits for it: `pidfd_open` refuses it like a live one, `/proc` still lists it, but it is
-/// exited. Waiting on it must report exited.
+/// exited. Opening it must report it gone, not a refusal.
 #[skuld::test]
-fn wait_on_a_ptraced_zombie_thread_reports_exited() {
+fn open_of_a_ptraced_zombie_thread_is_none() {
     let (mut child, writer, listener) = spawn_tid_reporter("traced-worker");
     let leader = child.id().pid() as libc::pid_t;
     let mut tracer = Tracer {
@@ -136,9 +133,6 @@ fn wait_on_a_ptraced_zombie_thread_reports_exited() {
     let mut reader = accept_reader(&listener, &mut child);
     let tid = read_tid(&mut reader);
     assert_eq!(tid, worker as u32, "the reported tid is the traced worker's");
-    let p = cosca::Process::from_pid(tid)
-        .found()
-        .expect("the live worker thread's tid resolves to an identity");
 
     tracer.writer().write_all(b"x").expect("tell the worker to exit");
     // Observe the worker's exit without reaping it: it stays a zombie until this thread waits.
@@ -154,9 +148,10 @@ fn wait_on_a_ptraced_zombie_thread_reports_exited() {
     };
     assert_eq!(rc, 0, "waitid: {}", std::io::Error::last_os_error());
 
-    assert_eq!(
-        p.wait().map_err(|e| format!("{e:?}")),
-        Ok(()),
+    assert!(
+        cosca::Process::open_pid(tid)
+            .map_err(|e| format!("{e:?}"))
+            .is_ok_and(|p| p.is_none()),
         "a zombie non-leader thread has exited"
     );
 

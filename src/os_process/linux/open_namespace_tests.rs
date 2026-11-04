@@ -8,7 +8,6 @@ use std::rc::Rc;
 use super::open_tests::LiveNonLeaderTid;
 use crate::error::Error;
 use crate::identity::{proc_view, ProcDir, ProcView, ProcessId};
-use crate::os_process::Op;
 use crate::test_child::fixture_path;
 use crate::test_child::namespaces as ns;
 use crate::test_groups::{namespaces, Group};
@@ -31,7 +30,7 @@ fn fixture_status_mounted_over() {
         return;
     }
     ns::enter_private_mount_ns();
-    // A live foreign process: killed through `kill_by_id`, which goes through `open_verified`. Its
+    // A live foreign process: opened through `open_verified`, then killed. Its
     // identity is read before the mount: `of` answers `Unknown` once a file is mounted over `/proc`.
     let mut child = crate::test_spawn::spawn(std::process::Command::new("cat").stdin(std::process::Stdio::piped()))
         .expect("spawn cat");
@@ -43,11 +42,14 @@ fn fixture_status_mounted_over() {
     std::fs::write(&status, "Name:\tcosca\nState:\tR (running)\n").expect("write the fake status");
     ns::bind_over(&status, &PathBuf::from(format!("/proc/{}/status", std::process::id())));
 
-    crate::os_process::kill_by_id(id).expect("a live foreign kill must not depend on the /proc view");
+    let process = crate::os_process::open(id)
+        .expect("a live foreign open must not depend on the /proc view")
+        .expect("the live child opens");
+    crate::os_process::kill(&*process).expect("a live foreign kill must not depend on the /proc view");
     let status = child.wait().expect("reap the killed child");
     assert!(!status.success(), "the child must have been killed, got {status:?}");
 
-    let own = super::open_verified(ProcessId::current(), Op::Wait);
+    let own = super::open_verified(ProcessId::current());
     assert!(matches!(own, Ok(Some(_))), "got {own:?}");
 
     match proc_view() {
@@ -98,7 +100,7 @@ fn fixture_pid_ns_inner() {
     assert!(matches!(view, ProcView::Diverged), "got {view:?}");
 
     // `pidfd_open(1)` opens this very process; the outer procfs numbers it differently.
-    match super::open_verified(ProcessId::current(), Op::Wait) {
+    match super::open_verified(ProcessId::current()) {
         Err(Error::Unassessable { detail, .. }) => {
             assert!(detail.contains("outer pid namespace"), "{detail}");
             assert!(
@@ -182,7 +184,7 @@ fn fixture_overmount_success() {
     let pid = std::process::id();
     let (fired, hook) = recording_hook(move || overmount_proc_with_a_foreign_stat(pid));
     let _hook = super::fault::between_check_and_read(hook);
-    let result = super::open_verified(ProcessId::current(), Op::Wait);
+    let result = super::open_verified(ProcessId::current());
     assert!(fired.get(), "the between-check-and-read hook must have run");
     assert_by_path_stat_is_fake(pid);
     assert!(matches!(result, Ok(Some(_))), "got {result:?}");
@@ -205,7 +207,7 @@ fn fixture_overmount_einval() {
     let (fired, hook) = recording_hook(move || overmount_proc_with_a_foreign_stat(tid));
     let _hook = super::fault::between_check_and_read(hook);
     let _errno = super::fault::force_pidfd_open_errno_once(rustix::io::Errno::NOENT);
-    let result = super::open_verified(worker.id, Op::Wait);
+    let result = super::open_verified(worker.id);
     assert!(fired.get(), "the between-check-and-read hook must have run");
     assert_by_path_stat_is_fake(tid);
     match result {
@@ -234,7 +236,7 @@ fn fixture_stat_overmount_success() {
     let pid = std::process::id();
     let (fired, hook) = recording_hook(move || overmount_stat_with_a_foreign_file(pid));
     let _hook = super::fault::between_check_and_read(hook);
-    let result = super::open_verified(ProcessId::current(), Op::Wait);
+    let result = super::open_verified(ProcessId::current());
     assert!(fired.get(), "the between-check-and-read hook must have run");
     assert_by_path_stat_is_fake(pid);
     assert_unassessable_existence(result);
@@ -257,7 +259,7 @@ fn fixture_stat_overmount_einval() {
     let (fired, hook) = recording_hook(move || overmount_stat_with_a_foreign_file(tid));
     let _hook = super::fault::between_check_and_read(hook);
     let _errno = super::fault::force_pidfd_open_errno_once(rustix::io::Errno::NOENT);
-    let result = super::open_verified(worker.id, Op::Wait);
+    let result = super::open_verified(worker.id);
     assert!(fired.get(), "the between-check-and-read hook must have run");
     assert_by_path_stat_is_fake(tid);
     assert_unassessable_existence(result);
@@ -287,7 +289,7 @@ fn fixture_tmpfs_at_proc() {
         ProcView::Unassessable(why) => assert!(why.reason.contains("not procfs"), "{why}"),
         other => panic!("a tmpfs at /proc must be Unassessable, got {other:?}"),
     }
-    match super::open_verified(id, Op::Wait) {
+    match super::open_verified(id) {
         Err(Error::Unassessable { detail, .. }) => assert!(detail.contains("not procfs"), "{detail}"),
         other => panic!("a tmpfs at /proc must be Unassessable, got {other:?}"),
     }

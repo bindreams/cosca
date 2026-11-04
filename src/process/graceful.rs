@@ -1,6 +1,8 @@
 //! Foreign `Process` graceful shutdown — the soft-then-hard escalation trio over a process
 //! the crate does not own (no stdio, no reap). Lone ops are identity-bound and surface real
-//! failures; tree ops are best-effort identity-walk sweeps (the `TreeWalk` contract).
+//! failures; tree ops are best-effort identity-walk sweeps (the `TreeWalk` contract). A tree op
+//! signals the root by number after an identity check, not through the held handle, until the
+//! containment boundary takes the handle.
 
 use std::time::Duration;
 
@@ -8,48 +10,31 @@ use super::Process;
 use crate::error::Error;
 
 impl Process {
-    /// Send `SIGTERM` to the foreign process — a cooperative request to exit. Signal-only.
-    /// Identity-bound as for [`kill`](Process::kill) (Linux `pidfd_send_signal`; macOS audit
-    /// token, 14.4 and later). Already-dead ⇒ `Ok`; a real failure (`EPERM`) ⇒ `Err`. On Linux a
-    /// refused `pidfd_open` is `Unsupported` (see [`Error::Unsupported`]).
+    /// Send `SIGTERM` to the process — a cooperative request to exit. Signal-only. Bound to the
+    /// process this handle opened, as for [`kill`](Process::kill). Already-dead ⇒ `Ok`; a real
+    /// failure (`EPERM`) ⇒ `Err`.
     ///
-    /// **Windows: `Unsupported`, for two concrete absences.** A `Process` holds only a pid,
-    /// nothing that pins it, and `GenerateConsoleCtrlEvent` takes a raw pid with no
-    /// verify-then-signal form — so a foreign console-group signal cannot be made
-    /// identity-bound, unlike every other op on this type. And Win32 exposes no way to learn
-    /// whether a foreign pid leads a console process group, so a non-leader would silently
-    /// signal *its* leader's whole group instead. An owned [`Child`](crate::Child) has neither
-    /// problem: its held process handle keeps the pid allocated, so the pid can only ever name
-    /// that child's own group.
+    /// **Windows: `Unsupported`.** `GenerateConsoleCtrlEvent` takes a raw pid, and Win32 exposes
+    /// no way to learn whether a foreign pid leads a console process group, so a non-leader would
+    /// silently signal *its* leader's whole group instead. An owned [`Child`](crate::Child) has
+    /// no such problem: it created its group, so the pid can only ever name that child's own
+    /// group.
     pub fn terminate(&self) -> Result<(), Error> {
-        crate::os_process::terminate_by_id(self.id)
+        crate::os_process::terminate(&*self.os)
     }
 
-    /// Cooperative-then-forced lone shutdown of the foreign process: `SIGTERM`, wait up to
+    /// Cooperative-then-forced lone shutdown of the process: `SIGTERM`, wait up to
     /// `grace` for it to exit, then `SIGKILL` if it has not. No `ExitStatus` — the kernel hands
     /// exit status only to the real parent. Escalation proceeds even if `SIGTERM` is ignored.
     /// Unix only; Windows returns `Unsupported`. `grace` is relative; `ZERO` signals, polls
     /// once, then escalates.
     ///
-    /// A watch failure surfaces only after the kill runs; a kill error wins over it. On Linux a
-    /// refused `pidfd_open` is `Unsupported` (see [`Error::Unsupported`]), naming the step it hit: terminate,
-    /// the grace wait, or the kill.
+    /// A watch failure surfaces only after the kill runs; a kill error wins over it.
     pub fn graceful_shutdown(&self, grace: Duration) -> Result<(), Error> {
-        crate::os_process::terminate_by_id(self.id)?;
+        self.terminate()?;
         #[cfg(test)]
         crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterTerminate);
-        // A watch failure must not strand the process between the soft signal and the
-        // escalation — the kill still runs (grace unobservable => escalate now); the watch
-        // error surfaces only after it succeeds (a kill error wins — deliberate subsumption,
-        // mirroring the owned twins' disposition).
-        let watch = crate::os_process::drive::exited_by_id(self.id, Some(grace));
-        if matches!(watch, Ok(true)) {
-            return Ok(()); // exited within grace
-        }
-        // Hard SIGKILL (no reap — not the parent); an Err returns HERE, subsuming any watch Err.
-        crate::os_process::kill_by_id(self.id)?;
-        watch?;
-        Ok(())
+        crate::graceful::after_grace(self.wait_timeout(grace), || self.kill())
     }
 
     /// Best-effort hard sweep of the foreign process's tree: an identity-walk that re-verifies
@@ -68,8 +53,8 @@ impl Process {
 
     /// Best-effort graceful (`SIGTERM`) sweep of the foreign process's tree (identity-walk, root
     /// then descendants). Signal-only. Unix only: on Windows this rests on
-    /// [`terminate`](Process::terminate), whose two absences — no pinned pid, and no way to
-    /// learn whether a foreign pid leads a group — apply here too, so it returns `Unsupported`
+    /// [`terminate`](Process::terminate), whose absence — no way to learn whether a foreign
+    /// pid leads a group — applies here too, so it returns `Unsupported`
     /// (use [`kill_tree`](Process::kill_tree) for a hard sweep).
     ///
     /// # Errors
@@ -106,21 +91,13 @@ impl Process {
     ///
     /// A grace-watch failure does not strand the tree between the soft signal and the sweep:
     /// the hard sweep still runs (an unobservable grace escalates immediately), and the watch
-    /// error is surfaced afterward; a sweep failure would win over it. On Linux that error
-    /// includes a refused `pidfd_open` (see [`Error::Unsupported`]).
+    /// error is surfaced afterward; a sweep failure would win over it.
     pub fn graceful_shutdown_tree(&self, grace: Duration) -> Result<(), Error> {
         self.terminate_tree()?; // SIGTERM-walk (Windows: Unsupported, early return)
         #[cfg(test)]
         crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterTerminate);
 
-        // Watch-Err ordering: sweep first, then surface (see graceful_shutdown above).
-        let watch = crate::os_process::drive::exited_by_id(self.id, Some(grace));
-        // The sweep is unconditional — a gracefully-exited root does NOT mean the descendants
-        // drained. A sweep Err subsumes any watch Err; there is no reap to order against (the
-        // real parent collects the zombie).
-        self.kill_tree()?;
-        watch?;
-        Ok(())
+        crate::graceful::after_tree_grace(self.wait_timeout(grace), || self.kill_tree())
     }
 }
 

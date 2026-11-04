@@ -62,10 +62,9 @@ fn death_watch_accept_or_die_retries_a_kevent_wait_interrupted_by_a_signal() {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn a target that waits for its stdin to close");
-    let target = crate::Process::from_pid(child.id())
+    let target = crate::identity::ProcessId::of(child.id())
         .found()
-        .expect("resolve the freshly spawned target")
-        .id();
+        .expect("resolve the freshly spawned target");
     let stdin = child.stdin.take();
     let interrupter = kevent_eintr::interrupt_once_blocked(&done, move || drop(stdin));
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

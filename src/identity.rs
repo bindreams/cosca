@@ -26,6 +26,10 @@ pub use state::{Existence, Liveness, Resolved};
 mod persist;
 pub use persist::{Platform, ProcessIdRecord, RECORD_VERSION};
 
+#[path = "identity/tree.rs"]
+mod tree;
+pub use tree::Recursive;
+
 #[cfg_attr(windows, path = "identity/windows.rs")]
 #[cfg_attr(target_os = "linux", path = "identity/linux.rs")]
 #[cfg_attr(target_os = "macos", path = "identity/macos.rs")]
@@ -188,8 +192,9 @@ impl ProcessId {
 
 #[cfg(windows)]
 pub(crate) use backend::{
-    close as windows_close, is_access_denied as windows_is_access_denied, open_classified as windows_open_classified,
-    terminate_held as windows_terminate_held, Opened, Termination,
+    close as windows_close, exit_look as windows_exit_look, is_access_denied as windows_is_access_denied,
+    open_classified as windows_open_classified, open_dropping_refused as windows_open_dropping_refused,
+    terminate_held as windows_terminate_held, Look, Opened, Termination,
 };
 
 #[cfg(all(windows, test))]

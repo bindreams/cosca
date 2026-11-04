@@ -483,7 +483,7 @@ fn root_check_before_send(root: &GroupRoot<'_>, pid: RawPid, signal: Option<Sign
 /// (`classify_member`) let it through to the attempt.
 #[cfg(target_os = "linux")]
 fn check_or_signal_linux_sigkill(pid: RawPid, id: crate::identity::ProcessId, root: &GroupRoot<'_>) -> Reached {
-    match crate::os_process::linux::open::open_verified(id, crate::os_process::Op::GroupTeardown) {
+    match crate::os_process::linux::open::open_verified(id) {
         Ok(None) => Reached::Yes, // already gone
         Ok(Some(pidfd)) => match root_check_before_send(root, id.pid(), Some(Signal::SIGKILL)) {
             Err(reached) => reached,

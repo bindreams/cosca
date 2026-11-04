@@ -713,7 +713,9 @@ fn end_tree(tree: &mut Tree, grand: Option<cosca::identity::ProcessId>) {
         keep_grandchild(&mut tree.socks, socket);
     }
     let killed = tree.child.kill_tree();
-    let root = grand.is_none().then(|| cosca::Process::from_id(tree.child.id()).wait());
+    let root = grand
+        .is_none()
+        .then(|| cosca::Process::open(tree.child.id()).and_then(|root| root.map_or(Ok(()), |root| root.wait())));
     assert_tree_ended(killed, root, &mut tree.socks);
 }
 
@@ -957,7 +959,11 @@ async fn end_async_tree(tree: &mut AsyncTree, grand: Option<cosca::identity::Pro
     let killed = tree.child.kill_tree();
     let root = match grand {
         Some(_) => None,
-        None => Some(cosca::tokio::Process::from_id(tree.child.id()).wait().await),
+        None => Some(match cosca::tokio::Process::open(tree.child.id()) {
+            Ok(Some(root)) => root.wait().await,
+            Ok(None) => Ok(()),
+            Err(e) => Err(e),
+        }),
     };
     assert_tree_ended(killed, root, &mut tree.socks);
 }

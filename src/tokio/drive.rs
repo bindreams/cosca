@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use crate::error::Error;
 use crate::identity::ProcessId;
-use crate::os_process::{open, Exit, Op, OsProcess, WaitFor};
+use crate::os_process::{open, Exit, OsProcess, WaitFor};
 use crate::tokio::wait::deadline_from;
 
 /// What the entry point does before any open or look: the watch-fault seam.
@@ -33,10 +33,17 @@ fn enter() -> Result<(), Error> {
 pub(crate) async fn exited_by_id(id: ProcessId, timeout: Option<Duration>) -> Result<bool, Error> {
     enter()?;
     let deadline = absolute(timeout);
-    match open(id, Op::Wait)? {
+    match open(id)? {
         None => Ok(true),
-        Some(mut process) => drive(&mut *process, deadline).await,
+        Some(process) => drive(&*process, deadline).await,
     }
+}
+
+/// [`exited_by_id`] for a process already open: `Ok(true)` = exited, `Ok(false)` = still running
+/// after the deadline's final look.
+pub(crate) async fn exited_held(p: &dyn OsProcess, timeout: Option<Duration>) -> Result<bool, Error> {
+    enter()?;
+    drive(p, absolute(timeout)).await
 }
 
 /// `timeout` as an absolute deadline, fixed up front so no wake extends the total wait. On Windows
@@ -51,7 +58,7 @@ fn absolute(timeout: Option<Duration>) -> Option<std::time::Instant> {
 /// The wait loop against an absolute `deadline` from [`absolute`]: look; if running, wait on what
 /// the look returned. Dropping the future releases the wait: the fd is deregistered on Unix, and the
 /// blocking thread is released on Windows.
-async fn drive(p: &mut dyn OsProcess, deadline: Option<std::time::Instant>) -> Result<bool, Error> {
+async fn drive(p: &dyn OsProcess, deadline: Option<std::time::Instant>) -> Result<bool, Error> {
     // Set when the wait was released without an exit signal: the next look is the final one
     // whatever the clock reads.
     let mut released = false;
@@ -93,23 +100,36 @@ async fn wait(wait_for: &WaitFor<'_>, deadline: Option<std::time::Instant>) -> R
 }
 
 /// Resolve when `wait_for` wakes, with no bound of its own.
+///
+/// The round registers a duplicate of the held descriptor, not the descriptor itself: waits on
+/// one open process run at the same time, and the reactor takes one registration per descriptor
+/// (epoll refuses a second with `EEXIST`; a kqueue's two registrations would displace each
+/// other's wake). A duplicate shares the open file description, so readiness is shared and nothing
+/// is consumed; it opens no new process descriptor.
 #[cfg(unix)]
 async fn watch(wait_for: &WaitFor<'_>) -> Result<(), Error> {
-    match wait_for {
-        #[cfg(target_os = "linux")]
-        WaitFor::Readable(fd) => crate::tokio::wait::watch_pidfd(*fd).await,
-        #[cfg(target_os = "macos")]
-        WaitFor::Kqueue(watch) => {
-            use ::tokio::io::unix::AsyncFd;
-            use ::tokio::io::Interest;
+    let WaitFor::Readable(held) = wait_for;
+    let fd = held.try_clone_to_owned().map_err(Error::Io)?;
+    #[cfg(target_os = "linux")]
+    return crate::tokio::wait::watch_pidfd(fd).await;
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsFd;
 
-            use crate::tokio::wait::watch_readable;
+        use ::tokio::io::unix::AsyncFd;
+        use ::tokio::io::Interest;
 
-            let afd = AsyncFd::with_interest(watch.as_fd(), Interest::READABLE).map_err(Error::Io)?;
-            // `drain` is `true` once the event has been read, now or earlier; an empty drain clears
-            // readiness so a spurious wake waits again.
-            watch_readable(&afd, |_| watch.drain().map(|seen| seen.then_some(()))).await
-        }
+        use crate::tokio::wait::watch_readable;
+
+        let afd = AsyncFd::with_interest(fd, Interest::READABLE).map_err(Error::Io)?;
+        // Readiness is only a hint; the poll look decides, reads nothing, and clears the
+        // readiness on a false positive so the next wake waits again.
+        watch_readable(&afd, |fd| {
+            crate::os_process::poll::is_readable(fd.as_fd())
+                .map(|readable| readable.then_some(()))
+                .map_err(Error::Io)
+        })
+        .await
     }
 }
 

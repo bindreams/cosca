@@ -144,7 +144,7 @@ mod waits {
         let cancel = crate::os_process::windows::cancel::new_cancel_event().expect("event");
         use crate::os_process::{Exit, WaitFor};
 
-        let mut process = crate::os_process::open(crate::identity::ProcessId::current(), crate::os_process::Op::Wait)
+        let process = crate::os_process::open(crate::identity::ProcessId::current())
             .expect("open")
             .expect("the current process opens");
         let Exit::Running(WaitFor::Signalled(handle)) = process.exited().expect("look") else {
