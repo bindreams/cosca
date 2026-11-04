@@ -24,7 +24,7 @@ pub(crate) fn process_parents() -> Result<Vec<(RawPid, RawPid)>, Error> {
         .pids()
         .map_err(|e| unassessable("/proc could not be listed", Some(e)))?;
     for pid in pids {
-        let stat = match pid_stat::read(&dir, pid) {
+        let stat = match pid_stat::read_in_scan(&crate::identity::HostKernel, &dir, pid) {
             Ok(PidStat::Read(stat)) => stat,
             // The process exited between the listing and the read, or `hidepid` hides it.
             Ok(PidStat::Skipped(e)) => {

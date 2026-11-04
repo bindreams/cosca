@@ -458,7 +458,6 @@ pub(crate) mod fault {
         static FORCE_IDENTITY_STAT: RefCell<Vec<(u32, i32)>> = const { RefCell::new(Vec::new()) };
         static FORCE_FDINFO: Cell<Option<Result<super::PidfdTarget, i32>>> = const { Cell::new(None) };
         static FORCE_OPENAT2_ERRNO: Cell<Option<rustix::io::Errno>> = const { Cell::new(None) };
-        static FORCE_SELF_STAT: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
     }
 
     /// Disarms every forced value on drop, even unconsumed — so a test that panics before
@@ -476,7 +475,6 @@ pub(crate) mod fault {
             FORCE_IDENTITY_STAT.with(|f| f.borrow_mut().clear());
             FORCE_FDINFO.with(|f| f.set(None));
             FORCE_OPENAT2_ERRNO.with(|f| f.set(None));
-            FORCE_SELF_STAT.with(|f| f.take());
         }
     }
 
@@ -513,16 +511,6 @@ pub(crate) mod fault {
 
     pub(crate) fn forced_identity_stat_errno(pid: u32) -> Option<i32> {
         FORCE_IDENTITY_STAT.with(|f| f.borrow().iter().find(|&&(p, _)| p == pid).map(|&(_, e)| e))
-    }
-
-    /// Make the NEXT read of this process's own `stat` on THIS thread return `bytes`.
-    pub(crate) fn force_self_stat_once(bytes: &[u8]) -> Forced {
-        FORCE_SELF_STAT.with(|f| *f.borrow_mut() = Some(bytes.to_vec()));
-        Forced(())
-    }
-
-    pub(crate) fn take_forced_self_stat() -> Option<Vec<u8>> {
-        FORCE_SELF_STAT.with(|f| f.take())
     }
 
     /// Force the NEXT [`proc_view_with`](super::proc_view_with) on THIS thread.

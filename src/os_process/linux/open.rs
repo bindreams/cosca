@@ -115,7 +115,7 @@ pub(crate) fn take_scripted_pidfd_open() -> Option<rustix::io::Errno> {
 ///
 /// No pidfd to cross-check against, so the view comes from [`proc_view_with`](crate::identity::proc_view_with).
 fn verify_without_pidfd(id: ProcessId, errno: rustix::io::Errno) -> Result<Option<rustix::fd::OwnedFd>, Error> {
-    if id.signal_says_no_such_process() {
+    if id.signal_says_no_such_process(&crate::identity::HostKernel) {
         return Ok(None);
     }
     match crate::identity::proc_view_with(&crate::identity::HostKernel) {
@@ -239,12 +239,12 @@ pub(crate) fn exists_checked(id: ProcessId, proc_dir: &ProcDir) -> Existence {
     fault::run_between_hook();
     match fault::take_forced_exists() {
         Some(existence) => existence,
-        None => id.exists_in(proc_dir),
+        None => id.exists_in(&crate::identity::HostKernel, proc_dir),
     }
 }
 #[cfg(not(test))]
 fn exists_checked(id: ProcessId, proc_dir: &ProcDir) -> Existence {
-    id.exists_in(proc_dir)
+    id.exists_in(&crate::identity::HostKernel, proc_dir)
 }
 
 /// `id.is_alive_in(proc_dir)`, with a test seam: a forced [`Liveness`] (see
@@ -253,12 +253,12 @@ fn exists_checked(id: ProcessId, proc_dir: &ProcDir) -> Existence {
 fn alive_checked(id: ProcessId, proc_dir: &ProcDir) -> Liveness {
     match fault::take_forced_alive() {
         Some(liveness) => liveness,
-        None => id.is_alive_in(proc_dir),
+        None => id.is_alive_in(&crate::identity::HostKernel, proc_dir),
     }
 }
 #[cfg(not(test))]
 fn alive_checked(id: ProcessId, proc_dir: &ProcDir) -> Liveness {
-    id.is_alive_in(proc_dir)
+    id.is_alive_in(&crate::identity::HostKernel, proc_dir)
 }
 
 #[cfg(test)]

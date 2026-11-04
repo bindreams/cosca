@@ -167,7 +167,7 @@ pub(crate) fn members(pgid: i32) -> std::io::Result<Vec<Member>> {
     let mut out = Vec::new();
     // A listing error makes the whole scan unreliable; propagate it.
     for pid in proc_dir.pids()? {
-        let stat = match crate::identity::pid_stat::read(&proc_dir, pid) {
+        let stat = match crate::identity::pid_stat::read_in_scan(&crate::identity::HostKernel, &proc_dir, pid) {
             Ok(crate::identity::pid_stat::PidStat::Read(bytes)) => bytes,
             // A pid outside a `pgid` listing carries no information about it; the residual (a
             // foreign-uid member of `pgid` itself, hidden by `hidepid`) is documented on
