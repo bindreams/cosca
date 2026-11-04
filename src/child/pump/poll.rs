@@ -36,14 +36,37 @@ pub(crate) fn communicate(child: &mut Child, input: Option<&[u8]>) -> Result<Out
     // Every pipe end is closed from here on: the child sees EOF, or a broken pipe.
     let Finished { stdin, stdout, stderr } = pump.finish();
 
-    let status = child.wait()?;
-    if let Some(error) = poll_error {
-        return Err(Error::Io(error));
+    let status = child.wait();
+    // The first failure is returned: the wait's, else `poll`'s, else a stream's. The others are
+    // logged, each with its stream named.
+    let mut failures: Vec<(&str, io::Error)> = Vec::new();
+    failures.extend(poll_error.map(|e| ("poll", e)));
+    let stdout = stdout.unwrap_or_else(|e| {
+        failures.push(("stdout", e));
+        Vec::new()
+    });
+    let stderr = stderr.unwrap_or_else(|e| {
+        failures.push(("stderr", e));
+        Vec::new()
+    });
+    failures.extend(stdin.err().map(|e| ("stdin", e)));
+    let mut failures = failures.into_iter();
+    let result = match status {
+        Err(e) => Err(e),
+        Ok(status) => match failures.next() {
+            Some((_, e)) => Err(Error::Io(e)),
+            None => Ok(status),
+        },
+    };
+    match result {
+        Ok(status) => Ok(Output { status, stdout, stderr }),
+        Err(first) => {
+            for (stream, e) in failures {
+                log::debug!("communicate: the {stream} error was not returned: {e}");
+            }
+            Err(first)
+        }
     }
-    let stdout = stdout.map_err(Error::Io)?;
-    let stderr = stderr.map_err(Error::Io)?;
-    stdin.map_err(Error::Io)?;
-    Ok(Output { status, stdout, stderr })
 }
 
 /// The three streams of one `communicate`, each present while it is still open.
