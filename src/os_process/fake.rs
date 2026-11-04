@@ -67,6 +67,12 @@ struct Script {
     peeks: VecDeque<PeekAnswer>,
     reaps: VecDeque<ReapAnswer>,
     signals: VecDeque<SignalAnswer>,
+    /// What a peek answers once `peeks` is empty. `None`: such a call falls through.
+    peeks_always: Option<Box<dyn FnMut() -> PeekAnswer + Send>>,
+    /// What a reap answers once `reaps` is empty.
+    reaps_always: Option<ReapAnswer>,
+    /// Calls that the repeated answers took.
+    repeats: usize,
     /// `exited` and `try_reap` calls: the looks.
     looks: usize,
     look_times: Vec<Instant>,
@@ -94,6 +100,9 @@ impl FakeProcess {
                 peeks: VecDeque::new(),
                 reaps: VecDeque::new(),
                 signals: VecDeque::new(),
+                peeks_always: None,
+                reaps_always: None,
+                repeats: 0,
                 looks: 0,
                 look_times: Vec::new(),
                 signal_calls: Vec::new(),
@@ -107,6 +116,14 @@ impl FakeProcess {
     /// Answer `peeks` to successive [`OsChild::peek`] calls.
     pub(crate) fn peeks(self, peeks: impl IntoIterator<Item = PeekAnswer>) -> Self {
         self.script().peeks = peeks.into_iter().collect();
+        self
+    }
+
+    /// Answer every [`OsChild::peek`] that the `peeks` table has nothing left for with `answer()`,
+    /// however many calls there are.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn peeks_always(self, answer: impl FnMut() -> PeekAnswer + Send + 'static) -> Self {
+        self.script().peeks_always = Some(Box::new(answer));
         self
     }
 
@@ -129,6 +146,21 @@ impl FakeProcess {
     pub(crate) fn reaps(self, reaps: impl IntoIterator<Item = ReapAnswer>) -> Self {
         self.script().reaps = reaps.into_iter().collect();
         self
+    }
+
+    /// Answer every [`OsChild::try_reap`] that the `reaps` table has nothing left for with `answer`,
+    /// however many calls there are.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn reaps_always(self, answer: ReapAnswer) -> Self {
+        self.script().reaps_always = Some(answer);
+        self
+    }
+
+    /// How many calls [`peeks_always`](Self::peeks_always) and [`reaps_always`](Self::reaps_always)
+    /// answered.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn repeats(&self) -> usize {
+        self.script().repeats
     }
 
     /// Answer `signals` to successive [`OsProcess::signal`] calls.
@@ -194,6 +226,7 @@ impl fmt::Debug for FakeProcess {
         f.debug_struct("FakeProcess")
             .field("exits", &script.exits)
             .field("looks", &script.looks)
+            .field("repeats", &script.repeats)
             .finish_non_exhaustive()
     }
 }
@@ -236,7 +269,14 @@ impl OsProcess for FakeProcess {
 
 impl OsChild for FakeProcess {
     fn peek(&self) -> Result<PeekOutcome, Error> {
-        let scripted = self.script().peeks.pop_front();
+        let scripted = {
+            let mut script = self.script();
+            script.peeks.pop_front().or_else(|| {
+                let repeated = script.peeks_always.as_mut().map(|always| always());
+                script.repeats += usize::from(repeated.is_some());
+                repeated
+            })
+        };
         match (scripted, &self.0.real) {
             (Some(Ok(outcome)), _) => Ok(outcome),
             (Some(Err(error)), _) => Err(Error::Io(error)),
@@ -247,7 +287,14 @@ impl OsChild for FakeProcess {
 
     fn try_reap(&self) -> Result<TryReapOutcome<'_>, Error> {
         self.begin_look();
-        let scripted = self.script().reaps.pop_front();
+        let scripted = {
+            let mut script = self.script();
+            script.reaps.pop_front().or_else(|| {
+                let repeated = script.reaps_always;
+                script.repeats += usize::from(repeated.is_some());
+                repeated
+            })
+        };
         match (scripted, &self.0.real) {
             (Some(ReapAnswer::Reaped(record)), _) => Ok(TryReapOutcome::Reaped(record)),
             (Some(ReapAnswer::Running), _) => {

@@ -214,11 +214,6 @@ impl Reap {
     }
 }
 
-/// How many looks a sync cell's scripted root answers on macOS, where every look at the root
-/// answers the same: more than any cell takes, which [`Reap::assert_script_used`] checks.
-#[cfg(target_os = "macos")]
-const EVERY_LOOK: usize = 32;
-
 impl Reap {
     /// What makes the sync `child`'s own handle fail to vouch for the root in this reap, if anything
     /// does: Linux, one failed peek; macOS, every look at the root answers the same, so a graceful
@@ -239,17 +234,14 @@ impl Reap {
             match self {
                 Reap::Unanswered => {
                     return Some(child.proc.script_over(|f| {
-                        f.peeks(
-                            std::iter::repeat_with(|| Err(std::io::Error::other("forced peek failure")))
-                                .take(EVERY_LOOK),
-                        )
-                        .reaps([ReapAnswer::Err(std::io::ErrorKind::Other); EVERY_LOOK])
+                        f.peeks_always(|| Err(std::io::Error::other("forced peek failure")))
+                            .reaps_always(ReapAnswer::Err(std::io::ErrorKind::Other))
                     }));
                 }
                 Reap::Unpinned => {
                     return Some(child.proc.script_over(|f| {
-                        f.peeks(std::iter::repeat_with(|| Ok(PeekOutcome::Foreign(Foreign::Orphaned))).take(EVERY_LOOK))
-                            .reaps([ReapAnswer::Foreign(Foreign::Orphaned); EVERY_LOOK])
+                        f.peeks_always(|| Ok(PeekOutcome::Foreign(Foreign::Orphaned)))
+                            .reaps_always(ReapAnswer::Foreign(Foreign::Orphaned))
                     }));
                 }
                 _ => {}
@@ -260,7 +252,7 @@ impl Reap {
     }
 
     /// Checks that [`script`](Self::script)'s answers were used: on Linux the failed peek was the one
-    /// look at the root the entry point took, and on macOS the scripted looks did not run out.
+    /// look at the root the entry point took, and on macOS some look took the repeated answer.
     fn assert_script_used(self, script: Option<&crate::os_process::fake::FakeProcess>) {
         #[cfg(target_os = "linux")]
         if let Some(fake) = script {
@@ -268,7 +260,7 @@ impl Reap {
         }
         #[cfg(target_os = "macos")]
         if let Some(fake) = script {
-            assert!(fake.peeks_left() > 0, "{self:?}: the scripted looks ran out");
+            assert!(fake.repeats() > 0, "{self:?}: no look took the repeated answer");
         }
         let _ = (self, script);
     }
