@@ -194,16 +194,39 @@ fn teardown_after_a_refused_kill_of_an_exited_child_reaps_it_silently() {
     assert_eq!(fake.looks(), 1);
 }
 
-/// The look after a failed kill that fails itself is `Unknown` and still warns: the child is not
-/// shown to be gone.
+/// The look after a failed kill that fails itself is `Unknown`, and the warning names the look's
+/// error: the child is not shown to be running, so it does not claim to leave it running.
 ///
-/// Mutant: a failed look is read as an exit.
+/// Mutants: a failed look is read as an exit; the warning claims the child runs, or drops the look's
+/// error.
 #[skuld::test]
 fn teardown_after_a_refused_kill_with_a_failed_look_is_unknown() {
+    let look_error = std::io::Error::from(std::io::ErrorKind::Other).to_string();
     let fake = FakeProcess::new([])
         .reaps([ReapAnswer::Err(std::io::ErrorKind::Other)])
         .signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))]);
     let (torn, _) = teardown(&fake);
     assert_eq!(torn.fate, ChildFate::Unknown);
-    assert!(torn.left.is_some(), "{torn:?}");
+    let left = torn.left.as_deref().expect("a failed look is warned of");
+    assert!(
+        left.contains(&PID.to_string()) && left.contains(&look_error),
+        "{torn:?}"
+    );
+    assert!(!left.contains("leaving it running"), "{torn:?}");
+}
+
+/// A kill that failed on a child someone else already reaped: the look finds `ECHILD`, the child is
+/// `Gone`, and there is no warning that it is left running.
+///
+/// Mutant: the warning is returned for every look that did not collect an exit.
+#[cfg(unix)]
+#[skuld::test]
+fn teardown_after_a_refused_kill_of_a_child_reaped_elsewhere_is_gone_and_silent() {
+    let fake = FakeProcess::new([])
+        .reaps([ReapAnswer::Foreign(Foreign::Gone)])
+        .signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))]);
+    let (torn, _) = teardown(&fake);
+    assert_eq!(torn.fate, ChildFate::Gone);
+    assert_eq!(torn.left, None);
+    assert_eq!(fake.looks(), 1);
 }

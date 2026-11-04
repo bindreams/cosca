@@ -9,10 +9,11 @@
 //!   handle that lost its rights), so the teardown never blocks on it: one look at the present
 //!   moment, which collects it if it has exited. A child still running is [`ChildFate::Running`]
 //!   whatever the error, never `Unknown`, and the failure is returned in
-//!   [`TeardownOutcome::left`] for the caller's one warn. The decision is on the observed answer
-//!   and never on a flag saying elevation was asked for: a child that gained privilege on its own
-//!   (a setuid helper) fails the kill the same way, and a blocking wait would hang the drop for
-//!   ever.
+//!   [`TeardownOutcome::left`] for the caller's one warn. A look that finds it reaped elsewhere is
+//!   `Gone` and warns nothing; a look that fails otherwise is `Unknown` and warns with its error.
+//!   The decision is on the observed answer and never on a flag saying elevation was asked for: a
+//!   child that gained privilege on its own (a setuid helper) fails the kill the same way, and a
+//!   blocking wait would hang the drop for ever.
 
 use std::process::ExitStatus;
 
@@ -110,13 +111,19 @@ impl OwnedChild {
         let looked = self
             .wait(Some(crate::wait::now()))
             .and_then(|outcome| status_of_outcome(pid, outcome, Orphaned::Quiet));
-        let still_running = !matches!(looked, Ok(Some(_)));
-        let left = still_running
-            .then(|| format!("child {pid} could not be terminated on drop ({refused}); leaving it running"));
-        TeardownOutcome {
-            fate: crate::child::spawn::fate_of_a_look(looked.map_err(|e| e.into_io().raw_os_error()), Some(id)),
-            left,
-        }
+        let look_failure = looked.as_ref().err().map(ToString::to_string);
+        let fate = crate::child::spawn::fate_of_a_look(looked.map_err(|e| e.into_io().raw_os_error()), Some(id));
+        // Only a child still running is "left"; a look that found it reaped elsewhere warns nothing.
+        let left = match (&fate, look_failure) {
+            (ChildFate::Running { .. }, _) => Some(format!(
+                "child {pid} could not be terminated on drop ({refused}); leaving it running"
+            )),
+            (ChildFate::Unknown, Some(failure)) => Some(format!(
+                "child {pid} could not be terminated on drop ({refused}), and the look at it failed: {failure}"
+            )),
+            _ => None,
+        };
+        TeardownOutcome { fate, left }
     }
 }
 

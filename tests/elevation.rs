@@ -427,7 +427,7 @@ fn windows_kill_of_an_elevated_child_reports_what_happened(#[fixture(elevation)]
     let killed = child.kill();
     assert_kill_matches_payload(&killed, &mut payload);
     // On the lane `kill()` succeeded and the payload is gone. A child that cannot be terminated is covered at the
-    // unit level: `runas_teardown_on_drop_never_blocks_on_an_unterminable_child` (windows_raw/proc_tests.rs).
+    // unit level: `teardown_on_drop_never_blocks_on_a_handle_without_terminate` (windows_raw/teardown_tests.rs).
     drop(child);
     payload.release();
 }
