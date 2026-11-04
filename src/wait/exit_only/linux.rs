@@ -6,7 +6,8 @@ use std::os::fd::BorrowedFd;
 use rustix::io::Errno;
 use rustix::process::{waitid, WaitId, WaitIdOptions};
 
-use super::{is_exit_record, reaped_from_record, Foreign, Peek, Reap, Record, Target};
+use super::{exit_record_of, is_exit_record, Reap, Record, Target};
+use crate::os_process::child::{ExitRecord, Foreign, PeekOutcome};
 
 fn pidfd<'a>(target: &Target<'a>) -> BorrowedFd<'a> {
     match target {
@@ -33,16 +34,16 @@ pub(crate) fn waitid_record(fd: BorrowedFd<'_>, options: WaitIdOptions) -> Resul
     }
 }
 
-pub(super) fn peek(target: &Target<'_>) -> io::Result<Peek> {
+pub(super) fn peek(target: &Target<'_>) -> io::Result<PeekOutcome> {
     let fd = pidfd(target);
     match waitid_record(
         fd,
         WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
     ) {
-        Ok(Some(record)) if is_exit_record(record.si_code) => Ok(Peek::Exit(reaped_from_record(record))),
+        Ok(Some(record)) if is_exit_record(record.si_code) => Ok(PeekOutcome::Exit(exit_record_of(record))),
         // A ptrace stop, which Linux reports to the tracer whatever the options say: not an exit.
-        Ok(Some(_)) | Ok(None) => Ok(Peek::Running),
-        Err(Errno::CHILD) => Ok(Peek::Foreign(Foreign::Gone)),
+        Ok(Some(_)) | Ok(None) => Ok(PeekOutcome::Running),
+        Err(Errno::CHILD) => Ok(PeekOutcome::Foreign(Foreign::Gone)),
         Err(e) => {
             // Our own pidfd is open and names a child: the kernel has no other reason to refuse it.
             debug_assert!(
@@ -56,9 +57,9 @@ pub(super) fn peek(target: &Target<'_>) -> io::Result<Peek> {
 
 pub(super) fn try_reap(target: &Target<'_>) -> io::Result<Reap> {
     match peek(target)? {
-        Peek::Exit(_) => {}
-        Peek::Running => return Ok(Reap::Running),
-        Peek::Foreign(f) => return Ok(Reap::Foreign(f)),
+        PeekOutcome::Exit(_) => {}
+        PeekOutcome::Running => return Ok(Reap::Running),
+        PeekOutcome::Foreign(f) => return Ok(Reap::Foreign(f)),
     }
     let fd = pidfd(target);
     #[cfg(test)]
@@ -69,7 +70,7 @@ pub(super) fn try_reap(target: &Target<'_>) -> io::Result<Reap> {
         };
     }
     match waitid_record(fd, WaitIdOptions::EXITED | WaitIdOptions::NOHANG) {
-        Ok(Some(record)) => Ok(Reap::Reaped(reaped_from_record(super::consumed(record)))),
+        Ok(Some(record)) => Ok(Reap::Reaped(exit_record_of(super::consumed(record)))),
         // Peeked as an exit, then nothing to consume: a zombie only its tracer can reap.
         Ok(None) => Ok(Reap::Running),
         Err(Errno::CHILD) => Ok(Reap::Foreign(Foreign::Gone)),
@@ -77,7 +78,7 @@ pub(super) fn try_reap(target: &Target<'_>) -> io::Result<Reap> {
     }
 }
 
-pub(super) fn wait_visible_exit(target: &Target<'_>) -> io::Result<Peek> {
+pub(super) fn wait_visible_exit(target: &Target<'_>) -> io::Result<PeekOutcome> {
     #[cfg(test)]
     super::seams::step(super::seams::HolderStep::BlockingWaitid);
     #[cfg(test)]
@@ -96,21 +97,21 @@ pub(super) fn wait_visible_exit(target: &Target<'_>) -> io::Result<Peek> {
         waitid_record(pidfd(target), WaitIdOptions::EXITED | WaitIdOptions::NOWAIT)
     };
     match record {
-        Ok(Some(record)) if is_exit_record(record.si_code) => Ok(Peek::Exit(reaped_from_record(record))),
-        Ok(Some(_)) => Ok(Peek::Running),
+        Ok(Some(record)) if is_exit_record(record.si_code) => Ok(PeekOutcome::Exit(exit_record_of(record))),
+        Ok(Some(_)) => Ok(PeekOutcome::Running),
         Ok(None) => no_record(),
-        Err(Errno::CHILD) => Ok(Peek::Foreign(Foreign::Gone)),
+        Err(Errno::CHILD) => Ok(PeekOutcome::Foreign(Foreign::Gone)),
         Err(e) => Err(e.into()),
     }
 }
 
 /// A blocking `waitid` cannot legitimately find nothing: without `NOHANG` it waits.
-fn no_record() -> io::Result<Peek> {
+fn no_record() -> io::Result<PeekOutcome> {
     debug_assert!(false, "a blocking waitid(P_PIDFD, WEXITED) returned no record");
     Err(io::Error::other("a blocking waitid on the pidfd returned no record"))
 }
 
-pub(super) fn reap_blocking(target: &Target<'_>) -> io::Result<Result<super::Reaped, Foreign>> {
+pub(super) fn reap_blocking(target: &Target<'_>) -> io::Result<Result<ExitRecord, Foreign>> {
     let fd = pidfd(target);
     loop {
         #[cfg(test)]
@@ -123,7 +124,7 @@ pub(super) fn reap_blocking(target: &Target<'_>) -> io::Result<Result<super::Rea
             waitid_record(fd, WaitIdOptions::EXITED)
         };
         match record {
-            Ok(Some(record)) if is_exit_record(record.si_code) => return Ok(Ok(reaped_from_record(record))),
+            Ok(Some(record)) if is_exit_record(record.si_code) => return Ok(Ok(exit_record_of(record))),
             // A ptrace stop, reported whatever the options say: not an exit; the next call blocks.
             Ok(Some(_)) => continue,
             Ok(None) => {
@@ -189,7 +190,7 @@ pub(crate) fn open_own_child(
         }
     }
     match super::peek(&Target::PidFd(pidfd.as_fd())) {
-        Ok(Peek::Foreign(Foreign::Gone)) => Ok(None),
+        Ok(PeekOutcome::Foreign(Foreign::Gone)) => Ok(None),
         Ok(_) => Ok(Some(pidfd)),
         Err(e) => Err(Error::Io(e)),
     }

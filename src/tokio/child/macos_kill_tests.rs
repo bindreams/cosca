@@ -87,7 +87,7 @@ async fn macos_a_child_with_its_own_unique_id_is_unreaped() {
 async fn macos_a_pid_with_another_unique_id_is_reaped() {
     let (proc, _pid) = exited_unreaped_with(|real| Some(real ^ 1));
     let state = proc.state();
-    assert!(matches!(state, RootState::Reaped), "{state:?}");
+    assert!(matches!(state, RootState::Reaped { own: false }), "{state:?}");
 }
 
 /// Mutant: a child with no unique id is taken for one that can be verified.
@@ -175,7 +175,7 @@ async fn macos_a_running_child_whose_unique_id_cannot_be_read_is_not_unreaped() 
         proc.release(); // tokio's orphan queue reaps the killed child
         let as_expected = match expected {
             Shown::Unknown => matches!(state, RootState::Unknown(_)),
-            Shown::Reaped => matches!(state, RootState::Reaped),
+            Shown::Reaped => matches!(state, RootState::Reaped { own: false }),
         };
         assert!(
             as_expected,

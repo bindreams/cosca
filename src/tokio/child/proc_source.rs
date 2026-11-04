@@ -10,10 +10,10 @@ use crate::child::drop_report::Forgot;
 use crate::child::spawn::Diagnosis;
 use crate::error::{ChildFate, Error};
 use crate::identity::ProcessId;
+use crate::os_process::child::Foreign;
 #[cfg(unix)]
 use crate::signal::RootState;
 use crate::signal::{Sent, Sig};
-use crate::wait::exit_only::Foreign;
 
 /// How [`ProcSource::wait_and_reap`] ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,7 +71,7 @@ impl Forgotten {
         match state {
             RootState::Unknown(_) => Forgotten::Unproven,
             RootState::Unpinned => Forgotten::Unpinned,
-            RootState::Unreaped | RootState::Reaped => {
+            RootState::Unreaped | RootState::Reaped { .. } => {
                 // Every caller takes the state from `elsewhere`, which excludes `Unreaped`.
                 debug_assert!(
                     !matches!(state, RootState::Unreaped),
@@ -214,7 +214,7 @@ fn foreign_why(state: &RootState) -> String {
             "is not pinned by this process (RootState::Unpinned: {})",
             crate::signal::UNPINNED_WHY
         ),
-        RootState::Unreaped | RootState::Reaped => {
+        RootState::Unreaped | RootState::Reaped { .. } => {
             // Every caller takes the state from `elsewhere`, which excludes `Unreaped`.
             debug_assert!(
                 !matches!(state, RootState::Unreaped),
@@ -549,7 +549,7 @@ impl ProcSource {
         };
         match state {
             RootState::Unreaped => unreachable!("a wait refused a child its handle shows ours"),
-            RootState::Reaped => {
+            RootState::Reaped { .. } => {
                 self.forget_as("was reaped by someone else", Forgotten::ReapedElsewhere);
                 gone()
             }
@@ -665,23 +665,15 @@ impl ProcSource {
     pub(crate) fn state(&self) -> RootState {
         match self {
             ProcSource::Foreign { fate, .. } => match fate {
-                Forgotten::ReapedElsewhere => RootState::Reaped,
+                Forgotten::ReapedElsewhere => RootState::Reaped { own: false },
                 Forgotten::Unpinned => RootState::Unpinned,
                 Forgotten::Unproven => RootState::Unknown(std::io::Error::other(
                     "its handle was forgotten because it could not be shown to be ours, so it may still be running",
                 )),
             },
-            ProcSource::Tokio { child, .. } if child.id().is_none() => RootState::Reaped,
+            ProcSource::Tokio { child, .. } if child.id().is_none() => RootState::Reaped { own: true },
             ProcSource::Tokio { child, .. } => self.state_of(child),
         }
-    }
-
-    /// [`state`](ProcSource::state), and whether a `Reaped` is this backend's own reap: tokio's wait
-    /// collected the status. A forgotten backend's is not.
-    #[cfg(unix)]
-    pub(crate) fn state_and_own_reap(&self) -> (RootState, bool) {
-        let own = matches!(self, ProcSource::Tokio { child, .. } if child.id().is_none());
-        (self.state(), own)
     }
 
     /// [`state`](ProcSource::state) of a `Tokio` backend whose `child` may already be taken out of
@@ -696,7 +688,7 @@ impl ProcSource {
         child: &::tokio::process::Child,
     ) -> RootState {
         let ProcSource::Tokio { .. } = self else {
-            return RootState::Reaped;
+            return RootState::Reaped { own: false };
         };
         #[cfg(target_os = "linux")]
         let peeked = {
@@ -786,7 +778,7 @@ impl ProcSource {
             let target = crate::wait::exit_only::Target::PidFd(std::os::fd::AsFd::as_fd(pidfd));
             return Ok(matches!(
                 crate::wait::exit_only::peek(&target)?,
-                crate::wait::exit_only::Peek::Running
+                crate::os_process::child::PeekOutcome::Running
             ));
         }
         if self.is_reaped() {
@@ -799,7 +791,7 @@ impl ProcSource {
         };
         Ok(matches!(
             crate::wait::exit_only::peek(&target)?,
-            crate::wait::exit_only::Peek::Running
+            crate::os_process::child::PeekOutcome::Running
         ))
     }
 
@@ -1553,9 +1545,9 @@ impl ProcSource {
         });
         let mut failed = None;
         let fate = match reaped {
-            Ok(Ok(_reaped)) => {
+            Ok(Ok(_record)) => {
                 #[cfg(test)]
-                if let exit_only::Reaped::Status(status) = _reaped {
+                if let crate::os_process::child::ExitRecord::Status(status) = _record {
                     crate::child::spawn::fault::record_teardown_reap(pid, status);
                 }
                 ChildFate::Reaped
@@ -1634,7 +1626,7 @@ enum Halt {
 fn verdict_of(state: RootState) -> (Waited, Option<String>) {
     match state {
         RootState::Unreaped => unreachable!("a wait's look halted on a child its handle shows ours"),
-        RootState::Reaped => (
+        RootState::Reaped { .. } => (
             Waited::Foreign,
             Some("its handle shows it reaped by someone else".to_owned()),
         ),
@@ -1667,7 +1659,7 @@ fn collected(child: &mut ::tokio::process::Child) -> Result<ExitStatus, Halt> {
 async fn look_on_events<T>(
     pid: u32,
     identity: u64,
-    mut on_look: impl FnMut(std::io::Result<crate::wait::exit_only::Peek>) -> Result<Option<T>, Halt>,
+    mut on_look: impl FnMut(std::io::Result<crate::os_process::child::PeekOutcome>) -> Result<Option<T>, Halt>,
 ) -> Result<T, Halt> {
     use crate::wait::exit_only::{self, Target};
     let target = Target::pid(pid, Some(identity));
@@ -1675,7 +1667,7 @@ async fn look_on_events<T>(
     loop {
         // A `NOTE_REAP` means something else reaped it: no look by its pid may follow.
         if watch.reaped().map_err(Halt::Watch)? {
-            return Err(Halt::State(RootState::Reaped));
+            return Err(Halt::State(RootState::Reaped { own: false }));
         }
         let (looked, holder) = match exit_only::peek_verified_traced(&target) {
             Ok((peeked, holder)) => (Ok(peeked), holder),
@@ -1706,11 +1698,11 @@ async fn look_on_events<T>(
 #[cfg(unix)]
 fn reap_after_look(
     child: &mut ::tokio::process::Child,
-    looked: std::io::Result<crate::wait::exit_only::Peek>,
+    looked: std::io::Result<crate::os_process::child::PeekOutcome>,
 ) -> Result<Option<ExitStatus>, Halt> {
-    use crate::wait::exit_only::Peek;
+    use crate::os_process::child::PeekOutcome;
     match looked {
-        Ok(Peek::Exit(_)) => match child.try_wait() {
+        Ok(PeekOutcome::Exit(_)) => match child.try_wait() {
             Ok(Some(status)) => Ok(Some(status)),
             Ok(None) => Err(Halt::ReapedBetween(
                 "waitpid found no exit record after its handle showed one".to_owned(),
@@ -1720,7 +1712,7 @@ fn reap_after_look(
             )),
             Err(e) => Err(Halt::ReapFailed(e)),
         },
-        Ok(Peek::Running) => Ok(None),
+        Ok(PeekOutcome::Running) => Ok(None),
         other => Err(Halt::State(RootState::of_peek(other))),
     }
 }
@@ -1742,23 +1734,24 @@ fn still_ours(child: &::tokio::process::Child) -> bool {
 fn wait_on_pidfd(pid: u32, pidfd: &std::os::fd::OwnedFd, level: log::Level) -> (Waited, Option<String>) {
     use std::os::fd::AsFd;
 
-    use crate::wait::exit_only::{self, Peek, Target};
+    use crate::os_process::child::PeekOutcome;
+    use crate::wait::exit_only::{self, Target};
 
     match exit_only::wait_visible_exit(&Target::PidFd(pidfd.as_fd())) {
-        Ok(Peek::Exit(_reaped)) => {
+        Ok(PeekOutcome::Exit(_record)) => {
             #[cfg(test)]
-            if let exit_only::Reaped::Status(status) = _reaped {
+            if let crate::os_process::child::ExitRecord::Status(status) = _record {
                 crate::child::spawn::fault::record_teardown_reap(pid, status);
             }
             (Waited::Exited, None)
         }
-        Ok(Peek::Foreign(_)) => (
+        Ok(PeekOutcome::Foreign(_)) => (
             Waited::Foreign,
             Some("waitid on its pidfd found it reaped by someone else (ECHILD)".to_owned()),
         ),
         // A blocking wait that returns without an exit is a contract breach, like an errno that
         // is not `ECHILD`. Without proof the child is ours, tokio's by-pid reap must not run.
-        Ok(Peek::Running) => {
+        Ok(PeekOutcome::Running) => {
             log::log!(
                 level,
                 "wait_and_reap: waitid on child {pid}'s pidfd returned without an exit"
@@ -1789,8 +1782,9 @@ fn wait_reapable(pid: u32, identity: u64, level: log::Level) -> (Waited, Option<
     match await_reapable(pid, Some(identity), None) {
         Ok(Awaited::Reapable) => {
             #[cfg(test)]
-            if let Ok(crate::wait::exit_only::Peek::Exit(crate::wait::exit_only::Reaped::Status(status))) =
-                crate::wait::exit_only::peek(&crate::wait::exit_only::Target::pid(pid, Some(identity)))
+            if let Ok(crate::os_process::child::PeekOutcome::Exit(crate::os_process::child::ExitRecord::Status(
+                status,
+            ))) = crate::wait::exit_only::peek(&crate::wait::exit_only::Target::pid(pid, Some(identity)))
             {
                 crate::child::spawn::fault::record_teardown_reap(pid, status);
             }

@@ -520,7 +520,8 @@ fn child_exited_before_the_helper_finished(pid: Option<u32>, done: &OwnedFd) -> 
 
     use rustix::event::{poll, PollFd, PollFlags, Timespec};
 
-    use crate::wait::exit_only::{peek, Peek, Target};
+    use crate::os_process::child::PeekOutcome;
+    use crate::wait::exit_only::{peek, Target};
 
     let helper_done = |fds: &mut [PollFd<'_>], timeout: Option<&Timespec>| loop {
         match poll(fds, timeout) {
@@ -618,7 +619,7 @@ fn child_exited_before_the_helper_finished(pid: Option<u32>, done: &OwnedFd) -> 
     #[cfg(test)]
     let peeked = match injected {
         Some(errno) => Err(io::Error::from(errno)),
-        None if fault::watch_poll_armed() => Ok(Peek::Running),
+        None if fault::watch_poll_armed() => Ok(PeekOutcome::Running),
         None => peek(&Target::PidFd(watch.as_fd())),
     };
     #[cfg(test)]
@@ -626,8 +627,8 @@ fn child_exited_before_the_helper_finished(pid: Option<u32>, done: &OwnedFd) -> 
     #[cfg(not(test))]
     let (peeked, injected) = (peek(&Target::PidFd(watch.as_fd())), false);
     match peeked {
-        Ok(Peek::Foreign(_) | Peek::Exit(_)) => return Watch::Exited,
-        Ok(Peek::Running) => {}
+        Ok(PeekOutcome::Foreign(_) | PeekOutcome::Exit(_)) => return Watch::Exited,
+        Ok(PeekOutcome::Running) => {}
         Err(e) => {
             debug_assert!(injected, "waitid on a spawned child's pidfd failed: {e}");
             return unwatchable("waitid on its pidfd", &e);
@@ -879,12 +880,13 @@ fn conclude<T: Spawned>(
 ) -> Result<Held<T>, SpawnFailure> {
     let teardown = |pidfd: OwnedFd| super::teardown_through_pidfd(None, pidfd, None, warn_after);
     let opened_teardown = |pidfd: OwnedFd, error: Error| {
-        use crate::wait::exit_only::{peek, Peek, Target};
+        use crate::os_process::child::PeekOutcome;
+        use crate::wait::exit_only::{peek, Target};
         use std::os::fd::AsFd as _;
         // A child std collected never ran the program. A peek that fails tells nothing, so the
         // child is taken for a front still there, which is sent nothing.
         let collected = match peek(&Target::PidFd(pidfd.as_fd())) {
-            Ok(Peek::Foreign(_)) => true,
+            Ok(PeekOutcome::Foreign(_)) => true,
             Ok(_) => false,
             Err(e) => {
                 log::debug!("a failed spawn's child cannot be peeked ({e}); taken to be uncollected");
@@ -1048,7 +1050,10 @@ pub(crate) fn await_unexecuted_exit(
                 let seen = wait_visible_exit(&Target::PidFd(pidfd))?;
                 // tokio reaps it afterwards, so this is where a test sees how it ended.
                 #[cfg(test)]
-                if let crate::wait::exit_only::Peek::Exit(crate::wait::exit_only::Reaped::Status(status)) = seen {
+                if let crate::os_process::child::PeekOutcome::Exit(crate::os_process::child::ExitRecord::Status(
+                    status,
+                )) = seen
+                {
                     super::fault::record_teardown_reap(pid.unwrap_or(0), status);
                 }
                 let _ = seen;

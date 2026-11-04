@@ -42,10 +42,11 @@ use std::time::{Duration, Instant};
 use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent};
 
 use super::{OnTracer, TracerWatch};
+use crate::os_process::child::{Foreign, PeekOutcome};
 #[cfg(test)]
 use crate::os_process::macos::kqueue::test_hooks;
 use crate::os_process::macos::kqueue::{kevent_timeout, Event, Kqueue, Subscription};
-use crate::wait::exit_only::{self, Foreign, Peek, Target};
+use crate::wait::exit_only::{self, Target};
 
 /// The wait's verdict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,17 +101,17 @@ fn into_io(e: crate::error::Error) -> io::Error {
 
 /// One non-consuming look, by number and checked against `unique` when there is one, and the tracer
 /// that holds a running child, if one does.
-fn peek(pid: u32, unique: Option<u64>) -> io::Result<(Peek, Option<u32>)> {
+fn peek(pid: u32, unique: Option<u64>) -> io::Result<(PeekOutcome, Option<u32>)> {
     exit_only::peek_traced(&Target::pid(pid, unique))
 }
 
 /// The peek's verdict as a wait verdict, or `None` when the child is still running.
-fn settle(peeked: Peek) -> Option<Waited> {
+fn settle(peeked: PeekOutcome) -> Option<Waited> {
     match peeked {
-        Peek::Exit(_) => Some(Waited::Reapable),
-        Peek::Running => None,
-        Peek::Foreign(Foreign::Gone | Foreign::Other) => Some(Waited::Gone),
-        Peek::Foreign(Foreign::Orphaned) => Some(Waited::Orphaned),
+        PeekOutcome::Exit(_) => Some(Waited::Reapable),
+        PeekOutcome::Running => None,
+        PeekOutcome::Foreign(Foreign::Gone | Foreign::Other) => Some(Waited::Gone),
+        PeekOutcome::Foreign(Foreign::Orphaned) => Some(Waited::Orphaned),
     }
 }
 

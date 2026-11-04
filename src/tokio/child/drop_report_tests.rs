@@ -5,15 +5,15 @@
 #[cfg(target_os = "linux")]
 mod linux {
     use super::super::root_state_tests::{failed_peek, session_blocker, warns_since};
+    use crate::os_process::child::{Foreign, PeekOutcome};
     use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peeks};
-    use crate::wait::exit_only::{Foreign, Peek};
 
-    fn gone() -> std::io::Result<Peek> {
-        Ok(Peek::Foreign(Foreign::Gone))
+    fn gone() -> std::io::Result<PeekOutcome> {
+        Ok(PeekOutcome::Foreign(Foreign::Gone))
     }
 
-    fn running() -> std::io::Result<Peek> {
-        Ok(Peek::Running)
+    fn running() -> std::io::Result<PeekOutcome> {
+        Ok(PeekOutcome::Running)
     }
 
     /// A trusted root behind a closed front gate whose second look shows a foreign reap: the forget is
@@ -384,9 +384,9 @@ mod linux {
 #[cfg(target_os = "macos")]
 mod macos {
     use super::super::root_state_tests::warns_since;
+    use crate::os_process::child::{Foreign, PeekOutcome};
     use crate::tokio::Command;
     use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peek_once};
-    use crate::wait::exit_only::{Foreign, Peek};
 
     /// A failed spawn's teardown whose wait finds the zombie held by launchd (its tracer died)
     /// forgets tokio's `Child` under one warn, which names launchd and carries the leak.
@@ -406,7 +406,7 @@ mod macos {
         let pid = child.id().pid();
         let proc = child.os.proc.take().expect("the backend");
         let mark = crate::log_capture::mark();
-        let _orphaned = force_peek_once(Ok(Peek::Foreign(Foreign::Orphaned)));
+        let _orphaned = force_peek_once(Ok(PeekOutcome::Foreign(Foreign::Orphaned)));
 
         proc.reap_now(pid, None);
 

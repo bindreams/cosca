@@ -6,9 +6,9 @@
 //! is an unreaped zombie, so a reap by pid that should not have run consumes the record the test
 //! then finds gone.
 
+use crate::os_process::child::{Foreign, PeekOutcome};
 use crate::tokio::Command;
 use crate::wait::exit_only::seams::{force_peek_once, force_peeks};
-use crate::wait::exit_only::{Foreign, Peek};
 
 /// Watches one child from outside cosca and reaps it on the test's behalf.
 struct Witness {
@@ -118,7 +118,7 @@ fn exited_unreaped(kill_on_drop: bool) -> (crate::tokio::Child, Witness) {
 
 /// Makes the next peek through the child's handle see a foreign reap.
 fn force_evidence() -> impl Sized {
-    force_peek_once(Ok(Peek::Foreign(Foreign::Gone)))
+    force_peek_once(Ok(PeekOutcome::Foreign(Foreign::Gone)))
 }
 
 /// Mutant: no forget in the bypass branches. tokio's in-drop `try_wait` then reaps the zombie, and
@@ -144,7 +144,7 @@ async fn tokio_bypass_drop_after_a_refused_kill_and_a_foreign_reap_reaps_nothing
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
     let (child, witness) = exited_unreaped(true);
-    let _looks = force_peeks([Ok(Peek::Running), Ok(Peek::Foreign(Foreign::Gone))]);
+    let _looks = force_peeks([Ok(PeekOutcome::Running), Ok(PeekOutcome::Foreign(Foreign::Gone))]);
     let _refused = super::fault::force_kill_failure();
     let kills = super::drop_fault::record();
 
@@ -231,7 +231,7 @@ fn reap_now_after_a_refused_kill(evidence: fn() -> Box<dyn std::any::Any>) {
 /// Mutant: no forget in `reap_now`'s refused-kill arm (tokio's drop reaps the zombie by pid).
 #[skuld::test]
 async fn reap_now_after_a_refused_kill_and_a_foreign_reap_reaps_nothing() {
-    reap_now_after_a_refused_kill(|| Box::new(force_peek_once(Ok(Peek::Foreign(Foreign::Gone)))));
+    reap_now_after_a_refused_kill(|| Box::new(force_peek_once(Ok(PeekOutcome::Foreign(Foreign::Gone)))));
 }
 
 /// A failed look cannot show the child is ours, so the arm forgets it too.
@@ -307,7 +307,7 @@ async fn try_wait_and_wait_on_a_child_that_cannot_be_verified_say_so() {
 #[skuld::test]
 async fn finish_elevated_after_a_refused_kill_and_a_foreign_reap_reaps_nothing() {
     let (child, witness) = exited_unreaped(true);
-    let _evidence = force_peeks([Ok(Peek::Running), Ok(Peek::Foreign(Foreign::Gone))]);
+    let _evidence = force_peeks([Ok(PeekOutcome::Running), Ok(PeekOutcome::Foreign(Foreign::Gone))]);
     let _refused = super::fault::force_kill_failure();
     let err = crate::tokio::spawn::finish_elevated(
         child,

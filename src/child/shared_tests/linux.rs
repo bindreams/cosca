@@ -155,7 +155,7 @@ fn a_deadline_poll_arms_the_remaining_time_and_peeks_once_at_expiry() {
     crate::wait::block_probe::take();
     exit_seams::holder_steps();
     // The final peek consumes this forced answer: it proves a peek was taken at expiry.
-    let peeked = exit_seams::force_peek_once(Ok(crate::wait::exit_only::Peek::Running));
+    let peeked = exit_seams::force_peek_once(Ok(crate::os_process::child::PeekOutcome::Running));
     assert_eq!(
         b.shared
             .wait_deadline(deadline)

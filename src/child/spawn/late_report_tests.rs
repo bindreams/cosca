@@ -14,9 +14,9 @@ use super::identity_macos_tests::{
 use super::unique_report;
 use crate::error::ChildFate;
 use crate::identity::{uniq_fault, ReadPurpose, UniqRead};
+use crate::os_process::child::PeekOutcome;
 use crate::test_groups::{tracer_group, Group};
 use crate::wait::exit_only::seams::{force_peek_once, force_peeks};
-use crate::wait::exit_only::Peek;
 
 // What the one warn says =====
 
@@ -827,7 +827,12 @@ fn macos_late_teardown_whose_wait_passes_its_threshold_warns_once_and_still_reap
         child,
         &stdin,
         unique,
-        |_| vec![Box::new(force_peeks([Ok(Peek::Running), Ok(Peek::Running)]))],
+        |_| {
+            vec![Box::new(force_peeks([
+                Ok(PeekOutcome::Running),
+                Ok(PeekOutcome::Running),
+            ]))]
+        },
     );
     crate::wait::exit_only::seams::assert_peeks_exhausted();
     assert_eq!(fate, ChildFate::Reaped, "the wait goes on past the threshold");
@@ -948,12 +953,12 @@ fn macos_late_teardown_with_a_refused_kill_and_a_refused_read_is_unknown() {
 /// Mutant: the arm says the child was reaped, or `Gone`.
 #[skuld::test]
 fn macos_late_teardown_of_a_child_reaped_elsewhere_after_the_kill_is_killed() {
-    use crate::wait::exit_only::Foreign;
+    use crate::os_process::child::Foreign;
     let (child, stdin, unique) = std_blocker_with_unique();
     let stdin = Rc::new(Cell::new(Some(stdin)));
     let pid = child.id();
     let (fate, warns, sent) = tear_down(child, &stdin, unique, |_| {
-        vec![Box::new(force_peek_once(Ok(Peek::Foreign(Foreign::Gone))))]
+        vec![Box::new(force_peek_once(Ok(PeekOutcome::Foreign(Foreign::Gone))))]
     });
     assert_eq!(fate, ChildFate::Killed);
     assert_kill_sent(pid, &sent);
@@ -966,12 +971,12 @@ fn macos_late_teardown_of_a_child_reaped_elsewhere_after_the_kill_is_killed() {
 /// Mutant: the arm says the child was reaped.
 #[skuld::test]
 fn macos_late_teardown_of_an_orphaned_zombie_after_the_kill_is_killed_and_says_so() {
-    use crate::wait::exit_only::Foreign;
+    use crate::os_process::child::Foreign;
     let (child, stdin, unique) = std_blocker_with_unique();
     let stdin = Rc::new(Cell::new(Some(stdin)));
     let pid = child.id();
     let (fate, warns, sent) = tear_down(child, &stdin, unique, |_| {
-        vec![Box::new(force_peek_once(Ok(Peek::Foreign(Foreign::Orphaned))))]
+        vec![Box::new(force_peek_once(Ok(PeekOutcome::Foreign(Foreign::Orphaned))))]
     });
     assert_eq!(fate, ChildFate::Killed);
     assert_kill_sent(pid, &sent);
@@ -1012,13 +1017,13 @@ fn macos_late_teardown_with_a_failed_wait_is_killed() {
 /// Mutant: the arm says the child was reaped.
 #[skuld::test]
 fn macos_late_teardown_whose_reap_peek_fails_after_the_kill_is_unknown() {
-    use crate::wait::exit_only::Reaped;
+    use crate::os_process::child::ExitRecord;
     let (child, stdin, unique) = std_blocker_with_unique();
     let stdin = Rc::new(Cell::new(Some(stdin)));
     let pid = child.id();
     let (fate, warns, sent) = tear_down(child, &stdin, unique, |_| {
         vec![Box::new(force_peeks([
-            Ok(Peek::Exit(Reaped::Unreadable { si_code: 0 })),
+            Ok(PeekOutcome::Exit(ExitRecord::Unreadable { si_code: 0 })),
             Err(std::io::Error::other("forced reap-peek failure")),
         ]))]
     });
@@ -1051,7 +1056,7 @@ struct NotZombie {
 /// before the first sweep. The root is left a zombie, which this reaps.
 fn late_tree_not_zombie(
     contain: impl FnOnce(&mut crate::Command),
-    waited: crate::wait::exit_only::Foreign,
+    waited: crate::os_process::child::Foreign,
     spoil: impl FnOnce() + 'static,
 ) -> NotZombie {
     use crate::child::spawn::fault::{set_at, SpawnPoint};
@@ -1081,7 +1086,7 @@ fn late_tree_not_zombie(
         move || {
             let holders = crate::containment::fdmarker::fault::holder_kills_so_far();
             marks.set((walks.walked().len(), holders.len()));
-            *forced.borrow_mut() = Some(force_peek_once(Ok(Peek::Foreign(waited))));
+            *forced.borrow_mut() = Some(force_peek_once(Ok(PeekOutcome::Foreign(waited))));
         }
     });
     let mark = crate::log_capture::mark();
@@ -1123,7 +1128,7 @@ fn macos_late_marked_tree_whose_root_is_not_shown_a_zombie_still_sweeps_its_hold
         |cmd| {
             cmd.contain_with(ContainMode::TreeWalk);
         },
-        crate::wait::exit_only::Foreign::Gone,
+        crate::os_process::child::Foreign::Gone,
         || {
             crate::containment::enumerate::force_blind_snapshot_for_next_call(true);
             crate::containment::fdmarker::fault::set_force_root_kill_noop(true);
@@ -1158,7 +1163,7 @@ fn macos_late_walked_tree_whose_root_is_not_shown_a_zombie_is_not_walked_again()
         |cmd| {
             cmd.contain_with(ContainMode::TreeWalk).suppress_fd_marker();
         },
-        crate::wait::exit_only::Foreign::Orphaned,
+        crate::os_process::child::Foreign::Orphaned,
         || {},
     );
     assert!(!seen.survived, "the first sweep kills the grandchild");
@@ -1182,7 +1187,7 @@ fn macos_late_session_tree_whose_root_is_not_shown_a_zombie_says_so() {
         |cmd| {
             cmd.contain_with(ContainMode::Session).suppress_fd_marker();
         },
-        crate::wait::exit_only::Foreign::Gone,
+        crate::os_process::child::Foreign::Gone,
         || {},
     );
     assert!(!seen.survived, "the first sweep kills the grandchild");

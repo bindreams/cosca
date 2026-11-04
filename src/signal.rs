@@ -64,8 +64,9 @@ pub(crate) enum RootState {
     /// The root is an unreaped child (a zombie at worst): its pid names it, and a signal through
     /// its handle reaches it.
     Unreaped,
-    /// The root was reaped, by this handle or by someone else: its pid may name another process.
-    Reaped,
+    /// The root was reaped: its pid may name another process. `own` says whether this handle's own
+    /// wait collected it (else someone else did, or it was gone when adopted).
+    Reaped { own: bool },
     /// The handle could not say: a failed peek, or (macOS) a refused unique-id read. Treated as
     /// neither reaped nor unreaped; callers skip what a reuse of the pid could redirect, and act
     /// only through the handle.
@@ -150,7 +151,7 @@ pub(crate) fn why_untrusted(state: &RootState) -> String {
     match state {
         RootState::Unpinned => format!("the root is not pinned by this process (RootState::Unpinned: {UNPINNED_WHY})"),
         RootState::Unknown(e) => format!("the root could not be shown to be unreaped (RootState::Unknown: {e})"),
-        RootState::Unreaped | RootState::Reaped => {
+        RootState::Unreaped | RootState::Reaped { .. } => {
             debug_assert!(false, "{state:?} leaves the root's number trusted");
             "the root's number is trusted".to_owned()
         }
@@ -160,13 +161,12 @@ pub(crate) fn why_untrusted(state: &RootState) -> String {
 #[cfg(unix)]
 impl RootState {
     /// What a peek through the root's own handle shows.
-    pub(crate) fn of_peek(peeked: io::Result<crate::wait::exit_only::Peek>) -> RootState {
-        use crate::wait::exit_only::Peek;
+    pub(crate) fn of_peek(peeked: io::Result<crate::os_process::child::PeekOutcome>) -> RootState {
+        use crate::os_process::child::PeekOutcome;
         match peeked {
-            Ok(Peek::Running | Peek::Exit(_)) => RootState::Unreaped,
-            #[cfg(target_os = "macos")]
-            Ok(Peek::Foreign(crate::wait::exit_only::Foreign::Orphaned)) => RootState::Unpinned,
-            Ok(Peek::Foreign(_)) => RootState::Reaped,
+            Ok(PeekOutcome::Running | PeekOutcome::Exit(_)) => RootState::Unreaped,
+            Ok(PeekOutcome::Foreign(crate::os_process::child::Foreign::Orphaned)) => RootState::Unpinned,
+            Ok(PeekOutcome::Foreign(_)) => RootState::Reaped { own: false },
             Err(e) => RootState::Unknown(e),
         }
     }

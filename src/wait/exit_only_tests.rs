@@ -5,10 +5,11 @@ mod unix {
     use std::os::unix::process::ExitStatusExt;
     use std::process::ExitStatus;
 
-    use crate::wait::exit_only::{is_exit_record, reaped_from_record, Reaped, Record};
+    use crate::os_process::child::ExitRecord;
+    use crate::wait::exit_only::{exit_record_of, is_exit_record, Record};
 
-    fn status(code: i32, si_status: i32) -> Reaped {
-        reaped_from_record(Record {
+    fn status(code: i32, si_status: i32) -> ExitRecord {
+        exit_record_of(Record {
             si_code: code,
             si_status,
         })
@@ -22,7 +23,7 @@ mod unix {
     fn an_exited_record_gives_the_low_byte_as_the_code() {
         assert_eq!(
             status(libc::CLD_EXITED, 0x0A00_0107),
-            Reaped::Status(ExitStatus::from_raw(7 << 8))
+            ExitRecord::Status(ExitStatus::from_raw(7 << 8))
         );
     }
 
@@ -33,11 +34,11 @@ mod unix {
     fn killed_and_dumped_records_give_the_signal() {
         assert_eq!(
             status(libc::CLD_KILLED, 0x0A00_0009),
-            Reaped::Status(ExitStatus::from_raw(9))
+            ExitRecord::Status(ExitStatus::from_raw(9))
         );
         assert_eq!(
             status(libc::CLD_DUMPED, 0x0A00_000B),
-            Reaped::Status(ExitStatus::from_raw(0x0B | 0x80))
+            ExitRecord::Status(ExitStatus::from_raw(0x0B | 0x80))
         );
     }
 
@@ -49,7 +50,7 @@ mod unix {
     fn a_trapped_record_is_not_an_exit_record() {
         for code in [libc::CLD_TRAPPED, libc::CLD_STOPPED, libc::CLD_CONTINUED, 0, 99] {
             assert!(!is_exit_record(code), "si_code {code}");
-            assert_eq!(status(code, 5), Reaped::Unreadable { si_code: code });
+            assert_eq!(status(code, 5), ExitRecord::Unreadable { si_code: code });
         }
         for code in [libc::CLD_EXITED, libc::CLD_KILLED, libc::CLD_DUMPED] {
             assert!(is_exit_record(code), "si_code {code}");

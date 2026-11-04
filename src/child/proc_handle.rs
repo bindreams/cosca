@@ -81,13 +81,6 @@ impl ProcHandle {
         s.state()
     }
 
-    /// [`state`](Self::state), and whether a `Reaped` is this handle's own reap, from one read.
-    #[cfg(unix)]
-    pub(crate) fn state_and_own_reap(&self) -> (crate::signal::RootState, bool) {
-        let ProcHandle::Std(s) = self;
-        s.state_and_own_reap()
-    }
-
     /// Block until the child exits.
     pub(crate) fn wait(&self) -> io::Result<ExitStatus> {
         match self {
@@ -211,7 +204,7 @@ impl ProcHandle {
                     // fails, is `Killed` (see `Foreign::fate`).
                     Err(e) => Torn {
                         fate: if e.raw_os_error() == Some(libc::ECHILD) {
-                            crate::wait::exit_only::Foreign::Gone.fate(true)
+                            crate::os_process::child::Foreign::Gone.fate(true)
                         } else {
                             ChildFate::Killed
                         },
@@ -275,7 +268,7 @@ impl ProcHandle {
                             if e.raw_os_error() == Some(libc::ECHILD) {
                                 // Delivered, the kill is `Killed`; found nothing to signal, `Gone`.
                                 return Torn {
-                                    fate: crate::wait::exit_only::Foreign::Gone.fate(delivered),
+                                    fate: crate::os_process::child::Foreign::Gone.fate(delivered),
                                     left,
                                 };
                             }

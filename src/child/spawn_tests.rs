@@ -1551,12 +1551,8 @@ fn a_child_reaped_elsewhere_after_the_teardowns_kill_is_killed() {
 /// Mutant: either answer is swapped, or a verdict ignores the kill.
 #[skuld::test]
 fn a_foreign_verdict_is_killed_after_a_delivered_kill_and_gone_otherwise() {
-    use crate::wait::exit_only::Foreign;
-    #[cfg(target_os = "macos")]
-    let all = [Foreign::Gone, Foreign::Other, Foreign::Orphaned];
-    #[cfg(not(target_os = "macos"))]
-    let all = [Foreign::Gone];
-    for foreign in all {
+    use crate::os_process::child::Foreign;
+    for foreign in [Foreign::Gone, Foreign::Other, Foreign::Orphaned] {
         assert_eq!(foreign.fate(true), ChildFate::Killed, "{foreign:?}");
         assert_eq!(foreign.fate(false), ChildFate::Gone, "{foreign:?}");
     }

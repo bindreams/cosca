@@ -289,7 +289,7 @@ impl DropView {
         let root_pid = id.pid();
         let now = crate::child::root_identity_now(root_pid);
         let state = root();
-        let handle_reaped = matches!(state, RootState::Reaped);
+        let handle_reaped = matches!(state, RootState::Reaped { .. });
         let root = if crate::child::root_reaped(handle_reaped, id, now) {
             // The number shows the reap where the handle could not say; say so in the log.
             match &state {
@@ -299,7 +299,7 @@ impl DropView {
                 RootState::Unpinned => log::debug!(
                     "{label}: the root is not pinned by this process, but its number shows it reaped"
                 ),
-                RootState::Unreaped | RootState::Reaped => {}
+                RootState::Unreaped | RootState::Reaped { .. } => {}
             }
             RootView::Reaped
         } else {
@@ -307,7 +307,7 @@ impl DropView {
                 RootState::Unreaped => RootView::Trusted,
                 RootState::Unknown(e) => RootView::Unknown(e),
                 RootState::Unpinned => RootView::Unpinned,
-                RootState::Reaped => RootView::Reaped,
+                RootState::Reaped { .. } => RootView::Reaped,
             }
         };
         let view = DropView {
