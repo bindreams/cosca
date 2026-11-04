@@ -1545,9 +1545,9 @@ impl ProcSource {
         });
         let mut failed = None;
         let fate = match reaped {
-            Ok(Ok(_reaped)) => {
+            Ok(Ok(_record)) => {
                 #[cfg(test)]
-                if let crate::os_process::child::ExitRecord::Status(status) = _reaped {
+                if let crate::os_process::child::ExitRecord::Status(status) = _record {
                     crate::child::spawn::fault::record_teardown_reap(pid, status);
                 }
                 ChildFate::Reaped
@@ -1738,9 +1738,9 @@ fn wait_on_pidfd(pid: u32, pidfd: &std::os::fd::OwnedFd, level: log::Level) -> (
     use crate::wait::exit_only::{self, Target};
 
     match exit_only::wait_visible_exit(&Target::PidFd(pidfd.as_fd())) {
-        Ok(PeekOutcome::Exit(_reaped)) => {
+        Ok(PeekOutcome::Exit(_record)) => {
             #[cfg(test)]
-            if let crate::os_process::child::ExitRecord::Status(status) = _reaped {
+            if let crate::os_process::child::ExitRecord::Status(status) = _record {
                 crate::child::spawn::fault::record_teardown_reap(pid, status);
             }
             (Waited::Exited, None)

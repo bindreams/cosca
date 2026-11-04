@@ -197,7 +197,7 @@ pub(crate) fn is_exit_record(si_code: i32) -> bool {
 /// The wait status `record` describes. Total: a code that is not an exit record is
 /// [`ExitRecord::Unreadable`]. The masks drop the bits XNU ORs into `si_status`'s high byte.
 #[cfg(unix)]
-pub(crate) fn reaped_from_record(record: Record) -> ExitRecord {
+pub(crate) fn exit_record_of(record: Record) -> ExitRecord {
     use std::os::unix::process::ExitStatusExt;
     let Record { si_code, si_status } = record;
     let raw = match si_code {
