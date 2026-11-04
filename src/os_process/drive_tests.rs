@@ -1,9 +1,10 @@
 use std::time::{Duration, Instant};
 
-use super::{absolute, exited_held, run, ProcessExit, RunOutcome};
+use super::{absolute, exited_held, run, ProcessExit, RunOutcome, Step, Waitable};
 use crate::error::Error;
 use crate::identity::ProcessId;
 use crate::os_process::fake::{Answer, FakeProcess};
+use crate::os_process::{Exit, OsProcess};
 use crate::wait::{block_probe, fault, test_clock};
 
 fn fake(exits: impl IntoIterator<Item = Answer>) -> FakeProcess {
@@ -86,6 +87,201 @@ fn duration_max_is_unbounded() {
         [None],
         "an overflowing timeout arms an unbounded wait"
     );
+}
+
+/// What a [`Scripted`] look does.
+#[derive(Clone, Copy)]
+enum Move {
+    Done,
+    Recheck,
+    /// Wait on a source that is already fired: the block returns at once.
+    Wait,
+    /// Wait on a descriptor whose poll fails (`POLLERR`: the write end of a pipe nobody reads).
+    #[cfg(target_os = "linux")]
+    WaitFails,
+}
+
+/// A [`Waitable`] that plays `moves` and records the pauses it is asked for. A pause runs `on_pause`
+/// (a test moves the frozen clock in it), then returns at once.
+struct Scripted {
+    moves: std::collections::VecDeque<Move>,
+    source: FakeProcess,
+    looks: usize,
+    pauses: Vec<Duration>,
+    on_pause: Box<dyn FnMut(Duration)>,
+    on_look: Box<dyn FnMut(usize)>,
+    /// Whether [`Waitable::block_failed`] lets the loop go on.
+    survive_block_errors: bool,
+    block_errors: usize,
+    #[cfg(target_os = "linux")]
+    broken: Option<std::io::PipeWriter>,
+}
+
+impl Scripted {
+    fn new(moves: impl IntoIterator<Item = Move>) -> Self {
+        let moves: std::collections::VecDeque<Move> = moves.into_iter().collect();
+        let waits = moves.iter().filter(|m| matches!(m, Move::Wait)).count();
+        let source = fake(vec![Answer::Running; waits]);
+        source.wake();
+        Self {
+            moves,
+            source,
+            looks: 0,
+            pauses: Vec::new(),
+            on_pause: Box::new(|_| {}),
+            on_look: Box::new(|_| {}),
+            survive_block_errors: false,
+            block_errors: 0,
+            #[cfg(target_os = "linux")]
+            broken: None,
+        }
+    }
+}
+
+impl Waitable for Scripted {
+    type Output = ();
+
+    fn look(&mut self) -> Result<Step<'_, ()>, Error> {
+        (self.on_look)(self.looks);
+        self.looks += 1;
+        Ok(match self.moves.pop_front().expect("a look past the scripted moves") {
+            Move::Done => Step::Done(()),
+            Move::Recheck => Step::Recheck,
+            Move::Wait => match self.source.exited()? {
+                Exit::Running(wait_for) => Step::Wait(wait_for),
+                Exit::Exited => unreachable!("the source answers Running"),
+            },
+            #[cfg(target_os = "linux")]
+            Move::WaitFails => {
+                use std::os::fd::AsFd as _;
+                let (rx, tx) = std::io::pipe().expect("pipe");
+                drop(rx);
+                let tx: &std::io::PipeWriter = self.broken.insert(tx);
+                Step::Wait(crate::os_process::WaitFor::Readable(tx.as_fd()))
+            }
+        })
+    }
+
+    fn block_failed(&mut self, e: Error) -> Result<(), Error> {
+        self.block_errors += 1;
+        if self.survive_block_errors {
+            Ok(())
+        } else {
+            Err(e)
+        }
+    }
+
+    fn pause(&mut self, d: Duration) {
+        self.pauses.push(d);
+        (self.on_pause)(d);
+    }
+}
+
+fn ms(n: u64) -> Duration {
+    Duration::from_millis(n)
+}
+
+/// `pauses` in whole milliseconds: `backon` multiplies through `f32` seconds, so a step can come out
+/// a microsecond over (16.000001 ms).
+fn whole_ms(pauses: &[Duration]) -> Vec<u64> {
+    pauses
+        .iter()
+        .map(|d| (d.as_secs_f64() * 1000.0).round() as u64)
+        .collect()
+}
+
+/// Mutant: pause a constant, or restart the schedule at every pause, or cap it at another value.
+#[skuld::test]
+fn run_pauses_the_backoff_steps_on_recheck() {
+    block_probe::take();
+    let mut w = Scripted::new([Move::Recheck; 8].into_iter().chain([Move::Done]));
+    assert!(matches!(run(&mut w, None).unwrap(), RunOutcome::Done(())));
+    assert_eq!(whole_ms(&w.pauses), [1, 2, 4, 8, 16, 32, 50, 50]);
+    assert_eq!(w.looks, 9, "one look per pause, and one more");
+    assert!(block_probe::take().is_empty(), "a Recheck blocks on nothing");
+}
+
+/// Mutant: keep the schedule across a wait.
+#[skuld::test]
+fn run_restarts_the_backoff_after_a_wait() {
+    block_probe::take();
+    let mut w = Scripted::new([Move::Recheck, Move::Recheck, Move::Wait, Move::Recheck, Move::Done]);
+    assert!(matches!(run(&mut w, None).unwrap(), RunOutcome::Done(())));
+    assert_eq!(whole_ms(&w.pauses), [1, 2, 1]);
+    assert_eq!(block_probe::take().len(), 1, "the one Wait blocked once");
+}
+
+/// A pause never outlasts the deadline: the last one is cut to the time remaining, and the look
+/// after it is the final one.
+///
+/// Mutant: pause the whole step; or make no final look after the last pause.
+#[skuld::test]
+fn run_clamps_a_pause_to_the_time_remaining() {
+    let (_clock, _start) = test_clock::FrozenClockGuard::install();
+    let mut w = Scripted::new([Move::Recheck; 4]);
+    w.on_pause = Box::new(test_clock::advance);
+    let outcome = run(&mut w, absolute(Some(ms(4)))).unwrap();
+    assert!(matches!(outcome, RunOutcome::DeadlinePassed), "{outcome:?}");
+    assert_eq!(whole_ms(&w.pauses), [1, 2, 1]);
+    assert_eq!(w.looks, 4, "the last look is made at the deadline");
+}
+
+/// Mutant: pause at or after the deadline, or give up at the deadline without a final look.
+#[skuld::test]
+fn run_never_pauses_after_the_deadline() {
+    let (_clock, _start) = test_clock::FrozenClockGuard::install();
+    // The deadline is already past.
+    let mut w = Scripted::new([Move::Recheck]);
+    let outcome = run(&mut w, absolute(Some(Duration::ZERO))).unwrap();
+    assert!(matches!(outcome, RunOutcome::DeadlinePassed), "{outcome:?}");
+    assert!(w.pauses.is_empty());
+    assert_eq!(w.looks, 1);
+    // The deadline passes during a look that asks for a recheck: no pause, one final look, whose
+    // answer is the outcome.
+    let mut w = Scripted::new([Move::Recheck, Move::Done]);
+    w.on_look = Box::new(|n| {
+        if n == 0 {
+            test_clock::advance(ms(5));
+        }
+    });
+    let outcome = run(&mut w, absolute(Some(ms(5)))).unwrap();
+    assert!(matches!(outcome, RunOutcome::Done(())), "{outcome:?}");
+    assert!(w.pauses.is_empty());
+    assert_eq!(w.looks, 2);
+}
+
+/// A failed block is the `Waitable`'s to answer: by default it ends the loop with the error.
+///
+/// Mutant: swallow the error in `run`; or never hand it to the `Waitable`.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn run_returns_a_block_error_the_waitable_does_not_survive() {
+    let mut w = Scripted::new([Move::WaitFails, Move::Done]);
+    assert!(matches!(run(&mut w, None), Err(Error::Io(_))));
+    assert_eq!(w.block_errors, 1);
+    assert_eq!(w.looks, 1);
+}
+
+/// A `Waitable` that survives a failed block is looked at again, and the loop goes on.
+///
+/// Mutant: end the loop on a block error the `Waitable` survived; or skip the look after it.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn run_looks_again_after_a_block_error_the_waitable_survives() {
+    let mut w = Scripted::new([Move::WaitFails, Move::Recheck, Move::Done]);
+    w.survive_block_errors = true;
+    assert!(matches!(run(&mut w, None).unwrap(), RunOutcome::Done(())));
+    assert_eq!(w.block_errors, 1);
+    assert_eq!(w.looks, 3);
+}
+
+/// `exited()` never answers a recheck, so a [`ProcessExit`] has nothing to pause for: asking it to is
+/// a contract violation, not a sleep.
+#[cfg(debug_assertions)]
+#[skuld::test]
+#[should_panic(expected = "never asks for a recheck")]
+fn a_process_exit_is_never_paused() {
+    ProcessExit(&fake([])).pause(ms(1));
 }
 
 /// One open serves a signal and a wait from different threads: `Sync`, `&self`. The wait ends

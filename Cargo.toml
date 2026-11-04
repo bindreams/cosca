@@ -59,6 +59,8 @@ serde = { version = "1", optional = true, features = ["derive"] }
 # reactor-native death-watch); `time` solely for the grace bound on it. `sync` backs the
 # per-instance wait observer (a `#[cfg(test)]` oneshot seam) the raw async backend is tested with.
 tokio = { version = "1", optional = true, features = ["process", "rt", "io-util", "macros", "net", "sync", "time"] }
+# The wait loop's backoff schedule (`os_process::drive`). No default features: only the iterator.
+backon = { version = "=1.6.0", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
