@@ -484,7 +484,7 @@ pub(crate) fn wait_until_exited(pidfd: &OwnedFd) {
         pidfd.as_fd(),
         rustix::event::PollFlags::IN,
     )];
-    while rustix::event::poll(&mut fds, None) == Err(rustix::io::Errno::INTR) {}
+    crate::wait::poll_ready(&mut fds).expect("poll the pidfd");
 }
 
 /// What a drop that keeps its leaf armed does with a front in the leaf: the leaf's kill ends the

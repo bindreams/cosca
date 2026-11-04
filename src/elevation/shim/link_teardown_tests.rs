@@ -1,5 +1,7 @@
 //! Teardown and the process that owns the link.
 
+use rustix::event::{PollFd, PollFlags};
+
 use super::super::fake_shim::{next_acceptor_event, FakeShim, Rig};
 use super::super::probe::LinkEvent;
 use super::super::{KillError, KillOutcome, LinkOutcome, NotOwner, StartState, WaitError};
@@ -169,7 +171,7 @@ fn unknown_origin_in_the_original_stops_the_acceptor_and_removes_nothing() {
     link.owner.make_unreadable();
     drop(link);
     assert!(
-        super::super::sys::is_readable(&wake.reader),
+        crate::wait::any_ready_now(&mut [PollFd::new(&wake.reader, PollFlags::IN)]).unwrap(),
         "the stop byte is in the wake pipe"
     );
     probe.release_acceptor();

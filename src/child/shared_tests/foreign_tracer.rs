@@ -9,7 +9,6 @@
 //! either. The tracer is [`crate::test_support::foreign_tracer`].
 
 use std::cell::Cell;
-use std::os::fd::AsRawFd as _;
 use std::os::unix::process::ExitStatusExt as _;
 use std::rc::Rc;
 use std::sync::mpsc;
@@ -107,20 +106,8 @@ fn hand_back(go_byte: u8, wait: Wait, stop_first: bool) {
     let Some(Target::PidFd(fd)) = b.shared.target() else {
         panic!("a pidfd");
     };
-    let mut fds = [libc::pollfd {
-        fd: fd.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    }];
-    loop {
-        // SAFETY: `fds` is one valid `pollfd`.
-        let r = unsafe { libc::poll(fds.as_mut_ptr(), 1, -1) };
-        if r == 1 {
-            break;
-        }
-        let e = std::io::Error::last_os_error();
-        assert!(r == -1 && e.raw_os_error() == Some(libc::EINTR), "poll: {e}");
-    }
+    let mut fds = [rustix::event::PollFd::new(&fd, rustix::event::PollFlags::IN)];
+    crate::wait::poll_ready(&mut fds).expect("poll the pidfd");
     assert_eq!(
         b.shared.try_wait().expect("try_wait"),
         None,
