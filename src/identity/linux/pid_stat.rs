@@ -7,6 +7,7 @@
 
 use std::io;
 
+use super::kernel::Kernel;
 use super::proc_view::ProcDir;
 
 /// What reading one pid's `stat` yielded.
@@ -60,9 +61,9 @@ impl std::fmt::Display for Unreadable {
 }
 
 /// `pid`'s `stat` through `dir`: [`PidStat::Skipped`] for the errnos that mean the pid is not
-/// there for us, [`Unreadable`] for every other.
-pub(crate) fn read(dir: &ProcDir, pid: u32) -> Result<PidStat, Unreadable> {
-    let source = match read_raw(dir, pid) {
+/// there for us, [`Unreadable`] for every other. Never asks `kill(pid, 0)`.
+pub(crate) fn read_in_scan(kernel: &dyn Kernel, dir: &ProcDir, pid: u32) -> Result<PidStat, Unreadable> {
+    let source = match read_raw(kernel, dir, pid) {
         Ok(stat) => return Ok(PidStat::Read(stat)),
         Err(e) => e,
     };
@@ -72,7 +73,7 @@ pub(crate) fn read(dir: &ProcDir, pid: u32) -> Result<PidStat, Unreadable> {
         // process would abort every scan.
         Some(libc::ENOENT | libc::ESRCH | libc::EACCES) => return Ok(PidStat::Skipped(source)),
         // `hidepid`'s answer only if the checked directory still reads.
-        Some(libc::EPERM) => match check_dir_answers(dir) {
+        Some(libc::EPERM) => match check_dir_answers(kernel, dir) {
             Ok(()) => return Ok(PidStat::Skipped(source)),
             Err(refusal) => Kind::DirectoryRefuses(refusal),
         },
@@ -82,7 +83,13 @@ pub(crate) fn read(dir: &ProcDir, pid: u32) -> Result<PidStat, Unreadable> {
     Err(Unreadable { pid, kind, source })
 }
 
-fn read_raw(dir: &ProcDir, pid: u32) -> io::Result<Vec<u8>> {
+/// The raw `stat` read; what a failure means is each caller's policy ([`read_in_scan`],
+/// `identity::linux::stat_by_pid`).
+pub(super) fn read_stat_file(kernel: &dyn Kernel, dir: &ProcDir, pid: u32) -> io::Result<Vec<u8>> {
+    kernel.read(dir, &format!("{pid}/stat"))
+}
+
+fn read_raw(kernel: &dyn Kernel, dir: &ProcDir, pid: u32) -> io::Result<Vec<u8>> {
     #[cfg(test)]
     if let Some(errno) = fault::forced_stat_read_errno() {
         return Err(io::Error::from_raw_os_error(errno));
@@ -91,16 +98,16 @@ fn read_raw(dir: &ProcDir, pid: u32) -> io::Result<Vec<u8>> {
     if let Some(bytes) = fault::forced_stat_bytes() {
         return Ok(bytes);
     }
-    dir.read(&format!("{pid}/stat"))
+    read_stat_file(kernel, dir, pid)
 }
 
 /// Whether the checked directory still reads (`self/stat`).
-fn check_dir_answers(dir: &ProcDir) -> io::Result<()> {
+fn check_dir_answers(kernel: &dyn Kernel, dir: &ProcDir) -> io::Result<()> {
     #[cfg(test)]
     if let Some(errno) = fault::forced_recheck_errno() {
         return Err(io::Error::from_raw_os_error(errno));
     }
-    dir.read("self/stat").map(drop)
+    kernel.read(dir, "self/stat").map(drop)
 }
 
 /// Test-only seam: force the per-pid `stat` read.
@@ -148,3 +155,7 @@ pub(crate) mod fault {
         STAT_READ.with(|f| f.get()).map(|(errno, _)| errno)
     }
 }
+
+#[cfg(test)]
+#[path = "pid_stat_tests.rs"]
+mod pid_stat_tests;
