@@ -983,8 +983,9 @@ impl ProcSource {
     /// Block until the child's exit is visible to this process, or until `until`, and say which
     /// came first. For a message only: [`wait_and_reap_caused`](ProcSource::wait_and_reap_caused),
     /// which the caller runs next either way, is the wait that decides. Anything this cannot read
-    /// (a failed poll or peek, a child it cannot show to be ours, a foreign reap) answers `true`,
-    /// and is left to that wait.
+    /// (a failed peek, a child it cannot show to be ours, a foreign reap) answers `true`, and is
+    /// left to that wait. On Linux a failed poll is not one of them: the peeks decide, and a child
+    /// still running at `until` answers `false`.
     ///
     /// - **Linux:** [`crate::wait::pidfd_exit_visible_by`].
     /// - **macOS:** the verified-id kqueue wait, with `until` as its deadline.
