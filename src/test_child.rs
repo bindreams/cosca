@@ -1651,3 +1651,19 @@ pub(crate) fn cwd_and_path_tools() -> (tempfile::TempDir, tempfile::TempDir) {
 #[cfg(test)]
 #[path = "test_child_tests.rs"]
 mod test_child_tests;
+
+/// Whether the process `id` names has exited by `timeout` (`None`: for ever), found through a fresh
+/// open; a gone id has exited. Reaps nothing.
+#[cfg(any(target_os = "linux", windows))]
+pub(crate) fn exited_through_open(
+    id: crate::identity::ProcessId,
+    timeout: Option<std::time::Duration>,
+) -> Result<bool, crate::error::Error> {
+    match crate::Process::open(id)? {
+        None => Ok(true),
+        Some(process) => match timeout {
+            None => process.wait().map(|()| true),
+            Some(timeout) => process.wait_timeout(timeout),
+        },
+    }
+}

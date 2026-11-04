@@ -179,14 +179,14 @@ fn a_failed_elevated_spawns_cleanup_after_a_foreign_reap_reports_no_skip_for_an_
 fn a_drop_of_a_root_its_handle_cannot_read_kills_its_group_through_the_pidfd(
     #[fixture(pidfd_group_signal)] _group: &Group,
 ) {
-    use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peek_once};
-    let (child, member) = root_with_a_member();
+    let (mut child, member) = root_with_a_member();
     let _released = member.release_root_when_a_teardown_waits();
     let capture = Capture::start();
-    let forced = force_peek_once(Err(std::io::Error::other("forced peek failure")));
+    let fake = child
+        .proc
+        .script_over(|f| f.peeks([Err(std::io::Error::other("forced peek failure"))]));
     drop(child);
-    assert_peeks_exhausted();
-    drop(forced);
+    fake.assert_peeks_exhausted();
     let steps = capture.group_steps();
     assert_group_signalled_first_through_the_pidfd(&steps, libc::SIGKILL);
     member.assert_killed();
@@ -200,18 +200,18 @@ fn a_drop_of_a_root_its_handle_cannot_read_with_no_member_left_still_skips_the_g
     #[fixture(pidfd_group_signal)] _group: &Group,
 ) {
     use crate::identity::Resolved;
-    use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peek_once};
     crate::log_capture::install();
-    let child = session_sleep().spawn().expect("spawn");
+    let mut child = session_sleep().spawn().expect("spawn");
     let id = child.id();
     reap_root(&child, Reap::Foreign);
     let mark = crate::log_capture::mark();
     let capture = Capture::start();
     let _as_root = crate::child::fault::force_next_root_read(Resolved::Found(id));
-    let forced = force_peek_once(Err(std::io::Error::other("forced peek failure")));
+    let fake = child
+        .proc
+        .script_over(|f| f.peeks([Err(std::io::Error::other("forced peek failure"))]));
     drop(child);
-    assert_peeks_exhausted();
-    drop(forced);
+    fake.assert_peeks_exhausted();
     let steps = capture.group_steps();
     assert_eq!(steps, [], "nothing was sent to the group");
     let skips = crate::log_capture::records_since_on_current_thread(mark, "so it does not kill its process group");
