@@ -42,8 +42,10 @@ fn teardown_when_the_reap_answers(reap: ReapAnswer) -> (TeardownOutcome, Vec<log
 }
 
 /// Turns a wait that blocks into a recorded fact: the fake's wait is fired as the block begins, so
-/// a teardown that waits where it must not fails the count instead of hanging.
+/// a teardown that waits where it must not fails the count instead of hanging. The count starts
+/// empty: a block an earlier test left on this thread is dropped.
 fn fire_on_block(fake: &FakeProcess) -> crate::wait::block_probe::Armed {
+    crate::wait::block_probe::take();
     let fake = fake.clone();
     crate::wait::block_probe::on_blocking(move || fake.wake())
 }

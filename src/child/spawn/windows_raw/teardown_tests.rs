@@ -234,6 +234,7 @@ fn raw_spawn_teardown_with_a_denied_terminate_is_running_and_does_not_wait() {
     let (child, fake) = owned(real(owner.without_terminate_right(), owner.pid));
     // Ends the process once a wait blocks, so a teardown that waits fails the checks below instead of
     // hanging.
+    crate::wait::block_probe::take();
     let _end = crate::wait::block_probe::on_blocking(owner.end_with_code_zero());
     let fate = teardown_spawned(&child, owner.pid, Some(id), None);
     assert_eq!(fate, ChildFate::Running { id: Some(id) });
