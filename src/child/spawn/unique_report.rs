@@ -307,14 +307,14 @@ fn watch(read_end: &OwnedFd, pid: u32) -> io::Result<Watch> {
     use crate::wait::macos::{OnTracer, TracerWatch};
     use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent};
 
-    let kq = Kqueue::new().map_err(into_io)?;
+    let kq = Kqueue::new().map_err(Error::into_io)?;
     #[cfg(test)]
     seams::wait_begins();
     let pipe = Subscription::Readable {
         fd: read_end.as_raw_fd(),
         low_water: 1,
     };
-    kq.subscribe(pipe).map_err(into_io)?;
+    kq.subscribe(pipe).map_err(Error::into_io)?;
     // Registered before the first check, so a child that exits after it fires `NOTE_EXIT`, and one a
     // tracer attaches to fires `NOTE_SIGNAL`.
     let child = Subscription::Process {
@@ -325,7 +325,7 @@ fn watch(read_end: &OwnedFd, pid: u32) -> io::Result<Watch> {
     match kq.subscribe(child) {
         Ok(()) => {}
         Err(e) if e.raw_os_error() == Some(libc::ESRCH) => return Ok(Watch::ChildGone),
-        Err(e) => return Err(into_io(e)),
+        Err(e) => return Err(e.into_io()),
     }
     let mut tracer = TracerWatch::default();
     let blank = KEvent::new(0, EventFilter::EVFILT_READ, EvFlags::empty(), FilterFlag::empty(), 0, 0);
@@ -441,13 +441,6 @@ fn check(pid: u32) -> io::Result<Check> {
             }
         },
     })
-}
-
-fn into_io(e: Error) -> io::Error {
-    match e {
-        Error::Io(e) => e,
-        other => io::Error::other(other),
-    }
 }
 
 /// Reads one report from the non-blocking `read_end`.
