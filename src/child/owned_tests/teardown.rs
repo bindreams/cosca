@@ -28,7 +28,7 @@ fn teardown(fake: &FakeProcess) -> (TeardownOutcome, Vec<log::Level>) {
     let child = OwnedChild::new(Box::new(fake.clone()));
     let mark = crate::log_capture::mark();
     let torn = child.teardown_on_drop(id());
-    let levels = crate::log_capture::records_since_on_current_thread(mark, &format!("teardown of child {PID}"))
+    let levels = crate::log_capture::records_since_on_current_thread(mark, &PID.to_string())
         .into_iter()
         .map(|(level, _)| level)
         .collect();
@@ -228,5 +228,22 @@ fn teardown_after_a_refused_kill_of_a_child_reaped_elsewhere_is_gone_and_silent(
     let (torn, _) = teardown(&fake);
     assert_eq!(torn.fate, ChildFate::Gone);
     assert_eq!(torn.left, None);
+    assert_eq!(fake.looks(), 1);
+}
+
+/// A kill that failed on a child launchd holds the zombie of: the look finds `Orphaned`, the child is
+/// `Gone`, and nothing is warned of or logged above `debug`.
+///
+/// Mutants: the look warns of the launchd orphan; it reads the fate from the error (`Unknown` off
+/// Unix).
+#[skuld::test]
+fn teardown_after_a_refused_kill_of_a_child_launchd_holds_is_gone_and_silent() {
+    let fake = FakeProcess::new([])
+        .reaps([ReapAnswer::Foreign(Foreign::Orphaned)])
+        .signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))]);
+    let (torn, levels) = teardown(&fake);
+    assert_eq!(torn.fate, ChildFate::Gone);
+    assert_eq!(torn.left, None);
+    assert!(levels.iter().all(|level| *level >= log::Level::Debug), "{levels:?}");
     assert_eq!(fake.looks(), 1);
 }
