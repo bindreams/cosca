@@ -31,7 +31,7 @@ pub(crate) fn exited_by_id(id: ProcessId, timeout: Option<Duration>) -> Result<b
     let deadline = absolute(timeout);
     match open(id)? {
         None => Ok(true),
-        Some(process) => drive(&*process, deadline),
+        Some(process) => exited(&*process, deadline),
     }
 }
 
@@ -39,29 +39,71 @@ pub(crate) fn exited_by_id(id: ProcessId, timeout: Option<Duration>) -> Result<b
 /// after the deadline's final look.
 pub(crate) fn exited_held(p: &dyn OsProcess, timeout: Option<Duration>) -> Result<bool, Error> {
     enter()?;
-    drive(p, absolute(timeout))
+    exited(p, absolute(timeout))
+}
+
+/// [`run`] over a process's [`OsProcess::exited`] look.
+fn exited(p: &dyn OsProcess, deadline: Option<Instant>) -> Result<bool, Error> {
+    Ok(matches!(run(&mut ProcessExit(p), deadline)?, RunOutcome::Done(())))
 }
 
 /// `timeout` as an absolute deadline, fixed up front so no wake extends the total wait.
-pub(super) fn absolute(timeout: Option<Duration>) -> Option<Instant> {
+pub(crate) fn absolute(timeout: Option<Duration>) -> Option<Instant> {
     timeout.and_then(crate::wait::deadline_from)
 }
 
-/// The wait loop against an absolute `deadline` from [`absolute`]: look; if running, block on what
-/// the look returned.
-pub(super) fn drive(p: &dyn OsProcess, deadline: Option<Instant>) -> Result<bool, Error> {
+/// What a wait loop asks of what it waits on.
+pub(crate) trait Waitable {
+    type Output;
+    /// Done, or what to wait on. The [`WaitFor`] borrows `self` until the loop has waited on it.
+    fn look(&mut self) -> Result<Step<'_, Self::Output>, Error>;
+}
+
+/// What a [`Waitable::look`] found.
+pub(crate) enum Step<'a, T> {
+    Done(T),
+    Wait(WaitFor<'a>),
+}
+
+/// How [`run`] ended.
+#[derive(Debug)]
+pub(crate) enum RunOutcome<T> {
+    Done(T),
+    /// The deadline had passed at the final look, and the look was not done.
+    DeadlinePassed,
+}
+
+/// The one synchronous wait loop: look; if not done, block on what the look returned and look
+/// again. `deadline` is absolute (from [`absolute`]); `None` waits for ever. A look made at or after
+/// the deadline is the final one: it starts no block, and a look that is not done ends the loop with
+/// [`RunOutcome::DeadlinePassed`].
+pub(crate) fn run<W: Waitable>(w: &mut W, deadline: Option<Instant>) -> Result<RunOutcome<W::Output>, Error> {
     loop {
         // Read before the look: a look made at or after the deadline is the final one.
         let final_look = remaining(deadline) == Some(Duration::ZERO);
-        match p.exited()? {
-            Exit::Exited => return Ok(true),
-            Exit::Running(_) if final_look => return Ok(false),
-            Exit::Running(wait_for) => {
+        match w.look()? {
+            Step::Done(out) => return Ok(RunOutcome::Done(out)),
+            Step::Wait(_) if final_look => return Ok(RunOutcome::DeadlinePassed),
+            Step::Wait(wait_for) => {
                 if remaining(deadline) != Some(Duration::ZERO) {
                     block(&wait_for, deadline)?;
                 }
             }
         }
+    }
+}
+
+/// An open process's exit, as a [`Waitable`]: `look` is [`OsProcess::exited`].
+struct ProcessExit<'a>(&'a dyn OsProcess);
+
+impl Waitable for ProcessExit<'_> {
+    type Output = ();
+
+    fn look(&mut self) -> Result<Step<'_, ()>, Error> {
+        Ok(match self.0.exited()? {
+            Exit::Exited => Step::Done(()),
+            Exit::Running(wait_for) => Step::Wait(wait_for),
+        })
     }
 }
 
