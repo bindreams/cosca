@@ -1,6 +1,9 @@
 //! A stated-facts [`OsChild`]: what each call answers, in order, and nothing the OS would do. A call
 //! past its table panics. It never blocks; a `Running` answer hands out a [`WaitFor`] that the test
 //! fires with [`FakeProcess::wake`], and the driver's own blocking call is what a test counts.
+//!
+//! [`FakeProcess::over`] puts a real [`OsChild`] behind the tables: a call the table has an answer
+//! for gets it, and every other call, `os_handle` included, is the real one.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -35,8 +38,9 @@ pub(crate) enum ReapAnswer {
 /// One scripted answer of [`OsChild::peek`].
 pub(crate) type PeekAnswer = Result<PeekOutcome, std::io::ErrorKind>;
 
-/// One scripted answer of [`OsProcess::signal`].
-pub(crate) type SignalAnswer = Result<Sent, std::io::ErrorKind>;
+/// One scripted answer of [`OsProcess::signal`]. A failure is the whole `io::Error`, so a test can
+/// state a raw errno.
+pub(crate) type SignalAnswer = Result<Sent, std::io::Error>;
 
 /// Cloning gives another handle on the same tables and the same wake source: the test keeps one,
 /// the code under test owns the other.
@@ -46,6 +50,8 @@ pub(crate) struct FakeProcess(Arc<Shared>);
 struct Shared {
     script: Mutex<Script>,
     source: Source,
+    /// What answers a call the tables have nothing for. `None`: such a call panics.
+    real: Option<Box<dyn OsChild>>,
 }
 
 /// What calls consume and record, behind one lock so a `&FakeProcess` is `Sync`.
@@ -65,6 +71,17 @@ impl FakeProcess {
     /// A process that answers `exits` to successive `exited` looks. Every table starts empty, and a
     /// call past its table panics.
     pub(crate) fn new(exits: impl IntoIterator<Item = Answer>) -> Self {
+        Self::with(exits, None)
+    }
+
+    /// A process that answers from its tables (all empty to start) and, where a table has nothing,
+    /// from `real`.
+    #[cfg(windows)]
+    pub(crate) fn over(real: Box<dyn OsChild>) -> Self {
+        Self::with([], Some(real))
+    }
+
+    fn with(exits: impl IntoIterator<Item = Answer>, real: Option<Box<dyn OsChild>>) -> Self {
         Self(Arc::new(Shared {
             script: Mutex::new(Script {
                 exits: exits.into_iter().collect(),
@@ -77,6 +94,7 @@ impl FakeProcess {
                 on_look: None,
             }),
             source: Source::new(),
+            real,
         }))
     }
 
@@ -161,68 +179,66 @@ impl fmt::Debug for FakeProcess {
 
 impl OsProcess for FakeProcess {
     fn signal(&self, sig: Sig) -> Result<Sent, Error> {
-        let mut script = self.script();
-        script.signal_calls.push(sig);
-        match script
-            .signals
-            .pop_front()
-            .expect("FakeProcess: a signal was sent past the scripted answers")
-        {
-            Ok(sent) => Ok(sent),
-            Err(kind) => Err(Error::Io(kind.into())),
+        let scripted = {
+            let mut script = self.script();
+            script.signal_calls.push(sig);
+            script.signals.pop_front()
+        };
+        match (scripted, &self.0.real) {
+            (Some(Ok(sent)), _) => Ok(sent),
+            (Some(Err(error)), _) => Err(Error::Io(error)),
+            (None, Some(real)) => real.signal(sig),
+            (None, None) => panic!("FakeProcess: a signal was sent past the scripted answers"),
         }
     }
 
     fn exited(&self) -> Result<Exit<'_>, Error> {
         self.begin_look();
-        match self
-            .script()
-            .exits
-            .pop_front()
-            .expect("FakeProcess: a look was made past the scripted answers")
-        {
-            Answer::Exited => Ok(Exit::Exited),
-            Answer::Running => Ok(Exit::Running(self.0.source.wait_for())),
-            Answer::Err(kind) => Err(Error::Io(kind.into())),
+        let scripted = self.script().exits.pop_front();
+        match (scripted, &self.0.real) {
+            (Some(Answer::Exited), _) => Ok(Exit::Exited),
+            (Some(Answer::Running), _) => Ok(Exit::Running(self.0.source.wait_for())),
+            (Some(Answer::Err(kind)), _) => Err(Error::Io(kind.into())),
+            (None, Some(real)) => real.exited(),
+            (None, None) => panic!("FakeProcess: a look was made past the scripted answers"),
         }
     }
 
     #[cfg(any(target_os = "linux", windows))]
     fn os_handle(&self) -> super::child::OsHandle<'_> {
-        self.0.source.os_handle()
+        match &self.0.real {
+            Some(real) => real.os_handle(),
+            None => self.0.source.os_handle(),
+        }
     }
 }
 
 impl OsChild for FakeProcess {
     fn peek(&self) -> Result<PeekOutcome, Error> {
-        match self
-            .script()
-            .peeks
-            .pop_front()
-            .expect("FakeProcess: a peek was made past the scripted answers")
-        {
-            Ok(outcome) => Ok(outcome),
-            Err(kind) => Err(Error::Io(kind.into())),
+        let scripted = self.script().peeks.pop_front();
+        match (scripted, &self.0.real) {
+            (Some(Ok(outcome)), _) => Ok(outcome),
+            (Some(Err(kind)), _) => Err(Error::Io(kind.into())),
+            (None, Some(real)) => real.peek(),
+            (None, None) => panic!("FakeProcess: a peek was made past the scripted answers"),
         }
     }
 
     fn try_reap(&self) -> Result<TryReapOutcome<'_>, Error> {
         self.begin_look();
-        match self
-            .script()
-            .reaps
-            .pop_front()
-            .expect("FakeProcess: a reap was made past the scripted answers")
-        {
-            ReapAnswer::Reaped(record) => Ok(TryReapOutcome::Reaped(record)),
-            ReapAnswer::Running => {
+        let scripted = self.script().reaps.pop_front();
+        match (scripted, &self.0.real) {
+            (Some(ReapAnswer::Reaped(record)), _) => Ok(TryReapOutcome::Reaped(record)),
+            (Some(ReapAnswer::Running), _) => {
                 // Each reap that runs is a new wait: one holder's wake is not the next one's.
                 self.0.source.reset();
                 Ok(TryReapOutcome::Running(self.0.source.wait_for()))
             }
-            ReapAnswer::Recheck => Ok(TryReapOutcome::Recheck),
-            ReapAnswer::Foreign(foreign) => Ok(TryReapOutcome::Foreign(foreign)),
-            ReapAnswer::Err(kind) => Err(Error::Io(kind.into())),
+            (Some(ReapAnswer::Recheck), _) => Ok(TryReapOutcome::Recheck),
+            (Some(ReapAnswer::Foreign(foreign)), _) => Ok(TryReapOutcome::Foreign(foreign)),
+            (Some(ReapAnswer::Err(kind)), _) => Err(Error::Io(kind.into())),
+            (None, Some(real)) => real.try_reap(),
+            (None, None) => panic!("FakeProcess: a reap was made past the scripted answers"),
         }
     }
 }

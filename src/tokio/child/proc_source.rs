@@ -1,7 +1,6 @@
 //! The process backend behind an async [`Child`](super::Child): tokio's own `process::Child`, or
 //! (Windows) a raw `CreateProcessW` child that tokio's `Command` cannot express. `Child` forwards
-//! its wait/kill/stream operations here so it stays backend-blind, mirroring the sync
-//! [`ProcHandle`](crate::child::proc_handle::ProcHandle).
+//! its wait/kill/stream operations here so it stays backend-blind.
 
 use std::process::ExitStatus;
 

@@ -14,8 +14,8 @@ pub(crate) mod macos;
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 compile_error!("cosca::wait is implemented only for Linux, macOS, and Windows");
 
-/// Force the NEXT grace-watch on THIS thread to fail (consumed by the two drivers,
-/// [`crate::os_process::drive::exited_by_id`] and `tokio::drive::exited_by_id`, and by `Child::wait_timeout`),
+/// Force the NEXT grace-watch on THIS thread to fail (consumed by the entry of each driver,
+/// [`crate::os_process::drive`] and `tokio::drive`, and by `Child::wait_timeout`),
 /// so the watch-error escalation ordering is testable. Same take-semantics contract as the treewalk fault seam.
 #[cfg(test)]
 pub(crate) mod fault {

@@ -1,6 +1,18 @@
 //! The root of a tree that a teardown reaches through the root's pid: a process group, and a macOS
 //! fd marker's group.
 
+/// Whether the root's pid still names its group, read now: the check of a [`GroupRoot`].
+pub(crate) trait RootCheck {
+    /// `Ok` while the root's pid still names its group, else why not.
+    fn check(&self) -> Result<(), String>;
+}
+
+impl<F: Fn() -> Result<(), String>> RootCheck for F {
+    fn check(&self) -> Result<(), String> {
+        self()
+    }
+}
+
 /// The root of a tree whose group is named by the root's pid, as each send to that group needs it.
 /// Built from the root's own handle for one call and never stored, so no checked pid outlives the
 /// send it was checked for.
@@ -12,7 +24,7 @@ pub(crate) struct GroupRoot<'a> {
     pidfd: Option<std::os::fd::BorrowedFd<'a>>,
     /// Whether the root's pid still names its group, read now. `None`: no root was given, for a
     /// caller whose mechanism names no group.
-    check: Option<&'a dyn Fn() -> Result<(), String>>,
+    check: Option<&'a dyn RootCheck>,
 }
 
 impl<'a> GroupRoot<'a> {
@@ -20,10 +32,7 @@ impl<'a> GroupRoot<'a> {
     /// `check`: `Ok` while the root's pid still names its group, else why not.
     #[cfg(unix)]
     #[cfg_attr(not(target_os = "linux"), allow(unused_variables, reason = "only Linux has a pidfd"))]
-    pub(crate) fn new(
-        pidfd: Option<std::os::fd::BorrowedFd<'a>>,
-        check: &'a dyn Fn() -> Result<(), String>,
-    ) -> GroupRoot<'a> {
+    pub(crate) fn new(pidfd: Option<std::os::fd::BorrowedFd<'a>>, check: &'a dyn RootCheck) -> GroupRoot<'a> {
         GroupRoot {
             #[cfg(target_os = "linux")]
             pidfd,
@@ -33,7 +42,6 @@ impl<'a> GroupRoot<'a> {
 
     /// No root, for a caller whose mechanism names no group (a cgroup, a Job Object, a tree walk).
     /// A send by number with it is refused.
-    #[cfg(any(not(unix), all(test, target_os = "linux")))]
     pub(crate) fn none() -> GroupRoot<'static> {
         GroupRoot {
             #[cfg(target_os = "linux")]
@@ -87,7 +95,7 @@ impl<'a> GroupRoot<'a> {
             None => {}
         }
         match self.check {
-            Some(check) => check().map_err(NotItsGroup::Unproven),
+            Some(check) => check.check().map_err(NotItsGroup::Unproven),
             None => {
                 debug_assert!(false, "a send by the root's number was given no root to check");
                 Err(NotItsGroup::Unproven("no root was given to check".to_owned()))

@@ -9,7 +9,7 @@ use crate::error::Error;
 
 /// The `crate::wait::fault` grace-watch seam, consumed HERE rather than inside a specific
 /// backend so it applies uniformly to whichever watch `graceful_shutdown_tree` actually
-/// performs — root-only ([`crate::os_process::drive::exited_by_id`]) or whole-tree
+/// performs — root-only ([`OwnedChild::exited_by`](super::owned::OwnedChild::exited_by)) or whole-tree
 /// ([`crate::containment::Attached::wait_drained`]). Outside test builds the seam module does
 /// not exist at all, so this compiles to a constant `None`.
 #[cfg(test)]
@@ -49,8 +49,7 @@ impl Child {
     /// that case out: absence from its console list is equally the answer for a healthy child.
     /// Each such call also leaves a dead entry in the caller's console process list.
     ///
-    /// **Every error means nothing was sent and nothing was killed.** On Linux that includes a
-    /// refused `pidfd_open`, which is `Unsupported` (see [`Error::Unsupported`](crate::error::Error::Unsupported)).
+    /// **Every error means nothing was sent and nothing was killed.**
     ///
     /// **A macOS graphically-elevated child** ([`ElevatedVia::MacosOsascript`](crate::elevation::ElevatedVia::MacosOsascript))
     /// is refused while osascript runs, as its kill is (see [`kill`](Child::kill)): a `SIGTERM`
@@ -76,7 +75,7 @@ impl Child {
             }
             self.refuse_unpinned("terminate", None)?;
         }
-        crate::graceful::signal(self.graceful, self.id)
+        crate::graceful::signal(self.graceful, self.id, |sig| self.proc.signal(sig).map(drop))
     }
 
     /// Cooperative-then-forced lone shutdown: [`terminate`](Child::terminate), wait up to
@@ -152,27 +151,25 @@ impl Child {
         match self.kill_gate() {
             crate::elevation::front::Gate::Closed(unkillable) => return Err(unkillable),
             // An exit is permanent, so a refused signal to an exited front changes nothing.
-            crate::elevation::front::Gate::Exited => match self.proc.kill() {
+            crate::elevation::front::Gate::Exited => match self.kill_root() {
                 Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
                     log::debug!("the kill of exited front pid {} was refused ({e})", self.id.pid());
                 }
-                other => other.map_err(Error::Io)?,
+                other => other.map(drop).map_err(Error::Io)?,
             },
-            crate::elevation::front::Gate::Open => self.proc.kill().map_err(Error::Io)?,
+            crate::elevation::front::Gate::Open => self.kill_root().map(drop).map_err(Error::Io)?,
             // A live front in its cgroup: killed through it, and nothing signalled after it.
             crate::elevation::front::Gate::CgroupOnly => {
-                let check = || self.group_number_holds();
+                // A cgroup kill names no group by the root's pid, so no root is given.
+                debug_assert!(self.attached.is_cgroup(), "CgroupOnly is a front in a cgroup");
                 self.attached
-                    .hard_kill_marking(
-                        &self.tree_killed,
-                        &crate::containment::GroupRoot::new(self.proc.pidfd(), &check),
-                    )
+                    .hard_kill_marking(&self.tree_killed, &crate::containment::GroupRoot::none())
                     .map_err(|e| crate::elevation::front::cgroup_kill_failed(self.front, self.id.pid(), e))?;
                 self.cgroup_kill_reached()?;
             }
         }
         #[cfg(not(unix))]
-        self.proc.kill().map_err(Error::Io)?;
+        self.kill_root().map(drop).map_err(Error::Io)?;
         #[cfg(test)]
         fault::run_hook(fault::HookPoint::BeforeReap);
         let status = self.wait()?;
@@ -254,9 +251,6 @@ impl Child {
     /// immediately: no signal is confirmed sent, so there is nothing for a grace wait or
     /// sweep to act on yet.
     ///
-    /// A refused Linux `pidfd_open` while watching the root is `Unsupported` (see [`Error::Unsupported`](crate::error::Error::Unsupported)); it is a
-    /// watch failure, so the sweep still runs.
-    ///
     /// **A root reaped by something else** (see [`kill_tree`](Child::kill_tree)):
     ///
     /// - On Linux 6.9+ a process group that still has a member gets the `SIGTERM` through the
@@ -302,11 +296,9 @@ impl Child {
         // This handle's reaps are held off from the look until the `SIGTERM` is sent; the paths that
         // send nothing by the root's number wait the grace without it.
         #[cfg(unix)]
-        let held = self.proc.hold_reaps();
+        let held = self.proc.hold(self.id.pid());
         #[cfg(unix)]
-        let check = || super::tree_call::group_number_holds(self.id.pid(), held.state());
-        #[cfg(unix)]
-        let group = crate::containment::GroupRoot::new(self.proc.pidfd(), &check);
+        let group = held.group();
         #[cfg(not(unix))]
         let group = crate::containment::GroupRoot::none();
         #[cfg(unix)]
@@ -399,14 +391,14 @@ impl Child {
                 Ok(verdict) if verdict.permits_skipping_sweep() => (true, true, None),
                 // Not sufficient proof alone to skip the sweep (see the doc above) — fall back
                 // to the fresh, non-blocking, zero-duration root probe described there.
-                Ok(_) => match crate::os_process::drive::exited_by_id(self.id, Some(Duration::ZERO)) {
+                Ok(_) => match self.proc.exited_by(crate::wait::deadline_from(Duration::ZERO)) {
                     Ok(exited) => (false, exited, None),
                     Err(e) => (false, false, Some(e)),
                 },
                 Err(e) => (false, false, Some(e)),
             }
         } else {
-            match crate::os_process::drive::exited_by_id(self.id, Some(grace)) {
+            match self.proc.exited_by(crate::wait::deadline_from(grace)) {
                 // NON-reaping grace-wait on the root only.
                 Ok(exited) => (false, exited, None),
                 Err(e) => (false, false, Some(e)),
@@ -482,22 +474,23 @@ impl Child {
     #[cfg(target_os = "linux")]
     fn shut_down_root_through_pidfd(&self, call: &crate::child::TreeCall<'_>, grace: Duration, why: &str) -> Error {
         let shutdown = match crate::child::PidfdShutdown::start(self.terminate_gate(), || {
-            self.proc.signal_sent(crate::signal::Sig::Term).map_err(Error::Io)
+            self.proc.signal(crate::signal::Sig::Term)
         }) {
             Ok(shutdown) => shutdown,
             Err(unkillable) => return unkillable,
         };
         #[cfg(test)]
         fault::run_hook(fault::HookPoint::AfterTerminate);
-        let exited = shutdown.needs_grace().then(|| self.proc.exited_within(grace));
+        let exited = shutdown
+            .needs_grace()
+            .then(|| self.proc.exited_by(crate::wait::deadline_from(grace)));
         shutdown.finish(
             call,
             why,
             exited,
             || self.kill_gate(),
             || {
-                self.proc
-                    .kill_sent()
+                self.kill_root()
                     .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper()))
             },
         )

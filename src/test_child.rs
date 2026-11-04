@@ -11,6 +11,9 @@ pub(crate) mod pid_reuse;
 #[cfg(windows)]
 pub(crate) mod ctrl_break;
 
+#[cfg(windows)]
+pub(crate) mod unwaitable;
+
 #[cfg(unix)]
 pub(crate) mod blocked_tree_root;
 
@@ -22,6 +25,8 @@ pub(crate) mod reaped_elsewhere;
 
 #[cfg(any(target_os = "linux", all(target_os = "macos", feature = "tokio")))]
 pub(crate) mod member;
+
+pub(crate) mod over_fake;
 
 #[cfg(target_os = "macos")]
 use crate::test_own_process;
