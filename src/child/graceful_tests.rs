@@ -204,10 +204,9 @@ fn child_graceful_shutdown_tree_graceful_root_sigterm() {
     );
 }
 
-// `terminate` signals the child through the handle it already holds, not by opening the child
-// afresh from its number: with the next `pidfd_open` made to fail, the `SIGTERM` is still
-// delivered and the failure is still waiting for the next open. Its stdin is released after
-// `terminate` returns, so a `terminate` that sent nothing yields exit 0.
+// `terminate` signals through the held handle, not a fresh `pidfd_open`: with the next open set to
+// fail, SIGTERM still lands. Stdin is released only afterwards, so a terminate that sent nothing
+// exits 0.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn terminate_does_not_open_the_child_afresh() {
@@ -228,10 +227,8 @@ fn terminate_does_not_open_the_child_afresh() {
     assert_eq!(status.signal(), Some(libc::SIGTERM), "{status:?}");
 }
 
-// The root-only grace wait of `graceful_shutdown_tree` (a mechanism with no drain edge) looks at
-// the child through the handle it holds, not by opening it afresh: with the next `pidfd_open` made
-// to fail, it still sees the exit within the grace, so the call returns the status the `SIGTERM`
-// gave and no watch error surfaces.
+// The root-only grace wait looks through the held handle too: with the next `pidfd_open` failing,
+// it still sees the SIGTERM exit and surfaces no watch error.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn graceful_shutdown_grace_wait_does_not_open_the_child_afresh() {

@@ -348,8 +348,7 @@ fn assert_reaped_elsewhere(result: Result<impl std::fmt::Debug, crate::error::Er
     }
 }
 
-/// `wait`, `wait_deadline` and `wait_timeout` have nobody else to say that a zombie launchd holds
-/// is not ours to reap: each warns, once.
+/// `wait`, `wait_deadline` and `wait_timeout` each warn once of a zombie launchd holds.
 ///
 /// Mutant: `Child` writes the warn for some of them only, or for none.
 #[skuld::test]

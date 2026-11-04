@@ -49,8 +49,7 @@ impl Child {
     /// that case out: absence from its console list is equally the answer for a healthy child.
     /// Each such call also leaves a dead entry in the caller's console process list.
     ///
-    /// **Every error means nothing was sent and nothing was killed.** The signal goes through the
-    /// child's own handle, so it needs no `pidfd_open`.
+    /// **Every error means nothing was sent and nothing was killed.**
     ///
     /// **A macOS graphically-elevated child** ([`ElevatedVia::MacosOsascript`](crate::elevation::ElevatedVia::MacosOsascript))
     /// is refused while osascript runs, as its kill is (see [`kill`](Child::kill)): a `SIGTERM`

@@ -20,8 +20,7 @@ pub(super) enum Orphaned {
 }
 
 /// A wait's `outcome` on the child `pid` as the status `Child` answers: `Some` for an exit
-/// (`Unreadable` is `InvalidData`), `None` for a deadline that passed, and the `ECHILD` error for a
-/// child someone else reaped, with the launchd-orphan warning unless `orphaned` is `Quiet`.
+/// (`Unreadable` is `InvalidData`), `None` for a deadline that passed.
 pub(super) fn status_of_outcome(
     pid: u32,
     outcome: ChildWaitOutcome,
