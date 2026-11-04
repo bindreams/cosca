@@ -5,6 +5,7 @@
 
 use std::io;
 use std::os::fd::OwnedFd;
+use std::sync::Mutex;
 
 use rustix::io::Errno;
 use rustix::process::Pid;
@@ -19,6 +20,15 @@ pub(crate) struct FakeKernel<'a> {
     /// `Err` is a raw errno.
     reads: Vec<(String, Result<Vec<u8>, i32>)>,
     signal_probes: Vec<(Pid, Result<(), Errno>)>,
+    pidfd_opens: Vec<(Pid, PidfdRow)>,
+}
+
+/// What a `pidfd_open` row answers.
+enum PidfdRow {
+    /// Every call.
+    Errno(Errno),
+    /// The first call hands the fd out; a second panics.
+    Fd(Mutex<Option<OwnedFd>>),
 }
 
 impl<'a> FakeKernel<'a> {
@@ -29,6 +39,7 @@ impl<'a> FakeKernel<'a> {
             open_proc: None,
             reads: Vec::new(),
             signal_probes: Vec::new(),
+            pidfd_opens: Vec::new(),
         }
     }
 
@@ -52,6 +63,18 @@ impl<'a> FakeKernel<'a> {
         self
     }
 
+    /// `pidfd_open` of `pid` answers `answer`. An errno answers every call. An fd the test opened
+    /// itself is handed out once, because an `OwnedFd` has no copy with the same number.
+    pub(crate) fn on_pidfd_open(mut self, pid: u32, answer: Result<OwnedFd, Errno>) -> Self {
+        let target = Pid::from_raw(pid as i32).expect("a pidfd_open row names a positive pid");
+        let row = match answer {
+            Ok(fd) => PidfdRow::Fd(Mutex::new(Some(fd))),
+            Err(errno) => PidfdRow::Errno(errno),
+        };
+        self.pidfd_opens.push((target, row));
+        self
+    }
+
     /// Opening `/proc` fails as its `openat2` answering `errno`.
     pub(crate) fn open_proc_fails(mut self, errno: Errno) -> Self {
         self.open_proc = Some(errno);
@@ -65,7 +88,15 @@ impl<'a> FakeKernel<'a> {
 
 impl Kernel for FakeKernel<'_> {
     fn pidfd_open(&self, target: Pid) -> Result<OwnedFd, Errno> {
-        self.real(&format!("pidfd_open of {target:?}")).pidfd_open(target)
+        match self.pidfd_opens.iter().rev().find(|(p, _)| *p == target) {
+            Some((_, PidfdRow::Errno(errno))) => Err(*errno),
+            Some((_, PidfdRow::Fd(slot))) => Ok(slot
+                .lock()
+                .expect("no panic holds the row")
+                .take()
+                .unwrap_or_else(|| panic!("FakeKernel hands the pidfd of {target:?} out once"))),
+            None => self.real(&format!("pidfd_open of {target:?}")).pidfd_open(target),
+        }
     }
 
     fn open_proc(&self) -> Result<ProcDir, ViewUnreadable> {

@@ -241,10 +241,9 @@ fn pidfd_open_checked(kernel: &dyn Kernel, raw: Pid) -> Result<rustix::fd::Owned
 }
 
 /// Test seam: a forced [`Existence`] (see [`fault::force_exists_once`]) replaces the `/proc` read
-/// once, to drive the `Unknown` arms; runs [`fault::between_check_and_read`]'s hook first.
+/// once, to drive the `Unknown` arms.
 #[cfg(test)]
 fn exists_checked(kernel: &dyn Kernel, id: ProcessId, proc_dir: &ProcDir) -> Existence {
-    fault::run_between_hook();
     match fault::take_forced_exists() {
         Some(existence) => existence,
         None => id.exists_in(kernel, proc_dir),
@@ -277,31 +276,6 @@ pub(crate) mod fault {
             const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
         static FORCE_EXISTS: Cell<Option<Existence>> = const { Cell::new(None) };
         static FORCE_ALIVE: Cell<Option<Liveness>> = const { Cell::new(None) };
-        static BETWEEN_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
-    }
-
-    /// Clears the between-check-and-read hook on drop, consumed or not.
-    #[must_use = "dropping this immediately disarms the hook; bind it for the probe's duration"]
-    pub(crate) struct BetweenHook(());
-
-    /// Run `hook` once on THIS thread, after `open_verified` has checked that `/proc` describes
-    /// the target and before it reads `{pid}/stat`: the window in which a `/proc` looked up by
-    /// path could differ from the one that was checked.
-    pub(crate) fn between_check_and_read(hook: impl FnOnce() + 'static) -> BetweenHook {
-        BETWEEN_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
-        BetweenHook(())
-    }
-
-    impl Drop for BetweenHook {
-        fn drop(&mut self) {
-            BETWEEN_HOOK.with(|h| h.borrow_mut().take());
-        }
-    }
-
-    pub(super) fn run_between_hook() {
-        if let Some(hook) = BETWEEN_HOOK.with(|h| h.borrow_mut().take()) {
-            hook();
-        }
     }
 
     /// Disarms the forced errno on drop, so an unconsumed force can't leak into the next test on
