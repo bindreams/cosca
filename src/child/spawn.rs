@@ -1213,7 +1213,10 @@ fn await_exit_warning(
 /// The one `warn` of a spawn teardown whose wait for the child it killed has passed `after`; the
 /// wait goes on.
 pub(crate) fn warn_still_waiting(pid: Option<u32>, after: std::time::Duration) {
-    let who = super::lifecycle::child_named(pid);
+    let who = pid.map_or_else(
+        || "the spawned child (pid unknown)".to_owned(),
+        |pid| format!("child {pid}"),
+    );
     #[cfg(unix)]
     log::warn!(
         "{who} is not reapable {after:?} after its kill (it is still running, or a tracer holds its exit); still waiting for it to exit"

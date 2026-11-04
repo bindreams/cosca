@@ -106,7 +106,7 @@ impl OwnedChild {
             Ok(sent) => {
                 #[cfg(test)]
                 crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterDropKill);
-                match self.wait_after_kill(matches!(sent, Sent::Delivered), due) {
+                match self.wait_after_kill(Killed::Child, matches!(sent, Sent::Delivered), due) {
                     Ok(_status) => {
                         #[cfg(test)]
                         if let Some(pid) = self.pid() {
@@ -127,16 +127,22 @@ impl OwnedChild {
     pub(crate) fn reap_after_tree_kill(&self) -> TeardownOutcome {
         #[cfg(test)]
         crate::child::spawn::fault::run_between_kill_and_wait();
-        match self.wait_after_kill(true, None) {
+        match self.wait_after_kill(Killed::Child, true, None) {
             Ok(_) => TeardownOutcome::new(ChildFate::Reaped),
             Err(outcome) => outcome,
         }
     }
 
-    /// The blocking wait that follows a kill, `delivered` or not. `Ok` is the status it reaped; the
-    /// `Err` is the outcome of a teardown that reaped nothing. With `due`, it first watches for the
-    /// exit until the threshold, and warns once if the child has not exited by then.
-    fn wait_after_kill(&self, delivered: bool, due: Option<Due>) -> Result<ExitStatus, TeardownOutcome> {
+    /// The blocking wait that follows a kill, `delivered` or not; `killed` words its messages. `Ok`
+    /// is the status it reaped; the `Err` is the outcome of a teardown that reaped nothing. With
+    /// `due`, it first watches for the exit until the threshold, and warns once if the child has not
+    /// exited by then.
+    fn wait_after_kill(
+        &self,
+        killed: Killed,
+        delivered: bool,
+        due: Option<Due>,
+    ) -> Result<ExitStatus, TeardownOutcome> {
         let pid = self.pid();
         // What a failed wait shows of the child: only a delivered kill says it is dead or dying.
         let failed = |fate_left: Option<String>| TeardownOutcome {
@@ -156,14 +162,11 @@ impl OwnedChild {
             |after| crate::child::spawn::warn_still_waiting(pid, after),
             |child| child.wait(None),
         )
-        .map_err(|e| failed(Some(wait_failure(pid, &e))))?;
+        .map_err(|e| failed(Some(killed.reap_failed(pid, &e))))?;
         let status = status_of_outcome(pid, outcome, Orphaned::Quiet);
         match (outcome, status) {
             (ChildWaitOutcome::Foreign(foreign), _) => {
-                log::debug!(
-                    "teardown of {}: it was reaped elsewhere before the reap after the kill",
-                    child_named(pid)
-                );
+                log::debug!("{}", killed.reaped_elsewhere(pid));
                 Err(TeardownOutcome {
                     fate: foreign.fate(delivered),
                     front: None,
@@ -175,7 +178,7 @@ impl OwnedChild {
                 debug_assert!(false, "an unbounded wait ended at a deadline");
                 Err(failed(None))
             }
-            (_, Err(e)) => Err(failed(Some(wait_failure(pid, &e)))),
+            (_, Err(e)) => Err(failed(Some(killed.reap_failed(pid, &e)))),
         }
     }
 
@@ -217,13 +220,13 @@ impl OwnedChild {
         let pid = self.pid();
         let front = front_named(pid);
         let reaped = |status: ExitStatus| {
-            log::debug!("{front} was reaped ({status})");
+            log::debug!("Child::drop: {front} was killed through its cgroup and reaped ({status})");
             TeardownOutcome::of_front(ChildFate::Reaped, FrontFate::Reaped)
         };
         // A front reaped elsewhere is read from the typed outcome, so it is `Gone` on every OS.
         let looked = match self.wait(Some(crate::wait::now())) {
             Ok(ChildWaitOutcome::Foreign(foreign)) => {
-                log::debug!("{front} was reaped by someone else");
+                log::debug!("Child::drop: {front} was reaped by someone else");
                 return TeardownOutcome {
                     fate: foreign.fate(false),
                     front: Some(FrontFate::Unaccounted),
@@ -267,7 +270,7 @@ impl OwnedChild {
                     Ok(true) => {
                         #[cfg(test)]
                         crate::child::spawn::fault::run_between_kill_and_wait();
-                        match self.wait_after_kill(true, due) {
+                        match self.wait_after_kill(Killed::Front, true, due) {
                             Ok(status) => reaped(status),
                             Err(outcome) => TeardownOutcome {
                                 front: Some(FrontFate::Unaccounted),
@@ -289,7 +292,35 @@ fn front_named(pid: Option<u32>) -> String {
     )
 }
 
-/// A failed reap after a kill, for the caller's warn: it leaves a zombie or an unread exit.
-fn wait_failure(pid: Option<u32>, e: &Error) -> String {
-    format!("teardown of {}: the reap after the kill failed: {e}", child_named(pid))
+/// What a blocking wait after a kill waits for, which words the wait's messages.
+#[derive(Clone, Copy)]
+enum Killed {
+    /// The root, killed by the teardown or by a tree kill.
+    Child,
+    /// An elevation front its cgroup's kill ended.
+    Front,
+}
+
+impl Killed {
+    /// A failed reap after a kill, for the caller's warn: it leaves a zombie or an unread exit.
+    fn reap_failed(self, pid: Option<u32>, e: &Error) -> String {
+        match self {
+            Killed::Child => format!("teardown of {}: the reap after the kill failed: {e}", child_named(pid)),
+            Killed::Front => format!(
+                "{} was killed through its cgroup, and could not be reaped ({e})",
+                front_named(pid)
+            ),
+        }
+    }
+
+    /// The `debug` line of a wait that met a reap by someone else.
+    fn reaped_elsewhere(self, pid: Option<u32>) -> String {
+        match self {
+            Killed::Child => format!(
+                "teardown of {}: it was reaped elsewhere before the reap after the kill",
+                child_named(pid)
+            ),
+            Killed::Front => format!("Child::drop: {} was reaped by someone else", front_named(pid)),
+        }
+    }
 }

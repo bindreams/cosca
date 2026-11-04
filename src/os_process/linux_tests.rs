@@ -271,3 +271,31 @@ fn a_pidless_linux_child_is_signalled_and_reaped_through_its_pidfd() {
     assert_eq!(torn.fate, ChildFate::Reaped, "{torn:?}");
     assert_eq!(torn.left, None);
 }
+
+/// A send through the pidfd of a pid-less child that finds it reaped says "already gone" without a
+/// number.
+///
+/// Mutant: the unknown pid is worded as `child 0`.
+#[skuld::test]
+fn a_signal_to_a_reaped_pidless_linux_child_is_named_without_a_number() {
+    use crate::os_process::linux::LinuxProcess;
+    use crate::os_process::OsProcess as _;
+
+    crate::log_capture::install();
+    let mut cmd = crate::test_child::held_std_killable_blocker();
+    let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn the blocker");
+    let id = ProcessId::of(child.id())
+        .found()
+        .expect("the live child has an identity");
+    let pidfd = crate::wait::exit_only::open_own_child(id.pid(), Some(id))
+        .expect("pidfd_open")
+        .expect("the child is not reaped");
+    let os = LinuxProcess::new(None, pidfd);
+    assert_eq!(os.signal(Sig::Kill).expect("kill"), Sent::Delivered);
+    child.wait().expect("reap the killed child");
+    let mark = crate::log_capture::mark();
+    assert_eq!(os.signal(Sig::Kill).expect("a reaped child is gone"), Sent::Gone);
+    let said = crate::log_capture::records_since_on_current_thread(mark, "already gone");
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert!(said[0].1.contains("to the child (pid unknown): "), "{said:?}");
+}

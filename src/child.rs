@@ -26,7 +26,7 @@ pub(crate) mod owned;
 use owned::OwnedChild;
 
 #[path = "child/lifecycle.rs"]
-mod lifecycle;
+pub(crate) mod lifecycle;
 
 #[path = "child/suspended.rs"]
 pub(crate) mod suspended;

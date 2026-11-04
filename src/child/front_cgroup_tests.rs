@@ -520,10 +520,14 @@ fn assert_drop_kills_the_leaf_and_reaps_the_front(fault: impl FnOnce() -> Box<dy
     let steps = crate::containment::cgroup::fault::take_leaf_steps();
     release.assert_killed();
     assert!(awaited.load(Ordering::SeqCst), "the look came after the leaf's kill");
-    let said = crate::log_capture::records_since_on_current_thread(mark, &format!("elevation front pid {pid}"));
+    let said =
+        crate::log_capture::records_since_on_current_thread(mark, &format!("Child::drop: elevation front pid {pid}"));
     assert_eq!(said.len(), 1, "{said:?}");
     assert_eq!(said[0].0, log::Level::Debug, "{said:?}");
-    assert!(said[0].1.contains("was reaped (signal: 9"), "{said:?}");
+    assert!(
+        said[0].1.contains("killed through its cgroup and reaped (signal: 9"),
+        "{said:?}"
+    );
     assert!(reaped(&front), "the drop reaps the front its leaf's kill ended");
     assert!(steps.iter().any(|s| s == "kill"), "{steps:?}");
     wait_until_exited(&member);
@@ -592,10 +596,14 @@ fn cgroup_a_drop_places_a_front_that_reads_as_running_and_reaps_it(#[fixture(cgr
         drop(child);
     }
     release.assert_killed();
-    let said = crate::log_capture::records_since_on_current_thread(mark, &format!("elevation front pid {pid}"));
+    let said =
+        crate::log_capture::records_since_on_current_thread(mark, &format!("Child::drop: elevation front pid {pid}"));
     assert_eq!(said.len(), 1, "{said:?}");
     assert_eq!(said[0].0, log::Level::Debug, "{said:?}");
-    assert!(said[0].1.contains("was reaped (signal: 9"), "{said:?}");
+    assert!(
+        said[0].1.contains("killed through its cgroup and reaped (signal: 9"),
+        "{said:?}"
+    );
     assert!(reaped(&front), "the drop reaps the front");
     wait_until_exited(&member);
     let mut rest = Vec::new();
@@ -627,7 +635,8 @@ fn cgroup_a_drop_that_cannot_place_a_front_does_not_call_it_running(#[fixture(cg
         drop(child);
     }
     release.assert_killed();
-    let said = crate::log_capture::records_since_on_current_thread(mark, &format!("elevation front pid {pid}"));
+    let said =
+        crate::log_capture::records_since_on_current_thread(mark, &format!("Child::drop: elevation front pid {pid}"));
     assert_eq!(said.len(), 1, "{said:?}");
     assert_eq!(said[0].0, log::Level::Warn, "{said:?}");
     assert!(said[0].1.contains("cannot be read"), "{said:?}");

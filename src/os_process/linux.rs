@@ -26,8 +26,7 @@ impl LinuxProcess {
 
 impl OsProcess for LinuxProcess {
     fn signal(&self, sig: Sig) -> Result<Sent, Error> {
-        // The number only feeds a debug line and the test send log.
-        send_pidfd(self.pidfd.as_fd(), self.pid.unwrap_or(0), sig).map_err(|e| Error::Io(std::io::Error::from(e)))
+        send_pidfd(self.pidfd.as_fd(), self.pid, sig).map_err(|e| Error::Io(std::io::Error::from(e)))
     }
 
     fn exited(&self) -> Result<Exit<'_>, Error> {

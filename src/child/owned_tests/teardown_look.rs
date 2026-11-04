@@ -142,9 +142,9 @@ fn a_failed_wait_for_a_reached_front_is_unaccounted_for() {
     let torn = look(&fake, Some(&FakeReach::answering(Ok(true))));
     assert_outcome(&torn, ChildFate::Killed, FrontFate::Unaccounted);
     assert!(
-        torn.left
-            .as_deref()
-            .is_some_and(|left| left.contains("the reap after the kill failed")),
+        torn.left.as_deref().is_some_and(|left| left.contains(&format!(
+            "elevation front pid {PID} was killed through its cgroup, and could not be reaped"
+        ))),
         "{torn:?}"
     );
 }
@@ -152,7 +152,7 @@ fn a_failed_wait_for_a_reached_front_is_unaccounted_for() {
 /// A front reaped by someone else between the look and the wait is `Killed` (the cgroup kill landed
 /// first), unaccounted for, and only the debug log says so.
 ///
-/// Mutants: the foreign reap is warned of; it is `Gone`.
+/// Mutants: the foreign reap is warned of; it is `Gone`; the debug line is not worded as the front's.
 #[skuld::test]
 fn a_front_reaped_elsewhere_between_the_look_and_the_wait_is_killed_and_silent() {
     let fake = fake().reaps([ReapAnswer::Running, ReapAnswer::Foreign(Foreign::Gone)]);
@@ -164,6 +164,8 @@ fn a_front_reaped_elsewhere_between_the_look_and_the_wait_is_killed_and_silent()
         records.iter().all(|(level, _)| *level >= log::Level::Debug),
         "{records:?}"
     );
+    let said = format!("Child::drop: elevation front pid {PID} was reaped by someone else");
+    assert!(records.iter().any(|(_, text)| *text == said), "{records:?}");
 }
 
 /// A front whose place cannot be read is neither waited for nor called running: its fate is
@@ -208,9 +210,22 @@ fn a_front_launchd_holds_is_gone_with_the_launchd_note() {
     let torn = look(&fake, None);
     assert_outcome(&torn, ChildFate::Gone, FrontFate::Unaccounted);
     assert!(
-        torn.left.as_deref().is_some_and(|left| left.contains("launchd")),
+        torn.left
+            .as_deref()
+            .is_some_and(|left| left.starts_with(&format!("pid {PID}: not ours to reap (launchd holds its zombie"))),
         "{torn:?}"
     );
+}
+
+/// The launchd note of a front with no pid names it without a number.
+///
+/// Mutant: the note is built with a number.
+#[skuld::test]
+fn a_pidless_front_launchd_holds_is_named_without_a_number() {
+    let fake = FakeProcess::new([]).reaps([ReapAnswer::Foreign(Foreign::Orphaned)]);
+    let torn = look(&fake, None);
+    let left = torn.left.as_deref().expect("a front launchd holds is warned of");
+    assert!(left.starts_with("the child (pid unknown): not ours to reap"), "{left}");
 }
 
 /// A look that fails leaves the front unaccounted for with an unknown fate, and the warn names the
@@ -261,7 +276,7 @@ fn a_pidless_front_is_named_without_a_number() {
     let fake = FakeProcess::new([]).reaps([ReapAnswer::Running]);
     let torn = look(&fake, None);
     let left = torn.left.as_deref().expect("a front left running is warned of");
-    assert!(left.contains("pid unknown"), "{left}");
+    assert!(left.contains("the elevation front (pid unknown)"), "{left}");
     assert!(!left.chars().any(|c| c.is_ascii_digit()), "{left}");
 }
 

@@ -46,12 +46,12 @@ pub(super) fn status_of_outcome(
 pub(super) fn orphaned_note(pid: Option<u32>) -> String {
     format!(
         "{}: not ours to reap (launchd holds its zombie, because its tracer died)",
-        child_named(pid)
+        pid.map_or_else(|| "the child (pid unknown)".to_owned(), |pid| format!("pid {pid}"))
     )
 }
 
 /// How a message names a child: `child 4242`, or what stands for a pid that is not known.
-pub(super) fn child_named(pid: Option<u32>) -> String {
+pub(crate) fn child_named(pid: Option<u32>) -> String {
     pid.map_or_else(|| "the child (pid unknown)".to_owned(), |pid| format!("child {pid}"))
 }
 
