@@ -50,9 +50,9 @@ fn exited_unreaped_blocker() -> (Box<dyn OsChild>, u32) {
     (os, id.pid())
 }
 
-// S2g: an identity read that says the pid is gone =====
+// An identity read that says the pid is gone =====
 
-/// S2g: an id-checked peek whose identity read says the pid is `Gone` answers `Foreign(Gone)`.
+/// An id-checked peek whose identity read says the pid is `Gone` answers `Foreign(Gone)`.
 ///
 /// Mutant: `Gone` treated as a match: the peek returns `Exit`.
 #[skuld::test]
@@ -66,7 +66,7 @@ fn an_identity_read_gone_takes_the_echild_path() {
     reap_by_pid(pid);
 }
 
-// S10r: the second reap =====
+// The second reap =====
 
 /// The second reap of an exited, unreaped child, whose unique id reads as `read`. The zombie is
 /// left for the caller.
@@ -78,7 +78,7 @@ fn second_reap_with_unique(read: UniqRead) -> (Box<dyn OsChild>, u32) {
     (os, pid)
 }
 
-/// S10r: a second reap whose start no longer matches is skipped: nothing is consumed.
+/// A second reap whose start no longer matches is skipped: nothing is consumed.
 ///
 /// Mutant: a second consume without the start check.
 #[skuld::test]
@@ -88,7 +88,7 @@ fn a_second_reap_with_an_id_mismatch_is_skipped() {
     reap_by_pid(pid);
 }
 
-/// S10r: a second reap whose start matches consumes the leftover zombie.
+/// A second reap whose start matches consumes the leftover zombie.
 ///
 /// Mutant: the start check inverted.
 #[skuld::test]
@@ -101,7 +101,7 @@ fn a_second_reap_with_a_matching_id_consumes_the_leftover() {
     assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
 }
 
-/// S10r: a second peek that meets `ECHILD` is skipped quietly, not logged as a foreign reap or a
+/// A second peek that meets `ECHILD` is skipped quietly, not logged as a foreign reap or a
 /// warning.
 ///
 /// Mutant: the `ECHILD` logged at `warn`.
@@ -122,7 +122,7 @@ fn a_second_reap_that_meets_echild_is_skipped() {
     reap_by_pid(pid);
 }
 
-/// S10r: a second reap with no start to check is skipped with a `warn`, and consumes nothing: a
+/// A second reap with no start to check is skipped with a `warn`, and consumes nothing: a
 /// consume by a bare pid could take a reusing process's record.
 ///
 /// Mutant: the consume runs when there is no start.
@@ -138,7 +138,7 @@ fn a_second_reap_without_an_id_is_skipped_with_a_warning() {
     reap_by_pid(pid);
 }
 
-/// S10r: a second consume that finds nothing is skipped quietly.
+/// A second consume that finds nothing is skipped quietly.
 ///
 /// Mutant: a `debug_assert!` on the by-pid consume.
 #[skuld::test]

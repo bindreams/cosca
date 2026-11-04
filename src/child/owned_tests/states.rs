@@ -30,9 +30,9 @@ fn is_the_scripted_failure(err: &Error) -> bool {
     matches!(err, Error::Io(e) if e.kind() == KIND)
 }
 
-// S1, S20: the lock =====
+// The lock =====
 
-/// S1, S20: a poisoned mutex neither aborts nor hangs. A holder panics just after its re-lock,
+/// A poisoned mutex neither aborts nor hangs. A holder panics just after its re-lock,
 /// with the lock held; then `try_wait`, `signal`, `Debug` and `wait` all return from other
 /// threads.
 ///
@@ -73,7 +73,7 @@ fn a_poisoned_lock_neither_aborts_nor_hangs() {
     });
 }
 
-/// S1 (`Debug`): formatting the handle inside a blocked waiter does not block, and shows
+/// `Debug`: formatting the handle inside a blocked waiter does not block, and shows
 /// `locked`. The `on_condvar_block` hook runs under the lock and formats the handle itself.
 ///
 /// Mutant: `Debug` through `OwnedChild::lock()`, which the test build's owner check turns into a
@@ -103,9 +103,9 @@ fn debug_inside_a_blocked_waiter_does_not_block() {
     assert_eq!(status(waiter.join().expect("waiter")), held);
 }
 
-// S2, S6: one holder =====
+// One holder =====
 
-/// S2, S6: a second `wait` blocks behind the holder, on the `Condvar`, and returns the same
+/// A second `wait` blocks behind the holder, on the `Condvar`, and returns the same
 /// status.
 ///
 /// Mutant: no `W` check, so the second waiter becomes a second holder; it looks past the holder's
@@ -123,9 +123,9 @@ fn a_second_wait_blocks_behind_the_holder() {
     assert_eq!(status(waiter.join().expect("waiter")), held);
 }
 
-// S4: one look =====
+// One look =====
 
-/// S4: a look that finds the exit record reaps it once and caches it: a second call reaps nothing.
+/// A look that finds the exit record reaps it once and caches it: a second call reaps nothing.
 ///
 /// Mutant: no `E` write, so the second call reaps again, past the scripted answers.
 #[skuld::test]
@@ -139,7 +139,7 @@ fn a_look_reaps_an_exited_child_once() {
     assert!(child.is_reaped());
 }
 
-/// S4: a reap error is returned as it is, and the state stays `N`.
+/// A reap error is returned as it is, and the state stays `N`.
 ///
 /// Mutant: an error taken for the foreign path, or the state left in `W`.
 #[skuld::test]
@@ -152,9 +152,9 @@ fn a_look_that_fails_returns_the_error_and_stays_n() {
     assert!(matches!(try_wait(&child), Ok(ChildWaitOutcome::Exited(_))));
 }
 
-// S5: signal =====
+// Signal =====
 
-/// S5: `signal` during a parked wait goes to the OS at once and never blocks on the `Condvar`;
+/// `signal` during a parked wait goes to the OS at once and never blocks on the `Condvar`;
 /// the holder then reaps.
 ///
 /// Mutant: `signal` blocks on the `Condvar` while `W`; the signalling thread's hook panics.
@@ -178,9 +178,9 @@ fn signal_during_a_parked_wait_signals_and_the_holder_reaps() {
     status(holder.release_and_join());
 }
 
-// S7: a deadline behind a holder =====
+// A deadline behind a holder =====
 
-/// S7: a deadline waiter behind a parked holder blocks on the `Condvar` for the time remaining,
+/// A deadline waiter behind a parked holder blocks on the `Condvar` for the time remaining,
 /// then returns `DeadlinePassed` once its deadline has passed, while the holder is still parked.
 /// The clock is frozen, so the armed timeout is exactly the time remaining.
 ///
@@ -283,7 +283,7 @@ fn a_spurious_wake_re_arms_a_deadline_waiter_with_less_time() {
     );
 }
 
-/// S7, S8: a waiter whose deadline has passed, behind a holder, returns the exit status from its
+/// A waiter whose deadline has passed, behind a holder, returns the exit status from its
 /// peek at once, without reaping and without waiting for the holder. `Child::try_wait` is this
 /// call with the deadline now.
 ///
@@ -308,7 +308,7 @@ fn a_waiter_that_sees_an_exit_at_its_deadline_returns_its_status_without_reaping
     assert_eq!(peeked, reaped, "the holder's reap carries the same status");
 }
 
-/// S8: a waiter whose deadline has passed, behind a holder, on a running child returns
+/// A waiter whose deadline has passed, behind a holder, on a running child returns
 /// `DeadlinePassed`.
 ///
 /// Mutant: the exit-record branch taken for "running".
@@ -333,12 +333,12 @@ fn a_waiter_at_its_deadline_behind_a_holder_on_a_running_child_gets_deadline_pas
     status(holder.release_and_join());
 }
 
-// S9: a non-holder's foreign verdict =====
+// A non-holder's foreign verdict =====
 
-/// S9: a non-holder whose peek is foreign returns it and writes nothing: the holder, then released,
+/// A non-holder whose peek is foreign returns it and writes nothing: the holder, then released,
 /// finds its own `W` on the re-read (a `debug_assert!`) and reaps.
 ///
-/// Mutant: S9 writes `N`, so the holder's re-read finds a foreign state and its assert fires.
+/// Mutant: a non-holder's foreign verdict writes `N`, so the holder's re-read finds a foreign state and its assert fires.
 #[skuld::test]
 fn a_non_holder_peek_that_is_foreign_returns_it_and_writes_nothing() {
     let fake = FakeProcess::new([])
@@ -348,14 +348,17 @@ fn a_non_holder_peek_that_is_foreign_returns_it_and_writes_nothing() {
     let holder = park_holder(&child, &fake, |c| c.wait(Some(far())));
     let got = try_wait(&child).expect("the scripted peek");
     assert_eq!(got, ChildWaitOutcome::Foreign(Foreign::Gone));
-    assert!(matches!(child.lock().state, State::W { .. }), "S9 writes nothing");
+    assert!(
+        matches!(child.lock().state, State::W { .. }),
+        "a non-holder's foreign verdict writes nothing"
+    );
     status(holder.release_and_join());
     assert!(matches!(child.lock().state, State::E(_)));
 }
 
-// S10: the holder's reap =====
+// The holder's reap =====
 
-/// S10: an exit seen is reaped once, under the lock, and cached: a second `wait` never looks.
+/// An exit seen is reaped once, under the lock, and cached: a second `wait` never looks.
 ///
 /// Mutant: no `E` write, so the second `wait` looks past the scripted answers.
 #[skuld::test]
@@ -367,7 +370,7 @@ fn an_exit_seen_is_reaped_once_under_the_lock() {
     assert_eq!(fake.looks(), 1);
 }
 
-/// S10, S12, S15: a holder's normal return leaves the next holder alone. A regression test, with
+/// A holder's normal return leaves the next holder alone. A regression test, with
 /// no RED claimed: `finish` consumes the guard, so the hazard it guards is unrepresentable.
 #[skuld::test]
 fn a_holders_normal_return_leaves_the_next_holder_alone() {
@@ -409,7 +412,7 @@ fn a_holders_normal_return_leaves_the_next_holder_alone() {
     status(second.join().expect("second holder"));
 }
 
-/// S10, S14: a reap error returns it, restores `N` and wakes the waiters: the blocked waiter
+/// A reap error returns it, restores `N` and wakes the waiters: the blocked waiter
 /// becomes the holder.
 ///
 /// Mutant: a `?` return that leaves `W`: the waiter never wakes.
@@ -426,9 +429,9 @@ fn a_reap_error_restores_n_and_wakes_the_waiters() {
     status(waiter.join().expect("waiter"));
 }
 
-// S12, S13, S15 =====
+// Hand-off and failure of the holder =====
 
-/// S12: a holder whose deadline passes hands off to a blocked `wait`, which becomes the holder and
+/// A holder whose deadline passes hands off to a blocked `wait`, which becomes the holder and
 /// returns the real status. The holder's clock is frozen, and its second look moves it past the
 /// deadline, so the final look follows with no block.
 ///
@@ -461,7 +464,7 @@ fn an_expired_holder_hands_off_to_a_blocked_wait() {
     status(waiter.join().expect("waiter"));
 }
 
-/// S13: a holder that is told the child is foreign takes that path and restores `N`.
+/// A holder that is told the child is foreign takes that path and restores `N`.
 ///
 /// Mutant: *foreign* taken for *deadline passed*.
 #[skuld::test]
@@ -475,7 +478,7 @@ fn a_holder_that_sees_a_foreign_reap_returns_it_and_restores_n() {
     assert!(matches!(child.lock().state, State::N));
 }
 
-/// S15: a holder that panics in its look restores `N` and wakes the waiters.
+/// A holder that panics in its look restores `N` and wakes the waiters.
 ///
 /// Mutant: no guard: the waiter never wakes.
 #[skuld::test]
@@ -498,7 +501,7 @@ fn a_holder_that_panics_in_its_look_restores_n_and_wakes_the_waiters() {
     status(waiter.join().expect("waiter"));
 }
 
-/// S15: a holder that panics after its re-lock, holding the lock, restores `N` without
+/// A holder that panics after its re-lock, holding the lock, restores `N` without
 /// deadlocking: the blocked waiter wakes, takes the poisoned lock, becomes the holder and returns
 /// the real status.
 ///
@@ -526,7 +529,7 @@ fn a_holder_that_panics_after_its_relock_restores_n_without_deadlocking() {
     status(waiter.join().expect("waiter"));
 }
 
-// S11: a recheck =====
+// A recheck =====
 
 /// A look that asks for a recheck (a zombie a tracer holds, or an exit XNU is still finishing)
 /// is repeated after a backoff of 1, 2, 4 ... ms, on the handle's `Condvar`, until it shows the
@@ -550,7 +553,7 @@ fn a_recheck_backs_off_until_the_zombie_shows() {
     assert_eq!(fake.looks(), pauses.len() + 1);
 }
 
-/// S11: a holder blocked on its wait holds no lock: `Debug` shows `W`, not `locked`, and `signal`
+/// A holder blocked on its wait holds no lock: `Debug` shows `W`, not `locked`, and `signal`
 /// returns.
 ///
 /// Mutant: the wait under the lock, so `Debug`'s `try_lock` fails and prints `locked`.
@@ -611,9 +614,9 @@ fn exited_by_looks_through_exited_and_reaps_nothing() {
     assert!(!child.is_reaped());
 }
 
-// S16, S17: after the reap =====
+// After the reap =====
 
-/// S16: a cached status never reaches the OS, for any deadline.
+/// A cached status never reaches the OS, for any deadline.
 ///
 /// Mutant: no `E` check: the look runs past the scripted answers.
 #[skuld::test]
@@ -627,7 +630,7 @@ fn a_cached_status_never_reaches_the_os() {
     assert_eq!(fake.looks(), 1);
 }
 
-/// S17: `signal` after the reap sends nothing.
+/// `signal` after the reap sends nothing.
 ///
 /// Mutant: a `signal` to the OS after `E`: the empty signal table panics.
 #[skuld::test]
@@ -699,7 +702,7 @@ fn an_unreadable_consuming_record_is_cached_and_acts_by_no_pid() {
 
 /// Taking over a child makes no call to it: nothing is reaped or looked at.
 ///
-/// Mutant: `OwnedChild::new` looks at the child, as shared_child's `new` reaps one that exited.
+/// Mutant: `OwnedChild::new` reaps or looks at an already-exited child on adoption.
 #[skuld::test]
 fn adopt_never_reaps() {
     let fake = FakeProcess::new([]);
@@ -711,7 +714,7 @@ fn adopt_never_reaps() {
 /// `adopt` never reaps: an already-exited child is still a zombie afterwards, so a later
 /// wait reaps it and returns its status.
 ///
-/// Mutant: shared_child's `SharedChild::new`, which reaps an exited child on adoption.
+/// Mutant: `OwnedChild::new` reaps or looks at an already-exited child on adoption.
 #[cfg(unix)]
 #[skuld::test]
 fn adopt_never_reaps_a_zombie() {

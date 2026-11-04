@@ -24,9 +24,9 @@ fn is_foreign(outcome: &Result<ChildWaitOutcome, crate::error::Error>) -> bool {
     matches!(outcome, Ok(ChildWaitOutcome::Foreign(_)))
 }
 
-// S11m: a reap that finds nothing after `Reapable` =====
+// A reap that finds nothing after `Reapable` =====
 
-/// S11m: a consuming reap that finds nothing right after the wait saw a zombie means the pid
+/// A consuming reap that finds nothing right after the wait saw a zombie means the pid
 /// names something else now. It takes the `ECHILD` path, with no assert in any build, and the
 /// state goes back to `N`.
 ///
@@ -44,9 +44,9 @@ fn a_reap_that_finds_none_after_reapable_takes_the_echild_path() {
     wait_status(&b.owned);
 }
 
-// S10r: the second peek =====
+// The second peek =====
 
-/// S10r: the second peek runs after every first reap, traced or not. For an untraced child it
+/// The second peek runs after every first reap, traced or not. For an untraced child it
 /// answers `ECHILD` and is skipped quietly.
 ///
 /// Mutant: a second peek gated on `p_oppid`: no `SecondPeek` step for an untraced child.
@@ -513,7 +513,7 @@ fn a_wait_on_a_zombie_launchd_holds_warns_it_is_not_ours_to_reap() {
     crate::child::spawn::identity_macos_tests::reap_by_pid(pid);
 }
 
-// S11m: the reap finds no exit record after the peek saw one =====
+// The reap finds no exit record after the peek saw one =====
 
 /// A reap whose own peek finds no exit record right after the look's peek saw one is still our
 /// child (a foreign reap is `Foreign`): the look is `Recheck`, and the holder looks again after a
