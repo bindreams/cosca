@@ -73,3 +73,8 @@ pub const ELEVATION: skuld::Label;
 /// `pidfd_send_signal` signals a whole process group through its leader's pidfd.
 #[skuld::label]
 pub const PIDFD_GROUP_SIGNAL: skuld::Label;
+
+/// Selects the `UNPRIVILEGED` group's tests: those that mean something only when the process holds no
+/// privilege (for one, `RLIMIT_NPROC` does not bind root).
+#[skuld::label]
+pub const UNPRIVILEGED: skuld::Label;

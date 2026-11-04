@@ -476,6 +476,18 @@ pub(crate) fn rearm_until<T, E>(
     }
 }
 
+/// Blocks until `fds` has an event, retrying `EINTR`.
+#[cfg(unix)]
+pub(crate) fn poll_ready(fds: &mut [rustix::event::PollFd<'_>]) -> Result<(), rustix::io::Errno> {
+    loop {
+        match rustix::event::poll(fds, None) {
+            Ok(_) => return Ok(()),
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// Run `wait` (one Win32 wait, armed with the `ms` it is given) until it returns something other
 /// than `WAIT_TIMEOUT`, or the real `deadline` has passed (`WAIT_TIMEOUT` then), via
 /// [`rearm_until`]; see [`win32_timeout_ms`] for why a `WAIT_TIMEOUT` is never trusted.
