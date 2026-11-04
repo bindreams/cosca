@@ -454,9 +454,8 @@ fn set_writer_nonblocking(writer: &std::io::PipeWriter) {
     }
 }
 
-/// Block until `writer` is writable, or report that the reader hung up. A real readiness wait on a
-/// genuine fd event (no time-based polling). `Ok(true)` = writable, `Ok(false)` = the reader closed /
-/// errored (`POLLHUP`/`POLLERR`).
+/// Block until `writer` is writable, or report that the reader hung up: `Ok(true)` = writable,
+/// `Ok(false)` = hung up or errored (`POLLHUP`/`POLLERR`).
 fn wait_writable(writer: &std::io::PipeWriter) -> Result<bool, std::io::Error> {
     use rustix::event::{PollFd, PollFlags};
 

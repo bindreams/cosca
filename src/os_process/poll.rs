@@ -21,9 +21,8 @@ pub(crate) fn is_readable(fd: BorrowedFd<'_>) -> std::io::Result<bool> {
 const MAX_POLL_BLOCK: Duration = Duration::from_millis(i32::MAX as u64);
 
 /// Polls `fd` until it is readable or `deadline` passes, and says which. `None` is unbounded: one
-/// [`poll_ready`](crate::wait::poll_ready), always `true`. A deadline is the bounded form, re-armed
-/// each round against the real clock. Reads no state and reaps nothing: a pidfd names its process
-/// for good, so a reused pid cannot answer it.
+/// [`poll_ready`](crate::wait::poll_ready), always `true`. Reads no state and reaps nothing: a pidfd
+/// names its process for good, so a reused pid cannot answer it.
 pub(crate) fn poll_readable(fd: BorrowedFd<'_>, deadline: Option<Instant>) -> std::io::Result<bool> {
     let Some(deadline) = deadline else {
         #[cfg(test)]

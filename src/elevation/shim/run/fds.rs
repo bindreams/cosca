@@ -11,8 +11,7 @@ use super::log::Log;
 use crate::wait;
 
 /// Which of `fds` are readable or hung up, in the same order; an absent descriptor is never ready.
-/// Every error but `EINTR` is the caller's, and means nothing is known about any
-/// descriptor.
+/// Every error is the caller's, and means nothing is known about any descriptor.
 fn poll_in<const N: usize>(fds: [Option<BorrowedFd<'_>>; N], block: bool) -> Result<[bool; N], Errno> {
     let mut at = [None; N];
     let mut polled = Vec::with_capacity(N);
