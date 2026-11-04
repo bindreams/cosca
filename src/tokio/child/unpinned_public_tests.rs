@@ -111,7 +111,7 @@ async fn kill_of_an_orphaned_root_sends_nothing() {
     assert_eq!(warns_since(mark), Vec::<String>::new());
 
     child.kill().expect("an unreaped root is killed");
-    assert_eq!(sends.entries(), vec![(pid, Sig::Kill, Via::Pid)]);
+    assert_eq!(sends.entries(), vec![(pid, Sig::Kill, Via::Identity)]);
     drop(writer);
 }
 
@@ -128,7 +128,7 @@ async fn kill_of_an_unknown_root_is_sent_through_its_handle() {
     child.kill().expect("an unknown root is killed through its handle");
 
     assert_peeks_exhausted();
-    assert_eq!(sends.entries(), vec![(pid, Sig::Kill, Via::Pid)]);
+    assert_eq!(sends.entries(), vec![(pid, Sig::Kill, Via::Identity)]);
     drop(writer);
 }
 
@@ -538,7 +538,7 @@ async fn kill_tree_keeps_its_backstop_for_an_unknown_root() {
     child.kill_tree().expect("the backstop kills through the handle");
 
     assert_peeks_exhausted();
-    assert_eq!(sends.entries(), vec![(pid, Sig::Kill, Via::Pid)]);
+    assert_eq!(sends.entries(), vec![(pid, Sig::Kill, Via::Identity)]);
     drop(writer);
 }
 
@@ -562,7 +562,7 @@ async fn kill_tree_reads_the_root_once_for_its_backstop() {
     child.kill_tree().expect("the backstop kills the root");
 
     assert_eq!(forced_peeks_left(), 1, "the backstop read the state twice");
-    assert_eq!(sends.entries(), vec![(pid, Sig::Kill, Via::Pid)]);
+    assert_eq!(sends.entries(), vec![(pid, Sig::Kill, Via::Identity)]);
     drop(writer);
 }
 

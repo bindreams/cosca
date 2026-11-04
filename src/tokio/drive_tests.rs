@@ -10,7 +10,7 @@ use crate::os_process::fake::{Answer, FakeProcess};
 use crate::wait::fault;
 
 fn fake(exits: impl IntoIterator<Item = Answer>) -> FakeProcess {
-    FakeProcess::new(ProcessId::current(), exits)
+    FakeProcess::new(exits)
 }
 
 /// Poll `fut` once, with a waker that wakes nothing.

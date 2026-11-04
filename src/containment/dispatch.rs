@@ -1347,7 +1347,7 @@ pub(crate) fn prepare(
     })
 }
 
-/// Phase 2 (after spawn, before `SharedChild::adopt`): attach the mechanism and bundle it with the
+/// Phase 2 (after spawn, before the `OwnedChild` adopts): attach the mechanism and bundle it with the
 /// spawn's other achieved facts. Consumes `prepared` so Linux cgroup leaf ownership transfers
 /// cleanly to `Attached::Cgroup` without requiring interior mutability — hence the
 /// cooperative-signal mechanism is read off it first.

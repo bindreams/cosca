@@ -18,8 +18,6 @@ fn pidfd<'a>(target: &Target<'a>) -> BorrowedFd<'a> {
 /// One `waitid(P_PIDFD, options)`: `Ok(None)` when nothing matched (`si_signo == 0`, rustix
 /// zeroes the `siginfo_t` first). `EINTR` retries.
 pub(crate) fn waitid_record(fd: BorrowedFd<'_>, options: WaitIdOptions) -> Result<Option<Record>, Errno> {
-    #[cfg(test)]
-    super::seams::waitid_called(options.bits());
     loop {
         match waitid(WaitId::PidFd(fd), options) {
             Ok(status) => {
@@ -62,13 +60,6 @@ pub(super) fn try_reap(target: &Target<'_>) -> io::Result<Reap> {
         PeekOutcome::Foreign(f) => return Ok(Reap::Foreign(f)),
     }
     let fd = pidfd(target);
-    #[cfg(test)]
-    if let Some(forced) = super::seams::take_forced_reap() {
-        return match forced {
-            super::seams::ForcedReap::None => Ok(Reap::Running),
-            super::seams::ForcedReap::Errno(e) => Err(io::Error::from_raw_os_error(e)),
-        };
-    }
     match waitid_record(fd, WaitIdOptions::EXITED | WaitIdOptions::NOHANG) {
         Ok(Some(record)) => Ok(Reap::Reaped(exit_record_of(super::consumed(record)))),
         // Peeked as an exit, then nothing to consume: a zombie only its tracer can reap.
@@ -78,6 +69,10 @@ pub(super) fn try_reap(target: &Target<'_>) -> io::Result<Reap> {
     }
 }
 
+#[cfg_attr(
+    not(feature = "tokio"),
+    allow(dead_code, reason = "the only consumers are the tokio backend's")
+)]
 pub(super) fn wait_visible_exit(target: &Target<'_>) -> io::Result<PeekOutcome> {
     #[cfg(test)]
     super::seams::step(super::seams::HolderStep::BlockingWaitid);
@@ -106,6 +101,10 @@ pub(super) fn wait_visible_exit(target: &Target<'_>) -> io::Result<PeekOutcome> 
 }
 
 /// A blocking `waitid` cannot legitimately find nothing: without `NOHANG` it waits.
+#[cfg_attr(
+    not(feature = "tokio"),
+    allow(dead_code, reason = "the only caller is `wait_visible_exit`")
+)]
 fn no_record() -> io::Result<PeekOutcome> {
     debug_assert!(false, "a blocking waitid(P_PIDFD, WEXITED) returned no record");
     Err(io::Error::other("a blocking waitid on the pidfd returned no record"))

@@ -5,6 +5,7 @@
 //! that names the pid and the process's `p_idversion`: the kernel checks the version and signals
 //! while it holds a reference, so a process that took a reused pid is never signalled.
 
+use std::io;
 use std::os::fd::{AsFd, BorrowedFd};
 use std::sync::atomic::{AtomicI32, Ordering};
 
@@ -16,6 +17,7 @@ use crate::identity::{uniq_info, Existence, ProcessId, ReadPurpose, UniqRead};
 use crate::signal::{Sent, Sig};
 use kqueue::{Kqueue, Subscription};
 
+pub(crate) mod child;
 pub(crate) mod kqueue;
 
 extern "C" {
@@ -92,22 +94,96 @@ fn audit_token(pid: u32, id_version: i32) -> audit_token_t {
     token
 }
 
-/// Signal `signo` to `pid` if its `p_idversion` is still `id_version`. `Err` is the errno.
-fn send_with_token(pid: u32, id_version: i32, signo: libc::c_int) -> Result<(), i32> {
-    let mut token = audit_token(pid, id_version);
-    // SAFETY: `token` is a fully initialised audit token that outlives the call.
-    match unsafe { proc_signal_with_audittoken(&mut token, signo) } {
-        0 => Ok(()),
-        errno => Err(errno),
+/// Signal `sig` to `pid` if its `p_idversion` is still `id_version`. `Err` is the errno.
+fn send_with_token(pid: u32, id_version: i32, sig: Sig) -> Result<(), i32> {
+    #[cfg(test)]
+    let seam = crate::signal::seams::kills_refused();
+    #[cfg(not(test))]
+    let seam: Option<i32> = None;
+    let sent = match seam {
+        Some(errno) => Err(errno),
+        None => {
+            let mut token = audit_token(pid, id_version);
+            // SAFETY: `token` is a fully initialised audit token that outlives the call.
+            match unsafe { proc_signal_with_audittoken(&mut token, sig.as_libc()) } {
+                0 => Ok(()),
+                errno => Err(errno),
+            }
+        }
+    };
+    #[cfg(test)]
+    crate::send_log::record_by_identity(pid, sig.as_libc());
+    sent
+}
+
+/// How [`signal_by_token`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SignalByTokenOutcome {
+    /// The kernel took the signal.
+    Delivered,
+    /// The process has exited and is not reaped: `ESRCH`, and the pid still has the same unique id
+    /// at the same `p_idversion`. Nothing was delivered. A caller that owns the child reads this as
+    /// delivered, as a zombie it owns is on Linux; a caller that holds no child reads it as gone.
+    ExitedUnreaped,
+    /// The process is gone, or its pid names another process.
+    Gone,
+}
+
+/// The `p_idversion` of the process `unique` names, if `pid` still names it. `Ok(None)`: the pid is
+/// gone or names another process. A refusal is an error that keeps its errno.
+pub(crate) fn read_version(pid: u32, unique: u64, sig: Sig) -> io::Result<Option<i32>> {
+    match uniq_info(pid, ReadPurpose::Kill) {
+        UniqRead::Found(now) if now.unique_id == unique => Ok(Some(now.id_version)),
+        UniqRead::Found(_) | UniqRead::Gone => Ok(None),
+        UniqRead::Refused(errno) => Err(io_context(
+            format!("pid {pid}: its identity could not be read; {sig:?} not sent"),
+            io::Error::from_raw_os_error(errno),
+        )),
+    }
+}
+
+/// Send `sig` to the process `unique` names at `pid`, through an audit token at `idversion`, which
+/// follows the process across an `exec` and is left at the version it was last sent at. The kernel
+/// checks the pid with its `p_idversion` and signals while it holds a reference, so only the
+/// documented 2^32 version wrap can redirect it. A refused send is the bare errno, so an `EPERM`
+/// stays raw for the callers that promise it.
+///
+/// `pid` must be a single-process signal target. No cap on the loop: each pass past the first needs
+/// a fresh `exec` of the process.
+pub(crate) fn signal_by_token(
+    pid: u32,
+    unique: u64,
+    idversion: &mut i32,
+    sig: Sig,
+) -> io::Result<SignalByTokenOutcome> {
+    loop {
+        match send_with_token(pid, *idversion, sig) {
+            Ok(()) => return Ok(SignalByTokenOutcome::Delivered),
+            Err(libc::ESRCH) => {}
+            // `EPERM` and the rest are surfaced, not swallowed.
+            Err(errno) => return Err(io::Error::from_raw_os_error(errno)),
+        }
+        // `ESRCH` is a zombie, an `exec`, or a process that is gone: read what the pid names.
+        match read_version(pid, unique, sig)? {
+            Some(now) if now == *idversion => {
+                log::debug!("{sig:?} to pid {pid}: it has exited and is not reaped yet");
+                return Ok(SignalByTokenOutcome::ExitedUnreaped);
+            }
+            // It `exec`ed: the same process under a new version.
+            Some(now) => *idversion = now,
+            None => {
+                log::debug!("{sig:?} to pid {pid}: it is gone, or its pid names another process");
+                return Ok(SignalByTokenOutcome::Gone);
+            }
+        }
     }
 }
 
 impl OsProcess for MacProcess {
     fn signal(&self, sig: Sig) -> Result<Sent, Error> {
         let pid = self.id.pid();
-        let signo = sig.as_libc();
         // `kernel_task` is pid 0 and macOS resolves it, so an identity can name it. It is no
-        // target; the same total guard as the by-pid signals use.
+        // target, and the signal paths share one total guard against it.
         if crate::identity::probe::signal_target(pid).is_none() {
             // A discard site: the Result can carry this, so it must not read as a silent success.
             log::warn!("wait: pid {pid} is not a single-process signal target - not signaled");
@@ -116,39 +192,13 @@ impl OsProcess for MacProcess {
                 source: None,
             });
         }
-        // No cap: each pass past the first needs a fresh `exec` of the process.
-        loop {
-            let idversion = self.idversion.load(Ordering::Relaxed);
-            let sent = send_with_token(pid, idversion, signo);
-            #[cfg(test)]
-            crate::send_log::record_by_identity(pid, signo);
-            match sent {
-                Ok(()) => return Ok(Sent::Delivered),
-                Err(libc::ESRCH) => {}
-                // `EPERM` and the rest are surfaced, not swallowed.
-                Err(errno) => return Err(Error::Io(std::io::Error::from_raw_os_error(errno))),
-            }
-            // `ESRCH` is a zombie, an `exec`, or a process that is gone: read what the pid names.
-            match uniq_info(pid, ReadPurpose::Kill) {
-                UniqRead::Found(now) if now.unique_id == self.unique => {
-                    if now.id_version == idversion {
-                        log::debug!("{sig:?} to pid {pid}: it has exited and is not reaped yet");
-                        return Ok(Sent::Gone);
-                    }
-                    // It `exec`ed: the same process under a new version.
-                    self.idversion.store(now.id_version, Ordering::Relaxed);
-                }
-                UniqRead::Found(_) | UniqRead::Gone => {
-                    log::debug!("{sig:?} to pid {pid}: it is gone, or its pid names another process");
-                    return Ok(Sent::Gone);
-                }
-                UniqRead::Refused(errno) => {
-                    return Err(Error::Io(io_context(
-                        format!("pid {pid}: its identity could not be read; {sig:?} not sent"),
-                        std::io::Error::from_raw_os_error(errno),
-                    )));
-                }
-            }
+        let mut idversion = self.idversion.load(Ordering::Relaxed);
+        let outcome = signal_by_token(pid, self.unique, &mut idversion, sig);
+        self.idversion.store(idversion, Ordering::Relaxed);
+        match outcome.map_err(Error::Io)? {
+            SignalByTokenOutcome::Delivered => Ok(Sent::Delivered),
+            // This process holds no child: an exited process is gone to it.
+            SignalByTokenOutcome::ExitedUnreaped | SignalByTokenOutcome::Gone => Ok(Sent::Gone),
         }
     }
 

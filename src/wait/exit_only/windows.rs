@@ -37,16 +37,7 @@ pub(super) fn peek(target: &Target<'_>) -> io::Result<PeekOutcome> {
 
 pub(super) fn try_reap(target: &Target<'_>) -> io::Result<Reap> {
     match peek(target)? {
-        PeekOutcome::Exit(record) => {
-            #[cfg(test)]
-            if let Some(forced) = super::seams::take_forced_reap() {
-                return match forced {
-                    super::seams::ForcedReap::None => Ok(Reap::Running),
-                    super::seams::ForcedReap::Errno(e) => Err(io::Error::from_raw_os_error(e)),
-                };
-            }
-            Ok(Reap::Reaped(record))
-        }
+        PeekOutcome::Exit(record) => Ok(Reap::Reaped(record)),
         PeekOutcome::Running => Ok(Reap::Running),
         PeekOutcome::Foreign(f) => Ok(Reap::Foreign(f)),
     }
