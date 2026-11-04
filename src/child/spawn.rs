@@ -599,7 +599,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         pid,
         pidfd: std::os::fd::AsFd::as_fd(&child.through.pidfd),
     };
-    let (resolved, mut why) = resolve_identity(pid, &through);
+    let (resolved, cause, mut why) = resolve_identity(pid, &through);
     let id = match resolved {
         crate::identity::Resolved::Found(id) => id,
         // Different diagnosis per arm: an OS refusal is not a vanish.
@@ -648,7 +648,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             // on `Unassessable` to retry elevated would otherwise see an I/O failure and
             // treat a live, merely-unreadable child as a startup failure. A front's fate is a note.
             return Err(SpawnFailure::started(
-                fate.note(spawn_identity_error(other), front, Some(pid)),
+                fate.note(spawn_identity_error(other, cause), front, Some(pid)),
                 child_fate,
             ));
         }
@@ -939,7 +939,7 @@ impl LateTree {
         if prepared.mode.is_none() || !prepared.is_root {
             return tree;
         }
-        let (resolved, mut why) = resolve_identity(pid, &crate::wait::exit_only::Target::pid(pid, Some(unique)));
+        let (resolved, _, mut why) = resolve_identity(pid, &crate::wait::exit_only::Target::pid(pid, Some(unique)));
         let unshown = match resolved {
             Resolved::Found(id) => {
                 tree.id = Some(id);
@@ -2025,14 +2025,22 @@ impl ParentStd {
 /// The error for a spawn whose child could not be identified. `Gone` is an absence;
 /// `Unknown` is an OS refusal about a child that may be running fine - never report the
 /// second as the first.
-pub(crate) fn spawn_identity_error(outcome: crate::identity::Resolved<ProcessId>) -> Error {
+///
+/// `cause` is what the read that answered `Unknown` found out. An unavailable Linux `/proc` view is
+/// named; any other refusal is the OS's.
+pub(crate) fn spawn_identity_error(
+    outcome: crate::identity::Resolved<ProcessId>,
+    cause: crate::identity::UnknownCause,
+) -> Error {
     match outcome {
-        // An unavailable Linux `/proc` view is named; any other refusal is the OS's.
-        crate::identity::Resolved::Unknown => crate::identity::unknown_identity_error("the spawned child")
-            .unwrap_or_else(|| Error::Unassessable {
-                detail: "the OS refused to report the spawned child's identity".into(),
-                source: None,
-            }),
+        crate::identity::Resolved::Unknown => {
+            cause
+                .into_error("the spawned child")
+                .unwrap_or_else(|| Error::Unassessable {
+                    detail: "the OS refused to report the spawned child's identity".into(),
+                    source: None,
+                })
+        }
         _ => Error::Io(std::io::Error::other(
             "the spawned child exited and was reaped by another party, or its zombie is held by one, before its \
              identity could be read",
@@ -2054,16 +2062,21 @@ pub(crate) fn spawn_identity_error(outcome: crate::identity::Resolved<ProcessId>
 /// On macOS the `through` id is the one the child reported before `exec`.
 ///
 /// What the check found out, when it could not show the read named our child, comes back as a
-/// [`Diagnosis`]: the failed spawn's teardown carries it in its one `warn`.
+/// [`Diagnosis`]: the failed spawn's teardown carries it in its one `warn`. The
+/// [`UnknownCause`](crate::identity::UnknownCause) is the read's own, for [`spawn_identity_error`].
 pub(crate) fn resolve_identity(
     pid: u32,
     through: &crate::wait::exit_only::Target<'_>,
-) -> (crate::identity::Resolved<ProcessId>, Diagnosis) {
+) -> (
+    crate::identity::Resolved<ProcessId>,
+    crate::identity::UnknownCause,
+    Diagnosis,
+) {
     use crate::identity::Resolved;
 
-    let read = resolve_identity_unchecked(pid);
+    let (read, cause) = resolve_identity_unchecked(pid);
     let Resolved::Found(_) = read else {
-        return (read, Diagnosis::default());
+        return (read, cause, Diagnosis::default());
     };
     #[cfg(test)]
     fault::run_at(fault::SpawnPoint::AfterIdentityRead, pid);
@@ -2075,17 +2088,19 @@ pub(crate) fn resolve_identity(
         #[cfg(target_os = "macos")]
         let peeked = crate::wait::exit_only::peek_verified(through);
         match peeked {
-            Ok(PeekOutcome::Running | PeekOutcome::Exit(_)) => (read, Diagnosis::default()),
+            Ok(PeekOutcome::Running | PeekOutcome::Exit(_)) => (read, cause, Diagnosis::default()),
             // Orphaned: `Gone`, warned.
             Ok(PeekOutcome::Foreign(crate::os_process::child::Foreign::Orphaned)) => (
                 Resolved::Gone,
+                cause,
                 Diagnosis::of(format!(
                     "child {pid}: launchd holds its zombie, so its tracer died; it is not ours to reap"
                 )),
             ),
-            Ok(PeekOutcome::Foreign(_)) => (Resolved::Gone, Diagnosis::default()),
+            Ok(PeekOutcome::Foreign(_)) => (Resolved::Gone, cause, Diagnosis::default()),
             Err(e) => (
                 Resolved::Unknown,
+                cause,
                 Diagnosis::of(format!(
                     "child {pid}: its identity could not be checked against its handle ({e}); it is not shown to be ours"
                 )),
@@ -2095,7 +2110,7 @@ pub(crate) fn resolve_identity(
     #[cfg(windows)]
     {
         let _ = through;
-        (read, Diagnosis::default())
+        (read, cause, Diagnosis::default())
     }
 }
 
@@ -2145,24 +2160,26 @@ impl Drop for Diagnosis {
 }
 
 /// The unchecked half of [`resolve_identity`]: the read by pid alone, which nothing has yet shown
-/// to name our child. Only `resolve_identity` and tests call it. A test-only fault seam (`fault`)
-/// can force the vanished or unreadable branch.
-pub(crate) fn resolve_identity_unchecked(pid: u32) -> crate::identity::Resolved<ProcessId> {
+/// to name our child, and why it was `Unknown` when the read itself knows. Only `resolve_identity`
+/// and tests call it. A test-only fault seam (`fault`) can force the vanished or unreadable branch.
+pub(crate) fn resolve_identity_unchecked(
+    pid: u32,
+) -> (crate::identity::Resolved<ProcessId>, crate::identity::UnknownCause) {
     #[cfg(test)]
     {
         if fault::force_identity_unknown() {
             fault::capture(ProcessId::of(pid));
-            return crate::identity::Resolved::Unknown;
+            return (crate::identity::Resolved::Unknown, Default::default());
         }
         if fault::force_identity_vanished() {
             // Capture the child's real identity for the test to check what became of the child,
             // then simulate a vanish so `spawn` takes the identity-failure arm.
             fault::capture(ProcessId::of(pid));
             // The seam simulates a VANISH, not a refusal.
-            return crate::identity::Resolved::Gone;
+            return (crate::identity::Resolved::Gone, Default::default());
         }
     }
-    ProcessId::of(pid)
+    ProcessId::of_explained(pid)
 }
 
 /// `containment::attach` for the child whose identity `id` the spawn verified, with a test-only

@@ -1,7 +1,8 @@
 //! The identity reads against a REAL outer procfs, in re-exec'd children (see
 //! `test_child::namespaces` for the group's gating).
 
-use super::proc_view::{proc_view, ProcDir, ProcView};
+use super::kernel::HostKernel;
+use super::proc_view::{proc_view_with, ProcDir, ProcView};
 use crate::identity::stat_parse::parse_starttime_jiffies;
 use crate::identity::{Existence, Liveness, ProcessId, Resolved};
 use crate::test_child::fixture_path;
@@ -40,7 +41,7 @@ fn fixture_outer_procfs_inner() {
         1,
         "the fixture must be pid 1 of its own pid namespace"
     );
-    let view = proc_view();
+    let view = proc_view_with(&HostKernel);
     assert!(matches!(view, ProcView::Diverged), "got {view:?}");
 
     let dir = ProcDir::open().expect("/proc opens");

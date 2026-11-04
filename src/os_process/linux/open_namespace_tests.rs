@@ -7,7 +7,7 @@ use std::rc::Rc;
 
 use super::open_tests::LiveNonLeaderTid;
 use crate::error::Error;
-use crate::identity::{proc_view, ProcDir, ProcView, ProcessId};
+use crate::identity::{proc_view_with, HostKernel, ProcDir, ProcView, ProcessId};
 use crate::test_child::fixture_path;
 use crate::test_child::namespaces as ns;
 use crate::test_groups::{namespaces, Group};
@@ -17,7 +17,7 @@ use crate::test_groups::{namespaces, Group};
 /// not depend on the view (the success path proves its target through the pidfd's fdinfo), so it
 /// keeps working.
 ///
-/// Mutants: "the success path requires a `Same` `proc_view()`" — every live `open_verified` is
+/// Mutants: "the success path requires a `Same` `proc_view_with`" — every live `open_verified` is
 /// then `Unassessable`; "read `status` with a plain `openat`" — the fake status is read as real.
 #[skuld::test]
 fn namespaces_a_status_mounted_over_below_proc_keeps_live_foreign_kills_working(#[fixture(namespaces)] _group: &Group) {
@@ -52,7 +52,7 @@ fn fixture_status_mounted_over() {
     let own = super::open_verified(ProcessId::current());
     assert!(matches!(own, Ok(Some(_))), "got {own:?}");
 
-    match proc_view() {
+    match proc_view_with(&HostKernel) {
         ProcView::Unassessable(why) => {
             assert!(why.reason.contains("self/status could not be read"), "{why}");
             assert_eq!(
@@ -96,7 +96,7 @@ fn fixture_pid_ns_inner() {
         1,
         "the fixture must be pid 1 of its own pid namespace"
     );
-    let view = proc_view();
+    let view = proc_view_with(&HostKernel);
     assert!(matches!(view, ProcView::Diverged), "got {view:?}");
 
     // `pidfd_open(1)` opens this very process; the outer procfs numbers it differently.
@@ -285,7 +285,7 @@ fn fixture_tmpfs_at_proc() {
         matches!(&opened, Err(why) if why.reason.contains("not procfs")),
         "got {opened:?}"
     );
-    match proc_view() {
+    match proc_view_with(&HostKernel) {
         ProcView::Unassessable(why) => assert!(why.reason.contains("not procfs"), "{why}"),
         other => panic!("a tmpfs at /proc must be Unassessable, got {other:?}"),
     }
