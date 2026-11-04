@@ -250,23 +250,13 @@ pub(crate) fn proc_view_with(kernel: &dyn Kernel) -> ProcView {
         Some(fault::ForcedView::Unassessable) => {
             return ProcView::Unassessable(ViewUnreadable::new("forced by a test", None));
         }
-        Some(fault::ForcedView::Same) => {
-            return match kernel.open_proc() {
-                Ok(dir) => ProcView::Same(dir),
-                Err(why) => ProcView::Unassessable(why),
-            };
-        }
         None => {}
     }
     let dir = match kernel.open_proc() {
         Ok(dir) => dir,
         Err(why) => return ProcView::Unassessable(why),
     };
-    #[cfg(test)]
-    let forced_status = fault::take_forced_status();
-    #[cfg(not(test))]
-    let forced_status: Option<String> = None;
-    let status = match forced_status.map_or_else(|| kernel.read(&dir, "self/status").and_then(utf8), Ok) {
+    let status = match kernel.read(&dir, "self/status").and_then(utf8) {
         Ok(text) => text,
         Err(e) => {
             return ProcView::Unassessable(ViewUnreadable::new("self/status could not be read", Some(e)));
@@ -452,10 +442,9 @@ fn collect_pids(names: impl IntoIterator<Item = io::Result<Vec<u8>>>) -> io::Res
 pub(crate) mod fault {
     use std::cell::{Cell, RefCell};
 
-    /// A view to force. `Same` still opens the real `/proc`.
+    /// A view to force.
     #[derive(Debug, Clone, Copy)]
     pub(crate) enum ForcedView {
-        Same,
         Diverged,
         Unassessable,
     }
@@ -467,7 +456,6 @@ pub(crate) mod fault {
         static PROC_VIEW_FIRED_AT: Cell<Option<u32>> = const { Cell::new(None) };
         static FORCE_PIDS_ERRNO: Cell<Option<i32>> = const { Cell::new(None) };
         static FORCE_IDENTITY_STAT: RefCell<Vec<(u32, i32)>> = const { RefCell::new(Vec::new()) };
-        static FORCE_STATUS: RefCell<Option<String>> = const { RefCell::new(None) };
         static FORCE_FDINFO: Cell<Option<Result<super::PidfdTarget, i32>>> = const { Cell::new(None) };
         static FORCE_OPENAT2_ERRNO: Cell<Option<rustix::io::Errno>> = const { Cell::new(None) };
         static FORCE_SELF_STAT: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
@@ -487,7 +475,6 @@ pub(crate) mod fault {
             FORCE_PIDS_ERRNO.with(|f| f.set(None));
             FORCE_IDENTITY_STAT.with(|f| f.borrow_mut().clear());
             FORCE_FDINFO.with(|f| f.set(None));
-            FORCE_STATUS.with(|f| f.take());
             FORCE_OPENAT2_ERRNO.with(|f| f.set(None));
             FORCE_SELF_STAT.with(|f| f.take());
         }
@@ -536,17 +523,6 @@ pub(crate) mod fault {
 
     pub(crate) fn take_forced_self_stat() -> Option<Vec<u8>> {
         FORCE_SELF_STAT.with(|f| f.take())
-    }
-
-    /// Make the NEXT [`proc_view_with`](super::proc_view_with) on THIS thread read `text` as its
-    /// `status` file.
-    pub(crate) fn force_status_once(text: &str) -> Forced {
-        FORCE_STATUS.with(|f| *f.borrow_mut() = Some(text.to_owned()));
-        Forced(())
-    }
-
-    pub(crate) fn take_forced_status() -> Option<String> {
-        FORCE_STATUS.with(|f| f.take())
     }
 
     /// Force the NEXT [`proc_view_with`](super::proc_view_with) on THIS thread.

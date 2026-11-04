@@ -32,5 +32,9 @@ impl Kernel for HostKernel {
 }
 
 #[cfg(test)]
+#[path = "kernel/fake.rs"]
+pub(crate) mod fake;
+
+#[cfg(test)]
 #[path = "kernel_tests.rs"]
 mod kernel_tests;

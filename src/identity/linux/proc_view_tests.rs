@@ -6,12 +6,11 @@ use crate::test_child::fixture_path;
 use crate::test_child::namespaces as ns;
 use crate::test_groups::{namespaces, Group};
 
-use super::fault::{force_proc_view_once, force_status_once, ForcedView};
 use super::{
     classify_ns_links, classify_status, collect_pids, parse_fdinfo_pid, pidfd_pid_in, proc_view_with, PidfdTarget,
     ProcDir, ProcView, Verdict, ViewUnreadable,
 };
-use crate::identity::HostKernel;
+use crate::identity::{FakeKernel, HostKernel};
 
 fn ns_pid(exists: io::Result<bool>) -> impl FnOnce() -> io::Result<bool> {
     move || exists
@@ -138,38 +137,15 @@ fn fdinfo_pid_ignores_similarly_prefixed_keys() {
     );
 }
 
-/// A forced `Same` still opens the real `/proc`, so the dirfd it carries is usable.
+/// A `self/status` that is not UTF-8 is a view that cannot be read, not a panic. Mutant:
+/// "`utf8` unwraps".
 #[skuld::test]
-fn a_forced_same_view_carries_the_real_proc_dirfd() {
-    let forced = force_proc_view_once(ForcedView::Same);
-    let ProcView::Same(dir) = proc_view_with(&HostKernel) else {
-        panic!("a forced Same must be Same");
-    };
-    drop(forced);
-    let status = dir.read_to_string("self/status").expect("read through the dirfd");
-    assert!(status.contains("Name:"), "{status}");
-}
-
-/// The forced seam overrides the real read exactly once, then falls back to it.
-#[skuld::test]
-fn a_forced_view_is_consumed_once() {
-    let forced = force_proc_view_once(ForcedView::Diverged);
-    assert!(matches!(proc_view_with(&HostKernel), ProcView::Diverged));
-    assert!(
-        matches!(proc_view_with(&HostKernel), ProcView::Same(_)),
-        "a second call must reach the real read again"
-    );
-    drop(forced);
-}
-
-/// The guard disarms on drop even if the forced view was never consumed.
-#[skuld::test]
-fn a_forced_view_disarms_on_drop_even_if_unconsumed() {
-    drop(force_proc_view_once(ForcedView::Unassessable));
-    assert!(
-        matches!(proc_view_with(&HostKernel), ProcView::Same(_)),
-        "the forced view must not survive an unconsumed drop"
-    );
+fn proc_view_with_is_unassessable_for_a_status_that_is_not_utf8() {
+    let kernel = FakeKernel::over(&HostKernel).on_read("self/status", Ok(&[0xff]));
+    match proc_view_with(&kernel) {
+        ProcView::Unassessable(why) => assert!(why.reason.contains("self/status could not be read"), "{why}"),
+        other => panic!("got {other:?}"),
+    }
 }
 
 // Checked /proc dirfd =====
@@ -300,6 +276,33 @@ fn the_fdinfo_of_an_unreaped_targets_pidfd_names_its_pid() {
     );
 }
 
+/// The fdinfo path is `thread-self/fdinfo/<fd>`, and a fdinfo with no `Pid:` line is a view that
+/// cannot be read. The fake states a pid the real fdinfo never gives this fd, so a read of any
+/// other path would not match.
+#[skuld::test]
+fn pidfd_pid_in_reads_thread_self_fdinfo_and_names_a_missing_pid_line() {
+    use std::os::fd::AsRawFd as _;
+
+    let (mut child, pidfd) = spawn_exited_child_with_pidfd();
+    let dir = ProcDir::open().expect("/proc opens");
+    let path = format!("thread-self/fdinfo/{}", pidfd.as_raw_fd());
+    let stated = FakeKernel::over(&HostKernel).on_read(
+        &path,
+        Ok(b"Pid:	4321
+"),
+    );
+    let got = pidfd_pid_in(&stated, &dir, pidfd.as_fd());
+    let no_pid = FakeKernel::over(&HostKernel).on_read(
+        &path,
+        Ok(b"pos:	0
+"),
+    );
+    let err = pidfd_pid_in(&no_pid, &dir, pidfd.as_fd()).expect_err("no Pid line");
+    child.wait().expect("reap the child");
+    assert!(matches!(got, Ok(PidfdTarget::Pid(4321))), "got {got:?}");
+    assert!(err.reason.contains("no parseable Pid line"), "{err}");
+}
+
 fn spawn_exited_child_with_pidfd() -> (std::process::Child, rustix::fd::OwnedFd) {
     let child = crate::test_spawn::spawn(&mut std::process::Command::new("true")).expect("spawn true");
     let pid = rustix::process::Pid::from_raw(child.id() as i32).expect("child pid is nonzero");
@@ -393,8 +396,7 @@ fn fixture_coinciding_tid_inner() {
             tid,
             "precondition: /proc must number this thread as gettid() does"
         );
-        let _status = force_status_once(NO_NSPID);
-        proc_view_with(&HostKernel)
+        proc_view_with(&FakeKernel::over(&HostKernel).on_read("self/status", Ok(NO_NSPID.as_bytes())))
     })
     .join()
     .expect("verdict thread");
@@ -429,10 +431,7 @@ fn fixture_own_procfs_init() {
     }
     ns::enter_private_mount_ns();
     ns::mount_proc(std::path::Path::new("/proc"));
-    let view = {
-        let _status = force_status_once(NO_NSPID);
-        proc_view_with(&HostKernel)
-    };
+    let view = proc_view_with(&FakeKernel::over(&HostKernel).on_read("self/status", Ok(NO_NSPID.as_bytes())));
     assert!(matches!(view, ProcView::Same(_)), "got {view:?}");
     ns::run_dropping_to_nobody(fixture_path!(fixture_own_procfs_unprivileged));
 }
@@ -444,8 +443,7 @@ fn fixture_own_procfs_unprivileged() {
     }
     ns::drop_to_nobody();
     rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable).expect("PR_SET_DUMPABLE 0");
-    let _status = force_status_once(NO_NSPID);
-    match proc_view_with(&HostKernel) {
+    match proc_view_with(&FakeKernel::over(&HostKernel).on_read("self/status", Ok(NO_NSPID.as_bytes()))) {
         ProcView::Unassessable(why) => {
             assert!(why.reason.contains("1/ns/pid"), "{why}");
             assert_eq!(

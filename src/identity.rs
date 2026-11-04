@@ -208,6 +208,9 @@ pub(crate) use backend::pid_stat;
 #[cfg(target_os = "linux")]
 pub(crate) use backend::kernel::HostKernel;
 
+#[cfg(all(target_os = "linux", test))]
+pub(crate) use backend::kernel::fake::FakeKernel;
+
 #[cfg(target_os = "linux")]
 pub(crate) use backend::proc_view::{pidfd_pid_in, proc_view_with, PidfdTarget, ProcDir, ProcView, ViewUnreadable};
 
