@@ -5,7 +5,7 @@ use windows::Win32::System::Threading::CreateEventW;
 
 use crate::error::Error;
 use crate::identity::ProcessId;
-use crate::os_process::drive::{absolute, drive};
+use crate::os_process::drive::exited_held;
 use crate::os_process::{kill, open, terminate, terminate_by_id, Exit, OsProcess as _, WaitFor};
 use crate::signal::{Sent, Sig};
 use crate::test_child::live_blocker as blocker;
@@ -16,9 +16,9 @@ fn one_open_serves_look_signal_and_wait() {
     let (child, _stdin, id) = blocker();
     let p = open(id).unwrap().expect("a live process opens");
     assert!(matches!(p.exited().unwrap(), Exit::Running(WaitFor::Signalled(_))));
-    assert!(!drive(&*p, absolute(Some(Duration::ZERO))).unwrap());
+    assert!(!exited_held(&*p, Some(Duration::ZERO)).unwrap());
     assert_eq!(p.signal(Sig::Kill).unwrap(), Sent::Delivered);
-    assert!(drive(&*p, absolute(None)).unwrap());
+    assert!(exited_held(&*p, None).unwrap());
     child.wait().unwrap();
 }
 
@@ -29,7 +29,7 @@ fn open_with_wrong_start_token_is_none_and_sends_nothing() {
     assert!(open(other).unwrap().is_none());
     // Still running: the right identity opens and sees no exit.
     let p = open(id).unwrap().expect("the blocker is alive");
-    assert!(!drive(&*p, absolute(Some(Duration::ZERO))).unwrap());
+    assert!(!exited_held(&*p, Some(Duration::ZERO)).unwrap());
     child.kill().unwrap();
     child.wait().unwrap();
 }
@@ -42,7 +42,7 @@ fn exited_before_first_look_returns_true() {
     // `TerminateProcess` returns before the process object is signalled; the child's own wait is
     // the barrier.
     child.wait().unwrap();
-    assert!(drive(&*p, absolute(Some(Duration::ZERO))).unwrap());
+    assert!(exited_held(&*p, Some(Duration::ZERO)).unwrap());
 }
 
 /// Mutant: a refused `TerminateProcess` on an exited process is an error, or a kill of an exited
@@ -91,7 +91,7 @@ fn terminate_by_id_is_unsupported_and_sends_nothing() {
     assert_eq!(platform, "windows");
     assert!(detail.contains("graceful_shutdown_tree"), "{detail}");
     let p = open(id).unwrap().expect("the blocker is alive");
-    assert!(!drive(&*p, absolute(Some(Duration::ZERO))).unwrap());
+    assert!(!exited_held(&*p, Some(Duration::ZERO)).unwrap());
     child.kill().unwrap();
     child.wait().unwrap();
 }
@@ -104,7 +104,7 @@ fn terminate_of_a_windows_held_process_is_unsupported() {
     let p = open(id).unwrap().expect("a live process opens");
     let err = terminate(&*p).expect_err("Windows has no graceful per-process signal");
     assert!(matches!(err, Error::Unsupported { .. }), "{err:?}");
-    assert!(!drive(&*p, absolute(Some(Duration::ZERO))).unwrap());
+    assert!(!exited_held(&*p, Some(Duration::ZERO)).unwrap());
     child.kill().unwrap();
     child.wait().unwrap();
 }
@@ -195,7 +195,7 @@ fn a_look_without_synchronize_reads_the_exit_code() {
     let p = open(id).unwrap().expect("a live process opens with QUERY alone");
     assert_access_denied(p.exited(), "a look at a running process");
     assert_access_denied(
-        drive(&*p, absolute(Some(Duration::ZERO))),
+        exited_held(&*p, Some(Duration::ZERO)),
         "a driven look at a running process",
     );
     child.terminate();
