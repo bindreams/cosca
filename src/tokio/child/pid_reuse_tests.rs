@@ -52,7 +52,7 @@ fn tokio_child_holds_its_handshake_pidfd() {
             panic!("a fresh child is a tokio backend");
         };
         let dir = crate::identity::ProcDir::open().expect("/proc opens");
-        let target = crate::identity::pidfd_pid_in_view(&dir, pidfd.as_fd());
+        let target = crate::identity::pidfd_pid_in(&crate::identity::HostKernel, &dir, pidfd.as_fd());
         assert!(
             matches!(target, Ok(crate::identity::PidfdTarget::Pid(p)) if p == pid),
             "the held pidfd must name the child: {target:?}"

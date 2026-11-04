@@ -4,6 +4,39 @@
 /// every process it forks, as a seccomp-filtered container does. Run the denied code on its own
 /// thread to keep the test's own `pidfd_open`.
 pub fn deny_pidfd_open_on_this_thread(errno: i32) {
+    deny_syscall_on_this_thread(libc::SYS_pidfd_open, errno);
+    let denied = rustix::process::pidfd_open(rustix::process::getpid(), rustix::process::PidfdFlags::empty());
+    assert_eq!(
+        denied.map(drop).map_err(|e| e.raw_os_error()),
+        Err(errno),
+        "pidfd_open must be denied with the requested errno"
+    );
+}
+
+/// Make `openat2` fail with `errno` (a positive `libc` constant) on the calling thread and every
+/// process it forks, as a kernel before 5.6 (`ENOSYS`) or a seccomp-filtered container (`EPERM`)
+/// does. Run the denied code on its own thread to keep the test's own `openat2`.
+pub fn deny_openat2_on_this_thread(errno: i32) {
+    use rustix::fs::{openat2, Mode, OFlags, ResolveFlags, CWD};
+
+    deny_syscall_on_this_thread(libc::SYS_openat2, errno);
+    let denied = openat2(
+        CWD,
+        "/proc",
+        OFlags::DIRECTORY | OFlags::RDONLY | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::NO_MAGICLINKS,
+    );
+    assert_eq!(
+        denied.map(drop).map_err(|e| e.raw_os_error()),
+        Err(errno),
+        "openat2 must be denied with the requested errno"
+    );
+}
+
+/// Install a filter that fails syscall `nr` with `errno` on the calling thread and every process
+/// it forks.
+fn deny_syscall_on_this_thread(nr: libc::c_long, errno: i32) {
     // `seccomp_data.nr`, the syscall number, is at offset 0.
     let filter = [
         libc::sock_filter {
@@ -16,7 +49,7 @@ pub fn deny_pidfd_open_on_this_thread(errno: i32) {
             code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
             jt: 0,
             jf: 1,
-            k: libc::SYS_pidfd_open as u32,
+            k: nr as u32,
         },
         libc::sock_filter {
             code: (libc::BPF_RET | libc::BPF_K) as u16,
@@ -52,12 +85,6 @@ pub fn deny_pidfd_open_on_this_thread(errno: i32) {
             std::io::Error::last_os_error()
         );
     }
-    let denied = rustix::process::pidfd_open(rustix::process::getpid(), rustix::process::PidfdFlags::empty());
-    assert_eq!(
-        denied.map(drop).map_err(|e| e.raw_os_error()),
-        Err(errno),
-        "pidfd_open must be denied with the requested errno"
-    );
 }
 
 /// [`deny_pidfd_open_on_this_thread`], and also make every fork of a new process fail with

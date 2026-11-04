@@ -2,6 +2,8 @@
 //! `/proc/<pid>/stat` as the start token; `is_running` via process state; `created_at` via
 //! `/proc/stat` `btime` and `_SC_CLK_TCK`.
 
+#[path = "linux/kernel.rs"]
+pub(crate) mod kernel;
 #[path = "linux/pid_stat.rs"]
 pub(crate) mod pid_stat;
 #[path = "linux/proc_view.rs"]
@@ -21,6 +23,10 @@ mod read_namespace_tests;
 
 use std::time::{Duration, SystemTime};
 
+use rustix::io::Errno;
+use rustix::process::Pid;
+
+use self::kernel::Kernel;
 use self::proc_view::ProcDir;
 use super::probe::{classify_unreadable, SignalProbe};
 use super::stat_parse::parse_starttime_jiffies;
@@ -29,52 +35,50 @@ use crate::error::Error;
 
 /// `kill(pid, 0)` — existence/permission check only, no signal delivered. The target
 /// validation lives in the pure `probe` module so it is executed on every host.
-fn signal_probe(pid: RawPid) -> SignalProbe {
-    let Some(p) = super::probe::signal_target(pid) else {
+fn signal_probe(kernel: &dyn Kernel, pid: RawPid) -> SignalProbe {
+    let Some(target) = super::probe::signal_target(pid).and_then(Pid::from_raw) else {
         return SignalProbe::NotAPid;
     };
-    // SAFETY: kill with signal 0 performs the permission/existence check only.
-    if unsafe { libc::kill(p, 0) } == 0 {
-        return SignalProbe::Signalable;
-    }
-    match std::io::Error::last_os_error().raw_os_error() {
-        Some(libc::ESRCH) => SignalProbe::NoSuchProcess,
-        _ => SignalProbe::Denied,
+    match kernel.signal_probe(target) {
+        Ok(()) => SignalProbe::Signalable,
+        Err(Errno::SRCH) => SignalProbe::NoSuchProcess,
+        Err(_) => SignalProbe::Denied,
     }
 }
 
 /// `pid`'s `stat` through a `/proc` that is shown to describe this process's own pid namespace,
 /// else `Unknown` unless `kill(pid, 0)` says the pid is gone: an outer namespace's `/proc/<pid>`
 /// names another process, so what it says is no answer about `pid`.
-fn read_stat(pid: RawPid) -> Resolved<Vec<u8>> {
-    read_stat_explained(pid).0
+fn read_stat(kernel: &dyn Kernel, pid: RawPid) -> Resolved<Vec<u8>> {
+    read_stat_explained(kernel, pid).0
 }
 
 /// [`read_stat`], and the unusable view that made it `Unknown`, when one did.
-fn read_stat_explained(pid: RawPid) -> (Resolved<Vec<u8>>, Option<proc_view::ViewUnreadable>) {
-    match proc_view::proc_view().into_dir() {
-        Ok(dir) => (read_stat_in(&dir, pid), None),
+fn read_stat_explained(kernel: &dyn Kernel, pid: RawPid) -> (Resolved<Vec<u8>>, Option<proc_view::ViewUnreadable>) {
+    match proc_view::proc_view_with(kernel).into_dir() {
+        Ok(dir) => (stat_by_pid(kernel, &dir, pid), None),
         Err(why) => (
-            resolve_unreadable(pid, format_args!("the /proc view could not be established: {why}")),
+            resolve_unreadable(
+                kernel,
+                pid,
+                format_args!("the /proc view could not be established: {why}"),
+            ),
             Some(why),
         ),
     }
 }
 
-/// [`read_stat`] via `openat` on `proc_dir`, not a `/proc` path lookup.
-fn read_stat_in(proc_dir: &ProcDir, pid: RawPid) -> Resolved<Vec<u8>> {
+/// [`read_stat`] via `openat` on `proc_dir`, not a `/proc` path lookup. A failed read is `Gone`
+/// only when `kill(pid, 0)` says so ([`resolve_unreadable`]); a whole-table scan has the other
+/// policy (`pid_stat::read_in_scan`).
+fn stat_by_pid(kernel: &dyn Kernel, proc_dir: &ProcDir, pid: RawPid) -> Resolved<Vec<u8>> {
     #[cfg(test)]
     if let Some(errno) = proc_view::fault::forced_identity_stat_errno(pid) {
-        return resolve_unreadable(pid, std::io::Error::from_raw_os_error(errno));
+        return resolve_unreadable(kernel, pid, std::io::Error::from_raw_os_error(errno));
     }
-    read_stat_with(pid, || proc_dir.read(&format!("{pid}/stat")))
-}
-
-/// `stat` through `read`, else [`resolve_unreadable`].
-fn read_stat_with(pid: RawPid, read: impl FnOnce() -> std::io::Result<Vec<u8>>) -> Resolved<Vec<u8>> {
-    match read() {
+    match pid_stat::read_stat_file(kernel, proc_dir, pid) {
         Ok(bytes) => Resolved::Found(bytes),
-        Err(e) => resolve_unreadable(pid, e),
+        Err(e) => resolve_unreadable(kernel, pid, e),
     }
 }
 
@@ -82,8 +86,8 @@ fn read_stat_with(pid: RawPid, read: impl FnOnce() -> std::io::Result<Vec<u8>>) 
 /// says `ESRCH`, else `Unknown`. `ErrorKind` alone is not enough: under a `hidepid` mount
 /// another user's `/proc/<pid>` is invisible, so a LIVE process yields `ENOENT`; and a task
 /// that exits mid-read yields `ESRCH`, which has no `ErrorKind`.
-fn resolve_unreadable(pid: RawPid, why: impl std::fmt::Display) -> Resolved<Vec<u8>> {
-    match classify_unreadable(signal_probe(pid)) {
+fn resolve_unreadable(kernel: &dyn Kernel, pid: RawPid, why: impl std::fmt::Display) -> Resolved<Vec<u8>> {
+    match classify_unreadable(signal_probe(kernel, pid)) {
         Resolved::Gone => Resolved::Gone,
         _ => {
             // `debug`, not `warn`: this is a per-pid probe the tree-walk calls once per
@@ -97,19 +101,22 @@ fn resolve_unreadable(pid: RawPid, why: impl std::fmt::Display) -> Resolved<Vec<
 /// Whether `kill(pid, 0)` answers `ESRCH`. It resolves `pid` in THIS process's pid namespace,
 /// which is the one a caller's pid lives in, so unlike a `/proc` read this answer does not
 /// depend on which namespace `/proc` describes.
-pub(super) fn signal_says_no_such_process(pid: RawPid) -> bool {
-    signal_probe(pid) == SignalProbe::NoSuchProcess
+pub(super) fn signal_says_no_such_process(kernel: &dyn Kernel, pid: RawPid) -> bool {
+    signal_probe(kernel, pid) == SignalProbe::NoSuchProcess
 }
 
 /// The start token of `pid`, and the unusable `/proc` view behind an `Unknown`, when that is why.
-pub(super) fn start_token_explained(pid: RawPid) -> (Resolved<StartToken>, Option<proc_view::ViewUnreadable>) {
-    let (stat, cause) = read_stat_explained(pid);
+pub(super) fn start_token_explained(
+    kernel: &dyn Kernel,
+    pid: RawPid,
+) -> (Resolved<StartToken>, Option<proc_view::ViewUnreadable>) {
+    let (stat, cause) = read_stat_explained(kernel, pid);
     (start_token_from(pid, stat), cause)
 }
 
-/// [`start_token`], read through the `/proc` at `proc_dir`.
-pub(super) fn start_token_in(proc_dir: &ProcDir, pid: RawPid) -> Resolved<StartToken> {
-    start_token_from(pid, read_stat_in(proc_dir, pid))
+/// [`start_token_explained`], read through the `/proc` at `proc_dir`.
+pub(super) fn start_token_in(kernel: &dyn Kernel, proc_dir: &ProcDir, pid: RawPid) -> Resolved<StartToken> {
+    start_token_from(pid, stat_by_pid(kernel, proc_dir, pid))
 }
 
 fn start_token_from(pid: RawPid, stat: Resolved<Vec<u8>>) -> Resolved<StartToken> {
@@ -133,17 +140,17 @@ fn start_token_from(pid: RawPid, stat: Resolved<Vec<u8>>) -> Resolved<StartToken
     }
 }
 
-pub(super) fn is_running(pid: RawPid, start: StartToken) -> Liveness {
-    match read_stat(pid) {
-        Resolved::Found(stat) => super::stat_parse::running_from_stat(&stat, start),
-        Resolved::Gone => Liveness::Dead, // gone (reaped) => not running
-        Resolved::Unknown => Liveness::Unknown,
-    }
+pub(super) fn is_running(kernel: &dyn Kernel, pid: RawPid, start: StartToken) -> Liveness {
+    liveness_of(read_stat(kernel, pid), start)
 }
 
 /// [`is_running`], read through the `/proc` at `proc_dir`.
-pub(super) fn is_running_in(proc_dir: &ProcDir, pid: RawPid, start: StartToken) -> Liveness {
-    match read_stat_in(proc_dir, pid) {
+pub(super) fn is_running_in(kernel: &dyn Kernel, proc_dir: &ProcDir, pid: RawPid, start: StartToken) -> Liveness {
+    liveness_of(stat_by_pid(kernel, proc_dir, pid), start)
+}
+
+fn liveness_of(stat: Resolved<Vec<u8>>, start: StartToken) -> Liveness {
+    match stat {
         Resolved::Found(stat) => super::stat_parse::running_from_stat(&stat, start),
         Resolved::Gone => Liveness::Dead,
         Resolved::Unknown => Liveness::Unknown,
@@ -161,7 +168,7 @@ pub(super) fn is_running_in(proc_dir: &ProcDir, pid: RawPid, start: StartToken) 
 /// `hidepid` never hides a task from itself, so a failure here is not a foreign-pid outcome: it
 /// is logged at `error`, and [`ProcessId::current`](super::ProcessId::current) panics on it.
 pub(super) fn current_token() -> Resolved<StartToken> {
-    match read_self_stat() {
+    match std::fs::read("/proc/self/stat") {
         Ok(stat) => start_token_from(std::process::id(), Resolved::Found(stat)),
         Err(e) => {
             log::error!("own start token unreadable: /proc/self/stat: {e}");
@@ -170,27 +177,9 @@ pub(super) fn current_token() -> Resolved<StartToken> {
     }
 }
 
-fn read_self_stat() -> std::io::Result<Vec<u8>> {
-    #[cfg(test)]
-    if let Some(bytes) = proc_view::fault::take_forced_self_stat() {
-        return Ok(bytes);
-    }
-    std::fs::read("/proc/self/stat")
-}
-
-/// The error for a by-pid identity read of `subject` that answered `Unknown` because the
-/// `/proc` view is unavailable, or `None` when it is not (`hidepid`, a racing exit).
-///
-/// Without `openat2` it is [`Error::Unsupported`] naming that; otherwise
-/// [`Error::Unassessable`] carrying the view's reason.
-pub(crate) fn unknown_identity_error(subject: &str) -> Option<Error> {
-    proc_view::proc_view()
-        .into_dir()
-        .err()
-        .map(|why| view_error(subject, why))
-}
-
-/// The error for a by-pid identity read of `subject` that `why` (an unusable view) made `Unknown`.
+/// The error for a by-pid identity read of `subject` that `why` (an unusable view) made `Unknown`:
+/// [`Error::Unsupported`] naming `openat2` when that is missing, else [`Error::Unassessable`]
+/// carrying the view's reason.
 pub(crate) fn view_error(subject: &str, why: proc_view::ViewUnreadable) -> Error {
     why.unsupported(format!("identifying {subject}"))
         .unwrap_or_else(|| unassessable_view(subject, &why.reason, why.source))

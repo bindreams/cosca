@@ -952,21 +952,20 @@ pub(crate) type MemberTerm = (Option<u32>, crate::send_log::Via, i32);
 /// Notes a signal `signo` sent to the leaf member `pid` by `sys` on this thread, once answered; the
 /// route is the syscall's own, and a pidfd's pid is read from its fdinfo.
 pub(crate) fn record_member_term(sys: crate::containment::unix::Sys<'_>, pid: u32, signo: i32) {
-    use std::os::fd::AsRawFd as _;
-
     use crate::containment::unix::Sys;
+    use crate::identity::{pidfd_target_in, HostKernel, PidfdTarget, ProcDir};
     use crate::send_log::Via;
     let entry = match sys {
         Sys::Pidfd(pidfd, _) => {
-            let pid = std::fs::read_to_string(format!("/proc/thread-self/fdinfo/{}", pidfd.as_raw_fd()))
+            // A recorder takes no fault armed for the code under test: it opens and reads past the seams.
+            let pid = ProcDir::open_unforced()
+                .and_then(|dir| pidfd_target_in(&HostKernel, &dir, pidfd))
+                .map_err(|why| log::debug!("record_member_term: the pidfd's pid was not read: {why}"))
                 .ok()
-                .and_then(|fdinfo| {
-                    fdinfo
-                        .lines()
-                        .find_map(|line| line.strip_prefix("Pid:"))
-                        .and_then(|pid| pid.trim().parse::<i64>().ok())
-                })
-                .and_then(|pid| u32::try_from(pid).ok().filter(|&pid| pid > 0));
+                .and_then(|target| match target {
+                    PidfdTarget::Pid(pid) if pid > 0 => Some(pid),
+                    PidfdTarget::Pid(_) | PidfdTarget::Reaped => None,
+                });
             (pid, Via::Pidfd, signo)
         }
         Sys::Group(_) | Sys::Process(_) => (Some(pid), Via::Pid, signo),
