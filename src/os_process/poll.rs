@@ -33,7 +33,6 @@ pub(crate) fn poll_readable(fd: BorrowedFd<'_>, deadline: Option<Instant>) -> st
             tv_sec: d.as_secs() as i64,
             tv_nsec: d.subsec_nanos() as _,
         });
-        // A deadline wait never arms an unbounded poll.
         debug_assert!(
             deadline.is_none() || ts.is_some(),
             "a deadline wait armed an unbounded poll"
@@ -51,13 +50,16 @@ pub(crate) fn poll_readable(fd: BorrowedFd<'_>, deadline: Option<Instant>) -> st
 }
 
 /// What a `poll` that reported events found: `Ok(())` for `POLLIN` (a zombie, or an armed kqueue
-/// holding the exit) or `POLLHUP` (a reaped pidfd), both an exit; `POLLERR` is an error.
+/// holding the exit) or `POLLHUP` (a reaped pidfd), both an exit; `POLLERR` and `POLLNVAL` are errors.
 fn readable(revents: PollFlags) -> std::io::Result<()> {
     // POLLNVAL on an fd we own and hold alive is a contract violation.
     debug_assert!(
         !revents.contains(PollFlags::NVAL),
         "poll reported POLLNVAL: owned-fd contract violation"
     );
+    if revents.contains(PollFlags::NVAL) {
+        return Err(std::io::Error::other("poll reported POLLNVAL on an owned descriptor"));
+    }
     if revents.contains(PollFlags::ERR) {
         return Err(std::io::Error::other("poll returned POLLERR"));
     }

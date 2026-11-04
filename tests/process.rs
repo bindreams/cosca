@@ -131,6 +131,21 @@ fn a_held_process_reads_dead_and_its_acts_return_after_it_is_reaped() {
     assert!(p.wait_timeout(Duration::ZERO).expect("wait_timeout"));
 }
 
+/// After the reap no process has the child's pid, so `open_pid` is `None`. A pid reused since by
+/// an unrelated process would open as `Some` with another identity; this child's identity never
+/// opens.
+#[skuld::test]
+fn open_pid_of_a_reaped_child_is_none_or_another_process() {
+    let (child, sock) = spawn_blocker();
+    let id = child.id();
+    common::kill_release_reap(&child, sock);
+    drop(child); // on Windows the child's own handle keeps the exited process openable
+    match cosca::Process::open_pid(id.pid()).expect("a reaped pid is not an error") {
+        None => {}
+        Some(reused) => assert_ne!(reused.id(), id, "the reaped child's identity must not open"),
+    }
+}
+
 #[skuld::test]
 fn parent_and_children_resolve_the_spawned_tree() {
     let (child, mut sock) = spawn_blocker();
@@ -264,10 +279,10 @@ fn is_alive_is_false_for_a_real_zombie() {
         cosca::identity::Existence::Present,
         "a zombie identity still resolves"
     );
-    // A zombie opened now is gone or dead, never alive.
-    if let Some(zombie) = cosca::Process::open(p.id()).expect("open") {
-        assert_eq!(zombie.is_alive(), cosca::identity::Liveness::Dead);
-    }
+    let zombie = cosca::Process::open(p.id())
+        .expect("open")
+        .expect("an unreaped zombie opens as Some");
+    assert_eq!(zombie.is_alive(), cosca::identity::Liveness::Dead);
     raw.wait().expect("reap the zombie");
 }
 

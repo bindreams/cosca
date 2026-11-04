@@ -142,7 +142,7 @@ impl Capture {
 
 impl Capture {
     /// The identity-checked sends by number: the tree walk on every unix, and on macOS also
-    /// the signals a held `os_process` sends (`src/os_process/macos.rs`).
+    /// the signals a held `os_process` sends.
     #[cfg(unix)]
     pub(crate) fn by_identity(&self) -> Vec<IdentityEntry> {
         BY_IDENTITY.with(|log| log.borrow().clone().expect("a live capture has a log"))

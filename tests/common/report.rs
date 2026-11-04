@@ -174,7 +174,6 @@ pub fn wait_for_the_dropped_trees_grandchild(mark: usize, message: &str) {
         Some(Liveness::Alive),
         "the grandchild must be alive when identified, so its exit is the containment kill's"
     );
-    // `None`: the grandchild is already gone.
     let grandchild = cosca::Process::open(id).expect("open the grandchild");
     if drop_skipped_its_kill(mark) {
         let killed = grandchild.as_ref().map_or(Ok(()), |g| g.kill());

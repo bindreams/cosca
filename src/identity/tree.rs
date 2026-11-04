@@ -2,13 +2,20 @@
 
 use super::{ProcessId, RawPid, Resolved};
 use crate::error::Error;
-use crate::process::Recursive;
+
+/// Whether a tree query descends recursively or returns only direct children.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recursive {
+    /// Only direct children (one level).
+    No,
+    /// All descendants (the whole subtree).
+    Yes,
+}
 
 impl ProcessId {
     /// The parent process, by identity. Identity-guarded against pid-reuse: a genuine parent
     /// predates this child, so a recycled `ppid` naming a process created AFTER it (later
-    /// token) is rejected by the same token rule as [`children`](Self::children) — sound,
-    /// modulo the per-OS same-tick residual the whole crate shares.
+    /// token) is rejected by the same token rule as [`children`](Self::children).
     ///
     /// `Ok(None)` means there is none: `self` has no parent (pid 1), the parent has exited, or
     /// `self` is gone or was recycled. It is never an answer to a question that could not be

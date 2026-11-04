@@ -205,7 +205,8 @@ mod test_spawn;
 mod test_frozen;
 
 pub mod process;
-pub use process::{Process, Recursive};
+pub use identity::Recursive;
+pub use process::Process;
 
 #[cfg(feature = "tokio")]
 pub mod tokio;

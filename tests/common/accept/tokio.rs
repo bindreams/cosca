@@ -39,7 +39,6 @@ pub async fn accept_or_die_async_also(
     }
     #[cfg(unix)]
     let target = cosca::tokio::Process::open(child.id()).expect("open the control target");
-    // `None`: the target is already gone.
     #[cfg(unix)]
     let target_exit = async {
         match &target {

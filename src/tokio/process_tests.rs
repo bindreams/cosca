@@ -1,9 +1,6 @@
-//! The async mirror's constructors. `open` is a one-line forward, which is exactly the shape where
-//! a mis-wired delegate (a swallowed error, `None` turned into a handle) survives every happy-path
-//! test; the two negative cases are here because they need crate-internal fixtures. The positive
-//! case is covered by `tests/tokio_foreign.rs`.
-//!
-//! Synchronous tests, no async runtime: `open` is synchronous by design.
+//! The async `Process::open` negative cases (error forwarded, `None` stays `None`); they need
+//! crate-internal fixtures. The positive case is `tests/tokio_foreign.rs`. Synchronous: `open` is
+//! not async.
 
 use super::Process;
 use crate::identity::ProcessId;

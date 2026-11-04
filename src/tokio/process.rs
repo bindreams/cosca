@@ -2,8 +2,8 @@
 //! synchronously; only the death-watch and the graceful pair are async (`tokio::wait`).
 //! NO stdio (its pipes belong to its real parent); acts through the handle reach the process
 //! opened, never a later holder of its pid, while the tree acts check each member's identity and
-//! then send by number (see [`Process`](crate::Process)); nothing here reaps (the real parent
-//! collects the zombie).
+//! then send by number, the root included, until the containment boundary takes the held handle
+//! (see [`Process`](crate::Process)); nothing here reaps (the real parent collects the zombie).
 
 use std::time::Duration;
 

@@ -303,8 +303,7 @@ fn an_identity_written_by_another_process_restores_and_names_that_process() {
     let live = ProcessId::of(child.id()).found().expect("the live child resolves");
     assert_eq!(restored, live, "the restored identity must be the child's identity");
     assert_eq!(restored.pid(), child.id());
-    // The restored identity opens, and querying through that handle finds the live child —
-    // the whole point of persisting it.
+    // The restored identity opens, and querying through that handle finds the live child.
     assert_eq!(restored.exists(), Existence::Present);
     let restored_handle = Process::open(restored)
         .expect("the restored identity opens")

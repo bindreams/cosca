@@ -101,3 +101,38 @@ fn open_of_a_denied_identity_is_unassessable_not_none() {
     assert_eq!(id.is_alive(), Liveness::Unknown);
     assert!(child.is_running(), "and it must still have been live throughout");
 }
+
+/// A handle with QUERY alone (no `SYNCHRONIZE`) cannot tell a running process from exit code 259:
+/// `is_alive` is `Unknown`, `wait_timeout` is the OS's `ERROR_ACCESS_DENIED`, and an exit proves
+/// itself, so `is_alive` reads `Dead` once the process is terminated.
+///
+/// Mutant: the refused look reads as `Alive`, as `Dead`, or as `Ok(false)` from `wait_timeout`.
+#[cfg(windows)]
+#[skuld::test]
+fn a_query_only_handle_is_unknown_while_running_and_dead_after_termination() {
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(a_query_only_handle_is_unknown_while_running_and_dead_after_termination),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
+    let child = crate::identity::windows_fixture::spawn_query_only(&done);
+    let id = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
+        .expect("the owned handle always yields an identity");
+    let p = Process::open(id)
+        .expect("QUERY alone opens")
+        .expect("a live process opens");
+
+    assert_eq!(p.is_alive(), Liveness::Unknown);
+    let Err(Error::Io(io)) = p.wait_timeout(std::time::Duration::ZERO) else {
+        panic!("a look at a running process without SYNCHRONIZE must be Io");
+    };
+    assert_eq!(
+        io.raw_os_error(),
+        Some(windows::Win32::Foundation::ERROR_ACCESS_DENIED.0 as i32),
+        "{io:?}"
+    );
+
+    child.terminate();
+    assert_eq!(p.is_alive(), Liveness::Dead);
+}

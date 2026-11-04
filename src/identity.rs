@@ -28,6 +28,7 @@ pub use persist::{Platform, ProcessIdRecord, RECORD_VERSION};
 
 #[path = "identity/tree.rs"]
 mod tree;
+pub use tree::Recursive;
 
 #[cfg_attr(windows, path = "identity/windows.rs")]
 #[cfg_attr(target_os = "linux", path = "identity/linux.rs")]

@@ -288,7 +288,7 @@ fn pid_zero_is_refused_unassessable() {
 #[skuld::test]
 fn a_pid_zero_identity_never_reaches_kill() {
     let bogus = crate::identity::ProcessId::from_parts_for_test(0, 1);
-    // Already-gone is success: the pid holds a process, but not the one named.
+    // The pid holds `kernel_task`, not the process this identity names: nothing opens.
     assert!(
         open(bogus).expect("a pid-0 identity resolves to a stranger").is_none(),
         "a pid-0 identity opens nothing"

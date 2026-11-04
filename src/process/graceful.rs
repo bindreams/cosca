@@ -1,6 +1,8 @@
 //! Foreign `Process` graceful shutdown — the soft-then-hard escalation trio over a process
 //! the crate does not own (no stdio, no reap). Lone ops are identity-bound and surface real
-//! failures; tree ops are best-effort identity-walk sweeps (the `TreeWalk` contract).
+//! failures; tree ops are best-effort identity-walk sweeps (the `TreeWalk` contract). A tree op
+//! signals the root by number after an identity check, not through the held handle, until the
+//! containment boundary takes the handle.
 
 use std::time::Duration;
 

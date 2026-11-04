@@ -3,7 +3,8 @@
 //! it (`kill`, `terminate`, `wait*`, `graceful_shutdown`) reaches that process or reports it gone,
 //! never a later holder of its pid. The tree acts (`kill_tree`, `terminate_tree`,
 //! `graceful_shutdown_tree`) walk by identity: they check each member, then send by number, with
-//! the window principle 4 describes. `wait()` is a death-watch yielding no `ExitStatus` (the kernel
+//! the window principle 4 describes. The root is signalled the same way, by number after an
+//! identity check, until the containment boundary takes the held handle. `wait()` is a death-watch yielding no `ExitStatus` (the kernel
 //! hands exit status only to the real parent — contrast `Child::wait`). Its tree is
 //! [`ProcessId::children`] and [`ProcessId::parent`].
 
@@ -16,20 +17,12 @@ use crate::os_process::{Exit, OsProcess};
 #[path = "process/graceful.rs"]
 mod graceful;
 
-/// Whether a tree query descends recursively or returns only direct children.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Recursive {
-    /// Only direct children (one level).
-    No,
-    /// All descendants (the whole subtree).
-    Yes,
-}
-
 /// An open handle on a process, held since [`open`](Self::open). Acts through the handle
 /// (`kill`, `terminate`, `wait*`, `graceful_shutdown`) reach this process or report it gone; never
 /// a later holder of its pid. The tree acts (`kill_tree`, `terminate_tree`,
-/// `graceful_shutdown_tree`) check each member's identity, then send by number. Not `Clone`: open
-/// the [`ProcessId`] again.
+/// `graceful_shutdown_tree`) check each member's identity, then send by number, the root included
+/// (not through this handle) until the containment boundary takes it. Not `Clone`: open the
+/// [`ProcessId`] again.
 #[derive(Debug)]
 pub struct Process {
     id: ProcessId,
@@ -82,7 +75,10 @@ impl Process {
         match self.os.exited() {
             Ok(Exit::Exited) => Liveness::Dead,
             Ok(Exit::Running(_)) => Liveness::Alive,
-            Err(_) => Liveness::Unknown,
+            Err(e) => {
+                log::debug!("is_alive: reading the exit state of pid {} failed: {e}", self.id.pid());
+                Liveness::Unknown
+            }
         }
     }
 
