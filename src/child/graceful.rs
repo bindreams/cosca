@@ -152,13 +152,13 @@ impl Child {
         match self.kill_gate() {
             crate::elevation::front::Gate::Closed(unkillable) => return Err(unkillable),
             // An exit is permanent, so a refused signal to an exited front changes nothing.
-            crate::elevation::front::Gate::Exited => match self.proc.kill() {
+            crate::elevation::front::Gate::Exited => match self.kill_root() {
                 Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
                     log::debug!("the kill of exited front pid {} was refused ({e})", self.id.pid());
                 }
-                other => other.map_err(Error::Io)?,
+                other => other.map(drop).map_err(Error::Io)?,
             },
-            crate::elevation::front::Gate::Open => self.proc.kill().map_err(Error::Io)?,
+            crate::elevation::front::Gate::Open => self.kill_root().map(drop).map_err(Error::Io)?,
             // A live front in its cgroup: killed through it, and nothing signalled after it.
             crate::elevation::front::Gate::CgroupOnly => {
                 // A cgroup kill names no group by the root's pid, so no root is given.
@@ -170,7 +170,7 @@ impl Child {
             }
         }
         #[cfg(not(unix))]
-        self.proc.kill().map_err(Error::Io)?;
+        self.kill_root().map(drop).map_err(Error::Io)?;
         #[cfg(test)]
         fault::run_hook(fault::HookPoint::BeforeReap);
         let status = self.wait()?;
@@ -297,7 +297,7 @@ impl Child {
         // This handle's reaps are held off from the look until the `SIGTERM` is sent; the paths that
         // send nothing by the root's number wait the grace without it.
         #[cfg(unix)]
-        let held = self.proc.hold_reaps();
+        let held = self.proc.hold(self.id.pid());
         #[cfg(unix)]
         let group = held.group();
         #[cfg(not(unix))]
@@ -491,8 +491,7 @@ impl Child {
             exited,
             || self.kill_gate(),
             || {
-                self.proc
-                    .kill_sent()
+                self.kill_root()
                     .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper()))
             },
         )

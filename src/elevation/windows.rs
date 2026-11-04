@@ -225,7 +225,6 @@ use windows::Win32::UI::Shell::{
 };
 
 use crate::child::owned::OwnedChild;
-use crate::child::proc_handle::ProcHandle;
 use crate::child::spawn::windows_raw::resolve::ensure_no_nul_wide;
 use crate::child::spawn::{Classify, SpawnFailure};
 use crate::containment::Attachment;
@@ -603,7 +602,7 @@ pub(crate) fn spawn_elevated(cmd: &mut Command, kill_on_drop: bool) -> Result<cr
         }
         RunasOutcome::Launched { proc, pid, id, report } => {
             let mut child = crate::child::Child::from_parts(
-                ProcHandle::std(OwnedChild::new(Box::new(WindowsProcess::for_child(proc, pid))), pid),
+                OwnedChild::new(Box::new(WindowsProcess::for_child(proc, pid))),
                 id,
                 BTreeMap::new(),
                 kill_on_drop,

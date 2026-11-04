@@ -147,8 +147,9 @@ impl OsProcess for WindowsProcess {
             Sig::Kill => match windows_terminate_held(self.raw()) {
                 Termination::Terminated => Ok(Sent::Delivered),
                 Termination::Exited => Ok(Sent::Gone),
+                // The caller that goes on to report the refusal warns of it: a refusal warns once.
                 Termination::Failed(e) => {
-                    log::warn!("wait: TerminateProcess(pid {}) failed ({e})", self.pid);
+                    log::debug!("wait: TerminateProcess(pid {}) failed ({e})", self.pid);
                     Err(Error::Io(win32_io_error(e)))
                 }
             },

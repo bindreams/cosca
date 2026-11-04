@@ -13,10 +13,10 @@ use std::os::fd::{AsFd as _, OwnedFd};
 use std::os::unix::process::ExitStatusExt as _;
 use std::rc::Rc;
 
-use crate::child::fault::record_root_teardowns;
 use crate::child::front_kill_tests::{
     assert_ends_unsignalled, assert_reaped_unsignalled, assert_refused_by, assert_unkillable_front, cat, spawn_as,
 };
+use crate::child::owned::seams::record_root_teardowns;
 use crate::command::Command;
 use crate::elevation::{Backend, ElevatedVia};
 use crate::test_groups::{cgroup, Group};

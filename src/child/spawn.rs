@@ -5,7 +5,6 @@ use std::collections::BTreeMap;
 use std::process::Stdio as StdStdio;
 
 use crate::child::owned::OwnedChild;
-use crate::child::proc_handle::ProcHandle;
 pub(crate) use crate::child::spawn::failure::{after_the_spawn, Classify, SpawnFailure};
 use crate::child::{Child, ParentEnd};
 use crate::command::{Command, CommandInput, EnvOp};
@@ -133,7 +132,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     let tree = (child.containment().can_teardown() && !front_closed).then(|| {
         // The hold names the root's group. The handle owns the child outright here, so no reap
         // can land.
-        let held = child.proc.hold_reaps();
+        let held = child.proc.hold(child.id.pid());
         child
             .attached
             .hard_kill_marking_unless_reaped(&view, &child.tree_killed, &held.group())
@@ -731,7 +730,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         pid,
     )));
 
-    let mut child = Child::from_parts(ProcHandle::std(owned, pid), id, parent_ends, kill_on_drop, attachment);
+    let mut child = Child::from_parts(owned, id, parent_ends, kill_on_drop, attachment);
     child.set_front(cmd.elevation_front());
     Ok(child)
 }

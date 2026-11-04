@@ -4,7 +4,6 @@
 use std::collections::BTreeMap;
 
 use crate::child::owned::OwnedChild;
-use crate::child::proc_handle::ProcHandle;
 use crate::containment::{Attached, Attachment, Containment};
 use crate::graceful::GracefulMechanism;
 use crate::identity::ProcessId;
@@ -19,7 +18,7 @@ const ABSENT_PID: u32 = 0x7fff_fffe;
 /// kill on drop.
 pub(crate) fn child_over(fake: &FakeProcess) -> Child {
     Child::from_parts(
-        ProcHandle::std(OwnedChild::new(Box::new(fake.clone())), ABSENT_PID),
+        OwnedChild::new(Box::new(fake.clone())),
         ProcessId::from_parts(ABSENT_PID, 1),
         BTreeMap::new(),
         false,

@@ -87,7 +87,6 @@ use windows::Win32::System::Threading::{
 };
 
 use crate::child::owned::{ChildWaitOutcome, OwnedChild};
-use crate::child::proc_handle::ProcHandle;
 use crate::child::spawn::{
     attach_or_fault, null_end, reject_batch_path, resolve_identity, resolve_stdio, spawn_lock, ChildEnd, Classify,
     ParentStd, PipeOwnership, SpawnFailure,
@@ -240,7 +239,7 @@ pub(crate) fn spawn_raw(
     };
 
     Ok(Child::from_parts(
-        ProcHandle::std(OwnedChild::new(Box::new(WindowsProcess::for_child(proc, pid))), pid),
+        OwnedChild::new(Box::new(WindowsProcess::for_child(proc, pid))),
         id,
         parent_ends,
         kill_on_drop,

@@ -352,7 +352,7 @@ mod on_windows {
                 // Released and resumed after the drop's kill.
                 let teardown = release_at_teardown_kill(&frozen, writer);
                 let remote = Remote::open(frozen.id().pid());
-                let teardowns = crate::test_frozen::record_root_teardowns();
+                let teardowns = crate::child::owned::seams::record_root_teardowns();
 
                 drop(frozen);
 
