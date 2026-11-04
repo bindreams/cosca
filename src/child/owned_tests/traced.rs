@@ -49,8 +49,8 @@ fn held() -> (crate::Child, std::io::PipeWriter) {
     (tracee, stdin)
 }
 
-/// Runs `tracee.wait()` on a thread and returns once that thread is about to block in its first
-/// `kevent`, with the knote registered: no event can be lost after that.
+/// Runs `tracee.wait()` on a thread and returns once that thread is about to block on its first
+/// `poll` of the reap kqueue, whose knote is registered: no event can be lost after that.
 fn wait_blocked<'s, G>(
     scope: &'s std::thread::Scope<'s, '_>,
     tracee: &'s crate::Child,
@@ -59,14 +59,14 @@ fn wait_blocked<'s, G>(
     let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
     let waiter = scope.spawn(move || {
         let _armed = arm();
-        let _blocked = test_hooks::on_kevent_round(0, move || _ = blocked_tx.send(()));
+        let _blocked = crate::wait::block_probe::on_blocking(move || _ = blocked_tx.send(()));
         tracee.wait()
     });
-    blocked_rx.recv().expect("the waiter must reach its blocking kevent");
+    blocked_rx.recv().expect("the waiter must reach its blocking poll");
     waiter
 }
 
-/// A `SharedChild::wait` blocked while a tracer holds the child stays blocked through the child's
+/// An `OwnedChild` wait blocked while a tracer holds the child stays blocked through the child's
 /// exit, and returns the status once the tracer hands the zombie back. `try_wait` meanwhile says
 /// running.
 ///

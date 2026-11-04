@@ -319,14 +319,10 @@ fn final_peek(pid: u32, unique: Option<u64>) -> io::Result<Waited> {
     Ok(settle(peek(pid, unique)?.0).unwrap_or(Waited::DeadlinePassed))
 }
 
-// For a waiter that drives the kqueue itself (the tokio backend's reap) =====
+// For a waiter that drives the kqueue itself (the sync and the tokio child's reap) =====
 
 /// Register on `kq` what [`await_reapable_on`] waits on. `Ok(true)` when the `EVFILT_PROC` receipt
 /// says `ESRCH`, so no `NOTE_EXIT` or `NOTE_REAP` will come.
-#[cfg_attr(
-    not(feature = "tokio"),
-    allow(dead_code, reason = "the only other consumer is the tokio backend's reap")
-)]
 pub(crate) fn register_exit_events(kq: &Kqueue, pid: u32) -> io::Result<bool> {
     register(kq, pid)
 }
@@ -334,10 +330,6 @@ pub(crate) fn register_exit_events(kq: &Kqueue, pid: u32) -> io::Result<bool> {
 /// Read every event pending on `kq` without blocking: whether one was the child `pid`'s
 /// `NOTE_REAP`, and whether one was its `NOTE_EXIT`. The events of the tracers `tracer` watches are
 /// neither.
-#[cfg_attr(
-    not(feature = "tokio"),
-    allow(dead_code, reason = "the only consumer is the tokio backend's reap")
-)]
 pub(crate) fn drain_exit_events(kq: &Kqueue, pid: u32, tracer: &mut TracerWatch) -> io::Result<(bool, bool)> {
     let mut events = [blank(); BATCH];
     let (mut reaped, mut exited) = (false, false);

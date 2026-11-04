@@ -11,6 +11,7 @@ use std::os::windows::io::{AsHandle, AsRawHandle, FromRawHandle, OwnedHandle};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::Threading::{PROCESS_ACCESS_RIGHTS, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE};
 
+use super::child::{OsChild, OsHandle, PeekOutcome, TryReapOutcome};
 use super::{Exit, OsProcess, WaitFor};
 use crate::error::{win32_io_error, Error};
 use crate::identity::{
@@ -18,6 +19,7 @@ use crate::identity::{
     ProcessId, Termination,
 };
 use crate::signal::{Sent, Sig};
+use crate::wait::exit_only::{self, Reap, Target};
 
 pub(crate) mod cancel;
 
@@ -43,6 +45,16 @@ impl WindowsProcess {
             handle: unsafe { OwnedHandle::from_raw_handle(handle.0 as _) },
             has_synchronize: granted.0 & PROCESS_SYNCHRONIZE.0 != 0,
         }))
+    }
+
+    /// The child `pid` that a spawn created, by the handle the spawn returned. That handle carries
+    /// every access, `SYNCHRONIZE` and `PROCESS_TERMINATE` included.
+    pub(crate) fn for_child(handle: OwnedHandle, pid: u32) -> Self {
+        Self {
+            pid,
+            handle,
+            has_synchronize: true,
+        }
     }
 
     fn raw(&self) -> HANDLE {
@@ -149,6 +161,27 @@ impl OsProcess for WindowsProcess {
             Ok(Look::Running) => Ok(Exit::Running(WaitFor::Signalled(self.handle.as_handle()))),
             Err(e) => Err(Error::Io(win32_io_error(e))),
         }
+    }
+
+    fn os_handle(&self) -> OsHandle<'_> {
+        self.handle.as_handle()
+    }
+}
+
+impl OsChild for WindowsProcess {
+    fn peek(&self) -> Result<PeekOutcome, Error> {
+        debug_assert!(self.has_synchronize, "a child's handle can be waited on");
+        exit_only::peek(&Target::Handle(self.handle.as_handle())).map_err(Error::Io)
+    }
+
+    fn try_reap(&self) -> Result<TryReapOutcome<'_>, Error> {
+        debug_assert!(self.has_synchronize, "a child's handle can be waited on");
+        let handle = self.handle.as_handle();
+        Ok(match exit_only::try_reap(&Target::Handle(handle)).map_err(Error::Io)? {
+            Reap::Reaped(record) => TryReapOutcome::Reaped(record),
+            Reap::Running => TryReapOutcome::Running(WaitFor::Signalled(handle)),
+            Reap::Foreign(foreign) => TryReapOutcome::Foreign(foreign),
+        })
     }
 }
 

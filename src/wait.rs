@@ -657,10 +657,37 @@ pub(crate) mod block_probe {
 
     thread_local! {
         static ARMED: RefCell<Vec<Option<Duration>>> = const { RefCell::new(Vec::new()) };
+        static ON_BLOCKING: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
     }
 
     pub(crate) fn record(armed: Option<Duration>) {
         ARMED.with(|a| a.borrow_mut().push(armed));
+    }
+
+    /// [`record`], for a thread about to make a blocking OS call on a descriptor or handle (`poll`,
+    /// `WaitForSingleObject`), and run the hook [`on_blocking`] armed.
+    pub(crate) fn record_blocking(armed: Option<Duration>) {
+        record(armed);
+        if let Some(hook) = ON_BLOCKING.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
+    }
+
+    /// Disarms an unfired [`on_blocking`] hook on drop.
+    #[must_use = "dropping this immediately disarms the hook; bind it for the probe's duration"]
+    pub(crate) struct Armed(());
+
+    impl Drop for Armed {
+        fn drop(&mut self) {
+            ON_BLOCKING.with(|h| *h.borrow_mut() = None);
+        }
+    }
+
+    /// Run `hook` on this thread just before its next blocking `poll` or `WaitForSingleObject`: the
+    /// thread has released every lock it took for the wait it is about to make.
+    pub(crate) fn on_blocking(hook: impl FnOnce() + 'static) -> Armed {
+        ON_BLOCKING.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+        Armed(())
     }
 
     /// Every timeout armed on this thread since the last call, in order.

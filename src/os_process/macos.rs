@@ -16,6 +16,7 @@ use crate::identity::{uniq_info, Existence, ProcessId, ReadPurpose, UniqRead};
 use crate::signal::{Sent, Sig};
 use kqueue::{Kqueue, Subscription};
 
+pub(crate) mod child;
 pub(crate) mod kqueue;
 
 extern "C" {

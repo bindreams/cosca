@@ -39,6 +39,12 @@ pub(crate) trait OsProcess: Send + Sync + fmt::Debug {
     /// Look at the process once, without blocking. A [`Exit::Running`] look carries what to wait
     /// on for the next change; the wait ends on any change, so look again after it.
     fn exited(&self) -> Result<Exit<'_>, Error>;
+
+    /// The OS object that names the process, lent to platform-only consumers (Job Objects, resume,
+    /// cgroup attach). A fake lends its own wake fd or event, which names no process: code that
+    /// uses a handle is tested against real processes.
+    #[cfg(any(target_os = "linux", windows))]
+    fn os_handle(&self) -> child::OsHandle<'_>;
 }
 
 /// What one look at a process found.

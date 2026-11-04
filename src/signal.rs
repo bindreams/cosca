@@ -232,22 +232,39 @@ pub(crate) fn identity_unreadable(pid: u32, errno: i32) -> crate::error::Error {
 }
 
 /// Send `sig` to `pid` by number, only while it still has the unique id `identity` (`None`: no id
-/// is held, so nothing is sent). Nothing is
-/// sent to a pid that is gone or reused. A refused re-read is an error carrying the errno, so an
-/// `EPERM` stays `PermissionDenied`. The window between the check and `kill(2)` is macOS's own: it
-/// has no handle to send through.
+/// is held, so nothing is sent). Nothing is sent to a pid that is gone or reused. A refused re-read
+/// is an error carrying the errno, so an `EPERM` stays `PermissionDenied`. The window between the
+/// check and `kill(2)` is macOS's own: it has no handle to send through.
 #[cfg(target_os = "macos")]
 pub(crate) fn via_verified_pid(pid: u32, identity: Option<u64>, sig: Sig) -> io::Result<Sent> {
+    let Some(expected) = identity else {
+        log::debug!("child {pid} holds no unique id; {sig:?} not sent");
+        return Ok(Sent::Unverified);
+    };
+    send_checked(pid, expected, sig, |e| io_context("kill", e))
+}
+
+/// [`via_verified_pid`] for a child whose unique id is held, with the bare errno of a refused
+/// `kill(2)`, for a caller that promises its own caller the raw errno.
+#[cfg(target_os = "macos")]
+pub(crate) fn send_verified_pid(pid: u32, unique: u64, sig: Sig) -> io::Result<Sent> {
+    send_checked(pid, unique, sig, |e| e)
+}
+
+/// The check and the send of [`via_verified_pid`]; `kill_error` shapes a refused `kill(2)`.
+#[cfg(target_os = "macos")]
+fn send_checked(
+    pid: u32,
+    expected: u64,
+    sig: Sig,
+    kill_error: impl FnOnce(io::Error) -> io::Error,
+) -> io::Result<Sent> {
     use crate::identity::{uniq_info, ReadPurpose, UniqRead};
     let unreadable = |errno: i32| {
         io_context(
             format!("pid {pid}: its identity could not be read; {sig:?} not sent"),
             io::Error::from_raw_os_error(errno),
         )
-    };
-    let Some(expected) = identity else {
-        log::debug!("child {pid} holds no unique id; {sig:?} not sent");
-        return Ok(Sent::Unverified);
     };
     match uniq_info(pid, ReadPurpose::Kill) {
         UniqRead::Found(now) if now.unique_id == expected => {}
@@ -282,7 +299,7 @@ pub(crate) fn via_verified_pid(pid: u32, identity: Option<u64>, sig: Sig) -> io:
             log::debug!("kill({pid}, {sig:?}): the child is already gone");
             Ok(Sent::Gone)
         }
-        Err(e) => Err(io_context("kill", e)),
+        Err(e) => Err(kill_error(e)),
     }
 }
 
