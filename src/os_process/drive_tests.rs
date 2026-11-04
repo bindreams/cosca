@@ -1,6 +1,6 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use super::{absolute, drive};
+use super::{absolute, exited_held, run, ProcessExit, RunOutcome};
 use crate::error::Error;
 use crate::identity::ProcessId;
 use crate::os_process::fake::{Answer, FakeProcess};
@@ -14,7 +14,7 @@ fn fake(exits: impl IntoIterator<Item = Answer>) -> FakeProcess {
 fn zero_timeout_looks_once_and_never_blocks() {
     block_probe::take();
     let p = fake([Answer::Running]);
-    assert!(!drive(&p, absolute(Some(Duration::ZERO))).unwrap());
+    assert!(!exited_held(&p, Some(Duration::ZERO)).unwrap());
     assert_eq!(p.looks(), 1);
     assert!(block_probe::take().is_empty(), "a zero timeout must not block");
 }
@@ -24,7 +24,7 @@ fn zero_timeout_looks_once_and_never_blocks() {
 fn a_failed_look_is_returned_without_blocking() {
     block_probe::take();
     let p = fake([Answer::Err(std::io::ErrorKind::PermissionDenied)]);
-    let err = drive(&p, absolute(None)).unwrap_err();
+    let err = exited_held(&p, None).unwrap_err();
     assert!(
         matches!(&err, Error::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied),
         "{err:?}"
@@ -37,7 +37,7 @@ fn a_failed_look_is_returned_without_blocking() {
 fn exited_before_first_look_returns_true_without_blocking() {
     block_probe::take();
     let p = fake([Answer::Exited]);
-    assert!(drive(&p, absolute(None)).unwrap());
+    assert!(exited_held(&p, None).unwrap());
     assert_eq!(p.looks(), 1);
     assert!(block_probe::take().is_empty());
 }
@@ -47,7 +47,7 @@ fn wakes_and_looks_again() {
     block_probe::take();
     let p = fake([Answer::Running, Answer::Exited]);
     p.wake();
-    assert!(drive(&p, absolute(Some(Duration::from_secs(60)))).unwrap());
+    assert!(exited_held(&p, Some(Duration::from_secs(60))).unwrap());
     assert_eq!(p.looks(), 2);
     assert_eq!(block_probe::take().len(), 1, "one wait, between the two looks");
 }
@@ -64,7 +64,7 @@ fn expiry_ends_in_one_final_look() {
             test_clock::advance(Duration::from_secs(11));
         }
     });
-    assert!(!drive(&p, absolute(Some(timeout))).unwrap());
+    assert!(!exited_held(&p, Some(timeout)).unwrap());
     assert_eq!(p.looks(), 2);
     let last = *p.look_times().last().unwrap();
     assert!(last > start + timeout, "the final look must come after the deadline");
@@ -80,7 +80,7 @@ fn duration_max_is_unbounded() {
     block_probe::take();
     let p = fake([Answer::Running, Answer::Exited]);
     p.wake();
-    assert!(drive(&p, absolute(Some(Duration::MAX))).unwrap());
+    assert!(exited_held(&p, Some(Duration::MAX)).unwrap());
     assert_eq!(
         block_probe::take(),
         [None],
@@ -101,7 +101,7 @@ fn looks_and_a_signal_on_one_process_run_from_two_threads() {
     let process = open(id).unwrap().expect("a live process opens");
     let p: &dyn OsProcess = &*process;
     std::thread::scope(|scope| {
-        let waiter = scope.spawn(|| drive(p, absolute(None)));
+        let waiter = scope.spawn(|| exited_held(p, None));
         let killer = scope.spawn(|| p.signal(Sig::Kill));
         assert!(waiter.join().unwrap().unwrap(), "the wait ends when the process exits");
         let sent = killer.join().unwrap().unwrap();
@@ -117,7 +117,7 @@ mod windows {
 
     use std::time::{Duration, Instant};
 
-    use super::{absolute, drive};
+    use super::exited_held;
     use crate::os_process::drive::exited_by_id;
     use crate::os_process::open;
     use crate::test_child::live_blocker as blocker;
@@ -138,7 +138,7 @@ mod windows {
         wait_ms_probe::take();
         let _override = remaining_override_seam::set(Duration::from_micros(500));
         let deadline = at + Duration::from_millis(5);
-        let result = drive(&*process, absolute(Some(Duration::from_millis(5))));
+        let result = exited_held(&*process, Some(Duration::from_millis(5)));
         let reached = Instant::now() >= deadline;
         let arms = wait_ms_probe::take();
         drop(stdin);
@@ -185,7 +185,7 @@ mod windows {
         wait_ms_probe::take();
         let _override = remaining_override_seam::set(Duration::from_micros(500));
         wait_ms_probe::on_second_arm(move || drop(stdin)); // EOF -> the blocker exits for real
-        let result = drive(&*process, absolute(Some(Duration::from_secs(3600))));
+        let result = exited_held(&*process, Some(Duration::from_secs(3600)));
         let arms = wait_ms_probe::take();
         let exited = result.expect("a genuinely-terminated child must not report a wait failure");
         child.wait().expect("reap the child after it exits");
@@ -204,7 +204,7 @@ mod windows {
         wait_ms_probe::take();
         let _clamp = wait_clamp_seam::set(5);
         wait_ms_probe::on_second_arm(move || drop(stdin));
-        let result = drive(&*process, absolute(Some(Duration::from_secs(3600))));
+        let result = exited_held(&*process, Some(Duration::from_secs(3600)));
         let arms = wait_ms_probe::take();
         let exited = result.expect("a genuinely-terminated child must not report a wait failure");
         child.wait().expect("reap the child after it exits");
@@ -222,7 +222,7 @@ mod windows {
         let process = open(id).unwrap().expect("a live process opens");
         let (_clock, at) = FrozenClockGuard::install();
         let deadline = at + Duration::from_millis(50);
-        let result = drive(&*process, absolute(Some(Duration::from_millis(50))));
+        let result = exited_held(&*process, Some(Duration::from_millis(50)));
         let reached = Instant::now() >= deadline;
         drop(stdin);
         child.wait().expect("reap the blocker");
@@ -282,4 +282,116 @@ fn exited_held_zero_is_one_look() {
     let exited = fake([Answer::Exited]);
     assert!(super::exited_held(&exited, Some(Duration::ZERO)).unwrap());
     assert_eq!(exited.looks(), 1);
+}
+
+// `run` =====
+
+/// `run` over a fake's looks, against `deadline`.
+fn run_fake(p: &FakeProcess, deadline: Option<Instant>) -> Result<RunOutcome<()>, Error> {
+    run(&mut ProcessExit(p), deadline)
+}
+
+/// Mutant: block before the first look.
+#[skuld::test]
+fn run_returns_done_without_blocking() {
+    block_probe::take();
+    let p = fake([Answer::Exited]);
+    assert!(matches!(run_fake(&p, absolute(None)).unwrap(), RunOutcome::Done(())));
+    assert_eq!(p.looks(), 1);
+    assert!(block_probe::take().is_empty());
+}
+
+/// Mutant: return after the wake without looking again, or look twice per wake.
+#[skuld::test]
+fn run_blocks_on_the_wait_the_look_returned_then_looks_again() {
+    block_probe::take();
+    let p = fake([Answer::Running, Answer::Exited]);
+    p.wake();
+    assert!(matches!(
+        run_fake(&p, absolute(Some(Duration::from_secs(60)))).unwrap(),
+        RunOutcome::Done(())
+    ));
+    assert_eq!(p.looks(), 2);
+    assert_eq!(block_probe::take().len(), 1, "one block, between the two looks");
+}
+
+/// Mutant: block once before honouring a deadline that has already passed.
+#[skuld::test]
+fn run_with_an_expired_deadline_looks_once() {
+    block_probe::take();
+    let (_clock, start) = test_clock::FrozenClockGuard::install();
+    let p = fake([Answer::Running]);
+    assert!(matches!(run_fake(&p, Some(start)).unwrap(), RunOutcome::DeadlinePassed));
+    assert_eq!(p.looks(), 1);
+    assert!(block_probe::take().is_empty(), "a passed deadline arms nothing");
+}
+
+/// The clock passes the deadline at the start of the second look, after one block. That look has
+/// no time left to block in, so the next is the last: it returns, and nothing is armed after it.
+///
+/// Mutant: block (or loop) again after the deadline; mutant: return at the look that saw the clock
+/// pass, without the final look.
+#[skuld::test]
+fn run_takes_one_final_look_at_the_deadline_and_starts_no_round() {
+    block_probe::take();
+    let (_clock, start) = test_clock::FrozenClockGuard::install();
+    let timeout = Duration::from_secs(10);
+    let p = fake([Answer::Running, Answer::Running, Answer::Running]);
+    p.wake();
+    p.on_look(|n| {
+        if n == 1 {
+            test_clock::advance(Duration::from_secs(11));
+        }
+    });
+    assert!(matches!(
+        run_fake(&p, absolute(Some(timeout))).unwrap(),
+        RunOutcome::DeadlinePassed
+    ));
+    assert_eq!(p.looks(), 3);
+    assert!(*p.look_times().last().unwrap() > start + timeout);
+    assert_eq!(
+        block_probe::take().len(),
+        1,
+        "only the block before the deadline passed"
+    );
+}
+
+/// Mutant: arm the whole timeout each round, not what is left of it.
+#[skuld::test]
+fn run_arms_each_block_with_at_most_the_time_remaining() {
+    block_probe::take();
+    let (_clock, _start) = test_clock::FrozenClockGuard::install();
+    let p = fake([Answer::Running, Answer::Running, Answer::Exited]);
+    p.wake();
+    // 3 s of the 10 s pass at the start of each of the first two looks.
+    p.on_look(|n| {
+        if n < 2 {
+            test_clock::advance(Duration::from_secs(3));
+        }
+    });
+    assert!(matches!(
+        run_fake(&p, absolute(Some(Duration::from_secs(10)))).unwrap(),
+        RunOutcome::Done(())
+    ));
+    let armed: Vec<Duration> = block_probe::take().into_iter().map(|a| a.expect("bounded")).collect();
+    assert_eq!(armed.len(), 2, "{armed:?}");
+    assert!(armed[0] <= Duration::from_secs(7), "{armed:?}");
+    assert!(armed[1] <= Duration::from_secs(4), "{armed:?}");
+    assert!(armed[1] < armed[0], "{armed:?}");
+}
+
+/// Mutant: no clamp on the armed time, so a far deadline arms its whole distance.
+#[skuld::test]
+fn run_arms_a_deadline_beyond_the_block_limit_in_pieces() {
+    block_probe::take();
+    let p = fake([Answer::Running, Answer::Exited]);
+    p.wake();
+    let far = absolute(Some(Duration::from_secs(u64::from(u32::MAX)))).expect("the clock reaches 136 years");
+    assert!(matches!(run_fake(&p, Some(far)).unwrap(), RunOutcome::Done(())));
+    let armed = block_probe::take();
+    assert!(!armed.is_empty(), "the wait must have blocked");
+    for a in armed {
+        let a = a.expect("a deadline wait arms a bounded block");
+        assert!(a <= crate::wait::MAX_BLOCK, "armed {a:?}");
+    }
 }
