@@ -306,7 +306,7 @@ pub(crate) mod seams {
     }
 }
 
-/// The [`proc_view`] and fdinfo forcing seams.
+/// The [`proc_view_with`] and fdinfo forcing seams.
 #[cfg(all(target_os = "linux", test))]
 pub(crate) use backend::proc_view::{fault as proc_view_fault, openat2_refused_message};
 
