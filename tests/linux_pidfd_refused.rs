@@ -33,11 +33,9 @@ fn assert_refused(result: Result<impl std::fmt::Debug, Error>, op: &str, errno: 
     }
 }
 
-/// The refusal fails the open, once, naming it; an owned `Child` terminates, shuts down and kills
-/// through its own handle, so it needs no `pidfd_open` and meets no refusal.
+/// The refusal fails the open, once, naming it, for every way of opening a process.
 ///
 /// Mutants: an errno missing from the refusals; an op named as another; the message shape;
-/// `Child::kill`, `terminate` or the graceful grace wait routed through `pidfd_open`;
 /// `Process::current` built without an open.
 #[cfg(target_os = "linux")]
 #[skuld::test]
@@ -51,8 +49,58 @@ fn a_seccomp_refused_pidfd_open_fails_the_open_naming_process_open() {
                     assert_refused(cosca::Process::open_pid(child.id().pid()), "process open", name);
                     assert_refused(cosca::Process::open(child.id()), "process open", name);
                     assert_refused(cosca::Process::current(), "process open", name);
-                    // An owned child acts through its own handle: no pidfd_open, so no refusal.
+                })
+                .join()
+                .expect("the filtered thread");
+        });
+        common::kill_release_reap(&child, control);
+    }
+}
+
+/// An owned `Child` terminates through its own handle, so it needs no `pidfd_open` and meets no
+/// refusal: the `SIGTERM` lands. The control socket is released only after `terminate` returns, so
+/// a `terminate` that sent nothing leaves an exit 0.
+///
+/// Mutant: `Child::terminate` routed through `pidfd_open`, or sending nothing.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_child_terminates_through_its_own_handle_under_a_refused_pidfd_open() {
+    for (code, _) in REFUSALS {
+        let (child, control) = common::spawn_blocker();
+        std::thread::scope(|scope| {
+            let child = &child;
+            scope
+                .spawn(move || {
+                    common::seccomp::deny_pidfd_open_on_this_thread(code);
                     child.terminate().expect("Child::terminate needs no pidfd_open");
+                    drop(control);
+                })
+                .join()
+                .expect("the filtered thread");
+        });
+        let status = child.wait().expect("reap the terminated child");
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(libc::SIGTERM),
+            "the child dies of the terminate sent through its own handle: {status:?}"
+        );
+    }
+}
+
+/// An owned `Child` shuts down gracefully and kills through its own handle under a refused
+/// `pidfd_open`.
+///
+/// Mutant: `Child::graceful_shutdown` or `Child::kill` (or the grace wait) routed through
+/// `pidfd_open`.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_child_shuts_down_and_kills_through_its_own_handle_under_a_refused_pidfd_open() {
+    for (code, _) in REFUSALS {
+        let (child, control) = common::spawn_blocker();
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    common::seccomp::deny_pidfd_open_on_this_thread(code);
                     child
                         .graceful_shutdown(Duration::ZERO)
                         .expect("Child::graceful_shutdown needs no pidfd_open");
@@ -61,13 +109,11 @@ fn a_seccomp_refused_pidfd_open_fails_the_open_naming_process_open() {
                 .join()
                 .expect("the filtered thread");
         });
-        // The terminate above reached the child through its handle, so it died of SIGTERM.
         drop(control);
-        let status = child.wait().expect("reap the terminated child");
-        assert_eq!(
-            std::os::unix::process::ExitStatusExt::signal(&status),
-            Some(libc::SIGTERM),
-            "the child dies of the terminate sent through its own handle: {status:?}"
+        let status = child.wait().expect("reap the ended child");
+        assert!(
+            std::os::unix::process::ExitStatusExt::signal(&status).is_some(),
+            "the child was ended by a signal: {status:?}"
         );
     }
 }
