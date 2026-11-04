@@ -510,13 +510,13 @@ fn teardown_spawned(
     id: Option<crate::identity::ProcessId>,
     warn_after: Option<std::time::Duration>,
 ) -> ChildFate {
-    // Windows only, so the std path's invariant does NOT carry: there is no zombie to reap and the
-    // wait is a bare `WaitForSingleObject(handle, INFINITE)`. If the kill failed, nothing asked the
-    // child to exit and that wait would park forever - a logged, leaked child is strictly better.
-    // `wait_warning` owns the one wait.
-    if let Err(e) = child.signal(Sig::Kill) {
-        log::warn!("raw spawn teardown: kill of pid {pid} failed: {e}; not waiting");
-        return ChildFate::Running { id };
+    // A failed kill asked nothing to exit, so the wait would park forever: log and leak instead.
+    if let Err(refused) = child.signal(Sig::Kill) {
+        let looked = child.look_after_refused_kill(pid, id, refused);
+        if let Some(left) = &looked.left {
+            log::warn!("raw spawn teardown: {left}");
+        }
+        return looked.fate;
     }
     // A fixture only that kill would end is released here.
     #[cfg(test)]

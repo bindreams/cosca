@@ -8,8 +8,8 @@ use std::time::Duration;
 use windows::core::HRESULT;
 use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, HANDLE};
 use windows::Win32::System::Threading::{
-    CreateEventW, OpenProcess, TerminateProcess, CREATE_SUSPENDED, EXTENDED_STARTUPINFO_PRESENT,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, STARTUPINFOEXW,
+    OpenProcess, TerminateProcess, CREATE_SUSPENDED, EXTENDED_STARTUPINFO_PRESENT, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SYNCHRONIZE, STARTUPINFOEXW,
 };
 
 use super::proc::create_process;
@@ -219,31 +219,61 @@ fn raw_spawn_teardown_with_an_exit_under_way_and_a_failed_wait_is_killed() {
     assert_eq!(fake.looks(), 1, "the teardown made the wait that failed");
 }
 
-/// A failed spawn's teardown whose `TerminateProcess` fails outright (here on an event handle, which
-/// answers `ERROR_INVALID_HANDLE`) asked nothing to exit: it logs and answers `Running { id }`
-/// without waiting, and warns of the refusal once.
+/// A failed spawn's teardown whose `TerminateProcess` is denied on a live child (the handle lacks
+/// `PROCESS_TERMINATE`) asked nothing to exit: it looks once, never waits, answers `Running { id }`
+/// and warns of the refusal once.
 ///
-/// Mutants: the failed-kill arm falls through to the wait; the failed `TerminateProcess` is warned
-/// of where it is made, as well as by the teardown.
+/// Mutants: the failed-kill arm falls through to the wait; it answers without the look; the failed
+/// `TerminateProcess` is warned of where it is made, as well as by the teardown.
 #[skuld::test]
-fn raw_spawn_teardown_with_a_failed_terminate_is_running_and_does_not_wait() {
+fn raw_spawn_teardown_with_a_denied_terminate_is_running_and_does_not_wait() {
     let owner = Suspended::spawn();
     let id = owner.id();
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
-    // SAFETY: a fresh unnamed manual-reset event, signaled; the returned handle is ours alone.
-    let event = unsafe { CreateEventW(None, true, true, None) }.expect("create an event");
-    // SAFETY: `event` is a fresh owned handle from `CreateEventW`.
-    let event = unsafe { OwnedHandle::from_raw_handle(event.0) };
-    let (child, fake) = owned(real(event, owner.pid));
+    let (child, fake) = owned(real(owner.without_terminate_right(), owner.pid));
+    // Ends the process once a wait blocks, so a teardown that waits fails the checks below instead of
+    // hanging.
+    let _end = crate::wait::block_probe::on_blocking(owner.end_with_code_zero());
     let fate = teardown_spawned(&child, owner.pid, Some(id), None);
     assert_eq!(fate, ChildFate::Running { id: Some(id) });
-    assert_eq!(fake.looks(), 0, "a kill that failed must not be followed by a wait");
+    assert_eq!(fake.looks(), 1, "one look, and no wait");
+    assert_eq!(
+        crate::wait::block_probe::take(),
+        [],
+        "a failed kill is never followed by a wait"
+    );
     let warned = crate::log_capture::records_since_on_current_thread(mark, &owner.pid.to_string())
         .into_iter()
         .filter(|(level, _)| *level <= log::Level::Warn)
         .collect::<Vec<_>>();
     assert_eq!(warned.len(), 1, "one warn for one refusal: {warned:?}");
+}
+
+/// A failed spawn's teardown whose kill fails on a child that has exited collects it from the look
+/// and warns of nothing.
+///
+/// Mutant: the failed-kill arm answers `Running` without looking, and warns.
+#[skuld::test]
+fn raw_spawn_teardown_with_a_failed_terminate_of_an_exited_child_is_reaped_silently() {
+    let owner = Suspended::spawn();
+    let id = owner.id();
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let fake = FakeProcess::new([])
+        .reaps([ReapAnswer::Reaped(ExitRecord::Status(
+            std::process::ExitStatus::default(),
+        ))])
+        .signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))]);
+    let (child, fake) = owned(fake);
+    let fate = teardown_spawned(&child, owner.pid, Some(id), None);
+    assert_eq!(fate, ChildFate::Reaped);
+    assert_eq!(fake.looks(), 1);
+    let warned = crate::log_capture::records_since_on_current_thread(mark, &owner.pid.to_string())
+        .into_iter()
+        .filter(|(level, _)| *level <= log::Level::Warn)
+        .collect::<Vec<_>>();
+    assert_eq!(warned, [], "nothing is left running");
 }
 
 /// As `..._with_an_exit_under_way_and_a_failed_wait_is_killed`, but the kill is delivered to a live

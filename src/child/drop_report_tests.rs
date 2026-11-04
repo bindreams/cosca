@@ -161,7 +161,7 @@ fn a_retry_that_fails_anew_warns_of_the_new_failure() {
         "{warns:?}"
     );
     assert!(
-        warns[1].starts_with("Child::drop:") && warns[1].contains("could not be terminated on drop"),
+        warns[1].starts_with("Child::drop:") && warns[1].contains("could not be terminated"),
         "the retry's own refusal is warned of: {warns:?}"
     );
     drop(refused);

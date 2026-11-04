@@ -60,7 +60,7 @@ impl OwnedChild {
                     Err(outcome) => outcome,
                 }
             }
-            Err(refused) => self.look_after_refused_kill(id, refused),
+            Err(refused) => self.look_after_refused_kill(pid, Some(id), refused),
         }
     }
 
@@ -108,9 +108,9 @@ impl OwnedChild {
         }
     }
 
-    /// The one look after a kill that failed with `refused`, never a wait.
-    fn look_after_refused_kill(&self, id: ProcessId, refused: Error) -> TeardownOutcome {
-        let pid = id.pid();
+    /// The one look after a kill that failed with `refused`, never a wait. `id` is the child's
+    /// identity, if the caller read one.
+    pub(crate) fn look_after_refused_kill(&self, pid: u32, id: Option<ProcessId>, refused: Error) -> TeardownOutcome {
         // A child reaped elsewhere is read from the typed outcome, so it is `Gone` on every OS: the
         // error `status_of_outcome` renders it as is `ECHILD` on Unix only.
         let (fate, look_failure) = match self.wait(Some(crate::wait::now())) {
@@ -118,18 +118,17 @@ impl OwnedChild {
             looked => {
                 let looked = looked.and_then(|outcome| status_of_outcome(pid, outcome, Orphaned::Quiet));
                 let failure = looked.as_ref().err().map(ToString::to_string);
-                let fate =
-                    crate::child::spawn::fate_of_a_look(looked.map_err(|e| e.into_io().raw_os_error()), Some(id));
+                let fate = crate::child::spawn::fate_of_a_look(looked.map_err(|e| e.into_io().raw_os_error()), id);
                 (fate, failure)
             }
         };
         // Only a child still running is "left"; a look that found it reaped elsewhere warns nothing.
         let left = match (&fate, look_failure) {
             (ChildFate::Running { .. }, _) => Some(format!(
-                "child {pid} could not be terminated on drop ({refused}); leaving it running"
+                "child {pid} could not be terminated ({refused}); leaving it running"
             )),
             (ChildFate::Unknown, Some(failure)) => Some(format!(
-                "child {pid} could not be terminated on drop ({refused}), and the look at it failed: {failure}"
+                "child {pid} could not be terminated ({refused}), and the look at it failed: {failure}"
             )),
             _ => None,
         };
