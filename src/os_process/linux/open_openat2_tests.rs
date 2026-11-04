@@ -29,7 +29,7 @@ fn open_verified_is_unsupported_naming_openat2_when_it_is_unavailable() {
     }
 }
 
-/// The `pidfd_open`-refused arm asks [`proc_view`](crate::identity::proc_view).
+/// The `pidfd_open`-refused arm asks [`proc_view_with`](crate::identity::proc_view_with).
 /// Mutant: "`verify_without_pidfd` reports an unopenable `/proc` as `Unassessable`".
 #[skuld::test]
 fn open_verified_without_a_pidfd_is_unsupported_naming_openat2_when_it_is_unavailable() {
