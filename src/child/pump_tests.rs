@@ -209,3 +209,19 @@ fn fixture_communicate_with_pending_sigpipe() {
         );
     }
 }
+
+// Grandchild =====
+
+/// A grandchild that inherited stdout and outlives the child keeps `communicate` waiting until it
+/// closes it: everything it prints is collected. The grandchild reads a copy of the child's stdin, so
+/// it proceeds only once `communicate` has closed that pipe and the child has exited and let go of
+/// its own copy.
+///
+/// Mutant: `communicate` returns once the child has exited.
+#[skuld::test]
+fn a_grandchild_holding_stdout_keeps_communicate_waiting() {
+    let mut child = sh("exec 3<&0; (cat <&3 >/dev/null; echo late) & echo early");
+    let out = child.communicate(None).expect("communicate");
+    assert!(out.status.success());
+    assert_eq!(out.stdout, b"early\nlate\n");
+}
