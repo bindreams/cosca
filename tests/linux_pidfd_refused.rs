@@ -61,7 +61,14 @@ fn a_seccomp_refused_pidfd_open_fails_the_open_naming_process_open() {
                 .join()
                 .expect("the filtered thread");
         });
-        common::kill_release_reap(&child, control);
+        // The terminate above reached the child through its handle, so it died of SIGTERM.
+        drop(control);
+        let status = child.wait().expect("reap the terminated child");
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(libc::SIGTERM),
+            "the child dies of the terminate sent through its own handle: {status:?}"
+        );
     }
 }
 
