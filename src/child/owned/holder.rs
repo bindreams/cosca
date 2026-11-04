@@ -4,9 +4,9 @@
 use super::{Guard, OwnedChild, State};
 
 /// Arms the holder. Its `Drop`, which runs only if [`finish`](HolderGuard::finish) never did,
-/// restores `N` and wakes the waiters, **only if the state is still its own `W`**: another
-/// holder's `W` is left alone. It covers an `Err`, a `?` and a panic, before or after the
-/// re-lock.
+/// restores `N` and wakes the waiters. It covers an `Err`, a `?` and a panic, before or after
+/// the re-lock. Nothing else writes `State` while this holder's `W` is held, so `Drop` finding
+/// another state is a contract violation (a debug assertion).
 ///
 /// It owns the re-taken lock too: [`relock`](HolderGuard::relock) stores the `MutexGuard` back,
 /// and `Drop` uses it when there is one and locks only when there is none, so a panic after the
@@ -92,9 +92,13 @@ impl Drop for HolderGuard<'_> {
             return;
         }
         let mut lock = self.lock.take().unwrap_or_else(|| self.sc.lock());
-        if matches!(lock.state, State::W { token } if token == self.token) {
-            lock.set(State::N);
-            self.sc.notify(&mut lock);
-        }
+        debug_assert!(
+            matches!(lock.state, State::W { token } if token == self.token),
+            "the holder was dropped over the state {:?}, not its own W {{ token: {} }}",
+            lock.state,
+            self.token
+        );
+        lock.set(State::N);
+        self.sc.notify(&mut lock);
     }
 }

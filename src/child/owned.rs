@@ -19,10 +19,9 @@
 //! - Every lock is taken poison-tolerantly (`lock().unwrap_or_else(PoisonError::into_inner)`),
 //!   `Condvar` results included. `Debug` alone uses `try_lock`.
 //! - Every state write calls `notify_all` ([`Inner::set`], then [`OwnedChild::notify`]).
-//! - The holder is armed by a [`HolderGuard`] whose `Drop` restores `N` (and wakes the waiters)
-//!   only if the state is still its own `W`: an `Err`, a `?` or a panic can never strand the
-//!   waiters, and a normal return can never restore `N` under a new holder, because
-//!   [`HolderGuard::finish`] consumes the guard.
+//! - The holder is armed by a [`HolderGuard`] whose `Drop` restores `N` (and wakes the waiters):
+//!   an `Err`, a `?` or a panic can never strand the waiters, and a normal return can never
+//!   restore `N` under a new holder, because [`HolderGuard::finish`] consumes the guard.
 //! - A holder re-reads the state after it re-locks, before it acts on a look.
 //! - Every timed block is clamped and looped ([`crate::wait::clamp_block`], and `drive::run` for the
 //!   holder's), and after every wake `crate::wait::now() >= deadline` decides expiry, never the
