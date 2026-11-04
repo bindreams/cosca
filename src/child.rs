@@ -414,30 +414,26 @@ impl Child {
     /// torn down (killed through, with a failed kill retried, drained, removed), and then the front
     /// is looked at through [`tear_down`](OwnedChild::tear_down), which waits for it only if its
     /// place says the kill reached it. The leaf's subtree is captured while the leaf exists, since
-    /// it places the front once the leaf is gone. A front left running is warned of with `why`.
+    /// it places the front once the leaf is gone. A front left behind is worded here, with `why`.
     #[cfg(unix)]
     fn tear_down_leaf_and_look_at_front(&mut self, why: &dyn std::fmt::Display) -> TeardownOutcome {
         use crate::child::owned::teardown::Reach;
-        use crate::child::spawn::FrontFate;
 
         #[cfg(target_os = "linux")]
         let subtree = match &self.attached {
-            crate::containment::Attached::Cgroup(leaf) => Some(leaf.subtree()),
+            crate::containment::Attached::Cgroup(leaf) => {
+                Some(crate::containment::cgroup::LeafSubtree::of(leaf.subtree()))
+            }
             _ => None,
         };
         drop(std::mem::take(&mut self.attached));
         #[cfg(target_os = "linux")]
-        let reach: Option<&dyn Reach> = match &subtree {
-            Some(Ok(subtree)) => Some(subtree),
-            // A leaf whose subtree cannot be read cannot place the front.
-            Some(Err(e)) => Some(e),
-            None => None,
-        };
+        let reach: Option<&dyn Reach> = subtree.as_ref().map(|subtree| subtree as &dyn Reach);
         #[cfg(not(target_os = "linux"))]
         let reach: Option<&dyn Reach> = None;
         let mut torn = self.proc.tear_down(Some(self.id), TeardownKind::Look(reach), None);
-        if let (Some(FrontFate::LeftUnreaped), Some(left)) = (torn.front, torn.left.as_mut()) {
-            *left = format!("{left}; {why}");
+        if let Some(reason) = &torn.leave {
+            torn.left = Some(front_left_text(self.id.pid(), why, reason));
         }
         torn
     }
@@ -1162,6 +1158,29 @@ impl Child {
         };
         report.emit(&self.reported);
         fate
+    }
+}
+
+/// What a drop says of an elevation front `pid` it left behind for `reason`; `why` is why it did
+/// not kill the front.
+#[cfg(unix)]
+fn front_left_text(
+    pid: u32,
+    why: &dyn std::fmt::Display,
+    reason: &crate::child::owned::teardown::LeaveReason,
+) -> String {
+    use crate::child::owned::teardown::{LeaveReason, ReachFailure};
+
+    match reason {
+        LeaveReason::Running => format!(
+            "elevation front pid {pid} is left running and unreaped: {why}, and a kill of the front would orphan              the elevated program"
+        ),
+        LeaveReason::ReachUnknown(ReachFailure::Place(e)) => format!(
+            "elevation front pid {pid} is left unreaped: where it is cannot be read ({e}), so it is not known              whether the cgroup kill ended it"
+        ),
+        LeaveReason::ReachUnknown(ReachFailure::Subtree(e)) => format!(
+            "elevation front pid {pid} is left unreaped: its leaf's subtree cannot be read ({e}), so it is not              known whether the cgroup kill ended it"
+        ),
     }
 }
 

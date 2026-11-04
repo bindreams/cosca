@@ -20,13 +20,14 @@
 //! An elevation front is sent nothing: a kill of it would orphan the elevated program. One look at
 //! the present moment collects it if it has exited. A running front is waited for only if
 //! [`Reach::reached`] says a kill sent elsewhere (a cgroup leaf's) reached it, since that kill bounds
-//! the wait; otherwise it is left running and unreaped, and said so.
+//! the wait; otherwise it is left, and [`TeardownOutcome::leave`] says why. The wording of that is the
+//! caller's, which knows why the front was not killed.
 
+use std::io;
 use std::process::ExitStatus;
 
 use super::{ChildWaitOutcome, OwnedChild};
 use crate::child::lifecycle::{child_named, orphaned_note, status_of_outcome, Orphaned};
-use crate::child::spawn::FrontFate;
 use crate::error::{ChildFate, Error};
 use crate::identity::ProcessId;
 use crate::os_process::child::Foreign;
@@ -49,9 +50,35 @@ pub(crate) enum TeardownKind<'a> {
 
 /// Whether a kill sent elsewhere (a cgroup leaf's `cgroup.kill`) reached a child.
 pub(crate) trait Reach {
-    /// `Ok(true)`: the kill landed and reached `child`, so its exit follows. `Err`: where `child` is
-    /// cannot be read, so whether the kill reached it is not known.
-    fn reached(&self, child: &OwnedChild) -> std::io::Result<bool>;
+    /// `Ok(true)`: the kill landed and reached `child`, so its exit follows. `Err`: what could not be
+    /// read, so whether the kill reached `child` is not known.
+    fn reached(&self, child: &OwnedChild) -> Result<bool, ReachFailure>;
+}
+
+/// What a [`Reach`] could not read.
+#[derive(Debug)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "only a Linux cgroup leaf is a `Reach`")
+)]
+pub(crate) enum ReachFailure {
+    /// Where the child is.
+    Place(io::Error),
+    /// The subtree the kill went through.
+    Subtree(io::Error),
+}
+
+/// Why an elevation front was left behind, which no kill of it ended.
+#[derive(Debug)]
+#[cfg_attr(
+    windows,
+    allow(dead_code, reason = "no Windows teardown words a front left behind yet")
+)]
+pub(crate) enum LeaveReason {
+    /// It is running and no kill reached it: it is left running and unreaped.
+    Running,
+    /// Whether a kill reached it is not known: it is left unreaped.
+    ReachUnknown(ReachFailure),
 }
 
 /// What a teardown of the root did: the child's fate, and what it could not do, for the event's one
@@ -59,9 +86,10 @@ pub(crate) trait Reach {
 #[derive(Debug)]
 pub(crate) struct TeardownOutcome {
     pub(crate) fate: ChildFate,
-    /// What became of an elevation front ([`TeardownKind::Look`]); `None` for a child killed.
+    /// Why an elevation front ([`TeardownKind::Look`]) was left behind; `None` for a child killed,
+    /// and for a front reaped or lost to a reap or a look that failed (those are in `left`).
     #[cfg_attr(windows, allow(dead_code, reason = "no Windows teardown looks at a front yet"))]
-    pub(crate) front: Option<FrontFate>,
+    pub(crate) leave: Option<LeaveReason>,
     pub(crate) left: Option<String>,
 }
 
@@ -70,16 +98,16 @@ impl TeardownOutcome {
     pub(crate) fn new(fate: ChildFate) -> TeardownOutcome {
         TeardownOutcome {
             fate,
-            front: None,
+            leave: None,
             left: None,
         }
     }
 
-    /// A front's teardown with nothing to warn of.
-    fn of_front(fate: ChildFate, front: FrontFate) -> TeardownOutcome {
+    /// A front left behind, for `reason`; the caller words it.
+    fn left_behind(fate: ChildFate, reason: LeaveReason) -> TeardownOutcome {
         TeardownOutcome {
             fate,
-            front: Some(front),
+            leave: Some(reason),
             left: None,
         }
     }
@@ -151,7 +179,7 @@ impl OwnedChild {
             } else {
                 ChildFate::Unknown
             },
-            front: None,
+            leave: None,
             left: fate_left,
         };
         let outcome = wait_warning(
@@ -169,7 +197,7 @@ impl OwnedChild {
                 log::debug!("{}", killed.reaped_elsewhere(pid));
                 Err(TeardownOutcome {
                     fate: foreign.fate(delivered),
-                    front: None,
+                    leave: None,
                     left: (foreign == Foreign::Orphaned).then(|| orphaned_note(pid)),
                 })
             }
@@ -209,19 +237,20 @@ impl OwnedChild {
         };
         TeardownOutcome {
             fate,
-            front: None,
+            leave: None,
             left,
         }
     }
 
     /// The look arm of [`tear_down`](Self::tear_down). A front that has exited is reaped. One that
-    /// has not is waited for if `reach` says its place is where a kill landed, and otherwise left.
+    /// has not is waited for if `reach` says its place is where a kill landed, and otherwise left,
+    /// for the reason in [`TeardownOutcome::leave`].
     fn look_at_front(&self, id: Option<ProcessId>, reach: Option<&dyn Reach>, due: Option<Due>) -> TeardownOutcome {
         let pid = self.pid();
         let front = front_named(pid);
         let reaped = |status: ExitStatus| {
             log::debug!("Child::drop: {front} was killed through its cgroup and reaped ({status})");
-            TeardownOutcome::of_front(ChildFate::Reaped, FrontFate::Reaped)
+            TeardownOutcome::new(ChildFate::Reaped)
         };
         // A front reaped elsewhere is read from the typed outcome, so it is `Gone` on every OS.
         let looked = match self.wait(Some(crate::wait::now())) {
@@ -229,7 +258,7 @@ impl OwnedChild {
                 log::debug!("Child::drop: {front} was reaped by someone else");
                 return TeardownOutcome {
                     fate: foreign.fate(false),
-                    front: Some(FrontFate::Unaccounted),
+                    leave: None,
                     left: (foreign == Foreign::Orphaned).then(|| orphaned_note(pid)),
                 };
             }
@@ -239,43 +268,28 @@ impl OwnedChild {
             Ok(Some(status)) => reaped(status),
             Err(e) => TeardownOutcome {
                 fate: ChildFate::Unknown,
-                front: Some(FrontFate::Unaccounted),
+                leave: None,
                 left: Some(format!(
                     "{front} could not be looked at after its cgroup's teardown ({e})"
                 )),
             },
             Ok(None) => {
-                let left_running = || TeardownOutcome {
-                    fate: ChildFate::Running { id },
-                    front: Some(FrontFate::LeftUnreaped),
-                    left: Some(format!(
-                        "{front} is left running and unreaped, and a kill of the front would orphan the elevated \
-                         program"
-                    )),
-                };
+                let left_running = || TeardownOutcome::left_behind(ChildFate::Running { id }, LeaveReason::Running);
                 let Some(reach) = reach else {
                     return left_running();
                 };
                 match reach.reached(self) {
                     Ok(false) => left_running(),
-                    Err(e) => TeardownOutcome {
-                        fate: ChildFate::Unknown,
-                        front: Some(FrontFate::Unplaced),
-                        left: Some(format!(
-                            "{front} is left unreaped: where it is cannot be read ({e}), so it is not known whether \
-                             the cgroup kill ended it"
-                        )),
-                    },
+                    Err(failure) => {
+                        TeardownOutcome::left_behind(ChildFate::Unknown, LeaveReason::ReachUnknown(failure))
+                    }
                     // Dying: its kill is pending, so this wait ends.
                     Ok(true) => {
                         #[cfg(test)]
                         crate::child::spawn::fault::run_between_kill_and_wait();
                         match self.wait_after_kill(Killed::Front, true, due) {
                             Ok(status) => reaped(status),
-                            Err(outcome) => TeardownOutcome {
-                                front: Some(FrontFate::Unaccounted),
-                                ..outcome
-                            },
+                            Err(outcome) => outcome,
                         }
                     }
                 }

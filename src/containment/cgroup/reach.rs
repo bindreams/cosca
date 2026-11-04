@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use super::parse::{is_at_or_under, parse_v2_relative_path};
+use crate::child::owned::teardown::{Reach, ReachFailure};
 
 /// `_IOWR(PIDFS_IOCTL_MAGIC, 11, struct pidfd_info)`, with the 64-byte first version of the struct.
 /// The request is the same 32 bits under glibc's `unsigned long` and musl's `int`.
@@ -294,22 +295,37 @@ impl Subtree {
     }
 }
 
-impl crate::child::owned::teardown::Reach for Subtree {
+impl Reach for Subtree {
     /// [`Subtree::reached`] by the child's pid and pidfd. A child with no pid is not asked about:
     /// there is no number to place it by, so it is not shown to be reached.
-    fn reached(&self, child: &crate::child::owned::OwnedChild) -> io::Result<bool> {
+    fn reached(&self, child: &crate::child::owned::OwnedChild) -> Result<bool, ReachFailure> {
         match child.pid() {
-            Some(pid) => Subtree::reached(self, pid, child.pidfd()),
+            Some(pid) => Subtree::reached(self, pid, child.pidfd()).map_err(ReachFailure::Place),
             None => Ok(false),
         }
     }
 }
 
-/// A subtree that could not be read answers with the failure it had, so a teardown does not take an
-/// unreadable place for a place outside the kill.
-impl crate::child::owned::teardown::Reach for io::Error {
-    fn reached(&self, _child: &crate::child::owned::OwnedChild) -> io::Result<bool> {
-        Err(io::Error::new(self.kind(), self.to_string()))
+/// A leaf's subtree as a teardown found it: read, or the failure of reading it. The failure answers
+/// [`Reach`] as the subtree's own, so a teardown takes an unreadable subtree for neither a place
+/// outside the kill nor an unreadable place.
+pub(crate) enum LeafSubtree {
+    Read(Subtree),
+    Unreadable(io::Error),
+}
+
+impl LeafSubtree {
+    pub(crate) fn of(read: io::Result<Subtree>) -> LeafSubtree {
+        read.map_or_else(LeafSubtree::Unreadable, LeafSubtree::Read)
+    }
+}
+
+impl Reach for LeafSubtree {
+    fn reached(&self, child: &crate::child::owned::OwnedChild) -> Result<bool, ReachFailure> {
+        match self {
+            LeafSubtree::Read(subtree) => Reach::reached(subtree, child),
+            LeafSubtree::Unreadable(e) => Err(ReachFailure::Subtree(io::Error::new(e.kind(), e.to_string()))),
+        }
     }
 }
 

@@ -42,17 +42,20 @@ pub(super) fn status_of_outcome(
     }
 }
 
+/// What a message calls a child whose pid is not known.
+const PIDLESS_CHILD: &str = "the child (pid unknown)";
+
 /// What to say of a child whose zombie launchd holds.
 pub(super) fn orphaned_note(pid: Option<u32>) -> String {
     format!(
         "{}: not ours to reap (launchd holds its zombie, because its tracer died)",
-        pid.map_or_else(|| "the child (pid unknown)".to_owned(), |pid| format!("pid {pid}"))
+        pid.map_or_else(|| PIDLESS_CHILD.to_owned(), |pid| format!("pid {pid}"))
     )
 }
 
 /// How a message names a child: `child 4242`, or what stands for a pid that is not known.
 pub(crate) fn child_named(pid: Option<u32>) -> String {
-    pid.map_or_else(|| "the child (pid unknown)".to_owned(), |pid| format!("child {pid}"))
+    pid.map_or_else(|| PIDLESS_CHILD.to_owned(), |pid| format!("child {pid}"))
 }
 
 /// The `ECHILD` every wait answers when the child was reaped by someone else.

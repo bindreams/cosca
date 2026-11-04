@@ -6,7 +6,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use super::ProbeEnd;
-use super::{dying_in, front_placement, Subtree};
+use super::{dying_in, front_placement, LeafSubtree, Subtree};
 use crate::containment::cgroup::fault::{self, ProbeStep};
 use crate::containment::cgroup::test_support::alone;
 use crate::send_log::Via;
@@ -1243,16 +1243,19 @@ fn a_subtree_asked_about_a_pidless_child_says_not_reached() {
     assert!(!Reach::reached(&subtree(HIGH, true), &child).expect("a pid-less child is not asked about"));
 }
 
-/// A subtree that could not be read answers with the failure it had, of the same kind.
+/// A leaf's subtree that could not be read answers with the failure it had, of the same kind, as the
+/// subtree's and not the place's.
 ///
-/// Mutant: the unreadable place is taken for "not reached".
+/// Mutants: the unreadable subtree is taken for "not reached"; it is reported as an unreadable place.
 #[skuld::test]
 fn an_unreadable_subtree_answers_its_error() {
-    use crate::child::owned::teardown::Reach as _;
+    use crate::child::owned::teardown::{Reach as _, ReachFailure};
 
     let child = crate::child::owned::OwnedChild::new(Box::new(crate::os_process::fake::FakeProcess::new([])));
     let unreadable = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "the leaf cannot be read");
-    let err = unreadable.reached(&child).expect_err("the failure is the answer");
+    let Err(ReachFailure::Subtree(err)) = LeafSubtree::of(Err(unreadable)).reached(&child) else {
+        panic!("the failure is the subtree's");
+    };
     assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
     assert!(err.to_string().contains("the leaf cannot be read"), "{err}");
 }
