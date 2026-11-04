@@ -131,18 +131,30 @@ fn a_held_process_reads_dead_and_its_acts_return_after_it_is_reaped() {
     assert!(p.wait_timeout(Duration::ZERO).expect("wait_timeout"));
 }
 
-/// After the reap no process has the child's pid, so `open_pid` is `None`. A pid reused since by
-/// an unrelated process would open as `Some` with another identity; this child's identity never
-/// opens.
+/// After the reap no process has the child's pid, so `open_pid` is `None`, or `Some` with another
+/// identity if an unrelated process has reused the pid. On Linux and macOS the child's own identity
+/// never opens. On Windows a process object outlives its exit while any handle on it is open, and
+/// a handle held outside this process is not ours to close (measured: nothing in this process
+/// holds one after the drop): the identity may then open as `Process::open` documents, reading
+/// `Dead`.
 #[skuld::test]
 fn open_pid_of_a_reaped_child_is_none_or_another_process() {
     let (child, sock) = spawn_blocker();
     let id = child.id();
     common::kill_release_reap(&child, sock);
-    drop(child); // on Windows the child's own handle keeps the exited process openable
+    drop(child); // closes the child's own handles; on Windows they would keep the exited process openable
     match cosca::Process::open_pid(id.pid()).expect("a reaped pid is not an error") {
-        None => {}
-        Some(reused) => assert_ne!(reused.id(), id, "the reaped child's identity must not open"),
+        Some(held) if held.id() == id => {
+            if !cfg!(windows) {
+                panic!("the reaped child's identity must not open");
+            }
+            assert_eq!(
+                held.is_alive(),
+                cosca::identity::Liveness::Dead,
+                "a reaped process that opens reads Dead"
+            );
+        }
+        Some(_) | None => {}
     }
 }
 
