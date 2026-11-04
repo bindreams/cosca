@@ -50,10 +50,6 @@ pub(crate) enum TryReapOutcome<'a> {
         )
     )]
     Recheck,
-    #[cfg_attr(
-        windows,
-        allow(dead_code, reason = "a process handle pins its process: no foreign reap")
-    )]
     Foreign(Foreign),
 }
 
