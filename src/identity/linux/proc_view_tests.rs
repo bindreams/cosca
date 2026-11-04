@@ -276,9 +276,8 @@ fn the_fdinfo_of_an_unreaped_targets_pidfd_names_its_pid() {
     );
 }
 
-/// The fdinfo path is `thread-self/fdinfo/<fd>`, and a fdinfo with no `Pid:` line is a view that
-/// cannot be read. The fake states a pid the real fdinfo never gives this fd, so a read of any
-/// other path would not match.
+/// The pidfd's fdinfo is read at `thread-self/fdinfo/<fd>`, and one with no `Pid:` line is an
+/// unreadable view.
 #[skuld::test]
 fn pidfd_pid_in_reads_thread_self_fdinfo_and_names_a_missing_pid_line() {
     use std::os::fd::AsRawFd as _;
@@ -286,12 +285,14 @@ fn pidfd_pid_in_reads_thread_self_fdinfo_and_names_a_missing_pid_line() {
     let (mut child, pidfd) = spawn_exited_child_with_pidfd();
     let dir = ProcDir::open().expect("/proc opens");
     let path = format!("thread-self/fdinfo/{}", pidfd.as_raw_fd());
-    let stated = FakeKernel::over(&HostKernel).on_read(&path, Ok(b"Pid:\t4321\n"));
+    // A pid the real fdinfo never gives this fd, so a read of any other path cannot match.
+    let stated_pid = child.id() + 1;
+    let stated = FakeKernel::over(&HostKernel).on_read(&path, Ok(format!("Pid:\t{stated_pid}\n").as_bytes()));
     let got = pidfd_pid_in(&stated, &dir, pidfd.as_fd());
     let no_pid = FakeKernel::over(&HostKernel).on_read(&path, Ok(b"pos:\t0\n"));
     let err = pidfd_pid_in(&no_pid, &dir, pidfd.as_fd()).expect_err("no Pid line");
     child.wait().expect("reap the child");
-    assert!(matches!(got, Ok(PidfdTarget::Pid(4321))), "got {got:?}");
+    assert!(matches!(got, Ok(PidfdTarget::Pid(p)) if p == stated_pid), "got {got:?}");
     assert!(err.reason.contains("no parseable Pid line"), "{err}");
 }
 

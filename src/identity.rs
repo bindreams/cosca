@@ -249,8 +249,9 @@ pub(crate) struct UnknownCause {
 }
 
 impl UnknownCause {
-    /// The error for `subject`'s `Unknown` read when the view is why (see
-    /// [`unknown_identity_error`]), else `None`.
+    /// The error for `subject`'s `Unknown` read when the view is why: `Error::Unsupported` naming
+    /// the `openat2` requirement, or `Error::Unassessable` with the view's reason. `None` when the
+    /// view is fine (or off Linux, which has none): `hidepid`, a racing exit.
     pub(crate) fn into_error(self, subject: &str) -> Option<crate::error::Error> {
         #[cfg(target_os = "linux")]
         {
@@ -267,21 +268,6 @@ impl UnknownCause {
 #[cfg(not(target_os = "linux"))]
 fn start_token_explained(pid: RawPid) -> (Resolved<StartToken>, UnknownCause) {
     (backend::start_token(pid), UnknownCause::default())
-}
-
-/// The error for a by-pid read of `subject` that answered [`Resolved::Unknown`] because the
-/// checked `/proc` view is unavailable, or `None` when the view is fine (or off Linux, which has
-/// none). The cause is carried up: [`Error::Unsupported`] naming the `openat2` requirement, or
-/// [`Error::Unassessable`] with the view's reason.
-#[cfg(target_os = "linux")]
-pub(crate) fn unknown_identity_error(subject: &str) -> Option<crate::error::Error> {
-    backend::unknown_identity_error_with(&HostKernel, subject)
-}
-
-/// [`unknown_identity_error`] off Linux, where identity reads have no `/proc` view.
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn unknown_identity_error(_subject: &str) -> Option<crate::error::Error> {
-    None
 }
 
 #[cfg(all(target_os = "linux", test))]

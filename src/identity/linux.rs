@@ -24,6 +24,7 @@ mod read_namespace_tests;
 use std::time::{Duration, SystemTime};
 
 use rustix::io::Errno;
+use rustix::process::Pid;
 
 use self::kernel::Kernel;
 use self::proc_view::ProcDir;
@@ -35,10 +36,10 @@ use crate::error::Error;
 /// `kill(pid, 0)` — existence/permission check only, no signal delivered. The target
 /// validation lives in the pure `probe` module so it is executed on every host.
 fn signal_probe(kernel: &dyn Kernel, pid: RawPid) -> SignalProbe {
-    if super::probe::signal_target(pid).is_none() {
+    let Some(target) = super::probe::signal_target(pid).and_then(Pid::from_raw) else {
         return SignalProbe::NotAPid;
-    }
-    match kernel.signal_probe(pid) {
+    };
+    match kernel.signal_probe(target) {
         Ok(()) => SignalProbe::Signalable,
         Err(Errno::SRCH) => SignalProbe::NoSuchProcess,
         Err(_) => SignalProbe::Denied,
@@ -151,7 +152,7 @@ pub(super) fn is_running_in(kernel: &dyn Kernel, proc_dir: &ProcDir, pid: RawPid
 fn liveness_of(stat: Resolved<Vec<u8>>, start: StartToken) -> Liveness {
     match stat {
         Resolved::Found(stat) => super::stat_parse::running_from_stat(&stat, start),
-        Resolved::Gone => Liveness::Dead, // gone (reaped) => not running
+        Resolved::Gone => Liveness::Dead,
         Resolved::Unknown => Liveness::Unknown,
     }
 }
@@ -176,19 +177,9 @@ pub(super) fn current_token() -> Resolved<StartToken> {
     }
 }
 
-/// The error for a by-pid identity read of `subject` that answered `Unknown` because the
-/// `/proc` view is unavailable, or `None` when it is not (`hidepid`, a racing exit).
-///
-/// Without `openat2` it is [`Error::Unsupported`] naming that; otherwise
-/// [`Error::Unassessable`] carrying the view's reason.
-pub(crate) fn unknown_identity_error_with(kernel: &dyn Kernel, subject: &str) -> Option<Error> {
-    proc_view::proc_view_with(kernel)
-        .into_dir()
-        .err()
-        .map(|why| view_error(subject, why))
-}
-
-/// The error for a by-pid identity read of `subject` that `why` (an unusable view) made `Unknown`.
+/// The error for a by-pid identity read of `subject` that `why` (an unusable view) made `Unknown`:
+/// [`Error::Unsupported`] naming `openat2` when that is missing, else [`Error::Unassessable`]
+/// carrying the view's reason.
 pub(crate) fn view_error(subject: &str, why: proc_view::ViewUnreadable) -> Error {
     why.unsupported(format!("identifying {subject}"))
         .unwrap_or_else(|| unassessable_view(subject, &why.reason, why.source))

@@ -2,8 +2,7 @@
 //! system calls; the test `FakeKernel` answers from a table of stated facts and models no kernel.
 //!
 //! The logic lives once, in functions that take `&dyn Kernel`; every production caller passes
-//! `&HostKernel`. Reads that no test answers for (`btime`, `sysconf`, `boot_id`, the namespace
-//! link inodes, `/proc/self/cgroup`) stay raw.
+//! `&HostKernel`. Reads no test answers for stay raw until a test needs them.
 
 use std::io;
 
@@ -11,7 +10,6 @@ use rustix::io::Errno;
 use rustix::process::{test_kill_process, Pid};
 
 use super::proc_view::{ProcDir, ViewUnreadable};
-use crate::identity::probe::signal_target;
 
 pub(crate) trait Kernel: Sync {
     /// `ProcDir::open`: `openat2` of `/proc`, proven procfs's root.
@@ -21,8 +19,9 @@ pub(crate) trait Kernel: Sync {
     /// `thread-self/fdinfo/<fd>`.
     fn read(&self, dir: &ProcDir, path: &str) -> io::Result<Vec<u8>>;
 
-    /// `kill(pid, 0)`. `pid` is a [`signal_target`]; a number that is no pid answers `ESRCH`.
-    fn signal_probe(&self, pid: u32) -> Result<(), Errno>;
+    /// `kill(target, 0)`. The caller decides what is a kill target (`probe::signal_target`); the
+    /// kernel is asked only about one.
+    fn signal_probe(&self, target: Pid) -> Result<(), Errno>;
 }
 
 /// The real kernel.
@@ -37,15 +36,8 @@ impl Kernel for HostKernel {
         dir.read(path)
     }
 
-    fn signal_probe(&self, pid: u32) -> Result<(), Errno> {
-        let target = signal_target(pid);
-        debug_assert!(target.is_some(), "{pid} is no kill target; the caller checks first");
-        // Never issued for 0 or a wrapped value: `kill(0, ..)` and `kill(-n, ..)` signal groups
-        // and would answer for a process that is not there.
-        match target.and_then(Pid::from_raw) {
-            Some(pid) => test_kill_process(pid),
-            None => Err(Errno::SRCH),
-        }
+    fn signal_probe(&self, target: Pid) -> Result<(), Errno> {
+        test_kill_process(target)
     }
 }
 

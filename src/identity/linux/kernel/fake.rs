@@ -6,6 +6,7 @@
 use std::io;
 
 use rustix::io::Errno;
+use rustix::process::Pid;
 
 use super::Kernel;
 use crate::identity::{ProcDir, ViewUnreadable};
@@ -16,7 +17,7 @@ pub(crate) struct FakeKernel<'a> {
     open_proc: Option<Errno>,
     /// `Err` is a raw errno.
     reads: Vec<(String, Result<Vec<u8>, i32>)>,
-    signal_probes: Vec<(u32, Result<(), Errno>)>,
+    signal_probes: Vec<(Pid, Result<(), Errno>)>,
 }
 
 impl<'a> FakeKernel<'a> {
@@ -44,9 +45,9 @@ impl<'a> FakeKernel<'a> {
         self
     }
 
-    /// `kill(pid, 0)` answers `answer`.
-    pub(crate) fn on_signal_probe(mut self, pid: u32, answer: Result<(), Errno>) -> Self {
-        self.signal_probes.push((pid, answer));
+    /// `kill(target, 0)` answers `answer`.
+    pub(crate) fn on_signal_probe(mut self, target: Pid, answer: Result<(), Errno>) -> Self {
+        self.signal_probes.push((target, answer));
         self
     }
 
@@ -77,10 +78,10 @@ impl Kernel for FakeKernel<'_> {
         }
     }
 
-    fn signal_probe(&self, pid: u32) -> Result<(), Errno> {
-        match self.signal_probes.iter().rev().find(|(p, _)| *p == pid) {
+    fn signal_probe(&self, target: Pid) -> Result<(), Errno> {
+        match self.signal_probes.iter().rev().find(|(p, _)| *p == target) {
             Some((_, answer)) => *answer,
-            None => self.real(&format!("signal_probe of {pid}")).signal_probe(pid),
+            None => self.real(&format!("signal_probe of {target:?}")).signal_probe(target),
         }
     }
 }

@@ -4,13 +4,18 @@
 //! the view at all.
 
 use rustix::io::Errno;
+use rustix::process::Pid;
 
-use super::unknown_identity_error_with;
+use super::signal_probe;
 use crate::error::Error;
+use crate::identity::probe::SignalProbe;
 use crate::identity::{Existence, FakeKernel, HostKernel, Liveness, ProcessId, Resolved};
 
 /// Above `PID_MAX_LIMIT` (2^22) yet a valid positive `kill` target, so `kill(pid, 0)` answers `ESRCH`.
 pub(super) const NO_PROCESS_CAN_HOLD: u32 = i32::MAX as u32;
+
+/// [`NO_PROCESS_CAN_HOLD`] as the kill target the kernel is asked about.
+const NO_PROCESS_CAN_HOLD_TARGET: Pid = Pid::from_raw(i32::MAX).unwrap();
 
 /// `stat` of a process whose `starttime` (field 22) is 424242.
 const STAT_STARTED_AT_424242: &[u8] = b"4242 (x) S 1 4242 4242 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 424242 0 0";
@@ -43,8 +48,7 @@ fn same_view() -> FakeKernel<'static> {
 }
 
 /// Mutant: "read `stat` by path whatever the view" - the unavailable view is ignored and the
-/// live process resolves. The `no /proc` view: descriptor exhaustion is `Unknown` with a cause,
-/// never `Gone`.
+/// live process resolves.
 #[skuld::test]
 fn of_a_live_pid_is_unknown_when_the_view_is_unavailable() {
     for (name, kernel) in unavailable_views() {
@@ -62,7 +66,7 @@ fn of_a_live_pid_is_unknown_when_the_view_is_unavailable() {
 #[skuld::test]
 fn of_a_pid_no_process_can_hold_is_gone_whatever_the_view() {
     for (name, kernel) in unavailable_views() {
-        let kernel = kernel.on_signal_probe(NO_PROCESS_CAN_HOLD, Err(Errno::SRCH));
+        let kernel = kernel.on_signal_probe(NO_PROCESS_CAN_HOLD_TARGET, Err(Errno::SRCH));
         let got = ProcessId::of_with(&kernel, NO_PROCESS_CAN_HOLD).0;
         assert!(matches!(got, Resolved::Gone), "{name}: got {got:?}");
     }
@@ -83,7 +87,7 @@ fn exists_and_is_alive_are_unknown_for_a_live_process_when_the_view_is_unavailab
 fn exists_and_is_alive_are_gone_and_dead_for_a_pid_no_process_can_hold_whatever_the_view() {
     let id = ProcessId::from_parts_for_test(NO_PROCESS_CAN_HOLD, 1);
     for (name, kernel) in unavailable_views() {
-        let kernel = kernel.on_signal_probe(NO_PROCESS_CAN_HOLD, Err(Errno::SRCH));
+        let kernel = kernel.on_signal_probe(NO_PROCESS_CAN_HOLD_TARGET, Err(Errno::SRCH));
         assert_eq!(id.exists_with(&kernel).0, Existence::Gone, "{name}");
         assert_eq!(id.is_alive_with(&kernel), Liveness::Dead, "{name}");
     }
@@ -108,26 +112,46 @@ fn a_stat_that_cannot_be_read_is_gone_only_when_kill_says_esrch() {
         (libc::EACCES, Err(Errno::PERM), false),
     ];
     for (errno, probe, gone) in cases {
-        let kernel = same_view().on_read("4242/stat", Err(errno)).on_signal_probe(PID, probe);
+        let kernel = same_view()
+            .on_read(&format!("{PID}/stat"), Err(errno))
+            .on_signal_probe(Pid::from_raw(PID as i32).unwrap(), probe);
         let got = ProcessId::of_with(&kernel, PID).0;
         match (gone, &got) {
             (true, Resolved::Gone) | (false, Resolved::Unknown) => {}
             _ => panic!("stat {errno}, kill {probe:?}: got {got:?}"),
         }
     }
-    let found = same_view().on_read("4242/stat", Ok(STAT_STARTED_AT_424242));
+    let found = same_view().on_read(&format!("{PID}/stat"), Ok(STAT_STARTED_AT_424242));
     match ProcessId::of_with(&found, PID).0 {
         Resolved::Found(id) => assert_eq!(id.start_token_raw(), 424242),
         other => panic!("a readable stat must resolve, got {other:?}"),
     }
 }
 
+/// The caller decides what is a kill target: a number that is none is `NotAPid` without the kernel
+/// being asked (a `FakeKernel` with no row panics on any `signal_probe`). Mutant: "the check moves
+/// into the kernel, and the caller passes anything on".
+#[skuld::test]
+fn a_number_that_is_no_kill_target_is_never_probed() {
+    let kernel = FakeKernel::new();
+    for pid in [0, i32::MAX as u32 + 1, u32::MAX] {
+        assert_eq!(signal_probe(&kernel, pid), SignalProbe::NotAPid, "{pid}");
+    }
+}
+
+/// The error a caller sees for a live process's `Unknown` read of `kernel`: the read's own cause.
+fn cause_error_of_live_read(kernel: &FakeKernel<'_>) -> Option<Error> {
+    let (got, cause) = ProcessId::of_with(kernel, std::process::id());
+    assert!(matches!(got, Resolved::Unknown), "got {got:?}");
+    cause.into_error("the spawned child")
+}
+
 /// The exact text a caller sees when `openat2` is missing. Mutant: "the errno is dropped from
 /// the reason".
 #[skuld::test]
 fn the_error_for_a_host_without_openat2_names_the_requirement_and_the_errno() {
-    let kernel = FakeKernel::new().open_proc_fails(Errno::NOSYS);
-    let err = unknown_identity_error_with(&kernel, "the spawned child").expect("no openat2 is an error");
+    let kernel = FakeKernel::over(&HostKernel).open_proc_fails(Errno::NOSYS);
+    let err = cause_error_of_live_read(&kernel).expect("no openat2 is an error");
     assert_eq!(
         err.to_string(),
         format!(
@@ -142,7 +166,7 @@ fn the_error_for_a_host_without_openat2_names_the_requirement_and_the_errno() {
 #[skuld::test]
 fn the_error_for_a_diverged_view_carries_the_view() {
     let kernel = FakeKernel::over(&HostKernel).on_read("self/status", Ok(DIVERGED_STATUS));
-    let err = unknown_identity_error_with(&kernel, "the spawned child").expect("a diverged view is an error");
+    let err = cause_error_of_live_read(&kernel).expect("a diverged view is an error");
     assert!(
         matches!(&err, Error::Unassessable { detail, .. }
             if detail == "the spawned child identity could not be read: this process's /proc is an outer pid namespace's"),
@@ -153,7 +177,12 @@ fn the_error_for_a_diverged_view_carries_the_view() {
 /// With a fine view, an `Unknown` is the OS's (`hidepid`, a racing exit) and has no view to blame.
 #[skuld::test]
 fn no_error_is_blamed_on_a_fine_view() {
-    assert!(unknown_identity_error_with(&HostKernel, "the spawned child").is_none());
+    let kernel = same_view()
+        .on_read("4242/stat", Err(libc::ENOENT))
+        .on_signal_probe(Pid::from_raw(4242).unwrap(), Ok(()));
+    let (got, cause) = ProcessId::of_with(&kernel, 4242);
+    assert!(matches!(got, Resolved::Unknown), "got {got:?}");
+    assert!(cause.into_error("the spawned child").is_none());
 }
 
 /// An armed alias answers only a read that found a `stat`: it never turns `Gone` into `Found`.

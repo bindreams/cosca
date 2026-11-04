@@ -83,8 +83,8 @@ pub(crate) fn read_in_scan(kernel: &dyn Kernel, dir: &ProcDir, pid: u32) -> Resu
     Err(Unreadable { pid, kind, source })
 }
 
-/// `pid`'s `stat` through `dir`, as `kernel` reads it; what a failed read means is each caller's
-/// policy ([`read_in_scan`], `identity::linux::stat_by_pid`).
+/// The raw `stat` read; what a failure means is each caller's policy ([`read_in_scan`],
+/// `identity::linux::stat_by_pid`).
 pub(super) fn read_stat_file(kernel: &dyn Kernel, dir: &ProcDir, pid: u32) -> io::Result<Vec<u8>> {
     kernel.read(dir, &format!("{pid}/stat"))
 }
@@ -155,3 +155,7 @@ pub(crate) mod fault {
         STAT_READ.with(|f| f.get()).map(|(errno, _)| errno)
     }
 }
+
+#[cfg(test)]
+#[path = "pid_stat_tests.rs"]
+mod pid_stat_tests;

@@ -1,4 +1,5 @@
 use rustix::io::Errno;
+use rustix::process::{getpid, Pid};
 
 use super::{HostKernel, Kernel};
 
@@ -15,6 +16,9 @@ fn host_kernel_reads_a_file_under_the_proc_it_opens() {
 
 #[skuld::test]
 fn host_signal_probe_is_ok_for_this_process_and_esrch_for_i32_max() {
-    assert_eq!(HostKernel.signal_probe(std::process::id()), Ok(()));
-    assert_eq!(HostKernel.signal_probe(i32::MAX as u32), Err(Errno::SRCH));
+    assert_eq!(HostKernel.signal_probe(getpid()), Ok(()));
+    assert_eq!(
+        HostKernel.signal_probe(Pid::from_raw(i32::MAX).expect("a positive number")),
+        Err(Errno::SRCH)
+    );
 }
