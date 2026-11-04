@@ -3,14 +3,18 @@
 //! change the process-wide `SIGCHLD` disposition each run in a fresh re-exec of the test binary.
 //! The `exit_only` backend's own tests are in `wait::exit_only::macos_tests`.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::fixtures::{spawn_std_blocker, status, try_wait, wait_status, Blocker};
 use crate::child::owned::{ChildWaitOutcome, OwnedChild};
+use crate::error::Error;
 use crate::identity::{ppid_fault, uniq_fault, ReadPurpose, UniqRead, LAUNCHD};
-use crate::os_process::child::{Foreign, PeekOutcome};
-use crate::os_process::macos::kqueue::test_hooks::{self, ForcedOnce};
-use crate::signal::Sig;
+use crate::os_process::child::{Foreign, OsChild, PeekOutcome, TryReapOutcome};
+use crate::os_process::macos::child::MacChild;
+use crate::os_process::macos::kqueue::test_hooks;
+use crate::os_process::{Exit, OsProcess};
+use crate::signal::{Sent, Sig};
 use crate::test_groups::{setuid, Group};
 use crate::wait::exit_only::macos_tests::{echild_yet_resolvable, found, held_by_a_tracer, unique_of};
 use crate::wait::exit_only::seams::{self as exit_seams, HolderStep};
@@ -246,9 +250,40 @@ fn kill_on_an_own_unreaped_zombie_is_delivered() {
 
 // A pid that is not our child, yet still names it (a tracer holds it) =====
 
+/// A [`MacChild`] the test keeps a handle on, so a round hook can read its reap kqueue.
+#[derive(Debug)]
+pub(super) struct SharedMac(Arc<MacChild>);
+
+impl OsProcess for SharedMac {
+    fn signal(&self, sig: Sig) -> Result<Sent, Error> {
+        self.0.signal(sig)
+    }
+
+    fn exited(&self) -> Result<Exit<'_>, Error> {
+        self.0.exited()
+    }
+}
+
+impl OsChild for SharedMac {
+    fn peek(&self) -> Result<PeekOutcome, Error> {
+        self.0.peek()
+    }
+
+    fn try_reap(&self) -> Result<TryReapOutcome<'_>, Error> {
+        self.0.try_reap()
+    }
+}
+
+/// The child `pid`, whose unique id is `unique`, watched through a fresh [`MacChild`]: an
+/// `OwnedChild` over it, and the handle the round hooks read.
+pub(super) fn watch(pid: u32, unique: u64) -> (OwnedChild, Arc<MacChild>) {
+    let mac = Arc::new(MacChild::new(pid, unique).expect("watch the child"));
+    (OwnedChild::new(Box::new(SharedMac(Arc::clone(&mac)))), mac)
+}
+
 /// A child whose tracer dies while the child is exiting: XNU sends the child's `NOTE_EXIT` and
 /// `SIGCHLD` to the tracer alone, then gives the child to launchd. The wait watches the tracer as
-/// well, and its `NOTE_EXIT` makes the wait peek again, which finds launchd holding the child:
+/// well, and its `NOTE_EXIT` makes the wait look again, which finds launchd holding the child:
 /// `Orphaned`. This process's own pid stands in for the child (`waitid` answers `ECHILD`, and its id
 /// resolves), and a blocker for the tracer; the parent read is forced: the stand-in while it runs,
 /// launchd once it has exited. The stand-in is this test's child, so its `SIGCHLD` wakes the wait
@@ -260,8 +295,8 @@ fn a_wait_on_a_child_whose_tracer_dies_during_its_exit_is_woken_by_the_tracers_e
     use std::cell::Cell;
     use std::rc::Rc;
 
-    use crate::wait::macos::{await_reapable, Waited};
     let (pid, unique) = echild_yet_resolvable();
+    let (owned, _mac) = watch(pid, unique);
     let (mut tracer, tracer_stdin) = spawn_std_blocker();
     let tracer_pid = tracer.id();
     let exited = Rc::new(Cell::new(false));
@@ -269,13 +304,13 @@ fn a_wait_on_a_child_whose_tracer_dies_during_its_exit_is_woken_by_the_tracers_e
         let exited = Rc::clone(&exited);
         move || Ok(if exited.get() { LAUNCHD } else { tracer_pid })
     });
-    let _end = test_hooks::on_kevent_round(0, move || {
+    let _end = crate::wait::block_probe::on_round(0, move || {
         drop(tracer_stdin);
         crate::test_child::wait_until_zombie(tracer_pid);
         exited.set(true);
     });
     let _ = test_hooks::take_events();
-    let waited = await_reapable(pid, Some(unique), None).expect("wait");
+    let outcome = owned.wait(None).expect("wait");
     let events = test_hooks::take_events();
     assert!(
         events
@@ -283,21 +318,21 @@ fn a_wait_on_a_child_whose_tracer_dies_during_its_exit_is_woken_by_the_tracers_e
             .any(|&(filter, fflags)| filter == libc::EVFILT_PROC && fflags & libc::NOTE_EXIT != 0),
         "the tracer's exit must wake the wait: {events:?}"
     );
-    assert_eq!(waited, Waited::Orphaned);
+    assert_eq!(outcome, ChildWaitOutcome::Foreign(Foreign::Orphaned));
     tracer.wait().expect("reap the stand-in tracer");
 }
 
-/// The rounds of an `await_reapable_on` on `kq`: `hook` runs before each blocking round with the
-/// round's index and the kqueue. A round whose hook answers `false` (it found nothing pending that
-/// should be) gets a `SIGCHLD` to this process, which the wait also watches, so a wait that missed
-/// its event fails its test's assertion instead of hanging.
+/// The rounds of a wait on `mac`: `hook` runs before each blocking round with the round's index and
+/// the child. A round whose hook answers `false` (it found nothing pending that should be) gets a
+/// `SIGCHLD` to this process, which the wait also watches, so a wait that missed its event fails its
+/// test's assertion instead of hanging.
 pub(super) fn on_rounds(
-    kq: &std::rc::Rc<crate::os_process::macos::kqueue::Kqueue>,
-    mut hook: impl FnMut(u32, &crate::os_process::macos::kqueue::Kqueue) -> bool + 'static,
-) -> ForcedOnce {
-    let kq = std::rc::Rc::clone(kq);
-    test_hooks::on_every_kevent_round(move |round| {
-        if !hook(round, &kq) {
+    mac: &Arc<MacChild>,
+    mut hook: impl FnMut(u32, &MacChild) -> bool + 'static,
+) -> crate::wait::block_probe::Rounds {
+    let mac = Arc::clone(mac);
+    crate::wait::block_probe::on_every_round(move |round| {
+        if !hook(round, &mac) {
             test_hooks::send_signal(std::process::id(), libc::SIGCHLD);
         }
     })
@@ -305,7 +340,7 @@ pub(super) fn on_rounds(
 
 /// A tracer that attaches after the wait's check: XNU reparents the child to it and sends the child
 /// `SIGSTOP` (see `wait::macos::TracerWatch`). The wait watches the child's signals,
-/// so it peeks again, finds the tracer and watches it too; the tracer's exit, with launchd then
+/// so it looks again, finds the tracer and watches it too; the tracer's exit, with launchd then
 /// holding the child, ends the wait: `Orphaned`. This process's own pid stands in for the child, and
 /// a blocker for the tracer; the parent read is forced: this process until the attach, then the
 /// stand-in, then launchd once that has exited. A `SIGCONT` to this process stands in for the
@@ -317,7 +352,6 @@ fn a_wait_on_a_child_a_tracer_attaches_to_late_is_woken_by_the_attach() {
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
-    use crate::wait::macos::{await_reapable_on, Waited};
     let (pid, unique) = echild_yet_resolvable();
     let (mut tracer, tracer_stdin) = spawn_std_blocker();
     let tracer_pid = tracer.id();
@@ -326,16 +360,16 @@ fn a_wait_on_a_child_a_tracer_attaches_to_late_is_woken_by_the_attach() {
         let holder = Rc::clone(&holder);
         move || Ok(holder.get())
     });
-    let kq = Rc::new(crate::os_process::macos::kqueue::Kqueue::new().expect("kqueue"));
+    let (owned, mac) = watch(pid, unique);
     let attach_woke = Rc::new(Cell::new(None));
     let tracer_stdin = RefCell::new(Some(tracer_stdin));
-    let _rounds = on_rounds(&kq, {
+    let _rounds = on_rounds(&mac, {
         let attach_woke = Rc::clone(&attach_woke);
-        move |round, kq| match round {
+        move |round, mac| match round {
             0 => {
                 holder.set(tracer_pid);
                 test_hooks::send_signal(pid, libc::SIGCONT);
-                attach_woke.set(Some(test_hooks::event_pending(kq)));
+                attach_woke.set(Some(mac.event_pending()));
                 attach_woke.get() == Some(true)
             }
             1 => {
@@ -347,9 +381,9 @@ fn a_wait_on_a_child_a_tracer_attaches_to_late_is_woken_by_the_attach() {
             _ => false,
         }
     });
-    let waited = await_reapable_on(&kq, pid, Some(unique), None).expect("wait");
+    let outcome = owned.wait(None).expect("wait");
     assert_eq!(attach_woke.get(), Some(true), "the attach's signal must wake the wait");
-    assert_eq!(waited, Waited::Orphaned);
+    assert_eq!(outcome, ChildWaitOutcome::Foreign(Foreign::Orphaned));
     tracer.wait().expect("reap the stand-in tracer");
 }
 
@@ -361,7 +395,7 @@ fn started_by_us_traced_by(tracer: u32) -> (libc::pid_t, libc::pid_t) {
 
 /// A tracer that is itself traced: XNU sends its `NOTE_EXIT` only to its own tracer, and its exit
 /// sends that tracer `SIGCHLD` (see `wait::macos::TracerWatch`). The wait follows the chain of tracers and watches the signals of each, so
-/// that `SIGCHLD` wakes it, and the peek after it finds launchd holding the child: `Orphaned`. This
+/// that `SIGCHLD` wakes it, and the look after it finds launchd holding the child: `Orphaned`. This
 /// process's own pid stands in for the child, held by one blocker; a second blocker stands in for
 /// that one's tracer, by its forced parents. A `SIGCHLD` to the second stands in for the first one's
 /// exit, and the child's parent read then answers launchd.
@@ -372,7 +406,6 @@ fn a_wait_on_a_child_whose_tracer_is_traced_is_woken_by_that_tracers_exit() {
     use std::cell::Cell;
     use std::rc::Rc;
 
-    use crate::wait::macos::{await_reapable_on, Waited};
     let (pid, unique) = echild_yet_resolvable();
     let (tracer, tracer_stdin) = spawn_std_blocker();
     let (outer, outer_stdin) = spawn_std_blocker();
@@ -383,27 +416,27 @@ fn a_wait_on_a_child_whose_tracer_is_traced_is_woken_by_that_tracers_exit() {
         move || Ok(holder.get())
     });
     let _traced = crate::identity::kinfo::fault::force_parents(tracer_pid, move || started_by_us_traced_by(outer_pid));
-    let kq = Rc::new(crate::os_process::macos::kqueue::Kqueue::new().expect("kqueue"));
+    let (owned, mac) = watch(pid, unique);
     let exit_woke = Rc::new(Cell::new(None));
-    let _rounds = on_rounds(&kq, {
+    let _rounds = on_rounds(&mac, {
         let exit_woke = Rc::clone(&exit_woke);
-        move |round, kq| {
+        move |round, mac| {
             if round != 0 {
                 return false;
             }
             holder.set(LAUNCHD);
             test_hooks::send_signal(outer_pid, libc::SIGCHLD);
-            exit_woke.set(Some(test_hooks::event_pending(kq)));
+            exit_woke.set(Some(mac.event_pending()));
             exit_woke.get() == Some(true)
         }
     });
-    let waited = await_reapable_on(&kq, pid, Some(unique), None).expect("wait");
+    let outcome = owned.wait(None).expect("wait");
     assert_eq!(
         exit_woke.get(),
         Some(true),
         "the SIGCHLD that the traced tracer's exit sends its tracer must wake the wait"
     );
-    assert_eq!(waited, Waited::Orphaned);
+    assert_eq!(outcome, ChildWaitOutcome::Foreign(Foreign::Orphaned));
     for (mut child, stdin) in [(tracer, tracer_stdin), (outer, outer_stdin)] {
         drop(stdin);
         child.wait().expect("reap a stand-in tracer");
@@ -413,17 +446,19 @@ fn a_wait_on_a_child_whose_tracer_is_traced_is_woken_by_that_tracers_exit() {
 /// A tracer that began its exit, then lost its own tracer: XNU gives it to launchd and keeps its
 /// `p_oppid`, so its `NOTE_EXIT` and its `SIGCHLD` reach only launchd (see
 /// `wait::macos::TracerWatch`). It hands the child over once its exit reaches its children, so the
-/// wait peeks again on a backoff instead of blocking for an event that never comes. This process's own pid stands in for the child, held by
-/// a blocker whose forced parents say launchd holds it and a tracer attached to it; the child's
-/// parent read answers launchd from the first block on.
+/// look is `Recheck` and the wait pauses on a backoff instead of blocking for an event that never
+/// comes. This process's own pid stands in for the child, held by a blocker whose forced parents say
+/// launchd holds it and a tracer attached to it; the child's parent read answers the blocker until
+/// the first pause, then launchd.
 ///
-/// Mutant: a tracer launchd holds ends the walk, and the wait blocks with no timeout.
+/// Mutant: a tracer launchd holds is `Block` (the look's answer is the reap kqueue, not `Recheck`),
+/// so the wait blocks with no timeout: the round hook's wake then ends it, and its first block is
+/// not a timed pause.
 #[skuld::test]
 fn a_wait_on_a_child_whose_tracer_is_exiting_at_launchd_peeks_again_on_a_backoff() {
     use std::cell::Cell;
     use std::rc::Rc;
 
-    use crate::wait::macos::{await_reapable_on, Waited};
     let (pid, unique) = echild_yet_resolvable();
     let (mut tracer, tracer_stdin) = spawn_std_blocker();
     let tracer_pid = tracer.id();
@@ -433,24 +468,25 @@ fn a_wait_on_a_child_whose_tracer_is_exiting_at_launchd_peeks_again_on_a_backoff
         move || Ok(holder.get())
     });
     let _dying = crate::identity::kinfo::fault::force_parents(tracer_pid, || started_by_us_traced_by(LAUNCHD));
-    let kq = Rc::new(crate::os_process::macos::kqueue::Kqueue::new().expect("kqueue"));
-    let _rounds = on_rounds(&kq, move |round, _| {
+    let (owned, mac) = watch(pid, unique);
+    // The first pause is the wait's own backoff: the child's parent read answers launchd after it.
+    let _pause = crate::child::owned::seams::on_condvar_block({
+        let holder = Rc::clone(&holder);
+        move || holder.set(LAUNCHD)
+    });
+    // A wait that blocks instead of pausing gets the wake that lets it end, and fails below.
+    let _rounds = on_rounds(&mac, move |round, _| {
         holder.set(LAUNCHD);
-        // The first round's own wake, for a wait that blocked with no timeout.
         round != 0
     });
-    let before = test_hooks::await_requested_timeouts().len();
-    let waited = await_reapable_on(&kq, pid, Some(unique), None).expect("wait");
-    let blocks: Vec<_> = test_hooks::await_requested_timeouts()[before..]
-        .iter()
-        .copied()
-        .filter(|armed| *armed != Some(Duration::ZERO))
-        .collect();
+    crate::wait::block_probe::take();
+    let outcome = owned.wait(None).expect("wait");
+    let armed = crate::wait::block_probe::take();
     assert!(
-        matches!(blocks.first(), Some(Some(_))),
-        "the first block must be timed, to peek again: {blocks:?}"
+        matches!(armed.first(), Some(Some(_))),
+        "the first block must be a timed pause, to look again: {armed:?}"
     );
-    assert_eq!(waited, Waited::Orphaned);
+    assert_eq!(outcome, ChildWaitOutcome::Foreign(Foreign::Orphaned));
     drop(tracer_stdin);
     tracer.wait().expect("reap the stand-in tracer");
 }
@@ -516,12 +552,15 @@ fn a_wait_on_a_zombie_launchd_holds_warns_it_is_not_ours_to_reap() {
     let mut cmd = crate::Command::new();
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
-    let child = cmd.spawn().expect("spawn");
+    let mut child = cmd.spawn().expect("spawn");
     let pid = child.id().pid();
     drop(writer);
     crate::test_child::wait_until_zombie(pid);
     let mark = crate::log_capture::mark();
-    let _orphaned = exit_seams::force_peek_once(Ok(PeekOutcome::Foreign(Foreign::Orphaned)));
+    // The wait's own look is a reap.
+    child
+        .proc
+        .script_over(|f| f.reaps([crate::os_process::fake::ReapAnswer::Foreign(Foreign::Orphaned)]));
     _ = child.wait();
     let records = crate::log_capture::records_since_on_current_thread(mark, &format!("pid {pid}"));
     assert!(
@@ -530,7 +569,7 @@ fn a_wait_on_a_zombie_launchd_holds_warns_it_is_not_ours_to_reap() {
             .any(|(level, text)| *level == log::Level::Warn && text.contains("not ours to reap")),
         "{records:?}"
     );
-    // The drop reaps what the forced peek left.
+    // The drop reaps what the scripted look left.
     drop(child);
 }
 

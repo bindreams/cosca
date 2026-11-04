@@ -145,7 +145,8 @@ fn tracee_with_unique() -> (crate::Child, std::io::PipeWriter, u64) {
 
 /// A real tracer that attaches while the wait is blocked: the attach's `SIGSTOP` wakes the wait
 /// through the child's `NOTE_SIGNAL`, before anything else happens to the child. The wait then
-/// watches the tracer; the child's exit and the tracer's hand-back end it as `Reapable`.
+/// watches the tracer; the child's exit and the tracer's hand-back end it with the child's status.
+/// The wait is an `OwnedChild`'s over a second `MacChild` of the tracee, which reaps it.
 ///
 /// Mutant: the wait registers no `NOTE_SIGNAL` on the child.
 #[skuld::test]
@@ -153,22 +154,21 @@ fn a_tracer_that_attaches_during_a_wait_wakes_it(#[fixture(tracer_group)] _group
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
-    use crate::wait::macos::await_reapable_on;
     let (tracee, stdin, unique) = tracee_with_unique();
     let pid = tracee.id().pid();
+    let (owned, mac) = super::macos::watch(pid, unique);
     let pending = RefCell::new(Some(tracer::start(Mode::Auto)));
     let helper = Rc::new(RefCell::new(None));
     let stdin = RefCell::new(Some(stdin));
     let attach_woke = Rc::new(Cell::new(None));
-    let kq = Rc::new(crate::os_process::macos::kqueue::Kqueue::new().expect("kqueue"));
-    let _rounds = super::macos::on_rounds(&kq, {
+    let _rounds = super::macos::on_rounds(&mac, {
         let (helper, attach_woke) = (Rc::clone(&helper), Rc::clone(&attach_woke));
-        move |round, kq| match round {
+        move |round, mac| match round {
             0 => {
                 let mut attached = pending.borrow_mut().take().expect("the helper").attach_unheld(pid);
                 assert_eq!(attached.recv(), Report::Attached);
                 *helper.borrow_mut() = Some(attached);
-                attach_woke.set(Some(test_hooks::event_pending(kq)));
+                attach_woke.set(Some(mac.event_pending()));
                 attach_woke.get() == Some(true)
             }
             1 => {
@@ -178,20 +178,20 @@ fn a_tracer_that_attaches_during_a_wait_wakes_it(#[fixture(tracer_group)] _group
             _ => true,
         }
     });
-    let waited = await_reapable_on(&kq, pid, Some(unique), None).expect("wait");
+    let outcome = owned.wait(None);
     assert_eq!(attach_woke.get(), Some(true), "the attach's SIGSTOP must wake the wait");
-    assert_eq!(waited, Waited::Reapable);
     let mut helper = helper.borrow_mut().take().expect("the helper attached");
     assert_eq!(helper.recv(), Report::Reaped);
     drop(helper);
-    let status = tracee.wait().expect("the handed-back zombie is ours to reap");
+    let status = super::fixtures::status(outcome);
     assert!(status.success(), "{status:?}");
 }
 
 /// A child whose real tracer is itself traced by a second one: the wait walks the chain and
 /// registers the second tracer too, whose signals then wake it. A `SIGCONT` to the second tracer,
 /// which leaves a running process running, shows the registration. The child's exit and its
-/// tracer's hand-back end the wait as `Reapable`.
+/// tracer's hand-back end the wait with the child's status. The wait is an `OwnedChild`'s over a
+/// second `MacChild` of the tracee, which reaps it.
 ///
 /// Mutant: the walk stops at the child's tracer.
 #[skuld::test]
@@ -199,7 +199,6 @@ fn a_wait_on_a_child_whose_tracer_is_traced_watches_that_tracers_tracer(#[fixtur
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
-    use crate::wait::macos::await_reapable_on;
     let (tracee, stdin, unique) = tracee_with_unique();
     let pid = tracee.id().pid();
     let mut inner = tracer::start(Mode::Auto).attach_unheld(pid);
@@ -209,13 +208,13 @@ fn a_wait_on_a_child_whose_tracer_is_traced_watches_that_tracers_tracer(#[fixtur
     let outer_pid = outer.helper_pid();
     let stdin = RefCell::new(Some(stdin));
     let watched = Rc::new(Cell::new(None));
-    let kq = Rc::new(crate::os_process::macos::kqueue::Kqueue::new().expect("kqueue"));
-    let _rounds = super::macos::on_rounds(&kq, {
+    let (owned, mac) = super::macos::watch(pid, unique);
+    let _rounds = super::macos::on_rounds(&mac, {
         let watched = Rc::clone(&watched);
-        move |round, kq| match round {
+        move |round, mac| match round {
             0 => {
                 test_hooks::send_signal(outer_pid, libc::SIGCONT);
-                watched.set(Some(test_hooks::event_pending(kq)));
+                watched.set(Some(mac.event_pending()));
                 watched.get() == Some(true)
             }
             1 => {
@@ -225,13 +224,12 @@ fn a_wait_on_a_child_whose_tracer_is_traced_watches_that_tracers_tracer(#[fixtur
             _ => true,
         }
     });
-    let waited = await_reapable_on(&kq, pid, Some(unique), None).expect("wait");
+    let outcome = owned.wait(None);
     assert_eq!(
         watched.get(),
         Some(true),
         "the wait must watch the signals of the tracer's own tracer"
     );
-    assert_eq!(waited, Waited::Reapable);
     assert_eq!(inner.recv(), Report::Reaped);
     // The inner helper's exit goes to the outer one, its tracer and parent, which hands it back
     // when it reaps it; until then this process's reap of it fails with `ECHILD`.
@@ -239,6 +237,6 @@ fn a_wait_on_a_child_whose_tracer_is_traced_watches_that_tracers_tracer(#[fixtur
     assert_eq!(outer.recv(), Report::Reaped);
     drop(inner);
     drop(outer);
-    let status = tracee.wait().expect("the handed-back zombie is ours to reap");
+    let status = super::fixtures::status(outcome);
     assert!(status.success(), "{status:?}");
 }

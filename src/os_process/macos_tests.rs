@@ -357,6 +357,38 @@ fn esrch_at_registration_reads_as_exited_and_rechecks() {
     assert!(matches!(os.try_reap().unwrap(), TryReapOutcome::Reaped(_)));
 }
 
+/// A child whose tracer began its exit, then lost its own tracer, is held by launchd with its
+/// `p_oppid` kept: its `NOTE_EXIT` reaches only launchd, so nothing wakes a wait on the reap kqueue.
+/// The look is `Recheck`, which the driver paces, not `Running` on that kqueue. This process's own
+/// pid stands in for the child, held by a blocker whose forced parents say launchd holds it.
+///
+/// Mutant: a tracer launchd holds answers `Running` on the reap kqueue: the wait blocks for an event
+/// that never comes.
+#[skuld::test]
+fn a_child_whose_tracer_is_exiting_at_launchd_is_a_recheck() {
+    use crate::identity::{ppid_fault, LAUNCHD};
+    use crate::os_process::child::{OsChild, TryReapOutcome};
+    use crate::os_process::macos::child::MacChild;
+    use crate::wait::exit_only::macos_tests::echild_yet_resolvable;
+
+    let (pid, unique) = echild_yet_resolvable();
+    let mut cmd = crate::test_child::held_std_killable_blocker();
+    let mut tracer = crate::test_spawn::spawn(&mut cmd).expect("spawn the stand-in tracer");
+    let tracer_stdin = tracer.stdin.take();
+    let tracer_pid = tracer.id();
+    let _parent = ppid_fault::force_ppid_with(move || Ok(tracer_pid));
+    let _dying = crate::identity::kinfo::fault::force_parents(tracer_pid, || {
+        (std::process::id() as libc::pid_t, LAUNCHD as libc::pid_t)
+    });
+    let mac = MacChild::new(pid, unique).expect("watch the stand-in");
+
+    let look = mac.try_reap().expect("look");
+
+    assert!(matches!(look, TryReapOutcome::Recheck), "{look:?}");
+    drop(tracer_stdin);
+    tracer.wait().expect("reap the stand-in tracer");
+}
+
 const KQUEUE_MARKER: &str = "COSCA_TEST_MACCHILD_KQUEUE";
 
 /// A refused kqueue fails the adoption with the refusal, instead of an adopted child that can

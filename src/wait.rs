@@ -652,12 +652,22 @@ fn win32_wait_clamp() -> u32 {
 /// from the log.
 #[cfg(test)]
 pub(crate) mod block_probe {
+    #[cfg(target_os = "macos")]
+    use std::cell::Cell;
     use std::cell::RefCell;
     use std::time::Duration;
+
+    /// A hook that runs before each blocking round, with the round's index.
+    #[cfg(target_os = "macos")]
+    type RoundHook = Box<dyn FnMut(u32)>;
 
     thread_local! {
         static ARMED: RefCell<Vec<Option<Duration>>> = const { RefCell::new(Vec::new()) };
         static ON_BLOCKING: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+        #[cfg(target_os = "macos")]
+        static ROUND: Cell<u32> = const { Cell::new(0) };
+        #[cfg(target_os = "macos")]
+        static ON_ROUND: RefCell<Option<RoundHook>> = const { RefCell::new(None) };
     }
 
     pub(crate) fn record(armed: Option<Duration>) {
@@ -671,6 +681,56 @@ pub(crate) mod block_probe {
         if let Some(hook) = ON_BLOCKING.with(|h| h.borrow_mut().take()) {
             hook();
         }
+        #[cfg(target_os = "macos")]
+        fire_round();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn fire_round() {
+        let round = ROUND.with(|r| r.replace(r.get() + 1));
+        // Out of its slot for the call, so the hook may itself arm or drop rounds.
+        if let Some(mut hook) = ON_ROUND.with(|h| h.borrow_mut().take()) {
+            hook(round);
+            ON_ROUND.with(|h| {
+                let mut slot = h.borrow_mut();
+                if slot.is_none() {
+                    *slot = Some(hook);
+                }
+            });
+        }
+    }
+
+    /// Disarms an [`on_every_round`] hook on drop.
+    #[cfg(target_os = "macos")]
+    #[must_use = "dropping this immediately disarms the hook; bind it for the probe's duration"]
+    pub(crate) struct Rounds(());
+
+    #[cfg(target_os = "macos")]
+    impl Drop for Rounds {
+        fn drop(&mut self) {
+            ON_ROUND.with(|h| *h.borrow_mut() = None);
+        }
+    }
+
+    /// Run `hook` with the round's index on this thread just before every blocking `poll`, counted
+    /// from 0 at this call: the wait's own look has just returned what to block on, and every lock
+    /// is released.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn on_every_round(hook: impl FnMut(u32) + 'static) -> Rounds {
+        ROUND.with(|r| r.set(0));
+        ON_ROUND.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+        Rounds(())
+    }
+
+    /// Run `hook` on this thread just before blocking round `round` (see [`on_every_round`]).
+    #[cfg(target_os = "macos")]
+    pub(crate) fn on_round(round: u32, hook: impl FnOnce() + 'static) -> Rounds {
+        let mut hook = Some(hook);
+        on_every_round(move |at| {
+            if at == round {
+                hook.take().expect("a round comes once")();
+            }
+        })
     }
 
     /// Disarms an unfired [`on_blocking`] hook on drop.
