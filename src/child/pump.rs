@@ -1,5 +1,5 @@
 //! Deadlock-free `communicate`: stdin is fed while stdout and stderr are drained, so no full pipe
-//! buffer wedges the child. Unix does it on the calling thread, Windows on one thread per stream.
+//! buffer wedges the child.
 
 #[cfg(unix)]
 #[path = "pump/poll.rs"]

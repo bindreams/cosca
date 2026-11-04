@@ -1,9 +1,6 @@
 //! Unix: stdin, stdout and stderr go through one `poll` loop on the calling thread. No pipe can
 //! fill and stall the child, and nothing after the spawn needs a thread, so a caller under a task
 //! limit (`RLIMIT_NPROC`, a cgroup's `TasksMax`) cannot fail for want of one.
-//!
-//! This polls the pipe ends directly, through `wait::poll_ready`, not `os_process::poll`, which
-//! asks whether a process has exited.
 
 use std::io::{self, ErrorKind, PipeReader, PipeWriter, Read, Write};
 use std::os::fd::AsFd;
@@ -17,7 +14,6 @@ use crate::stdio::Fd;
 use crate::wait;
 use crate::Output;
 
-/// Bytes read from a pipe per call.
 const CHUNK: usize = 64 * 1024;
 
 pub(crate) fn communicate(child: &mut Child, input: Option<&[u8]>) -> Result<Output, Error> {

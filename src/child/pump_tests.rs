@@ -112,7 +112,6 @@ fn fixture_communicate_under_a_nproc_limit() {
     // SAFETY: lowers this fixture process's own process limit, and nothing else.
     let set = unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &limit) };
     assert_eq!(set, 0, "lower RLIMIT_NPROC: {}", std::io::Error::last_os_error());
-    // `RLIMIT_NPROC` does not bind uid 0 or a holder of CAP_SYS_RESOURCE or CAP_SYS_ADMIN.
     let refused = std::thread::Builder::new().spawn(|| {});
     assert!(
         refused.is_err(),

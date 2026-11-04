@@ -299,10 +299,10 @@ A group names an environment, not a mechanism. `CGROUP` means the unconfined cgr
 delegated cgroup with `unshare` permitted.
 
 `COSCA_TEST_UNPRIVILEGED` has no consent variable and no precondition: it holds the tests that
-mean something only without privilege, such as `communicate_starts_no_thread`, whose `RLIMIT_NPROC`
-does not bind root. It is a `test_group!` row joined with `#[fixture(unprivileged)] _group: &Group`,
-selected by `SKULD_LABELS=unprivileged`. Every root step of CI selects its tests by label, so none runs
-it; a root run of the unfiltered suite sets `COSCA_TEST_UNPRIVILEGED=0`.
+mean something only without privilege (`RLIMIT_NPROC` does not bind root). It is a `test_group!` row
+joined with `#[fixture(unprivileged)] _group: &Group`, selected by `SKULD_LABELS=unprivileged`. Every
+root step of CI selects its tests by label, so none runs it; a root run of the unfiltered suite sets
+`COSCA_TEST_UNPRIVILEGED=0`.
 
 **Why:** a skipped test reports the same pass as a working one, a gate that defaults to skip hides a
 whole group nobody decided to disable, and a process-wide mutation corrupts whichever tests share
