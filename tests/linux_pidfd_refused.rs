@@ -33,11 +33,12 @@ fn assert_refused(result: Result<impl std::fmt::Debug, Error>, op: &str, errno: 
     }
 }
 
-/// The refusal fails the open, once, naming it; an owned `Child` reaches the same refusal through
-/// its by-id acts, and kills through its own handle without one.
+/// The refusal fails the open, once, naming it; an owned `Child` terminates, shuts down and kills
+/// through its own handle, so it needs no `pidfd_open` and meets no refusal.
 ///
 /// Mutants: an errno missing from the refusals; an op named as another; the message shape;
-/// `Child::kill` routed through `pidfd_open`; `Process::current` built without an open.
+/// `Child::kill`, `terminate` or the graceful grace wait routed through `pidfd_open`;
+/// `Process::current` built without an open.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn a_seccomp_refused_pidfd_open_fails_the_open_naming_process_open() {
@@ -50,9 +51,11 @@ fn a_seccomp_refused_pidfd_open_fails_the_open_naming_process_open() {
                     assert_refused(cosca::Process::open_pid(child.id().pid()), "process open", name);
                     assert_refused(cosca::Process::open(child.id()), "process open", name);
                     assert_refused(cosca::Process::current(), "process open", name);
-                    assert_refused(child.terminate(), "process open", name);
-                    assert_refused(child.graceful_shutdown(Duration::ZERO), "process open", name);
-                    // An owned child is killed through its own handle: no pidfd, so no refusal.
+                    // An owned child acts through its own handle: no pidfd_open, so no refusal.
+                    child.terminate().expect("Child::terminate needs no pidfd_open");
+                    child
+                        .graceful_shutdown(Duration::ZERO)
+                        .expect("Child::graceful_shutdown needs no pidfd_open");
                     child.kill().expect("Child::kill needs no pidfd_open");
                 })
                 .join()
