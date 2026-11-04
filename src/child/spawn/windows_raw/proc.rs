@@ -1,212 +1,30 @@
-//! The raw-child process handle and the `CreateProcessW`/wait FFI primitives.
-//!
-//! [`RawChild`] owns the process `HANDLE` a raw spawn returns and answers the
-//! same wait/kill/identity questions as the std backend. [`create_process`] and
-//! [`wait_handle_or_cancel`] are the shared FFI seams the async backend reuses:
-//! the former is the sole `CreateProcessW` call site, the latter a cancellable
-//! process wait.
+//! The `CreateProcessW`/wait FFI primitives of the raw backend. [`create_process`] is the sole
+//! `CreateProcessW` call site, shared with the async backend, which also reuses
+//! [`wait_handle_or_cancel`], a cancellable process wait. The sync raw child is an
+//! [`OwnedChild`](crate::child::owned::OwnedChild) over a
+//! [`WindowsProcess`](crate::os_process::windows::WindowsProcess).
 
 use std::io;
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::io::{FromRawHandle, OwnedHandle};
 use std::os::windows::process::ExitStatusExt;
 use std::process::ExitStatus;
-use std::sync::OnceLock;
-use std::time::Instant;
 
 use windows::core::{PCWSTR, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_EVENT, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::Threading::{
-    CreateProcessW, GetExitCodeProcess, WaitForMultipleObjects, WaitForSingleObject, PROCESS_CREATION_FLAGS,
-    PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    CreateProcessW, GetExitCodeProcess, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
+    STARTUPINFOEXW,
 };
 
 use crate::error::{win32_io_error, Error};
-use crate::identity::{windows_is_access_denied, windows_terminate_held, Termination};
 
 /// `WaitForSingleObject`/`WaitForMultipleObjects` "no timeout" sentinel.
+#[cfg(feature = "tokio")]
 const INFINITE: u32 = 0xFFFF_FFFF;
-
-/// A child spawned via raw `CreateProcessW`, owning its process handle directly.
-#[derive(Debug)]
-pub(crate) struct RawChild {
-    proc: OwnedHandle,
-    pid: u32,
-    /// The status this handle's own `wait`, `try_wait` or `wait_deadline` returned: set once, and
-    /// only by them, so [`is_reaped`](Self::is_reaped) means "this handle recorded the exit".
-    /// A reader that sees the record a moment late is harmless on Windows: the open process
-    /// handle pins the pid, so it cannot be reused meanwhile.
-    reaped: OnceLock<ExitStatus>,
-}
-
-impl RawChild {
-    pub(crate) fn new(proc: OwnedHandle, pid: u32) -> RawChild {
-        RawChild {
-            proc,
-            pid,
-            reaped: OnceLock::new(),
-        }
-    }
-
-    pub(super) fn handle(&self) -> HANDLE {
-        HANDLE(self.proc.as_raw_handle())
-    }
-
-    /// The process handle, borrowed from `self`.
-    pub(crate) fn raw_handle(&self) -> std::os::windows::io::RawHandle {
-        self.proc.as_raw_handle()
-    }
-
-    /// Block on the exit that a denied or accepted `TerminateProcess` has set in motion.
-    fn reap(&self) -> io::Result<ExitStatus> {
-        self.wait()
-    }
-
-    pub(crate) fn id(&self) -> u32 {
-        self.pid
-    }
-
-    /// Whether this handle's own wait has recorded the exit. Nothing is consumed on Windows, so
-    /// an exit nobody waited on yet is not recorded: this is the same meaning as on the other
-    /// backends.
-    pub(crate) fn is_reaped(&self) -> bool {
-        self.reaped.get().is_some()
-    }
-
-    /// Record `status` as this handle's reap, and pass it on.
-    fn record(&self, status: ExitStatus) -> ExitStatus {
-        _ = self.reaped.set(status);
-        status
-    }
-
-    /// A `WaitForSingleObject` result that is neither signalled nor timed out: a contract breach
-    /// on our own live handle, reported as the OS error.
-    fn unexpected_wait_result(&self, r: WAIT_EVENT) -> io::Error {
-        let e = io::Error::last_os_error();
-        log::warn!(
-            "pid {}: WaitForSingleObject on the process handle returned {r:?}: {e}",
-            self.pid
-        );
-        debug_assert!(false, "WaitForSingleObject on our own process handle returned {r:?}");
-        e
-    }
-
-    /// Block until the child exits, returning its status.
-    pub(crate) fn wait(&self) -> io::Result<ExitStatus> {
-        #[cfg(test)]
-        fault::before_blocking_wait()?;
-        match wait_handle_or_cancel(self.handle(), None)? {
-            WaitOutcome::Exited => exit_status(self.handle()).map(|s| self.record(s)),
-            WaitOutcome::Cancelled => unreachable!("wait with no cancel handle cannot be cancelled"),
-        }
-    }
-
-    /// The exit status if the child has already exited, else `None`.
-    pub(crate) fn try_wait(&self) -> io::Result<Option<ExitStatus>> {
-        // SAFETY: `handle` is our live, owned process handle; a zero timeout polls without blocking.
-        let r = unsafe { WaitForSingleObject(self.handle(), 0) };
-        if r == WAIT_OBJECT_0 {
-            Ok(Some(self.record(exit_status(self.handle())?)))
-        } else if r == WAIT_TIMEOUT {
-            Ok(None)
-        } else {
-            Err(self.unexpected_wait_result(r))
-        }
-    }
-
-    /// Block until the child exits or `deadline` passes (`Ok(None)` at expiry). The wait is on a
-    /// real external event (child exit); the timeout is the caller's deadline, not a sync bet.
-    ///
-    /// Armed in rounds via `win32_timeout_ms`; WAIT_TIMEOUT is never trusted (Win32 waits may
-    /// time out early); rechecked each round (principle 13).
-    pub(crate) fn wait_deadline(&self, deadline: Instant) -> io::Result<Option<ExitStatus>> {
-        // SAFETY: `handle` is our live, owned process handle.
-        let r = crate::wait::wait_until(Some(deadline), |ms| unsafe { WaitForSingleObject(self.handle(), ms) });
-        if r == WAIT_OBJECT_0 {
-            Ok(Some(self.record(exit_status(self.handle())?)))
-        } else if r == WAIT_TIMEOUT {
-            Ok(None)
-        } else {
-            Err(self.unexpected_wait_result(r))
-        }
-    }
-
-    /// Hard-kill the process. An already-exited child is success (matches std's `kill`).
-    pub(crate) fn kill(&self) -> io::Result<()> {
-        if self.start_kill()? {
-            // The termination is under way: BLOCK on the real exit event, recording the exit.
-            self.reap()?;
-        }
-        Ok(())
-    }
-
-    /// Hard-kill the process and never wait. `Ok(true)` when the termination was already under way
-    /// (`Termination::Exited`): the caller owns the wait for it.
-    pub(crate) fn start_kill(&self) -> io::Result<bool> {
-        match windows_terminate_held(self.handle()) {
-            Termination::Terminated => Ok(false),
-            Termination::Exited => Ok(true),
-            // A handle without `PROCESS_TERMINATE` (a higher-integrity runas child), or any other
-            // failure: surface it, never block.
-            Termination::Failed(e) => Err(win32_io_error(e)),
-        }
-    }
-
-    /// Best-effort `kill_on_drop` teardown that never blocks on a child it cannot terminate.
-    /// Kill, then reap via a blocking wait on the real exit event. A handle without
-    /// `PROCESS_TERMINATE` (a higher-integrity runas child) is left running, never waited on. What
-    /// it could not do comes back in [`Torn::left`] for the caller's one warn; nothing is logged
-    /// here.
-    pub(crate) fn teardown_on_drop(&self, id: crate::identity::ProcessId) -> crate::child::proc_handle::Torn {
-        use crate::child::proc_handle::Torn;
-        use crate::error::ChildFate;
-        let reap_after_refusal = || {
-            let reaped = self.reap();
-            #[cfg(test)]
-            if let Ok(status) = &reaped {
-                crate::child::spawn::fault::record_teardown_reap(self.pid, *status);
-            }
-            Torn::new(fate_after_reap(reaped))
-        };
-        match windows_terminate_held(self.handle()) {
-            Termination::Terminated => {
-                #[cfg(test)]
-                crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterDropKill);
-                let reaped = self.reap();
-                #[cfg(test)]
-                if let Ok(status) = &reaped {
-                    crate::child::spawn::fault::record_teardown_reap(self.pid, *status);
-                }
-                Torn::new(fate_after_reap(reaped))
-            }
-            Termination::Exited => reap_after_refusal(),
-            // A runas child without `PROCESS_TERMINATE`: leave it, never block.
-            Termination::Failed(e) if windows_is_access_denied(&e) => Torn {
-                fate: ChildFate::Running { id: Some(id) },
-                left: Some(format!(
-                    "elevated child {} could not be terminated on drop (higher integrity); leaving it running",
-                    self.pid
-                )),
-            },
-            Termination::Failed(e) => Torn {
-                fate: ChildFate::Unknown,
-                left: Some(format!("terminating child {} on drop failed: {e:?}", self.pid)),
-            },
-        }
-    }
-}
-
-/// The fate after a teardown's blocking wait, which follows a delivered kill or an exit already
-/// under way: `Reaped` for a collected status, else `Killed` (dead or dying, the wait failed).
-pub(super) fn fate_after_reap(reaped: io::Result<ExitStatus>) -> crate::error::ChildFate {
-    use crate::error::ChildFate;
-    match reaped {
-        Ok(_) => ChildFate::Reaped,
-        Err(_) => ChildFate::Killed,
-    }
-}
 
 /// The outcome of [`wait_handle_or_cancel`]. `Copy`/`Eq`: the async backend clones it across the
 /// per-instance test observer channel and asserts on it.
+#[cfg(feature = "tokio")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WaitOutcome {
     /// The process handle signaled — the child exited.
@@ -217,7 +35,11 @@ pub(crate) enum WaitOutcome {
 
 /// Wait for `proc` to exit, or for `cancel` (if given) to signal first. With no cancel handle this
 /// is a plain blocking wait; the cancel arm backs the async backend's grace cancellation.
+#[cfg(feature = "tokio")]
 pub(crate) fn wait_handle_or_cancel(proc: HANDLE, cancel: Option<HANDLE>) -> io::Result<WaitOutcome> {
+    use windows::Win32::Foundation::{WAIT_EVENT, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::{WaitForMultipleObjects, WaitForSingleObject};
+
     match cancel {
         Some(cancel) => {
             let handles = [proc, cancel];
@@ -311,101 +133,6 @@ pub(crate) fn create_process(
         log::debug!("CloseHandle(hThread): {e:?}");
     }
     Ok((proc, pi.dwProcessId))
-}
-
-/// Seam for [`RawChild::kill`] and [`RawChild::teardown_on_drop`].
-#[cfg(test)]
-pub(crate) mod fault {
-    use std::cell::RefCell;
-
-    #[derive(Default)]
-    struct State {
-        armed: bool,
-        on_wait: Option<Box<dyn FnMut()>>,
-        waits: u32,
-        fail_next_wait: bool,
-    }
-
-    thread_local! {
-        static STATE: RefCell<State> = RefCell::new(State::default());
-    }
-
-    /// Run `on_wait` before every blocking wait on this thread and count them. Lets a test end a
-    /// never-exiting fixture a second way, so a no-op terminate fails on exit code, not by hanging.
-    ///
-    /// The guard resets the state on drop. Arming over a live guard is a test bug.
-    pub(crate) fn observe_waits(on_wait: impl FnMut() + 'static) -> Observer {
-        STATE.with(|s| {
-            let mut s = s.borrow_mut();
-            debug_assert!(!s.armed, "the wait observer is already armed");
-            *s = State {
-                armed: true,
-                on_wait: Some(Box::new(on_wait)),
-                ..State::default()
-            };
-        });
-        Observer
-    }
-
-    /// Counts a blocking wait and runs the observer's hook. `Err` when the observer made this wait
-    /// fail; the wait is then not made.
-    pub(crate) fn before_blocking_wait() -> std::io::Result<()> {
-        let (hook, fail) = STATE.with(|s| {
-            let mut s = s.borrow_mut();
-            if !s.armed {
-                return (None, false);
-            }
-            s.waits += 1;
-            (s.on_wait.take(), std::mem::take(&mut s.fail_next_wait))
-        });
-        if let Some(mut hook) = hook {
-            hook();
-            STATE.with(|s| s.borrow_mut().on_wait = Some(hook));
-        }
-        if fail {
-            return Err(std::io::Error::other(ForcedWaitFailure));
-        }
-        Ok(())
-    }
-
-    /// The error [`Observer::fail_next_wait`] makes a wait fail with.
-    #[derive(Debug)]
-    struct ForcedWaitFailure;
-
-    impl std::fmt::Display for ForcedWaitFailure {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("forced wait failure (test seam)")
-        }
-    }
-
-    impl std::error::Error for ForcedWaitFailure {}
-
-    /// Whether `e` is the failure [`Observer::fail_next_wait`] made, by its type.
-    pub(crate) fn is_forced_wait_failure(e: &std::io::Error) -> bool {
-        e.get_ref().is_some_and(|inner| inner.is::<ForcedWaitFailure>())
-    }
-
-    #[must_use]
-    pub(crate) struct Observer;
-
-    impl Observer {
-        /// Make the next blocking wait fail, as one on a handle that cannot be waited on would.
-        pub(crate) fn fail_next_wait(&self) {
-            STATE.with(|s| s.borrow_mut().fail_next_wait = true);
-        }
-
-        /// Blocking waits started since arming.
-        pub(crate) fn waits(&self) -> u32 {
-            STATE.with(|s| s.borrow().waits)
-        }
-    }
-
-    impl Drop for Observer {
-        fn drop(&mut self) {
-            let state = STATE.with(|s| std::mem::take(&mut *s.borrow_mut()));
-            drop(state);
-        }
-    }
 }
 
 #[cfg(test)]

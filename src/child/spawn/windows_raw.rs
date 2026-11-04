@@ -65,7 +65,6 @@ pub(crate) mod resolve;
 #[path = "windows_raw/proc.rs"]
 mod proc;
 
-pub(crate) use proc::RawChild;
 // The exit-status reader, which `wait::exit_only` reads a signalled handle's code through too.
 pub(crate) use proc::exit_status;
 // Additional seams the async raw backend reuses: the cancellable handle wait + its
@@ -87,6 +86,7 @@ use windows::Win32::System::Threading::{
     LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, STARTF_USESTDHANDLES, STARTUPINFOEXW,
 };
 
+use crate::child::owned::{ChildWaitOutcome, OwnedChild};
 use crate::child::proc_handle::ProcHandle;
 use crate::child::spawn::{
     attach_or_fault, null_end, reject_batch_path, resolve_identity, resolve_stdio, spawn_lock, ChildEnd, Classify,
@@ -95,6 +95,8 @@ use crate::child::spawn::{
 use crate::child::Child;
 use crate::command::{Command, CommandInput, EnvOp, ExecutableSpec};
 use crate::error::{win32_io_error, ChildFate, Error};
+use crate::os_process::windows::WindowsProcess;
+use crate::signal::Sig;
 use crate::stdio::{Fd, ResolvedStdio};
 
 /// Spawn `cmd` via raw `CreateProcessW`. Handles descriptors 0/1/2 plus arbitrary fd >= 3 (wired
@@ -238,7 +240,7 @@ pub(crate) fn spawn_raw(
     };
 
     Ok(Child::from_parts(
-        ProcHandle::Raw(RawChild::new(proc, pid)),
+        ProcHandle::std(OwnedChild::new(Box::new(WindowsProcess::for_child(proc, pid))), pid),
         id,
         parent_ends,
         kill_on_drop,
@@ -493,12 +495,27 @@ pub(crate) fn raw_spawn_teardown(
     id: Option<crate::identity::ProcessId>,
     warn_after: Option<std::time::Duration>,
 ) -> ChildFate {
-    let rc = RawChild::new(proc, pid);
-    // Windows only, so the std path-s invariant does NOT carry: there is no zombie to reap
-    // and `rc.wait()` is a bare `WaitForSingleObject(handle, INFINITE)`. If the kill failed,
-    // nothing asked the child to exit and that wait would park forever - a logged, leaked
-    // child is strictly better. The kill never waits: `wait_warning` owns the one wait.
-    if let Err(e) = rc.start_kill() {
+    teardown_spawned(
+        &OwnedChild::new(Box::new(WindowsProcess::for_child(proc, pid))),
+        pid,
+        id,
+        warn_after,
+    )
+}
+
+/// [`raw_spawn_teardown`] of the spawned `child`: one kill, which never waits, and then the one
+/// wait.
+fn teardown_spawned(
+    child: &OwnedChild,
+    pid: u32,
+    id: Option<crate::identity::ProcessId>,
+    warn_after: Option<std::time::Duration>,
+) -> ChildFate {
+    // Windows only, so the std path's invariant does NOT carry: there is no zombie to reap and the
+    // wait is a bare `WaitForSingleObject(handle, INFINITE)`. If the kill failed, nothing asked the
+    // child to exit and that wait would park forever - a logged, leaked child is strictly better.
+    // `wait_warning` owns the one wait.
+    if let Err(e) = child.signal(Sig::Kill) {
         log::warn!("raw spawn teardown: kill of pid {pid} failed: {e}; not waiting");
         return ChildFate::Running { id };
     }
@@ -506,28 +523,32 @@ pub(crate) fn raw_spawn_teardown(
     #[cfg(test)]
     crate::child::spawn::fault::run_between_kill_and_wait();
     let waited = crate::wait::teardown_warn::wait_warning(
-        &rc,
+        child,
         crate::wait::teardown_warn::Due::in_(warn_after),
-        |rc, until| crate::wait::teardown_warn::handle_signaled_by(rc.handle(), until),
+        |child, until| crate::wait::teardown_warn::handle_signaled_by(HANDLE(child.os_handle().as_raw_handle()), until),
         |after| crate::child::spawn::warn_still_waiting(Some(pid), after),
-        |rc| rc.wait(),
+        |child| child.wait(None),
     );
-    match &waited {
-        Ok(_status) => {
+    // The kill was delivered, or the child's exit was already under way: either way it is dead or
+    // dying.
+    match waited {
+        Ok(ChildWaitOutcome::Exited(_record)) => {
             #[cfg(test)]
-            crate::child::spawn::fault::record_teardown_reap(pid, *_status);
+            if let crate::os_process::child::ExitRecord::Status(status) = _record {
+                crate::child::spawn::fault::record_teardown_reap(pid, status);
+            }
+            ChildFate::Reaped
+        }
+        Ok(ChildWaitOutcome::Foreign(foreign)) => foreign.fate(true),
+        Ok(ChildWaitOutcome::DeadlinePassed) => {
+            debug_assert!(false, "an unbounded wait ended at a deadline");
+            ChildFate::Killed
         }
         Err(e) => {
             log::warn!("raw spawn teardown failed to reap pid {pid}: {e}");
-            #[cfg(test)]
-            let forced = proc::fault::is_forced_wait_failure(e);
-            #[cfg(not(test))]
-            let forced = false;
-            debug_assert!(forced, "raw spawn teardown failed to reap child: {e}");
+            ChildFate::Killed
         }
     }
-    // The kill was delivered, or the child's exit was already under way: either way it is dead or dying.
-    proc::fate_after_reap(waited)
 }
 
 /// The `STARTUPINFOEXW` for a raw spawn, with what it points at.
@@ -785,3 +806,7 @@ impl Drop for AttributeList {
 #[cfg(test)]
 #[path = "windows_raw_tests.rs"]
 mod windows_raw_tests;
+
+#[cfg(test)]
+#[path = "windows_raw/teardown_tests.rs"]
+mod teardown_tests;
