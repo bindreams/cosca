@@ -83,7 +83,7 @@ fn wait_deadline_past_returns_some_after_exit() {
 
 #[skuld::test]
 fn concurrent_wait_timeout_and_kill_is_safe() {
-    // `SharedChild` makes this race-free (the pidfd, handle or unreaped zombie pins the child).
+    // `OwnedChild` makes this race-free (the pidfd, handle or unreaped zombie pins the child).
     // The kill guarantees death, so wait_timeout observes Some — deterministic, no
     // is_alive/sleep. The 30s is only a backstop against a hang. The release after the kill is
     // what lets a `kill` that sent nothing fail the signal assertion, not block the waiter.

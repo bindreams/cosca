@@ -1,4 +1,4 @@
-//! `SharedChild` against a child this process traces (`TRACER` group; needs
+//! `OwnedChild` against a child this process traces (`TRACER` group; needs
 //! `COSCA_TEST_TRACER_CONSENT=1`). Every fixture child is spawned under `spawn_lock`.
 //!
 //! Linux reports a ptrace stop to the tracer whatever the `waitid` options say
@@ -7,9 +7,11 @@
 //! traces would take the stop for an exit and steal the tracer's stop event.
 
 #[cfg(target_os = "linux")]
-use super::fixtures::Blocker;
+use super::fixtures::{try_wait, wait_status, Blocker};
 #[cfg(target_os = "linux")]
-use crate::child::shared::State;
+use crate::child::owned::{ChildWaitOutcome, State};
+#[cfg(target_os = "linux")]
+use crate::signal::Sig;
 #[cfg(target_os = "linux")]
 use crate::test_child::reaped_elsewhere::kill_own_child;
 #[cfg(target_os = "linux")]
@@ -29,11 +31,14 @@ fn try_wait_leaves_a_ptrace_stop_for_the_tracer(#[fixture(tracer_group)] _group:
     use std::os::unix::process::ExitStatusExt as _;
 
     let b = Blocker::spawn();
-    let pid = b.shared.id() as libc::pid_t;
+    let pid = b.pid as libc::pid_t;
     own_tracer::seize_and_stop(pid);
 
-    assert_eq!(b.shared.try_wait().expect("try_wait"), None, "a stop is not an exit");
-    assert!(matches!(b.shared.lock().state, State::N));
+    assert!(
+        matches!(try_wait(&b.owned), Ok(ChildWaitOutcome::DeadlinePassed)),
+        "a stop is not an exit"
+    );
+    assert!(matches!(b.owned.lock().state, State::N));
 
     // The stop is still there for the tracer. `WNOHANG`: the `WNOWAIT` peek above already saw it,
     // so a missing stop is an assertion failure here, never a wait that blocks forever.
@@ -50,8 +55,8 @@ fn try_wait_leaves_a_ptrace_stop_for_the_tracer(#[fixture(tracer_group)] _group:
     // PTRACE_EVENT_STOP). Not the handle's `kill`: a send that went nowhere would leave this
     // tracee stopped for the `wait` below to block on, and ending it by closing its stdin does
     // not wake a ptrace stop.
-    kill_own_child(b.shared.id());
-    assert_eq!(b.shared.wait().expect("wait").signal(), Some(libc::SIGKILL));
+    kill_own_child(b.pid);
+    assert_eq!(wait_status(&b.owned).signal(), Some(libc::SIGKILL));
 }
 
 /// The handle's `kill` ends a child stopped under this process's `PTRACE_SEIZE`: a `SIGKILL` wakes
@@ -64,14 +69,14 @@ fn kill_ends_a_child_stopped_for_its_tracer(#[fixture(tracer_group)] _group: &Gr
     use std::os::unix::process::ExitStatusExt as _;
 
     let mut b = Blocker::spawn();
-    let pid = b.shared.id() as libc::pid_t;
+    let pid = b.pid as libc::pid_t;
     own_tracer::seize_and_stop(pid);
 
-    b.shared.kill().expect("kill");
+    b.owned.signal(Sig::Kill).expect("kill");
     own_tracer::resume_unless_dying(pid);
     b.end_child();
     assert_eq!(
-        b.shared.wait().expect("wait").signal(),
+        wait_status(&b.owned).signal(),
         Some(libc::SIGKILL),
         "the handle's kill did not end the stopped tracee"
     );
@@ -87,10 +92,11 @@ fn kill_ends_a_child_stopped_for_its_tracer(#[fixture(tracer_group)] _group: &Gr
 mod macos {
     use std::time::Duration;
 
-    use super::super::fixtures::Blocker;
-    use crate::child::shared::State;
+    use super::super::fixtures::{try_wait, wait_status, Blocker};
+    use crate::child::owned::{ChildWaitOutcome, State};
     use crate::identity::{uniq_fault, ReadPurpose, UniqRead};
     use crate::os_process::child::ExitRecord;
+    use crate::signal::Sig;
     use crate::test_child::{run_fixture_output_within, step, watchdog};
     use crate::test_groups::{tracer_group, Group};
     use crate::test_support::tracer::{attach_settled, debugger_signed_copy, settled_stop, AttachError};
@@ -127,7 +133,7 @@ mod macos {
     /// ever stops, and no stop comes.
     fn attach_and_confirm_stop(blocker: &Blocker) {
         step("attach and settle");
-        match attach_settled(blocker.shared.id()) {
+        match attach_settled(blocker.pid) {
             Ok(()) => {}
             Err(AttachError::Errno(e)) => panic!("attach: {}", std::io::Error::from_raw_os_error(e)),
             Err(AttachError::Exited { code, status }) => {
@@ -146,8 +152,8 @@ mod macos {
     /// delays a kill and cannot cancel it. So the child is asserted still stopped after `kill`,
     /// until `PT_KILL`.
     fn kill_stopped(blocker: &Blocker) {
-        let pid = blocker.shared.id();
-        blocker.shared.kill().expect("kill");
+        let pid = blocker.pid;
+        blocker.owned.signal(Sig::Kill).expect("kill");
         let stopped = settled_stop(pid);
         assert!(
             matches!(stopped, Ok(Some(_))),
@@ -185,10 +191,13 @@ mod macos {
         let b = Blocker::spawn();
         attach_and_confirm_stop(&b);
         step("try_wait");
-        assert_eq!(b.shared.try_wait().expect("try_wait"), None, "a stop is not an exit");
-        assert!(matches!(b.shared.lock().state, State::N));
+        assert!(
+            matches!(try_wait(&b.owned), Ok(ChildWaitOutcome::DeadlinePassed)),
+            "a stop is not an exit"
+        );
+        assert!(matches!(b.owned.lock().state, State::N));
         kill_stopped(&b);
-        assert_killed(b.shared.wait().expect("wait"));
+        assert_killed(wait_status(&b.owned));
     }
 
     /// A child this process traces is reaped fully: XNU needs two reaps, because the first only
@@ -210,13 +219,13 @@ mod macos {
         attach_and_confirm_stop(&b);
         kill_stopped(&b);
         step("wait");
-        assert_killed(b.shared.wait().expect("wait"));
+        assert_killed(wait_status(&b.owned));
         // SAFETY: an all-zero `siginfo_t` is valid, and `waitid` writes only into it.
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
         let r = unsafe {
             libc::waitid(
                 libc::P_PID,
-                b.shared.id() as libc::id_t,
+                b.pid as libc::id_t,
                 &mut info,
                 libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
             )
@@ -242,13 +251,13 @@ mod macos {
         step("spawn");
         let b = Blocker::spawn();
         attach_and_confirm_stop(&b);
-        let marker = format!("second reap of pid {}", b.shared.id());
+        let marker = format!("second reap of pid {}", b.pid);
         let mark = crate::log_capture::mark();
         let _forced = uniq_fault::force_uniq_read_once(ReadPurpose::SecondPeek, UniqRead::Refused(libc::EPERM));
         kill_stopped(&b);
-        assert_killed(b.shared.wait().expect("wait"));
+        assert_killed(wait_status(&b.owned));
         assert!(
-            matches!(b.shared.lock().state, State::E(ExitRecord::Status(_))),
+            matches!(b.owned.lock().state, State::E(ExitRecord::Status(_))),
             "the first reap's status is cached"
         );
         assert_eq!(crate::log_capture::levels_since(mark, &marker), vec![log::Level::Warn]);

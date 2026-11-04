@@ -86,7 +86,7 @@ struct CatPipes {
 }
 
 /// Spawn [`root_that_leaves_a_cat`] and read its `started`: the `cat` is forked, and the root is
-/// exiting, a zombie, or already reaped by the spawn (`SharedChild::new` reaps a root that has
+/// exiting, a zombie, or already reaped by the spawn (a mutant `OwnedChild::new` reaps a root that has
 /// exited by then).
 fn spawn_cat_tree() -> (crate::Child, CatPipes) {
     let mut child = root_that_leaves_a_cat().spawn().expect("spawn");

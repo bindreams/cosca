@@ -36,7 +36,7 @@ impl Child {
         timeout: Duration,
         until: impl FnOnce(Option<Instant>) -> Result<Option<ExitStatus>, Error>,
     ) -> Result<Option<ExitStatus>, Error> {
-        // The sync lone path's watch goes through `SharedChild::wait_deadline`, not
+        // The sync lone path's watch goes through `OwnedChild::wait`, not
         // `exited_by_id`, so it needs its own head of the shared watch fault seam.
         #[cfg(test)]
         if crate::wait::fault::take_force_watch_error() {
@@ -51,7 +51,7 @@ impl Child {
     /// Like [`wait_timeout`](Child::wait_timeout) but against an absolute `deadline`
     /// (at or before now behaves like [`try_wait`](Child::try_wait)).
     ///
-    /// Never returns `None` before the clock reaches `deadline`: `SharedChild` decides expiry
+    /// Never returns `None` before the clock reaches `deadline`: `OwnedChild` decides expiry
     /// from the clock after every wake, never from a primitive's own "timed out".
     pub fn wait_deadline(&self, deadline: Instant) -> Result<Option<ExitStatus>, Error> {
         self.proc.wait_deadline(deadline).map_err(Error::Io)

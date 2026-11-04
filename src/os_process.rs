@@ -39,6 +39,12 @@ pub(crate) trait OsProcess: Send + Sync + fmt::Debug {
     /// Look at the process once, without blocking. A [`Exit::Running`] look carries what to wait
     /// on for the next change; the wait ends on any change, so look again after it.
     fn exited(&self) -> Result<Exit<'_>, Error>;
+
+    /// The OS object that names the process, lent to platform-only consumers (Job Objects, resume,
+    /// cgroup attach). A fake lends its own wake fd or event, which names no process: code that
+    /// uses a handle is tested against real processes.
+    #[cfg(any(target_os = "linux", windows))]
+    fn os_handle(&self) -> child::OsHandle<'_>;
 }
 
 /// What one look at a process found.
@@ -70,7 +76,7 @@ pub(crate) const OPEN_CONSEQUENCE: &str = "its exit cannot be observed and no si
 pub(crate) fn open(id: ProcessId) -> Result<Option<Box<dyn OsProcess>>, Error> {
     #[cfg(target_os = "linux")]
     return Ok(linux::open::open_verified(id)?
-        .map(|pidfd| Box::new(linux::LinuxProcess::new(id, pidfd)) as Box<dyn OsProcess>));
+        .map(|pidfd| Box::new(linux::LinuxProcess::new(id.pid(), pidfd)) as Box<dyn OsProcess>));
     #[cfg(windows)]
     return Ok(windows::WindowsProcess::open(id)?.map(|p| Box::new(p) as Box<dyn OsProcess>));
     #[cfg(target_os = "macos")]

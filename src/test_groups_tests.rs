@@ -145,7 +145,7 @@ mod reexec {
         "child::spawn::spawn_tests::cgroup_sync_identity_failure_settles_the_leaf_verdict_before_the_kill";
 
     /// A real `TRACER` test: it attaches a tracer with `ptrace`, so only a granted group may run it.
-    const TRACER_TEST: &str = "child::shared::shared_tests::tracer::try_wait_leaves_a_ptrace_stop_for_the_tracer";
+    const TRACER_TEST: &str = "child::owned::owned_tests::tracer::try_wait_leaves_a_ptrace_stop_for_the_tracer";
 
     struct Case {
         test: &'static str,

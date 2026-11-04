@@ -396,6 +396,14 @@ impl Error {
         }
     }
 
+    /// This error as an [`std::io::Error`]: an [`Error::Io`] as it is, any other variant wrapped.
+    pub(crate) fn into_io(self) -> std::io::Error {
+        match self {
+            Error::Io(e) => e,
+            other => std::io::Error::other(other),
+        }
+    }
+
     /// The OS error code of an [`Error::Io`], for a look whose failure is told apart by it.
     #[cfg(any(unix, feature = "tokio"))]
     pub(crate) fn raw_os_error(&self) -> Option<i32> {
