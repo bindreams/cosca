@@ -204,6 +204,55 @@ fn child_graceful_shutdown_tree_graceful_root_sigterm() {
     );
 }
 
+// `terminate` signals the child through the handle it already holds, not by opening the child
+// afresh from its number: with the next `pidfd_open` made to fail, the `SIGTERM` is still
+// delivered and the failure is still waiting for the next open. Its stdin is released after
+// `terminate` returns, so a `terminate` that sent nothing yields exit 0.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn terminate_does_not_open_the_child_afresh() {
+    use std::os::unix::process::ExitStatusExt;
+    let _warns = crate::log_capture::warn_watch();
+    let (child, stdin) = crate::test_child::held_contained_blocker_without_cgroup(crate::Stdio::null());
+    let _forced = crate::os_process::linux::open::fault::force_pidfd_open_errno_once(rustix::io::Errno::MFILE);
+
+    child.terminate().expect("terminate");
+    drop(stdin);
+
+    assert_eq!(
+        crate::os_process::linux::open::fault::take_forced_pidfd_open_errno(),
+        Some(rustix::io::Errno::MFILE),
+        "the terminate opened the child afresh"
+    );
+    let status = child.wait().expect("reap");
+    assert_eq!(status.signal(), Some(libc::SIGTERM), "{status:?}");
+}
+
+// The root-only grace wait of `graceful_shutdown_tree` (a mechanism with no drain edge) looks at
+// the child through the handle it holds, not by opening it afresh: with the next `pidfd_open` made
+// to fail, it still sees the exit within the grace, so the call returns the status the `SIGTERM`
+// gave and no watch error surfaces.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn graceful_shutdown_grace_wait_does_not_open_the_child_afresh() {
+    use std::os::unix::process::ExitStatusExt;
+    let _warns = crate::log_capture::warn_watch();
+    let (child, stdin) = crate::test_child::held_contained_blocker_without_cgroup(crate::Stdio::pipe());
+    assert!(
+        !child.containment().can_observe_drain(),
+        "the fixture must watch the root only, got {:?}",
+        child.containment()
+    );
+    let _release = term_fault::release_at(term_fault::HookPoint::AfterTerminate, stdin);
+    let _forced = crate::os_process::linux::open::fault::force_pidfd_open_errno_once(rustix::io::Errno::MFILE);
+
+    let status = child
+        .graceful_shutdown_tree(Duration::from_secs(30))
+        .expect("the grace wait must see the exit through the handle");
+
+    assert_eq!(status.signal(), Some(libc::SIGTERM), "{status:?}");
+}
+
 // A contained two-member tree, a root `cat` and a grandchild `sh` reading the same stdin pipe: the
 // group's `SIGTERM` leaves neither alive. The root's status is `SIGTERM`, which the release (as in
 // the test above) turns into 0 if no `SIGTERM` was sent. The grandchild prints `leaf` once the

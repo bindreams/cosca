@@ -4,8 +4,11 @@ use std::time::{Duration, Instant};
 
 use backon::{BackoffBuilder as _, ExponentialBackoff, ExponentialBuilder};
 
-use super::{open, Exit, OsProcess, WaitFor};
+#[cfg(test)]
+use super::open;
+use super::{Exit, OsProcess, WaitFor};
 use crate::error::Error;
+#[cfg(test)]
 use crate::identity::ProcessId;
 use crate::wait::remaining;
 
@@ -28,6 +31,9 @@ fn enter() -> Result<(), Error> {
 /// Non-reaping. The bounded-section assert, the watch-fault seam and the deadline come before the
 /// open, so the timeout counts from the call and the first two hold for a gone id too. Every
 /// blocking call is armed from the time remaining, read right before it.
+///
+/// Tests only: an owned child is looked at through its own handle, never opened afresh by its number.
+#[cfg(test)]
 pub(crate) fn exited_by_id(id: ProcessId, timeout: Option<Duration>) -> Result<bool, Error> {
     enter()?;
     let deadline = absolute(timeout);

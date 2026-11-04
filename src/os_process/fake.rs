@@ -35,8 +35,9 @@ pub(crate) enum ReapAnswer {
 /// One scripted answer of [`OsChild::peek`].
 pub(crate) type PeekAnswer = Result<PeekOutcome, std::io::ErrorKind>;
 
-/// One scripted answer of [`OsProcess::signal`].
-pub(crate) type SignalAnswer = Result<Sent, std::io::ErrorKind>;
+/// One scripted answer of [`OsProcess::signal`]. A failure is the whole `io::Error`, so a test can
+/// state a raw errno.
+pub(crate) type SignalAnswer = Result<Sent, std::io::Error>;
 
 /// Cloning gives another handle on the same tables and the same wake source: the test keeps one,
 /// the code under test owns the other.
@@ -169,7 +170,7 @@ impl OsProcess for FakeProcess {
             .expect("FakeProcess: a signal was sent past the scripted answers")
         {
             Ok(sent) => Ok(sent),
-            Err(kind) => Err(Error::Io(kind.into())),
+            Err(error) => Err(Error::Io(error)),
         }
     }
 

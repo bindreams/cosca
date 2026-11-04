@@ -9,7 +9,7 @@ use crate::error::Error;
 
 /// The `crate::wait::fault` grace-watch seam, consumed HERE rather than inside a specific
 /// backend so it applies uniformly to whichever watch `graceful_shutdown_tree` actually
-/// performs — root-only ([`crate::os_process::drive::exited_by_id`]) or whole-tree
+/// performs — root-only ([`OwnedChild::exited_by`](super::owned::OwnedChild::exited_by)) or whole-tree
 /// ([`crate::containment::Attached::wait_drained`]). Outside test builds the seam module does
 /// not exist at all, so this compiles to a constant `None`.
 #[cfg(test)]
@@ -76,7 +76,7 @@ impl Child {
             }
             self.refuse_unpinned("terminate", None)?;
         }
-        crate::graceful::signal(self.graceful, self.id)
+        crate::graceful::signal(self.graceful, self.id, |sig| self.proc.signal(sig).map(drop))
     }
 
     /// Cooperative-then-forced lone shutdown: [`terminate`](Child::terminate), wait up to
@@ -395,14 +395,14 @@ impl Child {
                 Ok(verdict) if verdict.permits_skipping_sweep() => (true, true, None),
                 // Not sufficient proof alone to skip the sweep (see the doc above) — fall back
                 // to the fresh, non-blocking, zero-duration root probe described there.
-                Ok(_) => match crate::os_process::drive::exited_by_id(self.id, Some(Duration::ZERO)) {
+                Ok(_) => match self.proc.exited_by(crate::wait::deadline_from(Duration::ZERO)) {
                     Ok(exited) => (false, exited, None),
                     Err(e) => (false, false, Some(e)),
                 },
                 Err(e) => (false, false, Some(e)),
             }
         } else {
-            match crate::os_process::drive::exited_by_id(self.id, Some(grace)) {
+            match self.proc.exited_by(crate::wait::deadline_from(grace)) {
                 // NON-reaping grace-wait on the root only.
                 Ok(exited) => (false, exited, None),
                 Err(e) => (false, false, Some(e)),
@@ -478,14 +478,16 @@ impl Child {
     #[cfg(target_os = "linux")]
     fn shut_down_root_through_pidfd(&self, call: &crate::child::TreeCall<'_>, grace: Duration, why: &str) -> Error {
         let shutdown = match crate::child::PidfdShutdown::start(self.terminate_gate(), || {
-            self.proc.signal_sent(crate::signal::Sig::Term).map_err(Error::Io)
+            self.proc.signal(crate::signal::Sig::Term)
         }) {
             Ok(shutdown) => shutdown,
             Err(unkillable) => return unkillable,
         };
         #[cfg(test)]
         fault::run_hook(fault::HookPoint::AfterTerminate);
-        let exited = shutdown.needs_grace().then(|| self.proc.exited_within(grace));
+        let exited = shutdown
+            .needs_grace()
+            .then(|| self.proc.exited_by(crate::wait::deadline_from(grace)));
         shutdown.finish(
             call,
             why,

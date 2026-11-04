@@ -605,7 +605,6 @@ fn a_foreign_reap_is_cached_as_nothing_and_wait_stays_n() {
 /// The deadline of `exited_by` is read through the OS's own look, and reaps nothing.
 ///
 /// Mutant: `exited_by` reaps, or asks the reap's look.
-#[cfg(target_os = "linux")]
 #[skuld::test]
 fn exited_by_looks_through_exited_and_reaps_nothing() {
     let fake = FakeProcess::new([crate::os_process::fake::Answer::Exited]);

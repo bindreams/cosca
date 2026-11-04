@@ -490,19 +490,24 @@ fn the_kqueue_wait_reports_gone_for_a_pid_with_another_unique_id() {
     assert_eq!(waited, Waited::Gone);
 }
 
-/// A wait whose peek finds the zombie held by launchd (its tracer died) gives up on it with a
-/// `warn` that it is not ours to reap, not silently as for a reap.
+/// A `Child::wait` whose peek finds the zombie held by launchd (its tracer died) gives up on it with
+/// a `warn` that it is not ours to reap, not silently as for a reap.
 ///
-/// Mutant: `Waited::Orphaned` is folded into `Gone` without a log.
+/// Mutant: `Foreign::Orphaned` is folded into `Gone` without a log.
 #[skuld::test]
 fn a_wait_on_a_zombie_launchd_holds_warns_it_is_not_ours_to_reap() {
     crate::log_capture::install();
-    let mut b = Blocker::spawn();
-    b.end_child_and_confirm_exit();
-    let pid = b.pid;
+    let (stdin, writer) = crate::test_child::held_writer_stdin();
+    let mut cmd = crate::Command::new();
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(stdin).expect("set stdin");
+    let child = cmd.spawn().expect("spawn");
+    let pid = child.id().pid();
+    drop(writer);
+    crate::test_child::wait_until_zombie(pid);
     let mark = crate::log_capture::mark();
     let _orphaned = exit_seams::force_peek_once(Ok(PeekOutcome::Foreign(Foreign::Orphaned)));
-    _ = b.owned.wait(None);
+    _ = child.wait();
     let records = crate::log_capture::records_since_on_current_thread(mark, &format!("pid {pid}"));
     assert!(
         records
@@ -510,7 +515,8 @@ fn a_wait_on_a_zombie_launchd_holds_warns_it_is_not_ours_to_reap() {
             .any(|(level, text)| *level == log::Level::Warn && text.contains("not ours to reap")),
         "{records:?}"
     );
-    crate::child::spawn::identity_macos_tests::reap_by_pid(pid);
+    // The drop reaps what the forced peek left.
+    drop(child);
 }
 
 // S11m: the reap finds no exit record after the peek saw one =====

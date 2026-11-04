@@ -104,6 +104,10 @@ pub(crate) fn terminate(_p: &dyn OsProcess) -> Result<(), Error> {
 /// [`terminate`] the process `id` names, identity-verified. Already gone: `Ok`. Windows: `Unsupported`,
 /// with nothing opened.
 #[cfg(unix)]
+#[cfg_attr(
+    not(feature = "tokio"),
+    allow(dead_code, reason = "only the async child sends its graceful signal by number")
+)]
 pub(crate) fn terminate_by_id(id: ProcessId) -> Result<(), Error> {
     match open(id)? {
         Some(process) => terminate(&*process),

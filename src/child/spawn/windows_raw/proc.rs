@@ -31,7 +31,7 @@ const INFINITE: u32 = 0xFFFF_FFFF;
 pub(crate) struct RawChild {
     proc: OwnedHandle,
     pid: u32,
-    /// The status this handle's own `wait`, `try_wait` or `wait_deadline` returned: set once, and
+    /// The status this handle's own `wait` or `wait_deadline` returned: set once, and
     /// only by them, so [`is_reaped`](Self::is_reaped) means "this handle recorded the exit".
     /// A reader that sees the record a moment late is harmless on Windows: the open process
     /// handle pins the pid, so it cannot be reused meanwhile.
@@ -100,31 +100,27 @@ impl RawChild {
         }
     }
 
-    /// The exit status if the child has already exited, else `None`.
-    pub(crate) fn try_wait(&self) -> io::Result<Option<ExitStatus>> {
-        // SAFETY: `handle` is our live, owned process handle; a zero timeout polls without blocking.
-        let r = unsafe { WaitForSingleObject(self.handle(), 0) };
-        if r == WAIT_OBJECT_0 {
+    /// Block until the child exits or `deadline` passes (`Ok(None)` at expiry). The wait is on a
+    /// real external event (child exit); the timeout is the caller's deadline, not a sync bet.
+    pub(crate) fn wait_deadline(&self, deadline: Instant) -> io::Result<Option<ExitStatus>> {
+        if self.exited_by(Some(deadline))? {
             Ok(Some(self.record(exit_status(self.handle())?)))
-        } else if r == WAIT_TIMEOUT {
-            Ok(None)
         } else {
-            Err(self.unexpected_wait_result(r))
+            Ok(None)
         }
     }
 
-    /// Block until the child exits or `deadline` passes (`Ok(None)` at expiry). The wait is on a
-    /// real external event (child exit); the timeout is the caller's deadline, not a sync bet.
+    /// Whether the child has exited by `deadline` (`None`: for ever), recording nothing.
     ///
     /// Armed in rounds via `win32_timeout_ms`; WAIT_TIMEOUT is never trusted (Win32 waits may
     /// time out early); rechecked each round (principle 13).
-    pub(crate) fn wait_deadline(&self, deadline: Instant) -> io::Result<Option<ExitStatus>> {
+    pub(crate) fn exited_by(&self, deadline: Option<Instant>) -> io::Result<bool> {
         // SAFETY: `handle` is our live, owned process handle.
-        let r = crate::wait::wait_until(Some(deadline), |ms| unsafe { WaitForSingleObject(self.handle(), ms) });
+        let r = crate::wait::wait_until(deadline, |ms| unsafe { WaitForSingleObject(self.handle(), ms) });
         if r == WAIT_OBJECT_0 {
-            Ok(Some(self.record(exit_status(self.handle())?)))
+            Ok(true)
         } else if r == WAIT_TIMEOUT {
-            Ok(None)
+            Ok(false)
         } else {
             Err(self.unexpected_wait_result(r))
         }
