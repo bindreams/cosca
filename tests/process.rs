@@ -133,33 +133,60 @@ fn a_held_process_reads_dead_and_its_acts_return_after_it_is_reaped() {
 
 /// After the reap no process has the child's pid, so `open_pid` is `None`, or `Some` with another
 /// identity if an unrelated process has reused the pid. On Linux and macOS the child's own identity
-/// never opens. On Windows a process object outlives its exit while any handle on it is open, and
-/// a handle held outside this process is not ours to close (measured: nothing in this process
-/// holds one after the drop): the identity may then open as `Process::open` documents, reading
-/// `Dead`.
+/// never opens. On Windows a handle held outside this process keeps the exited process object, so
+/// the identity may open, reading `Dead` (see `Process::open`); a handle in this process on it is a
+/// leak and fails the test.
 #[skuld::test]
 fn open_pid_of_a_reaped_child_is_none_or_another_process() {
     let (child, sock) = spawn_blocker();
     let id = child.id();
     common::kill_release_reap(&child, sock);
-    drop(child); // closes the child's own handles; on Windows they would keep the exited process openable
+    drop(child); // on Windows its own handles would keep the exited process openable
     match cosca::Process::open_pid(id.pid()).expect("a reaped pid is not an error") {
         Some(held) if held.id() == id => {
-            if !cfg!(windows) {
-                panic!("the reaped child's identity must not open");
+            #[cfg(not(windows))]
+            panic!("the reaped child's identity must not open");
+            #[cfg(windows)]
+            {
+                assert_eq!(held.is_alive(), cosca::identity::Liveness::Dead);
+                drop(held); // our own reopen
+                assert_no_handle_of_this_process_names(id.pid());
             }
-            assert_eq!(
-                held.is_alive(),
-                cosca::identity::Liveness::Dead,
-                "a reaped process that opens reads Dead"
-            );
         }
-        Some(_) | None => {}
+        _ => {}
     }
 }
 
-/// While another handle on a reaped child is open, Windows keeps its process object, so the
-/// child's own identity still opens, reads `Dead`, and reports exited.
+/// Fails if a handle this process holds names the process object of `pid`. Only a holder outside
+/// this process may keep an exited child's object alive.
+#[cfg(windows)]
+fn assert_no_handle_of_this_process_names(pid: u32) {
+    use windows::Win32::Foundation::{CloseHandle, CompareObjectHandles};
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    // SAFETY: plain call; the handle it returns is closed below.
+    let Ok(reference) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }) else {
+        return; // the outside holder let go: nothing names the object
+    };
+    let mut leaked = Vec::new();
+    // The snapshot is taken in one call and this test creates no handles on other threads, so no
+    // value is reused before it is compared.
+    common::handle_snapshot::walk_handles(|h, _| {
+        // SAFETY: `CompareObjectHandles` only reads both handles; a stale one compares unequal.
+        if h != reference && unsafe { CompareObjectHandles(h, reference) }.as_bool() {
+            leaked.push(h.0 as usize);
+        }
+    });
+    // SAFETY: `reference` is the handle opened above and is closed once.
+    unsafe { CloseHandle(reference) }.expect("close the reference handle");
+    assert!(
+        leaked.is_empty(),
+        "this process holds handles {leaked:x?} on the reaped child's process object"
+    );
+}
+
+/// Windows keeps a reaped child's process object while another handle is open, so its identity
+/// still opens and reads `Dead`.
 #[cfg(windows)]
 #[skuld::test]
 fn a_reaped_child_held_by_another_handle_opens_dead_on_windows() {
