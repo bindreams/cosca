@@ -182,7 +182,14 @@ fn block(wait_for: &WaitFor<'_>, deadline: Option<Instant>) -> Result<(), Error>
                 unsafe { WaitForSingleObject(handle, ms) }
             });
             if waited != WAIT_OBJECT_0 && waited != WAIT_TIMEOUT {
-                return Err(Error::Io(std::io::Error::last_os_error()));
+                let e = std::io::Error::last_os_error();
+                // `Signalled` is handed out only for a handle that can be waited on, so the wait
+                // does not fail: a failure is a closed or invalid handle, our bug.
+                debug_assert!(
+                    false,
+                    "WaitForSingleObject on a process handle returned {waited:?}: {e}"
+                );
+                return Err(Error::Io(e));
             }
         }
     }
