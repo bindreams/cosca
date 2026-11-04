@@ -53,12 +53,16 @@ from devvm_common import (  # noqa: E402
     auto_consent_state_path,
     dotfile_dir,
     get_vagrant_machine_state,
+    host_provider,
+    host_unsupported_reason,
     powershell_quote,
+    require_host_support,
     require_tool,
     run_vagrant,
     stage_dir,
     stage_lock,
 )
+from devvm_hyperv import check_hyperv_host, vmconnect_hint  # noqa: E402
 from devvm_windows import (  # noqa: E402
     InteractiveLookupFailure,
     get_windows_interactive_username,
@@ -132,12 +136,14 @@ GUESTS: dict[str, Guest] = {
     "linux-arm64": Guest(
         name="linux-arm64",
         communicator="ssh",
+        arch="arm64",
         box="perk/ubuntu-24.04-arm64 (qemu/arm64)",
         tree_path_posix="/home/vagrant/cosca",
     ),
     "macos-arm64": Guest(
         name="macos-arm64",
         communicator="tart",
+        arch="arm64",
         box=MACOS_BOX_NOTE if sys.platform == "win32" else f"{devvm_macos.BASE_IMAGE} ({MACOS_BOX_NOTE})",
         available=sys.platform != "win32",
         unavailable_reason="needs an Apple Silicon Mac (Tart)" if sys.platform == "win32" else None,
@@ -147,11 +153,13 @@ GUESTS: dict[str, Guest] = {
         name="windows-x64",
         communicator="winrm",
         box="stromweld/windows-10 (qemu/amd64)",
+        hyperv_box="gusztavvargadr/windows-11 (hyperv/amd64)",
         tree_path_posix="C:/cosca",
     ),
     "windows-arm64": Guest(
         name="windows-arm64",
         communicator="winrm",
+        arch="arm64",
         box="(none)",
         available=False,
         unavailable_reason=(
@@ -472,8 +480,13 @@ def cmd_list(_args: argparse.Namespace) -> None:
         if not guest.available:
             print(f"{guest.name:14s} UNAVAILABLE  {guest.unavailable_reason}")
             continue
+        unsupported = host_unsupported_reason(guest)
+        if unsupported is not None:
+            print(f"{guest.name:14s} UNAVAILABLE  {unsupported}")
+            continue
         state = backend_for(guest).status()
-        print(f"{guest.name:14s} {state:14s} {guest.box}  (communicator: {guest.communicator})")
+        box = guest.hyperv_box if host_provider() == "hyperv" else guest.box
+        print(f"{guest.name:14s} {state:14s} {box}  (communicator: {guest.communicator})")
 
 
 def _vagrant_up(args: argparse.Namespace) -> None:
@@ -496,6 +509,10 @@ def _vagrant_up(args: argparse.Namespace) -> None:
     if getattr(args, "rev", None) is not None:
         print("error: --rev only applies to macOS guests (the others stage the working tree)", file=sys.stderr)
         sys.exit(1)
+    # Host checks come before the first mkdir or stage_tree, so a host that cannot run the guest
+    # leaves nothing behind. Only Hyper-V has any; the QEMU path has no host check.
+    if host_provider() == "hyperv":
+        check_hyperv_host(guest)
     dotfile_dir(guest).mkdir(parents=True, exist_ok=True)
     if guest.communicator == "winrm":
         # `--allow-elevation`/`--no-allow-elevation` explicitly sets and persists the choice;
@@ -515,7 +532,13 @@ def _vagrant_up(args: argparse.Namespace) -> None:
             "scripts/README.md#windows-guests.",
             file=sys.stderr,
         )
-    if display:
+    if display and host_provider() == "hyperv":
+        print(
+            "note: --display is ON for this guest — devvm will open Hyper-V's console window "
+            "(vmconnect) on it once the VM is up. The guest is headless either way.",
+            file=sys.stderr,
+        )
+    elif display:
         print(
             "note: --display is ON for this guest — QEMU will open a local window on this Mac "
             "(-display cocoa -vga std) instead of running headless. This is a local window "
@@ -529,7 +552,7 @@ def _vagrant_up(args: argparse.Namespace) -> None:
         if guest.communicator == "winrm":
             provision_windows_guest(guest, auto_consent=auto_consent, display=display, create=True)
         else:
-            run_vagrant(guest, ["up", "--provider", "qemu", "--provision"])
+            run_vagrant(guest, ["up", "--provider", host_provider(), "--provision"])
     if guest.communicator == "ssh":
         print(f"note: the read-only working tree is synced to {guest.tree_path_posix} — run `devvm.py sync {guest.name}` after local changes.")
     else:
@@ -542,6 +565,7 @@ def _vagrant_sync(args: argparse.Namespace) -> None:
     if getattr(args, "rev", None) is not None:
         print("error: --rev only applies to macOS guests (the others stage the working tree)", file=sys.stderr)
         sys.exit(1)
+    require_host_support(guest)
     if not dotfile_dir(guest).exists():
         print(f"error: guest '{guest.name}' has not been brought up yet; run `devvm.py up {guest.name}` first", file=sys.stderr)
         sys.exit(1)
@@ -558,29 +582,31 @@ def _vagrant_sync(args: argparse.Namespace) -> None:
 def _vagrant_ssh(args: argparse.Namespace) -> None:
     guest = GUESTS[args.guest]
     require_available(guest)
+    require_host_support(guest)
     if guest.communicator == "ssh":
         run_vagrant(guest, ["ssh"])
         return
-    # `vagrant powershell` shells out to a local powershell.exe/pwsh on the HOST, not the
-    # guest — Vagrant 2.4.9's plugins/commands/powershell/command.rb:74 raises HostUnsupported
-    # immediately on any host it doesn't detect as Windows. Refuse with the same message a
-    # developer would otherwise get from a raw Vagrant traceback, pointing at the two working
-    # alternatives instead: `run` for a one-off command, or RDP for an interactive session (the
-    # loopback-only forwarded port every Windows guest already exposes — see that guest's
-    # Vagrantfile). Don't bake in a host assumption beyond this check itself: on an actual
-    # Windows host, `vagrant powershell` works fine.
-    if not sys.platform.startswith("win"):
-        print(
-            f"error: `devvm.py ssh {guest.name}` runs `vagrant powershell`, which only works "
-            "on a Windows host — Vagrant 2.4.9 raises HostUnsupported immediately on any other "
-            "host (plugins/commands/powershell/command.rb:74), before ever touching the guest. "
-            f"Use `devvm.py run {guest.name} -- <cmd>` for a one-off command, or RDP into the "
-            "guest for an interactive session (127.0.0.1:3389 by default — see the 'rdp' "
-            f"forwarded_port in scripts/devvm/guests/{guest.name}/Vagrantfile).",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    run_vagrant(guest, ["powershell"])
+    # Refused on every host. `vagrant powershell` runs PowerShell on the HOST, and on a Windows
+    # host its first attempt can fall back to enable_psremoting.ps1, which writes the guest's
+    # address into the host's WSMan TrustedHosts (Vagrant 2.4.9, plugins/commands/powershell).
+    # command.rb restores it in an `ensure`, so a kill or a closed console leaves the host
+    # setting changed, and devvm reverts what it changes on a developer's machine. On any other
+    # host Vagrant raises HostUnsupported (command.rb:74) before touching the guest.
+    console = (
+        f"{vmconnect_hint(guest)} or `devvm.py up --display`"
+        if host_provider() == "hyperv"
+        else "RDP (127.0.0.1:3389 by default, the 'rdp' forwarded_port in "
+        f"scripts/devvm/guests/{guest.name}/Vagrantfile)"
+    )
+    print(
+        f"error: `devvm.py ssh {guest.name}` is not offered for Windows guests: it would run "
+        "`vagrant powershell`, which can rewrite the host's WSMan TrustedHosts and restores it "
+        "only if Vagrant exits normally. "
+        f"Use `devvm.py run {guest.name} -- <cmd>` for a one-off command, or {console} "
+        "for an interactive session.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 
 def _vagrant_run(args: argparse.Namespace) -> None:
@@ -610,6 +636,8 @@ def _vagrant_run(args: argparse.Namespace) -> None:
             file=sys.stderr,
         )
         sys.exit(1)
+
+    require_host_support(guest)
 
     if guest.communicator == "ssh":
         # `vagrant ssh -c` runs a non-interactive, non-login shell, which doesn't source
@@ -848,10 +876,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--display",
         action="store_true",
-        help="(Windows only) open a local QEMU window on this Mac (-display cocoa -vga std) "
-        "instead of running headless, e.g. so a human can watch the guest's console live. "
-        "Headless remains the default; this is a local window only, never VNC or any other "
-        "network-exposed display. Not persisted — pass it again on every `up` that needs it.",
+        help="(Windows guests only) open a local console window on the guest instead of running "
+        "headless, e.g. so a human can watch it live: a QEMU window on this Mac "
+        "(-display cocoa -vga std) with QEMU, Hyper-V's own console (vmconnect) on a Windows "
+        "host. Headless remains the default; this is a local window only, never VNC or any "
+        "other network-exposed display. Not persisted — pass it again on every `up` that needs it.",
     )
     p.add_argument(
         "--rev",

@@ -1,0 +1,18 @@
+{
+  "name": "gusztavvargadr/windows-11-2607.1.0",
+  "versions": [
+    {
+      "version": "2607.1.0",
+      "providers": [
+        {
+          "name": "hyperv",
+          "architecture": "amd64",
+          "default_architecture": true,
+          "url": "https://vagrantcloud.com/gusztavvargadr/boxes/windows-11/versions/2607.1.0/providers/hyperv/amd64/vagrant.box",
+          "checksum_type": "sha512",
+          "checksum": "b7b8c45b57376c1cff8e071db978c5e2df4c3988f8511509a6115b2308a204964b516e3de36dc73c18bca90458b903261a7ae55c61ef9ae0d575cc239bd8d257"
+        }
+      ]
+    }
+  ]
+}
