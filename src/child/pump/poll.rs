@@ -2,19 +2,19 @@
 //! fill and stall the child, and nothing after the spawn needs a thread, so a caller under a task
 //! limit (`RLIMIT_NPROC`, a cgroup's `TasksMax`) cannot fail for want of one.
 //!
-//! This is `rustix::event::poll` on the pipe ends directly, not `os_process::poll`, which asks
-//! whether a process has exited.
+//! This polls the pipe ends directly, through `wait::poll_ready`, not `os_process::poll`, which
+//! asks whether a process has exited.
 
 use std::io::{self, ErrorKind, PipeReader, PipeWriter, Read, Write};
 use std::os::fd::AsFd;
 
-use rustix::event::{poll, PollFd, PollFlags};
+use rustix::event::{PollFd, PollFlags};
 use rustix::fs::{fcntl_getfl, fcntl_setfl, OFlags};
-use rustix::io::Errno;
 
 use crate::child::Child;
 use crate::error::Error;
 use crate::stdio::Fd;
+use crate::wait;
 use crate::Output;
 
 /// Bytes read from a pipe per call.
@@ -119,11 +119,7 @@ impl<'a> Pump<'a> {
             if fds.is_empty() {
                 return Ok(());
             }
-            match poll(&mut fds, None) {
-                Ok(_) => {}
-                Err(Errno::INTR) => continue,
-                Err(e) => return Err(e.into()),
-            }
+            wait::poll_ready(&mut fds)?;
             // Any event (readable, writable, hung up, error) is served by trying the operation:
             // it reports EOF or a broken pipe itself.
             let ready: Vec<Slot> = slots
