@@ -49,8 +49,8 @@ impl Child {
     /// that case out: absence from its console list is equally the answer for a healthy child.
     /// Each such call also leaves a dead entry in the caller's console process list.
     ///
-    /// **Every error means nothing was sent and nothing was killed.** On Linux that includes a
-    /// refused `pidfd_open`, which is `Unsupported` (see [`Error::Unsupported`](crate::error::Error::Unsupported)).
+    /// **Every error means nothing was sent and nothing was killed.** The signal goes through the
+    /// child's own handle, so it needs no `pidfd_open`.
     ///
     /// **A macOS graphically-elevated child** ([`ElevatedVia::MacosOsascript`](crate::elevation::ElevatedVia::MacosOsascript))
     /// is refused while osascript runs, as its kill is (see [`kill`](Child::kill)): a `SIGTERM`
@@ -251,9 +251,6 @@ impl Child {
     /// I/O `source`) is not held — like `NoConsole`/`Unsupported`/`Io`, it returns
     /// immediately: no signal is confirmed sent, so there is nothing for a grace wait or
     /// sweep to act on yet.
-    ///
-    /// A refused Linux `pidfd_open` while watching the root is `Unsupported` (see [`Error::Unsupported`](crate::error::Error::Unsupported)); it is a
-    /// watch failure, so the sweep still runs.
     ///
     /// **A root reaped by something else** (see [`kill_tree`](Child::kill_tree)):
     ///
