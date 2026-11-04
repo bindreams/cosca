@@ -249,6 +249,20 @@ mod root_state {
         assert!(matches!(state, RootState::Reaped { own: false }), "{state:?}");
     }
 
+    /// A peek is never an own reap: whatever it shows of a child that is not ours to reap, the state
+    /// is not `Reaped { own: true }`, which only a handle that collected the exit itself reports.
+    ///
+    /// Mutant: a foreign verdict sets `own`.
+    #[skuld::test]
+    fn root_state_of_an_own_reap_carries_own() {
+        for gone in [Foreign::Gone, Foreign::Other] {
+            let state = RootState::of_peek(Ok(PeekOutcome::Foreign(gone)));
+            assert!(matches!(state, RootState::Reaped { own: false }), "{gone:?}: {state:?}");
+        }
+        let state = RootState::of_peek(Ok(PeekOutcome::Foreign(Foreign::Orphaned)));
+        assert!(matches!(state, RootState::Unpinned), "{state:?}");
+    }
+
     /// A running child is ours to act on.
     ///
     /// Mutant: `Running` is `Unknown`, or `Reaped`.

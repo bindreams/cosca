@@ -160,10 +160,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     let mut root_settled = true;
     let pid = child.id().pid();
     let (root_note, fate) = if view.unpinned_root() {
-        // Nothing was signalled, so a launchd-held zombie is `Gone`, as the classifier has it.
-        #[cfg(target_os = "macos")]
-        let fate = crate::os_process::child::Foreign::Orphaned.fate(false);
-        #[cfg(not(target_os = "macos"))]
+        // Nothing was signalled, so a foreign child (a zombie launchd holds too) is `Gone`.
         let fate = crate::os_process::child::Foreign::Gone.fate(false);
         (
             format!(
@@ -750,7 +747,7 @@ fn leave_front_after_attach_failure(child: std::process::Child) -> FrontFate {
 /// The checks are not pins: macOS has no handle, so the kill has `via_verified_pid`'s window
 /// between its id check and `kill(2)`, and the reap has `try_reap`'s between its id check and the
 /// consuming `waitid`. A child that cannot be shown ours (a refused id read) is left with a `warn`;
-/// a zombie launchd holds is not ours to reap, and is `Gone` (see [`Foreign::fate`]).
+/// a zombie launchd holds is not ours to reap, and is `Gone` (see [`Foreign::fate`](crate::os_process::child::Foreign::fate)).
 ///
 /// Dropping the `std` `Child` closes our pipe ends only.
 #[cfg(target_os = "macos")]
@@ -1257,7 +1254,7 @@ fn unverifiable(why: &dyn std::fmt::Display) -> String {
 #[cfg(target_os = "macos")]
 ///
 /// `killed`: whether cosca's kill was delivered, which decides the fate of a foreign verdict (see
-/// [`Foreign::fate`]).
+/// [`Foreign::fate`](crate::os_process::child::Foreign::fate)).
 fn reap_verified(
     pid: u32,
     target: &crate::wait::exit_only::Target<'_>,
@@ -2067,9 +2064,8 @@ pub(crate) fn resolve_identity(
         let peeked = crate::wait::exit_only::peek_verified(through);
         match peeked {
             Ok(PeekOutcome::Running | PeekOutcome::Exit(_)) => (read, Diagnosis::default()),
-            // macOS: held by launchd after its tracer died. It has exited and is not ours to reap, so it
-            // is `Gone`, with a warning that its zombie is not collected.
-            #[cfg(target_os = "macos")]
+            // Held by launchd after its tracer died (only macOS has such a zombie). It has exited and is
+            // not ours to reap, so it is `Gone`, with a warning that its zombie is not collected.
             Ok(PeekOutcome::Foreign(crate::os_process::child::Foreign::Orphaned)) => (
                 Resolved::Gone,
                 Diagnosis::of(format!(
