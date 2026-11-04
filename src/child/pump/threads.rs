@@ -1,6 +1,6 @@
 //! Windows: one thread per active stream, so stdin, stdout and stderr are serviced concurrently and
-//! no full pipe buffer can wedge the others. The `CreatePipe` ends cannot be polled; a drain on the
-//! calling thread waits for overlapped pipes made at spawn.
+//! no full pipe buffer can wedge the others. The `CreatePipe` ends cannot be polled; draining all
+//! three on the calling thread would need overlapped pipes made at spawn.
 
 use std::io::{Read, Write};
 use std::thread;
