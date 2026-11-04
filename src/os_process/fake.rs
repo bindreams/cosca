@@ -4,6 +4,7 @@
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::sync::Mutex;
 use std::time::Instant;
 
 use super::{Exit, OsProcess, WaitFor};
@@ -22,11 +23,16 @@ pub(crate) enum Answer {
 
 pub(crate) struct FakeProcess {
     id: ProcessId,
+    script: Mutex<Script>,
+    source: Source,
+}
+
+/// What looks consume and record, behind one lock so a `&FakeProcess` is `Sync`.
+struct Script {
     exits: VecDeque<Answer>,
     looks: usize,
     look_times: Vec<Instant>,
     on_look: Option<Box<dyn FnMut(usize) + Send>>,
-    source: Source,
 }
 
 impl FakeProcess {
@@ -34,10 +40,12 @@ impl FakeProcess {
     pub(crate) fn new(id: ProcessId, exits: impl IntoIterator<Item = Answer>) -> Self {
         Self {
             id,
-            exits: exits.into_iter().collect(),
-            looks: 0,
-            look_times: Vec::new(),
-            on_look: None,
+            script: Mutex::new(Script {
+                exits: exits.into_iter().collect(),
+                looks: 0,
+                look_times: Vec::new(),
+                on_look: None,
+            }),
             source: Source::new(),
         }
     }
@@ -49,43 +57,49 @@ impl FakeProcess {
 
     /// How many times `exited` was called.
     pub(crate) fn looks(&self) -> usize {
-        self.looks
+        self.script().looks
     }
 
     /// The `wait::now()` of each look, taken after its `on_look` hook ran.
-    pub(crate) fn look_times(&self) -> &[Instant] {
-        &self.look_times
+    pub(crate) fn look_times(&self) -> Vec<Instant> {
+        self.script().look_times.clone()
     }
 
     /// Run `hook` with the index of each look, at the start of the look.
-    pub(crate) fn on_look(&mut self, hook: impl FnMut(usize) + Send + 'static) {
-        self.on_look = Some(Box::new(hook));
+    pub(crate) fn on_look(&self, hook: impl FnMut(usize) + Send + 'static) {
+        self.script().on_look = Some(Box::new(hook));
+    }
+
+    fn script(&self) -> std::sync::MutexGuard<'_, Script> {
+        self.script.lock().expect("FakeProcess: a look or hook panicked")
     }
 }
 
 impl fmt::Debug for FakeProcess {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let script = self.script();
         f.debug_struct("FakeProcess")
             .field("id", &self.id)
-            .field("exits", &self.exits)
-            .field("looks", &self.looks)
+            .field("exits", &script.exits)
+            .field("looks", &script.looks)
             .finish_non_exhaustive()
     }
 }
 
 impl OsProcess for FakeProcess {
-    fn signal(&mut self, _sig: Sig) -> Result<Sent, Error> {
+    fn signal(&self, _sig: Sig) -> Result<Sent, Error> {
         unimplemented!("FakeProcess models no signal: it states what looks answer")
     }
 
-    fn exited(&mut self) -> Result<Exit<'_>, Error> {
-        let index = self.looks;
-        self.looks += 1;
-        if let Some(hook) = self.on_look.as_mut() {
+    fn exited(&self) -> Result<Exit<'_>, Error> {
+        let mut script = self.script();
+        let index = script.looks;
+        script.looks += 1;
+        if let Some(hook) = script.on_look.as_mut() {
             hook(index);
         }
-        self.look_times.push(crate::wait::now());
-        match self
+        script.look_times.push(crate::wait::now());
+        match script
             .exits
             .pop_front()
             .expect("FakeProcess: a look was made past the scripted answers")
@@ -97,52 +111,18 @@ impl OsProcess for FakeProcess {
     }
 }
 
-/// An [`ExitWatch`](super::macos::ExitWatch) armed for `EVFILT_READ` on `fd`, a pipe the test
-/// fires, in place of the `NOTE_EXIT` watch of a process.
-#[cfg(target_os = "macos")]
-pub(super) fn readable_watch(fd: std::os::fd::BorrowedFd<'_>) -> Result<super::macos::ExitWatch, Error> {
-    use std::os::fd::AsRawFd;
-
-    use crate::os_process::macos::kqueue::{Kqueue, Subscription};
-
-    let kq = Kqueue::new()?;
-    let readable = Subscription::Readable {
-        fd: fd.as_raw_fd(),
-        low_water: 1,
-    };
-    kq.subscribe(readable)?;
-    Ok(super::macos::ExitWatch::new(kq))
-}
-
 /// What a `Running` look hands out, and the way a test fires it.
 #[cfg(unix)]
 struct Source {
-    /// Kept open: on macOS only the kqueue refers to it.
-    #[cfg_attr(
-        target_os = "macos",
-        allow(dead_code, reason = "only keeps the pipe open for the kqueue")
-    )]
     rx: std::io::PipeReader,
     tx: std::io::PipeWriter,
-    #[cfg(target_os = "macos")]
-    watch: super::macos::ExitWatch,
 }
 
 #[cfg(unix)]
 impl Source {
     fn new() -> Self {
         let (rx, tx) = std::io::pipe().expect("FakeProcess: pipe");
-        #[cfg(target_os = "macos")]
-        let watch = {
-            use std::os::fd::AsFd;
-            readable_watch(rx.as_fd()).expect("FakeProcess: arm the pipe's kqueue")
-        };
-        Self {
-            rx,
-            tx,
-            #[cfg(target_os = "macos")]
-            watch,
-        }
+        Self { rx, tx }
     }
 
     fn fire(&self) {
@@ -151,13 +131,8 @@ impl Source {
     }
 
     fn wait_for(&self) -> WaitFor<'_> {
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::fd::AsFd;
-            WaitFor::Readable(self.rx.as_fd())
-        }
-        #[cfg(target_os = "macos")]
-        WaitFor::Kqueue(&self.watch)
+        use std::os::fd::AsFd;
+        WaitFor::Readable(self.rx.as_fd())
     }
 }
 

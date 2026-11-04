@@ -127,13 +127,13 @@ pub enum Error {
     ///
     /// # A refused `pidfd_open` on Linux
     ///
-    /// Every Linux operation that observes or signals a process by identity needs a pidfd
-    /// (kernel 5.3 or later): [`Process::wait`](crate::Process::wait),
-    /// [`wait_timeout`](crate::Process::wait_timeout), [`kill`](crate::Process::kill),
-    /// [`terminate`](crate::Process::terminate), the `graceful_shutdown*` family, and their
-    /// `tokio` twins. When `pidfd_open` is refused they fail with this variant,
-    /// with `op` naming the operation that needed it (`process wait`, `process kill`,
-    /// `process terminate`) and `detail` naming the errno.
+    /// Every Linux operation that opens a process by identity needs a pidfd (kernel 5.3 or
+    /// later): [`Process::open`](crate::Process::open), [`open_pid`](crate::Process::open_pid)
+    /// and [`current`](crate::Process::current), and the by-identity acts of a
+    /// [`Child`](crate::Child) (`terminate`, `graceful_shutdown`), with their `tokio` twins. When
+    /// `pidfd_open` is refused they fail with this variant, with `op` `process open` and
+    /// `detail` naming the errno. An open [`Process`](crate::Process) holds its pidfd, so none of
+    /// its acts can be refused later.
     ///
     /// - `ENOSYS`: the kernel predates 5.3, or a seccomp filter hides the syscall.
     /// - `EPERM` and `EACCES`: the kernel's own `pidfd_open` never returns them, so a seccomp
@@ -278,8 +278,8 @@ pub enum ChildFate {
     ///
     /// `id` is its identity when the spawn had read one, and `None` when the failure came before
     /// that read (an identity that could not be read, or a macOS report that never came). It is an
-    /// identity, not a pin: the child may exit and be reaped, and its pid reused. Check it before acting on it ([`ProcessId::is_alive`], or the
-    /// identity-checked kills of [`Process`](crate::Process)); never signal its number by itself.
+    /// identity, not a pin: the child may exit and be reaped, and its pid reused. Check it before acting on it ([`ProcessId::is_alive`]), or open it ([`Process::open`](crate::Process::open)),
+    /// whose acts reach only that process; never signal its number by itself.
     ///
     /// [`ProcessId::is_alive`]: crate::identity::ProcessId::is_alive
     Running { id: Option<crate::identity::ProcessId> },

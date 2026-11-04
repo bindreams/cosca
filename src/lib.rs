@@ -1,8 +1,8 @@
 //! `cosca`: unified cross-platform subprocess management.
 //!
 //! Build a process with [`Command`] (stdio, env, tree containment, elevation),
-//! spawn it into an owned [`Child`], or attach to an already-running process by
-//! pid via [`Process`]. Sync by default; async counterparts live in the `tokio`
+//! spawn it into an owned [`Child`], or open an already-running process with
+//! [`Process`]. Sync by default; async counterparts live in the `tokio`
 //! module behind the `tokio` feature.
 //!
 //! # Platform requirements
@@ -205,7 +205,8 @@ mod test_spawn;
 mod test_frozen;
 
 pub mod process;
-pub use process::{Process, Recursive};
+pub use identity::Recursive;
+pub use process::Process;
 
 #[cfg(feature = "tokio")]
 pub mod tokio;

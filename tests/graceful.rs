@@ -61,7 +61,9 @@ fn child_graceful_shutdown_unsupported_for_an_uncontained_child_on_windows() {
 fn process_terminate_sends_sigterm() {
     use std::os::unix::process::ExitStatusExt;
     let (child, sock) = common::spawn_blocker();
-    let p = cosca::Process::from_pid(child.id().pid()).found().expect("resolves");
+    let p = cosca::Process::open_pid(child.id().pid())
+        .expect("open")
+        .expect("running");
     p.terminate().expect("foreign terminate");
     // Release after the kill: a kill that sent nothing lets it exit 0, failing the status assertion.
     drop(sock);
@@ -77,7 +79,9 @@ fn process_graceful_shutdown_escalates() {
     // SIGTERM is ignored → SIGKILL is the only terminating signal the child can receive, so the
     // reaped status is unambiguously SIGKILL.
     let (child, sock) = common::spawn_control("control-block-ignore-term", &["R"], false);
-    let p = cosca::Process::from_pid(child.id().pid()).found().expect("resolves");
+    let p = cosca::Process::open_pid(child.id().pid())
+        .expect("open")
+        .expect("running");
     p.graceful_shutdown(Duration::ZERO).expect("foreign escalates");
     // Release after the kill: a kill that sent nothing lets it exit 0, failing the status assertion.
     drop(sock);
@@ -90,7 +94,9 @@ fn process_graceful_shutdown_escalates() {
 fn process_lone_graceful_unsupported_on_windows() {
     use std::time::Duration;
     let (child, sock) = common::spawn_blocker();
-    let p = cosca::Process::from_pid(child.id().pid()).found().expect("resolves");
+    let p = cosca::Process::open_pid(child.id().pid())
+        .expect("open")
+        .expect("running");
     assert!(matches!(p.terminate(), Err(cosca::error::Error::Unsupported { .. })));
     assert!(matches!(
         p.graceful_shutdown(Duration::from_secs(1)),
@@ -111,7 +117,9 @@ fn process_kill_tree_tears_down_tree() {
         common::Member::new(root, child.id().pid()),
         common::Member::new(grand, common::last_reported_grandchild().expect("the grandchild's pid")),
     );
-    let p = cosca::Process::from_pid(child.id().pid()).found().expect("resolves");
+    let p = cosca::Process::open_pid(child.id().pid())
+        .expect("open")
+        .expect("running");
     p.kill_tree().expect("kill_tree");
     // A kill that sent nothing fails here by assertion.
     common::assert_members_killed(vec![(root, "the root"), (grand, "the grandchild")]);
@@ -123,7 +131,9 @@ fn process_kill_tree_tears_down_tree() {
 fn process_soft_tree_unsupported_on_windows() {
     use std::time::Duration;
     let (child, sock) = common::spawn_blocker();
-    let p = cosca::Process::from_pid(child.id().pid()).found().expect("resolves");
+    let p = cosca::Process::open_pid(child.id().pid())
+        .expect("open")
+        .expect("running");
     assert!(matches!(
         p.terminate_tree(),
         Err(cosca::error::Error::Unsupported { .. })

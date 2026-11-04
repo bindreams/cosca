@@ -33,10 +33,10 @@ async fn async_id_is_a_real_stable_identity() {
     use std::io::Write as _;
     let (mut child, mut sock) = common::spawn_blocker_async().await;
     let id = child.id();
-    let p = cosca::Process::from_id(id);
+    let p = cosca::Process::open(id).expect("open").expect("the child is running");
     assert_eq!(p.id(), id);
     assert_eq!(
-        p.exists(),
+        id.exists(),
         cosca::identity::Existence::Present,
         "id() is a resolvable identity"
     );

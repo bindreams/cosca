@@ -19,10 +19,10 @@ const TRANSPORT: &str = "json";
 
 /// The pid of this process's real parent, `0` (never a parent's pid) if it has exited.
 fn parent_pid() -> u32 {
-    cosca::Process::current()
+    cosca::identity::ProcessId::current()
         .parent()
         .expect("find the parent process")
-        .map_or(0, |parent| parent.id().pid())
+        .map_or(0, |parent| parent.pid())
 }
 
 /// Call first in a test that changes process-global state.

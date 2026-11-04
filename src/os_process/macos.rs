@@ -1,21 +1,20 @@
 //! macOS: an [`OsProcess`] over an exit watch and the kernel's audit-token signal, and the kqueue
-//! behind [`WaitFor::Kqueue`](super::WaitFor::Kqueue).
+//! behind [`WaitFor::Readable`](super::WaitFor::Readable).
 //!
 //! macOS has no pidfd. A signal goes through `proc_signal_with_audittoken` instead, with a token
 //! that names the pid and the process's `p_idversion`: the kernel checks the version and signals
 //! while it holds a reference, so a process that took a reused pid is never signalled.
 
 use std::os::fd::{AsFd, BorrowedFd};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use mach2::message::audit_token_t;
 
-use super::{Exit, Op, OsProcess, WaitFor};
+use super::{Exit, OsProcess, WaitFor, OPEN_CONSEQUENCE};
 use crate::error::{io_context, Error};
 use crate::identity::{uniq_info, Existence, ProcessId, ReadPurpose, UniqRead};
 use crate::signal::{Sent, Sig};
-use kqueue::{Kqueue, Subscription, WaitOutcome};
+use kqueue::{Kqueue, Subscription};
 
 pub(crate) mod kqueue;
 
@@ -28,34 +27,29 @@ extern "C" {
     fn proc_signal_with_audittoken(audittoken: *mut audit_token_t, sig: libc::c_int) -> libc::c_int;
 }
 
-/// A process, its exit watch if it was opened for [`Op::Wait`], and what its audit token needs.
-/// `unique` is the process's `p_uniqueid`: never reused, and kept across `exec`. `idversion` is its
-/// `p_idversion`: it changes at `exec`. A signal needs no kqueue, so a kill or terminate holds no
-/// watch and costs no descriptor.
+/// A process, its exit watch, and what its audit token needs. `unique` is the process's
+/// `p_uniqueid`: never reused, and kept across `exec`. `idversion` is its `p_idversion`: it changes
+/// at `exec`, and `signal` follows it, so it is atomic. Every open arms the watch, one kqueue
+/// descriptor, because the one open serves a signal and a wait alike.
 #[derive(Debug)]
 pub(crate) struct MacProcess {
     id: ProcessId,
     unique: u64,
-    idversion: i32,
-    watch: Option<ExitWatch>,
+    idversion: AtomicI32,
+    watch: ExitWatch,
 }
 
 impl MacProcess {
     /// Open the process `id` names. `Ok(None)`: it is gone, or its pid now names another process.
-    /// `op` words the `Unassessable` errors, and only [`Op::Wait`] arms the exit watch.
-    pub(crate) fn open(id: ProcessId, op: Op) -> Result<Option<Self>, Error> {
+    pub(crate) fn open(id: ProcessId) -> Result<Option<Self>, Error> {
         let pid = id.pid();
-        let (warn_tail, detail_tail) = match op {
-            Op::Wait => ("; its exit cannot be observed", "; its exit cannot be observed"),
-            Op::Kill | Op::Terminate => (" - no signal was sent", "; no signal was sent"),
-        };
         let read = || match uniq_info(pid, ReadPurpose::Open) {
             UniqRead::Found(info) => Ok(Some(info)),
             UniqRead::Gone => Ok(None),
             UniqRead::Refused(errno) => {
-                log::warn!("wait: pid {pid} identity could not be read (errno {errno}){warn_tail}");
+                log::warn!("wait: pid {pid} identity could not be read (errno {errno}); {OPEN_CONSEQUENCE}");
                 Err(Error::Unassessable {
-                    detail: format!("pid {pid} identity could not be read (errno {errno}){detail_tail}"),
+                    detail: format!("pid {pid} identity could not be read (errno {errno}); {OPEN_CONSEQUENCE}"),
                     source: Some(std::io::Error::from_raw_os_error(errno)),
                 })
             }
@@ -67,24 +61,14 @@ impl MacProcess {
             Existence::Present => {}
             Existence::Gone => return Ok(None),
             Existence::Unknown => {
-                log::warn!("wait: pid {pid} identity could not be confirmed{warn_tail}");
+                log::warn!("wait: pid {pid} identity could not be confirmed; {OPEN_CONSEQUENCE}");
                 return Err(Error::Unassessable {
-                    detail: format!("pid {pid} identity could not be confirmed{detail_tail}"),
+                    detail: format!("pid {pid} identity could not be confirmed; {OPEN_CONSEQUENCE}"),
                     source: None,
                 });
             }
         }
-        if !matches!(op, Op::Wait) {
-            return Ok(Some(Self {
-                id,
-                unique: first.unique_id,
-                idversion: first.id_version,
-                watch: None,
-            }));
-        }
-        let Some(watch) = ExitWatch::proc_exit(pid)? else {
-            return Ok(None);
-        };
+        let watch = ExitWatch::proc_exit(pid)?;
         // The watch was armed on whatever held the pid by now. The same unique id before and
         // after proves it was this process: a unique id is never reused.
         let Some(second) = read()?.filter(|second| second.unique_id == first.unique_id) else {
@@ -93,8 +77,8 @@ impl MacProcess {
         Ok(Some(Self {
             id,
             unique: second.unique_id,
-            idversion: second.id_version,
-            watch: Some(watch),
+            idversion: AtomicI32::new(second.id_version),
+            watch,
         }))
     }
 }
@@ -119,7 +103,7 @@ fn send_with_token(pid: u32, id_version: i32, signo: libc::c_int) -> Result<(), 
 }
 
 impl OsProcess for MacProcess {
-    fn signal(&mut self, sig: Sig) -> Result<Sent, Error> {
+    fn signal(&self, sig: Sig) -> Result<Sent, Error> {
         let pid = self.id.pid();
         let signo = sig.as_libc();
         // `kernel_task` is pid 0 and macOS resolves it, so an identity can name it. It is no
@@ -134,7 +118,8 @@ impl OsProcess for MacProcess {
         }
         // No cap: each pass past the first needs a fresh `exec` of the process.
         loop {
-            let sent = send_with_token(pid, self.idversion, signo);
+            let idversion = self.idversion.load(Ordering::Relaxed);
+            let sent = send_with_token(pid, idversion, signo);
             #[cfg(test)]
             crate::send_log::record_by_identity(pid, signo);
             match sent {
@@ -146,12 +131,12 @@ impl OsProcess for MacProcess {
             // `ESRCH` is a zombie, an `exec`, or a process that is gone: read what the pid names.
             match uniq_info(pid, ReadPurpose::Kill) {
                 UniqRead::Found(now) if now.unique_id == self.unique => {
-                    if now.id_version == self.idversion {
+                    if now.id_version == idversion {
                         log::debug!("{sig:?} to pid {pid}: it has exited and is not reaped yet");
                         return Ok(Sent::Gone);
                     }
                     // It `exec`ed: the same process under a new version.
-                    self.idversion = now.id_version;
+                    self.idversion.store(now.id_version, Ordering::Relaxed);
                 }
                 UniqRead::Found(_) | UniqRead::Gone => {
                     log::debug!("{sig:?} to pid {pid}: it is gone, or its pid names another process");
@@ -167,41 +152,36 @@ impl OsProcess for MacProcess {
         }
     }
 
-    fn exited(&mut self) -> Result<Exit<'_>, Error> {
-        let Some(watch) = &self.watch else {
-            return Err(super::opened_for_a_signal());
-        };
-        // A consumed exit event stays in `seen`, so a look after a wait that read it is `Exited`.
-        if watch.drain()? {
+    fn exited(&self) -> Result<Exit<'_>, Error> {
+        let watch = &self.watch;
+        if watch.exited()? {
             Ok(Exit::Exited)
         } else {
-            Ok(Exit::Running(WaitFor::Kqueue(watch)))
+            Ok(Exit::Running(WaitFor::Readable(watch.as_fd())))
         }
     }
 }
 
-/// A kqueue armed for one event, and whether that event was ever read. A kqueue reports an exit
-/// once, so a wait that consumed it must not hide it from the next look: `seen` stays set.
-///
-/// An `AtomicBool`, not a `Cell`, so a future that holds `&ExitWatch` stays `Send`. `drain` and
-/// `block` never run at once: `&mut` access to the owning process serialises them, so no look
-/// falls between a wait taking the event and setting `seen`.
+/// A kqueue armed for the exit of one process, and nothing else. Nothing ever reads it: at exit XNU
+/// leaves the `NOTE_EXIT` knote queued (`EV_EOF | EV_ONESHOT`), and a kqueue descriptor polls
+/// readable while its queue is non-empty, so a zero-timeout `poll` is the look and any number of
+/// threads may look, or wait on the descriptor, at once. A `kevent` read would take the event
+/// away from every other waiter.
 #[derive(Debug)]
 pub(crate) struct ExitWatch {
     kq: Kqueue,
-    seen: AtomicBool,
+    /// The pid was already past registration (`ESRCH`) when the watch was armed: the process has
+    /// exited, and no event will ever be queued.
+    exited: bool,
 }
 
 impl ExitWatch {
     pub(super) fn new(kq: Kqueue) -> Self {
-        Self {
-            kq,
-            seen: AtomicBool::new(false),
-        }
+        Self { kq, exited: false }
     }
 
-    /// Arm `NOTE_EXIT` for `pid`. `Ok(None)`: the pid is already gone.
-    pub(crate) fn proc_exit(pid: u32) -> Result<Option<Self>, Error> {
+    /// Arm `NOTE_EXIT` for `pid`. A pid that is already gone is a watch that reads as exited.
+    pub(crate) fn proc_exit(pid: u32) -> Result<Self, Error> {
         let kq = Kqueue::new()?;
         let exit = Subscription::Process {
             pid,
@@ -209,44 +189,21 @@ impl ExitWatch {
             reap: false,
         };
         match kq.subscribe(exit) {
-            Ok(()) => Ok(Some(Self::new(kq))),
-            Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Ok(None),
+            Ok(()) => Ok(Self::new(kq)),
+            Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Ok(Self { kq, exited: true }),
             Err(e) => Err(e),
         }
     }
 
-    /// Block until the event has been read, by this call or an earlier one, or until `deadline`.
-    /// `Ok(true)` = the event was read.
-    pub(crate) fn block(&self, deadline: Option<Instant>) -> Result<bool, Error> {
-        if self.seen.load(Ordering::Relaxed) {
+    /// Whether the exit has happened. Reads nothing from the queue.
+    pub(crate) fn exited(&self) -> Result<bool, Error> {
+        if self.exited {
             return Ok(true);
         }
-        // Only a wait that is really armed counts as a block.
-        #[cfg(test)]
-        crate::wait::block_probe::record(crate::wait::remaining(deadline));
-        match self.kq.wait(deadline)? {
-            WaitOutcome::Events(_) => {
-                self.seen.store(true, Ordering::Relaxed);
-                Ok(true)
-            }
-            WaitOutcome::DeadlinePassed => Ok(false),
-        }
+        crate::os_process::poll::is_readable(self.kq.as_fd()).map_err(Error::Io)
     }
 
-    /// Read a pending event without blocking. `Ok(true)` = the event has been read, now or
-    /// earlier.
-    pub(crate) fn drain(&self) -> Result<bool, Error> {
-        if !self.kq.poll()?.is_empty() {
-            self.seen.store(true, Ordering::Relaxed);
-        }
-        Ok(self.seen.load(Ordering::Relaxed))
-    }
-
-    /// The kqueue's descriptor, for a reactor that registers it.
-    #[cfg_attr(
-        not(feature = "tokio"),
-        allow(dead_code, reason = "only the async driver registers the kqueue")
-    )]
+    /// The kqueue's descriptor: readable once the exit has happened.
     pub(crate) fn as_fd(&self) -> BorrowedFd<'_> {
         self.kq.as_fd()
     }

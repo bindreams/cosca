@@ -4,7 +4,7 @@
 use crate::containment::enumerate::backend_fault::force_snapshot_failure;
 use crate::error::Error;
 use crate::identity::ProcessId;
-use crate::test_child::{live_findstr_blocker as live_member, release_findstr_unterminated as release};
+use crate::test_child::{live_findstr_blocker as live_member, open_live, release_findstr_unterminated as release};
 use crate::Recursive;
 
 fn assert_names_toolhelp(result: Result<(), Error>, what: &str) {
@@ -20,15 +20,16 @@ fn assert_names_toolhelp(result: Result<(), Error>, what: &str) {
 /// return the error".
 #[skuld::test]
 fn every_walk_over_a_failed_snapshot_errors_and_terminates_nothing() {
-    type Walk = fn(ProcessId) -> Result<(), Error>;
+    type Walk = fn(&crate::Process) -> Result<(), Error>;
     let walks: [(&str, Walk); 2] = [
-        ("hard_kill", |id| super::hard_kill(id).map(|_| ())),
-        ("kill_tree", |id| crate::Process::from_id(id).kill_tree()),
+        ("hard_kill", |p| super::hard_kill(p.id()).map(|_| ())),
+        ("kill_tree", |p| p.kill_tree()),
     ];
     for (name, walk) in walks {
         let (child, id) = live_member();
+        let process = open_live(id);
         let forced = force_snapshot_failure();
-        let result = walk(id);
+        let result = walk(&process);
         drop(forced);
         assert_names_toolhelp(result, name);
         release(child);
@@ -38,7 +39,7 @@ fn every_walk_over_a_failed_snapshot_errors_and_terminates_nothing() {
 /// Mutant: "`parent` / `children` map the snapshot's error to `Ok(None)` / `Ok(vec![])`".
 #[skuld::test]
 fn parent_and_children_over_a_failed_snapshot_are_unassessable() {
-    let me = crate::Process::from_id(ProcessId::current());
+    let me = ProcessId::current();
     let forced = force_snapshot_failure();
     let results = [
         ("parent", me.parent().map(|_| ())),
@@ -59,7 +60,6 @@ fn a_walk_from_a_root_that_lost_its_pid_terminates_nothing() {
     let stale = ProcessId::from_parts_for_test(me.pid(), me.start_token_raw().wrapping_sub(1));
     let (child, _) = live_member();
     super::hard_kill(stale).expect("a root that lost its pid is nothing to do");
-    crate::Process::from_id(stale).kill_tree().expect("likewise");
     release(child);
 }
 
@@ -68,7 +68,7 @@ fn a_walk_from_a_root_that_lost_its_pid_terminates_nothing() {
 /// `windows` crate's own `io::Error` conversion, which keeps the HRESULT (`0x80070005`).
 #[skuld::test]
 fn a_failed_snapshot_is_unassessable_with_its_win32_code() {
-    let me = crate::Process::from_id(ProcessId::current());
+    let me = ProcessId::current();
     let forced = force_snapshot_failure();
     let result = me.parent();
     drop(forced);

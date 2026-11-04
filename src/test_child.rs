@@ -324,6 +324,14 @@ pub(crate) fn exiting_member_command() -> std::process::Command {
     cmd
 }
 
+/// An open handle on the live process `id` names. Open it before arming a fault: opening may
+/// read what the fault forces.
+pub(crate) fn open_live(id: crate::identity::ProcessId) -> crate::Process {
+    crate::Process::open(id)
+        .expect("open the live process")
+        .expect("the live process is not gone")
+}
+
 /// A live [`exiting_member_command`] child that has announced itself, and its identity.
 #[cfg(unix)]
 pub(crate) fn live_exiting_member() -> (std::process::Child, crate::identity::ProcessId) {
@@ -679,8 +687,7 @@ fn watch_linux(listener: &std::net::TcpListener, target: crate::identity::Proces
 
     use rustix::event::{poll, PollFd, PollFlags};
 
-    let Some(pidfd) = crate::os_process::linux::open::open_verified(target, crate::os_process::Op::Wait)
-        .expect("open a pidfd to watch the target")
+    let Some(pidfd) = crate::os_process::linux::open::open_verified(target).expect("open a pidfd to watch the target")
     else {
         return WatchEvent::Died;
     };
@@ -781,7 +788,8 @@ fn watch_windows(listener: &std::net::TcpListener, target: crate::identity::Proc
     use windows::Win32::Networking::WinSock::{WSAEventSelect, FD_ACCEPT, SOCKET, WSAEVENT};
     use windows::Win32::System::Threading::{WaitForMultipleObjects, INFINITE};
 
-    let Some(process) = crate::os_process::windows::open_verified(target).expect("open a handle to watch the target")
+    let Some((process, _granted)) =
+        crate::os_process::windows::open_verified(target).expect("open a handle to watch the target")
     else {
         return WatchEvent::Died;
     };
@@ -1544,10 +1552,9 @@ fn spawn_connects_and_exits(
         cmd.env(ack::ACK_ENV, "1");
     }
     let child = crate::test_spawn::spawn(&mut cmd).expect("spawn the connects-and-exits fixture");
-    let target = crate::Process::from_pid(child.id())
+    let target = crate::identity::ProcessId::of(child.id())
         .found()
-        .expect("resolve the freshly spawned fixture's pid")
-        .id();
+        .expect("resolve the freshly spawned fixture's pid");
     (child, target)
 }
 

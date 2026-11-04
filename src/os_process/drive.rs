@@ -2,7 +2,7 @@
 
 use std::time::{Duration, Instant};
 
-use super::{open, Exit, Op, OsProcess, WaitFor};
+use super::{open, Exit, OsProcess, WaitFor};
 use crate::error::Error;
 use crate::identity::ProcessId;
 use crate::wait::remaining;
@@ -29,10 +29,17 @@ fn enter() -> Result<(), Error> {
 pub(crate) fn exited_by_id(id: ProcessId, timeout: Option<Duration>) -> Result<bool, Error> {
     enter()?;
     let deadline = absolute(timeout);
-    match open(id, Op::Wait)? {
+    match open(id)? {
         None => Ok(true),
-        Some(mut process) => drive(&mut *process, deadline),
+        Some(process) => drive(&*process, deadline),
     }
+}
+
+/// [`exited_by_id`] for a process already open: `Ok(true)` = exited, `Ok(false)` = still running
+/// after the deadline's final look.
+pub(crate) fn exited_held(p: &dyn OsProcess, timeout: Option<Duration>) -> Result<bool, Error> {
+    enter()?;
+    drive(p, absolute(timeout))
 }
 
 /// `timeout` as an absolute deadline, fixed up front so no wake extends the total wait.
@@ -42,7 +49,7 @@ pub(super) fn absolute(timeout: Option<Duration>) -> Option<Instant> {
 
 /// The wait loop against an absolute `deadline` from [`absolute`]: look; if running, block on what
 /// the look returned.
-pub(super) fn drive(p: &mut dyn OsProcess, deadline: Option<Instant>) -> Result<bool, Error> {
+pub(super) fn drive(p: &dyn OsProcess, deadline: Option<Instant>) -> Result<bool, Error> {
     loop {
         // Read before the look: a look made at or after the deadline is the final one.
         let final_look = remaining(deadline) == Some(Duration::ZERO);
@@ -61,13 +68,9 @@ pub(super) fn drive(p: &mut dyn OsProcess, deadline: Option<Instant>) -> Result<
 /// Block on `wait_for` until it wakes or `deadline` passes. The caller looks again either way.
 fn block(wait_for: &WaitFor<'_>, deadline: Option<Instant>) -> Result<(), Error> {
     match wait_for {
-        #[cfg(target_os = "linux")]
-        WaitFor::Readable(pidfd) => {
-            crate::os_process::linux::poll_pidfd_exit(*pidfd, deadline).map_err(Error::Io)?;
-        }
-        #[cfg(target_os = "macos")]
-        WaitFor::Kqueue(watch) => {
-            watch.block(deadline)?;
+        #[cfg(unix)]
+        WaitFor::Readable(fd) => {
+            crate::os_process::poll::poll_readable(*fd, deadline).map_err(Error::Io)?;
         }
         #[cfg(windows)]
         WaitFor::Signalled(process) => {

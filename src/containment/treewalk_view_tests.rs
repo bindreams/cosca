@@ -10,7 +10,7 @@ use crate::identity::proc_view_fault::{
     force_openat2_errno, force_proc_view_after, force_proc_view_once, proc_view_fired_at, ForcedView,
 };
 use crate::identity::ProcessId;
-use crate::test_child::{live_exiting_member as live_member, release_unsignalled as release};
+use crate::test_child::{live_exiting_member as live_member, open_live, release_unsignalled as release};
 use crate::Recursive;
 
 /// An identity for this process's pid that this process no longer holds: its children are the
@@ -38,14 +38,14 @@ fn views() -> [(ForcedView, &'static str); 2] {
     ]
 }
 
-type Walk = fn(ProcessId) -> Result<(), Error>;
+type Walk = fn(&crate::Process) -> Result<(), Error>;
 
 fn walks() -> [(&'static str, Walk); 4] {
     [
-        ("hard_kill", |id| super::hard_kill(id).map(|_| ())),
-        ("terminate", |id| super::terminate(id)),
-        ("kill_tree", |id| crate::Process::from_id(id).kill_tree()),
-        ("terminate_tree", |id| crate::Process::from_id(id).terminate_tree()),
+        ("hard_kill", |p| super::hard_kill(p.id()).map(|_| ())),
+        ("terminate", |p| super::terminate(p.id())),
+        ("kill_tree", |p| p.kill_tree()),
+        ("terminate_tree", |p| p.terminate_tree()),
     ]
 }
 
@@ -58,8 +58,9 @@ fn every_walk_over_an_untrusted_view_errors_and_signals_nothing() {
     for (name, walk) in walks() {
         for (view, cause) in views() {
             let (child, id) = live_member();
+            let process = open_live(id);
             let forced = force_proc_view_once(view);
-            let result = walk(id);
+            let result = walk(&process);
             drop(forced);
             assert!(
                 matches!(&result, Err(Error::Unassessable { detail, .. }) if detail.contains(cause)),
@@ -78,8 +79,9 @@ fn every_walk_without_openat2_is_unsupported_naming_it() {
     for (name, walk) in walks() {
         for (errno, code) in [(rustix::io::Errno::NOSYS, "ENOSYS"), (rustix::io::Errno::PERM, "EPERM")] {
             let (child, id) = live_member();
+            let process = open_live(id);
             let forced = force_openat2_errno(errno);
-            let result = walk(id);
+            let result = walk(&process);
             drop(forced);
             match result {
                 Err(Error::Unsupported { detail, .. }) => {
@@ -96,7 +98,7 @@ fn every_walk_without_openat2_is_unsupported_naming_it() {
 /// error to `Ok(None)` / `Ok(vec![])`".
 #[skuld::test]
 fn parent_and_children_without_openat2_are_unsupported_naming_it() {
-    let me = crate::Process::from_id(ProcessId::current());
+    let me = ProcessId::current();
     for (errno, code) in [(rustix::io::Errno::NOSYS, "ENOSYS"), (rustix::io::Errno::PERM, "EPERM")] {
         let forced = force_openat2_errno(errno);
         let results = [
@@ -118,7 +120,7 @@ fn parent_and_children_without_openat2_are_unsupported_naming_it() {
 
 // The snapshot precedes the anchor =====
 
-type Query = fn(&crate::Process) -> Result<(), Error>;
+type Query = fn(&ProcessId) -> Result<(), Error>;
 
 fn queries() -> [(&'static str, Query); 3] {
     [
@@ -133,7 +135,7 @@ fn queries() -> [(&'static str, Query); 3] {
 /// on the anchor and the error blames the wrong read.
 #[skuld::test]
 fn parent_and_children_take_the_snapshot_before_the_anchor() {
-    let me = crate::Process::from_id(ProcessId::current());
+    let me = ProcessId::current();
     for (name, query) in queries() {
         for (view, cause) in views() {
             let forced = force_proc_view_once(view);
@@ -154,8 +156,8 @@ fn parent_and_children_take_the_snapshot_before_the_anchor() {
 /// has recovered by then, so the error blames access); "the table read's error is dropped".
 #[skuld::test]
 fn an_anchor_read_that_fails_names_the_view_that_failed_it() {
-    let me = crate::Process::from_id(ProcessId::current());
-    let pid = me.id().pid();
+    let me = ProcessId::current();
+    let pid = me.pid();
     for (name, query) in queries() {
         for (view, cause) in views() {
             let forced = force_proc_view_after(1, view);
@@ -174,10 +176,16 @@ fn an_anchor_read_that_fails_names_the_view_that_failed_it() {
 // The anchor guards the walk =====
 
 /// A root that no longer holds its pid has no descendants: its pid's new owner's children are not
-/// its own, and are never signalled. Mutant: "walk without an anchor".
+/// its own, and are never signalled. Mutant: "walk without an anchor". A stale identity cannot be
+/// opened, so only the identity-level walks run.
 #[skuld::test]
 fn every_walk_from_a_root_that_lost_its_pid_is_ok_and_signals_nothing() {
-    for (name, walk) in walks() {
+    type IdWalk = fn(ProcessId) -> Result<(), Error>;
+    let walks: [(&str, IdWalk); 2] = [
+        ("hard_kill", |id| super::hard_kill(id).map(|_| ())),
+        ("terminate", |id| super::terminate(id)),
+    ];
+    for (name, walk) in walks {
         let (child, _) = live_member();
         let result = walk(stale_root());
         assert!(result.is_ok(), "{name}: {result:?}");
@@ -191,8 +199,9 @@ fn every_walk_from_a_root_that_lost_its_pid_is_ok_and_signals_nothing() {
 fn every_walk_from_a_root_that_cannot_be_queried_errors_and_signals_nothing() {
     for (name, walk) in walks() {
         let (child, id) = live_member();
+        let process = open_live(id);
         let forced = force_proc_view_after(1, ForcedView::Unassessable);
-        let result = walk(id);
+        let result = walk(&process);
         assert_eq!(
             proc_view_fired_at(),
             Some(1),
@@ -217,9 +226,9 @@ fn every_walk_from_a_root_that_cannot_be_queried_errors_and_signals_nothing() {
 /// Mutant: "a `self` missing from the table is `Ok(None)` / `Ok(vec![])`".
 #[skuld::test]
 fn a_live_self_missing_from_the_table_is_unassessable() {
-    let me = crate::Process::from_id(ProcessId::current());
+    let me = ProcessId::current();
     let _forced = crate::identity::pid_stat::fault::force_stat_read(libc::EACCES, None);
     for (_, query) in queries() {
-        assert_unassessable_naming(query(&me), &[&format!("pid {} is live but absent", me.id().pid())]);
+        assert_unassessable_naming(query(&me), &[&format!("pid {} is live but absent", me.pid())]);
     }
 }

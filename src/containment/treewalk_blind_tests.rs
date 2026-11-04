@@ -4,7 +4,7 @@
 use crate::containment::enumerate::backend_fault::{force_blind_snapshot, force_denied, force_join_alloc_failure};
 use crate::error::Error;
 use crate::identity::ProcessId;
-use crate::test_child::{live_exiting_member as live_member, release_unsignalled as release};
+use crate::test_child::{live_exiting_member as live_member, open_live, release_unsignalled as release};
 use crate::Recursive;
 
 fn assert_unassessable_naming(result: Result<(), Error>, cause: &str) {
@@ -16,18 +16,18 @@ fn assert_unassessable_naming(result: Result<(), Error>, cause: &str) {
     }
 }
 
-type Walk = fn(ProcessId) -> Result<(), Error>;
+type Walk = fn(&crate::Process) -> Result<(), Error>;
 
 fn walks() -> [(&'static str, Walk); 4] {
     [
-        ("hard_kill", |id| super::hard_kill(id).map(|_| ())),
-        ("terminate", |id| super::terminate(id)),
-        ("kill_tree", |id| crate::Process::from_id(id).kill_tree()),
-        ("terminate_tree", |id| crate::Process::from_id(id).terminate_tree()),
+        ("hard_kill", |p| super::hard_kill(p.id()).map(|_| ())),
+        ("terminate", |p| super::terminate(p.id())),
+        ("kill_tree", |p| p.kill_tree()),
+        ("terminate_tree", |p| p.terminate_tree()),
     ]
 }
 
-type Query = fn(&crate::Process) -> Result<(), Error>;
+type Query = fn(&ProcessId) -> Result<(), Error>;
 
 fn queries() -> [(&'static str, Query); 3] {
     [
@@ -43,8 +43,9 @@ fn queries() -> [(&'static str, Query); 3] {
 fn every_walk_over_a_failed_listing_errors_and_signals_nothing() {
     for (name, walk) in walks() {
         let (child, id) = live_member();
+        let process = open_live(id);
         let forced = force_blind_snapshot();
-        let result = walk(id);
+        let result = walk(&process);
         drop(forced);
         assert!(
             matches!(&result, Err(Error::Unassessable { detail, .. }) if detail.contains("proc_listallpids")),
@@ -57,7 +58,7 @@ fn every_walk_over_a_failed_listing_errors_and_signals_nothing() {
 /// Mutant: "`parent` / `children` map the snapshot's error to `Ok(None)` / `Ok(vec![])`".
 #[skuld::test]
 fn parent_and_children_over_a_failed_listing_are_unassessable() {
-    let me = crate::Process::from_id(ProcessId::current());
+    let me = ProcessId::current();
     for (name, query) in queries() {
         let forced = force_blind_snapshot();
         let result = query(&me);
@@ -76,8 +77,9 @@ fn parent_and_children_over_a_failed_listing_are_unassessable() {
 fn every_walk_over_a_snapshot_with_a_denied_ppid_errors_and_signals_nothing() {
     for (name, walk) in walks() {
         let (child, id) = live_member();
+        let process = open_live(id);
         let forced = force_denied(&[id.pid() as libc::c_int]);
-        let result = walk(id);
+        let result = walk(&process);
         drop(forced);
         assert!(
             matches!(&result, Err(Error::Unassessable { detail, .. }) if detail.contains(&format!("sample: [{}]", id.pid()))),
@@ -91,7 +93,7 @@ fn every_walk_over_a_snapshot_with_a_denied_ppid_errors_and_signals_nothing() {
 #[skuld::test]
 fn parent_and_children_over_a_snapshot_with_a_denied_ppid_are_unassessable() {
     let (child, id) = live_member();
-    let me = crate::Process::from_id(ProcessId::current());
+    let me = ProcessId::current();
     for (_, query) in queries() {
         let forced = force_denied(&[id.pid() as libc::c_int]);
         let result = query(&me);
@@ -107,8 +109,9 @@ fn parent_and_children_over_a_snapshot_with_a_denied_ppid_are_unassessable() {
 fn every_walk_over_a_failed_edge_allocation_errors_and_signals_nothing() {
     for (name, walk) in walks() {
         let (child, id) = live_member();
+        let process = open_live(id);
         let forced = force_join_alloc_failure();
-        let result = walk(id);
+        let result = walk(&process);
         drop(forced);
         assert!(
             matches!(&result, Err(Error::Unassessable { detail, .. }) if detail.contains("edge buffer")),
@@ -119,12 +122,18 @@ fn every_walk_over_a_failed_edge_allocation_errors_and_signals_nothing() {
 }
 
 /// A root that no longer holds its pid has no descendants: its pid's new owner's children are not
-/// its own. Mutant: "walk without an anchor".
+/// its own. Mutant: "walk without an anchor". A stale identity cannot be opened, so only the
+/// identity-level walks run.
 #[skuld::test]
 fn every_walk_from_a_root_that_lost_its_pid_is_ok_and_signals_nothing() {
+    type IdWalk = fn(ProcessId) -> Result<(), Error>;
+    let walks: [(&str, IdWalk); 2] = [
+        ("hard_kill", |id| super::hard_kill(id).map(|_| ())),
+        ("terminate", |id| super::terminate(id)),
+    ];
     let me = ProcessId::current();
     let stale = ProcessId::from_parts_for_test(me.pid(), me.start_token_raw().wrapping_sub(1));
-    for (name, walk) in walks() {
+    for (name, walk) in walks {
         let (child, _) = live_member();
         let result = walk(stale);
         assert!(result.is_ok(), "{name}: {result:?}");

@@ -353,11 +353,10 @@ fn pid1_uid() -> u32 {
     0
 }
 
-/// Mutants: the op is another `Op`; the forced errno is not consumed (no fallback, so no
-/// line).
+/// Mutant: the forced errno is not consumed (no fallback, so no line).
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn a_refused_pidfd_open_falls_back_to_kill_naming_group_teardown() {
+fn a_refused_pidfd_open_falls_back_to_kill_naming_process_open() {
     use crate::containment::cgroup::test_support::{block_on, fork_running};
 
     crate::log_capture::install();
@@ -378,7 +377,7 @@ fn a_refused_pidfd_open_falls_back_to_kill_naming_group_teardown() {
     assert_eq!(lines[0].0, log::Level::Debug);
     assert!(
         lines[0].1.contains(
-            "process-group teardown is not supported on linux: cosca requires pidfd_open (Linux \u{2265} 5.3), \
+            "process open is not supported on linux: cosca requires pidfd_open (Linux \u{2265} 5.3), \
              refused here: pidfd_open answered EPERM"
         ),
         "{lines:?}"

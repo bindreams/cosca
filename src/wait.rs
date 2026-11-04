@@ -510,7 +510,7 @@ pub(crate) fn wait_until(
 pub(crate) fn pidfd_exit_visible_by(pidfd: std::os::fd::BorrowedFd<'_>, until: Instant) -> bool {
     use crate::wait::exit_only::{self, Peek, Target};
 
-    match crate::os_process::linux::poll_pidfd_exit(pidfd, Some(until)) {
+    match crate::os_process::poll::poll_readable(pidfd, Some(until)) {
         Ok(true) => {}
         Err(e) => log::debug!("a look at a killed child's exit could not poll its pidfd ({e}); it peeks instead"),
         Ok(false) => return false,
@@ -568,9 +568,9 @@ fn win32_wait_clamp() -> u32 {
 }
 
 /// Test-only, thread-local record of the timeout each timed block was armed with on this thread
-/// (`None` = unbounded): a `poll` or `Condvar::wait_timeout` round, a Win32 wait, or (macOS) one
-/// `ExitWatch::block` that arms a wait. A test proves a deadline wait armed nothing
-/// longer than the time remaining, and blocked at all, from the log.
+/// (`None` = unbounded): a `poll` or `Condvar::wait_timeout` round, or a Win32 wait.
+/// A test proves a deadline wait armed nothing longer than the time remaining, and blocked at all,
+/// from the log.
 #[cfg(test)]
 pub(crate) mod block_probe {
     use std::cell::RefCell;
