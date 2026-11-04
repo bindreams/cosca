@@ -62,6 +62,11 @@ pub(crate) trait Waitable {
     /// Called for [`Step::Recheck`], with the next step of the backoff, already cut to the time
     /// remaining.
     fn pause(&mut self, d: Duration);
+    /// Called when the block a [`Step::Wait`] asked for fails with `e`. The default ends the loop
+    /// with `e`; a `Waitable` that can still decide by looking again returns `Ok`, and `run` looks.
+    fn block_failed(&mut self, e: Error) -> Result<(), Error> {
+        Err(e)
+    }
 }
 
 /// What a [`Waitable::look`] found.
@@ -102,7 +107,8 @@ fn backoff() -> ExponentialBackoff {
 /// that is not done ends the loop with [`RunOutcome::DeadlinePassed`].
 ///
 /// A pause is the next step of one backoff, cut to the time remaining; the backoff starts over after
-/// every block.
+/// every block. A failed block goes to [`Waitable::block_failed`], which ends the loop with the error
+/// unless it is survived.
 pub(crate) fn run<W: Waitable>(w: &mut W, deadline: Option<Instant>) -> Result<RunOutcome<W::Output>, Error> {
     let mut steps = backoff();
     loop {
@@ -112,8 +118,11 @@ pub(crate) fn run<W: Waitable>(w: &mut W, deadline: Option<Instant>) -> Result<R
             Step::Wait(_) | Step::Recheck if final_look => return Ok(RunOutcome::DeadlinePassed),
             Step::Wait(wait_for) => {
                 if remaining(deadline) != Some(Duration::ZERO) {
-                    block(&wait_for, deadline)?;
+                    let blocked = block(&wait_for, deadline);
                     steps = backoff();
+                    if let Err(e) = blocked {
+                        w.block_failed(e)?;
+                    }
                 }
             }
             Step::Recheck => {

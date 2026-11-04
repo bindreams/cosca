@@ -499,25 +499,24 @@ pub(crate) fn wait_until(
 }
 
 /// Waits until the exit of `pidfd`'s process is visible to this process, or until `until`, and
-/// says which came first. Anything it cannot read (a failed block or peek, a foreign reap) answers
-/// `true`, for the caller's unbounded wait to decide. Reaps nothing.
+/// says which came first. Anything it cannot read (a failed peek, a foreign reap) answers `true`,
+/// for the caller's unbounded wait to decide. Reaps nothing.
 ///
 /// A readable pidfd whose zombie a foreign tracer still holds shows no exit to a peek. The kernel
 /// wakes the pidfd again when the tracer lets go, but `poll(2)` on an already readable pidfd
-/// returns at once and cannot wait for that wake, so the look is a [`Step::Recheck`](crate::os_process::drive::Step::Recheck): the peek is
-/// repeated on [`run`](crate::os_process::drive::run)'s backoff until `until`. The backoff paces looks; the deadline
-/// decides only the answer.
+/// returns at once and cannot wait for that wake, so the peek is repeated with a capped backoff
+/// until `until`. A failed poll of the pidfd is logged and treated the same way: the peeks decide,
+/// and a child still running at `until` answers `false`.
 #[cfg(target_os = "linux")]
 pub(crate) fn pidfd_exit_visible_by(pidfd: std::os::fd::BorrowedFd<'_>, until: Instant) -> bool {
     use crate::os_process::drive::{run, RunOutcome};
 
-    match run(&mut PidfdExit(pidfd), Some(until)) {
+    match run(&mut PidfdExit::new(pidfd), Some(until)) {
         Ok(RunOutcome::Done(())) => true,
         Ok(RunOutcome::DeadlinePassed) => false,
         Err(e) => {
-            log::debug!(
-                "a look at a killed child's exit could not wait on its pidfd ({e}); the wait that follows decides"
-            );
+            log::debug!("a look at a killed child's exit failed ({e}); the wait that follows decides");
+            debug_assert!(false, "a pidfd look does not fail: {e}");
             true
         }
     }
@@ -526,7 +525,28 @@ pub(crate) fn pidfd_exit_visible_by(pidfd: std::os::fd::BorrowedFd<'_>, until: I
 /// A child's pidfd, as a [`Waitable`](crate::os_process::drive::Waitable): done once a peek shows
 /// the exit.
 #[cfg(target_os = "linux")]
-struct PidfdExit<'a>(std::os::fd::BorrowedFd<'a>);
+struct PidfdExit<'a> {
+    pidfd: std::os::fd::BorrowedFd<'a>,
+    /// A poll of `pidfd` has failed: the look no longer asks for a block.
+    poll_failed: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl<'a> PidfdExit<'a> {
+    fn new(pidfd: std::os::fd::BorrowedFd<'a>) -> Self {
+        Self {
+            pidfd,
+            poll_failed: false,
+        }
+    }
+
+    /// Log the first failed poll; the peeks decide from then on.
+    fn note_poll_failed(&mut self, e: &dyn std::fmt::Display) {
+        if !std::mem::replace(&mut self.poll_failed, true) {
+            log::debug!("a look at a killed child's exit could not poll its pidfd ({e}); it peeks instead");
+        }
+    }
+}
 
 #[cfg(target_os = "linux")]
 impl crate::os_process::drive::Waitable for PidfdExit<'_> {
@@ -537,7 +557,7 @@ impl crate::os_process::drive::Waitable for PidfdExit<'_> {
         use crate::os_process::WaitFor;
         use crate::wait::exit_only::{self, Peek, Target};
 
-        match exit_only::peek(&Target::PidFd(self.0)) {
+        match exit_only::peek(&Target::PidFd(self.pidfd)) {
             Ok(Peek::Running) => {}
             Ok(Peek::Exit(_) | Peek::Foreign(_)) => return Ok(Step::Done(())),
             Err(e) => {
@@ -547,11 +567,14 @@ impl crate::os_process::drive::Waitable for PidfdExit<'_> {
                 return Ok(Step::Done(()));
             }
         }
-        match crate::os_process::poll::is_readable(self.0) {
-            Ok(false) => Ok(Step::Wait(WaitFor::Readable(self.0))),
+        if self.poll_failed {
+            return Ok(Step::Recheck);
+        }
+        match crate::os_process::poll::is_readable(self.pidfd) {
+            Ok(false) => Ok(Step::Wait(WaitFor::Readable(self.pidfd))),
             Ok(true) => Ok(Step::Recheck),
             Err(e) => {
-                log::debug!("a look at a killed child's exit could not poll its pidfd ({e}); it peeks again");
+                self.note_poll_failed(&e);
                 Ok(Step::Recheck)
             }
         }
@@ -559,6 +582,11 @@ impl crate::os_process::drive::Waitable for PidfdExit<'_> {
 
     fn pause(&mut self, d: Duration) {
         std::thread::sleep(d);
+    }
+
+    fn block_failed(&mut self, e: crate::error::Error) -> Result<(), crate::error::Error> {
+        self.note_poll_failed(&e);
+        Ok(())
     }
 }
 

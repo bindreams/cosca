@@ -645,6 +645,58 @@ mod pidfd_exit_visible {
         child.wait().expect("reap");
     }
 
+    /// A pidfd poll that fails is not an answer: the peeks decide until the deadline, so a running
+    /// child is still `false` at it, and no block is armed. Runs in a re-exec'd process with
+    /// `RLIMIT_NOFILE` at 0, which makes the kernel refuse every `poll(2)` with `EINVAL`.
+    ///
+    /// Mutant: answer `true` at once after a failed poll; or look at the child with a block again.
+    #[skuld::test]
+    fn a_failed_poll_leaves_the_peek_to_decide_until_the_deadline() {
+        crate::test_child::run_fixture(crate::test_child::fixture_path!(
+            fixture_a_failed_poll_leaves_the_peek_to_decide
+        ));
+    }
+
+    #[skuld::test]
+    fn fixture_a_failed_poll_leaves_the_peek_to_decide() {
+        if !crate::test_child::is_fixture_reexec() {
+            return;
+        }
+        let mut child = blocker();
+        let pidfd = crate::containment::cgroup::test_support::pidfd_of(child.id());
+        let mut before = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `before` is a valid out-pointer.
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut before) }, 0);
+        let none = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: before.rlim_max,
+        };
+        // SAFETY: lowers this fixture process's own soft limit; it is put back below.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &none) }, 0);
+        assert!(
+            crate::os_process::poll::is_readable(pidfd.as_fd()).is_err(),
+            "the precondition: poll fails"
+        );
+        crate::wait::block_probe::take();
+        let until = Instant::now() + Duration::from_millis(30);
+        assert!(!pidfd_exit_visible_by(pidfd.as_fd(), until));
+        assert!(Instant::now() >= until, "reported before the deadline");
+        assert!(
+            crate::wait::block_probe::take().is_empty(),
+            "no block after a failed poll"
+        );
+        // SAFETY: puts back the limit read above.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &before) }, 0);
+        child.kill().expect("kill");
+        crate::test_child::wait_until_zombie(child.id());
+        let far = Instant::now() + Duration::from_secs(3600);
+        assert!(pidfd_exit_visible_by(pidfd.as_fd(), far));
+        child.wait().expect("reap");
+    }
+
     /// A child someone else reaped is visible at once, even past the deadline: the look is the one
     /// the deadline cannot cut short.
     ///

@@ -96,6 +96,9 @@ enum Move {
     Recheck,
     /// Wait on a source that is already fired: the block returns at once.
     Wait,
+    /// Wait on a descriptor whose poll fails (`POLLERR`: the write end of a pipe nobody reads).
+    #[cfg(target_os = "linux")]
+    WaitFails,
 }
 
 /// A [`Waitable`] that plays `moves` and records the pauses it is asked for. A pause runs `on_pause`
@@ -107,6 +110,11 @@ struct Scripted {
     pauses: Vec<Duration>,
     on_pause: Box<dyn FnMut(Duration)>,
     on_look: Box<dyn FnMut(usize)>,
+    /// Whether [`Waitable::block_failed`] lets the loop go on.
+    survive_block_errors: bool,
+    block_errors: usize,
+    #[cfg(target_os = "linux")]
+    broken: Option<std::io::PipeWriter>,
 }
 
 impl Scripted {
@@ -122,6 +130,10 @@ impl Scripted {
             pauses: Vec::new(),
             on_pause: Box::new(|_| {}),
             on_look: Box::new(|_| {}),
+            survive_block_errors: false,
+            block_errors: 0,
+            #[cfg(target_os = "linux")]
+            broken: None,
         }
     }
 }
@@ -139,7 +151,24 @@ impl Waitable for Scripted {
                 Exit::Running(wait_for) => Step::Wait(wait_for),
                 Exit::Exited => unreachable!("the source answers Running"),
             },
+            #[cfg(target_os = "linux")]
+            Move::WaitFails => {
+                use std::os::fd::AsFd as _;
+                let (rx, tx) = std::io::pipe().expect("pipe");
+                drop(rx);
+                let tx: &std::io::PipeWriter = self.broken.insert(tx);
+                Step::Wait(crate::os_process::WaitFor::Readable(tx.as_fd()))
+            }
         })
+    }
+
+    fn block_failed(&mut self, e: Error) -> Result<(), Error> {
+        self.block_errors += 1;
+        if self.survive_block_errors {
+            Ok(())
+        } else {
+            Err(e)
+        }
     }
 
     fn pause(&mut self, d: Duration) {
@@ -219,6 +248,31 @@ fn run_never_pauses_after_the_deadline() {
     assert!(matches!(outcome, RunOutcome::Done(())), "{outcome:?}");
     assert!(w.pauses.is_empty());
     assert_eq!(w.looks, 2);
+}
+
+/// A failed block is the `Waitable`'s to answer: by default it ends the loop with the error.
+///
+/// Mutant: swallow the error in `run`; or never hand it to the `Waitable`.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn run_returns_a_block_error_the_waitable_does_not_survive() {
+    let mut w = Scripted::new([Move::WaitFails, Move::Done]);
+    assert!(matches!(run(&mut w, None), Err(Error::Io(_))));
+    assert_eq!(w.block_errors, 1);
+    assert_eq!(w.looks, 1);
+}
+
+/// A `Waitable` that survives a failed block is looked at again, and the loop goes on.
+///
+/// Mutant: end the loop on a block error the `Waitable` survived; or skip the look after it.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn run_looks_again_after_a_block_error_the_waitable_survives() {
+    let mut w = Scripted::new([Move::WaitFails, Move::Recheck, Move::Done]);
+    w.survive_block_errors = true;
+    assert!(matches!(run(&mut w, None).unwrap(), RunOutcome::Done(())));
+    assert_eq!(w.block_errors, 1);
+    assert_eq!(w.looks, 3);
 }
 
 /// `exited()` never answers a recheck, so a [`ProcessExit`] has nothing to pause for: asking it to is
