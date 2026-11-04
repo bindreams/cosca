@@ -869,10 +869,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     let mut root_settled = true;
     let (root_note, fate) = if view.unpinned_root() {
         forgot = child.forget_for(&view);
-        // Nothing was signalled, so a launchd-held zombie is `Gone`, as the classifier has it.
-        #[cfg(target_os = "macos")]
-        let fate = crate::os_process::child::Foreign::Orphaned.fate(false);
-        #[cfg(not(target_os = "macos"))]
+        // Nothing was signalled, so a foreign child (a zombie launchd holds too) is `Gone`.
         let fate = crate::os_process::child::Foreign::Gone.fate(false);
         (
             format!(

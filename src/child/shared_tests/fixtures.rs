@@ -161,8 +161,8 @@ pub(super) fn assert_adoption_is_gone<G>(arm: impl FnOnce() -> G) {
     assert!(is_echild(&shared.try_wait().expect_err("try_wait")));
     assert!(is_echild(&shared.wait_deadline(far).expect_err("wait_deadline")));
     assert!(
-        matches!(shared.state(), crate::signal::RootState::Reaped { .. }),
-        "a child that was gone at adoption holds no handle: its root is reaped"
+        matches!(shared.state(), crate::signal::RootState::Reaped { own: false }),
+        "a child that was gone at adoption holds no handle: its root is reaped, and not by this handle"
     );
     let log = crate::send_log::Capture::start();
     shared

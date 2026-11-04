@@ -116,6 +116,23 @@ fn forgotten(reaped_elsewhere: bool) -> (crate::tokio::Child, std::io::PipeWrite
     (child, writer)
 }
 
+/// A backend forgotten as reaped elsewhere answers `Reaped`, and not as this handle's own reap.
+///
+/// Mutant: `ProcSource::state` reads a foreign reap as `own: true`.
+#[skuld::test]
+async fn a_backend_forgotten_as_reaped_elsewhere_is_not_an_own_reap() {
+    crate::tokio::test_runtime::assert_current_thread();
+    let (mut child, writer) = forgotten(true);
+    let id = child.id();
+    let state = child.os.proc_mut().state();
+    let _fate = child.tear_down_now();
+    collect(id, writer);
+    assert!(
+        matches!(state, crate::signal::RootState::Reaped { own: false }),
+        "{state:?}"
+    );
+}
+
 /// A backend forgotten without proof of a foreign reap says nothing of a reap at its drop: no status
 /// of ours was collected. On Linux the armed drop kills the child through the pidfd the backend
 /// kept; on macOS nothing reaches it, and it may be running.
