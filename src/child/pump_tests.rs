@@ -132,7 +132,8 @@ fn fixture_communicate_under_a_nproc_limit() {
 /// is not killed when a child stops reading stdin: `communicate` returns `Ok`. Runs in a re-exec'd
 /// child, since the disposition is process-wide.
 ///
-/// Mutant: the stdin write runs with `SIGPIPE` unblocked.
+/// Mutant: the stdin write can raise `SIGPIPE` unguarded (unblocked, or without `F_SETNOSIGPIPE` on
+/// macOS).
 #[skuld::test]
 fn a_child_that_stops_reading_stdin_does_not_kill_a_default_sigpipe_host() {
     crate::test_child::run_fixture(crate::test_child::fixture_path!(

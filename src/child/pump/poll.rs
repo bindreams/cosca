@@ -105,6 +105,7 @@ impl<'a> Pump<'a> {
         // With no input, closing the pipe at once is the child's EOF.
         let feed = stdin.filter(|_| !input.is_empty()).and_then(|pipe| {
             nonblocking(&pipe)
+                .and_then(|()| forbid_sigpipe(&pipe))
                 .map(|()| Feed { pipe, rest: input })
                 .map_err(|e| stdin_error = Some(e))
                 .ok()
@@ -223,11 +224,42 @@ fn nonblocking(pipe: &impl AsFd) -> io::Result<()> {
     Ok(())
 }
 
-/// One `write` that cannot kill the host. Writing to a pipe nobody reads raises `SIGPIPE` on the
-/// calling thread, and a host that left its disposition at the default dies of it (a C host, a
-/// cdylib, `-Zon-broken-pipe=kill`); Rust's runtime ignores it, but a library cannot rely on that.
-/// `SIGPIPE` is blocked on this thread around the write; the one the write raised is consumed, and
-/// one already pending (the host's own) is left for the host.
+// SIGPIPE =====
+//
+// Writing to a pipe nobody reads raises `SIGPIPE`, and a host that left its disposition at the
+// default dies of it (a C host, a cdylib, `-Zon-broken-pipe=kill`); Rust's runtime ignores it, but a
+// library cannot rely on that. Either way the write reports `EPIPE`.
+
+/// macOS: marks the pipe `F_SETNOSIGPIPE` once, before the first write, so a write to a broken pipe
+/// fails with `EPIPE` and raises nothing. macOS delivers that signal to the process, not the writing
+/// thread, so the guard of the other systems cannot catch it.
+#[cfg(target_os = "macos")]
+fn forbid_sigpipe(pipe: &PipeWriter) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: `fcntl(F_SETNOSIGPIPE, int)` on a descriptor `pipe` keeps open. rustix has no wrapper.
+    let status = unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_SETNOSIGPIPE, 1 as libc::c_int) };
+    if status == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// One `write`. `forbid_sigpipe` already stopped the pipe from raising `SIGPIPE`.
+#[cfg(target_os = "macos")]
+fn write_without_sigpipe(pipe: &mut PipeWriter, bytes: &[u8]) -> io::Result<usize> {
+    pipe.write(bytes)
+}
+
+/// Other Unixes: nothing to set up; `write_without_sigpipe` blocks the signal around each write.
+#[cfg(not(target_os = "macos"))]
+fn forbid_sigpipe(_: &PipeWriter) -> io::Result<()> {
+    Ok(())
+}
+
+/// One `write` that cannot kill the host. `SIGPIPE` is blocked on this thread around the write
+/// (the signal is thread-directed here); the one the write raised is consumed, and one already
+/// pending (the host's own) is left for the host.
+#[cfg(not(target_os = "macos"))]
 fn write_without_sigpipe(pipe: &mut PipeWriter, bytes: &[u8]) -> io::Result<usize> {
     // SAFETY: plain signal-mask calls on a set initialised by `sigemptyset`, restoring the mask
     // before returning. `sigwait` runs only when `SIGPIPE` is pending and blocked here, so it
@@ -253,6 +285,7 @@ fn write_without_sigpipe(pipe: &mut PipeWriter, bytes: &[u8]) -> io::Result<usiz
 }
 
 /// Whether `SIGPIPE` is pending for the calling thread or the process.
+#[cfg(not(target_os = "macos"))]
 fn sigpipe_pending() -> bool {
     // SAFETY: `sigpending` fills a zeroed set the call owns; `sigismember` only reads it.
     unsafe {
