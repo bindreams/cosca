@@ -1,11 +1,11 @@
 //! std-only spawn: resolve the crate's `Stdio` model onto `std::process::Command`,
-//! wire the program/args via the `quote` module, and adopt the child into a `SharedChild`.
+//! wire the program/args via the `quote` module, and adopt the child into an `OwnedChild`.
 
 use std::collections::BTreeMap;
 use std::process::Stdio as StdStdio;
 
+use crate::child::owned::OwnedChild;
 use crate::child::proc_handle::ProcHandle;
-use crate::child::shared::SharedChild;
 pub(crate) use crate::child::spawn::failure::{after_the_spawn, Classify, SpawnFailure};
 use crate::child::{Child, ParentEnd};
 use crate::command::{Command, CommandInput, EnvOp};
@@ -194,7 +194,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
                 ChildFate::Gone,
             ),
             // A sync child's kill always verifies: the pidfd or the handle names it, and on macOS the
-            // unique id every production spawn adopts is held (`SharedChild::adopt` is test-only there).
+            // unique id every production spawn adopts is held (`MacChild::new` takes it).
             // Were it ever not, the child may still be running.
             Ok(crate::signal::Sent::Unverified) => {
                 debug_assert!(false, "a sync child's kill always verifies its target");
@@ -584,7 +584,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     // against the handle held since the spawn: a pid alone does not say whom it names once
     // something else has reaped the child. The attach takes this identity and does not re-read
     // the root's, so a reap and reuse after the check cannot make the containment name a stranger.
-    // `SharedChild::adopt` reaps nothing, so this is also the identity it takes.
+    // Adopting reaps nothing, so this is also the identity the `OwnedChild` takes.
     #[cfg(test)]
     fault::run_at(fault::SpawnPoint::BeforeIdentity, child.id());
     #[cfg(target_os = "linux")]
@@ -694,21 +694,45 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             return Err(SpawnFailure::started(fate.note(error, front, Some(pid)), child_fate));
         }
     };
-    // The pidfd is already held, so adopting cannot fail.
+    // The pidfd is already held, so adopting cannot fail. Nothing of std's `Child` is used after
+    // this: its stdio went to `parent_ends`, so dropping it neither kills nor reaps.
     #[cfg(target_os = "linux")]
-    let shared = SharedChild::adopt_opened(child.child, id, child.through.pidfd);
+    let owned = {
+        drop(child.child);
+        OwnedChild::new(Box::new(crate::os_process::linux::LinuxProcess::new(
+            pid,
+            child.through.pidfd,
+        )))
+    };
+    // A refused kqueue is the one way to fail, and the child is then reachable by its unique id alone.
     #[cfg(target_os = "macos")]
-    let shared = SharedChild::adopt_verified(child, id, unique);
-    #[cfg(windows)]
-    let shared = match SharedChild::adopt(child, id) {
-        Ok(shared) => shared,
-        Err((error, child)) => {
-            let (error, fate) = teardown_after_failed_adoption(child, error, Some(id));
-            return Err(SpawnFailure::started(error, fate));
+    let owned = match crate::os_process::macos::child::MacChild::new(pid, unique) {
+        Ok(os) => {
+            drop(child);
+            OwnedChild::new(Box::new(os))
+        }
+        Err(error) => {
+            // A front is sent nothing and left; any other child is killed and reaped through its
+            // verified unique id, as for a failed attach.
+            let (fate, child_fate) = if front.is_some() {
+                (
+                    leave_front_after_attach_failure(child),
+                    ChildFate::Running { id: Some(id) },
+                )
+            } else {
+                (FrontFate::NotAFront, teardown_after_attach_failure(child, unique, id))
+            };
+            return Err(SpawnFailure::started(fate.note(error, front, Some(pid)), child_fate));
         }
     };
+    // Windows: std's process handle becomes the `OwnedChild`'s own.
+    #[cfg(windows)]
+    let owned = OwnedChild::new(Box::new(crate::os_process::windows::WindowsProcess::for_child(
+        std::os::windows::io::OwnedHandle::from(child),
+        pid,
+    )));
 
-    let mut child = Child::from_parts(ProcHandle::std(shared), id, parent_ends, kill_on_drop, attachment);
+    let mut child = Child::from_parts(ProcHandle::std(owned, pid), id, parent_ends, kill_on_drop, attachment);
     child.set_front(cmd.elevation_front());
     Ok(child)
 }
@@ -743,9 +767,9 @@ fn leave_front_after_attach_failure(child: std::process::Child) -> FrontFate {
 /// - A child already gone: nothing to do.
 /// - A kill that failed: one verified, non-blocking reap, and the child is left.
 ///
-/// The checks are not pins: macOS has no handle, so the kill has `via_verified_pid`'s window
-/// between its id check and `kill(2)`, and the reap has `try_reap`'s between its id check and the
-/// consuming `waitid`. A child that cannot be shown ours (a refused id read) is left with a `warn`;
+/// The checks are not pins: macOS has no handle. The kill is exact, by audit token (the kernel
+/// checks the pid's `p_idversion`), but the reap has `try_reap`'s window between its id check and
+/// the consuming `waitid`. A child that cannot be shown ours (a refused id read) is left with a `warn`;
 /// a zombie launchd holds is not ours to reap, and is `Gone`.
 ///
 /// Dropping the `std` `Child` closes our pipe ends only.
@@ -1093,11 +1117,11 @@ fn kill_and_reap_noting(
     after_kill: impl FnOnce(bool),
 ) -> (ChildFate, KillOutcome) {
     use crate::os_process::child::Foreign;
-    use crate::signal::{via_verified_pid, Sent, Sig};
+    use crate::signal::{via_audit_token, Sent, Sig};
     use crate::wait::macos::Waited;
 
     let target = crate::wait::exit_only::Target::pid(pid, Some(unique));
-    match via_verified_pid(pid, Some(unique), Sig::Kill) {
+    match via_audit_token(pid, Some(unique), Sig::Kill) {
         Ok(Sent::Delivered) => {
             // A fixture that only the kill would end is released here when no kill was sent.
             #[cfg(test)]
@@ -1135,7 +1159,7 @@ fn kill_and_reap_noting(
             (Foreign::Gone.fate(false), KillOutcome::NotSent)
         }
         Ok(Sent::Unverified) => {
-            debug_assert!(false, "`via_verified_pid` was given `Some(unique)`, so it verifies");
+            debug_assert!(false, "`via_audit_token` was given `Some(unique)`, so it verifies");
             after_kill(false);
             (ChildFate::Running { id }, KillOutcome::Unverified)
         }
@@ -1397,16 +1421,12 @@ fn leave_unverified_child(
     fate
 }
 
-/// The spawned `child` could not be adopted. Answers `error`.
+/// The spawned `child` could not be adopted: its unique-id report is not an id (unreadable or
+/// malformed), so it is left alone (see `leave_unverified_child`). Answers `error`.
 ///
-/// - **Windows:** its process handle could not be duplicated. The handle still pins the process, so
-///   the child is torn down.
-/// - **macOS:** its unique-id report is not an id (unreadable or malformed), so it is left alone
-///   (see `leave_unverified_child`).
-///
-/// Not on Linux, where the pidfd is opened before `exec` (see `pidfd_handshake`) and adoption
-/// cannot fail.
-#[cfg(not(target_os = "linux"))]
+/// Only macOS adopts by a reported id. Linux opens the pidfd before `exec` (see `pidfd_handshake`)
+/// and Windows takes std's process handle, so on both adoption cannot fail.
+#[cfg(target_os = "macos")]
 fn teardown_after_failed_adoption(
     child: std::process::Child,
     error: Error,
@@ -1414,15 +1434,12 @@ fn teardown_after_failed_adoption(
 ) -> (Error, ChildFate) {
     #[cfg(test)]
     fault::capture(ProcessId::of(child.id()));
-    #[cfg(target_os = "macos")]
     let fate = leave_unverified_child(
         child,
         crate::containment::RootIdentity::Unknown,
         id,
         &mut Diagnosis::default(),
     );
-    #[cfg(not(target_os = "macos"))]
-    let fate = teardown_unadopted(child, id);
     (error, fate)
 }
 
@@ -2200,7 +2217,7 @@ pub(crate) fn attach_or_fault(
 }
 
 /// A spawned child that an error path abandons before adoption, killed and reaped by
-/// [`teardown_unadopted`].
+/// [`teardown_unadopted_noting`].
 #[cfg(not(target_os = "macos"))]
 trait Unadopted: Send + 'static {
     /// Its pid, for logs; `None` where the spawn that failed never handed the child back.
@@ -2532,7 +2549,7 @@ pub(crate) fn front_subtree(
     }
 }
 
-/// [`teardown_unadopted`], unless `child` is an elevation front: a kill of that would orphan the
+/// [`teardown_unadopted_noting`], unless `child` is an elevation front: a kill of that would orphan the
 /// elevated program. A front is sent nothing. One that has exited is reaped now. One a cgroup kill
 /// landed on and reached (see [`Subtree::reached`](crate::containment::cgroup::Subtree::reached)) is
 /// dying: its exit, which that kill bounds, is waited for, and it is reaped. Any other is left
@@ -2754,15 +2771,9 @@ fn teardown_through_pidfd_noting(
 /// which reaps it whenever it does, so it never lingers as a zombie. EPERM is the one kill failure
 /// that is not asserted, because it is reachable without any bug.
 ///
-/// `id` is the child's identity, if the spawn had read one.
-#[cfg(windows)]
-fn teardown_unadopted(child: impl Unadopted, id: Option<ProcessId>) -> ChildFate {
-    teardown_unadopted_noting(child, id, NO_WAIT_WARN, &mut Diagnosis::default())
-}
-
-/// [`teardown_unadopted`] for a spawn whose identity check found `why`: the teardown's `warn`, if it
-/// has one, carries it. Linux: with `warn`, the wait for the killed child warns once it passes
-/// that long ([`warn_still_waiting`]), and goes on.
+/// `id` is the child's identity, if the spawn had read one. For a spawn whose identity check found
+/// `why`, the teardown's `warn`, if it has one, carries it. Linux: with `warn`, the wait for the
+/// killed child warns once it passes that long ([`warn_still_waiting`]), and goes on.
 #[cfg(not(target_os = "macos"))]
 fn teardown_unadopted_noting(
     mut child: impl Unadopted,
@@ -3270,7 +3281,7 @@ pub(crate) mod fault {
     }
 
     /// Run `hook` at the next kill-then-blocking-wait teardown on this thread, once the kill has
-    /// returned `Ok` and before the wait: `teardown_unadopted`, the sync `finish_elevated`,
+    /// returned `Ok` and before the wait: `teardown_unadopted_noting`, the sync `finish_elevated`,
     /// `raw_spawn_teardown` (Windows), the async `wait_and_reap` and `teardown_through_pidfd`, or
     /// `await_unexecuted_exit`. See [`release_between_kill_and_wait`] and [`record_teardown_reaps`].
     pub(crate) fn set_between_kill_and_wait(hook: impl FnOnce() + 'static) -> ArmedBetweenKillAndWait {
@@ -3569,7 +3580,7 @@ pub(crate) mod fault {
 
         /// The release hook fired: the teardown's kill returned. For a teardown whose reap is not
         /// recorded (the kernel's, or forced to fail).
-        #[cfg(unix)]
+        #[cfg(target_os = "macos")]
         pub(crate) fn assert_released(&self) {
             assert!(
                 self.fired.get(),

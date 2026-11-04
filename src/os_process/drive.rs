@@ -40,8 +40,13 @@ pub(crate) fn exited_by_id(id: ProcessId, timeout: Option<Duration>) -> Result<b
 /// [`exited_by_id`] for a process already open: `Ok(true)` = exited, `Ok(false)` = still running
 /// after the deadline's final look.
 pub(crate) fn exited_held(p: &dyn OsProcess, timeout: Option<Duration>) -> Result<bool, Error> {
+    exited_until(p, absolute(timeout))
+}
+
+/// [`exited_held`] against an absolute `deadline` (`None`: unbounded).
+pub(crate) fn exited_until(p: &dyn OsProcess, deadline: Option<Instant>) -> Result<bool, Error> {
     enter()?;
-    exited(p, absolute(timeout))
+    exited(p, deadline)
 }
 
 /// [`run`] over a process's [`OsProcess::exited`] look.
@@ -74,11 +79,7 @@ pub(crate) enum Step<'a, T> {
     Done(T),
     Wait(WaitFor<'a>),
     /// Nothing will signal the change (a tracer holds the zombie, or the OS is still finishing the
-    /// exit): look again after a [`Waitable::pause`]. Only Linux's pidfd look produces it today.
-    #[cfg_attr(
-        not(target_os = "linux"),
-        allow(dead_code, reason = "only Linux produces Recheck so far")
-    )]
+    /// exit): look again after a [`Waitable::pause`].
     Recheck,
 }
 
@@ -170,7 +171,7 @@ fn block(wait_for: &WaitFor<'_>, deadline: Option<Instant>) -> Result<(), Error>
             let handle = HANDLE(process.as_raw_handle());
             let waited = crate::wait::wait_until(deadline, |ms| {
                 #[cfg(test)]
-                crate::wait::block_probe::record((ms != u32::MAX).then(|| Duration::from_millis(ms.into())));
+                crate::wait::block_probe::record_blocking((ms != u32::MAX).then(|| Duration::from_millis(ms.into())));
                 // SAFETY: `handle` is borrowed from `wait_for`, which outlives the call.
                 unsafe { WaitForSingleObject(handle, ms) }
             });

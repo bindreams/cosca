@@ -598,9 +598,10 @@ impl ProcSource {
     /// - **Linux:** `pidfd_send_signal` on the handshake pidfd, never by pid, so a foreign reap
     ///   followed by a pid reuse cannot redirect it. A child forgotten as not shown to be ours is
     ///   still signalled through it.
-    /// - **macOS:** by pid, after a check that the pid still has the unique id read at spawn. macOS
-    ///   has no handle to send through: a reap by another reaper between that check and the send is
-    ///   not seen, and the signal then goes to whatever process holds the number.
+    /// - **macOS:** by audit token, after a read that the pid still has the unique id read at spawn.
+    ///   The kernel checks the pid's `p_idversion` and signals while it holds a reference, so a reap
+    ///   by another reaper and a pid reuse cannot redirect it; only the documented 2^32 version
+    ///   wrap is left. A child that has exited and is not reaped is [`Sent::Delivered`].
     pub(crate) fn signal(&self, sig: Sig) -> Result<Sent, Error> {
         match self {
             #[cfg(target_os = "linux")]
@@ -628,7 +629,7 @@ impl ProcSource {
             #[cfg(target_os = "macos")]
             ProcSource::Tokio { child, identity, .. } => {
                 let pid = child.id().expect("checked above");
-                crate::signal::via_verified_pid(pid, *identity, sig).map_err(Error::Io)
+                crate::signal::via_audit_token(pid, *identity, sig).map_err(Error::Io)
             }
             #[cfg(windows)]
             ProcSource::Tokio { child, .. } => {
