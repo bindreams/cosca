@@ -229,7 +229,7 @@ fn unassessable(
 /// `pidfd_open`, with a test seam: a forced errno (see [`fault::force_pidfd_open_errno_once`])
 /// replaces the syscall once.
 #[cfg(test)]
-pub(crate) fn pidfd_open_checked(kernel: &dyn Kernel, raw: Pid) -> Result<rustix::fd::OwnedFd, rustix::io::Errno> {
+fn pidfd_open_checked(kernel: &dyn Kernel, raw: Pid) -> Result<rustix::fd::OwnedFd, rustix::io::Errno> {
     match fault::take_forced_pidfd_open_errno() {
         Some(errno) => Err(errno),
         None => kernel.pidfd_open(raw),
@@ -243,7 +243,7 @@ fn pidfd_open_checked(kernel: &dyn Kernel, raw: Pid) -> Result<rustix::fd::Owned
 /// Test seam: a forced [`Existence`] (see [`fault::force_exists_once`]) replaces the `/proc` read
 /// once, to drive the `Unknown` arms; runs [`fault::between_check_and_read`]'s hook first.
 #[cfg(test)]
-pub(crate) fn exists_checked(kernel: &dyn Kernel, id: ProcessId, proc_dir: &ProcDir) -> Existence {
+fn exists_checked(kernel: &dyn Kernel, id: ProcessId, proc_dir: &ProcDir) -> Existence {
     fault::run_between_hook();
     match fault::take_forced_exists() {
         Some(existence) => existence,

@@ -132,9 +132,9 @@ pub(crate) enum PeekOutcome {
 
 /// Take over the std `child`, whose identity `id` the caller has just read, as the [`OsChild`] of
 /// its platform. **Never reaps**: an already-exited child is still a zombie afterwards. A child
-/// already reaped elsewhere cannot be adopted: `Err` with `ECHILD` (macOS: or an unreadable
-/// identity), and the child handed back untouched. Tests only: a spawn adopts through the handle it
-/// holds.
+/// already reaped elsewhere cannot be adopted: `Err` (Linux: the `pidfd_open` of its pid fails; macOS:
+/// `ECHILD`, or an unreadable identity), and the child handed back untouched. On Linux the child is
+/// opened by its own, unreaped pid. Tests only: a spawn adopts through the handle it holds.
 #[cfg(test)]
 #[allow(
     clippy::result_large_err,
@@ -145,13 +145,23 @@ pub(crate) fn adopt_std(
     id: crate::identity::ProcessId,
 ) -> Result<Box<dyn OsChild>, (Error, std::process::Child)> {
     debug_assert_eq!(child.id(), id.pid(), "the identity must be the child's");
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     let gone = || Error::Io(std::io::Error::from_raw_os_error(libc::ECHILD));
     #[cfg(target_os = "linux")]
-    let os: Box<dyn OsChild> = match crate::wait::exit_only::open_own_child(id.pid(), Some(id)) {
-        Ok(Some(pidfd)) => Box::new(super::linux::LinuxProcess::new(Some(id.pid()), pidfd)),
-        Ok(None) => return Err((gone(), child)),
-        Err(e) => return Err((e, child)),
+    let os: Box<dyn OsChild> = {
+        use crate::identity::{HostKernel, Kernel as _};
+
+        let target = rustix::process::Pid::from_raw(id.pid() as i32).expect("a spawned child's pid is never 0");
+        // Never in a stdio slot: with 0, 1 or 2 closed, the lowest free number is one, and the
+        // application may `dup2` its stdio back over it, destroying the pidfd.
+        match HostKernel
+            .pidfd_open(target)
+            .map_err(|e| Error::Io(crate::error::io_context("pidfd_open", std::io::Error::from(e))))
+            .and_then(|pidfd| crate::above_stdio::above_stdio(pidfd).map_err(Error::Io))
+        {
+            Ok(pidfd) => Box::new(super::linux::LinuxProcess::new(Some(id.pid()), pidfd)),
+            Err(e) => return Err((e, child)),
+        }
     };
     #[cfg(target_os = "macos")]
     let os: Box<dyn OsChild> = match crate::signal::read_identity(id.pid()) {
