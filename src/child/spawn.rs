@@ -3281,7 +3281,7 @@ pub(crate) mod fault {
     }
 
     /// Run `hook` at the next kill-then-blocking-wait teardown on this thread, once the kill has
-    /// returned `Ok` and before the wait: `teardown_unadopted`, the sync `finish_elevated`,
+    /// returned `Ok` and before the wait: `teardown_unadopted_noting`, the sync `finish_elevated`,
     /// `raw_spawn_teardown` (Windows), the async `wait_and_reap` and `teardown_through_pidfd`, or
     /// `await_unexecuted_exit`. See [`release_between_kill_and_wait`] and [`record_teardown_reaps`].
     pub(crate) fn set_between_kill_and_wait(hook: impl FnOnce() + 'static) -> ArmedBetweenKillAndWait {
