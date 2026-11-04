@@ -31,6 +31,39 @@ thread_local! {
     static PARK_AFTER_REAP: RefCell<Option<ParkGate>> = const { RefCell::new(None) };
     static PANIC_AFTER_RELOCK: Cell<bool> = const { Cell::new(false) };
     static ON_CONDVAR_BLOCK: RefCell<Option<BlockHook>> = const { RefCell::new(None) };
+    static ROOT_TEARDOWNS: Cell<Option<u32>> = const { Cell::new(None) };
+}
+
+/// From now on every root teardown a drop starts on THIS thread ([`OwnedChild::teardown_on_drop`]:
+/// a kill and a wait) is counted. It still runs.
+///
+/// [`OwnedChild::teardown_on_drop`]: super::OwnedChild::teardown_on_drop
+pub(crate) fn record_root_teardowns() -> RootTeardownRecorder {
+    ROOT_TEARDOWNS.with(|c| c.set(Some(0)));
+    RootTeardownRecorder(())
+}
+
+#[must_use = "recording stops as soon as the recorder is dropped"]
+pub(crate) struct RootTeardownRecorder(());
+
+impl RootTeardownRecorder {
+    pub(crate) fn count(&self) -> u32 {
+        ROOT_TEARDOWNS.with(|c| c.get().expect("the recorder is live"))
+    }
+}
+
+impl Drop for RootTeardownRecorder {
+    fn drop(&mut self) {
+        ROOT_TEARDOWNS.with(|c| c.set(None));
+    }
+}
+
+pub(super) fn note_root_teardown() {
+    ROOT_TEARDOWNS.with(|c| {
+        if let Some(n) = c.get() {
+            c.set(Some(n + 1));
+        }
+    });
 }
 
 /// Disarms an unconsumed force on drop.

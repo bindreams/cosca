@@ -229,31 +229,10 @@ fn assert_consecutive_frozen_waits_never_early(child: &crate::Child) {
     assert!(Instant::now() >= second, "the second wait returned before its deadline");
 }
 
-/// Mutant (Windows): a second clock advance around the `Raw` backend's own `wait_until`.
+/// Mutant (Windows): a second clock advance around `drive::block`'s own `wait_until`.
 #[skuld::test]
 fn std_child_consecutive_frozen_waits_never_return_early() {
     let (child, _stdin) = spawn_never_exiting();
-    assert_consecutive_frozen_waits_never_early(&child);
-}
-
-/// Mutant: wrap `RawChild::wait_deadline` in the recheck helper, which advances the frozen clock a
-/// second time.
-#[cfg(windows)]
-#[skuld::test]
-fn raw_child_consecutive_frozen_waits_never_return_early() {
-    let mut cmd = crate::Command::new();
-    let findstr = std::path::Path::new(&std::env::var_os("SystemRoot").expect("SystemRoot"))
-        .join("System32")
-        .join("findstr.exe");
-    cmd.executable(findstr).args(["findstr", "x"]);
-    cmd.stdin(crate::Stdio::pipe_in()).expect("configure piped stdin");
-    cmd.stdout(crate::Stdio::null()).expect("configure null stdout");
-    let mut child = cmd.spawn().expect("spawn");
-    let _stdin = child.stdin().expect("piped stdin");
-    assert!(
-        matches!(child.proc, crate::child::proc_handle::ProcHandle::Raw(_)),
-        "an explicit executable() must route to the raw backend"
-    );
     assert_consecutive_frozen_waits_never_early(&child);
 }
 
@@ -335,4 +314,70 @@ fn drop_kills_a_contained_tree() {
         .read_to_end(&mut rest)
         .expect("both members are gone, so the pipe ends");
     assert!(rest.is_empty(), "the drop missed the grandchild: {rest:?}");
+}
+
+// A zombie launchd holds =====
+
+/// A child whose every reap answers that launchd holds the zombie (macOS: its tracer died).
+fn child_of_an_orphaned_zombie(waits: usize) -> crate::Child {
+    use crate::os_process::child::Foreign;
+    use crate::os_process::fake::{FakeProcess, ReapAnswer};
+    crate::test_child::over_fake::child_over(
+        &FakeProcess::new([]).reaps(std::iter::repeat_n(ReapAnswer::Foreign(Foreign::Orphaned), waits)),
+    )
+}
+
+/// The `warn`s this thread logged since `mark` that say a zombie is not ours to reap.
+fn orphan_warns_since(mark: usize) -> usize {
+    crate::log_capture::records_since_on_current_thread(mark, "not ours to reap")
+        .into_iter()
+        .filter(|(level, _)| *level == log::Level::Warn)
+        .count()
+}
+
+/// The error every wait on a child someone else reaped answers.
+fn assert_reaped_elsewhere(result: Result<impl std::fmt::Debug, crate::error::Error>) {
+    match result {
+        Err(crate::error::Error::Io(e)) => {
+            #[cfg(unix)]
+            assert_eq!(e.raw_os_error(), Some(libc::ECHILD), "{e}");
+            #[cfg(windows)]
+            assert!(e.to_string().contains("reaped elsewhere"), "{e}");
+        }
+        other => panic!("expected the reaped-elsewhere error, got {other:?}"),
+    }
+}
+
+/// `wait`, `wait_deadline` and `wait_timeout` each warn once of a zombie launchd holds.
+///
+/// Mutant: `Child` writes the warn for some of them only, or for none.
+#[skuld::test]
+fn a_loud_wait_warns_of_an_orphaned_zombie() {
+    crate::log_capture::install();
+    let hour = Duration::from_secs(3600);
+    for name in ["wait", "wait_deadline", "wait_timeout"] {
+        let child = child_of_an_orphaned_zombie(1);
+        let mark = crate::log_capture::mark();
+        match name {
+            "wait" => assert_reaped_elsewhere(child.wait()),
+            "wait_deadline" => assert_reaped_elsewhere(child.wait_deadline(crate::wait::now() + hour)),
+            _ => assert_reaped_elsewhere(child.wait_timeout(hour)),
+        }
+        assert_eq!(orphan_warns_since(mark), 1, "{name}");
+    }
+}
+
+/// `try_wait` and a quiet `wait_timeout` leave the zombie launchd holds unreported: their callers
+/// report it with the refusal they go on to make.
+///
+/// Mutant: `Child` warns whatever the caller asked.
+#[cfg(unix)]
+#[skuld::test]
+fn a_quiet_wait_does_not_warn_of_an_orphaned_zombie() {
+    crate::log_capture::install();
+    let child = child_of_an_orphaned_zombie(2);
+    let mark = crate::log_capture::mark();
+    assert_reaped_elsewhere(child.try_wait());
+    assert_reaped_elsewhere(child.wait_timeout_quiet(Duration::from_secs(3600)));
+    assert_eq!(orphan_warns_since(mark), 0);
 }
