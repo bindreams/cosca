@@ -229,15 +229,9 @@ fn a_front_left_behind_is_worded_by_the_drop() {
         (Some(Err((Cause::Subtree, io::ErrorKind::Other))), Left::Subtree),
     ];
     let wanted = [
-        format!(
-            "elevation front pid {PID} is left running and unreaped: {why}, and a kill of the front would orphan              the elevated program"
-        ),
-        format!(
-            "elevation front pid {PID} is left unreaped: where it is cannot be read ({cause}), so it is not known              whether the cgroup kill ended it"
-        ),
-        format!(
-            "elevation front pid {PID} is left unreaped: its leaf's subtree cannot be read ({cause}), so it is not              known whether the cgroup kill ended it"
-        ),
+        format!("elevation front pid {PID} is left running and unreaped: {why}, and a kill of the front would orphan the elevated program"),
+        format!("elevation front pid {PID} is left unreaped: where it is cannot be read ({cause}), so it is not known whether the cgroup kill ended it"),
+        format!("elevation front pid {PID} is left unreaped: its leaf's subtree cannot be read ({cause}), so it is not known whether the cgroup kill ended it"),
     ];
     for ((reach, left), wanted) in reaches.into_iter().zip(wanted) {
         let fake = fake().reaps([ReapAnswer::Running]);

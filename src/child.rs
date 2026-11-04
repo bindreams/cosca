@@ -1173,13 +1173,16 @@ fn front_left_text(
 
     match reason {
         LeaveReason::Running => format!(
-            "elevation front pid {pid} is left running and unreaped: {why}, and a kill of the front would orphan              the elevated program"
+            "elevation front pid {pid} is left running and unreaped: {why}, and a kill of the front would orphan \
+             the elevated program"
         ),
         LeaveReason::ReachUnknown(ReachFailure::Place(e)) => format!(
-            "elevation front pid {pid} is left unreaped: where it is cannot be read ({e}), so it is not known              whether the cgroup kill ended it"
+            "elevation front pid {pid} is left unreaped: where it is cannot be read ({e}), so it is not known \
+             whether the cgroup kill ended it"
         ),
         LeaveReason::ReachUnknown(ReachFailure::Subtree(e)) => format!(
-            "elevation front pid {pid} is left unreaped: its leaf's subtree cannot be read ({e}), so it is not              known whether the cgroup kill ended it"
+            "elevation front pid {pid} is left unreaped: its leaf's subtree cannot be read ({e}), so it is not \
+             known whether the cgroup kill ended it"
         ),
     }
 }
