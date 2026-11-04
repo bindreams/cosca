@@ -323,6 +323,6 @@ fn try_reap_of_an_exited_child_reads_the_exit_code() {
     let TryReapOutcome::Reaped(ExitRecord::Status(status)) = os.try_reap().unwrap() else {
         panic!("an exited child is reaped");
     };
-    // `TerminateProcess` exits with the code the blocker's kill passes.
-    assert_eq!(status.code(), Some(1));
+    // The code the kill's `TerminateProcess` ended the child with.
+    assert_eq!(status.code(), Some(crate::identity::WINDOWS_TERMINATE_EXIT_CODE as i32));
 }
