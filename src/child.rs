@@ -252,12 +252,13 @@ impl Child {
         if let Some(error) = crate::child::spawn::failure::seams::take_wait_failure() {
             return Err(error);
         }
-        self.proc.wait().map_err(Error::Io)
+        self.wait_root_unbounded()
     }
 
     /// Return the exit status if the child has already exited.
     pub fn try_wait(&self) -> Result<Option<std::process::ExitStatus>, Error> {
-        self.proc.try_wait().map_err(Error::Io)
+        // One look at the present moment. A zombie launchd holds is the caller's to report.
+        self.wait_root(Some(crate::wait::now()), lifecycle::Orphaned::Quiet)
     }
 
     /// Is this child an elevation backend, whose elevated program may outlive it?
@@ -425,10 +426,10 @@ impl Child {
         let looked = if fault::front_read_as_running() {
             Ok(None)
         } else {
-            self.proc.try_wait()
+            self.try_wait().map_err(Error::into_io)
         };
         #[cfg(not(all(test, target_os = "linux")))]
-        let looked = self.proc.try_wait();
+        let looked = self.try_wait().map_err(Error::into_io);
         let reaped = |status: std::process::ExitStatus| {
             log::debug!("Child::drop: elevation front pid {pid} was killed through its cgroup and reaped ({status})");
             Torn::new(ChildFate::Reaped)
@@ -504,7 +505,7 @@ impl Child {
     fn wait_for_dying_front(&self) -> std::io::Result<std::process::ExitStatus> {
         #[cfg(test)]
         crate::child::spawn::fault::run_between_kill_and_wait();
-        self.proc.wait()
+        self.wait_root_unbounded().map_err(Error::into_io)
     }
 
     #[cfg(unix)]

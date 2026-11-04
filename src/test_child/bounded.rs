@@ -9,9 +9,10 @@ use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::child::owned::OwnedChild;
-use crate::child::proc_handle::ProcHandle;
+use crate::child::owned::{ChildWaitOutcome, OwnedChild};
 use crate::identity::ProcessId;
+use crate::os_process::child::ExitRecord;
+use crate::signal::Sig;
 
 /// [`run_fixture_output`](super::run_fixture_output) from `program` (a modified copy of this
 /// binary, say), under a failure `bound`: `Ok` with the fixture's output once it exits, `Err`
@@ -51,28 +52,27 @@ fn output_within(mut child: Child, bound: Duration) -> Result<Output, Output> {
     let id = ProcessId::of(child.id())
         .found()
         .expect("the live child has an identity");
-    let pid = child.id();
-    let shared = Arc::new(ProcHandle::std(
-        OwnedChild::adopt(child, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}")),
-        pid,
-    ));
+    let shared = Arc::new(OwnedChild::adopt(child, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}")));
     let (tx, rx) = channel();
     let waiter = {
         let shared = Arc::clone(&shared);
         // The receiver outlives the waiter: a failed send needs no handling.
-        std::thread::spawn(move || _ = tx.send(shared.wait()))
+        std::thread::spawn(move || _ = tx.send(shared.wait(None)))
     };
     let (status, in_time) = match rx.recv_timeout(bound) {
         Ok(status) => (status, true),
         Err(RecvTimeoutError::Timeout) => {
-            shared.kill().expect("kill the hung fixture");
+            shared.signal(Sig::Kill).expect("kill the hung fixture");
             (rx.recv().expect("the waiter ended without a result"), false)
         }
         Err(RecvTimeoutError::Disconnected) => panic!("the waiter ended without a result"),
     };
     waiter.join().expect("the waiter");
     let output = Output {
-        status: status.expect("wait for the fixture"),
+        status: match status {
+            Ok(ChildWaitOutcome::Exited(ExitRecord::Status(status))) => status,
+            other => panic!("wait for the fixture: {other:?}"),
+        },
         stdout: stdout.join().expect("stdout reader"),
         stderr: stderr.join().expect("stderr reader"),
     };

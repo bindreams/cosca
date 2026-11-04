@@ -150,7 +150,7 @@ fn proc_handle_raw_is_reaped_only_once_its_own_wait_returns() {
     end_with_code_zero(raw);
     wait_for_exit_unrecorded(raw);
     assert!(!handle.is_reaped(), "an exit nobody waited on is not a recorded reap");
-    handle.wait().expect("wait");
+    handle.wait(None).expect("wait");
     assert!(handle.is_reaped());
 }
 
@@ -379,7 +379,10 @@ fn teardown_on_drop_never_blocks_on_a_handle_without_terminate() {
     );
     assert_eq!(observer.waits(), 0, "teardown blocked on a child it cannot terminate");
     assert!(
-        denied.try_wait().expect("try_wait").is_none(),
+        denied
+            .wait_deadline(crate::wait::now())
+            .expect("a look at the present moment")
+            .is_none(),
         "nothing ended the child"
     );
 }

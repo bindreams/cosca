@@ -29,9 +29,7 @@
 
 use std::fmt;
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
-#[cfg(target_os = "linux")]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::error::Error;
 use crate::os_process::child::{ExitRecord, Foreign, OsChild, PeekOutcome};
@@ -305,7 +303,6 @@ impl OwnedChild {
     /// non-tracer parent while `p_oppid` is set, `kern_event.c:1203-1210`). Reaps nothing: during a
     /// graceful tree shutdown the root stays an unreaped zombie until the group kill is done, so its
     /// pid names no one else (principle 4). Takes no lock, so it may run while another thread waits.
-    #[cfg(target_os = "linux")]
     pub(crate) fn exited_by(&self, deadline: Option<Instant>) -> Result<bool, Error> {
         crate::os_process::drive::exited_until(&*self.os, deadline)
     }
