@@ -156,7 +156,7 @@ fn fail(shared: &Shared, why: String) {
 /// The pump: take in the watch's events and broadcast each batch that bears on the leaf, until
 /// `stop` is written.
 fn run_pump(shared: &Shared, stop: &OwnedFd) {
-    use rustix::event::{poll, PollFd, PollFlags};
+    use rustix::event::{PollFd, PollFlags};
 
     let mut watch = shared.watch.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(watch) = watch.as_mut() {
@@ -165,10 +165,8 @@ fn run_pump(shared: &Shared, stop: &OwnedFd) {
                 PollFd::from_borrowed_fd(watch.as_fd(), PollFlags::IN),
                 PollFd::from_borrowed_fd(stop.as_fd(), PollFlags::IN),
             ];
-            match poll(&mut fds, None) {
-                Ok(_) => {}
-                Err(rustix::io::Errno::INTR) => continue,
-                Err(e) => break fail(shared, format!("its watch could not be polled ({e})")),
+            if let Err(e) = crate::wait::poll_ready(&mut fds) {
+                break fail(shared, format!("its watch could not be polled ({e})"));
             }
             if !fds[1].revents().is_empty() {
                 break;

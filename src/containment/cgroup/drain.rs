@@ -139,7 +139,7 @@ impl DrainWatch {
 
     /// Block until the leaf drains — `populated` reads 0, or the leaf is removed. Unbounded.
     pub(crate) fn wait(&mut self) -> Result<(), Error> {
-        use rustix::event::{poll, PollFd, PollFlags};
+        use rustix::event::{PollFd, PollFlags};
 
         loop {
             if !self.populated()? {
@@ -148,11 +148,8 @@ impl DrainWatch {
             #[cfg(test)]
             super::fault::notify_drain_blocking();
             let mut fds = [PollFd::from_borrowed_fd(self.fd.as_fd(), PollFlags::IN)];
-            match poll(&mut fds, None) {
-                Ok(_) => drop(self.consume()?),
-                Err(rustix::io::Errno::INTR) => {}
-                Err(e) => return Err(Error::Io(e.into())),
-            }
+            crate::wait::poll_ready(&mut fds).map_err(|e| Error::Io(e.into()))?;
+            self.consume()?;
         }
     }
 

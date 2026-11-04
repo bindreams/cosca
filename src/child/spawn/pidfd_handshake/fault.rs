@@ -180,10 +180,10 @@ impl Drop for UnwindChecks<'_> {
 
 /// Whether the parent's end has NOT read EOF; if so, shuts it so the helper can end.
 fn probe_shut_read(parent_end: &OwnedFd) -> bool {
-    use rustix::event::{poll, PollFd, PollFlags, Timespec};
+    use rustix::event::{PollFd, PollFlags};
 
     let mut fds = [PollFd::new(parent_end, PollFlags::RDHUP)];
-    poll(&mut fds, Some(&Timespec { tv_sec: 0, tv_nsec: 0 })).expect("poll the parent's end");
+    crate::wait::any_ready_now(&mut fds).expect("poll the parent's end");
     let reached = fds[0].revents().contains(PollFlags::RDHUP);
     if !reached {
         _ = rustix::net::shutdown(parent_end, rustix::net::Shutdown::Both);
@@ -585,7 +585,7 @@ impl EndProbes {
 
     /// Once the wait for the child is over: the parent's end must read EOF. If not, shuts it.
     pub(super) fn finish(self, parent_end: &OwnedFd) {
-        use rustix::event::{poll, PollFd, PollFlags, Timespec};
+        use rustix::event::{PollFd, PollFlags};
 
         if self.child_end.is_none() {
             return;
@@ -593,7 +593,7 @@ impl EndProbes {
         // `RDHUP` is reported only if asked for: a read side shut, by `shutdown` or by the peer's
         // last close.
         let mut fds = [PollFd::new(parent_end, PollFlags::RDHUP)];
-        poll(&mut fds, Some(&Timespec { tv_sec: 0, tv_nsec: 0 })).expect("poll the parent's end");
+        crate::wait::any_ready_now(&mut fds).expect("poll the parent's end");
         let eof_reached = fds[0].revents().contains(PollFlags::RDHUP);
         if !eof_reached {
             _ = rustix::net::shutdown(parent_end, rustix::net::Shutdown::Both);
@@ -611,10 +611,10 @@ impl EndProbes {
 /// Whether `fd`'s socket is shut both ways (`POLLHUP`, a check that does not block). If not, shuts
 /// it, so a mutant that forgot fails its test at an assert rather than hanging it.
 fn probe_shut(fd: &OwnedFd) -> bool {
-    use rustix::event::{poll, PollFd, PollFlags, Timespec};
+    use rustix::event::{PollFd, PollFlags};
 
     let mut fds = [PollFd::new(fd, PollFlags::empty())];
-    poll(&mut fds, Some(&Timespec { tv_sec: 0, tv_nsec: 0 })).expect("poll the channel");
+    crate::wait::any_ready_now(&mut fds).expect("poll the channel");
     let shut = fds[0].revents().contains(PollFlags::HUP);
     if !shut {
         _ = rustix::net::shutdown(fd, rustix::net::Shutdown::Both);

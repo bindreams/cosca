@@ -518,32 +518,12 @@ enum Watch {
 fn child_exited_before_the_helper_finished(pid: Option<u32>, done: &OwnedFd) -> Watch {
     use std::os::fd::AsFd;
 
-    use rustix::event::{poll, PollFd, PollFlags, Timespec};
+    use rustix::event::{PollFd, PollFlags};
 
     use crate::os_process::child::PeekOutcome;
     use crate::wait::exit_only::{peek, Target};
+    use crate::wait::{any_ready_now, poll_ready};
 
-    let helper_done = |fds: &mut [PollFd<'_>], timeout: Option<&Timespec>| loop {
-        match poll(fds, timeout) {
-            Ok(_) => return Ok(()),
-            // `ENOMEM` is the kernel's transient shortage, not an answer.
-            Err(Errno::INTR | Errno::NOMEM) => continue,
-            Err(e) => return Err(e),
-        }
-    };
-    // Normally the child reported and execed: the helper is done, and nothing needs watching.
-    let mut fds = [PollFd::new(done, PollFlags::IN)];
-    let zero = Timespec { tv_sec: 0, tv_nsec: 0 };
-    if helper_done(&mut fds, Some(&zero)).is_ok() && fds[0].revents().contains(PollFlags::IN) {
-        return Watch::Running;
-    }
-    let Some(raw) = pid
-        .and_then(|pid| i32::try_from(pid).ok())
-        .and_then(rustix::process::Pid::from_raw)
-    else {
-        debug_assert!(false, "a spawned child without a pid: {pid:?}");
-        return Watch::Running;
-    };
     let unwatchable = |what: &str, e: &dyn std::fmt::Display| {
         let cause = format!("{what}: {e}");
         log::warn!(
@@ -551,6 +531,20 @@ fn child_exited_before_the_helper_finished(pid: Option<u32>, done: &OwnedFd) -> 
             super::named(pid)
         );
         Watch::Unwatchable(cause)
+    };
+    // Normally the child reported and execed: the helper is done, and nothing needs watching.
+    let mut fds = [PollFd::new(done, PollFlags::IN)];
+    match any_ready_now(&mut fds) {
+        Ok(true) if fds[0].revents().contains(PollFlags::IN) => return Watch::Running,
+        Ok(_) => {}
+        Err(e) => return unwatchable("poll on the helper's completion", &e),
+    }
+    let Some(raw) = pid
+        .and_then(|pid| i32::try_from(pid).ok())
+        .and_then(rustix::process::Pid::from_raw)
+    else {
+        debug_assert!(false, "a spawned child without a pid: {pid:?}");
+        return Watch::Running;
     };
     // A watch only, opened by number. The number is the child's own while the child is an unreaped
     // child of this process. After a foreign reap, it shows only while the number is free
@@ -640,10 +634,10 @@ fn child_exited_before_the_helper_finished(pid: Option<u32>, done: &OwnedFd) -> 
     #[cfg(test)]
     let polled = match fault::watch_poll_errno() {
         Some(errno) => Err(errno),
-        None => helper_done(&mut fds, None),
+        None => poll_ready(&mut fds),
     };
     #[cfg(not(test))]
-    let polled = helper_done(&mut fds, None);
+    let polled = poll_ready(&mut fds);
     // No contract: a process of the same user can lower `RLIMIT_NOFILE` below the two descriptors
     // polled, and `poll` then fails with `EINVAL`.
     if let Err(e) = polled {

@@ -685,7 +685,7 @@ pub(crate) fn accept_or_signalled(listener: &std::net::TcpListener, drained: &Dr
 fn watch_linux(listener: &std::net::TcpListener, target: crate::identity::ProcessId) -> WatchEvent {
     use std::os::fd::AsFd;
 
-    use rustix::event::{poll, PollFd, PollFlags};
+    use rustix::event::{PollFd, PollFlags};
 
     let Some(pidfd) = crate::os_process::linux::open::open_verified(target).expect("open a pidfd to watch the target")
     else {
@@ -697,13 +697,11 @@ fn watch_linux(listener: &std::net::TcpListener, target: crate::identity::Proces
         PollFd::new(&listener_fd, PollFlags::IN),
     ];
     loop {
-        match poll(&mut fds, None) {
-            Ok(_) => {}
-            Err(rustix::io::Errno::INTR) => continue,
-            Err(e) => panic!(
+        if let Err(e) = crate::wait::poll_ready(&mut fds) {
+            panic!(
                 "poll while waiting for a control connection: {}",
                 std::io::Error::from(e)
-            ),
+            );
         }
         let (pidfd_revents, listener_revents) = (fds[0].revents(), fds[1].revents());
         // POLLNVAL would mean this function handed poll() a bad fd. It returns at once and never

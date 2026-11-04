@@ -51,13 +51,7 @@ impl Witness {
             use std::os::fd::AsFd;
             let fd = self.pidfd.as_fd();
             let mut fds = [rustix::event::PollFd::new(&fd, rustix::event::PollFlags::IN)];
-            loop {
-                match rustix::event::poll(&mut fds, None) {
-                    Ok(n) if n > 0 => return,
-                    Ok(_) | Err(rustix::io::Errno::INTR) => {}
-                    Err(e) => panic!("poll(pidfd): {e}"),
-                }
-            }
+            crate::wait::poll_ready(&mut fds).expect("poll(pidfd)");
         }
         #[cfg(target_os = "macos")]
         {
