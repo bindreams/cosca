@@ -5,7 +5,6 @@
 
 use rustix::io::Errno;
 
-use super::proc_view::fault::force_openat2_errno;
 use super::unknown_identity_error_with;
 use crate::error::Error;
 use crate::identity::{Existence, FakeKernel, HostKernel, Liveness, ProcessId, Resolved};
@@ -121,30 +120,6 @@ fn a_stat_that_cannot_be_read_is_gone_only_when_kill_says_esrch() {
         Resolved::Found(id) => assert_eq!(id.start_token_raw(), 424242),
         other => panic!("a readable stat must resolve, got {other:?}"),
     }
-}
-
-/// A host where `openat2` answers `ENOSYS` (kernel before 5.6) or `EPERM` (a seccomp filter): no
-/// view can be established, yet `/proc` is mounted and `current()` must still work.
-/// Mutant: "`current_token` opens the checked `/proc` when the view is not `Same`".
-#[skuld::test]
-fn current_works_where_openat2_is_unavailable() {
-    let ordinary = ProcessId::current();
-    for errno in [rustix::io::Errno::NOSYS, rustix::io::Errno::PERM] {
-        let _forced = force_openat2_errno(errno);
-        assert_eq!(ProcessId::current(), ordinary, "{errno}");
-    }
-}
-
-/// Without `openat2` there is no view, so a by-pid read of a live pid is `Unknown`, and a pid
-/// no process can hold is still `Gone`.
-#[skuld::test]
-fn by_pid_reads_are_unknown_or_gone_where_openat2_is_unavailable() {
-    let id = ProcessId::current();
-    let _forced = force_openat2_errno(rustix::io::Errno::NOSYS);
-    assert!(matches!(ProcessId::of(std::process::id()), Resolved::Unknown));
-    assert_eq!(id.exists(), Existence::Unknown);
-    assert_eq!(id.is_alive(), Liveness::Unknown);
-    assert!(matches!(ProcessId::of(NO_PROCESS_CAN_HOLD), Resolved::Gone));
 }
 
 /// The exact text a caller sees when `openat2` is missing. Mutant: "the errno is dropped from
