@@ -798,11 +798,10 @@ fn the_state_is_reaped_as_soon_as_the_reap_is_recorded() {
             reached.recv().expect("the reap was recorded");
             #[cfg(unix)]
             let seen = matches!(child.hold().state(), crate::signal::RootState::Reaped { own: true });
-            #[cfg(not(unix))]
-            let seen = true;
             let seen_own = child.is_reaped();
             release.send(()).expect("release");
             assert!(matches!(a.join().expect("join"), Ok(ChildWaitOutcome::Exited(_))));
+            #[cfg(unix)]
             assert!(seen, "the reap was recorded, but the state was not Reaped");
             assert!(seen_own, "the reap was recorded, but is_reaped answered false");
         });

@@ -171,7 +171,7 @@ fn try_reap_of_a_running_child_waits_on_its_pidfd() {
     assert_eq!(fd.as_raw_fd(), os.os_handle().as_raw_fd());
     drop(stdin);
     assert!(exited_held(&*os, None).unwrap());
-    os.try_reap().unwrap();
+    assert!(matches!(os.try_reap().unwrap(), TryReapOutcome::Reaped(_)));
 }
 
 /// A reap of an exited child consumes its record once; the child is then foreign.

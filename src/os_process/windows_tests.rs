@@ -291,11 +291,12 @@ fn denied_open_source(
 /// A running child has no exit record: a peek says so, and consumes nothing.
 #[skuld::test]
 fn peek_of_a_running_child_is_running() {
-    use crate::os_process::child::{adopted_blocker, PeekOutcome};
+    use crate::os_process::child::{adopted_blocker, PeekOutcome, TryReapOutcome};
     let (os, _id, _stdin) = adopted_blocker();
     assert_eq!(os.peek().unwrap(), PeekOutcome::Running);
     os.signal(Sig::Kill).unwrap();
     assert!(exited_held(&*os, None).unwrap());
+    assert!(matches!(os.try_reap().unwrap(), TryReapOutcome::Reaped(_)));
 }
 
 /// A reap of a running child hands out the process handle to wait on.
