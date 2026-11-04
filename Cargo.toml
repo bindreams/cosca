@@ -301,6 +301,11 @@ path = "tests/linux_pidfd_refused.rs"
 harness = false
 
 [[test]]
+name = "linux_openat2_refused"
+path = "tests/linux_openat2_refused.rs"
+harness = false
+
+[[test]]
 name = "process"
 path = "tests/process.rs"
 harness = false

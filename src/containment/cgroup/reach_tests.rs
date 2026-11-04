@@ -443,7 +443,7 @@ impl ProbeGuard {
 
 /// This test process's own `/proc`.
 fn proc_dir() -> crate::identity::ProcDir {
-    match crate::identity::proc_view() {
+    match crate::identity::proc_view_with(&crate::identity::HostKernel) {
         crate::identity::ProcView::Same(dir) => dir,
         _ => panic!("precondition: this test's /proc is its own pid namespace's"),
     }

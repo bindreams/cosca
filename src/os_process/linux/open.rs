@@ -113,12 +113,12 @@ pub(crate) fn take_scripted_pidfd_open() -> Option<rustix::io::Errno> {
 ///   reads as "gone", and `containment::unix::group` treats `Io` as "no pidfd" and falls back to
 ///   `kill(2)`.
 ///
-/// No pidfd to cross-check against, so the view comes from [`proc_view`](crate::identity::proc_view).
+/// No pidfd to cross-check against, so the view comes from [`proc_view_with`](crate::identity::proc_view_with).
 fn verify_without_pidfd(id: ProcessId, errno: rustix::io::Errno) -> Result<Option<rustix::fd::OwnedFd>, Error> {
-    if id.signal_says_no_such_process() {
+    if id.signal_says_no_such_process(&crate::identity::HostKernel) {
         return Ok(None);
     }
-    match crate::identity::proc_view() {
+    match crate::identity::proc_view_with(&crate::identity::HostKernel) {
         ProcView::Same(proc_dir) => match exists_checked(id, &proc_dir) {
             Existence::Gone => Ok(None),
             Existence::Present => match alive_checked(id, &proc_dir) {
@@ -156,7 +156,7 @@ fn verify_without_pidfd(id: ProcessId, errno: rustix::io::Errno) -> Result<Optio
 /// Anything else is `Unassessable`.
 fn verify_pidfd_target(id: ProcessId, pidfd: rustix::fd::OwnedFd) -> Result<Option<rustix::fd::OwnedFd>, Error> {
     let proc_dir = crate::identity::ProcDir::open().map_err(|why| view_unreadable(id, why, None))?;
-    match crate::identity::pidfd_pid_in_view(&proc_dir, pidfd.as_fd()) {
+    match crate::identity::pidfd_pid_in(&crate::identity::HostKernel, &proc_dir, pidfd.as_fd()) {
         Ok(PidfdTarget::Pid(pid)) if pid == id.pid() => {}
         // Reaped after `pidfd_open`: gone, and nothing to signal.
         Ok(PidfdTarget::Reaped) => return Ok(None),
@@ -231,34 +231,32 @@ fn pidfd_open_checked(raw: Pid) -> Result<rustix::fd::OwnedFd, rustix::io::Errno
     pidfd_open(raw, PidfdFlags::empty())
 }
 
-/// `id.exists_in(proc_dir)`, with a test seam: a forced [`Existence`] (see
-/// [`fault::force_exists_once`]) replaces the `/proc` read once, to drive the `Unknown` arms; runs
-/// [`fault::between_check_and_read`]'s hook first.
+/// Test seam: a forced [`Existence`] (see [`fault::force_exists_once`]) replaces the `/proc` read
+/// once, to drive the `Unknown` arms; runs [`fault::between_check_and_read`]'s hook first.
 #[cfg(test)]
 pub(crate) fn exists_checked(id: ProcessId, proc_dir: &ProcDir) -> Existence {
     fault::run_between_hook();
     match fault::take_forced_exists() {
         Some(existence) => existence,
-        None => id.exists_in(proc_dir),
+        None => id.exists_in(&crate::identity::HostKernel, proc_dir),
     }
 }
 #[cfg(not(test))]
 fn exists_checked(id: ProcessId, proc_dir: &ProcDir) -> Existence {
-    id.exists_in(proc_dir)
+    id.exists_in(&crate::identity::HostKernel, proc_dir)
 }
 
-/// `id.is_alive_in(proc_dir)`, with a test seam: a forced [`Liveness`] (see
-/// [`fault::force_alive_once`]) replaces the `/proc` read once.
+/// Test seam: a forced [`Liveness`] (see [`fault::force_alive_once`]) replaces the `/proc` read once.
 #[cfg(test)]
 fn alive_checked(id: ProcessId, proc_dir: &ProcDir) -> Liveness {
     match fault::take_forced_alive() {
         Some(liveness) => liveness,
-        None => id.is_alive_in(proc_dir),
+        None => id.is_alive_in(&crate::identity::HostKernel, proc_dir),
     }
 }
 #[cfg(not(test))]
 fn alive_checked(id: ProcessId, proc_dir: &ProcDir) -> Liveness {
-    id.is_alive_in(proc_dir)
+    id.is_alive_in(&crate::identity::HostKernel, proc_dir)
 }
 
 #[cfg(test)]

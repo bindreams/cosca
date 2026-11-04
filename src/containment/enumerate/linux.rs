@@ -1,5 +1,5 @@
 //! Linux `(pid, ppid)` snapshot: list the numeric entries of the checked `/proc`
-//! (`identity::linux::proc_view`) and read field 4 of each `stat` via the comm-safe `parse_ppid`.
+//! (`identity::linux::proc_view_with`) and read field 4 of each `stat` via the comm-safe `parse_ppid`.
 
 use crate::error::Error;
 use crate::identity::pid_stat::{self, PidStat};
@@ -11,21 +11,20 @@ use crate::identity::RawPid;
 /// absence: the walk would miss that process and its subtree (see [`crate::identity::pid_stat`]).
 pub(crate) fn process_parents() -> Result<Vec<(RawPid, RawPid)>, Error> {
     let mut out = Vec::new();
-    let dir =
-        crate::identity::proc_view()
-            .into_dir()
-            .map_err(|why| match why.unsupported("listing the process table") {
-                Some(unsupported) => {
-                    log::warn!("enumerate::process_parents: {unsupported}");
-                    unsupported
-                }
-                None => unassessable(&why.reason, why.source),
-            })?;
+    let dir = crate::identity::proc_view_with(&crate::identity::HostKernel)
+        .into_dir()
+        .map_err(|why| match why.unsupported("listing the process table") {
+            Some(unsupported) => {
+                log::warn!("enumerate::process_parents: {unsupported}");
+                unsupported
+            }
+            None => unassessable(&why.reason, why.source),
+        })?;
     let pids = dir
         .pids()
         .map_err(|e| unassessable("/proc could not be listed", Some(e)))?;
     for pid in pids {
-        let stat = match pid_stat::read(&dir, pid) {
+        let stat = match pid_stat::read_in_scan(&crate::identity::HostKernel, &dir, pid) {
             Ok(PidStat::Read(stat)) => stat,
             // The process exited between the listing and the read, or `hidepid` hides it.
             Ok(PidStat::Skipped(e)) => {

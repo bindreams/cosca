@@ -141,7 +141,7 @@ pub(crate) fn members(pgid: i32) -> std::io::Result<Vec<Member>> {
     }
 }
 
-/// Linux: scan the checked `/proc` (`identity::linux::proc_view`) and keep the entries whose
+/// Linux: scan the checked `/proc` (`identity::linux::proc_view_with`) and keep the entries whose
 /// `stat` field 5 is `pgid`, carrying field 22 (`starttime`) as the token. There is no narrower
 /// kernel interface for process-group membership.
 ///
@@ -153,7 +153,7 @@ pub(crate) fn members(pgid: i32) -> std::io::Result<Vec<Member>> {
 pub(crate) fn members(pgid: i32) -> std::io::Result<Vec<Member>> {
     use crate::identity::stat_parse::{parse_pgrp, parse_starttime_jiffies};
 
-    let proc_dir = crate::identity::proc_view()
+    let proc_dir = crate::identity::proc_view_with(&crate::identity::HostKernel)
         .into_dir()
         .map_err(|why| match why.openat2_requirement() {
             Some(requirement) => std::io::Error::new(
@@ -167,7 +167,7 @@ pub(crate) fn members(pgid: i32) -> std::io::Result<Vec<Member>> {
     let mut out = Vec::new();
     // A listing error makes the whole scan unreliable; propagate it.
     for pid in proc_dir.pids()? {
-        let stat = match crate::identity::pid_stat::read(&proc_dir, pid) {
+        let stat = match crate::identity::pid_stat::read_in_scan(&crate::identity::HostKernel, &proc_dir, pid) {
             Ok(crate::identity::pid_stat::PidStat::Read(bytes)) => bytes,
             // A pid outside a `pgid` listing carries no information about it; the residual (a
             // foreign-uid member of `pgid` itself, hidden by `hidepid`) is documented on
