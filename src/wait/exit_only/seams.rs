@@ -69,7 +69,7 @@ pub(crate) fn force_peeks(results: impl IntoIterator<Item = io::Result<PeekOutco
     Forced(|| FORCED_PEEK.with(|f| f.borrow_mut().clear()))
 }
 
-#[cfg(any(feature = "tokio", target_os = "macos"))]
+#[cfg(feature = "tokio")]
 /// How many forced peeks of [`force_peeks`] this thread has not yet consumed.
 pub(crate) fn forced_peeks_left() -> usize {
     FORCED_PEEK.with(|f| f.borrow().len())
