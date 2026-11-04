@@ -839,19 +839,34 @@ fn the_state_is_an_own_reap_only_once_a_look_returns_the_record() {
     assert!(child.is_reaped());
 }
 
-/// A hold's group check reads the hold's own state: an unreaped root's pid names its group, and a
-/// root reaped by someone else does not.
+/// A hold's group check reads the hold's own state: an unreaped root's pid names its group, a root
+/// reaped by someone else does not, and after this handle's own reap the pid names it only while no
+/// other process holds the number. The own-reaped root's peek table is empty, so a check that
+/// peeks panics.
 ///
-/// Mutant: the check passes whatever the state, or reads the OS instead of the hold.
+/// Mutant: the check passes whatever the state, reads the OS instead of the hold, or treats an own
+/// reap as a reap elsewhere.
 #[cfg(unix)]
 #[skuld::test]
 fn a_hold_checks_the_roots_group_by_its_own_state() {
     use crate::containment::RootCheck as _;
+    use crate::identity::Resolved;
     let fake = FakeProcess::new([]).peeks([Ok(PeekOutcome::Running), Ok(PeekOutcome::Foreign(Foreign::Gone))]);
     let child = OwnedChild::new(Box::new(fake));
     assert_eq!(child.hold(UNREAD_PID).check(), Ok(()));
     let refused = child.hold(UNREAD_PID).check().expect_err("reaped elsewhere");
     assert!(refused.contains("reaped elsewhere"), "{refused}");
+
+    let fake = FakeProcess::new([]).reaps([ReapAnswer::Reaped(exit())]);
+    let child = OwnedChild::new(Box::new(fake));
+    status(child.wait(None));
+    {
+        let _gone = crate::child::fault::force_root_reads(Resolved::Gone);
+        assert_eq!(child.hold(UNREAD_PID).check(), Ok(()));
+    }
+    let _unknown = crate::child::fault::force_root_reads(Resolved::Unknown);
+    let refused = child.hold(UNREAD_PID).check().expect_err("the pid could not be read");
+    assert!(refused.contains("this handle reaped the root"), "{refused}");
 }
 
 /// A waiter parked on its wait is a holder (`W`), not a reap.

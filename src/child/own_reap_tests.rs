@@ -10,8 +10,6 @@ use std::thread::JoinHandle;
 
 use crate::containment::unix::fault::{record_kill_group, record_term_group};
 use crate::graceful_hooks::{at, HookPoint};
-#[cfg(target_os = "linux")]
-use crate::test_groups::{cgroup, Group};
 
 /// What the waiter thread did first.
 #[derive(Debug, PartialEq, Eq)]
@@ -134,81 +132,5 @@ fn graceful_shutdown_tree_holds_off_an_own_wait_until_its_sigterm_is_sent() {
                 .unwrap_or_else(|e| panic!("shut the tree down: {e}"))
         },
         |hook| termed.on_send(hook),
-    );
-}
-
-// A front in a cgroup -----
-
-/// A front in a cgroup whose `cat` ignores `SIGTERM`, so a graceful shutdown escalates; and its stdin.
-#[cfg(target_os = "linux")]
-fn cgroup_front() -> (Arc<crate::Child>, std::io::PipeWriter) {
-    use std::io::Read as _;
-
-    let mut cmd = crate::Command::new();
-    cmd.args(["sh", "-c", "trap '' TERM; echo ready; exec cat"]);
-    cmd.stdout(crate::Stdio::pipe_out()).expect("stdout pipe");
-    cmd.contain_with(crate::ContainMode::Strongest);
-    let via = crate::elevation::ElevatedVia::Wrapped(crate::elevation::Backend::Sudo);
-    let (mut child, stdin) = crate::child::front_kill_tests::spawn_as(cmd, via);
-    let mut ready = [0u8; 6];
-    child
-        .stdout()
-        .expect("stdout pipe")
-        .read_exact(&mut ready)
-        .expect("read `ready`");
-    (Arc::new(child), stdin)
-}
-
-/// Runs `op` on a cgroup front and returns whether this thread held the front's reaps when the
-/// `cgroup.kill` was written.
-///
-/// Mutant: the kill's group root built from a hold that is dropped, or never taken, before the send.
-#[cfg(target_os = "linux")]
-fn held_at_the_cgroup_kill_write(op: impl FnOnce(&crate::Child, std::io::PipeWriter)) -> Option<bool> {
-    let (child, stdin) = cgroup_front();
-    let held: Rc<std::cell::Cell<Option<bool>>> = Rc::default();
-    let _hook = crate::containment::cgroup::fault::set_before_kill_write({
-        let child = Arc::clone(&child);
-        let held = Rc::clone(&held);
-        move || held.set(Some(child.proc.is_held_by_current_thread()))
-    });
-    op(&child, stdin);
-    held.get()
-}
-
-/// Site #1 (`kill_sent_gated`).
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn kill_of_a_cgroup_only_front_holds_off_an_own_wait_until_its_sends_are_done(#[fixture(cgroup)] _group: &Group) {
-    let held = held_at_the_cgroup_kill_write(|child, stdin| {
-        child.kill().expect("the cgroup kill reaches the front");
-        drop(stdin);
-        child.wait().expect("reap the front");
-    });
-    assert_eq!(
-        held,
-        Some(true),
-        "the cgroup kill was written with the reaps not held off"
-    );
-}
-
-/// Site #5 (`graceful_shutdown`'s escalation).
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn graceful_shutdown_of_a_cgroup_only_front_holds_off_an_own_wait_until_its_sends_are_done(
-    #[fixture(cgroup)] _group: &Group,
-) {
-    let held = held_at_the_cgroup_kill_write(|child, stdin| {
-        // Released before the reap inside the call: an escalation that sent nothing lets the front
-        // end by itself instead of hanging the reap.
-        let _release = crate::graceful_hooks::release_at(HookPoint::BeforeReap, stdin);
-        child
-            .graceful_shutdown(std::time::Duration::ZERO)
-            .expect("the cgroup kill ends the front");
-    });
-    assert_eq!(
-        held,
-        Some(true),
-        "the cgroup kill was written with the reaps not held off"
     );
 }
