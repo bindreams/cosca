@@ -46,6 +46,10 @@ impl Process {
     /// - [`Error::Unassessable`]: the process exists but cannot be opened or its identity
     ///   verified (access denied, a `/proc` that is not this pid namespace's).
     /// - [`Error::Unsupported`]: the OS lacks the mechanism (on Linux, a refused `pidfd_open`).
+    /// - [`Error::NotThreadGroupLeader`]: on Linux, `id` names a live thread that is not its
+    ///   process's leader.
+    /// - [`Error::Io`]: the open failed otherwise (a `pidfd_open` error on Linux; a kqueue that
+    ///   cannot be created or armed on macOS).
     pub fn open(id: ProcessId) -> Result<Option<Process>, Error> {
         Ok(crate::os_process::open(id)?.map(|os| Process { id, os }))
     }
