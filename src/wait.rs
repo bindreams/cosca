@@ -552,13 +552,14 @@ impl crate::os_process::drive::Waitable for PidfdExit<'_> {
     type Output = ();
 
     fn look(&mut self) -> Result<crate::os_process::drive::Step<'_, ()>, crate::error::Error> {
+        use crate::os_process::child::PeekOutcome;
         use crate::os_process::drive::Step;
         use crate::os_process::WaitFor;
-        use crate::wait::exit_only::{self, Peek, Target};
+        use crate::wait::exit_only::{self, Target};
 
         match exit_only::peek(&Target::PidFd(self.pidfd)) {
-            Ok(Peek::Running) => {}
-            Ok(Peek::Exit(_) | Peek::Foreign(_)) => return Ok(Step::Done(())),
+            Ok(PeekOutcome::Running) => {}
+            Ok(PeekOutcome::Exit(_) | PeekOutcome::Foreign(_)) => return Ok(Step::Done(())),
             Err(e) => {
                 log::debug!(
                     "a look at a killed child's exit could not peek at it ({e}); the wait that follows decides"

@@ -242,14 +242,13 @@ fn answer(attached: &Attached, state: State, own: bool, read: Resolved<ProcessId
     let looked = std::cell::Cell::new(false);
     let number = root_number(attached, PGID as u32, || {
         looked.set(true);
-        let state = match state {
+        match state {
             State::Unreaped => RootState::Unreaped,
-            State::Reaped => RootState::Reaped,
+            State::Reaped => RootState::Reaped { own },
             State::Unknown => RootState::Unknown(std::io::Error::other("forced")),
             #[cfg(target_os = "macos")]
             State::Unpinned => RootState::Unpinned,
-        };
-        (state, own)
+        }
     });
     let answer = match number {
         RootNumber::Trusted => Answer::Trusted,
@@ -385,23 +384,46 @@ fn root_number_answers_an_unpinned_root_untrusted() {
 fn group_number_holds_only_for_an_unreaped_root_or_a_free_number_after_its_own_reap() {
     use super::group_number_holds;
     let own = std::process::id();
-    assert_eq!(group_number_holds(own, (RootState::Unreaped, false)), Ok(()));
+    assert_eq!(group_number_holds(own, RootState::Unreaped), Ok(()));
     let refused = [
-        (RootState::Reaped, false, "reaped elsewhere"),
+        (RootState::Reaped { own: false }, "reaped elsewhere"),
         (
             RootState::Unknown(std::io::Error::other("a failed peek")),
-            false,
             "a failed peek",
         ),
-        (RootState::Unpinned, false, "not pinned"),
+        (RootState::Unpinned, "not pinned"),
         // This process holds its own pid, so the number names another process than the root.
-        (RootState::Reaped, true, "another process holds"),
+        (RootState::Reaped { own: true }, "another process holds"),
     ];
-    for (state, own_reap, why) in refused {
-        let label = format!("{state:?}, own reap {own_reap}");
-        let err = group_number_holds(own, (state, own_reap)).expect_err(&label);
+    for (state, why) in refused {
+        let label = format!("{state:?}");
+        let err = group_number_holds(own, state).expect_err(&label);
         assert!(err.contains(why), "{label}: {err}");
     }
+}
+
+/// `group_number_holds` reads `own` from the state: a reap by someone else refuses whatever the
+/// pid's identity read says, and an own reap is decided by that read. Mutant: "`own` is ignored".
+#[skuld::test]
+fn group_number_holds_reads_own_from_the_state() {
+    use super::group_number_holds;
+    let other = || ProcessId::from_parts_for_test(PGID as u32, 1);
+    let reads = || [Resolved::Gone, Resolved::Found(other()), Resolved::Unknown];
+    for read in reads() {
+        let _read = crate::child::fault::force_root_reads(read);
+        let err = group_number_holds(PGID as u32, RootState::Reaped { own: false }).expect_err("reaped elsewhere");
+        assert!(err.contains("reaped elsewhere"), "{err}");
+    }
+    let _gone = crate::child::fault::force_root_reads(Resolved::Gone);
+    assert_eq!(group_number_holds(PGID as u32, RootState::Reaped { own: true }), Ok(()));
+    drop(_gone);
+    let _found = crate::child::fault::force_root_reads(Resolved::Found(other()));
+    let err = group_number_holds(PGID as u32, RootState::Reaped { own: true }).expect_err("another process holds");
+    assert!(err.contains("another process holds"), "{err}");
+    drop(_found);
+    let _unknown = crate::child::fault::force_root_reads(Resolved::Unknown);
+    let err = group_number_holds(PGID as u32, RootState::Reaped { own: true }).expect_err("unreadable");
+    assert!(err.contains("could not be read"), "{err}");
 }
 
 // through_the_pidfd -----

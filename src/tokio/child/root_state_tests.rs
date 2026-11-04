@@ -27,7 +27,7 @@ async fn state_after_own_wait_is_reaped_without_a_warn() {
     let forgot = child.proc_mut().forget_if_foreign();
     drop(child);
 
-    assert!(matches!(state, RootState::Reaped), "{state:?}");
+    assert!(matches!(state, RootState::Reaped { own: true }), "{state:?}");
     assert_eq!(forgot, None, "this handle reaped the child itself");
     assert_eq!(warns_since(mark), Vec::<String>::new());
 }
@@ -62,7 +62,7 @@ pub(super) fn session_blocker(kill_on_drop: bool) -> (crate::tokio::Child, std::
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn failed_peek(what: &str) -> std::io::Result<crate::wait::exit_only::Peek> {
+pub(super) fn failed_peek(what: &str) -> std::io::Result<crate::os_process::child::PeekOutcome> {
     Err(std::io::Error::other(what.to_owned()))
 }
 
@@ -105,8 +105,8 @@ async fn a_tokio_drop_with_an_unknown_root_warns_once() {
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn a_tokio_drop_with_an_unknown_root_behind_a_closed_front_gate_warns_once() {
+    use crate::os_process::child::PeekOutcome;
     use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peeks};
-    use crate::wait::exit_only::Peek;
 
     crate::log_capture::install();
     let recorder = crate::containment::unix::fault::record_kill_group();
@@ -115,8 +115,8 @@ async fn a_tokio_drop_with_an_unknown_root_behind_a_closed_front_gate_warns_once
     let mark = crate::log_capture::mark();
     // The gate's two looks at the front (it runs), the read, then the second look.
     let _failed = force_peeks([
-        Ok(Peek::Running),
-        Ok(Peek::Running),
+        Ok(PeekOutcome::Running),
+        Ok(PeekOutcome::Running),
         failed_peek("forced"),
         failed_peek("forced"),
     ]);
@@ -236,14 +236,14 @@ async fn a_tokio_drop_whose_kill_fails_on_an_unknown_root_warns_once() {
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn an_unknown_seen_only_on_the_second_look_names_its_error() {
+    use crate::os_process::child::PeekOutcome;
     use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peeks};
-    use crate::wait::exit_only::Peek;
 
     crate::log_capture::install();
     let _recorder = crate::containment::unix::fault::record_kill_group();
     let (child, _writer) = session_blocker(true);
     let mark = crate::log_capture::mark();
-    let _failed = force_peeks([Ok(Peek::Running), failed_peek("second look failure 91")]);
+    let _failed = force_peeks([Ok(PeekOutcome::Running), failed_peek("second look failure 91")]);
 
     drop(child);
 
@@ -406,14 +406,14 @@ async fn finish_elevated_with_an_unknown_root_that_is_already_gone_warns_once() 
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn a_second_look_that_shows_a_foreign_reap_is_named() {
+    use crate::os_process::child::{Foreign, PeekOutcome};
     use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peeks};
-    use crate::wait::exit_only::{Foreign, Peek};
 
     crate::log_capture::install();
     let _recorder = crate::containment::unix::fault::record_kill_group();
     let (child, _writer) = session_blocker(true);
     let mark = crate::log_capture::mark();
-    let _looks = force_peeks([failed_peek("forced"), Ok(Peek::Foreign(Foreign::Gone))]);
+    let _looks = force_peeks([failed_peek("forced"), Ok(PeekOutcome::Foreign(Foreign::Gone))]);
 
     drop(child);
 
@@ -426,10 +426,10 @@ async fn a_second_look_that_shows_a_foreign_reap_is_named() {
 #[cfg(target_os = "macos")]
 mod macos {
     use super::*;
+    use crate::os_process::child::{Foreign, PeekOutcome};
     use crate::send_log::{Capture, Via};
     use crate::signal::Sig;
     use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peeks};
-    use crate::wait::exit_only::{Foreign, Peek};
 
     fn walked_blocker() -> (crate::tokio::Child, std::io::PipeWriter) {
         let (stdin, writer) = crate::test_child::held_writer_stdin();
@@ -451,7 +451,7 @@ mod macos {
         let pid = child.id().pid();
         let sends = Capture::start();
         let mark = crate::log_capture::mark();
-        let orphaned = || Ok(Peek::Foreign(Foreign::Orphaned));
+        let orphaned = || Ok(PeekOutcome::Foreign(Foreign::Orphaned));
         let _orphaned = force_peeks([orphaned(), orphaned()]);
 
         drop(child);
@@ -482,7 +482,7 @@ mod macos {
     async fn waiting_on_an_orphaned_root_is_unassessable_without_a_source() {
         crate::log_capture::install();
         let (mut child, _writer) = walked_blocker();
-        let _orphaned = force_peeks([Ok(Peek::Foreign(Foreign::Orphaned))]);
+        let _orphaned = force_peeks([Ok(PeekOutcome::Foreign(Foreign::Orphaned))]);
 
         let err = child
             .try_wait()
@@ -509,8 +509,13 @@ mod macos {
         let sends = Capture::start();
         let mark = crate::log_capture::mark();
         // The gate's two looks at the front (it runs), the read, then the second look.
-        let orphaned = || Ok(Peek::Foreign(Foreign::Orphaned));
-        let _looks = force_peeks([Ok(Peek::Running), Ok(Peek::Running), orphaned(), orphaned()]);
+        let orphaned = || Ok(PeekOutcome::Foreign(Foreign::Orphaned));
+        let _looks = force_peeks([
+            Ok(PeekOutcome::Running),
+            Ok(PeekOutcome::Running),
+            orphaned(),
+            orphaned(),
+        ]);
 
         drop(child);
 
@@ -567,7 +572,7 @@ mod macos {
         // the assertion below is not vacuous.
         let (control, _control_writer) = session_blocker();
         let control_pid = control.id().pid();
-        let gone = force_peeks([Ok(Peek::Foreign(Foreign::Gone))]);
+        let gone = force_peeks([Ok(PeekOutcome::Foreign(Foreign::Gone))]);
         drop(control);
         drop(gone);
         assert!(holders.killed().contains(&control_pid), "{:?}", holders.killed());
@@ -575,7 +580,7 @@ mod macos {
         let (child, _writer) = session_blocker();
         let pid = child.id().pid();
         let sends = Capture::start();
-        let orphaned = || Ok(Peek::Foreign(Foreign::Orphaned));
+        let orphaned = || Ok(PeekOutcome::Foreign(Foreign::Orphaned));
         let _orphaned = force_peeks([orphaned(), orphaned()]);
 
         drop(child);
@@ -599,7 +604,7 @@ mod macos {
         let sends = Capture::start();
         let mark = crate::log_capture::mark();
         // The cleanup's first look, then the second look of its own `forget_for`.
-        let orphaned = || Ok(Peek::Foreign(Foreign::Orphaned));
+        let orphaned = || Ok(PeekOutcome::Foreign(Foreign::Orphaned));
         let _orphaned = force_peeks([orphaned(), orphaned()]);
 
         let (err, fate) =

@@ -47,7 +47,8 @@ impl SharedChild {
     fn platform_wait(&self, deadline: Option<Instant>) -> io::Result<Unlocked> {
         use std::os::fd::AsFd;
 
-        use crate::wait::exit_only::{self, Peek, Target};
+        use crate::os_process::child::PeekOutcome;
+        use crate::wait::exit_only::{self, Target};
 
         let Some(pidfd) = &self.pidfd else {
             return Err(super::echild());
@@ -61,9 +62,9 @@ impl SharedChild {
         #[cfg(test)]
         exit_only::seams::step(exit_only::seams::HolderStep::FinalPeek);
         match exit_only::peek(&Target::PidFd(pidfd.as_fd()))? {
-            Peek::Exit(_) => Ok(Unlocked::ExitSeen),
-            Peek::Running => Ok(Unlocked::DeadlinePassed),
-            Peek::Foreign(_) => Ok(Unlocked::Gone),
+            PeekOutcome::Exit(_) => Ok(Unlocked::ExitSeen),
+            PeekOutcome::Running => Ok(Unlocked::DeadlinePassed),
+            PeekOutcome::Foreign(_) => Ok(Unlocked::Gone),
         }
     }
 
@@ -85,7 +86,8 @@ impl SharedChild {
         use std::os::fd::AsFd;
         use std::time::Duration;
 
-        use crate::wait::exit_only::{self, Peek, Target};
+        use crate::os_process::child::PeekOutcome;
+        use crate::wait::exit_only::{self, Target};
 
         let Some(pidfd) = &self.pidfd else {
             return Err(super::echild());
@@ -94,7 +96,7 @@ impl SharedChild {
         let Some(deadline) = deadline else {
             holder.unlock();
             return match exit_only::wait_visible_exit(&target)? {
-                Peek::Foreign(_) => Ok(Unlocked::Gone),
+                PeekOutcome::Foreign(_) => Ok(Unlocked::Gone),
                 _ => Ok(Unlocked::ExitSeen),
             };
         };
@@ -106,9 +108,9 @@ impl SharedChild {
             if now >= deadline {
                 // Expired: one final peek.
                 return Ok(match exit_only::peek(&target)? {
-                    Peek::Exit(_) => Unlocked::ExitSeen,
-                    Peek::Running => Unlocked::DeadlinePassed,
-                    Peek::Foreign(_) => Unlocked::Gone,
+                    PeekOutcome::Exit(_) => Unlocked::ExitSeen,
+                    PeekOutcome::Running => Unlocked::DeadlinePassed,
+                    PeekOutcome::Foreign(_) => Unlocked::Gone,
                 });
             }
             #[cfg(test)]
@@ -126,9 +128,9 @@ impl SharedChild {
             crate::wait::test_clock::advance_by_elapsed_if_frozen(started.elapsed());
             interval = (interval * 2).min(Duration::from_millis(50));
             match exit_only::peek(&target)? {
-                Peek::Exit(_) => return Ok(Unlocked::ExitSeen),
-                Peek::Foreign(_) => return Ok(Unlocked::Gone),
-                Peek::Running => {}
+                PeekOutcome::Exit(_) => return Ok(Unlocked::ExitSeen),
+                PeekOutcome::Foreign(_) => return Ok(Unlocked::Gone),
+                PeekOutcome::Running => {}
             }
         }
     }
@@ -178,7 +180,8 @@ impl SharedChild {
         use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
         use windows::Win32::System::Threading::WaitForSingleObject;
 
-        use crate::wait::exit_only::{self, Peek, Target};
+        use crate::os_process::child::PeekOutcome;
+        use crate::wait::exit_only::{self, Target};
 
         let handle = HANDLE(self.handle.as_raw_handle());
         // SAFETY: `handle` is our owned process handle, alive for the whole call.
@@ -191,9 +194,9 @@ impl SharedChild {
         }
         // Expired: one final peek.
         match exit_only::peek(&Target::Handle(self.handle.as_handle()))? {
-            Peek::Exit(_) => Ok(Unlocked::ExitSeen),
-            Peek::Running => Ok(Unlocked::DeadlinePassed),
-            Peek::Foreign(_) => Ok(Unlocked::Gone),
+            PeekOutcome::Exit(_) => Ok(Unlocked::ExitSeen),
+            PeekOutcome::Running => Ok(Unlocked::DeadlinePassed),
+            PeekOutcome::Foreign(_) => Ok(Unlocked::Gone),
         }
     }
 

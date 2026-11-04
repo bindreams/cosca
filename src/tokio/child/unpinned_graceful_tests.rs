@@ -12,9 +12,9 @@ use crate::child::unpinned_public_tests::{
     Untrusted, BOTH,
 };
 use crate::error::Error;
+use crate::os_process::child::{Foreign, PeekOutcome};
 use crate::send_log::Capture;
 use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peeks, forced_peeks_left, Forced};
-use crate::wait::exit_only::{Foreign, Peek};
 
 /// A hook slot that holds a forced peek until the test is over, so the guard is not dropped (and the
 /// force disarmed) before the shutdown reads it.
@@ -112,7 +112,7 @@ async fn graceful_shutdown_watch_stays_quiet_for_an_orphaned_root() {
     let (mut child, writer) = crate::test_child::term_ignoring_blocker_async().await;
     let sends = Capture::start();
     let mark = crate::log_capture::mark();
-    let _looks = force_peeks([Ok(Peek::Running), Ok(Peek::Foreign(Foreign::Orphaned))]);
+    let _looks = force_peeks([Ok(PeekOutcome::Running), Ok(PeekOutcome::Foreign(Foreign::Orphaned))]);
 
     let err = child
         .graceful_shutdown(Duration::ZERO)
@@ -236,7 +236,7 @@ async fn graceful_shutdown_tree_decides_its_signal_on_one_look_at_the_root() {
         let left = Arc::clone(&left);
         move || *left.lock().expect("the hook's slot") = Some(forced_peeks_left())
     });
-    let looks = force_peeks([Ok(Peek::Running), Ok(Peek::Foreign(Foreign::Orphaned))]);
+    let looks = force_peeks([Ok(PeekOutcome::Running), Ok(PeekOutcome::Foreign(Foreign::Orphaned))]);
 
     // The sweep and the reap that follow are not under test.
     _ = child.graceful_shutdown_tree(Duration::ZERO).await;
@@ -300,9 +300,9 @@ async fn graceful_shutdown_tree_does_not_reap_an_exited_orphaned_root_after_a_fa
     let mark = crate::log_capture::mark();
     // The entry's read, the sweep's, the reap's.
     let _looks = force_peeks([
-        Ok(Peek::Running),
-        Ok(Peek::Foreign(Foreign::Orphaned)),
-        Ok(Peek::Foreign(Foreign::Orphaned)),
+        Ok(PeekOutcome::Running),
+        Ok(PeekOutcome::Foreign(Foreign::Orphaned)),
+        Ok(PeekOutcome::Foreign(Foreign::Orphaned)),
     ]);
 
     let err = child

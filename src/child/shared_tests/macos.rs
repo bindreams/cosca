@@ -7,10 +7,11 @@ use std::time::{Duration, Instant};
 use super::fixtures::{spawn_std_blocker, Blocker};
 use crate::child::shared::SharedChild;
 use crate::identity::{ppid_fault, uniq_fault, uniq_info, ReadErr, ReadPurpose, UniqInfo, UniqRead, LAUNCHD};
+use crate::os_process::child::{Foreign, PeekOutcome};
 use crate::os_process::macos::kqueue::test_hooks::{self, ForcedOnce};
 use crate::test_groups::{setuid, Group};
 use crate::wait::exit_only::seams::{self as exit_seams, ForcedReap, HolderStep};
-use crate::wait::exit_only::{self, Foreign, Peek, Target};
+use crate::wait::exit_only::{self, Target};
 
 fn far() -> Instant {
     Instant::now() + Duration::from_secs(3600)
@@ -71,12 +72,12 @@ fn an_identity_read_gone_takes_the_echild_path() {
     let forced = uniq_fault::force_uniq_read_once(ReadPurpose::Peek, UniqRead::Gone);
     let peeked = loop {
         match exit_only::peek(&target).expect("peek") {
-            Peek::Running => confirm_exit_of(&child),
+            PeekOutcome::Running => confirm_exit_of(&child),
             other => break other,
         }
     };
     drop(forced);
-    assert_eq!(peeked, Peek::Foreign(Foreign::Gone));
+    assert_eq!(peeked, PeekOutcome::Foreign(Foreign::Gone));
     child.wait().expect("reap");
 }
 
@@ -463,7 +464,7 @@ fn an_echild_for_a_pid_held_by_a_tracer_is_running() {
     let (pid, unique) = echild_yet_resolvable();
     let target = Target::pid(pid, Some(unique));
     let forced = held_by_a_tracer();
-    assert_eq!(exit_only::peek(&target).expect("peek"), Peek::Running);
+    assert_eq!(exit_only::peek(&target).expect("peek"), PeekOutcome::Running);
     drop(forced);
     let _forced = held_by_a_tracer();
     assert_eq!(
@@ -689,7 +690,7 @@ fn a_wait_on_a_child_whose_tracer_is_exiting_at_launchd_peeks_again_on_a_backoff
 #[skuld::test]
 fn an_echild_for_another_users_process_that_launchd_does_not_own_is_running() {
     let target = Target::pid(1, Some(unique_of(1)));
-    assert_eq!(exit_only::peek(&target).expect("peek"), Peek::Running);
+    assert_eq!(exit_only::peek(&target).expect("peek"), PeekOutcome::Running);
     assert_eq!(
         exit_only::try_reap(&target).expect("try_reap"),
         exit_only::Reap::Running
@@ -707,7 +708,7 @@ fn an_echild_for_a_pid_orphaned_to_launchd_is_orphaned() {
     let forced = orphaned_to_launchd();
     assert_eq!(
         exit_only::peek(&target).expect("peek"),
-        Peek::Foreign(Foreign::Orphaned)
+        PeekOutcome::Foreign(Foreign::Orphaned)
     );
     drop(forced);
     let _forced = orphaned_to_launchd();
@@ -727,7 +728,10 @@ fn an_echild_whose_parent_read_fails_is_foreign() {
     let (pid, unique) = echild_yet_resolvable();
     let target = Target::pid(pid, Some(unique));
     let forced = ppid_fault::force_ppid_once(Err(ReadErr::Refused(libc::EPERM)));
-    assert_eq!(exit_only::peek(&target).expect("peek"), Peek::Foreign(Foreign::Gone));
+    assert_eq!(
+        exit_only::peek(&target).expect("peek"),
+        PeekOutcome::Foreign(Foreign::Gone)
+    );
     drop(forced);
     let forced = ppid_fault::force_ppid_once(Err(ReadErr::Gone));
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| exit_only::peek(&target)));
@@ -737,7 +741,7 @@ fn an_echild_whose_parent_read_fails_is_foreign() {
     } else {
         assert_eq!(
             outcome.expect("release returns").expect("peek"),
-            Peek::Foreign(Foreign::Gone)
+            PeekOutcome::Foreign(Foreign::Gone)
         );
     }
 }
@@ -765,7 +769,7 @@ fn an_echild_for_a_pid_that_no_longer_names_the_child_is_foreign() {
             .collect();
         assert_eq!(
             exit_only::peek(&target).expect("peek"),
-            Peek::Foreign(want),
+            PeekOutcome::Foreign(want),
             "{reads:?}"
         );
         drop(forced);
@@ -801,7 +805,7 @@ fn an_echild_with_no_id_stays_foreign() {
     let (pid, _) = echild_yet_resolvable();
     assert_eq!(
         exit_only::peek(&Target::pid(pid, None)).expect("peek"),
-        Peek::Foreign(Foreign::Gone)
+        PeekOutcome::Foreign(Foreign::Gone)
     );
 }
 
@@ -841,7 +845,7 @@ fn a_wait_on_a_zombie_launchd_holds_warns_it_is_not_ours_to_reap() {
     b.end_child_and_confirm_exit();
     let pid = b.shared.id();
     let mark = crate::log_capture::mark();
-    let _orphaned = exit_seams::force_peek_once(Ok(Peek::Foreign(Foreign::Orphaned)));
+    let _orphaned = exit_seams::force_peek_once(Ok(PeekOutcome::Foreign(Foreign::Orphaned)));
     _ = b.shared.wait();
     let records = crate::log_capture::records_since_on_current_thread(mark, &format!("pid {pid}"));
     assert!(
@@ -866,7 +870,7 @@ fn a_reap_that_finds_no_exit_record_after_reapable_waits_again() {
     let slot = std::rc::Rc::new(std::cell::RefCell::new(None));
     let _hook = exit_seams::on_holder_step(HolderStep::Reap, {
         let slot = std::rc::Rc::clone(&slot);
-        move || *slot.borrow_mut() = Some(exit_seams::force_peek_once(Ok(Peek::Running)))
+        move || *slot.borrow_mut() = Some(exit_seams::force_peek_once(Ok(PeekOutcome::Running)))
     });
     let status = b.shared.wait().expect("the holder waited again and got the exit");
     assert!(status.success(), "{status:?}");

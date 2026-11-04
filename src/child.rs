@@ -457,7 +457,7 @@ impl Child {
                             Err(e) if e.raw_os_error() == Some(libc::ECHILD) => {
                                 log::debug!("Child::drop: elevation front pid {pid} was reaped by someone else");
                                 // The cgroup kill landed first: delivered, so `Killed`.
-                                Torn::new(crate::wait::exit_only::Foreign::Gone.fate(true))
+                                Torn::new(crate::os_process::child::Foreign::Gone.fate(true))
                             }
                             Err(e) => Torn {
                                 fate: ChildFate::Killed,
@@ -682,7 +682,7 @@ impl Child {
         #[cfg(unix)]
         let held = self.proc.hold_reaps();
         #[cfg(unix)]
-        let check = || tree_call::group_number_holds(self.id.pid(), held.state_and_own_reap());
+        let check = || tree_call::group_number_holds(self.id.pid(), held.state());
         #[cfg(unix)]
         let group = crate::containment::GroupRoot::new(self.proc.pidfd(), &check);
         #[cfg(not(unix))]
@@ -691,7 +691,7 @@ impl Child {
         if let Some(result) = self
             .tree_call(crate::containment::dispatch::TreeSignal::Kill, "kill_tree", earlier)
             .root_checked(
-                || held.state_and_own_reap(),
+                || held.state(),
                 || {
                     held.signal_sent(crate::signal::Sig::Kill)
                         .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper()))
@@ -829,7 +829,7 @@ impl Child {
         #[cfg(unix)]
         let held = self.proc.hold_reaps();
         #[cfg(unix)]
-        let check = || tree_call::group_number_holds(self.id.pid(), held.state_and_own_reap());
+        let check = || tree_call::group_number_holds(self.id.pid(), held.state());
         #[cfg(unix)]
         let group = crate::containment::GroupRoot::new(self.proc.pidfd(), &check);
         #[cfg(not(unix))]
@@ -838,7 +838,7 @@ impl Child {
         if let Some(result) = self
             .tree_call(crate::containment::dispatch::TreeSignal::Term, "terminate_tree", None)
             .root_checked(
-                || held.state_and_own_reap(),
+                || held.state(),
                 || held.signal_sent(crate::signal::Sig::Term).map_err(Error::Io),
                 &group,
             )
@@ -857,7 +857,7 @@ impl Child {
     /// Whether the root's pid still names its group, read now through its handle.
     #[cfg(unix)]
     fn group_number_holds(&self) -> Result<(), String> {
-        tree_call::group_number_holds(self.id.pid(), self.proc.state_and_own_reap())
+        tree_call::group_number_holds(self.id.pid(), self.proc.state())
     }
 
     /// A tree call on this child's tree ([`TreeCall`]).

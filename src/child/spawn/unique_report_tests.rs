@@ -459,11 +459,12 @@ fn forked_by_us_held_by(parent: u32) -> (libc::pid_t, libc::pid_t) {
 /// Mutant: the check takes a child this process forked for running, whoever holds it.
 #[skuld::test]
 fn awaiting_a_child_launchd_holds_after_its_tracer_died_answers_missing_without_blocking() {
-    use crate::wait::exit_only::{seams::force_peek_once, Foreign, Peek};
+    use crate::os_process::child::{Foreign, PeekOutcome};
+    use crate::wait::exit_only::seams::force_peek_once;
     let (child, stdin) = live_child();
     let pid = child.id();
     let (r, copy) = pipe();
-    let _echild = force_peek_once(Ok(Peek::Foreign(Foreign::Gone)));
+    let _echild = force_peek_once(Ok(PeekOutcome::Foreign(Foreign::Gone)));
     let _parents = crate::identity::kinfo::fault::force_parents(pid, || forked_by_us_held_by(crate::identity::LAUNCHD));
     let before = seams::block_count();
     let _release = release_on_block(copy);
@@ -488,14 +489,15 @@ fn awaiting_a_child_whose_tracer_dies_during_its_exit_is_woken_by_the_tracers_ex
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
-    use crate::wait::exit_only::{seams::force_peeks, Foreign, Peek};
+    use crate::os_process::child::{Foreign, PeekOutcome};
+    use crate::wait::exit_only::seams::force_peeks;
     let (child, stdin) = live_child();
     let pid = child.id();
     let (mut tracer, tracer_stdin) = live_child();
     let tracer_pid = tracer.id();
     let (r, copy) = pipe();
     // More than the wait takes: the child stays `ECHILD` to this process throughout.
-    let _echild = force_peeks((0..8).map(|_| Ok(Peek::Foreign(Foreign::Gone))));
+    let _echild = force_peeks((0..8).map(|_| Ok(PeekOutcome::Foreign(Foreign::Gone))));
     let tracer_exited = Rc::new(Cell::new(false));
     let _parents = crate::identity::kinfo::fault::force_parents(pid, {
         let exited = Rc::clone(&tracer_exited);
@@ -554,16 +556,18 @@ fn awaiting_a_child_a_tracer_attaches_to_late_is_woken_by_the_attach() {
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
+    use crate::os_process::child::{Foreign, PeekOutcome};
     use crate::os_process::macos::kqueue::test_hooks::{event_pending, send_signal};
-    use crate::wait::exit_only::{seams::force_peeks, Foreign, Peek};
+    use crate::wait::exit_only::seams::force_peeks;
     let (child, stdin) = live_child();
     let pid = child.id();
     let (mut tracer, tracer_stdin) = live_child();
     let tracer_pid = tracer.id();
     let (r, copy) = pipe();
     // Running for the first check, then `ECHILD` throughout: more than the wait takes.
-    let _peeks =
-        force_peeks(std::iter::once(Ok(Peek::Running)).chain((0..8).map(|_| Ok(Peek::Foreign(Foreign::Gone)))));
+    let _peeks = force_peeks(
+        std::iter::once(Ok(PeekOutcome::Running)).chain((0..8).map(|_| Ok(PeekOutcome::Foreign(Foreign::Gone)))),
+    );
     let holder = Rc::new(Cell::new(std::process::id()));
     let _parents = crate::identity::kinfo::fault::force_parents(pid, {
         let holder = Rc::clone(&holder);
@@ -653,9 +657,10 @@ fn await_held(
 ) -> (Report, u32, Vec<Option<std::time::Duration>>) {
     use std::cell::RefCell;
 
-    use crate::wait::exit_only::{seams::force_peeks, Foreign, Peek};
+    use crate::os_process::child::{Foreign, PeekOutcome};
+    use crate::wait::exit_only::seams::force_peeks;
     let (r, copy) = pipe();
-    let _echild = force_peeks((0..16).map(|_| Ok(Peek::Foreign(Foreign::Gone))));
+    let _echild = force_peeks((0..16).map(|_| Ok(PeekOutcome::Foreign(Foreign::Gone))));
     let _parents = crate::identity::kinfo::fault::force_parents(child, move || forked_by_us_held_by(tracer));
     let _links = crate::wait::macos::tracer_seams::force_links(links);
     let recorded = seams::say_waiting_after_then_record(say_after);
