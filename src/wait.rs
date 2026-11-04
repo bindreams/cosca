@@ -652,12 +652,25 @@ fn win32_wait_clamp() -> u32 {
 /// from the log.
 #[cfg(test)]
 pub(crate) mod block_probe {
+    #[cfg(target_os = "macos")]
+    use std::cell::Cell;
     use std::cell::RefCell;
     use std::time::Duration;
+
+    /// A hook that runs before each blocking round, with the round's index.
+    #[cfg(target_os = "macos")]
+    type RoundHook = Box<dyn FnMut(u32)>;
 
     thread_local! {
         static ARMED: RefCell<Vec<Option<Duration>>> = const { RefCell::new(Vec::new()) };
         static ON_BLOCKING: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+        #[cfg(target_os = "macos")]
+        static ROUND: Cell<u32> = const { Cell::new(0) };
+        #[cfg(target_os = "macos")]
+        static ON_ROUND: RefCell<Option<RoundHook>> = const { RefCell::new(None) };
+        /// Which arming owns `ON_ROUND`: every arm and every disarm moves it on.
+        #[cfg(target_os = "macos")]
+        static ROUND_OWNER: Cell<u64> = const { Cell::new(0) };
     }
 
     pub(crate) fn record(armed: Option<Duration>) {
@@ -671,6 +684,61 @@ pub(crate) mod block_probe {
         if let Some(hook) = ON_BLOCKING.with(|h| h.borrow_mut().take()) {
             hook();
         }
+        #[cfg(target_os = "macos")]
+        fire_round();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn fire_round() {
+        let round = ROUND.with(|r| r.replace(r.get() + 1));
+        // Out of its slot for the call, so the hook may itself arm or drop rounds; it goes back
+        // only if neither happened.
+        if let Some(mut hook) = ON_ROUND.with(|h| h.borrow_mut().take()) {
+            let owner = ROUND_OWNER.with(Cell::get);
+            hook(round);
+            if ROUND_OWNER.with(Cell::get) == owner {
+                ON_ROUND.with(|h| *h.borrow_mut() = Some(hook));
+            }
+        }
+    }
+
+    /// Disarms an [`on_every_round`] hook on drop.
+    #[cfg(target_os = "macos")]
+    #[must_use = "dropping this immediately disarms the hook; bind it for the probe's duration"]
+    pub(crate) struct Rounds(u64);
+
+    #[cfg(target_os = "macos")]
+    impl Drop for Rounds {
+        /// Disarms only the arming this guard came from: a guard that a later arm replaced does
+        /// nothing.
+        fn drop(&mut self) {
+            if ROUND_OWNER.with(Cell::get) == self.0 {
+                ON_ROUND.with(|h| *h.borrow_mut() = None);
+                ROUND_OWNER.with(|o| o.set(self.0 + 1));
+            }
+        }
+    }
+
+    /// Run `hook` with the round's index on this thread just before every blocking `poll`, counted
+    /// from 0 at this call: the wait's own look has just returned what to block on, and every lock
+    /// is released.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn on_every_round(hook: impl FnMut(u32) + 'static) -> Rounds {
+        ROUND.with(|r| r.set(0));
+        let owner = ROUND_OWNER.with(|o| o.replace(o.get() + 1)) + 1;
+        ON_ROUND.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+        Rounds(owner)
+    }
+
+    /// Run `hook` on this thread just before blocking round `round` (see [`on_every_round`]).
+    #[cfg(target_os = "macos")]
+    pub(crate) fn on_round(round: u32, hook: impl FnOnce() + 'static) -> Rounds {
+        let mut hook = Some(hook);
+        on_every_round(move |at| {
+            if at == round {
+                hook.take().expect("a round comes once")();
+            }
+        })
     }
 
     /// Disarms an unfired [`on_blocking`] hook on drop.
