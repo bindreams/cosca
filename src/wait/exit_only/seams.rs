@@ -17,8 +17,6 @@ pub(crate) enum HolderStep {
         allow(dead_code, reason = "only macOS takes a second peek")
     )]
     SecondPeek,
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code, reason = "only Linux blocks in waitid"))]
-    BlockingWaitid,
 }
 
 type StepHook = Box<dyn FnOnce()>;
@@ -69,7 +67,7 @@ pub(crate) fn force_peeks(results: impl IntoIterator<Item = io::Result<PeekOutco
     Forced(|| FORCED_PEEK.with(|f| f.borrow_mut().clear()))
 }
 
-#[cfg(any(feature = "tokio", target_os = "macos"))]
+#[cfg(feature = "tokio")]
 /// How many forced peeks of [`force_peeks`] this thread has not yet consumed.
 pub(crate) fn forced_peeks_left() -> usize {
     FORCED_PEEK.with(|f| f.borrow().len())
@@ -85,7 +83,7 @@ pub(crate) fn assert_peeks_exhausted() {
 
 /// Every peek on this thread answers `answer()`, after any of [`force_peeks`], until the guard drops:
 /// for a test that cannot count the looks a call takes.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "tokio"))]
 pub(crate) fn force_every_peek(answer: PeekAnswer) -> Forced {
     FORCED_EVERY_PEEK.with(|f| f.set(Some(answer)));
     Forced(|| FORCED_EVERY_PEEK.with(|f| f.set(None)))
