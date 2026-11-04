@@ -14,6 +14,12 @@ fn warns_since(mark: usize) -> Vec<String> {
         .collect()
 }
 
+/// The OS's words for the `EPERM` that `refuse_kills` answers: the warn names the refusal as the OS
+/// gave it.
+fn refusal() -> String {
+    std::io::Error::from_raw_os_error(libc::EPERM).to_string()
+}
+
 fn session_blocker() -> (crate::Child, std::io::PipeWriter) {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
     let mut cmd = Command::new();
@@ -59,7 +65,7 @@ fn an_unknown_root_with_a_refused_kill_warns_once() {
     assert!(
         warns[0].starts_with("Child::drop:")
             && warns[0].contains("RootState::Unknown")
-            && warns[0].contains("permission denied"),
+            && warns[0].contains(&refusal()),
         "{warns:?}"
     );
 }
@@ -110,7 +116,7 @@ fn finish_elevated_with_an_unknown_root_and_a_failed_reap_warns_once() {
 fn finish_elevated_leaves_the_handle_armed_when_the_root_kill_was_refused() {
     crate::log_capture::install();
     let (child, writer) = bare_blocker();
-    let teardowns = crate::child::fault::record_root_teardowns();
+    let teardowns = crate::child::owned::seams::record_root_teardowns();
     let mark = crate::log_capture::mark();
     let refused = crate::signal::seams::refuse_kills();
 
@@ -123,7 +129,7 @@ fn finish_elevated_leaves_the_handle_armed_when_the_root_kill_was_refused() {
     );
     let warns = warns_since(mark);
     assert_eq!(warns.len(), 1, "{warns:?}");
-    assert!(warns[0].contains("permission denied"), "{warns:?}");
+    assert!(warns[0].contains(&refusal()), "{warns:?}");
     drop(refused);
     drop(writer);
 }
@@ -137,7 +143,7 @@ fn finish_elevated_leaves_the_handle_armed_when_the_root_kill_was_refused() {
 fn a_retry_that_fails_anew_warns_of_the_new_failure() {
     crate::log_capture::install();
     let (child, writer) = bare_blocker();
-    let teardowns = crate::child::fault::record_root_teardowns();
+    let teardowns = crate::child::owned::seams::record_root_teardowns();
     let mark = crate::log_capture::mark();
     let err_peek = || Err(std::io::Error::other("forced peek failure"));
     // The cleanup's read, then the drop's.
@@ -155,7 +161,7 @@ fn a_retry_that_fails_anew_warns_of_the_new_failure() {
         "{warns:?}"
     );
     assert!(
-        warns[1].starts_with("Child::drop:") && warns[1].contains("could not be terminated on drop"),
+        warns[1].starts_with("Child::drop:") && warns[1].contains("could not be terminated"),
         "the retry's own refusal is warned of: {warns:?}"
     );
     drop(refused);
@@ -176,7 +182,7 @@ fn a_retry_that_only_repeats_the_cleanups_warn_is_debug() {
     let (child, writer) = bare_blocker();
     // Released once the drop's retried kill returned: that kill is the one that lands.
     let blocker = crate::child::spawn::fault::release_at_drop_kill(writer);
-    let teardowns = crate::child::fault::record_root_teardowns();
+    let teardowns = crate::child::owned::seams::record_root_teardowns();
     let mark = crate::log_capture::mark();
     let err_peek = || Err(std::io::Error::other("forced peek failure"));
     // The cleanup's read, then the drop's.

@@ -9,7 +9,7 @@ use std::io::{PipeWriter, Read as _};
 use std::os::unix::process::ExitStatusExt as _;
 use std::time::Duration;
 
-use crate::child::fault::record_root_teardowns;
+use crate::child::owned::seams::record_root_teardowns;
 use crate::command::Command;
 use crate::elevation::{Backend, ElevatedStdio, ElevatedVia, ElevationReport};
 use crate::error::{ElevationErrorKind, Error};

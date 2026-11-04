@@ -92,7 +92,8 @@ impl Child {
         if mechanism.addresses_a_bare_pid() && !self.proc().pins_pid() {
             return Err(self.unpinned_pid_refusal("terminate"));
         }
-        crate::graceful::signal(mechanism, self.id())
+        let id = self.id();
+        crate::graceful::signal(mechanism, id, |_| crate::os_process::terminate_by_id(id))
     }
 
     /// Cooperative-then-forced lone shutdown: [`terminate`](Child::terminate), wait up to

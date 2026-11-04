@@ -31,7 +31,14 @@ pub(super) fn peek(target: &Target<'_>) -> io::Result<PeekOutcome> {
     } else if r == WAIT_TIMEOUT {
         Ok(PeekOutcome::Running)
     } else {
-        Err(io::Error::last_os_error())
+        let e = io::Error::last_os_error();
+        // A wait on our own process handle, which carries `SYNCHRONIZE`, does not fail: a failure
+        // is a closed or invalid handle, our bug.
+        debug_assert!(
+            false,
+            "WaitForSingleObject on our own process handle returned {r:?}: {e}"
+        );
+        Err(e)
     }
 }
 

@@ -45,7 +45,8 @@ The public types follow the same line:
 `OsProcess` exposes something platform-specific in one of three ways, and no other:
 
 - an operation every platform has, as a plain method;
-- the platform's native handle, through `os_handle()`;
+- the platform's native handle, through `os_handle()`, or a `pidfd()` view of it (Linux `Some`,
+  macOS `None`) for the consumers that take an optional fd on both Unixes;
 - a consumer's own knowledge (cgroup membership, Job Object assignment), which stays with that
   consumer and uses the borrowed handle.
 

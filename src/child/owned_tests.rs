@@ -17,6 +17,8 @@ mod linux;
 mod macos;
 #[path = "owned_tests/states.rs"]
 mod states;
+#[path = "owned_tests/teardown.rs"]
+mod teardown;
 #[cfg(target_os = "macos")]
 #[path = "owned_tests/traced.rs"]
 mod traced;
