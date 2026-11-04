@@ -3,15 +3,15 @@
 
 use std::os::fd::BorrowedFd;
 
-use rustix::event::{poll, PollFd, PollFlags, Timespec};
+use rustix::event::{PollFd, PollFlags};
 use rustix::fs::{open, Mode, OFlags};
 use rustix::io::Errno;
 
 use super::log::Log;
+use crate::wait;
 
 /// Which of `fds` are readable or hung up, in the same order; an absent descriptor is never ready.
-/// `EINTR` is retried; every other error is the caller's, and means nothing is known about any
-/// descriptor.
+/// Every error is the caller's, and means nothing is known about any descriptor.
 fn poll_in<const N: usize>(fds: [Option<BorrowedFd<'_>>; N], block: bool) -> Result<[bool; N], Errno> {
     let mut at = [None; N];
     let mut polled = Vec::with_capacity(N);
@@ -21,13 +21,10 @@ fn poll_in<const N: usize>(fds: [Option<BorrowedFd<'_>>; N], block: bool) -> Res
             polled.push(PollFd::new(fd, PollFlags::IN));
         }
     }
-    let zero = Timespec { tv_sec: 0, tv_nsec: 0 };
-    loop {
-        match poll(&mut polled, (!block).then_some(&zero)) {
-            Ok(_) => break,
-            Err(Errno::INTR) => {}
-            Err(e) => return Err(e),
-        }
+    if block {
+        wait::poll_ready(&mut polled)?;
+    } else {
+        wait::any_ready_now(&mut polled)?;
     }
     let mut ready = [false; N];
     for (slot, index) in at.iter().enumerate() {

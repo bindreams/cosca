@@ -159,7 +159,7 @@ impl ReportChannel {
     /// final, and return it. See [`ReportChannel`] for why `spawn` returning is not enough, and for
     /// why the wait goes through `pidfd`.
     pub(crate) fn wait(&mut self, pidfd: std::os::fd::BorrowedFd<'_>) -> PlacementReport {
-        use rustix::event::{poll, PollFd, PollFlags};
+        use rustix::event::{PollFd, PollFlags};
 
         // The parent's own copy would otherwise keep the channel open forever.
         self.write = None;
@@ -181,13 +181,8 @@ impl ReportChannel {
             #[cfg(test)]
             fault::notify_wait_polling();
             // No timeout: the child reports or exits on its way to `exec`, like `std`'s own wait.
-            loop {
-                match poll(&mut fds, None) {
-                    Ok(_) => break,
-                    // `ENOMEM` is the kernel's transient shortage, not an answer.
-                    Err(rustix::io::Errno::INTR | rustix::io::Errno::NOMEM) => continue,
-                    Err(e) => panic!("poll on the placement report channel failed: {e}"),
-                }
+            if let Err(e) = crate::wait::poll_ready(&mut fds) {
+                panic!("poll on the placement report channel failed: {e}");
             }
             if !fds[1].revents().is_empty() {
                 // The child has exited: whatever it sent is queued.

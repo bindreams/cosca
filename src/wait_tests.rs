@@ -762,3 +762,170 @@ mod pidfd_exit_visible {
         child.wait().expect("reap");
     }
 }
+
+// `any_ready_now` and `poll_ready` =====
+
+#[cfg(unix)]
+mod poll {
+    use std::io::Write as _;
+
+    use rustix::event::{PollFd, PollFlags};
+    use rustix::io::Errno;
+
+    use crate::test_own_process::{own_process, test_path};
+    use crate::wait::{any_ready_now, poll_ready};
+
+    /// More descriptors than any `poll(2)` takes: Linux's limit is `RLIMIT_NOFILE`, lowered by
+    /// [`lower_the_descriptor_limit`], macOS's is `OPEN_MAX` (10240).
+    const OVERSIZE: usize = 10_241;
+
+    /// Process-wide: only a test that runs in a process of its own may call it.
+    fn lower_the_descriptor_limit() {
+        let limit = libc::rlimit {
+            rlim_cur: 16,
+            rlim_max: 16,
+        };
+        // SAFETY: lowers this process's own descriptor limit; the pointer is to a live local.
+        let set = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) };
+        assert_eq!(set, 0, "lower RLIMIT_NOFILE");
+    }
+
+    /// Mutant: `Ok(ready) => return Ok(false)`.
+    #[skuld::test]
+    fn any_ready_now_is_true_for_a_readable_descriptor() {
+        let (rx, mut tx) = std::io::pipe().unwrap();
+        tx.write_all(&[1]).unwrap();
+        let mut fds = [PollFd::new(&rx, PollFlags::IN)];
+        assert_eq!(any_ready_now(&mut fds), Ok(true));
+        assert!(
+            fds[0].revents().contains(PollFlags::IN),
+            "the events found are in the slice"
+        );
+    }
+
+    /// Mutant: `Ok(ready) => return Ok(ready >= 0)` or `Ok(true)`.
+    #[skuld::test]
+    fn any_ready_now_is_false_when_nothing_is_ready() {
+        let (rx, _tx) = std::io::pipe().unwrap();
+        let mut fds = [PollFd::new(&rx, PollFlags::IN)];
+        assert_eq!(any_ready_now(&mut fds), Ok(false));
+        assert!(fds[0].revents().is_empty());
+    }
+
+    /// A failed poll is an error, never "nothing ready".
+    ///
+    /// Mutant: `Err(e) => return Err(e)` becomes `Err(_) => return Ok(false)`.
+    #[skuld::test]
+    fn any_ready_now_reports_a_failed_poll_as_an_error() {
+        let Some(_done) = own_process(
+            test_path!(any_ready_now_reports_a_failed_poll_as_an_error),
+            crate::test_spawn::spawn,
+        ) else {
+            return;
+        };
+        let (rx, _tx) = std::io::pipe().unwrap();
+        let mut fds: Vec<_> = (0..OVERSIZE).map(|_| PollFd::new(&rx, PollFlags::IN)).collect();
+        lower_the_descriptor_limit();
+        assert_eq!(any_ready_now(&mut fds), Err(Errno::INVAL));
+    }
+
+    /// Mutant: `Ok(_) => return Ok(())` becomes `Ok(_) => continue`, which blocks for good here.
+    #[skuld::test]
+    fn poll_ready_returns_once_a_descriptor_is_ready() {
+        let (rx, mut tx) = std::io::pipe().unwrap();
+        tx.write_all(&[1]).unwrap();
+        let mut fds = [PollFd::new(&rx, PollFlags::IN)];
+        assert_eq!(poll_ready(&mut fds), Ok(()));
+        assert!(
+            fds[0].revents().contains(PollFlags::IN),
+            "the events found are in the slice"
+        );
+    }
+
+    /// A failed poll is an error, not a return that looks like readiness.
+    ///
+    /// Mutant: `Err(e) => return Err(e)` becomes `Err(_) => return Ok(())`.
+    #[skuld::test]
+    fn poll_ready_reports_a_failed_poll_as_an_error() {
+        let Some(_done) = own_process(
+            test_path!(poll_ready_reports_a_failed_poll_as_an_error),
+            crate::test_spawn::spawn,
+        ) else {
+            return;
+        };
+        let (rx, _tx) = std::io::pipe().unwrap();
+        let mut fds: Vec<_> = (0..OVERSIZE).map(|_| PollFd::new(&rx, PollFlags::IN)).collect();
+        lower_the_descriptor_limit();
+        assert_eq!(poll_ready(&mut fds), Err(Errno::INVAL));
+    }
+
+    /// A signal that lands while `poll_ready` is blocked in `poll(2)` interrupts it, and it blocks
+    /// again: it returns only once the descriptor is ready. The polling thread is signalled only
+    /// after the kernel shows it inside the poll, so the signal cannot land before or after it.
+    /// Runs in a process of its own: a signal's disposition is process-wide.
+    ///
+    /// Mutant: `Err(Errno::INTR) => continue` is dropped, so the `EINTR` is returned.
+    #[cfg(target_os = "linux")]
+    #[skuld::test]
+    fn poll_ready_retries_an_interrupted_poll() {
+        use std::os::unix::thread::JoinHandleExt as _;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
+
+        static HANDLED: AtomicUsize = AtomicUsize::new(0);
+        extern "C" fn count(_: libc::c_int) {
+            HANDLED.fetch_add(1, Ordering::SeqCst);
+        }
+
+        // Whether thread `tid` is blocked in `poll(2)` or `ppoll(2)`, as the kernel reports it.
+        fn blocked_in_poll(tid: u32) -> bool {
+            let path = format!("/proc/self/task/{tid}/syscall");
+            let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+            let Some(Ok(number)) = text.split_whitespace().next().map(str::parse::<libc::c_long>) else {
+                return false; // `running`
+            };
+            #[cfg(target_arch = "x86_64")]
+            let polls = [libc::SYS_poll, libc::SYS_ppoll];
+            #[cfg(not(target_arch = "x86_64"))]
+            let polls = [libc::SYS_ppoll];
+            polls.contains(&number)
+        }
+
+        let Some(_done) = own_process(
+            test_path!(poll_ready_retries_an_interrupted_poll),
+            crate::test_spawn::spawn,
+        ) else {
+            return;
+        };
+        // No `SA_RESTART`: the interrupted `poll` reports `EINTR`.
+        let action = SigAction::new(SigHandler::Handler(count), SaFlags::empty(), SigSet::empty());
+        // SAFETY: `count` only touches an atomic, so it is async-signal-safe.
+        unsafe { sigaction(Signal::SIGUSR2, &action) }.expect("install the handler");
+
+        let (rx, mut tx) = std::io::pipe().unwrap();
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let poller = std::thread::spawn(move || {
+            tid_tx
+                .send(rustix::thread::gettid().as_raw_nonzero().get() as u32)
+                .unwrap();
+            poll_ready(&mut [PollFd::new(&rx, PollFlags::IN)])
+        });
+        let tid = tid_rx.recv().unwrap();
+        while !blocked_in_poll(tid) {
+            std::thread::yield_now();
+        }
+        // SAFETY: the thread is still running, so its `pthread_t` is valid.
+        let sent = unsafe { libc::pthread_kill(poller.as_pthread_t(), libc::SIGUSR2) };
+        assert_eq!(sent, 0, "signal the polling thread");
+        while HANDLED.load(Ordering::SeqCst) == 0 {
+            std::thread::yield_now();
+        }
+        tx.write_all(&[1]).unwrap();
+        assert_eq!(
+            poller.join().unwrap(),
+            Ok(()),
+            "the interrupted poll was retried, not returned"
+        );
+    }
+}
