@@ -89,13 +89,7 @@ impl ProcHandle {
     /// Block until the child exits.
     pub(crate) fn wait(&self) -> io::Result<ExitStatus> {
         match self {
-            ProcHandle::Std(s, pid) => match wait_std(s, *pid, None, Orphaned::Warn)? {
-                Some(status) => Ok(status),
-                None => {
-                    debug_assert!(false, "an unbounded wait ended with no exit");
-                    Err(io::Error::other("an unbounded wait ended with no exit"))
-                }
-            },
+            ProcHandle::Std(s, pid) => wait_unbounded(s, *pid),
             #[cfg(windows)]
             ProcHandle::Raw(r) => r.wait(),
         }
