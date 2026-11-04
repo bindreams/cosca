@@ -215,6 +215,9 @@ fn granted_access(handle: HANDLE) -> windows::core::Result<u32> {
     )))
 }
 
+/// The exit code `terminate_held` ends a process with.
+pub(crate) const TERMINATE_EXIT_CODE: u32 = 1;
+
 fn terminate_process(handle: HANDLE) -> windows::core::Result<()> {
     #[cfg(test)]
     if fault::take_exiting_refusal() {
@@ -223,7 +226,7 @@ fn terminate_process(handle: HANDLE) -> windows::core::Result<()> {
         )));
     }
     // SAFETY: the caller's live process handle.
-    unsafe { TerminateProcess(handle, 1) }
+    unsafe { TerminateProcess(handle, TERMINATE_EXIT_CODE) }
 }
 
 /// Test seam for the window Windows leaves open while a process exits.

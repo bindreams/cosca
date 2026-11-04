@@ -887,7 +887,7 @@ async fn exited_within_of_a_child_never_shown_ours_is_false() {
     reap_behind_the_owner(pid);
 }
 
-/// Async twin of `child/shared_tests/tracer.rs`'s `kill_ends_a_child_stopped_for_its_tracer`, over
+/// Async twin of `child/owned_tests/tracer.rs`'s `kill_ends_a_child_stopped_for_its_tracer`, over
 /// `ProcSource::signal`.
 #[cfg(target_os = "linux")]
 #[skuld::test]

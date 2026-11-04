@@ -105,7 +105,7 @@ async fn an_echild_after_a_look_that_showed_the_exit_is_a_foreign_reap() {
     drop(child);
 }
 
-/// The async reap's twin of `shared_tests::macos::a_wait_on_a_child_whose_tracer_dies_during_its_exit_is_woken_by_the_tracers_exit`:
+/// The async reap's twin of `child::owned_tests::macos::a_wait_on_a_child_whose_tracer_dies_during_its_exit_is_woken_by_the_tracers_exit`:
 /// XNU sends a traced child's `NOTE_EXIT` and `SIGCHLD` to its tracer alone, and a tracer that dies
 /// while the child is exiting leaves it to launchd. The reap watches the tracer too, and its
 /// `NOTE_EXIT` makes it look again, which finds launchd holding the child: `Unpinned`. This

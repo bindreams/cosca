@@ -159,11 +159,8 @@ pub(super) fn peek_holder(target: &Target<'_>, verified: bool) -> io::Result<(Pe
 /// The consuming `waitid(WEXITED | WNOHANG)`. `Ok(None)` when it finds nothing.
 fn consume(pid: u32) -> io::Result<Option<Record>> {
     #[cfg(test)]
-    if let Some(forced) = super::seams::take_forced_reap() {
-        return match forced {
-            super::seams::ForcedReap::None => Ok(None),
-            super::seams::ForcedReap::Errno(e) => Err(io::Error::from_raw_os_error(e)),
-        };
+    if super::seams::take_forced_empty_reap() {
+        return Ok(None);
     }
     waitid_record(pid, libc::WEXITED | libc::WNOHANG).map(|r| r.map(super::consumed))
 }

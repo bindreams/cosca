@@ -199,6 +199,8 @@ pub(crate) use backend::{
 
 #[cfg(all(windows, test))]
 pub(crate) use backend::fault as windows_fault;
+#[cfg(all(windows, test))]
+pub(crate) use backend::TERMINATE_EXIT_CODE as WINDOWS_TERMINATE_EXIT_CODE;
 
 #[cfg(target_os = "linux")]
 pub(crate) use backend::pid_stat;

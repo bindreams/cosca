@@ -144,7 +144,7 @@ fn proc_handle_raw_is_reaped_only_once_its_own_wait_returns() {
     handle.kill().expect("kill");
     let raw = match &handle {
         ProcHandle::Raw(r) => r.handle(),
-        ProcHandle::Std(_) => unreachable!(),
+        ProcHandle::Std(..) => unreachable!(),
     };
     // Keeps a no-op `kill` from hanging the wait below, which this test does not exercise.
     end_with_code_zero(raw);

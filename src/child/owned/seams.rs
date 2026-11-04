@@ -1,35 +1,8 @@
-//! Test seams for `SharedChild`. Thread-local, take-once, armed on the thread that makes the
+//! Test seams for `OwnedChild`. Thread-local, take-once, armed on the thread that makes the
 //! call; each returns a guard that disarms an unconsumed force on drop.
 
 use std::cell::{Cell, RefCell};
-use std::io;
 use std::sync::mpsc::{Receiver, Sender};
-
-use super::unlocked::Unlocked;
-
-/// What `force_unlocked_wait` makes the holder's unlocked wait do.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum ForcedWait {
-    ExitSeen,
-    DeadlinePassed,
-    Gone,
-    /// The wait fails with this errno.
-    Errno(i32),
-    /// The wait panics.
-    Panic,
-}
-
-impl ForcedWait {
-    pub(super) fn into_result(self) -> io::Result<Unlocked> {
-        match self {
-            ForcedWait::ExitSeen => Ok(Unlocked::ExitSeen),
-            ForcedWait::DeadlinePassed => Ok(Unlocked::DeadlinePassed),
-            ForcedWait::Gone => Ok(Unlocked::Gone),
-            ForcedWait::Errno(e) => Err(io::Error::from_raw_os_error(e)),
-            ForcedWait::Panic => panic!("forced panic in the holder's unlocked wait (test seam)"),
-        }
-    }
-}
 
 /// The two ends of a gate the holder parks on: it sends on `reached`, then blocks on `release`.
 pub(crate) struct ParkGate {
@@ -55,13 +28,9 @@ pub(crate) fn park_gate() -> (ParkGate, Receiver<()>, Sender<()>) {
 type BlockHook = Box<dyn FnOnce(Option<std::time::Duration>)>;
 
 thread_local! {
-    static PARK: RefCell<Option<ParkGate>> = const { RefCell::new(None) };
     static PARK_AFTER_REAP: RefCell<Option<ParkGate>> = const { RefCell::new(None) };
-    static FORCED_WAIT: Cell<Option<ForcedWait>> = const { Cell::new(None) };
     static PANIC_AFTER_RELOCK: Cell<bool> = const { Cell::new(false) };
     static ON_CONDVAR_BLOCK: RefCell<Option<BlockHook>> = const { RefCell::new(None) };
-    #[cfg(windows)]
-    static FORCE_DUPLICATE_HANDLE_ERROR: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Disarms an unconsumed force on drop.
@@ -74,24 +43,8 @@ impl Drop for Forced {
     }
 }
 
-/// The next holder on this thread parks on `gate` inside its unlocked wait, before its platform
-/// wait.
-pub(crate) fn park_in_unlocked_wait(gate: ParkGate) -> Forced {
-    PARK.with(|p| *p.borrow_mut() = Some(gate));
-    Forced(|| PARK.with(|p| *p.borrow_mut() = None))
-}
-
-pub(super) fn park_if_armed() {
-    if let Some(gate) = PARK.with(|p| p.borrow_mut().take()) {
-        // A closed channel means the test is gone: carry on rather than hang.
-        _ = gate.reached.send(());
-        _ = gate.release.recv();
-    }
-}
-
-/// This thread's next `wait`, `wait_deadline` or `try_wait` that reaps parks on `gate` once the
+/// This thread's next `wait` that reaps parks on `gate` once the
 /// `E` write is done and the lock is released, before it returns.
-#[cfg(unix)]
 pub(crate) fn park_after_reap_recorded_on(gate: ParkGate) -> Forced {
     PARK_AFTER_REAP.with(|p| *p.borrow_mut() = Some(gate));
     Forced(|| PARK_AFTER_REAP.with(|p| *p.borrow_mut() = None))
@@ -103,17 +56,6 @@ pub(super) fn park_after_reap_recorded() {
         _ = gate.reached.send(());
         _ = gate.release.recv();
     }
-}
-
-/// The next holder on this thread gets `wait` from its unlocked wait instead of the platform
-/// wait.
-pub(crate) fn force_unlocked_wait(wait: ForcedWait) -> Forced {
-    FORCED_WAIT.with(|f| f.set(Some(wait)));
-    Forced(|| FORCED_WAIT.with(|f| f.set(None)))
-}
-
-pub(super) fn take_forced_unlocked_wait() -> Option<ForcedWait> {
-    FORCED_WAIT.with(Cell::take)
 }
 
 /// The next holder on this thread panics just after `relock()`, while it holds the lock: which
@@ -150,19 +92,7 @@ pub(super) fn before_condvar_block(remaining: Option<std::time::Duration>) {
     }
 }
 
-/// The next `adopt` on this thread fails its `DuplicateHandle` with `ERROR_ACCESS_DENIED`.
-#[cfg(windows)]
-pub(crate) fn force_duplicate_handle_error_once() -> Forced {
-    FORCE_DUPLICATE_HANDLE_ERROR.with(|f| f.set(true));
-    Forced(|| FORCE_DUPLICATE_HANDLE_ERROR.with(|f| f.set(false)))
-}
-
-#[cfg(windows)]
-pub(super) fn take_forced_duplicate_handle_error() -> bool {
-    FORCE_DUPLICATE_HANDLE_ERROR.with(Cell::take)
-}
-
-/// Run on any thread whose lock of a `SharedChild` finds it held, before it blocks.
+/// Run on any thread whose lock of a `OwnedChild` finds it held, before it blocks.
 #[cfg(unix)]
 type ContendedHook = Box<dyn Fn() + Send>;
 
@@ -184,7 +114,7 @@ impl Drop for ContendedArmed {
     }
 }
 
-/// Run `hook` each time a thread's lock of a `SharedChild` finds it held, just before that thread
+/// Run `hook` each time a thread's lock of a `OwnedChild` finds it held, just before that thread
 /// blocks on it: proof the thread has not got past the lock.
 #[cfg(unix)]
 pub(crate) fn on_lock_contended(hook: impl Fn() + Send + 'static) -> ContendedArmed {
