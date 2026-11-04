@@ -189,13 +189,16 @@ fn open_fds() -> usize {
     std::fs::read_dir("/proc/self/fd").expect("read /proc/self/fd").count()
 }
 
-/// A wait round registers the pidfd the process already holds: it opens no descriptor of its own,
-/// so a wait does not fail with `EMFILE` where the held pidfd alone would not.
+/// A wait round opens no process descriptor of its own (no `pidfd_open`): the one descriptor it adds
+/// is a duplicate of the pidfd the process already holds, which is what lets waits on one process
+/// run at once (the reactor takes one registration per descriptor).
 ///
-/// Mutant: register a duplicate of the pidfd, which is one more open descriptor for the round.
+/// Mutant: open a pidfd for the round, which is a second added descriptor. Mutant: register the
+/// held pidfd itself, which adds none (and fails a second concurrent wait; see
+/// `async_foreign_concurrent_waits_both_resolve_on_exit`).
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn a_wait_round_opens_no_descriptor() {
+fn a_wait_round_adds_only_a_duplicate_of_the_held_pidfd() {
     use crate::os_process::open;
     use crate::test_child::held_contained_blocker_without_cgroup;
 
@@ -214,7 +217,7 @@ fn a_wait_round_opens_no_descriptor() {
         );
         open_fds()
     });
-    assert_eq!(during, before, "the round registered a descriptor of its own");
+    assert_eq!(during, before + 1, "the round adds exactly one descriptor, a duplicate");
     drop(stdin);
     child.wait().expect("reap the blocker");
 }

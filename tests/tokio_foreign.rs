@@ -54,6 +54,38 @@ async fn async_foreign_wait_timeout_observes_an_exit() {
     common::assert_killed("the killed child", child.wait().expect("reap"));
 }
 
+/// Two waits pending at once on one handle (`&self`, so `select!`, `join!` and shared `Arc`s all
+/// reach it) both resolve on the exit. Mutant: each wait registers the one held descriptor itself,
+/// so the second registration fails (Linux) or displaces the first's wake (macOS).
+#[cfg(feature = "tokio")]
+#[skuld::test]
+async fn async_foreign_concurrent_waits_both_resolve_on_exit() {
+    use std::future::{poll_fn, Future};
+    use std::pin::pin;
+    use std::task::Poll;
+    use std::time::Duration;
+
+    let (child, sock) = common::spawn_blocker();
+    let p = Process::open_pid(child.id().pid()).expect("open").expect("running");
+    // 30 s is the failure bound of the exit this test causes, not a synchronisation delay.
+    let mut first = pin!(p.wait());
+    let mut second = pin!(p.wait_timeout(Duration::from_secs(30)));
+    // Both are registered and pending before the kill.
+    poll_fn(|cx| {
+        assert!(first.as_mut().poll(cx).is_pending(), "a live process waits");
+        assert!(second.as_mut().poll(cx).is_pending(), "a live process waits");
+        Poll::Ready(())
+    })
+    .await;
+    child.kill().expect("kill");
+    // Released after the kill: a kill that sent nothing exits 0.
+    drop(sock);
+    let (first, second) = ::tokio::join!(first, second);
+    first.expect("the first wait resolves on the real exit");
+    assert!(second.expect("the second wait"), "the second wait sees the exit");
+    common::assert_killed("the killed child", child.wait().expect("reap"));
+}
+
 #[cfg(feature = "tokio")]
 #[skuld::test]
 async fn async_foreign_introspection_delegates() {

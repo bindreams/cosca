@@ -100,30 +100,36 @@ async fn wait(wait_for: &WaitFor<'_>, deadline: Option<std::time::Instant>) -> R
 }
 
 /// Resolve when `wait_for` wakes, with no bound of its own.
+///
+/// The round registers a duplicate of the held descriptor, not the descriptor itself: waits on
+/// one open process run at the same time, and the reactor takes one registration per descriptor
+/// (epoll refuses a second with `EEXIST`; a kqueue's two registrations would displace each
+/// other's wake). A duplicate shares the open file description, so readiness is shared and nothing
+/// is consumed; it opens no new process descriptor.
 #[cfg(unix)]
 async fn watch(wait_for: &WaitFor<'_>) -> Result<(), Error> {
-    match wait_for {
-        #[cfg(target_os = "linux")]
-        WaitFor::Readable(fd) => crate::tokio::wait::watch_pidfd(*fd).await,
-        #[cfg(target_os = "macos")]
-        WaitFor::Readable(fd) => {
-            use std::os::fd::AsFd;
+    let WaitFor::Readable(held) = wait_for;
+    let fd = held.try_clone_to_owned().map_err(Error::Io)?;
+    #[cfg(target_os = "linux")]
+    return crate::tokio::wait::watch_pidfd(fd).await;
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsFd;
 
-            use ::tokio::io::unix::AsyncFd;
-            use ::tokio::io::Interest;
+        use ::tokio::io::unix::AsyncFd;
+        use ::tokio::io::Interest;
 
-            use crate::tokio::wait::watch_readable;
+        use crate::tokio::wait::watch_readable;
 
-            let afd = AsyncFd::with_interest(*fd, Interest::READABLE).map_err(Error::Io)?;
-            // Readiness is only a hint; the poll look decides, reads nothing, and clears the
-            // readiness on a false positive so the next wake waits again.
-            watch_readable(&afd, |fd| {
-                crate::os_process::poll::is_readable(fd.as_fd())
-                    .map(|readable| readable.then_some(()))
-                    .map_err(Error::Io)
-            })
-            .await
-        }
+        let afd = AsyncFd::with_interest(fd, Interest::READABLE).map_err(Error::Io)?;
+        // Readiness is only a hint; the poll look decides, reads nothing, and clears the
+        // readiness on a false positive so the next wake waits again.
+        watch_readable(&afd, |fd| {
+            crate::os_process::poll::is_readable(fd.as_fd())
+                .map(|readable| readable.then_some(()))
+                .map_err(Error::Io)
+        })
+        .await
     }
 }
 
