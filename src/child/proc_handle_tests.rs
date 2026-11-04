@@ -30,8 +30,8 @@ fn any_other_kill_error_also_never_blocks() {
 /// the handle recorded can say `Reaped`.
 #[cfg(unix)]
 fn reaped(h: &ProcHandle) -> bool {
-    let _running = crate::wait::exit_only::seams::force_peek_once(Ok(crate::wait::exit_only::Peek::Running));
-    matches!(h.state(), crate::signal::RootState::Reaped)
+    let _running = crate::wait::exit_only::seams::force_peek_once(Ok(crate::os_process::child::PeekOutcome::Running));
+    matches!(h.state(), crate::signal::RootState::Reaped { .. })
 }
 
 // A kill alone is not a reap: a zombie still pins its number.

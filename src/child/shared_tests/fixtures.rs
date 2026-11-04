@@ -87,7 +87,7 @@ pub(super) fn confirm_exit(shared: &SharedChild) {
         let target = shared.target().expect("a pidfd");
         let peeked = crate::wait::exit_only::wait_visible_exit(&target).expect("wait for the exit");
         assert!(
-            matches!(peeked, crate::wait::exit_only::Peek::Exit(_)),
+            matches!(peeked, crate::os_process::child::PeekOutcome::Exit(_)),
             "the exit must be visible, got {peeked:?}"
         );
     }
@@ -161,7 +161,7 @@ pub(super) fn assert_adoption_is_gone<G>(arm: impl FnOnce() -> G) {
     assert!(is_echild(&shared.try_wait().expect_err("try_wait")));
     assert!(is_echild(&shared.wait_deadline(far).expect_err("wait_deadline")));
     assert!(
-        matches!(shared.state(), crate::signal::RootState::Reaped),
+        matches!(shared.state(), crate::signal::RootState::Reaped { .. }),
         "a child that was gone at adoption holds no handle: its root is reaped"
     );
     let log = crate::send_log::Capture::start();

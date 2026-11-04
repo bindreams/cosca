@@ -7,7 +7,8 @@ use std::os::windows::io::{AsRawHandle, BorrowedHandle};
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::WaitForSingleObject;
 
-use super::{Peek, Reap, Reaped, Target};
+use super::{Reap, Target};
+use crate::os_process::child::{ExitRecord, PeekOutcome};
 
 fn handle<'a>(target: &Target<'a>) -> BorrowedHandle<'a> {
     match target {
@@ -21,14 +22,14 @@ pub(crate) fn exit_status(h: BorrowedHandle<'_>) -> io::Result<std::process::Exi
     crate::child::spawn::windows_raw::exit_status(HANDLE(h.as_raw_handle()))
 }
 
-pub(super) fn peek(target: &Target<'_>) -> io::Result<Peek> {
+pub(super) fn peek(target: &Target<'_>) -> io::Result<PeekOutcome> {
     let h = handle(target);
     // SAFETY: `h` is a live process handle borrowed for the call; a zero timeout polls.
     let r = unsafe { WaitForSingleObject(HANDLE(h.as_raw_handle()), 0) };
     if r == WAIT_OBJECT_0 {
-        Ok(Peek::Exit(Reaped::Status(exit_status(h)?)))
+        Ok(PeekOutcome::Exit(ExitRecord::Status(exit_status(h)?)))
     } else if r == WAIT_TIMEOUT {
-        Ok(Peek::Running)
+        Ok(PeekOutcome::Running)
     } else {
         Err(io::Error::last_os_error())
     }
@@ -36,7 +37,7 @@ pub(super) fn peek(target: &Target<'_>) -> io::Result<Peek> {
 
 pub(super) fn try_reap(target: &Target<'_>) -> io::Result<Reap> {
     match peek(target)? {
-        Peek::Exit(reaped) => {
+        PeekOutcome::Exit(reaped) => {
             #[cfg(test)]
             if let Some(forced) = super::seams::take_forced_reap() {
                 return match forced {
@@ -46,7 +47,7 @@ pub(super) fn try_reap(target: &Target<'_>) -> io::Result<Reap> {
             }
             Ok(Reap::Reaped(reaped))
         }
-        Peek::Running => Ok(Reap::Running),
-        Peek::Foreign(f) => Ok(Reap::Foreign(f)),
+        PeekOutcome::Running => Ok(Reap::Running),
+        PeekOutcome::Foreign(f) => Ok(Reap::Foreign(f)),
     }
 }

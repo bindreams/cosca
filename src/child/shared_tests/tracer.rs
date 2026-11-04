@@ -90,10 +90,10 @@ mod macos {
     use super::super::fixtures::Blocker;
     use crate::child::shared::State;
     use crate::identity::{uniq_fault, ReadPurpose, UniqRead};
+    use crate::os_process::child::ExitRecord;
     use crate::test_child::{run_fixture_output_within, step, watchdog};
     use crate::test_groups::{tracer_group, Group};
     use crate::test_support::tracer::{attach_settled, debugger_signed_copy, settled_stop, AttachError};
-    use crate::wait::exit_only::Reaped;
 
     const MARKER: &str = "COSCA_TEST_SHARED_TRACER";
 
@@ -248,7 +248,7 @@ mod macos {
         kill_stopped(&b);
         assert_killed(b.shared.wait().expect("wait"));
         assert!(
-            matches!(b.shared.lock().state, State::E(Reaped::Status(_))),
+            matches!(b.shared.lock().state, State::E(ExitRecord::Status(_))),
             "the first reap's status is cached"
         );
         assert_eq!(crate::log_capture::levels_since(mark, &marker), vec![log::Level::Warn]);

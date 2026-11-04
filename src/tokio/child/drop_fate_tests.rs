@@ -362,11 +362,11 @@ async fn reaped_is_reported_only_for_a_status_that_was_collected() {
 #[cfg(target_os = "macos")]
 #[skuld::test]
 async fn macos_an_orphaned_child_at_drop_is_gone() {
-    use crate::wait::exit_only::{Foreign, Peek};
+    use crate::os_process::child::{Foreign, PeekOutcome};
     crate::tokio::test_runtime::assert_current_thread();
     let (mut child, writer) = live(false);
     let id = child.id();
-    let looks = force_peeks((0..4).map(|_| Ok(Peek::Foreign(Foreign::Orphaned))));
+    let looks = force_peeks((0..4).map(|_| Ok(PeekOutcome::Foreign(Foreign::Orphaned))));
     let fate = child.tear_down_now();
     drop(looks);
     collect(id, writer);

@@ -12,6 +12,7 @@ use crate::error::Error;
 use crate::identity::ProcessId;
 use crate::signal::{Sent, Sig};
 
+pub(crate) mod child;
 pub(crate) mod drive;
 #[cfg(test)]
 pub(crate) mod fake;

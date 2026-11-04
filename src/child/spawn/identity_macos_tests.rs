@@ -640,14 +640,14 @@ fn macos_attach_failure_teardown_with_a_refused_kill_leaves_the_child_and_reaps_
 /// kill and the reap warn separately.
 #[skuld::test]
 fn macos_attach_failure_teardown_of_an_orphaned_child_is_gone_and_warns() {
-    use crate::wait::exit_only::{Foreign, Peek};
+    use crate::os_process::child::{Foreign, PeekOutcome};
 
     crate::log_capture::install();
     let (child, _stdin, unique) = std_blocker_with_unique();
     let pid = child.id();
     let mark = crate::log_capture::mark();
     let _refused = refuse_the_kill();
-    let _orphaned = force_peek_once(Ok(Peek::Foreign(Foreign::Orphaned)));
+    let _orphaned = force_peek_once(Ok(PeekOutcome::Foreign(Foreign::Orphaned)));
     let fate = teardown(child, unique);
     crate::wait::exit_only::seams::assert_peeks_exhausted();
     assert_eq!(fate, crate::error::ChildFate::Gone, "a launchd-held zombie is gone");
@@ -788,13 +788,13 @@ fn macos_attach_failure_teardown_does_not_reap_a_pid_reused_after_the_wait() {
 /// `Gone` (the fate of a child cosca delivered nothing to).
 #[skuld::test]
 fn macos_attach_failure_teardown_of_an_orphaned_zombie_after_the_kill_is_killed_and_warns() {
-    use crate::wait::exit_only::{Foreign, Peek};
+    use crate::os_process::child::{Foreign, PeekOutcome};
 
     crate::log_capture::install();
     let (child, _stdin, unique) = std_blocker_with_unique();
     let pid = child.id();
     let mark = crate::log_capture::mark();
-    let _orphaned = force_peek_once(Ok(Peek::Foreign(Foreign::Orphaned)));
+    let _orphaned = force_peek_once(Ok(PeekOutcome::Foreign(Foreign::Orphaned)));
     let fate = teardown(child, unique);
     crate::wait::exit_only::seams::assert_peeks_exhausted();
     assert_eq!(
@@ -816,12 +816,12 @@ fn macos_attach_failure_teardown_of_an_orphaned_zombie_after_the_kill_is_killed_
 /// Mutant: the `Waited::Gone` arm of `kill_and_reap_verified` answers `Gone`.
 #[skuld::test]
 fn macos_attach_failure_teardown_of_a_child_reaped_elsewhere_after_the_kill_is_killed() {
-    use crate::wait::exit_only::{Foreign, Peek};
+    use crate::os_process::child::{Foreign, PeekOutcome};
 
     crate::log_capture::install();
     let (child, _stdin, unique) = std_blocker_with_unique();
     let pid = child.id();
-    let _reaped = force_peek_once(Ok(Peek::Foreign(Foreign::Gone)));
+    let _reaped = force_peek_once(Ok(PeekOutcome::Foreign(Foreign::Gone)));
     let fate = teardown(child, unique);
     assert_eq!(fate, crate::error::ChildFate::Killed);
     // The kill was delivered; the zombie is the test's to collect.

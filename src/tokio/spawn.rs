@@ -871,9 +871,9 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
         forgot = child.forget_for(&view);
         // Nothing was signalled, so a launchd-held zombie is `Gone`, as the classifier has it.
         #[cfg(target_os = "macos")]
-        let fate = crate::wait::exit_only::Foreign::Orphaned.fate(false);
+        let fate = crate::os_process::child::Foreign::Orphaned.fate(false);
         #[cfg(not(target_os = "macos"))]
-        let fate = crate::wait::exit_only::Foreign::Gone.fate(false);
+        let fate = crate::os_process::child::Foreign::Gone.fate(false);
         (
             format!(
                 "the elevated child was left alone, neither signalled nor waited on: {}",
@@ -986,7 +986,7 @@ impl crate::child::spawn::pidfd_handshake::Spawned for ::tokio::process::Child {
             }
             Err(e) => {
                 log::debug!("{}: reaped by someone else ({e})", crate::child::spawn::named(pid));
-                crate::wait::exit_only::Foreign::Gone.fate(delivered)
+                crate::os_process::child::Foreign::Gone.fate(delivered)
             }
         }
     }

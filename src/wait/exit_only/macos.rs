@@ -7,7 +7,8 @@ use std::io;
 
 use crate::identity::{held_by, uniq_info, Held, ReadPurpose, UniqRead, LAUNCHD};
 
-use super::{is_exit_record, reaped_from_record, Foreign, Peek, Reap, Record, Target};
+use super::{is_exit_record, reaped_from_record, Reap, Record, Target};
+use crate::os_process::child::{Foreign, PeekOutcome};
 
 fn pid_and_unique(target: &Target<'_>) -> (u32, Option<u64>) {
     match target {
@@ -45,15 +46,15 @@ fn is_echild(e: &io::Error) -> bool {
 }
 
 /// The non-consuming look: `waitid(WEXITED | WNOHANG | WNOWAIT)`, with no start check.
-fn peek_raw(pid: u32) -> io::Result<Peek> {
+fn peek_raw(pid: u32) -> io::Result<PeekOutcome> {
     #[cfg(test)]
     if let Some(forced) = super::seams::take_forced_peek() {
         return forced;
     }
     match waitid_record(pid, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT) {
-        Ok(Some(record)) if is_exit_record(record.si_code) => Ok(Peek::Exit(reaped_from_record(record))),
-        Ok(_) => Ok(Peek::Running),
-        Err(e) if is_echild(&e) => Ok(Peek::Foreign(Foreign::Gone)),
+        Ok(Some(record)) if is_exit_record(record.si_code) => Ok(PeekOutcome::Exit(reaped_from_record(record))),
+        Ok(_) => Ok(PeekOutcome::Running),
+        Err(e) if is_echild(&e) => Ok(PeekOutcome::Foreign(Foreign::Gone)),
         Err(e) => Err(e),
     }
 }
@@ -76,28 +77,28 @@ fn check_unique(pid: u32, unique: u64, purpose: ReadPurpose) -> IdCheck {
     }
 }
 
-pub(super) fn peek(target: &Target<'_>) -> io::Result<Peek> {
+pub(super) fn peek(target: &Target<'_>) -> io::Result<PeekOutcome> {
     peek_with(target, false)
 }
 
 /// [`peek`]; with `verified`, a `Running` child whose id cannot be read is an error.
-pub(super) fn peek_with(target: &Target<'_>, verified: bool) -> io::Result<Peek> {
+pub(super) fn peek_with(target: &Target<'_>, verified: bool) -> io::Result<PeekOutcome> {
     peek_holder(target, verified).map(|(peeked, _)| peeked)
 }
 
 /// [`peek_with`], and the tracer that holds the child when the verdict is `Running` because a
 /// process other than this one and launchd holds it.
-pub(super) fn peek_holder(target: &Target<'_>, verified: bool) -> io::Result<(Peek, Option<u32>)> {
+pub(super) fn peek_holder(target: &Target<'_>, verified: bool) -> io::Result<(PeekOutcome, Option<u32>)> {
     let (pid, unique) = pid_and_unique(target);
     let peeked = peek_raw(pid)?;
     let Some(unique) = unique else {
         return Ok((peeked, None));
     };
     match peeked {
-        Peek::Exit(_) => match check_unique(pid, unique, ReadPurpose::Peek) {
+        PeekOutcome::Exit(_) => match check_unique(pid, unique, ReadPurpose::Peek) {
             IdCheck::Matches => Ok((peeked, None)),
-            IdCheck::Other => Ok((Peek::Foreign(Foreign::Other), None)),
-            IdCheck::Gone => Ok((Peek::Foreign(Foreign::Gone), None)),
+            IdCheck::Other => Ok((PeekOutcome::Foreign(Foreign::Other), None)),
+            IdCheck::Gone => Ok((PeekOutcome::Foreign(Foreign::Gone), None)),
             // The read was refused (a MACF denial): an exit that cannot be tied to the child is not
             // consumed by a bare pid. The errno stays in the error, so `EPERM` stays
             // `PermissionDenied`.
@@ -108,11 +109,11 @@ pub(super) fn peek_holder(target: &Target<'_>, verified: bool) -> io::Result<(Pe
         },
         // `waitid` found a child of ours that has not exited. A foreign reap followed by a reuse
         // of the pid by another child of ours also looks like this, so the id decides.
-        Peek::Running => match check_unique(pid, unique, ReadPurpose::Running) {
-            IdCheck::Other => Ok((Peek::Foreign(Foreign::Other), None)),
+        PeekOutcome::Running => match check_unique(pid, unique, ReadPurpose::Running) {
+            IdCheck::Other => Ok((PeekOutcome::Foreign(Foreign::Other), None)),
             // `waitid` found the child running and the id read finds no such process: it was
             // reaped in between, so nothing is left to call running.
-            IdCheck::Gone => Ok((Peek::Foreign(Foreign::Gone), None)),
+            IdCheck::Gone => Ok((PeekOutcome::Foreign(Foreign::Gone), None)),
             IdCheck::Matches => Ok((peeked, None)),
             IdCheck::Unreadable(_) if !verified => Ok((peeked, None)),
             IdCheck::Unreadable(errno) => Err(io::Error::new(
@@ -135,12 +136,12 @@ pub(super) fn peek_holder(target: &Target<'_>, verified: bool) -> io::Result<(Pe
         // if that hand-back ever comes; the tokio backend forgets it. A spawn that meets it fails
         // with its child `Gone`, and its child (dropped or forgotten) is not reaped by pid, so a
         // hand-back leaves the zombie.
-        Peek::Foreign(Foreign::Gone) => match held_by(pid, unique, ReadPurpose::Echild) {
-            Held::Other => Ok((Peek::Foreign(Foreign::Other), None)),
-            Held::Parent(ppid) if ppid == LAUNCHD => Ok((Peek::Foreign(Foreign::Orphaned), None)),
+        PeekOutcome::Foreign(Foreign::Gone) => match held_by(pid, unique, ReadPurpose::Echild) {
+            Held::Other => Ok((PeekOutcome::Foreign(Foreign::Other), None)),
+            Held::Parent(ppid) if ppid == LAUNCHD => Ok((PeekOutcome::Foreign(Foreign::Orphaned), None)),
             // A tracer detached between the two reads: our child again.
-            Held::Parent(ppid) if ppid == std::process::id() => Ok((Peek::Running, None)),
-            Held::Parent(tracer) => Ok((Peek::Running, Some(tracer))),
+            Held::Parent(ppid) if ppid == std::process::id() => Ok((PeekOutcome::Running, None)),
+            Held::Parent(tracer) => Ok((PeekOutcome::Running, Some(tracer))),
             // `ESRCH` with `arg = 1` is a reap: a process resolves from `P_REF_DEAD` until then.
             Held::Gone => Ok((peeked, None)),
             // A MACF denial: not ours to see. A caller that treats `Running` as "this is our
@@ -151,7 +152,7 @@ pub(super) fn peek_holder(target: &Target<'_>, verified: bool) -> io::Result<(Pe
                 format!("pid {pid}: its identity could not be read (errno {errno}); it cannot be shown to be reaped"),
             )),
         },
-        Peek::Foreign(Foreign::Other | Foreign::Orphaned) => Ok((peeked, None)),
+        PeekOutcome::Foreign(Foreign::Other | Foreign::Orphaned) => Ok((peeked, None)),
     }
 }
 
@@ -170,9 +171,9 @@ fn consume(pid: u32) -> io::Result<Option<Record>> {
 pub(super) fn try_reap(target: &Target<'_>) -> io::Result<Reap> {
     let (pid, unique) = pid_and_unique(target);
     match peek(target)? {
-        Peek::Exit(_) => {}
-        Peek::Running => return Ok(Reap::Running),
-        Peek::Foreign(f) => return Ok(Reap::Foreign(f)),
+        PeekOutcome::Exit(_) => {}
+        PeekOutcome::Running => return Ok(Reap::Running),
+        PeekOutcome::Foreign(f) => return Ok(Reap::Foreign(f)),
     }
     // Our own zombie's unique id, read before the first reap: the first reap does not change it
     // (`proc_reparentlocked` returns early when the parent is unchanged, `kern_exit.c:3411`),
@@ -207,12 +208,12 @@ pub(crate) fn second_reap(pid: u32, unique: Option<u64>) {
     #[cfg(test)]
     super::seams::step(super::seams::HolderStep::SecondPeek);
     match peek_raw(pid) {
-        Ok(Peek::Exit(_)) => {}
-        Ok(Peek::Running) => {
+        Ok(PeekOutcome::Exit(_)) => {}
+        Ok(PeekOutcome::Running) => {
             log::debug!("second reap of pid {pid}: nothing to consume");
             return;
         }
-        Ok(Peek::Foreign(_)) => {
+        Ok(PeekOutcome::Foreign(_)) => {
             log::debug!("second reap of pid {pid}: already reaped elsewhere");
             return;
         }

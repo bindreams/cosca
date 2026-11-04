@@ -109,7 +109,7 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
 /// its handle like any other, and the tree kills named by its number are skipped, as for a reaped
 /// root. A root this process does not pin (`RootState::Unpinned`, macOS) is left alone: neither
 /// signalled nor waited on, and the error says so; its fate is `Gone`, as the classifier
-/// ([`Foreign::fate`](crate::wait::exit_only::Foreign::fate)) gives a zombie launchd holds. The event
+/// ([`Foreign::fate`](crate::os_process::child::Foreign::fate)) gives a zombie launchd holds. The event
 /// warns once: the unsettled root, a failed reap and any other leftover share one record, labelled
 /// `finish_elevated`.
 ///
@@ -162,9 +162,9 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     let (root_note, fate) = if view.unpinned_root() {
         // Nothing was signalled, so a launchd-held zombie is `Gone`, as the classifier has it.
         #[cfg(target_os = "macos")]
-        let fate = crate::wait::exit_only::Foreign::Orphaned.fate(false);
+        let fate = crate::os_process::child::Foreign::Orphaned.fate(false);
         #[cfg(not(target_os = "macos"))]
-        let fate = crate::wait::exit_only::Foreign::Gone.fate(false);
+        let fate = crate::os_process::child::Foreign::Gone.fate(false);
         (
             format!(
                 "the elevated child was left alone, neither signalled nor waited on: {}",
@@ -965,7 +965,7 @@ impl LateTree {
                 let check = || {
                     let target = crate::wait::exit_only::Target::pid(pid, Some(unique));
                     let state = crate::signal::RootState::of_peek(crate::wait::exit_only::peek_verified(&target));
-                    crate::child::tree_call::group_number_holds(pid, (state, false))
+                    crate::child::tree_call::group_number_holds(pid, state)
                 };
                 let result = match attached.hard_kill_report(&crate::containment::GroupRoot::new(None, &check)) {
                     (Err(e), _) => Err(e.to_string()),
@@ -1096,8 +1096,8 @@ fn kill_and_reap_noting(
     breach: &mut Option<String>,
     after_kill: impl FnOnce(bool),
 ) -> (ChildFate, KillOutcome) {
+    use crate::os_process::child::Foreign;
     use crate::signal::{via_verified_pid, Sent, Sig};
-    use crate::wait::exit_only::Foreign;
     use crate::wait::macos::Waited;
 
     let target = crate::wait::exit_only::Target::pid(pid, Some(unique));
@@ -1266,7 +1266,8 @@ fn reap_verified(
     notes: &mut Vec<String>,
     breach: &mut Option<String>,
 ) -> ChildFate {
-    use crate::wait::exit_only::{peek_verified, try_reap, Foreign, Peek, Reap, Reaped};
+    use crate::os_process::child::{ExitRecord, Foreign, PeekOutcome};
+    use crate::wait::exit_only::{peek_verified, try_reap, Reap};
 
     let foreign = |why: Foreign, notes: &mut Vec<String>| {
         match why {
@@ -1280,17 +1281,17 @@ fn reap_verified(
             notes.push(unverifiable(&e));
             return ChildFate::Unknown;
         }
-        Ok(Peek::Foreign(why)) => return foreign(why, notes),
-        Ok(Peek::Running) => {
+        Ok(PeekOutcome::Foreign(why)) => return foreign(why, notes),
+        Ok(PeekOutcome::Running) => {
             notes.push("is still running".to_owned());
             return ChildFate::Running { id };
         }
-        Ok(Peek::Exit(_)) => {}
+        Ok(PeekOutcome::Exit(_)) => {}
     }
     match try_reap(target) {
-        Ok(Reap::Reaped(Reaped::Status(_))) => ChildFate::Reaped,
+        Ok(Reap::Reaped(ExitRecord::Status(_))) => ChildFate::Reaped,
         // The consuming `waitid` collected the zombie, whatever it reported.
-        Ok(Reap::Reaped(Reaped::Unreadable { si_code })) => {
+        Ok(Reap::Reaped(ExitRecord::Unreadable { si_code })) => {
             notes.push(format!(
                 "a consuming waitid returned si_code {si_code}, not an exit record"
             ));
@@ -2059,23 +2060,23 @@ pub(crate) fn resolve_identity(
     fault::run_at(fault::SpawnPoint::AfterIdentityRead, pid);
     #[cfg(unix)]
     {
-        use crate::wait::exit_only::Peek;
+        use crate::os_process::child::PeekOutcome;
         #[cfg(target_os = "linux")]
         let peeked = crate::wait::exit_only::peek(through);
         #[cfg(target_os = "macos")]
         let peeked = crate::wait::exit_only::peek_verified(through);
         match peeked {
-            Ok(Peek::Running | Peek::Exit(_)) => (read, Diagnosis::default()),
+            Ok(PeekOutcome::Running | PeekOutcome::Exit(_)) => (read, Diagnosis::default()),
             // macOS: held by launchd after its tracer died. It has exited and is not ours to reap, so it
             // is `Gone`, with a warning that its zombie is not collected.
             #[cfg(target_os = "macos")]
-            Ok(Peek::Foreign(crate::wait::exit_only::Foreign::Orphaned)) => (
+            Ok(PeekOutcome::Foreign(crate::os_process::child::Foreign::Orphaned)) => (
                 Resolved::Gone,
                 Diagnosis::of(format!(
                     "child {pid}: launchd holds its zombie, so its tracer died; it is not ours to reap"
                 )),
             ),
-            Ok(Peek::Foreign(_)) => (Resolved::Gone, Diagnosis::default()),
+            Ok(PeekOutcome::Foreign(_)) => (Resolved::Gone, Diagnosis::default()),
             Err(e) => (
                 Resolved::Unknown,
                 Diagnosis::of(format!(
@@ -2307,16 +2308,17 @@ impl Unadopted for PidfdChild {
         self.delivered
     }
     fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
-        use crate::wait::exit_only::{try_reap, Reap, Reaped};
+        use crate::os_process::child::ExitRecord;
+        use crate::wait::exit_only::{try_reap, Reap};
         if self.reaped.is_some() {
             return Ok(self.reaped);
         }
         match try_reap(&self.target())? {
-            Reap::Reaped(Reaped::Status(status)) => {
+            Reap::Reaped(ExitRecord::Status(status)) => {
                 self.reaped = Some(status);
                 Ok(Some(status))
             }
-            Reap::Reaped(Reaped::Unreadable { si_code }) => Err(std::io::Error::new(
+            Reap::Reaped(ExitRecord::Unreadable { si_code }) => Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("the child's exit record was unreadable (si_code {si_code})"),
             )),
@@ -2325,16 +2327,17 @@ impl Unadopted for PidfdChild {
         }
     }
     fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        use crate::wait::exit_only::{reap_blocking, Reaped};
+        use crate::os_process::child::ExitRecord;
+        use crate::wait::exit_only::reap_blocking;
         if let Some(status) = self.reaped {
             return Ok(status);
         }
         match reap_blocking(&self.target())? {
-            Ok(Reaped::Status(status)) => {
+            Ok(ExitRecord::Status(status)) => {
                 self.reaped = Some(status);
                 Ok(status)
             }
-            Ok(Reaped::Unreadable { si_code }) => Err(std::io::Error::new(
+            Ok(ExitRecord::Unreadable { si_code }) => Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("the child's exit record was unreadable (si_code {si_code})"),
             )),
@@ -2723,15 +2726,16 @@ fn teardown_through_pidfd_noting(
     warn: impl SlowWait,
     why: &mut Diagnosis,
 ) -> ChildFate {
-    use crate::wait::exit_only::{peek, Peek};
+    use crate::os_process::child::PeekOutcome;
+    use crate::wait::exit_only::peek;
 
     let child = PidfdChild::new(pid, pidfd);
     match peek(&child.target()) {
-        Ok(Peek::Foreign(why)) => {
+        Ok(PeekOutcome::Foreign(why)) => {
             log::debug!("{}: already collected when its spawn failed", named(pid));
             return why.fate(false);
         }
-        Ok(Peek::Exit(_) | Peek::Running) => {}
+        Ok(PeekOutcome::Exit(_) | PeekOutcome::Running) => {}
         // `waitid` on a pidfd of this process's own child answers or says `ECHILD`.
         Err(e) => {
             log::warn!(
@@ -2811,7 +2815,7 @@ fn teardown_unadopted_noting(
         Err(reap) if reap.raw_os_error() == Some(libc::ECHILD) => {
             log::debug!("spawn teardown: {} was reaped by someone else", named(child.pid()));
             // The kill went first: delivered, it is `Killed`; found nothing to signal, `Gone`.
-            crate::wait::exit_only::Foreign::Gone.fate(child.kill_delivered())
+            crate::os_process::child::Foreign::Gone.fate(child.kill_delivered())
         }
         Err(reap) => {
             log::warn!(

@@ -239,14 +239,14 @@ mod macos {
 // The root's state from a peek =====
 
 mod root_state {
+    use crate::os_process::child::{Foreign, PeekOutcome};
     use crate::signal::RootState;
-    use crate::wait::exit_only::{Foreign, Peek};
 
     /// Mutant: a reap by someone else is `Unknown`.
     #[skuld::test]
     fn a_foreign_reap_is_reaped() {
-        let state = RootState::of_peek(Ok(Peek::Foreign(Foreign::Gone)));
-        assert!(matches!(state, RootState::Reaped), "{state:?}");
+        let state = RootState::of_peek(Ok(PeekOutcome::Foreign(Foreign::Gone)));
+        assert!(matches!(state, RootState::Reaped { own: false }), "{state:?}");
     }
 
     /// A running child is ours to act on.
@@ -254,7 +254,7 @@ mod root_state {
     /// Mutant: `Running` is `Unknown`, or `Reaped`.
     #[skuld::test]
     fn a_running_peek_is_unreaped() {
-        let state = RootState::of_peek(Ok(Peek::Running));
+        let state = RootState::of_peek(Ok(PeekOutcome::Running));
         assert!(matches!(state, RootState::Unreaped), "{state:?}");
     }
 
@@ -263,8 +263,8 @@ mod root_state {
     /// Mutant: `Exit` is `Reaped`.
     #[skuld::test]
     fn an_exit_record_peek_is_unreaped() {
-        let exit = crate::wait::exit_only::Reaped::Status(std::os::unix::process::ExitStatusExt::from_raw(0));
-        let state = RootState::of_peek(Ok(Peek::Exit(exit)));
+        let exit = crate::os_process::child::ExitRecord::Status(std::os::unix::process::ExitStatusExt::from_raw(0));
+        let state = RootState::of_peek(Ok(PeekOutcome::Exit(exit)));
         assert!(matches!(state, RootState::Unreaped), "{state:?}");
     }
 
@@ -283,10 +283,9 @@ mod root_state {
     /// An orphaned zombie (held by launchd) is `Unpinned`.
     ///
     /// Mutants: `Orphaned` is `Reaped`; `Orphaned` is `Unknown` (a root we still pin).
-    #[cfg(target_os = "macos")]
     #[skuld::test]
     fn an_orphaned_zombie_is_unpinned() {
-        let state = RootState::of_peek(Ok(Peek::Foreign(Foreign::Orphaned)));
+        let state = RootState::of_peek(Ok(PeekOutcome::Foreign(Foreign::Orphaned)));
         assert!(matches!(&state, RootState::Unpinned), "{state:?}");
     }
 }
