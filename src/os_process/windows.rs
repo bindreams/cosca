@@ -48,7 +48,8 @@ impl WindowsProcess {
     }
 
     /// The child `pid` that a spawn created, by the handle the spawn returned. That handle carries
-    /// every access, `SYNCHRONIZE` and `PROCESS_TERMINATE` included.
+    /// `SYNCHRONIZE`; it carries `PROCESS_TERMINATE` too unless the spawn was a UAC elevation,
+    /// whose handle may lack it (a kill then fails with the Win32 error).
     pub(crate) fn for_child(handle: OwnedHandle, pid: u32) -> Self {
         Self {
             pid,

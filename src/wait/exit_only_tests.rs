@@ -99,3 +99,30 @@ mod step_hooks {
         seams::holder_steps();
     }
 }
+
+#[cfg(windows)]
+mod windows {
+    use std::os::windows::io::{AsRawHandle, BorrowedHandle};
+
+    use crate::wait::exit_only::{peek, Target};
+
+    /// A wait on our own process handle that fails is a contract breach, not an answer: debug
+    /// builds assert, release builds return the OS error.
+    ///
+    /// Mutant: the `debug_assert!` removed from the failed arm of `peek`.
+    #[skuld::test]
+    fn a_failed_wait_on_our_own_handle_is_a_contract_breach() {
+        let file = std::fs::File::open("NUL").expect("open NUL");
+        let raw = file.as_raw_handle();
+        drop(file);
+        // SAFETY: the handle is closed, which is the point: the wait on it fails. Nothing else in
+        // this process opens a handle between the close and the call.
+        let closed = unsafe { BorrowedHandle::borrow_raw(raw) };
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| peek(&Target::Handle(closed))));
+        if cfg!(debug_assertions) {
+            assert!(outcome.is_err(), "a debug build asserts the contract");
+        } else {
+            outcome.expect("release returns").expect_err("a breach is an error");
+        }
+    }
+}
