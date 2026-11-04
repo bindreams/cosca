@@ -4,16 +4,12 @@ use std::time::{Duration, Instant};
 
 use backon::{BackoffBuilder as _, ExponentialBackoff, ExponentialBuilder};
 
-#[cfg(test)]
-use super::open;
 use super::{Exit, OsProcess, WaitFor};
 use crate::error::Error;
-#[cfg(test)]
-use crate::identity::ProcessId;
 use crate::wait::remaining;
 
-/// What the entry point does before any open or look: the bounded-section assert, then the
-/// watch-fault seam.
+/// What the entry point does before any look: the bounded-section assert, then the watch-fault
+/// seam.
 fn enter() -> Result<(), Error> {
     #[cfg(feature = "tokio")]
     crate::bounded::assert_may_block("waiting for a process to exit");
@@ -24,27 +20,12 @@ fn enter() -> Result<(), Error> {
     Ok(())
 }
 
-/// Block until the process `id` names has exited or `timeout` has passed, and say which.
-/// `Ok(true)` = exited, `Ok(false)` = still running after the deadline's final look; a process that
-/// is gone, or whose pid now names another process, has exited, with no wait. `None` = until exit;
+/// Block until the open process `p` has exited or `timeout` has passed, and say which: `Ok(true)` =
+/// exited, `Ok(false)` = still running after the deadline's final look. `None` = until exit;
 /// `Some(ZERO)` = one look, no blocking call; a `Duration` too large for the clock is unbounded.
-/// Non-reaping. The bounded-section assert, the watch-fault seam and the deadline come before the
-/// open, so the timeout counts from the call and the first two hold for a gone id too. Every
-/// blocking call is armed from the time remaining, read right before it.
-///
-/// Tests only: an owned child is looked at through its own handle, never opened afresh by its number.
-#[cfg(test)]
-pub(crate) fn exited_by_id(id: ProcessId, timeout: Option<Duration>) -> Result<bool, Error> {
-    enter()?;
-    let deadline = absolute(timeout);
-    match open(id)? {
-        None => Ok(true),
-        Some(process) => exited(&*process, deadline),
-    }
-}
-
-/// [`exited_by_id`] for a process already open: `Ok(true)` = exited, `Ok(false)` = still running
-/// after the deadline's final look.
+/// Non-reaping. The bounded-section assert and the watch-fault seam come before the first look, and
+/// the deadline is fixed there, so every blocking call is armed from the time remaining, read right
+/// before it.
 pub(crate) fn exited_held(p: &dyn OsProcess, timeout: Option<Duration>) -> Result<bool, Error> {
     exited_until(p, absolute(timeout))
 }
