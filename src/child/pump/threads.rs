@@ -78,3 +78,7 @@ fn join_bytes(h: Option<thread::ScopedJoinHandle<'_, std::io::Result<Vec<u8>>>>)
         None => Ok(Vec::new()),
     }
 }
+
+#[cfg(test)]
+#[path = "threads_tests.rs"]
+mod threads_tests;
