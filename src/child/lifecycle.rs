@@ -35,12 +35,17 @@ pub(super) fn status_of_outcome(
         ))),
         ChildWaitOutcome::Foreign(foreign) => {
             if foreign == Foreign::Orphaned && orphaned == Orphaned::Warn {
-                log::warn!("pid {pid}: not ours to reap (launchd holds its zombie, because its tracer died)");
+                log::warn!("{}", orphaned_note(pid));
             }
             Err(Error::Io(echild()))
         }
         ChildWaitOutcome::DeadlinePassed => Ok(None),
     }
+}
+
+/// What to say of a child whose zombie launchd holds.
+pub(super) fn orphaned_note(pid: u32) -> String {
+    format!("pid {pid}: not ours to reap (launchd holds its zombie, because its tracer died)")
 }
 
 /// The `ECHILD` every wait answers when the child was reaped by someone else.

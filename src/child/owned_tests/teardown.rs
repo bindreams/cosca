@@ -75,6 +75,23 @@ fn a_teardown_reap_that_meets_a_foreign_reap_is_debug() {
     assert_eq!(levels, vec![log::Level::Debug]);
 }
 
+/// A reap after a delivered kill that finds launchd holding the child's zombie: the child is
+/// `Killed`, and the launchd note comes back for the caller's one warn, not logged here.
+///
+/// Mutants: the foreign arm drops the note; the teardown warns of it on its own.
+#[skuld::test]
+fn a_reap_after_a_delivered_kill_that_meets_launchd_returns_the_note_and_logs_nothing_above_debug() {
+    let (torn, levels) = teardown_when_the_reap_answers(ReapAnswer::Foreign(Foreign::Orphaned));
+    assert_eq!(torn.fate, ChildFate::Killed, "{torn:?}");
+    assert!(
+        torn.left
+            .as_deref()
+            .is_some_and(|text| text.contains(&PID.to_string()) && text.contains("launchd")),
+        "{torn:?}"
+    );
+    assert!(levels.iter().all(|level| *level >= log::Level::Debug), "{levels:?}");
+}
+
 /// A reap after a tree kill that was delivered meets a foreign reap: someone else collected the
 /// exit after the kill, which is `Killed`, never `Gone` (the fate of a child cosca delivered
 /// nothing to).

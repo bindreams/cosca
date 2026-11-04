@@ -18,9 +18,10 @@
 use std::process::ExitStatus;
 
 use super::{ChildWaitOutcome, OwnedChild};
-use crate::child::lifecycle::{status_of_outcome, Orphaned};
+use crate::child::lifecycle::{orphaned_note, status_of_outcome, Orphaned};
 use crate::error::{ChildFate, Error};
 use crate::identity::ProcessId;
+use crate::os_process::child::Foreign;
 use crate::signal::{Sent, Sig};
 
 /// What a teardown of the root did: the child's fate, and what it could not do, for the event's one
@@ -89,12 +90,14 @@ impl OwnedChild {
             left: fate_left,
         };
         let outcome = self.wait(None).map_err(|e| failed(Some(wait_failure(pid, &e))))?;
-        // The launchd-orphan warning of a foreign outcome is written here, as for any other wait.
-        let status = status_of_outcome(pid, outcome, Orphaned::Warn);
+        let status = status_of_outcome(pid, outcome, Orphaned::Quiet);
         match (outcome, status) {
             (ChildWaitOutcome::Foreign(foreign), _) => {
                 log::debug!("teardown of child {pid}: it was reaped elsewhere before the reap after the kill");
-                Err(TeardownOutcome::new(foreign.fate(delivered)))
+                Err(TeardownOutcome {
+                    fate: foreign.fate(delivered),
+                    left: (foreign == Foreign::Orphaned).then(|| orphaned_note(pid)),
+                })
             }
             (_, Ok(Some(status))) => Ok(status),
             (_, Ok(None)) => {
