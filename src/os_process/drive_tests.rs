@@ -314,7 +314,6 @@ mod windows {
     use std::time::{Duration, Instant};
 
     use super::exited_held;
-    use crate::os_process::drive::exited_by_id;
     use crate::os_process::open;
     use crate::test_child::live_blocker as blocker;
     use crate::wait::test_clock::FrozenClockGuard;
@@ -354,15 +353,16 @@ mod windows {
         );
     }
 
-    /// `exited_by_id` arms its first wait with the whole timeout it was given, on a live process.
+    /// `exited_held` arms its first wait with the whole timeout it was given, on a live process.
     ///
     /// Mutant: the timeout is dropped on the way to the loop (the wait is unbounded, or zero).
     #[skuld::test]
-    fn exited_by_id_arms_the_wait_from_its_timeout() {
+    fn exited_held_arms_the_wait_from_its_timeout() {
         let (child, stdin, id) = blocker();
+        let process = open(id).unwrap().expect("a live process opens");
         let (_clock, _at) = FrozenClockGuard::install();
         block_probe::take();
-        let result = exited_by_id(id, Some(Duration::from_millis(50)));
+        let result = exited_held(&*process, Some(Duration::from_millis(50)));
         let armed = block_probe::take();
         drop(stdin);
         child.wait().expect("reap the blocker");
@@ -425,29 +425,6 @@ mod windows {
         assert!(!result.expect("a live never-exiting child must not report a wait failure"));
         assert!(reached, "the call returned before the real deadline");
     }
-}
-
-/// An identity naming a live pid under a start token it never had: `open` is `None` for it.
-fn gone_id() -> ProcessId {
-    let current = ProcessId::current();
-    ProcessId::from_parts_for_test(current.pid(), current.start_token_raw() ^ 1)
-}
-
-/// Mutant: `exited_by_id` takes the seam only after `open`, so a gone id never reaches it.
-#[skuld::test]
-fn exited_by_id_returns_a_forced_watch_error_for_a_gone_id() {
-    fault::set_force_watch_error(true);
-    assert!(super::exited_by_id(gone_id(), None).is_err());
-    assert!(!fault::armed(), "the seam is consumed");
-}
-
-/// Mutant: `exited_by_id` asserts only after `open`, so a gone id may block inside a section.
-#[cfg(feature = "tokio")]
-#[skuld::test]
-#[should_panic(expected = "would block inside an async Drop")]
-fn exited_by_id_refuses_a_gone_id_inside_a_bounded_section() {
-    let _section = crate::bounded::Section::enter();
-    _ = super::exited_by_id(gone_id(), Some(Duration::ZERO));
 }
 
 /// Mutant: `exited_held` skips the seam, or takes it after the look.

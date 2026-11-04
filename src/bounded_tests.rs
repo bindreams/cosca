@@ -42,17 +42,16 @@ fn a_section_is_per_thread() {
 mod waits {
     use super::Section;
 
-    /// `os_process::drive::exited_by_id`, which every platform's process-exit wait sits behind.
+    /// `Process::wait_timeout`, whose `os_process::drive::exited_held` every platform's process-exit
+    /// wait sits behind.
     ///
-    /// Mutant: drop the assert from `os_process::drive::exited_by_id`.
+    /// Mutant: drop the assert from `os_process::drive::enter`.
     #[skuld::test]
     #[should_panic(expected = "would block inside an async Drop")]
-    fn exited_by_id_refuses_inside_a_section() {
+    fn process_wait_refuses_inside_a_section() {
+        let current = crate::Process::current().expect("open the current process");
         let _section = Section::enter();
-        _ = crate::os_process::drive::exited_by_id(
-            crate::identity::ProcessId::current(),
-            Some(std::time::Duration::ZERO),
-        );
+        _ = current.wait_timeout(std::time::Duration::ZERO);
     }
 
     /// `Attached::wait_drained`, on a mechanism with no drain edge: refused all the same.

@@ -10,7 +10,7 @@ use crate::identity::{Liveness, Resolved, StartToken};
 /// One look at whether `id`'s process has exited, through the open: gone or recycled
 /// is exited.
 fn exited_now(id: crate::identity::ProcessId) -> Result<bool, crate::error::Error> {
-    crate::os_process::drive::exited_by_id(id, Some(std::time::Duration::ZERO))
+    crate::test_child::exited_through_open(id, Some(std::time::Duration::ZERO))
 }
 
 #[skuld::test]
@@ -148,9 +148,9 @@ fn kill_of_an_access_denied_live_process_is_an_error() {
 
 /// `Process::wait` must not report an exit it never observed.
 #[skuld::test]
-fn exited_by_id_of_an_access_denied_live_process_is_an_error() {
+fn waiting_on_an_access_denied_live_process_is_an_error() {
     let Some(done) = crate::test_own_process::own_process(
-        crate::test_own_process::test_path!(exited_by_id_of_an_access_denied_live_process_is_an_error),
+        crate::test_own_process::test_path!(waiting_on_an_access_denied_live_process_is_an_error),
         crate::test_spawn::spawn,
     ) else {
         return;
