@@ -7,11 +7,7 @@
 //! - **Failed, whatever the error:** nothing asked the child to exit (an elevated child a plain
 //!   parent cannot signal fails with `EPERM` on Unix and `ACCESS_DENIED` on Windows, and so can a
 //!   handle that lost its rights), so the teardown never blocks on it: one look at the present
-//!   moment, which collects it if it has exited. A child still running is [`ChildFate::Running`]
-//!   whatever the error, never `Unknown`, and the failure is returned in
-//!   [`TeardownOutcome::left`] for the caller's one warn. A look that finds it reaped elsewhere is
-//!   `Gone` and warns nothing; a look that fails otherwise is `Unknown` and warns with its error.
-//!   The decision is on the observed answer and never on a flag saying elevation was asked for: a
+//!   moment, which collects it if it has exited. The decision is on the observed answer and never on a flag saying elevation was asked for: a
 //!   child that gained privilege on its own (a setuid helper) fails the kill the same way, and a
 //!   blocking wait would hang the drop for ever.
 
@@ -122,7 +118,6 @@ impl OwnedChild {
                 (fate, failure)
             }
         };
-        // Only a child still running is "left"; a look that found it reaped elsewhere warns nothing.
         let left = match (&fate, look_failure) {
             (ChildFate::Running { .. }, _) => Some(format!(
                 "child {pid} could not be terminated ({refused}); leaving it running"

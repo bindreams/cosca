@@ -1,6 +1,4 @@
-//! The teardown policy of `OwnedChild` over a `FakeProcess`: one policy for every OS, decided by
-//! what the kill answered. A kill that was delivered, or found nothing to signal, is followed by a
-//! blocking wait; a kill that failed by one non-blocking look.
+//! The teardown policy of `OwnedChild` over a `FakeProcess` (see `owned::teardown`).
 
 use std::process::ExitStatus;
 
@@ -35,8 +33,7 @@ fn teardown(fake: &FakeProcess) -> (TeardownOutcome, Vec<log::Level>) {
     (torn, levels)
 }
 
-/// What the teardown returned and the levels it logged, with the kill delivered and the reap after
-/// it answering `reap`.
+/// [`teardown`] with the kill delivered and the reap after it answering `reap`.
 fn teardown_when_the_reap_answers(reap: ReapAnswer) -> (TeardownOutcome, Vec<log::Level>) {
     teardown(&FakeProcess::new([]).reaps([reap]).signals([Ok(Sent::Delivered)]))
 }
