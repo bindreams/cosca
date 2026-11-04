@@ -158,6 +158,30 @@ fn open_pid_of_a_reaped_child_is_none_or_another_process() {
     }
 }
 
+/// While another handle on a reaped child is open, Windows keeps its process object, so the
+/// child's own identity still opens, reads `Dead`, and reports exited.
+#[cfg(windows)]
+#[skuld::test]
+fn a_reaped_child_held_by_another_handle_opens_dead_on_windows() {
+    let (child, sock) = spawn_blocker();
+    let id = child.id();
+    let holder = cosca::Process::open(id).expect("open").expect("running");
+    common::kill_release_reap(&child, sock);
+    drop(child);
+    let reopened = cosca::Process::open_pid(id.pid())
+        .expect("a held pid is not an error")
+        .expect("the held process object still opens");
+    assert_eq!(reopened.id(), id);
+    assert_eq!(reopened.is_alive(), cosca::identity::Liveness::Dead);
+    assert!(reopened.wait_timeout(Duration::ZERO).expect("wait_timeout"));
+    let by_id = cosca::Process::open(id)
+        .expect("a held identity is not an error")
+        .expect("the held process object still opens by identity");
+    assert_eq!(by_id.id(), id);
+    assert_eq!(by_id.is_alive(), cosca::identity::Liveness::Dead);
+    drop(holder);
+}
+
 #[skuld::test]
 fn parent_and_children_resolve_the_spawned_tree() {
     let (child, mut sock) = spawn_blocker();
