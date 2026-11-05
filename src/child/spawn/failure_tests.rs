@@ -216,7 +216,7 @@ fn an_unreaped_child_whose_fate_names_no_identity_asserts_in_debug() {
 #[cfg_attr(debug_assertions, should_panic(expected = "is `Running` with its identity"))]
 fn an_unreaped_child_whose_fate_names_another_process_asserts_in_debug() {
     let id = crate::identity::ProcessId::current();
-    let other = crate::identity::ProcessId::from_parts(id.pid() + 1, 1);
+    let other = crate::identity::ProcessId::from_parts_for_test(id.pid() + 1, crate::identity::Key::for_test(1));
     drop(Error::from(SpawnFailure::MayHaveStarted {
         cause: io("attach"),
         fate: ChildFate::Running { id: Some(other) },

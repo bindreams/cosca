@@ -73,7 +73,7 @@ pub enum ElevationErrorKind {
 ///
 /// No variant says anything about whether the process is running — that is
 /// [`ProcessId::is_alive`](crate::identity::ProcessId::is_alive). These are all statements
-/// about whether a start token can be *compared* on this host at all.
+/// about whether a saved token can be *compared* on this host at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum RecordErrorKind {
@@ -81,8 +81,9 @@ pub enum RecordErrorKind {
     #[error("unknown record format version")]
     UnknownVersion,
     /// The record was written on a different OS. Start tokens are not comparable across
-    /// platforms — Linux's are boot-relative jiffies, Windows's and macOS's are absolute
-    /// timestamps — so a cross-platform comparison is meaningless, not merely wrong.
+    /// platforms — Linux's are per-boot values (a pidfd inode or boot-relative jiffies), Windows's
+    /// and macOS's are absolute timestamps — so a cross-platform comparison is meaningless, not
+    /// merely wrong.
     #[error("the record was written on a different platform")]
     ForeignPlatform,
     /// The record's pid cannot name a single process on this platform: zero anywhere, or
@@ -91,8 +92,9 @@ pub enum RecordErrorKind {
     /// rejected up front rather than left to fail — or, worse, succeed — later.
     #[error("the record's pid cannot name a single process")]
     InvalidPid,
-    /// Linux: the record was written in a different boot session, where the jiffy counter
-    /// started over. The saved token would alias onto an unrelated process.
+    /// Linux: the record was written in a different boot session, where the token's counter (the
+    /// pidfd inodes, the jiffies) started over. The saved token would alias onto an unrelated
+    /// process.
     #[error("the record was written in a different boot session")]
     ForeignBootSession,
     /// Linux: the record carries no boot identifier, so its boot session cannot be checked.
@@ -105,7 +107,17 @@ pub enum RecordErrorKind {
     /// Linux: the record carries no pid namespace identifier.
     #[error("the record carries no pid namespace identifier")]
     MissingPidNamespace,
-    /// This host's own boot session could not be read, so a record could neither be
+    /// Linux: the record's token is of another kind than this host's: a `pidfs` inode where this
+    /// host's pidfds have none, or a `starttime` where they do. The two are never comparable, so
+    /// the saved token would alias onto an unrelated process. A kind this build does not know is
+    /// this too.
+    #[error("the record's token is of another kind than this host's")]
+    ForeignTokenKind,
+    /// Linux: the record carries no kind of token, so it cannot be told which this is.
+    #[error("the record carries no kind of token")]
+    MissingTokenKind,
+    /// This host's own boot session, or on Linux its kind of token (read from its own pidfd), could
+    /// not be read, so a record could neither be
     /// written nor checked. The only variant that is not about the record's contents; the
     /// failing path and the OS error are in the error's `detail` and `source`.
     #[error("this host's boot session could not be read")]

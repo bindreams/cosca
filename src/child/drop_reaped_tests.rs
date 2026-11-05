@@ -717,8 +717,8 @@ fn fd_marker_with_a_group_drop_after_wait_neither_signals_the_group_nor_walks() 
 #[skuld::test]
 fn a_root_is_reaped_by_its_own_reap_or_by_its_number_reading_gone_or_different() {
     use crate::identity::{ProcessId, Resolved};
-    let id = ProcessId::from_parts_for_test(4242, 7);
-    let other = ProcessId::from_parts_for_test(4242, 8);
+    let id = ProcessId::from_parts_for_test(4242, crate::identity::Key::for_test(7));
+    let other = id.with_other_value();
     for (own, now, reaped) in [
         (true, Resolved::Found(id), true),
         (true, Resolved::Found(other), true),
