@@ -498,7 +498,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             .as_ref()
             .filter(|_| cmd.elevation_front().is_some())
         {
-            crate::containment::cgroup::front_placement(|| leaf.id()).not_started()?;
+            crate::containment::cgroup::front_placement(&crate::identity::HostKernel, || leaf.id()).not_started()?;
         }
 
         let _guard = spawn_lock();

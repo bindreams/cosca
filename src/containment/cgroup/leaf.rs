@@ -92,7 +92,7 @@ fn pidfd_exited(pidfd: std::os::fd::BorrowedFd<'_>) -> io::Result<bool> {
 /// A `/proc` state of `Z` or `X` with the pidfd unexited is a thread-group leader that exited while
 /// other threads run: the group has not exited, so that is no state of the child.
 #[cfg(target_os = "linux")]
-fn proc_state(child: crate::containment::ChildHandle<'_>) -> Option<char> {
+fn proc_state(kernel: &dyn crate::identity::Kernel, child: crate::containment::ChildHandle<'_>) -> Option<char> {
     let crate::containment::ChildHandle { pid, pidfd } = child;
     let exited = |when: &str| match pidfd_exited(pidfd) {
         Ok(exited) => Some(exited),
@@ -106,7 +106,7 @@ fn proc_state(child: crate::containment::ChildHandle<'_>) -> Option<char> {
     }
     #[cfg(test)]
     fault::run_before_state_read();
-    let state = read_proc_state(pid);
+    let state = read_proc_state(kernel, pid);
     if exited("after")? {
         return Some('Z');
     }
@@ -127,45 +127,41 @@ fn proc_state(child: crate::containment::ChildHandle<'_>) -> Option<char> {
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
 enum StateUnknown {
-    /// `/proc` belongs to an outer pid namespace, so its `<pid>` could name another process.
-    OuterProcfs,
-    /// `/proc` could not be verified to be this process's own pid namespace's.
-    ViewUnassessable(crate::identity::ViewUnreadable),
+    /// `/proc` is an outer pid namespace's, or could not be verified to be this process's own.
+    View(crate::identity::ViewUnreadable),
     /// `<pid>/stat` could not be read.
     Unreadable(std::io::Error),
     /// `<pid>/stat` has no state field.
-    Unparsable(String),
+    Unparsable(Vec<u8>),
 }
 
 #[cfg(target_os = "linux")]
 impl std::fmt::Display for StateUnknown {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::OuterProcfs => f.write_str("/proc is an outer pid namespace's"),
-            Self::ViewUnassessable(why) => write!(f, "the /proc view could not be established: {why}"),
+            Self::View(why) => write!(f, "the /proc view cannot be relied on: {why}"),
             Self::Unreadable(e) => write!(f, "its stat could not be read: {e}"),
-            Self::Unparsable(stat) => write!(f, "its stat has no state field: {stat:?}"),
+            Self::Unparsable(stat) => write!(f, "its stat has no state field: {:?}", String::from_utf8_lossy(stat)),
         }
     }
 }
 
+/// `pid`'s state letter. Any failure, the pidfd-bracketed read's included, means the state is
+/// unknown.
 #[cfg(target_os = "linux")]
-fn read_proc_state(pid: u32) -> Result<char, StateUnknown> {
-    use crate::identity::{proc_view_with, HostKernel, ProcView};
-    let proc_dir = match proc_view_with(&HostKernel) {
-        ProcView::Same(proc_dir) => proc_dir,
-        ProcView::Diverged => return Err(StateUnknown::OuterProcfs),
-        ProcView::Unassessable(why) => return Err(StateUnknown::ViewUnassessable(why)),
-    };
-    let stat = proc_dir
-        .read_to_string(&format!("{pid}/stat"))
-        .map_err(StateUnknown::Unreadable)?;
+fn read_proc_state(kernel: &dyn crate::identity::Kernel, pid: u32) -> Result<char, StateUnknown> {
+    let proc_dir = crate::identity::proc_view_with(kernel)
+        .into_dir()
+        .map_err(StateUnknown::View)?;
+    let stat = crate::identity::pid_stat::read_stat_file(kernel, &proc_dir, pid).map_err(StateUnknown::Unreadable)?;
     state_from_stat(stat)
 }
 
 #[cfg(target_os = "linux")]
-fn state_from_stat(stat: String) -> Result<char, StateUnknown> {
-    parse_proc_stat_state(&stat).ok_or(StateUnknown::Unparsable(stat))
+fn state_from_stat(stat: Vec<u8>) -> Result<char, StateUnknown> {
+    crate::identity::stat_parse::parse_state(&stat)
+        .map(char::from)
+        .ok_or(StateUnknown::Unparsable(stat))
 }
 
 /// What [`CgroupLeaf::drain_step`] found.
@@ -350,7 +346,7 @@ impl CgroupLeaf {
             PlacementReport::WriteFailed(errno) => NotEntered::WriteFailed(errno),
         };
         let path = self.leaf_path.join("cgroup.procs");
-        let child_state = proc_state(child);
+        let child_state = proc_state(&crate::identity::HostKernel, child);
         Err(match self.dir.read("cgroup.procs") {
             Ok(procs) => NotPlaced::Absent {
                 pid: child.pid,
