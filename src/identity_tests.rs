@@ -163,8 +163,8 @@ enum Owner {
 /// number, a missing record or a missing order key settles `Unknown` before the proof (a gone parent
 /// then blames the candidate); an unreadable number reads as a match or as another parent's; a failed
 /// proof blames the candidate or answers `Gone`; a `Gone` read becomes `Unknown`; a read before the
-/// order bound, or has no order key under a bound, waits for the proof, or is `Unknown` when the proof
-/// fails (the proof is asked for, here a panic).
+/// order bound, or one with no order key under a bound, waits for the proof, or is `Unknown` when the
+/// proof fails (the proof is asked for, here a panic).
 #[skuld::test]
 fn a_candidates_read_and_its_parents_proof_give_one_answer() {
     use super::{OrderKey, Ordered, OrderedRead, ParentRead, UnknownCause};
@@ -278,53 +278,58 @@ fn a_candidates_read_and_its_parents_proof_give_one_answer() {
         }
     }
 
-    // A found read whose order key does not follow the bound is gone, whatever its parent number and
-    // before any proof: a proof that would fail is never asked for. A key that follows it, or none
-    // bound, leaves the table's answer. An equal key does not follow it.
-    for (key_name, bound, follows) in [("before", 10, false), ("equal to", 9, false), ("after", 8, true)] {
+    // The bound rows: a bound is handed out only where `ORDER_AFTER_PARENT` (Windows), and `judged`
+    // asserts it.
+    #[cfg(windows)]
+    {
+        // A found read whose order key does not follow the bound is gone, whatever its parent number and
+        // before any proof: a proof that would fail is never asked for. A key that follows it, or none
+        // bound, leaves the table's answer. An equal key does not follow it.
+        for (key_name, bound, follows) in [("before", 10, false), ("equal to", 9, false), ("after", 8, true)] {
+            for claimed in [ParentRead::Is(PARENT), ParentRead::Is(OTHER), ParentRead::Unreadable] {
+                let judged = |bound| {
+                    OrderedRead {
+                        read: found,
+                        parent: claimed,
+                        cause: stated(),
+                    }
+                    .judged(CANDIDATE, PARENT, bound)
+                };
+                let held: Proof = || Ok(());
+                let (answer, cause) = if follows {
+                    judged(Some(OrderKey::for_test(bound))).proved(held)
+                } else {
+                    judged(Some(OrderKey::for_test(bound))).proved(|| panic!("the parent's proof is asked for"))
+                };
+                let (unbound, unbound_cause) = judged(None).proved(held);
+                let expected = if follows {
+                    (unbound, owner_of(unbound_cause))
+                } else {
+                    nobody_gone
+                };
+                assert_eq!(
+                    (answer, owner_of(cause)),
+                    expected,
+                    "a read whose key is {key_name} the bound, its parent number {claimed:?}"
+                );
+            }
+        }
+
+        // Where a bound applies, a found read with no order key is not kept, as `ProcessId::parent` has it.
         for claimed in [ParentRead::Is(PARENT), ParentRead::Is(OTHER), ParentRead::Unreadable] {
-            let judged = |bound| {
-                OrderedRead {
-                    read: found,
-                    parent: claimed,
-                    cause: stated(),
-                }
-                .judged(CANDIDATE, PARENT, bound)
-            };
-            let held: Proof = || Ok(());
-            let (answer, cause) = if follows {
-                judged(Some(OrderKey::for_test(bound))).proved(held)
-            } else {
-                judged(Some(OrderKey::for_test(bound))).proved(|| panic!("the parent's proof is asked for"))
-            };
-            let (unbound, unbound_cause) = judged(None).proved(held);
-            let expected = if follows {
-                (unbound, owner_of(unbound_cause))
-            } else {
-                nobody_gone
-            };
+            let (answer, cause) = OrderedRead {
+                read: Resolved::Found((Key::for_test(5), None)),
+                parent: claimed,
+                cause: stated(),
+            }
+            .judged(CANDIDATE, PARENT, Some(OrderKey::for_test(8)))
+            .proved(|| panic!("the parent's proof is asked for"));
             assert_eq!(
                 (answer, owner_of(cause)),
-                expected,
-                "a read whose key is {key_name} the bound, its parent number {claimed:?}"
+                nobody_gone,
+                "a read with no order key under a bound, its parent number {claimed:?}"
             );
         }
-    }
-
-    // Where a bound applies, a found read with no order key is not kept, as `ProcessId::parent` has it.
-    for claimed in [ParentRead::Is(PARENT), ParentRead::Is(OTHER), ParentRead::Unreadable] {
-        let (answer, cause) = OrderedRead {
-            read: Resolved::Found((Key::for_test(5), None)),
-            parent: claimed,
-            cause: stated(),
-        }
-        .judged(CANDIDATE, PARENT, Some(OrderKey::for_test(8)))
-        .proved(|| panic!("the parent's proof is asked for"));
-        assert_eq!(
-            (answer, owner_of(cause)),
-            nobody_gone,
-            "a read with no order key under a bound, its parent number {claimed:?}"
-        );
     }
 
     for (read_name, read, expected) in [
@@ -409,14 +414,12 @@ fn a_reused_creator_edge_is_dropped_only_where_the_order_after_the_parent_is_the
 
 /// A read that found no record says its parent number could not be read only if it asked for it.
 ///
-/// Mutant: `missing` reads `Unreadable` for a read that did not ask, or `NotAsked` for one that did
+/// Mutant: `not_read` reads `Unreadable` for a read that did not ask, or `NotAsked` for one that did
 /// (a `NotAsked` that is judged against a named parent breaks the debug assertion there).
 #[skuld::test]
 fn a_missing_record_reads_the_parent_number_as_asked() {
-    use super::{OrderedRead, ParentRead, UnknownCause};
+    use super::ParentRead;
 
-    let asked = OrderedRead::missing(Resolved::Unknown, UnknownCause::default(), true);
-    assert_eq!(asked.parent, ParentRead::Unreadable);
-    let alone = OrderedRead::missing(Resolved::Unknown, UnknownCause::default(), false);
-    assert_eq!(alone.parent, ParentRead::NotAsked);
+    assert_eq!(ParentRead::not_read(true), ParentRead::Unreadable);
+    assert_eq!(ParentRead::not_read(false), ParentRead::NotAsked);
 }

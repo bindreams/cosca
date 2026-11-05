@@ -1,6 +1,6 @@
 //! The process tree around a [`ProcessId`](super::ProcessId): its parent and its children.
 
-use super::{keeps_order, resolution_of, HostKernel, Kernel, ProcessId, ORDER_AFTER_PARENT};
+use super::{keeps, resolution_of, HostKernel, Kernel, ProcessId, ORDER_AFTER_PARENT};
 use crate::error::Error;
 
 /// Whether a tree query descends recursively or returns only direct children.
@@ -56,9 +56,7 @@ impl ProcessId {
         };
         // Where the creator is never updated, a genuine parent started before its child.
         if ORDER_AFTER_PARENT {
-            let kept = own_order
-                .zip(parent_order)
-                .is_some_and(|(own, parent)| keeps_order(own, parent));
+            let kept = parent_order.is_some() && keeps(own_order, parent_order);
             return Ok(kept.then_some(parent));
         }
         // Elsewhere `self` read after the parent must still name it, and it must still hold its pid.

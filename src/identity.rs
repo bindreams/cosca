@@ -130,6 +130,12 @@ pub(crate) fn keeps_order(key: OrderKey, bound: OrderKey) -> bool {
     key > bound
 }
 
+/// [`keeps_order`] over the optional keys of a read and of its bound: with no `bound` nothing
+/// applies and the read is kept; under one, a read with no order key is not.
+pub(crate) fn keeps(order: Option<OrderKey>, bound: Option<OrderKey>) -> bool {
+    bound.is_none_or(|bound| order.is_some_and(|order| keeps_order(order, bound)))
+}
+
 /// The candidate's own parent number, as one ordered read found it: in the record or on the handle
 /// that gave the candidate's id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,6 +146,18 @@ enum ParentRead {
     Is(RawPid),
     /// The read asked and could not find it.
     Unreadable,
+}
+
+impl ParentRead {
+    /// What a read that found no process says of the parent number: it could not read it if it
+    /// `asked`, else it was not asked.
+    fn not_read(asked: bool) -> ParentRead {
+        if asked {
+            ParentRead::Unreadable
+        } else {
+            ParentRead::NotAsked
+        }
+    }
 }
 
 /// What a backend's one read of a process says: its key and its order key, which is `Some` exactly
@@ -220,14 +238,11 @@ impl OrderedRead {
     /// A read that found no process: `read` is `Gone` or `Unknown` (it has no found value). There is
     /// no record to take a parent number from, so a read that `asked_parent` is told it could not
     /// read it ([`ParentRead::Unreadable`]), and one that did not ask says so.
+    #[cfg(not(windows))]
     fn missing(read: Resolved<std::convert::Infallible>, cause: UnknownCause, asked_parent: bool) -> OrderedRead {
         OrderedRead {
             read: read.map(|never| match never {}),
-            parent: if asked_parent {
-                ParentRead::Unreadable
-            } else {
-                ParentRead::NotAsked
-            },
+            parent: ParentRead::not_read(asked_parent),
             cause,
         }
     }
@@ -255,9 +270,10 @@ impl OrderedRead {
     }
 
     /// The read for `pid`, whose caller was told `parent` created it. A key not after `bound` (given
-    /// only where [`ORDER_AFTER_PARENT`]), another parent's number, or a `Gone` read settles the
-    /// answer; every other read waits on the proof of `parent` ([`Judged`]). The bound is checked
-    /// first, so a candidate that cannot be the parent's child never asks for a proof that might fail.
+    /// only where [`ORDER_AFTER_PARENT`]), a found read with no order key under a bound, another
+    /// parent's number, or a `Gone` read settles the answer; every other read waits on the proof of
+    /// `parent` ([`Judged`]). The bound is checked first, so a candidate that cannot be the
+    /// parent's child never asks for a proof that might fail.
     fn judged(self, pid: RawPid, parent: RawPid, bound: Option<OrderKey>) -> Judged {
         let OrderedRead {
             read,
@@ -268,11 +284,12 @@ impl OrderedRead {
             claimed != ParentRead::NotAsked,
             "a parent was named, so its number must be asked for"
         );
+        debug_assert!(
+            bound.is_none() || ORDER_AFTER_PARENT,
+            "a bound is handed out only where ORDER_AFTER_PARENT, and a read there carries its key"
+        );
         match (claimed, read) {
-            // As `parent_with`: where a bound applies, a read with no order key is not kept either.
-            (_, Resolved::Found((_, order)))
-                if bound.is_some_and(|bound| !order.is_some_and(|order| keeps_order(order, bound))) =>
-            {
+            (_, Resolved::Found((_, order))) if !keeps(order, bound) => {
                 Judged::Settled((Resolved::Gone, UnknownCause::default()))
             }
             (ParentRead::Is(found), _) if found != parent => Judged::Settled((Resolved::Gone, UnknownCause::default())),

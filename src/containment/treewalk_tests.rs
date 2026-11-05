@@ -314,6 +314,28 @@ fn the_bound_is_the_roots_bound_not_its_id_token() {
     }
 }
 
+/// What the live anchor hands the walk as its children's bound: where the platform orders by
+/// creation (Windows) the root's order key, elsewhere none, read through `anchor` itself and not
+/// stated. Mutants: the anchor hands out a bound off Windows; it hands out none on Windows.
+#[cfg(not(windows))]
+#[skuld::test]
+fn the_anchor_hands_out_no_bound_off_windows() {
+    let proof = super::anchor(&crate::identity::HostKernel, ProcessId::current())
+        .expect("this process reads")
+        .expect("this process is live");
+    assert_eq!(proof.bound, None);
+}
+
+/// As [`the_anchor_hands_out_no_bound_off_windows`], on Windows.
+#[cfg(windows)]
+#[skuld::test]
+fn the_anchor_hands_out_a_bound_on_windows() {
+    let proof = super::anchor(&crate::identity::HostKernel, ProcessId::current())
+        .expect("this process reads")
+        .expect("this process is live");
+    assert!(proof.bound.is_some());
+}
+
 /// `resolve_or_drop` is a named discard site: an access-denied descendant must be dropped
 /// from the walk AND leave a warn behind, never be silently folded in with a gone pid.
 #[cfg(windows)]
