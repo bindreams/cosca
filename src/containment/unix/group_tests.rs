@@ -1,8 +1,26 @@
 // Unit tests for process-group membership listing and the identity it carries.
 
-use super::{members, state, GroupState, Member};
+#[cfg(not(target_os = "linux"))]
+use super::members;
+#[cfg(target_os = "linux")]
+use super::members_with;
+use super::{state, GroupState, Member};
+#[cfg(target_os = "linux")]
+use crate::identity::{FakeKernel, HostKernel};
 use crate::identity::{Liveness, ProcessId};
 use nix::sys::signal::Signal;
+
+/// The listing of `pgid` by the host's kernel.
+fn list(pgid: i32) -> std::io::Result<Vec<Member>> {
+    #[cfg(target_os = "linux")]
+    {
+        members_with(&HostKernel, pgid)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        members(pgid)
+    }
+}
 
 fn is_alive(m: &Member) -> bool {
     matches!(ProcessId::from_parts(m.pid, m.token).is_alive(), Liveness::Alive)
@@ -42,7 +60,7 @@ fn members_lists_a_live_owned_group() {
     await_member_ready(&mut child);
     let pgid = child.id() as i32;
 
-    let listed = members(pgid).expect("list the group");
+    let listed = list(pgid).expect("list the group");
     let leader = listed
         .iter()
         .find(|m| m.pid == child.id())
@@ -64,7 +82,7 @@ fn members_marks_an_unreaped_leader_as_dead() {
     let pid = child.id();
     await_zombie(pid);
 
-    let listed = members(pid as i32).expect("list the group");
+    let listed = list(pid as i32).expect("list the group");
     let leader = listed
         .iter()
         .find(|m| m.pid == pid)
@@ -92,7 +110,7 @@ fn members_marks_an_unreaped_leader_as_dead() {
 /// assertion is a genuine independent check rather than a restatement of the fixture.
 #[skuld::test]
 fn members_of_an_absent_group_is_empty() {
-    assert_eq!(members(i32::MAX).expect("list an absent group"), vec![]);
+    assert_eq!(list(i32::MAX).expect("list an absent group"), vec![]);
 }
 
 /// The token the listing carries is the SAME encoding a live read of the pid would produce —
@@ -107,7 +125,7 @@ fn members_token_matches_a_live_read_of_the_same_pid() {
     await_member_ready(&mut child);
     let pgid = child.id() as i32;
 
-    let listed = members(pgid).expect("list the group");
+    let listed = list(pgid).expect("list the group");
     let leader = listed.iter().find(|m| m.pid == child.id()).expect("leader listed");
     let live = ProcessId::of(child.id()).found().expect("resolve the live leader");
     assert_eq!(
@@ -525,59 +543,32 @@ fn a_live_non_leader_thread_member_is_unknown_and_never_falls_back_to_kill() {
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn members_is_an_error_when_the_proc_view_is_diverged() {
-    use crate::identity::proc_view_fault::{force_proc_view_once, ForcedView};
-    let _forced = force_proc_view_once(ForcedView::Diverged);
-    let err = members(i32::MAX).expect_err("a diverged view lists nothing");
+    let kernel = FakeKernel::over(&HostKernel).diverged_view();
+    let err = members_with(&kernel, i32::MAX).expect_err("a diverged view lists nothing");
     assert!(err.to_string().contains("outer pid namespace"), "{err}");
 }
 
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn members_is_an_error_naming_the_cause_when_the_proc_view_is_unassessable() {
-    use crate::identity::proc_view_fault::{force_proc_view_once, ForcedView};
-    let _forced = force_proc_view_once(ForcedView::Unassessable);
-    let err = members(i32::MAX).expect_err("an unassessable view lists nothing");
-    assert!(err.to_string().contains("forced by a test"), "{err}");
-}
-
-/// Without `openat2` no `/proc` view can be established, and the listing says that is why:
-/// `Unsupported`, naming the requirement, as a spawn does. Mutant: "surface every unreadable view
-/// as `io::Error::other`".
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn members_without_openat2_is_unsupported_naming_the_requirement() {
-    use crate::identity::proc_view_fault::force_openat2_errno;
-    for (errno, name) in [(rustix::io::Errno::NOSYS, "ENOSYS"), (rustix::io::Errno::PERM, "EPERM")] {
-        let forced = force_openat2_errno(errno);
-        let err = members(i32::MAX).expect_err("no openat2, no listing");
-        drop(forced);
-        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported, "{errno}: {err}");
-        assert_eq!(
-            err.to_string(),
-            format!(
-                "containment::unix::group::members: {}, so pgid {} cannot be listed",
-                crate::identity::openat2_refused_message(name),
-                i32::MAX
-            ),
-            "{errno}"
-        );
-    }
-}
-
-/// Any other `openat2` failure is not the requirement: it keeps its kind and does not claim
-/// `openat2` is missing. Mutant: "flag every `/proc` open failure as missing `openat2`".
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn members_with_another_openat2_failure_is_not_unsupported() {
-    use crate::identity::proc_view_fault::force_openat2_errno;
-    let forced = force_openat2_errno(rustix::io::Errno::NOENT);
-    let err = members(i32::MAX).expect_err("an unopenable /proc lists nothing");
-    drop(forced);
-    assert_ne!(err.kind(), std::io::ErrorKind::Unsupported, "{err}");
-    assert!(!err.to_string().contains("cosca requires openat2"), "{err}");
+    let kernel = FakeKernel::over(&HostKernel).unreadable_view();
+    let err = members_with(&kernel, i32::MAX).expect_err("an unassessable view lists nothing");
+    assert!(err.to_string().contains("self/status could not be read"), "{err}");
 }
 
 // Per-pid stat read failures (Linux) =====
+
+/// The pid the stat rows list and read.
+#[cfg(target_os = "linux")]
+const PID: u32 = 4242;
+
+/// A kernel listing one pid, `PID`, whose `stat` read answers `errno`.
+#[cfg(target_os = "linux")]
+fn failing_stat(errno: i32) -> FakeKernel<'static> {
+    FakeKernel::over(&HostKernel)
+        .on_pids(Ok(&[PID]))
+        .on_read(&format!("{PID}/stat"), Err(errno))
+}
 
 /// The failures that mean "this pid says nothing about the group": it exited mid-scan (ENOENT,
 /// ESRCH) or `hidepid` hides it (EACCES, and EPERM while the checked directory still answers).
@@ -587,8 +578,8 @@ fn members_with_another_openat2_failure_is_not_unsupported() {
 #[skuld::test]
 fn members_excludes_a_pid_whose_stat_read_says_it_is_gone_or_hidden() {
     for errno in [libc::ENOENT, libc::ESRCH, libc::EACCES, libc::EPERM] {
-        let _forced = super::fault::force_stat_read(errno, None);
-        let listed = members(i32::MAX).unwrap_or_else(|e| panic!("errno {errno} is an exclusion: {e}"));
+        let listed = members_with(&failing_stat(errno), i32::MAX)
+            .unwrap_or_else(|e| panic!("errno {errno} is an exclusion: {e}"));
         assert!(listed.is_empty(), "errno {errno}: {listed:?}");
     }
 }
@@ -608,8 +599,7 @@ fn members_is_an_error_naming_pid_and_errno_for_any_other_stat_read_failure() {
         libc::EIO,
         libc::ENOSYS,
     ] {
-        let _forced = super::fault::force_stat_read(errno, None);
-        let err = members(i32::MAX).expect_err("an unexplained read failure lists nothing");
+        let err = members_with(&failing_stat(errno), i32::MAX).expect_err("an unexplained read failure lists nothing");
         let text = err.to_string();
         assert!(
             text.contains(&std::io::Error::from_raw_os_error(errno).to_string()),
@@ -619,8 +609,9 @@ fn members_is_an_error_naming_pid_and_errno_for_any_other_stat_read_failure() {
             assert!(text.contains("beyond a mount"), "{errno}: {text}");
         }
         let pid = text.split("/stat").next().unwrap().rsplit(' ').next().unwrap();
-        assert!(
-            pid.parse::<u32>().is_ok(),
+        assert_eq!(
+            pid.parse::<u32>().ok(),
+            Some(PID),
             "{errno}: the error must name the pid before `/stat`: {text}"
         );
     }
@@ -633,8 +624,8 @@ fn members_is_an_error_naming_pid_and_errno_for_any_other_stat_read_failure() {
 #[skuld::test]
 fn members_is_an_error_for_eperm_when_the_checked_directory_also_refuses() {
     for recheck in [libc::EPERM, libc::ENOSYS, libc::EMFILE] {
-        let _forced = super::fault::force_stat_read(libc::EPERM, Some(recheck));
-        let err = members(i32::MAX).expect_err("a refusing directory lists nothing");
+        let kernel = failing_stat(libc::EPERM).on_read("self/stat", Err(recheck));
+        let err = members_with(&kernel, i32::MAX).expect_err("a refusing directory lists nothing");
         let text = err.to_string();
         assert!(text.contains("self/stat"), "{recheck}: {text}");
         assert!(

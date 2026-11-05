@@ -212,7 +212,7 @@ impl ProcDir {
     }
 
     /// The pids listed under this `/proc`: its decimal-named entries.
-    pub(crate) fn pids(&self) -> io::Result<Vec<u32>> {
+    pub(super) fn pids(&self) -> io::Result<Vec<u32>> {
         let dir = rustix::fs::Dir::new(self.open_beneath(".", OFlags::RDONLY | OFlags::DIRECTORY)?)?;
         collect_pids(dir.map(|entry| Ok(entry?.file_name().to_bytes().to_vec())))
     }
