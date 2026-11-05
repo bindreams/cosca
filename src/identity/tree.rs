@@ -57,7 +57,7 @@ impl ProcessId {
             }
         };
         // `ppid` is only a number: `self`'s own read must still name it, and the parent must still
-        // hold it after that read (Linux and Windows; macOS checks neither).
+        // hold it after that read.
         let key = match ProcessId::of_ordered_with(kernel, self.pid(), Some(parent)) {
             (Resolved::Found((read, key)), _) if read == *self => key,
             // `self` was replaced, exited, or has another parent now.
