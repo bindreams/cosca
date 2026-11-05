@@ -115,13 +115,13 @@ fn a_refused_kill_of_a_child_that_has_exited_hands_nothing_back() {
     assert!(handed_back.is_none(), "the teardown handed the child back");
 }
 
-/// A refused kill whose look then fails leaves the child's fate unknown, so nothing is handed back:
-/// a handed-back child is one shown to run.
+/// A refused kill whose look then fails leaves the child's fate unknown, and the child uncollected
+/// and still the caller's: it is handed back, as a child known to run is.
 ///
-/// Mutant: any refused kill hands the child back.
+/// Mutant: only a `Running` fate hands back.
 #[cfg(unix)]
 #[skuld::test]
-fn a_refused_kill_with_a_failed_look_hands_nothing_back() {
+fn a_refused_kill_with_a_failed_look_hands_the_child_back() {
     use crate::os_process::fake::ReapAnswer;
 
     let (mut child, stdin) = held_uncontained_blocker(true);
@@ -133,7 +133,60 @@ fn a_refused_kill_with_a_failed_look_hands_nothing_back() {
     let (fate, handed_back) = tear_down_holding(child, stdin, Disposition::HandBack);
 
     assert_eq!(fate, ChildFate::Unknown);
-    assert!(handed_back.is_none(), "the teardown handed the child back");
+    handed_back.unreaped();
+    handed_back.wait();
+}
+
+/// A kill that was delivered, and a wait for the child that then failed, leave the child `Killed`
+/// and still a zombie of this process: it is handed back.
+///
+/// Mutant: only a `Running` fate hands back.
+#[cfg(unix)]
+#[skuld::test]
+fn a_delivered_kill_whose_wait_failed_hands_the_child_back() {
+    use crate::os_process::fake::ReapAnswer;
+    use crate::signal::Sent;
+
+    let (mut child, stdin) = held_uncontained_blocker(true);
+    // The kill is scripted: the child exits when released, below.
+    child.proc.script_over(|f| {
+        f.signals([Ok(Sent::Delivered)])
+            .reaps([ReapAnswer::Err(std::io::ErrorKind::Other)])
+    });
+
+    let (fate, handed_back) = tear_down_holding(child, stdin, Disposition::HandBack);
+
+    assert_eq!(fate, ChildFate::Killed);
+    handed_back.unreaped();
+    handed_back.wait();
+}
+
+/// A child someone else reaped is not this process's to hand back, whether the kill was refused
+/// (`Gone`) or delivered first (`Killed`).
+///
+/// Mutants: a `Killed` fate hands back; any fate but `Reaped` hands back.
+#[cfg(unix)]
+#[skuld::test]
+fn a_child_reaped_elsewhere_is_not_handed_back() {
+    use crate::os_process::child::Foreign;
+    use crate::os_process::fake::ReapAnswer;
+    use crate::signal::Sent;
+
+    let refused = || Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+    for (kill, fate) in [(refused(), ChildFate::Gone), (Ok(Sent::Delivered), ChildFate::Killed)] {
+        let (mut child, stdin) = held_uncontained_blocker(true);
+        child
+            .proc
+            .script_over(|f| f.signals([kill]).reaps([ReapAnswer::Foreign(Foreign::Gone)]));
+
+        let (torn, handed_back) = tear_down_holding(child, stdin, Disposition::HandBack);
+
+        assert_eq!(torn, fate);
+        assert!(
+            handed_back.is_none(),
+            "the teardown handed back a child reaped elsewhere"
+        );
+    }
 }
 
 /// A child whose group is killed before its root kill is refused is handed back after that group
@@ -263,6 +316,50 @@ fn an_elevation_front_is_left_when_the_caller_leaves_it() {
     );
     drop(handed_back);
     crate::test_child::wait_until_zombie(id.pid());
+}
+
+/// A front whose look fails is uncollected and still ours: it is handed back though its fate is
+/// `Unknown`.
+///
+/// Mutant: only a `Running` fate hands back.
+#[cfg(unix)]
+#[skuld::test]
+fn an_elevation_front_whose_look_failed_is_handed_back() {
+    use crate::os_process::fake::ReapAnswer;
+
+    let (mut child, stdin) = a_running_front();
+    child
+        .proc
+        .script_over(|f| f.reaps([ReapAnswer::Err(std::io::ErrorKind::Other)]));
+
+    let (fate, handed_back) = tear_down_holding(child, stdin, Disposition::HandBack);
+
+    assert_eq!(fate, ChildFate::Unknown);
+    handed_back.unreaped();
+    handed_back.wait();
+}
+
+/// A front someone else reaped is not this process's to hand back, though its look found no exit.
+///
+/// Mutant: a front is handed back whatever its look found.
+#[cfg(unix)]
+#[skuld::test]
+fn an_elevation_front_reaped_elsewhere_is_not_handed_back() {
+    use crate::os_process::child::Foreign;
+    use crate::os_process::fake::ReapAnswer;
+
+    let (mut child, stdin) = a_running_front();
+    child
+        .proc
+        .script_over(|f| f.reaps([ReapAnswer::Foreign(Foreign::Gone)]));
+
+    let (fate, handed_back) = tear_down_holding(child, stdin, Disposition::HandBack);
+
+    assert_eq!(fate, ChildFate::Gone);
+    assert!(
+        handed_back.is_none(),
+        "the teardown handed back a front reaped elsewhere"
+    );
 }
 
 /// A front that has exited when the teardown runs reads `Gate::Exited`, so it goes through the

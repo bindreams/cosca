@@ -525,12 +525,7 @@ fn assert_drop_kills_the_leaf_and_reaps_the_front(fault: impl FnOnce() -> Box<dy
     );
     let said =
         crate::log_capture::records_since_on_current_thread(mark, &format!("Child::drop: elevation front pid {pid}"));
-    assert_eq!(said.len(), 1, "{said:?}");
-    assert_eq!(said[0].0, log::Level::Debug, "{said:?}");
-    assert!(
-        said[0].1.contains("killed through its cgroup and reaped (signal: 9"),
-        "{said:?}"
-    );
+    assert_eq!(said, [], "a front reaped with its status needs no word");
     assert!(reaped(&front), "the drop reaps the front its leaf's kill ended");
     assert!(steps.iter().any(|s| s == "kill"), "{steps:?}");
     wait_until_exited(&member);
@@ -601,12 +596,7 @@ fn cgroup_a_drop_places_a_front_that_reads_as_running_and_reaps_it(#[fixture(cgr
     release.assert_killed();
     let said =
         crate::log_capture::records_since_on_current_thread(mark, &format!("Child::drop: elevation front pid {pid}"));
-    assert_eq!(said.len(), 1, "{said:?}");
-    assert_eq!(said[0].0, log::Level::Debug, "{said:?}");
-    assert!(
-        said[0].1.contains("killed through its cgroup and reaped (signal: 9"),
-        "{said:?}"
-    );
+    assert_eq!(said, [], "a front reaped with its status needs no word");
     assert!(reaped(&front), "the drop reaps the front");
     wait_until_exited(&member);
     let mut rest = Vec::new();
@@ -770,8 +760,8 @@ fn cgroup_a_failed_password_write_terminates_a_front_that_refuses_signals(#[fixt
 }
 
 /// A failed password write whose cgroup kill fails refuses the front's kill as `kill` does,
-/// naming the failure, and sends the front nothing. The front then ends on its stdin, unsignalled,
-/// and the leaf the failed kill left behind is removed.
+/// naming the failure, and sends the front nothing. The front is handed back, ends on its stdin,
+/// unsignalled, and the leaf the failed kill left behind is removed.
 #[skuld::test]
 fn cgroup_a_failed_password_write_whose_cgroup_kill_fails_refuses_as_kill_does(#[fixture(cgroup)] _group: &Group) {
     let (child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
@@ -793,15 +783,17 @@ fn cgroup_a_failed_password_write_whose_cgroup_kill_fails_refuses_as_kill_does(#
         )
         .expect_err("a failed write fails the spawn")
     };
-    let (err, fate) = err.expect_may_have_started_with();
+    let release = stdin.take().expect("the teardown must not release the front");
+    let (err, fate, handed_back) = err.expect_may_have_started_parts(release);
     assert_eq!(
         fate,
         crate::error::ChildFate::Running { id: Some(id) },
         "a front its cgroup kill did not end may be running"
     );
     assert_front_refused_by_its_cgroup_kill(&err, pid);
-    drop(stdin.take().expect("the teardown must not release the front"));
-    assert_reaped_unsignalled(pid);
+    handed_back.unreaped();
+    let status = handed_back.wait();
+    assert!(status.success(), "the front was signalled: {status:?}");
     std::fs::remove_dir(&leaf).unwrap_or_else(|e| panic!("remove the leaf {}: {e}", leaf.display()));
 }
 
@@ -1068,19 +1060,29 @@ pub(crate) fn failed_held_front_spawns(
     })
 }
 
-/// Each failure notes its front was killed by its leaf and reaped, and the teardown's own wait
-/// reaped it dead of `SIGKILL`, as `reaps` recorded.
+/// Each failure notes its front was killed by its leaf and reaped. With `reaps` (the async spawn's
+/// wait, which records its reap), the teardown's own wait reaped it dead of `SIGKILL`. Without (the
+/// sync spawn's look, which records none), the front is gone from the test's reach: the teardown
+/// reaped it; `failed_held_front_spawns` has already seen the leaf's kill end it.
 #[track_caller]
 pub(crate) fn assert_killed_by_the_leaf(
     failures: &[HeldFailure; 2],
-    reaps: &crate::child::spawn::fault::TeardownReaps,
+    reaps: Option<&crate::child::spawn::fault::TeardownReaps>,
 ) {
-    let recorded = reaps.recorded();
     for HeldFailure { err, pid, .. } in failures {
         let text = err.to_string();
         assert_eq!(err.fate(), Some(crate::error::ChildFate::Reaped), "{text}");
         assert!(text.contains(&format!("pid {pid} is what sudo left")), "{text}");
         assert!(text.contains("its cgroup's kill ended it, and it was reaped"), "{text}");
+        let Some(reaps) = reaps else {
+            assert_eq!(
+                crate::child::front_kill_tests::reap(*pid),
+                None,
+                "the teardown reaped front {pid}"
+            );
+            continue;
+        };
+        let recorded = reaps.recorded();
         let status = recorded
             .iter()
             .find_map(|(reaped, status)| (reaped == pid).then_some(*status))
@@ -1093,11 +1095,12 @@ pub(crate) fn assert_killed_by_the_leaf(
     }
 }
 
-/// Each failure notes its front was left unreaped, and the teardown never waited on it: its stdin
-/// is still held. Then ends each front by closing its stdin, reaps it, unsignalled, and removes
-/// the leaf a failed kill left behind with it.
+/// Each failure notes its front was handed back (`handed_back`: the sync spawn) or left unreaped
+/// (the async spawn), and the teardown never waited on it: its stdin is still held. Then ends each
+/// front by closing its stdin, reaps it, unsignalled, and removes the leaf a failed kill left behind
+/// with it.
 #[track_caller]
-pub(crate) fn assert_left_running(kill: LeafKill, failures: [HeldFailure; 2]) {
+pub(crate) fn assert_left_running(kill: LeafKill, failures: [HeldFailure; 2], handed_back: bool) {
     for HeldFailure {
         err,
         pid,
@@ -1112,14 +1115,22 @@ pub(crate) fn assert_left_running(kill: LeafKill, failures: [HeldFailure; 2]) {
             "{text}"
         );
         assert!(text.contains(&format!("pid {pid} is what sudo left")), "{text}");
+        let left = if handed_back {
+            "handed back to the caller"
+        } else {
+            "left unreaped"
+        };
         assert!(
-            text.contains("the elevated program may be running; it is left unreaped"),
+            text.contains(&format!("the elevated program may be running; it is {left}")),
             "{text}"
         );
         assert!(
             stdin.borrow().is_some(),
             "the teardown waited on front {pid}, which no kill reached"
         );
+        // The front's stdin is held by the test (`stdin`), not by the helper.
+        let (_, _, held) = crate::test_child::expect_may_have_started_parts(err, ());
+        assert_eq!(!held.is_none(), handed_back, "{text}");
         let own = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).expect("read the front's cgroup");
         let path = own
             .lines()
@@ -1127,7 +1138,11 @@ pub(crate) fn assert_left_running(kill: LeafKill, failures: [HeldFailure; 2]) {
             .expect("a cgroup v2 `0::` line")
             .to_owned();
         drop(stdin.borrow_mut().take());
-        let status = crate::child::front_kill_tests::reap(pid).expect("the front was left unreaped");
+        let status = if held.is_none() {
+            crate::child::front_kill_tests::reap(pid).expect("the front was left unreaped")
+        } else {
+            held.wait()
+        };
         assert!(status.success(), "front {pid} was signalled: {status:?}");
         // The cgroup the front was left in, if the test made it or a failed kill left it behind.
         if matches!(kill, LeafKill::Fails | LeafKill::MissesIntoNamesake) {
@@ -1137,40 +1152,13 @@ pub(crate) fn assert_left_running(kill: LeafKill, failures: [HeldFailure; 2]) {
     }
 }
 
-/// A failed spawn's teardown drops a contained front's leaf first, whose kill ends it, then waits
-/// for it through its pidfd, reaps it and says so, on the error it would have returned anyway. The
-/// front's stdin stays open, so only the kill ends it. The teardown is made to see the front still
-/// running, as it can: a task leaves its cgroup, which ends the leaf's drain, before its parent can
-/// collect it.
+/// A failed spawn's teardown drops a contained front's leaf first, whose kill ends it, then looks at
+/// it, waits for it through its pidfd if it is still dying, reaps it and says so, on the error it
+/// would have returned anyway. The front's stdin stays open, so only the kill ends it.
 #[skuld::test]
 fn cgroup_a_failed_spawn_kills_a_contained_front_and_reaps_it(#[fixture(cgroup)] _group: &Group) {
-    let _running = crate::child::spawn::fault::see_fronts_running();
-    let reaps = crate::child::spawn::fault::record_teardown_reaps();
     let failures = failed_held_front_spawns(LeafKill::Lands, |cmd| cmd.spawn().map(drop));
-    assert_killed_by_the_leaf(&failures, &reaps);
-}
-
-/// A failed spawn's teardown reads a front its leaf's kill has made a zombie, with its own wait,
-/// not the seam that has it see the front running: the real read finds the zombie and reaps it,
-/// waiting for nothing. The teardown first waits (without reaping) until the front is a zombie, so
-/// the read is not a race with the kill. Mutant: "a zombie front is left unreaped".
-#[skuld::test]
-fn cgroup_a_failed_spawn_reaps_a_front_its_leaf_made_a_zombie_without_waiting(#[fixture(cgroup)] _group: &Group) {
-    let _zombie = crate::child::spawn::fault::exit_fronts_before_teardown();
-    crate::containment::cgroup::fault::record_leaf_steps();
-    let reaps = crate::child::spawn::fault::record_teardown_reaps();
-    let failures = failed_held_front_spawns(LeafKill::Lands, |cmd| cmd.spawn().map(drop));
-    for HeldFailure { err, pid, .. } in &failures {
-        let text = err.to_string();
-        assert!(text.contains(&format!("pid {pid} is what sudo left")), "{text}");
-        assert!(text.contains("and it was reaped"), "{text}");
-        assert_eq!(
-            crate::child::front_kill_tests::reap(*pid),
-            None,
-            "the teardown's read reaped front {pid}"
-        );
-    }
-    assert_eq!(reaps.recorded(), [], "the zombie was reaped by the read, not by a wait");
+    assert_killed_by_the_leaf(&failures, None);
 }
 
 /// A failed spawn's front, its place read through `/proc` alone, is killed by its leaf and reaped:
@@ -1178,37 +1166,35 @@ fn cgroup_a_failed_spawn_reaps_a_front_its_leaf_made_a_zombie_without_waiting(#[
 /// removal answers.
 #[skuld::test]
 fn cgroup_a_failed_spawn_kills_a_front_read_through_proc_and_reaps_it(#[fixture(cgroup)] _group: &Group) {
-    let _running = crate::child::spawn::fault::see_fronts_running();
-    let reaps = crate::child::spawn::fault::record_teardown_reaps();
     let failures = failed_held_front_spawns(LeafKill::LandsReadThroughProc, |cmd| cmd.spawn().map(drop));
-    assert_killed_by_the_leaf(&failures, &reaps);
+    assert_killed_by_the_leaf(&failures, None);
 }
 
 /// A failed spawn whose front was moved into a live cgroup named as `/proc` prints the removed leaf
-/// leaves it running. A filler kept in the leaf makes the leaf's kill land, so nothing but the
+/// hands it back, running. A filler kept in the leaf makes the leaf's kill land, so nothing but the
 /// record tells the front from one the kill reached: before the leaf's removal, with the leaf live,
 /// the front read the leaf's path with ` (deleted)` after it, so it was recorded outside, and the
 /// record answers once the leaf is gone.
 #[skuld::test]
-fn cgroup_a_failed_spawn_leaves_a_front_in_a_namesake_of_its_leaf_running(#[fixture(cgroup)] _group: &Group) {
+fn cgroup_a_failed_spawn_hands_back_a_front_in_a_namesake_of_its_leaf(#[fixture(cgroup)] _group: &Group) {
     let kill = LeafKill::MissesIntoNamesake;
-    assert_left_running(kill, failed_held_front_spawns(kill, |cmd| cmd.spawn().map(drop)));
+    assert_left_running(kill, failed_held_front_spawns(kill, |cmd| cmd.spawn().map(drop)), true);
 }
 
-/// A failed spawn whose leaf's kill fails leaves its front running: in its leaf, but reached by
+/// A failed spawn whose leaf's kill fails hands back its front, running: in its leaf, but reached by
 /// nothing, so it is not waited for.
 #[skuld::test]
-fn cgroup_a_failed_spawn_whose_leaf_kill_fails_leaves_the_front_running(#[fixture(cgroup)] _group: &Group) {
+fn cgroup_a_failed_spawn_whose_leaf_kill_fails_hands_back_the_front(#[fixture(cgroup)] _group: &Group) {
     let kill = LeafKill::Fails;
-    assert_left_running(kill, failed_held_front_spawns(kill, |cmd| cmd.spawn().map(drop)));
+    assert_left_running(kill, failed_held_front_spawns(kill, |cmd| cmd.spawn().map(drop)), true);
 }
 
-/// A failed spawn whose front was moved out of its leaf leaves it running: the leaf's kill did not
-/// reach it, so it is not waited for.
+/// A failed spawn whose front was moved out of its leaf hands it back, running: the leaf's kill did
+/// not reach it, so it is not waited for.
 #[skuld::test]
-fn cgroup_a_failed_spawn_leaves_a_front_moved_out_of_its_leaf_running(#[fixture(cgroup)] _group: &Group) {
+fn cgroup_a_failed_spawn_hands_back_a_front_moved_out_of_its_leaf(#[fixture(cgroup)] _group: &Group) {
     let kill = LeafKill::MissesMovedFront;
-    assert_left_running(kill, failed_held_front_spawns(kill, |cmd| cmd.spawn().map(drop)));
+    assert_left_running(kill, failed_held_front_spawns(kill, |cmd| cmd.spawn().map(drop)), true);
 }
 
 /// A contained front that outlives the grace is killed through its cgroup alone. Its `cat` ignores
@@ -1453,10 +1439,8 @@ fn cgroup_a_front_nested_under_its_leaf_is_killed_under_hidepid(#[fixture(cgroup
 /// sweep's record places it; the teardown waits for it and reaps it.
 #[skuld::test]
 fn cgroup_a_failed_spawn_kills_a_front_nested_under_its_leaf_under_hidepid(#[fixture(cgroup)] _group: &Group) {
-    let _running = crate::child::spawn::fault::see_fronts_running();
-    let reaps = crate::child::spawn::fault::record_teardown_reaps();
     let failures = failed_held_front_spawns(LeafKill::LandsNestedHidden, |cmd| cmd.spawn().map(drop));
-    assert_killed_by_the_leaf(&failures, &reaps);
+    assert_killed_by_the_leaf(&failures, None);
 }
 
 /// A front in a cgroup under its leaf behind a mount, which the walk cannot list: its place is
@@ -1730,45 +1714,64 @@ pub(crate) fn front_its_leaf_did_not_take() -> (Command, PipeWriter) {
 }
 
 /// Spawns `cmd`, a front, through `spawn` with its identity check failing (`Gone`), and returns the
-/// error with the child's pid. The front is left running, and no identity was read for it.
-pub(crate) fn fail_the_identity_check(
+/// error with the child's pid and the front it handed back, if it did, with `release` (the front's
+/// stdin). The front is still running, and no identity was read for it.
+pub(crate) fn fail_the_identity_check<R>(
     cmd: &mut Command,
     spawn: impl FnOnce(&mut Command) -> Result<(), crate::error::Error>,
-) -> (crate::error::Error, u32) {
+    release: R,
+) -> (crate::error::Error, u32, crate::test_child::HandedBack<R>) {
     use crate::child::spawn::fault;
     fault::set_force_identity_vanished(true);
     let result = spawn(cmd);
     fault::set_force_identity_vanished(false);
-    let (err, fate) = crate::child::spawn::failure::expect_may_have_started_with(
+    let (err, fate, handed_back) = crate::test_child::expect_may_have_started_parts(
         result.expect_err("the forced identity failure fails the spawn"),
+        release,
     );
     assert_eq!(fate, crate::error::ChildFate::Running { id: None }, "{err:?}");
     let crate::identity::Resolved::Found(id) = fault::take_captured().expect("the seam captured the child") else {
         panic!("the seam must capture a resolved identity");
     };
-    (err, id.pid())
+    (err, id.pid(), handed_back)
 }
 
-/// `err` notes that the front `pid` is left unreaped, and closing `stdin` then ends it unsignalled.
+/// `err` notes that the front `pid` is handed back (`handed_back` holds it: the sync spawn) or left
+/// unreaped (it holds none: the async spawn), and releasing the front then ends it unsignalled.
 #[track_caller]
-pub(crate) fn assert_left_unsignalled(err: &crate::error::Error, pid: u32, stdin: PipeWriter) {
+pub(crate) fn assert_left_unsignalled<R>(
+    err: &crate::error::Error,
+    pid: u32,
+    handed_back: crate::test_child::HandedBack<R>,
+) {
     let text = err.to_string();
     assert!(text.contains(&format!("pid {pid} is what sudo left")), "{text}");
+    let left = if handed_back.is_none() {
+        "left unreaped"
+    } else {
+        "handed back to the caller"
+    };
     assert!(
-        text.contains("the elevated program may be running; it is left unreaped"),
+        text.contains(&format!("the elevated program may be running; it is {left}")),
         "{text}"
     );
-    drop(stdin);
-    assert_reaped_unsignalled(pid);
+    if handed_back.is_none() {
+        drop(handed_back);
+        assert_reaped_unsignalled(pid);
+    } else {
+        let status = handed_back.wait();
+        assert!(status.success(), "the front was signalled: {status:?}");
+    }
 }
 
-/// A front whose leaf did not take it is uncontained: a failed identity check sends it nothing, and
-/// says so.
+/// A front whose leaf did not take it is uncontained: a failed identity check sends it nothing,
+/// hands it back, and says so.
 #[skuld::test]
-fn cgroup_a_front_its_leaf_did_not_take_is_left_by_a_failed_identity_check(#[fixture(cgroup)] _group: &Group) {
+fn cgroup_a_front_its_leaf_did_not_take_is_handed_back_by_a_failed_identity_check(#[fixture(cgroup)] _group: &Group) {
     let (mut cmd, stdin) = front_its_leaf_did_not_take();
-    let (err, pid) = fail_the_identity_check(&mut cmd, |cmd| cmd.spawn().map(drop));
-    assert_left_unsignalled(&err, pid, stdin);
+    let (err, pid, handed_back) = fail_the_identity_check(&mut cmd, |cmd| cmd.spawn().map(drop), stdin);
+    assert!(!handed_back.is_none(), "a sync spawn hands the front back");
+    assert_left_unsignalled(&err, pid, handed_back);
 }
 
 /// A front spawn that cannot capture its leaf's subtree (the cgroup id read fails) says so at
@@ -1797,7 +1800,7 @@ fn cgroup_a_failed_spawn_says_why_its_leaf_did_not_take_the_child(#[fixture(cgro
     crate::log_capture::install();
     let (mut cmd, stdin) = front_its_leaf_did_not_take();
     let mark = crate::log_capture::mark();
-    let (err, pid) = fail_the_identity_check(&mut cmd, |cmd| cmd.spawn().map(drop));
+    let (err, pid, handed_back) = fail_the_identity_check(&mut cmd, |cmd| cmd.spawn().map(drop), stdin);
     let logs = crate::log_capture::records_since_on_current_thread(mark, "not placed in its leaf");
     assert_eq!(logs.len(), 1, "{logs:?}");
     assert_eq!(logs[0].0, log::Level::Debug);
@@ -1805,5 +1808,5 @@ fn cgroup_a_failed_spawn_says_why_its_leaf_did_not_take_the_child(#[fixture(cgro
         logs[0].1.contains(&format!("child {pid} is not in the leaf cgroup")),
         "{logs:?}"
     );
-    assert_left_unsignalled(&err, pid, stdin);
+    assert_left_unsignalled(&err, pid, handed_back);
 }
