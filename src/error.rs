@@ -121,7 +121,12 @@ pub enum RecordErrorKind {
 pub enum Error {
     #[error("argument parsing failed: {0}")]
     Quote(#[from] QuoteError),
-    #[error(transparent)]
+    /// An I/O error.
+    ///
+    /// The OS code may sit on an `io::Error` further down the chain, under context cosca added:
+    /// walk `source()` from this `Error` and take the first `io::Error` whose `raw_os_error()` is
+    /// `Some`.
+    #[error("{0}")]
     Io(#[from] std::io::Error),
     /// An operation isn't available on this platform / in this build.
     ///
@@ -396,18 +401,30 @@ impl Error {
         }
     }
 
-    /// The OS error code of an [`Error::Io`], for a look whose failure is told apart by it.
+    /// The OS error code of an [`Error::Io`], for a look whose failure is told apart by it: the
+    /// first of [`io_errors`](Error::io_errors) that has one. `None` for any other variant.
     #[cfg(any(unix, feature = "tokio"))]
     pub(crate) fn raw_os_error(&self) -> Option<i32> {
-        match self {
-            Error::Io(e) => e.raw_os_error(),
+        self.io_errors().find_map(std::io::Error::raw_os_error)
+    }
+
+    /// The `io::Error`s down an [`Error::Io`]'s `source()` chain, outermost first; none for any
+    /// other variant. The first is the wrapped `io::Error` itself (its `source()`); under
+    /// [`io_context`] and [`with_note`](Error::with_note) that one is a code-less wrapper and the
+    /// OS error comes below it.
+    #[cfg(any(unix, feature = "tokio", test))]
+    pub(crate) fn io_errors(&self) -> impl Iterator<Item = &std::io::Error> {
+        let start = match self {
+            Error::Io(_) => std::error::Error::source(self),
             _ => None,
-        }
+        };
+        std::iter::successors(start, |s| s.source()).filter_map(|s| s.downcast_ref::<std::io::Error>())
     }
 
     /// This error with `note` appended to what it says, its variant and kind kept: a caller that
     /// matches on the variant still sees the cause. An [`Error::Io`] keeps its kind, and its
-    /// original error as the [`source`](std::error::Error::source), which keeps the OS code.
+    /// original error as the [`source`](std::error::Error::source), so the OS code stays where
+    /// `Error::raw_os_error`, the walk described on [`Error::Io`], finds it.
     #[cfg_attr(not(unix), allow(dead_code, reason = "only the unix spawn teardowns add a note"))]
     pub(crate) fn with_note(self, note: &str) -> Error {
         let append = |detail: String| format!("{detail}; {note}");
