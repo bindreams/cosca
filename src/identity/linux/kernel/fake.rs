@@ -58,10 +58,11 @@ impl<'a> FakeKernel<'a> {
         }
     }
 
-    /// A kernel over `real` whose `/proc` lists `pid` alone, and whose `stat` read of it fails with
-    /// the raw `errno`: what a whole-table scan meets in one pid.
+    /// A kernel over `real` whose `/proc` is this namespace's own and lists `pid` alone, and whose
+    /// `stat` read of it fails with the raw `errno`: what a whole-table scan meets in one pid.
     pub(crate) fn listing_unreadable_pid(real: &'a dyn Kernel, pid: u32, errno: i32) -> Self {
         Self::over(real)
+            .same_view()
             .on_pids(Ok(&[pid]))
             .on_read(&format!("{pid}/stat"), Err(errno))
     }
@@ -83,6 +84,11 @@ impl<'a> FakeKernel<'a> {
     pub(crate) fn on_pids(mut self, answer: Result<&[u32], i32>) -> Self {
         self.pids = Some(answer.map(<[u32]>::to_vec));
         self
+    }
+
+    /// `self/status` shows the pid in one namespace: `/proc` is this namespace's own.
+    pub(crate) fn same_view(self) -> Self {
+        self.on_read("self/status", Ok(b"NSpid:\t4242\n"))
     }
 
     /// `self/status` shows the pid in two namespaces: `/proc` is an outer namespace's.

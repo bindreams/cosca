@@ -141,7 +141,7 @@ fn eperm_is_unassessable_when_the_checked_directory_also_refuses() {
 /// Mutant: "an unlistable `/proc` is an empty snapshot".
 #[skuld::test]
 fn an_unlistable_proc_is_unassessable_naming_the_errno() {
-    let kernel = FakeKernel::over(&HostKernel).on_pids(Err(libc::EIO));
+    let kernel = FakeKernel::over(&HostKernel).same_view().on_pids(Err(libc::EIO));
     match process_parents_with(&kernel) {
         Err(crate::error::Error::Unassessable { detail, source }) => {
             assert!(detail.contains("/proc could not be listed"), "{detail}");
@@ -170,6 +170,7 @@ fn an_unparsable_stat_is_unassessable_naming_the_pid() {
 #[should_panic(expected = "the kernel printed an unparseable stat")]
 fn an_unparsable_stat_in_the_scan_is_asserted_in_debug() {
     let kernel = FakeKernel::over(&HostKernel)
+        .same_view()
         .on_pids(Ok(&[PID]))
         .on_read(&format!("{PID}/stat"), Ok(b"garbage"));
     drop(process_parents_with(&kernel));
@@ -181,6 +182,7 @@ fn an_unparsable_stat_in_the_scan_is_asserted_in_debug() {
 #[skuld::test]
 fn an_unparsable_stat_in_the_scan_is_unassessable_in_release() {
     let kernel = FakeKernel::over(&HostKernel)
+        .same_view()
         .on_pids(Ok(&[PID]))
         .on_read(&format!("{PID}/stat"), Ok(b"garbage"));
     match process_parents_with(&kernel) {
