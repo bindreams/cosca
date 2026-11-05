@@ -136,6 +136,34 @@ fn a_candidate_that_orders_before_its_accepted_parent_is_dropped_with_its_subtre
     }
 }
 
+/// Windows runs the walk with its own consts, `ALLOW_EQUAL_ORDER` and `ORDER_AFTER_PARENT`, and
+/// the table above is the reused-creator edge: the creator read passes it (the candidate's creator
+/// pid is its accepted parent's pid), so only the order rule drops it. Nothing real reaches this
+/// edge, as a creator always has the lower sequence number, so the stub states it.
+///
+/// Mutant (CI runs this row; no other row pins the consts on Windows): `ORDER_AFTER_PARENT` is
+/// `false` on Windows, or `descendants_from_key` passes the flags swapped.
+#[cfg(windows)]
+#[skuld::test]
+fn on_windows_a_reused_creator_edge_is_dropped_under_the_production_consts() {
+    use super::{ALLOW_EQUAL_ORDER, ORDER_AFTER_PARENT};
+    let parents = [(200, ROOT_PID), (300, 200), (400, 300)];
+    let tokens = HashMap::from([
+        (200u32, ROOT_TOKEN + 10),
+        (300u32, ROOT_TOKEN + 5), // after the root, before its accepted parent
+        (400u32, ROOT_TOKEN + 20),
+    ]);
+    let got = descendants_with(
+        root(),
+        root_key(),
+        &parents,
+        ALLOW_EQUAL_ORDER,
+        ORDER_AFTER_PARENT,
+        resolver(&tokens),
+    );
+    assert_eq!(pids(got), [200]);
+}
+
 /// A real chain, each key after its parent's, is kept under every setting.
 #[skuld::test]
 fn a_chain_whose_keys_each_follow_their_parents_is_kept_under_both_settings() {
@@ -397,14 +425,39 @@ fn resolve_or_drop_drops_an_access_denied_pid_and_warns() {
     assert!(denied.is_running(), "and dropping it must not have touched it");
 }
 
-/// The Windows wiring of the parent-order rule, through `descendants_from_key` with real processes:
-/// `y` started before `x`, both after the root (this process). A snapshot that names `x` as `y`'s
-/// parent is a stale creator edge: `y` orders after the root but before its claimed parent, so it
-/// is dropped. Named the other way round, the same processes are a genuine chain. Mutants (const
-/// false on Windows; flags swapped in `descendants_from_key`) keep `y` under `x`.
+/// The text of `resolve_or_drop`'s warn for a candidate whose creator-pid query was refused: the
+/// cause reaches `unqueryable_read`, which words it, so the warn names the pid and the `NTSTATUS`
+/// and does not fall back to "access denied?".
+///
+/// The failed query itself is not driven through the walk: forcing one needs a hook in production
+/// code, and Windows has no `FakeKernel` methods to state it in.
+///
+/// Mutant: `into_error` drops the creator status.
 #[cfg(windows)]
 #[skuld::test]
-fn a_real_candidate_that_started_before_its_claimed_parent_is_dropped_on_windows() {
+fn a_refused_creator_query_is_worded_with_its_status_in_the_walks_warn_on_windows() {
+    let refused = windows::Win32::Foundation::NTSTATUS(0xC000_0004_u32 as i32);
+    let cause = crate::identity::UnknownCause::default().with_creator_status(refused);
+    let crate::error::Error::Unassessable { detail, .. } = super::unqueryable_read(7, cause) else {
+        panic!("a refused creator query is Unassessable");
+    };
+    assert_eq!(
+        detail,
+        "pid 7 exists but its creator process id query failed: NTSTATUS 0xc0000004"
+    );
+}
+
+/// The Windows wiring of the walk to the creator read, through `descendants_from_key` with real
+/// processes: `x` and `y` are both children of the root (this process). A snapshot that names `x` as
+/// `y`'s parent is a stale creator edge: `y`'s own creator is the root, so it is dropped under `x`
+/// and kept under the root. `x` is spawned first, so `y`'s key follows `x`'s and the parent-order
+/// rule passes the edge: only the creator read drops `y`. (A real edge that breaks the rule names a
+/// creator that is not the process's, which the creator read catches first, so the stub rows pin
+/// that rule.)
+/// Mutant: `resolve_or_drop` passes no parent to the read.
+#[cfg(windows)]
+#[skuld::test]
+fn a_real_candidate_is_dropped_under_a_parent_that_is_not_its_creator_on_windows() {
     use crate::identity::HostKernel;
     use crate::test_child::{live_findstr_blocker, release_findstr_unterminated};
 
@@ -412,23 +465,18 @@ fn a_real_candidate_that_started_before_its_claimed_parent_is_dropped_on_windows
     let root_key = super::anchor(&HostKernel, root)
         .expect("the root reads")
         .expect("the root is live");
-    // `y` is created first, so its sequence number is the lower.
-    let (y_child, y) = live_findstr_blocker();
     let (x_child, x) = live_findstr_blocker();
+    let (y_child, y) = live_findstr_blocker();
 
     let stale_creator = [(x.pid(), root.pid()), (y.pid(), x.pid())];
-    assert_eq!(
-        super::descendants_from_key(&HostKernel, root, root_key, &stale_creator),
-        vec![x]
-    );
-    let genuine = [(y.pid(), root.pid()), (x.pid(), y.pid())];
-    assert_eq!(
-        super::descendants_from_key(&HostKernel, root, root_key, &genuine),
-        vec![y, x]
-    );
+    let dropped = super::descendants_from_key(&HostKernel, root, root_key, &stale_creator);
+    let genuine = [(x.pid(), root.pid()), (y.pid(), root.pid())];
+    let kept = super::descendants_from_key(&HostKernel, root, root_key, &genuine);
 
     release_findstr_unterminated(x_child);
     release_findstr_unterminated(y_child);
+    assert_eq!(dropped, vec![x]);
+    assert_eq!(kept, vec![x, y]);
 }
 
 /// `kill_by_identity`-s pre-open Denied arm - the outcome that can leave a process running.
