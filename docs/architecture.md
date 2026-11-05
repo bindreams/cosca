@@ -88,7 +88,9 @@ In order:
    - Under `MacChild` ([#877](https://github.com/bindreams/cosca/issues/877), the macOS
      kernel-view slice): `exit_only::{peek, peek_verified, peek_traced}` still consult the
      `exit_only::seams` hook; five macOS tests need it, and `MacChild::event_pending` (a `cfg(test)`
-     accessor) goes with it. `LinuxProcess` no longer does. That slice also removes
+     accessor) goes with it. `LinuxProcess` no longer does. The macOS arm of the `unreadable` test
+     helper still answers through the thread-local `force_unknown` hook until that slice gives
+     macOS `Kernel` methods. That slice also removes
      `block_probe::on_round` and `on_every_round`, the `cfg(test)` round hooks of `wait.rs`.
 2. **Elevation backends:** a black box that says what the tracked process is (the program, or a
    wrapper that outlives it) and what may be signalled. `Child` asks it; it stops knowing sudo,

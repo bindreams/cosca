@@ -5,8 +5,8 @@
 //! 1-second start-time granularity is useless as an ordering key, and it pulls a
 //! second major `windows` version.
 
-use crate::error::Error;
-use crate::identity::{Kernel, RawPid};
+#[cfg(target_os = "macos")]
+use crate::identity::RawPid;
 
 #[cfg_attr(windows, path = "enumerate/windows.rs")]
 #[cfg_attr(target_os = "linux", path = "enumerate/linux.rs")]
@@ -22,12 +22,11 @@ compile_error!("cosca::containment::enumerate is implemented only for Windows, L
 ///
 /// # Errors
 ///
-/// [`Error::Unassessable`] naming the cause when no trustworthy snapshot can be taken
-/// ([`Error::Unsupported`] on Linux without `openat2`). An empty `Ok` means the host has no
-/// processes: a walk over a failed snapshot would find no descendants and skip every kill and wait.
-pub(crate) fn process_parents(kernel: &dyn Kernel) -> Result<Vec<(RawPid, RawPid)>, Error> {
-    backend::process_parents(kernel)
-}
+/// [`Error::Unassessable`](crate::error::Error::Unassessable) naming the cause when no trustworthy
+/// snapshot can be taken ([`Error::Unsupported`](crate::error::Error::Unsupported) on Linux without
+/// `openat2`). An empty `Ok` means the host has no processes: a walk over a failed snapshot would
+/// find no descendants and skip every kill and wait.
+pub(crate) use backend::process_parents;
 
 /// Every listable pid plus the `(pid, ppid)` edges plus the denied-ppid-read count, from one
 /// enumeration (macOS only — the fd-marker sweep needs all three, consistently, so it cannot
