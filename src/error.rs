@@ -237,8 +237,9 @@ pub enum Error {
     /// `Command::output`, `status` and `read`, sync and tokio, return this variant for every
     /// failure after their spawn succeeded. They tear the child down then, as its drop would (see
     /// `kill_on_drop`), and the fate says what that did; `read`'s invalid UTF-8 comes after the exit
-    /// was collected (`Reaped`). When the sync methods' teardown cannot kill the child and it still
-    /// runs, they return it in `unreaped`. The tokio methods do not: they leave it running and warn,
+    /// was collected (`Reaped`). When the sync methods' teardown cannot end the child (a refused
+    /// kill, or an elevation front, which is sent none) and it still runs, they return it in
+    /// `unreaped`. The tokio methods do not: they leave it running and warn,
     /// with `unreaped` `None` and `fate` `Running`, until the async child can wait for one (a
     /// blocking wait on a runtime thread is forbidden). So do
     /// [`SuspendedChild::resume`](crate::SuspendedChild::resume) and its tokio twin for the frozen
@@ -286,7 +287,7 @@ pub enum ChildFate {
     Killed,
     /// The child may still be running: cosca left it alone (an elevation front, which it never
     /// signals, a child it could not show to be its own, or one `kill_on_drop(false)` keeps) or
-    /// could not kill it. A child it could not kill may come back to the caller: see the `unreaped`
+    /// could not kill it. A child it could not end may come back to the caller: see the `unreaped`
     /// field of [`Error::MayHaveStarted`].
     ///
     /// `id` is its identity when the spawn had read one, and `None` when the failure came before

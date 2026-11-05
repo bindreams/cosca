@@ -1,5 +1,6 @@
-//! [`Unreaped`]: a child a failed spawn or a failed `status`, `output` or `read` could not end,
-//! handed to the caller who owns it.
+//! [`Unreaped`]: a child a failed spawn or a failed `status`, `output` or `read` could not end (its
+//! kill was refused, or it is an elevation front, which is sent none), handed to the caller who owns
+//! it.
 
 use std::process::ExitStatus;
 
@@ -13,13 +14,16 @@ use crate::os_process::child_named;
 
 /// A child a failed spawn, or a sync [`Command::status`](crate::Command::status),
 /// [`output`](crate::Command::output) or [`read`](crate::Command::read) that failed after it, could
-/// not end: its kill was refused (`EPERM`, `ACCESS_DENIED`) and it still runs. It comes back in
+/// not end: its kill was refused (`EPERM`, `ACCESS_DENIED`), or it is an elevation front, which is
+/// sent no kill because one would orphan the elevated program; and it still runs. It comes back in
 /// [`Error::MayHaveStarted`], which the caller owns from then on.
 ///
 /// Settle it with [`wait`](Unreaped::wait), which blocks until the child exits and reaps it, or
 /// [`leak`](Unreaped::leak), which gives it up. A value dropped otherwise does what `wait` does,
 /// then logs one line naming the child. So the drop blocks: in async code, take the value off the
-/// runtime thread (`spawn_blocking`) or `leak` it.
+/// runtime thread (`spawn_blocking`) or `leak` it. For a front the wait ends when the front does,
+/// which is when its program does, no later than the call that failed would have waited had it
+/// succeeded; `leak` is how to not wait for it at all.
 ///
 /// A value dropped while its thread is panicking does not wait: it gives the child up, which keeps
 /// running unreaped until this process exits, and logs one `warn` naming its pid.

@@ -89,7 +89,8 @@ pub(crate) enum LookOutcome {
     LookFailed(Error),
     /// A kill sent elsewhere ended it, and the reap failed.
     ReapFailed(Error),
-    /// It is running and no kill reached it: it is left running and unreaped.
+    /// It is running and no kill reached it: it is left running and unreaped, or handed back by a
+    /// caller that does ([`Disposition::HandBack`]).
     LeftRunning,
     /// Where it is could not be read, so whether a kill reached it is not known: it is left
     /// unreaped.

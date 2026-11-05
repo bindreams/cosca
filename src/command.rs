@@ -948,7 +948,7 @@ impl Command {
     /// Run to completion capturing stdout+stderr (stdin is connected to null).
     ///
     /// Fails as [`spawn`](Self::spawn) does, and with [`Error::MayHaveStarted`] after it. A child
-    /// the teardown could not kill is in the error's `unreaped`.
+    /// the teardown could not end is in the error's `unreaped`.
     pub fn output(&mut self) -> Result<crate::Output, Error> {
         self.apply_default_stdin(crate::Stdio::null())?;
         self.stdout(crate::Stdio::pipe())?;
@@ -963,7 +963,7 @@ impl Command {
     /// Run to completion with inherited stdio, returning the exit status.
     ///
     /// Fails as [`spawn`](Self::spawn) does, and with [`Error::MayHaveStarted`] after it. A child
-    /// the teardown could not kill is in the error's `unreaped`.
+    /// the teardown could not end is in the error's `unreaped`.
     pub fn status(&mut self) -> Result<crate::ExitStatus, Error> {
         // Force inherit so a caller who previously called .stdout(pipe()) does
         // not get a pump-free wait() that deadlocks once the pipe buffer fills.
@@ -981,7 +981,7 @@ impl Command {
     /// stderr inherited). Errors on invalid UTF-8; output is verbatim (no trim).
     ///
     /// Fails as [`spawn`](Self::spawn) does, and with [`Error::MayHaveStarted`] after it. A child
-    /// the teardown could not kill is in the error's `unreaped`.
+    /// the teardown could not end is in the error's `unreaped`.
     pub fn read(&mut self) -> Result<String, Error> {
         self.apply_default_stdin(crate::Stdio::null())?;
         self.stdout(crate::Stdio::pipe())?;
