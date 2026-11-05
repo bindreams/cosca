@@ -1381,7 +1381,7 @@ impl Marker {
                 new_walk.push(root);
             }
             if !blind {
-                for id in crate::containment::treewalk::descendants(root, &parents) {
+                for id in crate::containment::treewalk::descendants(&crate::identity::HostKernel, root, &parents) {
                     if seen.insert(id) {
                         new_walk.push(id);
                     }
@@ -1514,7 +1514,7 @@ impl Marker {
             // that WAS resolved — a known member left running, not a gap in discovery. Not
             // retried (see this fn's doc); folded into `incomplete`. Anything else
             // (`Terminated`, `AlreadyGone`) is a real resolution: progress.
-            if crate::containment::treewalk::kill_by_identity(id, signal)
+            if crate::containment::treewalk::kill_by_identity(&crate::identity::HostKernel, id, signal)
                 == crate::containment::treewalk::KillOutcome::NotAttempted
             {
                 *incomplete = true;
@@ -1616,7 +1616,7 @@ impl Marker {
             }
             MarkerQuery::Held => {
                 use crate::containment::treewalk::KillOutcome;
-                let outcome = crate::containment::treewalk::kill_by_identity(id, signal);
+                let outcome = crate::containment::treewalk::kill_by_identity(&crate::identity::HostKernel, id, signal);
                 // From the outcome, after the call: a kill that re-verified a different process, or
                 // sent nothing, leaves no record of a holder killed.
                 #[cfg(test)]

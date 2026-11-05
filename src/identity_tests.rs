@@ -54,6 +54,23 @@ fn current_process_resolves_exists_and_is_alive() {
     assert!(me.created_at().is_some());
 }
 
+/// `of_with` and `exists_with` are the one entry on every platform: the host kernel answers as
+/// `of` and `exists` do. Mutant: "the non-Linux entry ignores the pid".
+#[skuld::test]
+fn the_host_kernel_resolves_this_process_through_of_with_and_exists_with() {
+    let me = ProcessId::current();
+    assert_eq!(ProcessId::of_with(&super::HostKernel, me.pid()).0, Resolved::Found(me));
+    assert_eq!(
+        me.exists_with(&super::HostKernel).0,
+        crate::identity::Existence::Present
+    );
+    let stale = ProcessId::from_parts_for_test(me.pid(), me.start_token_raw().wrapping_add(1));
+    assert_eq!(
+        stale.exists_with(&super::HostKernel).0,
+        crate::identity::Existence::Gone
+    );
+}
+
 #[skuld::test]
 fn start_token_raw_is_stable_and_matches_reresolved() {
     let me = ProcessId::current();

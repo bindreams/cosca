@@ -348,6 +348,7 @@ pub(crate) fn exiting_member_command() -> std::process::Command {
 
 /// An open handle on the live process `id` names. Open it before arming a fault: opening may
 /// read what the fault forces.
+#[cfg(any(windows, target_os = "macos"))]
 pub(crate) fn open_live(id: crate::identity::ProcessId) -> crate::Process {
     crate::Process::open(id)
         .expect("open the live process")

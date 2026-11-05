@@ -51,7 +51,12 @@ impl Process {
     /// an exited but unreaped one opens as for [`open`](Self::open). Errors as for `open`; a pid
     /// whose identity cannot be read is [`Error::Unassessable`].
     pub fn open_pid(pid: RawPid) -> Result<Option<Process>, Error> {
-        match ProcessId::of_explained(pid) {
+        Self::open_pid_with(&crate::identity::HostKernel, pid)
+    }
+
+    /// [`open_pid`](Self::open_pid), reading the pid's identity through `kernel`.
+    pub(crate) fn open_pid_with(kernel: &dyn crate::identity::Kernel, pid: RawPid) -> Result<Option<Process>, Error> {
+        match ProcessId::of_with(kernel, pid) {
             (Resolved::Found(id), _) => Process::open(id),
             (Resolved::Gone, _) => Ok(None),
             (Resolved::Unknown, cause) => Err(crate::containment::treewalk::unqueryable(&format!("pid {pid}"), cause)),

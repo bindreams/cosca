@@ -41,10 +41,8 @@ fn process_is_send_and_sync() {
 #[skuld::test]
 fn open_pid_of_a_pid_that_cannot_be_queried_is_unassessable() {
     let (child, id) = crate::test_child::live_exiting_member();
-    let forced = crate::identity::force_unknown_identity(id.pid());
-    let result = Process::open_pid(id.pid());
-    drop(forced);
-    match result {
+    let (kernel, _guard) = crate::identity::unreadable(id.pid());
+    match Process::open_pid_with(&kernel, id.pid()) {
         Err(Error::Unassessable { detail, .. }) => {
             assert!(
                 detail.contains(&format!("pid {} exists but could not be queried", id.pid())),

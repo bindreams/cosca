@@ -1,4 +1,4 @@
-use super::process_parents_with;
+use super::process_parents;
 use crate::identity::{FakeKernel, HostKernel, Kernel, UNREADABLE_STATUS_REASON};
 
 type Records = Vec<(log::Level, String)>;
@@ -8,7 +8,7 @@ const PID: u32 = 4242;
 fn snapshot_with(kernel: &dyn Kernel) -> (Result<Vec<(u32, u32)>, crate::error::Error>, Records) {
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
-    let got = process_parents_with(kernel);
+    let got = process_parents(kernel);
     (
         got,
         crate::log_capture::records_since_on_current_thread(mark, "enumerate::process_parents"),
@@ -57,7 +57,7 @@ fn an_unassessable_view_is_unassessable_and_warned_about_naming_the_cause() {
 fn the_ordinary_snapshot_lists_this_process_with_its_parent() {
     let me = std::process::id();
     let ppid = std::os::unix::process::parent_id();
-    assert!(crate::containment::enumerate::process_parents()
+    assert!(crate::containment::enumerate::process_parents(&HostKernel)
         .expect("the snapshot")
         .contains(&(me, ppid)));
 }
@@ -71,7 +71,7 @@ fn the_ordinary_snapshot_lists_this_process_with_its_parent() {
 fn a_pid_whose_stat_is_gone_or_hidden_is_skipped() {
     for errno in [libc::ENOENT, libc::ESRCH, libc::EACCES, libc::EPERM] {
         let kernel = FakeKernel::listing_unreadable_pid(&HostKernel, PID, errno);
-        let got = process_parents_with(&kernel).unwrap_or_else(|e| panic!("errno {errno} is an absence: {e}"));
+        let got = process_parents(&kernel).unwrap_or_else(|e| panic!("errno {errno} is an absence: {e}"));
         assert!(got.is_empty(), "errno {errno}: {got:?}");
     }
 }
@@ -92,7 +92,7 @@ fn any_other_stat_read_failure_is_unassessable_naming_pid_and_errno() {
         libc::ENOSYS,
     ] {
         let kernel = FakeKernel::listing_unreadable_pid(&HostKernel, PID, errno);
-        let text = match process_parents_with(&kernel) {
+        let text = match process_parents(&kernel) {
             Err(crate::error::Error::Unassessable { detail, source }) => {
                 assert!(source.is_some(), "errno {errno}: the read's error is the source");
                 detail
@@ -123,7 +123,7 @@ fn eperm_is_unassessable_when_the_checked_directory_also_refuses() {
     for recheck in [libc::EPERM, libc::ENOSYS, libc::EMFILE] {
         let kernel =
             FakeKernel::listing_unreadable_pid(&HostKernel, PID, libc::EPERM).on_read("self/stat", Err(recheck));
-        match process_parents_with(&kernel) {
+        match process_parents(&kernel) {
             Err(crate::error::Error::Unassessable { detail, .. }) => {
                 assert!(detail.contains("self/stat"), "{recheck}: {detail}");
                 assert!(
@@ -141,7 +141,7 @@ fn eperm_is_unassessable_when_the_checked_directory_also_refuses() {
 #[skuld::test]
 fn an_unlistable_proc_is_unassessable_naming_the_errno() {
     let kernel = FakeKernel::over(&HostKernel).same_view().on_pids(Err(libc::EIO));
-    match process_parents_with(&kernel) {
+    match process_parents(&kernel) {
         Err(crate::error::Error::Unassessable { detail, source }) => {
             assert!(detail.contains("/proc could not be listed"), "{detail}");
             assert_eq!(source.and_then(|e| e.raw_os_error()), Some(libc::EIO));
@@ -172,7 +172,7 @@ fn an_unparsable_stat_in_the_scan_is_asserted_in_debug() {
         .same_view()
         .on_pids(Ok(&[PID]))
         .on_read(&format!("{PID}/stat"), Ok(b"garbage"));
-    drop(process_parents_with(&kernel));
+    drop(process_parents(&kernel));
 }
 
 /// Without the assertion (release), the scan still refuses to drop the pid. Mutant: "an unparsable
@@ -184,7 +184,7 @@ fn an_unparsable_stat_in_the_scan_is_unassessable_in_release() {
         .same_view()
         .on_pids(Ok(&[PID]))
         .on_read(&format!("{PID}/stat"), Ok(b"garbage"));
-    match process_parents_with(&kernel) {
+    match process_parents(&kernel) {
         Err(crate::error::Error::Unassessable { detail, .. }) => {
             assert!(detail.contains("/stat has no parseable"), "{detail}")
         }

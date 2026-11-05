@@ -6,7 +6,7 @@
 //! second major `windows` version.
 
 use crate::error::Error;
-use crate::identity::RawPid;
+use crate::identity::{Kernel, RawPid};
 
 #[cfg_attr(windows, path = "enumerate/windows.rs")]
 #[cfg_attr(target_os = "linux", path = "enumerate/linux.rs")]
@@ -25,15 +25,8 @@ compile_error!("cosca::containment::enumerate is implemented only for Windows, L
 /// [`Error::Unassessable`] naming the cause when no trustworthy snapshot can be taken
 /// ([`Error::Unsupported`] on Linux without `openat2`). An empty `Ok` means the host has no
 /// processes: a walk over a failed snapshot would find no descendants and skip every kill and wait.
-pub(crate) fn process_parents() -> Result<Vec<(RawPid, RawPid)>, Error> {
-    #[cfg(target_os = "linux")]
-    {
-        backend::process_parents_with(&crate::identity::HostKernel)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        backend::process_parents()
-    }
+pub(crate) fn process_parents(kernel: &dyn Kernel) -> Result<Vec<(RawPid, RawPid)>, Error> {
+    backend::process_parents(kernel)
 }
 
 /// Every listable pid plus the `(pid, ppid)` edges plus the denied-ppid-read count, from one

@@ -567,7 +567,7 @@ impl Attached {
             #[cfg(target_os = "macos")]
             Attached::FdMarker(m) => m.hard_kill(root),
             Attached::TreeWalk(root) => {
-                return match crate::containment::treewalk::hard_kill(*root) {
+                return match crate::containment::treewalk::hard_kill(&crate::identity::HostKernel, *root) {
                     Ok(complete) => (Ok(()), complete),
                     Err(e) => (Err(e), false),
                 };
@@ -611,7 +611,7 @@ impl Attached {
             Attached::JobObject(_) => crate::containment::windows::terminate(_child_pid),
             #[cfg(target_os = "macos")]
             Attached::FdMarker(m) => m.terminate(root),
-            Attached::TreeWalk(root) => crate::containment::treewalk::terminate(*root),
+            Attached::TreeWalk(root) => crate::containment::treewalk::terminate(&crate::identity::HostKernel, *root),
         }
     }
 

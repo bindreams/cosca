@@ -1,25 +1,10 @@
 // Unit tests for process-group membership listing and the identity it carries.
 
-#[cfg(not(target_os = "linux"))]
-use super::members;
+use super::{members, state, GroupState, Member};
 #[cfg(target_os = "linux")]
-use super::members_with;
-use super::{state, GroupState, Member};
-#[cfg(target_os = "linux")]
-use crate::identity::{FakeKernel, HostKernel, UNREADABLE_STATUS_REASON};
-use crate::identity::{Liveness, ProcessId};
+use crate::identity::{FakeKernel, UNREADABLE_STATUS_REASON};
+use crate::identity::{HostKernel, Liveness, ProcessId};
 use nix::sys::signal::Signal;
-
-fn list(pgid: i32) -> std::io::Result<Vec<Member>> {
-    #[cfg(target_os = "linux")]
-    {
-        members_with(&HostKernel, pgid)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        members(pgid)
-    }
-}
 
 fn is_alive(m: &Member) -> bool {
     matches!(ProcessId::from_parts(m.pid, m.token).is_alive(), Liveness::Alive)
@@ -59,7 +44,7 @@ fn members_lists_a_live_owned_group() {
     await_member_ready(&mut child);
     let pgid = child.id() as i32;
 
-    let listed = list(pgid).expect("list the group");
+    let listed = members(&HostKernel, pgid).expect("list the group");
     let leader = listed
         .iter()
         .find(|m| m.pid == child.id())
@@ -81,7 +66,7 @@ fn members_marks_an_unreaped_leader_as_dead() {
     let pid = child.id();
     await_zombie(pid);
 
-    let listed = list(pid as i32).expect("list the group");
+    let listed = members(&HostKernel, pid as i32).expect("list the group");
     let leader = listed
         .iter()
         .find(|m| m.pid == pid)
@@ -109,7 +94,7 @@ fn members_marks_an_unreaped_leader_as_dead() {
 /// assertion is a genuine independent check rather than a restatement of the fixture.
 #[skuld::test]
 fn members_of_an_absent_group_is_empty() {
-    assert_eq!(list(i32::MAX).expect("list an absent group"), vec![]);
+    assert_eq!(members(&HostKernel, i32::MAX).expect("list an absent group"), vec![]);
 }
 
 /// The token the listing carries is the SAME encoding a live read of the pid would produce —
@@ -124,7 +109,7 @@ fn members_token_matches_a_live_read_of_the_same_pid() {
     await_member_ready(&mut child);
     let pgid = child.id() as i32;
 
-    let listed = list(pgid).expect("list the group");
+    let listed = members(&HostKernel, pgid).expect("list the group");
     let leader = listed.iter().find(|m| m.pid == child.id()).expect("leader listed");
     let live = ProcessId::of(child.id()).found().expect("resolve the live leader");
     assert_eq!(
@@ -543,7 +528,7 @@ fn a_live_non_leader_thread_member_is_unknown_and_never_falls_back_to_kill() {
 #[skuld::test]
 fn members_is_an_error_when_the_proc_view_is_diverged() {
     let kernel = FakeKernel::over(&HostKernel).diverged_view();
-    let err = members_with(&kernel, i32::MAX).expect_err("a diverged view lists nothing");
+    let err = members(&kernel, i32::MAX).expect_err("a diverged view lists nothing");
     assert!(err.to_string().contains("outer pid namespace"), "{err}");
 }
 
@@ -551,7 +536,7 @@ fn members_is_an_error_when_the_proc_view_is_diverged() {
 #[skuld::test]
 fn members_is_an_error_naming_the_cause_when_the_proc_view_is_unassessable() {
     let kernel = FakeKernel::over(&HostKernel).unreadable_view();
-    let err = members_with(&kernel, i32::MAX).expect_err("an unassessable view lists nothing");
+    let err = members(&kernel, i32::MAX).expect_err("an unassessable view lists nothing");
     assert!(err.to_string().contains(UNREADABLE_STATUS_REASON), "{err}");
 }
 
@@ -570,7 +555,7 @@ const PID: u32 = 4242;
 fn members_excludes_a_pid_whose_stat_read_says_it_is_gone_or_hidden() {
     for errno in [libc::ENOENT, libc::ESRCH, libc::EACCES, libc::EPERM] {
         let kernel = FakeKernel::listing_unreadable_pid(&HostKernel, PID, errno);
-        let listed = members_with(&kernel, i32::MAX).unwrap_or_else(|e| panic!("errno {errno} is an exclusion: {e}"));
+        let listed = members(&kernel, i32::MAX).unwrap_or_else(|e| panic!("errno {errno} is an exclusion: {e}"));
         assert!(listed.is_empty(), "errno {errno}: {listed:?}");
     }
 }
@@ -591,7 +576,7 @@ fn members_is_an_error_naming_pid_and_errno_for_any_other_stat_read_failure() {
         libc::ENOSYS,
     ] {
         let kernel = FakeKernel::listing_unreadable_pid(&HostKernel, PID, errno);
-        let err = members_with(&kernel, i32::MAX).expect_err("an unexplained read failure lists nothing");
+        let err = members(&kernel, i32::MAX).expect_err("an unexplained read failure lists nothing");
         let text = err.to_string();
         assert!(
             text.contains(&std::io::Error::from_raw_os_error(errno).to_string()),
@@ -618,7 +603,7 @@ fn members_is_an_error_for_eperm_when_the_checked_directory_also_refuses() {
     for recheck in [libc::EPERM, libc::ENOSYS, libc::EMFILE] {
         let kernel =
             FakeKernel::listing_unreadable_pid(&HostKernel, PID, libc::EPERM).on_read("self/stat", Err(recheck));
-        let err = members_with(&kernel, i32::MAX).expect_err("a refusing directory lists nothing");
+        let err = members(&kernel, i32::MAX).expect_err("a refusing directory lists nothing");
         let text = err.to_string();
         assert!(text.contains("self/stat"), "{recheck}: {text}");
         assert!(

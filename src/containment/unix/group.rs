@@ -42,7 +42,7 @@ pub(crate) struct Member {
 /// the same record as its pid. libproc's `proc_listpgrppids` is deliberately NOT used: it
 /// returns a COUNT where its siblings return bytes, and it carries no start time.
 #[cfg(target_os = "macos")]
-pub(crate) fn members(pgid: i32) -> std::io::Result<Vec<Member>> {
+pub(crate) fn members(_kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::io::Result<Vec<Member>> {
     use crate::identity::kinfo::kinfo_proc;
 
     const RECORD: usize = std::mem::size_of::<kinfo_proc>();
@@ -150,7 +150,7 @@ pub(crate) fn members(pgid: i32) -> std::io::Result<Vec<Member>> {
 /// read fails the listing unless the pid exited (`ENOENT`/`ESRCH`) or `hidepid` hides it
 /// (`EACCES`, or `EPERM` while the checked directory still answers).
 #[cfg(target_os = "linux")]
-pub(crate) fn members_with(kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::io::Result<Vec<Member>> {
+pub(crate) fn members(kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::io::Result<Vec<Member>> {
     use crate::identity::stat_parse::{parse_pgrp, parse_starttime_jiffies};
 
     let proc_dir =
@@ -222,7 +222,7 @@ pub(crate) fn members_with(kernel: &dyn crate::identity::Kernel, pgid: i32) -> s
 /// unlistable rather than silently empty — an empty group would read as
 /// "teardown succeeded".
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
-pub(crate) fn members(_pgid: i32) -> std::io::Result<Vec<Member>> {
+pub(crate) fn members(_kernel: &dyn crate::identity::Kernel, _pgid: i32) -> std::io::Result<Vec<Member>> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "process-group membership is implemented only for Linux and macOS",
@@ -625,10 +625,7 @@ pub(crate) fn converge(pgid: i32, signal: Signal, root: &GroupRoot<'_>) -> std::
     let listing_pgid = fault::listed(pgid);
     #[cfg(not(test))]
     let listing_pgid = pgid;
-    #[cfg(target_os = "linux")]
-    let listed = members_with(&crate::identity::HostKernel, listing_pgid)?;
-    #[cfg(not(target_os = "linux"))]
-    let listed = members(listing_pgid)?;
+    let listed = members(&crate::identity::HostKernel, listing_pgid)?;
     #[cfg(test)]
     fault::run_after_listing();
     let mut refused = Vec::new();
