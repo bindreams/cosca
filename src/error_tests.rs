@@ -189,7 +189,7 @@ fn io_context_keeps_the_os_error_as_its_source() {
 fn io_context_error_in_error_io_reaches_the_os_code_through_source() {
     let code = if cfg!(windows) { 5 } else { 13 };
     let e = Error::Io(crate::error::io_context(
-        "could not check C:\t.exe",
+        "could not check C:\\t.exe",
         std::io::Error::from_raw_os_error(code),
     ));
     let found = std::iter::successors(std::error::Error::source(&e), |s| s.source())
