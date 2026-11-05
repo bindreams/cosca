@@ -221,8 +221,12 @@ fn descendants_and_children_the_kernel_cannot_read_are_dropped() {
     let me = ProcessId::current();
     let parents = [(id.pid(), me.pid())];
     let (kernel, _guard) = unreadable(id.pid());
-    assert!(super::descendants(&kernel, me, &parents).is_empty());
-    assert!(super::children_of(&kernel, me, &parents).is_empty());
+    assert!(super::descendants(&kernel, me, &parents)
+        .expect("a readable anchor")
+        .is_empty());
+    assert!(super::children_of(&kernel, me, &parents)
+        .expect("a readable anchor")
+        .is_empty());
     release(child);
 }
 
