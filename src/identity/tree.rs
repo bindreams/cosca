@@ -15,7 +15,7 @@ pub enum Recursive {
 impl ProcessId {
     /// The parent process, by identity. Identity-guarded against pid-reuse: a genuine parent
     /// predates this child, so a recycled `ppid` naming a process created AFTER it (later
-    /// token) is rejected by the same token rule as [`children`](Self::children).
+    /// order key) is rejected by the same order-key rule as [`children`](Self::children).
     ///
     /// `Ok(None)` means there is none: `self` has no parent (pid 1), the parent has exited, or
     /// `self` is gone or was recycled. It is never an answer to a question that could not be
@@ -48,8 +48,8 @@ impl ProcessId {
             return Ok(None);
         }
         // An access-denied parent is not "no parent".
-        let parent = match ProcessId::of_with(kernel, ppid) {
-            (Resolved::Found(p), _) => p,
+        let (parent, parent_key) = match ProcessId::of_ordered_with(kernel, ppid) {
+            (Resolved::Found(read), _) => read,
             (Resolved::Gone, _) => return Ok(None),
             (Resolved::Unknown, cause) => {
                 return Err(crate::containment::treewalk::unqueryable(
@@ -58,15 +58,21 @@ impl ProcessId {
                 ));
             }
         };
-        // Identity guard: a genuine parent predates this child, so the child's start token
-        // orders at-or-after the parent's. A recycled ppid names a process created AFTER
-        // this one (later token) — reject it.
-        Ok(crate::containment::treewalk::keeps_token(
-            self.start_token_raw(),
-            parent.start_token_raw(),
-            crate::containment::treewalk::ALLOW_EQUAL_TOKEN,
+        let key = match self.order_key_with(kernel) {
+            (Resolved::Found(key), _) => key,
+            (Resolved::Gone, _) => return Ok(None),
+            (Resolved::Unknown, cause) => {
+                return Err(crate::containment::treewalk::unqueryable(
+                    &format!("pid {}", self.pid()),
+                    cause,
+                ));
+            }
+        };
+        // A genuine parent predates this child; a recycled ppid names a later-started process.
+        Ok(
+            crate::containment::treewalk::keeps_order(key, parent_key, crate::containment::treewalk::ALLOW_EQUAL_ORDER)
+                .then_some(parent),
         )
-        .then_some(parent))
     }
 
     /// `self`'s ppid in `parents`. `self` passed its anchor, so it is live: a row missing for it
@@ -91,8 +97,8 @@ impl ProcessId {
     }
 
     /// The process's children. `Recursive::No` = direct children; `Recursive::Yes` = the
-    /// whole subtree. Identity-guarded against pid-reuse by the tree-walk token rule (a
-    /// candidate is kept only if its start token orders at-or-after this process). Snapshot;
+    /// whole subtree. Identity-guarded against pid-reuse by the tree-walk order-key rule (a
+    /// candidate is kept only if its order key orders at-or-after this process's). Snapshot;
     /// best-effort.
     ///
     /// An empty list means there are none (or `self` is gone or was recycled); a process table
@@ -116,10 +122,10 @@ impl ProcessId {
             self.absent_from_snapshot(kernel)?;
             return Ok(Vec::new());
         }
-        Ok(match recursive {
+        match recursive {
             Recursive::No => crate::containment::treewalk::children_of(kernel, *self, &parents),
             Recursive::Yes => crate::containment::treewalk::descendants(kernel, *self, &parents),
-        })
+        }
     }
 }
 
