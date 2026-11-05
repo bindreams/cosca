@@ -1099,6 +1099,7 @@ fn marker_without_holders(root: crate::identity::ProcessId, pgid: Option<i32>) -
 fn the_drops_skip_names_the_walk_and_the_group_only_when_there_is_one() {
     let _serialize = test_spawn_lock();
     let view = crate::containment::DropView {
+        caller: crate::containment::dispatch::TeardownCaller::Drop,
         root_pid: 4242,
         root: crate::containment::dispatch::RootView::Reaped,
         tree_killed: false,

@@ -63,7 +63,7 @@ fn pidfd_after(child: &mut crate::tokio::Child, forget: impl FnOnce(&mut super::
 async fn a_forget_for_a_drop_keeps_the_pidfd() {
     crate::tokio::test_runtime::assert_current_thread();
     let (mut child, fd) = reaped_elsewhere_root();
-    let view = child.read_root_view("a test");
+    let view = child.read_root_view(crate::containment::dispatch::TeardownCaller::Drop);
     assert_eq!(pidfd_after(&mut child, |proc| proc.forget_for(&view).is_some()), fd);
 }
 

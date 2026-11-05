@@ -14,6 +14,37 @@ mod setuid_lane_check_tests;
 #[path = "test_privilege/setuid_protocol_tests.rs"]
 mod setuid_protocol_tests;
 
+/// Spawns the setuid helper as a `setuid-stdin-block root` child through [`crate::Command`] and
+/// waits for its `+` ready byte, so the child is root and blocked on its stdin. Returns the child
+/// and the write end of its stdin; closing that makes the helper exit with success.
+///
+/// Lives here, not in [`setuid`]: integration tests include that file with `#[path]` and have no
+/// `crate::Command`.
+///
+/// # Panics
+/// As [`setuid::setuid_helper`] does, and when the spawn or the ready byte fails.
+pub(crate) fn spawn_setuid_blocker() -> (crate::Child, std::io::PipeWriter) {
+    use std::io::Read as _;
+    let helper = setuid::setuid_helper();
+    let mut cmd = crate::Command::new();
+    // `args` is the whole argv, program name included.
+    cmd.executable(&helper)
+        .args(["cosca_testbin", "setuid-stdin-block", "root"]);
+    cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
+    cmd.stdout(crate::Stdio::pipe()).expect("stdout pipe");
+    cmd.stderr(crate::Stdio::null()).expect("stderr null");
+    let mut child = cmd.spawn().expect("spawn the setuid helper");
+    let stdin = child.stdin().expect("piped stdin");
+    let mut ready = [0u8; 1];
+    child
+        .stdout()
+        .expect("piped stdout")
+        .read_exact(&mut ready)
+        .expect("the helper reports ready");
+    assert_eq!(ready, *b"+");
+    (child, stdin)
+}
+
 /// Fails unless the caller holds a DAC bypass (see [`holds_dac_bypass`]). Off-switch and consent belong
 /// to the `ROOT` group (`test_groups.rs`).
 pub(crate) fn assert_holds_dac_bypass() {

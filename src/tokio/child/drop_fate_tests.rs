@@ -2,6 +2,7 @@
 //! more than the evidence shows. `Gone` needs proof that something else reaped the child; a handle
 //! that merely cannot say (a failed peek) leaves the child possibly running.
 
+use crate::containment::dispatch::TeardownCaller;
 use crate::error::ChildFate;
 use crate::tokio::Command;
 use crate::wait::exit_only::seams::force_peeks;
@@ -41,7 +42,7 @@ fn a_failed_peek_answers_what_the_drop_did(kill_on_drop: bool) {
     let (mut child, writer) = live(kill_on_drop);
     let id = child.id();
     let looks = force_peeks((0..4).map(|_| Err(std::io::Error::other("forced peek failure 5d1b"))));
-    let fate = child.tear_down_now();
+    let fate = child.tear_down_now(TeardownCaller::Drop);
     drop(looks);
     // The child was forgotten: end it and collect it here (an armed drop on Linux has killed it
     // through its pidfd, which a failed peek does not stop; the zombie is ours to collect).
@@ -78,7 +79,7 @@ async fn a_disarmed_teardown_with_a_failed_peek_looks_and_warns_once() {
     let id = child.id();
     let looks = force_peeks((0..4).map(|_| Err(std::io::Error::other("forced peek failure 8e2a"))));
     let mark = crate::log_capture::mark();
-    let fate = child.tear_down_now();
+    let fate = child.tear_down_now(TeardownCaller::Drop);
     let left = crate::wait::exit_only::seams::forced_peeks_left();
     drop(looks);
     collect(id, writer);
@@ -125,7 +126,7 @@ async fn a_backend_forgotten_as_reaped_elsewhere_is_not_an_own_reap() {
     let (mut child, writer) = forgotten(true);
     let id = child.id();
     let state = child.os.proc_mut().state();
-    let _fate = child.tear_down_now();
+    let _fate = child.tear_down_now(TeardownCaller::Drop);
     collect(id, writer);
     assert!(
         matches!(state, crate::signal::RootState::Reaped { own: false }),
@@ -144,7 +145,7 @@ async fn the_drop_of_a_child_forgotten_unproven_claims_no_reap() {
     crate::tokio::test_runtime::assert_current_thread();
     let (mut child, writer) = forgotten(false);
     let id = child.id();
-    let fate = child.tear_down_now();
+    let fate = child.tear_down_now(TeardownCaller::Drop);
     // Released after the drop's kill, so a kill that sent nothing fails the assertion on how the
     // child ended.
     let status = collect(id, writer);
@@ -182,7 +183,7 @@ async fn the_drop_of_an_unproven_backend_whose_root_its_pidfd_shows_gone_says_go
     child.kill().expect("a root reaped elsewhere has nothing left to kill");
     assert_peeks_exhausted();
     drop(failed);
-    let fate = child.tear_down_now();
+    let fate = child.tear_down_now(TeardownCaller::Drop);
     assert_eq!(fate, ChildFate::Gone);
 }
 
@@ -199,7 +200,7 @@ async fn a_refused_kill_of_an_unproven_backend_at_drop_is_named() {
     let id = child.id();
     let refused = super::fault::force_kill_failure();
     let mark = crate::log_capture::mark();
-    let fate = child.tear_down_now();
+    let fate = child.tear_down_now(TeardownCaller::Drop);
     drop(refused);
     collect(id, writer);
     assert_eq!(fate, ChildFate::Running { id: Some(id) });
@@ -237,7 +238,7 @@ async fn the_drop_of_a_child_forgotten_as_reaped_elsewhere_says_gone() {
     crate::tokio::test_runtime::assert_current_thread();
     let (mut child, writer) = forgotten(true);
     let id = child.id();
-    let fate = child.tear_down_now();
+    let fate = child.tear_down_now(TeardownCaller::Drop);
     collect(id, writer);
     assert_eq!(fate, ChildFate::Gone);
 }
@@ -384,8 +385,31 @@ async fn macos_an_orphaned_child_at_drop_is_gone() {
     let (mut child, writer) = live(false);
     let id = child.id();
     let looks = force_peeks((0..4).map(|_| Ok(PeekOutcome::Foreign(Foreign::Orphaned))));
-    let fate = child.tear_down_now();
+    let fate = child.tear_down_now(TeardownCaller::Drop);
     drop(looks);
     collect(id, writer);
     assert_eq!(fate, ChildFate::Gone);
+}
+
+/// A teardown named a failed run's (a failed `resume`) words its warn as one, not as a drop's.
+///
+/// Mutant: `tear_down_now` ignores its caller and names every teardown a drop.
+#[skuld::test]
+async fn a_teardown_named_a_failed_run_words_its_warn_as_one() {
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let (mut child, writer) = live(true);
+    let id = child.id();
+    let refused = super::fault::force_kill_failure();
+    let mark = crate::log_capture::mark();
+
+    let fate = child.tear_down_now(TeardownCaller::FailedRun);
+
+    drop(refused);
+    // The child exits once its stdin closes, and tokio collects it.
+    drop(writer);
+    assert_eq!(fate, ChildFate::Running { id: Some(id) });
+    let warns = crate::log_capture::records_since(mark, "leaving it running");
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(warns[0].starts_with("teardown after a failed run: "), "{warns:?}");
 }

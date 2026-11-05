@@ -258,9 +258,10 @@ slow-timeout = { period = "30s", terminate-after = 1, grace-period = "1s" }
 # A backstop, not a detector: the `OwnedChild` tests fail by assertion (see `assert_handed_off`),
 # not by timing out. This bound only stops a regression those checks did not anticipate, in a test
 # that `recv()`s or `join()`s on our own code, from stalling the job. The macOS wait's tests
-# (`wait::macos::await_reapable::await_reapable_tests`) block on a real kqueue in the same way. Under
+# (`wait::macos::await_reapable::await_reapable_tests`) block on a real kqueue in the same way, and
+# the hand-back tests hold the release of a child the call under test might wrongly wait for. Under
 # `profile.default` so `profile.ci` and local runs inherit it.
-filter = 'test(/^child::owned::owned_tests::/) | test(/^wait::macos::await_reapable::await_reapable_tests/)'
+filter = 'test(/^child::owned::owned_tests::/) | test(/^wait::macos::await_reapable::await_reapable_tests/) | test(/^child::hand_back_tests::/)'
 slow-timeout = { period = "10s", terminate-after = 1, grace-period = "1s" }
 
 [[profile.default.overrides]]
