@@ -484,10 +484,7 @@ fn a_failure_after_the_spawn_hands_back_a_child_whose_kill_is_refused(
 
     let error = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), child);
 
-    let crate::error::Error::MayHaveStarted { fate, unreaped, .. } = error else {
-        panic!("expected MayHaveStarted, got {error:?}");
-    };
-    let handed_back = crate::test_child::HandedBack::new(stdin, unreaped.map(|unreaped| *unreaped));
+    let (_, fate, handed_back) = crate::test_child::expect_may_have_started_parts(error, stdin);
 
     assert_eq!(fate, crate::error::ChildFate::Running { id: Some(id) });
     assert_eq!(handed_back.unreaped().pid(), Some(id.pid()));
