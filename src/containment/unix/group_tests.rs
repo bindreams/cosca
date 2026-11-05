@@ -643,6 +643,75 @@ fn members_is_an_error_for_eperm_when_the_checked_directory_also_refuses() {
     }
 }
 
+/// `PID` is in group 1234 by the scan's `stat`; the identity read that follows makes its own.
+/// `stat_fixture` puts the process in group 1234.
+#[cfg(target_os = "linux")]
+fn scan_shows_group_1234() -> (FakeKernel<'static>, std::io::PipeWriter) {
+    use crate::identity::stat_parse::stat_fixture;
+
+    let (reader, writer) = std::io::pipe().expect("a pipe");
+    let kernel = FakeKernel::over(&HostKernel)
+        .same_view()
+        .on_pids(Ok(&[PID]))
+        .on_read(&format!("{PID}/stat"), Ok(&stat_fixture("S", 777)))
+        .on_pidfd_open(PID, Ok(reader.into()))
+        .on_pidfs_ino(PID, Ok(Some(100)));
+    (kernel, writer)
+}
+
+/// The scan's `stat` is a record of whoever held the pid then: the identity read's own `stat`,
+/// which shows another group, wins, and the pid is no member. Mutant: "the listing keeps the scan's
+/// membership".
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn members_excludes_a_pid_whose_own_stat_shows_another_group() {
+    let (kernel, _writer) = scan_shows_group_1234();
+    // The own read's pgrp is field 5; `stat_fixture` has 1234 there.
+    let moved = String::from_utf8(crate::identity::stat_parse::stat_fixture("S", 777))
+        .expect("a fixture is text")
+        .replacen(" S 1 1234 1234 ", " S 1 99 99 ", 1);
+    let kernel = kernel.on_read_after(&format!("{PID}/stat"), 1, Ok(moved.as_bytes()));
+    assert!(members(&kernel, 1234).expect("an exclusion, not an error").is_empty());
+}
+
+/// A pid that is gone by the identity read is no member. Mutant: "a gone member fails the listing".
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn members_excludes_a_pid_whose_identity_read_finds_it_gone() {
+    let (kernel, _writer) = scan_shows_group_1234();
+    let kernel = kernel.on_pidfd_open(PID, Err(rustix::io::Errno::SRCH));
+    assert!(members(&kernel, 1234).expect("an exclusion, not an error").is_empty());
+}
+
+/// An identity read that fails with no cause the read knows (on a host whose pidfds have no inode:
+/// a `stat` without a start time) excludes the pid; it does not fail the listing. Mutant: "an
+/// unknown read with no cause fails the listing".
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn members_excludes_a_pid_whose_identity_read_is_unknown_with_no_cause() {
+    let (kernel, _writer) = scan_shows_group_1234();
+    let kernel =
+        kernel
+            .on_pidfs_ino(PID, Ok(None))
+            .on_read_after(&format!("{PID}/stat"), 1, Ok(b"4242 (x) S 1 1234 1234"));
+    assert!(members(&kernel, 1234).expect("an exclusion, not an error").is_empty());
+}
+
+/// The same table lists the member when nothing moves. Mutant: "the listing excludes every pid".
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn members_lists_a_pid_whose_scan_and_identity_read_agree() {
+    let (kernel, _writer) = scan_shows_group_1234();
+    let listed = members(&kernel, 1234).expect("a readable table");
+    assert_eq!(
+        listed,
+        vec![Member {
+            id: ProcessId::from_parts_for_test(PID, crate::identity::Key::Pidfs(100)),
+            system: false
+        }]
+    );
+}
+
 /// A member whose pidfd cannot be opened fails the listing: a refused `pidfd_open` stays
 /// `Unsupported` (the caller reports it so), a transient one is `Other`. Mutant: "the listing error
 /// is always `Other`", "the member is excluded".
