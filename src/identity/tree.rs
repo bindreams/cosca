@@ -1,6 +1,6 @@
 //! The process tree around a [`ProcessId`](super::ProcessId): its parent and its children.
 
-use super::{HostKernel, Kernel, ProcessId, RawPid, Resolved};
+use super::{HostKernel, Kernel, ProcessId, RawPid, Resolved, UnknownCause};
 use crate::error::Error;
 
 /// Whether a tree query descends recursively or returns only direct children.
@@ -48,8 +48,8 @@ impl ProcessId {
             return Ok(None);
         }
         // An access-denied parent is not "no parent".
-        let parent = match ProcessId::of_with(kernel, ppid) {
-            (Resolved::Found(p), _) => p,
+        let (parent, parent_key) = match ProcessId::of_ordered_with(kernel, ppid) {
+            (Resolved::Found(read), _) => read,
             (Resolved::Gone, _) => return Ok(None),
             (Resolved::Unknown, cause) => {
                 return Err(crate::containment::treewalk::unqueryable(
@@ -58,15 +58,23 @@ impl ProcessId {
                 ));
             }
         };
-        // Identity guard: a genuine parent predates this child, so the child's start token
+        let key = match self.order_key_with(kernel) {
+            Resolved::Found(key) => key,
+            Resolved::Gone => return Ok(None),
+            Resolved::Unknown => {
+                return Err(crate::containment::treewalk::unqueryable(
+                    &format!("pid {}", self.pid()),
+                    UnknownCause::default(),
+                ));
+            }
+        };
+        // Order guard: a genuine parent predates this child, so the child's order key
         // orders at-or-after the parent's. A recycled ppid names a process created AFTER
-        // this one (later token) — reject it.
-        Ok(crate::containment::treewalk::keeps_token(
-            self.start_token_raw(),
-            parent.start_token_raw(),
-            crate::containment::treewalk::ALLOW_EQUAL_TOKEN,
+        // this one (later key) — reject it.
+        Ok(
+            crate::containment::treewalk::keeps_order(key, parent_key, crate::containment::treewalk::ALLOW_EQUAL_ORDER)
+                .then_some(parent),
         )
-        .then_some(parent))
     }
 
     /// `self`'s ppid in `parents`. `self` passed its anchor, so it is live: a row missing for it

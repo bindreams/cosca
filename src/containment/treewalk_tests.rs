@@ -3,7 +3,7 @@
 //! closure drive `descendants_with` against BOTH `allow_equal` rules.
 
 use super::descendants_with;
-use crate::identity::{ProcessId, RawPid};
+use crate::identity::{OrderKey, ProcessId, RawPid};
 use std::collections::HashMap;
 
 const ROOT_PID: RawPid = 100;
@@ -13,10 +13,15 @@ fn id(pid: RawPid, token: u64) -> ProcessId {
     ProcessId::from_parts_for_test(pid, token)
 }
 
+/// What the live resolver returns for a process whose identity token and order key agree.
+fn resolved(pid: RawPid, token: u64) -> (ProcessId, OrderKey) {
+    (id(pid, token), OrderKey::for_test(token))
+}
+
 /// Build a resolver from a (pid -> token) table. A pid absent from the table is
 /// unresolvable (returns `None`, modelling an already-gone process).
-fn resolver(tokens: &HashMap<RawPid, u64>) -> impl Fn(RawPid) -> Option<ProcessId> + '_ {
-    move |pid| tokens.get(&pid).map(|&t| id(pid, t))
+fn resolver(tokens: &HashMap<RawPid, u64>) -> impl Fn(RawPid) -> Option<(ProcessId, OrderKey)> + '_ {
+    move |pid| tokens.get(&pid).map(|&t| resolved(pid, t))
 }
 
 /// Collect the result pids into a sorted Vec for order-independent comparison.
@@ -29,6 +34,10 @@ fn root() -> ProcessId {
     id(ROOT_PID, ROOT_TOKEN)
 }
 
+fn root_key() -> OrderKey {
+    OrderKey::for_test(ROOT_TOKEN)
+}
+
 // A genuine later child (token > root) is kept under BOTH rules =====
 
 #[skuld::test]
@@ -36,7 +45,7 @@ fn keeps_genuine_later_child_under_both_rules() {
     let parents = [(200, ROOT_PID)];
     let tokens = HashMap::from([(200u32, ROOT_TOKEN + 5)]);
     for allow_equal in [true, false] {
-        let got = descendants_with(root(), &parents, allow_equal, resolver(&tokens));
+        let got = descendants_with(root(), root_key(), &parents, allow_equal, resolver(&tokens));
         assert_eq!(pids(got), [200], "later child kept (allow_equal={allow_equal})");
     }
 }
@@ -47,7 +56,7 @@ fn keeps_genuine_later_child_under_both_rules() {
 fn same_tick_child_included_when_allow_equal_true() {
     let parents = [(200, ROOT_PID)];
     let tokens = HashMap::from([(200u32, ROOT_TOKEN)]); // equal token
-    let got = descendants_with(root(), &parents, true, resolver(&tokens));
+    let got = descendants_with(root(), root_key(), &parents, true, resolver(&tokens));
     assert_eq!(pids(got), [200], "same-tick child included with allow_equal=true");
 }
 
@@ -55,7 +64,7 @@ fn same_tick_child_included_when_allow_equal_true() {
 fn same_tick_child_excluded_when_allow_equal_false() {
     let parents = [(200, ROOT_PID)];
     let tokens = HashMap::from([(200u32, ROOT_TOKEN)]); // equal token
-    let got = descendants_with(root(), &parents, false, resolver(&tokens));
+    let got = descendants_with(root(), root_key(), &parents, false, resolver(&tokens));
     assert!(got.is_empty(), "same-tick child excluded with allow_equal=false");
 }
 
@@ -71,7 +80,7 @@ fn stale_ppid_impostor_excluded_under_both_rules() {
     let parents = [(200, ROOT_PID)];
     let tokens = HashMap::from([(200u32, ROOT_TOKEN - 1)]);
     for allow_equal in [true, false] {
-        let got = descendants_with(root(), &parents, allow_equal, resolver(&tokens));
+        let got = descendants_with(root(), root_key(), &parents, allow_equal, resolver(&tokens));
         assert!(got.is_empty(), "impostor excluded (allow_equal={allow_equal})");
     }
 }
@@ -87,7 +96,7 @@ fn recurses_into_deep_tree() {
         (300u32, ROOT_TOKEN + 2),
         (400u32, ROOT_TOKEN + 3),
     ]);
-    let got = descendants_with(root(), &parents, true, resolver(&tokens));
+    let got = descendants_with(root(), root_key(), &parents, true, resolver(&tokens));
     assert_eq!(pids(got), [200, 300, 400]);
 }
 
@@ -101,7 +110,7 @@ fn impostor_prunes_its_whole_subtree() {
         (200u32, ROOT_TOKEN - 5), // impostor
         (300u32, ROOT_TOKEN + 5), // would-be grandchild
     ]);
-    let got = descendants_with(root(), &parents, true, resolver(&tokens));
+    let got = descendants_with(root(), root_key(), &parents, true, resolver(&tokens));
     assert!(got.is_empty(), "subtree under a rejected impostor is pruned");
 }
 
@@ -113,7 +122,7 @@ fn reparented_orphan_is_missed() {
     // pid 1; its ppid no longer chains to the root, so the walk cannot reach it.
     let parents = [(300, 1)];
     let tokens = HashMap::from([(300u32, ROOT_TOKEN + 9)]);
-    let got = descendants_with(root(), &parents, true, resolver(&tokens));
+    let got = descendants_with(root(), root_key(), &parents, true, resolver(&tokens));
     assert!(got.is_empty(), "reparented orphan is honestly missed (documented)");
 }
 
@@ -125,7 +134,7 @@ fn root_is_never_included() {
     // root pid never appears in the descendant set even if such an edge exists.
     let parents = [(ROOT_PID, ROOT_PID), (200, ROOT_PID)];
     let tokens = HashMap::from([(ROOT_PID, ROOT_TOKEN), (200u32, ROOT_TOKEN + 1)]);
-    let got = descendants_with(root(), &parents, true, resolver(&tokens));
+    let got = descendants_with(root(), root_key(), &parents, true, resolver(&tokens));
     assert_eq!(pids(got), [200], "root excluded; genuine child kept");
 }
 
@@ -137,7 +146,7 @@ fn duplicate_edge_yields_pid_once() {
     // (or later double-kill) the same process twice.
     let parents = [(200, ROOT_PID), (200, ROOT_PID)];
     let tokens = HashMap::from([(200u32, ROOT_TOKEN + 1)]);
-    let got = descendants_with(root(), &parents, true, resolver(&tokens));
+    let got = descendants_with(root(), root_key(), &parents, true, resolver(&tokens));
     assert_eq!(pids(got), [200], "duplicate edge collapses to a single result");
 }
 
@@ -149,7 +158,7 @@ fn unresolvable_candidate_is_skipped() {
     // snapshot and resolve); it is dropped along with anything under it.
     let parents = [(200, ROOT_PID), (300, 200)];
     let tokens = HashMap::from([(300u32, ROOT_TOKEN + 5)]); // 200 missing
-    let got = descendants_with(root(), &parents, true, resolver(&tokens));
+    let got = descendants_with(root(), root_key(), &parents, true, resolver(&tokens));
     assert!(got.is_empty(), "gone candidate and its subtree are skipped");
 }
 
@@ -157,19 +166,18 @@ fn unresolvable_candidate_is_skipped() {
 
 #[skuld::test]
 fn children_of_keeps_one_level_genuine_children_only() {
-    use super::{children_of_with, ALLOW_EQUAL_TOKEN};
-    use crate::identity::ProcessId;
+    use super::{children_of_with, ALLOW_EQUAL_ORDER};
     // root 100/tok50; direct child 101/tok60 (genuine, tok>root); grandchild 102 (ppid
     // 101, not one level); impostor 103 ppid 100 tok40 (created before root => excluded).
     let root = ProcessId::from_parts_for_test(100, 50);
     let parents = [(101, 100), (102, 101), (103, 100)];
     let resolve = |pid: u32| match pid {
-        101 => Some(ProcessId::from_parts_for_test(101, 60)),
-        102 => Some(ProcessId::from_parts_for_test(102, 70)),
-        103 => Some(ProcessId::from_parts_for_test(103, 40)),
+        101 => Some(resolved(101, 60)),
+        102 => Some(resolved(102, 70)),
+        103 => Some(resolved(103, 40)),
         _ => None,
     };
-    let pids: Vec<u32> = children_of_with(root, &parents, ALLOW_EQUAL_TOKEN, resolve)
+    let pids: Vec<u32> = children_of_with(root, OrderKey::for_test(50), &parents, ALLOW_EQUAL_ORDER, resolve)
         .iter()
         .map(|id| id.pid())
         .collect();
@@ -182,17 +190,17 @@ fn children_of_keeps_one_level_genuine_children_only() {
 fn children_of_same_tick_child_depends_on_allow_equal() {
     use super::children_of_with;
     // Direct child 101 whose token EQUALS the parent's: kept under allow_equal=true,
-    // excluded under false — proves children_of_with threads allow_equal to keeps_token.
+    // excluded under false — proves children_of_with threads allow_equal to keeps_order.
     let root = ProcessId::from_parts_for_test(100, ROOT_TOKEN);
     let parents = [(101, 100)];
-    let resolve = |pid: u32| (pid == 101).then(|| ProcessId::from_parts_for_test(101, ROOT_TOKEN));
+    let resolve = |pid: u32| (pid == 101).then(|| resolved(101, ROOT_TOKEN));
     assert_eq!(
-        pids(children_of_with(root, &parents, true, resolve)),
+        pids(children_of_with(root, root_key(), &parents, true, resolve)),
         [101],
         "same-tick child included with allow_equal=true"
     );
     assert!(
-        children_of_with(root, &parents, false, resolve).is_empty(),
+        children_of_with(root, root_key(), &parents, false, resolve).is_empty(),
         "same-tick child excluded with allow_equal=false"
     );
 }
@@ -206,12 +214,33 @@ fn children_of_duplicate_edge_yields_pid_once() {
     // double-kill) the same child twice.
     let root = ProcessId::from_parts_for_test(100, ROOT_TOKEN);
     let parents = [(101, 100), (101, 100)];
-    let resolve = |pid: u32| (pid == 101).then(|| ProcessId::from_parts_for_test(101, ROOT_TOKEN + 1));
+    let resolve = |pid: u32| (pid == 101).then(|| resolved(101, ROOT_TOKEN + 1));
     assert_eq!(
-        pids(children_of_with(root, &parents, true, resolve)),
+        pids(children_of_with(root, root_key(), &parents, true, resolve)),
         [101],
         "duplicate edge collapses to a single child"
     );
+}
+
+// The guard orders by the order key, not by the identity token =====
+
+/// A candidate whose id's token orders after the root's but whose order key orders before it is an
+/// impostor: the filters read the key. Mutant: "the filters compare `start_token_raw()`".
+#[skuld::test]
+fn a_candidate_whose_order_key_precedes_the_roots_is_dropped_even_when_its_id_token_does_not() {
+    use super::children_of_with;
+    let parents = [(200, ROOT_PID)];
+    let resolve = |pid: u32| (pid == 200).then(|| (id(200, ROOT_TOKEN + 5), OrderKey::for_test(ROOT_TOKEN - 5)));
+    for allow_equal in [true, false] {
+        assert!(
+            descendants_with(root(), root_key(), &parents, allow_equal, resolve).is_empty(),
+            "descendants_with dropped by key (allow_equal={allow_equal})"
+        );
+        assert!(
+            children_of_with(root(), root_key(), &parents, allow_equal, resolve).is_empty(),
+            "children_of_with dropped by key (allow_equal={allow_equal})"
+        );
+    }
 }
 
 /// `resolve_or_drop` is a named discard site: an access-denied descendant must be dropped

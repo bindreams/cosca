@@ -10,30 +10,31 @@
 //! misses reparented orphans (a child whose parent already exited, so its ppid no
 //! longer chains to the root) and broker-spawned escapes.
 //!
-//! # The PID-reuse / stale-ppid defense (the token-order rule)
+//! # The PID-reuse / stale-ppid defense (the order-key rule)
 //!
 //! A `(pid, ppid)` snapshot is racy: a candidate's `pid` may have been recycled,
 //! or its `ppid` may name a *recycled* root pid. So a chained ppid alone does not
-//! prove descent. The candidate's high-res start token (Linux jiffies / Windows
-//! 100 ns FILETIME / macOS µs) must additionally order correctly against the
-//! root's: a genuine descendant was created at-or-after the root acquired its
-//! pid. The keep predicate is
+//! prove descent. The candidate's [`OrderKey`] (when it started: Linux jiffies /
+//! Windows 100 ns FILETIME / macOS µs), read beside its id, must additionally order
+//! correctly against the root's: a genuine descendant was created at-or-after the
+//! root acquired its pid. The walk orders by the key and never reads the identity
+//! token for it. The keep predicate is
 //!
 //! ```text
-//! token > root.token || (allow_equal && token == root.token)
+//! key > root.key || (allow_equal && key == root.key)
 //! ```
 //!
-//! `allow_equal` is a per-OS `cfg` const ([`ALLOW_EQUAL_TOKEN`]): `true` on
+//! `allow_equal` is a per-OS `cfg` const ([`ALLOW_EQUAL_ORDER`]): `true` on
 //! Linux/macOS, `false` on Windows. Why per-OS:
 //!
 //! - An impostor — a *stale ppid* pointing at a *recycled* root pid — is always a
-//!   process created *before* the root (token **<** root.token), so it is
-//!   excluded by both rules. This is the case the token guard exists to defend.
+//!   process created *before* the root (key **<** root.key), so it is
+//!   excluded by both rules. This is the case the order guard exists to defend.
 //! - The rule cannot defend a root whose own pid was recycled: the new owner's children
 //!   are created after the root, so they pass it. So the walk takes its snapshot first, then
 //!   requires the root to still hold its pid ([`anchor_present`]); a root that does not
-//!   walks nothing.
-//! - A `token == root.token` candidate whose current ppid == root.pid can only be
+//!   walks nothing. A root whose key cannot be read walks nothing either.
+//! - A `key == root.key` candidate whose current ppid == root.pid can only be
 //!   a *genuine* same-tick child: an unrelated same-tick collision that also
 //!   happens to carry a recycled ppid equal to root.pid is impossible.
 //! - **Linux/macOS** reparent orphans to pid 1 / launchd, so a process whose ppid
@@ -46,7 +47,7 @@
 //!   indistinguishable from impossible, so strict `>` loses nothing there.
 
 use crate::error::Error;
-use crate::identity::{Existence, Kernel, ProcessId, RawPid, Resolved, UnknownCause};
+use crate::identity::{Existence, Kernel, OrderKey, ProcessId, RawPid, Resolved, UnknownCause};
 
 /// What one identity-verified kill attempt achieved. `AlreadyGone` and `NotAttempted` are
 /// both "no signal was delivered", but only the first means there was nothing to deliver one
@@ -65,9 +66,9 @@ pub(crate) enum KillOutcome {
 /// The tree-walk resolver. A pid we may not query is dropped from the walk exactly like a
 /// pid that is gone - the walk cannot kill what it cannot verify - but the two are logged
 /// apart, because "denied" is an operational signal (run elevated) and "gone" is not.
-pub(crate) fn resolve_or_drop(kernel: &dyn Kernel, pid: RawPid) -> Option<ProcessId> {
-    match ProcessId::of_with(kernel, pid).0 {
-        Resolved::Found(id) => Some(id),
+pub(crate) fn resolve_or_drop(kernel: &dyn Kernel, pid: RawPid) -> Option<(ProcessId, OrderKey)> {
+    match ProcessId::of_ordered_with(kernel, pid).0 {
+        Resolved::Found(read) => Some(read),
         Resolved::Gone => None,
         Resolved::Unknown => {
             // The pid is IN the message on purpose: `log_capture` is one process-global
@@ -82,42 +83,42 @@ pub(crate) fn resolve_or_drop(kernel: &dyn Kernel, pid: RawPid) -> Option<Proces
 #[cfg(unix)]
 use nix::sys::signal::Signal;
 
-/// Per-OS token-order rule. See the module docs for the full
+/// Per-OS order-key rule. See the module docs for the full
 /// rationale. Linux/macOS reparent orphans → ppid is authoritative → keep
 /// same-tick children (`>=`). Windows recycles pids and never reparents → keep
 /// strict `>`.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(crate) const ALLOW_EQUAL_TOKEN: bool = true;
+pub(crate) const ALLOW_EQUAL_ORDER: bool = true;
 #[cfg(windows)]
-pub(crate) const ALLOW_EQUAL_TOKEN: bool = false;
+pub(crate) const ALLOW_EQUAL_ORDER: bool = false;
 // Other Unix (e.g. BSD without a tested rule): default to the conservative
 // strict-`>` rule. enumerate's compile_error gates real support per OS.
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-pub(crate) const ALLOW_EQUAL_TOKEN: bool = false;
+pub(crate) const ALLOW_EQUAL_ORDER: bool = false;
 
 /// The PID-reuse keep-predicate (the crate's core safety invariant — see the module
-/// docs): a candidate genuinely descends from an anchor only if its start token orders
+/// docs): a candidate genuinely descends from an anchor only if its order key orders
 /// at-or-after the anchor's. The single source of this rule, shared by `descendants_with`
 /// and `children_of_with`.
-pub(crate) fn keeps_token(token: u64, anchor: u64, allow_equal: bool) -> bool {
-    token > anchor || (allow_equal && token == anchor)
+pub(crate) fn keeps_order(key: OrderKey, anchor: OrderKey, allow_equal: bool) -> bool {
+    key > anchor || (allow_equal && key == anchor)
 }
 
 /// Pure descendant filter (host-testable on every OS). Walks `parents` down from
 /// `root`, and for each pid whose ppid chains to `root.pid()` resolves its
-/// identity via `resolve` and keeps it ONLY if its start token orders correctly
-/// against the root's per `allow_equal` (see module docs). `resolve` is injected
-/// so the filter is pure: live code passes `ProcessId::of_with`, tests pass a stub.
+/// identity and order key via `resolve` and keeps it ONLY if its key orders correctly
+/// against `root_key` per `allow_equal` (see module docs). `resolve` is injected
+/// so the filter is pure: live code passes `ProcessId::of_ordered_with`, tests pass a stub.
 ///
 /// The root itself is never included (callers kill the root explicitly first).
 pub(crate) fn descendants_with(
     root: ProcessId,
+    root_key: OrderKey,
     parents: &[(RawPid, RawPid)],
     allow_equal: bool,
-    resolve: impl Fn(RawPid) -> Option<ProcessId>,
+    resolve: impl Fn(RawPid) -> Option<(ProcessId, OrderKey)>,
 ) -> Vec<ProcessId> {
-    let root_token = root.start_token_raw();
-    let keep = |token: u64| keeps_token(token, root_token, allow_equal);
+    let keep = |key: OrderKey| keeps_order(key, root_key, allow_equal);
 
     // BFS over the ppid forest. `frontier` holds pids whose children we still
     // need to visit; it starts as just the root pid. A pid joins the result (and
@@ -134,7 +135,8 @@ pub(crate) fn descendants_with(
     // Memoize identity resolution per pid so `resolve(pid)` runs at most once per
     // pid even when an edge is re-examined across frontier iterations or a pid
     // appears in multiple edges; identity is stable for the duration of the walk.
-    let mut resolved: std::collections::HashMap<RawPid, Option<ProcessId>> = std::collections::HashMap::new();
+    let mut resolved: std::collections::HashMap<RawPid, Option<(ProcessId, OrderKey)>> =
+        std::collections::HashMap::new();
 
     while !frontier.is_empty() {
         let mut next: Vec<RawPid> = Vec::new();
@@ -150,12 +152,12 @@ pub(crate) fn descendants_with(
             if pid == ppid {
                 continue;
             }
-            let id = *resolved.entry(pid).or_insert_with(|| resolve(pid));
-            let Some(id) = id else {
+            let read = *resolved.entry(pid).or_insert_with(|| resolve(pid));
+            let Some((id, key)) = read else {
                 log::debug!("treewalk: pid {pid} unresolvable — dropping its subtree");
                 continue;
             };
-            if !keep(id.start_token_raw()) {
+            if !keep(key) {
                 log::debug!("treewalk: dropping subtree under impostor pid {pid} (recycled pid / stale ppid)");
                 continue;
             }
@@ -173,33 +175,53 @@ pub(crate) fn descendants_with(
     result
 }
 
-/// Live descendants of `root`: the pure filter wired to `kernel`'s `ProcessId::of_with` resolver
-/// and the per-OS `ALLOW_EQUAL_TOKEN` rule.
+/// `anchor`'s order key for a walk from it. A walk from an anchor that cannot be ordered against
+/// keeps nothing, so `None` ends it empty; it is logged at `debug`.
+fn anchor_key(kernel: &dyn Kernel, anchor: ProcessId) -> Option<OrderKey> {
+    match anchor.order_key_with(kernel) {
+        Resolved::Found(key) => Some(key),
+        Resolved::Gone | Resolved::Unknown => {
+            log::debug!(
+                "treewalk: pid {pid} has no readable order key - walking nothing",
+                pid = anchor.pid()
+            );
+            None
+        }
+    }
+}
+
+/// Live descendants of `root`: the pure filter wired to `kernel`'s `ProcessId::of_ordered_with`
+/// resolver and the per-OS `ALLOW_EQUAL_ORDER` rule. Empty when `root`'s order key cannot be read.
 pub(crate) fn descendants(kernel: &dyn Kernel, root: ProcessId, parents: &[(RawPid, RawPid)]) -> Vec<ProcessId> {
-    descendants_with(root, parents, ALLOW_EQUAL_TOKEN, |pid| resolve_or_drop(kernel, pid))
+    let Some(root_key) = anchor_key(kernel, root) else {
+        return Vec::new();
+    };
+    descendants_with(root, root_key, parents, ALLOW_EQUAL_ORDER, |pid| {
+        resolve_or_drop(kernel, pid)
+    })
 }
 
 /// Pure one-level child filter (host-testable): keep each pid whose ppid == the parent's
-/// pid and whose start token passes `keeps_token` against the parent's. `resolve` is
+/// pid and whose order key passes `keeps_order` against `parent_key`. `resolve` is
 /// injected for purity. The parent itself is never included.
 pub(crate) fn children_of_with(
     parent: ProcessId,
+    parent_key: OrderKey,
     parents: &[(RawPid, RawPid)],
     allow_equal: bool,
-    resolve: impl Fn(RawPid) -> Option<ProcessId>,
+    resolve: impl Fn(RawPid) -> Option<(ProcessId, OrderKey)>,
 ) -> Vec<ProcessId> {
-    let ptoken = parent.start_token_raw();
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for &(pid, ppid) in parents {
         if ppid != parent.pid() || pid == ppid {
             continue;
         }
-        let Some(id) = resolve(pid) else {
+        let Some((id, key)) = resolve(pid) else {
             log::debug!("treewalk: pid {pid} unresolvable — dropped from children");
             continue;
         };
-        if !keeps_token(id.start_token_raw(), ptoken, allow_equal) {
+        if !keeps_order(key, parent_key, allow_equal) {
             log::debug!("treewalk: dropping impostor pid {pid} (recycled pid / stale ppid)");
             continue;
         }
@@ -210,10 +232,16 @@ pub(crate) fn children_of_with(
     out
 }
 
-/// Live one-level children of `parent`: the pure filter wired to `kernel`'s `ProcessId::of_with`
-/// and the per-OS `ALLOW_EQUAL_TOKEN` rule.
+/// Live one-level children of `parent`: the pure filter wired to `kernel`'s
+/// `ProcessId::of_ordered_with` and the per-OS `ALLOW_EQUAL_ORDER` rule. Empty when `parent`'s
+/// order key cannot be read.
 pub(crate) fn children_of(kernel: &dyn Kernel, parent: ProcessId, parents: &[(RawPid, RawPid)]) -> Vec<ProcessId> {
-    children_of_with(parent, parents, ALLOW_EQUAL_TOKEN, |pid| resolve_or_drop(kernel, pid))
+    let Some(parent_key) = anchor_key(kernel, parent) else {
+        return Vec::new();
+    };
+    children_of_with(parent, parent_key, parents, ALLOW_EQUAL_ORDER, |pid| {
+        resolve_or_drop(kernel, pid)
+    })
 }
 
 /// Kill `id` only if the pid STILL resolves to that exact identity — never a

@@ -60,6 +60,20 @@ impl StartToken {
     }
 }
 
+/// When a process started: comparable only with keys read on this host this boot. The tree walk's
+/// PID-reuse guard orders by it. Not the identity: equal keys do not mean the same process.
+///
+/// Built only inside `identity`, by the backends' reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct OrderKey(u64);
+
+impl OrderKey {
+    #[cfg(test)]
+    pub(crate) fn for_test(v: u64) -> OrderKey {
+        OrderKey(v)
+    }
+}
+
 /// A process identity that stays unique across time: `(pid, start_token)`.
 /// `Eq`/`Hash` are over the pair, so a recycled PID never compares equal to the
 /// original process.
@@ -76,9 +90,9 @@ impl ProcessId {
         self.pid
     }
 
-    /// The raw start token as a `u64`, for crate-internal ordering by creation
-    /// time (the containment tree-walk keeps only descendants created at-or-after
-    /// the root acquired its pid). Opaque outside identity ordering.
+    /// The raw start token as a `u64`, for tests that forge or compare tokens. Production code
+    /// orders by [`OrderKey`] and never reads the token.
+    #[cfg(test)]
     pub(crate) fn start_token_raw(&self) -> u64 {
         self.start.raw()
     }
@@ -111,6 +125,18 @@ impl ProcessId {
             let (read, cause) = start_token_explained(pid);
             (read.map(|start| ProcessId { pid, start }), cause)
         }
+    }
+
+    /// [`of_with`](Self::of_with), with the order key of the same read beside the id.
+    pub(crate) fn of_ordered_with(kernel: &dyn Kernel, pid: RawPid) -> (Resolved<(ProcessId, OrderKey)>, UnknownCause) {
+        let (read, cause) = Self::of_with(kernel, pid);
+        (read.map(|id| (id, OrderKey(id.start.raw()))), cause)
+    }
+
+    /// When this process started, for ordering against other processes' keys (the tree walk's
+    /// PID-reuse guard). [`Resolved::Gone`] and [`Resolved::Unknown`] mean no key could be read.
+    pub(crate) fn order_key_with(&self, _kernel: &dyn Kernel) -> Resolved<OrderKey> {
+        Resolved::Found(OrderKey(self.start.raw()))
     }
 
     /// Build a `ProcessId` from an already-known `(pid, raw start token)` pair, without a
