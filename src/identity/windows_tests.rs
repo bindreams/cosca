@@ -4,7 +4,7 @@ use windows::Win32::System::Threading::{
 };
 
 use super::{creation_token, current_token, exit_look, is_running, open_dropping_refused, start_token, Look, Opened};
-use crate::identity::windows_fixture::spawn_restricted;
+use crate::identity::windows_fixture::{spawn_restricted, spawn_restricted_shell};
 use crate::identity::{Key, Liveness, Resolved};
 
 /// One look at whether `id`'s process has exited, through the open: gone or recycled
@@ -542,5 +542,208 @@ fn a_refusal_on_a_handle_whose_rights_cannot_be_read_is_failed() {
     assert!(
         !super::is_access_denied(&e),
         "the failure is the rights read's own: {e:?}"
+    );
+}
+
+// order key =====
+
+fn order_key_of(id: crate::identity::ProcessId) -> crate::identity::OrderKey {
+    match id.order_key_with(&crate::identity::HostKernel).0 {
+        Resolved::Found(key) => key,
+        other => panic!("the order key of {id:?} should read, got {other:?}"),
+    }
+}
+
+/// The order key is the process sequence number, not the creation time that is the id's key.
+///
+/// Mutant: the order key is the id's key.
+#[skuld::test]
+fn the_order_key_is_not_the_creation_time() {
+    let me = crate::identity::ProcessId::current();
+    let (read, _) = crate::identity::ProcessId::of_ordered_with(&crate::identity::HostKernel, me.pid(), None);
+    let Resolved::Found((id, key)) = read else {
+        panic!("our own order key must read, got {read:?}");
+    };
+    assert_eq!(id, me, "the id of the ordered read is the id of the by-pid read");
+    assert_ne!(key, crate::identity::OrderKey::for_test(me.key().raw()));
+    assert_eq!(key, order_key_of(me), "both reads of one process agree");
+}
+
+/// The fact the tree walk relies on: a process's sequence number is greater than its creator's.
+///
+/// Mutant: the order key is a value that does not grow from creator to child.
+#[skuld::test]
+fn a_child_orders_after_its_creator_and_a_grandchild_after_the_child() {
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(a_child_orders_after_its_creator_and_a_grandchild_after_the_child),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
+    let child = spawn_restricted_shell(&done, PROCESS_QUERY_LIMITED_INFORMATION.0);
+    let grandchild = child.wait_for_child();
+    let me = crate::identity::ProcessId::current();
+    let child_id = crate::identity::ProcessId::of(child.pid())
+        .found()
+        .expect("the child is ours");
+    let grandchild_id = crate::identity::ProcessId::of(grandchild)
+        .found()
+        .expect("the grandchild is ours");
+    let keys = (order_key_of(me), order_key_of(child_id), order_key_of(grandchild_id));
+    assert!(keys.0 < keys.1, "child {:?} after creator {:?}", keys.1, keys.0);
+    assert!(keys.1 < keys.2, "grandchild {:?} after child {:?}", keys.2, keys.1);
+}
+
+/// A pid that another process holds has no order key for the id that was read before.
+///
+/// Mutant: the order key of a recycled pid is read as the new holder's.
+#[skuld::test]
+fn the_order_key_of_a_stale_id_is_gone() {
+    let stale = crate::identity::ProcessId::current().with_other_value();
+    assert_eq!(stale.order_key_with(&crate::identity::HostKernel).0, Resolved::Gone);
+}
+
+/// Mutant: the walk drops a genuine descendant under the sequence-number order.
+#[skuld::test]
+fn the_walk_keeps_a_real_child_and_grandchild_of_a_real_spawned_root() {
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(the_walk_keeps_a_real_child_and_grandchild_of_a_real_spawned_root),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
+    let child = spawn_restricted_shell(&done, PROCESS_QUERY_LIMITED_INFORMATION.0);
+    let grandchild = child.wait_for_child();
+    let root = crate::identity::ProcessId::of(child.pid())
+        .found()
+        .expect("the root is ours");
+    let direct = root.children(crate::Recursive::No);
+    let below_us = crate::identity::ProcessId::current().children(crate::Recursive::Yes);
+    let direct = direct.expect("the root's children are enumerable");
+    assert!(
+        direct.iter().any(|id| id.pid() == grandchild),
+        "{grandchild} not among {direct:?}"
+    );
+    let below_us = below_us.expect("our descendants are enumerable");
+    for pid in [root.pid(), grandchild] {
+        assert!(
+            below_us.iter().any(|id| id.pid() == pid),
+            "{pid} not among {below_us:?}"
+        );
+    }
+}
+
+// the two reads of one handle =====
+
+const REFUSED: windows::Win32::Foundation::NTSTATUS = windows::Win32::Foundation::NTSTATUS(0xC000_0004_u32 as i32);
+
+fn refused_key() -> windows::core::Result<Key> {
+    Err(windows::core::Error::from_hresult(windows::core::HRESULT::from_win32(
+        windows::Win32::Foundation::ERROR_ACCESS_DENIED.0,
+    )))
+}
+
+/// The error text of a read's cause, for the subject `pid 7`.
+fn cause_text(cause: crate::identity::UnknownCause) -> Option<String> {
+    cause.into_error("pid 7").map(|e| e.to_string())
+}
+
+/// Both reads answered: the id's key and the order key, from one handle.
+///
+/// Mutant: the order key is the key.
+#[skuld::test]
+fn two_good_reads_are_the_key_and_the_sequence_number() {
+    let key = Key::for_test(5);
+    for expected in [None, Some(key)] {
+        let (read, cause) = super::combine(7, expected, Ok(key), Ok(9));
+        assert_eq!(read, Resolved::Found((key, crate::identity::OrderKey::for_test(9))));
+        assert_eq!(cause_text(cause), None);
+    }
+}
+
+/// A refused sequence-number query on the process asked about is `Unknown`, with its status.
+///
+/// Mutant: the refusal reads as the generic "access denied?" one.
+#[skuld::test]
+fn a_refused_sequence_number_on_the_expected_process_is_unknown_with_its_status() {
+    let key = Key::for_test(5);
+    for expected in [None, Some(key)] {
+        let (read, cause) = super::combine(7, expected, Ok(key), Err(REFUSED));
+        assert_eq!(read, Resolved::Unknown);
+        let text = cause_text(cause).expect("the refusal is the cause");
+        assert!(
+            text.contains("pid 7") && text.contains("process sequence number query failed: NTSTATUS 0xc0000004"),
+            "{text}"
+        );
+    }
+}
+
+/// Another process's key is `Gone` whatever the sequence-number query said: a recycled pid whose
+/// new holder refuses the query is not an unreadable root.
+///
+/// Mutant: the sequence-number result is looked at before the key.
+#[skuld::test]
+fn another_processs_key_is_gone_whether_or_not_its_sequence_number_reads() {
+    let (read, cause) = super::combine(7, Some(Key::for_test(5)), Ok(Key::for_test(6)), Err(REFUSED));
+    assert_eq!(read, Resolved::Gone);
+    assert_eq!(cause_text(cause), None);
+    let (read, _) = super::combine(7, Some(Key::for_test(5)), Ok(Key::for_test(6)), Ok(9));
+    assert_eq!(read, Resolved::Gone);
+}
+
+/// A key that cannot be read leaves nothing to compare: `Unknown`. When the sequence-number query
+/// was refused too, the cause keeps its status and the log keeps the key's failure.
+///
+/// Mutant: the second failure is dropped.
+#[skuld::test]
+fn two_failed_reads_keep_both_failures() {
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let (read, cause) = super::combine(70_007, Some(Key::for_test(5)), refused_key(), Err(REFUSED));
+    assert_eq!(read, Resolved::Unknown);
+    assert!(
+        cause_text(cause).is_some_and(|t| t.contains("NTSTATUS 0xc0000004")),
+        "the sequence-number refusal is the cause"
+    );
+    assert!(
+        crate::log_capture::contains_since(mark, "GetProcessTimes failed on an opened handle for pid 70007"),
+        "the key's failure is logged"
+    );
+
+    let (read, cause) = super::combine(70_008, None, refused_key(), Ok(9));
+    assert_eq!(read, Resolved::Unknown);
+    assert_eq!(cause_text(cause), None, "a key refusal alone has no status to name");
+}
+
+/// Class 92 answers for every process this caller can open: the CI pin of the private read on the
+/// runner's real process population. Read-only.
+/// An elevated caller opens more, so an elevated runner covers processes an unelevated one cannot.
+///
+/// Mutant: the class is refused for a kind of process (a protected or system one).
+#[skuld::test]
+fn the_sequence_number_reads_on_every_process_that_opens() {
+    let parents =
+        crate::containment::enumerate::process_parents(&crate::identity::HostKernel).expect("the process snapshot");
+    let (mut opened, mut refused, mut gone) = (0usize, 0usize, 0usize);
+    let mut failures = Vec::new();
+    for (pid, _) in parents {
+        match super::open_classified(pid, PROCESS_QUERY_LIMITED_INFORMATION) {
+            Opened::Found(handle) => {
+                opened += 1;
+                if let Err(status) = super::sequence_number(handle) {
+                    failures.push(format!("pid {pid}: NTSTATUS {:#010x}", status.0 as u32));
+                }
+                super::close(handle);
+            }
+            Opened::Denied(_) => refused += 1,
+            Opened::Gone => gone += 1,
+        }
+    }
+    eprintln!("sequence number read on {opened} processes; {refused} refused to open, {gone} gone");
+    assert!(opened > 0, "no process could be opened: {refused} refused, {gone} gone");
+    assert!(
+        failures.is_empty(),
+        "class 92 failed on {} of {opened} opened processes ({refused} refused to open): {failures:?}",
+        failures.len()
     );
 }
