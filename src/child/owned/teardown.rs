@@ -22,8 +22,9 @@
 //! An elevation front is sent nothing: a kill of it would orphan the elevated program. One look at
 //! the present moment collects it if it has exited. A running front is waited for only if
 //! [`Reach::reached`] says a kill sent elsewhere (a cgroup leaf's) reached it, since that kill bounds
-//! the wait; otherwise it is left. [`TeardownOutcome::look`] says how it went, as data: the caller
-//! knows why the front was not killed, and words it.
+//! the wait; otherwise it is left running. [`TeardownOutcome::look`] says how it went, as data: the
+//! caller knows why the front was not killed and whether it hands a running front back
+//! ([`Disposition`]), and words it.
 
 use std::io;
 use std::process::ExitStatus;
@@ -37,9 +38,9 @@ use crate::os_process::child_named;
 use crate::signal::{Sent, Sig};
 use crate::wait::teardown_warn::Due;
 
-/// What the caller does with a child that still runs after its kill was refused: `Leave` it
-/// running, or `HandBack` it as an [`Unreaped`](crate::Unreaped). It words the teardown's warn; the
-/// caller does what it says.
+/// What the caller does with a child that still runs after its kill was refused, or after it was
+/// sent none (an elevation front): `Leave` it running, or `HandBack` it as an
+/// [`Unreaped`](crate::Unreaped). It words the warn of the event; the caller does what it says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Disposition {
     Leave,

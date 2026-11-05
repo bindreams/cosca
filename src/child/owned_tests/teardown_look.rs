@@ -256,15 +256,25 @@ fn a_front_that_has_exited_is_reaped_though_its_subtree_cannot_be_read() {
 #[cfg(unix)]
 mod worded {
     use super::*;
+    use crate::child::owned::teardown::Disposition;
     use crate::containment::dispatch::TeardownCaller;
 
     const WHY: &str = "the front is not in a cgroup this drop killed";
 
-    /// The outcome of `tear_down` over `fake`, as the drop words it, and its debug records.
-    fn worded_by_the_drop(fake: &FakeProcess, reach: Reaches<'_>) -> (TeardownOutcome, Vec<(log::Level, String)>) {
+    /// The two things a caller can do with a front still running. An outcome that hands nothing
+    /// back is worded the same under both.
+    const BOTH: [Disposition; 2] = [Disposition::Leave, Disposition::HandBack];
+
+    /// The outcome of `tear_down` over `fake`, as the drop words it for a caller that does
+    /// `disposition`, and its debug records.
+    fn worded_by_the_drop(
+        disposition: Disposition,
+        fake: &FakeProcess,
+        reach: Reaches<'_>,
+    ) -> (TeardownOutcome, Vec<(log::Level, String)>) {
         let (torn, _) = look_logged(fake, Some(id()), reach, None);
         let mark = crate::log_capture::mark();
-        let worded = crate::child::word_front(TeardownCaller::Drop, PID, &WHY, torn);
+        let worded = crate::child::word_front(TeardownCaller::Drop, PID, &WHY, disposition, torn);
         (
             worded,
             crate::log_capture::records_since_on_current_thread(mark, "Child::drop: "),
@@ -276,110 +286,152 @@ mod worded {
     }
 
     #[track_caller]
-    fn assert_left(reach: Reaches<'_>, fake: &FakeProcess, wanted: &str) {
+    fn assert_left(disposition: Disposition, reach: Reaches<'_>, fake: &FakeProcess, wanted: &str) {
         let _fire = fire_on_block(fake);
-        let (worded, records) = worded_by_the_drop(fake, reach);
-        assert_eq!(worded.left.as_deref(), Some(wanted), "{worded:?}");
+        let (worded, records) = worded_by_the_drop(disposition, fake, reach);
+        assert_eq!(worded.left.as_deref(), Some(wanted), "{disposition:?}: {worded:?}");
         assert_eq!(records, [], "a leftover is a warn's, not a debug line");
         assert!(worded.look.is_none(), "the look is worded and used up: {worded:?}");
     }
 
     #[track_caller]
-    fn assert_debug(reach: Reaches<'_>, fake: &FakeProcess, wanted: &str) {
+    fn assert_debug(disposition: Disposition, reach: Reaches<'_>, fake: &FakeProcess, wanted: &str) {
         let _fire = fire_on_block(fake);
-        let (worded, records) = worded_by_the_drop(fake, reach);
-        assert_eq!(worded.left, None, "{worded:?}");
+        let (worded, records) = worded_by_the_drop(disposition, fake, reach);
+        assert_eq!(worded.left, None, "{disposition:?}: {worded:?}");
         assert_eq!(records, [(log::Level::Debug, wanted.to_owned())]);
     }
 
     #[skuld::test]
     fn a_front_left_running_is_worded_with_why() {
         assert_left(
+            Disposition::Leave,
             Ok(None),
             &fake().reaps([ReapAnswer::Running]),
             "elevation front pid 4242 is left running and unreaped: the front is not in a cgroup this drop killed, and a kill of the front would orphan the elevated program",
         );
         assert_left(
+            Disposition::Leave,
             Ok(Some(&FakeReach::answering(Ok(false)))),
             &fake().reaps([ReapAnswer::Running]),
             "elevation front pid 4242 is left running and unreaped: the front is not in a cgroup this drop killed, and a kill of the front would orphan the elevated program",
         );
     }
 
+    /// A caller that hands the front back says so, where the one that leaves it says it is left.
+    ///
+    /// Mutant: the wording ignores the disposition.
+    #[skuld::test]
+    fn a_front_left_running_is_worded_as_handed_back_for_a_caller_that_hands_it_back() {
+        assert_left(
+            Disposition::HandBack,
+            Ok(None),
+            &fake().reaps([ReapAnswer::Running]),
+            "elevation front pid 4242 is running and unreaped: the front is not in a cgroup this drop killed, and a kill of the front would orphan the elevated program; handed back to the caller in the error",
+        );
+        assert_left(
+            Disposition::HandBack,
+            Ok(Some(&FakeReach::answering(Ok(false)))),
+            &fake().reaps([ReapAnswer::Running]),
+            "elevation front pid 4242 is running and unreaped: the front is not in a cgroup this drop killed, and a kill of the front would orphan the elevated program; handed back to the caller in the error",
+        );
+    }
+
+    /// Mutant: `HandBack` rewords an outcome that hands nothing back.
     #[skuld::test]
     fn a_front_whose_place_cannot_be_read_is_worded() {
-        assert_left(
-            Ok(Some(&FakeReach::answering(Err(io::ErrorKind::Other)))),
-            &fake().reaps([ReapAnswer::Running]),
-            &format!("elevation front pid 4242 is left unreaped: where it is cannot be read ({}), so it is not known whether the cgroup kill ended it", cause()),
-        );
+        for disposition in BOTH {
+            assert_left(
+                disposition,
+                Ok(Some(&FakeReach::answering(Err(io::ErrorKind::Other)))),
+                &fake().reaps([ReapAnswer::Running]),
+                &format!("elevation front pid 4242 is left unreaped: where it is cannot be read ({}), so it is not known whether the cgroup kill ended it", cause()),
+            );
+        }
     }
 
     #[skuld::test]
     fn a_front_whose_subtree_cannot_be_read_is_worded() {
-        assert_left(
-            Err(io::Error::from(io::ErrorKind::Other)),
-            &fake().reaps([ReapAnswer::Running]),
-            &format!("elevation front pid 4242 is left unreaped: its leaf's subtree cannot be read ({}), so it is not known whether the cgroup kill ended it", cause()),
-        );
+        for disposition in BOTH {
+            assert_left(
+                disposition,
+                Err(io::Error::from(io::ErrorKind::Other)),
+                &fake().reaps([ReapAnswer::Running]),
+                &format!("elevation front pid 4242 is left unreaped: its leaf's subtree cannot be read ({}), so it is not known whether the cgroup kill ended it", cause()),
+            );
+        }
     }
 
     #[skuld::test]
     fn a_front_that_cannot_be_looked_at_is_worded() {
-        assert_left(
-            Ok(None),
-            &fake().reaps([ReapAnswer::Err(io::ErrorKind::Other)]),
-            &format!(
-                "elevation front pid 4242 could not be looked at after its cgroup's teardown ({})",
-                cause()
-            ),
-        );
+        for disposition in BOTH {
+            assert_left(
+                disposition,
+                Ok(None),
+                &fake().reaps([ReapAnswer::Err(io::ErrorKind::Other)]),
+                &format!(
+                    "elevation front pid 4242 could not be looked at after its cgroup's teardown ({})",
+                    cause()
+                ),
+            );
+        }
     }
 
     #[skuld::test]
     fn a_front_that_cannot_be_reaped_after_the_kill_is_worded() {
-        assert_left(
-            Ok(Some(&FakeReach::answering(Ok(true)))),
-            &fake().reaps([ReapAnswer::Running, ReapAnswer::Err(io::ErrorKind::Other)]),
-            &format!(
-                "elevation front pid 4242 was killed through its cgroup, and could not be reaped ({})",
-                cause()
-            ),
-        );
+        for disposition in BOTH {
+            assert_left(
+                disposition,
+                Ok(Some(&FakeReach::answering(Ok(true)))),
+                &fake().reaps([ReapAnswer::Running, ReapAnswer::Err(io::ErrorKind::Other)]),
+                &format!(
+                    "elevation front pid 4242 was killed through its cgroup, and could not be reaped ({})",
+                    cause()
+                ),
+            );
+        }
     }
 
     #[skuld::test]
     fn a_front_reaped_is_said_at_debug() {
-        assert_debug(
-            Ok(None),
-            &fake().reaps([ReapAnswer::Reaped(exit())]),
-            &format!(
-                "Child::drop: elevation front pid 4242 was killed through its cgroup and reaped ({})",
-                std::process::ExitStatus::default()
-            ),
-        );
-        assert_debug(
-            Ok(Some(&FakeReach::answering(Ok(true)))),
-            &fake().reaps([ReapAnswer::Running, ReapAnswer::Running, ReapAnswer::Reaped(exit())]),
-            &format!(
-                "Child::drop: elevation front pid 4242 was killed through its cgroup and reaped ({})",
-                std::process::ExitStatus::default()
-            ),
-        );
+        for disposition in BOTH {
+            assert_debug(
+                disposition,
+                Ok(None),
+                &fake().reaps([ReapAnswer::Reaped(exit())]),
+                &format!(
+                    "Child::drop: elevation front pid 4242 was killed through its cgroup and reaped ({})",
+                    std::process::ExitStatus::default()
+                ),
+            );
+            assert_debug(
+                disposition,
+                Ok(Some(&FakeReach::answering(Ok(true)))),
+                &fake().reaps([ReapAnswer::Running, ReapAnswer::Running, ReapAnswer::Reaped(exit())]),
+                &format!(
+                    "Child::drop: elevation front pid 4242 was killed through its cgroup and reaped ({})",
+                    std::process::ExitStatus::default()
+                ),
+            );
+        }
     }
 
     #[skuld::test]
     fn a_front_reaped_by_someone_else_is_said_at_debug() {
-        assert_debug(
-            Ok(None),
-            &fake().reaps([ReapAnswer::Foreign(Foreign::Gone)]),
-            "Child::drop: elevation front pid 4242 was reaped by someone else",
-        );
-        assert_debug(
-            Ok(Some(&FakeReach::answering(Ok(true)))),
-            &fake().reaps([ReapAnswer::Running, ReapAnswer::Foreign(Foreign::Gone)]),
-            "Child::drop: elevation front pid 4242 was reaped by someone else",
-        );
+        for disposition in BOTH {
+            assert_debug(
+                disposition,
+                Ok(None),
+                &fake().reaps([ReapAnswer::Foreign(Foreign::Gone)]),
+                "Child::drop: elevation front pid 4242 was reaped by someone else",
+            );
+            assert_debug(
+                disposition,
+                Ok(Some(&FakeReach::answering(Ok(true)))),
+                &fake().reaps([ReapAnswer::Running, ReapAnswer::Foreign(Foreign::Gone)]),
+                "Child::drop: elevation front pid 4242 was reaped by someone else",
+            );
+        }
     }
 
     /// A teardown after a failed run words its look under its own name, not a drop's.
@@ -392,7 +444,7 @@ mod worded {
         let (torn, _) = look_logged(&fake, Some(id()), Ok(None), None);
         let mark = crate::log_capture::mark();
 
-        crate::child::word_front(TeardownCaller::FailedRun, PID, &WHY, torn);
+        crate::child::word_front(TeardownCaller::FailedRun, PID, &WHY, Disposition::Leave, torn);
 
         let records = crate::log_capture::records_since_on_current_thread(mark, "elevation front pid");
         assert_eq!(records.len(), 1, "{records:?}");
@@ -411,7 +463,7 @@ mod worded {
     fn an_outcome_with_no_look_is_returned_as_it_is() {
         let mut torn = TeardownOutcome::new(ChildFate::Reaped);
         torn.left = Some("from the policy".to_owned());
-        let worded = crate::child::word_front(TeardownCaller::Drop, PID, &WHY, torn);
+        let worded = crate::child::word_front(TeardownCaller::Drop, PID, &WHY, Disposition::Leave, torn);
         assert_eq!(worded.left.as_deref(), Some("from the policy"));
     }
 }

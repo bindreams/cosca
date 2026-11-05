@@ -424,12 +424,14 @@ impl Child {
     /// is looked at through [`tear_down`](OwnedChild::tear_down), which waits for it only if its
     /// place says the kill reached it. The leaf's subtree is captured while the leaf exists, since
     /// it places the front once the leaf is gone. How the look went is worded by [`word_front`],
-    /// with `why`, under `caller`'s name.
+    /// with `why`, under `caller`'s name, for a caller that does `disposition` with a front that
+    /// still runs.
     #[cfg(unix)]
     fn tear_down_leaf_and_look_at_front(
         &mut self,
         caller: TeardownCaller,
         why: &dyn std::fmt::Display,
+        disposition: Disposition,
     ) -> TeardownOutcome {
         use crate::child::owned::teardown::Reach;
 
@@ -452,7 +454,7 @@ impl Child {
         #[cfg(not(target_os = "linux"))]
         let reach: Result<Option<&dyn Reach>, std::io::Error> = Ok(None);
         let torn = self.proc.tear_down(Some(self.id), TeardownKind::Look(reach), None);
-        word_front(caller, self.id.pid(), why, torn)
+        word_front(caller, self.id.pid(), why, disposition, torn)
     }
 
     /// What a forced kill of this child may do (see [`crate::elevation::front`]).
@@ -1153,7 +1155,7 @@ impl Child {
             crate::elevation::front::Gate::Closed(unkillable) => {
                 // The leaf stays armed: its teardown kills what it holds, a front among it if it is
                 // in it. Run now, not at field drop, so the look at the front comes after it.
-                let torn = self.tear_down_leaf_and_look_at_front(caller, &unkillable);
+                let torn = self.tear_down_leaf_and_look_at_front(caller, &unkillable, disposition);
                 report.left.extend(torn.left);
                 report.emit(&self.reported);
                 return torn.fate;
@@ -1198,7 +1200,7 @@ impl Child {
                     Ok(()) => self.proc.reap_after_tree_kill(),
                     // Never waited for. The armed leaf still kills what it holds, retrying a kill
                     // that failed, and the front is looked at once that is done.
-                    Err(e) => self.tear_down_leaf_and_look_at_front(caller, &e),
+                    Err(e) => self.tear_down_leaf_and_look_at_front(caller, &e, disposition),
                 }
             } else {
                 // The tree kill above may have reached the root: if the root's own kill is refused,
@@ -1218,12 +1220,14 @@ impl Child {
 /// What `caller` says of how its look at the elevation front `pid` went (`torn.look`): a debug line
 /// for a front that was reaped, or reaped by someone else, and a leftover for its one warn for any
 /// other. `why` is why the caller did not kill the front. An outcome with no look is returned as it
-/// is.
+/// is. A front still running is worded as handed back if `disposition` says the caller hands it
+/// back, and as left otherwise; no other outcome depends on it.
 #[cfg(unix)]
 fn word_front(
     caller: TeardownCaller,
     pid: u32,
     why: &dyn std::fmt::Display,
+    disposition: Disposition,
     mut torn: TeardownOutcome,
 ) -> TeardownOutcome {
     use crate::child::owned::teardown::LookOutcome;
@@ -1247,10 +1251,16 @@ fn word_front(
         LookOutcome::ReapFailed(e) => Some(format!(
             "elevation front pid {pid} was killed through its cgroup, and could not be reaped ({e})"
         )),
-        LookOutcome::LeftRunning => Some(format!(
-            "elevation front pid {pid} is left running and unreaped: {why}, and a kill of the front would orphan \
-             the elevated program"
-        )),
+        LookOutcome::LeftRunning => Some(match disposition {
+            Disposition::Leave => format!(
+                "elevation front pid {pid} is left running and unreaped: {why}, and a kill of the front would orphan \
+                 the elevated program"
+            ),
+            Disposition::HandBack => format!(
+                "elevation front pid {pid} is running and unreaped: {why}, and a kill of the front would orphan \
+                 the elevated program; handed back to the caller in the error"
+            ),
+        }),
         LookOutcome::PlaceUnreadable(e) => Some(format!(
             "elevation front pid {pid} is left unreaped: where it is cannot be read ({e}), so it is not known \
              whether the cgroup kill ended it"
