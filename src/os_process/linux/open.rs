@@ -95,13 +95,6 @@ pub(crate) fn probe_pidfd_support_with(kernel: &dyn Kernel) -> Result<(), Error>
         .map_err(spawn_open_error)
 }
 
-/// The next scripted `pidfd_open` outcome on THIS thread, for a `pidfd_open` made elsewhere: the
-/// spawn handshake's is made by the child. See [`fault::force_pidfd_open_script`].
-#[cfg(test)]
-pub(crate) fn take_scripted_pidfd_open() -> Option<rustix::io::Errno> {
-    fault::take_forced_pidfd_open_errno()
-}
-
 /// `pidfd_open` refused `id`'s pid with `errno`. `Ok(None)` when the process is provably gone;
 /// otherwise an error, since a live target cannot be waited on or signalled through a pidfd.
 ///

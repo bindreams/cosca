@@ -103,6 +103,7 @@ type VerdictHook = Box<dyn FnOnce(Option<u32>)>;
 
 thread_local! {
     static DONE_FD_FAILURE: Cell<Option<Errno>> = const { Cell::new(None) };
+    static CHILD_PIDFD_OPEN_FAILURE: Cell<Option<Errno>> = const { Cell::new(None) };
     #[cfg(feature = "tokio")]
     static UNEXECUTED_WAIT_FAILURE: Cell<Option<Errno>> = const { Cell::new(None) };
     static CHILD_FAULT: Cell<ChildFault> = const { Cell::new(ChildFault::None) };
@@ -224,6 +225,28 @@ impl Drop for ArmedDoneFdFailure {
 
 pub(super) fn take_done_fd_failure() -> Option<Errno> {
     DONE_FD_FAILURE.with(Cell::take)
+}
+
+/// Disarms the child's `pidfd_open` failure on drop.
+#[must_use = "dropping this disarms the failure at once"]
+pub(crate) struct ArmedChildPidfdOpen(());
+
+/// Make the NEXT spawn's child answer its own `pidfd_open` with `errno`. The child makes that call
+/// after the fork, where a [`Kernel`](crate::identity::Kernel) fake's tables cannot be consulted.
+pub(crate) fn fail_child_pidfd_open(errno: Errno) -> ArmedChildPidfdOpen {
+    CHILD_PIDFD_OPEN_FAILURE.with(|f| f.set(Some(errno)));
+    ArmedChildPidfdOpen(())
+}
+
+impl Drop for ArmedChildPidfdOpen {
+    fn drop(&mut self) {
+        CHILD_PIDFD_OPEN_FAILURE.with(|f| f.set(None));
+    }
+}
+
+/// Taken once by `register`, on the spawning thread.
+pub(super) fn take_child_pidfd_open_failure() -> Option<Errno> {
+    CHILD_PIDFD_OPEN_FAILURE.with(Cell::take)
 }
 
 /// Disarms the failure of the wait for an unexecuted child's exit on drop.
