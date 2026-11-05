@@ -566,6 +566,71 @@ fn converge_looks_at_a_members_liveness_through_its_kernel() {
     _ = child.wait();
 }
 
+/// A member that refused the probe (`EPERM`) is looked at once more before it counts as a survivor,
+/// through the kernel the pass reads through. Its `stat` is read by the listing, the first look, the
+/// re-verify before the probe and then the second look, which finds its pid's new owner: the member
+/// is gone. Mutant: "`reconfirm_survivor`'s look reads through `HostKernel`": the member is still
+/// alive and the group is `Refused`.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn converge_looks_again_at_a_refusing_member_through_its_kernel() {
+    let mut child = crate::test_spawn::spawn(&mut member_command(0)).expect("spawn leader");
+    await_member_ready(&mut child);
+    let pid = child.id();
+
+    let kernel = FakeKernel::over(&HostKernel).on_read_after(
+        &format!("{pid}/stat"),
+        3,
+        Ok(&crate::test_child::stat_of_a_new_owner(pid)),
+    );
+    let refusing = crate::containment::unix::fault::refuse_probes();
+    let state = super::converge(
+        &kernel,
+        pid as i32,
+        Signal::SIGTERM,
+        &crate::containment::GroupRoot::trusted_for_test(),
+    );
+    drop(refusing);
+
+    assert!(matches!(state, Ok(GroupState::Cleared)), "got {state:?}");
+    _ = child.kill();
+    _ = child.wait();
+}
+
+/// A `SIGKILL` pass opens each member's pidfd through the kernel it is given: where that kernel
+/// refuses the open, the member's kill is resent by its number. Mutant: "`converge` hands
+/// `HostKernel` to `check_or_signal_linux_sigkill`": the open succeeds and the kill goes through
+/// the pidfd.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn converge_sigkill_opens_a_members_pidfd_through_its_kernel() {
+    use crate::send_log::{Capture, GroupStep, Route};
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let mut child = crate::test_spawn::spawn(&mut member_command(0)).expect("spawn leader");
+    await_member_ready(&mut child);
+    let pid = child.id();
+
+    let kernel = FakeKernel::over(&HostKernel).on_pidfd_open(pid, Err(rustix::io::Errno::MFILE));
+    let capture = Capture::start();
+    let state = super::converge(
+        &kernel,
+        pid as i32,
+        Signal::SIGKILL,
+        &crate::containment::GroupRoot::trusted_for_test(),
+    );
+    let steps = capture.group_steps();
+    drop(capture);
+
+    assert!(matches!(state, Ok(GroupState::Cleared)), "got {state:?}");
+    assert_eq!(
+        steps,
+        [GroupStep::Check, GroupStep::Member(Route::Number, pid, libc::SIGKILL)]
+    );
+    let status = child.wait().expect("reap the leader");
+    assert_eq!(status.signal(), Some(libc::SIGKILL), "the resend killed the member");
+}
+
 /// A member that is a live non-leader thread is `Unknown`, with a warn naming that cause, and is
 /// never sent to the `kill(2)` fallback (a `kill` on a tid signals its whole thread group). The
 /// `pid` argument is a disposable child, so a regression that fell back would land on it, never on
