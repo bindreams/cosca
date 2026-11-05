@@ -8,7 +8,7 @@ use crate::test_groups::{namespaces, Group};
 
 use super::{
     classify_ns_links, classify_status, collect_pids, parse_fdinfo_pid, pidfd_pid_in, proc_view_with, PidfdTarget,
-    ProcDir, ProcView, Verdict, ViewUnreadable,
+    ProcDir, ProcView, Verdict, ViewUnreadable, UNREADABLE_STATUS_REASON,
 };
 use crate::identity::{FakeKernel, HostKernel};
 
@@ -143,7 +143,7 @@ fn fdinfo_pid_ignores_similarly_prefixed_keys() {
 fn proc_view_with_is_unassessable_for_a_status_that_is_not_utf8() {
     let kernel = FakeKernel::over(&HostKernel).on_read("self/status", Ok(&[0xff]));
     match proc_view_with(&kernel) {
-        ProcView::Unassessable(why) => assert!(why.reason.contains("self/status could not be read"), "{why}"),
+        ProcView::Unassessable(why) => assert!(why.reason.contains(UNREADABLE_STATUS_REASON), "{why}"),
         other => panic!("got {other:?}"),
     }
 }

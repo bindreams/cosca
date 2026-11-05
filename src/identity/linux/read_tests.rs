@@ -18,9 +18,6 @@ pub(super) const NO_PROCESS_CAN_HOLD: u32 = i32::MAX as u32;
 /// [`NO_PROCESS_CAN_HOLD`] as the kill target the kernel is asked about.
 const NO_PROCESS_CAN_HOLD_TARGET: Pid = Pid::from_raw(i32::MAX).unwrap();
 
-/// A `self/status` with the pid in one namespace: `/proc` is this namespace's own.
-const SAME_STATUS: &[u8] = b"NSpid:\t4242\n";
-
 /// The kernels that leave a live pid unanswerable, over the real one: a diverged view, a
 /// `self/status` that cannot be read, and no `/proc` to open (descriptor exhaustion).
 fn unavailable_views() -> [(&'static str, FakeKernel<'static>); 3] {
@@ -29,11 +26,6 @@ fn unavailable_views() -> [(&'static str, FakeKernel<'static>); 3] {
         ("unassessable", FakeKernel::over(&HostKernel).unreadable_view()),
         ("no /proc", FakeKernel::over(&HostKernel).open_proc_fails(Errno::MFILE)),
     ]
-}
-
-/// A kernel whose view is this namespace's own, over the real one.
-fn same_view() -> FakeKernel<'static> {
-    FakeKernel::over(&HostKernel).on_read("self/status", Ok(SAME_STATUS))
 }
 
 /// Mutant: "read `stat` by path whatever the view" - the unavailable view is ignored and the
@@ -101,7 +93,8 @@ fn a_stat_that_cannot_be_read_is_gone_only_when_kill_says_esrch() {
         (libc::EACCES, Err(Errno::PERM), false),
     ];
     for (errno, probe, gone) in cases {
-        let kernel = same_view()
+        let kernel = FakeKernel::over(&HostKernel)
+            .same_view()
             .on_read(&format!("{PID}/stat"), Err(errno))
             .on_signal_probe(Pid::from_raw(PID as i32).unwrap(), probe);
         let got = ProcessId::of_with(&kernel, PID).0;
@@ -110,7 +103,9 @@ fn a_stat_that_cannot_be_read_is_gone_only_when_kill_says_esrch() {
             _ => panic!("stat {errno}, kill {probe:?}: got {got:?}"),
         }
     }
-    let found = same_view().on_read(&format!("{PID}/stat"), Ok(&stat_fixture("S", 424242)));
+    let found = FakeKernel::over(&HostKernel)
+        .same_view()
+        .on_read(&format!("{PID}/stat"), Ok(&stat_fixture("S", 424242)));
     match ProcessId::of_with(&found, PID).0 {
         Resolved::Found(id) => assert_eq!(id.start_token_raw(), 424242),
         other => panic!("a readable stat must resolve, got {other:?}"),
@@ -166,7 +161,8 @@ fn the_error_for_a_diverged_view_carries_the_view() {
 /// With a fine view, an `Unknown` is the OS's (`hidepid`, a racing exit) and has no view to blame.
 #[skuld::test]
 fn no_error_is_blamed_on_a_fine_view() {
-    let kernel = same_view()
+    let kernel = FakeKernel::over(&HostKernel)
+        .same_view()
         .on_read("4242/stat", Err(libc::ENOENT))
         .on_signal_probe(Pid::from_raw(4242).unwrap(), Ok(()));
     let (got, cause) = ProcessId::of_with(&kernel, 4242);
