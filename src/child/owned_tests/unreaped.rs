@@ -10,6 +10,9 @@ use crate::os_process::child::Foreign;
 use crate::os_process::fake::{FakeProcess, ReapAnswer};
 use crate::os_process::PIDLESS_CHILD;
 
+// `Error` carries an `Unreaped`, and users move errors across threads.
+static_assertions::assert_impl_all!(Unreaped: Send, Sync);
+
 fn unreaped(fake: &FakeProcess, id: Option<ProcessId>) -> Unreaped {
     Unreaped::new(OwnedChild::new(Box::new(fake.clone())), id)
 }
