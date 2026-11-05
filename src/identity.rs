@@ -262,7 +262,9 @@ impl ProcessId {
     /// for the anchor of a walk: [`Resolved::Found`] only if it did at the read. On Windows the key
     /// read is that proof, so the proof and the key are one read: two could find a process that
     /// exits between them gone, and its children, which Windows does not reparent, unwalked.
-    /// Elsewhere [`exists_with`](Self::exists_with) proves it and the key follows.
+    /// Elsewhere [`exists_with`](Self::exists_with) proves it and the key follows: two reads for a
+    /// Linux `pidfs` key (a `ticks` key and a macOS key need no second one). A process gone between
+    /// them is `Gone`, and its children, reparented at its exit, no longer descend from it.
     pub(crate) fn anchor_order_key_with(&self, kernel: &dyn Kernel) -> (Resolved<OrderKey>, UnknownCause) {
         #[cfg(windows)]
         {

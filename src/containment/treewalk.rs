@@ -31,10 +31,14 @@
 //!   excluded by both rules.
 //! - The rule cannot defend a root whose own pid was recycled: the new owner's children
 //!   are created after the root, so they pass it. So the walk takes its snapshot first, then
-//!   reads the root's key once ([`anchor`]), which also proves it still holds its pid; a root
+//!   reads the root's key ([`anchor`]), which also proves it still holds its pid; a root
 //!   that does not walks nothing. A root that is gone by the time its key is read walks nothing;
 //!   one whose key exists but cannot be read is an error (`Error::Unassessable`), never an empty
-//!   walk.
+//!   walk. On Windows the proof and the key are one read on one handle, so a root that exits
+//!   cannot be proved and then found gone with its (unreparented) children unwalked. Elsewhere
+//!   the pid is proved and then keyed, two reads for a Linux `pidfs` key (a Linux `ticks` key and
+//!   a macOS key are known without a second read): a root gone between them walks nothing, which
+//!   loses no one, because its children are reparented at its exit and no longer descend from it.
 //! - A `key == root.key` candidate whose current ppid == root.pid can only be
 //!   a *genuine* same-tick child: an unrelated same-tick collision that also
 //!   happens to carry a recycled ppid equal to root.pid is impossible.
@@ -78,13 +82,21 @@ pub(crate) fn resolve_or_drop(kernel: &dyn Kernel, pid: RawPid, parent: ProcessI
         (Resolved::Found(read), _) => Some(read),
         (Resolved::Gone, _) => None,
         (Resolved::Unknown, cause) => {
-            let why = cause
-                .into_error(&format!("pid {pid}"))
-                .map_or_else(|| "access denied?".to_owned(), |e| e.to_string());
+            let parent_blamed = cause.blamed_parent().is_some();
+            let why = match unqueryable_read(pid, cause) {
+                Error::Unassessable { detail, .. } => detail,
+                other => other.to_string(),
+            };
             // The pid is IN the message on purpose: `log_capture` is one process-global
             // buffer shared by every parallel test, so a test asserting on this line must be
-            // able to pin it to its own fixture rather than to any concurrent teardown.
-            log::warn!("treewalk: pid {pid} could not be queried ({why}) - dropped from the walk");
+            // able to pin it to its own fixture rather than to any concurrent teardown. The reason
+            // names it when it is the subject, else the blamed parent, and then the pid is named here.
+            let dropped = if parent_blamed {
+                format!("pid {pid} dropped")
+            } else {
+                "dropped".to_owned()
+            };
+            log::warn!("treewalk: {why} - {dropped} from the walk");
             None
         }
     }
@@ -203,7 +215,8 @@ fn settle_anchor(anchor: ProcessId, read: (Resolved<OrderKey>, UnknownCause)) ->
 
 /// `anchor`'s order key for a walk from it, read after the snapshot: also the proof that it still
 /// holds its pid, so a walk takes its edges from the snapshot only for a root that held the pid
-/// throughout. One read serves as both (see [`ProcessId::anchor_order_key_with`]); pass the key to
+/// throughout. On Windows one read serves as both; elsewhere the pid is proved, then keyed (see
+/// [`ProcessId::anchor_order_key_with`] and the module docs). Pass the key to
 /// [`descendants_from_key`] or [`children_of_from_key`].
 ///
 /// # Errors
@@ -439,7 +452,7 @@ pub(crate) fn kill_by_identity(id: ProcessId) -> KillOutcome {
 }
 
 /// Whether `root` still holds its pid, asked AFTER the snapshot was taken, for a caller that needs
-/// no order key (a walk uses [`anchor`], which asks both in one read). `Ok(false)`: gone or
+/// no order key (a walk uses [`anchor`], which asks for both). `Ok(false)`: gone or
 /// recycled. [`Error::Unassessable`] (or `Unsupported`) when it cannot be told, naming the read's
 /// cause.
 pub(crate) fn anchor_present(kernel: &dyn Kernel, root: ProcessId) -> Result<bool, Error> {
@@ -457,6 +470,16 @@ pub(crate) fn unqueryable(subject: &str, cause: UnknownCause) -> Error {
         detail: format!("{subject} exists but could not be queried (access denied?)"),
         source: None,
     })
+}
+
+/// [`unqueryable`] for the ordered read of `pid` that left `Unknown` with `cause`: the subject is
+/// `pid`, or the parent whose proof failed when `cause` blames it.
+pub(crate) fn unqueryable_read(pid: RawPid, cause: UnknownCause) -> Error {
+    let subject = match cause.blamed_parent() {
+        Some(parent) => format!("ppid {parent}"),
+        None => format!("pid {pid}"),
+    };
+    unqueryable(&subject, cause)
 }
 
 /// Hard-kill the tree rooted at `root` by identity: snapshot once, compute

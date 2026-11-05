@@ -213,8 +213,10 @@ fn a_pid_the_kernel_cannot_read_is_dropped_and_warned_about() {
     let (kernel, _guard) = unreadable(id.pid());
     let mark = crate::log_capture::mark();
     assert_eq!(super::resolve_or_drop(&kernel, id.pid(), ProcessId::current()), None);
-    let warned =
-        crate::log_capture::records_since_on_current_thread(mark, &format!("pid {} could not be queried", id.pid()));
+    let warned = crate::log_capture::records_since_on_current_thread(
+        mark,
+        &format!("pid {} exists but could not be queried", id.pid()),
+    );
     assert_eq!(warned.len(), 1, "{warned:?}");
     assert_eq!(warned[0].0, log::Level::Warn);
     release(child);
@@ -229,8 +231,10 @@ fn the_warn_for_a_dropped_pid_names_the_cause_of_its_read() {
     let kernel = View::Unreadable.fail(FakeKernel::over(&HostKernel), 0);
     let mark = crate::log_capture::mark();
     assert_eq!(super::resolve_or_drop(&kernel, id.pid(), ProcessId::current()), None);
-    let warned =
-        crate::log_capture::records_since_on_current_thread(mark, &format!("pid {} could not be queried", id.pid()));
+    let warned = crate::log_capture::records_since_on_current_thread(
+        mark,
+        &format!("pid {} identity could not be read", id.pid()),
+    );
     assert_eq!(warned.len(), 1, "{warned:?}");
     assert!(warned[0].1.contains(View::Unreadable.cause()), "{warned:?}");
     assert!(!warned[0].1.contains("access denied?"), "{warned:?}");

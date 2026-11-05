@@ -195,6 +195,25 @@ fn a_child_whose_parent_cannot_be_proved_again_is_dropped() {
     assert!(children_of(&kernel(), root(), &EDGES).unwrap().is_empty());
 }
 
+/// The warn for that child names the parent whose proof failed, and the child's pid once. Mutant:
+/// "the warn blames the child's pid".
+#[skuld::test]
+fn the_warn_for_a_child_whose_parent_cannot_be_proved_names_the_parent() {
+    crate::log_capture::install();
+    let kernel = table().on_pidfs_ino_after_read(ROOT, &format!("{CHILD}/stat"), Err(Errno::BADF));
+    let mark = crate::log_capture::mark();
+    assert_eq!(super::resolve_or_drop(&kernel, CHILD, root()), None);
+    let warned = crate::log_capture::records_since_on_current_thread(mark, &format!("pid {CHILD}"));
+    assert_eq!(warned.len(), 1, "{warned:?}");
+    let (level, message) = &warned[0];
+    assert_eq!(*level, log::Level::Warn);
+    assert!(
+        message.contains(&format!("ppid {ROOT} identity could not be read")),
+        "{message}"
+    );
+    assert_eq!(message.matches(&format!("pid {CHILD}")).count(), 1, "{message}");
+}
+
 /// On a host whose pidfds have no inode the proof is the ticks compare: the root's `stat` shows the
 /// ticks the id has, or another process's.
 fn ticks_table(root_start_now: u64) -> FakeKernel<'static> {
@@ -236,27 +255,32 @@ fn root_proof_fails_at_its_key_read() -> FakeKernel<'static> {
 
 /// A root that held its pid when the walk began and whose key read finds another process there
 /// walks nothing, whatever each entry point read before: the answer is the key read's. Mutants: "the
-/// walk goes on after a `Gone` key read"; "the root is signalled". The root's number is not in the
-/// host's table, so a walk that took the presence proof for the whole answer would call it live and
-/// absent from the snapshot.
+/// walk goes on after a `Gone` key read" (`hard_kill` and `terminate` record a walk, as they do
+/// when the key is read after the walk has begun); "the root is signalled". The root's number is
+/// not in the host's table, so a walk that took the presence proof for the whole answer would call
+/// it live and absent from the snapshot.
 #[skuld::test]
 fn a_root_whose_key_read_finds_another_process_walks_nothing() {
     let sends = crate::send_log::Capture::start();
+    let walks = super::fault::record_walks();
     assert!(super::hard_kill(&root_changes_hands_at_its_key_read(), root()).expect("a gone root is Ok"));
     super::terminate(&root_changes_hands_at_its_key_read(), root()).expect("a gone root is Ok");
     for recursive in [Recursive::No, Recursive::Yes] {
         let children = root().children_with(&root_changes_hands_at_its_key_read(), recursive);
         assert_eq!(children.expect("a gone root is Ok"), vec![], "{recursive:?}");
     }
+    assert_eq!(walks.walked(), Vec::<u32>::new(), "no walk began");
     assert!(sends.by_identity().is_empty(), "{:?}", sends.by_identity());
 }
 
 /// A root whose key read cannot be made is an error from every entry point, never an empty walk:
 /// an empty one would let a caller kill the root and leave its descendants running. Mutants: "an
-/// `Unknown` key read is an empty walk"; "the root is signalled".
+/// `Unknown` key read is an empty walk"; "the root is signalled"; "the walk begins before the key
+/// is read" (`hard_kill` and `terminate` record a walk).
 #[skuld::test]
 fn a_root_whose_key_read_cannot_be_made_is_unassessable_and_signals_nothing() {
     let sends = crate::send_log::Capture::start();
+    let walks = super::fault::record_walks();
     let results = [
         super::hard_kill(&root_proof_fails_at_its_key_read(), root()).map(|_| ()),
         super::terminate(&root_proof_fails_at_its_key_read(), root()),
@@ -275,7 +299,37 @@ fn a_root_whose_key_read_cannot_be_made_is_unassessable_and_signals_nothing() {
             other => panic!("expected Unassessable, got {other:?}"),
         }
     }
+    assert_eq!(walks.walked(), Vec::<u32>::new(), "no walk began");
     assert!(sends.by_identity().is_empty(), "{:?}", sends.by_identity());
+}
+
+/// A root whose pid is not in the snapshot yet was live at its key read is an error from `parent` and
+/// `children`: its row was omitted. The key read is the only look at the root, so a root that exits
+/// after it is not "gone, so no children" (on Windows that would leave its unreparented children
+/// running). The `ticks` root's one `stat` read is the key read; a second read finds it gone. Mutant:
+/// "a root absent from the snapshot is read again".
+#[skuld::test]
+fn a_root_absent_from_the_snapshot_is_unassessable_even_if_it_exits_after_its_key_read() {
+    let kernel = || {
+        FakeKernel::over(&HostKernel)
+            .same_view()
+            .on_read(&format!("{ROOT}/stat"), Ok(&stat(ROOT, 1, ROOT_START)))
+            .on_read_after(&format!("{ROOT}/stat"), 1, Err(libc::ENOENT))
+            .on_signal_probe(Pid::from_raw(ROOT as i32).unwrap(), Err(Errno::SRCH))
+    };
+    let results = [
+        ticks_root().parent_with(&kernel()).map(|_| ()),
+        ticks_root().children_with(&kernel(), Recursive::No).map(|_| ()),
+        ticks_root().children_with(&kernel(), Recursive::Yes).map(|_| ()),
+    ];
+    for result in results {
+        match result {
+            Err(Error::Unassessable { detail, .. }) => {
+                assert!(detail.contains(&format!("pid {ROOT} is live but absent")), "{detail}");
+            }
+            other => panic!("expected Unassessable, got {other:?}"),
+        }
+    }
 }
 
 // The kill goes through the proved pidfd =====
