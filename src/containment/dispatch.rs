@@ -260,15 +260,48 @@ pub(crate) enum RootView {
     Trusted,
 }
 
-/// The label of a `Child`'s own drop, which prefixes its log lines.
-pub(crate) const DROP_LABEL: &str = "Child::drop";
+/// Who tears a child down. The caller prefixes the teardown's log lines and names its own event in
+/// them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TeardownCaller {
+    /// A `Child`'s own drop.
+    Drop,
+    /// A helper that owns the child and failed after its spawn (`Command::status`, `output`, `read`,
+    /// `SuspendedChild::resume`).
+    FailedRun,
+    /// The cleanup of an elevated spawn that cannot finish.
+    #[cfg(unix)]
+    FinishElevated,
+}
+
+impl TeardownCaller {
+    /// The prefix of the caller's log lines.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            TeardownCaller::Drop => "Child::drop",
+            TeardownCaller::FailedRun => "teardown after a failed run",
+            #[cfg(unix)]
+            TeardownCaller::FinishElevated => "finish_elevated",
+        }
+    }
+
+    /// How a log line of the caller refers to its own event: a drop is "this drop", any other
+    /// teardown is "this teardown".
+    #[cfg(unix)]
+    pub(crate) fn this_event(self) -> &'static str {
+        match self {
+            TeardownCaller::Drop => "this drop",
+            TeardownCaller::FailedRun | TeardownCaller::FinishElevated => "this teardown",
+        }
+    }
+}
 
 /// What a `Child`'s drop knows about its root, for [`Attached::hard_kill_for_drop`].
 #[cfg(unix)]
 #[derive(Debug)]
 pub(crate) struct DropView {
-    /// The caller, which prefixes its log lines.
-    pub(crate) label: &'static str,
+    /// The caller's name, prefixing its log lines.
+    pub(crate) caller: TeardownCaller,
     pub(crate) root_pid: u32,
     pub(crate) root: RootView,
     /// This handle already killed the tree completely.
@@ -277,30 +310,21 @@ pub(crate) struct DropView {
 
 #[cfg(unix)]
 impl DropView {
-    /// How a log line of the caller refers to its own event: a drop is "this drop", any other
-    /// teardown is "this teardown".
-    pub(crate) fn this_event(&self) -> &'static str {
-        if self.label == DROP_LABEL {
-            "this drop"
-        } else {
-            "this teardown"
-        }
-    }
-
     /// Read the state a drop or a failed-spawn cleanup decides on: the root's number first, then
     /// the handle's own answer ([`RootState`](crate::signal::RootState)). The handle is exact
     /// where the number is not: a foreign reap followed by a same-tick reuse still reads as this
     /// root by its start token.
     ///
     /// Reading emits no `warn`: the caller reports once, with a
-    /// [`DropReport`](crate::child::drop_report::DropReport). `label` names the caller in log lines.
+    /// [`DropReport`](crate::child::drop_report::DropReport). `caller` names itself in log lines.
     pub(crate) fn read(
-        label: &'static str,
+        caller: TeardownCaller,
         id: crate::identity::ProcessId,
         root: impl FnOnce() -> crate::signal::RootState,
         tree_killed: &TreeKilled,
     ) -> DropView {
         use crate::signal::RootState;
+        let label = caller.label();
         let root_pid = id.pid();
         let now = crate::child::root_identity_now(root_pid);
         let state = root();
@@ -326,7 +350,7 @@ impl DropView {
             }
         };
         let view = DropView {
-            label,
+            caller,
             root_pid,
             root,
             tree_killed: tree_killed.is_set(),
@@ -763,7 +787,7 @@ impl Attached {
             DropReach::Skip(skipped) => skipped,
         };
         let why = view.why_number_untrusted();
-        let (label, this) = (view.label, view.this_event());
+        let (label, this) = (view.caller.label(), view.caller.this_event());
         let left_behind = if view.tree_killed {
             log::debug!(
                 "{label}: {why} and this handle already killed the tree, \
@@ -823,7 +847,7 @@ impl Attached {
                 RootNumber::GroupGone => {
                     log::debug!(
                         "{}: {why}, and its pidfd shows its process group has no member left, so nothing is sent",
-                        view.label
+                        view.caller.label()
                     );
                     return DropReach::GroupGone;
                 }

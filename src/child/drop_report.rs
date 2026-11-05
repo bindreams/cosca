@@ -54,7 +54,7 @@ pub(crate) enum PartKey {
 
 /// What one drop or cleanup found, for its single `warn`.
 pub(crate) struct DropReport<'a> {
-    /// The look at the root; its label, the caller, prefixes the warn.
+    /// The look at the root.
     pub(crate) view: &'a DropView,
     /// The elevation front the event left running instead of signalling, and why.
     pub(crate) front: Option<&'a Error>,
@@ -92,7 +92,7 @@ impl<'a> DropReport<'a> {
         }
         let text = format!(
             "{}: {}",
-            self.view.label,
+            self.view.caller.label(),
             parts
                 .iter()
                 .map(|(_, text)| text.as_str())
@@ -130,7 +130,7 @@ impl<'a> DropReport<'a> {
             parts.push((PartKey::Described, state));
         }
         if let (RootView::Reaped, Some(action)) = (&self.view.root, &self.skipped) {
-            let this = self.view.this_event();
+            let this = self.view.caller.this_event();
             parts.push((
                 PartKey::Described,
                 format!(

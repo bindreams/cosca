@@ -859,7 +859,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     // below then says why.
     let gate = child.kill_gate();
     // The look at the root, right before the tree kill it decides.
-    let view = child.read_root_view("finish_elevated");
+    let view = child.read_root_view(crate::containment::dispatch::TeardownCaller::FinishElevated);
     // What forgetting tokio's `Child` leaked, if the cleanup forgot it: the one warn below says so.
     let mut forgot: Option<crate::child::drop_report::Forgot> = None;
     let mut skipped = None;

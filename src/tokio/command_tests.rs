@@ -186,6 +186,46 @@ async fn a_failure_after_the_spawn_leaves_a_child_that_opted_out() {
     drop(writer);
 }
 
+/// A teardown whose kill is refused leaves the child running, warned, and hands nothing back: the
+/// tokio helpers do not return an `Unreaped` until the async child can wait for one (a blocking wait
+/// on a runtime thread breaks the rule against blocking it). The warn reads as a teardown's, not a
+/// drop's.
+///
+/// Mutants: the child is handed back; the fate is not `Running`; the warn is prefixed `Child::drop`.
+#[cfg(unix)]
+#[skuld::test]
+async fn a_failure_after_the_spawn_whose_kill_is_refused_leaves_the_child_running_and_warns() {
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let (mut child, writer) = held_blocker(true);
+    let id = child.id();
+    let refused = crate::tokio::child::fault::force_kill_failure();
+    let mark = crate::log_capture::mark();
+
+    let error = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), &mut child).await;
+
+    drop(refused);
+    // The child exits once its stdin closes, and tokio collects it.
+    drop(writer);
+    assert!(
+        matches!(
+            error,
+            crate::error::Error::MayHaveStarted {
+                fate: crate::error::ChildFate::Running { id: Some(running) },
+                unreaped: None,
+                ..
+            } if running == id
+        ),
+        "{error:?}"
+    );
+    let warns = crate::log_capture::records_since(mark, "leaving it running");
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(
+        warns[0].starts_with("teardown after a failed run: ") && warns[0].contains(&id.pid().to_string()),
+        "{warns:?}"
+    );
+}
+
 /// Async twin of the sync `a_failure_after_the_spawn_notes_the_elevated_program_only_behind_a_backend`.
 #[cfg(unix)]
 #[skuld::test]

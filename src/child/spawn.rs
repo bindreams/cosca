@@ -124,8 +124,12 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     // below then says why.
     let gate = child.kill_gate();
     // The look at the root, right before the tree kill it decides.
-    let view =
-        crate::containment::DropView::read("finish_elevated", child.id, || child.proc.state(), &child.tree_killed);
+    let view = crate::containment::DropView::read(
+        crate::containment::dispatch::TeardownCaller::FinishElevated,
+        child.id,
+        || child.proc.state(),
+        &child.tree_killed,
+    );
     let mut report = crate::child::drop_report::DropReport::new(&view);
     let mut skipped = None;
     let front_closed = matches!(gate, crate::elevation::front::Gate::Closed(_));

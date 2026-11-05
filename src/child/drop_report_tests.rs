@@ -279,8 +279,12 @@ fn a_handle_that_could_not_say_is_logged_when_the_number_shows_the_reap() {
         .proc
         .script_over(|f| f.peeks([Err(std::io::Error::other("handle doubt 6e2"))]));
 
-    let view =
-        crate::containment::DropView::read("labelled-reader", child.id, || child.proc.state(), &child.tree_killed);
+    let view = crate::containment::DropView::read(
+        crate::containment::dispatch::TeardownCaller::FailedRun,
+        child.id,
+        || child.proc.state(),
+        &child.tree_killed,
+    );
 
     fake.assert_peeks_exhausted();
     assert!(
@@ -291,7 +295,7 @@ fn a_handle_that_could_not_say_is_logged_when_the_number_shows_the_reap() {
     let records = crate::log_capture::records_since_on_current_thread(mark, "handle doubt 6e2");
     assert_eq!(records.len(), 1, "{records:?}");
     assert!(
-        records[0].0 == log::Level::Debug && records[0].1.starts_with("labelled-reader:"),
+        records[0].0 == log::Level::Debug && records[0].1.starts_with("teardown after a failed run:"),
         "{records:?}"
     );
 }
@@ -304,7 +308,7 @@ fn a_handle_that_could_not_say_is_logged_when_the_number_shows_the_reap() {
 #[skuld::test]
 fn asking_why_a_trusted_root_is_untrusted_is_a_contract_breach() {
     let view = crate::containment::DropView {
-        label: "test",
+        caller: crate::containment::dispatch::TeardownCaller::Drop,
         root_pid: 1,
         root: crate::containment::dispatch::RootView::Trusted,
         tree_killed: false,
