@@ -59,10 +59,9 @@ fn a_refused_kill_answers_from_what_became_of_the_child() {
             refused_kill_answer(&torn_down(second_teardown(Ok(Sent::Delivered), exit(), id)), id),
             ChildFate::Reaped
         );
-        // Killed, and the wait failed: uncollected, so not answered as ended (`Killed`).
         assert_eq!(
             refused_kill_answer(&torn_down(second_teardown(Ok(Sent::Delivered), failed(), id)), id),
-            ChildFate::Running { id: None }
+            ChildFate::Killed
         );
         // Refused again, and still running at the look: left, with the identity the spawn read.
         let refused = || Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));

@@ -513,25 +513,3 @@ fn an_uncollected_child_whose_clause_is_below_warn_breaks_the_contract() {
     outcome.clause = Some((log::Level::Debug, "a clause below warn".to_owned()));
     PidfdTeardown::new(outcome, Expect::Anything).say_as_failed_spawn(&mut Diagnosis::default());
 }
-
-/// A child left uncollected is never answered `Killed`: a failed wait after a delivered kill leaves it
-/// ours, and `Killed` would read as ended. A child the teardown collected keeps the fate it has.
-///
-/// Mutant: the answer is the teardown's fate whatever `uncollected` says, or `Running` for every
-/// uncollected child.
-#[skuld::test]
-fn an_uncollected_child_is_answered_running_not_killed() {
-    let uncollected = after_a_failed_wait(Expect::Anything);
-    assert_eq!(uncollected.outcome.fate, ChildFate::Killed);
-    assert!(uncollected.outcome.uncollected);
-    assert_eq!(uncollected.answered_fate(), ChildFate::Running { id: None });
-
-    let mut killed = TeardownOutcome::new(ChildFate::Killed);
-    killed.clause = Some((log::Level::Debug, "reaped by someone else".to_owned()));
-    assert_eq!(
-        PidfdTeardown::new(killed, Expect::Anything).answered_fate(),
-        ChildFate::Killed
-    );
-    let (unknown, _) = teardown_of(Kill::Refused, Found::WaitFailed, Expect::Anything);
-    assert_eq!(unknown.answered_fate(), unknown.outcome.fate);
-}

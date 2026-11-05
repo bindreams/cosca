@@ -281,8 +281,11 @@ enum Refused {
     TornDown(TornDown),
     /// Tokio's handle was released, and nothing else was done to the child. macOS: tokio's drop queues
     /// a child still running on the runtime's orphan queue. Windows: the raw backend is dropped, and
-    /// nothing waits for the child.
-    #[cfg(not(target_os = "linux"))]
+    /// nothing waits for the child. Not Linux, which tears every child not shown gone down again.
+    #[cfg_attr(
+        target_os = "linux",
+        allow(dead_code, reason = "only macOS and Windows release a child after a refused kill")
+    )]
     Released,
 }
 
@@ -309,10 +312,14 @@ fn refused_kill_warning(pid: u32, e: &Error, after: &Refused) -> String {
                 text.push_str(&format!("; {clause}"));
             }
         }
-        #[cfg(target_os = "macos")]
-        Refused::Released => text.push_str(&format!("; it is {HANDED_TO_ORPHAN_REAPER}")),
-        #[cfg(windows)]
-        Refused::Released => text.push_str(crate::child::owned::teardown::Disposition::Leave.suffix(true)),
+        Refused::Released => {
+            #[cfg(target_os = "linux")]
+            debug_assert!(false, "Linux tears every child not shown gone down again");
+            #[cfg(target_os = "macos")]
+            text.push_str(&format!("; it is {HANDED_TO_ORPHAN_REAPER}"));
+            #[cfg(windows)]
+            text.push_str(crate::child::owned::teardown::Disposition::Leave.suffix(true));
+        }
     }
     text
 }
@@ -1632,7 +1639,7 @@ impl ProcSource {
             Due::in_(super::slow_teardown_after()),
         );
         torn.say_as_failed_spawn(why);
-        torn.answered_fate()
+        torn.outcome.fate
     }
 
     /// Install the per-instance test wait observer (raw backend only). Panics on a Tokio child —
@@ -1653,16 +1660,15 @@ impl ProcSource {
 /// What became of a child whose teardown kill was refused (a setuid child answers `EPERM`), by
 /// `after`: its second teardown's fate, the forgetting's (a child not shown to be ours), or, one
 /// released, running. `id` is its identity, if the spawn had read one.
-#[cfg_attr(
-    target_os = "linux",
-    allow(unused_variables, reason = "only a released child answers with the identity")
-)]
 fn refused_kill_answer(after: &Refused, id: Option<ProcessId>) -> ChildFate {
     match after {
         Refused::Forgotten(forgotten) => forgotten.fate,
-        Refused::TornDown(torn_down) => torn_down.torn.answered_fate(),
-        #[cfg(not(target_os = "linux"))]
-        Refused::Released => ChildFate::Running { id },
+        Refused::TornDown(torn_down) => torn_down.torn.outcome.fate,
+        Refused::Released => {
+            #[cfg(target_os = "linux")]
+            debug_assert!(false, "Linux tears every child not shown gone down again");
+            ChildFate::Running { id }
+        }
     }
 }
 

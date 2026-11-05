@@ -268,17 +268,6 @@ impl PidfdTeardown {
         PidfdTeardown { outcome, expect }
     }
 
-    /// What a failed spawn answers of the child: the teardown's fate, but a child left uncollected is
-    /// never `Killed`. `Killed` says the child is dead or dying, and a failed wait that left it ours
-    /// cannot show that, while [`SpawnFailure::ended_child`](crate::child::spawn::failure::SpawnFailure)
-    /// counts `Killed` as ended.
-    pub(crate) fn answered_fate(&self) -> ChildFate {
-        match self.outcome.fate {
-            ChildFate::Killed if self.outcome.uncollected => ChildFate::Running { id: None },
-            fate => fate,
-        }
-    }
-
     /// Takes the clause of a teardown that left its child uncollected, for the caller that logs the
     /// warn.
     pub(crate) fn left(&mut self) -> Left {

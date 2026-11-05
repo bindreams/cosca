@@ -533,14 +533,12 @@ fn an_out_of_reach_child_never_told_to_go_is_said_to_have_never_run() {
 /// A child that never named itself, which the handshake's pidfd reached and its teardown left
 /// uncollected (`Uncollected`), is worded as that: the teardown's clause under the failed spawn's
 /// label, one warn. It is not worded as a child out of its cgroup v2 leaf's reach, whatever the
-/// failure was. It answers `Running`, as no fate of an uncollected child shows it ended, and when
-/// the handshake already ended the child through its own copy of the pidfd, the warn says the
-/// handshake's fate first and the leaf's teardown's clause after it, not that the child is left
-/// whatever the handshake did.
+/// failure was. It answers the fate its teardown established, and when the handshake already ended
+/// the child through its own copy of the pidfd, the warn says the handshake's fate first and the
+/// leaf's teardown's clause after it, not that the child is left whatever the handshake did.
 ///
-/// Mutant: `Uncollected` is worded as `OutOfReach`, with its hedge about the leaf; it answers the
-/// fate its teardown established (`Killed` after a failed wait); its warn ignores what the
-/// handshake did.
+/// Mutant: `Uncollected` is worded as `OutOfReach`, with its hedge about the leaf; it answers
+/// `Running` whatever its teardown found; its warn ignores what the handshake did.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn an_uncollected_child_is_said_left_by_its_teardown_not_out_of_the_leafs_reach() {
@@ -563,15 +561,11 @@ fn an_uncollected_child_is_said_left_by_its_teardown_not_out_of_the_leafs_reach(
         crate::log_capture::records_since_on_current_thread(mark, marker)
     };
 
-    // Left to the leaf, an uncollected child is not ended, whatever fate its teardown established:
-    // `Killed` after a failed wait included.
+    // The fate the teardown established, not a constant.
     for fate in [ChildFate::Killed, ChildFate::Unknown, ChildFate::Running { id: None }] {
         let failure = SpawnFailure::started(error(), ChildFate::Unknown, None);
         let answered = super::abandoned_after_handshake(uncollected(fate), failure, None, true);
-        assert_eq!(
-            answered.expect_may_have_started_with().1,
-            ChildFate::Running { id: None }
-        );
+        assert_eq!(answered.expect_may_have_started_with().1, fate);
     }
 
     // The handshake ended the child, and the leaf's teardown of its copy says it left it.

@@ -921,7 +921,9 @@ fn conclude<T: Spawned>(
                 if let Err(e) = crate::containment::kill_group_through_pidfd(pidfd.as_fd(), None) {
                     super::note_refused_group_kill(None, e, collected, &mut why);
                 }
-                let child_fate = end_through_pidfd(None, pidfd, expect, warn_after, &mut why).answered_fate();
+                let child_fate = end_through_pidfd(None, pidfd, expect, warn_after, &mut why)
+                    .outcome
+                    .fate;
                 (error, child_fate)
             }
             LeftFront::LeafHeld(leaf) => {
@@ -929,9 +931,9 @@ fn conclude<T: Spawned>(
                     Ok(copy) => leaf.set(Some((copy, expect))),
                     Err(e) => log::debug!("a failed spawn's pidfd could not be copied for its cgroup leaf ({e})"),
                 }
-                (error, teardown(pidfd).answered_fate())
+                (error, teardown(pidfd).outcome.fate)
             }
-            LeftFront::Here(_) | LeftFront::NotAFront => (error, teardown(pidfd).answered_fate()),
+            LeftFront::Here(_) | LeftFront::NotAFront => (error, teardown(pidfd).outcome.fate),
         }
     };
     // A failed spawn that dropped a child it never told to go, with nothing holding it. std's
@@ -1043,7 +1045,8 @@ fn end_unexecuted(pid: Option<u32>, pidfd: OwnedFd, warn_after: Option<std::time
         warn_after,
         &mut super::Diagnosis::default(),
     )
-    .answered_fate()
+    .outcome
+    .fate
 }
 
 /// Blocks until the child `pidfd` names has exited, without reaping it: a child that never ran

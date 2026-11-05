@@ -1237,11 +1237,10 @@ fn abandoned_after_handshake(
     }
     failure.answered_by(|error| match abandoned {
         AbandonedChild::Front(fate) => (fate.note(error, front, None), front_child_fate(fate)),
-        // Out of the leaf's reach, and not known to be dead; or its teardown left it uncollected,
-        // which no fate of it, `Killed` after a failed wait included, shows to be ended.
-        AbandonedChild::MaybeUnreachable | AbandonedChild::OutOfReach(_) | AbandonedChild::Uncollected(_) => {
-            (error, ChildFate::Running { id: None })
-        }
+        // Out of the leaf's reach, and not known to be dead.
+        AbandonedChild::MaybeUnreachable | AbandonedChild::OutOfReach(_) => (error, ChildFate::Running { id: None }),
+        // What the teardown established of the child it left.
+        AbandonedChild::Uncollected(left) => (error, left.fate),
         AbandonedChild::Ended | AbandonedChild::MaybeUnreaped => (error, ChildFate::Unknown),
     })
 }
