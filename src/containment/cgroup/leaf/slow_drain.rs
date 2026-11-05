@@ -25,19 +25,6 @@ pub(crate) trait TeardownWarn {
     fn warn(&mut self, waiting: Waiting<'_>);
 }
 
-/// `warn`, as the warn of a failed spawn's teardown through a pidfd.
-pub(crate) struct Through<'a>(pub(crate) &'a mut dyn TeardownWarn);
-
-impl crate::child::spawn::SlowWait for Through<'_> {
-    fn due(&self) -> Option<(std::time::Instant, std::time::Duration)> {
-        self.0.due().map(|due| (due.until, due.after))
-    }
-
-    fn warn(&mut self, pid: Option<u32>, _after: std::time::Duration) {
-        self.0.warn(Waiting::Child(pid));
-    }
-}
-
 /// No warn: every wait but an async teardown's.
 pub(crate) struct NoWarn;
 
