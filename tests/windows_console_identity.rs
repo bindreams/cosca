@@ -287,7 +287,7 @@ fn probe_cosca(configure: impl FnOnce(&mut cosca::Command)) -> CoscaProbe {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind report listener");
     let addr = listener.local_addr().unwrap().to_string();
     let me = std::process::id().to_string();
-    let mut cmd = cosca::Command::new();
+    let mut cmd = common::command(common::Console::Asked);
     cmd.args([
         env!("CARGO_BIN_EXE_cosca_testbin"),
         "report-console-identity",

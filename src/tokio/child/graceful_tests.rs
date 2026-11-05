@@ -2,6 +2,8 @@
 
 use std::time::Duration;
 
+use crate::test_child::Console;
+
 use super::fault as term_fault;
 use crate::wait::fault;
 
@@ -162,7 +164,7 @@ async fn async_graceful_lone_watch_error_still_escalates_and_reaps() {
 async fn async_graceful_shutdown_graceful_path() {
     use std::os::unix::process::ExitStatusExt;
     crate::tokio::test_runtime::assert_current_thread();
-    let mut cmd = crate::tokio::Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     let mut child = cmd.spawn().expect("spawn");
@@ -206,7 +208,7 @@ async fn async_graceful_shutdown_tree_tears_down_tree() {
 
     use ::tokio::io::AsyncReadExt as _;
     crate::tokio::test_runtime::assert_current_thread();
-    let mut cmd = crate::tokio::Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args([
         "sh",
         "-c",
@@ -249,7 +251,7 @@ async fn async_graceful_shutdown_tree_sweeps_survivor_after_graceful_root_exit()
     let _warns = crate::log_capture::warn_watch();
     use ::tokio::io::AsyncReadExt as _;
     crate::tokio::test_runtime::assert_current_thread();
-    let mut cmd = crate::tokio::Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::TERM_SURVIVOR_TREE_ARGV.iter().copied());
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
@@ -294,7 +296,7 @@ async fn async_graceful_shutdown_tree_escalates_with_a_surviving_grandchild() {
     let _warns = crate::log_capture::warn_watch();
     use ::tokio::io::AsyncReadExt as _;
     crate::tokio::test_runtime::assert_current_thread();
-    let mut cmd = crate::tokio::Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::TERM_IGNORING_TREE_ARGV.iter().copied());
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
@@ -440,7 +442,9 @@ async fn async_graceful_tree_unassessable_mechanism_failure_fails_fast() {
 #[skuld::test]
 async fn async_graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_authoritative() {
     crate::tokio::test_runtime::assert_current_thread();
-    let mut cmd = crate::tokio::Command::new();
+    // Asked on Windows: the test sends a console-group break to a child that registered with the
+    // console; a unix child has no console, so the argument is moot there.
+    let mut cmd = crate::test_child::tokio_command(Console::Asked);
     #[cfg(unix)]
     {
         cmd.args(["sh", "-c", "echo r; exec cat"]);
@@ -566,7 +570,7 @@ async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root()
     crate::tokio::test_runtime::assert_current_thread();
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let mut cmd = crate::tokio::Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args([
         "sh",
         "-c",
@@ -654,7 +658,9 @@ async fn windows_async_graceful_tree_members_remain_surfaces_the_forced_sweep_fa
     std_listener.set_nonblocking(true).expect("nonblocking listener");
     let listener = tokio::net::TcpListener::from_std(std_listener).expect("tokio listener");
 
-    let mut cmd = crate::tokio::Command::new();
+    // Asked: `graceful_shutdown_tree` breaks the root's console group, which a hidden root would
+    // not be in.
+    let mut cmd = crate::test_child::tokio_command(Console::Asked);
     cmd.executable(std::env::current_exe().expect("current_exe"))
         .args(crate::test_child::fixture_argv(
             crate::test_child::FIXTURE_SURVIVES_GROUP_SIGNAL_TEST,

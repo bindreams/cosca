@@ -10,6 +10,8 @@
 
 use std::io::Read as _;
 
+use crate::test_child::Console;
+
 use crate::child::owned::seams::record_root_teardowns;
 use crate::child::spawn::fault::{release_at_drop_kill, release_between_kill_and_wait};
 use crate::command::Command;
@@ -36,7 +38,7 @@ const SESSION_CONTAINMENT: Containment = Containment::Session;
 
 /// A command in its own session: `Attached::ProcessGroup` off macOS, `Attached::FdMarker` on it.
 fn session(argv: &[&str]) -> Command {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(argv.iter().copied());
     cmd.contain_with(ContainMode::Session);
     cmd
@@ -263,7 +265,7 @@ fn drop_after_wait_leaves_a_descendant_running_until_it_is_ended_explicitly() {
 fn dropping_a_waited_on_tree_walk_child_walks_nothing_and_warns_with_the_root_pid() {
     crate::log_capture::install();
     let walks = record_walks();
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(["true"]);
     cmd.contain_with(ContainMode::TreeWalk);
     let child = cmd.spawn().expect("spawn");
@@ -298,7 +300,7 @@ fn dropping_a_waited_on_tree_walk_child_walks_nothing_and_warns_with_the_root_pi
 fn dropping_a_running_tree_walk_child_walks_from_its_pid_and_does_not_warn() {
     crate::log_capture::install();
     let walks = record_walks();
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.contain_with(ContainMode::TreeWalk);
     cmd.stdin(Stdio::pipe_in()).expect("stdin pipe");
@@ -518,7 +520,7 @@ fn drop_after_a_failed_kill_tree_and_wait_still_warns() {
 #[skuld::test]
 fn drop_after_an_incomplete_tree_walk_kill_and_wait_still_warns() {
     crate::log_capture::install();
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(Stdio::pipe_in()).expect("stdin pipe");
     cmd.contain_with(ContainMode::TreeWalk);
@@ -659,7 +661,7 @@ fn fd_marker_drop_after_wait_sweeps_the_marker_holders_but_names_nothing_by_the_
 /// "no walk" assertion vacuous.
 #[cfg(target_os = "macos")]
 fn reaped_blocker_root(mode: ContainMode) -> (u32, crate::Child) {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(Stdio::pipe_in()).expect("stdin pipe");
     cmd.contain_with(mode);

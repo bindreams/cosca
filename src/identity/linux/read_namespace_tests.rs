@@ -7,6 +7,7 @@ use crate::identity::stat_parse::parse_starttime_jiffies;
 use crate::identity::{Existence, Liveness, ProcessId, Resolved};
 use crate::test_child::fixture_path;
 use crate::test_child::namespaces as ns;
+use crate::test_child::Console;
 use crate::test_groups::{namespaces, Group};
 
 /// pid 1 of a new pid namespace whose `/proc` is still the outer one: `/proc/1` is the outer
@@ -87,7 +88,7 @@ fn fixture_outer_procfs_inner() {
     ));
 
     // A spawn cannot identify its child, and says the view is why.
-    let mut cmd = crate::command::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     // Released after the kill: a kill that sent nothing exits 0.
     let (stdin, teardown) = crate::child::spawn::fault::teardown_blocker_stdin();

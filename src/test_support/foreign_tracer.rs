@@ -12,6 +12,9 @@
 //! whose own thread blocks until the tracer hands the zombie back drives it from another thread.
 
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+
+#[cfg(feature = "tokio")]
+use crate::test_child::Console;
 use std::os::unix::process::CommandExt as _;
 use std::process::{ChildStdin, ChildStdout};
 
@@ -372,7 +375,7 @@ fn tokio_tracee() {
 /// its stdout.
 #[cfg(feature = "tokio")]
 pub(crate) fn tokio_tracee_command() -> crate::tokio::Command {
-    let mut cmd = crate::tokio::Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.executable(std::env::current_exe().expect("current_exe"))
         .args(crate::test_child::fixture_argv(fixture_path!(tokio_tracee)));
     crate::test_reexec::scrub_env(|var| _ = cmd.env_remove(var));

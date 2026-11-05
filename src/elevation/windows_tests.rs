@@ -68,6 +68,7 @@ fn is_elevated_agrees_with_integrity_level() {
 use crate::command::Command;
 use crate::error::Error;
 use crate::stdio::Stdio;
+use crate::test_child::Console;
 
 fn is_unsupported<T>(r: Result<T, Error>) -> bool {
     matches!(r, Err(Error::Unsupported { .. }))
@@ -88,7 +89,7 @@ fn unsupported_detail<T: std::fmt::Debug>(r: Result<T, Error>) -> String {
 
 #[skuld::test]
 fn piped_stdio_is_unsupported() {
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     c.args([r"C:\Windows\System32\whoami.exe"]).elevate();
     c.stdout(Stdio::pipe()).unwrap();
     assert!(is_unsupported(super::reject_unsupported_config(&c)));
@@ -96,12 +97,12 @@ fn piped_stdio_is_unsupported() {
 
 #[skuld::test]
 fn null_and_merge_stdio_are_unsupported() {
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     c.args([r"C:\Windows\System32\whoami.exe"]).elevate();
     c.stdin(Stdio::null()).unwrap();
     assert!(is_unsupported(super::reject_unsupported_config(&c)));
 
-    let mut c2 = Command::new();
+    let mut c2 = crate::test_child::command(Console::Hidden);
     c2.args([r"C:\Windows\System32\whoami.exe"]).elevate();
     c2.stderr(Stdio::merge(crate::stdio::Fd::STDOUT)).unwrap();
     assert!(is_unsupported(super::reject_unsupported_config(&c2)));
@@ -109,7 +110,7 @@ fn null_and_merge_stdio_are_unsupported() {
 
 #[skuld::test]
 fn high_fd_is_unsupported() {
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     c.args([r"C:\Windows\System32\whoami.exe"]).elevate();
     c.fd(3, Stdio::pipe_out()).unwrap();
     assert!(is_unsupported(super::reject_unsupported_config(&c)));
@@ -117,18 +118,18 @@ fn high_fd_is_unsupported() {
 
 #[skuld::test]
 fn env_and_contain_are_unsupported() {
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     c.args([r"C:\Windows\System32\whoami.exe"]).elevate().env("FOO", "bar");
     assert!(is_unsupported(super::reject_unsupported_config(&c)));
 
-    let mut c2 = Command::new();
+    let mut c2 = crate::test_child::command(Console::Hidden);
     c2.args([r"C:\Windows\System32\whoami.exe"]).elevate().contain();
     assert!(is_unsupported(super::reject_unsupported_config(&c2)));
 }
 
 #[skuld::test]
 fn inherit_only_is_accepted() {
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     c.args([r"C:\Windows\System32\whoami.exe"]).elevate();
     c.stdout(Stdio::inherit()).unwrap();
     assert!(super::reject_unsupported_config(&c).is_ok());
@@ -167,7 +168,7 @@ fn launch_runas_rejects_bad_config_before_the_short_circuit_regardless_of_privil
     // Piped stdio must fail with Unsupported and never prompt — the gate runs BEFORE the
     // already-elevated short-circuit, so the verdict is identical for elevated=false/true.
     for elevated in [false, true] {
-        let mut c = Command::new();
+        let mut c = crate::test_child::command(Console::Hidden);
         c.args([r"C:\Windows\System32\whoami.exe"]).elevate();
         c.stdout(Stdio::pipe()).unwrap();
         assert!(
@@ -180,7 +181,7 @@ fn launch_runas_rejects_bad_config_before_the_short_circuit_regardless_of_privil
 #[skuld::test]
 fn commandline_elevated_is_unsupported_on_windows_regardless_of_privilege() {
     for elevated in [false, true] {
-        let mut c = Command::new();
+        let mut c = crate::test_child::command(Console::Hidden);
         c.commandline("whoami").elevate();
         assert!(is_unsupported(super::plan_runas(&c, &win_host(elevated))));
     }
@@ -192,7 +193,7 @@ fn commandline_elevated_is_unsupported_on_windows_regardless_of_privilege() {
 /// set. `executable()` alone is refused for the setter, the gate's first rule.
 #[skuld::test]
 fn an_argv_less_command_is_not_reported_as_a_commandline_command() {
-    let mut by_executable = Command::new();
+    let mut by_executable = crate::test_child::command(Console::Hidden);
     by_executable.executable("x.exe").elevate();
     assert_eq!(
         unsupported_detail(super::plan_runas(&by_executable, &win_host(false)).map(|_| ())),
@@ -200,7 +201,7 @@ fn an_argv_less_command_is_not_reported_as_a_commandline_command() {
         "executable() only"
     );
 
-    let mut bare = Command::new();
+    let mut bare = crate::test_child::command(Console::Hidden);
     bare.elevate();
     match super::plan_runas(&bare, &win_host(false)) {
         Err(e @ Error::Unsupported { .. }) => {
@@ -223,7 +224,7 @@ fn an_argv_less_command_is_not_reported_as_a_commandline_command() {
 fn a_clean_unelevated_request_plans_a_launch() {
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     c.args([r"C:\Windows\System32\whoami.exe", "/all"]).elevate();
     let launch = match super::plan_runas(&c, &win_host(false)) {
         Ok(super::RunasStep::Launch(launch)) => launch,
@@ -255,7 +256,7 @@ fn a_clean_unelevated_request_plans_a_launch() {
 #[skuld::test]
 fn a_percent_in_current_dir_is_refused() {
     for elevated in [false, true] {
-        let mut c = Command::new();
+        let mut c = crate::test_child::command(Console::Hidden);
         c.args([r"C:\Windows\System32\whoami.exe"])
             .current_dir(r"C:\work\%TEMP%")
             .elevate();
@@ -272,7 +273,7 @@ fn a_percent_in_current_dir_is_refused() {
 /// The affirmative leg with a `current_dir()`: `lpDirectory` carries it, wide and NUL-terminated.
 #[skuld::test]
 fn a_clean_request_with_a_current_dir_plans_a_launch_in_it() {
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     c.args([r"C:\Windows\System32\whoami.exe"])
         .current_dir(r"C:\Windows\Temp")
         .elevate();
@@ -292,7 +293,7 @@ fn a_clean_request_with_a_current_dir_plans_a_launch_in_it() {
 fn already_elevated_inherit_only_is_run_as_is() {
     // The RunAsIs branch: an inherit-only elevated request on an already-elevated host
     // passes the gate and short-circuits (no ShellExecuteEx).
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     c.args([r"C:\Windows\System32\whoami.exe"]).elevate();
     assert!(matches!(
         super::plan_runas(&c, &win_host(true)),
@@ -307,18 +308,18 @@ fn assert_setter_refused(setter: &str, set: fn(&mut Command, &str), programs: &[
     let words = &super::ARGV_REFUSALS;
     for elevated in [false, true] {
         for &program in programs {
-            let mut plain = Command::new();
+            let mut plain = crate::test_child::command(Console::Hidden);
             plain.args([program, "/all"]);
-            let mut line = Command::new();
+            let mut line = crate::test_child::command(Console::Hidden);
             line.commandline("whoami /all");
-            let mut nul_arg = Command::new();
+            let mut nul_arg = crate::test_child::command(Console::Hidden);
             nul_arg.args([std::ffi::OsString::from(program), nul_between("a", "b")]);
-            let mut nul_cwd = Command::new();
+            let mut nul_cwd = crate::test_child::command(Console::Hidden);
             nul_cwd.args([program]).current_dir(nul_between(r"C:\w", "x"));
             for (what, mut c) in [
                 ("a plain argv", plain),
                 ("commandline()", line),
-                ("no input", Command::new()),
+                ("no input", crate::test_child::command(Console::Hidden)),
                 ("a NUL in an argument", nul_arg),
                 ("a NUL in current_dir()", nul_cwd),
             ] {
@@ -335,7 +336,7 @@ fn assert_setter_refused(setter: &str, set: fn(&mut Command, &str), programs: &[
                 }
             }
             // `reject_unsupported_config` is the one gate ahead of it.
-            let mut env = Command::new();
+            let mut env = crate::test_child::command(Console::Hidden);
             env.args([program]).env("A", "1");
             set(&mut env, program);
             env.elevate();
@@ -378,7 +379,7 @@ fn an_elevated_raw_executable_is_refused() {
 #[skuld::test]
 fn an_extensionless_absolute_argv0_program_is_refused_on_the_consent_path() {
     for n in [r"C:\tools\setup", r"C:\tools\setup.bat.exe.lnk"] {
-        let mut c = Command::new();
+        let mut c = crate::test_child::command(Console::Hidden);
         c.args([n]).elevate();
         match super::plan_runas(&c, &win_host(false)) {
             Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput => {
@@ -397,7 +398,7 @@ fn an_extensionless_absolute_argv0_program_is_refused_on_the_consent_path() {
 /// `CreateProcessW`, which assumes no default extension.
 #[skuld::test]
 fn an_extensionless_absolute_argv0_program_is_refused_when_already_elevated_too() {
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     c.args([r"C:\tools\setup"]).elevate();
     assert!(is_pathext_refusal(super::plan_runas(&c, &win_host(true)).map(|_| ())));
 }
@@ -406,7 +407,7 @@ fn an_extensionless_absolute_argv0_program_is_refused_when_already_elevated_too(
 #[skuld::test]
 fn an_absolute_argv0_exe_or_com_program_plans_a_launch() {
     for n in [r"C:\tools\setup.exe", r"C:\tools\SETUP.COM"] {
-        let mut c = Command::new();
+        let mut c = crate::test_child::command(Console::Hidden);
         c.args([n]).elevate();
         assert!(
             matches!(super::plan_runas(&c, &win_host(false)), Ok(super::RunasStep::Launch(_))),
@@ -470,7 +471,7 @@ fn a_search_batch_reached_through_normalisation_is_refused_regardless_of_privile
 fn search_commands(names: &[&str]) -> Vec<(String, Command)> {
     let mut out = Vec::new();
     for &n in names {
-        let mut argv = Command::new();
+        let mut argv = crate::test_child::command(Console::Hidden);
         argv.args([n]).elevate();
         out.push((format!("args([{n:?}])"), argv));
     }
@@ -505,7 +506,7 @@ fn runas_shows_the_window_by_default() {
 /// requests nothing, so there is nothing to refuse.
 #[skuld::test]
 fn elevation_rejects_raw_creation_flags() {
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     c.args([r"C:\Windows\System32\whoami.exe"])
         .elevate()
         .creation_flags(0x0000_0040);
@@ -515,14 +516,14 @@ fn elevation_rejects_raw_creation_flags() {
 
 #[skuld::test]
 fn elevation_accepts_a_zero_creation_flags_word() {
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     c.args([r"C:\Windows\System32\whoami.exe"]).elevate().creation_flags(0);
     assert!(super::reject_unsupported_config(&c).is_ok());
 }
 
 #[skuld::test]
 fn elevation_rejects_detached() {
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     c.args([r"C:\Windows\System32\whoami.exe"]).elevate().detached();
     let detail = unsupported_detail(super::reject_unsupported_config(&c));
     crate::error::assert_detail_is_not_hard_wrapped(&detail);
@@ -530,7 +531,7 @@ fn elevation_rejects_detached() {
 
 #[skuld::test]
 fn elevation_rejects_breakaway() {
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     c.args([r"C:\Windows\System32\whoami.exe"])
         .elevate()
         .breakaway_from_job();
@@ -543,7 +544,7 @@ fn elevation_rejects_breakaway() {
 /// silence, and the three rejections above would all still pass.
 #[skuld::test]
 fn elevation_accepts_no_window() {
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     c.args([r"C:\Windows\System32\whoami.exe"]).elevate().no_window();
     assert!(super::reject_unsupported_config(&c).is_ok());
 }
@@ -642,13 +643,13 @@ fn launch_runas_refuses_a_truncating_nul_regardless_of_privilege() {
     for elevated in [false, true] {
         // lpFile, lpParameters, lpDirectory — one probe each, every other field clean so the
         // refusal can only have come from the field under test.
-        let mut by_program = Command::new();
+        let mut by_program = crate::test_child::command(Console::Hidden);
         by_program.args([nul_path.clone()]).elevate();
 
-        let mut by_argument = Command::new();
+        let mut by_argument = crate::test_child::command(Console::Hidden);
         by_argument.args([clean.clone(), nul_path.clone()]).elevate();
 
-        let mut by_cwd = Command::new();
+        let mut by_cwd = crate::test_child::command(Console::Hidden);
         by_cwd.args([clean.clone()]).current_dir(&nul_path).elevate();
 
         for (field, needle, c) in [
@@ -686,7 +687,7 @@ fn launch_runas_refuses_a_truncating_nul_regardless_of_privilege() {
 fn the_elevated_and_raw_paths_word_the_nul_refusal_identically() {
     let token = nul_between(r"C:\tools\x.exe", "junk");
 
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     c.args([token.clone()]).elevate();
     let elevated = match super::plan_runas(&c, &win_host(false)) {
         Err(Error::Io(e)) => e.to_string(),
@@ -720,7 +721,7 @@ fn the_elevated_and_raw_paths_word_the_nul_refusal_identically() {
 fn launch_runas_refuses_a_batch_program_regardless_of_privilege() {
     for elevated in [false, true] {
         for probe in ["setup.bat", "setup.cmd", "SETUP.BAT"] {
-            let mut c = Command::new();
+            let mut c = crate::test_child::command(Console::Hidden);
             c.args([probe, "a&calc"]).elevate();
             assert!(
                 is_unsupported(super::plan_runas(&c, &win_host(elevated)).map(|_| ())),
@@ -737,7 +738,7 @@ fn launch_runas_refuses_an_absolute_argv0_batch_reached_through_normalisation_re
     for elevated in [false, true] {
         // Trailing dot; one trailing space; a file named `.bat`.
         for probe in [r"C:\t\setup.bat.", r"C:\t\setup.bat ", r"C:\t\.bat"] {
-            let mut c = Command::new();
+            let mut c = crate::test_child::command(Console::Hidden);
             c.args([probe, "a&calc"]).elevate();
             let detail = unsupported_detail(super::plan_runas(&c, &win_host(elevated)).map(|_| ()));
             assert!(
@@ -761,7 +762,7 @@ fn launch_runas_refuses_a_program_not_ending_in_exe_or_com() {
             "setup.msc",
             r"C:\tools\setup.exe.",
         ] {
-            let mut c = Command::new();
+            let mut c = crate::test_child::command(Console::Hidden);
             c.args([probe, "a&calc"]).elevate();
             assert!(
                 is_pathext_refusal(super::plan_runas(&c, &win_host(elevated)).map(|_| ())),
@@ -777,7 +778,7 @@ fn launch_runas_refuses_a_program_not_ending_in_exe_or_com() {
 fn launch_runas_refuses_a_program_that_is_not_fully_qualified() {
     for elevated in [false, true] {
         for probe in ["whoami.exe", r"tools\setup.exe", r"\tools\setup.exe", "C:setup.exe"] {
-            let mut c = Command::new();
+            let mut c = crate::test_child::command(Console::Hidden);
             c.args([probe]).elevate();
             assert!(
                 is_unsupported(super::plan_runas(&c, &win_host(elevated)).map(|_| ())),
@@ -793,14 +794,14 @@ fn launch_runas_refuses_a_program_that_is_not_fully_qualified() {
 #[skuld::test]
 fn launch_runas_refuses_a_token_shell_execute_rewrites() {
     for elevated in [false, true] {
-        let mut c = Command::new();
+        let mut c = crate::test_child::command(Console::Hidden);
         c.args([r#""C:\tools\setup.bat""#, "a&calc"]).elevate();
         assert!(
             is_unsupported(super::plan_runas(&c, &win_host(elevated)).map(|_| ())),
             "elevated={elevated}: a quote is refused"
         );
         for probe in ["file:///C:/tools/setup%2Ebat", "shell:startup", r"C:\tools\%X%"] {
-            let mut c = Command::new();
+            let mut c = crate::test_child::command(Console::Hidden);
             c.args([probe, "a&calc"]).elevate();
             assert!(
                 is_pathext_refusal(super::plan_runas(&c, &win_host(elevated)).map(|_| ())),
@@ -841,7 +842,7 @@ fn nul_bearing_batch_looking_path_is_diagnosed_as_a_nul_not_a_batch_refusal() {
         "premise: the shared gate refuses this as a NUL too, never as a batch file"
     );
     for elevated in [false, true] {
-        let mut c = Command::new();
+        let mut c = crate::test_child::command(Console::Hidden);
         c.args([nul_bat.clone()]).elevate();
         match super::plan_runas(&c, &win_host(elevated)) {
             Err(Error::Io(e)) => {
@@ -891,7 +892,7 @@ fn a_nul_after_a_batch_extension_is_blamed_on_the_nul_not_the_batch_gate() {
         "premise: the shared gate refuses this as a NUL"
     );
     for elevated in [false, true] {
-        let mut c = Command::new();
+        let mut c = crate::test_child::command(Console::Hidden);
         c.args([bat_nul.clone(), OsString::from("a&calc")]).elevate();
         match super::plan_runas(&c, &win_host(elevated)) {
             Err(Error::Io(e)) => {
@@ -922,7 +923,7 @@ fn a_nul_after_a_batch_extension_is_blamed_on_the_nul_not_the_batch_gate() {
 #[skuld::test]
 fn a_poisoned_program_path_is_named_before_a_poisoned_argument_or_cwd() {
     for elevated in [false, true] {
-        let mut c = Command::new();
+        let mut c = crate::test_child::command(Console::Hidden);
         c.args([nul_between(r"C:\tools\setup.bat", "junk"), nul_between("x", "y")])
             .current_dir(nul_between(r"C:\work", "junk"))
             .elevate();
@@ -953,7 +954,7 @@ fn a_poisoned_program_path_is_named_before_a_poisoned_argument_or_cwd() {
 #[skuld::test]
 fn a_poisoned_working_directory_is_named_before_the_batch_gate() {
     for elevated in [false, true] {
-        let mut c = Command::new();
+        let mut c = crate::test_child::command(Console::Hidden);
         c.args([std::ffi::OsString::from(r"C:\tools\setup.bat")])
             .current_dir(nul_between(r"C:\work", "junk"))
             .elevate();
@@ -983,7 +984,7 @@ fn a_poisoned_working_directory_is_named_before_the_batch_gate() {
 #[skuld::test]
 fn a_poisoned_argument_is_named_before_the_batch_gate() {
     for elevated in [false, true] {
-        let mut c = Command::new();
+        let mut c = crate::test_child::command(Console::Hidden);
         c.args([std::ffi::OsString::from(r"C:\tools\setup.bat"), nul_between("x", "y")])
             .elevate();
         match super::plan_runas(&c, &win_host(elevated)) {

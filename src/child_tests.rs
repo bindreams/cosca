@@ -2,6 +2,8 @@
 
 #[cfg(target_os = "macos")]
 use crate::containment::fdmarker::is_teardown_mechanism_failure;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::test_child::Console;
 
 /// Regression test: the group-signal step's ordinary refusal outcomes (`Error::Containment` /
 /// `Error::Unassessable { source: None, .. }`, distinguished from a genuine teardown-mechanism
@@ -24,7 +26,7 @@ use crate::containment::fdmarker::is_teardown_mechanism_failure;
 #[cfg(target_os = "macos")]
 #[skuld::test]
 fn kill_tree_reports_an_ordinary_group_refusal_through_the_real_dispatch_and_classifier_path() {
-    let mut child = crate::Command::new()
+    let mut child = crate::test_child::command(Console::Hidden)
         .executable("/usr/bin/true")
         .arg("true") // argv[0]; `executable` alone selects the loaded image, not argv
         .contain_with(crate::ContainMode::Strongest)
@@ -72,7 +74,7 @@ fn drop_warns_instead_of_asserting_on_a_real_teardown_mechanism_failure() {
         graceful: crate::graceful::GracefulMechanism::Process,
     });
 
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     // The override is consumed by this spawn; `kill_on_drop` defaults to true.

@@ -5,6 +5,8 @@
 //! test yields to its runtime.
 
 use std::os::fd::{AsFd as _, OwnedFd};
+
+use crate::test_child::Console;
 use std::os::unix::process::ExitStatusExt as _;
 
 use super::front_kill_tests::{assert_ends_unsignalled, cat, spawn_as};
@@ -44,7 +46,7 @@ fn in_cgroup(mut cmd: Command) -> Command {
 /// Async twin of the sync `spawn_nobody_front`.
 async fn spawn_nobody_front() -> (Child, ChildStdin) {
     use ::tokio::io::AsyncReadExt as _;
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args([
         "setpriv",
         "--reuid=65534",
@@ -193,7 +195,7 @@ struct FrontWithMember {
 async fn spawn_front_with_member() -> FrontWithMember {
     use ::tokio::io::AsyncReadExt as _;
     let (member_reader, member_stdin) = std::io::pipe().expect("pipe");
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(["sh", "-c", FRONT_WITH_MEMBER_SH]);
     cmd.stdout(Stdio::pipe()).expect("stdout pipe");
     cmd.stderr(Stdio::from_file(std::fs::File::from(OwnedFd::from(member_reader))))
@@ -635,7 +637,7 @@ async fn cgroup_a_failed_spawn_kills_a_front_nested_under_its_leaf_under_hidepid
 async fn cgroup_a_front_whose_leaf_gives_no_id_is_refused_before_its_fork(#[fixture(cgroup)] _group: &Group) {
     use crate::child::front_cgroup_tests::{assert_refused_unforked_naming, spawn_front_noting_fork};
     let _no_id = crate::containment::cgroup::fault::fail_cgroup_id(libc::ENOSYS);
-    let mut cmd = crate::command::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(["cat"]).contain_with(ContainMode::Strongest);
     cmd.stdin(Stdio::pipe_in()).expect("stdin pipe");
     let (result, forked) =
@@ -692,7 +694,7 @@ async fn cgroup_an_unplaceable_front_is_refused_before_its_fork(#[fixture(cgroup
     let _missing = crate::containment::cgroup::fault::miss_pidfd_info();
     let _hidden = crate::containment::cgroup::fault::hide_proc();
     let _failing = crate::containment::cgroup::fault::fail_kill_writes();
-    let mut cmd = crate::command::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(["cat"])
         .contain_with(ContainMode::Strongest)
         .kill_on_drop(true);
@@ -711,7 +713,7 @@ fn fail_a_contained_front_spawn(
     hook: impl FnOnce(u32) + 'static,
 ) -> (crate::error::Error, u32) {
     use crate::child::spawn::fault;
-    let mut cmd = crate::command::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(["cat"]).contain_with(ContainMode::Strongest);
     cmd.stdin(Stdio::from_file(std::fs::File::from(OwnedFd::from(stdin))))
         .expect("stdin");
@@ -946,7 +948,7 @@ fn fail_a_contained_front_spawn_where(
 ) -> (crate::error::Error, u32) {
     use crate::child::spawn::fault;
     use crate::containment::cgroup::fault as leaf_fault;
-    let mut cmd = crate::command::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(["cat"]).contain_with(ContainMode::Strongest);
     cmd.stdin(Stdio::from_file(std::fs::File::from(OwnedFd::from(stdin))))
         .expect("stdin");
@@ -1016,7 +1018,7 @@ async fn cgroup_a_child_dead_before_its_report_is_no_front(#[fixture(cgroup)] _g
 /// `sudo`, once it says `ready`: the escalation of a graceful shutdown runs against it.
 async fn spawn_term_ignoring_front() -> (Child, ChildStdin) {
     use ::tokio::io::AsyncReadExt as _;
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(["sh", "-c", "trap '' TERM; echo ready; exec cat"]);
     cmd.stdout(Stdio::pipe()).expect("stdout pipe");
     let (mut child, stdin) = spawn_as(in_cgroup(cmd), SUDO);

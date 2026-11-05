@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
 
-use cosca::{Command, Fd, Stdio};
+use cosca::{Fd, Stdio};
 
 #[path = "common/mod.rs"]
 mod common;
@@ -38,7 +38,7 @@ mod stderr_log {
 
 #[skuld::test]
 fn spawn_and_status_exit_code() {
-    let mut cmd = Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     cmd.executable(testbin()).args(["cosca_testbin", "exit", "7"]);
     let child = cmd.spawn().expect("spawn");
     let status = child.wait().expect("wait");
@@ -47,7 +47,7 @@ fn spawn_and_status_exit_code() {
 
 #[skuld::test]
 fn spawned_child_has_live_identity() {
-    let mut cmd = Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     cmd.executable(testbin()).args(["cosca_testbin", "exit", "0"]);
     let child = cmd.spawn().expect("spawn");
     // id() is stable across two calls.
@@ -57,7 +57,7 @@ fn spawned_child_has_live_identity() {
 
 #[skuld::test]
 fn try_wait_returns_none_before_exit_and_some_after() {
-    let mut cmd = Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     // tee-both blocks on stdin — the child won't exit until stdin is closed.
     // Null stdout/stderr: nothing reads them, and tee-both's outputs need no pump.
     cmd.executable(testbin())
@@ -87,7 +87,7 @@ fn try_wait_returns_none_before_exit_and_some_after() {
 
 #[skuld::test]
 fn kill_terminates_running_child() {
-    let mut cmd = Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     // tee-both blocks indefinitely on stdin.
     cmd.executable(testbin())
         .args(["cosca_testbin", "tee-both"])
@@ -106,7 +106,7 @@ fn kill_terminates_running_child() {
 
 #[skuld::test]
 fn stdout_pipe_captures_output() {
-    let mut cmd = Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     cmd.executable(testbin())
         .args(["cosca_testbin", "emit", "5", "0"])
         .stdout(Stdio::pipe())
@@ -124,7 +124,7 @@ fn stdout_pipe_captures_output() {
 
 #[skuld::test]
 fn stderr_pipe_captures_output() {
-    let mut cmd = Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     cmd.executable(testbin())
         .args(["cosca_testbin", "emit", "0", "3"])
         .stderr(Stdio::pipe())
@@ -142,7 +142,7 @@ fn stderr_pipe_captures_output() {
 
 #[skuld::test]
 fn stdin_pipe_is_writable() {
-    let mut cmd = Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     // tee-both reads stdin and copies to stdout+stderr; we just need to confirm
     // the write end is usable. Stdout goes to null: nothing reads it, and no pump is needed.
     cmd.executable(testbin())
@@ -165,7 +165,7 @@ fn stdin_pipe_is_writable() {
 
 #[skuld::test]
 fn merge_stderr_onto_stdout_combines_output() {
-    let mut cmd = Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     // emit 3 bytes to stdout, 2 to stderr; merge stderr→stdout so both come
     // through the single stdout pipe.
     cmd.executable(testbin())
@@ -191,7 +191,7 @@ fn merge_stderr_onto_stdout_combines_output() {
 
 #[skuld::test]
 fn null_stdout_discards_output() {
-    let mut cmd = Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     cmd.executable(testbin())
         .args(["cosca_testbin", "emit", "100", "0"])
         .stdout(Stdio::null())
@@ -207,7 +207,7 @@ fn null_stdout_discards_output() {
 #[skuld::test]
 fn merge_to_merge_is_rejected() {
     // stdout -> merge(stderr), stderr -> merge(stdout): chained merge.
-    let mut cmd = Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     cmd.executable(testbin()).args(["cosca_testbin", "exit", "0"]);
     cmd.stderr(Stdio::merge(cosca::Fd::STDOUT)).expect("stderr merge");
     cmd.stdout(Stdio::merge(cosca::Fd::STDERR)).expect("stdout merge");
@@ -222,7 +222,7 @@ fn merge_to_merge_is_rejected() {
 
 #[skuld::test]
 fn env_variable_reaches_child() {
-    let mut cmd = Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     cmd.executable(testbin())
         .args(["cosca_testbin", "env", "COSCA_TEST_VAR"])
         .env("COSCA_TEST_VAR", "hello123")
@@ -240,7 +240,7 @@ fn env_variable_reaches_child() {
 #[skuld::test]
 fn current_dir_sets_working_directory() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let mut cmd = Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     cmd.executable(testbin())
         .args(["cosca_testbin", "cwd"])
         .current_dir(dir.path())
@@ -270,7 +270,7 @@ fn commandline_mode_c1_fix_no_duplicate_program_token() {
     // whole command line to raw_arg duplicated the program in argv[0]+argv[1].
     let tb = testbin();
     let line = format!("{tb} echo-argv argA argB");
-    let mut cmd = Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     cmd.commandline(&line).stdout(Stdio::pipe()).expect("stdout pipe");
     let mut child = cmd.spawn().expect("spawn commandline");
     let mut reader = child.stdout().expect("stdout reader");
@@ -292,7 +292,7 @@ fn commandline_mode_c1_fix_no_duplicate_program_token() {
 #[cfg(unix)]
 #[skuld::test]
 fn posix_executable_override_preserves_argv0() {
-    let mut cmd = Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     cmd.executable(testbin()).args(["custom-name", "argv0"]);
     let s = cmd.read().expect("read");
     assert_eq!(s, "custom-name\n"); // child's argv[0] is the user's, not the testbin path
@@ -306,7 +306,7 @@ fn communicate_does_not_deadlock_on_large_bidirectional_io() {
     // stdout and stderr while the parent writes stdin and reads both outputs.
     // A non-concurrent pump would deadlock here.
     let input = vec![b'x'; 512 * 1024];
-    let mut cmd = Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     cmd.executable(testbin()).args(["cosca_testbin", "tee-both"]);
     cmd.stdin(Stdio::pipe()).unwrap();
     cmd.stdout(Stdio::pipe()).unwrap();
@@ -320,7 +320,7 @@ fn communicate_does_not_deadlock_on_large_bidirectional_io() {
 
 #[skuld::test]
 fn output_captures_stdout_and_stderr_with_sizes() {
-    let mut cmd = Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     cmd.executable(testbin()).args(["cosca_testbin", "emit", "5", "3"]);
     let out = cmd.output().expect("output");
     assert!(out.status.success());
@@ -330,7 +330,7 @@ fn output_captures_stdout_and_stderr_with_sizes() {
 
 #[skuld::test]
 fn read_returns_verbatim_utf8() {
-    let mut cmd = Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     cmd.executable(testbin()).args(["cosca_testbin", "echo-argv", "hello"]);
     let s = cmd.read().expect("read");
     assert_eq!(s, "hello\n"); // verbatim: trailing newline preserved
@@ -349,7 +349,7 @@ fn commandline_round_trips_through_split_or_passthrough() {
 
 #[skuld::test]
 fn merge_stderr_into_stdout() {
-    let mut cmd = Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     cmd.executable(testbin()).args(["cosca_testbin", "emit", "4", "4"]);
     cmd.stdout(Stdio::pipe()).unwrap();
     cmd.stderr(Stdio::merge(Fd::STDOUT)).unwrap();
@@ -364,7 +364,7 @@ fn merge_stderr_into_stdout() {
 
 #[skuld::test]
 fn null_stdout_discards() {
-    let mut cmd = Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     cmd.executable(testbin()).args(["cosca_testbin", "emit", "100", "0"]);
     cmd.stdout(Stdio::null()).unwrap();
     let status = cmd.status().expect("status");
@@ -380,7 +380,7 @@ fn null_stdout_discards() {
 #[cfg(unix)]
 #[skuld::test]
 fn unix_fd3_pipe_round_trips() {
-    let mut cmd = Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     cmd.executable(testbin())
         .args(["cosca_testbin", "fd3-echo"])
         .stdout(Stdio::pipe())
@@ -409,7 +409,7 @@ fn unix_fd3_pipe_round_trips() {
 #[cfg(unix)]
 #[skuld::test]
 fn unix_fd3_null_is_accepted() {
-    let mut cmd = Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     cmd.executable(testbin())
         .args(["cosca_testbin", "fd3-echo"])
         .stdout(Stdio::pipe())
@@ -433,7 +433,7 @@ fn unix_fd3_null_is_accepted() {
 #[cfg(unix)]
 #[skuld::test]
 fn unix_fd3_inherit_is_rejected() {
-    let mut cmd = Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     cmd.executable(testbin())
         .args(["cosca_testbin", "exit", "0"])
         .fd(3, Stdio::inherit())
@@ -466,7 +466,7 @@ fn unix_fd_out_of_range_fails_spawn_cleanly_not_abort() {
     };
     let _rlimit_guard = common::RestoreRlimitNofile::lower_to(&done, 256);
 
-    let mut cmd = Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     cmd.executable(testbin())
         .args(["cosca_testbin", "exit", "0"])
         .fd(100_000, Stdio::null())
@@ -492,7 +492,7 @@ fn unix_fd_out_of_range_fails_spawn_cleanly_not_abort() {
 #[cfg(unix)]
 #[skuld::test]
 fn unix_fd_i32_max_fails_spawn_cleanly_not_abort() {
-    let mut cmd = Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     cmd.executable(testbin())
         .args(["cosca_testbin", "exit", "0"])
         .fd(i32::MAX, Stdio::null())
@@ -533,7 +533,7 @@ fn a_mapped_fd_does_not_leak_into_a_stderr_pipe_when_fd2_is_closed() {
 
     let _restore = common::test_stdio::RestoreStdio::close(&done, &[2]);
 
-    let mut cmd = Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     cmd.executable("/bin/sh").args(["sh", "-c", "echo LEAK >&3"]);
     cmd.stderr(Stdio::from_file(err_f.try_clone().expect("clone stderr target")))
         .expect("stderr from_file");
@@ -581,7 +581,7 @@ fn relocating_a_low_parent_fd_keeps_spawn_errors_reported() {
 
     let _restore = common::test_stdio::RestoreStdio::close(&done, &[1, 2]);
 
-    let mut cmd = Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     cmd.executable("/bin/sh").args(["sh", "-c", "true"]);
     cmd.stdout(Stdio::from_file(out_f.try_clone().expect("clone stdout target")))
         .expect("stdout from_file");
@@ -623,7 +623,7 @@ fn unix_fd3_file_round_trips() {
     tmp.write_all(b"from file via fd3").expect("write tmpfile");
     tmp.seek(std::io::SeekFrom::Start(0)).expect("seek");
 
-    let mut cmd = Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     cmd.executable(testbin())
         .args(["cosca_testbin", "fd3-echo"])
         .stdout(Stdio::pipe())
@@ -645,7 +645,7 @@ fn unix_fd3_file_round_trips() {
 /// and what fd 3 carried. Read to EOF; no timers.
 #[cfg(target_os = "linux")]
 fn contain_with_fd3() -> (cosca::Containment, Vec<u8>) {
-    let mut cmd = Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     cmd.executable(testbin())
         .args(["cosca_testbin", "fd3-write", "FD3PAYLOAD"])
         // pipe_out: child writes, parent holds the read end.
@@ -701,7 +701,7 @@ fn run_free_fn_builds_command_from_args() {
 
 #[skuld::test]
 fn read_errors_on_invalid_utf8() {
-    let mut cmd = Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     // 0xff is not valid UTF-8.
     cmd.executable(testbin()).args(["cosca_testbin", "emit-raw", "ff"]);
     let err = cmd.read().expect_err("should fail on invalid UTF-8");
@@ -719,7 +719,7 @@ fn read_errors_on_invalid_utf8() {
 
 #[skuld::test]
 fn detach_leaves_the_child_running() {
-    let mut cmd = Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     cmd.executable(testbin()).args(["cosca_testbin", "tee-both"]);
     cmd.stdin(Stdio::pipe()).unwrap();
     // The orphan exits after this test returns; it must not hold nextest's stdout/stderr.
@@ -757,7 +757,7 @@ fn detach_leaves_the_child_running() {
 
 #[skuld::test]
 fn uncontained_child_reports_containment_none() {
-    let mut cmd = Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     cmd.executable(testbin()).args(["cosca_testbin", "exit", "0"]);
     let child = cmd.spawn().expect("spawn");
     assert_eq!(child.containment(), cosca::Containment::None);
@@ -778,7 +778,7 @@ fn spawn_contained_tree() -> (cosca::Child, std::net::TcpStream) {
     use std::net::TcpListener;
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind control listener");
     let addr = listener.local_addr().unwrap().to_string();
-    let mut cmd = Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     cmd.env(common::ACK_ENV, "1");
     cmd.env(common::ECHO_HELD_ENV, "1");
     cmd.executable(testbin())
@@ -834,7 +834,7 @@ fn spawn_contained_echo_tree(kill_on_drop: bool) -> EchoTree {
     use std::net::TcpListener;
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind control listener");
     let addr = listener.local_addr().unwrap().to_string();
-    let mut cmd = Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     cmd.env(common::ACK_ENV, "1");
     cmd.executable(testbin())
         .args(["cosca_testbin", "spawn-grandchild-echo", &addr]);
@@ -1044,7 +1044,7 @@ fn spawn_session_tree() -> (cosca::Child, std::net::TcpStream) {
     use std::net::TcpListener;
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind control listener");
     let addr = listener.local_addr().unwrap().to_string();
-    let mut cmd = Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     cmd.env(common::ACK_ENV, "1");
     cmd.env(common::ECHO_HELD_ENV, "1");
     cmd.executable(testbin())
@@ -1096,7 +1096,7 @@ fn unix_session_containment_reports_session() {
 fn unix_session_child_is_own_session_leader() {
     let parent_sid = unsafe { libc::getsid(0) };
 
-    let mut cmd = Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     cmd.executable(testbin())
         .args(["cosca_testbin", "sid-report"])
         .stdout(Stdio::pipe())
@@ -1146,7 +1146,7 @@ fn spawn_treewalk_tree() -> (cosca::Child, std::net::TcpStream, std::net::TcpStr
     use std::net::TcpListener;
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind control listener");
     let addr = listener.local_addr().unwrap().to_string();
-    let mut cmd = Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     cmd.env(common::ACK_ENV, "1");
     cmd.env(common::ECHO_HELD_ENV, "1");
     cmd.executable(testbin())
@@ -1245,7 +1245,7 @@ fn treewalk_kills_process_group_escapee() {
     use std::net::TcpListener;
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind control listener");
     let addr = listener.local_addr().unwrap().to_string();
-    let mut cmd = Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     cmd.env(common::ACK_ENV, "1");
     cmd.env(common::ECHO_HELD_ENV, "1");
     cmd.executable(testbin())
@@ -1569,7 +1569,7 @@ fn linux_cgroup_v2_keeps_the_worker_of_a_root_that_already_exited(#[fixture(cgro
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind control listener");
     let addr = listener.local_addr().unwrap().to_string();
     // `sh` backgrounds the worker without waiting for its exec, so the root exits at once.
-    let mut cmd = Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     cmd.env(common::ACK_ENV, "1");
     cmd.executable("/bin/sh")
         .args(["sh", "-c", r#""$0" control-echo-pid "$1" G & exit 0"#, testbin(), &addr]);
@@ -1653,7 +1653,7 @@ fn death_watch_linux_cgroup_v2_accept_or_signalled_panics_when_the_leaf_drains_b
 ) {
     stderr_log::install();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind control listener");
-    let mut cmd = Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     cmd.executable("/bin/sh").args(["sh", "-c", "exit 0"]);
     cmd.contain();
     let child = cmd.spawn().expect("spawn");
@@ -1772,7 +1772,7 @@ fn parse_closed_slots(slots: &str) -> Vec<i32> {
 #[cfg(target_os = "linux")]
 fn spawn_with_std_slots_closed(
     _own_process: &common::test_own_process::Completion,
-    cmd: &mut Command,
+    cmd: &mut cosca::Command,
     slots: &[i32],
 ) -> Result<cosca::Child, cosca::error::Error> {
     // Everything this process needs open is opened already, so nothing fills the gaps but the
@@ -1824,7 +1824,7 @@ fn spawn_with_slots_closed(done: &common::test_own_process::Completion, slots: &
     file.write_all(CONTENTS).expect("fill the file");
     file.rewind().expect("rewind the file");
 
-    let mut cmd = Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     cmd.env(common::ACK_ENV, "1");
     // The root stays alive in `wait` for as long as the worker does.
     cmd.executable("/bin/sh")

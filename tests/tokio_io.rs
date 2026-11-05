@@ -20,7 +20,7 @@ fn failed_exec_fate() -> cosca::error::ChildFate {
 #[cfg(feature = "tokio")]
 #[skuld::test]
 async fn async_spawn_status_reports_exit_code() {
-    let mut cmd = cosca::tokio::Command::new();
+    let mut cmd = common::tokio_command(common::Console::Hidden);
     cmd.executable(common::testbin()).args(["cosca_testbin", "exit", "7"]);
     assert_eq!(cmd.status().await.expect("status").code(), Some(7));
 }
@@ -66,7 +66,7 @@ async fn async_try_wait_is_none_before_exit_then_some_after() {
 #[cfg(feature = "tokio")]
 #[skuld::test]
 async fn async_env_reaches_child() {
-    let mut cmd = cosca::tokio::Command::new();
+    let mut cmd = common::tokio_command(common::Console::Hidden);
     cmd.executable(common::testbin())
         .args(["cosca_testbin", "env", "SP_PLAN8"])
         .env("SP_PLAN8", "async");
@@ -77,7 +77,7 @@ async fn async_env_reaches_child() {
 #[cfg(feature = "tokio")]
 #[skuld::test]
 async fn async_output_captures_streams() {
-    let mut cmd = cosca::tokio::Command::new();
+    let mut cmd = common::tokio_command(common::Console::Hidden);
     cmd.executable(common::testbin())
         .args(["cosca_testbin", "emit", "5", "3"]);
     let out = cmd.output().await.expect("output");
@@ -91,7 +91,7 @@ async fn async_output_captures_streams() {
 async fn async_communicate_is_deadlock_free() {
     // tee-both copies stdin to BOTH stdout and stderr; a non-concurrent reader would deadlock
     // once a pipe buffer fills. Concurrent try_join! must complete with all bytes on both.
-    let mut cmd = cosca::tokio::Command::new();
+    let mut cmd = common::tokio_command(common::Console::Hidden);
     cmd.executable(common::testbin()).args(["cosca_testbin", "tee-both"]);
     cmd.stdin(cosca::Stdio::pipe()).unwrap();
     cmd.stdout(cosca::Stdio::pipe()).unwrap();
@@ -108,7 +108,7 @@ async fn async_communicate_is_deadlock_free() {
 async fn async_communicate_tolerates_early_stdin_close() {
     // A child that exits without reading all of stdin closes the pipe early; write_all then
     // yields BrokenPipe. communicate must treat that as EOF and still return captured output.
-    let mut cmd = cosca::tokio::Command::new();
+    let mut cmd = common::tokio_command(common::Console::Hidden);
     cmd.executable(common::testbin())
         .args(["cosca_testbin", "emit", "2", "0"]); // never reads stdin
     cmd.stdin(cosca::Stdio::pipe()).unwrap();
@@ -130,7 +130,7 @@ async fn async_communicate_none_with_piped_stdin_signals_eof() {
     // Piped stdin + no input: the write future takes `Some(writer)`, skips the write, and drops the
     // writer to signal EOF. `tee-both` reads stdin to EOF, so with no input it must complete rather
     // than hang waiting on a stdin that never closes.
-    let mut cmd = cosca::tokio::Command::new();
+    let mut cmd = common::tokio_command(common::Console::Hidden);
     cmd.executable(common::testbin()).args(["cosca_testbin", "tee-both"]);
     cmd.stdin(cosca::Stdio::pipe()).unwrap();
     cmd.stdout(cosca::Stdio::pipe()).unwrap();
@@ -150,7 +150,7 @@ async fn async_communicate_none_with_piped_stdin_signals_eof() {
 #[cfg(feature = "tokio")]
 #[skuld::test]
 async fn async_read_errors_on_invalid_utf8() {
-    let mut cmd = cosca::tokio::Command::new();
+    let mut cmd = common::tokio_command(common::Console::Hidden);
     cmd.executable(common::testbin())
         .args(["cosca_testbin", "emit-raw", "61", "ff", "62"]);
     let err = cmd.read().await.expect_err("invalid utf-8 must error");
@@ -164,7 +164,7 @@ async fn async_read_errors_on_invalid_utf8() {
 #[cfg(feature = "tokio")]
 #[skuld::test] // NOT #[tokio::test] — verifies the no-runtime guard returns Err (not panic / deferred failure)
 fn async_spawn_outside_runtime_errors() {
-    let mut cmd = cosca::tokio::Command::new();
+    let mut cmd = common::tokio_command(common::Console::Hidden);
     cmd.executable(common::testbin()).args(["cosca_testbin", "exit", "0"]);
     let err = cmd.spawn().expect_err("spawn outside a tokio runtime must Err");
     assert!(matches!(err, cosca::error::Error::Io(_)), "got {err:?}");
@@ -183,7 +183,7 @@ fn async_spawn_on_io_disabled_runtime_panics_on_unix() {
         .expect("build an IO-disabled current-thread runtime");
     let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         rt.block_on(async {
-            let mut cmd = cosca::tokio::Command::new();
+            let mut cmd = common::tokio_command(common::Console::Hidden);
             cmd.executable(common::testbin()).args(["cosca_testbin", "exit", "0"]);
             // The child may already be running when the spawn panics; keep it off nextest's pipes.
             common::silence_async(&mut cmd);
@@ -212,7 +212,7 @@ fn async_spawn_on_io_disabled_runtime_succeeds_on_windows() {
         .build()
         .expect("build an IO-disabled current-thread runtime");
     let spawned = rt.block_on(async {
-        let mut cmd = cosca::tokio::Command::new();
+        let mut cmd = common::tokio_command(common::Console::Hidden);
         cmd.executable(common::testbin()).args(["cosca_testbin", "exit", "0"]);
         cmd.spawn().is_ok()
     });
@@ -227,7 +227,7 @@ fn async_spawn_on_io_disabled_runtime_succeeds_on_windows() {
 async fn async_chained_merge_is_unsupported() {
     // A merge whose target is itself a merge → Unsupported (mirrors the sync chained-merge test):
     // stderr -> stdout, and stdout -> stdin, so stdout's resolved kind is Merge.
-    let mut cmd = cosca::tokio::Command::new();
+    let mut cmd = common::tokio_command(common::Console::Hidden);
     cmd.executable(common::testbin()).args(["cosca_testbin", "exit", "0"]);
     cmd.stdout(cosca::Stdio::merge(cosca::Fd::STDIN)).unwrap();
     cmd.stderr(cosca::Stdio::merge(cosca::Fd::STDOUT)).unwrap();
@@ -572,7 +572,7 @@ async fn assert_async_opted_out_tree_survives(kill_on_drop: bool, opt_out: impl 
 #[skuld::test]
 async fn async_unix_fd3_pipe_round_trips() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut cmd = cosca::tokio::Command::new();
+    let mut cmd = common::tokio_command(common::Console::Hidden);
     cmd.executable(common::testbin()).args(["cosca_testbin", "fd3-echo"]);
     cmd.stdout(cosca::Stdio::pipe()).expect("stdout pipe");
     cmd.fd(3, cosca::Stdio::pipe_in()).expect("fd 3 pipe_in");
@@ -598,7 +598,7 @@ async fn async_unix_fd3_pipe_round_trips() {
 #[skuld::test]
 async fn async_unix_fd3_null_is_accepted() {
     use tokio::io::AsyncReadExt;
-    let mut cmd = cosca::tokio::Command::new();
+    let mut cmd = common::tokio_command(common::Console::Hidden);
     cmd.executable(common::testbin()).args(["cosca_testbin", "fd3-echo"]);
     cmd.stdout(cosca::Stdio::pipe()).expect("stdout pipe");
     cmd.fd(3, cosca::Stdio::null()).expect("fd 3 null");
@@ -623,7 +623,7 @@ async fn async_unix_fd3_null_is_accepted() {
 #[skuld::test]
 async fn async_unix_fd3_pipe_out_delivers_child_bytes() {
     use tokio::io::AsyncReadExt;
-    let mut cmd = cosca::tokio::Command::new();
+    let mut cmd = common::tokio_command(common::Console::Hidden);
     cmd.executable(common::testbin())
         .args(["cosca_testbin", "fd3-write", "fd3-token"]);
     cmd.fd(3, cosca::Stdio::pipe_out()).expect("fd 3 pipe_out");
@@ -656,7 +656,7 @@ async fn async_unix_fd_out_of_range_fails_spawn_cleanly_not_abort() {
     };
     let _rlimit_guard = common::RestoreRlimitNofile::lower_to(&done, 256);
 
-    let mut cmd = cosca::tokio::Command::new();
+    let mut cmd = common::tokio_command(common::Console::Hidden);
     cmd.executable(common::testbin())
         .args(["cosca_testbin", "exit", "0"])
         .fd(100_000, cosca::Stdio::null())
@@ -687,7 +687,7 @@ async fn async_unix_fd_out_of_range_fails_spawn_cleanly_not_abort() {
 #[cfg(unix)]
 #[skuld::test]
 async fn async_unix_fd_i32_max_fails_spawn_cleanly_not_abort() {
-    let mut cmd = cosca::tokio::Command::new();
+    let mut cmd = common::tokio_command(common::Console::Hidden);
     cmd.executable(common::testbin())
         .args(["cosca_testbin", "exit", "0"])
         .fd(i32::MAX, cosca::Stdio::null())
@@ -730,7 +730,7 @@ async fn async_a_mapped_fd_does_not_leak_into_a_stderr_pipe_when_fd2_is_closed()
 
     let _restore = common::test_stdio::RestoreStdio::close(&done, &[2]);
 
-    let mut cmd = cosca::tokio::Command::new();
+    let mut cmd = common::tokio_command(common::Console::Hidden);
     cmd.executable("/bin/sh").args(["sh", "-c", "echo LEAK >&3"]);
     cmd.stderr(cosca::Stdio::pipe()).expect("stderr pipe");
     cmd.fd(3, cosca::Stdio::null()).expect("fd 3 null");
@@ -777,7 +777,7 @@ async fn async_relocating_a_low_parent_fd_keeps_spawn_errors_reported() {
 
     let _restore = common::test_stdio::RestoreStdio::close(&done, &[1, 2]);
 
-    let mut cmd = cosca::tokio::Command::new();
+    let mut cmd = common::tokio_command(common::Console::Hidden);
     cmd.executable("/bin/sh").args(["sh", "-c", "true"]);
     cmd.stdout(cosca::Stdio::from_file(out_f.try_clone().expect("clone stdout target")))
         .expect("stdout from_file");
@@ -820,7 +820,7 @@ async fn async_relocating_a_low_parent_fd_keeps_spawn_errors_reported() {
 async fn async_fd3_wrong_direction_take_puts_the_end_back() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     // pipe_in: the read-accessor first (wrong) must not lose the write end.
-    let mut cmd = cosca::tokio::Command::new();
+    let mut cmd = common::tokio_command(common::Console::Hidden);
     cmd.executable(common::testbin()).args(["cosca_testbin", "fd3-echo"]);
     cmd.stdout(cosca::Stdio::pipe()).expect("stdout pipe");
     cmd.fd(3, cosca::Stdio::pipe_in()).expect("fd 3 pipe_in");
@@ -845,7 +845,7 @@ async fn async_fd3_wrong_direction_take_puts_the_end_back() {
     assert_eq!(buf, b"put-back");
 
     // pipe_out: the write-accessor first (wrong) must not lose the read end.
-    let mut cmd = cosca::tokio::Command::new();
+    let mut cmd = common::tokio_command(common::Console::Hidden);
     cmd.executable(common::testbin())
         .args(["cosca_testbin", "fd3-write", "still-here"]);
     cmd.fd(3, cosca::Stdio::pipe_out()).expect("fd 3 pipe_out");
@@ -869,7 +869,7 @@ async fn async_fd3_wrong_direction_take_puts_the_end_back() {
 #[skuld::test]
 async fn async_merge_stderr_onto_stdout_combines_output() {
     use tokio::io::AsyncReadExt;
-    let mut cmd = cosca::tokio::Command::new();
+    let mut cmd = common::tokio_command(common::Console::Hidden);
     // Same scenario as sync merge_stderr_onto_stdout_combines_output (tests/spawn_io.rs):
     // emit 3 bytes to stdout, 2 to stderr; merged, all 5 arrive on the one stdout pipe.
     cmd.executable(common::testbin())
@@ -906,7 +906,7 @@ async fn async_merge_stderr_onto_stdout_combines_output() {
 #[skuld::test]
 async fn async_merge_into_unpiped_targets_still_works() {
     // Regression: merge into null stays on the existing (non-owned) path.
-    let mut cmd = cosca::tokio::Command::new();
+    let mut cmd = common::tokio_command(common::Console::Hidden);
     cmd.executable(common::testbin())
         .args(["cosca_testbin", "emit", "3", "2"]);
     cmd.stdout(cosca::Stdio::null()).expect("stdout null");
@@ -920,7 +920,7 @@ async fn async_merge_into_unpiped_targets_still_works() {
 #[cfg(feature = "tokio")]
 #[skuld::test]
 async fn async_communicate_reads_a_merged_stream() {
-    let mut cmd = cosca::tokio::Command::new();
+    let mut cmd = common::tokio_command(common::Console::Hidden);
     cmd.executable(common::testbin())
         .args(["cosca_testbin", "emit", "3", "2"]);
     cmd.stdout(cosca::Stdio::pipe()).expect("stdout pipe");
@@ -942,7 +942,7 @@ async fn async_communicate_reads_a_merged_stream() {
 async fn async_merged_stream_accessor_has_take_semantics() {
     // stdout() as a piped merge target: first take yields the reader, second is None
     // (take semantics, matching the tokio-owned branch).
-    let mut cmd = cosca::tokio::Command::new();
+    let mut cmd = common::tokio_command(common::Console::Hidden);
     cmd.executable(common::testbin())
         .args(["cosca_testbin", "emit", "3", "2"]);
     cmd.stdout(cosca::Stdio::pipe()).expect("stdout pipe");
@@ -966,7 +966,7 @@ async fn async_merged_stream_accessor_has_take_semantics() {
 async fn async_non_merged_stream_accessor_has_take_semantics() {
     // Regression: the pre-pass skips slots it does not assign, so stdin/stdout/stderr keep
     // plain take-semantics in a non-merge config.
-    let mut cmd = cosca::tokio::Command::new();
+    let mut cmd = common::tokio_command(common::Console::Hidden);
     cmd.executable(common::testbin())
         .args(["cosca_testbin", "emit", "5", "0"]);
     cmd.stdin(cosca::Stdio::pipe()).expect("stdin pipe");
@@ -988,7 +988,7 @@ async fn async_non_merged_stream_accessor_has_take_semantics() {
 async fn async_plain_piped_stream_accessor_has_take_semantics() {
     // The tokio-owned (non-merge) branch's take-semantics: stdout piped (no merge), so
     // tokio owns the internal pipe. Verifies parity with the merge-owned case above.
-    let mut cmd = cosca::tokio::Command::new();
+    let mut cmd = common::tokio_command(common::Console::Hidden);
     cmd.executable(common::testbin())
         .args(["cosca_testbin", "emit", "3", "0"]);
     cmd.stdout(cosca::Stdio::pipe()).expect("stdout pipe");
@@ -1010,7 +1010,7 @@ async fn async_plain_piped_stream_accessor_has_take_semantics() {
 #[skuld::test]
 async fn async_merge_into_piped_stdin_feeds_the_merged_child() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut cmd = cosca::tokio::Command::new();
+    let mut cmd = common::tokio_command(common::Console::Hidden);
     cmd.executable(common::testbin())
         .args(["cosca_testbin", "stdin-split-echo", "3"]);
     cmd.stdin(cosca::Stdio::pipe()).expect("stdin pipe");
@@ -1040,7 +1040,7 @@ async fn async_merge_into_piped_stdin_feeds_the_merged_child() {
 #[skuld::test]
 async fn async_fd3_source_merges_into_piped_stdout() {
     use tokio::io::AsyncReadExt;
-    let mut cmd = cosca::tokio::Command::new();
+    let mut cmd = common::tokio_command(common::Console::Hidden);
     cmd.executable(common::testbin())
         .args(["cosca_testbin", "fd3-write", "fd3-merged"]);
     cmd.stdout(cosca::Stdio::pipe()).expect("stdout pipe");
@@ -1066,7 +1066,7 @@ async fn async_fd3_source_merges_into_piped_stdout() {
 #[skuld::test]
 async fn async_fd3_source_merges_into_piped_stdin() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut cmd = cosca::tokio::Command::new();
+    let mut cmd = common::tokio_command(common::Console::Hidden);
     cmd.executable(common::testbin()).args(["cosca_testbin", "fd3-echo"]);
     cmd.stdin(cosca::Stdio::pipe()).expect("stdin pipe");
     cmd.stdout(cosca::Stdio::pipe()).expect("stdout pipe");
@@ -1130,7 +1130,7 @@ async fn death_watch_spawn_tree_async_panics_if_its_death_watch_is_ever_reverted
 #[cfg(feature = "tokio")]
 fn bind_and_spawn(args: &[&str], ack: bool) -> (::tokio::net::TcpListener, cosca::tokio::Child) {
     let (listener, addr) = common::bind_async_listener();
-    let mut cmd = cosca::tokio::Command::new();
+    let mut cmd = common::tokio_command(common::Console::Hidden);
     let mut argv = vec![common::testbin().to_string()];
     argv.extend(args.iter().map(|a| a.replace("{addr}", &addr)));
     cmd.args(argv);
@@ -1186,7 +1186,7 @@ async fn death_watch_accept_or_die_async_acks_the_connection_it_accepts() {
 async fn death_watch_accept_or_die_async_also_reports_a_gone_descendant_as_dead() {
     use std::process::Stdio;
     let (listener, _addr) = common::bind_async_listener();
-    let mut cmd = cosca::tokio::Command::new();
+    let mut cmd = common::tokio_command(common::Console::Hidden);
     // Alive and silent until its stdin closes: the target must outlive the accept below, and
     // `hold-until-stdin-eof` ends only when its stdin closes (the panic's unwind closes it).
     cmd.args([common::testbin().to_string(), "hold-until-stdin-eof".to_string()]);

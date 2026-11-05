@@ -1,8 +1,8 @@
 //! Test-only child processes shared across the crate's unit tests.
 //!
-//! On Windows these spawn through [`crate::test_spawn`] or build their `Command` with `no_window()`,
-//! so a child opens no console window; a test of the console-group signals takes an `_on_console`
-//! helper.
+//! On Windows these spawn through [`crate::test_spawn`] or build their `Command` with [`command`],
+//! the one place a test builds a `Command`, so a child opens no console window unless the test
+//! passes [`Console::Asked`]; a test of the console-group signals takes an `_on_console` helper.
 
 skuld::default_labels!(crate::test_harness::ROOT);
 
@@ -38,9 +38,33 @@ use crate::test_own_process;
 #[path = "../tests/common/kevent_eintr.rs"]
 mod kevent_eintr;
 
-// Blocker fixtures =====
+pub(crate) use crate::test_spawn::console_flags::Console;
 
-use crate::test_spawn::console_flags::Console;
+// The Command factory =====
+
+/// The one place a test builds a [`crate::Command`]. On Windows a [`Console::Hidden`] command asks
+/// for `no_window()`, so a test run from a process with no console opens no window; a test that
+/// signals the child's console group or measures console membership passes [`Console::Asked`].
+/// Off Windows both are a plain `Command::new()`.
+pub(crate) fn command(console: Console) -> crate::Command {
+    let mut cmd = crate::Command::new();
+    if console.hides_window() {
+        cmd.no_window();
+    }
+    cmd
+}
+
+/// [`command`] for the async `Command`.
+#[cfg(feature = "tokio")]
+pub(crate) fn tokio_command(console: Console) -> crate::tokio::Command {
+    let mut cmd = crate::tokio::Command::new();
+    if console.hides_window() {
+        cmd.no_window();
+    }
+    cmd
+}
+
+// Blocker fixtures =====
 
 /// The argv of a child that does nothing until its stdin reaches EOF or it is killed: `cat`, or
 /// `findstr x` on Windows. Every fixture that needs a child "still alive at some later check"
@@ -260,7 +284,7 @@ pub(crate) fn held_treewalk_blocker() -> (crate::Child, std::io::PipeWriter) {
 /// test holds. `kill_on_drop` is the command's.
 pub(crate) fn held_uncontained_blocker(kill_on_drop: bool) -> (crate::Child, std::io::PipeWriter) {
     let (stdin, writer) = held_writer_stdin();
-    let mut cmd = crate::Command::new();
+    let mut cmd = command(Console::Hidden);
     cmd.args(BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
     cmd.kill_on_drop(kill_on_drop);
@@ -321,11 +345,8 @@ fn held_blocker(
     console: Console,
     contain: impl FnOnce(&mut crate::Command),
 ) -> (crate::Child, std::io::PipeWriter) {
-    let mut cmd = crate::Command::new();
+    let mut cmd = command(console);
     cmd.args(BLOCKER_ARGV.iter().copied());
-    if console.hides_window() {
-        cmd.no_window();
-    }
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(stdout).expect("set stdout");
     contain(&mut cmd);
@@ -370,11 +391,8 @@ fn held_blocker_async(
     console: Console,
     contain: impl FnOnce(&mut crate::tokio::Command),
 ) -> (crate::tokio::Child, crate::tokio::ChildStdin) {
-    let mut cmd = crate::tokio::Command::new();
+    let mut cmd = tokio_command(console);
     cmd.args(BLOCKER_ARGV.iter().copied());
-    if console.hides_window() {
-        cmd.no_window();
-    }
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(stdout).expect("set stdout");
     contain(&mut cmd);
@@ -1398,11 +1416,8 @@ pub(crate) fn windows_blocker_on_console() -> (crate::Child, std::io::PipeWriter
 
 #[cfg(windows)]
 fn windows_blocker_with(console: Console) -> (crate::Child, std::io::PipeWriter) {
-    let mut cmd = crate::Command::new();
+    let mut cmd = command(console);
     cmd.args([windows_more()]);
-    if console.hides_window() {
-        cmd.no_window();
-    }
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(crate::Stdio::null()).expect("set stdout null");
     cmd.contain();
@@ -1432,11 +1447,8 @@ fn windows_blocker_async_with(
     console: Console,
     configure: impl FnOnce(&mut crate::tokio::Command),
 ) -> (crate::tokio::Child, crate::tokio::ChildStdin) {
-    let mut cmd = crate::tokio::Command::new();
+    let mut cmd = tokio_command(console);
     cmd.args([windows_more()]);
-    if console.hides_window() {
-        cmd.no_window();
-    }
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(crate::Stdio::null()).expect("set stdout null");
     configure(&mut cmd);
@@ -1491,7 +1503,7 @@ pub(crate) const TERM_SURVIVOR_TREE_ARGV: &[&str] = &[
 pub(crate) fn term_ignoring_blocker() -> (crate::Child, std::io::PipeWriter) {
     use std::io::Read as _;
 
-    let mut cmd = crate::Command::new();
+    let mut cmd = command(Console::Hidden);
     cmd.args(TERM_IGNORING_BLOCKER_ARGV.iter().copied());
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
@@ -1512,7 +1524,7 @@ pub(crate) fn term_ignoring_blocker() -> (crate::Child, std::io::PipeWriter) {
 pub(crate) async fn term_ignoring_blocker_async() -> (crate::tokio::Child, crate::tokio::ChildStdin) {
     use ::tokio::io::AsyncReadExt as _;
 
-    let mut cmd = crate::tokio::Command::new();
+    let mut cmd = tokio_command(Console::Hidden);
     cmd.args(TERM_IGNORING_BLOCKER_ARGV.iter().copied());
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");

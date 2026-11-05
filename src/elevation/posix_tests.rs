@@ -306,11 +306,12 @@ fn fixture_relative_path_elements_are_never_resolved() {
 #[cfg(unix)]
 mod rewrite_tests {
     use super::super::{password_line, rewrite_with_host, PendingPassword, PosixRewrite};
-    use crate::command::{Command, CommandInput, EnvOp};
+    use crate::command::{CommandInput, EnvOp};
     use crate::elevation::plan::{BackendSet, Host, Os};
     use crate::elevation::{Auth, Backend, ElevatedStdio, ElevatedVia};
     use crate::error::Error;
     use crate::stdio::{Fd, ResolvedStdio, Stdio};
+    use crate::test_child::Console;
     use std::ffi::OsString;
     use std::path::PathBuf;
 
@@ -340,7 +341,7 @@ mod rewrite_tests {
 
     #[skuld::test]
     fn rewrite_is_nondestructive_and_reports_wrapped_backend() {
-        let mut c = Command::new();
+        let mut c = crate::test_child::command(Console::Hidden);
         c.args(["id", "-u"])
             .env("LD_PRELOAD", "/evil.so")
             .env("FOO", "bar")
@@ -373,7 +374,7 @@ mod rewrite_tests {
 
     #[skuld::test]
     fn rewrite_twice_yields_identical_derived_argv() {
-        let mut c = Command::new();
+        let mut c = crate::test_child::command(Console::Hidden);
         c.args(["id"])
             .elevation_backend(Backend::Sudo)
             .elevation_auth(Auth::NonInteractive);
@@ -384,7 +385,7 @@ mod rewrite_tests {
 
     #[skuld::test]
     fn env_remove_or_clear_plus_elevate_is_unsupported() {
-        let mut c = Command::new();
+        let mut c = crate::test_child::command(Console::Hidden);
         c.args(["id"])
             .env_clear()
             .env("KEEP", "1")
@@ -394,7 +395,7 @@ mod rewrite_tests {
             rewrite_with_host(&mut c, &sudo_host()),
             Err(Error::Unsupported { .. })
         ));
-        let mut c2 = Command::new();
+        let mut c2 = crate::test_child::command(Console::Hidden);
         c2.args(["id"])
             .env("A", "1")
             .env_remove("A")
@@ -417,7 +418,7 @@ mod rewrite_tests {
             },
             ..sudo_host()
         };
-        let mut c = Command::new();
+        let mut c = crate::test_child::command(Console::Hidden);
         c.args(["id"])
             .env("A", "1")
             .elevation_backend(Backend::Doas)
@@ -436,7 +437,7 @@ mod rewrite_tests {
             },
             ..sudo_host()
         };
-        let mut c2 = Command::new();
+        let mut c2 = crate::test_child::command(Console::Hidden);
         c2.args(["id"])
             .env("A", "1")
             .elevation_backend(Backend::Pkexec)
@@ -449,7 +450,7 @@ mod rewrite_tests {
 
     #[skuld::test]
     fn askpass_path_is_carried_in_the_backend_env() {
-        let mut c = Command::new();
+        let mut c = crate::test_child::command(Console::Hidden);
         c.args(["id"])
             .elevation_backend(Backend::Sudo)
             .elevation_auth(Auth::Askpass(PathBuf::from("/usr/bin/ssh-askpass")));
@@ -463,7 +464,7 @@ mod rewrite_tests {
 
     #[skuld::test]
     fn stdin_auth_wires_fd0_to_a_file_and_defers_the_write() {
-        let mut c = Command::new();
+        let mut c = crate::test_child::command(Console::Hidden);
         c.args(["id"])
             .elevation_backend(Backend::Sudo)
             .elevation_auth(Auth::Stdin(crate::elevation::Secret::new("pw")));
@@ -480,7 +481,7 @@ mod rewrite_tests {
 
     #[skuld::test]
     fn stdin_auth_with_caller_configured_fd0_is_unsupported() {
-        let mut c = Command::new();
+        let mut c = crate::test_child::command(Console::Hidden);
         c.args(["id"])
             .elevation_backend(Backend::Sudo)
             .elevation_auth(Auth::Stdin(crate::elevation::Secret::new("pw")));
@@ -493,7 +494,7 @@ mod rewrite_tests {
 
     #[skuld::test]
     fn fd_ge_3_elevated_is_unsupported() {
-        let mut c = Command::new();
+        let mut c = crate::test_child::command(Console::Hidden);
         c.args(["id"])
             .elevation_backend(Backend::Sudo)
             .elevation_auth(Auth::NonInteractive);
@@ -506,7 +507,7 @@ mod rewrite_tests {
 
     #[skuld::test]
     fn commandline_elevated_is_unsupported() {
-        let mut c = Command::new();
+        let mut c = crate::test_child::command(Console::Hidden);
         c.commandline("id -u")
             .elevation_backend(Backend::Sudo)
             .elevation_auth(Auth::NonInteractive);
@@ -528,7 +529,7 @@ mod rewrite_tests {
         // The RunAsIs (requested but already elevated) branch: no wrapper, but the
         // sanitizer STILL runs — a dangerous forwarded var must never reach the root
         // child, and the report carries the real stripped list.
-        let mut c = Command::new();
+        let mut c = crate::test_child::command(Console::Hidden);
         c.args(["id", "-u"])
             .env("LD_PRELOAD", "/evil.so")
             .elevation_backend(Backend::Sudo)
@@ -557,7 +558,7 @@ mod rewrite_tests {
         // Same structurally-invalid requests must be rejected whether or not the caller
         // is already elevated (Config gates run before the RunAsIs short-circuit).
         for host in [sudo_host(), elevated_sudo_host()] {
-            let mut a = Command::new();
+            let mut a = crate::test_child::command(Console::Hidden);
             a.args(["id"])
                 .elevation_backend(Backend::Sudo)
                 .elevation_auth(Auth::NonInteractive);
@@ -568,7 +569,7 @@ mod rewrite_tests {
                 host.elevated
             );
 
-            let mut b = Command::new();
+            let mut b = crate::test_child::command(Console::Hidden);
             b.args(["id"])
                 .env("A", "1")
                 .elevation_backend(Backend::Doas)
@@ -588,7 +589,7 @@ mod rewrite_tests {
                 host.elevated
             );
 
-            let mut d = Command::new();
+            let mut d = crate::test_child::command(Console::Hidden);
             d.commandline("id -u")
                 .elevation_backend(Backend::Sudo)
                 .elevation_auth(Auth::NonInteractive);
@@ -688,7 +689,7 @@ mod rewrite_tests {
 
     #[skuld::test]
     fn macos_gui_rewrites_to_osascript() {
-        let mut c = Command::new();
+        let mut c = crate::test_child::command(Console::Hidden);
         c.args(["/usr/bin/id", "-u"]).elevation_auth(Auth::Gui);
         let rw = rewrite_with_host(&mut c, &macos_gui_host(false)).expect("macos gui rewrite");
         let derived = rw.derived;
@@ -709,7 +710,7 @@ mod rewrite_tests {
     fn macos_gui_uses_the_macos_gate_not_the_posix_one() {
         // .contain() is legal under sudo and illegal under osascript; the gate
         // choice is what makes the difference, so assert the macOS message.
-        let mut c = Command::new();
+        let mut c = crate::test_child::command(Console::Hidden);
         c.args(["/usr/bin/id"]).contain().elevation_auth(Auth::Gui);
         // `PosixRewrite` has no `Debug`, so the error is named rather than the whole
         // Result — the same reason the sibling arms below spell `Ok(_)` out.
@@ -727,7 +728,7 @@ mod rewrite_tests {
         // as root would see .contain() accepted and ship it, and every unprivileged
         // user would hit a hard Unsupported at runtime.
         for elevated in [false, true] {
-            let mut c = Command::new();
+            let mut c = crate::test_child::command(Console::Hidden);
             c.args(["/usr/bin/id"]).contain().elevation_auth(Auth::Gui);
             match rewrite_with_host(&mut c, &macos_gui_host(elevated)) {
                 Err(Error::Unsupported { platform, .. }) => assert_eq!(platform, "macos"),
@@ -740,7 +741,7 @@ mod rewrite_tests {
     #[skuld::test]
     fn an_already_root_macos_gui_caller_runs_unwrapped() {
         // With a clean config the short-circuit still applies: no osascript.
-        let mut c = Command::new();
+        let mut c = crate::test_child::command(Console::Hidden);
         c.args(["/usr/bin/id"]).elevation_auth(Auth::Gui);
         let rw = rewrite_with_host(&mut c, &macos_gui_host(true)).expect("already-root rewrite");
         assert_eq!(rw.report.expect("a report").via, ElevatedVia::AlreadyElevated);
@@ -751,7 +752,7 @@ mod rewrite_tests {
     fn a_forced_backend_with_gui_gets_the_planners_verdict_not_the_trampolines() {
         // Backend::Sudo + Auth::Gui never reaches osascript, so the message must be
         // about the backend pairing, not about the authorization trampoline.
-        let mut c = Command::new();
+        let mut c = crate::test_child::command(Console::Hidden);
         c.args(["/usr/bin/id"])
             .elevation_backend(Backend::Sudo)
             .elevation_auth(Auth::Gui);
@@ -773,7 +774,7 @@ mod rewrite_tests {
         // pre-empted by a structural complaint.
         let mut host = macos_gui_host(false);
         host.available.osascript = None;
-        let mut c = Command::new();
+        let mut c = crate::test_child::command(Console::Hidden);
         c.args(["/usr/bin/id"]).elevation_auth(Auth::Gui);
         match rewrite_with_host(&mut c, &host) {
             Err(Error::Elevation { kind, detail }) => {
@@ -787,7 +788,7 @@ mod rewrite_tests {
 
     #[skuld::test]
     fn macos_non_gui_auth_still_takes_the_posix_path() {
-        let mut c = Command::new();
+        let mut c = crate::test_child::command(Console::Hidden);
         c.args(["/usr/bin/id"]).elevation_auth(Auth::NonInteractive);
         let rw = rewrite_with_host(&mut c, &macos_gui_host(false)).expect("sudo rewrite");
         assert_eq!(rw.backend_path, Some(PathBuf::from("/usr/bin/sudo")));
@@ -798,7 +799,7 @@ mod rewrite_tests {
     /// rewrite, not just the setter/getter pair.
     #[skuld::test]
     fn rewrite_suppresses_the_fd_marker_on_the_derived_command_while_keeping_containment() {
-        let mut c = Command::new();
+        let mut c = crate::test_child::command(Console::Hidden);
         c.args(["id", "-u"])
             .contain_with(crate::ContainMode::Strongest)
             .elevation_backend(Backend::Sudo)
@@ -824,7 +825,7 @@ mod rewrite_tests {
     /// contained child on this path must still get the marker.
     #[skuld::test]
     fn already_elevated_requested_does_not_suppress_the_fd_marker() {
-        let mut c = Command::new();
+        let mut c = crate::test_child::command(Console::Hidden);
         c.args(["id", "-u"])
             .contain_with(crate::ContainMode::Strongest)
             .elevation_backend(Backend::Sudo)

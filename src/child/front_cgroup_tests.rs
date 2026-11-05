@@ -8,6 +8,8 @@
 //! write, still succeeds.
 
 use std::cell::{Cell, RefCell};
+
+use crate::test_child::Console;
 use std::io::{PipeReader, PipeWriter, Read as _};
 use std::os::fd::{AsFd as _, OwnedFd};
 use std::os::unix::process::ExitStatusExt as _;
@@ -39,7 +41,7 @@ pub(crate) fn in_cgroup(mut cmd: Command) -> Command {
 /// A `cat` that runs as `nobody` in a cgroup, reported as launched by `sudo`: a front whose signal a
 /// thread without `CAP_KILL` is refused. Returns once it runs as `nobody`.
 pub(crate) fn nobody_cat() -> Command {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args([
         "setpriv",
         "--reuid=65534",
@@ -428,7 +430,7 @@ pub(crate) struct FrontWithMember {
 /// Spawns a [`FrontWithMember`], once the member has said its pid.
 pub(crate) fn spawn_front_with_member() -> FrontWithMember {
     let (member_reader, member_stdin) = std::io::pipe().expect("pipe");
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(["sh", "-c", FRONT_WITH_MEMBER_SH]);
     cmd.stdout(Stdio::pipe_out()).expect("stdout pipe");
     cmd.stderr(Stdio::from_file(std::fs::File::from(OwnedFd::from(member_reader))))
@@ -1215,7 +1217,7 @@ fn cgroup_a_failed_spawn_leaves_a_front_moved_out_of_its_leaf_running(#[fixture(
 /// `SIGTERM`, so the escalation runs.
 #[skuld::test]
 fn cgroup_graceful_shutdown_of_a_front_escalates_through_the_cgroup(#[fixture(cgroup)] _group: &Group) {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(["sh", "-c", "trap '' TERM; echo ready; exec cat"]);
     cmd.stdout(Stdio::pipe_out()).expect("stdout pipe");
     let (mut child, stdin) = spawn_as(in_cgroup(cmd), SUDO);
@@ -1239,7 +1241,7 @@ fn cgroup_graceful_shutdown_of_a_front_escalates_through_the_cgroup(#[fixture(cg
 /// failure, and sends the front nothing. Its `cat` ignores `SIGTERM`, so the escalation runs.
 #[skuld::test]
 fn cgroup_a_failed_escalation_of_a_front_is_unkillable(#[fixture(cgroup)] _group: &Group) {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(["sh", "-c", "trap '' TERM; echo ready; exec cat"]);
     cmd.stdout(Stdio::pipe_out()).expect("stdout pipe");
     let (mut child, stdin) = spawn_as(in_cgroup(cmd), SUDO);

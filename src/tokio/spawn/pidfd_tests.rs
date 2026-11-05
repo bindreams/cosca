@@ -3,6 +3,8 @@
 //! to EOF after the command is dropped.
 
 use std::cell::Cell;
+
+use crate::test_child::Console;
 use std::io::Read;
 use std::os::fd::OwnedFd;
 use std::rc::Rc;
@@ -18,7 +20,7 @@ use crate::tokio::Command;
 
 fn marker_command() -> (Command, std::io::PipeReader) {
     let (reader, writer) = std::io::pipe().expect("pipe");
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(["sh", "-c", "echo ran"]);
     cmd.stdout(Stdio::from_file(std::fs::File::from(OwnedFd::from(writer))))
         .expect("set stdout");
@@ -210,7 +212,7 @@ async fn a_leafless_tokio_failure_for_a_child_with_no_usable_pidfd_says_it_never
 /// The fate a tokio spawn, contained by its session, that failed without running the program
 /// carries for the child its handshake held.
 fn fate_of_unexecuted() -> ChildFate {
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(["sh", "-c", "echo ran"]);
     cmd.contain_with(crate::ContainMode::Session);
     match super::spawn(&mut cmd) {
@@ -342,7 +344,7 @@ async fn a_tokio_failure_after_the_fork_may_have_started() {
 /// Mutant: a failed tokio exec answers that the program did not start.
 #[skuld::test]
 async fn a_tokio_exec_failure_may_have_started() {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(["cosca-no-such-program-142"]);
     let (err, fate) = expect_may_have_started_with(cmd.spawn().expect_err("a missing program fails the spawn"));
     assert_eq!(

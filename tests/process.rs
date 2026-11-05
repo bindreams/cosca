@@ -881,7 +881,7 @@ fn death_watch_accept_tree_panics_when_the_grandchild_dies_before_connecting_whi
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap().to_string();
     let (report, report_addr) = common::bind_report();
-    let mut cmd = cosca::Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     cmd.executable(common::testbin())
         .args(["cosca_testbin", "spawn-grandchild-dies", &addr])
         .env(common::ACK_ENV, "1")

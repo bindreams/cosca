@@ -24,9 +24,10 @@ mod setuid_protocol_tests;
 /// # Panics
 /// As [`setuid::setuid_helper`] does, and when the spawn or the ready byte fails.
 pub(crate) fn spawn_setuid_blocker() -> (crate::Child, std::io::PipeWriter) {
+    use crate::test_child::Console;
     use std::io::Read as _;
     let helper = setuid::setuid_helper();
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     // `args` is the whole argv, program name included.
     cmd.executable(&helper)
         .args(["cosca_testbin", "setuid-stdin-block", "root"]);
