@@ -54,8 +54,7 @@ pub(crate) enum PartKey {
 
 /// What one drop or cleanup found, for its single `warn`.
 pub(crate) struct DropReport<'a> {
-    /// The caller, which prefixes the warn.
-    pub(crate) label: &'a str,
+    /// The look at the root.
     pub(crate) view: &'a DropView,
     /// The elevation front the event left running instead of signalling, and why.
     pub(crate) front: Option<&'a Error>,
@@ -71,9 +70,8 @@ pub(crate) struct DropReport<'a> {
 }
 
 impl<'a> DropReport<'a> {
-    pub(crate) fn new(label: &'a str, view: &'a DropView) -> DropReport<'a> {
+    pub(crate) fn new(view: &'a DropView) -> DropReport<'a> {
         DropReport {
-            label,
             view,
             front: None,
             skipped: None,
@@ -94,7 +92,7 @@ impl<'a> DropReport<'a> {
         }
         let text = format!(
             "{}: {}",
-            self.label,
+            self.view.caller.label(),
             parts
                 .iter()
                 .map(|(_, text)| text.as_str())
@@ -132,11 +130,12 @@ impl<'a> DropReport<'a> {
             parts.push((PartKey::Described, state));
         }
         if let (RootView::Reaped, Some(action)) = (&self.view.root, &self.skipped) {
+            let this = self.view.caller.this_event();
             parts.push((
                 PartKey::Described,
                 format!(
-                    "the root is already reaped, so this drop does not {action}, whose number may now belong to an \
-                 unrelated process. Descendants that outlived the reaped root are not torn down by this drop; \
+                    "the root is already reaped, so {this} does not {action}, whose number may now belong to an \
+                 unrelated process. Descendants that outlived the reaped root are not torn down by {this}; \
                  call kill_tree() before wait() to end them (https://github.com/bindreams/cosca/issues/382)"
                 ),
             ));

@@ -563,7 +563,7 @@ async fn a_kill_on_drop_false_drop_of_an_armed_leaf_never_blocks() {
     assert!(!child.kill_on_drop, "the command opted out");
     let root = linux::Pidfd::of(&child);
     // The root stays alive: only the tree is killed.
-    let view = child.read_root_view("test");
+    let view = child.read_root_view(crate::containment::dispatch::TeardownCaller::Drop);
     child.kill_tree_members_unless_reaped(&view).expect("kill the tree");
     assert_eq!(
         fake.kill_written(),
@@ -782,7 +782,7 @@ async fn a_teardown_of_a_reaped_child_is_reaped_armed_or_not() {
         drop(child.stdin().expect("piped stdin"));
         child.wait().await.expect("the child exits once its stdin closes");
         assert_eq!(
-            child.tear_down_now(),
+            child.tear_down_now(crate::containment::dispatch::TeardownCaller::Drop),
             crate::error::ChildFate::Reaped,
             "kill_on_drop={kill_on_drop}"
         );
