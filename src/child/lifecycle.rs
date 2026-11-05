@@ -65,13 +65,14 @@ impl From<WaitToExitError> for Error {
 /// Block until `proc` is reaped, and return its status. The wait has no deadline.
 ///
 /// With `due`, it first watches for the exit until the threshold, and warns once if the child has
-/// not exited by then; the threshold picks the message and ends nothing. `orphaned` says whether a
-/// zombie launchd holds is warned of here.
+/// not exited by then. `orphaned` says whether a zombie launchd holds is warned of here.
 pub(super) fn wait_to_exit(
     proc: &OwnedChild,
     due: Option<Due>,
     orphaned: Orphaned,
 ) -> Result<ExitStatus, WaitToExitError> {
+    #[cfg(feature = "tokio")]
+    crate::bounded::assert_may_block("a wait for a child's exit");
     let pid = proc.pid();
     let outcome = wait_warning(
         proc,
