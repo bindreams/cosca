@@ -57,7 +57,7 @@ pub(super) fn cause(errno: Errno) -> UnknownCause {
 }
 
 /// Opens `pid` and proves that its pidfd has inode `ino`.
-pub(super) fn prove(kernel: &dyn Kernel, pid: RawPid, ino: u64) -> Proof {
+pub(crate) fn prove(kernel: &dyn Kernel, pid: RawPid, ino: u64) -> Proof {
     let Some(target) = target(pid) else {
         return Proof::Lost;
     };

@@ -368,6 +368,12 @@ pub(crate) use backend::pid_stat;
 #[cfg(target_os = "linux")]
 pub(crate) use backend::kernel::{HostKernel, Kernel};
 
+#[cfg(target_os = "linux")]
+pub(crate) use backend::prove::{prove, Proof};
+
+#[cfg(all(target_os = "linux", test))]
+pub(crate) use backend::kernel::PIDFD_THREAD;
+
 #[cfg(not(target_os = "linux"))]
 pub(crate) use no_reads::{HostKernel, Kernel};
 
@@ -408,6 +414,12 @@ pub(crate) struct UnknownCause {
 }
 
 impl UnknownCause {
+    /// The failed pidfd call, when one is why.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn errno(&self) -> Option<rustix::io::Errno> {
+        self.errno
+    }
+
     /// The cause of a read through `/proc` that `view`, when it is `Some`, left `Unknown`.
     #[cfg(target_os = "linux")]
     pub(crate) fn of_view(view: Option<ViewUnreadable>) -> UnknownCause {
@@ -476,6 +488,15 @@ pub(crate) use backend::proc_view::openat2_refused_message;
 
 #[cfg(target_os = "linux")]
 impl ProcessId {
+    /// The inode of the process's pidfd, when this id is of the `pidfs` kind: the proof of it is
+    /// [`prove`].
+    pub(crate) fn pidfs_ino(&self) -> Option<u64> {
+        match self.key {
+            Key::Pidfs(ino) => Some(ino),
+            Key::Ticks(_) => None,
+        }
+    }
+
     /// [`of_with`](Self::of_with), and the process's own `stat` record (its `ppid`, `pgrp`, ...),
     /// read so that it belongs to the identity returned: a `stat` of a later holder of the pid is
     /// never paired with this id.

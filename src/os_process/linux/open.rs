@@ -10,12 +10,12 @@
 //! `spawn` probes `pidfd_open` on this process's own pid before it forks ([`probe_pidfd_support_with`]),
 //! so a refusal fails the spawn with no child; see `child::spawn::pidfd_handshake` for the rest.
 
-use std::os::fd::AsFd;
+use std::os::fd::AsFd as _;
 
 use rustix::process::{Pid, PidfdFlags};
 
 use crate::error::Error;
-use crate::identity::{Existence, Kernel, Liveness, PidfdTarget, ProcView, ProcessId, ViewUnreadable};
+use crate::identity::{Existence, Kernel, Liveness, PidfdTarget, ProcView, ProcessId, Proof, ViewUnreadable};
 use crate::os_process::OPEN_CONSEQUENCE;
 
 /// The operation an `Unsupported` open names.
@@ -32,6 +32,9 @@ pub(crate) fn open_verified_with(kernel: &dyn Kernel, id: ProcessId) -> Result<O
         "pid {} exceeds i32::MAX; pidfd cast would truncate",
         id.pid()
     );
+    if let Some(ino) = id.pidfs_ino() {
+        return open_proved(kernel, id, ino);
+    }
     let raw = Pid::from_raw(id.pid() as i32).expect("a resolvable ProcessId is never pid 0");
     match kernel.pidfd_open(raw, PidfdFlags::empty()) {
         Ok(pidfd) => verify_pidfd_target(kernel, id, pidfd),
@@ -41,13 +44,44 @@ pub(crate) fn open_verified_with(kernel: &dyn Kernel, id: ProcessId) -> Result<O
         // (gone), or a non-leader tid: live, or a ptraced zombie thread kept until its tracer
         // waits. Errno alone can't tell, so re-verify.
         Err(e @ (rustix::io::Errno::INVAL | rustix::io::Errno::NOENT)) => verify_without_pidfd(kernel, id, e),
-        Err(e) => match refusal_name(e) {
-            Some(name) => Err(pidfd_open_unsupported(OP_NAME, name)),
-            None => Err(Error::Io(crate::error::io_context(
-                "pidfd_open",
-                std::io::Error::from(e),
-            ))),
+        Err(e) => Err(open_error(e)),
+    }
+}
+
+/// `open_verified_with` for a `Pidfs` id: the pidfd's inode proves it, so no `/proc` is read.
+///
+/// A pid that holds a thread leading no group opens with `PIDFD_THREAD`: a live one is
+/// [`Error::NotThreadGroupLeader`], and one that has exited (a ptraced zombie thread kept until its
+/// tracer waits; its pidfd polls readable) is gone. A process reaped after the open still has its
+/// inode, so the pidfd is returned and polls readable.
+fn open_proved(kernel: &dyn Kernel, id: ProcessId, ino: u64) -> Result<Option<rustix::fd::OwnedFd>, Error> {
+    match crate::identity::prove(kernel, id.pid(), ino) {
+        Proof::Holds { fd, thread: None } => Ok(Some(fd)),
+        Proof::Holds {
+            fd,
+            thread: Some(errno),
+        } => match crate::os_process::poll::is_readable(fd.as_fd()) {
+            Ok(true) => Ok(None),
+            Ok(false) => Err(Error::NotThreadGroupLeader {
+                pid: id.pid(),
+                detail: OPEN_CONSEQUENCE.into(),
+                source: std::io::Error::from(errno),
+            }),
+            Err(e) => Err(Error::Io(crate::error::io_context("poll", e))),
         },
+        Proof::Lost => Ok(None),
+        Proof::Unknown(cause) => Err(open_error(
+            cause.errno().expect("a proof is unknown only for a failed pidfd call"),
+        )),
+    }
+}
+
+/// The error for a `pidfd_open` that failed with `errno` for a reason that says nothing about the
+/// target: a refusal is [`Error::Unsupported`], anything else [`Error::Io`].
+fn open_error(errno: rustix::io::Errno) -> Error {
+    match refusal_name(errno) {
+        Some(name) => pidfd_open_unsupported(OP_NAME, name),
+        None => Error::Io(crate::error::io_context("pidfd_open", std::io::Error::from(errno))),
     }
 }
 
@@ -227,3 +261,7 @@ mod open_tests;
 #[cfg(test)]
 #[path = "open_namespace_tests.rs"]
 mod open_namespace_tests;
+
+#[cfg(test)]
+#[path = "open_pidfs_tests.rs"]
+mod open_pidfs_tests;
