@@ -287,8 +287,8 @@ pub enum ChildFate {
     Killed,
     /// The child may still be running: cosca left it alone (an elevation front, which it never
     /// signals, a child it could not show to be its own, or one `kill_on_drop(false)` keeps) or
-    /// could not kill it. A child it could not end may come back to the caller: see the `unreaped`
-    /// field of [`Error::MayHaveStarted`].
+    /// could not kill it. Either may come back to the caller: see the `unreaped` field of
+    /// [`Error::MayHaveStarted`].
     ///
     /// `id` is its identity when the spawn had read one, and `None` when the failure came before
     /// that read (an identity that could not be read, or a macOS report that never came). It is an

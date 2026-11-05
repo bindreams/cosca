@@ -195,16 +195,16 @@ fn a_dying_front_launchd_holds_is_warned_of_by_the_wait() {
     );
 }
 
-/// A front whose place cannot be read is neither waited for nor called running: its fate is
-/// `Unknown` and it is left for an unreadable place.
+/// A front whose place cannot be read is not waited for. The look saw it running, so its fate is
+/// `Running`, and it is left for an unreadable place.
 ///
-/// Mutants: an unreadable place is taken for running, or for reached.
+/// Mutants: an unreadable place is taken for reached; the fate is `Unknown`.
 #[skuld::test]
-fn a_front_whose_place_cannot_be_read_is_not_called_running_nor_waited_for() {
+fn a_front_whose_place_cannot_be_read_is_left_running_and_not_waited_for() {
     let fake = fake().reaps([ReapAnswer::Running]);
     let _fire = fire_on_block(&fake);
     let torn = look(&fake, Some(&FakeReach::answering(Err(io::ErrorKind::Other))));
-    assert_outcome(&torn, ChildFate::Unknown, Went::PlaceUnreadable);
+    assert_outcome(&torn, ChildFate::Running { id: Some(id()) }, Went::PlaceUnreadable);
     assert_eq!(fake.looks(), 1);
     assert_eq!(crate::wait::block_probe::take(), [], "no wait");
 }
@@ -221,17 +221,17 @@ impl std::fmt::Display for Original {
 
 impl std::error::Error for Original {}
 
-/// A front whose leaf's subtree cannot be read is left for that, not for an unreadable place, with
-/// the very error it was given.
+/// A front whose leaf's subtree cannot be read is left running for that, not for an unreadable
+/// place, with the very error it was given.
 ///
 /// Mutants: an unreadable subtree is reported as an unreadable place; the error is rebuilt from its
-/// kind and text.
+/// kind and text; the fate is `Unknown`.
 #[skuld::test]
 fn a_front_whose_subtree_cannot_be_read_is_left_for_the_subtree_with_its_own_error() {
     let fake = fake().reaps([ReapAnswer::Running]);
     let unreadable = io::Error::new(io::ErrorKind::PermissionDenied, Original);
     let (torn, _) = look_logged(&fake, Some(id()), Err(unreadable), None);
-    assert_outcome(&torn, ChildFate::Unknown, Went::SubtreeUnreadable);
+    assert_outcome(&torn, ChildFate::Running { id: Some(id()) }, Went::SubtreeUnreadable);
     let Some(LookOutcome::SubtreeUnreadable(e)) = &torn.look else {
         panic!("{torn:?}");
     };
@@ -337,29 +337,48 @@ mod worded {
         );
     }
 
-    /// Mutant: `HandBack` rewords an outcome that hands nothing back.
+    /// Mutant: `Leave` words the front as handed back.
     #[skuld::test]
-    fn a_front_whose_place_cannot_be_read_is_worded() {
-        for disposition in BOTH {
-            assert_left(
-                disposition,
-                Ok(Some(&FakeReach::answering(Err(io::ErrorKind::Other)))),
-                &fake().reaps([ReapAnswer::Running]),
-                &format!("elevation front pid 4242 is left unreaped: where it is cannot be read ({}), so it is not known whether the cgroup kill ended it", cause()),
-            );
-        }
+    fn a_front_whose_place_cannot_be_read_is_worded_as_left_for_a_caller_that_leaves_it() {
+        assert_left(
+            Disposition::Leave,
+            Ok(Some(&FakeReach::answering(Err(io::ErrorKind::Other)))),
+            &fake().reaps([ReapAnswer::Running]),
+            &format!("elevation front pid 4242 is left unreaped: where it is cannot be read ({}), so it is not known whether the cgroup kill ended it", cause()),
+        );
     }
 
+    /// Mutant: `HandBack` words the front as left.
     #[skuld::test]
-    fn a_front_whose_subtree_cannot_be_read_is_worded() {
-        for disposition in BOTH {
-            assert_left(
-                disposition,
-                Err(io::Error::from(io::ErrorKind::Other)),
-                &fake().reaps([ReapAnswer::Running]),
-                &format!("elevation front pid 4242 is left unreaped: its leaf's subtree cannot be read ({}), so it is not known whether the cgroup kill ended it", cause()),
-            );
-        }
+    fn a_front_whose_place_cannot_be_read_is_worded_as_handed_back_for_a_caller_that_hands_it_back() {
+        assert_left(
+            Disposition::HandBack,
+            Ok(Some(&FakeReach::answering(Err(io::ErrorKind::Other)))),
+            &fake().reaps([ReapAnswer::Running]),
+            &format!("elevation front pid 4242 is running and unreaped: where it is cannot be read ({}), so it is not known whether the cgroup kill ended it; handed back to the caller in the error", cause()),
+        );
+    }
+
+    /// Mutant: `Leave` words the front as handed back.
+    #[skuld::test]
+    fn a_front_whose_subtree_cannot_be_read_is_worded_as_left_for_a_caller_that_leaves_it() {
+        assert_left(
+            Disposition::Leave,
+            Err(io::Error::from(io::ErrorKind::Other)),
+            &fake().reaps([ReapAnswer::Running]),
+            &format!("elevation front pid 4242 is left unreaped: its leaf's subtree cannot be read ({}), so it is not known whether the cgroup kill ended it", cause()),
+        );
+    }
+
+    /// Mutant: `HandBack` words the front as left.
+    #[skuld::test]
+    fn a_front_whose_subtree_cannot_be_read_is_worded_as_handed_back_for_a_caller_that_hands_it_back() {
+        assert_left(
+            Disposition::HandBack,
+            Err(io::Error::from(io::ErrorKind::Other)),
+            &fake().reaps([ReapAnswer::Running]),
+            &format!("elevation front pid 4242 is running and unreaped: its leaf's subtree cannot be read ({}), so it is not known whether the cgroup kill ended it; handed back to the caller in the error", cause()),
+        );
     }
 
     #[skuld::test]

@@ -202,10 +202,7 @@ fn a_running_front() -> (Child, std::io::PipeWriter) {
     )
 }
 
-/// What a teardown that hands a running elevation front back leaves: the front's `Running` fate and
-/// identity in the `Unreaped`, nothing sent to it (it is `Alive` and waited for by nobody yet), the
-/// one warn saying it is handed back, and then, once released, an exit of 0, which a kill would not
-/// give.
+/// Asserts a running front was handed back unkilled, with one warn saying so.
 #[cfg(unix)]
 #[track_caller]
 fn assert_front_handed_back(
@@ -231,12 +228,10 @@ fn assert_front_handed_back(
     assert!(handed_back.wait().success(), "a front is sent nothing");
 }
 
-/// An elevation front that is running is handed back, sent nothing.
-///
 /// Mutants: a front is left whatever the caller says; a front is killed; the warn says it is left.
 #[cfg(unix)]
 #[skuld::test]
-fn an_elevation_front_left_running_is_handed_back() {
+fn a_running_elevation_front_is_handed_back() {
     let (child, stdin) = a_running_front();
     let id = child.id();
     let mark = crate::log_capture::mark();
@@ -271,7 +266,8 @@ fn an_elevation_front_is_left_when_the_caller_leaves_it() {
 }
 
 /// A front that has exited when the teardown runs reads `Gate::Exited`, so it goes through the
-/// `Kill` arm and is reaped by the look; there is nothing to give back.
+/// `Kill` arm: the kill is a no-op for a zombie, and the wait after it reaps the front. No look
+/// runs, and there is nothing to give back.
 #[cfg(unix)]
 #[skuld::test]
 fn an_elevation_front_that_has_exited_is_reaped_not_handed_back() {
@@ -301,6 +297,7 @@ mod in_a_cgroup {
     use crate::child::Child;
     use crate::error::ChildFate;
     use crate::identity::Existence;
+    use crate::os_process::fake::ReapAnswer;
     use crate::test_child::tear_down_holding;
     use crate::test_groups::{cgroup, Group};
     use crate::{Command, ContainMode, Containment};
@@ -375,6 +372,58 @@ mod in_a_cgroup {
         let (fate, handed_back) = tear_down_holding(child, stdin, Disposition::HandBack);
 
         assert!(!Path::new(&leaf).exists(), "the leaf {leaf} was removed by the call");
+        assert_front_handed_back(id, mark, fate, handed_back);
+    }
+
+    /// A front whose place cannot be read is not known to have been reached by the leaf's kill: the
+    /// look saw it running (scripted, as on a kernel before 6.19, where the leaf's kill ends it
+    /// first), so it is handed back.
+    ///
+    /// Mutant: an unreadable place is `Unknown`, which hands nothing back.
+    #[skuld::test]
+    fn a_front_whose_place_cannot_be_read_is_handed_back(#[fixture(cgroup)] _group: &Group) {
+        crate::log_capture::install();
+        let (mut child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
+        let id = child.id();
+        child.proc.script_over(|fake| fake.reaps([ReapAnswer::Running]));
+        let mark = crate::log_capture::mark();
+
+        let (fate, handed_back) = {
+            let _unreadable = crate::containment::cgroup::fault::fail_pidfd_info();
+            tear_down_holding(child, stdin, Disposition::HandBack)
+        };
+
+        assert_eq!(fate, ChildFate::Running { id: Some(id) });
+        assert_eq!(handed_back.unreaped().id(), Some(id));
+        let warns = warns_since(mark);
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert!(
+            warns[0].starts_with(&format!(
+                "teardown after a failed run: elevation front pid {} is running and unreaped",
+                id.pid()
+            )) && warns[0].contains("cannot be read")
+                && warns[0].contains("handed back to the caller in the error"),
+            "{warns:?}"
+        );
+        handed_back.wait();
+    }
+
+    /// The same for a front whose leaf's subtree cannot be read.
+    ///
+    /// Mutant: an unreadable subtree is `Unknown`, which hands nothing back.
+    #[skuld::test]
+    fn a_front_whose_subtree_cannot_be_read_is_handed_back(#[fixture(cgroup)] _group: &Group) {
+        crate::log_capture::install();
+        let (child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
+        let id = child.id();
+        move_out_of_its_leaf(id.pid());
+        let mark = crate::log_capture::mark();
+
+        let (fate, handed_back) = {
+            let _unreadable = crate::containment::cgroup::fault::fail_subtree(libc::EIO);
+            tear_down_holding(child, stdin, Disposition::HandBack)
+        };
+
         assert_front_handed_back(id, mark, fate, handed_back);
     }
 

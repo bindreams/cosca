@@ -424,8 +424,7 @@ impl Child {
     /// is looked at through [`tear_down`](OwnedChild::tear_down), which waits for it only if its
     /// place says the kill reached it. The leaf's subtree is captured while the leaf exists, since
     /// it places the front once the leaf is gone. How the look went is worded by [`word_front`],
-    /// with `why`, under `caller`'s name, for a caller that does `disposition` with a front that
-    /// still runs.
+    /// with `why`, under `caller`'s name and `disposition`.
     #[cfg(unix)]
     fn tear_down_leaf_and_look_at_front(
         &mut self,
@@ -1059,7 +1058,7 @@ impl Child {
     ///
     /// Only a `kill_on_drop(false)` child is left whatever `disposition` says. The containment is
     /// torn down as `self` drops, before this returns. On Windows a refused root kill gets the
-    /// single look, as before.
+    /// single look.
     pub(crate) fn tear_down_or_hand_back(
         mut self,
         disposition: Disposition,
@@ -1217,8 +1216,9 @@ impl Child {
 /// What `caller` says of how its look at the elevation front `pid` went (`torn.look`): a debug line
 /// for a front that was reaped, or reaped by someone else, and a leftover for its one warn for any
 /// other. `why` is why the caller did not kill the front. An outcome with no look is returned as it
-/// is. A front still running is worded as handed back if `disposition` says the caller hands it
-/// back, and as left otherwise; no other outcome depends on it.
+/// is. A front seen running (left running, or with its place or its leaf's subtree unreadable) is
+/// worded as handed back if `disposition` says the caller hands it back, and as left otherwise; no
+/// other outcome depends on it.
 #[cfg(unix)]
 fn word_front(
     caller: TeardownCaller,
@@ -1232,6 +1232,16 @@ fn word_front(
     let label = caller.label();
     let Some(look) = torn.look.take() else {
         return torn;
+    };
+    // A front seen running whose reach cannot be read: it is not known whether the cgroup kill ended it.
+    let unreadable = |cause: String| match disposition {
+        Disposition::Leave => format!(
+            "elevation front pid {pid} is left unreaped: {cause}, so it is not known whether the cgroup kill ended it"
+        ),
+        Disposition::HandBack => format!(
+            "elevation front pid {pid} is running and unreaped: {cause}, so it is not known whether the cgroup kill \
+             ended it; handed back to the caller in the error"
+        ),
     };
     torn.left = match look {
         LookOutcome::Reaped(status) => {
@@ -1258,14 +1268,8 @@ fn word_front(
                  the elevated program; handed back to the caller in the error"
             ),
         }),
-        LookOutcome::PlaceUnreadable(e) => Some(format!(
-            "elevation front pid {pid} is left unreaped: where it is cannot be read ({e}), so it is not known \
-             whether the cgroup kill ended it"
-        )),
-        LookOutcome::SubtreeUnreadable(e) => Some(format!(
-            "elevation front pid {pid} is left unreaped: its leaf's subtree cannot be read ({e}), so it is not \
-             known whether the cgroup kill ended it"
-        )),
+        LookOutcome::PlaceUnreadable(e) => Some(unreadable(format!("where it is cannot be read ({e})"))),
+        LookOutcome::SubtreeUnreadable(e) => Some(unreadable(format!("its leaf's subtree cannot be read ({e})"))),
     };
     torn
 }
