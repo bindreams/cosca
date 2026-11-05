@@ -288,16 +288,17 @@ impl std::fmt::Display for SuspendedSpawn {
 /// Spawn `program` through `std::process` SUSPENDED, read the image the new process was created
 /// from, and terminate it before it runs.
 pub(crate) fn suspended_image(program: &str) -> Result<String, SuspendedSpawn> {
+    use crate::common::console_flags::Console;
     use std::os::windows::io::AsRawHandle;
-    use std::os::windows::process::CommandExt;
     use std::process::Stdio;
 
-    let mut child = crate::common::spawn_locked(
+    let mut child = crate::common::spawn_locked_with(
         std::process::Command::new(program)
-            .creation_flags(CREATE_SUSPENDED.0 | CREATE_NO_WINDOW.0)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null()),
+        CREATE_SUSPENDED.0,
+        Console::Hidden,
     )
     .map_err(SuspendedSpawn::Refused)?;
     let mut buf = vec![0u16; 32 * 1024];

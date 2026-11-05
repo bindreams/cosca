@@ -5,6 +5,7 @@ use crate::child::group_exact_tests::EndedAtTheSigterm;
 use crate::send_log::{assert_group_signalled_first_through_the_pidfd, Capture, GroupStep, Route};
 use crate::test_child::member::{releasable_root_with_a_member_contained, Member};
 use crate::test_child::reaped_elsewhere::{kill_own_child, reap_behind_status};
+use crate::test_child::Console;
 use crate::test_groups::{pidfd_group_signal, Group};
 
 /// The sync `root_with_a_member`'s twin, and the writer whose drop ends its root with status `0`;
@@ -19,7 +20,7 @@ pub(crate) fn releasable_root_with_a_member() -> (crate::tokio::Child, Member, s
 /// whose drop ends it with status `0`. Its group has no other member.
 pub(crate) fn releasable_group_root() -> (crate::tokio::Child, std::io::PipeWriter) {
     let (stdin, release) = crate::test_child::held_writer_stdin();
-    let mut cmd = crate::tokio::Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
     cmd.contain_with(crate::ContainMode::Session);

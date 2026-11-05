@@ -7,6 +7,7 @@
 use super::*;
 use crate::command::Command;
 use crate::error::Error;
+use crate::test_child::Console;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 
@@ -33,15 +34,15 @@ fn invalid_input_message(via: &str, r: Result<(), Error>) -> String {
 /// `executable()` when set and otherwise the argv[0] / command-line first token, so each arm needs
 /// its own leg.
 fn commands_with_token(token: &OsString) -> Vec<(&'static str, Command)> {
-    let mut by_argv = Command::new();
+    let mut by_argv = crate::test_child::command(Console::Hidden);
     by_argv.args([token.clone()]);
 
     // argv[0] is deliberately clean and DIFFERENT from `token`: with the probe in both fields a
     // passing leg would not say which one the gate read.
-    let mut by_executable = Command::new();
+    let mut by_executable = crate::test_child::command(Console::Hidden);
     by_executable.executable(token).args(["ordinary.exe"]);
 
-    let mut by_commandline = Command::new();
+    let mut by_commandline = crate::test_child::command(Console::Hidden);
     by_commandline.commandline(token.clone());
 
     vec![
@@ -116,7 +117,7 @@ fn a_nul_in_the_program_token_is_not_blamed_on_the_environment() {
 /// `args([..])` by hand — and `args(["a", "b\0c", "d"])` would name no element at all.
 #[skuld::test]
 fn a_nul_in_an_argument_is_blamed_on_its_index() {
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     c.args([OsString::from("a"), nul_between("b", "c"), OsString::from("d")]);
     let msg = invalid_input_message("argv", super::raw_program_and_line(&c).map(|_| ()));
     assert!(msg.contains("argument 1"), "must name the offending element, got {msg}");
@@ -139,7 +140,7 @@ fn a_nul_in_an_argument_is_blamed_on_its_index() {
 
 #[skuld::test]
 fn raw_program_and_line_rejects_an_empty_command_line_with_no_executable_set() {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.commandline("");
     let err = raw_program_and_line(&cmd).unwrap_err();
     assert!(matches!(err, Error::Io(_)), "{err:?}");
@@ -147,7 +148,7 @@ fn raw_program_and_line_rejects_an_empty_command_line_with_no_executable_set() {
 
 #[skuld::test]
 fn raw_program_and_line_rejects_a_whitespace_only_command_line_with_no_executable_set() {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.commandline("   ");
     let err = raw_program_and_line(&cmd).unwrap_err();
     assert!(matches!(err, Error::Io(_)), "{err:?}");
@@ -155,7 +156,7 @@ fn raw_program_and_line_rejects_a_whitespace_only_command_line_with_no_executabl
 
 #[skuld::test]
 fn raw_program_and_line_allows_an_empty_command_line_when_executable_is_set() {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     // executable() alone still supplies lpApplicationName, so an empty command line here is not
     // the NULL-lpApplicationName hazard the check above exists to close — matches the existing
     // `Empty` arm's own "executable() alone" case.
@@ -166,7 +167,7 @@ fn raw_program_and_line_allows_an_empty_command_line_when_executable_is_set() {
 
 #[skuld::test]
 fn raw_program_and_line_allows_a_non_empty_command_line_with_no_executable_set() {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.commandline("tool --flag");
     assert!(raw_program_and_line(&cmd).is_ok());
 }
@@ -210,7 +211,7 @@ const EXACT_CWD: &str = r"C:\cosca-process-cwd";
 fn target_completes_an_exact_program_without_searching_it() {
     // The contract in one assertion: a BARE name, which `executable()` would look up on PATH and
     // append `.exe` to, is only completed against this process's cwd, as the loader would.
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.raw_executable("tool").args(["tool"]);
     let image = image_on(&cmd).expect("an exact program is never searched, so it cannot miss");
     assert_eq!(image.as_deref(), Some(Path::new(r"C:\cosca-process-cwd\tool")));
@@ -236,7 +237,7 @@ fn fixture_load_exact_probe() {
     let Some(current_dir) = std::env::var_os(FIXTURE_LOAD_EXACT_PROBE_ENV) else {
         return;
     };
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     // A filter that matches nothing, so the probe exits 0 without running a test.
     c.raw_executable(PROBE)
         .args([PROBE, "--exact", "__cosca_no_such_test__"])
@@ -257,7 +258,7 @@ fn fixture_load_exact_probe() {
 
 /// [`fixture_load_exact_probe`]'s exit code when run with `process_cwd` as its cwd.
 fn load_exact_probe(process_cwd: &Path, current_dir: &Path) -> Option<i32> {
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     c.executable(std::env::current_exe().expect("current_exe"))
         .args(crate::test_child::fixture_argv(FIXTURE_LOAD_EXACT_PROBE_TEST))
         .env(FIXTURE_LOAD_EXACT_PROBE_ENV, current_dir)
@@ -295,7 +296,7 @@ fn target_resolves_a_search_program_to_an_absolute_path() {
     // The other half, so the test pair proves a DIFFERENCE rather than one arm in isolation:
     // the same bare name through `executable()` is resolved and absolute. `cmd` is chosen because
     // it lives in the System32 directory the bare-name search visits on any Windows host.
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.executable("cmd").args(["cmd"]);
     let image = image(&cmd).expect("cmd resolves on any Windows host").unwrap();
     assert!(
@@ -309,7 +310,7 @@ fn target_resolves_a_search_program_to_an_absolute_path() {
 fn target_rejects_an_empty_exact_program() {
     // An empty `lpApplicationName` is a pointer to a lone NUL, not the NULL pointer, and whether
     // CreateProcessW treats the two alike is undocumented. Fail closed rather than find out.
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.raw_executable("").args(["tool"]);
     match image(&cmd) {
         Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput => {}
@@ -322,9 +323,9 @@ fn target_rejects_an_empty_exact_program() {
 #[skuld::test]
 fn a_spawn_of_a_program_that_names_no_file_is_invalid_input() {
     for n in [r"C:\t\dir\", ".", "..", "C:", r"x\.."] {
-        let mut exact = Command::new();
+        let mut exact = crate::test_child::command(Console::Hidden);
         exact.raw_executable(n).args(["tool"]);
-        let mut search = Command::new();
+        let mut search = crate::test_child::command(Console::Hidden);
         search.executable(n).args(["tool"]);
         for (via, mut c) in [("raw_executable", exact), ("executable", search)] {
             match c.spawn() {
@@ -346,7 +347,7 @@ fn target_rejects_an_exact_program_that_names_no_file() {
     // sink. `C:\t\...` and `C:\t\. ` (one trailing space) name no file only after Win32
     // normalisation, so they pin the post-check.
     for n in [r"C:\t\dir\", r"C:\t\.", ".", "..", "C:", r"C:\t\...", r"C:\t\. "] {
-        let mut cmd = Command::new();
+        let mut cmd = crate::test_child::command(Console::Hidden);
         cmd.raw_executable(n).args(["tool"]);
         match image(&cmd) {
             Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput => {}
@@ -359,7 +360,7 @@ fn target_rejects_an_exact_program_that_names_no_file() {
 fn target_completes_an_exact_program_as_the_loader_does() {
     // Completed by `GetFullPathNameW`'s rules, which the loader applies to `lpApplicationName`:
     // the trailing dot goes, as it would there.
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.raw_executable(r"t\tool.").args(["tool"]);
     assert_eq!(
         image_on(&cmd).unwrap().as_deref(),
@@ -374,7 +375,7 @@ fn target_completes_an_exact_program_as_the_loader_does() {
 fn the_token_gate_refuses_an_exact_batch_reached_through_win32_normalisation() {
     // Trailing dot; one trailing space; a file named `.bat`, which has no extension to `Path`.
     for n in ["setup.bat.", "setup.bat ", r"C:\t\.bat"] {
-        let mut cmd = Command::new();
+        let mut cmd = crate::test_child::command(Console::Hidden);
         cmd.raw_executable(n).args(["tool"]);
         match reject_batch_program(&cmd) {
             Err(Error::Unsupported { platform, detail, .. }) => {
@@ -390,7 +391,7 @@ fn the_token_gate_refuses_an_exact_batch_reached_through_win32_normalisation() {
 #[skuld::test]
 fn target_completes_an_exact_program_that_is_not_a_batch_file() {
     for n in ["setup.exe", "setup.bat.exe"] {
-        let mut cmd = Command::new();
+        let mut cmd = crate::test_child::command(Console::Hidden);
         cmd.raw_executable(n).args(["tool"]);
         assert_eq!(image_on(&cmd).unwrap(), Some(Path::new(EXACT_CWD).join(n)));
     }
@@ -400,7 +401,7 @@ fn target_completes_an_exact_program_that_is_not_a_batch_file() {
 fn target_falls_back_to_the_program_token_when_no_executable_is_set() {
     // The fd>=3 route: neither setter was called, so `lpApplicationName` would be NULL without
     // this fallback — and a NULL makes CreateProcessW search, including the calling process's cwd.
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(["cmd", "/C", "exit 0"]);
     let image = image(&cmd).expect("argv[0] resolves").unwrap();
     assert!(image.is_absolute(), "the fallback must resolve too, got {image:?}");
@@ -412,7 +413,7 @@ fn target_falls_back_to_the_program_token_when_no_executable_is_set() {
 /// `fd >= 3` arm of `routes_to_raw_backend`. On this route `program_token` alone picks the string
 /// `reject_batch_program` judges, so a wrong pick skips the gate entirely.
 fn high_fd_command() -> Command {
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     c.fd(3, crate::stdio::Stdio::pipe_out()).expect("fd 3");
     c
 }
@@ -491,7 +492,7 @@ fn target_pins_the_resolved_directory_as_the_childs() {
         } else {
             r"sub\tool.exe"
         };
-        let mut cmd = Command::new();
+        let mut cmd = crate::test_child::command(Console::Hidden);
         cmd.executable(token).args([token]);
         if let Some(c) = cmd_cwd {
             cmd.current_dir(c);
@@ -512,7 +513,7 @@ fn target_pins_the_resolved_directory_as_the_childs() {
 /// A share-less UNC `current_dir` is refused with `InvalidInput`, never a panic in the resolver.
 #[skuld::test]
 fn target_refuses_a_share_less_unc_current_dir() {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.executable(r".\tool.exe")
         .args([r".\tool.exe"])
         .current_dir(r"\\server");
@@ -527,7 +528,7 @@ fn target_refuses_a_share_less_unc_current_dir() {
 /// does; `current_dir` is completed against the same one read and is the child's directory.
 #[skuld::test]
 fn target_completes_an_exact_program_and_its_current_dir_from_one_read() {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.raw_executable("tool.exe").args(["tool.exe"]).current_dir("sub");
     let reads = std::cell::Cell::new(0);
     let got = target_with(&cmd, &spawn_env(&cmd).unwrap(), || {
@@ -543,9 +544,9 @@ fn target_completes_an_exact_program_and_its_current_dir_from_one_read() {
 /// `current_dir("")` gets one verdict on both arms: it names no directory.
 #[skuld::test]
 fn an_empty_current_dir_is_refused_on_both_arms() {
-    let mut search = Command::new();
+    let mut search = crate::test_child::command(Console::Hidden);
     search.executable("tool").args(["tool"]).current_dir("");
-    let mut exact = Command::new();
+    let mut exact = crate::test_child::command(Console::Hidden);
     exact.raw_executable(r"C:\t\tool.exe").args(["tool"]).current_dir("");
     for (arm, cmd) in [("Search", search), ("Exact", exact)] {
         match target_with(&cmd, &spawn_env(&cmd).unwrap(), || {
@@ -562,7 +563,7 @@ fn an_empty_current_dir_is_refused_on_both_arms() {
 /// program: `lpCurrentDirectory` is never left for `CreateProcessW` to read again.
 #[skuld::test]
 fn target_pins_the_process_cwd_for_every_program() {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.executable("cmd").args(["cmd"]);
     let reads = std::cell::Cell::new(0);
     let got = target_with(&cmd, &spawn_env(&cmd).unwrap(), || {
@@ -587,7 +588,7 @@ fn raw_blocker() -> (Command, crate::child::spawn::fault::TeardownBlocker) {
         stdout,
         guard,
     } = crate::child::spawn::fault::teardown_blocker_parts();
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     c.executable(&argv[0]).args(argv);
     c.stdin(stdin).expect("stdin");
     c.stdout(stdout.expect("a Windows blocker nulls its stdout"))
@@ -654,7 +655,7 @@ fn a_raw_spawn_whose_create_process_fails_did_not_start() {
     let dir = tempfile::tempdir().expect("tempdir");
     let image = dir.path().join("not-a-program.exe");
     std::fs::write(&image, b"not a PE image").expect("write the image");
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     c.executable(&image).args(["not-a-program"]);
     let err = crate::child::spawn::failure::expect_not_started(c.spawn().expect_err("a non-PE image fails"));
     assert!(matches!(err, Error::Io(ref e) if e.raw_os_error().is_some()), "{err:?}");
@@ -674,19 +675,19 @@ fn raw_refusals_before_create_process_did_not_start() {
     let dir = tempfile::tempdir().expect("tempdir");
     let bat = dir.path().join("x.bat");
     std::fs::write(&bat, b"@echo off\n").expect("write the batch file");
-    let mut batch = Command::new();
+    let mut batch = crate::test_child::command(Console::Hidden);
     batch.executable(&bat).args(["x.bat"]);
-    let mut cwd_nul = Command::new();
+    let mut cwd_nul = crate::test_child::command(Console::Hidden);
     cwd_nul
         .executable("findstr")
         .args(["findstr", "x"])
         .current_dir(std::path::PathBuf::from("a\u{0}b"));
-    let mut line_nul = Command::new();
+    let mut line_nul = crate::test_child::command(Console::Hidden);
     line_nul.executable("findstr").args(["findstr", "a\u{0}b"]);
-    let mut oversized = Command::new();
+    let mut oversized = crate::test_child::command(Console::Hidden);
     oversized.executable("findstr").args(["findstr", "x"]);
     oversized.fd(70_000, Stdio::null()).expect("fd 70000");
-    let mut inherit_fd3 = Command::new();
+    let mut inherit_fd3 = crate::test_child::command(Console::Hidden);
     inherit_fd3.executable("findstr").args(["findstr", "x"]);
     inherit_fd3.fd(3, Stdio::inherit()).expect("fd 3");
     for (what, mut cmd, variant) in [

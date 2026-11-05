@@ -21,6 +21,8 @@ pub fn run(report: &str, env_dump: &str, own_dump: &str, dir: &str) {
         env_dump.as_ref(),
     ])
     .current_dir(dir)
+    // The elevated image gets no console from this process (runas starts it apart), so hide it here.
+    .no_window()
     .elevate();
     let status = cmd.status().expect("the elevated image");
     std::process::exit(status.code().expect("a Windows exit code"));

@@ -5,11 +5,12 @@
 
 use crate::graceful_hooks::{at, HookPoint};
 use crate::send_log::{Capture, GroupStep, Route};
+use crate::test_child::Console;
 
 /// A zombie root leading its own group (its fd marker suppressed on macOS): unreaped at the look.
 pub(crate) fn zombie_group_root() -> crate::Child {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
     cmd.contain_with(crate::ContainMode::Session);

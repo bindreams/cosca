@@ -1,5 +1,7 @@
 use std::os::fd::{AsRawFd, OwnedFd};
 
+use crate::test_child::Console;
+
 use super::{
     adopted_id, await_report, failed_spawn_error, read_report, register, seams, set_nonblocking, Report, Unadoptable,
 };
@@ -251,7 +253,7 @@ fn a_child_killed_before_its_report_is_missing_on_ok() {
 fn an_unwritten_report_then_a_killed_child_is_answered_died_before_exec() {
     let _killed = seams::force_child_killed_before_report();
     let _unwritten = seams::find_the_report_unwritten();
-    let mut cmd = crate::command::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(["/usr/bin/true"]);
     let error = cmd
         .spawn()

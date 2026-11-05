@@ -2,7 +2,8 @@
 //! however many steps (the unsettled root, the refused kill, the failed reap) each had to say. Each
 //! test forces the looks it counts on and asserts they were all made.
 
-use crate::{Command, ContainMode};
+use crate::test_child::Console;
+use crate::ContainMode;
 
 /// Every record at `warn` or above that this thread logged since `mark`.
 fn warns_since(mark: usize) -> Vec<String> {
@@ -26,7 +27,7 @@ fn refusal() -> String {
 
 fn contained_blocker(mode: ContainMode) -> (crate::Child, std::io::PipeWriter) {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
     cmd.contain_with(mode);
@@ -37,7 +38,7 @@ fn contained_blocker(mode: ContainMode) -> (crate::Child, std::io::PipeWriter) {
 /// (a macOS fd marker's sweep kills the root, which holds the marker).
 fn bare_blocker() -> (crate::Child, std::io::PipeWriter) {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
     (cmd.spawn().expect("spawn"), writer)
@@ -406,7 +407,7 @@ fn child_in_a_leaf_whose_kill_fails() -> (
         graceful: crate::graceful::GracefulMechanism::Process,
     });
     let (stdin, writer) = crate::test_child::held_writer_stdin();
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
     let child = crate::child::spawn::spawn_uncommitted(&mut cmd).expect("spawn");

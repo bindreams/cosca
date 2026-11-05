@@ -4,12 +4,12 @@
 
 use crate::test_child::pid_reuse::{in_fresh_pid_ns, reap_behind_and_reuse, reuser_id, sigusr1_and_wait};
 use crate::test_child::reaped_elsewhere::{assert_one_reaped_elsewhere_warn, REAPED_ELSEWHERE};
+use crate::test_child::Console;
 use crate::test_groups::{namespaces, pidfd_group_signal};
-use crate::Command;
 
 fn spawn_blocker() -> (crate::Child, std::io::PipeWriter) {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
     (cmd.spawn().expect("spawn"), writer)
@@ -70,7 +70,7 @@ fn treewalk_root_is_the_verified_identity_body() {
     use crate::child::spawn::fault;
 
     let (stdin, writer) = crate::test_child::held_writer_stdin();
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
     cmd.contain_with(crate::ContainMode::TreeWalk);
@@ -119,7 +119,7 @@ in_fresh_pid_ns!(
 /// A blocker in its own session (`Attached::ProcessGroup`), which exits once `writer` is dropped.
 fn spawn_group_blocker() -> (crate::Child, std::io::PipeWriter) {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
     cmd.contain_with(crate::ContainMode::Session);
