@@ -1,9 +1,5 @@
 //! Linux: the sync spawn's teardown of the child it holds once the handshake has given it a pidfd,
 //! when the identity read or the attach that follows fails.
-//!
-//! The child is an [`OwnedChild`] from the moment the handshake succeeds, so the teardown is
-//! [`OwnedChild::tear_down`], and the caller's rule for a child that still runs applies: it is handed
-//! back in the error ([`Disposition::HandBack`]).
 
 use super::{Diagnosis, FrontFate};
 use crate::child::owned::teardown::{Disposition, Reach, TeardownKind};

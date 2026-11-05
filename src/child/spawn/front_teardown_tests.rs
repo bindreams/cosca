@@ -67,7 +67,7 @@ fn leaf_of(child: &crate::Child) -> &crate::containment::cgroup::CgroupLeaf {
     }
 }
 
-/// The front rule tokio's pidfd teardown still runs, over `front`.
+/// The front rule of tokio's pidfd teardown, over `front`.
 fn leave_front(
     front: NotYetExited,
     id: Option<ProcessId>,

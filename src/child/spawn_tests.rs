@@ -3,6 +3,9 @@
 //! Windows backend router, and that a refused spawn refuses before it touches our handle
 //! inheritance. In the library (not `tests/`) because the seam is `pub(crate)`/`#[cfg(test)]` and
 //! only reachable from within the crate. The batch gate's tests are in `spawn/batch_gate_tests.rs`.
+//!
+//! The Windows-only tests here cover teardown steps that Linux's sync spawn takes through
+//! `OwnedChild::tear_down`, whose rows are in `owned_tests` and `hand_back_tests`.
 
 use super::failure::{expect_may_have_started_with, expect_not_started};
 use super::fault;
@@ -141,9 +144,6 @@ fn attach_failure_reaps_the_spawned_child() {
 /// A `kill` that fails for a child that has already exited is not a failure: the teardown goes on
 /// to reap it, as it does after any successful kill. The child here exits by itself (its stdin is
 /// already closed), so nothing but the reap can account for it in the recorder.
-///
-/// Windows only: the Linux teardown sends the kill through a pidfd, which a zombie takes, so no
-/// kill of an exited child fails there.
 #[cfg(windows)]
 #[skuld::test]
 fn a_kill_error_for_an_already_exited_child_still_reaps_it() {
@@ -181,9 +181,6 @@ fn a_kill_error_for_an_already_exited_child_still_reaps_it() {
 ///
 /// Each leg's forced error carries its own marker, and records are scanned from a mark taken just
 /// before, so a concurrent test's warning cannot satisfy this one.
-///
-/// Windows only: the Linux teardown is `OwnedChild::tear_down`, whose failed reap comes back for the
-/// caller's one warn (`a_failed_teardown_reap_is_returned_and_not_logged`).
 #[cfg(windows)]
 #[skuld::test]
 fn a_failed_teardown_reap_is_logged_on_both_arms() {
@@ -199,9 +196,6 @@ fn a_failed_teardown_reap_is_logged_on_both_arms() {
 /// spawn for as long as it runs. The reap fault is armed as a tripwire — left unconsumed, it proves
 /// the reap step was never reached. Any failure but EPERM is also `debug_assert`ed; EPERM is
 /// reachable without a bug.
-///
-/// Windows only: the Linux teardown hands back a child whose kill is refused
-/// (`a_child_whose_teardown_kill_is_refused_is_handed_back`, in the setuid group).
 #[cfg(windows)]
 #[skuld::test]
 fn a_failed_teardown_kill_is_logged_and_skips_the_blocking_reap_on_both_arms() {
@@ -254,9 +248,6 @@ fn a_failed_teardown_kill_is_logged_and_skips_the_blocking_reap_on_both_arms() {
 /// A child the teardown could not kill is not left a zombie: it is handed to a detached thread
 /// that reaps it once it exits on its own. Here it is blocked reading stdin, and exits when the
 /// failed spawn drops the pipe's parent end; the thread signals the reap on a channel.
-///
-/// Windows only: Linux starts no such thread; it hands the child back
-/// (`a_child_whose_teardown_kill_is_refused_is_handed_back`).
 #[cfg(windows)]
 #[skuld::test]
 fn a_child_the_teardown_cannot_kill_is_reaped_once_it_exits() {
@@ -291,9 +282,6 @@ fn a_child_the_teardown_cannot_kill_is_reaped_once_it_exits() {
 /// running, and the error says so, naming it; it is reaped in the background once it exits.
 ///
 /// Mutant: a refused kill reports the child reaped.
-///
-/// Windows only: on Linux the child is handed back
-/// (`a_child_whose_teardown_kill_is_refused_is_handed_back`).
 #[cfg(windows)]
 #[skuld::test]
 fn a_child_whose_teardown_kill_is_refused_may_still_be_running() {
@@ -367,9 +355,6 @@ fn a_failed_teardown_step_is_logged_on_both_arms(
 /// keeps its credentials, so `kill(2)` refuses it with EPERM — is reaped, not left a zombie: an
 /// exited child is reaped at once, and one not yet exited is handed to the background reaper.
 /// Either way it ends reaped.
-///
-/// Windows only: the Linux teardown looks once after a refused kill and reaps what has exited
-/// (`teardown_after_a_refused_kill_looks_once_and_never_waits`).
 #[cfg(windows)]
 #[skuld::test]
 fn a_child_whose_kill_failed_after_it_exited_is_reaped() {

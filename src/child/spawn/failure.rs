@@ -251,8 +251,6 @@ impl SpawnFailure {
 #[track_caller]
 pub(crate) fn expect_may_have_started_with(error: Error) -> (Error, ChildFate) {
     let (cause, fate, unreaped) = error_parts(error);
-    // Dropping a handed-back child would wait for it; a test that gets one takes it apart with
-    // `test_child::expect_handed_back`.
     if let Some(unreaped) = unreaped {
         unreaped.leak();
         panic!("the spawn handed a child back ({fate:?}): {cause:?}");
