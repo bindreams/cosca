@@ -318,7 +318,7 @@ fn macos_sync_spawn_of_a_late_front_leaves_it_running_and_says_so() {
         &["elevation front", "left unreaped", ZOMBIE],
         &["was sent SIGKILL", SAID_REFUSED_RUNNING, SAID_NOT_SENT],
     );
-    assert!(err.to_string().contains("it is left unreaped"), "{err}");
+    assert!(err.to_string().contains("; left unreaped"), "{err}");
     // The writer stays open until the reap: closing it would let the child exit by itself.
     end_unsignalled_and_reap(pid);
     drop(writer);

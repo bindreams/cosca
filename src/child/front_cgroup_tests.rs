@@ -347,17 +347,36 @@ fn cgroup_drop_of_a_front_kills_it_through_the_cgroup_and_reaps_it(#[fixture(cgr
     crate::log_capture::install();
     let teardowns = record_root_teardowns();
     let (child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
-    let pidfd = pidfd_of(child.id().pid());
+    let pid = child.id().pid();
+    let pidfd = pidfd_of(pid);
     // Released as the kill returns; see [`KillRelease`].
     let release = release_after_cgroup_kill(stdin);
-    release.observe(child.id().pid());
+    release.observe(pid);
     let mark = crate::log_capture::mark();
     drop(child);
     release.assert_killed();
     assert_eq!(teardowns.count(), 0, "the drop sends the front no kill of its own");
     assert!(reaped(&pidfd), "the drop reaps the front its cgroup kill ended");
-    let warns = crate::log_capture::records_since_on_current_thread(mark, "Child::drop");
-    assert_eq!(warns, [], "a front the cgroup killed is not left behind");
+    let said = crate::log_capture::records_since_on_current_thread(mark, "Child::drop");
+    assert_said_reaped_at_debug(&said, pid, "a front the cgroup killed is not left behind");
+}
+
+/// A drop's records about the front `pid` it reaped with its status: none above `debug`, and the
+/// reap itself said once, at `debug`, led by the drop's name ("after the kill" only if the look found
+/// the front still running and waited for it, which the first look does not always find).
+#[track_caller]
+fn assert_said_reaped_at_debug(said: &[(log::Level, String)], pid: u32, what: &str) {
+    let reaped = format!("Child::drop: elevation front pid {pid}: reaped it");
+    let reaped_after_the_kill = format!("{reaped} after the kill");
+    assert!(
+        said.iter().all(|(level, _)| *level >= log::Level::Debug),
+        "{what}: a record above debug: {said:?}"
+    );
+    let reaps: Vec<_> = said
+        .iter()
+        .filter(|(_, text)| *text == reaped || *text == reaped_after_the_kill)
+        .collect();
+    assert_eq!(reaps.len(), 1, "{what}: the reap is said once: {said:?}");
 }
 
 /// A failed cgroup kill may leave the program running, so the front is not signalled either.
@@ -527,7 +546,7 @@ fn assert_drop_kills_the_leaf_and_reaps_the_front(fault: impl FnOnce() -> Box<dy
     );
     let said =
         crate::log_capture::records_since_on_current_thread(mark, &format!("Child::drop: elevation front pid {pid}"));
-    assert_eq!(said, [], "a front reaped with its status needs no word");
+    assert_said_reaped_at_debug(&said, pid, "a front reaped with its status needs no warn");
     assert!(reaped(&front), "the drop reaps the front its leaf's kill ended");
     assert!(steps.iter().any(|s| s == "kill"), "{steps:?}");
     wait_until_exited(&member);
@@ -598,7 +617,7 @@ fn cgroup_a_drop_places_a_front_that_reads_as_running_and_reaps_it(#[fixture(cgr
     release.assert_killed();
     let said =
         crate::log_capture::records_since_on_current_thread(mark, &format!("Child::drop: elevation front pid {pid}"));
-    assert_eq!(said, [], "a front reaped with its status needs no word");
+    assert_said_reaped_at_debug(&said, pid, "a front reaped with its status needs no warn");
     assert!(reaped(&front), "the drop reaps the front");
     wait_until_exited(&member);
     let mut rest = Vec::new();
@@ -1062,37 +1081,22 @@ pub(crate) fn failed_held_front_spawns(
     })
 }
 
-/// Each failure notes its front was killed by its leaf and reaped. With `reaps` (the async spawn's
-/// wait, which records its reap), the teardown's own wait reaped it dead of `SIGKILL`. Without (the
-/// sync spawn's look, which records none), the front is gone from the test's reach: the teardown
-/// reaped it; `failed_held_front_spawns` has already seen the leaf's kill end it.
+/// Each failure notes its front was killed by its leaf and reaped. The front is gone from the test's
+/// reach: the teardown's look or wait reaped it, and records no reap of its own;
+/// `failed_held_front_spawns` has already seen the leaf's kill end it. Which of the two reaps it is the
+/// kernel's timing; `owned_tests::teardown_look::a_running_front_the_kill_reached_is_waited_for_and_reaped`
+/// pins the wait.
 #[track_caller]
-pub(crate) fn assert_killed_by_the_leaf(
-    failures: &[HeldFailure; 2],
-    reaps: Option<&crate::child::spawn::fault::TeardownReaps>,
-) {
+pub(crate) fn assert_killed_by_the_leaf(failures: &[HeldFailure; 2]) {
     for HeldFailure { err, pid, .. } in failures {
         let text = err.to_string();
         assert_eq!(err.fate(), Some(crate::error::ChildFate::Reaped), "{text}");
         assert!(text.contains(&format!("pid {pid} is what sudo left")), "{text}");
         assert!(text.contains("its cgroup's kill ended it, and it was reaped"), "{text}");
-        let Some(reaps) = reaps else {
-            assert_eq!(
-                crate::child::front_kill_tests::reap(*pid),
-                None,
-                "the teardown reaped front {pid}"
-            );
-            continue;
-        };
-        let recorded = reaps.recorded();
-        let status = recorded
-            .iter()
-            .find_map(|(reaped, status)| (reaped == pid).then_some(*status))
-            .unwrap_or_else(|| panic!("the teardown waited for front {pid}: {recorded:?}"));
         assert_eq!(
-            status.signal(),
-            Some(libc::SIGKILL),
-            "front {pid} ended by its leaf's kill"
+            crate::child::front_kill_tests::reap(*pid),
+            None,
+            "the teardown reaped front {pid}"
         );
     }
 }
@@ -1118,12 +1122,12 @@ pub(crate) fn assert_left_running(kill: LeafKill, failures: [HeldFailure; 2], ha
         );
         assert!(text.contains(&format!("pid {pid} is what sudo left")), "{text}");
         let left = if handed_back {
-            "handed back to the caller"
+            "handed back to the caller in the error"
         } else {
             "left unreaped"
         };
         assert!(
-            text.contains(&format!("the elevated program may be running; it is {left}")),
+            text.contains(&format!("the elevated program may be running; {left}")),
             "{text}"
         );
         assert!(
@@ -1160,7 +1164,7 @@ pub(crate) fn assert_left_running(kill: LeafKill, failures: [HeldFailure; 2], ha
 #[skuld::test]
 fn cgroup_a_failed_spawn_kills_a_contained_front_and_reaps_it(#[fixture(cgroup)] _group: &Group) {
     let failures = failed_held_front_spawns(LeafKill::Lands, |cmd| cmd.spawn().map(drop));
-    assert_killed_by_the_leaf(&failures, None);
+    assert_killed_by_the_leaf(&failures);
 }
 
 /// A failed spawn's front, its place read through `/proc` alone, is killed by its leaf and reaped:
@@ -1169,7 +1173,7 @@ fn cgroup_a_failed_spawn_kills_a_contained_front_and_reaps_it(#[fixture(cgroup)]
 #[skuld::test]
 fn cgroup_a_failed_spawn_kills_a_front_read_through_proc_and_reaps_it(#[fixture(cgroup)] _group: &Group) {
     let failures = failed_held_front_spawns(LeafKill::LandsReadThroughProc, |cmd| cmd.spawn().map(drop));
-    assert_killed_by_the_leaf(&failures, None);
+    assert_killed_by_the_leaf(&failures);
 }
 
 /// A failed spawn whose front was moved into a live cgroup named as `/proc` prints the removed leaf
@@ -1442,7 +1446,7 @@ fn cgroup_a_front_nested_under_its_leaf_is_killed_under_hidepid(#[fixture(cgroup
 #[skuld::test]
 fn cgroup_a_failed_spawn_kills_a_front_nested_under_its_leaf_under_hidepid(#[fixture(cgroup)] _group: &Group) {
     let failures = failed_held_front_spawns(LeafKill::LandsNestedHidden, |cmd| cmd.spawn().map(drop));
-    assert_killed_by_the_leaf(&failures, None);
+    assert_killed_by_the_leaf(&failures);
 }
 
 /// A front in a cgroup under its leaf behind a mount, which the walk cannot list: its place is
@@ -1751,10 +1755,10 @@ pub(crate) fn assert_left_unsignalled<R>(
     let left = if handed_back.is_none() {
         "left unreaped"
     } else {
-        "handed back to the caller"
+        "handed back to the caller in the error"
     };
     assert!(
-        text.contains(&format!("the elevated program may be running; it is {left}")),
+        text.contains(&format!("the elevated program may be running; {left}")),
         "{text}"
     );
     if handed_back.is_none() {

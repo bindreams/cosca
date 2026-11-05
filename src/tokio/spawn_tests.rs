@@ -7,7 +7,7 @@ use crate::child::spawn::fault;
 use crate::error::{ChildFate, Error};
 use crate::test_child::Console;
 #[cfg(target_os = "linux")]
-use crate::test_groups::{cgroup, Group};
+use crate::test_groups::{cgroup, setuid, Group};
 use crate::tokio::Command;
 
 /// [`blocker`] for a kill-then-blocking-reap test; see [`fault::teardown_blocker_stdin`].
@@ -171,7 +171,7 @@ async fn cgroup_a_post_fork_tokio_failure_leaves_no_live_child_in_a_leaked_leaf(
 /// kind is. The child is left alive, blocked on stdin, and exits when the failed spawn drops the
 /// pipe's parent end. macOS: tokio's own `Child` drop hands it to the runtime's orphan reaper,
 /// which the test drives until the child is reaped. Linux: tokio's `Child` is forgotten and the
-/// child goes to the pidfd teardown (the seam refuses only the first kill), so it is reaped through
+/// child is torn down again through its pidfd (the seam refuses only the first kill), so it is reaped through
 /// its pidfd and never released to tokio's by-pid reap.
 #[skuld::test]
 fn a_failed_teardown_kill_in_the_async_spawn_asserts_all_but_eperm() {
@@ -245,6 +245,127 @@ fn a_failed_teardown_kill_in_the_async_spawn_asserts_all_but_eperm() {
         drive_until_reaped(&runtime, &captured);
         fault::assert_child_reaped(captured);
     }
+}
+
+/// A failed async spawn whose child refuses the kill, through its handle and again through its pidfd
+/// (a setuid-root helper refuses every kill of this process), leaves it running and says so in the one
+/// warn, which names the kill that was refused. Nothing reaps it behind the caller's back: the child
+/// is still this process's unreaped child until the test reaps it.
+///
+/// The helper is fully root once it has written its ready byte, which is read before the identity
+/// check.
+///
+/// Mutants: a refused kill reports the child reaped; the second teardown starts a thread that reaps
+/// it; the warn says it was torn down.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn a_child_whose_teardown_kill_is_refused_twice_stays_running_and_unreaped(#[fixture(setuid)] _group: &Group) {
+    use crate::child::front_kill_tests::reap;
+
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let (mut cmd, writer, _root) = setuid_blocker_ready_before_identity();
+    fault::set_force_attach_failure(true);
+    let mark = crate::log_capture::mark();
+
+    let err = cmd.spawn().err();
+
+    fault::set_force_attach_failure(false);
+    let Some(crate::identity::Resolved::Found(id)) = fault::take_captured() else {
+        panic!("the seam captured the child's identity");
+    };
+    let (_, fate) = expect_may_have_started_with(err.expect("the forced attach failure fails the spawn"));
+    assert_eq!(fate, ChildFate::Running { id: Some(id) });
+    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "")
+        .into_iter()
+        .filter(|(level, _)| *level <= log::Level::Warn)
+        .collect();
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(warns[0].1.contains("could not be terminated"), "{warns:?}");
+    assert!(warns[0].1.contains("leaving it running"), "{warns:?}");
+    assert!(!warns[0].1.contains("torn down"), "{warns:?}");
+    // The helper exits once its stdin closes; the test, not a thread, reaps it.
+    drop(writer);
+    let status = reap(id.pid()).expect("the child is still unreaped");
+    assert!(status.success(), "{status:?}");
+}
+
+/// A setuid-root helper that blocks on its stdin, ready to be spawned, the write end of its stdin,
+/// and the hook that waits for the helper's ready byte before the identity check (it is fully root
+/// once it has written it), armed for the spawn's `BeforeIdentity` point.
+#[cfg(target_os = "linux")]
+fn setuid_blocker_ready_before_identity() -> (Command, std::io::PipeWriter, crate::oneshot_hook::Armed) {
+    use std::io::Read as _;
+
+    use crate::child::spawn::fault::SpawnPoint;
+
+    let (stdin, writer) = crate::test_child::held_writer_stdin();
+    let (mut ready, ready_end) = std::io::pipe().expect("pipe");
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
+    cmd.executable(crate::test_privilege::setuid::setuid_helper()).args([
+        "cosca_testbin",
+        "setuid-stdin-block",
+        "root",
+    ]);
+    cmd.stdin(stdin).expect("set stdin");
+    cmd.stdout(crate::Stdio::from_file(std::fs::File::from(
+        std::os::fd::OwnedFd::from(ready_end),
+    )))
+    .expect("set stdout");
+    cmd.stderr(crate::Stdio::null()).expect("null stderr");
+    let root = fault::set_at(SpawnPoint::BeforeIdentity, move || {
+        let mut byte = [0u8; 1];
+        ready.read_exact(&mut byte).expect("the helper reports ready");
+        assert_eq!(byte, *b"+");
+    });
+    (cmd, writer, root)
+}
+
+/// A failed async spawn whose identity check cannot answer, of a child that refuses every kill (a
+/// setuid-root helper), is torn down through its pidfd, which refuses too: the child is left
+/// running, and the fate says so, not `Reaped`. One warn says it all, under the failed spawn's name:
+/// the forget, and that the teardown could not terminate it and left it running. The test, not a
+/// thread, reaps it.
+///
+/// CI only (the `setuid` group).
+///
+/// Mutants: the identity-unknown arm answers `Reaped`, or sends the child no kill through its pidfd
+/// and leaves it unreaped; the refused teardown's warn leaves out the clause, or is a second warn.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn an_identity_unknown_child_whose_kill_is_refused_stays_running_and_is_said_so(
+    #[fixture(setuid)] _group: &Group,
+) {
+    use crate::child::front_kill_tests::reap;
+
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let (mut cmd, writer, _root) = setuid_blocker_ready_before_identity();
+    fault::set_force_identity_unknown(true);
+    let mark = crate::log_capture::mark();
+
+    let err = cmd.spawn().err();
+
+    fault::set_force_identity_unknown(false);
+    let Some(crate::identity::Resolved::Found(id)) = fault::take_captured() else {
+        panic!("the seam captured the child's pid");
+    };
+    let (_, fate) = expect_may_have_started_with(err.expect("the forced unknown identity fails the spawn"));
+    assert_eq!(fate, ChildFate::Running { id: None });
+    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "")
+        .into_iter()
+        .filter(|(level, _)| *level <= log::Level::Warn)
+        .collect();
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    let warn = &warns[0].1;
+    assert!(warn.starts_with("teardown after a failed spawn: "), "{warns:?}");
+    assert!(warn.contains("cannot be shown to be ours"), "{warns:?}");
+    assert!(warn.contains("could not be terminated"), "{warns:?}");
+    assert!(warn.contains("leaving it running"), "{warns:?}");
+    assert!(!warn.contains("reaped it"), "{warns:?}");
+    drop(writer);
+    let status = reap(id.pid()).expect("the child is still unreaped");
+    assert!(status.success(), "{status:?}");
 }
 
 /// Turn `runtime`'s driver, whose every turn reaps tokio's exited orphans, until the child
@@ -407,6 +528,77 @@ fn an_out_of_reach_child_never_told_to_go_is_said_to_have_never_run() {
             .contains("may be left running and nothing can reach it outside its cgroup v2 leaf"),
         "{said:?}"
     );
+}
+
+/// A child that never named itself, which the handshake's pidfd reached and its teardown left
+/// uncollected (`Uncollected`), is worded as that: the teardown's clause under the failed spawn's
+/// label, one warn. It is not worded as a child out of its cgroup v2 leaf's reach, whatever the
+/// failure was. It answers the fate its teardown established, and when the handshake already ended
+/// the child through its own copy of the pidfd, the warn says the handshake's fate first and the
+/// leaf's teardown's clause after it, not that the child is left whatever the handshake did.
+///
+/// Mutant: `Uncollected` is worded as `OutOfReach`, with its hedge about the leaf; it answers
+/// `Running` whatever its teardown found; its warn ignores what the handshake did.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn an_uncollected_child_is_said_left_by_its_teardown_not_out_of_the_leafs_reach() {
+    use crate::child::owned::teardown::{Expect, PidfdTeardown, TeardownOutcome};
+    use crate::child::spawn::failure::SpawnFailure;
+    use crate::containment::AbandonedChild;
+
+    crate::log_capture::install();
+    let marker = "cosca-abandoned-uncollected-probe-4e19";
+    let clause = "child could not be terminated (Operation not permitted); leaving it running";
+    let error = || Error::Io(std::io::Error::other(marker));
+    let uncollected = |fate| {
+        let torn = PidfdTeardown::new(TeardownOutcome::left_uncollected(fate, clause.into()), Expect::Anything);
+        AbandonedChild::Uncollected(torn.uncollected().expect("an uncollected teardown is left"))
+    };
+    let abandon = |failure: SpawnFailure| {
+        let mark = crate::log_capture::mark();
+        let _ = super::abandoned_after_handshake(uncollected(ChildFate::Unknown), failure, None, false);
+        crate::log_capture::records_since_on_current_thread(mark, marker)
+    };
+
+    // The fate the teardown established, not a constant.
+    for fate in [ChildFate::Killed, ChildFate::Unknown, ChildFate::Running { id: None }] {
+        let failure = SpawnFailure::started(error(), ChildFate::Unknown, None);
+        let answered = super::abandoned_after_handshake(uncollected(fate), failure, None, true);
+        assert_eq!(answered.expect_may_have_started_with().1, fate);
+    }
+
+    // The handshake ended the child, and the leaf's teardown of its copy says it left it.
+    for ended in [ChildFate::Reaped, ChildFate::Killed, ChildFate::Gone] {
+        let mark = crate::log_capture::mark();
+        super::warn_for_abandoned(&uncollected(ChildFate::Unknown), &error(), Some(ended));
+        let said = crate::log_capture::records_since_on_current_thread(mark, marker);
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert_eq!(said[0].0, log::Level::Warn, "{said:?}");
+        assert!(
+            said[0].1.contains(&format!(
+                "{ended}, and the teardown of its cgroup v2 leaf's copy of its pidfd says: {clause}"
+            )),
+            "{said:?}"
+        );
+        assert!(!said[0].1.contains("teardown after a failed spawn"), "{said:?}");
+    }
+
+    for failure in [
+        SpawnFailure::NotStartedUnreaped(error()),
+        SpawnFailure::NotStarted(error()),
+    ] {
+        let said = abandon(failure);
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert_eq!(said[0].0, log::Level::Warn, "{said:?}");
+        assert!(
+            said[0].1.contains(&format!("teardown after a failed spawn: {clause}")),
+            "{said:?}"
+        );
+        assert!(
+            !said[0].1.contains("cgroup v2 leaf") && !said[0].1.contains("nothing can reach it"),
+            "{said:?}"
+        );
+    }
 }
 
 /// When the handshake already killed and reaped the child, the abandonment does not say it is left
