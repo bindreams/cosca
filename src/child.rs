@@ -30,6 +30,7 @@ mod lifecycle;
 
 #[path = "child/suspended.rs"]
 pub(crate) mod suspended;
+pub use owned::unreaped::Unreaped;
 pub use suspended::SuspendedChild;
 
 #[path = "child/graceful.rs"]
