@@ -296,8 +296,9 @@ mod in_a_cgroup {
     use std::io::PipeWriter;
     use std::path::Path;
 
-    use super::{refuse_the_kill, warns_since};
-    use crate::child::front_cgroup_tests::{cgroup_dir_of, move_out_of_its_leaf};
+    use super::{assert_front_handed_back, refuse_the_kill, warns_since};
+    use crate::child::front_cgroup_tests::{cgroup_dir_of, in_cgroup, move_out_of_its_leaf, SUDO};
+    use crate::child::front_kill_tests::{cat, spawn_as};
     use crate::child::owned::teardown::Disposition;
     use crate::child::Child;
     use crate::error::ChildFate;
@@ -337,6 +338,45 @@ mod in_a_cgroup {
         handed_back.unreaped();
         assert!(!Path::new(&leaf).exists(), "the leaf {leaf} was removed by the call");
         handed_back.wait();
+    }
+
+    /// A front in a leaf that is outside it when the teardown looks at it was not ended by the leaf's
+    /// kill: it is handed back, and the leaf is gone by the time the call returns.
+    ///
+    /// Mutant: the hand-back holds the leaf.
+    #[skuld::test]
+    fn a_front_outside_its_leaf_is_handed_back_after_its_leaf_is_gone(#[fixture(cgroup)] _group: &Group) {
+        crate::log_capture::install();
+        let (child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
+        let id = child.id();
+        let leaf = cgroup_dir_of(id.pid());
+        move_out_of_its_leaf(id.pid());
+        let mark = crate::log_capture::mark();
+
+        let (fate, unreaped) = child.tear_down_or_hand_back(Disposition::HandBack);
+
+        assert!(!Path::new(&leaf).exists(), "the leaf {leaf} was removed by the call");
+        assert_front_handed_back(id, mark, fate, HandedBack::new(stdin, unreaped));
+    }
+
+    /// A front that leaves its leaf during the leaf's kill (the gate read `CgroupOnly`, and the kill
+    /// did not reach it) is handed back the same way.
+    ///
+    /// Mutant: the `CgroupOnly` arm of the drop's teardown drops the caller's disposition.
+    #[skuld::test]
+    fn a_front_that_leaves_its_leaf_during_the_kill_is_handed_back(#[fixture(cgroup)] _group: &Group) {
+        crate::log_capture::install();
+        let (child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
+        let id = child.id();
+        let leaf = cgroup_dir_of(id.pid());
+        let pid = id.pid();
+        let _moving = crate::containment::cgroup::fault::set_before_kill_write(move || move_out_of_its_leaf(pid));
+        let mark = crate::log_capture::mark();
+
+        let (fate, unreaped) = child.tear_down_or_hand_back(Disposition::HandBack);
+
+        assert!(!Path::new(&leaf).exists(), "the leaf {leaf} was removed by the call");
+        assert_front_handed_back(id, mark, fate, HandedBack::new(stdin, unreaped));
     }
 
     /// A root whose own kill is refused, and which the leaf's `cgroup.kill` ends, is waited for and
