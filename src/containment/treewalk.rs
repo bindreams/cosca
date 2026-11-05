@@ -202,8 +202,8 @@ pub(crate) fn descendants_with(
             };
             // With the parent-order rule the accepted parent's key is the bar: it already ordered
             // after the root's, so the root's is implied.
-            let anchor = if parent_order { parent_key } else { root_key };
-            if !keeps_order(key, anchor, allow_equal) {
+            let bar = if parent_order { parent_key } else { root_key };
+            if !keeps_order(key, bar, allow_equal) {
                 log::debug!("treewalk: dropping subtree under impostor pid {pid} (recycled pid / stale ppid)");
                 continue;
             }
