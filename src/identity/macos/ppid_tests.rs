@@ -132,3 +132,22 @@ fn an_ordered_read_reads_the_parent_number_only_when_asked() {
     assert!(matches!(under, Resolved::Found(_)), "{under:?}");
     assert_eq!(fault::ppid_read_attempts(kid.pid()), 1);
 }
+
+/// A record whose key is not the `expected` one is another process's: `Gone`, with or without a
+/// parent named. The record with the expected key is found.
+///
+/// Mutant: `ordered_read` ignores `expected`.
+#[skuld::test]
+fn a_record_with_another_key_than_the_expected_one_is_gone() {
+    let (child, kid) = live_exiting_member();
+    let host = &crate::identity::HostKernel;
+    let read = |expected: Key, parent| ProcessId::of_ordered_with(host, kid.pid(), parent, Some(expected), None).0;
+    let other = kid.with_other_value().key();
+    let found = read(kid.key(), None);
+    let gone_alone = read(other, None);
+    let gone_under = read(other, Some(ProcessId::current()));
+    release_unsignalled(child);
+    assert!(matches!(found, Resolved::Found(_)), "{found:?}");
+    assert_eq!(gone_alone, Resolved::Gone);
+    assert_eq!(gone_under, Resolved::Gone);
+}

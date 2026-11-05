@@ -16,20 +16,25 @@ fn id(pid: RawPid, token: u64) -> ProcessId {
     ProcessId::from_parts_for_test(pid, Key::for_test(token))
 }
 
+/// The bound a candidate's children follow, as a resolver hands it out where the platform orders.
+fn bound_of(token: u64) -> Option<OrderKey> {
+    Some(OrderKey::for_test(token))
+}
+
 /// What the live resolver returns for a process whose identity token and order key agree.
-fn resolved(pid: RawPid, token: u64) -> (ProcessId, OrderKey) {
-    (id(pid, token), OrderKey::for_test(token))
+fn resolved(pid: RawPid, token: u64) -> (ProcessId, Option<OrderKey>) {
+    (id(pid, token), bound_of(token))
 }
 
 /// Build a resolver from a (pid -> token) table. A pid absent from the table is
 /// unresolvable (`Ok(None)`, modelling an already-gone process, or one the read found out of order).
-fn resolver(tokens: &HashMap<RawPid, u64>) -> impl Fn(RawPid, ProcessId, OrderKey) -> Resolution + '_ {
+fn resolver(tokens: &HashMap<RawPid, u64>) -> impl Fn(RawPid, ProcessId, Option<OrderKey>) -> Resolution + '_ {
     move |pid, _parent, _bound| Ok(tokens.get(&pid).map(|&t| resolved(pid, t)))
 }
 
 /// What the live resolver returns for a pid whose read was `Unknown`.
 fn unreadable(pid: RawPid) -> Error {
-    super::unqueryable_read(pid, UnknownCause::default())
+    crate::identity::unqueryable_read("pid", pid, UnknownCause::default())
 }
 
 /// Collect the member pids into a sorted Vec for order-independent comparison.
@@ -50,8 +55,8 @@ fn root() -> ProcessId {
     id(ROOT_PID, ROOT_TOKEN)
 }
 
-fn root_key() -> OrderKey {
-    OrderKey::for_test(ROOT_TOKEN)
+fn root_bound() -> Option<OrderKey> {
+    bound_of(ROOT_TOKEN)
 }
 
 // Deep trees recurse =====
@@ -65,7 +70,7 @@ fn recurses_into_deep_tree() {
         (300u32, ROOT_TOKEN + 2),
         (400u32, ROOT_TOKEN + 3),
     ]);
-    let got = descendants_with(root(), root_key(), &parents, false, resolver(&tokens));
+    let got = descendants_with(root(), root_bound(), &parents, resolver(&tokens));
     assert_eq!(pids(got), [200, 300, 400]);
 }
 
@@ -77,7 +82,7 @@ fn reparented_orphan_is_missed() {
     // pid 1; its ppid no longer chains to the root, so the walk cannot reach it.
     let parents = [(300, 1)];
     let tokens = HashMap::from([(300u32, ROOT_TOKEN + 9)]);
-    let got = descendants_with(root(), root_key(), &parents, false, resolver(&tokens));
+    let got = descendants_with(root(), root_bound(), &parents, resolver(&tokens));
     assert!(
         got.members.is_empty(),
         "reparented orphan is honestly missed (documented)"
@@ -92,7 +97,7 @@ fn root_is_never_included() {
     // root pid never appears in the descendant set even if such an edge exists.
     let parents = [(ROOT_PID, ROOT_PID), (200, ROOT_PID)];
     let tokens = HashMap::from([(ROOT_PID, ROOT_TOKEN), (200u32, ROOT_TOKEN + 1)]);
-    let got = descendants_with(root(), root_key(), &parents, false, resolver(&tokens));
+    let got = descendants_with(root(), root_bound(), &parents, resolver(&tokens));
     assert_eq!(pids(got), [200], "root excluded; genuine child kept");
 }
 
@@ -104,7 +109,7 @@ fn duplicate_edge_yields_pid_once() {
     // (or later double-kill) the same process twice.
     let parents = [(200, ROOT_PID), (200, ROOT_PID)];
     let tokens = HashMap::from([(200u32, ROOT_TOKEN + 1)]);
-    let got = descendants_with(root(), root_key(), &parents, false, resolver(&tokens));
+    let got = descendants_with(root(), root_bound(), &parents, resolver(&tokens));
     assert_eq!(pids(got), [200], "duplicate edge collapses to a single result");
 }
 
@@ -116,7 +121,7 @@ fn unresolvable_candidate_is_skipped() {
     // snapshot and resolve); it is dropped along with anything under it.
     let parents = [(200, ROOT_PID), (300, 200)];
     let tokens = HashMap::from([(300u32, ROOT_TOKEN + 5)]); // 200 missing
-    let got = descendants_with(root(), root_key(), &parents, false, resolver(&tokens));
+    let got = descendants_with(root(), root_bound(), &parents, resolver(&tokens));
     assert!(got.members.is_empty(), "gone candidate and its subtree are skipped");
     assert!(got.unassessed.is_empty(), "a gone candidate is not unassessed");
 }
@@ -129,7 +134,7 @@ fn an_unreadable_candidate_and_its_subtree_are_out_of_the_walk_and_it_is_unasses
     let parents = [(200, ROOT_PID), (300, 200), (400, ROOT_PID)];
     let tokens = HashMap::from([(300u32, ROOT_TOKEN + 5), (400u32, ROOT_TOKEN + 6)]);
     let read = resolver(&tokens);
-    let got = descendants_with(root(), root_key(), &parents, false, |pid, parent, bound| {
+    let got = descendants_with(root(), root_bound(), &parents, |pid, parent, bound| {
         if pid == 200 {
             Err(unreadable(200))
         } else {
@@ -145,7 +150,7 @@ fn an_unreadable_candidate_and_its_subtree_are_out_of_the_walk_and_it_is_unasses
 #[skuld::test]
 fn a_duplicate_edge_to_an_unreadable_candidate_is_one_unassessed_entry() {
     let parents = [(200, ROOT_PID), (200, ROOT_PID)];
-    let got = descendants_with(root(), root_key(), &parents, false, |pid, _, _| Err(unreadable(pid)));
+    let got = descendants_with(root(), root_bound(), &parents, |pid, _, _| Err(unreadable(pid)));
     assert_eq!(unassessed(&got), [200]);
     assert!(got.members.is_empty());
 }
@@ -160,7 +165,7 @@ fn only_a_gone_candidate_is_logged_as_gone_or_an_impostor() {
     const GONE: RawPid = 61_002;
     crate::log_capture::install();
     let parents = [(UNREADABLE, ROOT_PID), (GONE, ROOT_PID)];
-    let resolve = |pid: RawPid, _parent: ProcessId, _bound: OrderKey| -> Resolution {
+    let resolve = |pid: RawPid, _parent: ProcessId, _bound: Option<OrderKey>| -> Resolution {
         if pid == UNREADABLE {
             Err(unreadable(pid))
         } else {
@@ -168,8 +173,8 @@ fn only_a_gone_candidate_is_logged_as_gone_or_an_impostor() {
         }
     };
     let mark = crate::log_capture::mark();
-    descendants_with(root(), root_key(), &parents, false, resolve);
-    children_of_with(root(), root_key(), &parents, resolve);
+    descendants_with(root(), root_bound(), &parents, resolve);
+    children_of_with(root(), root_bound(), &parents, resolve);
     assert!(crate::log_capture::contains_since(
         mark,
         &format!("pid {GONE} gone, or an impostor")
@@ -186,7 +191,7 @@ fn an_unreadable_direct_child_is_unassessed_in_the_one_level_filter_too() {
     let parents = [(200, ROOT_PID), (200, ROOT_PID), (300, ROOT_PID), (400, 200)];
     let tokens = HashMap::from([(300u32, ROOT_TOKEN + 5)]);
     let read = resolver(&tokens);
-    let got = children_of_with(root(), root_key(), &parents, |pid, parent, bound| {
+    let got = children_of_with(root(), root_bound(), &parents, |pid, parent, bound| {
         if pid == 200 {
             Err(unreadable(200))
         } else {
@@ -207,7 +212,7 @@ fn a_duplicate_edge_is_resolved_once_in_both_filters() {
 
     let parents = [(200, ROOT_PID), (200, ROOT_PID)];
     let reads = Cell::new(0);
-    let first_reads_second_does_not = |pid: RawPid, _parent: ProcessId, _bound: OrderKey| {
+    let first_reads_second_does_not = |pid: RawPid, _parent: ProcessId, _bound: Option<OrderKey>| {
         reads.set(reads.get() + 1);
         if reads.get() == 1 {
             Ok(Some(resolved(pid, ROOT_TOKEN + 5)))
@@ -215,11 +220,11 @@ fn a_duplicate_edge_is_resolved_once_in_both_filters() {
             Err(unreadable(pid))
         }
     };
-    let got = children_of_with(root(), root_key(), &parents, first_reads_second_does_not);
+    let got = children_of_with(root(), root_bound(), &parents, first_reads_second_does_not);
     assert_eq!((pids(got), reads.get()), (vec![200], 1), "one level");
 
     reads.set(0);
-    let got = descendants_with(root(), root_key(), &parents, false, first_reads_second_does_not);
+    let got = descendants_with(root(), root_bound(), &parents, first_reads_second_does_not);
     assert!(got.unassessed.is_empty(), "{:?}", got.unassessed);
     assert_eq!((pids(got), reads.get()), (vec![200], 1), "whole subtree");
 }
@@ -234,7 +239,7 @@ fn children_of_keeps_one_level_genuine_children_only() {
     let root = id(100, 50);
     let parents = [(101, 100), (102, 101), (103, 100)];
     let tokens = HashMap::from([(101u32, 60), (102u32, 70)]);
-    let got = children_of_with(root, OrderKey::for_test(50), &parents, resolver(&tokens));
+    let got = children_of_with(root, bound_of(50), &parents, resolver(&tokens));
     assert!(got.unassessed.is_empty());
     assert_eq!(pids(got), [101]);
 }
@@ -250,16 +255,17 @@ fn children_of_duplicate_edge_yields_pid_once() {
     let parents = [(101, 100), (101, 100)];
     let tokens = HashMap::from([(101u32, ROOT_TOKEN + 1)]);
     assert_eq!(
-        pids(children_of_with(root, root_key(), &parents, resolver(&tokens))),
+        pids(children_of_with(root, root_bound(), &parents, resolver(&tokens))),
         [101],
         "duplicate edge collapses to a single child"
     );
 }
 
 /// The resolver is told the accepted process the snapshot made each candidate's parent, so a backend
-/// can drop a candidate whose parent's number has another holder now, and the key it must follow.
-/// The parent of a grandchild is the id the walk accepted for the child. Mutants: "the resolver is
-/// asked the root for every candidate"; "the bound is the root's key under the parent-order rule".
+/// can drop a candidate whose parent's number has another holder now, and the bound it must follow:
+/// the accepted parent's, which the resolver handed out with it. The parent of a grandchild is the
+/// id the walk accepted for the child. Mutants: "the resolver is asked the root for every
+/// candidate"; "the bound is the root's for a deeper candidate".
 #[skuld::test]
 fn the_resolver_is_asked_for_each_candidates_accepted_parent() {
     use std::cell::RefCell;
@@ -267,47 +273,45 @@ fn the_resolver_is_asked_for_each_candidates_accepted_parent() {
     use super::children_of_with;
 
     let asked = RefCell::new(Vec::new());
-    let resolve = |pid: u32, parent: ProcessId, bound: OrderKey| -> Resolution {
+    let resolve = |pid: u32, parent: ProcessId, bound: Option<OrderKey>| -> Resolution {
         asked.borrow_mut().push((pid, parent, bound));
         Ok(Some(resolved(pid, ROOT_TOKEN + 1)))
     };
     let parents = [(200, ROOT_PID), (300, 200)];
-    let child_key = OrderKey::for_test(ROOT_TOKEN + 1);
-    descendants_with(root(), root_key(), &parents, false, resolve);
+    descendants_with(root(), root_bound(), &parents, resolve);
     assert_eq!(
         asked.take(),
-        [(200, root(), root_key()), (300, id(200, ROOT_TOKEN + 1), root_key())]
-    );
-    // Under the parent-order rule the bound is the accepted parent's key.
-    descendants_with(root(), root_key(), &parents, true, resolve);
-    assert_eq!(
-        asked.take(),
-        [(200, root(), root_key()), (300, id(200, ROOT_TOKEN + 1), child_key)]
+        [
+            (200, root(), root_bound()),
+            (300, id(200, ROOT_TOKEN + 1), bound_of(ROOT_TOKEN + 1))
+        ]
     );
 
-    children_of_with(root(), root_key(), &parents, resolve);
-    assert_eq!(asked.take(), [(200, root(), root_key())]);
+    children_of_with(root(), root_bound(), &parents, resolve);
+    assert_eq!(asked.take(), [(200, root(), root_bound())]);
 }
 
-/// The bound the filters hand the resolver is the `root_key` argument, not the root id's token:
-/// here the root's token is `ROOT_TOKEN` and its key is another number. Mutant: "the filters hand
-/// out `root.key()`".
+/// The bound the filters hand the resolver for the root's children is the `root_bound` argument,
+/// not the root id's token: here the root's token is `ROOT_TOKEN` and its bound is another number,
+/// or none, as where no order is relied on. Mutants: "the filters hand out `root.key()`"; "the
+/// filters hand out a bound the platform did not give".
 #[skuld::test]
-fn the_bound_is_the_roots_order_key_not_its_id_token() {
+fn the_bound_is_the_roots_bound_not_its_id_token() {
     use std::cell::RefCell;
 
     use super::children_of_with;
     let parents = [(200, ROOT_PID)];
-    let key = OrderKey::for_test(ROOT_TOKEN - 500);
     let asked = RefCell::new(Vec::new());
-    let resolve = |pid: u32, _parent: ProcessId, bound: OrderKey| -> Resolution {
+    let resolve = |pid: u32, _parent: ProcessId, bound: Option<OrderKey>| -> Resolution {
         asked.borrow_mut().push((pid, bound));
         Ok(None)
     };
-    descendants_with(root(), key, &parents, false, resolve);
-    assert_eq!(asked.take(), [(200, key)], "descendants_with");
-    children_of_with(root(), key, &parents, resolve);
-    assert_eq!(asked.take(), [(200, key)], "children_of_with");
+    for bound in [bound_of(ROOT_TOKEN - 500), None] {
+        descendants_with(root(), bound, &parents, resolve);
+        assert_eq!(asked.take(), [(200, bound)], "descendants_with");
+        children_of_with(root(), bound, &parents, resolve);
+        assert_eq!(asked.take(), [(200, bound)], "children_of_with");
+    }
 }
 
 /// `resolve_or_drop` is a named discard site: an access-denied descendant must be dropped
@@ -327,13 +331,7 @@ fn resolve_or_drop_drops_an_access_denied_pid_and_warns() {
     assert!(denied.is_running(), "precondition: the subject must be live");
     let mark = crate::log_capture::mark();
     assert!(
-        super::resolve_or_drop(
-            &crate::identity::HostKernel,
-            denied.pid(),
-            ProcessId::current(),
-            OrderKey::for_test(0)
-        )
-        .is_err(),
+        super::resolve_or_drop(&crate::identity::HostKernel, denied.pid(), ProcessId::current(), None).is_err(),
         "the walk cannot keep what it cannot verify, and an unread pid is not a gone one"
     );
     assert!(crate::log_capture::contains_since(
@@ -356,7 +354,7 @@ fn resolve_or_drop_drops_an_access_denied_pid_and_warns() {
 fn a_refused_creator_query_is_worded_with_its_status_in_the_walks_warn_on_windows() {
     let refused = windows::Win32::Foundation::NTSTATUS(0xC000_0004_u32 as i32);
     let cause = crate::identity::UnknownCause::default().with_creator_status(refused);
-    let crate::error::Error::Unassessable { detail, .. } = super::unqueryable_read(7, cause) else {
+    let crate::error::Error::Unassessable { detail, .. } = crate::identity::unqueryable_read("pid", 7, cause) else {
         panic!("a refused creator query is Unassessable");
     };
     assert_eq!(

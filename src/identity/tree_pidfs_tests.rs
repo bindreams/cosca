@@ -55,7 +55,7 @@ fn the_parent_of_a_pidfs_id_is_the_pidfs_id_of_its_parent() {
 }
 
 /// Where the creator is updated, the proof is `self`'s own `ppid` after the parent's read, not an
-/// order: a parent that started after `self` (a tracer, or a clock step) is named while its pid
+/// order: a parent that started after `self` (a tracer) is named while its pid
 /// still shows as `self`'s `ppid`. `SELF` started at 2000. Mutant: "`parent` orders `self` after its
 /// parent (`keeps_order`) after the second read": no parent is named.
 #[skuld::test]
@@ -192,6 +192,46 @@ fn a_parent_that_loses_its_number_after_the_childs_read_is_not_named() {
     );
     let lost = ticks_table().on_read_after(&format!("{PARENT}/stat"), 1, Ok(&stat(PARENT, 1, 1_001)));
     assert_eq!(ticks_me().parent_with(&lost).expect("a readable table"), None);
+}
+
+/// `self`'s `stat` shows another start time at the second read: the pid changed hands between the
+/// reads, and a `ticks` id is told only by the record it just read, so `self` has no parent. Mutant:
+/// "the second read is not compared with `self`'s key": the old parent is named.
+#[skuld::test]
+fn a_ticks_id_whose_pid_shows_another_start_time_at_the_second_read_has_no_parent() {
+    let kernel = ticks_table().on_read_after(&format!("{SELF}/stat"), 1, Ok(&stat(SELF, PARENT, 2_001)));
+    assert_eq!(ticks_me().parent_with(&kernel).expect("a readable table"), None);
+}
+
+/// A pid that now shows a `ticks` key, for a `pidfs` id: another process holds it, and the pidfd shows
+/// so before the `stat`, which is refused here, is read. Mutant: "a `ticks` look is read as the
+/// id's own": the refusal is an error.
+#[skuld::test]
+fn a_pidfs_id_whose_pid_now_shows_a_ticks_key_has_no_parent() {
+    let kernel = table_without_self_stat(1_000)
+        .on_pidfs_ino(SELF, Ok(None))
+        .on_read(&format!("{SELF}/stat"), Err(libc::EACCES))
+        .on_signal_probe(Pid::from_raw(SELF as i32).unwrap(), Ok(()));
+    assert_eq!(me().parent_with(&kernel).expect("a recycled pid is not an error"), None);
+}
+
+/// A `ticks` id's key is known only from the record just read, so a pid whose record cannot be read
+/// might hold `self` and is an error naming it, unlike a `pidfs` id, which the pidfd tells apart
+/// first. Mutant: "an unreadable record is no parent".
+#[skuld::test]
+fn a_ticks_id_whose_record_cannot_be_read_is_unassessable() {
+    let kernel = ticks_table_without_parent_stat()
+        .on_read(&format!("{SELF}/stat"), Err(libc::EACCES))
+        .on_signal_probe(Pid::from_raw(SELF as i32).unwrap(), Ok(()));
+    match ticks_me().parent_with(&kernel) {
+        Err(Error::Unassessable { detail, .. }) => {
+            assert!(
+                detail.contains(&format!("pid {SELF} exists but could not be queried")),
+                "{detail}"
+            );
+        }
+        other => panic!("expected Unassessable, got {other:?}"),
+    }
 }
 
 /// A parent whose proof after `self`'s read cannot be made is an error naming the parent, not

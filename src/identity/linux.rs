@@ -230,9 +230,9 @@ pub(super) fn of(kernel: &dyn Kernel, pid: RawPid) -> (Resolved<Key>, UnknownCau
 }
 
 /// [`of`], and a `stat` record that is that process's own: for a `Pidfs` key the bracketed one, and
-/// for ticks the very record the ticks were read from. `expected`: the key of the process the caller
-/// means. A pid whose pidfd shows another kind of key or another inode is `Gone` before its `stat`
-/// is read, so a process that cannot be read is not mistaken for the one asked about.
+/// for ticks the very record the ticks were read from. `expected`: see
+/// [`ProcessId::of_ordered_with`](super::ProcessId::of_ordered_with). A pidfd that shows another
+/// kind of key or another inode is `Gone` before the `stat` is read.
 pub(super) fn of_stat(
     kernel: &dyn Kernel,
     pid: RawPid,
@@ -378,12 +378,6 @@ fn start_ticks(kernel: &dyn Kernel, pid: RawPid, key: Key) -> (Resolved<u64>, Un
             (ticks_from(pid, stat), cause)
         }
     }
-}
-
-/// When `pid` started, for ordering.
-pub(super) fn order_key(kernel: &dyn Kernel, pid: RawPid, key: Key) -> (Resolved<OrderKey>, UnknownCause) {
-    let (ticks, cause) = start_ticks(kernel, pid, key);
-    (ticks.map(OrderKey), cause)
 }
 
 pub(super) fn is_running(kernel: &dyn Kernel, pid: RawPid, key: Key) -> Liveness {

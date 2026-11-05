@@ -548,8 +548,8 @@ pub(super) fn start_token(pid: RawPid) -> Resolved<Key> {
 
 /// The key, the order key (the start time, which is the key's value) and, when `ask_parent`, the
 /// parent pid of `pid`, from one record. With `ask_parent`, waits out a parent pid that `fork()` is
-/// still filling in ([`ppid_of`]); without, reads the record once. `expected`: the key of the process
-/// the caller means; a record with another key is [`Resolved::Gone`].
+/// still filling in ([`ppid_of`]); without, reads the record once. `expected`: see
+/// [`ProcessId::of_ordered_with`](super::ProcessId::of_ordered_with).
 pub(super) fn ordered_read(pid: RawPid, expected: Option<Key>, ask_parent: bool) -> OrderedRead {
     let read = if ask_parent {
         by_pid(pid, || ppid_and_key(pid)).map(|(ppid, key)| (key, ParentRead::Is(ppid)))

@@ -9,8 +9,7 @@
 use crate::child::front_cgroup_tests::pidfd_of;
 use crate::error::Error;
 use crate::identity::{
-    ticks_host, ticks_id, unreadable, FakeKernel, HostKernel, Kernel, Key, OrderKey, ProcessId,
-    UNREADABLE_STATUS_REASON,
+    ticks_host, ticks_id, unreadable, FakeKernel, HostKernel, Kernel, Key, ProcessId, UNREADABLE_STATUS_REASON,
 };
 use crate::test_child::{
     live_exiting_member as live_member, open_live, release_unsignalled as release, stat_of_a_new_owner,
@@ -229,7 +228,7 @@ fn a_pid_the_kernel_cannot_read_is_dropped_and_warned_about() {
     let (child, id) = live_member();
     let (kernel, _guard) = unreadable(id.pid());
     let mark = crate::log_capture::mark();
-    assert!(super::resolve_or_drop(&kernel, id.pid(), ProcessId::current(), OrderKey::for_test(0)).is_err());
+    assert!(super::resolve_or_drop(&kernel, id.pid(), ProcessId::current(), None).is_err());
     let warned = crate::log_capture::records_since_on_current_thread(
         mark,
         &format!("pid {} exists but could not be queried", id.pid()),
@@ -257,7 +256,7 @@ fn the_warn_for_a_dropped_pid_names_the_cause_of_its_own_read_under_a_held_paren
         0,
     );
     let mark = crate::log_capture::mark();
-    assert!(super::resolve_or_drop(&kernel, id.pid(), parent, OrderKey::for_test(0)).is_err());
+    assert!(super::resolve_or_drop(&kernel, id.pid(), parent, None).is_err());
     let warned = crate::log_capture::records_since_on_current_thread(
         mark,
         &format!("pid {} identity could not be read", id.pid()),
@@ -284,7 +283,7 @@ fn the_warn_for_a_dropped_pid_names_the_cause_of_its_parents_proof() {
     let parent = ticks_id(me.pid());
     let kernel = View::Unreadable.fail(FakeKernel::over(&HostKernel), 0);
     let mark = crate::log_capture::mark();
-    assert!(super::resolve_or_drop(&kernel, id.pid(), parent, OrderKey::for_test(0)).is_err());
+    assert!(super::resolve_or_drop(&kernel, id.pid(), parent, None).is_err());
     let warned = crate::log_capture::records_since_on_current_thread(
         mark,
         &format!("ppid {} identity could not be read", me.pid()),
@@ -517,12 +516,11 @@ fn a_candidate_whose_stat_shows_another_parent_is_dropped() {
         .on_read("1/stat", Ok(&crate::identity::stat_parse::stat_fixture("S", 5)));
     let parent = |pid| ProcessId::from_parts_for_test(pid, Key::for_test(5));
     // `stat_fixture` shows parent 1.
-    let bound = OrderKey::for_test(0);
     assert_eq!(
-        super::resolve_or_drop(&kernel, PID, parent(99), bound).expect("a read"),
+        super::resolve_or_drop(&kernel, PID, parent(99), None).expect("a read"),
         None
     );
-    assert!(super::resolve_or_drop(&kernel, PID, parent(1), bound)
+    assert!(super::resolve_or_drop(&kernel, PID, parent(1), None)
         .expect("a read")
         .is_some());
 }

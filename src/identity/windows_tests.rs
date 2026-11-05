@@ -566,8 +566,8 @@ fn the_order_key_is_not_the_creation_time() {
         panic!("our own order key must read, got {read:?}");
     };
     assert_eq!(id, me, "the id of the ordered read is the id of the by-pid read");
-    assert_ne!(key, crate::identity::OrderKey::for_test(me.key().raw()));
-    assert_eq!(key, order_key_of(me), "both reads of one process agree");
+    assert_ne!(key, Some(crate::identity::OrderKey::for_test(me.key().raw())));
+    assert_eq!(key, Some(order_key_of(me)), "both reads of one process agree");
 }
 
 /// The fact the tree walk relies on: a process's sequence number is greater than its creator's.

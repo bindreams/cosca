@@ -167,7 +167,7 @@ enum Owner {
 /// a panic).
 #[skuld::test]
 fn a_candidates_read_and_its_parents_proof_give_one_answer() {
-    use super::{OrderKey, Ordered, OrderedRead, ParentRead, UnknownCause, ALLOW_EQUAL_ORDER};
+    use super::{OrderKey, Ordered, OrderedRead, ParentRead, UnknownCause};
     const CANDIDATE: RawPid = 7;
     const PARENT: RawPid = 100;
     const OTHER: RawPid = 101;
@@ -180,7 +180,7 @@ fn a_candidates_read_and_its_parents_proof_give_one_answer() {
 
     let nobody_gone = (Resolved::Gone, Owner::Nobody);
     let own_gone = (Resolved::Gone, Owner::Candidate);
-    let own_found = (Resolved::Found((id(CANDIDATE, 5), order)), Owner::Candidate);
+    let own_found = (Resolved::Found((id(CANDIDATE, 5), order.bound())), Owner::Candidate);
     let own_unknown = (Resolved::Unknown, Owner::Candidate);
     let parent_unknown = (Resolved::Unknown, Owner::Parent);
     type Proof = fn() -> Result<(), Ordered>;
@@ -280,12 +280,8 @@ fn a_candidates_read_and_its_parents_proof_give_one_answer() {
 
     // A found read whose order key does not follow the bound is gone, whatever its parent number and
     // before any proof: a proof that would fail is never asked for. A key that follows it, or none
-    // bound, leaves the table's answer. An equal key follows it only where equality is allowed.
-    for (key_name, bound, follows) in [
-        ("before", 10, false),
-        ("equal to", 9, ALLOW_EQUAL_ORDER),
-        ("after", 8, true),
-    ] {
+    // bound, leaves the table's answer. An equal key does not follow it.
+    for (key_name, bound, follows) in [("before", 10, false), ("equal to", 9, false), ("after", 8, true)] {
         for claimed in [ParentRead::Is(PARENT), ParentRead::Is(OTHER), ParentRead::Unreadable] {
             let judged = |bound| {
                 OrderedRead {
@@ -334,32 +330,61 @@ fn a_candidates_read_and_its_parents_proof_give_one_answer() {
     }
 }
 
-/// The keep-predicate, under both `allow_equal` values: a key after the anchor's is kept, one before
-/// it (a stale-ppid impostor) is not, and an equal one (a same-tick child) is kept only where
-/// equality is allowed. `judged` and `ProcessId::parent` apply it under the per-OS const.
+/// The keep-predicate is strict: a key after the bound is kept, one before it (a stale-creator
+/// impostor) or equal to it is not. `judged` applies it to the candidate's key, and `ProcessId::parent`
+/// to the key of `self` against its parent's, where [`ORDER_AFTER_PARENT`](super::ORDER_AFTER_PARENT).
 ///
-/// Mutants: `>` for `>=` under `true`, or `>=` for `>` under `false` (the equal row); `<` for `>`.
+/// Mutants: `>=` for `>` (the equal row); `<` for `>`.
 #[skuld::test]
-fn the_keep_predicate_follows_allow_equal_only_for_an_equal_key() {
+fn the_keep_predicate_keeps_only_a_key_after_the_bound() {
     use super::{keeps_order, OrderKey};
-    let anchor = OrderKey::for_test(1_000);
-    for (name, key, kept_if_equal_allowed, kept_if_not) in [
-        ("after", 1_005, true, true),
-        ("equal to", 1_000, true, false),
-        ("before", 999, false, false),
+    let bound = OrderKey::for_test(1_000);
+    for (name, key, kept) in [
+        ("after", 1_005, true),
+        ("equal to", 1_000, false),
+        ("before", 999, false),
     ] {
-        let key = OrderKey::for_test(key);
-        assert_eq!(
-            keeps_order(key, anchor, true),
-            kept_if_equal_allowed,
-            "{name}, allow_equal=true"
-        );
-        assert_eq!(
-            keeps_order(key, anchor, false),
-            kept_if_not,
-            "{name}, allow_equal=false"
-        );
+        assert_eq!(keeps_order(OrderKey::for_test(key), bound), kept, "{name}");
     }
+}
+
+/// The walk's filter over a reused-creator table, through the platform's real bound: `x` is the
+/// root's child, and `y` was created by an earlier holder of `x`'s pid (its read shows `x`'s pid as
+/// its parent number) and orders before `x`. Where the order after the parent is the proof
+/// ([`ORDER_AFTER_PARENT`](super::ORDER_AFTER_PARENT), Windows) `y` is dropped; elsewhere its parent
+/// number is the proof and it is kept. The resolver states each pid's read and applies `judged`, the
+/// read's own rule, so only the bounds the filter hands out and the platform's decision are on test.
+/// A real stale creator needs a Windows process table: that is `treewalk_tests`' live Windows rows.
+///
+/// Mutants: the walk or the read hands out a bound off Windows (`y` is dropped); it hands out none on
+/// Windows, or the root's rather than the accepted parent's (`y` is kept).
+#[skuld::test]
+fn a_reused_creator_edge_is_dropped_only_where_the_order_after_the_parent_is_the_proof() {
+    use super::{resolution_of, OrderKey, OrderedRead, ParentRead, UnknownCause};
+    use crate::containment::treewalk::descendants_with;
+
+    const ROOT: RawPid = 100;
+    const X: RawPid = 200;
+    const Y: RawPid = 300;
+    // Each pid's order key and the parent number its read shows.
+    let table = [(X, 200, ROOT), (Y, 150, X)];
+    let resolve = |pid: RawPid, parent: ProcessId, bound| {
+        let &(_, order, shown) = table.iter().find(|(p, ..)| *p == pid).expect("a stated pid");
+        let read = OrderedRead {
+            read: Resolved::Found((Key::for_test(order), OrderKey::for_test(order))),
+            parent: ParentRead::Is(shown),
+            cause: UnknownCause::default(),
+        };
+        resolution_of("pid", pid, read.judged(pid, parent.pid(), bound).proved(|| Ok(())))
+    };
+
+    let root_bound = OrderKey::for_test(100).bound();
+    let walk = descendants_with(id(ROOT, 100), root_bound, &[(X, ROOT), (Y, X)], resolve);
+
+    let members: Vec<RawPid> = walk.members.iter().map(ProcessId::pid).collect();
+    let expected: &[RawPid] = if cfg!(windows) { &[X] } else { &[X, Y] };
+    assert_eq!(members, expected);
+    assert!(walk.unassessed.is_empty());
 }
 
 /// A read that found no record says its parent number could not be read only if it asked for it.

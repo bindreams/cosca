@@ -321,8 +321,8 @@ fn creator_pid(handle: HANDLE) -> Result<usize, NTSTATUS> {
 }
 
 /// The id key and the order key of `pid`, read on one `PROCESS_QUERY_LIMITED_INFORMATION` handle,
-/// so both describe the same process. `expected`: the key of the process asked about, when there
-/// is one; a pid that holds another key is [`Resolved::Gone`]. `ask_parent`: also read the creator
+/// so both describe the same process. `expected`: see
+/// [`ProcessId::of_ordered_with`](super::ProcessId::of_ordered_with). `ask_parent`: also read the creator
 /// pid on that handle, never a fall back to the snapshot's `th32ParentProcessID`; a refused creator
 /// query is [`ParentRead::Unreadable`] with its `NTSTATUS` in the cause ([`creator_read`]).
 pub(super) fn ordered_read(pid: RawPid, expected: Option<Key>, ask_parent: bool) -> OrderedRead {
