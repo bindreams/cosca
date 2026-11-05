@@ -254,34 +254,23 @@ pub(super) fn of_stat(kernel: &dyn Kernel, pid: RawPid) -> (Resolved<(Key, Vec<u
 }
 
 /// The key, the order key (the `starttime`) and the parent number of `pid`, all from the `stat` that
-/// [`of_stat`] pairs with the key. A `stat` with no readable ppid or no `starttime` is unreadable,
-/// not a parent number or a start of zero.
-pub(super) fn ordered_read(kernel: &dyn Kernel, pid: RawPid) -> OrderedRead {
+/// [`of_stat`] pairs with the key. A `stat` with no `starttime` is unreadable, not a start of zero;
+/// the ppid is parsed (and an unreadable one logged) only when `ask_parent`, and is then unreadable,
+/// not a parent number.
+pub(super) fn ordered_read(kernel: &dyn Kernel, pid: RawPid, ask_parent: bool) -> OrderedRead {
     let (read, cause) = of_stat(kernel, pid);
     let (key, stat) = match read {
         Resolved::Found(found) => found,
-        // No `stat`, so no parent number.
-        Resolved::Gone => {
-            return OrderedRead {
-                read: Resolved::Gone,
-                parent: ParentRead::Unreadable,
-                cause,
-            }
-        }
-        Resolved::Unknown => {
-            return OrderedRead {
-                read: Resolved::Unknown,
-                parent: ParentRead::Unreadable,
-                cause,
-            }
-        }
+        Resolved::Gone => return OrderedRead::missing(Resolved::Gone, cause),
+        Resolved::Unknown => return OrderedRead::missing(Resolved::Unknown, cause),
     };
-    let parent = match parse_ppid(&stat) {
-        Some(ppid) => ParentRead::Is(ppid),
-        None => {
-            log::debug!("identity: the stat of pid {pid} has no readable ppid");
-            ParentRead::Unreadable
-        }
+    let parent = if !ask_parent {
+        ParentRead::NotAsked
+    } else if let Some(ppid) = parse_ppid(&stat) {
+        ParentRead::Is(ppid)
+    } else {
+        log::debug!("identity: the stat of pid {pid} has no readable ppid");
+        ParentRead::Unreadable
     };
     match parse_starttime_jiffies(&stat) {
         Some(ticks) => OrderedRead {

@@ -499,11 +499,19 @@ pub(crate) mod ppid_fault {
     }
 }
 
-/// What one read of a process's record says: its start key, and its parent pid when the record's
-/// is trusted ([`trusted_ppid`]; `None` is a `fork()` still filling it in).
+/// What one read of a process's record says: its start key, and its parent pid as the record has
+/// it, which is not yet judged ([`Record::ppid`]): a read that does not ask for it never does.
 struct Record {
     key: Key,
-    ppid: Option<RawPid>,
+    raw_ppid: RawPid,
+}
+
+impl Record {
+    /// The record's parent pid of `pid`, when [`trusted_ppid`] trusts it; `None` is a `fork()` still
+    /// filling it in.
+    fn ppid(&self, pid: RawPid) -> Option<RawPid> {
+        trusted_ppid(pid, self.raw_ppid)
+    }
 }
 
 /// One read of `pid`'s record, the one read behind the by-pid start key and the parent pid:
@@ -514,12 +522,12 @@ fn read_record(pid: RawPid) -> Resolved<Record> {
     if let Some(info) = bsd_info(pid) {
         return Resolved::Found(Record {
             key: token_of_bsd(&info),
-            ppid: trusted_ppid(pid, info.pbi_ppid),
+            raw_ppid: info.pbi_ppid,
         });
     }
     kinfo::kinfo(pid).map(|info| Record {
         key: token_of_kinfo(&info),
-        ppid: trusted_ppid(pid, info.e_ppid() as RawPid),
+        raw_ppid: info.e_ppid() as RawPid,
     })
 }
 
@@ -538,26 +546,24 @@ pub(super) fn start_token(pid: RawPid) -> Resolved<Key> {
     by_pid(pid, || read_record(pid).map(|record| record.key))
 }
 
-/// The key, the order key (the start time, which is the key's value) and the parent pid of `pid`,
-/// from one record. A parent pid still being filled in by `fork()` is waited for ([`ppid_of`]): the
-/// process is the candidate of a walk, which needs it.
-pub(super) fn ordered_read(pid: RawPid) -> OrderedRead {
-    match by_pid(pid, || ppid_and_key(pid)) {
-        Resolved::Found((ppid, key)) => OrderedRead {
+/// The key, the order key (the start time, which is the key's value) and, when `ask_parent`, the
+/// parent pid of `pid`, from one record. A read that asks for the parent waits out a parent pid
+/// still being filled in by `fork()` ([`ppid_of`]), which is the candidate of a walk with a parent
+/// to prove; one that does not ask reads the record once and neither judges nor waits for its ppid.
+pub(super) fn ordered_read(pid: RawPid, ask_parent: bool) -> OrderedRead {
+    let read = if ask_parent {
+        by_pid(pid, || ppid_and_key(pid)).map(|(ppid, key)| (key, ParentRead::Is(ppid)))
+    } else {
+        by_pid(pid, || read_record(pid)).map(|record| (record.key, ParentRead::NotAsked))
+    };
+    match read {
+        Resolved::Found((key, parent)) => OrderedRead {
             read: Resolved::Found((key, OrderKey(key.raw()))),
-            parent: ParentRead::Is(ppid),
+            parent,
             cause: UnknownCause::default(),
         },
-        Resolved::Gone => OrderedRead {
-            read: Resolved::Gone,
-            parent: ParentRead::Unreadable,
-            cause: UnknownCause::default(),
-        },
-        Resolved::Unknown => OrderedRead {
-            read: Resolved::Unknown,
-            parent: ParentRead::Unreadable,
-            cause: UnknownCause::default(),
-        },
+        Resolved::Gone => OrderedRead::missing(Resolved::Gone, UnknownCause::default()),
+        Resolved::Unknown => OrderedRead::missing(Resolved::Unknown, UnknownCause::default()),
     }
 }
 
@@ -569,8 +575,10 @@ pub(super) fn ordered_read(pid: RawPid) -> OrderedRead {
 /// function rather than re-deriving the rule) - a single function so production's two call
 /// sites and that oracle test cannot silently drift apart on what counts as trustworthy.
 ///
-/// `0` is legitimate ONLY for pid 1 (launchd, the one real process whose parent is the
-/// kernel). For any other pid, a `0` here means XNU served this pid's process-info record
+/// `0` is legitimate ONLY for pid 0 (`kernel_task`, the kernel itself: never forked, and its own
+/// parent number) and pid 1 (launchd, the one real process whose parent is the kernel). A pid
+/// that no `fork()` makes cannot be one in progress, and waiting on it would never end. For any
+/// other pid, a `0` here means XNU served this pid's process-info record
 /// before `fork()` finished filling in its parent field. This IS a real, live race, not a
 /// theoretical one: measured directly on a busy host during this crate's own test runs (a
 /// live, non-pid-1, freshly-forked process's sysctl record read `e_ppid == 0` while
@@ -586,9 +594,9 @@ pub(super) fn ordered_read(pid: RawPid) -> OrderedRead {
 /// `contract_violation`'s "layout drifted or the kernel misbehaved" case, only a narrow timing
 /// window - so an excluded `0` is a DESIGNED `None`, `debug`-logged like every other per-pid probe.
 fn trusted_ppid(pid: RawPid, raw: RawPid) -> Option<RawPid> {
-    if raw == 0 && pid != 1 {
+    if raw == 0 && pid > 1 {
         log::debug!(
-            "pid {pid}'s process-info record reported ppid == 0 for a non-pid-1 process - a \
+            "pid {pid}'s process-info record reported ppid == 0 for a process other than pid 0 and 1 - a \
              fork()-in-progress record, not a resolvable ppid"
         );
         None
@@ -619,8 +627,10 @@ fn read_ppid_once(pid: RawPid) -> PpidRead {
         return read;
     }
     match read_record(pid) {
-        Resolved::Found(Record { key, ppid: Some(ppid) }) => PpidRead::Found(ppid, key),
-        Resolved::Found(Record { ppid: None, .. }) => PpidRead::Forking,
+        Resolved::Found(record) => match record.ppid(pid) {
+            Some(ppid) => PpidRead::Found(ppid, record.key),
+            None => PpidRead::Forking,
+        },
         Resolved::Gone => PpidRead::Gone,
         Resolved::Unknown => PpidRead::Refused,
     }

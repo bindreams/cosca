@@ -113,10 +113,13 @@ impl OrderKey {
 /// that gave the candidate's id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ParentRead {
-    /// The read was not asked for it (Windows reads it only then).
+    /// The read was not asked for it: it is read, judged and logged only when it is.
     NotAsked,
     /// The parent number the read found.
     Is(RawPid),
+    /// The read found a number that no pid has, so no parent's: a creator pid wider than a pid.
+    #[cfg(windows)]
+    NoPid,
     /// The read asked and could not find it.
     Unreadable,
 }
@@ -132,7 +135,26 @@ struct OrderedRead {
 /// What an ordered read of a pid says: the identity and order key, or why there is none.
 type Ordered = (Resolved<(ProcessId, OrderKey)>, UnknownCause);
 
+/// What [`OrderedRead::judged`] makes of a read before the parent is proved again.
+enum Judged {
+    /// The answer, whatever the proof of the parent says.
+    Settled(Ordered),
+    /// The read names the parent: this is the answer if the parent is still held. A parent that is
+    /// gone makes it `Gone`, and one that cannot be proved `Unknown`, whatever this says.
+    IfParentHolds(Ordered),
+}
+
 impl OrderedRead {
+    /// A read that found no process: `read` is `Gone` or `Unknown` (it has no found value), and
+    /// there is no record to take a parent number from.
+    fn missing(read: Resolved<std::convert::Infallible>, cause: UnknownCause) -> OrderedRead {
+        OrderedRead {
+            read: read.map(|never| match never {}),
+            parent: ParentRead::Unreadable,
+            cause,
+        }
+    }
+
     /// The read with no parent named: the id and order key of `pid`.
     fn unclaimed(self, pid: RawPid) -> Ordered {
         (
@@ -143,12 +165,11 @@ impl OrderedRead {
 
     /// The read for `pid`, whose caller was told `parent` created it. A parent number that is
     /// another's is [`Resolved::Gone`] whatever the rest of the read said: the pid has changed
-    /// hands, and a refused read of anything else cannot hide that. Otherwise a read that is
-    /// [`Gone`](Resolved::Gone) or [`Unknown`](Resolved::Unknown) stays so, and a parent number that
-    /// could not be read leaves a found one [`Unknown`](Resolved::Unknown). `Err`: that is the
-    /// answer. `Ok`: the read is found and names `parent`, whose number does not yet prove it is
-    /// still the parent.
-    fn judged(self, pid: RawPid, parent: RawPid) -> Result<Ordered, Ordered> {
+    /// hands, and a refused read of anything else cannot hide that. Otherwise a `Gone` read stays so,
+    /// and a parent number that could not be read leaves any other read `Unknown`: both are
+    /// [`Judged::Settled`]. A read that names `parent` is [`Judged::IfParentHolds`], found or not,
+    /// so that a parent that is gone is `Gone` before a missing order key blames the candidate.
+    fn judged(self, pid: RawPid, parent: RawPid) -> Judged {
         let OrderedRead {
             read,
             parent: claimed,
@@ -159,14 +180,15 @@ impl OrderedRead {
             "a parent was named, so its number must be asked for"
         );
         match (claimed, read) {
-            (ParentRead::Is(found), _) if found != parent => Err((Resolved::Gone, UnknownCause::default())),
-            (_, Resolved::Gone) => Err((Resolved::Gone, cause)),
-            (_, Resolved::Unknown) | (ParentRead::Unreadable | ParentRead::NotAsked, _) => {
-                Err((Resolved::Unknown, cause))
-            }
+            (ParentRead::Is(found), _) if found != parent => Judged::Settled((Resolved::Gone, UnknownCause::default())),
+            #[cfg(windows)]
+            (ParentRead::NoPid, _) => Judged::Settled((Resolved::Gone, UnknownCause::default())),
+            (_, Resolved::Gone) => Judged::Settled((Resolved::Gone, cause)),
             (ParentRead::Is(_), Resolved::Found((key, order))) => {
-                Ok((Resolved::Found((ProcessId { pid, key }, order)), cause))
+                Judged::IfParentHolds((Resolved::Found((ProcessId { pid, key }, order)), cause))
             }
+            (ParentRead::Is(_), Resolved::Unknown) => Judged::IfParentHolds((Resolved::Unknown, cause)),
+            (ParentRead::Unreadable | ParentRead::NotAsked, _) => Judged::Settled((Resolved::Unknown, cause)),
         }
     }
 }
@@ -258,20 +280,20 @@ impl ProcessId {
         #[cfg(all(test, target_os = "macos"))]
         seams::note_by_pid_read();
         #[cfg(target_os = "linux")]
-        let read = backend::ordered_read(kernel, pid);
+        let read = backend::ordered_read(kernel, pid, parent.is_some());
         #[cfg(windows)]
         let read = backend::ordered_read(pid, None, parent.is_some());
         #[cfg(not(any(target_os = "linux", windows)))]
-        let read = backend::ordered_read(pid);
+        let read = backend::ordered_read(pid, parent.is_some());
         let Some(parent) = parent else {
             return read.unclaimed(pid);
         };
         match read.judged(pid, parent.pid()) {
-            Ok(found) => match parent.still_held(kernel) {
-                Ok(()) => found,
+            Judged::Settled(answer) => answer,
+            Judged::IfParentHolds(answer) => match parent.still_held(kernel) {
+                Ok(()) => answer,
                 Err(verdict) => verdict,
             },
-            Err(settled) => settled,
         }
     }
 

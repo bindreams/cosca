@@ -96,7 +96,9 @@ fn a_stat_without_a_start_time_gives_no_key() {
 
 /// How Linux's `ordered_read` reports the ppid of a `stat`, through `of_ordered_with` against a named
 /// parent: the number shown is another parent's (`Gone`, the pid changed hands), or none can be read
-/// from it (`Unknown`). What the shared step does with each is the row in `identity_tests`. Mutant: "an unreadable ppid is read as a number".
+/// from it (`Unknown`). What the shared step does with each is the row in `identity_tests`.
+///
+/// Mutant: "an unreadable ppid is read as a number".
 #[skuld::test]
 fn a_stat_with_no_readable_ppid_is_unknown_not_another_parent() {
     let parent = ProcessId::from_parts_for_test(7, Key::Pidfs(9));
@@ -115,6 +117,30 @@ fn a_stat_with_no_readable_ppid_is_unknown_not_another_parent() {
     let (unreadable, _writer) = with_ppid("x");
     assert!(matches!(
         ProcessId::of_ordered_with(&unreadable, PID, Some(parent)).0,
+        Resolved::Unknown
+    ));
+}
+
+/// A `stat` that names the parent but shows no start time is read as `Unknown`, once the parent is
+/// proved: a parent that is gone is `Gone` first, as when the start time is there, not blamed on the
+/// candidate. Mutant: the missing start time settles the read before the parent is proved.
+#[skuld::test]
+fn a_gone_parent_is_gone_before_a_missing_start_time_is_unknown() {
+    let parent = ProcessId::from_parts_for_test(7, Key::Pidfs(9));
+    let stat = b"4242 (x) S 7";
+
+    let (gone, _writer) = kernel_showing(stat, 100);
+    let gone = gone.on_pidfd_open(7, Err(Errno::SRCH));
+    assert!(matches!(
+        ProcessId::of_ordered_with(&gone, PID, Some(parent)).0,
+        Resolved::Gone
+    ));
+
+    let (held, _writer) = kernel_showing(stat, 100);
+    let (parent_fd, _parent_writer) = pidfd();
+    let held = held.on_pidfd_open(7, Ok(parent_fd)).on_pidfs_ino(7, Ok(Some(9)));
+    assert!(matches!(
+        ProcessId::of_ordered_with(&held, PID, Some(parent)).0,
         Resolved::Unknown
     ));
 }

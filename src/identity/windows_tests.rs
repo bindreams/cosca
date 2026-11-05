@@ -812,3 +812,43 @@ fn a_candidate_is_unknown_when_its_parent_cannot_be_opened_to_prove_it() {
     assert_eq!(read, Resolved::Unknown);
     assert_eq!(cause.blamed_parent(), Some(shell.pid()));
 }
+
+/// A refused creator query is an unreadable parent number that carries its `NTSTATUS` in the cause
+/// (the walk's warn words it from there); an answered one is the number, and adds nothing.
+///
+/// The query on an opened handle cannot be made to refuse here, so the row is over the function that
+/// builds the cause from its answer. Mutant: `creator_read` drops the status from the cause.
+#[skuld::test]
+fn a_refused_creator_query_puts_its_status_in_the_cause() {
+    use super::{creator_read, ParentRead};
+    use crate::identity::UnknownCause;
+
+    let refused = windows::Win32::Foundation::NTSTATUS(0xC000_0004_u32 as i32);
+    let (parent, cause) = creator_read(7, Err(refused), UnknownCause::default());
+    assert_eq!(parent, ParentRead::Unreadable);
+    let Some(crate::error::Error::Unassessable { detail, .. }) = cause.into_error("pid 7") else {
+        panic!("the refused query is the cause");
+    };
+    assert_eq!(
+        detail,
+        "pid 7 exists but its creator process id query failed: NTSTATUS 0xc0000004"
+    );
+
+    let (parent, cause) = creator_read(7, Ok(5), UnknownCause::default());
+    assert_eq!(parent, ParentRead::Is(5));
+    assert!(cause.into_error("pid 7").is_none());
+}
+
+/// A creator pid wider than a pid can be no parent's: it is [`ParentRead::NoPid`], which reads `Gone`,
+/// not an unreadable number, which reads `Unknown`.
+///
+/// Mutant: a wide creator pid reads as unreadable.
+#[cfg(target_pointer_width = "64")]
+#[skuld::test]
+fn a_creator_pid_wider_than_a_pid_is_no_pid() {
+    use super::{creator_read, ParentRead};
+
+    let (parent, cause) = creator_read(7, Ok(u32::MAX as usize + 1), crate::identity::UnknownCause::default());
+    assert_eq!(parent, ParentRead::NoPid);
+    assert!(cause.into_error("pid 7").is_none());
+}

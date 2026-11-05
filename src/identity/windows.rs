@@ -325,48 +325,43 @@ fn creator_pid(handle: HANDLE) -> Result<usize, NTSTATUS> {
 /// is one; a pid that holds another key is [`Resolved::Gone`]. `ask_parent`: also read the creator
 /// pid on that handle, never a fall back to the snapshot's `th32ParentProcessID`; a refused creator
 /// query is [`ParentRead::Unreadable`] with its `NTSTATUS` in the cause, and does not touch a read
-/// that did not ask. A refused query is `Unknown` with its `NTSTATUS` as the cause.
+/// that did not ask ([`creator_read`]). A refused query is `Unknown` with its `NTSTATUS` as the cause.
 pub(super) fn ordered_read(pid: RawPid, expected: Option<Key>, ask_parent: bool) -> OrderedRead {
     let handle = match open_classified(pid, PROCESS_QUERY_LIMITED_INFORMATION) {
         Opened::Found(h) => h,
         // No handle, so no creator: a read that asked is told it could not read it.
-        Opened::Gone => {
-            return OrderedRead {
-                read: Resolved::Gone,
-                parent: ParentRead::Unreadable,
-                cause: UnknownCause::default(),
-            }
-        }
-        Opened::Denied(_) => {
-            return OrderedRead {
-                read: Resolved::Unknown,
-                parent: ParentRead::Unreadable,
-                cause: UnknownCause::default(),
-            }
-        }
+        Opened::Gone => return OrderedRead::missing(Resolved::Gone, UnknownCause::default()),
+        Opened::Denied(_) => return OrderedRead::missing(Resolved::Unknown, UnknownCause::default()),
     };
     let (read, cause) = combine(pid, expected, creation_token_result(handle), sequence_number(handle));
     let (parent, cause) = if ask_parent {
-        match creator_pid(handle).map(RawPid::try_from) {
-            Ok(Ok(creator)) => (ParentRead::Is(creator), cause),
-            Ok(Err(_)) => {
-                log::debug!("the creator pid of pid {pid} is not a pid");
-                (ParentRead::Unreadable, cause)
-            }
-            Err(status) => {
-                log::debug!(
-                    "NtQueryInformationProcess(ProcessBasicInformation) failed on an opened handle for pid {pid}: \
-                     NTSTATUS {:#010x}",
-                    status.0 as u32
-                );
-                (ParentRead::Unreadable, cause.with_creator_status(status))
-            }
-        }
+        creator_read(pid, creator_pid(handle), cause)
     } else {
         (ParentRead::NotAsked, cause)
     };
     close(handle);
     OrderedRead { read, parent, cause }
+}
+
+/// The parent number `creator`, the answer of [`creator_pid`] for `pid`, gives: a creator too wide
+/// to be a pid is [`ParentRead::NoPid`] (it can be no parent's), and a refused query is
+/// [`ParentRead::Unreadable`] with its `NTSTATUS` added to `cause`.
+fn creator_read(pid: RawPid, creator: Result<usize, NTSTATUS>, cause: UnknownCause) -> (ParentRead, UnknownCause) {
+    match creator.map(RawPid::try_from) {
+        Ok(Ok(creator)) => (ParentRead::Is(creator), cause),
+        Ok(Err(_)) => {
+            log::debug!("the creator pid of pid {pid} is not a pid");
+            (ParentRead::NoPid, cause)
+        }
+        Err(status) => {
+            log::debug!(
+                "NtQueryInformationProcess(ProcessBasicInformation) failed on an opened handle for pid {pid}: \
+                 NTSTATUS {:#010x}",
+                status.0 as u32
+            );
+            (ParentRead::Unreadable, cause.with_creator_status(status))
+        }
+    }
 }
 
 /// What the two reads of one handle of `pid` say together. The key is compared with `expected`

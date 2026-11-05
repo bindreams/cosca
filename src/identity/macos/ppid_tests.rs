@@ -1,9 +1,11 @@
 //! `ppid_of`'s two kinds of `Unknown`: the transient fork-in-progress window is re-read until it
 //! resolves, and only the persistent sysctl refusal is `Unknown`, also when a walk's candidate is
-//! read under a parent. The rows for a candidate and its parent that run on every platform are in
-//! `identity::tree_tests`.
+//! read under a parent; and the pids whose parent number is `0` and not a fork in progress. The rows
+//! for a candidate and its parent that run on every platform are in `identity::tree_tests`.
+//!
+//! These rows run on macOS CI only.
 
-use super::{fault, resolve_ppid, PpidRead};
+use super::{fault, resolve_ppid, trusted_ppid, PpidRead};
 use crate::identity::{Key, ProcessId, Resolved};
 use crate::test_child::{live_exiting_member, release_unsignalled};
 
@@ -79,4 +81,61 @@ fn a_candidate_whose_parent_read_is_refused_is_unknown() {
     release_unsignalled(child);
     assert_eq!(read, Resolved::Unknown);
     assert_eq!(cause.blamed_parent(), None);
+}
+
+/// A parent number of `0` is a fork in progress for every pid but the two no `fork()` makes: pid 0
+/// (`kernel_task`, the kernel itself) and pid 1 (launchd, whose parent is the kernel). Waiting on
+/// either would never end.
+///
+/// Mutant: `trusted_ppid` trusts `0` for pid 1 only.
+#[skuld::test]
+fn a_zero_parent_is_trusted_only_for_the_kernel_and_launchd() {
+    assert_eq!(trusted_ppid(0, 0), Some(0));
+    assert_eq!(trusted_ppid(1, 0), Some(0));
+    assert_eq!(trusted_ppid(7, 0), None);
+    assert_eq!(trusted_ppid(7, 3), Some(3));
+}
+
+/// An ordered read of pid 0 under a parent answers, and does not find it a child of that parent (it
+/// is no process's child): a `0` parent number is another parent's, not a fork in progress to wait
+/// for.
+///
+/// Mutant: pid 0's `0` is untrusted (the read re-reads it forever).
+#[skuld::test]
+fn an_ordered_read_of_the_kernel_answers() {
+    let (under, _) = ProcessId::of_ordered_with(&crate::identity::HostKernel, 0, Some(ProcessId::current()));
+    assert!(!matches!(under, Resolved::Found(_)), "{under:?}");
+}
+
+/// The parent of launchd (pid 1, whose parent number is `0`) is asked and answers: its snapshot row
+/// names pid 0, which is read with no parent named and must not be waited on.
+///
+/// Mutant: an ordered read with no parent named waits for the record's parent number, which pid 0
+/// never gets.
+#[skuld::test]
+fn the_parent_of_launchd_answers() {
+    let Resolved::Found(launchd) = ProcessId::of(1) else {
+        panic!("launchd's record reads for any user");
+    };
+    match launchd.parent() {
+        Ok(_) | Err(crate::error::Error::Unassessable { .. }) => {}
+        other => panic!("the parent of launchd is an answer or unassessable, got {other:?}"),
+    }
+}
+
+/// An ordered read waits out a fork-in-progress parent number only when it asks for the parent: one
+/// that names none reads the record once and never reads the parent number.
+///
+/// Mutant: every ordered read goes through the parent read.
+#[skuld::test]
+fn an_ordered_read_reads_the_parent_number_only_when_asked() {
+    let (child, kid) = live_exiting_member();
+    let _forced = fault::force_ppid_reads(kid.pid(), &[]);
+    let (alone, _) = ProcessId::of_ordered_with(&crate::identity::HostKernel, kid.pid(), None);
+    assert!(matches!(alone, Resolved::Found(_)), "{alone:?}");
+    assert_eq!(fault::ppid_read_attempts(kid.pid()), 0);
+    let (under, _) = ProcessId::of_ordered_with(&crate::identity::HostKernel, kid.pid(), Some(ProcessId::current()));
+    release_unsignalled(child);
+    assert!(matches!(under, Resolved::Found(_)), "{under:?}");
+    assert_eq!(fault::ppid_read_attempts(kid.pid()), 1);
 }

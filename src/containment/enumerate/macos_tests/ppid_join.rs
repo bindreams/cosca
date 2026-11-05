@@ -100,9 +100,9 @@ fn parents_contains_this_process_edge() {
 /// The EPERM gap the module docs traced is now CLOSED for this case: pid 1 (launchd) is
 /// guaranteed to exist and, outside a root process, guaranteed to be owned by a different
 /// (root) user - a deterministic trigger for the sysctl fallback without spawning a
-/// cross-uid process. Its real ppid is 0 (the kernel) on every macOS version - the one case
+/// cross-uid process. Its real ppid is 0 (the kernel) on every macOS version - a case
 /// `identity::macos::trusted_ppid`'s "`e_ppid == 0` is never trusted" rule exempts by pid
-/// rather than discards (see that function's doc).
+/// (with pid 0's) rather than discards (see that function's doc).
 ///
 /// The precondition assertion is load-bearing, not decoration: the whole point of this test
 /// is that the FALLBACK resolves pid 1, but whether the fallback is even reached depends

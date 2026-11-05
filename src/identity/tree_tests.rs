@@ -173,7 +173,8 @@ fn a_candidate_is_gone_under_the_right_parent_pid_with_another_key() {
 fn a_candidate_is_unknown_when_its_parent_cannot_be_proved() {
     let (child, kid) = live_member();
     let me = std::process::id();
-    // On Linux the parent is the `/proc` kind, which the refused `stat` is what proves.
+    // On Linux the parent is a `ticks` id: a `pidfs` id is proved by its pidfd, without `/proc`, so
+    // a refused `stat` would not make its proof fail.
     #[cfg(target_os = "linux")]
     let parent = crate::identity::ticks_id(me);
     #[cfg(not(target_os = "linux"))]
