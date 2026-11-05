@@ -1,14 +1,16 @@
 //! A tree walk whose `/proc` view cannot be trusted errors instead of walking an empty snapshot,
-//! and never walks from a root that no longer holds its pid. Linux only: the view seam is
-//! `identity::proc_view_fault`.
+//! and never walks from a root that no longer holds its pid. Every read a walk makes, the
+//! per-pid ones included, goes through the kernel it is given. Linux only: the view is a
+//! [`FakeKernel`]'s `self/status` row.
 //!
 //! A live root must come out of every failing walk unsignalled: [`release`] proves it by its exit
 //! status.
 
 use crate::error::Error;
-use crate::identity::proc_view_fault::{force_proc_view_after, force_proc_view_once, proc_view_fired_at, ForcedView};
-use crate::identity::ProcessId;
-use crate::test_child::{live_exiting_member as live_member, open_live, release_unsignalled as release};
+use crate::identity::{unreadable, FakeKernel, HostKernel, Kernel, ProcessId, UNREADABLE_STATUS_REASON};
+use crate::test_child::{
+    live_exiting_member as live_member, open_live, release_unsignalled as release, stat_of_a_new_owner,
+};
 use crate::Recursive;
 
 /// An identity for this process's pid that this process no longer holds: its children are the
@@ -29,21 +31,49 @@ fn assert_unassessable_naming(result: Result<(), Error>, causes: &[&str]) {
     }
 }
 
-fn views() -> [(ForcedView, &'static str); 2] {
+/// How a view fails, and what its error names.
+#[derive(Clone, Copy)]
+enum View {
+    Diverged,
+    Unreadable,
+}
+
+impl View {
+    /// `kernel` whose `self/status` reads fail this way from the read that follows `earlier` reads.
+    fn fail<'a>(self, kernel: FakeKernel<'a>, earlier: usize) -> FakeKernel<'a> {
+        match self {
+            View::Diverged => kernel.diverged_view_after(earlier),
+            View::Unreadable => kernel.unreadable_view_after(earlier),
+        }
+    }
+
+    fn cause(self) -> &'static str {
+        match self {
+            View::Diverged => "outer pid namespace",
+            View::Unreadable => UNREADABLE_STATUS_REASON,
+        }
+    }
+}
+
+const VIEWS: [View; 2] = [View::Diverged, View::Unreadable];
+
+type Walk = fn(&dyn Kernel, ProcessId) -> Result<(), Error>;
+
+/// The walks that take an identity.
+fn id_walks() -> [(&'static str, Walk); 2] {
     [
-        (ForcedView::Diverged, "outer pid namespace"),
-        (ForcedView::Unassessable, "forced by a test"),
+        ("hard_kill", |k, id| super::hard_kill(k, id).map(|_| ())),
+        ("terminate", |k, id| super::terminate(k, id)),
     ]
 }
 
-type Walk = fn(&crate::Process) -> Result<(), Error>;
-
+/// Every walk, `Process`'s included, over an open handle on the live `id`.
 fn walks() -> [(&'static str, Walk); 4] {
     [
-        ("hard_kill", |p| super::hard_kill(p.id()).map(|_| ())),
-        ("terminate", |p| super::terminate(p.id())),
-        ("kill_tree", |p| p.kill_tree()),
-        ("terminate_tree", |p| p.terminate_tree()),
+        ("hard_kill", |k, id| super::hard_kill(k, id).map(|_| ())),
+        ("terminate", |k, id| super::terminate(k, id)),
+        ("kill_tree", |k, id| open_live(id).kill_tree_with(k)),
+        ("terminate_tree", |k, id| open_live(id).terminate_tree_with(k)),
     ]
 }
 
@@ -54,14 +84,12 @@ fn walks() -> [(&'static str, Walk); 4] {
 #[skuld::test]
 fn every_walk_over_an_untrusted_view_errors_and_signals_nothing() {
     for (name, walk) in walks() {
-        for (view, cause) in views() {
+        for view in VIEWS {
             let (child, id) = live_member();
-            let process = open_live(id);
-            let forced = force_proc_view_once(view);
-            let result = walk(&process);
-            drop(forced);
+            let kernel = view.fail(FakeKernel::over(&HostKernel), 0);
+            let result = walk(&kernel, id);
             assert!(
-                matches!(&result, Err(Error::Unassessable { detail, .. }) if detail.contains(cause)),
+                matches!(&result, Err(Error::Unassessable { detail, .. }) if detail.contains(view.cause())),
                 "{name}: {result:?}"
             );
             release(child);
@@ -71,33 +99,27 @@ fn every_walk_over_an_untrusted_view_errors_and_signals_nothing() {
 
 // The snapshot precedes the anchor =====
 
-type Query = fn(&ProcessId) -> Result<(), Error>;
+type Query = fn(&ProcessId, &dyn Kernel) -> Result<(), Error>;
 
 fn queries() -> [(&'static str, Query); 3] {
     [
-        ("parent", |p| p.parent().map(|_| ())),
-        ("children(No)", |p| p.children(Recursive::No).map(|_| ())),
-        ("children(Yes)", |p| p.children(Recursive::Yes).map(|_| ())),
+        ("parent", |p, k| p.parent_with(k).map(|_| ())),
+        ("children(No)", |p, k| p.children_with(k, Recursive::No).map(|_| ())),
+        ("children(Yes)", |p, k| p.children_with(k, Recursive::Yes).map(|_| ())),
     ]
 }
 
 /// The snapshot is the first view read, so the anchor that follows it vouches for the pid across
-/// the whole snapshot. Mutant: "the anchor is checked before the snapshot" - the forced view lands
+/// the whole snapshot. Mutant: "the anchor is checked before the snapshot" - the failing view lands
 /// on the anchor and the error blames the wrong read.
 #[skuld::test]
 fn parent_and_children_take_the_snapshot_before_the_anchor() {
     let me = ProcessId::current();
-    for (name, query) in queries() {
-        for (view, cause) in views() {
-            let forced = force_proc_view_once(view);
-            let result = query(&me);
-            assert_eq!(
-                proc_view_fired_at(),
-                Some(0),
-                "{name}: the snapshot is the first view read"
-            );
-            drop(forced);
-            assert_unassessable_naming(result, &["the process snapshot could not be taken", cause]);
+    for (_, query) in queries() {
+        for view in VIEWS {
+            let kernel = view.fail(FakeKernel::over(&HostKernel), 0);
+            let result = query(&me, &kernel);
+            assert_unassessable_naming(result, &["the process snapshot could not be taken", view.cause()]);
         }
     }
 }
@@ -109,17 +131,14 @@ fn parent_and_children_take_the_snapshot_before_the_anchor() {
 fn an_anchor_read_that_fails_names_the_view_that_failed_it() {
     let me = ProcessId::current();
     let pid = me.pid();
-    for (name, query) in queries() {
-        for (view, cause) in views() {
-            let forced = force_proc_view_after(1, view);
-            let result = query(&me);
-            assert_eq!(
-                proc_view_fired_at(),
-                Some(1),
-                "{name}: the anchor is the second view read"
+    for (_, query) in queries() {
+        for view in VIEWS {
+            let kernel = view.fail(FakeKernel::over(&HostKernel).same_view(), 1);
+            let result = query(&me, &kernel);
+            assert_unassessable_naming(
+                result,
+                &[&format!("pid {pid} identity could not be read"), view.cause()],
             );
-            drop(forced);
-            assert_unassessable_naming(result, &[&format!("pid {pid} identity could not be read"), cause]);
         }
     }
 }
@@ -131,14 +150,9 @@ fn an_anchor_read_that_fails_names_the_view_that_failed_it() {
 /// opened, so only the identity-level walks run.
 #[skuld::test]
 fn every_walk_from_a_root_that_lost_its_pid_is_ok_and_signals_nothing() {
-    type IdWalk = fn(ProcessId) -> Result<(), Error>;
-    let walks: [(&str, IdWalk); 2] = [
-        ("hard_kill", |id| super::hard_kill(id).map(|_| ())),
-        ("terminate", |id| super::terminate(id)),
-    ];
-    for (name, walk) in walks {
+    for (name, walk) in id_walks() {
         let (child, _) = live_member();
-        let result = walk(stale_root());
+        let result = walk(&HostKernel, stale_root());
         assert!(result.is_ok(), "{name}: {result:?}");
         release(child);
     }
@@ -148,22 +162,15 @@ fn every_walk_from_a_root_that_lost_its_pid_is_ok_and_signals_nothing() {
 /// signalled. Mutants: "an unqueryable root is treated as gone"; "the anchor is skipped".
 #[skuld::test]
 fn every_walk_from_a_root_that_cannot_be_queried_errors_and_signals_nothing() {
-    for (name, walk) in walks() {
+    for (_, walk) in walks() {
         let (child, id) = live_member();
-        let process = open_live(id);
-        let forced = force_proc_view_after(1, ForcedView::Unassessable);
-        let result = walk(&process);
-        assert_eq!(
-            proc_view_fired_at(),
-            Some(1),
-            "{name}: the anchor is the second view read"
-        );
-        drop(forced);
+        let kernel = View::Unreadable.fail(FakeKernel::over(&HostKernel).same_view(), 1);
+        let result = walk(&kernel, id);
         assert_unassessable_naming(
             result,
             &[
                 &format!("pid {} identity could not be read", id.pid()),
-                "forced by a test",
+                UNREADABLE_STATUS_REASON,
             ],
         );
         release(child);
@@ -173,13 +180,158 @@ fn every_walk_from_a_root_that_cannot_be_queried_errors_and_signals_nothing() {
 // A live process missing from the table =====
 
 /// This process is live, so a table without it is not "no parent" / "no children": the entry was
-/// omitted, not the process gone. `EACCES` makes the scan skip every pid, `self` included.
-/// Mutant: "a `self` missing from the table is `Ok(None)` / `Ok(vec![])`".
+/// omitted, not the process gone. `EACCES` on the scan's read of `self` makes it skip this pid; the
+/// anchor's read after it succeeds. Mutant: "a `self` missing from the table is `Ok(None)` /
+/// `Ok(vec![])`".
 #[skuld::test]
 fn a_live_self_missing_from_the_table_is_unassessable() {
     let me = ProcessId::current();
-    let _forced = crate::identity::pid_stat::fault::force_stat_read(libc::EACCES, None);
+    let stat = std::fs::read("/proc/self/stat").expect("this process's stat");
+    let path = format!("{}/stat", me.pid());
     for (_, query) in queries() {
-        assert_unassessable_naming(query(&me), &[&format!("pid {} is live but absent", me.pid())]);
+        let kernel =
+            FakeKernel::listing_unreadable_pid(&HostKernel, me.pid(), libc::EACCES).on_read_after(&path, 1, Ok(&stat));
+        assert_unassessable_naming(query(&me, &kernel), &[&format!("pid {} is live but absent", me.pid())]);
+    }
+}
+
+// The per-pid reads go through the walk's kernel =====
+
+/// A pid the kernel refuses to read is dropped from the walk and warned about, as a pid it cannot
+/// find would be. Mutant: "`resolve_or_drop` resolves through `HostKernel`".
+#[skuld::test]
+fn a_pid_the_kernel_cannot_read_is_dropped_and_warned_about() {
+    crate::log_capture::install();
+    let (child, id) = live_member();
+    let (kernel, _guard) = unreadable(id.pid());
+    let mark = crate::log_capture::mark();
+    assert_eq!(super::resolve_or_drop(&kernel, id.pid()), None);
+    let warned =
+        crate::log_capture::records_since_on_current_thread(mark, &format!("pid {} could not be queried", id.pid()));
+    assert_eq!(warned.len(), 1, "{warned:?}");
+    assert_eq!(warned[0].0, log::Level::Warn);
+    release(child);
+}
+
+/// Mutants: "`descendants` resolves through `HostKernel`", "`children_of` resolves through
+/// `HostKernel`": the unreadable child is found.
+#[skuld::test]
+fn descendants_and_children_the_kernel_cannot_read_are_dropped() {
+    let (child, id) = live_member();
+    let me = ProcessId::current();
+    let parents = [(id.pid(), me.pid())];
+    let (kernel, _guard) = unreadable(id.pid());
+    assert!(super::descendants(&kernel, me, &parents).is_empty());
+    assert!(super::children_of(&kernel, me, &parents).is_empty());
+    release(child);
+}
+
+/// A kill re-verifies through the kernel: a pid it cannot read is not signalled and counts as
+/// not attempted; one it shows with another start time is already gone. Mutant:
+/// "`kill_by_identity` re-verifies through `HostKernel`": the member is signalled.
+#[skuld::test]
+fn kill_by_identity_spares_a_pid_the_kernel_cannot_read_or_shows_as_another_process() {
+    let (child, id) = live_member();
+    let (unreadable_kernel, _guard) = unreadable(id.pid());
+    assert_eq!(
+        super::kill_by_identity(&unreadable_kernel, id, nix::sys::signal::Signal::SIGTERM),
+        super::KillOutcome::NotAttempted
+    );
+    let new_owner =
+        FakeKernel::over(&HostKernel).on_read(&format!("{}/stat", id.pid()), Ok(&stat_of_a_new_owner(id.pid())));
+    assert_eq!(
+        super::kill_by_identity(&new_owner, id, nix::sys::signal::Signal::SIGTERM),
+        super::KillOutcome::AlreadyGone
+    );
+    release(child);
+}
+
+/// The root's `stat` is read three times: by the snapshot, by the anchor, and by the kill's
+/// re-verify, which finds another start time. Nothing is signalled. Mutant: "the walk's kill
+/// re-verifies through `HostKernel`".
+#[skuld::test]
+fn every_walk_re_verifies_its_kill_through_its_kernel() {
+    for (name, walk) in walks() {
+        let (child, id) = live_member();
+        let kernel = FakeKernel::over(&HostKernel).on_read_after(
+            &format!("{}/stat", id.pid()),
+            2,
+            Ok(&stat_of_a_new_owner(id.pid())),
+        );
+        let result = walk(&kernel, id);
+        assert!(result.is_ok(), "{name}: {result:?}");
+        release(child);
+    }
+}
+
+// A descendant's reads go through the walk's kernel =====
+
+/// A live root `sh` that has announced its pid, its identity, and the identity of the `sh` it
+/// forked. That descendant prints `released` and exits at the EOF of its stdin, which the test
+/// holds the write end of; the root waits for it.
+fn live_member_with_descendant() -> (std::process::Child, ProcessId, ProcessId) {
+    let mut cmd = std::process::Command::new("/bin/sh");
+    cmd.arg("-c")
+        .arg("exec 3<&0; sh -c 'read _ignored; echo released' <&3 3<&- & echo $$; wait")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
+    let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn the root");
+    crate::test_child::await_member_ready(&mut child);
+    let root = ProcessId::of(child.id()).found().expect("the live root resolves");
+    let descendants = root
+        .children_with(&HostKernel, Recursive::No)
+        .expect("the root's children are readable");
+    let [descendant] = descendants[..] else {
+        panic!("the root has exactly one child, got {descendants:?}");
+    };
+    (child, root, descendant)
+}
+
+/// The root was signalled with `signo` and the descendant was not: released by EOF, it still
+/// prints. A signalled descendant has nothing to print, and the read ends at EOF without it.
+fn release_with_a_signalled_root(who: &str, mut child: std::process::Child, signo: i32) {
+    use std::io::Read as _;
+    use std::os::unix::process::ExitStatusExt as _;
+    drop(child.stdin.take());
+    let mut printed = String::new();
+    child
+        .stdout
+        .take()
+        .expect("piped stdout")
+        .read_to_string(&mut printed)
+        .expect("read to EOF");
+    assert_eq!(
+        printed, "released\n",
+        "{who}: the descendant must not have been signalled"
+    );
+    let status = child.wait().expect("reap the root");
+    assert_eq!(
+        status.signal(),
+        Some(signo),
+        "{who}: the walk must have signalled the root"
+    );
+}
+
+/// The descendant's `stat` is read by the snapshot, then by the walk's resolve of it, then by the
+/// kill's re-verify, which the kernel refuses or shows as another start time. Only the root is
+/// signalled. Mutants: "`descendants` resolves through `HostKernel`" (the re-verify becomes the
+/// second read, which the row lets through), "the descendant loop's kill re-verifies through
+/// `HostKernel`", each in `hard_kill` and in `terminate`: the descendant is signalled.
+#[skuld::test]
+fn every_id_walk_re_verifies_a_descendants_kill_through_its_kernel() {
+    for ((name, walk), signo) in id_walks().into_iter().zip([libc::SIGKILL, libc::SIGTERM]) {
+        for shows_a_new_owner in [false, true] {
+            let (child, root, descendant) = live_member_with_descendant();
+            let new_owner = stat_of_a_new_owner(descendant.pid());
+            let answer = if shows_a_new_owner {
+                Ok(new_owner.as_slice())
+            } else {
+                Err(libc::EACCES)
+            };
+            let kernel = FakeKernel::over(&HostKernel).on_read_after(&format!("{}/stat", descendant.pid()), 2, answer);
+            let result = walk(&kernel, root);
+            assert!(result.is_ok(), "{name}, new owner {shows_a_new_owner}: {result:?}");
+            release_with_a_signalled_root(name, child, signo);
+        }
     }
 }

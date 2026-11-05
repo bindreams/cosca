@@ -93,12 +93,24 @@ impl<'a> FakeKernel<'a> {
 
     /// `self/status` shows the pid in two namespaces: `/proc` is an outer namespace's.
     pub(crate) fn diverged_view(self) -> Self {
-        self.on_read("self/status", Ok(b"NSpid:\t4242\t1\n"))
+        self.diverged_view_after(0)
+    }
+
+    /// [`diverged_view`](Self::diverged_view) from the read of `self/status` that follows
+    /// `earlier_reads` reads of it.
+    pub(crate) fn diverged_view_after(self, earlier_reads: usize) -> Self {
+        self.on_read_after("self/status", earlier_reads, Ok(b"NSpid:\t4242\t1\n"))
     }
 
     /// `self/status` cannot be read (`EIO`).
     pub(crate) fn unreadable_view(self) -> Self {
-        self.on_read("self/status", Err(libc::EIO))
+        self.unreadable_view_after(0)
+    }
+
+    /// [`unreadable_view`](Self::unreadable_view) from the read of `self/status` that follows
+    /// `earlier_reads` reads of it.
+    pub(crate) fn unreadable_view_after(self, earlier_reads: usize) -> Self {
+        self.on_read_after("self/status", earlier_reads, Err(libc::EIO))
     }
 
     /// `kill(target, 0)` answers `answer`.
