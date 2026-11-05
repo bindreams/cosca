@@ -144,10 +144,10 @@ fn a_teardown_after_a_refused_identity_read_warns_once_past_1s(#[fixture(tracer_
     }));
 }
 
-/// The teardown whose first kill was refused hands the child to the pidfd teardown, whose own kill
-/// lands; its reap warns as well.
+/// The teardown whose first kill was refused tears the child down again through its pidfd
+/// (`OwnedChild::tear_down`), whose own kill lands; its reap warns as well.
 ///
-/// Mutant: the pidfd teardown reaps with no warn.
+/// Mutant: the second teardown reaps with no warn.
 #[skuld::test]
 fn a_teardown_whose_first_kill_was_refused_warns_once_past_1s(#[fixture(tracer_group)] _group: &Group) {
     assert_teardown_warns_once_before_blocking(Seize::At(SpawnPoint::BeforeAttach, || {
@@ -158,7 +158,7 @@ fn a_teardown_whose_first_kill_was_refused_warns_once_past_1s(#[fixture(tracer_g
 
 /// The teardown after a failed attach of an elevation front in a cgroup leaf. The leaf's kill ends
 /// the front, which is sent nothing itself, and the teardown waits for its exit through its pidfd
-/// (`leave_unadopted_front_noting`).
+/// (`OwnedChild::tear_down` with `TeardownKind::Look`).
 ///
 /// Mutant: the front's wait has no warn.
 #[skuld::test]

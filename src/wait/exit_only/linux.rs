@@ -109,6 +109,10 @@ fn no_record() -> io::Result<PeekOutcome> {
     Err(io::Error::other("a blocking waitid on the pidfd returned no record"))
 }
 
+#[cfg_attr(
+    not(feature = "tokio"),
+    allow(dead_code, reason = "the only consumers are the tokio backend's")
+)]
 pub(super) fn reap_blocking(target: &Target<'_>) -> io::Result<Result<ExitRecord, Foreign>> {
     let fd = pidfd(target);
     loop {

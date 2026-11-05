@@ -687,9 +687,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                     },
                     &mut why,
                 );
-                // The read failed, so no identity is known.
-                #[cfg(not(target_os = "macos"))]
-                let (fate, child_fate) = proc.leave_front_noting(pid, None, subtree.as_ref(), &mut why);
+                #[cfg(target_os = "macos")]
                 return Err(SpawnFailure::started(
                     fate.note(
                         crate::child::spawn::spawn_identity_error(other, cause),
@@ -699,6 +697,19 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                     child_fate,
                     None,
                 ));
+                // The read failed, so no identity is known.
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let (error, child_fate) = proc.leave_front_noting(
+                        pid,
+                        None,
+                        subtree.as_ref(),
+                        &mut why,
+                        crate::child::spawn::spawn_identity_error(other, cause),
+                        front,
+                    );
+                    return Err(SpawnFailure::started(error, child_fate, None));
+                }
             }
             // Linux 6.9+: the group the root may have left members in, whoever reaped the root.
             #[cfg(target_os = "linux")]
@@ -763,7 +774,11 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                 // Elsewhere the failed attach has dropped the containment: a cgroup leaf's drop kills
                 // and drains it, so a front in it is dying, and is waited for.
                 #[cfg(not(target_os = "macos"))]
-                let (fate, child_fate) = proc.leave_front(pid, Some(id), subtree.as_ref());
+                {
+                    let (error, child_fate) = proc.leave_front(pid, Some(id), subtree.as_ref(), error, front);
+                    return Err(SpawnFailure::started(error, child_fate, None));
+                }
+                #[cfg(target_os = "macos")]
                 return Err(SpawnFailure::started(
                     fate.note(error, Some(front), Some(pid)),
                     child_fate,

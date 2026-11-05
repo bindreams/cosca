@@ -541,12 +541,10 @@ async fn cgroup_kill_tree_of_a_front_asks_the_gate_once(#[fixture(cgroup)] _grou
 #[skuld::test]
 async fn cgroup_a_failed_spawn_kills_a_contained_front_and_reaps_it(#[fixture(cgroup)] _group: &Group) {
     use crate::child::front_cgroup_tests::{assert_killed_by_the_leaf, failed_held_front_spawns, LeafKill};
-    let _running = crate::child::spawn::fault::see_fronts_running();
-    let reaps = crate::child::spawn::fault::record_teardown_reaps();
     let failures = failed_held_front_spawns(LeafKill::Lands, |cmd| {
         crate::tokio::spawn::spawn(cmd).map(drop).map_err(Into::into)
     });
-    assert_killed_by_the_leaf(&failures, Some(&reaps));
+    assert_killed_by_the_leaf(&failures);
 }
 
 /// Async twin of the sync `cgroup_a_failed_spawn_whose_leaf_kill_fails_hands_back_the_front`, which
@@ -583,12 +581,10 @@ async fn cgroup_a_failed_spawn_leaves_a_front_moved_out_of_its_leaf_running(#[fi
 #[skuld::test]
 async fn cgroup_a_failed_spawn_kills_a_front_read_through_proc_and_reaps_it(#[fixture(cgroup)] _group: &Group) {
     use crate::child::front_cgroup_tests::{assert_killed_by_the_leaf, failed_held_front_spawns, LeafKill};
-    let _running = crate::child::spawn::fault::see_fronts_running();
-    let reaps = crate::child::spawn::fault::record_teardown_reaps();
     let failures = failed_held_front_spawns(LeafKill::LandsReadThroughProc, |cmd| {
         crate::tokio::spawn::spawn(cmd).map(drop).map_err(Into::into)
     });
-    assert_killed_by_the_leaf(&failures, Some(&reaps));
+    assert_killed_by_the_leaf(&failures);
 }
 
 /// Async twin of the sync `cgroup_a_failed_spawn_hands_back_a_front_in_a_namesake_of_its_leaf`, which
@@ -630,12 +626,10 @@ async fn cgroup_a_front_nested_under_its_leaf_is_killed_under_hidepid(#[fixture(
 #[skuld::test]
 async fn cgroup_a_failed_spawn_kills_a_front_nested_under_its_leaf_under_hidepid(#[fixture(cgroup)] _group: &Group) {
     use crate::child::front_cgroup_tests::{assert_killed_by_the_leaf, failed_held_front_spawns, LeafKill};
-    let _running = crate::child::spawn::fault::see_fronts_running();
-    let reaps = crate::child::spawn::fault::record_teardown_reaps();
     let failures = failed_held_front_spawns(LeafKill::LandsNestedHidden, |cmd| {
         crate::tokio::spawn::spawn(cmd).map(drop).map_err(Into::into)
     });
-    assert_killed_by_the_leaf(&failures, Some(&reaps));
+    assert_killed_by_the_leaf(&failures);
 }
 
 /// Async twin of the sync `cgroup_a_front_whose_leaf_gives_no_id_is_refused_before_its_fork`.

@@ -6,7 +6,9 @@ use std::io;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
+use super::held_teardown::{tear_down_held, HeldTeardown};
 use super::Diagnosis;
+use crate::child::owned::teardown::Disposition;
 use crate::child::owned::OwnedChild;
 use crate::containment::cgroup::{fault, PlacedAtRemoval, Subtree, Swept};
 use crate::elevation::front::Front;
@@ -302,4 +304,111 @@ fn a_front_that_has_exited_is_reaped_without_waiting() {
         None,
         "the teardown reaped the front"
     );
+}
+
+/// `tear_down_held` for a caller that leaves what it could not end: `front`, with what the teardown
+/// is told of the rest as `HeldTeardown` says, over `owned`.
+fn tear_down_leaving(
+    owned: OwnedChild,
+    front: Option<Front>,
+    why: &mut Diagnosis,
+) -> (Error, ChildFate, Option<crate::Unreaped>) {
+    let how = HeldTeardown {
+        front,
+        id: None,
+        subtree: None,
+        disposition: Disposition::Leave,
+        due: None,
+    };
+    tear_down_held(owned, how, why, failed())
+}
+
+/// A child whose kill is refused, under a caller that leaves it, is left running and warned of, and
+/// nothing is handed back. It starts no thread: the child is the caller's to reap, and the test does.
+///
+/// Mutants: the arm hands back what a `Leave` caller leaves; the warn says it is handed back; the child
+/// is reported reaped.
+#[skuld::test]
+fn a_refused_kill_under_leave_is_left_running_and_warned_and_nothing_is_handed_back() {
+    crate::log_capture::install();
+    let (owned, stdin) = held_blocker(|f| {
+        f.signals([Err(io::Error::from(io::ErrorKind::PermissionDenied))])
+            .reaps([ReapAnswer::Running])
+    });
+    let pid = owned.pid().expect("the held child has a pid");
+    let mark = crate::log_capture::mark();
+
+    let (_, fate, unreaped) = tear_down_leaving(owned, None, &mut Diagnosis::default());
+
+    assert_eq!(fate, ChildFate::Running { id: None });
+    assert!(unreaped.is_none(), "a caller that leaves it is handed nothing back");
+    let warns = warns_since(mark);
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(
+        warns[0].contains("leaving it running") && !warns[0].contains("handed back"),
+        "{warns:?}"
+    );
+    // The test's own cleanup: the blocker exits on its stdin's close, and is the test's to reap.
+    drop(stdin);
+    crate::child::front_kill_tests::reap(pid).expect("the left child is still unreaped");
+}
+
+/// A front still running, under a caller that leaves it, is noted as left unreaped, and nothing is
+/// handed back.
+///
+/// Mutants: the note says it is handed back; the front is handed back.
+#[skuld::test]
+fn a_running_front_under_leave_is_noted_as_left_unreaped_and_nothing_is_handed_back() {
+    crate::log_capture::install();
+    let (owned, stdin) = held_blocker(|f| f.reaps([ReapAnswer::Running]));
+    let pid = owned.pid().expect("the held child has a pid");
+    let mark = crate::log_capture::mark();
+
+    let (error, fate, unreaped) = tear_down_leaving(owned, Some(Front::Sudo), &mut Diagnosis::default());
+
+    assert_eq!(fate, ChildFate::Running { id: None });
+    assert!(unreaped.is_none());
+    let error = error.to_string();
+    assert!(
+        error.contains("the elevated program may be running; it is left unreaped") && !error.contains("handed back"),
+        "{error}"
+    );
+    let warns = warns_since(mark);
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(
+        warns[0].contains("is left running and unreaped") && !warns[0].contains("handed back"),
+        "{warns:?}"
+    );
+    drop(stdin);
+    crate::child::front_kill_tests::reap(pid).expect("the left front is still unreaped");
+}
+
+/// A front whose pid is not known (tokio's spawn failed before it returned one) is named so, in the
+/// error and in the warn.
+///
+/// Mutant: the front is named `pid 0`.
+#[skuld::test]
+fn a_front_with_no_pid_is_named_as_such() {
+    crate::log_capture::install();
+    let (owned, stdin) = held_blocker(|f| f);
+    let pid = owned.pid().expect("the held child has a pid");
+    // The same child, named by its pidfd alone: the copy is the pid-less handle's own.
+    let pidfd = owned.pidfd().expect("a Linux child has its pidfd");
+    let pidless = OwnedChild::new(Box::new(crate::os_process::linux::LinuxProcess::new(
+        None,
+        pidfd.try_clone_to_owned().expect("dup the pidfd"),
+    )));
+    let mark = crate::log_capture::mark();
+
+    let (error, _, unreaped) = tear_down_leaving(pidless, Some(Front::Sudo), &mut Diagnosis::default());
+
+    assert!(unreaped.is_none());
+    let error = error.to_string();
+    assert!(error.contains("the spawned child is what sudo left"), "{error}");
+    let warns = warns_since(mark);
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(warns[0].starts_with("the elevation front (pid unknown)"), "{warns:?}");
+    drop(stdin);
+    drop(owned);
+    crate::child::front_kill_tests::reap(pid).expect("the left front is still unreaped");
 }

@@ -7,7 +7,7 @@ use crate::child::spawn::fault;
 use crate::error::{ChildFate, Error};
 use crate::test_child::Console;
 #[cfg(target_os = "linux")]
-use crate::test_groups::{cgroup, Group};
+use crate::test_groups::{cgroup, setuid, Group};
 use crate::tokio::Command;
 
 /// [`blocker`] for a kill-then-blocking-reap test; see [`fault::teardown_blocker_stdin`].
@@ -171,7 +171,7 @@ async fn cgroup_a_post_fork_tokio_failure_leaves_no_live_child_in_a_leaked_leaf(
 /// kind is. The child is left alive, blocked on stdin, and exits when the failed spawn drops the
 /// pipe's parent end. macOS: tokio's own `Child` drop hands it to the runtime's orphan reaper,
 /// which the test drives until the child is reaped. Linux: tokio's `Child` is forgotten and the
-/// child goes to the pidfd teardown (the seam refuses only the first kill), so it is reaped through
+/// child is torn down again through its pidfd (the seam refuses only the first kill), so it is reaped through
 /// its pidfd and never released to tokio's by-pid reap.
 #[skuld::test]
 fn a_failed_teardown_kill_in_the_async_spawn_asserts_all_but_eperm() {
@@ -245,6 +245,69 @@ fn a_failed_teardown_kill_in_the_async_spawn_asserts_all_but_eperm() {
         drive_until_reaped(&runtime, &captured);
         fault::assert_child_reaped(captured);
     }
+}
+
+/// A failed async spawn whose child refuses the kill, through its handle and again through its pidfd
+/// (a setuid-root helper refuses every kill of this process), leaves it running and says so in the one
+/// warn, which names the kill that was refused. Nothing reaps it behind the caller's back: the child
+/// is still this process's unreaped child until the test reaps it.
+///
+/// The helper is fully root once it has written its ready byte, which is read before the identity
+/// check.
+///
+/// Mutants: a refused kill reports the child reaped; the second teardown starts a thread that reaps
+/// it; the warn says it was torn down.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn a_child_whose_teardown_kill_is_refused_twice_stays_running_and_unreaped(#[fixture(setuid)] _group: &Group) {
+    use std::io::Read as _;
+
+    use crate::child::front_kill_tests::reap;
+    use crate::child::spawn::fault::SpawnPoint;
+
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let (stdin, writer) = crate::test_child::held_writer_stdin();
+    let (mut ready, ready_end) = std::io::pipe().expect("pipe");
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
+    cmd.executable(crate::test_privilege::setuid::setuid_helper()).args([
+        "cosca_testbin",
+        "setuid-stdin-block",
+        "root",
+    ]);
+    cmd.stdin(stdin).expect("set stdin");
+    cmd.stdout(crate::Stdio::from_file(std::fs::File::from(
+        std::os::fd::OwnedFd::from(ready_end),
+    )))
+    .expect("set stdout");
+    cmd.stderr(crate::Stdio::null()).expect("null stderr");
+    let _root = fault::set_at(SpawnPoint::BeforeIdentity, move || {
+        let mut byte = [0u8; 1];
+        ready.read_exact(&mut byte).expect("the helper reports ready");
+        assert_eq!(byte, *b"+");
+    });
+    fault::set_force_attach_failure(true);
+    let mark = crate::log_capture::mark();
+
+    let err = cmd.spawn().err();
+
+    fault::set_force_attach_failure(false);
+    let Some(crate::identity::Resolved::Found(id)) = fault::take_captured() else {
+        panic!("the seam captured the child's identity");
+    };
+    let (_, fate) = expect_may_have_started_with(err.expect("the forced attach failure fails the spawn"));
+    assert_eq!(fate, ChildFate::Running { id: Some(id) });
+    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "")
+        .into_iter()
+        .filter(|(level, _)| *level <= log::Level::Warn)
+        .collect();
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(warns[0].1.contains("could not be terminated"), "{warns:?}");
+    assert!(warns[0].1.contains("leaving it running"), "{warns:?}");
+    // The helper exits once its stdin closes; the test, not a thread, reaps it.
+    drop(writer);
+    let status = reap(id.pid()).expect("the child is still unreaped");
+    assert!(status.success(), "{status:?}");
 }
 
 /// Turn `runtime`'s driver, whose every turn reaps tokio's exited orphans, until the child

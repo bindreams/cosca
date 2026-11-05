@@ -79,21 +79,23 @@ In order:
      graceful path sends through; `GroupRoot::new` with no `ReapHold`; its tests' hooks,
      `exit_only::seams` and `signal::seams`, which `Process::kill`'s tests share.
    - Spawn (the spawn-time slice): `exit_only::Target` and `exit_only::Reap`, which spawn
-     identity, `kill_and_reap_*`, `unique_report` and `PidfdChild` still take by handle or number
-     (`PidfdChild` now only for the async spawn and the cgroup leaf's abandonment);
+     identity, `kill_and_reap_*` and `unique_report` still take by handle or number;
      `await_reapable` and its kqueue round hooks (macOS), which spawn teardown still waits
      through; `GroupRoot::new` at the failed-spawn identity check (`spawn.rs`) and the cgroup
      leaf's abandonment (`leaf.rs`); the `exit_only::seams` their tests use. `OwnedChild::tear_down`
-     is the one kill-then-settle policy, and `Child::drop` uses it; so does the sync Linux spawn,
-     from the handshake's `conclude` to the identity and attach arms (`held_teardown.rs`), which
-     build the `OwnedChild` once when the handshake succeeds. `Settlement` is the one
+     is the one kill-then-settle policy, and `Child::drop` uses it; so does every Linux spawn,
+     sync and async, from the handshake's `conclude` to the identity and attach arms
+     (`held_teardown.rs`), the async spawn's refused-kill teardown, and the cgroup leaf's
+     abandonment of a child it cannot name. The sync spawn builds the `OwnedChild` once when the
+     handshake succeeds. No Linux spawn reaps by pid or starts a thread of its own. `Settlement` is the one
      classification of what a wait or look answered (the fate, whether the child is left
      uncollected, what to say); the teardowns, `finish_elevated` and `Unreaped` all ask it. A teardown that cannot end a child,
      a refused kill or a running elevation front, hands it back as `Unreaped`, in
      `Error::MayHaveStarted`: the sync Linux spawn does, and so does the sync `finish_elevated`;
      the `Command::{status, output, read}` do through `Child::tear_down_or_hand_back`.
      `SuspendedChild::resume` runs it too but leaves the child, since a frozen thread may never run.
-     The other spawns still tear down by themselves (async Linux, Windows, macOS).
+     The async Linux spawn leaves a child it could not end running, warned, until the async-child
+     slice. Windows and macOS still tear down by themselves.
    - Under `MacChild` ([#877](https://github.com/bindreams/cosca/issues/877), the macOS
      kernel-view slice): `exit_only::{peek, peek_verified, peek_traced}` still consult the
      `exit_only::seams` hook; five macOS tests need it, and `MacChild::event_pending` (a `cfg(test)`

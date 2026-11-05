@@ -1209,7 +1209,7 @@ impl Child {
     }
 }
 
-/// What `caller` says of how its look at the elevation front `pid` went (`torn.look`): what the
+/// What `caller` says of how its look at the elevation front `pid` (`None`: not known) went (`torn.look`): what the
 /// front's [`Settlement`](lifecycle::Settlement) words, a debug line or a leftover for its one warn
 /// (a front reaped with its status needs no word), and a leftover for any other. `why` is why the
 /// caller did not kill the front. An outcome with no look is returned as it
@@ -1219,7 +1219,7 @@ impl Child {
 #[cfg(unix)]
 fn word_front(
     caller: TeardownCaller,
-    pid: u32,
+    pid: impl Into<Option<u32>>,
     why: &dyn std::fmt::Display,
     disposition: Disposition,
     mut torn: TeardownOutcome,
@@ -1227,33 +1227,32 @@ fn word_front(
     use crate::child::owned::teardown::LookOutcome;
 
     let label = caller.label();
+    let front = pid.into().map_or_else(
+        || "the elevation front (pid unknown)".to_owned(),
+        |pid| format!("elevation front pid {pid}"),
+    );
     let Some(look) = torn.look.take() else {
         return torn;
     };
     // A front seen running whose reach cannot be read: it is not known whether the cgroup kill ended it.
     let unreadable = |cause: String| match disposition {
-        Disposition::Leave => format!(
-            "elevation front pid {pid} is left unreaped: {cause}, so it is not known whether the cgroup kill ended it"
-        ),
+        Disposition::Leave => {
+            format!("{front} is left unreaped: {cause}, so it is not known whether the cgroup kill ended it")
+        }
         Disposition::HandBack => format!(
-            "elevation front pid {pid} is running and unreaped: {cause}, so it is not known whether the cgroup kill \
+            "{front} is running and unreaped: {cause}, so it is not known whether the cgroup kill \
              ended it; handed back to the caller in the error"
         ),
     };
     torn.left = match look {
-        LookOutcome::Ended(settlement) => settlement.leftover(
-            &format!("elevation front pid {pid}"),
-            None,
-            disposition,
-            &format!("{label}: "),
-        ),
+        LookOutcome::Ended(settlement) => settlement.leftover(&front, None, disposition, &format!("{label}: ")),
         LookOutcome::LeftRunning => Some(match disposition {
             Disposition::Leave => format!(
-                "elevation front pid {pid} is left running and unreaped: {why}, and a kill of the front would orphan \
+                "{front} is left running and unreaped: {why}, and a kill of the front would orphan \
                  the elevated program"
             ),
             Disposition::HandBack => format!(
-                "elevation front pid {pid} is running and unreaped: {why}, and a kill of the front would orphan \
+                "{front} is running and unreaped: {why}, and a kill of the front would orphan \
                  the elevated program; handed back to the caller in the error"
             ),
         }),

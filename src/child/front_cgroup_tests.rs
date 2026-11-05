@@ -1062,37 +1062,20 @@ pub(crate) fn failed_held_front_spawns(
     })
 }
 
-/// Each failure notes its front was killed by its leaf and reaped. With `reaps` (the async spawn's
-/// wait, which records its reap), the teardown's own wait reaped it dead of `SIGKILL`. Without (the
-/// sync spawn's look, which records none), the front is gone from the test's reach: the teardown
-/// reaped it; `failed_held_front_spawns` has already seen the leaf's kill end it.
+/// Each failure notes its front was killed by its leaf and reaped. The front is gone from the test's
+/// reach: the teardown's look or wait reaped it, and records no reap of its own;
+/// `failed_held_front_spawns` has already seen the leaf's kill end it.
 #[track_caller]
-pub(crate) fn assert_killed_by_the_leaf(
-    failures: &[HeldFailure; 2],
-    reaps: Option<&crate::child::spawn::fault::TeardownReaps>,
-) {
+pub(crate) fn assert_killed_by_the_leaf(failures: &[HeldFailure; 2]) {
     for HeldFailure { err, pid, .. } in failures {
         let text = err.to_string();
         assert_eq!(err.fate(), Some(crate::error::ChildFate::Reaped), "{text}");
         assert!(text.contains(&format!("pid {pid} is what sudo left")), "{text}");
         assert!(text.contains("its cgroup's kill ended it, and it was reaped"), "{text}");
-        let Some(reaps) = reaps else {
-            assert_eq!(
-                crate::child::front_kill_tests::reap(*pid),
-                None,
-                "the teardown reaped front {pid}"
-            );
-            continue;
-        };
-        let recorded = reaps.recorded();
-        let status = recorded
-            .iter()
-            .find_map(|(reaped, status)| (reaped == pid).then_some(*status))
-            .unwrap_or_else(|| panic!("the teardown waited for front {pid}: {recorded:?}"));
         assert_eq!(
-            status.signal(),
-            Some(libc::SIGKILL),
-            "front {pid} ended by its leaf's kill"
+            crate::child::front_kill_tests::reap(*pid),
+            None,
+            "the teardown reaped front {pid}"
         );
     }
 }
@@ -1160,7 +1143,7 @@ pub(crate) fn assert_left_running(kill: LeafKill, failures: [HeldFailure; 2], ha
 #[skuld::test]
 fn cgroup_a_failed_spawn_kills_a_contained_front_and_reaps_it(#[fixture(cgroup)] _group: &Group) {
     let failures = failed_held_front_spawns(LeafKill::Lands, |cmd| cmd.spawn().map(drop));
-    assert_killed_by_the_leaf(&failures, None);
+    assert_killed_by_the_leaf(&failures);
 }
 
 /// A failed spawn's front, its place read through `/proc` alone, is killed by its leaf and reaped:
@@ -1169,7 +1152,7 @@ fn cgroup_a_failed_spawn_kills_a_contained_front_and_reaps_it(#[fixture(cgroup)]
 #[skuld::test]
 fn cgroup_a_failed_spawn_kills_a_front_read_through_proc_and_reaps_it(#[fixture(cgroup)] _group: &Group) {
     let failures = failed_held_front_spawns(LeafKill::LandsReadThroughProc, |cmd| cmd.spawn().map(drop));
-    assert_killed_by_the_leaf(&failures, None);
+    assert_killed_by_the_leaf(&failures);
 }
 
 /// A failed spawn whose front was moved into a live cgroup named as `/proc` prints the removed leaf
@@ -1442,7 +1425,7 @@ fn cgroup_a_front_nested_under_its_leaf_is_killed_under_hidepid(#[fixture(cgroup
 #[skuld::test]
 fn cgroup_a_failed_spawn_kills_a_front_nested_under_its_leaf_under_hidepid(#[fixture(cgroup)] _group: &Group) {
     let failures = failed_held_front_spawns(LeafKill::LandsNestedHidden, |cmd| cmd.spawn().map(drop));
-    assert_killed_by_the_leaf(&failures, None);
+    assert_killed_by_the_leaf(&failures);
 }
 
 /// A front in a cgroup under its leaf behind a mount, which the walk cannot list: its place is

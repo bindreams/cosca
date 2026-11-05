@@ -210,8 +210,8 @@ fn reap_now_after_a_refused_kill(evidence: fn() -> Box<dyn std::any::Any>) {
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(warns[0].1.contains("leaks"), "{warns:?}");
     assert!(
-        !crate::log_capture::contains_since(mark, "handed to the pidfd teardown"),
-        "nothing was handed to the pidfd teardown"
+        !crate::log_capture::contains_since(mark, "torn down through its pidfd"),
+        "nothing was torn down through its pidfd"
     );
     assert_eq!(backend_drops.get(), 0, "tokio's Child must have been forgotten");
     let witness = slot.borrow_mut().take().expect("the hook ran");
@@ -519,8 +519,8 @@ async fn a_failed_identity_peek_is_unknown_kills_the_child_and_forgets_the_tokio
 /// A teardown whose kill is refused (`EPERM`, as a setuid child answers) while the child is still
 /// ours must not hand tokio's `Child` to its drop: tokio would reap it later with `waitpid(pid)`
 /// from its orphan queue, when the number may name another process. tokio's `Child` is forgotten
-/// and the child goes to the pidfd teardown (another kill, then a reap through the pidfd). The
-/// seam refuses only the first kill, so that teardown's kill lands and its reap is recorded.
+/// and the child is torn down again through its pidfd (another kill, then a reap through the pidfd).
+/// The seam refuses only the first kill, so that teardown's kill lands and its reap is recorded.
 ///
 /// Mutants: the refused arm releases tokio's `Child` (`backend_drops` is 1, no teardown reap is
 /// recorded); the arm forgets it and does nothing else (no teardown reap is recorded); the forget
@@ -560,8 +560,8 @@ fn refused_kill_teardown(attach_failure: bool, armed_in_hook: Option<fn() -> Box
     drop(armed);
     assert!(err.is_some(), "the forced failure fails the spawn");
     assert!(
-        crate::log_capture::contains_since(mark, "teardown refused); it is handed to the pidfd teardown"),
-        "the warn must say the kill was refused and the child handed on"
+        crate::log_capture::contains_since(mark, "teardown refused); it is torn down through its pidfd"),
+        "the warn must say the kill was refused and the child torn down through its pidfd"
     );
     // The identity check that failed (when one did), the refused kill and the forget are one event:
     // one warn, which carries the diagnosis and the leak.

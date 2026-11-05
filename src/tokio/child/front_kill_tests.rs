@@ -425,7 +425,7 @@ async fn a_failed_spawn_leaves_an_elevation_front_running_and_says_so() {
     assert!(
         warns
             .iter()
-            .all(|(_, text)| text.contains("leaks") && text.contains("left elevation front")),
+            .all(|(_, text)| text.contains("leaks") && text.contains("is left running and unreaped")),
         "{warns:?}"
     );
     for (_, pid, handed_back) in &failures {

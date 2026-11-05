@@ -172,6 +172,10 @@ pub(crate) fn wait_visible_exit(target: &Target<'_>) -> io::Result<PeekOutcome> 
 /// this process owns: `ECHILD` (something else reaped it) is [`Foreign::Gone`]. Blocks in
 /// `waitid(P_PIDFD, WEXITED)`, so a ptrace stop is skipped, not returned.
 #[cfg(target_os = "linux")]
+#[cfg_attr(
+    not(feature = "tokio"),
+    allow(dead_code, reason = "the only consumers are the tokio backend's")
+)]
 pub(crate) fn reap_blocking(target: &Target<'_>) -> io::Result<Result<ExitRecord, Foreign>> {
     linux::reap_blocking(target)
 }
