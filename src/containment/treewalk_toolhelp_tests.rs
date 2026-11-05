@@ -22,7 +22,9 @@ fn assert_names_toolhelp(result: Result<(), Error>, what: &str) {
 fn every_walk_over_a_failed_snapshot_errors_and_terminates_nothing() {
     type Walk = fn(&crate::Process) -> Result<(), Error>;
     let walks: [(&str, Walk); 2] = [
-        ("hard_kill", |p| super::hard_kill(p.id()).map(|_| ())),
+        ("hard_kill", |p| {
+            super::hard_kill(&crate::identity::HostKernel, p.id()).map(|_| ())
+        }),
         ("kill_tree", |p| p.kill_tree()),
     ];
     for (name, walk) in walks {
@@ -59,7 +61,7 @@ fn a_walk_from_a_root_that_lost_its_pid_terminates_nothing() {
     let me = ProcessId::current();
     let stale = ProcessId::from_parts_for_test(me.pid(), me.start_token_raw().wrapping_sub(1));
     let (child, _) = live_member();
-    super::hard_kill(stale).expect("a root that lost its pid is nothing to do");
+    super::hard_kill(&crate::identity::HostKernel, stale).expect("a root that lost its pid is nothing to do");
     release(child);
 }
 

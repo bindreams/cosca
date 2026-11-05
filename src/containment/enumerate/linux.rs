@@ -10,7 +10,7 @@ use crate::identity::RawPid;
 /// An outer pid namespace's `/proc` lists pids that mean nothing to the caller, and the tree walk
 /// signals by pid, so it is an error, not a snapshot. So is every `stat` read that is not an
 /// absence: the walk would miss that process and its subtree (see [`crate::identity::pid_stat`]).
-pub(crate) fn process_parents_with(kernel: &dyn Kernel) -> Result<Vec<(RawPid, RawPid)>, Error> {
+pub(crate) fn process_parents(kernel: &dyn Kernel) -> Result<Vec<(RawPid, RawPid)>, Error> {
     let mut out = Vec::new();
     let dir = crate::identity::proc_view_with(kernel).into_dir().map_err(|why| {
         match why.unsupported("listing the process table") {

@@ -1,25 +1,10 @@
 // Unit tests for process-group membership listing and the identity it carries.
 
-#[cfg(not(target_os = "linux"))]
-use super::members;
+use super::{members, state, GroupState, Member};
 #[cfg(target_os = "linux")]
-use super::members_with;
-use super::{state, GroupState, Member};
-#[cfg(target_os = "linux")]
-use crate::identity::{FakeKernel, HostKernel, UNREADABLE_STATUS_REASON};
-use crate::identity::{Liveness, ProcessId};
+use crate::identity::{FakeKernel, UNREADABLE_STATUS_REASON};
+use crate::identity::{HostKernel, Liveness, ProcessId};
 use nix::sys::signal::Signal;
-
-fn list(pgid: i32) -> std::io::Result<Vec<Member>> {
-    #[cfg(target_os = "linux")]
-    {
-        members_with(&HostKernel, pgid)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        members(pgid)
-    }
-}
 
 fn is_alive(m: &Member) -> bool {
     matches!(ProcessId::from_parts(m.pid, m.token).is_alive(), Liveness::Alive)
@@ -59,7 +44,7 @@ fn members_lists_a_live_owned_group() {
     await_member_ready(&mut child);
     let pgid = child.id() as i32;
 
-    let listed = list(pgid).expect("list the group");
+    let listed = members(&HostKernel, pgid).expect("list the group");
     let leader = listed
         .iter()
         .find(|m| m.pid == child.id())
@@ -81,7 +66,7 @@ fn members_marks_an_unreaped_leader_as_dead() {
     let pid = child.id();
     await_zombie(pid);
 
-    let listed = list(pid as i32).expect("list the group");
+    let listed = members(&HostKernel, pid as i32).expect("list the group");
     let leader = listed
         .iter()
         .find(|m| m.pid == pid)
@@ -109,7 +94,7 @@ fn members_marks_an_unreaped_leader_as_dead() {
 /// assertion is a genuine independent check rather than a restatement of the fixture.
 #[skuld::test]
 fn members_of_an_absent_group_is_empty() {
-    assert_eq!(list(i32::MAX).expect("list an absent group"), vec![]);
+    assert_eq!(members(&HostKernel, i32::MAX).expect("list an absent group"), vec![]);
 }
 
 /// The token the listing carries is the SAME encoding a live read of the pid would produce —
@@ -124,7 +109,7 @@ fn members_token_matches_a_live_read_of_the_same_pid() {
     await_member_ready(&mut child);
     let pgid = child.id() as i32;
 
-    let listed = list(pgid).expect("list the group");
+    let listed = members(&HostKernel, pgid).expect("list the group");
     let leader = listed.iter().find(|m| m.pid == child.id()).expect("leader listed");
     let live = ProcessId::of(child.id()).found().expect("resolve the live leader");
     assert_eq!(
@@ -383,7 +368,7 @@ fn a_refused_pidfd_open_falls_back_to_kill_naming_process_open() {
     let id = ProcessId::of(child.pid()).found().expect("the live child resolves");
     let mark = crate::log_capture::mark();
 
-    let kernel = crate::identity::FakeKernel::new().on_pidfd_open(child.pid(), Err(rustix::io::Errno::PERM));
+    let kernel = FakeKernel::over(&HostKernel).on_pidfd_open(child.pid(), Err(rustix::io::Errno::PERM));
     let reached = super::check_or_signal_linux_sigkill(
         &kernel,
         child.pid(),
@@ -422,7 +407,7 @@ fn a_transient_pidfd_open_failure_falls_back_to_kill_naming_the_syscall() {
     let id = ProcessId::of(child.pid()).found().expect("the live child resolves");
     let mark = crate::log_capture::mark();
 
-    let kernel = crate::identity::FakeKernel::new().on_pidfd_open(child.pid(), Err(rustix::io::Errno::MFILE));
+    let kernel = FakeKernel::over(&HostKernel).on_pidfd_open(child.pid(), Err(rustix::io::Errno::MFILE));
     let reached = super::check_or_signal_linux_sigkill(
         &kernel,
         child.pid(),
@@ -464,7 +449,7 @@ fn the_by_number_fallback_resends_only_after_a_check_of_the_root() {
     let resend = |check: &dyn crate::containment::RootCheck| {
         let root = crate::containment::GroupRoot::new(None, check);
         let capture = Capture::start();
-        let kernel = crate::identity::FakeKernel::new().on_pidfd_open(child.pid(), Err(rustix::io::Errno::MFILE));
+        let kernel = FakeKernel::over(&HostKernel).on_pidfd_open(child.pid(), Err(rustix::io::Errno::MFILE));
         let reached = super::check_or_signal_linux_sigkill(&kernel, child.pid(), id, &root);
         (reached, capture.group_steps())
     };
@@ -488,6 +473,162 @@ fn the_by_number_fallback_resends_only_after_a_check_of_the_root() {
         libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL,
         "the resend killed the member: status {status:#x}"
     );
+}
+
+/// The by-number fallback re-verifies the member through the kernel the sweep reads through: a
+/// member whose `stat` that kernel refuses is unassessable, and nothing is sent to it. Mutant:
+/// "`check_or_signal` re-verifies through `HostKernel`": the resend is sent.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn the_by_number_fallback_re_verifies_through_its_kernel() {
+    use crate::containment::cgroup::test_support::{block_on, fork_running};
+    use crate::send_log::{Capture, GroupStep};
+
+    let (gate_r, gate_w) = std::io::pipe().expect("pipe");
+    let gate_r_fd = std::os::fd::AsRawFd::as_raw_fd(&gate_r);
+    let child = fork_running(|| block_on(gate_r_fd));
+    let id = ProcessId::of(child.pid()).found().expect("the live child resolves");
+
+    let kernel = FakeKernel::over(&HostKernel)
+        .on_pidfd_open(child.pid(), Err(rustix::io::Errno::MFILE))
+        .on_read(&format!("{}/stat", child.pid()), Err(libc::EACCES));
+    let capture = Capture::start();
+    let reached = super::check_or_signal_linux_sigkill(
+        &kernel,
+        child.pid(),
+        id,
+        &crate::containment::GroupRoot::trusted_for_test(),
+    );
+
+    assert!(matches!(reached, super::Reached::Unknown), "got {reached:?}");
+    assert_eq!(capture.group_steps(), [GroupStep::Check], "nothing was resent");
+    drop(gate_w);
+}
+
+/// A pass reads each member through the kernel it is given. The leader's `stat` is read by the
+/// listing, then by the look at its liveness, then by the re-verify before the probe.
+///
+/// A re-verify the kernel refuses leaves the member unassessable. Mutant: "`check_or_signal`
+/// re-verifies through `HostKernel`": the probe reaches it and the group is `Cleared`.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn converge_re_verifies_a_member_through_its_kernel() {
+    let mut child = crate::test_spawn::spawn(&mut member_command(0)).expect("spawn leader");
+    await_member_ready(&mut child);
+    let pid = child.id();
+
+    let kernel = FakeKernel::over(&HostKernel).on_read_after(&format!("{pid}/stat"), 2, Err(libc::EACCES));
+    let state = super::converge(
+        &kernel,
+        pid as i32,
+        Signal::SIGTERM,
+        &crate::containment::GroupRoot::trusted_for_test(),
+    );
+
+    assert!(
+        matches!(state, Ok(GroupState::Unlistable { source: None, .. })),
+        "got {state:?}"
+    );
+    _ = child.kill();
+    _ = child.wait();
+}
+
+/// A member the kernel shows as another process (its pid's new owner) is not alive, so the pass
+/// attempts nothing on it: the root is not even checked. Mutant: "the liveness look reads through
+/// `HostKernel`".
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn converge_looks_at_a_members_liveness_through_its_kernel() {
+    let mut child = crate::test_spawn::spawn(&mut member_command(0)).expect("spawn leader");
+    await_member_ready(&mut child);
+    let pid = child.id();
+
+    let kernel = FakeKernel::over(&HostKernel).on_read_after(
+        &format!("{pid}/stat"),
+        1,
+        Ok(&crate::test_child::stat_of_a_new_owner(pid)),
+    );
+    let checks = std::cell::Cell::new(0);
+    let check = || {
+        checks.set(checks.get() + 1);
+        Ok(())
+    };
+    let state = super::converge(
+        &kernel,
+        pid as i32,
+        Signal::SIGTERM,
+        &crate::containment::GroupRoot::new(None, &check),
+    );
+
+    assert!(matches!(state, Ok(GroupState::Cleared)), "got {state:?}");
+    assert_eq!(checks.get(), 0, "nothing was attempted on a member that is not alive");
+    _ = child.kill();
+    _ = child.wait();
+}
+
+/// A member that refused the probe (`EPERM`) is looked at once more before it counts as a survivor,
+/// through the kernel the pass reads through. Its `stat` is read by the listing, the first look, the
+/// re-verify before the probe and then the second look, which finds its pid's new owner: the member
+/// is gone. Mutant: "`reconfirm_survivor`'s look reads through `HostKernel`": the member is still
+/// alive and the group is `Refused`.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn converge_looks_again_at_a_refusing_member_through_its_kernel() {
+    let mut child = crate::test_spawn::spawn(&mut member_command(0)).expect("spawn leader");
+    await_member_ready(&mut child);
+    let pid = child.id();
+
+    let kernel = FakeKernel::over(&HostKernel).on_read_after(
+        &format!("{pid}/stat"),
+        3,
+        Ok(&crate::test_child::stat_of_a_new_owner(pid)),
+    );
+    let refusing = crate::containment::unix::fault::refuse_probes();
+    let state = super::converge(
+        &kernel,
+        pid as i32,
+        Signal::SIGTERM,
+        &crate::containment::GroupRoot::trusted_for_test(),
+    );
+    drop(refusing);
+
+    assert!(matches!(state, Ok(GroupState::Cleared)), "got {state:?}");
+    _ = child.kill();
+    _ = child.wait();
+}
+
+/// A `SIGKILL` pass opens each member's pidfd through the kernel it is given: where that kernel
+/// refuses the open, the member's kill is resent by its number. Mutant: "`converge` hands
+/// `HostKernel` to `check_or_signal_linux_sigkill`": the open succeeds and the kill goes through
+/// the pidfd.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn converge_sigkill_opens_a_members_pidfd_through_its_kernel() {
+    use crate::send_log::{Capture, GroupStep, Route};
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let mut child = crate::test_spawn::spawn(&mut member_command(0)).expect("spawn leader");
+    await_member_ready(&mut child);
+    let pid = child.id();
+
+    let kernel = FakeKernel::over(&HostKernel).on_pidfd_open(pid, Err(rustix::io::Errno::MFILE));
+    let capture = Capture::start();
+    let state = super::converge(
+        &kernel,
+        pid as i32,
+        Signal::SIGKILL,
+        &crate::containment::GroupRoot::trusted_for_test(),
+    );
+    let steps = capture.group_steps();
+    drop(capture);
+
+    assert!(matches!(state, Ok(GroupState::Cleared)), "got {state:?}");
+    assert_eq!(
+        steps,
+        [GroupStep::Check, GroupStep::Member(Route::Number, pid, libc::SIGKILL)]
+    );
+    let status = child.wait().expect("reap the leader");
+    assert_eq!(status.signal(), Some(libc::SIGKILL), "the resend killed the member");
 }
 
 /// A member that is a live non-leader thread is `Unknown`, with a warn naming that cause, and is
@@ -543,7 +684,7 @@ fn a_live_non_leader_thread_member_is_unknown_and_never_falls_back_to_kill() {
 #[skuld::test]
 fn members_is_an_error_when_the_proc_view_is_diverged() {
     let kernel = FakeKernel::over(&HostKernel).diverged_view();
-    let err = members_with(&kernel, i32::MAX).expect_err("a diverged view lists nothing");
+    let err = members(&kernel, i32::MAX).expect_err("a diverged view lists nothing");
     assert!(err.to_string().contains("outer pid namespace"), "{err}");
 }
 
@@ -551,7 +692,7 @@ fn members_is_an_error_when_the_proc_view_is_diverged() {
 #[skuld::test]
 fn members_is_an_error_naming_the_cause_when_the_proc_view_is_unassessable() {
     let kernel = FakeKernel::over(&HostKernel).unreadable_view();
-    let err = members_with(&kernel, i32::MAX).expect_err("an unassessable view lists nothing");
+    let err = members(&kernel, i32::MAX).expect_err("an unassessable view lists nothing");
     assert!(err.to_string().contains(UNREADABLE_STATUS_REASON), "{err}");
 }
 
@@ -570,7 +711,7 @@ const PID: u32 = 4242;
 fn members_excludes_a_pid_whose_stat_read_says_it_is_gone_or_hidden() {
     for errno in [libc::ENOENT, libc::ESRCH, libc::EACCES, libc::EPERM] {
         let kernel = FakeKernel::listing_unreadable_pid(&HostKernel, PID, errno);
-        let listed = members_with(&kernel, i32::MAX).unwrap_or_else(|e| panic!("errno {errno} is an exclusion: {e}"));
+        let listed = members(&kernel, i32::MAX).unwrap_or_else(|e| panic!("errno {errno} is an exclusion: {e}"));
         assert!(listed.is_empty(), "errno {errno}: {listed:?}");
     }
 }
@@ -591,7 +732,7 @@ fn members_is_an_error_naming_pid_and_errno_for_any_other_stat_read_failure() {
         libc::ENOSYS,
     ] {
         let kernel = FakeKernel::listing_unreadable_pid(&HostKernel, PID, errno);
-        let err = members_with(&kernel, i32::MAX).expect_err("an unexplained read failure lists nothing");
+        let err = members(&kernel, i32::MAX).expect_err("an unexplained read failure lists nothing");
         let text = err.to_string();
         assert!(
             text.contains(&std::io::Error::from_raw_os_error(errno).to_string()),
@@ -618,7 +759,7 @@ fn members_is_an_error_for_eperm_when_the_checked_directory_also_refuses() {
     for recheck in [libc::EPERM, libc::ENOSYS, libc::EMFILE] {
         let kernel =
             FakeKernel::listing_unreadable_pid(&HostKernel, PID, libc::EPERM).on_read("self/stat", Err(recheck));
-        let err = members_with(&kernel, i32::MAX).expect_err("a refusing directory lists nothing");
+        let err = members(&kernel, i32::MAX).expect_err("a refusing directory lists nothing");
         let text = err.to_string();
         assert!(text.contains("self/stat"), "{recheck}: {text}");
         assert!(
