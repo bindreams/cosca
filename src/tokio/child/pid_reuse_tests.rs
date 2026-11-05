@@ -4,6 +4,8 @@
 
 use std::os::fd::AsFd;
 
+use crate::test_child::Console;
+
 use rustix::process::{pidfd_open, Pid, PidfdFlags, WaitId, WaitIdOptions};
 
 use crate::send_log::{Capture, Via};
@@ -13,7 +15,6 @@ use crate::test_child::pid_reuse::{
 };
 use crate::test_child::reaped_elsewhere::{assert_one_reaped_elsewhere_warn, REAPED_ELSEWHERE};
 use crate::test_groups::{namespaces, pidfd_group_signal, tracer_group};
-use crate::tokio::Command;
 
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
@@ -30,7 +31,7 @@ fn spawn_blocker() -> (crate::tokio::Child, std::io::PipeWriter) {
 /// [`spawn_blocker`] with `kill_on_drop` as given.
 fn spawn_blocker_with(kill_on_drop: bool) -> (crate::tokio::Child, std::io::PipeWriter) {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
     cmd.kill_on_drop(kill_on_drop);
@@ -739,7 +740,7 @@ fn finish_elevated_of_a_process_group_whose_root_reads_as_a_reuser_sends_no_kill
     runtime().block_on(async {
         let recorder = crate::containment::unix::fault::record_kill_group();
         let (stdin, writer) = crate::test_child::held_writer_stdin();
-        let mut cmd = Command::new();
+        let mut cmd = crate::test_child::tokio_command(Console::Hidden);
         cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
         cmd.stdin(stdin).expect("set stdin");
         cmd.contain_with(crate::ContainMode::Session);
@@ -925,7 +926,7 @@ fn spawn_failure_teardown_leaves_the_stranger_alone(attach_arm: bool) {
 
     runtime().block_on(async {
         let (stdin, writer) = crate::test_child::held_writer_stdin();
-        let mut cmd = Command::new();
+        let mut cmd = crate::test_child::tokio_command(Console::Hidden);
         cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
         cmd.stdin(stdin).expect("set stdin");
 
@@ -1029,7 +1030,7 @@ fn treewalk_root_is_the_verified_identity_body() {
 
     runtime().block_on(async {
         let (stdin, writer) = crate::test_child::held_writer_stdin();
-        let mut cmd = Command::new();
+        let mut cmd = crate::test_child::tokio_command(Console::Hidden);
         cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
         cmd.stdin(stdin).expect("set stdin");
         cmd.contain_with(crate::ContainMode::TreeWalk);
@@ -1089,7 +1090,7 @@ fn a_panicking_logger_in_reap_nows_via_pidfd_log_body() {
     crate::log_capture::install();
     runtime().block_on(async {
         let (stdin, writer) = crate::test_child::held_writer_stdin();
-        let mut cmd = Command::new();
+        let mut cmd = crate::test_child::tokio_command(Console::Hidden);
         cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
         cmd.stdin(stdin).expect("set stdin");
         let stranger = Rc::new(RefCell::new(None));
@@ -1168,7 +1169,7 @@ in_fresh_pid_ns!(
 /// A blocker in its own session (`Attached::ProcessGroup`), which exits once `writer` is dropped.
 fn spawn_group_blocker() -> (crate::tokio::Child, std::io::PipeWriter) {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
     cmd.contain_with(crate::ContainMode::Session);

@@ -1,4 +1,6 @@
 use super::{ProcSource, Waited};
+#[cfg(unix)]
+use crate::test_child::Console;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::test_groups::{tracer_group, Group};
 
@@ -167,7 +169,7 @@ async fn wait_and_reap_refuses_an_already_reaped_child_the_caller_never_awaited(
 )]
 #[skuld::test]
 async fn the_elevated_cleanup_entry_refuses_an_already_reaped_child() {
-    let mut cmd = crate::tokio::Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.executable(std::env::current_exe().expect("current_exe"))
         // `cosca::Command::args` is the FULL argv; libtest drops slot 0 as the binary name.
         .args(["cosca_unit_tests", "--exact", "__cosca_no_such_test__"]);
@@ -540,7 +542,7 @@ fn spawn_cosca_child_that_exits() -> crate::tokio::Child {
 
 #[cfg(unix)]
 fn spawn_cosca_child_that_exits_result() -> Result<crate::tokio::Child, crate::error::Error> {
-    let mut cmd = crate::tokio::Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.executable(std::env::current_exe().expect("current_exe"))
         // `cosca::Command::args` is the FULL argv; libtest drops slot 0 as the binary name.
         .args(["cosca_unit_tests", "--exact", "__cosca_no_such_test__"]);
@@ -735,7 +737,7 @@ async fn macos_a_refused_own_identity_read_fails_the_spawn_and_the_program_does_
     let _forced = crate::child::spawn::unique_report::seams::force_child_read_errno(libc::EPERM);
     use crate::child::spawn::identity_macos_tests::{ran_marker, RAN_ARGV};
     let (stdout, reader) = ran_marker();
-    let mut cmd = crate::tokio::Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(RAN_ARGV);
     cmd.stdout(stdout).expect("set stdout");
 
@@ -895,7 +897,7 @@ async fn kill_ends_a_child_stopped_for_its_tracer(#[fixture(tracer_group)] _grou
     use std::os::unix::process::ExitStatusExt as _;
 
     crate::tokio::test_runtime::assert_current_thread();
-    let mut cmd = crate::tokio::Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(crate::Stdio::null()).expect("set stdout");

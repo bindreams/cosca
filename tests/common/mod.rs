@@ -48,6 +48,10 @@ pub mod inheritable;
 #[cfg(windows)]
 pub mod windows_reparse;
 
+pub mod console_flags;
+pub use console_flags::Console;
+mod factory;
+pub use factory::*;
 mod locked;
 pub use locked::*;
 
@@ -548,11 +552,27 @@ pub fn spawn_control_with(
     contain: bool,
     configure: impl FnOnce(&mut cosca::Command),
 ) -> (cosca::Child, TcpStream) {
+    spawn_control_on(Console::Hidden, mode, extra, contain, configure)
+}
+
+/// [`spawn_control`] on this process's console, for a test of the console-group signals: a child
+/// with a window-less console of its own is outside the group those signals address.
+pub fn spawn_control_on_console(mode: &str, extra: &[&str], contain: bool) -> (cosca::Child, TcpStream) {
+    spawn_control_on(Console::Asked, mode, extra, contain, |_| {})
+}
+
+fn spawn_control_on(
+    console: Console,
+    mode: &str,
+    extra: &[&str],
+    contain: bool,
+    configure: impl FnOnce(&mut cosca::Command),
+) -> (cosca::Child, TcpStream) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap().to_string();
     let mut argv: Vec<String> = vec!["cosca_testbin".into(), mode.into(), addr];
     argv.extend(extra.iter().map(|s| s.to_string()));
-    let mut cmd = cosca::Command::new();
+    let mut cmd = command(console);
     cmd.executable(testbin()).args(&argv).env(ACK_ENV, "1");
     silence(&mut cmd);
     if contain {
@@ -610,7 +630,7 @@ pub fn spawn_tree_with(
 fn tree_command(mode: &str, contain: bool) -> (cosca::Command, TcpListener, TcpListener) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap().to_string();
-    let mut cmd = cosca::Command::new();
+    let mut cmd = command(Console::Hidden);
     cmd.executable(testbin())
         .args(["cosca_testbin", mode, addr.as_str()])
         .env(ACK_ENV, "1");
@@ -816,10 +836,31 @@ pub async fn spawn_control_async_with(
     contain: bool,
     configure: impl FnOnce(&mut cosca::tokio::Command),
 ) -> (cosca::tokio::Child, TcpStream) {
+    spawn_control_async_on(Console::Hidden, mode, extra, contain, configure).await
+}
+
+/// [`spawn_control_async`] on this process's console, for a test of the console-group signals.
+#[cfg(feature = "tokio")]
+pub async fn spawn_control_async_on_console(
+    mode: &str,
+    extra: &[&str],
+    contain: bool,
+) -> (cosca::tokio::Child, TcpStream) {
+    spawn_control_async_on(Console::Asked, mode, extra, contain, |_| {}).await
+}
+
+#[cfg(feature = "tokio")]
+async fn spawn_control_async_on(
+    console: Console,
+    mode: &str,
+    extra: &[&str],
+    contain: bool,
+    configure: impl FnOnce(&mut cosca::tokio::Command),
+) -> (cosca::tokio::Child, TcpStream) {
     let (listener, addr) = bind_async_listener();
     let mut argv: Vec<String> = vec!["cosca_testbin".into(), mode.into(), addr];
     argv.extend(extra.iter().map(|s| s.to_string()));
-    let mut cmd = cosca::tokio::Command::new();
+    let mut cmd = tokio_command(console);
     cmd.env(ACK_ENV, "1");
     silence_async(&mut cmd);
     if contain {
@@ -853,8 +894,26 @@ pub async fn spawn_tree_async(
     mode: &str,
     configure: impl FnOnce(&mut cosca::tokio::Command),
 ) -> (cosca::tokio::Child, TcpStream, TcpStream) {
+    spawn_tree_async_on(Console::Hidden, mode, configure).await
+}
+
+/// [`spawn_tree_async`] on this process's console, for a test of the console-group signals.
+#[cfg(feature = "tokio")]
+pub async fn spawn_tree_async_on_console(
+    mode: &str,
+    configure: impl FnOnce(&mut cosca::tokio::Command),
+) -> (cosca::tokio::Child, TcpStream, TcpStream) {
+    spawn_tree_async_on(Console::Asked, mode, configure).await
+}
+
+#[cfg(feature = "tokio")]
+async fn spawn_tree_async_on(
+    console: Console,
+    mode: &str,
+    configure: impl FnOnce(&mut cosca::tokio::Command),
+) -> (cosca::tokio::Child, TcpStream, TcpStream) {
     let (listener, addr) = bind_async_listener();
-    let mut cmd = cosca::tokio::Command::new();
+    let mut cmd = tokio_command(console);
     // Load the testbin as argv[0] via the std path (mode/addr at args[1..], so it behaves
     // identically): the trees that stay uncontained are backend-agnostic, so
     // argv[0] keeps this helper on one code path across OSes. `configure` applies the
@@ -909,7 +968,7 @@ pub async fn spawn_tree_async_ending_a_failure(mode: &str) -> (cosca::tokio::Chi
     use std::panic::resume_unwind;
 
     let (listener, addr) = bind_async_listener();
-    let mut cmd = cosca::tokio::Command::new();
+    let mut cmd = tokio_command(Console::Hidden);
     cmd.args([testbin(), mode, addr.as_str()])
         .env(ACK_ENV, "1")
         .env(ECHO_HELD_ENV, "1");
@@ -1015,7 +1074,7 @@ pub async fn spawn_echo_tree_async_configured(
     configure: impl FnOnce(&mut cosca::tokio::Command),
 ) -> AsyncEchoTree {
     let (listener, addr) = bind_async_listener();
-    let mut cmd = cosca::tokio::Command::new();
+    let mut cmd = tokio_command(Console::Hidden);
     cmd.args([testbin(), mode, addr.as_str()]).env(ACK_ENV, "1");
     silence_async(&mut cmd);
     configure(&mut cmd);

@@ -7,6 +7,8 @@ use crate::child::Child;
 use crate::error::ChildFate;
 use crate::identity::Liveness;
 use crate::os_process::fake::FakeProcess;
+#[cfg(target_os = "linux")]
+use crate::test_child::Console;
 use crate::test_child::{held_uncontained_blocker, tear_down_holding};
 
 /// Make the next kill of `child` fail with `PermissionDenied`, as an elevated child's does.
@@ -202,7 +204,7 @@ fn a_handed_back_process_group_child_has_its_group_killed_first() {
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     let recorder = crate::containment::unix::fault::record_kill_group();
     let (stdin, writer) = crate::test_child::held_writer_stdin();
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
     cmd.contain_with(ContainMode::Session);
@@ -395,14 +397,14 @@ mod in_a_cgroup {
     use crate::error::ChildFate;
     use crate::identity::Existence;
     use crate::os_process::fake::ReapAnswer;
-    use crate::test_child::tear_down_holding;
+    use crate::test_child::{tear_down_holding, Console};
     use crate::test_groups::{cgroup, Group};
-    use crate::{Command, ContainMode, Containment};
+    use crate::{ContainMode, Containment};
 
     /// A `cat` in a cgroup leaf, and the write end of its stdin.
     fn blocker_in_a_leaf() -> (Child, PipeWriter) {
         let (stdin, writer) = crate::test_child::held_writer_stdin();
-        let mut cmd = Command::new();
+        let mut cmd = crate::test_child::command(Console::Hidden);
         cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
         cmd.stdin(stdin).expect("set stdin");
         cmd.contain_with(ContainMode::Strongest);

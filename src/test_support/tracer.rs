@@ -57,6 +57,8 @@
 
 use std::io::Write as _;
 
+use crate::test_child::Console;
+
 mod attach;
 mod machine;
 mod sys;
@@ -599,7 +601,7 @@ impl Ready {
 /// may read them and attach.
 pub(crate) fn spawn_tracee(kind: Tracee) -> (crate::Child, Ready) {
     let exe = std::env::current_exe().expect("current_exe");
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.executable(&exe)
         .args(crate::test_child::fixture_argv(crate::test_child::fixture_path!(
             uh_tracee_fixture

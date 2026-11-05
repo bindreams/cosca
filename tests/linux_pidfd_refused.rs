@@ -339,7 +339,7 @@ fn a_seccomp_refused_pidfd_open_fails_the_spawn_naming_spawn() {
     for (code, name) in REFUSALS {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().unwrap().to_string();
-        let mut cmd = cosca::Command::new();
+        let mut cmd = common::command(common::Console::Hidden);
         cmd.executable(common::testbin())
             .args(["cosca_testbin", "control-block", addr.as_str(), "R"]);
         let result = std::thread::scope(|scope| {
@@ -407,7 +407,7 @@ fn a_seccomp_refused_pidfd_open_is_found_before_any_fork() {
             code,
             name,
             |stdout| {
-                let mut cmd = cosca::Command::new();
+                let mut cmd = common::command(common::Console::Hidden);
                 cmd.args(["sh", "-c", "echo ran"]);
                 cmd.stdout(cosca::Stdio::from_file(stdout)).expect("set stdout");
                 cmd
@@ -431,7 +431,7 @@ fn a_seccomp_refused_pidfd_open_is_found_before_any_async_fork() {
             code,
             name,
             |stdout| {
-                let mut cmd = cosca::tokio::Command::new();
+                let mut cmd = common::tokio_command(common::Console::Hidden);
                 cmd.args(["sh", "-c", "echo ran"]);
                 cmd.stdout(cosca::Stdio::from_file(stdout)).expect("set stdout");
                 cmd

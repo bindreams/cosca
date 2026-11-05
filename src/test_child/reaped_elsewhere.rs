@@ -1,6 +1,8 @@
 //! Fixtures for a contained root reaped behind its handle's back, and the record its tree ops log
 //! for it.
 
+use super::Console;
+
 /// Every record of the tree ops' skip for a root reaped elsewhere contains this.
 pub(crate) const REAPED_ELSEWHERE: &str = "was reaped elsewhere";
 
@@ -59,7 +61,7 @@ pub(crate) fn assert_one_untrusted_number_warn(mark: usize, pgid: u32) {
 
 /// A `sleep` in its own session: `Attached::ProcessGroup`, or on macOS an fd marker with a group.
 pub(crate) fn session_sleep() -> crate::Command {
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(["sleep", "300"]);
     cmd.contain_with(crate::ContainMode::Session);
     cmd
@@ -71,7 +73,7 @@ pub(crate) fn session_sleep() -> crate::Command {
 /// wait to block on a root that never ends.
 #[cfg(target_os = "linux")]
 pub(crate) fn session_cat() -> crate::Command {
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(["cat"]);
     cmd.contain_with(crate::ContainMode::Session);
     cmd.stdin(crate::Stdio::pipe_in()).expect("stdin pipe");
@@ -83,7 +85,7 @@ pub(crate) fn session_cat() -> crate::Command {
 /// signal.
 #[cfg(target_os = "linux")]
 pub(crate) fn term_ignoring_session_cat() -> crate::Command {
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(["sh", "-c", r#"trap "" TERM; echo ready; exec cat"#]);
     cmd.contain_with(crate::ContainMode::Session);
     cmd.stdin(crate::Stdio::pipe_in()).expect("stdin pipe");
@@ -224,7 +226,7 @@ impl EscapedHolder {
 #[cfg(target_os = "macos")]
 pub(crate) fn escaped_holder_tree(mode: crate::ContainMode, ignore_term: bool) -> (crate::Child, EscapedHolder) {
     use std::io::BufRead as _;
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(["sh", "-c", &escaped_holder_script(ignore_term)]);
     cmd.contain_with(mode);
     cmd.stdin(crate::Stdio::pipe_in()).expect("stdin pipe");

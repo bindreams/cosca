@@ -2,6 +2,7 @@
 
 use crate::child::spawn::fault::{self, SpawnPoint};
 use crate::error::Error;
+use crate::test_child::Console;
 use crate::test_groups::{setuid, Group};
 use crate::wait::exit_only::seams::force_peeks;
 
@@ -20,7 +21,7 @@ fn a_failed_identity_peek_is_unknown_and_kills_and_reaps_the_child() {
     crate::log_capture::install();
     // Released after the kill: a kill that sent nothing exits 0.
     let (stdin, teardown) = fault::teardown_blocker_stdin();
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
     let pid = Rc::new(Cell::new(0));

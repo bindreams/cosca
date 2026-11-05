@@ -5,6 +5,8 @@
 //! came late means std's own spawn is not trusted, so the child is torn down through its unique id.
 
 use std::cell::Cell;
+
+use crate::test_child::Console;
 use std::rc::Rc;
 
 use super::identity_macos_tests::{
@@ -235,7 +237,7 @@ fn macos_a_spawn_waiting_for_a_late_report_lets_another_spawn_complete() {
     let (mut cmd, writer) = sync_blocker();
     cmd.stdout(null_stdio()).expect("set stdout");
     // Set up before the close, so its stdio lands above fds 0 to 2.
-    let mut other = crate::Command::new();
+    let mut other = crate::test_child::command(Console::Hidden);
     other.args(["/usr/bin/true"]);
     other.stdin(null_stdio()).expect("set stdin");
     other.stdout(null_stdio()).expect("set stdout");
@@ -432,7 +434,7 @@ impl Tree {
 fn macos_sync_spawn_of_a_late_contained_child_kills_its_tree() {
     crate::log_capture::install();
     let (tree, ends) = tree_pipes();
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(TREE_ARGV).contain();
     for (fd, end) in ends {
         cmd.fd(fd, end).expect("set the fd");
@@ -467,7 +469,7 @@ fn late_tree_walk(spoil: impl FnOnce() + 'static) -> (u32, ChildFate, bool, usiz
     use crate::containment::ContainMode;
     crate::log_capture::install();
     let (tree, ends) = tree_pipes();
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(TREE_ARGV).contain_with(ContainMode::TreeWalk);
     cmd.suppress_fd_marker();
     for (fd, end) in ends {
@@ -557,7 +559,7 @@ fn macos_late_session_child_without_a_marker_is_torn_down_with_what_it_starts_af
     };
     crate::log_capture::install();
     let (tree, ends) = tree_pipes();
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(TREE_ARGV).contain_with(ContainMode::Session);
     cmd.suppress_fd_marker();
     cmd.stdin(null_stdio()).expect("set stdin");
@@ -632,7 +634,7 @@ fn macos_late_session_child_without_a_marker_is_torn_down_with_what_it_starts_af
 fn macos_sync_spawn_of_a_late_child_reaped_before_its_teardown_kills_its_marked_tree() {
     crate::log_capture::install();
     let (tree, ends) = tree_pipes();
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(TREE_ARGV).contain();
     for (fd, end) in ends {
         cmd.fd(fd, end).expect("set the fd");
@@ -1063,7 +1065,7 @@ fn late_tree_not_zombie(
     use std::cell::RefCell;
     crate::log_capture::install();
     let (tree, ends) = tree_pipes();
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(TREE_ARGV);
     contain(&mut cmd);
     for (fd, end) in ends {
@@ -1245,7 +1247,7 @@ fn macos_late_teardown_of_an_unreadable_marked_child_sweeps_its_holders() {
     use crate::child::spawn::fault::{set_at, SpawnPoint};
     crate::log_capture::install();
     let (tree, ends) = tree_pipes();
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(TREE_ARGV).contain();
     for (fd, end) in ends {
         cmd.fd(fd, end).expect("set the fd");
