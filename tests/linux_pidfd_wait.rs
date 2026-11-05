@@ -1,5 +1,5 @@
 //! Regression tests: a non-leader tid must not be reported as a live-and-exited process.
-//! `pidfd_open` refuses such a tid (EINVAL < 6.16, ENOENT >= 6.16); see `open_verified`. A live
+//! `pidfd_open` refuses such a tid (EINVAL < 6.16, ENOENT >= 6.16); see `open_verified_with`. A live
 //! one is `NotThreadGroupLeader`; an exited-but-unreaped (ptraced) one is exited. The
 //! reaped-leader sibling is in `src/os_process/linux/open_tests.rs`.
 
