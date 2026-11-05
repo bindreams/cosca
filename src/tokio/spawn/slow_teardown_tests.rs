@@ -158,7 +158,7 @@ fn a_teardown_whose_first_kill_was_refused_warns_once_past_1s(#[fixture(tracer_g
 
 /// The teardown after a failed attach of an elevation front in a cgroup leaf. The leaf's kill ends
 /// the front, which is sent nothing itself, and the teardown waits for its exit through its pidfd
-/// (`OwnedChild::tear_down` with `TeardownKind::Look`).
+/// (`OwnedChild::look_at_front`).
 ///
 /// Mutant: the front's wait has no warn.
 #[skuld::test]

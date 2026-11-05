@@ -251,7 +251,8 @@ fn try_reap_of_a_zombie_only_its_tracer_sees_is_recheck(#[fixture(tracer_group)]
 /// Mutant: a pid is required to signal or to settle the child.
 #[skuld::test]
 fn a_pidless_linux_child_is_signalled_and_reaped_through_its_pidfd() {
-    use crate::child::owned::teardown::{Disposition, TeardownKind};
+    use crate::child::owned::owned_tests::teardown_lines::said_of;
+    use crate::child::owned::teardown::{Disposition, Kill};
     use crate::error::ChildFate;
     use crate::os_process::linux::LinuxProcess;
 
@@ -267,14 +268,14 @@ fn a_pidless_linux_child_is_signalled_and_reaped_through_its_pidfd() {
     assert_eq!(owned.pid(), None);
     let torn = owned.tear_down(
         None,
-        TeardownKind::Kill {
+        Kill {
             disposition: Disposition::Leave,
             tree: None,
         },
         None,
     );
-    assert_eq!(torn.fate, ChildFate::Reaped, "{torn:?}");
-    assert!(matches!(torn.clause, Some((log::Level::Debug, _))), "{torn:?}");
+    assert_eq!(torn.fate(), ChildFate::Reaped, "{torn:?}");
+    assert!(matches!(said_of(&torn), Some((log::Level::Debug, _))), "{torn:?}");
 }
 
 /// A send through the pidfd of a pid-less child that finds it reaped says "already gone" without a

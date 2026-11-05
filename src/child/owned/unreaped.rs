@@ -98,7 +98,7 @@ impl Drop for Unreaped {
             return;
         }
         let subject = format!("{who} was dropped without wait or leak");
-        let (level, text) = settlement.wording(&subject, None, Some(Disposition::Leave));
-        log::log!(level, "{text}");
+        let said = settlement.wording(&subject, None, Some(Disposition::Leave));
+        log::log!(said.level(), "{}", said.text());
     }
 }

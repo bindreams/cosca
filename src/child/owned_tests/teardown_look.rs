@@ -6,7 +6,8 @@ use std::cell::RefCell;
 use std::io;
 
 use super::teardown::{child_with_an_unreadable_exit, due_now, exit, fake, fire_on_block, id, slow_warns, PID};
-use crate::child::owned::teardown::{LookOutcome, Reach, TeardownKind, TeardownOutcome};
+use crate::child::lifecycle::Wording;
+use crate::child::owned::teardown::{FrontLook, LookOutcome, Reach};
 use crate::child::owned::OwnedChild;
 use crate::error::ChildFate;
 use crate::identity::ProcessId;
@@ -44,29 +45,27 @@ impl Reach for FakeReach {
 /// none; or the failure of reading the subtree that kill went through.
 type Reaches<'a> = Result<Option<&'a dyn Reach>, io::Error>;
 
-/// `tear_down(id, Look(reach), due)` over `fake`, and everything it logged on this thread.
+/// `look_at_front(id, reach, due)` over `fake`, and everything it logged on this thread.
 fn look_logged(
     fake: &FakeProcess,
     id: Option<ProcessId>,
     reach: Reaches<'_>,
     due: Option<Due>,
-) -> (TeardownOutcome, Vec<(log::Level, String)>) {
+) -> (FrontLook, Vec<(log::Level, String)>) {
     crate::log_capture::install();
     let child = OwnedChild::new(Box::new(fake.clone()));
     let mark = crate::log_capture::mark();
-    let torn = child.tear_down(id, TeardownKind::Look(reach), due);
+    let torn = child.look_at_front(id, reach, due);
     (torn, crate::log_capture::records_since_on_current_thread(mark, ""))
 }
 
-fn look(fake: &FakeProcess, reach: Option<&dyn Reach>) -> TeardownOutcome {
+fn look(fake: &FakeProcess, reach: Option<&dyn Reach>) -> FrontLook {
     look_logged(fake, Some(id()), Ok(reach), None).0
 }
 
 /// How the look at a front went, as far as the tests tell it apart.
 #[derive(Debug, PartialEq, Eq)]
 enum Went {
-    /// Not the look of a front.
-    Nothing,
     /// The look, or the wait after it, ended; the fate and `uncollected` say how.
     Ended,
     LeftRunning,
@@ -74,21 +73,30 @@ enum Went {
     SubtreeUnreadable,
 }
 
-fn went(torn: &TeardownOutcome) -> Went {
+fn went(torn: &FrontLook) -> Went {
     match &torn.look {
-        None => Went::Nothing,
-        Some(LookOutcome::Ended(_)) => Went::Ended,
-        Some(LookOutcome::LeftRunning) => Went::LeftRunning,
-        Some(LookOutcome::PlaceUnreadable(_)) => Went::PlaceUnreadable,
-        Some(LookOutcome::SubtreeUnreadable(_)) => Went::SubtreeUnreadable,
+        LookOutcome::Ended(_) => Went::Ended,
+        LookOutcome::LeftRunning => Went::LeftRunning,
+        LookOutcome::PlaceUnreadable(_) => Went::PlaceUnreadable,
+        LookOutcome::SubtreeUnreadable(_) => Went::SubtreeUnreadable,
     }
 }
 
-/// The policy words nothing of a front: what the drop says is its own, from the typed outcome.
+/// Whether the look left the front uncollected, as the wording of the look says: a look that did
+/// not end is a front still running.
+fn uncollected(torn: &FrontLook) -> bool {
+    match &torn.look {
+        LookOutcome::Ended(settlement) => {
+            matches!(settlement.wording("", None, None), Wording::Uncollected(_))
+        }
+        _ => true,
+    }
+}
+
+/// The policy words nothing of a front: what the drop says is its own, from the typed look.
 #[track_caller]
-fn assert_outcome(torn: &TeardownOutcome, fate: ChildFate, went_as: Went) {
+fn assert_outcome(torn: &FrontLook, fate: ChildFate, went_as: Went) {
     assert_eq!((&torn.fate, went(torn)), (&fate, went_as), "{torn:?}");
-    assert_eq!(torn.clause, None, "{torn:?}");
 }
 
 /// A front that has exited at the look is reaped, and nothing asks where it is.
@@ -154,7 +162,7 @@ fn a_failed_wait_for_a_reached_front_is_unaccounted_for() {
     let _fire = fire_on_block(&fake);
     let torn = look(&fake, Some(&FakeReach::answering(Ok(true))));
     assert_outcome(&torn, ChildFate::Killed, Went::Ended);
-    assert!(torn.uncollected, "{torn:?}");
+    assert!(uncollected(&torn), "{torn:?}");
 }
 
 /// A front reaped by someone else between the look and the wait is `Killed` (the cgroup kill landed
@@ -167,7 +175,7 @@ fn a_front_reaped_elsewhere_between_the_look_and_the_wait_is_killed_and_silent()
     let _fire = fire_on_block(&fake);
     let (torn, records) = look_logged(&fake, Some(id()), Ok(Some(&FakeReach::answering(Ok(true)))), None);
     assert_outcome(&torn, ChildFate::Killed, Went::Ended);
-    assert!(!torn.uncollected, "{torn:?}");
+    assert!(!uncollected(&torn), "{torn:?}");
     assert!(
         records.iter().all(|(level, _)| *level >= log::Level::Debug),
         "{records:?}"
@@ -228,7 +236,7 @@ fn a_front_whose_subtree_cannot_be_read_is_left_for_the_subtree_with_its_own_err
     let unreadable = io::Error::new(io::ErrorKind::PermissionDenied, Original);
     let (torn, _) = look_logged(&fake, Some(id()), Err(unreadable), None);
     assert_outcome(&torn, ChildFate::Running { id: Some(id()) }, Went::SubtreeUnreadable);
-    let Some(LookOutcome::SubtreeUnreadable(e)) = &torn.look else {
+    let LookOutcome::SubtreeUnreadable(e) = &torn.look else {
         panic!("{torn:?}");
     };
     assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
@@ -252,9 +260,10 @@ fn a_front_that_has_exited_is_reaped_though_its_subtree_cannot_be_read() {
 #[cfg(unix)]
 mod worded {
     use super::super::teardown::warn_of;
+    use super::super::teardown_lines::said_of;
     use super::*;
     use crate::child::lifecycle::Settlement;
-    use crate::child::owned::teardown::Disposition;
+    use crate::child::owned::teardown::{Disposition, TeardownOutcome};
     use crate::child::owned::ChildWaitOutcome;
     use crate::os_process::child::ExitRecord;
 
@@ -291,7 +300,6 @@ mod worded {
         let (worded, records) = worded_by_the_drop(disposition, fake, reach);
         assert_eq!(warn_of(&worded), Some(wanted), "{disposition:?}: {worded:?}");
         assert_eq!(records, [], "the wording logs nothing: the caller does");
-        assert!(worded.look.is_none(), "the look is worded and used up: {worded:?}");
     }
 
     /// The clause is a `debug` line that says `wanted`.
@@ -300,7 +308,7 @@ mod worded {
         let _fire = fire_on_block(fake);
         let (worded, records) = worded_by_the_drop(disposition, fake, reach);
         assert_eq!(
-            worded.clause,
+            said_of(&worded),
             Some((log::Level::Debug, wanted.to_owned())),
             "{disposition:?}: {worded:?}"
         );
@@ -433,11 +441,9 @@ mod worded {
     fn a_front_reaped_with_an_unreadable_exit_record_is_worded_as_reaped() {
         for disposition in BOTH {
             let answer = Ok(ChildWaitOutcome::Exited(ExitRecord::Unreadable { si_code: 7 }));
-            let torn = TeardownOutcome {
+            let torn = FrontLook {
                 fate: ChildFate::Reaped,
-                uncollected: false,
-                look: Some(LookOutcome::Ended(Settlement::new(answer, true))),
-                clause: None,
+                look: LookOutcome::Ended(Settlement::new(answer, true)),
             };
             let worded = crate::child::word_front(PID, &WHY, disposition, torn);
             assert_eq!(
@@ -458,7 +464,7 @@ mod worded {
     #[skuld::test]
     fn a_front_collected_with_an_unreadable_exit_record_is_worded_without_a_hand_back() {
         for disposition in BOTH {
-            let torn = child_with_an_unreadable_exit().tear_down(Some(id()), TeardownKind::Look(Ok(None)), None);
+            let torn = child_with_an_unreadable_exit().look_at_front(Some(id()), Ok(None), None);
             let worded = crate::child::word_front(PID, &WHY, disposition, torn);
             let left = warn_of(&worded).expect("a warn to say");
             assert!(left.contains("reaped it;") && left.contains("unreadable"), "{left}");
@@ -531,17 +537,6 @@ mod worded {
             );
         }
     }
-
-    /// A teardown that is not a front's has no look to word: the outcome is returned as it is.
-    ///
-    /// Mutant: the rendering rewrites `clause`.
-    #[skuld::test]
-    fn an_outcome_with_no_look_is_returned_as_it_is() {
-        let mut torn = TeardownOutcome::new(ChildFate::Reaped);
-        torn.clause = Some((log::Level::Warn, "from the policy".to_owned()));
-        let worded = crate::child::word_front(PID, &WHY, Disposition::Leave, torn);
-        assert_eq!(warn_of(&worded), Some("from the policy"));
-    }
 }
 
 /// A front someone else reaped is gone, unaccounted for, and nothing is warned of.
@@ -553,7 +548,7 @@ fn a_front_reaped_by_someone_else_is_gone() {
     let reach = FakeReach::answering(Ok(true));
     let torn = look(&fake, Some(&reach));
     assert_outcome(&torn, ChildFate::Gone, Went::Ended);
-    assert!(!torn.uncollected, "{torn:?}");
+    assert!(!uncollected(&torn), "{torn:?}");
     assert_eq!(reach.asked(), []);
 }
 
@@ -595,7 +590,7 @@ fn a_failed_look_at_a_front_is_unknown() {
     let reach = FakeReach::answering(Ok(true));
     let torn = look(&fake, Some(&reach));
     assert_outcome(&torn, ChildFate::Unknown, Went::Ended);
-    assert!(torn.uncollected, "{torn:?}");
+    assert!(uncollected(&torn), "{torn:?}");
     assert_eq!(reach.asked(), []);
 }
 
@@ -629,7 +624,6 @@ fn a_pidless_front_is_left_running() {
     let fake = FakeProcess::new([]).reaps([ReapAnswer::Running]);
     let torn = look(&fake, None);
     assert_eq!(went(&torn), Went::LeftRunning, "{torn:?}");
-    assert_eq!(torn.clause, None);
 }
 
 /// A front waited for past the threshold is warned of once before the wait blocks; one that exits
@@ -666,9 +660,9 @@ fn a_front_waited_for_past_its_threshold_warns_once() {
 /// Mutant: a look that ended with an unreadable record is a failed look, `Unknown` and uncollected.
 #[skuld::test]
 fn a_front_whose_look_found_the_exit_record_unreadable_is_reaped_and_collected() {
-    let torn = child_with_an_unreadable_exit().tear_down(Some(id()), TeardownKind::Look(Ok(None)), None);
+    let torn = child_with_an_unreadable_exit().look_at_front(Some(id()), Ok(None), None);
     assert_eq!((went(&torn), &torn.fate), (Went::Ended, &ChildFate::Reaped), "{torn:?}");
-    assert!(!torn.uncollected, "{torn:?}");
+    assert!(!uncollected(&torn), "{torn:?}");
 }
 
 /// A front left running is never waited for, so a threshold never has it look for the exit.

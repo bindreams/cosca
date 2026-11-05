@@ -9,7 +9,7 @@ use std::sync::Arc;
 use super::held_teardown::{tear_down_held, HeldTeardown};
 use super::Diagnosis;
 use crate::child::owned::owned_tests::teardown_lines::{self, Found, Kill};
-use crate::child::owned::teardown::{Disposition, Expect, PidfdTeardown, TeardownOutcome};
+use crate::child::owned::teardown::{Disposition, Expect, PidfdTeardown};
 use crate::child::owned::OwnedChild;
 use crate::containment::cgroup::{fault, PlacedAtRemoval, Subtree, Swept};
 use crate::elevation::front::Front;
@@ -441,23 +441,24 @@ fn after_a_failed_wait(expect: Expect) -> PidfdTeardown {
 /// logged, whoever the caller is.
 ///
 /// Mutant: `warn_pidfd_teardown` asserts nothing.
+#[cfg(debug_assertions)]
 #[skuld::test]
 #[should_panic(expected = "a wait on a child's own pidfd failed")]
 fn a_failed_wait_on_a_pidfd_nothing_looked_at_breaks_the_contract() {
     crate::log_capture::install();
-    let mut torn = after_a_failed_wait(Expect::Waited);
-    torn.say_as_failed_spawn(&mut Diagnosis::default());
+    after_a_failed_wait(Expect::Waited).say_as_failed_spawn(&mut Diagnosis::default());
 }
 
 /// A kill of a child that never ran the program is not refused: a child left running breaks the
 /// contract.
 ///
 /// Mutant: `Expect::Unexecuted` asserts no more than `Expect::Waited`.
+#[cfg(debug_assertions)]
 #[skuld::test]
 #[should_panic(expected = "never ran the program was refused")]
 fn a_refused_kill_of_a_child_that_never_ran_breaks_the_contract() {
     crate::log_capture::install();
-    let (mut torn, _) = teardown_of(Kill::Refused, Found::Running, Expect::Unexecuted);
+    let (torn, _) = teardown_of(Kill::Refused, Found::Running, Expect::Unexecuted);
     torn.say_as_failed_spawn(&mut Diagnosis::default());
 }
 
@@ -469,8 +470,7 @@ fn a_refused_kill_of_a_child_that_never_ran_breaks_the_contract() {
 fn a_failed_wait_on_a_pidfd_a_look_failed_on_is_not_a_breach() {
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
-    let mut torn = after_a_failed_wait(Expect::Anything);
-    torn.say_as_failed_spawn(&mut Diagnosis::default());
+    after_a_failed_wait(Expect::Anything).say_as_failed_spawn(&mut Diagnosis::default());
     assert_eq!(warns_since(mark).len(), 1);
 }
 
@@ -482,7 +482,7 @@ fn a_failed_wait_on_a_pidfd_a_look_failed_on_is_not_a_breach() {
 #[skuld::test]
 fn a_clean_teardown_with_a_diagnosis_owed_is_one_labelled_warn() {
     crate::log_capture::install();
-    let (mut torn, clause) = teardown_of(Kill::Delivered, Found::Exited, Expect::Waited);
+    let (torn, clause) = teardown_of(Kill::Delivered, Found::Exited, Expect::Waited);
     let mut why = Diagnosis::default();
     why.add("the identity check failed");
     let mark = crate::log_capture::mark();
@@ -496,40 +496,4 @@ fn a_clean_teardown_with_a_diagnosis_owed_is_one_labelled_warn() {
             "teardown after a failed spawn: the identity check failed; {clause}"
         )]
     );
-}
-
-/// An uncollected outcome whose clause is `clause`: running, left.
-fn uncollected_with(clause: Option<(log::Level, &str)>) -> TeardownOutcome {
-    let mut outcome = TeardownOutcome::new(ChildFate::Running { id: None });
-    outcome.uncollected = true;
-    outcome.clause = clause.map(|(level, text)| (level, text.to_owned()));
-    outcome
-}
-
-/// The contract of every outcome is asserted where its clause is made, so that every consumer of an
-/// outcome is covered: a child left uncollected with a clause below warn breaks it.
-///
-/// Mutant: the assertion is dropped, or checks that a clause exists, not its level.
-#[skuld::test]
-#[should_panic(expected = "the clause of an uncollected child is a warn")]
-fn an_uncollected_child_whose_clause_is_below_warn_breaks_the_contract() {
-    uncollected_with(Some((log::Level::Debug, "a clause below warn"))).with_clause_asserted();
-}
-
-/// A child left uncollected has a clause: an outcome with none breaks the contract.
-///
-/// Mutant: a missing clause of an uncollected child is let through.
-#[skuld::test]
-#[should_panic(expected = "the clause of an uncollected child is a warn")]
-fn an_uncollected_child_with_no_clause_breaks_the_contract() {
-    uncollected_with(None).with_clause_asserted();
-}
-
-/// A child left uncollected with a clause at warn, and a collected one with none, keep the contract.
-///
-/// Mutant: the assertion rejects a warn, or a collected child with no clause.
-#[skuld::test]
-fn an_outcome_that_keeps_the_contract_passes_the_assertion() {
-    uncollected_with(Some((log::Level::Warn, "a warn"))).with_clause_asserted();
-    TeardownOutcome::new(ChildFate::Reaped).with_clause_asserted();
 }

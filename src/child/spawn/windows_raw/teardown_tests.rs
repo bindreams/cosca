@@ -14,7 +14,8 @@ use windows::Win32::System::Threading::{
 
 use super::proc::create_process;
 use super::teardown_spawned;
-use crate::child::owned::teardown::{Disposition, TeardownKind};
+use crate::child::lifecycle::Wording;
+use crate::child::owned::teardown::{Disposition, Kill};
 use crate::child::owned::{ChildWaitOutcome, OwnedChild};
 use crate::error::ChildFate;
 use crate::identity::ProcessId;
@@ -338,14 +339,17 @@ fn a_kill_teardown_of_a_child_waits_for_the_exit_it_started() {
     let _end = crate::wait::block_probe::on_blocking(owner.end_with_code_zero());
     let torn = handle.tear_down(
         Some(owner.id()),
-        TeardownKind::Kill {
+        Kill {
             disposition: Disposition::Leave,
             tree: None,
         },
         None,
     );
-    assert_eq!(torn.fate, ChildFate::Reaped, "{torn:?}");
-    assert!(matches!(torn.clause, Some((log::Level::Debug, _))), "{torn:?}");
+    assert_eq!(torn.fate(), ChildFate::Reaped, "{torn:?}");
+    assert!(
+        matches!(torn.said(), Some(Wording::Collected(log::Level::Debug, _))),
+        "{torn:?}"
+    );
     assert!(handle.is_reaped(), "teardown must wait for the exit it started");
     let outcome = handle.wait(None).expect("wait after teardown");
     let ChildWaitOutcome::Exited(ExitRecord::Status(status)) = outcome else {
@@ -378,15 +382,15 @@ fn a_kill_teardown_never_blocks_on_a_handle_without_terminate() {
     let _end = crate::wait::block_probe::on_blocking(owner.end_with_code_zero());
     let torn = handle.tear_down(
         Some(id),
-        TeardownKind::Kill {
+        Kill {
             disposition: Disposition::Leave,
             tree: None,
         },
         None,
     );
-    assert_eq!(torn.fate, ChildFate::Running { id: Some(id) }, "{torn:?}");
+    assert_eq!(torn.fate(), ChildFate::Running { id: Some(id) }, "{torn:?}");
     assert!(
-        matches!(&torn.clause, Some((log::Level::Warn, text)) if text.contains(&owner.pid.to_string())),
+        matches!(torn.said(), Some(Wording::Uncollected(text)) if text.contains(&owner.pid.to_string())),
         "{torn:?}"
     );
     assert_eq!(fake.looks(), 1, "teardown looked once and did not wait");
@@ -418,14 +422,17 @@ fn teardown_of_a_handle_without_terminate_to_an_exited_child_reaps_it() {
     owner.wait_for_exit();
     let torn = handle.tear_down(
         Some(owner.id()),
-        TeardownKind::Kill {
+        Kill {
             disposition: Disposition::Leave,
             tree: None,
         },
         None,
     );
-    assert_eq!(torn.fate, ChildFate::Reaped, "{torn:?}");
-    assert!(matches!(torn.clause, Some((log::Level::Debug, _))), "{torn:?}");
+    assert_eq!(torn.fate(), ChildFate::Reaped, "{torn:?}");
+    assert!(
+        matches!(torn.said(), Some(Wording::Collected(log::Level::Debug, _))),
+        "{torn:?}"
+    );
 }
 
 /// A child whose exit is under way but not signalled yet, on a handle that holds
@@ -440,14 +447,17 @@ fn teardown_of_an_exiting_unsignalled_child_reaps_it() {
     crate::identity::windows_fault::refuse_next_terminate_as_exiting();
     let torn = handle.tear_down(
         Some(owner.id()),
-        TeardownKind::Kill {
+        Kill {
             disposition: Disposition::Leave,
             tree: None,
         },
         None,
     );
-    assert_eq!(torn.fate, ChildFate::Reaped, "{torn:?}");
-    assert!(matches!(torn.clause, Some((log::Level::Debug, _))), "{torn:?}");
+    assert_eq!(torn.fate(), ChildFate::Reaped, "{torn:?}");
+    assert!(
+        matches!(torn.said(), Some(Wording::Collected(log::Level::Debug, _))),
+        "{torn:?}"
+    );
 }
 
 /// The kill delivered nothing (the exit was under way), so, as on every OS, a failed wait shows
@@ -462,12 +472,12 @@ fn teardown_of_an_exiting_child_with_a_failed_wait_is_unknown() {
     crate::identity::windows_fault::refuse_next_terminate_as_exiting();
     let torn = handle.tear_down(
         Some(owner.id()),
-        TeardownKind::Kill {
+        Kill {
             disposition: Disposition::Leave,
             tree: None,
         },
         None,
     );
-    assert_eq!(torn.fate, ChildFate::Unknown, "{torn:?}");
+    assert_eq!(torn.fate(), ChildFate::Unknown, "{torn:?}");
     assert_eq!(fake.looks(), 1, "the teardown made the wait that failed");
 }

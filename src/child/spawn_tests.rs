@@ -976,6 +976,7 @@ fn a_failed_password_write_reports_a_failed_root_reap() {
 #[skuld::test]
 fn finish_elevated_words_a_root_its_delivered_kill_reached_by_how_the_wait_ended() {
     use crate::child::lifecycle::Settlement;
+    use crate::child::owned::owned_tests::teardown_lines::said_of;
     use crate::child::owned::ChildWaitOutcome;
     use crate::error::ChildFate;
     use crate::os_process::child::{ExitRecord, Foreign};
@@ -1006,10 +1007,14 @@ fn finish_elevated_words_a_root_its_delivered_kill_reached_by_how_the_wait_ended
         for (answer, fate, said) in rows {
             let (note, torn) = super::root_after_a_delivered_kill(42, id, exited_front, &Settlement::new(answer, true));
             assert_eq!(Some(&note), said.as_ref(), "{exited_front}");
-            assert_eq!(torn.clause, said.map(|said| (log::Level::Warn, said)), "{exited_front}");
-            assert_eq!(torn.fate, fate, "{exited_front}");
+            assert_eq!(
+                said_of(&torn),
+                said.map(|said| (log::Level::Warn, said)),
+                "{exited_front}"
+            );
+            assert_eq!(torn.fate(), fate, "{exited_front}");
             assert!(
-                !torn.uncollected,
+                !torn.uncollected(),
                 "{exited_front}: collected, or not ours: nothing to hand back"
             );
         }
@@ -1018,11 +1023,11 @@ fn finish_elevated_words_a_root_its_delivered_kill_reached_by_how_the_wait_ended
         let (note, torn) = super::root_after_a_delivered_kill(42, id, exited_front, &elsewhere);
         assert_eq!(note, format!("{who}: reaped by someone else"));
         assert_eq!(
-            torn.clause,
+            said_of(&torn),
             Some((log::Level::Debug, format!("{who}: reaped by someone else"))),
             "{exited_front}: a foreign reap is not a warn"
         );
-        assert_eq!(torn.fate, ChildFate::Killed);
+        assert_eq!(torn.fate(), ChildFate::Killed);
     }
 }
 
@@ -1060,21 +1065,18 @@ fn finish_elevated_words_a_root_whose_kill_was_refused_by_what_the_look_found() 
         let child = OwnedChild::new(Box::new(FakeProcess::new([]).with_pid(42).reaps([reap])));
         let denied = Error::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
         let looked = child.look_after_refused_kill(None, denied, Disposition::HandBack);
-        assert_eq!(super::root_after_a_refused_kill(refusal(), &looked), said);
+        assert_eq!(super::root_after_a_refused_kill(refusal(), looked.refused_look()), said);
     }
 
     // A record the reap could not read is stated, not built: a debug build asserts on that reap.
-    let mut unreadable = crate::child::owned::teardown::TeardownOutcome::new(ChildFate::Reaped);
-    unreadable.look = Some(crate::child::owned::teardown::LookOutcome::Ended(
-        crate::child::lifecycle::Settlement::new(
-            Ok(crate::child::owned::ChildWaitOutcome::Exited(ExitRecord::Unreadable {
-                si_code: 7,
-            })),
-            false,
-        ),
-    ));
+    let unreadable = crate::child::lifecycle::Settlement::new(
+        Ok(crate::child::owned::ChildWaitOutcome::Exited(ExitRecord::Unreadable {
+            si_code: 7,
+        })),
+        false,
+    );
     assert_eq!(
-        super::root_after_a_refused_kill(refusal(), &unreadable),
+        super::root_after_a_refused_kill(refusal(), Some(&unreadable)),
         format!(
             "{}: it has exited, and was reaped; the child's exit record was unreadable (si_code 7)",
             refusal()

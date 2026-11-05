@@ -516,9 +516,8 @@ fn teardown_spawned(
 ) -> ChildFate {
     // A failed kill asked nothing to exit, so the wait would park forever: log and leak instead.
     if let Err(refused) = child.signal(Sig::Kill) {
-        let mut looked = child.look_after_refused_kill(id, refused, Disposition::Leave);
-        looked.say_as_failed_spawn(&mut Diagnosis::default());
-        return looked.fate;
+        let looked = child.look_after_refused_kill(id, refused, Disposition::Leave);
+        return looked.say_as_failed_spawn(&mut Diagnosis::default()).fate;
     }
     // A fixture only that kill would end is released here.
     #[cfg(test)]
@@ -538,9 +537,9 @@ fn teardown_spawned(
         crate::child::spawn::fault::record_teardown_reap(pid, status);
     }
     let subject = format!("teardown of {}", child_named(Some(pid)));
-    let mut torn = TeardownOutcome::of_settlement(&settlement, id, &subject, None, Disposition::Leave);
-    torn.say_as_failed_spawn(&mut Diagnosis::default());
-    torn.fate
+    TeardownOutcome::of_settlement(&settlement, id, &subject, None, Disposition::Leave)
+        .say_as_failed_spawn(&mut Diagnosis::default())
+        .fate
 }
 
 /// The `STARTUPINFOEXW` for a raw spawn, with what it points at.

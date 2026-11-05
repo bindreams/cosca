@@ -5,7 +5,7 @@ use super::{refused_kill_answer, refused_kill_warning, Forgetting, Refused};
 use crate::child::owned::owned_tests::teardown_lines;
 use crate::child::owned::owned_tests::teardown_lines::PID;
 #[cfg(target_os = "linux")]
-use crate::child::owned::teardown::{Disposition, Expect, PidfdTeardown, TeardownKind, TeardownOutcome};
+use crate::child::owned::teardown::{Disposition, Expect, Kill, PidfdTeardown, TeardownOutcome};
 #[cfg(target_os = "linux")]
 use crate::child::owned::OwnedChild;
 use crate::error::{ChildFate, Error};
@@ -28,7 +28,7 @@ fn second_teardown(kill: Result<Sent, std::io::Error>, reap: ReapAnswer, id: Opt
     let fake = FakeProcess::new([]).with_pid(7).reaps([reap]).signals([kill]);
     OwnedChild::new(Box::new(fake)).tear_down(
         id,
-        TeardownKind::Kill {
+        Kill {
             disposition: Disposition::Leave,
             tree: None,
         },

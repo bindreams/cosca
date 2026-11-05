@@ -5,37 +5,46 @@
 use super::Abandoned;
 use crate::child::owned::owned_tests::teardown_lines::{outcome, rows};
 use crate::child::owned::teardown::{Disposition, Expect, Left, PidfdTeardown};
+use crate::error::ChildFate;
 
 /// `Ended` promises the child is reaped or will be, so a teardown that left it uncollected (a kill
 /// refused and the child running, a look or a wait that failed) is not `Ended`: it is `Uncollected`,
-/// and says what the teardown found, as the one warn the caller logs, with the expectation its pidfd
-/// came with. A collected child is `Ended`.
+/// and says what the teardown found, as the one warn the caller logs. A collected child is `Ended`.
+///
+/// Each row carries the expectation its path would have: an uncollected child that is not running
+/// was left by a failed look or wait, which only a caller that knows a look failed can come to, and
+/// that caller expects `Anything`; any other teardown expects what a caller that knows no look
+/// failed does, `Waited`.
 ///
 /// Mutants: every teardown of a child that never named itself answers `Ended`; an uncollected one
 /// answers `OutOfReach`, which says it is out of its leaf's reach; the `Left` carries another
 /// expectation than the teardown's.
 #[skuld::test]
 fn a_child_that_never_named_itself_is_ended_only_if_its_teardown_collected_it() {
-    for expect in [Expect::Anything, Expect::Waited, Expect::Unexecuted] {
-        for row in rows() {
-            let torn = PidfdTeardown::new(outcome(&row, Disposition::Leave), expect);
-            let fate = torn.outcome.fate;
-            let answer = Abandoned::after_pidless_teardown(torn);
-            if row.uncollected {
-                assert_eq!(
-                    answer,
-                    Abandoned::Uncollected(Left {
-                        clause: row.leave.clone(),
-                        fate,
-                        expect,
-                    }),
-                    "{expect:?} {:?} {:?}",
-                    row.kill,
-                    row.found
-                );
-            } else {
-                assert_eq!(answer, Abandoned::Ended, "{expect:?} {:?} {:?}", row.kill, row.found);
-            }
+    for row in rows() {
+        let outcome = outcome(&row, Disposition::Leave);
+        let expect = if row.uncollected && !matches!(outcome.fate(), ChildFate::Running { .. }) {
+            Expect::Anything
+        } else {
+            Expect::Waited
+        };
+        let torn = PidfdTeardown::new(outcome, expect);
+        let fate = torn.outcome.fate();
+        let answer = Abandoned::after_pidless_teardown(torn);
+        if row.uncollected {
+            assert_eq!(
+                answer,
+                Abandoned::Uncollected(Left {
+                    clause: row.leave.clone(),
+                    fate,
+                    expect,
+                }),
+                "{:?} {:?}",
+                row.kill,
+                row.found
+            );
+        } else {
+            assert_eq!(answer, Abandoned::Ended, "{:?} {:?}", row.kill, row.found);
         }
     }
 }

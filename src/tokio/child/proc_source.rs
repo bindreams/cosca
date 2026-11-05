@@ -308,8 +308,8 @@ fn refused_kill_warning(pid: u32, e: &Error, after: &Refused) -> String {
                 Some(leak) => text.push_str(&format!("; forgetting tokio's handle for it leaks {leak}")),
                 None => text.push_str("; tokio's handle for it was already forgotten"),
             }
-            if let Some((_, clause)) = &torn_down.torn.outcome.clause {
-                text.push_str(&format!("; {clause}"));
+            if let Some(said) = torn_down.torn.outcome.said() {
+                text.push_str(&format!("; {}", said.text()));
             }
         }
         Refused::Released => {
@@ -1631,15 +1631,15 @@ impl ProcSource {
     pub(crate) fn teardown_through_pidfd(mut self, pid: u32, id: Option<ProcessId>, why: &mut Diagnosis) -> ChildFate {
         crate::bounded::assert_may_block("teardown_through_pidfd");
         self.forget_deferring(Forgotten::Unproven.why(), Forgotten::Unproven, why);
-        let mut torn = tear_down_pidfd(
+        tear_down_pidfd(
             Some(pid),
             self.take_forgotten_pidfd(),
             id,
             Expect::Anything,
             Due::in_(super::slow_teardown_after()),
-        );
-        torn.say_as_failed_spawn(why);
-        torn.outcome.fate
+        )
+        .say_as_failed_spawn(why)
+        .fate
     }
 
     /// Install the per-instance test wait observer (raw backend only). Panics on a Tokio child —
@@ -1663,7 +1663,7 @@ impl ProcSource {
 fn refused_kill_answer(after: &Refused, id: Option<ProcessId>) -> ChildFate {
     match after {
         Refused::Forgotten(forgotten) => forgotten.fate,
-        Refused::TornDown(torn_down) => torn_down.torn.outcome.fate,
+        Refused::TornDown(torn_down) => torn_down.torn.outcome.fate(),
         Refused::Released => {
             #[cfg(target_os = "linux")]
             debug_assert!(false, "Linux tears every child not shown gone down again");

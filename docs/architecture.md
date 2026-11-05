@@ -110,8 +110,9 @@ In order:
      Apart from these,
      only the cgroup leaf's `end_child` (both spawns) starts a background reaping thread.
      `Settlement` is the one
-     classification of what a wait or look answered (the fate, whether the child is left
-     uncollected, and a clause for every answer, with its level); the teardowns,
+     classification of what a wait or look answered (the fate, and a clause for every answer: a
+     child left uncollected has only a warn, so no clause of one can be built at another level);
+     the teardowns,
      `finish_elevated` and `Unreaped` all ask it. A teardown that cannot end a child, a
      refused kill or a running elevation front, hands it back as `Unreaped`, in
      `Error::MayHaveStarted`: the sync Linux spawn does, and so does the sync `finish_elevated`;

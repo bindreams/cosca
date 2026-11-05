@@ -13,7 +13,7 @@
 use std::io;
 
 use super::teardown::{child_with_an_unreadable_exit, exit, fake, id};
-use crate::child::owned::teardown::{Disposition, TeardownKind, TeardownOutcome};
+use crate::child::owned::teardown::{Disposition, TeardownOutcome};
 use crate::child::owned::OwnedChild;
 use crate::error::Error;
 use crate::os_process::child::Foreign;
@@ -214,9 +214,14 @@ pub(crate) fn rows() -> Vec<Row> {
     ]
 }
 
+/// What `torn` said of the child, and at what level.
+pub(crate) fn said_of(torn: &TeardownOutcome) -> Option<(log::Level, String)> {
+    torn.said().map(|said| (said.level(), said.text().to_owned()))
+}
+
 /// The outcome of the real teardown `row` states, for a caller that does `disposition`.
 pub(crate) fn outcome(row: &Row, disposition: Disposition) -> TeardownOutcome {
-    let kill = TeardownKind::Kill {
+    let kill = crate::child::owned::teardown::Kill {
         disposition,
         tree: None,
     };
@@ -304,13 +309,13 @@ fn the_teardown_says_every_row_as_the_table_states_it() {
             let torn = outcome(&row, disposition);
             let wanted = row.clause(disposition);
             assert_one_wording(wanted);
-            assert_eq!(torn.uncollected, row.uncollected, "{:?} {:?}", row.kill, row.found);
+            assert_eq!(torn.uncollected(), row.uncollected, "{:?} {:?}", row.kill, row.found);
             assert_eq!(
-                disposition.hands_back(&torn),
+                disposition.hands_back(&torn.remains()),
                 row.uncollected && disposition == Disposition::HandBack
             );
             assert_eq!(
-                torn.clause,
+                said_of(&torn),
                 Some((row.level, wanted.to_owned())),
                 "{:?} {:?} {disposition:?}",
                 row.kill,
@@ -330,9 +335,9 @@ fn the_reap_after_a_tree_kill_says_every_delivered_row_as_the_table_states_it() 
     for row in rows().into_iter().filter(|row| row.kill == Kill::Delivered) {
         for disposition in [Disposition::Leave, Disposition::HandBack] {
             let torn = outcome_after_a_tree_kill(&row, disposition);
-            assert_eq!(torn.uncollected, row.uncollected, "{:?} {disposition:?}", row.found);
+            assert_eq!(torn.uncollected(), row.uncollected, "{:?} {disposition:?}", row.found);
             assert_eq!(
-                torn.clause,
+                said_of(&torn),
                 Some((row.level, row.clause(disposition).to_owned())),
                 "{:?} {disposition:?}",
                 row.found
@@ -387,7 +392,7 @@ fn callers() -> Vec<(&'static str, Say)> {
         }));
     }
     #[cfg(any(target_os = "linux", windows))]
-    callers.push((TeardownCaller::FailedSpawn.label(), |mut torn| {
+    callers.push((TeardownCaller::FailedSpawn.label(), |torn| {
         torn.say_as_failed_spawn(&mut crate::child::spawn::Diagnosis::default());
     }));
     callers
@@ -396,7 +401,7 @@ fn callers() -> Vec<(&'static str, Say)> {
 /// What a `Child`'s drop, a failed run's teardown and `finish_elevated` do with an outcome: fold its
 /// clause into the event's one report and emit it.
 #[cfg(unix)]
-fn say_in_a_report(caller: crate::containment::dispatch::TeardownCaller, mut torn: TeardownOutcome) {
+fn say_in_a_report(caller: crate::containment::dispatch::TeardownCaller, torn: TeardownOutcome) {
     use crate::containment::dispatch::{DropView, RootView};
 
     let view = DropView {
@@ -406,6 +411,6 @@ fn say_in_a_report(caller: crate::containment::dispatch::TeardownCaller, mut tor
         tree_killed: false,
     };
     let mut report = crate::child::drop_report::DropReport::new(&view);
-    report.fold_clause(&mut torn);
+    report.fold_clause(torn);
     report.emit(&[]);
 }

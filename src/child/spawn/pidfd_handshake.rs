@@ -75,7 +75,7 @@ use rustix::net::{AddressFamily, RecvFlags, ReturnFlags, SendFlags, Shutdown, So
 use super::fd_channel::{above_stdio, above_stdio_keeping, publish_ends, register as register_hook, Shared};
 use super::held_teardown::{tear_down_held, tear_down_pidfd, HeldTeardown};
 use super::{SpawnFailure, SpawnLockGuard};
-use crate::child::owned::teardown::{Disposition, Expect, PidfdTeardown};
+use crate::child::owned::teardown::{Disposition, Expect, Remains};
 use crate::child::owned::OwnedChild;
 use crate::error::{ChildFate, Error};
 use crate::os_process::linux::LinuxProcess;
@@ -920,9 +920,7 @@ fn conclude<T: Spawned>(
                 if let Err(e) = crate::containment::kill_group_through_pidfd(pidfd.as_fd(), None) {
                     super::note_refused_group_kill(None, e, collected, &mut why);
                 }
-                let child_fate = end_through_pidfd(None, pidfd, expect, warn_after, &mut why)
-                    .outcome
-                    .fate;
+                let child_fate = end_through_pidfd(None, pidfd, expect, warn_after, &mut why).fate;
                 (error, child_fate)
             }
             LeftFront::LeafHeld(leaf) => {
@@ -933,9 +931,9 @@ fn conclude<T: Spawned>(
                     Ok(copy) => leaf.set(Some((copy, Expect::Anything))),
                     Err(e) => log::debug!("a failed spawn's pidfd could not be copied for its cgroup leaf ({e})"),
                 }
-                (error, teardown(pidfd).outcome.fate)
+                (error, teardown(pidfd).fate)
             }
-            LeftFront::Here(_) | LeftFront::NotAFront => (error, teardown(pidfd).outcome.fate),
+            LeftFront::Here(_) | LeftFront::NotAFront => (error, teardown(pidfd).fate),
         }
     };
     // A failed spawn that dropped a child it never told to go, with nothing holding it. std's
@@ -1023,17 +1021,15 @@ fn conclude<T: Spawned>(
 /// [`tear_down_pidfd`] for the child `pidfd` names, whose pid is `pid` if known: a child it could
 /// not end is left running and warned of, the warn led by `why`; the fate says so. `expect`: see
 /// [`Expect`]. With `warn_after`, the wait for the killed child warns once it passes that long.
-/// Answers the teardown, whose clause is said.
+/// Answers what is left of the teardown, whose clause is said.
 fn end_through_pidfd(
     pid: Option<u32>,
     pidfd: OwnedFd,
     expect: Expect,
     warn_after: Option<std::time::Duration>,
     why: &mut super::Diagnosis,
-) -> PidfdTeardown {
-    let mut torn = tear_down_pidfd(pid, pidfd, None, expect, Due::in_(warn_after));
-    torn.say_as_failed_spawn(why);
-    torn
+) -> Remains {
+    tear_down_pidfd(pid, pidfd, None, expect, Due::in_(warn_after)).say_as_failed_spawn(why)
 }
 
 /// [`end_through_pidfd`] for a child that was never told to go, so it never ran the program
@@ -1047,7 +1043,6 @@ fn end_unexecuted(pid: Option<u32>, pidfd: OwnedFd, warn_after: Option<std::time
         warn_after,
         &mut super::Diagnosis::default(),
     )
-    .outcome
     .fate
 }
 

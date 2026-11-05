@@ -551,9 +551,8 @@ fn an_uncollected_child_is_said_left_by_its_teardown_not_out_of_the_leafs_reach(
     let clause = "child could not be terminated (Operation not permitted); leaving it running";
     let error = || Error::Io(std::io::Error::other(marker));
     let uncollected = |fate| {
-        let mut torn = PidfdTeardown::new(TeardownOutcome::new(fate), Expect::Anything);
-        torn.outcome.clause = Some((log::Level::Warn, clause.into()));
-        AbandonedChild::Uncollected(torn.left())
+        let torn = PidfdTeardown::new(TeardownOutcome::left_uncollected(fate, clause.into()), Expect::Anything);
+        AbandonedChild::Uncollected(torn.uncollected().expect("an uncollected teardown is left"))
     };
     let abandon = |failure: SpawnFailure| {
         let mark = crate::log_capture::mark();

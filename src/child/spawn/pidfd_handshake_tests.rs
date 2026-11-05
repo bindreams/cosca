@@ -1777,7 +1777,6 @@ fn a_child_ended_through_its_pidfd_is_said_reaped_under_the_failed_spawns_name()
         None,
         &mut crate::child::spawn::Diagnosis::default(),
     )
-    .outcome
     .fate;
 
     assert_eq!(fate, ChildFate::Reaped);

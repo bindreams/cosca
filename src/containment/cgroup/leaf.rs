@@ -1059,12 +1059,14 @@ impl Abandoned {
     /// `torn` says. A child the teardown collected is `Ended`, and the teardown's clause is said as
     /// a failed spawn's. One it left uncollected is [`Uncollected`](Abandoned::Uncollected), with the
     /// clause as the one warn the caller logs, and the teardown's verdict.
-    fn after_pidless_teardown(mut torn: PidfdTeardown) -> Abandoned {
-        if torn.outcome.uncollected {
-            return Abandoned::Uncollected(torn.left());
+    fn after_pidless_teardown(torn: PidfdTeardown) -> Abandoned {
+        match torn.uncollected() {
+            Ok(left) => Abandoned::Uncollected(left),
+            Err(collected) => {
+                collected.say_as_failed_spawn(&mut crate::child::spawn::Diagnosis::default());
+                Abandoned::Ended
+            }
         }
-        torn.say_as_failed_spawn(&mut crate::child::spawn::Diagnosis::default());
-        Abandoned::Ended
     }
 }
 

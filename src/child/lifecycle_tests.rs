@@ -390,7 +390,7 @@ mod settlement {
     use std::io;
     use std::process::ExitStatus;
 
-    use crate::child::lifecycle::Settlement;
+    use crate::child::lifecycle::{Settlement, Wording};
     use crate::child::owned::owned_tests::teardown_lines::{HANDED_BACK, LEFT};
     use crate::child::owned::teardown::{Disposition, TeardownOutcome};
     use crate::child::owned::ChildWaitOutcome;
@@ -433,18 +433,31 @@ mod settlement {
         Ok(ChildWaitOutcome::DeadlinePassed)
     }
 
-    /// The three facts every row states besides the wording.
+    /// The three facts every row states besides the wording: the fate, whether the wording is the
+    /// warn of an uncollected child, and the fate of a front.
     #[track_caller]
     fn assert_row(settlement: &Settlement, fate: ChildFate, uncollected: bool, front: FrontFate) {
         assert_eq!(settlement.fate(Some(id())), fate, "{settlement:?}");
-        assert_eq!(settlement.uncollected(), uncollected, "{settlement:?}");
+        for disposition in EVERY {
+            assert_eq!(
+                matches!(worded_as_is(settlement, disposition), Wording::Uncollected(_)),
+                uncollected,
+                "{settlement:?} {disposition:?}"
+            );
+        }
         assert_eq!(settlement.front_fate(), front, "{settlement:?}");
     }
 
     /// What the settlement says of the child "S" under `disposition`, with the running clause
     /// [`RUNNING`].
-    fn worded(settlement: &Settlement, disposition: Option<Disposition>) -> (log::Level, String) {
+    fn worded_as_is(settlement: &Settlement, disposition: Option<Disposition>) -> Wording {
         settlement.wording("S", Some(RUNNING), disposition)
+    }
+
+    /// [`worded_as_is`], as its level and text.
+    fn worded(settlement: &Settlement, disposition: Option<Disposition>) -> (log::Level, String) {
+        let said = worded_as_is(settlement, disposition);
+        (said.level(), said.text().to_owned())
     }
 
     /// A child that exited with a status is reaped, said at `debug` as "reaped it", "after the kill"
@@ -602,7 +615,7 @@ mod settlement {
         for disposition in EVERY {
             assert_eq!(
                 settlement.wording("S", None, disposition),
-                (log::Level::Warn, "S: its wait ended with no exit".to_owned())
+                Wording::Uncollected("S: its wait ended with no exit".to_owned())
             );
         }
     }
@@ -627,9 +640,11 @@ mod settlement {
 
     /// A clause at warn is the outcome's warn text for the caller's one warn, and is logged by
     /// nobody; one below it is logged at its level, led by the caller's label and a colon, and
-    /// returns nothing. Either way the clause is taken.
+    /// returns nothing. Either way the clause is taken, and what is left is the fate and whether the
+    /// child is uncollected.
     ///
-    /// Mutants: a debug clause is returned; a warn is logged; the label is dropped; the clause stays.
+    /// Mutants: a debug clause is returned; a warn is logged; the label is dropped; the remains
+    /// lose the uncollected child.
     #[skuld::test]
     fn a_clause_at_warn_is_the_warn_and_anything_below_is_logged() {
         crate::log_capture::install();
@@ -638,11 +653,12 @@ mod settlement {
         };
 
         let mark = crate::log_capture::mark();
-        let mut gone = outcome(foreign(Foreign::Gone));
-        assert_eq!(gone.take_warn("lead"), None);
-        assert_eq!(gone.clause, None);
-        let mut reaped = outcome(exited());
-        assert_eq!(reaped.take_warn("lead"), None);
+        let (warn, remains) = outcome(foreign(Foreign::Gone)).take_warn("lead");
+        assert_eq!(warn, None);
+        assert!(!remains.uncollected);
+        let (warn, remains) = outcome(exited()).take_warn("lead");
+        assert_eq!(warn, None);
+        assert!(!remains.uncollected);
         assert_eq!(
             crate::log_capture::records_since_on_current_thread(mark, "S:"),
             vec![
@@ -652,12 +668,12 @@ mod settlement {
         );
 
         let mark = crate::log_capture::mark();
-        let mut failed = outcome(failed());
+        let (warn, remains) = outcome(failed()).take_warn("lead");
         assert_eq!(
-            failed.take_warn("lead").as_deref(),
+            warn.as_deref(),
             Some(format!("S: the wait failed: cosca-wait-e5a1{LEFT}").as_str())
         );
-        assert_eq!(failed.clause, None);
+        assert!(remains.uncollected);
         assert_eq!(
             crate::log_capture::records_since_on_current_thread(mark, "S:"),
             Vec::<(log::Level, String)>::new()

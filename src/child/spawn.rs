@@ -7,7 +7,7 @@ use std::process::Stdio as StdStdio;
 #[cfg(unix)]
 use crate::child::lifecycle::{wait_to_exit, Settlement};
 #[cfg(unix)]
-use crate::child::owned::teardown::{Disposition, LookOutcome, TeardownOutcome};
+use crate::child::owned::teardown::{Disposition, Remains, TeardownOutcome};
 #[cfg(unix)]
 use crate::child::owned::ChildWaitOutcome;
 use crate::child::owned::OwnedChild;
@@ -175,7 +175,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
                 "the elevated child was left alone, neither signalled nor waited on: {}",
                 view.why_number_untrusted()
             ),
-            TeardownOutcome::new(fate),
+            Remains::collected(fate),
         )
     } else {
         let root = match gate {
@@ -196,31 +196,29 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
         match root {
             Ok(crate::signal::Sent::Gone) if exited_front => (
                 "the elevated child had already exited, and was reaped by someone else".to_string(),
-                TeardownOutcome::new(ChildFate::Gone),
+                Remains::collected(ChildFate::Gone),
             ),
             Ok(crate::signal::Sent::Gone) => (
                 "the elevated child could not be terminated (it was already reaped)".to_string(),
-                TeardownOutcome::new(ChildFate::Gone),
+                Remains::collected(ChildFate::Gone),
             ),
             // A sync child's kill always verifies: the pidfd or the handle names it, and on macOS the
             // unique id every production spawn adopts is held (`MacChild::new` takes it).
             // Were it ever not, the child may still be running.
             Ok(crate::signal::Sent::Unverified) => {
                 debug_assert!(false, "a sync child's kill always verifies its target");
-                report.left.push(format!(
-                    "the elevated child pid {pid} could not be terminated (it could not be verified, and may still be \
-                     running){}",
-                    Disposition::HandBack.suffix(true)
-                ));
+                let torn = TeardownOutcome::left_uncollected(
+                    ChildFate::Running { id: Some(child.id()) },
+                    format!(
+                        "the elevated child pid {pid} could not be terminated (it could not be verified, and may \
+                         still be running){}",
+                        Disposition::HandBack.suffix(true)
+                    ),
+                );
                 (
                     "the elevated child could not be terminated (it could not be verified, and may still be running)"
                         .to_string(),
-                    TeardownOutcome {
-                        fate: ChildFate::Running { id: Some(child.id()) },
-                        uncollected: true,
-                        look: None,
-                        clause: None,
-                    },
+                    report.fold_clause(torn),
                 )
             }
             Ok(crate::signal::Sent::Delivered) => {
@@ -231,20 +229,21 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
                 if let Some(status) = settlement.status() {
                     fault::record_teardown_reap(pid, status);
                 }
-                let (note, mut torn) = root_after_a_delivered_kill(pid, child.id(), exited_front, &settlement);
-                report.fold_clause(&mut torn);
-                (note, torn)
+                let (note, torn) = root_after_a_delivered_kill(pid, child.id(), exited_front, &settlement);
+                (note, report.fold_clause(torn))
             }
             Err(e) => {
                 #[cfg(test)]
                 fault::run_between_kill_and_wait();
                 // The non-blocking look reaps a child that has exited by now.
                 let note = format!("the elevated child could not be terminated ({e})");
-                let mut looked = child
+                let looked = child
                     .proc
                     .look_after_refused_kill(Some(child.id()), e, Disposition::HandBack);
-                report.fold_clause(&mut looked);
-                (root_after_a_refused_kill(note, &looked), looked)
+                (
+                    root_after_a_refused_kill(note, looked.refused_look()),
+                    report.fold_clause(looked),
+                )
             }
         }
     };
@@ -322,28 +321,28 @@ fn root_after_a_delivered_kill(
             "the elevated child was terminated".to_string()
         }
     } else {
-        settlement.wording(&subject, None, None).1
+        settlement.wording(&subject, None, None).text().to_owned()
     };
     let torn = TeardownOutcome::of_settlement(settlement, Some(id), &subject, None, Disposition::HandBack);
     (note, torn)
 }
 
 /// What [`finish_elevated`] says of a root whose kill was refused, which `refusal` states, once the
-/// one look at it found what `looked` says. A root the look collected is said as the look showed
+/// one look at it ended as `looked` says (`None`: it did not end). A root the look collected is said as the look showed
 /// it, with an unreadable exit record appended; another answer is worded as [`Settlement::wording`] words it,
 /// after the refusal; a root still running is the refusal alone. The note says where the root goes:
 /// the clause does not.
 #[cfg(unix)]
-fn root_after_a_refused_kill(refusal: String, looked: &TeardownOutcome) -> String {
-    match &looked.look {
-        Some(LookOutcome::Ended(settlement)) if matches!(settlement.fate(None), ChildFate::Reaped) => {
+fn root_after_a_refused_kill(refusal: String, looked: Option<&Settlement>) -> String {
+    match looked {
+        Some(settlement) if matches!(settlement.fate(None), ChildFate::Reaped) => {
             let unreadable = settlement
                 .unreadable_record()
                 .map_or(String::new(), |why| format!("; {why}"));
             format!("{refusal}: it has exited, and was reaped{unreadable}")
         }
-        Some(LookOutcome::Ended(settlement)) => settlement.wording(&refusal, None, None).1,
-        _ => refusal,
+        Some(settlement) => settlement.wording(&refusal, None, None).text().to_owned(),
+        None => refusal,
     }
 }
 
@@ -2386,7 +2385,7 @@ impl FrontFate {
         }
     }
 
-    /// The fate of the front a look ([`TeardownKind::Look`](crate::child::owned::teardown::TeardownKind))
+    /// The fate of the front a look ([`OwnedChild::look_at_front`](crate::child::owned::OwnedChild::look_at_front))
     /// found: one that is running, or whose place or subtree could not be read, is left (or handed
     /// back) with the elevated program possibly running.
     #[cfg(target_os = "linux")]

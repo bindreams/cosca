@@ -5,7 +5,7 @@
 use std::os::fd::OwnedFd;
 
 use super::{Diagnosis, FrontFate};
-use crate::child::owned::teardown::{Disposition, Expect, PidfdTeardown, Reach, TeardownKind};
+use crate::child::owned::teardown::{warn_pidfd_teardown, Disposition, Expect, Kill, PidfdTeardown, Reach, Remains};
 use crate::child::owned::OwnedChild;
 use crate::containment::cgroup::Subtree;
 use crate::elevation::front::Front;
@@ -49,24 +49,24 @@ pub(crate) fn tear_down_held(
         due,
     } = how;
     let pid = child.pid();
-    let (front_fate, mut torn) = if front.is_some() {
+    let (front_fate, torn) = if front.is_some() {
         let reach = Ok(subtree.map(|subtree| subtree as &dyn Reach));
-        let torn = child.tear_down(id, TeardownKind::Look(reach), due);
-        let fate = torn.look.as_ref().map(FrontFate::of_look);
-        let worded = crate::child::word_front(pid, &"its spawn failed", disposition, torn);
-        (fate, worded)
+        let look = child.look_at_front(id, reach, due);
+        let fate = FrontFate::of_look(&look.look);
+        let worded = crate::child::word_front(pid, &"its spawn failed", disposition, look);
+        (Some(fate), worded)
     } else {
         let tree = None;
-        (None, child.tear_down(id, TeardownKind::Kill { disposition, tree }, due))
+        (None, child.tear_down(id, Kill { disposition, tree }, due))
     };
-    torn.say_as_failed_spawn(why);
-    let unreaped = disposition.hands_back(&torn).then(|| Unreaped::new(child, id));
+    let remains = torn.say_as_failed_spawn(why);
+    let unreaped = disposition.hands_back(&remains).then(|| Unreaped::new(child, id));
     let error = match front_fate {
         Some(fate) if unreaped.is_some() => fate.note_handed_back(error, front, pid),
         Some(fate) => fate.note(error, front, pid),
         None => error,
     };
-    (error, torn.fate, unreaped)
+    (error, remains.fate, unreaped)
 }
 
 impl PidfdTeardown {
@@ -74,9 +74,10 @@ impl PidfdTeardown {
     /// ([`failed_spawn_line`](crate::child::owned::teardown::TeardownOutcome::failed_spawn_line)): its
     /// warn, if it has one, goes through [`warn_pidfd_teardown`](crate::child::owned::teardown::warn_pidfd_teardown),
     /// which asserts the teardown's contract with its caller.
-    pub(crate) fn say_as_failed_spawn(&mut self, why: &mut Diagnosis) {
-        let line = self.outcome.failed_spawn_line(why);
-        self.warn(line.as_deref());
+    pub(crate) fn say_as_failed_spawn(self, why: &mut Diagnosis) -> Remains {
+        let (line, remains) = self.outcome.failed_spawn_line(why);
+        warn_pidfd_teardown(line.as_deref(), &remains, self.expect);
+        remains
     }
 }
 
@@ -95,9 +96,9 @@ pub(crate) fn tear_down_pidfd(
     due: Option<Due>,
 ) -> PidfdTeardown {
     let child = OwnedChild::new(Box::new(LinuxProcess::new(pid, pidfd)));
-    let kind = TeardownKind::Kill {
+    let kill = Kill {
         disposition: Disposition::Leave,
         tree: None,
     };
-    PidfdTeardown::new(child.tear_down(id, kind, due), expect)
+    PidfdTeardown::new(child.tear_down(id, kill, due), expect)
 }

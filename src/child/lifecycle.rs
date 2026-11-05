@@ -50,10 +50,11 @@ pub(super) fn status_of_outcome(
 /// What became of a child after a wait, or a look at the present moment, answered `answer`
 /// (`killed`: a kill reached the child, delivered by this handle or by a containment kill that
 /// reached it). The one classification of that answer, which every teardown, `finish_elevated` and
-/// `Unreaped` asks for the fate, whether the child is left uncollected, the fate of an elevation
-/// front, and what to say.
+/// `Unreaped` asks for the fate, the fate of an elevation front, and what to say. Whether the child
+/// is left uncollected (still this process's: neither reaped by it nor shown reaped elsewhere, so a
+/// caller can hand it back) is the [`Wording`] variant, which is what the clause is built from.
 ///
-/// | answer                       | [`fate`](Self::fate)  | [`uncollected`](Self::uncollected) | [`front_fate`](Self::front_fate) | [`wording`](Self::wording)                                  |
+/// | answer                       | [`fate`](Self::fate)  | uncollected                        | [`front_fate`](Self::front_fate) | [`wording`](Self::wording)                                  |
 /// | ---------------------------- | --------------------- | ---------------------------------- | -------------------------------- | ----------------------------------------------------------- |
 /// | `Exited(Status)`             | `Reaped`              | no                                 | `Reaped`                         | debug "reaped it" ("after the kill" only if `killed`)       |
 /// | `Exited(Unreadable)`         | `Reaped`              | no                                 | `Reaped`                         | warn "reaped it; e" ("after the kill" only if `killed`)     |
@@ -93,16 +94,6 @@ impl Settlement {
             Err(_) => ChildFate::Unknown,
             Ok(ChildWaitOutcome::DeadlinePassed) => ChildFate::Running { id },
         }
-    }
-
-    /// Whether the child is still this process's: neither reaped by it nor shown reaped elsewhere.
-    /// It is the child a caller can hand back. A deadline that passed, or a wait that failed, leaves
-    /// it, a zombie if there is one.
-    pub(crate) fn uncollected(&self) -> bool {
-        !matches!(
-            self.answer,
-            Ok(ChildWaitOutcome::Exited(_) | ChildWaitOutcome::Foreign(_))
-        )
     }
 
     /// What became of an elevation front, which is sent nothing.
@@ -145,34 +136,57 @@ impl Settlement {
     /// at that level or folds into its own warn. `subject` leads it. `running` is the whole line for
     /// a child still running; `None` for a wait with no deadline, which says it ended with no exit.
     /// `disposition` adds where an uncollected child goes; `None` for a caller that says so itself.
-    pub(crate) fn wording(
-        &self,
-        subject: &str,
-        running: Option<&str>,
-        disposition: Option<Disposition>,
-    ) -> (log::Level, String) {
+    pub(crate) fn wording(&self, subject: &str, running: Option<&str>, disposition: Option<Disposition>) -> Wording {
         let after = if self.killed { " after the kill" } else { "" };
         match &self.answer {
             Ok(ChildWaitOutcome::Exited(ExitRecord::Status(_))) => {
-                (log::Level::Debug, format!("{subject}: reaped it{after}"))
+                Wording::Collected(log::Level::Debug, format!("{subject}: reaped it{after}"))
             }
-            Ok(ChildWaitOutcome::Exited(ExitRecord::Unreadable { si_code })) => (
+            Ok(ChildWaitOutcome::Exited(ExitRecord::Unreadable { si_code })) => Wording::Collected(
                 log::Level::Warn,
                 format!("{subject}: reaped it{after}; {}", unreadable(*si_code)),
             ),
-            Ok(ChildWaitOutcome::Foreign(Foreign::Orphaned)) => (log::Level::Warn, format!("{subject}: {ORPHANED}")),
-            Ok(ChildWaitOutcome::Foreign(_)) => (log::Level::Debug, format!("{subject}: reaped by someone else")),
-            Err(e) => (
-                log::Level::Warn,
-                format!(
-                    "{subject}: the wait failed: {e}{}",
-                    disposition.map_or("", |disposition| disposition.suffix(self.uncollected()))
-                ),
-            ),
-            Ok(ChildWaitOutcome::DeadlinePassed) => (
-                log::Level::Warn,
+            Ok(ChildWaitOutcome::Foreign(Foreign::Orphaned)) => {
+                Wording::Collected(log::Level::Warn, format!("{subject}: {ORPHANED}"))
+            }
+            Ok(ChildWaitOutcome::Foreign(_)) => {
+                Wording::Collected(log::Level::Debug, format!("{subject}: reaped by someone else"))
+            }
+            Err(e) => Wording::Uncollected(format!(
+                "{subject}: the wait failed: {e}{}",
+                disposition.map_or("", |disposition| disposition.suffix(true))
+            )),
+            Ok(ChildWaitOutcome::DeadlinePassed) => Wording::Uncollected(
                 running.map_or_else(|| format!("{subject}: its wait ended with no exit"), str::to_owned),
             ),
+        }
+    }
+}
+
+/// What a [`Settlement`] says of the child: the clause of a child the caller collected, at the level
+/// it is said at, or the warn of one it did not. A child still this process's has no level to
+/// choose: its clause is a warn, so a clause that is not cannot be built for it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Wording {
+    /// Reaped by this process, or shown reaped elsewhere ([`Settlement::uncollected`] false).
+    Collected(log::Level, String),
+    /// Still this process's ([`Settlement::uncollected`]); the text is a warn.
+    Uncollected(String),
+}
+
+impl Wording {
+    /// The level the clause is said at.
+    pub(crate) fn level(&self) -> log::Level {
+        match self {
+            Wording::Collected(level, _) => *level,
+            Wording::Uncollected(_) => log::Level::Warn,
+        }
+    }
+
+    /// The clause.
+    pub(crate) fn text(&self) -> &str {
+        match self {
+            Wording::Collected(_, text) | Wording::Uncollected(text) => text,
         }
     }
 }
