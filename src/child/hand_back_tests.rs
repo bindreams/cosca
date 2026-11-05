@@ -56,8 +56,7 @@ fn a_refused_kill_hands_the_child_back_and_says_so() {
     handed_back.wait();
 }
 
-/// A caller that leaves a child whose kill is refused gets it left, warned, and no `Unreaped`:
-/// the caller's disposition decides, not the helper.
+/// A caller that leaves a child whose kill is refused gets it left, warned, and no `Unreaped`.
 ///
 /// Mutant: the teardown hands the child back whatever the caller said.
 #[cfg(unix)]
@@ -138,6 +137,53 @@ fn a_refused_kill_with_a_failed_look_hands_nothing_back() {
     assert_eq!(fate, ChildFate::Unknown);
     assert!(unreaped.is_none(), "{unreaped:?}");
     drop(stdin);
+}
+
+/// A child whose group is killed before its root kill is refused is handed back after that group
+/// kill: handing back skips nothing of the teardown. The group kill is recorded and not sent, so the
+/// root still runs for the hand-back.
+///
+/// Mutant: a child that is to be handed back skips the tree kill.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_handed_back_process_group_child_has_its_group_killed_first() {
+    use crate::{ContainMode, Containment};
+
+    let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
+    let recorder = crate::containment::unix::fault::record_kill_group();
+    let (stdin, writer) = crate::test_child::held_writer_stdin();
+    let mut cmd = crate::Command::new();
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(stdin).expect("set stdin");
+    cmd.contain_with(ContainMode::Session);
+    let mut child = cmd.spawn().expect("spawn");
+    assert_eq!(child.containment(), Containment::Session);
+    let id = child.id();
+    refuse_the_kill(&mut child);
+
+    let (fate, unreaped) = child.tear_down_or_hand_back(Disposition::HandBack);
+    let handed_back = HandedBack::new(writer, unreaped);
+
+    recorder.assert_killed_only(id.pid() as i32);
+    assert_eq!(fate, ChildFate::Running { id: Some(id) });
+    handed_back.unreaped();
+    handed_back.wait();
+}
+
+/// A child in a Job Object is ended by the Job's kill, so there is nothing to hand back.
+///
+/// Mutant: a Job-contained child is handed back though its Job was terminated.
+#[cfg(windows)]
+#[skuld::test]
+fn a_job_contained_child_is_killed_by_its_job_and_not_handed_back() {
+    let (child, stdin, id) = crate::test_child::live_blocker();
+
+    let (fate, unreaped) = child.tear_down_or_hand_back(Disposition::HandBack);
+    let handed_back = HandedBack::new(stdin, unreaped);
+
+    assert_eq!(fate, ChildFate::Reaped);
+    assert!(handed_back.is_none());
+    assert_eq!(id.is_alive(), Liveness::Dead);
 }
 
 /// An elevation front that is left running is not handed back (fronts are the next change), and is

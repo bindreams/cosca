@@ -254,10 +254,9 @@ pub(crate) fn held_uncontained_blocker(kill_on_drop: bool) -> (crate::Child, std
     (cmd.spawn().expect("spawn"), writer)
 }
 
-/// A test's hold on the child a teardown handed back, if it did, and on what lets that child exit
-/// (`release`: the stdin's write end, a thread to resume). `release` drops first, so a failed
-/// assertion ends the test: the [`Unreaped`](crate::Unreaped)'s drop waits for the child, and would
-/// wait for ever on one nothing releases. Build it at once from the teardown's result.
+/// The child a teardown handed back, if it did, and what lets it exit (`release`: the stdin's write
+/// end, a thread to resume). `release` drops first, so a failed assertion ends the test instead of
+/// hanging in the [`Unreaped`](crate::Unreaped)'s drop. Build it at once from the teardown's result.
 pub(crate) struct HandedBack<R> {
     release: R,
     unreaped: Option<crate::Unreaped>,

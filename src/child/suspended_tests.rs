@@ -402,7 +402,6 @@ mod on_windows {
 
     /// A failed resume whose teardown cannot kill the frozen child leaves it, warned, and hands
     /// nothing back: a child whose initial thread may never run would block an `Unreaped` for ever.
-    /// The test then ends the child itself.
     ///
     /// Mutant: `resume` hands the child back.
     #[skuld::test]

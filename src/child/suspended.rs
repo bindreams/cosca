@@ -86,11 +86,10 @@ impl SuspendedChild {
     ///
     /// [`Error::MayHaveStarted`] when the resume failed or only partly happened (a thread that
     /// something else also suspended stays suspended). The child is then torn down and the error's
-    /// `fate` says how. A child whose kill is refused, and which still runs, is left, warned, and
-    /// named by the `fate` (`Running`); `unreaped` is `None`. Unlike `Command::status`, it is not
-    /// handed back: a failed release may leave the initial thread frozen, so the child may never
-    /// run, and waiting for it would block for ever. A child killed by something else *before* the
-    /// call is this error too.
+    /// `fate` says how. A child whose kill is refused and which still runs is left and warned, with
+    /// `fate` `Running` and `unreaped` `None`: a failed release may leave its initial thread frozen,
+    /// so waiting for it could block for ever. A child killed by something else *before* the call is
+    /// this error too.
     pub fn resume(self) -> Result<Child, Error> {
         let SuspendedChild {
             mut child,

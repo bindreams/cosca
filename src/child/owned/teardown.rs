@@ -37,13 +37,12 @@ use crate::os_process::child_named;
 use crate::signal::{Sent, Sig};
 use crate::wait::teardown_warn::Due;
 
-/// What the caller does with a child that still runs after its kill was refused. It words the
-/// teardown's warn; the caller does what it says.
+/// What the caller does with a child that still runs after its kill was refused: `Leave` it
+/// running, or `HandBack` it as an [`Unreaped`](crate::Unreaped). It words the teardown's warn; the
+/// caller does what it says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Disposition {
-    /// The child is left running.
     Leave,
-    /// The child goes back to the caller as an [`Unreaped`](crate::Unreaped).
     HandBack,
 }
 
@@ -223,7 +222,7 @@ impl OwnedChild {
     }
 
     /// The one look after a kill that failed with `refused`, never a wait. `id` is the child's
-    /// identity, if the caller read one. A child still running is worded as `disposition` says.
+    /// identity, if the caller read one.
     pub(crate) fn look_after_refused_kill(
         &self,
         id: Option<ProcessId>,
