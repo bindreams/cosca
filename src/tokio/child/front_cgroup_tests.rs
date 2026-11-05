@@ -541,12 +541,10 @@ async fn cgroup_kill_tree_of_a_front_asks_the_gate_once(#[fixture(cgroup)] _grou
 #[skuld::test]
 async fn cgroup_a_failed_spawn_kills_a_contained_front_and_reaps_it(#[fixture(cgroup)] _group: &Group) {
     use crate::child::front_cgroup_tests::{assert_killed_by_the_leaf, failed_held_front_spawns, LeafKill};
-    let _running = crate::child::spawn::fault::see_fronts_running();
-    let reaps = crate::child::spawn::fault::record_teardown_reaps();
     let failures = failed_held_front_spawns(LeafKill::Lands, |cmd| {
         crate::tokio::spawn::spawn(cmd).map(drop).map_err(Into::into)
     });
-    assert_killed_by_the_leaf(&failures, Some(&reaps));
+    assert_killed_by_the_leaf(&failures);
 }
 
 /// Async twin of the sync `cgroup_a_failed_spawn_whose_leaf_kill_fails_hands_back_the_front`, which
@@ -583,12 +581,10 @@ async fn cgroup_a_failed_spawn_leaves_a_front_moved_out_of_its_leaf_running(#[fi
 #[skuld::test]
 async fn cgroup_a_failed_spawn_kills_a_front_read_through_proc_and_reaps_it(#[fixture(cgroup)] _group: &Group) {
     use crate::child::front_cgroup_tests::{assert_killed_by_the_leaf, failed_held_front_spawns, LeafKill};
-    let _running = crate::child::spawn::fault::see_fronts_running();
-    let reaps = crate::child::spawn::fault::record_teardown_reaps();
     let failures = failed_held_front_spawns(LeafKill::LandsReadThroughProc, |cmd| {
         crate::tokio::spawn::spawn(cmd).map(drop).map_err(Into::into)
     });
-    assert_killed_by_the_leaf(&failures, Some(&reaps));
+    assert_killed_by_the_leaf(&failures);
 }
 
 /// Async twin of the sync `cgroup_a_failed_spawn_hands_back_a_front_in_a_namesake_of_its_leaf`, which
@@ -630,12 +626,10 @@ async fn cgroup_a_front_nested_under_its_leaf_is_killed_under_hidepid(#[fixture(
 #[skuld::test]
 async fn cgroup_a_failed_spawn_kills_a_front_nested_under_its_leaf_under_hidepid(#[fixture(cgroup)] _group: &Group) {
     use crate::child::front_cgroup_tests::{assert_killed_by_the_leaf, failed_held_front_spawns, LeafKill};
-    let _running = crate::child::spawn::fault::see_fronts_running();
-    let reaps = crate::child::spawn::fault::record_teardown_reaps();
     let failures = failed_held_front_spawns(LeafKill::LandsNestedHidden, |cmd| {
         crate::tokio::spawn::spawn(cmd).map(drop).map_err(Into::into)
     });
-    assert_killed_by_the_leaf(&failures, Some(&reaps));
+    assert_killed_by_the_leaf(&failures);
 }
 
 /// Async twin of the sync `cgroup_a_front_whose_leaf_gives_no_id_is_refused_before_its_fork`.
@@ -820,7 +814,7 @@ async fn cgroup_a_contained_front_moved_out_of_its_leaf_is_left_running(#[fixtur
     let (err, pid) = fail_a_contained_front_spawn(reader, move_out_of_its_leaf);
     assert_front_noted(
         &err,
-        "the elevated program may be running; it is left unreaped",
+        "the elevated program may be running; left unreaped",
         ChildFate::Running { id: None },
     );
     assert!(
@@ -884,7 +878,7 @@ async fn cgroup_a_contained_front_its_leaf_could_not_kill_is_left_running(#[fixt
     };
     assert_front_noted(
         &err,
-        "the elevated program may be running; it is left unreaped",
+        "the elevated program may be running; left unreaped",
         ChildFate::Running { id: None },
     );
     assert!(
@@ -943,7 +937,7 @@ async fn cgroup_a_front_its_leaf_did_not_take_is_left_when_tokio_drops_it(#[fixt
     let text = err.to_string();
     assert!(text.contains("the spawned child is what sudo left"), "{text}");
     assert!(
-        text.contains("the elevated program may be running; it is left unreaped"),
+        text.contains("the elevated program may be running; left unreaped"),
         "{text}"
     );
     drop(stdin);
@@ -1131,7 +1125,7 @@ async fn cgroup_a_contained_front_whose_leaf_subtree_cannot_be_read_is_left_nami
     assert!(warns[0].1.contains("its leaf's subtree cannot be read: "), "{warns:?}");
     assert_front_noted(
         &err,
-        "the elevated program may be running; it is left unreaped",
+        "the elevated program may be running; left unreaped",
         ChildFate::Unknown,
     );
     // Its leaf's kill, which does not need the subtree, ended it; the abandonment left it unreaped.

@@ -414,9 +414,11 @@ async fn a_failed_spawn_leaves_an_elevation_front_running_and_says_so() {
     let failures = failed_front_spawns(None, |cmd| {
         crate::tokio::spawn::spawn(cmd).map(drop).map_err(Into::into)
     });
-    assert_noted(&failures, "the elevated program may be running; it is left unreaped");
+    assert_noted(&failures, "the elevated program may be running; left unreaped");
     // Each failed spawn is one event: the forget of tokio's `Child` and the front left running share
-    // one warn, which carries the leak. (Mutant: the forget warns on its own.)
+    // one warn, which carries the leak. (Mutant: the forget warns on its own.) The front is only
+    // looked at, and is left running: the warn does not say it was torn down. (Mutant:
+    // `leave_front_noting`'s forget note claims a teardown.)
     let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "")
         .into_iter()
         .filter(|(level, _)| *level <= log::Level::Warn)
@@ -425,9 +427,10 @@ async fn a_failed_spawn_leaves_an_elevation_front_running_and_says_so() {
     assert!(
         warns
             .iter()
-            .all(|(_, text)| text.contains("leaks") && text.contains("left elevation front")),
+            .all(|(_, text)| text.contains("leaks") && text.contains("is left running and unreaped")),
         "{warns:?}"
     );
+    assert!(warns.iter().all(|(_, text)| !text.contains("torn down")), "{warns:?}");
     for (_, pid, handed_back) in &failures {
         assert!(
             handed_back.is_none(),
@@ -477,7 +480,7 @@ async fn a_spawn_failing_after_its_fork_leaves_an_elevation_front_running_and_sa
     let text = err.to_string();
     assert!(text.contains("the spawned child is what sudo left"), "{text}");
     assert!(
-        text.contains("the elevated program may be running; it is left unreaped"),
+        text.contains("the elevated program may be running; left unreaped"),
         "{text}"
     );
     drop(writer);

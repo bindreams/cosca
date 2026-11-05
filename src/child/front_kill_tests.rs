@@ -130,7 +130,11 @@ fn drop_of_an_exited_front_reaps_it_and_warns_of_nothing() {
     crate::test_child::wait_until_zombie(pid);
     let mark = crate::log_capture::mark();
     drop(child);
-    let warns = crate::log_capture::records_since_on_current_thread(mark, "Child::drop");
+    // The reap is said at `debug`, as "reaped it": only a warn is a complaint.
+    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "Child::drop")
+        .into_iter()
+        .filter(|(level, _)| *level <= log::Level::Warn)
+        .collect();
     assert!(warns.is_empty(), "{warns:?}");
     assert_eq!(reap(pid), None, "the drop reaps an exited front");
 }
@@ -428,7 +432,10 @@ fn a_failed_password_write_signals_neither_a_live_front_nor_its_group() {
         panic!("expected an Elevation error, got {err:?}");
     };
     assert!(detail.contains("could not be terminated"), "{detail}");
-    assert!(detail.contains("it is handed back to the caller"), "{detail}");
+    assert!(
+        detail.contains(crate::child::owned::owned_tests::teardown_lines::HANDED_BACK),
+        "{detail}"
+    );
     assert!(detail.contains(&format!("pid {pid} is what sudo left")), "{detail}");
     // Released: the front exits by itself, unsignalled.
     let status = handed_back.wait();
@@ -690,7 +697,7 @@ fn a_failed_spawn_hands_back_an_elevation_front_and_says_so() {
     let failures = failed_front_spawns(None, |cmd| cmd.spawn().map(drop));
     assert_noted(
         &failures,
-        "the elevated program may be running; it is handed back to the caller",
+        "the elevated program may be running; handed back to the caller in the error",
     );
     for (_, pid, handed_back) in failures {
         assert_eq!(handed_back.unreaped().pid(), Some(pid));
@@ -758,7 +765,7 @@ pub(crate) fn assert_attach_failure_left_the_front(err: &Error, pid: u32, mark: 
     assert!(matches!(err, Error::Containment { .. }), "the variant is kept: {err:?}");
     let text = err.to_string();
     assert!(text.contains(&format!("pid {pid} is what sudo left")), "{text}");
-    assert!(text.contains("it is left unreaped"), "{text}");
+    assert!(text.contains("; left unreaped"), "{text}");
     assert!(
         crate::log_capture::contains_since(mark, "attach failed"),
         "the warning says the attach failed"
@@ -948,7 +955,7 @@ pub(crate) fn assert_unadopted_front_noted(err: &Error, pid: u32) {
     let text = err.to_string();
     assert!(text.contains(&format!("pid {pid} is what sudo left")), "{text}");
     assert!(
-        text.contains("the elevated program may be running; it is left unreaped"),
+        text.contains("the elevated program may be running; left unreaped"),
         "{text}"
     );
 }
