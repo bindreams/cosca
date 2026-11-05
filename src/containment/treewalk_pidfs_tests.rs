@@ -10,6 +10,7 @@ use std::os::fd::OwnedFd;
 use rustix::io::Errno;
 use rustix::process::Pid;
 
+use super::Walk;
 use crate::error::Error;
 use crate::identity::{FakeKernel, HostKernel, Kernel, Key, OrderKey, ProcessId};
 use crate::Recursive;
@@ -55,12 +56,17 @@ fn table() -> FakeKernel<'static> {
 
 const EDGES: [(u32, u32); 1] = [(CHILD, ROOT)];
 
-/// The descendants of `root` as a walk takes them: the anchor's one read, then the walk from its key.
+/// The walk from `root` as the walks take it: the anchor's one read, then the walk from its key.
 /// Empty, not an error, for a root that is gone; an error for one that cannot be read.
-pub(super) fn descendants(kernel: &dyn Kernel, root: ProcessId, edges: &[(u32, u32)]) -> Result<Vec<ProcessId>, Error> {
+pub(super) fn walk(kernel: &dyn Kernel, root: ProcessId, edges: &[(u32, u32)]) -> Result<Walk, Error> {
     Ok(super::anchor(kernel, root)?
         .map(|key| super::descendants_from_key(kernel, root, key, edges))
         .unwrap_or_default())
+}
+
+/// The members of [`walk`].
+pub(super) fn descendants(kernel: &dyn Kernel, root: ProcessId, edges: &[(u32, u32)]) -> Result<Vec<ProcessId>, Error> {
+    walk(kernel, root, edges).map(|walk| walk.members)
 }
 
 /// [`descendants`], one level.
@@ -70,7 +76,7 @@ pub(super) fn children_of(
     edges: &[(u32, u32)],
 ) -> Result<Vec<ProcessId>, Error> {
     Ok(super::anchor(kernel, parent)?
-        .map(|key| super::children_of_from_key(kernel, parent, key, edges))
+        .map(|key| super::children_of_from_key(kernel, parent, key, edges).members)
         .unwrap_or_default())
 }
 
@@ -80,7 +86,7 @@ pub(super) fn children_of(
 #[skuld::test]
 fn resolve_or_drop_pairs_a_pidfs_id_with_its_start_time() {
     assert_eq!(
-        super::resolve_or_drop(&table(), CHILD, root()),
+        super::resolve_or_drop(&table(), CHILD, root()).expect("the child reads"),
         Some((child(), OrderKey::for_test(CHILD_START)))
     );
 }
@@ -211,6 +217,33 @@ fn a_child_whose_parent_cannot_be_proved_again_is_dropped() {
     assert!(children_of(&kernel(), root(), &EDGES).unwrap().is_empty());
 }
 
+/// That child is not a gone one: the walk lists it as unassessed, with the parent's proof as the
+/// reason, in both filters. A child whose pid is gone is listed in neither. Mutants: "an `Unknown`
+/// read is dropped as `Gone`"; "a gone read is counted".
+#[skuld::test]
+fn a_child_whose_parent_cannot_be_proved_again_is_unassessed_and_a_gone_child_is_not() {
+    let unproved = || table().on_pidfs_ino_after_read(ROOT, &format!("{CHILD}/stat"), Err(Errno::BADF));
+    let found = walk(&unproved(), root(), &EDGES).unwrap();
+    let [(pid, Error::Unassessable { detail, .. })] = &found.unassessed[..] else {
+        panic!("expected one Unassessable entry, got {:?}", found.unassessed);
+    };
+    assert_eq!(*pid, CHILD);
+    assert!(
+        detail.contains(&format!("ppid {ROOT} identity could not be read")),
+        "{detail}"
+    );
+    assert!(found.members.is_empty());
+    let key = super::anchor(&unproved(), root()).unwrap().expect("the root reads");
+    let children = super::children_of_from_key(&unproved(), root(), key, &EDGES);
+    assert_eq!(children.unassessed.len(), 1, "{:?}", children.unassessed);
+
+    let gone = table()
+        .on_pidfd_open(CHILD, Err(Errno::SRCH))
+        .on_read(&format!("{CHILD}/stat"), Err(libc::ENOENT));
+    let found = walk(&gone, root(), &EDGES).unwrap();
+    assert!(found.members.is_empty() && found.unassessed.is_empty(), "{found:?}");
+}
+
 /// The warn for that child names the parent whose proof failed, and the child's pid once. Mutant:
 /// "the warn blames the child's pid".
 #[skuld::test]
@@ -218,7 +251,7 @@ fn the_warn_for_a_child_whose_parent_cannot_be_proved_names_the_parent() {
     crate::log_capture::install();
     let kernel = table().on_pidfs_ino_after_read(ROOT, &format!("{CHILD}/stat"), Err(Errno::BADF));
     let mark = crate::log_capture::mark();
-    assert_eq!(super::resolve_or_drop(&kernel, CHILD, root()), None);
+    assert!(super::resolve_or_drop(&kernel, CHILD, root()).is_err());
     let warned = crate::log_capture::records_since_on_current_thread(mark, &format!("pid {CHILD}"));
     assert_eq!(warned.len(), 1, "{warned:?}");
     let (level, message) = &warned[0];

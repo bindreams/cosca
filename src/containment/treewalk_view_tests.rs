@@ -212,7 +212,7 @@ fn a_pid_the_kernel_cannot_read_is_dropped_and_warned_about() {
     let (child, id) = live_member();
     let (kernel, _guard) = unreadable(id.pid());
     let mark = crate::log_capture::mark();
-    assert_eq!(super::resolve_or_drop(&kernel, id.pid(), ProcessId::current()), None);
+    assert!(super::resolve_or_drop(&kernel, id.pid(), ProcessId::current()).is_err());
     let warned = crate::log_capture::records_since_on_current_thread(
         mark,
         &format!("pid {} exists but could not be queried", id.pid()),
@@ -240,7 +240,7 @@ fn the_warn_for_a_dropped_pid_names_the_cause_of_its_own_read_under_a_held_paren
         0,
     );
     let mark = crate::log_capture::mark();
-    assert_eq!(super::resolve_or_drop(&kernel, id.pid(), parent), None);
+    assert!(super::resolve_or_drop(&kernel, id.pid(), parent).is_err());
     let warned = crate::log_capture::records_since_on_current_thread(
         mark,
         &format!("pid {} identity could not be read", id.pid()),
@@ -267,7 +267,7 @@ fn the_warn_for_a_dropped_pid_names_the_cause_of_its_parents_proof() {
     let parent = ticks_id(me.pid());
     let kernel = View::Unreadable.fail(FakeKernel::over(&HostKernel), 0);
     let mark = crate::log_capture::mark();
-    assert_eq!(super::resolve_or_drop(&kernel, id.pid(), parent), None);
+    assert!(super::resolve_or_drop(&kernel, id.pid(), parent).is_err());
     let warned = crate::log_capture::records_since_on_current_thread(
         mark,
         &format!("ppid {} identity could not be read", me.pid()),
@@ -444,6 +444,46 @@ fn every_id_walk_re_verifies_a_descendants_kill_through_its_kernel() {
     }
 }
 
+/// A live root with one live descendant, and a kernel in which the descendant's identity cannot be
+/// read (`EMFILE` on its pidfd). The `/proc` path: the root's id is a `starttime` id.
+fn root_with_an_unreadable_descendant() -> (std::process::Child, ProcessId, ProcessId, FakeKernel<'static>) {
+    let (child, root, descendant) = live_member_with_descendant();
+    let root = ticks_id(root.pid());
+    let kernel = FakeKernel::over(&HostKernel)
+        .live_without_pidfs(root.pid(), pidfd_of(root.pid()))
+        .on_pidfd_open(descendant.pid(), Err(rustix::io::Errno::MFILE));
+    (child, root, descendant, kernel)
+}
+
+/// A descendant the walk cannot read is not signalled, and `hard_kill` says it did not reach every
+/// member (`Ok(false)`), so its caller does not mark the tree killed. `terminate` is best effort and
+/// stays `Ok`. Mutants: "an `Unknown` read is dropped as `Gone`": `Ok(true)`; "`terminate` reports
+/// the incomplete walk".
+#[skuld::test]
+fn a_descendant_that_cannot_be_read_makes_hard_kill_incomplete_and_leaves_terminate_ok() {
+    let (child, root, _, kernel) = root_with_an_unreadable_descendant();
+    assert!(!super::hard_kill(&kernel, root).expect("the walk ran"));
+    release_with_a_signalled_root("hard_kill", child, libc::SIGKILL);
+
+    let (child, root, _, kernel) = root_with_an_unreadable_descendant();
+    super::terminate(&kernel, root).expect("best effort");
+    release_with_a_signalled_root("terminate", child, libc::SIGTERM);
+}
+
+/// `children` of a root with a descendant the walk cannot read is an error naming that pid and why,
+/// never the short list. Mutant: "`children` takes the members and ignores `unassessed`".
+#[skuld::test]
+fn children_of_a_root_with_a_descendant_that_cannot_be_read_is_an_error_naming_it() {
+    for recursive in [Recursive::No, Recursive::Yes] {
+        let (child, root, descendant, kernel) = root_with_an_unreadable_descendant();
+        assert_unassessable_naming(
+            root.children_with(&kernel, recursive).map(|_| ()),
+            &[&format!("pid {} identity could not be read", descendant.pid())],
+        );
+        release(child);
+    }
+}
+
 /// The candidate's own `stat` names its parent, and the walk accepts it only under the parent the
 /// snapshot gave it: a pid that exited and was reused since the snapshot, by a process of another
 /// parent, is dropped. Mutants: "the resolver ignores the parent", "the resolver always drops".
@@ -459,6 +499,8 @@ fn a_candidate_whose_stat_shows_another_parent_is_dropped() {
         .on_read("1/stat", Ok(&crate::identity::stat_parse::stat_fixture("S", 5)));
     let parent = |pid| ProcessId::from_parts_for_test(pid, Key::for_test(5));
     // `stat_fixture` shows parent 1.
-    assert!(super::resolve_or_drop(&kernel, PID, parent(99)).is_none());
-    assert!(super::resolve_or_drop(&kernel, PID, parent(1)).is_some());
+    assert_eq!(super::resolve_or_drop(&kernel, PID, parent(99)).expect("a read"), None);
+    assert!(super::resolve_or_drop(&kernel, PID, parent(1))
+        .expect("a read")
+        .is_some());
 }

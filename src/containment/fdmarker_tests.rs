@@ -1027,8 +1027,8 @@ fn kill_holder_leaves_a_denied_pid_unsignalled_and_reports_incomplete() {
 /// `hard_kill()` — not a synthetic check of the `incomplete` bool in isolation. Forces a
 /// genuinely blind pass via the enumerate backend's test-only fault seam (module docs at the
 /// top of `enumerate/macos.rs`), NOT by naming an unkillable real pid as `root`: an unprivileged
-/// but real identity like pid 1 cannot be used as `root` here, because `treewalk::descendants`
-/// would then walk pid 1's ENTIRE real ppid subtree — every process on the host, launchd being
+/// but real identity like pid 1 cannot be used as `root` here, because the sweep's
+/// `treewalk::descendants_from_key` would then walk pid 1's ENTIRE real ppid subtree — every process on the host, launchd being
 /// everyone's eventual ancestor — and this sweep would attempt to SIGKILL every one of them.
 /// `inert_root()` and `pgid: None` keep every channel this test does not need inert, so the blind
 /// pass is the ONLY source of `incomplete` — no real process is signalled by this test at all.

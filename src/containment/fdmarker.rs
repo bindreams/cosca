@@ -1381,14 +1381,23 @@ impl Marker {
                 new_walk.push(root);
             }
             if !blind {
-                match crate::containment::treewalk::descendants(&crate::identity::HostKernel, root, &parents) {
-                    Ok(found) => {
-                        for id in found {
+                let kernel = &crate::identity::HostKernel;
+                match crate::containment::treewalk::anchor(kernel, root) {
+                    Ok(Some(root_key)) => {
+                        let walk = crate::containment::treewalk::descendants_from_key(kernel, root, root_key, &parents);
+                        for id in walk.members {
                             if seen.insert(id) {
                                 new_walk.push(id);
                             }
                         }
+                        // A candidate that could not be read was warned and is not signalled: not
+                        // observed is not observed absent, so the sweep is incomplete.
+                        if !walk.unassessed.is_empty() {
+                            *incomplete = true;
+                        }
                     }
+                    // Gone: nothing to walk.
+                    Ok(None) => {}
                     // Not observed is not observed absent: like a blind pass, the walk channel
                     // is skipped and the sweep reports `incomplete`.
                     Err(e) => {

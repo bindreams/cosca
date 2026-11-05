@@ -102,11 +102,13 @@ impl ProcessId {
     /// compares strictly (`>`), not at-or-after. Snapshot; best-effort.
     ///
     /// An empty list means there are none (or `self` is gone or was recycled); a process table
-    /// that cannot be read is an error, never an empty list.
+    /// that cannot be read is an error, never an empty list, and neither is a candidate that cannot
+    /// be assessed: the list is never a short one.
     ///
     /// # Errors
     ///
-    /// As [`parent`](Self::parent).
+    /// As [`parent`](Self::parent), and [`Error::Unassessable`] (or `Unsupported`) naming the first
+    /// candidate whose identity could not be read, or whose parent's could not be proved.
     pub fn children(&self, recursive: Recursive) -> Result<Vec<ProcessId>, Error> {
         self.children_with(&HostKernel, recursive)
     }
@@ -121,10 +123,15 @@ impl ProcessId {
         if !parents.iter().any(|&(pid, _)| pid == self.pid()) {
             return Err(self.absent_from_snapshot());
         }
-        Ok(match recursive {
+        let walk = match recursive {
             Recursive::No => crate::containment::treewalk::children_of_from_key(kernel, *self, key, &parents),
             Recursive::Yes => crate::containment::treewalk::descendants_from_key(kernel, *self, key, &parents),
-        })
+        };
+        // A candidate the walk could not read may be a child: the list would be short, not empty.
+        match walk.unassessed.into_iter().next() {
+            Some((_, why)) => Err(why),
+            None => Ok(walk.members),
+        }
     }
 }
 

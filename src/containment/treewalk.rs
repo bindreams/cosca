@@ -85,6 +85,13 @@
 //! a warning naming `ppid N`; and only a held parent lets its own failure stand, dropped with a
 //! warning naming the candidate (on Windows, with the `NTSTATUS` of a refused creator-pid or
 //! sequence-number query).
+//!
+//! # A walk that could not assess a member
+//!
+//! Both of those drops are a candidate the walk could not assess, unlike a `Gone` one, which is
+//! not a member and is dropped silently. The walk returns them in [`Walk::unassessed`] beside its
+//! members, so no caller takes a short list for the whole tree: [`hard_kill`] reports `Ok(false)`,
+//! the fd marker's sweep reports itself incomplete, and `ProcessId::children` is an error.
 
 use crate::error::Error;
 use crate::identity::{Existence, Kernel, OrderKey, ProcessId, RawPid, Resolved, UnknownCause};
@@ -103,9 +110,28 @@ pub(crate) enum KillOutcome {
     NotAttempted,
 }
 
-/// The tree-walk resolver. A pid we may not query is dropped from the walk exactly like a
-/// pid that is gone - the walk cannot kill what it cannot verify - but the two are logged
-/// apart, because "denied" is an operational signal (run elevated) and "gone" is not.
+/// What a walk found: the genuine members, and the candidates it could not assess.
+///
+/// A candidate whose identity could not be read stays out of `members` (the walk cannot kill what it
+/// cannot verify), and so does its subtree, which the walk cannot reach through it. It is counted in
+/// `unassessed`, so a caller never takes a short `members` for the whole tree. A candidate that is
+/// gone is in neither.
+#[derive(Debug, Default)]
+pub(crate) struct Walk {
+    pub(crate) members: Vec<ProcessId>,
+    /// Each candidate dropped for an `Unknown` read, with why ([`unqueryable_read`]): the candidate's
+    /// own failure, or the proof of the parent it was read under.
+    pub(crate) unassessed: Vec<(RawPid, Error)>,
+}
+
+/// What the walk's resolver says of a candidate: `Ok(None)` for one that is gone (or no longer its
+/// parent's child), `Err` for one that could not be read.
+pub(crate) type Resolution = Result<Option<(ProcessId, OrderKey)>, Error>;
+
+/// The tree-walk resolver. A pid we may not query is dropped from the walk like a pid that is gone -
+/// the walk cannot kill what it cannot verify - but the two are told apart: "denied" is warned
+/// here and returned as `Err`, which the filter counts as unassessed ([`Walk::unassessed`]), and
+/// "gone" is `Ok(None)`, dropped silently.
 ///
 /// `parent` is the process the walk accepted as the parent the snapshot gave `pid`. Where the read of
 /// `pid` carries its parent, a candidate
@@ -113,14 +139,15 @@ pub(crate) enum KillOutcome {
 /// snapshot or the same process was orphaned and is no longer in the tree; and when its parent's
 /// number no longer holds `parent`, which means the parent was reaped and its number taken by a
 /// process whose own children the candidate could be.
-pub(crate) fn resolve_or_drop(kernel: &dyn Kernel, pid: RawPid, parent: ProcessId) -> Option<(ProcessId, OrderKey)> {
+pub(crate) fn resolve_or_drop(kernel: &dyn Kernel, pid: RawPid, parent: ProcessId) -> Resolution {
     match ProcessId::of_ordered_with(kernel, pid, Some(parent)) {
-        (Resolved::Found(read), _) => Some(read),
-        (Resolved::Gone, _) => None,
+        (Resolved::Found(read), _) => Ok(Some(read)),
+        (Resolved::Gone, _) => Ok(None),
         (Resolved::Unknown, cause) => {
             let parent_blamed = cause.blamed_parent().is_some();
-            let why = match unqueryable_read(pid, cause) {
-                Error::Unassessable { detail, .. } => detail,
+            let error = unqueryable_read(pid, cause);
+            let why = match &error {
+                Error::Unassessable { detail, .. } => detail.clone(),
                 other => other.to_string(),
             };
             // The pid is IN the message on purpose: `log_capture` is one process-global
@@ -133,7 +160,7 @@ pub(crate) fn resolve_or_drop(kernel: &dyn Kernel, pid: RawPid, parent: ProcessI
                 "dropped".to_owned()
             };
             log::warn!("treewalk: {why} - {dropped} from the walk");
-            None
+            Err(error)
         }
     }
 }
@@ -177,7 +204,8 @@ pub(crate) fn keeps_order(key: OrderKey, anchor: OrderKey, allow_equal: bool) ->
 /// the edge names, and keeps it ONLY if its key orders correctly
 /// against `root_key` per `allow_equal` (see module docs). With `parent_order` it must order
 /// after the accepted parent's key instead. `resolve` is injected
-/// so the filter is pure: live code passes [`resolve_or_drop`], tests pass a stub.
+/// so the filter is pure: live code passes [`resolve_or_drop`], tests pass a stub. A candidate the
+/// resolver errs on is dropped with its subtree and listed once in [`Walk::unassessed`].
 ///
 /// The root itself is never included (callers kill the root explicitly first).
 pub(crate) fn descendants_with(
@@ -186,14 +214,14 @@ pub(crate) fn descendants_with(
     parents: &[(RawPid, RawPid)],
     allow_equal: bool,
     parent_order: bool,
-    resolve: impl Fn(RawPid, ProcessId) -> Option<(ProcessId, OrderKey)>,
-) -> Vec<ProcessId> {
+    resolve: impl Fn(RawPid, ProcessId) -> Resolution,
+) -> Walk {
     // BFS over the ppid forest. `frontier` holds the accepted pids whose children we still
     // need to visit, each with its order key; it starts as just the root. A pid joins the result
     // (and the next frontier) only if its ppid is in the current accepted set AND its
     // order key passes `keeps_order`. No fixed iteration cap: the loop drains a
     // strictly shrinking set of not-yet-visited edges.
-    let mut result: Vec<ProcessId> = Vec::new();
+    let mut walk = Walk::default();
     let mut frontier: Vec<(ProcessId, OrderKey)> = vec![(root, root_key)];
     // Remaining (pid, ppid) edges not yet attached to the tree.
     let mut pending: Vec<(RawPid, RawPid)> = parents.to_vec();
@@ -220,7 +248,12 @@ pub(crate) fn descendants_with(
             if pid == ppid {
                 continue;
             }
-            let read = *resolved.entry(pid).or_insert_with(|| resolve(pid, parent));
+            let read = *resolved.entry(pid).or_insert_with(|| {
+                resolve(pid, parent).unwrap_or_else(|why| {
+                    walk.unassessed.push((pid, why));
+                    None
+                })
+            });
             let Some((id, key)) = read else {
                 log::debug!("treewalk: pid {pid} unresolvable — dropping its subtree");
                 continue;
@@ -234,7 +267,7 @@ pub(crate) fn descendants_with(
             // `accepted.insert` dedups so a duplicate edge never enumerates/kills the
             // same process twice.
             if accepted.insert(pid) {
-                result.push(id);
+                walk.members.push(id);
                 next.push((id, key));
             }
         }
@@ -242,7 +275,7 @@ pub(crate) fn descendants_with(
         frontier = next;
     }
 
-    result
+    walk
 }
 
 /// What `read`, the order key of `anchor` for a walk from it, means for the walk. `Ok(None)`: the
@@ -281,7 +314,7 @@ pub(crate) fn descendants_from_key(
     root: ProcessId,
     root_key: OrderKey,
     parents: &[(RawPid, RawPid)],
-) -> Vec<ProcessId> {
+) -> Walk {
     descendants_with(
         root,
         root_key,
@@ -292,41 +325,33 @@ pub(crate) fn descendants_from_key(
     )
 }
 
-/// [`descendants_from_key`] for `root`'s order key, read here with no proof that `root` still holds
-/// its pid: the fd marker's sweep, whose root is not asked for. (Elsewhere a walk calls [`anchor`].)
-///
-/// # Errors
-///
-/// [`Error::Unassessable`] (or `Unsupported`) when `root`'s order key exists but cannot be read.
-/// Empty, not an error, when `root` is gone.
-#[cfg(target_os = "macos")]
-pub(crate) fn descendants(
-    kernel: &dyn Kernel,
-    root: ProcessId,
-    parents: &[(RawPid, RawPid)],
-) -> Result<Vec<ProcessId>, Error> {
-    Ok(settle_anchor(root, root.order_key_with(kernel))?
-        .map(|root_key| descendants_from_key(kernel, root, root_key, parents))
-        .unwrap_or_default())
-}
-
 /// Pure one-level child filter (host-testable): keep each pid whose ppid == the parent's
 /// pid and whose order key passes `keeps_order` against `parent_key`. `resolve(pid, parent)` is
-/// injected for purity. The parent itself is never included.
+/// injected for purity. The parent itself is never included. A pid the resolver errs on is listed
+/// once in [`Walk::unassessed`].
 pub(crate) fn children_of_with(
     parent: ProcessId,
     parent_key: OrderKey,
     parents: &[(RawPid, RawPid)],
     allow_equal: bool,
-    resolve: impl Fn(RawPid, ProcessId) -> Option<(ProcessId, OrderKey)>,
-) -> Vec<ProcessId> {
-    let mut out = Vec::new();
+    resolve: impl Fn(RawPid, ProcessId) -> Resolution,
+) -> Walk {
+    let mut walk = Walk::default();
     let mut seen = std::collections::HashSet::new();
     for &(pid, ppid) in parents {
         if ppid != parent.pid() || pid == ppid {
             continue;
         }
-        let Some((id, key)) = resolve(pid, parent) else {
+        let read = match resolve(pid, parent) {
+            Ok(read) => read,
+            Err(why) => {
+                if !walk.unassessed.iter().any(|&(listed, _)| listed == pid) {
+                    walk.unassessed.push((pid, why));
+                }
+                None
+            }
+        };
+        let Some((id, key)) = read else {
             log::debug!("treewalk: pid {pid} unresolvable — dropped from children");
             continue;
         };
@@ -335,10 +360,10 @@ pub(crate) fn children_of_with(
             continue;
         }
         if seen.insert(pid) {
-            out.push(id);
+            walk.members.push(id);
         }
     }
-    out
+    walk
 }
 
 /// Live one-level children of `parent`, whose order key is `parent_key`: the pure filter wired to
@@ -348,7 +373,7 @@ pub(crate) fn children_of_from_key(
     parent: ProcessId,
     parent_key: OrderKey,
     parents: &[(RawPid, RawPid)],
-) -> Vec<ProcessId> {
+) -> Walk {
     children_of_with(parent, parent_key, parents, ALLOW_EQUAL_ORDER, |pid, parent| {
         resolve_or_drop(kernel, pid, parent)
     })
@@ -547,7 +572,8 @@ pub(crate) fn unqueryable_read(pid: RawPid, cause: UnknownCause) -> Error {
 /// is `Ok`, with nothing killed.
 ///
 /// `Ok(false)`: the walk ran but was not complete, because an identity it resolved refused the
-/// kill, so members may be left running.
+/// kill, or a candidate's identity could not be read (so it and its subtree were not walked), so
+/// members may be left running.
 pub(crate) fn hard_kill(kernel: &dyn Kernel, root: ProcessId) -> Result<bool, Error> {
     // Test-only fault seam: skip the root's identity kill (take semantics — see `fault`).
     #[cfg(test)]
@@ -565,7 +591,12 @@ pub(crate) fn hard_kill(kernel: &dyn Kernel, root: ProcessId) -> Result<bool, Er
     if fault::take_force_incomplete() {
         complete = false;
     }
-    let descendants = descendants_from_key(kernel, root, root_key, &parents);
+    let Walk {
+        members: descendants,
+        unassessed,
+    } = descendants_from_key(kernel, root, root_key, &parents);
+    // A candidate that could not be read is not killed, and nor is anything under it: not complete.
+    complete &= unassessed.is_empty();
     #[cfg(unix)]
     {
         if !skip_root {
@@ -721,7 +752,8 @@ pub(crate) fn terminate(kernel: &dyn Kernel, root: ProcessId) -> Result<(), Erro
         };
         #[cfg(test)]
         fault::note_walk(root.pid());
-        let descendants = descendants_from_key(kernel, root, root_key, &parents);
+        // Best effort by contract: a candidate that could not be read was warned and is not signalled.
+        let descendants = descendants_from_key(kernel, root, root_key, &parents).members;
         let _ = kill_by_identity(kernel, root, Signal::SIGTERM);
         for id in descendants {
             let _ = kill_by_identity(kernel, id, Signal::SIGTERM);
