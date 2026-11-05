@@ -25,13 +25,13 @@ use crate::os_process::fake::ReapAnswer;
 use crate::test_groups::{cgroup, Group};
 use crate::{ContainMode, Containment, Stdio};
 
-const SUDO: ElevatedVia = ElevatedVia::Wrapped(Backend::Sudo);
+pub(crate) const SUDO: ElevatedVia = ElevatedVia::Wrapped(Backend::Sudo);
 
 /// A forced kill of a child: `kill` or `kill_tree`.
 type Kill = fn(&crate::Child) -> Result<(), crate::error::Error>;
 
 /// `cmd`, contained in a cgroup.
-fn in_cgroup(mut cmd: Command) -> Command {
+pub(crate) fn in_cgroup(mut cmd: Command) -> Command {
     cmd.contain_with(ContainMode::Strongest);
     cmd
 }
