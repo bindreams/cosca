@@ -22,6 +22,10 @@ pub(crate) type OsHandle<'a> = BorrowedHandle<'a>;
 /// Policy (reap once, "already reaped is gone") belongs to the caller: these calls state what the OS
 /// says now.
 pub(crate) trait OsChild: OsProcess {
+    /// The child's pid, for messages. `None`: the spawn never learned it (a Linux child whose spawn
+    /// failed after the handshake opened its pidfd); acts go by the handle either way.
+    fn pid(&self) -> Option<u32>;
+
     /// Look at the exit record without consuming it, and without touching anything a waiter waits
     /// on. A stop, or a zombie only its tracer sees, is [`PeekOutcome::Running`]. Any thread, any
     /// time.
@@ -145,7 +149,7 @@ pub(crate) fn adopt_std(
     let gone = || Error::Io(std::io::Error::from_raw_os_error(libc::ECHILD));
     #[cfg(target_os = "linux")]
     let os: Box<dyn OsChild> = match crate::wait::exit_only::open_own_child(id.pid(), Some(id)) {
-        Ok(Some(pidfd)) => Box::new(super::linux::LinuxProcess::new(id.pid(), pidfd)),
+        Ok(Some(pidfd)) => Box::new(super::linux::LinuxProcess::new(Some(id.pid()), pidfd)),
         Ok(None) => return Err((gone(), child)),
         Err(e) => return Err((e, child)),
     };
