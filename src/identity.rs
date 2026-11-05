@@ -12,8 +12,9 @@
 //! wall-clock from boot time drifts under NTP and would silently break
 //! `Eq`/`Hash`. The human-facing wall-clock lives in `created_at()`,
 //! allowed to drift and never used for identity. What orders processes (the tree walk's PID-reuse
-//! guard) is not the key but an `OrderKey`: the start time, which on Linux a `pidfs` id reads from
-//! `/proc`; on Windows the process sequence number, read on the handle the creation time is read on.
+//! guard) is not the key but an `OrderKey`: the start time (on Linux a `pidfs` id reads it from
+//! `/proc`), or on Windows the process sequence number, read on the handle the creation time is
+//! read on.
 //!
 //! The key is not portable across a reboot on every platform — see [`ProcessIdRecord`]
 //! for the persist/restore round trip and what it refuses.
@@ -217,14 +218,8 @@ impl ProcessId {
         #[cfg(windows)]
         {
             let _ = (kernel, parent);
-            match backend::ordered_read(pid) {
-                Resolved::Found((key, order)) => (
-                    Resolved::Found((ProcessId { pid, key }, order)),
-                    UnknownCause::default(),
-                ),
-                Resolved::Gone => (Resolved::Gone, UnknownCause::default()),
-                Resolved::Unknown => (Resolved::Unknown, UnknownCause::default()),
-            }
+            let (read, cause) = backend::ordered_read(pid);
+            (read.map(|(key, order)| (ProcessId { pid, key }, order)), cause)
         }
         #[cfg(not(any(target_os = "linux", windows)))]
         {
@@ -245,8 +240,8 @@ impl ProcessId {
     /// Where this process falls in the order of process creation (see [`OrderKey`]), for ordering
     /// against other processes' keys (the tree walk's PID-reuse guard). [`Resolved::Gone`] and
     /// [`Resolved::Unknown`] mean no key could be read, and a pid that another process holds now is
-    /// `Gone` on Windows, where the key is read from the process; the [`UnknownCause`] says why when
-    /// the read itself knows, as for [`of_with`](Self::of_with).
+    /// `Gone`; the [`UnknownCause`] says why when the read itself knows, as for
+    /// [`of_with`](Self::of_with).
     pub(crate) fn order_key_with(&self, kernel: &dyn Kernel) -> (Resolved<OrderKey>, UnknownCause) {
         #[cfg(target_os = "linux")]
         {
@@ -255,7 +250,7 @@ impl ProcessId {
         #[cfg(windows)]
         {
             let _ = kernel;
-            (backend::order_key(self.pid, self.key), UnknownCause::default())
+            backend::order_key(self.pid, self.key)
         }
         #[cfg(not(any(target_os = "linux", windows)))]
         {
@@ -474,7 +469,8 @@ pub(crate) use backend::proc_view::{
 };
 
 /// Why a by-pid read answered `Unknown`, when the read itself knows: on Linux, the unusable
-/// `/proc` view it went through. Carried out of the failing read, so the error describes that read
+/// `/proc` view it went through or the failed pidfd call; on Windows, the `NTSTATUS` of the refused
+/// sequence-number query. Carried out of the failing read, so the error describes that read
 /// and not a second look at a view that may have recovered.
 #[derive(Debug, Default)]
 pub(crate) struct UnknownCause {
@@ -486,6 +482,9 @@ pub(crate) struct UnknownCause {
     /// The parent whose proof left an ordered read `Unknown`, when that and not the read's own pid
     /// is why (Linux).
     parent: Option<RawPid>,
+    /// The `NTSTATUS` of the refused process-sequence-number query that left the read `Unknown`.
+    #[cfg(windows)]
+    sequence_status: Option<windows::Win32::Foundation::NTSTATUS>,
 }
 
 impl UnknownCause {
@@ -500,6 +499,15 @@ impl UnknownCause {
     fn of_parent(mut self, parent: RawPid) -> UnknownCause {
         self.parent = Some(parent);
         self
+    }
+
+    /// The cause of a read that a refused process-sequence-number query (`status`) left `Unknown`.
+    #[cfg(windows)]
+    pub(crate) fn of_sequence_status(status: windows::Win32::Foundation::NTSTATUS) -> UnknownCause {
+        UnknownCause {
+            sequence_status: Some(status),
+            ..UnknownCause::default()
+        }
     }
 
     /// The failed pidfd call, when one is why.
@@ -530,8 +538,9 @@ impl UnknownCause {
 
     /// The error for `subject`'s `Unknown` read when the read knows why: `Error::Unsupported` naming
     /// the `openat2` requirement or a refused `pidfd_open`, or `Error::Unassessable` with the view's
-    /// reason or the errno that failed. `None` when nothing is known (or off Linux, which has no view
-    /// and no pidfd): `hidepid`, a racing exit.
+    /// reason or the errno that failed; on Windows, `Error::Unassessable` naming the refused
+    /// sequence-number query's `NTSTATUS`. `None` when nothing is known (or on macOS, which has no
+    /// view and no pidfd): `hidepid`, a racing exit, an access denial.
     pub(crate) fn into_error(self, subject: &str) -> Option<crate::error::Error> {
         #[cfg(target_os = "linux")]
         {
@@ -541,7 +550,17 @@ impl UnknownCause {
                 (None, None) => None,
             }
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(windows)]
+        {
+            self.sequence_status.map(|status| crate::error::Error::Unassessable {
+                detail: format!(
+                    "{subject} exists but its process sequence number query failed: NTSTATUS {:#010x}",
+                    status.0 as u32
+                ),
+                source: None,
+            })
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
         {
             let _ = (self, subject);
             None

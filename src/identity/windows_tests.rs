@@ -4,7 +4,7 @@ use windows::Win32::System::Threading::{
 };
 
 use super::{creation_token, current_token, exit_look, is_running, open_dropping_refused, start_token, Look, Opened};
-use crate::identity::windows_fixture::spawn_restricted;
+use crate::identity::windows_fixture::{spawn_restricted, spawn_restricted_shell};
 use crate::identity::{Key, Liveness, Resolved};
 
 /// One look at whether `id`'s process has exited, through the open: gone or recycled
@@ -554,23 +554,6 @@ fn order_key_of(id: crate::identity::ProcessId) -> crate::identity::OrderKey {
     }
 }
 
-/// A child of `child` (`cmd /C more` runs `more` as a child), as the process snapshot lists it, once
-/// it appears. The wait re-checks the snapshot and is ended by `child` exiting.
-fn grandchild_pid(child: &mut std::process::Child) -> u32 {
-    loop {
-        assert!(
-            child.try_wait().expect("poll the fixture").is_none(),
-            "the fixture exited before spawning its child"
-        );
-        let parents =
-            crate::containment::enumerate::process_parents(&crate::identity::HostKernel).expect("the process snapshot");
-        if let Some((pid, _)) = parents.iter().find(|(_, ppid)| *ppid == child.id()) {
-            return *pid;
-        }
-        std::thread::yield_now();
-    }
-}
-
 /// The order key is the process sequence number, not the creation time that is the id's key.
 ///
 /// Mutant: the order key is the id's key.
@@ -591,17 +574,22 @@ fn the_order_key_is_not_the_creation_time() {
 /// Mutant: the order key is a value that does not grow from creator to child.
 #[skuld::test]
 fn a_child_orders_after_its_creator_and_a_grandchild_after_the_child() {
-    let mut child = spawn_blocked_child();
-    let grandchild = grandchild_pid(&mut child);
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(a_child_orders_after_its_creator_and_a_grandchild_after_the_child),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
+    let child = spawn_restricted_shell(&done, PROCESS_QUERY_LIMITED_INFORMATION.0);
+    let grandchild = child.wait_for_child();
     let me = crate::identity::ProcessId::current();
-    let child_id = crate::identity::ProcessId::of(child.id())
+    let child_id = crate::identity::ProcessId::of(child.pid())
         .found()
         .expect("the child is ours");
     let grandchild_id = crate::identity::ProcessId::of(grandchild)
         .found()
         .expect("the grandchild is ours");
     let keys = (order_key_of(me), order_key_of(child_id), order_key_of(grandchild_id));
-    end(child);
     assert!(keys.0 < keys.1, "child {:?} after creator {:?}", keys.1, keys.0);
     assert!(keys.1 < keys.2, "grandchild {:?} after child {:?}", keys.2, keys.1);
 }
@@ -618,14 +606,19 @@ fn the_order_key_of_a_stale_id_is_gone() {
 /// The walk keeps a real child and grandchild of a real spawned root, ordered by sequence number.
 #[skuld::test]
 fn the_walk_keeps_a_real_child_and_grandchild_of_a_real_spawned_root() {
-    let mut child = spawn_blocked_child();
-    let grandchild = grandchild_pid(&mut child);
-    let root = crate::identity::ProcessId::of(child.id())
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(the_walk_keeps_a_real_child_and_grandchild_of_a_real_spawned_root),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
+    let child = spawn_restricted_shell(&done, PROCESS_QUERY_LIMITED_INFORMATION.0);
+    let grandchild = child.wait_for_child();
+    let root = crate::identity::ProcessId::of(child.pid())
         .found()
         .expect("the root is ours");
     let direct = root.children(crate::Recursive::No);
     let below_us = crate::identity::ProcessId::current().children(crate::Recursive::Yes);
-    end(child);
     let direct = direct.expect("the root's children are enumerable");
     assert!(
         direct.iter().any(|id| id.pid() == grandchild),
@@ -638,4 +631,57 @@ fn the_walk_keeps_a_real_child_and_grandchild_of_a_real_spawned_root() {
             "{pid} not among {below_us:?}"
         );
     }
+}
+
+/// A failed sequence-number query reaches the caller as that query's failure, with its status.
+///
+/// Mutant: the error of a failed class-92 query reads as the generic "access denied?" one.
+#[skuld::test]
+fn a_failed_sequence_number_query_names_its_status() {
+    let cause =
+        crate::identity::UnknownCause::of_sequence_status(windows::Win32::Foundation::NTSTATUS(0xC000_0004_u32 as i32));
+    let err = crate::containment::treewalk::unqueryable("pid 7", cause);
+    assert!(
+        matches!(err, crate::error::Error::Unassessable { .. }),
+        "an unqueryable process is Unassessable: {err:?}"
+    );
+    let text = err.to_string();
+    assert!(
+        text.contains("pid 7") && text.contains("process sequence number query failed: NTSTATUS 0xc0000004"),
+        "{text}"
+    );
+}
+
+/// Class 92 answers for every process this caller can open: the CI pin of the private read on the
+/// runner's real process population. Read-only: it opens each process in the snapshot with
+/// `PROCESS_QUERY_LIMITED_INFORMATION` and queries it, and signals, suspends and modifies nothing.
+/// An elevated caller opens more, so an elevated runner covers processes an unelevated one cannot.
+///
+/// Mutant: the class is refused for a kind of process (a protected or system one).
+#[skuld::test]
+fn the_sequence_number_reads_on_every_process_that_opens() {
+    let parents =
+        crate::containment::enumerate::process_parents(&crate::identity::HostKernel).expect("the process snapshot");
+    let (mut opened, mut refused, mut gone) = (0usize, 0usize, 0usize);
+    let mut failures = Vec::new();
+    for (pid, _) in parents {
+        match super::open_classified(pid, PROCESS_QUERY_LIMITED_INFORMATION) {
+            Opened::Found(handle) => {
+                opened += 1;
+                if let Err(status) = super::sequence_number(handle) {
+                    failures.push(format!("pid {pid}: NTSTATUS {:#010x}", status.0 as u32));
+                }
+                super::close(handle);
+            }
+            Opened::Denied(_) => refused += 1,
+            Opened::Gone => gone += 1,
+        }
+    }
+    eprintln!("sequence number read on {opened} processes; {refused} refused to open, {gone} gone");
+    assert!(opened > 0, "no process could be opened: {refused} refused, {gone} gone");
+    assert!(
+        failures.is_empty(),
+        "class 92 failed on {} of {opened} opened processes ({refused} refused to open): {failures:?}",
+        failures.len()
+    );
 }

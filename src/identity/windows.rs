@@ -29,7 +29,7 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::System::WindowsProgramming::PUBLIC_OBJECT_BASIC_INFORMATION;
 
-use super::{Key, Liveness, OrderKey, RawPid, Resolved};
+use super::{Key, Liveness, OrderKey, RawPid, Resolved, UnknownCause};
 
 /// 100 ns intervals between 1601-01-01 (FILETIME epoch) and 1970-01-01 (Unix).
 const EPOCH_DIFF_100NS: u64 = 116_444_736_000_000_000;
@@ -297,13 +297,13 @@ fn sequence_number(handle: HANDLE) -> Result<u64, NTSTATUS> {
 }
 
 /// The id key and the order key of `pid`, read on one `PROCESS_QUERY_LIMITED_INFORMATION` handle,
-/// so both describe the same process. A refused sequence-number query is `Unknown`, never a
-/// fall back to the creation time.
-pub(super) fn ordered_read(pid: RawPid) -> Resolved<(Key, OrderKey)> {
+/// so both describe the same process. A refused sequence-number query is `Unknown` with its
+/// `NTSTATUS` as the cause, never a fall back to the creation time.
+pub(super) fn ordered_read(pid: RawPid) -> (Resolved<(Key, OrderKey)>, UnknownCause) {
     let handle = match open_classified(pid, PROCESS_QUERY_LIMITED_INFORMATION) {
         Opened::Found(h) => h,
-        Opened::Gone => return Resolved::Gone,
-        Opened::Denied(_) => return Resolved::Unknown,
+        Opened::Gone => return (Resolved::Gone, UnknownCause::default()),
+        Opened::Denied(_) => return (Resolved::Unknown, UnknownCause::default()),
     };
     let read = ordered_from_handle(handle, pid);
     close(handle);
@@ -311,14 +311,14 @@ pub(super) fn ordered_read(pid: RawPid) -> Resolved<(Key, OrderKey)> {
 }
 
 /// [`ordered_read`] on an open handle of `pid` with `PROCESS_QUERY_LIMITED_INFORMATION`.
-fn ordered_from_handle(handle: HANDLE, pid: RawPid) -> Resolved<(Key, OrderKey)> {
+fn ordered_from_handle(handle: HANDLE, pid: RawPid) -> (Resolved<(Key, OrderKey)>, UnknownCause) {
     let key = creation_token_result(handle);
     let sequence = sequence_number(handle);
     match (key, sequence) {
-        (Ok(key), Ok(sequence)) => Resolved::Found((key, OrderKey(sequence))),
+        (Ok(key), Ok(sequence)) => (Resolved::Found((key, OrderKey(sequence))), UnknownCause::default()),
         (Err(e), _) => {
             log::debug!("GetProcessTimes failed on an opened handle for pid {pid}: {e}");
-            Resolved::Unknown
+            (Resolved::Unknown, UnknownCause::default())
         }
         (Ok(_), Err(status)) => {
             log::debug!(
@@ -326,18 +326,18 @@ fn ordered_from_handle(handle: HANDLE, pid: RawPid) -> Resolved<(Key, OrderKey)>
                  NTSTATUS {:#010x}",
                 status.0 as u32
             );
-            Resolved::Unknown
+            (Resolved::Unknown, UnknownCause::of_sequence_status(status))
         }
     }
 }
 
 /// The order key of the process that holds `pid` as `key`: [`Resolved::Gone`] when another
 /// process holds it now.
-pub(super) fn order_key(pid: RawPid, key: Key) -> Resolved<OrderKey> {
+pub(super) fn order_key(pid: RawPid, key: Key) -> (Resolved<OrderKey>, UnknownCause) {
     match ordered_read(pid) {
-        Resolved::Found((now, order)) if now == key => Resolved::Found(order),
-        Resolved::Found(_) | Resolved::Gone => Resolved::Gone,
-        Resolved::Unknown => Resolved::Unknown,
+        (Resolved::Found((now, order)), _) if now == key => (Resolved::Found(order), UnknownCause::default()),
+        (Resolved::Found(_) | Resolved::Gone, _) => (Resolved::Gone, UnknownCause::default()),
+        (Resolved::Unknown, cause) => (Resolved::Unknown, cause),
     }
 }
 
@@ -356,7 +356,7 @@ pub(crate) fn windows_ordered_identity_from_handle(
     handle: HANDLE,
     pid: RawPid,
 ) -> Option<(crate::identity::ProcessId, OrderKey)> {
-    let (key, order) = ordered_from_handle(handle, pid).found()?;
+    let (key, order) = ordered_from_handle(handle, pid).0.found()?;
     Some((crate::identity::ProcessId { pid, key }, order))
 }
 
