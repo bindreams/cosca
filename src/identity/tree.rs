@@ -1,6 +1,7 @@
 //! The process tree around a [`ProcessId`](super::ProcessId): its parent and its children.
 
 use super::{HostKernel, Kernel, ProcessId, Resolved};
+use crate::containment::treewalk::{keeps_order, resolution_of, ALLOW_EQUAL_ORDER, ORDER_AFTER_PARENT};
 use crate::error::Error;
 
 /// Whether a tree query descends recursively or returns only direct children.
@@ -13,9 +14,12 @@ pub enum Recursive {
 }
 
 impl ProcessId {
-    /// The parent process, by identity. Identity-guarded against pid-reuse: a genuine parent
-    /// predates this child, so a recycled `ppid` naming a process created AFTER it (later
-    /// order key) is rejected by the same order-key rule as [`children`](Self::children).
+    /// The parent process, by identity. Identity-guarded against pid-reuse by one proof that the
+    /// `ppid` read names the real parent and not a later holder of its pid, the proof the walk
+    /// makes of each candidate. Where an orphan is reparented (Linux, macOS), `self` is read again
+    /// after its parent, and its `ppid` must still name the parent, which must still hold its pid.
+    /// Where the creator is never updated (Windows), `self` must instead have started strictly
+    /// after the parent; a parent that started after its child is a recycled `ppid`.
     ///
     /// `Ok(None)` means there is none: `self` has no parent (pid 1), the parent has exited, or
     /// `self` is gone or was recycled. It is never an answer to a question that could not be
@@ -23,21 +27,20 @@ impl ProcessId {
     ///
     /// # Errors
     ///
-    /// - [`Error::Unassessable`]: `self` (or its parent) exists but cannot be queried.
+    /// - [`Error::Unassessable`]: `self` (or its parent) exists but cannot be queried, at any of the
+    ///   reads; or its parent's proof cannot be made.
     /// - [`Error::Unsupported`]: on Linux, `openat2` is unavailable (Linux ≥ 5.6).
     pub fn parent(&self) -> Result<Option<ProcessId>, Error> {
         self.parent_with(&HostKernel)
     }
 
-    /// [`parent`](Self::parent), reading through `kernel`. `self` is read a second time, under the
-    /// parent, after the parent's read: where an orphan is reparented (Linux, macOS), a `ppid` that
-    /// still names the parent then proves the read was of the real parent and not of a later holder
-    /// of its pid, which the at-or-after order rule alone passes when created in `self`'s tick.
+    /// [`parent`](Self::parent), reading through `kernel`.
     pub(crate) fn parent_with(&self, kernel: &dyn Kernel) -> Result<Option<ProcessId>, Error> {
         // `self`'s parent number is not in the process table: a live process may have no row
         // (Toolhelp omits an exited process whose handle is held), so it comes from `self`'s own
         // read, which is also the proof that `self` holds its pid and gives its order key. An
-        // Unknown read cannot rule out a recycled pid, so it is an error.
+        // Unknown read cannot rule out a recycled pid, so it is an error. It is the one read that
+        // returns the number, which the shared read under a parent does not.
         let (ppid, key) = match self.parent_number_and_order_with(kernel) {
             (Resolved::Found(read), _) => read,
             (Resolved::Gone, _) => return Ok(None),
@@ -50,7 +53,7 @@ impl ProcessId {
             return Ok(None);
         }
         // An access-denied parent is not "no parent".
-        let (parent, parent_key) = match ProcessId::of_ordered_with(kernel, ppid, None) {
+        let (parent, parent_key) = match ProcessId::of_ordered_with(kernel, ppid, None, None, None) {
             (Resolved::Found(read), _) => read,
             (Resolved::Gone, _) => return Ok(None),
             (Resolved::Unknown, cause) => {
@@ -60,22 +63,17 @@ impl ProcessId {
                 ));
             }
         };
-        // `ppid` is only a number: `self`'s own read must still name it after the parent was read,
-        // and the parent must still hold it after that read.
-        match ProcessId::of_ordered_with(kernel, self.pid(), Some(parent)) {
-            (Resolved::Found((read, _)), _) if read == *self => {}
-            // `self` was replaced, exited, or has another parent now.
-            (Resolved::Found(_) | Resolved::Gone, _) => return Ok(None),
-            // The parent's proof can be what failed, not `self`'s read.
-            (Resolved::Unknown, cause) => {
-                return Err(crate::containment::treewalk::unqueryable_read(self.pid(), cause));
-            }
+        // `ppid` is only a number: something must show it names the parent and not a later holder
+        // of its pid.
+        if ORDER_AFTER_PARENT {
+            // The creator is never updated, so a read of `self` shows nothing new: a genuine parent
+            // started before its child.
+            return Ok(keeps_order(key, parent_key, ALLOW_EQUAL_ORDER).then_some(parent));
         }
-        // A genuine parent predates this child; a recycled ppid names a later-started process.
-        Ok(
-            crate::containment::treewalk::keeps_order(key, parent_key, crate::containment::treewalk::ALLOW_EQUAL_ORDER)
-                .then_some(parent),
-        )
+        // Reparenting updates `ppid`: `self`'s own read after the parent's must still name the
+        // parent, and the parent must still hold its pid after it.
+        let read = ProcessId::of_ordered_with(kernel, self.pid(), Some(parent), Some(self.key), None);
+        Ok(resolution_of(self.pid(), read)?.map(|_| parent))
     }
 
     /// The process's children. `Recursive::No` = direct children; `Recursive::Yes` = the

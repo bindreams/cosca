@@ -560,7 +560,8 @@ fn order_key_of(id: crate::identity::ProcessId) -> crate::identity::OrderKey {
 #[skuld::test]
 fn the_order_key_is_not_the_creation_time() {
     let me = crate::identity::ProcessId::current();
-    let (read, _) = crate::identity::ProcessId::of_ordered_with(&crate::identity::HostKernel, me.pid(), None);
+    let (read, _) =
+        crate::identity::ProcessId::of_ordered_with(&crate::identity::HostKernel, me.pid(), None, None, None);
     let Resolved::Found((id, key)) = read else {
         panic!("our own order key must read, got {read:?}");
     };
@@ -810,7 +811,8 @@ fn a_candidate_is_unknown_when_its_parent_cannot_be_opened_to_prove_it() {
     assert!(shell.is_running(), "precondition: the parent must be live");
     // The shell cannot be read by pid, so its id is stated; only its pid is looked up.
     let parent = crate::identity::ProcessId::from_parts_for_test(shell.pid(), Key::for_test(1));
-    let (read, cause) = crate::identity::ProcessId::of_ordered_with(&crate::identity::HostKernel, ping, Some(parent));
+    let (read, cause) =
+        crate::identity::ProcessId::of_ordered_with(&crate::identity::HostKernel, ping, Some(parent), None, None);
     assert_eq!(read, Resolved::Unknown);
     assert_eq!(cause.blamed_parent(), Some(shell.pid()));
 }

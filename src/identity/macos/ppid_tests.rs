@@ -75,7 +75,8 @@ fn a_refused_sysctl_is_unknown_after_one_read() {
 fn a_candidate_whose_parent_read_is_refused_is_unknown() {
     let (child, kid) = live_exiting_member();
     let _forced = fault::force_ppid_reads(kid.pid(), &[PpidRead::Refused]);
-    let (read, cause) = ProcessId::of_ordered_with(&crate::identity::HostKernel, kid.pid(), Some(ProcessId::current()));
+    let parent = Some(ProcessId::current());
+    let (read, cause) = ProcessId::of_ordered_with(&crate::identity::HostKernel, kid.pid(), parent, None, None);
     release_unsignalled(child);
     assert_eq!(read, Resolved::Unknown);
     assert_eq!(cause.blamed_parent(), None);
@@ -122,10 +123,11 @@ fn one_parent_read_of_launchd_finds_its_parent_zero() {
 fn an_ordered_read_reads_the_parent_number_only_when_asked() {
     let (child, kid) = live_exiting_member();
     let _forced = fault::force_ppid_reads(kid.pid(), &[]);
-    let (alone, _) = ProcessId::of_ordered_with(&crate::identity::HostKernel, kid.pid(), None);
+    let (alone, _) = ProcessId::of_ordered_with(&crate::identity::HostKernel, kid.pid(), None, None, None);
     assert!(matches!(alone, Resolved::Found(_)), "{alone:?}");
     assert_eq!(fault::ppid_read_attempts(kid.pid()), 0);
-    let (under, _) = ProcessId::of_ordered_with(&crate::identity::HostKernel, kid.pid(), Some(ProcessId::current()));
+    let parent = Some(ProcessId::current());
+    let (under, _) = ProcessId::of_ordered_with(&crate::identity::HostKernel, kid.pid(), parent, None, None);
     release_unsignalled(child);
     assert!(matches!(under, Resolved::Found(_)), "{under:?}");
     assert_eq!(fault::ppid_read_attempts(kid.pid()), 1);

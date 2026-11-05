@@ -111,7 +111,7 @@ fn a_stat_with_no_readable_ppid_is_unknown_not_another_parent() {
 
     let (another, _writer) = with_ppid("8");
     assert!(matches!(
-        ProcessId::of_ordered_with(&another, PID, Some(parent)).0,
+        ProcessId::of_ordered_with(&another, PID, Some(parent), None, None).0,
         Resolved::Gone
     ));
     // The parent is held, so the candidate's own failure stands.
@@ -119,7 +119,7 @@ fn a_stat_with_no_readable_ppid_is_unknown_not_another_parent() {
     let (parent_fd, _parent_writer) = pidfd();
     let unreadable = unreadable.on_pidfd_open(7, Ok(parent_fd)).on_pidfs_ino(7, Ok(Some(9)));
     assert!(matches!(
-        ProcessId::of_ordered_with(&unreadable, PID, Some(parent)).0,
+        ProcessId::of_ordered_with(&unreadable, PID, Some(parent), None, None).0,
         Resolved::Unknown
     ));
 }
@@ -139,7 +139,7 @@ fn a_gone_parent_is_gone_before_a_refused_stat_is_unknown() {
         .on_pidfd_open(PID, Ok(fd))
         .on_pidfs_ino(PID, Ok(Some(100)))
         .on_pidfd_open(7, Err(Errno::SRCH));
-    let (read, _) = ProcessId::of_ordered_with(&gone, PID, Some(parent));
+    let (read, _) = ProcessId::of_ordered_with(&gone, PID, Some(parent), None, None);
     assert!(matches!(read, Resolved::Gone), "{read:?}");
 }
 
@@ -154,7 +154,7 @@ fn a_gone_parent_is_gone_before_a_missing_start_time_is_unknown() {
     let (gone, _writer) = kernel_showing(stat, 100);
     let gone = gone.on_pidfd_open(7, Err(Errno::SRCH));
     assert!(matches!(
-        ProcessId::of_ordered_with(&gone, PID, Some(parent)).0,
+        ProcessId::of_ordered_with(&gone, PID, Some(parent), None, None).0,
         Resolved::Gone
     ));
 
@@ -162,7 +162,7 @@ fn a_gone_parent_is_gone_before_a_missing_start_time_is_unknown() {
     let (parent_fd, _parent_writer) = pidfd();
     let held = held.on_pidfd_open(7, Ok(parent_fd)).on_pidfs_ino(7, Ok(Some(9)));
     assert!(matches!(
-        ProcessId::of_ordered_with(&held, PID, Some(parent)).0,
+        ProcessId::of_ordered_with(&held, PID, Some(parent), None, None).0,
         Resolved::Unknown
     ));
 }
@@ -179,7 +179,7 @@ fn another_parent_is_gone_even_when_the_start_time_is_missing() {
     let (parent_fd, _parent_writer) = pidfd();
     let kernel = kernel.on_pidfd_open(7, Ok(parent_fd)).on_pidfs_ino(7, Ok(Some(9)));
     assert!(matches!(
-        ProcessId::of_ordered_with(&kernel, PID, Some(parent)).0,
+        ProcessId::of_ordered_with(&kernel, PID, Some(parent), None, None).0,
         Resolved::Gone
     ));
 }

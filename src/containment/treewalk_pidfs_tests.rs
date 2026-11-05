@@ -83,7 +83,7 @@ pub(super) fn children_of(
 #[skuld::test]
 fn resolve_or_drop_pairs_a_pidfs_id_with_its_start_time() {
     assert_eq!(
-        super::resolve_or_drop(&table(), CHILD, root()).expect("the child reads"),
+        super::resolve_or_drop(&table(), CHILD, root(), OrderKey::for_test(ROOT_START)).expect("the child reads"),
         Some((child(), OrderKey::for_test(CHILD_START)))
     );
 }
@@ -247,6 +247,24 @@ fn a_child_whose_parent_cannot_be_proved_again_is_unassessed_and_a_gone_child_is
     }
 }
 
+/// A child that started before the root cannot be the root's child, so the root's proof, which cannot
+/// be made here, is never asked for: the child is gone, listed in neither `members` nor `unassessed`.
+/// Mutant: "the order rule is checked after the parent's proof": the child is unassessed.
+#[skuld::test]
+fn a_child_that_started_before_its_parent_is_gone_before_the_parents_proof_is_asked() {
+    let kernel = || {
+        table()
+            .on_read(&format!("{CHILD}/stat"), Ok(&stat(CHILD, ROOT, ROOT_START - 1)))
+            .on_pidfs_ino_after_read(ROOT, &format!("{CHILD}/stat"), Err(Errno::BADF))
+    };
+    for depth in [Recursive::Yes, Recursive::No] {
+        let found = super::walk_from(&kernel(), root(), &EDGES, depth)
+            .unwrap()
+            .expect("the root is live");
+        assert!(found.members.is_empty() && found.unassessed.is_empty(), "{found:?}");
+    }
+}
+
 /// The warn for that child names the parent whose proof failed, and the child's pid once. Mutant:
 /// "the warn blames the child's pid".
 #[skuld::test]
@@ -254,7 +272,7 @@ fn the_warn_for_a_child_whose_parent_cannot_be_proved_names_the_parent() {
     crate::log_capture::install();
     let kernel = table().on_pidfs_ino_after_read(ROOT, &format!("{CHILD}/stat"), Err(Errno::BADF));
     let mark = crate::log_capture::mark();
-    assert!(super::resolve_or_drop(&kernel, CHILD, root()).is_err());
+    assert!(super::resolve_or_drop(&kernel, CHILD, root(), OrderKey::for_test(ROOT_START)).is_err());
     let warned = crate::log_capture::records_since_on_current_thread(mark, &format!("pid {CHILD}"));
     assert_eq!(warned.len(), 1, "{warned:?}");
     let (level, message) = &warned[0];

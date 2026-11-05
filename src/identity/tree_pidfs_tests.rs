@@ -54,13 +54,6 @@ fn the_parent_of_a_pidfs_id_is_the_pidfs_id_of_its_parent() {
     );
 }
 
-/// A parent that started after its child is a recycled ppid. Mutant: "the keys compared are the
-/// inodes" (900 > 5 would reject the genuine parent above, and 5 < 900 would keep this one).
-#[skuld::test]
-fn a_parent_that_started_after_its_pidfs_child_is_rejected() {
-    assert_eq!(me().parent_with(&table(3_000)).expect("a readable table"), None);
-}
-
 /// `self`'s own read gives the ppid and the key: a pid gone by that read has no parent.
 #[skuld::test]
 fn a_pidfs_id_whose_start_time_is_gone_has_no_parent() {
@@ -102,22 +95,52 @@ fn a_pidfs_id_whose_start_time_cannot_be_read_is_unassessable() {
 
 /// The ppid `self`'s first read gives is only a number. If `self`'s read under the parent it named,
 /// which follows the parent's own, shows another ppid, the process changed parents (or its pid
-/// changed hands) and has no parent to name. `self`'s `stat` is read by the ppid read, then by that
-/// second read. Mutant: "the second read's ppid is not compared with the first's": the old parent
-/// is named.
+/// changed hands) and has no parent to name, even when the parent's pid went to a process started in
+/// `self`'s own tick, which the order rule alone would pass. `self`'s `stat` is read by the ppid read,
+/// then by that second read. Mutant: "the second read's ppid is not compared with the first's": the
+/// old parent is named.
 #[skuld::test]
 fn an_id_whose_own_read_shows_another_ppid_has_no_parent() {
-    let kernel = table(1_000).on_read_after(&format!("{SELF}/stat"), 1, Ok(&stat(SELF, 1, 2_000)));
-    assert_eq!(me().parent_with(&kernel).expect("a readable table"), None);
+    for parent_start in [1_000, 2_000] {
+        let kernel = table(parent_start).on_read_after(&format!("{SELF}/stat"), 1, Ok(&stat(SELF, 1, 2_000)));
+        assert_eq!(
+            me().parent_with(&kernel).expect("a readable table"),
+            None,
+            "a parent started at {parent_start}"
+        );
+    }
 }
 
-/// A parent that exited and whose pid went to a process created in the same tick as `self` passes
-/// the at-or-after order rule; `self`, reparented to the reaper, shows it in the second read. Mutant:
-/// "the order rule alone proves the parent": the holder is named.
+/// `self`'s pid changes hands after the parent was read, to a process that cannot be read (as under
+/// `hidepid`): the second read names the key it means, so it finds another process there and `self` is
+/// gone, whether or not its new holder can be read. Mutant: "the second read does not name `self`'s
+/// key": the refusal is an error.
 #[skuld::test]
-fn a_parent_pid_recycled_in_the_childs_tick_is_not_named() {
-    let kernel = table(2_000).on_read_after(&format!("{SELF}/stat"), 1, Ok(&stat(SELF, 1, 2_000)));
-    assert_eq!(me().parent_with(&kernel).expect("a readable table"), None);
+fn a_pidfs_id_recycled_between_the_reads_whose_new_holder_cannot_be_read_has_no_parent() {
+    let kernel = table(1_000)
+        .on_pidfs_ino_after_read(SELF, &format!("{PARENT}/stat"), Ok(Some(SELF_INO + 1)))
+        .on_read_after(&format!("{SELF}/stat"), 1, Err(libc::EACCES))
+        .on_signal_probe(Pid::from_raw(SELF as i32).unwrap(), Ok(()));
+    assert_eq!(me().parent_with(&kernel).expect("a recycled pid is not an error"), None);
+}
+
+/// `self`'s own second read fails while it still names the parent: the answer is the shared read's
+/// (`Unknown` blaming `self`, the parent being held), an error naming `self`, not "no parent". Mutant:
+/// "a failed second read is no parent".
+#[skuld::test]
+fn a_childs_second_read_that_fails_is_the_subject_of_the_error() {
+    let kernel = table(1_000)
+        .on_read_after(&format!("{SELF}/stat"), 1, Err(libc::EACCES))
+        .on_signal_probe(Pid::from_raw(SELF as i32).unwrap(), Ok(()));
+    match me().parent_with(&kernel) {
+        Err(Error::Unassessable { detail, .. }) => {
+            assert!(
+                detail.contains(&format!("pid {SELF} exists but could not be queried")),
+                "{detail}"
+            );
+        }
+        other => panic!("expected Unassessable, got {other:?}"),
+    }
 }
 
 /// A host whose pidfds have no inode, so the ticks are the proof, read from `stat`: `SELF` has its

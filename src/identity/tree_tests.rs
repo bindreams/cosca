@@ -136,6 +136,29 @@ fn the_parent_of_a_spawned_child_is_the_current_process() {
     assert_eq!(parent, Some(ProcessId::current()));
 }
 
+/// `parent` reads its process, then the parent, and reads its process again only where reparenting
+/// makes that read the proof ([`ORDER_AFTER_PARENT`](crate::containment::treewalk::ORDER_AFTER_PARENT)
+/// says where it does not: Windows, whose creator is never updated, orders instead). Counted by the
+/// by-pid read seam, which the platforms that have it share.
+///
+/// Mutant: Windows re-reads its process; macOS does not.
+#[cfg(any(target_os = "macos", windows))]
+#[skuld::test]
+fn parent_reads_its_process_again_only_where_the_creator_is_updated() {
+    let (child, kid) = live_member();
+    let before = crate::identity::seams::by_pid_reads();
+    let parent = kid.parent().expect("the parent is readable");
+    let reads = crate::identity::seams::by_pid_reads() - before;
+    release(child);
+    assert_eq!(parent, Some(ProcessId::current()));
+    let expected = if crate::containment::treewalk::ORDER_AFTER_PARENT {
+        2
+    } else {
+        3
+    };
+    assert_eq!(reads, expected);
+}
+
 /// A live process that did not create the candidate is not its parent, though it is a real process
 /// holding a real pid: the candidate's own parent number is read, not the listing's claim.
 ///
@@ -144,7 +167,7 @@ fn the_parent_of_a_spawned_child_is_the_current_process() {
 fn a_candidate_is_gone_under_a_parent_that_did_not_create_it() {
     let (x_child, x) = live_member();
     let (y_child, y) = live_member();
-    let (read, _) = ProcessId::of_ordered_with(&HostKernel, y.pid(), Some(x));
+    let (read, _) = ProcessId::of_ordered_with(&HostKernel, y.pid(), Some(x), None, None);
     release(y_child);
     release(x_child);
     assert_eq!(read, Resolved::Gone);
@@ -157,7 +180,8 @@ fn a_candidate_is_gone_under_a_parent_that_did_not_create_it() {
 #[skuld::test]
 fn a_candidate_is_gone_under_the_right_parent_pid_with_another_key() {
     let (child, kid) = live_member();
-    let (read, _) = ProcessId::of_ordered_with(&HostKernel, kid.pid(), Some(ProcessId::current().with_other_value()));
+    let other_parent = Some(ProcessId::current().with_other_value());
+    let (read, _) = ProcessId::of_ordered_with(&HostKernel, kid.pid(), other_parent, None, None);
     release(child);
     assert_eq!(read, Resolved::Gone);
 }
@@ -179,7 +203,7 @@ fn a_candidate_is_unknown_when_its_parent_cannot_be_proved() {
     #[cfg(not(target_os = "linux"))]
     let parent = ProcessId::current();
     let (kernel, _guard) = crate::identity::unreadable(me);
-    let (read, cause) = ProcessId::of_ordered_with(&kernel, kid.pid(), Some(parent));
+    let (read, cause) = ProcessId::of_ordered_with(&kernel, kid.pid(), Some(parent), None, None);
     release(child);
     assert_eq!(read, Resolved::Unknown);
     assert_eq!(cause.blamed_parent(), Some(me));

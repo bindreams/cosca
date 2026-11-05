@@ -45,6 +45,8 @@ pub(crate) mod windows_fixture;
 #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 compile_error!("cosca::identity is implemented only for Windows, Linux, and macOS");
 
+use crate::containment::treewalk::{keeps_order, ALLOW_EQUAL_ORDER};
+
 /// A process identifier as the OS knows it (matches `std::process::id`).
 pub type RawPid = u32;
 
@@ -196,10 +198,11 @@ impl OrderedRead {
         )
     }
 
-    /// The read for `pid`, whose caller was told `parent` created it. Another parent's number, or a
-    /// `Gone` read, settles the answer; every other read waits on the proof of `parent`
-    /// ([`Judged`]).
-    fn judged(self, pid: RawPid, parent: RawPid) -> Judged {
+    /// The read for `pid`, whose caller was told `parent` created it. A key before `bound`, another
+    /// parent's number, or a `Gone` read settles the answer; every other read waits on the proof of
+    /// `parent` ([`Judged`]). The bound is checked first, so a candidate that cannot be the parent's
+    /// child never asks for a proof that might fail.
+    fn judged(self, pid: RawPid, parent: RawPid, bound: Option<OrderKey>) -> Judged {
         let OrderedRead {
             read,
             parent: claimed,
@@ -210,6 +213,11 @@ impl OrderedRead {
             "a parent was named, so its number must be asked for"
         );
         match (claimed, read) {
+            (_, Resolved::Found((_, order)))
+                if bound.is_some_and(|bound| !keeps_order(order, bound, ALLOW_EQUAL_ORDER)) =>
+            {
+                Judged::Settled((Resolved::Gone, UnknownCause::default()))
+            }
             (ParentRead::Is(found), _) if found != parent => Judged::Settled((Resolved::Gone, UnknownCause::default())),
             (_, Resolved::Gone) => Judged::Settled((Resolved::Gone, cause)),
             (ParentRead::Is(_), Resolved::Found((key, order))) => {
@@ -225,7 +233,7 @@ impl OrderedRead {
 /// key of the process the caller means, when it has one; a pid that holds another key is
 /// [`Resolved::Gone`], and a backend whose read can fail after the key is known says so before it.
 fn read_ordered(kernel: &dyn Kernel, pid: RawPid, expected: Option<Key>, ask_parent: bool) -> OrderedRead {
-    #[cfg(all(test, target_os = "macos"))]
+    #[cfg(all(test, any(target_os = "macos", windows)))]
     seams::note_by_pid_read();
     #[cfg(target_os = "linux")]
     {
@@ -291,7 +299,7 @@ impl ProcessId {
     /// [`of_explained`](Self::of_explained) through `kernel`: the one entry to a by-pid identity
     /// read, on every platform.
     pub(crate) fn of_with(kernel: &dyn Kernel, pid: RawPid) -> (Resolved<ProcessId>, UnknownCause) {
-        #[cfg(all(test, target_os = "macos"))]
+        #[cfg(all(test, any(target_os = "macos", windows)))]
         seams::note_by_pid_read();
         #[cfg(target_os = "linux")]
         {
@@ -316,7 +324,12 @@ impl ProcessId {
         }
     }
 
-    /// [`of_with`](Self::of_with), with the order key of the same read beside the id.
+    /// [`of_with`](Self::of_with), with the order key of the same read beside the id: the one entry
+    /// that reads a pid under a parent, for the tree walk's candidates and for
+    /// [`parent`](Self::parent)'s second read of its own process.
+    ///
+    /// `expected`: the key of the process the caller means, when it has one; a pid that holds
+    /// another key is [`Resolved::Gone`], whatever else its read says.
     ///
     /// `parent`: the process the caller was told is this one's parent. Each backend's read carries
     /// the process's parent number from the record or handle that gives the id, and a process with
@@ -326,17 +339,34 @@ impl ProcessId {
     /// number that no longer holds it is [`Resolved::Gone`] too, and one whose proof cannot be made
     /// is [`Resolved::Unknown`], blaming the parent. The candidate's own failure is blamed on it only
     /// while the parent is held ([`Judged`]).
-    pub(crate) fn of_ordered_with(kernel: &dyn Kernel, pid: RawPid, parent: Option<ProcessId>) -> Ordered {
-        let read = read_ordered(kernel, pid, None, parent.is_some());
+    ///
+    /// `order_bound`, only with a `parent`: the order key the read must follow, under
+    /// [`ALLOW_EQUAL_ORDER`]. A read that does not is [`Resolved::Gone`], settled before the parent
+    /// is proved, so a proof that would fail never turns a process that cannot be the child into an
+    /// error.
+    pub(crate) fn of_ordered_with(
+        kernel: &dyn Kernel,
+        pid: RawPid,
+        parent: Option<ProcessId>,
+        expected: Option<Key>,
+        order_bound: Option<OrderKey>,
+    ) -> Ordered {
+        debug_assert!(
+            parent.is_some() || order_bound.is_none(),
+            "an order bound is for a read under a named parent"
+        );
+        let read = read_ordered(kernel, pid, expected, parent.is_some());
         let Some(parent) = parent else {
             return read.unclaimed(pid);
         };
-        read.judged(pid, parent.pid()).proved(|| parent.still_held(kernel))
+        read.judged(pid, parent.pid(), order_bound)
+            .proved(|| parent.still_held(kernel))
     }
 
-    /// The parent number and the order key of `self`'s own read, for a caller that has no parent to
-    /// name yet. The number is only a number: the parent it names may be another process by now, and
-    /// the caller reads that process and orders it against the key ([`OrderKey`]).
+    /// The parent number and the order key of `self`'s own read, for [`parent`](Self::parent)'s first
+    /// read, which names no parent yet and needs the number, which [`Ordered`] does not carry. The
+    /// number is only a number: the parent it names may be another process by now, and the caller
+    /// reads that process and orders it against the key ([`OrderKey`]).
     /// [`Resolved::Gone`] when another process holds `self`'s pid now, whether or not that process
     /// can be read; [`Resolved::Unknown`] when the read, or the number in it, cannot be had.
     pub(crate) fn parent_number_and_order_with(
@@ -724,8 +754,8 @@ fn start_token_explained(pid: RawPid) -> (Resolved<Key>, UnknownCause) {
     (backend::start_token(pid), UnknownCause::default())
 }
 
-/// macOS test seams.
-#[cfg(all(target_os = "macos", test))]
+/// Test seams of the platforms that count by-pid reads (macOS, Windows).
+#[cfg(all(any(target_os = "macos", windows), test))]
 pub(crate) mod seams {
     use std::cell::Cell;
 

@@ -59,13 +59,15 @@
 //! that a later process holds now, and that process's key can still order after the root's. So
 //! there ([`ORDER_AFTER_PARENT`]) a candidate is kept only if its key orders after its accepted
 //! parent's key, with the same `allow_equal`. [`children_of_with`] needs no switch: its parent is
-//! the anchor.
+//! the anchor. `ProcessId::parent` makes the same choice from the same const: it orders `self`
+//! strictly after the parent, and reads `self` no more.
 //!
 //! There is no parent-order rule elsewhere ([`ORDER_AFTER_PARENT`] is off). On macOS a tracer
 //! becomes the parent of a traced child it started after (XNU's `PT_ATTACH` sets the child's
 //! `p_ppid`), and a child forked after a clock step orders before its parent, so the rule would drop
 //! either. On Linux the stat ppid is `real_parent`, which
-//! reparenting updates, so the parent check plus the parent's proof suffices.
+//! reparenting updates, so the parent check plus the parent's proof suffices; `ProcessId::parent`
+//! reads `self` again under the parent for the same proof.
 //!
 //! The rule also drops a genuine descendant whose creator exited and whose creator's pid now belongs
 //! to a later in-tree process, with its subtree: from the snapshot alone it cannot be told from a
@@ -79,7 +81,9 @@
 //! parent no longer holds that pid when the read is done. So a descendant whose parent exits while
 //! the walk runs is dropped with its subtree: Linux and macOS reparent it, so its record names its
 //! new parent; Windows never updates the creator pid, which still names the dead parent, and the
-//! read cannot tell that from a pid that changed hands. A candidate whose own read fails (no record,
+//! read cannot tell that from a pid that changed hands. A candidate whose key does not follow the
+//! bound (above) is dropped as `Gone` in the same read, before the parent is proved: a process that
+//! cannot be the child is not a member the walk failed to assess. A candidate whose own read fails (no record,
 //! no order key, or a parent number that cannot be read) goes to the proof of the accepted parent
 //! first: a parent that is gone drops it quietly, as `Gone`; one that cannot be proved drops it with
 //! a warning naming `ppid N`; and only a held parent lets its own failure stand, dropped with a
@@ -131,9 +135,20 @@ pub(crate) struct Walk {
     pub(crate) unassessed: Vec<(RawPid, Error)>,
 }
 
-/// What the walk's resolver says of a candidate: `Ok(None)` for one that is gone (or no longer its
-/// parent's child), `Err` for one that could not be read.
+/// What a read of a candidate under its parent says: `Ok(None)` for one that is gone (or no longer
+/// its parent's child, or not ordered after the bound), `Err` for one that could not be read.
 pub(crate) type Resolution = Result<Option<(ProcessId, OrderKey)>, Error>;
+
+/// The [`Resolution`] that `read`, the answer of [`ProcessId::of_ordered_with`] for `pid`, gives:
+/// `Unknown` is the error of [`unqueryable_read`]. The one mapping of the shared read, for the walk
+/// and for [`ProcessId::parent`].
+pub(crate) fn resolution_of(pid: RawPid, read: (Resolved<(ProcessId, OrderKey)>, UnknownCause)) -> Resolution {
+    match read {
+        (Resolved::Found(read), _) => Ok(Some(read)),
+        (Resolved::Gone, _) => Ok(None),
+        (Resolved::Unknown, cause) => Err(unqueryable_read(pid, cause)),
+    }
+}
 
 /// The tree-walk resolver. A pid we may not query is dropped from the walk like a pid that is gone -
 /// the walk cannot kill what it cannot verify - but the two are told apart: "denied" is warned
@@ -145,31 +160,30 @@ pub(crate) type Resolution = Result<Option<(ProcessId, OrderKey)>, Error>;
 /// is dropped when its parent's number is another now, which means the pid changed hands since the
 /// snapshot or the same process was orphaned and is no longer in the tree; and when its parent's
 /// number no longer holds `parent`, which means the parent was reaped and its number taken by a
-/// process whose own children the candidate could be.
-pub(crate) fn resolve_or_drop(kernel: &dyn Kernel, pid: RawPid, parent: ProcessId) -> Resolution {
-    match ProcessId::of_ordered_with(kernel, pid, Some(parent)) {
-        (Resolved::Found(read), _) => Ok(Some(read)),
-        (Resolved::Gone, _) => Ok(None),
-        (Resolved::Unknown, cause) => {
-            let parent_blamed = cause.blamed_parent().is_some();
-            let error = unqueryable_read(pid, cause);
-            let why = match &error {
-                Error::Unassessable { detail, .. } => detail.clone(),
-                other => other.to_string(),
-            };
-            // The pid is IN the message on purpose: `log_capture` is one process-global
-            // buffer shared by every parallel test, so a test asserting on this line must be
-            // able to pin it to its own fixture rather than to any concurrent teardown. The reason
-            // names it when it is the subject, else the blamed parent, and then the pid is named here.
-            let dropped = if parent_blamed {
-                format!("pid {pid} dropped")
-            } else {
-                "dropped".to_owned()
-            };
-            log::warn!("treewalk: {why} - {dropped} from the walk");
-            Err(error)
-        }
+/// process whose own children the candidate could be. `bound` is the order key the candidate must
+/// follow ([`ProcessId::of_ordered_with`]): one that does not is dropped as gone, before `parent` is
+/// proved.
+pub(crate) fn resolve_or_drop(kernel: &dyn Kernel, pid: RawPid, parent: ProcessId, bound: OrderKey) -> Resolution {
+    let read = ProcessId::of_ordered_with(kernel, pid, Some(parent), None, Some(bound));
+    let parent_blamed = read.1.blamed_parent().is_some();
+    let resolution = resolution_of(pid, read);
+    if let Err(error) = &resolution {
+        let why = match error {
+            Error::Unassessable { detail, .. } => detail.clone(),
+            other => other.to_string(),
+        };
+        // The pid is IN the message on purpose: `log_capture` is one process-global
+        // buffer shared by every parallel test, so a test asserting on this line must be
+        // able to pin it to its own fixture rather than to any concurrent teardown. The reason
+        // names it when it is the subject, else the blamed parent, and then the pid is named here.
+        let dropped = if parent_blamed {
+            format!("pid {pid} dropped")
+        } else {
+            "dropped".to_owned()
+        };
+        log::warn!("treewalk: {why} - {dropped} from the walk");
     }
+    resolution
 }
 
 #[cfg(unix)]
@@ -188,10 +202,13 @@ pub(crate) const ALLOW_EQUAL_ORDER: bool = false;
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 pub(crate) const ALLOW_EQUAL_ORDER: bool = false;
 
-/// Whether a candidate must also order after its accepted parent, not only after the root. Only
-/// Windows, where the parent field is the creator and never updated, so a ppid can name a pid a
-/// later process holds now. Off on macOS: it would drop a child whose in-tree tracer started after
-/// it, or one forked after a clock step.
+/// Whether the order of a process after its parent is the proof of the parent, instead of the
+/// process's own `ppid` after the parent was read. True only on Windows, where the parent field is
+/// the creator and never updated, so a ppid can name a pid a later process holds now and a second read
+/// of the process shows nothing new; a candidate must then order after its accepted parent, not only
+/// after the root, and [`ProcessId::parent`] does not read its process again. False elsewhere:
+/// reparenting updates `ppid`, so the read under the parent is the proof, and an order rule would
+/// drop a child whose in-tree tracer started after it, or one forked after a clock step (macOS).
 #[cfg(windows)]
 pub(crate) const ORDER_AFTER_PARENT: bool = true;
 #[cfg(not(windows))]
@@ -199,18 +216,18 @@ pub(crate) const ORDER_AFTER_PARENT: bool = false;
 
 /// The PID-reuse keep-predicate (the crate's core safety invariant — see the module
 /// docs): a candidate genuinely descends from an anchor only if its order key orders
-/// at-or-after the anchor's. The single source of this rule, shared by `descendants_with`
-/// and `children_of_with`.
+/// at-or-after the anchor's. The single source of this rule: the walk's reads apply it through
+/// `ProcessId::of_ordered_with`'s order bound, and `ProcessId::parent` where [`ORDER_AFTER_PARENT`].
 pub(crate) fn keeps_order(key: OrderKey, anchor: OrderKey, allow_equal: bool) -> bool {
     key > anchor || (allow_equal && key == anchor)
 }
 
 /// Pure descendant filter (host-testable on every OS). Walks `parents` down from
 /// `root`, and for each pid whose ppid chains to `root.pid()` resolves its
-/// identity and order key via `resolve(pid, parent)`, `parent` being the accepted process whose pid
-/// the edge names, and keeps it ONLY if its key orders correctly
-/// against `root_key` per `allow_equal` (see module docs). With `parent_order` it must order
-/// after the accepted parent's key instead. `resolve` is injected
+/// identity and order key via `resolve(pid, parent, bound)`, `parent` being the accepted process whose
+/// pid the edge names, and `bound` the order key the candidate must follow (see module docs): the
+/// root's, or with `parent_order` the accepted parent's. The resolver answers `Ok(None)` for a
+/// candidate that does not. `resolve` is injected
 /// so the filter is pure: live code passes [`resolve_or_drop`], tests pass a stub. A candidate the
 /// resolver errs on is dropped with its subtree and listed once in [`Walk::unassessed`].
 ///
@@ -219,14 +236,13 @@ pub(crate) fn descendants_with(
     root: ProcessId,
     root_key: OrderKey,
     parents: &[(RawPid, RawPid)],
-    allow_equal: bool,
     parent_order: bool,
-    resolve: impl Fn(RawPid, ProcessId) -> Resolution,
+    resolve: impl Fn(RawPid, ProcessId, OrderKey) -> Resolution,
 ) -> Walk {
     // BFS over the ppid forest. `frontier` holds the accepted pids whose children we still
     // need to visit, each with its order key; it starts as just the root. A pid joins the result
-    // (and the next frontier) only if its ppid is in the current accepted set AND its
-    // order key passes `keeps_order`. No fixed iteration cap: the loop drains a
+    // (and the next frontier) only if its ppid is in the current accepted set AND the resolver
+    // finds it ordered after the bound. No fixed iteration cap: the loop drains a
     // strictly shrinking set of not-yet-visited edges.
     let mut walk = Walk::default();
     let mut frontier: Vec<(ProcessId, OrderKey)> = vec![(root, root_key)];
@@ -255,22 +271,20 @@ pub(crate) fn descendants_with(
             if pid == ppid {
                 continue;
             }
+            // Under parent_order the parent's key implies the root's.
+            let bound = if parent_order { parent_key } else { root_key };
             let read = *resolved.entry(pid).or_insert_with(|| {
-                resolve(pid, parent).unwrap_or_else(|why| {
+                resolve(pid, parent, bound).unwrap_or_else(|why| {
                     walk.unassessed.push((pid, why));
                     None
                 })
             });
             let Some((id, key)) = read else {
-                log::debug!("treewalk: pid {pid} unresolvable — dropping its subtree");
+                log::debug!(
+                    "treewalk: pid {pid} gone, or an impostor (recycled pid / stale ppid) - dropping its subtree"
+                );
                 continue;
             };
-            // Under parent_order the parent's key implies the root's.
-            let must_follow = if parent_order { parent_key } else { root_key };
-            if !keeps_order(key, must_follow, allow_equal) {
-                log::debug!("treewalk: dropping subtree under impostor pid {pid} (recycled pid / stale ppid)");
-                continue;
-            }
             // `accepted.insert` dedups so a duplicate edge never enumerates/kills the
             // same process twice.
             if accepted.insert(pid) {
@@ -321,26 +335,20 @@ fn descendants_from_key(
     root_key: OrderKey,
     parents: &[(RawPid, RawPid)],
 ) -> Walk {
-    descendants_with(
-        root,
-        root_key,
-        parents,
-        ALLOW_EQUAL_ORDER,
-        ORDER_AFTER_PARENT,
-        |pid, parent| resolve_or_drop(kernel, pid, parent),
-    )
+    descendants_with(root, root_key, parents, ORDER_AFTER_PARENT, |pid, parent, bound| {
+        resolve_or_drop(kernel, pid, parent, bound)
+    })
 }
 
 /// Pure one-level child filter (host-testable): keep each pid whose ppid == the parent's
-/// pid and whose order key passes `keeps_order` against `parent_key`. `resolve(pid, parent)` is
-/// injected for purity. The parent itself is never included. A pid the resolver errs on is listed
-/// once in [`Walk::unassessed`].
+/// pid and which the resolver finds ordered after `parent_key`: `resolve(pid, parent, bound)` is
+/// injected for purity, with `parent_key` as the bound. The parent itself is never included. A pid
+/// the resolver errs on is listed once in [`Walk::unassessed`].
 pub(crate) fn children_of_with(
     parent: ProcessId,
     parent_key: OrderKey,
     parents: &[(RawPid, RawPid)],
-    allow_equal: bool,
-    resolve: impl Fn(RawPid, ProcessId) -> Resolution,
+    resolve: impl Fn(RawPid, ProcessId, OrderKey) -> Resolution,
 ) -> Walk {
     let mut walk = Walk::default();
     // Each pid is resolved once, so a duplicate edge cannot list a pid twice or be read differently.
@@ -349,21 +357,17 @@ pub(crate) fn children_of_with(
         if ppid != parent.pid() || pid == ppid || !resolved.insert(pid) {
             continue;
         }
-        let read = match resolve(pid, parent) {
+        let read = match resolve(pid, parent, parent_key) {
             Ok(read) => read,
             Err(why) => {
                 walk.unassessed.push((pid, why));
                 None
             }
         };
-        let Some((id, key)) = read else {
-            log::debug!("treewalk: pid {pid} unresolvable — dropped from children");
+        let Some((id, _)) = read else {
+            log::debug!("treewalk: pid {pid} gone, or an impostor (recycled pid / stale ppid) - dropped from children");
             continue;
         };
-        if !keeps_order(key, parent_key, allow_equal) {
-            log::debug!("treewalk: dropping impostor pid {pid} (recycled pid / stale ppid)");
-            continue;
-        }
         walk.members.push(id);
     }
     walk
@@ -377,8 +381,8 @@ fn children_of_from_key(
     parent_key: OrderKey,
     parents: &[(RawPid, RawPid)],
 ) -> Walk {
-    children_of_with(parent, parent_key, parents, ALLOW_EQUAL_ORDER, |pid, parent| {
-        resolve_or_drop(kernel, pid, parent)
+    children_of_with(parent, parent_key, parents, |pid, parent, bound| {
+        resolve_or_drop(kernel, pid, parent, bound)
     })
 }
 

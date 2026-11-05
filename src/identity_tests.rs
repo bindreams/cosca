@@ -162,10 +162,12 @@ enum Owner {
 /// Mutants: another parent's number is hidden by a refused read or by the proof; an unreadable
 /// number, a missing record or a missing order key settles `Unknown` before the proof (a gone parent
 /// then blames the candidate); an unreadable number reads as a match or as another parent's; a failed
-/// proof blames the candidate or answers `Gone`; a `Gone` read becomes `Unknown`.
+/// proof blames the candidate or answers `Gone`; a `Gone` read becomes `Unknown`; a read before the
+/// order bound waits for the proof, or is `Unknown` when the proof fails (the proof is asked for, here
+/// a panic).
 #[skuld::test]
 fn a_candidates_read_and_its_parents_proof_give_one_answer() {
-    use super::{OrderKey, Ordered, OrderedRead, ParentRead, UnknownCause};
+    use super::{OrderKey, Ordered, OrderedRead, ParentRead, UnknownCause, ALLOW_EQUAL_ORDER};
     const CANDIDATE: RawPid = 7;
     const PARENT: RawPid = 100;
     const OTHER: RawPid = 101;
@@ -266,12 +268,49 @@ fn a_candidates_read_and_its_parents_proof_give_one_answer() {
                 parent: claimed,
                 cause: stated(),
             }
-            .judged(CANDIDATE, PARENT)
+            .judged(CANDIDATE, PARENT, None)
             .proved(proof);
             assert_eq!(
                 (answer, owner_of(cause)),
                 expected,
                 "a {read_name} read, its parent number {number_name}, the parent {proof_name}"
+            );
+        }
+    }
+
+    // A found read whose order key does not follow the bound is gone, whatever its parent number and
+    // before any proof: a proof that would fail is never asked for. A key that follows it, or none
+    // bound, leaves the table's answer. An equal key follows it only where equality is allowed.
+    for (key_name, bound, follows) in [
+        ("before", 10, false),
+        ("equal to", 9, ALLOW_EQUAL_ORDER),
+        ("after", 8, true),
+    ] {
+        for claimed in [ParentRead::Is(PARENT), ParentRead::Is(OTHER), ParentRead::Unreadable] {
+            let judged = |bound| {
+                OrderedRead {
+                    read: found,
+                    parent: claimed,
+                    cause: stated(),
+                }
+                .judged(CANDIDATE, PARENT, bound)
+            };
+            let held: Proof = || Ok(());
+            let (answer, cause) = if follows {
+                judged(Some(OrderKey::for_test(bound))).proved(held)
+            } else {
+                judged(Some(OrderKey::for_test(bound))).proved(|| panic!("the parent's proof is asked for"))
+            };
+            let (unbound, unbound_cause) = judged(None).proved(held);
+            let expected = if follows {
+                (unbound, owner_of(unbound_cause))
+            } else {
+                nobody_gone
+            };
+            assert_eq!(
+                (answer, owner_of(cause)),
+                expected,
+                "a read whose key is {key_name} the bound, its parent number {claimed:?}"
             );
         }
     }
