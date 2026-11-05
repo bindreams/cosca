@@ -270,10 +270,8 @@ fn an_elevation_front_is_left_when_the_caller_leaves_it() {
     crate::test_child::wait_until_zombie(id.pid());
 }
 
-/// A front that has exited when the teardown runs is reaped by the look; there is nothing to give
-/// back.
-///
-/// Mutant: a front is handed back without a look.
+/// A front that has exited when the teardown runs reads `Gate::Exited`, so it goes through the
+/// `Kill` arm and is reaped by the look; there is nothing to give back.
 #[cfg(unix)]
 #[skuld::test]
 fn an_elevation_front_that_has_exited_is_reaped_not_handed_back() {
@@ -353,10 +351,10 @@ mod in_a_cgroup {
         move_out_of_its_leaf(id.pid());
         let mark = crate::log_capture::mark();
 
-        let (fate, unreaped) = child.tear_down_or_hand_back(Disposition::HandBack);
+        let (fate, handed_back) = tear_down_holding(child, stdin, Disposition::HandBack);
 
         assert!(!Path::new(&leaf).exists(), "the leaf {leaf} was removed by the call");
-        assert_front_handed_back(id, mark, fate, HandedBack::new(stdin, unreaped));
+        assert_front_handed_back(id, mark, fate, handed_back);
     }
 
     /// A front that leaves its leaf during the leaf's kill (the gate read `CgroupOnly`, and the kill
@@ -373,10 +371,10 @@ mod in_a_cgroup {
         let _moving = crate::containment::cgroup::fault::set_before_kill_write(move || move_out_of_its_leaf(pid));
         let mark = crate::log_capture::mark();
 
-        let (fate, unreaped) = child.tear_down_or_hand_back(Disposition::HandBack);
+        let (fate, handed_back) = tear_down_holding(child, stdin, Disposition::HandBack);
 
         assert!(!Path::new(&leaf).exists(), "the leaf {leaf} was removed by the call");
-        assert_front_handed_back(id, mark, fate, HandedBack::new(stdin, unreaped));
+        assert_front_handed_back(id, mark, fate, handed_back);
     }
 
     /// A root whose own kill is refused, and which the leaf's `cgroup.kill` ends, is waited for and

@@ -21,9 +21,8 @@ use crate::os_process::child_named;
 /// Settle it with [`wait`](Unreaped::wait), which blocks until the child exits and reaps it, or
 /// [`leak`](Unreaped::leak), which gives it up. A value dropped otherwise does what `wait` does,
 /// then logs one line naming the child. So the drop blocks: in async code, take the value off the
-/// runtime thread (`spawn_blocking`) or `leak` it. For a front the wait ends when the front does,
-/// which is when its program does, no later than the call that failed would have waited had it
-/// succeeded; `leak` is how to not wait for it at all.
+/// runtime thread (`spawn_blocking`) or `leak` it. For a front the wait ends when the front
+/// exits, no later than the call that failed would have waited had it succeeded; `leak` is how to not wait for it at all.
 ///
 /// A value dropped while its thread is panicking does not wait: it gives the child up, which keeps
 /// running unreaped until this process exits, and logs one `warn` naming its pid.

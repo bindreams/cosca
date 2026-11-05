@@ -1088,7 +1088,8 @@ impl Child {
     }
 
     /// The kill-on-drop teardown, answering what became of the child. `caller` prefixes the event's
-    /// warn, and `disposition` words it for a child that still runs after a refused kill.
+    /// warn, and `disposition` words it for a child that still runs after a refused kill, and for an
+    /// elevation front left running.
     fn tear_down(&mut self, caller: TeardownCaller, disposition: Disposition) -> crate::error::ChildFate {
         // Hard-kill the contained tree (if any) — on Linux cgroup.kill reaches an elevated
         // subtree — then tear the direct child down. The dispatcher preserves the Unix
@@ -1141,9 +1142,9 @@ impl Child {
         use crate::child::owned::teardown::Reach;
         use crate::error::ChildFate;
 
-        // A live elevation front gets no signal of its own: outside a cgroup it is left running,
-        // unreaped, and named. The gate comes first, so the look at the root is right before the
-        // kill it decides.
+        // A live elevation front gets no signal of its own: outside a cgroup it is sent nothing and
+        // stays running and unreaped, named by the warn; a `HandBack` caller then takes it. The
+        // gate comes first, so the look at the root is right before the kill it decides.
         let gate = self.kill_gate();
         let view = crate::containment::DropView::read(caller, self.id, || self.proc.state(), &self.tree_killed);
         let mut report = DropReport::new(&view);
