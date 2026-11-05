@@ -27,6 +27,8 @@ mod traced;
 #[cfg(unix)]
 #[path = "owned_tests/tracer.rs"]
 mod tracer;
+#[path = "owned_tests/unreaped.rs"]
+mod unreaped;
 #[cfg(windows)]
 #[path = "owned_tests/windows.rs"]
 mod windows;

@@ -474,6 +474,7 @@ fn assert_failed_after_the_spawn(error: crate::error::Error, fate: crate::error:
         fate: got,
         wrapper_elevated,
         source,
+        ..
     } = &error
     else {
         panic!("expected MayHaveStarted, got {error:?}");
@@ -536,6 +537,7 @@ fn read_of_invalid_utf8_behind_a_wrapper_keeps_the_wrapper_flag() {
             fate,
             wrapper_elevated,
             source,
+            ..
         } = &error
         else {
             panic!("expected MayHaveStarted, got {error:?}");
