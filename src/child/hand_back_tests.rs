@@ -321,7 +321,8 @@ mod in_a_cgroup {
     /// and the `Unreaped` is waited for later. The child sits outside the leaf, as a program that
     /// moved itself out does, so the leaf's `cgroup.kill` does not end it.
     ///
-    /// Mutants: the leaf is held by the handed-back child; the call blocks on the root.
+    /// Mutants: the leaf is held by the handed-back child; the call blocks on the root (that one is
+    /// caught by nextest's bound on this module, not by an assertion).
     #[skuld::test]
     fn a_handed_back_child_does_not_hold_up_its_leaf(#[fixture(cgroup)] _group: &Group) {
         let (mut child, stdin) = blocker_in_a_leaf();
