@@ -7,7 +7,7 @@ use crate::identity::{HostKernel, Liveness, ProcessId};
 use nix::sys::signal::Signal;
 
 fn is_alive(m: &Member) -> bool {
-    matches!(ProcessId::from_parts(m.pid, m.token).is_alive(), Liveness::Alive)
+    matches!(m.id.is_alive(), Liveness::Alive)
 }
 
 /// Block until `pid` has exited, leaving it UNREAPED so it is a zombie the
@@ -47,7 +47,7 @@ fn members_lists_a_live_owned_group() {
     let listed = members(&HostKernel, pgid).expect("list the group");
     let leader = listed
         .iter()
-        .find(|m| m.pid == child.id())
+        .find(|m| m.id.pid() == child.id())
         .unwrap_or_else(|| panic!("leader {} missing from {listed:?}", child.id()));
     assert!(is_alive(leader), "a running leader's token must resolve to Alive");
 
@@ -69,7 +69,7 @@ fn members_marks_an_unreaped_leader_as_dead() {
     let listed = members(&HostKernel, pid as i32).expect("list the group");
     let leader = listed
         .iter()
-        .find(|m| m.pid == pid)
+        .find(|m| m.id.pid() == pid)
         .unwrap_or_else(|| panic!("unreaped leader {pid} missing from {listed:?}"));
     assert!(
         !is_alive(leader),
@@ -97,26 +97,22 @@ fn members_of_an_absent_group_is_empty() {
     assert_eq!(members(&HostKernel, i32::MAX).expect("list an absent group"), vec![]);
 }
 
-/// The token the listing carries is the SAME encoding a live read of the pid would produce —
-/// not a different, incompatible one — so a later `ProcessId::from_parts` re-check is
-/// comparing like with like. (macOS: pinned across `proc_pidinfo` and `sysctl` by the
-/// existing `kinfo_tests` cross-source oracle; this test pins the listing itself against
-/// `ProcessId::of`'s live read, on both platforms.)
+/// The id the listing carries is the SAME identity a live read of the pid would produce —
+/// not a different, incompatible one — so a later re-check is comparing like with like.
+/// (macOS: pinned across `proc_pidinfo` and `sysctl` by the existing `kinfo_tests`
+/// cross-source oracle; this test pins the listing itself against `ProcessId::of`'s live
+/// read, on both platforms.)
 #[skuld::test]
-fn members_token_matches_a_live_read_of_the_same_pid() {
+fn members_id_matches_a_live_read_of_the_same_pid() {
     // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
     let mut child = crate::test_spawn::spawn(&mut member_command(0)).expect("spawn leader");
     await_member_ready(&mut child);
     let pgid = child.id() as i32;
 
     let listed = members(&HostKernel, pgid).expect("list the group");
-    let leader = listed.iter().find(|m| m.pid == child.id()).expect("leader listed");
+    let leader = listed.iter().find(|m| m.id.pid() == child.id()).expect("leader listed");
     let live = ProcessId::of(child.id()).found().expect("resolve the live leader");
-    assert_eq!(
-        leader.token,
-        live.start_token_raw(),
-        "listing token must match a fresh live read"
-    );
+    assert_eq!(leader.id, live, "listing id must match a fresh live read");
 
     _ = child.kill();
     _ = child.wait();
