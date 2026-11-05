@@ -238,13 +238,18 @@ pub enum Error {
     /// failure after their spawn succeeded. They tear the child down then, as its drop would (see
     /// `kill_on_drop`), and the fate says what that did; `read`'s invalid UTF-8 comes after the exit
     /// was collected (`Reaped`). When the sync methods' teardown cannot end the child (a refused
-    /// kill, or an elevation front, which is sent none) and it still runs, they return it in
-    /// `unreaped`. The tokio methods do not: they leave it running and warn,
+    /// kill, or an elevation front, which is sent none) and it is not known to have been collected,
+    /// they return it in `unreaped`. The tokio methods do not: they leave it running and warn,
     /// with `unreaped` `None` and `fate` `Running`, until the async child can wait for one (a
     /// blocking wait on a runtime thread is forbidden). So do
     /// [`SuspendedChild::resume`](crate::SuspendedChild::resume) and its tokio twin for the frozen
     /// child they could not kill: a failed release may leave its thread frozen, so waiting for it
     /// could block for ever.
+    ///
+    /// A failed sync spawn hands back the child when the spawn or run could not end it: on Linux,
+    /// when the identity read or the attach fails after the handshake, and on every Unix, when the
+    /// elevation backend's password write fails. The other failed spawns leave a child they could not
+    /// end running and warn.
     ///
     /// On Windows, a failed `ShellExecuteEx` launch is classified by its error (see `runas_failure`).
     #[error("the program may have started, and {fate}{}: {source}", elevated_note(.fate, *.wrapper_elevated))]
@@ -257,9 +262,11 @@ pub enum Error {
         #[source]
         source: Box<Error>,
         /// The child itself, when the spawn could not end it and hands it to the caller; see
-        /// [`Unreaped`](crate::Unreaped) for how to settle it. Then `fate` is
-        /// [`ChildFate::Running`] with the child's own identity. Dropped while its thread is
-        /// panicking, it is given up, not waited for.
+        /// [`Unreaped`](crate::Unreaped) for how to settle it. Then `fate` is the one of a child that
+        /// is not known to have been collected: [`ChildFate::Running`], [`ChildFate::Unknown`] when
+        /// the look at it failed, or [`ChildFate::Killed`] when the wait for it failed after the kill.
+        /// A `Running` fate carries the child's own identity, except where the identity read failed
+        /// (`id: None`). Dropped while its thread is panicking, it is given up, not waited for.
         unreaped: Option<Box<crate::Unreaped>>,
     },
 }
@@ -419,7 +426,7 @@ impl Error {
     }
 
     /// The OS error code of an [`Error::Io`], for a look whose failure is told apart by it.
-    #[cfg(any(unix, feature = "tokio"))]
+    #[cfg(feature = "tokio")]
     pub(crate) fn raw_os_error(&self) -> Option<i32> {
         match self {
             Error::Io(e) => e.raw_os_error(),

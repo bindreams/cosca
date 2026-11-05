@@ -14,6 +14,48 @@ mod setuid_lane_check_tests;
 #[path = "test_privilege/setuid_protocol_tests.rs"]
 mod setuid_protocol_tests;
 
+/// The command for the setuid helper as a `setuid-stdin-block root` child, with no stdio set. The
+/// child writes its `+` ready byte to stdout once it is root, and exits with success when its stdin
+/// reaches EOF.
+///
+/// # Panics
+/// As [`setuid::setuid_helper`] does.
+pub(crate) fn setuid_blocker_command() -> crate::Command {
+    let mut cmd = crate::Command::new();
+    // `args` is the whole argv, program name included.
+    cmd.executable(setuid::setuid_helper())
+        .args(["cosca_testbin", "setuid-stdin-block", "root"]);
+    cmd
+}
+
+/// [`setuid_blocker_command`] for a spawn that fails after its fork, which closes the parent ends of
+/// its pipes. Returns the command; the write end of the child's stdin, which the caller holds so
+/// that the child runs on; and `until_root`, which blocks until the child has written its ready
+/// byte and so is root, and which the caller runs once the spawn has returned (a refused kill is
+/// refused only from then on).
+///
+/// # Panics
+/// As [`setuid::setuid_helper`] does, and (in `until_root`) when the ready byte does not come.
+#[cfg(target_os = "linux")]
+pub(crate) fn setuid_blocker_for_a_failing_spawn() -> (crate::Command, std::io::PipeWriter, impl FnOnce() + 'static) {
+    use std::io::Read as _;
+    let (stdin, writer) = crate::test_child::held_writer_stdin();
+    let (mut ready, ready_end) = std::io::pipe().expect("pipe");
+    let mut cmd = setuid_blocker_command();
+    cmd.stdin(stdin).expect("set stdin");
+    cmd.stdout(crate::Stdio::from_file(std::fs::File::from(
+        std::os::fd::OwnedFd::from(ready_end),
+    )))
+    .expect("set stdout");
+    cmd.stderr(crate::Stdio::null()).expect("null stderr");
+    let until_root = move || {
+        let mut byte = [0u8; 1];
+        ready.read_exact(&mut byte).expect("the helper reports ready");
+        assert_eq!(byte, *b"+");
+    };
+    (cmd, writer, until_root)
+}
+
 /// Spawns the setuid helper as a `setuid-stdin-block root` child through [`crate::Command`] and
 /// waits for its `+` ready byte, so the child is root and blocked on its stdin. Returns the child
 /// and the write end of its stdin; closing that makes the helper exit with success.
@@ -25,11 +67,7 @@ mod setuid_protocol_tests;
 /// As [`setuid::setuid_helper`] does, and when the spawn or the ready byte fails.
 pub(crate) fn spawn_setuid_blocker() -> (crate::Child, std::io::PipeWriter) {
     use std::io::Read as _;
-    let helper = setuid::setuid_helper();
-    let mut cmd = crate::Command::new();
-    // `args` is the whole argv, program name included.
-    cmd.executable(&helper)
-        .args(["cosca_testbin", "setuid-stdin-block", "root"]);
+    let mut cmd = setuid_blocker_command();
     cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
     cmd.stdout(crate::Stdio::pipe()).expect("stdout pipe");
     cmd.stderr(crate::Stdio::null()).expect("stderr null");
