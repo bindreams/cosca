@@ -257,7 +257,8 @@ pub enum Error {
         source: Box<Error>,
         /// The child itself, when the spawn could not end it and hands it to the caller; see
         /// [`Unreaped`](crate::Unreaped) for how to settle it. Then `fate` is
-        /// [`ChildFate::Running`] with the child's own identity.
+        /// [`ChildFate::Running`] with the child's own identity. Dropped while its thread is
+        /// panicking, it is given up, not waited for.
         unreaped: Option<Box<crate::Unreaped>>,
     },
 }

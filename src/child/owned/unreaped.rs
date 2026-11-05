@@ -21,6 +21,9 @@ use crate::os_process::child_named;
 /// then logs one line naming the child. So the drop blocks: in async code, take the value off the
 /// runtime thread (`spawn_blocking`) or `leak` it.
 ///
+/// A value dropped while its thread is panicking does not wait: it gives the child up, which keeps
+/// running unreaped until this process exits, and logs one `warn` naming its pid.
+///
 /// ```
 /// use cosca::error::Error;
 ///
@@ -80,6 +83,11 @@ impl Drop for Unreaped {
         };
         let pid = child.pid();
         let who = child_named(pid);
+        // A destructor that blocks on a child during unwinding can hang the panic for good.
+        if std::thread::panicking() {
+            log::warn!("{who} was dropped without wait or leak while the thread is panicking; gave it up, unreaped");
+            return;
+        }
         match wait_to_exit(&child, None, Orphaned::Quiet) {
             Ok(status) => {
                 log::warn!("{who} was dropped without wait or leak; waited for it and reaped it ({status})")
