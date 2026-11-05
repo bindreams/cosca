@@ -16,6 +16,10 @@ pub(crate) mod prove;
 pub(crate) mod fault;
 
 #[cfg(test)]
+#[path = "linux/bracket_tests.rs"]
+mod bracket_tests;
+
+#[cfg(test)]
 #[path = "linux/read_tests.rs"]
 mod read_tests;
 
@@ -227,10 +231,40 @@ fn ticks_from(pid: RawPid, stat: Resolved<Vec<u8>>) -> Resolved<u64> {
     }
 }
 
-/// When `pid` started, for ordering: the ticks.
+/// `pid`'s `stat` while the process with `pidfs` inode `ino` holds the pid: read, then proved again.
+/// A process that holds the pid when the proof is made held it from when the id was made, so the
+/// `stat` read between is its own; the other order would let a reuser's `stat` through. `Gone` when
+/// the proof finds another process.
+fn bracketed_stat(kernel: &dyn Kernel, pid: RawPid, ino: u64) -> (Resolved<Vec<u8>>, UnknownCause) {
+    let (stat, view) = read_stat_explained(kernel, pid);
+    let stat = match stat {
+        Resolved::Found(stat) => stat,
+        Resolved::Gone => return (Resolved::Gone, UnknownCause::of_view(view)),
+        Resolved::Unknown => return (Resolved::Unknown, UnknownCause::of_view(view)),
+    };
+    match prove::prove(kernel, pid, ino) {
+        Proof::Holds { .. } => (Resolved::Found(stat), UnknownCause::default()),
+        Proof::Lost => (Resolved::Gone, UnknownCause::default()),
+        Proof::Unknown(cause) => (Resolved::Unknown, cause),
+    }
+}
+
+/// When the process `key` names started, in ticks: a `Ticks` key is that, and a `Pidfs` key's
+/// process shows it in its bracketed `stat`.
+fn start_ticks(kernel: &dyn Kernel, pid: RawPid, key: Key) -> (Resolved<u64>, UnknownCause) {
+    match key {
+        Key::Ticks(ticks) => (Resolved::Found(ticks), UnknownCause::default()),
+        Key::Pidfs(ino) => {
+            let (stat, cause) = bracketed_stat(kernel, pid, ino);
+            (ticks_from(pid, stat), cause)
+        }
+    }
+}
+
+/// When `pid` started, for ordering.
 pub(super) fn order_key(kernel: &dyn Kernel, pid: RawPid, key: Key) -> (Resolved<OrderKey>, UnknownCause) {
-    let _ = (kernel, pid);
-    (Resolved::Found(OrderKey(key.raw())), UnknownCause::default())
+    let (ticks, cause) = start_ticks(kernel, pid, key);
+    (ticks.map(OrderKey), cause)
 }
 
 pub(super) fn is_running(kernel: &dyn Kernel, pid: RawPid, key: Key) -> Liveness {
@@ -319,8 +353,7 @@ fn unassessable_view(subject: &str, reason: &str, source: Option<std::io::Error>
 }
 
 pub(super) fn created_at(kernel: &dyn Kernel, pid: RawPid, key: Key) -> Option<SystemTime> {
-    let _ = (kernel, pid);
-    let jiffies = key.raw();
+    let jiffies = start_ticks(kernel, pid, key).0.found()?;
     let hz = clock_ticks_per_sec()?;
     let btime = boot_time_secs()?;
     let secs = btime + jiffies / hz;

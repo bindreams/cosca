@@ -20,8 +20,8 @@ fn resolved(pid: RawPid, token: u64) -> (ProcessId, OrderKey) {
 
 /// Build a resolver from a (pid -> token) table. A pid absent from the table is
 /// unresolvable (returns `None`, modelling an already-gone process).
-fn resolver(tokens: &HashMap<RawPid, u64>) -> impl Fn(RawPid) -> Option<(ProcessId, OrderKey)> + '_ {
-    move |pid| tokens.get(&pid).map(|&t| resolved(pid, t))
+fn resolver(tokens: &HashMap<RawPid, u64>) -> impl Fn(RawPid, RawPid) -> Option<(ProcessId, OrderKey)> + '_ {
+    move |pid, _ppid| tokens.get(&pid).map(|&t| resolved(pid, t))
 }
 
 /// Collect the result pids into a sorted Vec for order-independent comparison.
@@ -171,7 +171,7 @@ fn children_of_keeps_one_level_genuine_children_only() {
     // 101, not one level); impostor 103 ppid 100 tok40 (created before root => excluded).
     let root = id(100, 50);
     let parents = [(101, 100), (102, 101), (103, 100)];
-    let resolve = |pid: u32| match pid {
+    let resolve = |pid: u32, _ppid: u32| match pid {
         101 => Some(resolved(101, 60)),
         102 => Some(resolved(102, 70)),
         103 => Some(resolved(103, 40)),
@@ -193,7 +193,7 @@ fn children_of_same_tick_child_depends_on_allow_equal() {
     // excluded under false — proves children_of_with threads allow_equal to keeps_order.
     let root = id(100, ROOT_TOKEN);
     let parents = [(101, 100)];
-    let resolve = |pid: u32| (pid == 101).then(|| resolved(101, ROOT_TOKEN));
+    let resolve = |pid: u32, _ppid: u32| (pid == 101).then(|| resolved(101, ROOT_TOKEN));
     assert_eq!(
         pids(children_of_with(root, root_key(), &parents, true, resolve)),
         [101],
@@ -214,7 +214,7 @@ fn children_of_duplicate_edge_yields_pid_once() {
     // double-kill) the same child twice.
     let root = id(100, ROOT_TOKEN);
     let parents = [(101, 100), (101, 100)];
-    let resolve = |pid: u32| (pid == 101).then(|| resolved(101, ROOT_TOKEN + 1));
+    let resolve = |pid: u32, _ppid: u32| (pid == 101).then(|| resolved(101, ROOT_TOKEN + 1));
     assert_eq!(
         pids(children_of_with(root, root_key(), &parents, true, resolve)),
         [101],
@@ -230,7 +230,8 @@ fn children_of_duplicate_edge_yields_pid_once() {
 fn a_candidate_whose_order_key_precedes_the_roots_is_dropped_even_when_its_id_token_does_not() {
     use super::children_of_with;
     let parents = [(200, ROOT_PID)];
-    let resolve = |pid: u32| (pid == 200).then(|| (id(200, ROOT_TOKEN + 5), OrderKey::for_test(ROOT_TOKEN - 5)));
+    let resolve =
+        |pid: u32, _ppid: u32| (pid == 200).then(|| (id(200, ROOT_TOKEN + 5), OrderKey::for_test(ROOT_TOKEN - 5)));
     for allow_equal in [true, false] {
         assert!(
             descendants_with(root(), root_key(), &parents, allow_equal, resolve).is_empty(),
@@ -241,6 +242,28 @@ fn a_candidate_whose_order_key_precedes_the_roots_is_dropped_even_when_its_id_to
             "children_of_with dropped by key (allow_equal={allow_equal})"
         );
     }
+}
+
+/// The resolver is told the parent the snapshot gave each candidate, so a backend whose read carries
+/// the parent can drop a candidate that has another one now. Mutant: "the resolver is asked the
+/// root's pid for every candidate".
+#[skuld::test]
+fn the_resolver_is_asked_for_each_candidates_parent_in_the_snapshot() {
+    use std::cell::RefCell;
+
+    use super::children_of_with;
+
+    let asked = RefCell::new(Vec::new());
+    let resolve = |pid: u32, ppid: u32| {
+        asked.borrow_mut().push((pid, ppid));
+        Some(resolved(pid, ROOT_TOKEN + 1))
+    };
+    let parents = [(200, ROOT_PID), (300, 200)];
+    descendants_with(root(), root_key(), &parents, true, resolve);
+    assert_eq!(asked.take(), [(200, ROOT_PID), (300, 200)]);
+
+    children_of_with(root(), root_key(), &parents, true, resolve);
+    assert_eq!(asked.take(), [(200, ROOT_PID)]);
 }
 
 /// The anchor side of the same rule: candidates are compared against the `root_key` argument, not
@@ -255,7 +278,8 @@ fn candidates_are_compared_against_the_roots_order_key_not_its_id_token() {
         (ROOT_TOKEN - 500, ROOT_TOKEN - 300, true),
         (ROOT_TOKEN + 500, ROOT_TOKEN + 300, false),
     ] {
-        let resolve = |pid: u32| (pid == 200).then(|| (id(200, candidate_key), OrderKey::for_test(candidate_key)));
+        let resolve =
+            |pid: u32, _ppid: u32| (pid == 200).then(|| (id(200, candidate_key), OrderKey::for_test(candidate_key)));
         for allow_equal in [true, false] {
             let want: &[RawPid] = if kept { &[200] } else { &[] };
             let got = descendants_with(root(), OrderKey::for_test(root_key), &parents, allow_equal, resolve);
@@ -291,7 +315,7 @@ fn resolve_or_drop_drops_an_access_denied_pid_and_warns() {
     assert!(denied.is_running(), "precondition: the subject must be live");
     let mark = crate::log_capture::mark();
     assert!(
-        super::resolve_or_drop(&crate::identity::HostKernel, denied.pid()).is_none(),
+        super::resolve_or_drop(&crate::identity::HostKernel, denied.pid(), std::process::id()).is_none(),
         "the walk cannot keep what it cannot verify"
     );
     assert!(crate::log_capture::contains_since(

@@ -161,16 +161,46 @@ impl ProcessId {
     }
 
     /// [`of_with`](Self::of_with), with the order key of the same read beside the id.
-    pub(crate) fn of_ordered_with(kernel: &dyn Kernel, pid: RawPid) -> (Resolved<(ProcessId, OrderKey)>, UnknownCause) {
-        let (read, cause) = Self::of_with(kernel, pid);
-        match read {
-            Resolved::Found(id) => match id.order_key_with(kernel) {
-                (Resolved::Found(key), _) => (Resolved::Found((id, key)), cause),
-                (Resolved::Gone, cause) => (Resolved::Gone, cause),
-                (Resolved::Unknown, cause) => (Resolved::Unknown, cause),
-            },
-            Resolved::Gone => (Resolved::Gone, cause),
-            Resolved::Unknown => (Resolved::Unknown, cause),
+    ///
+    /// `expected_ppid`: the parent the caller was told the process has. Where the read carries the
+    /// process's parent (Linux: the `stat` made with the id), a process with another parent now is
+    /// [`Resolved::Gone`]: the pid has changed hands. Elsewhere it is not checked.
+    pub(crate) fn of_ordered_with(
+        kernel: &dyn Kernel,
+        pid: RawPid,
+        expected_ppid: Option<RawPid>,
+    ) -> (Resolved<(ProcessId, OrderKey)>, UnknownCause) {
+        #[cfg(target_os = "linux")]
+        {
+            let (read, cause) = Self::of_stat_with(kernel, pid);
+            let (id, stat) = match read {
+                Resolved::Found(found) => found,
+                Resolved::Gone => return (Resolved::Gone, cause),
+                Resolved::Unknown => return (Resolved::Unknown, cause),
+            };
+            if let Some(expected) = expected_ppid {
+                if stat_parse::parse_ppid(&stat) != Some(expected) {
+                    return (Resolved::Gone, UnknownCause::default());
+                }
+            }
+            match stat_parse::parse_starttime_jiffies(&stat) {
+                Some(ticks) => (Resolved::Found((id, OrderKey(ticks))), cause),
+                None => (Resolved::Unknown, UnknownCause::default()),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = expected_ppid;
+            let (read, cause) = Self::of_with(kernel, pid);
+            match read {
+                Resolved::Found(id) => match id.order_key_with(kernel) {
+                    (Resolved::Found(key), _) => (Resolved::Found((id, key)), cause),
+                    (Resolved::Gone, cause) => (Resolved::Gone, cause),
+                    (Resolved::Unknown, cause) => (Resolved::Unknown, cause),
+                },
+                Resolved::Gone => (Resolved::Gone, cause),
+                Resolved::Unknown => (Resolved::Unknown, cause),
+            }
         }
     }
 

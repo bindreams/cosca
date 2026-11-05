@@ -65,8 +65,12 @@ pub(crate) enum KillOutcome {
 /// The tree-walk resolver. A pid we may not query is dropped from the walk exactly like a
 /// pid that is gone - the walk cannot kill what it cannot verify - but the two are logged
 /// apart, because "denied" is an operational signal (run elevated) and "gone" is not.
-pub(crate) fn resolve_or_drop(kernel: &dyn Kernel, pid: RawPid) -> Option<(ProcessId, OrderKey)> {
-    match ProcessId::of_ordered_with(kernel, pid).0 {
+///
+/// `ppid` is the parent the snapshot gave `pid`. Where the read of `pid` carries its parent (Linux:
+/// the `stat` the id was made with), a candidate with another parent now is dropped: the pid has
+/// changed hands since the snapshot. Elsewhere the listing has nothing to check it against.
+pub(crate) fn resolve_or_drop(kernel: &dyn Kernel, pid: RawPid, ppid: RawPid) -> Option<(ProcessId, OrderKey)> {
+    match ProcessId::of_ordered_with(kernel, pid, Some(ppid)).0 {
         Resolved::Found(read) => Some(read),
         Resolved::Gone => None,
         Resolved::Unknown => {
@@ -105,9 +109,9 @@ pub(crate) fn keeps_order(key: OrderKey, anchor: OrderKey, allow_equal: bool) ->
 
 /// Pure descendant filter (host-testable on every OS). Walks `parents` down from
 /// `root`, and for each pid whose ppid chains to `root.pid()` resolves its
-/// identity and order key via `resolve` and keeps it ONLY if its key orders correctly
+/// identity and order key via `resolve(pid, ppid)` and keeps it ONLY if its key orders correctly
 /// against `root_key` per `allow_equal` (see module docs). `resolve` is injected
-/// so the filter is pure: live code passes `ProcessId::of_ordered_with`, tests pass a stub.
+/// so the filter is pure: live code passes [`resolve_or_drop`], tests pass a stub.
 ///
 /// The root itself is never included (callers kill the root explicitly first).
 pub(crate) fn descendants_with(
@@ -115,7 +119,7 @@ pub(crate) fn descendants_with(
     root_key: OrderKey,
     parents: &[(RawPid, RawPid)],
     allow_equal: bool,
-    resolve: impl Fn(RawPid) -> Option<(ProcessId, OrderKey)>,
+    resolve: impl Fn(RawPid, RawPid) -> Option<(ProcessId, OrderKey)>,
 ) -> Vec<ProcessId> {
     let keep = |key: OrderKey| keeps_order(key, root_key, allow_equal);
 
@@ -151,7 +155,7 @@ pub(crate) fn descendants_with(
             if pid == ppid {
                 continue;
             }
-            let read = *resolved.entry(pid).or_insert_with(|| resolve(pid));
+            let read = *resolved.entry(pid).or_insert_with(|| resolve(pid, ppid));
             let Some((id, key)) = read else {
                 log::debug!("treewalk: pid {pid} unresolvable — dropping its subtree");
                 continue;
@@ -203,20 +207,24 @@ pub(crate) fn descendants(
     let Some(root_key) = anchor_key(kernel, root)? else {
         return Ok(Vec::new());
     };
-    Ok(descendants_with(root, root_key, parents, ALLOW_EQUAL_ORDER, |pid| {
-        resolve_or_drop(kernel, pid)
-    }))
+    Ok(descendants_with(
+        root,
+        root_key,
+        parents,
+        ALLOW_EQUAL_ORDER,
+        |pid, ppid| resolve_or_drop(kernel, pid, ppid),
+    ))
 }
 
 /// Pure one-level child filter (host-testable): keep each pid whose ppid == the parent's
-/// pid and whose order key passes `keeps_order` against `parent_key`. `resolve` is
+/// pid and whose order key passes `keeps_order` against `parent_key`. `resolve(pid, ppid)` is
 /// injected for purity. The parent itself is never included.
 pub(crate) fn children_of_with(
     parent: ProcessId,
     parent_key: OrderKey,
     parents: &[(RawPid, RawPid)],
     allow_equal: bool,
-    resolve: impl Fn(RawPid) -> Option<(ProcessId, OrderKey)>,
+    resolve: impl Fn(RawPid, RawPid) -> Option<(ProcessId, OrderKey)>,
 ) -> Vec<ProcessId> {
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -224,7 +232,7 @@ pub(crate) fn children_of_with(
         if ppid != parent.pid() || pid == ppid {
             continue;
         }
-        let Some((id, key)) = resolve(pid) else {
+        let Some((id, key)) = resolve(pid, ppid) else {
             log::debug!("treewalk: pid {pid} unresolvable — dropped from children");
             continue;
         };
@@ -258,7 +266,7 @@ pub(crate) fn children_of(
         parent_key,
         parents,
         ALLOW_EQUAL_ORDER,
-        |pid| resolve_or_drop(kernel, pid),
+        |pid, ppid| resolve_or_drop(kernel, pid, ppid),
     ))
 }
 

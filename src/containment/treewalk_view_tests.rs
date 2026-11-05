@@ -205,7 +205,7 @@ fn a_pid_the_kernel_cannot_read_is_dropped_and_warned_about() {
     let (child, id) = live_member();
     let (kernel, _guard) = unreadable(id.pid());
     let mark = crate::log_capture::mark();
-    assert_eq!(super::resolve_or_drop(&kernel, id.pid()), None);
+    assert_eq!(super::resolve_or_drop(&kernel, id.pid(), std::process::id()), None);
     let warned =
         crate::log_capture::records_since_on_current_thread(mark, &format!("pid {} could not be queried", id.pid()));
     assert_eq!(warned.len(), 1, "{warned:?}");
@@ -338,4 +338,19 @@ fn every_id_walk_re_verifies_a_descendants_kill_through_its_kernel() {
             release_with_a_signalled_root(name, child, signo);
         }
     }
+}
+
+/// The candidate's own `stat` names its parent, and the walk accepts it only under the parent the
+/// snapshot gave it: a pid that exited and was reused since the snapshot, by a process of another
+/// parent, is dropped. Mutants: "the resolver ignores the parent", "the resolver always drops".
+#[skuld::test]
+fn a_candidate_whose_stat_shows_another_parent_is_dropped() {
+    const PID: u32 = 4242;
+    let stat = crate::identity::stat_parse::stat_fixture("S", 777);
+    let kernel = FakeKernel::over(&HostKernel)
+        .same_view()
+        .on_read(&format!("{PID}/stat"), Ok(&stat));
+    // `stat_fixture` shows parent 1.
+    assert!(super::resolve_or_drop(&kernel, PID, 99).is_none());
+    assert!(super::resolve_or_drop(&kernel, PID, 1).is_some());
 }

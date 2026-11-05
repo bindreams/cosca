@@ -48,7 +48,7 @@ impl ProcessId {
             return Ok(None);
         }
         // An access-denied parent is not "no parent".
-        let (parent, parent_key) = match ProcessId::of_ordered_with(kernel, ppid) {
+        let (parent, parent_key) = match ProcessId::of_ordered_with(kernel, ppid, None) {
             (Resolved::Found(read), _) => read,
             (Resolved::Gone, _) => return Ok(None),
             (Resolved::Unknown, cause) => {
