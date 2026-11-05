@@ -23,6 +23,7 @@ pub(crate) mod spawn;
 pub(crate) mod drop_report;
 #[path = "child/owned.rs"]
 pub(crate) mod owned;
+use owned::slot::ChildSlot;
 use owned::OwnedChild;
 
 #[path = "child/lifecycle.rs"]
@@ -122,7 +123,9 @@ pub(crate) enum ParentEnd {
 /// A spawned child process the crate owns.
 #[derive(Debug)]
 pub struct Child {
-    proc: OwnedChild,
+    /// Empty only inside [`tear_down_or_hand_back`](Child::tear_down_or_hand_back), which consumes
+    /// the child.
+    proc: ChildSlot,
     /// Stable identity resolved immediately after spawn.
     id: ProcessId,
     pipes: BTreeMap<Fd, ParentEnd>,
@@ -152,7 +155,7 @@ impl Child {
         attachment: crate::containment::Attachment,
     ) -> Child {
         Child {
-            proc,
+            proc: ChildSlot::new(proc),
             id,
             pipes,
             kill_on_drop,

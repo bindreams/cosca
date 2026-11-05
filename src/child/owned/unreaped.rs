@@ -2,6 +2,7 @@
 
 use std::process::ExitStatus;
 
+use super::slot::ChildSlot;
 use super::OwnedChild;
 use crate::child::lifecycle::{orphaned_note, wait_to_exit, Orphaned, WaitToExitError};
 use crate::error::Error;
@@ -32,8 +33,8 @@ use crate::os_process::child_named;
 /// ```
 #[derive(Debug)]
 pub struct Unreaped {
-    /// `None` once `wait`, `leak` or the drop has taken the child: it is settled once.
-    child: Option<OwnedChild>,
+    /// Empty once `wait`, `leak` or the drop has taken the child: it is settled once.
+    child: ChildSlot,
     id: Option<ProcessId>,
 }
 
@@ -41,15 +42,15 @@ impl Unreaped {
     /// Own `child`, whose identity the spawn read as `id`, if it did.
     #[allow(dead_code, reason = "no spawn teardown hands a child back yet")]
     pub(crate) fn new(child: OwnedChild, id: Option<ProcessId>) -> Unreaped {
-        Unreaped { child: Some(child), id }
+        Unreaped {
+            child: ChildSlot::new(child),
+            id,
+        }
     }
 
     /// The child's pid; `None` for a Linux child whose spawn learned only its pidfd.
     pub fn pid(&self) -> Option<u32> {
-        self.child
-            .as_ref()
-            .expect("a live Unreaped holds its child: wait and leak consume it")
-            .pid()
+        self.child.pid()
     }
 
     /// The child's identity, if the spawn read one.
