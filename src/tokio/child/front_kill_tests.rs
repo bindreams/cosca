@@ -401,7 +401,8 @@ async fn terminate_of_a_live_sudo_front_is_sent() {
     assert_eq!(child.wait().await.expect("wait").signal(), Some(libc::SIGTERM));
 }
 
-/// Async twin of the sync `a_failed_spawn_leaves_an_elevation_front_running_and_says_so`.
+/// Async twin of the sync `a_failed_spawn_hands_back_an_elevation_front_and_says_so`, which leaves
+/// the front where the sync one hands it back.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn a_failed_spawn_leaves_an_elevation_front_running_and_says_so() {
@@ -425,7 +426,11 @@ async fn a_failed_spawn_leaves_an_elevation_front_running_and_says_so() {
             .all(|(_, text)| text.contains("leaks") && text.contains("left elevation front")),
         "{warns:?}"
     );
-    for (_, pid) in &failures {
+    for (_, pid, unreaped) in &failures {
+        assert!(
+            unreaped.is_none(),
+            "an async spawn leaves the front, it hands nothing back"
+        );
         let status = reap(*pid).expect("the front must be left unreaped");
         assert!(status.success(), "the teardown signalled the front: {status:?}");
     }

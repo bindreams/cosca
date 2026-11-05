@@ -116,36 +116,38 @@ fn finish_elevated_with_an_unknown_root_and_a_failed_reap_warns_once() {
     );
 }
 
-/// A failed spawn's cleanup whose root kill is refused has not settled the root, so it leaves the
-/// handle armed and the handle's drop retries the kill. The cleanup said nothing, so the retry's
-/// refusal is the one warn.
+/// A failed spawn's cleanup whose root kill is refused, and whose root still runs, hands the root
+/// back in the error and disarms the handle: the caller owns the root now, and the handle's drop does
+/// not retry the kill. The cleanup's one warn is the refusal.
 ///
-/// Mutant: the cleanup disarms the handle whatever became of the root.
+/// Mutants: the cleanup leaves the handle armed (the drop retries) and drops the root; the root is
+/// not handed back.
 #[skuld::test]
-fn finish_elevated_leaves_the_handle_armed_when_the_root_kill_was_refused() {
+fn finish_elevated_hands_back_a_root_whose_kill_was_refused() {
     crate::log_capture::install();
     let (mut child, writer) = bare_blocker();
     let teardowns = crate::child::owned::seams::record_root_teardowns();
     let mark = crate::log_capture::mark();
-    let fake = child.proc.script_over(|f| f.signals([refused(), refused()]));
+    let fake = child.proc.script_over(|f| f.signals([refused()]));
 
-    let err = crate::child::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
+    let failure = crate::child::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
+    let (_, fate, unreaped) = crate::child::spawn::failure::expect_handed_back(failure.into());
+    let handed_back = crate::test_child::HandedBack::new(writer, Some(unreaped));
 
-    assert_eq!(
-        teardowns.count(),
-        1,
-        "the handle's drop retries the refused root kill ({err:?})"
-    );
-    assert_eq!(fake.signal_calls().len(), 2, "the cleanup's kill and the retry");
+    assert!(matches!(fate, crate::error::ChildFate::Running { .. }), "{fate:?}");
+    assert_eq!(teardowns.count(), 0, "the handle is disarmed: its drop does not retry");
+    assert_eq!(fake.signal_calls().len(), 1, "the cleanup's kill alone");
     let warns = warns_since(mark);
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(warns[0].contains(&refusal()), "{warns:?}");
-    drop(writer);
+    let status = handed_back.wait();
+    assert!(status.success(), "the root exits on EOF: {status:?}");
 }
 
 /// A cleanup that warned of its unknown root and then left its handle armed (the root kill was
-/// refused): the handle's drop retries and is refused again. The refusal is new, which the cleanup
-/// did not report, so the drop warns of it; the unknown root it repeats rides along.
+/// refused, and the look after it failed, so the root is not known to run): the handle's drop retries
+/// and is refused again. The refusal is new, which the cleanup did not report, so the drop warns of
+/// it; the unknown root it repeats rides along.
 ///
 /// Mutant: the drop's report is a `debug` record whenever the cleanup warned of anything.
 #[skuld::test]
@@ -155,9 +157,11 @@ fn a_retry_that_fails_anew_warns_of_the_new_failure() {
     let teardowns = crate::child::owned::seams::record_root_teardowns();
     let mark = crate::log_capture::mark();
     let err_peek = || Err(std::io::Error::other("forced peek failure"));
-    let fake = child
-        .proc
-        .script_over(|f| f.peeks([err_peek(), err_peek()]).signals([refused(), refused()]));
+    let fake = child.proc.script_over(|f| {
+        f.peeks([err_peek(), err_peek()])
+            .signals([refused(), refused()])
+            .reaps([crate::os_process::fake::ReapAnswer::Err(std::io::ErrorKind::Other)])
+    });
 
     let err = crate::child::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
 
@@ -178,8 +182,8 @@ fn a_retry_that_fails_anew_warns_of_the_new_failure() {
 }
 
 /// A cleanup that warned of its unknown root and left its handle armed (the root kill was refused,
-/// once): the handle's drop retries, the kill lands, and all the drop has to say is the unknown root
-/// again, which is a `debug` record.
+/// once, and the look after it failed): the handle's drop retries, the kill lands, and all the drop
+/// has to say is the unknown root again, which is a `debug` record.
 ///
 /// Mutant: the drop's report ignores that the cleanup already warned.
 #[skuld::test]
@@ -191,9 +195,11 @@ fn a_retry_that_only_repeats_the_cleanups_warn_is_debug() {
     let teardowns = crate::child::owned::seams::record_root_teardowns();
     let mark = crate::log_capture::mark();
     let err_peek = || Err(std::io::Error::other("forced peek failure"));
-    let fake = child
-        .proc
-        .script_over(|f| f.peeks([err_peek(), err_peek()]).signals([refused()]));
+    let fake = child.proc.script_over(|f| {
+        f.peeks([err_peek(), err_peek()])
+            .signals([refused()])
+            .reaps([crate::os_process::fake::ReapAnswer::Err(std::io::ErrorKind::Other)])
+    });
 
     let err = crate::child::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
 
