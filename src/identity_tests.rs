@@ -156,17 +156,8 @@ enum Owner {
 }
 
 /// What one ordered read of a candidate and the proof of its named parent say together, over the
-/// whole grid. With a parent named:
-///
-/// - Another parent's number is `Gone` whatever the rest of the read said, and the proof is never
-///   needed.
-/// - A `Gone` read is `Gone`, with its own cause, whatever the proof says.
-/// - Otherwise the parent proof comes first: a parent that is gone is `Gone`; one that cannot be
-///   proved is `Unknown` blaming the parent. Only a held parent lets the candidate's own read answer:
-///   found with the parent's number, `Found`; found with an unreadable number, or `Unknown`, `Unknown`
-///   with the candidate's cause.
-///
-/// With no parent named, the read is the answer, its cause the candidate's.
+/// whole grid. The table is the contract: rows are (read, its parent number), columns the parent's
+/// proof. With no parent named, the read is the answer.
 ///
 /// Mutants: another parent's number is hidden by a refused read or by the proof; an unreadable
 /// number, a missing record or a missing order key settles `Unknown` before the proof (a gone parent
@@ -304,8 +295,7 @@ fn a_candidates_read_and_its_parents_proof_give_one_answer() {
     }
 }
 
-/// A read that found no record says its parent number could not be read only if it asked for it
-/// (the table above judges each `parent` value).
+/// A read that found no record says its parent number could not be read only if it asked for it.
 ///
 /// Mutant: `missing` reads `Unreadable` for a read that did not ask, or `NotAsked` for one that did
 /// (a `NotAsked` that is judged against a named parent breaks the debug assertion there).

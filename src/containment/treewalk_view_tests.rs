@@ -223,8 +223,8 @@ fn a_pid_the_kernel_cannot_read_is_dropped_and_warned_about() {
 }
 
 /// The warn names why the read failed when the read knows, so an unreadable view is not reported as
-/// access. The candidate's own read fails with the view, and its parent is held (a `Pidfs` id is
-/// proved by pidfd, which reads no `/proc`), so the warn names the candidate and its cause.
+/// access. The candidate's own read fails with the view, and its parent is held, so the warn names
+/// the candidate and its cause.
 /// Mutants: "`resolve_or_drop` drops the cause": the warn says "access denied?"; "a held parent's
 /// proof blames the parent": the warn names `ppid`.
 #[skuld::test]

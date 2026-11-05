@@ -324,8 +324,7 @@ fn creator_pid(handle: HANDLE) -> Result<usize, NTSTATUS> {
 /// so both describe the same process. `expected`: the key of the process asked about, when there
 /// is one; a pid that holds another key is [`Resolved::Gone`]. `ask_parent`: also read the creator
 /// pid on that handle, never a fall back to the snapshot's `th32ParentProcessID`; a refused creator
-/// query is [`ParentRead::Unreadable`] with its `NTSTATUS` in the cause, and does not touch a read
-/// that did not ask ([`creator_read`]). A refused query is `Unknown` with its `NTSTATUS` as the cause.
+/// query is [`ParentRead::Unreadable`] with its `NTSTATUS` in the cause ([`creator_read`]).
 pub(super) fn ordered_read(pid: RawPid, expected: Option<Key>, ask_parent: bool) -> OrderedRead {
     let handle = match open_classified(pid, PROCESS_QUERY_LIMITED_INFORMATION) {
         Opened::Found(h) => h,
@@ -352,6 +351,7 @@ fn creator_read(pid: RawPid, creator: Result<usize, NTSTATUS>, cause: UnknownCau
         Ok(creator) => match RawPid::try_from(creator) {
             Ok(creator) => (ParentRead::Is(creator), cause),
             Err(_) => {
+                log::debug!("the creator pid {creator:#x} of pid {pid} is wider than a DWORD");
                 debug_assert!(false, "the creator pid {creator:#x} of pid {pid} is wider than a DWORD");
                 (ParentRead::Unreadable, cause)
             }

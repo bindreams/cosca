@@ -500,7 +500,7 @@ pub(crate) mod ppid_fault {
 }
 
 /// What one read of a process's record says: its start key, and its parent pid as the record has
-/// it, which is not yet judged ([`Record::ppid`]): a read that does not ask for it never does.
+/// it, not yet judged ([`Record::ppid`]).
 struct Record {
     key: Key,
     raw_ppid: RawPid,
@@ -547,9 +547,8 @@ pub(super) fn start_token(pid: RawPid) -> Resolved<Key> {
 }
 
 /// The key, the order key (the start time, which is the key's value) and, when `ask_parent`, the
-/// parent pid of `pid`, from one record. A read that asks for the parent waits out a parent pid
-/// still being filled in by `fork()` ([`ppid_of`]), which is the candidate of a walk with a parent
-/// to prove; one that does not ask reads the record once and neither judges nor waits for its ppid.
+/// parent pid of `pid`, from one record. With `ask_parent`, waits out a parent pid that `fork()` is
+/// still filling in ([`ppid_of`]); without, reads the record once.
 pub(super) fn ordered_read(pid: RawPid, ask_parent: bool) -> OrderedRead {
     let read = if ask_parent {
         by_pid(pid, || ppid_and_key(pid)).map(|(ppid, key)| (key, ParentRead::Is(ppid)))
@@ -576,8 +575,8 @@ pub(super) fn ordered_read(pid: RawPid, ask_parent: bool) -> OrderedRead {
 /// sites and that oracle test cannot silently drift apart on what counts as trustworthy.
 ///
 /// `0` is legitimate ONLY for pid 0 (`kernel_task`, the kernel itself: never forked, and its own
-/// parent number) and pid 1 (launchd, the one real process whose parent is the kernel). A pid
-/// that no `fork()` makes cannot be one in progress, and waiting on it would never end. For any
+/// parent number) and pid 1 (launchd, the one real process whose parent is the kernel). Neither is
+/// ever mid-`fork()`, so waiting on a `0` there would never end. For any
 /// other pid, a `0` here means XNU served this pid's process-info record
 /// before `fork()` finished filling in its parent field. This IS a real, live race, not a
 /// theoretical one: measured directly on a busy host during this crate's own test runs (a

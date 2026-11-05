@@ -2,8 +2,6 @@
 //! resolves, and only the persistent sysctl refusal is `Unknown`, also when a walk's candidate is
 //! read under a parent; and the pids whose parent number is `0` and not a fork in progress. The rows
 //! for a candidate and its parent that run on every platform are in `identity::tree_tests`.
-//!
-//! These rows run on macOS CI only.
 
 use super::{fault, read_ppid_once, resolve_ppid, trusted_ppid, PpidRead};
 use crate::identity::{Key, ProcessId, Resolved};
@@ -85,7 +83,7 @@ fn a_candidate_whose_parent_read_is_refused_is_unknown() {
 
 /// A parent number of `0` is a fork in progress for every pid but the two no `fork()` makes: pid 0
 /// (`kernel_task`, the kernel itself) and pid 1 (launchd, whose parent is the kernel). Waiting on
-/// either would never end. A pure row, so a regression fails by assertion and not by a hung read.
+/// either would never end.
 ///
 /// Mutants: `trusted_ppid` trusts `0` for pid 1 only, or for pid 0 only, or for every pid.
 #[skuld::test]
@@ -104,9 +102,14 @@ fn a_zero_parent_is_trusted_only_for_the_kernel_and_launchd() {
 /// the record under another pid.
 #[skuld::test]
 fn one_parent_read_of_launchd_finds_its_parent_zero() {
-    assert!(
-        matches!(read_ppid_once(1), PpidRead::Found(0, _)),
-        "launchd's record reads for any user and names parent 0"
+    let read = read_ppid_once(1);
+    let PpidRead::Found(0, key) = read else {
+        panic!("precondition: launchd's record reads for any user and names parent 0, got {read:?}");
+    };
+    assert_eq!(
+        super::start_token(1),
+        Resolved::Found(key),
+        "the key of the parent read is the one record's"
     );
 }
 

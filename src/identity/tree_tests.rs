@@ -126,8 +126,7 @@ fn a_parent_that_is_access_denied_is_unassessable_naming_the_ppid() {
 }
 
 /// A spawned child's parent is this process: `parent` reads the child again under the parent it
-/// found, which must name that parent on every platform. This is the row for a candidate found
-/// under its real parent, with its own id and order key. Mutant: the check of the child's own
+/// found, which must name that parent on every platform. Mutant: the check of the child's own
 /// parent rejects the real one.
 #[skuld::test]
 fn the_parent_of_a_spawned_child_is_the_current_process() {

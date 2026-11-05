@@ -113,7 +113,7 @@ impl OrderKey {
 /// that gave the candidate's id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ParentRead {
-    /// The read was not asked for it: it is read, judged and logged only when it is.
+    /// The read was not asked for the parent number.
     NotAsked,
     /// The parent number the read found.
     Is(RawPid),
@@ -138,7 +138,7 @@ enum Judged {
     Settled(Ordered),
     /// The read did not prove another parent: this is the answer if the parent is still held. A
     /// parent that is gone makes it `Gone`, and one that cannot be proved `Unknown` blaming the
-    /// parent, whatever this says.
+    /// parent.
     IfParentHolds(Ordered),
 }
 
@@ -180,13 +180,9 @@ impl OrderedRead {
         )
     }
 
-    /// The read for `pid`, whose caller was told `parent` created it. A parent number that is
-    /// another's is [`Resolved::Gone`] whatever the rest of the read said: the pid has changed
-    /// hands, and a refused read of anything else cannot hide that. A `Gone` read stays so. Every
-    /// other read is [`Judged::IfParentHolds`], whether it found the process or not and whether it
-    /// read the parent number or not: the parent is proved before the candidate's own failure (a
-    /// missing record, a missing order key, an unreadable parent number) answers `Unknown`, so that a
-    /// parent that is gone is `Gone` and not blamed on the candidate.
+    /// The read for `pid`, whose caller was told `parent` created it. Another parent's number, or a
+    /// `Gone` read, settles the answer; every other read waits on the proof of `parent`
+    /// ([`Judged`]).
     fn judged(self, pid: RawPid, parent: RawPid) -> Judged {
         let OrderedRead {
             read,
@@ -285,15 +281,12 @@ impl ProcessId {
     /// [`of_with`](Self::of_with), with the order key of the same read beside the id.
     ///
     /// `parent`: the process the caller was told is this one's parent. Each backend's read carries
-    /// the process's parent number from the record or handle that gives the id (Linux: the `stat`;
-    /// Windows: the creator pid; macOS: the process-info record), and a process with another parent
-    /// number now is [`Resolved::Gone`] whatever else the read said: the pid has changed hands, or the
-    /// process was reparented. A number that is read does not yet name the parent, which may have been
-    /// reaped and its number taken, so `parent` is then proved again: a number that no longer holds it
-    /// is [`Resolved::Gone`] too, and one whose proof cannot be made is [`Resolved::Unknown`], blaming
-    /// the parent. That proof comes before the candidate's own failure answers: a record that cannot be
-    /// read, a missing order key or a parent number that cannot be read is `Unknown` blaming the
-    /// candidate only while the parent is held.
+    /// the process's parent number from the record or handle that gives the id, and a process with
+    /// another parent number now is [`Resolved::Gone`] whatever else the read said: the pid has
+    /// changed hands, or the process was reparented. A number that is read does not yet name the
+    /// parent, which may have been reaped and its number taken, so `parent` is then proved again: a
+    /// number that no longer holds it is [`Resolved::Gone`] too, and one whose proof cannot be made
+    /// is [`Resolved::Unknown`], blaming the parent.
     pub(crate) fn of_ordered_with(kernel: &dyn Kernel, pid: RawPid, parent: Option<ProcessId>) -> Ordered {
         #[cfg(all(test, target_os = "macos"))]
         seams::note_by_pid_read();

@@ -167,6 +167,20 @@ fn a_gone_parent_is_gone_before_a_missing_start_time_is_unknown() {
     ));
 }
 
+/// A `stat` that names another parent but shows no start time is `Gone`: the other parent settles
+/// the answer before the missing start time can make it `Unknown`.
+///
+/// Mutant: a missing start time hides the other parent's number.
+#[skuld::test]
+fn another_parent_is_gone_even_when_the_start_time_is_missing() {
+    let parent = ProcessId::from_parts_for_test(7, Key::Pidfs(9));
+    let (kernel, _writer) = kernel_showing(b"4242 (x) S 8", 100);
+    assert!(matches!(
+        ProcessId::of_ordered_with(&kernel, PID, Some(parent)).0,
+        Resolved::Gone
+    ));
+}
+
 /// A `Ticks` id's key is its ticks, and nothing is read: a kernel with no rows panics on a read.
 #[skuld::test]
 fn a_ticks_ids_order_key_is_its_ticks_with_no_read() {

@@ -833,3 +833,22 @@ fn a_refused_creator_query_puts_its_status_in_the_cause() {
     assert_eq!(parent, ParentRead::Is(5));
     assert_eq!(cause.creator_status, None);
 }
+
+/// A cause that already holds a refused sequence-number query keeps it as the error when the
+/// creator query is refused too: the sequence-number query is named first.
+///
+/// Mutant: the creator status takes precedence over the sequence status in `into_error`.
+#[skuld::test]
+fn a_refused_creator_query_does_not_displace_a_refused_sequence_number_in_the_error() {
+    use super::{creator_read, ParentRead};
+    use crate::identity::UnknownCause;
+
+    let creator_refused = windows::Win32::Foundation::NTSTATUS(0xC000_0022_u32 as i32);
+    let (parent, cause) = creator_read(7, Err(creator_refused), UnknownCause::of_sequence_status(REFUSED));
+    assert_eq!(parent, ParentRead::Unreadable);
+    let text = cause_text(cause).expect("a refusal is the cause");
+    assert!(
+        text.contains("process sequence number query failed: NTSTATUS 0xc0000004") && !text.contains("creator"),
+        "{text}"
+    );
+}
