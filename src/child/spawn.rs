@@ -118,7 +118,8 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
 ///
 /// A root the cleanup did not show collected ([`TeardownOutcome::uncollected`]) is handed back in
 /// the error (an `Unreaped`) and the handle is disarmed. The drop that would have retried a failed
-/// tree kill does not run for it, so the cleanup retries that kill once first. The handle is also
+/// tree kill does not run for it, so the cleanup retries that kill once first, and the warn and the
+/// error say how the retry went (a skipped kill is not a retry that worked). The handle is also
 /// disarmed once the tree is settled: killed, not for the cleanup to kill, or deliberately left
 /// alone (a reaped or unpinned root). Only a failed tree kill with a root not handed back leaves
 /// the handle armed, so its drop writes the kill again; that drop does not warn of the event a
@@ -156,7 +157,8 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     // The tree is settled when it was killed completely, was not for the cleanup to kill, or was
     // deliberately left alone because the root is reaped or unpinned.
     let tree_settled = tree.is_none() || child.tree_killed.is_set() || (skipped.is_some() && view.leaves_root_alone());
-    let (mut tree_note, tree_warn) = report_tree_teardown(tree, &child.attached.teardown_subject());
+    let subject = child.attached.teardown_subject();
+    let (mut tree_note, tree_warn) = report_tree_teardown(tree, &subject);
     report.tree = tree_warn;
     if let Some(note) = skipped {
         tree_note.push_str(&format!("; its contained tree was not killed: {note}"));
@@ -233,22 +235,13 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
                     }
                     Err(waited) => {
                         uncollected = waited.uncollected();
-                        let e = Error::from(waited);
-                        let (what, note) = if exited_front {
-                            (
-                                "exited ",
-                                format!("the elevated child had already exited, but could not be reaped ({e})"),
-                            )
-                        } else {
-                            (
-                                "killed ",
-                                format!("the elevated child was killed but could not be reaped ({e})"),
-                            )
-                        };
-                        report.left.push(format!(
-                            "could not reap the {what}elevated child pid {pid}: {e}{}",
-                            Disposition::HandBack.handed_back_suffix(uncollected)
-                        ));
+                        if matches!(waited, WaitToExitError::Elsewhere(_)) {
+                            log::debug!(
+                                "finish_elevated: the elevated child pid {pid} was reaped elsewhere after its kill"
+                            );
+                        }
+                        let (note, left) = reap_after_the_kill_ended(pid, exited_front, uncollected, waited);
+                        report.left.extend(left);
                         (note, ChildFate::Killed)
                     }
                 }
@@ -278,10 +271,29 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     torn.uncollected = uncollected;
     let hands_back = Disposition::HandBack.hands_back(&torn);
     // A handed-back root takes the drop that would have retried a failed tree kill with it: retry
-    // here. The failed first kill has been reported (`report.tree`); the error's note says no more
-    // of it once the retry worked.
-    if hands_back && !tree_settled && kill_tree().is_ok() {
-        tree_note.clear();
+    // here. The one warn and the error's note say how the retry went.
+    if hands_back && !tree_settled {
+        match kill_tree() {
+            Ok(None) => {
+                tree_note.clear();
+                report.tree = tree_failure.as_ref().map(|first| {
+                    format!(
+                        "tree teardown after a failed password write took a retry ({subject}): the first attempt \
+                         failed: {first}"
+                    )
+                });
+            }
+            // A skip kills nothing: the notes of the first attempt stand.
+            Ok(Some(_)) => {}
+            Err(again) => {
+                let too = format!("; the retry failed too ({again})");
+                tree_note.push_str(&too);
+                match report.tree.as_mut() {
+                    Some(warn) => warn.push_str(&too),
+                    None => report.tree = report_tree_teardown(Some(Err(again)), &subject).1,
+                }
+            }
+        }
     }
     let warned = report.emit(&[]);
     let root_note = if hands_back {
@@ -303,6 +315,40 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
         fate,
         unreaped,
     ))
+}
+
+/// What [`finish_elevated`] says of a root whose reap after its kill ended as `waited` without a
+/// status (`uncollected` is `waited.uncollected()`): the error's note, and the leftover for the
+/// event's one warn. A reap someone else made has no leftover.
+#[cfg(unix)]
+fn reap_after_the_kill_ended(
+    pid: u32,
+    exited_front: bool,
+    uncollected: bool,
+    waited: WaitToExitError,
+) -> (String, Option<String>) {
+    let (what, note, but) = if exited_front {
+        ("exited ", "the elevated child had already exited", ", but")
+    } else {
+        ("killed ", "the elevated child was killed", " but")
+    };
+    let unreadable = matches!(waited, WaitToExitError::Unreadable(_));
+    let elsewhere = matches!(waited, WaitToExitError::Elsewhere(_));
+    let e = Error::from(waited);
+    if unreadable {
+        // The reap consumed the zombie: only its exit record is lost.
+        return (
+            format!("{note}; it was reaped, but {e}"),
+            Some(format!("reaped the {what}elevated child pid {pid}; {e}")),
+        );
+    }
+    let left = (!elsewhere).then(|| {
+        format!(
+            "could not reap the {what}elevated child pid {pid}: {e}{}",
+            Disposition::HandBack.handed_back_suffix(uncollected)
+        )
+    });
+    (format!("{note}{but} could not be reaped ({e})"), left)
 }
 
 /// The fate of a child cosca did not kill (its kill was refused, or never sent), from one
@@ -2487,9 +2533,10 @@ impl FrontFate {
         use crate::child::owned::teardown::LookOutcome;
         match look {
             LookOutcome::Reaped(_) => FrontFate::Reaped,
-            LookOutcome::ReapedElsewhere | LookOutcome::LookFailed(_) | LookOutcome::ReapFailed(_) => {
-                FrontFate::Unaccounted
-            }
+            LookOutcome::ReapedElsewhere
+            | LookOutcome::LookFailed(_)
+            | LookOutcome::ReapFailed(_)
+            | LookOutcome::ReapUnreadable(_) => FrontFate::Unaccounted,
             LookOutcome::LeftRunning => FrontFate::LeftUnreaped,
             LookOutcome::PlaceUnreadable(_) | LookOutcome::SubtreeUnreadable(_) => FrontFate::Unplaced,
         }

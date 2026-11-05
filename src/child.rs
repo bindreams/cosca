@@ -1256,6 +1256,9 @@ fn word_front(
             "elevation front pid {pid} was killed through its cgroup, and could not be reaped ({e}){}",
             disposition.handed_back_suffix(torn.uncollected)
         )),
+        LookOutcome::ReapUnreadable(e) => Some(format!(
+            "elevation front pid {pid} was killed through its cgroup and reaped; {e}"
+        )),
         LookOutcome::LeftRunning => Some(match disposition {
             Disposition::Leave => format!(
                 "elevation front pid {pid} is left running and unreaped: {why}, and a kill of the front would orphan \

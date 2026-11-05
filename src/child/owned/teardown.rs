@@ -111,6 +111,8 @@ pub(crate) enum LookOutcome {
     LookFailed(Error),
     /// A kill sent elsewhere ended it, and the reap failed.
     ReapFailed(Error),
+    /// A kill sent elsewhere ended it, and the reap consumed it but read no exit record.
+    ReapUnreadable(Error),
     /// It is running and no kill reached it: it is left running and unreaped, or handed back by a
     /// caller that does ([`Disposition::HandBack`]).
     LeftRunning,
@@ -245,6 +247,8 @@ impl OwnedChild {
             }
             failed => {
                 let uncollected = failed.uncollected();
+                // The consuming reap took the zombie: the child is reaped, and only its record is lost.
+                let reaped = matches!(failed, WaitToExitError::Unreadable(_));
                 let e = Error::from(failed);
                 TeardownOutcome {
                     fate: if delivered {
@@ -254,11 +258,15 @@ impl OwnedChild {
                     },
                     uncollected,
                     look: None,
-                    left: Some(format!(
-                        "teardown of {}: the reap after the kill failed: {e}{}",
-                        child_named(pid),
-                        disposition.handed_back_suffix(uncollected)
-                    )),
+                    left: Some(if reaped {
+                        format!("teardown of {}: reaped it after the kill; {e}", child_named(pid))
+                    } else {
+                        format!(
+                            "teardown of {}: the reap after the kill failed: {e}{}",
+                            child_named(pid),
+                            disposition.handed_back_suffix(uncollected)
+                        )
+                    }),
                 }
             }
         }
@@ -285,13 +293,10 @@ impl OwnedChild {
             Ok(ChildWaitOutcome::Foreign(foreign)) => (foreign.fate(false), None),
             looked => match looked.and_then(|outcome| status_of_outcome(pid, outcome, Orphaned::Quiet)) {
                 Ok(status) => (crate::child::spawn::fate_of_a_look(Ok(status), id), None),
-                Err(failure) => {
-                    let errno = match &failure {
-                        Error::Io(e) => e.raw_os_error(),
-                        _ => None,
-                    };
-                    (crate::child::spawn::fate_of_a_look(Err(errno), id), Some(failure))
-                }
+                Err(failure) => (
+                    crate::child::spawn::fate_of_a_look(Err(failure.raw_os_error()), id),
+                    Some(failure),
+                ),
             },
         };
         let left = match (&fate, &look_failure) {
@@ -360,6 +365,10 @@ impl OwnedChild {
                             // The kill landed first: delivered, so `Killed`.
                             Err(WaitToExitError::Elsewhere(foreign)) => {
                                 TeardownOutcome::of_front(foreign.fate(true), LookOutcome::ReapedElsewhere, false)
+                            }
+                            // The reap consumed it, so it is not the caller's to take back.
+                            Err(WaitToExitError::Unreadable(e)) => {
+                                TeardownOutcome::of_front(ChildFate::Killed, LookOutcome::ReapUnreadable(e), false)
                             }
                             Err(failed) => {
                                 let uncollected = failed.uncollected();

@@ -224,6 +224,34 @@ fn finish_elevated_hands_back_nothing_when_the_root_was_reaped_elsewhere_after_t
     assert_eq!(teardowns.count(), 0, "the handle is disarmed: its drop does not retry");
 }
 
+/// A root whose reap someone else made after the kill is not a failed kill or reap: the cleanup says
+/// so at `debug` (principle 5) and warns of nothing.
+///
+/// Mutant: the cleanup lists the foreign reap among the leftovers, which the one warn reports.
+#[skuld::test]
+fn finish_elevated_logs_a_root_reaped_elsewhere_after_the_kill_at_debug() {
+    crate::log_capture::install();
+    let (mut child, writer) = bare_blocker();
+    let mark = crate::log_capture::mark();
+    child.proc.script_over(|f| {
+        f.signals([Ok(crate::signal::Sent::Delivered)])
+            .reaps([crate::os_process::fake::ReapAnswer::Foreign(
+                crate::os_process::child::Foreign::Gone,
+            )])
+    });
+
+    let failure = crate::child::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
+    let (_, _, handed_back) = crate::test_child::expect_may_have_started_parts(failure.into(), writer);
+
+    assert!(handed_back.is_none());
+    assert_eq!(warns_since(mark), Vec::<String>::new());
+    let debug = crate::log_capture::records_since_on_current_thread(mark, "reaped elsewhere");
+    assert!(
+        debug.len() == 1 && debug[0].0 == log::Level::Debug,
+        "one debug record names the foreign reap: {debug:?}"
+    );
+}
+
 /// A failed spawn's cleanup whose reap fails after a delivered kill: the root is not shown
 /// collected, so it is handed back and the handle is disarmed, and the handle's drop does not retry.
 ///
@@ -392,6 +420,105 @@ fn a_failed_tree_kill_is_retried_before_the_root_is_handed_back() {
         std::fs::read(&kill_file).expect("read cgroup.kill"),
         crate::containment::cgroup::KILL_PAYLOAD,
         "the cleanup must retry the tree kill"
+    );
+    handed_back.wait();
+}
+
+/// A retry that killed the tree is not reported as a failed teardown: the one warn says the kill took
+/// a retry and names the first failure, and the error no longer says the tree was not killed.
+///
+/// Mutant: the warn keeps the first failure's text, or the error keeps its note.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_tree_kill_that_worked_on_the_retry_is_reported_as_a_retry_not_a_failure() {
+    use crate::child::spawn::fault;
+
+    crate::log_capture::install();
+    let (mut child, writer, leaf_path, kill_file, _dir) = child_in_a_leaf_whose_kill_fails();
+    child.proc.script_over(|f| f.signals([refused()]));
+    let healed = kill_file.clone();
+    let _hook = fault::set_between_kill_and_wait(move || {
+        std::fs::remove_dir(&healed).expect("remove the directory");
+        std::fs::write(&healed, b"").expect("create cgroup.kill");
+    });
+    let mark = crate::log_capture::mark();
+
+    let failure = crate::child::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
+    let (cause, _, handed_back) = crate::test_child::expect_handed_back(failure.into(), writer);
+
+    let first = std::io::Error::from_raw_os_error(libc::EISDIR).to_string();
+    let warns = warns_since(mark);
+    let warn = warns
+        .iter()
+        .find(|warn| warn.contains(&leaf_path.display().to_string()))
+        .unwrap_or_else(|| panic!("no warn names the tree: {warns:?}"));
+    assert!(
+        warn.contains("took a retry") && warn.contains(&first),
+        "the warn says the kill took a retry, after: {first}: {warn}"
+    );
+    assert!(
+        !warn.contains(crate::child::spawn::TREE_TEARDOWN_WARN),
+        "the tree was killed: {warn}"
+    );
+    assert!(
+        !cause.to_string().contains("could not be killed"),
+        "the error blames no tree: {cause}"
+    );
+    handed_back.wait();
+}
+
+/// A retry that fails again puts its error in the one warn and in the error, after the first's.
+///
+/// Mutant: the retry's error is dropped.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_tree_kill_that_failed_on_the_retry_too_names_both_failures() {
+    crate::log_capture::install();
+    let (mut child, writer, leaf_path, _kill_file, _dir) = child_in_a_leaf_whose_kill_fails();
+    child.proc.script_over(|f| f.signals([refused()]));
+    // The first write fails with `EIO`, the retry's with `EISDIR` (`cgroup.kill` is a directory).
+    let _first = crate::containment::cgroup::fault::fail_next_kill_write();
+    let mark = crate::log_capture::mark();
+
+    let failure = crate::child::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
+    let (cause, _, handed_back) = crate::test_child::expect_handed_back(failure.into(), writer);
+
+    let first = std::io::Error::from_raw_os_error(libc::EIO).to_string();
+    let retry = std::io::Error::from_raw_os_error(libc::EISDIR).to_string();
+    let warns = warns_since(mark);
+    let warn = warns
+        .iter()
+        .find(|warn| warn.contains(&leaf_path.display().to_string()))
+        .unwrap_or_else(|| panic!("no warn names the tree: {warns:?}"));
+    for text in [warn.as_str(), cause.to_string().as_str()] {
+        assert!(
+            text.contains(&first) && text.contains(&format!("the retry failed too ({retry})")),
+            "both failures, first then the retry's: {text}"
+        );
+    }
+    handed_back.wait();
+}
+
+/// A tree kill skipped because the root's state is unknown, and a root whose kill is refused and
+/// which is handed back: the retry skips again and kills nothing, so the error still says the tree
+/// was not killed.
+///
+/// Mutant: the retry's `Ok` clears the note whether or not it killed the tree.
+#[skuld::test]
+fn a_skipped_tree_kill_keeps_its_note_when_the_root_is_handed_back() {
+    crate::log_capture::install();
+    let (mut child, writer) = session_blocker();
+    child.proc.script_over(|f| {
+        f.peeks([Err(std::io::Error::other("forced peek failure"))])
+            .signals([refused()])
+    });
+
+    let failure = crate::child::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
+    let (cause, _, handed_back) = crate::test_child::expect_handed_back(failure.into(), writer);
+
+    assert!(
+        cause.to_string().contains("its contained tree was not killed"),
+        "nothing killed the tree: {cause}"
     );
     handed_back.wait();
 }

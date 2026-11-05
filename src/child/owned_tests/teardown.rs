@@ -155,22 +155,23 @@ fn assert_collected_with_an_unreadable_record(torn: &TeardownOutcome, dispositio
 }
 
 /// A reap after a kill that consumed the zombie without an exit record leaves nothing to hand back,
-/// though the wait reports an error.
+/// though the wait reports an error, and the leftover says the child was reaped.
 ///
-/// Mutant: any failed wait is uncollected.
+/// Mutants: any failed wait is uncollected; the leftover says the reap failed.
 #[skuld::test]
 fn a_reap_after_a_kill_whose_exit_record_was_unreadable_leaves_nothing_uncollected() {
     for disposition in [Disposition::Leave, Disposition::HandBack] {
         let torn = child_with_an_unreadable_exit().reap_after_tree_kill(disposition);
         assert_eq!(torn.fate, ChildFate::Killed, "{torn:?}");
-        assert_collected_with_an_unreadable_record(&torn, disposition, "the reap after the kill");
+        assert_collected_with_an_unreadable_record(&torn, disposition, "reaped it after the kill");
+        assert!(!torn.left.as_deref().unwrap_or_default().contains("failed"), "{torn:?}");
     }
 }
 
 /// The same through the entry point: a kill sent nothing to a child already reaped, and the wait after
 /// it meets the unreadable record.
 ///
-/// Mutant: any failed wait is uncollected.
+/// Mutants: any failed wait is uncollected; the leftover says the reap failed.
 #[skuld::test]
 fn a_teardown_of_a_child_with_an_unreadable_exit_leaves_nothing_uncollected() {
     for disposition in [Disposition::Leave, Disposition::HandBack] {
@@ -183,7 +184,8 @@ fn a_teardown_of_a_child_with_an_unreadable_exit_leaves_nothing_uncollected() {
             None,
         );
         assert_eq!(torn.fate, ChildFate::Unknown, "{torn:?}");
-        assert_collected_with_an_unreadable_record(&torn, disposition, "the reap after the kill");
+        assert_collected_with_an_unreadable_record(&torn, disposition, "reaped it after the kill");
+        assert!(!torn.left.as_deref().unwrap_or_default().contains("failed"), "{torn:?}");
     }
 }
 

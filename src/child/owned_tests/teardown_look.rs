@@ -71,6 +71,7 @@ enum Went {
     ReapedElsewhere,
     LookFailed,
     ReapFailed,
+    ReapUnreadable,
     LeftRunning,
     PlaceUnreadable,
     SubtreeUnreadable,
@@ -83,6 +84,7 @@ fn went(torn: &TeardownOutcome) -> Went {
         Some(LookOutcome::ReapedElsewhere) => Went::ReapedElsewhere,
         Some(LookOutcome::LookFailed(_)) => Went::LookFailed,
         Some(LookOutcome::ReapFailed(_)) => Went::ReapFailed,
+        Some(LookOutcome::ReapUnreadable(_)) => Went::ReapUnreadable,
         Some(LookOutcome::LeftRunning) => Went::LeftRunning,
         Some(LookOutcome::PlaceUnreadable(_)) => Went::PlaceUnreadable,
         Some(LookOutcome::SubtreeUnreadable(_)) => Went::SubtreeUnreadable,
@@ -419,6 +421,35 @@ mod worded {
                     cause(),
                     handed_back(disposition)
                 ),
+            );
+        }
+    }
+
+    /// A front the cgroup kill ended, whose reap consumed the zombie but read no exit record, is
+    /// worded as reaped with an unreadable record: not as a reap that failed, and with no hand-back
+    /// the caller has no child for. (A debug build asserts on the reap that produces it, so the
+    /// outcome is stated.)
+    ///
+    /// Mutant: `ReapUnreadable` is worded as `ReapFailed`.
+    #[skuld::test]
+    fn a_front_reaped_with_an_unreadable_exit_record_is_worded_as_reaped() {
+        for disposition in BOTH {
+            let torn = TeardownOutcome {
+                fate: ChildFate::Killed,
+                uncollected: false,
+                look: Some(LookOutcome::ReapUnreadable(crate::error::Error::Io(io::Error::other(
+                    "its exit record was unreadable (si_code 7)",
+                )))),
+                left: None,
+            };
+            let worded = crate::child::word_front(TeardownCaller::Drop, PID, &WHY, disposition, torn);
+            assert_eq!(
+                worded.left.as_deref(),
+                Some(
+                    "elevation front pid 4242 was killed through its cgroup and reaped; its exit record was \
+                     unreadable (si_code 7)"
+                ),
+                "{disposition:?}"
             );
         }
     }
