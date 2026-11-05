@@ -121,7 +121,7 @@ pub enum RecordErrorKind {
 pub enum Error {
     #[error("argument parsing failed: {0}")]
     Quote(#[from] QuoteError),
-    /// An I/O error. Its [`source`](std::error::Error::source) is the wrapped `io::Error`.
+    /// An I/O error.
     ///
     /// The OS code may sit on an `io::Error` further down the chain, under context cosca added:
     /// walk `source()` and take the first `io::Error` whose `raw_os_error()` is `Some`.
@@ -411,9 +411,7 @@ impl Error {
 
     /// This error with `note` appended to what it says, its variant and kind kept: a caller that
     /// matches on the variant still sees the cause. An [`Error::Io`] keeps its kind, and its
-    /// original error as the [`source`](std::error::Error::source), which keeps the OS code. The
-    /// new `io::Error` is a custom one, so its own `raw_os_error()` is `None`; the code is on the
-    /// error below it.
+    /// original error as the [`source`](std::error::Error::source), which keeps the OS code.
     #[cfg_attr(not(unix), allow(dead_code, reason = "only the unix spawn teardowns add a note"))]
     pub(crate) fn with_note(self, note: &str) -> Error {
         let append = |detail: String| format!("{detail}; {note}");

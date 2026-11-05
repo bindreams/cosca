@@ -192,10 +192,23 @@ fn io_context_error_in_error_io_reaches_the_os_code_through_source() {
         "could not check C:\\t.exe",
         std::io::Error::from_raw_os_error(code),
     ));
-    let found = std::iter::successors(std::error::Error::source(&e), |s| s.source())
+    assert_eq!(os_codes_below(&e), [None, Some(code)]);
+}
+
+/// A note on an `Error::Io` puts its own `io::Error`, which has no code, above the original one.
+#[skuld::test]
+fn a_noted_error_io_has_the_os_code_one_io_error_down() {
+    let code = if cfg!(windows) { 5 } else { 13 };
+    let e = Error::Io(std::io::Error::from_raw_os_error(code)).with_note("while tearing down");
+    assert_eq!(os_codes_below(&e), [None, Some(code)]);
+}
+
+/// The `raw_os_error()` of each `io::Error` reached by walking `source()` from `e`, outermost first.
+fn os_codes_below(e: &Error) -> Vec<Option<i32>> {
+    std::iter::successors(std::error::Error::source(e), |s| s.source())
         .filter_map(|s| s.downcast_ref::<std::io::Error>())
-        .find_map(std::io::Error::raw_os_error);
-    assert_eq!(found, Some(code));
+        .map(std::io::Error::raw_os_error)
+        .collect()
 }
 
 /// A note keeps every variant and its other fields, appends to the detail, and keeps each `source`.
