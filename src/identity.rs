@@ -45,20 +45,43 @@ compile_error!("cosca::identity is implemented only for Windows, Linux, and macO
 /// A process identifier as the OS knows it (matches `std::process::id`).
 pub type RawPid = u32;
 
-/// A raw, per-process kernel start value. Opaque: its only meaning is identity
-/// (exact equality). Interpreted into a wall-clock time only by `created_at`.
+/// What makes a [`ProcessId`] one process and not a later holder of its pid: a raw, per-process
+/// kernel value, opaque, compared exactly. Interpreted into a wall-clock time only by
+/// `created_at`. Linux has two kinds, [`backend::Key`]; Windows and macOS one.
+#[cfg(not(target_os = "linux"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct StartToken(u64);
+pub(crate) struct Key(u64);
 
-impl StartToken {
-    pub(crate) fn from_raw(v: u64) -> StartToken {
-        StartToken(v)
+#[cfg(not(target_os = "linux"))]
+impl Key {
+    pub(crate) fn from_raw(v: u64) -> Key {
+        Key(v)
     }
 
     fn raw(self) -> u64 {
         self.0
     }
+
+    /// A key restored from a record's `token`; only Linux keys have a kind.
+    fn restored(token: u64, _kind: Option<&str>) -> Key {
+        Key(token)
+    }
+
+    /// This backend's default kind, for tests that run on every platform.
+    #[cfg(test)]
+    pub(crate) fn for_test(v: u64) -> Key {
+        Key(v)
+    }
+
+    /// The same kind with another value.
+    #[cfg(test)]
+    fn other_value(self) -> Key {
+        Key(self.0.wrapping_add(1))
+    }
 }
+
+#[cfg(target_os = "linux")]
+pub(crate) use backend::Key;
 
 /// When a process started: comparable only with keys read on this host this boot. The tree walk's
 /// PID-reuse guard orders by it. Not the identity: equal keys do not mean the same process.
@@ -74,13 +97,13 @@ impl OrderKey {
     }
 }
 
-/// A process identity that stays unique across time: `(pid, start_token)`.
+/// A process identity that stays unique across time: `(pid, key)`.
 /// `Eq`/`Hash` are over the pair, so a recycled PID never compares equal to the
 /// original process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ProcessId {
     pid: RawPid,
-    start: StartToken,
+    key: Key,
 }
 
 impl ProcessId {
@@ -90,11 +113,21 @@ impl ProcessId {
         self.pid
     }
 
-    /// The raw start token as a `u64`, for tests that forge or compare tokens. Production code
-    /// orders by [`OrderKey`] and never reads the token.
+    /// The key, for tests that compare it with a stated one. Production code orders by
+    /// [`OrderKey`] and never reads the key.
     #[cfg(test)]
-    pub(crate) fn start_token_raw(&self) -> u64 {
-        self.start.raw()
+    pub(crate) fn key(&self) -> Key {
+        self.key
+    }
+
+    /// The same pid with another value of this id's own kind of key: what a later holder of the
+    /// pid would have.
+    #[cfg(test)]
+    pub(crate) fn with_other_value(&self) -> ProcessId {
+        ProcessId {
+            pid: self.pid,
+            key: self.key.other_value(),
+        }
     }
 
     /// Resolve the live identity of `pid`. [`Resolved::Gone`] means the OS reports no such
@@ -116,53 +149,62 @@ impl ProcessId {
         seams::note_by_pid_read();
         #[cfg(target_os = "linux")]
         {
-            let (read, view) = backend::start_token_explained(kernel, pid);
-            (read.map(|start| ProcessId { pid, start }), UnknownCause { view })
+            let (read, cause) = backend::of(kernel, pid);
+            (read.map(|key| ProcessId { pid, key }), cause)
         }
         #[cfg(not(target_os = "linux"))]
         {
             let _ = kernel;
             let (read, cause) = start_token_explained(pid);
-            (read.map(|start| ProcessId { pid, start }), cause)
+            (read.map(|key| ProcessId { pid, key }), cause)
         }
     }
 
     /// [`of_with`](Self::of_with), with the order key of the same read beside the id.
     pub(crate) fn of_ordered_with(kernel: &dyn Kernel, pid: RawPid) -> (Resolved<(ProcessId, OrderKey)>, UnknownCause) {
         let (read, cause) = Self::of_with(kernel, pid);
-        (read.map(|id| (id, OrderKey(id.start.raw()))), cause)
+        match read {
+            Resolved::Found(id) => match id.order_key_with(kernel) {
+                (Resolved::Found(key), _) => (Resolved::Found((id, key)), cause),
+                (Resolved::Gone, cause) => (Resolved::Gone, cause),
+                (Resolved::Unknown, cause) => (Resolved::Unknown, cause),
+            },
+            Resolved::Gone => (Resolved::Gone, cause),
+            Resolved::Unknown => (Resolved::Unknown, cause),
+        }
     }
 
     /// When this process started, for ordering against other processes' keys (the tree walk's
     /// PID-reuse guard). [`Resolved::Gone`] and [`Resolved::Unknown`] mean no key could be read;
     /// the [`UnknownCause`] says why when the read itself knows, as for [`of_with`](Self::of_with).
-    pub(crate) fn order_key_with(&self, _kernel: &dyn Kernel) -> (Resolved<OrderKey>, UnknownCause) {
-        (Resolved::Found(OrderKey(self.start.raw())), UnknownCause::default())
-    }
-
-    /// Build a `ProcessId` from an already-known `(pid, raw start token)` pair, without a
-    /// live read. Used where the pair was already read as part of a larger record — the
-    /// containment group listing reads a member's start token in the very sysctl/proc record
-    /// it reads the pid from, and a second, separate read to re-derive it would itself race
-    /// against the pid-reuse hazard this type exists to catch.
-    ///
-    /// `cfg(any(unix, test))`: the only non-test caller (`containment::unix::group`) is
-    /// Unix-only, so a Windows *release* build has no caller for this at all — gated to avoid
-    /// a `dead_code` warning there (`cargo build --target *-pc-windows-msvc` is a real CI job,
-    /// and this crate is otherwise warning-clean). Still available under
-    /// `cfg(test)` on every platform, because `from_parts_for_test` below calls it everywhere.
-    #[cfg(any(unix, test))]
-    pub(crate) fn from_parts(pid: RawPid, token: u64) -> ProcessId {
-        ProcessId {
-            pid,
-            start: StartToken::from_raw(token),
+    pub(crate) fn order_key_with(&self, kernel: &dyn Kernel) -> (Resolved<OrderKey>, UnknownCause) {
+        #[cfg(target_os = "linux")]
+        {
+            backend::order_key(kernel, self.pid, self.key)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = kernel;
+            (Resolved::Found(OrderKey(self.key.raw())), UnknownCause::default())
         }
     }
 
-    /// Test-only alias, kept so the many existing test call sites need no rename.
+    /// Build a `ProcessId` from an already-known `(pid, start time)` pair, without a live read.
+    /// The macOS group listing reads a member's start time in the very sysctl record it reads the
+    /// pid from, and a second, separate read to re-derive it would itself race against the
+    /// pid-reuse hazard this type exists to catch.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn from_parts(pid: RawPid, token: u64) -> ProcessId {
+        ProcessId {
+            pid,
+            key: Key::from_raw(token),
+        }
+    }
+
+    /// A test identity with a stated key.
     #[cfg(test)]
-    pub(crate) fn from_parts_for_test(pid: RawPid, token: u64) -> ProcessId {
-        Self::from_parts(pid, token)
+    pub(crate) fn from_parts_for_test(pid: RawPid, key: Key) -> ProcessId {
+        ProcessId { pid, key }
     }
 
     /// This process's own identity. Windows reads the current-process pseudo-handle, which
@@ -178,12 +220,17 @@ impl ProcessId {
     /// fails, which has no documented cause. Infallible by design — every caller, including
     /// `Process::current()`, relies on it.
     pub fn current() -> ProcessId {
-        let start = backend::current_token()
-            .found()
-            .expect("a process must be able to read its own start token (Linux: /proc/self/stat must be readable)");
+        #[cfg(target_os = "linux")]
+        let read = backend::current_key(&HostKernel);
+        #[cfg(not(target_os = "linux"))]
+        let read = backend::current_token();
+        let key = read.found().expect(
+            "a process must be able to read its own identity (Linux: pidfd_open of itself, and /proc/self/stat \
+             below 6.9, must work)",
+        );
         ProcessId {
             pid: std::process::id(),
-            start,
+            key,
         }
     }
 
@@ -202,8 +249,7 @@ impl ProcessId {
     pub(crate) fn exists_with(&self, kernel: &dyn Kernel) -> (Existence, UnknownCause) {
         #[cfg(target_os = "linux")]
         {
-            let (read, view) = backend::start_token_explained(kernel, self.pid);
-            (self.existence_from(read), UnknownCause { view })
+            backend::exists(kernel, self.pid, self.key)
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -213,10 +259,11 @@ impl ProcessId {
         }
     }
 
-    /// What `read`, the start token now at this pid, says about this process.
-    fn existence_from(&self, read: Resolved<StartToken>) -> Existence {
+    /// What `read`, the key now at this pid, says about this process.
+    #[cfg(not(target_os = "linux"))]
+    fn existence_from(&self, read: Resolved<Key>) -> Existence {
         match read {
-            Resolved::Found(t) if t == self.start => Existence::Present,
+            Resolved::Found(t) if t == self.key => Existence::Present,
             Resolved::Found(_) | Resolved::Gone => Existence::Gone,
             Resolved::Unknown => Existence::Unknown,
         }
@@ -243,19 +290,33 @@ impl ProcessId {
     pub(crate) fn is_alive_with(&self, kernel: &dyn Kernel) -> Liveness {
         #[cfg(target_os = "linux")]
         {
-            backend::is_running(kernel, self.pid, self.start)
+            backend::is_running(kernel, self.pid, self.key)
         }
         #[cfg(not(target_os = "linux"))]
         {
             let _ = kernel;
-            backend::is_running(self.pid, self.start)
+            backend::is_running(self.pid, self.key)
         }
     }
 
     /// Best-effort wall-clock creation time. Lazy and allowed to drift (NTP);
     /// NEVER used for identity. `None` if the process is gone or unavailable.
     pub fn created_at(&self) -> Option<std::time::SystemTime> {
-        backend::created_at(self.start)
+        self.created_at_with(&HostKernel)
+    }
+
+    /// [`created_at`](Self::created_at) through `kernel`: on Linux a `pidfs` id reads the start
+    /// time from `/proc`.
+    pub(crate) fn created_at_with(&self, kernel: &dyn Kernel) -> Option<std::time::SystemTime> {
+        #[cfg(target_os = "linux")]
+        {
+            backend::created_at(kernel, self.pid, self.key)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = kernel;
+            backend::created_at(self.key)
+        }
     }
 }
 
@@ -311,16 +372,39 @@ pub(crate) use backend::proc_view::{
 pub(crate) struct UnknownCause {
     #[cfg(target_os = "linux")]
     view: Option<ViewUnreadable>,
+    /// The failed `pidfd_open`, `fstatfs` or `fstat` that left the read `Unknown`.
+    #[cfg(target_os = "linux")]
+    errno: Option<rustix::io::Errno>,
 }
 
 impl UnknownCause {
-    /// The error for `subject`'s `Unknown` read when the view is why: `Error::Unsupported` naming
-    /// the `openat2` requirement, or `Error::Unassessable` with the view's reason. `None` when the
-    /// view is fine (or off Linux, which has none): `hidepid`, a racing exit.
+    /// The cause of a read through `/proc` that `view`, when it is `Some`, left `Unknown`.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn of_view(view: Option<ViewUnreadable>) -> UnknownCause {
+        UnknownCause { view, errno: None }
+    }
+
+    /// The cause of a read that a failed pidfd call (`errno`) left `Unknown`.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn of_errno(errno: rustix::io::Errno) -> UnknownCause {
+        UnknownCause {
+            view: None,
+            errno: Some(errno),
+        }
+    }
+
+    /// The error for `subject`'s `Unknown` read when the read knows why: `Error::Unsupported` naming
+    /// the `openat2` requirement or a refused `pidfd_open`, or `Error::Unassessable` with the view's
+    /// reason or the errno that failed. `None` when nothing is known (or off Linux, which has no view
+    /// and no pidfd): `hidepid`, a racing exit.
     pub(crate) fn into_error(self, subject: &str) -> Option<crate::error::Error> {
         #[cfg(target_os = "linux")]
         {
-            self.view.map(|why| backend::view_error(subject, why))
+            match (self.view, self.errno) {
+                (Some(why), _) => Some(backend::view_error(subject, why)),
+                (None, Some(errno)) => Some(backend::errno_error(subject, errno)),
+                (None, None) => None,
+            }
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -331,7 +415,7 @@ impl UnknownCause {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn start_token_explained(pid: RawPid) -> (Resolved<StartToken>, UnknownCause) {
+fn start_token_explained(pid: RawPid) -> (Resolved<Key>, UnknownCause) {
     (backend::start_token(pid), UnknownCause::default())
 }
 
@@ -362,17 +446,25 @@ pub(crate) use backend::proc_view::openat2_refused_message;
 
 #[cfg(target_os = "linux")]
 impl ProcessId {
+    /// [`of_with`](Self::of_with), and the process's own `stat` record (its `ppid`, `pgrp`, ...),
+    /// read so that it belongs to the identity returned: a `stat` of a later holder of the pid is
+    /// never paired with this id.
+    pub(crate) fn of_stat_with(kernel: &dyn Kernel, pid: RawPid) -> (Resolved<(ProcessId, Vec<u8>)>, UnknownCause) {
+        let (read, cause) = backend::of_stat(kernel, pid);
+        (read.map(|(key, stat)| (ProcessId { pid, key }, stat)), cause)
+    }
+
     /// [`exists`](Self::exists), reading through the `/proc` at `proc_dir` instead of
     /// re-resolving `/proc` by path. Only meaningful when that `/proc` is known to describe
     /// this pid's namespace.
     pub(crate) fn exists_in(&self, kernel: &dyn Kernel, proc_dir: &ProcDir) -> Existence {
-        self.existence_from(backend::start_token_in(kernel, proc_dir, self.pid))
+        backend::exists_in(kernel, proc_dir, self.pid, self.key)
     }
 
     /// [`is_alive`](Self::is_alive), reading through the `/proc` at `proc_dir`; see
     /// [`exists_in`](Self::exists_in).
     pub(crate) fn is_alive_in(&self, kernel: &dyn Kernel, proc_dir: &ProcDir) -> Liveness {
-        backend::is_running_in(kernel, proc_dir, self.pid, self.start)
+        backend::is_running_in(kernel, proc_dir, self.pid, self.key)
     }
 
     /// Whether `kill(pid, 0)` answers `ESRCH`; independent of `/proc`.
@@ -451,7 +543,7 @@ pub(crate) enum HandleIdentity {
 #[cfg(windows)]
 pub(crate) fn windows_handle_identity(handle: windows::Win32::Foundation::HANDLE, id: ProcessId) -> HandleIdentity {
     match backend::creation_token_result(handle) {
-        Ok(t) if t == id.start => HandleIdentity::Same,
+        Ok(t) if t == id.key => HandleIdentity::Same,
         Ok(_) => HandleIdentity::Different,
         Err(e) => HandleIdentity::Unreadable(e),
     }

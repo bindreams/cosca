@@ -36,7 +36,7 @@ fn open_after_reap_is_none() {
 #[skuld::test]
 fn open_with_wrong_start_token_is_none_and_sends_nothing() {
     let (child, _stdin, id) = blocker();
-    let other = ProcessId::from_parts_for_test(id.pid(), id.start_token_raw() + 1);
+    let other = id.with_other_value();
     assert!(open(other).unwrap().is_none());
     // Still running: the right identity opens and sees no exit.
     let p = open(id).unwrap().expect("the blocker is alive");
@@ -128,7 +128,7 @@ fn kill_and_terminate_of_a_held_process_that_is_gone_are_ok() {
 #[skuld::test]
 fn terminate_by_id_on_a_gone_process_is_ok() {
     let (child, _stdin, id) = blocker();
-    let other = ProcessId::from_parts_for_test(id.pid(), id.start_token_raw() + 1);
+    let other = id.with_other_value();
     terminate_by_id(other).unwrap();
     let p = open(id).unwrap().expect("the blocker is alive");
     assert!(!exited_held(&*p, Some(Duration::ZERO)).unwrap());

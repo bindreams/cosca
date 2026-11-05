@@ -177,8 +177,12 @@ impl<'a> PauseKernel<'a> {
 }
 
 impl Kernel for PauseKernel<'_> {
-    fn pidfd_open(&self, target: Pid) -> Result<OwnedFd, Errno> {
-        self.inner.pidfd_open(target)
+    fn pidfd_open(&self, target: Pid, flags: rustix::process::PidfdFlags) -> Result<OwnedFd, Errno> {
+        self.inner.pidfd_open(target, flags)
+    }
+
+    fn pidfs_ino(&self, fd: std::os::fd::BorrowedFd<'_>) -> Result<Option<u64>, Errno> {
+        self.inner.pidfs_ino(fd)
     }
 
     fn open_proc(&self) -> Result<ProcDir, ViewUnreadable> {

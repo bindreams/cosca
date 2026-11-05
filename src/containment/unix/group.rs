@@ -152,7 +152,8 @@ pub(crate) fn members(_kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::
 /// (`EACCES`, or `EPERM` while the checked directory still answers).
 #[cfg(target_os = "linux")]
 pub(crate) fn members(kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::io::Result<Vec<Member>> {
-    use crate::identity::stat_parse::{parse_pgrp, parse_starttime_jiffies};
+    use crate::identity::stat_parse::parse_pgrp;
+    use crate::identity::Resolved;
 
     let proc_dir =
         crate::identity::proc_view_with(kernel)
@@ -199,20 +200,38 @@ pub(crate) fn members(kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::i
         if g != pgid as u32 {
             continue;
         }
-        let Some(token) = parse_starttime_jiffies(&stat) else {
-            // No usable identity token — a later re-check could never confirm this pid is
-            // still the SAME process, so it cannot be counted as a member either; visible,
-            // not silent.
-            log::debug!(
-                "containment::unix::group::members: /proc/{pid}/stat matched pgid {pgid} but \
-                 had no parseable starttime; excluding it"
-            );
-            continue;
+        // The scan's `stat` is a record of whoever held `pid` then. The member's identity is made
+        // by a read that pairs it with a `stat` of its own, and the membership is asked again of
+        // that one: a pid that exited and was reused since the scan is not a member.
+        let (id, own_stat) = match ProcessId::of_stat_with(kernel, pid) {
+            (Resolved::Found(read), _) => read,
+            (Resolved::Gone, _) => {
+                log::debug!("containment::unix::group::members: pid {pid} is gone; excluding it");
+                continue;
+            }
+            // A cause the read knows (an unusable `/proc` view, a refused or exhausted `pidfd_open`)
+            // fails the listing, because excluding the member could clear a live group. A record
+            // that merely would not parse, as a task exiting mid-read leaves, is excluded.
+            (Resolved::Unknown, cause) => match cause.into_error(&format!("pid {pid}")) {
+                Some(why) => {
+                    return Err(std::io::Error::other(format!(
+                        "containment::unix::group::members: {why}, so process group {pgid} cannot be listed"
+                    )));
+                }
+                None => {
+                    log::debug!(
+                        "containment::unix::group::members: pid {pid} matched pgid {pgid} but its identity \
+                         could not be read; excluding it"
+                    );
+                    continue;
+                }
+            },
         };
-        out.push(Member {
-            id: ProcessId::from_parts(pid, token),
-            system: false,
-        });
+        if parse_pgrp(&own_stat) != Some(pgid as u32) {
+            log::debug!("containment::unix::group::members: pid {pid} is no longer in pgid {pgid}; excluding it");
+            continue;
+        }
+        out.push(Member { id, system: false });
     }
     Ok(out)
 }

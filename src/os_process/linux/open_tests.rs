@@ -11,13 +11,13 @@ use rustix::process::{getpid, pidfd_open, PidfdFlags};
 use super::open_verified_with;
 use crate::error::Error;
 use crate::identity::stat_parse::stat_fixture;
-use crate::identity::{Existence, FakeKernel, HostKernel, ProcessId, UNREADABLE_STATUS_REASON};
+use crate::identity::{Existence, FakeKernel, HostKernel, Key, ProcessId, UNREADABLE_STATUS_REASON};
 
 /// A pid that no live process is expected to hold; only its `pidfd_open` row exists.
 const FABRICATED: u32 = 4242;
 
 fn fabricated_id() -> ProcessId {
-    ProcessId::from_parts_for_test(FABRICATED, 1)
+    ProcessId::from_parts_for_test(FABRICATED, Key::for_test(1))
 }
 
 #[path = "open_tests/fixture.rs"]
@@ -229,10 +229,7 @@ fn open_verified_on_a_dead_non_leader_tid_is_gone() {
 
     let kernel = FakeKernel::over(&HostKernel)
         .on_pidfd_open(id.pid(), Err(Errno::NOENT))
-        .on_read(
-            &format!("{}/stat", id.pid()),
-            Ok(&stat_fixture("Z", id.start_token_raw())),
-        );
+        .on_read(&format!("{}/stat", id.pid()), Ok(&stat_fixture("Z", id.key().ticks())));
     let result = open_verified_with(&kernel, id);
     assert!(
         matches!(result, Ok(None)),
@@ -254,7 +251,7 @@ fn open_verified_is_unassessable_when_the_einval_arms_liveness_is_unknown() {
     let stat = format!("{}/stat", id.pid());
     let kernel = FakeKernel::over(&HostKernel)
         .on_pidfd_open(id.pid(), Err(Errno::INVAL))
-        .on_read(&stat, Ok(&stat_fixture("S", id.start_token_raw())))
+        .on_read(&stat, Ok(&stat_fixture("S", id.key().ticks())))
         .on_read_after(&stat, 1, Err(libc::EACCES));
     let result = open_verified_with(&kernel, id);
     match result {

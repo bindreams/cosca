@@ -12,7 +12,7 @@
 
 use std::os::fd::AsFd;
 
-use rustix::process::Pid;
+use rustix::process::{Pid, PidfdFlags};
 
 use crate::error::Error;
 use crate::identity::{Existence, Kernel, Liveness, PidfdTarget, ProcView, ProcessId, ViewUnreadable};
@@ -33,7 +33,7 @@ pub(crate) fn open_verified_with(kernel: &dyn Kernel, id: ProcessId) -> Result<O
         id.pid()
     );
     let raw = Pid::from_raw(id.pid() as i32).expect("a resolvable ProcessId is never pid 0");
-    match kernel.pidfd_open(raw) {
+    match kernel.pidfd_open(raw, PidfdFlags::empty()) {
         Ok(pidfd) => verify_pidfd_target(kernel, id, pidfd),
         Err(rustix::io::Errno::SRCH) => Ok(None),
         // pidfd_open needs a pid that resolves to a thread-group leader task. EINVAL (< 6.16) /
@@ -53,7 +53,7 @@ pub(crate) fn open_verified_with(kernel: &dyn Kernel, id: ProcessId) -> Result<O
 
 /// The name of `errno` if `pidfd_open` answering it is a refusal: no pidfd is possible here.
 /// The classification is documented on [`Error::Unsupported`].
-fn refusal_name(errno: rustix::io::Errno) -> Option<&'static str> {
+pub(crate) fn refusal_name(errno: rustix::io::Errno) -> Option<&'static str> {
     match errno {
         rustix::io::Errno::NOSYS => Some("ENOSYS"),
         rustix::io::Errno::PERM => Some("EPERM"),
@@ -63,7 +63,7 @@ fn refusal_name(errno: rustix::io::Errno) -> Option<&'static str> {
     }
 }
 
-fn pidfd_open_unsupported(op: &str, errno_name: &str) -> Error {
+pub(crate) fn pidfd_open_unsupported(op: &str, errno_name: &str) -> Error {
     Error::Unsupported {
         op: op.into(),
         platform: "linux",
@@ -91,7 +91,7 @@ pub(crate) fn spawn_open_error(errno: rustix::io::Errno) -> Error {
 /// can be installed after the first spawn.
 pub(crate) fn probe_pidfd_support_with(kernel: &dyn Kernel) -> Result<(), Error> {
     kernel
-        .pidfd_open(rustix::process::getpid())
+        .pidfd_open(rustix::process::getpid(), PidfdFlags::empty())
         .map(drop)
         .map_err(spawn_open_error)
 }

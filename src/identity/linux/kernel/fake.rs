@@ -4,11 +4,11 @@
 //! Rows are plain data: a path or pid is looked up by `==`, and a later row replaces an earlier one.
 
 use std::io;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::sync::Mutex;
 
 use rustix::io::Errno;
-use rustix::process::Pid;
+use rustix::process::{Pid, PidfdFlags};
 
 use super::Kernel;
 use crate::identity::{ProcDir, ViewUnreadable};
@@ -25,15 +25,30 @@ pub(crate) struct FakeKernel<'a> {
     /// The listing of any `/proc`: the pids, or a raw errno.
     pids: Option<Result<Vec<u32>, i32>>,
     signal_probes: Vec<(Pid, Result<(), Errno>)>,
-    pidfd_opens: Vec<(Pid, PidfdRow)>,
+    /// A pid, the flags the row answers (`None`: any), and the answer.
+    pidfd_opens: Vec<(Pid, Option<PidfdFlags>, PidfdRow)>,
+    /// A pid, the path whose earlier read the row waits for (`None`: no wait), and the answer.
+    pidfs_inos: Vec<(Pid, Option<String>, Result<Option<u64>, Errno>)>,
+    /// The descriptors this kernel has handed out, so that `pidfs_ino` can tell whose they are.
+    opened: Mutex<Vec<Opened>>,
 }
 
-/// What a `pidfd_open` row answers.
+/// A pidfd this kernel opened: its number, the pid, and how many times each path had been read then.
+struct Opened {
+    fd: RawFd,
+    pid: Pid,
+    reads: Vec<(String, usize)>,
+}
+
+/// What a `pidfd_open` row answers, on every call.
 enum PidfdRow {
-    /// Every call.
     Errno(Errno),
-    /// The first call hands the fd out; a second panics.
-    Fd(Mutex<Option<OwnedFd>>),
+    /// The first call hands out the test's own fd, whose number the test may have stated rows
+    /// about; each later one a duplicate of it.
+    Fd {
+        first: Mutex<Option<OwnedFd>>,
+        spare: OwnedFd,
+    },
 }
 
 impl<'a> FakeKernel<'a> {
@@ -47,6 +62,8 @@ impl<'a> FakeKernel<'a> {
             pids: None,
             signal_probes: Vec::new(),
             pidfd_opens: Vec::new(),
+            pidfs_inos: Vec::new(),
+            opened: Mutex::new(Vec::new()),
         }
     }
 
@@ -119,16 +136,46 @@ impl<'a> FakeKernel<'a> {
         self
     }
 
-    /// `pidfd_open` of `pid` answers `answer`. An errno answers every call. An fd the test opened
-    /// itself is handed out once, because an `OwnedFd` has no copy with the same number.
-    pub(crate) fn on_pidfd_open(mut self, pid: u32, answer: Result<OwnedFd, Errno>) -> Self {
-        let target = Pid::from_raw(pid as i32).expect("a pidfd_open row names a positive pid");
+    /// `pidfd_open` of `pid`, with any flags, answers `answer` on every call. An fd the test opened
+    /// itself is handed out as it is on the first call, and as a duplicate of it on each later one.
+    pub(crate) fn on_pidfd_open(self, pid: u32, answer: Result<OwnedFd, Errno>) -> Self {
+        self.pidfd_open_row(pid, None, answer)
+    }
+
+    /// [`on_pidfd_open`](Self::on_pidfd_open) for opens with exactly `flags`.
+    pub(crate) fn on_pidfd_open_flags(self, pid: u32, flags: PidfdFlags, answer: Result<OwnedFd, Errno>) -> Self {
+        self.pidfd_open_row(pid, Some(flags), answer)
+    }
+
+    fn pidfd_open_row(mut self, pid: u32, flags: Option<PidfdFlags>, answer: Result<OwnedFd, Errno>) -> Self {
+        let target = Self::target(pid);
         let row = match answer {
-            Ok(fd) => PidfdRow::Fd(Mutex::new(Some(fd))),
+            Ok(fd) => PidfdRow::Fd {
+                spare: fd.try_clone().expect("the row's fd duplicates"),
+                first: Mutex::new(Some(fd)),
+            },
             Err(errno) => PidfdRow::Errno(errno),
         };
-        self.pidfd_opens.push((target, row));
+        self.pidfd_opens.push((target, flags, row));
         self
+    }
+
+    /// A pidfd this kernel opened for `pid` has `pidfs_ino` `answer`: `Some(inode)` on pidfs, `None`
+    /// on a kernel whose pidfds have none, or an errno.
+    pub(crate) fn on_pidfs_ino(mut self, pid: u32, answer: Result<Option<u64>, Errno>) -> Self {
+        self.pidfs_inos.push((Self::target(pid), None, answer));
+        self
+    }
+
+    /// [`on_pidfs_ino`](Self::on_pidfs_ino) for the pidfds of `pid` opened after `path` was read
+    /// once: from then on this row answers in place of the plain one.
+    pub(crate) fn on_pidfs_ino_after_read(mut self, pid: u32, path: &str, answer: Result<Option<u64>, Errno>) -> Self {
+        self.pidfs_inos.push((Self::target(pid), Some(path.to_owned()), answer));
+        self
+    }
+
+    fn target(pid: u32) -> Pid {
+        Pid::from_raw(pid as i32).expect("a row names a positive pid")
     }
 
     /// Opening `/proc` fails as its `openat2` answering `errno`.
@@ -158,15 +205,45 @@ impl<'a> FakeKernel<'a> {
 }
 
 impl Kernel for FakeKernel<'_> {
-    fn pidfd_open(&self, target: Pid) -> Result<OwnedFd, Errno> {
-        match self.pidfd_opens.iter().rev().find(|(p, _)| *p == target) {
-            Some((_, PidfdRow::Errno(errno))) => Err(*errno),
-            Some((_, PidfdRow::Fd(slot))) => Ok(slot
-                .lock()
-                .expect("no panic holds the row")
-                .take()
-                .unwrap_or_else(|| panic!("FakeKernel hands the pidfd of {target:?} out once"))),
-            None => self.real(&format!("pidfd_open of {target:?}")).pidfd_open(target),
+    fn pidfd_open(&self, target: Pid, flags: PidfdFlags) -> Result<OwnedFd, Errno> {
+        let row = self
+            .pidfd_opens
+            .iter()
+            .rev()
+            .find(|(p, row_flags, _)| *p == target && row_flags.is_none_or(|f| f == flags));
+        let opened = match row {
+            Some((_, _, PidfdRow::Errno(errno))) => return Err(*errno),
+            Some((_, _, PidfdRow::Fd { first, spare })) => {
+                let first = first.lock().expect("no panic holds the row").take();
+                first.unwrap_or_else(|| spare.try_clone().expect("the row's fd duplicates"))
+            }
+            None => self
+                .real(&format!("pidfd_open of {target:?}"))
+                .pidfd_open(target, flags)?,
+        };
+        let reads = self.read_counts.lock().expect("no panic holds the counts").clone();
+        self.opened.lock().expect("no panic holds the opens").push(Opened {
+            fd: opened.as_raw_fd(),
+            pid: target,
+            reads,
+        });
+        Ok(opened)
+    }
+
+    fn pidfs_ino(&self, fd: BorrowedFd<'_>) -> Result<Option<u64>, Errno> {
+        let raw = fd.as_raw_fd();
+        let opened = self.opened.lock().expect("no panic holds the opens");
+        let Some(open) = opened.iter().rev().find(|o| o.fd == raw) else {
+            return self.real("pidfs_ino of a descriptor it did not open").pidfs_ino(fd);
+        };
+        let read_before_open = |path: &str| open.reads.iter().any(|(p, n)| p == path && *n > 0);
+        let rows = || self.pidfs_inos.iter().rev().filter(|(p, _, _)| *p == open.pid);
+        let row = rows()
+            .find(|(_, after, _)| after.as_deref().is_some_and(read_before_open))
+            .or_else(|| rows().find(|(_, after, _)| after.is_none()));
+        match row {
+            Some((_, _, answer)) => *answer,
+            None => self.real(&format!("pidfs_ino of {:?}", open.pid)).pidfs_ino(fd),
         }
     }
 

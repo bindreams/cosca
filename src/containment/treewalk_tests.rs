@@ -3,14 +3,14 @@
 //! closure drive `descendants_with` against BOTH `allow_equal` rules.
 
 use super::descendants_with;
-use crate::identity::{OrderKey, ProcessId, RawPid};
+use crate::identity::{Key, OrderKey, ProcessId, RawPid};
 use std::collections::HashMap;
 
 const ROOT_PID: RawPid = 100;
 const ROOT_TOKEN: u64 = 1_000;
 
 fn id(pid: RawPid, token: u64) -> ProcessId {
-    ProcessId::from_parts_for_test(pid, token)
+    ProcessId::from_parts_for_test(pid, Key::for_test(token))
 }
 
 /// What the live resolver returns for a process whose identity token and order key agree.
@@ -169,7 +169,7 @@ fn children_of_keeps_one_level_genuine_children_only() {
     use super::{children_of_with, ALLOW_EQUAL_ORDER};
     // root 100/tok50; direct child 101/tok60 (genuine, tok>root); grandchild 102 (ppid
     // 101, not one level); impostor 103 ppid 100 tok40 (created before root => excluded).
-    let root = ProcessId::from_parts_for_test(100, 50);
+    let root = id(100, 50);
     let parents = [(101, 100), (102, 101), (103, 100)];
     let resolve = |pid: u32| match pid {
         101 => Some(resolved(101, 60)),
@@ -191,7 +191,7 @@ fn children_of_same_tick_child_depends_on_allow_equal() {
     use super::children_of_with;
     // Direct child 101 whose token EQUALS the parent's: kept under allow_equal=true,
     // excluded under false — proves children_of_with threads allow_equal to keeps_order.
-    let root = ProcessId::from_parts_for_test(100, ROOT_TOKEN);
+    let root = id(100, ROOT_TOKEN);
     let parents = [(101, 100)];
     let resolve = |pid: u32| (pid == 101).then(|| resolved(101, ROOT_TOKEN));
     assert_eq!(
@@ -212,7 +212,7 @@ fn children_of_duplicate_edge_yields_pid_once() {
     use super::children_of_with;
     // A snapshot listing the same (pid, ppid) edge twice must not enumerate (or later
     // double-kill) the same child twice.
-    let root = ProcessId::from_parts_for_test(100, ROOT_TOKEN);
+    let root = id(100, ROOT_TOKEN);
     let parents = [(101, 100), (101, 100)];
     let resolve = |pid: u32| (pid == 101).then(|| resolved(101, ROOT_TOKEN + 1));
     assert_eq!(
@@ -337,7 +337,7 @@ fn kill_by_identity_spares_a_stale_identity_and_kills_a_matching_one() {
         crate::identity::windows_fixture::spawn_restricted_releasable(&done, PROCESS_QUERY_LIMITED_INFORMATION.0);
     let real = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
         .expect("the owned handle always yields an identity");
-    let stale = crate::identity::ProcessId::from_parts_for_test(real.pid(), real.start_token_raw() ^ 1);
+    let stale = real.with_other_value();
 
     assert_eq!(
         super::kill_by_identity(stale),

@@ -526,7 +526,8 @@ fn converge_re_verifies_a_member_through_its_kernel() {
 }
 
 /// A member the kernel shows as another process (its pid's new owner) is not alive, so the pass
-/// attempts nothing on it: the root is not even checked. Mutant: "the liveness look reads through
+/// attempts nothing on it: the root is not even checked. The new owner shows from the third read of
+/// the `stat`: after the scan's and the identity's. Mutant: "the liveness look reads through
 /// `HostKernel`".
 #[cfg(target_os = "linux")]
 #[skuld::test]
@@ -537,7 +538,7 @@ fn converge_looks_at_a_members_liveness_through_its_kernel() {
 
     let kernel = FakeKernel::over(&HostKernel).on_read_after(
         &format!("{pid}/stat"),
-        1,
+        2,
         Ok(&crate::test_child::stat_of_a_new_owner(pid)),
     );
     let checks = std::cell::Cell::new(0);

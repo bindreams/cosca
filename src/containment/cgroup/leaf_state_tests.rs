@@ -159,10 +159,12 @@ impl Drop for KillOnDrop {
     }
 }
 
-/// A pidfd that cannot be polled says nothing about the child: no state, not "exited".
+/// A pidfd that cannot be polled says nothing about the child: no state, not "exited". A closed
+/// descriptor breaks the owned-fd contract of the poll, which debug builds assert.
 ///
 /// Mutant: any ready poll reads as exit (`POLLNVAL` included).
 #[skuld::test]
+#[cfg_attr(debug_assertions, should_panic(expected = "POLLNVAL"))]
 fn a_pidfd_that_cannot_be_polled_gives_no_state() {
     use std::os::fd::{AsRawFd, BorrowedFd};
 

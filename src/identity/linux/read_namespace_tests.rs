@@ -59,7 +59,7 @@ fn fixture_outer_procfs_inner() {
     let current = ProcessId::current();
     assert_eq!(current.pid(), 1);
     assert_eq!(
-        current.start_token_raw(),
+        current.key().ticks(),
         own,
         "current() must carry this process's own token"
     );

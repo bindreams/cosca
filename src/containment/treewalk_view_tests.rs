@@ -17,7 +17,7 @@ use crate::Recursive;
 /// children of the pid's new owner.
 fn stale_root() -> ProcessId {
     let me = ProcessId::current();
-    ProcessId::from_parts_for_test(me.pid(), me.start_token_raw().wrapping_sub(1))
+    me.with_other_value()
 }
 
 fn assert_unassessable_naming(result: Result<(), Error>, causes: &[&str]) {

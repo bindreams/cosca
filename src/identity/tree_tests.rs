@@ -71,7 +71,7 @@ fn parent_of_a_process_whose_parent_is_access_denied_is_unassessable_naming_the_
 #[skuld::test]
 fn parent_and_children_of_a_gone_anchor_are_ok_and_empty() {
     let real = ProcessId::current();
-    let stale = ProcessId::from_parts_for_test(real.pid(), real.start_token_raw().wrapping_add(1));
+    let stale = real.with_other_value();
     assert!(matches!(stale.parent(), Ok(None)));
     for recursive in [Recursive::No, Recursive::Yes] {
         assert_eq!(stale.children(recursive).expect("gone is not an error"), Vec::new());

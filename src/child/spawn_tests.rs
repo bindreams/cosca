@@ -1593,7 +1593,7 @@ fn resolve_identity_of_a_reaped_child_whose_pid_a_same_tick_reuser_holds_is_gone
     let reaped = waitid(WaitId::PidFd(std::os::fd::AsFd::as_fd(&pidfd)), WaitIdOptions::EXITED).expect("raw reap");
     assert!(reaped.is_some(), "the raw reap must consume an exit record");
 
-    let look_alike = stat_fixture("S", id.start_token_raw());
+    let look_alike = stat_fixture("S", id.key().ticks());
     let kernel = FakeKernel::over(&HostKernel)
         .same_view()
         .on_read(&format!("{pid}/stat"), Ok(&look_alike));

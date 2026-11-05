@@ -28,7 +28,7 @@
 
 use crate::error::{Error, RecordErrorKind};
 
-use super::{backend, ProcessId, RawPid, StartToken};
+use super::{backend, Key, ProcessId, RawPid};
 
 /// The record format this build writes. A reader rejects any version it does not know,
 /// so a future bump can change the fields' meaning safely. Within a version, changes are
@@ -287,7 +287,7 @@ fn record_from(id: &ProcessId, scope: Result<Scope, ScopeReadError>) -> Result<P
         version: RECORD_VERSION,
         platform: Platform::current(),
         pid: id.pid,
-        token: id.start.raw(),
+        token: id.key.raw(),
         boot_id: scope.boot_id,
         pid_ns: scope.pid_ns,
     })
@@ -303,7 +303,7 @@ fn restore(
     let (pid, token) = validate(record, here, &scope).map_err(|kind| reject(record, &scope, kind))?;
     Ok(ProcessId {
         pid,
-        start: StartToken::from_raw(token),
+        key: Key::restored(token, None),
     })
 }
 

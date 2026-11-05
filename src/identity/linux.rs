@@ -8,6 +8,8 @@ pub(crate) mod kernel;
 pub(crate) mod pid_stat;
 #[path = "linux/proc_view.rs"]
 pub(crate) mod proc_view;
+#[path = "linux/prove.rs"]
+pub(crate) mod prove;
 
 #[cfg(test)]
 #[path = "linux/fault.rs"]
@@ -21,6 +23,7 @@ mod read_tests;
 #[path = "linux/read_namespace_tests.rs"]
 mod read_namespace_tests;
 
+use std::os::fd::AsFd as _;
 use std::time::{Duration, SystemTime};
 
 use rustix::io::Errno;
@@ -28,9 +31,10 @@ use rustix::process::Pid;
 
 use self::kernel::Kernel;
 use self::proc_view::ProcDir;
+use self::prove::Proof;
 use super::probe::{classify_unreadable, SignalProbe};
 use super::stat_parse::parse_starttime_jiffies;
-use super::{Liveness, RawPid, Resolved, StartToken};
+use super::{Existence, Liveness, OrderKey, RawPid, Resolved, UnknownCause};
 use crate::error::Error;
 
 /// `kill(pid, 0)` — existence/permission check only, no signal delivered. The target
@@ -101,29 +105,116 @@ pub(super) fn signal_says_no_such_process(kernel: &dyn Kernel, pid: RawPid) -> b
     signal_probe(kernel, pid) == SignalProbe::NoSuchProcess
 }
 
-/// The start token of `pid`, and the unusable `/proc` view behind an `Unknown`, when that is why.
-pub(super) fn start_token_explained(
-    kernel: &dyn Kernel,
-    pid: RawPid,
-) -> (Resolved<StartToken>, Option<proc_view::ViewUnreadable>) {
-    let (stat, cause) = read_stat_explained(kernel, pid);
-    (start_token_from(pid, stat), cause)
+/// What makes a Linux process: `pidfs`, the inode of its pidfd, or, below Linux 6.9 where pidfds
+/// have no inode of their own, the `starttime` ticks `/proc` shows. Two ids of different kinds never
+/// compare equal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum Key {
+    Pidfs(u64),
+    Ticks(u64),
 }
 
-/// [`start_token_explained`], read through the `/proc` at `proc_dir`.
-pub(super) fn start_token_in(kernel: &dyn Kernel, proc_dir: &ProcDir, pid: RawPid) -> Resolved<StartToken> {
-    start_token_from(pid, stat_by_pid(kernel, proc_dir, pid))
+impl Key {
+    /// The value, whichever the kind.
+    pub(super) fn raw(self) -> u64 {
+        match self {
+            Key::Pidfs(v) | Key::Ticks(v) => v,
+        }
+    }
+
+    /// A key restored from a record's `token`.
+    pub(super) fn restored(token: u64, _kind: Option<&str>) -> Key {
+        Key::Ticks(token)
+    }
+
+    /// The `Ticks` key of `v`: this backend's default kind, for tests that run on every platform.
+    #[cfg(test)]
+    pub(crate) fn for_test(v: u64) -> Key {
+        Key::Ticks(v)
+    }
+
+    /// The ticks of a `Ticks` key, for a test that states them in a `stat` it fakes.
+    #[cfg(test)]
+    pub(crate) fn ticks(self) -> u64 {
+        match self {
+            Key::Ticks(v) => v,
+            Key::Pidfs(_) => panic!("{self:?} has no ticks"),
+        }
+    }
+
+    /// The same kind with another value.
+    #[cfg(test)]
+    pub(super) fn other_value(self) -> Key {
+        match self {
+            Key::Pidfs(v) => Key::Pidfs(v.wrapping_add(1)),
+            Key::Ticks(v) => Key::Ticks(v.wrapping_add(1)),
+        }
+    }
 }
 
-fn start_token_from(pid: RawPid, stat: Resolved<Vec<u8>>) -> Resolved<StartToken> {
+/// The identity of `pid`, and the unusable `/proc` view behind an `Unknown`, when that is why.
+pub(super) fn of(kernel: &dyn Kernel, pid: RawPid) -> (Resolved<Key>, UnknownCause) {
+    let (stat, view) = read_stat_explained(kernel, pid);
+    (ticks_from(pid, stat).map(Key::Ticks), UnknownCause::of_view(view))
+}
+
+/// [`of`], and a `stat` record that is that process's own.
+pub(super) fn of_stat(kernel: &dyn Kernel, pid: RawPid) -> (Resolved<(Key, Vec<u8>)>, UnknownCause) {
+    let (stat, view) = read_stat_explained(kernel, pid);
+    let bytes = match &stat {
+        Resolved::Found(bytes) => bytes.clone(),
+        _ => Vec::new(),
+    };
+    (
+        ticks_from(pid, stat).map(|ticks| (Key::Ticks(ticks), bytes)),
+        UnknownCause::of_view(view),
+    )
+}
+
+/// Whether the process `key` names still holds `pid`.
+pub(super) fn exists(kernel: &dyn Kernel, pid: RawPid, key: Key) -> (Existence, UnknownCause) {
+    match key {
+        Key::Ticks(ticks) => {
+            let (stat, view) = read_stat_explained(kernel, pid);
+            (
+                existence_of_ticks(ticks_from(pid, stat), ticks),
+                UnknownCause::of_view(view),
+            )
+        }
+        Key::Pidfs(ino) => match prove::prove(kernel, pid, ino) {
+            Proof::Holds { .. } => (Existence::Present, UnknownCause::default()),
+            Proof::Lost => (Existence::Gone, UnknownCause::default()),
+            Proof::Unknown(cause) => (Existence::Unknown, cause),
+        },
+    }
+}
+
+/// [`exists`], reading through the `/proc` at `proc_dir`: a `Pidfs` id needs no `/proc`.
+pub(super) fn exists_in(kernel: &dyn Kernel, proc_dir: &ProcDir, pid: RawPid, key: Key) -> Existence {
+    match key {
+        Key::Ticks(ticks) => existence_of_ticks(ticks_from(pid, stat_by_pid(kernel, proc_dir, pid)), ticks),
+        Key::Pidfs(_) => exists(kernel, pid, key).0,
+    }
+}
+
+/// What `read`, the ticks now at the pid, says about the process that had `ticks`.
+fn existence_of_ticks(read: Resolved<u64>, ticks: u64) -> Existence {
+    match read {
+        Resolved::Found(now) if now == ticks => Existence::Present,
+        Resolved::Found(_) | Resolved::Gone => Existence::Gone,
+        Resolved::Unknown => Existence::Unknown,
+    }
+}
+
+/// `pid`'s `starttime` ticks from `stat`: RAW jiffies, NOT converted to wall-clock.
+fn ticks_from(pid: RawPid, stat: Resolved<Vec<u8>>) -> Resolved<u64> {
     #[cfg(test)]
     if let Some(aliased) = fault::on_read(pid, matches!(stat, Resolved::Found(_))) {
-        return Resolved::Found(aliased);
+        return Resolved::Found(aliased.raw());
     }
     match stat {
-        // RAW jiffies are the identity token — NOT converted to wall-clock.
         Resolved::Found(stat) => match parse_starttime_jiffies(&stat) {
-            Some(j) => Resolved::Found(StartToken::from_raw(j)),
+            Some(j) => Resolved::Found(j),
             // Reachable when a task exits mid-read and the kernel hands back a truncated
             // buffer, so this must not be an assertion.
             None => {
@@ -136,26 +227,51 @@ fn start_token_from(pid: RawPid, stat: Resolved<Vec<u8>>) -> Resolved<StartToken
     }
 }
 
-pub(super) fn is_running(kernel: &dyn Kernel, pid: RawPid, start: StartToken) -> Liveness {
-    liveness_of(read_stat(kernel, pid), start)
+/// When `pid` started, for ordering: the ticks.
+pub(super) fn order_key(kernel: &dyn Kernel, pid: RawPid, key: Key) -> (Resolved<OrderKey>, UnknownCause) {
+    let _ = (kernel, pid);
+    (Resolved::Found(OrderKey(key.raw())), UnknownCause::default())
 }
 
-/// [`is_running`], read through the `/proc` at `proc_dir`.
-pub(super) fn is_running_in(kernel: &dyn Kernel, proc_dir: &ProcDir, pid: RawPid, start: StartToken) -> Liveness {
-    liveness_of(stat_by_pid(kernel, proc_dir, pid), start)
+pub(super) fn is_running(kernel: &dyn Kernel, pid: RawPid, key: Key) -> Liveness {
+    match key {
+        Key::Ticks(ticks) => liveness_of(read_stat(kernel, pid), ticks),
+        // The pidfd polls readable once the process has exited, a zombie included, and not before:
+        // `/proc` shows `Z` for a live process whose leader thread exited, its pidfd does not.
+        Key::Pidfs(ino) => match prove::prove(kernel, pid, ino) {
+            Proof::Holds { fd, .. } => match crate::os_process::poll::is_readable(fd.as_fd()) {
+                Ok(true) => Liveness::Dead,
+                Ok(false) => Liveness::Alive,
+                Err(e) => {
+                    log::debug!("the pidfd of pid {pid} could not be polled: {e}");
+                    Liveness::Unknown
+                }
+            },
+            Proof::Lost => Liveness::Dead,
+            Proof::Unknown(_) => Liveness::Unknown,
+        },
+    }
 }
 
-fn liveness_of(stat: Resolved<Vec<u8>>, start: StartToken) -> Liveness {
+/// [`is_running`], read through the `/proc` at `proc_dir`: a `Pidfs` id needs no `/proc`.
+pub(super) fn is_running_in(kernel: &dyn Kernel, proc_dir: &ProcDir, pid: RawPid, key: Key) -> Liveness {
+    match key {
+        Key::Ticks(ticks) => liveness_of(stat_by_pid(kernel, proc_dir, pid), ticks),
+        Key::Pidfs(_) => is_running(kernel, pid, key),
+    }
+}
+
+fn liveness_of(stat: Resolved<Vec<u8>>, ticks: u64) -> Liveness {
     match stat {
-        Resolved::Found(stat) => super::stat_parse::running_from_stat(&stat, start),
+        Resolved::Found(stat) => super::stat_parse::running_from_stat(&stat, ticks),
         Resolved::Gone => Liveness::Dead,
         Resolved::Unknown => Liveness::Unknown,
     }
 }
 
-/// Our own start token, read from `self`.
+/// Our own key.
 ///
-/// `ProcessId` is the pair `(std::process::id(), token)`. Under an outer namespace's `/proc`
+/// `ProcessId` is the pair `(std::process::id(), key)`. Under an outer namespace's `/proc`
 /// (`unshare --pid --fork` without `--mount-proc`: `getpid()` is 1, `/proc/1` is another
 /// process) `/proc/<getpid()>` names someone else, but the kernel resolves `self` for the reader.
 /// A plain read, so it needs neither `openat2` nor a `/proc` view; the by-pid re-reads
@@ -163,9 +279,9 @@ fn liveness_of(stat: Resolved<Vec<u8>>, start: StartToken) -> Liveness {
 ///
 /// `hidepid` never hides a task from itself, so a failure here is not a foreign-pid outcome: it
 /// is logged at `error`, and [`ProcessId::current`](super::ProcessId::current) panics on it.
-pub(super) fn current_token() -> Resolved<StartToken> {
+pub(super) fn current_key(_kernel: &dyn Kernel) -> Resolved<Key> {
     match std::fs::read("/proc/self/stat") {
-        Ok(stat) => start_token_from(std::process::id(), Resolved::Found(stat)),
+        Ok(stat) => ticks_from(std::process::id(), Resolved::Found(stat)).map(Key::Ticks),
         Err(e) => {
             log::error!("own start token unreadable: /proc/self/stat: {e}");
             Resolved::Unknown
@@ -181,6 +297,19 @@ pub(crate) fn view_error(subject: &str, why: proc_view::ViewUnreadable) -> Error
         .unwrap_or_else(|| unassessable_view(subject, &why.reason, why.source))
 }
 
+/// The error for a by-pid identity read of `subject` that a failed pidfd call (`errno`) made
+/// `Unknown`: [`Error::Unsupported`] when the call was refused, else [`Error::Unassessable`]
+/// carrying the errno.
+pub(crate) fn errno_error(subject: &str, errno: Errno) -> Error {
+    match crate::os_process::linux::open::refusal_name(errno) {
+        Some(name) => crate::os_process::linux::open::pidfd_open_unsupported(&format!("identifying {subject}"), name),
+        None => Error::Unassessable {
+            detail: format!("{subject} identity could not be read: {errno}"),
+            source: Some(std::io::Error::from(errno)),
+        },
+    }
+}
+
 fn unassessable_view(subject: &str, reason: &str, source: Option<std::io::Error>) -> Error {
     let mut detail = format!("{subject} identity could not be read: {reason}");
     if let Some(source) = &source {
@@ -189,8 +318,9 @@ fn unassessable_view(subject: &str, reason: &str, source: Option<std::io::Error>
     Error::Unassessable { detail, source }
 }
 
-pub(super) fn created_at(start: StartToken) -> Option<SystemTime> {
-    let jiffies = start.raw();
+pub(super) fn created_at(kernel: &dyn Kernel, pid: RawPid, key: Key) -> Option<SystemTime> {
+    let _ = (kernel, pid);
+    let jiffies = key.raw();
     let hz = clock_ticks_per_sec()?;
     let btime = boot_time_secs()?;
     let secs = btime + jiffies / hz;

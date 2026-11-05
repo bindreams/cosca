@@ -107,11 +107,7 @@ pub(crate) fn reuser_id(
     id: crate::identity::ProcessId,
     same_tick: bool,
 ) -> crate::identity::Resolved<crate::identity::ProcessId> {
-    let raw = id.start_token_raw();
-    crate::identity::Resolved::Found(crate::identity::ProcessId::from_parts_for_test(
-        id.pid(),
-        if same_tick { raw } else { raw + 1 },
-    ))
+    crate::identity::Resolved::Found(if same_tick { id } else { id.with_other_value() })
 }
 
 /// [`sigusr1_and_wait`] without consuming the exit: sends `SIGUSR1`, then waits on a pidfd until the

@@ -21,7 +21,7 @@ fn current_opens_and_is_alive() {
 #[skuld::test]
 fn open_of_a_recycled_identity_is_none() {
     let real = ProcessId::current();
-    let stale = ProcessId::from_parts_for_test(real.pid(), real.start_token_raw().wrapping_add(1));
+    let stale = real.with_other_value();
     assert!(Process::open(stale)
         .expect("a stale identity is not an error")
         .is_none());

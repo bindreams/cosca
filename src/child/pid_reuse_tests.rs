@@ -68,7 +68,7 @@ fn treewalk_root_is_the_verified_identity_body() {
 
     use crate::child::spawn::fault;
     use crate::identity::fault::alias_token;
-    use crate::identity::{ProcessId, Resolved, StartToken};
+    use crate::identity::{ProcessId, Resolved};
 
     let (stdin, writer) = crate::test_child::held_writer_stdin();
     let mut cmd = Command::new();
@@ -88,7 +88,7 @@ fn treewalk_root_is_the_verified_identity_body() {
             drop(writer);
             let reuser = reap_behind_and_reuse(pid);
             // A reuse in a later clock tick, whichever tick the reuser really started in.
-            let token = StartToken::from_raw(id.start_token_raw() + 1);
+            let token = id.with_other_value().key();
             *alias.borrow_mut() = Some(Box::new(alias_token(reuser.id(), token)));
             *stranger.borrow_mut() = Some(reuser);
         }

@@ -10,7 +10,7 @@ use super::signal_probe;
 use crate::error::Error;
 use crate::identity::probe::SignalProbe;
 use crate::identity::stat_parse::stat_fixture;
-use crate::identity::{Existence, FakeKernel, HostKernel, Liveness, ProcessId, Resolved};
+use crate::identity::{Existence, FakeKernel, HostKernel, Key, Liveness, ProcessId, Resolved};
 
 /// Above `PID_MAX_LIMIT` (2^22) yet a valid positive `kill` target, so `kill(pid, 0)` answers `ESRCH`.
 pub(super) const NO_PROCESS_CAN_HOLD: u32 = i32::MAX as u32;
@@ -66,7 +66,7 @@ fn exists_and_is_alive_are_unknown_for_a_live_process_when_the_view_is_unavailab
 /// Mutant: "`exists`/`is_alive` ask `/proc` only, so an unavailable view hides an `ESRCH`".
 #[skuld::test]
 fn exists_and_is_alive_are_gone_and_dead_for_a_pid_no_process_can_hold_whatever_the_view() {
-    let id = ProcessId::from_parts_for_test(NO_PROCESS_CAN_HOLD, 1);
+    let id = ProcessId::from_parts_for_test(NO_PROCESS_CAN_HOLD, Key::for_test(1));
     for (name, kernel) in unavailable_views() {
         let kernel = kernel.on_signal_probe(NO_PROCESS_CAN_HOLD_TARGET, Err(Errno::SRCH));
         assert_eq!(id.exists_with(&kernel).0, Existence::Gone, "{name}");
@@ -107,7 +107,7 @@ fn a_stat_that_cannot_be_read_is_gone_only_when_kill_says_esrch() {
         .same_view()
         .on_read(&format!("{PID}/stat"), Ok(&stat_fixture("S", 424242)));
     match ProcessId::of_with(&found, PID).0 {
-        Resolved::Found(id) => assert_eq!(id.start_token_raw(), 424242),
+        Resolved::Found(id) => assert_eq!(id.key(), Key::for_test(424242)),
         other => panic!("a readable stat must resolve, got {other:?}"),
     }
 }
@@ -168,52 +168,4 @@ fn no_error_is_blamed_on_a_fine_view() {
     let (got, cause) = ProcessId::of_with(&kernel, 4242);
     assert!(matches!(got, Resolved::Unknown), "got {got:?}");
     assert!(cause.into_error("the spawned child").is_none());
-}
-
-/// An armed alias answers only a read that found a `stat`: it never turns `Gone` into `Found`.
-#[skuld::test]
-fn alias_token_aliases_only_a_found_stat() {
-    use super::fault::alias_token;
-    use super::start_token_from;
-    use crate::identity::StartToken;
-
-    const PID: u32 = 4242;
-    let aliased = StartToken::from_raw(7);
-    let _armed = alias_token(PID, aliased);
-
-    assert!(matches!(start_token_from(PID, Resolved::Gone), Resolved::Gone));
-    assert!(matches!(start_token_from(PID, Resolved::Unknown), Resolved::Unknown));
-    match start_token_from(PID, Resolved::Found(stat_fixture("S", 424242))) {
-        Resolved::Found(t) => assert_eq!(t, aliased, "a found stat answers the alias"),
-        other => panic!("a found stat must resolve, got {other:?}"),
-    }
-    // Another pid is untouched.
-    match start_token_from(PID + 1, Resolved::Found(stat_fixture("S", 424242))) {
-        Resolved::Found(t) => assert_eq!(t, StartToken::from_raw(424242)),
-        other => panic!("got {other:?}"),
-    }
-}
-
-/// Dropping the guard ends the alias, and only its own pid's. Mutant: `AliasGuard::drop` removes
-/// nothing, or every pid's alias.
-#[skuld::test]
-fn dropping_the_alias_guard_ends_that_alias_only() {
-    use super::fault::alias_token;
-    use super::start_token_from;
-    use crate::identity::StartToken;
-
-    let read = |pid| match start_token_from(pid, Resolved::Found(stat_fixture("S", 424242))) {
-        Resolved::Found(t) => t,
-        other => panic!("a found stat must resolve, got {other:?}"),
-    };
-    let first = alias_token(4343, StartToken::from_raw(1));
-    let _second = alias_token(4344, StartToken::from_raw(2));
-    assert_eq!(read(4343), StartToken::from_raw(1));
-    drop(first);
-    assert_eq!(
-        read(4343),
-        StartToken::from_raw(424242),
-        "the dropped guard's alias is gone"
-    );
-    assert_eq!(read(4344), StartToken::from_raw(2), "another pid's alias stays armed");
 }
