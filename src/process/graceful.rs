@@ -48,7 +48,12 @@ impl Process {
     /// [`Error::Unassessable`] when the process table cannot be read: nothing is killed, the root
     /// included.
     pub fn kill_tree(&self) -> Result<(), Error> {
-        crate::containment::treewalk::hard_kill(self.id).map(|_| ())
+        self.kill_tree_with(&crate::identity::HostKernel)
+    }
+
+    /// [`kill_tree`](Self::kill_tree), reading through `kernel`.
+    pub(crate) fn kill_tree_with(&self, kernel: &dyn crate::identity::Kernel) -> Result<(), Error> {
+        crate::containment::treewalk::hard_kill(kernel, self.id).map(|_| ())
     }
 
     /// Best-effort graceful (`SIGTERM`) sweep of the foreign process's tree (identity-walk, root
@@ -61,13 +66,18 @@ impl Process {
     ///
     /// [`Error::Unassessable`] when the process table cannot be read: nothing is signalled.
     pub fn terminate_tree(&self) -> Result<(), Error> {
+        self.terminate_tree_with(&crate::identity::HostKernel)
+    }
+
+    /// [`terminate_tree`](Self::terminate_tree), reading through `kernel`.
+    pub(crate) fn terminate_tree_with(&self, kernel: &dyn crate::identity::Kernel) -> Result<(), Error> {
         #[cfg(unix)]
         {
-            crate::containment::treewalk::terminate(self.id)
+            crate::containment::treewalk::terminate(kernel, self.id)
         }
         #[cfg(windows)]
         {
-            let _ = self.id;
+            let _ = (kernel, self.id);
             Err(Error::Unsupported {
                 op: "foreign tree graceful terminate".into(),
                 platform: "windows",
@@ -79,7 +89,7 @@ impl Process {
         }
         #[cfg(not(any(unix, windows)))]
         {
-            let _ = self.id;
+            let _ = (kernel, self.id);
             Ok(())
         }
     }
