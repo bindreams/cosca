@@ -78,6 +78,35 @@ fn an_unknown_root_with_a_refused_kill_warns_once() {
     );
 }
 
+/// The teardown of a root says what became of it under the caller's own name: a teardown after a
+/// failed run leads its `debug` reap line with that name, not a drop's.
+///
+/// Mutant: `Child::tear_down` leads the clause with `TeardownCaller::Drop.label()`, whoever called.
+#[skuld::test]
+fn a_roots_reap_is_said_under_the_name_of_the_caller_that_tore_it_down() {
+    use crate::containment::dispatch::TeardownCaller;
+
+    crate::log_capture::install();
+    let (mut child, writer) = bare_blocker();
+    let pid = child.id().pid();
+    let mark = crate::log_capture::mark();
+
+    let torn = child.tear_down(
+        TeardownCaller::FailedRun,
+        crate::child::owned::teardown::Disposition::Leave,
+    );
+
+    assert_eq!(torn.fate, crate::error::ChildFate::Reaped);
+    assert_eq!(
+        crate::log_capture::records_since_on_current_thread(mark, ""),
+        [(
+            log::Level::Debug,
+            format!("teardown after a failed run: teardown of child {pid}: reaped it after the kill")
+        )]
+    );
+    drop(writer);
+}
+
 /// A failed spawn's cleanup on an unknown root whose reap fails after the kill: the unknown state
 /// and the failed reap are one event, so one warn that names both.
 ///

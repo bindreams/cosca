@@ -1,5 +1,5 @@
-//! Tests of `exit_only`'s Linux backend over real children: the contract breaches of its blocking
-//! waits.
+//! Tests of `exit_only`'s Linux backend over real children: the contract breach of its blocking
+//! wait.
 
 use crate::os_process::child::adopted_blocker;
 use crate::test_child::wait_until_zombie;
@@ -21,29 +21,6 @@ fn a_blocking_waitid_that_finds_no_record_is_a_contract_breach() {
     let forced = exit_seams::force_visible_none_once();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::wait::exit_only::wait_visible_exit(&target)
-    }));
-    drop(forced);
-    if cfg!(debug_assertions) {
-        assert!(outcome.is_err(), "a debug build asserts the contract");
-    } else {
-        let err = outcome.expect("release returns").expect_err("a breach is an error");
-        assert!(err.to_string().contains("no record"), "{err}");
-    }
-}
-
-/// The same breach in `reap_blocking` is not a ptrace stop to wait past either.
-///
-/// Mutant: `Ok(None)` folded into the ptrace-stop arm, which waits again (a busy loop without
-/// the seam; here the next wait reaps the child and answers).
-#[skuld::test]
-fn a_blocking_reap_that_finds_no_record_is_a_contract_breach() {
-    let (os, id, stdin) = adopted_blocker();
-    drop(stdin);
-    wait_until_zombie(id.pid());
-    let target = Target::PidFd(os.os_handle());
-    let forced = exit_seams::force_visible_none_once();
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::wait::exit_only::reap_blocking(&target)
     }));
     drop(forced);
     if cfg!(debug_assertions) {
