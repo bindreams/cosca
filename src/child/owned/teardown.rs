@@ -48,11 +48,12 @@ pub(crate) enum Disposition {
 }
 
 impl Disposition {
-    /// Whether the caller hands back a child whose teardown ended with `fate`: it does under
-    /// [`HandBack`](Disposition::HandBack) when the child still runs. The one rule of every
+    /// Whether the caller hands back the child `torn` is the teardown of: it does under
+    /// [`HandBack`](Disposition::HandBack) when the teardown left the child
+    /// [uncollected](TeardownOutcome::uncollected), whatever its fate says. The one rule of every
     /// hand-back; the caller owns the child and builds the [`Unreaped`](crate::Unreaped).
-    pub(crate) fn hands_back(self, fate: &ChildFate) -> bool {
-        self == Disposition::HandBack && matches!(fate, ChildFate::Running { .. })
+    pub(crate) fn hands_back(self, torn: &TeardownOutcome) -> bool {
+        self == Disposition::HandBack && torn.uncollected
     }
 }
 
@@ -114,6 +115,12 @@ pub(crate) enum LookOutcome {
 #[derive(Debug)]
 pub(crate) struct TeardownOutcome {
     pub(crate) fate: ChildFate,
+    /// Whether the teardown left the child uncollected: still this process's, neither reaped by it
+    /// nor shown reaped elsewhere. It is the child the caller can hand back
+    /// ([`Disposition::hands_back`]). It is not [`fate`](Self::fate)'s to say: a refused kill whose
+    /// look failed is `Unknown`, and a kill whose wait failed is `Killed`, and both are uncollected,
+    /// while a `Killed` child someone else reaped is not.
+    pub(crate) uncollected: bool,
     /// How the look at an elevation front ([`TeardownKind::Look`]) went; `None` for a child killed.
     #[cfg_attr(windows, allow(dead_code, reason = "no Windows teardown looks at a front yet"))]
     pub(crate) look: Option<LookOutcome>,
@@ -121,19 +128,21 @@ pub(crate) struct TeardownOutcome {
 }
 
 impl TeardownOutcome {
-    /// A teardown with nothing to warn of.
+    /// A teardown that collected the child, with nothing to warn of.
     pub(crate) fn new(fate: ChildFate) -> TeardownOutcome {
         TeardownOutcome {
             fate,
+            uncollected: false,
             look: None,
             left: None,
         }
     }
 
-    /// A front's teardown, which went `look`.
-    fn of_front(fate: ChildFate, look: LookOutcome) -> TeardownOutcome {
+    /// A front's teardown, which went `look` and left it `uncollected` or not.
+    fn of_front(fate: ChildFate, look: LookOutcome, uncollected: bool) -> TeardownOutcome {
         TeardownOutcome {
             fate,
+            uncollected,
             look: Some(look),
             left: None,
         }
@@ -212,6 +221,7 @@ impl OwnedChild {
                 );
                 TeardownOutcome {
                     fate: foreign.fate(delivered),
+                    uncollected: false,
                     look: None,
                     left: (foreign == Foreign::Orphaned).then(|| orphaned_note(pid)),
                 }
@@ -222,6 +232,8 @@ impl OwnedChild {
                 } else {
                     ChildFate::Unknown
                 },
+                // The wait failed: the zombie, if there is one, is still ours.
+                uncollected: true,
                 look: None,
                 left: Some(format!(
                     "teardown of {}: the reap after the kill failed: {e}",
@@ -264,7 +276,15 @@ impl OwnedChild {
             )),
             _ => None,
         };
-        TeardownOutcome { fate, look: None, left }
+        // The look collects a child that has exited and finds one reaped elsewhere `Gone`; any other
+        // fate of a look is a child that is still ours and uncollected.
+        let uncollected = matches!(fate, ChildFate::Running { .. } | ChildFate::Unknown);
+        TeardownOutcome {
+            fate,
+            uncollected,
+            look: None,
+            left,
+        }
     }
 
     /// The look arm of [`tear_down`](Self::tear_down). A front that has exited is reaped. One that
@@ -279,17 +299,17 @@ impl OwnedChild {
         let pid = self.pid();
         let looked = match self.wait(Some(crate::wait::now())) {
             Ok(ChildWaitOutcome::Foreign(foreign)) => {
-                return TeardownOutcome::of_front(foreign.fate(false), LookOutcome::ReapedElsewhere);
+                return TeardownOutcome::of_front(foreign.fate(false), LookOutcome::ReapedElsewhere, false);
             }
             looked => looked.and_then(|outcome| status_of_outcome(pid, outcome, Orphaned::Quiet)),
         };
         match looked {
-            Ok(Some(status)) => TeardownOutcome::of_front(ChildFate::Reaped, LookOutcome::Reaped(status)),
-            Err(e) => TeardownOutcome::of_front(ChildFate::Unknown, LookOutcome::LookFailed(e)),
+            Ok(Some(status)) => TeardownOutcome::of_front(ChildFate::Reaped, LookOutcome::Reaped(status), false),
+            Err(e) => TeardownOutcome::of_front(ChildFate::Unknown, LookOutcome::LookFailed(e), true),
             Ok(None) => {
                 // The look saw it running; an unreadable reach leaves open only whether the kill
                 // reached it.
-                let running = |look| TeardownOutcome::of_front(ChildFate::Running { id }, look);
+                let running = |look| TeardownOutcome::of_front(ChildFate::Running { id }, look, true);
                 let reach = match reach {
                     Err(e) => return running(LookOutcome::SubtreeUnreadable(e)),
                     Ok(None) => return running(LookOutcome::LeftRunning),
@@ -304,13 +324,15 @@ impl OwnedChild {
                         #[cfg(test)]
                         crate::child::spawn::fault::run_between_kill_and_wait();
                         match wait_to_exit(self, due, Orphaned::Warn) {
-                            Ok(status) => TeardownOutcome::of_front(ChildFate::Reaped, LookOutcome::Reaped(status)),
+                            Ok(status) => {
+                                TeardownOutcome::of_front(ChildFate::Reaped, LookOutcome::Reaped(status), false)
+                            }
                             // The kill landed first: delivered, so `Killed`.
                             Err(WaitToExitError::Elsewhere(foreign)) => {
-                                TeardownOutcome::of_front(foreign.fate(true), LookOutcome::ReapedElsewhere)
+                                TeardownOutcome::of_front(foreign.fate(true), LookOutcome::ReapedElsewhere, false)
                             }
                             Err(WaitToExitError::Failed(e)) => {
-                                TeardownOutcome::of_front(ChildFate::Killed, LookOutcome::ReapFailed(e))
+                                TeardownOutcome::of_front(ChildFate::Killed, LookOutcome::ReapFailed(e), true)
                             }
                         }
                     }

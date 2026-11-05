@@ -770,8 +770,8 @@ fn cgroup_a_failed_password_write_terminates_a_front_that_refuses_signals(#[fixt
 }
 
 /// A failed password write whose cgroup kill fails refuses the front's kill as `kill` does,
-/// naming the failure, and sends the front nothing. The front then ends on its stdin, unsignalled,
-/// and the leaf the failed kill left behind is removed.
+/// naming the failure, and sends the front nothing. The front is handed back, ends on its stdin,
+/// unsignalled, and the leaf the failed kill left behind is removed.
 #[skuld::test]
 fn cgroup_a_failed_password_write_whose_cgroup_kill_fails_refuses_as_kill_does(#[fixture(cgroup)] _group: &Group) {
     let (child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
@@ -793,15 +793,18 @@ fn cgroup_a_failed_password_write_whose_cgroup_kill_fails_refuses_as_kill_does(#
         )
         .expect_err("a failed write fails the spawn")
     };
-    let (err, fate) = err.expect_may_have_started_with();
+    let (err, fate, unreaped) = err.expect_may_have_started_parts();
     assert_eq!(
         fate,
         crate::error::ChildFate::Running { id: Some(id) },
         "a front its cgroup kill did not end may be running"
     );
     assert_front_refused_by_its_cgroup_kill(&err, pid);
-    drop(stdin.take().expect("the teardown must not release the front"));
-    assert_reaped_unsignalled(pid);
+    let release = stdin.take().expect("the teardown must not release the front");
+    let handed_back = crate::test_child::HandedBack::new(release, unreaped);
+    handed_back.unreaped();
+    let status = handed_back.wait();
+    assert!(status.success(), "the front was signalled: {status:?}");
     std::fs::remove_dir(&leaf).unwrap_or_else(|e| panic!("remove the leaf {}: {e}", leaf.display()));
 }
 

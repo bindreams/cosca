@@ -13,9 +13,10 @@ use crate::os_process::child_named;
 
 /// A child a failed spawn, or a sync [`Command::status`](crate::Command::status),
 /// [`output`](crate::Command::output) or [`read`](crate::Command::read) that failed after it, could
-/// not end: its kill was refused (`EPERM`, `ACCESS_DENIED`), or, after one of those three calls, it is
-/// an elevation front, which is sent none; and it still runs. It comes back in
-/// [`Error::MayHaveStarted`], which the caller owns from then on.
+/// not end: its kill was refused (`EPERM`, `ACCESS_DENIED`), or it is an elevation front, which is
+/// sent none, or the wait for it failed after the kill; and it is not known to have been collected.
+/// Its fate in the error is then `Running`, or `Unknown` when the look at it failed, or `Killed` when
+/// the wait failed. It comes back in [`Error::MayHaveStarted`], which the caller owns from then on.
 ///
 /// Settle it with [`wait`](Unreaped::wait), which blocks until the child exits and reaps it, or
 /// [`leak`](Unreaped::leak), which gives it up. A value dropped otherwise does what `wait` does,

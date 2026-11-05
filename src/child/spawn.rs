@@ -88,7 +88,8 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
 /// The reap follows the ROOT's kill alone. A tree kill can fail (a setuid member refusing the
 /// signal) while the root dies, and a killed root must be waited for, or it stays a zombie. A
 /// failed root kill (e.g. `Unkillable`) cannot be waited for, so it gets a non-blocking
-/// `try_wait` and the note that it may still be running. A root already reaped (`Sent::Gone`) is
+/// `try_wait`. A root that look finds running, or cannot look at, is handed back to the caller in
+/// the error (an `Unreaped`), and the note says so. A root already reaped (`Sent::Gone`) is
 /// neither waited on nor `try_wait`ed, and is reported as "could not be terminated (it was already
 /// reaped)".
 ///
@@ -113,10 +114,13 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
 /// warns once: the unsettled root, a failed reap and any other leftover share one record, labelled
 /// `finish_elevated`.
 ///
-/// The handle is disarmed only once the cleanup has settled both the tree and the root: each was
-/// killed, is gone, or was deliberately left alone (a reaped or unpinned root, a live front).
-/// Otherwise (a refused kill, a failed tree kill, a failed reap) the handle stays armed, so its drop
-/// tries again; that drop does not warn of the event a second time.
+/// The handle is disarmed once the cleanup has handed the root back, or has settled both the tree
+/// and the root: each was killed, is gone, or was deliberately left alone (a reaped or unpinned
+/// root, a live front). A root is handed back when its kill was refused (or never sent, for a live
+/// front) and the look at it found it running or failed: it is uncollected, and the caller's. If
+/// the tree kill failed, or a reap after a delivered kill failed, and the root was not handed back,
+/// the handle stays armed, so its drop tries again; that drop does not warn of the event a second
+/// time.
 #[cfg(unix)]
 pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> Result<Child, SpawnFailure> {
     let Err(write_err) = written else {
@@ -160,6 +164,8 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     // deliberately not signalled (an unpinned root, a live front). A refused kill, or a reap that
     // failed, leaves it to the handle's drop to try again.
     let mut root_settled = true;
+    // Whether the cleanup left the root uncollected and still the handle's: the caller can take it.
+    let mut uncollected = false;
     let pid = child.id().pid();
     let (root_note, fate) = if view.unpinned_root() {
         // Nothing was signalled.
@@ -201,6 +207,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
             // Were it ever not, the child may still be running.
             Ok(crate::signal::Sent::Unverified) => {
                 debug_assert!(false, "a sync child's kill always verifies its target");
+                uncollected = true;
                 (
                     "the elevated child could not be terminated (it could not be verified, and may still be running)"
                         .to_string(),
@@ -249,7 +256,9 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
                 fault::run_between_kill_and_wait();
                 // The non-blocking look reaps a child that has exited by now.
                 let fate = fate_of_a_look(child.try_wait().map_err(|e| e.raw_os_error()), Some(child.id()));
-                if Disposition::HandBack.hands_back(&fate) {
+                // A look that collected the root, or found it reaped elsewhere, leaves nothing.
+                uncollected = matches!(fate, ChildFate::Running { .. } | ChildFate::Unknown);
+                if uncollected {
                     report.left.push(format!(
                         "the elevated child pid {pid} could not be terminated ({e}); handed back to the caller in the error"
                     ));
@@ -260,7 +269,9 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     };
     let warned = report.emit(&[]);
     // A root still running is the caller's: it is disarmed, and handed back in the error.
-    let hands_back = Disposition::HandBack.hands_back(&fate);
+    let mut torn = crate::child::owned::teardown::TeardownOutcome::new(fate);
+    torn.uncollected = uncollected;
+    let hands_back = Disposition::HandBack.hands_back(&torn);
     let root_note = if hands_back {
         format!("{root_note}; it is handed back to the caller")
     } else {
@@ -605,11 +616,12 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     if front.is_some() {
         prepared.watch_front(pid);
     }
-    // Read the identity while we still own the un-reaped `std::process::Child`, and check the read
-    // against the handle held since the spawn: a pid alone does not say whom it names once
-    // something else has reaped the child. The attach takes this identity and does not re-read
-    // the root's, so a reap and reuse after the check cannot make the containment name a stranger.
-    // Adopting reaps nothing, so this is also the identity the `OwnedChild` takes.
+    // Read the identity while the child is still unreaped, and check the read against the handle
+    // held since the spawn (the pidfd on Linux, `std`'s `Child` elsewhere): a pid alone does not
+    // say whom it names once something else has reaped the child. The attach takes this identity
+    // and does not re-read the root's, so a reap and reuse after the check cannot make the
+    // containment name a stranger. Nothing here reaps the child, so this is also the identity the
+    // adopted `OwnedChild` takes.
     #[cfg(test)]
     fault::run_at(fault::SpawnPoint::BeforeIdentity, pid);
     #[cfg(target_os = "linux")]
@@ -2513,6 +2525,9 @@ impl FrontFate {
             FrontFate::LeftUnreaped => {
                 format!("it was sent nothing, so the elevated program may be running; {left}")
             }
+            FrontFate::Unaccounted if handed_back => format!(
+                "it was sent nothing and could not be waited on, so the elevated program may be running; {left}"
+            ),
             FrontFate::Unaccounted => {
                 "it was sent nothing and could not be waited on, so the elevated program may be running".to_owned()
             }
@@ -3758,6 +3773,10 @@ pub(crate) mod unique_report;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "spawn/front_teardown_tests.rs"]
 mod front_teardown_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "spawn/held_teardown_tests.rs"]
+mod held_teardown_tests;
 
 #[cfg(all(test, target_os = "linux"))]
 #[path = "spawn/identity_group_tests.rs"]

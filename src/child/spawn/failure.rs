@@ -51,7 +51,7 @@ pub(crate) enum SpawnFailure {
 impl SpawnFailure {
     /// A failure after which the program may have started, of a child that is not an elevation
     /// backend. `unreaped` is the child the spawn hands back, if it does; then `fate` is `Running`
-    /// with its identity.
+    /// with its identity, or `Unknown` (the look at it failed), or `Killed` (the wait for it failed).
     pub(crate) fn started(cause: Error, fate: ChildFate, unreaped: Option<Unreaped>) -> SpawnFailure {
         SpawnFailure::MayHaveStarted {
             cause,
@@ -341,10 +341,12 @@ impl From<SpawnFailure> for Error {
                     "a `may have started` failure's cause is itself `may have started`: {cause}"
                 );
                 debug_assert!(
-                    unreaped
-                        .as_ref()
-                        .is_none_or(|child| fate == ChildFate::Running { id: child.id() }),
-                    "a child handed back is `Running` with its identity, got {fate:?}"
+                    unreaped.as_ref().is_none_or(|child| match fate {
+                        ChildFate::Running { id } => id == child.id(),
+                        ChildFate::Unknown | ChildFate::Killed => true,
+                        _ => false,
+                    }),
+                    "a child handed back is `Running` with its identity, `Unknown` or `Killed`, got {fate:?}"
                 );
                 Error::MayHaveStarted {
                     fate,

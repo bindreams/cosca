@@ -144,10 +144,35 @@ fn finish_elevated_hands_back_a_root_whose_kill_was_refused() {
     assert!(status.success(), "the root exits on EOF: {status:?}");
 }
 
+/// A failed spawn's cleanup whose root kill is refused and whose look then fails: the root is
+/// uncollected and the caller's, so it is handed back and the handle disarmed, though its fate is
+/// `Unknown`.
+///
+/// Mutant: only a `Running` fate hands back (the handle's drop then retries and leaks the root).
+#[skuld::test]
+fn finish_elevated_hands_back_a_root_whose_kill_was_refused_and_look_failed() {
+    crate::log_capture::install();
+    let (mut child, writer) = bare_blocker();
+    let teardowns = crate::child::owned::seams::record_root_teardowns();
+    child.proc.script_over(|f| {
+        f.signals([refused()])
+            .reaps([crate::os_process::fake::ReapAnswer::Err(std::io::ErrorKind::Other)])
+    });
+
+    let failure = crate::child::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
+    let (_, fate, unreaped) = crate::child::spawn::failure::expect_handed_back(failure.into());
+    let handed_back = crate::test_child::HandedBack::new(writer, Some(unreaped));
+
+    assert_eq!(fate, crate::error::ChildFate::Unknown);
+    assert_eq!(teardowns.count(), 0, "the handle is disarmed: its drop does not retry");
+    let status = handed_back.wait();
+    assert!(status.success(), "the root exits on EOF: {status:?}");
+}
+
 /// A cleanup that warned of its unknown root and then left its handle armed (the root kill was
-/// refused, and the look after it failed, so the root is not known to run): the handle's drop retries
-/// and is refused again. The refusal is new, which the cleanup did not report, so the drop warns of
-/// it; the unknown root it repeats rides along.
+/// delivered, and the reap after it failed): the handle's drop retries and its kill is refused. The
+/// refusal is new, which the cleanup did not report, so the drop warns of it; the unknown root it
+/// repeats rides along.
 ///
 /// Mutant: the drop's report is a `debug` record whenever the cleanup warned of anything.
 #[skuld::test]
@@ -157,9 +182,10 @@ fn a_retry_that_fails_anew_warns_of_the_new_failure() {
     let teardowns = crate::child::owned::seams::record_root_teardowns();
     let mark = crate::log_capture::mark();
     let err_peek = || Err(std::io::Error::other("forced peek failure"));
+    // The first kill is scripted as delivered and sends nothing: the root runs until the writer drops.
     let fake = child.proc.script_over(|f| {
         f.peeks([err_peek(), err_peek()])
-            .signals([refused(), refused()])
+            .signals([Ok(crate::signal::Sent::Delivered), refused()])
             .reaps([crate::os_process::fake::ReapAnswer::Err(std::io::ErrorKind::Other)])
     });
 
@@ -181,9 +207,9 @@ fn a_retry_that_fails_anew_warns_of_the_new_failure() {
     drop(writer);
 }
 
-/// A cleanup that warned of its unknown root and left its handle armed (the root kill was refused,
-/// once, and the look after it failed): the handle's drop retries, the kill lands, and all the drop
-/// has to say is the unknown root again, which is a `debug` record.
+/// A cleanup that warned of its unknown root and left its handle armed (the root kill was
+/// delivered, and the reap after it failed): the handle's drop retries, its kill lands, and all the
+/// drop has to say is the unknown root again, which is a `debug` record.
 ///
 /// Mutant: the drop's report ignores that the cleanup already warned.
 #[skuld::test]
@@ -195,9 +221,10 @@ fn a_retry_that_only_repeats_the_cleanups_warn_is_debug() {
     let teardowns = crate::child::owned::seams::record_root_teardowns();
     let mark = crate::log_capture::mark();
     let err_peek = || Err(std::io::Error::other("forced peek failure"));
+    // The first kill is scripted as delivered and sends nothing; the drop's kill is the real one.
     let fake = child.proc.script_over(|f| {
         f.peeks([err_peek(), err_peek()])
-            .signals([refused()])
+            .signals([Ok(crate::signal::Sent::Delivered)])
             .reaps([crate::os_process::fake::ReapAnswer::Err(std::io::ErrorKind::Other)])
     });
 

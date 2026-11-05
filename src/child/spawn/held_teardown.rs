@@ -48,7 +48,7 @@ pub(super) fn tear_down_held(
     if let Some(left) = &torn.left {
         log::warn!("{}", why.fold(left));
     }
-    let unreaped = disposition.hands_back(&torn.fate).then(|| Unreaped::new(child, id));
+    let unreaped = disposition.hands_back(&torn).then(|| Unreaped::new(child, id));
     let error = match front_fate {
         Some(fate) if unreaped.is_some() => fate.note_handed_back(error, front, Some(pid)),
         Some(fate) => fate.note(error, front, Some(pid)),
