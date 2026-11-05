@@ -9,6 +9,7 @@ use super::ProbeEnd;
 use super::{dying_in, front_placement, Subtree};
 use crate::containment::cgroup::fault::{self, ProbeStep};
 use crate::containment::cgroup::test_support::alone;
+use crate::identity::{FakeKernel, HostKernel, UNREADABLE_STATUS_REASON};
 use crate::send_log::Via;
 use crate::test_child::reaped_elsewhere::warns_since;
 use crate::test_groups::{cgroup, Group};
@@ -117,7 +118,7 @@ fn a_subtree_reached_a_task_only_once_its_kill_landed() {
 fn with_pidfd_info_a_front_is_placeable_whatever_proc_hides() {
     let _id = fault::force_pidfd_cgroup_id(HIGH);
     let _hidden = fault::hide_proc();
-    front_placement(|| Ok(HIGH)).expect("placeable by a pidfd's cgroup id");
+    front_placement(&HostKernel, || Ok(HIGH)).expect("placeable by a pidfd's cgroup id");
 }
 
 /// Without `PIDFD_GET_INFO`, a `/proc` that shows a process this one may not trace makes fronts
@@ -129,7 +130,7 @@ fn with_pidfd_info_a_front_is_placeable_whatever_proc_hides() {
 #[skuld::test]
 fn cgroup_without_pidfd_info_a_proc_that_shows_untraceable_processes_places_fronts(#[fixture(cgroup)] _group: &Group) {
     let _missing = fault::miss_pidfd_info();
-    front_placement(|| Ok(HIGH)).expect("the lane's /proc shows its root every process");
+    front_placement(&HostKernel, || Ok(HIGH)).expect("the lane's /proc shows its root every process");
 }
 
 /// Without `PIDFD_GET_INFO`, a `/proc` that hides a process this one may not trace refuses an
@@ -138,7 +139,7 @@ fn cgroup_without_pidfd_info_a_proc_that_shows_untraceable_processes_places_fron
 fn without_pidfd_info_a_hidepid_proc_refuses_naming_hidepid() {
     let _missing = fault::miss_pidfd_info();
     let _hidden = fault::hide_proc();
-    match front_placement(|| Ok(HIGH)) {
+    match front_placement(&HostKernel, || Ok(HIGH)) {
         Err(crate::error::Error::Unsupported { detail, .. }) => {
             assert!(detail.contains("hidepid"), "{detail}");
             assert!(detail.contains("before anything is spawned"), "{detail}");
@@ -151,10 +152,9 @@ fn without_pidfd_info_a_hidepid_proc_refuses_naming_hidepid() {
 /// `hidepid`.
 #[skuld::test]
 fn without_pidfd_info_a_diverged_proc_view_refuses_naming_the_view() {
-    use crate::identity::proc_view_fault::{force_proc_view_once, ForcedView};
     let _missing = fault::miss_pidfd_info();
-    let _view = force_proc_view_once(ForcedView::Diverged);
-    match front_placement(|| Ok(HIGH)) {
+    let kernel = FakeKernel::over(&HostKernel).diverged_view();
+    match front_placement(&kernel, || Ok(HIGH)) {
         Err(crate::error::Error::Unsupported { detail, .. }) => {
             assert!(detail.contains("an outer pid namespace's"), "{detail}");
             assert!(!detail.contains("hidepid"), "{detail}");
@@ -166,13 +166,12 @@ fn without_pidfd_info_a_diverged_proc_view_refuses_naming_the_view() {
 /// Without `PIDFD_GET_INFO`, an unassessable `/proc` view refuses, naming that, not `hidepid`.
 #[skuld::test]
 fn without_pidfd_info_an_unassessable_proc_view_refuses_naming_the_view() {
-    use crate::identity::proc_view_fault::{force_proc_view_once, ForcedView};
     let _missing = fault::miss_pidfd_info();
-    let _view = force_proc_view_once(ForcedView::Unassessable);
-    match front_placement(|| Ok(HIGH)) {
+    let kernel = FakeKernel::over(&HostKernel).unreadable_view();
+    match front_placement(&kernel, || Ok(HIGH)) {
         Err(crate::error::Error::Unsupported { detail, .. }) => {
             assert!(
-                detail.contains("could not be established (forced by a test)"),
+                detail.contains(&format!("could not be established ({UNREADABLE_STATUS_REASON})")),
                 "{detail}"
             );
             assert!(!detail.contains("hidepid"), "{detail}");
@@ -198,10 +197,10 @@ fn cgroup_the_placement_probe_answers_with_fds_0_and_1_closed(#[fixture(cgroup)]
     };
     let _missing = fault::miss_pidfd_info();
     let restore = RestoreStdio::close(&done, &[0, 1]);
-    let shown = front_placement(|| Ok(HIGH));
+    let shown = front_placement(&HostKernel, || Ok(HIGH));
     let hidden = {
         let _hidden = fault::hide_proc();
-        front_placement(|| Ok(HIGH))
+        front_placement(&HostKernel, || Ok(HIGH))
     };
     drop(restore);
     shown.expect("this test's /proc hides nothing");
@@ -357,7 +356,7 @@ fn a_recorded_place_answers_for_its_own_task_alone() {
 fn without_pidfd_info_a_hidepid_1_proc_refuses_naming_hidepid() {
     let _missing = fault::miss_pidfd_info();
     let _hidden = fault::hide_proc_as(libc::EPERM);
-    match front_placement(|| Ok(HIGH)) {
+    match front_placement(&HostKernel, || Ok(HIGH)) {
         Err(crate::error::Error::Unsupported { detail, .. }) => assert!(detail.contains("hidepid"), "{detail}"),
         other => panic!("expected Unsupported, got {other:?}"),
     }
@@ -368,7 +367,7 @@ fn without_pidfd_info_a_hidepid_1_proc_refuses_naming_hidepid() {
 fn a_probe_child_that_stays_dumpable_fails_the_probe() {
     let _missing = fault::miss_pidfd_info();
     let _dumpable = fault::keep_probe_dumpable();
-    match front_placement(|| Ok(HIGH)) {
+    match front_placement(&HostKernel, || Ok(HIGH)) {
         Err(crate::error::Error::Io(e)) => assert!(e.to_string().contains("non-dumpable"), "{e}"),
         other => panic!("expected Io, got {other:?}"),
     }
@@ -379,7 +378,7 @@ fn a_probe_child_that_stays_dumpable_fails_the_probe() {
 #[skuld::test]
 fn a_refused_pidfd_info_refuses_naming_it() {
     let _failing = fault::fail_pidfd_info();
-    match front_placement(|| Ok(HIGH)) {
+    match front_placement(&HostKernel, || Ok(HIGH)) {
         Err(crate::error::Error::Unsupported { detail, .. }) => {
             assert!(detail.contains("PIDFD_GET_INFO failed"), "{detail}");
         }
@@ -393,7 +392,7 @@ fn a_refused_pidfd_info_refuses_naming_it() {
 #[skuld::test]
 fn a_host_that_gives_no_cgroup_id_refuses_naming_the_errno() {
     for errno in [libc::ENOSYS, libc::EOPNOTSUPP, libc::EPERM] {
-        match front_placement(|| Err(std::io::Error::from_raw_os_error(errno))) {
+        match front_placement(&HostKernel, || Err(std::io::Error::from_raw_os_error(errno))) {
             Err(crate::error::Error::Unsupported { detail, .. }) => {
                 let named = std::io::Error::from_raw_os_error(errno).to_string();
                 assert!(detail.contains(&named), "{errno}: {detail}");
@@ -407,7 +406,7 @@ fn a_host_that_gives_no_cgroup_id_refuses_naming_the_errno() {
 /// Any other failure to read the leaf's id is the spawn's I/O error, not a claim about the host.
 #[skuld::test]
 fn any_other_failure_to_read_the_leaf_id_is_an_io_error() {
-    match front_placement(|| Err(std::io::Error::from_raw_os_error(libc::ENOMEM))) {
+    match front_placement(&HostKernel, || Err(std::io::Error::from_raw_os_error(libc::ENOMEM))) {
         Err(crate::error::Error::Io(e)) => assert!(e.to_string().contains("leaf"), "{e}"),
         other => panic!("expected Io, got {other:?}"),
     }
@@ -613,7 +612,7 @@ fn the_probe_child_is_killed_through_its_pidfd() {
     let _missing = fault::miss_pidfd_info();
     let _hidden = fault::hide_proc();
     fault::take_probe_steps();
-    front_placement(|| Ok(HIGH)).expect_err("a hidden /proc refuses");
+    front_placement(&HostKernel, || Ok(HIGH)).expect_err("a hidden /proc refuses");
     assert_eq!(
         fault::take_probe_steps(),
         [
@@ -653,7 +652,7 @@ fn a_probe_child_no_pidfd_can_pin_is_killed_and_reaped_by_its_number() {
         }
     });
     fault::take_probe_steps();
-    front_placement(|| Ok(HIGH)).expect_err("a hidden /proc refuses");
+    front_placement(&HostKernel, || Ok(HIGH)).expect_err("a hidden /proc refuses");
     let pid = forked.get().expect("the probe forked");
     assert_eq!(
         fault::take_probe_steps(),
@@ -678,7 +677,7 @@ fn a_probe_child_reaped_elsewhere_before_its_pin_is_sent_nothing() {
         None
     });
     fault::take_probe_steps();
-    let err = front_placement(|| Ok(HIGH)).expect_err("the probe has no child left");
+    let err = front_placement(&HostKernel, || Ok(HIGH)).expect_err("the probe has no child left");
     assert_eq!(fault::take_probe_steps(), [], "nothing was sent");
     assert!(matches!(err, crate::error::Error::Io(_)), "{err:?}");
 }
@@ -703,7 +702,7 @@ fn a_probe_child_whose_pidfd_kill_fails_is_released_and_reaped_through_its_pidfd
     });
     fault::take_probe_steps();
     let mark = crate::log_capture::mark();
-    front_placement(|| Ok(HIGH)).expect_err("a hidden /proc refuses");
+    front_placement(&HostKernel, || Ok(HIGH)).expect_err("a hidden /proc refuses");
     let pid = forked.get().expect("the probe's child was to be killed");
     assert_eq!(
         fault::take_probe_steps(),
@@ -739,7 +738,7 @@ fn a_probe_child_whose_kill_by_number_fails_is_released_and_warned() {
     let _failed = fault::set_before_probe_kill(|_| Some(libc::EPERM));
     fault::take_probe_steps();
     let mark = crate::log_capture::mark();
-    front_placement(|| Ok(HIGH)).expect_err("a hidden /proc refuses");
+    front_placement(&HostKernel, || Ok(HIGH)).expect_err("a hidden /proc refuses");
     let pid = forked.get().expect("the probe forked");
     assert_eq!(
         fault::take_probe_steps(),
@@ -781,7 +780,7 @@ fn a_failed_kill_of_one_probe_is_not_stalled_by_another_probes_child() {
         }
     });
     fault::take_probe_steps();
-    front_placement(|| Ok(HIGH)).expect_err("a hidden /proc refuses");
+    front_placement(&HostKernel, || Ok(HIGH)).expect_err("a hidden /proc refuses");
     assert_eq!(
         fault::take_probe_steps(),
         [
@@ -837,7 +836,7 @@ fn a_probe_child_reaped_by_an_ignored_sigchld_keeps_the_verdict() {
     let _missing = fault::miss_pidfd_info();
     let _hidden = fault::hide_proc();
     fault::take_probe_steps();
-    let err = front_placement(|| Ok(HIGH)).expect_err("a hidden /proc refuses");
+    let err = front_placement(&HostKernel, || Ok(HIGH)).expect_err("a hidden /proc refuses");
     assert!(matches!(err, crate::error::Error::Unsupported { .. }), "{err:?}");
     assert_eq!(
         fault::take_probe_steps(),
@@ -862,7 +861,7 @@ fn a_probe_child_no_pidfd_pins_reaped_by_an_ignored_sigchld_keeps_the_verdict() 
     let _hidden = fault::hide_proc();
     let _unpinned = fault::set_before_probe_pin(|_| Some(libc::EMFILE));
     fault::take_probe_steps();
-    let err = front_placement(|| Ok(HIGH)).expect_err("a hidden /proc refuses");
+    let err = front_placement(&HostKernel, || Ok(HIGH)).expect_err("a hidden /proc refuses");
     assert!(matches!(err, crate::error::Error::Unsupported { .. }), "{err:?}");
     assert_eq!(
         fault::take_probe_steps(),
@@ -887,7 +886,7 @@ fn a_probe_child_reaped_by_another_waiter_keeps_the_verdict() {
         None
     });
     fault::take_probe_steps();
-    let err = front_placement(|| Ok(HIGH)).expect_err("a hidden /proc refuses");
+    let err = front_placement(&HostKernel, || Ok(HIGH)).expect_err("a hidden /proc refuses");
     assert!(matches!(err, crate::error::Error::Unsupported { .. }), "{err:?}");
     assert_eq!(
         fault::take_probe_steps(),
@@ -917,7 +916,7 @@ fn a_probe_child_already_dead_at_its_pidfd_send_is_reaped_through_the_pidfd() {
         }
     });
     fault::take_probe_steps();
-    front_placement(|| Ok(HIGH)).expect_err("a hidden /proc refuses");
+    front_placement(&HostKernel, || Ok(HIGH)).expect_err("a hidden /proc refuses");
     let pid = forked.get().expect("the probe's child was to be killed");
     assert_eq!(
         fault::take_probe_steps(),
@@ -985,7 +984,7 @@ fn assert_probe_answers_with_spare_descriptors(spare: usize) {
     let _limit = limit_nofile(spare);
     fault::take_probe_steps();
     let mark = crate::log_capture::mark();
-    let err = front_placement(|| Ok(HIGH)).expect_err("a hidden /proc refuses");
+    let err = front_placement(&HostKernel, || Ok(HIGH)).expect_err("a hidden /proc refuses");
     assert!(
         matches!(&err, crate::error::Error::Unsupported { detail, .. } if detail.contains("hides the cgroup")),
         "the refusal is the hidden /proc's: {err:?}"
@@ -1040,7 +1039,7 @@ fn a_probe_child_that_exits_early_with_sigchld_ignored_says_so() {
         );
         None
     });
-    let err = front_placement(|| Ok(HIGH)).expect_err("the probe has no child left");
+    let err = front_placement(&HostKernel, || Ok(HIGH)).expect_err("the probe has no child left");
     assert!(
         err.to_string().contains("SIGCHLD"),
         "the error names the ignored SIGCHLD: {err}"
@@ -1086,7 +1085,7 @@ fn a_probe_child_that_cannot_close_its_descriptors_is_reported_abandoned() {
     });
     fault::take_probe_steps();
     let mark = crate::log_capture::mark();
-    let err = front_placement(|| Ok(HIGH)).expect_err("the probe fails");
+    let err = front_placement(&HostKernel, || Ok(HIGH)).expect_err("the probe fails");
     let pid = forked.get().expect("the probe's child was to be killed");
     assert!(
         matches!(&err, crate::error::Error::Io(e) if e.to_string().contains("ABANDONED")),
