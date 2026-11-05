@@ -103,13 +103,14 @@ fn a_zero_parent_is_trusted_only_for_the_kernel_and_launchd() {
 #[skuld::test]
 fn one_parent_read_of_launchd_finds_its_parent_zero() {
     let read = read_ppid_once(1);
+    // Any user can read launchd's record (unsandboxed, as CI's runners are).
     let PpidRead::Found(0, key) = read else {
-        panic!("precondition: launchd's record reads for any user and names parent 0, got {read:?}");
+        panic!("one parent read of launchd must find parent 0, got {read:?}");
     };
     assert_eq!(
         super::start_token(1),
         Resolved::Found(key),
-        "the key of the parent read is the one record's"
+        "the parent read's key is launchd's"
     );
 }
 

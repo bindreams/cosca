@@ -168,13 +168,16 @@ fn a_gone_parent_is_gone_before_a_missing_start_time_is_unknown() {
 }
 
 /// A `stat` that names another parent but shows no start time is `Gone`: the other parent settles
-/// the answer before the missing start time can make it `Unknown`.
+/// the answer before the missing start time can make it `Unknown`. The named parent is held, so only
+/// the other parent's number can make it `Gone`.
 ///
 /// Mutant: a missing start time hides the other parent's number.
 #[skuld::test]
 fn another_parent_is_gone_even_when_the_start_time_is_missing() {
     let parent = ProcessId::from_parts_for_test(7, Key::Pidfs(9));
     let (kernel, _writer) = kernel_showing(b"4242 (x) S 8", 100);
+    let (parent_fd, _parent_writer) = pidfd();
+    let kernel = kernel.on_pidfd_open(7, Ok(parent_fd)).on_pidfs_ino(7, Ok(Some(9)));
     assert!(matches!(
         ProcessId::of_ordered_with(&kernel, PID, Some(parent)).0,
         Resolved::Gone

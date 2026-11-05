@@ -286,7 +286,8 @@ impl ProcessId {
     /// changed hands, or the process was reparented. A number that is read does not yet name the
     /// parent, which may have been reaped and its number taken, so `parent` is then proved again: a
     /// number that no longer holds it is [`Resolved::Gone`] too, and one whose proof cannot be made
-    /// is [`Resolved::Unknown`], blaming the parent.
+    /// is [`Resolved::Unknown`], blaming the parent. The candidate's own failure is blamed on it only
+    /// while the parent is held ([`Judged`]).
     pub(crate) fn of_ordered_with(kernel: &dyn Kernel, pid: RawPid, parent: Option<ProcessId>) -> Ordered {
         #[cfg(all(test, target_os = "macos"))]
         seams::note_by_pid_read();

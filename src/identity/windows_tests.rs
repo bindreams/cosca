@@ -636,6 +636,8 @@ fn the_walk_keeps_a_real_child_and_grandchild_of_a_real_spawned_root() {
 // the two reads of one handle =====
 
 const REFUSED: windows::Win32::Foundation::NTSTATUS = windows::Win32::Foundation::NTSTATUS(0xC000_0004_u32 as i32);
+const ACCESS_DENIED: windows::Win32::Foundation::NTSTATUS =
+    windows::Win32::Foundation::NTSTATUS(0xC000_0022_u32 as i32);
 
 fn refused_key() -> windows::core::Result<Key> {
     Err(windows::core::Error::from_hresult(windows::core::HRESULT::from_win32(
@@ -824,10 +826,9 @@ fn a_refused_creator_query_puts_its_status_in_the_cause() {
     use super::{creator_read, ParentRead};
     use crate::identity::UnknownCause;
 
-    let refused = windows::Win32::Foundation::NTSTATUS(0xC000_0004_u32 as i32);
-    let (parent, cause) = creator_read(7, Err(refused), UnknownCause::default());
+    let (parent, cause) = creator_read(7, Err(REFUSED), UnknownCause::default());
     assert_eq!(parent, ParentRead::Unreadable);
-    assert_eq!(cause.creator_status, Some(refused));
+    assert_eq!(cause.creator_status, Some(REFUSED));
 
     let (parent, cause) = creator_read(7, Ok(5), UnknownCause::default());
     assert_eq!(parent, ParentRead::Is(5));
@@ -843,8 +844,7 @@ fn a_refused_creator_query_does_not_displace_a_refused_sequence_number_in_the_er
     use super::{creator_read, ParentRead};
     use crate::identity::UnknownCause;
 
-    let creator_refused = windows::Win32::Foundation::NTSTATUS(0xC000_0022_u32 as i32);
-    let (parent, cause) = creator_read(7, Err(creator_refused), UnknownCause::of_sequence_status(REFUSED));
+    let (parent, cause) = creator_read(7, Err(ACCESS_DENIED), UnknownCause::of_sequence_status(REFUSED));
     assert_eq!(parent, ParentRead::Unreadable);
     let text = cause_text(cause).expect("a refusal is the cause");
     assert!(

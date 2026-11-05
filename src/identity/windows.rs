@@ -351,7 +351,7 @@ fn creator_read(pid: RawPid, creator: Result<usize, NTSTATUS>, cause: UnknownCau
         Ok(creator) => match RawPid::try_from(creator) {
             Ok(creator) => (ParentRead::Is(creator), cause),
             Err(_) => {
-                log::debug!("the creator pid {creator:#x} of pid {pid} is wider than a DWORD");
+                log::warn!("the creator pid {creator:#x} of pid {pid} is wider than a DWORD");
                 debug_assert!(false, "the creator pid {creator:#x} of pid {pid} is wider than a DWORD");
                 (ParentRead::Unreadable, cause)
             }

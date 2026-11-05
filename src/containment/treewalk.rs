@@ -63,7 +63,8 @@
 //!
 //! There is no parent-order rule elsewhere ([`ORDER_AFTER_PARENT`] is off). On macOS a tracer
 //! becomes the parent of a traced child it started after (XNU's `PT_ATTACH` sets the child's
-//! `p_ppid`), so the rule would drop that child. On Linux the stat ppid is `real_parent`, which
+//! `p_ppid`), and a child forked after a clock step orders before its parent, so the rule would drop
+//! either. On Linux the stat ppid is `real_parent`, which
 //! reparenting updates, so the parent check plus the parent's proof suffices.
 //!
 //! The rule also drops a genuine descendant whose creator exited and whose creator's pid now belongs
