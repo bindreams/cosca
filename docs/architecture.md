@@ -98,5 +98,9 @@ In order:
 3. **Containment mechanisms:** today an enum whose callers ask which mechanism they hold. It
    becomes operations on the tree, taking the root as an `OwnedChild`.
 4. **The `Child` core:** with 1–3 done, the sync and async `Child` become one policy and two
-   drivers.
+   drivers. It also removes `child::fault::force_root_reads` and `force_next_root_read`, a
+   thread-local hook that answers the root's identity read (`root_identity_now`) beside
+   `FakeKernel`: the root's read moves into `OwnedChild`, through the kernel it was built with, and
+   those tests state `FakeKernel` rows (owner, 2026-11-05: kept until then; needs
+   [#877](https://github.com/bindreams/cosca/issues/877) on macOS).
 5. **Spawn:** produces an `OsChild`, its pipes, its containment and its elevation, for both halves.
