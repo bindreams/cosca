@@ -68,20 +68,6 @@ pub(crate) fn read_populated(file: &mut File, buf: &mut String) -> Result<bool, 
     })
 }
 
-/// Whether the process `pidfd` names has exited, reaped or not: the pidfd turns readable at exit
-/// and stays so.
-#[cfg(target_os = "linux")]
-fn pidfd_exited(pidfd: std::os::fd::BorrowedFd<'_>) -> io::Result<bool> {
-    use rustix::event::{PollFd, PollFlags};
-
-    let mut fds = [PollFd::new(&pidfd, PollFlags::IN)];
-    crate::wait::any_ready_now(&mut fds)?;
-    if fds[0].revents().contains(PollFlags::NVAL) {
-        return Err(io::Error::from_raw_os_error(libc::EBADF));
-    }
-    Ok(fds[0].revents().contains(PollFlags::IN))
-}
-
 /// The state letter of `child`, or `None` when it is unknown; the cause is logged at debug (see
 /// [`StateUnknown`]). Only the pidfd says `Z`: the child exited, which separates "the placement
 /// write failed" from "the child exited before membership was checked".
@@ -94,7 +80,7 @@ fn pidfd_exited(pidfd: std::os::fd::BorrowedFd<'_>) -> io::Result<bool> {
 #[cfg(target_os = "linux")]
 fn proc_state(kernel: &dyn crate::identity::Kernel, child: crate::containment::ChildHandle<'_>) -> Option<char> {
     let crate::containment::ChildHandle { pid, pidfd } = child;
-    let exited = |when: &str| match pidfd_exited(pidfd) {
+    let exited = |when: &str| match crate::os_process::poll::is_readable(pidfd) {
         Ok(exited) => Some(exited),
         Err(e) => {
             log::debug!("cgroup leaf: whether pid {pid} had exited {when} its state was read is unknown: {e}");
@@ -828,14 +814,14 @@ fn pin_member(pid: u32) -> rustix::io::Result<std::os::fd::OwnedFd> {
         .and_then(|raw| rustix::process::pidfd_open(raw, rustix::process::PidfdFlags::empty()))
 }
 
-/// [`pidfd_exited`] for [`CgroupLeaf::terminate`]'s member; a test build lets a `fail_terminate`
-/// seam answer in its place.
+/// Whether [`CgroupLeaf::terminate`]'s member has exited, reaped or not: its pidfd turns readable at
+/// exit and stays so. A test build lets a `fail_terminate` seam answer in its place.
 fn member_exited(pidfd: std::os::fd::BorrowedFd<'_>) -> io::Result<bool> {
     #[cfg(test)]
     if let Some(errno) = fault::terminate_fails(fault::TerminateStep::Exited) {
         return Err(io::Error::from_raw_os_error(errno));
     }
-    pidfd_exited(pidfd)
+    crate::os_process::poll::is_readable(pidfd)
 }
 
 /// [`CgroupLeaf::terminate`]'s `SIGTERM` to the member `pidfd` pins, and the kernel's answer. It goes

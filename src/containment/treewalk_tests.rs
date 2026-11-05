@@ -3,14 +3,14 @@
 //! closure drive `descendants_with` against BOTH `allow_equal` rules.
 
 use super::descendants_with;
-use crate::identity::{OrderKey, ProcessId, RawPid};
+use crate::identity::{Key, OrderKey, ProcessId, RawPid};
 use std::collections::HashMap;
 
 const ROOT_PID: RawPid = 100;
 const ROOT_TOKEN: u64 = 1_000;
 
 fn id(pid: RawPid, token: u64) -> ProcessId {
-    ProcessId::from_parts_for_test(pid, token)
+    ProcessId::from_parts_for_test(pid, Key::for_test(token))
 }
 
 /// What the live resolver returns for a process whose identity token and order key agree.
@@ -20,8 +20,8 @@ fn resolved(pid: RawPid, token: u64) -> (ProcessId, OrderKey) {
 
 /// Build a resolver from a (pid -> token) table. A pid absent from the table is
 /// unresolvable (returns `None`, modelling an already-gone process).
-fn resolver(tokens: &HashMap<RawPid, u64>) -> impl Fn(RawPid) -> Option<(ProcessId, OrderKey)> + '_ {
-    move |pid| tokens.get(&pid).map(|&t| resolved(pid, t))
+fn resolver(tokens: &HashMap<RawPid, u64>) -> impl Fn(RawPid, ProcessId) -> Option<(ProcessId, OrderKey)> + '_ {
+    move |pid, _parent| tokens.get(&pid).map(|&t| resolved(pid, t))
 }
 
 /// Collect the result pids into a sorted Vec for order-independent comparison.
@@ -169,9 +169,9 @@ fn children_of_keeps_one_level_genuine_children_only() {
     use super::{children_of_with, ALLOW_EQUAL_ORDER};
     // root 100/tok50; direct child 101/tok60 (genuine, tok>root); grandchild 102 (ppid
     // 101, not one level); impostor 103 ppid 100 tok40 (created before root => excluded).
-    let root = ProcessId::from_parts_for_test(100, 50);
+    let root = id(100, 50);
     let parents = [(101, 100), (102, 101), (103, 100)];
-    let resolve = |pid: u32| match pid {
+    let resolve = |pid: u32, _parent: ProcessId| match pid {
         101 => Some(resolved(101, 60)),
         102 => Some(resolved(102, 70)),
         103 => Some(resolved(103, 40)),
@@ -191,9 +191,9 @@ fn children_of_same_tick_child_depends_on_allow_equal() {
     use super::children_of_with;
     // Direct child 101 whose token EQUALS the parent's: kept under allow_equal=true,
     // excluded under false — proves children_of_with threads allow_equal to keeps_order.
-    let root = ProcessId::from_parts_for_test(100, ROOT_TOKEN);
+    let root = id(100, ROOT_TOKEN);
     let parents = [(101, 100)];
-    let resolve = |pid: u32| (pid == 101).then(|| resolved(101, ROOT_TOKEN));
+    let resolve = |pid: u32, _parent: ProcessId| (pid == 101).then(|| resolved(101, ROOT_TOKEN));
     assert_eq!(
         pids(children_of_with(root, root_key(), &parents, true, resolve)),
         [101],
@@ -212,9 +212,9 @@ fn children_of_duplicate_edge_yields_pid_once() {
     use super::children_of_with;
     // A snapshot listing the same (pid, ppid) edge twice must not enumerate (or later
     // double-kill) the same child twice.
-    let root = ProcessId::from_parts_for_test(100, ROOT_TOKEN);
+    let root = id(100, ROOT_TOKEN);
     let parents = [(101, 100), (101, 100)];
-    let resolve = |pid: u32| (pid == 101).then(|| resolved(101, ROOT_TOKEN + 1));
+    let resolve = |pid: u32, _parent: ProcessId| (pid == 101).then(|| resolved(101, ROOT_TOKEN + 1));
     assert_eq!(
         pids(children_of_with(root, root_key(), &parents, true, resolve)),
         [101],
@@ -225,12 +225,14 @@ fn children_of_duplicate_edge_yields_pid_once() {
 // The guard orders by the order key, not by the identity token =====
 
 /// A candidate whose id's token orders after the root's but whose order key orders before it is an
-/// impostor: the filters read the key. Mutant: "the filters compare `start_token_raw()`".
+/// impostor: the filters read the key. Mutant: "the filters compare `id.key()`".
 #[skuld::test]
 fn a_candidate_whose_order_key_precedes_the_roots_is_dropped_even_when_its_id_token_does_not() {
     use super::children_of_with;
     let parents = [(200, ROOT_PID)];
-    let resolve = |pid: u32| (pid == 200).then(|| (id(200, ROOT_TOKEN + 5), OrderKey::for_test(ROOT_TOKEN - 5)));
+    let resolve = |pid: u32, _parent: ProcessId| {
+        (pid == 200).then(|| (id(200, ROOT_TOKEN + 5), OrderKey::for_test(ROOT_TOKEN - 5)))
+    };
     for allow_equal in [true, false] {
         assert!(
             descendants_with(root(), root_key(), &parents, allow_equal, resolve).is_empty(),
@@ -243,10 +245,33 @@ fn a_candidate_whose_order_key_precedes_the_roots_is_dropped_even_when_its_id_to
     }
 }
 
+/// The resolver is told the accepted process the snapshot made each candidate's parent, so a backend
+/// can drop a candidate whose parent's number has another holder now. The parent of a grandchild is
+/// the id the walk accepted for the child. Mutant: "the resolver is asked the root for every
+/// candidate".
+#[skuld::test]
+fn the_resolver_is_asked_for_each_candidates_accepted_parent() {
+    use std::cell::RefCell;
+
+    use super::children_of_with;
+
+    let asked = RefCell::new(Vec::new());
+    let resolve = |pid: u32, parent: ProcessId| {
+        asked.borrow_mut().push((pid, parent));
+        Some(resolved(pid, ROOT_TOKEN + 1))
+    };
+    let parents = [(200, ROOT_PID), (300, 200)];
+    descendants_with(root(), root_key(), &parents, true, resolve);
+    assert_eq!(asked.take(), [(200, root()), (300, id(200, ROOT_TOKEN + 1))]);
+
+    children_of_with(root(), root_key(), &parents, true, resolve);
+    assert_eq!(asked.take(), [(200, root())]);
+}
+
 /// The anchor side of the same rule: candidates are compared against the `root_key` argument, not
 /// against the root id's token. Here the root's token is `ROOT_TOKEN` but its key is lower
 /// (a candidate between them is kept) or higher (a candidate between them is dropped).
-/// Mutant: "the filters compare against `root.start_token_raw()`".
+/// Mutant: "the filters compare against `root.key()`".
 #[skuld::test]
 fn candidates_are_compared_against_the_roots_order_key_not_its_id_token() {
     use super::children_of_with;
@@ -255,7 +280,9 @@ fn candidates_are_compared_against_the_roots_order_key_not_its_id_token() {
         (ROOT_TOKEN - 500, ROOT_TOKEN - 300, true),
         (ROOT_TOKEN + 500, ROOT_TOKEN + 300, false),
     ] {
-        let resolve = |pid: u32| (pid == 200).then(|| (id(200, candidate_key), OrderKey::for_test(candidate_key)));
+        let resolve = |pid: u32, _parent: ProcessId| {
+            (pid == 200).then(|| (id(200, candidate_key), OrderKey::for_test(candidate_key)))
+        };
         for allow_equal in [true, false] {
             let want: &[RawPid] = if kept { &[200] } else { &[] };
             let got = descendants_with(root(), OrderKey::for_test(root_key), &parents, allow_equal, resolve);
@@ -291,7 +318,7 @@ fn resolve_or_drop_drops_an_access_denied_pid_and_warns() {
     assert!(denied.is_running(), "precondition: the subject must be live");
     let mark = crate::log_capture::mark();
     assert!(
-        super::resolve_or_drop(&crate::identity::HostKernel, denied.pid()).is_none(),
+        super::resolve_or_drop(&crate::identity::HostKernel, denied.pid(), ProcessId::current()).is_none(),
         "the walk cannot keep what it cannot verify"
     );
     assert!(crate::log_capture::contains_since(
@@ -337,7 +364,7 @@ fn kill_by_identity_spares_a_stale_identity_and_kills_a_matching_one() {
         crate::identity::windows_fixture::spawn_restricted_releasable(&done, PROCESS_QUERY_LIMITED_INFORMATION.0);
     let real = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
         .expect("the owned handle always yields an identity");
-    let stale = crate::identity::ProcessId::from_parts_for_test(real.pid(), real.start_token_raw() ^ 1);
+    let stale = real.with_other_value();
 
     assert_eq!(
         super::kill_by_identity(stale),

@@ -375,7 +375,7 @@ async fn tokio_graceful_shutdown_tree_after_own_wait_claims_no_sigterm_it_did_no
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     use crate::child::fault::force_next_root_read;
-    use crate::identity::{ProcessId, Resolved};
+    use crate::identity::Resolved;
     use crate::test_child::reaped_elsewhere::UNTRUSTED_NUMBER;
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
@@ -385,7 +385,7 @@ async fn tokio_graceful_shutdown_tree_after_own_wait_claims_no_sigterm_it_did_no
     let pid = child.id().pid();
     kill_own_child(pid);
     child.wait().await.expect("this handle reaps the root");
-    let other = ProcessId::from_parts_for_test(pid, child.id().start_token_raw() + 1);
+    let other = child.id().with_other_value();
     // The shutdown's look finds another process; the sweep's, after the terminate, cannot read the
     // pid. This guard clears the second force too, should it go unconsumed.
     let _reads = force_next_root_read(Resolved::Found(other));
@@ -680,7 +680,7 @@ async fn tokio_kill_tree_after_own_wait_and_reuse_kills_a_holder_that_left_the_g
     let pid = child.id().pid();
     child.kill().expect("kill the root");
     child.wait().await.expect("this handle reaps the root");
-    let other = ProcessId::from_parts_for_test(pid, child.id().start_token_raw() + 1);
+    let other = child.id().with_other_value();
     let _reused = crate::child::fault::force_next_root_read(Resolved::Found(other));
 
     child.kill_tree().expect("every holder was reached");
@@ -920,7 +920,7 @@ async fn tokio_kill_tree_of_a_walk_marker_after_own_wait_and_reuse_walks_nothing
     let pid = child.id().pid();
     child.kill().expect("kill the root");
     child.wait().await.expect("this handle reaps the root");
-    let other = ProcessId::from_parts_for_test(pid, child.id().start_token_raw() + 1);
+    let other = child.id().with_other_value();
     let _reused = crate::child::fault::force_next_root_read(Resolved::Found(other));
 
     let result = child.kill_tree();

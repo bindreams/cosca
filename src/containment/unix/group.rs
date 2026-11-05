@@ -143,16 +143,22 @@ pub(crate) fn members(_kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::
 }
 
 /// Linux: scan the checked `/proc` (`identity::linux::proc_view_with`) and keep the entries whose
-/// `stat` field 5 is `pgid`, carrying field 22 (`starttime`) as the token. There is no narrower
-/// kernel interface for process-group membership.
+/// `stat` field 5 is `pgid`. Each such pid's identity is then made by `ProcessId::of_stat_with`,
+/// with a `stat` of its own, and kept only if that `stat` still shows `pgid`: a pid that changed
+/// hands since the scan is no member. There is no narrower kernel interface for process-group
+/// membership.
 ///
 /// A `/proc` from another pid namespace is an error naming the view, not an empty group. Without
 /// `openat2` (Linux < 5.6, or seccomp) no view can be checked: `ErrorKind::Unsupported`. A `stat`
 /// read fails the listing unless the pid exited (`ENOENT`/`ESRCH`) or `hidepid` hides it
-/// (`EACCES`, or `EPERM` while the checked directory still answers).
+/// (`EACCES`, or `EPERM` while the checked directory still answers). A member whose pidfd cannot
+/// be opened fails the listing too (`ErrorKind::Unsupported` for a refused `pidfd_open`, `Other`
+/// for a transient one such as `EMFILE`): its identity is told through the pidfd, and leaving it out
+/// could clear a live group.
 #[cfg(target_os = "linux")]
 pub(crate) fn members(kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::io::Result<Vec<Member>> {
-    use crate::identity::stat_parse::{parse_pgrp, parse_starttime_jiffies};
+    use crate::identity::stat_parse::parse_pgrp;
+    use crate::identity::Resolved;
 
     let proc_dir =
         crate::identity::proc_view_with(kernel)
@@ -199,20 +205,45 @@ pub(crate) fn members(kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::i
         if g != pgid as u32 {
             continue;
         }
-        let Some(token) = parse_starttime_jiffies(&stat) else {
-            // No usable identity token — a later re-check could never confirm this pid is
-            // still the SAME process, so it cannot be counted as a member either; visible,
-            // not silent.
-            log::debug!(
-                "containment::unix::group::members: /proc/{pid}/stat matched pgid {pgid} but \
-                 had no parseable starttime; excluding it"
-            );
-            continue;
+        // The scan's `stat` is a record of whoever held `pid` then. The member's identity is made
+        // by a read that pairs it with a `stat` of its own, and the membership is asked again of
+        // that one: a pid that exited and was reused since the scan is not a member.
+        let (id, own_stat) = match ProcessId::of_stat_with(kernel, pid) {
+            (Resolved::Found(read), _) => read,
+            (Resolved::Gone, _) => {
+                log::debug!("containment::unix::group::members: pid {pid} is gone; excluding it");
+                continue;
+            }
+            // A cause the read knows (an unusable `/proc` view, a refused or exhausted `pidfd_open`)
+            // fails the listing, because excluding the member could clear a live group. A record
+            // that merely would not parse, as a task exiting mid-read leaves, is excluded.
+            (Resolved::Unknown, cause) => match cause.into_error(&format!("pid {pid}")) {
+                Some(why) => {
+                    // A refusal stays `Unsupported`, as the `openat2` arm above, so the caller
+                    // reports the platform's `Unsupported` and not an unassessable group.
+                    let kind = match why {
+                        crate::error::Error::Unsupported { .. } => std::io::ErrorKind::Unsupported,
+                        _ => std::io::ErrorKind::Other,
+                    };
+                    return Err(std::io::Error::new(
+                        kind,
+                        format!("containment::unix::group::members: {why}, so process group {pgid} cannot be listed"),
+                    ));
+                }
+                None => {
+                    log::debug!(
+                        "containment::unix::group::members: pid {pid} matched pgid {pgid} but its identity \
+                         could not be read; excluding it"
+                    );
+                    continue;
+                }
+            },
         };
-        out.push(Member {
-            id: ProcessId::from_parts(pid, token),
-            system: false,
-        });
+        if parse_pgrp(&own_stat) != Some(pgid as u32) {
+            log::debug!("containment::unix::group::members: pid {pid} is no longer in pgid {pgid}; excluding it");
+            continue;
+        }
+        out.push(Member { id, system: false });
     }
     Ok(out)
 }
@@ -329,9 +360,10 @@ fn classify_member(
 /// On Linux this is closed for real, not just narrowed: `SIGKILL` delivery goes through
 /// `pidfd_open`+`pidfd_send_signal` (`check_or_signal_linux_sigkill`, below), through
 /// `open_verified_with` — the fd itself pins the identity at the kernel level, so a pid reused
-/// after `pidfd_open` cannot be hit even in principle. macOS has no pidfd equivalent, so `kill(2)` here keeps the same
-/// irreducible window as `treewalk::kill_by_identity` (re-verify, then `kill(2)`): a recycled
-/// pid in that window is a documented best-effort limitation of the group and tree sweeps.
+/// after `pidfd_open` cannot be hit even in principle, and `treewalk::kill_by_identity` signals
+/// the same way. Only macOS has the window: it has no pidfd equivalent, so `kill(2)` here and in
+/// `treewalk::kill_by_identity` (re-verify, then `kill(2)`) can reach a pid recycled in that gap,
+/// a documented best-effort limitation of the group and tree sweeps there.
 /// `Process::kill` on macOS does not have it: it signals by audit token
 /// (`os_process::macos::MacProcess::signal`).
 fn check_or_signal(
@@ -449,19 +481,21 @@ fn root_check_before_send(root: &GroupRoot<'_>, pid: RawPid, signal: Option<Sign
 ///
 /// **How `open_verified_with`'s answers map here.**
 /// - `Ok(None)` (already gone) is `Reached::Yes`. That includes a reaped process-group leader
-///   (`pidfd_open` `EINVAL`/`ENOENT`, then `id.exists()` says `Gone`) and a ptraced zombie thread.
-/// - `Error::Unsupported` (`pidfd_open` refused) and `Error::Io` (a transient `pidfd_open`
-///   failure, or a `poll` failure) fall back to `check_or_signal`'s plain `kill(2)`. "We couldn't even ask" must not become `Reached::Unknown` on the containers this
-///   fallback exists for; `kill(2)` observes envelopes this module controls directly.
+///   (`pidfd_open` `EINVAL`/`ENOENT`, which a `Pidfs` id takes as lost and a `Ticks` id settles by
+///   `id.exists()` saying `Gone`) and a ptraced zombie thread.
 /// - `Error::NotThreadGroupLeader` is `Reached::Unknown`, with no fallback. The kernel did answer:
 ///   this pid is a live thread, not a process. `kill(2)` on a tid signals the whole thread group
 ///   that owns it, which is not the member that was listed.
-/// - `Error::Unassessable` (identity denied by `id.exists()` or `id.is_alive()`, or the pid
-///   overflows the pidfd interface) is `Reached::Unknown`: a statement about the pid's identity,
-///   not about whether the kernel can open a pidfd, which no fallback resolves.
+/// - `Error::Unsupported` (`pidfd_open` refused), `Error::Io` (a transient `pidfd_open` failure,
+///   or a `poll` failure) and `Error::Unassessable` (identity denied, or the pid overflows the
+///   pidfd interface) are `Reached::Unknown`, with no fallback to `kill(2)`: the member's identity
+///   is told through a pidfd on every kernel, so without one nothing proves that its pid still
+///   names the listed member, and a bare pid is never signalled on a guess.
 ///
 /// **Why this never signals via the already-open pidfd when `id.exists()` answers `Unknown`
-/// inside `open_verified_with`.** This looks tempting — `pidfd_open` already succeeded, so
+/// inside `open_verified_with`.** (That is the path of a `Ticks` id, on a host before Linux 6.9. A
+/// `Pidfs` id is proved by the open pidfd's own inode and reads no `/proc`, so it has no such gap.)
+/// This looks tempting — `pidfd_open` already succeeded, so
 /// *something* is there — but it does not actually close the gap, for the same reason
 /// `check_or_signal`'s own `Resolved::Unknown` arm (above) must never signal a bare pid:
 /// `pidfd_open(pid)` binds to WHATEVER process holds that pid NUMBER at the moment it is
@@ -484,15 +518,15 @@ fn root_check_before_send(root: &GroupRoot<'_>, pid: RawPid, signal: Option<Sign
 #[cfg(target_os = "linux")]
 fn check_or_signal_linux_sigkill(
     kernel: &dyn crate::identity::Kernel,
-    pid: RawPid,
     id: crate::identity::ProcessId,
     root: &GroupRoot<'_>,
 ) -> Reached {
+    use std::os::fd::AsFd as _;
     match crate::os_process::linux::open::open_verified_with(kernel, id) {
         Ok(None) => Reached::Yes, // already gone
         Ok(Some(pidfd)) => match root_check_before_send(root, id.pid(), Some(Signal::SIGKILL)) {
             Err(reached) => reached,
-            Ok(()) => match send_member_pidfd(&pidfd, id.pid()) {
+            Ok(()) => match super::pidfd_signal_member(pidfd.as_fd(), id.pid(), Signal::SIGKILL) {
                 Ok(()) => Reached::Yes,
                 Err(nix::errno::Errno::ESRCH) => Reached::Yes, // exited between open and signal
                 Err(nix::errno::Errno::EPERM) => {
@@ -511,14 +545,6 @@ fn check_or_signal_linux_sigkill(
                 }
             },
         },
-        Err(e @ (crate::error::Error::Unsupported { .. } | crate::error::Error::Io(_))) => {
-            log::debug!(
-                "containment::unix::group: pidfd unavailable ({e}) for pid {}; falling back to \
-                 kill(2) — same residual race macOS already accepts",
-                id.pid()
-            );
-            check_or_signal(kernel, pid, id, Some(Signal::SIGKILL), root)
-        }
         Err(e @ crate::error::Error::NotThreadGroupLeader { .. }) => {
             log::warn!(
                 "containment::unix::group: pid {} is a live thread, not a thread-group leader, so it \
@@ -534,17 +560,6 @@ fn check_or_signal_linux_sigkill(
             Reached::Unknown
         }
     }
-}
-
-/// `SIGKILL` through a member's own pidfd, `pid` the member's.
-#[cfg(target_os = "linux")]
-fn send_member_pidfd(pidfd: &rustix::fd::OwnedFd, pid: RawPid) -> nix::Result<()> {
-    use std::os::fd::AsFd as _;
-    super::send_signal(
-        super::Target::Member(pid),
-        super::Sys::Pidfd(pidfd.as_fd(), 0),
-        Signal::SIGKILL,
-    )
 }
 
 /// "Ask forgiveness, one more time": re-confirm a `Survivor` verdict with a SECOND liveness
@@ -615,9 +630,10 @@ fn reconfirm_survivor(outcome: MemberOutcome, recheck: impl FnOnce() -> crate::i
 /// this handle's own reap). Each `SIGKILL` resend and each `SIGTERM` probe therefore has its own
 /// check of the root ([`GroupRoot::check`]), which shows the listing named the root's group. On Linux
 /// a `SIGKILL` resend first pins the member by a pidfd that its identity check vouches for, then
-/// checks the root, then sends through that pidfd. A `SIGTERM` probe, and a resend by the member's
-/// pid (on macOS, or where the pidfd cannot be opened), checks the root, then the member's identity
-/// right before the send. A member whose root check fails is unassessable and not signalled; on
+/// checks the root, then sends through that pidfd; a Linux member whose pidfd cannot be opened is
+/// unassessable and not signalled. A `SIGTERM` probe, and a resend by the member's pid (on macOS),
+/// checks the root, then the member's identity right before the send. A member whose root check
+/// fails is unassessable and not signalled; on
 /// 6.9+, once the group has no member left, it is in another group that took the number, and is not
 /// a survivor. A change between a check and the send is not seen: the window `Child::kill_tree`
 /// documents.
@@ -655,7 +671,7 @@ pub(crate) fn converge(
                 // documented on it.
                 #[cfg(target_os = "linux")]
                 {
-                    check_or_signal_linux_sigkill(kernel, id.pid(), id, root)
+                    check_or_signal_linux_sigkill(kernel, id, root)
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
