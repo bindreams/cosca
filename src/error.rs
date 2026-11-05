@@ -237,7 +237,13 @@ pub enum Error {
     /// `Command::output`, `status` and `read`, sync and tokio, return this variant for every
     /// failure after their spawn succeeded. They tear the child down then, as its drop would (see
     /// `kill_on_drop`), and the fate says what that did; `read`'s invalid UTF-8 comes after the exit
-    /// was collected (`Reaped`).
+    /// was collected (`Reaped`). When the sync methods' teardown cannot kill the child and it still
+    /// runs, they return it in `unreaped`. The tokio methods do not: they leave it running and warn,
+    /// with `unreaped` `None` and `fate` `Running`, until the async child can wait for one (a
+    /// blocking wait on a runtime thread is forbidden). So do
+    /// [`SuspendedChild::resume`](crate::SuspendedChild::resume) and its tokio twin for the frozen
+    /// child they could not kill: a failed release may leave its thread frozen, so waiting for it
+    /// could block for ever.
     ///
     /// On Windows, a failed `ShellExecuteEx` launch is classified by its error (see `runas_failure`).
     #[error("the program may have started, and {fate}{}: {source}", elevated_note(.fate, *.wrapper_elevated))]
@@ -251,7 +257,8 @@ pub enum Error {
         source: Box<Error>,
         /// The child itself, when the spawn could not end it and hands it to the caller; see
         /// [`Unreaped`](crate::Unreaped) for how to settle it. Then `fate` is
-        /// [`ChildFate::Running`] with the child's own identity.
+        /// [`ChildFate::Running`] with the child's own identity. Dropped while its thread is
+        /// panicking, it is given up, not waited for.
         unreaped: Option<Box<crate::Unreaped>>,
     },
 }

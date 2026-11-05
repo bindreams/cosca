@@ -84,7 +84,10 @@ async fn tokio_armed_drop_reaps_before_returning() {
     }
     {
         let (mut child, teardown) = released_blocker();
-        assert_eq!(child.tear_down_now(), ChildFate::Reaped);
+        assert_eq!(
+            child.tear_down_now(crate::containment::dispatch::TeardownCaller::Drop),
+            ChildFate::Reaped
+        );
         teardown.assert_killed();
     }
     let (mut child, teardown) = released_blocker();
