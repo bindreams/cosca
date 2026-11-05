@@ -197,8 +197,8 @@ fn a_live_self_missing_from_the_table_is_unassessable() {
 
 // The per-pid reads go through the walk's kernel =====
 
-/// A pid the kernel refuses to read is dropped from the walk and warned about, as its pid for a
-/// kernel that answers. Mutant: "`resolve_or_drop` resolves through `HostKernel`".
+/// A pid the kernel refuses to read is dropped from the walk and warned about, as a pid it cannot
+/// find would be. Mutant: "`resolve_or_drop` resolves through `HostKernel`".
 #[skuld::test]
 fn a_pid_the_kernel_cannot_read_is_dropped_and_warned_about() {
     crate::log_capture::install();
@@ -261,5 +261,77 @@ fn every_walk_re_verifies_its_kill_through_its_kernel() {
         let result = walk(&kernel, id);
         assert!(result.is_ok(), "{name}: {result:?}");
         release(child);
+    }
+}
+
+// A descendant's reads go through the walk's kernel =====
+
+/// A live root `sh` that has announced its pid, its identity, and the identity of the `sh` it
+/// forked. That descendant prints `released` and exits at the EOF of its stdin, which the test
+/// holds the write end of; the root waits for it.
+fn live_member_with_descendant() -> (std::process::Child, ProcessId, ProcessId) {
+    let mut cmd = std::process::Command::new("/bin/sh");
+    cmd.arg("-c")
+        .arg("exec 3<&0; sh -c 'read _ignored; echo released' <&3 3<&- & echo $$; wait")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
+    let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn the root");
+    crate::test_child::await_member_ready(&mut child);
+    let root = ProcessId::of(child.id()).found().expect("the live root resolves");
+    let descendants = root
+        .children_with(&HostKernel, Recursive::No)
+        .expect("the root's children are readable");
+    let [descendant] = descendants[..] else {
+        panic!("the root has exactly one child, got {descendants:?}");
+    };
+    (child, root, descendant)
+}
+
+/// The root was signalled with `signo` and the descendant was not: released by EOF, it still
+/// prints. A signalled descendant has nothing to print, and the read ends at EOF without it.
+fn release_with_a_signalled_root(who: &str, mut child: std::process::Child, signo: i32) {
+    use std::io::Read as _;
+    use std::os::unix::process::ExitStatusExt as _;
+    drop(child.stdin.take());
+    let mut printed = String::new();
+    child
+        .stdout
+        .take()
+        .expect("piped stdout")
+        .read_to_string(&mut printed)
+        .expect("read to EOF");
+    assert_eq!(
+        printed, "released\n",
+        "{who}: the descendant must not have been signalled"
+    );
+    let status = child.wait().expect("reap the root");
+    assert_eq!(
+        status.signal(),
+        Some(signo),
+        "{who}: the walk must have signalled the root"
+    );
+}
+
+/// The descendant's `stat` is read by the snapshot, then by the walk's resolve of it, then by the
+/// kill's re-verify, which the kernel refuses or shows as another start time. Only the root is
+/// signalled. Mutants: "`descendants` resolves through `HostKernel`" (the re-verify becomes the
+/// second read, which the row lets through), "the descendant loop's kill re-verifies through
+/// `HostKernel`", each in `hard_kill` and in `terminate`: the descendant is signalled.
+#[skuld::test]
+fn every_id_walk_re_verifies_a_descendants_kill_through_its_kernel() {
+    for ((name, walk), signo) in id_walks().into_iter().zip([libc::SIGKILL, libc::SIGTERM]) {
+        for shows_a_new_owner in [false, true] {
+            let (child, root, descendant) = live_member_with_descendant();
+            let new_owner = stat_of_a_new_owner(descendant.pid());
+            let answer = if shows_a_new_owner {
+                Ok(new_owner.as_slice())
+            } else {
+                Err(libc::EACCES)
+            };
+            let kernel = FakeKernel::over(&HostKernel).on_read_after(&format!("{}/stat", descendant.pid()), 2, answer);
+            let result = walk(&kernel, root);
+            assert!(result.is_ok(), "{name}, new owner {shows_a_new_owner}: {result:?}");
+            release_with_a_signalled_root(name, child, signo);
+        }
     }
 }
