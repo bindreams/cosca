@@ -87,9 +87,11 @@ fn fixture_outer_procfs_inner() {
     // A spawn identifies its child by its pidfd, so it succeeds.
     let mut cmd = crate::command::Command::new();
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
-    let (stdin, teardown) = crate::child::spawn::fault::teardown_blocker_stdin();
+    let (stdin, writer) = crate::test_child::held_writer_stdin();
     cmd.stdin(stdin).expect("set stdin pipe");
     let spawned = cmd.spawn().expect("a spawn needs no /proc view on pidfs");
+    // Released after the drop's kill: a kill that sent nothing exits 0.
+    let teardown = crate::child::spawn::fault::release_at_drop_kill(writer);
     drop(spawned);
     teardown.assert_killed();
 }

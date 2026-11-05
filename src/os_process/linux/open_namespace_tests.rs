@@ -43,6 +43,8 @@ fn fixture_status_mounted_over() {
         .expect("spawn cat");
     // The `/proc` path, as the rows below: the identity is the `starttime`.
     let id = crate::identity::ticks_id(child.id());
+    // Read now as well: a read through the view is `Unknown` once a file is mounted below `/proc`.
+    let own_id = crate::identity::ticks_id(std::process::id());
     let scratch = tempfile::tempdir().expect("tempdir");
     let status = scratch.path().join("status");
     std::fs::write(&status, "Name:\tcosca\nState:\tR (running)\n").expect("write the fake status");
@@ -55,7 +57,7 @@ fn fixture_status_mounted_over() {
     let status = child.wait().expect("reap the killed child");
     assert!(!status.success(), "the child must have been killed, got {status:?}");
 
-    let own = super::open_verified_with(&HostKernel, crate::identity::ticks_id(std::process::id()));
+    let own = super::open_verified_with(&HostKernel, own_id);
     assert!(matches!(own, Ok(Some(_))), "got {own:?}");
 
     match proc_view_with(&HostKernel) {
@@ -105,8 +107,14 @@ fn fixture_pid_ns_inner() {
     let view = proc_view_with(&HostKernel);
     assert!(matches!(view, ProcView::Diverged), "got {view:?}");
 
+    // This process's `Ticks` id, from the `stat` the kernel resolves `self` to for the reader: a
+    // by-pid read cannot make it, since the outer `/proc/1` is another process.
+    let stat = std::fs::read("/proc/self/stat").expect("read own stat");
+    let ticks = crate::identity::stat_parse::parse_starttime_jiffies(&stat).expect("own starttime parses");
+    let own = crate::identity::ProcessId::from_parts_for_test(1, crate::identity::Key::Ticks(ticks));
+
     // `pidfd_open(1)` opens this very process; the outer procfs numbers it differently.
-    match super::open_verified_with(&HostKernel, crate::identity::ticks_id(std::process::id())) {
+    match super::open_verified_with(&HostKernel, own) {
         Err(Error::Unassessable { detail, .. }) => {
             assert!(detail.contains("outer pid namespace"), "{detail}");
             assert!(
