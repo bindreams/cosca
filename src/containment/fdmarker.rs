@@ -1537,9 +1537,10 @@ impl Marker {
             // that WAS resolved — a known member left running, not a gap in discovery. Not
             // retried (see this fn's doc); folded into `incomplete`. Anything else
             // (`Terminated`, `AlreadyGone`) is a real resolution: progress.
-            if crate::containment::treewalk::kill_by_identity(&crate::identity::HostKernel, id, signal)
-                == crate::containment::treewalk::KillOutcome::NotAttempted
-            {
+            if matches!(
+                crate::containment::treewalk::kill_by_identity(&crate::identity::HostKernel, id, signal),
+                crate::containment::treewalk::KillOutcome::NotAttempted(_)
+            ) {
                 *incomplete = true;
             } else {
                 progressed = true;
@@ -1646,7 +1647,7 @@ impl Marker {
                 if outcome == KillOutcome::Terminated {
                     fault::note_holder_kill(id.pid(), signal);
                 }
-                outcome == KillOutcome::NotAttempted
+                matches!(outcome, KillOutcome::NotAttempted(_))
             }
         }
     }

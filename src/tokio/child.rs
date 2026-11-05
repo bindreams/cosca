@@ -860,15 +860,14 @@ impl Child {
     /// was killed, the root included, and a retry can work. (`Drop` cannot retry, so it still
     /// kills the root and logs that descendants may be orphaned.)
     ///
+    /// On the `TreeWalk` mechanism, a walk that killed what it could and left a member running is an
+    /// [`Error::MemberNotKilled`] naming the first and why: its identity could not be read, or its
+    /// kill was refused. The handle backstop still ran; a retry walks again.
+    ///
     /// On the Unix process-group and session mechanisms this returns
     /// [`Error::Containment`](crate::error::Error::Containment) when a live member of the
     /// group refused the signal — a setuid binary in the tree is the ordinary cause. The
     /// tree is still running and this process cannot bring it down.
-    ///
-    /// **This guarantee, and its converse — that `Ok` is positive proof the group cleared —
-    /// hold only for the `ProcessGroup`/`Session` mechanisms**, not `TreeWalk`: a separate,
-    /// unfixed gap means `TreeWalk` does not yet propagate a live refuser's outcome into this
-    /// call's result.
     ///
     /// **A `hidepid`-restricted Linux host can still return `Ok` with a live refuser left
     /// running.** `/proc` is this mechanism's only way to confirm the group cleared, and
@@ -1031,10 +1030,9 @@ impl Child {
     /// readable leaf id, or a member listed as pid `0` in an unseen pid namespace); one `warn` names
     /// the leaf and pids. [`kill_tree`](Child::kill_tree) still reaches them.
     ///
-    /// See [`kill_tree`](Child::kill_tree)'s doc for four things that also apply here: the
-    /// `ProcessGroup`/`Session`-only scope of this guarantee (a separate, unfixed gap for
-    /// `TreeWalk`), the residual `hidepid` gap on Linux, a root reaped by something else, and a reap
-    /// between a check and its send, which may send the `SIGTERM` to a number another process holds.
+    /// See [`kill_tree`](Child::kill_tree)'s doc for three things that also apply here: the
+    /// residual `hidepid` gap on Linux, a root reaped by something else, and a reap between a check
+    /// and its send, which may send the `SIGTERM` to a number another process holds.
     ///
     /// **Windows, after the root's exit has been observed.** The event is addressed by the
     /// ROOT's pid — on the job-object mechanism and the tree walk alike — and this handle stops

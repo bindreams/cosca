@@ -26,6 +26,21 @@ fn stale_root() -> ProcessId {
     me.with_other_value()
 }
 
+/// `result` is the error of a walk that left `pid` unkilled, and its message says each of `causes`.
+#[track_caller]
+fn assert_not_killed(result: Result<(), Error>, pid: u32, causes: &[&str]) {
+    match result {
+        Err(Error::MemberNotKilled { pid: named, source }) => {
+            assert_eq!(named, pid, "the first member left behind");
+            let said = source.to_string();
+            for cause in causes {
+                assert!(said.contains(cause), "the error must name {cause:?}: {said}");
+            }
+        }
+        other => panic!("expected MemberNotKilled for pid {pid} naming {causes:?}, got {other:?}"),
+    }
+}
+
 fn assert_unassessable_naming(result: Result<(), Error>, causes: &[&str]) {
     match result {
         Err(Error::Unassessable { detail, .. }) => {
@@ -68,7 +83,7 @@ type Walk = fn(&dyn Kernel, ProcessId) -> Result<(), Error>;
 /// The walks that take an identity.
 fn id_walks() -> [(&'static str, Walk); 2] {
     [
-        ("hard_kill", |k, id| super::hard_kill(k, id).map(|_| ())),
+        ("hard_kill", |k, id| super::hard_kill(k, id)),
         ("terminate", |k, id| super::terminate(k, id)),
     ]
 }
@@ -76,7 +91,7 @@ fn id_walks() -> [(&'static str, Walk); 2] {
 /// Every walk, `Process`'s included, over an open handle on the live `id`.
 fn walks() -> [(&'static str, Walk); 4] {
     [
-        ("hard_kill", |k, id| super::hard_kill(k, id).map(|_| ())),
+        ("hard_kill", |k, id| super::hard_kill(k, id)),
         ("terminate", |k, id| super::terminate(k, id)),
         ("kill_tree", |k, id| open_live(id).kill_tree_with(k)),
         ("terminate_tree", |k, id| open_live(id).terminate_tree_with(k)),
@@ -218,7 +233,7 @@ fn a_live_root_missing_from_the_table_still_has_its_descendant_walked_and_killed
         let pids: Vec<u32> = members.iter().map(ProcessId::pid).collect();
         assert_eq!(pids, [descendant.pid()], "{recursive:?}");
     }
-    assert!(super::hard_kill(&kernel, root).expect("the walk ran"));
+    super::hard_kill(&kernel, root).expect("the walk ran");
     // Both were killed: the root by its signal, the descendant before it could print.
     let mut printed = String::new();
     std::io::Read::read_to_string(&mut child.stdout.take().expect("piped stdout"), &mut printed).expect("read to EOF");
@@ -335,10 +350,8 @@ fn kill_by_identity_spares_a_pid_the_kernel_cannot_read_or_shows_as_another_proc
     let unreadable_kernel = FakeKernel::over(&HostKernel)
         .live_without_pidfs(pid, pidfd_of(pid))
         .on_read(&format!("{pid}/stat"), Err(libc::EACCES));
-    assert_eq!(
-        super::kill_by_identity(&unreadable_kernel, id, nix::sys::signal::Signal::SIGTERM),
-        super::KillOutcome::NotAttempted
-    );
+    let outcome = super::kill_by_identity(&unreadable_kernel, id, nix::sys::signal::Signal::SIGTERM);
+    assert!(matches!(outcome, super::KillOutcome::NotAttempted(_)), "{outcome:?}");
     let new_owner = FakeKernel::over(&HostKernel)
         .live_without_pidfs(pid, pidfd_of(pid))
         .on_read(&format!("{pid}/stat"), Ok(&stat_of_a_new_owner(pid)));
@@ -359,10 +372,12 @@ fn kill_by_identity_spares_a_pidfs_pid_the_kernel_cannot_open_or_shows_as_anothe
     let pid = id.pid();
     let ino = id.pidfs_ino().expect("a pidfs host makes pidfs ids");
     let refusing = FakeKernel::over(&HostKernel).on_pidfd_open(pid, Err(rustix::io::Errno::MFILE));
-    assert_eq!(
-        super::kill_by_identity(&refusing, id, nix::sys::signal::Signal::SIGTERM),
-        super::KillOutcome::NotAttempted
-    );
+    // The reason is the refusal's own, so an error built from it names the process and why.
+    let outcome = super::kill_by_identity(&refusing, id, nix::sys::signal::Signal::SIGTERM);
+    let super::KillOutcome::NotAttempted(why) = outcome else {
+        panic!("expected NotAttempted, got {outcome:?}");
+    };
+    assert!(why.contains(&pid.to_string()) && why.contains("pidfd"), "{why}");
     let new_owner = FakeKernel::over(&HostKernel).on_pidfs_ino(pid, Ok(Some(ino + 1)));
     assert_eq!(
         super::kill_by_identity(&new_owner, id, nix::sys::signal::Signal::SIGTERM),
@@ -463,7 +478,13 @@ fn every_id_walk_re_verifies_a_descendants_kill_through_its_kernel() {
                 .live_without_pidfs(descendant.pid(), pidfd_of(descendant.pid()))
                 .on_read_after(&format!("{}/stat", descendant.pid()), 2, answer);
             let result = walk(&kernel, root);
-            assert!(result.is_ok(), "{name}, new owner {shows_a_new_owner}: {result:?}");
+            // A refused kill leaves the descendant running, so `hard_kill` names it; `terminate` is
+            // best effort. A descendant shown as another process is gone, not left behind.
+            if name == "hard_kill" && !shows_a_new_owner {
+                assert_not_killed(result, descendant.pid(), &[]);
+            } else {
+                assert!(result.is_ok(), "{name}, new owner {shows_a_new_owner}: {result:?}");
+            }
             release_with_a_signalled_root(name, child, signo);
         }
     }
@@ -480,15 +501,21 @@ fn root_with_an_unreadable_descendant() -> (std::process::Child, ProcessId, Proc
     (child, root, descendant, kernel)
 }
 
-/// A descendant the walk cannot read is not signalled, and `hard_kill` says it did not reach every
-/// member (`Ok(false)`), so its caller does not mark the tree killed. `terminate` is best effort and
-/// stays `Ok`. Mutants: "an `Unknown` read is dropped as `Gone`": `Ok(true)`; "`terminate` reports
-/// the incomplete walk".
+/// A descendant the walk cannot read is not signalled, and `hard_kill` and `Process::kill_tree`
+/// are an error naming it and why, so a caller does not take the tree for killed. `terminate` is best
+/// effort and stays `Ok`. Mutants: "an `Unknown` read is dropped as `Gone`": `Ok`; "`kill_tree`
+/// drops the walk's error"; "`terminate` reports the incomplete walk".
 #[skuld::test]
-fn a_descendant_that_cannot_be_read_makes_hard_kill_incomplete_and_leaves_terminate_ok() {
-    let (child, root, _, kernel) = root_with_an_unreadable_descendant();
-    assert!(!super::hard_kill(&kernel, root).expect("the walk ran"));
+fn a_descendant_that_cannot_be_read_makes_hard_kill_and_kill_tree_err_naming_it_and_leaves_terminate_ok() {
+    let (child, root, descendant, kernel) = root_with_an_unreadable_descendant();
+    let cause = format!("pid {} identity could not be read", descendant.pid());
+    assert_not_killed(super::hard_kill(&kernel, root), descendant.pid(), &[&cause]);
     release_with_a_signalled_root("hard_kill", child, libc::SIGKILL);
+
+    let (child, root, descendant, kernel) = root_with_an_unreadable_descendant();
+    let cause = format!("pid {} identity could not be read", descendant.pid());
+    assert_not_killed(open_live(root).kill_tree_with(&kernel), descendant.pid(), &[&cause]);
+    release_with_a_signalled_root("kill_tree", child, libc::SIGKILL);
 
     let (child, root, _, kernel) = root_with_an_unreadable_descendant();
     super::terminate(&kernel, root).expect("best effort");

@@ -515,10 +515,10 @@ fn macos_late_tree_walk_that_fails_before_the_root_kill_says_its_tree_may_be_lef
     );
 }
 
-/// A walk that left a member it could not kill is not a complete kill, though it returns `Ok`: the
-/// warn says so, even when a later walk is complete.
+/// A walk that left a member it could not kill is an error naming it: the warn says so, even when a
+/// later walk is complete.
 ///
-/// Mutant: the sweep reads only the walk's `Ok`, not whether it was complete.
+/// Mutant: a later walk's `Ok` overwrites the error of the first.
 #[skuld::test]
 fn macos_late_tree_walk_that_leaves_a_member_says_its_tree_may_be_left() {
     let (pid, fate, _, mark) = late_tree_walk(crate::containment::treewalk::fault::force_incomplete_once);
@@ -526,11 +526,7 @@ fn macos_late_tree_walk_that_leaves_a_member_says_its_tree_may_be_left() {
     assert_one_warn(
         pid,
         mark,
-        &[
-            SAID_REAPED,
-            "its tree may not be fully killed",
-            "a member could not be killed",
-        ],
+        &[SAID_REAPED, "its tree may not be fully killed", "was not killed"],
         &[],
     );
 }

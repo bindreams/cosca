@@ -581,27 +581,8 @@ impl Attached {
         Ok(false)
     }
 
-    /// Hard-kill the contained tree (best-effort; already-gone is success).
-    pub(crate) fn hard_kill(&self, root: &crate::containment::GroupRoot<'_>) -> Result<(), crate::error::Error> {
-        self.hard_kill_report(root).0
-    }
-
-    /// [`hard_kill`](Self::hard_kill), and record in `killed` that the tree is gone when the kill
-    /// was complete: `Ok`, and for a `TreeWalk` also a walk with no unresolved member. A kill
-    /// that failed or left members behind marks nothing.
-    pub(crate) fn hard_kill_marking(
-        &self,
-        killed: &TreeKilled,
-        root: &crate::containment::GroupRoot<'_>,
-    ) -> Result<(), crate::error::Error> {
-        let (result, complete) = self.hard_kill_report(root);
-        if result.is_ok() && complete {
-            killed.mark();
-        }
-        result
-    }
-
-    /// The kill's result, and whether it was complete. Only a `TreeWalk`'s `Ok` can be incomplete.
+    /// Hard-kill the contained tree (best-effort; already-gone is success). `Ok` means the tree is
+    /// gone: a `TreeWalk` that left a member behind is an [`Error::MemberNotKilled`].
     ///
     /// `root` is the root a send to a group named by its pid needs (see
     /// [`GroupRoot`](crate::containment::GroupRoot)); every other mechanism ignores it.
@@ -609,11 +590,8 @@ impl Attached {
         not(unix),
         allow(unused_variables, reason = "only Unix names a group by the root's pid")
     )]
-    pub(crate) fn hard_kill_report(
-        &self,
-        root: &crate::containment::GroupRoot<'_>,
-    ) -> (Result<(), crate::error::Error>, bool) {
-        let result = match self {
+    pub(crate) fn hard_kill(&self, root: &crate::containment::GroupRoot<'_>) -> Result<(), crate::error::Error> {
+        match self {
             Attached::None | Attached::Delegated => Ok(()),
             #[cfg(unix)]
             Attached::ProcessGroup(pgid) => crate::containment::unix::kill_group(*pgid, root),
@@ -623,24 +601,32 @@ impl Attached {
             Attached::JobObject(job) => job.hard_kill().map_err(Error::Io),
             #[cfg(target_os = "macos")]
             Attached::FdMarker(m) => m.hard_kill(root),
-            Attached::TreeWalk(root) => {
-                return match crate::containment::treewalk::hard_kill(&crate::identity::HostKernel, *root) {
-                    Ok(complete) => (Ok(()), complete),
-                    Err(e) => (Err(e), false),
-                };
-            }
-        };
-        let complete = result.is_ok();
-        (result, complete)
+            Attached::TreeWalk(root) => crate::containment::treewalk::hard_kill(&crate::identity::HostKernel, *root),
+        }
+    }
+
+    /// [`hard_kill`](Self::hard_kill), and record in `killed` that the tree is gone when it was `Ok`.
+    /// A kill that failed or left members behind marks nothing.
+    pub(crate) fn hard_kill_marking(
+        &self,
+        killed: &TreeKilled,
+        root: &crate::containment::GroupRoot<'_>,
+    ) -> Result<(), crate::error::Error> {
+        let result = self.hard_kill(root);
+        if result.is_ok() {
+            killed.mark();
+        }
+        result
     }
 
     /// Whether `result`, from [`hard_kill`](Self::hard_kill), is a `TreeWalk` refusal to walk: the
     /// snapshot could not be taken, or the root exists but could not be queried, so NOTHING was
     /// killed, the root included. Killing the root anyway would reparent the descendants out of the
     /// ppid walk, so a retry could no longer find them. Every other mechanism's error is a kill that
-    /// was attempted.
+    /// was attempted, and so is a `TreeWalk`'s [`Error::MemberNotKilled`]: that walk killed what it
+    /// could and left a member.
     pub(crate) fn hard_kill_refused_to_walk(&self, result: &Result<(), crate::error::Error>) -> bool {
-        matches!(self, Attached::TreeWalk(_)) && result.is_err()
+        matches!(self, Attached::TreeWalk(_)) && matches!(result, Err(e) if !matches!(e, Error::MemberNotKilled { .. }))
     }
 
     /// Send the graceful termination signal to the group (signal-only).

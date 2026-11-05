@@ -208,6 +208,20 @@ pub enum Error {
         #[source]
         source: Option<std::io::Error>,
     },
+    /// A tree-walk kill left a member running: it killed what it could, and `pid`, the first member
+    /// it left behind, was not. `source` says why: the member's identity could not be read
+    /// ([`Error::Unassessable`]), or its kill was refused ([`Error::Containment`]). The other
+    /// members were killed, or are further members it left; the message names only the first.
+    ///
+    /// Comes from the `TreeWalk` mechanism's `kill_tree` and `graceful_shutdown_tree`, and from
+    /// [`Process::kill_tree`](crate::Process::kill_tree) and its `graceful_shutdown_tree`, which walk
+    /// the tree. A retry walks again.
+    #[error("pid {pid} was not killed: {source}")]
+    MemberNotKilled {
+        pid: u32,
+        #[source]
+        source: Box<Error>,
+    },
     /// The pid names a live thread that is not its process's thread-group leader, so it is not
     /// a process that can be waited on or signalled as one (on Linux, `pidfd_open` refuses it).
     /// Not "gone": the thread is running. `source` is the OS error that refused it; compare
@@ -474,6 +488,10 @@ impl Error {
             Error::Unassessable { detail, source } => Error::Unassessable {
                 detail: append(detail),
                 source,
+            },
+            Error::MemberNotKilled { pid, source } => Error::MemberNotKilled {
+                pid,
+                source: Box::new(source.with_note(note)),
             },
             Error::NotThreadGroupLeader { pid, detail, source } => Error::NotThreadGroupLeader {
                 pid,

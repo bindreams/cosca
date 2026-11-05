@@ -514,8 +514,8 @@ fn drop_after_a_failed_kill_tree_and_wait_still_warns() {
     assert_eq!(records[0].0, log::Level::Warn);
 }
 
-/// The same for a `TreeWalk` whose walk was incomplete but returned `Ok`. Not on macOS, where
-/// `TreeWalk` mode is an fd marker, whose incompleteness is an `Err` (the test above).
+/// The same for a `TreeWalk` whose walk was incomplete, which is an `Err` of its own variant. Not on
+/// macOS, where `TreeWalk` mode is an fd marker (the test above).
 #[cfg(not(target_os = "macos"))]
 #[skuld::test]
 fn drop_after_an_incomplete_tree_walk_kill_and_wait_still_warns() {
@@ -527,7 +527,10 @@ fn drop_after_an_incomplete_tree_walk_kill_and_wait_still_warns() {
     let mut child = cmd.spawn().expect("spawn");
     let stdin = child.stdin().expect("stdin pipe");
     crate::containment::treewalk::fault::force_incomplete_once();
-    child.kill_tree().expect("a tree walk reports Ok");
+    let left = child
+        .kill_tree()
+        .expect_err("a tree walk that left a member is an error");
+    assert!(matches!(left, crate::error::Error::MemberNotKilled { .. }), "{left:?}");
     // Released after the kill so a no-op kill fails the assertion, not the wait.
     drop(stdin);
     crate::test_child::assert_killed("the root", child.wait().expect("reap the root"));

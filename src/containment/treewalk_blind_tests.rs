@@ -20,9 +20,7 @@ type Walk = fn(&crate::Process) -> Result<(), Error>;
 
 fn walks() -> [(&'static str, Walk); 4] {
     [
-        ("hard_kill", |p| {
-            super::hard_kill(&crate::identity::HostKernel, p.id()).map(|_| ())
-        }),
+        ("hard_kill", |p| super::hard_kill(&crate::identity::HostKernel, p.id())),
         ("terminate", |p| super::terminate(&crate::identity::HostKernel, p.id())),
         ("kill_tree", |p| p.kill_tree()),
         ("terminate_tree", |p| p.terminate_tree()),
@@ -130,9 +128,7 @@ fn every_walk_over_a_failed_edge_allocation_errors_and_signals_nothing() {
 fn every_walk_from_a_root_that_lost_its_pid_is_ok_and_signals_nothing() {
     type IdWalk = fn(ProcessId) -> Result<(), Error>;
     let walks: [(&str, IdWalk); 2] = [
-        ("hard_kill", |id| {
-            super::hard_kill(&crate::identity::HostKernel, id).map(|_| ())
-        }),
+        ("hard_kill", |id| super::hard_kill(&crate::identity::HostKernel, id)),
         ("terminate", |id| super::terminate(&crate::identity::HostKernel, id)),
     ];
     let me = ProcessId::current();

@@ -276,6 +276,57 @@ async fn async_kill_tree_backstop_is_load_bearing() {
     );
 }
 
+/// A walk that killed some and left a member returns an error of its own variant, which is not a
+/// refusal to walk: the handle backstop still runs, so the root dies, and the error is returned.
+/// (macOS `TreeWalk` mode is an fd marker, which has no such walk.)
+/// Mutant: the incomplete walk's error is taken for a refusal to walk, so `kill_tree` returns it
+/// without the backstop.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[skuld::test]
+fn sync_kill_tree_after_an_incomplete_walk_still_runs_the_handle_backstop() {
+    use super::super::treewalk::fault;
+    let mut cmd = crate::test_child::command(Console::Hidden);
+    cmd.args(["cat"]);
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+    cmd.contain_with(crate::ContainMode::TreeWalk);
+    let mut child = cmd.spawn().expect("spawn");
+    // Closed right after the kill: a no-op backstop exits 0.
+    let stdin = child.stdin().expect("piped stdin");
+    fault::set_force_root_kill_noop(true);
+    fault::force_incomplete_once();
+    let left = child.kill_tree().expect_err("the walk left a member");
+    assert!(matches!(left, crate::error::Error::MemberNotKilled { .. }), "{left:?}");
+    drop(stdin);
+    let status = child.wait().expect("reap");
+    assert!(
+        !status.success(),
+        "the handle backstop must be what killed the root, got {status:?}"
+    );
+}
+
+#[cfg(all(unix, not(target_os = "macos"), feature = "tokio"))]
+#[skuld::test]
+async fn async_kill_tree_after_an_incomplete_walk_still_runs_the_handle_backstop() {
+    use super::super::treewalk::fault;
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
+    cmd.args(["cat"]);
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+    cmd.contain_with(crate::ContainMode::TreeWalk);
+    let mut child = cmd.spawn().expect("spawn");
+    // Closed right after the kill: a no-op backstop exits 0.
+    let stdin = child.stdin().expect("piped stdin");
+    fault::set_force_root_kill_noop(true);
+    fault::force_incomplete_once();
+    let left = child.kill_tree().expect_err("the walk left a member");
+    assert!(matches!(left, crate::error::Error::MemberNotKilled { .. }), "{left:?}");
+    drop(stdin);
+    let status = child.wait().await.expect("reap");
+    assert!(
+        !status.success(),
+        "the handle backstop must be what killed the root, got {status:?}"
+    );
+}
+
 // fd marker install policy (macOS) =====
 
 /// The install policy, exhaustively: every mode installs a marker for a ROOT spawn, no

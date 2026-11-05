@@ -490,10 +490,7 @@ fn a_root_that_exited_while_its_handle_is_held_is_walked_and_its_child_killed() 
         children.iter().any(|id| id.pid() == ping),
         "{ping} not among {children:?}"
     );
-    assert!(
-        super::hard_kill(&HostKernel, root).expect("an exited root whose handle is held is walked"),
-        "the walk is complete"
-    );
+    super::hard_kill(&HostKernel, root).expect("an exited root whose handle is held is walked completely");
 
     // SAFETY: `ping_handle` is our live handle with the synchronize right. The wait ends with the
     // kill just asked for, or with the child's own exit.
@@ -524,7 +521,35 @@ fn kill_by_identity_reports_not_attempted_when_the_open_is_denied() {
     let id = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
         .expect("the owned handle always yields an identity");
     assert!(child.is_running(), "precondition: the subject must be live");
-    assert_eq!(super::kill_by_identity(id), super::KillOutcome::NotAttempted);
+    let outcome = super::kill_by_identity(id);
+    assert!(matches!(outcome, super::KillOutcome::NotAttempted(_)), "{outcome:?}");
+    assert!(child.is_running(), "a denied open must leave the process running");
+}
+
+/// A root the walk may read but not terminate is left running, and `hard_kill` is an error naming it
+/// and why. Mutant: `hard_kill` drops a `NotAttempted` outcome.
+#[cfg(windows)]
+#[skuld::test]
+fn hard_kill_of_a_root_whose_open_is_denied_is_an_error_naming_it() {
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(hard_kill_of_a_root_whose_open_is_denied_is_an_error_naming_it),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
+    // Readable by pid, but not terminable: the walk anchors on it, and its kill is refused.
+    let child = crate::identity::windows_fixture::spawn_query_only(&done);
+    let id = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
+        .expect("the owned handle always yields an identity");
+    assert!(child.is_running(), "precondition: the subject must be live");
+    match super::hard_kill(&crate::identity::HostKernel, id) {
+        Err(crate::error::Error::MemberNotKilled { pid, source }) => {
+            assert_eq!(pid, child.pid());
+            let said = source.to_string();
+            assert!(said.contains("could not be queried"), "{said}");
+        }
+        other => panic!("expected MemberNotKilled for the root, got {other:?}"),
+    }
     assert!(child.is_running(), "a denied open must leave the process running");
 }
 

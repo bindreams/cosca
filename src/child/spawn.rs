@@ -1127,11 +1127,9 @@ impl LateTree {
                     let state = crate::signal::RootState::of_peek(crate::wait::exit_only::peek_verified(&target));
                     crate::child::tree_call::group_number_holds(pid, state)
                 };
-                let result = match attached.hard_kill_report(&crate::containment::GroupRoot::new(None, &check)) {
-                    (Err(e), _) => Err(e.to_string()),
-                    (Ok(()), false) => Err("a member could not be killed".to_owned()),
-                    (Ok(()), true) => Ok(()),
-                };
+                let result = attached
+                    .hard_kill(&crate::containment::GroupRoot::new(None, &check))
+                    .map_err(|e| e.to_string());
                 self.fold(result);
             }
             // The root is not shown ours any more: only the holders, and never the root.

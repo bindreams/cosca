@@ -328,7 +328,7 @@ fn root_proof_fails() -> FakeKernel<'static> {
 fn a_root_whose_proof_finds_another_process_walks_nothing() {
     let sends = crate::send_log::Capture::start();
     let walks = super::fault::record_walks();
-    assert!(super::hard_kill(&root_changed_hands(), root()).expect("a gone root is Ok"));
+    super::hard_kill(&root_changed_hands(), root()).expect("a gone root is Ok");
     super::terminate(&root_changed_hands(), root()).expect("a gone root is Ok");
     for recursive in [Recursive::No, Recursive::Yes] {
         let children = root().children_with(&root_changed_hands(), recursive);
@@ -347,7 +347,7 @@ fn a_root_whose_proof_cannot_be_made_is_unassessable_and_signals_nothing() {
     let sends = crate::send_log::Capture::start();
     let walks = super::fault::record_walks();
     let results = [
-        super::hard_kill(&root_proof_fails(), root()).map(|_| ()),
+        super::hard_kill(&root_proof_fails(), root()),
         super::terminate(&root_proof_fails(), root()),
         root().children_with(&root_proof_fails(), Recursive::No).map(|_| ()),
         root().children_with(&root_proof_fails(), Recursive::Yes).map(|_| ()),
