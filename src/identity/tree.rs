@@ -58,9 +58,12 @@ impl ProcessId {
                 ));
             }
         };
-        let key = match self.order_key_with(kernel) {
-            (Resolved::Found(key), _) => key,
-            (Resolved::Gone, _) => return Ok(None),
+        // `ppid` is only a number: `self`'s own read must still name it, and the parent must still
+        // hold it after that read (Linux; the other platforms check neither).
+        let key = match ProcessId::of_ordered_with(kernel, self.pid(), Some(parent)) {
+            (Resolved::Found((read, key)), _) if read == *self => key,
+            // `self` was replaced, exited, or has another parent now.
+            (Resolved::Found(_) | Resolved::Gone, _) => return Ok(None),
             (Resolved::Unknown, cause) => {
                 return Err(crate::containment::treewalk::unqueryable(
                     &format!("pid {}", self.pid()),

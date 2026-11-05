@@ -84,3 +84,43 @@ fn a_pidfs_id_whose_start_time_cannot_be_read_is_unassessable() {
         other => panic!("expected Unassessable, got {other:?}"),
     }
 }
+
+/// The snapshot's ppid is only a number. If `self`'s own read, which follows, shows another ppid,
+/// the process changed parents (or its pid changed hands) and has no parent to name. Mutant: "the
+/// read's ppid is not compared with the snapshot's": the old parent is named.
+#[skuld::test]
+fn an_id_whose_own_read_shows_another_ppid_has_no_parent() {
+    let kernel = table(1_000).on_read_after(&format!("{SELF}/stat"), 1, Ok(&stat(SELF, 1, 2_000)));
+    assert_eq!(me().parent_with(&kernel).expect("a readable table"), None);
+}
+
+/// [`table`] on a host whose pidfds have no inode: the ticks are the proof, read from `stat`.
+fn ticks_table() -> FakeKernel<'static> {
+    FakeKernel::over(&HostKernel)
+        .same_view()
+        .on_pids(Ok(&[PARENT, SELF]))
+        .on_pidfd_open(PARENT, Ok(stand_in()))
+        .on_pidfs_ino(PARENT, Ok(None))
+        .on_pidfd_open(SELF, Ok(stand_in()))
+        .on_pidfs_ino(SELF, Ok(None))
+        .on_read(&format!("{PARENT}/stat"), Ok(&stat(PARENT, 1, 1_000)))
+        .on_read(&format!("{SELF}/stat"), Ok(&stat(SELF, PARENT, 2_000)))
+}
+
+fn ticks_me() -> ProcessId {
+    ProcessId::from_parts_for_test(SELF, Key::Ticks(2_000))
+}
+
+/// The parent's number is proved again after `self`'s read: the parent's `stat` is read by the
+/// snapshot, by its own resolve, and then by that proof, which finds another start time. Mutant:
+/// "the parent is not proved again after `self`'s read": the parent is named.
+#[skuld::test]
+fn a_parent_that_loses_its_number_after_the_childs_read_is_not_named() {
+    let held = ticks_table();
+    assert_eq!(
+        ticks_me().parent_with(&held).expect("a readable table"),
+        Some(ProcessId::from_parts_for_test(PARENT, Key::Ticks(1_000)))
+    );
+    let lost = ticks_table().on_read_after(&format!("{PARENT}/stat"), 2, Ok(&stat(PARENT, 1, 1_001)));
+    assert_eq!(ticks_me().parent_with(&lost).expect("a readable table"), None);
+}
