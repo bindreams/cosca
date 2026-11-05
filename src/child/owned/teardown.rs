@@ -30,7 +30,9 @@ use std::io;
 use std::process::ExitStatus;
 
 use super::{ChildWaitOutcome, OwnedChild};
-use crate::child::lifecycle::{orphaned_note, status_of_outcome, wait_to_exit, Orphaned, WaitToExitError};
+use crate::child::lifecycle::{
+    left_uncollected, orphaned_note, status_of_outcome, wait_to_exit, Orphaned, WaitToExitError,
+};
 use crate::error::{ChildFate, Error};
 use crate::identity::ProcessId;
 use crate::os_process::child::Foreign;
@@ -56,12 +58,13 @@ impl Disposition {
         self == Disposition::HandBack && torn.uncollected
     }
 
-    /// What a warn about an uncollected child adds when the caller hands it back: where the child
-    /// went. Nothing for a caller that leaves it.
-    pub(crate) fn handed_back_suffix(self) -> &'static str {
-        match self {
-            Disposition::Leave => "",
-            Disposition::HandBack => "; handed back to the caller in the error",
+    /// What a warn about a child adds when the caller hands it back: where the child went. Nothing
+    /// for a caller that leaves it, or for a child the teardown [collected](TeardownOutcome::uncollected)
+    /// (`uncollected` false): there is none to hand back.
+    pub(crate) fn handed_back_suffix(self, uncollected: bool) -> &'static str {
+        match (self, uncollected) {
+            (Disposition::HandBack, true) => "; handed back to the caller in the error",
+            _ => "",
         }
     }
 }
@@ -128,9 +131,11 @@ pub(crate) struct TeardownOutcome {
     /// nor shown reaped elsewhere. It is the child the caller can hand back
     /// ([`Disposition::hands_back`]). It is not [`fate`](Self::fate)'s to say: a refused kill whose
     /// look failed is `Unknown`, and a kill whose wait failed is `Killed`, and both are uncollected,
-    /// while a `Killed` child someone else reaped is not.
+    /// while a `Killed` child someone else reaped is not, and neither is one this teardown reaped
+    /// whose exit record was unreadable.
     pub(crate) uncollected: bool,
-    /// How the look at an elevation front ([`TeardownKind::Look`]) went; `None` for a child killed.
+    /// How the look at an elevation front ([`TeardownKind::Look`]) went; for a child killed, `None`,
+    /// or the failure of the look after a refused kill ([`look_after_refused_kill`](OwnedChild::look_after_refused_kill)).
     #[cfg_attr(windows, allow(dead_code, reason = "no Windows teardown looks at a front yet"))]
     pub(crate) look: Option<LookOutcome>,
     pub(crate) left: Option<String>,
@@ -222,7 +227,7 @@ impl OwnedChild {
 
     /// The outcome of a root teardown whose wait after the kill reaped nothing, `delivered` or not.
     /// Only a delivered kill says the child is dead or dying. A child the wait failed on is left
-    /// uncollected, and the leftover says where it goes under `disposition`.
+    /// uncollected if the wait failed, and the leftover says where it goes under `disposition`.
     fn settle_unreaped(&self, delivered: bool, unreaped: WaitToExitError, disposition: Disposition) -> TeardownOutcome {
         let pid = self.pid();
         match unreaped {
@@ -238,26 +243,30 @@ impl OwnedChild {
                     left: (foreign == Foreign::Orphaned).then(|| orphaned_note(pid)),
                 }
             }
-            WaitToExitError::Failed(e) => TeardownOutcome {
-                fate: if delivered {
-                    ChildFate::Killed
-                } else {
-                    ChildFate::Unknown
-                },
-                // The wait failed: the zombie, if there is one, is still ours.
-                uncollected: true,
-                look: None,
-                left: Some(format!(
-                    "teardown of {}: the reap after the kill failed: {e}{}",
-                    child_named(pid),
-                    disposition.handed_back_suffix()
-                )),
-            },
+            failed => {
+                let uncollected = failed.uncollected();
+                let e = Error::from(failed);
+                TeardownOutcome {
+                    fate: if delivered {
+                        ChildFate::Killed
+                    } else {
+                        ChildFate::Unknown
+                    },
+                    uncollected,
+                    look: None,
+                    left: Some(format!(
+                        "teardown of {}: the reap after the kill failed: {e}{}",
+                        child_named(pid),
+                        disposition.handed_back_suffix(uncollected)
+                    )),
+                }
+            }
         }
     }
 
     /// The one look after a kill that failed with `refused`, never a wait. `id` is the child's
-    /// identity, if the caller read one.
+    /// identity, if the caller read one. A look that failed is also
+    /// [`TeardownOutcome::look`], as [`LookOutcome::LookFailed`].
     pub(crate) fn look_after_refused_kill(
         &self,
         id: Option<ProcessId>,
@@ -268,16 +277,24 @@ impl OwnedChild {
         let who = child_named(pid);
         // A child reaped elsewhere is read from the typed outcome, so it is `Gone` on every OS: the
         // error `status_of_outcome` renders it as is `ECHILD` on Unix only.
-        let (fate, look_failure) = match self.wait(Some(crate::wait::now())) {
+        let waited = self.wait(Some(crate::wait::now()));
+        // The look collects a child that has exited, whatever its record says, and finds one reaped
+        // elsewhere gone; any other answer is a child that is still ours and uncollected.
+        let uncollected = left_uncollected(&waited);
+        let (fate, look_failure) = match waited {
             Ok(ChildWaitOutcome::Foreign(foreign)) => (foreign.fate(false), None),
-            looked => {
-                let looked = looked.and_then(|outcome| status_of_outcome(pid, outcome, Orphaned::Quiet));
-                let failure = looked.as_ref().err().map(ToString::to_string);
-                let fate = crate::child::spawn::fate_of_a_look(looked.map_err(|e| e.into_io().raw_os_error()), id);
-                (fate, failure)
-            }
+            looked => match looked.and_then(|outcome| status_of_outcome(pid, outcome, Orphaned::Quiet)) {
+                Ok(status) => (crate::child::spawn::fate_of_a_look(Ok(status), id), None),
+                Err(failure) => {
+                    let errno = match &failure {
+                        Error::Io(e) => e.raw_os_error(),
+                        _ => None,
+                    };
+                    (crate::child::spawn::fate_of_a_look(Err(errno), id), Some(failure))
+                }
+            },
         };
-        let left = match (&fate, look_failure) {
+        let left = match (&fate, &look_failure) {
             (ChildFate::Running { .. }, _) => Some(match disposition {
                 Disposition::Leave => format!("{who} could not be terminated ({refused}); leaving it running"),
                 Disposition::HandBack => {
@@ -286,17 +303,14 @@ impl OwnedChild {
             }),
             (ChildFate::Unknown, Some(failure)) => Some(format!(
                 "{who} could not be terminated ({refused}), and the look at it failed: {failure}{}",
-                disposition.handed_back_suffix()
+                disposition.handed_back_suffix(uncollected)
             )),
             _ => None,
         };
-        // The look collects a child that has exited and finds one reaped elsewhere `Gone`; any other
-        // fate of a look is a child that is still ours and uncollected.
-        let uncollected = matches!(fate, ChildFate::Running { .. } | ChildFate::Unknown);
         TeardownOutcome {
             fate,
             uncollected,
-            look: None,
+            look: look_failure.map(LookOutcome::LookFailed),
             left,
         }
     }
@@ -311,7 +325,9 @@ impl OwnedChild {
         due: Option<Due>,
     ) -> TeardownOutcome {
         let pid = self.pid();
-        let looked = match self.wait(Some(crate::wait::now())) {
+        let waited = self.wait(Some(crate::wait::now()));
+        let uncollected = left_uncollected(&waited);
+        let looked = match waited {
             Ok(ChildWaitOutcome::Foreign(foreign)) => {
                 return TeardownOutcome::of_front(foreign.fate(false), LookOutcome::ReapedElsewhere, false);
             }
@@ -319,7 +335,7 @@ impl OwnedChild {
         };
         match looked {
             Ok(Some(status)) => TeardownOutcome::of_front(ChildFate::Reaped, LookOutcome::Reaped(status), false),
-            Err(e) => TeardownOutcome::of_front(ChildFate::Unknown, LookOutcome::LookFailed(e), true),
+            Err(e) => TeardownOutcome::of_front(ChildFate::Unknown, LookOutcome::LookFailed(e), uncollected),
             Ok(None) => {
                 // The look saw it running; an unreadable reach leaves open only whether the kill
                 // reached it.
@@ -345,8 +361,13 @@ impl OwnedChild {
                             Err(WaitToExitError::Elsewhere(foreign)) => {
                                 TeardownOutcome::of_front(foreign.fate(true), LookOutcome::ReapedElsewhere, false)
                             }
-                            Err(WaitToExitError::Failed(e)) => {
-                                TeardownOutcome::of_front(ChildFate::Killed, LookOutcome::ReapFailed(e), true)
+                            Err(failed) => {
+                                let uncollected = failed.uncollected();
+                                TeardownOutcome::of_front(
+                                    ChildFate::Killed,
+                                    LookOutcome::ReapFailed(failed.into()),
+                                    uncollected,
+                                )
                             }
                         }
                     }

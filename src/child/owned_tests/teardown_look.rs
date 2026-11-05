@@ -5,7 +5,7 @@
 use std::cell::RefCell;
 use std::io;
 
-use super::teardown::{due_now, exit, fake, fire_on_block, id, slow_warns, PID};
+use super::teardown::{child_with_an_unreadable_exit, due_now, exit, fake, fire_on_block, id, slow_warns, PID};
 use crate::child::owned::teardown::{LookOutcome, Reach, TeardownKind, TeardownOutcome};
 use crate::child::owned::OwnedChild;
 use crate::error::ChildFate;
@@ -423,6 +423,24 @@ mod worded {
         }
     }
 
+    /// A front collected with its exit record unreadable is worded as a failure, without a hand-back
+    /// the caller has no child for.
+    ///
+    /// Mutant: the wording adds the hand-back suffix whatever the outcome.
+    #[skuld::test]
+    fn a_front_collected_with_an_unreadable_exit_record_is_worded_without_a_hand_back() {
+        for disposition in BOTH {
+            let torn = child_with_an_unreadable_exit().tear_down(Some(id()), TeardownKind::Look(Ok(None)), None);
+            let worded = crate::child::word_front(TeardownCaller::Drop, PID, &WHY, disposition, torn);
+            let left = worded.left.expect("a failure to say");
+            assert!(
+                left.contains("could not be looked at") && left.contains("unreadable"),
+                "{left}"
+            );
+            assert!(!left.contains("handed back"), "{disposition:?}: {left}");
+        }
+    }
+
     #[skuld::test]
     fn a_front_reaped_is_said_at_debug() {
         for disposition in BOTH {
@@ -611,6 +629,21 @@ fn a_front_waited_for_past_its_threshold_warns_once() {
         assert_outcome(&torn, ChildFate::Reaped, Went::Reaped);
         assert_eq!(slow_warns(&records).len(), warned, "{records:?}");
     }
+}
+
+/// A front whose look consumed the zombie without an exit record is collected: the look failed, but
+/// nothing is left to hand back.
+///
+/// Mutant: a failed look is uncollected whatever failed it.
+#[skuld::test]
+fn a_front_whose_look_found_the_exit_record_unreadable_is_collected() {
+    let torn = child_with_an_unreadable_exit().tear_down(Some(id()), TeardownKind::Look(Ok(None)), None);
+    assert_eq!(
+        (went(&torn), &torn.fate),
+        (Went::LookFailed, &ChildFate::Unknown),
+        "{torn:?}"
+    );
+    assert!(!torn.uncollected, "{torn:?}");
 }
 
 /// A front left running is never waited for, so a threshold never has it look for the exit.

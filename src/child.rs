@@ -1250,11 +1250,11 @@ fn word_front(
         }
         LookOutcome::LookFailed(e) => Some(format!(
             "elevation front pid {pid} could not be looked at after its cgroup's teardown ({e}){}",
-            disposition.handed_back_suffix()
+            disposition.handed_back_suffix(torn.uncollected)
         )),
         LookOutcome::ReapFailed(e) => Some(format!(
             "elevation front pid {pid} was killed through its cgroup, and could not be reaped ({e}){}",
-            disposition.handed_back_suffix()
+            disposition.handed_back_suffix(torn.uncollected)
         )),
         LookOutcome::LeftRunning => Some(match disposition {
             Disposition::Leave => format!(

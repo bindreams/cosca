@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 use std::process::Stdio as StdStdio;
 
 #[cfg(unix)]
+use crate::child::lifecycle::{wait_to_exit, Orphaned, WaitToExitError};
+#[cfg(unix)]
 use crate::child::owned::teardown::Disposition;
 use crate::child::owned::OwnedChild;
 pub(crate) use crate::child::spawn::failure::{after_the_spawn, Classify, SpawnFailure};
@@ -114,12 +116,13 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
 /// warns once: the unsettled root, a failed reap and any other leftover share one record, labelled
 /// `finish_elevated`.
 ///
-/// A root the cleanup did not show collected is handed back in the error (an `Unreaped`) and the
-/// handle is disarmed: a root whose kill was refused (or never sent, for a live front) and whose
-/// look found it running or failed, or whose reap failed after a delivered kill. The handle is also
+/// A root the cleanup did not show collected ([`TeardownOutcome::uncollected`]) is handed back in
+/// the error (an `Unreaped`) and the handle is disarmed. The drop that would have retried a failed
+/// tree kill does not run for it, so the cleanup retries that kill once first. The handle is also
 /// disarmed once the tree is settled: killed, not for the cleanup to kill, or deliberately left
-/// alone (a reaped or unpinned root). Only a failed tree kill leaves the handle armed, so its drop
-/// writes the kill again; that drop does not warn of the event a second time.
+/// alone (a reaped or unpinned root). Only a failed tree kill with a root not handed back leaves
+/// the handle armed, so its drop writes the kill again; that drop does not warn of the event a
+/// second time.
 #[cfg(unix)]
 pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> Result<Child, SpawnFailure> {
     let Err(write_err) = written else {
@@ -138,14 +141,14 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     let mut report = crate::child::drop_report::DropReport::new(&view);
     let mut skipped = None;
     let front_closed = matches!(gate, crate::elevation::front::Gate::Closed(_));
-    let tree = (child.containment().can_teardown() && !front_closed).then(|| {
+    let kill_tree = || {
         // The handle owns the child outright here, so no reap can land.
         let held = child.proc.hold(child.id.pid());
         child
             .attached
             .hard_kill_marking_unless_reaped(&view, &child.tree_killed, &held.group())
-            .map(|s| skipped = s)
-    });
+    };
+    let tree = (child.containment().can_teardown() && !front_closed).then(|| kill_tree().map(|s| skipped = s));
     let tree_failure = match &tree {
         Some(Err(e)) => Some(e.to_string()),
         _ => None,
@@ -203,6 +206,11 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
             Ok(crate::signal::Sent::Unverified) => {
                 debug_assert!(false, "a sync child's kill always verifies its target");
                 uncollected = true;
+                report.left.push(format!(
+                    "the elevated child pid {pid} could not be terminated (it could not be verified, and may still be \
+                     running){}",
+                    Disposition::HandBack.handed_back_suffix(uncollected)
+                ));
                 (
                     "the elevated child could not be terminated (it could not be verified, and may still be running)"
                         .to_string(),
@@ -223,35 +231,25 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
                         };
                         (note.to_string(), ChildFate::Reaped)
                     }
-                    Err(e) if exited_front => {
-                        uncollected = !reaped_elsewhere(&e);
+                    Err(waited) => {
+                        uncollected = waited.uncollected();
+                        let e = Error::from(waited);
+                        let (what, note) = if exited_front {
+                            (
+                                "exited ",
+                                format!("the elevated child had already exited, but could not be reaped ({e})"),
+                            )
+                        } else {
+                            (
+                                "killed ",
+                                format!("the elevated child was killed but could not be reaped ({e})"),
+                            )
+                        };
                         report.left.push(format!(
-                            "could not reap the exited elevated child pid {pid}: {e}{}",
-                            if uncollected {
-                                Disposition::HandBack.handed_back_suffix()
-                            } else {
-                                ""
-                            }
+                            "could not reap the {what}elevated child pid {pid}: {e}{}",
+                            Disposition::HandBack.handed_back_suffix(uncollected)
                         ));
-                        (
-                            format!("the elevated child had already exited, but could not be reaped ({e})"),
-                            ChildFate::Killed,
-                        )
-                    }
-                    Err(e) => {
-                        uncollected = !reaped_elsewhere(&e);
-                        report.left.push(format!(
-                            "could not reap the killed elevated child pid {pid}: {e}{}",
-                            if uncollected {
-                                Disposition::HandBack.handed_back_suffix()
-                            } else {
-                                ""
-                            }
-                        ));
-                        (
-                            format!("the elevated child was killed but could not be reaped ({e})"),
-                            ChildFate::Killed,
-                        )
+                        (note, ChildFate::Killed)
                     }
                 }
             }
@@ -259,23 +257,33 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
                 #[cfg(test)]
                 fault::run_between_kill_and_wait();
                 // The non-blocking look reaps a child that has exited by now.
-                let fate = fate_of_a_look(child.try_wait().map_err(|e| e.raw_os_error()), Some(child.id()));
-                // A look that collected the root, or found it reaped elsewhere, leaves nothing.
-                uncollected = matches!(fate, ChildFate::Running { .. } | ChildFate::Unknown);
-                if uncollected {
-                    report.left.push(format!(
-                        "the elevated child pid {pid} could not be terminated ({e}); handed back to the caller in the error"
-                    ));
-                }
-                (format!("the elevated child could not be terminated ({e})"), fate)
+                let note = format!("the elevated child could not be terminated ({e})");
+                let looked = child
+                    .proc
+                    .look_after_refused_kill(Some(child.id()), e, Disposition::HandBack);
+                uncollected = looked.uncollected;
+                report.left.extend(looked.left);
+                let note = match looked.look {
+                    Some(crate::child::owned::teardown::LookOutcome::LookFailed(failure)) => {
+                        format!("{note}, and the look at it failed: {failure}")
+                    }
+                    _ => note,
+                };
+                (note, looked.fate)
             }
         }
     };
-    let warned = report.emit(&[]);
     // A root not shown collected is the caller's: it is disarmed, and handed back in the error.
     let mut torn = crate::child::owned::teardown::TeardownOutcome::new(fate);
     torn.uncollected = uncollected;
     let hands_back = Disposition::HandBack.hands_back(&torn);
+    // A handed-back root takes the drop that would have retried a failed tree kill with it: retry
+    // here. The failed first kill has been reported (`report.tree`); the error's note says no more
+    // of it once the retry worked.
+    if hands_back && !tree_settled && kill_tree().is_ok() {
+        tree_note.clear();
+    }
+    let warned = report.emit(&[]);
     let root_note = if hands_back {
         format!("{root_note}; it is handed back to the caller")
     } else {
@@ -315,20 +323,14 @@ pub(crate) fn fate_of_a_look(
     }
 }
 
-/// Whether a failed wait says someone else reaped the child (`ECHILD`): it is then not ours to hand back.
-#[cfg(unix)]
-fn reaped_elsewhere(error: &Error) -> bool {
-    matches!(error, Error::Io(e) if e.raw_os_error() == Some(libc::ECHILD))
-}
-
-/// `child.wait()` after the root's kill, which a test can force to fail. The forced failure still
+/// The wait for the root after its kill, which a test can force to fail. The forced failure still
 /// REAPS first, so the test that asks for it leaks nothing.
 #[cfg(unix)]
-fn wait_killed_elevated(child: &Child) -> Result<std::process::ExitStatus, Error> {
-    let waited = child.wait();
+fn wait_killed_elevated(child: &Child) -> Result<std::process::ExitStatus, WaitToExitError> {
+    let waited = wait_to_exit(&child.proc, None, Orphaned::Warn);
     #[cfg(test)]
     if let Some(marker) = fault::take_force_reap_failure() {
-        return waited.and(Err(Error::Io(std::io::Error::other(marker))));
+        return waited.and(Err(WaitToExitError::Failed(Error::Io(std::io::Error::other(marker)))));
     }
     waited
 }
@@ -3016,17 +3018,17 @@ pub(crate) mod fault {
     /// find every elevation front still running, as they find one its leaf's kill reached but that
     /// has not exited yet: in the kernel a task leaves its cgroup, which ends the leaf's drain,
     /// before its parent can collect it.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "tokio"))]
     pub(crate) fn see_fronts_running() -> SeeFrontsRunning {
         FRONTS_SEEN_RUNNING.with(|f| f.set(true));
         SeeFrontsRunning(())
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "tokio"))]
     #[must_use = "fronts are seen as they are again as soon as the guard is dropped"]
     pub(crate) struct SeeFrontsRunning(());
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "tokio"))]
     impl Drop for SeeFrontsRunning {
         fn drop(&mut self) {
             FRONTS_SEEN_RUNNING.with(|f| f.set(false));

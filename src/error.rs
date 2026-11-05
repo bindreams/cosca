@@ -246,9 +246,9 @@ pub enum Error {
     /// child they could not kill: a failed release may leave its thread frozen, so waiting for it
     /// could block for ever.
     ///
-    /// A failed sync spawn hands back a child it could not end in the same way on Linux, when the
-    /// identity read or the attach fails after the handshake, and on every Unix when the elevation
-    /// backend's password write fails. The other failed spawns leave such a child running and warn.
+    /// A failed sync spawn hands back a child on Linux, when the identity read or the attach fails
+    /// after the handshake, and on every Unix when the elevation backend's password write fails. The
+    /// other failed spawns leave such a child running and warn.
     ///
     /// On Windows, a failed `ShellExecuteEx` launch is classified by its error (see `runas_failure`).
     #[error("the program may have started, and {fate}{}: {source}", elevated_note(.fate, *.wrapper_elevated))]
@@ -425,7 +425,7 @@ impl Error {
     }
 
     /// The OS error code of an [`Error::Io`], for a look whose failure is told apart by it.
-    #[cfg(any(unix, feature = "tokio"))]
+    #[cfg(feature = "tokio")]
     pub(crate) fn raw_os_error(&self) -> Option<i32> {
         match self {
             Error::Io(e) => e.raw_os_error(),

@@ -27,6 +27,17 @@ pub(super) fn exit() -> ExitRecord {
     ExitRecord::Status(ExitStatus::default())
 }
 
+/// A child whose reap consumed the zombie and read no exit record, so every wait on it answers
+/// `Exited(Unreadable)`. A debug build asserts that contract breach after it caches the record; a
+/// release build returns.
+pub(super) fn child_with_an_unreadable_exit() -> OwnedChild {
+    let child = OwnedChild::new(Box::new(
+        fake().reaps([ReapAnswer::Reaped(ExitRecord::Unreadable { si_code: 7 })]),
+    ));
+    _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| child.wait(None)));
+    child
+}
+
 /// What `tear_down(id, Kill, due)` returned over `fake`, and everything it logged on this thread.
 fn tear_down_logged(
     fake: &FakeProcess,
@@ -128,6 +139,64 @@ fn a_refused_kill_whose_look_failed_is_worded_by_the_disposition() {
             .signals([crate::os_process::fake::failed_signal(libc::EPERM)]);
         let torn = tear_down_as(&fake, disposition);
         assert_left_says(&torn, disposition, "and the look at it failed");
+    }
+}
+
+/// A leftover about a child whose reap consumed the zombie but read no exit record: the child is
+/// collected, so a caller that hands children back has none to hand back, and the leftover does not
+/// say it did.
+#[track_caller]
+fn assert_collected_with_an_unreadable_record(torn: &TeardownOutcome, disposition: Disposition, wanted: &str) {
+    let text = torn.left.as_deref().unwrap_or_default();
+    assert!(text.contains(wanted) && text.contains("unreadable"), "{torn:?}");
+    assert!(!text.contains("handed back"), "{torn:?}");
+    assert!(!torn.uncollected, "{torn:?}");
+    assert!(!disposition.hands_back(torn), "{torn:?}");
+}
+
+/// A reap after a kill that consumed the zombie without an exit record leaves nothing to hand back,
+/// though the wait reports an error.
+///
+/// Mutant: any failed wait is uncollected.
+#[skuld::test]
+fn a_reap_after_a_kill_whose_exit_record_was_unreadable_leaves_nothing_uncollected() {
+    for disposition in [Disposition::Leave, Disposition::HandBack] {
+        let torn = child_with_an_unreadable_exit().reap_after_tree_kill(disposition);
+        assert_eq!(torn.fate, ChildFate::Killed, "{torn:?}");
+        assert_collected_with_an_unreadable_record(&torn, disposition, "the reap after the kill");
+    }
+}
+
+/// The same through the entry point: a kill sent nothing to a child already reaped, and the wait after
+/// it meets the unreadable record.
+///
+/// Mutant: any failed wait is uncollected.
+#[skuld::test]
+fn a_teardown_of_a_child_with_an_unreadable_exit_leaves_nothing_uncollected() {
+    for disposition in [Disposition::Leave, Disposition::HandBack] {
+        let torn = child_with_an_unreadable_exit().tear_down(
+            Some(id()),
+            TeardownKind::Kill {
+                disposition,
+                tree: None,
+            },
+            None,
+        );
+        assert_eq!(torn.fate, ChildFate::Unknown, "{torn:?}");
+        assert_collected_with_an_unreadable_record(&torn, disposition, "the reap after the kill");
+    }
+}
+
+/// A refused kill whose look consumed the zombie without an exit record leaves nothing to hand back.
+///
+/// Mutant: a look that failed is uncollected whatever failed it.
+#[skuld::test]
+fn a_refused_kill_whose_look_found_the_exit_record_unreadable_leaves_nothing_uncollected() {
+    for disposition in [Disposition::Leave, Disposition::HandBack] {
+        let refused = crate::error::Error::Io(std::io::Error::other("refused"));
+        let torn = child_with_an_unreadable_exit().look_after_refused_kill(Some(id()), refused, disposition);
+        assert_eq!(torn.fate, ChildFate::Unknown, "{torn:?}");
+        assert_collected_with_an_unreadable_record(&torn, disposition, "the look at it failed");
     }
 }
 

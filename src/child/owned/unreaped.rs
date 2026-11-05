@@ -15,8 +15,8 @@ use crate::os_process::child_named;
 /// [`output`](crate::Command::output) or [`read`](crate::Command::read) that failed after it, could
 /// not end: its kill was refused (`EPERM`, `ACCESS_DENIED`), or it is an elevation front, which is
 /// sent none, or the wait for it failed after the kill; and it is not known to have been collected.
-/// Its fate in the error is then `Running`, or `Unknown` when the look at it failed, or `Killed` when
-/// the wait failed. It comes back in [`Error::MayHaveStarted`], which the caller owns from then on.
+/// Its fate in the error is one of a child not known to be collected; see [`Error::MayHaveStarted`],
+/// which it comes back in and the caller owns from then on.
 ///
 /// Settle it with [`wait`](Unreaped::wait), which blocks until the child exits and reaps it, or
 /// [`leak`](Unreaped::leak), which gives it up. A value dropped otherwise does what `wait` does,
@@ -98,6 +98,9 @@ impl Drop for Unreaped {
             Err(WaitToExitError::Elsewhere(Foreign::Orphaned)) => log::warn!("{}", orphaned_note(pid)),
             Err(WaitToExitError::Elsewhere(_)) => {
                 log::debug!("{who} was dropped without wait or leak; someone else had reaped it");
+            }
+            Err(WaitToExitError::Unreadable(e)) => {
+                log::warn!("{who} was dropped without wait or leak; reaped it, but its exit was unreadable: {e}")
             }
             Err(WaitToExitError::Failed(e)) => {
                 log::warn!("{who} was dropped without wait or leak, and waiting for it failed: {e}")

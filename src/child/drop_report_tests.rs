@@ -167,6 +167,63 @@ fn finish_elevated_hands_back_a_root_whose_kill_was_refused_and_look_failed() {
     assert!(status.success(), "the root exits on EOF: {status:?}");
 }
 
+/// A root whose kill was refused and whose look failed: the look's failure is in the cleanup's one
+/// warn and in the error's detail, as the refusal is.
+///
+/// Mutant: the cleanup keeps the fate of the look and drops its error.
+#[skuld::test]
+fn finish_elevated_names_the_failure_of_the_look_after_a_refused_kill() {
+    crate::log_capture::install();
+    let (mut child, writer) = bare_blocker();
+    let mark = crate::log_capture::mark();
+    child.proc.script_over(|f| {
+        f.signals([refused()])
+            .reaps([crate::os_process::fake::ReapAnswer::Err(std::io::ErrorKind::Other)])
+    });
+
+    let failure = crate::child::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
+    let (cause, _, handed_back) = crate::test_child::expect_handed_back(failure.into(), writer);
+
+    let failed_look = std::io::Error::from(std::io::ErrorKind::Other).to_string();
+    let warns = warns_since(mark);
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(
+        warns[0].contains(&format!("and the look at it failed: {failed_look}")),
+        "{warns:?}"
+    );
+    assert!(
+        cause
+            .to_string()
+            .contains(&format!("and the look at it failed: {failed_look}")),
+        "{cause}"
+    );
+    handed_back.wait();
+}
+
+/// A root someone else reaped between the delivered kill and its reap is not the cleanup's to hand
+/// back: the error carries no child, and the handle is disarmed.
+///
+/// Mutant: a failed wait hands the root back whatever failed it.
+#[skuld::test]
+fn finish_elevated_hands_back_nothing_when_the_root_was_reaped_elsewhere_after_the_kill() {
+    crate::log_capture::install();
+    let (mut child, writer) = bare_blocker();
+    let teardowns = crate::child::owned::seams::record_root_teardowns();
+    child.proc.script_over(|f| {
+        f.signals([Ok(crate::signal::Sent::Delivered)])
+            .reaps([crate::os_process::fake::ReapAnswer::Foreign(
+                crate::os_process::child::Foreign::Gone,
+            )])
+    });
+
+    let failure = crate::child::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
+    let (_, fate, handed_back) = crate::test_child::expect_may_have_started_parts(failure.into(), writer);
+
+    assert_eq!(fate, crate::error::ChildFate::Killed);
+    assert!(handed_back.is_none(), "a root reaped elsewhere is not handed back");
+    assert_eq!(teardowns.count(), 0, "the handle is disarmed: its drop does not retry");
+}
+
 /// A failed spawn's cleanup whose reap fails after a delivered kill: the root is not shown
 /// collected, so it is handed back and the handle is disarmed, and the handle's drop does not retry.
 ///
@@ -234,9 +291,8 @@ fn child_in_a_leaf_whose_kill_fails() -> (
 }
 
 /// A tree kill that fails in a cleanup that then kills the root: the tree is not settled, so the
-/// handle stays armed, and its drop writes the kill again. This is the one path that leaves the
-/// handle armed. The drop's kill fails again with what the cleanup already warned of, so the drop's
-/// record is `debug`, and the cleanup's is the one warn.
+/// handle stays armed, and its drop writes the kill again. The drop's kill fails again with what the
+/// cleanup already warned of, so the drop's record is `debug`, and the cleanup's is the one warn.
 ///
 /// Mutant: the drop's report warns again of what the cleanup warned of.
 #[cfg(target_os = "linux")]
@@ -306,6 +362,38 @@ fn a_transient_tree_kill_failure_is_retried_by_the_drop() {
         "the failed kill is reported once, and the retry adds nothing"
     );
     reaps.assert_killed();
+}
+
+/// A tree kill that fails in a cleanup whose root kill is refused: the root is handed back and the
+/// handle disarmed, so no drop retries the tree kill. The cleanup retries it before it hands the
+/// root back.
+///
+/// Mutant: the cleanup hands the root back without retrying a failed tree kill.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_failed_tree_kill_is_retried_before_the_root_is_handed_back() {
+    use crate::child::spawn::fault;
+
+    crate::log_capture::install();
+    let (mut child, writer, _leaf_path, kill_file, _dir) = child_in_a_leaf_whose_kill_fails();
+    child.proc.script_over(|f| f.signals([refused()]));
+    // The failure ends once the root's kill is refused: the retry finds a file it can write.
+    let healed = kill_file.clone();
+    let _hook = fault::set_between_kill_and_wait(move || {
+        std::fs::remove_dir(&healed).expect("remove the directory");
+        std::fs::write(&healed, b"").expect("create cgroup.kill");
+    });
+
+    let failure = crate::child::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
+    let (_, fate, handed_back) = crate::test_child::expect_handed_back(failure.into(), writer);
+
+    assert!(matches!(fate, crate::error::ChildFate::Running { .. }), "{fate:?}");
+    assert_eq!(
+        std::fs::read(&kill_file).expect("read cgroup.kill"),
+        crate::containment::cgroup::KILL_PAYLOAD,
+        "the cleanup must retry the tree kill"
+    );
+    handed_back.wait();
 }
 
 /// A handle that could not say, when the root's number shows it reaped: the doubt is not dropped

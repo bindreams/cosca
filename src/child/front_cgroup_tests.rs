@@ -1162,14 +1162,11 @@ pub(crate) fn assert_left_running(kill: LeafKill, failures: [HeldFailure; 2], ha
     }
 }
 
-/// A failed spawn's teardown drops a contained front's leaf first, whose kill ends it, then waits
-/// for it through its pidfd, reaps it and says so, on the error it would have returned anyway. The
-/// front's stdin stays open, so only the kill ends it. The teardown is made to see the front still
-/// running, as it can: a task leaves its cgroup, which ends the leaf's drain, before its parent can
-/// collect it.
+/// A failed spawn's teardown drops a contained front's leaf first, whose kill ends it, then looks at
+/// it, waits for it through its pidfd if it is still dying, reaps it and says so, on the error it
+/// would have returned anyway. The front's stdin stays open, so only the kill ends it.
 #[skuld::test]
 fn cgroup_a_failed_spawn_kills_a_contained_front_and_reaps_it(#[fixture(cgroup)] _group: &Group) {
-    let _running = crate::child::spawn::fault::see_fronts_running();
     let failures = failed_held_front_spawns(LeafKill::Lands, |cmd| cmd.spawn().map(drop));
     assert_killed_by_the_leaf(&failures, None);
 }
@@ -1179,7 +1176,6 @@ fn cgroup_a_failed_spawn_kills_a_contained_front_and_reaps_it(#[fixture(cgroup)]
 /// removal answers.
 #[skuld::test]
 fn cgroup_a_failed_spawn_kills_a_front_read_through_proc_and_reaps_it(#[fixture(cgroup)] _group: &Group) {
-    let _running = crate::child::spawn::fault::see_fronts_running();
     let failures = failed_held_front_spawns(LeafKill::LandsReadThroughProc, |cmd| cmd.spawn().map(drop));
     assert_killed_by_the_leaf(&failures, None);
 }
@@ -1453,7 +1449,6 @@ fn cgroup_a_front_nested_under_its_leaf_is_killed_under_hidepid(#[fixture(cgroup
 /// sweep's record places it; the teardown waits for it and reaps it.
 #[skuld::test]
 fn cgroup_a_failed_spawn_kills_a_front_nested_under_its_leaf_under_hidepid(#[fixture(cgroup)] _group: &Group) {
-    let _running = crate::child::spawn::fault::see_fronts_running();
     let failures = failed_held_front_spawns(LeafKill::LandsNestedHidden, |cmd| cmd.spawn().map(drop));
     assert_killed_by_the_leaf(&failures, None);
 }
