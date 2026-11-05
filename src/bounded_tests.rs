@@ -54,6 +54,17 @@ mod waits {
         _ = current.wait_timeout(std::time::Duration::ZERO);
     }
 
+    /// `wait_to_exit`, which an `Unreaped` dropped over a child that has exited still enters.
+    ///
+    /// Mutant: drop the assert from `wait_to_exit`.
+    #[skuld::test]
+    #[should_panic(expected = "would block inside an async Drop")]
+    fn unreaped_drop_refuses_inside_a_section() {
+        let unreaped = crate::test_child::over_fake::exited_unreaped(crate::identity::ProcessId::current());
+        let _section = Section::enter();
+        drop(unreaped);
+    }
+
     /// `Attached::wait_drained`, on a mechanism with no drain edge: refused all the same.
     ///
     /// Mutant: drop the assert from `Attached::wait_drained`.

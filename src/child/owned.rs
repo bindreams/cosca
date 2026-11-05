@@ -39,6 +39,8 @@ use crate::signal::{Sent, Sig};
 mod holder;
 #[path = "owned/teardown.rs"]
 pub(crate) mod teardown;
+#[path = "owned/unreaped.rs"]
+pub(crate) mod unreaped;
 #[path = "owned/waiting.rs"]
 mod waiting;
 
