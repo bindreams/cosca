@@ -206,10 +206,7 @@ impl Reap {
             Reap::Unpinned => None,
             Reap::OwnFree | Reap::ForeignFree | Reap::ForeignSeen => Some(Resolved::Gone),
             Reap::OwnUnknown => Some(Resolved::Unknown),
-            Reap::OwnReused | Reap::ForeignReused => Some(Resolved::Found(ProcessId::from_parts_for_test(
-                root.pid(),
-                root.start_token_raw() + 1,
-            ))),
+            Reap::OwnReused | Reap::ForeignReused => Some(Resolved::Found(root.with_other_value())),
         }
     }
 }

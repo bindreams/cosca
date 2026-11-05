@@ -189,7 +189,7 @@ pub(crate) fn adopt_pidfd(
 
     let target = rustix::process::Pid::from_raw(id.pid() as i32).expect("a spawned child's pid is never 0");
     let pidfd = kernel
-        .pidfd_open(target)
+        .pidfd_open(target, rustix::process::PidfdFlags::empty())
         .map_err(|e| Error::Io(crate::error::io_context("pidfd_open", std::io::Error::from(e))))?;
     // Never in a stdio slot: with 0, 1 or 2 closed, the lowest free number is one, and the
     // application may `dup2` its stdio back over it, destroying the pidfd.

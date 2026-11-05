@@ -14,7 +14,7 @@
 
 use std::time::{Duration, SystemTime};
 
-use super::{Liveness, RawPid, Resolved, StartToken};
+use super::{Key, Liveness, RawPid, Resolved};
 
 #[path = "macos/kinfo.rs"]
 pub(crate) mod kinfo;
@@ -57,16 +57,16 @@ pub(super) fn contract_violation(what: std::fmt::Arguments<'_>) {
     debug_assert!(false, "{what}");
 }
 
-fn token_of_bsd(info: &libc::proc_bsdinfo) -> StartToken {
-    StartToken::from_raw(info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
+fn token_of_bsd(info: &libc::proc_bsdinfo) -> Key {
+    Key::from_raw(info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
 }
 
-fn token_of_kinfo(info: &kinfo::kinfo_proc) -> StartToken {
+fn token_of_kinfo(info: &kinfo::kinfo_proc) -> Key {
     // SAFETY: the kernel's KERN_PROC copy always fills `p_starttime` (XNU
     // fill_externproc); the union's other arm is kernel-internal queue pointers never
     // exported here. Both arms are plain old data, so the read is defined.
     let start = unsafe { info.kp_proc.p_un.p_starttime };
-    StartToken::from_raw(start.tv_sec as u64 * 1_000_000 + start.tv_usec as u64)
+    Key::from_raw(start.tv_sec as u64 * 1_000_000 + start.tv_usec as u64)
 }
 
 /// Which identity read a [`uniq_info`] or [`held_by`] call is, so a test can inject a result into
@@ -499,7 +499,7 @@ pub(crate) mod ppid_fault {
     }
 }
 
-pub(super) fn start_token(pid: RawPid) -> Resolved<StartToken> {
+pub(super) fn start_token(pid: RawPid) -> Resolved<Key> {
     #[cfg(test)]
     if fault::is_unknown(pid) {
         return Resolved::Unknown;
@@ -625,11 +625,11 @@ fn fork_pause(attempt: u32) {
 }
 
 /// `proc_pidinfo` on self is always permitted, so the by-pid path cannot be denied here.
-pub(super) fn current_token() -> Resolved<StartToken> {
+pub(super) fn current_token() -> Resolved<Key> {
     start_token(std::process::id())
 }
 
-pub(super) fn is_running(pid: RawPid, start: StartToken) -> Liveness {
+pub(super) fn is_running(pid: RawPid, start: Key) -> Liveness {
     if let Some(info) = bsd_info(pid) {
         if token_of_bsd(&info) != start {
             return Liveness::Dead; // reused PID
@@ -660,7 +660,7 @@ pub(super) fn is_running(pid: RawPid, start: StartToken) -> Liveness {
     }
 }
 
-pub(super) fn created_at(start: StartToken) -> Option<SystemTime> {
+pub(super) fn created_at(start: Key) -> Option<SystemTime> {
     Some(SystemTime::UNIX_EPOCH + Duration::from_micros(start.raw()))
 }
 

@@ -6,16 +6,18 @@
 //!
 //! The kernel floor, the per-syscall versions, and how a refused syscall is classified
 //! (`Unsupported` versus `Io`) are in the crate root's "Platform requirements". Without `openat2`
-//! the checked `/proc` view cannot be built, and `open_verified_with` is `Unsupported` naming `openat2`.
+//! the checked `/proc` view cannot be built, and `open_verified_with` of an id told by its
+//! `starttime` (a host before Linux 6.9) is `Unsupported` naming `openat2`; an id told by its pidfd's
+//! inode needs no `/proc` view.
 //! `spawn` probes `pidfd_open` on this process's own pid before it forks ([`probe_pidfd_support_with`]),
 //! so a refusal fails the spawn with no child; see `child::spawn::pidfd_handshake` for the rest.
 
-use std::os::fd::AsFd;
+use std::os::fd::AsFd as _;
 
-use rustix::process::Pid;
+use rustix::process::{Pid, PidfdFlags};
 
 use crate::error::Error;
-use crate::identity::{Existence, Kernel, Liveness, PidfdTarget, ProcView, ProcessId, ViewUnreadable};
+use crate::identity::{Existence, Kernel, Liveness, PidfdTarget, ProcView, ProcessId, Proof, ViewUnreadable};
 use crate::os_process::OPEN_CONSEQUENCE;
 
 /// The operation an `Unsupported` open names.
@@ -24,16 +26,20 @@ const OP_NAME: &str = "process open";
 /// Open a pidfd for `id` through `kernel`, re-verifying identity. `Ok(None)` => already gone (treat
 /// as exited).
 ///
-/// Every `/proc` read goes through one checked `/proc` dirfd shown to describe `id`'s pid
-/// namespace; otherwise [`Error::Unassessable`], never a `Gone` off a foreign `/proc`.
+/// A `Pidfs` id is proved by its pidfd's inode and reads no `/proc`. For a `Ticks` id every `/proc`
+/// read goes through one checked `/proc` dirfd shown to describe `id`'s pid namespace; otherwise
+/// [`Error::Unassessable`], never a `Gone` off a foreign `/proc`.
 pub(crate) fn open_verified_with(kernel: &dyn Kernel, id: ProcessId) -> Result<Option<rustix::fd::OwnedFd>, Error> {
     debug_assert!(
         id.pid() <= i32::MAX as u32,
         "pid {} exceeds i32::MAX; pidfd cast would truncate",
         id.pid()
     );
+    if let Some(ino) = id.pidfs_ino() {
+        return open_proved(kernel, id, ino);
+    }
     let raw = Pid::from_raw(id.pid() as i32).expect("a resolvable ProcessId is never pid 0");
-    match kernel.pidfd_open(raw) {
+    match kernel.pidfd_open(raw, PidfdFlags::empty()) {
         Ok(pidfd) => verify_pidfd_target(kernel, id, pidfd),
         Err(rustix::io::Errno::SRCH) => Ok(None),
         // pidfd_open needs a pid that resolves to a thread-group leader task. EINVAL (< 6.16) /
@@ -41,19 +47,50 @@ pub(crate) fn open_verified_with(kernel: &dyn Kernel, id: ProcessId) -> Result<O
         // (gone), or a non-leader tid: live, or a ptraced zombie thread kept until its tracer
         // waits. Errno alone can't tell, so re-verify.
         Err(e @ (rustix::io::Errno::INVAL | rustix::io::Errno::NOENT)) => verify_without_pidfd(kernel, id, e),
-        Err(e) => match refusal_name(e) {
-            Some(name) => Err(pidfd_open_unsupported(OP_NAME, name)),
-            None => Err(Error::Io(crate::error::io_context(
-                "pidfd_open",
-                std::io::Error::from(e),
-            ))),
+        Err(e) => Err(open_error(e)),
+    }
+}
+
+/// `open_verified_with` for a `Pidfs` id: the pidfd's inode proves it, so no `/proc` is read.
+///
+/// A pid that holds a thread leading no group opens with `PIDFD_THREAD`: a live one is
+/// [`Error::NotThreadGroupLeader`], and one that has exited (a ptraced zombie thread kept until its
+/// tracer waits; its pidfd polls readable) is gone. A process reaped after the open still has its
+/// inode, so the pidfd is returned and polls readable.
+fn open_proved(kernel: &dyn Kernel, id: ProcessId, ino: u64) -> Result<Option<rustix::fd::OwnedFd>, Error> {
+    match crate::identity::prove(kernel, id.pid(), ino) {
+        Proof::Holds { fd, thread: None } => Ok(Some(fd)),
+        Proof::Holds {
+            fd,
+            thread: Some(errno),
+        } => match crate::os_process::poll::is_readable(fd.as_fd()) {
+            Ok(true) => Ok(None),
+            Ok(false) => Err(Error::NotThreadGroupLeader {
+                pid: id.pid(),
+                detail: OPEN_CONSEQUENCE.into(),
+                source: std::io::Error::from(errno),
+            }),
+            Err(e) => Err(Error::Io(crate::error::io_context("poll", e))),
         },
+        Proof::Lost => Ok(None),
+        Proof::Unknown(cause) => Err(open_error(
+            cause.errno().expect("a proof is unknown only for a failed pidfd call"),
+        )),
+    }
+}
+
+/// The error for a `pidfd_open` that failed with `errno` for a reason that says nothing about the
+/// target: a refusal is [`Error::Unsupported`], anything else [`Error::Io`].
+pub(crate) fn open_error(errno: rustix::io::Errno) -> Error {
+    match refusal_name(errno) {
+        Some(name) => pidfd_open_unsupported(OP_NAME, name),
+        None => Error::Io(crate::error::io_context("pidfd_open", std::io::Error::from(errno))),
     }
 }
 
 /// The name of `errno` if `pidfd_open` answering it is a refusal: no pidfd is possible here.
 /// The classification is documented on [`Error::Unsupported`].
-fn refusal_name(errno: rustix::io::Errno) -> Option<&'static str> {
+pub(crate) fn refusal_name(errno: rustix::io::Errno) -> Option<&'static str> {
     match errno {
         rustix::io::Errno::NOSYS => Some("ENOSYS"),
         rustix::io::Errno::PERM => Some("EPERM"),
@@ -63,7 +100,7 @@ fn refusal_name(errno: rustix::io::Errno) -> Option<&'static str> {
     }
 }
 
-fn pidfd_open_unsupported(op: &str, errno_name: &str) -> Error {
+pub(crate) fn pidfd_open_unsupported(op: &str, errno_name: &str) -> Error {
     Error::Unsupported {
         op: op.into(),
         platform: "linux",
@@ -91,7 +128,7 @@ pub(crate) fn spawn_open_error(errno: rustix::io::Errno) -> Error {
 /// can be installed after the first spawn.
 pub(crate) fn probe_pidfd_support_with(kernel: &dyn Kernel) -> Result<(), Error> {
     kernel
-        .pidfd_open(rustix::process::getpid())
+        .pidfd_open(rustix::process::getpid(), PidfdFlags::empty())
         .map(drop)
         .map_err(spawn_open_error)
 }
@@ -105,8 +142,7 @@ pub(crate) fn probe_pidfd_support_with(kernel: &dyn Kernel) -> Result<(), Error>
 ///   [`Error::NotThreadGroupLeader`]. `Unknown` from either query is `Unassessable`.
 /// - `Diverged`, or a view that could not be established, is `Unassessable` naming the view and
 ///   the `pidfd_open` errno. A raw `Io` here would surface as a bare `NotFound` on 6.16+, which
-///   reads as "gone", and `containment::unix::group` treats `Io` as "no pidfd" and falls back to
-///   `kill(2)`.
+///   reads as "gone".
 ///
 /// No pidfd to cross-check against, so the view comes from [`proc_view_with`](crate::identity::proc_view_with).
 fn verify_without_pidfd(
@@ -227,3 +263,7 @@ mod open_tests;
 #[cfg(test)]
 #[path = "open_namespace_tests.rs"]
 mod open_namespace_tests;
+
+#[cfg(test)]
+#[path = "open_pidfs_tests.rs"]
+mod open_pidfs_tests;
