@@ -323,7 +323,7 @@ fn resolve_or_drop_drops_an_access_denied_pid_and_warns() {
     );
     assert!(crate::log_capture::contains_since(
         mark,
-        &format!("treewalk: pid {} could not be queried", denied.pid())
+        &format!("treewalk: pid {} exists but could not be queried", denied.pid())
     ));
     assert!(denied.is_running(), "and dropping it must not have touched it");
 }
