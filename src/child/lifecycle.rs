@@ -5,9 +5,12 @@ use std::io;
 use std::process::ExitStatus;
 use std::time::{Duration, Instant};
 
+use super::owned::teardown::Disposition;
 use super::owned::{ChildWaitOutcome, OwnedChild};
+use super::spawn::FrontFate;
 use super::Child;
-use crate::error::Error;
+use crate::error::{ChildFate, Error};
+use crate::identity::ProcessId;
 use crate::os_process::child::{ExitRecord, Foreign};
 use crate::os_process::PIDLESS_CHILD;
 use crate::wait::teardown_warn::{wait_warning, Due};
@@ -32,7 +35,7 @@ pub(super) fn status_of_outcome(
         ChildWaitOutcome::Exited(ExitRecord::Status(status)) => Ok(Some(status)),
         ChildWaitOutcome::Exited(ExitRecord::Unreadable { si_code }) => Err(Error::Io(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("the child's exit record was unreadable (si_code {si_code})"),
+            unreadable(si_code),
         ))),
         ChildWaitOutcome::Foreign(foreign) => {
             if foreign == Foreign::Orphaned && orphaned == Orphaned::Warn {
@@ -44,60 +47,120 @@ pub(super) fn status_of_outcome(
     }
 }
 
-/// How [`wait_to_exit`] ended without a status.
-pub(super) enum WaitToExitError {
-    /// Someone else reaped the child.
-    Elsewhere(Foreign),
-    /// This handle reaped the child, and its exit record was unreadable.
-    Unreadable(Error),
-    /// The wait failed.
-    Failed(Error),
+/// What became of a child after a wait, or a look at the present moment, answered `answer`
+/// (`killed`: a kill reached the child, delivered by this handle or by a containment kill that
+/// reached it). The one classification of that answer: every teardown and every `Unreaped` asks it
+/// the fate, whether the child is left uncollected, the fate of an elevation front, and what to say.
+///
+/// | answer                       | [`fate`](Self::fate)  | [`uncollected`](Self::uncollected) | [`front_fate`](Self::front_fate) | [`wording`](Self::wording)                                  |
+/// | ---------------------------- | --------------------- | ---------------------------------- | -------------------------------- | ----------------------------------------------------------- |
+/// | `Exited(Status)`             | `Reaped`              | no                                 | `Reaped`                         | nothing                                                     |
+/// | `Exited(Unreadable)`         | `Reaped`              | no                                 | `Reaped`                         | warn "reaped it; e" ("after the kill" only if `killed`)     |
+/// | `Foreign(Gone, Other)`       | `f.fate(killed)`      | no                                 | `Unaccounted`                    | debug "reaped by someone else"                              |
+/// | `Foreign(Orphaned)`          | `f.fate(killed)`      | no                                 | `Unaccounted`                    | warn [`orphaned_note`]                                      |
+/// | `Err(e)`, `killed`           | `Killed`              | yes                                | `Unaccounted`                    | warn "the wait failed: e", and where the child goes         |
+/// | `Err(e)`, not `killed`       | `Unknown`             | yes                                | `Unaccounted`                    | as above                                                    |
+/// | `DeadlinePassed`, not killed | `Running { id }`      | yes                                | `LeftUnreaped`                   | warn: the caller's running clause                           |
+/// | `DeadlinePassed`, `killed`   | none: a kill is followed by a wait with no deadline, and [`new`](Self::new) asserts it | | |                                                  |
+///
+/// An unreadable record means the consuming reap took the zombie: the child was collected, only its
+/// exit is lost, so it is `Reaped` whether or not a kill reached it.
+#[derive(Debug)]
+pub(crate) struct Settlement {
+    answer: Result<ChildWaitOutcome, Error>,
+    killed: bool,
 }
 
-impl WaitToExitError {
-    /// Whether the child is still this process's after the wait ended so: only a wait that failed
-    /// leaves it, a zombie if there is one, uncollected. [`left_uncollected`] says the same of a
-    /// look.
-    pub(super) fn uncollected(&self) -> bool {
-        matches!(self, WaitToExitError::Failed(_))
+impl Settlement {
+    pub(crate) fn new(answer: Result<ChildWaitOutcome, Error>, killed: bool) -> Settlement {
+        debug_assert!(
+            !(killed && matches!(answer, Ok(ChildWaitOutcome::DeadlinePassed))),
+            "a kill is followed by a wait with no deadline"
+        );
+        Settlement { answer, killed }
     }
-}
 
-impl From<WaitToExitError> for Error {
-    /// A child reaped elsewhere is `ECHILD`, as every wait answers it.
-    fn from(error: WaitToExitError) -> Error {
-        match error {
-            WaitToExitError::Elsewhere(_) => Error::Io(echild()),
-            WaitToExitError::Unreadable(e) | WaitToExitError::Failed(e) => e,
+    /// What became of the child, whose identity the caller read as `id`, if it did.
+    pub(crate) fn fate(&self, id: Option<ProcessId>) -> ChildFate {
+        match &self.answer {
+            Ok(ChildWaitOutcome::Exited(_)) => ChildFate::Reaped,
+            Ok(ChildWaitOutcome::Foreign(foreign)) => foreign.fate(self.killed),
+            Err(_) if self.killed => ChildFate::Killed,
+            Err(_) => ChildFate::Unknown,
+            Ok(ChildWaitOutcome::DeadlinePassed) => ChildFate::Running { id },
+        }
+    }
+
+    /// Whether the child is still this process's: neither reaped by it nor shown reaped elsewhere.
+    /// It is the child a caller can hand back. A deadline that passed, or a wait that failed, leaves
+    /// it, a zombie if there is one.
+    pub(crate) fn uncollected(&self) -> bool {
+        !matches!(
+            self.answer,
+            Ok(ChildWaitOutcome::Exited(_) | ChildWaitOutcome::Foreign(_))
+        )
+    }
+
+    /// What became of an elevation front, which is sent nothing.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "only the Linux spawn words a front it looked at")
+    )]
+    pub(crate) fn front_fate(&self) -> FrontFate {
+        match &self.answer {
+            Ok(ChildWaitOutcome::Exited(_)) => FrontFate::Reaped,
+            Ok(ChildWaitOutcome::Foreign(_)) | Err(_) => FrontFate::Unaccounted,
+            Ok(ChildWaitOutcome::DeadlinePassed) => FrontFate::LeftUnreaped,
+        }
+    }
+
+    /// What to say of the child `pid`, and at what level; the caller logs it. `subject` leads every
+    /// line but a zombie launchd holds, which names the pid itself. `running` is the whole line
+    /// for a child still running. `disposition` adds where an uncollected child goes.
+    pub(crate) fn wording(
+        &self,
+        pid: Option<u32>,
+        subject: &str,
+        running: &str,
+        disposition: Disposition,
+    ) -> Option<(log::Level, String)> {
+        match &self.answer {
+            Ok(ChildWaitOutcome::Exited(ExitRecord::Status(_))) => None,
+            Ok(ChildWaitOutcome::Exited(ExitRecord::Unreadable { si_code })) => {
+                let after = if self.killed { " after the kill" } else { "" };
+                Some((
+                    log::Level::Warn,
+                    format!("{subject}: reaped it{after}; {}", unreadable(*si_code)),
+                ))
+            }
+            Ok(ChildWaitOutcome::Foreign(Foreign::Orphaned)) => Some((log::Level::Warn, orphaned_note(pid))),
+            Ok(ChildWaitOutcome::Foreign(_)) => Some((log::Level::Debug, format!("{subject}: reaped by someone else"))),
+            Err(e) => Some((
+                log::Level::Warn,
+                format!(
+                    "{subject}: the wait failed: {e}{}",
+                    disposition.handed_back_suffix(self.uncollected())
+                ),
+            )),
+            Ok(ChildWaitOutcome::DeadlinePassed) => Some((log::Level::Warn, running.to_owned())),
         }
     }
 }
 
-/// Whether a wait on the child, or a look at it, that answered `answer` left it uncollected: still
-/// this process's, neither reaped by it nor shown reaped elsewhere. A child that exited with an
-/// unreadable record was reaped, so it is not; a deadline that passed, or a wait that failed, is.
-pub(super) fn left_uncollected(answer: &Result<ChildWaitOutcome, Error>) -> bool {
-    !matches!(answer, Ok(ChildWaitOutcome::Exited(_) | ChildWaitOutcome::Foreign(_)))
-}
-
-/// Block until `proc` is reaped, and return its status. The wait has no deadline.
+/// Block until `proc` is reaped, and answer how the wait ended, never with a deadline passed.
 ///
 /// With `due`, it first waits as the handle does, bounded by the threshold, and warns once if the
 /// wait ends with the deadline passed ([`wait_warning`]). That watch is the handle's own wait, not a
 /// look at whether the child exited: a zombie a tracer holds is visible as exited but cannot be
 /// reaped, so it is "not ended" until it can be. Any other outcome of the bounded wait (an exit, a
 /// foreign reap, a failure) is the result, and nothing waits again. Only after the warn does the
-/// unbounded wait run. `orphaned` says whether a zombie launchd holds is warned of here.
-pub(super) fn wait_to_exit(
-    proc: &OwnedChild,
-    due: Option<Due>,
-    orphaned: Orphaned,
-) -> Result<ExitStatus, WaitToExitError> {
+/// unbounded wait run.
+pub(super) fn wait_to_exit(proc: &OwnedChild, due: Option<Due>) -> Result<ChildWaitOutcome, Error> {
     #[cfg(feature = "tokio")]
     crate::bounded::assert_may_block("a wait for a child's exit");
     let pid = proc.pid();
     // The state carries the bounded wait's answer to `wait` when it is the result.
-    let outcome = wait_warning(
+    let answer = wait_warning(
         (proc, None),
         due,
         |(proc, answer), until| {
@@ -110,19 +173,23 @@ pub(super) fn wait_to_exit(
         },
         |after| crate::child::spawn::warn_still_waiting(pid, after),
         |(proc, answer)| answer.unwrap_or_else(|| proc.wait(None)),
-    )
-    .map_err(WaitToExitError::Failed)?;
-    match (outcome, status_of_outcome(pid, outcome, orphaned)) {
-        (ChildWaitOutcome::Foreign(foreign), _) => Err(WaitToExitError::Elsewhere(foreign)),
-        (_, Ok(Some(status))) => Ok(status),
-        (_, Ok(None)) => {
-            debug_assert!(false, "an unbounded wait ended with no exit");
-            Err(WaitToExitError::Failed(Error::Io(io::Error::other(
-                "an unbounded wait ended with no exit",
-            ))))
-        }
-        (_, Err(e)) => Err(WaitToExitError::Unreadable(e)),
-    }
+    );
+    debug_assert!(
+        !matches!(answer, Ok(ChildWaitOutcome::DeadlinePassed)),
+        "an unbounded wait ended with no exit"
+    );
+    answer
+}
+
+/// [`wait_to_exit`] with no threshold, as the status the public waits answer.
+pub(super) fn wait_for_status(proc: &OwnedChild) -> Result<ExitStatus, Error> {
+    status_of_outcome(proc.pid(), wait_to_exit(proc, None)?, Orphaned::Warn)?
+        .ok_or_else(|| Error::Io(io::Error::other("an unbounded wait ended with no exit")))
+}
+
+/// The error of an exit record a consuming `waitid` could not read.
+fn unreadable(si_code: i32) -> String {
+    format!("the child's exit record was unreadable (si_code {si_code})")
 }
 
 /// What to say of a child whose zombie launchd holds.

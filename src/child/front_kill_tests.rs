@@ -553,7 +553,7 @@ fn a_failed_password_write_whose_exited_front_cannot_be_reaped_says_it_had_exite
         panic!("expected an Elevation error, got {err:?}");
     };
     assert!(
-        detail.contains("the elevated child had already exited, but could not be reaped"),
+        detail.contains("(it had already exited): the wait failed: forced reap failure"),
         "{detail}"
     );
     assert!(!detail.contains("killed"), "{detail}");

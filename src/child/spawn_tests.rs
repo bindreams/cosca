@@ -945,15 +945,17 @@ fn a_failed_password_write_reports_a_failed_root_reap() {
         panic!("got {err:?}");
     };
     assert!(
-        detail.contains("killed but could not be reaped") && detail.contains("cosca-finish-elevated-reap-4c1e"),
-        "the note must say the reap failed, got {detail:?}"
+        detail.contains(&format!(
+            "the elevated child pid {pid}: the wait failed: cosca-finish-elevated-reap-4c1e"
+        )),
+        "the note must say the wait failed, got {detail:?}"
     );
     assert!(
         !detail.contains("was terminated"),
         "a child that was not reaped is not reported as terminated: {detail:?}"
     );
     assert_eq!(
-        crate::log_capture::levels_since(mark, &format!("could not reap the killed elevated child pid {pid}")),
+        crate::log_capture::levels_since(mark, &format!("the elevated child pid {pid}: the wait failed")),
         [log::Level::Warn]
     );
     assert_eq!(teardown.recorded(), vec![], "a failed reap is not recorded");
@@ -961,49 +963,6 @@ fn a_failed_password_write_reports_a_failed_root_reap() {
         fault::take_force_reap_failure().is_none(),
         "the teardown consumed the forced failure"
     );
-}
-
-/// What `finish_elevated` says of a root whose reap after the kill ended without a status, by what
-/// became of the child. A debug build asserts on the reap that produces `Unreadable`, so the
-/// outcomes are stated.
-///
-/// Mutants: `Unreadable` is worded as a reap that failed or is handed back; a reap someone else made
-/// is among the leftovers.
-#[cfg(unix)]
-#[skuld::test]
-fn finish_elevated_words_a_reap_that_ended_without_a_status_by_what_became_of_the_child() {
-    use crate::child::lifecycle::WaitToExitError;
-    use crate::os_process::child::Foreign;
-
-    let io = || Error::Io(std::io::Error::other("cosca-reap-e5a1"));
-    for exited_front in [false, true] {
-        let who = if exited_front { "exited " } else { "killed " };
-        let (note, left) = super::reap_after_the_kill_ended(42, exited_front, true, WaitToExitError::Failed(io()));
-        assert!(
-            note.contains("could not be reaped (cosca-reap-e5a1)"),
-            "{exited_front}: {note}"
-        );
-        assert_eq!(
-            left.as_deref(),
-            Some(format!("could not reap the {who}elevated child pid 42: cosca-reap-e5a1; handed back to the caller in the error").as_str())
-        );
-
-        let (note, left) = super::reap_after_the_kill_ended(42, exited_front, false, WaitToExitError::Unreadable(io()));
-        let left = left.expect("an unreadable record is a leftover to say");
-        assert!(
-            note.contains("it was reaped, but cosca-reap-e5a1") && !note.contains("could not"),
-            "{exited_front}: {note}"
-        );
-        assert_eq!(
-            left,
-            format!("reaped the {who}elevated child pid 42; cosca-reap-e5a1"),
-            "{exited_front}"
-        );
-
-        let (_, left) =
-            super::reap_after_the_kill_ended(42, exited_front, false, WaitToExitError::Elsewhere(Foreign::Gone));
-        assert_eq!(left, None, "{exited_front}: a foreign reap is not a leftover");
-    }
 }
 
 /// `report_tree_teardown` (shared by both `finish_elevated` variants) reports a failed teardown in

@@ -4,11 +4,12 @@
 use std::process::ExitStatus;
 
 use super::slot::ChildSlot;
-use super::OwnedChild;
-use crate::child::lifecycle::{orphaned_note, wait_to_exit, Orphaned, WaitToExitError};
+use super::teardown::Disposition;
+use super::{ChildWaitOutcome, OwnedChild};
+use crate::child::lifecycle::{wait_for_status, wait_to_exit, Settlement};
 use crate::error::Error;
 use crate::identity::ProcessId;
-use crate::os_process::child::Foreign;
+use crate::os_process::child::ExitRecord;
 use crate::os_process::child_named;
 
 /// A child a failed spawn, or a sync [`Command::status`](crate::Command::status),
@@ -70,7 +71,7 @@ impl Unreaped {
     /// failed; the child is settled either way.
     pub fn wait(mut self) -> Result<ExitStatus, Error> {
         let child = self.child.take().expect("a live Unreaped holds its child");
-        Ok(wait_to_exit(&child, None, Orphaned::Warn)?)
+        wait_for_status(&child)
     }
 
     /// Give the child up, unreaped. Logs nothing.
@@ -91,20 +92,15 @@ impl Drop for Unreaped {
             log::warn!("{who} was dropped without wait or leak while the thread is panicking; gave it up, unreaped");
             return;
         }
-        match wait_to_exit(&child, None, Orphaned::Quiet) {
-            Ok(status) => {
-                log::warn!("{who} was dropped without wait or leak; waited for it and reaped it ({status})")
-            }
-            Err(WaitToExitError::Elsewhere(Foreign::Orphaned)) => log::warn!("{}", orphaned_note(pid)),
-            Err(WaitToExitError::Elsewhere(_)) => {
-                log::debug!("{who} was dropped without wait or leak; someone else had reaped it");
-            }
-            Err(WaitToExitError::Unreadable(e)) => {
-                log::warn!("{who} was dropped without wait or leak; reaped it, but its exit was unreadable: {e}")
-            }
-            Err(WaitToExitError::Failed(e)) => {
-                log::warn!("{who} was dropped without wait or leak, and waiting for it failed: {e}")
-            }
+        let answer = wait_to_exit(&child, None);
+        if let Ok(ChildWaitOutcome::Exited(ExitRecord::Status(status))) = &answer {
+            log::warn!("{who} was dropped without wait or leak; waited for it and reaped it ({status})");
+            return;
+        }
+        let settlement = Settlement::new(answer, false);
+        let subject = format!("{who} was dropped without wait or leak");
+        if let Some((level, text)) = settlement.wording(pid, &subject, "", Disposition::Leave) {
+            log::log!(level, "{text}");
         }
     }
 }

@@ -259,7 +259,7 @@ impl Child {
         if let Some(error) = crate::child::spawn::failure::seams::take_wait_failure() {
             return Err(error);
         }
-        Ok(lifecycle::wait_to_exit(&self.proc, None, lifecycle::Orphaned::Warn)?)
+        lifecycle::wait_for_status(&self.proc)
     }
 
     /// Return the exit status if the child has already exited.
@@ -1209,9 +1209,10 @@ impl Child {
     }
 }
 
-/// What `caller` says of how its look at the elevation front `pid` went (`torn.look`): a debug line
-/// for a front that was reaped, or reaped by someone else, and a leftover for its one warn for any
-/// other. `why` is why the caller did not kill the front. An outcome with no look is returned as it
+/// What `caller` says of how its look at the elevation front `pid` went (`torn.look`): what the
+/// front's [`Settlement`](lifecycle::Settlement) words, a debug line or a leftover for its one warn
+/// (a front reaped with its status needs no word), and a leftover for any other. `why` is why the
+/// caller did not kill the front. An outcome with no look is returned as it
 /// is. A front seen running (left running, or with its place or its leaf's subtree unreadable) is
 /// worded as handed back if `disposition` says the caller hands it back, and as left otherwise; no
 /// other outcome depends on it.
@@ -1240,25 +1241,16 @@ fn word_front(
         ),
     };
     torn.left = match look {
-        LookOutcome::Reaped(status) => {
-            log::debug!("{label}: elevation front pid {pid} was killed through its cgroup and reaped ({status})");
-            None
+        LookOutcome::Ended(settlement) => {
+            match settlement.wording(Some(pid), &format!("elevation front pid {pid}"), "", disposition) {
+                Some((log::Level::Warn, text)) => Some(text),
+                Some((level, text)) => {
+                    log::log!(level, "{label}: {text}");
+                    None
+                }
+                None => None,
+            }
         }
-        LookOutcome::ReapedElsewhere => {
-            log::debug!("{label}: elevation front pid {pid} was reaped by someone else");
-            None
-        }
-        LookOutcome::LookFailed(e) => Some(format!(
-            "elevation front pid {pid} could not be looked at after its cgroup's teardown ({e}){}",
-            disposition.handed_back_suffix(torn.uncollected)
-        )),
-        LookOutcome::ReapFailed(e) => Some(format!(
-            "elevation front pid {pid} was killed through its cgroup, and could not be reaped ({e}){}",
-            disposition.handed_back_suffix(torn.uncollected)
-        )),
-        LookOutcome::ReapUnreadable(e) => Some(format!(
-            "elevation front pid {pid} was killed through its cgroup and reaped; {e}"
-        )),
         LookOutcome::LeftRunning => Some(match disposition {
             Disposition::Leave => format!(
                 "elevation front pid {pid} is left running and unreaped: {why}, and a kill of the front would orphan \

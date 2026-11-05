@@ -122,7 +122,7 @@ fn a_failed_reap_after_a_kill_is_worded_by_the_disposition() {
             .reaps([ReapAnswer::Err(std::io::ErrorKind::Other)])
             .signals([Ok(Sent::Delivered)]);
         let torn = tear_down_as(&fake, disposition);
-        assert_left_says(&torn, disposition, "the reap after the kill failed");
+        assert_left_says(&torn, disposition, "the wait failed");
     }
 }
 
@@ -138,7 +138,8 @@ fn a_refused_kill_whose_look_failed_is_worded_by_the_disposition() {
             .reaps([ReapAnswer::Err(std::io::ErrorKind::Other)])
             .signals([crate::os_process::fake::failed_signal(libc::EPERM)]);
         let torn = tear_down_as(&fake, disposition);
-        assert_left_says(&torn, disposition, "and the look at it failed");
+        assert_left_says(&torn, disposition, "could not be terminated");
+        assert_left_says(&torn, disposition, "the wait failed");
     }
 }
 
@@ -155,23 +156,25 @@ fn assert_collected_with_an_unreadable_record(torn: &TeardownOutcome, dispositio
 }
 
 /// A reap after a kill that consumed the zombie without an exit record leaves nothing to hand back,
-/// though the wait reports an error, and the leftover says the child was reaped.
+/// though the wait reports an error: the child was reaped, and the leftover says so.
 ///
-/// Mutants: any failed wait is uncollected; the leftover says the reap failed.
+/// Mutants: any failed wait is uncollected; the leftover says the reap failed; the fate is `Killed`.
 #[skuld::test]
 fn a_reap_after_a_kill_whose_exit_record_was_unreadable_leaves_nothing_uncollected() {
     for disposition in [Disposition::Leave, Disposition::HandBack] {
         let torn = child_with_an_unreadable_exit().reap_after_tree_kill(disposition);
-        assert_eq!(torn.fate, ChildFate::Killed, "{torn:?}");
+        assert_eq!(torn.fate, ChildFate::Reaped, "{torn:?}");
         assert_collected_with_an_unreadable_record(&torn, disposition, "reaped it after the kill");
         assert!(!torn.left.as_deref().unwrap_or_default().contains("failed"), "{torn:?}");
     }
 }
 
 /// The same through the entry point: a kill sent nothing to a child already reaped, and the wait after
-/// it meets the unreadable record.
+/// it meets the unreadable record. No kill reached the child, so the leftover does not say "after the
+/// kill".
 ///
-/// Mutants: any failed wait is uncollected; the leftover says the reap failed.
+/// Mutants: any failed wait is uncollected; the leftover says the reap failed, or says "after the
+/// kill" of a kill that sent nothing; the fate is `Unknown`.
 #[skuld::test]
 fn a_teardown_of_a_child_with_an_unreadable_exit_leaves_nothing_uncollected() {
     for disposition in [Disposition::Leave, Disposition::HandBack] {
@@ -183,22 +186,28 @@ fn a_teardown_of_a_child_with_an_unreadable_exit_leaves_nothing_uncollected() {
             },
             None,
         );
-        assert_eq!(torn.fate, ChildFate::Unknown, "{torn:?}");
-        assert_collected_with_an_unreadable_record(&torn, disposition, "reaped it after the kill");
+        assert_eq!(torn.fate, ChildFate::Reaped, "{torn:?}");
+        assert_collected_with_an_unreadable_record(&torn, disposition, "reaped it");
         assert!(!torn.left.as_deref().unwrap_or_default().contains("failed"), "{torn:?}");
+        assert!(
+            !torn.left.as_deref().unwrap_or_default().contains("after the kill"),
+            "{torn:?}"
+        );
     }
 }
 
-/// A refused kill whose look consumed the zombie without an exit record leaves nothing to hand back.
+/// A refused kill whose look consumed the zombie without an exit record leaves nothing to hand back,
+/// and the child is reaped.
 ///
-/// Mutant: a look that failed is uncollected whatever failed it.
+/// Mutant: a look that ended with an unreadable record is a failed look, `Unknown` and uncollected.
 #[skuld::test]
 fn a_refused_kill_whose_look_found_the_exit_record_unreadable_leaves_nothing_uncollected() {
     for disposition in [Disposition::Leave, Disposition::HandBack] {
         let refused = crate::error::Error::Io(std::io::Error::other("refused"));
         let torn = child_with_an_unreadable_exit().look_after_refused_kill(Some(id()), refused, disposition);
-        assert_eq!(torn.fate, ChildFate::Unknown, "{torn:?}");
-        assert_collected_with_an_unreadable_record(&torn, disposition, "the look at it failed");
+        assert_eq!(torn.fate, ChildFate::Reaped, "{torn:?}");
+        assert_collected_with_an_unreadable_record(&torn, disposition, "reaped it");
+        assert!(!torn.left.as_deref().unwrap_or_default().contains("failed"), "{torn:?}");
     }
 }
 
@@ -211,7 +220,7 @@ fn a_failed_reap_after_a_tree_kill_is_worded_by_the_disposition() {
     for disposition in [Disposition::Leave, Disposition::HandBack] {
         let fake = fake().reaps([ReapAnswer::Err(std::io::ErrorKind::Other)]);
         let torn = OwnedChild::new(Box::new(fake)).reap_after_tree_kill(disposition);
-        assert_left_says(&torn, disposition, "the reap after the kill failed");
+        assert_left_says(&torn, disposition, "the wait failed");
     }
 }
 
@@ -225,7 +234,7 @@ fn a_failed_teardown_reap_is_returned_and_not_logged() {
     assert!(
         torn.left
             .as_deref()
-            .is_some_and(|text| text.contains("the reap after the kill failed")),
+            .is_some_and(|text| text.contains("the wait failed")),
         "{torn:?}"
     );
     assert_eq!(torn.fate, ChildFate::Killed, "the kill was delivered: {torn:?}");
@@ -527,18 +536,21 @@ fn teardown_after_a_refused_kill_of_a_child_reaped_elsewhere_is_gone_and_silent(
 }
 
 /// A kill that failed on a child launchd holds the zombie of: the look finds `Orphaned`, the child is
-/// `Gone`, and nothing is warned of or logged above `debug`.
+/// `Gone`, the launchd note comes back for the caller's one warn, and nothing is logged above `debug`.
 ///
-/// Mutants: the look warns of the launchd orphan; it reads the fate from the error (`Unknown` off
-/// Unix).
+/// Mutants: the look drops the launchd note, or logs it itself; it reads the fate from the error
+/// (`Unknown` off Unix).
 #[skuld::test]
-fn teardown_after_a_refused_kill_of_a_child_launchd_holds_is_gone_and_silent() {
+fn teardown_after_a_refused_kill_of_a_child_launchd_holds_is_gone_and_returns_the_note() {
     let fake = fake()
         .reaps([ReapAnswer::Foreign(Foreign::Orphaned)])
         .signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))]);
     let (torn, levels) = teardown(&fake);
     assert_eq!(torn.fate, ChildFate::Gone);
-    assert_eq!(torn.left, None);
+    assert_eq!(
+        torn.left.as_deref(),
+        Some("pid 4242: not ours to reap (launchd holds its zombie, because its tracer died)")
+    );
     assert!(levels.iter().all(|level| *level >= log::Level::Debug), "{levels:?}");
     assert_eq!(fake.looks(), 1);
 }
@@ -704,7 +716,7 @@ fn a_failed_bounded_wait_is_the_result_and_is_not_repeated() {
     assert!(
         torn.left
             .as_deref()
-            .is_some_and(|text| text.contains("the reap after the kill failed")),
+            .is_some_and(|text| text.contains("the wait failed")),
         "{torn:?}"
     );
     assert_eq!(slow_warns(&records), Vec::<&String>::new());

@@ -5,15 +5,19 @@ use std::collections::BTreeMap;
 use std::process::Stdio as StdStdio;
 
 #[cfg(unix)]
-use crate::child::lifecycle::{wait_to_exit, Orphaned, WaitToExitError};
+use crate::child::lifecycle::{wait_to_exit, Settlement};
 #[cfg(unix)]
-use crate::child::owned::teardown::Disposition;
+use crate::child::owned::teardown::{Disposition, LookOutcome, TeardownOutcome};
+#[cfg(unix)]
+use crate::child::owned::ChildWaitOutcome;
 use crate::child::owned::OwnedChild;
 pub(crate) use crate::child::spawn::failure::{after_the_spawn, Classify, SpawnFailure};
 use crate::child::{Child, ParentEnd};
 use crate::command::{Command, CommandInput, EnvOp};
 use crate::error::{ChildFate, Error};
 use crate::identity::ProcessId;
+#[cfg(all(unix, test))]
+use crate::os_process::child::ExitRecord;
 use crate::stdio::{Direction, Fd, ResolvedStdio};
 
 // A child-side descriptor handed to std via `Stdio::from`.
@@ -164,10 +168,8 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
         tree_note.push_str(&format!("; its contained tree was not killed: {note}"));
     }
     let exited_front = matches!(gate, crate::elevation::front::Gate::Exited);
-    // Whether the cleanup left the root uncollected and still the handle's: the caller can take it.
-    let mut uncollected = false;
     let pid = child.id().pid();
-    let (root_note, fate) = if view.unpinned_root() {
+    let (root_note, torn) = if view.unpinned_root() {
         // Nothing was signalled.
         let fate = crate::os_process::child::Foreign::Gone.fate(false);
         (
@@ -175,7 +177,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
                 "the elevated child was left alone, neither signalled nor waited on: {}",
                 view.why_number_untrusted()
             ),
-            fate,
+            TeardownOutcome::new(fate),
         )
     } else {
         let root = match gate {
@@ -196,80 +198,82 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
         match root {
             Ok(crate::signal::Sent::Gone) if exited_front => (
                 "the elevated child had already exited, and was reaped by someone else".to_string(),
-                ChildFate::Gone,
+                TeardownOutcome::new(ChildFate::Gone),
             ),
             Ok(crate::signal::Sent::Gone) => (
                 "the elevated child could not be terminated (it was already reaped)".to_string(),
-                ChildFate::Gone,
+                TeardownOutcome::new(ChildFate::Gone),
             ),
             // A sync child's kill always verifies: the pidfd or the handle names it, and on macOS the
             // unique id every production spawn adopts is held (`MacChild::new` takes it).
             // Were it ever not, the child may still be running.
             Ok(crate::signal::Sent::Unverified) => {
                 debug_assert!(false, "a sync child's kill always verifies its target");
-                uncollected = true;
                 report.left.push(format!(
                     "the elevated child pid {pid} could not be terminated (it could not be verified, and may still be \
                      running){}",
-                    Disposition::HandBack.handed_back_suffix(uncollected)
+                    Disposition::HandBack.handed_back_suffix(true)
                 ));
                 (
                     "the elevated child could not be terminated (it could not be verified, and may still be running)"
                         .to_string(),
-                    ChildFate::Running { id: Some(child.id()) },
+                    TeardownOutcome {
+                        fate: ChildFate::Running { id: Some(child.id()) },
+                        uncollected: true,
+                        look: None,
+                        left: None,
+                    },
                 )
             }
             Ok(crate::signal::Sent::Delivered) => {
                 #[cfg(test)]
                 fault::run_between_kill_and_wait();
-                match wait_killed_elevated(&child) {
-                    Ok(_status) => {
-                        #[cfg(test)]
-                        fault::record_teardown_reap(pid, _status);
-                        let note = if exited_front {
-                            "the elevated child had already exited, and was reaped"
-                        } else {
-                            "the elevated child was terminated"
-                        };
-                        (note.to_string(), ChildFate::Reaped)
-                    }
-                    Err(waited) => {
-                        uncollected = waited.uncollected();
-                        if matches!(waited, WaitToExitError::Elsewhere(_)) {
-                            log::debug!(
-                                "finish_elevated: the elevated child pid {pid} was reaped elsewhere after its kill"
-                            );
-                        }
-                        let (note, left) = reap_after_the_kill_ended(pid, exited_front, uncollected, waited);
-                        report.left.extend(left);
-                        (note, ChildFate::Killed)
-                    }
+                let answer = wait_killed_elevated(&child);
+                #[cfg(test)]
+                if let Ok(ChildWaitOutcome::Exited(ExitRecord::Status(status))) = &answer {
+                    fault::record_teardown_reap(pid, *status);
                 }
+                let settlement = Settlement::new(answer, true);
+                let subject = if exited_front {
+                    format!("the elevated child pid {pid} (it had already exited)")
+                } else {
+                    format!("the elevated child pid {pid}")
+                };
+                // The error says it as the warn does, less where the root goes: its note says that.
+                let note = match settlement.wording(Some(pid), &subject, "", Disposition::Leave) {
+                    Some((_, text)) => text,
+                    None if exited_front => "the elevated child had already exited, and was reaped".to_string(),
+                    None => "the elevated child was terminated".to_string(),
+                };
+                let mut torn =
+                    child
+                        .proc
+                        .outcome_of(&settlement, Some(child.id()), &subject, "", Disposition::HandBack);
+                report.left.extend(torn.left.take());
+                (note, torn)
             }
             Err(e) => {
                 #[cfg(test)]
                 fault::run_between_kill_and_wait();
                 // The non-blocking look reaps a child that has exited by now.
                 let note = format!("the elevated child could not be terminated ({e})");
-                let looked = child
+                let mut looked = child
                     .proc
                     .look_after_refused_kill(Some(child.id()), e, Disposition::HandBack);
-                uncollected = looked.uncollected;
-                report.left.extend(looked.left);
-                let note = match looked.look {
-                    Some(crate::child::owned::teardown::LookOutcome::LookFailed(failure)) => {
-                        format!("{note}, and the look at it failed: {failure}")
-                    }
+                report.left.extend(looked.left.take());
+                let note = match &looked.look {
+                    Some(LookOutcome::Ended(settlement)) => settlement
+                        .wording(Some(pid), &note, "", Disposition::Leave)
+                        .map_or(note, |(_, text)| text),
                     _ => note,
                 };
-                (note, looked.fate)
+                (note, looked)
             }
         }
     };
     // A root not shown collected is the caller's: it is disarmed, and handed back in the error.
-    let mut torn = crate::child::owned::teardown::TeardownOutcome::new(fate);
-    torn.uncollected = uncollected;
     let hands_back = Disposition::HandBack.hands_back(&torn);
+    let fate = torn.fate;
     // A handed-back root takes the drop that would have retried a failed tree kill with it: retry
     // here. The one warn and the error's note say how the retry went.
     if hands_back && !tree_settled {
@@ -317,40 +321,6 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     ))
 }
 
-/// What [`finish_elevated`] says of a root whose reap after its kill ended as `waited` without a
-/// status (`uncollected` is `waited.uncollected()`): the error's note, and the leftover for the
-/// event's one warn. A reap someone else made has no leftover.
-#[cfg(unix)]
-fn reap_after_the_kill_ended(
-    pid: u32,
-    exited_front: bool,
-    uncollected: bool,
-    waited: WaitToExitError,
-) -> (String, Option<String>) {
-    let (what, note, but) = if exited_front {
-        ("exited ", "the elevated child had already exited", ", but")
-    } else {
-        ("killed ", "the elevated child was killed", " but")
-    };
-    let unreadable = matches!(waited, WaitToExitError::Unreadable(_));
-    let elsewhere = matches!(waited, WaitToExitError::Elsewhere(_));
-    let e = Error::from(waited);
-    if unreadable {
-        // The reap consumed the zombie: only its exit record is lost.
-        return (
-            format!("{note}; it was reaped, but {e}"),
-            Some(format!("reaped the {what}elevated child pid {pid}; {e}")),
-        );
-    }
-    let left = (!elsewhere).then(|| {
-        format!(
-            "could not reap the {what}elevated child pid {pid}: {e}{}",
-            Disposition::HandBack.handed_back_suffix(uncollected)
-        )
-    });
-    (format!("{note}{but} could not be reaped ({e})"), left)
-}
-
 /// The fate of a child cosca did not kill (its kill was refused, or never sent), from one
 /// non-blocking look that collects it if it has exited: `Reaped` then, `Running` if it has not
 /// exited, `Gone` if the look found it reaped by someone else (`ECHILD`), and `Unknown` if the look
@@ -372,11 +342,11 @@ pub(crate) fn fate_of_a_look(
 /// The wait for the root after its kill, which a test can force to fail. The forced failure still
 /// REAPS first, so the test that asks for it leaks nothing.
 #[cfg(unix)]
-fn wait_killed_elevated(child: &Child) -> Result<std::process::ExitStatus, WaitToExitError> {
-    let waited = wait_to_exit(&child.proc, None, Orphaned::Warn);
+fn wait_killed_elevated(child: &Child) -> Result<ChildWaitOutcome, Error> {
+    let waited = wait_to_exit(&child.proc, None);
     #[cfg(test)]
     if let Some(marker) = fault::take_force_reap_failure() {
-        return waited.and(Err(WaitToExitError::Failed(Error::Io(std::io::Error::other(marker)))));
+        return waited.and(Err(Error::Io(std::io::Error::other(marker))));
     }
     waited
 }
@@ -2500,7 +2470,7 @@ pub(crate) enum FrontFate {
     Reaped,
     /// It was running, and is left unreaped (it stays a zombie once it exits).
     LeftUnreaped,
-    /// It could not be waited on: reaped by someone else, or unreadable.
+    /// It could not be waited on: reaped by someone else, or the wait failed.
     Unaccounted,
     /// Where it is could not be read, so it is not known whether its cgroup's kill ended it. It is
     /// left unreaped.
@@ -2532,11 +2502,7 @@ impl FrontFate {
     pub(crate) fn of_look(look: &crate::child::owned::teardown::LookOutcome) -> FrontFate {
         use crate::child::owned::teardown::LookOutcome;
         match look {
-            LookOutcome::Reaped(_) => FrontFate::Reaped,
-            LookOutcome::ReapedElsewhere
-            | LookOutcome::LookFailed(_)
-            | LookOutcome::ReapFailed(_)
-            | LookOutcome::ReapUnreadable(_) => FrontFate::Unaccounted,
+            LookOutcome::Ended(settlement) => settlement.front_fate(),
             LookOutcome::LeftRunning => FrontFate::LeftUnreaped,
             LookOutcome::PlaceUnreadable(_) | LookOutcome::SubtreeUnreadable(_) => FrontFate::Unplaced,
         }

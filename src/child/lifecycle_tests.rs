@@ -381,3 +381,221 @@ fn a_quiet_wait_does_not_warn_of_an_orphaned_zombie() {
     assert_reaped_elsewhere(child.wait_timeout_quiet(Duration::from_secs(3600)));
     assert_eq!(orphan_warns_since(mark), 0);
 }
+
+// `Settlement`: one row per answer of the table in its doc =====
+
+mod settlement {
+    use std::io;
+    use std::process::ExitStatus;
+
+    use crate::child::lifecycle::Settlement;
+    use crate::child::owned::teardown::Disposition;
+    use crate::child::owned::ChildWaitOutcome;
+    use crate::child::spawn::FrontFate;
+    use crate::error::{ChildFate, Error};
+    use crate::identity::ProcessId;
+    use crate::os_process::child::{ExitRecord, Foreign};
+
+    const PID: u32 = 4242;
+    const BOTH: [Disposition; 2] = [Disposition::Leave, Disposition::HandBack];
+    const RUNNING: &str = "the caller's running clause";
+    const HANDED_BACK: &str = "; handed back to the caller in the error";
+
+    fn id() -> ProcessId {
+        ProcessId::from_parts(PID, 1)
+    }
+
+    fn failure() -> Error {
+        Error::Io(io::Error::other("cosca-wait-e5a1"))
+    }
+
+    fn exited() -> Result<ChildWaitOutcome, Error> {
+        Ok(ChildWaitOutcome::Exited(ExitRecord::Status(ExitStatus::default())))
+    }
+
+    fn unreadable() -> Result<ChildWaitOutcome, Error> {
+        Ok(ChildWaitOutcome::Exited(ExitRecord::Unreadable { si_code: 7 }))
+    }
+
+    fn foreign(foreign: Foreign) -> Result<ChildWaitOutcome, Error> {
+        Ok(ChildWaitOutcome::Foreign(foreign))
+    }
+
+    fn failed() -> Result<ChildWaitOutcome, Error> {
+        Err(failure())
+    }
+
+    fn passed() -> Result<ChildWaitOutcome, Error> {
+        Ok(ChildWaitOutcome::DeadlinePassed)
+    }
+
+    /// The three facts every row states besides the wording.
+    #[track_caller]
+    fn assert_row(settlement: &Settlement, fate: ChildFate, uncollected: bool, front: FrontFate) {
+        assert_eq!(settlement.fate(Some(id())), fate, "{settlement:?}");
+        assert_eq!(settlement.uncollected(), uncollected, "{settlement:?}");
+        assert_eq!(settlement.front_fate(), front, "{settlement:?}");
+    }
+
+    /// What the settlement says of the child "S" under `disposition`, with the pid 4242 and the
+    /// running clause [`RUNNING`].
+    fn worded(settlement: &Settlement, disposition: Disposition) -> Option<(log::Level, String)> {
+        settlement.wording(Some(PID), "S", RUNNING, disposition)
+    }
+
+    /// A child that exited with a status is reaped and nothing is said, whether or not a kill reached it.
+    ///
+    /// Mutants: it is uncollected; it is worded.
+    #[skuld::test]
+    fn an_exit_with_a_status_is_reaped_and_silent() {
+        for killed in [false, true] {
+            let settlement = Settlement::new(exited(), killed);
+            assert_row(&settlement, ChildFate::Reaped, false, FrontFate::Reaped);
+            for disposition in BOTH {
+                assert_eq!(worded(&settlement, disposition), None, "{killed}");
+            }
+        }
+    }
+
+    /// An exit whose record was unreadable was reaped, whether or not a kill reached it: the
+    /// consuming reap took the zombie. Only a kill that reached it is "after the kill".
+    ///
+    /// Mutants: the fate is `Killed` after a kill, or `Unknown`; it is uncollected; it is a front
+    /// unaccounted for; the wording says "after the kill" without one.
+    #[skuld::test]
+    fn an_unreadable_exit_is_reaped_and_warned_of() {
+        for (killed, said) in [
+            (
+                false,
+                "S: reaped it; the child's exit record was unreadable (si_code 7)",
+            ),
+            (
+                true,
+                "S: reaped it after the kill; the child's exit record was unreadable (si_code 7)",
+            ),
+        ] {
+            let settlement = Settlement::new(unreadable(), killed);
+            assert_row(&settlement, ChildFate::Reaped, false, FrontFate::Reaped);
+            for disposition in BOTH {
+                assert_eq!(
+                    worded(&settlement, disposition),
+                    Some((log::Level::Warn, said.to_owned()))
+                );
+            }
+        }
+    }
+
+    /// Someone else reaped it: not collected by this handle, so nothing to hand back. The fate says
+    /// whether a kill reached it, and the line is `debug`.
+    ///
+    /// Mutants: the line is a warn; the fate ignores the kill; it is uncollected.
+    #[skuld::test]
+    fn a_foreign_reap_is_gone_or_killed_and_said_at_debug() {
+        for foreign_reap in [Foreign::Gone, Foreign::Other] {
+            for (killed, fate) in [(false, ChildFate::Gone), (true, ChildFate::Killed)] {
+                let settlement = Settlement::new(foreign(foreign_reap), killed);
+                assert_row(&settlement, fate, false, FrontFate::Unaccounted);
+                for disposition in BOTH {
+                    assert_eq!(
+                        worded(&settlement, disposition),
+                        Some((log::Level::Debug, "S: reaped by someone else".to_owned()))
+                    );
+                }
+            }
+        }
+    }
+
+    /// A zombie launchd holds is the same, but warned of, naming the pid.
+    ///
+    /// Mutants: the line is `debug`; it is prefixed with the caller's subject.
+    #[skuld::test]
+    fn a_zombie_launchd_holds_is_gone_or_killed_and_warned_of() {
+        for (killed, fate) in [(false, ChildFate::Gone), (true, ChildFate::Killed)] {
+            let settlement = Settlement::new(foreign(Foreign::Orphaned), killed);
+            assert_row(&settlement, fate, false, FrontFate::Unaccounted);
+            for disposition in BOTH {
+                assert_eq!(
+                    worded(&settlement, disposition),
+                    Some((
+                        log::Level::Warn,
+                        "pid 4242: not ours to reap (launchd holds its zombie, because its tracer died)".to_owned()
+                    ))
+                );
+            }
+        }
+        let pidless = Settlement::new(foreign(Foreign::Orphaned), false);
+        let (_, text) = pidless.wording(None, "S", RUNNING, Disposition::Leave).expect("a warn");
+        assert!(text.starts_with(crate::os_process::PIDLESS_CHILD), "{text}");
+    }
+
+    /// A wait that failed after a kill reached the child: `Killed`, uncollected, and the warn says
+    /// where the child goes under the disposition.
+    ///
+    /// Mutants: the fate is `Unknown`; it is collected; the suffix ignores the disposition.
+    #[skuld::test]
+    fn a_failed_wait_after_a_kill_is_killed_uncollected_and_warned_of() {
+        let settlement = Settlement::new(failed(), true);
+        assert_row(&settlement, ChildFate::Killed, true, FrontFate::Unaccounted);
+        let said = "S: the wait failed: cosca-wait-e5a1";
+        assert_eq!(
+            worded(&settlement, Disposition::Leave),
+            Some((log::Level::Warn, said.to_owned()))
+        );
+        assert_eq!(
+            worded(&settlement, Disposition::HandBack),
+            Some((log::Level::Warn, format!("{said}{HANDED_BACK}")))
+        );
+    }
+
+    /// A wait that failed with no kill having reached the child shows nothing of what became of it:
+    /// `Unknown`, otherwise the row above.
+    ///
+    /// Mutant: the fate ignores whether a kill reached the child.
+    #[skuld::test]
+    fn a_failed_wait_without_a_kill_is_unknown_uncollected_and_warned_of() {
+        let settlement = Settlement::new(failed(), false);
+        assert_row(&settlement, ChildFate::Unknown, true, FrontFate::Unaccounted);
+        let said = "S: the wait failed: cosca-wait-e5a1";
+        assert_eq!(
+            worded(&settlement, Disposition::Leave),
+            Some((log::Level::Warn, said.to_owned()))
+        );
+        assert_eq!(
+            worded(&settlement, Disposition::HandBack),
+            Some((log::Level::Warn, format!("{said}{HANDED_BACK}")))
+        );
+    }
+
+    /// A deadline that passed, with no kill having reached the child: it is running, uncollected, a
+    /// front left unreaped, and the caller's running clause is the warn, as it is.
+    ///
+    /// Mutants: the fate keeps no identity; it is collected; the clause is prefixed.
+    #[skuld::test]
+    fn a_deadline_that_passed_is_running_uncollected_and_the_callers_clause() {
+        let settlement = Settlement::new(passed(), false);
+        assert_row(
+            &settlement,
+            ChildFate::Running { id: Some(id()) },
+            true,
+            FrontFate::LeftUnreaped,
+        );
+        assert_eq!(settlement.fate(None), ChildFate::Running { id: None });
+        for disposition in BOTH {
+            assert_eq!(
+                worded(&settlement, disposition),
+                Some((log::Level::Warn, RUNNING.to_owned()))
+            );
+        }
+    }
+
+    /// A kill reached the child, and the wait that follows has no deadline: an answer that the
+    /// deadline passed breaks that contract.
+    ///
+    /// Mutant: the contract is not asserted.
+    #[cfg(debug_assertions)]
+    #[skuld::test]
+    fn a_deadline_that_passed_after_a_kill_breaks_the_contract() {
+        let built = std::panic::catch_unwind(|| Settlement::new(passed(), true));
+        assert!(built.is_err(), "a deadline cannot pass in an unbounded wait");
+    }
+}

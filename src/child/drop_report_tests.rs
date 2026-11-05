@@ -24,12 +24,12 @@ fn refusal() -> String {
     std::io::Error::from_raw_os_error(libc::EPERM).to_string()
 }
 
-fn session_blocker() -> (crate::Child, std::io::PipeWriter) {
+fn contained_blocker(mode: ContainMode) -> (crate::Child, std::io::PipeWriter) {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
     let mut cmd = Command::new();
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
-    cmd.contain_with(ContainMode::Session);
+    cmd.contain_with(mode);
     (cmd.spawn().expect("spawn"), writer)
 }
 
@@ -85,7 +85,7 @@ fn an_unknown_root_with_a_refused_kill_warns_once() {
 fn finish_elevated_with_an_unknown_root_and_a_failed_reap_warns_once() {
     crate::log_capture::install();
     let _recorder = crate::containment::unix::fault::record_kill_group();
-    let (mut child, writer) = session_blocker();
+    let (mut child, writer) = contained_blocker(ContainMode::Session);
     let pid = child.id().pid();
     // Released once the cleanup's root kill returned, before its reap (the forced failure comes
     // after the reap, which records nothing): the root must be a zombie that died of `SIGKILL`.
@@ -111,7 +111,7 @@ fn finish_elevated_with_an_unknown_root_and_a_failed_reap_warns_once() {
     assert!(
         warns[0].starts_with("finish_elevated:")
             && warns[0].contains("RootState::Unknown")
-            && warns[0].contains(&format!("could not reap the killed elevated child pid {pid}")),
+            && warns[0].contains(&format!("the elevated child pid {pid}: the wait failed")),
         "{warns:?}"
     );
 }
@@ -188,13 +188,11 @@ fn finish_elevated_names_the_failure_of_the_look_after_a_refused_kill() {
     let warns = warns_since(mark);
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(
-        warns[0].contains(&format!("and the look at it failed: {failed_look}")),
+        warns[0].contains(&format!("the wait failed: {failed_look}")),
         "{warns:?}"
     );
     assert!(
-        cause
-            .to_string()
-            .contains(&format!("and the look at it failed: {failed_look}")),
+        cause.to_string().contains(&format!("the wait failed: {failed_look}")),
         "{cause}"
     );
     handed_back.wait();
@@ -245,7 +243,7 @@ fn finish_elevated_logs_a_root_reaped_elsewhere_after_the_kill_at_debug() {
 
     assert!(handed_back.is_none());
     assert_eq!(warns_since(mark), Vec::<String>::new());
-    let debug = crate::log_capture::records_since_on_current_thread(mark, "reaped elsewhere");
+    let debug = crate::log_capture::records_since_on_current_thread(mark, "reaped by someone else");
     assert!(
         debug.len() == 1 && debug[0].0 == log::Level::Debug,
         "one debug record names the foreign reap: {debug:?}"
@@ -277,7 +275,8 @@ fn finish_elevated_hands_back_a_root_whose_reap_failed_after_a_delivered_kill() 
     let warns = warns_since(mark);
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(
-        warns[0].contains("could not reap the killed elevated child")
+        warns[0].contains("the elevated child pid")
+            && warns[0].contains(": the wait failed: ")
             && warns[0].ends_with("handed back to the caller in the error"),
         "{warns:?}"
     );
@@ -501,13 +500,14 @@ fn a_tree_kill_that_failed_on_the_retry_too_names_both_failures() {
 
 /// A tree kill skipped because the root's state is unknown, and a root whose kill is refused and
 /// which is handed back: the retry skips again and kills nothing, so the error still says the tree
-/// was not killed.
+/// was not killed. The tree is a ppid walk from the root's number, which an unknown root skips on
+/// every kernel; a process group does not skip on Linux 6.9+, where the root's pidfd names it.
 ///
 /// Mutant: the retry's `Ok` clears the note whether or not it killed the tree.
 #[skuld::test]
 fn a_skipped_tree_kill_keeps_its_note_when_the_root_is_handed_back() {
     crate::log_capture::install();
-    let (mut child, writer) = session_blocker();
+    let (mut child, writer) = contained_blocker(ContainMode::TreeWalk);
     child.proc.script_over(|f| {
         f.peeks([Err(std::io::Error::other("forced peek failure"))])
             .signals([refused()])
@@ -530,7 +530,7 @@ fn a_skipped_tree_kill_keeps_its_note_when_the_root_is_handed_back() {
 #[skuld::test]
 fn a_handle_that_could_not_say_is_logged_when_the_number_shows_the_reap() {
     crate::log_capture::install();
-    let (mut child, _writer) = session_blocker();
+    let (mut child, _writer) = contained_blocker(ContainMode::Session);
     let mark = crate::log_capture::mark();
     let _number = crate::child::fault::force_next_root_read(crate::identity::Resolved::Gone);
     let fake = child

@@ -525,12 +525,7 @@ fn assert_drop_kills_the_leaf_and_reaps_the_front(fault: impl FnOnce() -> Box<dy
     );
     let said =
         crate::log_capture::records_since_on_current_thread(mark, &format!("Child::drop: elevation front pid {pid}"));
-    assert_eq!(said.len(), 1, "{said:?}");
-    assert_eq!(said[0].0, log::Level::Debug, "{said:?}");
-    assert!(
-        said[0].1.contains("killed through its cgroup and reaped (signal: 9"),
-        "{said:?}"
-    );
+    assert_eq!(said, [], "a front reaped with its status needs no word");
     assert!(reaped(&front), "the drop reaps the front its leaf's kill ended");
     assert!(steps.iter().any(|s| s == "kill"), "{steps:?}");
     wait_until_exited(&member);
@@ -601,12 +596,7 @@ fn cgroup_a_drop_places_a_front_that_reads_as_running_and_reaps_it(#[fixture(cgr
     release.assert_killed();
     let said =
         crate::log_capture::records_since_on_current_thread(mark, &format!("Child::drop: elevation front pid {pid}"));
-    assert_eq!(said.len(), 1, "{said:?}");
-    assert_eq!(said[0].0, log::Level::Debug, "{said:?}");
-    assert!(
-        said[0].1.contains("killed through its cgroup and reaped (signal: 9"),
-        "{said:?}"
-    );
+    assert_eq!(said, [], "a front reaped with its status needs no word");
     assert!(reaped(&front), "the drop reaps the front");
     wait_until_exited(&member);
     let mut rest = Vec::new();

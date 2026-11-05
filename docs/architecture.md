@@ -86,7 +86,9 @@ In order:
      leaf's abandonment (`leaf.rs`); the `exit_only::seams` their tests use. `OwnedChild::tear_down`
      is the one kill-then-settle policy, and `Child::drop` uses it; so does the sync Linux spawn,
      from the handshake's `conclude` to the identity and attach arms (`held_teardown.rs`), which
-     build the `OwnedChild` once when the handshake succeeds. A teardown that cannot end a child,
+     build the `OwnedChild` once when the handshake succeeds. `Settlement` is the one
+     classification of what a wait or look answered (the fate, whether the child is left
+     uncollected, what to say); the teardowns, `finish_elevated` and `Unreaped` all ask it. A teardown that cannot end a child,
      a refused kill or a running elevation front, hands it back as `Unreaped`, in
      `Error::MayHaveStarted`: the sync Linux spawn does, and so does the sync `finish_elevated`;
      the `Command::{status, output, read}` do through `Child::tear_down_or_hand_back`.
