@@ -24,7 +24,7 @@ use crate::os_process::linux::open::probe_pidfd_support_with;
 use crate::stdio::Stdio;
 use crate::test_child::fixture_path;
 use crate::test_child::namespaces as ns;
-use crate::test_groups::{namespaces, Group};
+use crate::test_groups::{namespaces, setuid, Group};
 
 /// A command that writes `ran` to a pipe and exits, and the read end of that pipe.
 fn marker_command() -> (Command, std::io::PipeReader) {
@@ -316,8 +316,6 @@ fn a_child_gone_before_its_go_ahead_fails_the_spawn_and_is_reaped() {
 /// Mutant: the pidfd is dropped when the spawn fails.
 #[skuld::test]
 fn a_spawn_that_fails_after_the_child_execed_kills_and_reaps_it() {
-    use std::os::unix::process::ExitStatusExt;
-
     let (reader, writer) = std::io::pipe().expect("pipe");
     let (mut std_cmd, pending) = raw_command(crate::test_child::BLOCKER_ARGV[0]);
     std_cmd
@@ -325,15 +323,7 @@ fn a_spawn_that_fails_after_the_child_execed_kills_and_reaps_it() {
         .stdin(std::process::Stdio::from(OwnedFd::from(reader)))
         .stdout(std::process::Stdio::null());
     // Only the kill ends it: its stdin's writer is released between the kill and the reap.
-    let fired = Rc::new(Cell::new(false));
-    let release = crate::child::spawn::fault::set_between_kill_and_wait({
-        let fired = Rc::clone(&fired);
-        move || {
-            drop(writer);
-            fired.set(true);
-        }
-    });
-    let reaps = crate::child::spawn::fault::record_teardown_reaps();
+    let teardown = crate::child::spawn::fault::release_between_kill_and_wait(writer);
 
     let guard = super::super::spawn_lock();
     let handshake = pending.open(&guard).expect("open");
@@ -349,12 +339,10 @@ fn a_spawn_that_fails_after_the_child_execed_kills_and_reaps_it() {
         Err(SpawnFailure::NotStarted(Error::Io(e))) => assert_eq!(e.to_string(), "post-fork failure (test)"),
         other => panic!("expected the spawn's own error, got {:?}", other.err()),
     }
-    assert!(fired.get(), "the running child must be killed through its pidfd");
-    let recorded = reaps.recorded();
+    teardown.assert_killed();
+    let recorded = teardown.recorded();
     assert_eq!(recorded.len(), 1, "{recorded:?}");
-    assert_eq!(recorded[0].1.signal(), Some(libc::SIGKILL));
     assert_no_child_of_this_thread("the child is reaped through its pidfd");
-    drop(release);
 }
 
 /// A hook after the handshake's fails: std reports it and collects the child, so there is nothing
@@ -1072,51 +1060,39 @@ fn a_pidfd_that_cannot_move_above_stdio_is_still_handed_on() {
     }
 }
 
-/// A child left unreaped is worded by why, not always as a death before its report.
+/// A child left unreaped is worded by why, not always as a death before its report. The words are
+/// the warn that says the child is left.
 #[skuld::test]
 fn an_abandoned_child_is_worded_by_its_cause() {
-    struct Recorder(std::rc::Rc<RefCell<Option<String>>>);
-    impl super::Spawned for Recorder {
-        const ERR_PROVES_NO_EXEC: bool = true;
+    crate::log_capture::install();
+    let ended_cat = || {
+        let (mut cat, _pidfd) = cat_with_pidfd();
+        drop(cat.stdin.take());
+        crate::test_child::wait_until_zombie(cat.id());
+        cat
+    };
+    let said = |mark| {
+        let said = crate::log_capture::records_since_on_current_thread(mark, "it is left unreaped");
+        assert_eq!(said.len(), 1, "{said:?}");
+        said[0].1.clone()
+    };
 
-        fn pid(&self) -> Option<u32> {
-            Some(4)
-        }
-        fn reap_unexecuted(self, _: OwnedFd, _: Option<std::time::Duration>) -> ChildFate {
-            panic!("there is no pidfd to reap through");
-        }
-        fn abandon_unreported(self, why: &str) {
-            *self.0.borrow_mut() = Some(why.to_string());
-        }
-    }
-
-    let said = std::rc::Rc::new(RefCell::new(None));
+    let mark = crate::log_capture::mark();
     let failed = Outcome::Failed(Error::Io(std::io::Error::other("the report was cut short")), None);
-    let err = super::conclude(
-        Ok(Recorder(Rc::clone(&said))),
-        failed,
-        super::LeftFront::NotAFront,
-        None,
-    )
-    .err();
+    let err = super::conclude(Ok(ended_cat()), failed, super::LeftFront::NotAFront, None).err();
     assert_eq!(
         err.map(|e| e.expect_not_started().to_string()).as_deref(),
         Some("the report was cut short")
     );
-    let why = said.borrow_mut().take().expect("the child was abandoned");
+    let why = said(mark);
     assert!(
         why.contains("the report was cut short") && !why.contains("died"),
         "{why}"
     );
 
-    super::conclude(
-        Ok(Recorder(Rc::clone(&said))),
-        Outcome::NoReport,
-        super::LeftFront::NotAFront,
-        None,
-    )
-    .err();
-    let why = said.borrow_mut().take().expect("the child was abandoned");
+    let mark = crate::log_capture::mark();
+    super::conclude(Ok(ended_cat()), Outcome::NoReport, super::LeftFront::NotAFront, None).err();
+    let why = said(mark);
     assert!(why.contains("died before it sent its pidfd"), "{why}");
 }
 
@@ -1283,6 +1259,41 @@ fn group_leading_cat_with_pidfd() -> (std::process::Child, OwnedFd) {
     (cat, pidfd)
 }
 
+/// A child tokio dropped after it ran the program, whose kill is refused (as a setuid-root child
+/// refuses it), is left running and warned of, and the spawn's fate says it runs. The teardown is the
+/// caller's `Leave`: the handshake hands nothing back and starts no thread.
+///
+/// Mutant: a refused kill reports the child reaped, or drops the warn.
+#[skuld::test]
+fn a_dropped_child_whose_kill_is_refused_is_left_running_and_warned(#[fixture(setuid)] _group: &Group) {
+    crate::log_capture::install();
+    let (child, stdin) = crate::test_privilege::spawn_setuid_blocker();
+    let pidfd = child
+        .proc
+        .pidfd()
+        .expect("a Linux child has a pidfd")
+        .try_clone_to_owned()
+        .expect("duplicate the pidfd");
+    let mark = crate::log_capture::mark();
+
+    let (_, fate) = super::conclude(
+        Err::<NoChild, _>(std::io::Error::other("tokio failed")),
+        Outcome::Opened(pidfd),
+        super::LeftFront::NotAFront,
+        None,
+    )
+    .err()
+    .expect("the spawn fails")
+    .expect_may_have_started_with();
+
+    assert_eq!(fate, ChildFate::Running { id: None });
+    let warns = crate::log_capture::records_since_on_current_thread(mark, "leaving it running");
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    // The test's own child, still running: released, it exits on EOF.
+    drop(stdin);
+    assert!(child.wait().expect("wait").success());
+}
+
 /// A front tokio dropped after it ran the program is sent nothing and left, and the error says so.
 #[skuld::test]
 fn a_dropped_front_is_left_and_noted() {
@@ -1415,51 +1426,33 @@ fn a_not_started_failure_carries_the_fate_of_the_child_it_held() {
     }
 }
 
-/// A child `spawn` returned, whose teardown through its pidfd answers `.0`.
-struct Fated(ChildFate);
-
-impl super::Spawned for Fated {
-    const ERR_PROVES_NO_EXEC: bool = false;
-
-    fn pid(&self) -> Option<u32> {
-        Some(4)
-    }
-    fn reap_unexecuted(self, _: OwnedFd, _: Option<std::time::Duration>) -> ChildFate {
-        self.0
-    }
-    fn abandon_unreported(self, _: &str) {}
-}
-
-/// Any descriptor, for a [`Fated`] child's pidfd, which its teardown ignores.
-fn any_fd() -> OwnedFd {
-    std::fs::File::open("/dev/null").expect("open /dev/null").into()
-}
-
 /// A failure of a spawn that returned a child it held carries exactly the fate that child's
-/// teardown answered. Mutant: an arm that tears the child down drops or replaces its fate.
+/// teardown answered. A child reaped by someone else is `Gone`, one killed and reaped is `Reaped`:
+/// each arm carries its own. Mutant: an arm that tears the child down drops or replaces its fate.
 #[skuld::test]
 fn a_returned_childs_failure_carries_its_teardowns_fate() {
-    let (_, fate) = super::conclude(
-        Ok(Fated(ChildFate::Gone)),
-        Outcome::Gone(any_fd()),
-        super::LeftFront::NotAFront,
-        None,
-    )
-    .err()
-    .expect("the spawn fails")
-    .expect_not_started_with_child();
+    // Reaped by someone else before the teardown: `Gone`.
+    let (mut cat, pidfd) = cat_with_pidfd();
+    drop(cat.stdin.take());
+    cat.wait().expect("collect the child");
+    let (_, fate) = super::conclude(Ok(cat), Outcome::Gone(pidfd), super::LeftFront::NotAFront, None)
+        .err()
+        .expect("the spawn fails")
+        .expect_not_started_with_child();
     assert_eq!(fate, ChildFate::Gone);
 
+    // Running: killed and reaped.
+    let (cat, pidfd) = cat_with_pidfd();
     let (_, fate) = super::conclude(
-        Ok(Fated(ChildFate::Killed)),
-        Outcome::Failed(Error::Io(std::io::Error::other("helper")), Some(any_fd())),
+        Ok(cat),
+        Outcome::Failed(Error::Io(std::io::Error::other("helper")), Some(pidfd)),
         super::LeftFront::NotAFront,
         None,
     )
     .err()
     .expect("the spawn fails")
     .expect_not_started_with_child();
-    assert_eq!(fate, ChildFate::Killed);
+    assert_eq!(fate, ChildFate::Reaped);
 }
 
 /// A returned child whose pidfd never reached this process was never told to go, so it dies at its
@@ -1473,7 +1466,11 @@ fn a_returned_child_with_no_pidfd_is_killed() {
         Outcome::NoReport,
         Outcome::Unwatched("forced".to_string()),
     ] {
-        let (_, fate) = super::conclude(Ok(Fated(ChildFate::Reaped)), outcome, super::LeftFront::NotAFront, None)
+        // A `cat` that has already ended, so the child the arm leaves unreaped runs no more.
+        let (mut cat, _pidfd) = cat_with_pidfd();
+        drop(cat.stdin.take());
+        crate::test_child::wait_until_zombie(cat.id());
+        let (_, fate) = super::conclude(Ok(cat), outcome, super::LeftFront::NotAFront, None)
             .err()
             .expect("the spawn fails")
             .expect_not_started_with_child();
