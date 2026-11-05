@@ -240,22 +240,21 @@ fn parent_and_children_resolve_the_spawned_tree() {
 fn children_recursive_distinguishes_direct_from_descendant() {
     // spawn-grandchild: the child connects (tag "R") and spawns a control-block grandchild
     // (tag "G"). `spawn_grandchild` accepts BOTH, death-watched, which proves the 2-level tree
-    // is alive; we learn the grandchild's identity via kid.children(No), then assert it is in
+    // is alive; the child reports the grandchild's identity, then we assert it is in
     // me.children(Yes) but NOT No — the one-level-vs-recursive distinction a No<->Yes arm swap
-    // would otherwise pass silently.
+    // would otherwise pass silently. (Not "kid's only child": on Windows a child spawned with no
+    // window also has its console host as a child.)
     let (child, socks) = common::spawn_grandchild(false);
     let me = cosca::identity::ProcessId::current();
     let kid = cosca::identity::ProcessId::of(child.id().pid())
         .found()
         .expect("child resolves");
-    // The grandchild is kid's only direct child — use it to learn the grandchild's identity.
+    let grandkid = common::last_reported_grandchild_id().expect("the child reported its grandchild");
     let grandkids = kid.children(cosca::Recursive::No).expect("children are enumerable");
-    assert_eq!(
-        grandkids.len(),
-        1,
-        "the spawn-grandchild child has exactly one direct child"
+    assert!(
+        grandkids.contains(&grandkid),
+        "the grandchild is the child's direct child"
     );
-    let grandkid = grandkids[0];
 
     let direct = me.children(cosca::Recursive::No).expect("children are enumerable");
     assert!(direct.contains(&kid), "Recursive::No must include the direct child");
