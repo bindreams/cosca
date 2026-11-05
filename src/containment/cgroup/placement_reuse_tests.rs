@@ -146,7 +146,7 @@ fn state_read_over_a_reused_number_is_discarded_body() {
     });
 
     assert_eq!(
-        super::proc_state(handle_of(pid, &held)),
+        super::proc_state(&crate::identity::HostKernel, handle_of(pid, &held)),
         Some('Z'),
         "a state read over a number that changed hands is not the child's"
     );

@@ -105,26 +105,6 @@ pub(crate) fn parse_populated(contents: &str) -> Option<bool> {
     None
 }
 
-/// Extract the process state letter (`R`, `S`, `Z`, …) from the contents of a
-/// `/proc/<pid>/stat` line. `None` when the line is absent or malformed — never a guessed
-/// state.
-///
-/// Field 2 (`comm`) is arbitrary bytes wrapped in parentheses and may itself contain spaces
-/// and parentheses, so splitting on whitespace from the start misplaces every later field.
-/// The scan therefore begins after the LAST `)` in the line, which is where the kernel's
-/// fixed-shape, whitespace-separated tail starts; field 3 there is the state.
-#[cfg_attr(
-    not(target_os = "linux"),
-    allow(
-        dead_code,
-        reason = "cgroup::leaf is this function's only caller and is linux-gated; kept host-agnostic"
-    )
-)]
-pub(crate) fn parse_proc_stat_state(stat: &str) -> Option<char> {
-    let tail = &stat[stat.rfind(')')? + 1..];
-    tail.split_whitespace().next()?.chars().next()
-}
-
 #[cfg(test)]
 #[path = "parse_tests.rs"]
 mod parse_tests;
