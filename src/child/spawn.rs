@@ -3732,7 +3732,7 @@ pub(crate) mod pidfd_handshake;
 // Linux: the sync spawn's teardown of the child it holds after the handshake.
 #[cfg(target_os = "linux")]
 #[path = "spawn/held_teardown.rs"]
-mod held_teardown;
+pub(crate) mod held_teardown;
 
 // Windows raw `CreateProcessW` spawn backend.
 #[cfg(windows)]

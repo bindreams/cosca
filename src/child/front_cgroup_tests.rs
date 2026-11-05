@@ -1138,10 +1138,9 @@ pub(crate) fn assert_left_running(kill: LeafKill, failures: [HeldFailure; 2], ha
             stdin.borrow().is_some(),
             "the teardown waited on front {pid}, which no kill reached"
         );
-        let crate::error::Error::MayHaveStarted { unreaped, .. } = err else {
-            panic!("expected MayHaveStarted, got {err:?}");
-        };
-        assert_eq!(unreaped.is_some(), handed_back, "{text}");
+        // The front's stdin is held by the test (`stdin`), not by the helper.
+        let (_, _, held) = crate::test_child::expect_may_have_started_parts(err, ());
+        assert_eq!(!held.is_none(), handed_back, "{text}");
         let own = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).expect("read the front's cgroup");
         let path = own
             .lines()
@@ -1149,9 +1148,10 @@ pub(crate) fn assert_left_running(kill: LeafKill, failures: [HeldFailure; 2], ha
             .expect("a cgroup v2 `0::` line")
             .to_owned();
         drop(stdin.borrow_mut().take());
-        let status = match unreaped {
-            Some(unreaped) => unreaped.wait().expect("the handed-back front exits once released"),
-            None => crate::child::front_kill_tests::reap(pid).expect("the front was left unreaped"),
+        let status = if held.is_none() {
+            crate::child::front_kill_tests::reap(pid).expect("the front was left unreaped")
+        } else {
+            held.wait()
         };
         assert!(status.success(), "front {pid} was signalled: {status:?}");
         // The cgroup the front was left in, if the test made it or a failed kill left it behind.

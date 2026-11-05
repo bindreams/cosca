@@ -22,7 +22,7 @@ use crate::Unreaped;
 /// at: reaped if it has exited, waited for if `subtree`, where its leaf's kill went, shows that kill
 /// reached it, and otherwise running. `id` is the child's identity, if the spawn read one. `why`
 /// leads the teardown's one warn, if it has one.
-pub(super) fn tear_down_held(
+pub(crate) fn tear_down_held(
     child: OwnedChild,
     pid: u32,
     front: Option<Front>,

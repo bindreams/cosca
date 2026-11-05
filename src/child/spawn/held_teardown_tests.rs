@@ -6,14 +6,12 @@ use std::io;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use super::held_teardown::tear_down_held;
-use super::Diagnosis;
 use crate::child::owned::OwnedChild;
 use crate::containment::cgroup::{fault, PlacedAtRemoval, Subtree, Swept};
 use crate::elevation::front::Front;
 use crate::error::{ChildFate, Error};
 use crate::os_process::fake::{FakeProcess, ReapAnswer};
-use crate::test_child::held_uncontained_blocker;
+use crate::test_child::{held_uncontained_blocker, tear_down_held_holding};
 
 /// The `Error` a failed spawn arm tears down after.
 fn failed() -> Error {
@@ -44,17 +42,6 @@ fn killed_subtree() -> Subtree {
     )
 }
 
-/// The message of the one `Error` the arm returns, with its hand-back, settled.
-fn settle(torn: (Error, ChildFate, Option<crate::Unreaped>), stdin: std::io::PipeWriter) -> (String, ChildFate, bool) {
-    let (error, fate, unreaped) = torn;
-    let handed_back = unreaped.is_some();
-    drop(stdin);
-    if let Some(unreaped) = unreaped {
-        unreaped.wait().expect("the handed-back child exits once released");
-    }
-    (error.to_string(), fate, handed_back)
-}
-
 /// A child whose kill is refused and whose look then fails is uncollected and still ours: the arm
 /// hands it back though its fate is `Unknown`.
 ///
@@ -66,11 +53,11 @@ fn a_refused_kill_whose_look_failed_is_handed_back() {
             .reaps([ReapAnswer::Err(io::ErrorKind::Other)])
     });
 
-    let torn = tear_down_held(owned, pid, None, None, None, &mut Diagnosis::default(), failed());
+    let (_, fate, handed_back) = tear_down_held_holding(owned, pid, None, None, None, stdin, failed());
 
-    let (_, fate, handed_back) = settle(torn, stdin);
     assert_eq!(fate, ChildFate::Unknown);
-    assert!(handed_back, "the arm handed nothing back");
+    handed_back.unreaped();
+    handed_back.wait();
 }
 
 /// A front whose look fails is uncollected and still ours: handed back, and the error says so.
@@ -80,23 +67,16 @@ fn a_refused_kill_whose_look_failed_is_handed_back() {
 fn a_front_whose_look_failed_is_handed_back_and_the_error_says_so() {
     let (owned, pid, stdin) = held_blocker(|f| f.reaps([ReapAnswer::Err(io::ErrorKind::Other)]));
 
-    let torn = tear_down_held(
-        owned,
-        pid,
-        Some(Front::Sudo),
-        None,
-        None,
-        &mut Diagnosis::default(),
-        failed(),
-    );
+    let (error, fate, handed_back) = tear_down_held_holding(owned, pid, Some(Front::Sudo), None, None, stdin, failed());
 
-    let (error, fate, handed_back) = settle(torn, stdin);
     assert_eq!(fate, ChildFate::Unknown);
-    assert!(handed_back, "the arm handed nothing back");
+    handed_back.unreaped();
+    let error = error.to_string();
     assert!(
         error.contains("could not be waited on") && error.contains("handed back to the caller"),
         "{error}"
     );
+    handed_back.wait();
 }
 
 /// A front whose place cannot be read is handed back, and the error says where it is cannot be read.
@@ -107,26 +87,19 @@ fn a_front_whose_place_cannot_be_read_is_handed_back_and_the_error_says_so() {
     let (owned, pid, stdin) = held_blocker(|f| f.reaps([ReapAnswer::Running]));
     let subtree = killed_subtree();
 
-    let torn = {
+    let (error, fate, handed_back) = {
         let _unreadable = fault::fail_pidfd_info();
-        tear_down_held(
-            owned,
-            pid,
-            Some(Front::Sudo),
-            None,
-            Some(&subtree),
-            &mut Diagnosis::default(),
-            failed(),
-        )
+        tear_down_held_holding(owned, pid, Some(Front::Sudo), None, Some(&subtree), stdin, failed())
     };
 
-    let (error, fate, handed_back) = settle(torn, stdin);
     assert!(matches!(fate, ChildFate::Running { .. }), "{fate:?}");
-    assert!(handed_back, "the arm handed nothing back");
+    handed_back.unreaped();
+    let error = error.to_string();
     assert!(
         error.contains("where it is cannot be read") && error.contains("handed back to the caller"),
         "{error}"
     );
+    handed_back.wait();
 }
 
 /// A front its leaf's kill reached, whose reap then fails, is `Killed`, uncollected and still ours:
@@ -138,24 +111,17 @@ fn a_front_whose_reap_failed_after_the_leaf_kill_is_handed_back_and_the_error_sa
     let (owned, pid, stdin) = held_blocker(|f| f.reaps([ReapAnswer::Running, ReapAnswer::Err(io::ErrorKind::Other)]));
     let subtree = killed_subtree();
 
-    let torn = {
+    let (error, fate, handed_back) = {
         let _placed = fault::force_pidfd_cgroup_id(7);
-        tear_down_held(
-            owned,
-            pid,
-            Some(Front::Sudo),
-            None,
-            Some(&subtree),
-            &mut Diagnosis::default(),
-            failed(),
-        )
+        tear_down_held_holding(owned, pid, Some(Front::Sudo), None, Some(&subtree), stdin, failed())
     };
 
-    let (error, fate, handed_back) = settle(torn, stdin);
     assert_eq!(fate, ChildFate::Killed);
-    assert!(handed_back, "the arm handed nothing back");
+    handed_back.unreaped();
+    let error = error.to_string();
     assert!(
         error.contains("could not be waited on") && error.contains("handed back to the caller"),
         "{error}"
     );
+    handed_back.wait();
 }
