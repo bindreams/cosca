@@ -260,10 +260,15 @@ pub(crate) enum RootView {
     Trusted,
 }
 
+/// The label of a `Child`'s own drop, which prefixes its log lines.
+pub(crate) const DROP_LABEL: &str = "Child::drop";
+
 /// What a `Child`'s drop knows about its root, for [`Attached::hard_kill_for_drop`].
 #[cfg(unix)]
 #[derive(Debug)]
 pub(crate) struct DropView {
+    /// The caller, which prefixes its log lines.
+    pub(crate) label: &'static str,
     pub(crate) root_pid: u32,
     pub(crate) root: RootView,
     /// This handle already killed the tree completely.
@@ -272,6 +277,16 @@ pub(crate) struct DropView {
 
 #[cfg(unix)]
 impl DropView {
+    /// How a log line of the caller refers to its own event: a drop is "this drop", any other
+    /// teardown is "this teardown".
+    pub(crate) fn this_event(&self) -> &'static str {
+        if self.label == DROP_LABEL {
+            "this drop"
+        } else {
+            "this teardown"
+        }
+    }
+
     /// Read the state a drop or a failed-spawn cleanup decides on: the root's number first, then
     /// the handle's own answer ([`RootState`](crate::signal::RootState)). The handle is exact
     /// where the number is not: a foreign reap followed by a same-tick reuse still reads as this
@@ -280,7 +295,7 @@ impl DropView {
     /// Reading emits no `warn`: the caller reports once, with a
     /// [`DropReport`](crate::child::drop_report::DropReport). `label` names the caller in log lines.
     pub(crate) fn read(
-        label: &str,
+        label: &'static str,
         id: crate::identity::ProcessId,
         root: impl FnOnce() -> crate::signal::RootState,
         tree_killed: &TreeKilled,
@@ -311,6 +326,7 @@ impl DropView {
             }
         };
         let view = DropView {
+            label,
             root_pid,
             root,
             tree_killed: tree_killed.is_set(),
@@ -747,16 +763,17 @@ impl Attached {
             DropReach::Skip(skipped) => skipped,
         };
         let why = view.why_number_untrusted();
+        let (label, this) = (view.label, view.this_event());
         let left_behind = if view.tree_killed {
             log::debug!(
-                "Child::drop: {why} and this handle already killed the tree, \
-                 so this drop does not {skipped}"
+                "{label}: {why} and this handle already killed the tree, \
+                 so {this} does not {skipped}"
             );
             None
         } else {
             // A reaped root's skip is the drop's warn; an unsettled root's is part of its state's.
             if !matches!(view.root, RootView::Reaped) {
-                log::debug!("Child::drop: {why}, so this drop does not {skipped}");
+                log::debug!("{label}: {why}, so {this} does not {skipped}");
             }
             Some(skipped)
         };
@@ -805,7 +822,8 @@ impl Attached {
                 RootNumber::Trusted => return DropReach::Kill,
                 RootNumber::GroupGone => {
                     log::debug!(
-                        "Child::drop: {why}, and its pidfd shows its process group has no member left, so nothing is sent"
+                        "{}: {why}, and its pidfd shows its process group has no member left, so nothing is sent",
+                        view.label
                     );
                     return DropReach::GroupGone;
                 }

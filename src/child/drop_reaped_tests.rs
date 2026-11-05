@@ -138,6 +138,41 @@ fn dropping_a_waited_on_process_group_child_sends_no_killpg_and_warns_with_the_p
         text.contains("kill_tree()") && text.contains("wait()"),
         "the warn says how to end descendants: {text}"
     );
+    assert!(
+        text.contains("so this drop does not") && text.contains("by this drop"),
+        "the drop calls itself a drop: {text}"
+    );
+}
+
+/// The same skip in the teardown a helper runs after its failed run is worded as that teardown,
+/// under its own label, not as a drop.
+///
+/// Mutant: the shared text says "this drop", or the label is `Child::drop`.
+#[skuld::test]
+fn tearing_down_a_waited_on_process_group_child_after_a_failed_run_does_not_call_itself_a_drop() {
+    #[cfg(target_os = "linux")]
+    let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
+    crate::log_capture::install();
+    let _recorder = record_kill_group();
+    let child = session(&["true"]).spawn().expect("spawn");
+    child.wait().expect("reap the root");
+
+    let mark = crate::log_capture::mark();
+    let (fate, unreaped) = child.tear_down_or_hand_back(crate::child::owned::teardown::Disposition::HandBack);
+
+    assert!(unreaped.is_none(), "{unreaped:?}");
+    assert_eq!(fate, crate::error::ChildFate::Reaped);
+    let warns = crate::log_capture::records_since_on_current_thread(mark, "the root is already reaped");
+    assert_eq!(warns.len(), 1, "exactly one warn, got {warns:?}");
+    let text = &warns[0].1;
+    assert!(
+        text.starts_with("teardown after a failed run: the root is already reaped"),
+        "{text}"
+    );
+    assert!(
+        text.contains("so this teardown does not") && text.contains("by this teardown") && !text.contains("drop"),
+        "{text}"
+    );
 }
 
 /// The warn is for the skip only. Mutant: the reaped test is inverted or dropped, so a running

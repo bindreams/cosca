@@ -1,6 +1,7 @@
 //! A child created frozen: the window in which its identity can be recorded before it executes
 //! one instruction. See [`Command::spawn_suspended`](crate::Command::spawn_suspended).
 
+use crate::child::owned::teardown::Disposition;
 use crate::child::Child;
 use crate::command::Command;
 use crate::error::Error;
@@ -85,8 +86,11 @@ impl SuspendedChild {
     ///
     /// [`Error::MayHaveStarted`] when the resume failed or only partly happened (a thread that
     /// something else also suspended stays suspended). The child is then torn down and the error's
-    /// `fate` says how. A child whose kill is refused, and which still runs, comes back in the
-    /// error's `unreaped`. A child killed by something else *before* the call is this error too.
+    /// `fate` says how. A child whose kill is refused, and which still runs, is left, warned, and
+    /// named by the `fate` (`Running`); `unreaped` is `None`. Unlike `Command::status`, it is not
+    /// handed back: a failed release may leave the initial thread frozen, so the child may never
+    /// run, and waiting for it would block for ever. A child killed by something else *before* the
+    /// call is this error too.
     pub fn resume(self) -> Result<Child, Error> {
         let SuspendedChild {
             mut child,
@@ -100,7 +104,7 @@ impl SuspendedChild {
             }
             Err(e) => {
                 let behind_wrapper = child.behind_wrapper();
-                let (fate, unreaped) = child.tear_down_or_hand_back();
+                let (fate, unreaped) = child.tear_down_or_hand_back(Disposition::Leave);
                 Err(crate::child::spawn::after_the_spawn(
                     Error::Containment {
                         detail: format!("could not resume the frozen child: {e}"),

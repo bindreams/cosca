@@ -1039,21 +1039,27 @@ pub(crate) mod fault {
 impl Drop for Child {
     fn drop(&mut self) {
         if self.kill_on_drop {
-            _ = self.tear_down("Child::drop", Disposition::Leave);
+            _ = self.tear_down(crate::containment::dispatch::DROP_LABEL, Disposition::Leave);
         }
     }
 }
 
 impl Child {
-    /// What [`Drop`] does, now, for a helper that owns the child and fails after its spawn: it says
-    /// what became of the child, and gives the child back when the teardown could not end it.
+    /// What [`Drop`] does, now, for a caller that owns the child and fails after its spawn: it says
+    /// what became of the child. With [`Disposition::HandBack`], a child whose teardown could not
+    /// end it is given back too.
     ///
     /// A child `kill_on_drop(false)` keeps is left alone, as the drop leaves it, and is not handed
-    /// back. Otherwise, when the root's kill is refused and the child still runs, it goes back as an
-    /// [`Unreaped`] (fate `Running` with this child's identity), unless it is an elevation front:
-    /// a front is sent no kill, and is left running. The containment is torn down as `self` drops,
-    /// before this returns.
-    pub(crate) fn tear_down_or_hand_back(mut self) -> (crate::error::ChildFate, Option<Unreaped>) {
+    /// back. Otherwise, when `disposition` is `HandBack`, the root's kill is refused and the child
+    /// still runs, it goes back as an [`Unreaped`] (fate `Running` with this child's identity),
+    /// unless it is an elevation front: a front is sent no kill, and is left running whatever the
+    /// caller said. The containment is torn down as `self` drops, before this returns. A Windows
+    /// Job Object is closed then too, and its `KILL_ON_JOB_CLOSE` kills the child, so a contained
+    /// child is handed back there only when the Job's own kill failed first.
+    pub(crate) fn tear_down_or_hand_back(
+        mut self,
+        disposition: Disposition,
+    ) -> (crate::error::ChildFate, Option<Unreaped>) {
         use crate::error::ChildFate;
 
         if !self.kill_on_drop {
@@ -1066,11 +1072,11 @@ impl Child {
         }
         self.kill_on_drop = false;
         let disposition = if self.front.is_none() {
-            Disposition::HandBack
+            disposition
         } else {
             Disposition::Leave
         };
-        let fate = self.tear_down("Child::tear_down_or_hand_back", disposition);
+        let fate = self.tear_down("teardown after a failed run", disposition);
         let handed_back = disposition == Disposition::HandBack && matches!(fate, ChildFate::Running { .. });
         (fate, handed_back.then(|| self.into_unreaped()))
     }
@@ -1084,7 +1090,7 @@ impl Child {
 
     /// The kill-on-drop teardown, answering what became of the child. `label` prefixes the event's
     /// warn, and `disposition` words it for a child that still runs after a refused kill.
-    fn tear_down(&mut self, label: &str, disposition: Disposition) -> crate::error::ChildFate {
+    fn tear_down(&mut self, label: &'static str, disposition: Disposition) -> crate::error::ChildFate {
         // Hard-kill the contained tree (if any) — on Linux cgroup.kill reaches an elevated
         // subtree — then tear the direct child down. The dispatcher preserves the Unix
         // kill-before-wait order and NEVER blocks on an unkillable elevated child.
@@ -1126,7 +1132,7 @@ impl Child {
     /// [`kill_tree`](Child::kill_tree). On Linux 6.9+ a process group is decided by the root's pidfd
     /// ([`Attached::hard_kill_for_drop`](crate::containment::Attached::hard_kill_for_drop)). An
     /// unreaped root stays a zombie, pinning its number, until `tear_down`.
-    fn drop_unix(&mut self, label: &str, disposition: Disposition) -> crate::error::ChildFate {
+    fn drop_unix(&mut self, label: &'static str, disposition: Disposition) -> crate::error::ChildFate {
         use crate::child::drop_report::DropReport;
         use crate::error::ChildFate;
 
@@ -1135,7 +1141,7 @@ impl Child {
         // kill it decides.
         let gate = self.kill_gate();
         let view = crate::containment::DropView::read(label, self.id, || self.proc.state(), &self.tree_killed);
-        let mut report = DropReport::new(label, &view);
+        let mut report = DropReport::new(&view);
         let cgroup_only = match gate {
             crate::elevation::front::Gate::Closed(unkillable) => {
                 // The leaf stays armed: its teardown kills what it holds, a front among it if it is

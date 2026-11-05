@@ -964,7 +964,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
             }
         }
     };
-    let mut report = crate::child::drop_report::DropReport::new("finish_elevated", &view);
+    let mut report = crate::child::drop_report::DropReport::new(&view);
     report.forgot = forgot;
     report.tree = tree_warn;
     let warned = report.emit(&[]);

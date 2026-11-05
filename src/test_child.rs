@@ -254,6 +254,43 @@ pub(crate) fn held_uncontained_blocker(kill_on_drop: bool) -> (crate::Child, std
     (cmd.spawn().expect("spawn"), writer)
 }
 
+/// A test's hold on the child a teardown handed back, if it did, and on what lets that child exit
+/// (`release`: the stdin's write end, a thread to resume). `release` drops first, so a failed
+/// assertion ends the test: the [`Unreaped`](crate::Unreaped)'s drop waits for the child, and would
+/// wait for ever on one nothing releases. Build it at once from the teardown's result.
+pub(crate) struct HandedBack<R> {
+    release: R,
+    unreaped: Option<crate::Unreaped>,
+}
+
+impl<R> HandedBack<R> {
+    pub(crate) fn new(release: R, unreaped: Option<crate::Unreaped>) -> HandedBack<R> {
+        HandedBack { release, unreaped }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn is_none(&self) -> bool {
+        self.unreaped.is_none()
+    }
+
+    /// The handed-back child; panics when the teardown handed none back.
+    #[track_caller]
+    pub(crate) fn unreaped(&self) -> &crate::Unreaped {
+        self.unreaped.as_ref().expect("the teardown handed the child back")
+    }
+
+    /// Release the child and wait for it to exit.
+    #[track_caller]
+    pub(crate) fn wait(self) -> std::process::ExitStatus {
+        let HandedBack { release, unreaped } = self;
+        drop(release);
+        unreaped
+            .expect("the teardown handed the child back")
+            .wait()
+            .expect("the handed-back child exits once released")
+    }
+}
+
 fn held_blocker(
     stdout: crate::Stdio,
     contain: impl FnOnce(&mut crate::Command),

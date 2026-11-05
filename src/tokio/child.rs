@@ -329,7 +329,7 @@ impl Child {
     /// What this child's own handle and the root's number say about the root, for a cleanup that
     /// decides on both. Logs nothing about an unsettled root: the caller does, once.
     #[cfg(unix)]
-    pub(super) fn read_root_view(&self, label: &str) -> crate::containment::DropView {
+    pub(super) fn read_root_view(&self, label: &'static str) -> crate::containment::DropView {
         crate::containment::DropView::read(
             label,
             self.id,
@@ -1578,7 +1578,7 @@ impl Child {
         let gate = self.kill_on_drop.then(|| kill_gate(self.front, &os, self.id.pid()));
         #[cfg(unix)]
         let view = crate::containment::DropView::read(
-            "Child::drop",
+            crate::containment::dispatch::DROP_LABEL,
             self.id,
             || {
                 os.proc
@@ -1689,7 +1689,7 @@ impl Child {
         let tree_failed = signals.tree.is_some();
         #[cfg(unix)]
         {
-            let mut report = crate::child::drop_report::DropReport::new("Child::drop", &view);
+            let mut report = crate::child::drop_report::DropReport::new(&view);
             report.front = front_left.as_ref();
             report.skipped = signals.skipped;
             report.forgot = signals.forgot;

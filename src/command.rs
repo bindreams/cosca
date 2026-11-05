@@ -1008,7 +1008,7 @@ impl Command {
 /// carries it when its teardown could not end it.
 fn after_the_spawn(error: Error, child: crate::Child) -> Error {
     let behind_wrapper = child.behind_wrapper();
-    let (fate, unreaped) = child.tear_down_or_hand_back();
+    let (fate, unreaped) = child.tear_down_or_hand_back(crate::child::owned::teardown::Disposition::HandBack);
     crate::child::spawn::after_the_spawn(error, fate, unreaped, behind_wrapper)
 }
 

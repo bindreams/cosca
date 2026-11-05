@@ -1,5 +1,5 @@
-//! [`Unreaped`]: a child a failed spawn or a run-to-completion method could not end, handed to the
-//! caller who owns it.
+//! [`Unreaped`]: a child a failed spawn or a failed `status`, `output` or `read` could not end,
+//! handed to the caller who owns it.
 
 use std::process::ExitStatus;
 
@@ -11,11 +11,10 @@ use crate::identity::ProcessId;
 use crate::os_process::child::Foreign;
 use crate::os_process::child_named;
 
-/// A child a failed spawn could not end: its kill was refused (`EPERM`, `ACCESS_DENIED`) and it
-/// still runs. It comes back in [`Error::MayHaveStarted`], which the caller owns from then on. The
-/// sync [`Command::status`](crate::Command::status), [`output`](crate::Command::output) and
-/// [`read`](crate::Command::read), and [`SuspendedChild::resume`](crate::SuspendedChild::resume),
-/// hand a child back this way.
+/// A child a failed spawn, or a sync [`Command::status`](crate::Command::status),
+/// [`output`](crate::Command::output) or [`read`](crate::Command::read) that failed after it, could
+/// not end: its kill was refused (`EPERM`, `ACCESS_DENIED`) and it still runs. It comes back in
+/// [`Error::MayHaveStarted`], which the caller owns from then on.
 ///
 /// Settle it with [`wait`](Unreaped::wait), which blocks until the child exits and reaps it, or
 /// [`leak`](Unreaped::leak), which gives it up. A value dropped otherwise does what `wait` does,

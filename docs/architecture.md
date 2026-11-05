@@ -85,8 +85,8 @@ In order:
      leaf's abandonment (`leaf.rs`); the `exit_only::seams` their tests use. `OwnedChild::tear_down`
      is the one kill-then-settle policy, and `Child::drop` uses it. A spawn teardown whose kill is
      refused hands the child back as `Unreaped`, in `Error::MayHaveStarted`. The sync
-     `Command::{status, output, read}` and `SuspendedChild::resume` hand back through
-     `Child::tear_down_or_hand_back`.
+     `Command::{status, output, read}` hand back through `Child::tear_down_or_hand_back`;
+     `SuspendedChild::resume` runs it too but leaves the child, since a frozen thread may never run.
    - Under `MacChild` ([#877](https://github.com/bindreams/cosca/issues/877), the macOS
      kernel-view slice): `exit_only::{peek, peek_verified, peek_traced}` still consult the
      `exit_only::seams` hook; five macOS tests need it, and `MacChild::event_pending` (a `cfg(test)`

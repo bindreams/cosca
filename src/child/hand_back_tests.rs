@@ -2,11 +2,12 @@
 //! gives back when the kill is refused. A refused kill is scripted over a real child (`script_over`);
 //! the real refusal is `command_tests`' (the setuid group).
 
+use crate::child::owned::teardown::Disposition;
 use crate::child::Child;
 use crate::error::ChildFate;
 use crate::identity::Liveness;
 use crate::os_process::fake::FakeProcess;
-use crate::test_child::held_uncontained_blocker;
+use crate::test_child::{held_uncontained_blocker, HandedBack};
 
 /// Make the next kill of `child` fail with `PermissionDenied`, as an elevated child's does.
 fn refuse_the_kill(child: &mut Child) -> FakeProcess {
@@ -25,10 +26,10 @@ fn warns_since(mark: usize) -> Vec<String> {
 }
 
 /// A child whose kill is refused and which still runs comes back as an `Unreaped` that names it,
-/// and the one warn says so, and does not claim a drop.
+/// and the one warn says so, in the words of a teardown after a failed run, not of a drop.
 ///
 /// Mutants: the child is dropped instead; the fate or the identity is wrong; the warn says the
-/// child is left running, or is prefixed as a drop's.
+/// child is left running, or is prefixed with a private name or as a drop's.
 #[skuld::test]
 fn a_refused_kill_hands_the_child_back_and_says_so() {
     crate::log_capture::install();
@@ -37,25 +38,49 @@ fn a_refused_kill_hands_the_child_back_and_says_so() {
     refuse_the_kill(&mut child);
     let mark = crate::log_capture::mark();
 
-    let (fate, unreaped) = child.tear_down_or_hand_back();
+    let (fate, unreaped) = child.tear_down_or_hand_back(Disposition::HandBack);
+    let handed_back = HandedBack::new(stdin, unreaped);
 
     assert_eq!(fate, ChildFate::Running { id: Some(id) });
-    let unreaped = unreaped.expect("a child whose kill was refused is handed back");
-    assert_eq!(unreaped.pid(), Some(id.pid()));
-    assert_eq!(unreaped.id(), Some(id));
+    assert_eq!(handed_back.unreaped().pid(), Some(id.pid()));
+    assert_eq!(handed_back.unreaped().id(), Some(id));
     let warns = warns_since(mark);
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(
-        warns[0].contains(&id.pid().to_string())
+        warns[0].starts_with("teardown after a failed run: ")
+            && warns[0].contains(&id.pid().to_string())
             && warns[0].contains("handed back to the caller")
-            && !warns[0].contains("leaving it running")
-            && !warns[0].contains("Child::drop"),
+            && !warns[0].contains("leaving it running"),
+        "{warns:?}"
+    );
+    handed_back.wait();
+}
+
+/// A caller that leaves a child whose kill is refused gets it left, warned, and no `Unreaped`:
+/// the caller's disposition decides, not the helper.
+///
+/// Mutant: the teardown hands the child back whatever the caller said.
+#[cfg(unix)]
+#[skuld::test]
+fn a_refused_kill_is_left_when_the_caller_leaves_it() {
+    crate::log_capture::install();
+    let (mut child, stdin) = held_uncontained_blocker(true);
+    let id = child.id();
+    refuse_the_kill(&mut child);
+    let mark = crate::log_capture::mark();
+
+    let (fate, unreaped) = child.tear_down_or_hand_back(Disposition::Leave);
+
+    assert_eq!(fate, ChildFate::Running { id: Some(id) });
+    assert!(unreaped.is_none(), "{unreaped:?}");
+    let warns = warns_since(mark);
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(
+        warns[0].starts_with("teardown after a failed run: ") && warns[0].contains("leaving it running"),
         "{warns:?}"
     );
     drop(stdin);
-    unreaped
-        .wait()
-        .expect("the handed-back child exits once its stdin closes");
+    crate::test_child::wait_until_zombie(id.pid());
 }
 
 /// A child that opted out of `kill_on_drop` is not torn down and not handed back: its `Unreaped`
@@ -67,7 +92,7 @@ fn a_child_that_opted_out_is_not_handed_back() {
     let (child, stdin) = held_uncontained_blocker(false);
     let id = child.id();
 
-    let (fate, unreaped) = child.tear_down_or_hand_back();
+    let (fate, unreaped) = child.tear_down_or_hand_back(Disposition::HandBack);
 
     assert_eq!(fate, ChildFate::Running { id: Some(id) });
     assert!(unreaped.is_none(), "{unreaped:?}");
@@ -87,7 +112,7 @@ fn a_refused_kill_of_a_child_that_has_exited_hands_nothing_back() {
     crate::test_child::wait_until_zombie(child.id().pid());
     refuse_the_kill(&mut child);
 
-    let (fate, unreaped) = child.tear_down_or_hand_back();
+    let (fate, unreaped) = child.tear_down_or_hand_back(Disposition::HandBack);
 
     assert_eq!(fate, ChildFate::Reaped);
     assert!(unreaped.is_none(), "{unreaped:?}");
@@ -108,7 +133,7 @@ fn a_refused_kill_with_a_failed_look_hands_nothing_back() {
             .reaps([ReapAnswer::Err(std::io::ErrorKind::Other)])
     });
 
-    let (fate, unreaped) = child.tear_down_or_hand_back();
+    let (fate, unreaped) = child.tear_down_or_hand_back(Disposition::HandBack);
 
     assert_eq!(fate, ChildFate::Unknown);
     assert!(unreaped.is_none(), "{unreaped:?}");
@@ -128,7 +153,7 @@ fn an_elevation_front_left_running_is_not_handed_back() {
     let (child, stdin) = spawn_as(cat(), ElevatedVia::Wrapped(Backend::Sudo));
     let id = child.id();
 
-    let (fate, unreaped) = child.tear_down_or_hand_back();
+    let (fate, unreaped) = child.tear_down_or_hand_back(Disposition::HandBack);
 
     assert_eq!(fate, ChildFate::Running { id: Some(id) });
     assert!(unreaped.is_none(), "{unreaped:?}");
@@ -146,8 +171,10 @@ mod in_a_cgroup {
 
     use super::{refuse_the_kill, warns_since};
     use crate::child::front_cgroup_tests::{cgroup_dir_of, move_out_of_its_leaf};
+    use crate::child::owned::teardown::Disposition;
     use crate::child::Child;
     use crate::error::ChildFate;
+    use crate::test_child::HandedBack;
     use crate::test_groups::{cgroup, Group};
     use crate::{Command, ContainMode, Containment};
 
@@ -176,15 +203,13 @@ mod in_a_cgroup {
         move_out_of_its_leaf(pid);
         refuse_the_kill(&mut child);
 
-        let (fate, unreaped) = child.tear_down_or_hand_back();
+        let (fate, unreaped) = child.tear_down_or_hand_back(Disposition::HandBack);
+        let handed_back = HandedBack::new(stdin, unreaped);
 
         assert!(matches!(fate, ChildFate::Running { .. }), "{fate:?}");
-        let unreaped = unreaped.expect("handed back");
+        handed_back.unreaped();
         assert!(!Path::new(&leaf).exists(), "the leaf {leaf} was removed by the call");
-        drop(stdin);
-        unreaped
-            .wait()
-            .expect("the handed-back child exits once its stdin closes");
+        handed_back.wait();
     }
 
     /// A leaf whose `cgroup.kill` fails is given up and logged, and the call returns with the child
@@ -201,20 +226,18 @@ mod in_a_cgroup {
 
         let (fate, unreaped) = {
             let _failing = crate::containment::cgroup::fault::fail_kill_writes();
-            child.tear_down_or_hand_back()
+            child.tear_down_or_hand_back(Disposition::HandBack)
         };
+        let handed_back = HandedBack::new(stdin, unreaped);
 
         assert!(matches!(fate, ChildFate::Running { .. }), "{fate:?}");
-        let unreaped = unreaped.expect("handed back");
+        handed_back.unreaped();
         let warns = warns_since(mark);
         assert!(
             warns.iter().any(|w| w.contains(&leaf) && w.contains("was not removed")),
             "the leaf left behind is named: {warns:?}"
         );
-        drop(stdin);
-        unreaped
-            .wait()
-            .expect("the handed-back child exits once its stdin closes");
+        handed_back.wait();
         std::fs::remove_dir(&leaf).expect("remove the leaf the call gave up");
     }
 }

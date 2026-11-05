@@ -304,6 +304,7 @@ fn a_handle_that_could_not_say_is_logged_when_the_number_shows_the_reap() {
 #[skuld::test]
 fn asking_why_a_trusted_root_is_untrusted_is_a_contract_breach() {
     let view = crate::containment::DropView {
+        label: "test",
         root_pid: 1,
         root: crate::containment::dispatch::RootView::Trusted,
         tree_killed: false,

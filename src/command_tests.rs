@@ -502,22 +502,18 @@ fn a_failure_after_the_spawn_hands_back_a_child_whose_kill_is_refused(
 
     let error = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), child);
 
-    let crate::error::Error::MayHaveStarted {
-        fate,
-        unreaped: Some(unreaped),
-        ..
-    } = error
-    else {
-        panic!("expected MayHaveStarted around the child, got {error:?}");
+    let crate::error::Error::MayHaveStarted { fate, unreaped, .. } = error else {
+        panic!("expected MayHaveStarted, got {error:?}");
     };
+    let handed_back = crate::test_child::HandedBack::new(stdin, unreaped.map(|unreaped| *unreaped));
+
     assert_eq!(fate, crate::error::ChildFate::Running { id: Some(id) });
-    assert_eq!(unreaped.pid(), Some(id.pid()));
+    assert_eq!(handed_back.unreaped().pid(), Some(id.pid()));
     assert_eq!(id.is_alive(), crate::identity::Liveness::Alive);
     let warns = crate::log_capture::records_since_on_current_thread(mark, "handed back to the caller");
     assert_eq!(warns.len(), 1, "{warns:?}");
-    drop(stdin);
-    let status = unreaped.wait().expect("the helper exits on EOF");
-    assert!(status.success(), "{status:?}");
+    let status = handed_back.wait();
+    assert!(status.success(), "the helper exits on EOF: {status:?}");
 }
 
 // A run-to-completion helper that fails after its spawn =====
