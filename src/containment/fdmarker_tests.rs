@@ -1027,8 +1027,8 @@ fn kill_holder_leaves_a_denied_pid_unsignalled_and_reports_incomplete() {
 /// `hard_kill()` — not a synthetic check of the `incomplete` bool in isolation. Forces a
 /// genuinely blind pass via the enumerate backend's test-only fault seam (module docs at the
 /// top of `enumerate/macos.rs`), NOT by naming an unkillable real pid as `root`: an unprivileged
-/// but real identity like pid 1 cannot be used as `root` here, because `treewalk::descendants`
-/// would then walk pid 1's ENTIRE real ppid subtree — every process on the host, launchd being
+/// but real identity like pid 1 cannot be used as `root` here, because the sweep's
+/// `treewalk::walk_from` would then walk pid 1's ENTIRE real ppid subtree — every process on the host, launchd being
 /// everyone's eventual ancestor — and this sweep would attempt to SIGKILL every one of them.
 /// `inert_root()` and `pgid: None` keep every channel this test does not need inert, so the blind
 /// pass is the ONLY source of `incomplete` — no real process is signalled by this test at all.
@@ -1049,6 +1049,124 @@ fn hard_kill_reports_err_on_a_genuinely_blind_pass() {
         result.is_err(),
         "a sweep whose only pass was blind must report Err, not silently converge as Ok(())"
     );
+}
+
+/// A pass whose root's identity cannot be read (`identity::unreadable` refuses its by-pid read, as
+/// the OS can) skips the walk channel and is `incomplete`: not observed is not observed absent. The
+/// root is already in `seen`, so the pass signals no one, and the walk is the only source of
+/// `incomplete`, and no walk is recorded. The warn names the marker handle. Mutants: the unreadable
+/// root is `Ok(None)` (a gone root), which walks nothing and reports a complete pass; the walk is
+/// recorded before the root is proved.
+#[skuld::test]
+fn a_pass_whose_root_cannot_be_read_skips_the_walk_and_is_incomplete() {
+    let _serialize = test_spawn_lock();
+    crate::log_capture::install();
+    let mut cmd = std::process::Command::new("/usr/bin/true");
+    let prepared = install_on(&mut cmd, &[]).expect("install");
+    drop(cmd);
+    let root = inert_root();
+    let marker = super::Marker::new(prepared, root, None);
+    let (_kernel, _unreadable) = crate::identity::unreadable(root.pid());
+
+    let mut seen: std::collections::HashSet<crate::identity::ProcessId> = std::collections::HashSet::from([root]);
+    let mut group_result: Result<(), crate::error::Error> = Ok(());
+    let mut incomplete = false;
+    let walks = crate::containment::treewalk::fault::record_walks();
+    let mark = crate::log_capture::mark();
+    let progressed = marker.sweep_pass(
+        nix::sys::signal::Signal::SIGKILL,
+        &mut seen,
+        &mut group_result,
+        &mut incomplete,
+        true,
+        super::Scope::Full(&crate::containment::GroupRoot::trusted_for_test()),
+    );
+
+    assert!(incomplete, "an unreadable root is not a complete walk");
+    assert!(!progressed, "nothing was signalled");
+    assert_eq!(
+        walks.walked(),
+        Vec::<u32>::new(),
+        "no walk began from a root that could not be read"
+    );
+    let warned = crate::log_capture::records_since_on_current_thread(
+        mark,
+        &format!(
+            "fd marker {:#x}: the root's descendants could not be walked",
+            marker.handle
+        ),
+    );
+    assert_eq!(warned.len(), 1, "{warned:?}");
+}
+
+/// A pass whose walk cannot read a live child of its live root (`identity::unreadable` refuses the
+/// child's by-pid read, as the OS can) does not signal it and is `incomplete`: not observed is not
+/// observed absent. The root is already in `seen`, so the child is the only candidate and nothing
+/// is signalled. Mutant: the sweep takes the walk's members and ignores `unassessed`: the pass
+/// reports complete.
+#[skuld::test]
+fn a_pass_with_a_child_that_cannot_be_read_does_not_signal_it_and_is_incomplete() {
+    use std::io::Read as _;
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let _serialize = test_spawn_lock();
+    let mut cmd = std::process::Command::new("/usr/bin/true");
+    let prepared = install_on(&mut cmd, &[]).expect("install");
+    drop(cmd);
+    // A root `sh` that has announced its pid and forked an `sh` that prints `released` at EOF of its
+    // stdin, which the test holds the write end of.
+    let mut root_cmd = std::process::Command::new("/bin/sh");
+    root_cmd
+        .arg("-c")
+        .arg("exec 3<&0; sh -c 'read _ignored; echo released' <&3 3<&- & echo $$; wait")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the test holds spawn_lock for its whole body via `_serialize`"
+    )]
+    let mut root_child = root_cmd.spawn().expect("spawn the root");
+    crate::test_child::await_member_ready(&mut root_child);
+    let root = crate::identity::ProcessId::of(root_child.id())
+        .found()
+        .expect("the live root resolves");
+    let children = root
+        .children(crate::Recursive::No)
+        .expect("the root's children are readable");
+    let [child] = children[..] else {
+        panic!("the root has exactly one child, got {children:?}");
+    };
+    let marker = super::Marker::new(prepared, root, None);
+    let (_kernel, _unreadable) = crate::identity::unreadable(child.pid());
+
+    let mut seen: std::collections::HashSet<crate::identity::ProcessId> = std::collections::HashSet::from([root]);
+    let mut group_result: Result<(), crate::error::Error> = Ok(());
+    let mut incomplete = false;
+    let progressed = marker.sweep_pass(
+        nix::sys::signal::Signal::SIGKILL,
+        &mut seen,
+        &mut group_result,
+        &mut incomplete,
+        true,
+        super::Scope::Full(&crate::containment::GroupRoot::trusted_for_test()),
+    );
+
+    assert!(incomplete, "a child the walk could not read is not a complete walk");
+    assert!(!progressed, "nothing was signalled");
+    drop(root_child.stdin.take());
+    let mut printed = String::new();
+    root_child
+        .stdout
+        .take()
+        .expect("piped stdout")
+        .read_to_string(&mut printed)
+        .expect("read to EOF");
+    assert_eq!(
+        printed, "released\n",
+        "the unreadable child must not have been signalled"
+    );
+    let status = root_child.wait().expect("reap the root");
+    assert_eq!((status.signal(), status.code()), (None, Some(0)));
 }
 
 use super::is_teardown_mechanism_failure;
