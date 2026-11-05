@@ -20,9 +20,12 @@ pub(crate) trait Kernel: Sync {
     /// `ProcDir::open`: `openat2` of `/proc`, proven procfs's root.
     fn open_proc(&self) -> Result<ProcDir, ViewUnreadable>;
 
-    /// The file at `path` under `dir`: `<pid>/stat`, `self/stat`, `self/status` or
-    /// `thread-self/fdinfo/<fd>`.
+    /// The file at `path` under `dir`: `<pid>/stat`, `<pid>/cgroup`, `self/stat`, `self/status`
+    /// or `thread-self/fdinfo/<fd>`.
     fn read(&self, dir: &ProcDir, path: &str) -> io::Result<Vec<u8>>;
+
+    /// The numeric entries of `dir` (`ProcDir::pids`).
+    fn pids(&self, dir: &ProcDir) -> io::Result<Vec<u32>>;
 
     /// `kill(target, 0)`. The caller decides what is a kill target (`probe::signal_target`); the
     /// kernel is asked only about one.
@@ -43,6 +46,10 @@ impl Kernel for HostKernel {
 
     fn read(&self, dir: &ProcDir, path: &str) -> io::Result<Vec<u8>> {
         dir.read(path)
+    }
+
+    fn pids(&self, dir: &ProcDir) -> io::Result<Vec<u32>> {
+        dir.pids()
     }
 
     fn signal_probe(&self, target: Pid) -> Result<(), Errno> {
