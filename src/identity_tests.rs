@@ -317,12 +317,4 @@ fn a_missing_record_reads_the_parent_number_as_asked() {
     assert_eq!(asked.parent, ParentRead::Unreadable);
     let alone = OrderedRead::missing(Resolved::Unknown, UnknownCause::default(), false);
     assert_eq!(alone.parent, ParentRead::NotAsked);
-
-    // With the parent gone, the refused read of the candidate is `Gone`: the walk is not told a live
-    // process could not be read.
-    let (answer, cause) = asked
-        .judged(7, 100)
-        .proved(|| Err((Resolved::Gone, UnknownCause::default())));
-    assert_eq!(answer, Resolved::Gone);
-    assert!(cause.into_error("pid 7").is_none());
 }

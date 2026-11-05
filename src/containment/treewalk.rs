@@ -74,10 +74,13 @@
 //! parent no longer holds that pid when the read is done. So a descendant whose parent exits while
 //! the walk runs is dropped with its subtree: Linux and macOS reparent it, so its record names its
 //! new parent; Windows never updates the creator pid, which still names the dead parent, and the
-//! read cannot tell that from a pid that changed hands. A parent number that cannot be read leaves
-//! the candidate unproved, and it is dropped with a warning (on Windows, naming the `NTSTATUS`).
-//! There is no parent-order rule off Windows ([`ORDER_AFTER_PARENT`] is off): a tracer is the
-//! parent of a traced child it started after.
+//! read cannot tell that from a pid that changed hands. A candidate whose own read fails (no record,
+//! no order key, or a parent number that cannot be read) goes to the proof of the accepted parent
+//! first: a parent that is gone drops it quietly, as `Gone`; one that cannot be proved drops it with
+//! a warning naming `ppid N`; and only a held parent lets its own failure stand, dropped with a
+//! warning naming the candidate (on Windows, naming the `NTSTATUS`). There is no parent-order rule
+//! off Windows ([`ORDER_AFTER_PARENT`] is off): a tracer is the parent of a traced child it started
+//! after.
 
 use crate::error::Error;
 use crate::identity::{Existence, Kernel, OrderKey, ProcessId, RawPid, Resolved, UnknownCause};
