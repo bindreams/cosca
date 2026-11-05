@@ -186,6 +186,22 @@ fn a_grandchild_read_after_its_accepted_parents_number_changed_hands_is_dropped(
     );
 }
 
+/// The parent-order rule is off here: `GRAND` started after the root but before its listed parent
+/// `CHILD`, and is kept, as `descendants_from_key` passes `ORDER_AFTER_PARENT`. Mutant:
+/// `ORDER_AFTER_PARENT` is true off Windows.
+#[skuld::test]
+fn a_grandchild_that_started_before_its_listed_parent_is_kept_off_windows() {
+    let kernel = table_with_a_grandchild().on_read(
+        &format!("{GRAND}/stat"),
+        Ok(&stat(GRAND, CHILD, (ROOT_START + CHILD_START) / 2)),
+    );
+    let grand = ProcessId::from_parts_for_test(GRAND, Key::Pidfs(GRAND_INO));
+    assert_eq!(
+        descendants(&kernel, root(), &EDGES_WITH_A_GRANDCHILD).unwrap(),
+        vec![child(), grand]
+    );
+}
+
 /// A parent whose proof cannot be made (here: its pidfd's inode cannot be read) verifies nothing, so
 /// the child is dropped like a pid the walk cannot query, not walked.
 #[skuld::test]
