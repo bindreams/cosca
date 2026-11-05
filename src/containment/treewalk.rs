@@ -49,6 +49,16 @@
 //! - **Windows** keeps strict `>`: sequence numbers are unique (one per process creation) and a
 //!   process's exceeds its creator's, so two processes never share a key and strict `>` loses no
 //!   genuine child.
+//!
+//! # The parent-order rule (Windows only)
+//!
+//! Where the parent field is the *creator* and is never updated (Windows), a ppid can name a pid
+//! that a later process holds now, and that process's key can still order after the root's. So
+//! there ([`ORDER_AFTER_PARENT`]) a candidate is kept only if its key orders after its accepted
+//! parent's key, with the same `allow_equal`; the root's key is implied, since every accepted
+//! parent already ordered after it. Linux and macOS leave the rule off: their ppid is the current
+//! parent, and on macOS the rule would drop a child whose in-tree tracer started after it, or one
+//! forked after a clock step. [`children_of_with`] needs no switch: its parent is the anchor.
 
 use crate::error::Error;
 use crate::identity::{Existence, Kernel, OrderKey, ProcessId, RawPid, Resolved, UnknownCause};
@@ -118,6 +128,16 @@ pub(crate) const ALLOW_EQUAL_ORDER: bool = false;
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 pub(crate) const ALLOW_EQUAL_ORDER: bool = false;
 
+/// Whether a candidate must also order after its accepted parent, not only after the root. Only
+/// Windows: there the parent field is the creator and is never updated, so a ppid can name a pid
+/// that a later process holds now. Linux and macOS reparent orphans, so their ppid is the current
+/// parent; on macOS the rule would drop a child whose in-tree tracer started after it, or one
+/// forked after a clock step.
+#[cfg(windows)]
+pub(crate) const ORDER_AFTER_PARENT: bool = true;
+#[cfg(not(windows))]
+pub(crate) const ORDER_AFTER_PARENT: bool = false;
+
 /// The PID-reuse keep-predicate (the crate's core safety invariant — see the module
 /// docs): a candidate genuinely descends from an anchor only if its order key orders
 /// at-or-after the anchor's. The single source of this rule, shared by `descendants_with`
@@ -130,7 +150,8 @@ pub(crate) fn keeps_order(key: OrderKey, anchor: OrderKey, allow_equal: bool) ->
 /// `root`, and for each pid whose ppid chains to `root.pid()` resolves its
 /// identity and order key via `resolve(pid, parent)`, `parent` being the accepted process whose pid
 /// the edge names, and keeps it ONLY if its key orders correctly
-/// against `root_key` per `allow_equal` (see module docs). `resolve` is injected
+/// against `root_key` per `allow_equal` (see module docs). With `parent_order` the bar is the
+/// accepted parent's key instead (the root's is implied). `resolve` is injected
 /// so the filter is pure: live code passes [`resolve_or_drop`], tests pass a stub.
 ///
 /// The root itself is never included (callers kill the root explicitly first).
@@ -139,17 +160,16 @@ pub(crate) fn descendants_with(
     root_key: OrderKey,
     parents: &[(RawPid, RawPid)],
     allow_equal: bool,
+    parent_order: bool,
     resolve: impl Fn(RawPid, ProcessId) -> Option<(ProcessId, OrderKey)>,
 ) -> Vec<ProcessId> {
-    let keep = |key: OrderKey| keeps_order(key, root_key, allow_equal);
-
-    // BFS over the ppid forest. `frontier` holds pids whose children we still
-    // need to visit; it starts as just the root. A pid joins the result (and
-    // the next frontier) only if its ppid is in the current accepted set AND its
+    // BFS over the ppid forest. `frontier` holds the accepted pids whose children we still
+    // need to visit, each with its order key; it starts as just the root. A pid joins the result
+    // (and the next frontier) only if its ppid is in the current accepted set AND its
     // order key passes `keeps_order`. No fixed iteration cap: the loop drains a
     // strictly shrinking set of not-yet-visited edges.
     let mut result: Vec<ProcessId> = Vec::new();
-    let mut frontier: Vec<ProcessId> = vec![root];
+    let mut frontier: Vec<(ProcessId, OrderKey)> = vec![(root, root_key)];
     // Remaining (pid, ppid) edges not yet attached to the tree.
     let mut pending: Vec<(RawPid, RawPid)> = parents.to_vec();
     // Pids already accepted, so a duplicate edge (e.g. a snapshot that lists a
@@ -162,11 +182,11 @@ pub(crate) fn descendants_with(
         std::collections::HashMap::new();
 
     while !frontier.is_empty() {
-        let mut next: Vec<ProcessId> = Vec::new();
+        let mut next: Vec<(ProcessId, OrderKey)> = Vec::new();
         // Partition: edges whose ppid is in the current frontier are candidates.
         let mut still_pending: Vec<(RawPid, RawPid)> = Vec::with_capacity(pending.len());
         for (pid, ppid) in pending.drain(..) {
-            let Some(&parent) = frontier.iter().find(|p| p.pid() == ppid) else {
+            let Some(&(parent, parent_key)) = frontier.iter().find(|(p, _)| p.pid() == ppid) else {
                 still_pending.push((pid, ppid));
                 continue;
             };
@@ -180,7 +200,10 @@ pub(crate) fn descendants_with(
                 log::debug!("treewalk: pid {pid} unresolvable — dropping its subtree");
                 continue;
             };
-            if !keep(key) {
+            // With the parent-order rule the accepted parent's key is the bar: it already ordered
+            // after the root's, so the root's is implied.
+            let anchor = if parent_order { parent_key } else { root_key };
+            if !keeps_order(key, anchor, allow_equal) {
                 log::debug!("treewalk: dropping subtree under impostor pid {pid} (recycled pid / stale ppid)");
                 continue;
             }
@@ -188,7 +211,7 @@ pub(crate) fn descendants_with(
             // same process twice.
             if accepted.insert(pid) {
                 result.push(id);
-                next.push(id);
+                next.push((id, key));
             }
         }
         pending = still_pending;
@@ -235,9 +258,14 @@ pub(crate) fn descendants_from_key(
     root_key: OrderKey,
     parents: &[(RawPid, RawPid)],
 ) -> Vec<ProcessId> {
-    descendants_with(root, root_key, parents, ALLOW_EQUAL_ORDER, |pid, parent| {
-        resolve_or_drop(kernel, pid, parent)
-    })
+    descendants_with(
+        root,
+        root_key,
+        parents,
+        ALLOW_EQUAL_ORDER,
+        ORDER_AFTER_PARENT,
+        |pid, parent| resolve_or_drop(kernel, pid, parent),
+    )
 }
 
 /// [`descendants_from_key`] for `root`'s order key, read here with no proof that `root` still holds
