@@ -170,20 +170,28 @@ fn a_handed_back_process_group_child_has_its_group_killed_first() {
     handed_back.wait();
 }
 
-/// A child in a Job Object is ended by the Job's kill, so there is nothing to hand back.
+/// A Job-contained child whose own kill is refused, and whose look then shows it exited, is reaped
+/// and nothing is handed back. The look's answer is scripted on the fake: whether a real look
+/// catches the child that `TerminateJobObject` is ending is a race, which this test does not pin.
 ///
-/// Mutant: a Job-contained child is handed back though its Job was terminated.
+/// Mutant: a refused kill hands the child back without looking at it.
 #[cfg(windows)]
 #[skuld::test]
-fn a_job_contained_child_is_killed_by_its_job_and_not_handed_back() {
-    let (child, stdin, id) = crate::test_child::live_blocker();
+fn a_job_contained_child_whose_kill_is_refused_and_look_shows_the_exit_is_not_handed_back() {
+    use crate::os_process::child::ExitRecord;
+    use crate::os_process::fake::ReapAnswer;
+
+    let (mut child, stdin, _id) = crate::test_child::live_blocker();
+    child.proc.script_over(|f| {
+        f.signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))])
+            .reaps([ReapAnswer::Reaped(ExitRecord::Status(Default::default()))])
+    });
 
     let (fate, unreaped) = child.tear_down_or_hand_back(Disposition::HandBack);
     let handed_back = HandedBack::new(stdin, unreaped);
 
     assert_eq!(fate, ChildFate::Reaped);
     assert!(handed_back.is_none());
-    assert_eq!(id.is_alive(), Liveness::Dead);
 }
 
 /// An elevation front that is left running is not handed back (fronts are the next change), and is
@@ -220,7 +228,7 @@ mod in_a_cgroup {
     use crate::child::owned::teardown::Disposition;
     use crate::child::Child;
     use crate::error::ChildFate;
-    use crate::identity::Liveness;
+    use crate::identity::Existence;
     use crate::test_child::HandedBack;
     use crate::test_groups::{cgroup, Group};
     use crate::{Command, ContainMode, Containment};
@@ -263,7 +271,9 @@ mod in_a_cgroup {
     /// reaped: that kill is asynchronous, so a look at the present moment races it. Nothing is
     /// handed back or warned of. The refusal is scripted over the real child in its real leaf.
     ///
-    /// Mutant: the refused kill is followed by one look, which finds the child still dying.
+    /// The race is not forced here: a child that had already exited before the look passes on the
+    /// mutant too. The deterministic pin is `owned_tests/teardown.rs`'s
+    /// `a_refused_kill_of_a_child_the_tree_kill_reached_is_waited_for_and_reaped`, on a fake.
     #[skuld::test]
     fn a_refused_kill_of_a_child_the_leaf_killed_is_reaped_not_handed_back(#[fixture(cgroup)] _group: &Group) {
         crate::log_capture::install();
@@ -276,15 +286,13 @@ mod in_a_cgroup {
 
         assert_eq!(fate, ChildFate::Reaped);
         assert!(unreaped.is_none(), "{unreaped:?}");
-        assert_eq!(id.is_alive(), Liveness::Dead, "the root was reaped");
+        assert_eq!(id.exists(), Existence::Gone, "the root was reaped, not left a zombie");
         assert_eq!(warns_since(mark), Vec::<String>::new());
         drop(stdin);
     }
 
     /// The same child dropped: its refused kill is not "leaving it running", and the root is reaped,
     /// not left a zombie behind the leaf's kill.
-    ///
-    /// Mutant: the drop's look races the leaf's kill, warns, and leaves the zombie.
     #[skuld::test]
     fn dropping_a_child_whose_kill_is_refused_but_whose_leaf_killed_it_reaps_it(#[fixture(cgroup)] _group: &Group) {
         crate::log_capture::install();
@@ -295,7 +303,7 @@ mod in_a_cgroup {
 
         drop(child);
 
-        assert_eq!(id.is_alive(), Liveness::Dead, "the root was reaped");
+        assert_eq!(id.exists(), Existence::Gone, "the root was reaped, not left a zombie");
         assert_eq!(warns_since(mark), Vec::<String>::new());
         drop(stdin);
     }
