@@ -404,7 +404,11 @@ mod settlement {
     const EVERY: [Option<Disposition>; 3] = [None, Some(Disposition::Leave), Some(Disposition::HandBack)];
     const RUNNING: &str = "the caller's running clause";
     const HANDED_BACK: &str = "; handed back to the caller in the error";
-    const LEFT_UNREAPED: &str = "; left unreaped";
+    /// Where a child goes that a caller leaves; Windows has no zombies to leave unreaped.
+    #[cfg(unix)]
+    const LEFT: &str = "; left unreaped";
+    #[cfg(windows)]
+    const LEFT: &str = "; not waited on";
 
     fn id() -> ProcessId {
         ProcessId::from_parts_for_test(PID, crate::identity::Key::for_test(1))
@@ -551,7 +555,7 @@ mod settlement {
         let said = "S: the wait failed: cosca-wait-e5a1";
         for (disposition, goes) in [
             (None, ""),
-            (Some(Disposition::Leave), LEFT_UNREAPED),
+            (Some(Disposition::Leave), LEFT),
             (Some(Disposition::HandBack), HANDED_BACK),
         ] {
             assert_eq!(
@@ -560,6 +564,29 @@ mod settlement {
                 "{disposition:?}"
             );
         }
+    }
+
+    /// Unix: a child a caller leaves after a failed wait is said to be left unreaped, which it is: a
+    /// zombie once it exits.
+    ///
+    /// Mutant: the wording is the Windows one, or says nothing of where the child goes.
+    #[cfg(unix)]
+    #[skuld::test]
+    fn a_failed_wait_of_a_child_left_says_left_unreaped_on_unix() {
+        let (_, said) = Settlement::new(failed(), true).wording("S", None, Some(Disposition::Leave));
+        assert_eq!(said, "S: the wait failed: cosca-wait-e5a1; left unreaped");
+    }
+
+    /// Windows: there are no zombies, so a child a caller leaves after a failed wait is said to be not
+    /// waited on, and never to be left unreaped.
+    ///
+    /// Mutant: the wording is the Unix one.
+    #[cfg(windows)]
+    #[skuld::test]
+    fn a_failed_wait_of_a_child_left_says_not_waited_on_on_windows() {
+        let (_, said) = Settlement::new(failed(), true).wording("S", None, Some(Disposition::Leave));
+        assert_eq!(said, "S: the wait failed: cosca-wait-e5a1; not waited on");
+        assert!(!said.contains("unreaped"), "{said}");
     }
 
     /// A wait that failed with no kill having reached the child shows nothing of what became of it:
@@ -627,10 +654,10 @@ mod settlement {
     }
 
     /// A clause at warn is the outcome's warn text for the caller's one warn, and is logged by
-    /// nobody; one below it is logged at its level, led as the caller says, and returns nothing.
-    /// Either way the clause is taken.
+    /// nobody; one below it is logged at its level, led by the caller's label and a colon, and
+    /// returns nothing. Either way the clause is taken.
     ///
-    /// Mutants: a debug clause is returned; a warn is logged; the lead is dropped; the clause stays.
+    /// Mutants: a debug clause is returned; a warn is logged; the label is dropped; the clause stays.
     #[skuld::test]
     fn a_clause_at_warn_is_the_warn_and_anything_below_is_logged() {
         crate::log_capture::install();
@@ -640,10 +667,10 @@ mod settlement {
 
         let mark = crate::log_capture::mark();
         let mut gone = outcome(foreign(Foreign::Gone));
-        assert_eq!(gone.take_warn("lead: "), None);
+        assert_eq!(gone.take_warn("lead"), None);
         assert_eq!(gone.clause, None);
         let mut reaped = outcome(exited());
-        assert_eq!(reaped.take_warn("lead: "), None);
+        assert_eq!(reaped.take_warn("lead"), None);
         assert_eq!(
             crate::log_capture::records_since_on_current_thread(mark, "S:"),
             vec![
@@ -655,8 +682,8 @@ mod settlement {
         let mark = crate::log_capture::mark();
         let mut failed = outcome(failed());
         assert_eq!(
-            failed.take_warn("lead: ").as_deref(),
-            Some("S: the wait failed: cosca-wait-e5a1; left unreaped")
+            failed.take_warn("lead").as_deref(),
+            Some(format!("S: the wait failed: cosca-wait-e5a1{LEFT}").as_str())
         );
         assert_eq!(failed.clause, None);
         assert_eq!(

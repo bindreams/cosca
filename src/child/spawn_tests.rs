@@ -1026,6 +1026,60 @@ fn finish_elevated_words_a_root_its_delivered_kill_reached_by_how_the_wait_ended
     }
 }
 
+/// What `finish_elevated` says of a root whose kill was refused, by what the one look at it found
+/// (the outcomes `look_after_refused_kill` builds over a child 42): a root found exited says so as
+/// the delivered-kill note does, and the others are worded as `Settlement` words them, after the
+/// refusal. The note is the error's: `Error::Elevation` detail.
+///
+/// Mutants: a collected root reads "reaped it" after the refusal, with no word of its having
+/// exited; a root still running is worded as one that ended.
+#[cfg(unix)]
+#[skuld::test]
+fn finish_elevated_words_a_root_whose_kill_was_refused_by_what_the_look_found() {
+    use crate::child::owned::teardown::Disposition;
+    use crate::child::owned::OwnedChild;
+    use crate::os_process::child::{ExitRecord, Foreign};
+    use crate::os_process::fake::{FakeProcess, ReapAnswer};
+
+    let refusal = || "the elevated child could not be terminated (denied)".to_owned();
+    let rows = [
+        (
+            ReapAnswer::Reaped(ExitRecord::Status(Default::default())),
+            format!("{}: it had already exited, and was reaped", refusal()),
+        ),
+        (
+            ReapAnswer::Foreign(Foreign::Gone),
+            format!("{}: reaped by someone else", refusal()),
+        ),
+        // Still running: the refusal alone; the caller says where the root goes.
+        (ReapAnswer::Running, refusal()),
+    ];
+    for (reap, said) in rows {
+        let child = OwnedChild::new(Box::new(FakeProcess::new([]).with_pid(42).reaps([reap])));
+        let denied = Error::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        let looked = child.look_after_refused_kill(None, denied, Disposition::HandBack);
+        assert_eq!(super::root_after_a_refused_kill(refusal(), &looked), said);
+    }
+
+    // A record the reap could not read is stated, not built: a debug build asserts on that reap.
+    let mut unreadable = crate::child::owned::teardown::TeardownOutcome::new(ChildFate::Reaped);
+    unreadable.look = Some(crate::child::owned::teardown::LookOutcome::Ended(
+        crate::child::lifecycle::Settlement::new(
+            Ok(crate::child::owned::ChildWaitOutcome::Exited(ExitRecord::Unreadable {
+                si_code: 7,
+            })),
+            false,
+        ),
+    ));
+    assert_eq!(
+        super::root_after_a_refused_kill(refusal(), &unreadable),
+        format!(
+            "{}: reaped it; the child's exit record was unreadable (si_code 7)",
+            refusal()
+        )
+    );
+}
+
 /// `report_tree_teardown` (shared by both `finish_elevated` variants) reports a failed teardown in
 /// the returned note and in the text the cleanup's one warn carries, logs nothing itself, and
 /// reports nothing when the teardown worked or was not tried.

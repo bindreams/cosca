@@ -1728,3 +1728,27 @@ fn conclude_answers_every_remaining_pair() {
     .expect_not_started();
     assert!(matches!(&error, Error::Io(e) if e.to_string() == "helper"), "{error:?}");
 }
+
+/// A child the failed spawn's teardown ends through its pidfd is said reaped under the spawn
+/// teardown's name, at `debug`: every line of a teardown names its caller.
+///
+/// Mutant: the teardown's debug clause is logged with no label, or under a drop's.
+#[skuld::test]
+fn a_child_ended_through_its_pidfd_is_said_reaped_under_the_failed_spawns_name() {
+    crate::log_capture::install();
+    let (cat, pidfd) = cat_with_pidfd();
+    let pid = cat.id();
+    let mark = crate::log_capture::mark();
+
+    let fate = super::end_through_pidfd(Some(pid), pidfd, None, &mut crate::child::spawn::Diagnosis::default());
+
+    assert_eq!(fate, ChildFate::Reaped);
+    assert_eq!(
+        crate::log_capture::records_since_on_current_thread(mark, ""),
+        [(
+            log::Level::Debug,
+            format!("teardown after a failed spawn: teardown of child {pid}: reaped it after the kill")
+        )]
+    );
+    drop(cat);
+}

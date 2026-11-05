@@ -1022,7 +1022,7 @@ fn end_through_pidfd(
     why: &mut super::Diagnosis,
 ) -> ChildFate {
     let mut torn = tear_down_pidfd(pid, pidfd, None, Due::in_(warn_after));
-    if let Some(left) = torn.take_warn("") {
+    if let Some(left) = torn.take_warn(crate::containment::dispatch::TeardownCaller::FailedSpawn.label()) {
         log::warn!("{}", why.fold(&left));
     }
     torn.fate

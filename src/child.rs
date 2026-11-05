@@ -1114,7 +1114,7 @@ impl Child {
                 },
                 None,
             );
-            left.extend(torn.take_warn(&format!("{}: ", caller.label())));
+            left.extend(torn.take_warn(caller.label()));
             if !left.is_empty() {
                 log::warn!("{}: {}", caller.label(), left.join("; "));
             }
@@ -1149,7 +1149,7 @@ impl Child {
                 // The leaf stays armed: its teardown kills what it holds, a front among it if it is
                 // in it. Run now, not at field drop, so the look at the front comes after it.
                 let mut torn = self.tear_down_leaf_and_look_at_front(&unkillable, disposition);
-                report.left.extend(torn.take_warn(&format!("{}: ", caller.label())));
+                report.left.extend(torn.take_warn(caller.label()));
                 report.emit(&self.reported);
                 return torn;
             }
@@ -1203,7 +1203,7 @@ impl Child {
                     .tear_down(Some(self.id), TeardownKind::Kill { disposition, tree }, None)
             }
         };
-        report.left.extend(torn.take_warn(&format!("{}: ", caller.label())));
+        report.left.extend(torn.take_warn(caller.label()));
         report.emit(&self.reported);
         torn
     }
@@ -1238,7 +1238,8 @@ fn word_front(
         }
         Disposition::HandBack => format!(
             "{front} is running and unreaped: {cause}, so it is not known whether the cgroup kill \
-             ended it; handed back to the caller in the error"
+             ended it{}",
+            disposition.suffix(true)
         ),
     };
     let warn = |text| Some((log::Level::Warn, text));
@@ -1251,7 +1252,8 @@ fn word_front(
             ),
             Disposition::HandBack => format!(
                 "{front} is running and unreaped: {why}, and a kill of the front would orphan \
-                 the elevated program; handed back to the caller in the error"
+                 the elevated program{}",
+                disposition.suffix(true)
             ),
         }),
         LookOutcome::PlaceUnreadable(e) => warn(unreadable(format!("where it is cannot be read ({e})"))),

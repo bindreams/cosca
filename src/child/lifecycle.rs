@@ -156,7 +156,7 @@ impl Settlement {
                 log::Level::Warn,
                 format!(
                     "{subject}: the wait failed: {e}{}",
-                    disposition.map_or("", |disposition| disposition.clause(self.uncollected()))
+                    disposition.map_or("", |disposition| disposition.suffix(self.uncollected()))
                 ),
             ),
             Ok(ChildWaitOutcome::DeadlinePassed) => (

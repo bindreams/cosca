@@ -55,16 +55,25 @@ impl Disposition {
     }
 
     /// What a clause about a child adds, for where the child goes: handed back by a caller that
-    /// hands it back, left unreaped by one that leaves it. Nothing for a child the teardown
+    /// hands it back, left by one that leaves it. Nothing for a child the teardown
     /// [collected](TeardownOutcome::uncollected) (`uncollected` false): there is none to place.
-    pub(crate) fn clause(self, uncollected: bool) -> &'static str {
+    /// The one wording of both: every note of a child handed back or left says it this way.
+    pub(crate) fn suffix(self, uncollected: bool) -> &'static str {
         match (self, uncollected) {
             (Disposition::HandBack, true) => "; handed back to the caller in the error",
-            (Disposition::Leave, true) => "; left unreaped",
+            (Disposition::Leave, true) => LEFT,
             (_, false) => "",
         }
     }
 }
+
+/// What a child that a caller leaves is, after the semicolon. Unix: a zombie once it exits, until
+/// someone reaps it. Windows has no zombies: what is true is that nothing waits for it.
+const LEFT: &str = if cfg!(unix) {
+    "; left unreaped"
+} else {
+    "; not waited on"
+};
 
 /// What a teardown does to the child.
 pub(crate) enum TeardownKind<'a> {
@@ -178,12 +187,14 @@ impl TeardownOutcome {
     }
 
     /// Takes the clause for a caller with one warn: a clause at warn comes back to fold into that
-    /// warn, and one below it is logged here at its level, led by `lead`.
-    pub(crate) fn take_warn(&mut self, lead: &str) -> Option<String> {
+    /// warn, and one below it is logged here at its level, led by the caller's `label` (the same
+    /// one that leads the caller's warn, so every line names its caller). `label` is a name, not
+    /// a lead built for the occasion: it costs nothing when the level is off.
+    pub(crate) fn take_warn(&mut self, label: &str) -> Option<String> {
         match self.clause.take()? {
             (log::Level::Warn, text) => Some(text),
             (level, text) => {
-                log::log!(level, "{lead}{text}");
+                log::log!(level, "{label}: {text}");
                 None
             }
         }
@@ -264,9 +275,10 @@ impl OwnedChild {
         // A child reaped elsewhere is read from the typed outcome, so it is `Gone` on every OS.
         let settlement = Settlement::new(self.wait(Some(crate::wait::now())), false);
         let subject = format!("{} could not be terminated ({refused})", child_named(self.pid()));
+        // Still running: the caller that leaves it says it keeps running, not that it is left unreaped.
         let running = match disposition {
             Disposition::Leave => format!("{subject}; leaving it running"),
-            Disposition::HandBack => format!("{subject}; handed back to the caller in the error"),
+            Disposition::HandBack => format!("{subject}{}", disposition.suffix(true)),
         };
         let mut torn = TeardownOutcome::of_settlement(&settlement, id, &subject, Some(&running), disposition);
         if settlement.ended() {

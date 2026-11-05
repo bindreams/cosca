@@ -61,7 +61,7 @@ pub(crate) fn tear_down_held(
         (None, child.tear_down(id, TeardownKind::Kill { disposition, tree }, due))
     };
     // The clause at warn is the teardown's one warn; a lower one is logged on its own.
-    if let Some(left) = torn.take_warn(&format!("{}: ", TeardownCaller::FailedSpawn.label())) {
+    if let Some(left) = torn.take_warn(TeardownCaller::FailedSpawn.label()) {
         log::warn!("{}", why.fold(&left));
     }
     let unreaped = disposition.hands_back(&torn).then(|| Unreaped::new(child, id));

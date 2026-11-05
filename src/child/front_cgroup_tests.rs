@@ -347,28 +347,36 @@ fn cgroup_drop_of_a_front_kills_it_through_the_cgroup_and_reaps_it(#[fixture(cgr
     crate::log_capture::install();
     let teardowns = record_root_teardowns();
     let (child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
-    let pidfd = pidfd_of(child.id().pid());
+    let pid = child.id().pid();
+    let pidfd = pidfd_of(pid);
     // Released as the kill returns; see [`KillRelease`].
     let release = release_after_cgroup_kill(stdin);
-    release.observe(child.id().pid());
+    release.observe(pid);
     let mark = crate::log_capture::mark();
     drop(child);
     release.assert_killed();
     assert_eq!(teardowns.count(), 0, "the drop sends the front no kill of its own");
     assert!(reaped(&pidfd), "the drop reaps the front its cgroup kill ended");
     let said = crate::log_capture::records_since_on_current_thread(mark, "Child::drop");
-    assert_said_reaped_at_debug(&said, "a front the cgroup killed is not left behind");
+    assert_said_reaped_at_debug(&said, pid, "a front the cgroup killed is not left behind");
 }
 
-/// A drop's records about a front it reaped with its status: none above `debug`, and what is said
-/// is the reap itself.
+/// A drop's records about the front `pid` it reaped with its status: none above `debug`, and the
+/// reap itself said once, at `debug`, led by the drop's name ("after the kill" only if the look found
+/// the front still running and waited for it, which the first look does not always find).
 #[track_caller]
-fn assert_said_reaped_at_debug(said: &[(log::Level, String)], what: &str) {
+fn assert_said_reaped_at_debug(said: &[(log::Level, String)], pid: u32, what: &str) {
+    let reaped = format!("Child::drop: elevation front pid {pid}: reaped it");
+    let reaped_after_the_kill = format!("{reaped} after the kill");
     assert!(
-        said.iter()
-            .all(|(level, text)| *level == log::Level::Debug && text.contains(": reaped it")),
-        "{what}: {said:?}"
+        said.iter().all(|(level, _)| *level >= log::Level::Debug),
+        "{what}: a record above debug: {said:?}"
     );
+    let reaps: Vec<_> = said
+        .iter()
+        .filter(|(_, text)| *text == reaped || *text == reaped_after_the_kill)
+        .collect();
+    assert_eq!(reaps.len(), 1, "{what}: the reap is said once: {said:?}");
 }
 
 /// A failed cgroup kill may leave the program running, so the front is not signalled either.
@@ -538,7 +546,7 @@ fn assert_drop_kills_the_leaf_and_reaps_the_front(fault: impl FnOnce() -> Box<dy
     );
     let said =
         crate::log_capture::records_since_on_current_thread(mark, &format!("Child::drop: elevation front pid {pid}"));
-    assert_said_reaped_at_debug(&said, "a front reaped with its status needs no warn");
+    assert_said_reaped_at_debug(&said, pid, "a front reaped with its status needs no warn");
     assert!(reaped(&front), "the drop reaps the front its leaf's kill ended");
     assert!(steps.iter().any(|s| s == "kill"), "{steps:?}");
     wait_until_exited(&member);
@@ -609,7 +617,7 @@ fn cgroup_a_drop_places_a_front_that_reads_as_running_and_reaps_it(#[fixture(cgr
     release.assert_killed();
     let said =
         crate::log_capture::records_since_on_current_thread(mark, &format!("Child::drop: elevation front pid {pid}"));
-    assert_said_reaped_at_debug(&said, "a front reaped with its status needs no warn");
+    assert_said_reaped_at_debug(&said, pid, "a front reaped with its status needs no warn");
     assert!(reaped(&front), "the drop reaps the front");
     wait_until_exited(&member);
     let mut rest = Vec::new();

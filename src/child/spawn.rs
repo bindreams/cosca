@@ -210,7 +210,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
                 report.left.push(format!(
                     "the elevated child pid {pid} could not be terminated (it could not be verified, and may still be \
                      running){}",
-                    Disposition::HandBack.clause(true)
+                    Disposition::HandBack.suffix(true)
                 ));
                 (
                     "the elevated child could not be terminated (it could not be verified, and may still be running)"
@@ -232,7 +232,9 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
                     fault::record_teardown_reap(pid, status);
                 }
                 let (note, mut torn) = root_after_a_delivered_kill(pid, child.id(), exited_front, &settlement);
-                report.left.extend(torn.take_warn("finish_elevated: "));
+                report
+                    .left
+                    .extend(torn.take_warn(crate::containment::dispatch::TeardownCaller::FinishElevated.label()));
                 (note, torn)
             }
             Err(e) => {
@@ -243,14 +245,10 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
                 let mut looked = child
                     .proc
                     .look_after_refused_kill(Some(child.id()), e, Disposition::HandBack);
-                report.left.extend(looked.take_warn("finish_elevated: "));
-                let note = match &looked.look {
-                    // The wording leads with the refusal and says what the look found as a clause;
-                    // the note says where the root goes.
-                    Some(LookOutcome::Ended(settlement)) => settlement.wording(&note, None, None).1,
-                    _ => note,
-                };
-                (note, looked)
+                report
+                    .left
+                    .extend(looked.take_warn(crate::containment::dispatch::TeardownCaller::FinishElevated.label()));
+                (root_after_a_refused_kill(note, &looked), looked)
             }
         }
     };
@@ -332,6 +330,22 @@ fn root_after_a_delivered_kill(
     };
     let torn = TeardownOutcome::of_settlement(settlement, Some(id), &subject, None, Disposition::HandBack);
     (note, torn)
+}
+
+/// What [`finish_elevated`] says of a root whose kill was refused, which `refusal` states, once the
+/// one look at it found what `looked` says. A root found collected says what happened, as the
+/// delivered-kill note does ("had already exited, and was reaped"); another answer is worded as
+/// [`Settlement::wording`] words it, after the refusal; a root still running is the refusal alone.
+/// The note says where the root goes: the clause does not.
+#[cfg(unix)]
+fn root_after_a_refused_kill(refusal: String, looked: &TeardownOutcome) -> String {
+    match &looked.look {
+        Some(LookOutcome::Ended(settlement)) if settlement.status().is_some() => {
+            format!("{refusal}: it had already exited, and was reaped")
+        }
+        Some(LookOutcome::Ended(settlement)) => settlement.wording(&refusal, None, None).1,
+        _ => refusal,
+    }
 }
 
 /// The fate of a child cosca did not kill (its kill was refused, or never sent), from one

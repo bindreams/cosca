@@ -386,13 +386,13 @@ mod worded {
         );
     }
 
-    /// The suffix of an uncollected front: handed back by a caller that hands it back, left unreaped
-    /// by one that leaves it.
+    /// The suffix of an uncollected front: handed back by a caller that hands it back, left by one
+    /// that leaves it.
     ///
     /// Mutant: the wording ignores the disposition.
     fn handed_back(disposition: Disposition) -> &'static str {
         match disposition {
-            Disposition::Leave => "; left unreaped",
+            Disposition::Leave => super::super::teardown::LEFT,
             Disposition::HandBack => "; handed back to the caller in the error",
         }
     }

@@ -104,15 +104,22 @@ fn tear_down_as(fake: &FakeProcess, disposition: Disposition) -> TeardownOutcome
     )
 }
 
+/// Where a child goes that a caller leaves: Unix leaves a zombie unreaped, and Windows has none, so
+/// the child is not waited on.
+#[cfg(unix)]
+pub(super) const LEFT: &str = "; left unreaped";
+#[cfg(windows)]
+pub(super) const LEFT: &str = "; not waited on";
+
 /// The words a warn clause has under `disposition`: a caller that hands the child back says so, and
-/// one that leaves it says it is left unreaped.
+/// one that leaves it says it is [`LEFT`].
 #[track_caller]
 fn assert_left_says(torn: &TeardownOutcome, disposition: Disposition, wanted: &str) {
     let text = warn_of(torn).unwrap_or_default();
     assert!(text.contains(wanted), "{torn:?}");
     let (goes, other) = match disposition {
-        Disposition::HandBack => ("; handed back to the caller in the error", "; left unreaped"),
-        Disposition::Leave => ("; left unreaped", "handed back"),
+        Disposition::HandBack => ("; handed back to the caller in the error", LEFT),
+        Disposition::Leave => (LEFT, "handed back"),
     };
     assert!(text.ends_with(goes), "{torn:?}");
     assert!(!text.contains(other), "{torn:?}");

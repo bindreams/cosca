@@ -515,8 +515,9 @@ fn teardown_spawned(
     // A failed kill asked nothing to exit, so the wait would park forever: log and leak instead.
     if let Err(refused) = child.signal(Sig::Kill) {
         let mut looked = child.look_after_refused_kill(id, refused, Disposition::Leave);
-        if let Some(left) = looked.take_warn("raw spawn teardown: ") {
-            log::warn!("raw spawn teardown: {left}");
+        let label = "raw spawn teardown";
+        if let Some(left) = looked.take_warn(label) {
+            log::warn!("{label}: {left}");
         }
         return looked.fate;
     }

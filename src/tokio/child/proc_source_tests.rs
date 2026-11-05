@@ -9,6 +9,12 @@ use crate::signal::Sent;
 #[cfg(target_os = "linux")]
 use crate::test_child::Console;
 
+/// What the clause of a child left uncollected adds: Windows has no zombies to leave unreaped.
+#[cfg(unix)]
+const LEFT: &str = "; left unreaped";
+#[cfg(windows)]
+const LEFT: &str = "; not waited on";
+
 /// The second teardown of a refused child, as `OwnedChild` runs it for a caller that leaves the child
 /// (`tear_down_pidfd`'s), over a child 7 whose kill answers `kill` and whose wait or look answers
 /// `reap`. Its outcome is the one the refused-kill warn is built from.
@@ -27,7 +33,7 @@ fn second_teardown(kill: Result<Sent, std::io::Error>, reap: ReapAnswer) -> Tear
 fn torn_down(outcome: TeardownOutcome) -> Refused {
     Refused::TornDown(TornDown {
         outcome,
-        leak: "a pidfd",
+        leak: Some("a pidfd"),
     })
 }
 
@@ -103,30 +109,59 @@ fn a_released_child_is_worded_as_not_waited_on() {
     assert!(!text.contains("orphan"), "{text}");
 }
 
-/// A refused kill left to a backend that was already forgotten breaks the contract that Linux tears
-/// down every child it does not forget through its pidfd: asserted in debug, and in a release build
-/// worded as nothing torn down, with the child answered as running.
+/// A refused kill of a backend already forgotten as not shown to be ours still holds the child's
+/// pidfd, so Linux tears the child down through it, as for one it forgets now: killed, reaped, and
+/// said in the one warn, which leaks nothing of its own. The child is a real one, ours.
 ///
-/// Mutant: the case is worded as a release, or silent.
+/// Mutant: the case answers without a teardown, leaving the child running and its pidfd closed
+/// unused.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-#[cfg_attr(
-    debug_assertions,
-    should_panic(expected = "neither torn down through its pidfd nor forgotten")
-)]
-fn a_refused_kill_of_a_backend_already_forgotten_asserts_on_linux() {
+fn a_refused_kill_of_a_backend_already_forgotten_is_torn_down_through_its_pidfd() {
+    let mut child =
+        crate::test_spawn::spawn(&mut crate::test_child::held_std_killable_blocker()).expect("spawn the child");
+    let pid = child.id();
+    let pidfd = rustix::process::pidfd_open(
+        rustix::process::Pid::from_raw(pid as i32).expect("a positive pid"),
+        rustix::process::PidfdFlags::empty(),
+    )
+    .expect("pidfd_open");
     let proc = super::ProcSource::Foreign {
         stdin: None,
         stdout: None,
         stderr: None,
         fate: super::Forgotten::Unproven,
-        pid: None,
-        pidfd: super::PinnedPidfd(Some(std::fs::File::open("/dev/null").expect("open /dev/null").into())),
+        pid: Some(pid),
+        pidfd: super::PinnedPidfd(Some(pidfd)),
     };
-    let id = Some(ProcessId::current());
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let reaps = crate::child::spawn::fault::record_teardown_reaps();
     let e = Error::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
-    let fate = proc.after_refused_kill(7, id, &e, &mut crate::child::spawn::Diagnosis::default());
-    assert_eq!(fate, ChildFate::Running { id });
+    let fate = proc.after_refused_kill(
+        pid,
+        Some(ProcessId::current()),
+        &e,
+        &mut crate::child::spawn::Diagnosis::default(),
+    );
+    assert_eq!(fate, ChildFate::Reaped);
+    reaps.assert_killed();
+    let already_reaped = child
+        .wait()
+        .expect_err("the teardown reaped the child through its pidfd");
+    assert_eq!(already_reaped.raw_os_error(), Some(libc::ECHILD));
+    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "")
+        .into_iter()
+        .filter(|(level, _)| *level <= log::Level::Warn)
+        .map(|(_, text)| text)
+        .collect();
+    assert_eq!(
+        warns,
+        vec![format!(
+            "teardown kill of child {pid} failed ({e}); tokio's handle for it was already forgotten; teardown of \
+             child {pid}: reaped it after the kill"
+        )]
+    );
 }
 
 /// The warn for a refused teardown kill carries the clause of the second teardown's outcome, the one
@@ -170,11 +205,11 @@ fn the_refused_kill_warning_words_every_answer_the_second_teardown_gives() {
         // Uncollected under a caller that leaves the child.
         (
             second_teardown(Ok(Sent::Delivered), ReapAnswer::Err(std::io::ErrorKind::Other)),
-            format!("teardown of child 7: the wait failed: {wait_error}; left unreaped"),
+            format!("teardown of child 7: the wait failed: {wait_error}{LEFT}"),
         ),
         (
             second_teardown(Err(denied()), ReapAnswer::Err(std::io::ErrorKind::Other)),
-            format!("child 7 could not be terminated ({e}): the wait failed: {wait_error}; left unreaped"),
+            format!("child 7 could not be terminated ({e}): the wait failed: {wait_error}{LEFT}"),
         ),
         (
             second_teardown(Err(denied()), ReapAnswer::Running),
@@ -185,7 +220,7 @@ fn the_refused_kill_warning_words_every_answer_the_second_teardown_gives() {
         let fate = outcome.fate;
         let text = refused_kill_warning(7, &e, &torn_down(outcome));
         assert_eq!(text, format!("{bare}; {clause}"), "{fate:?}");
-        for old in ["torn down through", "not waited on", "left uncollected"] {
+        for old in ["torn down through", "left uncollected"] {
             assert!(!text.contains(old), "{fate:?} says {old:?}: {text}");
         }
     }
