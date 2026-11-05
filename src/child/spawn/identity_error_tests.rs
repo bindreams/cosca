@@ -6,16 +6,14 @@ use crate::error::Error;
 use crate::test_seccomp::{deny_openat2_on_this_thread, OPENAT2_REFUSALS};
 
 /// The kernel refuses `openat2` (a real seccomp filter): the spawn fails `Unsupported` naming it,
-/// and the pidfd pins the child, so it is killed and reaped. The child is held only by the
-/// teardown blocker's pipe, which the teardown releases after its kill: a spawn that leaves the
-/// child running fails the assertion instead of hanging.
+/// and the pidfd pins the child, so it is killed and reaped.
 ///
 /// Mutant: `spawn_identity_error` reports every `Unknown` as the OS refusing (`Unassessable` that
 /// names no cause).
 #[skuld::test]
 fn a_spawn_where_openat2_is_refused_is_unsupported_naming_it_and_reaps_the_child() {
     for (errno, name) in OPENAT2_REFUSALS {
-        // The filter ends with its thread; the hooks `teardown_blocker` arms are thread-local.
+        // The hooks `teardown_blocker` arms are thread-local.
         std::thread::scope(|scope| {
             scope
                 .spawn(|| {

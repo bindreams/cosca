@@ -7,14 +7,10 @@ use crate::test_seccomp::{deny_openat2_on_this_thread, OPENAT2_REFUSALS};
 
 /// `Drop` cannot retry, so it still kills the root through its handle, and says descendants may be
 /// orphaned.
-///
-/// Mutant: the drop skips the root kill after a snapshot failure (the root would outlive its
-/// handle).
 #[skuld::test]
 fn a_seccomp_refused_openat2_makes_a_treewalk_drop_kill_the_root_and_warn_of_orphans() {
     crate::log_capture::install();
     for (errno, name) in OPENAT2_REFUSALS {
-        // The filter ends with its thread, so the assertion on `id` below still has `openat2`.
         let id = std::thread::scope(|scope| {
             scope
                 .spawn(|| {

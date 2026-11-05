@@ -1,4 +1,4 @@
-//! The async twin of `child/openat2_refused_drop_tests.rs`.
+//! The async twin of the sync refused-drop rows.
 
 use crate::identity::Existence;
 use crate::test_seccomp::{deny_openat2_on_this_thread, OPENAT2_REFUSALS};
@@ -6,13 +6,10 @@ use crate::test_seccomp::{deny_openat2_on_this_thread, OPENAT2_REFUSALS};
 /// The drop waits for the root, so its stdin is released between the drop's kill and its wait
 /// (`release_between_kill_and_wait`): a root nothing killed exits `0` on the release, and the reap's
 /// recorded status then fails the `SIGKILL` assertion instead of leaving the drop waiting.
-///
-/// Mutant: the async drop skips the root kill after a snapshot failure.
 #[skuld::test]
 fn a_seccomp_refused_openat2_makes_an_async_treewalk_drop_kill_the_root_and_warn_of_orphans() {
     crate::log_capture::install();
     for (errno, name) in OPENAT2_REFUSALS {
-        // The filter ends with its thread, so the assertion on `id` below still has `openat2`.
         let id = std::thread::scope(|scope| {
             scope
                 .spawn(|| {

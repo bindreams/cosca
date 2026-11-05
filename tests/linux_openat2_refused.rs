@@ -122,12 +122,13 @@ fn refused_detail(errno: &str) -> String {
     format!("cosca requires openat2 (Linux \u{2265} 5.6), refused here: openat2 answered {errno}")
 }
 
-/// `result` is `Unsupported` carrying exactly the refusal, for the call `what`.
+/// `result` is `Unsupported` carrying exactly the refusal, for the call `what`. Returns its `op`.
 #[cfg(target_os = "linux")]
-fn assert_unsupported_naming(result: Result<(), cosca::error::Error>, errno: &str, what: &str) {
+fn assert_unsupported_naming(result: Result<(), cosca::error::Error>, errno: &str, what: &str) -> String {
     match result {
-        Err(cosca::error::Error::Unsupported { detail, .. }) => {
-            assert_eq!(detail, refused_detail(errno), "{what} under {errno}")
+        Err(cosca::error::Error::Unsupported { op, detail, .. }) => {
+            assert_eq!(detail, refused_detail(errno), "{what} under {errno}");
+            op
         }
         other => panic!("{what} under an openat2 answering {errno} must be Unsupported, got {other:?}"),
     }
@@ -145,9 +146,6 @@ fn spawn_treewalk_blocker() -> (cosca::Child, std::net::TcpStream) {
 
 /// Every query that takes the process snapshot says the refusal, and warns of it: never "no
 /// parent", never "no children".
-///
-/// Mutant: the snapshot reports an unopenable `/proc` as `Unassessable`, or maps it to `Ok(None)` or
-/// `Ok(vec![])`.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn a_seccomp_refused_openat2_makes_parent_and_children_unsupported_naming_openat2_and_warned() {
@@ -164,18 +162,22 @@ fn a_seccomp_refused_openat2_makes_parent_and_children_unsupported_naming_openat
             ]
         });
         for (call, result) in results {
-            assert_unsupported_naming(result, name, call);
+            let op = assert_unsupported_naming(result, name, call);
+            assert_eq!(op, "listing the process table", "{call} under {name}");
         }
+        // Scoped to the snapshot's own emitter, so no other record carrying the text counts.
+        let warned = format!(
+            "enumerate::process_parents: listing the process table is not supported on linux: {}",
+            refused_detail(name)
+        );
         assert!(
-            common::levels_since(mark, &refused_detail(name)).contains(&log::Level::Warn),
+            common::levels_since(mark, &warned).contains(&log::Level::Warn),
             "{name}: the snapshot's refusal is warned of"
         );
     }
 }
 
 /// Another refusal of `openat2` is not the requirement: it is `Unassessable`.
-///
-/// Mutant: every open failure is `Unsupported`.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn a_seccomp_refused_openat2_with_another_errno_is_not_unsupported_for_the_snapshot() {
@@ -189,8 +191,6 @@ fn a_seccomp_refused_openat2_with_another_errno_is_not_unsupported_for_the_snaps
 
 /// A `Process` kills and terminates its tree by walking the snapshot, so both say the refusal and
 /// signal nothing: the child leaves clean when its control socket is released.
-///
-/// Mutant: the walk maps the snapshot's error to `Unassessable`, or signals the root first.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn a_seccomp_refused_openat2_makes_process_kill_tree_and_terminate_tree_unsupported_naming_openat2() {
@@ -219,14 +219,13 @@ fn a_seccomp_refused_openat2_makes_process_kill_tree_and_terminate_tree_unsuppor
 
 /// A `Session` child lists its group through `/proc`: `kill_tree` and `terminate_tree` say the
 /// refusal, as a wait or a spawn does, and not `Unassessable` with the kind buried in `source`.
-///
-/// Mutant: `verify` maps an unlistable group to `Unassessable`, or `members` reports it as
-/// `io::Error::other`.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn a_seccomp_refused_openat2_makes_kill_tree_and_terminate_tree_of_a_session_unsupported_naming_openat2() {
     for (errno, name) in REFUSALS {
         let (child, control) = common::spawn_control("control-block", &["R"], true);
+        // `setsid` makes the child its own group leader.
+        let pgid = child.id().pid();
         let results = with_openat2_refused(errno, || {
             [
                 ("kill_tree", child.kill_tree()),
@@ -235,8 +234,17 @@ fn a_seccomp_refused_openat2_makes_kill_tree_and_terminate_tree_of_a_session_uns
         });
         for (call, result) in results {
             match result {
-                Err(cosca::error::Error::Unsupported { detail, .. }) => {
-                    assert!(detail.contains(&refused_detail(name)), "{call} under {name}: {detail}")
+                Err(cosca::error::Error::Unsupported { op, platform, detail }) => {
+                    assert_eq!(platform, "linux", "{call} under {name}");
+                    assert!(op.contains(&pgid.to_string()), "{call} under {name}: {op}");
+                    assert_eq!(
+                        detail,
+                        format!(
+                            "containment::unix::group::members: {}, so pgid {pgid} cannot be listed",
+                            refused_detail(name)
+                        ),
+                        "{call} under {name}"
+                    );
                 }
                 other => panic!("{call} under {name}: expected Unsupported, got {other:?}"),
             }
@@ -247,8 +255,6 @@ fn a_seccomp_refused_openat2_makes_kill_tree_and_terminate_tree_of_a_session_uns
 
 /// Another refusal is not the requirement: a group that cannot be listed keeps its own error and
 /// does not claim `openat2` is missing.
-///
-/// Mutant: every `/proc` open failure is flagged as missing `openat2`.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn a_seccomp_refused_openat2_with_another_errno_is_not_unsupported_for_a_group_listing() {
@@ -264,8 +270,6 @@ fn a_seccomp_refused_openat2_with_another_errno_is_not_unsupported_for_a_group_l
 
 /// The walk could not find the descendants, and killing the root first would reparent them out of
 /// any retry's reach: nothing is killed, the root included, and the error is returned.
-///
-/// Mutant: the handle backstop runs after a refused walk.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn a_seccomp_refused_openat2_leaves_a_treewalk_roots_kill_tree_an_error_and_the_root_alive() {
@@ -283,8 +287,6 @@ fn a_seccomp_refused_openat2_leaves_a_treewalk_roots_kill_tree_an_error_and_the_
 }
 
 /// A retry once `openat2` answers again finds the tree and kills it.
-///
-/// Mutant: `kill_tree` sends nothing from its second call on.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn a_seccomp_refused_openat2_then_recovered_lets_kill_tree_retry() {
@@ -297,8 +299,6 @@ fn a_seccomp_refused_openat2_then_recovered_lets_kill_tree_retry() {
 
 /// The async twin of the `kill_tree` row above. The runtime is built and the child spawned before
 /// the filter lands.
-///
-/// Mutant: the async handle's own backstop runs after a refused walk.
 #[cfg(all(target_os = "linux", feature = "tokio"))]
 #[skuld::test]
 fn a_seccomp_refused_openat2_leaves_an_async_treewalk_roots_kill_tree_an_error_and_the_root_alive() {
