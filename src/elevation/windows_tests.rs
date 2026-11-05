@@ -1055,6 +1055,7 @@ fn a_shell_execute_failure_takes_its_answer_from_the_classification() {
             },
             fate: ChildFate::Unknown,
             wrapper_elevated: false,
+            ..
         }
     ));
 }
