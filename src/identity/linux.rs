@@ -261,8 +261,8 @@ pub(super) fn ordered_read(kernel: &dyn Kernel, pid: RawPid, ask_parent: bool) -
     let (read, cause) = of_stat(kernel, pid);
     let (key, stat) = match read {
         Resolved::Found(found) => found,
-        Resolved::Gone => return OrderedRead::missing(Resolved::Gone, cause),
-        Resolved::Unknown => return OrderedRead::missing(Resolved::Unknown, cause),
+        Resolved::Gone => return OrderedRead::missing(Resolved::Gone, cause, ask_parent),
+        Resolved::Unknown => return OrderedRead::missing(Resolved::Unknown, cause, ask_parent),
     };
     let parent = if !ask_parent {
         ParentRead::NotAsked

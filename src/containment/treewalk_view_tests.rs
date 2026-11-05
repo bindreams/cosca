@@ -223,17 +223,19 @@ fn a_pid_the_kernel_cannot_read_is_dropped_and_warned_about() {
 }
 
 /// The warn names why the read failed when the read knows, so an unreadable view is not reported as
-/// access. Mutant: "`resolve_or_drop` drops the cause": the warn says "access denied?".
+/// access. The view fails every read, the parent's proof too, so the warn blames the parent.
+/// Mutant: "`resolve_or_drop` drops the cause": the warn says "access denied?".
 #[skuld::test]
 fn the_warn_for_a_dropped_pid_names_the_cause_of_its_read() {
     crate::log_capture::install();
     let (child, id) = live_member();
     let kernel = View::Unreadable.fail(FakeKernel::over(&HostKernel), 0);
+    let me = ProcessId::current();
     let mark = crate::log_capture::mark();
-    assert_eq!(super::resolve_or_drop(&kernel, id.pid(), ProcessId::current()), None);
+    assert_eq!(super::resolve_or_drop(&kernel, id.pid(), me), None);
     let warned = crate::log_capture::records_since_on_current_thread(
         mark,
-        &format!("pid {} identity could not be read", id.pid()),
+        &format!("ppid {} identity could not be read", me.pid()),
     );
     assert_eq!(warned.len(), 1, "{warned:?}");
     assert!(warned[0].1.contains(View::Unreadable.cause()), "{warned:?}");

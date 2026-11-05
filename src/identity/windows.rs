@@ -330,8 +330,8 @@ pub(super) fn ordered_read(pid: RawPid, expected: Option<Key>, ask_parent: bool)
     let handle = match open_classified(pid, PROCESS_QUERY_LIMITED_INFORMATION) {
         Opened::Found(h) => h,
         // No handle, so no creator: a read that asked is told it could not read it.
-        Opened::Gone => return OrderedRead::missing(Resolved::Gone, UnknownCause::default()),
-        Opened::Denied(_) => return OrderedRead::missing(Resolved::Unknown, UnknownCause::default()),
+        Opened::Gone => return OrderedRead::missing(Resolved::Gone, UnknownCause::default(), ask_parent),
+        Opened::Denied(_) => return OrderedRead::missing(Resolved::Unknown, UnknownCause::default(), ask_parent),
     };
     let (read, cause) = combine(pid, expected, creation_token_result(handle), sequence_number(handle));
     let (parent, cause) = if ask_parent {
@@ -343,15 +343,18 @@ pub(super) fn ordered_read(pid: RawPid, expected: Option<Key>, ask_parent: bool)
     OrderedRead { read, parent, cause }
 }
 
-/// The parent number `creator`, the answer of [`creator_pid`] for `pid`, gives: a creator too wide
-/// to be a pid is [`ParentRead::NoPid`] (it can be no parent's), and a refused query is
-/// [`ParentRead::Unreadable`] with its `NTSTATUS` added to `cause`.
+/// The parent number `creator`, the answer of [`creator_pid`] for `pid`, gives; a refused query is
+/// [`ParentRead::Unreadable`] with its `NTSTATUS` added to `cause`. A pid is a `DWORD`, so a creator
+/// wider than one is a contract violation: asserted in debug, and in release read as the largest pid,
+/// which no process holds and so is another's parent number (`Gone`), never a match.
 fn creator_read(pid: RawPid, creator: Result<usize, NTSTATUS>, cause: UnknownCause) -> (ParentRead, UnknownCause) {
-    match creator.map(RawPid::try_from) {
-        Ok(Ok(creator)) => (ParentRead::Is(creator), cause),
-        Ok(Err(_)) => {
-            log::debug!("the creator pid of pid {pid} is not a pid");
-            (ParentRead::NoPid, cause)
+    match creator {
+        Ok(creator) => {
+            let creator = RawPid::try_from(creator).unwrap_or_else(|_| {
+                debug_assert!(false, "the creator pid {creator:#x} of pid {pid} is wider than a DWORD");
+                RawPid::MAX
+            });
+            (ParentRead::Is(creator), cause)
         }
         Err(status) => {
             log::debug!(

@@ -117,9 +117,6 @@ enum ParentRead {
     NotAsked,
     /// The parent number the read found.
     Is(RawPid),
-    /// The read found a number that no pid has, so no parent's: a creator pid wider than a pid.
-    #[cfg(windows)]
-    NoPid,
     /// The read asked and could not find it.
     Unreadable,
 }
@@ -139,18 +136,38 @@ type Ordered = (Resolved<(ProcessId, OrderKey)>, UnknownCause);
 enum Judged {
     /// The answer, whatever the proof of the parent says.
     Settled(Ordered),
-    /// The read names the parent: this is the answer if the parent is still held. A parent that is
-    /// gone makes it `Gone`, and one that cannot be proved `Unknown`, whatever this says.
+    /// The read did not prove another parent: this is the answer if the parent is still held. A
+    /// parent that is gone makes it `Gone`, and one that cannot be proved `Unknown` blaming the
+    /// parent, whatever this says.
     IfParentHolds(Ordered),
 }
 
+impl Judged {
+    /// The answer, given `proof` that the named parent still holds its pid: `Ok(())` if it does,
+    /// else the answer the failed proof gives. A [`Judged::Settled`] answer never asks for it.
+    fn proved(self, proof: impl FnOnce() -> Result<(), Ordered>) -> Ordered {
+        match self {
+            Judged::Settled(answer) => answer,
+            Judged::IfParentHolds(answer) => match proof() {
+                Ok(()) => answer,
+                Err(verdict) => verdict,
+            },
+        }
+    }
+}
+
 impl OrderedRead {
-    /// A read that found no process: `read` is `Gone` or `Unknown` (it has no found value), and
-    /// there is no record to take a parent number from.
-    fn missing(read: Resolved<std::convert::Infallible>, cause: UnknownCause) -> OrderedRead {
+    /// A read that found no process: `read` is `Gone` or `Unknown` (it has no found value). There is
+    /// no record to take a parent number from, so a read that `asked_parent` is told it could not
+    /// read it ([`ParentRead::Unreadable`]), and one that did not ask says so.
+    fn missing(read: Resolved<std::convert::Infallible>, cause: UnknownCause, asked_parent: bool) -> OrderedRead {
         OrderedRead {
             read: read.map(|never| match never {}),
-            parent: ParentRead::Unreadable,
+            parent: if asked_parent {
+                ParentRead::Unreadable
+            } else {
+                ParentRead::NotAsked
+            },
             cause,
         }
     }
@@ -165,10 +182,11 @@ impl OrderedRead {
 
     /// The read for `pid`, whose caller was told `parent` created it. A parent number that is
     /// another's is [`Resolved::Gone`] whatever the rest of the read said: the pid has changed
-    /// hands, and a refused read of anything else cannot hide that. Otherwise a `Gone` read stays so,
-    /// and a parent number that could not be read leaves any other read `Unknown`: both are
-    /// [`Judged::Settled`]. A read that names `parent` is [`Judged::IfParentHolds`], found or not,
-    /// so that a parent that is gone is `Gone` before a missing order key blames the candidate.
+    /// hands, and a refused read of anything else cannot hide that. A `Gone` read stays so. Every
+    /// other read is [`Judged::IfParentHolds`], whether it found the process or not and whether it
+    /// read the parent number or not: the parent is proved before the candidate's own failure (a
+    /// missing record, a missing order key, an unreadable parent number) answers `Unknown`, so that a
+    /// parent that is gone is `Gone` and not blamed on the candidate.
     fn judged(self, pid: RawPid, parent: RawPid) -> Judged {
         let OrderedRead {
             read,
@@ -181,14 +199,12 @@ impl OrderedRead {
         );
         match (claimed, read) {
             (ParentRead::Is(found), _) if found != parent => Judged::Settled((Resolved::Gone, UnknownCause::default())),
-            #[cfg(windows)]
-            (ParentRead::NoPid, _) => Judged::Settled((Resolved::Gone, UnknownCause::default())),
             (_, Resolved::Gone) => Judged::Settled((Resolved::Gone, cause)),
             (ParentRead::Is(_), Resolved::Found((key, order))) => {
                 Judged::IfParentHolds((Resolved::Found((ProcessId { pid, key }, order)), cause))
             }
-            (ParentRead::Is(_), Resolved::Unknown) => Judged::IfParentHolds((Resolved::Unknown, cause)),
-            (ParentRead::Unreadable | ParentRead::NotAsked, _) => Judged::Settled((Resolved::Unknown, cause)),
+            // The candidate's own failure, which a held parent lets stand.
+            (_, Resolved::Found(_) | Resolved::Unknown) => Judged::IfParentHolds((Resolved::Unknown, cause)),
         }
     }
 }
@@ -274,8 +290,10 @@ impl ProcessId {
     /// number now is [`Resolved::Gone`] whatever else the read said: the pid has changed hands, or the
     /// process was reparented. A number that is read does not yet name the parent, which may have been
     /// reaped and its number taken, so `parent` is then proved again: a number that no longer holds it
-    /// is [`Resolved::Gone`] too, and one whose proof cannot be made is [`Resolved::Unknown`]. A parent
-    /// number that cannot be read is `Unknown`.
+    /// is [`Resolved::Gone`] too, and one whose proof cannot be made is [`Resolved::Unknown`], blaming
+    /// the parent. That proof comes before the candidate's own failure answers: a record that cannot be
+    /// read, a missing order key or a parent number that cannot be read is `Unknown` blaming the
+    /// candidate only while the parent is held.
     pub(crate) fn of_ordered_with(kernel: &dyn Kernel, pid: RawPid, parent: Option<ProcessId>) -> Ordered {
         #[cfg(all(test, target_os = "macos"))]
         seams::note_by_pid_read();
@@ -288,13 +306,7 @@ impl ProcessId {
         let Some(parent) = parent else {
             return read.unclaimed(pid);
         };
-        match read.judged(pid, parent.pid()) {
-            Judged::Settled(answer) => answer,
-            Judged::IfParentHolds(answer) => match parent.still_held(kernel) {
-                Ok(()) => answer,
-                Err(verdict) => verdict,
-            },
-        }
+        read.judged(pid, parent.pid()).proved(|| parent.still_held(kernel))
     }
 
     /// Where this process falls in the order of process creation (see [`OrderKey`]), for ordering

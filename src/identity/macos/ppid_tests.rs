@@ -85,42 +85,15 @@ fn a_candidate_whose_parent_read_is_refused_is_unknown() {
 
 /// A parent number of `0` is a fork in progress for every pid but the two no `fork()` makes: pid 0
 /// (`kernel_task`, the kernel itself) and pid 1 (launchd, whose parent is the kernel). Waiting on
-/// either would never end.
+/// either would never end. A pure row, so a regression fails by assertion and not by a hung read.
 ///
-/// Mutant: `trusted_ppid` trusts `0` for pid 1 only.
+/// Mutants: `trusted_ppid` trusts `0` for pid 1 only, or for pid 0 only, or for every pid.
 #[skuld::test]
 fn a_zero_parent_is_trusted_only_for_the_kernel_and_launchd() {
     assert_eq!(trusted_ppid(0, 0), Some(0));
     assert_eq!(trusted_ppid(1, 0), Some(0));
     assert_eq!(trusted_ppid(7, 0), None);
     assert_eq!(trusted_ppid(7, 3), Some(3));
-}
-
-/// An ordered read of pid 0 under a parent answers, and does not find it a child of that parent (it
-/// is no process's child): a `0` parent number is another parent's, not a fork in progress to wait
-/// for.
-///
-/// Mutant: pid 0's `0` is untrusted (the read re-reads it forever).
-#[skuld::test]
-fn an_ordered_read_of_the_kernel_answers() {
-    let (under, _) = ProcessId::of_ordered_with(&crate::identity::HostKernel, 0, Some(ProcessId::current()));
-    assert!(!matches!(under, Resolved::Found(_)), "{under:?}");
-}
-
-/// The parent of launchd (pid 1, whose parent number is `0`) is asked and answers: its snapshot row
-/// names pid 0, which is read with no parent named and must not be waited on.
-///
-/// Mutant: an ordered read with no parent named waits for the record's parent number, which pid 0
-/// never gets.
-#[skuld::test]
-fn the_parent_of_launchd_answers() {
-    let Resolved::Found(launchd) = ProcessId::of(1) else {
-        panic!("launchd's record reads for any user");
-    };
-    match launchd.parent() {
-        Ok(_) | Err(crate::error::Error::Unassessable { .. }) => {}
-        other => panic!("the parent of launchd is an answer or unassessable, got {other:?}"),
-    }
 }
 
 /// An ordered read waits out a fork-in-progress parent number only when it asks for the parent: one

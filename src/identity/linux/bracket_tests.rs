@@ -114,11 +114,33 @@ fn a_stat_with_no_readable_ppid_is_unknown_not_another_parent() {
         ProcessId::of_ordered_with(&another, PID, Some(parent)).0,
         Resolved::Gone
     ));
+    // The parent is held, so the candidate's own failure stands.
     let (unreadable, _writer) = with_ppid("x");
+    let (parent_fd, _parent_writer) = pidfd();
+    let unreadable = unreadable.on_pidfd_open(7, Ok(parent_fd)).on_pidfs_ino(7, Ok(Some(9)));
     assert!(matches!(
         ProcessId::of_ordered_with(&unreadable, PID, Some(parent)).0,
         Resolved::Unknown
     ));
+}
+
+/// A `stat` that cannot be read at all, for a candidate under a parent that is gone, is `Gone`: the
+/// read is `Unknown` blaming the candidate only once the parent is held.
+///
+/// Mutant: Linux's `ordered_read` does not say it asked for the parent number when the `stat` is
+/// missing.
+#[skuld::test]
+fn a_gone_parent_is_gone_before_a_refused_stat_is_unknown() {
+    let parent = ProcessId::from_parts_for_test(7, Key::Pidfs(9));
+    let (fd, _writer) = pidfd();
+    let gone = FakeKernel::over(&HostKernel)
+        .same_view()
+        .on_read(STAT, Err(libc::EACCES))
+        .on_pidfd_open(PID, Ok(fd))
+        .on_pidfs_ino(PID, Ok(Some(100)))
+        .on_pidfd_open(7, Err(Errno::SRCH));
+    let (read, _) = ProcessId::of_ordered_with(&gone, PID, Some(parent));
+    assert!(matches!(read, Resolved::Gone), "{read:?}");
 }
 
 /// A `stat` that names the parent but shows no start time is read as `Unknown`, once the parent is

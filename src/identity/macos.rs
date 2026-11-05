@@ -562,8 +562,8 @@ pub(super) fn ordered_read(pid: RawPid, ask_parent: bool) -> OrderedRead {
             parent,
             cause: UnknownCause::default(),
         },
-        Resolved::Gone => OrderedRead::missing(Resolved::Gone, UnknownCause::default()),
-        Resolved::Unknown => OrderedRead::missing(Resolved::Unknown, UnknownCause::default()),
+        Resolved::Gone => OrderedRead::missing(Resolved::Gone, UnknownCause::default(), ask_parent),
+        Resolved::Unknown => OrderedRead::missing(Resolved::Unknown, UnknownCause::default(), ask_parent),
     }
 }
 
