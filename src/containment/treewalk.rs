@@ -8,7 +8,8 @@
 //! down from the root, and kills each *genuine* descendant by identity. It is
 //! best-effort and reports as [`crate::containment::Containment::TreeWalk`]: it
 //! misses reparented orphans (a child whose parent exited before the walk read the
-//! child, so its ppid no longer chains to the root) and broker-spawned escapes. On Windows it also
+//! child, so its ppid no longer chains to the root), a descendant whose parent exits while the walk
+//! runs, with its subtree (see the parent read below), and broker-spawned escapes. On Windows it also
 //! misses a genuine descendant whose creator exited and whose creator's pid now belongs to a later
 //! in-tree process, with its subtree (see the parent-order rule below).
 //!
@@ -57,22 +58,33 @@
 //! Where the parent field is the *creator* and is never updated (Windows), a ppid can name a pid
 //! that a later process holds now, and that process's key can still order after the root's. So
 //! there ([`ORDER_AFTER_PARENT`]) a candidate is kept only if its key orders after its accepted
-//! parent's key, with the same `allow_equal`. Off elsewhere (see [`ORDER_AFTER_PARENT`]).
-//! [`children_of_with`] needs no switch: its parent is the anchor.
+//! parent's key, with the same `allow_equal`. [`children_of_with`] needs no switch: its parent is
+//! the anchor.
+//!
+//! There is no parent-order rule elsewhere ([`ORDER_AFTER_PARENT`] is off). On macOS a tracer
+//! becomes the parent of a traced child it started after (XNU's `PT_ATTACH` sets the child's
+//! `p_ppid`), and a child forked after a clock step orders before its parent, so the rule would drop
+//! either. On Linux the stat ppid is `real_parent`, which
+//! reparenting updates, so the parent check plus the parent's proof suffices.
 //!
 //! The rule also drops a genuine descendant whose creator exited and whose creator's pid now belongs
 //! to a later in-tree process, with its subtree: from the snapshot alone it cannot be told from a
 //! stale-creator impostor.
 //!
-//! # The creator read (Windows only)
+//! # The parent read (every platform)
 //!
-//! A snapshot row's ppid is only a number. The resolver reads the candidate again on one handle: its
-//! creator pid (class 0), its id and its order key. A candidate whose creator is not the accepted
-//! parent's pid is dropped, and so is one whose accepted parent no longer holds that pid when the
-//! read is done. So a descendant whose parent exits while the walk runs is dropped with its
-//! subtree: its creator pid still names the dead parent, which the read cannot tell from a pid that
-//! changed hands. A creator read that fails leaves the candidate unproved, and it is dropped with a
-//! warning that names the `NTSTATUS`.
+//! A snapshot row's ppid is only a number. The resolver reads the candidate again, and its parent
+//! number, id and order key all come from that one read, so they describe the same process. A candidate
+//! whose parent number is not the accepted parent's pid is dropped, and so is one whose accepted
+//! parent no longer holds that pid when the read is done. So a descendant whose parent exits while
+//! the walk runs is dropped with its subtree: Linux and macOS reparent it, so its record names its
+//! new parent; Windows never updates the creator pid, which still names the dead parent, and the
+//! read cannot tell that from a pid that changed hands. A candidate whose own read fails (no record,
+//! no order key, or a parent number that cannot be read) goes to the proof of the accepted parent
+//! first: a parent that is gone drops it quietly, as `Gone`; one that cannot be proved drops it with
+//! a warning naming `ppid N`; and only a held parent lets its own failure stand, dropped with a
+//! warning naming the candidate (on Windows, with the `NTSTATUS` of a refused creator-pid or
+//! sequence-number query).
 
 use crate::error::Error;
 use crate::identity::{Existence, Kernel, OrderKey, ProcessId, RawPid, Resolved, UnknownCause};
@@ -96,12 +108,11 @@ pub(crate) enum KillOutcome {
 /// apart, because "denied" is an operational signal (run elevated) and "gone" is not.
 ///
 /// `parent` is the process the walk accepted as the parent the snapshot gave `pid`. Where the read of
-/// `pid` carries its parent (Linux: the `stat` the id was made with; Windows: the creator pid read
-/// on the handle that gives the id), a candidate is dropped when its parent's number is another now,
-/// which means the pid changed hands since the snapshot or the same process was orphaned and is no
-/// longer in the tree; and when its parent's number no longer holds `parent`, which means the parent
-/// was reaped and its number taken by a process whose own children the candidate could be. On macOS
-/// the listing has nothing to check it against.
+/// `pid` carries its parent, a candidate
+/// is dropped when its parent's number is another now, which means the pid changed hands since the
+/// snapshot or the same process was orphaned and is no longer in the tree; and when its parent's
+/// number no longer holds `parent`, which means the parent was reaped and its number taken by a
+/// process whose own children the candidate could be.
 pub(crate) fn resolve_or_drop(kernel: &dyn Kernel, pid: RawPid, parent: ProcessId) -> Option<(ProcessId, OrderKey)> {
     match ProcessId::of_ordered_with(kernel, pid, Some(parent)) {
         (Resolved::Found(read), _) => Some(read),
