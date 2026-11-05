@@ -121,7 +121,7 @@ pub enum RecordErrorKind {
 pub enum Error {
     #[error("argument parsing failed: {0}")]
     Quote(#[from] QuoteError),
-    #[error(transparent)]
+    #[error("{0}")]
     Io(#[from] std::io::Error),
     /// An operation isn't available on this platform / in this build.
     ///

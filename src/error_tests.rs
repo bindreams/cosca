@@ -298,3 +298,20 @@ fn win32_io_error_unwraps_a_win32_hresult() {
     let e_fail = win32_io_error(Error::from_hresult(HRESULT(0x8000_4005u32 as i32)));
     assert_eq!(e_fail.raw_os_error(), Some(0x8000_4005u32 as i32));
 }
+
+#[skuld::test]
+fn io_error_source_is_the_wrapped_io_error() {
+    let e = Error::Io(std::io::Error::from_raw_os_error(13));
+    let source = std::error::Error::source(&e).expect("Error::Io has a source");
+    let io = source
+        .downcast_ref::<std::io::Error>()
+        .expect("the source is the io::Error");
+    assert_eq!(io.raw_os_error(), Some(13));
+}
+
+#[skuld::test]
+fn io_error_displays_the_wrapped_message_unchanged() {
+    let inner = std::io::Error::other("disk on fire");
+    let expected = inner.to_string();
+    assert_eq!(Error::Io(inner).to_string(), expected);
+}
