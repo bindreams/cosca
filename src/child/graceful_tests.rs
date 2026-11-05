@@ -204,35 +204,103 @@ fn child_graceful_shutdown_tree_graceful_root_sigterm() {
     );
 }
 
-// `terminate` signals through the held handle, not a fresh `pidfd_open`: with the next open set to
-// fail, SIGTERM still lands. Stdin is released only afterwards, so a terminate that sent nothing
-// exits 0.
+// With no descriptor free, `terminate` and the root-only grace wait still work: they signal and
+// look through the handle they hold, and open nothing. The fixtures run in a re-exec'd process
+// (the limit is process-wide) and lower `RLIMIT_NOFILE` to the lowest free descriptor number, so
+// that every `pidfd_open`, `/proc` open or pipe made under it fails with `EMFILE`.
+
+/// Lowers the soft `RLIMIT_NOFILE` to the number of the lowest free descriptor while it lives.
+#[cfg(target_os = "linux")]
+#[must_use = "dropping this restores the limit at once"]
+struct NoFreeDescriptor(rustix::process::Rlimit);
+
+#[cfg(target_os = "linux")]
+impl NoFreeDescriptor {
+    fn lower() -> Self {
+        use std::os::fd::AsRawFd as _;
+
+        use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
+
+        let probe = std::fs::File::open("/dev/null").expect("open a probe descriptor");
+        let lowest_free = probe.as_raw_fd();
+        drop(probe);
+        let before = getrlimit(Resource::Nofile);
+        let lowered = Rlimit {
+            current: Some(lowest_free as u64),
+            ..before
+        };
+        setrlimit(Resource::Nofile, lowered).expect("lower the soft descriptor limit");
+        NoFreeDescriptor(before)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for NoFreeDescriptor {
+    fn drop(&mut self) {
+        let restored = rustix::process::setrlimit(rustix::process::Resource::Nofile, self.0);
+        assert!(
+            restored.is_ok() || std::thread::panicking(),
+            "restore the descriptor limit: {restored:?}"
+        );
+    }
+}
+
+// `terminate` signals through the held handle, not a fresh `pidfd_open`. Stdin is released only
+// afterwards, so a terminate that sent nothing exits 0. The child is not contained: a contained
+// child reaped before its drop warns below Linux 6.9, which has no group signal for a reaped root.
+//
+// Mutant: `terminate` re-opens the child by its identity.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn terminate_does_not_open_the_child_afresh() {
+fn terminate_needs_no_free_descriptor() {
+    crate::test_child::run_fixture(crate::test_child::fixture_path!(
+        fixture_terminate_with_no_free_descriptor
+    ));
+}
+
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn fixture_terminate_with_no_free_descriptor() {
     use std::os::unix::process::ExitStatusExt;
+
+    if !crate::test_child::is_fixture_reexec() {
+        return;
+    }
     let _warns = crate::log_capture::warn_watch();
-    let (child, stdin) = crate::test_child::held_contained_blocker_without_cgroup(crate::Stdio::null());
-    let _forced = crate::os_process::linux::open::fault::force_pidfd_open_errno_once(rustix::io::Errno::MFILE);
+    let (child, stdin) = crate::test_child::held_blocker(crate::Stdio::null(), |_| {});
 
-    child.terminate().expect("terminate");
+    let no_descriptor = NoFreeDescriptor::lower();
+    let terminated = child.terminate();
+    drop(no_descriptor);
+
+    terminated.expect("terminate opens no descriptor");
     drop(stdin);
-
-    assert_eq!(
-        crate::os_process::linux::open::fault::take_forced_pidfd_open_errno(),
-        Some(rustix::io::Errno::MFILE),
-        "the terminate opened the child afresh"
-    );
     let status = child.wait().expect("reap");
     assert_eq!(status.signal(), Some(libc::SIGTERM), "{status:?}");
 }
 
-// The root-only grace wait looks through the held handle too: with the next `pidfd_open` failing,
-// it still sees the SIGTERM exit and surfaces no watch error.
+// The root-only grace wait looks through the held handle too: with no descriptor free from the
+// `SIGTERM` on, it still sees the exit and surfaces no watch error.
+//
+// Mutant: the grace wait re-opens the child.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn graceful_shutdown_grace_wait_does_not_open_the_child_afresh() {
+fn graceful_shutdown_grace_wait_needs_no_free_descriptor() {
+    crate::test_child::run_fixture(crate::test_child::fixture_path!(
+        fixture_graceful_shutdown_with_no_free_descriptor
+    ));
+}
+
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn fixture_graceful_shutdown_with_no_free_descriptor() {
+    use std::cell::Cell;
     use std::os::unix::process::ExitStatusExt;
+    use std::rc::Rc;
+
+    if !crate::test_child::is_fixture_reexec() {
+        return;
+    }
     let _warns = crate::log_capture::warn_watch();
     let (child, stdin) = crate::test_child::held_contained_blocker_without_cgroup(crate::Stdio::pipe());
     assert!(
@@ -240,13 +308,18 @@ fn graceful_shutdown_grace_wait_does_not_open_the_child_afresh() {
         "the fixture must watch the root only, got {:?}",
         child.containment()
     );
-    let _release = term_fault::release_at(term_fault::HookPoint::AfterTerminate, stdin);
-    let _forced = crate::os_process::linux::open::fault::force_pidfd_open_errno_once(rustix::io::Errno::MFILE);
+    // At the hook the `SIGTERM` is sent: the grace wait that follows runs with no descriptor free.
+    let lowered = Rc::new(Cell::new(None));
+    let slot = Rc::clone(&lowered);
+    let _hook = term_fault::at(term_fault::HookPoint::AfterTerminate, move || {
+        drop(stdin);
+        slot.set(Some(NoFreeDescriptor::lower()));
+    });
 
-    let status = child
-        .graceful_shutdown_tree(Duration::from_secs(30))
-        .expect("the grace wait must see the exit through the handle");
+    let status = child.graceful_shutdown_tree(Duration::from_secs(30));
+    drop(lowered.take());
 
+    let status = status.expect("the grace wait must see the exit through the handle");
     assert_eq!(status.signal(), Some(libc::SIGTERM), "{status:?}");
 }
 
