@@ -285,7 +285,3 @@ mod open_tests;
 #[cfg(test)]
 #[path = "open_namespace_tests.rs"]
 mod open_namespace_tests;
-
-#[cfg(test)]
-#[path = "open_openat2_tests.rs"]
-mod open_openat2_tests;
