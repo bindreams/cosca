@@ -12,7 +12,10 @@ use rustix::process::Pid;
 
 use super::open_tests::LiveNonLeaderTid;
 use crate::error::Error;
-use crate::identity::{proc_view_with, FakeKernel, HostKernel, Kernel, ProcDir, ProcView, ProcessId, ViewUnreadable};
+use crate::identity::{
+    proc_view_with, FakeKernel, HostKernel, Kernel, ProcDir, ProcView, ProcessId, ViewUnreadable,
+    UNREADABLE_STATUS_REASON,
+};
 use crate::test_child::fixture_path;
 use crate::test_child::namespaces as ns;
 use crate::test_groups::{namespaces, Group};
@@ -59,7 +62,7 @@ fn fixture_status_mounted_over() {
 
     match proc_view_with(&HostKernel) {
         ProcView::Unassessable(why) => {
-            assert!(why.reason.contains("self/status could not be read"), "{why}");
+            assert!(why.reason.contains(UNREADABLE_STATUS_REASON), "{why}");
             assert_eq!(
                 why.source.as_ref().and_then(|e| e.raw_os_error()),
                 Some(libc::EXDEV),

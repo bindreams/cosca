@@ -70,6 +70,9 @@ pub(crate) fn pidfd_cgroup_id(pidfd: BorrowedFd<'_>) -> io::Result<Option<u64>> 
 /// Whether `/proc/<pid>/cgroup` names `leaf_path` (a unified-hierarchy path) or a cgroup under it
 /// (see [`names_leaf`]): `other_id` says the task's pidfd gave a cgroup id other than the leaf's,
 /// and `recorded` answers for the leaf's own path with ` (deleted)` after it.
+///
+/// Reads through [`HostKernel`](crate::identity::HostKernel) and the containment `fault` hooks,
+/// not a `Kernel` the caller passes: this is containment's own read.
 pub(crate) fn proc_names(
     leaf_path: &str,
     pid: u32,
@@ -950,7 +953,7 @@ fn untraceable_cgroup_readable(kernel: &dyn crate::identity::Kernel) -> Result<(
         Ok(2) => Some(
             match hidden {
                 Some(errno) => Err(io::Error::from_raw_os_error(errno)),
-                None => proc_dir.read_to_string(&format!("{pid}/cgroup")).map(drop),
+                None => kernel.read(&proc_dir, &format!("{pid}/cgroup")).map(drop),
             }
             .map_err(|e| match e.raw_os_error() {
                 Some(libc::ENOENT | libc::EPERM | libc::EACCES) => Unreadable::Hidden(e),

@@ -139,7 +139,7 @@ enum StateUnknown {
 impl std::fmt::Display for StateUnknown {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::View(why) => write!(f, "the /proc view could not be established: {why}"),
+            Self::View(why) => write!(f, "the /proc view cannot be relied on: {why}"),
             Self::Unreadable(e) => write!(f, "its stat could not be read: {e}"),
             Self::Unparsable(stat) => write!(f, "its stat has no state field: {:?}", String::from_utf8_lossy(stat)),
         }
@@ -147,7 +147,7 @@ impl std::fmt::Display for StateUnknown {
 }
 
 /// `pid`'s state letter. Any failure, the pidfd-bracketed read's included, means the state is
-/// unknown; the leaf has no use for the finer errno policy of the scans.
+/// unknown.
 #[cfg(target_os = "linux")]
 fn read_proc_state(kernel: &dyn crate::identity::Kernel, pid: u32) -> Result<char, StateUnknown> {
     let proc_dir = crate::identity::proc_view_with(kernel)

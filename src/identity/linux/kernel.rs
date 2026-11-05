@@ -20,8 +20,8 @@ pub(crate) trait Kernel: Sync {
     /// `ProcDir::open`: `openat2` of `/proc`, proven procfs's root.
     fn open_proc(&self) -> Result<ProcDir, ViewUnreadable>;
 
-    /// The file at `path` under `dir`: `<pid>/stat`, `self/stat`, `self/status` or
-    /// `thread-self/fdinfo/<fd>`.
+    /// The file at `path` under `dir`: `<pid>/stat`, `<pid>/cgroup`, `self/stat`, `self/status`
+    /// or `thread-self/fdinfo/<fd>`.
     fn read(&self, dir: &ProcDir, path: &str) -> io::Result<Vec<u8>>;
 
     /// The numeric entries of `dir` (`ProcDir::pids`).

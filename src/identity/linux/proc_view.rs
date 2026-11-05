@@ -47,6 +47,9 @@ pub(crate) enum ProcView {
 /// Why a [`ProcView::Diverged`] `/proc` cannot answer questions about the caller's pids.
 pub(crate) const DIVERGED_REASON: &str = "this process's /proc is an outer pid namespace's";
 
+/// Why a [`ProcView::Unassessable`] `/proc` could not say which namespace it is.
+pub(crate) const UNREADABLE_STATUS_REASON: &str = "self/status could not be read";
+
 impl ProcView {
     /// The `/proc` directory of a [`Same`](Self::Same) view; any other view is why not.
     pub(crate) fn into_dir(self) -> Result<ProcDir, ViewUnreadable> {
@@ -251,7 +254,7 @@ pub(crate) fn proc_view_with(kernel: &dyn Kernel) -> ProcView {
     let status = match kernel.read(&dir, "self/status").and_then(utf8) {
         Ok(text) => text,
         Err(e) => {
-            return ProcView::Unassessable(ViewUnreadable::new("self/status could not be read", Some(e)));
+            return ProcView::Unassessable(ViewUnreadable::new(UNREADABLE_STATUS_REASON, Some(e)));
         }
     };
     let verdict = match classify_status(&status, || ns_pid_exists(&dir)) {

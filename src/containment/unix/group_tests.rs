@@ -6,11 +6,10 @@ use super::members;
 use super::members_with;
 use super::{state, GroupState, Member};
 #[cfg(target_os = "linux")]
-use crate::identity::{FakeKernel, HostKernel};
+use crate::identity::{FakeKernel, HostKernel, UNREADABLE_STATUS_REASON};
 use crate::identity::{Liveness, ProcessId};
 use nix::sys::signal::Signal;
 
-/// The listing of `pgid` by the host's kernel.
 fn list(pgid: i32) -> std::io::Result<Vec<Member>> {
     #[cfg(target_os = "linux")]
     {
@@ -553,10 +552,10 @@ fn members_is_an_error_when_the_proc_view_is_diverged() {
 fn members_is_an_error_naming_the_cause_when_the_proc_view_is_unassessable() {
     let kernel = FakeKernel::over(&HostKernel).unreadable_view();
     let err = members_with(&kernel, i32::MAX).expect_err("an unassessable view lists nothing");
-    assert!(err.to_string().contains("self/status could not be read"), "{err}");
+    assert!(err.to_string().contains(UNREADABLE_STATUS_REASON), "{err}");
 }
 
-// Per-pid stat read failures (Linux) =====
+// Per-pid stat read failures =====
 
 /// The pid the stat rows list and read.
 #[cfg(target_os = "linux")]

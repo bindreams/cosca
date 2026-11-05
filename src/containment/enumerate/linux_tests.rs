@@ -1,9 +1,8 @@
 use super::process_parents_with;
-use crate::identity::{FakeKernel, HostKernel, Kernel};
+use crate::identity::{FakeKernel, HostKernel, Kernel, UNREADABLE_STATUS_REASON};
 
 type Records = Vec<(log::Level, String)>;
 
-/// The pid the stat rows list and read.
 const PID: u32 = 4242;
 
 fn snapshot_with(kernel: &dyn Kernel) -> (Result<Vec<(u32, u32)>, crate::error::Error>, Records) {
@@ -44,11 +43,11 @@ fn a_diverged_view_is_unassessable_and_warned_about() {
 #[skuld::test]
 fn an_unassessable_view_is_unassessable_and_warned_about_naming_the_cause() {
     let (got, records) = snapshot_with(&FakeKernel::over(&HostKernel).unreadable_view());
-    assert_unassessable_naming(got, "self/status could not be read");
+    assert_unassessable_naming(got, UNREADABLE_STATUS_REASON);
     assert!(
         records
             .iter()
-            .any(|(level, m)| *level == log::Level::Warn && m.contains("self/status could not be read")),
+            .any(|(level, m)| *level == log::Level::Warn && m.contains(UNREADABLE_STATUS_REASON)),
         "{records:?}"
     );
 }

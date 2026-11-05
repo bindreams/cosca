@@ -11,7 +11,7 @@ use rustix::process::{getpid, pidfd_open, PidfdFlags};
 use super::open_verified_with;
 use crate::error::Error;
 use crate::identity::stat_parse::stat_fixture;
-use crate::identity::{Existence, FakeKernel, HostKernel, ProcessId};
+use crate::identity::{Existence, FakeKernel, HostKernel, ProcessId, UNREADABLE_STATUS_REASON};
 
 /// A pid that no live process is expected to hold; only its `pidfd_open` row exists.
 const FABRICATED: u32 = 4242;
@@ -216,13 +216,7 @@ fn open_verified_on_a_live_non_leader_tid_is_unassessable_when_the_proc_view_is_
         .on_pidfd_open(worker.id.pid(), Err(Errno::INVAL))
         .unreadable_view();
     let result = open_verified_with(&kernel, worker.id).map(|fd| fd.is_some());
-    assert_unassessable_with_cause(
-        result,
-        &["self/status could not be read", "pidfd_open: "],
-        true,
-        &marker,
-        mark,
-    );
+    assert_unassessable_with_cause(result, &[UNREADABLE_STATUS_REASON, "pidfd_open: "], true, &marker, mark);
 }
 
 /// A non-leader tid that has exited but is not yet reaped (a ptraced zombie thread) reads

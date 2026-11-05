@@ -237,7 +237,7 @@ pub(crate) use backend::kernel::{HostKernel, Kernel};
 pub(crate) use backend::kernel::fake::FakeKernel;
 
 #[cfg(all(target_os = "linux", test))]
-pub(crate) use backend::proc_view::DIVERGED_REASON;
+pub(crate) use backend::proc_view::{DIVERGED_REASON, UNREADABLE_STATUS_REASON};
 
 #[cfg(target_os = "linux")]
 pub(crate) use backend::proc_view::{pidfd_pid_in, proc_view_with, PidfdTarget, ProcDir, ProcView, ViewUnreadable};

@@ -2,7 +2,7 @@
 
 use super::{proc_state, read_proc_state, StateUnknown};
 use crate::containment::cgroup::test_support::{handle_of, pidfd_of};
-use crate::identity::{FakeKernel, HostKernel, DIVERGED_REASON};
+use crate::identity::{FakeKernel, HostKernel, DIVERGED_REASON, UNREADABLE_STATUS_REASON};
 use crate::test_child::namespaces as ns;
 use crate::test_child::{fixture_path, member_command};
 use crate::test_groups::{namespaces, Group};
@@ -83,7 +83,7 @@ fn no_state_is_read_when_the_view_is_diverged_or_unassessable() {
 
     let unreadable = FakeKernel::over(&HostKernel).unreadable_view();
     match read_proc_state(&unreadable, me).expect_err("no state") {
-        StateUnknown::View(v) => assert_eq!(v.reason, "self/status could not be read"),
+        StateUnknown::View(v) => assert_eq!(v.reason, UNREADABLE_STATUS_REASON),
         other => panic!("{other:?}"),
     }
     assert_eq!(proc_state(&unreadable, handle_of(me, &pidfd_of(me))), None);

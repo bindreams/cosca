@@ -9,7 +9,7 @@ use super::ProbeEnd;
 use super::{dying_in, front_placement, Subtree};
 use crate::containment::cgroup::fault::{self, ProbeStep};
 use crate::containment::cgroup::test_support::alone;
-use crate::identity::{FakeKernel, HostKernel};
+use crate::identity::{FakeKernel, HostKernel, UNREADABLE_STATUS_REASON};
 use crate::send_log::Via;
 use crate::test_child::reaped_elsewhere::warns_since;
 use crate::test_groups::{cgroup, Group};
@@ -171,7 +171,7 @@ fn without_pidfd_info_an_unassessable_proc_view_refuses_naming_the_view() {
     match front_placement(&kernel, || Ok(HIGH)) {
         Err(crate::error::Error::Unsupported { detail, .. }) => {
             assert!(
-                detail.contains("could not be established (self/status could not be read)"),
+                detail.contains(&format!("could not be established ({UNREADABLE_STATUS_REASON})")),
                 "{detail}"
             );
             assert!(!detail.contains("hidepid"), "{detail}");
