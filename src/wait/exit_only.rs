@@ -36,10 +36,6 @@ use macos as backend;
 #[cfg(windows)]
 use windows as backend;
 
-/// Opens a spawned child's pidfd the way `OwnedChild::adopt` does; tests that adopt a child call it.
-#[cfg(all(test, target_os = "linux"))]
-pub(crate) use linux::open_own_child;
-
 #[cfg(all(test, target_os = "linux"))]
 #[path = "exit_only/linux_tests.rs"]
 mod linux_tests;

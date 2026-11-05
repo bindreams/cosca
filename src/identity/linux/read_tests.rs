@@ -9,6 +9,7 @@ use rustix::process::Pid;
 use super::signal_probe;
 use crate::error::Error;
 use crate::identity::probe::SignalProbe;
+use crate::identity::stat_parse::stat_fixture;
 use crate::identity::{Existence, FakeKernel, HostKernel, Liveness, ProcessId, Resolved};
 
 /// Above `PID_MAX_LIMIT` (2^22) yet a valid positive `kill` target, so `kill(pid, 0)` answers `ESRCH`.
@@ -17,12 +18,6 @@ pub(super) const NO_PROCESS_CAN_HOLD: u32 = i32::MAX as u32;
 /// [`NO_PROCESS_CAN_HOLD`] as the kill target the kernel is asked about.
 const NO_PROCESS_CAN_HOLD_TARGET: Pid = Pid::from_raw(i32::MAX).unwrap();
 
-/// `stat` of a process whose `starttime` (field 22) is 424242.
-const STAT_STARTED_AT_424242: &[u8] = b"4242 (x) S 1 4242 4242 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 424242 0 0";
-
-/// A `self/status` with the pid in two namespaces: `/proc` is an outer namespace's.
-const DIVERGED_STATUS: &[u8] = b"NSpid:\t4242\t1\n";
-
 /// A `self/status` with the pid in one namespace: `/proc` is this namespace's own.
 const SAME_STATUS: &[u8] = b"NSpid:\t4242\n";
 
@@ -30,14 +25,8 @@ const SAME_STATUS: &[u8] = b"NSpid:\t4242\n";
 /// `self/status` that cannot be read, and no `/proc` to open (descriptor exhaustion).
 fn unavailable_views() -> [(&'static str, FakeKernel<'static>); 3] {
     [
-        (
-            "diverged",
-            FakeKernel::over(&HostKernel).on_read("self/status", Ok(DIVERGED_STATUS)),
-        ),
-        (
-            "unassessable",
-            FakeKernel::over(&HostKernel).on_read("self/status", Err(libc::EIO)),
-        ),
+        ("diverged", FakeKernel::over(&HostKernel).diverged_view()),
+        ("unassessable", FakeKernel::over(&HostKernel).unreadable_view()),
         ("no /proc", FakeKernel::over(&HostKernel).open_proc_fails(Errno::MFILE)),
     ]
 }
@@ -121,7 +110,7 @@ fn a_stat_that_cannot_be_read_is_gone_only_when_kill_says_esrch() {
             _ => panic!("stat {errno}, kill {probe:?}: got {got:?}"),
         }
     }
-    let found = same_view().on_read(&format!("{PID}/stat"), Ok(STAT_STARTED_AT_424242));
+    let found = same_view().on_read(&format!("{PID}/stat"), Ok(&stat_fixture("S", 424242)));
     match ProcessId::of_with(&found, PID).0 {
         Resolved::Found(id) => assert_eq!(id.start_token_raw(), 424242),
         other => panic!("a readable stat must resolve, got {other:?}"),
@@ -165,7 +154,7 @@ fn the_error_for_a_host_without_openat2_names_the_requirement_and_the_errno() {
 /// Mutant: "the cause is replaced by the generic refusal".
 #[skuld::test]
 fn the_error_for_a_diverged_view_carries_the_view() {
-    let kernel = FakeKernel::over(&HostKernel).on_read("self/status", Ok(DIVERGED_STATUS));
+    let kernel = FakeKernel::over(&HostKernel).diverged_view();
     let err = cause_error_of_live_read(&kernel).expect("a diverged view is an error");
     assert!(
         matches!(&err, Error::Unassessable { detail, .. }
@@ -198,12 +187,12 @@ fn alias_token_aliases_only_a_found_stat() {
 
     assert!(matches!(start_token_from(PID, Resolved::Gone), Resolved::Gone));
     assert!(matches!(start_token_from(PID, Resolved::Unknown), Resolved::Unknown));
-    match start_token_from(PID, Resolved::Found(STAT_STARTED_AT_424242.to_vec())) {
+    match start_token_from(PID, Resolved::Found(stat_fixture("S", 424242))) {
         Resolved::Found(t) => assert_eq!(t, aliased, "a found stat answers the alias"),
         other => panic!("a found stat must resolve, got {other:?}"),
     }
     // Another pid is untouched.
-    match start_token_from(PID + 1, Resolved::Found(STAT_STARTED_AT_424242.to_vec())) {
+    match start_token_from(PID + 1, Resolved::Found(stat_fixture("S", 424242))) {
         Resolved::Found(t) => assert_eq!(t, StartToken::from_raw(424242)),
         other => panic!("got {other:?}"),
     }
@@ -217,7 +206,7 @@ fn dropping_the_alias_guard_ends_that_alias_only() {
     use super::start_token_from;
     use crate::identity::StartToken;
 
-    let read = |pid| match start_token_from(pid, Resolved::Found(STAT_STARTED_AT_424242.to_vec())) {
+    let read = |pid| match start_token_from(pid, Resolved::Found(stat_fixture("S", 424242))) {
         Resolved::Found(t) => t,
         other => panic!("a found stat must resolve, got {other:?}"),
     };

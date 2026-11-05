@@ -132,9 +132,14 @@ pub(crate) enum PeekOutcome {
 
 /// Take over the std `child`, whose identity `id` the caller has just read, as the [`OsChild`] of
 /// its platform. **Never reaps**: an already-exited child is still a zombie afterwards. A child
-/// already reaped elsewhere cannot be adopted: `Err` with `ECHILD` (macOS: or an unreadable
-/// identity), and the child handed back untouched. Tests only: a spawn adopts through the handle it
-/// holds.
+/// already reaped elsewhere cannot be adopted: `Err`, and the child handed back untouched.
+///
+/// - Linux: the `pidfd_open` of its pid fails, or `waitid(P_PIDFD, WEXITED | WNOHANG | WNOWAIT)` on
+///   the pidfd answers `ECHILD`: it names no child of this process. A running child, or an exit
+///   not yet reaped, is adopted.
+/// - macOS: `ECHILD`, or an unreadable identity.
+///
+/// Tests only: a spawn adopts through the handle it holds.
 #[cfg(test)]
 #[allow(
     clippy::result_large_err,
@@ -145,12 +150,11 @@ pub(crate) fn adopt_std(
     id: crate::identity::ProcessId,
 ) -> Result<Box<dyn OsChild>, (Error, std::process::Child)> {
     debug_assert_eq!(child.id(), id.pid(), "the identity must be the child's");
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     let gone = || Error::Io(std::io::Error::from_raw_os_error(libc::ECHILD));
     #[cfg(target_os = "linux")]
-    let os: Box<dyn OsChild> = match crate::wait::exit_only::open_own_child(id.pid(), Some(id)) {
-        Ok(Some(pidfd)) => Box::new(super::linux::LinuxProcess::new(Some(id.pid()), pidfd)),
-        Ok(None) => return Err((gone(), child)),
+    let os = match adopt_pidfd(&crate::identity::HostKernel, id) {
+        Ok(os) => os,
         Err(e) => return Err((e, child)),
     };
     #[cfg(target_os = "macos")]
@@ -171,6 +175,31 @@ pub(crate) fn adopt_std(
     #[cfg(unix)]
     drop(child);
     Ok(os)
+}
+
+/// [`adopt_std`]'s Linux half: the pidfd of `id`'s pid, confirmed to name a child of this process.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn adopt_pidfd(
+    kernel: &dyn crate::identity::Kernel,
+    id: crate::identity::ProcessId,
+) -> Result<Box<dyn OsChild>, Error> {
+    use std::os::fd::AsFd as _;
+
+    use crate::wait::exit_only::{peek, Target};
+
+    let target = rustix::process::Pid::from_raw(id.pid() as i32).expect("a spawned child's pid is never 0");
+    let pidfd = kernel
+        .pidfd_open(target)
+        .map_err(|e| Error::Io(crate::error::io_context("pidfd_open", std::io::Error::from(e))))?;
+    // Never in a stdio slot: with 0, 1 or 2 closed, the lowest free number is one, and the
+    // application may `dup2` its stdio back over it, destroying the pidfd.
+    let pidfd = crate::above_stdio::above_stdio(pidfd).map_err(Error::Io)?;
+    match peek(&Target::PidFd(pidfd.as_fd())).map_err(Error::Io)? {
+        PeekOutcome::Foreign(_) => Err(Error::Io(std::io::Error::from_raw_os_error(libc::ECHILD))),
+        PeekOutcome::Exit(_) | PeekOutcome::Running => {
+            Ok(Box::new(super::linux::LinuxProcess::new(Some(id.pid()), pidfd)))
+        }
+    }
 }
 
 /// A running blocker child (see [`crate::test_child::held_std_killable_blocker`]) adopted by
