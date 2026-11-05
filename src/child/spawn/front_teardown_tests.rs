@@ -93,7 +93,7 @@ fn cgroup_a_front_the_leaf_kill_reached_is_waited_for_and_reaped(#[fixture(cgrou
         waited: Arc::clone(&waited),
     };
     let (fate, child_fate) = teardown_unadopted_or_front(front, sudo_front(), id, Some(&subtree));
-    assert_eq!(fate, FrontFate::Reaped);
+    assert_eq!(fate, Some(FrontFate::Reaped));
     assert_eq!(child_fate, ChildFate::Reaped);
     assert!(waited.load(Ordering::SeqCst));
     assert!(reaped(&observer), "the teardown reaps the front");
@@ -119,7 +119,7 @@ fn cgroup_a_front_outside_its_leaf_is_left_unwaited(#[fixture(cgroup)] _group: &
         waited: Arc::clone(&waited),
     };
     let (fate, child_fate) = teardown_unadopted_or_front(front, sudo_front(), id, Some(&subtree));
-    assert_eq!(fate, FrontFate::LeftUnreaped);
+    assert_eq!(fate, Some(FrontFate::LeftUnreaped));
     assert_eq!(child_fate, ChildFate::Running { id });
     assert!(
         !waited.load(Ordering::SeqCst),
@@ -158,7 +158,7 @@ fn cgroup_a_front_its_leaf_could_not_kill_is_left_unwaited(#[fixture(cgroup)] _g
         waited: Arc::clone(&waited),
     };
     let (fate, child_fate) = teardown_unadopted_or_front(front, sudo_front(), id, Some(&subtree));
-    assert_eq!(fate, FrontFate::LeftUnreaped);
+    assert_eq!(fate, Some(FrontFate::LeftUnreaped));
     assert_eq!(child_fate, ChildFate::Running { id });
     assert!(
         !waited.load(Ordering::SeqCst),
@@ -202,7 +202,7 @@ fn cgroup_a_front_whose_place_cannot_be_read_is_left_unwaited(#[fixture(cgroup)]
         let _unreadable = crate::containment::cgroup::fault::fail_pidfd_info();
         teardown_unadopted_or_front(front, sudo_front(), id, Some(&subtree))
     };
-    assert_eq!(fate, FrontFate::Unplaced);
+    assert_eq!(fate, Some(FrontFate::Unplaced));
     assert_eq!(child_fate, ChildFate::Unknown);
     assert!(!waited.load(Ordering::SeqCst), "an unplaced front is not waited for");
     let notes = crate::log_capture::records_since_on_current_thread(mark, "cgroup cannot be read");
@@ -241,7 +241,7 @@ fn cgroup_a_front_the_leaf_kill_reached_whose_wait_fails_is_unaccounted_for(#[fi
     };
     let mark = crate::log_capture::mark();
     let (fate, child_fate) = teardown_unadopted_or_front(front, sudo_front(), id, Some(&subtree));
-    assert_eq!(fate, FrontFate::Unaccounted);
+    assert_eq!(fate, Some(FrontFate::Unaccounted));
     assert_eq!(child_fate, ChildFate::Killed);
     assert!(waited.load(Ordering::SeqCst), "a front the kill reached is waited for");
     let warns = crate::log_capture::records_since_on_current_thread(mark, "could not be reaped");
