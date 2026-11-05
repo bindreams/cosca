@@ -212,54 +212,38 @@ fn raw_os_error_walks_an_error_io_to_the_first_os_code() {
     );
 }
 
-/// An `Error::Io` built over an `io_context` error has the OS code of the context's source.
-#[cfg(any(unix, feature = "tokio"))]
+/// Where the OS code sits below an `Error::Io`: its own `source()` is the wrapper cosca added, which
+/// has no code, and the code is on the error the wrapper holds. A return to `#[error(transparent)]`
+/// would skip the wrapper and fail these.
 #[skuld::test]
-fn io_context_error_in_error_io_reaches_the_os_code() {
+fn an_error_io_over_io_context_has_the_code_one_io_error_down() {
     let code = if cfg!(windows) { 5 } else { 13 };
     let e = Error::Io(crate::error::io_context(
         "could not check C:\\t.exe",
         std::io::Error::from_raw_os_error(code),
     ));
-    assert_eq!(
-        first_source_io(&e).raw_os_error(),
-        None,
-        "the wrapper is the first source"
-    );
-    assert_eq!(e.raw_os_error(), Some(code));
+    assert_eq!(codes_down(&e), [None, Some(code)]);
 }
 
-/// A note on an `Error::Io` leaves the OS code of the original error.
-#[cfg(any(unix, feature = "tokio"))]
+/// A note on an `Error::Io` puts its own code-less `io::Error` above the original one.
 #[skuld::test]
-fn a_noted_error_io_has_the_os_code_of_the_original() {
+fn a_noted_error_io_has_the_code_one_io_error_down() {
     let code = if cfg!(windows) { 5 } else { 13 };
     let e = Error::Io(std::io::Error::from_raw_os_error(code)).with_note("while tearing down");
-    assert_eq!(
-        first_source_io(&e).raw_os_error(),
-        None,
-        "the wrapper is the first source"
-    );
-    assert_eq!(e.raw_os_error(), Some(code));
+    assert_eq!(codes_down(&e), [None, Some(code)]);
 }
 
 /// A note on an `io_context` error, the shape the unix spawn teardowns produce, leaves the OS code
 /// under both wrappers.
-#[cfg(any(unix, feature = "tokio"))]
 #[skuld::test]
-fn a_note_on_a_context_error_io_has_the_os_code_of_the_original() {
+fn a_note_on_a_context_error_io_has_the_code_under_both_wrappers() {
     let code = if cfg!(windows) { 5 } else { 13 };
     let e = Error::Io(crate::error::io_context(
         "pidfd_open",
         std::io::Error::from_raw_os_error(code),
     ))
     .with_note("while tearing down");
-    assert_eq!(
-        first_source_io(&e).raw_os_error(),
-        None,
-        "the wrapper is the first source"
-    );
-    assert_eq!(e.raw_os_error(), Some(code));
+    assert_eq!(codes_down(&e), [None, None, Some(code)]);
 }
 
 /// A note keeps every variant and its other fields, appends to the detail, and keeps each `source`.
@@ -395,10 +379,10 @@ fn io_error_displays_the_wrapped_message_unchanged() {
     assert_eq!(Error::Io(inner).to_string(), expected);
 }
 
-/// The `io::Error` that `e`'s own `source()` returns: the one `Error::Io` wraps.
-#[cfg(any(unix, feature = "tokio"))]
-fn first_source_io(e: &Error) -> &std::io::Error {
-    std::error::Error::source(e)
-        .and_then(|s| s.downcast_ref::<std::io::Error>())
-        .expect("Error::Io's source is its io::Error")
+/// The `raw_os_error()` of each `io::Error` reached by walking `source()` from `e`, outermost first.
+fn codes_down(e: &Error) -> Vec<Option<i32>> {
+    std::iter::successors(std::error::Error::source(e), |s| s.source())
+        .filter_map(|s| s.downcast_ref::<std::io::Error>())
+        .map(std::io::Error::raw_os_error)
+        .collect()
 }

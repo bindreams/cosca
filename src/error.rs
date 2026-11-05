@@ -125,7 +125,7 @@ pub enum Error {
     ///
     /// The OS code may sit on an `io::Error` further down the chain, under context cosca added:
     /// walk `source()` from this `Error` and take the first `io::Error` whose `raw_os_error()` is
-    /// `Some`. The crate's own `Error::raw_os_error` does this walk.
+    /// `Some`.
     #[error("{0}")]
     Io(#[from] std::io::Error),
     /// An operation isn't available on this platform / in this build.
