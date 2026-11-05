@@ -31,7 +31,7 @@ use std::os::fd::AsFd as _;
 use std::time::{Duration, SystemTime};
 
 use rustix::io::Errno;
-use rustix::process::Pid;
+use rustix::process::{Pid, PidfdFlags};
 
 use self::kernel::Kernel;
 use self::proc_view::ProcDir;
@@ -109,6 +109,10 @@ pub(super) fn signal_says_no_such_process(kernel: &dyn Kernel, pid: RawPid) -> b
     signal_probe(kernel, pid) == SignalProbe::NoSuchProcess
 }
 
+/// The wire names of the two kinds of [`Key`], in a record's `token_kind`.
+const PIDFS: &str = "pidfs";
+const TICKS: &str = "ticks";
+
 /// What makes a Linux process: `pidfs`, the inode of its pidfd, or, below Linux 6.9 where pidfds
 /// have no inode of their own, the `starttime` ticks `/proc` shows. Two ids of different kinds never
 /// compare equal.
@@ -126,9 +130,25 @@ impl Key {
         }
     }
 
-    /// A key restored from a record's `token`.
-    pub(super) fn restored(token: u64, _kind: Option<&str>) -> Key {
-        Key::Ticks(token)
+    /// A key restored from a record's `token` of the kind the record names. The record was
+    /// validated against this host's kind first, so the name is one of the two.
+    pub(super) fn restored(token: u64, kind: Option<&str>) -> Key {
+        debug_assert!(
+            matches!(kind, Some(PIDFS | TICKS)),
+            "a validated record names a kind of token, not {kind:?}"
+        );
+        match kind {
+            Some(PIDFS) => Key::Pidfs(token),
+            _ => Key::Ticks(token),
+        }
+    }
+
+    /// The kind a record names for this key.
+    pub(super) fn wire_kind(self) -> Option<&'static str> {
+        Some(match self {
+            Key::Pidfs(_) => PIDFS,
+            Key::Ticks(_) => TICKS,
+        })
     }
 
     /// The `Ticks` key of `v`: this backend's default kind, for tests that run on every platform.
@@ -382,22 +402,29 @@ use super::persist::{Scope, ScopeReadError};
 const BOOT_ID_PATH: &str = "/proc/sys/kernel/random/boot_id";
 const PID_NS_PATH: &str = "/proc/self/ns/pid";
 
-/// This host's boot session, as the two things a `/proc` jiffy token is relative to.
+/// This host's boot session, as the things a saved token is relative to.
 ///
-/// `boot_id` scopes the jiffy counter, which restarts at every boot; the `/proc/self/ns/pid`
-/// inode scopes the PID, because a container shares the host's `boot_id` (it is not
-/// namespaced) while numbering its processes independently. Either one alone would let a
-/// saved token be compared against an unrelated process.
+/// `boot_id` scopes the token, which restarts at every boot (the jiffy counter, the pidfs inode
+/// counter); the `/proc/self/ns/pid` inode scopes the PID, because a container shares the host's
+/// `boot_id` (it is not namespaced) while numbering its processes independently; and the kind of
+/// token says whether the host's tokens are `pidfs` inodes or `starttime` ticks, which are not
+/// comparable. Any one alone would let a saved token be compared against an unrelated process.
 ///
-/// Both reads are of the caller's own `/proc` entries, which no `hidepid` mount hides from
-/// the task itself; a failure here means `/proc` is not mounted at all.
+/// The first two reads are of the caller's own `/proc` entries, which no `hidepid` mount hides
+/// from the task itself; a failure there means `/proc` is not mounted at all. The kind is read from
+/// the caller's own pidfd, so a host that refuses `pidfd_open` to it has no scope either.
 pub(super) fn session_scope() -> Result<Scope, ScopeReadError> {
-    session_scope_at(std::path::Path::new(BOOT_ID_PATH), std::path::Path::new(PID_NS_PATH))
+    session_scope_at(
+        &kernel::HostKernel,
+        std::path::Path::new(BOOT_ID_PATH),
+        std::path::Path::new(PID_NS_PATH),
+    )
 }
 
-/// [`session_scope`] with the two `/proc` paths as parameters, so a test can point them at
-/// paths that really do not exist and exercise the failure without mocking a syscall.
+/// [`session_scope`] through `kernel`, with the two `/proc` paths as parameters, so a test can
+/// point them at paths that really do not exist and exercise the failure without mocking a syscall.
 pub(super) fn session_scope_at(
+    kernel: &dyn Kernel,
     boot_id_path: &std::path::Path,
     pid_ns_path: &std::path::Path,
 ) -> Result<Scope, ScopeReadError> {
@@ -427,8 +454,27 @@ pub(super) fn session_scope_at(
             source,
         })?
         .ino();
+    let token_kind = own_token_kind(kernel).map_err(|errno| ScopeReadError {
+        path: "pidfd_open of this process".to_owned(),
+        source: std::io::Error::from(errno),
+    })?;
     Ok(Scope {
         boot_id: Some(boot_id.to_owned()),
         pid_ns: Some(pid_ns),
+        token_kind: Some(token_kind),
+    })
+}
+
+/// The inode of this process's own pidfd: `Some` on pidfs, `None` where pidfds have none.
+fn own_pidfs_ino(kernel: &dyn Kernel) -> Result<Option<u64>, Errno> {
+    let pidfd = kernel.pidfd_open(rustix::process::getpid(), PidfdFlags::empty())?;
+    kernel.pidfs_ino(pidfd.as_fd())
+}
+
+/// The kind of [`Key`] this host's processes have, as a record names it.
+fn own_token_kind(kernel: &dyn Kernel) -> Result<&'static str, Errno> {
+    Ok(match own_pidfs_ino(kernel)? {
+        Some(_) => PIDFS,
+        None => TICKS,
     })
 }

@@ -1,21 +1,23 @@
 //! Persisting a [`ProcessId`](super::ProcessId) and restoring it later.
 //!
-//! A `ProcessId` is `(pid, raw start token)`, and the token is whatever the kernel keeps —
+//! A `ProcessId` is `(pid, raw token)`, and the token is whatever the kernel keeps —
 //! which is not equally portable across the three backends:
 //!
 //! | Platform | Token | Survives a reboot? |
 //! |---|---|---|
 //! | Windows | creation `FILETIME` | yes — absolute 100 ns ticks since 1601 |
 //! | macOS | `kinfo_proc` start µs | yes — absolute µs since 1970 |
-//! | Linux | `/proc` `starttime` jiffies | **no** — counted from boot |
+//! | Linux, `"pidfs"` | the pidfd's inode (Linux 6.9+) | **no** — the counter restarts each boot |
+//! | Linux, `"ticks"` | `/proc` `starttime` jiffies | **no** — counted from boot |
 //!
 //! A naively-serialized Linux token therefore aliases onto whichever process occupies that
 //! pid after a reboot, reintroducing exactly the pid-reuse hazard `ProcessId` exists to
 //! remove — and doing it silently, because the holder believes they have a strong identity.
+//! The two Linux kinds are not comparable with each other either, so a record names its kind.
 //!
 //! So the persisted form is an explicit, versioned, self-describing [`ProcessIdRecord`] and
 //! the only way back is [`TryFrom`], which rejects a record from another platform, another
-//! boot session, another pid namespace, or an unknown format version.
+//! boot session, another pid namespace, another kind of token, or an unknown format version.
 //!
 //! A restored `ProcessId` says nothing about whether the process is still there — ask
 //! [`ProcessId::exists`](super::ProcessId::exists) or
@@ -33,7 +35,7 @@ use super::{backend, Key, ProcessId, RawPid};
 /// The record format this build writes. A reader rejects any version it does not know,
 /// so a future bump can change the fields' meaning safely. Within a version, changes are
 /// additive only: a reader ignores fields it does not recognise.
-pub const RECORD_VERSION: u32 = 1;
+pub const RECORD_VERSION: u32 = 2;
 
 /// The OS a persisted identity was produced on. Start tokens are not comparable across
 /// platforms, so this tag is checked before anything else about the token.
@@ -161,6 +163,11 @@ pub struct ProcessIdRecord {
     /// had without this field — `(pid, boot_id, token)` — never less.
     #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))]
     pub pid_ns: Option<u64>,
+    /// Linux: what `token` is, `"pidfs"` (the pidfd's inode, on Linux 6.9+) or `"ticks"` (the
+    /// `starttime`, below it). Tokens of the two kinds are never comparable, so a record of one is
+    /// refused on a host of the other. `None` on Windows and macOS, which have one kind.
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))]
+    pub token_kind: Option<String>,
 }
 
 /// The live session a token has to belong to, as read from THIS host. Empty on platforms
@@ -169,6 +176,8 @@ pub struct ProcessIdRecord {
 pub(crate) struct Scope {
     pub(crate) boot_id: Option<String>,
     pub(crate) pid_ns: Option<u64>,
+    /// The kind of token this host's ids have: Linux `"pidfs"` or `"ticks"`.
+    pub(crate) token_kind: Option<&'static str>,
 }
 
 impl Scope {
@@ -225,7 +234,8 @@ pub(crate) fn reject(record: &ProcessIdRecord, scope: &Scope, kind: RecordErrorK
     Error::IdentityRecord {
         kind,
         detail: format!(
-            "record v{} from {} for pid {} (boot_id {:?} vs live {:?}, pid_ns {:?} vs live {:?})",
+            "record v{} from {} for pid {} (boot_id {:?} vs live {:?}, pid_ns {:?} vs live {:?}, \
+             token_kind {:?} vs live {:?})",
             record.version,
             record.platform.as_str(),
             record.pid,
@@ -233,6 +243,8 @@ pub(crate) fn reject(record: &ProcessIdRecord, scope: &Scope, kind: RecordErrorK
             scope.boot_id,
             record.pid_ns,
             scope.pid_ns,
+            record.token_kind,
+            scope.token_kind,
         ),
         source: None,
     }
@@ -275,6 +287,13 @@ pub(crate) fn validate(
             Some(_) => {}
         }
     }
+    if let Some(live) = scope.token_kind {
+        match record.token_kind.as_deref() {
+            None => return Err(RecordErrorKind::MissingTokenKind),
+            Some(saved) if saved != live => return Err(RecordErrorKind::ForeignTokenKind),
+            Some(_) => {}
+        }
+    }
     Ok((record.pid, record.token))
 }
 
@@ -290,6 +309,7 @@ fn record_from(id: &ProcessId, scope: Result<Scope, ScopeReadError>) -> Result<P
         token: id.key.raw(),
         boot_id: scope.boot_id,
         pid_ns: scope.pid_ns,
+        token_kind: id.key.wire_kind().map(str::to_owned),
     })
 }
 
@@ -303,7 +323,7 @@ fn restore(
     let (pid, token) = validate(record, here, &scope).map_err(|kind| reject(record, &scope, kind))?;
     Ok(ProcessId {
         pid,
-        key: Key::restored(token, None),
+        key: Key::restored(token, record.token_kind.as_deref()),
     })
 }
 

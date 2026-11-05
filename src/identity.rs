@@ -67,6 +67,11 @@ impl Key {
         Key(token)
     }
 
+    /// The kind a record names for this key: none, off Linux.
+    fn wire_kind(self) -> Option<&'static str> {
+        None
+    }
+
     /// This backend's default kind, for tests that run on every platform.
     #[cfg(test)]
     pub(crate) fn for_test(v: u64) -> Key {

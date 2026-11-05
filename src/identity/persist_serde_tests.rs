@@ -8,31 +8,33 @@ use super::{Platform, ProcessIdRecord, RECORD_VERSION};
 
 fn windows_record() -> ProcessIdRecord {
     ProcessIdRecord {
-        version: 1,
+        version: 2,
         platform: Platform::Windows,
         pid: 4242,
         // A real measured creation FILETIME, larger than 2^53.
         token: 134_301_578_477_907_396,
         boot_id: None,
         pid_ns: None,
+        token_kind: None,
     }
 }
 
 fn linux_record() -> ProcessIdRecord {
     ProcessIdRecord {
-        version: 1,
+        version: 2,
         platform: Platform::Linux,
         pid: 4242,
         token: 162_431_157,
         boot_id: Some("36c39237-f06e-4e88-a74d-ea99d42b817c".into()),
         pid_ns: Some(4_026_531_836),
+        token_kind: Some("pidfs".into()),
     }
 }
 
 #[skuld::test]
-fn the_version_is_one() {
-    // The wire literals below hard-code v1; a bump must come with a format decision.
-    assert_eq!(RECORD_VERSION, 1);
+fn the_version_is_two() {
+    // The wire literals below hard-code v2; a bump must come with a format decision.
+    assert_eq!(RECORD_VERSION, 2);
 }
 
 #[skuld::test]
@@ -40,7 +42,7 @@ fn a_windows_record_serializes_to_the_documented_json() {
     let json = serde_json::to_string(&windows_record()).expect("serialize");
     assert_eq!(
         json,
-        r#"{"v":1,"platform":"windows","pid":4242,"token":"134301578477907396"}"#
+        r#"{"v":2,"platform":"windows","pid":4242,"token":"134301578477907396"}"#
     );
 }
 
@@ -49,8 +51,26 @@ fn a_linux_record_serializes_to_the_documented_json() {
     let json = serde_json::to_string(&linux_record()).expect("serialize");
     assert_eq!(
         json,
-        r#"{"v":1,"platform":"linux","pid":4242,"token":"162431157","boot_id":"36c39237-f06e-4e88-a74d-ea99d42b817c","pid_ns":4026531836}"#
+        r#"{"v":2,"platform":"linux","pid":4242,"token":"162431157","boot_id":"36c39237-f06e-4e88-a74d-ea99d42b817c","pid_ns":4026531836,"token_kind":"pidfs"}"#
     );
+}
+
+/// A record the previous format wrote names no kind of token, and its token may be of either:
+/// it is refused as an unknown version, not guessed at.
+#[skuld::test]
+fn a_version_one_record_is_refused() {
+    use crate::identity::ProcessId;
+    let json = format!(
+        r#"{{"v":1,"platform":"{}","pid":4242,"token":"162431157"}}"#,
+        Platform::current().as_str()
+    );
+    let decoded: ProcessIdRecord = serde_json::from_str(&json).expect("a v1 record still decodes");
+    match ProcessId::try_from(&decoded) {
+        Err(crate::error::Error::IdentityRecord { kind, .. }) => {
+            assert_eq!(kind, crate::error::RecordErrorKind::UnknownVersion)
+        }
+        other => panic!("expected UnknownVersion, got {other:?}"),
+    }
 }
 
 #[skuld::test]
