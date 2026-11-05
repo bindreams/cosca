@@ -1524,7 +1524,7 @@ fn windows_blocker_async_with(
 /// The argv of a child that ignores `SIGTERM` (an ignored disposition survives the `exec`), tells
 /// its stdout it is ready, then blocks on stdin as `cat`. Only `SIGKILL` or stdin EOF ends it.
 #[cfg(unix)]
-const TERM_IGNORING_BLOCKER_ARGV: &[&str] = &["sh", "-c", "trap '' TERM; echo r; exec cat"];
+pub(crate) const TERM_IGNORING_BLOCKER_ARGV: &[&str] = &["sh", "-c", "trap '' TERM; echo r; exec cat"];
 
 /// A root and a grandchild on one stdin pipe, in one process group. The root prints `r` once the
 /// grandchild is forked. The grandchild prints `eof` if its `cat` ends of its own accord, so a test

@@ -209,9 +209,12 @@ pub enum Error {
         source: Option<std::io::Error>,
     },
     /// A tree-walk kill left a member running: it killed what it could, and `pid`, the first member
-    /// it left behind, was not. `source` says why: the member's identity could not be read
-    /// ([`Error::Unassessable`]), or its kill was refused ([`Error::Containment`]). The other
-    /// members were killed, or are further members it left; the message names only the first.
+    /// it left behind, was not. `source` says why: the member's identity could not be read, at the
+    /// walk or when the kill came ([`Error::Unassessable`]), or the OS refused the kill
+    /// ([`Error::Io`], whose [`raw_os_error`](std::io::Error::raw_os_error) is the refusal's code, as
+    /// for [`Process::kill`](crate::Process::kill)). The other members were killed, or are further
+    /// members it left; the message names only the first. The root is named last: an error that names
+    /// the root left no other member.
     ///
     /// Comes from the `TreeWalk` mechanism's `kill_tree` and `graceful_shutdown_tree`, and from
     /// [`Process::kill_tree`](crate::Process::kill_tree) and its `graceful_shutdown_tree`, which walk
@@ -337,6 +340,14 @@ pub enum ChildFate {
     Gone,
     /// cosca cannot say what became of the child.
     Unknown,
+}
+
+impl ChildFate {
+    /// Whether cosca's own kill ended the child: it is dead, and its exit was collected or its kill
+    /// delivered. A child that was already gone, or that may still run, is not.
+    pub(crate) fn ended_by_the_kill(&self) -> bool {
+        matches!(self, ChildFate::Reaped | ChildFate::Killed)
+    }
 }
 
 impl std::fmt::Display for ChildFate {

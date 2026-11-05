@@ -637,6 +637,54 @@ async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root()
     }
 }
 
+// Async twin of `graceful_tree_that_left_a_descendant_reaps_the_root_the_backstop_killed_and_returns_the_error`.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[skuld::test]
+async fn async_graceful_tree_that_left_a_descendant_reaps_the_root_the_backstop_killed_and_returns_the_error() {
+    use ::tokio::io::AsyncReadExt as _;
+
+    use crate::containment::treewalk::fault::{self, LeftBehind};
+
+    crate::tokio::test_runtime::assert_current_thread();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
+    cmd.args(crate::test_child::TERM_IGNORING_BLOCKER_ARGV.iter().copied());
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+    cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
+    cmd.contain_with(crate::ContainMode::TreeWalk);
+    let mut child = cmd.spawn().expect("spawn");
+    let _stdin = child.stdin().expect("piped stdin");
+    let mut readiness = [0u8; 1];
+    child
+        .stdout()
+        .expect("piped stdout")
+        .read_exact(&mut readiness)
+        .await
+        .expect("readiness byte");
+    let id = child.id();
+    assert_eq!(
+        id.exists(),
+        crate::identity::Existence::Present,
+        "precondition: the root runs"
+    );
+
+    fault::force_incomplete_once(LeftBehind::Descendant);
+    let err = child
+        .graceful_shutdown_tree(Duration::from_millis(200))
+        .await
+        .expect_err("a descendant was left");
+
+    assert!(matches!(err, crate::error::Error::MemberNotKilled { .. }), "{err:?}");
+    assert_eq!(
+        id.exists(),
+        crate::identity::Existence::Gone,
+        "the root the backstop killed must be reaped before the error returns"
+    );
+    crate::test_child::assert_killed(
+        "the root",
+        child.wait().await.expect("the reaped root's status is kept"),
+    );
+}
+
 // Async twin of `windows_graceful_tree_members_remain_surfaces_the_forced_sweep_failure` — see
 // there for the full rationale, including why the Unix twin's reap postcondition does not
 // translate to Windows (no Windows-observable difference between the fixed code and the bug it

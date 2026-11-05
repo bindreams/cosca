@@ -581,8 +581,18 @@ impl Attached {
         Ok(false)
     }
 
-    /// Hard-kill the contained tree (best-effort; already-gone is success). `Ok` means the tree is
-    /// gone: a `TreeWalk` that left a member behind is an [`Error::MemberNotKilled`].
+    /// Hard-kill the contained tree (best-effort; already-gone is success). What `Ok` says depends on
+    /// how the mechanism names the tree:
+    ///
+    /// - A cgroup leaf and a Job Object name it in the kernel: `Ok` says the kernel killed every
+    ///   member, however it was spawned.
+    /// - A process group or session, and an fd marker, name it by a number or a pipe: `Ok` says every
+    ///   member they list or find holding it was reached. A member outside it (one that left the group,
+    ///   or on Linux one `hidepid` hides) is not.
+    /// - A `TreeWalk` names it by parentage: `Ok` says every descendant of the root at the walk's
+    ///   snapshot was killed. A process already reparented away from the root (an orphan), or one the
+    ///   snapshot did not list, is not a descendant to it and is not killed. A descendant it left
+    ///   running is an [`Error::MemberNotKilled`].
     ///
     /// `root` is the root a send to a group named by its pid needs (see
     /// [`GroupRoot`](crate::containment::GroupRoot)); every other mechanism ignores it.
@@ -627,6 +637,36 @@ impl Attached {
     /// could and left a member.
     pub(crate) fn hard_kill_refused_to_walk(&self, result: &Result<(), crate::error::Error>) -> bool {
         matches!(self, Attached::TreeWalk(_)) && matches!(result, Err(e) if !matches!(e, Error::MemberNotKilled { .. }))
+    }
+
+    /// Whether `result`, from [`hard_kill`](Self::hard_kill), is a `TreeWalk`'s error that names the
+    /// root `root_pid` alone: the walk names the root last, so no other member was left behind.
+    /// The root's death by its handle then settles the walk.
+    pub(crate) fn hard_kill_left_only_the_root(&self, result: &Result<(), crate::error::Error>, root_pid: u32) -> bool {
+        matches!(self, Attached::TreeWalk(_))
+            && matches!(result, Err(Error::MemberNotKilled { pid, .. }) if *pid == root_pid)
+    }
+
+    /// The result of `kill_tree`: the walk's `group` result and then the handle `backstop`'s, for the
+    /// root `root_pid`. A walk that left only the root is settled by a backstop that killed it: the
+    /// tree is gone, and `killed` records it. Otherwise the group's error comes first, then the
+    /// backstop's.
+    pub(crate) fn hard_kill_settled_by_backstop(
+        &self,
+        killed: &TreeKilled,
+        group: Result<(), crate::error::Error>,
+        backstop: Result<(), crate::error::Error>,
+        root_pid: u32,
+    ) -> Result<(), crate::error::Error> {
+        if let (Err(group), Err(bs)) = (&group, &backstop) {
+            // Both-fail: the group error is surfaced; subsuming the backstop's is deliberate.
+            log::debug!("kill_tree handle backstop also failed ({bs}); surfacing the group error: {group}");
+        }
+        if backstop.is_ok() && self.hard_kill_left_only_the_root(&group, root_pid) {
+            killed.mark();
+            return Ok(());
+        }
+        group.and(backstop)
     }
 
     /// Send the graceful termination signal to the group (signal-only).

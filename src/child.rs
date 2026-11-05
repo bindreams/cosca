@@ -507,7 +507,8 @@ impl Child {
     ///
     /// On the `TreeWalk` mechanism, a walk that killed what it could and left a member running is an
     /// [`Error::MemberNotKilled`] naming the first and why: its identity could not be read, or its
-    /// kill was refused. The handle backstop still ran; a retry walks again.
+    /// kill was refused. The root is named last, so a walk that left only the root is `Ok` once the
+    /// handle backstop killed it. The backstop still ran; a retry walks again.
     ///
     /// On the Unix process-group and session mechanisms this returns
     /// [`Error::Containment`](crate::error::Error::Containment) when a live member of the
@@ -585,12 +586,14 @@ impl Child {
     /// [`CgroupV2`](crate::Containment::CgroupV2), whose kill names no pid. An fd marker's walk from
     /// the root's pid checks each process it signals by its identity.
     pub fn kill_tree(&self) -> Result<(), Error> {
-        self.kill_tree_after(None)
+        self.kill_tree_after(None, &mut false)
     }
 
     /// [`kill_tree`](Self::kill_tree), as a step of an operation that already sent `earlier`, so an
-    /// error never claims the whole operation sent nothing.
-    pub(crate) fn kill_tree_after(&self, earlier: Option<&str>) -> Result<(), Error> {
+    /// error never claims the whole operation sent nothing. `root_killed` is set when the handle
+    /// backstop killed the root, whatever the call returns: the root then exits, and a caller may
+    /// wait for it before it returns an error.
+    pub(crate) fn kill_tree_after(&self, earlier: Option<&str>, root_killed: &mut bool) -> Result<(), Error> {
         #[cfg(not(unix))]
         let _ = earlier;
         self.require_contained()?;
@@ -663,14 +666,15 @@ impl Child {
             );
             Ok(())
         } else {
-            self.kill_root()
+            let killed = self
+                .kill_root()
                 .map(drop)
-                .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper()))
+                .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper()));
+            *root_killed = killed.is_ok();
+            killed
         };
-        if let (Err(group), Err(bs)) = (&group_result, &backstop) {
-            log::debug!("kill_tree handle backstop also failed ({bs}); surfacing the group error: {group}");
-        }
-        group_result.and(backstop)
+        self.attached
+            .hard_kill_settled_by_backstop(&self.tree_killed, group_result, backstop, self.id.pid())
     }
 
     /// Send the graceful termination signal to the contained group — `SIGTERM` via
@@ -1099,14 +1103,6 @@ impl Child {
         {
             let mut left = Vec::new();
             let tree = self.attached.hard_kill(&crate::containment::GroupRoot::none());
-            if let Err(e) = &tree {
-                let orphaned = if self.attached.hard_kill_refused_to_walk(&tree) {
-                    "; the root is killed regardless, so its descendants may be orphaned"
-                } else {
-                    ""
-                };
-                left.push(format!("contained-tree teardown did not fully succeed: {e}{orphaned}"));
-            }
             let torn = self.proc.tear_down(
                 Some(self.id),
                 Kill {
@@ -1116,6 +1112,19 @@ impl Child {
                 None,
             );
             let (warn, remains) = torn.take_warn(caller.label());
+            // Reported after the root's kill: a walk that left only the root is settled by it.
+            if let Err(e) = &tree {
+                if !(self.attached.hard_kill_left_only_the_root(&tree, self.id.pid())
+                    && remains.fate.ended_by_the_kill())
+                {
+                    let orphaned = if self.attached.hard_kill_refused_to_walk(&tree) {
+                        "; the root is killed regardless, so its descendants may be orphaned"
+                    } else {
+                        ""
+                    };
+                    left.push(format!("contained-tree teardown did not fully succeed: {e}{orphaned}"));
+                }
+            }
             left.extend(warn);
             if !left.is_empty() {
                 log::warn!("{}: {}", caller.label(), left.join("; "));
@@ -1163,18 +1172,20 @@ impl Child {
         let kill = self.attached.hard_kill_for_drop(&view, &held.group());
         drop(held);
         report.skipped = kill.skipped;
-        if let Err(e) = &kill.result {
-            // A live member refused, or couldn't be confirmed — visible, not silently
-            // discarded, on the RAII teardown path most callers actually hit. A mechanism
-            // failure (e.g. `EACCES`/`EIO` on `cgroup.kill`) is a real OS outcome, so it is
-            // reported, never asserted on.
+        // A live member refused, or couldn't be confirmed — visible, not silently
+        // discarded, on the RAII teardown path most callers actually hit. A mechanism
+        // failure (e.g. `EACCES`/`EIO` on `cgroup.kill`) is a real OS outcome, so it is
+        // reported, never asserted on. Reported after the root's kill below: a walk that left only
+        // the root is settled by it.
+        let tree = kill.result.as_ref().err().map(|e| {
             let mut tree = format!("contained-tree teardown did not fully succeed: {e}");
             if self.attached.hard_kill_refused_to_walk(&kill.result) {
                 // Unlike `kill_tree`, a drop cannot be retried: the root dies below either way.
                 tree.push_str("; the root is killed regardless, so its descendants may be orphaned");
             }
-            report.tree = Some(tree);
-        }
+            tree
+        });
+        let left_only_the_root = self.attached.hard_kill_left_only_the_root(&kill.result, self.id.pid());
         // Kill, block until the child has exited, and collect its status here — this handle owns
         // the child outright, and a sync caller owns the thread it is blocking. The async twin
         // (`cosca::tokio::Child`'s `Drop`) does the same on Unix.
@@ -1200,11 +1211,21 @@ impl Child {
             } else {
                 // The tree kill above may have reached the root: if the root's own kill is refused,
                 // that kill is what ends it.
-                let tree = kill.result.is_ok().then_some(&self.attached as &dyn Reach);
-                self.proc.tear_down(Some(self.id), Kill { disposition, tree }, None)
+                let reach = kill.result.is_ok().then_some(&self.attached as &dyn Reach);
+                self.proc.tear_down(
+                    Some(self.id),
+                    Kill {
+                        disposition,
+                        tree: reach,
+                    },
+                    None,
+                )
             }
         };
         let remains = report.fold_clause(torn);
+        if !(left_only_the_root && remains.fate.ended_by_the_kill()) {
+            report.tree = tree;
+        }
         report.emit(&self.reported);
         remains
     }

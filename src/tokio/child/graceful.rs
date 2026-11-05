@@ -434,9 +434,10 @@ impl Child {
             );
         }
         // A sweep Err subsumes any watch or terminate Err; it must propagate before the reap on
-        // a LIVE root (waiting unswept would hang), but once the root's exit was observed, the
-        // reap runs first so no zombie is stranded.
+        // a LIVE root (waiting unswept would hang), but once the root is dead (its exit was observed,
+        // or the sweep's backstop killed it), the reap runs first so no zombie is stranded.
         if !drained {
+            let mut root_killed = false;
             // The `#[cfg(test)]` arm lets a test PROVE the sweep is skipped when `drained`,
             // not merely that it would have no-op'd: forcing this call to fail and then
             // observing `Ok` from the whole function is only possible if this branch was
@@ -445,14 +446,14 @@ impl Child {
             let sweep_result = if fault::take_force_kill_tree_error() {
                 Err(fault::forced_kill_tree_error())
             } else {
-                self.kill_tree_after(earlier)
+                self.kill_tree_after(earlier, &mut root_killed)
             };
             #[cfg(not(test))]
-            let sweep_result = self.kill_tree_after(earlier);
+            let sweep_result = self.kill_tree_after(earlier, &mut root_killed);
             if let Err(sweep) = sweep_result {
                 // A zombie launchd holds is not ours to reap: waiting on it only warns.
-                if root_exited && !self.root_is_unpinned() {
-                    // Best-effort reap so an observed-exited root isn't left a zombie; `sweep`
+                if (root_exited || root_killed) && !self.root_is_unpinned() {
+                    // Best-effort reap so a dead root isn't left a zombie; `sweep`
                     // (below) is already the error this call reports, so a failure here is
                     // secondary — but every other discarded error in this module is still logged,
                     // and a silent one here would obscure a second, independent failure mode.

@@ -862,7 +862,8 @@ impl Child {
     ///
     /// On the `TreeWalk` mechanism, a walk that killed what it could and left a member running is an
     /// [`Error::MemberNotKilled`] naming the first and why: its identity could not be read, or its
-    /// kill was refused. The handle backstop still ran; a retry walks again.
+    /// kill was refused. The root is named last, so a walk that left only the root is `Ok` once the
+    /// handle backstop killed it. The backstop still ran; a retry walks again.
     ///
     /// On the Unix process-group and session mechanisms this returns
     /// [`Error::Containment`](crate::error::Error::Containment) when a live member of the
@@ -897,12 +898,14 @@ impl Child {
     /// look.** As for the sync [`Child::kill_tree`](crate::Child::kill_tree). On Linux the handle
     /// keeps the root's pidfd when it forgets tokio's `Child`, whatever it saw.
     pub fn kill_tree(&mut self) -> Result<(), Error> {
-        self.kill_tree_after(None)
+        self.kill_tree_after(None, &mut false)
     }
 
     /// [`kill_tree`](Self::kill_tree), as a step of an operation that already sent `earlier`, so an
-    /// error never claims the whole operation sent nothing.
-    pub(crate) fn kill_tree_after(&mut self, earlier: Option<&str>) -> Result<(), Error> {
+    /// error never claims the whole operation sent nothing. `root_killed` is set when the handle
+    /// backstop killed the root, whatever the call returns: the root then exits, and a caller may
+    /// wait for it before it returns an error.
+    pub(crate) fn kill_tree_after(&mut self, earlier: Option<&str>, root_killed: &mut bool) -> Result<(), Error> {
         #[cfg(not(unix))]
         let _ = earlier;
         self.require_contained()?;
@@ -970,15 +973,19 @@ impl Child {
             Ok(())
         } else {
             // `front` was `None`, so the gate was open.
-            self.kill_sent_gated(crate::elevation::front::Gate::Open).map(|_| ())
+            let killed = self.kill_sent_gated(crate::elevation::front::Gate::Open).map(|_| ());
+            *root_killed = killed.is_ok();
+            killed
         };
         #[cfg(not(unix))]
-        let backstop = self.kill();
-        // Both-fail: the group error is surfaced; subsuming the backstop's is deliberate.
-        if let (Err(group), Err(bs)) = (&group_result, &backstop) {
-            log::debug!("kill_tree handle backstop also failed ({bs}); surfacing the group error: {group}");
-        }
-        group_result.and(backstop)
+        let backstop = {
+            let killed = self.kill();
+            *root_killed = killed.is_ok();
+            killed
+        };
+        self.os
+            .attached
+            .hard_kill_settled_by_backstop(&self.tree_killed, group_result, backstop, self.id.pid())
     }
 
     /// Send the graceful termination signal to the contained group — `SIGTERM` via
@@ -1694,6 +1701,10 @@ impl Child {
                 signals.fate = ChildFate::Reaped;
             }
         }
+        // Reported after the root's kill: a walk that left only the root is settled by it.
+        if signals.tree_left_only_the_root && signals.fate.ended_by_the_kill() {
+            signals.tree = None;
+        }
         #[cfg(unix)]
         let tree_failed = signals.tree.is_some();
         #[cfg(unix)]
@@ -1709,6 +1720,10 @@ impl Child {
         // Off Unix there is no root state to report: what the signals could not do is the event.
         #[cfg(not(unix))]
         let tree_failed = false;
+        #[cfg(not(unix))]
+        if let Some(tree) = signals.tree.take() {
+            signals.left.insert(0, tree);
+        }
         #[cfg(not(unix))]
         if !signals.left.is_empty() {
             log::warn!("{}: {}", caller.label(), signals.left.join("; "));
@@ -1950,8 +1965,10 @@ struct DropSignals {
     #[cfg(unix)]
     forgot: Option<crate::child::drop_report::Forgot>,
     /// The contained tree's teardown failure, if it failed.
-    #[cfg(unix)]
     tree: Option<String>,
+    /// Whether that failure left only the root. The drop's own kill of the root then settles it,
+    /// and it is not reported.
+    tree_left_only_the_root: bool,
     /// What the root kill could not do.
     left: Vec<String>,
     /// What the armed drop waits for once it has signalled.
@@ -1983,8 +2000,8 @@ impl DropSignals {
             skipped: None,
             #[cfg(unix)]
             forgot: None,
-            #[cfg(unix)]
             tree: None,
+            tree_left_only_the_root: false,
             left: Vec::new(),
         }
     }
@@ -2045,12 +2062,8 @@ fn signal_on_drop(
             // Unlike `kill_tree`, a drop cannot be retried: the root dies below either way.
             failed.push_str("; the root is killed regardless, so its descendants may be orphaned");
         }
-        #[cfg(unix)]
-        {
-            signals.tree = Some(failed);
-        }
-        #[cfg(not(unix))]
-        signals.left.push(failed);
+        signals.tree = Some(failed);
+        signals.tree_left_only_the_root = os.attached.hard_kill_left_only_the_root(&tree, pid);
     }
     // Already reaped, or not pinned by this process: no signal to issue. The caller tells its own
     // reap from a foreign one; a root someone else reaped, or launchd holds, is `Gone`.

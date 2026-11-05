@@ -394,10 +394,8 @@ fn a_kill_by_identity_is_sent_through_the_proved_pidfd() {
     use std::os::unix::process::ExitStatusExt as _;
     let (mut child, id, kernel) = live_child_in_a_table();
     let sends = crate::send_log::Capture::start();
-    assert_eq!(
-        super::kill_by_identity(&kernel, id, Signal::SIGTERM),
-        super::KillOutcome::Terminated
-    );
+    let outcome = super::kill_by_identity(&kernel, id, Signal::SIGTERM);
+    assert!(matches!(outcome, super::KillOutcome::Terminated), "{outcome:?}");
     assert_eq!(
         sends.group_steps(),
         vec![crate::send_log::GroupStep::Member(
@@ -420,8 +418,6 @@ fn a_kill_by_identity_of_a_process_reaped_after_the_proof_is_already_gone() {
     let (mut child, id, kernel) = live_child_in_a_table();
     drop(child.stdin.take());
     child.wait().expect("the child exits at EOF");
-    assert_eq!(
-        super::kill_by_identity(&kernel, id, nix::sys::signal::Signal::SIGTERM),
-        super::KillOutcome::AlreadyGone
-    );
+    let outcome = super::kill_by_identity(&kernel, id, nix::sys::signal::Signal::SIGTERM);
+    assert!(matches!(outcome, super::KillOutcome::AlreadyGone), "{outcome:?}");
 }

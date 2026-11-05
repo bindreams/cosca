@@ -484,20 +484,95 @@ async fn drop_after_terminate_tree_and_wait_still_warns() {
     assert_eq!(records[0].0, log::Level::Warn);
 }
 
-/// The same for a `TreeWalk` whose walk was incomplete, which is an `Err` of its own variant. Not on
-/// macOS, where `TreeWalk` mode is an fd marker (the test above).
+/// A `TreeWalk` blocker whose next walk is forced to leave `left` behind. Not on macOS, where
+/// `TreeWalk` mode is an fd marker.
 #[cfg(not(target_os = "macos"))]
-#[skuld::test]
-async fn drop_after_an_incomplete_tree_walk_kill_and_wait_still_warns() {
-    crate::tokio::test_runtime::assert_current_thread();
-    crate::log_capture::install();
+fn tree_walk_blocker_leaving(
+    left: crate::containment::treewalk::fault::LeftBehind,
+) -> (crate::tokio::Child, crate::tokio::ChildStdin) {
     let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
     cmd.contain_with(ContainMode::TreeWalk);
     let mut child = cmd.spawn().expect("spawn");
     let stdin = child.stdin().expect("stdin pipe");
-    crate::containment::treewalk::fault::force_incomplete_once();
+    crate::containment::treewalk::fault::force_incomplete_once(left);
+    (child, stdin)
+}
+
+/// A drop whose walk leaves a descendant reports it once, after the root's kill. Mutant: the walk's
+/// per-member warn is kept beside the drop's.
+#[cfg(not(target_os = "macos"))]
+#[skuld::test]
+async fn a_drop_whose_walk_leaves_a_descendant_warns_once_and_kills_the_root() {
+    use crate::containment::treewalk::fault::LeftBehind;
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let (child, stdin) = tree_walk_blocker_leaving(LeftBehind::Descendant);
+    let teardown = release_between_kill_and_wait(stdin);
+    let pid = child.id().pid();
+    let sends = Capture::start();
+    let mark = crate::log_capture::mark();
+    drop(child);
+
+    assert_the_drop_killed(&teardown, &sends, pid);
+    let records = crate::log_capture::records_since_on_current_thread(mark, "was not killed");
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].0, log::Level::Warn);
+    let drop_records = crate::log_capture::records_since_on_current_thread(mark, "Child::drop");
+    assert_eq!(drop_records.len(), 1, "one report of the event: {drop_records:?}");
+}
+
+/// A drop whose walk leaves only the root, which the drop's own kill of the root then ends, says
+/// nothing. Mutant: the drop reports the walk's error before the root's kill.
+#[cfg(not(target_os = "macos"))]
+#[skuld::test]
+async fn a_drop_whose_walk_leaves_only_the_root_does_not_warn_when_the_drop_kills_it() {
+    use crate::containment::treewalk::fault::LeftBehind;
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let (child, stdin) = tree_walk_blocker_leaving(LeftBehind::Root);
+    let teardown = release_between_kill_and_wait(stdin);
+    let pid = child.id().pid();
+    let sends = Capture::start();
+    let mark = crate::log_capture::mark();
+    drop(child);
+
+    assert_the_drop_killed(&teardown, &sends, pid);
+    assert_eq!(
+        crate::log_capture::records_since_on_current_thread(mark, "Child::drop"),
+        []
+    );
+}
+
+/// A walk that left only the root and a backstop kill of it leave the tree killed, so the drop has
+/// nothing to say. Mutant: the tree is not marked killed.
+#[cfg(not(target_os = "macos"))]
+#[skuld::test]
+async fn drop_after_a_walk_that_left_only_the_root_and_a_backstop_kill_does_not_warn() {
+    use crate::containment::treewalk::fault::LeftBehind;
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let (mut child, stdin) = tree_walk_blocker_leaving(LeftBehind::Root);
+    child.kill_tree().expect("the backstop killed the only member left");
+    drop(stdin);
+    crate::test_child::assert_killed("the root", child.wait().await.expect("reap the root"));
+
+    let mark = crate::log_capture::mark();
+    drop(child);
+
+    // The tree is marked killed: the drop skips the walk from the reaped root's number at `debug`.
+    assert_skipped_at_debug(mark);
+}
+
+/// The same for a `TreeWalk` whose walk left a descendant, which is an `Err` of its own variant.
+#[cfg(not(target_os = "macos"))]
+#[skuld::test]
+async fn drop_after_an_incomplete_tree_walk_kill_and_wait_still_warns() {
+    use crate::containment::treewalk::fault::LeftBehind;
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let (mut child, stdin) = tree_walk_blocker_leaving(LeftBehind::Descendant);
     let left = child
         .kill_tree()
         .expect_err("a tree walk that left a member is an error");

@@ -8,6 +8,8 @@
 use super::{descendants_with, Resolution, Walk};
 use crate::error::Error;
 use crate::identity::{Key, OrderKey, ProcessId, RawPid, UnknownCause};
+#[cfg(unix)]
+use crate::test_groups::setuid;
 use std::collections::HashMap;
 
 const ROOT_PID: RawPid = 100;
@@ -545,12 +547,47 @@ fn hard_kill_of_a_root_whose_open_is_denied_is_an_error_naming_it() {
     match super::hard_kill(&crate::identity::HostKernel, id) {
         Err(crate::error::Error::MemberNotKilled { pid, source }) => {
             assert_eq!(pid, child.pid());
+            assert!(
+                matches!(*source, crate::error::Error::Unassessable { source: Some(_), .. }),
+                "an identity that could not be read is Unassessable, carrying the OS error: {source:?}"
+            );
             let said = source.to_string();
             assert!(said.contains("could not be queried"), "{said}");
         }
         other => panic!("expected MemberNotKilled for the root, got {other:?}"),
     }
     assert!(child.is_running(), "a denied open must leave the process running");
+}
+
+/// A member the OS refuses the signal is left running, and `hard_kill`'s error carries the refusal's
+/// OS error, so a caller can tell it from one that could not be read. A setuid-root helper refuses
+/// the kill of its caller. Mutant: the refusal is flattened to text.
+#[cfg(unix)]
+#[skuld::test]
+fn hard_kill_of_a_root_that_refuses_the_signal_is_an_error_carrying_the_errno(
+    #[fixture(setuid)] _group: &crate::test_groups::Group,
+) {
+    let (child, stdin) = crate::test_privilege::spawn_setuid_blocker();
+    let err = super::hard_kill(&crate::identity::HostKernel, child.id()).expect_err("the kill is refused");
+    // The message reads once: the pid, then the OS's own words.
+    let os = std::io::Error::from_raw_os_error(libc::EPERM);
+    assert_eq!(
+        err.to_string(),
+        format!("pid {} was not killed: {os}", child.id().pid())
+    );
+    match err {
+        crate::error::Error::MemberNotKilled { pid, source } => {
+            assert_eq!(pid, child.id().pid());
+            assert!(
+                matches!(*source, crate::error::Error::Io(ref e) if e.raw_os_error() == Some(libc::EPERM)),
+                "{source:?}"
+            );
+        }
+        other => panic!("expected MemberNotKilled, got {other:?}"),
+    }
+    // The helper exits at EOF: nothing killed it.
+    drop(stdin);
+    assert!(child.wait().expect("the helper exits on EOF").success());
 }
 
 /// `kill_by_identity` must terminate only the process whose START TOKEN matches. A stale
@@ -573,20 +610,20 @@ fn kill_by_identity_spares_a_stale_identity_and_kills_a_matching_one() {
         .expect("the owned handle always yields an identity");
     let stale = real.with_other_value();
 
-    assert_eq!(
-        super::kill_by_identity(stale),
-        super::KillOutcome::AlreadyGone,
-        "a stale identity names a process that is gone - nothing to terminate"
+    let outcome = super::kill_by_identity(stale);
+    assert!(
+        matches!(outcome, super::KillOutcome::AlreadyGone),
+        "a stale identity names a process that is gone - nothing to terminate: {outcome:?}"
     );
     assert!(
         child.is_running(),
         "a stale identity must never terminate the pid-s occupant"
     );
 
-    assert_eq!(
-        super::kill_by_identity(real),
-        super::KillOutcome::Terminated,
-        "a matching identity must reach TerminateProcess"
+    let outcome = super::kill_by_identity(real);
+    assert!(
+        matches!(outcome, super::KillOutcome::Terminated),
+        "a matching identity must reach TerminateProcess: {outcome:?}"
     );
     // The child reads `stdin` to its end and exits 0, so a kill that sent nothing ends the wait
     // below with that code, not with the kill's `1`.
@@ -621,10 +658,10 @@ fn kill_by_identity_reports_a_member_that_exits_before_the_terminate_as_gone() {
     let exiter = std::rc::Rc::clone(&child);
     super::fault::set_before_terminate(move || exiter.terminate());
 
-    assert_eq!(
-        super::kill_by_identity(id),
-        super::KillOutcome::AlreadyGone,
-        "a member that exited before the terminate has nothing left to kill"
+    let outcome = super::kill_by_identity(id);
+    assert!(
+        matches!(outcome, super::KillOutcome::AlreadyGone),
+        "a member that exited before the terminate has nothing left to kill: {outcome:?}"
     );
     assert!(!child.is_running(), "precondition: the hook ended the member");
 }
@@ -657,5 +694,5 @@ fn kill_by_identity_reports_a_member_that_is_exiting_but_not_signalled_as_gone()
     child.kill().expect("end the fixture");
     child.wait().expect("reap the fixture");
 
-    assert_eq!(outcome, super::KillOutcome::AlreadyGone);
+    assert!(matches!(outcome, super::KillOutcome::AlreadyGone), "{outcome:?}");
 }

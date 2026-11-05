@@ -26,12 +26,14 @@ fn stale_root() -> ProcessId {
     me.with_other_value()
 }
 
-/// `result` is the error of a walk that left `pid` unkilled, and its message says each of `causes`.
+/// `result` is the error of a walk that left `pid` unkilled because its identity could not be read
+/// ([`Error::Unassessable`]), and its message says each of `causes`.
 #[track_caller]
 fn assert_not_killed(result: Result<(), Error>, pid: u32, causes: &[&str]) {
     match result {
         Err(Error::MemberNotKilled { pid: named, source }) => {
             assert_eq!(named, pid, "the first member left behind");
+            assert!(matches!(*source, Error::Unassessable { .. }), "{source:?}");
             let said = source.to_string();
             for cause in causes {
                 assert!(said.contains(cause), "the error must name {cause:?}: {said}");
@@ -355,10 +357,8 @@ fn kill_by_identity_spares_a_pid_the_kernel_cannot_read_or_shows_as_another_proc
     let new_owner = FakeKernel::over(&HostKernel)
         .live_without_pidfs(pid, pidfd_of(pid))
         .on_read(&format!("{pid}/stat"), Ok(&stat_of_a_new_owner(pid)));
-    assert_eq!(
-        super::kill_by_identity(&new_owner, id, nix::sys::signal::Signal::SIGTERM),
-        super::KillOutcome::AlreadyGone
-    );
+    let outcome = super::kill_by_identity(&new_owner, id, nix::sys::signal::Signal::SIGTERM);
+    assert!(matches!(outcome, super::KillOutcome::AlreadyGone), "{outcome:?}");
     release(child);
 }
 
@@ -377,12 +377,19 @@ fn kill_by_identity_spares_a_pidfs_pid_the_kernel_cannot_open_or_shows_as_anothe
     let super::KillOutcome::NotAttempted(why) = outcome else {
         panic!("expected NotAttempted, got {outcome:?}");
     };
-    assert!(why.contains(&pid.to_string()) && why.contains("pidfd"), "{why}");
-    let new_owner = FakeKernel::over(&HostKernel).on_pidfs_ino(pid, Ok(Some(ino + 1)));
+    // An identity that could not be read is `Unassessable`, with the refusal as its source.
+    let Error::Unassessable { detail, source } = &why else {
+        panic!("expected Unassessable, got {why:?}");
+    };
+    assert!(detail.contains("pidfd"), "{detail}");
     assert_eq!(
-        super::kill_by_identity(&new_owner, id, nix::sys::signal::Signal::SIGTERM),
-        super::KillOutcome::AlreadyGone
+        source.as_ref().and_then(std::io::Error::raw_os_error),
+        Some(libc::EMFILE),
+        "{why:?}"
     );
+    let new_owner = FakeKernel::over(&HostKernel).on_pidfs_ino(pid, Ok(Some(ino + 1)));
+    let outcome = super::kill_by_identity(&new_owner, id, nix::sys::signal::Signal::SIGTERM);
+    assert!(matches!(outcome, super::KillOutcome::AlreadyGone), "{outcome:?}");
     release(child);
 }
 
@@ -460,11 +467,16 @@ fn release_with_a_signalled_root(who: &str, mut child: std::process::Child, sign
 /// second read, which the row lets through), "the descendant loop's kill re-verifies through
 /// `HostKernel`", "the kill ignores a start time that differs", each in `hard_kill` and in
 /// `terminate`: the descendant is signalled.
+///
+/// A member whose identity cannot be read at kill time is `Unassessable`. `hard_kill` returns it and
+/// warns of nothing; `terminate`, which cannot, warns.
 #[skuld::test]
 fn every_id_walk_re_verifies_a_descendants_kill_through_its_kernel() {
+    crate::log_capture::install();
     for ((name, walk), signo) in id_walks().into_iter().zip([libc::SIGKILL, libc::SIGTERM]) {
         for shows_a_new_owner in [false, true] {
             let (child, root, descendant) = live_member_with_descendant();
+            let mark = crate::log_capture::mark();
             // The `/proc` path: the walk's ids are `starttime` ids.
             let root = ticks_id(root.pid());
             let new_owner = stat_of_a_new_owner(descendant.pid());
@@ -480,10 +492,20 @@ fn every_id_walk_re_verifies_a_descendants_kill_through_its_kernel() {
             let result = walk(&kernel, root);
             // A refused kill leaves the descendant running, so `hard_kill` names it; `terminate` is
             // best effort. A descendant shown as another process is gone, not left behind.
+            let warned: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "treewalk:")
+                .into_iter()
+                .filter(|(level, said)| *level == log::Level::Warn && said.contains(&descendant.pid().to_string()))
+                .collect();
             if name == "hard_kill" && !shows_a_new_owner {
                 assert_not_killed(result, descendant.pid(), &[]);
+                assert_eq!(warned, [], "the error is the report");
             } else {
                 assert!(result.is_ok(), "{name}, new owner {shows_a_new_owner}: {result:?}");
+                assert_eq!(
+                    warned.len(),
+                    usize::from(name == "terminate" && !shows_a_new_owner),
+                    "{name}, new owner {shows_a_new_owner}: {warned:?}"
+                );
             }
             release_with_a_signalled_root(name, child, signo);
         }
