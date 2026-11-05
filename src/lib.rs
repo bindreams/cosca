@@ -32,8 +32,7 @@
 //!   from a by-pid identity read, wait or kill, and from a spawn inside
 //!   [`Error::MayHaveStarted`](error::Error::MayHaveStarted): a spawn reads the identity once the
 //!   child runs. On 6.9+ a by-pid identity read, an open and a spawn need no view; listing a
-//!   process group or the process table, and a start time (`created_at`, the tree walk's order),
-//!   still do. [`ProcessId::current`](identity::ProcessId::current) needs only a readable
+//!   process group or the process table, and a start time (`created_at`), still do. [`ProcessId::current`](identity::ProcessId::current) needs only a readable
 //!   `/proc/self/stat` before 6.9, and on 6.9+ no `/proc` at all.
 //! - The elevation shim (`cosca::init`) runs on Linux. Other platforms have no shim; `init` reports
 //!   that and does not start the program. It needs `/proc` mounted: it reaches cosca's socket through

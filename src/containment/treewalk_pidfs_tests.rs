@@ -1,7 +1,7 @@
 //! The tree walk over `pidfs` ids (and, at the end, `ticks` ids), on a [`FakeKernel`] that states
-//! the table. A process's key
-//! (its start time, from `stat`) and its identity (its pidfd's inode) are different numbers here, so
-//! a wrapper that hands the filter one for the other fails.
+//! the table. A process's identity
+//! (its pidfd's inode) and the start time its `stat` shows are different numbers here, so a wrapper
+//! that hands the filter one for the other fails.
 //!
 //! Rows run on every Linux that has `pidfd_open`; none needs pidfs.
 
@@ -11,7 +11,7 @@ use rustix::io::Errno;
 use rustix::process::Pid;
 
 use crate::error::Error;
-use crate::identity::{FakeKernel, HostKernel, Kernel, Key, OrderKey, ProcessId};
+use crate::identity::{FakeKernel, HostKernel, Kernel, Key, ProcessId};
 use crate::Recursive;
 
 const ROOT: u32 = 4242;
@@ -41,10 +41,12 @@ fn child() -> ProcessId {
 }
 
 /// A kernel in which `ROOT` has inode `ROOT_INO` and `CHILD` (its child) has `CHILD_INO`, each
-/// showing its start time.
+/// showing its start time, and which lists those two pids and no other: a walk through it reaches no
+/// host process, whichever host pids those numbers are.
 fn table() -> FakeKernel<'static> {
     FakeKernel::over(&HostKernel)
         .same_view()
+        .on_pids(Ok(&[ROOT, CHILD]))
         .on_pidfd_open(ROOT, Ok(stand_in()))
         .on_pidfs_ino(ROOT, Ok(Some(ROOT_INO)))
         .on_pidfd_open(CHILD, Ok(stand_in()))
@@ -53,14 +55,15 @@ fn table() -> FakeKernel<'static> {
         .on_read(&format!("{CHILD}/stat"), Ok(&stat(CHILD, ROOT, CHILD_START)))
 }
 
-const EDGES: [(u32, u32); 1] = [(CHILD, ROOT)];
+/// The snapshot: the root has a row, as a live root does.
+const EDGES: [(u32, u32); 2] = [(ROOT, 1), (CHILD, ROOT)];
 
-/// The descendants of `root` as a walk takes them: the anchor's one read, then the walk from its key.
-/// Empty, not an error, for a root that is gone; an error for one that cannot be read.
+/// The members of the walk from `root`, whole subtree. Empty, not an error, for a root that is
+/// gone; an error for one that cannot be read.
 pub(super) fn descendants(kernel: &dyn Kernel, root: ProcessId, edges: &[(u32, u32)]) -> Result<Vec<ProcessId>, Error> {
-    Ok(super::anchor(kernel, root)?
-        .map(|key| super::descendants_from_key(kernel, root, key, edges))
-        .unwrap_or_default())
+    Ok(super::walk_from(kernel, root, edges, Recursive::Yes)?
+        .unwrap_or_default()
+        .members)
 }
 
 /// [`descendants`], one level.
@@ -69,24 +72,24 @@ pub(super) fn children_of(
     parent: ProcessId,
     edges: &[(u32, u32)],
 ) -> Result<Vec<ProcessId>, Error> {
-    Ok(super::anchor(kernel, parent)?
-        .map(|key| super::children_of_from_key(kernel, parent, key, edges))
-        .unwrap_or_default())
+    Ok(super::walk_from(kernel, parent, edges, Recursive::No)?
+        .unwrap_or_default()
+        .members)
 }
 
-/// The resolver hands the filter the child's identity (its inode) and its key (its start time), each
-/// in its place. Mutants: "the id carries the start time", "the key is the inode" (5 orders before
-/// the root's 1000, so the child is dropped).
+/// The resolver hands the filter the child's identity (its inode), and no bound for its children: a
+/// Linux walk orders by nothing. Mutants: "the id carries the start time"; "the resolver hands out
+/// the start time as a bound".
 #[skuld::test]
-fn resolve_or_drop_pairs_a_pidfs_id_with_its_start_time() {
+fn resolve_or_drop_hands_out_a_pidfs_id_and_no_bound() {
     assert_eq!(
-        super::resolve_or_drop(&table(), CHILD, root()),
-        Some((child(), OrderKey::for_test(CHILD_START)))
+        super::resolve_or_drop(&table(), CHILD, root(), None).expect("the child reads"),
+        Some((child(), None))
     );
 }
 
 #[skuld::test]
-fn descendants_and_children_of_keep_the_child_of_a_pidfs_root_by_start_time() {
+fn descendants_and_children_of_keep_the_child_of_a_pidfs_root() {
     assert_eq!(
         descendants(&table(), root(), &EDGES).expect("a readable root"),
         vec![child()]
@@ -97,36 +100,52 @@ fn descendants_and_children_of_keep_the_child_of_a_pidfs_root_by_start_time() {
     );
 }
 
-/// A child that started before the root is a recycled pid or a stale parent, whatever its inode.
-/// Mutant: "the root's key is its inode" (a start time of 500 is below 1000, but above 5).
+/// A child that started before the root, whose `ppid` names the root while the root holds its pid,
+/// is the root's child: the `ppid` read after the root was proved is what counts, and no order of
+/// start times is asked. Mutant: "a Linux walk drops a candidate that started before its parent".
 #[skuld::test]
-fn a_child_that_started_before_a_pidfs_root_is_dropped() {
-    let kernel = table().on_read(&format!("{CHILD}/stat"), Ok(&stat(CHILD, ROOT, 500)));
-    assert!(descendants(&kernel, root(), &EDGES).unwrap().is_empty());
-    assert!(children_of(&kernel, root(), &EDGES).unwrap().is_empty());
+fn a_child_that_started_before_a_pidfs_root_is_still_its_child() {
+    let kernel = table().on_read(&format!("{CHILD}/stat"), Ok(&stat(CHILD, ROOT, ROOT_START - 500)));
+    assert_eq!(descendants(&kernel, root(), &EDGES).unwrap(), vec![child()]);
+    assert_eq!(children_of(&kernel, root(), &EDGES).unwrap(), vec![child()]);
 }
 
-/// A root whose start time is gone from `/proc` while its pidfd still opens (it was reaped between)
-/// has nothing to walk, and that is not an error.
+/// A child whose `stat` names the root but shows no start time is a member, and the walk is
+/// complete: no start time is read, so none is missing. Mutant: "a Linux read requires a start time"
+/// (the child is unassessed, and `children` errs).
 #[skuld::test]
-fn the_walk_of_a_pidfs_root_whose_stat_is_gone_is_empty() {
-    let kernel = table()
+fn a_pidfs_child_whose_stat_shows_no_start_time_is_a_member_of_a_complete_walk() {
+    let kernel = table().on_read(&format!("{CHILD}/stat"), Ok(format!("{CHILD} (x) S {ROOT}").as_bytes()));
+    for depth in [Recursive::Yes, Recursive::No] {
+        let walk = super::walk_from(&kernel, root(), &EDGES, depth)
+            .unwrap()
+            .expect("the root is live");
+        assert_eq!(walk.members, vec![child()], "{depth:?}");
+        assert!(walk.unassessed.is_empty(), "{:?}", walk.unassessed);
+    }
+}
+
+/// A `ticks` root whose `stat`, which proves it, is gone has nothing to walk, and that is not an
+/// error.
+#[skuld::test]
+fn the_walk_of_a_ticks_root_whose_stat_is_gone_is_empty() {
+    let kernel = ticks_table(ROOT_START)
         .on_read(&format!("{ROOT}/stat"), Err(libc::ENOENT))
         .on_signal_probe(Pid::from_raw(ROOT as i32).unwrap(), Err(Errno::SRCH));
-    assert!(descendants(&kernel, root(), &EDGES).unwrap().is_empty());
-    assert!(children_of(&kernel, root(), &EDGES).unwrap().is_empty());
+    assert!(descendants(&kernel, ticks_root(), &EDGES).unwrap().is_empty());
+    assert!(children_of(&kernel, ticks_root(), &EDGES).unwrap().is_empty());
 }
 
-/// A root whose start time cannot be read (`hidepid`) is an error, never an empty walk: an empty one
-/// would let a caller kill the root and leave its descendants running.
+/// A `ticks` root whose `stat` cannot be read (`hidepid`) is an error, never an empty walk: an
+/// empty one would let a caller kill the root and leave its descendants running.
 #[skuld::test]
-fn the_walk_of_a_pidfs_root_whose_stat_cannot_be_read_is_unassessable() {
-    let kernel = table()
+fn the_walk_of_a_ticks_root_whose_stat_cannot_be_read_is_unassessable() {
+    let kernel = ticks_table(ROOT_START)
         .on_read(&format!("{ROOT}/stat"), Err(libc::EACCES))
         .on_signal_probe(Pid::from_raw(ROOT as i32).unwrap(), Ok(()));
     for result in [
-        descendants(&kernel, root(), &EDGES),
-        children_of(&kernel, root(), &EDGES),
+        descendants(&kernel, ticks_root(), &EDGES),
+        children_of(&kernel, ticks_root(), &EDGES),
     ] {
         match result {
             Err(Error::Unassessable { detail, .. }) => {
@@ -154,7 +173,7 @@ fn table_with_a_grandchild() -> FakeKernel<'static> {
         .on_read(&format!("{GRAND}/stat"), Ok(&stat(GRAND, CHILD, GRAND_START)))
 }
 
-const EDGES_WITH_A_GRANDCHILD: [(u32, u32); 2] = [(CHILD, ROOT), (GRAND, CHILD)];
+const EDGES_WITH_A_GRANDCHILD: [(u32, u32); 3] = [(ROOT, 1), (CHILD, ROOT), (GRAND, CHILD)];
 
 /// The child's `ppid` names the root's number, and only the root's number: after the child's read
 /// the number may belong to a process that reaped the root and took it. So the root is proved again
@@ -186,8 +205,8 @@ fn a_grandchild_read_after_its_accepted_parents_number_changed_hands_is_dropped(
     );
 }
 
-/// The parent-order rule is off here: `GRAND` started after the root but before its listed parent
-/// `CHILD`, and is kept, as `descendants_from_key` passes `ORDER_AFTER_PARENT`. Mutant:
+/// The parent-order rule is off here ([`ORDER_AFTER_PARENT`](crate::identity::ORDER_AFTER_PARENT)):
+/// `GRAND` started after the root but before its listed parent `CHILD`, and is kept. Mutant:
 /// `ORDER_AFTER_PARENT` is true off Windows.
 #[skuld::test]
 fn a_grandchild_that_started_before_its_listed_parent_is_kept_off_windows() {
@@ -211,6 +230,39 @@ fn a_child_whose_parent_cannot_be_proved_again_is_dropped() {
     assert!(children_of(&kernel(), root(), &EDGES).unwrap().is_empty());
 }
 
+/// That child is not a gone one: the walk lists it as unassessed, with the parent's proof as the
+/// reason, in both filters. A child whose pid is gone is listed in neither. Mutants: "an `Unknown`
+/// read is dropped as `Gone`"; "a gone read is counted".
+#[skuld::test]
+fn a_child_whose_parent_cannot_be_proved_again_is_unassessed_and_a_gone_child_is_not() {
+    let unproved = || table().on_pidfs_ino_after_read(ROOT, &format!("{CHILD}/stat"), Err(Errno::BADF));
+    let walk = |kernel: &FakeKernel, depth| {
+        super::walk_from(kernel, root(), &EDGES, depth)
+            .unwrap()
+            .expect("the root is live")
+    };
+    let found = walk(&unproved(), Recursive::Yes);
+    let [(pid, Error::Unassessable { detail, .. })] = &found.unassessed[..] else {
+        panic!("expected one Unassessable entry, got {:?}", found.unassessed);
+    };
+    assert_eq!(*pid, CHILD);
+    assert!(
+        detail.contains(&format!("ppid {ROOT} identity could not be read")),
+        "{detail}"
+    );
+    assert!(found.members.is_empty());
+    let children = walk(&unproved(), Recursive::No);
+    assert_eq!(children.unassessed.len(), 1, "{:?}", children.unassessed);
+
+    let gone = table()
+        .on_pidfd_open(CHILD, Err(Errno::SRCH))
+        .on_read(&format!("{CHILD}/stat"), Err(libc::ENOENT));
+    for depth in [Recursive::Yes, Recursive::No] {
+        let found = walk(&gone, depth);
+        assert!(found.members.is_empty() && found.unassessed.is_empty(), "{found:?}");
+    }
+}
+
 /// The warn for that child names the parent whose proof failed, and the child's pid once. Mutant:
 /// "the warn blames the child's pid".
 #[skuld::test]
@@ -218,7 +270,7 @@ fn the_warn_for_a_child_whose_parent_cannot_be_proved_names_the_parent() {
     crate::log_capture::install();
     let kernel = table().on_pidfs_ino_after_read(ROOT, &format!("{CHILD}/stat"), Err(Errno::BADF));
     let mark = crate::log_capture::mark();
-    assert_eq!(super::resolve_or_drop(&kernel, CHILD, root()), None);
+    assert!(super::resolve_or_drop(&kernel, CHILD, root(), None).is_err());
     let warned = crate::log_capture::records_since_on_current_thread(mark, &format!("pid {CHILD}"));
     assert_eq!(warned.len(), 1, "{warned:?}");
     let (level, message) = &warned[0];
@@ -257,55 +309,48 @@ fn on_a_ticks_host_a_child_is_kept_only_while_its_parent_shows_its_ticks() {
     assert!(children_of(&changed_hands, ticks_root(), &EDGES).unwrap().is_empty());
 }
 
-// The root's key read is its proof =====
+// The root's proof is the anchor =====
 
-/// A kernel in which `ROOT` holds its pid until its `stat` is read for its key, and then does not.
-fn root_changes_hands_at_its_key_read() -> FakeKernel<'static> {
-    table().on_pidfs_ino_after_read(ROOT, &format!("{ROOT}/stat"), Ok(Some(ROOT_INO + 1)))
+/// A kernel in which another process holds `ROOT`'s pid when the walk proves it.
+fn root_changed_hands() -> FakeKernel<'static> {
+    table().on_pidfs_ino(ROOT, Ok(Some(ROOT_INO + 1)))
 }
 
-/// A kernel in which `ROOT` holds its pid until its `stat` is read for its key, and then cannot be proved.
-fn root_proof_fails_at_its_key_read() -> FakeKernel<'static> {
-    table().on_pidfs_ino_after_read(ROOT, &format!("{ROOT}/stat"), Err(Errno::BADF))
+/// A kernel in which `ROOT`'s pid cannot be proved.
+fn root_proof_fails() -> FakeKernel<'static> {
+    table().on_pidfs_ino(ROOT, Err(Errno::BADF))
 }
 
-/// A root that held its pid when the walk began and whose key read finds another process there
-/// walks nothing, whatever each entry point read before: the answer is the key read's. Mutants: "the
-/// walk goes on after a `Gone` key read" (`hard_kill` and `terminate` record a walk, as they do
-/// when the key is read after the walk has begun); "the root is signalled". The root's number is
-/// not in the host's table, so a walk that took the presence proof for the whole answer would call
-/// it live and absent from the snapshot.
+/// A root whose pid another process holds when the walk proves it walks nothing, from every entry
+/// point: the answer is the proof's. Mutants: "the walk goes on after a `Gone` proof" (`hard_kill`
+/// and `terminate` record a walk, as they do once the root is proved); "the root is signalled".
 #[skuld::test]
-fn a_root_whose_key_read_finds_another_process_walks_nothing() {
+fn a_root_whose_proof_finds_another_process_walks_nothing() {
     let sends = crate::send_log::Capture::start();
     let walks = super::fault::record_walks();
-    assert!(super::hard_kill(&root_changes_hands_at_its_key_read(), root()).expect("a gone root is Ok"));
-    super::terminate(&root_changes_hands_at_its_key_read(), root()).expect("a gone root is Ok");
+    assert!(super::hard_kill(&root_changed_hands(), root()).expect("a gone root is Ok"));
+    super::terminate(&root_changed_hands(), root()).expect("a gone root is Ok");
     for recursive in [Recursive::No, Recursive::Yes] {
-        let children = root().children_with(&root_changes_hands_at_its_key_read(), recursive);
+        let children = root().children_with(&root_changed_hands(), recursive);
         assert_eq!(children.expect("a gone root is Ok"), vec![], "{recursive:?}");
     }
     assert_eq!(walks.walked(), Vec::<u32>::new(), "no walk began");
     assert!(sends.by_identity().is_empty(), "{:?}", sends.by_identity());
 }
 
-/// A root whose key read cannot be made is an error from every entry point, never an empty walk:
+/// A root whose proof cannot be made is an error from every entry point, never an empty walk:
 /// an empty one would let a caller kill the root and leave its descendants running. Mutants: "an
-/// `Unknown` key read is an empty walk"; "the root is signalled"; "the walk begins before the key
-/// is read" (`hard_kill` and `terminate` record a walk).
+/// `Unknown` proof is an empty walk"; "the root is signalled"; "the walk begins before the root is
+/// proved" (`hard_kill` and `terminate` record a walk).
 #[skuld::test]
-fn a_root_whose_key_read_cannot_be_made_is_unassessable_and_signals_nothing() {
+fn a_root_whose_proof_cannot_be_made_is_unassessable_and_signals_nothing() {
     let sends = crate::send_log::Capture::start();
     let walks = super::fault::record_walks();
     let results = [
-        super::hard_kill(&root_proof_fails_at_its_key_read(), root()).map(|_| ()),
-        super::terminate(&root_proof_fails_at_its_key_read(), root()),
-        root()
-            .children_with(&root_proof_fails_at_its_key_read(), Recursive::No)
-            .map(|_| ()),
-        root()
-            .children_with(&root_proof_fails_at_its_key_read(), Recursive::Yes)
-            .map(|_| ()),
+        super::hard_kill(&root_proof_fails(), root()).map(|_| ()),
+        super::terminate(&root_proof_fails(), root()),
+        root().children_with(&root_proof_fails(), Recursive::No).map(|_| ()),
+        root().children_with(&root_proof_fails(), Recursive::Yes).map(|_| ()),
     ];
     for result in results {
         match result {
@@ -317,35 +362,6 @@ fn a_root_whose_key_read_cannot_be_made_is_unassessable_and_signals_nothing() {
     }
     assert_eq!(walks.walked(), Vec::<u32>::new(), "no walk began");
     assert!(sends.by_identity().is_empty(), "{:?}", sends.by_identity());
-}
-
-/// A root whose pid is not in the snapshot yet was live at its key read is an error from `parent` and
-/// `children`: its row was omitted. The key read is the only look at the root, so a root that exits
-/// after it is not "gone, so no children" (on Windows that would leave its unreparented children
-/// running). The `ticks` root's one `stat` read is the key read; a second read finds it gone. Mutant:
-/// "a root absent from the snapshot is read again".
-#[skuld::test]
-fn a_root_absent_from_the_snapshot_is_unassessable_even_if_it_exits_after_its_key_read() {
-    let kernel = || {
-        FakeKernel::over(&HostKernel)
-            .same_view()
-            .on_read(&format!("{ROOT}/stat"), Ok(&stat(ROOT, 1, ROOT_START)))
-            .on_read_after(&format!("{ROOT}/stat"), 1, Err(libc::ENOENT))
-            .on_signal_probe(Pid::from_raw(ROOT as i32).unwrap(), Err(Errno::SRCH))
-    };
-    let results = [
-        ticks_root().parent_with(&kernel()).map(|_| ()),
-        ticks_root().children_with(&kernel(), Recursive::No).map(|_| ()),
-        ticks_root().children_with(&kernel(), Recursive::Yes).map(|_| ()),
-    ];
-    for result in results {
-        match result {
-            Err(Error::Unassessable { detail, .. }) => {
-                assert!(detail.contains(&format!("pid {ROOT} is live but absent")), "{detail}");
-            }
-            other => panic!("expected Unassessable, got {other:?}"),
-        }
-    }
 }
 
 // The kill goes through the proved pidfd =====
