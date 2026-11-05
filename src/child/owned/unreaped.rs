@@ -16,6 +16,20 @@ use crate::os_process::child_named;
 /// [`leak`](Unreaped::leak), which gives it up. A value dropped otherwise does what `wait` does,
 /// then logs one line naming the child. So the drop blocks: in async code, take the value off the
 /// runtime thread (`spawn_blocking`) or `leak` it.
+///
+/// ```
+/// use cosca::error::Error;
+///
+/// fn settle(error: Error) {
+///     if let Error::MayHaveStarted { unreaped: Some(child), .. } = error {
+///         eprintln!("waiting for pid {:?}", child.pid());
+///         match child.wait() {
+///             Ok(status) => eprintln!("it exited: {status}"),
+///             Err(e) => eprintln!("could not wait for it: {e}"),
+///         }
+///     }
+/// }
+/// ```
 #[derive(Debug)]
 pub struct Unreaped {
     /// `None` once `wait`, `leak` or the drop has taken the child: it is settled once.

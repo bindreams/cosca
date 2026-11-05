@@ -273,6 +273,7 @@ fn the_elevated_program_note_is_for_a_wrapper_elevated_spawn_only() {
             fate,
             wrapper_elevated,
             source: Box::new(Error::Io(std::io::Error::other("cause"))),
+            unreaped: None,
         }
         .to_string()
     };
@@ -283,6 +284,60 @@ fn the_elevated_program_note_is_for_a_wrapper_elevated_spawn_only() {
     for fate in [ChildFate::Running { id: None }, ChildFate::Unknown] {
         assert!(!message(fate, true).contains(note), "{fate:?}");
     }
+}
+
+/// A child over a fake that has exited, so dropping it waits for nothing.
+fn unreaped_child(id: crate::identity::ProcessId) -> Box<crate::child::owned::unreaped::Unreaped> {
+    use crate::os_process::child::ExitRecord;
+    use crate::os_process::fake::{FakeProcess, ReapAnswer};
+
+    let exit = ExitRecord::Status(std::process::ExitStatus::default());
+    let fake = FakeProcess::new([])
+        .with_pid(id.pid())
+        .reaps([ReapAnswer::Reaped(exit)]);
+    let child = crate::child::owned::OwnedChild::new(Box::new(fake));
+    Box::new(crate::child::owned::unreaped::Unreaped::new(child, Some(id)))
+}
+
+/// An error that carries the child reads, prints and matches as the same error without it.
+///
+/// Mutant: `fate` or `Display` looks at `unreaped`.
+#[skuld::test]
+fn an_error_with_an_unreaped_child_still_reports_its_fate_and_message() {
+    let id = crate::identity::ProcessId::current();
+    let fate = ChildFate::Running { id: Some(id) };
+    let error = |unreaped| Error::MayHaveStarted {
+        fate,
+        wrapper_elevated: false,
+        source: Box::new(Error::Io(std::io::Error::other("cause"))),
+        unreaped,
+    };
+    let with_child = error(Some(unreaped_child(id)));
+    assert_eq!(with_child.fate(), Some(fate));
+    assert_eq!(with_child.to_string(), error(None).to_string());
+}
+
+/// A note added to the error keeps the child it carries.
+///
+/// Mutant: `with_note` rebuilds the variant without `unreaped`.
+#[skuld::test]
+fn with_note_keeps_the_unreaped_child() {
+    let id = crate::identity::ProcessId::current();
+    let error = Error::MayHaveStarted {
+        fate: ChildFate::Running { id: Some(id) },
+        wrapper_elevated: false,
+        source: Box::new(Error::Containment { detail: "x".into() }),
+        unreaped: Some(unreaped_child(id)),
+    }
+    .with_note("front left");
+    let Error::MayHaveStarted { source, unreaped, .. } = &error else {
+        panic!("expected MayHaveStarted, got {error:?}");
+    };
+    assert_eq!(unreaped.as_ref().map(|child| child.pid()), Some(Some(id.pid())));
+    assert!(
+        matches!(**source, Error::Containment { ref detail } if detail == "x; front left"),
+        "{source:?}"
+    );
 }
 
 /// A Win32 failure wrapped as `HRESULT_FROM_WIN32` comes back as its Win32 code, as std's own

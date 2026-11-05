@@ -8,6 +8,7 @@
 //! spawn names its answer: [`Classify::not_started`] or [`SpawnFailure::started`].
 
 use crate::error::{ChildFate, Error};
+use crate::Unreaped;
 
 /// A failed spawn's error, and whether the program could have started.
 #[derive(Debug)]
@@ -42,17 +43,20 @@ pub(crate) enum SpawnFailure {
         fate: ChildFate,
         /// Whether the child is an elevation backend (see [`Error::MayHaveStarted`]).
         wrapper_elevated: bool,
+        /// The child, when the spawn hands it to the caller (see [`Error::MayHaveStarted`]).
+        unreaped: Option<Box<Unreaped>>,
     },
 }
 
 impl SpawnFailure {
     /// A failure after which the program may have started, of a child that is not an elevation
-    /// backend.
+    /// backend, and that the spawn does not hand back.
     pub(crate) fn started(cause: Error, fate: ChildFate) -> SpawnFailure {
         SpawnFailure::MayHaveStarted {
             cause,
             fate,
             wrapper_elevated: false,
+            unreaped: None,
         }
     }
 
@@ -71,10 +75,12 @@ impl SpawnFailure {
                 cause,
                 fate,
                 wrapper_elevated,
+                unreaped,
             } => SpawnFailure::MayHaveStarted {
                 cause: f(cause),
                 fate,
                 wrapper_elevated,
+                unreaped,
             },
         }
     }
@@ -83,23 +89,29 @@ impl SpawnFailure {
     /// backend, whose elevated program may outlive its fate (see [`Error::MayHaveStarted`]).
     pub(crate) fn behind_wrapper(self) -> SpawnFailure {
         match self {
-            SpawnFailure::MayHaveStarted { cause, fate, .. } => SpawnFailure::MayHaveStarted {
+            SpawnFailure::MayHaveStarted {
+                cause, fate, unreaped, ..
+            } => SpawnFailure::MayHaveStarted {
                 cause,
                 fate,
                 wrapper_elevated: true,
+                unreaped,
             },
             not_started => not_started,
         }
     }
 
     /// This failure, if it says the program may have started, with the error and fate `f` makes of
-    /// its cause: for an answer that comes after the failure, from a leaf's abandonment.
+    /// its cause: for an answer that comes after the failure, from a leaf's abandonment. A child
+    /// the failure carries stays with it, so `f` must leave a fate that agrees with it:
+    /// `Error::from` asserts so.
     #[cfg(all(feature = "tokio", target_os = "linux"))]
     pub(crate) fn answered_by(self, f: impl FnOnce(Error) -> (Error, ChildFate)) -> SpawnFailure {
         match self {
             SpawnFailure::MayHaveStarted {
                 cause,
                 wrapper_elevated,
+                unreaped,
                 ..
             } => {
                 let (cause, fate) = f(cause);
@@ -107,6 +119,7 @@ impl SpawnFailure {
                     cause,
                     fate,
                     wrapper_elevated,
+                    unreaped,
                 }
             }
             not_started => not_started,
@@ -274,15 +287,23 @@ impl From<SpawnFailure> for Error {
                 cause,
                 fate,
                 wrapper_elevated,
+                unreaped,
             } => {
                 debug_assert!(
                     !matches!(cause, Error::MayHaveStarted { .. }),
                     "a `may have started` failure's cause is itself `may have started`: {cause}"
                 );
+                debug_assert!(
+                    unreaped
+                        .as_ref()
+                        .is_none_or(|child| fate == ChildFate::Running { id: child.id() }),
+                    "a child handed back is `Running` with its identity, got {fate:?}"
+                );
                 Error::MayHaveStarted {
                     fate,
                     wrapper_elevated,
                     source: Box::new(cause),
+                    unreaped,
                 }
             }
         }

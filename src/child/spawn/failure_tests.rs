@@ -75,6 +75,7 @@ fn behind_wrapper_sets_the_flag_alone() {
         fate,
         wrapper_elevated,
         source,
+        ..
     } = &marked
     else {
         panic!("expected MayHaveStarted, got {marked:?}");
@@ -112,6 +113,7 @@ fn after_the_spawn_keeps_the_cause_the_fate_and_the_wrapper_flag() {
             fate,
             wrapper_elevated,
             source,
+            ..
         } = &error
         else {
             panic!("expected MayHaveStarted, got {error:?}");
@@ -123,6 +125,77 @@ fn after_the_spawn_keeps_the_cause_the_fate_and_the_wrapper_flag() {
             "{source:?}"
         );
     }
+}
+
+/// A child over a fake that has exited, so dropping it waits for nothing.
+fn unreaped_child(id: crate::identity::ProcessId) -> Box<crate::child::Unreaped> {
+    use crate::os_process::child::ExitRecord;
+    use crate::os_process::fake::{FakeProcess, ReapAnswer};
+
+    let exit = ExitRecord::Status(std::process::ExitStatus::default());
+    let fake = FakeProcess::new([])
+        .with_pid(id.pid())
+        .reaps([ReapAnswer::Reaped(exit)]);
+    let child = crate::child::owned::OwnedChild::new(Box::new(fake));
+    Box::new(crate::child::Unreaped::new(child, Some(id)))
+}
+
+/// A failure that carries a child keeps it through `map`, `behind_wrapper` and the conversion to
+/// an `Error`; a failure built by `started` carries none.
+///
+/// Mutants: any of the three drops `unreaped`; `started` invents one.
+#[skuld::test]
+fn a_failure_carries_its_unreaped_child_through_map_behind_wrapper_and_from() {
+    let id = crate::identity::ProcessId::current();
+    let failure = SpawnFailure::MayHaveStarted {
+        cause: io("attach"),
+        fate: ChildFate::Running { id: Some(id) },
+        wrapper_elevated: false,
+        unreaped: Some(unreaped_child(id)),
+    };
+    let error = Error::from(failure.map(|_| io("mapped")).behind_wrapper());
+    let Error::MayHaveStarted {
+        unreaped: Some(child),
+        wrapper_elevated: true,
+        ..
+    } = error
+    else {
+        panic!("expected MayHaveStarted around a child, got {error:?}");
+    };
+    assert_eq!(child.pid(), Some(id.pid()));
+    let none = Error::from(SpawnFailure::started(io("attach"), ChildFate::Reaped));
+    assert!(matches!(none, Error::MayHaveStarted { unreaped: None, .. }), "{none:?}");
+}
+
+/// A child is handed back only with the fate `Running` and its own identity: anything else is a
+/// contract breach, and asserts in debug.
+///
+/// Mutant: `From` does not check the fate against the child.
+#[skuld::test]
+#[cfg_attr(debug_assertions, should_panic(expected = "is `Running` with its identity"))]
+fn an_unreaped_child_whose_fate_is_not_running_asserts_in_debug() {
+    let id = crate::identity::ProcessId::current();
+    drop(Error::from(SpawnFailure::MayHaveStarted {
+        cause: io("attach"),
+        fate: ChildFate::Reaped,
+        wrapper_elevated: false,
+        unreaped: Some(unreaped_child(id)),
+    }));
+}
+
+/// As above, for a `Running` fate that names another identity (or none).
+///
+/// Mutant: `From` checks the variant of the fate and not its identity.
+#[skuld::test]
+#[cfg_attr(debug_assertions, should_panic(expected = "is `Running` with its identity"))]
+fn an_unreaped_child_whose_fate_names_another_identity_asserts_in_debug() {
+    let id = crate::identity::ProcessId::current();
+    drop(Error::from(SpawnFailure::MayHaveStarted {
+        cause: io("attach"),
+        fate: ChildFate::Running { id: None },
+        wrapper_elevated: false,
+        unreaped: Some(unreaped_child(id)),
+    }));
 }
 
 #[skuld::test]
@@ -139,8 +212,12 @@ fn map_keeps_the_answer_the_fate_and_the_flag() {
     assert!(
         matches!(
             mapped,
-            SpawnFailure::MayHaveStarted { cause: Error::Io(ref e), fate: ChildFate::Killed, wrapper_elevated: true }
-                if e.to_string() == "b"
+            SpawnFailure::MayHaveStarted {
+                cause: Error::Io(ref e),
+                fate: ChildFate::Killed,
+                wrapper_elevated: true,
+                ..
+            } if e.to_string() == "b"
         ),
         "{mapped:?}"
     );
