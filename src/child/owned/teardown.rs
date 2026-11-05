@@ -13,7 +13,9 @@
 //!   handle that lost its rights), so the teardown never blocks on it: one look at the present
 //!   moment, which collects it if it has exited. The decision is on the observed answer and never on a flag saying elevation was asked for: a
 //!   child that gained privilege on its own (a setuid helper) fails the kill the same way, and a
-//!   blocking wait would hang the drop for ever.
+//!   blocking wait would hang the drop for ever. The exception is a child that a kill sent through
+//!   its containment ([`Reach::reached`]) reached: that kill is asynchronous and ends it, so a look
+//!   would race it, and the reap is the wait the kill bounds.
 //!
 //! # Look
 //!
@@ -47,9 +49,12 @@ pub(crate) enum Disposition {
 
 /// What a teardown does to the child.
 pub(crate) enum TeardownKind<'a> {
-    /// Kill it, then settle it as the module doc says. A child that still runs after a refused kill
-    /// is treated as the disposition says.
-    Kill(Disposition),
+    /// Kill it, then settle it as the module doc says. `tree` says whether a kill already sent
+    /// through the child's containment reached it; `None`: there is no such kill.
+    Kill {
+        disposition: Disposition,
+        tree: Option<&'a dyn Reach>,
+    },
     /// An elevation front: sent nothing, and looked at. The reach says whether a kill sent
     /// elsewhere reached it. `Ok(None)`: there is no such kill, so a running front is always left.
     /// `Err`: the subtree that kill went through could not be read, so whether it reached the front
@@ -135,12 +140,18 @@ impl OwnedChild {
     /// zombie launchd holds.
     pub(crate) fn tear_down(&self, id: Option<ProcessId>, kind: TeardownKind<'_>, due: Option<Due>) -> TeardownOutcome {
         match kind {
-            TeardownKind::Kill(disposition) => self.kill_and_settle(id, disposition, due),
+            TeardownKind::Kill { disposition, tree } => self.kill_and_settle(id, disposition, tree, due),
             TeardownKind::Look(reach) => self.look_at_front(id, reach, due),
         }
     }
 
-    fn kill_and_settle(&self, id: Option<ProcessId>, disposition: Disposition, due: Option<Due>) -> TeardownOutcome {
+    fn kill_and_settle(
+        &self,
+        id: Option<ProcessId>,
+        disposition: Disposition,
+        tree: Option<&dyn Reach>,
+        due: Option<Due>,
+    ) -> TeardownOutcome {
         #[cfg(test)]
         super::seams::note_root_teardown();
         match self.signal(Sig::Kill) {
@@ -158,13 +169,19 @@ impl OwnedChild {
                     Err(unreaped) => self.settle_unreaped(matches!(sent, Sent::Delivered), unreaped),
                 }
             }
-            Err(refused) => self.look_after_refused_kill(id, refused, disposition),
+            Err(refused) => match tree.map(|tree| tree.reached(self)) {
+                // The tree's kill reached it, and is asynchronous: one look would race it. Its exit
+                // follows, so the reap is the wait that kill bounds.
+                Some(Ok(true)) => self.reap_after_tree_kill(),
+                // No tree kill, one that missed the child, or one whose reach cannot be read: nothing
+                // is shown to be ending it.
+                _ => self.look_after_refused_kill(id, refused, disposition),
+            },
         }
     }
 
     /// Reap a child a tree kill has just ended, sending it nothing: the kill bounds the wait.
     /// A failed reap comes back in [`TeardownOutcome::left`], as for [`tear_down`](Self::tear_down).
-    #[cfg(unix)]
     pub(crate) fn reap_after_tree_kill(&self) -> TeardownOutcome {
         #[cfg(test)]
         crate::child::spawn::fault::run_between_kill_and_wait();

@@ -265,7 +265,14 @@ fn a_pidless_linux_child_is_signalled_and_reaped_through_its_pidfd() {
     drop(child);
     let owned = crate::child::owned::OwnedChild::new(Box::new(LinuxProcess::new(None, pidfd)));
     assert_eq!(owned.pid(), None);
-    let torn = owned.tear_down(None, TeardownKind::Kill(Disposition::Leave), None);
+    let torn = owned.tear_down(
+        None,
+        TeardownKind::Kill {
+            disposition: Disposition::Leave,
+            tree: None,
+        },
+        None,
+    );
     assert_eq!(torn.fate, ChildFate::Reaped, "{torn:?}");
     assert_eq!(torn.left, None);
 }

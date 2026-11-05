@@ -1081,6 +1081,25 @@ pub(crate) enum RootIdentity {
     Unknown,
 }
 
+/// Whether the tree kill of this mechanism reached the child. Only a cgroup leaf's `cgroup.kill` is
+/// shown to, whatever the child's credentials: its flag says the write landed, then where the child
+/// is says it was in the leaf. A signal to a group or to walked members is subject to the kernel's
+/// permission check, as the child's own kill is, so it reaches nothing that kill does not.
+#[cfg(unix)]
+impl crate::child::owned::teardown::Reach for Attached {
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(unused_variables, reason = "only a Linux cgroup reads it")
+    )]
+    fn reached(&self, child: &crate::child::owned::OwnedChild) -> std::io::Result<bool> {
+        #[cfg(target_os = "linux")]
+        if let Attached::Cgroup(leaf) = self {
+            return leaf.subtree()?.reached(child);
+        }
+        Ok(false)
+    }
+}
+
 /// Which Unix setup action to apply to a root `Command` for a given mode.
 /// Pure function: used by `prepare` and unit-tested separately to verify
 /// mutual exclusivity: Session → setsid only; Strongest/default → pgroup

@@ -1110,9 +1110,14 @@ impl Child {
                 };
                 left.push(format!("contained-tree teardown did not fully succeed: {e}{orphaned}"));
             }
-            let torn = self
-                .proc
-                .tear_down(Some(self.id), TeardownKind::Kill(disposition), None);
+            let torn = self.proc.tear_down(
+                Some(self.id),
+                TeardownKind::Kill {
+                    disposition,
+                    tree: None,
+                },
+                None,
+            );
             left.extend(torn.left);
             if !left.is_empty() {
                 log::warn!("{label}: {}", left.join("; "));
@@ -1134,6 +1139,7 @@ impl Child {
     /// unreaped root stays a zombie, pinning its number, until `tear_down`.
     fn drop_unix(&mut self, label: &'static str, disposition: Disposition) -> crate::error::ChildFate {
         use crate::child::drop_report::DropReport;
+        use crate::child::owned::teardown::Reach;
         use crate::error::ChildFate;
 
         // A live elevation front gets no signal of its own: outside a cgroup it is left running,
@@ -1194,8 +1200,11 @@ impl Child {
                     Err(e) => self.tear_down_leaf_and_look_at_front(&e),
                 }
             } else {
+                // The tree kill above may have reached the root: if the root's own kill is refused,
+                // that kill is what ends it.
+                let tree = kill.result.is_ok().then_some(&self.attached as &dyn Reach);
                 self.proc
-                    .tear_down(Some(self.id), TeardownKind::Kill(disposition), None)
+                    .tear_down(Some(self.id), TeardownKind::Kill { disposition, tree }, None)
             };
             report.left.extend(torn.left);
             torn.fate

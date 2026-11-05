@@ -174,6 +174,7 @@ mod in_a_cgroup {
     use crate::child::owned::teardown::Disposition;
     use crate::child::Child;
     use crate::error::ChildFate;
+    use crate::identity::Liveness;
     use crate::test_child::HandedBack;
     use crate::test_groups::{cgroup, Group};
     use crate::{Command, ContainMode, Containment};
@@ -210,6 +211,47 @@ mod in_a_cgroup {
         handed_back.unreaped();
         assert!(!Path::new(&leaf).exists(), "the leaf {leaf} was removed by the call");
         handed_back.wait();
+    }
+
+    /// A root whose own kill is refused, and which the leaf's `cgroup.kill` ends, is waited for and
+    /// reaped: that kill is asynchronous, so a look at the present moment races it. Nothing is
+    /// handed back or warned of. The refusal is scripted over the real child in its real leaf.
+    ///
+    /// Mutant: the refused kill is followed by one look, which finds the child still dying.
+    #[skuld::test]
+    fn a_refused_kill_of_a_child_the_leaf_killed_is_reaped_not_handed_back(#[fixture(cgroup)] _group: &Group) {
+        crate::log_capture::install();
+        let (mut child, stdin) = blocker_in_a_leaf();
+        let id = child.id();
+        refuse_the_kill(&mut child);
+        let mark = crate::log_capture::mark();
+
+        let (fate, unreaped) = child.tear_down_or_hand_back(Disposition::HandBack);
+
+        assert_eq!(fate, ChildFate::Reaped);
+        assert!(unreaped.is_none(), "{unreaped:?}");
+        assert_eq!(id.is_alive(), Liveness::Dead, "the root was reaped");
+        assert_eq!(warns_since(mark), Vec::<String>::new());
+        drop(stdin);
+    }
+
+    /// The same child dropped: its refused kill is not "leaving it running", and the root is reaped,
+    /// not left a zombie behind the leaf's kill.
+    ///
+    /// Mutant: the drop's look races the leaf's kill, warns, and leaves the zombie.
+    #[skuld::test]
+    fn dropping_a_child_whose_kill_is_refused_but_whose_leaf_killed_it_reaps_it(#[fixture(cgroup)] _group: &Group) {
+        crate::log_capture::install();
+        let (mut child, stdin) = blocker_in_a_leaf();
+        let id = child.id();
+        refuse_the_kill(&mut child);
+        let mark = crate::log_capture::mark();
+
+        drop(child);
+
+        assert_eq!(id.is_alive(), Liveness::Dead, "the root was reaped");
+        assert_eq!(warns_since(mark), Vec::<String>::new());
+        drop(stdin);
     }
 
     /// A leaf whose `cgroup.kill` fails is given up and logged, and the call returns with the child

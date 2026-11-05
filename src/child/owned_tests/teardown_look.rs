@@ -15,20 +15,20 @@ use crate::os_process::fake::{Answer, FakeProcess, ReapAnswer};
 use crate::wait::teardown_warn::Due;
 
 /// A [`Reach`] with a stated answer, and the pids of the children it was asked about.
-struct FakeReach {
+pub(super) struct FakeReach {
     answer: Result<bool, io::ErrorKind>,
     asked: RefCell<Vec<Option<u32>>>,
 }
 
 impl FakeReach {
-    fn answering(answer: Result<bool, io::ErrorKind>) -> Self {
+    pub(super) fn answering(answer: Result<bool, io::ErrorKind>) -> Self {
         Self {
             answer,
             asked: RefCell::default(),
         }
     }
 
-    fn asked(&self) -> Vec<Option<u32>> {
+    pub(super) fn asked(&self) -> Vec<Option<u32>> {
         self.asked.borrow().clone()
     }
 }
