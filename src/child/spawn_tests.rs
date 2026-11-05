@@ -1560,3 +1560,45 @@ fn an_unfolded_diagnosis_is_logged_on_drop_but_not_while_unwinding() {
         "diagnosis 9b7a, dropped unwinding"
     ));
 }
+
+// The spawn's identity read =====
+
+/// A spawn whose child is reaped behind its back, and its pid reused by a stranger whose start
+/// token is the child's own (a same-tick reuse), before the identity read. The read finds the
+/// look-alike, so only the peek through the child's own pidfd shows it is not the child: `Gone`.
+///
+/// Mutant: `resolve_identity` skips the peek through the handle.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn resolve_identity_of_a_reaped_child_whose_pid_a_same_tick_reuser_holds_is_gone() {
+    use rustix::process::{pidfd_open, waitid, Pid, PidfdFlags, WaitId, WaitIdOptions};
+
+    use crate::identity::stat_parse::stat_fixture;
+    use crate::identity::{FakeKernel, HostKernel, ProcessId, Resolved};
+    use crate::wait::exit_only::Target;
+
+    let mut child = crate::test_spawn::spawn(&mut crate::test_child::held_std_blocker(std::process::Stdio::null()))
+        .expect("spawn the child");
+    let pid = child.id();
+    let raw = Pid::from_raw(pid as i32).expect("a child's pid is nonzero");
+    let pidfd = pidfd_open(raw, PidfdFlags::empty()).expect("pidfd_open the child");
+    let Resolved::Found(id) = ProcessId::of(pid) else {
+        panic!("the child must be readable before it is reaped")
+    };
+
+    drop(child.stdin.take());
+    crate::test_child::pid_reuse::wait_pollin(std::os::fd::AsFd::as_fd(&pidfd));
+    let reaped = waitid(WaitId::Pid(raw), WaitIdOptions::EXITED).expect("raw reap");
+    assert!(reaped.is_some(), "the raw reap must consume an exit record");
+    child.wait().expect_err("the raw reap took the exit record");
+
+    let look_alike = stat_fixture("S", id.start_token_raw());
+    let kernel = FakeKernel::over(&HostKernel)
+        .same_view()
+        .on_read(&format!("{pid}/stat"), Ok(&look_alike));
+    let (read, _, _) = super::resolve_identity(&kernel, pid, &Target::PidFd(std::os::fd::AsFd::as_fd(&pidfd)));
+    assert!(
+        matches!(read, Resolved::Gone),
+        "a look-alike with the child's token is not the child: {read:?}"
+    );
+}
