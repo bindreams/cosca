@@ -8,6 +8,10 @@ use std::path::PathBuf;
 use super::*;
 
 #[cfg(target_os = "linux")]
+use crate::child::owned::teardown::{Expect, Left, PidfdTeardown};
+#[cfg(target_os = "linux")]
+use crate::child::spawn::held_teardown::tear_down_pidfd;
+#[cfg(target_os = "linux")]
 use std::fs::{self, File};
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -922,8 +926,14 @@ impl CgroupLeaf {
         self.procs_fd = None;
         // Before the verdict — a spawn that failed, maybe after its fork — end the exchange.
         if self.report.is_some() {
-            if let Abandoned::OutOfReach(why) = self.abandon_before_verdict(false, None, warn) {
-                log::warn!("cgroup v2: {why}");
+            match self.abandon_before_verdict(false, None, warn) {
+                Abandoned::OutOfReach(why) => log::warn!("cgroup v2: {why}"),
+                Abandoned::Uncollected(left) => left.warn(&format!(
+                    "{}: {}",
+                    crate::containment::dispatch::TeardownCaller::FailedSpawn.label(),
+                    left.clause
+                )),
+                Abandoned::Ended | Abandoned::MaybeUnreaped | Abandoned::Front(_) => {}
             }
         }
         if std::mem::replace(&mut self.abandoned, true) {
@@ -1033,9 +1043,31 @@ pub(crate) enum Abandoned {
     /// The child may be running, and cosca could not kill it: it has no pidfd or refused the
     /// signal, and its leaf does not hold it. Says which, for the caller's one warn.
     OutOfReach(String),
+    /// The child never named itself, and the handshake's pidfd reached it, but its teardown left it
+    /// uncollected (its kill refused and it running, a wait or look that failed). Says what the
+    /// teardown found: its clause, for the caller's one warn, which the failed spawn's label leads,
+    /// and what its warn asserts, for the caller to log through [`Left::warn`].
+    Uncollected(Left),
     /// The child is an elevation front, which was sent no signal of its own (see
     /// [`CgroupLeaf::abandon_before_verdict`]), and this is what became of it.
     Front(crate::child::spawn::FrontFate),
+}
+
+#[cfg(target_os = "linux")]
+impl Abandoned {
+    /// The answer for a child that never named itself, torn down through the handshake's pidfd as
+    /// `torn` says. A child the teardown collected is `Ended`, and the teardown's clause is said as
+    /// a failed spawn's. One it left uncollected is [`Uncollected`](Abandoned::Uncollected), with the
+    /// clause as the one warn the caller logs, and the teardown's verdict.
+    fn after_pidless_teardown(torn: PidfdTeardown) -> Abandoned {
+        match torn.uncollected() {
+            Ok(left) => Abandoned::Uncollected(left),
+            Err(collected) => {
+                collected.say_as_failed_spawn(&mut crate::child::spawn::Diagnosis::default());
+                Abandoned::Ended
+            }
+        }
+    }
 }
 
 /// What became of the child itself when its spawn was abandoned.
@@ -1076,7 +1108,7 @@ impl CgroupLeaf {
     pub(crate) fn abandon_before_verdict(
         &mut self,
         front: bool,
-        handshake: Option<OwnedFd>,
+        handshake: Option<(OwnedFd, Expect)>,
         warn: &mut dyn TeardownWarn,
     ) -> Abandoned {
         let Some(channel) = self.report.take() else {
@@ -1086,17 +1118,26 @@ impl CgroupLeaf {
         self.abandoned = true;
         let mut received = channel.shut();
         self.entered = received.placement() == PlacementReport::Placed;
-        // The handshake's pidfd names the child where its intent named it by no handle.
+        // The handshake's pidfd names the child where its intent named it by no handle, and the
+        // handshake says what it expects of a teardown through it.
+        let mut handed = None;
         if received.pidfd.is_none() && received.proc_dir.is_none() {
-            received.pidfd = handshake;
+            if let Some((pidfd, expect)) = handshake {
+                received.pidfd = Some(pidfd);
+                handed = Some(expect);
+            }
         }
-        // A child that never named itself never reached the point where it could run the program:
-        // it is no front, and the handshake's pidfd alone can reap it.
+        // A child that never named itself is no front, and a pidfd alone can reap it. Whether it
+        // ran the program is the handshake's to say, with its pidfd's `Expect`; the child's own
+        // intent pidfd (`handed` is `None`) establishes neither that nor that no look failed:
+        // anything stands.
         if received.pid.is_none() {
             if let Some(pidfd) = received.pidfd.take() {
                 self.remove_holding_nothing();
-                crate::child::spawn::teardown_through_pidfd(None, pidfd, None, slow_drain::Through(warn));
-                return Abandoned::Ended;
+                // No pid, no identity, no tree kill: killed through the pidfd, and left if refused.
+                let expect = handed.unwrap_or(Expect::Anything);
+                let torn = tear_down_pidfd(None, pidfd, None, expect, warn.due());
+                return Abandoned::after_pidless_teardown(torn);
             }
         }
         // Only a child that reported goes on to `exec`: one that named itself and sent no report
@@ -2019,6 +2060,10 @@ mod end_front_tests;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "leaf/end_child_tests.rs"]
 mod end_child_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "leaf/pidless_tests.rs"]
+mod pidless_tests;
 
 #[cfg(test)]
 #[path = "leaf_tests.rs"]

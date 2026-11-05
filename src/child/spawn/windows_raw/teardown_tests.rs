@@ -14,7 +14,8 @@ use windows::Win32::System::Threading::{
 
 use super::proc::create_process;
 use super::teardown_spawned;
-use crate::child::owned::teardown::{Disposition, TeardownKind};
+use crate::child::lifecycle::Wording;
+use crate::child::owned::teardown::{Disposition, Kill};
 use crate::child::owned::{ChildWaitOutcome, OwnedChild};
 use crate::error::ChildFate;
 use crate::identity::ProcessId;
@@ -249,6 +250,13 @@ fn raw_spawn_teardown_with_a_denied_terminate_is_running_and_does_not_wait() {
         .filter(|(level, _)| *level <= log::Level::Warn)
         .collect::<Vec<_>>();
     assert_eq!(warned.len(), 1, "one warn for one refusal: {warned:?}");
+    assert!(
+        warned[0].1.starts_with(&format!(
+            "teardown after a failed spawn: child {} could not be terminated",
+            owner.pid
+        )),
+        "{warned:?}"
+    );
 }
 
 /// A failed spawn's teardown whose kill fails on a child that has exited collects it from the look
@@ -286,6 +294,8 @@ fn raw_spawn_teardown_with_a_failed_terminate_of_an_exited_child_is_reaped_silen
 fn raw_spawn_teardown_with_a_delivered_terminate_and_a_failed_wait_is_killed() {
     let owner = Suspended::spawn();
     let (child, fake) = owned(real(owner.duplicate(), owner.pid).reaps([ReapAnswer::Err(KIND)]));
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
     let fate = teardown_spawned(&child, owner.pid, None, None);
     assert_eq!(fate, ChildFate::Killed);
     assert_eq!(fake.looks(), 1, "the teardown made the wait that failed");
@@ -293,6 +303,20 @@ fn raw_spawn_teardown_with_a_delivered_terminate_and_a_failed_wait_is_killed() {
         owner.wait_for_exit().code(),
         Some(1),
         "the teardown's kill must have ended it"
+    );
+    // Said as every teardown says a failed wait, under the failed spawn's name.
+    let warns = crate::log_capture::records_since_on_current_thread(mark, &owner.pid.to_string());
+    assert_eq!(
+        warns,
+        [(
+            log::Level::Warn,
+            format!(
+                "teardown after a failed spawn: teardown of child {}: the wait failed: {}{}",
+                owner.pid,
+                crate::child::owned::owned_tests::teardown_lines::wait_error(),
+                crate::child::owned::owned_tests::teardown_lines::LEFT
+            )
+        )]
     );
 }
 
@@ -315,14 +339,17 @@ fn a_kill_teardown_of_a_child_waits_for_the_exit_it_started() {
     let _end = crate::wait::block_probe::on_blocking(owner.end_with_code_zero());
     let torn = handle.tear_down(
         Some(owner.id()),
-        TeardownKind::Kill {
+        Kill {
             disposition: Disposition::Leave,
             tree: None,
         },
         None,
     );
-    assert_eq!(torn.fate, ChildFate::Reaped, "{torn:?}");
-    assert!(torn.left.is_none(), "{torn:?}");
+    assert_eq!(torn.fate(), ChildFate::Reaped, "{torn:?}");
+    assert!(
+        matches!(torn.said(), Some(Wording::Collected(log::Level::Debug, _))),
+        "{torn:?}"
+    );
     assert!(handle.is_reaped(), "teardown must wait for the exit it started");
     let outcome = handle.wait(None).expect("wait after teardown");
     let ChildWaitOutcome::Exited(ExitRecord::Status(status)) = outcome else {
@@ -355,17 +382,15 @@ fn a_kill_teardown_never_blocks_on_a_handle_without_terminate() {
     let _end = crate::wait::block_probe::on_blocking(owner.end_with_code_zero());
     let torn = handle.tear_down(
         Some(id),
-        TeardownKind::Kill {
+        Kill {
             disposition: Disposition::Leave,
             tree: None,
         },
         None,
     );
-    assert_eq!(torn.fate, ChildFate::Running { id: Some(id) }, "{torn:?}");
+    assert_eq!(torn.fate(), ChildFate::Running { id: Some(id) }, "{torn:?}");
     assert!(
-        torn.left
-            .as_deref()
-            .is_some_and(|text| text.contains(&owner.pid.to_string())),
+        matches!(torn.said(), Some(Wording::Uncollected(text)) if text.contains(&owner.pid.to_string())),
         "{torn:?}"
     );
     assert_eq!(fake.looks(), 1, "teardown looked once and did not wait");
@@ -397,14 +422,17 @@ fn teardown_of_a_handle_without_terminate_to_an_exited_child_reaps_it() {
     owner.wait_for_exit();
     let torn = handle.tear_down(
         Some(owner.id()),
-        TeardownKind::Kill {
+        Kill {
             disposition: Disposition::Leave,
             tree: None,
         },
         None,
     );
-    assert_eq!(torn.fate, ChildFate::Reaped, "{torn:?}");
-    assert!(torn.left.is_none(), "{torn:?}");
+    assert_eq!(torn.fate(), ChildFate::Reaped, "{torn:?}");
+    assert!(
+        matches!(torn.said(), Some(Wording::Collected(log::Level::Debug, _))),
+        "{torn:?}"
+    );
 }
 
 /// A child whose exit is under way but not signalled yet, on a handle that holds
@@ -419,14 +447,17 @@ fn teardown_of_an_exiting_unsignalled_child_reaps_it() {
     crate::identity::windows_fault::refuse_next_terminate_as_exiting();
     let torn = handle.tear_down(
         Some(owner.id()),
-        TeardownKind::Kill {
+        Kill {
             disposition: Disposition::Leave,
             tree: None,
         },
         None,
     );
-    assert_eq!(torn.fate, ChildFate::Reaped, "{torn:?}");
-    assert!(torn.left.is_none(), "{torn:?}");
+    assert_eq!(torn.fate(), ChildFate::Reaped, "{torn:?}");
+    assert!(
+        matches!(torn.said(), Some(Wording::Collected(log::Level::Debug, _))),
+        "{torn:?}"
+    );
 }
 
 /// The kill delivered nothing (the exit was under way), so, as on every OS, a failed wait shows
@@ -441,12 +472,12 @@ fn teardown_of_an_exiting_child_with_a_failed_wait_is_unknown() {
     crate::identity::windows_fault::refuse_next_terminate_as_exiting();
     let torn = handle.tear_down(
         Some(owner.id()),
-        TeardownKind::Kill {
+        Kill {
             disposition: Disposition::Leave,
             tree: None,
         },
         None,
     );
-    assert_eq!(torn.fate, ChildFate::Unknown, "{torn:?}");
+    assert_eq!(torn.fate(), ChildFate::Unknown, "{torn:?}");
     assert_eq!(fake.looks(), 1, "the teardown made the wait that failed");
 }

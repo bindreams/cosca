@@ -1263,7 +1263,7 @@ fn group_leading_cat_with_pidfd() -> (std::process::Child, OwnedFd) {
 
 /// A child tokio dropped after it ran the program, whose kill is refused (as a setuid-root child
 /// refuses it), is left running and warned of, and the spawn's fate says it runs. The teardown is the
-/// caller's `Leave`: the handshake hands nothing back and starts no thread.
+/// caller's `Leave`: the handshake hands nothing back.
 ///
 /// Mutant: a refused kill reports the child reaped, or drops the warn.
 #[skuld::test]
@@ -1316,7 +1316,7 @@ fn a_dropped_front_is_left_and_noted() {
     );
     let text = err.to_string();
     assert!(text.contains("the spawned child is what sudo left"), "{text}");
-    assert!(text.contains("it is left unreaped"), "{text}");
+    assert!(text.contains("; left unreaped"), "{text}");
     drop(cat.stdin.take());
     assert!(cat.wait().expect("wait").success(), "the front was signalled");
 }
@@ -1554,12 +1554,42 @@ fn a_front_left_to_its_leaf_keeps_its_pidfd_and_is_sent_nothing() {
         ChildFate::Unknown,
         "the leaf's abandonment answers, not the handshake"
     );
-    let stashed = left.take().expect("the pidfd is left for the leaf");
+    let (stashed, expect) = left.take().expect("the pidfd is left for the leaf");
     assert_eq!(stashed.as_raw_fd(), raw, "the pidfd it was given");
+    // The peek of the running front succeeded, so a wait on its pidfd is expected to.
+    assert_eq!(expect, crate::child::owned::teardown::Expect::Waited);
     // Not signalled and not waited on: closing its stdin ends it with status 0, and it was not
     // reaped before this wait.
     drop(cat.stdin.take());
     assert!(cat.wait().expect("wait").success(), "the front was signalled");
+}
+
+/// A child the leaf holds without a front is torn down by the handshake through the original pidfd,
+/// and the leaf gets a copy: the handshake's wait may have failed, so the copy's teardown may come
+/// to anything, whatever the peek of the original said.
+///
+/// Mutant: the copy carries the original's expectation (`Waited` after a successful peek).
+#[skuld::test]
+fn the_leafs_copy_of_a_pidfd_the_handshake_ends_through_expects_anything() {
+    let (mut cat, pidfd) = cat_with_pidfd();
+    let left: super::LeftPidfd = Rc::new(Cell::new(None));
+    let (_, fate) = super::conclude(
+        Err::<NoChild, _>(std::io::Error::other("tokio failed")),
+        Outcome::Opened(pidfd),
+        super::LeftFront::LeafHeld(Rc::clone(&left)),
+        None,
+    )
+    .err()
+    .expect("the spawn fails")
+    .expect_may_have_started_with();
+    assert_eq!(
+        fate,
+        ChildFate::Reaped,
+        "the handshake ended the child through the original"
+    );
+    let (_copy, expect) = left.take().expect("the leaf holds a copy");
+    assert_eq!(expect, crate::child::owned::teardown::Expect::Anything);
+    drop(cat.stdin.take());
 }
 
 /// Only a child told to go can run the program, so every arm of `conclude` but one answers that it
@@ -1727,4 +1757,35 @@ fn conclude_answers_every_remaining_pair() {
     .expect("the spawn fails")
     .expect_not_started();
     assert!(matches!(&error, Error::Io(e) if e.to_string() == "helper"), "{error:?}");
+}
+
+/// A child the failed spawn's teardown ends through its pidfd is said reaped under the spawn
+/// teardown's name, at `debug`: every line of a teardown names its caller.
+///
+/// Mutant: the teardown's debug clause is logged with no label, or under a drop's.
+#[skuld::test]
+fn a_child_ended_through_its_pidfd_is_said_reaped_under_the_failed_spawns_name() {
+    crate::log_capture::install();
+    let (cat, pidfd) = cat_with_pidfd();
+    let pid = cat.id();
+    let mark = crate::log_capture::mark();
+
+    let fate = super::end_through_pidfd(
+        Some(pid),
+        pidfd,
+        super::Expect::Waited,
+        None,
+        &mut crate::child::spawn::Diagnosis::default(),
+    )
+    .fate;
+
+    assert_eq!(fate, ChildFate::Reaped);
+    assert_eq!(
+        crate::log_capture::records_since_on_current_thread(mark, ""),
+        [(
+            log::Level::Debug,
+            format!("teardown after a failed spawn: teardown of child {pid}: reaped it after the kill")
+        )]
+    );
+    drop(cat);
 }
