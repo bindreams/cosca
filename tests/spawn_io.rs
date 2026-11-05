@@ -343,7 +343,8 @@ fn commandline_round_trips_through_split_or_passthrough() {
     // the first token (the args-only raw_arg fix — a duplicated program token
     // would make the child print the wrong argv or error).
     let line = format!(r#""{}" echo-argv hello"#, testbin());
-    let s = cosca::run_line(line).read().expect("read");
+    // The free function under test builds the command, so the factory cannot: no window by hand.
+    let s = cosca::run_line(line).no_window().read().expect("read");
     assert_eq!(s, "hello\n");
 }
 
@@ -695,7 +696,10 @@ fn linux_cgroup_v2_contain_with_fd3_does_not_clobber_cgroup_procs_fd(#[fixture(c
 
 #[skuld::test]
 fn run_free_fn_builds_command_from_args() {
-    let s = cosca::run([testbin(), "echo-argv", "world"]).read().expect("read");
+    let s = cosca::run([testbin(), "echo-argv", "world"])
+        .no_window()
+        .read()
+        .expect("read");
     assert_eq!(s, "world\n");
 }
 

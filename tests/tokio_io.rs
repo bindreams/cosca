@@ -240,6 +240,7 @@ async fn async_chained_merge_is_unsupported() {
 async fn async_run_builds_command_from_args() {
     // `run([...])` derives the program from the first arg (mirrors the sync run free fn).
     let s = cosca::tokio::run([common::testbin(), "echo-argv", "world"])
+        .no_window()
         .read()
         .await
         .expect("read");
@@ -252,7 +253,7 @@ async fn async_run_line_round_trips() {
     // `run_line(line)` routes through `.commandline()`: POSIX splits via shlex, Windows passes the
     // line through and derives the program from the first token (mirrors the sync round-trip test).
     let line = format!(r#""{}" echo-argv hello"#, common::testbin());
-    let s = cosca::tokio::run_line(line).read().await.expect("read");
+    let s = cosca::tokio::run_line(line).no_window().read().await.expect("read");
     assert_eq!(s, "hello\n");
 }
 
