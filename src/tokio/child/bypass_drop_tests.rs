@@ -7,7 +7,7 @@
 //! then finds gone.
 
 use crate::os_process::child::{Foreign, PeekOutcome};
-use crate::tokio::Command;
+use crate::test_child::Console;
 use crate::wait::exit_only::seams::{force_peek_once, force_peeks};
 
 /// Watches one child from outside cosca and reaps it on the test's behalf.
@@ -99,7 +99,7 @@ impl Witness {
 /// A child that has exited and is not reaped, and the witness of it.
 fn exited_unreaped(kill_on_drop: bool) -> (crate::tokio::Child, Witness) {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
     cmd.kill_on_drop(kill_on_drop);
@@ -189,7 +189,7 @@ fn reap_now_after_a_refused_kill(evidence: fn() -> Box<dyn std::any::Any>) {
     let backend_drops = super::fault::count_backend_drops();
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(crate::stdio::Stdio::null()).expect("stdin");
 
@@ -329,7 +329,7 @@ async fn a_panicking_logger_in_the_tree_teardown_warn_does_not_reap_the_child_by
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let (stdin, writer) = crate::test_child::held_writer_stdin();
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
     cmd.contain_with(crate::ContainMode::Session);
@@ -362,7 +362,7 @@ async fn a_panicking_refused_kill_warn_in_drop_does_not_strand_or_reap_by_pid() 
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let (stdin, writer) = crate::test_child::held_writer_stdin();
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
     cmd.kill_on_drop(true);
@@ -394,7 +394,7 @@ async fn an_unwind_out_of_drop_closes_the_untaken_stdin_pipe() {
     crate::tokio::test_runtime::assert_current_thread();
     use std::os::fd::AsRawFd;
     crate::log_capture::install();
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(crate::stdio::Stdio::pipe_in()).expect("set stdin");
     cmd.kill_on_drop(true);
@@ -463,7 +463,7 @@ async fn a_failed_identity_peek_is_unknown_kills_the_child_and_forgets_the_tokio
     let mark = crate::log_capture::mark();
     // Released after the kill: a kill that sent nothing exits 0.
     let (stdin, reaps) = crate::child::spawn::fault::teardown_blocker_stdin();
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("stdin");
 
@@ -550,7 +550,7 @@ fn refused_kill_teardown(attach_failure: bool, armed_in_hook: Option<fn() -> Box
     let mark = crate::log_capture::mark();
     // Released once the pidfd teardown's (landing) kill returned.
     let (stdin, reaps) = fault::teardown_blocker_stdin();
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("stdin");
 

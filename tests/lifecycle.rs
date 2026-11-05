@@ -2,8 +2,6 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::time::{Duration, Instant};
 
-use cosca::Command;
-
 #[path = "common/mod.rs"]
 mod common;
 use common::{spawn_control, testbin};
@@ -110,7 +108,7 @@ fn child_is_send_and_sync() {
 
 #[skuld::test]
 fn tree_ops_on_uncontained_child_are_unsupported() {
-    let mut cmd = Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     cmd.executable(testbin()).args(["cosca_testbin", "exit", "0"]);
     let child = cmd.spawn().expect("spawn");
     assert_eq!(child.containment(), cosca::Containment::None);
@@ -133,7 +131,7 @@ fn nested_member_kill_tree_is_unsupported_end_to_end() {
     // marker-propagation regression degrading nested -> None (also Unsupported) is caught.
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap().to_string();
-    let mut cmd = Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     cmd.executable(testbin())
         .args(["cosca_testbin", "report-nested-kill-tree", &addr])
         .env(common::ACK_ENV, "1");

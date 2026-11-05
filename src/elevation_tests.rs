@@ -305,6 +305,7 @@ fn non_permission_kill_error_stays_io_even_when_elevated() {
 fn the_shared_argv_gate_refuses_each_rule_with_the_backends_words() {
     use crate::command::Command;
     use crate::error::Error;
+    use crate::test_child::Console;
     const WORDS: super::ArgvRefusals = super::ArgvRefusals {
         platform: "test",
         op_prefix: "test elevation",
@@ -328,20 +329,20 @@ fn the_shared_argv_gate_refuses_each_rule_with_the_backends_words() {
         }),
     ];
     for (name, set) in setters {
-        let mut matching = Command::new();
+        let mut matching = crate::test_child::command(Console::Hidden);
         matching.args(["/usr/bin/id", "-u"]);
-        let mut distinct = Command::new();
+        let mut distinct = crate::test_child::command(Console::Hidden);
         distinct.args(["not-id"]);
-        let mut line = Command::new();
+        let mut line = crate::test_child::command(Console::Hidden);
         line.commandline("id -u");
-        let mut empty_argv = Command::new();
+        let mut empty_argv = crate::test_child::command(Console::Hidden);
         empty_argv.args::<[&str; 0], &str>([]);
         for (what, mut c) in [
             ("argv[0] == program", matching),
             ("argv[0] != program", distinct),
             ("commandline()", line),
             ("an empty argv", empty_argv),
-            ("no input", Command::new()),
+            ("no input", crate::test_child::command(Console::Hidden)),
         ] {
             set(&mut c, "/usr/bin/id");
             assert_eq!(
@@ -351,21 +352,21 @@ fn the_shared_argv_gate_refuses_each_rule_with_the_backends_words() {
             );
         }
     }
-    let mut empty_argv = Command::new();
+    let mut empty_argv = crate::test_child::command(Console::Hidden);
     empty_argv.args::<[&str; 0], &str>([]);
-    for no_program in [Command::new(), empty_argv] {
+    for no_program in [crate::test_child::command(Console::Hidden), empty_argv] {
         assert_eq!(
             refusal(&no_program),
             "test elevation of an empty command / set a program via .args([...]) before .elevate()"
         );
     }
-    let mut line = Command::new();
+    let mut line = crate::test_child::command(Console::Hidden);
     line.commandline("id -u");
     assert_eq!(
         refusal(&line),
         "test elevation of a commandline() command / no command lines here"
     );
-    let mut ok = Command::new();
+    let mut ok = crate::test_child::command(Console::Hidden);
     ok.args(["/usr/bin/id", "-u"]);
     assert_eq!(super::elevation_argv(&ok, &WORDS).expect("accepted").len(), 2);
 }

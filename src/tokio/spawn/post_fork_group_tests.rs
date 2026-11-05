@@ -8,6 +8,7 @@ use crate::child::spawn::identity_group_tests::{Container, ROOT_LEAVING_A_MEMBER
 use crate::error::ChildFate;
 use crate::send_log::{assert_group_signalled_first_through_the_pidfd, Capture, GroupStep, Route};
 use crate::test_child::member::{await_started, Member, RELEASE_FD, ROOT_WITH_A_MEMBER};
+use crate::test_child::Console;
 use crate::test_groups::{cgroup, pidfd_group_signal, Group};
 
 /// The root's state when the spawn fails: running with its member, exited by itself and
@@ -88,7 +89,7 @@ fn failed_spawn_as(
                 crate::test_child::reaped_elsewhere::reap_behind(pid);
             }
         });
-        let mut cmd = crate::tokio::Command::new();
+        let mut cmd = crate::test_child::tokio_command(Console::Hidden);
         cmd.args(root.argv());
         cmd.contain_with(mode);
         cmd.set_elevation_front(front);
@@ -236,7 +237,7 @@ async fn a_tokio_spawn_failing_after_its_fork_under_a_tree_walk_sends_no_group_a
 async fn a_tokio_exec_failure_kills_a_group_with_no_member_and_sends_nothing_by_number() {
     crate::tokio::test_runtime::assert_current_thread();
     let capture = Capture::start();
-    let mut cmd = crate::tokio::Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(["cosca-no-such-program-142"]);
     cmd.contain_with(crate::ContainMode::Session);
     let (_err, fate) = crate::child::spawn::failure::expect_may_have_started_with(
@@ -403,7 +404,7 @@ async fn a_tokio_exec_failure_whose_group_kill_is_refused_warns_that_the_reaped_
     crate::log_capture::install();
     let refused = crate::containment::unix::fault::refuse_group_sends();
     let mark = crate::log_capture::mark();
-    let mut cmd = crate::tokio::Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(["cosca-no-such-program-142"]);
     cmd.contain_with(crate::ContainMode::Session);
     let (_err, fate) = crate::child::spawn::failure::expect_may_have_started_with(
@@ -442,7 +443,7 @@ async fn a_tokio_exec_failure_below_6_9_warns_that_the_reaped_child_may_never_ha
     let old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     let capture = Capture::start();
     let mark = crate::log_capture::mark();
-    let mut cmd = crate::tokio::Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(["cosca-no-such-program-142"]);
     cmd.contain_with(crate::ContainMode::Session);
     let (_err, fate) = crate::child::spawn::failure::expect_may_have_started_with(

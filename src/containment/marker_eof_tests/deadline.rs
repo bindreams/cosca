@@ -3,6 +3,8 @@
 //! real clock; "no drain past expiry" against a pipe that is already full, so no writer races it.
 
 use std::os::fd::AsFd;
+
+use crate::test_child::Console;
 use std::time::{Duration, Instant};
 
 use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent};
@@ -44,7 +46,7 @@ fn block_until_drained_never_returns_before_a_real_deadline() {
     // against a REAL clock (no mock needed: scheduling can only push a return later, never
     // earlier). `yes` keeps the descriptor continuously ready, so this can only terminate via
     // the deadline path, not a real EOF.
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.executable("/bin/sh").args(["sh", "-c", "exec yes >&3"]);
     cmd.fd(3, crate::Stdio::pipe_out()).expect("marker pipe");
     let mut child = cmd.spawn().expect("spawn yes");
@@ -151,7 +153,7 @@ fn full_marker_with_a_live_holder() -> (crate::Child, std::io::PipeWriter, std::
         "the pipe must be full before the test can prove nothing drains it"
     );
 
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.executable("/bin/sh").args(["sh", "-c", "exec cat >/dev/null"]);
     cmd.fd(0, crate::Stdio::pipe_in()).expect("stdin pipe");
     // Moves `marker_w` in — this test's own copy is gone from here on, before the wait ever
