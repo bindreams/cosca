@@ -2,6 +2,8 @@
 //!
 //! - `start_token`: raw creation `FILETIME` (identity, NOT epoch-adjusted).
 //! - `created_at`: that 100 ns-since-1601 value converted to `SystemTime`.
+//! - `ordered_read`: the id's key and the `OrderKey` (the process sequence number, through the
+//!   private `NtQueryInformationProcess` class 92), read on one handle.
 //! - `is_running`: authoritative "not exited" via `WaitForSingleObject(_, 0)`, which tests
 //!   the process's *signaled state* — so it flips to dead the instant the process exits,
 //!   without the object-teardown window that an existence check (`OpenProcess` succeeding)
@@ -16,8 +18,9 @@
 use std::time::{Duration, SystemTime};
 
 use windows::Wdk::Foundation::{NtQueryObject, ObjectBasicInformation};
+use windows::Wdk::System::Threading::{NtQueryInformationProcess, PROCESSINFOCLASS};
 use windows::Win32::Foundation::{
-    CloseHandle, RtlNtStatusToDosError, ERROR_INVALID_PARAMETER, FILETIME, HANDLE, STILL_ACTIVE, WAIT_FAILED,
+    CloseHandle, RtlNtStatusToDosError, ERROR_INVALID_PARAMETER, FILETIME, HANDLE, NTSTATUS, STILL_ACTIVE, WAIT_FAILED,
     WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::System::Threading::{
@@ -26,7 +29,7 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::System::WindowsProgramming::PUBLIC_OBJECT_BASIC_INFORMATION;
 
-use super::{Key, Liveness, RawPid, Resolved};
+use super::{Key, Liveness, OrderKey, RawPid, Resolved, UnknownCause};
 
 /// 100 ns intervals between 1601-01-01 (FILETIME epoch) and 1970-01-01 (Unix).
 const EPOCH_DIFF_100NS: u64 = 116_444_736_000_000_000;
@@ -264,6 +267,95 @@ pub(crate) fn creation_token_result(handle: HANDLE) -> windows::core::Result<Key
 
 pub(super) fn creation_token(handle: HANDLE) -> Option<Key> {
     creation_token_result(handle).ok()
+}
+
+/// `PROCESSINFOCLASS` 92, `ProcessSequenceNumber`: an 8-byte count of process creations on this
+/// boot, unique per process and greater for a process than for its creator. Not in the `windows`
+/// crate's constants (its `MaxProcessInfoClass` is 83).
+const PROCESS_SEQUENCE_NUMBER: PROCESSINFOCLASS = PROCESSINFOCLASS(92);
+
+/// The sequence number of the process `handle` names, or the `NTSTATUS` that refused it. The
+/// handle needs `PROCESS_QUERY_LIMITED_INFORMATION`.
+fn sequence_number(handle: HANDLE) -> Result<u64, NTSTATUS> {
+    let mut sequence = 0u64;
+    // SAFETY: `handle` is live; `sequence` is the 8-byte buffer class 92 writes.
+    let status = unsafe {
+        NtQueryInformationProcess(
+            handle,
+            PROCESS_SEQUENCE_NUMBER,
+            std::ptr::from_mut(&mut sequence).cast(),
+            std::mem::size_of::<u64>() as u32,
+            std::ptr::null_mut(),
+        )
+    };
+    if status.is_ok() {
+        Ok(sequence)
+    } else {
+        Err(status)
+    }
+}
+
+/// The id key and the order key of `pid`, read on one `PROCESS_QUERY_LIMITED_INFORMATION` handle,
+/// so both describe the same process. `expected`: the key of the process asked about, when there
+/// is one; a pid that holds another key is [`Resolved::Gone`]. A refused sequence-number query is
+/// `Unknown` with its `NTSTATUS` as the cause.
+pub(super) fn ordered_read(pid: RawPid, expected: Option<Key>) -> (Resolved<(Key, OrderKey)>, UnknownCause) {
+    let handle = match open_classified(pid, PROCESS_QUERY_LIMITED_INFORMATION) {
+        Opened::Found(h) => h,
+        Opened::Gone => return (Resolved::Gone, UnknownCause::default()),
+        Opened::Denied(_) => return (Resolved::Unknown, UnknownCause::default()),
+    };
+    let read = ordered_from_handle(handle, pid, expected);
+    close(handle);
+    read
+}
+
+/// [`ordered_read`] on an open handle of `pid` with `PROCESS_QUERY_LIMITED_INFORMATION`.
+pub(super) fn ordered_from_handle(
+    handle: HANDLE,
+    pid: RawPid,
+    expected: Option<Key>,
+) -> (Resolved<(Key, OrderKey)>, UnknownCause) {
+    combine(pid, expected, creation_token_result(handle), sequence_number(handle))
+}
+
+/// What the two reads of one handle of `pid` say together. The key is compared with `expected`
+/// first: another process's key is [`Resolved::Gone`] whatever the sequence-number query said. A
+/// failure of either read is `Unknown`; a refused sequence-number query is the cause, and a failed
+/// key read is logged.
+fn combine(
+    pid: RawPid,
+    expected: Option<Key>,
+    key: windows::core::Result<Key>,
+    sequence: Result<u64, NTSTATUS>,
+) -> (Resolved<(Key, OrderKey)>, UnknownCause) {
+    match (key, sequence) {
+        (Ok(now), _) if expected.is_some_and(|expected| expected != now) => (Resolved::Gone, UnknownCause::default()),
+        (Ok(key), Ok(sequence)) => (Resolved::Found((key, OrderKey(sequence))), UnknownCause::default()),
+        (Ok(_), Err(status)) => {
+            log::debug!(
+                "NtQueryInformationProcess(ProcessSequenceNumber) failed on an opened handle for pid {pid}: \
+                 NTSTATUS {:#010x}",
+                status.0 as u32
+            );
+            (Resolved::Unknown, UnknownCause::of_sequence_status(status))
+        }
+        (Err(e), sequence) => {
+            log::debug!("GetProcessTimes failed on an opened handle for pid {pid}: {e}");
+            let cause = sequence
+                .err()
+                .map_or_else(UnknownCause::default, UnknownCause::of_sequence_status);
+            (Resolved::Unknown, cause)
+        }
+    }
+}
+
+/// The order key of the process that holds `pid` as `key`: [`Resolved::Gone`] when another
+/// process holds it now. The read that proves the process is still there is the one that gives the
+/// key.
+pub(super) fn order_key(pid: RawPid, key: Key) -> (Resolved<OrderKey>, UnknownCause) {
+    let (read, cause) = ordered_read(pid, Some(key));
+    (read.map(|(_, order)| order), cause)
 }
 
 /// Build a `ProcessId` from an already-open Windows process handle and its pid, reusing the
