@@ -136,27 +136,21 @@ fn the_parent_of_a_spawned_child_is_the_current_process() {
     assert_eq!(parent, Some(ProcessId::current()));
 }
 
-/// `parent` reads its process, then the parent, and reads its process again only where reparenting
-/// makes that read the proof ([`ORDER_AFTER_PARENT`](crate::containment::treewalk::ORDER_AFTER_PARENT)
-/// says where it does not: Windows, whose creator is never updated, orders instead). Counted by the
-/// by-pid read seam, which the platforms that have it share.
+/// On macOS, where reparenting makes it the proof, `parent` reads its process, then the parent, then
+/// its process again. Counted by the by-pid read seam. (Windows, which orders instead and reads its
+/// process once, has no counter.)
 ///
-/// Mutant: Windows re-reads its process; macOS does not.
-#[cfg(any(target_os = "macos", windows))]
+/// Mutant: `parent` does not read its process again.
+#[cfg(target_os = "macos")]
 #[skuld::test]
-fn parent_reads_its_process_again_only_where_the_creator_is_updated() {
+fn parent_reads_its_process_again_under_the_parent() {
     let (child, kid) = live_member();
     let before = crate::identity::seams::by_pid_reads();
     let parent = kid.parent().expect("the parent is readable");
     let reads = crate::identity::seams::by_pid_reads() - before;
     release(child);
     assert_eq!(parent, Some(ProcessId::current()));
-    let expected = if crate::containment::treewalk::ORDER_AFTER_PARENT {
-        2
-    } else {
-        3
-    };
-    assert_eq!(reads, expected);
+    assert_eq!(reads, 3);
 }
 
 /// A live process that did not create the candidate is not its parent, though it is a real process

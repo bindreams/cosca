@@ -26,7 +26,7 @@
 //! key > root.key || (allow_equal && key == root.key)
 //! ```
 //!
-//! `allow_equal` is a per-OS `cfg` const ([`ALLOW_EQUAL_ORDER`]): `true` on
+//! `allow_equal` is a per-OS `cfg` const ([`ALLOW_EQUAL_ORDER`](crate::identity::ALLOW_EQUAL_ORDER)): `true` on
 //! Linux/macOS, `false` on Windows. Why per-OS:
 //!
 //! - An impostor — a *stale ppid* pointing at a *recycled* root pid — is always a
@@ -104,7 +104,7 @@
 //! lives. Only a walk is affected: a Job Object holds its members by membership and never walks.
 
 use crate::error::Error;
-use crate::identity::{Kernel, OrderKey, ProcessId, RawPid, Resolved, UnknownCause};
+use crate::identity::{Kernel, OrderKey, ProcessId, RawPid, Resolved, UnknownCause, ORDER_AFTER_PARENT};
 use crate::Recursive;
 
 /// What one identity-verified kill attempt achieved. `AlreadyGone` and `NotAttempted` are
@@ -189,39 +189,6 @@ pub(crate) fn resolve_or_drop(kernel: &dyn Kernel, pid: RawPid, parent: ProcessI
 #[cfg(unix)]
 use nix::sys::signal::Signal;
 
-/// Per-OS order-key rule. See the module docs for the full
-/// rationale. Linux/macOS reparent orphans → ppid is authoritative → keep
-/// same-tick children (`>=`). Windows recycles pids and never reparents → keep
-/// strict `>`.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(crate) const ALLOW_EQUAL_ORDER: bool = true;
-#[cfg(windows)]
-pub(crate) const ALLOW_EQUAL_ORDER: bool = false;
-// Other Unix (e.g. BSD without a tested rule): default to the conservative
-// strict-`>` rule. enumerate's compile_error gates real support per OS.
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-pub(crate) const ALLOW_EQUAL_ORDER: bool = false;
-
-/// Whether the order of a process after its parent is the proof of the parent, instead of the
-/// process's own `ppid` after the parent was read. True only on Windows, where the parent field is
-/// the creator and never updated, so a ppid can name a pid a later process holds now and a second read
-/// of the process shows nothing new; a candidate must then order after its accepted parent, not only
-/// after the root, and [`ProcessId::parent`] does not read its process again. False elsewhere:
-/// reparenting updates `ppid`, so the read under the parent is the proof, and an order rule would
-/// drop a child whose in-tree tracer started after it, or one forked after a clock step (macOS).
-#[cfg(windows)]
-pub(crate) const ORDER_AFTER_PARENT: bool = true;
-#[cfg(not(windows))]
-pub(crate) const ORDER_AFTER_PARENT: bool = false;
-
-/// The PID-reuse keep-predicate (the crate's core safety invariant — see the module
-/// docs): a candidate genuinely descends from an anchor only if its order key orders
-/// at-or-after the anchor's. The single source of this rule: the walk's reads apply it through
-/// `ProcessId::of_ordered_with`'s order bound, and `ProcessId::parent` where [`ORDER_AFTER_PARENT`].
-pub(crate) fn keeps_order(key: OrderKey, anchor: OrderKey, allow_equal: bool) -> bool {
-    key > anchor || (allow_equal && key == anchor)
-}
-
 /// Pure descendant filter (host-testable on every OS). Walks `parents` down from
 /// `root`, and for each pid whose ppid chains to `root.pid()` resolves its
 /// identity and order key via `resolve(pid, parent, bound)`, `parent` being the accepted process whose
@@ -273,16 +240,23 @@ pub(crate) fn descendants_with(
             }
             // Under parent_order the parent's key implies the root's.
             let bound = if parent_order { parent_key } else { root_key };
-            let read = *resolved.entry(pid).or_insert_with(|| {
-                resolve(pid, parent, bound).unwrap_or_else(|why| {
-                    walk.unassessed.push((pid, why));
-                    None
-                })
-            });
+            let read = *resolved
+                .entry(pid)
+                .or_insert_with(|| match resolve(pid, parent, bound) {
+                    Ok(None) => {
+                        log::debug!(
+                        "treewalk: pid {pid} gone, or an impostor (recycled pid / stale ppid) - dropping its subtree"
+                    );
+                        None
+                    }
+                    Ok(read) => read,
+                    // Already warned where the read was made.
+                    Err(why) => {
+                        walk.unassessed.push((pid, why));
+                        None
+                    }
+                });
             let Some((id, key)) = read else {
-                log::debug!(
-                    "treewalk: pid {pid} gone, or an impostor (recycled pid / stale ppid) - dropping its subtree"
-                );
                 continue;
             };
             // `accepted.insert` dedups so a duplicate edge never enumerates/kills the
@@ -357,18 +331,16 @@ pub(crate) fn children_of_with(
         if ppid != parent.pid() || pid == ppid || !resolved.insert(pid) {
             continue;
         }
-        let read = match resolve(pid, parent, parent_key) {
-            Ok(read) => read,
-            Err(why) => {
-                walk.unassessed.push((pid, why));
-                None
+        match resolve(pid, parent, parent_key) {
+            Ok(Some((id, _))) => walk.members.push(id),
+            Ok(None) => {
+                log::debug!(
+                    "treewalk: pid {pid} gone, or an impostor (recycled pid / stale ppid) - dropped from children"
+                );
             }
-        };
-        let Some((id, _)) = read else {
-            log::debug!("treewalk: pid {pid} gone, or an impostor (recycled pid / stale ppid) - dropped from children");
-            continue;
-        };
-        walk.members.push(id);
+            // Already warned where the read was made.
+            Err(why) => walk.unassessed.push((pid, why)),
+        }
     }
     walk
 }

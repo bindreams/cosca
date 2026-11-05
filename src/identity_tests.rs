@@ -334,6 +334,34 @@ fn a_candidates_read_and_its_parents_proof_give_one_answer() {
     }
 }
 
+/// The keep-predicate, under both `allow_equal` values: a key after the anchor's is kept, one before
+/// it (a stale-ppid impostor) is not, and an equal one (a same-tick child) is kept only where
+/// equality is allowed. `judged` and `ProcessId::parent` apply it under the per-OS const.
+///
+/// Mutants: `>` for `>=` under `true`, or `>=` for `>` under `false` (the equal row); `<` for `>`.
+#[skuld::test]
+fn the_keep_predicate_follows_allow_equal_only_for_an_equal_key() {
+    use super::{keeps_order, OrderKey};
+    let anchor = OrderKey::for_test(1_000);
+    for (name, key, kept_if_equal_allowed, kept_if_not) in [
+        ("after", 1_005, true, true),
+        ("equal to", 1_000, true, false),
+        ("before", 999, false, false),
+    ] {
+        let key = OrderKey::for_test(key);
+        assert_eq!(
+            keeps_order(key, anchor, true),
+            kept_if_equal_allowed,
+            "{name}, allow_equal=true"
+        );
+        assert_eq!(
+            keeps_order(key, anchor, false),
+            kept_if_not,
+            "{name}, allow_equal=false"
+        );
+    }
+}
+
 /// A read that found no record says its parent number could not be read only if it asked for it.
 ///
 /// Mutant: `missing` reads `Unreadable` for a read that did not ask, or `NotAsked` for one that did

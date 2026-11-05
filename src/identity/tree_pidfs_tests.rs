@@ -54,6 +54,21 @@ fn the_parent_of_a_pidfs_id_is_the_pidfs_id_of_its_parent() {
     );
 }
 
+/// Where the creator is updated, the proof is `self`'s own `ppid` after the parent's read, not an
+/// order: a parent that started after `self` (a tracer, or a clock step) is named while its pid
+/// still shows as `self`'s `ppid`. `SELF` started at 2000. Mutant: "`parent` orders `self` after its
+/// parent (`keeps_order`) after the second read": no parent is named.
+#[skuld::test]
+fn a_parent_that_started_after_its_child_is_named_while_the_childs_ppid_still_names_it() {
+    for parent_start in [2_000, 3_000] {
+        assert_eq!(
+            me().parent_with(&table(parent_start)).expect("a readable table"),
+            Some(ProcessId::from_parts_for_test(PARENT, Key::Pidfs(PARENT_INO))),
+            "a parent started at {parent_start}"
+        );
+    }
+}
+
 /// `self`'s own read gives the ppid and the key: a pid gone by that read has no parent.
 #[skuld::test]
 fn a_pidfs_id_whose_start_time_is_gone_has_no_parent() {

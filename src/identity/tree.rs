@@ -1,7 +1,7 @@
 //! The process tree around a [`ProcessId`](super::ProcessId): its parent and its children.
 
-use super::{HostKernel, Kernel, ProcessId, Resolved};
-use crate::containment::treewalk::{keeps_order, resolution_of, ALLOW_EQUAL_ORDER, ORDER_AFTER_PARENT};
+use super::{keeps_order, HostKernel, Kernel, ProcessId, Resolved, ALLOW_EQUAL_ORDER, ORDER_AFTER_PARENT};
+use crate::containment::treewalk::resolution_of;
 use crate::error::Error;
 
 /// Whether a tree query descends recursively or returns only direct children.
@@ -16,19 +16,23 @@ pub enum Recursive {
 impl ProcessId {
     /// The parent process, by identity. Identity-guarded against pid-reuse by one proof that the
     /// `ppid` read names the real parent and not a later holder of its pid, the proof the walk
-    /// makes of each candidate. Where an orphan is reparented (Linux, macOS), `self` is read again
-    /// after its parent, and its `ppid` must still name the parent, which must still hold its pid.
-    /// Where the creator is never updated (Windows), `self` must instead have started strictly
-    /// after the parent; a parent that started after its child is a recycled `ppid`.
+    /// makes of each candidate:
+    ///
+    /// - Linux, macOS (an orphan is reparented): `self` is read again after its parent, and its
+    ///   `ppid` must still name the parent, which must still hold its pid. The parent may have
+    ///   started after `self` (a tracer, or a clock step).
+    /// - Windows (the creator is never updated): `self` is read once, and must have started
+    ///   strictly after the parent; a parent that started after its child is a recycled `ppid`.
     ///
     /// `Ok(None)` means there is none: `self` has no parent (pid 1), the parent has exited, or
-    /// `self` is gone or was recycled. It is never an answer to a question that could not be
-    /// asked.
+    /// `self` is gone or was recycled, as of its read (on Windows, the one that gave the parent
+    /// number). It is never an answer to a question that could not be asked.
     ///
     /// # Errors
     ///
-    /// - [`Error::Unassessable`]: `self` (or its parent) exists but cannot be queried, at any of the
-    ///   reads; or its parent's proof cannot be made.
+    /// - [`Error::Unassessable`]: `self` or its parent exists but cannot be queried, at any of the
+    ///   reads. On Linux and macOS also when the parent's pid cannot be proved held after
+    ///   `self`'s second read; Windows reads `self` once and makes no such proof.
     /// - [`Error::Unsupported`]: on Linux, `openat2` is unavailable (Linux ≥ 5.6).
     pub fn parent(&self) -> Result<Option<ProcessId>, Error> {
         self.parent_with(&HostKernel)

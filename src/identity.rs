@@ -45,8 +45,6 @@ pub(crate) mod windows_fixture;
 #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 compile_error!("cosca::identity is implemented only for Windows, Linux, and macOS");
 
-use crate::containment::treewalk::{keeps_order, ALLOW_EQUAL_ORDER};
-
 /// A process identifier as the OS knows it (matches `std::process::id`).
 pub type RawPid = u32;
 
@@ -109,6 +107,39 @@ impl OrderKey {
     pub(crate) fn for_test(v: u64) -> OrderKey {
         OrderKey(v)
     }
+}
+
+/// Per-OS order-key rule: whether a key equal to its anchor's is kept. The tree walk's module docs
+/// give the rationale. Linux/macOS reparent orphans, so ppid is authoritative and a same-tick child
+/// is kept (`>=`). Windows recycles pids and never reparents, and keys are unique there, so it
+/// keeps strict `>`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) const ALLOW_EQUAL_ORDER: bool = true;
+#[cfg(windows)]
+pub(crate) const ALLOW_EQUAL_ORDER: bool = false;
+// Other Unix (e.g. BSD without a tested rule): default to the conservative
+// strict-`>` rule. enumerate's compile_error gates real support per OS.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+pub(crate) const ALLOW_EQUAL_ORDER: bool = false;
+
+/// Whether the order of a process after its parent is the proof of the parent, instead of the
+/// process's own `ppid` after the parent was read. True only on Windows, where the parent field is
+/// the creator and never updated, so a ppid can name a pid a later process holds now and a second read
+/// of the process shows nothing new; a candidate must then order after its accepted parent, not only
+/// after the root, and [`ProcessId::parent`] does not read its process again. False elsewhere:
+/// reparenting updates `ppid`, so the read under the parent is the proof, and an order rule would
+/// drop a child whose in-tree tracer started after it, or one forked after a clock step (macOS).
+#[cfg(windows)]
+pub(crate) const ORDER_AFTER_PARENT: bool = true;
+#[cfg(not(windows))]
+pub(crate) const ORDER_AFTER_PARENT: bool = false;
+
+/// The PID-reuse keep-predicate (the crate's core safety invariant, see the tree walk's module
+/// docs): a candidate genuinely descends from an anchor only if its order key orders at-or-after the
+/// anchor's. The single source of this rule: the walk's reads apply it through
+/// [`ProcessId::of_ordered_with`]'s order bound, and [`ProcessId::parent`] where [`ORDER_AFTER_PARENT`].
+pub(crate) fn keeps_order(key: OrderKey, anchor: OrderKey, allow_equal: bool) -> bool {
+    key > anchor || (allow_equal && key == anchor)
 }
 
 /// The candidate's own parent number, as one ordered read found it: in the record or on the handle
@@ -233,7 +264,7 @@ impl OrderedRead {
 /// key of the process the caller means, when it has one; a pid that holds another key is
 /// [`Resolved::Gone`], and a backend whose read can fail after the key is known says so before it.
 fn read_ordered(kernel: &dyn Kernel, pid: RawPid, expected: Option<Key>, ask_parent: bool) -> OrderedRead {
-    #[cfg(all(test, any(target_os = "macos", windows)))]
+    #[cfg(all(test, target_os = "macos"))]
     seams::note_by_pid_read();
     #[cfg(target_os = "linux")]
     {
@@ -299,7 +330,7 @@ impl ProcessId {
     /// [`of_explained`](Self::of_explained) through `kernel`: the one entry to a by-pid identity
     /// read, on every platform.
     pub(crate) fn of_with(kernel: &dyn Kernel, pid: RawPid) -> (Resolved<ProcessId>, UnknownCause) {
-        #[cfg(all(test, any(target_os = "macos", windows)))]
+        #[cfg(all(test, target_os = "macos"))]
         seams::note_by_pid_read();
         #[cfg(target_os = "linux")]
         {
@@ -754,8 +785,8 @@ fn start_token_explained(pid: RawPid) -> (Resolved<Key>, UnknownCause) {
     (backend::start_token(pid), UnknownCause::default())
 }
 
-/// Test seams of the platforms that count by-pid reads (macOS, Windows).
-#[cfg(all(any(target_os = "macos", windows), test))]
+/// macOS test seams.
+#[cfg(all(target_os = "macos", test))]
 pub(crate) mod seams {
     use std::cell::Cell;
 
