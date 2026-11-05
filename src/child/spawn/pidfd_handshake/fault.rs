@@ -244,7 +244,6 @@ impl Drop for ArmedChildPidfdOpen {
     }
 }
 
-/// Taken once by `register`, on the spawning thread.
 pub(super) fn take_child_pidfd_open_failure() -> Option<Errno> {
     CHILD_PIDFD_OPEN_FAILURE.with(Cell::take)
 }

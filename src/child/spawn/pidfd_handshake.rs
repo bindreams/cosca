@@ -171,7 +171,7 @@ enum Outcome {
 pub(crate) fn register(cmd: &mut std::process::Command) -> Pending {
     #[cfg(test)]
     let fault = fault::child_fault();
-    // The child opens its own pidfd, where a thread-local seam cannot reach: take it here.
+    // Taken on the spawning thread; the child cannot read thread-locals.
     #[cfg(test)]
     let scripted = fault::take_child_pidfd_open_failure();
     // SAFETY: the hook reads atomics and makes only direct syscalls (libc or rustix, see

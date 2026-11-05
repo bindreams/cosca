@@ -326,10 +326,9 @@ fn classify_member(
 /// mistakenly signalled": the re-verify and the `kill(2)` below are non-atomic, so a recycle
 /// in THAT gap (not the earlier, listing-to-here gap the re-verify closes) is still possible.
 /// On Linux this is closed for real, not just narrowed: `SIGKILL` delivery goes through
-/// `pidfd_open`+`pidfd_send_signal` (`check_or_signal_linux_sigkill`, below), reusing
-/// `crate::os_process::linux::open::open_verified_with` verbatim rather than a second implementation — the fd
-/// itself pins the identity at the kernel level, so a pid reused after `pidfd_open` cannot be
-/// hit even in principle. macOS has no pidfd equivalent, so `kill(2)` here keeps the same
+/// `pidfd_open`+`pidfd_send_signal` (`check_or_signal_linux_sigkill`, below), through
+/// `open_verified_with` — the fd itself pins the identity at the kernel level, so a pid reused
+/// after `pidfd_open` cannot be hit even in principle. macOS has no pidfd equivalent, so `kill(2)` here keeps the same
 /// irreducible window as `treewalk::kill_by_identity` (re-verify, then `kill(2)`): a recycled
 /// pid in that window is a documented best-effort limitation of the group and tree sweeps.
 /// `Process::kill` on macOS does not have it: it signals by audit token
@@ -440,9 +439,8 @@ fn root_check_before_send(root: &GroupRoot<'_>, pid: RawPid, signal: Option<Sign
 }
 
 /// Linux-only, `SIGKILL`-only: the atomic version of `check_or_signal`'s resend, via the
-/// crate's own existing pidfd primitive (`os_process::linux::open::open_verified_with` — reused, not
-/// reimplemented, per this module's own stated preference; it already does exactly "open a
-/// pidfd for this identity, re-verifying, `Ok(None)` if already gone"). `pidfd_send_signal`
+/// crate's `open_verified_with` ("open a pidfd for this identity, re-verifying, `Ok(None)` if
+/// already gone"). `pidfd_send_signal`
 /// on the returned fd is guaranteed to hit the SAME process `open_verified_with` just confirmed,
 /// even if the pid number is reused by something else in between — no gap remains, unlike
 /// `check_or_signal`'s plain-`kill(2)` path.

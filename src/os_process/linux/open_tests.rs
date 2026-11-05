@@ -13,7 +13,7 @@ use crate::error::Error;
 use crate::identity::stat_parse::stat_fixture;
 use crate::identity::{Existence, FakeKernel, HostKernel, ProcessId};
 
-/// A pid no row reads: a `FakeKernel::new()` that answers its `pidfd_open` row and nothing else.
+/// A pid that no live process is expected to hold; only its `pidfd_open` row exists.
 const FABRICATED: u32 = 4242;
 
 fn fabricated_id() -> ProcessId {
