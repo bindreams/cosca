@@ -167,6 +167,17 @@ pub(crate) struct KillOnDrop {
 
 #[cfg(target_os = "linux")]
 impl KillOnDrop {
+    /// Guards `child`, a std child of this process the test still holds (for its pipes, or its `id`).
+    /// Opens the pidfd now, while `child` is unreaped, so it names it exactly. A test that reaps
+    /// `child` before the guard drops, through std or otherwise, [`defuse`](Self::defuse)s the guard
+    /// after the reap: a pidfd of a reaped child refuses the kill.
+    pub(crate) fn of(child: &std::process::Child) -> KillOnDrop {
+        KillOnDrop {
+            pid: child.id(),
+            pidfd: Some(pidfd_of(child.id())),
+        }
+    }
+
     /// The guarded pid, without disarming the guard. Don't reap through this pid: it would race
     /// the guard's `Drop`. [`defuse`](Self::defuse) first to take over.
     pub(crate) fn pid(&self) -> u32 {
