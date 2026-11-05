@@ -60,7 +60,7 @@ impl Acceptor<'_> {
                 PollFd::new(self.listener, PollFlags::IN),
             ];
             fds.extend(self.pending.iter().map(|c| PollFd::new(c, PollFlags::IN)));
-            sys::poll_ready(&mut fds).map_err(|e| AcceptorFailure::Errno(e.raw_os_error()))?;
+            crate::wait::poll_ready(&mut fds).map_err(|e| AcceptorFailure::Errno(e.raw_os_error()))?;
             let woken = !fds[0].revents().is_empty();
             let incoming = !fds[1].revents().is_empty();
             let ready: Vec<bool> = fds[2..].iter().map(|f| !f.revents().is_empty()).collect();
