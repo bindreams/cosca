@@ -1384,6 +1384,10 @@ mod child_reap_tests;
 mod child_wait_tree_tests;
 
 #[cfg(all(test, target_os = "linux"))]
+#[path = "child_openat2_refused_drop_tests.rs"]
+mod child_openat2_refused_drop_tests;
+
+#[cfg(all(test, target_os = "linux"))]
 impl Child {
     /// Test-only: the path of the cgroup leaf this child holds, if any.
     pub(crate) fn leaf_path_for_test(&self) -> Option<std::path::PathBuf> {

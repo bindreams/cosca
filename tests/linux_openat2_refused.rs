@@ -9,9 +9,8 @@ use cosca::identity::{Existence, Liveness, ProcessId, Resolved};
 #[path = "common/mod.rs"]
 mod common;
 
-/// `openat2` answers `ENOSYS` before Linux 5.6, and `EPERM` under a seccomp profile that blocks it.
 #[cfg(target_os = "linux")]
-const REFUSALS: [(i32, &str); 2] = [(libc::ENOSYS, "ENOSYS"), (libc::EPERM, "EPERM")];
+use common::seccomp::OPENAT2_REFUSALS as REFUSALS;
 
 /// Above `PID_MAX_LIMIT` (2^22) yet a valid positive `kill` target, so `kill(pid, 0)` answers `ESRCH`.
 #[cfg(target_os = "linux")]
@@ -263,42 +262,6 @@ fn a_seccomp_refused_openat2_with_another_errno_is_not_unsupported_for_a_group_l
     common::kill_tree_release_reap(&child, control);
 }
 
-/// The spawn reads the child's identity through the checked `/proc`: it fails `Unsupported` naming
-/// the refusal, and the child is reaped.
-///
-/// Mutant: `spawn_identity_error` reports every `Unknown` as the OS refusing (`Unassessable` that
-/// names no cause).
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn a_seccomp_refused_openat2_fails_a_spawn_naming_openat2_and_reaps_the_child() {
-    for (errno, name) in REFUSALS {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let addr = listener.local_addr().unwrap().to_string();
-        let mut cmd = cosca::Command::new();
-        cmd.executable(common::testbin())
-            .args(["cosca_testbin", "control-block", addr.as_str(), "R"]);
-        common::silence(&mut cmd);
-        let err = with_openat2_refused(errno, || cmd.spawn()).expect_err("a spawn without openat2 must fail");
-        match err {
-            cosca::error::Error::MayHaveStarted { fate, source, .. } => {
-                assert_eq!(
-                    fate,
-                    cosca::error::ChildFate::Reaped,
-                    "{name}: the pidfd pins the child, so it is reaped"
-                );
-                match *source {
-                    cosca::error::Error::Unsupported { detail, platform, .. } => {
-                        assert_eq!(platform, "linux");
-                        assert_eq!(detail, refused_detail(name), "{name}");
-                    }
-                    other => panic!("{name}: expected Unsupported, got {other:?}"),
-                }
-            }
-            other => panic!("{name}: expected MayHaveStarted, got {other:?}"),
-        }
-    }
-}
-
 /// The walk could not find the descendants, and killing the root first would reparent them out of
 /// any retry's reach: nothing is killed, the root included, and the error is returned.
 ///
@@ -329,32 +292,6 @@ fn a_seccomp_refused_openat2_then_recovered_lets_kill_tree_retry() {
         let (child, control) = spawn_treewalk_blocker();
         with_openat2_refused(errno, || child.kill_tree()).expect_err("the first attempt fails");
         common::kill_tree_release_reap(&child, control);
-    }
-}
-
-/// `Drop` cannot retry, so it still kills the root through its handle, and says descendants may be
-/// orphaned. The control socket is held throughout, so the drop returns only if the root was
-/// killed.
-///
-/// Mutant: the drop skips the root kill after a snapshot failure.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn a_seccomp_refused_openat2_makes_a_treewalk_drop_kill_the_root_and_warn_of_orphans() {
-    for (errno, name) in REFUSALS {
-        let (child, control) = spawn_treewalk_blocker();
-        let id = child.id();
-        let mark = common::log_mark();
-        with_openat2_refused(errno, move || drop(child));
-        assert!(
-            common::levels_since(mark, "may be orphaned").contains(&log::Level::Warn),
-            "{name}"
-        );
-        assert_eq!(
-            id.exists(),
-            Existence::Gone,
-            "{name}: the root must be killed and reaped"
-        );
-        drop(control);
     }
 }
 
@@ -392,46 +329,6 @@ fn a_seccomp_refused_openat2_leaves_an_async_treewalk_roots_kill_tree_an_error_a
             status.success(),
             "{name}: the root must not have been killed: {status:?}"
         );
-    }
-}
-
-/// The async twin of the drop row above.
-///
-/// Mutant: the async drop skips the root kill after a snapshot failure.
-#[cfg(all(target_os = "linux", feature = "tokio"))]
-#[skuld::test]
-fn a_seccomp_refused_openat2_makes_an_async_treewalk_drop_kill_the_root_and_warn_of_orphans() {
-    for (errno, name) in REFUSALS {
-        let mark = common::log_mark();
-        let (id, control) = on_a_thread(|| {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("a current-thread runtime");
-            let _entered = runtime.enter();
-            let (child, control) = runtime.block_on(common::spawn_control_async_with(
-                "control-block",
-                &["R"],
-                false,
-                |cmd| {
-                    cmd.contain_with(cosca::ContainMode::TreeWalk);
-                },
-            ));
-            let id = child.id();
-            common::seccomp::deny_openat2_on_this_thread(errno);
-            drop(child);
-            (id, control)
-        });
-        assert!(
-            common::levels_since(mark, "may be orphaned").contains(&log::Level::Warn),
-            "{name}"
-        );
-        assert_eq!(
-            id.exists(),
-            Existence::Gone,
-            "{name}: the root must be killed and reaped"
-        );
-        drop(control);
     }
 }
 

@@ -80,6 +80,10 @@ pub(crate) mod group_exact_tests;
 #[path = "child/drop_group_exact_tests.rs"]
 mod drop_group_exact_tests;
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "child/openat2_refused_drop_tests.rs"]
+mod openat2_refused_drop_tests;
+
 #[cfg(all(test, unix))]
 #[path = "child/drop_reaped_tests.rs"]
 mod drop_reaped_tests;

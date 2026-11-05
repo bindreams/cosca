@@ -1,7 +1,50 @@
 //! A spawn whose child's identity cannot be read because the checked `/proc` view is
-//! unavailable says so.
+//! unavailable says so, and does not leak the child.
 
+use super::spawn_tests::teardown_blocker;
 use crate::error::Error;
+use crate::test_seccomp::{deny_openat2_on_this_thread, OPENAT2_REFUSALS};
+
+/// The kernel refuses `openat2` (a real seccomp filter): the spawn fails `Unsupported` naming it,
+/// and the pidfd pins the child, so it is killed and reaped. The child is held only by the
+/// teardown blocker's pipe, which the teardown releases after its kill: a spawn that leaves the
+/// child running fails the assertion instead of hanging.
+///
+/// Mutant: `spawn_identity_error` reports every `Unknown` as the OS refusing (`Unassessable` that
+/// names no cause).
+#[skuld::test]
+fn a_spawn_where_openat2_is_refused_is_unsupported_naming_it_and_reaps_the_child() {
+    for (errno, name) in OPENAT2_REFUSALS {
+        // The filter ends with its thread; the hooks `teardown_blocker` arms are thread-local.
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let (mut cmd, teardown) = teardown_blocker();
+                    deny_openat2_on_this_thread(errno);
+                    let err = cmd.spawn().err();
+
+                    let (err, fate) = crate::child::spawn::failure::expect_may_have_started_with(
+                        err.expect("a spawn without openat2 must fail"),
+                    );
+                    assert_eq!(
+                        fate,
+                        crate::error::ChildFate::Reaped,
+                        "{name}: the pidfd pins the child, so it is reaped"
+                    );
+                    match err {
+                        Error::Unsupported { detail, platform, .. } => {
+                            assert_eq!(platform, "linux");
+                            assert_eq!(detail, crate::identity::openat2_refused_message(name), "{name}");
+                        }
+                        other => panic!("{name}: expected Unsupported, got {other:?}"),
+                    }
+                    teardown.assert_killed();
+                })
+                .join()
+                .expect("the filtered thread")
+        });
+    }
+}
 
 /// The error describes the read that failed, not a second look at a view that may have recovered:
 /// the host's own view is fine here, yet the cause the read carried is named. Mutant:
