@@ -253,7 +253,7 @@ impl Child {
         if let Some(error) = crate::child::spawn::failure::seams::take_wait_failure() {
             return Err(error);
         }
-        lifecycle::wait_to_exit(&self.proc)
+        Ok(lifecycle::wait_to_exit(&self.proc, None, lifecycle::Orphaned::Warn)?)
     }
 
     /// Return the exit status if the child has already exited.

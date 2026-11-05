@@ -2,8 +2,8 @@
 
 use std::process::ExitStatus;
 
-use super::{ChildWaitOutcome, OwnedChild};
-use crate::child::lifecycle::{orphaned_note, status_of_outcome, wait_to_exit, Orphaned};
+use super::OwnedChild;
+use crate::child::lifecycle::{orphaned_note, wait_to_exit, Orphaned, WaitToExitError};
 use crate::error::Error;
 use crate::identity::ProcessId;
 use crate::os_process::child::Foreign;
@@ -57,7 +57,6 @@ impl Unreaped {
 
     /// The child's identity, if the spawn read one.
     pub fn id(&self) -> Option<ProcessId> {
-        debug_assert!(self.child.is_some(), "only a live Unreaped is asked for its identity");
         self.id
     }
 
@@ -65,7 +64,7 @@ impl Unreaped {
     /// failed; the child is settled either way.
     pub fn wait(mut self) -> Result<ExitStatus, Error> {
         let child = self.child.take().expect("a live Unreaped holds its child");
-        wait_to_exit(&child)
+        Ok(wait_to_exit(&child, None, Orphaned::Warn)?)
     }
 
     /// Give the child up, unreaped. Logs nothing.
@@ -81,22 +80,17 @@ impl Drop for Unreaped {
         };
         let pid = child.pid();
         let who = child_named(pid);
-        match child.wait(None) {
-            Ok(ChildWaitOutcome::Foreign(Foreign::Orphaned)) => log::warn!("{}", orphaned_note(pid)),
-            Ok(ChildWaitOutcome::Foreign(_)) => {
+        match wait_to_exit(&child, None, Orphaned::Quiet) {
+            Ok(status) => {
+                log::warn!("{who} was dropped without wait or leak; waited for it and reaped it ({status})")
+            }
+            Err(WaitToExitError::Elsewhere(Foreign::Orphaned)) => log::warn!("{}", orphaned_note(pid)),
+            Err(WaitToExitError::Elsewhere(_)) => {
                 log::debug!("{who} was dropped without wait or leak; someone else had reaped it");
             }
-            Ok(outcome) => match status_of_outcome(pid, outcome, Orphaned::Quiet) {
-                Ok(Some(status)) => {
-                    log::warn!("{who} was dropped without wait or leak; waited for it and reaped it ({status})")
-                }
-                Ok(None) => {
-                    debug_assert!(false, "an unbounded wait ended at a deadline");
-                    log::warn!("{who} was dropped without wait or leak; its wait ended with no exit");
-                }
-                Err(e) => log::warn!("{who} was dropped without wait or leak; its exit could not be read: {e}"),
-            },
-            Err(e) => log::warn!("{who} was dropped without wait or leak, and waiting for it failed: {e}"),
+            Err(WaitToExitError::Failed(e)) => {
+                log::warn!("{who} was dropped without wait or leak, and waiting for it failed: {e}")
+            }
         }
     }
 }

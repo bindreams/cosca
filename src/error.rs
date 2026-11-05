@@ -251,8 +251,8 @@ pub enum Error {
         source: Box<Error>,
         /// The child itself, when the spawn could not end it and hands it to the caller. The caller
         /// owns it: [`wait`](crate::Unreaped::wait) or [`leak`](crate::Unreaped::leak) settles it,
-        /// else its drop blocks until the child exits. Then `fate` is [`ChildFate::Running`] with
-        /// the child's own identity.
+        /// else its drop blocks until the child exits (in async code, take it off the runtime
+        /// thread). Then `fate` is [`ChildFate::Running`] with the child's own identity.
         unreaped: Option<Box<crate::Unreaped>>,
     },
 }
