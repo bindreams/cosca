@@ -174,6 +174,21 @@ impl TeardownOutcome {
             look: None,
             clause: Some(settlement.wording(subject, running, Some(disposition))),
         }
+        .with_clause_asserted()
+    }
+
+    /// Asserts (debug) the contract of every outcome: a child left uncollected has a clause at warn
+    /// (see [`Settlement`]'s table). Asserted once, where an outcome gets its clause
+    /// ([`of_settlement`](Self::of_settlement) and `child::word_front`), so every consumer
+    /// of the outcome is covered: the failed-spawn line, [`take_warn`](Self::take_warn), a pidfd
+    /// teardown's [`left`](PidfdTeardown::left).
+    pub(crate) fn with_clause_asserted(self) -> TeardownOutcome {
+        debug_assert!(
+            !self.uncollected || matches!(self.clause, Some((log::Level::Warn, _))),
+            "the clause of an uncollected child is a warn: {:?}",
+            self.clause
+        );
+        self
     }
 
     /// A front's teardown, which left it `uncollected` or not and went `look`.
@@ -205,19 +220,10 @@ impl TeardownOutcome {
     /// warn or `why` is owed (the diagnosis is then the warn, and says what became of the child in
     /// it, whatever the clause's level); the caller logs the returned line. Otherwise the clause is
     /// logged here at its level, on its own.
-    ///
-    /// The one place every failed-spawn line is built, so the one that asserts (in debug) the
-    /// contract: a child left uncollected has a clause at warn (see [`Settlement`]'s table). An
-    /// owed diagnosis forces a line out whatever the level, so the line is no proof of it.
     #[cfg(any(target_os = "linux", windows))]
     pub(crate) fn failed_spawn_line(&mut self, why: &mut crate::child::spawn::Diagnosis) -> Option<String> {
         let label = crate::containment::dispatch::TeardownCaller::FailedSpawn.label();
-        let clause = self.clause.take();
-        debug_assert!(
-            !self.uncollected || matches!(clause, Some((log::Level::Warn, _))),
-            "the clause of an uncollected child is a warn: {clause:?}"
-        );
-        let (level, text) = clause?;
+        let (level, text) = self.clause.take()?;
         if level == log::Level::Warn || why.is_owed() {
             return Some(format!("{label}: {}", why.fold(&text)));
         }
@@ -277,14 +283,11 @@ impl PidfdTeardown {
     }
 
     /// Takes the clause of a teardown that left its child uncollected, for the caller that logs the
-    /// warn. The clause is at warn (see [`Settlement`]'s table): a teardown that made none, or one
-    /// below it, breaks the contract, asserted in debug.
+    /// warn. The clause is at warn: the outcome's construction asserts it
+    /// ([`with_clause_asserted`](TeardownOutcome::with_clause_asserted)), so the fallback text is
+    /// unreachable in debug.
     pub(crate) fn left(&mut self) -> Left {
         let clause = self.outcome.clause.take();
-        debug_assert!(
-            matches!(clause, Some((log::Level::Warn, _))),
-            "the clause of an uncollected child is a warn: {clause:?}"
-        );
         Left {
             clause: clause.map_or_else(|| "its teardown left it uncollected".to_owned(), |(_, clause)| clause),
             fate: self.outcome.fate,
@@ -325,8 +328,8 @@ impl Left {
 
 /// The one place the warn of a pidfd teardown is logged: `line`, then the teardown's contract
 /// with its caller, asserted after the warn so that a panic does not lose it. (That a child left
-/// uncollected has a warn is the line's own contract, asserted where it is built: see
-/// [`failed_spawn_line`](TeardownOutcome::failed_spawn_line) and [`PidfdTeardown::left`].)
+/// uncollected has a warn is the outcome's own contract, asserted where it is built: see
+/// [`with_clause_asserted`](TeardownOutcome::with_clause_asserted).)
 /// `uncollected` and `fate` are the teardown's ([`TeardownOutcome`]); `expect` is its caller's.
 #[cfg_attr(
     not(target_os = "linux"),

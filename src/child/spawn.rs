@@ -352,10 +352,7 @@ fn root_after_a_refused_kill(refusal: String, looked: &TeardownOutcome) -> Strin
 /// exited, `Gone` if the look found it reaped by someone else (`ECHILD`), and `Unknown` if the look
 /// failed otherwise. `looked` carries the failed look's OS error, and `id` is the child's identity,
 /// if the spawn had read one.
-#[cfg_attr(
-    not(any(feature = "tokio", windows)),
-    allow(dead_code, reason = "the callers are tokio's teardowns and Windows' std teardown")
-)]
+#[cfg(any(feature = "tokio", not(any(target_os = "macos", target_os = "linux"))))]
 pub(crate) fn fate_of_a_look(
     looked: Result<Option<std::process::ExitStatus>, Option<i32>>,
     id: Option<ProcessId>,

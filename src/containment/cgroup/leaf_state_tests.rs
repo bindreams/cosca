@@ -1,10 +1,10 @@
 //! `proc_state` reads a child's state only through the checked `/proc` view.
 
 use super::{proc_state, read_proc_state, StateUnknown};
-use crate::containment::cgroup::test_support::{handle_of, pidfd_of};
+use crate::containment::cgroup::test_support::{handle_of, pidfd_of, KillOnDrop};
 use crate::identity::{FakeKernel, HostKernel, DIVERGED_REASON, UNREADABLE_STATUS_REASON};
 use crate::test_child::namespaces as ns;
-use crate::test_child::{fixture_path, member_command, KillOnDrop};
+use crate::test_child::{fixture_path, member_command};
 use crate::test_groups::{namespaces, pidfd_group_signal, Group};
 
 #[skuld::test]
@@ -130,11 +130,10 @@ fn fixture_state_overmount() {
         return;
     }
     ns::enter_private_mount_ns();
-    let mut child = KillOnDrop(Some(
-        crate::test_spawn::spawn(&mut member_command(0)).expect("spawn the member"),
-    ));
-    crate::test_child::await_member_ready(child.0.as_mut().expect("child"));
-    let pid = child.0.as_ref().expect("child").id();
+    let mut child = crate::test_spawn::spawn(&mut member_command(0)).expect("spawn the member");
+    let _guard = KillOnDrop::of(&child);
+    crate::test_child::await_member_ready(&mut child);
+    let pid = child.id();
     assert!(
         proc_state(&HostKernel, handle_of(pid, &pidfd_of(pid))).is_some(),
         "the member has a state before the mount"

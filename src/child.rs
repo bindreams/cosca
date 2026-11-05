@@ -1259,7 +1259,7 @@ fn word_front(
         LookOutcome::PlaceUnreadable(e) => warn(unreadable(format!("where it is cannot be read ({e})"))),
         LookOutcome::SubtreeUnreadable(e) => warn(unreadable(format!("its leaf's subtree cannot be read ({e})"))),
     };
-    torn
+    torn.with_clause_asserted()
 }
 
 fn take_reader(pipes: &mut BTreeMap<Fd, ParentEnd>, fd: Fd) -> Option<PipeReader> {

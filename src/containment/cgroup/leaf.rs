@@ -1068,15 +1068,6 @@ impl Abandoned {
     }
 }
 
-/// What the teardown of a child that never named itself may come to, through the pidfd it is torn
-/// down through: `handed`, the expectation the handshake handed over with its pidfd. The child's own
-/// intent pidfd comes with none (`None`), and nothing there establishes that the child never ran the
-/// program or that no look failed: anything stands.
-#[cfg(target_os = "linux")]
-fn pidless_expect(handed: Option<Expect>) -> Expect {
-    handed.unwrap_or(Expect::Anything)
-}
-
 /// What became of the child itself when its spawn was abandoned.
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1134,13 +1125,16 @@ impl CgroupLeaf {
                 handed = Some(expect);
             }
         }
-        // A child that never named itself never reached the point where it could run the program:
-        // it is no front, and the handshake's pidfd alone can reap it.
+        // A child that never named itself is no front, and a pidfd alone can reap it. Whether it
+        // ran the program is the handshake's to say, with its pidfd's `Expect`; the child's own
+        // intent pidfd (`handed` is `None`) establishes neither that nor that no look failed:
+        // anything stands.
         if received.pid.is_none() {
             if let Some(pidfd) = received.pidfd.take() {
                 self.remove_holding_nothing();
                 // No pid, no identity, no tree kill: killed through the pidfd, and left if refused.
-                let torn = tear_down_pidfd(None, pidfd, None, pidless_expect(handed), warn.due());
+                let expect = handed.unwrap_or(Expect::Anything);
+                let torn = tear_down_pidfd(None, pidfd, None, expect, warn.due());
                 return Abandoned::after_pidless_teardown(torn);
             }
         }
