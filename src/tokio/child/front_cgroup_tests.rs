@@ -544,10 +544,11 @@ async fn cgroup_a_failed_spawn_kills_a_contained_front_and_reaps_it(#[fixture(cg
     let failures = failed_held_front_spawns(LeafKill::Lands, |cmd| {
         crate::tokio::spawn::spawn(cmd).map(drop).map_err(Into::into)
     });
-    assert_killed_by_the_leaf(&failures, &reaps);
+    assert_killed_by_the_leaf(&failures, Some(&reaps));
 }
 
-/// Async twin of the sync `cgroup_a_failed_spawn_whose_leaf_kill_fails_leaves_the_front_running`.
+/// Async twin of the sync `cgroup_a_failed_spawn_whose_leaf_kill_fails_hands_back_the_front`, which
+/// leaves the front where the sync one hands it back.
 #[skuld::test]
 async fn cgroup_a_failed_spawn_whose_leaf_kill_fails_leaves_the_front_running(#[fixture(cgroup)] _group: &Group) {
     use crate::child::front_cgroup_tests::{assert_left_running, failed_held_front_spawns, LeafKill};
@@ -557,10 +558,12 @@ async fn cgroup_a_failed_spawn_whose_leaf_kill_fails_leaves_the_front_running(#[
         failed_held_front_spawns(kill, |cmd| {
             crate::tokio::spawn::spawn(cmd).map(drop).map_err(Into::into)
         }),
+        false,
     );
 }
 
-/// Async twin of the sync `cgroup_a_failed_spawn_leaves_a_front_moved_out_of_its_leaf_running`.
+/// Async twin of the sync `cgroup_a_failed_spawn_hands_back_a_front_moved_out_of_its_leaf`, which
+/// leaves the front where the sync one hands it back.
 #[skuld::test]
 async fn cgroup_a_failed_spawn_leaves_a_front_moved_out_of_its_leaf_running(#[fixture(cgroup)] _group: &Group) {
     use crate::child::front_cgroup_tests::{assert_left_running, failed_held_front_spawns, LeafKill};
@@ -570,6 +573,7 @@ async fn cgroup_a_failed_spawn_leaves_a_front_moved_out_of_its_leaf_running(#[fi
         failed_held_front_spawns(kill, |cmd| {
             crate::tokio::spawn::spawn(cmd).map(drop).map_err(Into::into)
         }),
+        false,
     );
 }
 
@@ -582,10 +586,11 @@ async fn cgroup_a_failed_spawn_kills_a_front_read_through_proc_and_reaps_it(#[fi
     let failures = failed_held_front_spawns(LeafKill::LandsReadThroughProc, |cmd| {
         crate::tokio::spawn::spawn(cmd).map(drop).map_err(Into::into)
     });
-    assert_killed_by_the_leaf(&failures, &reaps);
+    assert_killed_by_the_leaf(&failures, Some(&reaps));
 }
 
-/// Async twin of the sync `cgroup_a_failed_spawn_leaves_a_front_in_a_namesake_of_its_leaf_running`.
+/// Async twin of the sync `cgroup_a_failed_spawn_hands_back_a_front_in_a_namesake_of_its_leaf`, which
+/// leaves the front where the sync one hands it back.
 #[skuld::test]
 async fn cgroup_a_failed_spawn_leaves_a_front_in_a_namesake_of_its_leaf_running(#[fixture(cgroup)] _group: &Group) {
     use crate::child::front_cgroup_tests::{assert_left_running, failed_held_front_spawns, LeafKill};
@@ -595,6 +600,7 @@ async fn cgroup_a_failed_spawn_leaves_a_front_in_a_namesake_of_its_leaf_running(
         failed_held_front_spawns(kill, |cmd| {
             crate::tokio::spawn::spawn(cmd).map(drop).map_err(Into::into)
         }),
+        false,
     );
 }
 
@@ -627,7 +633,7 @@ async fn cgroup_a_failed_spawn_kills_a_front_nested_under_its_leaf_under_hidepid
     let failures = failed_held_front_spawns(LeafKill::LandsNestedHidden, |cmd| {
         crate::tokio::spawn::spawn(cmd).map(drop).map_err(Into::into)
     });
-    assert_killed_by_the_leaf(&failures, &reaps);
+    assert_killed_by_the_leaf(&failures, Some(&reaps));
 }
 
 /// Async twin of the sync `cgroup_a_front_whose_leaf_gives_no_id_is_refused_before_its_fork`.
@@ -890,14 +896,21 @@ async fn cgroup_a_contained_front_its_leaf_could_not_kill_is_left_running(#[fixt
     std::fs::remove_dir(&leaf).unwrap_or_else(|e| panic!("remove the leaf left behind, {leaf}: {e}"));
 }
 
-/// Async twin of the sync `cgroup_a_front_its_leaf_did_not_take_is_left_by_a_failed_identity_check`.
+/// Async twin of the sync `cgroup_a_front_its_leaf_did_not_take_is_handed_back_by_a_failed_identity_check`,
+/// which leaves the front where the sync one hands it back.
 #[skuld::test]
 async fn cgroup_a_front_its_leaf_did_not_take_is_left_by_a_failed_identity_check(#[fixture(cgroup)] _group: &Group) {
     let (mut cmd, stdin) = front_its_leaf_did_not_take();
-    let (err, pid) = fail_the_identity_check(&mut cmd, |cmd| {
-        crate::tokio::spawn::spawn(cmd).map(drop).map_err(Into::into)
-    });
-    assert_left_unsignalled(&err, pid, stdin);
+    let (err, pid, handed_back) = fail_the_identity_check(
+        &mut cmd,
+        |cmd| crate::tokio::spawn::spawn(cmd).map(drop).map_err(Into::into),
+        stdin,
+    );
+    assert!(
+        handed_back.is_none(),
+        "an async spawn leaves the front, it hands nothing back"
+    );
+    assert_left_unsignalled(&err, pid, handed_back);
 }
 
 /// A front whose leaf did not take it, dropped by tokio after its fork, is sent nothing, by the
