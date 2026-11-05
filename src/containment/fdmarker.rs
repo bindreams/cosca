@@ -1390,9 +1390,10 @@ impl Marker {
                                 new_walk.push(id);
                             }
                         }
-                        // A candidate that could not be read was warned and is not signalled: not
+                        // A candidate that could not be read is warned of and not signalled: not
                         // observed is not observed absent, so the sweep is incomplete.
                         if !walk.unassessed.is_empty() {
+                            crate::containment::treewalk::warn_unassessed(&walk.unassessed);
                             *incomplete = true;
                         }
                     }
@@ -1538,7 +1539,7 @@ impl Marker {
             // retried (see this fn's doc); folded into `incomplete`. Anything else
             // (`Terminated`, `AlreadyGone`) is a real resolution: progress.
             let outcome = crate::containment::treewalk::kill_by_identity(&crate::identity::HostKernel, id, signal);
-            crate::containment::treewalk::warn_if_not_attempted(&outcome);
+            crate::containment::treewalk::warn_if_not_attempted(id, signal, &outcome);
             if matches!(outcome, crate::containment::treewalk::KillOutcome::NotAttempted(_)) {
                 *incomplete = true;
             } else {
@@ -1640,7 +1641,7 @@ impl Marker {
             MarkerQuery::Held => {
                 use crate::containment::treewalk::KillOutcome;
                 let outcome = crate::containment::treewalk::kill_by_identity(&crate::identity::HostKernel, id, signal);
-                crate::containment::treewalk::warn_if_not_attempted(&outcome);
+                crate::containment::treewalk::warn_if_not_attempted(id, signal, &outcome);
                 // From the outcome, after the call: a kill that re-verified a different process, or
                 // sent nothing, leaves no record of a holder killed.
                 #[cfg(test)]

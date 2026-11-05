@@ -280,6 +280,16 @@ pub(crate) fn held_treewalk_blocker() -> (crate::Child, std::io::PipeWriter) {
     })
 }
 
+/// [`held_treewalk_blocker`] whose next walk on this thread is forced to leave `left` behind.
+#[cfg(target_os = "linux")]
+pub(crate) fn held_treewalk_blocker_leaving(
+    left: crate::containment::treewalk::fault::LeftBehind,
+) -> (crate::Child, std::io::PipeWriter) {
+    let blocker = held_treewalk_blocker();
+    crate::containment::treewalk::fault::force_incomplete_once(left);
+    blocker
+}
+
 /// A live [`BLOCKER_ARGV`] child with no containment, and the write end of its stdin, which the
 /// test holds. `kill_on_drop` is the command's.
 pub(crate) fn held_uncontained_blocker(kill_on_drop: bool) -> (crate::Child, std::io::PipeWriter) {
@@ -447,6 +457,16 @@ pub(crate) fn held_treewalk_blocker_async() -> (crate::tokio::Child, crate::toki
     held_blocker_async(crate::Stdio::null(), Console::Hidden, |cmd| {
         cmd.contain_with(crate::ContainMode::TreeWalk);
     })
+}
+
+/// Async twin of [`held_treewalk_blocker_leaving`].
+#[cfg(all(target_os = "linux", feature = "tokio"))]
+pub(crate) fn held_treewalk_blocker_leaving_async(
+    left: crate::containment::treewalk::fault::LeftBehind,
+) -> (crate::tokio::Child, crate::tokio::ChildStdin) {
+    let blocker = held_treewalk_blocker_async();
+    crate::containment::treewalk::fault::force_incomplete_once(left);
+    blocker
 }
 
 #[cfg(feature = "tokio")]

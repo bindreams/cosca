@@ -207,6 +207,41 @@ mod linux {
         );
     }
 
+    /// A failed spawn's cleanup on a `TreeWalk` child whose walk left only the root: the cleanup's own
+    /// kill of the root ends it, so the error says nothing of a tree that could not be killed and the
+    /// cleanup warns of none. A walk that left a descendant is still reported, in the error and the
+    /// warn.
+    ///
+    /// Mutant: the cleanup reports the walk's error before the root's kill.
+    #[skuld::test]
+    async fn finish_elevated_settles_a_walk_that_left_only_the_root_by_its_own_kill_of_the_root() {
+        use crate::containment::treewalk::fault::LeftBehind;
+        crate::log_capture::install();
+        for (left, reported) in [(LeftBehind::Root, false), (LeftBehind::Descendant, true)] {
+            let (child, _writer) = crate::test_child::held_treewalk_blocker_leaving_async(left);
+            let mark = crate::log_capture::mark();
+
+            let failure =
+                crate::tokio::spawn::finish_elevated(child, Err(crate::error::Error::Io(std::io::Error::other("w"))))
+                    .expect_err("the spawn fails");
+            let (cause, _, _) = crate::test_child::expect_may_have_started_parts(failure.into(), ());
+
+            let cause = cause.to_string();
+            assert_eq!(
+                cause.contains("its contained tree could not be killed"),
+                reported,
+                "{left:?}: {cause}"
+            );
+            // The handle left armed by an unsettled tree warns again when it drops; the cleanup's own
+            // warn is the one counted.
+            let warns: Vec<_> = warns_since(mark)
+                .into_iter()
+                .filter(|warn| warn.starts_with("finish_elevated:"))
+                .collect();
+            assert_eq!(warns.len(), usize::from(reported), "{left:?}: {warns:?}");
+        }
+    }
+
     /// The wait's failure is named in the one warn: the cause of a foreign wait result is carried, not
     /// only logged at `debug`.
     ///

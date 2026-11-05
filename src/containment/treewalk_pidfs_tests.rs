@@ -263,14 +263,18 @@ fn a_child_whose_parent_cannot_be_proved_again_is_unassessed_and_a_gone_child_is
     }
 }
 
-/// The warn for that child names the parent whose proof failed, and the child's pid once. Mutant:
-/// "the warn blames the child's pid".
+/// The error for that child names the parent whose proof failed, and the warn of the walk's caller
+/// ([`super::warn_unassessed`]) names the child's pid once. Mutant: "the error blames the child's
+/// pid".
 #[skuld::test]
-fn the_warn_for_a_child_whose_parent_cannot_be_proved_names_the_parent() {
+fn the_report_of_a_child_whose_parent_cannot_be_proved_names_the_parent() {
     crate::log_capture::install();
     let kernel = table().on_pidfs_ino_after_read(ROOT, &format!("{CHILD}/stat"), Err(Errno::BADF));
+    let walked = super::walk_from(&kernel, root(), &EDGES, Recursive::Yes)
+        .expect("the root reads")
+        .expect("the root is live");
     let mark = crate::log_capture::mark();
-    assert!(super::resolve_or_drop(&kernel, CHILD, root(), None).is_err());
+    super::warn_unassessed(&walked.unassessed);
     let warned = crate::log_capture::records_since_on_current_thread(mark, &format!("pid {CHILD}"));
     assert_eq!(warned.len(), 1, "{warned:?}");
     let (level, message) = &warned[0];
@@ -347,7 +351,7 @@ fn a_root_whose_proof_cannot_be_made_is_unassessable_and_signals_nothing() {
     let sends = crate::send_log::Capture::start();
     let walks = super::fault::record_walks();
     let results = [
-        super::hard_kill(&root_proof_fails(), root()),
+        super::hard_kill(&root_proof_fails(), root()).map_err(crate::containment::dispatch::Unkilled::into_error),
         super::terminate(&root_proof_fails(), root()),
         root().children_with(&root_proof_fails(), Recursive::No).map(|_| ()),
         root().children_with(&root_proof_fails(), Recursive::Yes).map(|_| ()),

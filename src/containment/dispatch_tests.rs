@@ -279,23 +279,19 @@ async fn async_kill_tree_backstop_is_load_bearing() {
 /// A `TreeWalk` walk that killed what it could and left a member is not a refusal to walk: the
 /// handle backstop still runs and kills the root. A walk that left only the root is settled by that
 /// backstop (`Ok`, the tree marked killed); one that left a descendant is still the error naming it.
-/// (macOS `TreeWalk` mode is an fd marker, which has no such walk.)
+/// (macOS `TreeWalk` mode is an fd marker, which has no such walk. The fault seam is Unix's; the
+/// settling code is shared.)
 /// Mutants: the incomplete walk's error is taken for a refusal to walk, so `kill_tree` returns it
 /// without the backstop; the backstop's kill of the root does not settle a walk that left only the
 /// root; it settles a walk that left a descendant.
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 #[skuld::test]
 fn sync_kill_tree_after_an_incomplete_walk_still_runs_the_handle_backstop() {
     use super::super::treewalk::fault::{self, LeftBehind};
     for left in [LeftBehind::Root, LeftBehind::Descendant] {
         let mut cmd = crate::test_child::command(Console::Hidden);
-        #[cfg(unix)]
         cmd.args(["cat"]);
-        #[cfg(windows)]
-        cmd.args([crate::test_child::windows_more()]);
         cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
-        #[cfg(windows)]
-        cmd.stdout(crate::Stdio::null()).expect("set stdout null");
         cmd.contain_with(crate::ContainMode::TreeWalk);
         let mut child = cmd.spawn().expect("spawn");
         // Closed right after the kill: a no-op backstop exits 0.
@@ -319,19 +315,14 @@ fn sync_kill_tree_after_an_incomplete_walk_still_runs_the_handle_backstop() {
     }
 }
 
-#[cfg(all(not(target_os = "macos"), feature = "tokio"))]
+#[cfg(all(unix, not(target_os = "macos"), feature = "tokio"))]
 #[skuld::test]
 async fn async_kill_tree_after_an_incomplete_walk_still_runs_the_handle_backstop() {
     use super::super::treewalk::fault::{self, LeftBehind};
     for left in [LeftBehind::Root, LeftBehind::Descendant] {
         let mut cmd = crate::test_child::tokio_command(Console::Hidden);
-        #[cfg(unix)]
         cmd.args(["cat"]);
-        #[cfg(windows)]
-        cmd.args([crate::test_child::windows_more()]);
         cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
-        #[cfg(windows)]
-        cmd.stdout(crate::Stdio::null()).expect("set stdout null");
         cmd.contain_with(crate::ContainMode::TreeWalk);
         let mut child = cmd.spawn().expect("spawn");
         // Closed right after the kill: a no-op backstop exits 0.

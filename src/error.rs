@@ -219,6 +219,11 @@ pub enum Error {
     /// Comes from the `TreeWalk` mechanism's `kill_tree` and `graceful_shutdown_tree`, and from
     /// [`Process::kill_tree`](crate::Process::kill_tree) and its `graceful_shutdown_tree`, which walk
     /// the tree. A retry walks again.
+    ///
+    /// **macOS.** There [`ContainMode::TreeWalk`](crate::ContainMode::TreeWalk) is the fd marker's
+    /// sweep, which reports a member it could not reach as [`Error::Containment`] or
+    /// [`Error::Unassessable`] without a `source`. This variant comes from the ppid walk alone:
+    /// `Process::kill_tree`, and a `TreeWalk` handle on Linux and Windows.
     #[error("pid {pid} was not killed: {source}")]
     MemberNotKilled {
         pid: u32,
@@ -473,7 +478,9 @@ impl Error {
 
     /// This error with `note` appended to what it says, its variant and kind kept: a caller that
     /// matches on the variant still sees the cause. An [`Error::Io`] keeps its kind, and its
-    /// original error as the [`source`](std::error::Error::source), which keeps the OS code.
+    /// original error as the [`source`](std::error::Error::source), which keeps the OS code. An
+    /// [`Error::MemberNotKilled`] whose source is an OS error is returned as it is, without the
+    /// note: its [`raw_os_error`](std::io::Error::raw_os_error) is part of its contract.
     #[cfg_attr(not(unix), allow(dead_code, reason = "only the unix spawn teardowns add a note"))]
     pub(crate) fn with_note(self, note: &str) -> Error {
         let append = |detail: String| format!("{detail}; {note}");
@@ -500,6 +507,11 @@ impl Error {
                 detail: append(detail),
                 source,
             },
+            // A refused kill's OS error is the contract of this variant, and a note would hide it
+            // behind a wrapper (an `io::Error` with a payload has no OS code).
+            Error::MemberNotKilled { pid, source } if matches!(&*source, Error::Io(e) if e.raw_os_error().is_some()) => {
+                Error::MemberNotKilled { pid, source }
+            }
             Error::MemberNotKilled { pid, source } => Error::MemberNotKilled {
                 pid,
                 source: Box::new(source.with_note(note)),

@@ -486,11 +486,92 @@ enum DropReach {
     Skip(String),
 }
 
+/// A tree kill that did not complete: the error that says why, and whether the root is the only
+/// member it left running. Only a `TreeWalk` walk can leave the root alone; the root's own death
+/// then settles it ([`Attached::settle`]).
+#[derive(Debug)]
+pub(crate) struct Unkilled {
+    /// What `kill_tree` returns: for a walk, the first member left behind.
+    pub(crate) error: Error,
+    pub(crate) only_root: bool,
+}
+
+impl Unkilled {
+    /// A walk whose every member but the root was killed or gone; `error` names the root.
+    #[cfg(any(unix, windows))]
+    pub(crate) fn root_alone(error: Error) -> Unkilled {
+        Unkilled { error, only_root: true }
+    }
+
+    pub(crate) fn into_error(self) -> Error {
+        self.error
+    }
+}
+
+/// A failure of any other kind leaves the root no better than the rest.
+impl From<Error> for Unkilled {
+    fn from(error: Error) -> Unkilled {
+        Unkilled {
+            error,
+            only_root: false,
+        }
+    }
+}
+
+/// A `kill_tree` sweep that failed, and whether the root is dead all the same: its handle backstop
+/// ended it. A caller that waits for the root before it returns the error reads that.
+pub(crate) struct SweepFailure {
+    pub(crate) error: Error,
+    pub(crate) root_ended: bool,
+}
+
+/// A failure before the backstop ran, or that sent it nowhere: the root is not known dead.
+impl From<Error> for SweepFailure {
+    fn from(error: Error) -> SweepFailure {
+        SweepFailure {
+            error,
+            root_ended: false,
+        }
+    }
+}
+
+impl SweepFailure {
+    /// Whether a kill of the root through its handle ended it: it was killed, or was already dead. A
+    /// kill that could not be verified (`Sent::Unverified`) may have left the root running.
+    pub(crate) fn killed_root(sent: &Result<crate::signal::Sent, Error>) -> bool {
+        use crate::signal::Sent;
+        matches!(sent, Ok(Sent::Delivered | Sent::Gone))
+    }
+
+    /// The handle backstop's answer from its root kill's `sent`, and whether it ended the root.
+    pub(crate) fn backstop_of(sent: Result<crate::signal::Sent, Error>) -> (Result<(), Error>, bool) {
+        let ended = Self::killed_root(&sent);
+        (sent.map(drop), ended)
+    }
+
+    /// The answer of a `kill_tree` sweep: the walk's error, settled by the root's death
+    /// ([`Attached::settle`]), else the backstop's. `root_ended`: the backstop ended the root.
+    pub(crate) fn of(
+        attached: &Attached,
+        killed: &TreeKilled,
+        walk: Result<(), Unkilled>,
+        backstop: Result<(), Error>,
+        root_ended: bool,
+    ) -> Result<(), SweepFailure> {
+        let walk = attached.settle(killed, walk, root_ended);
+        if let (Err(walk), Err(backstop)) = (&walk, &backstop) {
+            // Both-fail: the walk's error is surfaced; subsuming the backstop's is deliberate.
+            log::debug!("kill_tree handle backstop also failed ({backstop}); surfacing the walk's error: {walk}");
+        }
+        walk.and(backstop).map_err(|error| SweepFailure { error, root_ended })
+    }
+}
+
 /// What [`Attached::hard_kill_for_drop`] did to the tree.
 #[cfg(unix)]
 pub(crate) struct DropKill {
     /// The kill's result.
-    pub(crate) result: Result<(), Error>,
+    pub(crate) result: Result<(), Unkilled>,
     /// What the drop did not do, because the root's number is untrusted and this handle had not
     /// already killed the tree: the tree it names may outlive the drop.
     pub(crate) skipped: Option<String>,
@@ -600,17 +681,17 @@ impl Attached {
         not(unix),
         allow(unused_variables, reason = "only Unix names a group by the root's pid")
     )]
-    pub(crate) fn hard_kill(&self, root: &crate::containment::GroupRoot<'_>) -> Result<(), crate::error::Error> {
+    pub(crate) fn hard_kill(&self, root: &crate::containment::GroupRoot<'_>) -> Result<(), Unkilled> {
         match self {
             Attached::None | Attached::Delegated => Ok(()),
             #[cfg(unix)]
-            Attached::ProcessGroup(pgid) => crate::containment::unix::kill_group(*pgid, root),
+            Attached::ProcessGroup(pgid) => crate::containment::unix::kill_group(*pgid, root).map_err(Unkilled::from),
             #[cfg(target_os = "linux")]
-            Attached::Cgroup(leaf) => leaf.hard_kill(),
+            Attached::Cgroup(leaf) => leaf.hard_kill().map_err(Unkilled::from),
             #[cfg(windows)]
-            Attached::JobObject(job) => job.hard_kill().map_err(Error::Io),
+            Attached::JobObject(job) => job.hard_kill().map_err(|e| Unkilled::from(Error::Io(e))),
             #[cfg(target_os = "macos")]
-            Attached::FdMarker(m) => m.hard_kill(root),
+            Attached::FdMarker(m) => m.hard_kill(root).map_err(Unkilled::from),
             Attached::TreeWalk(root) => crate::containment::treewalk::hard_kill(&crate::identity::HostKernel, *root),
         }
     }
@@ -621,7 +702,7 @@ impl Attached {
         &self,
         killed: &TreeKilled,
         root: &crate::containment::GroupRoot<'_>,
-    ) -> Result<(), crate::error::Error> {
+    ) -> Result<(), Unkilled> {
         let result = self.hard_kill(root);
         if result.is_ok() {
             killed.mark();
@@ -635,38 +716,56 @@ impl Attached {
     /// ppid walk, so a retry could no longer find them. Every other mechanism's error is a kill that
     /// was attempted, and so is a `TreeWalk`'s [`Error::MemberNotKilled`]: that walk killed what it
     /// could and left a member.
-    pub(crate) fn hard_kill_refused_to_walk(&self, result: &Result<(), crate::error::Error>) -> bool {
-        matches!(self, Attached::TreeWalk(_)) && matches!(result, Err(e) if !matches!(e, Error::MemberNotKilled { .. }))
-    }
-
-    /// Whether `result`, from [`hard_kill`](Self::hard_kill), is a `TreeWalk`'s error that names the
-    /// root `root_pid` alone: the walk names the root last, so no other member was left behind.
-    /// The root's death by its handle then settles the walk.
-    pub(crate) fn hard_kill_left_only_the_root(&self, result: &Result<(), crate::error::Error>, root_pid: u32) -> bool {
+    pub(crate) fn hard_kill_refused_to_walk(&self, result: &Result<(), Unkilled>) -> bool {
         matches!(self, Attached::TreeWalk(_))
-            && matches!(result, Err(Error::MemberNotKilled { pid, .. }) if *pid == root_pid)
+            && matches!(result, Err(left) if !matches!(left.error, Error::MemberNotKilled { .. }))
     }
 
-    /// The result of `kill_tree`: the walk's `group` result and then the handle `backstop`'s, for the
-    /// root `root_pid`. A walk that left only the root is settled by a backstop that killed it: the
-    /// tree is gone, and `killed` records it. Otherwise the group's error comes first, then the
-    /// backstop's.
-    pub(crate) fn hard_kill_settled_by_backstop(
+    /// What `result`, from [`hard_kill`](Self::hard_kill), comes to once the root's own handle has had
+    /// its say: the one place that decides what a walk left behind. `root_ended`: the handle's kill
+    /// ended the root (it was killed, or was already dead). A walk that left only the root is settled
+    /// by that; otherwise the answer is the error of the first member still left behind. `Ok` marks
+    /// the tree killed in `killed`.
+    ///
+    /// `kill_tree` reads `root_ended` from its backstop, which it runs for any walk; a drop or a
+    /// failed spawn's cleanup reads it from the fate of the root kill it made after the walk.
+    pub(crate) fn settle(
         &self,
         killed: &TreeKilled,
-        group: Result<(), crate::error::Error>,
-        backstop: Result<(), crate::error::Error>,
-        root_pid: u32,
-    ) -> Result<(), crate::error::Error> {
-        if let (Err(group), Err(bs)) = (&group, &backstop) {
-            // Both-fail: the group error is surfaced; subsuming the backstop's is deliberate.
-            log::debug!("kill_tree handle backstop also failed ({bs}); surfacing the group error: {group}");
+        result: Result<(), Unkilled>,
+        root_ended: bool,
+    ) -> Result<(), Error> {
+        match result {
+            Ok(()) => {}
+            Err(left) if left.only_root && root_ended => {
+                debug_assert!(
+                    matches!(self, Attached::TreeWalk(_)),
+                    "only a tree walk leaves the root alone"
+                );
+            }
+            Err(left) => return Err(left.error),
         }
-        if backstop.is_ok() && self.hard_kill_left_only_the_root(&group, root_pid) {
-            killed.mark();
-            return Ok(());
-        }
-        group.and(backstop)
+        killed.mark();
+        Ok(())
+    }
+
+    /// [`settle`](Self::settle) for a drop: the text of its warn when the tree is not settled, worded
+    /// here and only when it will be logged.
+    pub(crate) fn settle_for_drop(
+        &self,
+        killed: &TreeKilled,
+        result: Result<(), Unkilled>,
+        root_ended: bool,
+    ) -> Option<String> {
+        let refused = self.hard_kill_refused_to_walk(&result);
+        self.settle(killed, result, root_ended).err().map(|e| {
+            let mut said = format!("contained-tree teardown did not fully succeed: {e}");
+            if refused {
+                // Unlike `kill_tree`, a drop cannot be retried: the root dies below either way.
+                said.push_str("; the root is killed regardless, so its descendants may be orphaned");
+            }
+            said
+        })
     }
 
     /// Send the graceful termination signal to the group (signal-only).
@@ -847,7 +946,9 @@ impl Attached {
         };
         let result = match self {
             #[cfg(target_os = "macos")]
-            Attached::FdMarker(m) => m.hard_kill_holders_only(m.root().filter(|_| view.unpinned_root())),
+            Attached::FdMarker(m) => m
+                .hard_kill_holders_only(m.root().filter(|_| view.unpinned_root()))
+                .map_err(Unkilled::from),
             _ => Ok(()),
         };
         DropKill {
@@ -1025,7 +1126,7 @@ impl Attached {
         view: &DropView,
         killed: &TreeKilled,
         root: &crate::containment::GroupRoot<'_>,
-    ) -> Result<Option<String>, crate::error::Error> {
+    ) -> Result<Option<String>, Unkilled> {
         let skipped = match self.drop_reach(view, root) {
             DropReach::Kill => return self.hard_kill_marking(killed, root).map(|()| None),
             #[cfg(target_os = "linux")]

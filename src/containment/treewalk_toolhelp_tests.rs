@@ -22,7 +22,10 @@ fn assert_names_toolhelp(result: Result<(), Error>, what: &str) {
 fn every_walk_over_a_failed_snapshot_errors_and_terminates_nothing() {
     type Walk = fn(&crate::Process) -> Result<(), Error>;
     let walks: [(&str, Walk); 2] = [
-        ("hard_kill", |p| super::hard_kill(&crate::identity::HostKernel, p.id())),
+        ("hard_kill", |p| {
+            super::hard_kill(&crate::identity::HostKernel, p.id())
+                .map_err(crate::containment::dispatch::Unkilled::into_error)
+        }),
         ("kill_tree", |p| p.kill_tree()),
     ];
     for (name, walk) in walks {

@@ -146,6 +146,41 @@ fn finish_elevated_with_an_unknown_root_and_a_failed_reap_warns_once() {
     );
 }
 
+/// A failed spawn's cleanup on a `TreeWalk` child whose walk left only the root: the cleanup's own
+/// kill of the root ends it, so the tree is settled. The error says nothing of a tree that could not
+/// be killed, the cleanup warns of none, and the handle is disarmed. A walk that left a descendant is
+/// still reported, in the error and the warn. Not on macOS, where `TreeWalk` mode is an fd marker.
+///
+/// Mutant: the cleanup reports the walk's error before the root's kill.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn finish_elevated_settles_a_walk_that_left_only_the_root_by_its_own_kill_of_the_root() {
+    use crate::containment::treewalk::fault::LeftBehind;
+    crate::log_capture::install();
+    for (left, reported) in [(LeftBehind::Root, false), (LeftBehind::Descendant, true)] {
+        let (child, writer) = crate::test_child::held_treewalk_blocker_leaving(left);
+        let mark = crate::log_capture::mark();
+
+        let failure = crate::child::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
+        let (cause, fate, _) = crate::test_child::expect_may_have_started_parts(failure.into(), writer);
+
+        assert!(fate.ended_by_the_kill(), "{left:?}: {fate:?}");
+        let cause = cause.to_string();
+        assert_eq!(
+            cause.contains("its contained tree could not be killed"),
+            reported,
+            "{left:?}: {cause}"
+        );
+        // The handle left armed by an unsettled tree warns again when it drops; the cleanup's own
+        // warn is the one counted.
+        let warns: Vec<_> = warns_since(mark)
+            .into_iter()
+            .filter(|warn| warn.starts_with("finish_elevated:"))
+            .collect();
+        assert_eq!(warns.len(), usize::from(reported), "{left:?}: {warns:?}");
+    }
+}
+
 /// A failed spawn's cleanup whose root kill is refused, and whose root still runs, hands the root
 /// back in the error and disarms the handle: the caller owns the root now, and the handle's drop does
 /// not retry the kill. The cleanup's one warn is the refusal.

@@ -437,22 +437,21 @@ impl Child {
         // a LIVE root (waiting unswept would hang), but once the root is dead (its exit was observed,
         // or the sweep's backstop killed it), the reap runs first so no zombie is stranded.
         if !drained {
-            let mut root_killed = false;
             // The `#[cfg(test)]` arm lets a test PROVE the sweep is skipped when `drained`,
             // not merely that it would have no-op'd: forcing this call to fail and then
             // observing `Ok` from the whole function is only possible if this branch was
             // never entered at all.
             #[cfg(test)]
             let sweep_result = if fault::take_force_kill_tree_error() {
-                Err(fault::forced_kill_tree_error())
+                Err(fault::forced_kill_tree_error().into())
             } else {
-                self.kill_tree_after(earlier, &mut root_killed)
+                self.kill_tree_after(earlier)
             };
             #[cfg(not(test))]
-            let sweep_result = self.kill_tree_after(earlier, &mut root_killed);
+            let sweep_result = self.kill_tree_after(earlier);
             if let Err(sweep) = sweep_result {
                 // A zombie launchd holds is not ours to reap: waiting on it only warns.
-                if (root_exited || root_killed) && !self.root_is_unpinned() {
+                if (root_exited || sweep.root_ended) && !self.root_is_unpinned() {
                     // Best-effort reap so a dead root isn't left a zombie; `sweep`
                     // (below) is already the error this call reports, so a failure here is
                     // secondary — but every other discarded error in this module is still logged,
@@ -464,7 +463,7 @@ impl Child {
                         );
                     }
                 }
-                return Err(sweep);
+                return Err(sweep.error);
             }
         }
         #[cfg(test)]

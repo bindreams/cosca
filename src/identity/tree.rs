@@ -89,8 +89,13 @@ impl ProcessId {
             return Ok(Vec::new());
         };
         // A candidate the walk could not read may be a child: the list would be short, not empty.
-        match walk.unassessed.into_iter().next() {
-            Some((_, why)) => Err(why),
+        // The error names the first; the rest are warned of.
+        let mut unassessed = walk.unassessed.into_iter();
+        match unassessed.next() {
+            Some((_, why)) => {
+                crate::containment::treewalk::warn_unassessed(&unassessed.collect::<Vec<_>>());
+                Err(why)
+            }
             None => Ok(walk.members),
         }
     }

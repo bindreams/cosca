@@ -330,12 +330,13 @@ fn the_anchor_hands_out_a_bound_only_on_windows() {
 }
 
 /// `resolve_or_drop` is a named discard site: an access-denied descendant must be dropped
-/// from the walk AND leave a warn behind, never be silently folded in with a gone pid.
+/// from the walk as an error naming it, never be silently folded in with a gone pid. The walk's
+/// caller reports it ([`super::warn_unassessed`]), so the walk itself logs nothing.
 #[cfg(windows)]
 #[skuld::test]
-fn resolve_or_drop_drops_an_access_denied_pid_and_warns() {
+fn resolve_or_drop_drops_an_access_denied_pid_as_an_error() {
     let Some(done) = crate::test_own_process::own_process(
-        crate::test_own_process::test_path!(resolve_or_drop_drops_an_access_denied_pid_and_warns),
+        crate::test_own_process::test_path!(resolve_or_drop_drops_an_access_denied_pid_as_an_error),
         crate::test_spawn::spawn,
     ) else {
         return;
@@ -345,14 +346,19 @@ fn resolve_or_drop_drops_an_access_denied_pid_and_warns() {
     let denied = crate::identity::windows_fixture::spawn_restricted(&done, PROCESS_SYNCHRONIZE.0);
     assert!(denied.is_running(), "precondition: the subject must be live");
     let mark = crate::log_capture::mark();
+    let Err(Error::Unassessable { detail, .. }) =
+        super::resolve_or_drop(&crate::identity::HostKernel, denied.pid(), ProcessId::current(), None)
+    else {
+        panic!("the walk cannot keep what it cannot verify, and an unread pid is not a gone one");
+    };
     assert!(
-        super::resolve_or_drop(&crate::identity::HostKernel, denied.pid(), ProcessId::current(), None).is_err(),
-        "the walk cannot keep what it cannot verify, and an unread pid is not a gone one"
+        detail.contains(&format!("pid {} exists but could not be queried", denied.pid())),
+        "{detail}"
     );
-    assert!(crate::log_capture::contains_since(
-        mark,
-        &format!("treewalk: pid {} exists but could not be queried", denied.pid())
-    ));
+    assert!(
+        !crate::log_capture::contains_since(mark, &format!("treewalk: pid {}", denied.pid())),
+        "the walk's caller reports it, not the walk"
+    );
     assert!(denied.is_running(), "and dropping it must not have touched it");
 }
 
@@ -545,7 +551,10 @@ fn hard_kill_of_a_root_whose_open_is_denied_is_an_error_naming_it() {
         .expect("the owned handle always yields an identity");
     assert!(child.is_running(), "precondition: the subject must be live");
     match super::hard_kill(&crate::identity::HostKernel, id) {
-        Err(crate::error::Error::MemberNotKilled { pid, source }) => {
+        Err(super::Unkilled {
+            error: crate::error::Error::MemberNotKilled { pid, source },
+            only_root: true,
+        }) => {
             assert_eq!(pid, child.pid());
             assert!(
                 matches!(*source, crate::error::Error::Unassessable { source: Some(_), .. }),
@@ -568,7 +577,9 @@ fn hard_kill_of_a_root_that_refuses_the_signal_is_an_error_carrying_the_errno(
     #[fixture(setuid)] _group: &crate::test_groups::Group,
 ) {
     let (child, stdin) = crate::test_privilege::spawn_setuid_blocker();
-    let err = super::hard_kill(&crate::identity::HostKernel, child.id()).expect_err("the kill is refused");
+    let left = super::hard_kill(&crate::identity::HostKernel, child.id()).expect_err("the kill is refused");
+    assert!(left.only_root, "the root is the only member the walk left");
+    let err = left.error;
     // The message reads once: the pid, then the OS's own words.
     let os = std::io::Error::from_raw_os_error(libc::EPERM);
     assert_eq!(

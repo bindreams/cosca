@@ -57,6 +57,7 @@ impl Process {
     /// [`kill_tree`](Self::kill_tree), reading through `kernel`.
     pub(crate) fn kill_tree_with(&self, kernel: &dyn crate::identity::Kernel) -> Result<(), Error> {
         crate::containment::treewalk::hard_kill(kernel, self.id)
+            .map_err(crate::containment::dispatch::Unkilled::into_error)
     }
 
     /// Best-effort graceful (`SIGTERM`) sweep of the foreign process's tree (identity-walk, root

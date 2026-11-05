@@ -521,7 +521,11 @@ fn macos_late_tree_walk_that_fails_before_the_root_kill_says_its_tree_may_be_lef
 /// Mutant: a later walk's `Ok` overwrites the error of the first.
 #[skuld::test]
 fn macos_late_tree_walk_that_leaves_a_member_says_its_tree_may_be_left() {
-    let (pid, fate, _, mark) = late_tree_walk(crate::containment::treewalk::fault::force_incomplete_once);
+    let (pid, fate, _, mark) = late_tree_walk(|| {
+        crate::containment::treewalk::fault::force_incomplete_once(
+            crate::containment::treewalk::fault::LeftBehind::Descendant,
+        );
+    });
     assert_eq!(fate, ChildFate::Reaped, "the root is killed and reaped");
     assert_one_warn(
         pid,

@@ -155,18 +155,9 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     };
     let tree = (child.containment().can_teardown() && !front_closed).then(|| kill_tree().map(|s| skipped = s));
     let tree_failure = match &tree {
-        Some(Err(e)) => Some(e.to_string()),
+        Some(Err(left)) => Some(left.error.to_string()),
         _ => None,
     };
-    // The tree is settled when it was killed completely, was not for the cleanup to kill, or was
-    // deliberately left alone because the root is reaped or unpinned.
-    let tree_settled = tree.is_none() || child.tree_killed.is_set() || (skipped.is_some() && view.leaves_root_alone());
-    let subject = child.attached.teardown_subject();
-    let (mut tree_note, tree_warn) = report_tree_teardown(tree, &subject);
-    report.tree = tree_warn;
-    if let Some(note) = skipped {
-        tree_note.push_str(&format!("; its contained tree was not killed: {note}"));
-    }
     let exited_front = matches!(gate, crate::elevation::front::Gate::Exited);
     let pid = child.id().pid();
     let (root_note, torn) = if view.unpinned_root() {
@@ -252,6 +243,21 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     // A root not shown collected is the caller's: it is disarmed, and handed back in the error.
     let hands_back = Disposition::HandBack.hands_back(&torn);
     let fate = torn.fate;
+    // The tree is reported after the root's kill: a walk that left only the root is settled by it.
+    let tree = tree.map(|walk| {
+        child
+            .attached
+            .settle(&child.tree_killed, walk, fate.ended_by_the_kill())
+    });
+    // The tree is settled when it was killed completely, was not for the cleanup to kill, or was
+    // deliberately left alone because the root is reaped or unpinned.
+    let tree_settled = tree.is_none() || child.tree_killed.is_set() || (skipped.is_some() && view.leaves_root_alone());
+    let subject = child.attached.teardown_subject();
+    let (mut tree_note, tree_warn) = report_tree_teardown(tree, &subject);
+    report.tree = tree_warn;
+    if let Some(note) = skipped {
+        tree_note.push_str(&format!("; its contained tree was not killed: {note}"));
+    }
     // A handed-back root takes the drop that would have retried a failed tree kill with it: retry
     // here. The one warn and the error's note say how the retry went.
     if hands_back && !tree_settled {
@@ -268,6 +274,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
             // A skip kills nothing: the notes of the first attempt stand.
             Ok(Some(_)) => {}
             Err(again) => {
+                let again = again.into_error();
                 let too = format!("; the retry failed too ({again})");
                 tree_note.push_str(&too);
                 match report.tree.as_mut() {
@@ -1129,7 +1136,7 @@ impl LateTree {
                 };
                 let result = attached
                     .hard_kill(&crate::containment::GroupRoot::new(None, &check))
-                    .map_err(|e| e.to_string());
+                    .map_err(|left| left.into_error().to_string());
                 self.fold(result);
             }
             // The root is not shown ours any more: only the holders, and never the root.
