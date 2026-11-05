@@ -412,8 +412,8 @@ impl Error {
 
     /// This error with `note` appended to what it says, its variant and kind kept: a caller that
     /// matches on the variant still sees the cause. An [`Error::Io`] keeps its kind, and its
-    /// original error as the [`source`](std::error::Error::source), which keeps the OS code one
-    /// `io::Error` down.
+    /// original error as the [`source`](std::error::Error::source), so the OS code stays where the
+    /// walk on [`Error::Io`] finds it.
     #[cfg_attr(not(unix), allow(dead_code, reason = "only the unix spawn teardowns add a note"))]
     pub(crate) fn with_note(self, note: &str) -> Error {
         let append = |detail: String| format!("{detail}; {note}");

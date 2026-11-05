@@ -203,6 +203,19 @@ fn a_noted_error_io_has_the_os_code_one_io_error_down() {
     assert_eq!(os_codes_below(&e), [None, Some(code)]);
 }
 
+/// A note on an `io_context` error, the shape the unix spawn teardowns produce, leaves the OS code
+/// under both wrappers.
+#[skuld::test]
+fn a_note_on_a_context_error_io_leaves_the_os_code_under_both() {
+    let code = if cfg!(windows) { 5 } else { 13 };
+    let e = Error::Io(crate::error::io_context(
+        "pidfd_open",
+        std::io::Error::from_raw_os_error(code),
+    ))
+    .with_note("while tearing down");
+    assert_eq!(os_codes_below(&e), [None, None, Some(code)]);
+}
+
 /// The `raw_os_error()` of each `io::Error` reached by walking `source()` from `e`, outermost first.
 fn os_codes_below(e: &Error) -> Vec<Option<i32>> {
     std::iter::successors(std::error::Error::source(e), |s| s.source())
