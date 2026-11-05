@@ -150,24 +150,25 @@ pub(crate) fn members(pgid: i32) -> std::io::Result<Vec<Member>> {
 /// read fails the listing unless the pid exited (`ENOENT`/`ESRCH`) or `hidepid` hides it
 /// (`EACCES`, or `EPERM` while the checked directory still answers).
 #[cfg(target_os = "linux")]
-pub(crate) fn members(pgid: i32) -> std::io::Result<Vec<Member>> {
+pub(crate) fn members_with(kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::io::Result<Vec<Member>> {
     use crate::identity::stat_parse::{parse_pgrp, parse_starttime_jiffies};
 
-    let proc_dir = crate::identity::proc_view_with(&crate::identity::HostKernel)
-        .into_dir()
-        .map_err(|why| match why.openat2_requirement() {
-            Some(requirement) => std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                format!("containment::unix::group::members: {requirement}, so pgid {pgid} cannot be listed"),
-            ),
-            None => std::io::Error::other(format!(
-                "containment::unix::group::members: {why}, so its process listing says nothing about pgid {pgid}"
-            )),
-        })?;
+    let proc_dir =
+        crate::identity::proc_view_with(kernel)
+            .into_dir()
+            .map_err(|why| match why.openat2_requirement() {
+                Some(requirement) => std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    format!("containment::unix::group::members: {requirement}, so pgid {pgid} cannot be listed"),
+                ),
+                None => std::io::Error::other(format!(
+                    "containment::unix::group::members: {why}, so its process listing says nothing about pgid {pgid}"
+                )),
+            })?;
     let mut out = Vec::new();
     // A listing error makes the whole scan unreliable; propagate it.
-    for pid in proc_dir.pids()? {
-        let stat = match crate::identity::pid_stat::read_in_scan(&crate::identity::HostKernel, &proc_dir, pid) {
+    for pid in kernel.pids(&proc_dir)? {
+        let stat = match crate::identity::pid_stat::read_in_scan(kernel, &proc_dir, pid) {
             Ok(crate::identity::pid_stat::PidStat::Read(bytes)) => bytes,
             // A pid outside a `pgid` listing carries no information about it; the residual (a
             // foreign-uid member of `pgid` itself, hidden by `hidepid`) is documented on
@@ -621,9 +622,13 @@ fn reconfirm_survivor(outcome: MemberOutcome, recheck: impl FnOnce() -> crate::i
 /// documents.
 pub(crate) fn converge(pgid: i32, signal: Signal, root: &GroupRoot<'_>) -> std::io::Result<GroupState> {
     #[cfg(test)]
-    let listed = members(fault::listed(pgid))?;
+    let listing_pgid = fault::listed(pgid);
     #[cfg(not(test))]
-    let listed = members(pgid)?;
+    let listing_pgid = pgid;
+    #[cfg(target_os = "linux")]
+    let listed = members_with(&crate::identity::HostKernel, listing_pgid)?;
+    #[cfg(not(target_os = "linux"))]
+    let listed = members(listing_pgid)?;
     #[cfg(test)]
     fault::run_after_listing();
     let mut refused = Vec::new();
@@ -779,9 +784,6 @@ pub(crate) mod fault {
     }
     #[cfg(target_os = "linux")]
     pub(crate) type ArmedAfterListing = crate::oneshot_hook::Armed;
-
-    #[cfg(target_os = "linux")]
-    pub(crate) use crate::identity::pid_stat::fault::force_stat_read;
 }
 
 #[cfg(test)]

@@ -198,6 +198,12 @@ mod test_stdio_tests;
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod test_support;
 
+// The integration tests' seccomp filters, included rather than copied.
+#[cfg(all(test, target_os = "linux"))]
+#[allow(dead_code, reason = "each user, here and in tests/, takes a subset of the file")]
+#[path = "../tests/common/seccomp.rs"]
+mod test_seccomp;
+
 #[cfg(test)]
 mod test_spawn;
 
