@@ -17,8 +17,7 @@
 //! prove descent. The candidate's [`OrderKey`] (when it started: Linux jiffies /
 //! Windows 100 ns FILETIME / macOS µs), read beside its id, must additionally order
 //! correctly against the root's: a genuine descendant was created at-or-after the
-//! root acquired its pid. The walk orders by the key and never reads the identity
-//! token for it. The keep predicate is
+//! root acquired its pid. The keep predicate is
 //!
 //! ```text
 //! key > root.key || (allow_equal && key == root.key)
@@ -29,19 +28,19 @@
 //!
 //! - An impostor — a *stale ppid* pointing at a *recycled* root pid — is always a
 //!   process created *before* the root (key **<** root.key), so it is
-//!   excluded by both rules. This is the case the order guard exists to defend.
+//!   excluded by both rules.
 //! - The rule cannot defend a root whose own pid was recycled: the new owner's children
 //!   are created after the root, so they pass it. So the walk takes its snapshot first, then
 //!   requires the root to still hold its pid ([`anchor_present`]); a root that does not
-//!   walks nothing. A root whose key cannot be read walks nothing either.
+//!   walks nothing. A root that is gone by the time its key is read walks nothing; one whose key
+//!   exists but cannot be read is an error (`Error::Unassessable`), never an empty walk.
 //! - A `key == root.key` candidate whose current ppid == root.pid can only be
 //!   a *genuine* same-tick child: an unrelated same-tick collision that also
 //!   happens to carry a recycled ppid equal to root.pid is impossible.
 //! - **Linux/macOS** reparent orphans to pid 1 / launchd, so a process whose ppid
 //!   still equals root.pid genuinely descends from it — ppid is *authoritative*.
 //!   `>=` is therefore safe AND catches same-jiffy immediate children that strict
-//!   `>` would silently miss under Linux's coarse 10 ms jiffy clock (this also
-//!   makes the live integration test deterministic).
+//!   `>` would silently miss under Linux's coarse 10 ms jiffy clock.
 //! - **Windows** does not reparent and recycles pids freely, so the rule stays
 //!   strict `>`. Its 100 ns FILETIME clock makes a same-tick *genuine* child
 //!   indistinguishable from impossible, so strict `>` loses nothing there.

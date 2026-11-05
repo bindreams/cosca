@@ -97,11 +97,7 @@ fn members_of_an_absent_group_is_empty() {
     assert_eq!(members(&HostKernel, i32::MAX).expect("list an absent group"), vec![]);
 }
 
-/// The id the listing carries is the SAME identity a live read of the pid would produce —
-/// not a different, incompatible one — so a later re-check is comparing like with like.
-/// (macOS: pinned across `proc_pidinfo` and `sysctl` by the existing `kinfo_tests`
-/// cross-source oracle; this test pins the listing itself against `ProcessId::of`'s live
-/// read, on both platforms.)
+/// The id the listing carries equals `ProcessId::of`'s live read of the pid, so a later re-check compares like with like.
 #[skuld::test]
 fn members_id_matches_a_live_read_of_the_same_pid() {
     // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.

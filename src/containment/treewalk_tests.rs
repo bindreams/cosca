@@ -69,7 +69,7 @@ fn same_tick_child_excluded_when_allow_equal_false() {
 }
 
 // Stale-PPID impostor (token < root) is EXCLUDED under BOTH rules =====
-// This is the mutation-check case: dropping the token guard would WRONGLY
+// This is the mutation-check case: dropping the order-key guard would WRONGLY
 // include pid 200 here (its ppid chains to the root), so this assertion fails if
 // the guard is removed.
 

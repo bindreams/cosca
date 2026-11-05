@@ -1390,8 +1390,7 @@ impl Marker {
                         }
                     }
                     // Not observed is not observed absent: like a blind pass, the walk channel
-                    // is skipped and the sweep reports `incomplete`. The root (above) and the
-                    // other channels still run, and the root's descendants are not retried here.
+                    // is skipped and the sweep reports `incomplete`.
                     Err(e) => {
                         log::warn!(
                             "fd marker {:#x}: the root's descendants could not be walked ({e}) \

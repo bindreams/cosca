@@ -15,7 +15,7 @@ pub enum Recursive {
 impl ProcessId {
     /// The parent process, by identity. Identity-guarded against pid-reuse: a genuine parent
     /// predates this child, so a recycled `ppid` naming a process created AFTER it (later
-    /// token) is rejected by the same token rule as [`children`](Self::children).
+    /// order key) is rejected by the same order-key rule as [`children`](Self::children).
     ///
     /// `Ok(None)` means there is none: `self` has no parent (pid 1), the parent has exited, or
     /// `self` is gone or was recycled. It is never an answer to a question that could not be
@@ -68,9 +68,7 @@ impl ProcessId {
                 ));
             }
         };
-        // Order guard: a genuine parent predates this child, so the child's order key
-        // orders at-or-after the parent's. A recycled ppid names a process created AFTER
-        // this one (later key) — reject it.
+        // A genuine parent predates this child; a recycled ppid names a later-started process.
         Ok(
             crate::containment::treewalk::keeps_order(key, parent_key, crate::containment::treewalk::ALLOW_EQUAL_ORDER)
                 .then_some(parent),
