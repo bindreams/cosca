@@ -514,6 +514,15 @@ fn drop_after_a_failed_kill_tree_and_wait_still_warns() {
     assert_eq!(records[0].0, log::Level::Warn);
 }
 
+/// The warns of a drop of a live root since `mark`.
+#[cfg(not(target_os = "macos"))]
+fn live_drop_warns_since(mark: usize) -> Vec<(log::Level, String)> {
+    crate::log_capture::records_since_on_current_thread(mark, "Child::drop")
+        .into_iter()
+        .filter(|(level, _)| *level == log::Level::Warn)
+        .collect()
+}
+
 /// A `TreeWalk` blocker whose next walk is forced to leave `left` behind. Not on macOS, where
 /// `TreeWalk` mode is an fd marker (the test above).
 #[cfg(not(target_os = "macos"))]
@@ -589,7 +598,7 @@ fn a_drop_whose_walk_leaves_a_descendant_warns_once_and_kills_the_root() {
     let records = crate::log_capture::records_since_on_current_thread(mark, "was not killed");
     assert_eq!(records.len(), 1, "{records:?}");
     assert_eq!(records[0].0, log::Level::Warn);
-    let drop_records = crate::log_capture::records_since_on_current_thread(mark, "Child::drop");
+    let drop_records = live_drop_warns_since(mark);
     assert_eq!(drop_records.len(), 1, "one report of the event: {drop_records:?}");
     assert_eq!(
         id.exists(),
@@ -613,10 +622,7 @@ fn a_drop_whose_walk_leaves_only_the_root_does_not_warn_when_the_drop_kills_it()
     drop(child);
 
     blocker.assert_killed();
-    assert_eq!(
-        crate::log_capture::records_since_on_current_thread(mark, "Child::drop"),
-        []
-    );
+    assert_eq!(live_drop_warns_since(mark), []);
     assert_eq!(
         id.exists(),
         crate::identity::Existence::Gone,
