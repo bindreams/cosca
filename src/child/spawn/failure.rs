@@ -51,7 +51,7 @@ pub(crate) enum SpawnFailure {
 impl SpawnFailure {
     /// A failure after which the program may have started, of a child that is not an elevation
     /// backend. `unreaped` is the child the spawn hands back, if it does; then `fate` is `Running`
-    /// with its identity.
+    /// with its identity, or `Unknown` (the look at it failed), or `Killed` (the wait for it failed).
     pub(crate) fn started(cause: Error, fate: ChildFate, unreaped: Option<Unreaped>) -> SpawnFailure {
         SpawnFailure::MayHaveStarted {
             cause,
@@ -182,8 +182,25 @@ impl SpawnFailure {
     /// otherwise.
     #[track_caller]
     pub(crate) fn expect_may_have_started_with(self) -> (Error, ChildFate) {
+        let (cause, fate, unreaped) = self.parts();
+        // Dropping a handed-back child would wait for it; a test that gets one takes it apart with
+        // `test_child::SpawnFailure::expect_may_have_started_parts`.
+        if let Some(unreaped) = unreaped {
+            unreaped.leak();
+            panic!("the spawn handed a child back ({fate:?}): {cause:?}");
+        }
+        (cause, fate)
+    }
+
+    /// The error, fate and handed-back child (if any) of a failure that answered that the program
+    /// may have started; panics otherwise. For `test_child`, which wraps the child in its
+    /// `HandedBack`.
+    #[track_caller]
+    pub(crate) fn parts(self) -> (Error, ChildFate, Option<Unreaped>) {
         match self {
-            SpawnFailure::MayHaveStarted { cause, fate, .. } => (cause, fate),
+            SpawnFailure::MayHaveStarted {
+                cause, fate, unreaped, ..
+            } => (cause, fate, unreaped.map(|unreaped| *unreaped)),
             SpawnFailure::NotStarted(e) => panic!("expected `may have started`, got `not started`: {e:?}"),
             #[cfg(target_os = "linux")]
             SpawnFailure::NotStartedUnreaped(e) => panic!("expected `may have started`, got `not started`: {e:?}"),
@@ -233,8 +250,24 @@ impl SpawnFailure {
 #[cfg(test)]
 #[track_caller]
 pub(crate) fn expect_may_have_started_with(error: Error) -> (Error, ChildFate) {
+    let (cause, fate, unreaped) = error_parts(error);
+    if let Some(unreaped) = unreaped {
+        unreaped.leak();
+        panic!("the spawn handed a child back ({fate:?}): {cause:?}");
+    }
+    (cause, fate)
+}
+
+/// The cause, fate and handed-back child (if any) inside an error a public spawn returned, which
+/// must say the program may have started. For `test_child`, which wraps the child in its
+/// `HandedBack`.
+#[cfg(test)]
+#[track_caller]
+pub(crate) fn error_parts(error: Error) -> (Error, ChildFate, Option<Unreaped>) {
     match error {
-        Error::MayHaveStarted { fate, source, .. } => (*source, fate),
+        Error::MayHaveStarted {
+            fate, source, unreaped, ..
+        } => (*source, fate, unreaped.map(|unreaped| *unreaped)),
         other => panic!("expected Error::MayHaveStarted, got {other:?}"),
     }
 }
@@ -299,10 +332,12 @@ impl From<SpawnFailure> for Error {
                     "a `may have started` failure's cause is itself `may have started`: {cause}"
                 );
                 debug_assert!(
-                    unreaped
-                        .as_ref()
-                        .is_none_or(|child| fate == ChildFate::Running { id: child.id() }),
-                    "a child handed back is `Running` with its identity, got {fate:?}"
+                    unreaped.as_ref().is_none_or(|child| match fate {
+                        ChildFate::Running { id } => id == child.id(),
+                        ChildFate::Unknown | ChildFate::Killed => true,
+                        _ => false,
+                    }),
+                    "a child handed back is `Running` with its identity, `Unknown` or `Killed`, got {fate:?}"
                 );
                 Error::MayHaveStarted {
                     fate,

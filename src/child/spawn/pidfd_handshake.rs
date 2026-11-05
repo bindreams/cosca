@@ -74,7 +74,11 @@ use rustix::net::{AddressFamily, RecvFlags, ReturnFlags, SendFlags, Shutdown, So
 
 use super::fd_channel::{above_stdio, above_stdio_keeping, publish_ends, register as register_hook, Shared};
 use super::{SpawnFailure, SpawnLockGuard};
+use crate::child::owned::teardown::{Disposition, TeardownKind};
+use crate::child::owned::OwnedChild;
 use crate::error::{ChildFate, Error};
+use crate::os_process::linux::LinuxProcess;
+use crate::wait::teardown_warn::Due;
 
 const GO: u8 = 1;
 /// A report's tag: the child's pidfd is attached as `SCM_RIGHTS`; the value is 0.
@@ -135,7 +139,7 @@ impl Spawned for std::process::Child {
 
     // std's `Child` reaps nothing on drop: the pidfd is the only reaper.
     fn reap_unexecuted(self, pidfd: OwnedFd, warn_after: Option<std::time::Duration>) -> ChildFate {
-        super::teardown_through_pidfd(Some(self.id()), pidfd, None, warn_after)
+        end_unexecuted(Some(self.id()), pidfd, warn_after)
     }
 
     fn abandon_unreported(self, why: &str) {
@@ -872,7 +876,7 @@ fn conclude<T: Spawned>(
     front: LeftFront,
     warn_after: Option<std::time::Duration>,
 ) -> Result<Held<T>, SpawnFailure> {
-    let teardown = |pidfd: OwnedFd| super::teardown_through_pidfd(None, pidfd, None, warn_after);
+    let teardown = |pidfd: OwnedFd| tear_down_through_pidfd(None, pidfd, warn_after);
     let opened_teardown = |pidfd: OwnedFd, error: Error| {
         use crate::os_process::child::PeekOutcome;
         use crate::wait::exit_only::{peek, Target};
@@ -972,13 +976,13 @@ fn conclude<T: Spawned>(
         }
         // Not told to go, so it never ran the program.
         (Err(e), Outcome::Gone(pidfd)) => {
-            let fate = teardown(pidfd);
+            let fate = end_unexecuted(None, pidfd, warn_after);
             with_child(Error::Io(e), fate)
         }
         // The helper's error explains the abort std reports.
         (Err(_), Outcome::Failed(e, pidfd)) => match pidfd {
             Some(pidfd) => {
-                let fate = teardown(pidfd);
+                let fate = end_unexecuted(None, pidfd, warn_after);
                 with_child(e, fate)
             }
             None => not_started_unreaped(e),
@@ -996,6 +1000,36 @@ fn conclude<T: Spawned>(
         }
         (Err(e), Outcome::NoReport | Outcome::Unwatched(_)) => not_started_unreaped(Error::Io(e)),
     }
+}
+
+/// Kills the child `pidfd` names, whose pid is `pid` if known, and reaps it, through an
+/// [`OwnedChild`] over the pidfd. A child it could not end is left running (`Leave`) and warned of;
+/// the fate says so. With `warn_after`, the wait for the killed child warns once it passes that long.
+fn tear_down_through_pidfd(pid: Option<u32>, pidfd: OwnedFd, warn_after: Option<std::time::Duration>) -> ChildFate {
+    let child = OwnedChild::new(Box::new(LinuxProcess::new(pid, pidfd)));
+    let torn = child.tear_down(
+        None,
+        TeardownKind::Kill {
+            disposition: Disposition::Leave,
+            tree: None,
+        },
+        Due::in_(warn_after),
+    );
+    if let Some(left) = &torn.left {
+        log::warn!("{left}");
+    }
+    torn.fate
+}
+
+/// [`tear_down_through_pidfd`] for a child that was never told to go, so it never ran the program: it
+/// has this process's credentials, and nothing but its being gone can refuse its kill.
+fn end_unexecuted(pid: Option<u32>, pidfd: OwnedFd, warn_after: Option<std::time::Duration>) -> ChildFate {
+    let fate = tear_down_through_pidfd(pid, pidfd, warn_after);
+    debug_assert!(
+        !matches!(fate, ChildFate::Running { .. }),
+        "the kill of a child that never ran the program was refused"
+    );
+    fate
 }
 
 /// Blocks until the child `pidfd` names has exited, without reaping it: a child that never ran
