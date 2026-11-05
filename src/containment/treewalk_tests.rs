@@ -45,7 +45,7 @@ fn keeps_genuine_later_child_under_both_rules() {
     let parents = [(200, ROOT_PID)];
     let tokens = HashMap::from([(200u32, ROOT_TOKEN + 5)]);
     for allow_equal in [true, false] {
-        let got = descendants_with(root(), root_key(), &parents, allow_equal, resolver(&tokens));
+        let got = descendants_with(root(), root_key(), &parents, allow_equal, false, resolver(&tokens));
         assert_eq!(pids(got), [200], "later child kept (allow_equal={allow_equal})");
     }
 }
@@ -56,7 +56,7 @@ fn keeps_genuine_later_child_under_both_rules() {
 fn same_tick_child_included_when_allow_equal_true() {
     let parents = [(200, ROOT_PID)];
     let tokens = HashMap::from([(200u32, ROOT_TOKEN)]); // equal token
-    let got = descendants_with(root(), root_key(), &parents, true, resolver(&tokens));
+    let got = descendants_with(root(), root_key(), &parents, true, false, resolver(&tokens));
     assert_eq!(pids(got), [200], "same-tick child included with allow_equal=true");
 }
 
@@ -64,7 +64,7 @@ fn same_tick_child_included_when_allow_equal_true() {
 fn same_tick_child_excluded_when_allow_equal_false() {
     let parents = [(200, ROOT_PID)];
     let tokens = HashMap::from([(200u32, ROOT_TOKEN)]); // equal token
-    let got = descendants_with(root(), root_key(), &parents, false, resolver(&tokens));
+    let got = descendants_with(root(), root_key(), &parents, false, false, resolver(&tokens));
     assert!(got.is_empty(), "same-tick child excluded with allow_equal=false");
 }
 
@@ -80,7 +80,7 @@ fn stale_ppid_impostor_excluded_under_both_rules() {
     let parents = [(200, ROOT_PID)];
     let tokens = HashMap::from([(200u32, ROOT_TOKEN - 1)]);
     for allow_equal in [true, false] {
-        let got = descendants_with(root(), root_key(), &parents, allow_equal, resolver(&tokens));
+        let got = descendants_with(root(), root_key(), &parents, allow_equal, false, resolver(&tokens));
         assert!(got.is_empty(), "impostor excluded (allow_equal={allow_equal})");
     }
 }
@@ -96,7 +96,7 @@ fn recurses_into_deep_tree() {
         (300u32, ROOT_TOKEN + 2),
         (400u32, ROOT_TOKEN + 3),
     ]);
-    let got = descendants_with(root(), root_key(), &parents, true, resolver(&tokens));
+    let got = descendants_with(root(), root_key(), &parents, true, false, resolver(&tokens));
     assert_eq!(pids(got), [200, 300, 400]);
 }
 
@@ -110,8 +110,70 @@ fn impostor_prunes_its_whole_subtree() {
         (200u32, ROOT_TOKEN - 5), // impostor
         (300u32, ROOT_TOKEN + 5), // would-be grandchild
     ]);
-    let got = descendants_with(root(), root_key(), &parents, true, resolver(&tokens));
+    let got = descendants_with(root(), root_key(), &parents, true, false, resolver(&tokens));
     assert!(got.is_empty(), "subtree under a rejected impostor is pruned");
+}
+
+// The parent-order rule: a candidate must also order after its accepted parent =====
+
+/// The Windows stale-creator edge: 300's ppid names pid 200, but 300 was created after the root and
+/// before the process that holds 200 now (200's number changed hands, so the edge is stale). With
+/// the rule on, 300 and everything under it are dropped. Mutants (compare against the root's key;
+/// rule ignored) keep 300 with the rule on.
+#[skuld::test]
+fn a_candidate_that_orders_before_its_accepted_parent_is_dropped_with_its_subtree_when_the_rule_is_on() {
+    let parents = [(200, ROOT_PID), (300, 200), (400, 300)];
+    let tokens = HashMap::from([
+        (200u32, ROOT_TOKEN + 10),
+        (300u32, ROOT_TOKEN + 5), // after the root, before its accepted parent
+        (400u32, ROOT_TOKEN + 20),
+    ]);
+    for allow_equal in [true, false] {
+        let got = descendants_with(root(), root_key(), &parents, allow_equal, true, resolver(&tokens));
+        assert_eq!(pids(got), [200], "rule on, allow_equal={allow_equal}");
+        let got = descendants_with(root(), root_key(), &parents, allow_equal, false, resolver(&tokens));
+        assert_eq!(pids(got), [200, 300, 400], "rule off, allow_equal={allow_equal}");
+    }
+}
+
+/// A real chain, each key after its parent's, is kept under every setting.
+#[skuld::test]
+fn a_chain_whose_keys_each_follow_their_parents_is_kept_under_both_settings() {
+    let parents = [(200, ROOT_PID), (300, 200), (400, 300)];
+    let tokens = HashMap::from([
+        (200u32, ROOT_TOKEN + 1),
+        (300u32, ROOT_TOKEN + 2),
+        (400u32, ROOT_TOKEN + 3),
+    ]);
+    for allow_equal in [true, false] {
+        for parent_order in [true, false] {
+            let got = descendants_with(
+                root(),
+                root_key(),
+                &parents,
+                allow_equal,
+                parent_order,
+                resolver(&tokens),
+            );
+            assert_eq!(
+                pids(got),
+                [200, 300, 400],
+                "allow_equal={allow_equal}, parent_order={parent_order}"
+            );
+        }
+    }
+}
+
+/// The parent comparison takes the OS's `allow_equal`, as the root comparison does: a child whose
+/// key equals its accepted parent's is kept only when equality is allowed.
+#[skuld::test]
+fn a_candidate_whose_key_equals_its_accepted_parents_follows_allow_equal_when_the_rule_is_on() {
+    let parents = [(200, ROOT_PID), (300, 200)];
+    let tokens = HashMap::from([(200u32, ROOT_TOKEN + 10), (300u32, ROOT_TOKEN + 10)]);
+    let got = descendants_with(root(), root_key(), &parents, true, true, resolver(&tokens));
+    assert_eq!(pids(got), [200, 300], "equal to its parent, allow_equal=true");
+    let got = descendants_with(root(), root_key(), &parents, false, true, resolver(&tokens));
+    assert_eq!(pids(got), [200], "equal to its parent, allow_equal=false");
 }
 
 // A reparented orphan (ppid no longer == root) is honestly missed =====
@@ -122,7 +184,7 @@ fn reparented_orphan_is_missed() {
     // pid 1; its ppid no longer chains to the root, so the walk cannot reach it.
     let parents = [(300, 1)];
     let tokens = HashMap::from([(300u32, ROOT_TOKEN + 9)]);
-    let got = descendants_with(root(), root_key(), &parents, true, resolver(&tokens));
+    let got = descendants_with(root(), root_key(), &parents, true, false, resolver(&tokens));
     assert!(got.is_empty(), "reparented orphan is honestly missed (documented)");
 }
 
@@ -134,7 +196,7 @@ fn root_is_never_included() {
     // root pid never appears in the descendant set even if such an edge exists.
     let parents = [(ROOT_PID, ROOT_PID), (200, ROOT_PID)];
     let tokens = HashMap::from([(ROOT_PID, ROOT_TOKEN), (200u32, ROOT_TOKEN + 1)]);
-    let got = descendants_with(root(), root_key(), &parents, true, resolver(&tokens));
+    let got = descendants_with(root(), root_key(), &parents, true, false, resolver(&tokens));
     assert_eq!(pids(got), [200], "root excluded; genuine child kept");
 }
 
@@ -146,7 +208,7 @@ fn duplicate_edge_yields_pid_once() {
     // (or later double-kill) the same process twice.
     let parents = [(200, ROOT_PID), (200, ROOT_PID)];
     let tokens = HashMap::from([(200u32, ROOT_TOKEN + 1)]);
-    let got = descendants_with(root(), root_key(), &parents, true, resolver(&tokens));
+    let got = descendants_with(root(), root_key(), &parents, true, false, resolver(&tokens));
     assert_eq!(pids(got), [200], "duplicate edge collapses to a single result");
 }
 
@@ -158,7 +220,7 @@ fn unresolvable_candidate_is_skipped() {
     // snapshot and resolve); it is dropped along with anything under it.
     let parents = [(200, ROOT_PID), (300, 200)];
     let tokens = HashMap::from([(300u32, ROOT_TOKEN + 5)]); // 200 missing
-    let got = descendants_with(root(), root_key(), &parents, true, resolver(&tokens));
+    let got = descendants_with(root(), root_key(), &parents, true, false, resolver(&tokens));
     assert!(got.is_empty(), "gone candidate and its subtree are skipped");
 }
 
@@ -235,7 +297,7 @@ fn a_candidate_whose_order_key_precedes_the_roots_is_dropped_even_when_its_id_to
     };
     for allow_equal in [true, false] {
         assert!(
-            descendants_with(root(), root_key(), &parents, allow_equal, resolve).is_empty(),
+            descendants_with(root(), root_key(), &parents, allow_equal, false, resolve).is_empty(),
             "descendants_with dropped by key (allow_equal={allow_equal})"
         );
         assert!(
@@ -261,7 +323,7 @@ fn the_resolver_is_asked_for_each_candidates_accepted_parent() {
         Some(resolved(pid, ROOT_TOKEN + 1))
     };
     let parents = [(200, ROOT_PID), (300, 200)];
-    descendants_with(root(), root_key(), &parents, true, resolve);
+    descendants_with(root(), root_key(), &parents, true, false, resolve);
     assert_eq!(asked.take(), [(200, root()), (300, id(200, ROOT_TOKEN + 1))]);
 
     children_of_with(root(), root_key(), &parents, true, resolve);
@@ -285,7 +347,14 @@ fn candidates_are_compared_against_the_roots_order_key_not_its_id_token() {
         };
         for allow_equal in [true, false] {
             let want: &[RawPid] = if kept { &[200] } else { &[] };
-            let got = descendants_with(root(), OrderKey::for_test(root_key), &parents, allow_equal, resolve);
+            let got = descendants_with(
+                root(),
+                OrderKey::for_test(root_key),
+                &parents,
+                allow_equal,
+                false,
+                resolve,
+            );
             assert_eq!(
                 pids(got),
                 want,
@@ -326,6 +395,40 @@ fn resolve_or_drop_drops_an_access_denied_pid_and_warns() {
         &format!("treewalk: pid {} exists but could not be queried", denied.pid())
     ));
     assert!(denied.is_running(), "and dropping it must not have touched it");
+}
+
+/// The Windows wiring of the parent-order rule, through `descendants_from_key` with real processes:
+/// `y` started before `x`, both after the root (this process). A snapshot that names `x` as `y`'s
+/// parent is a stale creator edge: `y` orders after the root but before its claimed parent, so it
+/// is dropped. Named the other way round, the same processes are a genuine chain. Mutants (const
+/// false on Windows; flags swapped in `descendants_from_key`) keep `y` under `x`.
+#[cfg(windows)]
+#[skuld::test]
+fn a_real_candidate_that_started_before_its_claimed_parent_is_dropped_on_windows() {
+    use crate::identity::HostKernel;
+    use crate::test_child::{live_findstr_blocker, release_findstr_unterminated};
+
+    let root = ProcessId::current();
+    let root_key = super::anchor(&HostKernel, root)
+        .expect("the root reads")
+        .expect("the root is live");
+    // `y` is created first, so its sequence number is the lower.
+    let (y_child, y) = live_findstr_blocker();
+    let (x_child, x) = live_findstr_blocker();
+
+    let stale_creator = [(x.pid(), root.pid()), (y.pid(), x.pid())];
+    assert_eq!(
+        super::descendants_from_key(&HostKernel, root, root_key, &stale_creator),
+        vec![x]
+    );
+    let genuine = [(y.pid(), root.pid()), (x.pid(), y.pid())];
+    assert_eq!(
+        super::descendants_from_key(&HostKernel, root, root_key, &genuine),
+        vec![y, x]
+    );
+
+    release_findstr_unterminated(x_child);
+    release_findstr_unterminated(y_child);
 }
 
 /// `kill_by_identity`-s pre-open Denied arm - the outcome that can leave a process running.

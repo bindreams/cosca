@@ -97,8 +97,9 @@ impl ProcessId {
 
     /// The process's children. `Recursive::No` = direct children; `Recursive::Yes` = the
     /// whole subtree. Identity-guarded against pid-reuse by the tree-walk order-key rule (a
-    /// candidate is kept only if its order key orders at-or-after this process's). Snapshot;
-    /// best-effort.
+    /// candidate is kept only if its order key orders at-or-after this process's). On Windows with
+    /// `Recursive::Yes`, each candidate must also order after its accepted parent, and Windows
+    /// compares strictly (`>`), not at-or-after. Snapshot; best-effort.
     ///
     /// An empty list means there are none (or `self` is gone or was recycled); a process table
     /// that cannot be read is an error, never an empty list.
