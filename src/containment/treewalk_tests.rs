@@ -231,7 +231,7 @@ fn resolve_or_drop_drops_an_access_denied_pid_and_warns() {
     assert!(denied.is_running(), "precondition: the subject must be live");
     let mark = crate::log_capture::mark();
     assert!(
-        super::resolve_or_drop(denied.pid()).is_none(),
+        super::resolve_or_drop(&crate::identity::HostKernel, denied.pid()).is_none(),
         "the walk cannot keep what it cannot verify"
     );
     assert!(crate::log_capture::contains_since(
