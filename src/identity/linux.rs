@@ -39,8 +39,8 @@ use self::kernel::Kernel;
 use self::proc_view::ProcDir;
 use self::prove::Proof;
 use super::probe::{classify_unreadable, SignalProbe};
-use super::stat_parse::parse_starttime_jiffies;
-use super::{Existence, Liveness, OrderKey, RawPid, Resolved, TokenKind, UnknownCause};
+use super::stat_parse::{parse_ppid, parse_starttime_jiffies};
+use super::{Existence, Liveness, OrderKey, OrderedRead, ParentRead, RawPid, Resolved, TokenKind, UnknownCause};
 use crate::error::Error;
 
 /// `kill(pid, 0)` — existence/permission check only, no signal delivered. The target
@@ -250,6 +250,39 @@ pub(super) fn of_stat(kernel: &dyn Kernel, pid: RawPid) -> (Resolved<(Key, Vec<u
                 UnknownCause::of_view(view),
             )
         }
+    }
+}
+
+/// The key, the order key (the `starttime`) and the parent number of `pid`, all from the `stat` that
+/// [`of_stat`] pairs with the key. A `stat` with no `starttime` is unreadable, not a start of zero;
+/// the ppid is parsed (and an unreadable one logged) only when `ask_parent`, and is then unreadable,
+/// not a parent number.
+pub(super) fn ordered_read(kernel: &dyn Kernel, pid: RawPid, ask_parent: bool) -> OrderedRead {
+    let (read, cause) = of_stat(kernel, pid);
+    let (key, stat) = match read {
+        Resolved::Found(found) => found,
+        Resolved::Gone => return OrderedRead::missing(Resolved::Gone, cause, ask_parent),
+        Resolved::Unknown => return OrderedRead::missing(Resolved::Unknown, cause, ask_parent),
+    };
+    let parent = if !ask_parent {
+        ParentRead::NotAsked
+    } else if let Some(ppid) = parse_ppid(&stat) {
+        ParentRead::Is(ppid)
+    } else {
+        log::debug!("identity: the stat of pid {pid} has no readable ppid");
+        ParentRead::Unreadable
+    };
+    match parse_starttime_jiffies(&stat) {
+        Some(ticks) => OrderedRead {
+            read: Resolved::Found((key, OrderKey(ticks))),
+            parent,
+            cause,
+        },
+        None => OrderedRead {
+            read: Resolved::Unknown,
+            parent,
+            cause: UnknownCause::default(),
+        },
     }
 }
 
