@@ -147,6 +147,35 @@ fn a_held_process_needs_no_second_pidfd_open() {
     }
 }
 
+/// The root-only grace wait of a graceful shutdown looks through the handle the child holds: with
+/// `pidfd_open` refused from before the `SIGTERM`, it still sees the exit and surfaces no watch
+/// error. The child is contained without a cgroup, so only its root is watched. The control socket
+/// is released only afterwards, so a shutdown that sent no `SIGTERM` ends in the escalation's
+/// `SIGKILL`, not in the assertion's `SIGTERM`.
+///
+/// Mutant: the grace wait re-opens the child by its identity.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_root_only_graceful_shutdown_needs_no_pidfd_open() {
+    use std::os::unix::process::ExitStatusExt;
+
+    for (code, name) in REFUSALS {
+        let (child, control) = common::spawn_control("control-block", &["R"], true);
+        let status = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    common::seccomp::deny_pidfd_open_on_this_thread(code);
+                    child.graceful_shutdown_tree(Duration::from_secs(30))
+                })
+                .join()
+                .expect("the filtered thread")
+        });
+        drop(control);
+        let status = status.unwrap_or_else(|e| panic!("{name}: the grace wait needs no pidfd_open: {e}"));
+        assert_eq!(status.signal(), Some(libc::SIGTERM), "{name}: {status:?}");
+    }
+}
+
 /// [`a_seccomp_refused_pidfd_open_fails_the_open_naming_process_open`] for the async `Process`.
 #[cfg(target_os = "linux")]
 #[cfg(feature = "tokio")]

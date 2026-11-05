@@ -204,10 +204,12 @@ fn child_graceful_shutdown_tree_graceful_root_sigterm() {
     );
 }
 
-// With no descriptor free, `terminate` and the root-only grace wait still work: they signal and
-// look through the handle they hold, and open nothing. The fixtures run in a re-exec'd process
-// (the limit is process-wide) and lower `RLIMIT_NOFILE` to the lowest free descriptor number, so
-// that every `pidfd_open`, `/proc` open or pipe made under it fails with `EMFILE`.
+// With no descriptor free, `terminate` still works: it signals through the handle it holds and
+// opens nothing. The fixture runs in a re-exec'd process (the limit is process-wide) and lowers
+// `RLIMIT_NOFILE` to the lowest free descriptor number, so that every `pidfd_open`, `/proc` open or
+// pipe made under it fails with `EMFILE`. The root-only grace wait of `graceful_shutdown_tree` is
+// shown the same way under a refused `pidfd_open` in `tests/linux_pidfd_refused.rs`: the sweep
+// that follows the grace lists `/proc`, which an exhausted table would fail.
 
 /// Lowers the soft `RLIMIT_NOFILE` to the number of the lowest free descriptor while it lives.
 #[cfg(target_os = "linux")]
@@ -276,50 +278,6 @@ fn fixture_terminate_with_no_free_descriptor() {
     terminated.expect("terminate opens no descriptor");
     drop(stdin);
     let status = child.wait().expect("reap");
-    assert_eq!(status.signal(), Some(libc::SIGTERM), "{status:?}");
-}
-
-// The root-only grace wait looks through the held handle too: with no descriptor free from the
-// `SIGTERM` on, it still sees the exit and surfaces no watch error.
-//
-// Mutant: the grace wait re-opens the child.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn graceful_shutdown_grace_wait_needs_no_free_descriptor() {
-    crate::test_child::run_fixture(crate::test_child::fixture_path!(
-        fixture_graceful_shutdown_with_no_free_descriptor
-    ));
-}
-
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn fixture_graceful_shutdown_with_no_free_descriptor() {
-    use std::cell::Cell;
-    use std::os::unix::process::ExitStatusExt;
-    use std::rc::Rc;
-
-    if !crate::test_child::is_fixture_reexec() {
-        return;
-    }
-    let _warns = crate::log_capture::warn_watch();
-    let (child, stdin) = crate::test_child::held_contained_blocker_without_cgroup(crate::Stdio::pipe());
-    assert!(
-        !child.containment().can_observe_drain(),
-        "the fixture must watch the root only, got {:?}",
-        child.containment()
-    );
-    // At the hook the `SIGTERM` is sent: the grace wait that follows runs with no descriptor free.
-    let lowered = Rc::new(Cell::new(None));
-    let slot = Rc::clone(&lowered);
-    let _hook = term_fault::at(term_fault::HookPoint::AfterTerminate, move || {
-        drop(stdin);
-        slot.set(Some(NoFreeDescriptor::lower()));
-    });
-
-    let status = child.graceful_shutdown_tree(Duration::from_secs(30));
-    drop(lowered.take());
-
-    let status = status.expect("the grace wait must see the exit through the handle");
     assert_eq!(status.signal(), Some(libc::SIGTERM), "{status:?}");
 }
 
