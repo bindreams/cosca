@@ -2,6 +2,8 @@
 //! checked by `peek_verified`, which re-reads the child's unique id, after the read.
 
 use std::cell::{Cell, RefCell};
+
+use crate::test_child::Console;
 use std::rc::Rc;
 
 use crate::child::spawn::fault::{self, SpawnPoint};
@@ -94,7 +96,7 @@ pub(crate) fn other_unique_id(pid: u32) -> UniqRead {
 
 pub(crate) fn sync_blocker() -> (crate::Command, std::io::PipeWriter) {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
     (cmd, writer)
@@ -401,7 +403,7 @@ fn macos_sync_spawn_takes_the_childs_own_unique_id_and_reads_its_unique_id_by_pi
 #[skuld::test]
 fn macos_sync_spawn_childs_own_read_refused_is_unassessable_and_the_program_does_not_run() {
     let (stdout, reader) = ran_marker();
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(RAN_ARGV);
     cmd.stdout(stdout).expect("set stdout");
     let _forced = unique_report::seams::force_child_read_errno(libc::EPERM);

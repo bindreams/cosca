@@ -112,7 +112,7 @@ fn signal_refuses_a_child_with_no_mechanism() {
 #[cfg(windows)]
 #[skuld::test]
 fn signal_attempts_a_child_whose_group_may_be_in_another_console() {
-    let (child, stdin) = crate::test_child::windows_blocker();
+    let (child, stdin) = crate::test_child::windows_blocker_on_console();
     let other = super::signal(GracefulMechanism::OtherConsoleGroup, child.id(), root_is_not_signalled);
     let group = super::signal(GracefulMechanism::ConsoleGroup, child.id(), root_is_not_signalled);
     assert!(
@@ -141,7 +141,7 @@ fn signal_attempts_a_child_whose_group_may_be_in_another_console() {
 #[cfg(windows)]
 #[skuld::test]
 fn signal_refuses_a_child_cosca_did_not_create() {
-    let (child, stdin) = crate::test_child::windows_blocker();
+    let (child, stdin) = crate::test_child::windows_blocker_on_console();
     let mechanism = crate::containment::Attachment::uac_elevated().graceful;
     let err = super::signal(mechanism, child.id(), root_is_not_signalled)
         .expect_err("a child cosca did not create must not be signalled");

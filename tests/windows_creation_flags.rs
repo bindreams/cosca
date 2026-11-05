@@ -88,7 +88,7 @@ fn probe(backend: Backend, intent: Intent) -> String {
 
     match backend {
         Backend::SyncArgv | Backend::SyncExecutable => {
-            let mut cmd = cosca::Command::new();
+            let mut cmd = common::command(common::Console::Asked);
             cmd.args(&argv);
             if backend.is_raw() {
                 cmd.executable(testbin());
@@ -122,7 +122,7 @@ fn probe(backend: Backend, intent: Intent) -> String {
                     .set_nonblocking(true)
                     .expect("set the listener nonblocking for tokio");
                 let listener = ::tokio::net::TcpListener::from_std(listener).expect("wrap the listener for tokio");
-                let mut cmd = cosca::tokio::Command::new();
+                let mut cmd = common::tokio_command(common::Console::Asked);
                 cmd.args(&argv);
                 if backend.is_raw() {
                     cmd.executable(testbin());
@@ -299,7 +299,7 @@ fn a_no_window_contained_child_reports_no_in_process_route_via_the_raw_backend()
     let me = std::process::id().to_string();
 
     let spawn_one = |hidden: bool| -> (cosca::Child, TcpStream) {
-        let mut cmd = cosca::Command::new();
+        let mut cmd = common::command(common::Console::Asked);
         cmd.executable(testbin())
             .args(report_argv(&addr, &me))
             .env(common::ACK_ENV, "1")
@@ -354,7 +354,7 @@ async fn an_async_no_window_contained_child_reports_no_in_process_route_via_the_
         me: &str,
         hidden: bool,
     ) -> (cosca::tokio::Child, TcpStream) {
-        let mut cmd = cosca::tokio::Command::new();
+        let mut cmd = common::tokio_command(common::Console::Asked);
         cmd.executable(testbin())
             .args(report_argv(addr, me))
             .env(common::ACK_ENV, "1")

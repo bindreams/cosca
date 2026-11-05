@@ -1,6 +1,8 @@
 use super::after_refused_kill;
 use crate::error::ChildFate;
 use crate::identity::ProcessId;
+#[cfg(target_os = "linux")]
+use crate::test_child::Console;
 
 /// What a refused teardown kill answers: the pidfd reaper's answer wins over the forgetting's, and
 /// either wins over the fallback.
@@ -81,7 +83,7 @@ async fn an_echild_after_a_look_that_showed_the_exit_is_a_foreign_reap() {
     use crate::os_process::child::{ExitRecord, PeekOutcome};
     use crate::wait::exit_only::seams::force_peeks;
 
-    let mut cmd = crate::tokio::Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     let mut child = cmd.spawn().expect("spawn");

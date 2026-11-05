@@ -2,10 +2,10 @@
 
 use super::super::rewrite_with_host;
 use super::rewrite_tests::{elevated_sudo_host, sudo_host};
-use crate::command::Command;
 use crate::elevation::pkexec::PkexecVersion;
 use crate::elevation::plan::{BackendSet, Host, Os};
 use crate::elevation::{Auth, Backend};
+use crate::test_child::Console;
 use std::path::PathBuf;
 
 /// A Linux host offering every CLI backend, its `pkexec` pinned on `/dev/null`.
@@ -31,7 +31,7 @@ fn every_backend_host() -> Host {
 
 /// The name of the front the rewrite of an `id` under `backend` on `host` names, if any.
 fn front_named(backend: Backend, host: &Host) -> Option<&'static str> {
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     let auth = if backend == Backend::Pkexec {
         Auth::Gui
     } else {
