@@ -1,120 +1,155 @@
-use super::{refused_kill_answer, refused_kill_warning, Forgetting, TornDown};
+use super::{refused_kill_answer, refused_kill_warning, Forgetting, Refused, TornDown};
+use crate::child::owned::teardown::TeardownOutcome;
 use crate::error::{ChildFate, Error};
 use crate::identity::ProcessId;
 #[cfg(target_os = "linux")]
 use crate::test_child::Console;
 
-/// What a refused teardown kill answers: the second teardown's answer wins over the forgetting's,
-/// and either wins over the fallback.
+/// What a refused teardown kill answers: the second teardown's fate, the forgetting's, or, for a
+/// child released to tokio's orphan queue, running with the identity the spawn had read.
 ///
-/// Mutant: the forgetting wins over the second teardown, or an answer is dropped for the fallback.
+/// Mutant: one state answers another's fate, or the release drops the identity or answers `Unknown`.
 #[skuld::test]
-fn a_refused_kill_answers_with_the_second_teardown_then_the_forgetting() {
+fn a_refused_kill_answers_from_what_became_of_the_child() {
     let id = Some(ProcessId::current());
+    let torn = |fate| {
+        Refused::TornDown(TornDown {
+            outcome: TeardownOutcome {
+                fate,
+                uncollected: false,
+                look: None,
+                left: None,
+            },
+            leak: "a pidfd",
+        })
+    };
+    assert_eq!(refused_kill_answer(&torn(ChildFate::Reaped), id), ChildFate::Reaped);
+    assert_eq!(refused_kill_answer(&torn(ChildFate::Killed), id), ChildFate::Killed);
+    let forgotten = Refused::Forgotten(Forgetting {
+        leak: "a zombie",
+        why: String::new(),
+        fate: ChildFate::Gone,
+    });
+    assert_eq!(refused_kill_answer(&forgotten, id), ChildFate::Gone);
+    assert_eq!(refused_kill_answer(&Refused::Released, id), ChildFate::Running { id });
     assert_eq!(
-        refused_kill_answer(Some(ChildFate::Reaped), Some(ChildFate::Gone), id),
-        ChildFate::Reaped
-    );
-    assert_eq!(refused_kill_answer(None, Some(ChildFate::Gone), id), ChildFate::Gone);
-    assert_eq!(
-        refused_kill_answer(Some(ChildFate::Killed), None, id),
-        ChildFate::Killed
+        refused_kill_answer(&Refused::Released, None),
+        ChildFate::Running { id: None }
     );
 }
 
-/// The warn for a refused teardown kill words what became of the child from what the second
-/// teardown's outcome says, for every fate that teardown can give: "torn down through its pidfd"
-/// only of a child it reaped; a child it left uncollected (still running, its look failed, its wait
-/// failed) is "left uncollected", and one found reaped by someone else is that. The outcome's `left`
-/// and the forget's leak follow.
+/// A child released to tokio's orphan queue is worded as the macOS late teardown words it.
 ///
-/// Mutant: the wording follows whether the second teardown ran, or only whether its fate is
-/// `Running`, or ignores `uncollected`.
+/// Mutant: the release is worded apart from `reap_unreported`'s text, or not at all.
 #[skuld::test]
-fn the_refused_kill_warning_words_every_fate_the_second_teardown_gives() {
+fn a_released_child_is_worded_as_handed_to_tokios_orphan_reaper() {
     let e = Error::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
-    let torn = |fate, uncollected, left: Option<&str>| TornDown {
-        fate,
-        uncollected,
-        leak: "a pidfd",
-        left: left.map(str::to_owned),
-    };
-    let id = Some(ProcessId::current());
-    let rows = [
-        (
-            torn(ChildFate::Reaped, false, None),
-            "it is torn down through its pidfd",
-        ),
-        (torn(ChildFate::Killed, true, None), "it is left uncollected"),
-        (torn(ChildFate::Killed, false, None), "it was reaped by someone else"),
-        (torn(ChildFate::Gone, false, None), "it was reaped by someone else"),
-        (torn(ChildFate::Unknown, true, None), "it is left uncollected"),
-        (torn(ChildFate::Running { id }, true, None), "it is left uncollected"),
-    ];
-    for (torn_down, clause) in rows {
-        let text = refused_kill_warning(7, &e, None, Some(&torn_down));
-        assert!(
-            text.starts_with(&format!("teardown kill of child 7 failed ({e}); {clause}")),
-            "{:?} (uncollected: {}): {text}",
-            torn_down.fate,
-            torn_down.uncollected
-        );
-        assert!(
-            text.contains("forgetting tokio's handle for it leaks a pidfd"),
-            "{text}"
-        );
-        assert_eq!(
-            text.contains("torn down"),
-            clause.contains("torn down"),
-            "{:?}: {text}",
-            torn_down.fate
-        );
-    }
-
-    let left = torn(ChildFate::Running { id }, true, Some("leaving it running"));
-    assert!(refused_kill_warning(7, &e, None, Some(&left)).ends_with("; leaving it running"));
-
-    // No second teardown ran: the child was forgotten, or released.
-    let forgotten = Forgetting {
-        leak: "a zombie",
-        why: "was reaped by someone else".to_owned(),
-        fate: ChildFate::Gone,
-    };
-    let text = refused_kill_warning(7, &e, Some(&forgotten), None);
     assert_eq!(
-        text,
+        refused_kill_warning(7, &e, &Refused::Released),
         format!(
-            "teardown kill of child 7 failed ({e}); it is not waited on; the child was reaped by someone \
-             else; forgetting tokio's handle for it leaks a zombie"
+            "teardown kill of child 7 failed ({e}); {}",
+            super::HANDED_TO_ORPHAN_REAPER
         )
     );
 }
 
-/// Off Linux a child whose kill was refused and that is not forgotten is released to tokio's orphan
-/// queue, still running, with the identity the spawn had read.
+/// The warn for a refused teardown kill carries the second teardown outcome's own words (`left`)
+/// and nothing of its own about the child, for every fate that teardown can give: an outcome with
+/// nothing to warn of (reaped, or found reaped by someone else) adds nothing, and one with words is
+/// worded by them once, never beside a second clause of the warn's own.
 ///
-/// Mutant: the fallback is `Unknown`, or drops the identity.
-#[cfg(not(target_os = "linux"))]
+/// Mutant: the warn words the fate or `uncollected` itself, beside or instead of `left`.
 #[skuld::test]
-fn a_refused_kill_with_no_other_answer_leaves_the_child_running() {
+fn the_refused_kill_warning_words_every_fate_the_second_teardown_gives() {
+    let e = Error::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
     let id = Some(ProcessId::current());
-    assert_eq!(refused_kill_answer(None, None, id), ChildFate::Running { id });
-    assert_eq!(refused_kill_answer(None, None, None), ChildFate::Running { id: None });
-}
+    // A second teardown's outcome, with the `left` that `Settlement::wording` gives that fate (warn
+    // level only: a debug line is logged by the teardown and leaves `left` empty).
+    let torn = |fate, uncollected, left: Option<&str>| {
+        Refused::TornDown(TornDown {
+            outcome: TeardownOutcome {
+                fate,
+                uncollected,
+                look: None,
+                left: left.map(str::to_owned),
+            },
+            leak: "a pidfd",
+        })
+    };
+    let outcome_of = |after: &Refused| match after {
+        Refused::TornDown(t) => (t.outcome.fate, t.outcome.left.clone()),
+        _ => unreachable!("built by `torn`"),
+    };
+    // The warn up to what the outcome adds.
+    let bare = format!("teardown kill of child 7 failed ({e}); forgetting tokio's handle for it leaks a pidfd");
 
-/// On Linux every child that is not forgotten is torn down again through its pidfd, so no answer from
-/// either is a contract breach, asserted in debug.
-///
-/// Mutant: the fallback is silent on Linux.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-#[cfg_attr(
-    debug_assertions,
-    should_panic(expected = "neither torn down through its pidfd nor forgotten")
-)]
-fn a_refused_kill_with_no_other_answer_asserts_on_linux() {
-    let id = Some(ProcessId::current());
-    assert_eq!(refused_kill_answer(None, None, id), ChildFate::Running { id });
+    // An outcome with nothing to warn of adds nothing: no clause of the warn's own, whatever the fate.
+    let silent = [
+        torn(ChildFate::Reaped, false, None),
+        torn(ChildFate::Killed, false, None),
+        torn(ChildFate::Gone, false, None),
+    ];
+    for after in &silent {
+        assert_eq!(refused_kill_warning(7, &e, after), bare, "{:?}", outcome_of(after).0);
+    }
+
+    // One that has something to warn of is worded by it alone, once.
+    let spoken = [
+        torn(
+            ChildFate::Reaped,
+            false,
+            Some("teardown of child 7: reaped it after the kill; the child's exit record was unreadable"),
+        ),
+        torn(
+            ChildFate::Gone,
+            false,
+            Some("teardown of child 7: not ours to reap (launchd holds its zombie, because its tracer died)"),
+        ),
+        torn(
+            ChildFate::Killed,
+            true,
+            Some("teardown of child 7: the wait failed: cosca-wait-4d7b"),
+        ),
+        torn(
+            ChildFate::Unknown,
+            true,
+            Some("teardown of child 7: the wait failed: cosca-wait-4d7b"),
+        ),
+        torn(
+            ChildFate::Running { id },
+            true,
+            Some("child 7 could not be terminated (cosca); leaving it running"),
+        ),
+    ];
+    for after in spoken {
+        let (fate, left) = outcome_of(&after);
+        let left = left.expect("a warn-level outcome has words");
+        let text = refused_kill_warning(7, &e, &after);
+        assert_eq!(text, format!("{bare}; {left}"), "{fate:?}");
+        for clause in [
+            "torn down through",
+            "not waited on",
+            "left uncollected",
+            "reaped by someone else",
+        ] {
+            assert!(!text.contains(clause), "{fate:?} says {clause:?}: {text}");
+        }
+    }
+
+    // No second teardown ran: the child was forgotten.
+    let forgotten = Refused::Forgotten(Forgetting {
+        leak: "a zombie",
+        why: "was reaped by someone else".to_owned(),
+        fate: ChildFate::Gone,
+    });
+    let text = refused_kill_warning(7, &e, &forgotten);
+    assert_eq!(
+        text,
+        format!(
+            "teardown kill of child 7 failed ({e}); the child was reaped by someone else; forgetting tokio's \
+             handle for it leaks a zombie"
+        )
+    );
 }
 
 /// `exit_visible_by` waits, so it refuses to run inside an async drop's bounded section, before it

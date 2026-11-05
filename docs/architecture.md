@@ -90,20 +90,21 @@ In order:
      and attach arms (`ProcSource::leave_front_noting`), the second teardown of a refused kill
      (`ProcSource::tear_down_forgotten`), and the cgroup leaf's abandonment of a child it cannot
      name. The sync spawn builds the `OwnedChild` once when the handshake succeeds. Until the
-     async-child slice, tokio's own code ends the rest of the async spawn: `conclude`'s
-     `Ok(child)` arms (`Spawned` for tokio's `Child`: `reap_unexecuted` kills through the pidfd
-     and collects with `try_wait`, `abandon_unreported` leaves the child to tokio's orphan queue,
-     which `waitpid`s by pid), and the async non-front identity and attach arms
-     (`ProcSource::reap_now_noting` and `teardown_through_pidfd`: the kill and the wait are the
-     backend's, and only a refused kill goes on to `tear_down`, through `after_refused_kill`).
-     `reap_now_noting` collects with tokio's `try_wait` and the `Ok(child)` arms leave the child
-     to tokio, so those reap by pid; `teardown_through_pidfd` reaps through the pidfd
-     (`reap_blocking(&Target::PidFd(..))`) and then forgets tokio's `Child`. Apart from them, only
-     the cgroup leaf's `end_child`
-     (both spawns) starts a background reaping thread, until the leaf slice. `Settlement` is the one
+     async-child slice, tokio's own code ends the rest of the async spawn. `conclude`'s
+     `Ok(child)` arms are `Spawned` for tokio's `Child`: `reap_unexecuted` kills through the
+     pidfd and collects with tokio's `try_wait`, leaving a zombie it cannot yet collect to
+     tokio's orphan queue, and `abandon_unreported` leaves the child to that queue, which
+     `waitpid`s by pid. The async non-front identity and attach arms
+     (`ProcSource::reap_now_noting` and `teardown_through_pidfd`) make the kill and the wait
+     the backend's, and only a refused kill goes on to `tear_down`, through `after_refused_kill`.
+     `reap_now_noting` collects with tokio's `try_wait`, so it reaps by pid;
+     `teardown_through_pidfd` reaps through the pidfd (`reap_blocking(&Target::PidFd(..))`) and
+     then forgets tokio's `Child`. Apart from these, only the cgroup leaf's `end_child` (both
+     spawns) starts a background reaping thread, until the leaf slice. `Settlement` is the one
      classification of what a wait or look answered (the fate, whether the child is left
-     uncollected, what to say); the teardowns, `finish_elevated` and `Unreaped` all ask it. A teardown that cannot end a child,
-     a refused kill or a running elevation front, hands it back as `Unreaped`, in
+     uncollected, what to say); the teardowns, `finish_elevated` and `Unreaped` all ask it. A
+     teardown that cannot end a child, a refused kill or a running elevation front, hands it back
+     as `Unreaped`, in
      `Error::MayHaveStarted`: the sync Linux spawn does, and so does the sync `finish_elevated`;
      the `Command::{status, output, read}` do through `Child::tear_down_or_hand_back`.
      `SuspendedChild::resume` runs it too but leaves the child, since a frozen thread may never run.
