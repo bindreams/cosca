@@ -94,9 +94,9 @@ pub(crate) struct RestrictedChild {
     thread: HANDLE,
     /// Kills the whole tree when closed. `TerminateProcess` does NOT cascade, so without
     /// this `spawn_restricted_shell`'s `cmd.exe` would die while the `ping.exe` it launched
-    /// ran on for an hour. That orphan is not just a leak: `wait_for_child` scans a
-    /// host-wide `(pid, ppid)` snapshot, so a stranded grandchild whose dead parent pid
-    /// Windows later recycles onto a new fixture shell would be mistaken for its child.
+    /// ran on for an hour. That orphan is not just a leak: `wait_for_child` reads a
+    /// host-wide `(pid, ppid)` snapshot, where a stranded grandchild whose dead parent pid
+    /// Windows later recycles onto a new fixture shell is a candidate the order-key rule must drop.
     job: HANDLE,
     pid: u32,
 }
@@ -144,16 +144,20 @@ impl RestrictedChild {
     pub(crate) fn wait_for_child(&self) -> u32 {
         // Windows never reparents and recycles pids from a small dense table, so a raw
         // `ppid == self.pid` scan can match a pre-existing orphan whose real parent exited
-        // and whose pid was then handed to this fixture. Route through the crate-s own
-        // stale-ppid defense (`children_of` applies the order-key rule) so only a
-        // genuine child is returned.
-        let me = crate::identity::windows_identity_from_handle(self.handle, self.pid)
+        // and whose pid was then handed to this fixture. Route through the crate's own
+        // stale-ppid defense (`children_of_from_key` applies the order-key rule) so only a
+        // genuine child is returned. The fixture's pid may be unopenable by pid, which is how
+        // `anchor` reads the anchor's order key, so the key comes from the owned handle.
+        let (key, me_key) = super::backend::ordered_from_handle(self.handle, self.pid, None)
+            .0
+            .found()
             .expect("the owned handle always yields an identity");
+        let me = super::ProcessId::from_parts_for_test(self.pid, key);
         loop {
             assert!(self.is_running(), "the fixture shell exited before spawning its child");
             let kernel = &super::HostKernel;
             let parents = crate::containment::enumerate::process_parents(kernel).expect("the process snapshot");
-            let kids = crate::containment::treewalk::children_of(kernel, me, &parents).expect("the fixture's children");
+            let kids = crate::containment::treewalk::children_of_from_key(kernel, me, me_key, &parents);
             if let Some(kid) = kids.first() {
                 return kid.pid();
             }
