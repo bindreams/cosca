@@ -87,8 +87,8 @@ mod linux {
     }
     in_fresh_pid_ns!(
         namespaces_sync_pgroup_drop_after_foreign_reap_and_same_tick_reuse_sends_no_killpg,
-        fixture_sync_pgroup_drop_alias_driver,
-        fixture_sync_pgroup_drop_alias_init,
+        fixture_sync_pgroup_drop_root_reads_as_reuser_driver,
+        fixture_sync_pgroup_drop_root_reads_as_reuser_init,
         drop_after_foreign_reap_and_same_tick_reuse_body
     );
 

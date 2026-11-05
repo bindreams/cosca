@@ -363,7 +363,8 @@ in_fresh_pid_ns!(
 /// of the test's `SIGUSR1` and is a zombie when the child drops, so a reap by pid would take its
 /// exit record. The drop must leave it for the test to consume.
 ///
-/// The root's number reads as the child's own, as a reuse in the same tick has it, so only the child's own handle (its pidfd) can tell the drop the child is gone.
+/// The root's number reads as the child's own, as a reuse in the same tick has it, so only the
+/// child's own handle (its pidfd) can tell the drop the child is gone.
 ///
 /// Mutant: the drop does not forget (tokio's field-drop reaps the zombie by pid, and the test's own
 /// `waitid` gets `ECHILD`).
@@ -735,7 +736,7 @@ in_fresh_pid_ns!(
 ///
 /// Mutants: `kill_tree_members_unless_reaped` has no pidfd term (`finish_elevated` runs `killpg`);
 /// the drop has no first look (its tree kill runs `killpg`).
-fn finish_elevated_of_an_aliased_process_group_sends_no_killpg_body() {
+fn finish_elevated_of_a_process_group_whose_root_reads_as_a_reuser_sends_no_killpg_body() {
     runtime().block_on(async {
         let recorder = crate::containment::unix::fault::record_kill_group();
         let (stdin, writer) = crate::test_child::held_writer_stdin();
@@ -770,10 +771,10 @@ fn finish_elevated_of_an_aliased_process_group_sends_no_killpg_body() {
     });
 }
 in_fresh_pid_ns!(
-    namespaces_tokio_finish_elevated_of_an_aliased_process_group_sends_no_killpg,
+    namespaces_tokio_finish_elevated_of_a_process_group_whose_root_reads_as_a_reuser_sends_no_killpg,
     fixture_tokio_first_look_process_group_driver,
     fixture_tokio_first_look_process_group_init,
-    finish_elevated_of_an_aliased_process_group_sends_no_killpg_body
+    finish_elevated_of_a_process_group_whose_root_reads_as_a_reuser_sends_no_killpg_body
 );
 
 // A failed peek through the child's own pidfd =====
@@ -1201,10 +1202,12 @@ fn reuser_id(child: &crate::tokio::Child, same_tick: bool) -> crate::identity::R
     ))
 }
 
-/// The sync `kill_tree_after_a_foreign_reap_and_reuse`'s twin. Mutants: the precondition assert
-/// kept (a debug panic on the later-tick reuse); `killpg` sent; the decision taken on the number
-/// alone (the same-tick reuse reads as the root).
-fn kill_tree_after_a_foreign_reap_and_reuse() {
+/// The sync `kill_tree_after_a_foreign_reap_and_reuse`'s twin. The root's number is forced, after
+/// the reap and the reuse, to read as the reuser (the root's own start token if `same_tick`, else
+/// the next one), which a correct call never reads. Mutants: the precondition assert kept (a debug
+/// panic on the later-tick read); `killpg` sent; the decision taken on the number alone (the
+/// same-tick read reads as the root).
+fn kill_tree_after_a_foreign_reap_and_reuse(same_tick: bool) {
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     runtime().block_on(async {
         crate::log_capture::install();
@@ -1213,6 +1216,7 @@ fn kill_tree_after_a_foreign_reap_and_reuse() {
         let pid = child.id().pid();
         drop(writer);
         let reuser = reap_behind_and_reuse(pid);
+        let _read = crate::child::fault::force_root_reads(reuser_id(&child, same_tick));
 
         let mark = crate::log_capture::mark();
         let err = child
@@ -1233,20 +1237,26 @@ fn kill_tree_after_a_foreign_reap_and_reuse() {
         );
     });
 }
+fn kill_tree_after_a_foreign_reap_and_reuse_body() {
+    kill_tree_after_a_foreign_reap_and_reuse(false);
+}
+fn kill_tree_after_a_foreign_reap_and_same_tick_reuse_body() {
+    kill_tree_after_a_foreign_reap_and_reuse(true);
+}
 in_fresh_pid_ns!(
     namespaces_tokio_kill_tree_after_a_foreign_reap_and_reuse_sends_no_killpg,
     fixture_tokio_kill_tree_reuse_driver,
     fixture_tokio_kill_tree_reuse_init,
-    kill_tree_after_a_foreign_reap_and_reuse
+    kill_tree_after_a_foreign_reap_and_reuse_body
 );
 in_fresh_pid_ns!(
     namespaces_tokio_kill_tree_after_a_foreign_reap_and_same_tick_reuse_sends_no_killpg,
     fixture_tokio_kill_tree_same_tick_driver,
     fixture_tokio_kill_tree_same_tick_init,
-    kill_tree_after_a_foreign_reap_and_reuse
+    kill_tree_after_a_foreign_reap_and_same_tick_reuse_body
 );
 
-/// `terminate_tree`'s twin. Same mutants.
+/// `terminate_tree`'s twin, with the later-tick read forced. Same mutants.
 fn terminate_tree_after_a_foreign_reap_and_reuse_body() {
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     runtime().block_on(async {
@@ -1256,6 +1266,7 @@ fn terminate_tree_after_a_foreign_reap_and_reuse_body() {
         let pid = child.id().pid();
         drop(writer);
         let reuser = reap_behind_and_reuse(pid);
+        let _read = crate::child::fault::force_root_reads(reuser_id(&child, false));
 
         let mark = crate::log_capture::mark();
         let err = child
@@ -1440,7 +1451,8 @@ in_fresh_pid_ns!(
     terminate_tree_after_own_wait_and_reuse_body
 );
 
-/// The sync `graceful_shutdown_tree_after_a_foreign_reap_and_reuse_body`'s twin. Same mutant.
+/// The sync `graceful_shutdown_tree_after_a_foreign_reap_and_reuse_body`'s twin, with the later-tick
+/// read forced. Same mutant.
 fn graceful_shutdown_tree_after_a_foreign_reap_and_reuse_body() {
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     runtime().block_on(async {
@@ -1451,6 +1463,7 @@ fn graceful_shutdown_tree_after_a_foreign_reap_and_reuse_body() {
         let pid = child.id().pid();
         drop(writer);
         let reuser = reap_behind_and_reuse(pid);
+        let _read = crate::child::fault::force_root_reads(reuser_id(&child, false));
 
         let mark = crate::log_capture::mark();
         let err = child
