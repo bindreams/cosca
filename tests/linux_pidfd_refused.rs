@@ -203,12 +203,84 @@ fn a_seccomp_refused_pidfd_open_fails_the_async_open_naming_process_open() {
     }
 }
 
+/// Run `act` on a child of an async `control-block` fixture, on a current-thread runtime entered on
+/// a thread whose `pidfd_open` is refused with `code`. The runtime is built and the child spawned
+/// before the filter lands. `act` must fail `Unsupported` naming `process open`. The control socket
+/// is released only afterwards, so the returned status is a clean exit unless `act` ended the child.
+#[cfg(target_os = "linux")]
+#[cfg(feature = "tokio")]
+fn assert_async_act_refused<T: std::fmt::Debug + Send>(
+    code: i32,
+    name: &str,
+    contain: bool,
+    act: impl FnOnce(&tokio::runtime::Runtime, &mut cosca::tokio::Child) -> Result<T, Error> + Send,
+) -> std::process::ExitStatus {
+    let (result, status) = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("a current-thread runtime");
+                let _entered = runtime.enter();
+                let (mut child, control) =
+                    runtime.block_on(common::spawn_control_async("control-block", &["R"], contain));
+                common::seccomp::deny_pidfd_open_on_this_thread(code);
+                let result = act(&runtime, &mut child);
+                drop(control);
+                let status = runtime.block_on(child.wait()).expect("reap the child");
+                (result, status)
+            })
+            .join()
+            .expect("the filtered thread")
+    });
+    assert_refused(result, "process open", name);
+    status
+}
+
+/// The async `Child::terminate` signals by the child's identity, so a refused `pidfd_open` fails it
+/// with nothing sent: the child exits clean when its socket is released.
+///
+/// Mutant: `terminate_by_id` answers `Ok` when its open fails.
+#[cfg(target_os = "linux")]
+#[cfg(feature = "tokio")]
+#[skuld::test]
+fn a_refused_pidfd_open_fails_the_async_terminate_naming_process_open() {
+    for (code, name) in REFUSALS {
+        let status = assert_async_act_refused(code, name, false, |_, child| child.terminate());
+        assert!(
+            status.success(),
+            "{name}: nothing was sent, yet the child ended {status:?}"
+        );
+    }
+}
+
+/// The async `graceful_shutdown` terminates first, so a refused `pidfd_open` fails it before any
+/// wait and before the escalation: the child is not killed and exits clean when its socket is
+/// released.
+///
+/// Mutant: `terminate_by_id` answers `Ok` when its open fails, so the shutdown goes on to the
+/// escalation and kills the child.
+#[cfg(target_os = "linux")]
+#[cfg(feature = "tokio")]
+#[skuld::test]
+fn a_refused_pidfd_open_fails_the_async_graceful_shutdown_before_the_escalation_naming_process_open() {
+    for (code, name) in REFUSALS {
+        let status = assert_async_act_refused(code, name, false, |runtime, child| {
+            runtime.block_on(child.graceful_shutdown(Duration::from_secs(30)))
+        });
+        assert!(
+            status.success(),
+            "{name}: nothing was sent, yet the child ended {status:?}"
+        );
+    }
+}
+
 /// The root-only grace wait of an async `graceful_shutdown_tree` opens the child by its identity,
 /// so a refused `pidfd_open` fails the watch: the shutdown still ends the child and reaps it, then
-/// surfaces `Unsupported` naming `process open`. The runtime is built and the child spawned on the
-/// filtered thread before the filter lands, and the shutdown runs on that thread's runtime. The
-/// async `graceful_shutdown` and `terminate` open by identity too and fail before any wait, so only
-/// the tree form reaches the grace wait with `pidfd_open` refused.
+/// surfaces `Unsupported` naming `process open`. The async `graceful_shutdown` and `terminate` open
+/// by identity too and fail before any wait (the two rows above), so only the tree form reaches the
+/// grace wait with `pidfd_open` refused.
 ///
 /// Mutant: the grace wait's open maps its error to "gone" (`Ok(true)`).
 #[cfg(target_os = "linux")]
@@ -216,30 +288,14 @@ fn a_seccomp_refused_pidfd_open_fails_the_async_open_naming_process_open() {
 #[skuld::test]
 fn a_refused_pidfd_open_fails_the_async_graceful_shutdown_trees_grace_wait_naming_process_open() {
     for (code, name) in REFUSALS {
-        let result = std::thread::scope(|scope| {
-            scope
-                .spawn(|| {
-                    let runtime = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .expect("a current-thread runtime");
-                    let _entered = runtime.enter();
-                    let (mut child, control) =
-                        runtime.block_on(common::spawn_control_async("control-block", &["R"], true));
-                    assert!(
-                        !child.containment().can_observe_drain(),
-                        "{name}: the fixture must watch the root only, got {:?}",
-                        child.containment()
-                    );
-                    common::seccomp::deny_pidfd_open_on_this_thread(code);
-                    let result = runtime.block_on(child.graceful_shutdown_tree(Duration::from_secs(30)));
-                    drop(control);
-                    result
-                })
-                .join()
-                .expect("the filtered thread")
+        assert_async_act_refused(code, name, true, |runtime, child| {
+            assert!(
+                !child.containment().can_observe_drain(),
+                "{name}: the fixture must watch the root only, got {:?}",
+                child.containment()
+            );
+            runtime.block_on(child.graceful_shutdown_tree(Duration::from_secs(30)))
         });
-        assert_refused(result, "process open", name);
     }
 }
 
