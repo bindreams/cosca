@@ -234,6 +234,15 @@ pub(crate) fn held_contained_blocker_without_cgroup(stdout: crate::Stdio) -> (cr
     held_blocker(stdout, |cmd| _ = contain_without_cgroup(cmd))
 }
 
+/// A spawned [`ContainMode::TreeWalk`](crate::ContainMode::TreeWalk) [`BLOCKER_ARGV`] child with a
+/// null stdout, and the write end of its stdin.
+#[cfg(target_os = "linux")]
+pub(crate) fn held_treewalk_blocker() -> (crate::Child, std::io::PipeWriter) {
+    held_blocker(crate::Stdio::null(), |cmd| {
+        cmd.contain_with(crate::ContainMode::TreeWalk);
+    })
+}
+
 fn held_blocker(
     stdout: crate::Stdio,
     contain: impl FnOnce(&mut crate::Command),
@@ -260,6 +269,14 @@ pub(crate) fn held_contained_blocker_without_cgroup_async(
     stdout: crate::Stdio,
 ) -> (crate::tokio::Child, crate::tokio::ChildStdin) {
     held_blocker_async(stdout, |cmd| _ = contain_without_cgroup_async(cmd))
+}
+
+/// Async twin of [`held_treewalk_blocker`].
+#[cfg(all(target_os = "linux", feature = "tokio"))]
+pub(crate) fn held_treewalk_blocker_async() -> (crate::tokio::Child, crate::tokio::ChildStdin) {
+    held_blocker_async(crate::Stdio::null(), |cmd| {
+        cmd.contain_with(crate::ContainMode::TreeWalk);
+    })
 }
 
 #[cfg(feature = "tokio")]

@@ -15,6 +15,13 @@ fn host_kernel_reads_a_file_under_the_proc_it_opens() {
 }
 
 #[skuld::test]
+fn host_pids_lists_this_process() {
+    let dir = HostKernel.open_proc().expect("/proc opens");
+    let pids = HostKernel.pids(&dir).expect("/proc lists");
+    assert!(pids.contains(&std::process::id()), "{pids:?}");
+}
+
+#[skuld::test]
 fn host_signal_probe_is_ok_for_this_process_and_esrch_for_i32_max() {
     assert_eq!(HostKernel.signal_probe(getpid()), Ok(()));
     assert_eq!(
