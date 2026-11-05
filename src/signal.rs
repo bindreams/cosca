@@ -175,6 +175,10 @@ impl RootState {
 /// Send `sig` through `pidfd`, which names the child for good, so a reused pid cannot be hit.
 /// `None` is a child that was already gone when its handle was made.
 #[cfg(target_os = "linux")]
+#[cfg_attr(
+    not(feature = "tokio"),
+    allow(dead_code, reason = "the only consumer is the tokio spawn's unexecuted-child wait")
+)]
 pub(crate) fn via_pidfd(pidfd: Option<std::os::fd::BorrowedFd<'_>>, pid: u32, sig: Sig) -> io::Result<Sent> {
     let Some(pidfd) = pidfd else {
         log::debug!("child {pid} has no pidfd (it was gone when adopted); {sig:?} not sent");

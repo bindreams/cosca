@@ -15,6 +15,8 @@ pub(crate) use proc_source::Forgotten;
 pub(crate) use proc_source::ProcSource;
 #[cfg(any(unix, test))]
 pub(crate) use proc_source::Waited;
+#[cfg(target_os = "macos")]
+pub(crate) use proc_source::HANDED_TO_ORPHAN_REAPER;
 
 use std::collections::BTreeMap;
 use std::process::ExitStatus;

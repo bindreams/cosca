@@ -2,8 +2,10 @@
 
 use std::process::ExitStatus;
 
+use super::teardown_lines::said_of;
 use super::teardown_look::FakeReach;
-use crate::child::owned::teardown::{Disposition, TeardownKind, TeardownOutcome};
+use crate::child::lifecycle::Wording;
+use crate::child::owned::teardown::{Disposition, Kill, TeardownOutcome};
 use crate::child::owned::OwnedChild;
 use crate::error::ChildFate;
 use crate::identity::ProcessId;
@@ -38,6 +40,14 @@ pub(super) fn child_with_an_unreadable_exit() -> OwnedChild {
     child
 }
 
+/// The text of `torn`'s clause if it is a warn: what a caller with one warn folds into it.
+pub(super) fn warn_of(torn: &TeardownOutcome) -> Option<&str> {
+    match torn.said() {
+        Some(Wording::Uncollected(text) | Wording::Collected(log::Level::Warn, text)) => Some(text),
+        _ => None,
+    }
+}
+
 /// What `tear_down(id, Kill, due)` returned over `fake`, and everything it logged on this thread.
 fn tear_down_logged(
     fake: &FakeProcess,
@@ -49,7 +59,7 @@ fn tear_down_logged(
     let mark = crate::log_capture::mark();
     let torn = child.tear_down(
         id,
-        TeardownKind::Kill {
+        Kill {
             disposition: Disposition::Leave,
             tree: None,
         },
@@ -84,75 +94,16 @@ pub(super) fn fire_on_block(fake: &FakeProcess) -> crate::wait::block_probe::Arm
     crate::wait::block_probe::on_blocking(move || fake.wake())
 }
 
-/// `tear_down(id, Kill, no threshold)` over `fake` for a caller that does `disposition`.
-fn tear_down_as(fake: &FakeProcess, disposition: Disposition) -> TeardownOutcome {
-    OwnedChild::new(Box::new(fake.clone())).tear_down(
-        Some(id()),
-        TeardownKind::Kill {
-            disposition,
-            tree: None,
-        },
-        None,
-    )
-}
-
-/// The words a leftover has under `disposition`: a caller that hands the child back says so, and one
-/// that leaves it says nothing of that.
-#[track_caller]
-fn assert_left_says(torn: &TeardownOutcome, disposition: Disposition, wanted: &str) {
-    let handed_back = disposition == Disposition::HandBack;
-    let text = torn.left.as_deref().unwrap_or_default();
-    assert!(text.contains(wanted), "{torn:?}");
-    assert_eq!(
-        text.ends_with("; handed back to the caller in the error"),
-        handed_back,
-        "{torn:?}"
-    );
-    assert!(torn.uncollected, "{torn:?}");
-}
-
-/// A reap that fails after a delivered kill leaves the child uncollected, and the leftover says it is
-/// handed back to a caller that hands it back.
-///
-/// Mutant: the leftover ignores the disposition.
-#[skuld::test]
-fn a_failed_reap_after_a_kill_is_worded_by_the_disposition() {
-    for disposition in [Disposition::Leave, Disposition::HandBack] {
-        let fake = fake()
-            .reaps([ReapAnswer::Err(std::io::ErrorKind::Other)])
-            .signals([Ok(Sent::Delivered)]);
-        let torn = tear_down_as(&fake, disposition);
-        assert_left_says(&torn, disposition, "the wait failed");
-    }
-}
-
-/// A refused kill whose look then fails leaves the child uncollected, and the leftover says it is
-/// handed back to a caller that hands it back.
-///
-/// Mutant: the leftover ignores the disposition.
-#[cfg(unix)]
-#[skuld::test]
-fn a_refused_kill_whose_look_failed_is_worded_by_the_disposition() {
-    for disposition in [Disposition::Leave, Disposition::HandBack] {
-        let fake = fake()
-            .reaps([ReapAnswer::Err(std::io::ErrorKind::Other)])
-            .signals([crate::os_process::fake::failed_signal(libc::EPERM)]);
-        let torn = tear_down_as(&fake, disposition);
-        assert_left_says(&torn, disposition, "could not be terminated");
-        assert_left_says(&torn, disposition, "the wait failed");
-    }
-}
-
 /// A leftover about a child whose reap consumed the zombie but read no exit record: the child is
 /// collected, so a caller that hands children back has none to hand back, and the leftover does not
 /// say it did.
 #[track_caller]
 fn assert_collected_with_an_unreadable_record(torn: &TeardownOutcome, disposition: Disposition, wanted: &str) {
-    let text = torn.left.as_deref().unwrap_or_default();
+    let text = warn_of(torn).unwrap_or_default();
     assert!(text.contains(wanted) && text.contains("unreadable"), "{torn:?}");
     assert!(!text.contains("handed back"), "{torn:?}");
-    assert!(!torn.uncollected, "{torn:?}");
-    assert!(!disposition.hands_back(torn), "{torn:?}");
+    assert!(!torn.uncollected(), "{torn:?}");
+    assert!(!disposition.hands_back(&torn.remains()), "{torn:?}");
 }
 
 /// A reap after a kill that consumed the zombie without an exit record leaves nothing to hand back,
@@ -163,9 +114,9 @@ fn assert_collected_with_an_unreadable_record(torn: &TeardownOutcome, dispositio
 fn a_reap_after_a_kill_whose_exit_record_was_unreadable_leaves_nothing_uncollected() {
     for disposition in [Disposition::Leave, Disposition::HandBack] {
         let torn = child_with_an_unreadable_exit().reap_after_tree_kill(disposition);
-        assert_eq!(torn.fate, ChildFate::Reaped, "{torn:?}");
+        assert_eq!(torn.fate(), ChildFate::Reaped, "{torn:?}");
         assert_collected_with_an_unreadable_record(&torn, disposition, "reaped it after the kill");
-        assert!(!torn.left.as_deref().unwrap_or_default().contains("failed"), "{torn:?}");
+        assert!(!warn_of(&torn).unwrap_or_default().contains("failed"), "{torn:?}");
     }
 }
 
@@ -180,17 +131,17 @@ fn a_teardown_of_a_child_with_an_unreadable_exit_leaves_nothing_uncollected() {
     for disposition in [Disposition::Leave, Disposition::HandBack] {
         let torn = child_with_an_unreadable_exit().tear_down(
             Some(id()),
-            TeardownKind::Kill {
+            Kill {
                 disposition,
                 tree: None,
             },
             None,
         );
-        assert_eq!(torn.fate, ChildFate::Reaped, "{torn:?}");
+        assert_eq!(torn.fate(), ChildFate::Reaped, "{torn:?}");
         assert_collected_with_an_unreadable_record(&torn, disposition, "reaped it");
-        assert!(!torn.left.as_deref().unwrap_or_default().contains("failed"), "{torn:?}");
+        assert!(!warn_of(&torn).unwrap_or_default().contains("failed"), "{torn:?}");
         assert!(
-            !torn.left.as_deref().unwrap_or_default().contains("after the kill"),
+            !warn_of(&torn).unwrap_or_default().contains("after the kill"),
             "{torn:?}"
         );
     }
@@ -205,22 +156,9 @@ fn a_refused_kill_whose_look_found_the_exit_record_unreadable_leaves_nothing_unc
     for disposition in [Disposition::Leave, Disposition::HandBack] {
         let refused = crate::error::Error::Io(std::io::Error::other("refused"));
         let torn = child_with_an_unreadable_exit().look_after_refused_kill(Some(id()), refused, disposition);
-        assert_eq!(torn.fate, ChildFate::Reaped, "{torn:?}");
+        assert_eq!(torn.fate(), ChildFate::Reaped, "{torn:?}");
         assert_collected_with_an_unreadable_record(&torn, disposition, "reaped it");
-        assert!(!torn.left.as_deref().unwrap_or_default().contains("failed"), "{torn:?}");
-    }
-}
-
-/// The reap of a child a tree kill ended, when it fails, is worded the same way.
-///
-/// Mutant: that reap's leftover ignores the disposition.
-#[cfg(unix)]
-#[skuld::test]
-fn a_failed_reap_after_a_tree_kill_is_worded_by_the_disposition() {
-    for disposition in [Disposition::Leave, Disposition::HandBack] {
-        let fake = fake().reaps([ReapAnswer::Err(std::io::ErrorKind::Other)]);
-        let torn = OwnedChild::new(Box::new(fake)).reap_after_tree_kill(disposition);
-        assert_left_says(&torn, disposition, "the wait failed");
+        assert!(!warn_of(&torn).unwrap_or_default().contains("failed"), "{torn:?}");
     }
 }
 
@@ -232,23 +170,28 @@ fn a_failed_reap_after_a_tree_kill_is_worded_by_the_disposition() {
 fn a_failed_teardown_reap_is_returned_and_not_logged() {
     let (torn, levels) = teardown_when_the_reap_answers(ReapAnswer::Err(std::io::ErrorKind::Other));
     assert!(
-        torn.left
-            .as_deref()
-            .is_some_and(|text| text.contains("the wait failed")),
+        warn_of(&torn).is_some_and(|text| text.contains("the wait failed")),
         "{torn:?}"
     );
-    assert_eq!(torn.fate, ChildFate::Killed, "the kill was delivered: {torn:?}");
+    assert_eq!(torn.fate(), ChildFate::Killed, "the kill was delivered: {torn:?}");
     assert_eq!(levels, Vec::<log::Level>::new());
 }
 
-/// A reap that finds the child collected by someone else is logged at `debug` and returns nothing.
+/// A reap that finds the child collected by someone else comes back as a `debug` clause, and the
+/// teardown logs nothing.
 ///
-/// Mutant: every failure is returned; or none logged.
+/// Mutants: the clause is a warn, or missing; the teardown logs it.
 #[skuld::test]
-fn a_teardown_reap_that_meets_a_foreign_reap_is_debug() {
+fn a_teardown_reap_that_meets_a_foreign_reap_is_a_debug_clause() {
     let (torn, levels) = teardown_when_the_reap_answers(ReapAnswer::Foreign(Foreign::Gone));
-    assert_eq!(torn.left, None);
-    assert_eq!(levels, vec![log::Level::Debug]);
+    assert_eq!(
+        said_of(&torn),
+        Some((
+            log::Level::Debug,
+            format!("teardown of child {PID}: reaped by someone else")
+        ))
+    );
+    assert_eq!(levels, Vec::<log::Level>::new());
 }
 
 /// A reap after a delivered kill that finds launchd holding the child's zombie: the child is
@@ -258,11 +201,9 @@ fn a_teardown_reap_that_meets_a_foreign_reap_is_debug() {
 #[skuld::test]
 fn a_reap_after_a_delivered_kill_that_meets_launchd_returns_the_note_and_logs_nothing_above_debug() {
     let (torn, levels) = teardown_when_the_reap_answers(ReapAnswer::Foreign(Foreign::Orphaned));
-    assert_eq!(torn.fate, ChildFate::Killed, "{torn:?}");
+    assert_eq!(torn.fate(), ChildFate::Killed, "{torn:?}");
     assert!(
-        torn.left
-            .as_deref()
-            .is_some_and(|text| text.contains(&PID.to_string()) && text.contains("launchd")),
+        warn_of(&torn).is_some_and(|text| text.contains(&PID.to_string()) && text.contains("launchd")),
         "{torn:?}"
     );
     assert!(levels.iter().all(|level| *level >= log::Level::Debug), "{levels:?}");
@@ -278,8 +219,14 @@ fn a_reap_after_a_delivered_kill_that_meets_launchd_returns_the_note_and_logs_no
 fn a_reap_after_a_delivered_tree_kill_that_meets_a_foreign_reap_is_killed() {
     let fake = fake().reaps([ReapAnswer::Foreign(Foreign::Gone)]);
     let torn = OwnedChild::new(Box::new(fake)).reap_after_tree_kill(Disposition::Leave);
-    assert_eq!(torn.fate, ChildFate::Killed);
-    assert_eq!(torn.left, None);
+    assert_eq!(torn.fate(), ChildFate::Killed);
+    assert_eq!(
+        said_of(&torn),
+        Some((
+            log::Level::Debug,
+            "teardown of child 4242: reaped by someone else".to_owned()
+        ))
+    );
 }
 
 /// A reap after a tree kill reaps the child once, with a blocking wait, and says so.
@@ -291,8 +238,8 @@ fn a_reap_after_a_tree_kill_waits_for_the_exit() {
     let fake = fake().reaps([ReapAnswer::Running, ReapAnswer::Reaped(exit())]);
     let _fire = fire_on_block(&fake);
     let torn = OwnedChild::new(Box::new(fake.clone())).reap_after_tree_kill(Disposition::Leave);
-    assert_eq!(torn.fate, ChildFate::Reaped);
-    assert_eq!(torn.left, None);
+    assert_eq!(torn.fate(), ChildFate::Reaped);
+    assert_eq!(warn_of(&torn), None);
     assert_eq!(crate::wait::block_probe::take(), [None], "one unbounded block");
 }
 
@@ -307,7 +254,7 @@ fn a_failed_wait_after_a_kill_that_delivered_nothing_is_unknown() {
         .reaps([ReapAnswer::Err(std::io::ErrorKind::Other)])
         .signals([Ok(Sent::Gone)]);
     let (torn, _) = teardown(&fake);
-    assert_eq!(torn.fate, ChildFate::Unknown);
+    assert_eq!(torn.fate(), ChildFate::Unknown);
 }
 
 /// A kill that was delivered is followed by a blocking wait through the child's own `try_reap`, and
@@ -321,8 +268,14 @@ fn teardown_after_a_delivered_kill_waits_through_try_reap() {
         .signals([Ok(Sent::Delivered)]);
     let _fire = fire_on_block(&fake);
     let (torn, _) = teardown(&fake);
-    assert_eq!(torn.fate, ChildFate::Reaped);
-    assert_eq!(torn.left, None);
+    assert_eq!(torn.fate(), ChildFate::Reaped);
+    assert_eq!(
+        said_of(&torn),
+        Some((
+            log::Level::Debug,
+            "teardown of child 4242: reaped it after the kill".to_owned()
+        ))
+    );
     assert_eq!(fake.looks(), 2, "a look, then the look the wait woke to");
     assert_eq!(crate::wait::block_probe::take(), [None], "one unbounded block");
 }
@@ -338,11 +291,11 @@ fn teardown_after_a_kill_that_found_nothing_to_signal_waits_too() {
         .signals([Ok(Sent::Gone)]);
     let _fire = fire_on_block(&fake);
     let (torn, _) = teardown(&fake);
-    assert_eq!(torn.fate, ChildFate::Reaped);
+    assert_eq!(torn.fate(), ChildFate::Reaped);
     assert_eq!(fake.looks(), 2);
 }
 
-/// The `left` text of a teardown whose kill is refused and whose child still runs, under `disposition`.
+/// The warn clause of a teardown whose kill is refused and whose child still runs, under `disposition`.
 fn left_of_a_refused_kill_of_a_running_child(disposition: Disposition) -> String {
     let fake = fake()
         .reaps([ReapAnswer::Running])
@@ -350,14 +303,16 @@ fn left_of_a_refused_kill_of_a_running_child(disposition: Disposition) -> String
     let child = OwnedChild::new(Box::new(fake));
     let torn = child.tear_down(
         Some(id()),
-        TeardownKind::Kill {
+        Kill {
             disposition,
             tree: None,
         },
         None,
     );
-    assert_eq!(torn.fate, ChildFate::Running { id: Some(id()) }, "{torn:?}");
-    torn.left.expect("a refused kill of a running child is warned of")
+    assert_eq!(torn.fate(), ChildFate::Running { id: Some(id()) }, "{torn:?}");
+    warn_of(&torn)
+        .expect("a refused kill of a running child is warned of")
+        .to_owned()
 }
 
 /// `tear_down(Kill)` over a child whose kill is refused and which is running, with `tree` saying
@@ -370,7 +325,7 @@ fn refused_kill_with_a_tree_kill(tree: &FakeReach) -> (TeardownOutcome, FakeProc
     let child = OwnedChild::new(Box::new(fake.clone()));
     let torn = child.tear_down(
         Some(id()),
-        TeardownKind::Kill {
+        Kill {
             disposition: Disposition::HandBack,
             tree: Some(tree),
         },
@@ -396,15 +351,15 @@ fn a_refused_kill_of_a_child_the_tree_kill_reached_is_waited_for_and_reaped() {
 
     let torn = child.tear_down(
         Some(id()),
-        TeardownKind::Kill {
+        Kill {
             disposition: Disposition::HandBack,
             tree: Some(&reach),
         },
         None,
     );
 
-    assert_eq!(torn.fate, ChildFate::Reaped, "{torn:?}");
-    assert_eq!(torn.left, None, "{torn:?}");
+    assert_eq!(torn.fate(), ChildFate::Reaped, "{torn:?}");
+    assert_eq!(warn_of(&torn), None, "{torn:?}");
     assert_eq!(reach.asked(), [Some(PID)]);
     assert_eq!(crate::wait::block_probe::take(), [None], "one unbounded block");
 }
@@ -419,9 +374,13 @@ fn a_refused_kill_of_a_child_the_tree_kill_did_not_reach_is_looked_at_once() {
         let reach = FakeReach::answering(answer);
         let (torn, fake) = refused_kill_with_a_tree_kill(&reach);
 
-        assert_eq!(torn.fate, ChildFate::Running { id: Some(id()) }, "{answer:?}: {torn:?}");
+        assert_eq!(
+            torn.fate(),
+            ChildFate::Running { id: Some(id()) },
+            "{answer:?}: {torn:?}"
+        );
         assert!(
-            torn.left.as_deref().is_some_and(|left| left.contains("handed back")),
+            warn_of(&torn).is_some_and(|left| left.contains("handed back")),
             "{answer:?}: {torn:?}"
         );
         assert_eq!(reach.asked(), [Some(PID)], "{answer:?}");
@@ -468,8 +427,8 @@ fn teardown_after_a_refused_kill_looks_once_and_never_waits() {
             .signals([Err(std::io::Error::new(kind, "refused for the test"))]);
         let _fire = fire_on_block(&fake);
         let (torn, _) = teardown(&fake);
-        assert_eq!(torn.fate, ChildFate::Running { id: Some(id()) }, "{kind:?}: {torn:?}");
-        let left = torn.left.as_deref().unwrap_or_default();
+        assert_eq!(torn.fate(), ChildFate::Running { id: Some(id()) }, "{kind:?}: {torn:?}");
+        let left = warn_of(&torn).unwrap_or_default();
         assert!(
             left.contains(&PID.to_string()) && left.contains("refused for the test"),
             "{kind:?}: the warning names the child and the error: {torn:?}"
@@ -484,17 +443,24 @@ fn teardown_after_a_refused_kill_looks_once_and_never_waits() {
 }
 
 /// A kill that failed on a child that has exited: the look collects it, and there is nothing to
-/// warn of.
+/// warn of: the clause is a `debug` one that names the refusal.
 ///
 /// Mutant: the warning is returned whenever the kill failed.
 #[skuld::test]
-fn teardown_after_a_refused_kill_of_an_exited_child_reaps_it_silently() {
+fn teardown_after_a_refused_kill_of_an_exited_child_reaps_it_at_debug() {
+    let refusal = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
     let fake = fake()
         .reaps([ReapAnswer::Reaped(exit())])
         .signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))]);
     let (torn, _) = teardown(&fake);
-    assert_eq!(torn.fate, ChildFate::Reaped);
-    assert_eq!(torn.left, None);
+    assert_eq!(torn.fate(), ChildFate::Reaped);
+    assert_eq!(
+        said_of(&torn),
+        Some((
+            log::Level::Debug,
+            format!("child 4242 could not be terminated ({refusal}): reaped it")
+        ))
+    );
     assert_eq!(fake.looks(), 1);
 }
 
@@ -510,8 +476,8 @@ fn teardown_after_a_refused_kill_with_a_failed_look_is_unknown() {
         .reaps([ReapAnswer::Err(std::io::ErrorKind::Other)])
         .signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))]);
     let (torn, _) = teardown(&fake);
-    assert_eq!(torn.fate, ChildFate::Unknown);
-    let left = torn.left.as_deref().expect("a failed look is warned of");
+    assert_eq!(torn.fate(), ChildFate::Unknown);
+    let left = warn_of(&torn).expect("a failed look is warned of");
     assert!(
         left.contains(&PID.to_string()) && left.contains(&look_error),
         "{torn:?}"
@@ -520,18 +486,25 @@ fn teardown_after_a_refused_kill_with_a_failed_look_is_unknown() {
 }
 
 /// A kill that failed on a child someone else already reaped: the look finds `ECHILD`, the child is
-/// `Gone`, and there is no warning that it is left running.
+/// `Gone`, and there is no warning that it is left running: the clause is a `debug` one.
 ///
 /// Mutant: the warning is returned for every look that did not collect an exit; the fate of a look
 /// that found the child reaped elsewhere is `Unknown`.
 #[skuld::test]
-fn teardown_after_a_refused_kill_of_a_child_reaped_elsewhere_is_gone_and_silent() {
+fn teardown_after_a_refused_kill_of_a_child_reaped_elsewhere_is_gone_at_debug() {
+    let refusal = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
     let fake = fake()
         .reaps([ReapAnswer::Foreign(Foreign::Gone)])
         .signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))]);
     let (torn, _) = teardown(&fake);
-    assert_eq!(torn.fate, ChildFate::Gone);
-    assert_eq!(torn.left, None);
+    assert_eq!(torn.fate(), ChildFate::Gone);
+    assert_eq!(
+        said_of(&torn),
+        Some((
+            log::Level::Debug,
+            format!("child 4242 could not be terminated ({refusal}): reaped by someone else")
+        ))
+    );
     assert_eq!(fake.looks(), 1);
 }
 
@@ -548,13 +521,16 @@ fn teardown_after_a_refused_kill_of_a_child_launchd_holds_is_gone_and_returns_th
         .reaps([ReapAnswer::Foreign(Foreign::Orphaned)])
         .signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))]);
     let (torn, levels) = teardown(&fake);
-    assert_eq!(torn.fate, ChildFate::Gone);
+    assert_eq!(torn.fate(), ChildFate::Gone);
     assert_eq!(
-        torn.left,
-        Some(format!(
-            "child 4242 could not be terminated ({refusal}): not ours to reap (launchd holds its zombie, because its \
-             tracer died)"
-        ))
+        warn_of(&torn),
+        Some(
+            format!(
+                "child 4242 could not be terminated ({refusal}): not ours to reap (launchd holds its zombie, because \
+                 its tracer died)"
+            )
+            .as_str()
+        )
     );
     assert!(levels.iter().all(|level| *level >= log::Level::Debug), "{levels:?}");
     assert_eq!(fake.looks(), 1);
@@ -587,7 +563,7 @@ fn a_child_not_reapable_until_after_the_threshold_warns_once_and_is_reaped() {
         .reaps([ReapAnswer::Recheck, ReapAnswer::Recheck, ReapAnswer::Reaped(exit())])
         .signals([Ok(Sent::Delivered)]);
     let (torn, records) = tear_down_logged(&fake, Some(id()), Some(due_now()));
-    assert_eq!(torn.fate, ChildFate::Reaped, "{torn:?}");
+    assert_eq!(torn.fate(), ChildFate::Reaped, "{torn:?}");
     assert_eq!(slow_warns(&records).len(), 1, "{records:?}");
 }
 
@@ -600,7 +576,7 @@ fn a_child_reaped_within_the_threshold_is_not_waited_for_again() {
         .reaps([ReapAnswer::Reaped(exit())])
         .signals([Ok(Sent::Delivered)]);
     let (torn, records) = tear_down_logged(&fake, Some(id()), Some(due_now()));
-    assert_eq!(torn.fate, ChildFate::Reaped, "{torn:?}");
+    assert_eq!(torn.fate(), ChildFate::Reaped, "{torn:?}");
     assert_eq!(slow_warns(&records), Vec::<&String>::new(), "{records:?}");
 }
 
@@ -613,7 +589,7 @@ fn a_kill_teardown_without_an_id_leaves_a_running_child_without_one() {
         .reaps([ReapAnswer::Running])
         .signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))]);
     let (torn, _) = tear_down_logged(&fake, None, None);
-    assert_eq!(torn.fate, ChildFate::Running { id: None });
+    assert_eq!(torn.fate(), ChildFate::Running { id: None });
 }
 
 /// A child with no pid is named without a number.
@@ -625,7 +601,7 @@ fn a_pidless_child_is_named_without_a_number() {
         .reaps([ReapAnswer::Running])
         .signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))]);
     let (torn, _) = tear_down_logged(&fake, None, None);
-    let left = torn.left.as_deref().expect("a refused kill is warned of");
+    let left = warn_of(&torn).expect("a refused kill is warned of");
     assert!(left.contains(crate::os_process::PIDLESS_CHILD), "{left}");
     assert!(!left.chars().any(|c| c.is_ascii_digit()), "{left}");
 }
@@ -641,7 +617,7 @@ fn a_teardown_without_a_threshold_never_looks_for_the_exit() {
         .signals([Ok(Sent::Delivered)]);
     let _fire = fire_on_block(&fake);
     let (torn, _) = tear_down_logged(&fake, Some(id()), None);
-    assert_eq!(torn.fate, ChildFate::Reaped);
+    assert_eq!(torn.fate(), ChildFate::Reaped);
     assert_eq!(fake.looks(), 2);
 }
 
@@ -656,7 +632,7 @@ fn a_teardown_past_its_threshold_warns_once_before_it_blocks() {
         .signals([Ok(Sent::Delivered)]);
     let _fire = fire_on_block(&fake);
     let (torn, records) = tear_down_logged(&fake, Some(id()), Some(due_now()));
-    assert_eq!(torn.fate, ChildFate::Reaped);
+    assert_eq!(torn.fate(), ChildFate::Reaped);
     let warns = slow_warns(&records);
     assert!(
         warns.len() == 1 && warns[0].contains(&format!("child {PID}")),
@@ -674,7 +650,7 @@ fn a_wait_that_ends_before_the_threshold_does_not_warn() {
         .reaps([ReapAnswer::Reaped(exit())])
         .signals([Ok(Sent::Delivered)]);
     let (torn, records) = tear_down_logged(&fake, Some(id()), Some(due_now()));
-    assert_eq!(torn.fate, ChildFate::Reaped);
+    assert_eq!(torn.fate(), ChildFate::Reaped);
     assert_eq!(slow_warns(&records), Vec::<&String>::new());
 }
 
@@ -689,7 +665,7 @@ fn a_refused_kill_never_looks_for_the_exit_whatever_the_threshold() {
         .reaps([ReapAnswer::Running])
         .signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))]);
     let (torn, records) = tear_down_logged(&fake, Some(id()), Some(due_now()));
-    assert_eq!(torn.fate, ChildFate::Running { id: Some(id()) });
+    assert_eq!(torn.fate(), ChildFate::Running { id: Some(id()) });
     assert_eq!(fake.looks(), 1);
     assert_eq!(slow_warns(&records), Vec::<&String>::new());
 }
@@ -717,11 +693,9 @@ fn a_failed_bounded_wait_is_the_result_and_is_not_repeated() {
         .reaps([ReapAnswer::Err(std::io::ErrorKind::Other)])
         .signals([Ok(Sent::Delivered)]);
     let (torn, records) = tear_down_logged(&fake, Some(id()), Some(due_now()));
-    assert_eq!(torn.fate, ChildFate::Killed, "{torn:?}");
+    assert_eq!(torn.fate(), ChildFate::Killed, "{torn:?}");
     assert!(
-        torn.left
-            .as_deref()
-            .is_some_and(|text| text.contains("the wait failed")),
+        warn_of(&torn).is_some_and(|text| text.contains("the wait failed")),
         "{torn:?}"
     );
     assert_eq!(slow_warns(&records), Vec::<&String>::new());
