@@ -1068,6 +1068,15 @@ impl Abandoned {
     }
 }
 
+/// What the teardown of a child that never named itself may come to, through the pidfd it is torn
+/// down through: `handed`, the expectation the handshake handed over with its pidfd. The child's own
+/// intent pidfd comes with none (`None`), and nothing there establishes that the child never ran the
+/// program or that no look failed: anything stands.
+#[cfg(target_os = "linux")]
+fn pidless_expect(handed: Option<Expect>) -> Expect {
+    handed.unwrap_or(Expect::Anything)
+}
+
 /// What became of the child itself when its spawn was abandoned.
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1116,15 +1125,13 @@ impl CgroupLeaf {
         self.abandoned = true;
         let mut received = channel.shut();
         self.entered = received.placement() == PlacementReport::Placed;
-        // The pidfd of a child that never ran the program, from its own report: nothing looked at
-        // it, and nothing but its being gone can refuse its kill.
-        let mut expect = Expect::Unexecuted;
         // The handshake's pidfd names the child where its intent named it by no handle, and the
         // handshake says what it expects of a teardown through it.
+        let mut handed = None;
         if received.pidfd.is_none() && received.proc_dir.is_none() {
-            if let Some((pidfd, handed)) = handshake {
+            if let Some((pidfd, expect)) = handshake {
                 received.pidfd = Some(pidfd);
-                expect = handed;
+                handed = Some(expect);
             }
         }
         // A child that never named itself never reached the point where it could run the program:
@@ -1133,7 +1140,7 @@ impl CgroupLeaf {
             if let Some(pidfd) = received.pidfd.take() {
                 self.remove_holding_nothing();
                 // No pid, no identity, no tree kill: killed through the pidfd, and left if refused.
-                let torn = tear_down_pidfd(None, pidfd, None, expect, warn.due());
+                let torn = tear_down_pidfd(None, pidfd, None, pidless_expect(handed), warn.due());
                 return Abandoned::after_pidless_teardown(torn);
             }
         }

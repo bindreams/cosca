@@ -73,7 +73,7 @@ impl PidfdTeardown {
     /// Says the teardown as a failed spawn's
     /// ([`failed_spawn_line`](crate::child::owned::teardown::TeardownOutcome::failed_spawn_line)): its
     /// warn, if it has one, goes through [`warn_pidfd_teardown`](crate::child::owned::teardown::warn_pidfd_teardown),
-    /// which also asserts the contract when it has none.
+    /// which asserts the teardown's contract with its caller.
     pub(crate) fn say_as_failed_spawn(&mut self, why: &mut Diagnosis) {
         let line = self.outcome.failed_spawn_line(why);
         self.warn(line.as_deref());

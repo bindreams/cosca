@@ -222,6 +222,22 @@ pub(crate) fn held_std_killable_blocker() -> std::process::Command {
     }
 }
 
+/// Kills and reaps a std child when dropped, so a failing assertion cannot leak it. A test that
+/// reaped the child elsewhere than through std takes it out first (`0.take()`): the drop would
+/// signal a pid that is no longer the test's.
+#[cfg(unix)]
+pub(crate) struct KillOnDrop(pub(crate) Option<std::process::Child>);
+
+#[cfg(unix)]
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            _ = child.kill();
+            _ = child.wait();
+        }
+    }
+}
+
 /// `.contain()`, except that on Linux it asks for [`ContainMode::Session`](crate::ContainMode::Session)
 /// (a process group, torn down with `killpg`), which never looks for a cgroup. `.contain()` tries a
 /// cgroup leaf first and logs a warning where none is delegated, so a test that holds a

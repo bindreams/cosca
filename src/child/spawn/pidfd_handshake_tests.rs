@@ -1564,6 +1564,34 @@ fn a_front_left_to_its_leaf_keeps_its_pidfd_and_is_sent_nothing() {
     assert!(cat.wait().expect("wait").success(), "the front was signalled");
 }
 
+/// A child the leaf holds without a front is torn down by the handshake through the original pidfd,
+/// and the leaf gets a copy: the handshake's wait may have failed, so the copy's teardown may come
+/// to anything, whatever the peek of the original said.
+///
+/// Mutant: the copy carries the original's expectation (`Waited` after a successful peek).
+#[skuld::test]
+fn the_leafs_copy_of_a_pidfd_the_handshake_ends_through_expects_anything() {
+    let (mut cat, pidfd) = cat_with_pidfd();
+    let left: super::LeftPidfd = Rc::new(Cell::new(None));
+    let (_, fate) = super::conclude(
+        Err::<NoChild, _>(std::io::Error::other("tokio failed")),
+        Outcome::Opened(pidfd),
+        super::LeftFront::LeafHeld(Rc::clone(&left)),
+        None,
+    )
+    .err()
+    .expect("the spawn fails")
+    .expect_may_have_started_with();
+    assert_eq!(
+        fate,
+        ChildFate::Reaped,
+        "the handshake ended the child through the original"
+    );
+    let (_copy, expect) = left.take().expect("the leaf holds a copy");
+    assert_eq!(expect, crate::child::owned::teardown::Expect::Anything);
+    drop(cat.stdin.take());
+}
+
 /// Only a child told to go can run the program, so every arm of `conclude` but one answers that it
 /// did not start: a failed `spawn` after the child was told to go, from a spawn whose error does not
 /// prove that it failed before `exec` (tokio's). std's does, so its answer there is `not started`.

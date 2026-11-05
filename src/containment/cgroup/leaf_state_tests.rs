@@ -4,7 +4,7 @@ use super::{proc_state, read_proc_state, StateUnknown};
 use crate::containment::cgroup::test_support::{handle_of, pidfd_of};
 use crate::identity::{FakeKernel, HostKernel, DIVERGED_REASON, UNREADABLE_STATUS_REASON};
 use crate::test_child::namespaces as ns;
-use crate::test_child::{fixture_path, member_command};
+use crate::test_child::{fixture_path, member_command, KillOnDrop};
 use crate::test_groups::{namespaces, pidfd_group_signal, Group};
 
 #[skuld::test]
@@ -145,18 +145,6 @@ fn fixture_state_overmount() {
     std::fs::write(&fake, format!("{pid} (fake) Z 1 1 {zeros} 1 0\n")).expect("write the fake stat");
     ns::bind_over(&fake, std::path::Path::new(&format!("/proc/{pid}/stat")));
     assert_eq!(proc_state(&HostKernel, handle_of(pid, &pidfd_of(pid))), None);
-}
-
-/// Kills and reaps the child when dropped, so a failing assertion cannot leak it.
-struct KillOnDrop(Option<std::process::Child>);
-
-impl Drop for KillOnDrop {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.0.take() {
-            _ = child.kill();
-            _ = child.wait();
-        }
-    }
 }
 
 /// A closed descriptor breaks the owned-fd contract of the poll, which debug builds assert (release

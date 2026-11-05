@@ -135,9 +135,10 @@ fn a_released_child_is_worded_as_a_child_left() {
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn a_refused_kill_of_a_backend_already_forgotten_is_torn_down_through_its_pidfd() {
-    let mut child =
-        crate::test_spawn::spawn(&mut crate::test_child::held_std_killable_blocker()).expect("spawn the child");
-    let pid = child.id();
+    let mut child = crate::test_child::KillOnDrop(Some(
+        crate::test_spawn::spawn(&mut crate::test_child::held_std_killable_blocker()).expect("spawn the child"),
+    ));
+    let pid = child.0.as_ref().expect("child").id();
     let pidfd = rustix::process::pidfd_open(
         rustix::process::Pid::from_raw(pid as i32).expect("a positive pid"),
         rustix::process::PidfdFlags::empty(),
@@ -164,9 +165,14 @@ fn a_refused_kill_of_a_backend_already_forgotten_is_torn_down_through_its_pidfd(
     assert_eq!(fate, ChildFate::Reaped);
     reaps.assert_killed();
     let already_reaped = child
+        .0
+        .as_mut()
+        .expect("child")
         .wait()
         .expect_err("the teardown reaped the child through its pidfd");
     assert_eq!(already_reaped.raw_os_error(), Some(libc::ECHILD));
+    // Reaped through the pidfd: the guard must not signal its pid.
+    drop(child.0.take());
     let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "")
         .into_iter()
         .filter(|(level, _)| *level <= log::Level::Warn)

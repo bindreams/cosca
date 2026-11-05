@@ -102,9 +102,11 @@ In order:
      to `tear_down`, sending no kill of its own. A teardown through a pidfd
      (`held_teardown::tear_down_pidfd`) is told once what its caller knows of the pidfd
      (`Expect`, in `child::owned::teardown`), and its warn is logged through
-     `warn_pidfd_teardown`, which then asserts that contract; the handshake hands the leaf its
-     pidfd copy with the `Expect`, and the leaf's abandonment carries it with the clause (`Left`)
-     to where it is logged.
+     `warn_pidfd_teardown`, which then asserts that contract; a front left to the leaf
+     (`ToLeaf`) hands the leaf its original pidfd with the `Expect`, and a child the leaf holds
+     (`LeafHeld`) hands it a copy, with `Expect::Anything` since the handshake tears down through
+     the original; the leaf's abandonment carries the `Expect` with the clause (`Left`) to where
+     it is logged.
      Apart from these,
      only the cgroup leaf's `end_child` (both spawns) starts a background reaping thread.
      `Settlement` is the one

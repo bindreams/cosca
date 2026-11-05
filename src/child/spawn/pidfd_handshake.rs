@@ -75,8 +75,7 @@ use rustix::net::{AddressFamily, RecvFlags, ReturnFlags, SendFlags, Shutdown, So
 use super::fd_channel::{above_stdio, above_stdio_keeping, publish_ends, register as register_hook, Shared};
 use super::held_teardown::{tear_down_held, tear_down_pidfd, HeldTeardown};
 use super::{SpawnFailure, SpawnLockGuard};
-use crate::child::owned::teardown::Disposition;
-use crate::child::owned::teardown::{Expect, PidfdTeardown};
+use crate::child::owned::teardown::{Disposition, Expect, PidfdTeardown};
 use crate::child::owned::OwnedChild;
 use crate::error::{ChildFate, Error};
 use crate::os_process::linux::LinuxProcess;
@@ -927,8 +926,11 @@ fn conclude<T: Spawned>(
                 (error, child_fate)
             }
             LeftFront::LeafHeld(leaf) => {
+                // The leaf's copy names a child this teardown, through the original, is about to
+                // wait for: if that wait fails, so may the leaf's later one on the same child, so
+                // the copy's teardown may come to anything. `expect` is the original's, not its.
                 match pidfd.try_clone() {
-                    Ok(copy) => leaf.set(Some((copy, expect))),
+                    Ok(copy) => leaf.set(Some((copy, Expect::Anything))),
                     Err(e) => log::debug!("a failed spawn's pidfd could not be copied for its cgroup leaf ({e})"),
                 }
                 (error, teardown(pidfd).outcome.fate)
