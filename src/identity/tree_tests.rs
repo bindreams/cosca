@@ -185,6 +185,29 @@ fn a_candidate_is_unknown_when_its_parent_cannot_be_proved() {
     assert_eq!(cause.blamed_parent(), Some(me));
 }
 
+/// A process that has exited while its handle is held still has its creator: Toolhelp does not list
+/// it (measured on Windows 11 26100.9711), so `parent` reads the number from the process's own
+/// handle, not from the snapshot, and is not an error for a row that is not there.
+///
+/// Mutant: `parent` takes the parent number from the snapshot row.
+#[cfg(windows)]
+#[skuld::test]
+fn the_parent_of_an_exited_process_whose_handle_is_held_is_its_creator() {
+    let (mut child, id) = live_member();
+    // The std `Child` holds the process handle until it is dropped, at the end of the row.
+    child.kill().expect("terminate the child");
+    child.wait().expect("the child's exit is recorded");
+    let parents = crate::containment::enumerate::process_parents(&HostKernel).expect("the process snapshot");
+    assert!(
+        !parents.iter().any(|&(pid, _)| pid == id.pid()),
+        "precondition: Toolhelp must not list the exited process whose handle is held"
+    );
+    assert_eq!(
+        id.parent().expect("the creator is readable"),
+        Some(ProcessId::current())
+    );
+}
+
 /// A spawned child is among the current process's direct children, by identity.
 #[skuld::test]
 fn children_of_the_current_process_contain_a_spawned_child() {

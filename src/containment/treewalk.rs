@@ -100,7 +100,7 @@
 //! lives. Only a walk is affected: a Job Object holds its members by membership and never walks.
 
 use crate::error::Error;
-use crate::identity::{Existence, Kernel, OrderKey, ProcessId, RawPid, Resolved, UnknownCause};
+use crate::identity::{Kernel, OrderKey, ProcessId, RawPid, Resolved, UnknownCause};
 use crate::Recursive;
 
 /// What one identity-verified kill attempt achieved. `AlreadyGone` and `NotAttempted` are
@@ -391,9 +391,11 @@ fn children_of_from_key(
 ///
 /// # Errors
 ///
-/// [`Error::Unassessable`] (or `Unsupported`) when the anchor's key cannot be told, and when `root`
-/// is live at the anchor but has no row in `parents`: it held its pid throughout, so the snapshot
-/// omitted it, and an empty walk would let a caller kill it and leave its descendants running.
+/// [`Error::Unassessable`] (or `Unsupported`) when the anchor's key cannot be told.
+///
+/// `root` needs no row in `parents`: the walk reads only the rows that name it as their parent, and
+/// a missing row of `root` says nothing about those. Toolhelp, for one, does not list an exited
+/// process whose handle is held, though its children, which Windows does not reparent, run on.
 pub(crate) fn walk_from(
     kernel: &dyn Kernel,
     root: ProcessId,
@@ -403,9 +405,6 @@ pub(crate) fn walk_from(
     let Some(root_key) = anchor(kernel, root)? else {
         return Ok(None);
     };
-    if !parents.iter().any(|&(pid, _)| pid == root.pid()) {
-        return Err(root.absent_from_snapshot());
-    }
     Ok(Some(match depth {
         Recursive::No => children_of_from_key(kernel, root, root_key, parents),
         Recursive::Yes => descendants_from_key(kernel, root, root_key, parents),
@@ -561,18 +560,6 @@ pub(crate) fn kill_by_identity(id: ProcessId) -> KillOutcome {
     outcome
 }
 
-/// Whether `root` still holds its pid, asked AFTER the snapshot was taken, for a caller that needs
-/// no order key (a walk uses [`anchor`], which asks for both). `Ok(false)`: gone or
-/// recycled. [`Error::Unassessable`] (or `Unsupported`) when it cannot be told, naming the read's
-/// cause.
-pub(crate) fn anchor_present(kernel: &dyn Kernel, root: ProcessId) -> Result<bool, Error> {
-    match root.exists_with(kernel) {
-        (Existence::Present, _) => Ok(true),
-        (Existence::Gone, _) => Ok(false),
-        (Existence::Unknown, cause) => Err(unqueryable(&format!("pid {}", root.pid()), cause)),
-    }
-}
-
 /// The error for a `subject` (`pid N` / `ppid N`) that exists but read `Unknown`: the `/proc`
 /// view when that is why, else access.
 pub(crate) fn unqueryable(subject: &str, cause: UnknownCause) -> Error {
@@ -599,8 +586,7 @@ pub(crate) fn unqueryable_read(pid: RawPid, cause: UnknownCause) -> Error {
 /// # Errors
 ///
 /// [`Error::Unassessable`] when the process snapshot cannot be taken, or `root`'s
-/// identity or order key cannot be read after it (a root that exists but cannot be queried), or
-/// `root` is live but has no row in the snapshot (see [`walk_from`]).
+/// identity or order key cannot be read after it (a root that exists but cannot be queried).
 /// Nothing is killed, the root included: killing the root first would reparent its descendants
 /// out of the ppid walk, so a retry could no longer find them. A root that no longer holds its pid
 /// is `Ok`, with nothing killed.

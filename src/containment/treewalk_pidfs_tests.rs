@@ -41,10 +41,12 @@ fn child() -> ProcessId {
 }
 
 /// A kernel in which `ROOT` has inode `ROOT_INO` and `CHILD` (its child) has `CHILD_INO`, each
-/// showing its start time.
+/// showing its start time, and which lists those two pids and no other: a walk through it reaches no
+/// host process, whichever host pids those numbers are.
 fn table() -> FakeKernel<'static> {
     FakeKernel::over(&HostKernel)
         .same_view()
+        .on_pids(Ok(&[ROOT, CHILD]))
         .on_pidfd_open(ROOT, Ok(stand_in()))
         .on_pidfs_ino(ROOT, Ok(Some(ROOT_INO)))
         .on_pidfd_open(CHILD, Ok(stand_in()))
@@ -306,9 +308,7 @@ fn root_proof_fails_at_its_key_read() -> FakeKernel<'static> {
 /// A root that held its pid when the walk began and whose key read finds another process there
 /// walks nothing, whatever each entry point read before: the answer is the key read's. Mutants: "the
 /// walk goes on after a `Gone` key read" (`hard_kill` and `terminate` record a walk, as they do
-/// when the key is read after the walk has begun); "the root is signalled". The root's number is
-/// not in the host's table, so a walk that took the presence proof for the whole answer would call
-/// it live and absent from the snapshot.
+/// when the key is read after the walk has begun); "the root is signalled".
 #[skuld::test]
 fn a_root_whose_key_read_finds_another_process_walks_nothing() {
     let sends = crate::send_log::Capture::start();
@@ -345,62 +345,6 @@ fn a_root_whose_key_read_cannot_be_made_is_unassessable_and_signals_nothing() {
         match result {
             Err(Error::Unassessable { detail, .. }) => {
                 assert!(detail.contains(&format!("pid {ROOT}")), "{detail}");
-            }
-            other => panic!("expected Unassessable, got {other:?}"),
-        }
-    }
-    assert_eq!(walks.walked(), Vec::<u32>::new(), "no walk began");
-    assert!(sends.by_identity().is_empty(), "{:?}", sends.by_identity());
-}
-
-/// A root whose pid is not in the snapshot yet was live at its key read is an error from `parent` and
-/// `children`: its row was omitted. The key read is the only look at the root, so a root that exits
-/// after it is not "gone, so no children" (on Windows that would leave its unreparented children
-/// running). The `ticks` root's one `stat` read is the key read; a second read finds it gone. Mutant:
-/// "a root absent from the snapshot is read again".
-#[skuld::test]
-fn a_root_absent_from_the_snapshot_is_unassessable_even_if_it_exits_after_its_key_read() {
-    let kernel = || {
-        FakeKernel::over(&HostKernel)
-            .same_view()
-            .on_read(&format!("{ROOT}/stat"), Ok(&stat(ROOT, 1, ROOT_START)))
-            .on_read_after(&format!("{ROOT}/stat"), 1, Err(libc::ENOENT))
-            .on_signal_probe(Pid::from_raw(ROOT as i32).unwrap(), Err(Errno::SRCH))
-    };
-    let results = [
-        ticks_root().parent_with(&kernel()).map(|_| ()),
-        ticks_root().children_with(&kernel(), Recursive::No).map(|_| ()),
-        ticks_root().children_with(&kernel(), Recursive::Yes).map(|_| ()),
-    ];
-    for result in results {
-        match result {
-            Err(Error::Unassessable { detail, .. }) => {
-                assert!(detail.contains(&format!("pid {ROOT} is live but absent")), "{detail}");
-            }
-            other => panic!("expected Unassessable, got {other:?}"),
-        }
-    }
-}
-
-/// A root that is live at its key read and has no row in the snapshot is an error from every walk
-/// (`hard_kill` and `terminate` too, not only `children`): it held its pid throughout, so its row was
-/// omitted, and a walk that found no children would let a caller kill it and leave them running.
-/// Nothing is signalled and no walk begins. `ROOT`'s number is not in the host's table. Mutant: "a
-/// root with no row walks nothing" (`hard_kill` returns `Ok(true)` with nothing killed).
-#[skuld::test]
-fn a_live_root_with_no_row_in_the_snapshot_is_unassessable_from_every_walk_and_nothing_is_killed() {
-    let sends = crate::send_log::Capture::start();
-    let walks = super::fault::record_walks();
-    let results = [
-        super::hard_kill(&table(), root()).map(|_| ()),
-        super::terminate(&table(), root()),
-        root().children_with(&table(), Recursive::No).map(|_| ()),
-        root().children_with(&table(), Recursive::Yes).map(|_| ()),
-    ];
-    for result in results {
-        match result {
-            Err(Error::Unassessable { detail, .. }) => {
-                assert!(detail.contains(&format!("pid {ROOT} is live but absent")), "{detail}");
             }
             other => panic!("expected Unassessable, got {other:?}"),
         }

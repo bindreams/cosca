@@ -1,6 +1,6 @@
 //! The process tree around a [`ProcessId`](super::ProcessId): its parent and its children.
 
-use super::{HostKernel, Kernel, ProcessId, RawPid, Resolved};
+use super::{HostKernel, Kernel, ProcessId, Resolved};
 use crate::error::Error;
 
 /// Whether a tree query descends recursively or returns only direct children.
@@ -23,9 +23,8 @@ impl ProcessId {
     ///
     /// # Errors
     ///
-    /// - [`Error::Unassessable`]: `self` (or its parent) exists but cannot be queried, `self` is
-    ///   live but missing from the process table, or the table cannot be read or trusted (on Linux,
-    ///   a `/proc` that is not this pid namespace's).
+    /// - [`Error::Unassessable`]: `self` (or its parent) exists but cannot be queried, or the
+    ///   table cannot be read or trusted (on Linux, a `/proc` that is not this pid namespace's).
     /// - [`Error::Unsupported`]: on Linux, `openat2` is unavailable (Linux ≥ 5.6).
     pub fn parent(&self) -> Result<Option<ProcessId>, Error> {
         self.parent_with(&HostKernel)
@@ -33,14 +32,19 @@ impl ProcessId {
 
     /// [`parent`](Self::parent), reading through `kernel`.
     pub(crate) fn parent_with(&self, kernel: &dyn Kernel) -> Result<Option<ProcessId>, Error> {
-        // Snapshot first, then the anchor: a `self` that still holds its pid after the snapshot
-        // held it throughout, so the edges naming it are its own. An Unknown anchor cannot rule
-        // out a recycled pid either, so it is an error.
-        let parents = crate::containment::enumerate::process_parents(kernel)?;
-        if !crate::containment::treewalk::anchor_present(kernel, *self)? {
-            return Ok(None);
-        }
-        let ppid = self.parent_pid_in(&parents)?;
+        // The table is still read first, as `children` reads it: an unreadable one is an error
+        // here too. `self`'s parent number is not in it: a live process may have no row (Toolhelp
+        // omits an exited process whose handle is held), so it comes from `self`'s own read, which
+        // is also the proof that `self` holds its pid. An Unknown read cannot rule out a recycled
+        // pid, so it is an error.
+        crate::containment::enumerate::process_parents(kernel)?;
+        let ppid = match self.parent_number_with(kernel) {
+            (Resolved::Found(ppid), _) => ppid,
+            (Resolved::Gone, _) => return Ok(None),
+            (Resolved::Unknown, cause) => {
+                return Err(crate::containment::treewalk::unqueryable_read(self.pid(), cause));
+            }
+        };
         // A process is never its own parent (treewalk's convention).
         if ppid == self.pid() {
             return Ok(None);
@@ -72,27 +76,6 @@ impl ProcessId {
             crate::containment::treewalk::keeps_order(key, parent_key, crate::containment::treewalk::ALLOW_EQUAL_ORDER)
                 .then_some(parent),
         )
-    }
-
-    /// `self`'s ppid in `parents`; an error if it has no row (see
-    /// [`absent_from_snapshot`](Self::absent_from_snapshot)).
-    fn parent_pid_in(&self, parents: &[(RawPid, RawPid)]) -> Result<RawPid, Error> {
-        parents
-            .iter()
-            .find(|&&(pid, _)| pid == self.pid())
-            .map(|&(_, ppid)| ppid)
-            .ok_or_else(|| self.absent_from_snapshot())
-    }
-
-    /// The error for a `self` that was live at its anchor, read after the snapshot, and has no row
-    /// in it: it held its pid throughout, so the row was omitted. Another read of it would only
-    /// ask whether it has exited since, which does not explain the missing row (and, on Windows,
-    /// would turn an exit into an empty answer with its children still running).
-    pub(crate) fn absent_from_snapshot(&self) -> Error {
-        Error::Unassessable {
-            detail: format!("pid {} is live but absent from the process snapshot", self.pid()),
-            source: None,
-        }
     }
 
     /// The process's children. `Recursive::No` = direct children; `Recursive::Yes` = the

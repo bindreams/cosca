@@ -184,22 +184,35 @@ fn every_walk_from_a_root_that_cannot_be_queried_errors_and_signals_nothing() {
     }
 }
 
-// A live process missing from the table =====
+// A live root missing from the table =====
 
-/// This process is live, so a table without it is not "no parent" / "no children": the entry was
-/// omitted, not the process gone. `EACCES` on the scan's read of `self` makes it skip this pid; the
-/// anchor's read after it succeeds. Mutant: "a `self` missing from the table is `Ok(None)` /
-/// `Ok(vec![])`".
+/// A live root with no row in the table has its children walked and killed: the walk reads only the
+/// rows that name the root as their parent, and the root's own row says nothing about them. The
+/// table lists the descendant alone, so the walk reaches no other host process. Mutant: "a root
+/// absent from the table is `Unassessable`, or walks nothing" (`hard_kill` then leaves the
+/// descendant, and the root, running).
 #[skuld::test]
-fn a_live_self_missing_from_the_table_is_unassessable() {
-    let me = ProcessId::current();
-    let stat = std::fs::read("/proc/self/stat").expect("this process's stat");
-    let path = format!("{}/stat", me.pid());
-    for (_, query) in queries() {
-        let kernel =
-            FakeKernel::listing_unreadable_pid(&HostKernel, me.pid(), libc::EACCES).on_read_after(&path, 1, Ok(&stat));
-        assert_unassessable_naming(query(&me, &kernel), &[&format!("pid {} is live but absent", me.pid())]);
+fn a_live_root_missing_from_the_table_still_has_its_descendant_walked_and_killed() {
+    use std::os::unix::process::ExitStatusExt as _;
+    let (mut child, root, descendant) = live_member_with_descendant();
+    // The `/proc` path: the walk's ids are `starttime` ids.
+    let root = ticks_id(root.pid());
+    let kernel = FakeKernel::over(&HostKernel)
+        .same_view()
+        .on_pids(Ok(&[descendant.pid()]))
+        .live_without_pidfs(root.pid(), pidfd_of(root.pid()))
+        .live_without_pidfs(descendant.pid(), pidfd_of(descendant.pid()));
+    for recursive in [Recursive::No, Recursive::Yes] {
+        let members = root.children_with(&kernel, recursive).expect("the root's children");
+        let pids: Vec<u32> = members.iter().map(ProcessId::pid).collect();
+        assert_eq!(pids, [descendant.pid()], "{recursive:?}");
     }
+    assert!(super::hard_kill(&kernel, root).expect("the walk ran"));
+    // Both were killed: the root by its signal, the descendant before it could print.
+    let mut printed = String::new();
+    std::io::Read::read_to_string(&mut child.stdout.take().expect("piped stdout"), &mut printed).expect("read to EOF");
+    assert_eq!(printed, "", "the descendant must have been killed");
+    assert_eq!(child.wait().expect("reap the root").signal(), Some(libc::SIGKILL));
 }
 
 // The per-pid reads go through the walk's kernel =====

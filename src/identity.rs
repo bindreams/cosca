@@ -205,6 +205,26 @@ impl OrderedRead {
     }
 }
 
+/// The backend's one read of `pid`, asking for its parent number when `ask_parent`.
+fn read_ordered(kernel: &dyn Kernel, pid: RawPid, ask_parent: bool) -> OrderedRead {
+    #[cfg(all(test, target_os = "macos"))]
+    seams::note_by_pid_read();
+    #[cfg(target_os = "linux")]
+    {
+        backend::ordered_read(kernel, pid, ask_parent)
+    }
+    #[cfg(windows)]
+    {
+        let _ = kernel;
+        backend::ordered_read(pid, None, ask_parent)
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        let _ = kernel;
+        backend::ordered_read(pid, ask_parent)
+    }
+}
+
 /// A process identity that stays unique across time: `(pid, key)`.
 /// `Eq`/`Hash` are over the pair, so a recycled PID never compares equal to the
 /// original process.
@@ -289,18 +309,27 @@ impl ProcessId {
     /// is [`Resolved::Unknown`], blaming the parent. The candidate's own failure is blamed on it only
     /// while the parent is held ([`Judged`]).
     pub(crate) fn of_ordered_with(kernel: &dyn Kernel, pid: RawPid, parent: Option<ProcessId>) -> Ordered {
-        #[cfg(all(test, target_os = "macos"))]
-        seams::note_by_pid_read();
-        #[cfg(target_os = "linux")]
-        let read = backend::ordered_read(kernel, pid, parent.is_some());
-        #[cfg(windows)]
-        let read = backend::ordered_read(pid, None, parent.is_some());
-        #[cfg(not(any(target_os = "linux", windows)))]
-        let read = backend::ordered_read(pid, parent.is_some());
+        let read = read_ordered(kernel, pid, parent.is_some());
         let Some(parent) = parent else {
             return read.unclaimed(pid);
         };
         read.judged(pid, parent.pid()).proved(|| parent.still_held(kernel))
+    }
+
+    /// The parent number of `self`'s own read: the number its record or handle gives, for a caller
+    /// that has no parent to name yet (it is only a number, which [`of_ordered_with`](Self::of_ordered_with)
+    /// proves when it is named). [`Resolved::Gone`] when another process holds `self`'s pid now;
+    /// [`Resolved::Unknown`] when the read, or the number in it, cannot be had.
+    pub(crate) fn parent_number_with(&self, kernel: &dyn Kernel) -> (Resolved<RawPid>, UnknownCause) {
+        let OrderedRead { read, parent, cause } = read_ordered(kernel, self.pid, true);
+        debug_assert!(parent != ParentRead::NotAsked, "the parent number was asked for");
+        match (read, parent) {
+            (Resolved::Gone, _) => (Resolved::Gone, cause),
+            (Resolved::Found((key, _)), _) if key != self.key => (Resolved::Gone, UnknownCause::default()),
+            (Resolved::Found(_), ParentRead::Is(number)) => (Resolved::Found(number), cause),
+            // The read failed, or it found no parent number in the record or on the handle.
+            _ => (Resolved::Unknown, cause),
+        }
     }
 
     /// Where this process falls in the order of process creation (see [`OrderKey`]), for ordering

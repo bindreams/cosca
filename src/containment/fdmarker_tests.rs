@@ -1054,8 +1054,9 @@ fn hard_kill_reports_err_on_a_genuinely_blind_pass() {
 /// A pass whose root's identity cannot be read (`identity::unreadable` refuses its by-pid read, as
 /// the OS can) skips the walk channel and is `incomplete`: not observed is not observed absent. The
 /// root is already in `seen`, so the pass signals no one, and the walk is the only source of
-/// `incomplete`. The warn names the marker handle. Mutant: the unreadable root is `Ok(None)` (a gone
-/// root), which walks nothing and reports a complete pass.
+/// `incomplete`, and no walk is recorded. The warn names the marker handle. Mutants: the unreadable
+/// root is `Ok(None)` (a gone root), which walks nothing and reports a complete pass; the walk is
+/// recorded before the root is proved.
 #[skuld::test]
 fn a_pass_whose_root_cannot_be_read_skips_the_walk_and_is_incomplete() {
     let _serialize = test_spawn_lock();
@@ -1070,6 +1071,7 @@ fn a_pass_whose_root_cannot_be_read_skips_the_walk_and_is_incomplete() {
     let mut seen: std::collections::HashSet<crate::identity::ProcessId> = std::collections::HashSet::from([root]);
     let mut group_result: Result<(), crate::error::Error> = Ok(());
     let mut incomplete = false;
+    let walks = crate::containment::treewalk::fault::record_walks();
     let mark = crate::log_capture::mark();
     let progressed = marker.sweep_pass(
         nix::sys::signal::Signal::SIGKILL,
@@ -1082,6 +1084,11 @@ fn a_pass_whose_root_cannot_be_read_skips_the_walk_and_is_incomplete() {
 
     assert!(incomplete, "an unreadable root is not a complete walk");
     assert!(!progressed, "nothing was signalled");
+    assert_eq!(
+        walks.walked(),
+        Vec::<u32>::new(),
+        "no walk began from a root that could not be read"
+    );
     let warned = crate::log_capture::records_since_on_current_thread(
         mark,
         &format!(

@@ -57,8 +57,8 @@ fn a_parent_that_started_after_its_pidfs_child_is_rejected() {
     assert_eq!(me().parent_with(&table(3_000)).expect("a readable table"), None);
 }
 
-/// `self`'s `stat` is read twice, by the snapshot and by its key: a pid gone by the second read has
-/// no parent.
+/// `self`'s `stat` is read by the snapshot and by its own read, which gives the ppid and the key: a
+/// pid gone by the second read has no parent.
 #[skuld::test]
 fn a_pidfs_id_whose_start_time_is_gone_has_no_parent() {
     let kernel = table(1_000)
@@ -85,12 +85,14 @@ fn a_pidfs_id_whose_start_time_cannot_be_read_is_unassessable() {
     }
 }
 
-/// The snapshot's ppid is only a number. If `self`'s own read, which follows, shows another ppid,
-/// the process changed parents (or its pid changed hands) and has no parent to name. Mutant: "the
-/// read's ppid is not compared with the snapshot's": the old parent is named.
+/// The ppid `self`'s first read gives is only a number. If `self`'s read under the parent it named,
+/// which follows the parent's own, shows another ppid, the process changed parents (or its pid
+/// changed hands) and has no parent to name. `self`'s `stat` is read by the snapshot, by the ppid
+/// read, then by that second read. Mutant: "the second read's ppid is not compared with the first's":
+/// the old parent is named.
 #[skuld::test]
 fn an_id_whose_own_read_shows_another_ppid_has_no_parent() {
-    let kernel = table(1_000).on_read_after(&format!("{SELF}/stat"), 1, Ok(&stat(SELF, 1, 2_000)));
+    let kernel = table(1_000).on_read_after(&format!("{SELF}/stat"), 2, Ok(&stat(SELF, 1, 2_000)));
     assert_eq!(me().parent_with(&kernel).expect("a readable table"), None);
 }
 

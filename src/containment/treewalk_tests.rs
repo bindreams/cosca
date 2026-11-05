@@ -567,7 +567,7 @@ fn a_real_candidate_is_dropped_under_a_parent_that_is_not_its_creator_on_windows
     let (x_child, x) = live_findstr_blocker();
     let (y_child, y) = live_findstr_blocker();
 
-    // The root has a row, as a live root does in a snapshot (its parent is not read).
+    // The root's own row is not read, only the rows that name it as a parent.
     let stale_creator = [(root.pid(), 0), (x.pid(), root.pid()), (y.pid(), x.pid())];
     let dropped = super::walk_from(&HostKernel, root, &stale_creator, Recursive::Yes)
         .expect("the root reads")
@@ -583,6 +583,102 @@ fn a_real_candidate_is_dropped_under_a_parent_that_is_not_its_creator_on_windows
     assert!(dropped.unassessed.is_empty() && kept.unassessed.is_empty());
     assert_eq!(dropped.members, vec![x]);
     assert_eq!(kept.members, vec![x, y]);
+}
+
+/// A root that exits while its handle is held is walked, and its running child is killed. Windows
+/// does not reparent: the child's creator pid is still the root's. Toolhelp does not list an exited
+/// process whose handle is held (measured on Windows 11 26100.9711), so the snapshot has no row for
+/// the root while the walk's edges, which name it as the child's parent, are intact: a missing root
+/// row says nothing about them. The root's order key and creator are read from its own handle, which
+/// is held.
+///
+/// The root is a `cmd.exe` that holds its `ping` child, and the child ends by itself after 30
+/// seconds: a kill that did not happen fails the assertion on its exit code, and a failed row leaves
+/// the child running for that long at most.
+///
+/// Mutant: a root with no row in the snapshot is `Unassessable`, or walks nothing.
+#[cfg(windows)]
+#[skuld::test]
+fn a_root_that_exited_while_its_handle_is_held_is_walked_and_its_child_killed() {
+    use std::process::Stdio;
+
+    use windows::Win32::Foundation::WAIT_OBJECT_0;
+    use windows::Win32::System::Threading::{
+        GetExitCodeProcess, WaitForSingleObject, INFINITE, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    };
+
+    use crate::identity::{windows_close, windows_open_classified, HostKernel, Opened};
+    use crate::Recursive;
+
+    // The std `Child` holds the root's process handle until it is dropped, at the end of the row.
+    let mut shell = crate::test_spawn::spawn(
+        std::process::Command::new("cmd.exe")
+            .args(["/c", "ping.exe", "-n", "30", "127.0.0.1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null()),
+    )
+    .expect("spawn the root");
+    let root = ProcessId::of(shell.id()).found().expect("the live root resolves");
+    // The root's children are its console host and its `ping`: wait for the `ping`.
+    let ping = loop {
+        assert!(
+            shell.try_wait().expect("poll the root").is_none(),
+            "the root exited before its child was listed"
+        );
+        let children = root.children(Recursive::No).expect("the root's children");
+        let is_ping = |id: &ProcessId| {
+            crate::identity::windows_fixture::image_file_name(id.pid()).is_some_and(|image| {
+                std::path::Path::new(&image)
+                    .file_name()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("ping.exe"))
+            })
+        };
+        if let Some(ping) = children.into_iter().find(is_ping) {
+            break ping.pid();
+        }
+        std::thread::yield_now();
+    };
+    let Opened::Found(ping_handle) =
+        windows_open_classified(ping, PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION)
+    else {
+        panic!("the child is ours and openable");
+    };
+    shell.kill().expect("terminate the root");
+    shell.wait().expect("the root's exit is recorded");
+
+    let parents = crate::containment::enumerate::process_parents(&HostKernel).expect("the process snapshot");
+    assert!(
+        !parents.iter().any(|&(pid, _)| pid == root.pid()),
+        "precondition: Toolhelp must not list the exited root whose handle is held"
+    );
+    assert!(
+        parents.iter().any(|&(pid, ppid)| pid == ping && ppid == root.pid()),
+        "precondition: the running child must still name the exited root as its creator"
+    );
+
+    let children = root.children(Recursive::No).expect("the exited root's children");
+    assert!(
+        children.iter().any(|id| id.pid() == ping),
+        "{ping} not among {children:?}"
+    );
+    assert!(
+        super::hard_kill(&HostKernel, root).expect("an exited root whose handle is held is walked"),
+        "the walk is complete"
+    );
+
+    // SAFETY: `ping_handle` is our live handle with the synchronize right. The wait ends with the
+    // kill just asked for, or with the child's own exit.
+    let waited = unsafe { WaitForSingleObject(ping_handle, INFINITE) };
+    assert_eq!(waited, WAIT_OBJECT_0, "the wait on the child returned {waited:?}");
+    let mut code = 0u32;
+    // SAFETY: `ping_handle` is live with the query right; `code` is a u32.
+    unsafe { GetExitCodeProcess(ping_handle, &mut code) }.expect("the child's exit code");
+    windows_close(ping_handle);
+    assert_eq!(
+        code,
+        crate::identity::WINDOWS_TERMINATE_EXIT_CODE,
+        "the walk must have terminated the child"
+    );
 }
 
 /// `kill_by_identity`-s pre-open Denied arm - the outcome that can leave a process running.

@@ -1375,8 +1375,6 @@ impl Marker {
             "a full sweep of a marker made without its root"
         );
         if let Some(root) = self.root.filter(|_| walk) {
-            #[cfg(test)]
-            crate::containment::treewalk::fault::note_walk(root.pid());
             if seen.insert(root) {
                 new_walk.push(root);
             }
@@ -1384,6 +1382,9 @@ impl Marker {
                 let kernel = &crate::identity::HostKernel;
                 match crate::containment::treewalk::walk_from(kernel, root, &parents, crate::Recursive::Yes) {
                     Ok(Some(walk)) => {
+                        // A walk ran: the root held its pid, as `hard_kill` and `terminate` record.
+                        #[cfg(test)]
+                        crate::containment::treewalk::fault::note_walk(root.pid());
                         for id in walk.members {
                             if seen.insert(id) {
                                 new_walk.push(id);
