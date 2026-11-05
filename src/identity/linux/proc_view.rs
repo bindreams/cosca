@@ -238,16 +238,6 @@ pub(crate) fn utf8(bytes: Vec<u8>) -> io::Result<String> {
 /// This process's [`ProcView`], from `self/status`'s `NSpid` read through one `/proc` dirfd that
 /// `kernel` opens.
 pub(crate) fn proc_view_with(kernel: &dyn Kernel) -> ProcView {
-    #[cfg(test)]
-    let forced = fault::take_forced_proc_view();
-    #[cfg(test)]
-    match forced {
-        Some(fault::ForcedView::Diverged) => return ProcView::Diverged,
-        Some(fault::ForcedView::Unassessable) => {
-            return ProcView::Unassessable(ViewUnreadable::new("forced by a test", None));
-        }
-        None => {}
-    }
     let dir = match kernel.open_proc() {
         Ok(dir) => dir,
         Err(why) => return ProcView::Unassessable(why),
@@ -423,95 +413,6 @@ fn collect_pids(names: impl IntoIterator<Item = io::Result<Vec<u8>>>) -> io::Res
         pids.push(pid);
     }
     Ok(pids)
-}
-
-#[cfg(test)]
-pub(crate) mod fault {
-    use std::cell::{Cell, RefCell};
-
-    /// A view to force.
-    #[derive(Debug, Clone, Copy)]
-    pub(crate) enum ForcedView {
-        Diverged,
-        Unassessable,
-    }
-
-    thread_local! {
-        static FORCE_PROC_VIEW: Cell<Option<ForcedView>> = const { Cell::new(None) };
-        static FORCE_PROC_VIEW_SKIP: Cell<u32> = const { Cell::new(0) };
-        static PROC_VIEW_CALLS: Cell<u32> = const { Cell::new(0) };
-        static PROC_VIEW_FIRED_AT: Cell<Option<u32>> = const { Cell::new(None) };
-        static FORCE_IDENTITY_STAT: RefCell<Vec<(u32, i32)>> = const { RefCell::new(Vec::new()) };
-    }
-
-    /// Disarms every forced value on drop, even unconsumed — so a test that panics before
-    /// reaching the seam cannot leave one armed for whatever runs next on this thread.
-    #[must_use = "dropping this immediately disarms the forced values; bind it for the probe's duration"]
-    pub(crate) struct Forced(());
-
-    impl Drop for Forced {
-        fn drop(&mut self) {
-            FORCE_PROC_VIEW.with(|f| f.set(None));
-            FORCE_PROC_VIEW_SKIP.with(|f| f.set(0));
-            PROC_VIEW_CALLS.with(|f| f.set(0));
-            PROC_VIEW_FIRED_AT.with(|f| f.set(None));
-            FORCE_IDENTITY_STAT.with(|f| f.borrow_mut().clear());
-        }
-    }
-
-    /// Make every by-pid identity read of `pid`'s `stat` on THIS thread fail with `errno` (a
-    /// `hidepid` or access refusal that `kill(pid, 0)` does not call a gone pid), until the guard
-    /// drops. Reads by the checked-directory table scan are unaffected.
-    pub(crate) fn force_identity_stat_errno(pid: u32, errno: i32) -> Forced {
-        FORCE_IDENTITY_STAT.with(|f| f.borrow_mut().push((pid, errno)));
-        Forced(())
-    }
-
-    pub(crate) fn forced_identity_stat_errno(pid: u32) -> Option<i32> {
-        FORCE_IDENTITY_STAT.with(|f| f.borrow().iter().find(|&&(p, _)| p == pid).map(|&(_, e)| e))
-    }
-
-    /// Force the NEXT [`proc_view_with`](super::proc_view_with) on THIS thread.
-    pub(crate) fn force_proc_view_once(view: ForcedView) -> Forced {
-        PROC_VIEW_CALLS.with(|f| f.set(0));
-        PROC_VIEW_FIRED_AT.with(|f| f.set(None));
-        FORCE_PROC_VIEW.with(|f| f.set(Some(view)));
-        Forced(())
-    }
-
-    /// Force the [`proc_view_with`](super::proc_view_with) on THIS thread that follows `skip` real ones,
-    /// so a caller whose first read must pass (an anchor) fails only at a later one.
-    pub(crate) fn force_proc_view_after(skip: u32, view: ForcedView) -> Forced {
-        FORCE_PROC_VIEW_SKIP.with(|f| f.set(skip));
-        force_proc_view_once(view)
-    }
-
-    /// Where the forced view fired: how many [`proc_view_with`](super::proc_view_with) calls on THIS thread
-    /// preceded it since it was armed. `None` while it has not fired.
-    pub(crate) fn proc_view_fired_at() -> Option<u32> {
-        PROC_VIEW_FIRED_AT.with(|f| f.get())
-    }
-
-    pub(crate) fn take_forced_proc_view() -> Option<ForcedView> {
-        let index = PROC_VIEW_CALLS.with(|f| {
-            let n = f.get();
-            f.set(n + 1);
-            n
-        });
-        let skipped = FORCE_PROC_VIEW_SKIP.with(|f| {
-            let n = f.get();
-            f.set(n.saturating_sub(1));
-            n > 0
-        });
-        if skipped {
-            return None;
-        }
-        let forced = FORCE_PROC_VIEW.with(|f| f.take());
-        if forced.is_some() {
-            PROC_VIEW_FIRED_AT.with(|f| f.set(Some(index)));
-        }
-        forced
-    }
 }
 
 #[cfg(test)]

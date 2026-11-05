@@ -2,6 +2,7 @@
 //! `test_child::namespaces` for the group's gating).
 
 use crate::containment::enumerate::process_parents;
+use crate::identity::HostKernel;
 use crate::test_child::namespaces as ns;
 use crate::test_child::{await_member_ready, fixture_path, member_command};
 use crate::test_groups::{namespaces, Group};
@@ -28,7 +29,7 @@ fn fixture_enumerate_inner() {
     if !ns::is_child_in_new_pid_ns() {
         return;
     }
-    match process_parents() {
+    match process_parents(&HostKernel) {
         Err(crate::error::Error::Unassessable { detail, .. }) => {
             assert!(detail.contains("outer pid namespace"), "{detail}")
         }
@@ -60,7 +61,7 @@ fn fixture_enumerate_stat_overmount() {
     std::fs::write(&fake, format!("{pid} (fake) S 4242 999 {zeros} 1 0\n")).expect("write the fake stat");
     ns::bind_over(&fake, std::path::Path::new(&format!("/proc/{pid}/stat")));
 
-    match process_parents() {
+    match process_parents(&HostKernel) {
         Err(crate::error::Error::Unassessable { detail, .. }) => {
             assert!(
                 detail.contains(&format!("{pid}/stat lies beyond a mount in /proc")),
