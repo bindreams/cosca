@@ -72,6 +72,14 @@ pub(crate) enum WaitFor<'a> {
 #[cfg(unix)]
 pub(crate) const OPEN_CONSEQUENCE: &str = "its exit cannot be observed and no signal was sent";
 
+/// What a message calls a child whose pid is not known ([`OsChild::pid`](child::OsChild::pid)).
+pub(crate) const PIDLESS_CHILD: &str = "the child (pid unknown)";
+
+/// How a message names a child: `child 4242`, or what stands for a pid that is not known.
+pub(crate) fn child_named(pid: Option<u32>) -> String {
+    pid.map_or_else(|| PIDLESS_CHILD.to_owned(), |pid| format!("child {pid}"))
+}
+
 /// Open the process `id` names. `Ok(None)`: it is gone, or its pid now names another process.
 pub(crate) fn open(id: ProcessId) -> Result<Option<Box<dyn OsProcess>>, Error> {
     #[cfg(target_os = "linux")]

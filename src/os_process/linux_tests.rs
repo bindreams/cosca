@@ -297,5 +297,10 @@ fn a_signal_to_a_reaped_pidless_linux_child_is_named_without_a_number() {
     assert_eq!(os.signal(Sig::Kill).expect("a reaped child is gone"), Sent::Gone);
     let said = crate::log_capture::records_since_on_current_thread(mark, "already gone");
     assert_eq!(said.len(), 1, "{said:?}");
-    assert!(said[0].1.contains("to the child (pid unknown): "), "{said:?}");
+    assert!(
+        said[0]
+            .1
+            .contains(&format!("to {}: ", crate::os_process::PIDLESS_CHILD)),
+        "{said:?}"
+    );
 }

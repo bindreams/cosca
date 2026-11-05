@@ -649,10 +649,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             // treat a live, merely-unreadable child as a startup failure. A front's fate is a note.
             let error = spawn_identity_error(other, cause);
             return Err(SpawnFailure::started(
-                match fate {
-                    Some(fate) => fate.note(error, front, Some(pid)),
-                    None => error,
-                },
+                note_front(fate, error, front, Some(pid)),
                 child_fate,
             ));
         }
@@ -693,10 +690,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             #[cfg(all(not(target_os = "macos"), not(target_os = "linux")))]
             let (fate, child_fate) = teardown_unadopted_or_front(child, front, Some(id));
             return Err(SpawnFailure::started(
-                match fate {
-                    Some(fate) => fate.note(error, front, Some(pid)),
-                    None => error,
-                },
+                note_front(fate, error, front, Some(pid)),
                 child_fate,
             ));
         }
@@ -730,10 +724,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
                 (None, teardown_after_attach_failure(child, unique, id))
             };
             return Err(SpawnFailure::started(
-                match fate {
-                    Some(fate) => fate.note(error, front, Some(pid)),
-                    None => error,
-                },
+                note_front(fate, error, front, Some(pid)),
                 child_fate,
             ));
         }
@@ -2489,6 +2480,20 @@ impl FrontFate {
     }
 }
 
+/// A failed spawn's `error` with what became of the front `pid` noted ([`FrontFate::note`]). `fate`
+/// is `None` for a child that is not a front: `error` itself.
+fn note_front(
+    fate: Option<FrontFate>,
+    error: Error,
+    front: Option<crate::elevation::front::Front>,
+    pid: Option<u32>,
+) -> Error {
+    match fate {
+        Some(fate) => fate.note(error, front, pid),
+        None => error,
+    }
+}
+
 /// Settle `prepared`'s placement verdict in a failure arm after the fork, before the child is torn
 /// down, so the teardown never races the verdict's reads.
 pub(crate) fn settle_before_teardown(
@@ -2575,7 +2580,7 @@ pub(crate) fn front_subtree(
 
 /// [`teardown_unadopted_noting`], unless `child` is an elevation front: a kill of that would orphan the
 /// elevated program. A front is sent nothing. One that has exited is reaped now. One a cgroup kill
-/// landed on and reached (see [`Subtree::reached`](crate::containment::cgroup::Subtree::reached)) is
+/// landed on and reached (see [`Subtree::reached_by`](crate::containment::cgroup::Subtree::reached_by)) is
 /// dying: its exit, which that kill bounds, is waited for, and it is reaped. Any other is left
 /// unreaped, with nothing that waits for it, and stays a zombie once it exits. The caller returns
 /// its error with the front's fate noted ([`FrontFate::note`]).
@@ -2667,7 +2672,7 @@ fn leave_unadopted_front_noting(
             let mut unplaced = false;
             #[cfg(target_os = "linux")]
             if let (Some(subtree), Some(pid)) = (subtree, child.pid()) {
-                match subtree.reached(pid, Some(child.pidfd())) {
+                match subtree.reached_by(pid, Some(child.pidfd())) {
                     Ok(true) => {
                         #[cfg(test)]
                         fault::run_between_kill_and_wait();

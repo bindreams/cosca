@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use std::io;
 
 use super::teardown::{due_now, exit, fake, fire_on_block, id, slow_warns, PID};
-use crate::child::owned::teardown::{LeaveReason, Reach, ReachFailure, TeardownKind, TeardownOutcome};
+use crate::child::owned::teardown::{LookOutcome, Reach, TeardownKind, TeardownOutcome};
 use crate::child::owned::OwnedChild;
 use crate::error::ChildFate;
 use crate::identity::ProcessId;
@@ -14,21 +14,14 @@ use crate::os_process::child::Foreign;
 use crate::os_process::fake::{Answer, FakeProcess, ReapAnswer};
 use crate::wait::teardown_warn::Due;
 
-/// What a [`FakeReach`] fails to read.
-#[derive(Clone, Copy)]
-enum Cause {
-    Place,
-    Subtree,
-}
-
 /// A [`Reach`] with a stated answer, and the pids of the children it was asked about.
 struct FakeReach {
-    answer: Result<bool, (Cause, io::ErrorKind)>,
+    answer: Result<bool, io::ErrorKind>,
     asked: RefCell<Vec<Option<u32>>>,
 }
 
 impl FakeReach {
-    fn answering(answer: Result<bool, (Cause, io::ErrorKind)>) -> Self {
+    fn answering(answer: Result<bool, io::ErrorKind>) -> Self {
         Self {
             answer,
             asked: RefCell::default(),
@@ -41,20 +34,21 @@ impl FakeReach {
 }
 
 impl Reach for FakeReach {
-    fn reached(&self, child: &OwnedChild) -> Result<bool, ReachFailure> {
+    fn reached(&self, child: &OwnedChild) -> io::Result<bool> {
         self.asked.borrow_mut().push(child.pid());
-        self.answer.map_err(|(cause, kind)| match cause {
-            Cause::Place => ReachFailure::Place(io::Error::from(kind)),
-            Cause::Subtree => ReachFailure::Subtree(io::Error::from(kind)),
-        })
+        self.answer.map_err(io::Error::from)
     }
 }
+
+/// What the look at a front is given to tell whether a kill sent elsewhere reached it: a reach, or
+/// none; or the failure of reading the subtree that kill went through.
+type Reaches<'a> = Result<Option<&'a dyn Reach>, io::Error>;
 
 /// `tear_down(id, Look(reach), due)` over `fake`, and everything it logged on this thread.
 fn look_logged(
     fake: &FakeProcess,
     id: Option<ProcessId>,
-    reach: Option<&dyn Reach>,
+    reach: Reaches<'_>,
     due: Option<Due>,
 ) -> (TeardownOutcome, Vec<(log::Level, String)>) {
     crate::log_capture::install();
@@ -65,27 +59,41 @@ fn look_logged(
 }
 
 fn look(fake: &FakeProcess, reach: Option<&dyn Reach>) -> TeardownOutcome {
-    look_logged(fake, Some(id()), reach, None).0
+    look_logged(fake, Some(id()), Ok(reach), None).0
 }
 
-/// Why a front was left behind, as far as the tests tell it apart.
+/// How the look at a front went, as far as the tests tell it apart.
 #[derive(Debug, PartialEq, Eq)]
-enum Left {
+enum Went {
+    /// Not the look of a front.
     Nothing,
-    Running,
-    Place,
-    Subtree,
+    Reaped,
+    ReapedElsewhere,
+    LookFailed,
+    ReapFailed,
+    LeftRunning,
+    PlaceUnreadable,
+    SubtreeUnreadable,
 }
 
+fn went(torn: &TeardownOutcome) -> Went {
+    match &torn.look {
+        None => Went::Nothing,
+        Some(LookOutcome::Reaped(_)) => Went::Reaped,
+        Some(LookOutcome::ReapedElsewhere) => Went::ReapedElsewhere,
+        Some(LookOutcome::LookFailed(_)) => Went::LookFailed,
+        Some(LookOutcome::ReapFailed(_)) => Went::ReapFailed,
+        Some(LookOutcome::LeftRunning) => Went::LeftRunning,
+        Some(LookOutcome::PlaceUnreadable(_)) => Went::PlaceUnreadable,
+        Some(LookOutcome::SubtreeUnreadable(_)) => Went::SubtreeUnreadable,
+    }
+}
+
+/// The policy words nothing of a front: what the drop says is its own, from the typed outcome.
 #[track_caller]
-fn assert_outcome(torn: &TeardownOutcome, fate: ChildFate, left: Left) {
-    let left_behind = match &torn.leave {
-        None => Left::Nothing,
-        Some(LeaveReason::Running) => Left::Running,
-        Some(LeaveReason::ReachUnknown(ReachFailure::Place(_))) => Left::Place,
-        Some(LeaveReason::ReachUnknown(ReachFailure::Subtree(_))) => Left::Subtree,
-    };
-    assert_eq!((&torn.fate, left_behind), (&fate, left), "{torn:?}");
+fn assert_outcome(torn: &TeardownOutcome, fate: ChildFate, went_as: Went) {
+    assert_eq!((&torn.fate, went(torn)), (&fate, went_as), "{torn:?}");
+    assert_eq!(torn.left, None, "{torn:?}");
 }
 
 /// A front that has exited at the look is reaped, and nothing asks where it is.
@@ -96,22 +104,19 @@ fn a_front_that_has_exited_is_reaped_without_asking_where_it_is() {
     let fake = fake().reaps([ReapAnswer::Reaped(exit())]);
     let reach = FakeReach::answering(Ok(true));
     let torn = look(&fake, Some(&reach));
-    assert_outcome(&torn, ChildFate::Reaped, Left::Nothing);
-    assert_eq!(torn.left, None);
+    assert_outcome(&torn, ChildFate::Reaped, Went::Reaped);
     assert_eq!(reach.asked(), []);
 }
 
-/// A running front with no reach is left running, unreaped, with no wording of the policy's own (the
-/// caller words it), and is not waited for.
+/// A running front with no reach is left running, not waited for, and not worded by the policy.
 ///
-/// Mutants: it is waited for; it is called reaped; the policy words what the caller knows.
+/// Mutants: it is waited for; it is called reaped; the policy words it.
 #[skuld::test]
 fn a_running_front_with_no_reach_is_left_running_and_not_waited_for() {
     let fake = fake().reaps([ReapAnswer::Running]);
     let _fire = fire_on_block(&fake);
     let torn = look(&fake, None);
-    assert_outcome(&torn, ChildFate::Running { id: Some(id()) }, Left::Running);
-    assert_eq!(torn.left, None);
+    assert_outcome(&torn, ChildFate::Running { id: Some(id()) }, Went::LeftRunning);
     assert_eq!(fake.looks(), 1);
     assert_eq!(crate::wait::block_probe::take(), [], "no wait");
 }
@@ -126,8 +131,7 @@ fn a_running_front_the_kill_did_not_reach_is_left_running() {
     let _fire = fire_on_block(&fake);
     let reach = FakeReach::answering(Ok(false));
     let torn = look(&fake, Some(&reach));
-    assert_outcome(&torn, ChildFate::Running { id: Some(id()) }, Left::Running);
-    assert_eq!(torn.left, None);
+    assert_outcome(&torn, ChildFate::Running { id: Some(id()) }, Went::LeftRunning);
     assert_eq!(reach.asked(), [Some(PID)]);
     assert_eq!(crate::wait::block_probe::take(), [], "no wait");
 }
@@ -140,14 +144,13 @@ fn a_running_front_the_kill_reached_is_waited_for_and_reaped() {
     let fake = fake().reaps([ReapAnswer::Running, ReapAnswer::Running, ReapAnswer::Reaped(exit())]);
     let _fire = fire_on_block(&fake);
     let torn = look(&fake, Some(&FakeReach::answering(Ok(true))));
-    assert_outcome(&torn, ChildFate::Reaped, Left::Nothing);
-    assert_eq!(torn.left, None);
+    assert_outcome(&torn, ChildFate::Reaped, Went::Reaped);
     assert_eq!(fake.looks(), 3, "the look, the wait's look, the look the wait woke to");
     assert_eq!(crate::wait::block_probe::take(), [None], "one unbounded block");
 }
 
-/// A wait for a dying front that fails leaves it unaccounted for, and the warn names the failed
-/// reap. The kill landed, so the fate is `Killed`.
+/// A wait for a dying front that fails leaves it unaccounted for, with the failed reap in the
+/// outcome. The kill landed, so the fate is `Killed`.
 ///
 /// Mutant: the failure is dropped; the fate is `Unknown`.
 #[skuld::test]
@@ -155,96 +158,238 @@ fn a_failed_wait_for_a_reached_front_is_unaccounted_for() {
     let fake = fake().reaps([ReapAnswer::Running, ReapAnswer::Err(io::ErrorKind::Other)]);
     let _fire = fire_on_block(&fake);
     let torn = look(&fake, Some(&FakeReach::answering(Ok(true))));
-    assert_outcome(&torn, ChildFate::Killed, Left::Nothing);
-    assert!(
-        torn.left.as_deref().is_some_and(|left| left.contains(&format!(
-            "elevation front pid {PID} was killed through its cgroup, and could not be reaped"
-        ))),
-        "{torn:?}"
-    );
+    assert_outcome(&torn, ChildFate::Killed, Went::ReapFailed);
 }
 
 /// A front reaped by someone else between the look and the wait is `Killed` (the cgroup kill landed
-/// first), unaccounted for, and only the debug log says so.
+/// first), unaccounted for, and nothing above `debug` is logged.
 ///
-/// Mutants: the foreign reap is warned of; it is `Gone`; the debug line is not worded as the front's.
+/// Mutants: the foreign reap is warned of; it is `Gone`.
 #[skuld::test]
 fn a_front_reaped_elsewhere_between_the_look_and_the_wait_is_killed_and_silent() {
     let fake = fake().reaps([ReapAnswer::Running, ReapAnswer::Foreign(Foreign::Gone)]);
     let _fire = fire_on_block(&fake);
-    let (torn, records) = look_logged(&fake, Some(id()), Some(&FakeReach::answering(Ok(true))), None);
-    assert_outcome(&torn, ChildFate::Killed, Left::Nothing);
-    assert_eq!(torn.left, None);
+    let (torn, records) = look_logged(&fake, Some(id()), Ok(Some(&FakeReach::answering(Ok(true)))), None);
+    assert_outcome(&torn, ChildFate::Killed, Went::ReapedElsewhere);
     assert!(
         records.iter().all(|(level, _)| *level >= log::Level::Debug),
         "{records:?}"
     );
-    let said = format!("Child::drop: elevation front pid {PID} was reaped by someone else");
-    assert!(records.iter().any(|(_, text)| *text == said), "{records:?}");
+}
+
+/// A front reaped by someone else in the wait for it, whose zombie launchd holds, is warned of: the
+/// wait has nobody else to say so. It is `Killed`, as for any foreign reap after the kill.
+///
+/// Mutant: the wait is quiet about launchd.
+#[skuld::test]
+fn a_dying_front_launchd_holds_is_warned_of_by_the_wait() {
+    let fake = fake().reaps([ReapAnswer::Running, ReapAnswer::Foreign(Foreign::Orphaned)]);
+    let _fire = fire_on_block(&fake);
+    let (torn, records) = look_logged(&fake, Some(id()), Ok(Some(&FakeReach::answering(Ok(true)))), None);
+    assert_outcome(&torn, ChildFate::Killed, Went::ReapedElsewhere);
+    let warns: Vec<_> = records.iter().filter(|(level, _)| *level == log::Level::Warn).collect();
+    assert_eq!(warns.len(), 1, "{records:?}");
+    assert_eq!(
+        warns[0].1,
+        "pid 4242: not ours to reap (launchd holds its zombie, because its tracer died)"
+    );
 }
 
 /// A front whose place cannot be read is neither waited for nor called running: its fate is
-/// `Unknown` and it is left for an unreadable place, with the error.
+/// `Unknown` and it is left for an unreadable place.
 ///
 /// Mutants: an unreadable place is taken for running, or for reached.
 #[skuld::test]
 fn a_front_whose_place_cannot_be_read_is_not_called_running_nor_waited_for() {
     let fake = fake().reaps([ReapAnswer::Running]);
     let _fire = fire_on_block(&fake);
-    let torn = look(
-        &fake,
-        Some(&FakeReach::answering(Err((Cause::Place, io::ErrorKind::Other)))),
-    );
-    assert_outcome(&torn, ChildFate::Unknown, Left::Place);
-    assert_eq!(torn.left, None);
+    let torn = look(&fake, Some(&FakeReach::answering(Err(io::ErrorKind::Other))));
+    assert_outcome(&torn, ChildFate::Unknown, Went::PlaceUnreadable);
     assert_eq!(fake.looks(), 1);
     assert_eq!(crate::wait::block_probe::take(), [], "no wait");
 }
 
-/// A front whose leaf's subtree cannot be read is left for that, not for an unreadable place: the
-/// two are told apart.
-///
-/// Mutant: an unreadable subtree is reported as an unreadable place.
-#[skuld::test]
-fn a_front_whose_subtree_cannot_be_read_is_left_for_the_subtree() {
-    let fake = fake().reaps([ReapAnswer::Running]);
-    let torn = look(
-        &fake,
-        Some(&FakeReach::answering(Err((Cause::Subtree, io::ErrorKind::Other)))),
-    );
-    assert_outcome(&torn, ChildFate::Unknown, Left::Subtree);
-    assert_eq!(torn.left, None);
+/// What the test reads an error back by, to tell the error that went in from a copy of it.
+#[derive(Debug)]
+struct Original;
+
+impl std::fmt::Display for Original {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the leaf cannot be read")
+    }
 }
 
-/// What a drop says of each way it leaves a front, word for word: the front's pid, then the cause,
-/// with `why` in the running one's.
-#[cfg(unix)]
+impl std::error::Error for Original {}
+
+/// A front whose leaf's subtree cannot be read is left for that, not for an unreadable place, with
+/// the very error it was given.
+///
+/// Mutants: an unreadable subtree is reported as an unreadable place; the error is rebuilt from its
+/// kind and text.
 #[skuld::test]
-fn a_front_left_behind_is_worded_by_the_drop() {
-    let why = "the front is not in a cgroup this drop killed";
-    let cause = io::Error::from(io::ErrorKind::Other).to_string();
-    let reaches = [
-        (None, Left::Running),
-        (Some(Err((Cause::Place, io::ErrorKind::Other))), Left::Place),
-        (Some(Err((Cause::Subtree, io::ErrorKind::Other))), Left::Subtree),
-    ];
-    let wanted = [
-        format!("elevation front pid {PID} is left running and unreaped: {why}, and a kill of the front would orphan the elevated program"),
-        format!("elevation front pid {PID} is left unreaped: where it is cannot be read ({cause}), so it is not known whether the cgroup kill ended it"),
-        format!("elevation front pid {PID} is left unreaped: its leaf's subtree cannot be read ({cause}), so it is not known whether the cgroup kill ended it"),
-    ];
-    for ((reach, left), wanted) in reaches.into_iter().zip(wanted) {
-        let fake = fake().reaps([ReapAnswer::Running]);
-        let reach = reach.map(FakeReach::answering);
-        let torn = look(&fake, reach.as_ref().map(|reach| reach as &dyn Reach));
-        let fate = if left == Left::Running {
-            ChildFate::Running { id: Some(id()) }
-        } else {
-            ChildFate::Unknown
-        };
-        assert_outcome(&torn, fate, left);
-        let reason = torn.leave.as_ref().expect("a front left behind says why");
-        assert_eq!(crate::child::front_left_text(PID, &why, reason), wanted);
+fn a_front_whose_subtree_cannot_be_read_is_left_for_the_subtree_with_its_own_error() {
+    let fake = fake().reaps([ReapAnswer::Running]);
+    let unreadable = io::Error::new(io::ErrorKind::PermissionDenied, Original);
+    let (torn, _) = look_logged(&fake, Some(id()), Err(unreadable), None);
+    assert_outcome(&torn, ChildFate::Unknown, Went::SubtreeUnreadable);
+    let Some(LookOutcome::SubtreeUnreadable(e)) = &torn.look else {
+        panic!("{torn:?}");
+    };
+    assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+    assert!(e.get_ref().is_some_and(|inner| inner.is::<Original>()), "{e:?}");
+}
+
+/// A front that has exited is reaped whatever the subtree: the subtree is asked about only for a
+/// front still running.
+///
+/// Mutant: an unreadable subtree is looked at before the front.
+#[skuld::test]
+fn a_front_that_has_exited_is_reaped_though_its_subtree_cannot_be_read() {
+    let fake = fake().reaps([ReapAnswer::Reaped(exit())]);
+    let (torn, _) = look_logged(&fake, Some(id()), Err(io::Error::from(io::ErrorKind::Other)), None);
+    assert_outcome(&torn, ChildFate::Reaped, Went::Reaped);
+}
+
+/// What a drop says of each way it ends a front, word for word as the drop on `azhukova/dev` does:
+/// the front's pid, then the cause, with `why` in the running one's. The wording goes through the
+/// drop's own rendering, over what `tear_down` returned.
+#[cfg(unix)]
+mod worded {
+    use super::*;
+
+    const WHY: &str = "the front is not in a cgroup this drop killed";
+
+    /// The outcome of `tear_down` over `fake`, as the drop words it, and its debug records.
+    fn worded_by_the_drop(fake: &FakeProcess, reach: Reaches<'_>) -> (TeardownOutcome, Vec<(log::Level, String)>) {
+        let (torn, _) = look_logged(fake, Some(id()), reach, None);
+        let mark = crate::log_capture::mark();
+        let worded = crate::child::word_front(PID, &WHY, torn);
+        (
+            worded,
+            crate::log_capture::records_since_on_current_thread(mark, "Child::drop: "),
+        )
+    }
+
+    fn cause() -> String {
+        io::Error::from(io::ErrorKind::Other).to_string()
+    }
+
+    #[track_caller]
+    fn assert_left(reach: Reaches<'_>, fake: &FakeProcess, wanted: &str) {
+        let _fire = fire_on_block(fake);
+        let (worded, records) = worded_by_the_drop(fake, reach);
+        assert_eq!(worded.left.as_deref(), Some(wanted), "{worded:?}");
+        assert_eq!(records, [], "a leftover is a warn's, not a debug line");
+        assert!(worded.look.is_none(), "the look is worded and used up: {worded:?}");
+    }
+
+    #[track_caller]
+    fn assert_debug(reach: Reaches<'_>, fake: &FakeProcess, wanted: &str) {
+        let _fire = fire_on_block(fake);
+        let (worded, records) = worded_by_the_drop(fake, reach);
+        assert_eq!(worded.left, None, "{worded:?}");
+        assert_eq!(records, [(log::Level::Debug, wanted.to_owned())]);
+    }
+
+    #[skuld::test]
+    fn a_front_left_running_is_worded_with_why() {
+        assert_left(
+            Ok(None),
+            &fake().reaps([ReapAnswer::Running]),
+            "elevation front pid 4242 is left running and unreaped: the front is not in a cgroup this drop killed, and a kill of the front would orphan the elevated program",
+        );
+        assert_left(
+            Ok(Some(&FakeReach::answering(Ok(false)))),
+            &fake().reaps([ReapAnswer::Running]),
+            "elevation front pid 4242 is left running and unreaped: the front is not in a cgroup this drop killed, and a kill of the front would orphan the elevated program",
+        );
+    }
+
+    #[skuld::test]
+    fn a_front_whose_place_cannot_be_read_is_worded() {
+        assert_left(
+            Ok(Some(&FakeReach::answering(Err(io::ErrorKind::Other)))),
+            &fake().reaps([ReapAnswer::Running]),
+            &format!("elevation front pid 4242 is left unreaped: where it is cannot be read ({}), so it is not known whether the cgroup kill ended it", cause()),
+        );
+    }
+
+    #[skuld::test]
+    fn a_front_whose_subtree_cannot_be_read_is_worded() {
+        assert_left(
+            Err(io::Error::from(io::ErrorKind::Other)),
+            &fake().reaps([ReapAnswer::Running]),
+            &format!("elevation front pid 4242 is left unreaped: its leaf's subtree cannot be read ({}), so it is not known whether the cgroup kill ended it", cause()),
+        );
+    }
+
+    #[skuld::test]
+    fn a_front_that_cannot_be_looked_at_is_worded() {
+        assert_left(
+            Ok(None),
+            &fake().reaps([ReapAnswer::Err(io::ErrorKind::Other)]),
+            &format!(
+                "elevation front pid 4242 could not be looked at after its cgroup's teardown ({})",
+                cause()
+            ),
+        );
+    }
+
+    #[skuld::test]
+    fn a_front_that_cannot_be_reaped_after_the_kill_is_worded() {
+        assert_left(
+            Ok(Some(&FakeReach::answering(Ok(true)))),
+            &fake().reaps([ReapAnswer::Running, ReapAnswer::Err(io::ErrorKind::Other)]),
+            &format!(
+                "elevation front pid 4242 was killed through its cgroup, and could not be reaped ({})",
+                cause()
+            ),
+        );
+    }
+
+    #[skuld::test]
+    fn a_front_reaped_is_said_at_debug() {
+        assert_debug(
+            Ok(None),
+            &fake().reaps([ReapAnswer::Reaped(exit())]),
+            &format!(
+                "Child::drop: elevation front pid 4242 was killed through its cgroup and reaped ({})",
+                std::process::ExitStatus::default()
+            ),
+        );
+        assert_debug(
+            Ok(Some(&FakeReach::answering(Ok(true)))),
+            &fake().reaps([ReapAnswer::Running, ReapAnswer::Running, ReapAnswer::Reaped(exit())]),
+            &format!(
+                "Child::drop: elevation front pid 4242 was killed through its cgroup and reaped ({})",
+                std::process::ExitStatus::default()
+            ),
+        );
+    }
+
+    #[skuld::test]
+    fn a_front_reaped_by_someone_else_is_said_at_debug() {
+        assert_debug(
+            Ok(None),
+            &fake().reaps([ReapAnswer::Foreign(Foreign::Gone)]),
+            "Child::drop: elevation front pid 4242 was reaped by someone else",
+        );
+        assert_debug(
+            Ok(Some(&FakeReach::answering(Ok(true)))),
+            &fake().reaps([ReapAnswer::Running, ReapAnswer::Foreign(Foreign::Gone)]),
+            "Child::drop: elevation front pid 4242 was reaped by someone else",
+        );
+    }
+
+    /// A teardown that is not a front's has no look to word: the outcome is returned as it is.
+    ///
+    /// Mutant: the rendering rewrites `left`.
+    #[skuld::test]
+    fn an_outcome_with_no_look_is_returned_as_it_is() {
+        let mut torn = TeardownOutcome::new(ChildFate::Reaped);
+        torn.left = Some("from the policy".to_owned());
+        let worded = crate::child::word_front(PID, &WHY, torn);
+        assert_eq!(worded.left.as_deref(), Some("from the policy"));
     }
 }
 
@@ -256,41 +401,40 @@ fn a_front_reaped_by_someone_else_is_gone() {
     let fake = fake().reaps([ReapAnswer::Foreign(Foreign::Gone)]);
     let reach = FakeReach::answering(Ok(true));
     let torn = look(&fake, Some(&reach));
-    assert_outcome(&torn, ChildFate::Gone, Left::Nothing);
-    assert_eq!(torn.left, None);
+    assert_outcome(&torn, ChildFate::Gone, Went::ReapedElsewhere);
     assert_eq!(reach.asked(), []);
 }
 
-/// A front whose zombie launchd holds is gone, unaccounted for, and the warn says why it is not
-/// ours to reap.
+/// A front whose zombie launchd holds is gone, unaccounted for, and nothing is warned of: the look
+/// is silent for it, as the refused kill's look is.
 ///
-/// Mutant: the launchd note is dropped.
+/// Mutant: the look warns that launchd holds the zombie.
 #[skuld::test]
-fn a_front_launchd_holds_is_gone_with_the_launchd_note() {
+fn a_front_launchd_holds_is_gone_and_silent() {
     let fake = fake().reaps([ReapAnswer::Foreign(Foreign::Orphaned)]);
-    let torn = look(&fake, None);
-    assert_outcome(&torn, ChildFate::Gone, Left::Nothing);
+    let (torn, records) = look_logged(&fake, Some(id()), Ok(None), None);
+    assert_outcome(&torn, ChildFate::Gone, Went::ReapedElsewhere);
     assert!(
-        torn.left
-            .as_deref()
-            .is_some_and(|left| left.starts_with(&format!("pid {PID}: not ours to reap (launchd holds its zombie"))),
-        "{torn:?}"
+        records.iter().all(|(level, _)| *level < log::Level::Warn),
+        "{records:?}"
     );
 }
 
-/// The launchd note of a front with no pid names it without a number.
+/// A front with no pid that launchd holds is as silent.
 ///
-/// Mutant: the note is built with a number.
+/// Mutant: the note is built for a pid-less front.
 #[skuld::test]
-fn a_pidless_front_launchd_holds_is_named_without_a_number() {
+fn a_pidless_front_launchd_holds_is_gone_and_silent() {
     let fake = FakeProcess::new([]).reaps([ReapAnswer::Foreign(Foreign::Orphaned)]);
-    let torn = look(&fake, None);
-    let left = torn.left.as_deref().expect("a front launchd holds is warned of");
-    assert!(left.starts_with("the child (pid unknown): not ours to reap"), "{left}");
+    let (torn, records) = look_logged(&fake, None, Ok(None), None);
+    assert_outcome(&torn, ChildFate::Gone, Went::ReapedElsewhere);
+    assert!(
+        records.iter().all(|(level, _)| *level < log::Level::Warn),
+        "{records:?}"
+    );
 }
 
-/// A look that fails leaves the front unaccounted for with an unknown fate, and the warn names the
-/// failure.
+/// A look that fails leaves the front unaccounted for with an unknown fate.
 ///
 /// Mutants: the failed look is read as an exit or as running.
 #[skuld::test]
@@ -298,12 +442,7 @@ fn a_failed_look_at_a_front_is_unknown() {
     let fake = fake().reaps([ReapAnswer::Err(io::ErrorKind::Other)]);
     let reach = FakeReach::answering(Ok(true));
     let torn = look(&fake, Some(&reach));
-    assert_outcome(&torn, ChildFate::Unknown, Left::Nothing);
-    let failure = io::Error::from(io::ErrorKind::Other).to_string();
-    assert!(
-        torn.left.as_deref().is_some_and(|left| left.contains(&failure)),
-        "{torn:?}"
-    );
+    assert_outcome(&torn, ChildFate::Unknown, Went::LookFailed);
     assert_eq!(reach.asked(), []);
 }
 
@@ -324,19 +463,19 @@ fn a_look_teardown_sends_nothing() {
 fn the_identity_passes_into_a_front_left_running() {
     for given in [Some(id()), None] {
         let fake = fake().reaps([ReapAnswer::Running]);
-        let (torn, _) = look_logged(&fake, given, None, None);
+        let (torn, _) = look_logged(&fake, given, Ok(None), None);
         assert_eq!(torn.fate, ChildFate::Running { id: given });
     }
 }
 
-/// A front with no pid is left running like any other, with no wording of the policy's own.
+/// A front with no pid is left running like any other.
 ///
 /// Mutant: a pid is made up.
 #[skuld::test]
 fn a_pidless_front_is_left_running() {
     let fake = FakeProcess::new([]).reaps([ReapAnswer::Running]);
     let torn = look(&fake, None);
-    assert!(matches!(torn.leave, Some(LeaveReason::Running)), "{torn:?}");
+    assert_eq!(went(&torn), Went::LeftRunning, "{torn:?}");
     assert_eq!(torn.left, None);
 }
 
@@ -356,10 +495,10 @@ fn a_front_waited_for_past_its_threshold_warns_once() {
         let (torn, records) = look_logged(
             &fake,
             Some(id()),
-            Some(&FakeReach::answering(Ok(true))),
+            Ok(Some(&FakeReach::answering(Ok(true)))),
             Some(due_now()),
         );
-        assert_outcome(&torn, ChildFate::Reaped, Left::Nothing);
+        assert_outcome(&torn, ChildFate::Reaped, Went::Reaped);
         assert_eq!(slow_warns(&records).len(), warned, "{records:?}");
     }
 }
@@ -370,8 +509,8 @@ fn a_front_waited_for_past_its_threshold_warns_once() {
 #[skuld::test]
 fn a_front_left_running_never_looks_for_the_exit() {
     let fake = fake().reaps([ReapAnswer::Running]);
-    let (torn, records) = look_logged(&fake, Some(id()), None, Some(due_now()));
-    assert!(matches!(torn.leave, Some(LeaveReason::Running)), "{torn:?}");
+    let (torn, records) = look_logged(&fake, Some(id()), Ok(None), Some(due_now()));
+    assert_eq!(went(&torn), Went::LeftRunning, "{torn:?}");
     assert_eq!(fake.looks(), 1);
     assert_eq!(slow_warns(&records).len(), 0);
 }

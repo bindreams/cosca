@@ -207,7 +207,7 @@ pub(crate) fn send_pidfd(
         Err(rustix::io::Errno::SRCH) => {
             log::debug!(
                 "pidfd_send_signal({sig:?}) to {}: it is already gone",
-                crate::child::lifecycle::child_named(pid)
+                crate::os_process::child_named(pid)
             );
             Ok(Sent::Gone)
         }

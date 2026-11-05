@@ -26,7 +26,7 @@ pub(crate) mod owned;
 use owned::OwnedChild;
 
 #[path = "child/lifecycle.rs"]
-pub(crate) mod lifecycle;
+mod lifecycle;
 
 #[path = "child/suspended.rs"]
 pub(crate) mod suspended;
@@ -414,28 +414,32 @@ impl Child {
     /// torn down (killed through, with a failed kill retried, drained, removed), and then the front
     /// is looked at through [`tear_down`](OwnedChild::tear_down), which waits for it only if its
     /// place says the kill reached it. The leaf's subtree is captured while the leaf exists, since
-    /// it places the front once the leaf is gone. A front left behind is worded here, with `why`.
+    /// it places the front once the leaf is gone. How the look went is worded by [`word_front`],
+    /// with `why`.
     #[cfg(unix)]
     fn tear_down_leaf_and_look_at_front(&mut self, why: &dyn std::fmt::Display) -> TeardownOutcome {
         use crate::child::owned::teardown::Reach;
 
         #[cfg(target_os = "linux")]
         let subtree = match &self.attached {
-            crate::containment::Attached::Cgroup(leaf) => {
-                Some(crate::containment::cgroup::LeafSubtree::of(leaf.subtree()))
-            }
-            _ => None,
+            crate::containment::Attached::Cgroup(leaf) => leaf.subtree().map(Some),
+            _ => Ok(None),
         };
         drop(std::mem::take(&mut self.attached));
         #[cfg(target_os = "linux")]
-        let reach: Option<&dyn Reach> = subtree.as_ref().map(|subtree| subtree as &dyn Reach);
+        let (subtree, unreadable) = match subtree {
+            Ok(subtree) => (subtree, None),
+            Err(e) => (None, Some(e)),
+        };
+        #[cfg(target_os = "linux")]
+        let reach = match unreadable {
+            Some(e) => Err(e),
+            None => Ok(subtree.as_ref().map(|subtree| subtree as &dyn Reach)),
+        };
         #[cfg(not(target_os = "linux"))]
-        let reach: Option<&dyn Reach> = None;
-        let mut torn = self.proc.tear_down(Some(self.id), TeardownKind::Look(reach), None);
-        if let Some(reason) = &torn.leave {
-            torn.left = Some(front_left_text(self.id.pid(), why, reason));
-        }
-        torn
+        let reach: Result<Option<&dyn Reach>, std::io::Error> = Ok(None);
+        let torn = self.proc.tear_down(Some(self.id), TeardownKind::Look(reach), None);
+        word_front(self.id.pid(), why, torn)
     }
 
     /// What a forced kill of this child may do (see [`crate::elevation::front`]).
@@ -1161,30 +1165,46 @@ impl Child {
     }
 }
 
-/// What a drop says of an elevation front `pid` it left behind for `reason`; `why` is why it did
-/// not kill the front.
+/// What a drop says of how its look at the elevation front `pid` went (`torn.look`): a debug line
+/// for a front that was reaped, or reaped by someone else, and a leftover for the drop's one warn
+/// for any other. `why` is why the drop did not kill the front. An outcome with no look is returned
+/// as it is.
 #[cfg(unix)]
-fn front_left_text(
-    pid: u32,
-    why: &dyn std::fmt::Display,
-    reason: &crate::child::owned::teardown::LeaveReason,
-) -> String {
-    use crate::child::owned::teardown::{LeaveReason, ReachFailure};
+fn word_front(pid: u32, why: &dyn std::fmt::Display, mut torn: TeardownOutcome) -> TeardownOutcome {
+    use crate::child::owned::teardown::LookOutcome;
 
-    match reason {
-        LeaveReason::Running => format!(
+    let Some(look) = torn.look.take() else {
+        return torn;
+    };
+    torn.left = match look {
+        LookOutcome::Reaped(status) => {
+            log::debug!("Child::drop: elevation front pid {pid} was killed through its cgroup and reaped ({status})");
+            None
+        }
+        LookOutcome::ReapedElsewhere => {
+            log::debug!("Child::drop: elevation front pid {pid} was reaped by someone else");
+            None
+        }
+        LookOutcome::LookFailed(e) => Some(format!(
+            "elevation front pid {pid} could not be looked at after its cgroup's teardown ({e})"
+        )),
+        LookOutcome::ReapFailed(e) => Some(format!(
+            "elevation front pid {pid} was killed through its cgroup, and could not be reaped ({e})"
+        )),
+        LookOutcome::LeftRunning => Some(format!(
             "elevation front pid {pid} is left running and unreaped: {why}, and a kill of the front would orphan \
              the elevated program"
-        ),
-        LeaveReason::ReachUnknown(ReachFailure::Place(e)) => format!(
+        )),
+        LookOutcome::PlaceUnreadable(e) => Some(format!(
             "elevation front pid {pid} is left unreaped: where it is cannot be read ({e}), so it is not known \
              whether the cgroup kill ended it"
-        ),
-        LeaveReason::ReachUnknown(ReachFailure::Subtree(e)) => format!(
+        )),
+        LookOutcome::SubtreeUnreadable(e) => Some(format!(
             "elevation front pid {pid} is left unreaped: its leaf's subtree cannot be read ({e}), so it is not \
              known whether the cgroup kill ended it"
-        ),
-    }
+        )),
+    };
+    torn
 }
 
 fn take_reader(pipes: &mut BTreeMap<Fd, ParentEnd>, fd: Fd) -> Option<PipeReader> {

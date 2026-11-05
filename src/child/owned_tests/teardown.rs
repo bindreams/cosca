@@ -311,7 +311,7 @@ fn a_kill_teardown_without_an_id_leaves_a_running_child_without_one() {
     assert_eq!(torn.fate, ChildFate::Running { id: None });
 }
 
-/// A child with no pid is named without a number, and every act goes through its handle.
+/// A child with no pid is named without a number.
 ///
 /// Mutants: a pid is made up; the message is built with a number.
 #[skuld::test]
@@ -321,7 +321,7 @@ fn a_pidless_child_is_named_without_a_number() {
         .signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))]);
     let (torn, _) = tear_down_logged(&fake, None, None);
     let left = torn.left.as_deref().expect("a refused kill is warned of");
-    assert!(left.contains("pid unknown"), "{left}");
+    assert!(left.contains(crate::os_process::PIDLESS_CHILD), "{left}");
     assert!(!left.chars().any(|c| c.is_ascii_digit()), "{left}");
 }
 
@@ -405,9 +405,10 @@ fn a_kill_teardown_counts_one_root_teardown() {
 }
 
 /// A look at the exit that cannot be read does not stop the wait: it answers "ended" and the wait
-/// finds out.
+/// finds out. The failed look is logged at `debug`.
 ///
-/// Mutant: a failed look is an exit that is never waited for, or aborts the teardown.
+/// Mutant: a failed look is an exit that is never waited for, or aborts the teardown; or is dropped
+/// unlogged.
 #[skuld::test]
 fn an_unreadable_exit_look_does_not_stop_the_wait() {
     let fake = FakeProcess::new([Answer::Err(std::io::ErrorKind::Other)])
@@ -419,4 +420,11 @@ fn an_unreadable_exit_look_does_not_stop_the_wait() {
     assert_eq!(torn.fate, ChildFate::Reaped);
     assert_eq!(slow_warns(&records), Vec::<&String>::new());
     assert_eq!(crate::wait::block_probe::take(), [None], "the wait still ran");
+    let cause = std::io::Error::from(std::io::ErrorKind::Other).to_string();
+    assert!(
+        records
+            .iter()
+            .any(|(level, text)| *level == log::Level::Debug && text.contains("child 4242") && text.contains(&cause)),
+        "{records:?}"
+    );
 }

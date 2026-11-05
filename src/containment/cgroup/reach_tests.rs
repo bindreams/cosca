@@ -6,7 +6,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use super::ProbeEnd;
-use super::{dying_in, front_placement, LeafSubtree, Subtree};
+use super::{dying_in, front_placement, Subtree};
 use crate::containment::cgroup::fault::{self, ProbeStep};
 use crate::containment::cgroup::test_support::alone;
 use crate::send_log::Via;
@@ -105,10 +105,10 @@ fn a_subtree_reached_a_task_only_once_its_kill_landed() {
         .holds(pid, Some(pidfd.as_fd()))
         .expect("a forced id"));
     assert!(!subtree(HIGH, false)
-        .reached(pid, Some(pidfd.as_fd()))
+        .reached_by(pid, Some(pidfd.as_fd()))
         .expect("a forced id"));
     assert!(subtree(HIGH, true)
-        .reached(pid, Some(pidfd.as_fd()))
+        .reached_by(pid, Some(pidfd.as_fd()))
         .expect("a forced id"));
 }
 
@@ -1229,33 +1229,14 @@ fn a_descriptor_that_is_no_pidfd_fails_the_pin() {
     }
 }
 
-/// A subtree asked about a child with no pid says the kill did not reach it, though its kill
-/// landed and a pidfd would place it: it has no number to ask `/proc` with.
+/// A subtree asked about a child with no pid cannot place it, though its kill landed: it has no
+/// number to ask `/proc` with, so whether the kill reached it is unknown, not "no".
 ///
-/// Mutant: the pid-less child is asked as pid 0, or the pidfd alone decides.
+/// Mutant: the pid-less child is taken for not reached, or asked as pid 0.
 #[skuld::test]
-fn a_subtree_asked_about_a_pidless_child_says_not_reached() {
+fn a_subtree_asked_about_a_pidless_child_cannot_place_it() {
     use crate::child::owned::teardown::Reach;
 
-    let _id = fault::force_pidfd_cgroup_id(HIGH);
     let child = crate::child::owned::OwnedChild::new(Box::new(crate::os_process::fake::FakeProcess::new([])));
-    // Not `subtree.reached(..)`: the subtree's own method of that name takes a pid.
-    assert!(!Reach::reached(&subtree(HIGH, true), &child).expect("a pid-less child is not asked about"));
-}
-
-/// A leaf's subtree that could not be read answers with the failure it had, of the same kind, as the
-/// subtree's and not the place's.
-///
-/// Mutants: the unreadable subtree is taken for "not reached"; it is reported as an unreadable place.
-#[skuld::test]
-fn an_unreadable_subtree_answers_its_error() {
-    use crate::child::owned::teardown::{Reach as _, ReachFailure};
-
-    let child = crate::child::owned::OwnedChild::new(Box::new(crate::os_process::fake::FakeProcess::new([])));
-    let unreadable = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "the leaf cannot be read");
-    let Err(ReachFailure::Subtree(err)) = LeafSubtree::of(Err(unreadable)).reached(&child) else {
-        panic!("the failure is the subtree's");
-    };
-    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
-    assert!(err.to_string().contains("the leaf cannot be read"), "{err}");
+    assert!(subtree(HIGH, true).reached(&child).is_err());
 }

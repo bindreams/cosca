@@ -22,9 +22,8 @@ pub(crate) type OsHandle<'a> = BorrowedHandle<'a>;
 /// Policy (reap once, "already reaped is gone") belongs to the caller: these calls state what the OS
 /// says now.
 pub(crate) trait OsChild: OsProcess {
-    /// The child's pid, for messages and for the keys of holds. `None`: the spawn that made this
-    /// handle never learned it (a Linux child whose spawn failed after the handshake opened its
-    /// pidfd), and every act goes by the handle regardless.
+    /// The child's pid, for messages. `None`: the spawn never learned it (a Linux child whose spawn
+    /// failed after the handshake opened its pidfd); acts go by the handle either way.
     fn pid(&self) -> Option<u32>;
 
     /// Look at the exit record without consuming it, and without touching anything a waiter waits
