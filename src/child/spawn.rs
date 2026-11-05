@@ -335,6 +335,7 @@ fn root_after_a_delivered_kill(
 /// exited, `Gone` if the look found it reaped by someone else (`ECHILD`), and `Unknown` if the look
 /// failed otherwise. `looked` carries the failed look's OS error, and `id` is the child's identity,
 /// if the spawn had read one.
+#[cfg(any(feature = "tokio", not(target_os = "macos")))]
 pub(crate) fn fate_of_a_look(
     looked: Result<Option<std::process::ExitStatus>, Option<i32>>,
     id: Option<ProcessId>,
