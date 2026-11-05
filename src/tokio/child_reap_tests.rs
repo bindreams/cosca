@@ -700,10 +700,10 @@ async fn macos_reap_now_with_another_unique_id_is_gone() {
 #[cfg(target_os = "macos")]
 #[skuld::test]
 async fn macos_reap_now_of_a_zombie_launchd_holds_is_killed() {
+    use crate::os_process::child::{Foreign, PeekOutcome};
     use crate::wait::exit_only::seams::force_peek_once;
-    use crate::wait::exit_only::{Foreign, Peek};
     let (proc, pid) = exited_unreaped_with(Some);
-    let _orphaned = force_peek_once(Ok(Peek::Foreign(Foreign::Orphaned)));
+    let _orphaned = force_peek_once(Ok(PeekOutcome::Foreign(Foreign::Orphaned)));
 
     let fate = proc.reap_now(pid, None);
 
@@ -773,12 +773,12 @@ async fn macos_wait_and_reap_on_a_failed_peek_is_unverified() {
 #[cfg(target_os = "macos")]
 #[skuld::test]
 async fn macos_wait_and_reap_of_a_zombie_launchd_holds_is_orphaned_and_warns() {
+    use crate::os_process::child::{Foreign, PeekOutcome};
     use crate::wait::exit_only::seams::force_peek_once;
-    use crate::wait::exit_only::{Foreign, Peek};
     crate::log_capture::install();
     let (mut proc, pid) = exited_unreaped_with(Some);
     let mark = crate::log_capture::mark();
-    let _orphaned = force_peek_once(Ok(Peek::Foreign(Foreign::Orphaned)));
+    let _orphaned = force_peek_once(Ok(PeekOutcome::Foreign(Foreign::Orphaned)));
 
     assert_eq!(proc.wait_and_reap(pid), Waited::Orphaned);
 

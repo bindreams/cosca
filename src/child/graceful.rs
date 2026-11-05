@@ -304,13 +304,13 @@ impl Child {
         #[cfg(unix)]
         let held = self.proc.hold_reaps();
         #[cfg(unix)]
-        let check = || super::tree_call::group_number_holds(self.id.pid(), held.state_and_own_reap());
+        let check = || super::tree_call::group_number_holds(self.id.pid(), held.state());
         #[cfg(unix)]
         let group = crate::containment::GroupRoot::new(self.proc.pidfd(), &check);
         #[cfg(not(unix))]
         let group = crate::containment::GroupRoot::none();
         #[cfg(unix)]
-        let (decided, earlier) = match call.graceful(|| held.state_and_own_reap(), &group) {
+        let (decided, earlier) = match call.graceful(|| held.state(), &group) {
             crate::child::Graceful::Signal => (None, Some("the SIGTERM")),
             crate::child::Graceful::Sent { result, earlier } => (Some(result), earlier),
             crate::child::Graceful::End(e) => return Err(e),

@@ -40,7 +40,7 @@ impl SharedChild {
         let mut check = crate::wait::test_clock::RoundCheck::new("SharedChild::wait_inner");
         loop {
             match lock.state {
-                State::E(reaped) => return status_of(reaped).map(Some),
+                State::E(record) => return status_of(record).map(Some),
                 State::N => {
                     if self.target().is_none() {
                         return Err(echild());
@@ -140,12 +140,12 @@ impl SharedChild {
             exit_only::seams::step(exit_only::seams::HolderStep::Reap);
             match exit_only::try_reap(&target) {
                 // Nothing between the reap and the `E` write may panic.
-                Ok(Reap::Reaped(reaped)) => {
-                    drop(holder.finish(State::E(reaped)));
+                Ok(Reap::Reaped(record)) => {
+                    drop(holder.finish(State::E(record)));
                     #[cfg(test)]
                     super::seams::park_after_reap_recorded();
-                    self.log_unreadable(reaped);
-                    return status_of(reaped).map(Some);
+                    self.log_unreadable(record);
+                    return status_of(record).map(Some);
                 }
                 Ok(Reap::Foreign(_)) => {
                     drop(holder.finish(State::N));
