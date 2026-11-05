@@ -111,9 +111,8 @@ fn a_failed_identity_peek_and_a_refused_kill_share_one_warn(#[fixture(setuid)] _
 
     crate::wait::exit_only::seams::assert_peeks_exhausted();
     drop(armed);
-    let (err, _fate, unreaped) =
-        crate::child::spawn::failure::expect_handed_back(outcome.expect_err("a failed identity peek fails the spawn"));
-    let handed_back = crate::test_child::HandedBack::new(writer, Some(unreaped));
+    let (err, _fate, handed_back) =
+        crate::test_child::expect_handed_back(outcome.expect_err("a failed identity peek fails the spawn"), writer);
     assert!(matches!(err, Error::Unassessable { .. }), "{err:?}");
     let warns = warns_since(mark);
     assert_eq!(warns.len(), 1, "{warns:?}");

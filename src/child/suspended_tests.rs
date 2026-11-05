@@ -422,10 +422,7 @@ mod on_windows {
         let err = frozen.resume().expect_err("the resume was forced to fail");
         drop(forced);
 
-        let Error::MayHaveStarted { fate, unreaped, .. } = err else {
-            panic!("expected MayHaveStarted, got {err:?}");
-        };
-        let handed_back = crate::test_child::HandedBack::new(release, unreaped.map(|unreaped| *unreaped));
+        let (_, fate, handed_back) = crate::test_child::expect_may_have_started_parts(err, release);
         assert_eq!(fate, ChildFate::Running { id: Some(id) });
         assert!(handed_back.is_none(), "resume hands nothing back");
         let warns = crate::log_capture::records_since_on_current_thread(mark, "leaving it running");

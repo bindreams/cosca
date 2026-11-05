@@ -131,8 +131,7 @@ fn finish_elevated_hands_back_a_root_whose_kill_was_refused() {
     let fake = child.proc.script_over(|f| f.signals([refused()]));
 
     let failure = crate::child::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
-    let (_, fate, unreaped) = crate::child::spawn::failure::expect_handed_back(failure.into());
-    let handed_back = crate::test_child::HandedBack::new(writer, Some(unreaped));
+    let (_, fate, handed_back) = crate::test_child::expect_handed_back(failure.into(), writer);
 
     assert!(matches!(fate, crate::error::ChildFate::Running { .. }), "{fate:?}");
     assert_eq!(teardowns.count(), 0, "the handle is disarmed: its drop does not retry");
@@ -160,8 +159,7 @@ fn finish_elevated_hands_back_a_root_whose_kill_was_refused_and_look_failed() {
     });
 
     let failure = crate::child::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
-    let (_, fate, unreaped) = crate::child::spawn::failure::expect_handed_back(failure.into());
-    let handed_back = crate::test_child::HandedBack::new(writer, Some(unreaped));
+    let (_, fate, handed_back) = crate::test_child::expect_handed_back(failure.into(), writer);
 
     assert_eq!(fate, crate::error::ChildFate::Unknown);
     assert_eq!(teardowns.count(), 0, "the handle is disarmed: its drop does not retry");
@@ -186,8 +184,7 @@ fn finish_elevated_hands_back_a_root_whose_reap_failed_after_a_delivered_kill() 
     });
 
     let failure = crate::child::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
-    let (_, fate, unreaped) = crate::child::spawn::failure::expect_handed_back(failure.into());
-    let handed_back = crate::test_child::HandedBack::new(writer, Some(unreaped));
+    let (_, fate, handed_back) = crate::test_child::expect_handed_back(failure.into(), writer);
 
     assert_eq!(fate, crate::error::ChildFate::Killed);
     assert_eq!(teardowns.count(), 0, "the handle is disarmed: its drop does not retry");

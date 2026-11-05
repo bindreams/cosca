@@ -793,15 +793,14 @@ fn cgroup_a_failed_password_write_whose_cgroup_kill_fails_refuses_as_kill_does(#
         )
         .expect_err("a failed write fails the spawn")
     };
-    let (err, fate, unreaped) = err.expect_may_have_started_parts();
+    let release = stdin.take().expect("the teardown must not release the front");
+    let (err, fate, handed_back) = err.expect_may_have_started_parts(release);
     assert_eq!(
         fate,
         crate::error::ChildFate::Running { id: Some(id) },
         "a front its cgroup kill did not end may be running"
     );
     assert_front_refused_by_its_cgroup_kill(&err, pid);
-    let release = stdin.take().expect("the teardown must not release the front");
-    let handed_back = crate::test_child::HandedBack::new(release, unreaped);
     handed_back.unreaped();
     let status = handed_back.wait();
     assert!(status.success(), "the front was signalled: {status:?}");
@@ -1730,55 +1729,53 @@ pub(crate) fn front_its_leaf_did_not_take() -> (Command, PipeWriter) {
 }
 
 /// Spawns `cmd`, a front, through `spawn` with its identity check failing (`Gone`), and returns the
-/// error with the child's pid and the front it handed back, if it did. The front is still running,
-/// and no identity was read for it.
-pub(crate) fn fail_the_identity_check(
+/// error with the child's pid and the front it handed back, if it did, with `release` (the front's
+/// stdin). The front is still running, and no identity was read for it.
+pub(crate) fn fail_the_identity_check<R>(
     cmd: &mut Command,
     spawn: impl FnOnce(&mut Command) -> Result<(), crate::error::Error>,
-) -> (crate::error::Error, u32, Option<crate::Unreaped>) {
+    release: R,
+) -> (crate::error::Error, u32, crate::test_child::HandedBack<R>) {
     use crate::child::spawn::fault;
     fault::set_force_identity_vanished(true);
     let result = spawn(cmd);
     fault::set_force_identity_vanished(false);
-    let (err, fate, unreaped) = crate::child::spawn::failure::expect_may_have_started_parts(
+    let (err, fate, handed_back) = crate::test_child::expect_may_have_started_parts(
         result.expect_err("the forced identity failure fails the spawn"),
+        release,
     );
     assert_eq!(fate, crate::error::ChildFate::Running { id: None }, "{err:?}");
     let crate::identity::Resolved::Found(id) = fault::take_captured().expect("the seam captured the child") else {
         panic!("the seam must capture a resolved identity");
     };
-    (err, id.pid(), unreaped)
+    (err, id.pid(), handed_back)
 }
 
-/// `err` notes that the front `pid` is handed back (`unreaped`: the sync spawn) or left unreaped
-/// (none: the async spawn), and closing `stdin` then ends it unsignalled.
+/// `err` notes that the front `pid` is handed back (`handed_back` holds it: the sync spawn) or left
+/// unreaped (it holds none: the async spawn), and releasing the front then ends it unsignalled.
 #[track_caller]
-pub(crate) fn assert_left_unsignalled(
+pub(crate) fn assert_left_unsignalled<R>(
     err: &crate::error::Error,
     pid: u32,
-    stdin: PipeWriter,
-    unreaped: Option<crate::Unreaped>,
+    handed_back: crate::test_child::HandedBack<R>,
 ) {
     let text = err.to_string();
     assert!(text.contains(&format!("pid {pid} is what sudo left")), "{text}");
-    let left = if unreaped.is_some() {
-        "handed back to the caller"
-    } else {
+    let left = if handed_back.is_none() {
         "left unreaped"
+    } else {
+        "handed back to the caller"
     };
     assert!(
         text.contains(&format!("the elevated program may be running; it is {left}")),
         "{text}"
     );
-    match unreaped {
-        Some(unreaped) => {
-            let status = crate::test_child::HandedBack::new(stdin, Some(unreaped)).wait();
-            assert!(status.success(), "the front was signalled: {status:?}");
-        }
-        None => {
-            drop(stdin);
-            assert_reaped_unsignalled(pid);
-        }
+    if handed_back.is_none() {
+        drop(handed_back);
+        assert_reaped_unsignalled(pid);
+    } else {
+        let status = handed_back.wait();
+        assert!(status.success(), "the front was signalled: {status:?}");
     }
 }
 
@@ -1787,9 +1784,9 @@ pub(crate) fn assert_left_unsignalled(
 #[skuld::test]
 fn cgroup_a_front_its_leaf_did_not_take_is_handed_back_by_a_failed_identity_check(#[fixture(cgroup)] _group: &Group) {
     let (mut cmd, stdin) = front_its_leaf_did_not_take();
-    let (err, pid, unreaped) = fail_the_identity_check(&mut cmd, |cmd| cmd.spawn().map(drop));
-    assert!(unreaped.is_some(), "a sync spawn hands the front back");
-    assert_left_unsignalled(&err, pid, stdin, unreaped);
+    let (err, pid, handed_back) = fail_the_identity_check(&mut cmd, |cmd| cmd.spawn().map(drop), stdin);
+    assert!(!handed_back.is_none(), "a sync spawn hands the front back");
+    assert_left_unsignalled(&err, pid, handed_back);
 }
 
 /// A front spawn that cannot capture its leaf's subtree (the cgroup id read fails) says so at
@@ -1818,7 +1815,7 @@ fn cgroup_a_failed_spawn_says_why_its_leaf_did_not_take_the_child(#[fixture(cgro
     crate::log_capture::install();
     let (mut cmd, stdin) = front_its_leaf_did_not_take();
     let mark = crate::log_capture::mark();
-    let (err, pid, unreaped) = fail_the_identity_check(&mut cmd, |cmd| cmd.spawn().map(drop));
+    let (err, pid, handed_back) = fail_the_identity_check(&mut cmd, |cmd| cmd.spawn().map(drop), stdin);
     let logs = crate::log_capture::records_since_on_current_thread(mark, "not placed in its leaf");
     assert_eq!(logs.len(), 1, "{logs:?}");
     assert_eq!(logs[0].0, log::Level::Debug);
@@ -1826,5 +1823,5 @@ fn cgroup_a_failed_spawn_says_why_its_leaf_did_not_take_the_child(#[fixture(cgro
         logs[0].1.contains(&format!("child {pid} is not in the leaf cgroup")),
         "{logs:?}"
     );
-    assert_left_unsignalled(&err, pid, stdin, unreaped);
+    assert_left_unsignalled(&err, pid, handed_back);
 }

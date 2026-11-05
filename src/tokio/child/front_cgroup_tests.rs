@@ -901,14 +901,16 @@ async fn cgroup_a_contained_front_its_leaf_could_not_kill_is_left_running(#[fixt
 #[skuld::test]
 async fn cgroup_a_front_its_leaf_did_not_take_is_left_by_a_failed_identity_check(#[fixture(cgroup)] _group: &Group) {
     let (mut cmd, stdin) = front_its_leaf_did_not_take();
-    let (err, pid, unreaped) = fail_the_identity_check(&mut cmd, |cmd| {
-        crate::tokio::spawn::spawn(cmd).map(drop).map_err(Into::into)
-    });
+    let (err, pid, handed_back) = fail_the_identity_check(
+        &mut cmd,
+        |cmd| crate::tokio::spawn::spawn(cmd).map(drop).map_err(Into::into),
+        stdin,
+    );
     assert!(
-        unreaped.is_none(),
+        handed_back.is_none(),
         "an async spawn leaves the front, it hands nothing back"
     );
-    assert_left_unsignalled(&err, pid, stdin, unreaped);
+    assert_left_unsignalled(&err, pid, handed_back);
 }
 
 /// A front whose leaf did not take it, dropped by tokio after its fork, is sent nothing, by the

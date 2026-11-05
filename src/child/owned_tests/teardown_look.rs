@@ -11,7 +11,7 @@ use crate::child::owned::OwnedChild;
 use crate::error::ChildFate;
 use crate::identity::ProcessId;
 use crate::os_process::child::Foreign;
-use crate::os_process::fake::{Answer, FakeProcess, ReapAnswer};
+use crate::os_process::fake::{FakeProcess, ReapAnswer};
 use crate::wait::teardown_warn::Due;
 
 /// A [`Reach`] with a stated answer, and the pids of the children it was asked about.
@@ -588,15 +588,19 @@ fn a_pidless_front_is_left_running() {
 /// A front waited for past the threshold is warned of once before the wait blocks; one that exits
 /// before it is not.
 ///
-/// Mutants: no warn; the warn is not conditional on the look.
+/// Mutants: no warn; the warn is not conditional on the bounded wait.
 #[skuld::test]
 fn a_front_waited_for_past_its_threshold_warns_once() {
-    for (exits, warned) in [(Answer::Running, 1), (Answer::Exited, 0)] {
-        let fake = FakeProcess::new([exits]).with_pid(PID).reaps([
-            ReapAnswer::Running,
-            ReapAnswer::Running,
-            ReapAnswer::Reaped(exit()),
-        ]);
+    // The look sees it running; then the bounded wait either finds it still running (the warn) or
+    // reaps it.
+    for (reaps, warned) in [
+        (
+            vec![ReapAnswer::Running, ReapAnswer::Running, ReapAnswer::Reaped(exit())],
+            1,
+        ),
+        (vec![ReapAnswer::Running, ReapAnswer::Reaped(exit())], 0),
+    ] {
+        let fake = fake().reaps(reaps);
         let _fire = fire_on_block(&fake);
         let (torn, records) = look_logged(
             &fake,

@@ -182,9 +182,9 @@ impl SpawnFailure {
     /// otherwise.
     #[track_caller]
     pub(crate) fn expect_may_have_started_with(self) -> (Error, ChildFate) {
-        let (cause, fate, unreaped) = self.expect_may_have_started_parts();
+        let (cause, fate, unreaped) = self.parts();
         // Dropping a handed-back child would wait for it; a test that gets one takes it apart with
-        // `expect_may_have_started_parts`.
+        // `test_child::SpawnFailure::expect_may_have_started_parts`.
         if let Some(unreaped) = unreaped {
             unreaped.leak();
             panic!("the spawn handed a child back ({fate:?}): {cause:?}");
@@ -192,10 +192,11 @@ impl SpawnFailure {
         (cause, fate)
     }
 
-    /// [`expect_may_have_started_with`](Self::expect_may_have_started_with) with the child the
-    /// failure hands back, if it does.
+    /// The error, fate and handed-back child (if any) of a failure that answered that the program
+    /// may have started; panics otherwise. For `test_child`, which wraps the child in its
+    /// `HandedBack`.
     #[track_caller]
-    pub(crate) fn expect_may_have_started_parts(self) -> (Error, ChildFate, Option<Unreaped>) {
+    pub(crate) fn parts(self) -> (Error, ChildFate, Option<Unreaped>) {
         match self {
             SpawnFailure::MayHaveStarted {
                 cause, fate, unreaped, ..
@@ -249,9 +250,9 @@ impl SpawnFailure {
 #[cfg(test)]
 #[track_caller]
 pub(crate) fn expect_may_have_started_with(error: Error) -> (Error, ChildFate) {
-    let (cause, fate, unreaped) = expect_may_have_started_parts(error);
+    let (cause, fate, unreaped) = error_parts(error);
     // Dropping a handed-back child would wait for it; a test that gets one takes it apart with
-    // `expect_handed_back`.
+    // `test_child::expect_handed_back`.
     if let Some(unreaped) = unreaped {
         unreaped.leak();
         panic!("the spawn handed a child back ({fate:?}): {cause:?}");
@@ -260,25 +261,17 @@ pub(crate) fn expect_may_have_started_with(error: Error) -> (Error, ChildFate) {
 }
 
 /// The cause, fate and handed-back child (if any) inside an error a public spawn returned, which
-/// must say the program may have started.
+/// must say the program may have started. For `test_child`, which wraps the child in its
+/// `HandedBack`.
 #[cfg(test)]
 #[track_caller]
-pub(crate) fn expect_may_have_started_parts(error: Error) -> (Error, ChildFate, Option<Unreaped>) {
+pub(crate) fn error_parts(error: Error) -> (Error, ChildFate, Option<Unreaped>) {
     match error {
         Error::MayHaveStarted {
             fate, source, unreaped, ..
         } => (*source, fate, unreaped.map(|unreaped| *unreaped)),
         other => panic!("expected Error::MayHaveStarted, got {other:?}"),
     }
-}
-
-/// [`expect_may_have_started_parts`] for an error that hands the child back.
-#[cfg(all(test, unix))]
-#[track_caller]
-pub(crate) fn expect_handed_back(error: Error) -> (Error, ChildFate, Unreaped) {
-    let (cause, fate, unreaped) = expect_may_have_started_parts(error);
-    let unreaped = unreaped.unwrap_or_else(|| panic!("the spawn handed no child back ({fate:?}): {cause:?}"));
-    (cause, fate, unreaped)
 }
 
 /// Whether `error` is an `Unsupported` refusal.

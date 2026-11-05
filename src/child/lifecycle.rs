@@ -9,8 +9,8 @@ use super::owned::{ChildWaitOutcome, OwnedChild};
 use super::Child;
 use crate::error::Error;
 use crate::os_process::child::{ExitRecord, Foreign};
-use crate::os_process::{child_named, PIDLESS_CHILD};
-use crate::wait::teardown_warn::{wait_warning, Due};
+use crate::os_process::PIDLESS_CHILD;
+use crate::wait::teardown_warn::Due;
 
 /// Whether a wait that finds the child's zombie held by launchd (macOS) says so.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,8 +64,12 @@ impl From<WaitToExitError> for Error {
 
 /// Block until `proc` is reaped, and return its status. The wait has no deadline.
 ///
-/// With `due`, it first watches for the exit until the threshold, and warns once if the child has
-/// not exited by then. `orphaned` says whether a zombie launchd holds is warned of here.
+/// With `due`, it first waits as the handle does, bounded by the threshold, and warns once if the
+/// wait ends with the deadline passed. That watch is the handle's own wait, not a look at whether
+/// the child exited: a zombie a tracer holds is visible as exited but cannot be reaped, so it is
+/// "not ended" until it can be. Any other outcome of the bounded wait (an exit, a foreign reap, a
+/// failure) is the result, and nothing waits again. Only after the warn does the unbounded wait
+/// run. `orphaned` says whether a zombie launchd holds is warned of here.
 pub(super) fn wait_to_exit(
     proc: &OwnedChild,
     due: Option<Due>,
@@ -74,22 +78,20 @@ pub(super) fn wait_to_exit(
     #[cfg(feature = "tokio")]
     crate::bounded::assert_may_block("a wait for a child's exit");
     let pid = proc.pid();
-    let outcome = wait_warning(
-        proc,
-        due,
-        // A look that cannot read the exit ends the watch: the wait finds out.
-        |child, until| {
-            child.exited_by(Some(until)).unwrap_or_else(|e| {
-                log::debug!(
-                    "the look at {} for the exit failed ({e}); the wait finds out",
-                    child_named(child.pid())
-                );
-                true
-            })
-        },
-        |after| crate::child::spawn::warn_still_waiting(pid, after),
-        |child| child.wait(None),
-    )
+    let outcome = match due {
+        None => proc.wait(None),
+        Some(due) => {
+            #[cfg(feature = "tokio")]
+            crate::bounded::assert_may_block("a teardown's warned wait");
+            match proc.wait(Some(due.until)) {
+                Ok(ChildWaitOutcome::DeadlinePassed) => {
+                    crate::child::spawn::warn_still_waiting(pid, due.after);
+                    proc.wait(None)
+                }
+                other => other,
+            }
+        }
+    }
     .map_err(WaitToExitError::Failed)?;
     match (outcome, status_of_outcome(pid, outcome, orphaned)) {
         (ChildWaitOutcome::Foreign(foreign), _) => Err(WaitToExitError::Elsewhere(foreign)),

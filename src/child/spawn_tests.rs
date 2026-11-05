@@ -412,8 +412,8 @@ fn a_child_whose_kill_failed_after_it_exited_is_reaped() {
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn a_child_whose_teardown_kill_is_refused_is_handed_back(#[fixture(setuid)] _group: &Group) {
-    use crate::child::spawn::failure::expect_handed_back;
     use crate::child::spawn::fault::SpawnPoint;
+    use crate::test_child::expect_handed_back;
 
     crate::log_capture::install();
     let arms: [(fn(bool), bool); 2] = [
@@ -432,8 +432,7 @@ fn a_child_whose_teardown_kill_is_refused_is_handed_back(#[fixture(setuid)] _gro
             panic!("the seam captured the child's identity");
         };
 
-        let (_, fate, unreaped) = expect_handed_back(err);
-        let handed_back = crate::test_child::HandedBack::new(writer, Some(unreaped));
+        let (_, fate, handed_back) = expect_handed_back(err, writer);
 
         assert_eq!(
             fate,
@@ -948,13 +947,14 @@ fn a_failed_password_write_reports_a_failed_root_reap() {
     let pid = child.id().pid();
     fault::set_force_reap_failure("cosca-finish-elevated-reap-4c1e");
     let mark = crate::log_capture::mark();
-    let (err, fate, unreaped) = super::finish_elevated(child, failed_write())
+    let (err, fate, handed_back) = super::finish_elevated(child, failed_write())
         .expect_err("a failed write fails the spawn")
-        .expect_may_have_started_parts();
+        .expect_may_have_started_parts(());
     assert_eq!(fate, ChildFate::Killed, "killed, but not reaped");
-    // Not shown collected, so handed back. The forced failure reaps first, so there is nothing left
-    // to wait for.
-    unreaped.expect("the root is handed back").leak();
+    // Not shown collected, so handed back. The forced failure reaps first, so settling it finds it
+    // reaped elsewhere and returns at once.
+    handed_back.unreaped();
+    drop(handed_back);
 
     let Error::Elevation { detail, .. } = &err else {
         panic!("got {err:?}");

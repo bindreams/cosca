@@ -426,9 +426,9 @@ async fn a_failed_spawn_leaves_an_elevation_front_running_and_says_so() {
             .all(|(_, text)| text.contains("leaks") && text.contains("left elevation front")),
         "{warns:?}"
     );
-    for (_, pid, unreaped) in &failures {
+    for (_, pid, handed_back) in &failures {
         assert!(
-            unreaped.is_none(),
+            handed_back.is_none(),
             "an async spawn leaves the front, it hands nothing back"
         );
         let status = reap(*pid).expect("the front must be left unreaped");

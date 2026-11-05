@@ -8,7 +8,7 @@ use crate::child::owned::OwnedChild;
 use crate::error::ChildFate;
 use crate::identity::ProcessId;
 use crate::os_process::child::{ExitRecord, Foreign};
-use crate::os_process::fake::{Answer, FakeProcess, ReapAnswer};
+use crate::os_process::fake::{FakeProcess, ReapAnswer};
 use crate::signal::Sent;
 use crate::wait::teardown_warn::Due;
 
@@ -489,6 +489,33 @@ pub(super) fn slow_warns(records: &[(log::Level, String)]) -> Vec<&String> {
         .collect()
 }
 
+/// A child that is visible but cannot be reaped until after the threshold (a zombie a tracer holds:
+/// the reap answers `Recheck`) is warned of once, past the threshold, and then reaped.
+///
+/// Mutant: the warn watches whether the child exited, not the handle's own wait, so it never warns.
+#[skuld::test]
+fn a_child_not_reapable_until_after_the_threshold_warns_once_and_is_reaped() {
+    let fake = fake()
+        .reaps([ReapAnswer::Recheck, ReapAnswer::Recheck, ReapAnswer::Reaped(exit())])
+        .signals([Ok(Sent::Delivered)]);
+    let (torn, records) = tear_down_logged(&fake, Some(id()), Some(due_now()));
+    assert_eq!(torn.fate, ChildFate::Reaped, "{torn:?}");
+    assert_eq!(slow_warns(&records).len(), 1, "{records:?}");
+}
+
+/// A child reaped within the bounded wait is the result: nothing warns.
+///
+/// Mutant: the warn is not conditional on the bounded wait's outcome.
+#[skuld::test]
+fn a_child_reaped_within_the_threshold_is_not_waited_for_again() {
+    let fake = fake()
+        .reaps([ReapAnswer::Reaped(exit())])
+        .signals([Ok(Sent::Delivered)]);
+    let (torn, records) = tear_down_logged(&fake, Some(id()), Some(due_now()));
+    assert_eq!(torn.fate, ChildFate::Reaped, "{torn:?}");
+    assert_eq!(slow_warns(&records), Vec::<&String>::new(), "{records:?}");
+}
+
 /// A refused kill with no identity read leaves a running child without one.
 ///
 /// Mutant: the outcome carries a made-up identity.
@@ -536,9 +563,8 @@ fn a_teardown_without_a_threshold_never_looks_for_the_exit() {
 /// Mutants: the warn comes after the block; no warn; the wait ends at the threshold.
 #[skuld::test]
 fn a_teardown_past_its_threshold_warns_once_before_it_blocks() {
-    let fake = FakeProcess::new([Answer::Running])
-        .with_pid(PID)
-        .reaps([ReapAnswer::Running, ReapAnswer::Reaped(exit())])
+    let fake = fake()
+        .reaps([ReapAnswer::Running, ReapAnswer::Running, ReapAnswer::Reaped(exit())])
         .signals([Ok(Sent::Delivered)]);
     let _fire = fire_on_block(&fake);
     let (torn, records) = tear_down_logged(&fake, Some(id()), Some(due_now()));
@@ -553,11 +579,10 @@ fn a_teardown_past_its_threshold_warns_once_before_it_blocks() {
 
 /// A child that exits before the threshold is not warned of.
 ///
-/// Mutant: the warn is not conditional on the look.
+/// Mutant: the warn is not conditional on the bounded wait.
 #[skuld::test]
 fn a_wait_that_ends_before_the_threshold_does_not_warn() {
-    let fake = FakeProcess::new([Answer::Exited])
-        .with_pid(PID)
+    let fake = fake()
         .reaps([ReapAnswer::Reaped(exit())])
         .signals([Ok(Sent::Delivered)]);
     let (torn, records) = tear_down_logged(&fake, Some(id()), Some(due_now()));
@@ -594,27 +619,22 @@ fn a_kill_teardown_counts_one_root_teardown() {
     assert_eq!(recorder.count(), 1);
 }
 
-/// A look at the exit that cannot be read does not stop the wait: it answers "ended" and the wait
-/// finds out. The failed look is logged at `debug`.
+/// A bounded wait that fails is the result: the failure comes back as a failed reap, nothing warns
+/// of a slow wait, and nothing waits a second time (a second reap past the script panics).
 ///
-/// Mutant: a failed look is an exit that is never waited for, or aborts the teardown; or is dropped
-/// unlogged.
+/// Mutant: a failed bounded wait is followed by the unbounded one.
 #[skuld::test]
-fn an_unreadable_exit_look_does_not_stop_the_wait() {
-    let fake = FakeProcess::new([Answer::Err(std::io::ErrorKind::Other)])
-        .with_pid(PID)
-        .reaps([ReapAnswer::Running, ReapAnswer::Reaped(exit())])
+fn a_failed_bounded_wait_is_the_result_and_is_not_repeated() {
+    let fake = fake()
+        .reaps([ReapAnswer::Err(std::io::ErrorKind::Other)])
         .signals([Ok(Sent::Delivered)]);
-    let _fire = fire_on_block(&fake);
     let (torn, records) = tear_down_logged(&fake, Some(id()), Some(due_now()));
-    assert_eq!(torn.fate, ChildFate::Reaped);
-    assert_eq!(slow_warns(&records), Vec::<&String>::new());
-    assert_eq!(crate::wait::block_probe::take(), [None], "the wait still ran");
-    let cause = std::io::Error::from(std::io::ErrorKind::Other).to_string();
+    assert_eq!(torn.fate, ChildFate::Killed, "{torn:?}");
     assert!(
-        records
-            .iter()
-            .any(|(level, text)| *level == log::Level::Debug && text.contains("child 4242") && text.contains(&cause)),
-        "{records:?}"
+        torn.left
+            .as_deref()
+            .is_some_and(|text| text.contains("the reap after the kill failed")),
+        "{torn:?}"
     );
+    assert_eq!(slow_warns(&records), Vec::<&String>::new());
 }

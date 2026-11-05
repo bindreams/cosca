@@ -161,7 +161,9 @@ impl TeardownOutcome {
 impl OwnedChild {
     /// Best-effort teardown, the one entry point: do what `kind` says, then settle the child. `id`
     /// is the child's identity, if the caller read one. `due` is the threshold of the slow-teardown
-    /// warn on the blocking wait (`None`: no warn).
+    /// warn on the blocking wait (`None`: no warn). The warn watches the handle's own bounded wait:
+    /// a child that is visible as exited but cannot be reaped yet (a zombie a tracer holds) is still
+    /// waited for when the threshold passes, and warned of.
     ///
     /// Returns the child's fate, and what it could not do for the caller's one warn. It logs
     /// neither above `debug`, except that slow-teardown warn and, for a front it waits for, a
