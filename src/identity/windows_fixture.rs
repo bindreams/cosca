@@ -145,7 +145,7 @@ impl RestrictedChild {
         // Windows never reparents and recycles pids from a small dense table, so a raw
         // `ppid == self.pid` scan can match a pre-existing orphan whose real parent exited
         // and whose pid was then handed to this fixture. Route through the crate-s own
-        // stale-ppid defense (`children_of` applies the start-token order rule) so only a
+        // stale-ppid defense (`children_of` applies the order-key rule) so only a
         // genuine child is returned.
         let me = crate::identity::windows_identity_from_handle(self.handle, self.pid)
             .expect("the owned handle always yields an identity");

@@ -99,8 +99,8 @@ impl ProcessId {
     }
 
     /// The process's children. `Recursive::No` = direct children; `Recursive::Yes` = the
-    /// whole subtree. Identity-guarded against pid-reuse by the tree-walk token rule (a
-    /// candidate is kept only if its start token orders at-or-after this process). Snapshot;
+    /// whole subtree. Identity-guarded against pid-reuse by the tree-walk order-key rule (a
+    /// candidate is kept only if its order key orders at-or-after this process's). Snapshot;
     /// best-effort.
     ///
     /// An empty list means there are none (or `self` is gone or was recycled); a process table

@@ -243,6 +243,37 @@ fn a_candidate_whose_order_key_precedes_the_roots_is_dropped_even_when_its_id_to
     }
 }
 
+/// The anchor side of the same rule: candidates are compared against the `root_key` argument, not
+/// against the root id's token. Here the root's token is `ROOT_TOKEN` but its key is lower
+/// (a candidate between them is kept) or higher (a candidate between them is dropped).
+/// Mutant: "the filters compare against `root.start_token_raw()`".
+#[skuld::test]
+fn candidates_are_compared_against_the_roots_order_key_not_its_id_token() {
+    use super::children_of_with;
+    let parents = [(200, ROOT_PID)];
+    for (root_key, candidate_key, kept) in [
+        (ROOT_TOKEN - 500, ROOT_TOKEN - 300, true),
+        (ROOT_TOKEN + 500, ROOT_TOKEN + 300, false),
+    ] {
+        let resolve = |pid: u32| (pid == 200).then(|| (id(200, candidate_key), OrderKey::for_test(candidate_key)));
+        for allow_equal in [true, false] {
+            let want: &[RawPid] = if kept { &[200] } else { &[] };
+            let got = descendants_with(root(), OrderKey::for_test(root_key), &parents, allow_equal, resolve);
+            assert_eq!(
+                pids(got),
+                want,
+                "descendants_with: root_key {root_key}, candidate {candidate_key} (allow_equal={allow_equal})"
+            );
+            let got = children_of_with(root(), OrderKey::for_test(root_key), &parents, allow_equal, resolve);
+            assert_eq!(
+                pids(got),
+                want,
+                "children_of_with: root_key {root_key}, candidate {candidate_key} (allow_equal={allow_equal})"
+            );
+        }
+    }
+}
+
 /// `resolve_or_drop` is a named discard site: an access-denied descendant must be dropped
 /// from the walk AND leave a warn behind, never be silently folded in with a gone pid.
 #[cfg(windows)]

@@ -123,7 +123,7 @@ pub(crate) fn descendants_with(
     // BFS over the ppid forest. `frontier` holds pids whose children we still
     // need to visit; it starts as just the root pid. A pid joins the result (and
     // the next frontier) only if its ppid is in the current accepted set AND its
-    // identity passes the token guard. No fixed iteration cap: the loop drains a
+    // order key passes `keeps_order`. No fixed iteration cap: the loop drains a
     // strictly shrinking set of not-yet-visited edges.
     let mut result: Vec<ProcessId> = Vec::new();
     let mut frontier: Vec<RawPid> = vec![root.pid()];
@@ -396,9 +396,10 @@ pub(crate) fn unqueryable(subject: &str, cause: UnknownCause) -> Error {
 /// # Errors
 ///
 /// [`Error::Unassessable`] when the process snapshot cannot be taken, or `root`'s
-/// identity cannot be read after it. Nothing is killed, the root included: killing the root
-/// first would reparent its descendants out of the ppid walk, so a retry could no longer find
-/// them. A root that no longer holds its pid is `Ok`, with nothing killed.
+/// identity or order key cannot be read after it (a root that exists but cannot be queried).
+/// Nothing is killed, the root included: killing the root first would reparent its descendants
+/// out of the ppid walk, so a retry could no longer find them. A root that no longer holds its pid
+/// is `Ok`, with nothing killed.
 ///
 /// `Ok(false)`: the walk ran but was not complete, because an identity it resolved refused the
 /// kill, so members may be left running.
