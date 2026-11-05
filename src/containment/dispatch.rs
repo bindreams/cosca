@@ -134,7 +134,8 @@ impl Prepared {
     /// can drop one it forked — and say what became of that child. Without a leaf nothing can
     /// tell, so [`AbandonedChild::MaybeUnreachable`]. A child that is an elevation `front` is sent
     /// no signal of its own (see [`CgroupLeaf::abandon_before_verdict`]); `handshake` is the
-    /// pidfd its handshake left for a child the leaf cannot name.
+    /// pidfd its handshake left for a child the leaf cannot name, with what the handshake expects
+    /// of a teardown through it.
     ///
     /// [`CgroupLeaf::abandon_before_verdict`]: crate::containment::cgroup::CgroupLeaf::abandon_before_verdict
     #[cfg_attr(
@@ -147,7 +148,7 @@ impl Prepared {
     pub(crate) fn abandon_before_verdict(
         &mut self,
         front: bool,
-        #[cfg(target_os = "linux")] handshake: Option<std::os::fd::OwnedFd>,
+        #[cfg(target_os = "linux")] handshake: Option<(std::os::fd::OwnedFd, crate::child::owned::teardown::Expect)>,
     ) -> AbandonedChild {
         #[cfg(target_os = "linux")]
         if let Some(leaf) = self.cgroup_leaf.as_mut() {
@@ -160,6 +161,7 @@ impl Prepared {
                 Abandoned::Ended => AbandonedChild::Ended,
                 Abandoned::MaybeUnreaped => AbandonedChild::MaybeUnreaped,
                 Abandoned::OutOfReach(why) => AbandonedChild::OutOfReach(why),
+                Abandoned::Uncollected(clause) => AbandonedChild::Uncollected(clause),
                 Abandoned::Front(fate) => AbandonedChild::Front(fate),
             };
         }
@@ -209,6 +211,10 @@ pub(crate) enum AbandonedChild {
     /// It may be running where nothing can reach it: its leaf does not hold it, and it sent no
     /// handle on itself or refused its kill, as the text says.
     OutOfReach(String),
+    /// It never named itself, and the handshake's pidfd reached it, but its teardown left it
+    /// uncollected. Carries the teardown's clause, for the one warn, and what its warn asserts. Only
+    /// a Linux leaf produces it.
+    Uncollected(crate::child::owned::teardown::Left),
     /// It is an elevation front, which was sent no signal of its own, and this is what became of
     /// it.
     Front(crate::child::spawn::FrontFate),
@@ -269,8 +275,15 @@ pub(crate) enum TeardownCaller {
     /// A helper that owns the child and failed after its spawn (`Command::status`, `output`, `read`,
     /// `SuspendedChild::resume`).
     FailedRun,
-    /// The sync spawn's teardown of the child it holds, when its identity read or its attach fails.
-    #[cfg(target_os = "linux")]
+    /// A spawn's teardown of the child it holds, when its identity read or its attach fails (sync
+    /// or async), and the cleanup of a child the handshake abandons.
+    #[cfg_attr(
+        not(any(target_os = "linux", windows, feature = "tokio")),
+        allow(
+            dead_code,
+            reason = "only the Linux and Windows spawns and the async spawn tear a child down"
+        )
+    )]
     FailedSpawn,
     /// The cleanup of an elevated spawn that cannot finish.
     #[cfg(unix)]
@@ -283,7 +296,6 @@ impl TeardownCaller {
         match self {
             TeardownCaller::Drop => "Child::drop",
             TeardownCaller::FailedRun => "teardown after a failed run",
-            #[cfg(target_os = "linux")]
             TeardownCaller::FailedSpawn => "teardown after a failed spawn",
             #[cfg(unix)]
             TeardownCaller::FinishElevated => "finish_elevated",
@@ -296,9 +308,7 @@ impl TeardownCaller {
     pub(crate) fn this_event(self) -> &'static str {
         match self {
             TeardownCaller::Drop => "this drop",
-            #[cfg(target_os = "linux")]
-            TeardownCaller::FailedSpawn => "this teardown",
-            TeardownCaller::FailedRun | TeardownCaller::FinishElevated => "this teardown",
+            TeardownCaller::FailedSpawn | TeardownCaller::FailedRun | TeardownCaller::FinishElevated => "this teardown",
         }
     }
 }

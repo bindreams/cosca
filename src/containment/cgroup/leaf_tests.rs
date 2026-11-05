@@ -2546,6 +2546,49 @@ fn reaped(pidfd: &std::os::fd::OwnedFd) -> bool {
     )
 }
 
+/// An intent that names no pid (a negative one) but carries a pidfd is the child's own handle on a
+/// child that never named itself: it is killed and reaped through that pidfd, and the abandonment
+/// answers `Ended`. The pidfd is the child's own, so the teardown expects `Expect::Anything` of
+/// it; a row that tells that from the handshake's expectations needs a kill the child refuses (a
+/// setuid helper), which the leaf's tests have no fixture for.
+///
+/// Mutant: a pid-less intent with a pidfd is out of reach, or its child is left unreaped.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_pidless_intent_with_a_pidfd_is_killed_and_reaped_through_it() {
+    use std::os::fd::AsRawFd;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-abandoned-pidless-intent");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path);
+    let mut child =
+        crate::test_spawn::spawn(std::process::Command::new("/bin/cat").stdin(std::process::Stdio::piped()))
+            .expect("spawn a blocker");
+    let _stdin = child.stdin.take().expect("piped stdin");
+    let pidfd = pidfd_of(child.id());
+    // SAFETY: the leaf's channel is open; the intent names no pid and carries a pidfd that stays
+    // open for the send.
+    unsafe {
+        leaf.placement_slot()
+            .send(
+                crate::containment::cgroup::TAG_INTENT,
+                -1,
+                crate::containment::cgroup::HANDLE_PIDFD,
+                pidfd.as_raw_fd(),
+            )
+            .expect("send a pid-less intent");
+    }
+    // No handle owns the child once its spawn is abandoned: the leaf reaps it.
+    drop(child);
+
+    assert_eq!(
+        leaf.abandon_before_verdict(false, None, &mut crate::containment::cgroup::NoWarn),
+        crate::containment::cgroup::Abandoned::Ended
+    );
+    assert!(reaped(&pidfd), "the child must be reaped through the intent's pidfd");
+}
+
 /// Spawn `argv` as a child that leads its own group and places itself through `leaf`'s channel,
 /// reporting `Placed` (`/dev/null` stands in for `cgroup.procs`) or, with `fail`, the write's
 /// `EBADF`. `before` runs in the forked child first. Returns the child, never waited on here.

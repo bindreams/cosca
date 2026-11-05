@@ -7,7 +7,7 @@ use rustix::io::Errno;
 use rustix::process::{waitid, WaitId, WaitIdOptions};
 
 use super::{exit_record_of, is_exit_record, Reap, Record, Target};
-use crate::os_process::child::{ExitRecord, Foreign, PeekOutcome};
+use crate::os_process::child::{Foreign, PeekOutcome};
 
 fn pidfd<'a>(target: &Target<'a>) -> BorrowedFd<'a> {
     match target {
@@ -107,30 +107,4 @@ pub(super) fn wait_visible_exit(target: &Target<'_>) -> io::Result<PeekOutcome> 
 fn no_record() -> io::Result<PeekOutcome> {
     debug_assert!(false, "a blocking waitid(P_PIDFD, WEXITED) returned no record");
     Err(io::Error::other("a blocking waitid on the pidfd returned no record"))
-}
-
-pub(super) fn reap_blocking(target: &Target<'_>) -> io::Result<Result<ExitRecord, Foreign>> {
-    let fd = pidfd(target);
-    loop {
-        #[cfg(test)]
-        let forced_none = super::seams::take_forced_visible_none();
-        #[cfg(not(test))]
-        let forced_none = false;
-        let record = if forced_none {
-            Ok(None)
-        } else {
-            waitid_record(fd, WaitIdOptions::EXITED)
-        };
-        match record {
-            Ok(Some(record)) if is_exit_record(record.si_code) => return Ok(Ok(exit_record_of(record))),
-            // A ptrace stop, reported whatever the options say: not an exit; the next call blocks.
-            Ok(Some(_)) => continue,
-            Ok(None) => {
-                debug_assert!(false, "a blocking waitid(P_PIDFD, WEXITED) returned no record");
-                return Err(io::Error::other("a blocking waitid on the pidfd returned no record"));
-            }
-            Err(Errno::CHILD) => return Ok(Err(Foreign::Gone)),
-            Err(e) => return Err(e.into()),
-        }
-    }
 }

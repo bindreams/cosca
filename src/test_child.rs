@@ -380,9 +380,14 @@ pub(crate) fn tear_down_held_holding<R>(
     release: R,
     error: crate::error::Error,
 ) -> (crate::error::Error, crate::error::ChildFate, HandedBack<R>) {
-    let pid = child.pid().expect("the held child has a pid");
-    let (error, fate, unreaped) =
-        crate::child::spawn::held_teardown::tear_down_held(child, pid, front, id, subtree, why, error);
+    let how = crate::child::spawn::held_teardown::HeldTeardown {
+        front,
+        id,
+        subtree,
+        disposition: crate::child::owned::teardown::Disposition::HandBack,
+        due: None,
+    };
+    let (error, fate, unreaped) = crate::child::spawn::held_teardown::tear_down_held(child, how, why, error);
     (error, fate, HandedBack::new(release, unreaped))
 }
 
